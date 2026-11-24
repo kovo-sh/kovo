@@ -1132,9 +1132,9 @@ export function isMultiStepAssignment(input: {
   category?: string | null
   skills?: readonly string[]
 }): boolean {
-  // Deliberately ignores `hypothesis` prose: a det_lead says "chain it into a higher-impact finding"
-  // on every upgrade, which is not a multi-step assignment. Structured title/category/skill signals
-  // are the reliable contracts.
+  // A det_lead upgrade is one hypothesis, not a multi-step assignment: its prose says "chain it
+  // into a higher-impact finding" on every upgrade, and it must keep the 12-turn single-step lane.
+  if (/\bdet[_ ]lead\b|\blead upgrade\b/i.test(input.title ?? '')) return false
   const skillText = (input.skills ?? []).join(' ')
   return MULTI_STEP_ASSIGNMENT_RE.test(`${input.title ?? ''} ${input.category ?? ''} ${skillText}`)
 }
@@ -1240,6 +1240,9 @@ export interface AssignmentThroughputMetrics {
   assignmentWallP50: number
   assignmentWallP90: number
   assignmentWallSamples: number
+  /** Wall p50 over assignments that reached `complete` (excludes wall-capped/failed attempts). */
+  completedAssignmentWallP50: number
+  completedAssignmentWallSamples: number
   /** Mean turns per observed investigation assignment. */
   turnsPerAssignment: number
   providerStallTurns: number
@@ -1885,7 +1888,11 @@ function receiptFindingTemplate(vulnClass: 'ssrf' | 'xxe', origin: string, param
       title: `Asynchronous server-side request forgery on ${host}${param ? ` (${param})` : ''}`,
       severity: 'high' as const,
       cwe: 'CWE-918',
-      category: 'ssrf-redirects' as const,
+      // `Finding.category` is the grader's vulnClass key. A generic OWASP bucket
+      // (`ssrf-redirects`) would be scored as an unmatched FP despite the confirmed receipt.
+      category: 'ssrf' as const,
+      /** Coverage closure keeps the report's OWASP taxonomy. */
+      coverageCategory: 'ssrf-redirects' as const,
       impact: 'A server-side fetch of an attacker-controlled URL completes after the HTTP response, so synchronous SSRF filtering and response-time evidence miss it.',
       remediation: 'Resolve and allowlist outbound destinations against a strict scheme/host policy, block metadata and loopback ranges, and perform the fetch inside the request scope so failures are observable.',
       recheck: 'Re-inject the same canary URL and confirm no callback is delivered to the Guardian relay after the response.',
@@ -1895,7 +1902,9 @@ function receiptFindingTemplate(vulnClass: 'ssrf' | 'xxe', origin: string, param
     title: `Asynchronous XML external entity fetch on ${host}`,
     severity: 'high' as const,
     cwe: 'CWE-611',
-    category: 'injection-input' as const,
+    // Canonical vulnClass key (not the generic `injection-input` bucket).
+    category: 'xxe' as const,
+    coverageCategory: 'injection-input' as const,
     impact: 'An external entity is resolved by a background worker after the upload/preview response, enabling internal file or HTTP exfiltration.',
     remediation: 'Disable DTD and external entity resolution in the XML parser and process imports synchronously with a non-network resolver.',
     recheck: 'Re-submit the same DOCTYPE entity document and confirm the collector receives no request after the response.',
@@ -2091,6 +2100,8 @@ export class Execution {
   private readonly laneWallByRun = new Map<string, number>()
   /** Phase-B throughput telemetry: per-run assignment wall samples and provider turn latencies. */
   private readonly assignmentWallByRun = new Map<string, number[]>()
+  /** Wall samples for assignments that actually completed (the slot turned over on its own). */
+  private readonly completedAssignmentWallByRun = new Map<string, number[]>()
   private readonly turnLatencyByRun = new Map<string, number[]>()
   private readonly providerStallTurnsByRun = new Map<string, number>()
   private readonly providerStallRetriesByRun = new Map<string, number>()
@@ -5532,6 +5543,7 @@ export class Execution {
       workers = this.storage.workerList(runId).filter(worker => worker.phase === 'investigation')
     } catch { return null }
     const walls = this.assignmentWallByRun.get(runId) ?? []
+    const completedWalls = this.completedAssignmentWallByRun.get(runId) ?? []
     const turnSamples = this.turnLatencyByRun.get(runId) ?? []
     const turnSummary = summarizeTurnLatencies(turnSamples)
     const containers = this.backend.containerStats?.()
@@ -5544,6 +5556,8 @@ export class Execution {
       assignmentWallP50: Math.round(percentile(walls, 50)),
       assignmentWallP90: Math.round(percentile(walls, 90)),
       assignmentWallSamples: walls.length,
+      completedAssignmentWallP50: Math.round(percentile(completedWalls, 50)),
+      completedAssignmentWallSamples: completedWalls.length,
       turnsPerAssignment: turns.length ? Math.round((turns.reduce((sum, n) => sum + n, 0) / turns.length) * 10) / 10 : 0,
       providerStallTurns: this.providerStallTurnsByRun.get(runId) ?? 0,
       providerStallRetries: this.providerStallRetriesByRun.get(runId) ?? 0,
@@ -10275,6 +10289,11 @@ export class Execution {
       const walls = this.assignmentWallByRun.get(run.id) ?? []
       walls.push(wallMs)
       this.assignmentWallByRun.set(run.id, walls)
+      if (this.storage.worker(job.assignment.id)?.status === 'complete') {
+        const completed = this.completedAssignmentWallByRun.get(run.id) ?? []
+        completed.push(wallMs)
+        this.completedAssignmentWallByRun.set(run.id, completed)
+      }
       const samples = this.turnLatencyByRun.get(run.id) ?? []
       samples.push(...turnLatencies)
       this.turnLatencyByRun.set(run.id, samples)
@@ -10501,7 +10520,7 @@ export class Execution {
     try {
       this.storage.upsertCoverageEntry(run, assignment.id, {
         origin: input.origin,
-        category: template.category,
+        category: template.coverageCategory,
         status: 'reported',
         summary: `Confirmed async ${input.vulnClass.toUpperCase()} via ProofReceipt ${input.subscriptionId}`,
         linkedFindingId: findingId,

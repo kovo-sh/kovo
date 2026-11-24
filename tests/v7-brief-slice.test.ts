@@ -32,6 +32,10 @@ import {
   guardianVerifyPromptHint,
 } from '../src/server/agent-session.ts'
 import { declarativeReplaySpecSchema } from '../src/replay-spec.ts'
+import { findings as findingsTable } from '../src/server/schema.ts'
+import { eq } from 'drizzle-orm'
+import { classesCompatible } from '../benchmarks/realism-suite/lib/grade.ts'
+import { classCompatible } from '../benchmarks/realistic-bench/grader/match.ts'
 import {
   CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS,
   CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS,
@@ -490,6 +494,10 @@ test('race and multi-step assignments get 20–30 turns; single-step stays 12', 
   assert.ok(chain.wallClockMs <= CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS)
 
   assert.equal(isMultiStepAssignment({ skills: ['bola-idor-race'] }), true)
+  assert.equal(isMultiStepAssignment({
+    title: 'det_lead upgrade · authz_matrix PATCH /v3/admin/users/:id',
+    skills: ['bola-idor-race', 'false-positive-elimination'],
+  }), false)
   assert.equal(isMultiStepAssignment({ title: 'Cross-persona BOLA/IDOR matrix' }), true)
   assert.equal(isMultiStepAssignment({ title: 'det_lead upgrade · authz_matrix PATCH /v3/admin/users/:id', category: 'broken-access-control' }), false)
   assert.equal(
@@ -529,4 +537,73 @@ test('the stall watchdog retries once and exposes providerStallTurns/Retries', a
   const event = storage.eventsAfter(runId, 0, 500).find(e => e.kind === 'agentic.assignment_metrics')
   assert.ok(event, 'metrics are mirrored into a run event')
   assert.equal((event!.detail as Record<string, unknown>).providerStallRetries, 1)
+})
+
+// ============================================================================
+// 9. Receipt findings carry the canonical vulnClass (Realism #2 audit)
+// ============================================================================
+
+test('async SSRF/XXE receipt findings use the canonical category and match truth', async t => {
+  const { storage } = makeStore(t, 'guardian-v7-receipt-category-db-')
+  const { run, runId, assignment } = await approvedRun(storage)
+  const execution = new Execution(storage)
+  t.after(() => execution.stop())
+
+  const carrier = storage.recordExchange({
+    runId,
+    assignmentId: assignment.id,
+    scopeRevision: run.scopeRevision,
+    origin: ORIGIN,
+    finalOrigin: ORIGIN,
+    redirectOrigins: [],
+    method: 'POST',
+    pathAndQuery: '/api/preview',
+    personaHandle: 'anonymous',
+    status: 200,
+    mediaType: 'text/plain',
+    reqHeaders: {},
+    respHeaders: {},
+    body: 'ok',
+    durationMs: 5,
+  })
+
+  const cases = [
+    { vulnClass: 'ssrf' as const, cwe: 'CWE-918', truthClass: 'ssrf_internal_fetch', family: 'ssrf' },
+    { vulnClass: 'xxe' as const, cwe: 'CWE-611', truthClass: 'xxe_callback', family: 'xxe' },
+  ] as const
+  for (const entry of cases) {
+    const persisted = internals(execution).persistReceiptFinding(storage.run(runId), {
+      vulnClass: entry.vulnClass,
+      origin: ORIGIN,
+      param: 'url',
+      carrier,
+      receipt: { oobEventIds: [`evt-${entry.vulnClass}`] },
+      verification: {
+        confirmed: true,
+        vulnClass: entry.vulnClass,
+        rule: 'oob',
+        reason: 'canary callback observed after the response',
+        observed: 'callback',
+        expected: 'callback',
+      },
+      subscriptionId: `sub-${entry.vulnClass}`,
+    })
+    assert.equal(persisted, true, `${entry.vulnClass} receipt becomes a confirmed finding`)
+
+    const finding = storage.db.select().from(findingsTable)
+      .where(eq(findingsTable.runId, runId)).all()
+      .map(row => row.finding)
+      .find(row => row.cwe === entry.cwe)
+    assert.ok(finding, `${entry.vulnClass} finding is persisted`)
+    assert.equal(finding!.category, entry.vulnClass, 'category is the canonical vulnClass, not an OWASP bucket')
+    assert.equal(finding!.cwe, entry.cwe, 'CWE is unchanged')
+    assert.equal(finding!.verificationTier, 'runtime_confirmed')
+
+    // Both graders see the canonical category as compatible with the truth class.
+    assert.equal(classesCompatible(entry.truthClass, finding!.category), true)
+    assert.equal(classCompatible(
+      { vulnClass: entry.vulnClass, cwe: finding!.cwe },
+      { vulnClass: entry.family, cwe: entry.cwe },
+    ), true)
+  }
 })
