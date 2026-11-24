@@ -20,6 +20,7 @@ Format:
 
 ## Ready (dispatch when a lease frees)
 
+- [ ] **Engine lane (FIFO)** — one writer at a time on `execution.ts`, `deterministic-specs.ts`, `replay-verifier.ts`; merge order: sqli-baseline -> dispatch-funnel -> spec-submission -> cut3a | status: active | lease: coordinator discipline | deps: - | stream: -
 - [ ] Cut 3b: migrate remaining legacy kinds (browser_chain, rce_proof, auth_protocol_proof, cache_differential, http_chain traversal/redirect/xss/ssti/cmdi, dns_takeover, tls_audit, ws_chain, upload_probe, static_ast_proof) -> execution.ts < 8.5K, replay-verifier < 1.0K | status: blocked | lease: src/server/replay-verifier.ts, src/replay-spec.ts, src/server/floor-recipes.ts, src/server/proof-receipt.ts | deps: cut3a | stream: -
 - [ ] Realism #4 4-hop conversion 0/3 (act on the funnel verdict: brief depth vs proof conversion) | status: blocked | lease: src/server/execution.ts, src/server/assignment-brief.ts | deps: dispatch-funnel, realism-gates | stream: -
 - [ ] Realism #2 remaining capability: blind-SQLi + chain leg 3/3 | status: blocked | lease: src/server/deterministic-engine.ts, src/server/probes/** | deps: cut3a, realism-gates | stream: -
