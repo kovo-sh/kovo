@@ -43,6 +43,8 @@ import {
   normalizeRole,
 } from './oracle-invariants.ts'
 import type { ActorIdentity, AmbientAuth, ImpactStep, PersonaCredentialSource } from './oracle-invariants.ts'
+import { verifyReceipt } from './proof-receipt.ts'
+import type { ProofReceipt, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 
 // Re-exported for tests and callers that only import the verifier.
 export {
@@ -83,6 +85,32 @@ export interface ReplayVerificationResult {
   exchanges: BrokerExchangeResult[]
   evidencePayload: Record<string, unknown>
   evidenceSha256: string
+  /**
+   * v7 ProofReceipt check over the host-recorded transcript. Present whenever the replay could be
+   * expressed as a receipt (impact or out-of-band). `mode` says whether the receipt was advisory
+   * ('shadow') or gating ('strict'); see `proofReceiptMode`.
+   */
+  receipt?: ReplayReceiptCheck
+}
+
+export type ProofReceiptMode = 'off' | 'shadow' | 'strict'
+
+/**
+ * `GUARDIAN_PROOF_RECEIPT=off` restores the pure legacy DSL verdict, `shadow` (default) records the
+ * receipt without changing a verdict, and `strict` makes `verifyReceipt` the final confirmation
+ * gate. Strict is opt-in until parity across every suite is certified.
+ */
+export function proofReceiptMode(env: NodeJS.ProcessEnv = process.env): ProofReceiptMode {
+  const raw = (env.GUARDIAN_PROOF_RECEIPT ?? '').trim().toLowerCase()
+  if (raw === '0' || raw === 'off' || raw === 'false' || raw === 'no') return 'off'
+  if (raw === 'strict' || raw === 'enforce' || raw === '1') return 'strict'
+  return 'shadow'
+}
+
+export interface ReplayReceiptCheck {
+  receipt: ProofReceipt
+  verification: ReceiptVerification
+  mode: Exclude<ProofReceiptMode, 'off'>
 }
 
 export interface RetestReplayResult {
@@ -933,15 +961,225 @@ function lightSummary(ex: BrokerExchangeResult) {
   }
 }
 
+/**
+ * Map a replay spec onto a receipt class. Only classes whose evidence the receipt model can
+ * re-derive in-process are returned; everything else stays on the legacy verdict (no invented
+ * receipt rule keeps a confirmation alive).
+ */
+export function receiptVulnClassFor(spec: DeclarativeReplaySpec): string | null {
+  const text = `${spec.cwe} ${spec.category} ${spec.title} ${spec.impact}`
+  if (/CWE-918|\bssrf\b|server[- ]side request/i.test(text)) return 'ssrf'
+  if (/CWE-611|\bxxe\b|external entit/i.test(text)) return 'xxe'
+  if (spec.kind !== 'http_chain' && spec.kind !== 'auth_protocol_proof') return null
+  return vulnClassForImpactClass(classifyImpactDescriptor({
+    cwe: spec.cwe,
+    category: spec.category,
+    title: spec.title,
+    impact: spec.impact,
+  }))
+}
+
+function vulnClassForImpactClass(impactClass: string | null | undefined): string | null {
+  switch (impactClass) {
+    case 'authorization':
+    case 'bola':
+      return 'bola'
+    case 'bfla': return 'bfla'
+    case 'mass_assignment': return 'mass_assignment'
+    case 'csrf': return 'csrf'
+    case 'business_logic': return 'business_logic'
+    case 'markup': return 'xss_stored'
+    case 'disclosure': return 'info_disclosure'
+    default: return null
+  }
+}
+
+const replayCanaryTokenRe = /guardian-canary-[a-f0-9]{24}/i
+
+/**
+ * Build a ProofReceipt + transcript from a completed replay. The transcript is the host-recorded
+ * evidence the verifier already produced (`stepsOut` + exchange ids); nothing is re-executed.
+ * Returns null when the spec has no receipt representation.
+ */
+export function buildReplayReceipt(input: {
+  spec: DeclarativeReplaySpec
+  evidencePayload: Record<string, unknown>
+  exchangeIds: readonly string[]
+  exchanges: readonly BrokerExchangeResult[]
+}): { receipt: ProofReceipt; transcript: ReceiptTranscript } | null {
+  const impactGate = input.evidencePayload.impactGate as { required?: boolean } | undefined
+  const evidenceClass = typeof input.evidencePayload.evidenceClass === 'string'
+    ? input.evidencePayload.evidenceClass
+    : null
+  const vulnClass = vulnClassForImpactClass(evidenceClass) ?? receiptVulnClassFor(input.spec)
+  if (!vulnClass) return null
+  const isOob = vulnClass === 'ssrf' || vulnClass === 'xxe'
+  // The DSL only confirms an impact claim when its shared oracle gate applies. Do not manufacture a
+  // receipt for a class the replay never gated (auth-boundary, redirect, injection differentials):
+  // those keep their existing evidence model instead of being downgraded by a rule they never had.
+  if (!isOob && impactGate?.required !== true) return null
+  const stepsOut = (input.evidencePayload.steps ?? {}) as Record<string, unknown>
+  const steps = impactStepsFromStepsOut(input.spec, stepsOut)
+  if (steps.length === 0 && vulnClass !== 'ssrf' && vulnClass !== 'xxe') return null
+  const exchangeById = new Map<string, BrokerExchangeResult>()
+  input.exchangeIds.forEach((id, index) => {
+    const exchange = input.exchanges[index]
+    if (exchange) exchangeById.set(id, exchange)
+  })
+  const entries: ReceiptTranscriptEntry[] = []
+  const orderedIds: string[] = []
+  for (const [index, step] of steps.entries()) {
+    const recorded = stepsOut[step.id] as { exchangeId?: unknown } | undefined
+    const id = typeof recorded?.exchangeId === 'string'
+      ? recorded.exchangeId
+      : input.exchangeIds[index] ?? `exchange-${index}`
+    if (!id) continue
+    const exchange = exchangeById.get(id)
+    entries.push({
+      exchangeId: id,
+      step,
+      ...(typeof (recorded as { durationMs?: unknown } | undefined)?.durationMs === 'number'
+        ? { durationMs: (recorded as { durationMs: number }).durationMs }
+        : {}),
+      ...(exchange
+        ? { carrierText: `${exchange.pathAndQuery}\n${JSON.stringify(exchange.reqHeaders ?? {})}\n${String(exchange.body ?? '').slice(0, 32 * 1024)}` }
+        : {}),
+    })
+    orderedIds.push(id)
+  }
+
+  if (isOob) {
+    const carrying = entries.find(entry => replayCanaryTokenRe.test(entry.carrierText ?? ''))
+    if (!carrying) return null
+    const token = replayCanaryTokenRe.exec(carrying.carrierText ?? '')![0]
+    const receipt = {
+      vulnClass,
+      target: {
+        origin: input.spec.origin,
+        method: carrying.step.method.toUpperCase(),
+        ...(carrying.step.pathAndQuery ? { pathAndQuery: carrying.step.pathAndQuery } : {}),
+      },
+      exchangeIds: [carrying.exchangeId],
+      oobEventIds: ['replay-canary'],
+      browserTraceIds: [],
+      claimedDelta: `The target fetched the injected out-of-band canary after the ${vulnClass.toUpperCase()} probe.`,
+    }
+    const transcript: ReceiptTranscript = {
+      entries: [carrying],
+      oobEvents: [{
+        id: 'replay-canary',
+        callbackId: `replay:${carrying.exchangeId}`,
+        token,
+        targetOrigin: input.spec.origin,
+        delivered: true,
+        stage: 'immediate',
+        receivedAtMs: Date.now(),
+      }],
+      browserTraces: [],
+    }
+    return { receipt: receipt as ProofReceipt, transcript }
+  }
+
+  if (orderedIds.length === 0) return null
+  const targetExchangeStep = steps.find(step => step.arm === 'probe') ?? steps[0]
+  const targetEntry = entries.find(entry => entry.step === targetExchangeStep) ?? entries[0]
+  const receipt = {
+    vulnClass,
+    target: {
+      origin: input.spec.origin,
+      method: targetEntry.step.method.toUpperCase(),
+      ...(targetEntry.step.pathAndQuery ? { pathAndQuery: targetEntry.step.pathAndQuery } : {}),
+    },
+    exchangeIds: orderedIds,
+    oobEventIds: [],
+    browserTraceIds: [],
+    claimedDelta: (input.spec.expectedImpactEvents ?? []).length
+      ? `Replay observed the declared impact: ${(input.spec.expectedImpactEvents ?? []).join(', ')}.`
+      : `Replay moved state across the ${vulnClass} boundary described by "${input.spec.title.slice(0, 120)}".`,
+    ...(() => {
+      const declared = ((input.spec as { expectedImpactEvents?: string[] }).expectedImpactEvents ?? []).slice()
+      const csrfModelled = 'steps' in input.spec && Array.isArray(input.spec.steps) &&
+        input.spec.steps.some(s => Boolean((s as { request?: { csrfBind?: unknown } }).request?.csrfBind))
+      if (csrfModelled && !declared.includes('csrf_state_change')) declared.push('csrf_state_change')
+      return declared.length ? { oracleEvents: declared } : {}
+    })(),
+    ...('proofPatterns' in input.spec && Array.isArray(input.spec.proofPatterns) && input.spec.proofPatterns.length
+      ? { proofPatterns: input.spec.proofPatterns as string[] }
+      : {}),
+    ...('requiredRole' in input.spec && input.spec.requiredRole ? { requiredRole: input.spec.requiredRole } : {}),
+    ...('resourceTenant' in input.spec && input.spec.resourceTenant ? { resourceTenant: input.spec.resourceTenant } : {}),
+    ...('expectControlDenied' in input.spec && input.spec.expectControlDenied ? { expectControlDenied: true } : {}),
+  }
+  return { receipt: receipt as ProofReceipt, transcript: { entries } }
+}
+
+/**
+ * Apply the receipt to a verdict. Shadow mode only annotates; strict mode can only downgrade a
+ * confirmation (never promote one), so precision is monotonic.
+ */
+export function applyReceiptGate(input: {
+  mode: ProofReceiptMode
+  verdict: ReplayVerdict
+  outcome: ReplayAssertionOutcome
+  receipt: ProofReceipt
+  verification: ReceiptVerification
+}): { verdict: ReplayVerdict; outcome: ReplayAssertionOutcome; check?: ReplayReceiptCheck } {
+  if (input.mode === 'off') return { verdict: input.verdict, outcome: input.outcome }
+  const check: ReplayReceiptCheck = { receipt: input.receipt, verification: input.verification, mode: input.mode }
+  if (input.mode === 'strict' && input.verdict === 'confirmed' && !input.verification.confirmed) {
+    return {
+      verdict: 'inconclusive',
+      outcome: {
+        ...input.outcome,
+        confirmed: false,
+        reason: `ProofReceipt rejected the confirmation: ${input.verification.reason}`.slice(0, 1200),
+      },
+      check,
+    }
+  }
+  return { verdict: input.verdict, outcome: input.outcome, check }
+}
+
+function receiptCheckForResult(input: {
+  mode: ProofReceiptMode
+  verdict: ReplayVerdict
+  outcome: ReplayAssertionOutcome
+  spec: DeclarativeReplaySpec
+  evidencePayload: Record<string, unknown>
+  exchangeIds: readonly string[]
+  exchanges: readonly BrokerExchangeResult[]
+}): { verdict: ReplayVerdict; outcome: ReplayAssertionOutcome; check?: ReplayReceiptCheck } {
+  if (input.mode === 'off' || input.verdict !== 'confirmed') return { verdict: input.verdict, outcome: input.outcome }
+  const built = buildReplayReceipt({
+    spec: input.spec,
+    evidencePayload: input.evidencePayload,
+    exchangeIds: input.exchangeIds,
+    exchanges: input.exchanges,
+  })
+  if (!built) return { verdict: input.verdict, outcome: input.outcome }
+  const verification = verifyReceipt(built.receipt, built.transcript)
+  return applyReceiptGate({
+    mode: input.mode,
+    verdict: input.verdict,
+    outcome: input.outcome,
+    receipt: built.receipt,
+    verification,
+  })
+}
+
 async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<ReplayVerificationResult> {
   const { broker, backend, grant, signal } = params
   const assignmentId = params.assignmentId ?? randomUUID()
   const exchanges: BrokerExchangeResult[] = []
   const exchangeIds: string[] = []
-  const recordExchange = (ex: BrokerExchangeResult) => {
+  const recordExchange = (ex: BrokerExchangeResult): string | null => {
     exchanges.push(ex)
     const id = params.onExchange?.(ex)
-    if (typeof id === 'string' && id) exchangeIds.push(id)
+    if (typeof id === 'string' && id) {
+      exchangeIds.push(id)
+      return id
+    }
+    return null
   }
 
   // 1. Structural validation
@@ -1103,7 +1341,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           if (step.request.batchCount) {
             const batchReqs = Array.from({ length: step.request.batchCount }, () => ({ ...brokerReq }))
             const batchResults = await broker.executeBatch(batchReqs, grant, signal)
-            for (const ex of batchResults) recordExchange(ex)
+            const batchExchangeIds = batchResults.map(ex => recordExchange(ex)).filter((id): id is string => Boolean(id))
             rememberStep(step.id, batchReqs, batchResults)
             const first = batchResults[0]
             if (first) extractVariables(step, first, vars)
@@ -1113,6 +1351,8 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
               batchCount: batchResults.length,
               statuses: batchResults.map(r => r.status),
               responses: batchResults.map(summarizeExchange),
+              ...(batchExchangeIds.length ? { exchangeIds: batchExchangeIds } : {}),
+              ...(batchExchangeIds[0] ? { exchangeId: batchExchangeIds[0] } : {}),
               ...(first ? summarizeExchange(first) : {}),
               ...actorContextFor(step),
             }
@@ -1124,12 +1364,13 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
             }
           } else {
             const ex = await broker.executeHttp(brokerReq, grant, signal)
-            recordExchange(ex)
+            const exchangeId = recordExchange(ex)
             rememberStep(step.id, [brokerReq], [ex])
             extractVariables(step, ex, vars)
             const stepEntry: Record<string, unknown> = {
               id: step.id,
               role: step.role,
+              ...(exchangeId ? { exchangeId } : {}),
               ...summarizeExchange(ex),
               ...actorContextFor(step),
             }
@@ -3059,13 +3300,26 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     verdict = 'inconclusive'
   }
 
-  return {
+  // v7: one confirmation primitive. Shadow mode annotates the result for parity measurement;
+  // strict mode lets the receipt veto a DSL confirmation (never widen it).
+  const gated = receiptCheckForResult({
+    mode: proofReceiptMode(),
     verdict,
     outcome,
+    spec,
+    evidencePayload,
+    exchangeIds,
+    exchanges,
+  })
+
+  return {
+    verdict: gated.verdict,
+    outcome: gated.outcome,
     exchangeIds,
     exchanges,
     evidencePayload,
     evidenceSha256,
+    ...(gated.check ? { receipt: gated.check } : {}),
   }
 }
 

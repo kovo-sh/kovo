@@ -67,7 +67,6 @@ import {
   runAgentSession,
   threatModelPrompt,
   WarmSpecialistController,
-  withVerifierRepairFeedback,
   workerInvestigationPrompt,
 } from './agent-session.ts'
 import type {
@@ -85,7 +84,6 @@ import { createAgentTraceFromEnv } from './agent-trace.ts'
 import type { AgentTrace } from './agent-trace.ts'
 import { buildAssignmentBrief } from './assignment-brief.ts'
 import type { MissionKind } from './assignment-brief.ts'
-import type { CompiledProof } from './proof-tools.ts'
 import {
   BrokerApprovalRequired,
   BrokerCircuitOpen,
@@ -146,6 +144,8 @@ import type {
 } from './tier3-approval.ts'
 import { drainPendingOob, scheduleFinalReport } from './oob-drain.ts'
 import type { OobDrainOptions, OobDrainResult } from './oob-drain.ts'
+import { buildOobReceipt, verifyReceipt } from './proof-receipt.ts'
+import type { ReceiptOobEvent } from './proof-receipt.ts'
 export { DEFAULT_OOB_DRAIN_MS, OOB_DRAIN_POLL_MS, resolveOobDrainMs } from './oob-drain.ts'
 import { ProbePlanRegistry, selectRankedProbeTargets } from './probe-plan.ts'
 import { graphLeadTargets, seedCodeToRuntimeLeads as seedGraphLeads } from './graph-leads.ts'
@@ -256,7 +256,7 @@ function alignFindingForEvidence(
   return { ...finding, cwe: label.cwe, category: label.category }
 }
 import { availableReviewChecks, parseReviewPlan, reviewPlanPrompt, standardChecks } from './review-plan.ts'
-import { approvalRequests, findings, messages, replaySpecs } from './schema.ts'
+import { approvalRequests, canaries, findings, messages, replaySpecs } from './schema.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
 import { tenantTagForRun } from './scope-policy.ts'
 import { dedupeCodeAuditSuspects, runThreeStageSemanticAudit, runVariantSweepForFinding, toChainStepInputs } from './semantic-audit.ts'
@@ -393,9 +393,6 @@ export function resolveFloorLaneMode(
   if (raw === '0' || raw === 'off' || raw === 'false' || raw === 'no') return 'off'
   return 'on'
 }
-/** Hard cap on bounded Phase-3 reasoning refinements per run (M1.5). */
-const maxPhase3RefinementJobs = 10
-
 /** Page a Store listing to exhaustion; the coordinator never plans from a fixed-size snapshot. */
 export function collectAllPages<T>(
   fetchPage: (offset: number, limit: number) => readonly T[],
@@ -1728,6 +1725,49 @@ function createBroker(options: { storage: SecondOrderStore; canaryBroker: Canary
 }
 
 /** v6 Phase 1: map a deterministic probe class to the specialist category it best belongs to. */
+/**
+ * Classify a probe-minted canary purpose (`engine:ssrf:<param> (origin)`, `ssrf:<param>:http
+ * (origin)`, `xxe:general_entity (origin)`). Anything else (JWT/JKU, template, auth canaries) is
+ * not an async-injection proof and must not be converted into a finding.
+ */
+export function probeCanaryClass(purpose: string): { vulnClass: 'ssrf' | 'xxe'; origin: string; param: string | null } | null {
+  const origin = /\(([^()]+)\)\s*$/.exec(purpose)?.[1]?.trim()
+  if (!origin) return null
+  const match = /^(?:engine:)?(ssrf|xxe)(?::([^()\s]+))?/.exec(purpose)
+  if (!match) return null
+  const vulnClass = match[1] as 'ssrf' | 'xxe'
+  const segment = match[2] ?? ''
+  const variant = new Set(['http', 'dns', 'header', 'custom', 'general_entity', 'param_entity', 'svg_dtd'])
+  const param = vulnClass === 'ssrf' && segment && !variant.has(segment)
+    ? segment.split(':')[0] ?? null
+    : null
+  return { vulnClass, origin, param: param || null }
+}
+
+function receiptFindingTemplate(vulnClass: 'ssrf' | 'xxe', origin: string, param: string | null) {
+  const host = (() => { try { return new URL(origin).hostname } catch { return origin } })()
+  if (vulnClass === 'ssrf') {
+    return {
+      title: `Asynchronous server-side request forgery on ${host}${param ? ` (${param})` : ''}`,
+      severity: 'high' as const,
+      cwe: 'CWE-918',
+      category: 'ssrf-redirects' as const,
+      impact: 'A server-side fetch of an attacker-controlled URL completes after the HTTP response, so synchronous SSRF filtering and response-time evidence miss it.',
+      remediation: 'Resolve and allowlist outbound destinations against a strict scheme/host policy, block metadata and loopback ranges, and perform the fetch inside the request scope so failures are observable.',
+      recheck: 'Re-inject the same canary URL and confirm no callback is delivered to the Guardian relay after the response.',
+    }
+  }
+  return {
+    title: `Asynchronous XML external entity fetch on ${host}`,
+    severity: 'high' as const,
+    cwe: 'CWE-611',
+    category: 'injection-input' as const,
+    impact: 'An external entity is resolved by a background worker after the upload/preview response, enabling internal file or HTTP exfiltration.',
+    remediation: 'Disable DTD and external entity resolution in the XML parser and process imports synchronously with a non-network resolver.',
+    recheck: 'Re-submit the same DOCTYPE entity document and confirm the collector receives no request after the response.',
+  }
+}
+
 function detLeadCategory(probeClass: string): string {
   switch (probeClass) {
     case 'authz_matrix': return 'broken-access-control'
@@ -1889,8 +1929,6 @@ export class Execution {
    * Same 60 s TTL and scope binding as the single-use ledger.
    */
   private readonly burstApprovalInstances = new Map<string, { remaining: number; expiresAt: number }>()
-  /** runId → replay spec ids whose inline failure is eligible for bounded Phase-3 refinement. */
-  private readonly refinementEligible = new Map<string, Set<string>>()
   private readonly deterministicInFlight = new Set<string>()
   private readonly deterministicCompleted = new Set<string>()
   private readonly deterministicOnly: boolean
@@ -3013,72 +3051,6 @@ export class Execution {
         mediaType: mediaTypeOverride ?? res.mediaType,
       })
     }
-  }
-
-  private isRefinementEligible(runId: string, replaySpecId: string): boolean {
-    return this.refinementEligible.get(runId)?.has(replaySpecId) === true
-  }
-
-  private markRefinementEligible(runId: string, replaySpecId: string) {
-    let set = this.refinementEligible.get(runId)
-    if (!set) {
-      set = new Set<string>()
-      this.refinementEligible.set(runId, set)
-    }
-    set.add(replaySpecId)
-  }
-
-  /** Number of Phase-3 refinement jobs already dispatched for this run (complete or active). */
-  private refinementJobsDispatched(runId: string): number {
-    return this.storage.workerList(runId).filter(w => w.stepId?.startsWith('refine:')).length
-  }
-
-  private refinementBudgetRemaining(runId: string): number {
-    return Math.max(0, maxPhase3RefinementJobs - this.refinementJobsDispatched(runId))
-  }
-
-  /**
-   * Strong pre-verification signal gate for bounded Phase-3 reasoning refinement: only findings
-   * backed by an observed differential anomaly, a canary/OOB trigger, a second-order surface, or a
-   * high-confidence SAST suspect are worth an extra LLM pass. Everything else stays deterministic.
-   */
-  private hasStrongPreVerificationSignal(
-    run: Run,
-    findingRow: { finding: Finding },
-    specRow: ReplaySpecRow,
-    feedback?: InlineVerifyFeedback | null,
-  ): boolean {
-    if (specRow.spec.kind === 'static_ast_proof') return false
-    if (findingRow.finding.codeLocations?.length) return true
-    if (feedback?.canaryTriggered === true) return true
-    // A vertical-BFLA proof that only missed impact is repairable by adding a role-differential or
-    // mutation step, so it is worth one bounded Phase-3 reasoning pass.
-    if ((feedback as { impactEvidenceMissing?: boolean } | undefined)?.impactEvidenceMissing === true) return true
-    const controlPassed = feedback?.controlPassed === true
-    const differentialKinds = new Set([
-      'sql_boolean_diff', 'sql_time_diff', 'cache_differential', 'auth_protocol_proof', 'rce_proof', 'race_burst',
-    ])
-    if (controlPassed && differentialKinds.has(specRow.spec.kind)) return true
-
-    const linkedIds = new Set(findingRow.finding.chainFactIds ?? [])
-    if (linkedIds.size === 0) return false
-    let facts: Fact[] = []
-    try {
-      facts = this.storage.listFacts(run.id, { includeTainted: false, limit: 500 })
-    } catch {
-      return false
-    }
-    const multiPersona = run.capabilityTier >= 2
-    for (const fact of facts) {
-      if (!linkedIds.has(fact.id)) continue
-      const subkind = typeof fact.data?.subkind === 'string' ? fact.data.subkind : ''
-      if (subkind === 'code_audit_suspect' || subkind === 'second_order_surface') return true
-      if ((fact.kind as string) === 'cve_hypothesis') return true
-      if (fact.kind === 'dns' || fact.kind === 'tls') return true
-      if (fact.data?.triggered === true || fact.data?.anomaly === true || fact.data?.differential === true) return true
-      if (multiPersona && subkind === 'persona_resource') return true
-    }
-    return false
   }
 
   private consumeBurstApprovalInstance(input: StateChangeFingerprintInput, now = Date.now()): boolean {
@@ -9823,43 +9795,6 @@ export class Execution {
         },
 
         complete_intent: async (completion) => ({ recorded: true, status: completion.status }),
-
-        prove_authz_read_diff: async (proof: CompiledProof, signal: AbortSignal) => {
-          if (signal.aborted) throw new BrokerDenied('Assignment aborted.')
-          return this.submitProofSpec({
-            job, grant, currentSecrets,
-            ...(reposDir ? { reposDir } : {}),
-            proof,
-            onExchangeObserved: trackPersonaResources,
-          })
-        },
-        prove_state_mutation_diff: async (proof: CompiledProof, signal: AbortSignal) => {
-          if (signal.aborted) throw new BrokerDenied('Assignment aborted.')
-          return this.submitProofSpec({
-            job, grant, currentSecrets,
-            ...(reposDir ? { reposDir } : {}),
-            proof,
-            onExchangeObserved: trackPersonaResources,
-          })
-        },
-        prove_business_invariant: async (proof: CompiledProof, signal: AbortSignal) => {
-          if (signal.aborted) throw new BrokerDenied('Assignment aborted.')
-          return this.submitProofSpec({
-            job, grant, currentSecrets,
-            ...(reposDir ? { reposDir } : {}),
-            proof,
-            onExchangeObserved: trackPersonaResources,
-          })
-        },
-        prove_canary_or_redirect: async (proof: CompiledProof, signal: AbortSignal) => {
-          if (signal.aborted) throw new BrokerDenied('Assignment aborted.')
-          return this.submitProofSpec({
-            job, grant, currentSecrets,
-            ...(reposDir ? { reposDir } : {}),
-            proof,
-            onExchangeObserved: trackPersonaResources,
-          })
-        },
       }
 
       const personasPub = [...grant.personas?.values() ?? []].map(p => ({
@@ -10048,19 +9983,261 @@ export class Execution {
    * and records `oobDrainMs` / `promotedLate` in run-event meta. It never waits when nothing is
    * pending, so local-lab benchmark runs keep their zero-latency behavior.
    */
+  /**
+   * v7 Realism #2: a callback that lands after the synchronous probe/verification window still
+   * confirms an async SSRF/XXE. The durable `pending_oob` promotion is host-observed evidence, so it
+   * becomes a ProofReceipt validated against the recorded injection exchange and only then a
+   * `runtime_confirmed` finding (never a model assertion).
+   */
+  private promoteReceiptOob(runId: string): number {
+    let promotions: ReturnType<CanaryBroker['promoteLate']>
+    try { promotions = this.canaryBroker.promoteLate({ runId }) } catch { return 0 }
+    return this.convertOobPromotions(runId, promotions)
+  }
+
+  private convertOobPromotions(runId: string, promotions: ReturnType<CanaryBroker['promoteLate']>): number {
+    if (promotions.length === 0) return 0
+    let run: Run
+    try { run = this.storage.run(runId) } catch { return 0 }
+    if (run.status !== 'running') return 0
+    const approved = this.approvedOriginsSet(run)
+    let converted = 0
+    for (const promotion of promotions) {
+      const subscription = promotion.subscription
+      let canary: typeof canaries.$inferSelect | undefined
+      try {
+        canary = this.storage.db.select().from(canaries).where(eq(canaries.id, subscription.canaryId)).get()
+      } catch { canary = undefined }
+      if (!canary) continue
+      const classified = probeCanaryClass(canary.purpose)
+      if (!classified) continue
+      if (!approved.has(classified.origin)) continue
+      // The exact request that carried the canary is the causal binding; a callback alone does not
+      // prove that this target reached the listener.
+      let carrier: ReturnType<Store['searchExchanges']>[number] | undefined
+      try {
+        carrier = this.storage.searchExchanges(runId, subscription.token, { approvedOrigins: approved, limit: 10 })
+          .find(ex => [ex.pathAndQuery, ex.bodyPreview, JSON.stringify(ex.reqHeaders ?? {})]
+            .some(text => String(text).includes(subscription.token)))
+      } catch { carrier = undefined }
+      if (!carrier) continue
+      const receipt = buildOobReceipt({
+        vulnClass: classified.vulnClass,
+        origin: classified.origin,
+        method: carrier.method,
+        pathAndQuery: carrier.pathAndQuery,
+        ...(classified.param ? { param: classified.param } : {}),
+        exchangeIds: [carrier.id],
+        oobEventId: subscription.id,
+        claimedDelta: `The target fetched the injected ${classified.vulnClass.toUpperCase()} canary after its HTTP response (durable ${promotion.stage} callback).`,
+      })
+      const oobEvent: ReceiptOobEvent = {
+        id: subscription.id,
+        callbackId: promotion.callback.callbackId,
+        canaryId: subscription.canaryId,
+        token: subscription.token,
+        targetOrigin: classified.origin,
+        delivered: true,
+        stage: promotion.stage,
+        receivedAtMs: promotion.callback.receivedAt,
+        latencyMs: promotion.latencyMs,
+      }
+      let body = carrier.bodyPreview
+      try { body = this.storage.getExchange(runId, carrier.id).body } catch { /* preview is enough */ }
+      const verification = verifyReceipt(receipt, {
+        entries: [{
+          exchangeId: carrier.id,
+          step: {
+            id: carrier.id,
+            arm: 'probe',
+            method: carrier.method,
+            route: carrier.pathAndQuery.split('?')[0],
+            pathAndQuery: carrier.pathAndQuery,
+            status: carrier.status,
+            actor: { handle: carrier.personaHandle, role: null, tenant: null, auth: 'unknown', sameSite: null },
+            body,
+            requestHeaders: carrier.reqHeaders ?? null,
+            responseHeaders: carrier.respHeaders ?? null,
+          },
+          carrierText: `${carrier.pathAndQuery}\n${JSON.stringify(carrier.reqHeaders ?? {})}\n${body}`,
+        }],
+        oobEvents: [oobEvent],
+      })
+      if (!verification.confirmed) {
+        try {
+          this.storage.event(runId, 'oob.receipt_rejected', `OOB promotion for canary ${subscription.canaryId} did not verify: ${verification.reason}`, {
+            canaryId: subscription.canaryId,
+            subscriptionId: subscription.id,
+            reason: verification.reason,
+          })
+        } catch { /* store closed */ }
+        continue
+      }
+      try {
+        if (this.persistReceiptFinding(run, {
+          vulnClass: classified.vulnClass,
+          origin: classified.origin,
+          param: classified.param,
+          carrier,
+          receipt,
+          verification,
+          subscriptionId: subscription.id,
+        })) converted += 1
+      } catch { /* persistence is best-effort; never fail the drain */ }
+    }
+    return converted
+  }
+
+  private persistReceiptFinding(run: Run, input: {
+    vulnClass: 'ssrf' | 'xxe'
+    origin: string
+    param: string | null
+    carrier: ReturnType<Store['searchExchanges']>[number]
+    receipt: ReturnType<typeof buildOobReceipt>
+    verification: ReturnType<typeof verifyReceipt>
+    subscriptionId: string
+  }): boolean {
+    const asset = run.candidates.find(candidate => candidate.origin === input.origin && run.approved.includes(candidate.id))
+    if (!asset) return false
+    const template = receiptFindingTemplate(input.vulnClass, input.origin, input.param)
+    const rows = this.storage.db.select().from(findings).where(and(
+      eq(findings.runId, run.id),
+      eq(findings.goalRevision, run.goalRevision),
+    )).all()
+    // One async callback per (origin, class) target: never let a repeated poll inflate findings.
+    const duplicate = rows.find(row => row.finding.origin === input.origin &&
+      row.finding.cwe === template.cwe &&
+      (row.finding.status === 'confirmed' || row.finding.status === 'static_verified'))
+    if (duplicate) return false
+
+    const assignment = this.storage.workerList(run.id).find(worker => worker.id === input.carrier.assignmentId)
+      ?? this.storage.workerList(run.id)[0]
+    if (!assignment) return false
+    const evidence = this.storage.addArtifact(
+      run,
+      assignment,
+      'replay',
+      `ProofReceipt · async ${input.vulnClass.toUpperCase()} · ${new URL(input.origin).hostname}`,
+      JSON.stringify({
+        receipt: input.receipt,
+        verification: input.verification,
+        carrierExchangeId: input.carrier.id,
+        oobSubscriptionId: input.subscriptionId,
+      }, null, 2),
+      `receipt:oob:${input.subscriptionId}`,
+      [],
+    )
+
+    // Prefer the replay spec whose probe carried this canary (it has the chain context), else keep
+    // `replay_spec_id` null for a receipt-only finding.
+    let specRow: ReplaySpecRow | undefined
+    try {
+      specRow = this.storage.listReplaySpecs(run.id).find(row => {
+        const text = JSON.stringify(row.spec)
+        return text.includes(input.subscriptionId) || text.includes(input.carrier.id)
+      })
+    } catch { specRow = undefined }
+    const existing = specRow
+      ? rows.find(row => row.id === specRow!.findingId)
+      : rows.find(row => row.finding.origin === input.origin && row.finding.cwe === template.cwe && row.finding.status !== 'confirmed')
+    const findingId = existing?.id ?? randomUUID()
+    const finding: Finding = {
+      ...(existing?.finding ?? {}),
+      id: findingId,
+      origin: input.origin,
+      title: template.title,
+      status: 'confirmed',
+      severity: template.severity,
+      reason: input.verification.reason,
+      remediation: template.remediation,
+      impact: template.impact,
+      recheck: template.recheck,
+      category: template.category,
+      cwe: template.cwe,
+      confidence: 'high',
+      verification: `ProofReceipt ${input.receipt.oobEventIds[0]} · ${input.verification.rule} rule · ${input.verification.reason}`,
+      verificationTier: 'runtime_confirmed',
+      findingKind: 'multi_step_chain',
+      replaySpecId: specRow?.id,
+      exchangeIds: [...new Set([...(existing?.finding.exchangeIds ?? []), input.carrier.id])],
+      evidenceIds: [...new Set([...(existing?.finding.evidenceIds ?? []), evidence.id])],
+      scopeRevision: run.scopeRevision,
+    }
+    if (specRow) {
+      this.storage.upsertChainFinding(run, asset.id, finding, specRow.id, specRow.sourceOrigins)
+    } else if (existing) {
+      this.storage.db.update(findings).set({
+        verificationTier: 'runtime_confirmed',
+        verificationClass: 'runtime_confirmed',
+        finding,
+      }).where(and(eq(findings.runId, run.id), eq(findings.id, findingId))).run()
+    } else {
+      this.storage.db.insert(findings).values({
+        id: findingId,
+        runId: run.id,
+        assetId: asset.id,
+        goalRevision: run.goalRevision,
+        checkId: 'chain',
+        caseId: findingId,
+        findingKind: 'multi_step_chain',
+        replaySpecId: null,
+        sourceOrigins: [input.origin],
+        verificationTier: 'runtime_confirmed',
+        provenance: 'agent_only',
+        verificationClass: 'runtime_confirmed',
+        finding,
+      }).run()
+    }
+    try {
+      this.storage.upsertCoverageEntry(run, assignment.id, {
+        origin: input.origin,
+        category: template.category,
+        status: 'reported',
+        summary: `Confirmed async ${input.vulnClass.toUpperCase()} via ProofReceipt ${input.subscriptionId}`,
+        linkedFindingId: findingId,
+      })
+      this.storage.event(run.id, 'oob.receipt_confirmed',
+        `Late ${input.vulnClass.toUpperCase()} callback promoted to a runtime_confirmed finding (${input.verification.reason.slice(0, 200)}).`, {
+          findingId,
+          oobSubscriptionId: input.subscriptionId,
+          exchangeId: input.carrier.id,
+          rule: input.verification.rule,
+        })
+    } catch { /* metrics/coverage are best-effort */ }
+    return true
+  }
+
   async drainPendingOob(
     runOrId: Pick<Run, 'id'> | string,
     options: OobDrainOptions = {},
   ): Promise<OobDrainResult> {
     const runId = typeof runOrId === 'string' ? runOrId : runOrId.id
-    const result = await drainPendingOob(this.canaryBroker, runId, options)
+    // Convert already-delivered callbacks first: they may have landed while verification workers
+    // were finishing, before this drain started. Callbacks that arrive during the bounded wait are
+    // converted by the proxy as the shared drain promotes them (a promotion is claim-once, so a
+    // post-drain call would never see them again).
+    let promotedReceipts = this.promoteReceiptOob(runId)
+    const convertingRelay = new Proxy(this.canaryBroker, {
+      get: (target, prop, receiver) => {
+        if (prop === 'promoteLate') {
+          return (opts: { runId?: string; now?: number } = {}) => {
+            const promotions = target.promoteLate(opts)
+            try { promotedReceipts += this.convertOobPromotions(runId, promotions) } catch { /* best-effort */ }
+            return promotions
+          }
+        }
+        const value = Reflect.get(target, prop, receiver)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    const result = await drainPendingOob(convertingRelay, runId, options)
     this.lastOobDrain.set(runId, result)
     try {
       this.storage.event(
         runId,
         'oob.drain_complete',
-        `OOB drain finished in ${result.oobDrainMs} ms (${result.promotedLate} late callback(s) promoted, ${result.remaining} still pending).`,
-        { ...result },
+        `OOB drain finished in ${result.oobDrainMs} ms (${result.promotedLate} late callback(s) promoted, ${promotedReceipts} confirmed by ProofReceipt, ${result.remaining} still pending).`,
+        { ...result, promotedReceipts },
       )
     } catch { /* store closed */ }
     return result
@@ -10144,80 +10321,7 @@ export class Execution {
       f.sourceOrigins.every(o => approvedOrigins.has(o)),
     )
 
-    const ownedRefineSpecIds = new Set<string>()
-    for (const w of workers) {
-      if (w.phase === 'verification' && w.stepId?.startsWith('refine:') &&
-          w.status !== 'complete' && w.status !== 'canceled' && w.status !== 'failed') {
-        ownedRefineSpecIds.add(w.stepId.slice('refine:'.length))
-      }
-    }
-    for (const activeJob of this.active.values()) {
-      if (activeJob.assignment.runId === run.id &&
-          activeJob.assignment.phase === 'verification' &&
-          activeJob.assignment.stepId?.startsWith('refine:')) {
-        ownedRefineSpecIds.add(activeJob.assignment.stepId.slice('refine:'.length))
-      }
-    }
-    const refinedFindingIds = new Set<string>()
-    if (ownedRefineSpecIds.size > 0) {
-      for (const s of this.storage.listReplaySpecs(run.id)) {
-        if (ownedRefineSpecIds.has(s.id)) refinedFindingIds.add(s.findingId)
-      }
-    }
-
-    // 1b. Bounded Phase-3 reasoning refinement for inline-failed findings with strong pre-signals.
-    // This is what re-connects refinement after an inline `dismissed`/`inconclusive`: those rows are
-    // never `pending`, so the normal verification queue would otherwise never look at them again.
-    const eligibleRefineSpecIds = new Set<string>()
-    const refinementBudget = this.refinementBudgetRemaining(run.id)
-    if (refinementBudget > 0 && privateModelProfiles(this.storage).length > 0) {
-      const specById = new Map(this.storage.listReplaySpecs(run.id).map(s => [s.id, s]))
-      const rowsById = new Map(this.storage.db.select().from(findings).where(and(
-        eq(findings.runId, run.id),
-        eq(findings.goalRevision, run.goalRevision),
-      )).all().map(r => [r.id, r]))
-      let dispatched = 0
-      for (const specId of [...(this.refinementEligible.get(run.id) ?? [])]) {
-        if (dispatched >= refinementBudget) break
-        if (ownedRefineSpecIds.has(specId)) continue
-        const specRow = specById.get(specId)
-        if (!specRow) continue
-        const row = rowsById.get(specRow.findingId)
-        if (!row) continue
-        const status = row.finding.status
-        if (status === 'confirmed' || status === 'static_verified') continue
-        if (status !== 'pending' && status !== 'inconclusive' && status !== 'dismissed') continue
-        if (!row.sourceOrigins.every(o => approvedOrigins.has(o))) continue
-        if (!specRow.sourceOrigins.every(o => approvedOrigins.has(o))) continue
-        const asset = run.candidates.find(c => c.id === row.assetId)
-        this.storage.makeWorker(
-          run,
-          'verification',
-          asset,
-          `Refine replay · ${specRow.spec.title.slice(0, 75)}`,
-          `Bounded 8-turn Phase-3 refinement for inline-failed ${specRow.spec.kind} spec ${specId} with a strong pre-verification signal.`,
-          {
-            stepId: `refine:${specId}`,
-            sourceOrigins: specRow.sourceOrigins,
-            maxTurns: 8,
-          },
-        )
-        eligibleRefineSpecIds.add(specId)
-        refinedFindingIds.add(specRow.findingId)
-        dispatched += 1
-      }
-    }
-    if (eligibleRefineSpecIds.size > 0) {
-      this.storage.event(
-        run.id,
-        'refinement.dispatched',
-        `Dispatched ${eligibleRefineSpecIds.size} bounded Phase-3 refinement job(s) for inline-failed specs.`,
-        { specIds: [...eligibleRefineSpecIds], cap: maxPhase3RefinementJobs },
-      )
-    }
-
     for (const row of pendingFindings) {
-      if (refinedFindingIds.has(row.id)) continue
       const existing = workers.find(w => w.phase === 'verification' && w.stepId === row.replaySpecId && w.status !== 'canceled')
       if (!existing) {
         const asset = run.candidates.find(c => c.id === row.assetId)
@@ -10282,9 +10386,7 @@ export class Execution {
     this.active.set(claimed.id, job)
 
     const work = claimed.stepId
-      ? (claimed.stepId.startsWith('refine:')
-          ? this.runPhase3RefinementJob(job, claimed.stepId.slice('refine:'.length))
-          : this.verifyReplaySpecJob(job, claimed.stepId))
+      ? this.verifyReplaySpecJob(job, claimed.stepId)
       : this.verifyBaselineJob(job)
 
     void work.catch(error => {
@@ -10420,6 +10522,18 @@ export class Execution {
     }
     const result = await verifyReplaySpec(verifyParams)
     this.markReplaySpecCoverage(run, specRow.spec, `replay:${specRow.spec.kind}`)
+    if (result.receipt && !result.receipt.verification.confirmed) {
+      // Parity telemetry only: shadow receipts never change this verdict.
+      try {
+        this.storage.event(run.id, 'proof_receipt.shadow_reject',
+          `ProofReceipt did not substantiate spec ${specRow.id}: ${result.receipt.verification.reason}`.slice(0, 400), {
+            replaySpecId: specRow.id,
+            vulnClass: result.receipt.receipt.vulnClass,
+            rule: result.receipt.verification.rule,
+            mode: result.receipt.mode,
+          })
+      } catch { /* store closed */ }
+    }
 
     const current = this.check(job)
     let phaseFeedback: InlineVerifyFeedback | undefined
@@ -10451,6 +10565,8 @@ export class Execution {
           sourceOrigins: specRow.sourceOrigins,
           evidenceSha256: result.evidenceSha256,
           evidencePayload: result.evidencePayload,
+          receipt: result.receipt?.verification ?? null,
+          receiptArtifact: result.receipt?.receipt ?? null,
         }, null, 2), 'replay:' + specRow.id, currentSecrets())
 
       const staticCodeLocations: CodeLocation[] | undefined = staticSpec
@@ -10515,39 +10631,6 @@ export class Execution {
           verificationTier: null,
           finding: updatedFinding,
         })
-
-        const refineStepId = `refine:${specRow.id}`
-        const alreadyQueuedRefine = this.storage.workerList(current.id).some(w =>
-          w.phase === 'verification' && w.stepId === refineStepId,
-        )
-        const strongPreSignal = this.hasStrongPreVerificationSignal(current, findingRow, specRow, rawFeedback)
-        if (strongPreSignal) this.markRefinementEligible(current.id, specRow.id)
-        // Legacy Phase-3 refinement stays available for any spec that failed deterministic replay;
-        // the strong-signal eligibility set only widens dispatch to inline-failed findings that are
-        // never `pending` again. Both paths share the hard <=10 jobs/run cap.
-        const canRefine =
-          current.capabilityTier > 0 &&
-          !this.storage.checkBudgetExceeded(current.id) &&
-          privateModelProfiles(this.storage).length > 0 &&
-          !alreadyQueuedRefine &&
-          this.refinementBudgetRemaining(current.id) > 0 &&
-          specRow.sourceOrigins.every(o => permittedAtAdmission.has(o))
-        if (canRefine) {
-          const asset = current.candidates.find(c => c.id === findingRow.assetId)
-          this.storage.makeWorker(
-            current,
-            'verification',
-            asset,
-            `Refine replay · ${specRow.spec.title.slice(0, 75)}`,
-            `Bounded 8-turn Phase-3 refinement for failed ${specRow.spec.kind} spec ${specRow.id}.`,
-            {
-              stepId: refineStepId,
-              input: job.assignment,
-              maxTurns: 8,
-              sourceOrigins: specRow.sourceOrigins,
-            },
-          )
-        }
       }
       this.completeWorker(
         job.assignment,
@@ -10583,7 +10666,6 @@ export class Execution {
     spec: DeclarativeReplaySpec
     findingId?: string
     replaySpecId?: string
-    phase3RefinementAttempt?: number
     onExchangeObserved?: (curRun: Run, ex: BrokerExchangeResult, exchangeId: string) => void
   }): Promise<{
     findingId?: string
@@ -10645,7 +10727,7 @@ export class Execution {
       ...existingForFinding.map(r => r.attemptCount),
       0,
     )
-    const nextAttempt = params.phase3RefinementAttempt ?? (currentAttempts + 1)
+    const nextAttempt = currentAttempts + 1
     const maxAttempts = 1 + maxInlineVerifyRetries
 
     if (nextAttempt <= maxAttempts) {
@@ -10834,6 +10916,8 @@ export class Execution {
         exchangeIds: replay.exchangeIds,
         evidenceSha256: replay.evidenceSha256,
         evidencePayload: replay.evidencePayload,
+        receipt: replay.receipt?.verification ?? null,
+        receiptArtifact: replay.receipt?.receipt ?? null,
       }, null, 2),
       undefined,
       params.currentSecrets(),
@@ -10895,11 +10979,6 @@ export class Execution {
         )).get()
         if (refreshedRow) this.scheduleVariantSweepForFinding(latestRun, refreshedRow)
       } else {
-        if (this.hasStrongPreVerificationSignal(latestRun, findingRow, updatedSpec, normalizedFeedback)) {
-          // Phase-2 inline failure with a strong pre-verification signal: eligible for one bounded
-          // Phase-3 reasoning refinement (dispatched by driveVerification, <=10 per run).
-          this.markRefinementEligible(latestRun.id, updatedSpec.id)
-        }
         this.storage.updateProposedFinding(latestRun, findingRow.id, {
           replaySpecId: updatedSpec.id,
           sourceOrigins: mergedOrigins,
@@ -10930,541 +11009,6 @@ export class Execution {
       verificationTier: verdictTier,
       feedback: normalizedFeedback,
       artifactId: receipt.id,
-    }
-  }
-
-  /**
-   * Typed proof-compiler settlement path (`prove_*` tools). Compiles a proof object into an
-   * identifier-bound replay spec, persists the candidate, then uses the existing inline
-   * ReplayVerifier path. Never bypasses approvals: `executeInlineVerification` performs the same
-   * Tier-3 gates as `propose_chain_finding`.
-   */
-  private async submitProofSpec(params: {
-    job: Active
-    grant: Grant
-    currentSecrets: () => readonly NamedSecret[]
-    reposDir?: string
-    proof: CompiledProof
-    onExchangeObserved?: (curRun: Run, ex: BrokerExchangeResult, exchangeId: string) => void
-  }): Promise<unknown> {
-    const run = this.check(params.job)
-    if (this.storage.checkBudgetExceeded(run.id)) {
-      throw new BudgetExceededError('Run spend or request budget exceeded.')
-    }
-    const parsed = declarativeReplaySpecSchema.parse(params.proof.spec)
-    const origins = [...new Set(replaySpecOrigins(parsed))]
-    const approved = this.approvedOriginsSet(run)
-    if (!origins.length || origins.some(origin => !approved.has(origin))) {
-      throw new BrokerDenied('Proof spec references an origin outside current approved scope.')
-    }
-    const asset = run.candidates.find(c => origins.includes(c.origin) && run.approved.includes(c.id))
-    if (!asset) throw new Error('No approved asset matches the proof origin.')
-
-    const fields = extractSpecDedupeFields(parsed)
-    const existingRows = this.storage.db.select().from(findings).where(and(
-      eq(findings.runId, run.id),
-      eq(findings.goalRevision, run.goalRevision),
-    )).all()
-    const existingRefs: ExistingFindingRef[] = existingRows.map(row => {
-      const existingSpec = row.replaySpecId ? this.storage.getReplaySpec(run.id, row.replaySpecId) : null
-      const existingFields = existingSpec ? extractSpecDedupeFields(existingSpec.spec) : undefined
-      return {
-        id: row.id,
-        origin: row.finding.origin,
-        title: row.finding.title,
-        status: row.finding.status,
-        cwe: row.finding.cwe,
-        category: row.finding.category,
-        severity: row.finding.severity,
-        endpoint: existingFields?.endpoint ?? null,
-        authState: existingFields?.authState ?? null,
-        specKind: existingFields?.specKind ?? null,
-        method: existingFields?.method ?? null,
-        param: existingFields?.param ?? null,
-        graphqlField: existingFields?.graphqlField ?? null,
-        mutated: existingFields?.mutated ?? null,
-        fingerprintHash: row.fingerprintHash ?? null,
-      }
-    })
-    const duplicate = checkStructuralDuplicate({
-      origin: parsed.origin,
-      title: parsed.title,
-      cwe: parsed.cwe,
-      category: parsed.category,
-      severity: parsed.severity,
-      endpoint: fields.endpoint,
-      authState: fields.authState,
-      specKind: fields.specKind,
-      method: fields.method,
-      param: fields.param,
-      graphqlField: fields.graphqlField,
-      mutated: fields.mutated ?? null,
-    }, existingRefs)
-    if (duplicate.isDuplicate && duplicate.duplicateOfId) {
-      return {
-        findingId: duplicate.duplicateOfId,
-        status: 'deduplicated',
-        deduplicated: true,
-        proof: { warnings: params.proof.warnings, rationale: params.proof.rationale },
-        note: 'Structural duplicate of an existing finding; call update_proposed_finding to enrich or upgrade it.',
-      }
-    }
-
-    const findingId = randomUUID()
-    const specRow = this.storage.createReplaySpec(run, params.job.assignment, findingId, parsed, origins)
-    const evidence = this.storage.addArtifact(
-      run,
-      params.job.assignment,
-      'replay',
-      `Typed proof spec · ${parsed.title}`,
-      JSON.stringify({
-        replaySpecId: specRow.id,
-        specSha256: specRow.specSha256,
-        rationale: params.proof.rationale,
-        warnings: params.proof.warnings,
-        spec: parsed,
-      }, null, 2),
-      undefined,
-      params.currentSecrets(),
-    )
-    const finding: Finding = {
-      id: findingId,
-      origin: parsed.origin,
-      title: parsed.title,
-      status: 'pending',
-      severity: parsed.severity,
-      reason: parsed.severityRationale,
-      remediation: parsed.remediation,
-      impact: parsed.impact,
-      recheck: parsed.recheckInstructions,
-      category: parsed.category,
-      cwe: parsed.cwe,
-      confidence: 'medium',
-      verification: `Pending Zero-LLM ${parsed.kind} replay verification (typed proof spec ${specRow.id}).`,
-      findingKind: 'multi_step_chain',
-      replaySpecId: specRow.id,
-      fingerprintHash: duplicate.fingerprint.hash,
-      exchangeIds: [],
-      evidenceIds: [evidence.id],
-      scopeRevision: run.scopeRevision,
-    }
-    const saved = this.storage.upsertChainFinding(run, asset.id, finding, specRow.id, origins)
-    this.storage.addGraphEdge(run.id, { fromKind: 'assignment', fromId: params.job.assignment.id, toKind: 'finding', toId: saved.id, edgeKind: 'proves' })
-    this.schedulePlanner(run.id)
-
-    const inline = await this.executeInlineVerification({
-      job: params.job,
-      grant: params.grant,
-      currentSecrets: params.currentSecrets,
-      ...(params.reposDir ? { reposDir: params.reposDir } : {}),
-      spec: parsed,
-      findingId: saved.id,
-      replaySpecId: specRow.id,
-      ...(params.onExchangeObserved ? { onExchangeObserved: params.onExchangeObserved } : {}),
-    })
-    return withVerifierRepairFeedback({
-      findingId: saved.id,
-      replaySpecId: inline.replaySpecId,
-      status: inline.status,
-      ...(inline.verificationTier ? { verificationTier: inline.verificationTier } : {}),
-      inlineVerifyFeedback: inline.feedback,
-      proof: { warnings: params.proof.warnings, rationale: params.proof.rationale },
-      note: inline.status === 'confirmed' || inline.status === 'static_verified'
-        ? `Typed proof verified inline (${inline.status}).`
-        : `Typed proof verification returned ${inline.status}. Repair the request/identifier from inlineVerifyFeedback and re-submit.`,
-    })
-  }
-
-  private async runPhase3RefinementJob(job: Active, replaySpecId: string) {
-    const run = this.check(job)
-    const specRow = this.storage.getReplaySpec(run.id, replaySpecId)
-    const findingRow = this.storage.db.select().from(findings).where(and(
-      eq(findings.runId, run.id), eq(findings.id, specRow.findingId),
-    )).get()
-    if (!findingRow) {
-      this.completeWorker(job.assignment, run, 'Finding no longer exists.', [])
-      return
-    }
-    if (findingRow.finding.status === 'confirmed' || findingRow.finding.status === 'static_verified') {
-      this.completeWorker(job.assignment, run, `Finding already ${findingRow.finding.status}.`, [])
-      return
-    }
-
-    const permittedAtAdmission = this.approvedOriginsSet(run)
-    const { grant, secrets, currentSecrets } = this.buildGrant(job, run, permittedAtAdmission)
-    const { reposDir } = this.projectReposMount(run.projectId)
-    const allProfiles = privateModelProfiles(this.storage)
-    const reasoningPool = resolveProfilePoolForRole('reasoning', allProfiles)
-    if (!reasoningPool.length) {
-      this.completeWorker(job.assignment, run, 'No model profiles configured for Phase-3 refinement.', [])
-      return
-    }
-
-    const session = await this.backend.openSession(
-      job.assignment.id,
-      job.controller.signal,
-      reposDir ? { reposDir } : undefined,
-    )
-
-    let lastInlineFeedback: InlineVerifyFeedback | null = specRow.lastVerificationDiff ?? null
-    let lastExchangeIds: string[] = [...(findingRow.finding.exchangeIds ?? [])]
-    const collectedArtifactIds: string[] = []
-    let refinementVerifyAttempts = 0
-    const maxRefinementAttempts = 1 + maxInlineVerifyRetries
-
-    try {
-      const refinementHandlers: WorkerToolHandlers = {
-        spillOutput: async (id, content, signal) => session.stage(`tool-output/${id}.txt`, content, signal),
-        verify_replay_spec: async (args) => {
-          const spec = args.spec ?? args.replaySpec
-          if (!spec) throw new Error('verify_replay_spec requires spec or replaySpec.')
-          refinementVerifyAttempts += 1
-          const inline = await this.executeInlineVerification({
-            job,
-            grant,
-            currentSecrets,
-            reposDir,
-            spec,
-            findingId: args.findingId ?? findingRow.id,
-            replaySpecId: args.replaySpecId ?? specRow.id,
-            phase3RefinementAttempt: refinementVerifyAttempts,
-          })
-          lastInlineFeedback = inline.feedback
-          if (inline.artifactId) collectedArtifactIds.push(inline.artifactId)
-          return {
-            findingId: inline.findingId ?? findingRow.id,
-            replaySpecId: inline.replaySpecId,
-            status: inline.status,
-            ...(inline.verificationTier ? { verificationTier: inline.verificationTier } : {}),
-            inlineVerifyFeedback: inline.feedback,
-          }
-        },
-        update_proposed_finding: async (args) => {
-          const curRun = this.check(job)
-          const currentApproved = this.approvedOriginsSet(curRun)
-          const latestFinding = this.storage.db.select().from(findings).where(and(
-            eq(findings.runId, curRun.id), eq(findings.id, args.findingId),
-          )).get()
-          if (!latestFinding) throw new Error(`Finding ${args.findingId} not found in this run.`)
-          const isAlreadyVerified = latestFinding.finding.status === 'confirmed' || latestFinding.finding.status === 'static_verified'
-          let parsedUpdatedSpec: DeclarativeReplaySpec | undefined
-          let nextReplaySpecId = latestFinding.replaySpecId ?? undefined
-          let nextSourceOrigins = latestFinding.sourceOrigins
-          const extraEvidenceIds: string[] = []
-          let createdSpecRowId: string | undefined
-
-          if (args.replaySpec) {
-            const parsed = declarativeReplaySpecSchema.parse(args.replaySpec)
-            const specOrigins = replaySpecOrigins(parsed)
-            if (specOrigins.some(o => !currentApproved.has(o))) {
-              throw new BrokerDenied('Updated replay spec references an origin outside current approved scope.')
-            }
-            if (!isAlreadyVerified && refinementVerifyAttempts >= maxRefinementAttempts) {
-              return {
-                findingId: latestFinding.id,
-                replaySpecId: latestFinding.replaySpecId,
-                status: latestFinding.finding.status,
-                ...(latestFinding.verificationTier ? { verificationTier: latestFinding.verificationTier } : {}),
-                inlineVerifyFeedback: {
-                  verdict: 'inconclusive',
-                  controlPassed: false,
-                  assertionSummary: {
-                    observed: 'retry_limit_exceeded',
-                    expected: `<= ${maxRefinementAttempts} verification attempts`,
-                    reason: `Phase-3 refinement verification retry limit reached (maxInlineVerifyRetries=${maxInlineVerifyRetries}).`,
-                  },
-                  stepStatuses: [],
-                  retriesRemaining: 0,
-                } satisfies InlineVerifyFeedback,
-                updated: false,
-                isError: true,
-              }
-            }
-            parsedUpdatedSpec = parsed
-            nextSourceOrigins = [...new Set([...latestFinding.sourceOrigins, ...specOrigins])]
-            const createdSpec = this.storage.createReplaySpec(
-              curRun,
-              job.assignment,
-              latestFinding.id,
-              parsed,
-              nextSourceOrigins,
-              { initialAttemptCount: 0 },
-            )
-            createdSpecRowId = createdSpec.id
-            const ev = this.storage.addArtifact(curRun, job.assignment, 'replay',
-              `Refined replay spec · ${parsed.title}`,
-              JSON.stringify({ findingId: latestFinding.id, replaySpecId: createdSpec.id, specSha256: createdSpec.specSha256, spec: parsed }, null, 2),
-              undefined, currentSecrets())
-            extraEvidenceIds.push(ev.id)
-            collectedArtifactIds.push(ev.id)
-            if (!isAlreadyVerified) {
-              nextReplaySpecId = createdSpec.id
-            }
-          }
-          const updated = this.storage.updateProposedFinding(curRun, latestFinding.id, {
-            replaySpecId: nextReplaySpecId,
-            sourceOrigins: nextSourceOrigins,
-            ...(args.counterevidence !== undefined ? { counterevidence: args.counterevidence } : {}),
-            ...(args.confidenceRationale !== undefined ? { confidenceRationale: args.confidenceRationale } : {}),
-            ...(args.severityChangeConditions !== undefined ? { severityChangeConditions: args.severityChangeConditions } : {}),
-            ...(args.codeLocations !== undefined ? { codeLocations: args.codeLocations } : {}),
-            finding: {
-              ...(args.title ? { title: args.title } : {}),
-              ...(args.summary ? { reason: args.summary } : {}),
-              ...(!isAlreadyVerified && args.severity ? { severity: args.severity } : {}),
-              ...(!isAlreadyVerified && parsedUpdatedSpec ? { status: 'pending' as const } : {}),
-              ...(extraEvidenceIds.length ? { evidenceIds: extraEvidenceIds } : {}),
-            },
-          })
-          if (parsedUpdatedSpec && (args.verifyNow ?? true) && !isAlreadyVerified) {
-            refinementVerifyAttempts += 1
-            const inline = await this.executeInlineVerification({
-              job,
-              grant,
-              currentSecrets,
-              reposDir,
-              spec: parsedUpdatedSpec,
-              findingId: latestFinding.id,
-              replaySpecId: createdSpecRowId ?? nextReplaySpecId ?? specRow.id,
-              phase3RefinementAttempt: refinementVerifyAttempts,
-            })
-            lastInlineFeedback = inline.feedback
-            if (inline.artifactId) collectedArtifactIds.push(inline.artifactId)
-            return {
-              findingId: updated.id,
-              replaySpecId: inline.replaySpecId,
-              status: inline.status,
-              verificationTier: inline.verificationTier,
-              inlineVerifyFeedback: inline.feedback,
-              updated: true,
-            }
-          }
-          return {
-            findingId: updated.id,
-            replaySpecId: updated.replaySpecId,
-            status: updated.status,
-            updated: true,
-          }
-        },
-        record_coverage: async (args) => {
-          const curRun = this.check(job)
-          const currentApproved = this.approvedOriginsSet(curRun)
-          const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
-          if (!currentApproved.has(cleanOrigin)) throw new BrokerDenied(`Origin ${cleanOrigin} is not approved.`)
-          const ext = args as typeof args & { enforcingControl?: string; proofGapReason?: string; linkedFindingId?: string }
-          const entry = this.storage.upsertCoverageEntry(curRun, job.assignment.id, {
-            origin: cleanOrigin,
-            category: args.category,
-            status: args.status,
-            summary: args.summary,
-            enforcingControl: ext.enforcingControl,
-            proofGapReason: args.status === 'needs_follow_up' ? (ext.proofGapReason?.trim() || args.summary) : ext.proofGapReason,
-            linkedFindingId: ext.linkedFindingId,
-          })
-          return { id: entry.id, origin: entry.origin, category: entry.category, status: entry.status }
-        },
-        get_exchange: async ({ exchangeId, includeBody }, signal) => {
-          const curRun = this.check(job)
-          const currentApproved = this.approvedOriginsSet(curRun)
-          const ex = this.storage.getExchange(curRun.id, exchangeId)
-          if ([ex.origin, ex.finalOrigin, ...ex.redirectOrigins].some(o => !currentApproved.has(o))) {
-            throw new BrokerDenied('Exchange touches an origin outside current approved scope.')
-          }
-          let stagedPath: string | null = null
-          if (includeBody) {
-            stagedPath = await session.stage(`exchanges/${ex.id}.json`, JSON.stringify(ex, null, 2), signal).catch(() => null)
-          }
-          return { ...ex, body: includeBody ? ex.body.slice(0, 12_000) : undefined, stagedPath }
-        },
-        search_exchanges: async ({ query, origin, status, limit }) => {
-          const curRun = this.check(job)
-          const currentApproved = this.approvedOriginsSet(curRun)
-          return this.storage.searchExchanges(curRun.id, query, { approvedOrigins: currentApproved, origin, limit })
-            .filter(ex => status === undefined || ex.status === status)
-            .map(ex => ({
-              id: ex.id, origin: ex.origin, method: ex.method, pathAndQuery: ex.pathAndQuery,
-              status: ex.status, mediaType: ex.mediaType, bodyPreview: ex.bodyPreview.slice(0, 600),
-            }))
-        },
-        search_facts: async ({ query, origin, kind, limit }) => {
-          const curRun = this.check(job)
-          const currentApproved = this.approvedOriginsSet(curRun)
-          return this.storage.listFacts(curRun.id, { includeTainted: false, query, origin, kind, limit })
-            .filter(f => currentApproved.has(f.origin) && f.sourceOrigins.every(o => currentApproved.has(o)))
-        },
-        derive_evidence: async ({ command, outputs, timeoutMs }, signal) => {
-          const curRun = this.check(job)
-          const res = await session.exec(command, outputs ?? ['result.txt'], signal, timeoutMs ?? 60_000)
-          const ev = this.storage.addArtifact(curRun, job.assignment, 'analysis', 'Refinement derived evidence',
-            JSON.stringify({
-              command: redact(command, secrets),
-              exitStatus: res.exitCode,
-              stdout: redact(res.stdout, secrets),
-              stderr: redact(res.stderr, secrets),
-              outputs: res.outputs,
-            }, null, 2), undefined, secrets)
-          return { evidenceId: ev.id, exitCode: res.exitCode, stdout: res.stdout, stderr: res.stderr, outputs: res.outputs }
-        },
-        analyze_artifact: async (args, signal) => {
-          this.check(job)
-          const { tool, ...rest } = args
-          return await session.analyze(tool, rest, signal)
-        },
-        complete_intent: async (completion) => ({ recorded: true, status: completion.status }),
-      }
-
-      const maxRefineTurns = Math.max(1, Math.min(8, job.assignment.maxTurns || 8))
-      const refineInstructions = [
-        'You are Guardian v4’s Phase-3 Replay Spec Refinement specialist (strictly bounded 8-turn pass).',
-        'A submitted DeclarativeReplaySpec failed deterministic Zero-LLM verification. Inspect the sanitized InlineVerifyFeedback, prior exchanges, and facts.',
-        'If the vulnerability is real and the failure was a replay-spec bug (e.g. jq path/syntax error, missing extraction, wrong expectedStatus, or step ordering), call verify_replay_spec (or update_proposed_finding with verifyNow=true) with a repaired DeclarativeReplaySpec.',
-        'If the control genuinely blocks the exploit or the signal cannot be reproduced deterministically, close coverage cleanly via record_coverage ("ruled_out" with enforcingControl or "needs_follow_up" with proofGapReason) and call complete_intent.',
-        'You CANNOT mark a finding confirmed directly—only deterministic ReplayVerifier passing can confirm a finding.',
-      ].join('\n')
-
-      const refinePrompt = JSON.stringify({
-        finding: {
-          id: findingRow.id,
-          origin: findingRow.finding.origin,
-          title: findingRow.finding.title,
-          status: findingRow.finding.status,
-          category: findingRow.finding.category,
-          cwe: findingRow.finding.cwe,
-          severity: findingRow.finding.severity,
-        },
-        replaySpecId: specRow.id,
-        replaySpec: specRow.spec,
-        lastVerificationDiff: lastInlineFeedback,
-        maxTurns: maxRefineTurns,
-      }, null, 2)
-
-      const sessionResult = await runAgentSession({
-        directory: this.storage.directory,
-        sessionId: job.assignment.sessionId,
-        requestId: `refine:${specRow.id}:${run.goalRevision}:${run.scopeRevision}`,
-        profiles: reasoningPool,
-        scenario: 'worker-investigation',
-        roleAffinity: 'reasoning',
-        instructions: refineInstructions,
-        prompt: refinePrompt,
-        signal: job.controller.signal,
-        maxTurns: maxRefineTurns,
-        compaction: false,
-        enableSettlement: false,
-        requireCompleteIntent: true,
-        handlers: refinementHandlers,
-        secrets,
-        beforeCall: () => {
-          this.check(job)
-          if (this.storage.checkBudgetExceeded(run.id)) {
-            throw new BudgetExceededError('Run spend or request budget exceeded.')
-          }
-        },
-        onUsage: usage => {
-          this.storage.recordLlmSpend(run.id, {
-            usd: usage.costUsd,
-            tokens: usage.inputTokens + usage.outputTokens,
-          })
-        },
-        onTurn: turn => {
-          this.storage.updateWorker(job.assignment.id, { turnsUsed: turn })
-          this.storage.recordLlmSpend(run.id, { turns: 1 })
-        },
-        onProfileSuccess: id => recordProfileSuccess(id, this.storage),
-        onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
-      })
-
-      // Mandatory Post-Refinement Zero-LLM Gate
-      const latestRun = this.check(job)
-      let currentFinding = this.storage.db.select().from(findings).where(and(
-        eq(findings.runId, latestRun.id), eq(findings.id, findingRow.id),
-      )).get()
-      const activeSpecId = currentFinding?.replaySpecId ?? specRow.id
-      const currentSpec = this.storage.getReplaySpec(latestRun.id, activeSpecId)
-
-      if (currentFinding && currentFinding.finding.status === 'pending') {
-        const nextAttempt = refinementVerifyAttempts + 1
-        refinementVerifyAttempts = nextAttempt
-        const inline = await this.executeInlineVerification({
-          job,
-          grant,
-          currentSecrets,
-          reposDir,
-          spec: currentSpec.spec,
-          findingId: currentFinding.id,
-          replaySpecId: currentSpec.id,
-          phase3RefinementAttempt: nextAttempt,
-        })
-        lastInlineFeedback = inline.feedback
-        if (inline.artifactId) collectedArtifactIds.push(inline.artifactId)
-        currentFinding = this.storage.db.select().from(findings).where(and(
-          eq(findings.runId, latestRun.id), eq(findings.id, findingRow.id),
-        )).get()
-        if (currentFinding && currentFinding.finding.status === 'pending') {
-          const fallbackStatus: Finding['status'] =
-            lastInlineFeedback?.verdict === 'dismissed' ? 'dismissed' : 'inconclusive'
-          this.storage.updateProposedFinding(latestRun, currentFinding.id, {
-            verificationTier: null,
-            finding: {
-              status: fallbackStatus,
-              verificationTier: undefined,
-              confidence: fallbackStatus === 'dismissed' ? 'medium' : 'low',
-              reason: redact(
-                inline.feedback.assertionSummary?.reason ||
-                currentFinding.finding.reason ||
-                `Phase-3 refinement retry limit reached (maxInlineVerifyRetries=${maxInlineVerifyRetries}).`,
-                currentSecrets(),
-              ),
-            },
-          })
-          currentFinding = this.storage.db.select().from(findings).where(and(
-            eq(findings.runId, latestRun.id), eq(findings.id, findingRow.id),
-          )).get()
-        }
-      }
-
-      const finalStatus = currentFinding?.finding.status ?? 'inconclusive'
-      lastExchangeIds = [...(currentFinding?.finding.exchangeIds ?? lastExchangeIds)]
-
-      if (finalStatus !== 'confirmed' && finalStatus !== 'static_verified') {
-        const latestDiff = currentSpec.lastVerificationDiff ?? lastInlineFeedback
-        const targetCategory = currentSpec.spec.category as OwaspCategory
-        if (owaspCategories.includes(targetCategory) && this.permitted(latestRun, currentSpec.spec.origin)) {
-          const existingCov = this.storage.listCoverageEntries(latestRun.id, latestRun.goalRevision)
-            .find(c => c.origin === currentSpec.spec.origin && c.category === targetCategory)
-          const alreadyClosed = existingCov &&
-            (existingCov.status === 'reported' || existingCov.status === 'ruled_out' || existingCov.status === 'needs_follow_up')
-          if (!alreadyClosed) {
-            if (finalStatus === 'dismissed' && latestDiff?.controlPassed) {
-              this.storage.upsertCoverageEntry(latestRun, job.assignment.id, {
-                origin: currentSpec.spec.origin,
-                category: targetCategory,
-                status: 'ruled_out',
-                summary: `Ruled out after Phase-3 refinement: ${currentSpec.spec.title}`,
-                enforcingControl: lastExchangeIds[0] || `replay:${currentSpec.id}`,
-              })
-            } else {
-              this.storage.upsertCoverageEntry(latestRun, job.assignment.id, {
-                origin: currentSpec.spec.origin,
-                category: targetCategory,
-                status: 'needs_follow_up',
-                summary: `Unconfirmed after Phase-3 8-turn refinement: ${currentSpec.spec.title}`,
-                proofGapReason: latestDiff?.assertionSummary?.reason ||
-                  latestDiff?.assertionSummary?.observed ||
-                  currentFinding?.finding.reason ||
-                  'Phase-3 refinement could not confirm finding deterministically.',
-              })
-            }
-          }
-        }
-      }
-
-      const summary = sessionResult.completion
-        ? `[${sessionResult.completion.status}] Phase-3 refinement (${finalStatus}): ${sessionResult.completion.summary}`
-        : `Phase-3 refinement finished (${finalStatus}): ${sessionResult.answer.slice(0, 160)}`
-      this.completeWorker(job.assignment, this.check(job), summary, collectedArtifactIds, undefined, currentSecrets())
-    } finally {
-      await session.close().catch(() => undefined)
     }
   }
 
