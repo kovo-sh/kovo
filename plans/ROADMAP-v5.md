@@ -702,3 +702,20 @@ All four over-claim rows are `agent_only` provenance:
 Actions: `status-diff-guard` closes the 5xx-only confirmation loophole generally (a status-only 2xx→5xx divergence may never confirm; injection needs a DB/error fingerprint, boolean/timing arm, or OOB callback, while payload-induced 5xx keeps counting as *probe* evidence). `agent-fp-triage` makes a truth ruling on 1 and 4 from the fixture source (genuine / unintended / over-claim) and forbids silent truth inflation. 3 is already owned by `catalog-public`.
 
 **Certification:** lift claims stay halted. Worst-run precision is the gate, and it is 83.3% on held-out until these are ruled and closed.
+
+### 2026-11-24 — hourly check-in #14: two recall metrics, per-class status ban, no truth inflation, stalls not early-exit
+
+**Triage (accept/reject/defer):**
+
+| # | Recommendation | Verdict | Owner |
+|---|---|---|---|
+| 1 | Track **two** numbers: (a) **Total Product Recall** (unified `Execution`) ≥68% dev (≥40/59) and ≥55% salted held-out (≥32/58) at 100% worst-run precision, rewarding floor and lift equally; (b) a **frozen floor reference** (36/59 dev, 28/58 held-out) so floor gains don't move the goalposts | **ACCEPT** | certification |
+| 2 | **Anti-inert agentic guard**: still require **≥ +4 net-new** over the current floor (held-out +1 is too low) plus reason-bench lift where `--no-llm` = 0/28 | **ACCEPT** | certification |
+| 3 | **Ban bare status-only confirmation across all classes** (2xx→5xx or 2xx→4xx alone never confirms). Injection needs a semantic oracle: specific DB/parser/template fingerprint (never generic 500), paired boolean delta ≥2 rounds, jitter-tolerant timing, evaluated canary, or verified OOB. Status-only boolean SQLi allowed **only** with a tautology-vs-contradiction contrast plus a benign 200 baseline (keeps xben's 5 targets) | **ACCEPT** | `status-diff-guard` |
+| 4 | Authz family: 204 writes / 3xx redirects need `control_denied + variant_succeeded + non-public data (variantBody !== anonBody)` for reads, a clean post-GET readback for writes, or a canary host match for redirects. `anon = 401` is **not** an acceptable control for an authenticated cross-tenant write, and the finding route must bind to the mutating exchange (fixes the `GET /api/me` misattribution) | **ACCEPT** | `status-diff-guard` |
+| 5 | Over-claims triage: strict 3-way rule — faulty control/misattributed route ⇒ **verifier fix + Tier-0 archetype** (no fixture change); genuinely exploitable unintended bug ⇒ **harden fixture + CHANGELOG** (preferred, keeps N = 58); promote to truth **only** with an explicit versioned denominator bump. No ungraded "known gap" bucket | **ACCEPT** | `agent-fp-triage` |
+| 6 | Do **not** require legacy replay specs for `agent_only` confirmations — `guardian_verify` receipts are already persisted, replayable and double-run verified; reverting would reintroduce the `replay_spec_miss` wall and lock in the VM | **ACCEPT (rejected my own suggestion)** | — |
+| 7 | Throughput: do **not** widen early-exit; fix provider stalls and pooling — per-turn **no-token timeout 25–30 s** with one fast retry, and **warm-pool K=6** containers within run+tenant | **ACCEPT** | `stall-warmpool` |
+| 8 | Batch order: close the 3 over-claims to 100% precision → then Realism #4 (0/3 → ≥2/3) + stall/warm-pool → then `cut3b-parity` | **ACCEPT** | coordinator |
+
+**Certification definition update (adopted):** a lift claim now requires BOTH bars — Total Product Recall (≥40/59 dev, ≥32/58 held-out) at 100% worst-run precision, and ≥+4 net-new over the frozen floor snapshot. Current: dev 14+? / held-out **+1**. Still red.
