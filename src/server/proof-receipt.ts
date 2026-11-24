@@ -50,6 +50,12 @@ export const proofReceiptSchema = z.object({
   proofPatterns: z.array(z.string().trim().min(4).max(200)).max(4).optional(),
   /** When the injected value reached the target; a callback before this is not causal. */
   injectedAtMs: z.number().int().nonnegative().optional(),
+  /** Optional conserved-balance hints for `conserved_balance` receipts (always verified against host JSON). */
+  conservedBalance: z.object({
+    balanceField: z.string().trim().min(1).max(64).optional(),
+    capField: z.string().trim().min(1).max(64).optional(),
+    unitDebit: z.number().positive().optional(),
+  }).optional(),
 })
 export type ProofReceipt = z.output<typeof proofReceiptSchema>
 
@@ -104,7 +110,7 @@ export interface ReceiptVerification {
   confirmed: boolean
   vulnClass: string
   /** Rule family used to validate the receipt. */
-  rule: 'impact' | 'oob' | 'timing' | 'boolean' | 'status_differential' | 'browser' | 'redirect' | 'none'
+  rule: 'impact' | 'oob' | 'timing' | 'boolean' | 'status_differential' | 'browser' | 'redirect' | 'conserved_balance' | 'none'
   reason: string
   observed: string
   expected: string
@@ -112,7 +118,7 @@ export interface ReceiptVerification {
 }
 
 const OOB_CLASS_RE = /^(?:ssrf|xxe|blind_ssrf|blind_xxe|oob|webhook_forgery)$/i
-const TIMING_CLASS_RE = /^(?:blind_sqli|sqli_time|sql_time|timing|race)$/i
+const TIMING_CLASS_RE = /^(?:blind_sqli|sqli_time|sql_time|timing)$/i
 const BOOLEAN_CLASS_RE = /^(?:sqli|sql_boolean|sql_boolean_diff|boolean_sqli|boolean_differential)$/i
 /**
  * The paired status-boolean shape: a benign 2xx baseline, a 2xx tautology arm and a <500
@@ -122,6 +128,7 @@ const BOOLEAN_CLASS_RE = /^(?:sqli|sql_boolean|sql_boolean_diff|boolean_sqli|boo
  */
 const STATUS_DIFF_CLASS_RE = /^(?:sqli_status|sql_status|sql_status_diff|status_sqli|status_boolean)$/i
 const REDIRECT_CLASS_RE = /^(?:open_redirect|redirect|url_redirect|unvalidated_redirect)$/i
+const CONSERVED_BALANCE_CLASS_RE = /^(?:race|race_double_spend|race_condition|race_burst|double_spend|oversell|inventory_oversell|conserved_balance|toctou)$/i
 
 const IMPACT_CLASS_BY_VULN: Readonly<Record<string, ImpactClass>> = {
   bola: 'authorization',
@@ -168,6 +175,7 @@ export function receiptRuleFor(vulnClass: string): { rule: ReceiptVerification['
   if (STATUS_DIFF_CLASS_RE.test(vulnClass)) return { rule: 'status_differential' }
   if (BOOLEAN_CLASS_RE.test(vulnClass)) return { rule: 'boolean' }
   if (TIMING_CLASS_RE.test(vulnClass)) return { rule: 'timing' }
+  if (CONSERVED_BALANCE_CLASS_RE.test(vulnClass)) return { rule: 'conserved_balance' }
   if (REDIRECT_CLASS_RE.test(vulnClass)) return { rule: 'redirect' }
   const impactClass = IMPACT_CLASS_BY_VULN[vulnClass.toLowerCase()]
   if (impactClass) return { rule: 'impact', impactClass }
@@ -462,6 +470,10 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     }
   }
 
+  if (rule === 'conserved_balance') {
+    return verifyConservedBalanceReceipt(receipt, entriesById)
+  }
+
   // Impact rules: re-run the shared oracle model over the recorded steps.
   if (receipt.exchangeIds.length === 0) return reject(receipt, rule, 'An impact receipt needs at least one recorded exchange.')
   const steps = receipt.exchangeIds.map(id => entriesById.get(id)!.step)
@@ -517,6 +529,322 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     observed: receipt.claimedDelta,
     expected: 'an authorized actor or control shows the boundary the probe crossed',
     evidence: assessment.evidence,
+  }
+}
+
+const CONSERVED_FIELD_RE = /(?:balance|credit|stock|inventory|quantity|qty|remaining|available|quota|seat|used|count|redeem|funds|points|tokens|amount)/i
+const CONSERVED_CAP_FIELD_RE = /(?:limit|max|cap|quota|seat_limit|max_redemptions|max_uses|capacity)/i
+const CONSERVED_IGNORE_FIELD_RE = /^(?:id|status|code|version|timestamp|created_at|updated_at|http_status|ok|error)$/i
+const REQUEST_DEBIT_FIELD_RE = /^(?:amount|quantity|qty|debit|delta|value|count|seats|points|credits|transfer_amount|redeem_amount)$/i
+
+const BASELINE_READ_ROLES = new Set(['baseline_read', 'pre_read', 'baseline_balance', 'balance_before', 'pre_burst_read'])
+const POST_READ_ROLES = new Set(['post_read', 'post_burst_read', 'after_read', 'balance_after'])
+const SERIAL_PRE_ROLES = new Set(['serial_pre_read', 'serial_baseline_read', 'serial_before_read'])
+const SERIAL_POST_ROLES = new Set(['serial_post_read', 'serial_after_read', 'serial_read', 'serial_balance_after'])
+const BURST_ROLE_RE = /^(?:burst|race_burst|concurrent)(?:[_-].*)?$/i
+const SERIAL_MUTATION_ROLE_RE = /^serial(?:_(?:control|mutation|probe|step|request|debit))?(?:_\d+)?$/i
+
+const is2xxStatus = (status: number | null): boolean => status !== null && status >= 200 && status < 300
+const is4xxRejection = (status: number | null): boolean =>
+  status !== null && (status === 400 || status === 403 || status === 404 || status === 409 || status === 410 || status === 422)
+
+function parseStepJson(step: ImpactStep): unknown {
+  if (step.json !== undefined) return step.json
+  if (typeof step.body === 'string' && step.body.trim()) {
+    try { return JSON.parse(step.body) } catch { return undefined }
+  }
+  return undefined
+}
+
+/** Collect finite numeric leaf fields up to depth 2 (e.g. `balance`, `wallet.balance`, `seats_used`). */
+function extractNumericFields(value: unknown, prefix = '', depth = 0, out = new Map<string, number>()): Map<string, number> {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || depth > 2) return out
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    const path = prefix ? `${prefix}.${key}` : key
+    if (typeof entry === 'number' && Number.isFinite(entry)) {
+      if (!out.has(path)) out.set(path, entry)
+      if (prefix && !out.has(key)) out.set(key, entry)
+    } else if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+      extractNumericFields(entry, path, depth + 1, out)
+    }
+  }
+  return out
+}
+
+function numericFieldFrom(step: ImpactStep, fieldName: string): number | null {
+  const fields = extractNumericFields(parseStepJson(step))
+  const direct = fields.get(fieldName)
+  if (direct !== undefined) return direct
+  const lowered = fieldName.toLowerCase()
+  for (const [key, val] of fields.entries()) {
+    if (key.toLowerCase() === lowered) return val
+  }
+  return null
+}
+
+function sharedConservedField(
+  baseline: ImpactStep,
+  post: ImpactStep,
+  explicitField?: string,
+): { field: string; pre: number; post: number } | null {
+  if (explicitField) {
+    const pre = numericFieldFrom(baseline, explicitField)
+    const after = numericFieldFrom(post, explicitField)
+    return pre !== null && after !== null ? { field: explicitField, pre, post: after } : null
+  }
+  const preFields = extractNumericFields(parseStepJson(baseline))
+  const postFields = extractNumericFields(parseStepJson(post))
+  const candidates: Array<{ field: string; pre: number; post: number; priority: number }> = []
+  for (const [field, pre] of preFields.entries()) {
+    const leaf = field.split('.').pop() ?? field
+    if (CONSERVED_IGNORE_FIELD_RE.test(leaf)) continue
+    const after = postFields.get(field)
+    if (after === undefined) continue
+    if (!CONSERVED_FIELD_RE.test(leaf)) continue
+    // Prefer conserved balance/stock/remaining/used fields over cap/limit fields.
+    const isCap = CONSERVED_CAP_FIELD_RE.test(leaf) && !/(?:used|remaining|available|balance|stock|credit)/i.test(leaf)
+    const priority = (isCap ? 0 : 2) + (pre !== after ? 1 : 0)
+    candidates.push({ field, pre, post: after, priority })
+  }
+  candidates.sort((a, b) => b.priority - a.priority || a.field.length - b.field.length || a.field.localeCompare(b.field))
+  return candidates[0] ? { field: candidates[0].field, pre: candidates[0].pre, post: candidates[0].post } : null
+}
+
+function findCapValue(baseline: ImpactStep, post: ImpactStep, balanceField: string, explicitCapField?: string): { field: string; value: number } | null {
+  if (explicitCapField) {
+    const val = numericFieldFrom(post, explicitCapField) ?? numericFieldFrom(baseline, explicitCapField)
+    return val !== null ? { field: explicitCapField, value: val } : null
+  }
+  const combined = new Map([...extractNumericFields(parseStepJson(baseline)), ...extractNumericFields(parseStepJson(post))])
+  for (const [field, value] of combined.entries()) {
+    if (field === balanceField) continue
+    const leaf = field.split('.').pop() ?? field
+    if (CONSERVED_CAP_FIELD_RE.test(leaf) && value > 0) return { field, value }
+  }
+  return null
+}
+
+function requestDebitOf(step: ImpactStep, fallbackUnitDebit: number): number {
+  if (step.requestJson && typeof step.requestJson === 'object' && !Array.isArray(step.requestJson)) {
+    const fields = extractNumericFields(step.requestJson)
+    for (const [field, value] of fields.entries()) {
+      const leaf = field.split('.').pop() ?? field
+      if (REQUEST_DEBIT_FIELD_RE.test(leaf) && value > 0) return value
+    }
+  }
+  return fallbackUnitDebit
+}
+
+/**
+ * Fail-closed `conserved_balance` receipt rule for race / double-spend / inventory-oversell proofs.
+ * Requires host-recorded transcript evidence of:
+ *   1. A 2xx baseline numeric readback before the burst,
+ *   2. >=2 acknowledged (2xx) concurrent burst mutations (rejecting 5xx/4xx-only bursts),
+ *   3. A 2xx post-burst numeric readback on the same conserved field proving a conservation
+ *      violation (under-debit, negative balance/stock, or cap/quota overshoot — never status-only),
+ *   4. A passing serial control exchange proving the conservation boundary holds serially (either
+ *      serial debit matches expected debit without going negative, or serial mutation is rejected
+ *      with 4xx once depleted/used).
+ */
+function verifyConservedBalanceReceipt(
+  receipt: ProofReceipt,
+  entriesById: ReadonlyMap<string, ReceiptTranscriptEntry>,
+): ReceiptVerification {
+  const rule = 'conserved_balance' as const
+  if (receipt.exchangeIds.length < 4) {
+    return reject(
+      receipt,
+      rule,
+      'A conserved_balance receipt requires baseline readback, >=2 burst mutations, post-burst readback, and a serial control.',
+    )
+  }
+  const cited = receipt.exchangeIds.map(id => entriesById.get(id)!)
+  const roleOf = (entry: ReceiptTranscriptEntry): string => (entry.evidenceRole ?? '').trim().toLowerCase()
+
+  const burstIndices: number[] = []
+  cited.forEach((entry, index) => {
+    const role = roleOf(entry)
+    if (BURST_ROLE_RE.test(role) || (!role && entry.step.arm === 'probe' && stepMutatesState(entry.step))) {
+      burstIndices.push(index)
+    }
+  })
+  if (burstIndices.length < 2) {
+    return reject(receipt, rule, 'A conserved_balance receipt requires at least 2 concurrent mutation exchanges.')
+  }
+  const firstBurstIdx = burstIndices[0]!
+  const lastBurstIdx = burstIndices[burstIndices.length - 1]!
+  const burstEntries = burstIndices.map(i => cited[i]!)
+
+  if (receipt.target.method && burstEntries.every(entry => entry.step.method.toUpperCase() !== receipt.target.method)) {
+    return reject(receipt, rule, 'The cited burst exchange method does not match the receipt target.')
+  }
+  if (receipt.target.pathAndQuery) {
+    const wanted = normalizePath(receipt.target.pathAndQuery)
+    if (burstEntries.every(entry => routeOf(entry.step) !== wanted)) {
+      return reject(receipt, rule, 'The cited burst exchange route does not match the receipt target.')
+    }
+  }
+
+  const ackedBurst = burstEntries.filter(entry => is2xxStatus(entry.step.status))
+  if (ackedBurst.length === 0) {
+    return reject(receipt, rule, 'The concurrent burst produced no 2xx acknowledged mutations (5xx/4xx-only bursts never prove a race).')
+  }
+  if (ackedBurst.length < 2) {
+    return reject(receipt, rule, `Only ${ackedBurst.length} concurrent mutation was acknowledged; a conserved_balance proof requires >=2 acknowledged concurrent mutations.`)
+  }
+
+  // Locate baseline readback (before the burst).
+  let baselineIdx = cited.findIndex((entry, index) => index < firstBurstIdx && BASELINE_READ_ROLES.has(roleOf(entry)))
+  if (baselineIdx < 0) {
+    baselineIdx = cited.findIndex((entry, index) =>
+      index < firstBurstIdx && (entry.step.arm === 'setup' || entry.step.arm === 'control') && is2xxStatus(entry.step.status))
+  }
+  if (baselineIdx < 0 || !is2xxStatus(cited[baselineIdx]!.step.status)) {
+    return reject(receipt, rule, 'A conserved_balance receipt requires a 2xx baseline numeric readback before the burst.')
+  }
+  const baselineEntry = cited[baselineIdx]!
+
+  // Locate post-burst readback (after the burst, before any serial post-read).
+  let postIdx = cited.findIndex((entry, index) => index > lastBurstIdx && POST_READ_ROLES.has(roleOf(entry)))
+  if (postIdx < 0) {
+    postIdx = cited.findIndex((entry, index) =>
+      index > lastBurstIdx &&
+      !SERIAL_MUTATION_ROLE_RE.test(roleOf(entry)) &&
+      !SERIAL_POST_ROLES.has(roleOf(entry)) &&
+      !SERIAL_PRE_ROLES.has(roleOf(entry)) &&
+      (entry.step.arm === 'control' || entry.step.arm === 'cleanup' || entry.step.arm === 'setup') &&
+      is2xxStatus(entry.step.status))
+  }
+  if (postIdx < 0 || !is2xxStatus(cited[postIdx]!.step.status)) {
+    return reject(receipt, rule, 'A conserved_balance receipt requires a 2xx post-burst numeric readback after the burst.')
+  }
+  const postEntry = cited[postIdx]!
+
+  const conserved = sharedConservedField(baselineEntry.step, postEntry.step, receipt.conservedBalance?.balanceField)
+  if (!conserved) {
+    return reject(
+      receipt,
+      rule,
+      'Baseline and post-burst readbacks lack a shared numeric conserved field (status-only differential without numeric delta is rejected).',
+    )
+  }
+
+  const unitDebit = receipt.conservedBalance?.unitDebit ?? 1
+  const expectedBurstDebit = ackedBurst.reduce((sum, entry) => sum + requestDebitOf(entry.step, unitDebit), 0)
+  const actualBurstDebit = conserved.pre - conserved.post
+  const cap = findCapValue(baselineEntry.step, postEntry.step, conserved.field, receipt.conservedBalance?.capField)
+
+  // Locate serial control exchanges (must prove conservation holds serially).
+  const serialMutations = cited.filter((entry, index) => {
+    if (index === baselineIdx || index === postIdx || burstIndices.includes(index)) return false
+    const role = roleOf(entry)
+    if (SERIAL_PRE_ROLES.has(role) || SERIAL_POST_ROLES.has(role)) return false
+    return SERIAL_MUTATION_ROLE_RE.test(role) || (entry.step.arm === 'control' && stepMutatesState(entry.step))
+  })
+  const serialPreEntry = cited.find(entry => SERIAL_PRE_ROLES.has(roleOf(entry)))
+  const serialPostEntry = cited.find((entry, index) =>
+    index !== baselineIdx && index !== postIdx && !burstIndices.includes(index) && SERIAL_POST_ROLES.has(roleOf(entry)))
+
+  if (serialMutations.length === 0) {
+    return reject(receipt, rule, 'A conserved_balance receipt requires a serial control exchange proving the conservation boundary holds serially.')
+  }
+  const serial5xx = serialMutations.filter(entry => entry.step.status !== null && entry.step.status >= 500)
+  const serial2xx = serialMutations.filter(entry => is2xxStatus(entry.step.status))
+  const serial4xx = serialMutations.filter(entry => is4xxRejection(entry.step.status))
+
+  if (serial2xx.length === 0 && serial4xx.length === 0) {
+    return reject(
+      receipt,
+      rule,
+      serial5xx.length > 0
+        ? 'Serial control returned 5xx; cannot prove the conservation boundary holds serially.'
+        : 'Serial control produced neither a verified serial debit nor a 4xx conservation rejection.',
+    )
+  }
+
+  let serialControlKind: 'serial_debit_exact' | 'serial_rejection' | null = null
+  let serialDebitObserved: number | null = null
+  if (serial2xx.length > 0) {
+    if (!serialPostEntry || !is2xxStatus(serialPostEntry.step.status)) {
+      return reject(receipt, rule, 'Serial control mutations succeeded without a 2xx post-serial numeric readback proving exact serial debit.')
+    }
+    const serialPreVal = serialPreEntry && is2xxStatus(serialPreEntry.step.status)
+      ? numericFieldFrom(serialPreEntry.step, conserved.field)
+      : conserved.post
+    const serialPostVal = numericFieldFrom(serialPostEntry.step, conserved.field)
+    if (serialPreVal === null || serialPostVal === null) {
+      return reject(receipt, rule, `Serial control readback is missing numeric field "${conserved.field}".`)
+    }
+    const expectedSerialDebit = serial2xx.reduce((sum, entry) => sum + requestDebitOf(entry.step, unitDebit), 0)
+    const decreasing = conserved.post <= conserved.pre && !cap
+    const serialDelta = decreasing ? serialPreVal - serialPostVal : serialPostVal - serialPreVal
+    if (decreasing && serialPostVal < 0) {
+      return reject(receipt, rule, 'Serial control itself drove the conserved balance negative (not a concurrency/race boundary).')
+    }
+    if (cap && serialPostVal > cap.value) {
+      return reject(receipt, rule, `Serial control itself exceeded cap "${cap.field}" (${serialPostVal} > ${cap.value}); not a concurrency boundary.`)
+    }
+    if (serialDelta < expectedSerialDebit - 1e-6) {
+      return reject(
+        receipt,
+        rule,
+        `Serial control under-debited (${serialDelta} vs expected ${expectedSerialDebit}); conservation does not hold serially.`,
+      )
+    }
+    serialControlKind = 'serial_debit_exact'
+    serialDebitObserved = serialDelta
+  } else {
+    // Pure serial rejection (4xx once depleted/already-redeemed): verify serialPost (if given) did not violate further.
+    if (serialPostEntry && is2xxStatus(serialPostEntry.step.status)) {
+      const afterSerial = numericFieldFrom(serialPostEntry.step, conserved.field)
+      if (afterSerial !== null && Math.abs(afterSerial - conserved.post) > 1e-6) {
+        return reject(receipt, rule, 'Rejected serial control still mutated the conserved field; serial boundary did not hold.')
+      }
+    }
+    serialControlKind = 'serial_rejection'
+  }
+
+  // Evaluate conservation violation on the concurrent burst.
+  let violationKind: 'under_debit' | 'negative_balance' | 'cap_overshoot' | null = null
+  if (conserved.pre >= 0 && conserved.post < 0) {
+    violationKind = 'negative_balance'
+  } else if (cap && conserved.pre <= cap.value && conserved.post > cap.value) {
+    violationKind = 'cap_overshoot'
+  } else if (conserved.pre >= 0 && conserved.post >= 0 && actualBurstDebit < expectedBurstDebit - 1e-6) {
+    // Require concrete movement (either burst debited >0 but <expected, OR serial control proved a
+    // single serial mutation debits >0 while the concurrent burst debited less than expected).
+    const provedMutating = actualBurstDebit > 1e-6 || (serialDebitObserved !== null && serialDebitObserved > 1e-6)
+    if (provedMutating) violationKind = 'under_debit'
+  }
+
+  if (!violationKind) {
+    return reject(
+      receipt,
+      rule,
+      `Numeric readbacks on "${conserved.field}" (${conserved.pre} -> ${conserved.post} across ${ackedBurst.length} acked burst mutations, expected debit ${expectedBurstDebit}) show no conservation violation (no under-debit, negative balance, or cap overshoot).`,
+    )
+  }
+
+  return {
+    confirmed: true,
+    vulnClass: receipt.vulnClass,
+    rule,
+    reason: `Conserved-balance violation (${violationKind}) on "${conserved.field}": ${ackedBurst.length} concurrent mutations acknowledged (${conserved.pre} -> ${conserved.post}, expected debit ${expectedBurstDebit}, actual debit ${actualBurstDebit}) while serial control (${serialControlKind}) preserved the conservation boundary.`,
+    observed: receipt.claimedDelta,
+    expected: `concurrent mutations preserve "${conserved.field}" conservation identically to serial execution`,
+    evidence: {
+      balanceField: conserved.field,
+      preBalance: conserved.pre,
+      postBalance: conserved.post,
+      ackedBurstCount: ackedBurst.length,
+      totalBurstCount: burstEntries.length,
+      expectedBurstDebit,
+      actualBurstDebit,
+      violationKind,
+      serialControlKind,
+      ...(serialDebitObserved !== null ? { serialDebitObserved } : {}),
+      ...(cap ? { capField: cap.field, capValue: cap.value } : {}),
+    },
   }
 }
 
@@ -704,7 +1032,12 @@ export function buildAgentScriptReceipt(input: {
   const orderById = new Map(input.exchanges.map((exchange, index) => [exchange.exchangeId, index]))
   const buildTranscript = (
     armOverrides: ReadonlyMap<string, ImpactStep['arm']>,
-    extra?: { requestJson?: unknown; ambientAuth?: ImpactStep['actor']['auth']; sameSite?: string | null },
+    extra?: {
+      requestJson?: unknown
+      ambientAuth?: ImpactStep['actor']['auth']
+      sameSite?: string | null
+      evidenceRoleOverrides?: ReadonlyMap<string, string>
+    },
   ): ReceiptTranscript => ({
     entries: input.exchanges.map(exchange => ({
       exchangeId: exchange.exchangeId,
@@ -718,7 +1051,9 @@ export function buildAgentScriptReceipt(input: {
       ...(exchange.body !== undefined
         ? { carrierText: `${exchange.pathAndQuery}\n${JSON.stringify(exchange.requestHeaders ?? {})}\n${exchange.body}` }
         : {}),
-      ...(exchange.sessionRole ? { evidenceRole: exchange.sessionRole } : {}),
+      ...(extra?.evidenceRoleOverrides?.has(exchange.exchangeId)
+        ? { evidenceRole: extra.evidenceRoleOverrides.get(exchange.exchangeId)! }
+        : exchange.sessionRole ? { evidenceRole: exchange.sessionRole } : {}),
     })),
   })
   const cited = (ids: readonly string[]) => ids.filter(id => byId.has(id))
@@ -850,6 +1185,87 @@ export function buildAgentScriptReceipt(input: {
           oobEventIds: [],
           browserTraceIds: [],
           claimedDelta: `${input.title} — timing separation over ${controls.length}/${variants.length} recorded arms.`.slice(0, 1200),
+        }),
+        transcript,
+      }
+    }
+    if (kind === 'conserved_balance' || kind === 'race') {
+      const rawBaseline = recordField(claim, 'baselineExchangeId') ?? recordField(claim, 'beforeExchangeId')
+      const baselineId = typeof rawBaseline === 'string' && byId.has(rawBaseline) ? rawBaseline : null
+      const rawPost = recordField(claim, 'postExchangeId') ?? recordField(claim, 'afterExchangeId')
+      const postId = typeof rawPost === 'string' && byId.has(rawPost) ? rawPost : null
+      const burstIds = cited(stringArray(recordField(claim, 'burstExchangeIds') ?? recordField(claim, 'exchangeIds')))
+      const serialIds = cited(stringArray(recordField(claim, 'serialExchangeIds') ?? recordField(claim, 'controlExchangeIds')))
+      const rawSerialPre = recordField(claim, 'serialPreExchangeId')
+      const serialPreId = typeof rawSerialPre === 'string' && byId.has(rawSerialPre) ? rawSerialPre : null
+      const rawSerialPost = recordField(claim, 'serialPostExchangeId')
+      const serialPostId = typeof rawSerialPost === 'string' && byId.has(rawSerialPost) ? rawSerialPost : null
+      if (!baselineId || !postId || burstIds.length < 2 || serialIds.length === 0) continue
+      const firstBurst = byId.get(burstIds[0]!)
+      if (!firstBurst) continue
+      const armOverrides = new Map<string, ImpactStep['arm']>()
+      const evidenceRoleOverrides = new Map<string, string>()
+      armOverrides.set(baselineId, 'setup')
+      evidenceRoleOverrides.set(baselineId, 'baseline_read')
+      burstIds.forEach((id, index) => {
+        armOverrides.set(id, 'probe')
+        evidenceRoleOverrides.set(id, `burst_${index + 1}`)
+      })
+      armOverrides.set(postId, 'control')
+      evidenceRoleOverrides.set(postId, 'post_read')
+      if (serialPreId) {
+        armOverrides.set(serialPreId, 'control')
+        evidenceRoleOverrides.set(serialPreId, 'serial_pre_read')
+      }
+      serialIds.forEach((id, index) => {
+        armOverrides.set(id, 'control')
+        evidenceRoleOverrides.set(id, `serial_control_${index + 1}`)
+      })
+      if (serialPostId) {
+        armOverrides.set(serialPostId, 'control')
+        evidenceRoleOverrides.set(serialPostId, 'serial_post_read')
+      }
+      const exchangeIds = [...new Set([
+        baselineId,
+        ...burstIds,
+        postId,
+        ...(serialPreId ? [serialPreId] : []),
+        ...serialIds,
+        ...(serialPostId ? [serialPostId] : []),
+      ])]
+      const transcript = buildTranscript(armOverrides, {
+        ...(recordField(claim, 'requestBody') !== undefined ? { requestJson: recordField(claim, 'requestBody') } : {}),
+        evidenceRoleOverrides,
+      })
+      const rawClass = recordField(claim, 'vulnClass')
+      const vulnClass = typeof rawClass === 'string' && CONSERVED_BALANCE_CLASS_RE.test(rawClass.trim())
+        ? rawClass.trim()
+        : 'race_double_spend'
+      const balanceField = typeof recordField(claim, 'balanceField') === 'string' ? (recordField(claim, 'balanceField') as string).trim() : ''
+      const capField = typeof recordField(claim, 'capField') === 'string' ? (recordField(claim, 'capField') as string).trim() : ''
+      const unitDebitRaw = recordField(claim, 'unitDebit')
+      const unitDebit = typeof unitDebitRaw === 'number' && Number.isFinite(unitDebitRaw) && unitDebitRaw > 0 ? unitDebitRaw : undefined
+      return {
+        receipt: buildProofReceipt({
+          vulnClass,
+          target: {
+            origin: firstBurst.origin || input.origin,
+            method: firstBurst.method.toUpperCase(),
+            pathAndQuery: firstBurst.pathAndQuery,
+          },
+          exchangeIds,
+          oobEventIds: [],
+          browserTraceIds: [],
+          claimedDelta: `${input.title} — conserved-balance race over ${burstIds.length} burst + ${serialIds.length} serial control exchange(s).`.slice(0, 1200),
+          ...(balanceField || capField || unitDebit !== undefined
+            ? {
+                conservedBalance: {
+                  ...(balanceField ? { balanceField } : {}),
+                  ...(capField ? { capField } : {}),
+                  ...(unitDebit !== undefined ? { unitDebit } : {}),
+                },
+              }
+            : {}),
         }),
         transcript,
       }
