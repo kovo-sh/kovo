@@ -658,6 +658,12 @@ export async function probeDifferential(
       ...(req.runId ? { runId: req.runId } : {}),
       ...(req.assignmentId ? { assignmentId: req.assignmentId } : {}),
       ...r,
+      // Carry the differential class into the brokered request. A 5xx provoked by an
+      // injection/parser payload is target evidence, so the broker must count it separately from
+      // real target unavailability (it exempts that class from the availability circuit). The
+      // class used to be dropped here, so a single payload-induced 5xx storm could open the origin
+      // circuit and pause a healthy run.
+      probeClass: r.probeClass ?? req.probeClass,
     })
     if (!res.ok) {
       notes.push(`${r.method} ${r.pathAndQuery.slice(0, 80)} -> ${res.kind}: ${res.message.slice(0, 120)}`)

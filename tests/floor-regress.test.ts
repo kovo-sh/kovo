@@ -486,13 +486,16 @@ test('floor: a privileged identity mutation is proven by a named state delta on 
     assert.equal(specs.length, 1)
     const spec = specs[0]!.spec as Json
     const steps = spec.steps as Array<{ id: string; role: string; request: { method: string; pathAndQuery: string; persona?: string; jsonBody?: Json } }>
-    assert.deepEqual(steps.map(step => step.id), ['w0', 'c1', 'p1', 'p2'])
+    assert.deepEqual(steps.map(step => step.id), ['w0', 'c1', 'p1', 'p2', 'w3'])
     assert.equal(steps[0]!.request.persona, 'viewer')
     assert.equal(steps[0]!.request.jsonBody?.store, 'acme')
     assert.equal(steps[1]!.request.pathAndQuery, '/api/session')
     assert.equal(steps[1]!.request.persona, 'viewer')
     assert.equal(steps[2]!.request.jsonBody?.store, 'globex')
     assert.equal(steps[3]!.request.persona, 'viewer')
+    // The proof restores the actor's own scope afterwards, so the instrument never stays re-scoped.
+    assert.equal(steps[4]!.request.persona, 'viewer')
+    assert.equal(steps[4]!.request.jsonBody?.store, 'acme')
     assert.match(String(spec.assertionsJq), /"store"/)
     assert.deepEqual(spec.expectedImpactEvents, ['privilege_escalation'])
     const res = await verify(spec, fx.origin)
@@ -567,8 +570,9 @@ test('engine: a privileged mutation forms a self-state variant bound to the iden
   assert.deepEqual(selfVariant!.functionState?.bindings, [{ field: 'store', value: 'globex' }])
   assert.deepEqual(selfVariant!.functionState?.reset, [{ field: 'store', value: 'acme' }])
   assert.equal(selfVariant!.functionState?.body?.store, 'globex')
-  // The probe itself writes the actor's own value, so it never leaves the session mutated.
-  assert.equal(selfVariant!.jsonBody?.store, 'acme')
+  // The live probe carries no scope selector: an identity-assumption route would persist it on the
+  // operator session. The replay (functionState) still proves the scope delta and resets it.
+  assert.equal(Object.hasOwn(selfVariant!.jsonBody ?? {}, 'store'), false)
 })
 
 test('engine: a self-service update addresses the writer row the collection correlates', () => {
