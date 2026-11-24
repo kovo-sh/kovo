@@ -246,6 +246,31 @@ test('confirm-consistency: engine wiring routes every evidence write through the
   assert.match(executionSource, /const verdictRow = findingRow/)
 })
 
+test('confirm-consistency: the database trigger rejects a direct confirmed insert without evidence', async (t) => {
+  const { storage, run, asset } = await fixture(t)
+  const findingId = '00000000-0000-4000-8000-000000000009'
+  assert.throws(
+    () => storage.db.insert(findings).values({
+      id: findingId,
+      runId: run.id,
+      assetId: asset.id,
+      goalRevision: run.goalRevision,
+      checkId: 'chain',
+      caseId: findingId,
+      findingKind: 'multi_step_chain',
+      replaySpecId: null,
+      provenance: 'agent_only',
+      verificationClass: 'runtime_confirmed',
+      sourceOrigins: [ORIGIN],
+      verificationTier: 'runtime_confirmed',
+      finding: confirmedFinding(findingId, 'Direct SQL over-claim', 'CWE-639'),
+    }).run(),
+    (error: unknown) => /invariant\.confirmation_evidence/.test(String((error as Error)?.message ?? ''))
+      || /invariant\.confirmation_evidence/.test(String((error as { cause?: Error })?.cause?.message ?? '')),
+  )
+  assert.equal(storage.db.select().from(findings).get(), undefined, 'direct SQL must not bypass the invariant')
+})
+
 test('confirm-consistency: an FP autopsy attributes the confirming spec, not a failed retry', async () => {
   const { buildFalsePositiveEvidence } = await import('../scripts/benchmark-realistic.ts')
   const steps = (path: string) => [
