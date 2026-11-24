@@ -21,6 +21,7 @@ import { Execution, probeCanaryClass } from '../src/server/execution.ts'
 import {
   applyReceiptGate,
   buildReplayReceipt,
+  proofReceiptMode,
   retestReplaySpec,
   verifyReplaySpec,
 } from '../src/server/replay-verifier.ts'
@@ -232,6 +233,14 @@ test('M0 receipt: a static/unknown class never becomes runtime_confirmed', () =>
 // Cut 2 — replay/retest adapter + promotion classifier
 // ============================================================================
 
+test('M0 receipt: mode env is off/shadow/strict and defaults to shadow', () => {
+  assert.equal(proofReceiptMode({} as NodeJS.ProcessEnv), 'shadow')
+  assert.equal(proofReceiptMode({ GUARDIAN_PROOF_RECEIPT: '0' } as NodeJS.ProcessEnv), 'off')
+  assert.equal(proofReceiptMode({ GUARDIAN_PROOF_RECEIPT: 'off' } as NodeJS.ProcessEnv), 'off')
+  assert.equal(proofReceiptMode({ GUARDIAN_PROOF_RECEIPT: 'strict' } as NodeJS.ProcessEnv), 'strict')
+  assert.equal(proofReceiptMode({ GUARDIAN_PROOF_RECEIPT: '1' } as NodeJS.ProcessEnv), 'strict')
+})
+
 test('M0 receipt: the floor adapter builds a receipt and strict mode can only downgrade', () => {
   const spec = {
     kind: 'http_chain',
@@ -251,6 +260,8 @@ test('M0 receipt: the floor adapter builds a receipt and strict mode can only do
   const built = buildReplayReceipt({
     spec,
     evidencePayload: {
+      evidenceClass: 'mass_assignment',
+      impactGate: { required: true, satisfied: true },
       steps: {
         b1: { id: 'b1', role: 'control', exchangeId: 'ex-b1', status: 200, json: { owner_id: 'u1' }, actorRole: 'member' },
         p1: { id: 'p1', role: 'probe', exchangeId: 'ex-p1', status: 200, json: { owner_id: 'u2' }, actorRole: 'member' },
@@ -263,6 +274,16 @@ test('M0 receipt: the floor adapter builds a receipt and strict mode can only do
   assert.ok(built, 'adapter must produce a receipt for a persisted mutation')
   const verification = verifyReceipt(built.receipt, built.transcript)
   assert.equal(verification.confirmed, true, verification.reason)
+
+  assert.equal(built.receipt.vulnClass, 'mass_assignment', 'evidence class wins over the declared label')
+
+  // A class the verifier never gated (no impactGate) keeps its legacy evidence model.
+  assert.equal(buildReplayReceipt({
+    spec,
+    evidencePayload: { steps: { b1: { id: 'b1', role: 'control', exchangeId: 'ex-b1', status: 200 } } },
+    exchangeIds: ['ex-b1'],
+    exchanges: [],
+  }), null)
 
   const strict = applyReceiptGate({
     mode: 'strict',

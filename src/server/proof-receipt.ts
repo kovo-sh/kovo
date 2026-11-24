@@ -37,6 +37,8 @@ export const proofReceiptSchema = z.object({
   requiredRole: z.enum(['viewer', 'member', 'admin', 'owner']).optional(),
   resourceTenant: z.string().trim().min(1).max(64).optional(),
   expectControlDenied: z.boolean().optional(),
+  /** Non-secret credential value shapes asserted by the proof (re-tested against the bodies). */
+  proofPatterns: z.array(z.string().trim().min(4).max(200)).max(4).optional(),
   /** When the injected value reached the target; a callback before this is not causal. */
   injectedAtMs: z.number().int().nonnegative().optional(),
 })
@@ -291,6 +293,7 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     expectControlDenied: receipt.expectControlDenied,
     oracleEvents,
     targetOrigin: receipt.target.origin,
+    credentialPatterns: receipt.proofPatterns ?? null,
   }
   const assessment = assessImpactEvidence(input)
   if (!assessment.required) {

@@ -9992,6 +9992,10 @@ export class Execution {
   private promoteReceiptOob(runId: string): number {
     let promotions: ReturnType<CanaryBroker['promoteLate']>
     try { promotions = this.canaryBroker.promoteLate({ runId }) } catch { return 0 }
+    return this.convertOobPromotions(runId, promotions)
+  }
+
+  private convertOobPromotions(runId: string, promotions: ReturnType<CanaryBroker['promoteLate']>): number {
     if (promotions.length === 0) return 0
     let run: Run
     try { run = this.storage.run(runId) } catch { return 0 }
@@ -10209,12 +10213,24 @@ export class Execution {
   ): Promise<OobDrainResult> {
     const runId = typeof runOrId === 'string' ? runOrId : runOrId.id
     // Convert already-delivered callbacks first: they may have landed while verification workers
-    // were finishing, before this drain started.
-    const early = this.promoteReceiptOob(runId)
-    const result = await drainPendingOob(this.canaryBroker, runId, options)
-    // And again for callbacks that arrived during the bounded wait.
-    const late = this.promoteReceiptOob(runId)
-    const promotedReceipts = early + late
+    // were finishing, before this drain started. Callbacks that arrive during the bounded wait are
+    // converted by the proxy as the shared drain promotes them (a promotion is claim-once, so a
+    // post-drain call would never see them again).
+    let promotedReceipts = this.promoteReceiptOob(runId)
+    const convertingRelay = new Proxy(this.canaryBroker, {
+      get: (target, prop, receiver) => {
+        if (prop === 'promoteLate') {
+          return (opts: { runId?: string; now?: number } = {}) => {
+            const promotions = target.promoteLate(opts)
+            try { promotedReceipts += this.convertOobPromotions(runId, promotions) } catch { /* best-effort */ }
+            return promotions
+          }
+        }
+        const value = Reflect.get(target, prop, receiver)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    const result = await drainPendingOob(convertingRelay, runId, options)
     this.lastOobDrain.set(runId, result)
     try {
       this.storage.event(
@@ -10506,6 +10522,18 @@ export class Execution {
     }
     const result = await verifyReplaySpec(verifyParams)
     this.markReplaySpecCoverage(run, specRow.spec, `replay:${specRow.spec.kind}`)
+    if (result.receipt && !result.receipt.verification.confirmed) {
+      // Parity telemetry only: shadow receipts never change this verdict.
+      try {
+        this.storage.event(run.id, 'proof_receipt.shadow_reject',
+          `ProofReceipt did not substantiate spec ${specRow.id}: ${result.receipt.verification.reason}`.slice(0, 400), {
+            replaySpecId: specRow.id,
+            vulnClass: result.receipt.receipt.vulnClass,
+            rule: result.receipt.verification.rule,
+            mode: result.receipt.mode,
+          })
+      } catch { /* store closed */ }
+    }
 
     const current = this.check(job)
     let phaseFeedback: InlineVerifyFeedback | undefined
@@ -10537,6 +10565,8 @@ export class Execution {
           sourceOrigins: specRow.sourceOrigins,
           evidenceSha256: result.evidenceSha256,
           evidencePayload: result.evidencePayload,
+          receipt: result.receipt?.verification ?? null,
+          receiptArtifact: result.receipt?.receipt ?? null,
         }, null, 2), 'replay:' + specRow.id, currentSecrets())
 
       const staticCodeLocations: CodeLocation[] | undefined = staticSpec
@@ -10886,6 +10916,8 @@ export class Execution {
         exchangeIds: replay.exchangeIds,
         evidenceSha256: replay.evidenceSha256,
         evidencePayload: replay.evidencePayload,
+        receipt: replay.receipt?.verification ?? null,
+        receiptArtifact: replay.receipt?.receipt ?? null,
       }, null, 2),
       undefined,
       params.currentSecrets(),

@@ -971,13 +971,19 @@ export function receiptVulnClassFor(spec: DeclarativeReplaySpec): string | null 
   if (/CWE-918|\bssrf\b|server[- ]side request/i.test(text)) return 'ssrf'
   if (/CWE-611|\bxxe\b|external entit/i.test(text)) return 'xxe'
   if (spec.kind !== 'http_chain' && spec.kind !== 'auth_protocol_proof') return null
-  switch (classifyImpactDescriptor({
+  return vulnClassForImpactClass(classifyImpactDescriptor({
     cwe: spec.cwe,
     category: spec.category,
     title: spec.title,
     impact: spec.impact,
-  })) {
-    case 'authorization': return 'bola'
+  }))
+}
+
+function vulnClassForImpactClass(impactClass: string | null | undefined): string | null {
+  switch (impactClass) {
+    case 'authorization':
+    case 'bola':
+      return 'bola'
     case 'bfla': return 'bfla'
     case 'mass_assignment': return 'mass_assignment'
     case 'csrf': return 'csrf'
@@ -1001,8 +1007,17 @@ export function buildReplayReceipt(input: {
   exchangeIds: readonly string[]
   exchanges: readonly BrokerExchangeResult[]
 }): { receipt: ProofReceipt; transcript: ReceiptTranscript } | null {
-  const vulnClass = receiptVulnClassFor(input.spec)
+  const impactGate = input.evidencePayload.impactGate as { required?: boolean } | undefined
+  const evidenceClass = typeof input.evidencePayload.evidenceClass === 'string'
+    ? input.evidencePayload.evidenceClass
+    : null
+  const vulnClass = vulnClassForImpactClass(evidenceClass) ?? receiptVulnClassFor(input.spec)
   if (!vulnClass) return null
+  const isOob = vulnClass === 'ssrf' || vulnClass === 'xxe'
+  // The DSL only confirms an impact claim when its shared oracle gate applies. Do not manufacture a
+  // receipt for a class the replay never gated (auth-boundary, redirect, injection differentials):
+  // those keep their existing evidence model instead of being downgraded by a rule they never had.
+  if (!isOob && impactGate?.required !== true) return null
   const stepsOut = (input.evidencePayload.steps ?? {}) as Record<string, unknown>
   const steps = impactStepsFromStepsOut(input.spec, stepsOut)
   if (steps.length === 0 && vulnClass !== 'ssrf' && vulnClass !== 'xxe') return null
@@ -1033,7 +1048,7 @@ export function buildReplayReceipt(input: {
     orderedIds.push(id)
   }
 
-  if (vulnClass === 'ssrf' || vulnClass === 'xxe') {
+  if (isOob) {
     const carrying = entries.find(entry => replayCanaryTokenRe.test(entry.carrierText ?? ''))
     if (!carrying) return null
     const token = replayCanaryTokenRe.exec(carrying.carrierText ?? '')![0]
@@ -1081,8 +1096,15 @@ export function buildReplayReceipt(input: {
     claimedDelta: (input.spec.expectedImpactEvents ?? []).length
       ? `Replay observed the declared impact: ${(input.spec.expectedImpactEvents ?? []).join(', ')}.`
       : `Replay moved state across the ${vulnClass} boundary described by "${input.spec.title.slice(0, 120)}".`,
-    ...((input.spec as { expectedImpactEvents?: string[] }).expectedImpactEvents
-      ? { oracleEvents: (input.spec as { expectedImpactEvents?: string[] }).expectedImpactEvents }
+    ...(() => {
+      const declared = ((input.spec as { expectedImpactEvents?: string[] }).expectedImpactEvents ?? []).slice()
+      const csrfModelled = 'steps' in input.spec && Array.isArray(input.spec.steps) &&
+        input.spec.steps.some(s => Boolean((s as { request?: { csrfBind?: unknown } }).request?.csrfBind))
+      if (csrfModelled && !declared.includes('csrf_state_change')) declared.push('csrf_state_change')
+      return declared.length ? { oracleEvents: declared } : {}
+    })(),
+    ...('proofPatterns' in input.spec && Array.isArray(input.spec.proofPatterns) && input.spec.proofPatterns.length
+      ? { proofPatterns: input.spec.proofPatterns as string[] }
       : {}),
     ...('requiredRole' in input.spec && input.spec.requiredRole ? { requiredRole: input.spec.requiredRole } : {}),
     ...('resourceTenant' in input.spec && input.spec.resourceTenant ? { resourceTenant: input.spec.resourceTenant } : {}),
