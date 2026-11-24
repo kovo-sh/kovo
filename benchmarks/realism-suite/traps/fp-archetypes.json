@@ -248,6 +248,245 @@
         }
       ]
     }
+  },
+{
+  "id": "catalog-canary-public-read",
+  "title": "Anonymous storefront read returns the owner reference body including a store-scoped note canary",
+  "assessor": "authorization",
+  "expectedDismissal": "anonymous body identical to the owner reference on a public storefront page is publicness, not a cross-tenant crossing",
+  "input": {
+    "impactClass": "authorization",
+    "steps": [
+      {
+        "id": "ctl_none",
+        "arm": "control",
+        "method": "GET",
+        "route": "/api/v1/stores/:storeId/catalog/:productId",
+        "pathAndQuery": "/api/v1/stores/000000/catalog/204",
+        "status": 200,
+        "actor": {
+          "handle": null,
+          "role": null,
+          "tenant": null,
+          "auth": "none",
+          "sameSite": null
+        },
+        "json": {
+          "store": "000000",
+          "viewer": "000000",
+          "product": null,
+          "memberNote": ""
+        }
+      },
+      {
+        "id": "owner_ref",
+        "arm": "control",
+        "method": "GET",
+        "route": "/api/v1/stores/:storeId/catalog/:productId",
+        "pathAndQuery": "/api/v1/stores/9ca676/catalog/204",
+        "status": 200,
+        "actor": {
+          "handle": "persona_a",
+          "role": "owner",
+          "tenant": "9ca676",
+          "auth": "cookie",
+          "sameSite": "lax"
+        },
+        "json": {
+          "store": "9ca676",
+          "viewer": "9ca676",
+          "product": {
+            "id": "204",
+            "title": "Item 1",
+            "price": 1200
+          },
+          "memberNote": "loyalty rbc_9ca676_0123456789ab"
+        }
+      },
+      {
+        "id": "probe_anon",
+        "arm": "probe",
+        "method": "GET",
+        "route": "/api/v1/stores/:storeId/catalog/:productId",
+        "pathAndQuery": "/api/v1/stores/9ca676/catalog/204",
+        "status": 200,
+        "actor": {
+          "handle": null,
+          "role": null,
+          "tenant": null,
+          "auth": "none",
+          "sameSite": null
+        },
+        "json": {
+          "store": "9ca676",
+          "viewer": "9ca676",
+          "product": {
+            "id": "204",
+            "title": "Item 1",
+            "price": 1200
+          },
+          "memberNote": "loyalty rbc_9ca676_0123456789ab"
+        }
+      }
+    ]
   }
+},
+{
+  "id": "catalog-item-owner-reference",
+  "title": "Non-owner tenant reads a catalog item identical to the owner reference (store token in body)",
+  "assessor": "authorization",
+  "expectedDismissal": "an item read byte-identical to the owner reference is a public catalog object, not tenant-scoped data",
+  "input": {
+    "impactClass": "authorization",
+    "steps": [
+      {
+        "id": "owner_ref",
+        "arm": "control",
+        "method": "GET",
+        "route": "/api/v1/catalog/:productId",
+        "pathAndQuery": "/api/v1/catalog/201",
+        "status": 200,
+        "actor": {
+          "handle": "persona_a",
+          "role": "owner",
+          "tenant": "9ca676",
+          "auth": "cookie",
+          "sameSite": "lax"
+        },
+        "json": {
+          "id": 201,
+          "external_id": "201",
+          "store_id": "9ca676",
+          "title": "Item 2",
+          "price": 1700,
+          "stock": 5,
+          "body_html": "<p>Quality item 2</p>"
+        }
+      },
+      {
+        "id": "ctl_list",
+        "arm": "control",
+        "method": "GET",
+        "route": "/api/v1/catalog",
+        "pathAndQuery": "/api/v1/catalog",
+        "status": 200,
+        "actor": {
+          "handle": "persona_b",
+          "role": "owner",
+          "tenant": "6ea2e7",
+          "auth": "cookie",
+          "sameSite": "lax"
+        },
+        "json": {
+          "products": [
+            {
+              "external_id": "205",
+              "title": "Item 1",
+              "price": 1200,
+              "stock": 5
+            }
+          ]
+        }
+      },
+      {
+        "id": "probe_foreign",
+        "arm": "probe",
+        "method": "GET",
+        "route": "/api/v1/catalog/:productId",
+        "pathAndQuery": "/api/v1/catalog/201",
+        "status": 200,
+        "actor": {
+          "handle": "persona_b",
+          "role": "owner",
+          "tenant": "6ea2e7",
+          "auth": "cookie",
+          "sameSite": "lax"
+        },
+        "json": {
+          "id": 201,
+          "external_id": "201",
+          "store_id": "9ca676",
+          "title": "Item 2",
+          "price": 1700,
+          "stock": 5,
+          "body_html": "<p>Quality item 2</p>"
+        }
+      }
+    ]
+  }
+},
+{
+  "id": "catalog-list-anonymous-reference",
+  "title": "Anonymous caller gets the same store-scoped product listing the owner reference gets",
+  "assessor": "authorization",
+  "expectedDismissal": "an anonymous listing identical to the owner reference exposes only public product fields",
+  "input": {
+    "impactClass": "authorization",
+    "steps": [
+      {
+        "id": "owner_ref",
+        "arm": "control",
+        "method": "GET",
+        "route": "/api/v1/catalog",
+        "pathAndQuery": "/api/v1/catalog",
+        "status": 200,
+        "actor": {
+          "handle": "persona_a",
+          "role": "owner",
+          "tenant": "9ca676",
+          "auth": "cookie",
+          "sameSite": "lax"
+        },
+        "json": {
+          "products": [
+            {
+              "external_id": "201",
+              "title": "Item 1",
+              "price": 1200,
+              "stock": 5
+            },
+            {
+              "external_id": "202",
+              "title": "Item 2",
+              "price": 1700,
+              "stock": 5
+            }
+          ]
+        }
+      },
+      {
+        "id": "probe_anon",
+        "arm": "probe",
+        "method": "GET",
+        "route": "/api/v1/catalog",
+        "pathAndQuery": "/api/v1/catalog",
+        "status": 200,
+        "actor": {
+          "handle": null,
+          "role": null,
+          "tenant": null,
+          "auth": "none",
+          "sameSite": null
+        },
+        "json": {
+          "products": [
+            {
+              "external_id": "201",
+              "title": "Item 1",
+              "price": 1200,
+              "stock": 5
+            },
+            {
+              "external_id": "202",
+              "title": "Item 2",
+              "price": 1700,
+              "stock": 5
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
 ]
 }

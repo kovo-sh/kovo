@@ -243,6 +243,129 @@ function relatedRoute(a: ImpactStep, b: ImpactStep): boolean {
   return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`)
 }
 
+export interface PublicnessAssessment {
+  public: boolean
+  reason: string
+  referenceId?: string
+}
+
+/** Flattened, order-independent payload key for structural equality between two exchanges. */
+function payloadKey(step: ImpactStep): string | null {
+  if (step.json !== undefined && step.json !== null && typeof step.json === 'object') {
+    const flat = flattenJson(step.json)
+    if (flat.size === 0) return null
+    return `json:${[...flat.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join('\u0000')}`
+  }
+  if (typeof step.body === 'string' && step.body.length > 0) return `body:${step.body}`
+  return null
+}
+
+/** Leaf names of every array-bearing listing response in the chain (a public collection shape). */
+function listingLeaves(steps: readonly ImpactStep[]): Set<string> {
+  const leaves = new Set<string>()
+  const add = (path: string): void => {
+    const leaf = (path.replace(/\[\d+\]/g, '').split('.').pop() ?? '').toLowerCase()
+    if (leaf) leaves.add(leaf)
+  }
+  for (const step of steps) {
+    if (!isReadMethod(step.method) || !isSuccess(step.status) || step.json === undefined) continue
+    const flat = flattenJson(step.json)
+    if (![...flat.keys()].some(path => path.includes('['))) continue
+    for (const path of flat.keys()) add(path)
+  }
+  return leaves
+}
+
+/**
+ * Publicness: a storefront/catalog surface readable without authentication, or one where a
+ * non-owner caller receives a payload identical to the owner reference, is exposing the same
+ * public object — not an object-level crossing. The claim survives when the shared payload still
+ * binds an owner-scoped identity to another principal or carries a tenant/secret canary (a real
+ * disclosure that a public surface would not have).
+ */
+export function assessPublicness(args: { steps: readonly ImpactStep[]; probe: ImpactStep }): PublicnessAssessment {
+  const { steps, probe } = args
+  if (!isReadMethod(probe.method) || !isSuccess(probe.status)) return { public: false, reason: '' }
+  const probeTenant = probe.actor.tenant ?? null
+  const sameRouteReads = steps.filter(step =>
+    step !== probe &&
+    isReadMethod(step.method) &&
+    isSuccess(step.status) &&
+    sameRoute(step, probe) &&
+    step.json !== undefined &&
+    step.json !== null)
+  // (A) The surface is public when an anonymous caller is served a payload on the same route —
+  // including the probe itself when the claim is an unauthenticated read.
+  const anonymousRead = [probe, ...sameRouteReads].find(step =>
+    step.actor.handle === null && (step.actor.tenant ?? null) === null && step.json !== undefined && step.json !== null)
+  if (anonymousRead) {
+    return {
+      public: true,
+      referenceId: anonymousRead.id,
+      reason: `an unauthenticated caller was served a payload on the same route (${anonymousRead.id}), so the surface is publicly readable`,
+    }
+  }
+  // (B) A non-owner payload identical to the owner reference (or differing only on fields the
+  // public listing exposes) is the same public object. Local compare only; no anon arm needed.
+  const probeKey = payloadKey(probe)
+  if (!probeKey && probe.json === undefined) return { public: false, reason: '' }
+  const references = sameRouteReads.filter(step =>
+    step.arm === 'control' &&
+    step.actor.handle !== probe.actor.handle &&
+    (step.json !== undefined || typeof step.body === 'string') &&
+    // Publicness compares the *same object request*: a negative/absent-id control (different path)
+    // never establishes that the probe's payload is public.
+    (step.pathAndQuery === undefined || probe.pathAndQuery === undefined || step.pathAndQuery === probe.pathAndQuery))
+  if (references.length === 0) return { public: false, reason: '' }
+  const controlFlats = sameRouteReads
+    .filter(step => step.arm === 'control' && step.json !== undefined && step.json !== null && typeof step.json === 'object')
+    .map(step => flattenJson(step.json))
+  const listing = listingLeaves(steps)
+  const probeFlat = probe.json !== undefined && probe.json !== null && typeof probe.json === 'object' ? flattenJson(probe.json) : null
+  for (const reference of references) {
+    const referenceTenant = reference.actor.tenant ?? null
+    // Only an anonymous caller or a caller outside the reference tenant can be a "public" reader.
+    if (probeTenant !== null && referenceTenant !== null && probeTenant === referenceTenant) continue
+    if (!probeTenant && !referenceTenant) continue
+    const same = payloadKey(reference) === probeKey
+    let differingOnlyPublic = false
+    if (!same) {
+      if (!probeFlat) continue
+      const referenceFlat = reference.json !== undefined && reference.json !== null && typeof reference.json === 'object'
+        ? flattenJson(reference.json)
+        : null
+      if (!referenceFlat) continue
+      const differing = new Set<string>()
+      for (const [path, value] of probeFlat) if (referenceFlat.get(path) !== value) differing.add(path)
+      for (const path of referenceFlat.keys()) if (!probeFlat.has(path)) differing.add(path)
+      const leaves = [...differing].map(path => (path.replace(/\[\d+\]/g, '').split('.').pop() ?? '').toLowerCase())
+      differingOnlyPublic = differing.size > 0 && leaves.every(leaf => listing.has(leaf)) && !leaves.some(leaf => IDENTITY_FIELD_RE.test(leaf))
+      if (!differingOnlyPublic) continue
+    }
+    // A genuine victim-owned attribute or canary in the shared payload defeats publicness.
+    const ownerBound = probeFlat
+      ? [...probeFlat.entries()].some(([path, value]) => {
+        if (!value || value === 'null') return false
+        // Bound when the same value is served to a *control* actor (the owner reference read).
+        if (!controlFlats.some(flat => flat.get(path) === value)) return false
+        const leaf = (path.replace(/\[\d+\]/g, '').split('.').pop() ?? '').toLowerCase()
+        if (CANARY_VALUE_RE.test(value)) return true
+        return IDENTITY_FIELD_RE.test(leaf) && reference.actor.handle !== null
+      })
+      : false
+    if (ownerBound) continue
+    return {
+      public: true,
+      referenceId: reference.id,
+      reason: differingOnlyPublic
+        ? `the ${probe.actor.tenant ? 'non-owner' : 'anonymous'} response matches the owner reference ${reference.id} on the same route except for fields the public listing already exposes, so the resource is publicly readable (publicness), not an access-control crossing`
+        : `the ${probe.actor.tenant ? 'non-owner' : 'anonymous'} response is identical to the owner reference ${reference.id} on the same route, so the resource is publicly readable (publicness), not an access-control crossing`,
+    }
+  }
+  return { public: false, reason: '' }
+
+}
+
 /** True when the probe creates a new collection member (POST with no id-like final segment). */
 function isCreateShapedProbe(step: ImpactStep): boolean {
   if ((step.method ?? '').toUpperCase() !== 'POST') return false
@@ -325,6 +448,8 @@ const FUNCTION_SURFACE_RE = /(?:^|\/)(?:admin(?:istrator)?|internal|manage|manag
 const PRICE_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:price(?:_?cents)?|amount(?:_?cents)?|cost(?:_?cents)?)$/i
 const IDENTITY_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:owner(?:_?id)?|tenant(?:_?id)?|user(?:_?id)?|email|username|subject|created_?by|author)$/i
 const SECRET_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:secret|api_?key|access_?token|token|password|hash|private_?note|note|internal|ssn)$/i
+/** Tenant/secret canary value shape emitted by the lab canary registry (`rbc_`/`rbs_`). */
+const CANARY_VALUE_RE = /\brb[cs]_[a-z0-9]+_[0-9a-f]{6,}\b/i
 
 export function isProtectedField(path: string): boolean {
   const leaf = path.split('.').pop()?.toLowerCase() ?? ''
@@ -718,6 +843,19 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
         }
       }
     }
+    // Evidence-based publicness for routes whose path carries no public marker: a non-owner or
+    // anonymous caller served the *same* payload the owner reference receives is reading the same
+    // public object. Catalog/product surfaces (storefront browse, item detail, public store page)
+    // are readable by design; a genuine crossing still differs, or binds owner-scoped data.
+    const publicness = assessPublicness({ steps, probe })
+    if (publicness.public && !roleDifferential) {
+      return {
+        required: true,
+        satisfied: false,
+        reason: `Cross-tenant claim dismissed (publicness): ${publicness.reason}.`,
+        evidence: base,
+      }
+    }
     return {
       required: true,
       satisfied: true,
@@ -751,6 +889,18 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
   }
   const disclosure = assessReadDisclosure({ steps, probe })
   base.disclosureFields = disclosure.fields
+  // An anonymous (or non-owner) read that mirrors the owner reference on the same route exposes the
+  // same public record — a catalog listing/item — not an owner-scoped disclosure. Genuine private
+  // reads differ from the reference or bind an owner-scoped identity, so they are unaffected.
+  const publicness = assessPublicness({ steps, probe })
+  if (publicness.public && !roleDifferential) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: `Read claim dismissed (publicness): ${publicness.reason}.`,
+      evidence: base,
+    }
+  }
   if (disclosure.satisfied && !roleDifferential && !crossTenant && !boundaryControlDenied) {
     // Same-tenant, same-role read: the tenant is the object boundary, so an owner/identity field
     // alone is in policy (viewer reading a peer's space). Only private/secret data proves impact.
