@@ -161,4 +161,25 @@ unchanged*.
 
 ## Measurements
 
-Filled by the validation run on this branch (dev floor, xben, held-out-saas, held-out cell).
+All on this branch (`agents/agent-fp-triage`, base `66be563`).
+
+| Gate | Result |
+| :--- | :--- |
+| `npm run check` | pass (0 errors) |
+| `tests/v7-agent-fp-triage.test.ts` | 6/6 pass |
+| shopflow + opsportal fixture matrices, grader soundness/misclassified | 23/23 pass |
+| `scripts/worker-gate.sh` | **PASS** |
+| dev floor `Execution --no-llm`, seed 1, all apps | **36/59 (61.0%)**, 0 decoy FP, 0 unmatched FP, precision 100%, 0 spread (`acme 14/22, shopflow 12/19, opsportal 10/18`) |
+| xben-25 | **25/25**, 0 FP |
+| held-out-saas | **20/20**, 0 FP, patches **20/20** (`reproducedBefore=20`, `allPatches=fixed`) |
+| held-out shopflow cell, seed 1000042, 600 s, K=6, docker, `--keep-data-dirs` | **11/19 confirmed (57.9%) @ 100% precision** (strict 100%), 0 decoy FP, 0 unmatched, 0 misclassified, 0 dupes, real worker sessions, $0.517 |
+
+Before → after on that cell (shopflow): precision **83.3% → 100%**, unmatched FPs **2 → 0**,
+recall **10/19 → 11/19** (floor 10/19; the +1 is `review-stored-xss`, agentic variance, not this
+change — no site solver was touched). The catalog claim that was one of the two original FPs is
+ruled by `agents/catalog-public`; it did not reappear on the final cell.
+
+opsportal was **not** changed. Its definitive cell stays 7/17 @ 87.5% (1 unmatched + 1 misclassified);
+both charges are the verifier defects diffed above, and neither may be "fixed" by deflating the
+planted `og.ticket-assign-cross-write` / `og.log-filter-sqli` sites. 100% opsportal precision needs
+the `oracle-invariants.ts` diffs (out of this stream's lease).
