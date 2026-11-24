@@ -445,3 +445,24 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Horizon finding:** 45 min yielded **0 marginal recall over 10 min** (13/22 both) at 3× cost, so remaining gaps are hypothesis/proof coverage (white-box slices, workflows, chains), not runtime.
 - **Gate calibration accepted:** p50 hard fail ≤90 s (>75 s warns); monorepo micro-slice should use a cached post-recon snapshot.
 - **M1 rank after cert:** (1) #4 4-hop via attached slices, (2) #2 no-SSRF-hypothesis gap (promotion path already merged), (3) #3 race/workflow capability.
+
+### 2026-11-24 — hourly check-in #11: certify Floor+Realism milestone, hold "Agentic Lift"; fix 1/7 dispatch first
+
+**Measured going in:** dev floor 33/59 (55.9%, 0-spread, 100%); held-out floor 24/58 (41.4%, 100%); dev unified 35/59 (+2: acme +1, shopflow +1, opsportal 0) @100%; held-out unified 24/58 (**0 lift**, 2 unmatched FPs, 19–23 investigations/app); Realism #2 **async SSRF + XXE confirmed** (2 TP/0 FP); Realism #3 capability PASS; #4 wiring PASS, 4-hop 0/3.
+
+**Triage (accept/reject/defer):**
+
+| # | Recommendation | Verdict | Owner |
+|---|---|---|---|
+| 1 | Refuse to certify "Agentic Lift" at dev +2 / held-out +0; record a **Floor + Realism-Wiring Milestone** (33/59 dev 0-spread, 24/58 held-out, xben 25/25, held-out-saas 20/20+20/20, Realism #3 PASS, #2 async SSRF+XXE) | **ACCEPT** | coordinator |
+| 2 | Fair lift bar after the floor jump 26→33/59: **≥+6–8pp dev and ≥+6pp held-out** at 100% worst-run precision (~37–38/59 dev, ~28/58 held-out) | **ACCEPT** | certification stream |
+| 3 | Don't guess the missing class — pull a structured funnel over the ~60 held-out investigations (`dispatched → target_route_hit → verify_called → oracle_rejected_by → open_proof_gap`) plus the 2 FPs' rejection gap | **ACCEPT** | `heldout-lift` |
+| 4 | Audit order for 1/7 & 2/19: (a) dry-round stop/`decideNext()` after round 1 while ready steps are queued, or `alreadyConfirmed`/cap-2 filtering; (b) `dependsOn` gating leaving steps blocked; (c) dedupe collapsing routes onto `(origin,class)` | **ACCEPT** | `dispatch-funnel` (launched) |
+| 5 | Cheap invariant: emit dispatch funnel (`planned/filtered*/dispatched/remainingReadyAtStop/stopReason`) and assert `stopReason ∈ {dry_rounds, coordinator_done} ⇒ remainingReadyAtStop === 0` unless budget/wall/request exhausted | **ACCEPT** | `dispatch-funnel` |
+| 6 | Split Realism #2 gates: `oob_wiring_fnr ≤5%` (denominator = minted canaries, now 2/2 ⇒ 0%) separate from `fixture_capability_recall ≥75%` (all planted targets; blind-SQLi + chain stay there) | **ACCEPT** | `realism-gates` (launched) |
+| 7 | Cut 3 **option (a) strict strangler**: wire the 6 recipe families, delete their VM branches, hard no-fallback assertion now; remaining kinds in a follow-up (3b) | **ACCEPT** | `cut3a` (launched) |
+| 8 | Realism #4: read the 3-number funnel per Tier-A slice (`dispatched`, `target_route_hit`, `verify_called` vs `oracle_rejected_by`) before touching prompts; fix cold-recon starvation and the dispatch killer first | **ACCEPT** | `realism-gates` + `dispatch-funnel` |
+| 9 | Dev +2 vs held-out +0 is **noise around near-zero agentic conversion**, not dev overfitting; the 14.5pp floor gap is residual Layer-2 structure on randomized surfaces — do **not** chase with deterministic regexes, that is Layer 3's job | **ACCEPT** (no floor-regex work commissioned) | — |
+| 10 | Delete the 28h-stale `parity-diff` worktree | **ACCEPT** | coordinator (done; plan doc archived to /tmp/opencode/PARITY-DIFF-SEED1.archived.md) |
+
+**Consequence:** certification claim is versioned as **M0-interim (Floor + Realism-Wiring)**, not "agentic lift". Lift certification stays blocked until the funnel shows the true blocker and the +6pp bar is met.
