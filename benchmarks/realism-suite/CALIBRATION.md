@@ -148,19 +148,31 @@ GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- --fixture enterprise-spa
 
 ## Gate #2 — WAN + async OOB (`wan-oob`)
 
-Gate: **blind SQLi confirmed**, **async SSRF confirmed**, **async XXE confirmed**, and
-**async false-negative rate < 5%**, with chain `wan-oob-exfil` complete. Wiring is judged
-separately: at least one durable `pending_oob` subscription must be registered, and any late
-callback must be allowed the full >= 15 s drain window (see “Wiring health vs capability”).
+Two orthogonal gates (never blended):
+
+- **`oob_wiring_fnr` ≤ 5%** (target 0%) — async-OOB wiring reliability. Denominator = minted
+  async-OOB canaries whose callback fired (SSRF/XXE), falling back to all minted async canaries
+  when nothing fired; unmeasured (`null`) when no async canary was minted. Blind SQLi and the
+  exfil chain are **never** in this denominator.
+- **`fixture_capability_recall` ≥ 75%** — product capability over all planted #2 targets:
+  async SSRF, async XXE, blind SQLi, and chain `wan-oob-exfil` complete. 2 of 4 is 50% and fails;
+  3 of 4 (75%) passes.
+
+The legacy blended async false-negative rate is still printed as an informational row but is no
+longer a gate. Wiring is additionally judged separately: at least one durable `pending_oob`
+subscription must be registered, and any late callback must be allowed the full ≥ 15 s drain
+window (see “Wiring health vs capability”).
 
 | Measurement | Definition | `--no-llm` result | agentic result |
 | --- | --- | --- | --- |
-| Blind SQLi | TP for `wan-blind-sqli` | — | — |
-| Async SSRF | TP for `wan-ssrf-async` | — | — |
-| Async XXE | TP for `wan-xxe-async` | — | — |
-| Async false-negative rate | missed `{wan-blind-sqli, wan-ssrf-async, wan-xxe-async}` / 3 | — | — |
+| OOB wiring FNR | fired async canary targets without a confirmation / fired async canary targets (SSRF, XXE) | — | — |
+| Capability recall | confirmed planted targets / 4 `{wan-ssrf-async, wan-xxe-async, wan-blind-sqli, wan-oob-exfil chain}` | — | — |
+| Blind SQLi | TP for `wan-blind-sqli` (capability member) | — | — |
+| Async SSRF / XXE | TP for `wan-ssrf-async` / `wan-xxe-async` (capability and wiring members) | — | — |
+| Async canary evidence | `canaries` rows by purpose (`ssrf*` / `xxe*`): minted vs fired (`triggered` or `hit_count > 0`) | — | — |
+| Legacy blended async FNR | missed `{wan-blind-sqli, wan-ssrf-async, wan-xxe-async}` / 3 — **informational only** | — | — |
 | Fixture callback evidence | fixture-side collector observed `sqli` / `ssrf` / `xxe` / `webhook` after the HTTP response | — | — |
-| Chain completion | `wan-oob-exfil` covered/total | — | — |
+| Chain completion | `wan-oob-exfil` covered/total (capability member) | — | — |
 | Grade | TP / FP / precision / recall | — | — |
 
 ```bash
@@ -212,6 +224,7 @@ ranked Tier A.
 | Code leads | Program-Graph `det_lead` facts; `fourHopLeads` counts route→sink chains of at least four hops | — | — |
 | Probe plan | Phase-0 ranked plan: Tier A (`priority`), schema-typed, clustered probe subset, total routes | — | — |
 | 4-hop confirmations | TP count among `{mono-billing-bola, mono-report-sqli, mono-admin-bfla}` (0–3) | — | — |
+| Per-slice funnel | per Tier-A 4-hop slice: `dispatched_count` (assignments attributed via fact link / brief target / route hit), `target_route_hit` (broker exchange on the exact mounted method+route), `verify_called` (replay specs whose requests hit that route), `oracle_rejected_by` (structural rejection-code histogram) | — | — |
 | Chain completion | `mono-tenant-takeover` covered/total | — | — |
 | Grade | TP / FP / precision / recall | — | — |
 

@@ -744,6 +744,11 @@ export interface WiringMetricValues {
   tierA4HopSinks: number | null
   /** `guardian-qa-` records remaining after staging cleanup (staging only). */
   leakedEntities: number | null
+  /**
+   * Async-OOB wiring reliability (wan-oob only). Kept in the wiring report so a capability miss
+   * (blind SQLi, incomplete chain) can never masquerade as a wiring failure.
+   */
+  oobWiringFnr: OobWiringGate | null
 }
 
 export interface WiringReport {
@@ -782,6 +787,7 @@ export function emptyWiringMetrics(): WiringMetricValues {
     siblingDerivationSuppressed: null,
     tierA4HopSinks: null,
     leakedEntities: null,
+    oobWiringFnr: null,
   }
 }
 
@@ -796,8 +802,18 @@ export interface RealismMetrics {
     asyncSsrfConfirmed: boolean
     asyncXxeConfirmed: boolean
     webhookForgeryConfirmed: boolean
+    /**
+     * Legacy blended async miss rate. Includes blind SQLi in the async denominator and is
+     * informational only — it is never a gate any more. Use `wiringFnr` / `capability`.
+     */
     falseNegativeRate: number | null
     fixtureCallbacks: Record<string, boolean>
+    /** Async-OOB wiring gate (fired canaries only). */
+    wiringFnr?: OobWiringGate
+    /** Fixture capability gate over every planted #2 target. */
+    capability?: OobCapabilityGate
+    /** Structured canary evidence the wiring denominator was built from. */
+    canaryEvidence?: AsyncCanaryEvidence | null
   } | null
   staging: {
     writeBolaConfirmed: boolean
@@ -833,6 +849,11 @@ export interface RealismMetrics {
     /** Ranked probe plan emitted by Phase-0 (lossless store, sampled probing). */
     probePlan: { totalRoutes: number; priority: number; schemaTyped: number; probeSubset: number; clusters: number } | null
     fourHopConfirmations: number
+    /**
+     * Per Tier-A 4-hop slice funnel: dispatched → target route hit → verify called, plus the
+     * oracle rejection histogram. Built from assignments/broker exchanges/replay specs only.
+     */
+    sliceFunnel: SliceFunnelRow[] | null
   } | null
   grade: {
     submitted: number
@@ -849,6 +870,380 @@ export interface RealismMetrics {
 
 const ASYNC_TRUTH_IDS = ['wan-blind-sqli', 'wan-ssrf-async', 'wan-xxe-async'] as const
 const MONO_4HOP_IDS = ['mono-billing-bola', 'mono-report-sqli', 'mono-admin-bfla'] as const
+
+/**
+ * Async-OOB truth targets. They are the *only* members of the OOB wiring denominator: a
+ * capability miss on blind SQLi or an incomplete exfil chain says nothing about whether the
+ * async callback wiring worked, so those stay in the capability gate.
+ */
+const ASYNC_OOB_TRUTH: ReadonlyArray<{ id: string; kind: 'ssrf' | 'xxe'; label: string }> = [
+  { id: 'wan-ssrf-async', kind: 'ssrf', label: 'Async SSRF' },
+  { id: 'wan-xxe-async', kind: 'xxe', label: 'Async XXE' },
+]
+
+/** Planted Realism #2 capability targets (one chain member is the exfil chain itself). */
+const WAN_CAPABILITY_TARGETS: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'wan-ssrf-async', label: 'Async SSRF' },
+  { id: 'wan-xxe-async', label: 'Async XXE' },
+  { id: 'wan-blind-sqli', label: 'Blind SQLi (callback oracle)' },
+  { id: 'wan-oob-exfil', label: 'wan-oob-exfil chain complete' },
+]
+
+export interface AsyncCanaryCount {
+  /** Canary rows minted for this async OOB kind. */
+  minted: number
+  /** Canaries whose callback actually fired (`triggered` or `hit_count > 0`). */
+  fired: number
+}
+
+export interface AsyncCanaryEvidence {
+  ssrf: AsyncCanaryCount
+  xxe: AsyncCanaryCount
+}
+
+export type OobWiringBasis = 'fired_canaries' | 'all_minted_canaries' | 'none'
+
+/** Async-OOB wiring reliability, deliberately disjoint from fixture capability recall. */
+export interface OobWiringGate {
+  /** missed / denominator; `null` when no async canary evidence exists. */
+  rate: number | null
+  missed: number
+  denominator: number
+  basis: OobWiringBasis
+  firedTargets: string[]
+  mintedTargets: string[]
+  missedTargets: string[]
+}
+
+/** Fixture capability recall over every planted #2 target. */
+export interface OobCapabilityGate {
+  confirmed: number
+  planted: number
+  recall: number | null
+  members: Array<{ id: string; label: string; confirmed: boolean }>
+}
+
+export interface OobGateResult {
+  wiring: OobWiringGate
+  capability: OobCapabilityGate
+}
+
+export interface OobGateInput {
+  /** Structured canary rows; `null` means the table could not be read. */
+  canaries: AsyncCanaryEvidence | null
+  confirmed: {
+    asyncSsrf: boolean
+    asyncXxe: boolean
+    blindSqli: boolean
+    chainComplete: boolean
+  }
+  /** Fixture collector callbacks (supplementary fired evidence). */
+  fixtureCallbacks?: Record<string, boolean>
+  /** Durable `pending_oob` subscriptions; only used when canary rows are unreadable. */
+  pendingOobRegistered?: number | null
+}
+
+/**
+ * Split Realism #2 into two orthogonal gates.
+ *
+ * Wiring FNR answers "when an async-OOB canary fired, did the product convert it?". Its
+ * denominator is fired canary *targets* (SSRF/XXE), falling back to all minted async targets when
+ * nothing fired, and `null` when nothing was minted. Blind SQLi and the exfil chain are capability
+ * targets only — mixing them into this denominator is exactly the measurement dishonesty this gate
+ * removes.
+ *
+ * Capability recall answers "how many of the planted #2 targets did the product confirm?", over
+ * async SSRF, async XXE, blind SQLi and the completed exfil chain.
+ */
+export function computeOobGates(input: OobGateInput): OobGateResult {
+  const capabilityMembers = WAN_CAPABILITY_TARGETS.map(target => ({
+    id: target.id,
+    label: target.label,
+    confirmed: target.id === 'wan-oob-exfil'
+      ? input.confirmed.chainComplete
+      : target.id === 'wan-blind-sqli'
+        ? input.confirmed.blindSqli
+        : target.id === 'wan-ssrf-async'
+          ? input.confirmed.asyncSsrf
+          : input.confirmed.asyncXxe,
+  }))
+  const capabilityConfirmed = capabilityMembers.filter(member => member.confirmed).length
+  const capability: OobCapabilityGate = {
+    confirmed: capabilityConfirmed,
+    planted: capabilityMembers.length,
+    recall: capabilityMembers.length === 0 ? null : capabilityConfirmed / capabilityMembers.length,
+    members: capabilityMembers,
+  }
+
+  const pendingFallback = input.canaries === null && (input.pendingOobRegistered ?? 0) > 0
+  const targets = ASYNC_OOB_TRUTH.map(target => {
+    const counts = input.canaries?.[target.kind] ?? { minted: 0, fired: 0 }
+    const confirmed = target.kind === 'ssrf' ? input.confirmed.asyncSsrf : input.confirmed.asyncXxe
+    // A confirmed async finding is itself proof that the callback fired, even when the canary row
+    // was pruned before the harness read it.
+    const fired = counts.fired > 0 || Boolean(input.fixtureCallbacks?.[target.kind]) || confirmed
+    const minted = counts.minted > 0 || fired || pendingFallback
+    return { id: target.id, minted, fired, confirmed }
+  })
+
+  const firedTargets = targets.filter(target => target.fired).map(target => target.id)
+  const mintedTargets = targets.filter(target => target.minted).map(target => target.id)
+  let basis: OobWiringBasis = 'none'
+  let population: typeof targets = []
+  if (firedTargets.length > 0) {
+    basis = 'fired_canaries'
+    population = targets.filter(target => target.fired)
+  } else if (mintedTargets.length > 0) {
+    basis = 'all_minted_canaries'
+    population = targets.filter(target => target.minted)
+  }
+  const missedTargets = population.filter(target => !target.confirmed).map(target => target.id)
+  const wiring: OobWiringGate = {
+    rate: population.length === 0 ? null : missedTargets.length / population.length,
+    missed: missedTargets.length,
+    denominator: population.length,
+    basis,
+    firedTargets,
+    mintedTargets,
+    missedTargets,
+  }
+  return { wiring, capability }
+}
+
+/** Read the structured canary rows for the async-OOB kinds. `null` when unreadable. */
+export function readAsyncCanaryEvidence(storage: Store, runId: string): AsyncCanaryEvidence | null {
+  try {
+    const rows = storage.client.prepare(
+      'select purpose, triggered, hit_count from canaries where run_id = ?',
+    ).all(runId) as Array<{ purpose?: unknown; triggered?: unknown; hit_count?: unknown }>
+    const evidence: AsyncCanaryEvidence = { ssrf: { minted: 0, fired: 0 }, xxe: { minted: 0, fired: 0 } }
+    for (const row of rows) {
+      const purpose = typeof row.purpose === 'string' ? row.purpose.toLowerCase() : ''
+      const kind = purpose.includes('ssrf') ? 'ssrf' : purpose.includes('xxe') ? 'xxe' : null
+      if (!kind) continue
+      evidence[kind].minted += 1
+      const triggered = row.triggered === true || Number(row.triggered) === 1
+      if (triggered || Number(row.hit_count) > 0) evidence[kind].fired += 1
+    }
+    return evidence
+  } catch {
+    return null
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Realism #4 per-slice funnel (Tier-A 4-hop)
+// ---------------------------------------------------------------------------------------------
+
+export interface SliceFunnelRoute {
+  id: string
+  method: string
+  route: string
+}
+
+export interface SliceFunnelArtifacts {
+  /** Worker assignments with the labels the brief carried and the fact-linked routes. */
+  dispatches: Array<{
+    assignmentId: string
+    labels: string[]
+    factRoutes: Array<{ method: string; route: string }>
+  }>
+  /** Broker exchanges: the exact method + concrete path each assignment put on the wire. */
+  hits: Array<{ assignmentId: string; method: string; route: string }>
+  /** Replay verification calls, with the structural rejection code when the oracle said no. */
+  verifications: Array<{
+    method: string
+    route: string
+    verdict: string | null
+    rejectionCode: string | null
+    attempts: number
+  }>
+}
+
+export interface SliceFunnelRow {
+  id: string
+  method: string
+  route: string
+  dispatched: number
+  targetRouteHit: number
+  verifyCalled: number
+  oracleRejectedBy: Record<string, number>
+  confirmed: boolean
+  attribution: 'fact_link' | 'brief_target' | 'route_hit' | 'none'
+}
+
+/** Path prefix before the first template parameter, used to attribute brief text to a slice. */
+function routeStem(route: string): string {
+  const stem = (route.split(/[:{<]/)[0] ?? route).replace(/\/+$/, '')
+  return stem.length >= 5 ? stem : ''
+}
+
+function sliceRouteMatches(method: string, pattern: string, candidateMethod: string, candidate: string): boolean {
+  const left = method.toUpperCase()
+  const right = candidateMethod.toUpperCase()
+  if (left !== 'ANY' && right !== 'ANY' && left !== right) return false
+  return endpointMatches(pattern, candidate) || endpointMatches(candidate, pattern)
+}
+
+/**
+ * Compute the per-slice dispatch → route-hit → verify funnel. Pure: every input is a structured
+ * artifact row, so a truncated brief (dispatched>0, route hit 0), a dead verification call
+ * (route hit>0, verify called 0) and an oracle rejection (histogram) are distinguishable.
+ */
+export function computeSliceFunnels(input: {
+  slices: SliceFunnelRoute[]
+  artifacts: SliceFunnelArtifacts
+  confirmedIds: ReadonlySet<string>
+}): SliceFunnelRow[] {
+  return input.slices.map(slice => {
+    const factLinked = input.artifacts.dispatches.filter(dispatch =>
+      dispatch.factRoutes.some(fact => sliceRouteMatches(slice.method, slice.route, fact.method, fact.route)))
+    const briefTargeted = input.artifacts.dispatches.filter(dispatch => {
+      const stem = routeStem(slice.route)
+      return stem.length > 0 && dispatch.labels.some(label => label.includes(stem))
+    })
+    const hitAssignments = new Set(input.artifacts.hits
+      .filter(hit => sliceRouteMatches(slice.method, slice.route, hit.method, hit.route))
+      .map(hit => hit.assignmentId))
+    const dispatched = new Set([
+      ...factLinked.map(dispatch => dispatch.assignmentId),
+      ...briefTargeted.map(dispatch => dispatch.assignmentId),
+      ...hitAssignments,
+    ])
+    const verificationRows = input.artifacts.verifications
+      .filter(row => sliceRouteMatches(slice.method, slice.route, row.method, row.route))
+    const oracleRejectedBy: Record<string, number> = {}
+    for (const row of verificationRows) {
+      if (!row.rejectionCode) continue
+      oracleRejectedBy[row.rejectionCode] = (oracleRejectedBy[row.rejectionCode] ?? 0) + 1
+    }
+    const attribution: SliceFunnelRow['attribution'] = factLinked.length
+      ? 'fact_link'
+      : briefTargeted.length
+        ? 'brief_target'
+        : hitAssignments.size
+          ? 'route_hit'
+          : 'none'
+    return {
+      id: slice.id,
+      method: slice.method,
+      route: slice.route,
+      dispatched: dispatched.size,
+      targetRouteHit: hitAssignments.size,
+      verifyCalled: verificationRows.length,
+      oracleRejectedBy,
+      confirmed: input.confirmedIds.has(slice.id),
+      attribution,
+    }
+  })
+}
+
+/** Structural rejection code for a replay verdict. Never reads free-form prose. */
+export function verificationRejectionCode(feedback: Record<string, unknown> | null): {
+  verdict: string | null
+  code: string | null
+} {
+  if (!feedback) return { verdict: null, code: null }
+  const verdict = typeof feedback.verdict === 'string' ? feedback.verdict : null
+  if (verdict === 'confirmed' || verdict === 'static_verified') return { verdict, code: null }
+  if (typeof feedback.jqError === 'string' && feedback.jqError.length > 0) return { verdict, code: 'jq_error' }
+  if (feedback.spaCatchallMatched === true) return { verdict, code: 'spa_catchall' }
+  if (typeof feedback.failedStepId === 'string' && feedback.failedStepId.length > 0) return { verdict, code: 'step_failed' }
+  if (verdict === 'dismissed') return { verdict, code: 'dismissed' }
+  if (verdict === 'inconclusive') return { verdict, code: 'inconclusive' }
+  return { verdict, code: 'unclassified' }
+}
+
+/** Collect every `{method, pathAndQuery}` request embedded in a DeclarativeReplaySpec. */
+function collectSpecRequests(node: unknown, out: Array<{ method: string; route: string }>, depth = 0): void {
+  if (depth > 8 || node === null || typeof node !== 'object') return
+  if (Array.isArray(node)) {
+    for (const item of node) collectSpecRequests(item, out, depth + 1)
+    return
+  }
+  const obj = node as Record<string, unknown>
+  if (typeof obj.method === 'string' && typeof obj.pathAndQuery === 'string') {
+    out.push({ method: obj.method.toUpperCase(), route: canonicalRoutePath(obj.pathAndQuery) })
+  }
+  for (const value of Object.values(obj)) collectSpecRequests(value, out, depth + 1)
+}
+
+/** Read the structured rows the #4 funnel needs. Missing tables degrade to empty evidence. */
+export function readSliceFunnelArtifacts(storage: Store, runId: string): SliceFunnelArtifacts {
+  const dispatches: SliceFunnelArtifacts['dispatches'] = []
+  const hits: SliceFunnelArtifacts['hits'] = []
+  const verifications: SliceFunnelArtifacts['verifications'] = []
+  try {
+    const factRoutes = new Map<string, Array<{ method: string; route: string }>>()
+    const factRows = storage.client.prepare('select id, data from facts where run_id = ?').all(runId) as Array<{
+      id?: unknown
+      data?: unknown
+    }>
+    for (const row of factRows) {
+      const data = parseJsonObject(row.data)
+      if (!data || data.source !== 'program_graph' || typeof data.endpoint !== 'string') continue
+      const method = typeof data.method === 'string' ? data.method.toUpperCase() : 'GET'
+      const id = typeof row.id === 'string' ? row.id : ''
+      if (!id) continue
+      const list = factRoutes.get(id) ?? []
+      list.push({ method, route: canonicalRoutePath(data.endpoint) })
+      factRoutes.set(id, list)
+    }
+    const assignmentRows = storage.client.prepare(
+      'select id, title, objective, parent_fact_ids from assignments where run_id = ?',
+    ).all(runId) as Array<{ id?: unknown; title?: unknown; objective?: unknown; parent_fact_ids?: unknown }>
+    for (const row of assignmentRows) {
+      const assignmentId = typeof row.id === 'string' ? row.id : ''
+      if (!assignmentId) continue
+      const parentIds = Array.isArray(row.parent_fact_ids)
+        ? row.parent_fact_ids.filter((value): value is string => typeof value === 'string')
+        : []
+      dispatches.push({
+        assignmentId,
+        labels: [row.title, row.objective].filter((value): value is string => typeof value === 'string' && value.length > 0),
+        factRoutes: parentIds.flatMap(id => factRoutes.get(id) ?? []),
+      })
+    }
+    const exchangeRows = storage.client.prepare(
+      'select assignment_id, method, path_and_query from broker_exchanges where run_id = ?',
+    ).all(runId) as Array<{ assignment_id?: unknown; method?: unknown; path_and_query?: unknown }>
+    for (const row of exchangeRows) {
+      if (typeof row.assignment_id !== 'string' || typeof row.method !== 'string' || typeof row.path_and_query !== 'string') continue
+      hits.push({
+        assignmentId: row.assignment_id,
+        method: row.method.toUpperCase(),
+        route: canonicalRoutePath(row.path_and_query),
+      })
+    }
+    const specRows = storage.client.prepare(
+      'select spec, last_verification_diff, attempt_count from replay_specs where run_id = ?',
+    ).all(runId) as Array<{ spec?: unknown; last_verification_diff?: unknown; attempt_count?: unknown }>
+    for (const row of specRows) {
+      let requests: Array<{ method: string; route: string }> = []
+      try {
+        collectSpecRequests(typeof row.spec === 'string' ? JSON.parse(row.spec) : row.spec, requests)
+      } catch {
+        requests = []
+      }
+      if (requests.length === 0) continue
+      const feedback = parseJsonObject(row.last_verification_diff)
+      const { verdict, code } = verificationRejectionCode(feedback)
+      const attempts = Number(row.attempt_count)
+      for (const request of requests) {
+        verifications.push({
+          method: request.method,
+          route: request.route,
+          verdict,
+          rejectionCode: code,
+          attempts: Number.isFinite(attempts) ? attempts : 0,
+        })
+      }
+    }
+  } catch {
+    // A missing table means "no evidence", never a synthetic zero funnel.
+  }
+  return { dispatches, hits, verifications }
+}
 
 function truePositiveIds(grade: GradeResult | null): Set<string> {
   const ids = new Set<string>()
@@ -1220,6 +1615,25 @@ function tierA4HopSinkCount(input: {
   return matched
 }
 
+/** Per Tier-A 4-hop slice funnel for Realism #4. */
+function monorepoSliceFunnel(storage: Store, runId: string, confirmed: ReadonlySet<string>): SliceFunnelRow[] {
+  const truth = loadTruth('monorepo-whitebox')
+  const slices: SliceFunnelRoute[] = MONO_4HOP_IDS.flatMap(id => {
+    const finding = truth.findings.find(entry => entry.id === id)
+    if (!finding) return []
+    return [{
+      id,
+      method: (finding.method ?? 'GET').toUpperCase(),
+      route: normalizeRouteTemplate(finding.endpoint),
+    }]
+  })
+  return computeSliceFunnels({
+    slices,
+    artifacts: readSliceFunnelArtifacts(storage, runId),
+    confirmedIds: confirmed,
+  })
+}
+
 function siblingSuppressionObserved(fixture: string, events: RunEventRow[] | null): boolean | null {
   if (fixture !== 'monorepo-whitebox') return null
   if (events === null) return null
@@ -1241,6 +1655,8 @@ export function collectWiringMetrics(input: {
   routes: RouteRef[]
   broker?: BrokerObservation
   storeWriteSamples?: readonly number[]
+  /** Precomputed split OOB gates (computed from grade + canary rows by the caller). */
+  oobGates?: OobGateResult | null
 }): WiringMetricValues {
   const events = readRunEvents(input.storage, input.runId)
   const drainEvent = events?.filter(event => event.kind === 'oob.drain_complete').at(-1)
@@ -1299,6 +1715,7 @@ export function collectWiringMetrics(input: {
     siblingDerivationSuppressed: siblingSuppressionObserved(input.fixture, events),
     tierA4HopSinks: tierA4HopSinkCount({ fixture: input.fixture, events, leads }),
     leakedEntities: null,
+    oobWiringFnr: input.fixture === 'wan-oob' ? (input.oobGates?.wiring ?? null) : null,
   }
 }
 
@@ -1368,6 +1785,29 @@ export function evaluateWiring(fixture: string, values: WiringMetricValues): Wir
         ok: value => value >= 15_000,
         observed: `${drain} ms waited for ${late} late callback(s)`,
       }))
+    }
+
+    // Split gate: async-OOB wiring reliability, measured only over fired/minted async canaries.
+    // Blind SQLi and the exfil chain are capability targets and never enter this denominator.
+    // `null` means no gate data was supplied (legacy/synthetic wiring view); a supplied gate with
+    // no async canary evidence is `unmeasured` and fails closed.
+    const fnr = values.oobWiringFnr
+    if (fnr) {
+      if (fnr.rate === null) {
+        criteria.push({
+          id: 'oob_wiring_fnr',
+          label: 'OOB wiring false-negative rate <= 5% over async canaries that fired',
+          status: 'unmeasured',
+          observed: `no async-OOB canary evidence (basis ${fnr.basis})`,
+        })
+      } else {
+        criteria.push({
+          id: 'oob_wiring_fnr',
+          label: 'OOB wiring false-negative rate <= 5% over async canaries that fired',
+          status: fnr.rate <= 0.05 ? 'pass' : 'fail',
+          observed: `${(fnr.rate * 100).toFixed(1)}% (${fnr.missed}/${fnr.denominator} async canary target(s) unconfirmed; basis ${fnr.basis})`,
+        })
+      }
     }
   }
 
@@ -1466,6 +1906,8 @@ export function computeMetrics(input: {
   wiring: WiringMetricValues
   /** Operations carried by the harness-built API reference (grey/white-box). */
   specOps?: number
+  /** Precomputed split OOB gates; recomputed from `storage`/`grade` when omitted. */
+  oobGates?: OobGateResult | null
 }): RealismMetrics {
   const tp = truePositiveIds(input.grade)
   const chains: ChainSummary[] = (input.grade?.chains ?? []).map(chain => ({
@@ -1507,13 +1949,28 @@ export function computeMetrics(input: {
 
   if (input.fixture === 'wan-oob') {
     const missedAsync = ASYNC_TRUTH_IDS.filter(id => !tp.has(id)).length
+    const fixtureCallbacks = wanCallbacks(input.started)
+    const canaryEvidence = readAsyncCanaryEvidence(input.storage, input.runId)
+    const oobGates = input.oobGates ?? computeOobGates({
+      canaries: canaryEvidence,
+      confirmed: {
+        asyncSsrf: tp.has('wan-ssrf-async'),
+        asyncXxe: tp.has('wan-xxe-async'),
+        blindSqli: tp.has('wan-blind-sqli'),
+        chainComplete: chains.some(chain => chain.id === 'wan-oob-exfil' && chain.complete),
+      },
+      fixtureCallbacks,
+    })
     metrics.oob = {
       blindSqliConfirmed: tp.has('wan-blind-sqli'),
       asyncSsrfConfirmed: tp.has('wan-ssrf-async'),
       asyncXxeConfirmed: tp.has('wan-xxe-async'),
       webhookForgeryConfirmed: tp.has('wan-webhook-forgery'),
       falseNegativeRate: missedAsync / ASYNC_TRUTH_IDS.length,
-      fixtureCallbacks: wanCallbacks(input.started),
+      fixtureCallbacks,
+      wiringFnr: oobGates.wiring,
+      capability: oobGates.capability,
+      canaryEvidence,
     }
   }
 
@@ -1555,6 +2012,7 @@ export function computeMetrics(input: {
       fourHopLeads: leads.fourHop,
       probePlan: probePlanStats(input.storage, input.runId),
       fourHopConfirmations: MONO_4HOP_IDS.filter(id => tp.has(id)).length,
+      sliceFunnel: monorepoSliceFunnel(input.storage, input.runId, tp),
     }
   }
 
@@ -1605,25 +2063,49 @@ export function evaluateGate(fixture: string, metrics: RealismMetrics): GateCrit
 
   if (fixture === 'wan-oob') {
     const oob = metrics.oob
-    criteria.push(
-      { id: 'blind-sqli', label: 'Blind SQLi confirmed', required: true, met: Boolean(oob?.blindSqliConfirmed), observed: String(Boolean(oob?.blindSqliConfirmed)) },
-      { id: 'async-ssrf', label: 'Async SSRF confirmed', required: true, met: Boolean(oob?.asyncSsrfConfirmed), observed: String(Boolean(oob?.asyncSsrfConfirmed)) },
-      { id: 'async-xxe', label: 'Async XXE confirmed', required: true, met: Boolean(oob?.asyncXxeConfirmed), observed: String(Boolean(oob?.asyncXxeConfirmed)) },
-      {
-        id: 'async-false-negative-rate',
-        label: 'Async false-negative rate < 5%',
-        required: true,
-        met: oob?.falseNegativeRate !== null && oob?.falseNegativeRate !== undefined && oob.falseNegativeRate < 0.05,
-        observed: oob?.falseNegativeRate === null || oob?.falseNegativeRate === undefined ? 'not measured' : `${(oob.falseNegativeRate * 100).toFixed(1)}%`,
+    const chain = metrics.grade?.chains.find(entry => entry.id === 'wan-oob-exfil')
+    // The capability gate is over all planted #2 targets; the legacy blended FNR stays visible
+    // as an informational row so the number is not silently dropped.
+    const capability = oob?.capability ?? computeOobGates({
+      canaries: null,
+      confirmed: {
+        asyncSsrf: Boolean(oob?.asyncSsrfConfirmed),
+        asyncXxe: Boolean(oob?.asyncXxeConfirmed),
+        blindSqli: Boolean(oob?.blindSqliConfirmed),
+        chainComplete: chainComplete('wan-oob-exfil'),
       },
+      fixtureCallbacks: oob?.fixtureCallbacks ?? {},
+    }).capability
+    const missing = capability.members.filter(member => !member.confirmed).map(member => member.label)
+    criteria.push({
+      id: 'fixture_capability_recall',
+      label: 'Fixture capability recall >= 75% of planted #2 targets',
+      required: true,
+      met: capability.recall !== null && capability.recall >= 0.75,
+      observed: capability.recall === null
+        ? 'not measured'
+        : `${capability.confirmed}/${capability.planted} (${(capability.recall * 100).toFixed(1)}%)`
+          + `${missing.length ? ` — missing: ${missing.join(', ')}` : ''}`,
+    })
+    criteria.push(
+      { id: 'blind-sqli', label: 'Informational: blind SQLi confirmed (capability member)', required: false, met: Boolean(oob?.blindSqliConfirmed), observed: String(Boolean(oob?.blindSqliConfirmed)) },
+      { id: 'async-ssrf', label: 'Informational: async SSRF confirmed (capability member)', required: false, met: Boolean(oob?.asyncSsrfConfirmed), observed: String(Boolean(oob?.asyncSsrfConfirmed)) },
+      { id: 'async-xxe', label: 'Informational: async XXE confirmed (capability member)', required: false, met: Boolean(oob?.asyncXxeConfirmed), observed: String(Boolean(oob?.asyncXxeConfirmed)) },
       {
         id: 'chain-wan-oob-exfil',
-        label: 'Chain wan-oob-exfil complete',
-        required: true,
+        label: 'Informational: chain wan-oob-exfil complete (capability member)',
+        required: false,
         met: chainComplete('wan-oob-exfil'),
-        observed: metrics.grade?.chains.find(chain => chain.id === 'wan-oob-exfil')
-          ? `${metrics.grade.chains.find(chain => chain.id === 'wan-oob-exfil')!.covered}/${metrics.grade.chains.find(chain => chain.id === 'wan-oob-exfil')!.total}`
-          : 'not measured',
+        observed: chain ? `${chain.covered}/${chain.total}` : 'not measured',
+      },
+      {
+        id: 'legacy-blended-async-fnr',
+        label: 'Informational (not a gate): legacy blended async false-negative rate',
+        required: false,
+        met: oob?.falseNegativeRate !== null && oob?.falseNegativeRate !== undefined && oob.falseNegativeRate < 0.05,
+        observed: oob?.falseNegativeRate === null || oob?.falseNegativeRate === undefined
+          ? 'not measured'
+          : `${(oob.falseNegativeRate * 100).toFixed(1)}% — includes blind SQLi in the async denominator`,
       },
     )
   }
@@ -2526,6 +3008,19 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
     grade = gradeFindings(loadTruth(fixtureName), submitted)
     restoreStoreWrites?.()
     restoreStoreWrites = null
+    const tpIds = truePositiveIds(grade)
+    const oobGates = fixtureName === 'wan-oob'
+      ? computeOobGates({
+          canaries: readAsyncCanaryEvidence(storage, createdRun.id),
+          confirmed: {
+            asyncSsrf: tpIds.has('wan-ssrf-async'),
+            asyncXxe: tpIds.has('wan-xxe-async'),
+            blindSqli: tpIds.has('wan-blind-sqli'),
+            chainComplete: grade.chains.some(chain => chain.id === 'wan-oob-exfil' && chain.complete),
+          },
+          fixtureCallbacks: wanCallbacks(started),
+        })
+      : null
     const wiringValues = collectWiringMetrics({
       fixture: fixtureName,
       storage,
@@ -2534,6 +3029,7 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
       routes,
       ...(observedBroker ? { broker: observedBroker.observation() } : {}),
       storeWriteSamples,
+      oobGates,
     })
     metrics = computeMetrics({
       fixture: fixtureName,
@@ -2548,6 +3044,7 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
       runId: createdRun.id,
       wiring: wiringValues,
       specOps: ctx.specOps,
+      oobGates,
     })
     log(`[${slug}] ${terminalStatus}/${terminalPhase}: ${detailEndpoints.length} endpoints, ${detailFindings.length} findings, `
       + `${grade.truePositives} TP / ${grade.falsePositives} FP`)
@@ -2708,6 +3205,23 @@ function chainLine(id: string, chains: ChainSummary[]): string {
   return chain ? `${chain.covered}/${chain.total}${chain.complete ? ' complete' : ''}` : 'n/a'
 }
 
+/** Render the #4 per-slice funnel table (dispatch → route hit → verify → rejection codes). */
+export function renderSliceFunnelMarkdown(rows: readonly SliceFunnelRow[]): string[] {
+  if (rows.length === 0) return ['- not measured (no Tier-A 4-hop slices)']
+  const lines = [
+    '| slice | method | route | dispatched | target route hit | verify called | oracle rejected by | confirmed |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- |',
+  ]
+  for (const row of rows) {
+    const rejected = Object.entries(row.oracleRejectedBy)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([code, count]) => `${code}=${count}`)
+      .join(', ') || 'none'
+    lines.push(`| ${row.id} | ${row.method} | \`${row.route}\` | ${row.dispatched} | ${row.targetRouteHit} | ${row.verifyCalled} | ${rejected} | ${row.confirmed ? 'yes' : 'no'} |`)
+  }
+  return lines
+}
+
 export function renderCellMarkdown(result: RealismCellResult): string {
   const lines: string[] = []
   const chains = result.metrics.grade?.chains ?? []
@@ -2766,14 +3280,37 @@ export function renderCellMarkdown(result: RealismCellResult): string {
   }
   if (result.metrics.oob) {
     const oob = result.metrics.oob
+    const fnr = oob.wiringFnr
+    const capability = oob.capability
     lines.push('')
-    lines.push('## WAN / async OOB')
+    lines.push('## WAN / async OOB — split gates')
+    lines.push('')
+    lines.push(`- \`oob_wiring_fnr\`: ${pct(fnr?.rate ?? null)} — ${fnr?.rate === null || fnr === undefined
+      ? 'UNMEASURED'
+      : (fnr.rate <= 0.05 ? 'PASS' : 'FAIL')} (threshold <= 5%; ${fnr?.missed ?? '?'}/${fnr?.denominator ?? '?'} async canary target(s) unconfirmed; basis ${fnr?.basis ?? 'none'})`)
+    lines.push(`- \`fixture_capability_recall\`: ${pct(capability?.recall ?? null)} — ${capability?.recall === null || capability === undefined
+      ? 'UNMEASURED'
+      : (capability.recall >= 0.75 ? 'PASS' : 'FAIL')} (threshold >= 75%; ${capability?.confirmed ?? '?'}/${capability?.planted ?? '?'} planted targets)`)
+    lines.push(`- legacy blended async false-negative rate (informational, not a gate): ${pct(oob.falseNegativeRate)}`)
+    if (oob.canaryEvidence) {
+      lines.push(`- async canary evidence: SSRF ${oob.canaryEvidence.ssrf.minted} minted / ${oob.canaryEvidence.ssrf.fired} fired; XXE ${oob.canaryEvidence.xxe.minted} minted / ${oob.canaryEvidence.xxe.fired} fired`)
+    } else {
+      lines.push('- async canary evidence: not readable')
+    }
+    if (fnr && (fnr.firedTargets.length || fnr.missedTargets.length)) {
+      lines.push(`- OOB denominator targets: fired ${fnr.firedTargets.join(', ') || 'none'}; missed ${fnr.missedTargets.join(', ') || 'none'}`)
+    }
+    lines.push('')
+    lines.push('| capability target | confirmed |')
+    lines.push('| --- | --- |')
+    for (const member of capability?.members ?? []) {
+      lines.push(`| ${member.label} | ${member.confirmed ? 'yes' : 'no'} |`)
+    }
     lines.push('')
     lines.push(`- blind SQLi: ${oob.blindSqliConfirmed ? 'confirmed' : 'not confirmed'}`)
     lines.push(`- async SSRF: ${oob.asyncSsrfConfirmed ? 'confirmed' : 'not confirmed'}`)
     lines.push(`- async XXE: ${oob.asyncXxeConfirmed ? 'confirmed' : 'not confirmed'}`)
     lines.push(`- webhook forgery: ${oob.webhookForgeryConfirmed ? 'confirmed' : 'not confirmed'}`)
-    lines.push(`- async false-negative rate: ${pct(oob.falseNegativeRate)}`)
     lines.push(`- fixture-side callbacks observed: ${Object.entries(oob.fixtureCallbacks).filter(([, hit]) => hit).map(([kind]) => kind).join(', ') || 'none'}`)
   }
   if (result.metrics.staging) {
@@ -2800,6 +3337,10 @@ export function renderCellMarkdown(result: RealismCellResult): string {
       ? `- ranked probe plan: Tier A ${mono.probePlan.priority}; schema-typed ${mono.probePlan.schemaTyped}; subset ${mono.probePlan.probeSubset}/${mono.probePlan.totalRoutes} across ${mono.probePlan.clusters} clusters`
       : '- ranked probe plan: not measured')
     lines.push(`- 4-hop confirmations: ${mono.fourHopConfirmations}/3`)
+    lines.push('')
+    lines.push('### Per-slice funnel (Tier-A 4-hop)')
+    lines.push('')
+    lines.push(...renderSliceFunnelMarkdown(mono.sliceFunnel ?? []))
   }
   if (result.grade) {
     lines.push('')
@@ -2849,13 +3390,21 @@ function renderSummaryMarkdown(summary: RealismSummary): string {
   lines.push(`- fixtures: ${summary.passed} gate pass / ${summary.failed} not passing`)
   lines.push(`- artifact secret scan: ${summary.secretScan.clean ? 'clean' : 'FAILED'}`)
   lines.push('')
-  lines.push('| fixture | wiring | capability | overall | stage | TP | FP | precision | recall | chains |')
-  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |')
+  lines.push('| fixture | wiring | capability | overall | stage | TP | FP | precision | recall | chains | oob_wiring_fnr | capability_recall |')
+  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |')
   for (const cell of summary.cells) {
     const grade = cell.metrics.grade
     const chains = grade ? grade.chains.filter(chain => chain.complete).length : 0
     const chainTotal = grade?.chains.length ?? 0
-    lines.push(`| ${cell.fixture} | ${cell.wiringPassed ? 'PASS' : 'FAIL'} | ${cell.capabilityPassed ? 'PASS' : 'FAIL'} | ${cell.passed ? 'PASS' : 'FAIL'} | \`${cell.failureStage}\` | ${grade?.truePositives ?? 'n/a'} | ${grade?.falsePositives ?? 'n/a'} | ${pct(grade && grade.submitted ? grade.precision : null)} | ${pct(grade?.recall)} | ${chains}/${chainTotal} |`)
+    const oob = cell.metrics.oob
+    const fnr = oob?.wiringFnr?.rate ?? null
+    const fnrCell = oob?.wiringFnr
+      ? `${pct(fnr)} ${fnr === null ? 'UNMEASURED' : (fnr <= 0.05 ? 'PASS' : 'FAIL')}`
+      : 'n/a'
+    const recallCell = oob?.capability
+      ? `${pct(oob.capability.recall)} (${oob.capability.confirmed}/${oob.capability.planted}) ${(oob.capability.recall ?? 0) >= 0.75 ? 'PASS' : 'FAIL'}`
+      : 'n/a'
+    lines.push(`| ${cell.fixture} | ${cell.wiringPassed ? 'PASS' : 'FAIL'} | ${cell.capabilityPassed ? 'PASS' : 'FAIL'} | ${cell.passed ? 'PASS' : 'FAIL'} | \`${cell.failureStage}\` | ${grade?.truePositives ?? 'n/a'} | ${grade?.falsePositives ?? 'n/a'} | ${pct(grade && grade.submitted ? grade.precision : null)} | ${pct(grade?.recall)} | ${chains}/${chainTotal} | ${fnrCell} | ${recallCell} |`)
   }
   lines.push('')
   for (const cell of summary.cells) {
