@@ -11,16 +11,20 @@ import type { CanaryBroker } from './canary-broker.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
 import { listMountedRepos } from './github-connector.ts'
 import {
+  buildCodeDataflowSlice,
   deriveCodeToRuntimeHypotheses,
   extractProgramGraph,
   mapServicesToOrigins,
+  resolveRouteSinkPaths,
 } from './program-graph.ts'
 import type {
+  CodeDataflowSlice,
   CodeToRuntimeHypothesis,
   CommitDiffSignal,
   MonorepoService,
   ProgramGraph,
   ProgramRoute,
+  RouteSinkPath,
   ServiceOriginMapping,
 } from './program-graph.ts'
 import { buildSoft404ProbePaths } from './scoped-browser.ts'
@@ -50,6 +54,8 @@ export interface Phase0ReconParams {
   interactiveTraversal?: boolean
   /** Read-only traversal mode (no form submits). Defaults to true. */
   readOnlyMode?: boolean
+  /** Lower the per-run code-slice cap for tests/tight budgets (hard-capped at 200). */
+  maxCodeSlices?: number
 }
 
 export interface Phase0ReconResult {
@@ -86,7 +92,12 @@ export interface Phase0ReconResult {
   /** Admin/privileged or role-restricted routes surfaced immediately from the persona union. */
   privilegedEndpoints?: Array<{ method: string; pathTemplate: string; personas: string[]; reason: string }>
   /** Code-to-runtime hypotheses derived from the mounted Program Graph (planner/engine input). */
-  codeToRuntimeHypotheses?: CodeToRuntimeHypothesis[]
+  codeToRuntimeHypotheses?: CodeSliceHypothesis[]
+  /**
+   * Bounded attachment accounting for white-box dataflow slices stored on the hypotheses above.
+   * `codeSlice: 'unavailable'` means no graph/source was available (nothing was fabricated).
+   */
+  codeSlices?: Phase0CodeSliceSummary
   /** Mounted-repo Program Graph extraction summary (AST primary, regex fallback). */
   repoStaticExtraction?: RepoStaticExtractionSummary
   /**
@@ -1169,6 +1180,161 @@ export function rankAndClusterAstRoutes(input: {
     clusters: [...clusters.values()].map(cluster => cluster.meta),
     representatives,
     probeSubset,
+  }
+}
+
+/** Hard per-run cap on distinct code-dataflow slices built during Phase-0. */
+export const PHASE0_MAX_CODE_SLICES = 200
+
+/** Bounded accounting for Phase-0 code-slice attachment (metrics + result payload). */
+export interface Phase0CodeSliceSummary {
+  /** Route-bound hypotheses considered for a slice. */
+  candidates: number
+  /** Hypotheses that received a rendered slice. */
+  attached: number
+  /** Route-bound candidates that produced no slice (route absent from the graph). */
+  unavailable: number
+  /** Candidates left without a slice because the per-run cap was reached. */
+  capped: number
+  /** Distinct routes that produced a slice. */
+  routes: number
+  /** Mean rendered JSON size across the distinct attached slices. */
+  avgBytes: number
+  /** `missing_guard` entries carried by the distinct attached slices. */
+  guardDiffs: number
+  maxSlices: number
+  /** `attached` when at least one slice was attached, else `unavailable` (no graph/source). */
+  codeSlice: 'attached' | 'unavailable'
+}
+
+export type CodeSliceHypothesis = CodeToRuntimeHypothesis & { codeSlice?: CodeDataflowSlice }
+
+const CODE_SLICE_SEVERITY_RANK: Record<CodeToRuntimeHypothesis['severity'], number> = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+}
+
+export function emptyCodeSliceSummary(maxSlices = PHASE0_MAX_CODE_SLICES): Phase0CodeSliceSummary {
+  return {
+    candidates: 0,
+    attached: 0,
+    unavailable: 0,
+    capped: 0,
+    routes: 0,
+    avgBytes: 0,
+    guardDiffs: 0,
+    maxSlices,
+    codeSlice: 'unavailable',
+  }
+}
+
+/**
+ * Attach compact (`<= 600 B`) dataflow slices to code-to-runtime hypotheses.
+ *
+ * Selection is deterministic and layer-first: Tier-A routes (hypothesis-linked probe-plan
+ * priorities) first, then Tier-B schema/admin routes, then the long tail; ties break on severity,
+ * confidence and hypothesis id. At most `maxSlices` distinct routes are built per run (`200` hard
+ * cap), and the sink-path walk is shared across every slice. Hypotheses whose route is not in the
+ * graph stay untouched — no slice is fabricated.
+ */
+export function attachCodeSlicesToPhase0Hypotheses(input: {
+  graph?: ProgramGraph | null
+  hypotheses: readonly CodeToRuntimeHypothesis[]
+  /** Tier-A probe-plan route ids/keys (`METHOD path`). */
+  priorityRouteIds?: ReadonlySet<string>
+  priorityRouteKeys?: ReadonlySet<string>
+  /** Tier-B probe-plan route ids/keys (`METHOD path`). */
+  schemaTypedRouteIds?: ReadonlySet<string>
+  schemaTypedRouteKeys?: ReadonlySet<string>
+  maxSlices?: number
+  /** Reuse a precomputed sink-path set (avoids re-walking a large graph). */
+  sinkPaths?: readonly RouteSinkPath[]
+}): { hypotheses: CodeSliceHypothesis[]; summary: Phase0CodeSliceSummary } {
+  const maxSlices = Math.max(0, Math.min(input.maxSlices ?? PHASE0_MAX_CODE_SLICES, PHASE0_MAX_CODE_SLICES))
+  const summary = emptyCodeSliceSummary(maxSlices)
+  const keyOf = (hypothesis: CodeToRuntimeHypothesis): { key: string; ref: { routeId?: string; method?: string; path?: string } } | null => {
+    const routeId = typeof hypothesis.routeId === 'string' && hypothesis.routeId ? hypothesis.routeId : undefined
+    const method = typeof hypothesis.method === 'string' && hypothesis.method ? hypothesis.method.toUpperCase() : undefined
+    const path = typeof hypothesis.path === 'string' && hypothesis.path ? hypothesis.path : undefined
+    if (!routeId && !path) return null
+    return {
+      key: routeId ?? `${method ?? ''} ${path ?? ''}`,
+      ref: { ...(routeId ? { routeId } : {}), ...(method ? { method } : {}), ...(path ? { path } : {}) },
+    }
+  }
+  const candidates: Array<{ index: number; key: string; ref: { routeId?: string; method?: string; path?: string } }> = []
+  for (let index = 0; index < input.hypotheses.length; index += 1) {
+    const bound = keyOf(input.hypotheses[index]!)
+    if (bound) candidates.push({ index, ...bound })
+  }
+  summary.candidates = candidates.length
+  if (!input.graph || candidates.length === 0) {
+    summary.unavailable = candidates.length
+    return { hypotheses: input.hypotheses.map(hypothesis => hypothesis), summary }
+  }
+
+  const routeKey = (method?: string, path?: string) => `${(method ?? '').toUpperCase()} ${path ?? ''}`
+  const tierOf = (hypothesis: CodeToRuntimeHypothesis): number => {
+    const id = hypothesis.routeId
+    const key = routeKey(hypothesis.method, hypothesis.path)
+    if ((id && input.priorityRouteIds?.has(id)) || (hypothesis.path && input.priorityRouteKeys?.has(key))) return 0
+    if ((id && input.schemaTypedRouteIds?.has(id)) || (hypothesis.path && input.schemaTypedRouteKeys?.has(key))) return 1
+    return 2
+  }
+  const ordered = [...candidates].sort((a, b) => {
+    const ha = input.hypotheses[a.index]!
+    const hb = input.hypotheses[b.index]!
+    return tierOf(ha) - tierOf(hb)
+      || CODE_SLICE_SEVERITY_RANK[ha.severity] - CODE_SLICE_SEVERITY_RANK[hb.severity]
+      || hb.confidence - ha.confidence
+      || (ha.id < hb.id ? -1 : ha.id > hb.id ? 1 : 0)
+  })
+
+  const sinkPaths = input.sinkPaths ?? resolveRouteSinkPaths(input.graph, { maxDepth: 8, maxPaths: 500 })
+  const built = new Map<string, CodeDataflowSlice | null>()
+  const assigned = new Map<number, CodeDataflowSlice>()
+  const bytesByKey = new Map<string, number>()
+  let attempted = 0
+  for (const candidate of ordered) {
+    let slice = built.get(candidate.key)
+    if (slice === undefined) {
+      if (attempted >= maxSlices) {
+        summary.capped += 1
+        continue
+      }
+      attempted += 1
+      slice = buildCodeDataflowSlice(input.graph, candidate.ref, { sinkPaths, maxHops: 8 }) ?? null
+      built.set(candidate.key, slice)
+      if (slice) bytesByKey.set(candidate.key, Buffer.byteLength(JSON.stringify(slice), 'utf8'))
+    }
+    if (!slice) {
+      summary.unavailable += 1
+      continue
+    }
+    assigned.set(candidate.index, slice)
+    summary.attached += 1
+  }
+
+  summary.routes = bytesByKey.size
+  if (bytesByKey.size > 0) {
+    let total = 0
+    for (const bytes of bytesByKey.values()) total += bytes
+    summary.avgBytes = Math.round(total / bytesByKey.size)
+  }
+  for (const slice of built.values()) {
+    const diff = slice?.guardDiff?.length ?? 0
+    if (diff > 0) summary.guardDiffs += diff
+  }
+  summary.codeSlice = summary.attached > 0 ? 'attached' : 'unavailable'
+
+  return {
+    hypotheses: input.hypotheses.map((hypothesis, index) => {
+      const slice = assigned.get(index)
+      return slice ? { ...hypothesis, codeSlice: slice } : hypothesis
+    }),
+    summary,
   }
 }
 
@@ -2916,7 +3082,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   //    mount prefixes, exact methods, input schemas and middleware/guard chains. Regex extraction
   //    stays as an explicitly-marked fallback for constructs the structural scanner cannot attribute.
   let repoStaticExtraction: RepoStaticExtractionSummary | undefined
-  let codeToRuntimeHypotheses: CodeToRuntimeHypothesis[] | undefined
+  let codeToRuntimeHypotheses: CodeSliceHypothesis[] | undefined
+  let codeSlices = emptyCodeSliceSummary(params.maxCodeSlices)
   let probePlan: Phase0ReconResult['probePlan']
   if (params.reposDir && normalizedOrigins.length > 0) {
     const primaryOrigin = normalizedOrigins[0]!
@@ -2977,13 +3144,26 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       warnings: graphExtraction?.warnings ?? [],
     }
     if (graphExtraction) {
-      codeToRuntimeHypotheses = graphExtraction.hypotheses
       // Lossless store, ranked probe: every AST route is persisted above; this plan only
       // prioritizes and clusters the probing/consumption order for downstream consumers.
       const plan = rankAndClusterAstRoutes({
         routes: graphExtraction.routes,
         hypotheses: graphExtraction.hypotheses,
       })
+      // White-box slices ride on the hypothesis payload (bounded `codeSlice` field) so the brief
+      // builder can hand exact file:line evidence to a specialist without re-reading the graph.
+      // Tier-A (hypothesis-linked) routes are sliced first, then Tier-B, then the long tail.
+      const attached = attachCodeSlicesToPhase0Hypotheses({
+        graph: graphExtraction.graph,
+        hypotheses: graphExtraction.hypotheses,
+        priorityRouteIds: new Set(plan.priority.map(route => route.routeId).filter((id): id is string => Boolean(id))),
+        priorityRouteKeys: new Set(plan.priority.map(route => routeKey(route))),
+        schemaTypedRouteIds: new Set(plan.schemaTyped.map(route => route.routeId).filter((id): id is string => Boolean(id))),
+        schemaTypedRouteKeys: new Set(plan.schemaTyped.map(route => routeKey(route))),
+        ...(params.maxCodeSlices !== undefined ? { maxSlices: params.maxCodeSlices } : {}),
+      })
+      codeToRuntimeHypotheses = attached.hypotheses
+      codeSlices = attached.summary
       probePlan = {
         totalRoutes: plan.totalRoutes,
         priority: plan.priority.length,
@@ -3038,6 +3218,26 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       })
     }
   }
+
+  // 1a. White-box dataflow slices (metrics for every tier). `codeSlice: 'unavailable'` records
+  // that no graph/source existed; nothing is fabricated in that case.
+  storage.event(
+    runId,
+    'phase0.code_slices',
+    codeSlices.attached > 0
+      ? `Attached ${codeSlices.attached} code dataflow slice(s) (${codeSlices.routes} route(s), avg ${codeSlices.avgBytes} B).`
+      : 'No code dataflow slices available (no mounted graph/source); hypotheses stay slice-free.',
+    {
+      code_slices_attached: codeSlices.attached,
+      code_slices_unavailable: codeSlices.unavailable,
+      code_slices_capped: codeSlices.capped,
+      code_slices_routes: codeSlices.routes,
+      avg_slice_bytes: codeSlices.avgBytes,
+      guard_diffs: codeSlices.guardDiffs,
+      max_slices: codeSlices.maxSlices,
+      codeSlice: codeSlices.codeSlice,
+    },
+  )
 
   // 1b. Lossless ingestion of the grey-box API reference. Offline: every declared operation is
   // recorded with its declared method (DELETE/PATCH/body-only POST included), so a variant that
@@ -3110,6 +3310,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       ...(declaredSurface ? { declaredSurface } : {}),
       ...(repoStaticExtraction ? { repoStaticExtraction } : {}),
       ...(codeToRuntimeHypotheses && codeToRuntimeHypotheses.length ? { codeToRuntimeHypotheses } : {}),
+      codeSlices,
       ...(probePlan ? { probePlan } : {}),
       ...(siblingDerivationSuppressed ? { siblingDerivationSuppressed } : {}),
       visibleToPersonas: staticVisibility,
@@ -4484,6 +4685,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     visibleToPersonas,
     ...(repoStaticExtraction ? { repoStaticExtraction } : {}),
     ...(codeToRuntimeHypotheses && codeToRuntimeHypotheses.length ? { codeToRuntimeHypotheses } : {}),
+    codeSlices,
     ...(probePlan ? { probePlan } : {}),
     ...(siblingDerivationSuppressed ? { siblingDerivationSuppressed } : {}),
     ...(privilegedSurface.length > 0 ? { privilegedEndpoints: privilegedSurface } : {}),
