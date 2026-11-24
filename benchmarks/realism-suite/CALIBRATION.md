@@ -148,19 +148,31 @@ GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- --fixture enterprise-spa
 
 ## Gate #2 — WAN + async OOB (`wan-oob`)
 
-Gate: **blind SQLi confirmed**, **async SSRF confirmed**, **async XXE confirmed**, and
-**async false-negative rate < 5%**, with chain `wan-oob-exfil` complete. Wiring is judged
-separately: at least one durable `pending_oob` subscription must be registered, and any late
-callback must be allowed the full >= 15 s drain window (see “Wiring health vs capability”).
+Two orthogonal gates (never blended):
+
+- **`oob_wiring_fnr` ≤ 5%** (target 0%) — async-OOB wiring reliability. Denominator = minted
+  async-OOB canaries whose callback fired (SSRF/XXE), falling back to all minted async canaries
+  when nothing fired; unmeasured (`null`) when no async canary was minted. Blind SQLi and the
+  exfil chain are **never** in this denominator.
+- **`fixture_capability_recall` ≥ 75%** — product capability over all planted #2 targets:
+  async SSRF, async XXE, blind SQLi, and chain `wan-oob-exfil` complete. 2 of 4 is 50% and fails;
+  3 of 4 (75%) passes.
+
+The legacy blended async false-negative rate is still printed as an informational row but is no
+longer a gate. Wiring is additionally judged separately: at least one durable `pending_oob`
+subscription must be registered, and any late callback must be allowed the full ≥ 15 s drain
+window (see “Wiring health vs capability”).
 
 | Measurement | Definition | `--no-llm` result | agentic result |
 | --- | --- | --- | --- |
-| Blind SQLi | TP for `wan-blind-sqli` | — | — |
-| Async SSRF | TP for `wan-ssrf-async` | — | — |
-| Async XXE | TP for `wan-xxe-async` | — | — |
-| Async false-negative rate | missed `{wan-blind-sqli, wan-ssrf-async, wan-xxe-async}` / 3 | — | — |
+| OOB wiring FNR | fired async canary targets without a confirmation / fired async canary targets (SSRF, XXE) | — | — |
+| Capability recall | confirmed planted targets / 4 `{wan-ssrf-async, wan-xxe-async, wan-blind-sqli, wan-oob-exfil chain}` | — | — |
+| Blind SQLi | TP for `wan-blind-sqli` (capability member) | — | — |
+| Async SSRF / XXE | TP for `wan-ssrf-async` / `wan-xxe-async` (capability and wiring members) | — | — |
+| Async canary evidence | `canaries` rows by purpose (`ssrf*` / `xxe*`): minted vs fired (`triggered` or `hit_count > 0`) | — | — |
+| Legacy blended async FNR | missed `{wan-blind-sqli, wan-ssrf-async, wan-xxe-async}` / 3 — **informational only** | — | — |
 | Fixture callback evidence | fixture-side collector observed `sqli` / `ssrf` / `xxe` / `webhook` after the HTTP response | — | — |
-| Chain completion | `wan-oob-exfil` covered/total | — | — |
+| Chain completion | `wan-oob-exfil` covered/total (capability member) | — | — |
 | Grade | TP / FP / precision / recall | — | — |
 
 ```bash
@@ -212,6 +224,7 @@ ranked Tier A.
 | Code leads | Program-Graph `det_lead` facts; `fourHopLeads` counts route→sink chains of at least four hops | — | — |
 | Probe plan | Phase-0 ranked plan: Tier A (`priority`), schema-typed, clustered probe subset, total routes | — | — |
 | 4-hop confirmations | TP count among `{mono-billing-bola, mono-report-sqli, mono-admin-bfla}` (0–3) | — | — |
+| Per-slice funnel | per Tier-A 4-hop slice: `dispatched_count` (assignments attributed via fact link / brief target / route hit), `target_route_hit` (broker exchange on the exact mounted method+route), `verify_called` (replay specs whose requests hit that route), `oracle_rejected_by` (structural rejection-code histogram) | — | — |
 | Chain completion | `mono-tenant-takeover` covered/total | — | — |
 | Grade | TP / FP / precision / recall | — | — |
 
@@ -237,6 +250,9 @@ do not transcribe expected or simulated numbers.
 | 2026-11-23 | `5f0aea8` | `wan-oob` | grey-box / `--no-llm`, 300 s cap, default callback delays, merged main | FAIL | `investigation` | **wiring FAIL**: pending_oob registered 0; drain n/a; approvals 0 blocking / 176 auto-review rows; denied mutations 0; 33 endpoints; p99 1.37 ms; **capability FAIL**: blind SQLi / async SSRF / async XXE not confirmed, async FN 100%; fixture callbacks `sqli` only; TP 0 / FP 0; 467 engine requests | `realism-merged-2` (local out-dir) |
 | 2026-11-23 | `5f0aea8` | `staging-concurrency` | grey-box / `--no-llm`, 180 s cap, `staging_isolated`, HTTP/2 enabled, merged main | FAIL | `investigation` | **wiring FAIL**: approvals 0 blocking; **denied mutations 15 (all `staging_contract`)**; parked 0; leaked 0; h2 single-packet bursts 0 / fallback 0; 18 endpoints; p99 0.97 ms; **capability FAIL**: write-BOLA / race / checkout not confirmed; TP 0 / FP 0; 396 engine requests | `realism-merged-3` (local out-dir) |
 | 2026-11-23 | `5f0aea8` | `monorepo-whitebox` | white-box / `--no-llm`, 300 s cap, `GUARDIAN_RECON_SIBLINGS=1`, merged main | FAIL | `investigation` | **wiring PASS**: declared 2,565 / spec ops 2,565 / matched 2,565; persisted 5,130 rows (2,568 distinct); retrieved 5,130; truncated no; p99 0.39 ms; sibling suppression true; Tier A 4-hop 3/3; code leads 4 (3 four-hop); probe plan Tier A 3, subset 1,444/2,563. **capability FAIL**: SAST suspects 0, 4-hop 0/3, chain 0/2; TP 0 / FP 0; 5,130 endpoints; 373 engine requests | `realism-merged-4` (local out-dir) |
+| 2026-11-24 | `42ff918` | `wan-oob` | grey-box / `--no-llm` | FAIL | `gate_incomplete` | **split gates**: `oob_wiring_fnr` **0.0% PASS** (0/2 fired async canary targets unconfirmed; basis `fired_canaries`; SSRF 14 minted/1 fired, XXE 15 minted/3 fired); `fixture_capability_recall` **50.0% FAIL** (2/4 — missing blind SQLi and the exfil chain); legacy blended async FNR 33.3% informational only. **wiring PASS**: 29 pending_oob registered, 45 s drain, 4 late promotions. TP 2 / FP 0 / precision 100%; 34 endpoints; 393 broker exchanges; 166 s | `/tmp/realism-gates-wan-final` |
+| 2026-11-24 | `42ff918` | `staging-concurrency` | grey-box / `--no-llm`, `staging_isolated` | **PASS** | `passed` | **wiring PASS**; **capability PASS**: write-BOLA / HTTP/2 double-spend (2 single-packet bursts, 0 HTTP/1.1 fallback) / checkout tampering confirmed; 0 leaked `guardian-qa-` entities; chain 1/2 informational. TP 3 / FP 0 / precision 100%; 51 endpoints; 276 broker exchanges; 108 s | `/tmp/realism-gates-staging` |
+| 2026-11-24 | `42ff918` | `monorepo-whitebox` | white-box / `--no-llm` | FAIL | `investigation` | **wiring PASS** (declared 2,565 / matched 2,565; persisted 5,130 rows / 2,568 distinct; Tier A 4-hop 3/3; code leads 4 with 3 four-hop). **capability FAIL**: TP 0 / FP 0; 0 vulnerability findings; 5,130 endpoints; 373 engine requests. **#4 funnel**: billing 0 dispatched / 0 route hit / 0 verify; reports 0/0/0; admin 1/1/0 — confirmations lost before verification, not at brief truncation | `/tmp/realism-gates-mono-final` |
 
 Smoke rows (`91a4be1`) are harness-validation runs, not gate evidence: the WAN smoke row uses a
 shortened callback delay and the monorepo smoke row uses a shortened wall-clock cap. The
