@@ -54,7 +54,9 @@ All product rows are real `Execution` on the 3-app realistic dev cells (acme-saa
 | Realism wiring | #2–#4 wiring pass | #2 PASS, #3 PASS, #4 PASS | **PASS** |
 | Realism capability | ≥75% on #1–#4 | #3 PASS (3/3 confirms); #2 2/4 planted; #4 0/3 | **PARTIAL** |
 | Worst-run precision (agentic) | 100% on every lift cell | dev 100%; **held-out 2 unmatched FPs** | **FAIL** |
-| Agentic lift | ≥ +6–8 pp dev / ≥ +6 pp held-out | dev **+2** over the 33/59 tree (superseded by the 34/59 tree, remeasuring); held-out **+1 (+1.7 pp)** | **FAIL (bar held red)** |
+| **Total Product Recall** (unified `Execution`, 100% worst-run precision) | ≥ **40/59 dev** and ≥ **32/58** salted held-out | dev unified not re-measured on the 36/59 tree; held-out unified **29/58** but precision 50% | **FAIL** |
+| Frozen floor reference | 36/59 dev, 28/58 held-out (snapshot, not a moving target) | **36/59** dev, **28/58** held-out, both 100% | **PASS** |
+| Anti-inert agentic guard | ≥ +4 net-new over the frozen floor, plus reason-bench lift | held-out **+1**; reason-bench unmeasured | **FAIL** |
 | Dispatch coverage | ready steps are not stranded | fixed: opsportal 6→**19–25** distinct steps, acme 7→**14**; stranded only at wall-clock; invariant live in worker-gate | **PASS** |
 | Proof submission | route-hit targets produce a spec or an explicit proof gap | was **19 of 23** no-spec; after the 18-turn/120 s raise + settlement gate: **5/10 (50%)** spec-on-route in the measured cell | **IMPROVING (P0)** |
 | Confirmation integrity | no confirmed finding may carry a non-confirming diff | store-level `InvariantError` now enforces it; 0 violations on dev+held-out floor re-runs | **PASS (forward)** |
