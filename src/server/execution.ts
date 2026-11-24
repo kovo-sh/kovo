@@ -894,6 +894,61 @@ export interface DispatchStopEvaluation {
   stranded: boolean
 }
 
+/** One step's contribution to Pass-1 coverage (pure input, no store access). */
+export interface PassOneCoverageStep {
+  id: string
+  /** Ready/pending steps can still be dispatched this pass. */
+  dispatchable: boolean
+  /** True once any assignment was created for the step. */
+  dispatched: boolean
+  /** Normalized route templates the step names. */
+  routes: readonly string[]
+  /** `route|class` reinvestigation keys the step belongs to. */
+  keys: readonly string[]
+}
+
+export interface PassOneCoverage {
+  /** Tier-A endpoints (`METHOD /path`) with no dispatched step. */
+  uncoveredTierAEndpoints: string[]
+  /** Distinct first-pass `route|class` keys with a dispatchable step but no dispatch yet. */
+  uninvestigatedFirstPassClasses: string[]
+}
+
+/**
+ * Pass-1 coverage: what remains genuinely first-pass at a would-be stop. A `route|class` key is
+ * first-pass until one of its steps was dispatched; Tier-A endpoints count as covered only after a
+ * dispatched step names them. Deterministic ordering (sorted) so the metric is stable.
+ */
+export function passOneCoverage(input: {
+  tierAEndpoints: readonly string[]
+  steps: readonly PassOneCoverageStep[]
+}): PassOneCoverage {
+  const attemptedKeys = new Set<string>()
+  const dispatchedRoutes = new Set<string>()
+  for (const step of input.steps) {
+    if (!step.dispatched) continue
+    for (const key of step.keys) attemptedKeys.add(key)
+    for (const route of step.routes) dispatchedRoutes.add(route)
+  }
+  const uncoveredTierAEndpoints = [...new Set(input.tierAEndpoints)]
+    .filter(endpoint => {
+      const path = endpoint.split(' ').slice(1).join(' ')
+      return ![...dispatchedRoutes].some(route => route === path || route === endpoint)
+    })
+    .sort()
+  const firstPass = new Set<string>()
+  for (const step of input.steps) {
+    if (!step.dispatchable || step.dispatched) continue
+    for (const key of step.keys) {
+      if (!attemptedKeys.has(key)) firstPass.add(key)
+    }
+  }
+  return {
+    uncoveredTierAEndpoints,
+    uninvestigatedFirstPassClasses: [...firstPass].sort(),
+  }
+}
+
 /**
  * v7 coverage guard: never honour a dry-round/coordinator-done stop while dispatchable planned
  * work can still use a free worker slot. Budget/request/wall-clock exhaustion is terminal and is
@@ -910,6 +965,10 @@ export function evaluateDispatchStop(input: {
   budgetExhausted?: boolean
   requestExhausted?: boolean
   wallExhausted?: boolean
+  /** Pass-1 keys with a dispatchable step but no dispatch yet (never stop in front of these). */
+  uninvestigatedFirstPassClasses?: readonly string[]
+  /** Tier-A endpoints with no dispatched step (never stop in front of these). */
+  uncoveredTierAEndpoints?: readonly string[]
 }): DispatchStopEvaluation {
   const stopReason = normalizeDispatchStopReason(input.reason)
   const remainingReady = Math.max(0, Math.floor(input.remainingReady))
@@ -918,6 +977,14 @@ export function evaluateDispatchStop(input: {
   }
   const exhausted = input.budgetExhausted === true || input.requestExhausted === true || input.wallExhausted === true
   const guarded = STRANDED_READY_STOP_REASONS.includes(stopReason)
+  // A dry/coordinator stop may only end *speculative* re-investigation. First-pass work that is
+  // still dispatchable, or a Tier-A slice that was never dispatched, must block the stop; budget,
+  // request and wall-clock exhaustion still win.
+  const firstPassPending = (input.uninvestigatedFirstPassClasses?.length ?? 0) > 0
+  const tierAUncovered = (input.uncoveredTierAEndpoints?.length ?? 0) > 0
+  if (guarded && !exhausted && (firstPassPending || tierAUncovered)) {
+    return { decision: 'continue', stopReason, remainingReady, deferred: true, stranded: false }
+  }
   if (guarded && !exhausted && remainingReady > 0) {
     if ((input.freeSlots ?? 0) > 0) {
       return { decision: 'continue', stopReason, remainingReady, deferred: true, stranded: false }
@@ -968,6 +1035,14 @@ export function circuitBreakAction(input: {
 export const DET_LEAD_STEP_PRIORITY = 55
 /** At most this many det_lead upgrade assignments may be in flight concurrently. */
 export const DET_LEAD_CONCURRENT_CAP = 2
+/**
+ * Tier-A Program-Graph leads (code dataflow slice on a live route) outrank generic work and are
+ * exempt from the generic concurrent-lead cap: all of them must be dispatched in Round 1's first
+ * slots, never gated behind class/route steps and never killed by a dry-round stop.
+ */
+export const TIER_A_STEP_PRIORITY = 90
+/** Hard per-run cap on Tier-A lead steps seeded from Program-Graph facts. */
+export const TIER_A_MAX_SEEDED_STEPS = 6
 /** Up to this many interesting BOLA queue items are injected into a single assignment prompt. */
 export const ASSIGNMENT_BOLA_QUEUE_MAX_ITEMS = 10
 /** Hard byte ceiling for the per-assignment BOLA queue slice (was 53 KB for the full queue). */
@@ -1070,6 +1145,16 @@ export function detLeadEvidenceGate(data: Record<string, unknown> | null | undef
   if (!data || data.kind !== 'det_lead') return { admitted: false, reason: 'not_a_det_lead' }
   if (data.controlPassed === false) return { admitted: false, reason: 'control_collapsed' }
   if (data.contrast === false || data.differsFromControl === false) return { admitted: false, reason: 'no_contrast' }
+  // A Program-Graph white-box lead carries a bounded dataflow slice (route -> hops -> sink) as its
+  // contrast: the code path is the hypothesis, not a bare runtime anomaly. It is admit-eligible
+  // without the runtime control contrast a black-box det_lead requires.
+  if (data.source === 'program_graph') {
+    const slice = data.codeSlice as { hops?: unknown } | undefined
+    if (slice && Array.isArray(slice.hops) && slice.hops.length > 0) {
+      return { admitted: true, reason: 'code_dataflow_slice' }
+    }
+    return { admitted: false, reason: 'code_slice_missing' }
+  }
   // `detlane-leads` contract: emitted leads carry the promotion evidence that justified them. The
   // three kinds are exactly "a boundary was observed but not yet bound into a replay".
   const evidenceKind = typeof data.leadEvidenceKind === 'string' ? data.leadEvidenceKind : ''
@@ -1138,6 +1223,11 @@ export interface RoundRobinDispatchOptions {
   activeLeadCount?: number
   /** Host tiers used to order Tier-A/B routes ahead of low-value static hosts. */
   hostTiers?: Record<string, HostTier>
+  /**
+   * Tier-A Program-Graph step ids. They are dispatched first and do not consume the generic
+   * concurrent-lead cap, so every Tier-A slice reaches a slot in Round 1.
+   */
+  tierALeadIds?: ReadonlySet<string>
   /** Allow leads past the cap only when no non-lead ready step remains (default true). */
   allowLeadOverflow?: boolean
 }
@@ -1153,6 +1243,7 @@ export interface RoundRobinDispatchPlan<T extends DispatchLaneStep> {
 export function isDetLeadDispatchStep(step: Pick<DispatchLaneStep, 'title' | 'hypothesis'>): boolean {
   const text = `${step.title} ${step.hypothesis ?? ''}`
   return /\bdet[_ ]lead\b/i.test(text) ||
+    /\btier[- ]a code lead\b/i.test(text) ||
     /deterministic floor observed an unproven/i.test(text) ||
     /\bunproven\b[^.]{0,80}\blead\b/i.test(text) ||
     /\blead upgrade\b/i.test(text)
@@ -1216,7 +1307,19 @@ export function planRoundRobinDispatch<T extends DispatchLaneStep>(
   )
   const ordered: T[] = []
   const leadQueue = lanes.get('lead')!
-  while (ordered.length < capacity && leadQueue.length > 0 && selectedByLane.lead < leadCap) {
+  const tierALeadIds = options.tierALeadIds
+  // Tier-A first: every Tier-A slice must reach a slot in Round 1, independent of the generic
+  // concurrent-lead cap (it is still bounded by the worker capacity).
+  let tierASelected = 0
+  if (tierALeadIds?.size) {
+    for (let idx = 0; idx < leadQueue.length && ordered.length < capacity;) {
+      if (!tierALeadIds.has(leadQueue[idx]!.id)) { idx += 1; continue }
+      ordered.push(leadQueue.splice(idx, 1)[0]!)
+      selectedByLane.lead += 1
+      tierASelected += 1
+    }
+  }
+  while (ordered.length < capacity && leadQueue.length > 0 && selectedByLane.lead - tierASelected < leadCap) {
     ordered.push(leadQueue.shift()!)
     selectedByLane.lead += 1
   }
@@ -2804,6 +2907,10 @@ export class Execution {
   /** Realism #4: Tier-A code-lead signal → fallback proof spec (bounded, deduped per route/class). */
   private readonly codeLeadProofKeys = new Set<string>()
   private readonly codeLeadProofCounts = new Map<string, number>()
+  /** Tier-A Program-Graph facts/steps: seeded first, exempt from the generic lead cap. */
+  private readonly tierAFactIds = new Set<string>()
+  private readonly tierAStepIds = new Set<string>()
+  private readonly tierAStepKeys = new Set<string>()
   /** Facts whose lead contract failed the contrast gate; emit the skip reason once. */
   private readonly detLeadGateRejected = new Set<string>()
   /** det_lead fact ids whose capped reinvestigation was already reported (emit once per fact). */
@@ -5496,7 +5603,9 @@ export class Execution {
     // Trial budget = worker slots left after every distinct queued hypothesis. Duplicate trials may
     // fill idle capacity; they must never displace a planned hypothesis (the v7 funnel defect).
     const expansions = planMultiTrialExpansion({
-      steps,
+      // Tier-A leads are distinct hypotheses with their own Round-1 slot; duplicate trials would
+      // displace other first-pass work.
+      steps: steps.filter(step => !this.tierAStepIds.has(step.id)),
       concurrency: conc,
       multiTrialEnabled: true,
       highSignalFactIds: highSignalFacts,
@@ -6401,6 +6510,33 @@ export class Execution {
     return templatesMentionedInText(`${step.title} ${step.hypothesis}`)
   }
 
+  /** Pass-1 coverage view used by the dry-round stop guard and the stop-time telemetry. */
+  private passOneCoverageFor(run: Pick<Run, 'id'>, steps: readonly ChainStep[]): {
+    uncoveredTierAEndpoints: string[]
+    uninvestigatedFirstPassClasses: string[]
+    tierAEndpoints: string[]
+  } {
+    const tierAEndpoints = [...new Set(this.tierALeadFacts(run).map(fact => {
+      const method = typeof fact.data?.method === 'string' ? fact.data.method.toUpperCase() : 'GET'
+      const endpoint = typeof fact.data?.endpoint === 'string' ? fact.data.endpoint : ''
+      return `${method} ${endpoint}`
+    }).filter(endpoint => endpoint.length > 0))].sort()
+    const coverage = passOneCoverage({
+      tierAEndpoints,
+      steps: steps.map(step => {
+        const routes = this.stepMentionedRoutes(step)
+        return {
+          id: step.id,
+          dispatchable: step.status === 'ready' || step.status === 'pending',
+          dispatched: step.assignedWorkerId !== null || step.status === 'complete' || step.status === 'running',
+          routes,
+          keys: routes.map(route => reinvestigationKey(route, step.category)),
+        }
+      }),
+    })
+    return { ...coverage, tierAEndpoints }
+  }
+
   /**
    * A planner step that only names routes the deterministic floor already confirmed is a duplicate
    * dispatch, unless it declares a parent fact/step (that is an explicit chain/escalation).
@@ -6422,6 +6558,82 @@ export class Execution {
    * Priority is deliberately below planner-authored class steps; the scheduler also caps lead
    * concurrency independently, so a lead backlog can never pre-empt unproven target classes.
    */
+  /** Program-Graph code leads that carry a dataflow slice (Tier-A white-box hypotheses). */
+  private tierALeadFacts(run: Pick<Run, 'id'>): Fact[] {
+    return this.storage.listFacts(run.id, { includeTainted: false, limit: 200 })
+      .filter(fact => {
+        const data = fact.data
+        if (data?.kind !== 'det_lead' || data.source !== 'program_graph') return false
+        const slice = data.codeSlice as { hops?: unknown } | undefined
+        return Boolean(slice && Array.isArray(slice.hops) && slice.hops.length > 0)
+      })
+      .sort((a, b) => {
+        const keyOf = (fact: typeof a) =>
+          `${String(fact.data?.method ?? '')}\u0000${String(fact.data?.endpoint ?? '')}\u0000${fact.id}`
+        return keyOf(a).localeCompare(keyOf(b))
+      })
+  }
+
+  /**
+   * Seed every Tier-A Program-Graph lead as a ready step before the planner's first round. These
+   * are the white-box 4-hop hypotheses; they must never wait behind generic class/route steps or a
+   * dry-round stop. Idempotent per (route, class), bounded by {@link TIER_A_MAX_SEEDED_STEPS}.
+   */
+  private queueTierALeadSteps(run: Run, approvedOrigins: ReadonlySet<string>, budget: number): number {
+    const facts = this.tierALeadFacts(run)
+    if (!facts.length) return 0
+    const existing = this.storage.listChainSteps(run.id, run.goalRevision)
+    const boundFactIds = new Set(existing.flatMap(step => step.dependsOnFactIds))
+    let slots = Math.max(0, Math.min(TIER_A_MAX_SEEDED_STEPS, budget - existing.length))
+    let created = 0
+    for (const fact of facts) {
+      if (slots <= 0) break
+      this.tierAFactIds.add(fact.id)
+      if (boundFactIds.has(fact.id)) continue
+      if (!approvedOrigins.has(fact.origin)) continue
+      const endpoint = typeof fact.data?.endpoint === 'string' ? fact.data.endpoint : ''
+      const probeClass = typeof fact.data?.probeClass === 'string' ? fact.data.probeClass : ''
+      const method = typeof fact.data?.method === 'string' ? fact.data.method.toUpperCase() : 'GET'
+      if (!endpoint.startsWith('/') || !probeClass) continue
+      const asset = run.candidates.find(c => c.origin === fact.origin && run.approved.includes(c.id))
+      if (!asset) continue
+      const category = detLeadCategory(probeClass)
+      const routeKey = `${normalizeEndpointTemplate(endpoint)}|${confirmedCategoryFamily(category)}`
+      const dedupeKey = `${method} ${routeKey}`
+      if (this.tierAStepKeys.has(dedupeKey) || this.detLeadStepKeys.has(dedupeKey)) continue
+      const reason = typeof fact.data.reason === 'string' ? fact.data.reason.slice(0, 200) : 'white-box dataflow slice'
+      const skills = detLeadSkills(probeClass)
+      const title = `Tier-A code lead · ${probeClass} ${method} ${endpoint}`.slice(0, 180)
+      const hypothesis = `A white-box dataflow slice proves a ${probeClass} sink on ${method} ${endpoint} (${reason}). Prove it on the live route (control/variant differential) or record a coded proofGapReason.`
+      const createdStep = this.storage.addChainStep(run, {
+        title,
+        hypothesis,
+        category,
+        priority: TIER_A_STEP_PRIORITY,
+        targetAssetIds: [asset.id],
+        skills,
+        dependsOnFactIds: [fact.id],
+        sourceOrigins: [fact.origin],
+        specialistProfile: routeStepToSpecialist({ title, hypothesis, category, skills }),
+      })
+      this.storage.updateChainStep(createdStep.id, { status: 'ready' })
+      this.tierAStepKeys.add(dedupeKey)
+      this.tierAStepIds.add(createdStep.id)
+      this.detLeadStepKeys.add(dedupeKey)
+      slots -= 1
+      created += 1
+      try {
+        this.storage.event(
+          run.id,
+          'deterministic_lane.tier_a_seeded',
+          `Tier-A code lead ${probeClass} on ${method} ${endpoint} seeded as a Round-1 step.`,
+          { probeClass, endpoint, method, factId: fact.id, stepId: createdStep.id, priority: TIER_A_STEP_PRIORITY },
+        )
+      } catch { /* best-effort */ }
+    }
+    return created
+  }
+
   private queueDetLeadUpgradeSteps(run: Run, approvedOrigins: ReadonlySet<string>, budget: number): number {
     const confirmed = this.alreadyConfirmedRefs(run, 40)
     const confirmedKeys = new Set(confirmed.map(ref =>
@@ -6430,7 +6642,9 @@ export class Execution {
       // det_lead facts are listed in store row order (random row-id tiebreak). The upgrade queue
       // takes the first N, so sort by stable leading fields before choosing.
       .sort((a, b) => {
-        const keyOf = (fact: typeof a) => `${String(fact.data?.endpoint ?? '')}\u0000${String(fact.data?.method ?? '')}\u0000${String(fact.data?.probeClass ?? '')}\u0000${fact.id}`
+        // Program-Graph (Tier-A) leads sort first; the generic cap can then never displace them.
+        const keyOf = (fact: typeof a) =>
+          `${fact.data?.source === 'program_graph' ? '0' : '1'}\u0000${String(fact.data?.endpoint ?? '')}\u0000${String(fact.data?.method ?? '')}\u0000${String(fact.data?.probeClass ?? '')}\u0000${fact.id}`
         return keyOf(a).localeCompare(keyOf(b))
       })
     const existing = this.storage.listChainSteps(run.id, run.goalRevision)
@@ -6481,13 +6695,16 @@ export class Execution {
       }
       const reason = typeof fact.data.reason === 'string' ? fact.data.reason.slice(0, 200) : 'differential observation'
       const skills = detLeadSkills(probeClass)
-      const title = `det_lead upgrade · ${probeClass} ${method} ${endpoint}`.slice(0, 180)
-      const hypothesis = `The deterministic floor observed an unproven ${probeClass} signal at ${method} ${endpoint} (${reason}). Reproduce it, identify the concretely mutated input, and submit a verified proof or chain it into a higher-impact finding.`
+      const isTierA = fact.data.source === 'program_graph'
+      const title = `${isTierA ? 'Tier-A code lead' : 'det_lead upgrade'} · ${probeClass} ${method} ${endpoint}`.slice(0, 180)
+      const hypothesis = isTierA
+        ? `A white-box dataflow slice proves a ${probeClass} sink on ${method} ${endpoint} (${reason}). Prove it on the live route (control/variant differential) or record a coded proofGapReason.`
+        : `The deterministic floor observed an unproven ${probeClass} signal at ${method} ${endpoint} (${reason}). Reproduce it, identify the concretely mutated input, and submit a verified proof or chain it into a higher-impact finding.`
       const createdStep = this.storage.addChainStep(run, {
         title,
         hypothesis,
         category,
-        priority: DET_LEAD_STEP_PRIORITY,
+        priority: isTierA ? TIER_A_STEP_PRIORITY : DET_LEAD_STEP_PRIORITY,
         targetAssetIds: [asset.id],
         skills,
         dependsOnFactIds: [fact.id],
@@ -6496,6 +6713,11 @@ export class Execution {
       })
       this.storage.updateChainStep(createdStep.id, { status: 'ready' })
       this.detLeadStepKeys.add(`${method} ${routeKey}`)
+      if (isTierA) {
+        this.tierAStepIds.add(createdStep.id)
+        this.tierAFactIds.add(fact.id)
+        this.tierAStepKeys.add(`${method} ${routeKey}`)
+      }
       this.detLeadConsumed.add(fact.id)
       slots -= 1
       created += 1
@@ -6509,6 +6731,26 @@ export class Execution {
       } catch { /* best-effort */ }
     }
     return created
+  }
+
+  /**
+   * Explicit settlement deliverable for a Tier-A white-box assignment: which typed proof tool to run
+   * against the named sink, and the coded-gap alternative. The tool still decides the verdict; this
+   * only removes "which proof shape / what do I do when it is unreachable" friction.
+   */
+  private tierAProofDeliverable(input: {
+    category?: string | null
+    title?: string | null
+    hypothesis?: string | null
+    sinkKind?: string | null
+  }): string {
+    const text = `${input.category ?? ''} ${input.title ?? ''} ${input.hypothesis ?? ''} ${input.sinkKind ?? ''}`.toLowerCase()
+    const tool = /bfla|mass.assignment|privilege|role|grant|persist|csrf|workflow|state.change|business.logic/.test(text)
+      ? 'prove_persisted_mutation'
+      : /sqli|sql|inject|xss|ssti|command|template|xml|xxe/.test(text)
+        ? 'prove_boolean_or_timing_diff'
+        : 'prove_access_boundary'
+    return `Invoke guardian_verify(${tool}) against this sink (control vs variant on the exact route above), or record_coverage(proofGapReason="<status|cannot_build_spec>") with the blocking HTTP status. A bare "leaning true" without either is rejected at settlement.`
   }
 
   private missionKindForStep(step: ChainStep, hasDetLead: boolean): MissionKind {    if (/second.order|stored|canary/i.test(`${step.title} ${step.hypothesis}`)) return 'second_order'
@@ -6560,6 +6802,16 @@ export class Execution {
         (codeSlice?.hops.length ?? 0) >= 4
         ? 'full'
         : 'compact'
+      // Exact control/variant actors for the differential: deterministic order by handle, the
+      // variant prefers another tenant (the object/authorization boundary the sink sits behind).
+      const tierAPersonas = [...input.personas].sort((a, b) => a.handle.localeCompare(b.handle))
+      const tenantOfPersona = (label: string): string => /\(([^()]+)\)\s*$/.exec(label)?.[1]?.trim() ?? ''
+      const controlPersona = tierAPersonas[0]
+      const variantPersona = controlPersona
+        ? tierAPersonas.find(persona => persona.handle !== controlPersona.handle &&
+            tenantOfPersona(persona.roleLabel) !== tenantOfPersona(controlPersona.roleLabel))
+          ?? tierAPersonas.find(persona => persona.handle !== controlPersona.handle)
+        : undefined
       const text = buildAssignmentBrief({
         missionKind,
         origin,
@@ -6601,6 +6853,18 @@ export class Execution {
                 auth: codeSlice.auth,
                 ...(codeSlice.sink ? { sink: `${codeSlice.sink.kind}@${codeSlice.sink.at}` } : {}),
                 chain: codeSlice.hops.slice(0, 6).map(hop => hop.at).join('→'),
+                ...(controlPersona
+                  ? {
+                      controlPersona: controlPersona.handle,
+                      variantPersona: (variantPersona ?? controlPersona).handle,
+                    }
+                  : {}),
+                deliverable: this.tierAProofDeliverable({
+                  category: input.step.category,
+                  title: input.step.title,
+                  hypothesis: input.step.hypothesis,
+                  ...(codeSlice.sink ? { sinkKind: codeSlice.sink.kind } : {}),
+                }),
               },
             }
           : {}),
@@ -6854,6 +7118,19 @@ export class Execution {
 
     this.storage.refreshReadyChainSteps(run.id, run.goalRevision)
 
+    // Tier-A white-box leads are Round-1 work: seed them as ready steps before the floor/planner
+    // can queue generic class/route steps in front of them. Idempotent per route/class; the
+    // deterministic-only (`--no-llm`) lane converts through its own engine instead.
+    if (!this.deterministicOnly) {
+      try {
+        this.queueTierALeadSteps(
+          this.storage.run(run.id),
+          this.approvedOriginsSet(run),
+          computeDynamicStepBudget(this.storage, run.id),
+        )
+      } catch { /* seeding is additive */ }
+    }
+
     // Phase A: the deterministic floor runs sequentially *before* any agent dispatch, using the
     // same deep implementation/policy as `--no-llm`. It is not a sibling lane: dispatch yields
     // until it settles, so workers never race or clobber floor probe state and the floor cannot be
@@ -6907,11 +7184,13 @@ export class Execution {
       return
     }
     const leadStepIds = new Set(steps.filter(step => isDetLeadDispatchStep(step)).map(step => step.id))
+    // Tier-A leads are exempt from the generic concurrent-lead cap; only generic leads count.
     const activeLeadCount = [...this.active.values()].filter(job =>
       job.assignment.runId === run.id &&
       job.assignment.phase === 'investigation' &&
       typeof job.assignment.stepId === 'string' &&
-      leadStepIds.has(job.assignment.stepId)).length
+      leadStepIds.has(job.assignment.stepId) &&
+      !this.tierAStepIds.has(job.assignment.stepId)).length
 
     const slots = Math.max(0, maxConc - activeForRun)
     const hostTiers = computeHostTiers(
@@ -6922,6 +7201,7 @@ export class Execution {
       leadCap: DET_LEAD_CONCURRENT_CAP,
       activeLeadCount,
       hostTiers,
+      tierALeadIds: this.tierAStepIds,
     })
     let dispatched = 0
     for (const step of dispatchPlan.ordered) {
@@ -8828,11 +9108,12 @@ export class Execution {
       // F2: lead-bound coordinator dispatches obey the same low-priority rule as planner steps.
       const leadBound = boundFactIds.some(id => detLeadFactIds.has(id)) ||
         isDetLeadDispatchStep({ title, hypothesis: step.hypothesis })
+      const tierABound = boundFactIds.some(id => this.tierAFactIds.has(id))
       this.storage.addChainStep(run, {
         title: title.slice(0, 200),
         hypothesis: step.hypothesis,
         category,
-        priority: leadBound ? Math.min(step.priority, DET_LEAD_STEP_PRIORITY) : step.priority,
+        priority: tierABound ? TIER_A_STEP_PRIORITY : leadBound ? Math.min(step.priority, DET_LEAD_STEP_PRIORITY) : step.priority,
         targetAssetIds: assetIds,
         skills: step.skills,
         dependsOnFactIds: boundFactIds,
@@ -9116,9 +9397,10 @@ export class Execution {
         const specialistProfile = routeStepToSpecialist({
           title: step.title, hypothesis: step.hypothesis, category: step.category, skills: step.skills,
         })
+        const tierABound = parentFactIds.some(id => this.tierAFactIds.has(id))
         const created = this.storage.addChainStep(currentRun, {
           title: step.title, hypothesis: step.hypothesis, category: step.category,
-          priority: leadBound ? Math.min(step.priority, DET_LEAD_STEP_PRIORITY) : step.priority,
+          priority: tierABound ? TIER_A_STEP_PRIORITY : leadBound ? Math.min(step.priority, DET_LEAD_STEP_PRIORITY) : step.priority,
           targetAssetIds: assetIds, skills: step.skills, dependsOnFactIds: parentFactIds,
           dependsOnStepIds: parentStepIds, sourceOrigins: validOrigins, specialistProfile,
         })
@@ -9175,10 +9457,41 @@ export class Execution {
 
     // v7 coverage guard: a dry/coordinator stop must not abandon planned, dispatchable work while a
     // worker slot is free. The stop is deferred (never silently dropped) and the funnel records it.
-    const finalSteps = this.storage.listChainSteps(run.id, latest.goalRevision)
+    let finalSteps = this.storage.listChainSteps(run.id, latest.goalRevision)
     const finalFactIds = new Set(this.pageAll((offset, limit) =>
       this.storage.listFacts(run.id, { includeTainted: true, limit, offset })).map(fact => fact.id))
-    const remainingReady = dispatchableReadySteps(finalSteps, finalFactIds).length
+    let remainingReady = dispatchableReadySteps(finalSteps, finalFactIds).length
+    let coverage = this.passOneCoverageFor(run, finalSteps)
+    // A dry stop in front of unseeded Tier-A work is a bug, not a drained queue: seed every
+    // remaining Tier-A lead now and re-evaluate the stop against the refreshed queue.
+    let tierASeededAtStop = 0
+    if (decision.decision === 'stop' && (coverage.uninvestigatedFirstPassClasses.length || coverage.uncoveredTierAEndpoints.length)) {
+      tierASeededAtStop = this.queueTierALeadSteps(
+        this.storage.run(run.id),
+        this.approvedOriginsSet(run),
+        computeDynamicStepBudget(this.storage, run.id),
+      )
+      if (tierASeededAtStop > 0) {
+        finalSteps = this.storage.listChainSteps(run.id, latest.goalRevision)
+        remainingReady = dispatchableReadySteps(finalSteps, finalFactIds).length
+        coverage = this.passOneCoverageFor(run, finalSteps)
+      }
+    }
+    // An uncovered Tier-A lead with no approved asset/route binding cannot be dispatched by any
+    // lane; report it loudly instead of spinning the stop guard forever.
+    const tierAUnseedable = coverage.uncoveredTierAEndpoints.length > 0 &&
+      coverage.uninvestigatedFirstPassClasses.length === 0 &&
+      tierASeededAtStop === 0
+    if (tierAUnseedable) {
+      try {
+        this.storage.event(
+          run.id,
+          'planner.tier_a_unseedable',
+          `${coverage.uncoveredTierAEndpoints.length} Tier-A endpoint(s) have no dispatchable step (no approved asset or route binding).`,
+          { endpoints: coverage.uncoveredTierAEndpoints.slice(0, 8) },
+        )
+      } catch { /* telemetry is best-effort */ }
+    }
     const dispatchedTotal = finalSteps.filter(step => step.assignedWorkerId !== null).length
     const maxConc = Math.max(1, Math.min(maxWorkerConcurrency, latest.workerConcurrency || defaultWorkerConcurrency))
     const activeForRun = [...this.active.values()].filter(job =>
@@ -9192,6 +9505,8 @@ export class Execution {
       budgetExhausted: this.storage.checkBudgetExceeded(run.id),
       requestExhausted: latest.budgetRequests > 0 && latest.budgetRequests - latest.spentRequests <= 0,
       wallExhausted: this.maxDurationMs > 0 && latest.createdAt + this.maxDurationMs <= Date.now(),
+      uninvestigatedFirstPassClasses: tierAUnseedable ? [] : coverage.uninvestigatedFirstPassClasses,
+      uncoveredTierAEndpoints: tierAUnseedable ? [] : coverage.uncoveredTierAEndpoints,
     })
     if (stopEval.deferred) {
       this.storage.event(
@@ -9208,6 +9523,38 @@ export class Execution {
     funnel.remainingReadyAtStop = stopEval.decision === 'stop' ? remainingReady : 0
     funnel.stopReason = stopEval.decision === 'stop' ? stopEval.stopReason : 'running'
     funnel.filteredDep = permanentlyBlockedStepIds(finalSteps, finalFactIds).length
+    const filteredByReason = {
+      alreadyConfirmed: funnel.filteredAlreadyConfirmed,
+      cap: funnel.filteredCap,
+      dep: funnel.filteredDep,
+      dedupe: funnel.filteredDedupe,
+      noAsset: funnel.filteredNoAsset,
+      budget: funnel.filteredBudget,
+    }
+    const stopped = stopEval.decision === 'stop'
+    const coverageAtStop = {
+      stopReason: funnel.stopReason,
+      uncoveredTierAEndpointsAtStop: stopped ? coverage.uncoveredTierAEndpoints.length : 0,
+      uninvestigatedFirstPassClassesAtStop: stopped ? coverage.uninvestigatedFirstPassClasses.length : 0,
+      filteredByReason,
+      ...(tierASeededAtStop > 0 ? { tierASeededAtStop } : {}),
+      ...(tierAUnseedable ? { tierAUnseedable: true } : {}),
+    }
+    if (stopped) {
+      try {
+        this.storage.event(
+          run.id,
+          'planner.coverage_at_stop',
+          `Stop ${funnel.stopReason}: Tier-A uncovered ${coverageAtStop.uncoveredTierAEndpointsAtStop}, first-pass uninvestigated ${coverageAtStop.uninvestigatedFirstPassClassesAtStop}, remaining ready ${funnel.remainingReadyAtStop}.`,
+          {
+            ...coverageAtStop,
+            remainingReadyAtStop: funnel.remainingReadyAtStop,
+            tierAExamples: coverage.uncoveredTierAEndpoints.slice(0, 6),
+            firstPassExamples: coverage.uninvestigatedFirstPassClasses.slice(0, 6),
+          },
+        )
+      } catch { /* telemetry is best-effort */ }
+    }
     if (stopEval.stranded) {
       this.noteStrandedReadySteps(run.id, {
         roundNo, stopReason: stopEval.stopReason, remainingReady,
@@ -9219,11 +9566,7 @@ export class Execution {
       run.id,
       'planner.funnel',
       `Dispatch funnel r${roundNo}: planned ${funnel.planned}, enqueued ${funnel.enqueued}, dispatched ${funnel.dispatched}, ready ${funnel.remainingReady}, stop ${funnel.stopReason}.`,
-      { ...funnel, filtered: {
-        alreadyConfirmed: funnel.filteredAlreadyConfirmed, cap: funnel.filteredCap,
-        dep: funnel.filteredDep, dedupe: funnel.filteredDedupe,
-        noAsset: funnel.filteredNoAsset, budget: funnel.filteredBudget,
-      } },
+      { ...funnel, filtered: filteredByReason, coverage: coverageAtStop },
     )
 
     this.tracePlannerDecision(run.id, {
@@ -9246,6 +9589,7 @@ export class Execution {
         remainingReady: funnel.remainingReady, remainingReadyAtStop: funnel.remainingReadyAtStop,
         filteredCap: funnel.filteredCap, filteredDep: funnel.filteredDep,
         filteredAlreadyConfirmed: funnel.filteredAlreadyConfirmed, stopReason: funnel.stopReason,
+        coverage: coverageAtStop,
       },
       summary: parsedPlanner?.success ? parsedPlanner.data.summary.slice(0, 300) : compactText(answer, 300),
     })

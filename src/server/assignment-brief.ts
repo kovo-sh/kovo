@@ -99,6 +99,12 @@ export interface AssignmentBriefProofObligation {
   sink?: string
   /** `route -> ... -> sink` hop locations, already bounded by the caller. */
   chain?: string
+  /** Exact control actor for the differential (persona handle). */
+  controlPersona?: string
+  /** Exact variant actor for the differential (persona handle). */
+  variantPersona?: string
+  /** Explicit deliverable: invoke guardian_verify(<tool>) or record a coded proofGapReason. */
+  deliverable?: string
 }
 
 export interface AssignmentBriefInput {
@@ -275,12 +281,18 @@ function normalizeProofObligation(
   const auth = cleanText(obligation.auth, 16)
   const sink = redactBriefText(obligation.sink, 96)
   const chain = redactBriefText(obligation.chain, 200)
+  const controlPersona = cleanText(obligation.controlPersona, 48)
+  const variantPersona = cleanText(obligation.variantPersona, 48)
+  const deliverable = redactBriefText(obligation.deliverable, 240)
   return {
     route: `${routeMethod || 'ANY'} ${routePath}`,
     ...(params.length ? { params } : {}),
     ...(auth ? { auth } : {}),
     ...(sink ? { sink } : {}),
     ...(chain ? { chain } : {}),
+    ...(controlPersona ? { controlPersona } : {}),
+    ...(variantPersona ? { variantPersona } : {}),
+    ...(deliverable ? { deliverable } : {}),
   }
 }
 

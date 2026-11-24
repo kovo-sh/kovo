@@ -80,6 +80,41 @@ Tier-A). Confirmed claims: `cross_tenant_read GET /v2/billing/invoices/<id>` and
 `sqli GET /v2/reports/export` (both graded `matched_ground_truth`). 670 engine requests,
 2 signals → 2 fallback proofs → 2 confirmations.
 
+## Reviewer additions (same lease)
+
+1. **Mandatory Tier-A Round-1 seeding.** Program-Graph leads with a dataflow slice are now
+   admitted by `detLeadEvidenceGate` (`code_dataflow_slice`) and seeded as ready steps *before*
+   the floor/planner (`queueTierALeadSteps`, priority `TIER_A_STEP_PRIORITY`, cap 6, idempotent per
+   route/class). The round-robin dispatcher selects Tier-A steps first and exempts them from the
+   generic concurrent-lead cap, so all 3 slices reach slots in Round 1.
+2. **`dry_rounds` may only stop speculative re-investigation.** `evaluateDispatchStop` now defers a
+   dry/coordinator stop while any dispatchable first-pass `route|class` key or Tier-A endpoint is
+   still uninvestigated; budget/request/wall exhaustion still terminates normally. At a would-be
+   stop the planner first seeds any remaining Tier-A lead and re-evaluates; an unseedable Tier-A
+   lead (no approved asset/route binding) emits `planner.tier_a_unseedable` rather than spinning.
+3. **Stop-time telemetry.** `planner.coverage_at_stop` (and the `planner.funnel`/`planner.round`
+   details) carry `{stopReason, uncoveredTierAEndpointsAtStop, uninvestigatedFirstPassClassesAtStop,
+   filteredByReason, remainingReadyAtStop, tierASeededAtStop, tierAUnseedable}`. A stop with
+   Pass-1 work therefore cannot report `dry_rounds`; the `remainingReadyAtStop === 0` invariant
+   stays meaningful.
+4. **Tier-A brief proof contract.** Code-slice briefs carry the dataflow slice (full 1,600 B budget
+   for 4+ hop), the exact `controlPersona`/`variantPersona` pair (variant prefers another tenant),
+   and a `deliverable` naming the typed tool (`prove_access_boundary`, `prove_persisted_mutation`,
+   or `prove_boolean_or_timing_diff`) plus `record_coverage(proofGapReason="<status>")`. The 4-hop
+   chain is not a floor recipe; the conversion stays in the engine/agent proof path.
+
+### Stop metrics before → after
+
+| reading | before | after |
+|---|---|---|
+| stop-time coverage event | none (`dry_rounds` could stop in front of Pass-1) | `planner.coverage_at_stop` on every stop |
+| Tier-A first-slot seeding | gate required runtime contrast evidence → Tier-A deferred | seeded at priority 90, cap-exempt |
+| `remainingReadyAtStop` invariant | held only when `remainingReady === 0` or busy fleet | also enforced by first-pass/Tier-A coverage |
+| 4-hop funnel (`--no-llm`) | 0/2/2 dispatched, 0 verify, 0 confirmed | 3/3 dispatched + hit, 2 verify, 2 confirmed |
+
+The agentic stop-count table is produced from `planner.coverage_at_stop` on the next agentic cell;
+it is not fabricated here (no agentic cell is part of this stream's measured acceptance).
+
 ## Remaining gap / owner
 
 - `mono-admin-bfla`: the fixture exposes no readback of the mutated user and the verifier's

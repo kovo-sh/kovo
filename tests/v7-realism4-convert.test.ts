@@ -27,13 +27,19 @@ import {
   CODE_LEAD_IDENTIFIER_FORMS_PER_ROUTE,
   CODE_LEAD_PRIORITY_RISK,
   Execution,
+  TIER_A_STEP_PRIORITY,
   buildCodeLeadCrossTenantProof,
   buildCodeLeadSqlErrorProof,
   codeLeadMatrixRows,
   deriveCodeLeadIdentifierTargets,
+  detLeadEvidenceGate,
+  evaluateDispatchStop,
+  passOneCoverage,
+  planRoundRobinDispatch,
   prioritizeCodeLeadTargets,
   tenantLabelsFromRoleLabels,
 } from '../src/server/execution.ts'
+import { seedCodeToRuntimeLeads } from '../src/server/graph-leads.ts'
 import { httpChainReplaySpecSchema } from '../src/replay-spec.ts'
 import type { EngineHypothesis } from '../src/server/deterministic-engine.ts'
 import { codeToRuntimeLead } from '../src/server/graph-leads.ts'
@@ -249,7 +255,10 @@ test('assignmentBriefForStep grounds a code-slice step in the exact route and si
       dependsOnStepIds: [] as string[],
     },
     targetOrigins: [ORIGIN],
-    personas: [],
+    personas: [
+      { handle: 'mono-alice', roleLabel: 'member (tenant-alpha)' },
+      { handle: 'mono-bob', roleLabel: 'member (tenant-beta)' },
+    ],
     parentFacts: [fact],
     confirmed: [],
     detLeads: [],
@@ -259,13 +268,20 @@ test('assignmentBriefForStep grounds a code-slice step in the exact route and si
   assert.ok(brief, 'the brief is rendered')
   assert.ok(measureAssignmentBriefBytes(brief!) <= ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE)
   const packet = JSON.parse(brief!) as {
-    proofObligation?: { route: string; params?: string[]; auth?: string; sink?: string; chain?: string }
+    proofObligation?: {
+      route: string; params?: string[]; auth?: string; sink?: string; chain?: string
+      controlPersona?: string; variantPersona?: string; deliverable?: string
+    }
   }
   assert.equal(packet.proofObligation?.route, ADMIN_ROUTE)
   assert.deepEqual(packet.proofObligation?.params, ['role'])
   assert.equal(packet.proofObligation?.auth, 'unguarded')
   assert.match(packet.proofObligation?.sink ?? '', /^db_query@.*user-repo\.ts/)
   assert.match(packet.proofObligation?.chain ?? '', /controllers\/users\.ts:5/)
+  assert.equal(packet.proofObligation?.controlPersona, 'mono-alice')
+  assert.equal(packet.proofObligation?.variantPersona, 'mono-bob', 'variant prefers another tenant')
+  assert.match(packet.proofObligation?.deliverable ?? '', /guardian_verify\(prove_persisted_mutation\)/)
+  assert.match(packet.proofObligation?.deliverable ?? '', /proofGapReason/)
 })
 
 // ============================================================================
@@ -372,6 +388,112 @@ test('SQL error proof asserts the injected arm went 5xx while the control stayed
   assert.match(parsed.data!.steps[1]!.request.pathAndQuery, /sort=created_at%27$/)
   assert.match(parsed.data!.assertionsJq, /status >= 500/)
   assert.equal(buildCodeLeadSqlErrorProof({ origin: ORIGIN, hypothesis: hypothesis() }), null)
+})
+
+// ============================================================================
+// 6. Round-1 Tier-A seeding + dry-round guard + stop telemetry
+// ============================================================================
+
+test('a Program-Graph code slice is admissible lead evidence; a slice-less lead is not', () => {
+  const admitted = detLeadEvidenceGate({
+    kind: 'det_lead',
+    source: 'program_graph',
+    probeClass: 'authz_matrix',
+    endpoint: '/v2/billing/invoices/:id',
+    method: 'GET',
+    codeSlice: { route: 'GET /v2/billing/invoices/:id', hops: [{ at: 'routes.ts:1' }] },
+  })
+  assert.equal(admitted.admitted, true)
+  assert.equal(admitted.reason, 'code_dataflow_slice')
+  assert.equal(detLeadEvidenceGate({ kind: 'det_lead', source: 'program_graph', probeClass: 'authz_matrix' }).admitted, false)
+  assert.equal(detLeadEvidenceGate({ kind: 'det_lead', source: 'deterministic_engine', probeClass: 'authz_matrix' }).admitted, false)
+})
+
+test('Tier-A leads are dispatched before generic work and exempt from the generic lead cap', () => {
+  const step = (id: string, priority: number, seq: number, kind: 'lead' | 'tier-a' = 'lead') => ({
+    id, priority, seq,
+    title: kind === 'tier-a' ? `Tier-A code lead · authz_matrix ${id}` : `det_lead upgrade · ${id}`,
+    category: 'misconfig-exposure',
+    hypothesis: '', skills: [], dependsOnFactIds: [], dependsOnStepIds: [], sourceOrigins: [],
+  })
+  const genericLead = step('generic-lead', 90, 1)
+  const tierA1 = step('tier-a-1', TIER_A_STEP_PRIORITY, 2, 'tier-a')
+  const tierA2 = step('tier-a-2', TIER_A_STEP_PRIORITY, 3, 'tier-a')
+  const tierA3 = step('tier-a-3', TIER_A_STEP_PRIORITY, 4, 'tier-a')
+  const route = { ...step('route-1', 60, 5), title: 'route probe /api/orders', category: 'broken-access-control' }
+
+  const plan = planRoundRobinDispatch(
+    [route, genericLead, tierA3, tierA1, tierA2],
+    5,
+    { leadCap: 1, activeLeadCount: 0, tierALeadIds: new Set(['tier-a-1', 'tier-a-2', 'tier-a-3']) },
+  )
+  const ids = plan.ordered.map(entry => entry.id)
+  assert.deepEqual(ids.slice(0, 3), ['tier-a-1', 'tier-a-2', 'tier-a-3'], 'every Tier-A slice takes a first slot')
+  assert.ok(ids.includes('route-1'), 'the remaining slot still goes to route breadth')
+})
+
+test('Pass-1 coverage distinguishes a drained queue from uninvestigated first-pass work', () => {
+  const coverage = passOneCoverage({
+    tierAEndpoints: ['GET /v2/reports/export', 'PATCH /v3/admin/users/:id'],
+    steps: [
+      { id: 'a', dispatchable: false, dispatched: true, routes: ['/v2/reports/export'], keys: ['/v2/reports/export\u0000sqli'] },
+      { id: 'b', dispatchable: true, dispatched: false, routes: ['/v3/admin/users/:id'], keys: ['/v3/admin/users/:id\u0000authz'] },
+      { id: 'c', dispatchable: true, dispatched: false, routes: ['/api/orders'], keys: ['/api/orders\u0000authz'] },
+    ],
+  })
+  assert.deepEqual(coverage.uncoveredTierAEndpoints, ['PATCH /v3/admin/users/:id'])
+  assert.deepEqual(coverage.uninvestigatedFirstPassClasses.sort(), ['/api/orders\u0000authz', '/v3/admin/users/:id\u0000authz'])
+})
+
+test('a dry-round stop is deferred while first-pass or Tier-A work remains; exhaustion still stops', () => {
+  const deferred = evaluateDispatchStop({
+    decision: 'stop', reason: 'diminishing_returns', remainingReady: 0, freeSlots: 0, inFlight: 0,
+    uninvestigatedFirstPassClasses: ['/api/orders\u0000authz'],
+  })
+  assert.equal(deferred.decision, 'continue')
+  assert.equal(deferred.deferred, true)
+
+  const tierA = evaluateDispatchStop({
+    decision: 'stop', reason: 'diminishing_returns', remainingReady: 0, freeSlots: 0, inFlight: 0,
+    uncoveredTierAEndpoints: ['GET /v2/reports/export'],
+  })
+  assert.equal(tierA.decision, 'continue')
+
+  const exhausted = evaluateDispatchStop({
+    decision: 'stop', reason: 'diminishing_returns', remainingReady: 2, freeSlots: 1, inFlight: 0,
+    requestExhausted: true, uninvestigatedFirstPassClasses: ['/api/orders\u0000authz'],
+  })
+  assert.equal(exhausted.decision, 'stop', 'request/wall/budget exhaustion still terminates the run')
+
+  const drained = evaluateDispatchStop({
+    decision: 'stop', reason: 'diminishing_returns', remainingReady: 0, freeSlots: 3, inFlight: 0,
+  })
+  assert.equal(drained.decision, 'stop')
+})
+
+test('Tier-A leads seed as ready Round-1 steps without runtime contrast evidence and idempotently', async t => {
+  const { storage } = makeStore(t, 'guardian-v7-realism4-tier-a-')
+  const { run, assignment } = await approvedRun(storage)
+  const execution = new Execution(storage)
+  t.after(() => execution.stop())
+
+  const hypotheses = [
+    adminHypothesis(),
+    { ...adminHypothesis(), id: 'hyp-realism4-billing', kind: 'tenant_param_without_scope', method: 'GET', path: '/v2/billing/invoices/:id', probeClass: 'bola_bfla' },
+    { ...adminHypothesis(), id: 'hyp-realism4-report', kind: 'sql_concat_sink', method: 'GET', path: '/v2/reports/export', probeClass: 'injection' },
+  ] as CodeToRuntimeHypothesis[]
+  assert.equal(seedCodeToRuntimeLeads(storage, run, assignment, hypotheses, new Set(), ORIGIN), 3)
+
+  const created = internals(execution).queueTierALeadSteps(storage.run(run.id), new Set([ORIGIN]), 50)
+  assert.equal(created, 3, 'all three Tier-A leads are seeded')
+  const steps = storage.listChainSteps(run.id, run.goalRevision)
+    .filter(step => internals(execution).tierAStepIds.has(step.id))
+  assert.equal(steps.length, 3)
+  assert.ok(steps.every(step => step.status === 'ready'))
+  assert.ok(steps.every(step => step.priority === TIER_A_STEP_PRIORITY))
+  assert.ok(internals(execution).tierAFactIds.size >= 3)
+
+  assert.equal(internals(execution).queueTierALeadSteps(storage.run(run.id), new Set([ORIGIN]), 50), 0, 're-seeding is idempotent')
 })
 
 test('matrix parsing is typed and drops malformed rows', () => {
