@@ -187,27 +187,22 @@ export class ExecBoardManager {
     if (opts.assignmentId) {
       try { authorOrigins = this.storage.worker(opts.assignmentId).sourceOrigins } catch { /* assignment may be gone */ }
     }
-    const sent = this.postBoard(run, {
-      authorHandle: 'verifier',
-      authorRole: 'verifier',
-      kind: 'verdict',
+    const basePayload = {
+      authorHandle: 'verifier' as const,
+      authorRole: 'verifier' as const,
+      kind: 'verdict' as const,
       body,
-      mentions,
       ...(opts.findingId ? { refFindingIds: [opts.findingId] } : {}),
       ...(opts.refStepId ? { refStepId: opts.refStepId } : {}),
+    }
+    const sent = this.postBoard(run, {
+      ...basePayload,
+      mentions,
       ...(authorOrigins.length ? { sourceOrigins: authorOrigins } : {}),
     }, opts.secrets)
-    if (sent) return sent
+    if (sent || !mentions.length) return sent
     // A retired/unknown author handle must not lose the verdict: post without the mention.
-    if (!mentions.length) return null
-    return this.postBoard(run, {
-      authorHandle: 'verifier',
-      authorRole: 'verifier',
-      kind: 'verdict',
-      body,
-      ...(opts.findingId ? { refFindingIds: [opts.findingId] } : {}),
-      ...(opts.refStepId ? { refStepId: opts.refStepId } : {}),
-    }, opts.secrets)
+    return this.postBoard(run, basePayload, opts.secrets)
   }
 
   /** Deterministic @broker blocker for circuit-open / repeated 429 conditions. */

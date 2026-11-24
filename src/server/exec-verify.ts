@@ -7,7 +7,6 @@ import {
   findingSeverities,
   httpMethods,
   maxInlineVerifyRetries,
-  owaspCategories,
   responseCheckIds,
   type AssessmentCheckId,
   type Candidate,
@@ -354,6 +353,35 @@ function receiptFindingTemplate(vulnClass: 'ssrf' | 'xxe', origin: string, param
   }
 }
 
+function serializeProofReceiptRow(
+  pair: { receipt: import('./proof-receipt.ts').ProofReceipt; verification: import('./proof-receipt.ts').ReceiptVerification },
+): ReplayProofReceiptRow {
+  const { receipt, verification } = pair
+  return {
+    receipt: {
+      vulnClass: receipt.vulnClass,
+      target: receipt.target,
+      exchangeIds: receipt.exchangeIds,
+      oobEventIds: receipt.oobEventIds,
+      browserTraceIds: receipt.browserTraceIds,
+      claimedDelta: receipt.claimedDelta,
+      ...(receipt.oracleEvents ? { oracleEvents: receipt.oracleEvents } : {}),
+      ...(receipt.requiredRole ? { requiredRole: receipt.requiredRole } : {}),
+      ...(receipt.resourceTenant ? { resourceTenant: receipt.resourceTenant } : {}),
+      ...(receipt.expectControlDenied !== undefined ? { expectControlDenied: receipt.expectControlDenied } : {}),
+      ...(receipt.proofPatterns ? { proofPatterns: receipt.proofPatterns } : {}),
+    } satisfies ReplayProofReceiptRow['receipt'],
+    verification: {
+      confirmed: verification.confirmed,
+      vulnClass: verification.vulnClass,
+      rule: verification.rule,
+      reason: verification.reason,
+      observed: verification.observed,
+      expected: verification.expected,
+    },
+  }
+}
+
 export class ExecVerifier {
   private readonly host: ExecVerifyHost
   constructor(host: ExecVerifyHost) { this.host = host }
@@ -362,6 +390,37 @@ export class ExecVerifier {
   private get browser(): ScopedBrowser { return this.host.browser }
   private get canaryBroker(): CanaryBroker { return this.host.canaryBroker }
   private get backend(): WorkerBackend { return this.host.backend }
+
+  private async ensureCanaryListenerForSpec(spec: DeclarativeReplaySpec): Promise<void> {
+    if ((spec.kind === 'rce_proof' && spec.proofMode === 'oob_canary') || this.host.isCanaryListenerConfigured()) {
+      await this.canaryBroker.startListener({ enableDns: this.host.isCanaryDnsConfigured() }).catch(() => undefined)
+    }
+  }
+
+  private baseReplayRunnerParams(
+    spec: DeclarativeReplaySpec,
+    runId: string,
+    assignmentId: string,
+    grant: Grant,
+    signal: AbortSignal,
+    reposDir: string | undefined,
+    onExchange: (ex: BrokerExchangeResult) => string,
+  ) {
+    return {
+      spec,
+      broker: this.broker,
+      browser: this.browser,
+      canaryBroker: this.canaryBroker,
+      backend: this.backend,
+      reposDir,
+      grant,
+      signal,
+      storage: this.storage,
+      runId,
+      assignmentId,
+      onExchange,
+    }
+  }
 
 
   // --- Phase 3: Zero-LLM Verification (Replay Specs + Baseline Checks) ---
@@ -617,10 +676,7 @@ export class ExecVerifier {
     const { grant, secrets, currentSecrets } = this.host.buildGrant(job, run, permittedAtAdmission)
     const { reposDir } = this.host.projectReposMount(run.projectId)
 
-    // Priority #5 / v3 Dual HTTP+DNS CanaryBroker: ensure listener is started when needed or configured
-    if ((specRow.spec.kind === 'rce_proof' && specRow.spec.proofMode === 'oob_canary') || this.host.isCanaryListenerConfigured()) {
-      await this.canaryBroker.startListener({ enableDns: this.host.isCanaryDnsConfigured() }).catch(() => undefined)
-    }
+    await this.ensureCanaryListenerForSpec(specRow.spec)
 
     // Tier 3 HITL gate for rce_proof and upload_probe specs on non-local-lab targets
     if (specRow.spec.kind === 'rce_proof' || specRow.spec.kind === 'upload_probe') {
@@ -647,23 +703,13 @@ export class ExecVerifier {
       }
     }
 
-    const verifyParams = {
-      spec: specRow.spec,
-      broker: this.broker,
-      browser: this.browser,
-      canaryBroker: this.canaryBroker,
-      backend: this.backend,
-      reposDir,
-      grant,
-      signal: job.controller.signal,
-      storage: this.storage,
-      runId: run.id,
-      assignmentId: job.assignment.id,
-      onExchange: createExchangeRecorder(this.storage, () => run, job.assignment.id, currentSecrets, {
+    const verifyParams = this.baseReplayRunnerParams(
+      specRow.spec, run.id, job.assignment.id, grant, job.controller.signal, reposDir,
+      createExchangeRecorder(this.storage, () => run, job.assignment.id, currentSecrets, {
         trackResources: true,
         markCoverage: (r, o, m, p) => this.host.markEndpointCoverage(r, o, m, p, `replay:${specRow.spec.kind}`),
       }),
-    }
+    )
     const result = await verifyReplaySpec(verifyParams)
     this.host.markReplaySpecCoverage(run, specRow.spec, `replay:${specRow.spec.kind}`)
     if (result.receipt && !result.receipt.verification.confirmed) {
@@ -905,31 +951,7 @@ export class ExecVerifier {
       runtime: input.runtime,
       scriptSha256,
       artifactId: artifact.id,
-      receipt: receipt && verification
-        ? {
-            receipt: {
-              vulnClass: receipt.vulnClass,
-              target: receipt.target,
-              exchangeIds: receipt.exchangeIds,
-              oobEventIds: receipt.oobEventIds,
-              browserTraceIds: receipt.browserTraceIds,
-              claimedDelta: receipt.claimedDelta,
-              ...(receipt.oracleEvents ? { oracleEvents: receipt.oracleEvents } : {}),
-              ...(receipt.requiredRole ? { requiredRole: receipt.requiredRole } : {}),
-              ...(receipt.resourceTenant ? { resourceTenant: receipt.resourceTenant } : {}),
-              ...(receipt.expectControlDenied !== undefined ? { expectControlDenied: receipt.expectControlDenied } : {}),
-              ...(receipt.proofPatterns ? { proofPatterns: receipt.proofPatterns } : {}),
-            } satisfies ReplayProofReceiptRow['receipt'],
-            verification: {
-              confirmed: verification.confirmed,
-              vulnClass: verification.vulnClass,
-              rule: verification.rule,
-              reason: verification.reason,
-              observed: verification.observed,
-              expected: verification.expected,
-            },
-          }
-        : null,
+      receipt: receipt && verification ? serializeProofReceiptRow({ receipt, verification }) : null,
       createdAt: Date.now(),
     }
     const specRow = this.storage.createReplaySpec(
@@ -965,15 +987,7 @@ export class ExecVerifier {
       scopeRevision: run.scopeRevision,
     }
     this.storage.upsertChainFinding(run, asset.id, finding, specRow.id, [origin])
-    if (owaspCategories.includes(attribution.category as OwaspCategory) && this.host.permitted(run, origin)) {
-      this.storage.upsertCoverageEntry(run, assignment.id, {
-        origin,
-        category: attribution.category as OwaspCategory,
-        status: 'reported',
-        summary: `Confirmed via agent script proof: ${cleanTitle}`,
-        linkedFindingId: findingId,
-      })
-    }
+    recordReportedFindingCoverage(this.storage, run, assignment.id, origin, attribution.category, `Confirmed via agent script proof: ${cleanTitle}`, findingId, (r, o) => this.host.permitted(r, o))
     this.storage.event(run.id, 'agent.script_proof_confirmed', `Agent script proof confirmed a ${attribution.label} finding on ${origin}.`, {
       findingId,
       replaySpecId: specRow.id,
@@ -1115,31 +1129,7 @@ export class ExecVerifier {
       secrets: params.currentSecrets(),
     })
     const receiptRow = confirmed && result.receipt
-      ? {
-          receipt: {
-            vulnClass: result.receipt.receipt.vulnClass,
-            target: result.receipt.receipt.target,
-            exchangeIds: result.receipt.receipt.exchangeIds,
-            oobEventIds: result.receipt.receipt.oobEventIds,
-            browserTraceIds: result.receipt.receipt.browserTraceIds,
-            claimedDelta: result.receipt.receipt.claimedDelta,
-            ...(result.receipt.receipt.oracleEvents ? { oracleEvents: result.receipt.receipt.oracleEvents } : {}),
-            ...(result.receipt.receipt.requiredRole ? { requiredRole: result.receipt.receipt.requiredRole } : {}),
-            ...(result.receipt.receipt.resourceTenant ? { resourceTenant: result.receipt.receipt.resourceTenant } : {}),
-            ...(result.receipt.receipt.expectControlDenied !== undefined
-              ? { expectControlDenied: result.receipt.receipt.expectControlDenied }
-              : {}),
-            ...(result.receipt.receipt.proofPatterns ? { proofPatterns: result.receipt.receipt.proofPatterns } : {}),
-          } satisfies ReplayProofReceiptRow['receipt'],
-          verification: {
-            confirmed: result.receipt.verification.confirmed,
-            vulnClass: result.receipt.verification.vulnClass,
-            rule: result.receipt.verification.rule,
-            reason: result.receipt.verification.reason,
-            observed: result.receipt.verification.observed,
-            expected: result.receipt.verification.expected,
-          },
-        } satisfies ReplayProofReceiptRow
+      ? serializeProofReceiptRow(result.receipt)
       : confirmed
         ? proof.receipt ?? null
         : null
@@ -1287,9 +1277,7 @@ export class ExecVerifier {
     const maxAttempts = 1 + maxInlineVerifyRetries
 
     if (nextAttempt <= maxAttempts) {
-      if ((parsed.kind === 'rce_proof' && parsed.proofMode === 'oob_canary') || this.host.isCanaryListenerConfigured()) {
-        await this.canaryBroker.startListener({ enableDns: this.host.isCanaryDnsConfigured() }).catch(() => undefined)
-      }
+      await this.ensureCanaryListenerForSpec(parsed)
       if (parsed.kind === 'rce_proof' || parsed.kind === 'upload_probe') {
         const gateReq = buildTier3VerifyGateReq(parsed, 'Inline Zero-LLM verification')
         const approval = await this.host.waitForTier3Approval(params.job, {
@@ -1342,32 +1330,24 @@ export class ExecVerifier {
     }
 
     const { feedback, replay } = await verifyReplaySpecInline({
-      spec: parsed,
-      broker: this.broker,
-      browser: this.browser,
-      canaryBroker: this.canaryBroker,
-      backend: this.backend,
-      reposDir: params.reposDir,
-      grant: params.grant,
-      signal: params.job.controller.signal,
-      storage: this.storage,
-      runId: curRun.id,
-      assignmentId: params.job.assignment.id,
+      ...this.baseReplayRunnerParams(
+        parsed, curRun.id, params.job.assignment.id, params.grant, params.job.controller.signal, params.reposDir,
+        createExchangeRecorder(
+          this.storage,
+          () => this.host.check(params.job),
+          params.job.assignment.id,
+          params.currentSecrets,
+          {
+            trackResources: true,
+            markCoverage: (latest, o, m, p) => this.host.markEndpointCoverage(latest, o, m, p, `replay:${parsed.kind}`),
+            onSaved: (latest, ex, id) => params.onExchangeObserved?.(latest, ex, id),
+          },
+        ),
+      ),
       findingId: findingRow?.id,
       attemptCount: nextAttempt,
       maxRetries: maxInlineVerifyRetries,
       secrets: params.currentSecrets(),
-      onExchange: createExchangeRecorder(
-        this.storage,
-        () => this.host.check(params.job),
-        params.job.assignment.id,
-        params.currentSecrets,
-        {
-          trackResources: true,
-          markCoverage: (latest, o, m, p) => this.host.markEndpointCoverage(latest, o, m, p, `replay:${parsed.kind}`),
-          onSaved: (latest, ex, id) => params.onExchangeObserved?.(latest, ex, id),
-        },
-      ),
     })
     const latestForCoverage = this.host.check(params.job)
     this.host.markReplaySpecCoverage(latestForCoverage, parsed, `replay:${parsed.kind}`)
@@ -1585,25 +1565,13 @@ export class ExecVerifier {
     const permittedAtAdmission = this.host.approvedOriginsSet(run)
     const { grant, secrets, currentSecrets } = this.host.buildGrant(job, run, permittedAtAdmission)
 
-    if ((specRow.spec.kind === 'rce_proof' && specRow.spec.proofMode === 'oob_canary') || this.host.isCanaryListenerConfigured()) {
-      await this.canaryBroker.startListener({ enableDns: this.host.isCanaryDnsConfigured() }).catch(() => undefined)
-    }
+    await this.ensureCanaryListenerForSpec(specRow.spec)
 
     const { reposDir } = this.host.projectReposMount(run.projectId)
-    const retestRes = await retestReplaySpec({
-      spec: specRow.spec,
-      broker: this.broker,
-      browser: this.browser,
-      canaryBroker: this.canaryBroker,
-      backend: this.backend,
-      reposDir,
-      grant,
-      signal: job.controller.signal,
-      storage: this.storage,
-      runId: run.id,
-      assignmentId: job.assignment.id,
-      onExchange: createExchangeRecorder(this.storage, () => run, job.assignment.id, currentSecrets),
-    })
+    const retestRes = await retestReplaySpec(this.baseReplayRunnerParams(
+      specRow.spec, run.id, job.assignment.id, grant, job.controller.signal, reposDir,
+      createExchangeRecorder(this.storage, () => run, job.assignment.id, currentSecrets),
+    ))
 
     const current = this.storage.run(run.id)
     this.storage.transaction(() => {

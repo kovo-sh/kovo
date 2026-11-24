@@ -144,28 +144,26 @@ function deterministicRouteIsTestable(method: string, pathTemplate: string, hasI
 }
 
 
+type DerivedRouteParam = { name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }
+type DerivedRouteTarget = {
+  origin: string
+  method: string
+  pathTemplate: string
+  riskScore: number
+  source?: string
+  params: DerivedRouteParam[]
+}
+
 /** Tolerant OpenAPI extraction for specs whose stored text is redacted or truncated. */
 function parseTolerantOpenApiTargets(
   content: string,
   defaultOrigin: string,
   approvedOrigins: ReadonlySet<string>,
-): Array<{
-  origin: string
-  method: string
-  pathTemplate: string
-  riskScore: number
-  params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
-}> {
+): DerivedRouteTarget[] {
   const pathKeyRe = /"(\/[A-Za-z0-9_\-{}\/.:$\[\]]{0,200})"\s*:\s*\{/g
   const matches = [...content.matchAll(pathKeyRe)]
   if (!matches.length) return []
-  const out: Array<{
-    origin: string
-    method: string
-    pathTemplate: string
-    riskScore: number
-    params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
-  }> = []
+  const out: DerivedRouteTarget[] = []
   for (let idx = 0; idx < matches.length; idx += 1) {
     const match = matches[idx]
     const pathTemplate = match[1]
@@ -175,7 +173,7 @@ function parseTolerantOpenApiTargets(
     const block = content.slice(start, end)
     const methods = [...block.matchAll(/"(get|post|put|patch|delete)"\s*:\s*\{/g)].map(m => m[1].toUpperCase())
     if (!methods.length) continue
-    const params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }> = []
+    const params: DerivedRouteParam[] = []
     const paramRe = /"name"\s*:\s*"([A-Za-z0-9_.\-\[\]]{1,64})"[\s\S]{0,200}?"in"\s*:\s*"(query|path|header|formData|body)"/g
     for (const param of block.matchAll(paramRe)) {
       const location = param[2] === 'formData' ? 'form' : param[2] === 'body' ? 'json' : param[2] as 'query' | 'path' | 'header'
@@ -237,6 +235,27 @@ export class ExecFloorLane {
   private get backend(): WorkerBackend { return this.host.backend }
 
 
+  private createFloorExchangeRecorder(currentId: string, claimedId: string, currentSecrets: () => NamedSecret[]) {
+    return createExchangeRecorder(this.storage, () => this.storage.run(currentId), claimedId, currentSecrets, {
+      trackResources: true,
+      markCoverage: (latest, origin, method, pathAndQuery) =>
+        this.host.markEndpointCoverage(latest, origin, method, pathAndQuery, 'http_exchange'),
+      onSaved: (latest, ex, id) => this.host.scanSecondOrderExchange(latest, claimedId, ex, id),
+    })
+  }
+
+  private checkSpecDuplicate(run: Run, spec: DeclarativeReplaySpec, verifiedEndpoint?: string | null) {
+    const fields = extractSpecDedupeFields(spec)
+    const { refs } = buildExistingFindingRefs(this.storage, run.id, run.goalRevision)
+    return checkStructuralDuplicate({
+      origin: spec.origin, title: spec.title, cwe: spec.cwe, category: spec.category, severity: spec.severity,
+      endpoint: fields.endpoint, authState: fields.authState, specKind: fields.specKind,
+      method: fields.method, param: fields.param, graphqlField: fields.graphqlField,
+      mutated: fields.mutated ?? null,
+      ...(verifiedEndpoint ? { verifiedEndpoint } : {}),
+    }, refs)
+  }
+
   /** Verified handler/endpoint reported by the replay verifier's endpoint binding, if any. */
   verifiedEndpointOf(result: { evidencePayload?: Record<string, unknown> }): string | null {
     const binding = result.evidencePayload?.endpointBinding as
@@ -260,20 +279,8 @@ export class ExecFloorLane {
     assignment: Assignment,
     signal: AbortSignal,
     recordExchange: (exchange: BrokerExchangeResult) => string,
-  ): Promise<Array<{
-    origin: string
-    method: string
-    pathTemplate: string
-    riskScore: number
-    params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
-  }>> {
-    const out: Array<{
-      origin: string
-      method: string
-      pathTemplate: string
-      riskScore: number
-      params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
-    }> = []
+  ): Promise<DerivedRouteTarget[]> {
+    const out: DerivedRouteTarget[] = []
     let summaries: Array<{ id: string; origin: string; method: string; pathAndQuery: string; status: number; mediaType: string }> = []
     try {
       summaries = [...this.storage.runDetail(run.id).exchangesSummary].sort((a, b) =>
@@ -401,13 +408,7 @@ export class ExecFloorLane {
     run: Run,
     approvedOrigins: ReadonlySet<string>,
     existing: ReadonlyArray<{ origin: string; method: string; pathTemplate: string }>,
-  ): Array<{
-    origin: string
-    method: string
-    pathTemplate: string
-    riskScore: number
-    params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
-  }> {
+  ): DerivedRouteTarget[] {
     let specs: Array<{ name: string; kind: string; content: string }> = []
     try {
       specs = [...this.storage.listProjectSpecsFull(run.projectId)].sort((a, b) =>
@@ -416,13 +417,7 @@ export class ExecFloorLane {
       return []
     }
     const seen = new Set(existing.map(ep => `${ep.origin}|${ep.method.toUpperCase()}|${ep.pathTemplate}`))
-    const out: Array<{
-      origin: string
-      method: string
-      pathTemplate: string
-      riskScore: number
-      params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
-    }> = []
+    const out: DerivedRouteTarget[] = []
     const defaultOrigin = [...approvedOrigins].sort()[0]
     const mapLocation = (value: unknown): 'query' | 'json' | 'form' | 'path' | 'header' | null => {
       const raw = typeof value === 'string' ? value.toLowerCase() : ''
@@ -573,18 +568,7 @@ export class ExecFloorLane {
     const job: Active = { assignment: claimed, origins: new Set(approvedOrigins), controller: new AbortController() }
     const { grant, currentSecrets } = this.host.buildGrant(job, current, approvedOrigins)
 
-    const recordExchange = createExchangeRecorder(
-      this.storage,
-      () => this.storage.run(current.id),
-      claimed.id,
-      currentSecrets,
-      {
-        trackResources: true,
-        markCoverage: (latest, origin, method, pathAndQuery) =>
-          this.host.markEndpointCoverage(latest, origin, method, pathAndQuery, 'http_exchange'),
-        onSaved: (latest, ex, id) => this.host.scanSecondOrderExchange(latest, claimed.id, ex, id),
-      },
-    )
+    const recordExchange = this.createFloorExchangeRecorder(current.id, claimed.id, currentSecrets)
 
     const signal = job.controller.signal
 
@@ -1014,18 +998,7 @@ export class ExecFloorLane {
     const { grant, currentSecrets } = this.host.buildGrant(job, current, approvedOrigins)
     const signal = controller.signal
 
-    const recordExchange = createExchangeRecorder(
-      this.storage,
-      () => this.storage.run(current.id),
-      claimed.id,
-      currentSecrets,
-      {
-        trackResources: true,
-        markCoverage: (latest, origin, method, pathAndQuery) =>
-          this.host.markEndpointCoverage(latest, origin, method, pathAndQuery, 'http_exchange'),
-        onSaved: (latest, ex, id) => this.host.scanSecondOrderExchange(latest, claimed.id, ex, id),
-      },
-    )
+    const recordExchange = this.createFloorExchangeRecorder(current.id, claimed.id, currentSecrets)
 
     let leadCount = 0
     try {
@@ -1296,29 +1269,16 @@ export class ExecFloorLane {
   expandConventionalSurfaceTargets(
     origin: string,
     existing: ReadonlyArray<{ method: string; pathTemplate: string }>,
-  ): Array<{
-    origin: string
-    method: string
-    pathTemplate: string
-    riskScore: number
-    params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
-  }> {
+  ): DerivedRouteTarget[] {
     const seen = new Set(existing.map(ep => `${origin}|${ep.method.toUpperCase()}|${ep.pathTemplate}`))
-    const out: Array<{
-      origin: string
-      method: string
-      pathTemplate: string
-      riskScore: number
-      source?: string
-      params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }>
-    }> = []
+    const out: DerivedRouteTarget[] = []
     const add = (method: string, pathTemplate: string, riskScore = 12) => {
       const key = `${origin}|${method}|${pathTemplate}`
       if (seen.has(key)) return
       if (!pathTemplate.startsWith('/') || pathTemplate.length > 200) return
       if (/\.(?:js|css|map|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|mp4|pdf|zip|gz)$/i.test(pathTemplate)) return
       seen.add(key)
-      const params: Array<{ name: string; location: 'query' | 'json' | 'form' | 'path' | 'header' | 'xml' | 'graphql_var' }> = []
+      const params: DerivedRouteParam[] = []
       for (const match of pathTemplate.matchAll(/:([A-Za-z0-9_]+)/g)) params.push({ name: match[1], location: 'path' })
       out.push({ origin, method, pathTemplate, riskScore, source: 'conventional', params })
     }
@@ -1375,23 +1335,7 @@ export class ExecFloorLane {
     const spec = confirmed.spec
     if (spec.kind === 'static_ast_proof') return null
     if (confirmed.result.verdict !== 'confirmed') return null
-    const fields = extractSpecDedupeFields(spec)
-    const { refs: existingRefs } = buildExistingFindingRefs(this.storage, run.id, run.goalRevision)
-    const duplicate = checkStructuralDuplicate({
-      origin: spec.origin,
-      title: spec.title,
-      cwe: spec.cwe,
-      category: spec.category,
-      severity: spec.severity,
-      endpoint: fields.endpoint,
-      authState: fields.authState,
-      specKind: fields.specKind,
-      method: fields.method,
-      param: fields.param,
-      graphqlField: fields.graphqlField,
-      mutated: fields.mutated ?? null,
-      ...(this.verifiedEndpointOf(confirmed.result) ? { verifiedEndpoint: this.verifiedEndpointOf(confirmed.result)! } : {}),
-    }, existingRefs)
+    const duplicate = this.checkSpecDuplicate(run, spec, this.verifiedEndpointOf(confirmed.result))
     if (duplicate.isDuplicate) return null
 
     const origins = [...new Set(replaySpecOrigins(spec))].filter(origin => this.host.permitted(run, origin))
@@ -1548,22 +1492,7 @@ export class ExecFloorLane {
     if (!parsed.success) return null
     const spec = parsed.data
 
-    const fields = extractSpecDedupeFields(spec)
-    const { refs: existingRefs } = buildExistingFindingRefs(this.storage, input.run.id, input.run.goalRevision)
-    const duplicate = checkStructuralDuplicate({
-      origin: spec.origin,
-      title: spec.title,
-      cwe: spec.cwe,
-      category: spec.category,
-      severity: spec.severity,
-      endpoint: fields.endpoint,
-      authState: fields.authState,
-      specKind: fields.specKind,
-      method: fields.method,
-      param: fields.param,
-      graphqlField: fields.graphqlField,
-      mutated: fields.mutated ?? null,
-    }, existingRefs)
+    const duplicate = this.checkSpecDuplicate(input.run, spec)
     if (duplicate.isDuplicate) return null
 
     const fact = this.storage.addFact(input.run, input.assignment, {
