@@ -384,6 +384,8 @@ export interface ProbeDifferentialRequest {
   origin: string
   /** Endpoint path+query. authz_matrix requires a {{id}} placeholder. */
   pathAndQuery: string
+  /** True when the probe runs under the run-scoped staging tenant contract. */
+  staging?: boolean
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
   /** Parameter under test (sqli_boolean, sqli_time_diff, ssti_math, nosqli_type, xss_context) */
   param?: string

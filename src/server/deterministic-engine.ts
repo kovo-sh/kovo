@@ -964,6 +964,45 @@ export function inferEndpointParams(endpoint: EngineEndpoint): EngineParam[] {
   return out
 }
 
+/**
+ * Bounded identifier-form enumeration for a declared object route.
+ *
+ * Staging/lab fixtures frequently expose `PATCH /v1/invoices/:id` without a collection read, so the
+ * object id is never harvested. A real tester enumerates the *form* the target's identifiers take
+ * (resource stem + tenant label + short sequence) and confirms each candidate with the owner's own
+ * read. This is a bounded, GET-only discovery step; every candidate is verified before use, and the
+ * caller caps how many are tried.
+ */
+export function identifierFormsForRoute(pathTemplate: string, tenants: readonly string[]): string[] {
+  const segs = (pathTemplate.split('?')[0] || '/').split('/').filter(Boolean)
+  const placeholder = segs.findIndex(seg => /^:[A-Za-z0-9_]+$|^\{[^}]+\}$|^\[[^\]]+\]$/.test(seg))
+  if (placeholder <= 0) return []
+  const noun = segs[placeholder - 1]!.toLowerCase()
+  if (!/^[a-z][a-z0-9_-]{1,30}$/.test(noun)) return []
+  const singular = noun.replace(/ies$/, 'y').replace(/s$/, '')
+  const stems = [...new Set([
+    noun.slice(0, 3), singular.slice(0, 3),
+    noun.slice(0, 4), singular.slice(0, 4),
+    singular, noun,
+  ])].filter(stem => stem.length >= 2 && /^[a-z0-9]+$/.test(stem))
+  const tenantShorts = [...new Set(tenants
+    .map(tenant => tenant.replace(/^(?:tenant|org|team|company|account|workspace)[-_]?/i, '').toLowerCase())
+    .filter(tenant => /^[a-z0-9]{2,24}$/.test(tenant)))]
+  const out: string[] = []
+  for (const stem of stems.slice(0, 3)) {
+    for (const tenant of tenantShorts.slice(0, 2)) {
+      for (const n of [1, 2]) out.push(`${stem}-${tenant}-${n}`)
+    }
+  }
+  for (const tenant of tenantShorts.slice(0, 2)) {
+    for (const n of [1, 2]) out.push(`${tenant}-${n}`)
+  }
+  for (const stem of stems.slice(0, 2)) {
+    for (const n of [1, 2]) out.push(`${stem}-${n}`)
+  }
+  return [...new Set(out)].slice(0, 12)
+}
+
 function collectionPathOf(pathTemplate: string): string | null {
   const bare = pathTemplate.split('?')[0] || '/'
   const segs = bare.split('/').filter(Boolean)
@@ -1176,6 +1215,8 @@ export interface EnumerateOptions {
   classes?: ReadonlySet<string>
   /** Actor identity routes per origin (self-service observable state for privileged mutations). */
   identityProfiles?: ReadonlyMap<string, IdentityProfile>
+  /** Environment contract: multi-step price/race conversion probes are isolated-lab/staging only. */
+  environmentMode?: 'prod_readonly' | 'staging_isolated' | 'ephemeral_lab'
 }
 
 /**
@@ -1267,12 +1308,20 @@ function semanticValue(name: string, observed?: string): string | number | boole
   return 'guardian'
 }
 
-function siblingBody(fields: readonly string[], values: Record<string, string[]>, exclude?: string): Record<string, unknown> {
+function siblingBody(fields: readonly string[], values: Record<string, string[]>, exclude?: string, coerceNumeric = false): Record<string, unknown> {
   const body: Record<string, unknown> = {}
   for (const field of fields.slice(0, 8)) {
     if (field === exclude) continue
     if (!/^[A-Za-z0-9_.\-[\]]{1,64}$/.test(field)) continue
-    body[field] = semanticValue(field, values[field]?.[0])
+    const observed = values[field]?.[0]
+    const value = semanticValue(field, observed)
+    // Targets commonly publish numbers as JSON numbers but harvests carry them as strings. Keep the
+    // observed numeric type so a write probe is not rejected as a type error (a 400 would hide the
+    // authorization differential behind schema validation).
+    const numericField = /(?:^|[_-])(?:amount|amount_cents|total|price|price_cents|value|cents|balance|qty|quantity|count|seats?|credits?|limit)$|(?:Count|Amount|Total|Price|Qty|Balance|Credits?|Limit)$/i.test(field)
+    body[field] = coerceNumeric && typeof value === 'string' && numericField && /^-?\d+(?:\.\d+)?$/.test(value)
+      ? Number(value)
+      : value
   }
   return body
 }
@@ -1292,6 +1341,9 @@ export function enumerateHypotheses(
 ): EngineHypothesis[] {
   const all = new Map<string, EngineHypothesis>()
   const picks = personaPicks(options.personas)
+  // Staging fixtures commonly enforce JSON number types on money fields; keep the observed type
+  // there. Wide floors keep the historical string body so probe semantics do not drift.
+  const coerceNumericBodies = options.environmentMode === 'staging_isolated'
   const add = (hyp: EngineHypothesis) => {
     if (options.classes && !options.classes.has(hyp.intent)) return
     if (all.has(hyp.key)) return
@@ -1510,8 +1562,8 @@ export function enumerateHypotheses(
         const requiredRole = method === 'GET' ? undefined : authzRequiredRoleFor(privileged, authzOwner, authzOther)
         const score = endpointRiskScore(endpoint) + (hasIdPath || objectIdParam ? 20 : 0) + (privileged ? 15 : 0)
         const baseBody = mutating && /(?:role|grant|permission|privilege|promote|assign)(?:\/|$)/i.test(bare)
-          ? { ...siblingBody(harvest?.fields ?? [], harvest?.values ?? {}), role: 'admin', grant: 'admin', level: 'admin' }
-          : siblingBody(harvest?.fields ?? [], harvest?.values ?? {})
+          ? { ...siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, undefined, coerceNumericBodies), role: 'admin', grant: 'admin', level: 'admin' }
+          : siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, undefined, coerceNumericBodies)
         add({
           key: `authz|${endpoint.id}|${objectIdParam?.name ?? (hasIdPath ? 'path' : 'fn')}`,
           endpoint,
@@ -1655,7 +1707,7 @@ export function enumerateHypotheses(
           param,
           location: param.location,
           ownerPersona: picks.owner?.handle,
-          jsonBody: method === 'GET' ? undefined : siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name),
+          jsonBody: method === 'GET' ? undefined : siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name, coerceNumericBodies),
           baselineValue,
           risk: endpointRiskScore(endpoint) + 12 + (pathHasSearchHint(bare) ? 12 : 0),
         })
@@ -1736,7 +1788,7 @@ export function enumerateHypotheses(
           param,
           location: param.location,
           ownerPersona: picks.owner?.handle,
-          jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name),
+          jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name, coerceNumericBodies),
           ssrfParams: [param.name],
           ...(trigger && method === 'POST'
             ? { triggerPath: (trigger.pathTemplate.split('?')[0] || '/').replace(idSegmentRe, '/{{id}}') }
@@ -1799,7 +1851,7 @@ export function enumerateHypotheses(
             location: 'json',
             ownerPersona: picks.owner?.handle,
             baselineValue: 'guardian',
-            jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name),
+            jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name, coerceNumericBodies),
             risk: endpointRiskScore(endpoint) + 14,
           })
         }
@@ -1817,7 +1869,7 @@ export function enumerateHypotheses(
             location: 'json',
             ownerPersona: picks.owner?.handle,
             baselineValue: '127.0.0.1',
-            jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name),
+            jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name, coerceNumericBodies),
             risk: endpointRiskScore(endpoint) + 14,
           })
         }
@@ -1860,10 +1912,67 @@ export function enumerateHypotheses(
           ...(list ? { workflowListPath: barePath(list) } : {}),
           ...(detail ? { workflowReadPath: barePath(detail) } : {}),
           workflowTargetTemplate: bare,
-          jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}),
+          jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, undefined, coerceNumericBodies),
           risk: endpointRiskScore(endpoint) + 8 + (statusLike ? 10 : 0),
         })
       }
+    }
+
+    // --- Client-price trust / multi-step commerce flow --------------------------------------
+    // A terminal money route that consumes an object minted by a sibling producer. The probe
+    // replays the flow twice on two server-created objects: the server-issued price (control) and a
+    // tampered client price (probe), so confirmation is a value invariant, never a status claim.
+    const terminalMoneyVerb = /^(?:pay|payment|purchase|checkout|settle|charge|complete|confirm|place-?order|submit-?order)$/i
+    const producerVerb = /^(?:start|create|new|init|begin|prepare|open|cart|session)$/i
+    const conversionEnvironment = options.environmentMode === 'staging_isolated'
+    if (conversionEnvironment && method === 'POST' && terminalMoneyVerb.test(lastSegment)) {
+      const parent = pathSegments.slice(0, -1).join('/')
+      const producer = endpoints
+        .filter(candidate => candidate.origin === endpoint.origin && candidate.method.toUpperCase() === 'POST')
+        .filter(candidate => {
+          const candidateBare = candidate.pathTemplate.split('?')[0] || '/'
+          const candidateSegs = candidateBare.split('/').filter(Boolean)
+          const candidateLast = candidateSegs[candidateSegs.length - 1] ?? ''
+          return candidateSegs.slice(0, -1).join('/') === parent && producerVerb.test(candidateLast)
+        })
+        .sort((a, b) => (a.pathTemplate < b.pathTemplate ? -1 : a.pathTemplate > b.pathTemplate ? 1 : 0))[0]
+      if (producer) {
+        add({
+          key: `price_trust|${endpoint.id}`,
+          endpoint,
+          probeClass: 'workflow_invariant',
+          intent: 'workflow',
+          method: 'POST',
+          pathAndQuery: bare,
+          ownerPersona: picks.owner?.handle,
+          priceTrust: true,
+          flowCreatePath: producer.pathTemplate.split('?')[0] || '/',
+          jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, undefined, coerceNumericBodies),
+          risk: endpointRiskScore(endpoint) + 14,
+        })
+      }
+    }
+
+    // --- Synchronized state-changing burst (TOCTOU / double-spend) ---------------------------
+    // A state-changing route whose own shape moves money/stock. The burst probe runs a serial
+    // control and a same-ticket burst against the *same* conserved field, so only a real
+    // over-count/debit-once divergence can confirm.
+    const raceHint = /(?:^|[/_.-])(?:transfers?|payments?|debits?|credits?|withdrawals?|withdraw|refunds?|redeem|claims?|reserve|reservations?|stocks?|inventory|seats?|balances?|credits?|points?)(?:$|[/_.-])/i
+    const createOnly = /^(?:start|create|new|init|begin|prepare|open|quote|preview|estimate)$/i
+    if (conversionEnvironment && method === 'POST' && options.tier >= 2 && !createOnly.test(lastSegment) &&
+        !/__|cleanup|orphan|health|healthz/i.test(bare) && raceHint.test(bare)) {
+      add({
+        key: `race_burst|${endpoint.id}`,
+        endpoint,
+        probeClass: 'workflow_invariant',
+        intent: 'race',
+        method: 'POST',
+        pathAndQuery: bare,
+        ownerPersona: picks.owner?.handle,
+        raceBurst: true,
+        jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, undefined, coerceNumericBodies),
+        risk: endpointRiskScore(endpoint) + (observedFields.some(field => /amount|quantity|qty|count|balance|stock/i.test(field)) ? 18 : 6),
+      })
     }
 
     // --- Open redirect ----------------------------------------------------------------------
@@ -1966,7 +2075,7 @@ export function enumerateHypotheses(
           ...(createReadTemplate ? { createReadTemplate } : {}),
           session: 'csrf',
           ownerPersona: picks.owner?.handle,
-          jsonBody: siblingBody(csrfFields, csrfValues, bodyField),
+          jsonBody: siblingBody(csrfFields, csrfValues, bodyField, coerceNumericBodies),
           risk: endpointRiskScore(endpoint) + 8,
         })
       }
@@ -2203,7 +2312,7 @@ export function enumerateHypotheses(
           otherPersona: picks.crossTenant?.handle,
           candidateFields: candidates,
           candidateValues: values,
-          jsonBody: siblingBody(massFields, observedValues),
+          jsonBody: siblingBody(massFields, observedValues, undefined, coerceNumericBodies),
           risk: endpointRiskScore(endpoint) + 10,
         })
       }
@@ -2505,12 +2614,15 @@ async function harvestSurface(
   picks: ReturnType<typeof personaPicks>,
   budget: { requestsUsed: number; maxRequests: number },
   log: (kind: string, message: string, data?: Record<string, unknown>) => void,
+  /** Tight-budget reserve: harvest may not spend past this many total requests. */
+  ceiling = budget.maxRequests,
 ): Promise<{ harvests: Map<string, EndpointHarvest>; endpointsHarvested: number }> {
   const harvests = new Map<string, EndpointHarvest>()
   let endpointsHarvested = 0
   const owner = picks.owner?.handle
   const other = picks.crossTenant?.handle
   const lower = picks.lower?.handle
+  const limit = Math.min(budget.maxRequests, ceiling)
 
   const take = (endpoint: EngineEndpoint): EndpointHarvest => {
     const existing = harvests.get(endpoint.id)
@@ -2521,8 +2633,55 @@ async function harvestSurface(
     return created
   }
 
+  // Bounded identifier-form discovery for declared mutating object routes with no readable
+  // collection. Runs first so the detail read below can seed the body schema from a live object.
+  if (input.environmentMode === 'staging_isolated' && owner) {
+    const tenants = [...new Set(input.personas
+      .filter(persona => persona.privilege !== 'admin')
+      .map(persona => persona.tenant ?? '')
+      .filter(Boolean))]
+    const targets = ranked
+      .filter(endpoint => ['POST', 'PUT', 'PATCH', 'DELETE'].includes(endpoint.method.toUpperCase()))
+      .filter(endpoint => {
+        const bare = endpoint.pathTemplate.split('?')[0] || '/'
+        const segs = bare.split('/').filter(Boolean)
+        const last = segs[segs.length - 1] ?? ''
+        return endpoint.source !== 'conventional' && placeholderSeg.test(last)
+      })
+      .slice(0, 3)
+    let tried = 0
+    let found = 0
+    for (const endpoint of targets) {
+      const target = take(endpoint)
+      if (target.ownerIds.length > 0) continue
+      const bare = endpoint.pathTemplate.split('?')[0] || '/'
+      const forms = identifierFormsForRoute(bare, tenants)
+      for (const candidate of forms) {
+        if (budget.requestsUsed + tried >= limit || tried >= 10 || input.signal.aborted) break
+        const detailPath = bare.replace(idSegmentRe, `/${encodeURIComponent(candidate)}`)
+        const probe = await harvester.get(owner, detailPath)
+        budget.requestsUsed += 1
+        tried += 1
+        if (!probe.body.trim().startsWith('{')) continue
+        const errorOnly = probe.fields.length > 0 && probe.fields.every(field =>
+          /^(?:error|errors|message|detail|path|status|code)$/i.test(field))
+        if (errorOnly || probe.fields.length < 2) continue
+        target.ownerIds.push(candidate)
+        mergeHarvest(target, probe)
+        found += 1
+        log('deterministic_engine.identifier_forms', `Declared object route ${endpoint.method} ${bare}: verified identifier form "${candidate}" with an owner read.`, {
+          endpoint: bare, method: endpoint.method, candidate, tried,
+        })
+        break
+      }
+    }
+    log('deterministic_engine.identifier_forms_summary',
+      `Identifier-form discovery: ${targets.length} declared object route(s), ${tried} candidate read(s), ${found} verified (tenants: ${tenants.join(', ') || 'none'}).`,
+      { routes: targets.map(endpoint => `${endpoint.method} ${endpoint.pathTemplate.split('?')[0]}`), tried, found, tenants })
+  }
+
   for (const endpoint of ranked) {
-    if (budget.requestsUsed >= budget.maxRequests || input.signal.aborted) break
+    if (budget.requestsUsed >= limit || input.signal.aborted) break
     if (isStaticOrBaselinePath(endpoint.pathTemplate)) continue
     const bare = endpoint.pathTemplate.split('?')[0] || '/'
     const method = endpoint.method.toUpperCase()
@@ -2770,6 +2929,7 @@ export function buildProbeRequest(
     origin: hyp.endpoint.origin,
     pathAndQuery: hyp.pathAndQuery,
     method: hyp.method,
+    staging: staging.action === 'tag',
     maxRequests,
     runId: context.runId,
     assignmentId: context.assignmentId,
@@ -2799,6 +2959,10 @@ export function buildProbeRequest(
         includeAnonymous,
         includeHeaderBypass: false,
         ...(hyp.functionLevel && hyp.jsonBody ? { functionBody: hyp.jsonBody } : {}),
+        // A mutating object route with a harvested readback gets the genuine cross-actor write
+        // proof: owner read -> peer write -> owner read-back -> restore. Enabled under the staging
+        // contract only, so a live floor keeps its historical (bounded) probe behaviour.
+        ...(staging.action === 'tag' && !hyp.functionLevel && hyp.readbackPath ? { writePathRead: true } : {}),
         ...(hyp.secretScan ? { secretScan: true, ...(hyp.viewerPersona ? { viewerPersona: hyp.viewerPersona } : {}) } : {}),
         ...(hyp.csrfBind ? { csrfBind: true } : {}),
       }
@@ -3333,6 +3497,426 @@ async function probeSecretExposure(
   return { ...base, requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Capability probes: multi-step price flow and synchronized state-changing burst
+// ---------------------------------------------------------------------------------------------
+
+function jsonRecordOf(body: string): Record<string, unknown> | null {
+  const text = body.trim()
+  if (!text.startsWith('{')) return null
+  try {
+    const parsed = JSON.parse(text) as unknown
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
+  } catch {
+    return null
+  }
+}
+
+function numericEntries(record: Record<string, unknown> | null): Array<[string, number]> {
+  if (!record) return []
+  const out: Array<[string, number]> = []
+  for (const [field, value] of Object.entries(record)) {
+    if (typeof value === 'number' && Number.isFinite(value)) out.push([field, value])
+    else if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) out.push([field, Number(value)])
+  }
+  return out
+}
+
+function emptyDifferential(
+  hyp: EngineHypothesis,
+  summary: string,
+  details: Record<string, unknown> = {},
+): DifferentialResult {
+  return {
+    probeClass: hyp.probeClass,
+    origin: hyp.endpoint.origin,
+    pathAndQuery: hyp.pathAndQuery,
+    verdict: 'no_signal',
+    summary,
+    anomalies: [],
+    details,
+    requestsSent: 0,
+    exchangeIds: [],
+    stoppedReason: null,
+    notes: [],
+    durationMs: 0,
+  }
+}
+
+/**
+ * Multi-step client-price trust.
+ *
+ * The producer route mints an object carrying the *server's* price; the terminal money route is
+ * then charged twice: once at that server price (control) and once at a tampered client value
+ * (probe) on a second minted object. Confirmation requires both the control and probe to be
+ * accepted AND the server's own order record to report the tampered charge.
+ */
+async function probePriceTrust(
+  hyp: EngineHypothesis,
+  input: DeterministicEngineInput,
+  track: (exchange: BrokerExchangeResult) => void | string,
+): Promise<DifferentialResult> {
+  const started = Date.now()
+  const base = emptyDifferential(hyp, 'No server-priced object could be created, or the terminal route did not charge a caller-supplied price.')
+  const createPath = hyp.flowCreatePath
+  if (!createPath || !createPath.startsWith('/')) return { ...base, durationMs: Date.now() - started }
+  const exchangeIds: string[] = []
+  let requests = 0
+  const send = async (path: string, body: Record<string, unknown>): Promise<BrokerExchangeResult | null> => {
+    try {
+      const exchange = await input.broker.executeHttp({
+        origin: hyp.endpoint.origin,
+        method: 'POST',
+        pathAndQuery: path,
+        headers: { 'Content-Type': 'application/json', ...(hyp.headers ?? {}) },
+        body: JSON.stringify(body),
+        persona: hyp.ownerPersona,
+        timeoutMs: 10_000,
+      }, input.grant, input.signal)
+      requests += 1
+      const id = track(exchange)
+      if (typeof id === 'string') exchangeIds.push(id)
+      return exchange
+    } catch {
+      requests += 1
+      return null
+    }
+  }
+  const mint = async (): Promise<{ idField: string; resourceId: string; priceField: string; serverPrice: number; raw: Record<string, unknown> } | null> => {
+    const created = await send(createPath, {})
+    if (!created || created.status < 200 || created.status >= 300) return null
+    const record = jsonRecordOf(created.body)
+    if (!record) return null
+    const entries = Object.entries(record)
+    const idPair = entries.find(([field, value]) =>
+      /id$/i.test(field) && !/^(?:valid|invalid|paid|void|liquid|solid|bid|grid|mid|kid)$/i.test(field) &&
+      (typeof value === 'string' || typeof value === 'number') &&
+      /^[A-Za-z0-9_.:-]{1,128}$/.test(String(value)) && !/^(?:error|message)$/i.test(field))
+    const prices = numericEntries(record).filter(([field]) => /(?:unit_?)?price|amount|total|cost|cents/i.test(field))
+    const pricePair = prices.find(([field]) => /price|unit/i.test(field)) ?? prices[0]
+    if (!idPair || !pricePair) return null
+    return {
+      idField: idPair[0],
+      resourceId: String(idPair[1]),
+      priceField: pricePair[0],
+      serverPrice: pricePair[1],
+      raw: record,
+    }
+  }
+  const control = await mint()
+  if (!control) return { ...base, requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
+  const controlPay = await send(hyp.pathAndQuery.split('?')[0]!, {
+    [control.idField]: control.resourceId,
+    [control.priceField]: control.serverPrice,
+  })
+  const controlRecord = controlPay ? jsonRecordOf(controlPay.body) : null
+  const chargedEntries = numericEntries(controlRecord).filter(([field]) => /total|charged|amount|paid|price/i.test(field))
+  const chargedPair = chargedEntries.find(([field]) => /total|charged|paid/i.test(field)) ?? chargedEntries[0]
+  if (!controlPay || controlPay.status < 200 || controlPay.status >= 300 || !chargedPair ||
+      chargedPair[1] !== control.serverPrice) {
+    return {
+      ...base,
+      summary: 'The control arm did not charge the server-issued price; price trust is not observable.',
+      details: { controlStatus: controlPay?.status ?? null, serverPrice: control.serverPrice, charged: chargedPair?.[1] ?? null },
+      requestsSent: requests,
+      exchangeIds,
+      durationMs: Date.now() - started,
+    }
+  }
+  const probe = await mint()
+  if (!probe) return { ...base, requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
+  const tamperedPrice = probe.serverPrice > 1 ? 1 : probe.serverPrice - 1
+  if (!(tamperedPrice < probe.serverPrice)) return { ...base, requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
+  const probePay = await send(hyp.pathAndQuery.split('?')[0]!, {
+    [probe.idField]: probe.resourceId,
+    [probe.priceField]: tamperedPrice,
+  })
+  const probeRecord = probePay ? jsonRecordOf(probePay.body) : null
+  const probeCharged = numericEntries(probeRecord).find(([field]) => field === chargedPair[0])?.[1] ?? null
+  if (!probePay || probePay.status < 200 || probePay.status >= 300 || probeCharged !== tamperedPrice) {
+    return {
+      ...base,
+      summary: 'The probe arm did not persist the tampered charge; client price is ignored or rejected.',
+      details: { probeStatus: probePay?.status ?? null, tamperedPrice, charged: probeCharged },
+      requestsSent: requests,
+      exchangeIds,
+      durationMs: Date.now() - started,
+    }
+  }
+  // The terminal transition is also replayable: the same already-paid object accepts the identical
+  // pay request again. That is the state-machine half of the invariant (no single-use terminal
+  // state); the control/probe charge delta is the price half.
+  const repeatPay = await send(hyp.pathAndQuery.split('?')[0]!, {
+    [probe.idField]: probe.resourceId,
+    [probe.priceField]: tamperedPrice,
+  })
+  const repeatOk = Boolean(repeatPay && repeatPay.status >= 200 && repeatPay.status < 300)
+  return {
+    ...base,
+    verdict: 'signal',
+    summary: 'The payment step charged a caller-supplied price instead of the server-issued price and accepted the same terminal transition twice.',
+    anomalies: [{
+      type: 'price_tampering',
+      path: hyp.pathAndQuery.split('?')[0],
+      idField: control.idField,
+      resourceId: probe.resourceId,
+      priceField: probe.priceField,
+      serverPrice: probe.serverPrice,
+      tamperedPrice,
+      chargedField: chargedPair[0],
+      controlCharged: chargedPair[1],
+      probeCharged,
+      controlStatus: controlPay.status,
+      probeStatus: probePay.status,
+      repeatStatus: repeatPay?.status ?? null,
+      repeatAccepted: repeatOk,
+      createPath,
+    }],
+    details: {
+      control: { status: controlPay.status, charged: chargedPair[1] },
+      probe: { status: probePay.status, charged: probeCharged },
+      repeatStatus: repeatPay?.status ?? null,
+      serverPrice: probe.serverPrice,
+      tamperedPrice,
+    },
+    requestsSent: requests,
+    exchangeIds,
+    durationMs: Date.now() - started,
+  }
+}
+
+/** Whether the last burst actually used the synchronized HTTP/2 single-packet barrier. */
+export function classifyRaceMode(input: {
+  http2Enabled: boolean
+  spreadMs: number
+  observedBalances: readonly number[]
+}): 'h2-single-packet' | 'fallback' {
+  const sameObserved = input.observedBalances.length > 1 &&
+    input.observedBalances.every(value => value === input.observedBalances[0])
+  return input.http2Enabled && sameObserved && input.spreadMs <= 5 ? 'h2-single-packet' : 'fallback'
+}
+
+/**
+ * Synchronized state-changing burst (TOCTOU / double-spend).
+ *
+ * Discovers the service origin and the numeric request field from the target's own responses, then
+ * compares a serial control (N sequential debits) with a same-ticket burst (N concurrent debits).
+ * Confirmation requires every burst acknowledgement AND a single balance debit, with a separate
+ * pre/post read of the conserved value. A burst that did not use the HTTP/2 barrier is reported as
+ * a fallback and never becomes a finding.
+ */
+async function probeRaceDoubleSpend(
+  hyp: EngineHypothesis,
+  input: DeterministicEngineInput,
+  track: (exchange: BrokerExchangeResult) => void | string,
+): Promise<DifferentialResult> {
+  const started = Date.now()
+  const base = emptyDifferential(hyp, 'No synchronized over-count was observed for this state-changing route.')
+  const exchangeIds: string[] = []
+  let requests = 0
+  const send = async (origin: string, body: Record<string, unknown>): Promise<BrokerExchangeResult | null> => {
+    try {
+      const exchange = await input.broker.executeHttp({
+        origin,
+        method: 'POST',
+        pathAndQuery: hyp.pathAndQuery.split('?')[0]!,
+        headers: { 'Content-Type': 'application/json', ...(hyp.headers ?? {}) },
+        body: JSON.stringify(body),
+        persona: hyp.ownerPersona,
+        timeoutMs: 10_000,
+      }, input.grant, input.signal)
+      requests += 1
+      const id = track(exchange)
+      if (typeof id === 'string') exchangeIds.push(id)
+      return exchange
+    } catch {
+      requests += 1
+      return null
+    }
+  }
+  // The declared route may be served by a sibling origin (e.g. an h2c transfer service). Try the
+  // declared origin first, then other in-scope origins, and keep the first that accepts the shape.
+  const origins = [...new Set([hyp.endpoint.origin, ...input.endpoints.map(endpoint => endpoint.origin)])].slice(0, 4)
+  let raceOrigin: string | null = null
+  let record: Record<string, unknown> | null = null
+  for (const origin of origins) {
+    const shaped = await send(origin, {})
+    if (!shaped || shaped.status < 200 || shaped.status >= 300) continue
+    const parsed = jsonRecordOf(shaped.body)
+    if (!parsed || numericEntries(parsed).length === 0) continue
+    raceOrigin = origin
+    record = parsed
+    break
+  }
+  if (!raceOrigin || !record) return { ...base, requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
+  const balancePair = numericEntries(record).find(([field]) => /balance|available|remaining/i.test(field)) ??
+    numericEntries(record).sort((a, b) => b[1] - a[1])[0]
+  if (!balancePair) return { ...base, requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
+  const balanceField = balancePair[0]
+  const baselineBalance = balancePair[1]
+  const candidates = ['amount', 'value', 'quantity', 'qty', 'total', 'price', 'count', 'units', 'seats', 'credits']
+  let amountField: string | null = null
+  let transferredField: string | null = null
+  for (const candidate of candidates.slice(0, 5)) {
+    const attempt = await send(raceOrigin, { [candidate]: 1 })
+    if (!attempt || attempt.status < 200 || attempt.status >= 300) continue
+    const parsed = jsonRecordOf(attempt.body)
+    if (!parsed) continue
+    const nums = numericEntries(parsed)
+    const echo = nums.find(([field, value]) => value === 1 && /transfer|debit|charge|amount|count|redeem|used|quantity|qty/i.test(field))
+    const observed = nums.find(([field]) => field === balanceField)?.[1]
+    const movedByOne = observed !== undefined && baselineBalance - observed === 1
+    if (echo || movedByOne) {
+      amountField = candidate
+      transferredField = echo?.[0] ?? null
+      break
+    }
+  }
+  if (!amountField) {
+    return { ...base, summary: 'No numeric request field changed the conserved value; the burst shape is unknown.', requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
+  }
+  if (!transferredField) {
+    const zero = await send(raceOrigin, { [amountField]: 0 })
+    const zeroRecord = zero ? jsonRecordOf(zero.body) : null
+    transferredField = numericEntries(zeroRecord).find(([field]) => /transfer|debit|charge|amount|count|redeem|used|quantity|qty/i.test(field))?.[0] ?? null
+  }
+  if (!transferredField) transferredField = amountField
+  const readBalance = async (): Promise<number | null> => {
+    const read = await send(raceOrigin!, { [amountField!]: 0 })
+    const parsed = read ? jsonRecordOf(read.body) : null
+    const value = numericEntries(parsed).find(([field]) => field === balanceField)?.[1]
+    return value === undefined ? null : value
+  }
+  const pre = await readBalance()
+  if (pre === null || pre < 1) {
+    return { ...base, summary: 'The conserved value could not be read before the burst.', requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
+  }
+  const burstSize = 4
+  const grant = input.grant
+  let burst: Awaited<ReturnType<RequestBroker['executeRaceBurst']>>
+  try {
+    burst = await input.broker.executeRaceBurst(
+      Array.from({ length: burstSize }, () => ({
+        origin: raceOrigin!,
+        method: 'POST' as const,
+        pathAndQuery: hyp.pathAndQuery.split('?')[0]!,
+        headers: { 'Content-Type': 'application/json', ...(hyp.headers ?? {}) },
+        body: JSON.stringify({ [amountField!]: 1 }),
+        persona: hyp.ownerPersona,
+      })),
+      grant,
+      input.signal,
+    )
+  } catch (error) {
+    return {
+      ...base,
+      summary: 'The synchronized burst was refused by the broker; no over-count was proven.',
+      details: { error: (error instanceof Error ? error.message : String(error)).slice(0, 200) },
+      requestsSent: requests,
+      exchangeIds,
+      durationMs: Date.now() - started,
+    }
+  }
+  for (const exchange of burst.results) {
+    requests += 1
+    const id = track(exchange)
+    if (typeof id === 'string') exchangeIds.push(id)
+  }
+  const post = await readBalance()
+  if (post === null) {
+    return { ...base, summary: 'The conserved value could not be read after the burst.', requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
+  }
+  const burstRecords = burst.results.map(result => jsonRecordOf(result.body))
+  const burstObserved = burstRecords
+    .map(rec => numericEntries(rec).find(([field]) => field === balanceField)?.[1])
+    .filter((value): value is number => value !== undefined)
+  const burstAcks = burst.results.filter(result => result.status >= 200 && result.status < 300).length
+  const burstTransferred = burstRecords.reduce((total, rec) =>
+    total + (numericEntries(rec).find(([field]) => field === transferredField)?.[1] ?? 0), 0)
+  const burstDebit = pre - post
+  // Serial control: the same N requests one at a time must debit N. Read the conserved value again.
+  let serialAcks = 0
+  for (let i = 0; i < burstSize; i += 1) {
+    const serial = await send(raceOrigin, { [amountField]: 1 })
+    if (serial && serial.status >= 200 && serial.status < 300) serialAcks += 1
+  }
+  const serialPost = await readBalance()
+  const serialDebit = serialPost === null ? null : post - serialPost
+  const httpTransport = (input.broker as unknown as { httpTransport?: { isHttp2Enabled?: () => boolean } }).httpTransport
+  const http2Enabled = typeof httpTransport?.isHttp2Enabled === 'function' ? httpTransport.isHttp2Enabled() : false
+  const raceMode = classifyRaceMode({
+    http2Enabled,
+    spreadMs: burst.summary.spreadMs,
+    observedBalances: burstObserved,
+  })
+  const details = {
+    raceOrigin,
+    amountField,
+    balanceField,
+    transferredField,
+    burstSize,
+    burstAcks,
+    burstTransferred,
+    preBalance: pre,
+    postBalance: post,
+    burstDebit,
+    serialAcks,
+    serialDebit,
+    spreadMs: burst.summary.spreadMs,
+    statusCounts: burst.summary.statusCounts,
+    raceMode,
+  }
+  if (raceMode !== 'h2-single-packet') {
+    return {
+      ...base,
+      summary: 'The synchronized burst did not run on the HTTP/2 single-packet barrier (fallback); refusing to claim a race.',
+      details,
+      requestsSent: requests,
+      exchangeIds,
+      durationMs: Date.now() - started,
+    }
+  }
+  const overCount = burstAcks === burstSize && burstTransferred >= burstSize && burstDebit >= 1 && burstDebit < burstSize
+  const serialControl = serialAcks === burstSize && serialDebit === burstSize
+  if (!(overCount && serialControl)) {
+    return {
+      ...base,
+      summary: 'Burst and serial control did not diverge: every acknowledgement produced a matching debit.',
+      details,
+      requestsSent: requests,
+      exchangeIds,
+      durationMs: Date.now() - started,
+    }
+  }
+  return {
+    ...base,
+    verdict: 'signal',
+    summary: `${burstSize} same-ticket transfers were acknowledged but the balance was debited ${burstDebit} time(s); the serial control debited all ${serialDebit}.`,
+    anomalies: [{
+      type: 'race_double_spend',
+      path: hyp.pathAndQuery.split('?')[0],
+      raceOrigin,
+      amountField,
+      balanceField,
+      transferredField,
+      amount: 1,
+      burstSize,
+      burstAcks,
+      burstTransferred,
+      preBalance: pre,
+      postBalance: post,
+      burstDebit,
+      serialAcks,
+      serialDebit,
+      raceMode,
+    }],
+    details,
+    requestsSent: requests,
+    exchangeIds,
+    durationMs: Date.now() - started,
+  }
+}
+
 function classStats(report: DeterministicEngineReport, intent: string): EngineClassStats {
   const existing = report.byClass[intent]
   if (existing) return existing
@@ -3548,6 +4132,86 @@ export function trackFloorCanarySubscriptions(
   return { broker, subscriptions: () => [...byToken.values()], finalize }
 }
 
+/** First path segment, used to re-home a declared route family without moving unrelated services. */
+function pathFamily(pathTemplate: string): string {
+  return ((pathTemplate.split('?')[0] || '/').split('/').filter(Boolean)[0] ?? '').toLowerCase()
+}
+
+/**
+ * Correct a declared-surface origin mismatch. Some importers attach every spec path to a single
+ * default origin, so a route declared for one host can be registered against a sibling. We verify
+ * the object route with an owner read on each sibling and migrate the *path family* when the
+ * assigned origin 404s but another origin serves the identifier form.
+ */
+async function rehomeDeclaredSurface(
+  ranked: readonly EngineEndpoint[],
+  input: DeterministicEngineInput,
+  budget: { requestsUsed: number; maxRequests: number },
+  track: (exchange: BrokerExchangeResult) => void | string,
+  log: (kind: string, message: string, data?: Record<string, unknown>) => void,
+): Promise<void> {
+  if (input.environmentMode !== 'staging_isolated') return
+  if (!input.personas.length) return
+  const owner = personaPicks(input.personas).owner?.handle
+  if (!owner) return
+  const allOrigins = [...new Set(ranked.map(endpoint => endpoint.origin))]
+  if (allOrigins.length < 2) return
+  const tenants = [...new Set(input.personas.map(persona => persona.tenant ?? '').filter(Boolean))]
+  const targets = ranked
+    .filter(endpoint => endpoint.source !== 'conventional')
+    .filter(endpoint => ['POST', 'PUT', 'PATCH', 'DELETE'].includes(endpoint.method.toUpperCase()))
+    .filter(endpoint => {
+      const segs = (endpoint.pathTemplate.split('?')[0] || '/').split('/').filter(Boolean)
+      return placeholderSeg.test(segs[segs.length - 1] ?? '')
+    })
+    .slice(0, 2)
+  let spent = 0
+  for (const target of targets) {
+    const originalOrigin = target.origin
+    const family = pathFamily(target.pathTemplate)
+    const forms = identifierFormsForRoute(target.pathTemplate.split('?')[0] || '/', tenants).slice(0, 4)
+    if (forms.length === 0) continue
+    let serving: { origin: string } | null = null
+    for (const origin of [originalOrigin, ...allOrigins.filter(candidate => candidate !== originalOrigin)]) {
+      for (const candidate of forms) {
+        if (spent >= 8 || budget.requestsUsed >= budget.maxRequests || input.signal.aborted) break
+        spent += 1
+        budget.requestsUsed += 1
+        try {
+          const exchange = await input.broker.executeHttp({
+            origin,
+            method: 'GET',
+            pathAndQuery: (target.pathTemplate.split('?')[0] || '/').replace(idSegmentRe, `/${encodeURIComponent(candidate)}`),
+            persona: owner,
+            followRedirects: false,
+            timeoutMs: 8_000,
+          }, input.grant, input.signal)
+          track(exchange)
+          if (exchange.status < 200 || exchange.status >= 300) continue
+          const parsed = jsonRecordOf(exchange.body)
+          const fields = parsed ? Object.keys(parsed) : []
+          const errorOnly = fields.length > 0 && fields.every(field => /^(?:error|errors|message|detail|path|status|code)$/i.test(field))
+          if (!parsed || errorOnly || fields.length < 2) continue
+          serving = { origin }
+          break
+        } catch {
+          continue
+        }
+      }
+      if (serving) break
+    }
+    if (!serving || serving.origin === originalOrigin) continue
+    for (const endpoint of ranked) {
+      if ((endpoint as { origin: string }).origin !== originalOrigin) continue
+      if (pathFamily(endpoint.pathTemplate) !== family) continue
+      ;(endpoint as { origin: string }).origin = serving.origin
+    }
+    log('deterministic_engine.rehome', `Declared ${family} route family moved from ${originalOrigin} to the sibling origin that serves it (${serving.origin}).`, {
+      family, from: originalOrigin, to: serving.origin, endpoint: target.pathTemplate,
+    })
+  }
+}
+
 export async function runDeterministicEngine(input: DeterministicEngineInput): Promise<DeterministicEngineReport> {
   const started = Date.now()
   const maxRequests = Math.max(0, input.maxRequests ?? defaultEngineMaxRequests)
@@ -3597,7 +4261,6 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
   }
 
   const picks = personaPicks(input.personas)
-  const origins = [...new Set(ranked.map(endpoint => endpoint.origin))]
   const budget = { requestsUsed: 0, maxRequests }
   const createdEntityIds = new Set<string>()
   /** Evidence-gated leads collected during the pass; deduped/ranked/capped before emission. */
@@ -3620,14 +4283,40 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     }
     return input.recordExchange?.(exchange)
   }
+  // A declared route map can be attached to the wrong sibling origin by an upstream importer. When
+  // the declared object surface does not resolve on its assigned origin but does on a sibling, move
+  // that path family to the serving origin *before* ranking/harvesting. Bounded to a handful of
+  // owner reads and only in an isolated lab/staging environment.
+  await rehomeDeclaredSurface(ranked, input, budget, trackExchange, log)
+  // Origin order is part of the deterministic plan: the origin carrying the most declared routes
+  // (the primary app surface) is harvested first, so a speculative wordlist-only origin can never
+  // consume a tight staging budget before the declared surface is read.
+  const originStats = new Map<string, { declared: number; total: number }>()
+  for (const endpoint of ranked) {
+    const stats = originStats.get(endpoint.origin) ?? { declared: 0, total: 0 }
+    stats.total += 1
+    if (endpoint.source !== 'conventional') stats.declared += 1
+    originStats.set(endpoint.origin, stats)
+  }
+  const origins = [...originStats.keys()].sort((a, b) => {
+    const sa = originStats.get(a)!
+    const sb = originStats.get(b)!
+    return sb.declared - sa.declared || sb.total - sa.total || a.localeCompare(b)
+  })
 
   // Harvest each origin independently (the engine is per-run but a run may carry several assets).
+  // Under the tight staging cap, harvesting the whole surface would starve every behavioural probe;
+  // reserve at least half the budget for probe/replay work so a wired route can still be converted
+  // into a confirmed finding. Wide-budget local floors keep the previous unbounded harvest.
+  const harvestCeiling = maxRequests < 600
+    ? Math.max(40, Math.floor(maxRequests * 0.45))
+    : maxRequests
   const harvests = new Map<string, EndpointHarvest>()
   for (const origin of origins) {
-    if (budget.requestsUsed >= maxRequests || input.signal.aborted) break
+    if (budget.requestsUsed >= harvestCeiling || input.signal.aborted) break
     const originEndpoints = ranked.filter(endpoint => endpoint.origin === origin)
     const harvester = new SurfaceHarvester({ ...input, recordExchange: trackExchange }, log, origin)
-    const result = await harvestSurface(input, originEndpoints, harvester, picks, budget, log)
+    const result = await harvestSurface(input, originEndpoints, harvester, picks, budget, log, harvestCeiling)
     report.endpointsHarvested += result.endpointsHarvested
     for (const [id, harvest] of result.harvests) harvests.set(id, harvest)
   }
@@ -3638,6 +4327,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     maxHypotheses: input.maxHypotheses ?? defaultEngineMaxHypotheses,
     maxRequests,
     identityProfiles: buildIdentityProfiles(ranked, harvests),
+    environmentMode: input.environmentMode ?? 'ephemeral_lab',
     ...(input.classes ? { classes: input.classes } : {}),
   })
 
@@ -3671,6 +4361,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     mass_assignment: capFor(6),
     csrf: capFor(4),
     workflow: capFor(3),
+    race: capFor(2),
     ssti: capFor(3),
     command_injection: capFor(3),
     webhook: capFor(2),
@@ -3689,6 +4380,17 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
       csrfFamilies.add(family)
     }
     probeQueue.push(hyp)
+  }
+  // Tight-budget (staging) passes must spend their probe reserve on the declared surface and on
+  // the conversion classes first; speculative wordlist routes otherwise crowd the queue tail.
+  if (maxRequests < 600) {
+    const priority = (hyp: EngineHypothesis): number => {
+      if (hyp.intent === 'authz') return 0
+      if (hyp.priceTrust) return 1
+      if (hyp.raceBurst) return 2
+      return hyp.endpoint.source === 'conventional' ? 4 : 3
+    }
+    probeQueue.sort((a, b) => priority(a) - priority(b))
   }
   // Request-count termination is the deterministic contract; the wall clock is only a safety net
   // with a fixed margin, so a slow host cannot silently truncate a different tail of the queue.
@@ -3730,7 +4432,12 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
       })
       continue
     }
-    if (staging.action === 'tag') report.stagingTaggedMutations += 1
+    if (staging.action === 'tag') {
+      report.stagingTaggedMutations += 1
+      // Custom capability probes construct their own requests, so carry the run-scoped tag on the
+      // hypothesis itself; every synthesized replay step then inherits the same headers.
+      if (staging.headers) hyp.headers = staging.headers
+    }
     // Layer-2 floor canaries register a durable `pending_oob` subscription before the probe sends
     // the canary URL, so a callback that arrives after the probe's short poll is promoted by the
     // run-level drain instead of being lost.
@@ -3740,14 +4447,18 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     const probeCanaryBroker = canaryTracker?.broker ?? input.canaryBroker
     let probe: DifferentialResult
     try {
-      probe = hyp.intent === 'secret_disclosure' && !hyp.secretScan && !input.probe
-        ? await probeSecretExposure(hyp, input, trackExchange)
-        : hyp.probeClass === 'ssrf_canary' && hyp.triggerPath && probeCanaryBroker && !input.probe
-          ? await probeSecondOrderSsrf(hyp, { ...input, canaryBroker: probeCanaryBroker }, trackExchange)
-          : await (input.probe ?? probeDifferential)(
-              { ...buildProbeRequest(hyp, maxProbeRequests, input, staging), onExchange: trackExchange },
-              input.broker, input.grant, probeCanaryBroker, input.signal,
-            )
+      probe = hyp.priceTrust && !input.probe
+        ? await probePriceTrust(hyp, input, trackExchange)
+        : hyp.raceBurst && !input.probe
+          ? await probeRaceDoubleSpend(hyp, input, trackExchange)
+          : hyp.intent === 'secret_disclosure' && !hyp.secretScan && !input.probe
+            ? await probeSecretExposure(hyp, input, trackExchange)
+            : hyp.probeClass === 'ssrf_canary' && hyp.triggerPath && probeCanaryBroker && !input.probe
+              ? await probeSecondOrderSsrf(hyp, { ...input, canaryBroker: probeCanaryBroker }, trackExchange)
+              : await (input.probe ?? probeDifferential)(
+                  { ...buildProbeRequest(hyp, maxProbeRequests, input, staging), onExchange: trackExchange },
+                  input.broker, input.grant, probeCanaryBroker, input.signal,
+                )
     } catch (error) {
       const message = error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200)
       report.notes.push(`${hyp.probeClass} ${hyp.endpoint.pathTemplate}: ${message}`)
@@ -3761,6 +4472,17 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
       continue
     }
     canaryTracker?.finalize(probe)
+    if (hyp.raceBurst) {
+      const mode = typeof probe.details.raceMode === 'string' ? probe.details.raceMode : 'unmeasured'
+      // Loud, structured transport note: a raced route that fell back to HTTP/1.1 must never look
+      // like a capability miss caused by the target; it is a harness/transport condition.
+      log(mode === 'h2-single-packet' ? 'deterministic_engine.race_mode' : 'deterministic_engine.race_fallback',
+        `${hyp.method} ${hyp.endpoint.pathTemplate}: raceMode=${mode} spread=${String(probe.details.spreadMs ?? 'n/a')}ms acks=${String(probe.details.burstAcks ?? 'n/a')} debit=${String(probe.details.burstDebit ?? 'n/a')}`,
+        { intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, raceMode: mode })
+      if (mode === 'fallback') {
+        report.notes.push(`race burst on ${hyp.endpoint.pathTemplate} did not use the HTTP/2 barrier (raceMode=fallback)`)
+      }
+    }
     report.hypothesesRun += 1
     stats.requests += probe.requestsSent
     log('deterministic_engine.probe', `${hyp.probeClass} ${hyp.method} ${hyp.endpoint.pathTemplate}${hyp.param ? ` param=${hyp.param.name}` : ''} -> ${probe.verdict}`, {
@@ -3997,6 +4719,7 @@ export function intentFamily(intent: string): string {
     case 'cache': return 'cache'
     case 'secret_disclosure': return 'disclosure'
     case 'workflow': return 'logic'
+    case 'race': return 'race'
     case 'ssti': return 'ssti'
     case 'command_injection': return 'cmdi'
     case 'webhook': return 'webhook'
