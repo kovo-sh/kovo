@@ -38,6 +38,7 @@ import {
   assessImpactEvidence,
   assessMassAssignmentImpact,
   assessMfaBypass,
+  assessStatusOnlyDivergence,
   classifyBoundaryClaim,
   classifyImpactDescriptor,
   normalizeRole,
@@ -568,6 +569,38 @@ export function assessHttpChainProofStrength(
   snapshots: readonly HttpChainStepSnapshot[],
 ): HttpChainProofStrength {
   const assertionEvidence = classifyHttpChainAssertion(spec.assertionsJq)
+  // Universal status-only ban: a bare 2xx -> 4xx/5xx divergence can never confirm ANY class. The
+  // injection/authz/redirect oracles still run afterwards; this is a floor, not a substitute.
+  if (assertionEvidence === 'status_only') {
+    const statusOnly = assessStatusOnlyDivergence(
+      snapshots.map(snapshot => ({
+        id: snapshot.id,
+        arm: snapshot.role === 'probe'
+          ? 'probe' as const
+          : snapshot.role === 'control'
+            ? 'control' as const
+            : snapshot.role === 'cleanup'
+              ? 'cleanup' as const
+              : 'setup' as const,
+        method: snapshot.method,
+        route: snapshot.route,
+        pathAndQuery: snapshot.pathAndQuery,
+        status: snapshot.status,
+        actor: actorFromPersona(snapshot.actor, []),
+        json: snapshot.json,
+        body: snapshot.body,
+      })),
+    )
+    if (statusOnly.statusOnly) {
+      return {
+        claim: isAuthorizationClaim(spec) ? 'authorization' : 'other',
+        assertionEvidence,
+        differential: null,
+        satisfied: false,
+        reason: statusOnly.reason,
+      }
+    }
+  }
   if (!isAuthorizationClaim(spec)) {
     return { claim: 'other', assertionEvidence, differential: null, satisfied: true, reason: 'Not an authorization claim.' }
   }
@@ -1578,6 +1611,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         const distinctActors = new Set(spec.steps.map(step => step.request.persona ?? step.request.session ?? 'anonymous'))
         const gateApplies = impactClass === 'mass_assignment' || impactClass === 'csrf' ||
           impactClass === 'business_logic' || impactClass === 'markup' || impactClass === 'disclosure' ||
+          impactClass === 'injection' ||
           (impactClass === 'authorization' && (distinctActors.size > 1 || Boolean(spec.requiredRole) || Boolean(spec.resourceTenant)))
         const impactGate = !gateApplies
           ? null

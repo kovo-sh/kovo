@@ -18,6 +18,8 @@ import type { ImpactStep } from '../src/server/oracle-invariants.ts'
 import { receiptRuleFor, verifyReceipt } from '../src/server/proof-receipt.ts'
 import type { ReceiptTranscript } from '../src/server/proof-receipt.ts'
 import { evaluateClaims, TranscriptStore } from '../src/server/verify-rpc.ts'
+import { assessHttpChainProofStrength } from '../src/server/replay-verifier.ts'
+import { baseFields } from '../src/server/deterministic-specs.ts'
 import type { VerifyClaim } from '../src/server/verify-rpc.ts'
 
 const origin = 'https://app.example.invalid'
@@ -382,4 +384,27 @@ test('status-diff guard: the receipt target is bound to the mutating exchange, n
     resourceTenant: 'globex',
   }, transcript)
   assert.equal(bound.confirmed, true, bound.reason)
+})
+
+test('http_chain: a bare 200 -> 500 assertion is rejected for a non-authz (injection) claim', () => {
+  const spec = {
+    ...baseFields(
+      'http://127.0.0.1:1',
+      'POST /api/journals/filter passes unrecognized caller keys',
+      'CWE-20',
+      'injection-input',
+      'high',
+      '{ confirmed: (.steps["probe"].status == 500) }',
+    ),
+    kind: 'http_chain' as const,
+    steps: [],
+    assertionsJq: '{ confirmed: (.steps["probe"].status == 500) }',
+  }
+  const snapshots = [
+    { index: 0, id: 'control', role: 'control', method: 'POST', route: '/api/journals/filter', pathAndQuery: '/api/journals/filter', actor: 'persona:owner', status: 200, body: '{"items":[]}', bodyBytes: 12, mediaType: 'application/json', json: { items: [] }, secretMatches: 0 },
+    { index: 1, id: 'probe', role: 'probe', method: 'POST', route: '/api/journals/filter', pathAndQuery: '/api/journals/filter', actor: 'persona:owner', status: 500, body: '{"error":"Internal Server Error"}', bodyBytes: 30, mediaType: 'application/json', json: { error: 'Internal Server Error' }, secretMatches: 0 },
+  ]
+  const assessment = assessHttpChainProofStrength(spec as never, snapshots as never)
+  assert.equal(assessment.satisfied, false, 'status-only divergence must never confirm an injection claim')
+  assert.match(assessment.reason, /status/i)
 })
