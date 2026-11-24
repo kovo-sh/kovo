@@ -403,6 +403,104 @@ export function medianOf(nums: readonly number[]): number {
   return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
 }
 
+/** Median absolute deviation: a jitter-tolerant spread estimator for a small sample. */
+export function medianAbsoluteDeviation(nums: readonly number[]): number {
+  if (nums.length === 0) return 0
+  const center = medianOf(nums)
+  return medianOf(nums.map(value => Math.abs(value - center)))
+}
+
+/**
+ * Adaptive sleep delay for a noisy (WAN-jittered) link.
+ *
+ * A fixed 1.5 s delay is indistinguishable when the link's own spread is a large fraction of it.
+ * The delay is raised until the expected signal is several times the observed control spread, then
+ * clamped to the documented probe bound (1.5–5 s) so a blind probe never turns into a slow scan.
+ */
+export function adaptiveTimingDelayMs(baselineDurations: readonly number[], requestedMs: number): number {
+  const requested = Number.isFinite(requestedMs) ? requestedMs : 1500
+  if (baselineDurations.length < 2) {
+    return Math.max(1500, Math.min(5000, Math.round(requested)))
+  }
+  const spread = Math.max(...baselineDurations) - Math.min(...baselineDurations)
+  // 3x the observed spread keeps a real sleep outside the noise envelope with room to spare.
+  return Math.max(1500, Math.min(5000, Math.round(Math.max(requested, spread * 3 + 150))))
+}
+
+export interface TimingDifferentialSample {
+  baselineDurations: readonly number[]
+  probeDurations: readonly number[]
+  /** Every HTTP status observed for the paired rounds (all must be < 500). */
+  statuses: readonly number[]
+  delayMs: number
+}
+
+export interface TimingDifferentialAssessment {
+  passed: boolean
+  reason: string
+  rounds: number
+  baselineMedianMs: number
+  probeMedianMs: number
+  baselineMadMs: number
+  controlSpanMs: number
+  requiredDeltaMs: number
+  observedDeltaMs: number
+  /** Probes above the slowest control, allowing one jitter outlier. */
+  probesAboveControl: number
+}
+
+/**
+ * Robust `sqli_time_diff` decision.
+ *
+ * The old rule required `min(probe) > max(baseline)` plus a 0.85x-delay delta. On a WAN link with
+ * 50–300 ms jitter a single slow control sample defeats `min > max`, and a single fast probe sample
+ * defeats the delta, so a real sleep is missed. The robust rule uses medians and MAD:
+ *
+ *  - the median separation must exceed `max(0.6 x delay, 3 x MAD + 40 ms, 250 ms)`;
+ *  - the median probe must clear the *slowest* control by at least 20% of the delay;
+ *  - at least `rounds - 1` probes must exceed the slowest control (one outlier tolerated);
+ *  - every paired round must be non-5xx.
+ *
+ * A uniformly slow server (both arms slow) still fails: only the *separation* is signal.
+ */
+export function assessTimingDifferential(sample: TimingDifferentialSample): TimingDifferentialAssessment {
+  const rounds = Math.min(sample.baselineDurations.length, sample.probeDurations.length)
+  const baselineMedianMs = medianOf(sample.baselineDurations)
+  const probeMedianMs = medianOf(sample.probeDurations)
+  const baselineMadMs = medianAbsoluteDeviation(sample.baselineDurations)
+  const controlSpanMs = sample.baselineDurations.length === 0
+    ? 0
+    : Math.max(...sample.baselineDurations) - Math.min(...sample.baselineDurations)
+  const controlMaxMs = sample.baselineDurations.length === 0 ? 0 : Math.max(...sample.baselineDurations)
+  const observedDeltaMs = probeMedianMs - baselineMedianMs
+  const delayMs = Math.max(1, sample.delayMs)
+  const requiredDeltaMs = Math.max(0.6 * delayMs, 3 * baselineMadMs + 40, 250)
+  const probesAboveControl = sample.probeDurations.filter(duration => duration > controlMaxMs).length
+  const statusesOk = sample.statuses.every(status => status < 500)
+  const common = {
+    rounds,
+    baselineMedianMs,
+    probeMedianMs,
+    baselineMadMs,
+    controlSpanMs,
+    requiredDeltaMs,
+    observedDeltaMs,
+    probesAboveControl,
+  }
+  if (rounds < 3) return { ...common, passed: false, reason: `too few interleaved rounds (${rounds} < 3)` }
+  if (!statusesOk) return { ...common, passed: false, reason: 'a paired round returned a 5xx' }
+  if (observedDeltaMs < requiredDeltaMs) {
+    return { ...common, passed: false, reason: `median separation ${Math.round(observedDeltaMs)}ms is inside the jitter envelope (needs ${Math.round(requiredDeltaMs)}ms)` }
+  }
+  if (probeMedianMs - controlMaxMs < 0.2 * delayMs) {
+    return { ...common, passed: false, reason: `probe median ${Math.round(probeMedianMs)}ms does not clear the slowest control ${Math.round(controlMaxMs)}ms` }
+  }
+  if (probesAboveControl < rounds - 1) {
+    return { ...common, passed: false, reason: `only ${probesAboveControl}/${rounds} probes exceeded the slowest control` }
+  }
+  return { ...common, passed: true, reason: `median separation ${Math.round(observedDeltaMs)}ms exceeds the jitter envelope (${Math.round(requiredDeltaMs)}ms) across ${rounds} rounds` }
+}
+
 
 
 export async function diffSqlTimeDifferential(ctx: DiffContext, grant: Grant): Promise<DiffOutcome> {
@@ -421,10 +519,19 @@ export async function diffSqlTimeDifferential(ctx: DiffContext, grant: Grant): P
     }
   }
 
-  const delayMs = Math.max(1500, Math.min(3000, Math.round(req.delayMs ?? 1500)))
+  const requestedDelayMs = Math.max(1500, Math.min(3000, Math.round(req.delayMs ?? 1500)))
+  const baseValue = req.baselineValue ?? '1'
+  // Preflight: measure the link's own spread first. On a jittered WAN link a fixed delay can hide
+  // inside the noise, so the delay is raised until the expected sleep is several spreads wide.
+  const preflightDurations: number[] = []
+  for (let i = 0; i < 4; i += 1) {
+    const sample = await send(injectParam(req, baseValue))
+    if (!sample || sample.status >= 500) continue
+    preflightDurations.push(sample.durationMs)
+  }
+  const delayMs = adaptiveTimingDelayMs(preflightDurations, requestedDelayMs)
   const delaySec = Number((delayMs / 1000).toFixed(2))
   const delaySecInt = Math.max(1, Math.round(delayMs / 1000))
-  const baseValue = req.baselineValue ?? '1'
 
   const sqliteDelay = Math.min(90_000_000, delayMs * 25_000)
   const allCandidates: Array<{ dialect: 'mysql' | 'postgres' | 'mssql' | 'sqlite'; style: string; payload: string }> = [
@@ -447,57 +554,55 @@ export async function diffSqlTimeDifferential(ctx: DiffContext, grant: Grant): P
       ]
     : allCandidates
 
+  const maxRounds = 4
   const candidateSummaries: Array<Record<string, unknown>> = []
   for (const cand of candidates) {
-    const b1 = await send(injectParam(req, baseValue))
-    const p1 = await send(injectParam(req, cand.payload))
-    if (!b1 || !p1) continue
-    if (b1.status >= 500 || p1.status >= 500) continue
-    if (p1.durationMs - b1.durationMs < 0.7 * delayMs) {
-      candidateSummaries.push({ dialect: cand.dialect, style: cand.style, round1DeltaMs: p1.durationMs - b1.durationMs, passed: false })
-      continue
+    const baselineDurations: number[] = []
+    const probeDurations: number[] = []
+    const statuses: number[] = []
+    for (let round = 0; round < maxRounds; round += 1) {
+      // Interleave one baseline and one probe per round so drift affects both arms equally.
+      const baseline = await send(injectParam(req, baseValue))
+      if (!baseline) break
+      const probe = await send(injectParam(req, cand.payload))
+      if (!probe) break
+      baselineDurations.push(baseline.durationMs)
+      probeDurations.push(probe.durationMs)
+      statuses.push(baseline.status, probe.status)
+      if (round === 1) {
+        // Early skip only when there is no hint of a delay at all; a single slow probe keeps the
+        // candidate alive so a jitter outlier cannot mask a real sleep.
+        const approxDelta = medianOf(probeDurations) - medianOf(baselineDurations)
+        const anyProbeSlower = Math.max(...probeDurations) > Math.max(...baselineDurations)
+        if (approxDelta < 0.25 * delayMs && !anyProbeSlower) break
+      }
     }
-    const b2 = await send(injectParam(req, baseValue))
-    const p2 = await send(injectParam(req, cand.payload))
-    const b3 = await send(injectParam(req, baseValue))
-    const p3 = await send(injectParam(req, cand.payload))
-    if (!b2 || !p2 || !b3 || !p3) continue
-    const baseDurations = [b1.durationMs, b2.durationMs, b3.durationMs]
-    const probeDurations = [p1.durationMs, p2.durationMs, p3.durationMs]
-    const statusesOk = [b1, p1, b2, p2, b3, p3].every(e => e.status < 500)
-    const baselineMedianMs = medianOf(baseDurations)
-    const probeMedianMs = medianOf(probeDurations)
-    const minProbeMs = Math.min(...probeDurations)
-    const maxBaselineMs = Math.max(...baseDurations)
-    const nonOverlapping = minProbeMs > maxBaselineMs
-    const deltaOk = probeMedianMs - baselineMedianMs >= 0.85 * delayMs
-    const passed = statusesOk && nonOverlapping && deltaOk
+    const assessment = assessTimingDifferential({ baselineDurations, probeDurations, statuses, delayMs })
     const summaryRow = {
       dialect: cand.dialect,
       style: cand.style,
       delayMs,
-      baselineMedianMs,
-      probeMedianMs,
-      minProbeMs,
-      maxBaselineMs,
-      nonOverlapping,
-      passed,
+      requestedDelayMs,
+      preflightSpanMs: preflightDurations.length > 1
+        ? Math.max(...preflightDurations) - Math.min(...preflightDurations)
+        : 0,
+      ...assessment,
     }
     candidateSummaries.push(summaryRow)
-    if (passed) {
-      anomalies.push({ type: 'sql_time_differential', ...summaryRow })
-      return {
-        verdict: 'signal',
-        summary: `Non-overlapping time-based SQL differential (${cand.dialect}/${cand.style}) held across 3 interleaved rounds (probe median ${probeMedianMs}ms vs baseline ${baselineMedianMs}ms).`,
-        details: { ...summaryRow, suggestedReplayKind: 'sql_time_diff', candidates: candidateSummaries },
-      }
+    if (!assessment.passed) continue
+    const { baselineMedianMs, probeMedianMs } = assessment
+    anomalies.push({ type: 'sql_time_differential', ...summaryRow })
+    return {
+      verdict: 'signal',
+      summary: `Jitter-tolerant time-based SQL differential (${cand.dialect}/${cand.style}) held across ${assessment.rounds} interleaved rounds (probe median ${Math.round(probeMedianMs)}ms vs baseline median ${Math.round(baselineMedianMs)}ms, delay ${delayMs}ms).`,
+      details: { ...summaryRow, suggestedReplayKind: 'sql_time_diff', candidates: candidateSummaries },
     }
   }
 
   return {
     verdict: 'no_signal',
-    summary: 'No non-overlapping time-based SQL differential observed across 3 rounds.',
-    details: { delayMs, suggestedReplayKind: 'sql_time_diff', candidates: candidateSummaries },
+    summary: `No time-based SQL differential cleared the jitter envelope across ${maxRounds} interleaved rounds (delay ${delayMs}ms).`,
+    details: { delayMs, requestedDelayMs, suggestedReplayKind: 'sql_time_diff', candidates: candidateSummaries },
   }
 }
 
