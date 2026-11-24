@@ -61,6 +61,7 @@ import type { ResolvedModelProfile } from '../src/server/model-settings.ts'
 import { createProjectPersona, resolveRunPersonas } from '../src/server/persona-vault.ts'
 import type { NamedSecret } from '../src/server/redact.ts'
 import { redact, redactJsonValue } from '../src/server/redact.ts'
+import { normalizeEndpointTemplate } from '../src/server/dedupe.ts'
 import { Store } from '../src/server/store.ts'
 import type { EndpointRow } from '../src/server/store.ts'
 import {
@@ -720,6 +721,162 @@ export interface TranslateInput {
   spentUsd?: number
   now?: number
   secrets?: readonly NamedSecret[]
+}
+
+// ---------------------------------------------------------------------------
+// False-positive proof capture (durable, redacted)
+// ---------------------------------------------------------------------------
+
+export interface FalsePositiveExchangeSummary {
+  stepId: string
+  method: string
+  status: number | null
+  rejectedBy: string | null
+}
+
+export interface FalsePositiveProofSummary {
+  findingId: string
+  vulnClass: string
+  cwe: string | null
+  category: string | null
+  route: { method: string; pathTemplate: string }
+  verificationClass: string
+  provenance: string
+  oracleRulePassed: boolean
+  claimedDeltaSummary: string
+  exchangeSummaries: FalsePositiveExchangeSummary[]
+}
+
+interface FalsePositiveFindingLike {
+  id: string
+  category?: string | null
+  cwe?: string | null
+  title?: string | null
+  reason?: string | null
+  exchangeIds?: readonly string[] | null
+  verificationStatus?: string | null
+  provenance?: string | null
+}
+
+interface FalsePositiveSpecLike {
+  findingId: string
+  spec: unknown
+  lastVerificationDiff?: {
+    verdict?: string
+    failedStepId?: string
+    jqError?: string
+    stepStatuses?: ReadonlyArray<{ id: string; role?: string; status: number | null }>
+    assertionSummary?: { observed?: string; expected?: string; reason?: string }
+  } | null
+}
+
+interface FalsePositiveExchangeLike {
+  id: string
+  method: string
+  pathAndQuery: string
+  status: number
+}
+
+function specStepsWithIds(spec: unknown, out: Array<{ stepId: string; method: string; path: string }> = []): Array<{ stepId: string; method: string; path: string }> {
+  const seen = new Set<unknown>()
+  const visit = (value: unknown, depth: number) => {
+    if (out.length >= 24 || depth > 9 || !value || typeof value !== 'object' || seen.has(value)) return
+    seen.add(value)
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1)
+      return
+    }
+    const rec = value as Record<string, unknown>
+    const request = rec.request && typeof rec.request === 'object' && !Array.isArray(rec.request)
+      ? rec.request as Record<string, unknown>
+      : rec
+    const path = typeof request.pathAndQuery === 'string' ? request.pathAndQuery
+      : typeof request.path === 'string' ? request.path : null
+    const method = typeof request.method === 'string' ? request.method : null
+    if (path && method) {
+      const stepId = typeof rec.id === 'string' ? rec.id : `step-${out.length + 1}`
+      out.push({ stepId, method: method.toUpperCase(), path: path.split(/[?#]/, 1)[0] ?? '/' })
+    }
+    for (const child of Object.values(rec)) if (child !== request) visit(child, depth + 1)
+  }
+  visit(spec, 0)
+  return out
+}
+
+/**
+ * Build a redacted, structured proof summary for every unmatched/misclassified finding, so an FP
+ * can still be autopsied after the temp data dir is removed. Never includes bodies, headers,
+ * tokens, or free-form probe strings — only ids, route templates, statuses and oracle codes.
+ */
+export function buildFalsePositiveEvidence(
+  input: {
+    findingIds: readonly string[]
+    findings: readonly FalsePositiveFindingLike[]
+    replaySpecs: readonly FalsePositiveSpecLike[]
+    exchanges?: readonly FalsePositiveExchangeLike[]
+  },
+  secrets: readonly NamedSecret[] = [],
+): FalsePositiveProofSummary[] {
+  const wanted = [...new Set(input.findingIds.filter(id => typeof id === 'string' && id.length > 0))]
+  const out: FalsePositiveProofSummary[] = []
+  const exchangeById = new Map((input.exchanges ?? []).map(ex => [ex.id, ex]))
+  for (const findingId of wanted) {
+    const finding = input.findings.find(row => row.id === findingId)
+    if (!finding) continue
+    const spec = input.replaySpecs.find(row => row.findingId === findingId)
+    const diff = spec?.lastVerificationDiff ?? null
+    const steps = spec ? specStepsWithIds(spec.spec) : []
+    const findingExchanges = (finding.exchangeIds ?? [])
+      .map(id => exchangeById.get(id))
+      .filter((ex): ex is FalsePositiveExchangeLike => Boolean(ex))
+    const primary = steps[0] ?? (findingExchanges[0]
+      ? { stepId: 'exchange-1', method: findingExchanges[0].method, path: findingExchanges[0].pathAndQuery.split(/[?#]/, 1)[0] ?? '/' }
+      : null)
+    const statusById = new Map((diff?.stepStatuses ?? []).map(step => [step.id, step.status]))
+    const rejectedBy = diff?.failedStepId
+      ? redact(diff.jqError ?? diff.assertionSummary?.reason ?? 'oracle_rejected', secrets).slice(0, 160)
+      : null
+    const exchangeSummaries: FalsePositiveExchangeSummary[] = steps.length
+      ? steps.map(step => ({
+          stepId: step.stepId,
+          method: step.method,
+          status: statusById.get(step.stepId) ?? null,
+          rejectedBy: diff?.failedStepId === step.stepId ? rejectedBy : null,
+        }))
+      : findingExchanges.slice(0, 8).map((ex, index) => ({
+          stepId: `exchange-${index + 1}`,
+          method: ex.method.toUpperCase(),
+          status: ex.status,
+          rejectedBy: index === 0 ? rejectedBy : null,
+        }))
+    const assertion = diff?.assertionSummary
+    const delta = assertion
+      ? [assertion.observed, assertion.expected, assertion.reason].filter(Boolean).join(' | ')
+      : (finding.reason ?? finding.title ?? '')
+    out.push({
+      findingId,
+      vulnClass: finding.category ?? 'unknown',
+      cwe: finding.cwe ?? null,
+      category: spec ? (typeof (spec.spec as { category?: unknown })?.category === 'string' ? (spec.spec as { category: string }).category : null) : null,
+      route: primary
+        ? { method: primary.method.toUpperCase(), pathTemplate: normalizeEndpointTemplate(primary.path) }
+        : { method: '*', pathTemplate: '/unknown' },
+      verificationClass: finding.verificationStatus ?? 'runtime_confirmed',
+      provenance: finding.provenance ?? 'unknown',
+      oracleRulePassed: diff?.verdict === 'confirmed',
+      claimedDeltaSummary: redact(String(delta ?? ''), secrets).replace(/[\u0000-\u001f\u007f]+/g, ' ').slice(0, 240),
+      exchangeSummaries,
+    })
+  }
+  return out
+}
+
+/** Attach the evidence block only when non-empty, so a 0-FP artifact stays byte-identical. */
+export function withFalsePositiveEvidence<T extends Record<string, unknown>>(
+  artifact: T,
+  evidence: readonly FalsePositiveProofSummary[],
+): T | (T & { falsePositiveEvidence: FalsePositiveProofSummary[] }) {
+  return evidence.length ? { ...artifact, falsePositiveEvidence: [...evidence] } : artifact
 }
 
 interface ExtractedEndpoint { method?: string; path: string }
@@ -2246,6 +2403,8 @@ export function linkSnapshotModelCredentials(input: {
 export interface CellMeta {
   runtimeConfirmed?: number
   advisories?: number
+  /** Redacted proof summaries for unmatched/misclassified findings (survives temp-dir cleanup). */
+  falsePositiveEvidence?: FalsePositiveProofSummary[]
   app: AppName
   seed: number
   seedSet: 'dev' | 'held-out'
@@ -3027,6 +3186,13 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     }
     const card = gradeRun(gradeInput)
     const endedAt = nowMs()
+    // FP evidence must be captured while the store is still open: temp data dirs are removed below.
+    const falsePositiveEvidence = buildFalsePositiveEvidence({
+      findingIds: [...card.unmatchedFindingIds, ...(card.misclassifiedFindingIds ?? [])],
+      findings: detail.findings as unknown as FalsePositiveFindingLike[],
+      replaySpecs: detail.replaySpecs as unknown as FalsePositiveSpecLike[],
+      exchanges: detail.exchangesSummary,
+    }, secrets)
     const requestsOnDiscoveredRoutes = gradeInput.requestLog.filter(req =>
       detail.endpoints.some(ep => endpointMatches(
         { method: req.method, path: req.path },
@@ -3060,6 +3226,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     }
 
     const meta: CellMeta = {
+      ...(falsePositiveEvidence.length ? { falsePositiveEvidence } : {}),
       app,
       seed,
       seedSet: started.plan.seedSet,
@@ -3165,7 +3332,10 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     const jsonPath = join(args.outDir, `${slug}.json`)
     const mdPath = join(args.outDir, `${slug}.md`)
     const metaPath = join(args.outDir, `${slug}.meta.json`)
-    writeFileSync(jsonPath, `${renderScorecard(card, 'json')}\n`, { mode: 0o600 })
+    writeFileSync(jsonPath, `${JSON.stringify(withFalsePositiveEvidence(
+      card as unknown as Record<string, unknown>,
+      falsePositiveEvidence,
+    ), null, 2)}\n`, { mode: 0o600 })
     writeFileSync(mdPath, `${renderScorecard(card, 'md')}\n`, { mode: 0o600 })
 
     return { meta, scorecard: card, jsonPath, mdPath, metaPath }

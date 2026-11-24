@@ -111,6 +111,18 @@ export interface AssignmentBriefResult {
   truncated: boolean
 }
 
+/**
+ * Route evidence the settlement phase must name before a worker may conclude. `params` are
+ * parameter NAMES only — values are never rendered, matching the brief's no-secret invariant.
+ */
+export interface SettlementSpecTarget {
+  method: string
+  /** Path template or observed request path; query string/fragment is stripped. */
+  path: string
+  params?: readonly string[]
+  origin?: string
+}
+
 const SECRET_KEY_RE = /(?:secret|token|passw|pwd|api[_-]?key|authorization|cookie|session|jwt|bearer|credential|private[_-]?key|client[_-]?secret)/i
 const BODY_KEY_RE = /(?:body|content|html|snippet|payload|response|raw|markup|text)/i
 const SECRET_VALUE_RE = /^(?:bearer\s+)?[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$|^(?:sk|pk|ghp|gho|ghs|xox[baprs])_[A-Za-z0-9_-]{10,}$/i
@@ -160,7 +172,7 @@ function cleanPath(value: unknown): string {
 
 function cleanParamName(value: unknown): string {
   if (typeof value !== 'string') return ''
-  return value.trim().replace(/[^A-Za-z0-9_.:[\]-]/g, '').slice(0, 48)
+  return value.trim().split('=', 1)[0]!.replace(/[^A-Za-z0-9_.:[\]-]/g, '').slice(0, 48)
 }
 
 function cleanEncoding(value: unknown): string {
@@ -520,3 +532,31 @@ export function assertAssignmentBriefSize(text: string, maxBytes = ASSIGNMENT_BR
   }
   return bytes
 }
+
+/**
+ * One explicit settlement-phase proof line: the target route+method+param and the smallest valid
+ * replay spec that would prove it. Appended to the settlement nudge/banner (never the byte-capped
+ * assignment packet) so the reserved wrap-up turn has a concrete, copyable obligation.
+ *
+ * Pure: parameter names only, no values, no bodies, no secrets.
+ */
+export function renderSettlementSpecDirective(
+  target: SettlementSpecTarget | undefined,
+  specShape: string,
+  proofGapCodes: readonly string[],
+): string {
+  const method = (target?.method || 'GET').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 10) || 'GET'
+  const path = cleanPath(target?.path ?? '/')
+  const params = [...new Set((target?.params ?? []).map(cleanParamName).filter(Boolean))].slice(0, 4)
+  const paramText = params.length ? ` param=${params.join('|')}` : ''
+  const origin = target?.origin ? cleanText(target.origin.split(/[?#]/, 1)[0], 120) : ''
+  const route = `${method} ${path}${paramText}${origin ? ` on ${origin}` : ''}`
+  const codes = proofGapCodes.map(code => cleanText(code, 40)).filter(Boolean).slice(0, 8).join(', ')
+  return [
+    `[PROOF OBLIGATION — settlement] Your route evidence is ${route}.`,
+    'This wrap-up turn is reserved: submit ONE guardian_verify replay spec for that route before complete_intent.',
+    `Smallest valid spec: ${specShape}`,
+    `If no valid spec can be built, call record_coverage(status="needs_follow_up", proofGapReason="<code>") with a machine-readable code (${codes}) instead of silently skipping.`,
+  ].join(' ')
+}
+
