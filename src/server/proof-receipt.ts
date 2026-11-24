@@ -419,6 +419,9 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     if (targetRoute && probeRoute && probeRoute !== targetRoute) {
       return reject(receipt, rule, `The receipt target (${targetRoute}) is not the mutating probe exchange (${probeRoute}); a readback/GET used as evidence must not become the finding route.`)
     }
+    if (receipt.target.method && receipt.target.method.toUpperCase() !== mutatingProbe.method.toUpperCase()) {
+      return reject(receipt, rule, `The receipt target method (${receipt.target.method}) is not the mutating probe method (${mutatingProbe.method}); a read used as evidence must not become the write's finding method.`)
+    }
   }
   const oracleEvents = (receipt.oracleEvents ?? []).filter(knownOracleEvent)
   const input: ImpactInput = {

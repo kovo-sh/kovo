@@ -360,6 +360,18 @@ test('status-diff guard: the receipt target is bound to the mutating exchange, n
   assert.equal(misattributed.confirmed, false, misattributed.reason)
   assert.match(misattributed.reason, /not the mutating probe exchange/i)
 
+  const wrongMethod = verifyReceipt({
+    vulnClass: 'authorization',
+    target: { origin, method: 'GET', pathAndQuery: '/api/cases/3/assign' },
+    exchangeIds: ['ex-deny', 'ex-before', 'ex-write', 'ex-after'],
+    oobEventIds: [],
+    browserTraceIds: [],
+    claimedDelta: 'viewer cross-tenant assign',
+    resourceTenant: 'globex',
+  }, transcript)
+  assert.equal(wrongMethod.confirmed, false, wrongMethod.reason)
+  assert.match(wrongMethod.reason, /target method/i)
+
   const bound = verifyReceipt({
     vulnClass: 'authorization',
     target: { origin, method: 'POST', pathAndQuery: '/api/cases/3/assign' },
