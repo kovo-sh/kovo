@@ -447,16 +447,52 @@ test('M0: a late pending_oob callback for an SSRF canary becomes a runtime_confi
   })
   assert.equal(recorded.accepted, true)
 
+  // A second async class on the same asset (XXE) must coexist under the chain check key.
+  const xxe = canaryBroker.mintCanary(runId, 'xxe:general_entity', origin, { storage, assignmentId: worker.id })
+  canaryBroker.subscribe({ runId, assignmentId: worker.id, canaryId: xxe.id, token: xxe.token, artifact: '', immediateMs: 0, windowMs: 120_000 })
+  const xxeCarrier = storage.recordExchange({
+    runId,
+    assignmentId: worker.id,
+    scopeRevision: storage.run(runId).scopeRevision,
+    origin,
+    finalOrigin: origin,
+    redirectOrigins: [],
+    method: 'POST',
+    pathAndQuery: '/v1/import/preview',
+    personaHandle: null,
+    status: 202,
+    mediaType: 'application/xml',
+    reqHeaders: { 'content-type': 'application/xml' },
+    respHeaders: { 'content-type': 'application/json' },
+    body: `<?xml version="1.0"?><!DOCTYPE root [<!ENTITY x SYSTEM "${xxe.httpUrl}">]><root>&x;</root>`,
+    durationMs: 9,
+  })
+  assert.equal(canaryBroker.recordCallback({
+    token: xxe.token,
+    callbackId: `cb-${randomUUID().slice(0, 8)}`,
+    protocol: 'http',
+    sourceIp: '127.0.0.1',
+    method: 'GET',
+    path: `/c/${xxe.token}`,
+    runId,
+    assignmentId: worker.id,
+    canaryId: xxe.id,
+  }).accepted, true)
+
   await execution.drainPendingOob(runId, { graceMs: 0, pollMs: 1, sleep: async () => {} })
 
   const rows = storage.db.select().from((await import('../src/server/schema.ts')).findings).all()
-    .filter(row => row.runId === runId && row.finding.cwe === 'CWE-918')
-  assert.equal(rows.length, 1, 'exactly one receipt-confirmed SSRF finding')
-  assert.equal(rows[0]!.finding.status, 'confirmed')
-  assert.equal(rows[0]!.verificationTier, 'runtime_confirmed')
-  assert.equal(rows[0]!.replaySpecId, null, 'a receipt-only finding keeps replay_spec_id null')
-  assert.ok(rows[0]!.finding.exchangeIds?.includes(carrier.id))
-  assert.match(rows[0]!.finding.verification ?? '', /ProofReceipt/)
+    .filter(row => row.runId === runId)
+  const ssrfRows = rows.filter(row => row.finding.cwe === 'CWE-918')
+  const xxeRows = rows.filter(row => row.finding.cwe === 'CWE-611')
+  assert.equal(ssrfRows.length, 1, 'exactly one receipt-confirmed SSRF finding')
+  assert.equal(xxeRows.length, 1, 'the XXE promotion coexists with the SSRF finding')
+  assert.equal(ssrfRows[0]!.finding.status, 'confirmed')
+  assert.equal(ssrfRows[0]!.verificationTier, 'runtime_confirmed')
+  assert.equal(ssrfRows[0]!.replaySpecId, null, 'a receipt-only finding keeps replay_spec_id null')
+  assert.ok(ssrfRows[0]!.finding.exchangeIds?.includes(carrier.id))
+  assert.match(ssrfRows[0]!.finding.verification ?? '', /ProofReceipt/)
+  assert.ok(xxeRows[0]!.finding.exchangeIds?.includes(xxeCarrier.id))
 })
 
 test('M0: a promotion without a carrying exchange or for a non-probe canary never becomes a finding', async (t) => {

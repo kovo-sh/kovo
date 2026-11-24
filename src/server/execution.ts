@@ -10178,7 +10178,7 @@ export class Execution {
         assetId: asset.id,
         goalRevision: run.goalRevision,
         checkId: 'chain',
-        caseId: '',
+        caseId: findingId,
         findingKind: 'multi_step_chain',
         replaySpecId: null,
         sourceOrigins: [input.origin],
