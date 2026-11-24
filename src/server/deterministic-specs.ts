@@ -721,9 +721,6 @@ function booleanStyle(style: string): { quoteStyle: 'single' | 'double' | 'numer
     case 'single_double_paren': return { quoteStyle: 'single', valueTemplate: "{{baseline}}')) AND {{sql_expr}}-- -" }
     case 'like_breakout': return { quoteStyle: 'single', valueTemplate: "{{baseline}}%' AND {{sql_expr}}-- -" }
     case 'order_by': return { quoteStyle: 'single', valueTemplate: '{{baseline}} ORDER BY (CASE WHEN ({{sql_expr}}) THEN 1 ELSE 2 END)-- -' }
-    // The probe's no-operand fallback pair (`' OR '1'='1` vs `' AND '1'='2`) replays as the
-    // equivalent empty-baseline conjunction, which the verifier can express with one template.
-    case 'tautology': return { quoteStyle: 'single', valueTemplate: "{{baseline}}' AND {{sql_expr}}-- -" }
     default: return { quoteStyle: 'single' }
   }
 }
@@ -761,44 +758,12 @@ function synthSqlBoolean(hyp: EngineHypothesis, result: DifferentialResult): Syn
   }
   const hit = result.anomalies.find(a => a.type === 'boolean_differential')
   if (hit) {
-    // The probe reports the exact operand + single replay template for the pair that passed (and the
-    // pre-normalization `provenStyle`). Replaying that pair keeps the boolean differential grounded
-    // in the target's own data instead of rotating through seed/app literals that may not exist in
-    // this catalog.
-    const style = String(hit.provenStyle ?? hit.style ?? 'single_quote')
-    const grounded = typeof hit.baselineValue === 'string'
-      ? hit.baselineValue
-      : (typeof result.details.groundedBaselineValue === 'string' ? result.details.groundedBaselineValue : null)
+    const style = String(hit.style ?? 'single_quote')
     const out: SynthesizedEngineSpec[] = []
     const push = (candidate: SynthesizedEngineSpec) => {
       if (!out.some(existing => JSON.stringify(existing.spec) === JSON.stringify(candidate.spec))) out.push(candidate)
     }
-    const primary = booleanStyle(style)
-    const passedTemplate = typeof hit.valueTemplate === 'string' ? hit.valueTemplate : primary.valueTemplate
-    const rawQuoteStyle = typeof hit.quoteStyle === 'string' ? hit.quoteStyle : ''
-    const passedQuoteStyle = rawQuoteStyle === 'double' || rawQuoteStyle === 'numeric' || rawQuoteStyle === 'single'
-      ? rawQuoteStyle as 'single' | 'double' | 'numeric'
-      : primary.quoteStyle
-    push({
-      kind: 'sql_boolean_diff',
-      vulnClass: 'sqli',
-      endpoint: hyp.endpoint.pathTemplate,
-      spec: {
-        ...base,
-        quoteStyle: passedQuoteStyle,
-        ...(passedTemplate ? { valueTemplate: passedTemplate } : {}),
-        ...(grounded !== null ? { baselineValue: grounded } : {}),
-      },
-    })
-    if (grounded !== null) {
-      // Only the proven operand is retried across other shapes; no fresh seed/app literal rotation.
-      for (const fallback of ['like_breakout', 'single_quote', 'or_branch']) {
-        const candidate = make(fallback)
-        candidate.spec.baselineValue = grounded
-        push(candidate)
-      }
-      return out
-    }
+    push(make(style))
     // A LIKE-wrapped search needs a baseline the true/false arms can actually separate. An empty or
     // very common term makes the `LIKE '%<term>'` prefix match the whole collection on its own, so
     // both arms look identical; a fresh non-matching term is tried first, then short discriminators.

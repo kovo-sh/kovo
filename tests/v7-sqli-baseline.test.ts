@@ -15,7 +15,6 @@ import type { BrokerExchangeResult, Grant, RequestBroker } from '../src/server/b
 import type { ProbeDifferentialRequest } from '../src/server/probes/context.ts'
 import { probeDifferential } from '../src/server/surface-engine.ts'
 import type { DifferentialResult } from '../src/server/surface-engine.ts'
-import { synthesizeEngineSpecs } from '../src/server/deterministic-specs.ts'
 import type { EngineHypothesis } from '../src/server/deterministic-specs.ts'
 import {
   planFloorRecipe,
@@ -241,19 +240,6 @@ function echoBroker(seen: string[] = []): RequestBroker {
     },
   } as unknown as RequestBroker
 }
-
-test('sql-baseline: the synthesized spec carries the grounded operand and proven shape', () => {
-  const specs = synthesizeEngineSpecs(searchHypothesis(), groundedProbe('Zephyr 9'))
-  assert.ok(specs.length >= 1)
-  const primary = specs[0]!.spec as { baselineValue?: string; quoteStyle?: string; valueTemplate?: string }
-  assert.equal(primary.baselineValue, 'Zephyr 9')
-  assert.equal(primary.quoteStyle, 'single')
-  assert.equal(primary.valueTemplate, "{{baseline}}%' AND {{sql_expr}}-- -")
-  for (const spec of specs) {
-    const baseline = String((spec.spec as { baselineValue?: string }).baselineValue ?? '')
-    assert.ok(!/^(?:Item|a|e|1|zz)$/.test(baseline), `spec must not rotate to a seed literal (${baseline})`)
-  }
-})
 
 test('sql-baseline: the recipe plan replays the grounded operand and proven shape', () => {
   const plan = planFloorRecipe({
