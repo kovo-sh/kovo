@@ -612,9 +612,15 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
       const probeFieldValue = baselineWrite && bodyTemplate && typeof bodyTemplate === 'object' && !Array.isArray(bodyTemplate)
         ? (bodyTemplate as Record<string, unknown>)[baselineWrite.field]
         : undefined
+      // Field-bound when the readback exposes the mutated field at the top level (the strong form,
+      // which names the exact field). A collection/nested readback (e.g. a list of shipments) still
+      // proves the same non-idempotent change by carrying the value this probe wrote in a body that
+      // differs from the baseline; the value binding keeps a concurrent writer from being credited.
+      const probeLiteral = JSON.stringify(probeFieldValue ?? null)
+      const bodyBoundDelta = `((.steps.p2.body != .steps.c1.body) and (.steps.p2.body | contains(${probeLiteral})))`
       const fieldBoundDelta = baselineWrite && probeFieldValue !== undefined &&
         String(probeFieldValue) !== String(baselineWrite.baselineValue)
-        ? `((${jsonEquals('p2', baselineWrite.field, probeFieldValue)}) and (${jsonEquals('c1', baselineWrite.field, baselineWrite.baselineValue)}))`
+        ? `(((${jsonEquals('p2', baselineWrite.field, probeFieldValue)}) and (${jsonEquals('c1', baselineWrite.field, baselineWrite.baselineValue)})) or (${bodyBoundDelta}))`
         : null
       const persisted = method === 'DELETE'
         ? `(((.steps.p2.status >= 400) and (.steps.p2.status < 500)) or ((${is2xx('p2')}) and (.steps.p2.body != .steps.c1.body)))`

@@ -100,11 +100,32 @@ export async function proveWritePathBola(
 
 
 
+/**
+ * Identity/entitlement columns an authorization *probe* must never write. The matrix only needs a
+ * benign content write to prove that a non-owner can mutate; overposting a role/tenant here changes
+ * the target's state (and unrelated later probes) without adding evidence. Mass assignment is its
+ * own class and owns the privileged-column test.
+ */
+const authzMatrixIdentityField = /^(?:id|role|roles|permissions?|privileges?|is_?admin|is_?owner|admin|tenant|tenant_id|org|org_id|team|team_id|owner|owner_id|user|user_id|account|account_id|store|store_id|email|password|passwd|token|secret|api_?key|credential|plan|tier|scope|scopes)$/i
+
+function benignAuthzBody(body: Record<string, unknown> | undefined, keepIdentity: boolean): Record<string, unknown> {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return {}
+  if (keepIdentity) return { ...body }
+  const filtered = Object.fromEntries(Object.entries(body).filter(([field]) => !authzMatrixIdentityField.test(field)))
+  // A body made only of identity columns would otherwise turn into an empty write; keep a benign
+  // scalar when one exists so the access test still addresses a real mutation.
+  if (Object.keys(filtered).length > 0) return filtered
+  const scalar = Object.entries(body).find(([, value]) => typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean')
+  return scalar ? { [scalar[0]]: scalar[1] } : {}
+}
+
 export async function diffAuthorizationMatrix(ctx: DiffContext): Promise<DiffOutcome> {
   const { req, runner, notes, anomalies } = ctx
   const method: HttpMethod = (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH' || req.method === 'DELETE')
     ? req.method
     : 'GET'
+  const functionSurface = /(?:^|[/_.-])(?:admin|administration|internal|manage|management|staff|superuser|privileged|backoffice|permissions?|roles?|grants?|scopes?|impersonate)(?:$|[/_.-])/i
+  const matrixBody = benignAuthzBody(req.jsonBody, functionSurface.test(req.pathAndQuery.split('?')[0] ?? req.pathAndQuery))
   const ids = [...(req.resourceIds ?? [])].filter(i => /^[A-Za-z0-9_.:-]{1,128}$/.test(i)).slice(0, 10)
 
   // Optional producer-consumer lifecycle creation step as ownerPersona
@@ -175,7 +196,12 @@ export async function diffAuthorizationMatrix(ctx: DiffContext): Promise<DiffOut
       // differential. The selectivity gate and the owner reference must carry the same body the
       // matrix will use, so a 2xx means the object was addressed (not that the route accepts junk).
       const mutatingGate = method === 'POST' || method === 'PUT' || method === 'PATCH'
-      const gateBody = mutatingGate ? JSON.stringify(req.jsonBody ?? {}) : undefined
+      // A mutating reference only needs the body under the staging contract, where an empty-body
+      // schema rejection would otherwise mask a real cross-tenant write. Outside staging the
+      // historical no-body reference is retained so an unrelated write is never invented.
+      const gateBody = mutatingGate && req.staging
+        ? JSON.stringify(functionLevel && req.functionBody !== undefined ? req.functionBody : matrixBody)
+        : undefined
       const gateHeaders = gateBody
         ? { 'Content-Type': 'application/json', ...(req.headers ?? {}) }
         : req.headers
@@ -231,7 +257,7 @@ export async function diffAuthorizationMatrix(ctx: DiffContext): Promise<DiffOut
       }
       const isMutating = method === 'POST' || method === 'PUT' || method === 'PATCH'
       const bodyPayload = isMutating
-        ? JSON.stringify(functionLevel && req.functionBody !== undefined ? req.functionBody : (req.jsonBody ?? {}))
+        ? JSON.stringify(functionLevel && req.functionBody !== undefined ? req.functionBody : matrixBody)
         : undefined
       const res = await runner.send({
         origin: ctx.origin, method, pathAndQuery: path,
@@ -347,7 +373,7 @@ export async function diffAuthorizationMatrix(ctx: DiffContext): Promise<DiffOut
         anomalies.push({
           type: 'unauthorized_access', resourceId: id, actor: a.actor, method, status: res.ex.status, similarityToOwner: sim,
           functionLevel,
-          ...(method !== 'GET' ? { bodyTemplate: functionLevel && req.functionBody !== undefined ? req.functionBody : (req.jsonBody ?? {}) } : {}),
+          ...(method !== 'GET' ? { bodyTemplate: functionLevel && req.functionBody !== undefined ? req.functionBody : matrixBody } : {}),
         })
       }
     }

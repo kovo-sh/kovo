@@ -92,7 +92,7 @@ test('staging surface forms write-BOLA, price-trust and race-burst hypotheses', 
     { handle: 'alice', roleLabel: 'member (tenant-alpha)', privilege: 'member' as const, tenant: 'tenant-alpha' },
     { handle: 'bob', roleLabel: 'member (tenant-beta)', privilege: 'member' as const, tenant: 'tenant-beta' },
   ]
-  const hybrids = enumerateHypotheses(endpoints, harvests, { tier: 3, personas })
+  const hybrids = enumerateHypotheses(endpoints, harvests, { tier: 3, personas, environmentMode: 'staging_isolated' })
   const byKey = new Map(hybrids.map(hyp => [hyp.key, hyp]))
 
   const authz = byKey.get('authz|ep-invoice-write|path')
@@ -109,6 +109,11 @@ test('staging surface forms write-BOLA, price-trust and race-burst hypotheses', 
   assert.ok(race, 'state-changing money route forms a synchronized burst hypothesis')
   assert.equal(race!.intent, 'race')
   assert.equal(race!.raceBurst, true)
+
+  // Wide ephemeral-lab floors keep their original hypothesis set: the conversion probes are a
+  // staging-isolated capability, never extra surface on a live-lab floor.
+  const ephemeral = enumerateHypotheses(endpoints, harvests, { tier: 3, personas, environmentMode: 'ephemeral_lab' })
+  assert.equal(ephemeral.some(hyp => hyp.priceTrust || hyp.raceBurst), false)
 })
 
 test('price-trust proof names the caller price field and replays the terminal transition', () => {
@@ -311,7 +316,7 @@ test('hypothesis enumeration is stable across input order', () => {
   const harvests = new Map<string, EndpointHarvest>([
     ['a', emptyHarvest()], ['b', emptyHarvest()], ['c', emptyHarvest()],
   ])
-  const forward = enumerateHypotheses(endpoints, harvests, { tier: 3, personas }).map(hyp => hyp.key)
-  const reverse = enumerateHypotheses([...endpoints].reverse(), new Map([...harvests.entries()].reverse()), { tier: 3, personas }).map(hyp => hyp.key)
+  const forward = enumerateHypotheses(endpoints, harvests, { tier: 3, personas, environmentMode: 'staging_isolated' }).map(hyp => hyp.key)
+  const reverse = enumerateHypotheses([...endpoints].reverse(), new Map([...harvests.entries()].reverse()), { tier: 3, personas, environmentMode: 'staging_isolated' }).map(hyp => hyp.key)
   assert.deepEqual(reverse, forward)
 })

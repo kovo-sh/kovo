@@ -1215,6 +1215,8 @@ export interface EnumerateOptions {
   classes?: ReadonlySet<string>
   /** Actor identity routes per origin (self-service observable state for privileged mutations). */
   identityProfiles?: ReadonlyMap<string, IdentityProfile>
+  /** Environment contract: multi-step price/race conversion probes are isolated-lab/staging only. */
+  environmentMode?: 'prod_readonly' | 'staging_isolated' | 'ephemeral_lab'
 }
 
 /**
@@ -1306,7 +1308,7 @@ function semanticValue(name: string, observed?: string): string | number | boole
   return 'guardian'
 }
 
-function siblingBody(fields: readonly string[], values: Record<string, string[]>, exclude?: string): Record<string, unknown> {
+function siblingBody(fields: readonly string[], values: Record<string, string[]>, exclude?: string, coerceNumeric = false): Record<string, unknown> {
   const body: Record<string, unknown> = {}
   for (const field of fields.slice(0, 8)) {
     if (field === exclude) continue
@@ -1317,7 +1319,7 @@ function siblingBody(fields: readonly string[], values: Record<string, string[]>
     // observed numeric type so a write probe is not rejected as a type error (a 400 would hide the
     // authorization differential behind schema validation).
     const numericField = /(?:^|[_-])(?:amount|amount_cents|total|price|price_cents|value|cents|balance|qty|quantity|count|seats?|credits?|limit)$|(?:Count|Amount|Total|Price|Qty|Balance|Credits?|Limit)$/i.test(field)
-    body[field] = typeof value === 'string' && numericField && /^-?\d+(?:\.\d+)?$/.test(value)
+    body[field] = coerceNumeric && typeof value === 'string' && numericField && /^-?\d+(?:\.\d+)?$/.test(value)
       ? Number(value)
       : value
   }
@@ -1339,6 +1341,9 @@ export function enumerateHypotheses(
 ): EngineHypothesis[] {
   const all = new Map<string, EngineHypothesis>()
   const picks = personaPicks(options.personas)
+  // Staging fixtures commonly enforce JSON number types on money fields; keep the observed type
+  // there. Wide floors keep the historical string body so probe semantics do not drift.
+  const coerceNumericBodies = options.environmentMode === 'staging_isolated'
   const add = (hyp: EngineHypothesis) => {
     if (options.classes && !options.classes.has(hyp.intent)) return
     if (all.has(hyp.key)) return
@@ -1557,8 +1562,8 @@ export function enumerateHypotheses(
         const requiredRole = method === 'GET' ? undefined : authzRequiredRoleFor(privileged, authzOwner, authzOther)
         const score = endpointRiskScore(endpoint) + (hasIdPath || objectIdParam ? 20 : 0) + (privileged ? 15 : 0)
         const baseBody = mutating && /(?:role|grant|permission|privilege|promote|assign)(?:\/|$)/i.test(bare)
-          ? { ...siblingBody(harvest?.fields ?? [], harvest?.values ?? {}), role: 'admin', grant: 'admin', level: 'admin' }
-          : siblingBody(harvest?.fields ?? [], harvest?.values ?? {})
+          ? { ...siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, undefined, coerceNumericBodies), role: 'admin', grant: 'admin', level: 'admin' }
+          : siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, undefined, coerceNumericBodies)
         add({
           key: `authz|${endpoint.id}|${objectIdParam?.name ?? (hasIdPath ? 'path' : 'fn')}`,
           endpoint,
@@ -1702,7 +1707,7 @@ export function enumerateHypotheses(
           param,
           location: param.location,
           ownerPersona: picks.owner?.handle,
-          jsonBody: method === 'GET' ? undefined : siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name),
+          jsonBody: method === 'GET' ? undefined : siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name, coerceNumericBodies),
           baselineValue,
           risk: endpointRiskScore(endpoint) + 12 + (pathHasSearchHint(bare) ? 12 : 0),
         })
@@ -1783,7 +1788,7 @@ export function enumerateHypotheses(
           param,
           location: param.location,
           ownerPersona: picks.owner?.handle,
-          jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name),
+          jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name, coerceNumericBodies),
           ssrfParams: [param.name],
           ...(trigger && method === 'POST'
             ? { triggerPath: (trigger.pathTemplate.split('?')[0] || '/').replace(idSegmentRe, '/{{id}}') }
@@ -1846,7 +1851,7 @@ export function enumerateHypotheses(
             location: 'json',
             ownerPersona: picks.owner?.handle,
             baselineValue: 'guardian',
-            jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name),
+            jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name, coerceNumericBodies),
             risk: endpointRiskScore(endpoint) + 14,
           })
         }
@@ -1864,7 +1869,7 @@ export function enumerateHypotheses(
             location: 'json',
             ownerPersona: picks.owner?.handle,
             baselineValue: '127.0.0.1',
-            jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name),
+            jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name, coerceNumericBodies),
             risk: endpointRiskScore(endpoint) + 14,
           })
         }
@@ -1907,7 +1912,7 @@ export function enumerateHypotheses(
           ...(list ? { workflowListPath: barePath(list) } : {}),
           ...(detail ? { workflowReadPath: barePath(detail) } : {}),
           workflowTargetTemplate: bare,
-          jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}),
+          jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, undefined, coerceNumericBodies),
           risk: endpointRiskScore(endpoint) + 8 + (statusLike ? 10 : 0),
         })
       }
@@ -1919,7 +1924,8 @@ export function enumerateHypotheses(
     // tampered client price (probe), so confirmation is a value invariant, never a status claim.
     const terminalMoneyVerb = /^(?:pay|payment|purchase|checkout|settle|charge|complete|confirm|place-?order|submit-?order)$/i
     const producerVerb = /^(?:start|create|new|init|begin|prepare|open|cart|session)$/i
-    if (method === 'POST' && terminalMoneyVerb.test(lastSegment)) {
+    const conversionEnvironment = options.environmentMode === 'staging_isolated'
+    if (conversionEnvironment && method === 'POST' && terminalMoneyVerb.test(lastSegment)) {
       const parent = pathSegments.slice(0, -1).join('/')
       const producer = endpoints
         .filter(candidate => candidate.origin === endpoint.origin && candidate.method.toUpperCase() === 'POST')
@@ -1941,7 +1947,7 @@ export function enumerateHypotheses(
           ownerPersona: picks.owner?.handle,
           priceTrust: true,
           flowCreatePath: producer.pathTemplate.split('?')[0] || '/',
-          jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}),
+          jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, undefined, coerceNumericBodies),
           risk: endpointRiskScore(endpoint) + 14,
         })
       }
@@ -1953,7 +1959,7 @@ export function enumerateHypotheses(
     // over-count/debit-once divergence can confirm.
     const raceHint = /(?:^|[/_.-])(?:transfers?|payments?|debits?|credits?|withdrawals?|withdraw|refunds?|redeem|claims?|reserve|reservations?|stocks?|inventory|seats?|balances?|credits?|points?)(?:$|[/_.-])/i
     const createOnly = /^(?:start|create|new|init|begin|prepare|open|quote|preview|estimate)$/i
-    if (method === 'POST' && options.tier >= 2 && !createOnly.test(lastSegment) &&
+    if (conversionEnvironment && method === 'POST' && options.tier >= 2 && !createOnly.test(lastSegment) &&
         !/__|cleanup|orphan|health|healthz/i.test(bare) && raceHint.test(bare)) {
       add({
         key: `race_burst|${endpoint.id}`,
@@ -1964,7 +1970,7 @@ export function enumerateHypotheses(
         pathAndQuery: bare,
         ownerPersona: picks.owner?.handle,
         raceBurst: true,
-        jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}),
+        jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, undefined, coerceNumericBodies),
         risk: endpointRiskScore(endpoint) + (observedFields.some(field => /amount|quantity|qty|count|balance|stock/i.test(field)) ? 18 : 6),
       })
     }
@@ -2069,7 +2075,7 @@ export function enumerateHypotheses(
           ...(createReadTemplate ? { createReadTemplate } : {}),
           session: 'csrf',
           ownerPersona: picks.owner?.handle,
-          jsonBody: siblingBody(csrfFields, csrfValues, bodyField),
+          jsonBody: siblingBody(csrfFields, csrfValues, bodyField, coerceNumericBodies),
           risk: endpointRiskScore(endpoint) + 8,
         })
       }
@@ -2306,7 +2312,7 @@ export function enumerateHypotheses(
           otherPersona: picks.crossTenant?.handle,
           candidateFields: candidates,
           candidateValues: values,
-          jsonBody: siblingBody(massFields, observedValues),
+          jsonBody: siblingBody(massFields, observedValues, undefined, coerceNumericBodies),
           risk: endpointRiskScore(endpoint) + 10,
         })
       }
@@ -2923,6 +2929,7 @@ export function buildProbeRequest(
     origin: hyp.endpoint.origin,
     pathAndQuery: hyp.pathAndQuery,
     method: hyp.method,
+    staging: staging.action === 'tag',
     maxRequests,
     runId: context.runId,
     assignmentId: context.assignmentId,
@@ -2953,8 +2960,9 @@ export function buildProbeRequest(
         includeHeaderBypass: false,
         ...(hyp.functionLevel && hyp.jsonBody ? { functionBody: hyp.jsonBody } : {}),
         // A mutating object route with a harvested readback gets the genuine cross-actor write
-        // proof: owner read -> peer write -> owner read-back -> restore.
-        ...(!hyp.functionLevel && hyp.readbackPath ? { writePathRead: true } : {}),
+        // proof: owner read -> peer write -> owner read-back -> restore. Enabled under the staging
+        // contract only, so a live floor keeps its historical (bounded) probe behaviour.
+        ...(staging.action === 'tag' && !hyp.functionLevel && hyp.readbackPath ? { writePathRead: true } : {}),
         ...(hyp.secretScan ? { secretScan: true, ...(hyp.viewerPersona ? { viewerPersona: hyp.viewerPersona } : {}) } : {}),
         ...(hyp.csrfBind ? { csrfBind: true } : {}),
       }
@@ -4319,6 +4327,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     maxHypotheses: input.maxHypotheses ?? defaultEngineMaxHypotheses,
     maxRequests,
     identityProfiles: buildIdentityProfiles(ranked, harvests),
+    environmentMode: input.environmentMode ?? 'ephemeral_lab',
     ...(input.classes ? { classes: input.classes } : {}),
   })
 
