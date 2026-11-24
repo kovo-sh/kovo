@@ -6,7 +6,7 @@
 import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { verifyReplaySpec, verifyReplaySpecInline } from '../src/server/replay-verifier.ts'
+import { retestReplaySpec, verifyReplaySpec, verifyReplaySpecInline } from '../src/server/replay-verifier.ts'
 import type { ReplayVerificationResult } from '../src/server/replay-verifier.ts'
 import type { BrokerExchangeResult } from '../src/server/broker.ts'
 import type { InlineVerifyFeedback } from '../src/domain.ts'
@@ -226,6 +226,28 @@ async function verifyWithProfile(
     if (res.replay.verdict === 'confirmed' || res.replay.verdict === 'dismissed') break
   }
   return last
+}
+
+/**
+ * Patch retest entrypoint: the exact product retest path (`retestReplaySpec`).
+ *
+ * A proof that carries a persisted floor recipe re-runs that recipe and is judged by a fresh
+ * `ProofReceipt`; anything else takes the recorded-spec replay inside the same function. The verdict
+ * vocabulary is mapped back to the patch report's (`confirmed` = still vulnerable), so the fixed /
+ * regressed decision is unchanged.
+ */
+async function retestWithProfile(
+  env: EngineEnv, spec: Record<string, unknown>, backend: Awaited<ReturnType<typeof selectVerifierBackend>>['backend'],
+  onExchange: (ex: BrokerExchangeResult) => void, extraSignal?: AbortSignal,
+): Promise<VerifyResult> {
+  const signals = [env.controller.signal, AbortSignal.timeout(90_000)]
+  if (extraSignal) signals.push(extraSignal)
+  const retest = await retestReplaySpec({
+    spec, broker: env.broker, canaryBroker: env.canaryBroker, backend, grant: env.grant, storage: env.storage, runId: env.runId,
+    signal: AbortSignal.any(signals), onExchange: (ex: BrokerExchangeResult) => { onExchange(ex) },
+  })
+  const verdict = retest.verdict === 'reproduced' ? 'confirmed' : retest.verdict === 'fixed' ? 'dismissed' : 'inconclusive'
+  return { verdict, feedback: null, replay: retest.replay }
 }
 
 type ExecutedOutcome = ScoredOutcome & { spec?: Record<string, unknown> }
@@ -608,13 +630,13 @@ function buildDefaultRuntime(liveArgs: LivePipelineArgs): DefaultRuntime {
           let verdict = 'inconclusive'
           let note: string | undefined
           try {
-            const res = await verifyWithProfile(env, spec, worker, caps.inlineRetries, () => undefined, internal)
+            const res = await retestWithProfile(env, spec, worker, () => undefined, internal)
             verdict = res.verdict
             verdicts.push(verdict)
             if (res.replay?.outcome.reason) note = res.replay.outcome.reason
             if (verdict === 'inconclusive' && !internal.aborted) {
               // One bounded extra attempt for a spec that neither confirmed nor dismissed.
-              const retry = await verifyWithProfile(env, spec, worker, caps.inlineRetries, () => undefined, internal)
+              const retry = await retestWithProfile(env, spec, worker, () => undefined, internal)
               verdict = retry.verdict
               verdicts.push(verdict)
               if (retry.replay?.outcome.reason) note = retry.replay.outcome.reason

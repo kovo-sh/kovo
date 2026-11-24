@@ -8,10 +8,11 @@ import {
   containsDestructivePayload,
   declarativeReplaySpecSchema,
   extractCacheBusterParam,
+  floorRecipeEnvelopeSchema,
   replayAssertionOutcomeSchema,
   replaySpecOrigins,
 } from '../replay-spec.ts'
-import type { AuthMutation, DeclarativeReplaySpec, RaceBurstRequest, ReplayAssertionOutcome, ReplayStep } from '../replay-spec.ts'
+import type { AuthMutation, DeclarativeReplaySpec, FloorRecipeEnvelope, RaceBurstRequest, ReplayAssertionOutcome, ReplayStep } from '../replay-spec.ts'
 import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied, RequestBroker, websocketResultToExchange } from './broker.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
@@ -47,6 +48,7 @@ import type { ActorIdentity, AmbientAuth, ImpactStep, PersonaCredentialSource } 
 import { verifyReceipt } from './proof-receipt.ts'
 import type { ProofReceipt, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 import { wiredRecipeForSpecKind } from './floor-recipes.ts'
+import { retestPersistedRecipe } from './floor-recipe-engine.ts'
 
 // Re-exported for tests and callers that only import the verifier.
 export {
@@ -971,17 +973,6 @@ function statusMatchesExpected(expected: number | number[] | undefined, status: 
 function isUnexpectedErrorStatus(status: number, ...expected: Array<number | number[] | undefined>): boolean {
   if (status !== 404 && status < 500) return false
   return !expected.some(e => statusMatchesExpected(e, status))
-}
-
-function setJsonPath(target: Record<string, unknown>, dotPath: string, value: unknown) {
-  const parts = dotPath.split('.')
-  let cur = target
-  for (let i = 0; i < parts.length - 1; i += 1) {
-    const next = cur[parts[i]]
-    if (!next || typeof next !== 'object' || Array.isArray(next)) cur[parts[i]] = {}
-    cur = cur[parts[i]] as Record<string, unknown>
-  }
-  cur[parts[parts.length - 1]] = value
 }
 
 function lightSummary(ex: BrokerExchangeResult) {
@@ -3388,10 +3379,19 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
  * therefore throws (and warns) instead of silently evaluating the DSL for a family the floor is
  * supposed to confirm through a receipt.
  *
- * The legacy branch itself stays in `verifyReplaySpec` for two non-product callers: the capability
- * harness in `scripts/` (which is maintenance-only and still synthesizes sql specs) and patch retest.
- * Deleting it requires migrating those first; that dependency is recorded in
- * `LEGACY_UNWIRED_SPECKINDS` and the Cut 3a report.
+ * The legacy branch itself stays in `verifyReplaySpec` because, after the retest migration
+ * (`retestReplaySpec` re-runs a persisted floor recipe and verifies a fresh receipt; the capability
+ * harness retests through that same entrypoint), it still has reachable callers:
+ *
+ *   1. `Execution`'s agent-facing `verify_replay_spec` / `propose_chain_finding` path
+ *      (`execution.ts` -> `verifyReplaySpec`), which accepts any of the 14 declarative kinds from the
+ *      investigator. This is the dominant caller and the reason the DSL cannot be deleted yet:
+ *      `guardian_verify` script confirmation is not wired into `AgentSession` in production.
+ *   2. The deterministic engine's still-unwired kinds, recorded in `LEGACY_UNWIRED_SPECKINDS`.
+ *   3. `retestReplaySpec`'s legacy fallback for a persisted spec with no recipe envelope (an
+ *      agent-authored proof, or a row written before Cut 3).
+ *
+ * Deleting the VM therefore needs (1) to move to Layer-3 script proofs first.
  */
 export class RecipeWiredLegacyCallError extends Error {
   readonly code = 'GUARDIAN_RECIPE_WIRED_LEGACY_CALL'
@@ -3442,6 +3442,29 @@ function withVerificationTier(result: ReplayVerificationResult): ReplayVerificat
 }
 
 export async function retestReplaySpec(params: VerifyReplaySpecParams): Promise<RetestReplayResult> {
+  // Cut 3 retest receipts: a spec confirmed by a typed floor recipe carries that recipe, so retest
+  // re-runs the recipe and validates a fresh ProofReceipt. The legacy re-interpretation below is only
+  // for proofs that were never recipe-owned (LLM-authored specs and still-unwired kinds).
+  const persisted = persistedRecipeOf(params.spec)
+  if (persisted) {
+    const args = persisted.envelope.args as { vulnClass?: unknown; pathAndQuery?: unknown }
+    const result = await retestPersistedRecipe({
+      envelope: persisted.envelope,
+      specKind: persisted.kind,
+      vulnClass: typeof args.vulnClass === 'string' && args.vulnClass ? args.vulnClass : persisted.kind,
+      endpoint: typeof args.pathAndQuery === 'string' ? args.pathAndQuery : persisted.origin,
+      origin: persisted.origin,
+      broker: params.broker,
+      grant: params.grant,
+      signal: params.signal,
+      ...(params.runId ? { runId: params.runId } : {}),
+      ...(params.assignmentId ? { assignmentId: params.assignmentId } : {}),
+      ...(params.onExchange
+        ? { recordExchange: (exchange: BrokerExchangeResult) => params.onExchange?.(exchange) }
+        : {}),
+    })
+    return { verdict: result.verdict, replay: result.replay }
+  }
   // Retest is a regression replay of an already-persisted proof (reproduced vs fixed), not a new
   // confirmation, so it re-evaluates the recorded spec through the same replay used today.
   const replay = await verifyReplaySpec(params)
@@ -3451,6 +3474,19 @@ export async function retestReplaySpec(params: VerifyReplaySpecParams): Promise<
       ? 'fixed'
       : 'inconclusive'
   return { verdict, replay }
+}
+
+/** Read the persisted recipe envelope from a (not-yet-validated) spec. */
+function persistedRecipeOf(spec: unknown): { envelope: FloorRecipeEnvelope; kind: string; origin: string } | null {
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) return null
+  const record = spec as Record<string, unknown>
+  const parsed = floorRecipeEnvelopeSchema.safeParse(record.recipe)
+  if (!parsed.success) return null
+  return {
+    envelope: parsed.data,
+    kind: typeof record.kind === 'string' ? record.kind : parsed.data.recipeId,
+    origin: typeof record.origin === 'string' ? record.origin : '',
+  }
 }
 
 export interface VerifyReplaySpecInlineParams extends VerifyReplaySpecParams {

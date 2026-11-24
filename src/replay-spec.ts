@@ -182,8 +182,35 @@ export const replayStepSchema = z.object({
   extract: z.array(replayExtractSchema).max(8).optional(),
 })
 
+/**
+ * Persisted floor-recipe envelope (Cut 3 retest receipts).
+ *
+ * A spec confirmed by a typed floor recipe records the exact `recipeId` + args that produced it, so
+ * a retest re-runs the same recipe and validates a fresh `ProofReceipt` instead of re-interpreting
+ * the legacy declarative shape. The legacy fields above stay on the spec for attribution, reporting
+ * and the (still reachable) declarative re-verify path; they are not the retest contract.
+ */
+export const floorRecipeIds = [
+  'access_boundary',
+  'persisted_mutation',
+  'boolean_or_timing',
+  'oob_callback',
+  'race_burst',
+  'disclosure',
+] as const
+
+export const floorRecipeEnvelopeSchema = z.object({
+  recipeId: z.enum(floorRecipeIds),
+  /** Recipe arguments exactly as the planner produced them (typed by `FloorRecipeArgsMap`). */
+  args: z.record(z.string(), z.unknown()),
+})
+
+export type FloorRecipeEnvelope = z.output<typeof floorRecipeEnvelopeSchema>
+
 const replayBase = z.object({
   version: z.literal(1),
+  /** Typed floor recipe that confirmed (and owns the retest of) this proof. */
+  recipe: floorRecipeEnvelopeSchema.optional(),
   origin: scopedAssetOrigin,
   title: z.string().trim().min(3).max(200),
   category: z.enum(owaspCategories).or(z.string().trim().min(1).max(64)),
