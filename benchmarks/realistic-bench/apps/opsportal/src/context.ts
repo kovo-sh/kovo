@@ -132,46 +132,342 @@ export function buildContext(deps: ContextDeps): AppContext {
 // ---- minimal GraphQL-style executor ------------------------------------------------------------
 interface Selection { name: string; args: Record<string, string>; children: Selection[] }
 
-function parseSelections(src: string): Selection[] {
-  let i = 0
-  const parseSet = (): Selection[] => {
-    const out: Selection[] = []
-    while (i < src.length) {
-      const c = src[i]!
-      if (/\s|,/.test(c)) { i++; continue }
-      if (c === '}') { i++; break }
-      if (c === '{') { i++; continue }
-      // field name
-      let name = ''
-      while (i < src.length && /[A-Za-z0-9_]/.test(src[i]!)) name += src[i++]!
-      if (!name) { i++; continue }
-      const args: Record<string, string> = {}
-      while (i < src.length && /\s/.test(src[i]!)) i++
-      if (src[i] === '(') {
-        i++
-        while (i < src.length && src[i] !== ')') {
-          while (i < src.length && /[\s,]/.test(src[i]!)) i++
-          let an = ''
-          while (i < src.length && /[A-Za-z0-9_]/.test(src[i]!)) an += src[i++]!
-          while (i < src.length && /[\s:]/.test(src[i]!)) i++
-          let av = ''
-          if (src[i] === '"') { i++; while (i < src.length && src[i] !== '"') av += src[i++]!; i++ }
-          else while (i < src.length && /[A-Za-z0-9_.\-]/.test(src[i]!)) av += src[i++]!
-          if (an) args[an] = av
-        }
-        i++ // consume ')'
-      }
-      while (i < src.length && /\s/.test(src[i]!)) i++
-      let children: Selection[] = []
-      if (src[i] === '{') { i++; children = parseSet() }
-      out.push({ name, args, children })
-    }
-    return out
+/**
+ * Hard bounds for the tiny query parser. Every scanner loop advances its cursor and every loop
+ * tick is charged against `steps`; recursive selection sets are bounded by `depth`. A query that
+ * exceeds either bound fails with a `GraphQueryParseError` instead of spinning (the previous
+ * parser looped forever when an argument value started with `$`, `[` or `{`).
+ */
+export const MAX_GRAPH_QUERY_STEPS = 50_000
+export const MAX_GRAPH_QUERY_DEPTH = 64
+
+export class GraphQueryParseError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'GraphQueryParseError'
   }
-  // skip to first '{'
-  while (i < src.length && src[i] !== '{') i++
+}
+
+interface ParseState { steps: number }
+
+function tick(state: ParseState): void {
+  state.steps += 1
+  if (state.steps > MAX_GRAPH_QUERY_STEPS) {
+    throw new GraphQueryParseError(`query exceeds ${MAX_GRAPH_QUERY_STEPS} parse steps`)
+  }
+}
+
+function isNameChar(c: string | undefined): boolean {
+  return c !== undefined && /[A-Za-z0-9_]/.test(c)
+}
+
+/** Skip whitespace, commas, comments and BOM. Always makes progress. */
+function skipTrivia(src: string, i: number, state: ParseState): number {
+  while (i < src.length) {
+    tick(state)
+    const c = src[i]!
+    if (c === '\uFEFF' || /\s|,/.test(c)) { i++; continue }
+    if (c === '#') {
+      while (i < src.length && src[i] !== '\n' && src[i] !== '\r') { i++; tick(state) }
+      continue
+    }
+    break
+  }
+  return i
+}
+
+function readName(src: string, i: number, state: ParseState): { name: string; i: number } {
+  let name = ''
+  while (i < src.length && isNameChar(src[i])) { name += src[i++]!; tick(state) }
+  return { name, i }
+}
+
+function readString(src: string, i: number, state: ParseState): { value: string; i: number } {
+  if (src.startsWith('"""', i)) {
+    i += 3
+    let value = ''
+    while (i < src.length) {
+      tick(state)
+      if (src.startsWith('"""', i)) return { value, i: i + 3 }
+      if (src.startsWith('\\"""', i)) { value += '"""'; i += 4; continue }
+      value += src[i++]!
+    }
+    throw new GraphQueryParseError('unterminated block string')
+  }
+  if (src[i] !== '"') throw new GraphQueryParseError('expected a string literal')
   i++
-  return parseSet()
+  let value = ''
+  while (i < src.length) {
+    const c = src[i]!
+    if (c === '"') return { value, i: i + 1 }
+    if (c === '\n' || c === '\r') throw new GraphQueryParseError('unterminated string literal')
+    i++
+    tick(state)
+    if (c !== '\\') { value += c; continue }
+    if (i >= src.length) break
+    const esc = src[i++]!
+    tick(state)
+    switch (esc) {
+      case '"': value += '"'; break
+      case '\\': value += '\\'; break
+      case '/': value += '/'; break
+      case 'b': value += '\b'; break
+      case 'f': value += '\f'; break
+      case 'n': value += '\n'; break
+      case 'r': value += '\r'; break
+      case 't': value += '\t'; break
+      case 'u': {
+        const hex = src.slice(i, i + 4)
+        if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new GraphQueryParseError('invalid unicode escape')
+        value += String.fromCharCode(parseInt(hex, 16))
+        i += 4
+        break
+      }
+      default: throw new GraphQueryParseError(`invalid string escape \\${esc}`)
+    }
+  }
+  throw new GraphQueryParseError('unterminated string literal')
+}
+
+/** Skip a balanced `open`..`close` block (used for opaque definition/body ranges). */
+function skipBalanced(src: string, i: number, state: ParseState, open: string, close: string): number {
+  if (src[i] !== open) throw new GraphQueryParseError(`expected "${open}"`)
+  let depth = 0
+  while (i < src.length) {
+    const c = src[i]!
+    if (c === '"') { i = readString(src, i, state).i; continue }
+    if (c === open) depth++
+    else if (c === close) {
+      depth--
+      if (depth === 0) return i + 1
+    }
+    i++
+    tick(state)
+  }
+  throw new GraphQueryParseError(`unterminated "${open}" block`)
+}
+
+/** Read an argument value. Returns the documented string shape; composites keep their source text. */
+function readValue(src: string, i: number, state: ParseState): { value: string; i: number } {
+  const c = src[i]
+  if (c === undefined) throw new GraphQueryParseError('missing argument value')
+  if (c === '"') return readString(src, i, state)
+  if (c === '$') {
+    const ref = readName(src, i + 1, state)
+    if (!ref.name) throw new GraphQueryParseError('invalid variable reference')
+    return { value: `$${ref.name}`, i: ref.i }
+  }
+  if (c === '[' || c === '{') {
+    const start = i
+    const closers: string[] = [c === '[' ? ']' : '}']
+    i++
+    tick(state)
+    while (i < src.length) {
+      const ch = src[i]!
+      if (ch === '"') { i = readString(src, i, state).i; continue }
+      if (ch === '[' || ch === '{') { closers.push(ch === '[' ? ']' : '}'); i++; tick(state); continue }
+      if (ch === ']' || ch === '}') {
+        const expected = closers.pop()!
+        if (ch !== expected) throw new GraphQueryParseError(`mismatched "${ch}" in argument value`)
+        i++
+        tick(state)
+        if (closers.length === 0) return { value: src.slice(start, i), i }
+        continue
+      }
+      i++
+      tick(state)
+    }
+    throw new GraphQueryParseError('unterminated composite argument value')
+  }
+  // scalar / enum / number: capture until the next structural delimiter
+  const start = i
+  while (i < src.length) {
+    const ch = src[i]!
+    if (/[\s,)\]}:#]/.test(ch)) break
+    i++
+    tick(state)
+  }
+  if (i === start) throw new GraphQueryParseError('missing argument value')
+  return { value: src.slice(start, i), i }
+}
+
+function parseArguments(src: string, i: number, state: ParseState): { args: Record<string, string>; i: number } {
+  if (src[i] !== '(') throw new GraphQueryParseError('expected "("')
+  i++
+  tick(state)
+  const args: Record<string, string> = {}
+  while (true) {
+    i = skipTrivia(src, i, state)
+    if (i >= src.length) throw new GraphQueryParseError('unterminated argument list')
+    if (src[i] === ')') { tick(state); return { args, i: i + 1 } }
+    const name = readName(src, i, state)
+    if (!name.name) throw new GraphQueryParseError(`unexpected character "${src[i]}" in argument list`)
+    i = skipTrivia(src, name.i, state)
+    if (src[i] !== ':') throw new GraphQueryParseError(`missing ":" after argument "${name.name}"`)
+    i = skipTrivia(src, i + 1, state)
+    const value = readValue(src, i, state)
+    args[name.name] = value.value
+    i = value.i
+  }
+}
+
+function skipDirectives(src: string, i: number, state: ParseState): number {
+  while (true) {
+    i = skipTrivia(src, i, state)
+    if (src[i] !== '@') return i
+    const directive = readName(src, i + 1, state)
+    if (!directive.name) throw new GraphQueryParseError('directive without a name')
+    i = skipTrivia(src, directive.i, state)
+    if (src[i] === '(') i = parseArguments(src, i, state).i
+  }
+}
+
+function parseSelectionSet(
+  src: string,
+  i: number,
+  state: ParseState,
+  fragments: Map<string, string>,
+  depth: number,
+): { selections: Selection[]; i: number } {
+  if (depth > MAX_GRAPH_QUERY_DEPTH) {
+    throw new GraphQueryParseError(`query exceeds ${MAX_GRAPH_QUERY_DEPTH} nesting levels`)
+  }
+  if (src[i] !== '{') throw new GraphQueryParseError('expected "{"')
+  i++
+  tick(state)
+  const selections: Selection[] = []
+  while (true) {
+    i = skipTrivia(src, i, state)
+    if (i >= src.length) throw new GraphQueryParseError('unterminated selection set')
+    const c = src[i]!
+    if (c === '}') { tick(state); return { selections, i: i + 1 } }
+    if (c === '{') throw new GraphQueryParseError('unexpected "{" in selection set')
+    if (src.startsWith('...', i)) {
+      // Fragment spread or inline fragment: parse the referenced set and inline its fields.
+      i = skipTrivia(src, i + 3, state)
+      if (src[i] === '@') i = skipDirectives(src, i, state)
+      if (src.startsWith('on', i) && !isNameChar(src[i + 2])) {
+        i = skipTrivia(src, i + 2, state)
+        const typeName = readName(src, i, state)
+        if (!typeName.name) throw new GraphQueryParseError('inline fragment without a type condition')
+        i = skipDirectives(src, typeName.i, state)
+        i = skipTrivia(src, i, state)
+        const inner = parseSelectionSet(src, i, state, fragments, depth + 1)
+        selections.push(...inner.selections)
+        i = inner.i
+        continue
+      }
+      const spread = readName(src, i, state)
+      if (spread.name) {
+        const body = fragments.get(spread.name)
+        if (body === undefined) throw new GraphQueryParseError(`unknown fragment "${spread.name}"`)
+        const inner = parseSelectionSet(body, 0, state, fragments, depth + 1)
+        selections.push(...inner.selections)
+        i = spread.i
+        continue
+      }
+      // `... { ... }` (type-less inline fragment)
+      if (src[i] === '{') {
+        const inner = parseSelectionSet(src, i, state, fragments, depth + 1)
+        selections.push(...inner.selections)
+        i = inner.i
+        continue
+      }
+      throw new GraphQueryParseError('malformed fragment spread')
+    }
+    // field (optionally aliased)
+    const first = readName(src, i, state)
+    if (!first.name) throw new GraphQueryParseError(`unexpected character "${c}" in selection set`)
+    let name = first.name
+    i = skipTrivia(src, first.i, state)
+    if (src[i] === ':') {
+      i = skipTrivia(src, i + 1, state)
+      const aliased = readName(src, i, state)
+      if (!aliased.name) throw new GraphQueryParseError(`missing field name after "${name}:"`)
+      name = aliased.name
+      i = aliased.i
+    }
+    let args: Record<string, string> = {}
+    i = skipTrivia(src, i, state)
+    if (src[i] === '(') {
+      const parsed = parseArguments(src, i, state)
+      args = parsed.args
+      i = parsed.i
+    }
+    i = skipDirectives(src, i, state)
+    i = skipTrivia(src, i, state)
+    let children: Selection[] = []
+    if (src[i] === '{') {
+      const inner = parseSelectionSet(src, i, state, fragments, depth + 1)
+      children = inner.selections
+      i = inner.i
+    }
+    selections.push({ name, args, children })
+  }
+}
+
+/**
+ * Top-level document scan: records named fragment bodies (before or after the operation) and the
+ * offset of the operation selection set. Comments and string bodies are skipped so brace-like text
+ * inside them cannot confuse the scan.
+ */
+function scanDocument(src: string, state: ParseState): { fragments: Map<string, string>; opStart: number } {
+  const fragments = new Map<string, string>()
+  let opStart = -1
+  let i = 0
+  while (true) {
+    i = skipTrivia(src, i, state)
+    if (i >= src.length) break
+    if (src[i] === '"') { i = readString(src, i, state).i; continue }
+    if (src[i] === '{') {
+      if (opStart < 0) opStart = i
+      i = skipBalanced(src, i, state, '{', '}')
+      continue
+    }
+    const word = readName(src, i, state)
+    if (!word.name) { i++; tick(state); continue }
+    i = word.i
+    if (word.name === 'fragment') {
+      i = skipTrivia(src, i, state)
+      const name = readName(src, i, state)
+      if (!name.name) throw new GraphQueryParseError('fragment without a name')
+      i = skipTrivia(src, name.i, state)
+      const on = readName(src, i, state)
+      if (on.name !== 'on') throw new GraphQueryParseError(`fragment "${name.name}" is missing a type condition`)
+      i = skipTrivia(src, on.i, state)
+      const typeName = readName(src, i, state)
+      if (!typeName.name) throw new GraphQueryParseError(`fragment "${name.name}" is missing a type condition`)
+      i = skipDirectives(src, typeName.i, state)
+      i = skipTrivia(src, i, state)
+      if (src[i] !== '{') throw new GraphQueryParseError(`fragment "${name.name}" is missing a selection set`)
+      const start = i
+      i = skipBalanced(src, i, state, '{', '}')
+      fragments.set(name.name, src.slice(start, i))
+      continue
+    }
+    if (word.name === 'query' || word.name === 'mutation' || word.name === 'subscription') {
+      i = skipTrivia(src, i, state)
+      const opName = readName(src, i, state)
+      i = skipTrivia(src, opName.i, state)
+      // Variable definitions may contain default-value objects; skip the whole balanced group.
+      if (src[i] === '(') i = skipBalanced(src, i, state, '(', ')')
+      i = skipDirectives(src, i, state)
+      i = skipTrivia(src, i, state)
+      if (src[i] === '{') {
+        if (opStart < 0) opStart = i
+        i = skipBalanced(src, i, state, '{', '}')
+      }
+      continue
+    }
+  }
+  return { fragments, opStart }
+}
+
+function parseSelections(src: string): Selection[] {
+  const state: ParseState = { steps: 0 }
+  const { fragments, opStart } = scanDocument(src, state)
+  if (opStart < 0) return []
+  return parseSelectionSet(src, opStart, state, fragments, 0).selections
 }
 
 function walkSelection(sel: Selection, parent: unknown, fields: GraphFields): unknown {
