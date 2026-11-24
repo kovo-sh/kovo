@@ -18,7 +18,7 @@
  * Defensive QA framing: everything here is a *falsifier* for over-claims. It never invents impact.
  */
 
-export type ImpactClass = 'authorization' | 'bfla' | 'mass_assignment' | 'csrf' | 'business_logic' | 'markup' | 'disclosure' | 'other'
+export type ImpactClass = 'authorization' | 'bfla' | 'mass_assignment' | 'csrf' | 'business_logic' | 'markup' | 'disclosure' | 'injection' | 'other'
 /** Orthogonal boundary class: what kind of gate must be demonstrated for a claim. */
 export type BoundaryClass = 'auth' | 'mfa' | 'access' | 'other'
 export type RoleName = 'viewer' | 'member' | 'admin' | 'owner'
@@ -230,6 +230,12 @@ const BUSINESS_LOGIC_RE = /\b(?:business[- ]logic|workflow|step[- ]skip|state[- 
 const BUSINESS_LOGIC_CWE_RE = /^CWE-(?:840|841|472|1284)$/i
 const MARKUP_RE = /\b(?:xss|cross[- ]site\s+scripting|html[- ]injection|markup[- ]injection|script[- ]injection|scripting)\b/i
 const MARKUP_CWE_RE = /^CWE-(?:79|80|83)$/i
+// SQL injection has its own evidence model (control vs. boolean/error differentials), so it must not
+// be collapsed into the "disclosure" bucket just because the impact narrative says the rows leak.
+// Detection is by machine-readable label only: free-text "SQL injection" stays unmodelled ('other'),
+// as it always has, so a narrative word cannot promote an unrelated claim into an ungated class.
+const INJECTION_CWE_RE = /^CWE-(?:89|564|943)$/i
+const INJECTION_CATEGORY_RE = /^(?:sqli|sql[-_ ]?injection|blind[-_ ]?sqli)$/i
 const DISCLOSURE_RE = /\b(?:disclosure|data[- ]leak|information[- ]leak|leak(?:ed|s|age)?|exposure|expos(?:ed|ure)|sensitive[- ]data|unauthori[sz]ed[- ]read)\b/i
 const DISCLOSURE_CWE_RE = /^CWE-(?:200|359|522|532)$/i
 /**
@@ -253,6 +259,10 @@ export function classifyImpactDescriptor(parts: {
   // A markup claim is executable-content-only; classification is by CWE or explicit scripting words.
   if (MARKUP_CWE_RE.test(parts.cwe ?? '') || MARKUP_RE.test(text) ||
       MARKUP_RE.test(parts.category ?? '')) return 'markup'
+  // Injection is classified from its own CWE family or SQL-specific category *before* the impact
+  // narrative ("cross-store data disclosure") can rebrand it as information disclosure.
+  if (INJECTION_CWE_RE.test(parts.cwe ?? '') ||
+      INJECTION_CATEGORY_RE.test((parts.category ?? '').trim())) return 'injection'
   if (/\b(?:vertical|bfla|function[- ]level|privilege[- ]escalation)\b/i.test(text) ||
       /^CWE-(?:269|285|862|863)$/i.test(parts.cwe ?? '')) return 'bfla'
   // Business-logic/workflow claims carry their own impact model (invariant, repeat transition,
@@ -1218,6 +1228,7 @@ const IMPACT_CLASS_LABELS: Record<string, EvidenceClassLabel> = {
   markup: { vulnClass: 'xss_stored', cwe: 'CWE-79', category: 'xss' },
   disclosure: { vulnClass: 'info_disclosure', cwe: 'CWE-200', category: 'information-disclosure' },
   business_logic: { vulnClass: 'business_logic', cwe: 'CWE-840', category: 'business-logic' },
+  injection: { vulnClass: 'sqli', cwe: 'CWE-89', category: 'injection' },
 }
 
 const IMPACT_CLASS_CWES: Record<string, number[]> = {
@@ -1227,6 +1238,7 @@ const IMPACT_CLASS_CWES: Record<string, number[]> = {
   markup: [79, 80, 83],
   disclosure: [200, 359, 522, 532],
   business_logic: [840, 841, 472],
+  injection: [89, 564, 943],
 }
 
 /** Label for a verified impact class, or null when the class has no single canonical label. */

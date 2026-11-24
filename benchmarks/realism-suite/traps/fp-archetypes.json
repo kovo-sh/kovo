@@ -184,6 +184,70 @@
           }
         ]
       }
+    },
+  {
+    "id": "cart-coupon-echo-without-checkout",
+    "title": "Coupon apply echoes a discount on a cart but no checkout total or payment moves",
+    "assessor": "business_logic",
+    "expectedDismissal": "a mutation response echo of a writable cart/discount field is not a checkout financial invariant (no boundary, no repeated terminal transition, no protected amount persisted, no declared invariant event)",
+    "input": {
+      "impactClass": "business_logic",
+      "steps": [
+        {
+          "id": "apply",
+          "arm": "probe",
+          "method": "POST",
+          "route": "/api/carts/:cartId/coupons",
+          "pathAndQuery": "/api/carts/cart_1/coupons",
+          "status": 200,
+          "actor": { "handle": "member_a", "role": "member", "tenant": "store-a", "auth": "cookie", "sameSite": "lax" },
+          "requestJson": { "couponCode": "WELCOME10" },
+          "json": { "ok": true, "discount": 1000 }
+        }
+      ]
     }
-  ]
+  },
+  {
+    "id": "shared-cart-row-collision",
+    "title": "A concurrent worker's cart total is visible in the after-read of an unrelated quantity probe",
+    "assessor": "business_logic",
+    "expectedDismissal": "the delta field reflects no value this probe sent, so a concurrent writer on the shared cart row cannot be excluded",
+    "input": {
+      "impactClass": "business_logic",
+      "steps": [
+        {
+          "id": "before",
+          "arm": "probe",
+          "method": "GET",
+          "route": "/api/carts/:cartId",
+          "pathAndQuery": "/api/carts/cart_1",
+          "status": 200,
+          "actor": { "handle": "member_a", "role": "member", "tenant": "store-a", "auth": "cookie", "sameSite": "lax" },
+          "json": { "amount": 1200 }
+        },
+        {
+          "id": "add",
+          "arm": "probe",
+          "method": "POST",
+          "route": "/api/carts/:cartId/items",
+          "pathAndQuery": "/api/carts/cart_1/items",
+          "status": 201,
+          "actor": { "handle": "member_a", "role": "member", "tenant": "store-a", "auth": "cookie", "sameSite": "lax" },
+          "requestJson": { "qty": 7, "lineNote": "probe-line-zzz" },
+          "json": { "ok": true }
+        },
+        {
+          "id": "after",
+          "arm": "probe",
+          "method": "GET",
+          "route": "/api/carts/:cartId",
+          "pathAndQuery": "/api/carts/cart_1",
+          "status": 200,
+          "actor": { "handle": "member_a", "role": "member", "tenant": "store-a", "auth": "cookie", "sameSite": "lax" },
+          "json": { "amount": 9900 }
+        }
+      ]
+    }
+  }
+]
 }
