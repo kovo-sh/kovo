@@ -3668,11 +3668,30 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
     return { verdict, exchanges, receipt: null, vulnClass: null, transcriptDigests, ...attribution }
   }
   const verification = verifyReceipt(built.receipt, built.transcript)
+  if (!verification.confirmed) {
+    // Fail closed: if a script claim maps onto a ProofReceipt rule and `verifyReceipt()` rejects
+    // it (status-only, missing readback, anon-401 control, ...), do not fall back to confirming
+    // the script verdict without a receipt.
+    return {
+      verdict: {
+        ...verdict,
+        confirmed: false,
+        reason: 'oracle_failed',
+        detail: `ProofReceipt verification rejected the script claim (${verification.rule}): ${verification.reason}`,
+        rejectedBy: 'receipt',
+      },
+      exchanges,
+      receipt: null,
+      vulnClass: null,
+      transcriptDigests,
+      ...attribution,
+    }
+  }
   return {
     verdict,
     exchanges,
-    receipt: verification.confirmed ? { receipt: built.receipt, verification } : null,
-    vulnClass: verification.confirmed ? built.receipt.vulnClass : null,
+    receipt: { receipt: built.receipt, verification },
+    vulnClass: built.receipt.vulnClass,
     transcriptDigests,
     ...attribution,
   }
@@ -3762,6 +3781,9 @@ async function retestPersistedAgentScript(
       digests: result.transcriptDigests,
       verdict: result.verdict.reason,
     })).digest('hex'),
+    ...(result.receipt
+      ? { receipt: { mode: 'strict' as const, receipt: result.receipt.receipt, verification: result.receipt.verification } }
+      : {}),
   }
   return {
     verdict: replay.verdict === 'confirmed' ? 'reproduced' : replay.verdict === 'dismissed' ? 'fixed' : 'inconclusive',

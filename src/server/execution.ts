@@ -370,7 +370,7 @@ import { approvalRequests, canaries, findings, messages } from './schema.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
 import { tenantTagForRun } from './scope-policy.ts'
 import { dedupeCodeAuditSuspects, runThreeStageSemanticAudit, runVariantSweepForFinding, toChainStepInputs } from './semantic-audit.ts'
-import { assessmentAssignments, extractResourceRefsFromExchange, isOpaqueResourceId, store } from './store.ts'
+import { assessmentAssignments, extractResourceRefsFromExchange, InvariantError, isOpaqueResourceId, store } from './store.ts'
 import type {
   AgentScriptProofRecord,
   Assignment,
@@ -12362,6 +12362,12 @@ export class Execution {
     secrets: readonly NamedSecret[]
   }): { findingId: string; replaySpecId: string; receiptId: string | null } {
     const { run, assignment, proof } = input
+    if (!proof.verdict.confirmed || (proof.receipt && !proof.receipt.verification.confirmed)) {
+      throw new InvariantError(
+        'invariant.confirmation_evidence',
+        `Invariant: refusing to persist a non-confirming agent script proof (verdict=${proof.verdict.reason}).`,
+      )
+    }
     const receipt = proof.receipt?.receipt ?? null
     const verification = proof.receipt?.verification ?? null
     const claim = receipt?.vulnClass ?? 'disclosure'
@@ -12653,7 +12659,7 @@ export class Execution {
       sourceOrigins: specRow.sourceOrigins,
       secrets: params.currentSecrets(),
     })
-    const receiptRow = result.receipt
+    const receiptRow = confirmed && result.receipt
       ? {
           receipt: {
             vulnClass: result.receipt.receipt.vulnClass,
@@ -12679,7 +12685,9 @@ export class Execution {
             expected: result.receipt.verification.expected,
           },
         } satisfies ReplayProofReceiptRow
-      : proof.receipt ?? null
+      : confirmed
+        ? proof.receipt ?? null
+        : null
     this.storage.setReplaySpecProof(run.id, updatedSpec.id, {
       ...proof,
       replaySpecId: updatedSpec.id,
@@ -12766,11 +12774,8 @@ export class Execution {
     // Receipt-first: a finding that already carries a persisted agent script proof is judged by
     // re-running that script and re-validating its receipt. The declarative shape is attribution
     // only, so it is never parsed or interpreted for such a finding.
-    const agentProof = params.replaySpecId
-      ? this.storage.replaySpecProof(curRun.id, params.replaySpecId)
-      : params.findingId
-        ? this.storage.agentProofForFinding(curRun.id, params.findingId)
-        : null
+    const agentProof = (params.replaySpecId ? this.storage.replaySpecProof(curRun.id, params.replaySpecId) : null)
+      ?? (params.findingId ? this.storage.agentProofForFinding(curRun.id, params.findingId) : null)
     if (agentProof) {
       const receiptFirst = await this.reverifyAgentScriptProof(curRun, params, agentProof)
       if (receiptFirst) return receiptFirst

@@ -1397,7 +1397,6 @@ export class Store {
         updated_at INTEGER NOT NULL
       );
     `)
-    this.client.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`)
     this.initConfirmationGuards()
   }
 

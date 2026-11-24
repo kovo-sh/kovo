@@ -647,13 +647,21 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.length > 0) : []
 }
 
-function impactStepOf(exchange: ScriptProofExchange): ImpactStep {
+function impactStepOf(
+  exchange: ScriptProofExchange,
+  overrides?: {
+    arm?: ImpactStep['arm']
+    requestJson?: unknown
+    ambientAuth?: ImpactStep['actor']['auth']
+    sameSite?: string | null
+  },
+): ImpactStep {
   const roleLabel = exchange.actorRoleLabel ?? null
   const parsed = parseRoleLabel(roleLabel ?? exchange.personaHandle ?? null)
-  const arm = exchange.sessionRole === 'control' || exchange.sessionRole === 'probe' ||
+  const arm = overrides?.arm ?? (exchange.sessionRole === 'control' || exchange.sessionRole === 'probe' ||
     exchange.sessionRole === 'cleanup' || exchange.sessionRole === 'setup'
     ? exchange.sessionRole
-    : 'setup'
+    : 'setup')
   let json: unknown
   if (exchange.body !== undefined) {
     try { json = JSON.parse(exchange.body) } catch { json = undefined }
@@ -669,11 +677,12 @@ function impactStepOf(exchange: ScriptProofExchange): ImpactStep {
       handle: exchange.personaHandle ?? null,
       role: parsed.role,
       tenant: parsed.tenant,
-      auth: 'unknown',
-      sameSite: null,
+      auth: overrides?.ambientAuth ?? 'unknown',
+      sameSite: overrides?.sameSite ?? null,
     },
     ...(json !== undefined ? { json } : {}),
     ...(exchange.body !== undefined ? { body: exchange.body } : {}),
+    ...(overrides?.requestJson !== undefined ? { requestJson: overrides.requestJson } : {}),
     ...(exchange.requestHeaders ? { requestHeaders: exchange.requestHeaders } : {}),
     ...(exchange.responseHeaders ? { responseHeaders: exchange.responseHeaders } : {}),
     ...(exchange.durationMs !== undefined ? { durationMs: exchange.durationMs } : {}),
@@ -692,16 +701,26 @@ export function buildAgentScriptReceipt(input: {
   title: string
 }): { receipt: ProofReceipt; transcript: ReceiptTranscript } | null {
   const byId = new Map(input.exchanges.map(exchange => [exchange.exchangeId, exchange]))
-  const entries: ReceiptTranscriptEntry[] = input.exchanges.map(exchange => ({
-    exchangeId: exchange.exchangeId,
-    step: impactStepOf(exchange),
-    ...(exchange.durationMs !== undefined ? { durationMs: exchange.durationMs } : {}),
-    ...(exchange.body !== undefined
-      ? { carrierText: `${exchange.pathAndQuery}\n${JSON.stringify(exchange.requestHeaders ?? {})}\n${exchange.body}` }
-      : {}),
-    ...(exchange.sessionRole ? { evidenceRole: exchange.sessionRole } : {}),
-  }))
-  const transcript: ReceiptTranscript = { entries }
+  const orderById = new Map(input.exchanges.map((exchange, index) => [exchange.exchangeId, index]))
+  const buildTranscript = (
+    armOverrides: ReadonlyMap<string, ImpactStep['arm']>,
+    extra?: { requestJson?: unknown; ambientAuth?: ImpactStep['actor']['auth']; sameSite?: string | null },
+  ): ReceiptTranscript => ({
+    entries: input.exchanges.map(exchange => ({
+      exchangeId: exchange.exchangeId,
+      step: impactStepOf(exchange, {
+        ...(armOverrides.has(exchange.exchangeId) ? { arm: armOverrides.get(exchange.exchangeId)! } : {}),
+        ...(extra?.requestJson !== undefined ? { requestJson: extra.requestJson } : {}),
+        ...(extra?.ambientAuth ? { ambientAuth: extra.ambientAuth } : {}),
+        ...(extra?.sameSite !== undefined ? { sameSite: extra.sameSite } : {}),
+      }),
+      ...(exchange.durationMs !== undefined ? { durationMs: exchange.durationMs } : {}),
+      ...(exchange.body !== undefined
+        ? { carrierText: `${exchange.pathAndQuery}\n${JSON.stringify(exchange.requestHeaders ?? {})}\n${exchange.body}` }
+        : {}),
+      ...(exchange.sessionRole ? { evidenceRole: exchange.sessionRole } : {}),
+    })),
+  })
   const cited = (ids: readonly string[]) => ids.filter(id => byId.has(id))
 
   for (const claim of input.claims) {
@@ -714,16 +733,44 @@ export function buildAgentScriptReceipt(input: {
     if (typeof probeId !== 'string') continue
     const probe = byId.get(probeId)
     if (!probe) continue
-    const exchangeIds = cited([
+    const controlIds = cited(stringArray(recordField(claim, 'controlExchangeIds')))
+    const beforeId = typeof recordField(claim, 'beforeExchangeId') === 'string' && byId.has(recordField(claim, 'beforeExchangeId') as string)
+      ? recordField(claim, 'beforeExchangeId') as string
+      : null
+    const afterId = typeof recordField(claim, 'afterExchangeId') === 'string' && byId.has(recordField(claim, 'afterExchangeId') as string)
+      ? recordField(claim, 'afterExchangeId') as string
+      : null
+    // Deduplicate and preserve host-transcript chronological order so pre/post mutation readbacks
+    // stay strictly before/after the mutating probe in `findPersistence()`.
+    const exchangeIds = [...new Set([
+      ...(beforeId ? [beforeId] : []),
+      ...controlIds,
       probeId,
-      ...stringArray(recordField(claim, 'controlExchangeIds')),
-      ...(typeof recordField(claim, 'beforeExchangeId') === 'string' ? [recordField(claim, 'beforeExchangeId') as string] : []),
-      ...(typeof recordField(claim, 'afterExchangeId') === 'string' ? [recordField(claim, 'afterExchangeId') as string] : []),
-    ])
+      ...(afterId ? [afterId] : []),
+    ])].sort((a, b) => (orderById.get(a) ?? 0) - (orderById.get(b) ?? 0))
     if (exchangeIds.length === 0) continue
+    const armOverrides = new Map<string, ImpactStep['arm']>()
+    for (const id of controlIds) armOverrides.set(id, 'control')
+    if (beforeId) armOverrides.set(beforeId, 'control')
+    if (afterId) armOverrides.set(afterId, 'control')
+    armOverrides.set(probeId, 'probe')
+    const rawAmbient = recordField(claim, 'ambient')
+    const ambient = rawAmbient && typeof rawAmbient === 'object' && !Array.isArray(rawAmbient)
+      ? rawAmbient as { kind?: unknown; sameSite?: unknown }
+      : null
+    const ambientAuth = ambient?.kind === 'cookie' || ambient?.kind === 'bearer' || ambient?.kind === 'header' || ambient?.kind === 'unknown'
+      ? ambient.kind
+      : undefined
+    const sameSite = typeof ambient?.sameSite === 'string' ? ambient.sameSite : null
+    const transcript = buildTranscript(armOverrides, {
+      ...(recordField(claim, 'requestBody') !== undefined ? { requestJson: recordField(claim, 'requestBody') } : {}),
+      ...(ambientAuth ? { ambientAuth } : {}),
+      ...(sameSite !== null ? { sameSite } : {}),
+    })
     const requiredRole = recordField(claim, 'requiredRole')
     const resourceTenant = recordField(claim, 'resourceTenant')
     const oracleEvents = stringArray(recordField(claim, 'oracleEvents'))
+    const proofPatterns = stringArray(recordField(claim, 'proofPatterns')).filter(p => p.length >= 4 && p.length <= 200).slice(0, 4)
     return {
       receipt: buildProofReceipt({
         vulnClass,
@@ -742,6 +789,7 @@ export function buildAgentScriptReceipt(input: {
         ...(typeof resourceTenant === 'string' && resourceTenant ? { resourceTenant } : {}),
         ...(recordField(claim, 'expectControlDenied') === true ? { expectControlDenied: true } : {}),
         ...(oracleEvents.length ? { oracleEvents: [...new Set(oracleEvents)].slice(0, 8) } : {}),
+        ...(proofPatterns.length ? { proofPatterns } : {}),
       }),
       transcript,
     }
@@ -753,8 +801,12 @@ export function buildAgentScriptReceipt(input: {
       const controls = cited(stringArray(recordField(claim, 'controlIds')))
       const variants = cited(stringArray(recordField(claim, 'variantIds')))
       if (controls.length < 2 || controls.length !== variants.length) continue
-      const controlEntry = entries.find(entry => entry.exchangeId === controls[0])
-      const probeEntry = entries.find(entry => entry.exchangeId === variants[0])
+      const armOverrides = new Map<string, ImpactStep['arm']>()
+      for (const id of controls) armOverrides.set(id, 'control')
+      for (const id of variants) armOverrides.set(id, 'probe')
+      const transcript = buildTranscript(armOverrides)
+      const controlEntry = transcript.entries!.find(entry => entry.exchangeId === controls[0])
+      const probeEntry = transcript.entries!.find(entry => entry.exchangeId === variants[0])
       if (!controlEntry || !probeEntry) continue
       const param = deriveDifferingParam(controlEntry, probeEntry)
       if (!param) continue
@@ -782,6 +834,10 @@ export function buildAgentScriptReceipt(input: {
       if (controls.length < 5 || variants.length < 5) continue
       const probe = byId.get(variants[0]!)
       if (!probe) continue
+      const armOverrides = new Map<string, ImpactStep['arm']>()
+      for (const id of controls) armOverrides.set(id, 'control')
+      for (const id of variants) armOverrides.set(id, 'probe')
+      const transcript = buildTranscript(armOverrides)
       return {
         receipt: buildProofReceipt({
           vulnClass: 'blind_sqli',
