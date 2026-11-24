@@ -953,3 +953,24 @@ So the held-out figure in the #15 certificate (**28/58**) is **not reproducible 
 Either way the Total Product Recall bar stays ≥32/58, and dev 36/59 at 100% remains firm.
 
 **Certificate status: precision/floor certificate remains valid for dev; the held-out cell is marked provisional until this resolves.**
+
+### 2026-11-24 — gap validation: a coded gap must be earned from the transcript
+
+`gap-validation` merged (`45dcba6`). Every route-bound `proofGapReason` is now checked against the host-observed exchange ledger **before** the ordinary spec gate:
+
+| Code | Accepted only when that route shows |
+|---|---|
+| `no_authenticated_persona` / `auth_blocked` | 401/403 or a 3xx login redirect **and** <2 distinct authenticated personas with a 2xx there |
+| `endpoint_not_found` / `method_not_allowed` | 404 / 405 on that exact method + route family |
+| `no_readback_surface` | ≥1 non-denied mutating request in the family **and** no 2xx GET in it (the Realism #4 admin case) |
+| `hardened_or_no_anomaly` / `no_reproducible_signal` | a control exchange **and** ≥1 differential probe on that route |
+| `tier_blocked` | a host tier-denied exchange on that route |
+| `out_of_scope` | a scope-denied exchange, an origin outside approved origins, or a never-reached route |
+| `runtime_unavailable` | no exchange possible / runtime denial / no 2xx |
+| `no_spec_shape` / `baseline_empty` / `no_control_path` | ≥1 recorded exchange (route genuinely exercised) |
+
+An unsupported gap is rejected **once per route per assignment** with `agent.gap_validation` naming the code, route and the exact missing exchange, then the reserved wrap-up turn attempts the proof (no loops). Free-text gaps never discharge. Evidence comes only from status/persona/control/differential/denial fields — never bodies or tool prose. Stats `{accepted, rejected, byCode}` via `onGapValidation`; the `execution.ts` forwarding diff is queued behind `spec-authz`.
+
+Measured (held-out shopflow, 600 s, K=6, isolated kept dirs): **8/19 at 100% precision**, 0 decoy/unmatched, route-hit→verify **10/14 (71.4%)**, 24 coded gaps recorded with **4 adjudicated: 0 accepted, 4 rejected** (`no_reproducible_signal` ×3, `out_of_scope` ×1) in 2 events; the worker re-called `complete_intent` and was accepted — the loop guard held.
+
+**A decoy FP appeared in the non-isolated sharing run** (88.9%): a same-tenant `viewer` BFLA mis-attributed to the cross-tenant `shipment-bola-write` decoy. That is the **persona/scope bleed** again, now observed on the precision side — which is exactly why `persona-binding` is fixing transport-level scope rather than reporting.
