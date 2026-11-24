@@ -677,8 +677,29 @@ export function pathHasTemplateHint(path: string): boolean {
   return /(?:^|[/_.-])(?:render|preview|template|templates|layout|layouts|report|reports|docs?|pages?|email|emails|snippet|snippets)(?:$|[/_.-])/i.test(path)
 }
 
+/**
+ * Search-surface vocabulary. Membership is tested against whole path segments and whole tokens
+ * within a segment (split on `-`, `_`, `.`), never as a substring of a longer word. `catalog` is a
+ * listing noun, not a search surface: it is deliberately absent (it used to be matched by the
+ * generic `log` file hint and consumed SQL injection quota on routes that never read a query).
+ * `logs` / `audit-log` are file/audit surfaces; they belong to `pathHasFileHint`, not here.
+ */
+const searchHintTokens = new Set([
+  'search', 'searches', 'lookup', 'find', 'filter', 'query', 'queries', 'browse',
+])
+
+/** Lowercased path segments, query string dropped. */
+function pathSegmentsOf(path: string): string[] {
+  return (path.split('?')[0] || '/').split('/').filter(Boolean)
+}
+
+/** Whole tokens of one path segment: `catalog-search` -> `catalog`, `search`. */
+function segmentTokens(segment: string): string[] {
+  return segment.toLowerCase().split(/[-_.]+/).filter(Boolean)
+}
+
 export function pathHasSearchHint(path: string): boolean {
-  return /(?:^|[/_.-])(?:search|searches|lookup|find|filter|query|queries|browse|catalog)(?:$|[/_.-])/i.test(path)
+  return pathSegmentsOf(path).some(segment => segmentTokens(segment).some(token => searchHintTokens.has(token)))
 }
 
 /** A route whose shape says it runs an operator-supplied host/command probe. */
@@ -1249,6 +1270,27 @@ export interface EnumerateOptions {
   identityProfiles?: ReadonlyMap<string, IdentityProfile>
   /** Environment contract: multi-step price/race conversion probes are isolated-lab/staging only. */
   environmentMode?: 'prod_readonly' | 'staging_isolated' | 'ephemeral_lab'
+  /** Structured quota-reservation decisions, one per class holding verified reading-param evidence. */
+  onQuotaReservation?: (event: QuotaReservationEvent) => void
+}
+
+/**
+ * One evidence-based quota decision. `released` means no slot was held back: every verified
+ * reading-param candidate either already ranked inside its class quota or the global cap could not
+ * fund the reservation, so the slot went back to the normal ranking.
+ */
+export interface QuotaReservationEvent {
+  /** Intent/class the quota belongs to (e.g. `sqli`). */
+  class: string
+  /** Hypothesis key the decision is about (`probeClass|endpoint|param`). */
+  reservedFor: string
+  released: boolean
+  /** 1-based rank within the class ranking at decision time; `> quota` means it would be dropped. */
+  rankBefore: number
+  /** 1-based position in the final selected plan, or null when it was not selected. */
+  rankAfter: number | null
+  /** Class quota in force (the reservation, when used, adds exactly one slot on top). */
+  quota: number
 }
 
 /**
@@ -2408,16 +2450,78 @@ export function enumerateHypotheses(
     Object.entries(baseQuotas).map(([intent, quota]) => [intent, Math.max(quota, Math.ceil(quota * scale))]),
   )
   const max = slots
-  const used: Record<string, number> = {}
-  const selected: EngineHypothesis[] = []
-  for (const hyp of [...all.values()].sort((a, b) =>
+  const quotaFor = (intent: string): number => quotas[intent] ?? 4
+  // Canonical order: intent priority, then risk, then key. Every part is a total order, so the
+  // selection below never depends on Map insertion or store row order.
+  const compare = (a: EngineHypothesis, b: EngineHypothesis): number =>
     (intentPriority[b.intent] ?? 0) - (intentPriority[a.intent] ?? 0) ||
     b.risk - a.risk ||
-    a.key.localeCompare(b.key))) {
-    if ((used[hyp.intent] ?? 0) >= (quotas[hyp.intent] ?? 4)) continue
+    a.key.localeCompare(b.key)
+  const ranked = [...all.values()].sort(compare)
+
+  /**
+   * Evidence basis for a quota reservation: the harvester proved that a benign alternate value of
+   * this query parameter changes the response (paired control vs probe). That is the same
+   * differential recon records as `inferred_*:sensitive`, re-derived at probe time instead of
+   * trusted from a name, and it is the strongest injectable-surface signal the engine can hold.
+   */
+  const verifiedReadingParam = (hyp: EngineHypothesis): boolean => {
+    if (!hyp.param || hyp.param.location !== 'query') return false
+    return harvests.get(hyp.endpoint.id)?.activeQueryParams.includes(hyp.param.name) === true
+  }
+  const classRanking = new Map<string, EngineHypothesis[]>()
+  for (const hyp of ranked) {
+    let list = classRanking.get(hyp.intent)
+    if (!list) {
+      list = []
+      classRanking.set(hyp.intent, list)
+    }
+    list.push(hyp)
+  }
+  // Reserve at most one slot per class, only for a verified candidate the class quota would drop.
+  // The reservation is not a class-wide bump: when no such candidate exists nothing is held back.
+  const reserved = new Map<string, EngineHypothesis>()
+  for (const intent of [...classRanking.keys()].sort()) {
+    const miss = classRanking.get(intent)!.slice(quotaFor(intent)).find(verifiedReadingParam)
+    if (miss) reserved.set(intent, miss)
+  }
+
+  const selected: EngineHypothesis[] = []
+  const selectedKeys = new Set<string>()
+  const used: Record<string, number> = {}
+  const take = (hyp: EngineHypothesis, overrideQuota: boolean): boolean => {
+    if (selected.length >= max || selectedKeys.has(hyp.key)) return false
+    if (!overrideQuota && (used[hyp.intent] ?? 0) >= quotaFor(hyp.intent)) return false
+    selectedKeys.add(hyp.key)
     used[hyp.intent] = (used[hyp.intent] ?? 0) + 1
     selected.push(hyp)
-    if (selected.length >= max) break
+    return true
+  }
+  // Reservations are placed first so the global hypothesis cap can never consume the slot they
+  // need; the final list is re-sorted into canonical order, so probe sequence is unchanged.
+  for (const intent of [...reserved.keys()].sort()) take(reserved.get(intent)!, true)
+  for (const hyp of ranked) take(hyp, false)
+  selected.sort(compare)
+
+  if (options.onQuotaReservation) {
+    const positionOf = new Map<string, number>()
+    selected.forEach((hyp, idx) => positionOf.set(hyp.key, idx + 1))
+    for (const intent of [...classRanking.keys()].sort()) {
+      const list = classRanking.get(intent)!
+      const verified = list.filter(verifiedReadingParam)
+      if (verified.length === 0) continue
+      const held = reserved.get(intent)
+      const taken = held && selectedKeys.has(held.key) ? held : null
+      const target = taken ?? verified[0]!
+      options.onQuotaReservation({
+        class: intent,
+        reservedFor: target.key,
+        released: taken === null,
+        rankBefore: list.indexOf(target) + 1,
+        rankAfter: positionOf.get(target.key) ?? null,
+        quota: quotaFor(intent),
+      })
+    }
   }
   return selected
 }
@@ -4435,6 +4539,13 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     identityProfiles: buildIdentityProfiles(ranked, harvests),
     environmentMode: input.environmentMode ?? 'ephemeral_lab',
     ...(input.classes ? { classes: input.classes } : {}),
+    onQuotaReservation: event => log(
+      'engine.quota_reservation',
+      event.released
+        ? `Quota reservation released for ${event.class}: verified reading param candidate already had a slot (rank ${event.rankBefore} <= quota ${event.quota}).`
+        : `Quota reservation used for ${event.class}: verified reading param candidate at rank ${event.rankBefore} (quota ${event.quota}) reserved; selected at ${event.rankAfter ?? 'n/a'}.`,
+      { class: event.class, reservedFor: event.reservedFor, released: event.released, rankBefore: event.rankBefore, rankAfter: event.rankAfter, quota: event.quota },
+    ),
   })
 
   // v6 environment contract: a production read-only engagement never forms a mutating hypothesis,
