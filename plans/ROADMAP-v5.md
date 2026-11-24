@@ -486,3 +486,9 @@ Two concrete proof defects found: (a) shopflow `product-search-sqli` — true ar
 Held-out rerun after fixture hardening (shopflow settings/admin-reviews owner+admin gate, cart ownership): **25/58 at 100% precision, 0 FPs** (acme 10, shopflow 8, opsportal 7) — first held-out **+1** with precision intact. Acme's earlier FP row was unrecoverable (`dataDirKept:false`); two subsequent clean reruns, still unexplained and tracked.
 
 **Streams launched:** `sqli-baseline` (ground boolean arms in the target's own baseline rows) and `spec-submission` (make spec-or-explicit-proof-gap mandatory at settlement; classify the 19 no-spec targets).
+
+### 2026-11-24 — realism gates split (wiring vs capability) + #4 funnel
+
+- **`oob_wiring_fnr` separated from `fixture_capability_recall`** (reviewer-accepted): #2 now reports wiring PASS with **0.0% OOB wiring FNR** (0 of 2 fired async-canary targets unconfirmed) and **50.0% capability recall FAIL** (2 of 4 planted: async SSRF + XXE confirmed; blind SQLi and the exfil chain missing). The old blended 33.3% is informational only, so an unrelated capability miss can never again look like an OOB wiring defect.
+- **#4 per-slice funnel** now pins the loss stage per slice: `mono-admin-bfla` was **dispatched and hit the mounted route but never reached verification**; `mono-billing-bola` and `mono-report-sqli` were **never requested**. That is not a brief-truncation signature — it is the same post-route proof-submission loss seen on held-out (19/23 `no_spec_submitted`).
+- Realism #3 re-verified PASS after the split (3 TP / 0 FP, 2 h2 single-packet bursts, 0 leaks), so the change is measurement-only.
