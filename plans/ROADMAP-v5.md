@@ -631,3 +631,20 @@ Measured on dev acme 600 s K=6:
 **Do not widen the predicate for throughput yet.** A wider exit trades confirmations for slot turnover, and precision/recall outrank p50. Re-measure p50 on an idle box during the definitive run before deciding; if p50 still exceeds the 110 s gate, the next safe lever is warm-pool reuse and provider-stall handling, not earlier exits.
 
 Also fixed the cap-bump fallout in `tests/v6-phaseb-latency.test.ts` (it still asserted `maxTurns <= 12` / 75–90 s) to the current 18 turns / 90–120 s, and wired the early-exit stat into `AssignmentThroughputMetrics` + `agent.early_exit` events.
+
+### 2026-11-24 — first held-out floor gain from inferred params (24 → 25/58, 100% precision)
+
+`param-discovery` merged (`a07349c`). It also **corrected the diagnosis**: the SQLi stream's "declared `searchQuery`" was the logical spec key, not a persisted row — in reality `GET /api/v1/search` exists (`source=openapi`) with **0 `endpoint_params`** and an OpenAPI operation declaring `parameters: []`. The concrete app name is `query`.
+
+Three defects, all general:
+1. **Discovery gap** — no param name persisted; the generic vocabulary `q/query/term/keyword` ties alphabetically, `keyword` won, and the real `query` was missed.
+2. **Selection gap (substring bug)** — `pathHasSearchHint` matched the literal `log` inside `catalog`, so `catalog*` routes consumed SQLi quota. With quota 17 and search ranked 18th at risk 102, the real target was never probed.
+3. **No confidence model** on how a param name was obtained.
+
+Landed: provenance-tagged params (`observed[:detail]`, `inferred_bundle[:sensitive]`, `inferred_html[:sensitive]`, `inferred_ast[:sensitive]`), JS/UI noise filtering, a bounded **paired control-vs-probe sensitivity check** (dead inferred literals are deleted), location-aware filtering (dotted AST fields kept for JSON bodies, rejected as query keys), and one sorted `phase0.param_discovery` event with per-source counts.
+
+**Measured:** dev floor **34/59 ×3, 0 spread, 100%**; salted held-out **25/58 at 100%** (acme 9, shopflow **9** — was 8, opsportal 7), xben 25/25, held-out-saas 20/20 + 20/20 patches. The +1 is `GET /api/v1/search` SQLi seeded by `inferred_html:sensitive` `query` and confirmed through the normal differential + replay path — never from inference alone. One dev confirmation and one held-out confirmation came from inferred params, each fully proven.
+
+Regression caught during validation: the first noise filter dropped dotted JSON body fields and lost held-out-saas `hos-08` (19/20); location-aware filtering restored 20/20.
+
+Next: `sqli-quota` fixes the substring bug and adds an **evidence-based** quota reservation (one slot for a sensitivity-checked reading param that would otherwise miss the quota; released when unused) — not a class-wide quota bump.
