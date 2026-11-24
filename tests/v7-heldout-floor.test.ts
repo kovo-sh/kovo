@@ -111,7 +111,7 @@ test('held-out floor: a differential probe carries its class into the brokered r
 
 test('held-out floor: no template hypothesis for a numeric/money body field', () => {
   const endpoint: EngineEndpoint = {
-    id: 'POST:/api/billing-docs', origin: ORIGIN, method: 'POST', pathTemplate: '/api/billing-docs',
+    id: 'POST:/api/render-docs', origin: ORIGIN, method: 'POST', pathTemplate: '/api/render-docs',
     params: [
       { name: 'amount', location: 'json' },
       { name: 'title', location: 'json' },
@@ -134,7 +134,7 @@ test('held-out floor: no template hypothesis for a numeric/money body field', ()
 
 test('held-out floor: an import-shaped POST forms an XXE hypothesis without a wire sample', () => {
   const importRoute: EngineEndpoint = {
-    id: 'POST:/api/connections/import', origin: ORIGIN, method: 'POST', pathTemplate: '/api/connections/import',
+    id: 'POST:/api/feeds/import', origin: ORIGIN, method: 'POST', pathTemplate: '/api/feeds/import',
     params: [],
   }
   const urlRoute: EngineEndpoint = {
@@ -148,7 +148,7 @@ test('held-out floor: an import-shaped POST forms an XXE hypothesis without a wi
   const hypotheses = enumerateHypotheses([importRoute, urlRoute], harvests, { tier: 3, personas: PERSONAS })
   const xxe = hypotheses.filter(hyp => hyp.probeClass === 'xxe_canary')
   assert.equal(xxe.length, 1, 'exactly the document-import route is XXE-eligible')
-  assert.equal(xxe[0]!.endpoint.pathTemplate, '/api/connections/import')
+  assert.equal(xxe[0]!.endpoint.pathTemplate, '/api/feeds/import')
   // A URL-consuming route is structurally excluded: its body carries a fetch target, not a document.
   assert.ok(!hypotheses.some(hyp => hyp.probeClass === 'xxe_canary' && hyp.endpoint.pathTemplate === '/api/hooks'))
 })
@@ -158,7 +158,7 @@ test('held-out floor: an import-shaped POST forms an XXE hypothesis without a wi
 // ---------------------------------------------------------------------------
 
 test('held-out floor: identity-assumption routes are recognised and scope fields are stripped', () => {
-  assert.equal(IDENTITY_ASSUMPTION_ROUTE_RE.test('/api/admin/impersonate'), true)
+  assert.equal(IDENTITY_ASSUMPTION_ROUTE_RE.test('/api/admin/assume-role'), true)
   assert.equal(IDENTITY_ASSUMPTION_ROUTE_RE.test('/api/v1/admin/act-as'), true)
   assert.equal(IDENTITY_ASSUMPTION_ROUTE_RE.test('/api/switch-tenant'), true)
   assert.equal(IDENTITY_ASSUMPTION_ROUTE_RE.test('/api/admin/people'), false)
@@ -173,7 +173,7 @@ test('held-out floor: identity-assumption routes are recognised and scope fields
 
 test('held-out floor: an impersonation route gets no mass-assignment recipe and no foreign scope body', () => {
   const impersonate: EngineEndpoint = {
-    id: 'POST:/api/admin/impersonate', origin: ORIGIN, method: 'POST', pathTemplate: '/api/admin/impersonate',
+    id: 'POST:/api/admin/assume-role', origin: ORIGIN, method: 'POST', pathTemplate: '/api/admin/assume-role',
     params: [],
   }
   const collection: EngineEndpoint = {
@@ -185,10 +185,10 @@ test('held-out floor: an impersonation route gets no mass-assignment recipe and 
   ])
   const hypotheses = enumerateHypotheses([impersonate, collection], harvests, { tier: 3, personas: PERSONAS })
   const impersonateMass = hypotheses.filter(hyp => hyp.probeClass === 'mass_assignment' &&
-    hyp.endpoint.pathTemplate === '/api/admin/impersonate')
+    hyp.endpoint.pathTemplate === '/api/admin/assume-role')
   assert.equal(impersonateMass.length, 0, 'a scope-write probe must not run on a session-scoping route')
 
-  const authz = hypotheses.find(hyp => hyp.intent === 'authz' && hyp.endpoint.pathTemplate === '/api/admin/impersonate')
+  const authz = hypotheses.find(hyp => hyp.intent === 'authz' && hyp.endpoint.pathTemplate === '/api/admin/assume-role')
   assert.ok(authz, 'the access-control probe still runs on the impersonation route')
   assert.equal(Object.hasOwn(authz!.jsonBody ?? {}, 'store'), false,
     'the access probe must not carry a scope selector that the server would persist on the operator session')
