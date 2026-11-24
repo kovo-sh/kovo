@@ -48,6 +48,93 @@ function primingFields(env: ProbeEnv) {
     : {}
 }
 
+
+/**
+ * Cut 3c/3d prep: every emitted SQL spec also carries the `boolean_or_timing` recipe envelope, so
+ * the retest/replay path can run the typed recipe instead of re-interpreting the spec VM. The
+ * envelope is *attribution + retest* only: the spec's own declarative fields above stay untouched,
+ * so initial verification semantics (and xben's status-differential targets) are unchanged.
+ */
+function cut3RecipeEnvelope(
+  o: HypothesisOutcome,
+  env: ProbeEnv,
+  mode: 'boolean' | 'status' | 'timing',
+  selection: { baselineValue: string; quoteStyle?: string; valueTemplate?: string; payload?: string; contradiction?: string },
+): { recipeId: 'boolean_or_timing'; args: Record<string, unknown> } | undefined {
+  const fields = injectionFields(o, env)
+  const location = fields.paramLocation
+  if (location !== 'query' && location !== 'json' && location !== 'form') return undefined
+  const armFor = (value: string): { pathAndQuery: string; jsonBody?: Record<string, unknown> } => {
+    if (location === 'query') {
+      try {
+        const url = new URL(fields.pathAndQuery, 'http://guardian.invalid')
+        url.searchParams.set(fields.paramName, value)
+        return { pathAndQuery: `${url.pathname}${url.search}` }
+      } catch {
+        return { pathAndQuery: fields.pathAndQuery }
+      }
+    }
+    return {
+      pathAndQuery: fields.pathAndQuery,
+      jsonBody: { ...((fields.jsonBody as Record<string, unknown> | undefined) ?? {}), [fields.paramName]: value },
+    }
+  }
+  const control = armFor(selection.baselineValue)
+  const tautologyValue = selection.valueTemplate
+    ? selection.valueTemplate.replaceAll('{{baseline}}', selection.baselineValue).replaceAll('{{sql_expr}}', '1=1')
+    : selection.payload
+      ? selection.payload
+      : `${selection.baselineValue}' AND 1=1-- -`
+  const contradictionValue = selection.contradiction
+    ?? `${selection.baselineValue}' AND 1=2-- -`
+  const tautology = armFor(tautologyValue)
+  const contradiction = armFor(contradictionValue)
+  // A path/header/xml parameter cannot be moved by a query or JSON arm builder.
+  if (!tautology.pathAndQuery && !tautology.jsonBody) return undefined
+  const actor = { handle: env.owner ?? 'anonymous' }
+  const baseArgs = {
+    origin: env.origin,
+    method: fields.method,
+    pathAndQuery: fields.pathAndQuery,
+    vulnClass: mode === 'status' ? 'sqli_status' : 'sqli',
+    mode,
+    actor,
+    param: fields.paramName,
+    ...(selection.baselineValue ? { baselineValue: selection.baselineValue } : {}),
+    ...(selection.quoteStyle ? { quoteStyle: selection.quoteStyle } : {}),
+    ...(selection.valueTemplate ? { valueTemplate: selection.valueTemplate } : {}),
+  }
+  const args = mode === 'timing'
+    ? {
+        ...baseArgs,
+        controlPathAndQuery: control.pathAndQuery,
+        probePathAndQuery: tautology.pathAndQuery,
+        ...(control.jsonBody ? { controlJsonBody: control.jsonBody } : {}),
+        ...(tautology.jsonBody ? { probeJsonBody: tautology.jsonBody } : {}),
+      }
+    : mode === 'status'
+      ? {
+          ...baseArgs,
+          receiptClass: 'sqli_status',
+          rounds: 2,
+          controlPathAndQuery: control.pathAndQuery,
+          probePathAndQuery: tautology.pathAndQuery,
+          contradictionPathAndQuery: contradiction.pathAndQuery,
+          ...(control.jsonBody ? { controlJsonBody: control.jsonBody } : {}),
+          ...(tautology.jsonBody ? { probeJsonBody: tautology.jsonBody } : {}),
+          ...(contradiction.jsonBody ? { contradictionJsonBody: contradiction.jsonBody } : {}),
+        }
+      : {
+          ...baseArgs,
+          rounds: 2,
+          controlPathAndQuery: control.pathAndQuery,
+          probePathAndQuery: tautology.pathAndQuery,
+          ...(control.jsonBody ? { controlJsonBody: control.jsonBody } : {}),
+          ...(tautology.jsonBody ? { probeJsonBody: tautology.jsonBody } : {}),
+        }
+  return { recipeId: 'boolean_or_timing', args }
+}
+
 const jqBoolean = '{ controlPassed: (.sqlDiff.controlPassed == true), confirmed: (.sqlDiff.passed == true), observed: ("passed=" + (.sqlDiff.passed | tostring)), expected: "boolean differential holds" }'
 const jqTime = '{ controlPassed: (.sqlTimeDiff.controlPassed == true), confirmed: (.sqlTimeDiff.passed == true), observed: ("deltaMs=" + (.sqlTimeDiff.deltaMedianMs | tostring)), expected: "time differential holds" }'
 
@@ -58,6 +145,11 @@ export function synthSqlBoolean(o: HypothesisOutcome, env: ProbeEnv): Synthesize
   const hit = o.anomalies.find(a => a.type === 'boolean_differential')
   if (hit) {
     const s = booleanStyle(String(hit.style ?? 'single_quote'))
+    const envelope = cut3RecipeEnvelope(o, env, 'boolean', {
+      baselineValue: String(hit.baselineValue ?? o.ctx?.baseline ?? '1'),
+      quoteStyle: s.quoteStyle,
+      ...(s.valueTemplate ? { valueTemplate: s.valueTemplate } : {}),
+    })
     return [{
       kind: 'sql_boolean_diff',
       spec: {
@@ -67,6 +159,7 @@ export function synthSqlBoolean(o: HypothesisOutcome, env: ProbeEnv): Synthesize
         ...primingFields(env),
         quoteStyle: s.quoteStyle,
         ...(s.valueTemplate ? { valueTemplate: s.valueTemplate } : {}),
+        ...(envelope ? { recipe: envelope } : {}),
       },
     }]
   }
@@ -75,6 +168,12 @@ export function synthSqlBoolean(o: HypothesisOutcome, env: ProbeEnv): Synthesize
   if (o.hyp.location === 'graphql_var') return []
   // Error fingerprint proves the value reaches a SQL string literal. A tautology baseline plus the
   // verifier's randomized `k=k` / `k=k+1` triplet still yields a genuine boolean differential.
+  const fingerprintEnvelope = cut3RecipeEnvelope(o, env, 'status', {
+    baselineValue: String(o.ctx?.baseline ?? '1'),
+    quoteStyle: 'single',
+    valueTemplate: "x' OR {{sql_expr}}-- -",
+    contradiction: "x' AND 1=2-- -",
+  })
   const out: SynthesizedSpec[] = [{
     kind: 'sql_boolean_diff',
     spec: {
@@ -85,6 +184,7 @@ export function synthSqlBoolean(o: HypothesisOutcome, env: ProbeEnv): Synthesize
       baselineValue: "x' OR 1=1-- -",
       quoteStyle: 'single',
       valueTemplate: "x' OR {{sql_expr}}-- -",
+      ...(fingerprintEnvelope ? { recipe: fingerprintEnvelope } : {}),
     },
   }]
   // Additional observed-shape candidates, tried only when the generic breakout does not confirm.
@@ -124,6 +224,11 @@ export function synthSqlTime(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSp
   }
   const orExpr = delayExpr[dialect]
   const valueTemplate = style === 'or_branch' && orExpr ? `{{baseline}}' OR ${orExpr}-- -` : undefined
+  const timingEnvelope = cut3RecipeEnvelope(o, env, 'timing', {
+    baselineValue: String(hit.baselineValue ?? o.ctx?.baseline ?? '1'),
+    quoteStyle: booleanStyle(style).quoteStyle,
+    ...(valueTemplate ? { valueTemplate } : {}),
+  })
   return [{
     kind: 'sql_time_diff',
     spec: {
@@ -135,6 +240,7 @@ export function synthSqlTime(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSp
       dialect,
       delayMs: Math.round(delay),
       ...(valueTemplate ? { valueTemplate } : {}),
+      ...(timingEnvelope ? { recipe: timingEnvelope } : {}),
     },
   }]
 }
