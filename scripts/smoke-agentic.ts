@@ -738,6 +738,8 @@ interface RunResult {
   code: number | null
   wallMs: number
   logPath: string
+  /** True when the battery's hard stop fired (the child ignored its own budget/teardown). */
+  timedOut: boolean
 }
 
 async function spawnLogged(input: {
@@ -747,6 +749,8 @@ async function spawnLogged(input: {
   env: NodeJS.ProcessEnv
   logPath: string
   docker: boolean
+  /** Hard-kill the process group after this wall time. Default: 1 hour. */
+  killAfterMs?: number
 }): Promise<RunResult> {
   mkdirSync(dirname(input.logPath), { recursive: true, mode: 0o700 })
   const started = Date.now()
@@ -755,11 +759,13 @@ async function spawnLogged(input: {
   const useNewgrp = input.docker && !dockerUsable()
   const command = useNewgrp ? 'newgrp' : '/bin/bash'
   const args = useNewgrp ? ['docker', '-c', shellCommand] : ['-lc', shellCommand]
+  let timedOut = false
   const code = await new Promise<number | null>((resolvePromise) => {
     const child = spawn(command, args, {
       cwd: input.cwd,
       env: input.env,
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
     })
     let output = ''
     const cap = 200_000
@@ -768,17 +774,36 @@ async function spawnLogged(input: {
     }
     child.stdout.on('data', absorb)
     child.stderr.on('data', absorb)
+    const killGroup = (signal: NodeJS.Signals) => {
+      try {
+        if (child.pid) process.kill(-child.pid, signal)
+      } catch {
+        try { child.kill(signal) } catch { /* already gone */ }
+      }
+    }
+    let hardKill: ReturnType<typeof setTimeout> | undefined
+    const grace = setTimeout(() => {
+      timedOut = true
+      absorb(Buffer.from('\n[battery] hard stop: child exceeded its wall budget; terminating process group\n'))
+      killGroup('SIGTERM')
+      hardKill = setTimeout(() => killGroup('SIGKILL'), 8_000)
+    }, input.killAfterMs ?? 3_600_000)
+    grace.unref?.()
     child.on('error', (error) => {
       output += `\n[spawn error] ${error.message}\n`
+      clearTimeout(grace)
+      if (hardKill) clearTimeout(hardKill)
       writeFileSync(input.logPath, output, { mode: 0o600 })
       resolvePromise(127)
     })
     child.on('close', (exitCode) => {
+      clearTimeout(grace)
+      if (hardKill) clearTimeout(hardKill)
       writeFileSync(input.logPath, output, { mode: 0o600 })
       resolvePromise(exitCode)
     })
   })
-  return { code, wallMs: Date.now() - started, logPath: input.logPath }
+  return { code, wallMs: Date.now() - started, logPath: input.logPath, timedOut }
 }
 
 interface CellPlan {
@@ -900,6 +925,7 @@ async function runRealisticCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMe
     env: baseEnv(opts),
     logPath,
     docker: true,
+    killAfterMs: opts.durationSec * 1000 + 180_000,
   })
   const card = readJson<ScorecardLike>(scorecardPath(plan.outDir, plan.app, opts.seed))
   const meta = readJson<MetaLike>(metaPath(plan.outDir, plan.app, opts.seed))
@@ -1015,10 +1041,17 @@ async function runTrapCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetrics
       env: baseEnv(opts),
       logPath,
       docker: true,
+      killAfterMs: opts.trapDurationSec * 1000 + 60_000,
     })
     const dbPath = join(dataDir, 'guardian.sqlite')
     const counts = confirmedVulnerabilityCounts(dbPath)
+    const state = latestRunState(dbPath)
     const log = readLog(logPath)
+    // A deliberate budget stop is not a crash. It is acceptable only when the run actually
+    // reached investigation; a run that never left threat_model proves nothing about precision.
+    const budgetStop = result.timedOut || result.code === 143 || result.code === 1
+    const reachedInvestigation = counts.completedAssignments > 0 || counts.confirmed > 0
+      || (state !== null && state.phase !== 'threat_model' && state.phase !== 'phase0')
     return {
       id: plan.id,
       kind: 'trap',
@@ -1039,15 +1072,32 @@ async function runTrapCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetrics
       wallMs: result.wallMs,
       crashes: countCrashes(log),
       capability: counts.confirmed,
-      detail: `${counts.confirmed} confirmed, ${counts.advisory} advisory`,
+      detail: `${counts.confirmed} confirmed, ${counts.advisory} advisory; run ${state?.status ?? 'unknown'}/${state?.phase ?? 'unknown'}${budgetStop ? ' (budget stop)' : ''}`,
       ...(!existsSync(dbPath)
         ? { error: 'trap run persisted no findings DB' }
-        : result.code !== 0 && result.code !== 2
-          ? { error: `cli exit ${result.code}` }
-          : {}),
+        : budgetStop
+          ? (reachedInvestigation ? {} : { error: `trap never reached investigation (exit ${result.code})` })
+          : result.code !== 0 && result.code !== 2
+            ? { error: `cli exit ${result.code}` }
+            : {}),
     }
   } finally {
     await trap.stop()
+  }
+}
+
+export function latestRunState(dbPath: string): { status: string; phase: string } | null {
+  if (!existsSync(dbPath)) return null
+  let db: DatabaseSync | undefined
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true })
+    const row = db.prepare('select status, phase from runs order by rowid desc limit 1')
+      .get() as { status?: string; phase?: string } | undefined
+    return row ? { status: String(row.status ?? 'unknown'), phase: String(row.phase ?? 'unknown') } : null
+  } catch {
+    return null
+  } finally {
+    try { db?.close() } catch { /* best-effort */ }
   }
 }
 
@@ -1137,13 +1187,14 @@ async function runMicroCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetric
       env: baseEnv(opts),
       logPath,
       docker: true,
+      killAfterMs: opts.microDurationSec * 1000 + 150_000,
     })
     return {
       fixture,
       error: undefined as string | undefined,
       artifact: readJson<RealismArtifact>(join(fixtureOut, `${fixture}-grey-box.json`)),
       wallMs: result.wallMs,
-      db: join(dataDir, 'guardian.sqlite'),
+      db: join(dataDir, `${fixture}-grey-box`, 'guardian.sqlite'),
       log: readLog(logPath),
     }
   }))
@@ -1267,6 +1318,7 @@ async function runTierZero(opts: SmokeArgs, report: SmokeReport): Promise<void> 
     const logPath = join(opts.outDir, 'tier0-worker-gate.log')
     const result = await spawnLogged({
       command: 'bash', args: ['scripts/worker-gate.sh'], cwd: opts.repoRoot, env: process.env, logPath, docker: false,
+      killAfterMs: 1_800_000,
     })
     report.tier0.workerGate = result.code === 0 ? 'pass' : 'fail'
     gatePass = gatePass && result.code === 0

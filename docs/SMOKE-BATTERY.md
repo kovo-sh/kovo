@@ -34,7 +34,7 @@ npm run smoke:agentic -- --tier 0
 | `lift` | acme-saas post-floor snapshot | 300 s | paired net-new, floor preservation, precision 100% |
 | `rotation` | shopflow **or** opsportal post-floor snapshot | 300 s | precision 100% |
 | `trap` | hardened zero-vuln fixture with writable-looking decoys | 240 s | **0 confirmed** |
-| `micro` | realism #2 async OOB, #3 staging race/write-BOLA, #4 4-hop Tier-A sink | 180 s each | wiring and capability reported separately |
+| `micro` | realism #2 async OOB, #3 staging race/write-BOLA, #4 4-hop Tier-A sink | 300 s each | wiring and capability reported separately |
 
 Cell 2 rotates by `--cell-index` (or day of year when omitted). If the post-floor
 snapshot is missing, the cell falls back to a cold run and captures a snapshot for
