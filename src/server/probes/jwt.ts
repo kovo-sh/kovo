@@ -183,7 +183,10 @@ export async function diffAuthProtocolAudit(
       let detected = false
       for (const field of candidates) {
         for (const payload of claimCandidates.slice(0, 2)) {
-          const control = forge(payload, 'HS256', true)
+          // Both tokens are self-minted and carry an empty signature: the broker only permits that
+          // shape (a real signed token would be blocked), and the control must still be rejected by
+          // the target because the signature is not valid for HS256.
+          const control = forge(payload, 'HS256', false)
           const probe = forge(payload, 'none', false)
           const request = (token: string): InjectedRequest => transport === 'body'
             ? { method: (req.method ?? 'POST'), pathAndQuery: req.pathAndQuery, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...(req.jsonBody ?? {}), [field]: token }) }

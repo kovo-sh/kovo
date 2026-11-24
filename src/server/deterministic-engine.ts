@@ -2108,7 +2108,20 @@ export function enumerateHypotheses(
       // value. Both are derived from the route family, never from a benchmark literal: the id pool
       // comes from the harvest and the readback is the collection GET above the mutation.
       const raceCollection = collectionPathOf(bare)
-      const raceRead = raceCollection
+      // A write that consumes a *referenced* resource (`productId` + `itemQty`) conserves that
+      // resource's stock, not the mutated route's own row. Prefer the referenced resource's detail
+      // read, derived from the identifier parameter's noun — never from an app name.
+      const foreignIdParam = (endpoint.params ?? [])
+        .find(param => /Id$/i.test(param.name) && !/^(?:cart|order|id)$/i.test(param.name))
+      const foreignNoun = foreignIdParam ? foreignIdParam.name.replace(/Id$/i, '') : null
+      const foreignRead = foreignNoun
+        ? endpoints.find(candidate => {
+            const candidatePath = candidate.pathTemplate.split('?')[0] || '/'
+            if (candidate.method.toUpperCase() !== 'GET' || !hasDynamicIdSegment(candidatePath)) return false
+            return new RegExp(`(?:^|/)${foreignNoun}s?(?:/|$)`, 'i').test(candidatePath)
+          })
+        : undefined
+      const raceRead = foreignRead ?? (raceCollection
         ? endpoints.find(candidate => candidate.method.toUpperCase() === 'GET' &&
             (candidate.pathTemplate.split('?')[0] || '/') === raceCollection) ??
           endpoints.find(candidate => {
@@ -2116,13 +2129,19 @@ export function enumerateHypotheses(
             return candidate.method.toUpperCase() === 'GET' &&
               candidatePath.startsWith(`${raceCollection}/`) && hasDynamicIdSegment(candidatePath)
           })
-        : undefined
+        : undefined)
       // The mutation route rarely harvests its own objects, so the id pool comes from the route's
-      // own harvest first and the collection read's harvest second (both are evidence, not guesses).
+      // own harvest first and the read collection's harvest second (both are evidence, not guesses).
       const collectionHarvest = raceRead ? harvests.get(raceRead.id) : undefined
-      const raceIds = [...(harvest?.otherIds ?? []), ...(collectionHarvest?.otherIds ?? [])]
+      const foreignCollection = foreignNoun
+        ? endpoints.find(candidate => candidate.method.toUpperCase() === 'GET' &&
+            new RegExp(`(?:^|/)${foreignNoun}s?$`, 'i').test((candidate.pathTemplate.split('?')[0] || '/')))
+        : undefined
+      const foreignHarvest = foreignCollection ? harvests.get(foreignCollection.id) : undefined
+      const raceIds = [...(harvest?.otherIds ?? []), ...(collectionHarvest?.otherIds ?? []), ...(foreignHarvest?.otherIds ?? [])]
         .filter((id, index, all) => /^[A-Za-z0-9_.:-]{1,64}$/.test(id) && all.indexOf(id) === index)
         .slice(0, 8)
+      const foreignId = foreignHarvest?.otherIds[0] ?? collectionHarvest?.otherIds[0] ?? null
       add({
         key: `race_burst|${endpoint.id}`,
         endpoint,
@@ -2134,9 +2153,12 @@ export function enumerateHypotheses(
         raceBurst: true,
         ...(raceIds.length > 0 ? { resourceIds: raceIds } : {}),
         ...(raceRead ? { readbackPath: raceRead.pathTemplate.split('?')[0] || '/' } : {}),
-        jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, undefined, coerceNumericBodies),
+        jsonBody: {
+          ...siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, undefined, coerceNumericBodies),
+          ...(foreignIdParam && foreignId ? { [foreignIdParam.name]: foreignId } : {}),
+        },
         risk: endpointRiskScore(endpoint) + (observedFields.some(field => /amount|quantity|qty|count|balance|stock/i.test(field)) ? 18 : 6) +
-          (conservedResourceRoute ? 20 : 0),
+          (conservedResourceRoute ? 45 : 0),
       })
     }
 
@@ -2522,7 +2544,7 @@ export function enumerateHypotheses(
     // global hypothesis cap is reached.
     authz: 26, secret_disclosure: 5, graphql: 2, xxe: 5, ssrf: 7, traversal: 6, redirect: 6,
     xss: 6, mass_assignment: 6, csrf: 4, cache: 2, stored_xss: 2, workflow: 3, webhook: 2,
-    auth_protocol: 2, ssti: 3, command_injection: 3, sqli: 10,
+    auth_protocol: 2, ssti: 3, command_injection: 3, sqli: 10, race: 8,
   }
   const baseMax = options.maxHypotheses ?? defaultEngineMaxHypotheses
   // A probe costs ~11 requests (control/probe variants + read-back). Spend the request budget
@@ -4143,8 +4165,9 @@ export async function probeRaceDoubleSpend(
   const adminPersona = input.personas.find(persona => persona.privilege === 'admin')?.handle
   const readbackCandidates: Array<{ path: string; persona?: string }> = []
   if (hyp.readbackPath) {
-    readbackCandidates.push({ path: hyp.readbackPath })
-    if (adminPersona && adminPersona !== hyp.ownerPersona) readbackCandidates.push({ path: hyp.readbackPath, persona: adminPersona })
+    const readPath = substituteId(hyp.readbackPath, resolvedId)
+    readbackCandidates.push({ path: readPath })
+    if (adminPersona && adminPersona !== hyp.ownerPersona) readbackCandidates.push({ path: readPath, persona: adminPersona })
   }
   if (resolvedId) {
     readbackCandidates.push({ path: racePath.split('?')[0]! })
@@ -4170,8 +4193,50 @@ export async function probeRaceDoubleSpend(
       if (raceOrigin) break
     }
     if (raceOrigin) {
-      amountField = Object.keys(hyp.jsonBody ?? {})
-        .find(field => /^(?:amount|value|quantity|qty|count|units|seats|credits|total)$/i.test(field)) ?? null
+      // The request field that moves the conserved value: the harvest body first, then the route's
+      // declared parameters (an openapi redemption route declares `amount` even when the collection
+      // row exposes only `balance`).
+      const amountish = (field: string): boolean => /^(?:item_?|line_?|requested_?|reserved_?|redeem_?)?(?:amount|value|quantity|qty|count|units|seats|credits|points|total|redeem)$/i.test(field)
+      amountField = Object.keys(hyp.jsonBody ?? {}).find(amountish)
+        ?? (hyp.endpoint.params ?? []).map(param => param.name).find(name => amountish(name) && name !== balanceField)
+        ?? null
+      if (!amountField) {
+        // Last structural resort: a conserved-value write often names its request field after the
+        // value it moves (`balance`, `stock`). It is still the probe's own numeric field, verified
+        // by the same readback oracle.
+        amountField = (hyp.endpoint.params ?? []).map(param => param.name).find(name => name === balanceField) ?? null
+      }
+      if (!amountField) {
+        // Declared schema often omits the body field. Learn it from one non-destructive discovery
+        // request per candidate (value 1) and the readback delta — the same bounded shape probe the
+        // legacy path uses, now driven by the read-only baseline.
+        const candidates = Object.keys(hyp.jsonBody ?? {})
+          .filter(name => typeof (hyp.jsonBody as Record<string, unknown>)[name] === 'string')
+          .slice(0, 6)
+        const discovery = [...new Set([...candidates, 'amount', 'value', 'quantity', 'qty', 'count', 'units', 'credits', 'points'])]
+        const readConserved = async (): Promise<number | null> => {
+          if (!hyp.readbackPath) return null
+          const read = await sendGet(raceOrigin!, substituteId(hyp.readbackPath, resolvedId))
+          const parsed = read ? readableRecord(read.body) : null
+          if (!parsed) return null
+          return numericEntries(parsed).find(([field]) => field === balanceField)?.[1]
+            ?? numericEntries(parsed).find(([field]) => /balance|remaining|available|stock|on_?hand|quantity|credits?|points?/i.test(field))?.[1]
+            ?? null
+        }
+        for (const candidate of discovery.slice(0, 8)) {
+          const before = await readConserved()
+          const attempt = await send(raceOrigin!, { [candidate]: 1 })
+          if (!attempt || attempt.status < 200 || attempt.status >= 300) continue
+          const after = await readConserved()
+          const parsed = jsonRecordOf(attempt.body)
+          const echo = numericEntries(parsed).find(([field, value]) => value === 1 && /transfer|debit|charge|amount|count|redeem|used|quantity|qty|reserved/i.test(field))
+          if (echo || (before !== null && after !== null && before - after === 1)) {
+            amountField = candidate
+            transferredField = echo?.[0] ?? null
+            break
+          }
+        }
+      }
     }
   }
 
@@ -4225,7 +4290,9 @@ export async function probeRaceDoubleSpend(
       durationMs: Date.now() - started,
     }
   }
-  if (!transferredField) {
+  if (!transferredField && !hyp.readbackPath) {
+    // Legacy shape discovery only: with a readback the acknowledged transfer is ack-count x amount,
+    // so no extra mutating probe is sent.
     const zero = await send(raceOrigin, { [amountField]: 0 })
     const zeroRecord = zero ? jsonRecordOf(zero.body) : null
     transferredField = numericEntries(zeroRecord).find(([field]) => /transfer|debit|charge|amount|count|redeem|used|quantity|qty/i.test(field))?.[0] ?? null
@@ -4237,7 +4304,15 @@ export async function probeRaceDoubleSpend(
     if (hyp.readbackPath) {
       const read = await sendGet(raceOrigin!, hyp.readbackPath)
       const parsed = read ? readableRecord(read.body) : null
-      const value = parsed ? numericEntries(parsed).find(([field]) => field === balanceField)?.[1] : undefined
+      const conserved = (record: Record<string, unknown> | null): number | undefined => {
+        if (!record) return undefined
+        const exact = numericEntries(record).find(([field]) => field === balanceField)?.[1]
+        if (exact !== undefined) return exact
+        // The readback may name the conserved value differently from the collection row
+        // (`remaining` vs `balance`), so fall back to the semantic family.
+        return numericEntries(record).find(([field]) => /balance|remaining|available|stock|on_?hand|quantity|credits?|points?/i.test(field))?.[1]
+      }
+      const value = conserved(parsed)
       if (value !== undefined) return value
     }
     const read = await send(raceOrigin!, { [amountField!]: 0 })
@@ -4255,6 +4330,14 @@ export async function probeRaceDoubleSpend(
   // acknowledged and a racy one debits less; falling back to 1 keeps the classic single-ticket
   // over-count arm intact.
   const burstAmount = Math.max(1, Math.min(Math.floor(pre / (burstSize * 2)), burstSize))
+  // Keep only the route's *declared* body fields (a referencing identifier such as `productId`);
+  // harvested row fields must not be replayed into a write. Only the conserved-value field varies.
+  const declaredBodyFields = new Set((hyp.endpoint.params ?? []).map(param => param.name))
+  const declaredBody: Record<string, unknown> = {}
+  for (const [name, value] of Object.entries(hyp.jsonBody ?? {})) {
+    if (declaredBodyFields.has(name) && name !== amountField) declaredBody[name] = value
+  }
+  const amountBody = (value: number): Record<string, unknown> => ({ ...declaredBody, [amountField!]: value })
   const grant = input.grant
   let burst: Awaited<ReturnType<RequestBroker['executeRaceBurst']>>
   try {
@@ -4264,7 +4347,7 @@ export async function probeRaceDoubleSpend(
         method: 'POST' as const,
         pathAndQuery: hyp.pathAndQuery.split('?')[0]!,
         headers: { 'Content-Type': 'application/json', ...(hyp.headers ?? {}) },
-        body: JSON.stringify({ [amountField!]: burstAmount }),
+        body: JSON.stringify(amountBody(burstAmount)),
         persona: hyp.ownerPersona,
       })),
       grant,
@@ -4291,7 +4374,8 @@ export async function probeRaceDoubleSpend(
   }
   const burstRecords = burst.results.map(result => jsonRecordOf(result.body))
   const burstObserved = burstRecords
-    .map(rec => numericEntries(rec).find(([field]) => field === balanceField)?.[1])
+    .map(rec => numericEntries(rec).find(([field]) => field === balanceField)?.[1]
+      ?? numericEntries(rec).find(([field]) => /balance|remaining|available|stock|on_?hand|quantity|credits?|points?/i.test(field))?.[1])
     .filter((value): value is number => value !== undefined)
   const burstAcks = burst.results.filter(result => result.status >= 200 && result.status < 300).length
   // Acknowledged transfer: prefer an explicit echo of the transferred field; otherwise every 2xx
@@ -4304,7 +4388,7 @@ export async function probeRaceDoubleSpend(
   // Serial control: the same N requests one at a time must debit N. Read the conserved value again.
   let serialAcks = 0
   for (let i = 0; i < burstSize; i += 1) {
-    const serial = await send(raceOrigin, { [amountField]: burstAmount })
+    const serial = await send(raceOrigin, amountBody(burstAmount))
     if (serial && serial.status >= 200 && serial.status < 300) serialAcks += 1
   }
   const serialPost = await readBalance()
@@ -4709,6 +4793,48 @@ async function rehomeDeclaredSurface(
   }
 }
 
+/**
+ * Triage prefix: the canonical ranking with a stable reservation for the target's **declared**
+ * surface. Generated wordlist routes score high on generic risk and can fill every slot, which is
+ * how a declared reporting read or checkout write never reached a hypothesis.
+ */
+export function engineTriagePrefix(
+  endpoints: readonly EngineEndpoint[],
+  limit: number = defaultEngineMaxEndpoints,
+): EngineEndpoint[] {
+  const rankedAll = rankEndpoints(collapseRouteVariants(endpoints))
+  const declaredRanked = rankedAll.filter(endpoint => endpoint.source !== 'conventional')
+  const reservedCount = Math.min(declaredRanked.length, Math.max(24, Math.floor(limit * 0.35)))
+  const reserved = declaredRanked.slice(0, reservedCount)
+  const reservedIds = new Set(reserved.map(endpoint => endpoint.id))
+  return [
+    ...reserved,
+    ...rankedAll.filter(endpoint => !reservedIds.has(endpoint.id)),
+  ].slice(0, limit)
+}
+
+/** A response-identical (or empty-row) boolean arm is the signature of a blind timing sink. */
+export function shouldScheduleTimingFollowUp(input: {
+  probeClass: string
+  verdict: string
+  summary: string
+  hasParam: boolean
+  location?: string | null
+  /** Observed shape of the parameter (url/path/xml/jwt/number/text/...). */
+  paramShape?: string | null
+  routePath?: string | null
+}): boolean {
+  if (input.probeClass !== 'sqli_boolean' || !input.hasParam) return false
+  if (input.location !== 'query' && input.location !== 'json' && input.location !== 'form') return false
+  if (input.verdict !== 'no_signal' &&
+      !(input.verdict === 'inconclusive' && /no rows|empty (?:arm|result|response)/i.test(input.summary))) return false
+  // A URL/host/path/XML/JWT carrier is an SSRF/XXE/OOB sink, not a SQL string literal; spending the
+  // single follow-up there starves the real search sink.
+  if (input.paramShape && /^(?:url|path|xml|jwt|hostname|host)$/i.test(input.paramShape)) return false
+  if (input.routePath && /(?:webhook|hook|callback|fetch|import|upload|preview|redirect)/i.test(input.routePath)) return false
+  return true
+}
+
 export async function runDeterministicEngine(input: DeterministicEngineInput): Promise<DeterministicEngineReport> {
   const started = Date.now()
   const maxRequests = Math.max(0, input.maxRequests ?? defaultEngineMaxRequests)
@@ -4750,7 +4876,11 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
   if (!conventionalWordlist && candidateEndpoints.length !== input.endpoints.length) {
     report.notes.push(`conventional wordlist OFF: ${input.endpoints.length - candidateEndpoints.length} wordlist-only endpoint(s) excluded`)
   }
-  const ranked = rankEndpoints(collapseRouteVariants(candidateEndpoints)).slice(0, input.maxEndpoints ?? defaultEngineMaxEndpoints)
+  // Reserve part of the triage prefix for the target's **declared** surface. Generated wordlist
+  // routes score high on generic risk and can fill all 120 slots, which is how declared openapi
+  // endpoints (a reporting read, a checkout write) never got a hypothesis. The reservation is a
+  // stable partition over the canonical ranking, so determinism is unchanged.
+  const ranked = engineTriagePrefix(candidateEndpoints, input.maxEndpoints ?? defaultEngineMaxEndpoints)
   report.endpointsConsidered = ranked.length
   if (ranked.length === 0) {
     report.durationMs = Date.now() - started
@@ -4902,8 +5032,13 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
   // Bounded blind-SQLi follow-ups: a response-identical boolean arm is the signature of a sink whose
   // oracle is time, not content, so one timing probe is scheduled for that parameter.
   let timingFollowUps = 0
+  // One follow-up per endpoint+parameter (a route may try several text params, and only some reach
+  // the injection sink), bounded per run and only while most of the budget is unspent: a blind-sink
+  // probe costs ~40 exchanges and must never starve a later target's verification.
   const maxTimingFollowUps = 3
-  for (const hyp of probeQueue) {
+  const timingFollowUpBudgetFloor = Math.max(300, Math.floor(maxRequests * 0.2))
+  for (let queueIndex = 0; queueIndex < probeQueue.length; queueIndex += 1) {
+    const hyp = probeQueue[queueIndex]!
     if (input.signal.aborted) { report.stoppedReason = 'aborted'; break }
     if (Date.now() - started >= hardDeadlineMs) { report.stoppedReason = 'time'; break }
     if (budget.requestsUsed >= maxRequests) { report.stoppedReason = 'budget'; break }
@@ -5011,16 +5146,24 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     })
     if (probe.verdict !== 'signal') {
       if (!input.probe &&
-          hyp.probeClass === 'sqli_boolean' &&
-          probe.verdict === 'no_signal' &&
+          shouldScheduleTimingFollowUp({
+            probeClass: hyp.probeClass,
+            verdict: probe.verdict,
+            summary: probe.summary,
+            hasParam: Boolean(hyp.param),
+            location: hyp.location ?? null,
+            paramShape: hyp.param ? (harvests.get(hyp.endpoint.id)?.shapes?.[hyp.param.name] ?? null) : null,
+            routePath: hyp.endpoint.pathTemplate,
+          }) &&
           hyp.param &&
-          (hyp.location === 'query' || hyp.location === 'json' || hyp.location === 'form') &&
           timingFollowUps < maxTimingFollowUps &&
-          maxRequests - budget.requestsUsed >= perProbeRequestFloor * 2) {
+          maxRequests - budget.requestsUsed >= timingFollowUpBudgetFloor) {
         const followKey = `sqli_time_diff|${hyp.endpoint.id}|${hyp.param.name}`
         if (!probeQueue.some(item => item.key === followKey)) {
           timingFollowUps += 1
-          probeQueue.push({ ...hyp, key: followKey, probeClass: 'sqli_time_diff', intent: 'sqli' })
+          // Run it immediately: a blind sink must be measured before unrelated probes spend the
+          // remaining budget (this is what kept the follow-up from ever running on a tight cell).
+          probeQueue.splice(queueIndex + 1, 0, { ...hyp, key: followKey, probeClass: 'sqli_time_diff', intent: 'sqli' })
           log('deterministic_engine.sqli_time_followup',
             `sqli_boolean returned no_signal on ${hyp.method} ${hyp.endpoint.pathTemplate} param=${hyp.param.name}; scheduling one time-based follow-up.`,
             { endpoint: hyp.endpoint.pathTemplate, method: hyp.method, param: hyp.param.name, scheduled: timingFollowUps })

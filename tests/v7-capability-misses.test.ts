@@ -16,8 +16,10 @@ import { describe, test } from 'node:test'
 import {
   classifyRaceMode,
   endpointRiskScore,
+  engineTriagePrefix,
   enumerateHypotheses,
   probeRaceDoubleSpend,
+  shouldScheduleTimingFollowUp,
 } from '../src/server/deterministic-engine.ts'
 import type {
   DeterministicEngineInput,
@@ -424,5 +426,238 @@ describe('capability-misses: blind SQLi timing follow-up', () => {
     assert.equal(args.mode, 'timing')
     assert.equal(args.receiptClass, 'blind_sqli')
     assert.match(String(args.probePathAndQuery), /BLOB/i)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Regression shapes from the bench-verifier findings
+// ---------------------------------------------------------------------------
+
+describe('capability-misses: declared-surface triage prefix', () => {
+  test('a declared reporting read survives a wall of generated wordlist routes', () => {
+    const generated = Array.from({ length: 200 }, (_, index) =>
+      endpoint({ method: 'GET', pathTemplate: `/v4/generated/${index}/items`, riskScore: 95, source: 'conventional' }))
+    const declared = endpoint({ method: 'GET', pathTemplate: '/api/v1/reports/sales', riskScore: 45, source: 'openapi' })
+    const prefix = engineTriagePrefix([...generated, declared], 120)
+    assert.equal(prefix.length, 120)
+    assert.ok(prefix.some(item => item.pathTemplate === '/api/v1/reports/sales'), 'declared route must be inside the prefix')
+    assert.deepEqual(engineTriagePrefix([...generated, declared], 120).map(item => item.id), prefix.map(item => item.id))
+  })
+
+  test('a declared checkout write survives the same generated wall', () => {
+    const generated = Array.from({ length: 200 }, (_, index) =>
+      endpoint({ method: 'POST', pathTemplate: `/v4/generated/${index}/actions`, riskScore: 95, source: 'conventional' }))
+    const checkout = endpoint({ method: 'POST', pathTemplate: '/api/v1/bags/:cartId/checkout', riskScore: 65, source: 'openapi' })
+    const prefix = engineTriagePrefix([...generated, checkout], 120)
+    assert.ok(prefix.some(item => item.pathTemplate === '/api/v1/bags/:cartId/checkout'))
+  })
+})
+
+describe('capability-misses: blind-sink follow-up predicate', () => {
+  test('empty-row boolean arms schedule a timing follow-up', () => {
+    assert.equal(shouldScheduleTimingFollowUp({
+      probeClass: 'sqli_boolean',
+      verdict: 'inconclusive',
+      summary: 'Every boolean arm returned no rows; the operand could not be grounded through this sink.',
+      hasParam: true,
+      location: 'query',
+    }), true)
+  })
+
+  test('a URL/XXE/import carrier does not consume the single follow-up', () => {
+    const base = { probeClass: 'sqli_boolean', verdict: 'no_signal' as const, summary: '', hasParam: true, location: 'query' as const }
+    assert.equal(shouldScheduleTimingFollowUp({ ...base, paramShape: 'url' }), false)
+    assert.equal(shouldScheduleTimingFollowUp({ ...base, routePath: '/v1/integrations/webhook-test' }), false)
+    assert.equal(shouldScheduleTimingFollowUp({ ...base, routePath: '/v1/catalog/search', paramShape: 'text' }), true)
+  })
+
+  test('a signal, a non-sqli class, or a non-text location does not', () => {
+    assert.equal(shouldScheduleTimingFollowUp({ probeClass: 'sqli_boolean', verdict: 'signal', summary: '', hasParam: true, location: 'query' }), false)
+    assert.equal(shouldScheduleTimingFollowUp({ probeClass: 'ssti_math', verdict: 'no_signal', summary: '', hasParam: true, location: 'query' }), false)
+    assert.equal(shouldScheduleTimingFollowUp({ probeClass: 'sqli_boolean', verdict: 'no_signal', summary: '', hasParam: true, location: 'header' }), false)
+    assert.equal(shouldScheduleTimingFollowUp({ probeClass: 'sqli_boolean', verdict: 'no_signal', summary: '', hasParam: false, location: 'query' }), false)
+  })
+})
+
+describe('capability-misses: gift-card redemption shape', () => {
+  test('the amount field comes from declared route params when the row exposes only balance', async () => {
+    const state = { balance: 5000 }
+    const posted: Array<Record<string, unknown>> = []
+    const hypothesis = {
+      ...raceHypothesisFor(),
+      endpoint: endpoint({
+        method: 'POST',
+        pathTemplate: '/api/v1/store-credit/:creditId/redeem',
+        riskScore: 70,
+        params: [{ name: 'amount', location: 'json' }],
+      }),
+      pathAndQuery: '/api/v1/store-credit/{{id}}/redeem',
+      jsonBody: { external_id: 'gc-1', code: 'GC-1', balance: '5000' },
+      resourceIds: ['gc-1'],
+      readbackPath: '/api/v1/store-credit/gc-1',
+    }
+    const broker = {
+      httpTransport: { isHttp2Enabled: () => true },
+      executeHttp: async (req: { method: string; pathAndQuery: string; body?: string }) => {
+        const ex = (status: number, json: unknown) => ({ status, method: req.method, pathAndQuery: req.pathAndQuery, body: JSON.stringify(json), headers: {}, durationMs: 1, bytes: 1 }) as never
+        if (req.method.toUpperCase() === 'GET') {
+          if (req.pathAndQuery === '/api/v1/store-credit/gc-1') return ex(200, { external_id: 'gc-1', code: 'GC-1', balance: state.balance })
+          return ex(404, {})
+        }
+        const body = JSON.parse(req.body ?? '{}') as Record<string, unknown>
+        posted.push(body)
+        const amount = Number(body.amount ?? 0)
+        if (amount === 0) return ex(200, { ok: true, remaining: state.balance })
+        if (amount > state.balance) return ex(409, { error: 'insufficient_balance', balance: state.balance })
+        state.balance -= amount
+        return ex(200, { ok: true, redeemed: amount, remaining: state.balance })
+      },
+      executeRaceBurst: async (requests: Array<{ method: string; pathAndQuery: string; body: string }>) => {
+        const amount = Number((JSON.parse(requests[0]?.body ?? '{}') as { amount?: number }).amount ?? 0)
+        state.balance -= amount
+        const shared = state.balance + amount * (requests.length - 1)
+        return {
+          summary: { spreadMs: 2, statusCounts: { '200': requests.length } },
+          results: requests.map(req => ({ status: 200, method: req.method, pathAndQuery: req.pathAndQuery, body: JSON.stringify({ ok: true, redeemed: amount, remaining: shared }), headers: {}, durationMs: 1, bytes: 1 }) as never),
+        }
+      },
+    } as unknown as DeterministicEngineInput['broker']
+    const input = {
+      runId: 'run-giftcard',
+      assignmentId: 'asg-giftcard',
+      signal: new AbortController().signal,
+      endpoints: [hypothesis.endpoint],
+      personas,
+      broker,
+      grant: {} as never,
+      backend: {} as never,
+      tier: 3,
+      environmentMode: 'ephemeral_lab',
+    } as unknown as DeterministicEngineInput
+    const result = await probeRaceDoubleSpend(hypothesis as never, input, () => undefined)
+    assert.equal(result.verdict, 'signal', result.summary)
+    assert.ok(posted.every(body => 'amount' in body), 'the declared amount field must be the request field')
+    assert.ok(posted.every(body => !('external_id' in body || 'code' in body || 'balance' in body)), 'harvested row fields must not leak into the request body')
+  })
+})
+
+describe('capability-misses: inventory checkout shape', () => {
+  test('the race targets the referenced product stock, not the cart row', () => {
+    const surface = [
+      endpoint({ method: 'GET', pathTemplate: '/api/v1/products', riskScore: 50 }),
+      endpoint({ method: 'GET', pathTemplate: '/api/v1/products/:id', riskScore: 55 }),
+      endpoint({
+        method: 'POST',
+        pathTemplate: '/api/v1/bags/:cartId/checkout',
+        riskScore: 65,
+        params: [{ name: 'productId', location: 'json' }, { name: 'itemQty', location: 'json' }],
+      }),
+    ]
+    const harvests = new Map<string, EndpointHarvest>([
+      ['GET:/api/v1/products', harvest({ otherIds: ['prod-1'], fields: ['stock'], values: { stock: ['10'] } })],
+    ])
+    const race = enumerateHypotheses(surface, harvests, { tier: 3, personas, environmentMode: 'ephemeral_lab' })
+      .find(candidate => candidate.raceBurst)
+    assert.ok(race, 'checkout forms a race hypothesis')
+    assert.equal(race!.readbackPath, '/api/v1/products/:id', 'readback must be the referenced product detail')
+    assert.equal((race!.jsonBody as Record<string, unknown>).productId, 'prod-1')
+  })
+
+  test('the burst reads product stock and debits it once against four acknowledgements', async () => {
+    const state = { stock: 100 }
+    const posted: Array<Record<string, unknown>> = []
+    const hypothesis: EngineHypothesis = {
+      key: 'race_burst|POST:/api/v1/bags/:cartId/checkout',
+      endpoint: endpoint({
+        method: 'POST',
+        pathTemplate: '/api/v1/bags/:cartId/checkout',
+        riskScore: 65,
+        params: [{ name: 'productId', location: 'json' }, { name: 'itemQty', location: 'json' }],
+      }),
+      probeClass: 'workflow_invariant',
+      intent: 'race',
+      method: 'POST',
+      pathAndQuery: '/api/v1/bags/{{id}}/checkout',
+      ownerPersona: 'owner',
+      raceBurst: true,
+      resourceIds: ['cart-1'],
+      readbackPath: '/api/v1/products/:id',
+      jsonBody: { productId: 'prod-1', itemQty: '1' },
+      risk: 85,
+    }
+    const broker = {
+      httpTransport: { isHttp2Enabled: () => true },
+      executeHttp: async (req: { method: string; pathAndQuery: string; body?: string }) => {
+        const ex = (status: number, json: unknown) => ({ status, method: req.method, pathAndQuery: req.pathAndQuery, body: JSON.stringify(json), headers: {}, durationMs: 1, bytes: 1 }) as never
+        if (req.method.toUpperCase() === 'GET') return ex(200, { id: 'prod-1', stock: state.stock })
+        const body = JSON.parse(req.body ?? '{}') as Record<string, unknown>
+        posted.push(body)
+        const qty = Number(body.itemQty ?? 0)
+        if (qty === 0) return ex(200, { stock: state.stock })
+        if (qty > state.stock) return ex(409, { error: 'out_of_stock', stock: state.stock })
+        state.stock -= qty
+        return ex(201, { id: 'ord-1', reserved: qty })
+      },
+      executeRaceBurst: async (requests: Array<{ method: string; pathAndQuery: string; body: string }>) => {
+        const qty = Number((JSON.parse(requests[0]?.body ?? '{}') as { itemQty?: number }).itemQty ?? 0)
+        state.stock -= qty // racy: one reservation for every acknowledgement
+        const shared = state.stock + qty * (requests.length - 1)
+        return {
+          summary: { spreadMs: 2, statusCounts: { '201': requests.length } },
+          results: requests.map(req => ({ status: 201, method: req.method, pathAndQuery: req.pathAndQuery, body: JSON.stringify({ id: 'ord-1', reserved: qty, stock: shared }), headers: {}, durationMs: 1, bytes: 1 }) as never),
+        }
+      },
+    } as unknown as DeterministicEngineInput['broker']
+    const input = {
+      runId: 'run-inventory',
+      assignmentId: 'asg-inventory',
+      signal: new AbortController().signal,
+      endpoints: [hypothesis.endpoint],
+      personas,
+      broker,
+      grant: {} as never,
+      backend: {} as never,
+      tier: 3,
+      environmentMode: 'ephemeral_lab',
+    } as unknown as DeterministicEngineInput
+    const result = await probeRaceDoubleSpend(hypothesis as never, input, () => undefined)
+    assert.equal(result.verdict, 'signal', result.summary)
+    assert.ok(posted.every(body => 'productId' in body && 'itemQty' in body), 'the referenced product and quantity must be sent')
+  })
+})
+
+describe('capability-misses: JWT control transport', () => {
+  test('the control token is self-minted (empty signature) yet still rejected by the target', async () => {
+    process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+    const seen: string[] = []
+    const { diffAuthProtocolAudit } = await import('../src/server/probes/jwt.ts')
+    const ctx = {
+      req: {
+        probeClass: 'auth_protocol_audit',
+        origin: 'http://127.0.0.1:4100',
+        pathAndQuery: '/api/v1/reports/sales',
+        method: 'GET',
+        identityClaims: { tenant: 'store-a', store: 'store-a', sub: 'owner' },
+      },
+      origin: 'http://127.0.0.1:4100',
+      runner: {} as never,
+      notes: [],
+      anomalies: [] as Array<Record<string, unknown>>,
+      send: async (req: { headers?: Record<string, string> }) => {
+        const token = (req.headers?.Authorization ?? '').replace(/^Bearer\s+/i, '')
+        seen.push(token)
+        const [header] = token.split('.')
+        const alg = JSON.parse(Buffer.from(header ?? '', 'base64url').toString('utf8')).alg
+        const sig = token.split('.')[2] ?? ''
+        // Fixture semantics: an empty signature is invalid for HS256; alg:none is accepted and
+        // returns a data-bearing report.
+        if (alg === 'HS256' || sig !== '') return { status: 401, body: '{"error":"unauthorized"}', headers: {}, durationMs: 1 } as never
+        return { status: 200, body: '{"store":"store-a","report":{"orders":3,"gross":100}}', headers: {}, durationMs: 1 } as never
+      },
+    } as never
+    const outcome = await diffAuthProtocolAudit(ctx, undefined, { allowLocalLab: true, tier: 3 } as never)
+    assert.equal(outcome.verdict, 'signal', outcome.summary)
+    assert.ok(seen.length >= 2)
+    assert.ok(seen.every(token => token.split('.').length === 3 && (token.split('.')[2] ?? '') === ''), 'all tokens must be empty-signature')
   })
 })
