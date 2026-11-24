@@ -797,3 +797,22 @@ Fix (`deterministic-specs.ts` only): join the halves with an **empty command sub
 Measured: dev **36/59** (opsportal 9/18 → **10/18**, `og.diag-cmdi` via `rce_proof`, `splitEchoVerified=true`), opsportal 4 repeats all 10/18 (**0 spread**), held-out **28/58** (opsportal `og.diag-cmdi` confirms there too), xben 25/25, held-out-saas 20/20 + 20/20 patches.
 
 **Lesson recorded:** a stricter oracle can cost a *deterministic* target, and the loss often presents as a template/ordering symptom rather than a missing rule. Re-measuring the floor after every verifier merge is what caught it.
+
+### 2026-11-24 — first 3-app held-out agentic run at **100% precision** (29/58, +1 over floor)
+
+`/tmp/heldout-final`, salted seed 1000042, 600 s, K=6, docker, kept dirs (serialized after the tmpfs/`process-lock` failures):
+
+| cell | unified | floor | precision | investigations |
+|---|---|---|---|---|
+| acme | 11/22 | 11 | **100%** | 15 of 29 |
+| shopflow | **11/19** | 10 | **100%** | 11 of 29 |
+| opsportal | 7/17 | 7 | **100%** | 13 of 22 |
+| **total** | **29/58 (50.0%)** | **28/58** | **100%** (0 unmatched, 0 decoy) | 39 investigations |
+
+**Milestone:** the precision blocker is closed on a full held-out agentic matrix — every over-claim family ruled and gated, `audit-confirmation-consistency` clean, worst-run precision **100%**. That is the first held-out agentic run this cycle that can be quoted for precision.
+
+**Still red:** Total Product Recall (needs ≥32/58, we have 29) and the anti-inert guard (needs ≥+4 net-new, we have **+1**, shopflow only). Acme and opsportal add nothing over their floor despite 15 and 13 investigations.
+
+**Infrastructure lessons (both cost runs):**
+1. `/tmp` is a 15 GB tmpfs; accumulated benchmark dirs filled it (`EDQUOT`). Keep dirs only for cells under triage; clean after extracting evidence.
+2. The model-profile data dir takes `BEGIN EXCLUSIVE` on `process-lock.sqlite`, so **agentic runs are globally serialized** on this host. Floor (`--no-llm`) runs do not need the profile and can still run in parallel. Concurrent agentic runs were also a source of earlier p50 noise.
