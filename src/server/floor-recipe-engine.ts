@@ -280,8 +280,43 @@ function fillResourceId(pathAndQuery: string, id: string): string {
 }
 
 function resourceIdOf(input: FloorRecipePlanInput): string | null {
-  const id = input.hypothesis.resourceIds?.find(value => /^[A-Za-z0-9_.:-]{1,128}$/.test(value))
-  return id ?? null
+  const valid = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(value)
+  const matrix = Array.isArray(input.probe.details.matrix)
+    ? input.probe.details.matrix as Array<Record<string, unknown>>
+    : null
+  // The differential probe reports one anomaly per (method, object). Prefer the object whose owner
+  // read carried the most data: an empty-but-2xx collection is a legal matrix row, but it can never
+  // satisfy the read differential (the bogus-id control returns the same empty body). Legacy ranked
+  // hits by similarity; body size is the stable tie-breaker that survives an all-1.0 similarity.
+  const ownerBytes = (id: string): number => {
+    if (!matrix) return 0
+    let best = 0
+    for (const row of matrix) {
+      if (String(row.resourceId ?? '') !== id) continue
+      if (String(row.actor ?? '') !== 'owner') continue
+      if (row.accessible !== true) continue
+      const status = typeof row.status === 'number' ? row.status : 0
+      if (status < 200 || status >= 300) continue
+      const bytes = typeof row.bodyBytes === 'number' ? row.bodyBytes : 0
+      if (bytes > best) best = bytes
+    }
+    return best
+  }
+  const candidates = input.probe.anomalies
+    .filter(anomaly => anomaly.type === 'unauthorized_access' &&
+      String(anomaly.method ?? 'GET').toUpperCase() === input.hypothesis.method &&
+      valid(anomaly.resourceId))
+    .map(anomaly => anomaly.resourceId as string)
+  if (candidates.length > 0) {
+    let best = candidates[0]!
+    let bestBytes = ownerBytes(best)
+    for (const candidate of candidates.slice(1)) {
+      const bytes = ownerBytes(candidate)
+      if (bytes > bestBytes) { best = candidate; bestBytes = bytes }
+    }
+    return best
+  }
+  return input.hypothesis.resourceIds?.find(valid) ?? null
 }
 
 /** Readback route for a mutation, mirroring the legacy synthesizer's choice set. */
