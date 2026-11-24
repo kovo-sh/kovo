@@ -72,6 +72,8 @@ export interface AssignmentBriefConfirmedRef {
   param?: string | null
   cwe?: string | null
   origin?: string | null
+  /** Read-only finding id so a worker can cite a confirmed floor finding as a chain primitive. */
+  findingId?: string | null
 }
 
 export interface AssignmentBriefDetLead {
@@ -260,11 +262,13 @@ function sortRoutes(routes: readonly AssignmentBriefRoute[]): AssignmentBriefRou
 function normalizeConfirmed(ref: AssignmentBriefConfirmedRef): Record<string, unknown> {
   const param = cleanParamName(ref.param ?? '')
   const cwe = typeof ref.cwe === 'string' ? ref.cwe.trim().replace(/[^A-Za-z0-9-]/g, '').slice(0, 24) : ''
+  const findingId = typeof ref.findingId === 'string' ? cleanText(ref.findingId, 64) : ''
   return {
     method: (ref.method || 'GET').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 10) || 'GET',
     path: cleanPath(ref.path),
     ...(param ? { param } : {}),
     ...(cwe ? { cwe } : {}),
+    ...(findingId ? { findingId } : {}),
   }
 }
 
@@ -620,7 +624,7 @@ export function renderSettlementSpecDirective(
   const codes = proofGapCodes.map(code => cleanText(code, 40)).filter(Boolean).slice(0, 8).join(', ')
   return [
     `[PROOF OBLIGATION — settlement] Your route evidence is ${route}.`,
-    'This wrap-up turn is reserved: submit ONE guardian_verify replay spec for that route before complete_intent.',
+    'This wrap-up turn is reserved: submit ONE guardian_verify inline script (ctx.prove_*) or replay spec for that route before complete_intent.',
     `Smallest valid spec: ${specShape}`,
     `If no valid spec can be built, call record_coverage(status="needs_follow_up", proofGapReason="<code>") with a machine-readable code (${codes}) instead of silently skipping.`,
   ].join(' ')
