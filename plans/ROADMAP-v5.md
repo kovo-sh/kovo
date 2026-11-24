@@ -601,3 +601,13 @@ xben stayed 25/25 (the probe maps `tautology` → `or_branch` so legacy builders
 Validation on the reduced tree: dev **34/59** (3 runs, 0 spread, 100%), xben 25/25, held-out-saas 20/20 + 20/20 patches, held-out **24/58** @100%. Dev shopflow confirms `/api/v1/search` sqli through `boolean_or_timing` (`deterministic_engine.recipe_confirmed`).
 
 **Sharpened held-out diagnosis:** `/api/v1/search` *does* declare a param (`searchQuery`); the floor still never creates an `sqli_boolean` hypothesis for it (only `mass_assignment` probes the route). So the gap is **param anchoring for a class**, not necessarily param discovery — `param-discovery` has been asked to distinguish (A) missing param vs (B) present-but-not-anchored and to report the rejecting predicate if it lives outside its lease.
+
+### 2026-11-24 — precision invariant merged (certification blocker #1 closed forward)
+
+`confirm-consistency` (merged `72c9cc2`):
+- **Store-level invariant**: a finding can no longer persist `runtime_confirmed` (or `status = confirmed`) unless the cited receipt/replay verdict is confirming. `replayVerdictConfirmsRuntime()` + `InvariantError('invariant.confirmation_evidence')` at the single chokepoint used by inline replay, floor confirmations and receipt promotion. Typed exception, not a silent skip.
+- `execution.ts` demotes/removes a finding when a later downgrade arrives, and emits a loud `finding.confirmation_conflict` event that is counted.
+- `scripts/audit-confirmation-consistency.ts` audits a run's DB for confirmed findings whose persisted diff is non-confirming — usable on any future kept cell.
+- operator-visible invariant check added to `worker-gate.sh`.
+
+This is the certification blocker the spec-submission stream surfaced (a `runtime_confirmed` finding whose own diff said `inconclusive`). Claims remain halted until a clean held-out cell verifies forward.
