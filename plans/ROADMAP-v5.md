@@ -842,3 +842,27 @@ Measured: dev **36/59** (opsportal 9/18 → **10/18**, `og.diag-cmdi` via `rce_p
 | 8 | 1-cell frontier-model control to separate "model too weak" from "pipeline bug" | **DEFERRED (constraint)** — the operator requires the same production model (`deepseek/deepseek-v4.1-flash-1017`); a different-model control would need explicit operator approval. The autopsy bucket split answers the same question for structure, and bucket 4 is the only one that would implicate the model. | — |
 
 **Open question answered:** acme dev's 5/21 is now treated as suspected **premature Pass-1 dry-termination**, not a healthy dry queue — the bucket distinctor is whether first-pass work was still queued at stop, which the new metrics will report.
+
+### 2026-11-24 — conversion autopsy merged: the wall is dispatch + proof obligation, not the model
+
+`conversion-autopsy` (`3d365bf`, zero-cost, structured only). 52 planted-but-unfound targets bucketed:
+
+| bucket | rows |
+|---|---:|
+| `never_dispatched` | **15** |
+| `route_hit_no_verify` | **24** |
+| `verify_called_but_oracle_rejected` | 9 |
+| `probed_missed_bug` | **4** |
+
+Per app (never / no-verify / rejected / probed): dev acme 2/2/4/0, dev opsportal 0/5/1/2, dev shopflow 3/4/0/0, held-out acme 2/7/1/1, held-out opsportal 4/3/3/0, held-out shopflow 4/3/0/1.
+
+**Only 4 of 52 misses are a model-reasoning failure.** The rest are ours:
+1. **Proof obligation is global, not per-route.** `specSubmissionPending` consults one `codedProofGaps` counter, so a single `record_coverage` gap discharges **every** probed route — 111 of 140 investigations never verified. This is the single largest bucket (24).
+2. **Dispatch starvation.** 270 planned steps, only 117 ever assigned; **87 `ready` steps never ran**; all six cells stopped on the same 600 s wall-clock cap with exactly one paused worker per slot; 45 provider stalls (my 28 s no-token watchdog) cost 552 turns.
+3. **Oracle evidence-shape rejections** (9): same-tenant write rule (6), non-JSON body binding (4), CSRF impact-model gate (6), 2 mis-built cross-tenant controls.
+
+Ranked fixes (smallest first): control-arm object rule (2 rows) → profile-aware stall watchdog (45 aborts / 552 turns) → demote unstarted trial duplicates (287 turns) → **per-route coded proof gaps (~15 lines, targets 24 rows)** → planner coverage assert for discovered high-risk routes (6) → non-JSON body binding → raise the recall-tier cap (costly, last).
+
+Launched `proof-gap-route` (agent-session lease) for the biggest structural fix. The watchdog and trial-duplicate fixes need `execution.ts`, which `realism4-convert` holds — they are queued for the engine lane behind it.
+
+Two measurement caveats recorded in the doc: `og.ticket-assign-cross-write` **was** genuinely proved but the grader matched the finding to sibling `ticket-bola-read`; and every cell used 600 s, not the 15 min default.
