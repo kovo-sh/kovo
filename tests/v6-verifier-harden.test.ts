@@ -725,7 +725,7 @@ test('regression: a cross-actor authorization read still confirms with an owner-
   } finally { await fx.close() }
 })
 
-test('regression: sql_boolean_diff still confirms inside a large stable shell', async () => {
+test('regression: retired sql_boolean_diff kind without floorRecipe fails closed', async () => {
   const fx = await startFixture()
   try {
     const spec = {
@@ -755,7 +755,9 @@ test('regression: sql_boolean_diff still confirms inside a large stable shell', 
       }`,
     }
     const res = await verify(spec, fx.origin)
-    assert.equal(res.verdict, 'confirmed', String(res.outcome.reason))
+    assert.equal(res.verdict, 'dismissed', String(res.outcome.reason))
+    assert.equal(res.outcome.reason, 'retired_legacy_spec_kind: use guardian_verify')
+    assert.equal(res.exchanges.length, 0)
   } finally { await fx.close() }
 })
 

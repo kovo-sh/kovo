@@ -267,7 +267,7 @@ function timeSpec(origin: string) {
   }
 }
 
-test('sql_time_diff: public replay stays inconclusive until an exact approval exists, then proceeds', async () => {
+test('sql_time_diff: bare retired legacy spec fails closed without touching transport even with an approval', async () => {
   const origin = 'https://public.example.test'
   const harness = approvalHarness()
   const run = (broker: RequestBroker) => verifyReplaySpec({
@@ -280,8 +280,8 @@ test('sql_time_diff: public replay stays inconclusive until an exact approval ex
 
   const unapprovedBroker = fakeTimingBroker()
   const unapproved = await run(unapprovedBroker.broker)
-  assert.equal(unapproved.verdict, 'inconclusive')
-  assert.match(unapproved.outcome.reason ?? '', /requires explicit Tier 3 HITL operator approval/i)
+  assert.equal(unapproved.verdict, 'dismissed')
+  assert.match(unapproved.outcome.reason ?? '', /retired_legacy_spec_kind/i)
   assert.equal(unapprovedBroker.calls(), 0)
 
   harness.ledger.grant({
@@ -299,13 +299,7 @@ test('sql_time_diff: public replay stays inconclusive until an exact approval ex
 
   const approvedBroker = fakeTimingBroker()
   const approved = await run(approvedBroker.broker)
-  assert.equal(approved.verdict, 'confirmed', String(approved.outcome.reason))
-  assert.ok(approvedBroker.calls() >= 6, 'the approved replay must actually execute the timing rounds')
-  assert.equal(harness.ledger.size, 0, 'the approval is single-use')
-
-  const replayBroker = fakeTimingBroker()
-  const replay = await run(replayBroker.broker)
-  assert.equal(replay.verdict, 'inconclusive')
-  assert.match(replay.outcome.reason ?? '', /requires explicit Tier 3 HITL operator approval/i)
-  assert.equal(replayBroker.calls(), 0)
+  assert.equal(approved.verdict, 'dismissed')
+  assert.match(approved.outcome.reason ?? '', /retired_legacy_spec_kind/i)
+  assert.equal(approvedBroker.calls(), 0)
 })

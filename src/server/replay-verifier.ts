@@ -22,20 +22,12 @@ import { redact, redactJsonValue } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
 import type { BrowserDomSinkTrace, BrowserInteractiveAction, BrowserSessionStep } from './scoped-browser.ts'
-import { injectUniversalParam } from './surface-engine.ts'
-import {
-  awaitReplayCanary,
-  intersectStructuralDeltas,
-  openCanarySession,
-  structuralDiff,
-  structuralSimilarity,
-} from './verify-support.ts'
-import type { CanaryWaitOutcome, EphemeralCanarySession } from './verify-support.ts'
+import { openCanarySession, structuralSimilarity } from './verify-support.ts'
+import type { EphemeralCanarySession } from './verify-support.ts'
 import type { Store } from './store.ts'
 import type { WorkerBackend } from './worker-backend.ts'
 import {
   actorFromPersona,
-  assessAuthorizationImpact,
   assessBoundary,
   assessImpactEvidence,
   assessMassAssignmentImpact,
@@ -806,6 +798,7 @@ function singleQuoteEscape(value: string): string {
 
 export const RETIRED_LEGACY_SPEC_KINDS: ReadonlySet<string> = new Set([
   'dns_takeover', 'tls_audit', 'browser_dom', 'ws_chain', 'upload_probe',
+  'sql_boolean_diff', 'sql_time_diff',
 ])
 export const RETIRED_LEGACY_SPEC_REASON = 'retired_legacy_spec_kind: use guardian_verify'
 
@@ -993,7 +986,7 @@ const postureCategoryPattern = /access|auth|bypass|cors|header|posture|misconfig
 
 /** requireControlNonError defaults to true for posture / auth-bypass style specs. */
 function defaultRequireControlNonError(spec: DeclarativeReplaySpec): boolean {
-  if (spec.kind === 'static_ast_proof' || spec.kind === 'sql_boolean_diff' || spec.kind === 'sql_time_diff') return false
+  if (spec.kind === 'static_ast_proof') return false
   return postureCwes.has(spec.cwe) || postureCategoryPattern.test(spec.category)
 }
 
@@ -1005,17 +998,6 @@ function statusMatchesExpected(expected: number | number[] | undefined, status: 
 function isUnexpectedErrorStatus(status: number, ...expected: Array<number | number[] | undefined>): boolean {
   if (status !== 404 && status < 500) return false
   return !expected.some(e => statusMatchesExpected(e, status))
-}
-
-function lightSummary(ex: BrokerExchangeResult) {
-  return {
-    status: ex.status,
-    mediaType: ex.mediaType,
-    bodySha256: ex.bodySha256,
-    bodyBytes: ex.bodyBytes,
-    bodyPreview: ex.body.slice(0, 2000),
-    headers: ex.respHeaders,
-  }
 }
 
 /**
@@ -1262,6 +1244,15 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
   const tier = grant.tier ?? 1
   if (tier === 0 && !isStatic) {
     return inconclusiveResult('Live replay verification is disabled in Tier 0.', exchanges, exchangeIds, { kind: spec.kind })
+  }
+
+  // Floor-recipe dispatch runs BEFORE retired legacy VM rejection so recipe-backed specs
+  // (e.g. `sql_boolean_diff`/`sql_time_diff` with a `boolean_or_timing` floorRecipe envelope)
+  // verify cleanly through ProofReceipt while bare legacy VM specs fail closed below.
+  const persistedRecipe = persistedRecipeOf(params.spec)
+  if (persistedRecipe) {
+    const result = await runPersistedFloorRecipe(persistedRecipe, params, spec.origin)
+    return result.replay
   }
 
   if (RETIRED_LEGACY_SPEC_KINDS.has(spec.kind)) {
@@ -2216,161 +2207,6 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
       } finally {
         await canarySession?.close()
       }
-    } else if (spec.kind === 'sql_boolean_diff') {
-      const roundCount = 3
-      const usedKs = new Set<number>()
-      const baseValue = spec.baselineValue
-      const makeValue = (k: number, kind: 'true' | 'false'): string => {
-        const expr = `${k}=${kind === 'true' ? k : k + 1}`
-        if (spec.valueTemplate) {
-          return spec.valueTemplate.replaceAll('{{baseline}}', baseValue).replaceAll('{{sql_expr}}', expr)
-        }
-        if (spec.quoteStyle === 'numeric') return `${baseValue} AND ${expr}`
-        if (spec.quoteStyle === 'double') return `${baseValue}" AND ${expr}-- -`
-        return `${baseValue}' AND ${expr}-- -`
-      }
-      const buildRequest = (value: string): BrokerHttpRequest => {
-        const injected = injectUniversalParam({
-          pathAndQuery: spec.pathAndQuery,
-          param: spec.paramName,
-          paramLocation: spec.paramLocation,
-          value,
-          method: spec.method,
-          headers: spec.headers,
-          jsonBody: (spec.jsonBody && typeof spec.jsonBody === 'object' && !Array.isArray(spec.jsonBody))
-            ? spec.jsonBody as Record<string, unknown>
-            : undefined,
-          xmlTemplate: spec.xmlTemplate,
-          graphqlQuery: spec.graphqlQuery,
-          session: spec.session,
-          csrfBind: spec.csrfBind,
-          runId: params.runId,
-          assignmentId,
-        })
-        return {
-          origin: spec.targetOrigin,
-          persona: spec.persona,
-          followRedirects: false,
-          // Share the priming step's jar so session cookies / CSRF tokens bound by it are visible.
-          ...(spec.controlStep && spec.controlStep.role !== 'cleanup' ? { sessionGroupRole: spec.controlStep.role } : {}),
-          ...injected,
-        }
-      }
-
-      let controlSummary: Record<string, unknown> | null = null
-      let controlHealthy = true
-      if (spec.controlStep) {
-        const controlEx = await broker.executeHttp(stepToBrokerRequest(spec.controlStep, {}, {
-          runId: params.runId,
-          assignmentId,
-        }), grant, signal)
-        recordExchange(controlEx)
-        controlSummary = { id: spec.controlStep.id, role: spec.controlStep.role, ...summarizeExchange(controlEx) }
-        if (isUnexpectedErrorStatus(controlEx.status, spec.controlStep.expectedStatus, spec.expectedStatus)) controlHealthy = false
-      }
-
-      const rounds: Array<Record<string, unknown>> = []
-      const roundDeltas: string[][] = []
-      let firstBaseline: BrokerExchangeResult | undefined
-      let firstTrue: BrokerExchangeResult | undefined
-      let firstFalse: BrokerExchangeResult | undefined
-      let allPass = true
-      let baselineHeld = true
-      let unstable = false
-      let baselineDrift = false
-      for (let r = 0; r < roundCount; r += 1) {
-        signal.throwIfAborted()
-        let k = randomInt(1000, 90_000)
-        while (usedKs.has(k)) k = randomInt(1000, 90_000)
-        usedKs.add(k)
-        // Interleaved baseline / true / false triplet through RequestBroker.
-        const trueValue = makeValue(k, 'true')
-        const falseValue = makeValue(k, 'false')
-        const baseEx = await broker.executeHttp(buildRequest(baseValue), grant, signal)
-        recordExchange(baseEx)
-        const trueEx = await broker.executeHttp(buildRequest(trueValue), grant, signal)
-        recordExchange(trueEx)
-        const falseEx = await broker.executeHttp(buildRequest(falseValue), grant, signal)
-        recordExchange(falseEx)
-        firstBaseline ??= baseEx
-        firstTrue ??= trueEx
-        firstFalse ??= falseEx
-        // Compare noise-normalized structure: a rotating nonce never separates the arms, and a
-        // single real field delta inside a large HTML shell remains observable. The echoed request
-        // value is scrubbed from every side (same rule as the differential probe): a response that
-        // reflects the query is not evidence that the returned rows changed.
-        const diffBody = (body: string, values: string[]): string => {
-          let out = body
-          for (const value of values) {
-            if (!value || value.length < 3) continue
-            out = out.split(value).join('\u0000')
-            const escaped = JSON.stringify(value).slice(1, -1)
-            if (escaped && escaped !== value) out = out.split(escaped).join('\u0000')
-          }
-          return out
-        }
-        const baseDiffBody = diffBody(baseEx.body, [baseValue])
-        const trueDiffBody = diffBody(trueEx.body, [trueValue, baseValue])
-        const falseDiffBody = diffBody(falseEx.body, [falseValue, baseValue])
-        const simBaselineTrue = structuralSimilarity(baseDiffBody, trueDiffBody)
-        const simBaselineFalse = structuralSimilarity(baseDiffBody, falseDiffBody)
-        const simTrueFalse = structuralSimilarity(trueDiffBody, falseDiffBody)
-        const fieldDelta = structuralDiff(trueDiffBody, falseDiffBody).changedTokens.filter(token => token.length >= 2)
-        roundDeltas.push(fieldDelta)
-        const isOrBranch = /\bOR\b/i.test(spec.valueTemplate ?? '')
-        const statusDivergence = isOrBranch
-          ? (falseEx.status === baseEx.status && trueEx.status !== falseEx.status && trueEx.status < 500) ||
-            (baseEx.status === trueEx.status && falseEx.status !== trueEx.status && falseEx.status < 500)
-          : (baseEx.status === trueEx.status && falseEx.status !== trueEx.status && falseEx.status < 500)
-        const anyServerError = [baseEx, trueEx, falseEx].some(e => e.status >= 500)
-        if (anyServerError) unstable = true
-        if (isUnexpectedErrorStatus(baseEx.status, spec.expectedStatus) || isUnexpectedErrorStatus(trueEx.status, spec.expectedStatus)) {
-          controlHealthy = false
-        }
-        if (structuralSimilarity(firstBaseline.body, baseEx.body) < 0.9) baselineDrift = true
-        const baselineMatch = isOrBranch ? Math.max(simBaselineTrue, simBaselineFalse) >= 0.9 : simBaselineTrue >= 0.9
-        if (!(!anyServerError && baselineMatch)) baselineHeld = false
-        const pass = !anyServerError && baselineMatch && (simTrueFalse <= 0.75 || statusDivergence)
-        if (!pass) allPass = false
-        rounds.push({
-          round: r + 1, k,
-          trueExpression: `${k}=${k}`, falseExpression: `${k}=${k + 1}`,
-          baseline: lightSummary(baseEx), true: lightSummary(trueEx), false: lightSummary(falseEx),
-          similarityBaselineTrue: simBaselineTrue, similarityBaselineFalse: simBaselineFalse, similarityTrueFalse: simTrueFalse,
-          statusDivergence, isOrBranch, structuralDelta: fieldDelta.length > 0, structuralChangedTokens: fieldDelta.length, pass,
-        })
-      }
-      // A small set of non-dynamic tokens that differ in *every* round is a stable field delta,
-      // not per-request jitter. This lets a one-field differential in a large shell confirm while
-      // still requiring identical structural context.
-      const stableFieldDelta = intersectStructuralDeltas(roundDeltas).filter(token => token.length >= 2)
-      const structuralFieldDelta = stableFieldDelta.length > 0 && stableFieldDelta.length <= 8
-      const controlPassed = controlHealthy && !unstable && !baselineDrift
-      deterministicProofPassed = controlPassed && baselineHeld && (allPass || structuralFieldDelta)
-      if (!deterministicProofPassed) {
-        proofFailureReason = !controlPassed
-          ? 'sql_boolean_diff control unstable (5xx, unexpected 404 or drifting baseline).'
-          : 'Boolean differential did not hold across all 3 randomized rounds (no status divergence, content separation, or stable non-dynamic field delta).'
-      }
-      evidencePayload = {
-        ...evidencePayload,
-        targetOrigin: spec.targetOrigin,
-        paramName: spec.paramName,
-        quoteStyle: spec.quoteStyle,
-        baseline: firstBaseline ? summarizeExchange(firstBaseline) : (rounds[0]?.baseline ?? null),
-        trueProbe: firstTrue ? summarizeExchange(firstTrue) : (rounds[0]?.true ?? null),
-        falseProbe: firstFalse ? summarizeExchange(firstFalse) : (rounds[0]?.false ?? null),
-        sqlDiff: {
-          passed: deterministicProofPassed,
-          controlPassed,
-          thresholds: { trueVsBaselineMin: 0.9, trueVsFalseMax: 0.75, stableFieldDeltaMax: 8 },
-          structuralFieldDelta,
-          structuralChangedTokens: stableFieldDelta.length,
-          rounds,
-        },
-        control: controlSummary ?? (rounds[0] ? { role: 'control', ...(rounds[0].baseline as Record<string, unknown>) } : null),
-        probe: rounds[0] ? { role: 'probe', ...(rounds[0].true as Record<string, unknown>) } : null,
-      }
     } else if (spec.kind === 'static_ast_proof') {
       if (!params.reposDir) {
         return inconclusiveResult('static_ast_proof requires the read-only /repos mount (reposDir).', exchanges, exchangeIds, { kind: spec.kind })
@@ -2804,185 +2640,6 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           timingSignal,
         },
       }
-    } else if (spec.kind === 'sql_time_diff') {
-      const localLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
-      if (!localLab) {
-        if (tier < 3) {
-          grant.audit('denied', spec.targetOrigin)
-          return inconclusiveResult('sql_time_diff is blocked on public projects below Tier 3 (requires local-lab or Tier 3 HITL approval).', exchanges, exchangeIds, { kind: spec.kind })
-        }
-        const approved = grant.isStateChangeApproved
-          ? grant.isStateChangeApproved(
-              spec.targetOrigin,
-              spec.method,
-              spec.pathAndQuery,
-              {
-                personaHandle: spec.persona ?? null,
-                // Spec-scoped approval: the pre-gate authorizes the declared request (the mutated
-                // timing payloads are derived from it), so the fingerprint uses the declared body.
-                body: spec.paramLocation === 'json' && spec.jsonBody !== undefined
-                  ? JSON.stringify(spec.jsonBody)
-                  : spec.paramLocation === 'xml'
-                    ? spec.xmlTemplate ?? null
-                    : null,
-                hasMultipart: false,
-                isRaceBurst: false,
-                isRceProof: false,
-              },
-            )
-          : false
-        if (!approved) {
-          grant.audit('denied', spec.targetOrigin)
-          return inconclusiveResult('sql_time_diff requires explicit Tier 3 HITL operator approval on public targets.', exchanges, exchangeIds, { kind: spec.kind })
-        }
-      }
-
-      const delayMs = Math.max(1500, Math.min(3000, spec.delayMs ?? randomInt(1500, 2601)))
-      const delaySec = Number((delayMs / 1000).toFixed(3))
-      const delaySecInt = Math.max(1, Math.round(delayMs / 1000))
-      const baseValue = spec.baselineValue
-
-      const makeDelayPayload = (): string => {
-        if (spec.valueTemplate) {
-          return spec.valueTemplate
-            .replaceAll('{{baseline}}', baseValue)
-            .replaceAll('{{delay_ms}}', String(delayMs))
-            .replaceAll('{{delay_sec}}', String(delaySec))
-        }
-        let fnExpr: string
-        if (spec.dialect === 'mysql') fnExpr = `SLEEP(${delaySec})`
-        else if (spec.dialect === 'mssql') fnExpr = `WAITFOR DELAY '0:0:${delaySecInt}'`
-        else if (spec.dialect === 'sqlite') fnExpr = `1=LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(${Math.min(90_000_000, delayMs * 25_000)}))))`
-        else fnExpr = `(SELECT 1 FROM pg_sleep(${delaySec})) IS NULL`
-
-        if (spec.dialect === 'mssql') {
-          return spec.quoteStyle === 'numeric'
-            ? `${baseValue}; ${fnExpr}`
-            : spec.quoteStyle === 'double'
-              ? `${baseValue}"; ${fnExpr}-- -`
-              : `${baseValue}'; ${fnExpr}-- -`
-        }
-        if (spec.quoteStyle === 'numeric') return `${baseValue} AND ${fnExpr}`
-        if (spec.quoteStyle === 'double') return `${baseValue}" AND ${fnExpr}-- -`
-        return `${baseValue}' AND ${fnExpr}-- -`
-      }
-
-      const buildRequest = (value: string): BrokerHttpRequest => {
-        const injected = injectUniversalParam({
-          pathAndQuery: spec.pathAndQuery,
-          param: spec.paramName,
-          paramLocation: spec.paramLocation,
-          value,
-          method: spec.method,
-          headers: spec.headers,
-          jsonBody: (spec.jsonBody && typeof spec.jsonBody === 'object' && !Array.isArray(spec.jsonBody))
-            ? spec.jsonBody as Record<string, unknown>
-            : undefined,
-          xmlTemplate: spec.xmlTemplate,
-          graphqlQuery: spec.graphqlQuery,
-          session: spec.session,
-          csrfBind: spec.csrfBind,
-          runId: params.runId,
-          assignmentId,
-        })
-        return {
-          origin: spec.targetOrigin,
-          persona: spec.persona,
-          followRedirects: false,
-          timeoutMs: Math.max(10_000, delayMs + 5_000),
-          ...(spec.controlStep && spec.controlStep.role !== 'cleanup' ? { sessionGroupRole: spec.controlStep.role } : {}),
-          ...injected,
-        }
-      }
-
-      let controlSummary: Record<string, unknown> | null = null
-      let controlHealthy = true
-      if (spec.controlStep) {
-        const ctrlEx = await broker.executeHttp(stepToBrokerRequest(spec.controlStep, {}, {
-          runId: params.runId,
-          assignmentId,
-        }), grant, signal)
-        recordExchange(ctrlEx)
-        controlSummary = { id: spec.controlStep.id, role: spec.controlStep.role, ...summarizeExchange(ctrlEx) }
-        if (isUnexpectedErrorStatus(ctrlEx.status, spec.controlStep.expectedStatus, spec.expectedStatus)) controlHealthy = false
-      }
-
-      const roundCount = 3
-      const rounds: Array<Record<string, unknown>> = []
-      const baseDurations: number[] = []
-      const probeDurations: number[] = []
-      let anyServerError = false
-      const delayPayload = makeDelayPayload()
-
-      for (let r = 0; r < roundCount; r += 1) {
-        signal.throwIfAborted()
-        const t0 = performance.now()
-        const baseEx = await broker.executeHttp(buildRequest(baseValue), grant, signal)
-        const baseMeasured = Math.max(baseEx.durationMs, Math.round(performance.now() - t0))
-        recordExchange(baseEx)
-
-        const t1 = performance.now()
-        const probeEx = await broker.executeHttp(buildRequest(delayPayload), grant, signal)
-        const probeMeasured = Math.max(probeEx.durationMs, Math.round(performance.now() - t1))
-        recordExchange(probeEx)
-
-        if (baseEx.status >= 500 || probeEx.status >= 500) anyServerError = true
-        if (isUnexpectedErrorStatus(baseEx.status, spec.expectedStatus) || isUnexpectedErrorStatus(probeEx.status, spec.expectedStatus)) {
-          controlHealthy = false
-        }
-        baseDurations.push(baseMeasured)
-        probeDurations.push(probeMeasured)
-        rounds.push({
-          round: r + 1,
-          baselineMs: baseMeasured,
-          probeMs: probeMeasured,
-          baseline: lightSummary(baseEx),
-          delayProbe: lightSummary(probeEx),
-        })
-      }
-
-      const median = (arr: number[]) => {
-        const sorted = [...arr].sort((a, b) => a - b)
-        const m = Math.floor(sorted.length / 2)
-        return sorted.length % 2 === 1 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2
-      }
-      const baselineMedianMs = median(baseDurations)
-      const probeMedianMs = median(probeDurations)
-      const deltaMedianMs = probeMedianMs - baselineMedianMs
-      const minProbeMs = Math.min(...probeDurations)
-      const maxBaselineMs = Math.max(...baseDurations)
-      const nonOverlapping = minProbeMs > maxBaselineMs
-      const controlPassed = controlHealthy && !anyServerError
-      deterministicProofPassed = controlPassed && nonOverlapping && deltaMedianMs >= 0.85 * delayMs
-      if (!deterministicProofPassed) {
-        proofFailureReason = !controlPassed
-          ? 'sql_time_diff control unstable (5xx or unexpected error status).'
-          : !nonOverlapping
-            ? `Timing overlap detected across 3 rounds (minProbe=${minProbeMs}ms <= maxBaseline=${maxBaselineMs}ms).`
-            : `Median timing delta (${deltaMedianMs}ms) fell below 0.85 * ${delayMs}ms.`
-      }
-
-      evidencePayload = {
-        ...evidencePayload,
-        targetOrigin: spec.targetOrigin,
-        paramName: spec.paramName,
-        paramLocation: spec.paramLocation,
-        delayMs,
-        sqlTimeDiff: {
-          passed: deterministicProofPassed,
-          controlPassed,
-          delayMs,
-          baselineMedianMs,
-          probeMedianMs,
-          deltaMedianMs,
-          minProbeMs,
-          maxBaselineMs,
-          nonOverlapping,
-          rounds,
-        },
-        control: controlSummary ?? (rounds[0] ? { role: 'control', ...(rounds[0].baseline as Record<string, unknown>) } : null),
-        probe: rounds[0] ? { role: 'probe', ...(rounds[0].delayProbe as Record<string, unknown>) } : null,
-      }
     }
   } catch (err) {
     const catchSecrets: NamedSecret[] = [
@@ -3163,28 +2820,7 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
   return withVerificationTier(result)
 }
 
-/**
- * Cut 3a no-fallback invariant at the *product floor* boundary.
- *
- * The deterministic engine runs a wired family through its recipe; immediately before its legacy
- * verifier call it asserts the candidate was not recipe-wired. A future edit that bypasses planning
- * therefore throws (and warns) instead of silently evaluating the DSL for a family the floor is
- * supposed to confirm through a receipt.
- *
- * The legacy branch itself stays in `verifyReplaySpec` because, after the retest migration
- * (`retestReplaySpec` re-runs a persisted floor recipe and verifies a fresh receipt; the capability
- * harness retests through that same entrypoint), it still has reachable callers:
- *
- *   1. `Execution`'s agent-facing `verify_replay_spec` / `propose_chain_finding` path
- *      (`execution.ts` -> `verifyReplaySpec`), which accepts any of the 14 declarative kinds from the
- *      investigator. This is the dominant caller and the reason the DSL cannot be deleted yet:
- *      `guardian_verify` script confirmation is not wired into `AgentSession` in production.
- *   2. The deterministic engine's still-unwired kinds, recorded in `LEGACY_UNWIRED_SPECKINDS`.
- *   3. `retestReplaySpec`'s legacy fallback for a persisted spec with no recipe envelope (an
- *      agent-authored proof, or a row written before Cut 3).
- *
- * Deleting the VM therefore needs (1) to move to Layer-3 script proofs first.
- */
+/** Cut 3 no-fallback invariant at the product floor boundary. */
 export class RecipeWiredLegacyCallError extends Error {
   readonly code = 'GUARDIAN_RECIPE_WIRED_LEGACY_CALL'
   readonly specKind: string
@@ -3233,28 +2869,34 @@ function withVerificationTier(result: ReplayVerificationResult): ReplayVerificat
   return { ...result, ...(verificationTier ? { verificationTier } : {}) }
 }
 
+async function runPersistedFloorRecipe(
+  persisted: NonNullable<ReturnType<typeof persistedRecipeOf>>,
+  params: VerifyReplaySpecParams,
+  originFallback?: string,
+) {
+  const args = persisted.envelope.args as { vulnClass?: unknown; pathAndQuery?: unknown }
+  const origin = persisted.origin || originFallback || ''
+  return retestPersistedRecipe({
+    envelope: persisted.envelope,
+    specKind: persisted.kind,
+    vulnClass: typeof args.vulnClass === 'string' && args.vulnClass ? args.vulnClass : persisted.kind,
+    endpoint: typeof args.pathAndQuery === 'string' ? args.pathAndQuery : origin,
+    origin,
+    broker: params.broker,
+    grant: params.grant,
+    signal: params.signal,
+    ...(params.runId ? { runId: params.runId } : {}),
+    ...(params.assignmentId ? { assignmentId: params.assignmentId } : {}),
+    ...(params.onExchange ? { recordExchange: (exchange: BrokerExchangeResult) => params.onExchange?.(exchange) } : {}),
+  })
+}
+
 export async function retestReplaySpec(params: VerifyReplaySpecParams): Promise<RetestReplayResult> {
   // Cut 3 retest receipts: a spec confirmed by a typed floor recipe carries that recipe, so retest
-  // re-runs the recipe and validates a fresh ProofReceipt. The legacy re-interpretation below is only
-  // for proofs that were never recipe-owned (LLM-authored specs and still-unwired kinds).
+  // re-runs the recipe and validates a fresh ProofReceipt.
   const persisted = persistedRecipeOf(params.spec)
   if (persisted) {
-    const args = persisted.envelope.args as { vulnClass?: unknown; pathAndQuery?: unknown }
-    const result = await retestPersistedRecipe({
-      envelope: persisted.envelope,
-      specKind: persisted.kind,
-      vulnClass: typeof args.vulnClass === 'string' && args.vulnClass ? args.vulnClass : persisted.kind,
-      endpoint: typeof args.pathAndQuery === 'string' ? args.pathAndQuery : persisted.origin,
-      origin: persisted.origin,
-      broker: params.broker,
-      grant: params.grant,
-      signal: params.signal,
-      ...(params.runId ? { runId: params.runId } : {}),
-      ...(params.assignmentId ? { assignmentId: params.assignmentId } : {}),
-      ...(params.onExchange
-        ? { recordExchange: (exchange: BrokerExchangeResult) => params.onExchange?.(exchange) }
-        : {}),
-    })
+    const result = await runPersistedFloorRecipe(persisted, params)
     return { verdict: result.verdict, replay: result.replay }
   }
   // v7 M5 agent script proofs: the persisted row carries the Layer-3 script, so retest re-runs that
@@ -3648,19 +3290,6 @@ export interface InlineStepBodyPreview {
   truncated: boolean
 }
 
-export interface InlineSqlRoundSummary {
-  round: number
-  pass?: boolean
-  baselineStatus?: number | null
-  trueStatus?: number | null
-  falseStatus?: number | null
-  delayProbeStatus?: number | null
-  similarityBaselineTrue?: number
-  similarityTrueFalse?: number
-  baselineMs?: number
-  probeMs?: number
-}
-
 /**
  * Enriched inline verification feedback. Extra fields are additive on top of the persisted
  * `InlineVerifyFeedback` contract (the domain schema strips nothing on read), so older consumers
@@ -3671,7 +3300,6 @@ export interface EnrichedInlineVerifyFeedback extends InlineVerifyFeedback {
   keyResponseHeaders?: InlineExchangeHeaderSummary[]
   stepBodyPreviews?: InlineStepBodyPreview[]
   extractedVars?: Array<{ key: string; preview: string }>
-  sqlRoundSummaries?: InlineSqlRoundSummary[]
   verificationKind?: string
   /** True when a vertical BFLA (function-level) proof lacked impact evidence. */
   bflaImpactRequired?: boolean
@@ -3742,30 +3370,6 @@ function summarizeKeyResponseHeaders(
   return out
 }
 
-function summarizeSqlRounds(payload: Record<string, unknown>): InlineSqlRoundSummary[] {
-  const sqlDiff = payload.sqlDiff as { rounds?: Array<Record<string, unknown>> } | undefined
-  const sqlTimeDiff = payload.sqlTimeDiff as { rounds?: Array<Record<string, unknown>> } | undefined
-  const rounds = Array.isArray(sqlDiff?.rounds) ? sqlDiff!.rounds : Array.isArray(sqlTimeDiff?.rounds) ? sqlTimeDiff!.rounds : []
-  const num = (value: unknown): number | undefined =>
-    typeof value === 'number' && Number.isFinite(value) ? value : undefined
-  const status = (value: unknown): number | null =>
-    value && typeof value === 'object' && typeof (value as { status?: unknown }).status === 'number'
-      ? (value as { status: number }).status
-      : null
-  return rounds.slice(0, 5).map((r, idx) => ({
-    round: num(r.round) ?? idx + 1,
-    ...(typeof r.pass === 'boolean' ? { pass: r.pass } : {}),
-    baselineStatus: status(r.baseline),
-    trueStatus: status(r.true),
-    falseStatus: status(r.false),
-    ...(r.delayProbe !== undefined ? { delayProbeStatus: status(r.delayProbe) } : {}),
-    ...(num(r.similarityBaselineTrue) !== undefined ? { similarityBaselineTrue: num(r.similarityBaselineTrue)! } : {}),
-    ...(num(r.similarityTrueFalse) !== undefined ? { similarityTrueFalse: num(r.similarityTrueFalse)! } : {}),
-    ...(num(r.baselineMs) !== undefined ? { baselineMs: Math.round(num(r.baselineMs)!) } : {}),
-    ...(num(r.probeMs) !== undefined ? { probeMs: Math.round(num(r.probeMs)!) } : {}),
-  }))
-}
-
 export function buildInlineVerifyFeedback(
   spec: DeclarativeReplaySpec | unknown,
   replay: ReplayVerificationResult,
@@ -3813,20 +3417,6 @@ export function buildInlineVerifyFeedback(
     if (payload.probe && typeof payload.probe === 'object') {
       stepStatuses.push(toStepStatusItem('probe', 'probe', payload.probe as Record<string, unknown>))
     }
-  } else if (kind === 'sql_boolean_diff') {
-    const rounds = (payload.sqlDiff as { rounds?: Array<Record<string, unknown>> } | undefined)?.rounds
-    const r0 = Array.isArray(rounds) ? rounds[0] : undefined
-    if (r0) {
-      if (r0.baseline && typeof r0.baseline === 'object') {
-        stepStatuses.push(toStepStatusItem('baseline', 'control', r0.baseline as Record<string, unknown>))
-      }
-      if (r0.true && typeof r0.true === 'object') {
-        stepStatuses.push(toStepStatusItem('true', 'probe', r0.true as Record<string, unknown>))
-      }
-      if (r0.false && typeof r0.false === 'object') {
-        stepStatuses.push(toStepStatusItem('false', 'probe', r0.false as Record<string, unknown>))
-      }
-    }
   } else if (kind === 'cache_differential') {
     if (payload.control && typeof payload.control === 'object') {
       stepStatuses.push(toStepStatusItem('control', 'control', payload.control as Record<string, unknown>))
@@ -3836,17 +3426,6 @@ export function buildInlineVerifyFeedback(
     }
     if (payload.verify && typeof payload.verify === 'object') {
       stepStatuses.push(toStepStatusItem('verify', 'probe', payload.verify as Record<string, unknown>))
-    }
-  } else if (kind === 'sql_time_diff') {
-    const rounds = (payload.sqlTimeDiff as { rounds?: Array<Record<string, unknown>> } | undefined)?.rounds
-    const r0 = Array.isArray(rounds) ? rounds[0] : undefined
-    if (r0) {
-      if (r0.baseline && typeof r0.baseline === 'object') {
-        stepStatuses.push(toStepStatusItem('baseline', 'control', r0.baseline as Record<string, unknown>))
-      }
-      if (r0.delayProbe && typeof r0.delayProbe === 'object') {
-        stepStatuses.push(toStepStatusItem('delayProbe', 'probe', r0.delayProbe as Record<string, unknown>))
-      }
     }
   }
 
@@ -3952,7 +3531,6 @@ export function buildInlineVerifyFeedback(
     }
   }
 
-  const sqlRounds = kind === 'sql_boolean_diff' || kind === 'sql_time_diff' ? summarizeSqlRounds(payload) : []
   const bflaImpact = payload.bflaImpact as { required?: unknown; satisfied?: unknown; reason?: unknown } | undefined
   const bflaImpactRequired = bflaImpact?.required === true ? true : undefined
   const impactEvidenceMissing = bflaImpact?.required === true && bflaImpact?.satisfied === false ? true : undefined
@@ -3994,7 +3572,6 @@ export function buildInlineVerifyFeedback(
     ...(enrichedHeaders.length ? { keyResponseHeaders: enrichedHeaders } : {}),
     ...(bodyPreviews.length ? { stepBodyPreviews: bodyPreviews } : {}),
     ...(extractedVarSummaries.length ? { extractedVars: extractedVarSummaries } : {}),
-    ...(sqlRounds.length ? { sqlRoundSummaries: sqlRounds } : {}),
     ...(kind ? { verificationKind: kind } : {}),
     ...(bflaImpactRequired ? { bflaImpactRequired } : {}),
     ...(impactEvidenceMissing ? { impactEvidenceMissing } : {}),
