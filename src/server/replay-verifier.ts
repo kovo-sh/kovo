@@ -3527,13 +3527,23 @@ export interface AgentScriptProofResult {
   receipt: { receipt: ProofReceipt; verification: ReceiptVerification } | null
   vulnClass: string | null
   transcriptDigests: string[]
+  /** Script-declared attribution (never evidence by itself). */
+  claimTitle: string | null
+  severity: string | null
+  description: string | null
 }
 
 export async function runAgentScriptProof(params: AgentScriptProofParams): Promise<AgentScriptProofResult> {
   const code = params.script.trim()
   if (!code) throw new Error('An agent proof script is required.')
   if (Buffer.byteLength(code) > 64 * 1024) throw new Error('The agent proof script exceeds the 64 KiB limit.')
-  const attempts = new Map<1 | 2, { claims: Record<string, unknown>[]; transcript: TranscriptStore }>()
+  const attempts = new Map<1 | 2, {
+    claims: Record<string, unknown>[]
+    transcript: TranscriptStore
+    title: string | null
+    severity: string | null
+    description: string | null
+  }>()
   const openAttempt = async (input: { attempt: 1 | 2; nonce: string }): Promise<VerifyAttemptSession> => {
     const server = new VerifyRpcServer({
       broker: params.broker,
@@ -3575,11 +3585,17 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
         const claims = execution.result && typeof execution.result === 'object'
           ? ((execution.result as { claims?: unknown }).claims)
           : undefined
+        const declared = execution.result && typeof execution.result === 'object'
+          ? execution.result as { title?: unknown; severity?: unknown; description?: unknown }
+          : {}
         attempts.set(input.attempt, {
           claims: Array.isArray(claims)
             ? claims.filter((claim): claim is Record<string, unknown> => Boolean(claim) && typeof claim === 'object' && !Array.isArray(claim))
             : [],
           transcript: server.transcript,
+          title: typeof declared.title === 'string' && declared.title.trim() ? declared.title.trim() : null,
+          severity: typeof declared.severity === 'string' && declared.severity.trim() ? declared.severity.trim() : null,
+          description: typeof declared.description === 'string' && declared.description.trim() ? declared.description.trim() : null,
         })
         return {
           result: execution.result,
@@ -3609,9 +3625,14 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
         .find(([, captured]) => captured.transcript.size > 0)
     : undefined
   if (!passing) {
-    return { verdict, exchanges: [], receipt: null, vulnClass: null, transcriptDigests }
+    return { verdict, exchanges: [], receipt: null, vulnClass: null, transcriptDigests, claimTitle: null, severity: null, description: null }
   }
   const captured = passing[1]
+  const attribution = {
+    claimTitle: captured.title ?? verdict.claimTitle ?? null,
+    severity: captured.severity,
+    description: captured.description,
+  }
   const exchanges: ScriptProofExchange[] = captured.transcript.list().flatMap(record => {
     if (record.op === 'oob' || record.op === 'browser') return []
     const request = record.request
@@ -3644,7 +3665,7 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
     title: params.title?.trim() || verdict.claimTitle || 'Agent script proof',
   })
   if (!built) {
-    return { verdict, exchanges, receipt: null, vulnClass: null, transcriptDigests }
+    return { verdict, exchanges, receipt: null, vulnClass: null, transcriptDigests, ...attribution }
   }
   const verification = verifyReceipt(built.receipt, built.transcript)
   return {
@@ -3653,6 +3674,7 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
     receipt: verification.confirmed ? { receipt: built.receipt, verification } : null,
     vulnClass: verification.confirmed ? built.receipt.vulnClass : null,
     transcriptDigests,
+    ...attribution,
   }
 }
 

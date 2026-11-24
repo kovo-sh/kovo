@@ -8,6 +8,8 @@ import {
   assetOrigin,
   assetOriginForEnvironment,
   defaultWorkerConcurrency,
+  findingSeverities,
+  httpMethods,
   isLocalLabEnvEnabled,
   maxInlineVerifyRetries,
   maxWorkerConcurrency,
@@ -33,7 +35,7 @@ import type {
   VerificationTier,
 } from '../domain.ts'
 import { declarativeReplaySpecSchema, replaySpecOrigins } from '../replay-spec.ts'
-import type { DeclarativeReplaySpec } from '../replay-spec.ts'
+import type { AgentScriptProofEnvelope, DeclarativeReplaySpec } from '../replay-spec.ts'
 import { suppliedResponseLabel } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import {
@@ -65,6 +67,7 @@ import {
   routeStepToSpecialist,
   selectPreInjectionSkills,
   runAgentSession,
+  summarizeGuardianVerifyOutcome,
   threatModelPrompt,
   WarmSpecialistController,
   workerInvestigationPrompt,
@@ -73,6 +76,8 @@ import type {
   AlreadyConfirmedRef,
   CodeAuditSuspectData,
   DetLeadSummary,
+  GuardianVerifyArgs,
+  GuardianVerifyRuntime,
   HostTier,
   PersonaResourceQueueItem,
   RequestHttpArgs,
@@ -335,9 +340,11 @@ import type { NamedSecret } from './redact.ts'
 import {
   buildInlineVerifyFeedback,
   retestReplaySpec,
+  runAgentScriptProof,
   verifyReplaySpec,
   verifyReplaySpecInline,
 } from './replay-verifier.ts'
+import type { AgentScriptProofResult } from './replay-verifier.ts'
 import { alignClaimClass } from './oracle-invariants.ts'
 import { responseReview } from './response-checks.ts'
 
@@ -364,6 +371,7 @@ import { tenantTagForRun } from './scope-policy.ts'
 import { dedupeCodeAuditSuspects, runThreeStageSemanticAudit, runVariantSweepForFinding, toChainStepInputs } from './semantic-audit.ts'
 import { assessmentAssignments, extractResourceRefsFromExchange, isOpaqueResourceId, store } from './store.ts'
 import type {
+  AgentScriptProofRecord,
   Assignment,
   BoardMessageRow,
   ChainStep,
@@ -376,10 +384,113 @@ import type {
   Run,
   Store,
 } from './store.ts'
+import type { ReplayProofReceiptRow } from './schema.ts'
 import { probeDifferential, probeSurface, runSafeTemplates } from './surface-engine.ts'
 import type { DifferentialProbeClass } from './surface-engine.ts'
 import { LinuxWorkerBackend } from './worker-backend.ts'
 import type { WorkerBackend } from './worker-backend.ts'
+
+/**
+ * Confirmation attribution for an agent script proof: reporting vocabulary for a class whose
+ * confirmation came from the script's receipt. Only labels/CWE/copy — never a verification input.
+ */
+export function agentProofAttribution(vulnClass: string): {
+  label: string
+  cwe: string
+  category: OwaspCategory
+  impact: string
+  remediation: string
+} {
+  const key = vulnClass.toLowerCase()
+  if (/^(?:bol[ai]|idor|cross_tenant|authorization|access_control|broken-access-control)$/.test(key)) {
+    return {
+      label: 'broken object-level authorization',
+      cwe: 'CWE-639',
+      category: 'broken-access-control',
+      impact: 'An authenticated actor read or changed a resource owned by another tenant or user.',
+      remediation: 'Enforce an object-level authorization check on every request that names a resource id.',
+    }
+  }
+  if (/^(?:bfla|privilege_escalation)$/.test(key)) {
+    return {
+      label: 'broken function-level authorization',
+      cwe: 'CWE-285',
+      category: 'broken-access-control',
+      impact: 'A lower-privileged actor invoked a privileged function that should be role-gated.',
+      remediation: 'Gate the function server-side on the caller role, not on client-side visibility.',
+    }
+  }
+  if (/^mass_assignment$/.test(key)) {
+    return {
+      label: 'mass assignment',
+      cwe: 'CWE-915',
+      category: 'broken-access-control',
+      impact: 'An over-posted field persisted a value the actor was not allowed to set.',
+      remediation: 'Allowlist assignable fields and bind them explicitly server-side.',
+    }
+  }
+  if (/^csrf$/.test(key)) {
+    return {
+      label: 'cross-site request forgery',
+      cwe: 'CWE-352',
+      category: 'auth-identity',
+      impact: 'A cross-site request performed a state change as the victim without a valid intent token.',
+      remediation: 'Require a per-session anti-CSRF token (or SameSite=Lax cookies) on state-changing routes.',
+    }
+  }
+  if (/^(?:sqli|sql_boolean|blind_sqli|injection|nosqli|ssti|template_injection|command_injection|cmdi|path_traversal|directory_traversal)$/.test(key)) {
+    return {
+      label: 'injection',
+      cwe: 'CWE-74',
+      category: 'injection-input',
+      impact: 'Injected input changed the query/command structure or timing of the server-side operation.',
+      remediation: 'Use parameterized queries and context-appropriate encoding; never concatenate input into a command.',
+    }
+  }
+  if (/^(?:xss|xss_stored|xss_reflected|markup|html_injection)$/.test(key)) {
+    return {
+      label: 'cross-site scripting',
+      cwe: 'CWE-79',
+      category: 'injection-input',
+      impact: 'Actor-supplied markup was stored or reflected and executed in another user’s browser context.',
+      remediation: 'Encode output for the HTML context and apply a restrictive Content-Security-Policy.',
+    }
+  }
+  if (/^(?:ssrf|blind_ssrf|xxe|blind_xxe|oob|webhook_forgery)$/.test(key)) {
+    return {
+      label: 'server-side request forgery',
+      cwe: 'CWE-918',
+      category: 'ssrf-redirects',
+      impact: 'The target fetched an attacker-supplied destination or out-of-band canary.',
+      remediation: 'Allowlist outbound destinations and disable external entity resolution for XML parsers.',
+    }
+  }
+  if (/^(?:race|race_double_spend)$/.test(key)) {
+    return {
+      label: 'race condition',
+      cwe: 'CWE-362',
+      category: 'business-logic-race',
+      impact: 'A synchronized burst of the same request produced divergent outcomes (over-spend or duplicate effect).',
+      remediation: 'Serialize the state transition (unique constraint, lock, or idempotency key).',
+    }
+  }
+  if (/^(?:business_logic|invariant_violation|workflow_skip)$/.test(key)) {
+    return {
+      label: 'business-logic invariant violation',
+      cwe: 'CWE-840',
+      category: 'business-logic-race',
+      impact: 'A workflow invariant was violated by replaying or skipping a legitimate step.',
+      remediation: 'Enforce the invariant server-side and re-validate workflow state on every transition.',
+    }
+  }
+  return {
+    label: 'information disclosure',
+    cwe: 'CWE-200',
+    category: 'misconfig-exposure',
+    impact: 'The response exposed data the requesting actor was not entitled to read.',
+    remediation: 'Filter responses server-side to the fields the caller is authorized to see.',
+  }
+}
 
 type Active = {
   assignment: Assignment
@@ -11266,6 +11377,55 @@ export class Execution {
           }
         },
 
+        // v7 M5: the Layer-3 script proof path, persisted as a receipt. Registered only when the
+        // worker backend can run an air-gapped verification session; a replay-only backend keeps the
+        // (unchanged) declarative compilers instead of producing an inert script tool.
+        ...(this.backendSupportsVerifyScript() ? {
+          guardian_verify: async (args: GuardianVerifyArgs) => {
+            const curRun = this.check(job)
+            const runtime: GuardianVerifyRuntime = args.runtime
+              ?? (args.scriptPath && /\.py$/i.test(args.scriptPath) ? 'python' : 'ts')
+            const script = typeof args.script === 'string' && args.script.trim()
+              ? args.script.trim()
+              : args.scriptPath
+                ? this.readAgentProofScript(reposDir, args.scriptPath)
+                : ''
+            if (!script) {
+              throw new Error('guardian_verify requires `script` (inline) or `scriptPath` (a file in the mounted workspace).')
+            }
+            const approved = this.approvedOriginsSet(curRun)
+            const proof = await runAgentScriptProof({
+              script,
+              runtime,
+              ...(args.title?.trim() ? { title: args.title.trim() } : {}),
+              broker: this.broker,
+              grant,
+              backend: this.backend,
+              runId: curRun.id,
+              assignmentId: job.assignment.id,
+              targetOrigins: [...approved].slice(0, 8),
+              signal: job.controller.signal,
+              canaryBroker: this.canaryBroker,
+              ...(args.timeoutMs ? { timeoutMs: args.timeoutMs } : {}),
+            })
+            if (!proof.verdict.confirmed) return summarizeGuardianVerifyOutcome(proof.verdict)
+            const persisted = this.persistAgentScriptProof({
+              run: curRun,
+              assignment: job.assignment,
+              script,
+              runtime,
+              title: args.title?.trim() || proof.claimTitle || undefined,
+              proof,
+              secrets: currentSecrets(),
+            })
+            return summarizeGuardianVerifyOutcome({
+              ...proof.verdict,
+              detail: `${proof.verdict.detail} Finding ${persisted.findingId} cites ${persisted.receiptId ? `ProofReceipt ${persisted.receiptId}` : 'the persisted script proof'} (replay spec ${persisted.replaySpecId}).`
+                .trim(),
+            })
+          },
+        } : {}),
+
         suggest_candidate_host: async ({ origin, source, thirdParty }) => {
           const curRun = this.check(job)
           const clean = this.parseOriginForRun(curRun, origin)
@@ -12155,6 +12315,262 @@ export class Execution {
         assignmentId: specRow.assignmentId,
         attempt: specRow.attemptCount,
       })
+    }
+  }
+
+  // --- Phase 3b: agent script proofs (v7 M5) ---------------------------------
+
+  /**
+   * The Layer-3 script path needs a backend that can open an air-gapped session with the attempt's
+   * verification RPC directory mounted. A replay-only backend (local-jq) must keep the declarative
+   * compilers instead of exposing a script tool that can never run.
+   */
+  private backendSupportsVerifyScript(): boolean {
+    return this.backend instanceof LinuxWorkerBackend
+  }
+
+  /** Resolve a workspace-relative script path inside the read-only repo mount, bounded. */
+  private readAgentProofScript(reposDir: string | undefined, scriptPath: string): string {
+    if (!reposDir) throw new Error('guardian_verify scriptPath requires a mounted workspace; pass `script` inline.')
+    const clean = scriptPath.trim().replace(/^\/+/, '')
+    if (!clean || clean.includes('\0') || clean.split(/[\\/]/).includes('..')) {
+      throw new Error('guardian_verify scriptPath must stay inside the mounted workspace.')
+    }
+    const full = join(reposDir, clean)
+    if (!full.startsWith(reposDir + sep) || !existsSync(full)) {
+      throw new Error('guardian_verify scriptPath was not found in the mounted workspace.')
+    }
+    const size = statSync(full).size
+    if (size <= 0 || size > 64 * 1024) throw new Error('guardian_verify script must be between 1 byte and 64 KiB.')
+    return readFileSync(full, 'utf8')
+  }
+
+  /**
+   * Persist a confirmed Layer-3 proof: the script (redacted, owner-only artifact), the receipt row
+   * (script hash, verdict, receipt + verification), and a finding that cites the receipt. The
+   * declarative fields on the row are attribution for reporting/retest only; the receipt is what
+   * confirms.
+   */
+  private persistAgentScriptProof(input: {
+    run: Run
+    assignment: Assignment
+    script: string
+    runtime: 'ts' | 'python'
+    title?: string
+    proof: AgentScriptProofResult
+    secrets: readonly NamedSecret[]
+  }): { findingId: string; replaySpecId: string; receiptId: string | null } {
+    const { run, assignment, proof } = input
+    const receipt = proof.receipt?.receipt ?? null
+    const verification = proof.receipt?.verification ?? null
+    const claim = receipt?.vulnClass ?? 'disclosure'
+    const attribution = agentProofAttribution(claim)
+    const origin = receipt?.target.origin
+      ?? proof.exchanges.find(exchange => exchange.sessionRole === 'probe')?.origin
+      ?? proof.exchanges[0]?.origin
+    if (!origin || !this.approvedOriginsSet(run).has(origin)) {
+      throw new BrokerDenied('The proof exchanges name an origin outside the current approved scope.')
+    }
+    const asset = run.candidates.find(candidate => candidate.origin === origin && run.approved.includes(candidate.id))
+    if (!asset) throw new BrokerDenied('The proof origin is not an approved asset of this run.')
+    const title = (input.title ?? proof.claimTitle ?? `${attribution.label} confirmed by script proof`).slice(0, 200)
+    const severity = (findingSeverities as readonly string[]).includes(proof.severity ?? '')
+      ? proof.severity as Finding['severity']
+      : 'high'
+    const scriptSha256 = createHash('sha256').update(input.script).digest('hex')
+    const scriptRedacted = redact(input.script, input.secrets)
+    const cleanTitle = redact(title, input.secrets)
+
+    const artifact = this.storage.addArtifact(
+      run,
+      assignment,
+      'replay',
+      `Agent proof script · ${cleanTitle}`,
+      JSON.stringify({
+        mode: 'agent_script',
+        runtime: input.runtime,
+        scriptSha256,
+        script: scriptRedacted,
+        receipt,
+        verification,
+        transcriptDigests: proof.transcriptDigests,
+      }, null, 2),
+      `agent-proof:${scriptSha256}`,
+      input.secrets,
+    )
+
+    const envelope: AgentScriptProofEnvelope = {
+      kind: 'agent_script',
+      runtime: input.runtime,
+      script: scriptRedacted,
+      scriptSha256,
+      verdict: 'confirmed',
+      ...(receipt?.vulnClass ? { vulnClass: receipt.vulnClass } : {}),
+      exchangeIds: [...new Set(proof.exchanges.map(exchange => exchange.exchangeId))].slice(0, 64),
+      transcriptDigests: proof.transcriptDigests.slice(0, 4),
+      receiptArtifactId: artifact.id,
+      confirmedAt: Date.now(),
+    }
+    const feedback: InlineVerifyFeedback = {
+      verdict: 'confirmed',
+      verificationTier: 'runtime_confirmed',
+      controlPassed: proof.verdict.attempts.every(attempt => attempt.oraclePassed),
+      assertionSummary: {
+        observed: verification?.observed ?? `${proof.verdict.attempts.length} signed script runs confirmed the claim.`,
+        expected: verification?.expected ?? 'the claimed impact is re-derivable from the recorded transcript',
+        ...(verification?.reason ? { reason: verification.reason } : {}),
+      },
+      stepStatuses: [],
+      retriesRemaining: maxInlineVerifyRetries,
+    }
+    const findingId = this.storage.findDuplicateChainFinding(run.id, run.goalRevision, {
+      origin,
+      cwe: attribution.cwe,
+      category: attribution.category,
+      title: cleanTitle,
+    })?.id ?? randomUUID()
+    const spec = this.agentProofAttributionSpec({
+      origin,
+      title: cleanTitle,
+      attribution,
+      severity,
+      envelope,
+      proof,
+      receipt,
+    })
+    const proofRecord: AgentScriptProofRecord = {
+      replaySpecId: '',
+      findingId,
+      verdict: 'confirmed',
+      runtime: input.runtime,
+      scriptSha256,
+      artifactId: artifact.id,
+      receipt: receipt && verification
+        ? {
+            receipt: {
+              vulnClass: receipt.vulnClass,
+              target: receipt.target,
+              exchangeIds: receipt.exchangeIds,
+              oobEventIds: receipt.oobEventIds,
+              browserTraceIds: receipt.browserTraceIds,
+              claimedDelta: receipt.claimedDelta,
+              ...(receipt.oracleEvents ? { oracleEvents: receipt.oracleEvents } : {}),
+              ...(receipt.requiredRole ? { requiredRole: receipt.requiredRole } : {}),
+              ...(receipt.resourceTenant ? { resourceTenant: receipt.resourceTenant } : {}),
+              ...(receipt.expectControlDenied !== undefined ? { expectControlDenied: receipt.expectControlDenied } : {}),
+              ...(receipt.proofPatterns ? { proofPatterns: receipt.proofPatterns } : {}),
+            } satisfies ReplayProofReceiptRow['receipt'],
+            verification: {
+              confirmed: verification.confirmed,
+              vulnClass: verification.vulnClass,
+              rule: verification.rule,
+              reason: verification.reason,
+              observed: verification.observed,
+              expected: verification.expected,
+            },
+          }
+        : null,
+      createdAt: Date.now(),
+    }
+    const specRow = this.storage.createReplaySpec(
+      run,
+      assignment,
+      findingId,
+      spec,
+      [origin],
+      { initialAttemptCount: 1, verifiedInline: true, lastVerificationDiff: feedback, proof: proofRecord },
+    )
+
+    const finding: Finding = {
+      id: findingId,
+      origin,
+      title: cleanTitle,
+      status: 'confirmed',
+      severity,
+      reason: verification?.reason ?? proof.verdict.detail ?? 'Confirmed by a Layer-3 verification script.',
+      remediation: attribution.remediation,
+      impact: receipt?.claimedDelta ?? attribution.impact,
+      recheck: `Re-run the persisted ${input.runtime} proof script and re-validate its receipt.`,
+      category: attribution.category,
+      cwe: attribution.cwe,
+      confidence: 'high',
+      verification: receipt
+        ? `ProofReceipt ${receipt.exchangeIds[0] ?? scriptSha256.slice(0, 12)} · ${verification?.rule ?? 'receipt'} rule · ${verification?.reason ?? 'verified'}`
+        : `Layer-3 script proof (${input.runtime}) · ${proof.verdict.attempts.length} signed runs · digest ${proof.transcriptDigests[0]?.slice(0, 12) ?? 'n/a'}`,
+      verificationTier: 'runtime_confirmed',
+      findingKind: 'multi_step_chain',
+      replaySpecId: specRow.id,
+      exchangeIds: receipt?.exchangeIds?.length ? [...receipt.exchangeIds] : envelope.exchangeIds,
+      evidenceIds: [artifact.id],
+      scopeRevision: run.scopeRevision,
+    }
+    this.storage.upsertChainFinding(run, asset.id, finding, specRow.id, [origin])
+    if (owaspCategories.includes(attribution.category as OwaspCategory) && this.permitted(run, origin)) {
+      this.storage.upsertCoverageEntry(run, assignment.id, {
+        origin,
+        category: attribution.category as OwaspCategory,
+        status: 'reported',
+        summary: `Confirmed via agent script proof: ${cleanTitle}`,
+        linkedFindingId: findingId,
+      })
+    }
+    this.storage.event(run.id, 'agent.script_proof_confirmed', `Agent script proof confirmed a ${attribution.label} finding on ${origin}.`, {
+      findingId,
+      replaySpecId: specRow.id,
+      artifactId: artifact.id,
+      scriptSha256,
+      receiptRule: verification?.rule ?? null,
+      transcriptDigests: proof.transcriptDigests,
+    })
+    return { findingId, replaySpecId: specRow.id, receiptId: receipt?.exchangeIds[0] ?? null }
+  }
+
+  /** Attribution-only declarative row for a script proof (never interpreted as a DSL confirm). */
+  private agentProofAttributionSpec(input: {
+    origin: string
+    title: string
+    attribution: ReturnType<typeof agentProofAttribution>
+    severity: Finding['severity']
+    envelope: AgentScriptProofEnvelope
+    proof: AgentScriptProofResult
+    receipt: import('./proof-receipt.ts').ProofReceipt | null
+  }): DeclarativeReplaySpec {
+    const cited = input.receipt?.exchangeIds ?? []
+    const ordered = [
+      ...input.proof.exchanges.filter(exchange => cited.includes(exchange.exchangeId)),
+      ...input.proof.exchanges.filter(exchange => !cited.includes(exchange.exchangeId)),
+    ].slice(0, 8)
+    const steps = (ordered.length >= 2 ? ordered : [...ordered, ...ordered]).slice(0, 8).map((exchange, index) => ({
+      id: `proof_${index + 1}`,
+      role: index === 0 ? 'control' as const : 'probe' as const,
+      description: `${exchange.method.toUpperCase()} ${exchange.pathAndQuery} (agent script proof)`.slice(0, 400),
+      ...(exchange.status !== null ? { expectedStatus: exchange.status } : {}),
+      request: {
+        origin: exchange.origin,
+        method: (httpMethods as readonly string[]).includes(exchange.method.toUpperCase())
+          ? exchange.method.toUpperCase() as typeof httpMethods[number]
+          : 'GET' as const,
+        pathAndQuery: exchange.pathAndQuery.startsWith('/') ? exchange.pathAndQuery : `/${exchange.pathAndQuery}`,
+        followRedirects: false,
+        ...(exchange.personaHandle ? { persona: exchange.personaHandle } : {}),
+      },
+    }))
+    return {
+      version: 1,
+      kind: 'http_chain',
+      spaCatchallControl: false,
+      origin: input.origin,
+      title: input.title,
+      category: input.attribution.category,
+      cwe: input.attribution.cwe,
+      severity: input.severity,
+      severityRationale: `Confirmed by a Layer-3 verification script whose receipt was re-checked against the host transcript (${input.attribution.label}).`,
+      impact: input.attribution.impact,
+      remediation: input.attribution.remediation,
+      recheckInstructions: 'Re-run the persisted guardian_verify script; the finding is confirmed only by its receipt.',
+      assertionsJq: '[.[] | select(.status >= 200)]',
+      agentScript: input.envelope,
+      steps,
     }
   }
 
