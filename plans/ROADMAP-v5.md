@@ -758,3 +758,27 @@ Three precision streams merged in engine-lane order:
 - shopflow held-out **11/19 @100% precision** after the fixes.
 
 **Coordinator follow-through:** added the reviewer's rule that an **anonymous 401 is not a peer control for a cross-tenant write** (`peerDenial` returns false when the control is unauthenticated and the mutation is cross-tenant), in both the authorization and business-logic assessors. Test updated to accept either rejection reason (both are valid).
+
+### 2026-11-24 — throughput fixed (p50 104 s, 16/22 acme) but one deterministic target regressed
+
+**`stall-warmpool` merged (`1875bb0`).** Reviewer was right that the p50 rise was stalls + container churn, not turn budgets:
+- **28 s no-token watchdog** (`PROVIDER_STALL_NO_TOKEN_MS`, clamped 25–30 s): aborts a silent stream once and requests one bounded requeue. Every text/thinking/tool delta restarts the window, so slow-but-streaming is never killed. New metrics `providerStallTimeouts`, `providerStallWallSavedMs`.
+- **Warm pool K=6** keyed on run id + persona credential generation (shared pool keyed on cell + image + label + tenant): reuse only after a clean session, removed on rotation/dirty cleanup, and `closeWarmPool()` on stop. Metrics `containersReused`, `containerReuseHitRate`, `warmPoolPolicyRotations`.
+
+| acme agentic, 600 s, K=6 | value |
+|---|---|
+| recall / precision | **16/22 (72.7%)**, 100%, 0 decoy/unmatched |
+| assignment p50 / p90 | **104.4 s / 177.5 s** (completed-only p50 **72.8 s**) |
+| stall telemetry | 9 timeouts, 9 bounded retries, **300 s wall saved** |
+| pool | 8 launches / 23 reuses / 30 sessions → **77% hit rate**, 0 cold |
+
+Dev floor still 36/59 and 0 spread on that branch.
+
+**Regression found by my own re-measurement (and it is mine, not the stream's):** dev opsportal dropped **10/18 → 9/18**, losing `og.diag-cmdi`. Trace from the kept run (`/tmp/ops-cmdi`):
+1. `command_injection POST /api/diagnostics/run param=host -> no_signal`
+2. synthesized `http_chain` rejected — "no failing probe arm" (correct under the new status-only ban)
+3. `rce_proof` dismissed — "proof-of-execution check did not pass (possible reflection or unexecuted payload)"
+4. `command_injection ... param=endpointHost -> signal`
+5. **no spec is ever synthesized from that later signal.**
+
+So the loss is an ordering/dedupe interaction: the proof is synthesized from the first param attempt, and a later-param `signal` on the same endpoint never triggers re-synthesis. `cmdi-signal` is fixing this generally (a signal on any param of an endpoint must synthesize from that param's evidence, bounded and deterministic), with dev 36/59 + opsportal 10/18 required at 100%.
