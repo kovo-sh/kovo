@@ -268,159 +268,11 @@ test('recipe-wired boolean receipts are byte-identical across runs on identical 
 })
 
 // ============================================================================
-// Authz object access: access_boundary (read) and persisted_mutation (write)
-// ============================================================================
-
-function authzHypothesis(method: 'GET' | 'PATCH', readbackPath?: string): EngineHypothesis {
-  return {
-    key: `authz:${method}`,
-    endpoint: { id: 'ep-3', origin: ORIGIN, method, pathTemplate: '/api/invoices/{{id}}', params: [] },
-    probeClass: 'authz_matrix',
-    intent: 'authz',
-    method,
-    pathAndQuery: '/api/invoices/{{id}}',
-    ownerPersona: 'acme_owner',
-    otherPersona: 'globex_member',
-    resourceIds: ['42'],
-    jsonBody: method === 'PATCH' ? { amount: 1 } : undefined,
-    ...(readbackPath ? { readbackPath } : {}),
-    risk: 75,
-  }
-}
-
-function authzProbe(method: 'GET' | 'PATCH'): DifferentialResult {
-  return {
-    probeClass: 'authz_matrix',
-    origin: ORIGIN,
-    pathAndQuery: '/api/invoices/42',
-    verdict: 'signal',
-    summary: 'cross-actor access',
-    anomalies: [{ type: 'unauthorized_access', method, resourceId: '42', actor: 'other_persona', similarityToOwner: 0.98, bodyTemplate: { amount: 1 } }],
-    details: {
-      matrix: [
-        { actor: 'owner', resourceId: '42', method, status: 200, accessible: true, similarityToOwner: 1 },
-        { actor: 'anonymous', resourceId: '42', method, status: 401, accessible: false, similarityToOwner: 0 },
-        { actor: 'other_persona', resourceId: '42', method, status: 200, accessible: true, similarityToOwner: 0.98 },
-      ],
-    },
-    requestsSent: 9,
-    exchangeIds: [],
-    stoppedReason: null,
-    notes: [],
-    durationMs: 1,
-  }
-}
-
-const acmePersonas = () => [
-  { handle: 'acme_owner', roleLabel: 'owner (acme)', privilege: 'admin' as const, tenant: 'acme' },
-  { handle: 'globex_member', roleLabel: 'member (globex)', privilege: 'member' as const, tenant: 'globex' },
-]
-
-test('recipe-wired http_chain/bola confirms a cross-tenant read and rejects the hardened route', async () => {
-  const plan = planFloorRecipe({
-    hypothesis: authzHypothesis('GET'),
-    probe: authzProbe('GET'),
-    specKind: 'http_chain',
-    vulnClass: 'bola',
-    personas: acmePersonas(),
-  })
-  assert.ok(plan, 'http_chain/bola must be wired')
-  assert.equal(plan.recipeId, 'access_boundary')
-  assert.equal(plan.skipReason, undefined)
-
-  const record = { id: 42, ownerEmail: 'acme_owner', amount: 500, note: 'private settlement' }
-  const vulnerable = new FakeBroker(req => {
-    if (!req.persona) return { status: 401, body: JSON.stringify({ error: 'unauthenticated' }) }
-    return { status: 200, body: JSON.stringify(record) }
-  })
-  let cursor = 0
-  const execution = await runPlannedRecipe({
-    plan,
-    hypothesis: authzHypothesis('GET'),
-    broker: vulnerable as unknown as RequestBroker,
-    grant,
-    signal,
-    recordExchange: () => `ax-${++cursor}`,
-  })
-  assert.equal(execution.result.confirmed, true, execution.failure?.message ?? 'unexpected rejection')
-  assert.equal(execution.result.verification.rule, 'impact')
-  assert.equal(vulnerable.requests.length, 3)
-  assert.deepEqual(vulnerable.requests.map(request => request.persona ?? null), [
-    'acme_owner',
-    null,
-    'globex_member',
-  ])
-
-  const parsed = declarativeReplaySpecSchema.safeParse(recipeSpecRecord(plan, execution).spec)
-  assert.equal(parsed.success, true, parsed.success ? '' : JSON.stringify(parsed.error.issues))
-
-  const hardened = new FakeBroker(req => (!req.persona
-    ? { status: 401, body: JSON.stringify({ error: 'unauthenticated' }) }
-    : req.persona === 'globex_member'
-      ? { status: 403, body: JSON.stringify({ error: 'forbidden' }) }
-      : { status: 200, body: JSON.stringify(record) }))
-  const rejected = await runPlannedRecipe({
-    plan,
-    hypothesis: authzHypothesis('GET'),
-    broker: hardened as unknown as RequestBroker,
-    grant,
-    signal,
-    recordExchange: (() => { let n = 0; return () => `hx-${++n}` })(),
-  })
-  assert.equal(rejected.result.confirmed, false)
-  assert.equal(rejected.failure?.code, 'precondition_unsatisfied')
-  assert.ok(rejected.failure!.missingRoles.includes('probe_request'), rejected.failure!.missingRoles.join(','))
-})
-
-test('recipe-wired http_chain/cross_tenant_write confirms through a separate readback', async () => {
-  const plan = planFloorRecipe({
-    hypothesis: authzHypothesis('PATCH', '/api/invoices/42'),
-    probe: authzProbe('PATCH'),
-    specKind: 'http_chain',
-    vulnClass: 'cross_tenant_write',
-    personas: acmePersonas(),
-  })
-  assert.ok(plan)
-  assert.equal(plan.recipeId, 'persisted_mutation')
-
-  let mutated = false
-  const shop = new FakeBroker(req => {
-    if (!req.persona) return { status: 401, body: JSON.stringify({ error: 'unauthenticated' }) }
-    if (req.method === 'PATCH') {
-      mutated = true
-      return { status: 200, body: JSON.stringify({ ok: true }) }
-    }
-    return { status: 200, body: JSON.stringify({ id: 42, amount: mutated ? 1 : 500, ownerEmail: 'acme_owner' }) }
-  })
-  let cursor = 0
-  const execution = await runPlannedRecipe({
-    plan,
-    hypothesis: authzHypothesis('PATCH', '/api/invoices/42'),
-    broker: shop as unknown as RequestBroker,
-    grant,
-    signal,
-    recordExchange: () => `wx-${++cursor}`,
-  })
-  assert.equal(execution.result.confirmed, true, execution.failure?.message ?? 'unexpected rejection')
-  assert.deepEqual(execution.result.steps.map(step => step.role), ['baseline_read', 'mutation_probe', 'post_mutation_read'])
-  assert.deepEqual(shop.requests.map(request => request.persona ?? null), [
-    'acme_owner',
-    'globex_member',
-    'acme_owner',
-  ])
-})
-
-// ============================================================================
 // No-fallback assertion + explicit legacy path for unmapped kinds
 // ============================================================================
 
 test('the no-fallback assertion throws for every wired pair and stays quiet for unmapped kinds', () => {
-  for (const [kind, vulnClass] of [
-    ['sql_boolean_diff', 'sqli'],
-    ['http_chain', 'bola'],
-    ['http_chain', 'bfla'],
-    ['http_chain', 'cross_tenant_write'],
-  ] as const) {
+  for (const [kind, vulnClass] of [['sql_boolean_diff', 'sqli']] as const) {
     assert.equal(wiredRecipeForSpecKind(kind, vulnClass) !== null, true, `${kind} must be wired`)
     assert.throws(
       () => assertNotRecipeWiredLegacyCall({ kind, category: vulnClass }),
@@ -434,6 +286,9 @@ test('the no-fallback assertion throws for every wired pair and stays quiet for 
     ['http_chain', 'open_redirect'],
     ['http_chain', 'xss_reflected'],
     ['http_chain', 'info_disclosure'],
+    ['http_chain', 'bola'],
+    ['http_chain', 'bfla'],
+    ['http_chain', 'cross_tenant_write'],
     ['race_burst', 'race_double_spend'],
     ['sql_time_diff', 'sqli'],
     ['browser_chain', 'xss_reflected'],
@@ -447,6 +302,9 @@ test('the no-fallback assertion throws for every wired pair and stays quiet for 
 test('unmapped families still synthesize legacy specs and never get a recipe plan', () => {
   const probe = booleanProbe()
   for (const [specKind, vulnClass] of [
+    ['http_chain', 'bola'],
+    ['http_chain', 'bfla'],
+    ['http_chain', 'cross_tenant_write'],
     ['http_chain', 'mass_assignment'],
     ['http_chain', 'info_disclosure'],
     ['http_chain', 'xxe'],

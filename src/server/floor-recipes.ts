@@ -42,6 +42,10 @@
  * least two paired control/probe rounds with an identical request shape apart from the injected
  * predicate, and `verifyReceipt()` requires a stable structural response difference after token
  * stripping, a stable control baseline, and no 5xx. Echo/nonce-only changes are rejected.
+ *
+ * Cut 3a wires only the rows in `WIRED_SPECKIND_RECIPES` (currently `sql_boolean_diff`). The other
+ * rows above stay on the legacy verifier and are listed in `LEGACY_UNWIRED_SPECKINDS` with the
+ * measured blocking reason; `wiredRecipeForSpecKind` is the single source of truth for the guard.
  */
 import type { AmbientAuth, ImpactStep, RoleName } from './oracle-invariants.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
@@ -1178,21 +1182,21 @@ export function recipeForSpecKind(specKind: string, vulnClass?: string | null): 
  */
 export const WIRED_SPECKIND_RECIPES: readonly SpecKindRecipeMapping[] = [
   {
-    specKind: 'http_chain',
-    vulnClasses: ['bola', 'idor', 'bfla', 'authorization', 'cross_tenant_read', 'cross_tenant_write'],
-    recipe: 'access_boundary',
-    note: 'Read hits run access_boundary (entitled control served, matrix-denied control refused, probe served); mutating hits run persisted_mutation (baseline read, cross-actor write, separate readback).',
-  },
-  {
     specKind: 'sql_boolean_diff',
     vulnClasses: ['sqli'],
     recipe: 'boolean_or_timing',
-    note: 'Boolean rule: paired true/false predicate rounds, stable structural delta, no 5xx.',
+    note: 'Boolean rule: paired true/false predicate rounds, stable structural delta, no 5xx. Retest re-runs the paired requests through the recipe (reproduced vs fixed).',
   },
 ]
 
 /** Rows whose recipe exists but that stay on the legacy verifier for a measured reason. */
 export const LEGACY_UNWIRED_SPECKINDS: readonly { specKind: string; vulnClasses: readonly string[]; recipe: FloorRecipeId; reason: string }[] = [
+  {
+    specKind: 'http_chain',
+    vulnClasses: ['bola', 'idor', 'bfla', 'authorization', 'cross_tenant_read', 'cross_tenant_write'],
+    recipe: 'access_boundary',
+    reason: 'Measured on dev seed 1: wiring the authz recipe lost 5/10 legacy authz confirmations (shopflow order/customer reads, shipment write, admin impersonate; opsportal ticket read). These routes never deny a third actor — the legacy proof is a bogus-id negative control plus a write readback — and the access_boundary recipe cannot yet express a same-route bogus-id control or a baseline-write/self-state readback. Kept legacy until those two evidence shapes exist.',
+  },
   {
     specKind: 'sql_time_diff',
     vulnClasses: ['sqli'],

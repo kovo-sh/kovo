@@ -23,14 +23,12 @@ import type { DifferentialResult } from './surface-engine.ts'
 import { injectUniversalParam } from './probes/context.ts'
 import { floorRecipe, runFloorRecipe, wiredRecipeForSpecKind } from './floor-recipes.ts'
 import type {
-  AccessBoundaryArgs,
   BooleanOrTimingArgs,
   FloorActor,
   FloorRecipeArgs,
   FloorRecipeExecution,
   FloorRecipeId,
   FloorRequestSpec,
-  PersistedMutationArgs,
   RaceBurstArgs,
 } from './floor-recipes.ts'
 import type { ImpactStep, RoleName } from './oracle-invariants.ts'
@@ -235,116 +233,6 @@ function planRaceRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   return { ...sketch, args }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Authz object/function access (read boundary and write readback)
-// ---------------------------------------------------------------------------------------------
-
-interface ProbeMatrixRow {
-  actor?: string
-  resourceId?: string
-  method?: string
-  status?: number
-  accessible?: boolean
-}
-
-function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
-  const hyp = input.hypothesis
-  const sketch: FloorRecipePlan = {
-    recipeId: 'access_boundary',
-    specKind: input.specKind,
-    vulnClass: input.vulnClass,
-    endpoint: hyp.endpoint.pathTemplate,
-    args: {} as FloorRecipeArgs,
-  }
-  const matrix = Array.isArray(input.probe.details.matrix) ? input.probe.details.matrix as ProbeMatrixRow[] : null
-  const hits = input.probe.anomalies
-    .filter(anomaly => anomaly.type === 'unauthorized_access')
-    .sort((a, b) => {
-      const ga = String(a.method ?? 'GET') === 'GET' ? 0 : 1
-      const gb = String(b.method ?? 'GET') === 'GET' ? 0 : 1
-      if (ga !== gb) return ga - gb
-      return Number(b.similarityToOwner ?? 0) - Number(a.similarityToOwner ?? 0)
-    })
-  if (hits.length === 0) return { ...sketch, skipReason: 'no unauthorized_access evidence on the probe result' }
-  const hit = hits[0]!
-  const hitActor = String(hit.actor ?? '')
-  const method = String(hit.method ?? 'GET').toUpperCase()
-  if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
-    return { ...sketch, skipReason: `authz hit used unsupported method ${method}` }
-  }
-  const resourceId = String(hit.resourceId ?? '')
-  const functionLevel = hit.functionLevel === true || hyp.functionLevel === true
-  const path = functionLevel
-    ? hyp.pathAndQuery
-    : hyp.pathAndQuery.replaceAll('{{id}}', encodeURIComponent(resourceId))
-  if (!functionLevel && !/^[A-Za-z0-9_.:-]{1,128}$/.test(resourceId)) {
-    return { ...sketch, skipReason: 'authz hit did not carry a usable resource identifier' }
-  }
-  const probeHandle = hitActor === 'anonymous' ? null : (hyp.otherPersona ?? null)
-  const ownerHandle = hyp.readbackPersona ?? hyp.ownerPersona ?? null
-  if (!ownerHandle || (!probeHandle && hitActor !== 'anonymous')) {
-    return { ...sketch, skipReason: 'authz hypothesis lacks an entitled owner or probe persona' }
-  }
-  const headers = { ...(hyp.headers ?? {}), ...(input.headers ?? {}) }
-  const scopedHeaders = Object.keys(headers).length > 0 ? { headers } : {}
-  const mutating = method !== 'GET'
-  const rowsForId = matrix
-    ? (functionLevel ? matrix : matrix.filter(row => String(row.resourceId ?? '') === resourceId))
-    : []
-  const deniedRow = rowsForId.find(row => row.accessible === false && row.actor !== 'owner') ??
-    rowsForId.find(row => row.accessible === false)
-  const deniedHandle = deniedRow?.actor === 'anonymous' ? null : (deniedRow?.actor ?? null)
-  if (deniedRow === undefined) {
-    return { ...sketch, skipReason: 'probe matrix held no denied control arm for the target resource' }
-  }
-  const ownerActor = floorActorFor(ownerHandle, input.personas)
-  const probeActor = floorActorFor(probeHandle, input.personas)
-  const deniedActor = floorActorFor(deniedHandle, input.personas)
-
-  if (mutating) {
-    const baselinePath = hyp.readbackPath
-    if (!baselinePath) return { ...sketch, skipReason: 'mutating authz hit has no harvested readback route' }
-    const body = (hit.bodyTemplate !== undefined && hit.bodyTemplate !== null
-      ? hit.bodyTemplate
-      : hyp.jsonBody) as Record<string, unknown> | undefined
-    if (!body || typeof body !== 'object' || Array.isArray(body)) {
-      return { ...sketch, skipReason: 'mutating authz hit has no JSON body template' }
-    }
-    const args: PersistedMutationArgs = {
-      origin: hyp.endpoint.origin,
-      method,
-      pathAndQuery: path,
-      baselinePathAndQuery: baselinePath,
-      readbackPathAndQuery: baselinePath,
-      baselineMethod: 'GET',
-      readbackMethod: 'GET',
-      actor: probeActor,
-      readbackActor: ownerActor,
-      body,
-      vulnClass: input.vulnClass,
-      ...(hyp.authzRequiredRole ? { requiredRole: hyp.authzRequiredRole } : {}),
-      ...(ownerActor.tenant ? { resourceTenant: ownerActor.tenant } : {}),
-      ...scopedHeaders,
-    }
-    return { ...sketch, recipeId: 'persisted_mutation', args }
-  }
-
-  const args: AccessBoundaryArgs = {
-    origin: hyp.endpoint.origin,
-    method,
-    pathAndQuery: path,
-    owner: ownerActor,
-    probe: probeActor,
-    denied: deniedActor,
-    vulnClass: input.vulnClass,
-    ...(hyp.authzRequiredRole ? { requiredRole: hyp.authzRequiredRole } : {}),
-    ...(ownerActor.tenant ? { resourceTenant: ownerActor.tenant } : {}),
-    expectControlDenied: true,
-    ...scopedHeaders,
-  }
-  return { ...sketch, args }
-}
-
 /**
  * Rebuild a boolean recipe plan from a persisted `sql_boolean_diff` spec. Used by
  * `retestReplaySpec` so the retired legacy branch can stay deleted: retest re-executes the same
@@ -453,8 +341,6 @@ export function planFloorRecipe(input: FloorRecipePlanInput): FloorRecipePlan | 
   switch (recipe) {
     case 'boolean_or_timing': return planBooleanRecipe(input)
     case 'race_burst': return planRaceRecipe(input)
-    case 'access_boundary':
-    case 'persisted_mutation': return planAuthzRecipe(input)
     default: return {
       recipeId: recipe,
       specKind: input.specKind,
