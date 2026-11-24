@@ -27,36 +27,40 @@ All product rows are real `Execution` on the 3-app realistic dev cells (acme-saa
 
 | Measure | Result | Scope / caveat |
 | :--- | :--- | :--- |
-| Product floor (`Execution --no-llm`) | **31 / 59 (52.5%)**, **100%** precision, 0 decoy/unmatched | acme 11, shopflow 11, opsportal 9 |
-| Floor determinism | **0 spread**, 3 repeats identical (site sets included); loaded runs match idle (`driftApps=0`) | Measured on the **26/59** tree; the **31/59** tree is not yet re-gated (M0) |
-| Agentic, 600 s ample budget, K=6 (**acme**) | **13 / 22 (59.1%)**, **100%** precision, **+2 net** | 25 investigations, 2,225 of 31,000 requests, $0.65 |
-| Agentic, 45 min, run 1 (**acme**) | **15 / 22 (68.2%)**, **88.2%** precision (2 unmatched), **+4 net** | 83 investigations, 4,288 of 112,000 requests, $2.99 |
-| Agentic, 45 min, kept rerun (**acme**) | **13 / 22 (59.1%)**, **92.9%** precision (1 unmatched), **+2 net** | $3.01 |
-| Agentic K=6 n=3, pre budget split (**acme ×3**) | **11 / 12 / 11 of 22**; precision **100% / 92.3% / 100%**; median lift **0** | $0.48–0.51; p50 assignment 53 s. Superseded by the ample-budget rows above |
-| XBEN-25 | **25 / 25**, 100% precision | Hard regression gate; restored this cycle from 24/25 |
-| held-out-saas | **20 / 20** + **20 / 20 patches** | Hard regression gate |
-| Procedural control (acme seed 42) | **16 / 22** | Deterministic capability harness, not the product |
-| Realism #2 / #3 / #4 | **0 capability confirms** | #3 and #4 wiring PASS; #2 was **wiring FAIL** at check-in #8 (no `pending_oob` registered) and is an M1 re-verify item, not a pass |
-| Salted held-out product floor | **23 / 58** | **Stale** — last measured before the floor restore; must be re-run before any held-out claim |
-| `execution.ts` size | ~**10.5K LOC** | DSL retirement not started |
+| Product floor (`Execution --no-llm`) | **33 / 59 (55.9%)**, **100%** precision, 0 decoy/unmatched | acme 12, shopflow 11, opsportal 10 |
+| Floor determinism | **0 spread**, 3 repeats identical (site sets included, `driftApps=0`) | Re-gated on the current tree |
+| Salted held-out product floor (seed 1000042) | **24 / 58 (41.4%)**, **100%** precision | acme 9, shopflow 8, opsportal 7 |
+| Agentic, 600 s generous, 3 apps dev | **35 / 59 (59.3%)**, **100%** precision, 0 unmatched, **+2 net** | acme 13 (+1), shopflow 12 (+1), opsportal 10 (**+0**); ~$1.0 total |
+| Agentic, 600 s generous, 3 apps salted held-out | **24 / 58**, **+0 net**, **2 unmatched FPs** (acme, shopflow) | 19–23 investigations/app; 0.53 $/app. Blocked, see V7.2 |
+| Agentic rotation (shopflow, resumed, 300 s) | **3 / 19**, **100%** precision, p50 **77.5 s** | After injection-class precedence fix |
+| XBEN-25 | **25 / 25**, 100% precision | Hard regression gate |
+| held-out-saas | **20 / 20** + **20 / 20 patches** (`allPatches=fixed`) | Hard regression gate |
+| Realism #2 (`wan-oob`, no-llm) | **2 TP / 0 FP**; async **SSRF ✅**, async **XXE ✅**; gate still fails on blind-SQLi, blended async FNR 33.3%, chain 2/3 | Gate denominator split in flight |
+| Realism #3 (`staging-concurrency`) | **capability PASS** — write-BOLA, h2 single-packet race (2 ms spread, 4 acks / 1 debit), checkout tampering; 0 leaks; 100% precision | |
+| Realism #4 (`monorepo-whitebox`) | wiring PASS; 4-hop confirmations **0 / 3** | capability gap, not wiring |
+| `execution.ts` size | ~**11.5K LOC** | Grew with brief slices; Cut 3a target < 8.5K |
 
 **Scope rule carried forward:** product capability is always reported as `Execution --no-llm` (deterministic floor) **and** agentic (increment over that floor), on dev **and** salted held-out. Harness/procedural numbers are secondary evidence, never the product score.
 
 ### V7.2 Certification status
 
-**NOT CERTIFIED.** The v6 line is not certifiable as-is. The hard blockers are precision, incremental lift, and realism capability; determinism and preservation are pending re-gates.
+**TWO CLAIMS, TWO STATUSES.** "Floor + realism wiring" is recordable now; **"agentic lift" is not certifiable** (dev +2, held-out +0).
 
 | Gate | Target | Measured | Status |
 | :--- | :--- | :--- | :--- |
-| Worst-run precision | 100% on every lift cell | **88.2%–92.9%** at the 45-min horizon (1–2 unmatched per run) | **FAIL** |
-| Incremental lift | ≥ +10 pp dev / ≥ +8 pp held-out | **+2 net** at 600 s; **+2..+4** at 45 min (acme only, of 22) | **FAIL** |
-| Floor determinism | spread ≤ 1 target (target 0) | 0 spread on the determinism tree; 31/59 tree not yet re-gated | **PASS pending re-gate** |
-| Floor preservation | ≥ 0.95 | 1.00 on the acme unified cell; not measured on shopflow/opsportal | **PARTIAL** |
+| **Floor** dev | 0 spread, 100% precision | 33/59, 3 identical repeats, 100% | **PASS** |
+| **Floor** salted held-out | 100% precision, no regression | 24/58, 100% | **PASS** |
 | Legacy regression | xben 25/25, held-out 20/20 + 20/20 | both hold | **PASS** |
-| Realism capability | ≥75% on #1–#4 | **0 confirms** | **FAIL** |
-| Chains | ≥ 4/6 | not re-measured in v6 | **UNMEASURED** |
+| Realism wiring | #2–#4 wiring pass | #2 PASS, #3 PASS, #4 PASS | **PASS** |
+| Realism capability | ≥75% on #1–#4 | #3 PASS (3/3 confirms); #2 2/4 planted; #4 0/3 | **PARTIAL** |
+| Worst-run precision (agentic) | 100% on every lift cell | dev 100%; **held-out 2 unmatched FPs** | **FAIL** |
+| Agentic lift | ≥ +6–8 pp dev / ≥ +6 pp held-out | dev **+2 (+3.4 pp)**; held-out **+0** | **FAIL** |
+| Dispatch coverage | ready steps are not stranded | opsportal **1 of 7** planned, acme 2 of 19 | **FAIL (P0)** |
+| Chains | ≥ 4/6 | #2 chain 2/3; not re-measured elsewhere | **PARTIAL** |
 
-Two claims that must not be made: (a) "agentic adds +4 net" without saying it is acme-only at a 45-minute horizon where precision fell to 88.2%; (b) "realism is wired and working" — wiring and capability are separate results, and capability is zero.
+**M0-interim milestone (recorded 2026-11-24, pre-Cut3):** the floor (33/59 dev, 24/58 held-out, 0-spread, 100% precision), legacy regression gates, realism wiring, Realism #3 capability, and Realism #2 async SSRF+XXE are citable **with the explicit provenance "pre-Cut3: floor still confirms via declarative specs in `replay-verifier.ts`; receipts are shadow/convert for the agent path."** Cut 3a retires six of those spec families; the milestone must be re-gated after it lands.
+
+Two claims that must not be made: (a) "agentic lift is proven" — held-out is exactly the floor, and the dev +2 sits inside a dispatch defect that left 13 of 14 planned acme steps and 6 of 7 opsportal steps undispatched; (b) "realism is done" — #4 has 0 confirmations and #2 misses blind SQLi plus one chain leg.
 
 ### V7.3 Smoke battery (adopted design)
 
@@ -99,15 +103,15 @@ The fast battery answers one question: **did this change break the funnel, the p
 
 ### V7.5 Honest limitations
 
-1. **One app carries the lift story.** Every agentic number above is acme-only. There is no 3-app agentic measurement on the current tree, so "+2 net" is not a +10 pp aggregate claim.
+1. **The agentic increment is currently ~0.** Dev +2 and held-out +0, with the dev +2 produced while 13 of 14 planned acme steps and 6 of 7 opsportal steps were never dispatched. Treat every prior "+2 net" as unproven until the dispatch funnel is fixed and re-measured.
 2. **Longer horizon trades precision for recall.** 15/22 at 88.2% is not better than 13/22 at 100% until the unmatched claims are triaged. Worst-run precision at the horizon is the gate, not budget.
-3. **Budgets are not the constraint.** 3.8% of the agent request allowance, 13–30% of dollars, 1.1–1.7 req/s of a 50 RPS cap. Throughput and hypothesis/proof quality are.
-4. **Realism capability is 0.** #3/#4 wiring passes say the plumbing is connected; they say nothing about conversion. #2's wiring was still failing at last check.
-5. **The deterministic floor is not certified on the current tree.** 31/59 is measured; the 0-spread re-gate and floor preservation on all three apps are M0.
-6. **Salted held-out is stale.** 23/58 predates the floor restore; no held-out or gap claim is current.
-7. **Chains, white-box, and reason-bench are unmeasured in v6.** They remain Phase-2/M2 gates.
+3. **Budgets are not the constraint.** The binding limits are dispatch coverage, hypothesis/proof quality, and (on randomized held-out surfaces) structural assumptions in the deterministic layer. 45 min produced 0 marginal recall over 10 min.
+4. **Realism capability is partial, not complete.** #3 passes end-to-end. #2 confirms async SSRF and XXE (2 TP / 0 FP) but misses blind SQLi and one chain leg; the 33.3% "async FNR" blended an unrelated capability miss into the OOB denominator and is being split into `oob_wiring_fnr` and `fixture_capability_recall`. #4 has 0 of 3 4-hop confirmations despite 600 B slices attached.
+5. **The deterministic floor is re-gated and green** (33/59 dev, 0 spread, 24/58 held-out, 100% precision).
+6. **Held-out surfaces lag dev by 14.5 pp** on the floor (55.9% vs 41.4%). That is residual Layer-2 structure on randomized routes; it must be closed by Layer 3 (agents + white-box), not by more deterministic regexes.
+7. **Chains, white-box conversion, and reason-bench remain M1/M2 gates.** #2's chain is at 2/3; #4's 4-hop conversion is at 0/3.
 8. **The smoke battery is not yet calibrated.** Tier 1 is a tripwire until the 8-variant study lands; Tier 2 blind spots (cold integration, DB drift) are real.
-9. **DSL retirement has not started.** `execution.ts` remains ~10.5K LOC; certification must not be run on code scheduled for deletion without deciding the order (M0 open decision).
+9. **DSL retirement is partially started.** Cut 1–2 landed (agent path on ProofReceipt; floor receipts in shadow) and six typed floor recipes exist, but the production caller is not wired, so `execution.ts` is ~11.5K LOC and `replay-verifier.ts` still confirms the floor. Cut 3a is in flight with a no-fallback assertion.
 
 ### V7.6 Reporting rule
 
