@@ -875,11 +875,11 @@ export function assessMassAssignmentImpact(input: ImpactInput): MassAssignmentAs
       evidence,
     }
   }
-  if (protectedFields.length > 0 && protectedFields.every(isPriceField) && isCreateShapedProbe(mutatingProbe) && !oracleDeclared) {
+  if (protectedFields.length > 0 && protectedFields.every(isPriceField) && !oracleDeclared) {
     return {
       required: true,
       satisfied: false,
-      reason: `A create-time caller-chosen money value (${protectedFields.slice(0, 6).join(', ')}) persisted, but no catalog or invariant event binds it: a caller-supplied amount is not mass assignment of an entitlement.`,
+      reason: `A caller-chosen money value (${protectedFields.slice(0, 6).join(', ')}) persisted, but no catalog or invariant event binds it: a caller-supplied amount is not mass assignment of an entitlement.`,
       evidence,
     }
   }
@@ -1022,11 +1022,11 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
   // may legitimately accept it, and no control arm binds it. Require the endpoint's declared
   // invariant event for price/amount-only persistences on create-shaped probes.
   const priceOnly = labels.protectedFields.length > 0 && labels.protectedFields.every(isPriceField)
-  if (labels.persisted && priceOnly && isCreateShapedProbe(mutatingProbe) && !labels.oracleDeclared) {
+  if (labels.persisted && priceOnly && !labels.oracleDeclared) {
     return {
       required: true,
       satisfied: false,
-      reason: `A create-time caller-chosen money value (${labels.protectedFields.slice(0, 6).join(', ')}) persisted, but no invariant event is declared and no control arm binds the value: a caller-supplied amount is not an invariant violation.`,
+      reason: `A caller-chosen money value (${labels.protectedFields.slice(0, 6).join(', ')}) persisted, but no invariant event is declared and no control arm binds the value: a caller-supplied amount is not an invariant violation.`,
       evidence: labels,
     }
   }

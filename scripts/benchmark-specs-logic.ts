@@ -208,6 +208,9 @@ export function synthInvariantViolation(o: HypothesisOutcome, env: ProbeEnv): Sy
     spec: {
       ...baseFields(env, title, 'CWE-840', 'business-logic', 'high', jq),
       kind: 'http_chain',
+      // The probe observed the endpoint's invariant anomaly; declare it so the shared verifier can
+      // require an invariant source for a caller-chosen money value.
+      expectedImpactEvents: ['invariant_violation'],
       steps,
     },
   }]

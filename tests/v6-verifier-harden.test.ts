@@ -1280,9 +1280,10 @@ test('units: a self-service workflow transition is not business-logic impact (K=
   assert.equal(selfService.satisfied, false)
   assert.match(selfService.reason, /self-service|non-protected/i)
 
-  // The planted billing tamper moves a *protected* price field: still impact.
+  // The planted billing tamper moves a *protected* price field and declares its invariant.
   const protectedPrice = assessBusinessLogicImpact({
     impactClass: 'business_logic',
+    oracleEvents: ['invariant_violation'],
     steps: [
       { id: 'before', arm: 'control', method: 'GET', route: '/api/billing', status: 200, actor: ownerActor, json: { plan: 'pro', price: 4900 } },
       { id: 'probe', arm: 'probe', method: 'PATCH', route: '/api/billing', status: 200, actor: ownerActor, requestJson: { price: 1 }, json: { ok: true } },
@@ -1595,9 +1596,10 @@ test('units: a negative-amount create is not a business-logic invariant without 
   const accepted = assessBusinessLogicImpact({ ...invoiceCreate(-777), oracleEvents: ['invariant_violation'] })
   assert.equal(accepted.satisfied, true, accepted.reason)
 
-  // The planted billing tamper mutates one existing resource (PATCH), not a create: unchanged.
+  // The planted billing tamper mutates one existing resource (PATCH) and declares its invariant.
   const billing = assessBusinessLogicImpact({
     impactClass: 'business_logic',
+    oracleEvents: ['invariant_violation'],
     steps: [
       { id: 'before', arm: 'control', method: 'GET', route: '/api/plans/current', status: 200, actor: owner, json: { plan: 'pro', price: 4900 } },
       { id: 'probe', arm: 'probe', method: 'PATCH', route: '/api/plans/current', status: 200, actor: owner, requestJson: { price: 1 }, json: { ok: true } },
@@ -1605,6 +1607,18 @@ test('units: a negative-amount create is not a business-logic invariant without 
     ],
   })
   assert.equal(billing.satisfied, true, billing.reason)
+
+  // Same-tenant amount edits on an existing invoice need the invariant event too (the 45-min FP).
+  const sameTenantAmount = assessBusinessLogicImpact({
+    impactClass: 'business_logic',
+    steps: [
+      { id: 'before', arm: 'control', method: 'GET', route: '/api/invoices/i1', status: 200, actor: owner, json: { id: 'i1', amount: 5000 } },
+      { id: 'probe', arm: 'probe', method: 'PATCH', route: '/api/invoices/i1', status: 200, actor: owner, requestJson: { amount: -99999 }, json: { ok: true } },
+      { id: 'after', arm: 'control', method: 'GET', route: '/api/invoices/i1', status: 200, actor: owner, json: { id: 'i1', amount: -99999 } },
+    ],
+  })
+  assert.equal(sameTenantAmount.satisfied, false, sameTenantAmount.reason)
+  assert.match(sameTenantAmount.reason, /caller-supplied amount|invariant event/i)
 })
 
 test('units: a create-time amount overpost is not mass assignment without a catalog or event', () => {
