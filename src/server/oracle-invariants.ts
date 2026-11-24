@@ -235,6 +235,14 @@ function sameRoute(a: ImpactStep, b: ImpactStep): boolean {
   return (a.route ?? '') !== '' && a.route === b.route
 }
 
+/** Same resource tree: equal route family, or a collection readback above the mutated item. */
+function relatedRoute(a: ImpactStep, b: ImpactStep): boolean {
+  const left = routeFamily(a.route ?? a.pathAndQuery ?? '')
+  const right = routeFamily(b.route ?? b.pathAndQuery ?? '')
+  if (!left || !right) return false
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`)
+}
+
 /** True when the probe creates a new collection member (POST with no id-like final segment). */
 function isCreateShapedProbe(step: ImpactStep): boolean {
   if ((step.method ?? '').toUpperCase() !== 'POST') return false
@@ -262,7 +270,7 @@ const MARKUP_CWE_RE = /^CWE-(?:79|80|83)$/i
 // Detection is by machine-readable label only: free-text "SQL injection" stays unmodelled ('other'),
 // as it always has, so a narrative word cannot promote an unrelated claim into an ungated class.
 const INJECTION_CWE_RE = /^CWE-(?:89|564|943)$/i
-const INJECTION_CATEGORY_RE = /^(?:sqli|sql[-_ ]?injection|blind[-_ ]?sqli)$/i
+const INJECTION_CATEGORY_RE = /^(?:sqli|sql[-_ ]?injection|blind[-_ ]?sqli|injection[-_ ]input)$/i
 const DISCLOSURE_RE = /\b(?:disclosure|data[- ]leak|information[- ]leak|leak(?:ed|s|age)?|exposure|expos(?:ed|ure)|sensitive[- ]data|unauthori[sz]ed[- ]read)\b/i
 const DISCLOSURE_CWE_RE = /^CWE-(?:200|359|522|532)$/i
 /**
@@ -574,13 +582,14 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
   const probeRank = roleRank(probe.actor.role)
   const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
   // A successful same-route read by an actor in *another* tenant binds the resource to that tenant.
-  // The control read must be on the *same resource route* as the probe; a same-tenant `/api/me`
-  // read by two actors is not a victim readback for the object the probe mutated.
+  // The control read must be on the same resource tree as the probe (the item route or its parent
+  // collection); a same-tenant `/api/me` read by two actors is not a victim readback for the object
+  // the probe mutated.
   const crossTenantControlRead = controls.some(control =>
     isReadMethod(control.method) &&
     isSuccess(control.status) &&
     control.json !== undefined &&
-    sameRoute(control, probe) &&
+    relatedRoute(control, probe) &&
     Boolean(control.actor.tenant && probe.actor.tenant && control.actor.tenant !== probe.actor.tenant))
   // A claim-declared `resourceTenant` is model-supplied; it only counts when a signed control arm
   // corroborates the boundary (a denial on the same route, or a read served to the other tenant).
@@ -1530,9 +1539,16 @@ export function assessStatusOnlyDivergence(steps: readonly ImpactStep[]): Status
   // A successful probe that returns data or a state delta is independent positive evidence; the
   // failing sibling is then supporting context (e.g. a race burst's mixed outcomes), not the whole
   // proof. Only an evidence set whose probe arms *all* failed falls under the status-only ban.
+  const substantive = (step: ImpactStep): boolean => {
+    if (Array.isArray(step.json)) return step.json.length > 0
+    if (step.json !== undefined && step.json !== null && typeof step.json === 'object') {
+      return Object.keys(step.json as Record<string, unknown>).length > 0
+    }
+    const body = (step.body ?? '').trim()
+    return body.length >= 16 && body !== '{}' && body !== '[]' && !/^"(?:ok|success|done)"$/i.test(body)
+  }
   const hasPositiveProbe = allProbes.some(step =>
-    step.status !== null && step.status >= 200 && step.status < 300 &&
-    ((step.json !== undefined && step.json !== null) || (step.body?.length ?? 0) > 0))
+    step.status !== null && step.status >= 200 && step.status < 300 && substantive(step))
   if (hasPositiveProbe) {
     return {
       statusOnly: false,

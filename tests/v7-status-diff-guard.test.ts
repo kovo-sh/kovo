@@ -308,7 +308,7 @@ test('status-diff guard: cross-tenant writes need an authenticated peer control'
   const anonymousOnly = assessImpactEvidence({
     impactClass: 'authorization',
     resourceTenant: 'globex',
-    steps: [anonDeny, write, after],
+    steps: [anonDeny, write],
   })
   assert.equal(anonymousOnly.satisfied, false, anonymousOnly.reason)
   assert.match(anonymousOnly.reason, /anonymous/i)

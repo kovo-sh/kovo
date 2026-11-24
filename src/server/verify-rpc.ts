@@ -1577,8 +1577,12 @@ function claimEvidenceText(store: TranscriptStore, check: VerifyClaimCheck): str
   return ids.map(id => store.body(id) ?? '').join('\n').slice(0, 64 * 1024)
 }
 
-/** True when a passing claim carries evidence that stands without the HTTP status. */
-function hasStatusIndependentEvidence(store: TranscriptStore, check: VerifyClaimCheck): boolean {
+/**
+ * True when a passing claim carries evidence that stands without the HTTP status. A body/header
+ * claim is not enough on its own here: the *probe exchange* must carry an engine fingerprint, which
+ * is checked separately from the signed transcript body.
+ */
+function hasStatusIndependentEvidence(check: VerifyClaimCheck): boolean {
   if (!check.passed) return false
   switch (check.claim.kind) {
     case 'structural_diff':
@@ -1590,10 +1594,6 @@ function hasStatusIndependentEvidence(store: TranscriptStore, check: VerifyClaim
     case 'mfa':
     case 'dom_sentinel':
       return true
-    case 'body_contains':
-    case 'jsonpath':
-    case 'header':
-      return matchInjectionFingerprint(claimEvidenceText(store, check)) !== null
     default:
       return false
   }
@@ -1613,7 +1613,9 @@ export function evaluateClaims(
   const statusSteps = transcriptStatusSteps(store)
   const statusOnly = assessStatusOnlyDivergence(statusSteps)
   if (statusOnly.statusOnly) {
-    const backed = checks.some(check => hasStatusIndependentEvidence(store, check))
+    const probeText = statusOnly.probeId ? store.body(statusOnly.probeId) ?? '' : ''
+    const fingerprintBacked = matchInjectionFingerprint(probeText) !== null
+    const backed = fingerprintBacked || checks.some(check => hasStatusIndependentEvidence(check))
     if (!backed) {
       failures.push(`confirmation: ${statusOnly.reason} A status-only divergence cannot confirm injection, XSS, SSRF, traversal or any other class; cite an engine/parser fingerprint, a stable structural differential, a timing separation, a persisted state delta or an OOB callback.`)
     }
@@ -2737,10 +2739,13 @@ async function runAttempt(
         fingerprints: [],
       }
     }
+    const descriptorText = `${parsed.title ?? ''} ${parsed.description ?? ''}`
+    const declaredCwe = /\bCWE-\d{1,4}\b/i.exec(descriptorText)?.[0] ?? null
     const oracle = evaluateClaims(session.transcript, parsed.claims, {
       ...(options.canary ? { canary: options.canary } : {}),
       allowedExchangeIds: new Set(session.transcript.list().map(record => record.exchangeId)),
       claimedImpact: classifyImpactDescriptor({
+        cwe: declaredCwe,
         title: parsed.title,
         description: parsed.description,
       }),
