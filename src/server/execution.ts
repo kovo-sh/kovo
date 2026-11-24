@@ -5,7 +5,6 @@ import { and, asc, eq } from 'drizzle-orm'
 import { z } from 'zod'
 import type { AccessPolicySnapshot } from '../access-policy.ts'
 import {
-  assetOrigin,
   assetOriginForEnvironment,
   defaultWorkerConcurrency,
   findingSeverities,
@@ -19,23 +18,20 @@ import {
   specialistHandleByProfile,
   specialistProfileByHandle,
   workerHistory,
+  type AssessmentCheckId,
+  type BoardAuthorRole,
+  type BoardMessageKind,
+  type Candidate,
+  type CheckCoverage,
+  type CodeLocation,
+  type Finding,
+  type InlineVerifyFeedback,
+  type OwaspCategory,
+  type ResponseCheckId,
+  type ThreatModelSummary,
+  type VerificationTier,
 } from '../domain.ts'
-import type {
-  AssessmentCheckId,
-  BoardAuthorRole,
-  BoardMessageKind,
-  Candidate,
-  CheckCoverage,
-  CodeLocation,
-  Finding,
-  InlineVerifyFeedback,
-  OwaspCategory,
-  ResponseCheckId,
-  ThreatModelSummary,
-  VerificationTier,
-} from '../domain.ts'
-import { declarativeReplaySpecSchema, replaySpecOrigins } from '../replay-spec.ts'
-import type { AgentScriptProofEnvelope, DeclarativeReplaySpec } from '../replay-spec.ts'
+import { declarativeReplaySpecSchema, replaySpecOrigins, type AgentScriptProofEnvelope, type DeclarativeReplaySpec } from '../replay-spec.ts'
 import { suppliedResponseLabel } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import {
@@ -46,7 +42,6 @@ import {
   evaluateTier3Approval,
   StateChangeApprovalLedger,
 } from './approval-judge.ts'
-import type { StateChangeFingerprintInput } from './approval-judge.ts'
 import {
   AGENTIC_SPECIALIST_MAX_TURNS,
   AGENTIC_SPECIALIST_WALL_CLOCK_MS,
@@ -71,37 +66,40 @@ import {
   threatModelPrompt,
   WarmSpecialistController,
   workerInvestigationPrompt,
+  type AlreadyConfirmedRef,
+  type CodeAuditSuspectData,
+  type DetLeadSummary,
+  type GapValidationEvent,
+  type GuardianVerifyArgs,
+  type GuardianVerifyRuntime,
+  type HostTier,
+  type PersonaResourceQueueItem,
+  type ProofObligationEvent,
+  type RequestHttpArgs,
+  type RequestHttpRaceArgs,
+  type UnconfirmedSurfaceRef,
+  type WorkerToolHandlers,
 } from './agent-session.ts'
-import type {
-  AlreadyConfirmedRef,
-  CodeAuditSuspectData,
-  DetLeadSummary,
-  GapValidationEvent,
-  GuardianVerifyArgs,
-  GuardianVerifyRuntime,
-  HostTier,
-  PersonaResourceQueueItem,
-  ProofObligationEvent,
-  RequestHttpArgs,
-  RequestHttpRaceArgs,
-  UnconfirmedSurfaceRef,
-  WorkerToolHandlers,
-} from './agent-session.ts'
-import { createAgentTraceFromEnv } from './agent-trace.ts'
-import type { AgentTrace } from './agent-trace.ts'
-import { assertAssignmentBriefSize, buildAssignmentBrief } from './assignment-brief.ts'
-import { ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE } from './assignment-brief.ts'
-import type { MissionKind } from './assignment-brief.ts'
+import { createAgentTraceFromEnv, type AgentTrace } from './agent-trace.ts'
+import {
+  ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE,
+  assertAssignmentBriefSize,
+  buildAssignmentBrief,
+  type MissionKind,
+} from './assignment-brief.ts'
 import {
   BrokerApprovalRequired,
   BrokerCircuitOpen,
   BrokerDenied,
   RequestBroker,
   websocketResultToExchange,
+  type BrokerExchangeResult,
+  type BrokerHttpRequest,
+  type BrokerRaceBurstResult,
+  type Grant,
+  type PublicObservation,
 } from './broker.ts'
-import type { BrokerExchangeResult, BrokerHttpRequest, BrokerRaceBurstResult, Grant, PublicObservation } from './broker.ts'
-import { CanaryBroker, scanSecondOrderMarkers } from './canary-broker.ts'
-import type { SecondOrderStore } from './canary-broker.ts'
+import { CanaryBroker, scanSecondOrderMarkers, type SecondOrderStore } from './canary-broker.ts'
 import { hasCuratedAdvisory, queryCves, templateIdsForCves } from './cve-broker.ts'
 import {
   checkStructuralDuplicate,
@@ -109,8 +107,8 @@ import {
   evaluateSubmissionDedupe,
   extractSpecDedupeFields,
   normalizeEndpointTemplate,
+  type ExistingFindingRef,
 } from './dedupe.ts'
-import type { ExistingFindingRef } from './dedupe.ts'
 import {
   cleanupStagedEntities,
   extractCreatedId,
@@ -120,65 +118,89 @@ import {
   runDeterministicEngine,
   stagingProbeTag,
   tagStagingEntityBody,
+  type EngineConfirmed,
+  type EngineEndpoint,
+  type EngineLead,
+  type EnginePersona,
 } from './deterministic-engine.ts'
-import type { EngineConfirmed, EngineEndpoint, EngineHypothesis, EngineLead, EnginePersona } from './deterministic-engine.ts'
-import { injectUniversalParam } from './probes/context.ts'
-import { checkCoverage, meetsBaseline, readComparisons, verificationCommand } from './evidence-checks.ts'
-import type { EvidenceReview } from './evidence-checks.ts'
+import { checkCoverage, meetsBaseline, readComparisons, verificationCommand, type EvidenceReview } from './evidence-checks.ts'
+import { createExchangeRecorder, recordBrokerExchange } from './exec-exchange.ts'
 import { listMountedRepos, parseDependenciesFromFile, projectReposDir } from './github-connector.ts'
-import { LabRunner } from './lab-runner.ts'
-import type { LabTargetHandle } from './lab-runner.ts'
+import {
+  createGraphCoordinator,
+  decideNext,
+  type ChainHypothesis,
+  type CoordinatorDeps,
+  type CoordinatorEndpoint,
+  type CoordinatorProgramGraph,
+  type DispatchPlan,
+  type DispatchStepInput,
+  type GraphCoordinator,
+  type SchedulerDecision,
+} from './graph-coordinator.ts'
+import { graphLeadTargets, seedCodeToRuntimeLeads as seedGraphLeads } from './graph-leads.ts'
+import { LabRunner, type LabTargetHandle } from './lab-runner.ts'
 import {
   privateModelProfiles,
   recordProfileFailure,
   recordProfileSuccess,
   resolveProfilePoolForRole,
+  type ResolvedModelProfile,
 } from './model-settings.ts'
-import type { ResolvedModelProfile } from './model-settings.ts'
+import { drainPendingOob, scheduleFinalReport, type OobDrainOptions, type OobDrainResult } from './oob-drain.ts'
+import { alignClaimClass } from './oracle-invariants.ts'
 import { generateAndReviewPatch } from './patch-workflow.ts'
-import { PersonaAuthManager } from './persona-auth.ts'
-import type { PersonaSessionClone } from './persona-auth.ts'
+import { PersonaAuthManager, type PersonaSessionClone } from './persona-auth.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
-import type { ResolvedPersona } from './persona-vault.ts'
 import { crawlStateGraph, listEndpointsPaged, runPhase0Recon } from './phase0-recon.ts'
+import { ProbePlanRegistry, selectRankedProbeTargets, type Phase0GraphwireExtras, type Phase0ProbePlanSummary } from './probe-plan.ts'
 import type { CodeDataflowSlice, CodeToRuntimeHypothesis } from './program-graph.ts'
+import { buildOobReceipt, verifyReceipt, type ReceiptOobEvent } from './proof-receipt.ts'
+import { resolveProfileNoTokenWatchdogMs } from './provider-stream.ts'
+import { BudgetExceededError } from './provider.ts'
+import { redact, redactJsonValue, type NamedSecret } from './redact.ts'
+import {
+  buildInlineVerifyFeedback,
+  persistedAgentScriptOf,
+  retestReplaySpec,
+  runAgentScriptProof,
+  verifyReplaySpec,
+  verifyReplaySpecInline,
+  type AgentScriptProofResult,
+} from './replay-verifier.ts'
+import { responseReview } from './response-checks.ts'
+import { availableReviewChecks, parseReviewPlan, reviewPlanPrompt, standardChecks } from './review-plan.ts'
+import { approvalRequests, canaries, findings, messages, type ReplayProofReceiptRow } from './schema.ts'
+import { tenantTagForRun } from './scope-policy.ts'
+import { ScopedBrowser } from './scoped-browser.ts'
+import { dedupeCodeAuditSuspects, runThreeStageSemanticAudit, runVariantSweepForFinding, toChainStepInputs } from './semantic-audit.ts'
+import { cloneWorkerPersona } from './session-isolation.ts'
+import {
+  assessmentAssignments,
+  InvariantError,
+  isOpaqueResourceId,
+  store,
+  type AgentScriptProofRecord,
+  type Assignment,
+  type BoardMessageRow,
+  type ChainStep,
+  type Fact,
+  type PatchProposal,
+  type ReplaySpecRow,
+  type ResourceSampleRow,
+  type Run,
+  type Store,
+} from './store.ts'
+import { probeDifferential, probeSurface, runSafeTemplates, type DifferentialProbeClass } from './surface-engine.ts'
 import {
   consumeBurstInstance,
   planTier3ApprovalTargets,
   registerStateChangeGrant,
 } from './tier3-approval.ts'
-import type {
-  StateChangeApprovalInput,
-  StateChangeApprovalTarget,
-  Tier3ApprovalPlan,
-  Tier3ApprovalRequest,
-} from './tier3-approval.ts'
-import { drainPendingOob, scheduleFinalReport } from './oob-drain.ts'
-import type { OobDrainOptions, OobDrainResult } from './oob-drain.ts'
-import { buildOobReceipt, verifyReceipt } from './proof-receipt.ts'
-import type { ReceiptOobEvent } from './proof-receipt.ts'
-import { resolveProfileNoTokenWatchdogMs } from './provider-stream.ts'
+import { LinuxWorkerBackend, type WorkerBackend } from './worker-backend.ts'
 export { DEFAULT_OOB_DRAIN_MS, OOB_DRAIN_POLL_MS, resolveOobDrainMs } from './oob-drain.ts'
-import { ProbePlanRegistry, selectRankedProbeTargets } from './probe-plan.ts'
-import { graphLeadTargets, seedCodeToRuntimeLeads as seedGraphLeads } from './graph-leads.ts'
-import {
-  createGraphCoordinator,
-  decideNext,
-} from './graph-coordinator.ts'
-import type {
-  ChainHypothesis,
-  CoordinatorDeps,
-  CoordinatorEndpoint,
-  CoordinatorProgramGraph,
-  DispatchPlan,
-  DispatchStepInput,
-  GraphCoordinator,
-  SchedulerDecision,
-} from './graph-coordinator.ts'
-import { cloneWorkerPersona } from './session-isolation.ts'
-import type { Phase0GraphwireExtras, Phase0ProbePlanSummary } from './probe-plan.ts'
-export { selectRankedProbeTargets } from './probe-plan.ts'
-export type { Phase0GraphwireExtras, Phase0ProbePlanSummary } from './probe-plan.ts'
+export { selectRankedProbeTargets, type Phase0GraphwireExtras, type Phase0ProbePlanSummary } from './probe-plan.ts'
+export { extractResourceRefsFromExchange as extractPersonaResourcesFromExchange } from './store.ts'
 
 /** Bounded probe breadth per lane. The cap is a request-budget decision, not a store-read limit. */
 export const DETERMINISTIC_PROBE_CAP = 150
@@ -337,21 +359,6 @@ export function tenantLabelsFromRoleLabels(roleLabels: readonly string[]): strin
   }
   return [...labels].sort()
 }
-import { BudgetExceededError } from './provider.ts'
-import { redact, redactJsonValue } from './redact.ts'
-import type { NamedSecret } from './redact.ts'
-import {
-  buildInlineVerifyFeedback,
-  persistedAgentScriptOf,
-  retestReplaySpec,
-  runAgentScriptProof,
-  verifyReplaySpec,
-  verifyReplaySpecInline,
-} from './replay-verifier.ts'
-import type { AgentScriptProofResult } from './replay-verifier.ts'
-import { alignClaimClass } from './oracle-invariants.ts'
-import { responseReview } from './response-checks.ts'
-
 /**
  * A finding's declared class can disagree with what the proof actually showed (the common case:
  * a protected-field overpost reported as BOLA). The verifier records the verified `evidenceClass`;
@@ -368,31 +375,160 @@ function alignFindingForEvidence(
   if (!label) return finding
   return { ...finding, cwe: label.cwe, category: label.category }
 }
-import { availableReviewChecks, parseReviewPlan, reviewPlanPrompt, standardChecks } from './review-plan.ts'
-import { approvalRequests, canaries, findings, messages } from './schema.ts'
-import { ScopedBrowser } from './scoped-browser.ts'
-import { tenantTagForRun } from './scope-policy.ts'
-import { dedupeCodeAuditSuspects, runThreeStageSemanticAudit, runVariantSweepForFinding, toChainStepInputs } from './semantic-audit.ts'
-import { assessmentAssignments, extractResourceRefsFromExchange, InvariantError, isOpaqueResourceId, store } from './store.ts'
-import type {
-  AgentScriptProofRecord,
-  Assignment,
-  BoardMessageRow,
-  ChainStep,
-  ExtractedResourceRef,
-  Fact,
-  PatchProposal,
-  ReplaySpecRow,
-  ResourceHarvestExchange,
-  ResourceSampleRow,
-  Run,
-  Store,
-} from './store.ts'
-import type { ReplayProofReceiptRow } from './schema.ts'
-import { probeDifferential, probeSurface, runSafeTemplates } from './surface-engine.ts'
-import type { DifferentialProbeClass } from './surface-engine.ts'
-import { LinuxWorkerBackend } from './worker-backend.ts'
-import type { WorkerBackend } from './worker-backend.ts'
+
+function buildExistingFindingRefs(
+  storage: Store,
+  runId: string,
+  goalRevision: number,
+  options: { chainOnly?: boolean; includeDescriptions?: boolean } = {},
+) {
+  const rows = storage.db.select().from(findings).where(and(
+    eq(findings.runId, runId),
+    eq(findings.goalRevision, goalRevision),
+    ...(options.chainOnly ? [eq(findings.findingKind, 'multi_step_chain')] : []),
+  )).all()
+  const specMap = options.chainOnly ? new Map(storage.listReplaySpecs(runId).map(s => [s.id, s])) : null
+  const refs: ExistingFindingRef[] = rows.map(row => {
+    const existingSpec = row.replaySpecId
+      ? (specMap ? specMap.get(row.replaySpecId)?.spec : storage.getReplaySpec(runId, row.replaySpecId)?.spec)
+      : undefined
+    const existingFields = existingSpec ? extractSpecDedupeFields(existingSpec) : undefined
+    return {
+      id: row.id,
+      origin: row.finding.origin,
+      title: row.finding.title,
+      status: row.finding.status,
+      cwe: row.finding.cwe,
+      category: row.finding.category,
+      severity: row.finding.severity,
+      endpoint: existingFields?.endpoint ?? null,
+      authState: existingFields?.authState ?? null,
+      specKind: existingFields?.specKind ?? null,
+      method: existingFields?.method ?? null,
+      param: existingFields?.param ?? null,
+      graphqlField: existingFields?.graphqlField ?? null,
+      mutated: existingFields?.mutated ?? null,
+      ...(options.includeDescriptions
+        ? {
+            reason: row.finding.reason,
+            impact: row.finding.impact,
+            remediation: row.finding.remediation,
+            sourceOrigins: row.sourceOrigins,
+            fingerprintHash: row.fingerprintHash ?? row.finding.fingerprintHash ?? null,
+          }
+        : { fingerprintHash: row.fingerprintHash ?? null }),
+    }
+  })
+  return { rows, refs }
+}
+
+function retryLimitExceededFeedback(maxAttempts: number, reason: string): InlineVerifyFeedback {
+  return {
+    verdict: 'inconclusive',
+    controlPassed: false,
+    assertionSummary: { observed: 'retry_limit_exceeded', expected: `<= ${maxAttempts} verification attempts`, reason },
+    stepStatuses: [],
+    retriesRemaining: 0,
+  }
+}
+
+function indexEndpointParams(storage: Store, runId: string) {
+  const allParams = storage.listEndpointParams(runId)
+  const byEndpoint = new Map<string, typeof allParams>()
+  for (const param of allParams) {
+    const list = byEndpoint.get(param.endpointId) ?? []
+    list.push(param)
+    byEndpoint.set(param.endpointId, list)
+  }
+  return byEndpoint
+}
+
+function buildTier3VerifyGateReq(spec: Extract<DeclarativeReplaySpec, { kind: 'rce_proof' | 'upload_probe' }>, label: string) {
+  if (spec.kind === 'rce_proof') {
+    return {
+      origin: spec.probeStep.request.origin,
+      method: spec.probeStep.request.method,
+      pathAndQuery: spec.probeStep.request.pathAndQuery,
+      personaHandle: spec.probeStep.request.persona ?? null,
+      rationale: `[rce_proof:${spec.proofMode}] ${label} for "${spec.title}"`,
+      requestPreview: JSON.stringify({ proofMode: spec.proofMode, controlStep: spec.controlStep, probeStep: spec.probeStep }, null, 2),
+      bodyPreview: spec.probeStep.request.textBody
+        ?? (spec.probeStep.request.jsonBody !== undefined ? JSON.stringify(spec.probeStep.request.jsonBody) : undefined),
+      hasMultipart: false,
+      isRceProof: true,
+    }
+  }
+  return {
+    origin: spec.uploadStep.origin,
+    method: spec.uploadStep.method,
+    pathAndQuery: spec.uploadStep.pathAndQuery,
+    personaHandle: spec.uploadStep.persona ?? null,
+    rationale: `[upload_probe] ${label} for "${spec.title}"`,
+    requestPreview: JSON.stringify({
+      filename: spec.uploadStep.filename,
+      contentType: spec.uploadStep.contentType,
+      uploadStep: spec.uploadStep.pathAndQuery,
+      fetchStep: spec.fetchStep.request.pathAndQuery,
+    }, null, 2),
+    bodyPreview: spec.uploadStep.contentTemplate,
+    hasMultipart: true,
+    isRceProof: false,
+  }
+}
+
+type ReplayVerificationResult = Awaited<ReturnType<typeof verifyReplaySpec>>
+
+function deriveReplayOutcomeStatus(spec: DeclarativeReplaySpec, replay: ReplayVerificationResult) {
+  const staticSpec = spec.kind === 'static_ast_proof' ? spec : null
+  const isStaticAst = staticSpec !== null
+  const rawVerdict = replay.verdict as Finding['status']
+  const finalStatus: Finding['status'] = isStaticAst
+    ? (rawVerdict === 'confirmed' || rawVerdict === 'static_verified' ? 'static_verified' : rawVerdict)
+    : rawVerdict
+  const verificationTier: VerificationTier | undefined = finalStatus === 'static_verified'
+    ? 'static_verified'
+    : finalStatus === 'confirmed'
+      ? 'runtime_confirmed'
+      : undefined
+  return { staticSpec, isStaticAst, finalStatus, verificationTier }
+}
+
+function buildReplayFindingPatch(
+  spec: DeclarativeReplaySpec,
+  replay: ReplayVerificationResult,
+  existingFinding: Finding,
+  finalStatus: Finding['status'],
+  verificationTier: VerificationTier | undefined,
+  verificationVerb: string,
+  secretsList: readonly NamedSecret[],
+): { patch: Partial<Finding>; cleanObserved: string } {
+  const staticSpec = spec.kind === 'static_ast_proof' ? spec : null
+  const staticCodeLocations: CodeLocation[] | undefined = staticSpec
+    ? [{
+        repo: staticSpec.repo,
+        file: staticSpec.file,
+        startLine: staticSpec.startLine,
+        endLine: staticSpec.endLine,
+        label: staticSpec.sourceToSinkTrace?.slice(0, 180),
+      }]
+    : existingFinding.codeLocations
+  const cleanReason = redact(replay.outcome.reason || replay.outcome.observed || existingFinding.reason, secretsList)
+  const cleanObserved = redact(replay.outcome.observed, secretsList)
+  const patch: Partial<Finding> = {
+    status: finalStatus,
+    verificationTier,
+    reason: cleanReason,
+    confidence: (finalStatus === 'confirmed' || finalStatus === 'static_verified')
+      ? 'high'
+      : finalStatus === 'dismissed'
+        ? 'medium'
+        : 'low',
+    verification: `${staticSpec ? 'Deterministic offline static_ast_proof' : `Zero-LLM ${spec.kind} ${verificationVerb}`} verdict: ${finalStatus} (controlPassed=${replay.outcome.controlPassed}, observed: ${cleanObserved}).`,
+    ...(staticSpec ? { runtimeProofGap: staticSpec.runtimeProofGap } : {}),
+    ...(staticCodeLocations?.length ? { codeLocations: staticCodeLocations } : {}),
+  }
+  return { patch, cleanObserved }
+}
 
 /**
  * Confirmation attribution for an agent script proof: reporting vocabulary for a class whose
@@ -2394,11 +2530,6 @@ export interface BolaTestQueueItem extends PersonaResourceQueueItem {
   source: 'fact' | 'sample'
 }
 
-/** Backwards-compatible re-export: harvesting lives in `store.ts` so Phase-0/crawl can share it. */
-export function extractPersonaResourcesFromExchange(ex: ResourceHarvestExchange): ExtractedResourceRef[] {
-  return extractResourceRefsFromExchange(ex)
-}
-
 /**
  * Instantiate consumer item endpoints (`GET/PUT/PATCH/DELETE /…/:resourceId`) from a producer path.
  * Observed concrete item URLs are preserved; collection URLs get the harvested id appended.
@@ -3156,7 +3287,10 @@ export class Execution {
     // No idle warm container may outlive the run: a 29 GB host cannot accumulate one pool per
     // benchmark cell. Sessions still finishing release into the closed pool and remove themselves.
     try { await this.backend.closeWarmPool?.() } catch { /* teardown is best-effort */ }
-    for (const assignmentId of [...this.workerSessionClones.keys()]) this.disposeWorkerSessions(assignmentId)
+    for (const [assignmentId, tracked] of this.workerSessionClones) {
+      for (const entry of tracked) entry.clone.dispose()
+      this.workerSessionClones.delete(assignmentId)
+    }
     for (const trace of this.runTraces.values()) {
       try { trace.closeTrace() } catch { /* tracing must never break shutdown */ }
     }
@@ -3326,9 +3460,14 @@ export class Execution {
     // v6: every worker (always-on floor lane and agentic specialists alike) gets its own composite
     // session clone. A logout/rotation in one clone can never 401 a sibling worker.
     const personas = new Map(
-      [...resolvedPersonas.entries()].map(([handle, persona]) =>
-        [handle, this.clonePersonaForWorker(persona, job.assignment.id)] as const,
-      ),
+      [...resolvedPersonas.entries()].map(([handle, persona]) => {
+        const cloned = cloneWorkerPersona(persona, job.assignment.id, (h, wid) => this.personaAuth.cloneSession(h, wid))
+        if (!cloned) return [handle, persona] as const
+        const tracked = this.workerSessionClones.get(job.assignment.id) ?? []
+        tracked.push({ handle: cloned.persona.handle, clone: cloned.clone })
+        this.workerSessionClones.set(job.assignment.id, tracked)
+        return [handle, cloned.persona] as const
+      }),
     )
     const secrets = personaSecrets(personas)
     const currentSecrets = () => {
@@ -3422,7 +3561,7 @@ export class Execution {
         if (verdict.approved) return true
         // A synchronized burst of identical requests registers one single-use instance per request
         // under the same exact fingerprint; each retry consumes exactly one, never more.
-        if (context && this.consumeBurstApprovalInstance({
+        if (context && consumeBurstInstance(this.burstApprovalInstances, {
           runId: run.id,
           origin,
           method,
@@ -3493,27 +3632,6 @@ export class Execution {
     return { grant, secrets, currentSecrets }
   }
 
-  /**
-   * v6 Layer-1 identity isolation: bind one worker to one composite session clone.
-   *
-   * The clone shares the credential source but keeps its own cookie jar, so a logout/token-swap
-   * probe (or a 401-driven rotation) in the floor lane cannot clear a sibling agentic worker's
-   * session. The grant reads the clone view lazily, so a coordinated single-flight refresh is
-   * visible to every live worker without a shared mutable `.session` file write.
-   */
-  private clonePersonaForWorker(persona: ResolvedPersona, assignmentId: string): ResolvedPersona {
-    const cloned = cloneWorkerPersona(
-      persona,
-      assignmentId,
-      (handle, workerId) => this.personaAuth.cloneSession(handle, workerId),
-    )
-    if (!cloned) return persona
-    const tracked = this.workerSessionClones.get(assignmentId) ?? []
-    tracked.push({ handle: cloned.persona.handle, clone: cloned.clone })
-    this.workerSessionClones.set(assignmentId, tracked)
-    return cloned.persona
-  }
-
   /** Log out one worker's clone without touching siblings (used by logout/rotation probes). */
   logoutWorkerSession(assignmentId: string, handle?: string): number {
     const tracked = this.workerSessionClones.get(assignmentId) ?? []
@@ -3525,13 +3643,6 @@ export class Execution {
       loggedOut += 1
     }
     return loggedOut
-  }
-
-  private disposeWorkerSessions(assignmentId: string): void {
-    const tracked = this.workerSessionClones.get(assignmentId)
-    if (!tracked) return
-    for (const entry of tracked) entry.clone.dispose()
-    this.workerSessionClones.delete(assignmentId)
   }
 
   // --- v5 M5 Swarm Board wiring -------------------------------------------------
@@ -4091,24 +4202,60 @@ export class Execution {
     }
   }
 
-  private consumeBurstApprovalInstance(input: StateChangeFingerprintInput, now = Date.now()): boolean {
-    return consumeBurstInstance(this.burstApprovalInstances, input, now)
+  private async executeApprovedBrokerGroup<T>(
+    job: Active,
+    requests: BrokerHttpRequest[],
+    signal: AbortSignal,
+    options: {
+      isRaceBurst: boolean
+      rationale: string
+      requestPreview: string
+      denyLabel: string
+      secrets: readonly NamedSecret[]
+      execute: () => Promise<T>
+    },
+  ): Promise<T> {
+    const run = this.check(job)
+    if (options.isRaceBurst) {
+      const phaseRemaining = this.phaseRequestRemaining(run)
+      if (phaseRemaining !== null && requests.length > phaseRemaining) {
+        throw new BudgetExceededError('Race burst would exceed the agent request budget.')
+      }
+    }
+    const approvalPlan = planTier3ApprovalTargets(run, requests, { isRaceBurst: options.isRaceBurst })
+    try {
+      return await options.execute()
+    } catch (err) {
+      if (!(err instanceof BrokerApprovalRequired)) throw err
+      const approval = await this.waitForTier3Approval(job, {
+        origin: approvalPlan.primary.origin,
+        method: approvalPlan.primary.method,
+        pathAndQuery: approvalPlan.primary.pathAndQuery,
+        personaHandle: approvalPlan.primary.personaHandle,
+        rationale: options.rationale,
+        requestPreview: options.requestPreview,
+        bodyPreview: approvalPlan.primary.bodyPreview,
+        bodyHash: approvalPlan.primary.bodyHash,
+        headers: approvalPlan.primary.headers,
+        hasMultipart: approvalPlan.primary.hasMultipart,
+        ...(options.isRaceBurst ? { isRaceBurst: true } : {}),
+        approvalInstances: approvalPlan.primary.approvalInstances,
+        additionalApprovalTargets: approvalPlan.additional,
+        secrets: options.secrets,
+      }, signal)
+      if (!approval.approved) {
+        throw new BrokerDenied(
+          approval.deniedReason
+            ? `Tier 3 Safety Judge denied ${options.denyLabel} probe: ${approval.deniedReason}`
+            : `Tier 3 ${options.denyLabel} request was denied or expired.`,
+        )
+      }
+      return await options.execute()
+    }
   }
 
-  private planTier3Approval(
-    run: Run,
-    requests: ReadonlyArray<Tier3ApprovalRequest>,
-    options: { isRaceBurst?: boolean } = {},
-  ): Tier3ApprovalPlan {
-    return planTier3ApprovalTargets(run, requests, options)
-  }
-
-  /**
-   * Execute a synchronized race burst, resolving the whole burst with one approval decision.
-   * Identical request instances are registered as one single-use grant each, so the legitimate
-   * N-way burst is authorized exactly N times without looping through fresh approval cards.
-   */
-  private async executeApprovedRaceBurst(
+  /** Execute a synchronized race burst, resolving the whole burst with one approval decision. */
+  private executeApprovedRaceBurst(
     job: Active,
     requests: BrokerHttpRequest[],
     grant: Grant,
@@ -4117,58 +4264,21 @@ export class Execution {
       stepTitle: string
       rationale?: string
       secrets: readonly NamedSecret[]
-      /** Broker entry point (kept in the tool handler so wiring stays visible). */
       execute?: () => Promise<BrokerRaceBurstResult>
     },
   ): Promise<BrokerRaceBurstResult> {
-    const execute = options.execute ?? (() => this.broker.executeRaceBurst(requests, grant, signal))
-    const run = this.check(job)
-    const phaseRemaining = this.phaseRequestRemaining(run)
-    if (phaseRemaining !== null && requests.length > phaseRemaining) {
-      throw new BudgetExceededError('Race burst would exceed the agent request budget.')
-    }
-    const approvalPlan = this.planTier3Approval(run, requests, { isRaceBurst: true })
-    try {
-      return await execute()
-    } catch (err) {
-      if (!(err instanceof BrokerApprovalRequired)) throw err
-      const approval = await this.waitForTier3Approval(job, {
-        origin: approvalPlan.primary.origin,
-        method: approvalPlan.primary.method,
-        pathAndQuery: approvalPlan.primary.pathAndQuery,
-        personaHandle: approvalPlan.primary.personaHandle,
-        rationale: options.rationale ??
-          `Tier 3 concurrent race burst (${requests.length}x) during step "${options.stepTitle}"`,
-        requestPreview: JSON.stringify({
-          count: requests.length,
-          sample: requests[0],
-        }, null, 2),
-        bodyPreview: approvalPlan.primary.bodyPreview,
-        bodyHash: approvalPlan.primary.bodyHash,
-        headers: approvalPlan.primary.headers,
-        hasMultipart: approvalPlan.primary.hasMultipart,
-        isRaceBurst: true,
-        approvalInstances: approvalPlan.primary.approvalInstances,
-        additionalApprovalTargets: approvalPlan.additional,
-        secrets: options.secrets,
-      }, signal)
-      if (!approval.approved) {
-        throw new BrokerDenied(
-          approval.deniedReason
-            ? `Tier 3 Safety Judge denied race-burst probe: ${approval.deniedReason}`
-            : 'Tier 3 race-burst request was denied or expired.',
-        )
-      }
-      return await execute()
-    }
+    return this.executeApprovedBrokerGroup(job, requests, signal, {
+      isRaceBurst: true,
+      rationale: options.rationale ?? `Tier 3 concurrent race burst (${requests.length}x) during step "${options.stepTitle}"`,
+      requestPreview: JSON.stringify({ count: requests.length, sample: requests[0] }, null, 2),
+      denyLabel: 'race-burst',
+      secrets: options.secrets,
+      execute: options.execute ?? (() => this.broker.executeRaceBurst(requests, grant, signal)),
+    })
   }
 
-  /**
-   * Execute a synchronized batch, resolving the whole batch with one approval decision. Items that
-   * are already authorized keep working, and the retry registers one single-use instance per
-   * state-changing item so a consumed grant never fails the whole batch.
-   */
-  private async executeApprovedBatch(
+  /** Execute a synchronized batch, resolving the whole batch with one approval decision. */
+  private executeApprovedBatch(
     job: Active,
     requests: BrokerHttpRequest[],
     grant: Grant,
@@ -4177,68 +4287,28 @@ export class Execution {
       stepTitle: string
       rationale?: string
       secrets: readonly NamedSecret[]
-      /** Broker entry point (kept in the tool handler so wiring stays visible). */
       execute?: () => Promise<BrokerExchangeResult[]>
     },
   ): Promise<BrokerExchangeResult[]> {
-    const execute = options.execute ?? (() => this.broker.executeBatch(requests, grant, signal))
-    const run = this.check(job)
-    const approvalPlan = this.planTier3Approval(run, requests)
-    try {
-      return await execute()
-    } catch (err) {
-      if (!(err instanceof BrokerApprovalRequired)) throw err
-      // Broker request preparation runs synchronously for every item before any transport call, so
-      // a batch rejected at preparation normally sends nothing. Once the decision registers one
-      // exact grant per item, the batch is re-run as a unit; a consumed grant never fails it.
-      const approval = await this.waitForTier3Approval(job, {
-        origin: approvalPlan.primary.origin,
-        method: approvalPlan.primary.method,
-        pathAndQuery: approvalPlan.primary.pathAndQuery,
-        personaHandle: approvalPlan.primary.personaHandle,
-        rationale: options.rationale ??
-          `Tier 3 synchronized batch (${requests.length} requests) during step "${options.stepTitle}"`,
-        requestPreview: JSON.stringify({
-          count: requests.length,
-          items: requests.map((request, index) => ({
-            index,
-            method: request.method,
-            origin: request.origin,
-            pathAndQuery: request.pathAndQuery,
-            persona: request.persona ?? null,
-            bodyPreview: request.body?.slice(0, 300) ?? null,
-            multipartPartsCount: request.multipartParts?.length ?? 0,
-          })),
-        }, null, 2),
-        bodyPreview: approvalPlan.primary.bodyPreview,
-        bodyHash: approvalPlan.primary.bodyHash,
-        headers: approvalPlan.primary.headers,
-        hasMultipart: approvalPlan.primary.hasMultipart,
-        approvalInstances: approvalPlan.primary.approvalInstances,
-        additionalApprovalTargets: approvalPlan.additional,
-        secrets: options.secrets,
-      }, signal)
-      if (!approval.approved) {
-        throw new BrokerDenied(
-          approval.deniedReason
-            ? `Tier 3 Safety Judge denied batch probe: ${approval.deniedReason}`
-            : 'Tier 3 batch request was denied or expired.',
-        )
-      }
-      return await execute()
-    }
-  }
-
-  /**
-   * Register the exact, single-use grant a decision just authorized. The immediate broker retry
-   * consumes it only when origin/method/path/persona/body/flag fingerprint and scope revision match.
-   */
-  private registerStateChangeApproval(
-    run: Run,
-    input: StateChangeApprovalInput,
-    additional: StateChangeApprovalTarget[] = [],
-  ): void {
-    registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, input, additional)
+    return this.executeApprovedBrokerGroup(job, requests, signal, {
+      isRaceBurst: false,
+      rationale: options.rationale ?? `Tier 3 synchronized batch (${requests.length} requests) during step "${options.stepTitle}"`,
+      requestPreview: JSON.stringify({
+        count: requests.length,
+        items: requests.map((request, index) => ({
+          index,
+          method: request.method,
+          origin: request.origin,
+          pathAndQuery: request.pathAndQuery,
+          persona: request.persona ?? null,
+          bodyPreview: request.body?.slice(0, 300) ?? null,
+          multipartPartsCount: request.multipartParts?.length ?? 0,
+        })),
+      }, null, 2),
+      denyLabel: 'batch',
+      secrets: options.secrets,
+      execute: options.execute ?? (() => this.broker.executeBatch(requests, grant, signal)),
+    })
   }
 
   private async waitForTier3Approval(
@@ -4327,7 +4397,7 @@ export class Execution {
       })
       // The audit row above is never authoritative. Authorize only the exact request the judge
       // evaluated, via a single-use fingerprint the broker retry consumes once.
-      this.registerStateChangeApproval(run, {
+      registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, {
         origin: input.origin,
         method: input.method,
         pathAndQuery: input.pathAndQuery,
@@ -4479,7 +4549,7 @@ export class Execution {
       } catch { /* resume is best-effort; the request still retries under the approval ledger */ }
       // A human/operator approval authorizes exactly this fingerprint once; broader reuse requires
       // an explicit operator pattern (approve_similar_endpoint), never a prefix match on the card.
-      this.registerStateChangeApproval(run, {
+      registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, {
         origin: input.origin,
         method: input.method,
         pathAndQuery: input.pathAndQuery,
@@ -4901,26 +4971,7 @@ export class Execution {
               if (ex.method === 'GET' && ex.pathAndQuery === '/' && !phase0RootExchanges.has(ex.origin)) {
                 phase0RootExchanges.set(ex.origin, ex)
               }
-              const saved = this.storage.recordExchange({
-                runId: freshRun.id,
-                assignmentId: claimed.id,
-                scopeRevision: freshRun.scopeRevision,
-                origin: ex.origin,
-                finalOrigin: ex.finalOrigin,
-                redirectOrigins: ex.redirectOrigins,
-                method: ex.method,
-                pathAndQuery: ex.pathAndQuery,
-                personaHandle: ex.personaHandle,
-                status: ex.status,
-                mediaType: ex.mediaType,
-                reqHeaders: ex.reqHeaders,
-                respHeaders: ex.respHeaders,
-                body: ex.body,
-                durationMs: ex.durationMs,
-                secretMatches: ex.secretMatches,
-                secrets,
-              })
-              return saved.id
+              return recordBrokerExchange(this.storage, freshRun, claimed.id, ex, secrets).id
             },
           }) as Awaited<ReturnType<typeof runPhase0Recon>> & Phase0GraphwireExtras
           // v6 graphwire: the ranked plan bounds probe breadth without trimming the store, and
@@ -5095,25 +5146,7 @@ export class Execution {
                 followRedirects: true,
                 timeoutMs: 12_000,
               }, grant, task.controller.signal)
-              const savedEx = this.storage.recordExchange({
-                runId: freshRun.id,
-                assignmentId: hostWorker.id,
-                scopeRevision: freshRun.scopeRevision,
-                origin: ex.origin,
-                finalOrigin: ex.finalOrigin,
-                redirectOrigins: ex.redirectOrigins,
-                method: ex.method,
-                pathAndQuery: ex.pathAndQuery,
-                personaHandle: ex.personaHandle,
-                status: ex.status,
-                mediaType: ex.mediaType,
-                reqHeaders: ex.reqHeaders,
-                respHeaders: ex.respHeaders,
-                body: ex.body,
-                durationMs: ex.durationMs,
-                secretMatches: ex.secretMatches,
-                secrets,
-              })
+              const savedEx = recordBrokerExchange(this.storage, freshRun, hostWorker.id, ex, secrets)
               capture = { observation: ex.observation, note: 'Recorded approved HTTPS root response.' }
               observations.push({
                 origin: asset.origin,
@@ -5376,6 +5409,116 @@ export class Execution {
     }
   }
 
+  private buildSharedSessionHandlers(
+    job: Active,
+    session: Awaited<ReturnType<WorkerBackend['openSession']>>,
+    currentSecrets: () => readonly NamedSecret[],
+    options: {
+      offlineScriptLabel: string
+      onFactRecorded?: (curRun: Run) => void
+    },
+  ) {
+    return {
+      spillOutput: async (id: string, content: string, sig: AbortSignal) => session.stage(`tool-output/${id}.txt`, content, sig),
+      analyze_artifact: async (args: Parameters<NonNullable<WorkerToolHandlers['analyze_artifact']>>[0], sig: AbortSignal) => {
+        this.check(job)
+        const { tool, ...rest } = args
+        return await session.analyze(tool, rest, sig)
+      },
+      run_sast_scan: async (args: Parameters<NonNullable<WorkerToolHandlers['run_sast_scan']>>[0], sig: AbortSignal) => {
+        const curRun = this.check(job)
+        const res = await session.sast(args, sig)
+        const ev = this.storage.addArtifact(curRun, job.assignment, 'sast',
+          `SAST scan · ${res.repo} (${res.enginesRun.join(', ')})`,
+          JSON.stringify(res, null, 2), undefined, currentSecrets())
+        for (const engine of res.enginesRun) {
+          const st = res.engineStatus[engine]
+          this.storage.recordSastRun({
+            runId: curRun.id,
+            assignmentId: job.assignment.id,
+            repo: res.repo,
+            engine,
+            rawArtifactId: ev.id,
+            findingCount: st?.count ?? 0,
+            durationMs: st?.durationMs ?? res.durationMs,
+          })
+        }
+        return { evidenceId: ev.id, ...res }
+      },
+      run_offline_script: async (args: Parameters<NonNullable<WorkerToolHandlers['run_offline_script']>>[0], sig: AbortSignal) => {
+        const curRun = this.check(job)
+        const res = await session.runScript(args, sig)
+        const ev = this.storage.addArtifact(curRun, job.assignment, 'analysis',
+          options.offlineScriptLabel.replace('{runtime}', args.runtime),
+          JSON.stringify({
+            runtime: res.runtime,
+            exitCode: res.exitCode,
+            timedOut: res.timedOut,
+            durationMs: res.durationMs,
+            stdout: redact(res.stdout, currentSecrets()),
+            stderr: redact(res.stderr, currentSecrets()),
+          }, null, 2), undefined, currentSecrets())
+        return { evidenceId: ev.id, ...res }
+      },
+      query_cves: async (args: Parameters<NonNullable<WorkerToolHandlers['query_cves']>>[0], sig: AbortSignal) => {
+        this.check(job)
+        const advisories = await queryCves(args, sig)
+        return { count: advisories.length, advisories }
+      },
+      load_skill: async ({ name }: { name: string }) => {
+        if (name.trim().toLowerCase() === 'list') return { skills: listSkills() }
+        const skill = loadSkill(name)
+        if (!skill) return { error: `Unknown skill "${name}".`, available: listSkills().map(s => s.name) }
+        return skill
+      },
+      search_facts: async ({ query, origin, kind, limit }: Parameters<NonNullable<WorkerToolHandlers['search_facts']>>[0]) => {
+        const curRun = this.check(job)
+        const currentApproved = this.approvedOriginsSet(curRun)
+        return this.storage.listFacts(curRun.id, { includeTainted: false, query, origin, kind, limit })
+          .filter(f => currentApproved.has(f.origin) && f.sourceOrigins.every(o => currentApproved.has(o)))
+      },
+      record_fact: async (args: Parameters<NonNullable<WorkerToolHandlers['record_fact']>>[0]) => {
+        const curRun = this.check(job)
+        const currentApproved = this.approvedOriginsSet(curRun)
+        const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
+        if (!currentApproved.has(cleanOrigin)) throw new BrokerDenied(`Origin ${cleanOrigin} is not approved.`)
+        const fact = this.storage.addFact(curRun, job.assignment, {
+          kind: args.kind,
+          origin: cleanOrigin,
+          summary: args.summary,
+          data: args.data,
+          exchangeIds: args.exchangeIds,
+          evidenceIds: args.evidenceIds,
+          sourceOrigins: args.sourceOrigins,
+          secrets: currentSecrets(),
+        })
+        options.onFactRecorded?.(curRun)
+        return { factId: fact.id, kind: args.kind, origin: fact.origin }
+      },
+      record_coverage: async (args: Parameters<NonNullable<WorkerToolHandlers['record_coverage']>>[0]) => {
+        const curRun = this.check(job)
+        const currentApproved = this.approvedOriginsSet(curRun)
+        const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
+        if (!currentApproved.has(cleanOrigin)) throw new BrokerDenied(`Origin ${cleanOrigin} is not approved.`)
+        const ext = args as typeof args & { enforcingControl?: string; proofGapReason?: string; linkedFindingId?: string }
+        if (args.status === 'ruled_out' && !ext.enforcingControl?.trim()) {
+          throw new Error('record_coverage with status "ruled_out" requires a non-empty enforcingControl (exact file:line or negative-control exchangeId proving the control runs on the attacker path).')
+        }
+        const entry = this.storage.upsertCoverageEntry(curRun, job.assignment.id, {
+          origin: cleanOrigin,
+          category: args.category,
+          status: args.status,
+          summary: args.summary,
+          enforcingControl: ext.enforcingControl,
+          proofGapReason: args.status === 'needs_follow_up' ? (ext.proofGapReason?.trim() || args.summary) : ext.proofGapReason,
+          linkedFindingId: ext.linkedFindingId,
+        })
+        return { id: entry.id, origin: entry.origin, category: entry.category, status: entry.status }
+      },
+      complete_intent: async (completion: Parameters<NonNullable<WorkerToolHandlers['complete_intent']>>[0]) => ({ recorded: true, status: completion.status }),
+    } satisfies Partial<WorkerToolHandlers>
+  }
+
   // --- Phase 1B: Source-First Code Audit (Mounted /repos BEFORE live HTTP rounds) ---
 
   async runSourceFirstCodeAudit(
@@ -5433,7 +5576,9 @@ export class Execution {
       }
 
       const handlers: WorkerToolHandlers = {
-        spillOutput: async (id, content, sig) => session.stage(`tool-output/${id}.txt`, content, sig),
+        ...this.buildSharedSessionHandlers(job, session, currentSecrets, {
+          offlineScriptLabel: 'Offline {runtime} script (code audit)',
+        }),
         derive_evidence: async ({ command, outputs, timeoutMs }, sig) => {
           const curRun = this.check(job)
           const res = await session.exec(command, outputs ?? ['result.txt'], sig, timeoutMs ?? 60_000)
@@ -5447,101 +5592,6 @@ export class Execution {
             }, null, 2), undefined, secrets)
           return { evidenceId: ev.id, exitCode: res.exitCode, stdout: res.stdout, stderr: res.stderr, outputs: res.outputs }
         },
-        analyze_artifact: async (args, sig) => {
-          this.check(job)
-          const { tool, ...rest } = args
-          return await session.analyze(tool, rest, sig)
-        },
-        run_sast_scan: async (args, sig) => {
-          const curRun = this.check(job)
-          const res = await session.sast(args, sig)
-          const ev = this.storage.addArtifact(curRun, job.assignment, 'sast',
-            `SAST scan · ${res.repo} (${res.enginesRun.join(', ')})`,
-            JSON.stringify(res, null, 2), undefined, currentSecrets())
-          for (const engine of res.enginesRun) {
-            const st = res.engineStatus[engine]
-            this.storage.recordSastRun({
-              runId: curRun.id,
-              assignmentId: job.assignment.id,
-              repo: res.repo,
-              engine,
-              rawArtifactId: ev.id,
-              findingCount: st?.count ?? 0,
-              durationMs: st?.durationMs ?? res.durationMs,
-            })
-          }
-          return { evidenceId: ev.id, ...res }
-        },
-        run_offline_script: async (args, sig) => {
-          const curRun = this.check(job)
-          const res = await session.runScript(args, sig)
-          const ev = this.storage.addArtifact(curRun, job.assignment, 'analysis',
-            `Offline ${args.runtime} script (code audit)`,
-            JSON.stringify({
-              runtime: res.runtime,
-              exitCode: res.exitCode,
-              timedOut: res.timedOut,
-              durationMs: res.durationMs,
-              stdout: redact(res.stdout, currentSecrets()),
-              stderr: redact(res.stderr, currentSecrets()),
-            }, null, 2), undefined, currentSecrets())
-          return { evidenceId: ev.id, ...res }
-        },
-        query_cves: async (args, sig) => {
-          this.check(job)
-          const advisories = await queryCves(args, sig)
-          return { count: advisories.length, advisories }
-        },
-        load_skill: async ({ name }) => {
-          if (name.trim().toLowerCase() === 'list') return { skills: listSkills() }
-          const skill = loadSkill(name)
-          if (!skill) return { error: `Unknown skill "${name}".`, available: listSkills().map(s => s.name) }
-          return skill
-        },
-        search_facts: async ({ query, origin, kind, limit }) => {
-          const curRun = this.check(job)
-          const currentApproved = this.approvedOriginsSet(curRun)
-          return this.storage.listFacts(curRun.id, { includeTainted: false, query, origin, kind, limit })
-            .filter(f => currentApproved.has(f.origin) && f.sourceOrigins.every(o => currentApproved.has(o)))
-        },
-        record_fact: async (args) => {
-          const curRun = this.check(job)
-          const currentApproved = this.approvedOriginsSet(curRun)
-          const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
-          if (!currentApproved.has(cleanOrigin)) throw new BrokerDenied(`Origin ${cleanOrigin} is not approved.`)
-          const fact = this.storage.addFact(curRun, job.assignment, {
-            kind: args.kind,
-            origin: cleanOrigin,
-            summary: args.summary,
-            data: args.data,
-            exchangeIds: args.exchangeIds,
-            evidenceIds: args.evidenceIds,
-            sourceOrigins: args.sourceOrigins,
-            secrets: currentSecrets(),
-          })
-          return { factId: fact.id, kind: args.kind, origin: fact.origin }
-        },
-        record_coverage: async (args) => {
-          const curRun = this.check(job)
-          const currentApproved = this.approvedOriginsSet(curRun)
-          const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
-          if (!currentApproved.has(cleanOrigin)) throw new BrokerDenied(`Origin ${cleanOrigin} is not approved.`)
-          const ext = args as typeof args & { enforcingControl?: string; proofGapReason?: string; linkedFindingId?: string }
-          if (args.status === 'ruled_out' && !ext.enforcingControl?.trim()) {
-            throw new Error('record_coverage with status "ruled_out" requires a non-empty enforcingControl (exact file:line or negative-control exchangeId proving the control runs on the attacker path).')
-          }
-          const entry = this.storage.upsertCoverageEntry(curRun, job.assignment.id, {
-            origin: cleanOrigin,
-            category: args.category,
-            status: args.status,
-            summary: args.summary,
-            enforcingControl: ext.enforcingControl,
-            proofGapReason: args.status === 'needs_follow_up' ? (ext.proofGapReason?.trim() || args.summary) : ext.proofGapReason,
-            linkedFindingId: ext.linkedFindingId,
-          })
-          return { id: entry.id, origin: entry.origin, category: entry.category, status: entry.status }
-        },
-        complete_intent: async (completion) => ({ recorded: true, status: completion.status }),
       }
 
       const personasPub = [...grant.personas?.values() ?? []].map(p => ({
@@ -6072,11 +6122,7 @@ export class Execution {
 
   // --- v6 split request budgets (Phase A floor / Phase B agents) ------------------------------
 
-  /**
-   * Start Phase-A accounting. No-op in legacy mode. Called once, as close as possible to the
-   * floor's first request, so Phase-0 discovery/scope requests are not charged to Phase A.
-   */
-  private beginFloorRequestPhase(run: Run): PhaseRequestState | null {
+  private beginRequestPhase(run: Run, phase: 'floor' | 'agent'): PhaseRequestState | null {
     if (!this.phaseRequestBudgets) return null
     const existing = this.phaseRequestState.get(run.id)
     if (existing) return existing
@@ -6085,7 +6131,7 @@ export class Execution {
       agentBudget: this.phaseRequestBudgets.agent,
       baselineRequests: run.spentRequests,
       floorRequests: 0,
-      floorSettled: false,
+      floorSettled: phase === 'agent',
       floorBudgetExhausted: false,
       agentBudgetExhausted: false,
       agentExhaustedReported: false,
@@ -6098,9 +6144,11 @@ export class Execution {
       this.storage.event(
         run.id,
         'request_budget.phase_started',
-        `Phase A request allowance ${state.floorBudget}; Phase B allowance ${state.agentBudget} (split budgets; no borrowing).`,
+        phase === 'floor'
+          ? `Phase A request allowance ${state.floorBudget}; Phase B allowance ${state.agentBudget} (split budgets; no borrowing).`
+          : `Phase B request allowance ${state.agentBudget} (no Phase-A floor in this run).`,
         {
-          phase: 'floor',
+          phase,
           floorRequestBudget: state.floorBudget,
           agentRequestBudget: state.agentBudget,
           totalRequestBudget: run.budgetRequests > 0 ? run.budgetRequests : null,
@@ -6111,43 +6159,12 @@ export class Execution {
     return state
   }
 
-  /**
-   * Start (or adopt) Phase-B accounting when no floor lane ran (e.g. the deterministic sweep is
-   * off). A floor that did run settles itself and is not re-baselined here.
-   */
+  private beginFloorRequestPhase(run: Run): PhaseRequestState | null {
+    return this.beginRequestPhase(run, 'floor')
+  }
+
   private beginAgentRequestPhase(run: Run): PhaseRequestState | null {
-    if (!this.phaseRequestBudgets) return null
-    const existing = this.phaseRequestState.get(run.id)
-    if (existing) return existing
-    const state: PhaseRequestState = {
-      floorBudget: this.phaseRequestBudgets.floor,
-      agentBudget: this.phaseRequestBudgets.agent,
-      baselineRequests: run.spentRequests,
-      floorRequests: 0,
-      floorSettled: true,
-      floorBudgetExhausted: false,
-      agentBudgetExhausted: false,
-      agentExhaustedReported: false,
-      floorExhaustedReported: false,
-      agentSettled: false,
-      agentRequests: 0,
-    }
-    this.phaseRequestState.set(run.id, state)
-    try {
-      this.storage.event(
-        run.id,
-        'request_budget.phase_started',
-        `Phase B request allowance ${state.agentBudget} (no Phase-A floor in this run).`,
-        {
-          phase: 'agent',
-          floorRequestBudget: state.floorBudget,
-          agentRequestBudget: state.agentBudget,
-          totalRequestBudget: run.budgetRequests > 0 ? run.budgetRequests : null,
-          spentRequestsAtStart: state.baselineRequests,
-        },
-      )
-    } catch { /* telemetry is best-effort */ }
-    return state
+    return this.beginRequestPhase(run, 'agent')
   }
 
   /**
@@ -7414,75 +7431,59 @@ export class Execution {
 
   // --- Phase 1 (deterministic fallback): bounded zero-LLM probe pass when no model profile exists ---
 
-  private driveDeterministicInvestigation(run: Run) {
-    const key = `${run.id}:${run.goalRevision}:${run.scopeRevision}`
+  private launchDeterministicPass(
+    run: Run,
+    key: string,
+    eventPrefix: 'deterministic_probes' | 'deterministic_engine',
+    label: string,
+    execPass: () => Promise<void>,
+    onFinallyBeforeAdvance?: () => void,
+  ) {
     if (this.deterministicCompleted.has(key) || this.deterministicInFlight.has(key)) return
     this.deterministicInFlight.add(key)
-    void this.runDeterministicInvestigation(run)
+    void execPass()
       .catch(error => {
         try {
           const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
-          this.storage.event(run.id, 'deterministic_probes.failed', `Deterministic probe pass failed: ${msg}`)
+          this.storage.event(run.id, `${eventPrefix}.failed`, `${label} failed: ${msg}`)
         } catch { /* store closed or run removed */ }
       })
       .finally(() => {
         this.deterministicInFlight.delete(key)
         this.deterministicCompleted.add(key)
+        onFinallyBeforeAdvance?.()
         // The store may already be closed (test teardown / run deletion); never let cleanup throw.
         try {
           const latest = this.storage.run(run.id)
           if (latest.status === 'running' && latest.phase === 'investigation') {
             this.storage.event(
               latest.id,
-              'deterministic_probes.complete',
-              'Deterministic probe pass complete. Advancing to Zero-LLM verification.',
+              `${eventPrefix}.complete`,
+              `${label} complete. Advancing to Zero-LLM verification.`,
               { reuse: key },
             )
             this.advanceToVerification(latest)
           }
         } catch { /* store closed or run removed */ }
         try { this.notifyCheckpoint(run.id, 'deterministic-lane') } catch { /* best-effort */ }
-        try {
-          this.scheduleWake()
-        } catch { /* scheduler already stopped */ }
+        try { this.scheduleWake() } catch { /* scheduler already stopped */ }
       })
+  }
+
+  private driveDeterministicInvestigation(run: Run) {
+    const key = `${run.id}:${run.goalRevision}:${run.scopeRevision}`
+    this.launchDeterministicPass(run, key, 'deterministic_probes', 'Deterministic probe pass', () => this.runDeterministicInvestigation(run))
   }
 
   // --- Explicit --no-llm deterministic engine (Slice 2; separate from the M1 fallback above) ---
 
   private driveEngineInvestigation(run: Run) {
     const key = `${run.id}:${run.goalRevision}:${run.scopeRevision}:engine`
-    if (this.deterministicCompleted.has(key) || this.deterministicInFlight.has(key)) return
-    this.deterministicInFlight.add(key)
-    void this.runEngineInvestigation(run)
-      .catch(error => {
-        try {
-          const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
-          this.storage.event(run.id, 'deterministic_engine.failed', `Deterministic engine failed: ${msg}`)
-        } catch { /* store closed or run removed */ }
-      })
-      .finally(() => {
-        this.deterministicInFlight.delete(key)
-        this.deterministicCompleted.add(key)
-        // `--no-llm` has one phase: freeze the floor allowance so the summary reports it as such.
-        try { this.settleFloorRequestPhase(run.id, 'no_llm_complete') } catch { /* metrics only */ }
-        try {
-          const latest = this.storage.run(run.id)
-          if (latest.status === 'running' && latest.phase === 'investigation') {
-            this.storage.event(
-              latest.id,
-              'deterministic_engine.complete',
-              'Deterministic engine complete. Advancing to Zero-LLM verification.',
-              { reuse: key },
-            )
-            this.advanceToVerification(latest)
-          }
-        } catch { /* store closed or run removed */ }
-        try { this.notifyCheckpoint(run.id, 'deterministic-lane') } catch { /* best-effort */ }
-        try {
-          this.scheduleWake()
-        } catch { /* scheduler already stopped */ }
-      })
+    this.launchDeterministicPass(
+      run, key, 'deterministic_engine', 'Deterministic engine',
+      () => this.runEngineInvestigation(run),
+      () => { try { this.settleFloorRequestPhase(run.id, 'no_llm_complete') } catch { /* metrics only */ } },
+    )
   }
 
   /**
@@ -7773,13 +7774,7 @@ export class Execution {
       )
     } catch { /* metrics only */ }
 
-    const allParams = this.storage.listEndpointParams(current.id)
-    const paramsByEndpoint = new Map<string, typeof allParams>()
-    for (const param of allParams) {
-      const list = paramsByEndpoint.get(param.endpointId) ?? []
-      list.push(param)
-      paramsByEndpoint.set(param.endpointId, list)
-    }
+    const paramsByEndpoint = indexEndpointParams(this.storage, current.id)
 
 
     const personas = [...resolveRunPersonas(this.storage, current.projectId, current.approvedPersonaIds).values()]
@@ -7814,37 +7809,18 @@ export class Execution {
     const job: Active = { assignment: claimed, origins: new Set(approvedOrigins), controller: new AbortController() }
     const { grant, currentSecrets } = this.buildGrant(job, current, approvedOrigins)
 
-    const recordExchange = (ex: BrokerExchangeResult) => {
-      const latest = this.storage.run(current.id)
-      const saved = this.storage.recordExchange({
-        runId: current.id,
-        assignmentId: claimed.id,
-        scopeRevision: latest.scopeRevision,
-        origin: ex.origin,
-        finalOrigin: ex.finalOrigin,
-        redirectOrigins: ex.redirectOrigins,
-        method: ex.method,
-        pathAndQuery: ex.pathAndQuery,
-        personaHandle: ex.personaHandle,
-        status: ex.status,
-        mediaType: ex.mediaType,
-        reqHeaders: ex.reqHeaders,
-        respHeaders: ex.respHeaders,
-        body: ex.body,
-        durationMs: ex.durationMs,
-        secretMatches: ex.secretMatches,
-        secrets: currentSecrets(),
-      })
-      this.storage.trackExchangeResources({
-        runId: current.id,
-        scopeRevision: latest.scopeRevision,
-        exchange: ex,
-        source: 'surface_probe',
-      })
-      this.markEndpointCoverage(latest, ex.origin, ex.method, ex.pathAndQuery, 'http_exchange')
-      this.scanSecondOrderExchange(latest, claimed.id, ex, saved.id)
-      return saved.id
-    }
+    const recordExchange = createExchangeRecorder(
+      this.storage,
+      () => this.storage.run(current.id),
+      claimed.id,
+      currentSecrets,
+      {
+        trackResources: true,
+        markCoverage: (latest, origin, method, pathAndQuery) =>
+          this.markEndpointCoverage(latest, origin, method, pathAndQuery, 'http_exchange'),
+        onSaved: (latest, ex, id) => this.scanSecondOrderExchange(latest, claimed.id, ex, id),
+      },
+    )
 
     const signal = job.controller.signal
 
@@ -7889,7 +7865,7 @@ export class Execution {
         isObjectId: /^(?:id|uuid|[a-z][a-z0-9]*Id)$/i.test(param.name),
         source: 'openapi',
         createdAt: current.createdAt,
-      })) as unknown as typeof allParams)
+      })) as unknown as ReturnType<Store['listEndpointParams']>)
     }
     const probeEndpoints = [...endpoints, ...syntheticEndpoints]
     if (!probeEndpoints.length) return
@@ -8295,13 +8271,7 @@ export class Execution {
         )
       } catch { /* run may be gone */ }
     }
-    const allParams = this.storage.listEndpointParams(current.id)
-    const paramsByEndpoint = new Map<string, typeof allParams>()
-    for (const param of allParams) {
-      const list = paramsByEndpoint.get(param.endpointId) ?? []
-      list.push(param)
-      paramsByEndpoint.set(param.endpointId, list)
-    }
+    const paramsByEndpoint = indexEndpointParams(this.storage, current.id)
 
     const asset = current.candidates.find(c => approvedOrigins.has(c.origin) && current.approved.includes(c.id))
     if (!asset) return
@@ -8350,37 +8320,18 @@ export class Execution {
     const { grant, currentSecrets } = this.buildGrant(job, current, approvedOrigins)
     const signal = controller.signal
 
-    const recordExchange = (ex: BrokerExchangeResult) => {
-      const latest = this.storage.run(current.id)
-      const saved = this.storage.recordExchange({
-        runId: current.id,
-        assignmentId: claimed.id,
-        scopeRevision: latest.scopeRevision,
-        origin: ex.origin,
-        finalOrigin: ex.finalOrigin,
-        redirectOrigins: ex.redirectOrigins,
-        method: ex.method,
-        pathAndQuery: ex.pathAndQuery,
-        personaHandle: ex.personaHandle,
-        status: ex.status,
-        mediaType: ex.mediaType,
-        reqHeaders: ex.reqHeaders,
-        respHeaders: ex.respHeaders,
-        body: ex.body,
-        durationMs: ex.durationMs,
-        secretMatches: ex.secretMatches,
-        secrets: currentSecrets(),
-      })
-      this.storage.trackExchangeResources({
-        runId: current.id,
-        scopeRevision: latest.scopeRevision,
-        exchange: ex,
-        source: 'surface_probe',
-      })
-      this.markEndpointCoverage(latest, ex.origin, ex.method, ex.pathAndQuery, 'http_exchange')
-      this.scanSecondOrderExchange(latest, claimed.id, ex, saved.id)
-      return saved.id
-    }
+    const recordExchange = createExchangeRecorder(
+      this.storage,
+      () => this.storage.run(current.id),
+      claimed.id,
+      currentSecrets,
+      {
+        trackResources: true,
+        markCoverage: (latest, origin, method, pathAndQuery) =>
+          this.markEndpointCoverage(latest, origin, method, pathAndQuery, 'http_exchange'),
+        onSaved: (latest, ex, id) => this.scanSecondOrderExchange(latest, claimed.id, ex, id),
+      },
+    )
 
     let leadCount = 0
     try {
@@ -8729,31 +8680,7 @@ export class Execution {
     if (spec.kind === 'static_ast_proof') return null
     if (confirmed.result.verdict !== 'confirmed') return null
     const fields = extractSpecDedupeFields(spec)
-    const rows = this.storage.db.select().from(findings).where(and(
-      eq(findings.runId, run.id),
-      eq(findings.goalRevision, run.goalRevision),
-    )).all()
-    const existingRefs: ExistingFindingRef[] = rows.map(row => {
-      const existingSpec = row.replaySpecId ? this.storage.getReplaySpec(run.id, row.replaySpecId) : null
-      const existingFields = existingSpec ? extractSpecDedupeFields(existingSpec.spec) : undefined
-      return {
-        id: row.id,
-        origin: row.finding.origin,
-        title: row.finding.title,
-        status: row.finding.status,
-        cwe: row.finding.cwe,
-        category: row.finding.category,
-        severity: row.finding.severity,
-        endpoint: existingFields?.endpoint ?? null,
-        authState: existingFields?.authState ?? null,
-        specKind: existingFields?.specKind ?? null,
-        method: existingFields?.method ?? null,
-        param: existingFields?.param ?? null,
-        graphqlField: existingFields?.graphqlField ?? null,
-        mutated: existingFields?.mutated ?? null,
-        fingerprintHash: row.fingerprintHash ?? null,
-      }
-    })
+    const { refs: existingRefs } = buildExistingFindingRefs(this.storage, run.id, run.goalRevision)
     const duplicate = checkStructuralDuplicate({
       origin: spec.origin,
       title: spec.title,
@@ -8939,31 +8866,7 @@ export class Execution {
     const spec = parsed.data
 
     const fields = extractSpecDedupeFields(spec)
-    const existingRows = this.storage.db.select().from(findings).where(and(
-      eq(findings.runId, input.run.id),
-      eq(findings.goalRevision, input.run.goalRevision),
-    )).all()
-    const existingRefs: ExistingFindingRef[] = existingRows.map(row => {
-      const specRow = row.replaySpecId ? this.storage.getReplaySpec(input.run.id, row.replaySpecId) : null
-      const existingFields = specRow ? extractSpecDedupeFields(specRow.spec) : undefined
-      return {
-        id: row.id,
-        origin: row.finding.origin,
-        title: row.finding.title,
-        status: row.finding.status,
-        cwe: row.finding.cwe,
-        category: row.finding.category,
-        severity: row.finding.severity,
-        endpoint: existingFields?.endpoint ?? null,
-        authState: existingFields?.authState ?? null,
-        specKind: existingFields?.specKind ?? null,
-        method: existingFields?.method ?? null,
-        param: existingFields?.param ?? null,
-        graphqlField: existingFields?.graphqlField ?? null,
-        mutated: existingFields?.mutated ?? null,
-        fingerprintHash: row.fingerprintHash ?? null,
-      }
-    })
+    const { refs: existingRefs } = buildExistingFindingRefs(this.storage, input.run.id, input.run.goalRevision)
     const duplicate = checkStructuralDuplicate({
       origin: spec.origin,
       title: spec.title,
@@ -10106,25 +10009,7 @@ export class Execution {
           }
         }
 
-        const saved = this.storage.recordExchange({
-          runId: curRun.id,
-          assignmentId: job.assignment.id,
-          scopeRevision: curRun.scopeRevision,
-          origin: res.origin,
-          finalOrigin: res.finalOrigin,
-          redirectOrigins: res.redirectOrigins,
-          method: res.method,
-          pathAndQuery: res.pathAndQuery,
-          personaHandle: res.personaHandle,
-          status: res.status,
-          mediaType: res.mediaType,
-          reqHeaders: res.reqHeaders,
-          respHeaders: res.respHeaders,
-          body: res.body,
-          durationMs: res.durationMs,
-          secretMatches: res.secretMatches,
-          secrets: currentSecrets(),
-        })
+        const saved = recordBrokerExchange(this.storage, curRun, job.assignment.id, res, currentSecrets())
 
         // Priority #3: Auto-track persona_resource facts when Tier >= 2 and >= 2 personas are approved
         trackPersonaResources(curRun, res, saved.id)
@@ -10214,28 +10099,13 @@ export class Execution {
         })
 
         const summaries = burst.results.map(res => {
-          const saved = this.storage.recordExchange({
-            runId: curRun.id,
-            assignmentId: job.assignment.id,
-            scopeRevision: curRun.scopeRevision,
-            origin: res.origin,
-            finalOrigin: res.finalOrigin,
-            redirectOrigins: res.redirectOrigins,
-            method: res.method,
-            pathAndQuery: res.pathAndQuery,
-            personaHandle: res.personaHandle,
-            status: res.status,
-            mediaType: res.mediaType,
-            reqHeaders: res.reqHeaders,
-            respHeaders: res.respHeaders,
-            body: res.body,
-            durationMs: res.durationMs,
-            secretMatches: res.secretMatches,
-            secrets: currentSecrets(),
+          const saved = recordBrokerExchange(this.storage, curRun, job.assignment.id, res, currentSecrets(), {
+            markCoverage: (r, o, m, p) => this.markEndpointCoverage(r, o, m, p, 'http_exchange'),
+            onSaved: (r, e, id) => {
+              trackPersonaResources(r, e, id)
+              this.scanSecondOrderExchange(r, job.assignment.id, e, id)
+            },
           })
-          trackPersonaResources(curRun, res, saved.id)
-          this.markEndpointCoverage(curRun, res.origin, res.method, res.pathAndQuery, 'http_exchange')
-          this.scanSecondOrderExchange(curRun, job.assignment.id, res, saved.id)
           return {
             exchangeId: saved.id,
             origin: res.origin,
@@ -10266,8 +10136,46 @@ export class Execution {
         },
       })
 
+      const prepareBudgetedProbe = (origin: string, requestedMax: number | undefined, defaultMax: number) => {
+        const curRun = this.check(job)
+        if (this.storage.checkBudgetExceeded(curRun.id)) throw new BudgetExceededError('Run spend or request budget exceeded.')
+        const cleanOrigin = this.parseOriginForRun(curRun, origin)
+        const remainingReqs = this.phaseRequestRemaining(curRun) ?? (requestedMax ?? defaultMax)
+        if (remainingReqs <= 0) throw new BudgetExceededError('Agent request budget exhausted.')
+        const cappedMax = requestedMax !== undefined ? Math.min(requestedMax, remainingReqs) : Math.min(defaultMax, remainingReqs)
+        return { curRun, cleanOrigin, remainingReqs, cappedMax }
+      }
+      const stageJsonArtifact = async (
+        curRun: Run,
+        kind: 'dns' | 'tls' | 'browser' | 'surface' | 'ws',
+        title: string,
+        filename: string,
+        payload: unknown,
+        signal: AbortSignal,
+        secretsList: readonly NamedSecret[] = currentSecrets(),
+      ) => {
+        const serialized = JSON.stringify(payload, null, 2)
+        const ev = this.storage.addArtifact(curRun, job.assignment, kind, title, serialized, undefined, secretsList)
+        const stagedPath = await session.stage(filename.replace('{id}', ev.id.slice(0, 8)), serialized, signal).catch(() => null)
+        return { evidenceId: ev.id, stagedPath }
+      }
+      const makeTrackedExchangeRecorder = (curRun: Run) =>
+        createExchangeRecorder(this.storage, () => curRun, job.assignment.id, currentSecrets, {
+          onSaved: (r, e, id) => {
+            trackPersonaResources(r, e, id)
+            this.scanSecondOrderExchange(r, job.assignment.id, e, id)
+          },
+        })
+
+      const sharedHandlers = this.buildSharedSessionHandlers(job, session, currentSecrets, {
+        offlineScriptLabel: 'Offline {runtime} script',
+        onFactRecorded: curRun => {
+          boardTools.noteEvidence()
+          this.schedulePlanner(curRun.id)
+        },
+      })
       const handlers: WorkerToolHandlers = {
-        spillOutput: async (id, content, signal) => session.stage(`tool-output/${id}.txt`, content, signal),
+        ...sharedHandlers,
 
         board_post: async (args) => boardTools.board_post(args),
         board_read: async (args) => boardTools.board_read(args),
@@ -10322,28 +10230,13 @@ export class Execution {
             execute: () => this.broker.executeBatch(brokerReqs, grant, signal),
           })
           const summaries = results.map(res => {
-            const saved = this.storage.recordExchange({
-              runId: curRun.id,
-              assignmentId: job.assignment.id,
-              scopeRevision: curRun.scopeRevision,
-              origin: res.origin,
-              finalOrigin: res.finalOrigin,
-              redirectOrigins: res.redirectOrigins,
-              method: res.method,
-              pathAndQuery: res.pathAndQuery,
-              personaHandle: res.personaHandle,
-              status: res.status,
-              mediaType: res.mediaType,
-              reqHeaders: res.reqHeaders,
-              respHeaders: res.respHeaders,
-              body: res.body,
-              durationMs: res.durationMs,
-              secretMatches: res.secretMatches,
-              secrets: currentSecrets(),
+            const saved = recordBrokerExchange(this.storage, curRun, job.assignment.id, res, currentSecrets(), {
+              markCoverage: (r, o, m, p) => this.markEndpointCoverage(r, o, m, p, 'http_exchange'),
+              onSaved: (r, e, id) => {
+                trackPersonaResources(r, e, id)
+                this.scanSecondOrderExchange(r, job.assignment.id, e, id)
+              },
             })
-            trackPersonaResources(curRun, res, saved.id)
-            this.markEndpointCoverage(curRun, res.origin, res.method, res.pathAndQuery, 'http_exchange')
-            this.scanSecondOrderExchange(curRun, job.assignment.id, res, saved.id)
             return {
               exchangeId: saved.id, status: res.status, durationMs: res.durationMs,
               bodySha256: res.bodySha256, bodyPreview: res.bodyPreview.slice(0, 800),
@@ -10361,21 +10254,21 @@ export class Execution {
         inspect_dns: async ({ origin }, signal) => {
           const curRun = this.check(job)
           const dnsRes = await this.broker.inspectDns(origin, grant, signal)
-          const ev = this.storage.addArtifact(curRun, job.assignment, 'dns',
-            `DNS inspection · ${dnsRes.hostname}`, JSON.stringify(dnsRes, null, 2), undefined, secrets)
-          const stagedPath = await session.stage(`dns-${dnsRes.hostname.replace(/[^a-z0-9.-]/gi, '_')}.json`,
-            JSON.stringify(dnsRes, null, 2), signal).catch(() => null)
-          return { evidenceId: ev.id, stagedPath, ...dnsRes }
+          const staged = await stageJsonArtifact(
+            curRun, 'dns', `DNS inspection · ${dnsRes.hostname}`,
+            `dns-${dnsRes.hostname.replace(/[^a-z0-9.-]/gi, '_')}.json`, dnsRes, signal, secrets,
+          )
+          return { ...staged, ...dnsRes }
         },
 
         inspect_tls: async ({ origin }, signal) => {
           const curRun = this.check(job)
           const tlsRes = await this.broker.inspectTls(origin, grant, signal)
-          const ev = this.storage.addArtifact(curRun, job.assignment, 'tls',
-            `TLS audit · ${tlsRes.hostname}`, JSON.stringify(tlsRes, null, 2), undefined, secrets)
-          const stagedPath = await session.stage(`tls-${tlsRes.hostname.replace(/[^a-z0-9.-]/gi, '_')}.json`,
-            JSON.stringify(tlsRes, null, 2), signal).catch(() => null)
-          return { evidenceId: ev.id, stagedPath, ...tlsRes }
+          const staged = await stageJsonArtifact(
+            curRun, 'tls', `TLS audit · ${tlsRes.hostname}`,
+            `tls-${tlsRes.hostname.replace(/[^a-z0-9.-]/gi, '_')}.json`, tlsRes, signal, secrets,
+          )
+          return { ...staged, ...tlsRes }
         },
 
         browser_visit: async (args, signal) => {
@@ -10395,25 +10288,7 @@ export class Execution {
             waitAfterLoadMs: args.waitAfterLoadMs,
             secrets: currentSecrets(),
             onExchange: ex => {
-              const saved = this.storage.recordExchange({
-                runId: curRun.id,
-                assignmentId: job.assignment.id,
-                scopeRevision: curRun.scopeRevision,
-                origin: ex.origin,
-                finalOrigin: ex.finalOrigin,
-                redirectOrigins: ex.redirectOrigins,
-                method: ex.method,
-                pathAndQuery: ex.pathAndQuery,
-                personaHandle: ex.personaHandle,
-                status: ex.status,
-                mediaType: ex.mediaType,
-                reqHeaders: ex.reqHeaders,
-                respHeaders: ex.respHeaders,
-                body: ex.body,
-                durationMs: ex.durationMs,
-                secretMatches: ex.secretMatches,
-                secrets: currentSecrets(),
-              })
+              const saved = recordBrokerExchange(this.storage, curRun, job.assignment.id, ex, currentSecrets())
               this.scanSecondOrderExchange(curRun, job.assignment.id, ex, saved.id)
               return saved.id
             },
@@ -10458,30 +10333,12 @@ export class Execution {
               runId: curRun.id,
               assignmentId: job.assignment.id,
               secrets: currentSecrets(),
-              onExchange: ex => {
-                const saved = this.storage.recordExchange({
-                  runId: curRun.id,
-                  assignmentId: job.assignment.id,
-                  scopeRevision: curRun.scopeRevision,
-                  origin: ex.origin,
-                  finalOrigin: ex.finalOrigin,
-                  redirectOrigins: ex.redirectOrigins,
-                  method: ex.method,
-                  pathAndQuery: ex.pathAndQuery,
-                  personaHandle: ex.personaHandle,
-                  status: ex.status,
-                  mediaType: ex.mediaType,
-                  reqHeaders: ex.reqHeaders,
-                  respHeaders: ex.respHeaders,
-                  body: ex.body,
-                  durationMs: ex.durationMs,
-                  secretMatches: ex.secretMatches,
-                  secrets: currentSecrets(),
-                })
-                trackPersonaResources(curRun, ex, saved.id)
-              this.scanSecondOrderExchange(curRun, job.assignment.id, ex, saved.id)
-                return saved.id
-              },
+              onExchange: createExchangeRecorder(this.storage, () => curRun, job.assignment.id, currentSecrets, {
+                onSaved: (r, e, id) => {
+                  trackPersonaResources(r, e, id)
+                  this.scanSecondOrderExchange(r, job.assignment.id, e, id)
+                },
+              }),
             })),
             grant,
             signal,
@@ -10524,22 +10381,7 @@ export class Execution {
 
         run_sast_scan: async (args, signal) => {
           const curRun = this.check(job)
-          const res = await session.sast(args, signal)
-          const ev = this.storage.addArtifact(curRun, job.assignment, 'sast',
-            `SAST scan · ${res.repo} (${res.enginesRun.join(', ')})`,
-            JSON.stringify(res, null, 2), undefined, currentSecrets())
-          for (const engine of res.enginesRun) {
-            const st = res.engineStatus[engine]
-            this.storage.recordSastRun({
-              runId: curRun.id,
-              assignmentId: job.assignment.id,
-              repo: res.repo,
-              engine,
-              rawArtifactId: ev.id,
-              findingCount: st?.count ?? 0,
-              durationMs: st?.durationMs ?? res.durationMs,
-            })
-          }
+          const res = await sharedHandlers.run_sast_scan!(args, signal)
 
           // SCA (trivy-fs) findings carry CVE ids. Record them as low-confidence hypotheses so the
           // planner and safe-template runner can target real advisories (never auto-confirmed).
@@ -10578,37 +10420,11 @@ export class Execution {
               })
             }
           }
-          return { evidenceId: ev.id, ...res }
-        },
-
-        run_offline_script: async (args, signal) => {
-          const curRun = this.check(job)
-          const res = await session.runScript(args, signal)
-          const ev = this.storage.addArtifact(curRun, job.assignment, 'analysis',
-            `Offline ${args.runtime} script`,
-            JSON.stringify({
-              runtime: res.runtime,
-              exitCode: res.exitCode,
-              timedOut: res.timedOut,
-              durationMs: res.durationMs,
-              stdout: redact(res.stdout, currentSecrets()),
-              stderr: redact(res.stderr, currentSecrets()),
-            }, null, 2), undefined, currentSecrets())
-          return { evidenceId: ev.id, ...res }
+          return res
         },
 
         probe_surface: async (args, signal) => {
-          const curRun = this.check(job)
-          if (this.storage.checkBudgetExceeded(curRun.id)) throw new BudgetExceededError('Run spend or request budget exceeded.')
-          const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
-          const remainingReqs = this.phaseRequestRemaining(curRun) ?? (args.maxRequests ?? 150)
-          if (remainingReqs <= 0) {
-            throw new BudgetExceededError('Agent request budget exhausted.')
-          }
-          const cappedMax = args.maxRequests !== undefined
-            ? Math.min(args.maxRequests, remainingReqs)
-            : Math.min(150, remainingReqs)
-
+          const { curRun, cleanOrigin, cappedMax } = prepareBudgetedProbe(args.origin, args.maxRequests, 150)
           const res = await probeSurface({
             origin: cleanOrigin,
             mode: args.mode,
@@ -10620,76 +10436,27 @@ export class Execution {
             methods: args.methods,
             persona: args.persona,
             maxRequests: cappedMax,
-            onExchange: ex => {
-              const saved = this.storage.recordExchange({
-                runId: curRun.id,
-                assignmentId: job.assignment.id,
-                scopeRevision: curRun.scopeRevision,
-                origin: ex.origin,
-                finalOrigin: ex.finalOrigin,
-                redirectOrigins: ex.redirectOrigins,
-                method: ex.method,
-                pathAndQuery: ex.pathAndQuery,
-                personaHandle: ex.personaHandle,
-                status: ex.status,
-                mediaType: ex.mediaType,
-                reqHeaders: ex.reqHeaders,
-                respHeaders: ex.respHeaders,
-                body: ex.body,
-                durationMs: ex.durationMs,
-                secretMatches: ex.secretMatches,
-                secrets: currentSecrets(),
-              })
-              trackPersonaResources(curRun, ex, saved.id)
-              this.scanSecondOrderExchange(curRun, job.assignment.id, ex, saved.id)
-              return saved.id
-            },
+            onExchange: makeTrackedExchangeRecorder(curRun),
           }, this.broker, grant, signal)
 
-          this.markEndpointCoverage(
-            curRun,
-            res.origin,
-            args.methods?.[0] ?? 'GET',
-            args.basePath ?? '/',
-            `surface:${res.mode}`,
-          )
+          this.markEndpointCoverage(curRun, res.origin, args.methods?.[0] ?? 'GET', args.basePath ?? '/', `surface:${res.mode}`)
           this.storage.recordSurfaceProbe({
-            runId: curRun.id,
-            assignmentId: job.assignment.id,
-            scopeRevision: curRun.scopeRevision,
-            origin: res.origin,
-            probeKind: `surface:${res.mode}`,
-            requestsSent: res.requestsSent,
-            anomaliesFound: res.anomalies.length,
-            baselineSignature: res.baselineSignature,
+            runId: curRun.id, assignmentId: job.assignment.id, scopeRevision: curRun.scopeRevision,
+            origin: res.origin, probeKind: `surface:${res.mode}`,
+            requestsSent: res.requestsSent, anomaliesFound: res.anomalies.length, baselineSignature: res.baselineSignature,
           })
-          const ev = this.storage.addArtifact(curRun, job.assignment, 'surface',
-            `Surface probe (${res.mode}) · ${res.origin}`,
-            JSON.stringify(res, null, 2), undefined, currentSecrets())
-          const stagedPath = await session.stage(`surface-${ev.id.slice(0, 8)}.json`,
-            JSON.stringify(res, null, 2), signal).catch(() => null)
-          return { evidenceId: ev.id, stagedPath, ...res }
+          const staged = await stageJsonArtifact(curRun, 'surface', `Surface probe (${res.mode}) · ${res.origin}`, 'surface-{id}.json', res, signal)
+          return { ...staged, ...res }
         },
 
         probe_differential: async (args, signal) => {
-          const curRun = this.check(job)
-          if (this.storage.checkBudgetExceeded(curRun.id)) throw new BudgetExceededError('Run spend or request budget exceeded.')
-          const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
-          const remainingReqs = this.phaseRequestRemaining(curRun) ?? (args.maxRequests ?? 60)
-          if (remainingReqs <= 0) {
-            throw new BudgetExceededError('Agent request budget exhausted.')
-          }
-          const cappedMax = args.maxRequests !== undefined
-            ? Math.min(args.maxRequests, remainingReqs)
-            : Math.min(60, remainingReqs)
+          const { curRun, cleanOrigin, cappedMax } = prepareBudgetedProbe(args.origin, args.maxRequests, 60)
 
           // Default parameter / resource-ID selection from persisted endpoint_params & api_dependencies.
           const requestedTemplate = normalizeEndpointTemplate(args.pathAndQuery.split('?')[0] || '/')
-          const targetEndpoint = this.storage.listEndpoints(curRun.id, { origin: cleanOrigin })
-            .find(ep => ep.pathTemplate === requestedTemplate &&
-              (!args.method || ep.method === args.method.toUpperCase()))
-            ?? this.storage.listEndpoints(curRun.id, { origin: cleanOrigin })
-              .find(ep => ep.pathTemplate === requestedTemplate)
+          const originEndpoints = this.storage.listEndpoints(curRun.id, { origin: cleanOrigin })
+          const targetEndpoint = originEndpoints.find(ep => ep.pathTemplate === requestedTemplate && (!args.method || ep.method === args.method.toUpperCase()))
+            ?? originEndpoints.find(ep => ep.pathTemplate === requestedTemplate)
           const targetParams = targetEndpoint ? this.storage.listEndpointParams(curRun.id, targetEndpoint.id) : []
           const injectableParams = targetParams.filter(p => ['query', 'json', 'form', 'path', 'graphql_var'].includes(p.location) && !p.isCsrf)
           const preferredParam = [...injectableParams].sort((a, b) =>
@@ -10697,10 +10464,7 @@ export class Execution {
             Number(a.isObjectId) - Number(b.isObjectId),
           )[0]
           const resolvedParamName = args.paramName ?? preferredParam?.name
-          const preferredParamLocation = preferredParam && preferredParam.location !== 'cookie'
-            ? preferredParam.location
-            : undefined
-          const resolvedParamLocation = args.paramLocation ?? preferredParamLocation
+          const resolvedParamLocation = args.paramLocation ?? (preferredParam && preferredParam.location !== 'cookie' ? preferredParam.location : undefined)
           const resourceSamples = this.storage.listResourceSamples(curRun.id)
             .filter(sample => sample.origin === cleanOrigin && sample.resourceId !== '[redacted]')
           const matchingResourceIds = [...new Set([
@@ -10745,65 +10509,24 @@ export class Execution {
             assignmentId: job.assignment.id,
             storage: this.storage,
             maxRequests: cappedMax,
-            onExchange: ex => {
-              const saved = this.storage.recordExchange({
-                runId: curRun.id,
-                assignmentId: job.assignment.id,
-                scopeRevision: curRun.scopeRevision,
-                origin: ex.origin,
-                finalOrigin: ex.finalOrigin,
-                redirectOrigins: ex.redirectOrigins,
-                method: ex.method,
-                pathAndQuery: ex.pathAndQuery,
-                personaHandle: ex.personaHandle,
-                status: ex.status,
-                mediaType: ex.mediaType,
-                reqHeaders: ex.reqHeaders,
-                respHeaders: ex.respHeaders,
-                body: ex.body,
-                durationMs: ex.durationMs,
-                secretMatches: ex.secretMatches,
-                secrets: currentSecrets(),
-              })
-              trackPersonaResources(curRun, ex, saved.id)
-              this.scanSecondOrderExchange(curRun, job.assignment.id, ex, saved.id)
-              return saved.id
-            },
+            onExchange: makeTrackedExchangeRecorder(curRun),
           }, this.broker, grant, this.canaryBroker, signal)
 
-          this.markEndpointCoverage(
-            curRun,
-            res.origin,
-            args.method ?? 'GET',
-            args.pathAndQuery,
-            `diff:${res.probeClass}`,
-          )
+          this.markEndpointCoverage(curRun, res.origin, args.method ?? 'GET', args.pathAndQuery, `diff:${res.probeClass}`)
           this.storage.recordSurfaceProbe({
-            runId: curRun.id,
-            assignmentId: job.assignment.id,
-            scopeRevision: curRun.scopeRevision,
-            origin: res.origin,
-            probeKind: `diff:${res.probeClass}`,
-            requestsSent: res.requestsSent,
-            anomaliesFound: res.anomalies.length,
-            baselineSignature: res.verdict,
+            runId: curRun.id, assignmentId: job.assignment.id, scopeRevision: curRun.scopeRevision,
+            origin: res.origin, probeKind: `diff:${res.probeClass}`,
+            requestsSent: res.requestsSent, anomaliesFound: res.anomalies.length, baselineSignature: res.verdict,
           })
-          const ev = this.storage.addArtifact(curRun, job.assignment, 'surface',
-            `Differential probe (${res.probeClass}) · ${res.origin}${args.pathAndQuery.slice(0, 48)}`,
-            JSON.stringify(res, null, 2), undefined, currentSecrets())
-          const stagedPath = await session.stage(`diff-${ev.id.slice(0, 8)}.json`,
-            JSON.stringify(res, null, 2), signal).catch(() => null)
-          return { evidenceId: ev.id, stagedPath, ...res }
+          const staged = await stageJsonArtifact(
+            curRun, 'surface', `Differential probe (${res.probeClass}) · ${res.origin}${args.pathAndQuery.slice(0, 48)}`,
+            'diff-{id}.json', res, signal,
+          )
+          return { ...staged, ...res }
         },
 
         run_safe_templates: async (args, signal) => {
-          const curRun = this.check(job)
-          if (this.storage.checkBudgetExceeded(curRun.id)) throw new BudgetExceededError('Run spend or request budget exceeded.')
-          const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
-          const remainingReqs = this.phaseRequestRemaining(curRun) ?? 150
-          if (remainingReqs <= 0) {
-            throw new BudgetExceededError('Agent request budget exhausted.')
-          }
+          const { curRun, cleanOrigin, remainingReqs } = prepareBudgetedProbe(args.origin, undefined, 150)
 
           const techFactTags = this.storage.listFacts(curRun.id, { includeTainted: false, origin: cleanOrigin, kind: 'tech_fingerprint', limit: 30 })
             .flatMap(f => {
@@ -10850,39 +10573,13 @@ export class Execution {
             runId: curRun.id,
             assignmentId: job.assignment.id,
             storage: this.storage,
-            onExchange: ex => {
-              const saved = this.storage.recordExchange({
-                runId: curRun.id,
-                assignmentId: job.assignment.id,
-                scopeRevision: curRun.scopeRevision,
-                origin: ex.origin,
-                finalOrigin: ex.finalOrigin,
-                redirectOrigins: ex.redirectOrigins,
-                method: ex.method,
-                pathAndQuery: ex.pathAndQuery,
-                personaHandle: ex.personaHandle,
-                status: ex.status,
-                mediaType: ex.mediaType,
-                reqHeaders: ex.reqHeaders,
-                respHeaders: ex.respHeaders,
-                body: ex.body,
-                durationMs: ex.durationMs,
-                secretMatches: ex.secretMatches,
-                secrets: currentSecrets(),
-              })
-              return saved.id
-            },
+            onExchange: createExchangeRecorder(this.storage, () => curRun, job.assignment.id, currentSecrets),
           }, this.broker, grant, this.canaryBroker, signal)
 
           this.storage.recordSurfaceProbe({
-            runId: curRun.id,
-            assignmentId: job.assignment.id,
-            scopeRevision: curRun.scopeRevision,
-            origin: res.origin,
-            probeKind: 'safe_templates',
-            requestsSent: res.requestsSent,
-            anomaliesFound: res.matches.length,
-            baselineSignature: res.baselineSignature,
+            runId: curRun.id, assignmentId: job.assignment.id, scopeRevision: curRun.scopeRevision,
+            origin: res.origin, probeKind: 'safe_templates',
+            requestsSent: res.requestsSent, anomaliesFound: res.matches.length, baselineSignature: res.baselineSignature,
           })
 
           // Record template matches strictly as hypothesis/lead facts (NEVER auto-confirmed!)
@@ -10892,13 +10589,8 @@ export class Execution {
               origin: res.origin,
               summary: `[Safe template ${match.templateId}] ${match.name} (${match.severity}) on ${match.method} ${match.path} (HTTP ${match.status})`,
               data: {
-                templateId: match.templateId,
-                cve: match.cve ?? null,
-                cwe: match.cwe ?? null,
-                severity: match.severity,
-                evidence: match.evidence,
-                controlStatus: match.controlStatus,
-                confidence: 'low',
+                templateId: match.templateId, cve: match.cve ?? null, cwe: match.cwe ?? null,
+                severity: match.severity, evidence: match.evidence, controlStatus: match.controlStatus, confidence: 'low',
               },
               exchangeIds: match.exchangeId ? [match.exchangeId] : [],
               sourceOrigins: [res.origin],
@@ -10906,12 +10598,11 @@ export class Execution {
             })
           }
 
-          const ev = this.storage.addArtifact(curRun, job.assignment, 'surface',
-            `Safe templates · ${res.origin} (${res.matches.length} matches)`,
-            JSON.stringify(res, null, 2), undefined, currentSecrets())
-          const stagedPath = await session.stage(`templates-${ev.id.slice(0, 8)}.json`,
-            JSON.stringify(res, null, 2), signal).catch(() => null)
-          return { evidenceId: ev.id, stagedPath, ...res }
+          const staged = await stageJsonArtifact(
+            curRun, 'surface', `Safe templates · ${res.origin} (${res.matches.length} matches)`,
+            'templates-{id}.json', res, signal,
+          )
+          return { ...staged, ...res }
         },
 
         probe_websocket: async (args, signal) => {
@@ -10930,25 +10621,7 @@ export class Execution {
             secrets: currentSecrets(),
           }, grant, signal)
           const syntheticEx = websocketResultToExchange(wsRes)
-          const saved = this.storage.recordExchange({
-            runId: curRun.id,
-            assignmentId: job.assignment.id,
-            scopeRevision: curRun.scopeRevision,
-            origin: syntheticEx.origin,
-            finalOrigin: syntheticEx.finalOrigin,
-            redirectOrigins: syntheticEx.redirectOrigins,
-            method: syntheticEx.method,
-            pathAndQuery: syntheticEx.pathAndQuery,
-            personaHandle: syntheticEx.personaHandle,
-            status: syntheticEx.status,
-            mediaType: syntheticEx.mediaType,
-            reqHeaders: syntheticEx.reqHeaders,
-            respHeaders: syntheticEx.respHeaders,
-            body: syntheticEx.body,
-            durationMs: syntheticEx.durationMs,
-            secretMatches: syntheticEx.secretMatches,
-            secrets: currentSecrets(),
-          })
+          const saved = recordBrokerExchange(this.storage, curRun, job.assignment.id, syntheticEx, currentSecrets())
           // Second-order markers can surface in WebSocket frames or upgrade headers.
           const wsScanText = [
             ...Object.entries(wsRes.upgradeHeaders ?? {}).map(([k, v]) => `${k}: ${v}`),
@@ -10977,12 +10650,11 @@ export class Execution {
               })
             }
           }
-          const ev = this.storage.addArtifact(curRun, job.assignment, 'ws',
-            `WebSocket probe · ${wsRes.origin}${wsRes.pathAndQuery.slice(0, 60)}`,
-            JSON.stringify({ exchangeId: saved.id, ...wsRes }, null, 2), undefined, currentSecrets())
-          const stagedPath = await session.stage(`ws-${ev.id.slice(0, 8)}.json`,
-            JSON.stringify({ exchangeId: saved.id, ...wsRes }, null, 2), signal).catch(() => null)
-          return { exchangeId: saved.id, evidenceId: ev.id, stagedPath, ...wsRes }
+          const staged = await stageJsonArtifact(
+            curRun, 'ws', `WebSocket probe · ${wsRes.origin}${wsRes.pathAndQuery.slice(0, 60)}`,
+            'ws-{id}.json', { exchangeId: saved.id, ...wsRes }, signal,
+          )
+          return { exchangeId: saved.id, ...staged, ...wsRes }
         },
 
         derive_evidence: async ({ command, outputs, timeoutMs }, signal) => {
@@ -11005,27 +10677,12 @@ export class Execution {
           }
         },
 
-        analyze_artifact: async (args, signal) => {
-          this.check(job)
-          const { tool, ...rest } = args
-          return await session.analyze(tool, rest, signal)
-        },
-
         query_cves: async (args, signal) => {
-          this.check(job)
-          const advisories = await queryCves(args, signal)
+          const res = await sharedHandlers.query_cves!(args, signal)
           return {
-            count: advisories.length,
-            advisories,
+            ...res,
             note: 'Advisories are hypotheses only. Record a cve_hypothesis fact and verify reachability with a non-destructive Replay Spec before confirming.',
           }
-        },
-
-        load_skill: async ({ name }) => {
-          if (name.trim().toLowerCase() === 'list') return { skills: listSkills() }
-          const skill = loadSkill(name)
-          if (!skill) return { error: `Unknown skill "${name}".`, available: listSkills().map(s => s.name) }
-          return skill
         },
 
         mint_canary: async ({ purpose }) => {
@@ -11131,13 +10788,6 @@ export class Execution {
           }
         },
 
-        search_facts: async ({ query, origin, kind, limit }) => {
-          const curRun = this.check(job)
-          const currentApproved = this.approvedOriginsSet(curRun)
-          return this.storage.listFacts(curRun.id, { includeTainted: false, query, origin, kind, limit })
-            .filter(f => currentApproved.has(f.origin) && f.sourceOrigins.every(o => currentApproved.has(o)))
-        },
-
         read_peer_trace: async ({ assignmentId, limit }) => {
           const curRun = this.check(job)
           const currentApproved = this.approvedOriginsSet(curRun)
@@ -11163,48 +10813,6 @@ export class Execution {
           } catch {
             return { error: 'Digest not found.' }
           }
-        },
-
-
-        record_fact: async (args) => {
-          const curRun = this.check(job)
-          const currentApproved = this.approvedOriginsSet(curRun)
-          const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
-          if (!currentApproved.has(cleanOrigin)) throw new BrokerDenied(`Origin ${cleanOrigin} is not approved.`)
-          const fact = this.storage.addFact(curRun, job.assignment, {
-            kind: args.kind,
-            origin: cleanOrigin,
-            summary: args.summary,
-            data: args.data,
-            exchangeIds: args.exchangeIds,
-            evidenceIds: args.evidenceIds,
-            sourceOrigins: args.sourceOrigins,
-            secrets: currentSecrets(),
-          })
-          boardTools.noteEvidence()
-          this.schedulePlanner(curRun.id)
-          return { factId: fact.id, kind: args.kind, origin: fact.origin }
-        },
-
-        record_coverage: async (args) => {
-          const curRun = this.check(job)
-          const currentApproved = this.approvedOriginsSet(curRun)
-          const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
-          if (!currentApproved.has(cleanOrigin)) throw new BrokerDenied(`Origin ${cleanOrigin} is not approved.`)
-          const ext = args as typeof args & { enforcingControl?: string; proofGapReason?: string; linkedFindingId?: string }
-          if (args.status === 'ruled_out' && !ext.enforcingControl?.trim()) {
-            throw new Error('record_coverage with status "ruled_out" requires a non-empty enforcingControl (exact file:line or negative-control exchangeId proving the control runs on the attacker path).')
-          }
-          const entry = this.storage.upsertCoverageEntry(curRun, job.assignment.id, {
-            origin: cleanOrigin,
-            category: args.category,
-            status: args.status,
-            summary: args.summary,
-            enforcingControl: ext.enforcingControl,
-            proofGapReason: args.status === 'needs_follow_up' ? (ext.proofGapReason?.trim() || args.summary) : ext.proofGapReason,
-            linkedFindingId: ext.linkedFindingId,
-          })
-          return { id: entry.id, origin: entry.origin, category: entry.category, status: entry.status }
         },
 
         propose_chain_finding: async (args) => {
@@ -11237,37 +10845,9 @@ export class Execution {
 
           // Two-stage submission-time deduplication (§4.5B)
           const specDedupeFields = extractSpecDedupeFields(parsed)
-          const existingRows = this.storage.db.select().from(findings).where(and(
-            eq(findings.runId, curRun.id),
-            eq(findings.goalRevision, curRun.goalRevision),
-            eq(findings.findingKind, 'multi_step_chain'),
-          )).all()
-          const specMap = new Map(this.storage.listReplaySpecs(curRun.id).map(s => [s.id, s]))
-          const existingRefs: ExistingFindingRef[] = existingRows.map(row => {
-            const existingSpec = row.replaySpecId ? specMap.get(row.replaySpecId)?.spec : undefined
-            const existingFields = existingSpec ? extractSpecDedupeFields(existingSpec) : undefined
-            return {
-              id: row.id,
-              origin: row.finding.origin,
-              title: row.finding.title,
-              status: row.finding.status,
-              cwe: row.finding.cwe,
-              category: row.finding.category,
-              severity: row.finding.severity,
-              endpoint: existingFields?.endpoint ?? null,
-              authState: existingFields?.authState ?? null,
-              specKind: existingFields?.specKind ?? null,
-              method: existingFields?.method ?? null,
-              param: existingFields?.param ?? null,
-              graphqlField: existingFields?.graphqlField ?? null,
-              mutated: existingFields?.mutated ?? null,
-              reason: row.finding.reason,
-              impact: row.finding.impact,
-              remediation: row.finding.remediation,
-              sourceOrigins: row.sourceOrigins,
-              fingerprintHash: row.fingerprintHash ?? row.finding.fingerprintHash ?? null,
-            }
-          })
+          const { rows: existingRows, refs: existingRefs } = buildExistingFindingRefs(
+            this.storage, curRun.id, curRun.goalRevision, { chainOnly: true, includeDescriptions: true },
+          )
 
           const dedupeLlmCall = profiles.length
             ? createProviderLlmCall(profiles, {
@@ -11392,17 +10972,10 @@ export class Execution {
               deduplicated: true,
               rejected: true,
               isError: true,
-              inlineVerifyFeedback: {
-                verdict: 'inconclusive',
-                controlPassed: false,
-                assertionSummary: {
-                  observed: 'retry_limit_exceeded',
-                  expected: `<= ${maxAttempts} verification attempts`,
-                  reason: `Inline verification retry limit reached for existing finding ${canonicalMatchedRow.id} (maxInlineVerifyRetries=${maxInlineVerifyRetries}).`,
-                },
-                stepStatuses: [],
-                retriesRemaining: 0,
-              } satisfies InlineVerifyFeedback,
+              inlineVerifyFeedback: retryLimitExceededFeedback(
+                maxAttempts,
+                `Inline verification retry limit reached for existing finding ${canonicalMatchedRow.id} (maxInlineVerifyRetries=${maxInlineVerifyRetries}).`,
+              ),
             }
           }
 
@@ -11538,17 +11111,10 @@ export class Execution {
                 status: existingRow.finding.status,
                 ...(existingRow.verificationTier ? { verificationTier: existingRow.verificationTier } : {}),
                 severity: existingRow.finding.severity,
-                inlineVerifyFeedback: {
-                  verdict: 'inconclusive',
-                  controlPassed: false,
-                  assertionSummary: {
-                    observed: 'retry_limit_exceeded',
-                    expected: `<= ${maxAttempts} verification attempts`,
-                    reason: `Inline verification retry limit reached (maxInlineVerifyRetries=${maxInlineVerifyRetries}).`,
-                  },
-                  stepStatuses: [],
-                  retriesRemaining: 0,
-                } satisfies InlineVerifyFeedback,
+                inlineVerifyFeedback: retryLimitExceededFeedback(
+                  maxAttempts,
+                  `Inline verification retry limit reached (maxInlineVerifyRetries=${maxInlineVerifyRetries}).`,
+                ),
                 updated: false,
                 isError: true,
               }
@@ -12400,44 +11966,13 @@ export class Execution {
 
     // Tier 3 HITL gate for rce_proof and upload_probe specs on non-local-lab targets
     if (specRow.spec.kind === 'rce_proof' || specRow.spec.kind === 'upload_probe') {
-      const gateReq = specRow.spec.kind === 'rce_proof'
-        ? {
-            origin: specRow.spec.probeStep.request.origin,
-            method: specRow.spec.probeStep.request.method,
-            pathAndQuery: specRow.spec.probeStep.request.pathAndQuery,
-            personaHandle: specRow.spec.probeStep.request.persona ?? null,
-            rationale: `[rce_proof:${specRow.spec.proofMode}] Zero-LLM non-destructive PoE verification for "${specRow.spec.title}"`,
-            requestPreview: JSON.stringify({
-              proofMode: specRow.spec.proofMode,
-              controlStep: specRow.spec.controlStep,
-              probeStep: specRow.spec.probeStep,
-            }, null, 2),
-          }
-        : {
-            origin: specRow.spec.uploadStep.origin,
-            method: specRow.spec.uploadStep.method,
-            pathAndQuery: specRow.spec.uploadStep.pathAndQuery,
-            personaHandle: specRow.spec.uploadStep.persona ?? null,
-            rationale: `[upload_probe] Zero-LLM benign multipart upload verification for "${specRow.spec.title}"`,
-            requestPreview: JSON.stringify({
-              filename: specRow.spec.uploadStep.filename,
-              contentType: specRow.spec.uploadStep.contentType,
-              uploadStep: specRow.spec.uploadStep.pathAndQuery,
-              fetchStep: specRow.spec.fetchStep.request.pathAndQuery,
-            }, null, 2),
-          }
-      const approval = await this.waitForTier3Approval(job, {
-        ...gateReq,
-        bodyPreview: specRow.spec.kind === 'rce_proof'
-          ? (specRow.spec.probeStep.request.textBody ??
-              (specRow.spec.probeStep.request.jsonBody !== undefined
-                ? JSON.stringify(specRow.spec.probeStep.request.jsonBody)
-                : undefined))
-          : specRow.spec.uploadStep.contentTemplate,
-        hasMultipart: specRow.spec.kind === 'upload_probe',
-        isRceProof: specRow.spec.kind === 'rce_proof',
-        secrets,
-      }, job.controller.signal)
+      const gateReq = buildTier3VerifyGateReq(
+        specRow.spec,
+        specRow.spec.kind === 'rce_proof'
+          ? 'Zero-LLM non-destructive PoE verification'
+          : 'Zero-LLM benign multipart upload verification',
+      )
+      const approval = await this.waitForTier3Approval(job, { ...gateReq, secrets }, job.controller.signal)
       if (!approval.approved) {
         const current = this.check(job)
         const updatedFinding: Finding = {
@@ -12466,35 +12001,10 @@ export class Execution {
       storage: this.storage,
       runId: run.id,
       assignmentId: job.assignment.id,
-      onExchange: (ex: BrokerExchangeResult) => {
-        const saved = this.storage.recordExchange({
-          runId: run.id,
-          assignmentId: job.assignment.id,
-          scopeRevision: run.scopeRevision,
-          origin: ex.origin,
-          finalOrigin: ex.finalOrigin,
-          redirectOrigins: ex.redirectOrigins,
-          method: ex.method,
-          pathAndQuery: ex.pathAndQuery,
-          personaHandle: ex.personaHandle,
-          status: ex.status,
-          mediaType: ex.mediaType,
-          reqHeaders: ex.reqHeaders,
-          respHeaders: ex.respHeaders,
-          body: ex.body,
-          durationMs: ex.durationMs,
-          secretMatches: ex.secretMatches,
-          secrets: currentSecrets(),
-        })
-        this.storage.trackExchangeResources({
-          runId: run.id,
-          scopeRevision: run.scopeRevision,
-          exchange: ex,
-          source: 'surface_probe',
-        })
-        this.markEndpointCoverage(run, ex.origin, ex.method, ex.pathAndQuery, `replay:${specRow.spec.kind}`)
-        return saved.id
-      },
+      onExchange: createExchangeRecorder(this.storage, () => run, job.assignment.id, currentSecrets, {
+        trackResources: true,
+        markCoverage: (r, o, m, p) => this.markEndpointCoverage(r, o, m, p, `replay:${specRow.spec.kind}`),
+      }),
     }
     const result = await verifyReplaySpec(verifyParams)
     this.markReplaySpecCoverage(run, specRow.spec, `replay:${specRow.spec.kind}`)
@@ -12515,18 +12025,7 @@ export class Execution {
     let phaseFeedback: InlineVerifyFeedback | undefined
     this.storage.transaction(() => {
       // Strict Tier Separation (Invariant #4): static_ast_proof NEVER promotes to 'confirmed' / 'runtime_confirmed'
-      const staticSpec = specRow.spec.kind === 'static_ast_proof' ? specRow.spec : null
-      const isStaticAst = staticSpec !== null
-      const rawVerdict = result.verdict as Finding['status']
-      const finalStatus: Finding['status'] = isStaticAst
-        ? (rawVerdict === 'confirmed' || rawVerdict === 'static_verified' ? 'static_verified' : rawVerdict)
-        : rawVerdict
-      const verificationTier: VerificationTier | undefined = finalStatus === 'static_verified'
-        ? 'static_verified'
-        : finalStatus === 'confirmed'
-          ? 'runtime_confirmed'
-          : undefined
-
+      const { isStaticAst, finalStatus, verificationTier } = deriveReplayOutcomeStatus(specRow.spec, result)
       const receipt = this.storage.addArtifact(current, job.assignment, 'replay',
         `${isStaticAst ? 'Deterministic Static AST' : 'Zero-LLM replay'} · ${specRow.spec.title}`,
         JSON.stringify({
@@ -12545,32 +12044,13 @@ export class Execution {
           receiptArtifact: result.receipt?.receipt ?? null,
         }, null, 2), 'replay:' + specRow.id, currentSecrets())
 
-      const staticCodeLocations: CodeLocation[] | undefined = staticSpec
-        ? [{
-            repo: staticSpec.repo,
-            file: staticSpec.file,
-            startLine: staticSpec.startLine,
-            endLine: staticSpec.endLine,
-            label: staticSpec.sourceToSinkTrace?.slice(0, 180),
-          }]
-        : findingRow.finding.codeLocations
-
       const secretsList = currentSecrets()
-      const cleanReason = redact(result.outcome.reason || result.outcome.observed || findingRow.finding.reason, secretsList)
-      const cleanObserved = redact(result.outcome.observed, secretsList)
+      const { patch, cleanObserved } = buildReplayFindingPatch(
+        specRow.spec, result, findingRow.finding, finalStatus, verificationTier, 'replay', secretsList,
+      )
       const updatedFinding: Finding = {
         ...findingRow.finding,
-        status: finalStatus,
-        verificationTier,
-        reason: cleanReason,
-        confidence: (finalStatus === 'confirmed' || finalStatus === 'static_verified')
-          ? 'high'
-          : finalStatus === 'dismissed'
-            ? 'medium'
-            : 'low',
-        verification: `${isStaticAst ? 'Deterministic offline static_ast_proof' : `Zero-LLM ${specRow.spec.kind} replay`} verdict: ${finalStatus} (controlPassed=${result.outcome.controlPassed}, observed: ${cleanObserved}).`,
-        ...(staticSpec ? { runtimeProofGap: staticSpec.runtimeProofGap } : {}),
-        ...(staticCodeLocations?.length ? { codeLocations: staticCodeLocations } : {}),
+        ...patch,
         evidenceIds: [...new Set([...findingRow.finding.evidenceIds, receipt.id])],
         exchangeIds: [...new Set([...(findingRow.finding.exchangeIds ?? []), ...result.exchangeIds])],
         scopeRevision: current.scopeRevision,
@@ -12660,7 +12140,7 @@ export class Execution {
     }
     const full = join(reposDir, clean)
     if (!full.startsWith(reposDir + sep) || !existsSync(full)) {
-      throw new Error('guardian_verify scriptPath was not found in the mounted workspace.')
+      throw new Error('guardian_verify scriptPath was not found in the mounted workspace; pass the script inline via `script` instead.')
     }
     const size = statSync(full).size
     if (size <= 0 || size > 64 * 1024) throw new Error('guardian_verify script must be between 1 byte and 64 KiB.')
@@ -13156,41 +12636,7 @@ export class Execution {
         await this.canaryBroker.startListener({ enableDns: this.isCanaryDnsConfigured() }).catch(() => undefined)
       }
       if (parsed.kind === 'rce_proof' || parsed.kind === 'upload_probe') {
-        const gateReq = parsed.kind === 'rce_proof'
-          ? {
-              origin: parsed.probeStep.request.origin,
-              method: parsed.probeStep.request.method,
-              pathAndQuery: parsed.probeStep.request.pathAndQuery,
-              personaHandle: parsed.probeStep.request.persona ?? null,
-              rationale: `[rce_proof:${parsed.proofMode}] Inline Zero-LLM verification for "${parsed.title}"`,
-              requestPreview: JSON.stringify({
-                proofMode: parsed.proofMode,
-                controlStep: parsed.controlStep,
-                probeStep: parsed.probeStep,
-              }, null, 2),
-              bodyPreview: parsed.probeStep.request.textBody ??
-                (parsed.probeStep.request.jsonBody !== undefined
-                  ? JSON.stringify(parsed.probeStep.request.jsonBody)
-                  : undefined),
-              hasMultipart: false,
-              isRceProof: true,
-            }
-          : {
-              origin: parsed.uploadStep.origin,
-              method: parsed.uploadStep.method,
-              pathAndQuery: parsed.uploadStep.pathAndQuery,
-              personaHandle: parsed.uploadStep.persona ?? null,
-              rationale: `[upload_probe] Inline Zero-LLM verification for "${parsed.title}"`,
-              requestPreview: JSON.stringify({
-                filename: parsed.uploadStep.filename,
-                contentType: parsed.uploadStep.contentType,
-                uploadStep: parsed.uploadStep.pathAndQuery,
-                fetchStep: parsed.fetchStep.request.pathAndQuery,
-              }, null, 2),
-              bodyPreview: parsed.uploadStep.contentTemplate,
-              hasMultipart: true,
-              isRceProof: false,
-            }
+        const gateReq = buildTier3VerifyGateReq(parsed, 'Inline Zero-LLM verification')
         const approval = await this.waitForTier3Approval(params.job, {
           ...gateReq,
           secrets: params.currentSecrets(),
@@ -13256,37 +12702,17 @@ export class Execution {
       attemptCount: nextAttempt,
       maxRetries: maxInlineVerifyRetries,
       secrets: params.currentSecrets(),
-      onExchange: ex => {
-        const latest = this.check(params.job)
-        const saved = this.storage.recordExchange({
-          runId: latest.id,
-          assignmentId: params.job.assignment.id,
-          scopeRevision: latest.scopeRevision,
-          origin: ex.origin,
-          finalOrigin: ex.finalOrigin,
-          redirectOrigins: ex.redirectOrigins,
-          method: ex.method,
-          pathAndQuery: ex.pathAndQuery,
-          personaHandle: ex.personaHandle,
-          status: ex.status,
-          mediaType: ex.mediaType,
-          reqHeaders: ex.reqHeaders,
-          respHeaders: ex.respHeaders,
-          body: ex.body,
-          durationMs: ex.durationMs,
-          secretMatches: ex.secretMatches,
-          secrets: params.currentSecrets(),
-        })
-        this.storage.trackExchangeResources({
-          runId: latest.id,
-          scopeRevision: latest.scopeRevision,
-          exchange: ex,
-          source: 'surface_probe',
-        })
-        this.markEndpointCoverage(latest, ex.origin, ex.method, ex.pathAndQuery, `replay:${parsed.kind}`)
-        params.onExchangeObserved?.(latest, ex, saved.id)
-        return saved.id
-      },
+      onExchange: createExchangeRecorder(
+        this.storage,
+        () => this.check(params.job),
+        params.job.assignment.id,
+        params.currentSecrets,
+        {
+          trackResources: true,
+          markCoverage: (latest, o, m, p) => this.markEndpointCoverage(latest, o, m, p, `replay:${parsed.kind}`),
+          onSaved: (latest, ex, id) => params.onExchangeObserved?.(latest, ex, id),
+        },
+      ),
     })
     const latestForCoverage = this.check(params.job)
     this.markReplaySpecCoverage(latestForCoverage, parsed, `replay:${parsed.kind}`)
@@ -13302,16 +12728,7 @@ export class Execution {
       }
     }
 
-    const isStaticAst = parsed.kind === 'static_ast_proof'
-    const rawVerdict = replay.verdict as Finding['status']
-    const finalStatus: Finding['status'] = isStaticAst
-      ? (rawVerdict === 'confirmed' || rawVerdict === 'static_verified' ? 'static_verified' : rawVerdict)
-      : rawVerdict
-    const verificationTier: VerificationTier | undefined = finalStatus === 'static_verified'
-      ? 'static_verified'
-      : finalStatus === 'confirmed'
-        ? 'runtime_confirmed'
-        : undefined
+    const { isStaticAst, finalStatus, verificationTier } = deriveReplayOutcomeStatus(parsed, replay)
     const normalizedFeedback: InlineVerifyFeedback = {
       ...feedback,
       verdict: finalStatus as InlineVerifyFeedback['verdict'],
@@ -13351,31 +12768,12 @@ export class Execution {
     )
 
     if (findingRow && !isAlreadyVerified) {
-      const staticCodeLocations: CodeLocation[] | undefined = parsed.kind === 'static_ast_proof'
-        ? [{
-            repo: parsed.repo,
-            file: parsed.file,
-            startLine: parsed.startLine,
-            endLine: parsed.endLine,
-            label: parsed.sourceToSinkTrace?.slice(0, 180),
-          }]
-        : findingRow.finding.codeLocations
       const mergedOrigins = [...new Set([...findingRow.sourceOrigins, ...specOrigins])]
-      const secretsList = params.currentSecrets()
-      const cleanReason = redact(replay.outcome.reason || replay.outcome.observed || findingRow.finding.reason, secretsList)
-      const cleanObserved = redact(replay.outcome.observed, secretsList)
+      const { patch } = buildReplayFindingPatch(
+        parsed, replay, findingRow.finding, finalStatus, verificationTier, 'inline replay', params.currentSecrets(),
+      )
       const nextFindingPatch: Partial<Finding> = {
-        status: finalStatus,
-        verificationTier,
-        reason: cleanReason,
-        confidence: (finalStatus === 'confirmed' || finalStatus === 'static_verified')
-          ? 'high'
-          : finalStatus === 'dismissed'
-            ? 'medium'
-            : 'low',
-        verification: `${isStaticAst ? 'Deterministic offline static_ast_proof' : `Zero-LLM ${parsed.kind} inline replay`} verdict: ${finalStatus} (controlPassed=${replay.outcome.controlPassed}, observed: ${cleanObserved}).`,
-        ...(parsed.kind === 'static_ast_proof' ? { runtimeProofGap: parsed.runtimeProofGap } : {}),
-        ...(staticCodeLocations?.length ? { codeLocations: staticCodeLocations } : {}),
+        ...patch,
         evidenceIds: [receipt.id],
         exchangeIds: replay.exchangeIds,
       }
@@ -13584,28 +12982,7 @@ export class Execution {
       storage: this.storage,
       runId: run.id,
       assignmentId: job.assignment.id,
-      onExchange: ex => {
-        const saved = this.storage.recordExchange({
-          runId: run.id,
-          assignmentId: job.assignment.id,
-          scopeRevision: run.scopeRevision,
-          origin: ex.origin,
-          finalOrigin: ex.finalOrigin,
-          redirectOrigins: ex.redirectOrigins,
-          method: ex.method,
-          pathAndQuery: ex.pathAndQuery,
-          personaHandle: ex.personaHandle,
-          status: ex.status,
-          mediaType: ex.mediaType,
-          reqHeaders: ex.reqHeaders,
-          respHeaders: ex.respHeaders,
-          body: ex.body,
-          durationMs: ex.durationMs,
-          secretMatches: ex.secretMatches,
-          secrets: currentSecrets(),
-        })
-        return saved.id
-      },
+      onExchange: createExchangeRecorder(this.storage, () => run, job.assignment.id, currentSecrets),
     })
 
     const current = this.storage.run(run.id)
@@ -13946,7 +13323,11 @@ export class Execution {
       '# Result', '', outcome, '', 'Evidence: ' + artifactIds.join(', '),
     ].join('\n'), 'result', secrets)
     this.storage.updateWorker(worker.id, { status: 'complete', lease: null, leaseExpiresAt: null, outcome, checks })
-    this.disposeWorkerSessions(worker.id)
+    const trackedClones = this.workerSessionClones.get(worker.id)
+    if (trackedClones) {
+      for (const entry of trackedClones) entry.clone.dispose()
+      this.workerSessionClones.delete(worker.id)
+    }
     this.storage.message(run.id, worker.id, 'worker', outcome, undefined, [...artifactIds, result.id], secrets)
     this.storage.event(run.id, 'worker.complete', worker.title + ' completed.', {
       assignmentId: worker.id, artifactId: artifactIds[0] ?? result.id,
