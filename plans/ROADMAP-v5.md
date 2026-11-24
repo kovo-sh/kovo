@@ -536,3 +536,21 @@ Funnel attribution is exact (`planned = enqueued + filtered*`, gap 0 every round
 - `replay-verifier.ts` cannot reach <1.5K yet: 3,866 lines; `http_chain` alone carries 8/33 dev confirmations and patch retest.
 
 Follow-ups created: (a) status-divergent boolean receipt rule in `oracle-invariants.ts`, then delete the sql branch; (b) the no-model fallback in `execution.ts` still proposes sql specs (second producer of the retired path); (c) `scripts/benchmark-live.ts` still calls the legacy verifier.
+
+### 2026-11-24 — spec-submission: rule 1 fired (78.9% turn-capped); spec-on-route 12.5% → 50%
+
+**19-row autopsy (structured, from kept held-out cells; `plans/SPEC-SUBMISSION.md`):** `endReason` = **turn_limit 14**, wall_limit 1, concluded_clean 3, claimed_in_text_only 1. **15/19 (78.9%) hit a turn/wall cap while actively probing**, 7 of them mid-`verify_replay_spec` repair. 14/19 had already seen a 2xx on the target route; 18/19 noted the anomaly in text. So the pre-agreed **Rule 1 fired** and Rule 2 did not.
+
+**Fixes landed (merged `f6d5205`):**
+- Single-step budget **12 → 18 turns, 80 s → 120 s** (applied by the coordinator on the freed `execution.ts` lease; `settlementTurn` follows `maxTurns-2`).
+- Settlement cannot accept `complete_intent(proved|partial)` for a probed route without a spec or a coded `proofGapReason` (`no_spec_shape`, `no_authenticated_persona`, `baseline_empty`, `no_control_path`, `runtime_unavailable`, `tier_blocked`, `out_of_scope`, `no_reproducible_signal`); free-text gaps do not discharge it.
+- Reserved wrap-up verify turn + a route-specific obligation naming `METHOD path param=…` and the exact spec shape.
+- **FP evidence capture:** every unmatched/misclassified finding now embeds a redacted `falsePositiveEvidence` block (class, CWE, category, normalized route, `oracleRulePassed`, scrubbed delta summary, per-step status/`rejectedBy`) into the `--out` JSON and `.meta.json` **before** teardown. 0-FP artifacts are byte-identical.
+
+**Measured after-cell (salted held-out shopflow, 600 s, K=6):** spec-on-route **2/16 (12.5%) → 5/10 (50%)**; confirmed 8/19 → **9/19** (`review-stored-xss` agent-confirmed); cost $0.5455. Precision was 90% in that cell with 1 unmatched FP (now captured), and an earlier sibling cell ran 72.7%.
+
+**Two new P0 follow-ups opened:**
+1. A finding was persisted `runtime_confirmed` while its persisted diff said `verdict: inconclusive` — precision-integrity hole → stream `confirm-consistency`.
+2. The grounded-SQLi fix was built on a stale base and violated leases → parked; re-landed cleanly on main by `sqli-baseline2`.
+
+**Tooling:** `worker-gate.sh` lease guard now has a documented coordinator override (`WORKER_GATE_ALLOW_DIRTY_MAIN=1`) so the coordinator can validate its own in-flight edits while subagents stay blocked. Stale `v5-agentic-lane` test replaced: it referenced the `submitProofSpec` internal retired in M0 Cut 1, and now pins the live `verifierRepairFeedback` contract.
