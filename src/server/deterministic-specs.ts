@@ -1511,22 +1511,6 @@ const splitEchoConnectors: Record<string, (base: string) => string> = {
   backtick_echo: base => `${base}\`echo {{nonce_part1}}''{{nonce_part2}}\``,
 }
 
-/**
- * Alternate join for the same connector: command substitution is expanded inside the argument, so
- * a POSIX shell also produces the two halves contiguously. Tried only after the quoting shape is
- * rejected (the engine stops at the first confirmed candidate), bounded to one extra request pair
- * per signal. It covers a target that evaluates substitution but does not delete an empty quoted
- * word; it is derived from the recorded probe variant, never from a fresh probe.
- */
-const substitutionConnectors: Record<string, (base: string) => string> = {
-  semicolon_echo: base => `${base}; echo {{nonce_part1}}$(echo {{nonce_part2}})`,
-  subshell_echo: base => `${base}$(echo {{nonce_part1}})$(echo {{nonce_part2}})`,
-  quote_break: base => `${base}"; echo {{nonce_part1}}$(echo {{nonce_part2}}); "`,
-  quote_break_id: base => `${base}"; id; echo {{nonce_part1}}$(echo {{nonce_part2}}); "`,
-  pipe_echo: base => `${base} | echo {{nonce_part1}}$(echo {{nonce_part2}})`,
-  backtick_echo: base => `${base}\`echo {{nonce_part1}}$(echo {{nonce_part2}})\``,
-}
-
 function synthCommandInjection(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
   const hit = result.anomalies.find(a => a.type === 'command_executed')
   if (!hit || !hyp.param) return []
@@ -1554,13 +1538,10 @@ function synthCommandInjection(hyp: EngineHypothesis, result: DifferentialResult
     }
   }
   // Reuse the connector shape the probe already proved executes on *this* parameter and evidence.
-  // The quoting shape comes first (contiguous under both a real shell and a line-oriented shell
-  // model); the substitution shape is the bounded fallback.
+  // One bounded proof shape; the observed-payload chain below is the only fallback.
   const out: SynthesizedEngineSpec[] = []
-  for (const connectors of [splitEchoConnectors, substitutionConnectors]) {
-    const built = rceSpec((connectors[variant] ?? connectors.semicolon_echo!)(base))
-    if (built) out.push(built)
-  }
+  const built = rceSpec((splitEchoConnectors[variant] ?? splitEchoConnectors.semicolon_echo!)(base))
+  if (built) out.push(built)
   // Fallback for a target whose shell model joins the halves differently: replay the exact payload
   // the probe observed and assert the probe nonce is present while the sent payload is not
   // reflected (plain reflection cannot satisfy both halves). This is bounded to one extra candidate

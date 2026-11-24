@@ -319,10 +319,10 @@ function observedSignal(origin: string, param: string): DifferentialResult {
 
 test('command-injection signal synthesizes an evaluated nonce proof, not a reflected value', () => {
   const specs = synthesizeEngineSpecs(diagnosticsHypothesis('http://127.0.0.1:9', 'host'), observedSignal('http://127.0.0.1:9', 'host'))
-  assert.deepEqual(specs.map(spec => spec.kind), ['rce_proof', 'rce_proof', 'http_chain'])
+  assert.deepEqual(specs.map(spec => spec.kind), ['rce_proof', 'http_chain'])
 
   const rce = specs.filter(spec => spec.kind === 'rce_proof')
-  assert.equal(rce.length, 2, 'quoting join plus one bounded substitution fallback')
+  assert.equal(rce.length, 1, 'one bounded proof shape from the recorded exchange')
   for (const candidate of rce) {
     const spec = candidate.spec as Json
     assert.equal(spec.proofMode, 'split_echo')
@@ -337,9 +337,6 @@ test('command-injection signal synthesizes an evaluated nonce proof, not a refle
   // The assertion targets the template, not the minted token.
   assert.match(payload, /; echo \{\{nonce_part1\}\}\$\(echo ''\)\{\{nonce_part2\}\}$/)
   assert.equal(payload.includes('{{nonce_part1}}{{nonce_part2}}'), false, 'halves are never adjacent in the outbound request')
-
-  const fallback = (rce[1]!.spec as Json).probeStep as { request: { jsonBody: Json } }
-  assert.match(String(fallback.request.jsonBody.host), /\$\(echo \{\{nonce_part2\}\}\)/)
 })
 
 // ---------------------------------------------------------------------------------------------
@@ -407,8 +404,8 @@ test('a signalled parameter never causes a blind re-probe and spec attempts stay
     })
     const probes = trace.filter(step => step.event === 'probe')
     assert.equal(probes.length, 2, 'one probe per parameter hypothesis, no retry loop')
-    // 2 rce_proof candidates + the single observed-payload chain per signalled parameter.
-    assert.ok(report.specsSubmitted <= 6, `spec attempts bounded (${report.specsSubmitted})`)
+    // One rce_proof plus the single observed-payload chain per signalled parameter.
+    assert.ok(report.specsSubmitted <= 4, `spec attempts bounded (${report.specsSubmitted})`)
     const perSignal = new Map<string, number>()
     for (const step of trace.filter(entry => entry.event === 'verify')) {
       perSignal.set(step.endpoint, (perSignal.get(step.endpoint) ?? 0) + 1)
