@@ -6307,6 +6307,12 @@ export class Execution {
       requestExhausted: stopReason === 'requests_exhausted',
       wallExhausted: stopReason === 'wallclock_exhausted' || stopReason === 'run_stopped',
     })
+    const strandedEventsBefore = this.strandedReadyEvents.get(runId) ?? 0
+    if (evaluation.stranded) {
+      this.noteStrandedReadySteps(runId, {
+        roundNo: funnel.roundNo, stopReason, remainingReady, dispatched, planned: funnel.planned,
+      })
+    }
     const strandedEvents = this.strandedReadyEvents.get(runId) ?? 0
     try {
       this.storage.event(
@@ -6316,7 +6322,7 @@ export class Execution {
         {
           ...funnel, stopReason, remainingReadyAtStop: status === 'running' ? 0 : remainingReady,
           dispatched, filteredDep: blocked, strandedEvents,
-          stranded: evaluation.stranded || strandedEvents > 0,
+          stranded: evaluation.stranded || strandedEventsBefore > 0,
         },
       )
     } catch { /* metrics are best-effort */ }
@@ -8627,6 +8633,7 @@ export class Execution {
     }
     if (stopEval.decision === 'stop') this.plannerDoneRound.set(run.id, roundNo)
     funnel.dispatched = dispatchedTotal
+    funnel.dispatchedThisRound = Math.max(0, dispatchedTotal - (this.dispatchFunnels.get(run.id)?.dispatched ?? 0))
     funnel.remainingReady = remainingReady
     funnel.remainingReadyAtStop = stopEval.decision === 'stop' ? remainingReady : 0
     funnel.stopReason = stopEval.decision === 'stop' ? stopEval.stopReason : 'running'
