@@ -1373,10 +1373,11 @@ async function runMicroCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetric
     .map(result => formatSnapshotStatus(result.slice.snapshot, result.slice.timeoutSec))
     .filter(label => label !== 'n/a')
     .join('/') || 'n/a'
-  const latePromotions = results.reduce((sum, result) => {
+  const lateValues = results.flatMap(result => {
     const value = result.artifact?.metrics?.wiring?.metrics?.latePromotions
-    return sum + (typeof value === 'number' && Number.isFinite(value) ? value : 0)
-  }, 0)
+    return typeof value === 'number' && Number.isFinite(value) ? [value] : []
+  })
+  const latePromotions = lateValues.length > 0 ? lateValues.reduce((sum, value) => sum + value, 0) : null
   const wiringPass = results.every(result => result.artifact?.metrics?.wiring?.status === 'pass')
   const submitted = results.reduce((sum, result) => sum + (result.artifact?.grade?.submitted ?? 0), 0)
   const truePositives = results.reduce((sum, result) => sum + (result.artifact?.grade?.truePositives ?? 0), 0)
