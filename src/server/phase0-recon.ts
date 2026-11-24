@@ -2247,7 +2247,7 @@ function recordQueryParamsForEndpoint(input: {
   const observedSource = source.startsWith('observed') ? source : 'observed:url_query'
   // Sort keys so identical crawl input produces an identical insertion (and read) order.
   for (const name of [...new Set(names)].sort().slice(0, 12)) {
-    if (!name || !isUsefulParamName(name)) continue
+    if (!name || !isUsefulParamForLocation(name, 'query')) continue
     storage.upsertEndpointParam({
       runId,
       endpointId,
@@ -2364,9 +2364,15 @@ export function isUsefulParamName(name: string): boolean {
   if (PARAM_NOISE_RE.test(name)) return false
   if (/^\d+$/.test(name)) return false
   if (/^(?:on[a-z]|aria-|data-)/i.test(name) && name.length > 2) return false
-  // Dotted AST paths are body fields, never query names.
-  if (name.includes('.')) return false
+  // Dotted AST paths are legitimate JSON body fields (`filter.name`); callers reject them for
+  // query locations, where a dot is never a wire key.
   return true
+}
+
+/** Location-aware usefulness: dotted names are body fields, not query keys. */
+export function isUsefulParamForLocation(name: string, location: ParamLocation): boolean {
+  if (!isUsefulParamName(name)) return false
+  return !(location === 'query' && name.includes('.'))
 }
 
 /** Total order for discovered parameters: provenance rank, then name/location/source. */
@@ -2384,7 +2390,7 @@ export function orderDiscoveredParams<T extends DiscoveredParamCandidate>(candid
   const out: T[] = []
   for (const candidate of [...candidates].sort(compareDiscoveredParams)) {
     const key = `${candidate.name}|${candidate.location}`
-    if (!candidate.name || seen.has(key) || !isUsefulParamName(candidate.name)) continue
+    if (!candidate.name || seen.has(key) || !isUsefulParamForLocation(candidate.name, candidate.location)) continue
     seen.add(key)
     out.push(candidate)
   }
@@ -3782,7 +3788,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     const recordParams = (endpointId: string, paramList: readonly { name: string; location: ParamLocation }[], source: string): number => {
       let added = 0
       for (const p of paramList.slice(0, 24)) {
-        if (!p.name || !isUsefulParamName(p.name)) continue
+        if (!p.name || !isUsefulParamForLocation(p.name, p.location)) continue
         storage.upsertEndpointParam({
           runId,
           endpointId,
@@ -4107,12 +4113,13 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           queueJsonDoc(clean)
         }
         for (const bk of bodyKeys.slice(0, 20)) {
-          if (!bk || !isUsefulParamName(bk)) continue
+          const bkLocation: ParamLocation = method.toUpperCase() === 'GET' ? 'query' : 'json'
+          if (!bk || !isUsefulParamForLocation(bk, bkLocation)) continue
           storage.upsertEndpointParam({
             runId,
             endpointId: ep.id,
             name: bk,
-            location: method.toUpperCase() === 'GET' ? 'query' : 'json',
+            location: bkLocation,
             isCsrf: CSRF_PARAM_RE.test(bk),
             isObjectId: OBJECT_ID_PARAM_RE.test(bk),
             source: 'inferred_ast',
@@ -4139,7 +4146,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         const epId = addJsEndpoint(spec.method, spec.path)
         if (!epId) continue
         for (const p of spec.params) {
-          if (!isUsefulParamName(p.name)) continue
+          if (!isUsefulParamForLocation(p.name, p.location)) continue
           storage.upsertEndpointParam({
             runId,
             endpointId: epId,

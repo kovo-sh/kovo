@@ -22,6 +22,7 @@ import type { Grant } from '../src/server/broker.ts'
 import { inferEndpointParams } from '../src/server/deterministic-engine.ts'
 import {
   compareDiscoveredParams,
+  isUsefulParamForLocation,
   listEndpointsPaged,
   paramDiscoveryConfidence,
   paramProvenanceOfSource,
@@ -79,6 +80,15 @@ async function runRecon(
 }
 
 describe('v7 parameter discovery: provenance and evidence', () => {
+  test('noise filter keeps dotted JSON body fields and drops JS/UI literals', () => {
+    // A JSON body path like `filter.name` is a real injectable field; a query key never has a dot.
+    assert.equal(isUsefulParamForLocation('filter.name', 'json'), true)
+    assert.equal(isUsefulParamForLocation('filter.name', 'query'), false)
+    for (const noise of ['undefined', 'constructor', 'addEventListener', 'textContent', 'innerHTML', '$props']) {
+      assert.equal(isUsefulParamForLocation(noise, 'json'), false, `${noise} is JS/UI noise`)
+    }
+  })
+
   test('bundle literal is inferred (still lets the floor form a hypothesis); link ?q= is observed; unrelated route invents nothing', async (t: TestContext) => {
     const { storage, runId } = await runRecon(t, 'bundle-link', (req, res) => {
       const url = (req.url ?? '/').split('?')[0] ?? '/'
