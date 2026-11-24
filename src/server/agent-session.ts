@@ -9,9 +9,10 @@ import {
   GenerationTask,
   Harness,
   hook,
+  LiveDoc,
   ToolTask,
 } from '@earendil-works/pi-durable'
-import type { ToolRegistration } from '@earendil-works/pi-durable'
+import type { ConversationView, LiveState, ToolRegistration, WatchHandle } from '@earendil-works/pi-durable'
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node'
 import { arr, bool, int, lit, map, num, obj, oneOf, opt, str, union, unknown, unsafe } from '@earendil-works/pi-schema'
 import type { AnalyzerName } from '../../worker/analyzers.ts'
@@ -4488,6 +4489,12 @@ export interface RunAgentSessionOptions {
   /** Executed before each model request; return extra user messages (e.g. a <board_delta> block). */
   onTurnStart?: (turn: number, maxTurns: number) => { messages?: readonly string[] } | void
   /**
+   * Called whenever the in-flight assistant response grows (a text/thinking/tool-call token was
+   * committed). The caller uses it to reset a no-token stall watchdog, so slow streaming is never
+   * mistaken for a hung provider stream.
+   */
+  onStreamActivity?: () => void
+  /**
    * Called when complete_intent is rejected because a probed route has neither a replay spec nor a
    * machine-readable record_coverage proof gap. Wire this to `agent.spec_submission_required`.
    */
@@ -4888,6 +4895,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       progress: { partialIntervalMs: 250, persistWithinMs: 350 },
     },
   }, BACKGROUND_CONTEXT)
+  let activityWatch: WatchHandle<ConversationView> | undefined
 
   try {
     const agent = {
@@ -4899,6 +4907,26 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     }
     const conversation = await harness.root(context, { agent })
     await conversation.configure(agent, context)
+
+    // Token-progress seam: the generation task commits a throttled partial (text/thinking/tool-call
+    // deltas) into `pi.live`; a growing partial is proof the provider stream is alive. The caller
+    // resets its no-token watchdog from this signal, so slow-but-streaming turns never abort.
+    if (options.onStreamActivity) {
+      try {
+        activityWatch = await conversation.watch(context)
+        let lastFingerprint = ''
+        activityWatch.start(async call => {
+          if (call.kind !== 'value') return
+          const live = call.value.docs[LiveDoc.definition.kind] as LiveState | undefined
+          const fingerprint = liveStreamFingerprint(live?.generation?.message)
+          if (!fingerprint || fingerprint === lastFingerprint) return
+          lastFingerprint = fingerprint
+          try { options.onStreamActivity?.() } catch { /* telemetry only */ }
+        })
+      } catch {
+        activityWatch = undefined
+      }
+    }
 
     const input = { type: 'input' as const, content: scrub(options.prompt) }
     const submission = await conversation.submit({ ...input, requestId: options.requestId }, context)
@@ -5025,8 +5053,37 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       ...earlyExitFields(),
     }
   } finally {
+    await activityWatch?.stop().catch(() => undefined)
     await harness.close(BACKGROUND_CONTEXT)
   }
+}
+
+/**
+ * Fingerprint of a committed partial assistant message. Only token-bearing content counts (text,
+ * thinking, tool-call arguments); usage-only or bookkeeping commits do not reset a stall watchdog.
+ */
+function liveStreamFingerprint(message: unknown): string {
+  if (!message || typeof message !== 'object') return ''
+  const content = (message as { content?: unknown }).content
+  if (!Array.isArray(content)) return ''
+  let total = 0
+  const shape: string[] = []
+  for (const part of content) {
+    if (!part || typeof part !== 'object') continue
+    const block = part as Record<string, unknown>
+    if (typeof block.text === 'string') {
+      total += block.text.length
+      shape.push(`t${block.text.length}`)
+    } else if (typeof block.thinking === 'string') {
+      total += block.thinking.length
+      shape.push(`h${block.thinking.length}`)
+    } else if (block.arguments && typeof block.arguments === 'object') {
+      const size = JSON.stringify(block.arguments).length
+      total += size
+      shape.push(`a${size}`)
+    }
+  }
+  return total === 0 ? '' : `${content.length}|${total}|${shape.join(',')}`
 }
 
 function extractLastAssistantText(entries: readonly { model?: readonly { role: string; content?: unknown }[] }[]): string {

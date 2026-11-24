@@ -1440,6 +1440,99 @@ export const PROVIDER_STALL_ABORT_COLD_MS = 90_000
 export const PROVIDER_STALL_BASELINE_TURNS = 3
 /** One retry only: a stream that stalls twice is treated as an assignment failure. */
 export const MAX_PROVIDER_STALL_RETRIES = 1
+/**
+ * Per-turn no-token watchdog (25–30 s). A turn that has not emitted a single provider token
+ * for this long is hung, not slow: abort and requeue instead of waiting out the 45–90 s
+ * generation watchdog. The timer resets on every token, so a slow-but-streaming turn is safe.
+ */
+export const PROVIDER_STALL_NO_TOKEN_MS = 28_000
+
+/** Env override for the no-token watchdog (bounded 5–120 s; the product default is 28 s). */
+export function resolveProviderStallNoTokenMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.GUARDIAN_PROVIDER_NO_TOKEN_MS)
+  if (!Number.isFinite(raw) || raw <= 0) return PROVIDER_STALL_NO_TOKEN_MS
+  return Math.max(5_000, Math.min(120_000, Math.floor(raw)))
+}
+
+/**
+ * Per-turn watchdog that fires only after `thresholdMs()` of **no token activity**. `noteToken()`
+ * re-arms the full threshold, so streaming turns never trip it; a silent provider stream does.
+ * Extracted so the reset/fire semantics are unit-testable without a live model.
+ */
+export class ProviderNoTokenWatchdog {
+  private timer?: NodeJS.Timeout
+  private lastActivityAt?: number
+  private turn = 0
+  private readonly thresholdMs: () => number
+  private readonly onStall: (info: { turn: number; idleMs: number; thresholdMs: number }) => void
+  private readonly clock: () => number
+  private readonly setTimer: (fn: () => void, ms: number) => NodeJS.Timeout
+  private readonly clearTimer: (timer: NodeJS.Timeout) => void
+
+  constructor(input: {
+    thresholdMs: () => number
+    onStall: (info: { turn: number; idleMs: number; thresholdMs: number }) => void
+    clock?: () => number
+    setTimer?: (fn: () => void, ms: number) => NodeJS.Timeout
+    clearTimer?: (timer: NodeJS.Timeout) => void
+  }) {
+    this.thresholdMs = input.thresholdMs
+    this.onStall = input.onStall
+    this.clock = input.clock ?? (() => Date.now())
+    this.setTimer = input.setTimer ?? ((fn, ms) => {
+      const timer = setTimeout(fn, ms)
+      timer.unref?.()
+      return timer
+    })
+    this.clearTimer = input.clearTimer ?? (timer => clearTimeout(timer))
+  }
+
+  get active(): boolean { return this.timer !== undefined }
+
+  /** Start the idle window for `turn`; a fresh request always begins with no token yet. */
+  arm(turn: number): void {
+    this.clear()
+    this.turn = Math.max(0, Math.floor(turn))
+    this.lastActivityAt = this.clock()
+    this.schedule()
+  }
+
+  /** A provider token (text/thinking/tool-call delta) arrived: restart the idle window. */
+  noteToken(): void {
+    if (this.lastActivityAt === undefined) return
+    this.lastActivityAt = this.clock()
+    this.schedule()
+  }
+
+  clear(): void {
+    if (this.timer !== undefined) this.clearTimer(this.timer)
+    this.timer = undefined
+  }
+
+  private schedule(): void {
+    if (this.timer !== undefined) this.clearTimer(this.timer)
+    this.timer = undefined
+    const threshold = Math.max(0, Math.floor(this.thresholdMs()))
+    if (threshold <= 0) return
+    this.timer = this.setTimer(() => {
+      this.timer = undefined
+      const last = this.lastActivityAt
+      this.lastActivityAt = undefined
+      if (last === undefined) return
+      this.onStall({ turn: this.turn, idleMs: Math.max(0, this.clock() - last), thresholdMs: threshold })
+    }, threshold)
+  }
+}
+
+/** Stable fingerprint of persona credential generations: a rotation changes the warm-pool policy. */
+export function secretGenerationFingerprint(generations: readonly string[]): string {
+  const hash = createHash('sha256')
+  for (const entry of [...generations].sort()) {
+    hash.update(entry)
+    hash.update('\0')
+  }
+  return hash.digest('hex').slice(0, 16)
+}
 
 /** Env override for the single-step wall cap (bounded to 30–120 s so a slot still turns over). */
 export function singleStepWallClockMs(env: NodeJS.ProcessEnv = process.env): number {
@@ -1538,6 +1631,10 @@ export interface AssignmentThroughputMetrics {
   providerStallTurns: number
   /** Bounded requeues triggered by the stall watchdog (max one per assignment). */
   providerStallRetries: number
+  /** Times the per-turn no-token watchdog fired (28 s of silence). */
+  providerStallTimeouts: number
+  /** Wall estimated saved versus the previous 45–90 s generation watchdog, summed over timeouts. */
+  providerStallWallSavedMs: number
   turnLatencyP50: number
   turnLatencyP90: number
   containersLaunched: number
@@ -1546,6 +1643,10 @@ export interface AssignmentThroughputMetrics {
   coldContainerSessions: number
   idleWarmContainers: number
   warmCapacity: number
+  /** `containersReused / containerSessions` (0..1); how often a session took a warm container. */
+  containerReuseHitRate: number
+  /** Warm pools retired because the run/tenant/credential-generation policy changed. */
+  warmPoolPolicyRotations: number
 }
 
 /** Per-turn generation latencies: p50/p90 + how many turns crossed the stall flag threshold. */
@@ -2401,6 +2502,10 @@ export class Execution {
   private readonly earlyExitTurnsSavedByRun = new Map<string, number>()
   private readonly providerStallTurnsByRun = new Map<string, number>()
   private readonly providerStallRetriesByRun = new Map<string, number>()
+  private readonly providerStallTimeoutsByRun = new Map<string, number>()
+  private readonly providerStallWallSavedByRun = new Map<string, number>()
+  private readonly warmSecretEpochByRun = new Map<string, string>()
+  private readonly warmPoolPolicyRotationsByRun = new Map<string, number>()
   private readonly lastAssignmentMetrics = new Map<string, AssignmentThroughputMetrics>()
   /** runId → first agent dispatch time after Phase A, for phase-timing telemetry. */
   private readonly agenticFloorDispatchedAt = new Map<string, number>()
@@ -5883,6 +5988,8 @@ export class Execution {
       earlyExitTurnsSaved: this.earlyExitTurnsSavedByRun.get(runId) ?? 0,
       providerStallTurns: this.providerStallTurnsByRun.get(runId) ?? 0,
       providerStallRetries: this.providerStallRetriesByRun.get(runId) ?? 0,
+      providerStallTimeouts: this.providerStallTimeoutsByRun.get(runId) ?? 0,
+      providerStallWallSavedMs: this.providerStallWallSavedByRun.get(runId) ?? 0,
       turnLatencyP50: turnSummary.p50,
       turnLatencyP90: turnSummary.p90,
       containersLaunched: containers?.created ?? 0,
@@ -5891,13 +5998,17 @@ export class Execution {
       coldContainerSessions: containers?.coldSessions ?? 0,
       idleWarmContainers: containers?.idle ?? 0,
       warmCapacity: containers?.capacity ?? 0,
+      containerReuseHitRate: containers && containers.sessions > 0
+        ? Math.round((containers.reused / containers.sessions) * 1000) / 1000
+        : 0,
+      warmPoolPolicyRotations: this.warmPoolPolicyRotationsByRun.get(runId) ?? 0,
     }
     this.lastAssignmentMetrics.set(runId, metrics)
     try {
       this.storage.event(
         runId,
         'agentic.assignment_metrics',
-        `Phase B throughput: ${metrics.assignmentsCompleted}/${metrics.assignmentsObserved} assignment(s) complete, p50 ${(metrics.assignmentWallP50 / 1000).toFixed(1)}s / p90 ${(metrics.assignmentWallP90 / 1000).toFixed(1)}s, ${metrics.turnsPerAssignment} turn(s)/assignment, ${metrics.providerStallTurns} stall turn(s) / ${metrics.providerStallRetries} bounded retry(ies), ${metrics.containersLaunched} container launch(es) / ${metrics.containersReused} reuse(s).`,
+        `Phase B throughput: ${metrics.assignmentsCompleted}/${metrics.assignmentsObserved} assignment(s) complete, p50 ${(metrics.assignmentWallP50 / 1000).toFixed(1)}s / p90 ${(metrics.assignmentWallP90 / 1000).toFixed(1)}s, ${metrics.turnsPerAssignment} turn(s)/assignment, ${metrics.providerStallTurns} stall turn(s) / ${metrics.providerStallRetries} bounded retry(ies) / ${metrics.providerStallTimeouts} no-token timeout(s) (${(metrics.providerStallWallSavedMs / 1000).toFixed(1)}s saved), ${metrics.containersLaunched} container launch(es) / ${metrics.containersReused} reuse(s) (${(metrics.containerReuseHitRate * 100).toFixed(0)}% hit rate, ${metrics.idleWarmContainers}/${metrics.warmCapacity} idle).`,
         { ...metrics },
       )
     } catch { /* metrics are best-effort */ }
@@ -8875,6 +8986,23 @@ export class Execution {
     const permittedAtAdmission = this.approvedOriginsSet(run)
     const { grant, secrets, currentSecrets } = this.buildGrant(job, run, permittedAtAdmission)
 
+    // Warm-pool policy: run identity + persona credential generation. A rotation (or a new run or
+    // tenant) retires the pool instead of handing an older container to this assignment.
+    const generations = (grant.personas ? [...grant.personas.keys()] : []).sort().map(handle =>
+      `${handle}:${this.personaAuth.sessions.generation(handle)}`)
+    const secretEpoch = secretGenerationFingerprint(generations)
+    const priorEpoch = this.warmSecretEpochByRun.get(run.id)
+    if (priorEpoch !== undefined && priorEpoch !== secretEpoch) {
+      this.warmPoolPolicyRotationsByRun.set(run.id, (this.warmPoolPolicyRotationsByRun.get(run.id) ?? 0) + 1)
+      try {
+        this.storage.event(run.id, 'worker.warm_pool_rotated', 'Credential generation changed; rebuilding idle warm containers.', {
+          assignmentId: job.assignment.id, stepId: step.id, previous: priorEpoch, next: secretEpoch,
+        })
+      } catch { /* telemetry only */ }
+    }
+    this.warmSecretEpochByRun.set(run.id, secretEpoch)
+    try { this.backend.setWarmPoolPolicy?.(`${run.id}:${secretEpoch}`) } catch { /* pooling is best-effort */ }
+
     // Open ONE persistent air-gapped container for the entire intent
     const { reposDir, mountedRepos } = this.projectReposMount(run.projectId)
     const session = await this.backend.openSession(
@@ -8883,43 +9011,51 @@ export class Execution {
       reposDir ? { reposDir } : undefined,
     )
     const startedAt = Date.now()
-    // Per-turn generation latencies (provider stream), plus a watchdog that aborts a buffered
-    // stream instead of letting it consume the assignment wall.
+    // Per-turn generation latencies (provider stream) plus the no-token watchdog: 28 s of complete
+    // provider silence aborts the turn, while every token re-arms the timer so slow streaming is
+    // never killed. The old 45–90 s generation watchdog stays only as the wall-saved baseline.
     const turnLatencies: number[] = []
     let generationStartedAt: number | undefined
-    let stallTimer: NodeJS.Timeout | undefined
-    const clearStallTimer = () => {
-      if (stallTimer) { clearTimeout(stallTimer); stallTimer = undefined }
+    const noTokenMs = resolveProviderStallNoTokenMs()
+    /** Never let the watchdog outlive the assignment wall: leave 10 s to requeue (floor 5 s). */
+    const noTokenThresholdMs = () => {
+      const remainingWall = Math.max(0, budget.wallClockMs - (Date.now() - startedAt))
+      return Math.min(noTokenMs, Math.max(5_000, remainingWall - 10_000))
     }
     const stallAbortMs = () => providerStallAbortMs(percentile(turnLatencies, 50), turnLatencies.length)
-    /** Never let the watchdog outlive the assignment wall: leave 10 s (floor 15 s) to requeue. */
-    const stallDeadlineMs = () => {
-      const remainingWall = Math.max(0, budget.wallClockMs - (Date.now() - startedAt))
-      return Math.min(stallAbortMs(), Math.max(15_000, remainingWall - 10_000))
-    }
-    const armStallTimer = (turn: number) => {
-      clearStallTimer()
-      generationStartedAt = Date.now()
-      if (job.stallAbort) return
-      const thresholdMs = stallDeadlineMs()
-      stallTimer = setTimeout(() => {
-        if (!generationStartedAt) return
-        const elapsed = Date.now() - generationStartedAt
+    const stallWatchdog = new ProviderNoTokenWatchdog({
+      thresholdMs: noTokenThresholdMs,
+      onStall: ({ turn, idleMs, thresholdMs }) => {
+        if (generationStartedAt === undefined) return
+        generationStartedAt = undefined
         job.stallAbort = true
+        this.providerStallTimeoutsByRun.set(run.id, (this.providerStallTimeoutsByRun.get(run.id) ?? 0) + 1)
+        this.providerStallTurnsByRun.set(run.id, (this.providerStallTurnsByRun.get(run.id) ?? 0) + 1)
+        // What the previous generation watchdog would have waited before aborting this turn.
+        const previousThresholdMs = Math.min(stallAbortMs(), Math.max(15_000, budget.wallClockMs - (Date.now() - startedAt) - 10_000))
+        const wallSavedMs = Math.max(0, previousThresholdMs - idleMs)
+        this.providerStallWallSavedByRun.set(run.id, (this.providerStallWallSavedByRun.get(run.id) ?? 0) + wallSavedMs)
         try {
-          this.storage.event(run.id, 'worker.provider_stall', `Provider stream stalled on turn ${turn} (${Math.round(elapsed / 1000)}s without a response); aborting to free the slot.`, {
-            assignmentId: job.assignment.id, stepId: step.id, turn, elapsedMs: elapsed, thresholdMs, stallAbortMs: stallAbortMs(), wallClockMs: budget.wallClockMs,
+          this.storage.event(run.id, 'worker.provider_stall', `Provider stream stalled on turn ${turn} (${Math.round(idleMs / 1000)}s without a token); aborting to free the slot.`, {
+            assignmentId: job.assignment.id, stepId: step.id, turn, elapsedMs: idleMs, thresholdMs,
+            previousThresholdMs, wallSavedMs, stallAbortMs: stallAbortMs(), wallClockMs: budget.wallClockMs,
           })
         } catch { /* telemetry only */ }
-        job.controller.abort(new Error('Provider stream stalled.'))
-      }, thresholdMs)
-      stallTimer.unref?.()
+        job.controller.abort(new Error('Provider stream stalled (no token).'))
+      },
+    })
+    const armStallTimer = (turn: number) => {
+      stallWatchdog.clear()
+      generationStartedAt = Date.now()
+      if (job.stallAbort) return
+      stallWatchdog.arm(turn)
     }
+    const noteProviderToken = () => stallWatchdog.noteToken()
     const recordTurnLatency = () => {
       if (generationStartedAt === undefined) return
       const ms = Math.max(0, Date.now() - generationStartedAt)
       generationStartedAt = undefined
-      clearStallTimer()
+      stallWatchdog.clear()
       turnLatencies.push(ms)
       const stalls = this.providerStallTurnsByRun.get(run.id) ?? 0
       if (ms > PROVIDER_STALL_TURN_MS) this.providerStallTurnsByRun.set(run.id, stalls + 1)
@@ -10781,6 +10917,8 @@ export class Execution {
           this.storage.updateWorker(job.assignment.id, { turnsUsed: turn })
           this.storage.recordLlmSpend(run.id, { turns: 1 })
         },
+        // Provider token activity resets the no-token watchdog: a slow stream is not a stall.
+        onStreamActivity: noteProviderToken,
         onTurnStart: turn => {
           armStallTimer(turn)
           const member = this.storage.boardMember(run.id, boardHandle)
@@ -10812,7 +10950,7 @@ export class Execution {
         this.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: job.assignment.id })
       }, { behavior: 'immediate' })
     } finally {
-      clearStallTimer()
+      stallWatchdog.clear()
       generationStartedAt = undefined
       const wallMs = Math.max(0, Date.now() - startedAt)
       const walls = this.assignmentWallByRun.get(run.id) ?? []
