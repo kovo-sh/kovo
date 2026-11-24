@@ -761,8 +761,6 @@ export class Store {
   /** True whenever the FTS5 virtual table exists, even if the active mode is `off`. */
   private ftsTableExists = false
   private txDepth = 0
-  /** Per-run count of `finding.confirmation_conflict` demotions (precision-integrity telemetry). */
-  private readonly confirmationConflicts = new Map<string, number>()
   /** Bounded async write queue for broker exchanges (flushed by microtask/size boundary). */
   private pendingExchanges: PendingExchangeWrite[] = []
   private flushScheduled = false
@@ -3938,7 +3936,10 @@ export class Store {
 
   /** How many confirmed claims this run demoted after their persisted evidence stopped confirming. */
   confirmationConflictCount(runId: string): number {
-    return this.confirmationConflicts.get(runId) ?? 0
+    const row = this.db.select({ count: sql<number>`count(*)` }).from(tables.events).where(and(
+      eq(tables.events.runId, runId), eq(tables.events.kind, 'finding.confirmation_conflict'),
+    )).get()
+    return Number(row?.count ?? 0)
   }
 
   /**
@@ -4018,8 +4019,7 @@ export class Store {
       provenance: row.provenance,
     })
     if (evidence.backed || !evidence.contradicted) return false
-    const conflicts = (this.confirmationConflicts.get(runId) ?? 0) + 1
-    this.confirmationConflicts.set(runId, conflicts)
+    const conflicts = this.confirmationConflictCount(runId) + 1
     const demoted: Finding = {
       ...row.finding,
       status: 'inconclusive',
@@ -4753,8 +4753,7 @@ export class Store {
         verificationClass,
       })
     if (confirmationConflict) {
-      const conflicts = (this.confirmationConflicts.get(run.id) ?? 0) + 1
-      this.confirmationConflicts.set(run.id, conflicts)
+      const conflicts = this.confirmationConflictCount(run.id) + 1
       this.event(
         run.id,
         'finding.confirmation_conflict',
