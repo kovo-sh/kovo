@@ -17,7 +17,15 @@ import {
   runCommand,
 } from './domain.ts'
 import { execution } from './server/execution.ts'
-import { hasGithubPat, projectReposDir, syncGithubRepos } from './server/github-connector.ts'
+import {
+  clearGithubPat,
+  defaultSelectedRepoNames,
+  getGithubPatStatus,
+  listAccessibleGithubRepos,
+  projectReposDir,
+  saveGithubPat,
+  syncGithubRepos,
+} from './server/github-connector.ts'
 import { assertLocalLabAllowed, LabRunner } from './server/lab-runner.ts'
 import type { LabTargetHandle } from './server/lab-runner.ts'
 import {
@@ -39,11 +47,16 @@ import { exportReportSarif } from './server/sarif-export.ts'
 import { store } from './server/store.ts'
 import { readWorkerSession, testPersonaAuth } from './server/worker-session-reader.ts'
 
-export const workspaceData = createServerFn({ method: 'GET' }).handler(() => ({
-  ...store().listWorkspace(),
-  hasModel: modelReady(),
-  hasGithubPat: hasGithubPat(),
-}))
+export const workspaceData = createServerFn({ method: 'GET' }).handler(() => {
+  const db = store()
+  const githubPatStatus = getGithubPatStatus(db.directory)
+  return {
+    ...db.listWorkspace(),
+    hasModel: modelReady(),
+    hasGithubPat: githubPatStatus.configured,
+    githubPatStatus,
+  }
+})
 
 // --- Model Profiles (Multi-Profile Failover Pool) ---
 
@@ -101,11 +114,16 @@ function serializeLabTarget(handle: LabTargetHandle | undefined) {
 
 export const projectData = createServerFn({ method: 'GET' })
   .validator(z.object({ projectId: id }))
-  .handler(({ data }) => ({
-    ...store().projectDetail(data.projectId),
-    hasGithubPat: hasGithubPat(),
-    localLabEnvEnabled: isLocalLabEnvEnabled(),
-  }))
+  .handler(({ data }) => {
+    const db = store()
+    const githubPatStatus = getGithubPatStatus(db.directory)
+    return {
+      ...db.projectDetail(data.projectId),
+      hasGithubPat: githubPatStatus.configured,
+      githubPatStatus,
+      localLabEnvEnabled: isLocalLabEnvEnabled(),
+    }
+  })
 
 export const createProject = createServerFn({ method: 'POST' }).validator(newProject)
   .handler(({ data }) => store().createProject(data))
@@ -130,6 +148,49 @@ export const removeProjectSpec = createServerFn({ method: 'POST' })
   .validator(z.object({ requestId: id, projectId: id, specId: id }))
   .handler(({ data }) => store().deleteProjectSpec(data))
 
+export const saveGithubToken = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    token: z.string().trim().min(10, 'Enter a valid GitHub personal access token.').max(512),
+  }))
+  .handler(async ({ data }) => {
+    const db = store()
+    const status = saveGithubPat(db.directory, data.token)
+    try {
+      const listed = await listAccessibleGithubRepos({ dataDir: db.directory })
+      return {
+        status,
+        repos: listed.repos,
+        defaultSelected: defaultSelectedRepoNames(listed.repos),
+        truncated: listed.truncated,
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to verify GitHub token.'
+      if (msg.includes('HTTP 401')) {
+        clearGithubPat(db.directory)
+      }
+      throw new Error(msg)
+    }
+  })
+
+export const clearGithubToken = createServerFn({ method: 'POST' })
+  .handler(() => clearGithubPat(store().directory))
+
+export const listGithubRepositories = createServerFn({ method: 'GET' })
+  .handler(async () => {
+    const db = store()
+    const status = getGithubPatStatus(db.directory)
+    if (!status.configured) {
+      return { status, repos: [], defaultSelected: [], truncated: false }
+    }
+    const listed = await listAccessibleGithubRepos({ dataDir: db.directory })
+    return {
+      status,
+      repos: listed.repos,
+      defaultSelected: defaultSelectedRepoNames(listed.repos),
+      truncated: listed.truncated,
+    }
+  })
+
 export const syncGithubRepositories = createServerFn({ method: 'POST' })
   .validator(z.object({
     projectId: id,
@@ -139,6 +200,7 @@ export const syncGithubRepositories = createServerFn({ method: 'POST' })
     const db = store()
     db.project(data.projectId)
     const synced = await syncGithubRepos(data.repos, undefined, {
+      dataDir: db.directory,
       cloneDir: projectReposDir(db.directory, data.projectId),
     })
     let specsImported = 0

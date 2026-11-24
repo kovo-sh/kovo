@@ -2,12 +2,15 @@ import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import { useState } from 'react'
 import {
   addProjectAsset,
+  clearGithubToken,
   createRun,
   importSpec,
+  listGithubRepositories,
   projectData,
   registerPersona,
   removePersona,
   removeProjectSpec,
+  saveGithubToken,
   syncGithubRepositories,
   testPersonaAuthAction,
   updateProjectLabConfigAction,
@@ -150,15 +153,50 @@ function formatPersonaAuthBadge(persona: PublicPersona): string {
   return persona.headerName ? `${persona.authKind} · ${persona.headerName}` : persona.authKind
 }
 
+interface DiscoveredGithubRepo {
+  fullName: string
+  private: boolean
+  defaultBranch: string
+  updatedAt: string | null
+  description: string | null
+}
+
+function formatGithubPatBadge(status: { configured: boolean; source: 'vault' | 'fixture' | null; tokenKind: 'fine_grained' | 'classic' | 'unknown' | null }): string {
+  if (!status.configured) return 'Optional · Not connected'
+  const kindLabel = status.tokenKind === 'fine_grained'
+    ? 'Fine-grained PAT'
+    : status.tokenKind === 'classic'
+      ? 'Classic PAT'
+      : 'GitHub PAT'
+  return status.source === 'fixture' ? `${kindLabel} · fixture` : `${kindLabel} saved`
+}
+
+function formatIsoDay(iso: string | null): string | null {
+  if (!iso) return null
+  const ms = Date.parse(iso)
+  if (!Number.isFinite(ms)) return null
+  return new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
 function ProjectPage() {
-  const { project, assets, personas, specs, runs, hasGithubPat, localLabEnvEnabled } = Route.useLoaderData()
+  const { project, assets, personas, specs, runs, githubPatStatus, localLabEnvEnabled } = Route.useLoaderData()
   const navigate = useNavigate()
   const labAllowed = project.environment === 'local-lab' && localLabEnvEnabled
   const [panel, setPanel] = useState<'candidate' | 'dns' | 'access'>()
-  const [specPanel, setSpecPanel] = useState<'upload' | 'github'>()
   const [addingPersona, setAddingPersona] = useState(false)
   const [inlinePersonaOpen, setInlinePersonaOpen] = useState(false)
   const [starting, setStarting] = useState(runs.length === 0)
+
+  // Source repositories (GitHub PAT + auto-discovery checklist) state
+  const [githubTokenInput, setGithubTokenInput] = useState('')
+  const [editingGithubToken, setEditingGithubToken] = useState(false)
+  const [repoPickerOpen, setRepoPickerOpen] = useState(false)
+  const [discoveredRepos, setDiscoveredRepos] = useState<DiscoveredGithubRepo[]>([])
+  const [reposLoaded, setReposLoaded] = useState(false)
+  const [reposTruncated, setReposTruncated] = useState(false)
+  const [repoSearch, setRepoSearch] = useState('')
+  const [selectedRepos, setSelectedRepos] = useState<string[]>([])
+  const [githubNotice, setGithubNotice] = useState('')
 
   // New Run state (Mission presets + smart defaults)
   const [selectedPreset, setSelectedPreset] = useState<string>('')
@@ -218,6 +256,7 @@ function ProjectPage() {
   const action = useAction()
   const inventoryAction = useAction()
   const personaAction = useAction()
+  const githubAction = useAction()
   const specAction = useAction()
   const labAction = useAction()
   const allowlistAction = useAction()
@@ -297,9 +336,37 @@ function ProjectPage() {
     setNotice('')
   }
 
-  function toggleSpecPanel(next: typeof specPanel) {
-    setSpecPanel(current => current === next ? undefined : next)
-    setSpecNotice('')
+  function loadGithubRepos() {
+    setGithubNotice('')
+    void githubAction.submit(() => listGithubRepositories(), result => {
+      setDiscoveredRepos(result.repos)
+      setSelectedRepos(result.defaultSelected)
+      setReposTruncated(result.truncated)
+      setReposLoaded(true)
+      setRepoPickerOpen(true)
+      setEditingGithubToken(false)
+    })
+  }
+
+  function openRepoPicker() {
+    setEditingGithubToken(false)
+    setGithubNotice('')
+    if (repoPickerOpen && reposLoaded) {
+      setRepoPickerOpen(false)
+      return
+    }
+    setRepoPickerOpen(true)
+    if (!reposLoaded) {
+      loadGithubRepos()
+    }
+  }
+
+  function toggleSelectedRepo(fullName: string, checked: boolean) {
+    setSelectedRepos(prev =>
+      checked
+        ? (prev.includes(fullName) ? prev : [...prev, fullName])
+        : prev.filter(name => name !== fullName),
+    )
   }
 
   async function onSpecFileSelected(file: File | undefined) {
@@ -898,98 +965,269 @@ function ProjectPage() {
       })}</ul> : <p className="muted" style={{ marginTop: 8 }}>No personas configured yet.</p>}
     </section>
 
-    <section className="stacked-section" aria-label="Specs and GitHub repo sync">
+    <section className="stacked-section" aria-label="Source repositories">
       <div className="section-heading">
         <div>
-          <h2>Specs &amp; GitHub repo sync</h2>
-          <p className="muted">Supply OpenAPI/GraphQL schemas, lockfiles, or sync authorized repositories read-only for grey-box CVE &amp; route context.</p>
+          <div className="inline-badges">
+            <h2>Source repositories (read-only)</h2>
+            <span className={githubPatStatus.configured ? 'badge badge-complete' : 'badge'}>
+              {formatGithubPatBadge(githubPatStatus)}
+            </span>
+          </div>
+          <p className="muted">Optional read-only GitHub sync for grey-box code, schema, and CVE context. Tokens are saved in your local 0600 vault and never echoed back.</p>
         </div>
-        <div className="toolbar inventory-toolbar">
-          <Button onClick={() => toggleSpecPanel('upload')} aria-expanded={specPanel === 'upload'}>Import spec / lockfile</Button>
-          <Button onClick={() => toggleSpecPanel('github')} aria-expanded={specPanel === 'github'}>Sync GitHub repos</Button>
-        </div>
+        {githubPatStatus.configured && <div className="toolbar inventory-toolbar">
+          <Button
+            type="button"
+            variant="default"
+            disabled={githubAction.pending}
+            onClick={openRepoPicker}
+            aria-expanded={repoPickerOpen}
+          >
+            {repoPickerOpen ? 'Hide repos' : 'Discover & sync repos'}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            disabled={githubAction.pending}
+            onClick={() => { setEditingGithubToken(v => !v); setGithubNotice('') }}
+            aria-expanded={editingGithubToken}
+          >
+            {editingGithubToken ? 'Cancel' : 'Update token'}
+          </Button>
+        </div>}
       </div>
-      {specNotice && <p role="status" className="muted">{specNotice}</p>}
-      {specPanel === 'upload' && <form className="form-card" onSubmit={event => {
-        event.preventDefault()
-        const form = new FormData(event.currentTarget)
-        const originVal = String(form.get('origin') ?? '').trim()
-        const kindRaw = String(form.get('kind') ?? 'openapi')
-        const kind = (['openapi', 'graphql', 'routes', 'notes'] as const).includes(kindRaw as 'openapi')
-          ? kindRaw as 'openapi' | 'graphql' | 'routes' | 'notes' : 'notes'
-        void specAction.submit(() => importSpec({ data: {
-          requestId: crypto.randomUUID(),
-          projectId: project.id,
-          name: specName.trim() || String(form.get('name') ?? '').trim(),
-          kind,
-          ...(originVal ? { origin: originVal } : {}),
-          content: specContent,
-        } }), saved => {
-          setSpecPanel(undefined)
-          setSpecName('')
-          setSpecContent('')
-          setSpecNotice(`Imported spec "${saved.name}" (${saved.kind}).`)
-        })
-      }}>
-        <h3>Import spec, routes, or lockfile</h3>
-        <div className="field-grid-2">
-          <label>Name
-            <Input name="name" required maxLength={160} value={specName} onChange={e => setSpecName(e.target.value)}
-              placeholder="openapi.yaml or package-lock.json" />
-          </label>
-          <label>Kind
-            <NativeSelect name="kind" defaultValue="openapi">
-              <option value="openapi">OpenAPI / Swagger</option>
-              <option value="graphql">GraphQL schema</option>
-              <option value="routes">Route map / Server handlers</option>
-              <option value="notes">Lockfile / Dependencies / Notes</option>
-            </NativeSelect>
-          </label>
-        </div>
-        <label>Target origin (optional)
-          <Input name="origin" placeholder={project.seeds[0] ?? 'https://api.example.com'} />
-        </label>
-        <label>Load from file (optional, up to 2 MiB)
-          <Input type="file" accept=".json,.yaml,.yml,.graphql,.gql,.txt,.md,.lock" onChange={e => {
-            void onSpecFileSelected(e.target.files?.[0])
-          }} />
-        </label>
-        <label>Content
-          <Textarea name="content" rows={6} required value={specContent} onChange={e => setSpecContent(e.target.value)}
-            placeholder="Paste OpenAPI, GraphQL SDL, lockfile JSON, or route notes…" />
-        </label>
-        <FormError error={specAction.error} />
-        <div className="form-actions">
-          <Button type="button" onClick={() => setSpecPanel(undefined)}>Cancel</Button>
-          <Button type="submit" variant="default" disabled={specAction.pending || !specContent.trim()}>Import spec</Button>
-        </div>
-      </form>}
-      {specPanel === 'github' && <form className="form-card" onSubmit={event => {
-        event.preventDefault()
-        const form = new FormData(event.currentTarget)
-        const repos = String(form.get('repos') ?? '').split(/[\s,]+/).map(s => s.trim()).filter(Boolean)
-        void specAction.submit(() => syncGithubRepositories({ data: { projectId: project.id, repos } }), result => {
-          setSpecPanel(undefined)
-          const warnText = result.warnings.length ? ` Warnings: ${result.warnings.join('; ')}` : ''
-          setSpecNotice(`Synced ${result.repos.length} ${result.repos.length === 1 ? 'repo' : 'repos'}: ${result.specsImported} specs imported, ${result.dependenciesExtracted} dependencies extracted.${warnText}`)
-        })
-      }}>
+
+      {githubNotice && <p role="status" className="muted" style={{ marginTop: 8 }}>{githubNotice}</p>}
+      {specNotice && <p role="status" className="muted" style={{ marginTop: 8 }}>{specNotice}</p>}
+
+      {(!githubPatStatus.configured || editingGithubToken) && <form
+        className="form-card github-pat-card"
+        style={{ marginTop: 10 }}
+        onSubmit={event => {
+          event.preventDefault()
+          const token = githubTokenInput.trim()
+          if (!token) return
+          setGithubNotice('')
+          void githubAction.submit(() => saveGithubToken({ data: { token } }), result => {
+            setGithubTokenInput('')
+            setEditingGithubToken(false)
+            setDiscoveredRepos(result.repos)
+            setSelectedRepos(result.defaultSelected)
+            setReposTruncated(result.truncated)
+            setReposLoaded(true)
+            setRepoPickerOpen(true)
+            setRepoSearch('')
+            setGithubNotice(`Token saved to local 0600 vault. Found ${result.repos.length} accessible ${result.repos.length === 1 ? 'repository' : 'repositories'}.`)
+          })
+        }}
+      >
         <div className="section-heading">
-          <h3>Sync authorized GitHub repositories (read-only)</h3>
-          <span className={hasGithubPat ? 'badge badge-complete' : 'badge badge-attention'}>
-            {hasGithubPat ? 'GitHub PAT ready' : 'PAT not detected'}
-          </span>
+          <h3>{githubPatStatus.configured ? 'Update GitHub personal access token' : 'Connect GitHub with a Fine-Grained PAT'}</h3>
+          <a
+            className="action-link"
+            href="https://github.com/settings/personal-access-tokens/new"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Create Fine-Grained PAT on GitHub ↗
+          </a>
         </div>
-        <p className="muted">Reads the read-only token strictly from <code>~/.config/guardian-fixtures/github.pat</code> (0600). Imports lockfiles, OpenAPI/GraphQL schemas, and server route context with secrets redacted.</p>
-        <label>Repositories (<code>owner/repo</code>, one per line or comma-separated)
-          <Textarea name="repos" rows={3} required placeholder={'org/web-app\norg/api-service'} />
+        <ol className="github-pat-steps">
+          <li>Under <strong>Repository access</strong>, choose <strong>Only select repositories</strong> and pick the repos you want Guardian to inspect.</li>
+          <li>Under <strong>Repository permissions</strong>, set <strong>Contents: Read-only</strong>.</li>
+          <li>Click <strong>Generate token</strong> and paste it below — Guardian stores it in your local <code>0600</code> vault and auto-discovers accessible repos.</li>
+        </ol>
+        <label>GitHub Personal Access Token
+          <Input
+            name="githubPat"
+            type="password"
+            required
+            minLength={10}
+            maxLength={512}
+            autoComplete="off"
+            value={githubTokenInput}
+            onChange={e => setGithubTokenInput(e.target.value)}
+            placeholder="github_pat_…"
+          />
         </label>
-        <FormError error={specAction.error} />
+        <FormError error={githubAction.error} />
         <div className="form-actions">
-          <Button type="button" onClick={() => setSpecPanel(undefined)}>Cancel</Button>
-          <Button type="submit" variant="default" disabled={specAction.pending || !hasGithubPat}>Sync read-only</Button>
+          {githubPatStatus.configured && <Button type="button" variant="ghost" onClick={() => {
+            setEditingGithubToken(false)
+            setGithubTokenInput('')
+          }}>Cancel</Button>}
+          <Button type="submit" variant="default" disabled={githubAction.pending || githubTokenInput.trim().length < 10}>
+            {githubAction.pending ? 'Saving & discovering…' : 'Save token & discover repos'}
+          </Button>
         </div>
       </form>}
+
+      {githubPatStatus.configured && !editingGithubToken && repoPickerOpen && (() => {
+        const needle = repoSearch.trim().toLowerCase()
+        const filteredRepos = needle
+          ? discoveredRepos.filter(r =>
+            r.fullName.toLowerCase().includes(needle) ||
+            (r.description?.toLowerCase().includes(needle) ?? false) ||
+            r.defaultBranch.toLowerCase().includes(needle),
+          )
+          : discoveredRepos
+        const maxSyncBatch = 20
+        const showBroadNote = discoveredRepos.length > 10 || githubPatStatus.tokenKind === 'classic'
+        return <div className="form-card github-picker-card" style={{ marginTop: 10 }}>
+          <div className="section-heading">
+            <div>
+              <h3>Select repositories to sync</h3>
+              <p className="muted">
+                Read-only shallow clone + automatic OpenAPI, GraphQL, route, and lockfile extraction.
+                {reposTruncated && ' Showing the 200 most recently updated repositories.'}
+              </p>
+            </div>
+            <div className="toolbar">
+              <Button type="button" variant="ghost" disabled={githubAction.pending} onClick={loadGithubRepos}>
+                {githubAction.pending && !reposLoaded ? 'Loading…' : 'Refresh'}
+              </Button>
+              {githubPatStatus.source === 'vault' && <Button
+                type="button"
+                variant="ghost"
+                className="btn-danger"
+                disabled={githubAction.pending}
+                onClick={() => {
+                  setGithubNotice('')
+                  void githubAction.submit(() => clearGithubToken(), result => {
+                    setDiscoveredRepos([])
+                    setSelectedRepos([])
+                    setReposLoaded(false)
+                    setRepoPickerOpen(false)
+                    setRepoSearch('')
+                    setGithubNotice(result.status.configured
+                      ? 'Removed saved vault token (fallback fixture PAT is still present).'
+                      : 'Removed saved GitHub token from local vault.')
+                  })
+                }}
+              >
+                Remove saved token
+              </Button>}
+            </div>
+          </div>
+
+          {githubPatStatus.source === 'fixture' && <p className="muted small-note">
+            Using fallback fixture PAT from <code>~/.config/guardian-fixtures/github.pat</code>. Click <strong>Update token</strong> above to store a project-vault token instead.
+          </p>}
+
+          {showBroadNote && discoveredRepos.length > 0 && <div className="github-broad-note">
+            <span className="muted">
+              {githubPatStatus.tokenKind === 'classic'
+                ? `Classic PAT detected (${discoveredRepos.length} accessible repos).`
+                : `Found ${discoveredRepos.length} accessible repos.`}{' '}
+              {discoveredRepos.length > 10
+                ? 'Nothing was pre-selected so you do not accidentally clone everything.'
+                : 'Consider scoping a Fine-Grained PAT to only the target repositories.'}
+            </span>
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={githubAction.pending || filteredRepos.length === 0}
+              onClick={() => setSelectedRepos(filteredRepos.slice(0, maxSyncBatch).map(r => r.fullName))}
+            >
+              Select all{filteredRepos.length > maxSyncBatch ? ` (first ${maxSyncBatch})` : ` (${filteredRepos.length})`}
+            </Button>
+          </div>}
+
+          <div className="github-picker-toolbar">
+            <Input
+              type="search"
+              value={repoSearch}
+              onChange={e => setRepoSearch(e.target.value)}
+              placeholder="Filter repositories by name, branch, or description…"
+              aria-label="Filter GitHub repositories"
+            />
+            <div className="toolbar">
+              <Button
+                type="button"
+                variant="ghost"
+                disabled={githubAction.pending || filteredRepos.length === 0}
+                onClick={() => setSelectedRepos(filteredRepos.slice(0, maxSyncBatch).map(r => r.fullName))}
+              >
+                Select all
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                disabled={githubAction.pending || selectedRepos.length === 0}
+                onClick={() => setSelectedRepos([])}
+              >
+                Clear
+              </Button>
+            </div>
+          </div>
+
+          {githubAction.pending && !reposLoaded ? (
+            <p className="muted">Discovering accessible repositories…</p>
+          ) : filteredRepos.length > 0 ? (
+            <ul className="github-repo-list" aria-label="Accessible GitHub repositories">
+              {filteredRepos.map(repo => {
+                const checked = selectedRepos.includes(repo.fullName)
+                const updatedLabel = formatIsoDay(repo.updatedAt)
+                return <li key={repo.fullName} className="github-repo-row">
+                  <label className="checkbox github-repo-label">
+                    <Checkbox
+                      checked={checked}
+                      aria-label={`Select repository ${repo.fullName}`}
+                      onCheckedChange={next => toggleSelectedRepo(repo.fullName, Boolean(next))}
+                    />
+                    <span className="github-repo-meta">
+                      <span className="inline-badges">
+                        <strong className="mono">{repo.fullName}</strong>
+                        <span className="badge">{repo.private ? 'private' : 'public'}</span>
+                        <span className="badge badge-trace">{repo.defaultBranch}</span>
+                        {updatedLabel && <span className="muted xs">Updated {updatedLabel}</span>}
+                      </span>
+                      {repo.description && <small className="muted truncate">{repo.description}</small>}
+                    </span>
+                  </label>
+                </li>
+              })}
+            </ul>
+          ) : (
+            <p className="muted">
+              {discoveredRepos.length === 0
+                ? 'No repositories were returned for this token. Verify the token grants Repository permissions → Contents: Read-only on at least one repository.'
+                : `No repositories match "${repoSearch.trim()}".`}
+            </p>
+          )}
+
+          {selectedRepos.length > maxSyncBatch && (
+            <p role="alert" className="form-error">Select at most {maxSyncBatch} repositories per sync batch.</p>
+          )}
+          <FormError error={githubAction.error} />
+          <div className="form-actions">
+            <span className="muted run-summary-hint">
+              {selectedRepos.length} of {discoveredRepos.length} selected
+            </span>
+            <Button type="button" variant="ghost" onClick={() => setRepoPickerOpen(false)}>Close</Button>
+            <Button
+              type="button"
+              variant="default"
+              disabled={githubAction.pending || selectedRepos.length === 0 || selectedRepos.length > maxSyncBatch}
+              onClick={() => {
+                setGithubNotice('')
+                void githubAction.submit(
+                  () => syncGithubRepositories({ data: { projectId: project.id, repos: selectedRepos } }),
+                  result => {
+                    setRepoPickerOpen(false)
+                    const warnText = result.warnings.length ? ` Warnings: ${result.warnings.join('; ')}` : ''
+                    setGithubNotice(`Synced ${result.repos.length} ${result.repos.length === 1 ? 'repo' : 'repos'}: ${result.specsImported} specs imported, ${result.dependenciesExtracted} dependencies extracted.${warnText}`)
+                  },
+                )
+              }}
+            >
+              {githubAction.pending ? 'Syncing…' : `Sync selected (${selectedRepos.length})`}
+            </Button>
+          </div>
+        </div>
+      })()}
+
       {specs.length > 0 ? <ul className="project-list">{specs.map(spec => <li key={spec.id}>
         <div className="list-row">
           <span>
@@ -1006,7 +1244,70 @@ function ProjectPage() {
             } }), () => setSpecNotice(`Removed spec "${spec.name}".`))
           }}>Delete</Button>
         </div>
-      </li>)}</ul> : <p className="muted" style={{ marginTop: 8 }}>No specs or repository snapshots imported yet.</p>}
+      </li>)}</ul> : <p className="muted" style={{ marginTop: 8 }}>No repositories or specs synced yet.</p>}
+
+      <details className="advanced-schema-disclosure">
+        <summary className="collapsible-trigger">
+          Advanced: upload schemas or lockfiles manually
+        </summary>
+        <div className="advanced-schema-body">
+          <p className="muted small-note">
+            Guardian automatically discovers runtime schemas and extracts OpenAPI, GraphQL, and lockfile specs from synced repositories. Use manual upload only when you need to supply an extra schema or lockfile directly.
+          </p>
+          <form className="form-card" onSubmit={event => {
+            event.preventDefault()
+            const form = new FormData(event.currentTarget)
+            const originVal = String(form.get('origin') ?? '').trim()
+            const kindRaw = String(form.get('kind') ?? 'openapi')
+            const kind = (['openapi', 'graphql', 'routes', 'notes'] as const).includes(kindRaw as 'openapi')
+              ? kindRaw as 'openapi' | 'graphql' | 'routes' | 'notes' : 'notes'
+            void specAction.submit(() => importSpec({ data: {
+              requestId: crypto.randomUUID(),
+              projectId: project.id,
+              name: specName.trim() || String(form.get('name') ?? '').trim(),
+              kind,
+              ...(originVal ? { origin: originVal } : {}),
+              content: specContent,
+            } }), saved => {
+              setSpecName('')
+              setSpecContent('')
+              setSpecNotice(`Imported spec "${saved.name}" (${saved.kind}).`)
+            })
+          }}>
+            <h3>Upload OpenAPI, GraphQL, or lockfile</h3>
+            <div className="field-grid-2">
+              <label>Name
+                <Input name="name" required maxLength={160} value={specName} onChange={e => setSpecName(e.target.value)}
+                  placeholder="openapi.yaml or package-lock.json" />
+              </label>
+              <label>Kind
+                <NativeSelect name="kind" defaultValue="openapi">
+                  <option value="openapi">OpenAPI / Swagger</option>
+                  <option value="graphql">GraphQL schema</option>
+                  <option value="routes">Route map / Server handlers</option>
+                  <option value="notes">Lockfile / Dependencies / Notes</option>
+                </NativeSelect>
+              </label>
+            </div>
+            <label>Target origin (optional)
+              <Input name="origin" placeholder={project.seeds[0] ?? 'https://api.example.com'} />
+            </label>
+            <label>Load from file (optional, up to 2 MiB)
+              <Input type="file" accept=".json,.yaml,.yml,.graphql,.gql,.txt,.md,.lock" onChange={e => {
+                void onSpecFileSelected(e.target.files?.[0])
+              }} />
+            </label>
+            <label>Content
+              <Textarea name="content" rows={6} required value={specContent} onChange={e => setSpecContent(e.target.value)}
+                placeholder="Paste OpenAPI, GraphQL SDL, lockfile JSON, or route notes…" />
+            </label>
+            <FormError error={specAction.error} />
+            <div className="form-actions">
+              <Button type="submit" variant="default" disabled={specAction.pending || !specContent.trim()}>Import spec</Button>
+            </div>
+          </form>
+        </div>
+      </details>
     </section>
 
     <section className="stacked-section" aria-label="Local lab runner">

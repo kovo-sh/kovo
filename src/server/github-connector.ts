@@ -22,6 +22,39 @@ import type { NamedSecret } from './redact.ts'
 import { mineSecurityRelevantCommitDiffs, type CommitDiffSignal } from './program-graph.ts'
 
 export const DEFAULT_GITHUB_PAT_PATH = join(homedir(), '.config', 'guardian-fixtures', 'github.pat')
+export const DEFAULT_GITHUB_MAX_AUTO_SELECT = 10
+
+export type GithubPatSource = 'vault' | 'fixture'
+export type GithubPatKind = 'fine_grained' | 'classic' | 'unknown'
+
+export interface GithubPatStatus {
+  configured: boolean
+  source: GithubPatSource | null
+  tokenKind: GithubPatKind | null
+}
+
+export interface AccessibleGithubRepo {
+  fullName: string
+  private: boolean
+  defaultBranch: string
+  updatedAt: string | null
+  description: string | null
+}
+
+export interface ListAccessibleGithubReposOptions {
+  dataDir?: string
+  patPath?: string
+  apiBaseUrl?: string
+  fetchImpl?: typeof fetch
+  maxRepos?: number
+  signal?: AbortSignal
+}
+
+export interface ListAccessibleGithubReposResult {
+  repos: AccessibleGithubRepo[]
+  tokenKind: GithubPatKind
+  truncated: boolean
+}
 
 export interface RepoDependency {
   ecosystem: string
@@ -69,6 +102,7 @@ export interface SyncedGithubRepo {
 }
 
 export interface GithubSyncOptions {
+  dataDir?: string
   patPath?: string
   apiBaseUrl?: string
   gitBaseUrl?: string
@@ -185,6 +219,36 @@ function parseRepoFullName(rawName: string): { fullName: string; owner: string; 
   return { fullName, owner, repo }
 }
 
+function assertValidDataDir(dataDir: string): string {
+  if (!dataDir || /[\0,\r\n]/.test(dataDir)) {
+    throw new Error('Invalid workspace data directory.')
+  }
+  return dataDir
+}
+
+function vaultGithubPatPath(dataDir: string): string {
+  return join(assertValidDataDir(dataDir), 'credentials', 'github.pat')
+}
+
+export function classifyGithubPatKind(token: string): GithubPatKind {
+  const trimmed = token.trim()
+  if (trimmed.startsWith('github_pat_')) return 'fine_grained'
+  if (/^gh[pousr]_/.test(trimmed)) return 'classic'
+  return 'unknown'
+}
+
+/**
+ * Resolve the active GitHub PAT path: prefers `<dataDir>/credentials/github.pat` when present,
+ * falling back to `DEFAULT_GITHUB_PAT_PATH` only when the vault file is absent.
+ */
+export function resolveGithubPatPath(dataDir?: string): string {
+  if (dataDir) {
+    const vaultPath = vaultGithubPatPath(dataDir)
+    if (existsSync(vaultPath)) return vaultPath
+  }
+  return DEFAULT_GITHUB_PAT_PATH
+}
+
 function readGithubPat(patPath = DEFAULT_GITHUB_PAT_PATH): string {
   const stat = statSync(patPath)
   if (!stat.isFile() || stat.size === 0) {
@@ -201,13 +265,192 @@ function readGithubPat(patPath = DEFAULT_GITHUB_PAT_PATH): string {
   return pat
 }
 
-export function hasGithubPat(patPath = DEFAULT_GITHUB_PAT_PATH): boolean {
-  try {
-    readGithubPat(patPath)
-    return true
-  } catch {
-    return false
+export function saveGithubPat(dataDir: string, rawToken: string): GithubPatStatus {
+  const token = rawToken.trim()
+  if (!token || token.length < 10 || token.length > 512 || /[\s\0]/.test(token)) {
+    throw new Error('GitHub PAT must be a single non-empty token without whitespace.')
   }
+  const credDir = join(assertValidDataDir(dataDir), 'credentials')
+  mkdirSync(credDir, { recursive: true, mode: 0o700 })
+  chmodSync(credDir, 0o700)
+
+  const patPath = join(credDir, 'github.pat')
+  const tmpPath = join(credDir, `.github.pat.tmp-${randomUUID()}`)
+  try {
+    writeFileSync(tmpPath, `${token}\n`, { encoding: 'utf8', mode: 0o600 })
+    chmodSync(tmpPath, 0o600)
+    renameSync(tmpPath, patPath)
+    chmodSync(patPath, 0o600)
+  } finally {
+    if (existsSync(tmpPath)) {
+      try { rmSync(tmpPath, { force: true }) } catch { /* best-effort */ }
+    }
+  }
+  return {
+    configured: true,
+    source: 'vault',
+    tokenKind: classifyGithubPatKind(token),
+  }
+}
+
+export function clearGithubPat(dataDir: string): { cleared: boolean; status: GithubPatStatus } {
+  const patPath = vaultGithubPatPath(dataDir)
+  let cleared = false
+  try {
+    lstatSync(patPath)
+    rmSync(patPath, { force: true })
+    cleared = true
+  } catch {
+    cleared = false
+  }
+  return { cleared, status: getGithubPatStatus(dataDir) }
+}
+
+export function getGithubPatStatus(dataDir?: string, explicitPatPath?: string): GithubPatStatus {
+  if (explicitPatPath) {
+    try {
+      const pat = readGithubPat(explicitPatPath)
+      const source: GithubPatSource = resolve(explicitPatPath) === resolve(DEFAULT_GITHUB_PAT_PATH) ? 'fixture' : 'vault'
+      return { configured: true, source, tokenKind: classifyGithubPatKind(pat) }
+    } catch {
+      return { configured: false, source: null, tokenKind: null }
+    }
+  }
+  if (dataDir) {
+    const vaultPath = vaultGithubPatPath(dataDir)
+    if (existsSync(vaultPath)) {
+      try {
+        const pat = readGithubPat(vaultPath)
+        return { configured: true, source: 'vault', tokenKind: classifyGithubPatKind(pat) }
+      } catch {
+        return { configured: false, source: null, tokenKind: null }
+      }
+    }
+  }
+  try {
+    const pat = readGithubPat(DEFAULT_GITHUB_PAT_PATH)
+    return { configured: true, source: 'fixture', tokenKind: classifyGithubPatKind(pat) }
+  } catch {
+    return { configured: false, source: null, tokenKind: null }
+  }
+}
+
+export function hasGithubPat(patPathOrOptions?: string | { dataDir?: string; patPath?: string }): boolean {
+  if (typeof patPathOrOptions === 'object' && patPathOrOptions !== null) {
+    return getGithubPatStatus(patPathOrOptions.dataDir, patPathOrOptions.patPath).configured
+  }
+  if (typeof patPathOrOptions === 'string') {
+    try {
+      if (statSync(patPathOrOptions).isDirectory()) {
+        return getGithubPatStatus(patPathOrOptions).configured
+      }
+    } catch {
+      // May be a nonexistent dataDir or file path; try direct file read below.
+    }
+    try {
+      readGithubPat(patPathOrOptions)
+      return true
+    } catch {
+      return false
+    }
+  }
+  return getGithubPatStatus().configured
+}
+
+/**
+ * Pure helper for pre-selecting discovered repositories in the UI:
+ * - Fine-grained PATs typically expose <= 10 scoped repos, so all are pre-checked.
+ * - Broad classic PATs / large org accounts expose > maxAutoSelect repos, so none are pre-checked.
+ */
+export function defaultSelectedRepoNames(
+  repos: readonly Pick<AccessibleGithubRepo, 'fullName'>[],
+  maxAutoSelect = DEFAULT_GITHUB_MAX_AUTO_SELECT,
+): string[] {
+  const cap = Math.max(0, Math.floor(maxAutoSelect))
+  if (repos.length === 0 || repos.length > cap) return []
+  return repos.map(repo => repo.fullName)
+}
+
+export async function listAccessibleGithubRepos(
+  options: ListAccessibleGithubReposOptions = {},
+): Promise<ListAccessibleGithubReposResult> {
+  options.signal?.throwIfAborted()
+  const patPath = options.patPath ?? resolveGithubPatPath(options.dataDir)
+  const pat = readGithubPat(patPath)
+  const tokenKind = classifyGithubPatKind(pat)
+  const secrets: NamedSecret[] = [{ value: pat, placeholder: '[redacted]' }]
+  const apiBase = (options.apiBaseUrl ?? 'https://api.github.com').replace(/\/+$/, '')
+  const fetchFn = options.fetchImpl ?? fetch
+  const maxRepos = Math.max(1, Math.min(Math.floor(options.maxRepos ?? 200), 500))
+  const perPage = Math.min(100, maxRepos)
+  const maxPages = Math.ceil(maxRepos / perPage)
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${pat}`,
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'User-Agent': 'Guardian/2 read-only repo connector',
+  }
+
+  const repos: AccessibleGithubRepo[] = []
+  const seen = new Set<string>()
+  let truncated = false
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    options.signal?.throwIfAborted()
+    const query = `per_page=${perPage}&sort=updated&affiliation=owner,collaborator,organization_member${page > 1 ? `&page=${page}` : ''}`
+    const reqSignal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(20_000)]) : AbortSignal.timeout(20_000)
+    const res = await fetchFn(`${apiBase}/user/repos?${query}`, { method: 'GET', headers, signal: reqSignal })
+    if (!res.ok) {
+      const body = redact(await res.text().catch(() => ''), secrets).slice(0, 240)
+      if (res.status === 401) {
+        throw new Error(`GitHub rejected the token (HTTP 401): ${body || 'Bad credentials'}`)
+      }
+      if (res.status === 403) {
+        throw new Error(`GitHub denied repository access (HTTP 403): ${body || 'Insufficient permissions'}`)
+      }
+      throw new Error(`GitHub API GET /user/repos failed (${res.status}): ${body}`)
+    }
+    const batch = await res.json() as Array<{
+      full_name?: unknown
+      private?: unknown
+      default_branch?: unknown
+      updated_at?: unknown
+      description?: unknown
+    }>
+    if (!Array.isArray(batch) || batch.length === 0) break
+
+    for (const item of batch) {
+      if (repos.length >= maxRepos) {
+        truncated = true
+        break
+      }
+      const fullName = typeof item.full_name === 'string' ? item.full_name.trim() : ''
+      if (!fullName || !repoFullNamePattern.test(fullName) || seen.has(fullName)) continue
+      seen.add(fullName)
+      const description = typeof item.description === 'string' && item.description.trim()
+        ? redact(item.description.trim(), secrets).slice(0, 240)
+        : null
+      repos.push({
+        fullName,
+        private: Boolean(item.private),
+        defaultBranch: typeof item.default_branch === 'string' && item.default_branch.trim() ? item.default_branch.trim() : 'main',
+        updatedAt: typeof item.updated_at === 'string' && item.updated_at.trim() ? item.updated_at.trim() : null,
+        description,
+      })
+    }
+
+    if (batch.length < perPage) break
+    if (repos.length >= maxRepos) {
+      const linkHeader = res.headers?.get?.('link') ?? ''
+      if (linkHeader.includes('rel="next"') || page === maxPages) {
+        truncated = true
+      }
+      break
+    }
+  }
+
+  return { repos, tokenKind, truncated }
 }
 
 function classifyRepoPath(filePath: string): { category: SyncedRepoFile['category']; priority: number } | null {
@@ -876,7 +1119,7 @@ export async function cloneGithubRepos(
     throw new Error('Invalid repository clone root directory.')
   }
 
-  const pat = readGithubPat(options.patPath)
+  const pat = readGithubPat(options.patPath ?? resolveGithubPatPath(options.dataDir))
   const basicAuth = Buffer.from(`x-access-token:${pat}`, 'utf8').toString('base64')
   const secrets: NamedSecret[] = [
     { value: pat, placeholder: '[redacted]' },
@@ -1043,7 +1286,7 @@ export async function syncGithubRepos(
   }
 
   signal?.throwIfAborted()
-  const pat = readGithubPat(options.patPath)
+  const pat = readGithubPat(options.patPath ?? resolveGithubPatPath(options.dataDir))
   const secrets: NamedSecret[] = [{ value: pat, placeholder: '[redacted]' }]
   const apiBase = (options.apiBaseUrl ?? 'https://api.github.com').replace(/\/+$/, '')
   const fetchFn = options.fetchImpl ?? fetch
