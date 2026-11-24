@@ -123,6 +123,11 @@ the 3-cell/K=6 schedule and hit `Provider stream stalled; requeued once`; under 
 verifier confirmed 1–2 boundary claims that the K=4 serial reruns left inconclusive. This is a
 precision-variance problem in the proof gate, not a truth problem. It is why §6.5/§6.6 are P0.
 
+| FP | gate that should have caught it | present in any persisted diff? |
+| --- | --- | --- |
+| acme `d5f4b3ac…` | `endpoint_not_in_surface` + `spa_catchall` (evidence endpoint absent from the variant route map, or 2xx is the SPA index) | **no** — no such code exists in any `last_verification_diff` |
+| shopflow `d41c4bca…` | app owner/admin gate on the non-target merchant route; for the SQLi-label variant, `alignClaimClass` (CWE-89 evidence) | **no** oracle code needed; app fix applied in §5 |
+
 **The exact `oracle_rejected_by` gap.** In the 34-target held-out funnel, the only rejection codes
 that exist are `no_route_hit` (11), `no_spec_submitted` (19), `dismissed/true` (2),
 `inconclusive/burst-1` (1), `inconclusive/cross_read` (1) and `confirmed` (1). There is **no**
