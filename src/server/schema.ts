@@ -310,6 +310,34 @@ export const approvalLeases = sqliteTable('approval_leases', {
   uniqueIndex('approval_leases_route').on(table.runId, table.origin, table.method, table.routePattern, table.scopeRevision),
 ])
 
+/**
+ * Persisted receipt for an agent-script proof. Concrete (serializable) fields only: it is returned
+ * by the read API, and the verdict is re-derived by `verifyReceipt()`, never trusted from here.
+ */
+export interface ReplayProofReceiptRow {
+  receipt: {
+    vulnClass: string
+    target: { origin: string; method?: string; pathAndQuery?: string; param?: string }
+    exchangeIds: string[]
+    oobEventIds: string[]
+    browserTraceIds: string[]
+    claimedDelta: string
+    oracleEvents?: string[]
+    requiredRole?: string
+    resourceTenant?: string
+    expectControlDenied?: boolean
+    proofPatterns?: string[]
+  }
+  verification: {
+    confirmed: boolean
+    vulnClass: string
+    rule: string
+    reason: string
+    observed: string
+    expected: string
+  }
+}
+
 export const replaySpecs = sqliteTable('replay_specs', {
   id: text('id').primaryKey().notNull(),
   runId: text('run_id').notNull().references(() => runs.id),
@@ -323,8 +351,23 @@ export const replaySpecs = sqliteTable('replay_specs', {
   attemptCount: integer('attempt_count').default(1).notNull(),
   verifiedInline: integer('verified_inline', { mode: 'boolean' }).default(false).notNull(),
   lastVerificationDiff: text('last_verification_diff', { mode: 'json' }).$type<InlineVerifyFeedback | null>(),
+  /**
+   * v7 M5 agent-script proof columns. A `guardian_verify` script proof persists the oracle verdict,
+   * the receipt it was re-checked with and the owner-only artifact holding the script source +
+   * receipt. The declarative fields above stay for attribution; confirmation and retest are
+   * receipt-first (`verifyReceipt()` over the cited exchanges), never a DSL re-interpretation.
+   */
+  proofKind: text('proof_kind').$type<'agent_script' | null>(),
+  proofVerdict: text('proof_verdict').$type<'confirmed' | 'dismissed' | 'inconclusive' | null>(),
+  proofRuntime: text('proof_runtime').$type<'ts' | 'python' | null>(),
+  proofScriptSha256: text('proof_script_sha256'),
+  proofArtifactId: text('proof_artifact_id'),
+  proofReceipt: text('proof_receipt', { mode: 'json' }).$type<ReplayProofReceiptRow | null>(),
   createdAt: integer('created_at').notNull(),
-}, table => [index('replay_specs_run').on(table.runId)])
+}, table => [
+  index('replay_specs_run').on(table.runId),
+  index('replay_specs_proof').on(table.runId, table.proofKind),
+])
 
 export const retestRuns = sqliteTable('retest_runs', {
   id: text('id').primaryKey().notNull(),

@@ -71,6 +71,7 @@ import type {
 } from '../domain.ts'
 import { parseDnsInventory } from '../passive-dns.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
+import type { ReplayProofReceiptRow } from './schema.ts'
 import {
   buildProvenanceReport,
   chainFindingDedupKey,
@@ -110,7 +111,7 @@ import type { EnvironmentMode, OriginRole, ScopePolicy } from './scope-policy.ts
 import * as tables from './schema.ts'
 
 /** Local SQLite schema stamp (`PRAGMA user_version`), independent of Drizzle migrations. */
-export const STORE_SCHEMA_VERSION = 8
+export const STORE_SCHEMA_VERSION = 9
 
 const PENDING_OOB_RE = /pending[_\s-]?oob|awaiting[_\s-]?(?:oob|callback)/i
 
@@ -331,6 +332,55 @@ export type BrokerExchange = typeof tables.brokerExchanges.$inferSelect
 export type ApprovalRequest = typeof tables.approvalRequests.$inferSelect
 export type ApprovalLeaseRow = typeof tables.approvalLeases.$inferSelect
 export type ReplaySpecRow = typeof tables.replaySpecs.$inferSelect
+
+/**
+ * Persisted agent-script proof (v7 M5). The receipt is the confirmation primitive: `verifyReceipt()`
+ * re-derives the claim from the cited host exchanges, so a re-validation never trusts this row.
+ */
+export interface AgentScriptProofRecord {
+  replaySpecId: string
+  findingId: string
+  verdict: 'confirmed' | 'dismissed' | 'inconclusive'
+  runtime: 'ts' | 'python'
+  scriptSha256: string
+  artifactId?: string | null
+  /** `{ receipt, verification }` exactly as validated at confirmation time. */
+  receipt?: ReplayProofReceiptRow | null
+  createdAt: number
+}
+
+/** Columns written for an agent-script proof (kept in one place so accessors cannot drift). */
+function proofColumns(proof: AgentScriptProofRecord | null | undefined) {
+  if (!proof) {
+    return {
+      proofKind: null, proofVerdict: null, proofRuntime: null,
+      proofScriptSha256: null, proofArtifactId: null, proofReceipt: null,
+    }
+  }
+  return {
+    proofKind: 'agent_script' as const,
+    proofVerdict: proof.verdict,
+    proofRuntime: proof.runtime,
+    proofScriptSha256: proof.scriptSha256,
+    proofArtifactId: proof.artifactId ?? null,
+    proofReceipt: proof.receipt ?? null,
+  }
+}
+
+function proofRecordOf(row: ReplaySpecRow): AgentScriptProofRecord | null {
+  if (row.proofKind !== 'agent_script' || !row.proofVerdict || !row.proofRuntime || !row.proofScriptSha256) return null
+  return {
+    replaySpecId: row.id,
+    findingId: row.findingId,
+    verdict: row.proofVerdict,
+    runtime: row.proofRuntime,
+    scriptSha256: row.proofScriptSha256,
+    artifactId: row.proofArtifactId ?? null,
+    receipt: row.proofReceipt ?? null,
+    createdAt: row.createdAt,
+  }
+}
+
 export type RetestRun = typeof tables.retestRuns.$inferSelect
 export type CoverageEntry = typeof tables.coverageEntries.$inferSelect
 export type CanaryRow = typeof tables.canaries.$inferSelect
@@ -842,6 +892,7 @@ export class Store {
     this.initV4Schema()
     this.initV5Schema()
     this.initV6Schema()
+    this.initV7Schema()
     // v6.2 full-body FTS size guard: refuse to switch on an expensive index over a database that is
     // already large unless the operator explicitly forced it. Release the process lock so a
     // subsequent correctly-configured reopen can proceed.
@@ -1348,6 +1399,36 @@ export class Store {
     `)
     this.client.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`)
     this.initConfirmationGuards()
+  }
+
+  /**
+   * v7 M5 agent-script proof storage (additive, safe on legacy databases).
+   *
+   * A Layer-3 `guardian_verify` proof persists its oracle verdict, the receipt it was re-checked
+   * with and the owner-only artifact holding script source + receipt. Declarative columns stay for
+   * attribution; confirmation/retest are receipt-first. No backfill is needed: pre-migration rows
+   * are simply not script proofs.
+   */
+  private initV7Schema() {
+    const existingColumns = (table: string): Set<string> => {
+      const rows = this.client.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+      return new Set(rows.map(r => r.name))
+    }
+    const ensureColumn = (table: string, column: string, definition: string) => {
+      if (!existingColumns(table).has(column)) {
+        this.client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`)
+      }
+    }
+    ensureColumn('replay_specs', 'proof_kind', 'TEXT')
+    ensureColumn('replay_specs', 'proof_verdict', 'TEXT')
+    ensureColumn('replay_specs', 'proof_runtime', 'TEXT')
+    ensureColumn('replay_specs', 'proof_script_sha256', 'TEXT')
+    ensureColumn('replay_specs', 'proof_artifact_id', 'TEXT')
+    ensureColumn('replay_specs', 'proof_receipt', 'TEXT')
+    this.client.exec(`
+      CREATE INDEX IF NOT EXISTS replay_specs_proof ON replay_specs (run_id, proof_kind);
+    `)
+    this.client.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`)
   }
 
   /**
@@ -3953,6 +4034,7 @@ export class Store {
       initialAttemptCount?: number
       verifiedInline?: boolean
       lastVerificationDiff?: InlineVerifyFeedback | null
+      proof?: AgentScriptProofRecord | null
     },
   ): ReplaySpecRow {
     const specSha256 = createHash('sha256').update(JSON.stringify(spec)).digest('hex')
@@ -3969,8 +4051,39 @@ export class Store {
       attemptCount: options?.initialAttemptCount ?? 1,
       verifiedInline: options?.verifiedInline ?? false,
       lastVerificationDiff: options?.lastVerificationDiff ?? null,
+      ...proofColumns(options?.proof),
       createdAt: Date.now(),
     }).returning().get()
+  }
+
+  /** Persist (or replace) the agent-script proof attached to a replay spec row. */
+  setReplaySpecProof(runId: string, replaySpecId: string, proof: AgentScriptProofRecord): ReplaySpecRow {
+    const row = this.db.update(tables.replaySpecs)
+      .set(proofColumns(proof))
+      .where(and(eq(tables.replaySpecs.runId, runId), eq(tables.replaySpecs.id, replaySpecId)))
+      .returning().get()
+    if (!row) throw new Error('Replay spec not found.')
+    return row
+  }
+
+  /** Proof columns for a row (or null when the row is not a script proof). */
+  replaySpecProof(runId: string, replaySpecId: string): AgentScriptProofRecord | null {
+    const row = this.db.select().from(tables.replaySpecs).where(and(
+      eq(tables.replaySpecs.runId, runId), eq(tables.replaySpecs.id, replaySpecId),
+    )).get()
+    return row ? proofRecordOf(row) : null
+  }
+
+  /** Latest script proof attached to any spec row of a finding (null when none). */
+  agentProofForFinding(runId: string, findingId: string): AgentScriptProofRecord | null {
+    const rows = this.db.select().from(tables.replaySpecs).where(and(
+      eq(tables.replaySpecs.runId, runId), eq(tables.replaySpecs.findingId, findingId),
+    )).orderBy(desc(tables.replaySpecs.createdAt)).all()
+    for (const row of rows) {
+      const proof = proofRecordOf(row)
+      if (proof) return proof
+    }
+    return null
   }
 
   getReplaySpec(runId: string, replaySpecId: string): ReplaySpecRow {
