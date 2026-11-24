@@ -782,3 +782,18 @@ Dev floor still 36/59 and 0 spread on that branch.
 5. **no spec is ever synthesized from that later signal.**
 
 So the loss is an ordering/dedupe interaction: the proof is synthesized from the first param attempt, and a later-param `signal` on the same endpoint never triggers re-synthesis. `cmdi-signal` is fixing this generally (a signal on any param of an endpoint must synthesize from that param's evidence, bounded and deterministic), with dev 36/59 + opsportal 10/18 required at 100%.
+
+### 2026-11-24 — cmdi regression closed (root cause was not what I logged)
+
+My earlier log said "later-param signal never re-synthesizes". The stream's trace showed that was **wrong**: hypotheses are keyed per parameter and `endpointHost` was actually probed **first** (signal), with `host` being a decoy that resolves to `endpointHost` for seed 1 (its posts are `400 host_required`).
+
+The real defect was inside one hypothesis's candidate set:
+1. `synthCommandInjection` joined the split-proof halves with `; echo {{p1}}$(echo {{p2}})`. The target's shell model emits substitution output on its own line (`…\nP1\nP2\n`), so `splitEchoVerified` was false — the `rce_proof` dismissal was legitimate **for that template**.
+2. The only other candidate was the observed-payload `http_chain`, which the new injection oracle correctly vetoed (no fingerprint).
+3. The candidate set was exhausted, so the winning param's evidence never produced a valid proof.
+
+Fix (`deterministic-specs.ts` only): join the halves with an **empty command substitution** `$(echo '')` (empty quoted word for substitution-shaped variants), so a real shell evaluates it to nothing and the halves become contiguous in the response — while the outbound request never contains the assembled token and a quote-stripping filter cannot assemble it either. Derived from the recorded `command_executed` anomaly (`variant`, `baseValue`, param); no re-probe, still ≤2 candidates per signal, deterministic.
+
+Measured: dev **36/59** (opsportal 9/18 → **10/18**, `og.diag-cmdi` via `rce_proof`, `splitEchoVerified=true`), opsportal 4 repeats all 10/18 (**0 spread**), held-out **28/58** (opsportal `og.diag-cmdi` confirms there too), xben 25/25, held-out-saas 20/20 + 20/20 patches.
+
+**Lesson recorded:** a stricter oracle can cost a *deterministic* target, and the loss often presents as a template/ordering symptom rather than a missing rule. Re-measuring the floor after every verifier merge is what caught it.
