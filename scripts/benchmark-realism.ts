@@ -469,7 +469,7 @@ interface ExchangeLike {
 
 export interface TranslatedFindings {
   findings: SubmittedFinding[]
-  /** findingId -> number of concrete endpoints extracted for it (used for SAST->live linking). */
+  /** findingId -> number of declared target endpoints extracted for it (used for SAST->live linking). */
   endpointCounts: Map<string, number>
 }
 
@@ -480,6 +480,101 @@ function submitStatus(status: string): string {
   if (status === 'static_verified') return 'static_verified'
   if (status === 'pending') return 'proposed'
   return 'open_proof_gap'
+}
+
+type DeclaredEndpoint = { method?: string; path: string }
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function endpointPath(value: unknown): string | null {
+  return typeof value === 'string' && value.startsWith('/') && !value.startsWith('//') ? value : null
+}
+
+function endpointOf(record: Record<string, unknown>): DeclaredEndpoint | null {
+  const request = objectRecord(record.request)
+  const path = endpointPath(request?.pathAndQuery) ?? endpointPath(record.pathAndQuery)
+  if (!path) return null
+  const method = typeof request?.method === 'string'
+    ? request.method
+    : typeof record.method === 'string' ? record.method : undefined
+  return { ...(method ? { method: method.toUpperCase() } : {}), path }
+}
+
+/**
+ * Endpoints that carry the vulnerable action declared by one replay spec — the mutated probe
+ * step(s), never the benign control or owner readback that only establishes the baseline.
+ *
+ * A finding is graded on the endpoint it says it broke. Submitting every step of a replay chain
+ * turned an owner-scoped readback (`GET /v1/invoices/:id`) into an extra submission and a decoy
+ * false positive on the staging-concurrency suite, so probe extraction is authoritative here.
+ * Chains that legitimately target several endpoints still yield one entry per probe step.
+ *
+ * Returns [] when the spec carries no probe-role information (legacy/unknown shape), which lets
+ * the caller keep the historical whole-spec extraction as a fallback.
+ */
+export function declaredEndpointsFromReplaySpec(spec: unknown): DeclaredEndpoint[] {
+  const record = objectRecord(spec)
+  if (!record) return []
+  const out: DeclaredEndpoint[] = []
+  const add = (endpoint: DeclaredEndpoint | null): void => {
+    if (endpoint) out.push(endpoint)
+  }
+
+  // Role-bearing step specs: http_chain, auth_protocol_proof, browser_chain, ws_chain.
+  const steps = Array.isArray(record.steps) ? record.steps : []
+  const probeSteps = steps.filter(step => objectRecord(step)?.role === 'probe')
+  if (probeSteps.length) {
+    for (const step of probeSteps) {
+      const entry = objectRecord(step)
+      if (entry) add(endpointOf(entry))
+    }
+    return out
+  }
+  if (steps.length) return []
+
+  // Dedicated probe fields: the control/verify paths are deliberately skipped.
+  const method = typeof record.method === 'string' ? record.method.toUpperCase() : undefined
+  const probePath = endpointPath(record.probePath)
+  if (probePath) {
+    add({ ...(method ? { method } : {}), path: probePath })
+    return out
+  }
+
+  switch (typeof record.kind === 'string' ? record.kind : '') {
+    case 'race_burst': {
+      // The synchronized burst is the mutation; setupSteps are reads/mints and post-checks read back.
+      for (const burst of Array.isArray(record.burst) ? record.burst : []) {
+        const entry = objectRecord(burst)
+        if (entry) add(endpointOf(entry))
+      }
+      const probeStep = objectRecord(record.probeStep)
+      if (probeStep) add(endpointOf(probeStep))
+      return out
+    }
+    case 'rce_proof': {
+      const probeStep = objectRecord(record.probeStep)
+      if (probeStep) add(endpointOf(probeStep))
+      return out
+    }
+    case 'upload_probe': {
+      // The upload is the write; fetchStep/cleanupStep are readbacks.
+      const uploadStep = objectRecord(record.uploadStep)
+      if (uploadStep) add(endpointOf(uploadStep))
+      return out
+    }
+    case 'sql_boolean_diff':
+    case 'sql_time_diff': {
+      const path = endpointPath(record.pathAndQuery)
+      if (path) add({ ...(method ? { method } : {}), path })
+      return out
+    }
+    default:
+      return out
+  }
 }
 
 /** Translate persisted Guardian findings into the realism-suite grading schema. */
@@ -506,9 +601,12 @@ export function translateFindings(input: {
     if (finding.findingKind === 'baseline_check') continue
     if (IGNORED_FINDING_STATUSES.has(finding.status)) continue
     if (finding.supersededByFindingId) continue
-    const endpoints: Array<{ method?: string; path: string }> = []
+    const endpoints: DeclaredEndpoint[] = []
     for (const spec of (specsByFinding.get(finding.id) ?? []).slice(0, 3)) {
-      endpoints.push(...endpointsFromReplaySpec(spec.spec))
+      const declared = declaredEndpointsFromReplaySpec(spec.spec)
+      // Probe-role extraction is authoritative; only specs that carry no role information fall
+      // back to the historical whole-spec walk.
+      endpoints.push(...(declared.length ? declared : endpointsFromReplaySpec(spec.spec)))
     }
     if (!endpoints.length) {
       for (const id of finding.exchangeIds ?? []) {
