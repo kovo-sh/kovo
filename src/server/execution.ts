@@ -76,10 +76,12 @@ import type {
   AlreadyConfirmedRef,
   CodeAuditSuspectData,
   DetLeadSummary,
+  GapValidationEvent,
   GuardianVerifyArgs,
   GuardianVerifyRuntime,
   HostTier,
   PersonaResourceQueueItem,
+  ProofObligationEvent,
   RequestHttpArgs,
   RequestHttpRaceArgs,
   UnconfirmedSurfaceRef,
@@ -155,6 +157,7 @@ import { drainPendingOob, scheduleFinalReport } from './oob-drain.ts'
 import type { OobDrainOptions, OobDrainResult } from './oob-drain.ts'
 import { buildOobReceipt, verifyReceipt } from './proof-receipt.ts'
 import type { ReceiptOobEvent } from './proof-receipt.ts'
+import { resolveProfileNoTokenWatchdogMs } from './provider-stream.ts'
 export { DEFAULT_OOB_DRAIN_MS, OOB_DRAIN_POLL_MS, resolveOobDrainMs } from './oob-drain.ts'
 import { ProbePlanRegistry, selectRankedProbeTargets } from './probe-plan.ts'
 import { graphLeadTargets, seedCodeToRuntimeLeads as seedGraphLeads } from './graph-leads.ts'
@@ -973,7 +976,11 @@ export function planMultiTrialExpansion<T extends DispatchFunnelStep & {
   if (concurrency <= 1) return []
   const queued = input.steps.filter(step =>
     (step.status === 'pending' || step.status === 'ready') && !step.trialGroupId)
-  let surplus = multiTrialSurplusSlots(queued.length, concurrency)
+  // Existing queued trial-group members already occupy slots; count them so duplicates never
+  // accumulate across ticks beyond actual idle worker capacity.
+  const queuedInTrialGroups = input.steps.filter(step =>
+    (step.status === 'pending' || step.status === 'ready') && Boolean(step.trialGroupId)).length
+  let surplus = multiTrialSurplusSlots(queued.length + queuedInTrialGroups, concurrency)
   if (surplus <= 0) return []
   const expansions: MultiTrialExpansion<T>[] = []
   for (const step of queued) {
@@ -1326,6 +1333,8 @@ export interface DispatchLaneStep {
   dependsOnFactIds?: readonly string[]
   dependsOnStepIds?: readonly string[]
   sourceOrigins?: readonly string[]
+  /** Multi-trial sibling index (`0` or omitted = primary hypothesis; `> 0` = unstarted duplicate). */
+  trialIndex?: number | null
 }
 
 export interface RoundRobinDispatchOptions {
@@ -1386,7 +1395,13 @@ function dispatchTierRank(step: DispatchLaneStep, hostTiers?: Record<string, Hos
   return 1
 }
 
+function isTrialDuplicateStep(step: Pick<DispatchLaneStep, 'trialIndex'>): boolean {
+  return typeof step.trialIndex === 'number' && step.trialIndex > 0
+}
+
 function compareDispatchSteps(a: DispatchLaneStep, b: DispatchLaneStep, hostTiers?: Record<string, HostTier>): number {
+  const trialDup = Number(isTrialDuplicateStep(a)) - Number(isTrialDuplicateStep(b))
+  if (trialDup !== 0) return trialDup
   const tier = dispatchTierRank(a, hostTiers) - dispatchTierRank(b, hostTiers)
   if (tier !== 0) return tier
   if (a.priority !== b.priority) return b.priority - a.priority
@@ -1397,7 +1412,9 @@ function compareDispatchSteps(a: DispatchLaneStep, b: DispatchLaneStep, hostTier
 /**
  * Fill `slots` deterministically: up to the lead cap first, then one step per lane per round so a
  * lead backlog or a single large route lane can never starve the semantic classes. Leads past the
- * cap only run when no non-lead ready step remains.
+ * cap only run when no non-lead ready step remains. Unstarted trial duplicates (`trialIndex > 0`)
+ * are demoted strictly behind every distinct primary ready step across all lanes and only fill
+ * remaining surplus capacity.
  */
 export function planRoundRobinDispatch<T extends DispatchLaneStep>(
   steps: readonly T[],
@@ -1410,8 +1427,14 @@ export function planRoundRobinDispatch<T extends DispatchLaneStep>(
   }
   const lanes = new Map<DispatchLane, T[]>()
   for (const lane of ['lead', ...DISPATCH_LANE_ORDER] as DispatchLane[]) lanes.set(lane, [])
-  for (const step of steps) lanes.get(classifyDispatchLane(step, options.hostTiers))!.push(step)
+  const duplicateTrials: Array<{ lane: DispatchLane; step: T }> = []
+  for (const step of steps) {
+    const lane = classifyDispatchLane(step, options.hostTiers)
+    if (isTrialDuplicateStep(step)) duplicateTrials.push({ lane, step })
+    else lanes.get(lane)!.push(step)
+  }
   for (const lane of lanes.values()) lane.sort((a, b) => compareDispatchSteps(a, b, options.hostTiers))
+  duplicateTrials.sort((a, b) => compareDispatchSteps(a.step, b.step, options.hostTiers))
 
   const leadCap = Math.max(
     0,
@@ -1456,12 +1479,110 @@ export function planRoundRobinDispatch<T extends DispatchLaneStep>(
     }
   }
 
+  // Surplus slots only: unstarted trial duplicates never displace a distinct primary hypothesis.
+  for (const entry of duplicateTrials) {
+    if (ordered.length >= capacity) break
+    ordered.push(entry.step)
+    selectedByLane[entry.lane] += 1
+  }
+
   return {
     ordered,
     selectedByLane,
     leadCapRemaining: Math.max(0, leadCap - selectedByLane.lead),
     deferredLeads: leadQueue.length,
   }
+}
+
+export interface HighRiskEndpointCandidate {
+  origin: string
+  method: string
+  pathTemplate: string
+  riskScore: number
+  coveragePct?: number | null
+  testedClasses?: readonly string[] | null
+}
+
+/**
+ * Discovered high-risk endpoints (`riskScore >= minRisk`) that are neither confirmed nor covered
+ * by any existing planned/dispatched step. Used by the planner coverage assertion before accepting
+ * a dry/coordinator stop so high-risk routes cannot be silently dropped.
+ */
+export function selectUncoveredHighRiskEndpoints<T extends HighRiskEndpointCandidate>(input: {
+  endpoints: readonly T[]
+  approvedOrigins: ReadonlySet<string>
+  confirmedPaths: ReadonlySet<string>
+  coveredRoutes: ReadonlySet<string>
+  minRisk?: number
+  limit?: number
+}): T[] {
+  const minRisk = input.minRisk ?? 60
+  const limit = Math.max(0, Math.floor(input.limit ?? 6))
+  if (limit === 0) return []
+  const seen = new Set<string>()
+  const eligible: T[] = []
+  for (const ep of input.endpoints) {
+    if (!input.approvedOrigins.has(ep.origin)) continue
+    if (ep.riskScore < minRisk) continue
+    const normalizedPath = normalizeEndpointTemplate(ep.pathTemplate)
+    if (!normalizedPath || normalizedPath === '/') continue
+    if (input.confirmedPaths.has(normalizedPath)) continue
+    if (input.coveredRoutes.has(normalizedPath)) continue
+    const method = (ep.method || 'GET').toUpperCase()
+    const key = `${ep.origin}\u0000${method}\u0000${normalizedPath}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    eligible.push(ep)
+  }
+  eligible.sort((a, b) =>
+    b.riskScore - a.riskScore ||
+    (a.coveragePct ?? 0) - (b.coveragePct ?? 0) ||
+    a.method.localeCompare(b.method) ||
+    a.pathTemplate.localeCompare(b.pathTemplate))
+  return eligible.slice(0, limit)
+}
+
+/**
+ * Extract deduplicated assigned target routes for per-route proof-obligation tracking from a step's
+ * title/hypothesis and its parent `det_lead`/Program-Graph facts.
+ */
+export function extractAssignedTargetRoutes(input: {
+  title: string
+  hypothesis: string
+  parentFacts?: ReadonlyArray<{ origin?: string; data?: Record<string, unknown> | null }>
+  defaultOrigin?: string
+}): Array<{ method?: string; path?: string; origin?: string }> {
+  const routes: Array<{ method?: string; path?: string; origin?: string }> = []
+  const seen = new Set<string>()
+  const add = (entry: { method?: string; path?: string; origin?: string }) => {
+    const rawPath = entry.path?.trim()
+    if (!rawPath || !rawPath.startsWith('/')) return
+    const normalizedPath = normalizeEndpointTemplate(rawPath.split(/[?#]/, 1)[0] ?? rawPath)
+    const method = entry.method ? entry.method.toUpperCase() : undefined
+    const key = `${method ?? '*'} ${normalizedPath}`
+    if (seen.has(key)) return
+    seen.add(key)
+    routes.push({
+      ...(method ? { method } : {}),
+      path: rawPath,
+      ...(entry.origin ? { origin: entry.origin } : input.defaultOrigin ? { origin: input.defaultOrigin } : {}),
+    })
+  }
+  for (const fact of input.parentFacts ?? []) {
+    const data = fact.data
+    if (!data || typeof data !== 'object') continue
+    const endpoint = typeof data.endpoint === 'string'
+      ? data.endpoint
+      : typeof data.path === 'string'
+        ? data.path
+        : undefined
+    const method = typeof data.method === 'string' ? data.method : undefined
+    if (endpoint) add({ method, path: endpoint, origin: fact.origin })
+  }
+  for (const route of templatesMentionedInText(`${input.title} ${input.hypothesis}`)) {
+    add({ path: route, origin: input.defaultOrigin })
+  }
+  return routes.slice(0, 8)
 }
 
 /** Endpoint templates named inside free text (title/hypothesis), normalized. */
@@ -1963,6 +2084,20 @@ export interface AssignmentThroughputMetrics {
   containerReuseHitRate: number
   /** Warm pools retired because the run/tenant/credential-generation policy changed. */
   warmPoolPolicyRotations: number
+  /** Aggregated per-route proof-obligation stats forwarded from specialist sessions. */
+  proofObligation?: {
+    probedRoutes: number
+    coveredRoutes: number
+    gapRoutes: number
+    demandedRoutes: number
+    dischargedByGap: number
+  }
+  /** Aggregated coded proof-gap validation totals forwarded from specialist sessions. */
+  gapValidation?: {
+    accepted: number
+    rejected: number
+    byCode: Record<string, { accepted: number; rejected: number }>
+  }
 }
 
 /** Per-turn generation latencies: p50/p90 + how many turns crossed the stall flag threshold. */
@@ -2815,6 +2950,18 @@ export class Execution {
   private readonly turnLatencyByRun = new Map<string, number[]>()
   /** Turns saved by earned early exits (`agent.early_exit`) in this run. */
   private readonly earlyExitTurnsSavedByRun = new Map<string, number>()
+  private readonly proofObligationByRun = new Map<string, {
+    probedRoutes: number
+    coveredRoutes: number
+    gapRoutes: number
+    demandedRoutes: number
+    dischargedByGap: number
+  }>()
+  private readonly gapValidationByRun = new Map<string, {
+    accepted: number
+    rejected: number
+    byCode: Record<string, { accepted: number; rejected: number }>
+  }>()
   private readonly providerStallTurnsByRun = new Map<string, number>()
   private readonly providerStallRetriesByRun = new Map<string, number>()
   private readonly providerStallTimeoutsByRun = new Map<string, number>()
@@ -6326,6 +6473,18 @@ export class Execution {
         ? Math.round((containers.reused / containers.sessions) * 1000) / 1000
         : 0,
       warmPoolPolicyRotations: this.warmPoolPolicyRotationsByRun.get(runId) ?? 0,
+      ...(this.proofObligationByRun.has(runId) ? { proofObligation: { ...this.proofObligationByRun.get(runId)! } } : {}),
+      ...(this.gapValidationByRun.has(runId)
+        ? {
+            gapValidation: {
+              accepted: this.gapValidationByRun.get(runId)!.accepted,
+              rejected: this.gapValidationByRun.get(runId)!.rejected,
+              byCode: Object.fromEntries(
+                Object.entries(this.gapValidationByRun.get(runId)!.byCode).map(([k, v]) => [k, { ...v }]),
+              ),
+            },
+          }
+        : {}),
     }
     this.lastAssignmentMetrics.set(runId, metrics)
     try {
@@ -6462,6 +6621,73 @@ export class Execution {
       }),
     })
     return { ...coverage, tierAEndpoints }
+  }
+
+  /**
+   * Planner coverage assertion: before a dry/coordinator stop can terminate Phase B, ensure
+   * discovered high-risk unconfirmed endpoints (`riskScore >= 60`) have at least one first-pass
+   * investigation step queued (bounded to `min(6, remainingBudget)`).
+   */
+  private queueHighRiskCoverageSteps(
+    run: Run,
+    approvedOrigins: ReadonlySet<string>,
+    dynamicStepBudget: number,
+    existingSteps: readonly ChainStep[],
+  ): { seeded: number; endpoints: string[] } {
+    const remainingBudget = Math.max(0, dynamicStepBudget - existingSteps.length)
+    const cap = Math.min(6, remainingBudget)
+    if (cap <= 0) return { seeded: 0, endpoints: [] }
+    let endpoints: Array<{
+      origin: string
+      method: string
+      pathTemplate: string
+      riskScore: number
+      coveragePct?: number | null
+      testedClasses?: string[] | null
+    }> = []
+    try {
+      endpoints = this.storage.listEndpoints(run.id, { orderBy: 'risk', limit: 40 })
+    } catch {
+      return { seeded: 0, endpoints: [] }
+    }
+    const confirmedPaths = new Set(
+      this.alreadyConfirmedRefs(run, 100).map(ref => normalizeEndpointTemplate(ref.path)),
+    )
+    const coveredRoutes = new Set<string>()
+    for (const step of existingSteps) {
+      for (const route of this.stepMentionedRoutes(step)) coveredRoutes.add(route)
+    }
+    const candidates = selectUncoveredHighRiskEndpoints({
+      endpoints,
+      approvedOrigins,
+      confirmedPaths,
+      coveredRoutes,
+      minRisk: 60,
+      limit: cap,
+    })
+    const seededEndpoints: string[] = []
+    for (const ep of candidates) {
+      const asset = run.candidates.find(candidate => candidate.origin === ep.origin && run.approved.includes(candidate.id))
+      if (!asset) continue
+      const method = (ep.method || 'GET').toUpperCase()
+      const title = `High-risk route coverage · ${method} ${ep.pathTemplate}`
+      const hypothesis = `Discovered high-risk endpoint ${method} ${ep.pathTemplate} on ${ep.origin} (risk ${ep.riskScore}, coverage ${ep.coveragePct ?? 0}%) has no first-pass investigation yet. Probe authorization boundaries, state invariants, and input validation with control vs. variant evidence; submit a verified proof or coded record_coverage gap.`
+      const category = 'broken-access-control'
+      const specialistProfile = routeStepToSpecialist({ title, hypothesis, category, skills: [] })
+      this.storage.addChainStep(run, {
+        title,
+        hypothesis,
+        category,
+        priority: 70,
+        targetAssetIds: [asset.id],
+        skills: ['false-positive-elimination'],
+        dependsOnFactIds: [],
+        sourceOrigins: [ep.origin],
+        specialistProfile,
+      })
+      seededEndpoints.push(`${method} ${ep.pathTemplate}`)
+    }
+    return { seeded: seededEndpoints.length, endpoints: seededEndpoints }
   }
 
   /**
@@ -9308,6 +9534,36 @@ export class Execution {
         coverage = this.passOneCoverageFor(run, finalSteps)
       }
     }
+    // Planner coverage assertion: before honoring a dry/coordinator stop when budget/requests/wall
+    // remain, seed first-pass steps for discovered high-risk unconfirmed routes (`riskScore >= 60`).
+    const stopBudgetExhausted = this.storage.checkBudgetExceeded(run.id)
+    const stopRequestExhausted = latest.budgetRequests > 0 && latest.budgetRequests - latest.spentRequests <= 0
+    const stopWallExhausted = this.maxDurationMs > 0 && latest.createdAt + this.maxDurationMs <= Date.now()
+    let highRiskSeededAtStop = 0
+    if (decision.decision === 'stop' && !stopBudgetExhausted && !stopRequestExhausted && !stopWallExhausted) {
+      const seededHighRisk = this.queueHighRiskCoverageSteps(
+        this.storage.run(run.id),
+        this.approvedOriginsSet(run),
+        computeDynamicStepBudget(this.storage, run.id),
+        finalSteps,
+      )
+      if (seededHighRisk.seeded > 0) {
+        highRiskSeededAtStop = seededHighRisk.seeded
+        funnel.planned += seededHighRisk.seeded
+        funnel.enqueued += seededHighRisk.seeded
+        finalSteps = this.storage.listChainSteps(run.id, latest.goalRevision)
+        remainingReady = dispatchableReadySteps(finalSteps, finalFactIds).length
+        coverage = this.passOneCoverageFor(run, finalSteps)
+        try {
+          this.storage.event(
+            run.id,
+            'planner.high_risk_coverage_assert',
+            `Planner coverage assertion seeded ${seededHighRisk.seeded} uncovered high-risk route(s) before stop.`,
+            { roundNo, seeded: seededHighRisk.seeded, endpoints: seededHighRisk.endpoints },
+          )
+        } catch { /* telemetry is best-effort */ }
+      }
+    }
     // An uncovered Tier-A lead with no approved asset/route binding cannot be dispatched by any
     // lane; report it loudly instead of spinning the stop guard forever.
     const tierAUnseedable = coverage.uncoveredTierAEndpoints.length > 0 &&
@@ -9333,9 +9589,9 @@ export class Execution {
       remainingReady,
       freeSlots: Math.max(0, maxConc - activeForRun),
       inFlight: activeForRun,
-      budgetExhausted: this.storage.checkBudgetExceeded(run.id),
-      requestExhausted: latest.budgetRequests > 0 && latest.budgetRequests - latest.spentRequests <= 0,
-      wallExhausted: this.maxDurationMs > 0 && latest.createdAt + this.maxDurationMs <= Date.now(),
+      budgetExhausted: stopBudgetExhausted,
+      requestExhausted: stopRequestExhausted,
+      wallExhausted: stopWallExhausted,
       uninvestigatedFirstPassClasses: tierAUnseedable ? [] : coverage.uninvestigatedFirstPassClasses,
       uncoveredTierAEndpoints: tierAUnseedable ? [] : coverage.uncoveredTierAEndpoints,
     })
@@ -9369,6 +9625,7 @@ export class Execution {
       uninvestigatedFirstPassClassesAtStop: stopped ? coverage.uninvestigatedFirstPassClasses.length : 0,
       filteredByReason,
       ...(tierASeededAtStop > 0 ? { tierASeededAtStop } : {}),
+      ...(highRiskSeededAtStop > 0 ? { highRiskSeededAtStop } : {}),
       ...(tierAUnseedable ? { tierAUnseedable: true } : {}),
     }
     if (stopped) {
@@ -9627,7 +9884,18 @@ export class Execution {
     // never killed. The old 45–90 s generation watchdog stays only as the wall-saved baseline.
     const turnLatencies: number[] = []
     let generationStartedAt: number | undefined
-    const noTokenMs = resolveProviderStallNoTokenMs()
+    // Profile-aware no-token watchdog (backed by real-time per-frame SSE activity resets in
+    // provider-stream.ts + provider.ts): reasoning/thinking profiles get 45–60 s TTFT headroom.
+    const watchdogSpecialist = resolveSpecialistProfile(
+      step.specialistProfile ?? routeStepToSpecialist({
+        title: step.title,
+        hypothesis: step.hypothesis,
+        category: step.category,
+        skills: step.skills,
+      }),
+    )
+    const primaryProfile = resolveProfilePoolForRole(watchdogSpecialist.roleAffinity, profiles)[0] ?? profiles[0]
+    const noTokenMs = resolveProfileNoTokenWatchdogMs(primaryProfile)
     // Always the full no-token window. Never shrink it near the assignment wall: that turned
     // healthy-but-slow final turns into "stalls", burning a bounded retry on work the wall budget
     // was already going to settle.
@@ -11503,6 +11771,12 @@ export class Execution {
         maxTurns: job.assignment.maxTurns,
       })
       const runTrace = this.ensureRunTrace(run, profiles)
+      const assignedTargetRoutes = extractAssignedTargetRoutes({
+        title: step.title,
+        hypothesis: step.hypothesis,
+        parentFacts,
+        defaultOrigin: targetOrigins[0],
+      })
 
       const sessionResult = await runAgentSession({
         directory: this.storage.directory,
@@ -11589,6 +11863,53 @@ export class Execution {
         },
         onProfileSuccess: id => recordProfileSuccess(id, this.storage),
         onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
+        approvedOrigins: [...permittedAtAdmission],
+        ...(assignedTargetRoutes.length ? { assignedTargetRoutes } : {}),
+        onProofObligation: (info: ProofObligationEvent) => {
+          const prev = this.proofObligationByRun.get(run.id) ?? {
+            probedRoutes: 0,
+            coveredRoutes: 0,
+            gapRoutes: 0,
+            demandedRoutes: 0,
+            dischargedByGap: 0,
+          }
+          this.proofObligationByRun.set(run.id, {
+            probedRoutes: prev.probedRoutes + info.probedRoutes,
+            coveredRoutes: prev.coveredRoutes + info.coveredRoutes,
+            gapRoutes: prev.gapRoutes + info.gapRoutes,
+            demandedRoutes: prev.demandedRoutes + info.demandedRoutes,
+            dischargedByGap: prev.dischargedByGap + info.dischargedByGap,
+          })
+          try {
+            this.storage.event(
+              run.id,
+              'agent.proof_obligation',
+              `Proof obligation: ${info.coveredRoutes}/${info.probedRoutes} probed route(s) covered, ${info.gapRoutes} gap(s), ${info.demandedRoutes} demanded.`,
+              { assignmentId: job.assignment.id, stepId: step.id, ...info },
+            )
+          } catch { /* telemetry is best-effort */ }
+        },
+        onGapValidation: (info: GapValidationEvent) => {
+          const prev = this.gapValidationByRun.get(run.id) ?? { accepted: 0, rejected: 0, byCode: {} }
+          const byCode: Record<string, { accepted: number; rejected: number }> = { ...prev.byCode }
+          for (const [code, counts] of Object.entries(info.byCode)) {
+            const cur = byCode[code] ?? { accepted: 0, rejected: 0 }
+            byCode[code] = { accepted: cur.accepted + counts.accepted, rejected: cur.rejected + counts.rejected }
+          }
+          this.gapValidationByRun.set(run.id, {
+            accepted: prev.accepted + info.accepted,
+            rejected: prev.rejected + info.rejected,
+            byCode,
+          })
+          try {
+            this.storage.event(
+              run.id,
+              'agent.gap_validation',
+              `Gap validation: ${info.accepted} accepted, ${info.rejected} rejected.`,
+              { assignmentId: job.assignment.id, stepId: step.id, ...info },
+            )
+          } catch { /* telemetry is best-effort */ }
+        },
         onEarlyExit: info => {
           this.earlyExitTurnsSavedByRun.set(run.id,
             (this.earlyExitTurnsSavedByRun.get(run.id) ?? 0) + info.turnsSaved)
