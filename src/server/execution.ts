@@ -257,7 +257,7 @@ function alignFindingForEvidence(
   return { ...finding, cwe: label.cwe, category: label.category }
 }
 import { availableReviewChecks, parseReviewPlan, reviewPlanPrompt, standardChecks } from './review-plan.ts'
-import { approvalRequests, canaries, findings, messages, replaySpecs } from './schema.ts'
+import { approvalRequests, canaries, findings, messages } from './schema.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
 import { tenantTagForRun } from './scope-policy.ts'
 import { dedupeCodeAuditSuspects, runThreeStageSemanticAudit, runVariantSweepForFinding, toChainStepInputs } from './semantic-audit.ts'
@@ -7906,7 +7906,14 @@ export class Execution {
     })
 
     const findingId = randomUUID()
-    const specRow = this.storage.createReplaySpec(run, assignment, findingId, spec, origins)
+    const specRow = this.storage.createReplaySpec(run, assignment, findingId, spec, origins, {
+      verifiedInline: true,
+      // Persist the engine's own confirming verdict on the spec so the finding's evidence is
+      // self-describing (confirmed ⇒ the linked persisted diff confirms).
+      lastVerificationDiff: buildInlineVerifyFeedback(
+        spec, confirmed.result, 1, maxInlineVerifyRetries, secrets,
+      ),
+    })
     const artifact = this.storage.addArtifact(
       run,
       assignment,
@@ -11461,9 +11468,14 @@ export class Execution {
           currentSecrets(),
         )
         phaseFeedback = rawFeedback
-        this.storage.db.update(replaySpecs).set({
-          lastVerificationDiff: rawFeedback,
-        }).where(eq(replaySpecs.id, specRow.id)).run()
+        // Route the diff through the store so a non-confirming retest of an already-confirmed
+        // finding demotes it (and is counted) instead of leaving a confirmed claim contradicted.
+        this.storage.recordReplaySpecVerification(
+          current.id,
+          specRow.id,
+          rawFeedback,
+          `phase3 ${specRow.spec.kind} attempt ${specRow.attemptCount} returned ${finalStatus}`,
+        )
         this.storage.updateProposedFinding(current, findingRow.id, {
           verificationTier: null,
           finding: updatedFinding,
@@ -11639,11 +11651,17 @@ export class Execution {
               finding: { status: 'inconclusive', verificationTier: undefined, reason: deniedReason, confidence: 'low' },
             })
           }
+          const deniedRun = this.check(params.job)
+          const deniedRow = findingRow
+            ? this.storage.db.select().from(findings).where(and(
+                eq(findings.runId, deniedRun.id), eq(findings.id, findingRow.id),
+              )).get()
+            : undefined
           return {
             findingId: findingRow?.id,
             replaySpecId: updatedSpec.id,
             attemptCount: updatedSpec.attemptCount,
-            status: findingRow && isAlreadyVerified ? findingRow.finding.status : 'inconclusive',
+            status: deniedRow?.finding.status ?? 'inconclusive',
             feedback: deniedFeedback,
           }
         }
@@ -11825,9 +11843,18 @@ export class Execution {
       }
     }
 
-    const verdictStatus = findingRow && isAlreadyVerified ? findingRow.finding.status : finalStatus
-    const verdictTier = findingRow && isAlreadyVerified ? (findingRow.verificationTier ?? undefined) : verificationTier
-    this.postVerificationVerdict(this.storage.run(params.job.assignment.runId), {
+    // The persisted row is the single source of truth: a non-confirming attempt may have just
+    // demoted an already-confirmed finding (finding.confirmation_conflict). Never report the
+    // pre-attempt status in that case.
+    const verdictRun = this.storage.run(params.job.assignment.runId)
+    const verdictRow = findingRow
+      ? this.storage.db.select().from(findings).where(and(
+          eq(findings.runId, verdictRun.id), eq(findings.id, findingRow.id),
+        )).get()
+      : undefined
+    const verdictStatus = verdictRow?.finding.status ?? finalStatus
+    const verdictTier = verdictRow?.verificationTier ?? (verdictStatus === 'confirmed' ? verificationTier : undefined)
+    this.postVerificationVerdict(verdictRun, {
       replaySpecId: updatedSpec.id,
       findingId: findingRow?.id ?? params.findingId ?? null,
       title: parsed.title,
