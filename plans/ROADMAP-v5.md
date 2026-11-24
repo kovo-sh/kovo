@@ -554,3 +554,18 @@ Follow-ups created: (a) status-divergent boolean receipt rule in `oracle-invaria
 2. The grounded-SQLi fix was built on a stale base and violated leases → parked; re-landed cleanly on main by `sqli-baseline2`.
 
 **Tooling:** `worker-gate.sh` lease guard now has a documented coordinator override (`WORKER_GATE_ALLOW_DIRTY_MAIN=1`) so the coordinator can validate its own in-flight edits while subagents stay blocked. Stale `v5-agentic-lane` test replaced: it referenced the `submitProofSpec` internal retired in M0 Cut 1, and now pins the live `verifierRepairFeedback` contract.
+
+### 2026-11-24 — grounded SQLi arms (probe-only) + the real held-out blocker: zero discovered params
+
+**Probe-side fix validated (`agents/sqli-baseline` @ `e7ccd6d`, probe + test only after the lease revert):** the boolean probe now sends one benign empty-term request, harvests a literal operand from the returned rows, and uses it for the baseline and every shape, with the tautology pair as the only fallback. Measured arms on held-out shopflow `product-search-sqli`:
+
+| | baseline | true arm | false arm | result |
+|---|---|---|---|---|
+| before | `Item` → 3 rows | 0 rows | 0 rows | no separation; dismissed |
+| after | `Item 1` → 1 row | **1 row, 200** | **0 rows, 200** | 2/2 rounds pass; `provenStyle=single_quote` |
+
+xben stayed 25/25 (the probe maps `tautology` → `or_branch` so legacy builders still replay correctly), dev floor 33/59 at 100%, held-out 24/58 at 100%.
+
+**But two replay-side edits are still required for the +1, and a bigger blocker sits underneath.** With the grounded pair the replay dismisses on `simBaselineTrue = 0.8333 < 0.9` because the echoed `{"query":…}` contains the payload and `k` tokens; scrubbing the reflected request value yields `1.0` and confirms 3/3 (verified on a scratch copy). Those edits (`replay-verifier` scrub, `deterministic-specs` grounded pair) are being re-landed by `sqli-baseline2` **only where the live path still reaches them** after Cut 3a.
+
+**The blocker that actually holds held-out at 24/58:** the floor never forms an sqli hypothesis for `/api/v1/search` because recon stores **zero `endpoint_params`** for that route (`bucket=hypothesis_miss`). No pair fix can help a route the floor cannot describe. New stream `param-discovery` derives candidate params from evidence the crawler already holds (link query keys, form fields, XHR/GraphQL args, bundle literals near the path, schema docs) with `observed` vs `inferred` provenance — inferred params may form a hypothesis but can never create a confirmation.
