@@ -105,15 +105,39 @@ Tier-A). Confirmed claims: `cross_tenant_read GET /v2/billing/invoices/<id>` and
 
 ### Stop metrics before → after
 
-| reading | before | after |
-|---|---|---|
-| stop-time coverage event | none (`dry_rounds` could stop in front of Pass-1) | `planner.coverage_at_stop` on every stop |
-| Tier-A first-slot seeding | gate required runtime contrast evidence → Tier-A deferred | seeded at priority 90, cap-exempt |
-| `remainingReadyAtStop` invariant | held only when `remainingReady === 0` or busy fleet | also enforced by first-pass/Tier-A coverage |
-| 4-hop funnel (`--no-llm`) | 0/2/2 dispatched, 0 verify, 0 confirmed | 3/3 dispatched + hit, 2 verify, 2 confirmed |
+Measured on the agentic monorepo cell (`/tmp/opencode/re4-agentic2`, 600 s, docker, kept data dir):
 
-The agentic stop-count table is produced from `planner.coverage_at_stop` on the next agentic cell;
-it is not fabricated here (no agentic cell is part of this stream's measured acceptance).
+| reading | before (planning snapshot) | after (this branch) |
+|---|---|---|
+| planned steps reaching dispatch | 5/21 acme, 10/24 opsportal, 13/23 shopflow (24–59%) | 3/3 Tier-A seeded at priority 90 before Round 1 |
+| Tier-A seeded | gate required runtime contrast → deferred | 4 steps (`deterministic_lane.tier_a_seeded`), all priority 90 |
+| `dry_rounds` stops with Pass-1 work | possible (2-dry-round stop) | **0 dry stops**; 5 dry-round readings all reset by new primitives |
+| `remainingReady` / stranded | ready work abandoned at stop | 24–35 ready, `planner.ready_steps_stranded = 0` |
+| `planner.coverage_at_stop` | no such reading | emitted on every real stop (this cell ended on the harness wall clock, not a planner stop) |
+| 4-hop funnel (`--no-llm`) | 0/0/0 dispatched, 0 verify, 0 confirmed | 3/3 dispatched + hit, 2 slices verify-called, 2 confirmed @100% |
+| 4-hop funnel (agentic, 600 s) | — | dispatched 8/3/5, route-hit 7/2/5, verify 6/1/2, 2/3 confirmed |
+
+Agentic note: the same cell submitted two `open_proof_gap` admin-BFLA claims with the generic OWASP
+bucket `broken-access-control`, which the realism grader cannot match to the `bfla` truth (2
+unmatched submissions, submission precision 50%). No **confirmed** finding was false (2 TP / 0
+confirmed FP), and the two gaps are the expected `no_spec_submitted` shape, not a forced claim.
+Canonical class labelling for agentic submissions belongs to the agent/spec stream, not this lease.
+
+## Validation (all measured on this branch)
+
+| gate | result |
+|---|---|
+| `npm run check` | pass |
+| `tests/v7-realism4-convert.test.ts` | 15/15 pass |
+| `tests/v7-whitebox-wire.test.ts`, `tests/v7-brief-slice.test.ts`, `tests/v6-phaseb-dispatch.test.ts`, `tests/v7-dispatch-funnel.test.ts` | 61/61 pass |
+| `scripts/worker-gate.sh` | **PASS** |
+| realism #4 `--no-llm`, docker | wiring PASS (5,163/2,565, p99 0.55 ms, Tier-A 3/3); **3/3 dispatched + hit, 2/3 verify, 2/3 confirmed, 100%** |
+| dev floor `Execution --no-llm` seed 1 | **36/59 (61.0%)** — acme 14/22, shopflow 12/19, opsportal 10/18; 100%, 0 decoy, 0 unmatched |
+| xben-25 | **25/25**, 100%, 0 FP |
+| held-out-saas | **20/20**, 100%, 0 FP, patches **20/20 reproduced → 20/20 fixed**, all-patches `fixed` |
+
+(The dev 36/59 is the product harness `scripts/benchmark-realistic.ts`; the capability harness
+`benchmarks/realistic-bench` reports 29–30/59 on this host, unchanged from the base commit.)
 
 ## Remaining gap / owner
 
