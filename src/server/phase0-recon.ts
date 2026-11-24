@@ -166,6 +166,8 @@ export interface CrawlStateGraphResult {
   visibleToPersonas?: Record<string, string[]>
   /** Privileged/admin routes discovered through the persona union, surfaced immediately. */
   privilegedEndpoints?: Array<{ method: string; pathTemplate: string; personas: string[]; reason: string }>
+  /** Full-surface paged read the crawl's route lookups ran against (see `phase0.crawl_paged`). */
+  crawlPaged?: PagedReadMetric
 }
 
 export interface StaticExtractedRoute {
@@ -4735,6 +4737,56 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
   const visibility = new Map<string, Set<string>>()
   const privilegedByKey = new Map<string, { method: string; pathTemplate: string; personas: string[]; reason: string }>()
 
+  // Intercepted-query, Next-Action and persona-union lookups must see the whole stored surface.
+  // `storage.listEndpoints(runId, { origin })` pages at the store default (500 rows) and silently
+  // truncates large apps, so those lookups go through one paged index in the store's stable
+  // (risk, coverage, id) order and report a `phase0.crawl_paged` metric.
+  const crawlPagedMetric: PagedReadMetric = {
+    phase: 'state_graph',
+    origin: normalizedOrigin,
+    considered: 0,
+    used: 0,
+    truncated: false,
+    reads: 0,
+    pages: 0,
+  }
+  const crawlRouteKey = (method: string, pathTemplate: string): string =>
+    `${method.trim().toUpperCase()} ${pathTemplate.trim()}`
+  let crawlSurfaceIndex: Map<string, EndpointRow> | null = null
+  let crawlPagedKeys = new Set<string>()
+  const crawlResolvedKeys = new Set<string>()
+  /** Load the full-origin index once; later upserts are folded in by `noteCrawlEndpoint`. */
+  const crawlSurface = (): Map<string, EndpointRow> => {
+    if (crawlSurfaceIndex) return crawlSurfaceIndex
+    const rows = listEndpointsPaged(storage, runId, { origin: normalizedOrigin })
+    const index = new Map<string, EndpointRow>()
+    const pagedKeys = new Set<string>()
+    // Paged order is deterministic (risk desc, coverage asc, id asc); first row wins a duplicate
+    // route key so the index keeps the store's priority order and never double-counts a route.
+    for (const row of rows) {
+      const key = crawlRouteKey(row.method, row.pathTemplate)
+      if (!index.has(key)) index.set(key, row)
+      pagedKeys.add(key)
+    }
+    crawlSurfaceIndex = index
+    crawlPagedKeys = pagedKeys
+    crawlPagedMetric.considered += rows.length
+    crawlPagedMetric.reads += 1
+    crawlPagedMetric.pages += Math.max(1, Math.ceil(rows.length / ENDPOINT_PAGE_SIZE))
+    return index
+  }
+  /** Keep a freshly upserted row visible to later lookups without re-reading the whole surface. */
+  const noteCrawlEndpoint = (row: EndpointRow): EndpointRow => {
+    if (crawlSurfaceIndex) crawlSurfaceIndex.set(crawlRouteKey(row.method, row.pathTemplate), row)
+    return row
+  }
+  const findCrawlEndpoint = (method: string, pathTemplate: string): EndpointRow | undefined => {
+    const key = crawlRouteKey(method, pathTemplate)
+    const hit = crawlSurface().get(key)
+    if (hit && crawlPagedKeys.has(key)) crawlResolvedKeys.add(key)
+    return hit
+  }
+
   const tagVisibility = (method: string, rawPath: string, who: string): void => {
     const bare = rawPath.split('?')[0] || '/'
     const tmpl = normalizeDiscoveryTemplate(bare)
@@ -4754,7 +4806,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
     if (!cleanAction) return
     const method = (methodRaw || 'GET').toUpperCase()
     const pathTemplate = normalizeRouteTemplate(cleanAction)
-    const ep = storage.upsertEndpoint({
+    const ep = noteCrawlEndpoint(storage.upsertEndpoint({
       runId,
       scopeRevision,
       origin: normalizedOrigin,
@@ -4762,7 +4814,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
       pathTemplate,
       source: 'spa_crawl',
       riskScore: scoreEndpointRisk(method, pathTemplate),
-    })
+    }))
     tagVisibility(method, pathTemplate, who)
     endpointsDiscovered += 1
     for (const name of inputNames) {
@@ -4902,7 +4954,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
 
       // Record visited route
       const routeTemplate = normalizeRouteTemplate(next.pathAndQuery)
-      const routeEp = storage.upsertEndpoint({
+      const routeEp = noteCrawlEndpoint(storage.upsertEndpoint({
         runId,
         scopeRevision,
         origin: normalizedOrigin,
@@ -4911,7 +4963,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
         source: 'spa_crawl',
         authRequirement: persona ? `persona:${persona}` : null,
         riskScore: scoreEndpointRisk('GET', routeTemplate),
-      })
+      }))
       tagVisibility('GET', routeTemplate, who)
       endpointsDiscovered += 1
 
@@ -5007,7 +5059,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
         if (!shape) continue
         const tmpl = normalizeRouteTemplate(shape.path)
         const src: EndpointSource = /graphql|trpc/i.test(tmpl) ? 'graphql' : 'spa_crawl'
-        const ep = storage.upsertEndpoint({
+        const ep = noteCrawlEndpoint(storage.upsertEndpoint({
           runId,
           scopeRevision,
           origin: normalizedOrigin,
@@ -5016,7 +5068,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
           source: src,
           authRequirement: persona ? `persona:${persona}` : null,
           riskScore: scoreEndpointRisk(shape.method, tmpl),
-        })
+        }))
         tagVisibility(shape.method, tmpl, who)
         endpointsDiscovered += 1
         for (const p of shape.params) {
@@ -5037,8 +5089,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
       for (const ex of visit.exchanges) {
         if (ex.origin !== normalizedOrigin) continue
         const tmpl = normalizeRouteTemplate(ex.pathAndQuery)
-        const known = storage.listEndpoints(runId, { origin: normalizedOrigin })
-          .find(e => e.method === ex.method.toUpperCase() && e.pathTemplate === tmpl)
+        const known = findCrawlEndpoint(ex.method, tmpl)
         if (known) {
           const shape = inferXhrRequestShape({ url: ex.pathAndQuery, method: ex.method })
           for (const p of shape?.params ?? []) {
@@ -5057,7 +5108,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
         }
         const nextAction = ex.reqHeaders['next-action']
         if (nextAction) {
-          storage.upsertEndpoint({
+          noteCrawlEndpoint(storage.upsertEndpoint({
             runId,
             scopeRevision,
             origin: normalizedOrigin,
@@ -5067,10 +5118,9 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
             framework: 'nextjs',
             sinkKinds: ['server_action'],
             riskScore: 88,
-          })
+          }))
           endpointsDiscovered += 1
-          const actionEp = storage.listEndpoints(runId, { origin: normalizedOrigin })
-            .find(e => e.method === ex.method.toUpperCase() && e.pathTemplate === tmpl)
+          const actionEp = findCrawlEndpoint(ex.method, tmpl)
           if (actionEp) {
             storage.upsertEndpointParam({
               runId,
@@ -5136,10 +5186,9 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
     if (reasons.length === 0) continue
     privilegedByKey.set(key, { method, pathTemplate, personas, reason: reasons.join('+') })
     try {
-      const existing = storage.listEndpoints(runId, { origin: normalizedOrigin })
-        .find(ep => ep.method === method && ep.pathTemplate === pathTemplate)
+      const existing = findCrawlEndpoint(method, pathTemplate)
       if (existing) {
-        storage.upsertEndpoint({
+        noteCrawlEndpoint(storage.upsertEndpoint({
           runId,
           scopeRevision,
           origin: normalizedOrigin,
@@ -5148,7 +5197,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
           source: existing.source,
           authRequirement: rolePersonas.map(handle => `persona:${handle}`).join(',') || null,
           riskScore: isPrivilegedPathTemplate(pathTemplate) ? Math.max(existing.riskScore, 85) : existing.riskScore,
-        })
+        }))
       }
     } catch { /* visibility tagging is best-effort */ }
   }
@@ -5157,6 +5206,16 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
     storage.event(runId, 'phase0.privileged_surface',
       `Persona union surfaced ${privilegedEndpoints.length} privileged/role-restricted route(s).`,
       { origin: normalizedOrigin, routes: privilegedEndpoints.slice(0, 20) })
+  }
+  // Crawl-read accounting: `considered` is every stored row the index paged through, `used` is the
+  // distinct route keys a lookup resolved from it, and `truncated` is always false because the read
+  // pages until a short page proves completeness. Routes inserted during the crawl are folded into
+  // the index without re-paging, so they never inflate `used` beyond what the paged read supplied.
+  crawlPagedMetric.used = crawlResolvedKeys.size
+  if (crawlPagedMetric.reads > 0) {
+    storage.event(runId, 'phase0.crawl_paged',
+      `State-graph crawl read ${crawlPagedMetric.considered} endpoint row(s) across ${crawlPagedMetric.pages} page(s); ${crawlPagedMetric.used} route(s) resolved.`,
+      crawlPagedMetric)
   }
 
   return {
@@ -5169,6 +5228,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
     personasCrawled,
     routeMapEndpoints,
     visibleToPersonas,
+    ...(crawlPagedMetric.reads > 0 ? { crawlPaged: { ...crawlPagedMetric } } : {}),
     ...(privilegedEndpoints.length > 0 ? { privilegedEndpoints } : {}),
     ...(stoppedReason ? { stoppedReason } : {}),
   }
