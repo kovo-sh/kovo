@@ -730,82 +730,16 @@ test('M1.5: sql_boolean_diff and sql_time_diff report every round summary', () =
   assert.equal(timingFeedback.sqlRoundSummaries?.[0].probeMs, 40)
 })
 
-test('M1.5: Phase-3 refinement is gated by strong pre-signals and a hard <=10 job cap', async (t) => {
-  const storage = makeStore(t)
-  const { run, asset, worker } = await seedRunWithWorker(storage)
-  const execution = new Execution(storage)
-  t.after(() => execution.stop())
-
-  const privateExec = execution as unknown as {
-    hasStrongPreVerificationSignal: (
-      run: Run,
-      row: { finding: Finding },
-      specRow: { spec: { kind: string } },
-      feedback?: unknown,
-    ) => boolean
-    markRefinementEligible: (runId: string, specId: string) => void
-    isRefinementEligible: (runId: string, specId: string) => boolean
-    refinementBudgetRemaining: (runId: string) => number
-  }
-
-  const weakFinding = { finding: { status: 'inconclusive' } as Finding }
-  // A plain http_chain with a failed control and no linked evidence is NOT worth an LLM pass.
-  assert.equal(privateExec.hasStrongPreVerificationSignal(run, weakFinding, { spec: { kind: 'http_chain' } }, { controlPassed: false }), false)
-  // A differential kind whose control passed is.
-  assert.equal(privateExec.hasStrongPreVerificationSignal(run, weakFinding, { spec: { kind: 'sql_boolean_diff' } }, { controlPassed: true }), true)
-  // A triggered canary is.
-  assert.equal(privateExec.hasStrongPreVerificationSignal(run, weakFinding, { spec: { kind: 'http_chain' } }, { controlPassed: false, canaryTriggered: true }), true)
-  // Static-only proofs never consume refinement budget.
-  assert.equal(privateExec.hasStrongPreVerificationSignal(run, weakFinding, { spec: { kind: 'static_ast_proof' } }, { controlPassed: true }), false)
-
-  // Linked SAST suspects count as strong pre-signals.
-  storage.addFact(run, worker, {
-    kind: 'code_audit_suspect',
-    origin: asset.origin,
-    summary: 'Suspect sink without an ownership predicate.',
-    data: { subkind: 'code_audit_suspect', repo: 'r', file: 'a.ts', line: 1, sinkKind: 'api_route' },
-  })
-  const suspectFactId = storage.listFacts(run.id, { includeTainted: false, limit: 50 })[0].id
-  assert.equal(privateExec.hasStrongPreVerificationSignal(
-    run,
-    { finding: { status: 'inconclusive', chainFactIds: [suspectFactId] } as Finding },
-    { spec: { kind: 'http_chain' } },
-    { controlPassed: false },
-  ), true)
-
-  // Eligibility bookkeeping + cap.
-  assert.equal(privateExec.refinementBudgetRemaining(run.id), 10)
-  privateExec.markRefinementEligible(run.id, 'spec-1')
-  assert.equal(privateExec.isRefinementEligible(run.id, 'spec-1'), true)
-  assert.equal(privateExec.isRefinementEligible(run.id, 'spec-2'), false)
-
-  for (let i = 0; i < 10; i += 1) {
-    storage.makeWorker(run, 'verification', asset, `Refine replay ${i}`, 'Bounded refinement.', {
-      stepId: `refine:spec-${i}`,
-      sourceOrigins: [asset.origin],
-      maxTurns: 8,
-    })
-  }
-  assert.equal(privateExec.refinementBudgetRemaining(run.id), 0)
-  assert.equal(maxPhase3RefinementJobsForTest(), 10)
-})
-
-function maxPhase3RefinementJobsForTest(): number {
-  const match = /const maxPhase3RefinementJobs = (\d+)/.exec(executionSource)
-  return match ? Number(match[1]) : 0
-}
-
-test('M1.5: refinement dispatch is wired from driveVerification and re-checks the run cap', () => {
-  const driveBlock = /private driveVerification\(run: Run\) \{[\s\S]{0,12000}?for \(const row of pendingFindings\)/.exec(executionSource)?.[0] ?? ''
-  assert.ok(driveBlock, 'driveVerification block not found')
-  assert.ok(driveBlock.includes('eligibleRefineSpecIds'))
-  assert.ok(driveBlock.includes('this.refinementBudgetRemaining(run.id)'))
-  assert.ok(driveBlock.includes('refine:${specId}'))
-  assert.ok(/refinement\.dispatched/.test(driveBlock))
-  // Inline failures mark eligibility; the normal verification path re-checks it before refining.
-  assert.ok(executionSource.includes('this.markRefinementEligible(latestRun.id, updatedSpec.id)'))
-  assert.ok(/this\.refinementBudgetRemaining\(current\.id\) > 0/.test(executionSource))
-  assert.ok(/if \(strongPreSignal\) this\.markRefinementEligible/.test(executionSource))
+test('M0: Phase-3 DSL refinement queues are retired from execution.ts', () => {
+  // v7 M0 cut 1: the bounded Phase-3 reasoning pass existed only to repair a broken declarative
+  // spec. Agents prove with executable scripts now, so neither the eligibility queue nor the
+  // refine:<specId> worker lane may remain wired into the engine.
+  assert.ok(!executionSource.includes('refinementEligible'))
+  assert.ok(!executionSource.includes('maxPhase3RefinementJobs'))
+  assert.ok(!executionSource.includes('runPhase3RefinementJob'))
+  assert.ok(!executionSource.includes('markRefinementEligible'))
+  assert.ok(!/stepId: `refine:/.test(executionSource))
+  assert.ok(!executionSource.includes('Phase-3 refinement'))
 })
 
 test('M1: project schema helper stays usable (guards against accidental import drift)', () => {
