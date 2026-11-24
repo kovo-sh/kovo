@@ -107,12 +107,15 @@ import type { ExistingFindingRef } from './dedupe.ts'
 import {
   cleanupStagedEntities,
   extractCreatedId,
+  hasDynamicIdSegment,
+  identifierFormsForRoute,
   intentFamily,
   runDeterministicEngine,
   stagingProbeTag,
   tagStagingEntityBody,
 } from './deterministic-engine.ts'
-import type { EngineConfirmed, EngineEndpoint, EngineLead, EnginePersona } from './deterministic-engine.ts'
+import type { EngineConfirmed, EngineEndpoint, EngineHypothesis, EngineLead, EnginePersona } from './deterministic-engine.ts'
+import { injectUniversalParam } from './probes/context.ts'
 import { checkCoverage, meetsBaseline, readComparisons, verificationCommand } from './evidence-checks.ts'
 import type { EvidenceReview } from './evidence-checks.ts'
 import { listMountedRepos, parseDependenciesFromFile, projectReposDir } from './github-connector.ts'
@@ -227,6 +230,104 @@ export function probeSelectionMetrics(selection: Pick<ProbeSelection<unknown>, '
     probeCap: selection.cap,
     storedRows: selection.storedRows,
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Realism #4 — Tier-A code-lead dispatch priority
+//
+// The engine ranks every candidate route by static risk and then takes a bounded prefix. On a
+// 2,500-route monorepo the generic generated routes (risk 83–95) fill that prefix and the
+// hypothesis-linked white-box sinks (hand-written GET sinks score lower) never reach the harvest.
+// A code lead is a Tier-A hypothesis, not a long-tail route: it must outrank generic schema-typed
+// routes for the probe prefix. This does not widen the cap; it only orders it.
+// ---------------------------------------------------------------------------------------------
+
+/** Risk floor applied to Program-Graph code-lead routes for the engine's bounded probe prefix. */
+export const CODE_LEAD_PRIORITY_RISK = 240
+/** Concrete identifier-form read targets derived per Tier-A code-lead object route. */
+export const CODE_LEAD_IDENTIFIER_FORMS_PER_ROUTE = 2
+
+export interface CodeLeadTarget {
+  origin: string
+  method: string
+  pathTemplate: string
+  riskScore: number
+  source?: string
+  params: Array<{ name: string; location: string }>
+}
+
+/**
+ * Raise code-lead routes above generic routes for the engine's risk-ranked probe prefix.
+ * Pure: only the risk score changes, identity and params are preserved.
+ */
+export function prioritizeCodeLeadTargets<T extends { riskScore: number }>(targets: readonly T[]): T[] {
+  return targets.map(target => (
+    target.riskScore >= CODE_LEAD_PRIORITY_RISK
+      ? target
+      : { ...target, riskScore: CODE_LEAD_PRIORITY_RISK }
+  ))
+}
+
+/**
+ * Derive bounded, concrete read targets for a code-lead object route.
+ *
+ * A white-box sink route such as `GET /<svc>/invoices/:id` has no readable collection on the
+ * target, so the engine's harvester has no identifier to bind an authz read to. The target's own
+ * declared tenants plus the route noun give a small, deterministic set of identifier forms
+ * (`<noun>-<tenant>-<n>`), and a benign read of those forms seeds the engine's per-origin id pool.
+ * Derived targets are read-only, deduped against the stored surface and capped; they add no proof
+ * primitive and never bypass the differential verifier.
+ */
+export function deriveCodeLeadIdentifierTargets(input: {
+  targets: readonly CodeLeadTarget[]
+  /** Tenant labels declared by the run's personas (e.g. `tenant-alpha`). */
+  tenants: readonly string[]
+  existing: readonly { origin: string; method: string; pathTemplate: string }[]
+  perRoute?: number
+}): CodeLeadTarget[] {
+  const perRoute = Math.max(0, Math.min(input.perRoute ?? CODE_LEAD_IDENTIFIER_FORMS_PER_ROUTE, 4))
+  if (perRoute === 0 || input.tenants.length === 0) return []
+  const seen = new Set(input.existing.map(route =>
+    `${route.origin}|${route.method.toUpperCase()}|${route.pathTemplate}`))
+  const out: CodeLeadTarget[] = []
+  for (const target of [...input.targets].sort((a, b) =>
+    a.pathTemplate.localeCompare(b.pathTemplate) || a.method.localeCompare(b.method))) {
+    if (target.method.toUpperCase() !== 'GET') continue
+    const template = target.pathTemplate.split('?')[0] || '/'
+    if (!hasDynamicIdSegment(template)) continue
+    const forms = identifierFormsForRoute(template, input.tenants).slice(0, perRoute)
+    for (const form of forms) {
+      const pathTemplate = template.replace(
+        /(?:\/:[A-Za-z_][A-Za-z0-9_]*|\/\{[A-Za-z0-9_]+\}|\/\[[^\]]+\])/,
+        `/${encodeURIComponent(form)}`,
+      )
+      if (pathTemplate === template) continue
+      const key = `${target.origin}|GET|${pathTemplate}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push({
+        origin: target.origin,
+        method: 'GET',
+        pathTemplate,
+        riskScore: CODE_LEAD_PRIORITY_RISK,
+        source: 'program_graph',
+        params: [],
+      })
+    }
+  }
+  return out
+}
+
+/** Extract declared tenant labels from persona role labels (`member (tenant-alpha)`). */
+export function tenantLabelsFromRoleLabels(roleLabels: readonly string[]): string[] {
+  const labels = new Set<string>()
+  for (const label of roleLabels) {
+    const match = /\(([^()]+)\)\s*$/.exec(label)
+    if (!match) continue
+    const tenant = match[1]!.trim()
+    if (tenant.length >= 2 && tenant.length <= 48) labels.add(tenant)
+  }
+  return [...labels].sort()
 }
 import { BudgetExceededError } from './provider.ts'
 import { redact, redactJsonValue } from './redact.ts'
@@ -2183,7 +2284,6 @@ function parseTolerantOpenApiTargets(
 }
 
 /** Shared replay-spec boilerplate for deterministically synthesized specs. */function baseReplaySpecFields(
-  _run: Run,
   origin: string,
   overrides: {
     title: string
@@ -2207,6 +2307,188 @@ function parseTolerantOpenApiTargets(
     impact: overrides.impact.slice(0, 1200),
     remediation: overrides.remediation.slice(0, 1500),
     recheckInstructions: overrides.recheckInstructions.slice(0, 1000),
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Realism #4 — code-lead proof shapes the differential engine already discovered
+//
+// The authz probe returns an `unauthorized_access` matrix and the SQL probe a
+// `db_error_fingerprint`; `probes/authz.ts` states the intended next step ("build an http_chain
+// Replay Spec from this matrix") and the verifier explicitly supports error-based SQLi chains
+// (`.steps.p1.status >= 500`). The engine's generic synthesizers cannot express either shape on
+// their own (a GET authz proof demands an identical owner/probe body, which an app that echoes the
+// actor can never satisfy; the boolean recipe treats any 5xx as unstable). These builders render
+// the exact `http_chain` the existing replay verifier and oracle already accept. They are bounded
+// to Tier-A code-lead routes, submit through `recordDeterministicFinding`, and are still judged by
+// the normal replay verifier — no gate is relaxed.
+// ---------------------------------------------------------------------------------------------
+
+/** Hard per-run cap on fallback proofs synthesized from Tier-A code-lead signals. */
+export const CODE_LEAD_PROOF_FALLBACK_CAP = 3
+
+function fillReplayId(template: string, id: string): string {
+  return template.split('{{id}}').join(encodeURIComponent(id))
+}
+
+interface CodeLeadMatrixRow {
+  resourceId: string
+  actor: string
+  status: number | null
+  accessible: boolean | null
+}
+
+/** Typed view of the authz probe's `details.matrix` (missing rows are simply skipped). */
+export function codeLeadMatrixRows(probe: { details?: Record<string, unknown> }): CodeLeadMatrixRow[] {
+  const raw = probe.details?.matrix
+  if (!Array.isArray(raw)) return []
+  const rows: CodeLeadMatrixRow[] = []
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue
+    const row = entry as Record<string, unknown>
+    if (typeof row.resourceId !== 'string' || typeof row.actor !== 'string') continue
+    rows.push({
+      resourceId: row.resourceId,
+      actor: row.actor,
+      status: typeof row.status === 'number' ? row.status : null,
+      accessible: typeof row.accessible === 'boolean' ? row.accessible : null,
+    })
+  }
+  return rows
+}
+
+/**
+ * Cross-tenant object read: the owner arm and the other-tenant arm read the same resource and both
+ * are served. `assertionsJq` binds the proof to the object identifier (the probe body must carry
+ * it), so a public/static page that answers everyone cannot satisfy it; the oracle additionally
+ * requires the tenant differential from the signed transcripts.
+ */
+export function buildCodeLeadCrossTenantProof(input: {
+  origin: string
+  hypothesis: EngineHypothesis
+  resourceId: string
+  probeActor: string
+  ownerPersona: string
+  otherPersona: string
+}): Record<string, unknown> | null {
+  const { hypothesis: hyp, resourceId } = input
+  if (hyp.method !== 'GET' || !hyp.pathAndQuery.includes('{{id}}')) return null
+  if (!input.ownerPersona || !input.otherPersona || input.ownerPersona === input.otherPersona) return null
+  if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(resourceId)) return null
+  const path = fillReplayId(hyp.pathAndQuery, resourceId)
+  const idLiteral = JSON.stringify(resourceId)
+  const assertionsJq = `{ controlPassed: (((.steps.c1.status >= 200) and (.steps.c1.status < 300)) and ((.steps.c1.body | length) > 2)), ` +
+    `confirmed: (((.steps.p1.status >= 200) and (.steps.p1.status < 300)) and ((.steps.p1.body | length) > 2) and (.steps.p1.body | contains(${idLiteral}))), ` +
+    `observed: ("owner status=" + (.steps.c1.status | tostring) + " other status=" + (.steps.p1.status | tostring)), ` +
+    `expected: "the object is served to an actor from another tenant" }`
+  return {
+    ...baseReplaySpecFields(input.origin, {
+      title: `Cross-tenant object read on ${hyp.endpoint.pathTemplate.slice(0, 120)}`.slice(0, 200),
+      // Canonical object-authz class (`Finding.category` is the report/grade vulnClass key).
+      category: 'cross_tenant_read',
+      cwe: 'CWE-639',
+      severity: 'high',
+      severityRationale: `The authz matrix served resource "${resourceId}" to a non-owner actor (${input.probeActor}) on the same route that served its owner.`,
+      impact: 'An authenticated member of another tenant reads an object they do not own, exposing its contents and any embedded sensitive fields.',
+      remediation: 'Enforce the tenant/owner predicate in the data-access layer and return 404 for objects outside the caller scope.',
+      recheckInstructions: 'Replay the two-arm read after the ownership predicate is restored; the non-owner arm must be denied.',
+    }),
+    kind: 'http_chain',
+    assertionsJq,
+    expectedImpactEvents: ['cross_tenant_read'],
+    steps: [
+      {
+        id: 'c1',
+        role: 'control',
+        description: `Owner actor (${input.ownerPersona}) reads the addressed object`,
+        request: { origin: input.origin, method: 'GET', pathAndQuery: path, persona: input.ownerPersona, followRedirects: false },
+      },
+      {
+        id: 'p1',
+        role: 'probe',
+        description: `Other-tenant actor (${input.otherPersona}) reads the same object`,
+        request: { origin: input.origin, method: 'GET', pathAndQuery: path, persona: input.otherPersona, followRedirects: false },
+      },
+    ],
+  }
+}
+
+/**
+ * Error-based SQL injection: the benign parameter value is the control arm and the quote-terminated
+ * value is the probe arm. The oracle accepts the probe only when its body carries a database
+ * engine fingerprint the control does not (a generic 5xx is not evidence).
+ */
+export function buildCodeLeadSqlErrorProof(input: {
+  origin: string
+  hypothesis: EngineHypothesis
+  dialect?: string | null
+}): Record<string, unknown> | null {
+  const { hypothesis: hyp } = input
+  if (!hyp.param) return null
+  const method = hyp.method === 'POST' ? 'POST' : 'GET'
+  const location = hyp.location ?? hyp.param.location
+  if (method === 'GET' && location !== 'query') return null
+  if (!['query', 'json', 'form'].includes(location)) return null
+  const baseline = hyp.baselineValue && hyp.baselineValue.length > 0 ? hyp.baselineValue : '1'
+  const inject = (value: string) => injectUniversalParam({
+    pathAndQuery: hyp.pathAndQuery,
+    param: hyp.param!.name,
+    paramLocation: location,
+    value,
+    method,
+    ...(hyp.jsonBody ? { jsonBody: hyp.jsonBody } : {}),
+    ...(hyp.formBody ? { formBody: hyp.formBody } : {}),
+  })
+  const control = inject(baseline)
+  const probe = inject(`${baseline}'`)
+  const assertionsJq = `{ controlPassed: (((.steps.c1.status < 500) and ((.steps.c1.body | length) > 0))), ` +
+    `confirmed: ((.steps.p1.status >= 500) and (.steps.p1.body != .steps.c1.body)), ` +
+    `observed: ("control status=" + (.steps.c1.status | tostring) + " probe status=" + (.steps.p1.status | tostring)), ` +
+    `expected: "a SQL engine error fingerprint on the injectable parameter" }`
+  return {
+    ...baseReplaySpecFields(input.origin, {
+      title: `SQL parameterization differential · ${method} ${hyp.endpoint.pathTemplate.slice(0, 80)} (${hyp.param.name})`.slice(0, 200),
+      // Canonical injection class (`Finding.category` is the report/grade vulnClass key).
+      category: 'sqli',
+      cwe: 'CWE-89',
+      severity: 'high',
+      severityRationale: `A quote-terminated value for parameter "${hyp.param.name}" produced a structural database error${input.dialect ? ` (${input.dialect})` : ''} where the benign value did not.`,
+      impact: 'Unparameterized SQL handling lets a caller break out of the statement and infer or alter query results.',
+      remediation: 'Bind the parameter with the query parameterizer and remove string interpolation from the statement.',
+      recheckInstructions: 'Replay the benign/probe pair after switching to a bound parameter; the probe must return the same shape as the control.',
+    }),
+    kind: 'http_chain',
+    assertionsJq,
+    steps: [
+      {
+        id: 'c1',
+        role: 'control',
+        description: `Benign value for parameter "${hyp.param.name}"`,
+        request: {
+          origin: input.origin,
+          method,
+          pathAndQuery: control.pathAndQuery,
+          ...(control.body ? { textBody: control.body } : {}),
+          ...(control.headers ? { headers: control.headers } : {}),
+          ...(hyp.ownerPersona ? { persona: hyp.ownerPersona } : {}),
+          followRedirects: false,
+        },
+      },
+      {
+        id: 'p1',
+        role: 'probe',
+        description: `Quote-terminated value for parameter "${hyp.param.name}"`,
+        request: {
+          origin: input.origin,
+          method,
+          pathAndQuery: probe.pathAndQuery,
+          ...(probe.body ? { textBody: probe.body } : {}),
+          ...(probe.headers ? { headers: probe.headers } : {}),
+          ...(hyp.ownerPersona ? { persona: hyp.ownerPersona } : {}),
+          followRedirects: false,
+        },
+      },
+    ],
   }
 }
 
@@ -2519,6 +2801,9 @@ export class Execution {
   private readonly phaseTerminationReason = new Map<string, string>()
   private readonly detLeadConsumed = new Set<string>()
   private readonly detLeadStepKeys = new Set<string>()
+  /** Realism #4: Tier-A code-lead signal → fallback proof spec (bounded, deduped per route/class). */
+  private readonly codeLeadProofKeys = new Set<string>()
+  private readonly codeLeadProofCounts = new Map<string, number>()
   /** Facts whose lead contract failed the contrast gate; emit the skip reason once. */
   private readonly detLeadGateRejected = new Set<string>()
   /** det_lead fact ids whose capped reinvestigation was already reported (emit once per fact). */
@@ -6300,6 +6585,25 @@ export class Execution {
             }
           : {}),
         ...(codeSlice ? { codeSlice, codeExpansion } : {}),
+        // One explicit proof obligation for a white-box assignment: exact mounted route, declared
+        // parameter names, the middleware verdict and the sink chain. Names only; the specialist
+        // still has to build and verify the spec through the normal replay path.
+        ...(codeSlice
+          ? {
+              proofObligation: {
+                route: codeSlice.route,
+                method: codeSlice.methods[0],
+                params: [
+                  ...(codeSlice.input?.params ?? []),
+                  ...(codeSlice.input?.query ?? []),
+                  ...(codeSlice.input?.body ?? []),
+                ],
+                auth: codeSlice.auth,
+                ...(codeSlice.sink ? { sink: `${codeSlice.sink.kind}@${codeSlice.sink.at}` } : {}),
+                chain: codeSlice.hops.slice(0, 6).map(hop => hop.at).join('→'),
+              },
+            }
+          : {}),
         targetCount: routes.length > 1 ? 2 : 1,
         turnBudget: input.maxTurns,
       })
@@ -7259,7 +7563,7 @@ export class Execution {
                   assignment: claimed,
                   asset,
                   spec: {
-                    ...baseReplaySpecFields(latest, item.ep.origin, {
+                    ...baseReplaySpecFields(item.ep.origin, {
                       title: `Cross-persona object access · ${item.ep.method} ${item.ep.pathTemplate.slice(0, 80)}`,
                       category: 'broken-access-control',
                       cwe: 'CWE-639',
@@ -7374,7 +7678,7 @@ export class Execution {
             assignment: claimed,
             asset,
             spec: {
-              ...baseReplaySpecFields(latest, item.ep.origin, {
+              ...baseReplaySpecFields(item.ep.origin, {
                 title: `SQL parameterization differential · ${method} ${item.ep.pathTemplate.slice(0, 80)} (${candidate.name})`,
                 category: 'injection-input',
                 cwe: 'CWE-89',
@@ -7569,13 +7873,32 @@ export class Execution {
     const asset = current.candidates.find(c => approvedOrigins.has(c.origin) && current.approved.includes(c.id))
     if (!asset) return
 
+    // Tier-A Program-Graph leads this pass will probe. They are attached to the assignment so the
+    // dispatch funnel can attribute the lane to the exact code→runtime hypotheses it consumes
+    // (bounded: the same cap the engine applies to lead-derived targets).
+    const leadFacts = this.storage.listFacts(current.id, { includeTainted: false, limit: 200 })
+    const codeLeadFactIds = leadFacts
+      .filter(fact => fact.data?.kind === 'det_lead' && fact.data.source === 'program_graph')
+      .map(fact => fact.id)
+      .slice(0, 8)
+    // Tier-A hypotheses outrank the generic surface in the engine's bounded risk prefix.
+    const codeLeadTargets = prioritizeCodeLeadTargets(graphLeadTargets(leadFacts))
+    const codeLeadKeys = new Set(codeLeadTargets.map(target =>
+      `${target.method.toUpperCase()}|${target.pathTemplate}`))
+
+    // Name the Tier-A hypotheses this pass drives: a dispatch is attributed to the route the lane
+    // was created for, not to whichever exchange happened to land first.
+    const codeLeadObjective = codeLeadTargets.length
+      ? `Deterministic closed loop over Tier-A code leads (${[...new Set(codeLeadTargets.map(target =>
+          `${target.method.toUpperCase()} ${target.pathTemplate}`))].slice(0, 6).join(', ')}): risk-ranked triage, differential probes and Zero-LLM replay verification.`
+      : 'Deterministic closed loop: risk-ranked triage, differential probes and Zero-LLM replay verification.'
     const worker = this.storage.makeWorker(
       current,
       'investigation',
       asset,
       'Deterministic differential engine',
-      'Deterministic closed loop: risk-ranked triage, differential probes and Zero-LLM replay verification.',
-      { sourceOrigins: [...approvedOrigins].sort() },
+      codeLeadObjective.slice(0, 400),
+      { sourceOrigins: [...approvedOrigins].sort(), ...(codeLeadFactIds.length ? { parentFactIds: codeLeadFactIds } : {}) },
     )
     const claimed = this.storage.updateWorker(worker.id, {
       status: 'running',
@@ -7637,18 +7960,29 @@ export class Execution {
         params: Array<{ name: string; location: string }>
       }> = []
       try {
+        const specTargets = this.deriveDeterministicRouteTargets(current, approvedOrigins, storedEndpoints)
+        // Graphwire: Program-Graph code→runtime hypotheses are probed first by the floor. Their
+        // concrete identifier-form reads seed the authz matrix when the sink route has no
+        // collection of its own.
+        const tenantLabels = tenantLabelsFromRoleLabels(
+          [...resolveRunPersonas(this.storage, current.projectId, current.approvedPersonaIds).values()]
+            .map(persona => persona.roleLabel),
+        )
+        const codeLeadIdentifierTargets = deriveCodeLeadIdentifierTargets({
+          targets: codeLeadTargets,
+          tenants: tenantLabels,
+          existing: [...storedEndpoints, ...specTargets],
+        })
         derivedTargets = [
-          ...this.deriveDeterministicRouteTargets(current, approvedOrigins, storedEndpoints),
+          ...specTargets,
           ...await this.deriveRuntimeRouteMapTargets(current, approvedOrigins, grant, claimed, signal, recordExchange),
-          // Conventional action/noun wordlists are a local-lab convenience: on a real target the
-          // engine relies on discovered routes, JS/router harvesting and the API reference.
-          // Graphwire: Program-Graph code→runtime hypotheses are probed first by the floor.
-          ...graphLeadTargets(this.storage.listFacts(current.id, { includeTainted: false, limit: 200 })),
+          ...codeLeadIdentifierTargets,
+          ...codeLeadTargets,
           ...(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1'
             ? [...approvedOrigins].sort().flatMap(origin =>
                 this.expandConventionalSurfaceTargets(
                   origin,
-                  [...storedEndpoints, ...this.deriveDeterministicRouteTargets(current, approvedOrigins, storedEndpoints)],
+                  [...storedEndpoints, ...specTargets],
                 ))
             : []),
         ].filter((target, idx, all) =>
@@ -7686,7 +8020,9 @@ export class Execution {
             const location = paramLocation(param.location)
             return location ? [{ name: param.name, location, isObjectId: param.isObjectId, isCsrf: param.isCsrf }] : []
           }),
-          riskScore: endpoint.riskScore,
+          riskScore: codeLeadKeys.has(`${endpoint.method.toUpperCase()}|${endpoint.pathTemplate}`)
+            ? Math.max(endpoint.riskScore, CODE_LEAD_PRIORITY_RISK)
+            : endpoint.riskScore,
           sinkKinds: endpoint.sinkKinds,
           source: endpoint.source,
         })
@@ -7796,12 +8132,23 @@ export class Execution {
         onLead: lead => {
           if (leadCount >= 16) return
           leadCount += 1
+          const leadRun = this.storage.run(current.id)
           this.persistDeterministicLead({
-            run: this.storage.run(current.id),
+            run: leadRun,
             assignment: claimed,
             lead,
             secrets: currentSecrets(),
           })
+          try {
+            this.queueCodeLeadProofFallback({
+              run: leadRun,
+              assignment: claimed,
+              asset,
+              lead,
+              codeLeadKeys,
+              secrets: currentSecrets(),
+            })
+          } catch { /* fallback proof synthesis is additive */ }
         },
       })
 
@@ -8152,6 +8499,92 @@ export class Execution {
         { attribution: 'deterministic', endpoint: hyp.endpoint.pathTemplate, probeClass: hyp.probeClass },
       )
     } catch { /* lead persistence is best-effort */ }
+  }
+
+  /**
+   * Realism #4: convert a Tier-A code-lead signal into the exact `http_chain` proof shape the
+   * replay verifier already understands. Bounded per run and deduped per (route, class); the spec
+   * still goes through `recordDeterministicFinding` → normal replay verification → oracle gates.
+   */
+  private queueCodeLeadProofFallback(input: {
+    run: Run
+    assignment: Assignment
+    asset: Candidate
+    lead: EngineLead
+    codeLeadKeys: ReadonlySet<string>
+    secrets: readonly NamedSecret[]
+  }): string | null {
+    const { run, lead } = input
+    const hyp = lead.hypothesis
+    if (!input.codeLeadKeys.has(`${hyp.method.toUpperCase()}|${hyp.endpoint.pathTemplate}`)) return null
+    const count = this.codeLeadProofCounts.get(run.id) ?? 0
+    if (count >= CODE_LEAD_PROOF_FALLBACK_CAP) return null
+    const key = `${run.id}|${hyp.endpoint.origin}|${normalizeEndpointTemplate(hyp.endpoint.pathTemplate)}|${hyp.probeClass}`
+    if (this.codeLeadProofKeys.has(key)) return null
+
+    let spec: Record<string, unknown> | null = null
+    if (hyp.probeClass === 'sqli_boolean') {
+      const dbError = lead.probe.anomalies.find(anomaly => anomaly.type === 'db_error_fingerprint')
+      if (!dbError) return null
+      spec = buildCodeLeadSqlErrorProof({
+        origin: hyp.endpoint.origin,
+        hypothesis: hyp,
+        dialect: typeof dbError.dialect === 'string' ? dbError.dialect : null,
+      })
+    } else if (hyp.probeClass === 'authz_matrix' && hyp.method === 'GET' && hyp.otherPersona) {
+      const anomaly = lead.probe.anomalies.find(entry =>
+        entry.type === 'unauthorized_access' &&
+        entry.actor === 'other_persona' &&
+        typeof entry.resourceId === 'string')
+      if (!anomaly || typeof anomaly.resourceId !== 'string') return null
+      const rows = codeLeadMatrixRows(lead.probe)
+      const ownerServed = rows.some(row =>
+        row.resourceId === anomaly.resourceId && row.actor === 'owner' && row.accessible === true)
+      const otherServed = rows.some(row =>
+        row.resourceId === anomaly.resourceId && row.actor === 'other_persona' && row.accessible === true)
+      if (!ownerServed || !otherServed) return null
+      spec = buildCodeLeadCrossTenantProof({
+        origin: hyp.endpoint.origin,
+        hypothesis: hyp,
+        resourceId: anomaly.resourceId,
+        probeActor: 'other_persona',
+        ownerPersona: hyp.ownerPersona ?? '',
+        otherPersona: hyp.otherPersona,
+      })
+    }
+    if (!spec) return null
+
+    this.codeLeadProofKeys.add(key)
+    this.codeLeadProofCounts.set(run.id, count + 1)
+    try {
+      const findingId = this.recordDeterministicFinding({
+        run,
+        assignment: input.assignment,
+        asset: input.asset,
+        spec,
+        factData: {
+          subkind: 'code_lead_proof',
+          probeClass: hyp.probeClass,
+          endpoint: hyp.endpoint.pathTemplate,
+          method: hyp.method,
+          ...(hyp.param ? { param: hyp.param.name } : {}),
+          signal: lead.probe.anomalies.find(entry =>
+            entry.type === 'db_error_fingerprint' || entry.type === 'unauthorized_access') ?? null,
+        },
+        factSummary: `Tier-A code-lead proof drafted for ${hyp.method} ${hyp.endpoint.pathTemplate} (${hyp.probeClass}).`,
+        exchangeIds: lead.probe.exchangeIds,
+        secrets: input.secrets,
+      })
+      this.storage.event(
+        run.id,
+        'deterministic_engine.code_lead_proof',
+        `Tier-A code-lead ${hyp.probeClass} signal drafted as an http_chain proof on ${hyp.method} ${hyp.endpoint.pathTemplate}.`,
+        { endpoint: hyp.endpoint.pathTemplate, probeClass: hyp.probeClass, findingId },
+      )
+      return findingId
+    } catch {
+      return null
+    }
   }
 
   private recordDeterministicFinding(input: {
