@@ -20,6 +20,7 @@ import {
   assessInjectionImpact,
   assessStatusOnlyDivergence,
   knownOracleEvent,
+  parseRoleLabel,
   routeFamily,
   stepMutatesState,
 } from './oracle-invariants.ts'
@@ -598,6 +599,263 @@ function stepCarries(step: ImpactStep, token: string): boolean {
 /** Typed builder used by the floor/verifier so receipts are always schema-checked before use. */
 export function buildProofReceipt(input: z.input<typeof proofReceiptSchema>): ProofReceipt {
   return proofReceiptSchema.parse(input)
+}
+
+// ---------------------------------------------------------------------------
+// Agent-script receipts (v7 M5): turn a host-recorded Layer-3 transcript + the script's own claim
+// set into the same `ProofReceipt` the floor uses, so a script proof is re-checkable by
+// `verifyReceipt()` instead of by script stdout. The builder is deliberately conservative: it
+// returns null for any class it cannot map onto a receipt rule, and the caller then keeps the
+// script verdict alone (never a declarative re-interpretation).
+// ---------------------------------------------------------------------------
+
+/** One host-recorded Layer-3 exchange, reduced to what a receipt needs. */
+export interface ScriptProofExchange {
+  exchangeId: string
+  op?: string
+  method: string
+  pathAndQuery: string
+  origin: string
+  status: number | null
+  durationMs?: number
+  personaHandle?: string | null
+  /** Session-group role the script declared (`control`, `probe`, `setup`, `cleanup`). */
+  sessionRole?: string | null
+  /** Host-resolved persona role label (e.g. "owner (acme)"); never script-supplied. */
+  actorRoleLabel?: string | null
+  body?: string
+  requestHeaders?: Record<string, string> | null
+  responseHeaders?: Record<string, string> | null
+}
+
+const IMPACT_CLASS_TO_VULN_CLASS: Readonly<Record<string, string>> = {
+  authorization: 'authorization',
+  bfla: 'bfla',
+  mass_assignment: 'mass_assignment',
+  csrf: 'csrf',
+  business_logic: 'business_logic',
+  markup: 'markup',
+  disclosure: 'disclosure',
+  injection: 'injection',
+}
+
+function recordField(record: Record<string, unknown>, key: string): unknown {
+  return record[key]
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.length > 0) : []
+}
+
+function impactStepOf(
+  exchange: ScriptProofExchange,
+  overrides?: {
+    arm?: ImpactStep['arm']
+    requestJson?: unknown
+    ambientAuth?: ImpactStep['actor']['auth']
+    sameSite?: string | null
+  },
+): ImpactStep {
+  const roleLabel = exchange.actorRoleLabel ?? null
+  const parsed = parseRoleLabel(roleLabel ?? exchange.personaHandle ?? null)
+  const arm = overrides?.arm ?? (exchange.sessionRole === 'control' || exchange.sessionRole === 'probe' ||
+    exchange.sessionRole === 'cleanup' || exchange.sessionRole === 'setup'
+    ? exchange.sessionRole
+    : 'setup')
+  let json: unknown
+  if (exchange.body !== undefined) {
+    try { json = JSON.parse(exchange.body) } catch { json = undefined }
+  }
+  return {
+    id: exchange.exchangeId,
+    arm,
+    method: (exchange.method || 'GET').toUpperCase(),
+    route: (exchange.pathAndQuery || '/').split('?')[0],
+    pathAndQuery: exchange.pathAndQuery || '/',
+    status: exchange.status,
+    actor: {
+      handle: exchange.personaHandle ?? null,
+      role: parsed.role,
+      tenant: parsed.tenant,
+      auth: overrides?.ambientAuth ?? 'unknown',
+      sameSite: overrides?.sameSite ?? null,
+    },
+    ...(json !== undefined ? { json } : {}),
+    ...(exchange.body !== undefined ? { body: exchange.body } : {}),
+    ...(overrides?.requestJson !== undefined ? { requestJson: overrides.requestJson } : {}),
+    ...(exchange.requestHeaders ? { requestHeaders: exchange.requestHeaders } : {}),
+    ...(exchange.responseHeaders ? { responseHeaders: exchange.responseHeaders } : {}),
+    ...(exchange.durationMs !== undefined ? { durationMs: exchange.durationMs } : {}),
+  }
+}
+
+/**
+ * Derive a receipt from a confirmed script run. `claims` are the oracle-checked claim objects the
+ * SDK returned (already re-evaluated against the signed transcript); they are used only to name the
+ * class, the target and the exchange set. Every cited id must exist in `exchanges`.
+ */
+export function buildAgentScriptReceipt(input: {
+  claims: readonly Record<string, unknown>[]
+  exchanges: readonly ScriptProofExchange[]
+  origin: string
+  title: string
+}): { receipt: ProofReceipt; transcript: ReceiptTranscript } | null {
+  const byId = new Map(input.exchanges.map(exchange => [exchange.exchangeId, exchange]))
+  const orderById = new Map(input.exchanges.map((exchange, index) => [exchange.exchangeId, index]))
+  const buildTranscript = (
+    armOverrides: ReadonlyMap<string, ImpactStep['arm']>,
+    extra?: { requestJson?: unknown; ambientAuth?: ImpactStep['actor']['auth']; sameSite?: string | null },
+  ): ReceiptTranscript => ({
+    entries: input.exchanges.map(exchange => ({
+      exchangeId: exchange.exchangeId,
+      step: impactStepOf(exchange, {
+        ...(armOverrides.has(exchange.exchangeId) ? { arm: armOverrides.get(exchange.exchangeId)! } : {}),
+        ...(extra?.requestJson !== undefined ? { requestJson: extra.requestJson } : {}),
+        ...(extra?.ambientAuth ? { ambientAuth: extra.ambientAuth } : {}),
+        ...(extra?.sameSite !== undefined ? { sameSite: extra.sameSite } : {}),
+      }),
+      ...(exchange.durationMs !== undefined ? { durationMs: exchange.durationMs } : {}),
+      ...(exchange.body !== undefined
+        ? { carrierText: `${exchange.pathAndQuery}\n${JSON.stringify(exchange.requestHeaders ?? {})}\n${exchange.body}` }
+        : {}),
+      ...(exchange.sessionRole ? { evidenceRole: exchange.sessionRole } : {}),
+    })),
+  })
+  const cited = (ids: readonly string[]) => ids.filter(id => byId.has(id))
+
+  for (const claim of input.claims) {
+    if (recordField(claim, 'kind') !== 'impact') continue
+    const impactClass = recordField(claim, 'impactClass')
+    if (typeof impactClass !== 'string') continue
+    const vulnClass = IMPACT_CLASS_TO_VULN_CLASS[impactClass]
+    if (!vulnClass) continue
+    const probeId = recordField(claim, 'probeExchangeId')
+    if (typeof probeId !== 'string') continue
+    const probe = byId.get(probeId)
+    if (!probe) continue
+    const controlIds = cited(stringArray(recordField(claim, 'controlExchangeIds')))
+    const beforeId = typeof recordField(claim, 'beforeExchangeId') === 'string' && byId.has(recordField(claim, 'beforeExchangeId') as string)
+      ? recordField(claim, 'beforeExchangeId') as string
+      : null
+    const afterId = typeof recordField(claim, 'afterExchangeId') === 'string' && byId.has(recordField(claim, 'afterExchangeId') as string)
+      ? recordField(claim, 'afterExchangeId') as string
+      : null
+    // Deduplicate and preserve host-transcript chronological order so pre/post mutation readbacks
+    // stay strictly before/after the mutating probe in `findPersistence()`.
+    const exchangeIds = [...new Set([
+      ...(beforeId ? [beforeId] : []),
+      ...controlIds,
+      probeId,
+      ...(afterId ? [afterId] : []),
+    ])].sort((a, b) => (orderById.get(a) ?? 0) - (orderById.get(b) ?? 0))
+    if (exchangeIds.length === 0) continue
+    const armOverrides = new Map<string, ImpactStep['arm']>()
+    for (const id of controlIds) armOverrides.set(id, 'control')
+    if (beforeId) armOverrides.set(beforeId, 'control')
+    if (afterId) armOverrides.set(afterId, 'control')
+    armOverrides.set(probeId, 'probe')
+    const rawAmbient = recordField(claim, 'ambient')
+    const ambient = rawAmbient && typeof rawAmbient === 'object' && !Array.isArray(rawAmbient)
+      ? rawAmbient as { kind?: unknown; sameSite?: unknown }
+      : null
+    const ambientAuth = ambient?.kind === 'cookie' || ambient?.kind === 'bearer' || ambient?.kind === 'header' || ambient?.kind === 'unknown'
+      ? ambient.kind
+      : undefined
+    const sameSite = typeof ambient?.sameSite === 'string' ? ambient.sameSite : null
+    const transcript = buildTranscript(armOverrides, {
+      ...(recordField(claim, 'requestBody') !== undefined ? { requestJson: recordField(claim, 'requestBody') } : {}),
+      ...(ambientAuth ? { ambientAuth } : {}),
+      ...(sameSite !== null ? { sameSite } : {}),
+    })
+    const requiredRole = recordField(claim, 'requiredRole')
+    const resourceTenant = recordField(claim, 'resourceTenant')
+    const oracleEvents = stringArray(recordField(claim, 'oracleEvents'))
+    const proofPatterns = stringArray(recordField(claim, 'proofPatterns')).filter(p => p.length >= 4 && p.length <= 200).slice(0, 4)
+    return {
+      receipt: buildProofReceipt({
+        vulnClass,
+        target: {
+          origin: probe.origin || input.origin,
+          method: probe.method.toUpperCase(),
+          pathAndQuery: probe.pathAndQuery,
+        },
+        exchangeIds,
+        oobEventIds: [],
+        browserTraceIds: [],
+        claimedDelta: `${input.title} — script claims ${impactClass} impact over ${exchangeIds.length} host-recorded exchange(s).`.slice(0, 1200),
+        ...(requiredRole === 'viewer' || requiredRole === 'member' || requiredRole === 'admin' || requiredRole === 'owner'
+          ? { requiredRole }
+          : {}),
+        ...(typeof resourceTenant === 'string' && resourceTenant ? { resourceTenant } : {}),
+        ...(recordField(claim, 'expectControlDenied') === true ? { expectControlDenied: true } : {}),
+        ...(oracleEvents.length ? { oracleEvents: [...new Set(oracleEvents)].slice(0, 8) } : {}),
+        ...(proofPatterns.length ? { proofPatterns } : {}),
+      }),
+      transcript,
+    }
+  }
+
+  for (const claim of input.claims) {
+    const kind = recordField(claim, 'kind')
+    if (kind === 'structural_diff') {
+      const controls = cited(stringArray(recordField(claim, 'controlIds')))
+      const variants = cited(stringArray(recordField(claim, 'variantIds')))
+      if (controls.length < 2 || controls.length !== variants.length) continue
+      const armOverrides = new Map<string, ImpactStep['arm']>()
+      for (const id of controls) armOverrides.set(id, 'control')
+      for (const id of variants) armOverrides.set(id, 'probe')
+      const transcript = buildTranscript(armOverrides)
+      const controlEntry = transcript.entries!.find(entry => entry.exchangeId === controls[0])
+      const probeEntry = transcript.entries!.find(entry => entry.exchangeId === variants[0])
+      if (!controlEntry || !probeEntry) continue
+      const param = deriveDifferingParam(controlEntry, probeEntry)
+      if (!param) continue
+      const variantExchange = byId.get(variants[0]!)
+      return {
+        receipt: buildProofReceipt({
+          vulnClass: 'sqli',
+          target: {
+            origin: variantExchange?.origin || input.origin,
+            ...(probeEntry.step.method ? { method: probeEntry.step.method.toUpperCase() } : {}),
+            ...(probeEntry.step.pathAndQuery ? { pathAndQuery: probeEntry.step.pathAndQuery } : {}),
+            param,
+          },
+          exchangeIds: [...controls, ...variants],
+          oobEventIds: [],
+          browserTraceIds: [],
+          claimedDelta: `${input.title} — paired boolean differential over ${controls.length} recorded round(s).`.slice(0, 1200),
+        }),
+        transcript,
+      }
+    }
+    if (kind === 'timing') {
+      const controls = cited(stringArray(recordField(claim, 'controlIds')))
+      const variants = cited(stringArray(recordField(claim, 'variantIds')))
+      if (controls.length < 5 || variants.length < 5) continue
+      const probe = byId.get(variants[0]!)
+      if (!probe) continue
+      const armOverrides = new Map<string, ImpactStep['arm']>()
+      for (const id of controls) armOverrides.set(id, 'control')
+      for (const id of variants) armOverrides.set(id, 'probe')
+      const transcript = buildTranscript(armOverrides)
+      return {
+        receipt: buildProofReceipt({
+          vulnClass: 'blind_sqli',
+          target: {
+            origin: probe.origin || input.origin,
+            method: probe.method.toUpperCase(),
+            pathAndQuery: probe.pathAndQuery,
+          },
+          exchangeIds: [...controls, ...variants],
+          oobEventIds: [],
+          browserTraceIds: [],
+          claimedDelta: `${input.title} — timing separation over ${controls.length}/${variants.length} recorded arms.`.slice(0, 1200),
+        }),
+        transcript,
+      }
+    }
+  }
+  return null
 }
 
 /** Convenience for the async promotion path: one durable event, one carrying exchange. */

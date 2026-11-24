@@ -207,10 +207,45 @@ export const floorRecipeEnvelopeSchema = z.object({
 
 export type FloorRecipeEnvelope = z.output<typeof floorRecipeEnvelopeSchema>
 
+/**
+ * Persisted agent-script proof envelope (v7 M5 script-proof migration).
+ *
+ * An agent proof is a Layer-3 `guardian_verify` script whose claims the independent transcript
+ * oracle confirmed twice (fresh nonce, fresh session). The declarative fields on the row are only
+ * attribution for reporting; they are never the confirmation or retest contract. This envelope
+ * carries the bounded, redacted-at-rest script and the host-recorded confirmation so a retest can
+ * re-run the same script and re-validate a fresh receipt.
+ *
+ * The full receipt, script artifact id and transcript digests live on the `replay_specs` proof
+ * columns (queryable) and in the owner-only evidence artifact (purgeable).
+ */
+export const agentScriptProofEnvelopeSchema = z.object({
+  kind: z.literal('agent_script'),
+  runtime: z.enum(['ts', 'python']),
+  /** Bounded script source. Redacted at rest; the artifact copy is the purgeable record. */
+  script: z.string().min(1).max(64 * 1024),
+  /** sha256 of the pre-redaction script, binding the row to the artifact copy. */
+  scriptSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  /** Oracle verdict of the confirmation run. */
+  verdict: z.enum(['confirmed', 'dismissed', 'inconclusive']),
+  /** Machine-readable vulnerability class the receipt was built for (when mapped). */
+  vulnClass: z.string().trim().min(1).max(64).optional(),
+  /** Host-recorded exchange ids the confirmed claims cite (never script-supplied stdout). */
+  exchangeIds: z.array(z.string().trim().min(1).max(128)).max(64).default([]),
+  /** Transcript digests of the two fresh runs. */
+  transcriptDigests: z.array(z.string().trim().min(1).max(128)).max(4).default([]),
+  /** Evidence artifact holding the script source and receipt (owner-only, purgeable). */
+  receiptArtifactId: z.string().trim().min(1).max(128).optional(),
+  confirmedAt: z.number().int().nonnegative(),
+})
+export type AgentScriptProofEnvelope = z.output<typeof agentScriptProofEnvelopeSchema>
+
 const replayBase = z.object({
   version: z.literal(1),
   /** Typed floor recipe that confirmed (and owns the retest of) this proof. */
   recipe: floorRecipeEnvelopeSchema.optional(),
+  /** Layer-3 agent script that confirmed (and owns the retest of) this proof. */
+  agentScript: agentScriptProofEnvelopeSchema.optional(),
   origin: scopedAssetOrigin,
   title: z.string().trim().min(3).max(200),
   category: z.enum(owaspCategories).or(z.string().trim().min(1).max(64)),
