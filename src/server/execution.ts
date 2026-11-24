@@ -11443,6 +11443,23 @@ export class Execution {
         exchangeIds: [...new Set([...(findingRow.finding.exchangeIds ?? []), ...result.exchangeIds])],
         scopeRevision: current.scopeRevision,
       }
+      const rawFeedback = buildInlineVerifyFeedback(
+        specRow.spec,
+        result,
+        Math.max(1, specRow.attemptCount),
+        maxInlineVerifyRetries,
+        currentSecrets(),
+      )
+      phaseFeedback = rawFeedback
+      // Route every diff through the store: confirmation writes persist the confirming verdict
+      // before the finding write, and a non-confirming retest demotes an already-confirmed claim
+      // (and is counted) instead of leaving it contradicted by its own evidence.
+      this.storage.recordReplaySpecVerification(
+        current.id,
+        specRow.id,
+        rawFeedback,
+        `phase3 ${specRow.spec.kind} attempt ${specRow.attemptCount} returned ${finalStatus}`,
+      )
       if (finalStatus === 'confirmed' || finalStatus === 'static_verified') {
         this.storage.upsertChainFinding(current, findingRow.assetId, alignFindingForEvidence(updatedFinding, result), specRow.id, specRow.sourceOrigins)
         if (owaspCategories.includes(specRow.spec.category as OwaspCategory) &&
@@ -11460,22 +11477,6 @@ export class Execution {
         )).get()
         if (refreshedRow) this.scheduleVariantSweepForFinding(current, refreshedRow)
       } else {
-        const rawFeedback = buildInlineVerifyFeedback(
-          specRow.spec,
-          result,
-          Math.max(1, specRow.attemptCount),
-          maxInlineVerifyRetries,
-          currentSecrets(),
-        )
-        phaseFeedback = rawFeedback
-        // Route the diff through the store so a non-confirming retest of an already-confirmed
-        // finding demotes it (and is counted) instead of leaving a confirmed claim contradicted.
-        this.storage.recordReplaySpecVerification(
-          current.id,
-          specRow.id,
-          rawFeedback,
-          `phase3 ${specRow.spec.kind} attempt ${specRow.attemptCount} returned ${finalStatus}`,
-        )
         this.storage.updateProposedFinding(current, findingRow.id, {
           verificationTier: null,
           finding: updatedFinding,
