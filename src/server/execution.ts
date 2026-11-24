@@ -1533,6 +1533,8 @@ export interface AssignmentThroughputMetrics {
   completedAssignmentWallSamples: number
   /** Mean turns per observed investigation assignment. */
   turnsPerAssignment: number
+  /** Turns saved by earned early exits (`agent.early_exit`) in this run. */
+  earlyExitTurnsSaved: number
   providerStallTurns: number
   /** Bounded requeues triggered by the stall watchdog (max one per assignment). */
   providerStallRetries: number
@@ -2395,6 +2397,8 @@ export class Execution {
   /** Wall samples for assignments that actually completed (the slot turned over on its own). */
   private readonly completedAssignmentWallByRun = new Map<string, number[]>()
   private readonly turnLatencyByRun = new Map<string, number[]>()
+  /** Turns saved by earned early exits (`agent.early_exit`) in this run. */
+  private readonly earlyExitTurnsSavedByRun = new Map<string, number>()
   private readonly providerStallTurnsByRun = new Map<string, number>()
   private readonly providerStallRetriesByRun = new Map<string, number>()
   private readonly lastAssignmentMetrics = new Map<string, AssignmentThroughputMetrics>()
@@ -5876,6 +5880,7 @@ export class Execution {
       completedAssignmentWallP50: Math.round(percentile(completedWalls, 50)),
       completedAssignmentWallSamples: completedWalls.length,
       turnsPerAssignment: turns.length ? Math.round((turns.reduce((sum, n) => sum + n, 0) / turns.length) * 10) / 10 : 0,
+      earlyExitTurnsSaved: this.earlyExitTurnsSavedByRun.get(runId) ?? 0,
       providerStallTurns: this.providerStallTurnsByRun.get(runId) ?? 0,
       providerStallRetries: this.providerStallRetriesByRun.get(runId) ?? 0,
       turnLatencyP50: turnSummary.p50,
@@ -10787,6 +10792,15 @@ export class Execution {
         },
         onProfileSuccess: id => recordProfileSuccess(id, this.storage),
         onProfileFailure: (id, err, hard) => recordProfileFailure(id, err, hard, this.storage),
+        onEarlyExit: info => {
+          this.earlyExitTurnsSavedByRun.set(run.id,
+            (this.earlyExitTurnsSavedByRun.get(run.id) ?? 0) + info.turnsSaved)
+          this.storage.event(run.id, 'agent.early_exit',
+            `Early exit (${info.reason}) at turn ${info.turnsUsed}/${info.maxTurns}: `
+            + `${info.evidenceCount} distinct attempt(s), ${info.turnsSaved} turn(s) saved`
+            + (info.route ? ` on ${info.route.method} ${info.route.path}.` : '.'),
+            { ...info })
+        },
       })
 
       const latestRun = this.check(job)
