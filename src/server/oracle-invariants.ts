@@ -1059,6 +1059,326 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
 }
 
 // ---------------------------------------------------------------------------
+// Boolean differential (boolean-only SQL injection and similar paired probes)
+// ---------------------------------------------------------------------------
+
+/**
+ * One arm of a paired boolean-differential probe. The recipe sends the *same* request shape twice
+ * per round; only the injected predicate value differs between the control and probe arms.
+ */
+export interface BooleanDifferentialArm {
+  status: number | null
+  method?: string
+  pathAndQuery?: string
+  requestJson?: unknown
+  requestHeaders?: Record<string, string> | null
+  json?: unknown
+  body?: string
+}
+
+export interface BooleanDifferentialRound {
+  control: BooleanDifferentialArm
+  probe: BooleanDifferentialArm
+}
+
+export interface BooleanDifferentialAssessment extends ImpactAssessment {
+  evidence: {
+    rounds: number
+    stable: boolean
+    controlStable: boolean
+    probeStable: boolean
+    requestShapeMismatch: boolean
+    serverErrors: boolean
+    echoedOnly: boolean
+    changedPaths: string[]
+    echoPaths: string[]
+  }
+}
+
+const booleanVolatileHeaders = new Set([
+  'authorization', 'cookie', 'proxy-authorization', 'x-request-id', 'x-correlation-id',
+  'x-trace-id', 'traceparent', 'tracestate', 'date', 'set-cookie',
+])
+
+const nonceLikeRun = /[A-Za-z0-9_-]{16,}/g
+const uuidText = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+function leafClassOf(value: string, param?: string | null): string {
+  if (value === '') return 'empty'
+  if (uuidText.test(value)) return 'uuid'
+  if (/^-?\d+$/.test(value)) {
+    const n = Number(value)
+    return n === 0 ? 'num:zero' : n === 1 ? 'num:one' : n > 0 ? 'num:many' : 'num:negative'
+  }
+  if (/^(?:true|false)$/i.test(value)) return `bool:${value.toLowerCase()}`
+  if (param && value.toLowerCase().includes(param.toLowerCase())) return 'predicate'
+  if (/^[A-Za-z0-9_+/=-]{16,}$/.test(value)) return 'token'
+  return value.length <= 32 ? 'short' : 'long'
+}
+
+/**
+ * Coarse structural signature: presence of keys, array length buckets, primitive *classes* and
+ * status classes. Raw text is deliberately not compared, so a rotating nonce or timestamp cannot
+ * masquerade as a differential.
+ */
+function structuralSignature(value: unknown, param?: string | null): Map<string, string> {
+  const out = new Map<string, string>()
+  const walk = (node: unknown, path: string, depth: number): void => {
+    if (depth > 6 || out.size >= 256) return
+    const key = path || '$'
+    if (node === null || node === undefined) { out.set(key, 'null'); return }
+    if (Array.isArray(node)) {
+      out.set(`${key}[]`, node.length === 0 ? 'len:0' : node.length === 1 ? 'len:1' : node.length <= 3 ? 'len:few' : 'len:many')
+      for (let i = 0; i < Math.min(node.length, 8); i += 1) walk(node[i], `${key}[${i}]`, depth + 1)
+      return
+    }
+    if (typeof node === 'object') {
+      const entries = Object.entries(node as Record<string, unknown>).slice(0, 64)
+      for (const [childKey, child] of entries) walk(child, path ? `${path}.${childKey}` : childKey, depth + 1)
+      return
+    }
+    out.set(key, leafClassOf(String(node), param))
+  }
+  walk(value, '', 0)
+  if (out.size === 0) out.set('$', 'empty')
+  return out
+}
+
+function bodySignature(arm: BooleanDifferentialArm, param?: string | null): Map<string, string> {
+  const signature = arm.json !== undefined
+    ? structuralSignature(arm.json, param)
+    : (() => {
+        const text = String(arm.body ?? '')
+        const out = new Map<string, string>()
+        out.set('body.length', text.length === 0 ? 'len:0' : text.length < 64 ? 'len:small' : text.length < 1024 ? 'len:medium' : 'len:large')
+        out.set('body.lines', ((): string => {
+          const lines = text.split('\n').length
+          return lines <= 1 ? 'len:1' : lines <= 8 ? 'len:few' : 'len:many'
+        })())
+        return out
+      })()
+  signature.set('$status', arm.status === null ? 'none' : `${Math.floor(arm.status / 100)}xx`)
+  return signature
+}
+
+function flattenedRaw(arm: BooleanDifferentialArm): Map<string, string> {
+  if (arm.json !== undefined) return flattenJson(arm.json)
+  return new Map([['body.text', String(arm.body ?? '')]])
+}
+
+function paramValueFromQuery(pathAndQuery: string | undefined, param: string): string | null {
+  if (!pathAndQuery) return null
+  try {
+    return new URL(pathAndQuery, 'http://guardian.invalid').searchParams.get(param)
+  } catch {
+    return null
+  }
+}
+
+function paramValueFromJson(value: unknown, param: string): string | null {
+  if (!value || typeof value !== 'object') return null
+  const wanted = param.split('.').pop() ?? param
+  const walk = (node: unknown): string | null => {
+    if (!node || typeof node !== 'object') return null
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        const hit = walk(item)
+        if (hit !== null) return hit
+      }
+      return null
+    }
+    for (const [key, child] of Object.entries(node as Record<string, unknown>)) {
+      if (key === param || key === wanted) return child === undefined || child === null ? null : String(child)
+      const hit = walk(child)
+      if (hit !== null) return hit
+    }
+    return null
+  }
+  return walk(value)
+}
+
+function maskJsonParam(value: unknown, param: string): unknown {
+  const wanted = param.split('.').pop() ?? param
+  const walk = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(walk)
+    if (!node || typeof node !== 'object') return node
+    const out: Record<string, unknown> = {}
+    for (const [key, child] of Object.entries(node as Record<string, unknown>)) {
+      out[key] = key === param || key === wanted ? '{{injected}}' : walk(child)
+    }
+    return out
+  }
+  return walk(value)
+}
+
+function maskedPath(pathAndQuery: string | undefined, param: string): string {
+  if (!pathAndQuery) return ''
+  try {
+    const url = new URL(pathAndQuery, 'http://guardian.invalid')
+    if (url.searchParams.has(param)) url.searchParams.set(param, '{{injected}}')
+    return `${url.pathname}?${[...url.searchParams.entries()].map(([k, v]) => `${k}=${v}`).sort().join('&')}`
+  } catch {
+    return pathAndQuery
+  }
+}
+
+function canonicalHeaders(headers: Record<string, string> | null | undefined): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(headers ?? {})) {
+    if (booleanVolatileHeaders.has(key.toLowerCase())) continue
+    out[key.toLowerCase()] = value
+  }
+  return out
+}
+
+function requestShape(arm: BooleanDifferentialArm, param: string): string {
+  return JSON.stringify({
+    method: (arm.method ?? '').toUpperCase(),
+    path: maskedPath(arm.pathAndQuery, param),
+    json: arm.requestJson === undefined ? null : maskJsonParam(arm.requestJson, param),
+    headers: canonicalHeaders(arm.requestHeaders),
+  })
+}
+
+/**
+ * A rotating nonce/token: an alphanumeric run containing both letters and digits (or a long hex
+ * run). Used only to *reject* a difference as volatile, never to confirm one.
+ */
+function looksVolatileValue(text: string): boolean {
+  return /(?=.*[A-Za-z])(?=.*[0-9])[A-Za-z0-9_-]{8,}/.test(text) || /[0-9a-f]{12,}/i.test(text)
+}
+
+function normalizeEchoText(text: string, injected: readonly string[]): string {
+  let out = text
+  for (const value of injected) {
+    if (value) out = out.split(value).join('')
+  }
+  return out.replace(nonceLikeRun, '').trim()
+}
+
+/** Paths whose raw values differ, plus whether each difference is only an echo/nonce artefact. */
+function differentialPaths(control: BooleanDifferentialArm, probe: BooleanDifferentialArm, param: string): {
+  changed: string[]
+  echoed: string[]
+} {
+  const controlRaw = flattenedRaw(control)
+  const probeRaw = flattenedRaw(probe)
+  const paths = new Set([...controlRaw.keys(), ...probeRaw.keys()])
+  const injected = [
+    paramValueFromQuery(probe.pathAndQuery, param) ?? '',
+    paramValueFromQuery(control.pathAndQuery, param) ?? '',
+    paramValueFromJson(probe.requestJson, param) ?? '',
+    paramValueFromJson(control.requestJson, param) ?? '',
+  ].filter(Boolean)
+  const changed: string[] = []
+  const echoed: string[] = []
+  const controlSig = bodySignature(control, param)
+  const probeSig = bodySignature(probe, param)
+  for (const path of paths) {
+    const cRaw = controlRaw.get(path) ?? ''
+    const pRaw = probeRaw.get(path) ?? ''
+    // Signature-level comparison first: only class/bucket changes count as structural.
+    const cSig = controlSig.get(path) ?? ''
+    const pSig = probeSig.get(path) ?? ''
+    if (cSig === pSig) continue
+    changed.push(path)
+    const leaf = path.split('.').pop() ?? path
+    const looksEcho = leaf.toLowerCase() === param.toLowerCase() ||
+      leaf.toLowerCase().endsWith(param.toLowerCase()) ||
+      (pRaw !== cRaw && normalizeEchoText(pRaw, injected) === normalizeEchoText(cRaw, injected)) ||
+      (pRaw !== cRaw && looksVolatileValue(pRaw) && (cRaw === '' || looksVolatileValue(cRaw))) ||
+      (pRaw.includes(param) && cRaw.includes(param))
+    if (looksEcho) echoed.push(path)
+  }
+  return { changed, echoed }
+}
+
+function signatureMapKey(map: Map<string, string>): string {
+  return [...map.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join('|')
+}
+
+/**
+ * Paired boolean-differential oracle. Confirms only when:
+ *  - at least two control/probe rounds exist;
+ *  - each pair sends the same request shape (method, route with the injected parameter masked,
+ *    body and non-volatile headers) and the same route as its sibling arm;
+ *  - no arm returned 5xx;
+ *  - the control and probe structural signatures are each stable across rounds;
+ *  - the control-vs-probe structural difference is non-empty and identical in every round;
+ *  - the difference survives token stripping (echo/nonce-only changes are rejected).
+ */
+export function assessBooleanDifferential(input: {
+  rounds: readonly BooleanDifferentialRound[]
+  param?: string | null
+}): BooleanDifferentialAssessment {
+  const param = input.param?.trim() || ''
+  const evidence = {
+    rounds: input.rounds.length,
+    stable: false,
+    controlStable: false,
+    probeStable: false,
+    requestShapeMismatch: false,
+    serverErrors: false,
+    echoedOnly: false,
+    changedPaths: [] as string[],
+    echoPaths: [] as string[],
+  }
+  const reject = (reason: string): BooleanDifferentialAssessment => ({
+    required: true,
+    satisfied: false,
+    reason,
+    evidence,
+  })
+
+  if (!param) return reject('A boolean differential must name the injected parameter.')
+  if (input.rounds.length < 2) return reject('A boolean differential needs at least two paired control/probe rounds.')
+  for (const round of input.rounds) {
+    if ((round.control.status ?? 0) >= 500 || (round.probe.status ?? 0) >= 500) {
+      evidence.serverErrors = true
+      return reject('A boolean differential arm returned a server error (5xx); error behaviour is not proof.'
+      )
+    }
+  }
+  for (const round of input.rounds) {
+    if (requestShape(round.control, param) !== requestShape(round.probe, param)) {
+      evidence.requestShapeMismatch = true
+      return reject('The control and probe arms differ beyond the injected parameter (request shape mismatch).')
+    }
+  }
+
+  const controlSignatures = input.rounds.map(round => signatureMapKey(bodySignature(round.control, param)))
+  const probeSignatures = input.rounds.map(round => signatureMapKey(bodySignature(round.probe, param)))
+  evidence.controlStable = new Set(controlSignatures).size === 1
+  evidence.probeStable = new Set(probeSignatures).size === 1
+  if (!evidence.controlStable || !evidence.probeStable) {
+    return reject('The control or probe response structure was unstable across rounds; a moving baseline is not a differential.')
+  }
+
+  const roundDiffs = input.rounds.map(round => differentialPaths(round.control, round.probe, param))
+  const structural = roundDiffs.map(diff => diff.echoed.length === diff.changed.length ? '' : [...diff.changed].filter(path => !diff.echoed.includes(path)).sort().join(','))
+  const allEchoed = roundDiffs.every(diff => diff.changed.length > 0 && diff.echoed.length === diff.changed.length)
+  evidence.echoPaths = [...new Set(roundDiffs.flatMap(diff => diff.echoed))]
+  evidence.changedPaths = [...new Set(structural.flatMap(value => value ? value.split(',') : []))]
+  if (allEchoed) {
+    evidence.echoedOnly = true
+    return reject('The only difference was the injected predicate echoed back (or a rotating nonce); no structural response change.')
+  }
+  if (structural.some(value => value === '')) {
+    return reject('At least one round showed no structural response change; a boolean differential must reproduce every round.')
+  }
+  if (new Set(structural).size !== 1) {
+    return reject('The structural response difference was unstable across rounds; the boolean differential must be identical each round.')
+  }
+  evidence.stable = true
+  return {
+    required: true,
+    satisfied: true,
+    reason: `A paired control/probe differential reproduced across ${input.rounds.length} rounds: structural change in ${evidence.changedPaths.slice(0, 6).join(', ')} after token stripping, with a stable control baseline and no 5xx.`,
+    evidence,
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Markup / script execution
 // ---------------------------------------------------------------------------
 
