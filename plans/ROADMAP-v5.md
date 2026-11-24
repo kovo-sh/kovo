@@ -920,3 +920,18 @@ Funnel (`--no-llm`, docker):
 Remaining missed route-hit targets: `api-jwt-alg-none`, `giftcard-race`, `coupon-reuse`, `inventory-oversell` — a useful, concrete list for the next capability pass rather than a vague "conversion is bad".
 
 **Expected effect on lift:** with 39 investigations at 12.5% verify we got +1. At ~69% verify the same investigation budget should produce several more confirmed targets — to be measured on the next full matrix once `spec-authz` and `persona-binding` land.
+
+### 2026-11-24 — hourly check-in #16: retest-on-receipts is the final M0 step; per-request persona scope; gap validation
+
+**Triage (accept/reject/defer):**
+
+| # | Recommendation | Verdict | Owner |
+|---|---|---|---|
+| 1 | Moving patch retest (`patch-workflow.ts`) + `benchmark-live.ts` onto receipts/typed recipes **is** the final M0 step and runs in parallel on the serialized Engine Lane: floor findings retest by re-running the persisted recipe, agent findings by re-running the persisted `guardian_verify`, both validated by `verifyReceipt()`; then delete the VM | **ACCEPT** | `retest-receipts` (launched) |
+| 2 | Do not re-issue the certificate until the persona bisect lands. If the viewer **legitimately** owns persona_a's store and `bd01209` introduced a regression → fix it and re-confirm 28/58. If the viewer legitimately belongs to persona_b's store and `2621bab` only reached 28 through **cross-persona session bleed** → re-issue at **26/58 with an erratum** and keep Total Product Recall at ≥32/58 | **ACCEPT** | coordinator + `persona-binding` |
+| 3 | Sequence: fix persona-binding → **one Tier-1 smoke (~6 min, ~$1.30, precision trap included)** → then the full dev+held-out matrix. A 5.5× jump in `verify_called` stresses the oracle 5.5× harder, so smoke first rather than burning a serialized 6-app matrix | **ACCEPT** | coordinator |
+| 4 | **Hard per-request persona scope**: `Map<workerId, Map<personaHandle, IsolatedSession>>`, cookies resolved only from `(workerId, personaHandle)`, `Set-Cookie` rotations scoped back to that exact key. Post-hoc invalidation still puts another tenant's cookies on the wire. Mismatch detection stays as defense-in-depth | **ACCEPT** | `persona-binding` |
+| 5 | Do **not** cap coded gaps arbitrarily — **validate them against the Layer-1 transcript** per route: `auth_blocked` needs 401/403 + <2 authenticated successes; `endpoint_not_found` needs 404/405; `no_readback_surface` needs ≥1 mutation and 0 readable GETs in the family; `hardened_or_no_anomaly` needs a control + a differential probe. Unsubstantiated gap ⇒ one rejection + the reserved wrap-up turn | **ACCEPT** | `gap-validation` (launched) |
+| 6 | Batch order: (c) engine lane retest + VM deletion **and** (a) capability lane (`api-jwt-alg-none`, `giftcard-race`, `coupon-reuse`, `inventory-oversell` = 1 JWT boundary + 3 stateful race/workflow, general classes worth +4–5 held-out); (b) #2 blind SQLi/chain after. If those four still fail at 69% verify, a 1-cell frontier-model control needs operator approval (same-model constraint) | **ACCEPT** | coordinator |
+
+**Active after this pulse:** `spec-authz`, `persona-binding`, `retest-receipts`, `gap-validation`. Capability lane waits on `spec-authz`'s `deterministic-specs`/`probes` lease.
