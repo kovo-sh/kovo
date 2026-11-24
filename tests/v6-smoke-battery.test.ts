@@ -19,6 +19,7 @@ import { test } from 'node:test'
 
 import {
   assignmentP50Ms,
+  bestSnapshotDir,
   confirmedVulnerabilityCounts,
   conversionOf,
   countCrashes,
@@ -108,7 +109,7 @@ test('tier parsing: defaults, explicit flags, and rejection of unknown flags', (
   assert.equal(defaults.seed, 1)
   assert.equal(defaults.durationSec, 300)
   assert.equal(defaults.trapDurationSec, 240)
-  assert.equal(defaults.cellIndex, 0)
+  assert.ok(Number.isInteger(defaults.cellIndex) && defaults.cellIndex >= 0)
   assert.equal(defaults.budgetUsdPerCell, 0.8)
 
   const explicit = parseSmokeArgs([
@@ -330,6 +331,15 @@ test('snapshot-missing falls back to a cold run with snapshot capture', () => {
   const after = planTierOne(opts)
   assert.equal(after.find(plan => plan.kind === 'lift')!.source, 'snapshot')
   assert.equal(after.find(plan => plan.kind === 'rotation')!.source, 'cold')
+
+  // A planner-round checkpoint with floor confirmations is preferred over a pre-floor base copy.
+  const round = join(acme, 'planner-round-1')
+  mkdirSync(round, { recursive: true })
+  writeFileSync(join(acme, 'snapshot.json'), '{"counts":{"runtimeConfirmed":0}}\n')
+  writeFileSync(join(round, 'snapshot.json'), '{"counts":{"runtimeConfirmed":11}}\n')
+  assert.equal(bestSnapshotDir(acme), round)
+  assert.equal(planTierOne(opts).find(plan => plan.kind === 'lift')!.snapshot, round)
+  assert.equal(bestSnapshotDir(join(tempRoot, 'missing')), null)
 })
 
 // ---------------------------------------------------------------------------

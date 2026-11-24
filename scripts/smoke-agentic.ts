@@ -11,7 +11,7 @@
 // on synthetic, authorized loopback targets. It never attacks third-party systems.
 
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
@@ -45,6 +45,8 @@ export type AssessorKind = 'mfa' | 'business_logic' | 'mass_assignment' | 'csrf'
 // ---------------------------------------------------------------------------
 
 export interface SmokeArgs {
+  /** Repository/worktree root used for child processes (calibration varies this). */
+  repoRoot: string
   tier: Tier
   dryRun: boolean
   cellIndex: number
@@ -102,7 +104,7 @@ Flags:
   --seed <n>                dev seed for lift/rotation/trap (default 1)
   --duration-sec <n>        lift/rotation budget (default 300)
   --trap-duration-sec <n>   trap budget (default 240)
-  --micro-duration-sec <n>  per-fixture micro-slice budget (default 180)
+  --micro-duration-sec <n>  per-fixture micro-slice budget (default 300)
   --out-dir <path>          artifacts (default .guardian/smoke-battery)
   --data-dir <path>         Guardian data dir (default $GUARDIAN_DATA_DIR or
                             /home/omarchy/guardian-data)
@@ -190,8 +192,8 @@ export function parseSmokeArgs(argv: string[], _env: NodeJS.ProcessEnv = process
   for (const key of Object.keys(flags)) if (!known.has(key)) fail(`unknown flag --${key}`)
   if (flags.help === true) {
     return {
-      tier: 1, dryRun: false, cellIndex: 0, seed: 1, durationSec: 300,
-      trapDurationSec: 240, microDurationSec: 180, outDir: DEFAULT_OUT,
+      repoRoot: ROOT, tier: 1, dryRun: false, cellIndex: 0, seed: 1, durationSec: 300,
+      trapDurationSec: 240, microDurationSec: 300, outDir: DEFAULT_OUT,
       dataDir: DEFAULT_DATA_DIR, snapshotRoot: join(DEFAULT_OUT, 'snapshots'),
       liftBaseline: 0, corpusPath: CORPUS_PATH, json: false, calibrate: false,
       rerunOnMinusOne: false, skipWorkerGate: false, microFixtures: [...MICRO_FIXTURES],
@@ -214,15 +216,18 @@ export function parseSmokeArgs(argv: string[], _env: NodeJS.ProcessEnv = process
   if (!Number.isFinite(budget) || budget <= 0) fail('--budget-usd-per-cell must be a positive number')
   const liftBaselineRaw = Number(str(flags, 'lift-baseline') ?? '0')
   if (!Number.isFinite(liftBaselineRaw) || liftBaselineRaw < 0) fail('--lift-baseline must be >= 0')
+  const now = new Date()
+  const defaultCellIndex = Math.floor((now.getTime() - Date.UTC(now.getUTCFullYear(), 0, 0)) / 86_400_000)
   if (flags.calibrate === true && !str(flags, 'variants')) fail('--calibrate requires --variants <json>')
   return {
+    repoRoot: ROOT,
     tier: Number(tierRaw) as Tier,
     dryRun: flags['dry-run'] === true,
-    cellIndex: nonNegativeInt(str(flags, 'cell-index'), '--cell-index', 0),
+    cellIndex: nonNegativeInt(str(flags, 'cell-index'), '--cell-index', defaultCellIndex),
     seed: positiveInt(str(flags, 'seed'), '--seed', 1),
     durationSec: positiveInt(str(flags, 'duration-sec'), '--duration-sec', 300),
     trapDurationSec: positiveInt(str(flags, 'trap-duration-sec'), '--trap-duration-sec', 240),
-    microDurationSec: positiveInt(str(flags, 'micro-duration-sec'), '--micro-duration-sec', 180),
+    microDurationSec: positiveInt(str(flags, 'micro-duration-sec'), '--micro-duration-sec', 300),
     outDir,
     dataDir: str(flags, 'data-dir') ?? DEFAULT_DATA_DIR,
     snapshotRoot,
@@ -598,7 +603,11 @@ export function preservedSiteIds(card: ScorecardLike | null, baselineIds: string
 }
 
 export function conversionOf(card: ScorecardLike | null): number | null {
-  if (!card?.funnel) return null
+  if (!card) return null
+  // Prefer overall target conversion (confirmed/targets); fall back to spec conversion when a
+  // caller only has funnel counters. The lift gate compares this with the floor baseline.
+  if ((card.targets ?? 0) > 0) return (card.confirmed ?? 0) / card.targets!
+  if (!card.funnel) return null
   const submitted = card.funnel.specSubmitted ?? 0
   const confirmed = card.funnel.zeroLlmConfirmed ?? 0
   return submitted > 0 ? confirmed / submitted : (confirmed > 0 ? 1 : 0)
@@ -687,6 +696,31 @@ export function hasSnapshot(dir: string): boolean {
   return existsSync(join(dir, 'snapshot.json'))
 }
 
+/**
+ * Prefer the checkpoint with the most runtime-confirmed floor findings. The post-floor capture
+ * is taken at the boundary and can precede floor confirmations; `planner-round-N` carries them.
+ * Falling back to the base directory keeps old single-checkpoint snapshots working.
+ */
+export function bestSnapshotDir(dir: string): string | null {
+  if (!existsSync(dir)) return null
+  const runtimeConfirmed = (candidate: string): number => {
+    const snapshot = readJson<{ counts?: { runtimeConfirmed?: number } }>(join(candidate, 'snapshot.json'))
+    return snapshot?.counts?.runtimeConfirmed ?? 0
+  }
+  let best: string | null = hasSnapshot(dir) ? dir : null
+  let bestCount = best ? runtimeConfirmed(best) : -1
+  try {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^planner-round-\d+$/.test(entry.name)) continue
+      const candidate = join(dir, entry.name)
+      if (!hasSnapshot(candidate)) continue
+      const count = runtimeConfirmed(candidate)
+      if (count > bestCount) { best = candidate; bestCount = count }
+    }
+  } catch { /* unreadable directory means no checkpoint */ }
+  return best
+}
+
 // ---------------------------------------------------------------------------
 // Process execution
 // ---------------------------------------------------------------------------
@@ -761,14 +795,18 @@ interface CellPlan {
 export function planTierOne(opts: SmokeArgs): CellPlan[] {
   const micro = opts.microFixtures.join(',')
   const rotation = rotateSecondApp({ cellIndex: opts.cellIndex })
+  const liftSnapshot = bestSnapshotDir(snapshotDir(opts.snapshotRoot, 'acme-saas', opts.seed))
+  const rotationSnapshot = bestSnapshotDir(snapshotDir(opts.snapshotRoot, rotation, opts.seed))
   return [
     {
       id: 'lift',
       kind: 'lift',
       app: 'acme-saas',
-      source: hasSnapshot(snapshotDir(opts.snapshotRoot, 'acme-saas', opts.seed)) ? 'snapshot' : 'cold',
+      source: liftSnapshot ? 'snapshot' : 'cold',
       outDir: join(opts.outDir, 'cells', 'lift'),
-      snapshot: snapshotDir(opts.snapshotRoot, 'acme-saas', opts.seed),
+      ...(liftSnapshot
+        ? { snapshot: liftSnapshot }
+        : { snapshot: snapshotDir(opts.snapshotRoot, 'acme-saas', opts.seed) }),
       command: 'node scripts/benchmark-realistic.ts',
       args: ['--app', 'acme-saas'],
     },
@@ -776,9 +814,11 @@ export function planTierOne(opts: SmokeArgs): CellPlan[] {
       id: 'rotation',
       kind: 'rotation',
       app: rotation,
-      source: hasSnapshot(snapshotDir(opts.snapshotRoot, rotation, opts.seed)) ? 'snapshot' : 'cold',
+      source: rotationSnapshot ? 'snapshot' : 'cold',
       outDir: join(opts.outDir, 'cells', 'rotation'),
-      snapshot: snapshotDir(opts.snapshotRoot, rotation, opts.seed),
+      ...(rotationSnapshot
+        ? { snapshot: rotationSnapshot }
+        : { snapshot: snapshotDir(opts.snapshotRoot, rotation, opts.seed) }),
       command: 'node scripts/benchmark-realistic.ts',
       args: ['--app', rotation],
     },
@@ -831,10 +871,10 @@ function baseEnv(opts: SmokeArgs): NodeJS.ProcessEnv {
   }
 }
 
-async function prepareIsolated(dataDir: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+async function prepareIsolated(sourceDataDir: string, dataDir: string): Promise<{ ok: true } | { ok: false; reason: string }> {
   try {
     const { prepareIsolatedDataDir } = await import('./benchmark-realistic.ts')
-    prepareIsolatedDataDir({ sourceDataDir: DEFAULT_DATA_DIR, targetDir: dataDir })
+    prepareIsolatedDataDir({ sourceDataDir, targetDir: dataDir })
     return { ok: true }
   } catch (error) {
     return { ok: false, reason: error instanceof Error ? error.message : String(error) }
@@ -848,7 +888,7 @@ async function prepareIsolated(dataDir: string): Promise<{ ok: true } | { ok: fa
 async function runRealisticCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetrics> {
   mkdirSync(plan.outDir, { recursive: true, mode: 0o700 })
   const dataDir = join(plan.outDir, 'data')
-  const prepared = await prepareIsolated(dataDir)
+  const prepared = await prepareIsolated(opts.dataDir, dataDir)
   if (!prepared.ok) {
     return emptyCell(plan, { error: `data dir preflight failed: ${prepared.reason}` })
   }
@@ -856,7 +896,7 @@ async function runRealisticCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMe
   const result = await spawnLogged({
     command: 'node',
     args: ['scripts/benchmark-realistic.ts', ...realisticArgs(plan, opts)],
-    cwd: ROOT,
+    cwd: opts.repoRoot,
     env: baseEnv(opts),
     logPath,
     docker: true,
@@ -874,7 +914,16 @@ async function runRealisticCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMe
   const floorPreserved = plan.kind === 'lift' && baselineIds.length > 0
     ? preservedSiteIds(card, baselineIds)
     : null
+  // A resumed scorecard counts only oracle evidence from this process, so effective lift
+  // conversion = net-new + preserved floor findings over the cell's targets.
+  const effectiveConfirmed = plan.kind === 'lift' && plan.source === 'snapshot'
+    ? confirmed + (floorPreserved ?? 0)
+    : confirmed
+  const conversion = (card?.targets ?? 0) > 0 ? effectiveConfirmed / card!.targets! : conversionOf(card)
   const log = readLog(logPath)
+  const dbPath = plan.source === 'snapshot'
+    ? join(plan.outDir, 'data', `${plan.app}-seed${opts.seed}-grey-box-resume`, 'guardian.sqlite')
+    : join(dataDir, 'guardian.sqlite')
   return {
     id: plan.id,
     kind: plan.kind,
@@ -888,9 +937,9 @@ async function runRealisticCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMe
     netNew,
     floorConfirmed,
     floorPreserved,
-    conversion: conversionOf(card),
-    costUsd: card?.totalCostUsd ?? spentUsd(join(dataDir, 'guardian.sqlite')),
-    p50AssignmentMs: assignmentP50Ms(join(dataDir, 'guardian.sqlite')),
+    conversion,
+    costUsd: card?.totalCostUsd ?? spentUsd(dbPath),
+    p50AssignmentMs: assignmentP50Ms(dbPath),
     completedAssignments: meta?.assignments?.completed ?? 0,
     wallMs: meta?.durationMs ?? result.wallMs,
     crashes: countCrashes(`${log}\n${(meta?.notes ?? []).join('\n')}`),
@@ -925,12 +974,28 @@ function emptyCell(plan: CellPlan, extra: Partial<CellMetrics> = {}): CellMetric
 async function runTrapCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetrics> {
   mkdirSync(plan.outDir, { recursive: true, mode: 0o700 })
   const dataDir = join(plan.outDir, 'data')
-  const prepared = await prepareIsolated(dataDir)
+  const prepared = await prepareIsolated(opts.dataDir, dataDir)
   if (!prepared.ok) {
     return emptyCell(plan, { error: `data dir preflight failed: ${prepared.reason}` })
   }
   const trap = await startZeroVulnTrap({ seed: opts.seed })
   const logPath = join(plan.outDir, 'run.log')
+  // Hand the CLI owner-held synthetic bearer credentials so the trap's authorized surface is
+  // actually exercised. Files are 0600 and live inside the cell artifact dir.
+  const personaDir = join(plan.outDir, 'personas')
+  mkdirSync(personaDir, { recursive: true, mode: 0o700 })
+  const personaArgs: string[] = []
+  for (const persona of trap.personas) {
+    if (!persona.token) continue
+    const credentialPath = join(personaDir, `${persona.id}.json`)
+    writeFileSync(credentialPath, `${JSON.stringify({
+      secret: persona.token,
+      authKind: 'bearer',
+      roleLabel: `${persona.role} (${persona.tenant})`,
+      canaryMarkers: [],
+    }, null, 2)}\n`, { mode: 0o600 })
+    personaArgs.push('--persona', `${persona.id}:${credentialPath}`)
+  }
   try {
     const result = await spawnLogged({
       command: 'node',
@@ -939,13 +1004,14 @@ async function runTrapCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetrics
         '--origin', trap.origins.app!,
         '--local-lab',
         '--tier', '3',
+        ...personaArgs,
         '--budget-usd', String(opts.budgetUsdPerCell),
         '--budget-requests', '3000',
-        '--max-rps', '50',
+        '--max-rps', '20',
         '--timeout-sec', String(opts.trapDurationSec),
         '--output-dir', plan.outDir,
       ],
-      cwd: ROOT,
+      cwd: opts.repoRoot,
       env: baseEnv(opts),
       logPath,
       docker: true,
@@ -1051,7 +1117,7 @@ async function runMicroCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetric
     const fixtureOut = join(plan.outDir, fixture)
     mkdirSync(fixtureOut, { recursive: true, mode: 0o700 })
     const dataDir = join(fixtureOut, 'data')
-    const prepared = await prepareIsolated(dataDir)
+    const prepared = await prepareIsolated(opts.dataDir, dataDir)
     if (!prepared.ok) return { fixture, error: prepared.reason, artifact: null, wallMs: 0, db: '', log: '' }
     const logPath = join(fixtureOut, 'run.log')
     const result = await spawnLogged({
@@ -1064,9 +1130,10 @@ async function runMicroCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetric
         '--budget-usd', String(opts.budgetUsdPerCell),
         '--out-dir', fixtureOut,
         '--data-dir', dataDir,
+        '--keep-data-dirs',
         '--verifier', 'docker',
       ],
-      cwd: ROOT,
+      cwd: opts.repoRoot,
       env: baseEnv(opts),
       logPath,
       docker: true,
@@ -1199,7 +1266,7 @@ async function runTierZero(opts: SmokeArgs, report: SmokeReport): Promise<void> 
   if (!opts.skipWorkerGate && !opts.dryRun) {
     const logPath = join(opts.outDir, 'tier0-worker-gate.log')
     const result = await spawnLogged({
-      command: 'bash', args: ['scripts/worker-gate.sh'], cwd: ROOT, env: process.env, logPath, docker: false,
+      command: 'bash', args: ['scripts/worker-gate.sh'], cwd: opts.repoRoot, env: process.env, logPath, docker: false,
     })
     report.tier0.workerGate = result.code === 0 ? 'pass' : 'fail'
     gatePass = gatePass && result.code === 0
@@ -1296,10 +1363,14 @@ async function runCalibration(opts: SmokeArgs): Promise<void> {
       }
     }
     if (!cwd) cwd = ROOT
+    const variantOut = join(opts.outDir, 'calibration', variant.label)
     const variantOpts: SmokeArgs = {
       ...opts,
-      outDir: join(opts.outDir, 'calibration', variant.label),
-      snapshotRoot: join(opts.outDir, 'calibration', variant.label, 'snapshots'),
+      repoRoot: cwd,
+      outDir: variantOut,
+      snapshotRoot: join(variantOut, 'snapshots'),
+      corpusPath: join(cwd, 'benchmarks/realism-suite/traps/fp-archetypes.json'),
+      floorScorecard: undefined,
       dryRun: false,
       calibrate: false,
     }
