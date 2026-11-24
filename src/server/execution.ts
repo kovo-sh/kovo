@@ -804,6 +804,8 @@ export function evaluateDispatchStop(input: {
   reason: string
   remainingReady: number
   freeSlots?: number
+  /** Investigation assignments still in flight; they release the slots queued work waits for. */
+  inFlight?: number
   budgetExhausted?: boolean
   requestExhausted?: boolean
   wallExhausted?: boolean
@@ -818,6 +820,11 @@ export function evaluateDispatchStop(input: {
   if (guarded && !exhausted && remainingReady > 0) {
     if ((input.freeSlots ?? 0) > 0) {
       return { decision: 'continue', stopReason, remainingReady, deferred: true, stranded: false }
+    }
+    // A busy fleet is not stranding: every ready step is queued behind an in-flight assignment and
+    // the scheduler dispatches it as the slot frees. Only an idle fleet abandons planned work.
+    if ((input.inFlight ?? 0) > 0) {
+      return { decision: 'stop', stopReason, remainingReady, deferred: false, stranded: false }
     }
     return { decision: 'stop', stopReason, remainingReady, deferred: false, stranded: true }
   }
@@ -6303,6 +6310,7 @@ export class Execution {
       reason: stopReason,
       remainingReady,
       freeSlots: 0,
+      inFlight: latestSteps.filter(step => step.status === 'running').length,
       budgetExhausted: stopReason === 'budget_exhausted',
       requestExhausted: stopReason === 'requests_exhausted',
       wallExhausted: stopReason === 'wallclock_exhausted' || stopReason === 'run_stopped',
@@ -8619,6 +8627,7 @@ export class Execution {
       reason: decision.reason,
       remainingReady,
       freeSlots: Math.max(0, maxConc - activeForRun),
+      inFlight: activeForRun,
       budgetExhausted: this.storage.checkBudgetExceeded(run.id),
       requestExhausted: latest.budgetRequests > 0 && latest.budgetRequests - latest.spentRequests <= 0,
       wallExhausted: this.maxDurationMs > 0 && latest.createdAt + this.maxDurationMs <= Date.now(),

@@ -174,13 +174,22 @@ test('dry stop with ready work and a free slot is deferred, never silently stran
   assert.equal(evaluation.stopReason, 'dry_rounds')
 })
 
-test('dry stop with ready work and no free slot is reported as a stranded violation', () => {
+test('dry stop with ready work and an idle fleet is a stranded violation', () => {
   const evaluation = evaluateDispatchStop({
-    decision: 'stop', reason: 'diminishing_returns', remainingReady: 4, freeSlots: 0,
+    decision: 'stop', reason: 'diminishing_returns', remainingReady: 4, freeSlots: 0, inFlight: 0,
   })
   assert.equal(evaluation.decision, 'stop')
   assert.equal(evaluation.stranded, true)
   assert.equal(evaluation.remainingReady, 4)
+})
+
+test('dry stop with every slot busy is not a violation: the queue drains behind in-flight work', () => {
+  const evaluation = evaluateDispatchStop({
+    decision: 'stop', reason: 'diminishing_returns', remainingReady: 12, freeSlots: 0, inFlight: 6,
+  })
+  assert.equal(evaluation.decision, 'stop')
+  assert.equal(evaluation.stranded, false)
+  assert.equal(evaluation.remainingReady, 12)
 })
 
 test('a genuinely dry queue still stops (2 dry rounds, zero ready steps)', () => {
