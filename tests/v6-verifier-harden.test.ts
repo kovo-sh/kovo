@@ -793,33 +793,14 @@ test('regression: cache_differential still confirms a persisted poisoned entry',
   } finally { await fx.close() }
 })
 
-test('regression: a browser_dom XSS proof still confirms', async () => {
+test('regression: retired browser_dom kind fails closed without executing legacy VM code', async () => {
   const fx = await startFixture()
   try {
-    const visit = (canary: boolean, token: string | null) => ({
-      origin: fx.origin,
-      finalUrl: `${fx.origin}/card`,
-      title: 'Card',
-      status: 200,
-      domSnippet: '<div id="card"></div>',
-      links: [],
-      forms: [],
-      xhrRequests: [],
-      blockedOrigins: [],
-      consoleMessages: [],
-      postMessageListeners: { count: 0, originChecked: true, canaryHandledWithoutOriginCheck: false },
-      cookieNames: [],
-      localStorageKeys: [],
-      sessionStorageKeys: [],
-      canaryCheck: { token, triggered: canary, detail: canary ? 'active markup rendered' : null },
-      domSinkTraces: [],
-      exchangeIds: [],
-      exchanges: [],
-      durationMs: 1,
-    })
+    let visitCalls = 0
     const browser = {
-      async visitPage(req: { canaryToken?: string }) {
-        return visit(Boolean(req.canaryToken), req.canaryToken ?? null)
+      async visitPage() {
+        visitCalls += 1
+        throw new Error('retired browser_dom must never call visitPage')
       },
     }
     const spec = {
@@ -846,7 +827,9 @@ test('regression: a browser_dom XSS proof still confirms', async () => {
       }`,
     }
     const res = await verify(spec, fx.origin, browser)
-    assert.equal(res.verdict, 'confirmed', String(res.outcome.reason))
+    assert.equal(res.verdict, 'dismissed', String(res.outcome.reason))
+    assert.equal(res.outcome.reason, 'retired_legacy_spec_kind: use guardian_verify')
+    assert.equal(visitCalls, 0)
   } finally { await fx.close() }
 })
 

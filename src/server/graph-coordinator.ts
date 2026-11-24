@@ -183,10 +183,83 @@ export function isUncoveredEndpoint(endpoint: CoordinatorEndpoint): boolean {
   return (endpoint.testedClasses?.length ?? 0) === 0 && (endpoint.coveragePct ?? 0) <= 0
 }
 
+export type NonFloorSemanticClass = 'workflow' | 'business_logic' | 'race' | 'auth_protocol' | 'chain'
+export const NON_FLOOR_SEMANTIC_CLASSES: readonly NonFloorSemanticClass[] = [
+  'workflow', 'business_logic', 'race', 'auth_protocol', 'chain',
+]
+
+const SEMANTIC_MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+const WORKFLOW_PATH_RE = /\/(?:checkout|confirm|approve|reject|submit|publish|cancel|refunds?|transitions?|verify|activate|complete|close|escalate|impersonate|invites?)(?:\/|$)/i
+const BUSINESS_LOGIC_PATH_RE = /\/(?:carts?|orders?|invoices?|billing|plans?|subscriptions?|prices?|discounts?|coupons?|vouchers?|credits?|quotas?|seats?|limits?|tiers?|payments?)(?:\/|$)/i
+const RACE_PATH_RE = /\/(?:redeem|apply|transfers?|withdraw|debit|claims?|reserve|allocate|stock|inventory|balances?|wallets?|gifts?|cards?|coupons?|checkout|pay)(?:\/|$)/i
+const AUTH_PROTOCOL_PATH_RE = /\/(?:auth|login|tokens?|jwt|oauth|oidc|saml|sso|sessions?|refresh|mfa|2fa|otp|magic|reset|verify|keys?|webhooks?|reports?|exports?|integrations?)(?:\/|$)/i
+
+/**
+ * Pure structural classifier for non-floor semantic classes (`workflow`, `business_logic`, `race`,
+ * `auth_protocol`, `chain`) that are under-covered on an endpoint. Returns classes relevant to the
+ * endpoint that have not yet been tested, without any benchmark/app literals.
+ */
+export function classifySemanticEndpointClasses(endpoint: CoordinatorEndpoint): NonFloorSemanticClass[] {
+  const method = (endpoint.method || 'GET').toUpperCase()
+  const path = endpoint.pathTemplate || ''
+  const tested = new Set((endpoint.testedClasses ?? []).map(c => c.toLowerCase()))
+  const mutating = SEMANTIC_MUTATING_METHODS.has(method)
+  const out: NonFloorSemanticClass[] = []
+  if (mutating && WORKFLOW_PATH_RE.test(path) && !tested.has('workflow') && !tested.has('workflow_bypass')) {
+    out.push('workflow')
+  }
+  if (mutating && BUSINESS_LOGIC_PATH_RE.test(path) && !tested.has('business_logic') && !tested.has('price_tampering')) {
+    out.push('business_logic')
+  }
+  if (mutating && RACE_PATH_RE.test(path) && !tested.has('race') && !tested.has('race_burst') && !tested.has('race_condition')) {
+    out.push('race')
+  }
+  if ((AUTH_PROTOCOL_PATH_RE.test(path) || isRoleExclusive(endpoint)) && !tested.has('auth_protocol') && !tested.has('jwt') && !tested.has('jwt_forgery')) {
+    out.push('auth_protocol')
+  }
+  if ((endpoint.sinkKinds?.length ?? 0) > 0 && (endpoint.coveragePct ?? 0) < 100 && !tested.has('chain')) {
+    out.push('chain')
+  }
+  return out
+}
+
+export interface PrioritizedSemanticEndpoint {
+  endpoint: CoordinatorEndpoint
+  semanticClasses: NonFloorSemanticClass[]
+  priorityScore: number
+}
+
+/**
+ * Rank unconfirmed endpoints carrying untested non-floor semantic classes ahead of generic routes
+ * already swept by the deterministic floor. Pure and deterministic.
+ */
+export function prioritizeSemanticEndpoints(
+  endpoints: readonly CoordinatorEndpoint[],
+  options: { confirmedPaths?: ReadonlySet<string>; limit?: number } = {},
+): PrioritizedSemanticEndpoint[] {
+  const confirmed = options.confirmedPaths
+  const limit = resolveLimit(options.limit, 20)
+  const ranked: PrioritizedSemanticEndpoint[] = []
+  for (const endpoint of endpoints) {
+    if (confirmed?.has(endpoint.pathTemplate)) continue
+    const semanticClasses = classifySemanticEndpointClasses(endpoint)
+    if (!semanticClasses.length) continue
+    const score = (endpoint.riskScore ?? 0) + semanticClasses.length * 15 + (isUncoveredEndpoint(endpoint) ? 10 : 0)
+    ranked.push({ endpoint, semanticClasses, priorityScore: score })
+  }
+  ranked.sort((a, b) =>
+    b.priorityScore - a.priorityScore
+    || (a.endpoint.coveragePct ?? 0) - (b.endpoint.coveragePct ?? 0)
+    || (a.endpoint.id < b.endpoint.id ? -1 : a.endpoint.id > b.endpoint.id ? 1 : 0))
+  return ranked.slice(0, limit)
+}
+
 export interface QueryEndpointsArgs {
   cursor?: string
   limit?: number
   uncoveredOnly?: boolean
+  /** Include endpoints with untested non-floor semantic classes even if another floor class ran. */
+  untestedSemanticOnly?: boolean
   hasSink?: boolean
   missingAuthGuard?: boolean
   roleExclusive?: boolean
@@ -198,13 +271,17 @@ export function queryEndpoints(deps: CoordinatorDeps, args: QueryEndpointsArgs =
   const prefix = args.pathPrefix?.trim().toLowerCase()
   const filtered = deps.listEndpoints()
     .filter(endpoint => !args.uncoveredOnly || isUncoveredEndpoint(endpoint))
+    .filter(endpoint => !args.untestedSemanticOnly || classifySemanticEndpointClasses(endpoint).length > 0)
     .filter(endpoint => !args.hasSink || (endpoint.sinkKinds?.length ?? 0) > 0)
     .filter(endpoint => !args.missingAuthGuard || isMissingAuthGuard(endpoint))
     .filter(endpoint => !args.roleExclusive || isRoleExclusive(endpoint))
     .filter(endpoint => !prefix || endpoint.pathTemplate.toLowerCase().startsWith(prefix))
     .slice()
     .sort((a, b) =>
-      (b.riskScore ?? 0) - (a.riskScore ?? 0)
+      (args.untestedSemanticOnly
+        ? classifySemanticEndpointClasses(b).length - classifySemanticEndpointClasses(a).length
+        : 0)
+      || (b.riskScore ?? 0) - (a.riskScore ?? 0)
       || (a.coveragePct ?? 0) - (b.coveragePct ?? 0)
       || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   return pageOf(filtered, args.cursor, args.limit)

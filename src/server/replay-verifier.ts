@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, randomInt, randomUUID } from 'node:crypto'
-import { diffResponse, dnsTakeoverAnalyze } from '../../worker/analyzers.ts'
+import { diffResponse } from '../../worker/analyzers.ts'
 import { maxInlineVerifyRetries } from '../domain.ts'
 import type { InlineVerifyFeedback, VerificationTier } from '../domain.ts'
 import type { StateChangeApprovalContext } from './approval-judge.ts'
@@ -14,7 +14,7 @@ import {
   replaySpecOrigins,
 } from '../replay-spec.ts'
 import type { AgentScriptProofEnvelope, AuthMutation, DeclarativeReplaySpec, FloorRecipeEnvelope, RaceBurstRequest, ReplayAssertionOutcome, ReplayStep } from '../replay-spec.ts'
-import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied, RequestBroker, websocketResultToExchange } from './broker.ts'
+import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied, RequestBroker } from './broker.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
 import { personaSecrets } from './persona-vault.ts'
@@ -804,6 +804,34 @@ function singleQuoteEscape(value: string): string {
   return value.replaceAll("'", "'\\''")
 }
 
+export const RETIRED_LEGACY_SPEC_KINDS: ReadonlySet<string> = new Set([
+  'dns_takeover', 'tls_audit', 'browser_dom', 'ws_chain', 'upload_probe',
+])
+export const RETIRED_LEGACY_SPEC_REASON = 'retired_legacy_spec_kind: use guardian_verify'
+
+function retiredLegacyResult(
+  kind: string,
+  exchanges: BrokerExchangeResult[],
+  exchangeIds: string[],
+): ReplayVerificationResult {
+  const evidencePayload = { kind, retired: true, reason: RETIRED_LEGACY_SPEC_REASON }
+  const evidenceSha256 = createHash('sha256').update(JSON.stringify(evidencePayload)).digest('hex')
+  return {
+    verdict: 'dismissed',
+    outcome: {
+      confirmed: false,
+      controlPassed: false,
+      observed: RETIRED_LEGACY_SPEC_REASON,
+      expected: 'Proof submitted via guardian_verify or a wired floor recipe.',
+      reason: RETIRED_LEGACY_SPEC_REASON,
+    },
+    exchangeIds,
+    exchanges,
+    evidencePayload,
+    evidenceSha256,
+  }
+}
+
 function inconclusiveResult(
   reason: string,
   exchanges: BrokerExchangeResult[],
@@ -1236,42 +1264,27 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     return inconclusiveResult('Live replay verification is disabled in Tier 0.', exchanges, exchangeIds, { kind: spec.kind })
   }
 
-  // Hard Tier 3 + HITL approval gate for rce_proof and upload_probe
-  if (spec.kind === 'rce_proof' || spec.kind === 'upload_probe') {
-    const gateRequest = spec.kind === 'rce_proof'
-      ? spec.probeStep.request
-      : { origin: spec.uploadStep.origin, method: spec.uploadStep.method, pathAndQuery: spec.uploadStep.pathAndQuery }
+  if (RETIRED_LEGACY_SPEC_KINDS.has(spec.kind)) {
+    return retiredLegacyResult(spec.kind, exchanges, exchangeIds)
+  }
+
+  // Hard Tier 3 + HITL approval gate for rce_proof
+  if (spec.kind === 'rce_proof') {
+    const gateRequest = spec.probeStep.request
     if (tier < 3) {
       grant.audit('denied', gateRequest.origin)
       return inconclusiveResult(`${spec.kind} replay specs are blocked below Tier 3.`, exchanges, exchangeIds, { kind: spec.kind })
     }
     const localLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
     const approvalFn = grant.isStateChangeApproved
-    // Reproduce the exact fingerprint a Tier-3 decision registers (origin/method/path/persona/body
-    // hash + multipart/rce flags). Without context the one-shot ledger can never be consumed, and a
-    // matching operator pattern would be the only way through — which must never authorize an
-    // RCE/upload proof of execution, so both kinds are flagged `isRceProof`.
-    //
-    // Local-lab uploads short-circuit through the approval module's `local_lab` decision. A public
-    // upload additionally needs the execution-side registration to carry `isRceProof: true` (the
-    // multipart body is interpolated with a fresh nonce, so the broker must also key the grant to the
-    // prepared parts); until then public uploads fail closed instead of accepting a pattern.
-    const approvalContext: StateChangeApprovalContext = spec.kind === 'rce_proof'
-      ? {
-          personaHandle: spec.probeStep.request.persona ?? null,
-          body: spec.probeStep.request.textBody ??
-            (spec.probeStep.request.jsonBody !== undefined ? JSON.stringify(spec.probeStep.request.jsonBody) : null),
-          hasMultipart: false,
-          isRaceBurst: false,
-          isRceProof: true,
-        }
-      : {
-          personaHandle: spec.uploadStep.persona ?? null,
-          body: spec.uploadStep.contentTemplate,
-          hasMultipart: true,
-          isRaceBurst: false,
-          isRceProof: true,
-        }
+    const approvalContext: StateChangeApprovalContext = {
+      personaHandle: spec.probeStep.request.persona ?? null,
+      body: spec.probeStep.request.textBody ??
+        (spec.probeStep.request.jsonBody !== undefined ? JSON.stringify(spec.probeStep.request.jsonBody) : null),
+      hasMultipart: false,
+      isRaceBurst: false,
+      isRceProof: true,
+    }
     const approved = approvalFn
       ? approvalFn(gateRequest.origin, gateRequest.method, gateRequest.pathAndQuery, approvalContext)
       : localLab
@@ -1704,89 +1717,6 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         }
       } finally {
         await canarySession?.close()
-      }
-    } else if (spec.kind === 'dns_takeover') {
-      const dns = await broker.inspectDns(spec.targetOrigin, grant, signal)
-      let http: Record<string, unknown> | null = null
-      let httpError: string | null = null
-      let body = ''
-      let status: number | undefined
-      try {
-        const ex = await broker.executeHttp({
-          origin: spec.targetOrigin,
-          method: 'GET',
-          pathAndQuery: spec.probePath,
-          followRedirects: true,
-        }, grant, signal)
-        recordExchange(ex)
-        http = summarizeExchange(ex)
-        body = ex.body
-        status = ex.status
-      } catch (err) {
-        httpError = err instanceof Error ? err.message : String(err)
-      }
-      const analysis = dnsTakeoverAnalyze({
-        hostname: dns.hostname,
-        cnames: dns.cname,
-        a: dns.a,
-        aaaa: dns.aaaa,
-        status,
-        body,
-        nxdomain: dns.nxdomain,
-      })
-      evidencePayload = {
-        ...evidencePayload,
-        targetOrigin: spec.targetOrigin,
-        dns,
-        http,
-        httpError,
-        analysis,
-      }
-    } else if (spec.kind === 'tls_audit') {
-      const tls = await broker.inspectTls(spec.targetOrigin, grant, signal)
-      evidencePayload = {
-        ...evidencePayload,
-        targetOrigin: spec.targetOrigin,
-        tls,
-      }
-    } else if (spec.kind === 'browser_dom') {
-      const scopedBrowser = params.browser ?? new ScopedBrowser(broker)
-      const canaryToken = `guardian-dom-${randomAlphaToken(10)}`
-      const control = await scopedBrowser.visitPage({
-        origin: spec.targetOrigin,
-        pathAndQuery: spec.controlPath,
-        persona: spec.persona,
-        checkKind: spec.checkKind,
-        onExchange: ex => {
-          exchanges.push(ex)
-          const id = params.onExchange?.(ex)
-          if (typeof id === 'string' && id) exchangeIds.push(id)
-          return id
-        },
-      }, grant, signal)
-
-      const probe = await scopedBrowser.visitPage({
-        origin: spec.targetOrigin,
-        pathAndQuery: spec.probePath.replaceAll('{{canary_token}}', canaryToken),
-        persona: spec.persona,
-        checkKind: spec.checkKind,
-        canaryToken,
-        onExchange: ex => {
-          exchanges.push(ex)
-          const id = params.onExchange?.(ex)
-          if (typeof id === 'string' && id) exchangeIds.push(id)
-          return id
-        },
-      }, grant, signal)
-
-      const stripExchanges = ({ exchanges: _omit, ...rest }: typeof control) => rest
-      evidencePayload = {
-        ...evidencePayload,
-        targetOrigin: spec.targetOrigin,
-        checkKind: spec.checkKind,
-        canaryToken,
-        control: stripExchanges(control),
-        probe: stripExchanges(probe),
       }
     } else if (spec.kind === 'browser_chain') {
       const scopedBrowser = params.browser ?? new ScopedBrowser(broker)
@@ -2440,148 +2370,6 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         },
         control: controlSummary ?? (rounds[0] ? { role: 'control', ...(rounds[0].baseline as Record<string, unknown>) } : null),
         probe: rounds[0] ? { role: 'probe', ...(rounds[0].true as Record<string, unknown>) } : null,
-      }
-    } else if (spec.kind === 'ws_chain') {
-      const stepsOut: Record<string, unknown> = {}
-      let firstControl: Record<string, unknown> | undefined
-      let firstProbe: Record<string, unknown> | undefined
-      for (const step of spec.steps) {
-        signal.throwIfAborted()
-        const result = await broker.probeWebsocket({
-          origin: step.origin,
-          pathAndQuery: step.pathAndQuery,
-          originHeader: step.originHeader,
-          headers: step.headers,
-          persona: step.persona,
-          subprotocols: step.subprotocols,
-          sendMessages: step.sendMessages,
-          maxFrames: step.maxFrames,
-          timeoutMs: Math.max(1500, step.waitMs + 1000),
-        }, grant, signal)
-        recordExchange(websocketResultToExchange(result))
-        const received = result.frames.filter(f => f.direction === 'received')
-        const messages = received.map(f => f.data)
-        let firstJson: unknown = null
-        if (messages[0]) {
-          try { firstJson = JSON.parse(messages[0]) } catch { firstJson = null }
-        }
-        const entry: Record<string, unknown> = {
-          id: step.id,
-          role: step.role,
-          status: result.upgradeStatus ?? 0,
-          connected: result.connected,
-          upgradeStatus: result.upgradeStatus,
-          upgradeHeaders: result.upgradeHeaders,
-          subprotocol: result.subprotocol,
-          originHeader: result.originHeader,
-          persona: result.personaHandle,
-          sentFrames: result.sentFrames,
-          receivedFrames: result.receivedFrames,
-          messages,
-          firstMessage: messages[0] ?? null,
-          body: messages.join('\n'),
-          ...(firstJson !== null ? { json: firstJson } : {}),
-          closeCode: result.closeCode,
-          closeReason: result.closeReason,
-          error: result.error,
-        }
-        stepsOut[step.id] = entry
-        if (step.role === 'control' && !firstControl) firstControl = entry
-        if (step.role === 'probe' && !firstProbe) firstProbe = entry
-        if (
-          guardControlErrors && (step.role === 'control' || step.role === 'probe') && result.upgradeStatus !== null &&
-          isUnexpectedErrorStatus(result.upgradeStatus, spec.expectedStatus)
-        ) {
-          forcedInconclusiveReason ??= `Unexpected HTTP ${result.upgradeStatus} on WebSocket ${step.role} step "${step.id}" (requireControlNonError).`
-        }
-      }
-      evidencePayload = {
-        ...evidencePayload,
-        steps: stepsOut,
-        ...(firstControl ? { control: firstControl } : {}),
-        ...(firstProbe ? { probe: firstProbe } : {}),
-      }
-    } else if (spec.kind === 'upload_probe') {
-      const vars: Record<string, string> = { upload_nonce: `gup${randomAlphaToken(18)}` }
-      const nonce = vars.upload_nonce
-      const stepsOut: Record<string, unknown> = {}
-      let controlLeak = false
-      if (spec.controlStep) {
-        const controlEx = await broker.executeHttp(stepToBrokerRequest(spec.controlStep, vars), grant, signal)
-        recordExchange(controlEx)
-        extractVariables(spec.controlStep, controlEx, vars)
-        controlLeak = controlEx.body.includes(nonce)
-        stepsOut[spec.controlStep.id] = { id: spec.controlStep.id, role: spec.controlStep.role, ...summarizeExchange(controlEx) }
-        if (guardControlErrors && isUnexpectedErrorStatus(controlEx.status, spec.controlStep.expectedStatus, spec.expectedStatus)) {
-          forcedInconclusiveReason = `Unexpected HTTP ${controlEx.status} on upload_probe control step (requireControlNonError).`
-        }
-      }
-      const up = spec.uploadStep
-      const uploadHeaders: Record<string, string> = {}
-      for (const [k, v] of Object.entries(up.headers ?? {})) uploadHeaders[k] = interpolateString(v, vars)
-      const parts = [
-        {
-          name: up.fieldName,
-          filename: interpolateString(up.filename, vars),
-          contentType: up.contentType,
-          content: interpolateString(up.contentTemplate, vars),
-        },
-        ...Object.entries(up.extraFields ?? {}).map(([name, value]) => ({
-          name, contentType: 'text/plain', content: interpolateString(value, vars),
-        })),
-      ]
-      let fetchExchange: BrokerExchangeResult | undefined
-      try {
-        const uploadEx = await broker.executeHttp({
-          origin: up.origin, method: up.method, pathAndQuery: interpolateString(up.pathAndQuery, vars),
-          headers: uploadHeaders, multipartParts: parts, persona: up.persona, followRedirects: false,
-        }, grant, signal)
-        recordExchange(uploadEx)
-        extractVariables({ ...up, request: undefined as never, extract: up.extract } as unknown as ReplayStep, uploadEx, vars)
-        stepsOut[up.id] = { id: up.id, role: up.role, ...summarizeExchange(uploadEx) }
-
-        fetchExchange = await broker.executeHttp(stepToBrokerRequest(spec.fetchStep, vars), grant, signal)
-        recordExchange(fetchExchange)
-        stepsOut[spec.fetchStep.id] = { id: spec.fetchStep.id, role: spec.fetchStep.role, ...summarizeExchange(fetchExchange) }
-      } finally {
-        if (spec.cleanupStep) {
-          try {
-            const cleanupEx = await broker.executeHttp(stepToBrokerRequest(spec.cleanupStep, vars), grant, signal)
-            recordExchange(cleanupEx)
-            stepsOut[spec.cleanupStep.id] = { id: spec.cleanupStep.id, role: 'cleanup', ...summarizeExchange(cleanupEx) }
-          } catch (cleanupErr) {
-            stepsOut[spec.cleanupStep.id] = { id: spec.cleanupStep.id, role: 'cleanup', error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) }
-          }
-        }
-      }
-      const fetched = fetchExchange
-      const contentType = (fetched?.respHeaders['content-type'] ?? fetched?.mediaType ?? '').toLowerCase()
-      const disposition = fetched?.respHeaders['content-disposition'] ?? null
-      const attachment = Boolean(disposition && /^\s*attachment/i.test(disposition))
-      const unsafeType = /text\/html|image\/svg\+xml|application\/xhtml\+xml/.test(contentType)
-      const nonceInFetch = Boolean(fetched && fetched.body.includes(nonce))
-      const fetchOk = Boolean(fetched && fetched.status >= 200 && fetched.status < 300)
-      deterministicProofPassed = nonceInFetch && fetchOk && !controlLeak
-      if (!deterministicProofPassed) proofFailureReason = 'Verifier-minted upload nonce was not retrievable from the fetch step (or leaked on control).'
-      if (guardControlErrors && fetched && isUnexpectedErrorStatus(fetched.status, spec.fetchStep.expectedStatus, spec.expectedStatus)) {
-        forcedInconclusiveReason ??= `Unexpected HTTP ${fetched.status} on upload_probe fetch step (requireControlNonError).`
-      }
-      evidencePayload = {
-        ...evidencePayload,
-        uploadNonce: nonce,
-        steps: stepsOut,
-        extractedVars: vars,
-        uploadProof: {
-          nonceInFetchBody: nonceInFetch,
-          fetchStatus: fetched?.status ?? null,
-          fetchContentType: contentType || null,
-          contentDisposition: disposition,
-          hasAttachmentDisposition: attachment,
-          unsafeInlineRender: unsafeType && !attachment,
-          controlLeak,
-        },
-        ...(spec.controlStep ? { control: stepsOut[spec.controlStep.id] } : {}),
-        probe: stepsOut[spec.fetchStep.id],
       }
     } else if (spec.kind === 'static_ast_proof') {
       if (!params.reposDir) {
@@ -4018,7 +3806,7 @@ export function buildInlineVerifyFeedback(
       const p = payload.postCheck as Record<string, unknown>
       stepStatuses.push(toStepStatusItem(typeof p.id === 'string' ? p.id : 'postCheck', 'probe', p))
     }
-  } else if (kind === 'rce_proof' || kind === 'browser_dom') {
+  } else if (kind === 'rce_proof') {
     if (payload.control && typeof payload.control === 'object') {
       stepStatuses.push(toStepStatusItem('control', 'control', payload.control as Record<string, unknown>))
     }
@@ -4038,10 +3826,6 @@ export function buildInlineVerifyFeedback(
       if (r0.false && typeof r0.false === 'object') {
         stepStatuses.push(toStepStatusItem('false', 'probe', r0.false as Record<string, unknown>))
       }
-    }
-  } else if (kind === 'dns_takeover') {
-    if (payload.http && typeof payload.http === 'object') {
-      stepStatuses.push(toStepStatusItem('http', 'probe', payload.http as Record<string, unknown>))
     }
   } else if (kind === 'cache_differential') {
     if (payload.control && typeof payload.control === 'object') {
@@ -4074,10 +3858,6 @@ export function buildInlineVerifyFeedback(
     const stepMatch = /step\s+"([^"]+)"/i.exec(reason)
     if (stepMatch) {
       failedStepId = stepMatch[1]
-    } else if (/upload_probe\s+control\s+step/i.test(reason)) {
-      failedStepId = 'control'
-    } else if (/upload_probe\s+fetch\s+step/i.test(reason)) {
-      failedStepId = 'fetch'
     } else {
       const errStep = stepStatuses.find(s => s.status === null || s.status === 0 || s.status === 404 || s.status >= 500)
       if (errStep) {
