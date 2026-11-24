@@ -65,6 +65,10 @@ Record fresh fixtures explicitly with `npm run fixtures:capture -- responses`, `
 
 The separate opt-in command `npm run smoke:live -- --live` runs the production browser flow against live OpenRouter and the approved Dyad public home pages. It prints the local report path and data directory. Resume that run with `npm run smoke:live -- --live --resume <data-directory>` if it stops early.
 
+## Smoke battery
+
+`npm run smoke:agentic -- --tier 1` is the fast product-first inner loop: Tier 0 runs the worker gate plus six deterministic over-claim archetypes (all must be dismissed), and Tier 1 runs four parallel agentic cells — paired lift on acme-saas, a rotating second app, a hardened zero-vuln trap (0 confirmations required), and a realism #2/#3/#4 micro-slice. Budget is ~6 minutes and ~$1. Use `--tier 0` for the free pre-commit check, `--dry-run` to plan without model calls, and `--tier 2` to print the full matrix/held-out/endurance commands. See `docs/SMOKE-BATTERY.md`.
+
 ## Benchmark reports
 
 Run `npm run benchmark:reports` to replay the Northstar cases through the production app. The output goes to `test-results/report-benchmark/`. The `summary.json` regression scorecard covers the original four report versions. The `comparison-manifest.json` and `comparison-scorecard.json` also cover the same access issue on two approved hosts and a run with verified high and critical access discrepancies. Each report has a shared-input packet and an ordered run recording through the event that saved that version. These files link to the exact report export by digest. Copy the directory to a private workspace before adding Artex results or reader scores.
