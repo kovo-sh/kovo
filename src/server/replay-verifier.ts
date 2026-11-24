@@ -2325,21 +2325,38 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         while (usedKs.has(k)) k = randomInt(1000, 90_000)
         usedKs.add(k)
         // Interleaved baseline / true / false triplet through RequestBroker.
+        const trueValue = makeValue(k, 'true')
+        const falseValue = makeValue(k, 'false')
         const baseEx = await broker.executeHttp(buildRequest(baseValue), grant, signal)
         recordExchange(baseEx)
-        const trueEx = await broker.executeHttp(buildRequest(makeValue(k, 'true')), grant, signal)
+        const trueEx = await broker.executeHttp(buildRequest(trueValue), grant, signal)
         recordExchange(trueEx)
-        const falseEx = await broker.executeHttp(buildRequest(makeValue(k, 'false')), grant, signal)
+        const falseEx = await broker.executeHttp(buildRequest(falseValue), grant, signal)
         recordExchange(falseEx)
         firstBaseline ??= baseEx
         firstTrue ??= trueEx
         firstFalse ??= falseEx
         // Compare noise-normalized structure: a rotating nonce never separates the arms, and a
-        // single real field delta inside a large HTML shell remains observable.
-        const simBaselineTrue = structuralSimilarity(baseEx.body, trueEx.body)
-        const simBaselineFalse = structuralSimilarity(baseEx.body, falseEx.body)
-        const simTrueFalse = structuralSimilarity(trueEx.body, falseEx.body)
-        const fieldDelta = structuralDiff(trueEx.body, falseEx.body).changedTokens.filter(token => token.length >= 2)
+        // single real field delta inside a large HTML shell remains observable. The echoed request
+        // value is scrubbed from every side (same rule as the differential probe): a response that
+        // reflects the query is not evidence that the returned rows changed.
+        const diffBody = (body: string, values: string[]): string => {
+          let out = body
+          for (const value of values) {
+            if (!value || value.length < 3) continue
+            out = out.split(value).join('\u0000')
+            const escaped = JSON.stringify(value).slice(1, -1)
+            if (escaped && escaped !== value) out = out.split(escaped).join('\u0000')
+          }
+          return out
+        }
+        const baseDiffBody = diffBody(baseEx.body, [baseValue])
+        const trueDiffBody = diffBody(trueEx.body, [trueValue, baseValue])
+        const falseDiffBody = diffBody(falseEx.body, [falseValue, baseValue])
+        const simBaselineTrue = structuralSimilarity(baseDiffBody, trueDiffBody)
+        const simBaselineFalse = structuralSimilarity(baseDiffBody, falseDiffBody)
+        const simTrueFalse = structuralSimilarity(trueDiffBody, falseDiffBody)
+        const fieldDelta = structuralDiff(trueDiffBody, falseDiffBody).changedTokens.filter(token => token.length >= 2)
         roundDeltas.push(fieldDelta)
         const isOrBranch = /\bOR\b/i.test(spec.valueTemplate ?? '')
         const statusDivergence = isOrBranch

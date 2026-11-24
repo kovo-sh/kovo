@@ -15,8 +15,15 @@ import type { BrokerExchangeResult, Grant, RequestBroker } from '../src/server/b
 import type { ProbeDifferentialRequest } from '../src/server/probes/context.ts'
 import { probeDifferential } from '../src/server/surface-engine.ts'
 import type { DifferentialResult } from '../src/server/surface-engine.ts'
+import { synthesizeEngineSpecs } from '../src/server/deterministic-specs.ts'
+import type { EngineHypothesis } from '../src/server/deterministic-specs.ts'
+import {
+  planFloorRecipe,
+  recipeSpecRecord,
+  runPlannedRecipe,
+} from '../src/server/floor-recipe-engine.ts'
 
-const ORIGIN = 'http://sqli-baseline.invalid'
+const ORIGIN = 'https://sqli-baseline.invalid'
 const PATH = '/api/search'
 
 const grant: Grant = {
@@ -168,4 +175,189 @@ test('sql-baseline: a target whose arms stay empty is inconclusive, never confir
   assert.notEqual(res.verdict, 'signal', res.summary)
   assert.equal(res.verdict, 'inconclusive', res.summary)
   assert.equal(res.anomalies.length, 0)
+})
+
+// ---------------------------------------------------------------------------------------------
+// Cut 3a: the live confirmation paths must replay the grounded pair.
+// ---------------------------------------------------------------------------------------------
+
+function searchHypothesis(): EngineHypothesis {
+  return {
+    key: 'sqli|search',
+    endpoint: {
+      id: 'GET:/api/search',
+      origin: ORIGIN,
+      method: 'GET',
+      pathTemplate: PATH,
+      params: [{ name: 'query', location: 'query' }],
+    },
+    probeClass: 'sqli_boolean',
+    intent: 'sqli',
+    method: 'GET',
+    pathAndQuery: PATH,
+    param: { name: 'query', location: 'query' },
+    location: 'query',
+    baselineValue: 'Item',
+    risk: 80,
+  }
+}
+
+/** The anomaly shape the grounded probe emits, without spending probe requests. */
+function groundedProbe(baselineValue: string, provenStyle = 'like_breakout'): DifferentialResult {
+  return {
+    probeClass: 'sqli_boolean',
+    origin: ORIGIN,
+    pathAndQuery: PATH,
+    verdict: 'signal',
+    summary: 'grounded',
+    requestsSent: 0,
+    exchangeIds: [],
+    stoppedReason: null,
+    notes: [],
+    durationMs: 1,
+    anomalies: [{
+      type: 'boolean_differential',
+      style: provenStyle,
+      provenStyle,
+      baselineValue,
+      quoteStyle: 'single',
+      valueTemplate: "{{baseline}}%' AND {{sql_expr}}-- -",
+    }],
+    details: { groundedBaselineValue: baselineValue },
+  }
+}
+
+/** Echo-only target: every arm returns the same rows and only reflects the query back. */
+function echoBroker(seen: string[] = []): RequestBroker {
+  return {
+    async executeHttp(request: { pathAndQuery: string }) {
+      const url = new URL(request.pathAndQuery, ORIGIN)
+      const q = url.searchParams.get('query') ?? ''
+      seen.push(q)
+      return exchange(request.pathAndQuery, JSON.stringify({
+        query: q,
+        results: [{ title: 'Zephyr 9' }, { title: 'Lumen 4' }],
+      }))
+    },
+  } as unknown as RequestBroker
+}
+
+test('sql-baseline: the synthesized spec carries the grounded operand and proven shape', () => {
+  const specs = synthesizeEngineSpecs(searchHypothesis(), groundedProbe('Zephyr 9'))
+  assert.ok(specs.length >= 1)
+  const primary = specs[0]!.spec as { baselineValue?: string; quoteStyle?: string; valueTemplate?: string }
+  assert.equal(primary.baselineValue, 'Zephyr 9')
+  assert.equal(primary.quoteStyle, 'single')
+  assert.equal(primary.valueTemplate, "{{baseline}}%' AND {{sql_expr}}-- -")
+  for (const spec of specs) {
+    const baseline = String((spec.spec as { baselineValue?: string }).baselineValue ?? '')
+    assert.ok(!/^(?:Item|a|e|1|zz)$/.test(baseline), `spec must not rotate to a seed literal (${baseline})`)
+  }
+})
+
+test('sql-baseline: the recipe plan replays the grounded operand and proven shape', () => {
+  const plan = planFloorRecipe({
+    hypothesis: searchHypothesis(),
+    probe: groundedProbe('Zephyr 9'),
+    specKind: 'sql_boolean_diff',
+    vulnClass: 'sqli',
+    personas: [],
+  })
+  assert.ok(plan, 'sql_boolean_diff must be wired')
+  assert.equal(plan.skipReason, undefined)
+  const args = plan.args as { baselineValue?: string; controlPathAndQuery?: string; probePathAndQuery?: string; valueTemplate?: string }
+  assert.equal(args.baselineValue, 'Zephyr 9')
+  const controlValue = new URL(args.controlPathAndQuery!, ORIGIN).searchParams.get('query') ?? ''
+  const probeValue = new URL(args.probePathAndQuery!, ORIGIN).searchParams.get('query') ?? ''
+  assert.ok(controlValue.startsWith('Zephyr 9%'), `control arm must lead with the grounded term: ${controlValue}`)
+  assert.ok(probeValue.startsWith('Zephyr 9%'), `probe arm must lead with the grounded term: ${probeValue}`)
+  assert.ok(probeValue.includes("'"), 'the probe arm must keep the quote breakout')
+  assert.equal(args.valueTemplate, "{{baseline}}%' AND {{sql_expr}}-- -")
+  assert.ok(!/Item/.test(controlValue), 'a dev catalog term must never reach the recipe')
+})
+
+test('sql-baseline: a wired recipe confirms on a catalog lacking the dev literal', async () => {
+  const plan = planFloorRecipe({
+    hypothesis: searchHypothesis(),
+    probe: groundedProbe('Zephyr 9'),
+    specKind: 'sql_boolean_diff',
+    vulnClass: 'sqli',
+    personas: [],
+  })!
+  const seen: string[] = []
+  const execution = await runPlannedRecipe({
+    plan,
+    hypothesis: searchHypothesis(),
+    broker: fakeBroker(searchable({ catalog: ['Zephyr 9', 'Lumen 4'] }), seen),
+    grant,
+    signal: AbortSignal.timeout(10_000),
+    recordExchange: (() => { let n = 0; return () => `rx-${++n}` })(),
+  })
+  assert.equal(execution.result.confirmed, true, execution.failure?.message ?? 'unexpected rejection')
+  assert.ok(seen.every(q => q.startsWith('Zephyr 9%')), `every arm must be grounded (${seen.join(', ')})`)
+  const record = recipeSpecRecord(plan, execution).spec as { baselineValue?: string; valueTemplate?: string }
+  assert.equal(record.baselineValue, 'Zephyr 9')
+  assert.equal(record.valueTemplate, "{{baseline}}%' AND {{sql_expr}}-- -")
+})
+
+test('sql-baseline: the same wired recipe rejects a hardened catalog', async () => {
+  const plan = planFloorRecipe({
+    hypothesis: searchHypothesis(),
+    probe: groundedProbe('Zephyr 9'),
+    specKind: 'sql_boolean_diff',
+    vulnClass: 'sqli',
+    personas: [],
+  })!
+  const execution = await runPlannedRecipe({
+    plan,
+    hypothesis: searchHypothesis(),
+    broker: fakeBroker(searchable({ catalog: ['Zephyr 9', 'Lumen 4'], hardened: true })),
+    grant,
+    signal: AbortSignal.timeout(10_000),
+    recordExchange: (() => { let n = 0; return () => `hx-${++n}` })(),
+  })
+  assert.equal(execution.result.confirmed, false)
+  assert.equal(execution.failure?.code, 'receipt_rejected')
+})
+
+test('sql-baseline: an echo-only target is rejected by the receipt rule', async () => {
+  const plan = planFloorRecipe({
+    hypothesis: searchHypothesis(),
+    probe: groundedProbe('Zephyr 9'),
+    specKind: 'sql_boolean_diff',
+    vulnClass: 'sqli',
+    personas: [],
+  })!
+  const seen: string[] = []
+  const execution = await runPlannedRecipe({
+    plan,
+    hypothesis: searchHypothesis(),
+    broker: echoBroker(seen),
+    grant,
+    signal: AbortSignal.timeout(10_000),
+    recordExchange: (() => { let n = 0; return () => `ex-${++n}` })(),
+  })
+  assert.equal(execution.result.confirmed, false)
+  assert.equal(execution.failure?.code, 'receipt_rejected')
+})
+
+test('sql-baseline: a tautology-proven pair replays through the probe single-template', () => {
+  const probeResult = groundedProbe('', 'tautology')
+  // The probe normalizes the legacy style to or_branch and exposes `provenStyle: 'tautology'`.
+  ;(probeResult.anomalies[0] as Record<string, unknown>).style = 'or_branch'
+  const plan = planFloorRecipe({
+    hypothesis: searchHypothesis(),
+    probe: probeResult,
+    specKind: 'sql_boolean_diff',
+    vulnClass: 'sqli',
+    personas: [],
+  })
+  assert.ok(plan)
+  const args = plan.args as { baselineValue?: string; controlPathAndQuery?: string; probePathAndQuery?: string; valueTemplate?: string }
+  assert.equal(args.baselineValue, '')
+  assert.equal(args.valueTemplate, "{{baseline}}%' AND {{sql_expr}}-- -")
+  const controlValue = new URL(args.controlPathAndQuery!, ORIGIN).searchParams.get('query') ?? ''
+  const probeValue = new URL(args.probePathAndQuery!, ORIGIN).searchParams.get('query') ?? ''
+  assert.equal(controlValue, "%' AND 7919=7919-- -")
+  assert.equal(probeValue, "%' AND 7919=7920-- -")
 })

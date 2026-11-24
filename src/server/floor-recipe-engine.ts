@@ -111,6 +111,26 @@ function booleanExpression(style: BooleanStyle, baseline: string, key: number, a
   }
 }
 
+/**
+ * Build one arm of the boolean pair. The probe reports the exact operand and a single replay
+ * template for the shape that passed; replaying that pair keeps the differential grounded in the
+ * target's own data instead of a dev fixture literal that may not exist in this catalog. A template
+ * is preferred because the proven shape may not be one of the four legacy style branches.
+ */
+function booleanArm(input: {
+  template: string | null
+  style: BooleanStyle
+  baseline: string
+  key: number
+  arm: 'true' | 'false'
+}): string {
+  const expr = `${input.key}=${input.arm === 'true' ? input.key : input.key + 1}`
+  if (input.template) {
+    return input.template.replaceAll('{{baseline}}', input.baseline).replaceAll('{{sql_expr}}', expr)
+  }
+  return booleanExpression(input.style, input.baseline, input.key, input.arm)
+}
+
 function requestFromInjection(input: {
   hyp: EngineHypothesis
   value: string
@@ -160,15 +180,23 @@ function planBooleanRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
     args: {} as FloorRecipeArgs,
   }
   if (!hyp.param) return { ...sketch, skipReason: 'sqli hypothesis has no injected parameter' }
-  const baseline = hyp.baselineValue ?? '1'
   const hit = input.probe.anomalies.find(anomaly => anomaly.type === 'boolean_differential')
+  // Prefer the operand the probe actually grounded (a literal from the target's own rows, or the
+  // empty term of the tautology pair). A hypothesis default such as `1` is only the last resort.
+  const grounded = typeof hit?.baselineValue === 'string' ? hit.baselineValue : null
+  const baseline = grounded ?? hyp.baselineValue ?? '1'
   const key = 7_919
   const style = booleanStyleOf(hit?.style)
+  const rawTemplate = typeof hit?.valueTemplate === 'string' && hit.valueTemplate.includes('{{sql_expr}}')
+    ? hit.valueTemplate
+    : null
+  const rawQuote = typeof hit?.quoteStyle === 'string' ? hit.quoteStyle : ''
+  const quoteStyle: 'single' | 'double' | 'numeric' = rawQuote === 'double' || rawQuote === 'numeric' ? rawQuote : 'single'
   // The receipt's boolean rule pairs a *true* predicate (control arm) with a *false* predicate
   // (probe arm): the structural difference between them is the differential. A benign baseline vs a
   // true predicate is structurally identical by construction, so it can never be the pair.
-  const control = requestFromInjection({ hyp, value: booleanExpression(style, baseline, key, 'true') })
-  const probe = requestFromInjection({ hyp, value: booleanExpression(style, baseline, key, 'false') })
+  const control = requestFromInjection({ hyp, value: booleanArm({ template: rawTemplate, style, baseline, key, arm: 'true' }) })
+  const probe = requestFromInjection({ hyp, value: booleanArm({ template: rawTemplate, style, baseline, key, arm: 'false' }) })
   if (!control || !probe) return { ...sketch, skipReason: 'sqli injection point could not be expressed as a recipe request' }
   const args: BooleanOrTimingArgs = {
     mode: 'boolean',
@@ -181,6 +209,8 @@ function planBooleanRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
     vulnClass: 'sqli',
     actor: floorActorFor(hyp.ownerPersona ?? null, input.personas),
     rounds: 2,
+    baselineValue: baseline,
+    ...(rawTemplate ? { valueTemplate: rawTemplate, quoteStyle } : { quoteStyle }),
     ...(control.jsonBody !== undefined ? { controlJsonBody: control.jsonBody } : {}),
     ...(probe.jsonBody !== undefined ? { probeJsonBody: probe.jsonBody } : {}),
     ...(input.headers ?? hyp.headers ? { headers: { ...(hyp.headers ?? {}), ...(input.headers ?? {}) } } : {}),
@@ -462,8 +492,9 @@ function recordSpecFor(
       pathAndQuery: args.pathAndQuery,
       paramName: args.param ?? 'q',
       paramLocation: plan.paramLocation ?? 'query',
-      baselineValue: '1',
-      quoteStyle: 'single',
+      baselineValue: args.baselineValue ?? '1',
+      quoteStyle: args.quoteStyle ?? 'single',
+      ...(args.valueTemplate ? { valueTemplate: args.valueTemplate } : {}),
       ...(args.probeJsonBody !== undefined ? { jsonBody: args.probeJsonBody } : {}),
       ...(args.headers ? { headers: args.headers } : {}),
     }

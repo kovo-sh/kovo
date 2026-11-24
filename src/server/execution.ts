@@ -7250,6 +7250,14 @@ export class Execution {
           const dbError = outcome.anomalies.find(a => a.type === 'db_error_fingerprint')
           if (outcome.verdict !== 'signal' || (!booleanSignal && !dbError)) continue
           const dialect = typeof dbError?.dialect === 'string' ? dbError.dialect : null
+          // Replay the operand + shape that actually passed: a catalog-grounded baseline does not
+          // exist in a dev fixture, and a single-quote shape cannot replay a LIKE breakout.
+          const signalBaseline = typeof booleanSignal?.baselineValue === 'string' ? booleanSignal.baselineValue : baselineValue
+          const signalRawQuote = typeof booleanSignal?.quoteStyle === 'string' ? booleanSignal.quoteStyle : ''
+          const signalQuoteStyle = signalRawQuote === 'double' || signalRawQuote === 'numeric'
+            ? signalRawQuote as 'single' | 'double' | 'numeric'
+            : quoteStyle
+          const signalTemplate = typeof booleanSignal?.valueTemplate === 'string' ? booleanSignal.valueTemplate : null
           const findingId = this.recordDeterministicFinding({
             run: latest,
             assignment: claimed,
@@ -7271,8 +7279,9 @@ export class Execution {
               pathAndQuery,
               paramName: candidate.name,
               paramLocation: location,
-              baselineValue,
-              quoteStyle,
+              baselineValue: signalBaseline,
+              quoteStyle: signalQuoteStyle,
+              ...(signalTemplate ? { valueTemplate: signalTemplate } : {}),
               ...(jsonBody ? { jsonBody } : {}),
               assertionsJq: '{ controlPassed: true, confirmed: true, observed: "deterministic boolean differential", expected: "parameterized query" }',
             },
