@@ -14,8 +14,8 @@
  */
 import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
-import { assessImpactEvidence, knownOracleEvent } from './oracle-invariants.ts'
-import type { ImpactClass, ImpactInput, ImpactStep, RoleName } from './oracle-invariants.ts'
+import { assessBooleanDifferential, assessImpactEvidence, knownOracleEvent } from './oracle-invariants.ts'
+import type { BooleanDifferentialArm, BooleanDifferentialRound, ImpactClass, ImpactInput, ImpactStep, RoleName } from './oracle-invariants.ts'
 
 export const receiptIdSchema = z.string().trim().min(1).max(128)
 
@@ -89,7 +89,7 @@ export interface ReceiptVerification {
   confirmed: boolean
   vulnClass: string
   /** Rule family used to validate the receipt. */
-  rule: 'impact' | 'oob' | 'timing' | 'browser' | 'none'
+  rule: 'impact' | 'oob' | 'timing' | 'boolean' | 'browser' | 'none'
   reason: string
   observed: string
   expected: string
@@ -98,6 +98,7 @@ export interface ReceiptVerification {
 
 const OOB_CLASS_RE = /^(?:ssrf|xxe|blind_ssrf|blind_xxe|oob|webhook_forgery)$/i
 const TIMING_CLASS_RE = /^(?:blind_sqli|sqli_time|sql_time|timing|race)$/i
+const BOOLEAN_CLASS_RE = /^(?:sqli|sql_boolean|sql_boolean_diff|boolean_sqli|boolean_differential)$/i
 
 const IMPACT_CLASS_BY_VULN: Readonly<Record<string, ImpactClass>> = {
   bola: 'authorization',
@@ -128,6 +129,7 @@ const IMPACT_CLASS_BY_VULN: Readonly<Record<string, ImpactClass>> = {
 /** Classify a receipt's vulnerability label into the shared impact model (or a non-impact rule). */
 export function receiptRuleFor(vulnClass: string): { rule: ReceiptVerification['rule']; impactClass?: ImpactClass } {
   if (OOB_CLASS_RE.test(vulnClass)) return { rule: 'oob' }
+  if (BOOLEAN_CLASS_RE.test(vulnClass)) return { rule: 'boolean' }
   if (TIMING_CLASS_RE.test(vulnClass)) return { rule: 'timing' }
   const impactClass = IMPACT_CLASS_BY_VULN[vulnClass.toLowerCase()]
   if (impactClass) return { rule: 'impact', impactClass }
@@ -238,6 +240,54 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     }
   }
 
+  if (rule === 'boolean') {
+    if (receipt.exchangeIds.length < 4) {
+      return reject(receipt, rule, 'A boolean differential needs at least two paired control/probe rounds.')
+    }
+    const arms = receipt.exchangeIds.map(id => entriesById.get(id)!)
+    const controls = arms.filter(arm => arm.step.arm === 'control')
+    const probes = arms.filter(arm => arm.step.arm === 'probe')
+    if (controls.length !== probes.length || controls.length < 2) {
+      return reject(receipt, rule, 'A boolean differential needs an equal number (>=2) of control and probe arms.')
+    }
+    const param = receipt.target.param ?? deriveDifferingParam(controls[0]!, probes[0]!)
+    if (!param) return reject(receipt, rule, 'A boolean differential must name the injected parameter.')
+    const toArm = (entry: ReceiptTranscriptEntry): BooleanDifferentialArm => ({
+      status: entry.step.status,
+      method: entry.step.method,
+      pathAndQuery: entry.step.pathAndQuery,
+      ...(entry.step.requestJson !== undefined ? { requestJson: entry.step.requestJson } : {}),
+      requestHeaders: entry.step.requestHeaders ?? null,
+      ...(entry.step.json !== undefined ? { json: entry.step.json } : {}),
+      ...(entry.step.body !== undefined ? { body: entry.step.body } : {}),
+    })
+    const rounds: BooleanDifferentialRound[] = controls.map((control, index) => ({
+      control: toArm(control),
+      probe: toArm(probes[index]!),
+    }))
+    const assessment = assessBooleanDifferential({ rounds, param })
+    if (!assessment.satisfied) {
+      return {
+        confirmed: false,
+        vulnClass: receipt.vulnClass,
+        rule,
+        reason: assessment.reason,
+        observed: receipt.claimedDelta,
+        expected: 'a stable structural response difference between the two predicates',
+        evidence: assessment.evidence,
+      }
+    }
+    return {
+      confirmed: true,
+      vulnClass: receipt.vulnClass,
+      rule,
+      reason: assessment.reason,
+      observed: receipt.claimedDelta,
+      expected: 'identical responses for equivalent boolean predicates',
+      evidence: assessment.evidence,
+    }
+  }
+
   if (rule === 'timing') {
     if (receipt.exchangeIds.length < 2) return reject(receipt, rule, 'A timing receipt needs a control and a probe exchange.')
     const timed = receipt.exchangeIds.map(id => entriesById.get(id)!)
@@ -319,6 +369,17 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     expected: 'an authorized actor or control shows the boundary the probe crossed',
     evidence: assessment.evidence,
   }
+}
+
+function deriveDifferingParam(control: ReceiptTranscriptEntry, probe: ReceiptTranscriptEntry): string | null {
+  try {
+    const controlUrl = new URL(control.step.pathAndQuery ?? '', 'http://guardian.invalid')
+    const probeUrl = new URL(probe.step.pathAndQuery ?? '', 'http://guardian.invalid')
+    for (const [key, value] of probeUrl.searchParams.entries()) {
+      if (controlUrl.searchParams.get(key) !== value) return key
+    }
+  } catch { /* not a URL-shaped request */ }
+  return null
 }
 
 function normalizeOrigin(origin: string): string {

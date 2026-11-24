@@ -27,6 +27,7 @@ import {
 } from '../src/server/replay-verifier.ts'
 import {
   proofReceiptSchema,
+  receiptRuleFor,
   verifyReceipt,
 } from '../src/server/proof-receipt.ts'
 import type { ImpactStep, ReceiptTranscript, ReceiptTranscriptEntry } from '../src/server/proof-receipt.ts'
@@ -227,6 +228,100 @@ test('M0 receipt: a static/unknown class never becomes runtime_confirmed', () =>
   const verdict = verifyReceipt(receipt, {})
   assert.equal(verdict.confirmed, false)
   assert.match(verdict.reason, /No confirmation rule/)
+})
+
+test('M0 receipt: boolean differential confirms a stable paired structural change', () => {
+  const receipt = {
+    vulnClass: 'sqli',
+    target: { origin: 'https://app.example.invalid', method: 'GET', pathAndQuery: '/search?q=x', param: 'q' },
+    exchangeIds: ['c1', 'p1', 'c2', 'p2'],
+    oobEventIds: [],
+    browserTraceIds: [],
+    claimedDelta: 'The false predicate returns an empty result set while the true predicate returns rows.',
+  }
+  const controlPath = "/search?q=guardian' AND '1'='1"
+  const probePath = "/search?q=guardian' AND '1'='2"
+  const transcript: ReceiptTranscript = {
+    entries: [
+      entry('c1', step({ id: 'c1', arm: 'control', method: 'GET', status: 200, pathAndQuery: controlPath, json: { rows: [{ id: 1 }, { id: 2 }], message: 'ok' } })),
+      entry('p1', step({ id: 'p1', arm: 'probe', method: 'GET', status: 200, pathAndQuery: probePath, json: { rows: [], message: 'ok' } })),
+      entry('c2', step({ id: 'c2', arm: 'control', method: 'GET', status: 200, pathAndQuery: controlPath, json: { rows: [{ id: 1 }, { id: 2 }], message: 'ok' } })),
+      entry('p2', step({ id: 'p2', arm: 'probe', method: 'GET', status: 200, pathAndQuery: probePath, json: { rows: [], message: 'ok' } })),
+    ],
+  }
+  const confirmed = verifyReceipt(receipt, transcript)
+  assert.equal(confirmed.confirmed, true, confirmed.reason)
+  assert.equal(confirmed.rule, 'boolean')
+
+  assert.equal(receiptRuleFor('sqli').rule, 'boolean')
+  assert.equal(receiptRuleFor('blind_sqli').rule, 'timing', 'the timing path stays on blind_sqli')
+})
+
+test('M0 receipt: boolean differential rejects one round, echo-only, nonce-only and 5xx', () => {
+  const receipt = {
+    vulnClass: 'sqli',
+    target: { origin: 'https://app.example.invalid', method: 'GET', pathAndQuery: '/search?q=x', param: 'q' },
+    exchangeIds: ['c1', 'p1', 'c2', 'p2'],
+    oobEventIds: [],
+    browserTraceIds: [],
+    claimedDelta: 'The predicates diverge.',
+  }
+  const controlPath = "/search?q=guardian' AND '1'='1"
+  const probePath = "/search?q=guardian' AND '1'='2"
+  const pair = (id: string, arm: 'control' | 'probe', status: number, path: string, json: unknown) =>
+    entry(id, step({ id, arm, method: 'GET', status, pathAndQuery: path, json }))
+
+  const oneRound = verifyReceipt({ ...receipt, exchangeIds: ['c1', 'p1'] }, {
+    entries: [
+      pair('c1', 'control', 200, controlPath, { rows: [{ id: 1 }] }),
+      pair('p1', 'probe', 200, probePath, { rows: [] }),
+    ],
+  })
+  assert.equal(oneRound.confirmed, false)
+  assert.match(oneRound.reason, /two paired/i)
+
+  const echoOnly = verifyReceipt(receipt, {
+    entries: [
+      pair('c1', 'control', 200, controlPath, { result: '' }),
+      pair('p1', 'probe', 200, probePath, { result: "guardian' AND '1'='2" }),
+      pair('c2', 'control', 200, controlPath, { result: '' }),
+      pair('p2', 'probe', 200, probePath, { result: "guardian' AND '1'='2" }),
+    ],
+  })
+  assert.equal(echoOnly.confirmed, false)
+  assert.match(echoOnly.reason, /echoed|nonce/i)
+
+  const nonceOnly = verifyReceipt(receipt, {
+    entries: [
+      pair('c1', 'control', 200, controlPath, { rows: [], nonce: 'abc12345' }),
+      pair('p1', 'probe', 200, probePath, { rows: [], nonce: 'abcdef0123456789abcdef01' }),
+      pair('c2', 'control', 200, controlPath, { rows: [], nonce: 'abc12345' }),
+      pair('p2', 'probe', 200, probePath, { rows: [], nonce: 'abcdef0123456789abcdef01' }),
+    ],
+  })
+  assert.equal(nonceOnly.confirmed, false)
+
+  const serverError = verifyReceipt(receipt, {
+    entries: [
+      pair('c1', 'control', 200, controlPath, { rows: [{ id: 1 }] }),
+      pair('p1', 'probe', 500, probePath, { error: 'boom' }),
+      pair('c2', 'control', 200, controlPath, { rows: [{ id: 1 }] }),
+      pair('p2', 'probe', 200, probePath, { rows: [] }),
+    ],
+  })
+  assert.equal(serverError.confirmed, false)
+  assert.match(serverError.reason, /server error|5xx/i)
+
+  const shapeMismatch = verifyReceipt(receipt, {
+    entries: [
+      pair('c1', 'control', 200, controlPath, { rows: [{ id: 1 }] }),
+      pair('p1', 'probe', 200, `${probePath}&extra=1`, { rows: [] }),
+      pair('c2', 'control', 200, controlPath, { rows: [{ id: 1 }] }),
+      pair('p2', 'probe', 200, `${probePath}&extra=1`, { rows: [] }),
+    ],
+  })
+  assert.equal(shapeMismatch.confirmed, false)
+  assert.match(shapeMismatch.reason, /request shape/i)
 })
 
 // ============================================================================

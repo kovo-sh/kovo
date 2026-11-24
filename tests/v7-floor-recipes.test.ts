@@ -74,6 +74,9 @@ test('spec-kind mapping is 1:1 for receipt-shaped kinds and explicit about the g
   assert.equal(recipeForSpecKind('http_chain', 'ssrf'), 'oob_callback')
   assert.equal(recipeForSpecKind('sql_time_diff', 'sqli'), 'boolean_or_timing')
   assert.equal(recipeForSpecKind('sql_boolean_diff', 'sqli'), 'boolean_or_timing')
+  const booleanMapping = SPEC_KIND_RECIPES.find(row => row.specKind === 'sql_boolean_diff')!
+  assert.match(booleanMapping.note, /Boolean rule/)
+  assert.doesNotMatch(booleanMapping.note, /EXCEPTION/)
   assert.equal(recipeForSpecKind('race_burst', 'race_double_spend'), 'race_burst')
   assert.equal(recipeForSpecKind('browser_chain', 'xss_stored'), null)
   assert.equal(recipeForSpecKind('rce_proof', 'ssti'), null)
@@ -215,12 +218,96 @@ test('boolean_or_timing confirms a stable >3x timing separation and rejects a no
   assert.ok(hardened.failure!.missingRoles.includes('probe_delay'), hardened.failure!.missingRoles.join(','))
 })
 
-test('boolean_or_timing refuses boolean-only evidence and names the missing timing_arm', async () => {
-  const run = await runFloorRecipe(floorRecipe('boolean_or_timing', timingArgs('boolean')), timingDeps(40, 40))
+function booleanArgs(overrides: Partial<BooleanOrTimingArgs> = {}): BooleanOrTimingArgs {
+  return {
+    origin: ORIGIN,
+    method: 'GET',
+    pathAndQuery: "/search?q=guardian%27+AND+%271%27%3D%271",
+    controlPathAndQuery: "/search?q=guardian%27+AND+%271%27%3D%271",
+    probePathAndQuery: "/search?q=guardian%27+AND+%271%27%3D%272",
+    vulnClass: 'sqli',
+    param: 'q',
+    mode: 'boolean',
+    rounds: 2,
+    ...overrides,
+  }
+}
+
+type BooleanRound = { control: FloorExchange; probe: FloorExchange }
+
+function booleanDeps(rounds: BooleanRound[]): FloorRecipeDeps {
+  let controlIndex = 0
+  let probeIndex = 0
+  return fixtureDeps(spec => spec.role === 'boolean_control'
+    ? rounds[controlIndex++]!.control
+    : rounds[probeIndex++]!.probe)
+}
+
+function vulnRounds(rounds = 2): BooleanRound[] {
+  return Array.from({ length: rounds }, () => ({
+    control: { status: 200, json: { rows: [{ id: 1 }, { id: 2 }], message: 'ok' } },
+    probe: { status: 200, json: { rows: [], message: 'ok' } },
+  }))
+}
+
+test('boolean_or_timing confirms a stable paired boolean differential', async () => {
+  const run = await runFloorRecipe(floorRecipe('boolean_or_timing', booleanArgs()), booleanDeps(vulnRounds()))
+  assert.equal(run.failure, undefined, run.failure?.message ?? 'unexpected failure')
+  assert.equal(run.result.confirmed, true, run.result.verification.reason)
+  assert.equal(run.result.verification.rule, 'boolean')
+  assert.equal(run.receipt.exchangeIds.length, 4)
+})
+
+test('boolean_or_timing rejects hardened, echo-only, nonce-only, unstable and 5xx evidence', async () => {
+  const hardened = await runFloorRecipe(floorRecipe('boolean_or_timing', booleanArgs()), booleanDeps(
+    Array.from({ length: 2 }, () => ({
+      control: { status: 200, json: { rows: [{ id: 1 }] } },
+      probe: { status: 200, json: { rows: [{ id: 1 }] } },
+    })),
+  ))
+  assert.equal(hardened.result.confirmed, false)
+  assert.ok(hardened.failure!.missingRoles.includes('structural_delta'), hardened.failure!.missingRoles.join(','))
+
+  const echoed = await runFloorRecipe(floorRecipe('boolean_or_timing', booleanArgs()), booleanDeps(
+    Array.from({ length: 2 }, () => ({
+      control: { status: 200, json: { result: '' } },
+      probe: { status: 200, json: { result: "guardian' AND '1'='2" } },
+    })),
+  ))
+  assert.equal(echoed.result.confirmed, false)
+  assert.match(echoed.result.verification.reason, /echoed|nonce/i)
+
+  const nonce = await runFloorRecipe(floorRecipe('boolean_or_timing', booleanArgs()), booleanDeps(
+    Array.from({ length: 2 }, () => ({
+      control: { status: 200, json: { rows: [], nonce: 'abc12345' } },
+      probe: { status: 200, json: { rows: [], nonce: 'abcdef0123456789abcdef01' } },
+    })),
+  ))
+  assert.equal(nonce.result.confirmed, false)
+
+  const unstable = await runFloorRecipe(floorRecipe('boolean_or_timing', booleanArgs()), booleanDeps([
+    { control: { status: 200, json: { rows: [{ id: 1 }] } }, probe: { status: 200, json: { rows: [] } } },
+    { control: { status: 200, json: { rows: [{ id: 1 }] } }, probe: { status: 200, json: { rows: [{ id: 1 }] } } },
+  ]))
+  assert.equal(unstable.result.confirmed, false)
+  assert.equal(unstable.result.verification.confirmed, false)
+  assert.ok(unstable.failure!.missingRoles.includes('stable_differential'), unstable.failure!.missingRoles.join(','))
+
+  const serverError = await runFloorRecipe(floorRecipe('boolean_or_timing', booleanArgs()), booleanDeps([
+    { control: { status: 200, json: { rows: [{ id: 1 }] } }, probe: { status: 500, json: { error: 'boom' } } },
+    { control: { status: 200, json: { rows: [{ id: 1 }] } }, probe: { status: 200, json: { rows: [] } } },
+  ]))
+  assert.equal(serverError.result.confirmed, false)
+  assert.ok(serverError.failure!.missingRoles.includes('non_error_arm'), serverError.failure!.missingRoles.join(','))
+})
+
+test('boolean_or_timing rejects a request shape that differs beyond the predicate', async () => {
+  const run = await runFloorRecipe(
+    floorRecipe('boolean_or_timing', booleanArgs({ probePathAndQuery: "/search?q=guardian%27+AND+%271%27%3D%272&extra=1" })),
+    booleanDeps(vulnRounds()),
+  )
   assert.equal(run.result.confirmed, false)
-  assert.ok(run.failure)
-  assert.equal(run.failure!.code, 'precondition_unsatisfied')
-  assert.ok(run.failure!.missingRoles.includes('timing_arm'), run.failure!.missingRoles.join(','))
+  assert.ok(run.failure!.missingRoles.includes('request_shape'), run.failure!.missingRoles.join(','))
 })
 
 test('boolean_or_timing names a missing host duration', async () => {

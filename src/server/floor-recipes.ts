@@ -29,7 +29,7 @@
  * | `http_chain`           | csrf                                      | `persisted_mutation` | ambient cookie + foreign Origin header + csrf_state_change oracle |
  * | `http_chain`           | info_disclosure / secret_disclosure       | `disclosure`         | owner-scoped non-public field + denied peer |
  * | `http_chain`           | xxe / ssrf / webhook_forgery              | `oob_callback`       | delivered durable callback carrying the injected token |
- * | `sql_boolean_diff`     | sqli                                      | `boolean_or_timing`  | **exception**: boolean-only has no receipt rule yet (see below) |
+ * | `sql_boolean_diff`     | sqli                                      | `boolean_or_timing`  | boolean rule: >=2 paired rounds, stable structural change |
  * | `sql_time_diff`        | sqli                                      | `boolean_or_timing`  | timing rule, >3x separation |
  * | `race_burst`           | race_double_spend                         | `race_burst`         | repeated terminal transition + divergent burst outcomes |
  * | `browser_chain`        | xss_* / dom_*                             | — (no recipe)        | browser-trace receipts are a separate cut |
@@ -38,11 +38,10 @@
  * | `cache_differential`   | cache_poisoning                           | — (no recipe)        | no receipt rule |
  * | `http_chain`           | path_traversal / open_redirect / xss_*    | — (no recipe)        | no receipt rule |
  *
- * The one migration blocker is documented rather than faked: `verifyReceipt()` has no boolean-
- * differential rule (a `sqli` class returns `rule: 'none'`). `boolean_or_timing` therefore confirms
- * only timing evidence today and refuses a boolean-only run naming `timing_arm`. Cut 3 can retire
- * every other spec kind; boolean-only SQLi needs either a receipt rule (proof-receipt stream) or
- * must keep its spec shape.
+ * Boolean-only SQLi confirms through the `boolean_differential` receipt rule: the recipe sends at
+ * least two paired control/probe rounds with an identical request shape apart from the injected
+ * predicate, and `verifyReceipt()` requires a stable structural response difference after token
+ * stripping, a stable control baseline, and no 5xx. Echo/nonce-only changes are rejected.
  */
 import type { AmbientAuth, ImpactStep, RoleName } from './oracle-invariants.ts'
 import { buildProofReceipt, verifyReceipt } from './proof-receipt.ts'
@@ -166,11 +165,15 @@ export interface PersistedMutationArgs extends FloorRecipeBaseArgs {
 }
 
 export interface BooleanOrTimingArgs extends FloorRecipeBaseArgs {
-  /** `boolean` = control-vs-variant body differential; `timing` = conditional delay. */
+  /** `boolean` = control-vs-variant structural differential; `timing` = conditional delay. */
   mode: 'boolean' | 'timing'
   actor?: FloorActor
+  /** Path with the baseline (true) predicate; defaults to `pathAndQuery`. */
   controlPathAndQuery?: string
+  /** Path with the injected/false predicate; defaults to `pathAndQuery`. */
   probePathAndQuery?: string
+  /** Paired rounds for the boolean rule (clamped to 2..4; timing ignores it). */
+  rounds?: number
 }
 
 export interface OobCallbackArgs extends FloorRecipeBaseArgs {
@@ -415,6 +418,18 @@ class RecipeContext implements FloorRecipeContext {
 // Helpers
 // ---------------------------------------------------------------------------
 
+function deriveDifferingParam(controlPath: string, probePath: string): string | null {
+  try {
+    const control = new URL(controlPath, 'http://guardian.invalid').searchParams
+    const probe = new URL(probePath, 'http://guardian.invalid').searchParams
+    const keys = new Set([...control.keys(), ...probe.keys()])
+    for (const key of keys) {
+      if (control.get(key) !== probe.get(key)) return key
+    }
+  } catch { /* not URL-shaped */ }
+  return null
+}
+
 function pathOnly(pathAndQuery: string): string {
   return pathAndQuery.split('?')[0]!.split('#')[0]!.replace(/\/+$/, '') || '/'
 }
@@ -585,33 +600,67 @@ const persistedMutation = defineRecipe<PersistedMutationArgs>('persisted_mutatio
 })
 
 /**
- * Boolean-or-timing SQL injection. Only the timing shape is receipt-confirmable today: the control
- * and probe durations are host-recorded by Layer 1. A boolean-only run is refused with `timing_arm`
- * instead of being credited through a rule the receipt model does not have.
+ * Boolean-or-timing SQL injection. Timing uses host-recorded durations (>3x separation); boolean
+ * uses paired rounds whose structural response difference must reproduce with a stable control.
  */
 const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', async (args, ctx) => {
+  const actor = args.actor ?? ANONYMOUS
+  const controlPath = args.controlPathAndQuery ?? args.pathAndQuery
+  const probePath = args.probePathAndQuery ?? args.pathAndQuery
+
+  if (args.mode === 'boolean') {
+    const param = args.param ?? deriveDifferingParam(controlPath, probePath)
+    ctx.require(
+      Boolean(param),
+      'injected_parameter',
+      'A boolean SQL injection proof must name the injected parameter (or vary exactly one query key).',
+    )
+    const rounds = Math.max(2, Math.min(4, Math.floor(args.rounds ?? 2)))
+    const exchangeIds: string[] = []
+    let serverError = false
+    for (let round = 0; round < rounds; round += 1) {
+      const control = await ctx.send({
+        arm: 'control',
+        role: 'boolean_control',
+        method: args.method,
+        pathAndQuery: controlPath,
+        actor,
+      })
+      const probe = await ctx.send({
+        arm: 'probe',
+        role: 'boolean_probe',
+        method: args.method,
+        pathAndQuery: probePath,
+        actor,
+      })
+      exchangeIds.push(control.exchangeId, probe.exchangeId)
+      if ((control.exchange.status ?? 0) >= 500 || (probe.exchange.status ?? 0) >= 500) serverError = true
+    }
+    ctx.require(!serverError, 'non_error_arm', 'A boolean differential arm returned a server error (5xx).')
+    return buildProofReceipt({
+      vulnClass: 'sqli',
+      target: { ...targetOf(args), ...(param ? { param } : {}) },
+      exchangeIds,
+      oobEventIds: [],
+      browserTraceIds: [],
+      claimedDelta: `The boolean SQL predicate changed the response structure across ${rounds} paired rounds while the baseline predicate stayed stable.`,
+    })
+  }
+
   const control = await ctx.send({
     arm: 'control',
     role: 'timing_control',
     method: args.method,
-    pathAndQuery: args.controlPathAndQuery ?? args.pathAndQuery,
-    actor: args.actor ?? ANONYMOUS,
+    pathAndQuery: controlPath,
+    actor,
   })
   const probe = await ctx.send({
     arm: 'probe',
     role: 'timing_probe',
     method: args.method,
-    pathAndQuery: args.probePathAndQuery ?? args.pathAndQuery,
-    actor: args.actor ?? ANONYMOUS,
+    pathAndQuery: probePath,
+    actor,
   })
-
-  if (args.mode === 'boolean') {
-    ctx.require(
-      false,
-      'timing_arm',
-      'Boolean-only SQL injection has no verifyReceipt rule yet; a control/probe timing arm is required for receipt confirmation.',
-    )
-  }
 
   return buildProofReceipt({
     vulnClass: args.vulnClass,
@@ -619,9 +668,7 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
     exchangeIds: [control.exchangeId, probe.exchangeId],
     oobEventIds: [],
     browserTraceIds: [],
-    claimedDelta: args.mode === 'timing'
-      ? 'The conditional SQL payload produced a stable >3x response delay against the control arm.'
-      : 'The boolean SQL payload changed the response independently of the baseline value.',
+    claimedDelta: 'The conditional SQL payload produced a stable >3x response delay against the control arm.',
   })
 })
 
@@ -870,6 +917,17 @@ function inferMissingRoles(
   const reason = verification.reason
   const cited = (transcript.entries ?? []).filter(entry => receipt.exchangeIds.includes(entry.exchangeId))
 
+  if (verification.rule === 'boolean') {
+    if (/paired control\/probe rounds|equal number/.test(reason)) return ['paired_rounds']
+    if (/name the injected parameter/.test(reason)) return ['injected_parameter']
+    if (/request shape/.test(reason)) return ['request_shape']
+    if (/server error|5xx/.test(reason)) return ['non_error_arm']
+    if (/only difference was the injected predicate|rotating nonce/.test(reason)) return ['structural_delta']
+    if (/unstable|moving baseline/.test(reason)) return ['stable_differential']
+    if (/no structural response change/.test(reason)) return ['structural_delta']
+    return ['boolean_arm']
+  }
+
   if (verification.rule === 'timing') {
     if (/control and a probe/.test(reason)) return ['timing_control', 'timing_probe']
     if (/wall-clock duration/.test(reason)) {
@@ -957,7 +1015,7 @@ export const SPEC_KIND_RECIPES: readonly SpecKindRecipeMapping[] = [
     specKind: 'sql_boolean_diff',
     vulnClasses: ['sqli'],
     recipe: 'boolean_or_timing',
-    note: 'EXCEPTION: boolean-only evidence has no receipt rule yet; the recipe refuses with missing timing_arm.',
+    note: 'Boolean rule: >=2 paired rounds, identical request shape apart from the predicate, stable structural delta after token stripping, no 5xx.',
   },
   {
     specKind: 'sql_time_diff',
