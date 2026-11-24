@@ -1223,8 +1223,13 @@ async function runMicroCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetric
     floorPreserved: null,
     conversion: null,
     costUsd: results.reduce((sum, result) => sum + spentUsd(result.db), 0),
-    p50AssignmentMs: null,
-    completedAssignments: results.reduce((sum, result) => sum + (assignmentP50Ms(result.db) === null ? 0 : 1), 0),
+    p50AssignmentMs: (() => {
+      const values = results.map(result => assignmentP50Ms(result.db)).filter((value): value is number => value !== null)
+      return values.length > 0 ? Math.max(...values) : null
+    })(),
+    completedAssignments: results.reduce(
+      (sum, result) => sum + confirmedVulnerabilityCounts(result.db).completedAssignments, 0,
+    ),
     wallMs: Math.max(0, ...results.map(result => result.wallMs)),
     crashes: results.reduce((sum, result) => sum + countCrashes(result.log), 0),
     wiring: wiringPass ? 'pass' : (results.some(result => result.artifact?.metrics?.wiring?.status === 'fail') ? 'fail' : 'unmeasured'),
