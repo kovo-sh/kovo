@@ -298,6 +298,57 @@ test('access_boundary rejects the same cross-actor read when the probe gets no v
   assert.equal(execution.result.confirmed, false)
 })
 
+test('access_boundary accepts the collection-reference shape: a distinct 2xx control instead of a denial', async () => {
+  const execution = await runFloorRecipe(floorRecipe('access_boundary', {
+    origin: ORIGIN,
+    method: 'GET',
+    pathAndQuery: '/api/assets?projectId=project-1',
+    vulnClass: 'bola',
+    owner: READ_OWNER,
+    probe: READ_PROBE,
+    denied: READ_OWNER,
+    deniedPathAndQuery: '/api/assets?projectId=project-bogus',
+    controlEvidence: 'denial_or_distinct',
+  }), {
+    request: req => {
+      const bogus = req.pathAndQuery.includes('project-bogus')
+      return {
+        status: 200,
+        json: bogus ? { assets: [] } : { assets: [{ id: 'a1', owner_id: 'persona_a', tenant_id: 'tenant-a', private_note: 'victim data' }] },
+        body: bogus
+          ? JSON.stringify({ assets: [] })
+          : JSON.stringify({ assets: [{ id: 'a1', owner_id: 'persona_a', tenant_id: 'tenant-a', private_note: 'victim data' }] }),
+        route: '/api/assets',
+      }
+    },
+    nextExchangeId: seq(),
+  })
+  assert.equal(execution.result.confirmed, true, execution.failure?.message ?? execution.result.verification.reason)
+})
+
+test('access_boundary still rejects a distinct control when the recipe asked for a denial', async () => {
+  const execution = await runFloorRecipe(floorRecipe('access_boundary', {
+    origin: ORIGIN,
+    method: 'GET',
+    pathAndQuery: '/api/assets?projectId=project-1',
+    vulnClass: 'bola',
+    owner: READ_OWNER,
+    probe: READ_PROBE,
+    denied: READ_OWNER,
+    deniedPathAndQuery: '/api/assets?projectId=project-bogus',
+  }), {
+    request: req => ({
+      status: 200,
+      json: { assets: req.pathAndQuery.includes('bogus') ? [] : [{ id: 'a1', private_note: 'victim data' }] },
+      body: req.pathAndQuery.includes('bogus') ? '{"assets":[]}' : '{"assets":[{"id":"a1","private_note":"victim data"}]}',
+      route: '/api/assets',
+    }),
+    nextExchangeId: seq(),
+  })
+  assert.equal(execution.result.confirmed, false)
+  assert.match(execution.failure?.message ?? '', /denial/i)
+})
+
 // ============================================================================
 // 4. Authorization write: baseline write + pre-read + mutation + post-read
 // ============================================================================
@@ -387,7 +438,7 @@ test('persisted_mutation resets self-service state before the proof (bfla impers
     oracleEvents: ['privilege_escalation'],
   }), {
     request: req => {
-      const persona = req.persona ?? 'viewer'
+      const persona = req.actor.handle
       if (req.method === 'GET') {
         const store = sessions.get(persona) ?? 'own-store'
         return {
@@ -405,6 +456,59 @@ test('persisted_mutation resets self-service state before the proof (bfla impers
   })
   assert.equal(execution.result.confirmed, true, execution.failure?.message ?? execution.result.verification.reason)
   assert.match(execution.result.verification.reason, /role-gated function surface|persisted/i)
+})
+
+test('persisted_mutation confirms a DELETE when the post-read tombstone is 404 without a JSON body', async () => {
+  let deleted = false
+  const execution = await runFloorRecipe(floorRecipe('persisted_mutation', {
+    origin: ORIGIN,
+    method: 'DELETE',
+    pathAndQuery: '/api/admin/people/person-victim',
+    vulnClass: 'cross_tenant_write',
+    actor: { handle: 'viewer', role: 'viewer', tenant: 'tenant-b', auth: 'cookie' },
+    body: {},
+    baselineMethod: 'GET',
+    baselinePathAndQuery: '/api/people/person-victim',
+    readbackMethod: 'GET',
+    readbackPathAndQuery: '/api/people/person-victim',
+    readbackActor: { handle: 'admin', role: 'admin', tenant: 'tenant-a', auth: 'cookie' },
+    requiredRole: 'admin',
+  }), {
+    request: req => {
+      if (req.method === 'GET') {
+        return deleted
+          ? { status: 404, body: '', route: '/api/people/person-victim' }
+          : { status: 200, json: { id: 'person-victim', role: 'viewer' }, body: '{"id":"person-victim","role":"viewer"}', route: '/api/people/person-victim' }
+      }
+      deleted = true
+      return { status: 204, body: '', route: '/api/admin/people/person-victim' }
+    },
+    nextExchangeId: seq(),
+  })
+  assert.equal(execution.result.confirmed, true, execution.failure?.message ?? execution.result.verification.reason)
+})
+
+test('persisted_mutation rejects a DELETE whose post-read still serves the resource', async () => {
+  const execution = await runFloorRecipe(floorRecipe('persisted_mutation', {
+    origin: ORIGIN,
+    method: 'DELETE',
+    pathAndQuery: '/api/admin/people/person-victim',
+    vulnClass: 'cross_tenant_write',
+    actor: { handle: 'viewer', role: 'viewer', tenant: 'tenant-b', auth: 'cookie' },
+    body: {},
+    baselineMethod: 'GET',
+    baselinePathAndQuery: '/api/people/person-victim',
+    readbackMethod: 'GET',
+    readbackPathAndQuery: '/api/people/person-victim',
+    readbackActor: { handle: 'admin', role: 'admin', tenant: 'tenant-a', auth: 'cookie' },
+    requiredRole: 'admin',
+  }), {
+    request: req => req.method === 'GET'
+      ? { status: 200, json: { id: 'person-victim' }, body: '{"id":"person-victim"}', route: '/api/people/person-victim' }
+      : { status: 204, body: '', route: '/api/admin/people/person-victim' },
+    nextExchangeId: seq(),
+  })
+  assert.equal(execution.result.confirmed, false)
 })
 
 // ============================================================================
@@ -456,6 +560,31 @@ function personas() {
     { handle: 'persona_b', roleLabel: 'member (tenant-b)', privilege: 'member' as const, tenant: 'tenant-b' },
   ]
 }
+
+test('an authz DELETE plans against the reserved victim, not the consumed matrix id', () => {
+  const hypothesis: EngineHypothesis = {
+    ...authzHypothesis(false),
+    method: 'DELETE',
+    endpoint: { id: 'ep-delete', origin: ORIGIN, method: 'DELETE', pathTemplate: '/api/admin/people/:personId', params: [] },
+    pathAndQuery: '/api/admin/people/{{id}}',
+    readbackPath: '/api/people/{{id}}',
+    functionLevel: false,
+    resourceIds: ['consumed-id'],
+    reservedVictimId: 'reserved-victim',
+  }
+  const plan = planFloorRecipe({
+    hypothesis,
+    probe: authzProbe(false),
+    specKind: 'http_chain',
+    vulnClass: 'bola',
+    personas: personas(),
+  })
+  assert.ok(plan)
+  assert.equal(plan.recipeId, 'persisted_mutation')
+  const args = plan.args as PersistedMutationArgs
+  assert.equal(args.pathAndQuery, '/api/admin/people/reserved-victim')
+  assert.equal(args.baselinePathAndQuery, '/api/people/reserved-victim')
+})
 
 test('authz reads plan the access_boundary recipe with a bogus-id denial control', () => {
   const plan = planFloorRecipe({

@@ -329,11 +329,11 @@ function baselineWriteFor(body: unknown): { body: Record<string, unknown>; field
 function authzBodyOf(input: FloorRecipePlanInput): Record<string, unknown> | null {
   const hyp = input.hypothesis
   if (hyp.functionState?.body) return hyp.functionState.body
-  const hit = input.probe.anomalies.find(anomaly =>
+  const hits = input.probe.anomalies.filter(anomaly =>
     anomaly.type === 'unauthorized_access' &&
-    String(anomaly.method ?? 'GET').toUpperCase() === hyp.method &&
     anomaly.bodyTemplate !== undefined && anomaly.bodyTemplate !== null &&
     typeof anomaly.bodyTemplate === 'object' && !Array.isArray(anomaly.bodyTemplate))
+  const hit = hits.find(anomaly => String(anomaly.method ?? 'GET').toUpperCase() === hyp.method) ?? hits[0]
   if (hit?.bodyTemplate) return hit.bodyTemplate as Record<string, unknown>
   return hyp.jsonBody ?? null
 }
@@ -355,7 +355,15 @@ function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   const id = resourceIdOf(input)
   const functionLevel = hyp.functionLevel === true
   if (!functionLevel && !id) return { ...sketch, skipReason: 'object-level authz hypothesis has no usable resource identifier' }
-  const realPath = id ? fillResourceId(hyp.pathAndQuery, id) : hyp.pathAndQuery
+  const privileged = PRIVILEGED_ACTION_RE.test(hyp.pathAndQuery.split('?')[0]!)
+  // A destructive probe matrix consumes the identifiers it exercises. The engine reserves one live
+  // victim for the replay when a privileged delete needs an observable removal; reuse it so the
+  // pre-read, mutation and post-read all address a real object.
+  const reserved = hyp.method === 'DELETE' && !functionLevel && privileged && hyp.reservedVictimId
+    ? hyp.reservedVictimId
+    : null
+  const resolvedId = reserved && /^[A-Za-z0-9_.:-]{1,128}$/.test(reserved) ? reserved : id
+  const realPath = resolvedId ? fillResourceId(hyp.pathAndQuery, resolvedId) : hyp.pathAndQuery
   const owner = floorActorFor(ownerHandle, input.personas)
   const probe = floorActorFor(probeHandle, input.personas)
   const headers = { ...(hyp.headers ?? {}), ...(input.headers ?? {}) }
@@ -366,6 +374,7 @@ function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
     // authorization oracle decides whether the denial is boundary evidence or merely selectivity,
     // and confirms a cross-tenant disclosure from the entitled/probe pair.
     const deniedPath = id && !functionLevel ? fillResourceId(hyp.pathAndQuery, bogusIdFor(id)) : realPath
+    const idInPath = /\/\{\{id\}\}(?:\/|$|\?)/.test(hyp.pathAndQuery) || /\/:\w+(?:\/|$|\?)/.test(hyp.pathAndQuery)
     const args: AccessBoundaryArgs = {
       origin: hyp.endpoint.origin,
       method: 'GET',
@@ -375,6 +384,7 @@ function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
       probe,
       denied: owner,
       ...(deniedPath !== realPath ? { deniedPathAndQuery: deniedPath } : {}),
+      ...(!idInPath ? { controlEvidence: 'denial_or_distinct' as const } : {}),
       ...(Object.keys(headers).length > 0 ? { headers } : {}),
     }
     return { ...sketch, args, paramLocation: 'path' }
@@ -385,7 +395,7 @@ function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   // attributable (a fresh baseline write, or a reset for self-service session state).
   const body = authzBodyOf(input)
   if (!body) return { ...sketch, skipReason: 'authz mutation hypothesis has no request body template' }
-  const readbackPath = authzReadbackPath(input, id, functionLevel)
+  const readbackPath = authzReadbackPath(input, resolvedId, functionLevel)
   if (!readbackPath) return { ...sketch, skipReason: 'authz mutation hypothesis has no separate readback route' }
   const readbackActor = floorActorFor(hyp.readbackPersona ?? ownerHandle, input.personas)
   const selfState = Boolean(hyp.functionState?.bindings?.length)
@@ -393,7 +403,6 @@ function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   const resetBody = selfState && hyp.functionState?.reset?.length
     ? { ...body, ...Object.fromEntries(hyp.functionState.reset.map(item => [item.field, item.value])) }
     : null
-  const privileged = PRIVILEGED_ACTION_RE.test(hyp.pathAndQuery.split('?')[0]!)
   const args: PersistedMutationArgs = {
     origin: hyp.endpoint.origin,
     method: hyp.method,

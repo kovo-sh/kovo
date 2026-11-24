@@ -159,6 +159,13 @@ export interface AccessBoundaryArgs extends FloorRecipeBaseArgs {
    */
   deniedPathAndQuery?: string
   deniedMethod?: string
+  /**
+   * What the negative control proves. `denial` (default) requires a 4xx. `denial_or_distinct`
+   * accepts the legacy collection-reference shape: a bogus identifier returns 2xx but a body
+   * different from the entitled read, so the route is selective without a denial. The impact
+   * oracle still decides confirmation; this only keeps the recipe from discarding a valid control.
+   */
+  controlEvidence?: 'denial' | 'denial_or_distinct'
   requiredRole?: RoleName
   resourceTenant?: string
   expectControlDenied?: boolean
@@ -587,7 +594,10 @@ const accessBoundary = defineRecipe<AccessBoundaryArgs>('access_boundary', async
   })
 
   ctx.require(isSuccess(entitled.exchange.status), 'entitled_read', 'The entitled control was not served the resource.')
-  ctx.require(isDenied(denied.exchange.status), 'denied_control', `The peer control returned ${denied.exchange.status ?? 'no status'} instead of a denial.`)
+  const deniedBody = denied.exchange.body ?? ''
+  const distinctControl = isSuccess(denied.exchange.status) && deniedBody.length > 2 && deniedBody !== (entitled.exchange.body ?? '')
+  const controlOk = isDenied(denied.exchange.status) || (args.controlEvidence === 'denial_or_distinct' && distinctControl)
+  ctx.require(controlOk, 'denied_control', `The control arm returned ${denied.exchange.status ?? 'no status'} without a denial or a distinct selective body.`)
   ctx.require(isSuccess(probe.exchange.status), 'probe_request', `The probe actor was not served the resource (${probe.exchange.status ?? 'no status'}).`)
 
   return buildProofReceipt({
@@ -672,7 +682,11 @@ const persistedMutation = defineRecipe<PersistedMutationArgs>('persisted_mutatio
 
   ctx.require(baseline.exchange.json !== undefined, 'baseline_read', 'The pre-mutation baseline read recorded no JSON body.')
   ctx.require(isSuccess(probe.exchange.status), 'mutation_probe', `The mutating probe was not accepted (${probe.exchange.status ?? 'no status'}).`)
-  ctx.require(after.exchange.json !== undefined, 'post_mutation_read', 'The separate post-mutation GET recorded no JSON body.')
+  // A DELETE's separate readback proves persistence by reporting the resource gone; a 404/410
+  // tombstone need not carry a JSON body (the persistence oracle handles that case).
+  const tombstone = args.method.toUpperCase() === 'DELETE' &&
+    (after.exchange.status === 404 || after.exchange.status === 410)
+  ctx.require(after.exchange.json !== undefined || tombstone, 'post_mutation_read', 'The separate post-mutation GET recorded no JSON body.')
 
   return buildProofReceipt({
     vulnClass: args.vulnClass,
