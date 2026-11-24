@@ -315,6 +315,49 @@ export function replaySpecRouteSteps(spec: unknown): Array<{ method: string; pat
 }
 
 /**
+ * One observed response on a probed route. Body-free by construction: only the status code, the
+ * recorded body hash (a shape fingerprint, never content) and host-observed anomaly/refutation
+ * flags. The early-exit predicate reads this ledger, never tool text.
+ */
+export interface RouteAttemptObservation {
+  method: string
+  path: string
+  pathAndQuery: string
+  /** HTTP status, or null when the probe tool does not surface one (differential/calibration). */
+  status: number | null
+  /** Recorded body sha256 (shape fingerprint) when the broker exposed it. */
+  bodySha256: string | null
+  /** Host-observed anomaly (differential `signal`, non-empty anomaly list, or an error probe). */
+  anomaly: boolean
+  /** Control-vs-probe differential returned `no_signal` with no anomaly: the class hypothesis was refuted. */
+  refuted: boolean
+  /** SPA catch-all calibration flagged the path (same body for unknown paths, no per-path state). */
+  staticCatchAll: boolean
+}
+
+/** Route-evidence aggregate consumed by the early-exit predicate. Pure data, no bodies. */
+export interface RouteObservationSnapshot {
+  attempts: number
+  /** Distinct `METHOD pathAndQuery` attempts (exact repeats collapse: repetition is not evidence). */
+  distinctAttempts: number
+  /** Distinct `METHOD path` routes touched. */
+  distinctPaths: number
+  /** Distinct parameter-name sets exercised. */
+  distinctParams: number
+  /** Distinct body shas observed (<=1 with >=2 attempts means one stable shape). */
+  distinctBodies: number
+  anomalyCount: number
+  statuses: readonly number[]
+  denialStatuses: readonly number[]
+  /** Non-denial responses to state-changing methods (POST/PUT/PATCH/DELETE). */
+  stateChangeAttempts: number
+  staticCatchAll: boolean
+  refutedHypotheses: number
+  /** Most-observed route (method/path/params only). */
+  route?: SpecRouteEvidence
+}
+
+/**
  * Per-assignment spec-submission ledger. Small, mutable and dependency-free so the tool layer and
  * the settlement runner share one source of truth without touching session storage.
  */
@@ -322,6 +365,8 @@ export class SpecSubmissionTracker {
   private state: SpecSubmissionSnapshot = { probes: 0, specAttempts: 0, targetCovered: false, codedProofGaps: 0, proofGaps: [], required: 0 }
   /** Probed route key → evidence + probe count; the most-probed route is the target proxy. */
   private readonly routeCounts = new Map<string, { route: SpecRouteEvidence; count: number }>()
+  /** Bounded, body-free route response ledger (status/sha/anomaly only) for early-exit settlement. */
+  private readonly observations: RouteAttemptObservation[] = []
   /** Route keys (`METHOD path`) that a submitted spec or verify script positively covers. */
   private readonly coveredRoutes = new Set<string>()
   /** Attempts whose spec shape could not be attributed to a route; treated as covering any target. */
@@ -407,6 +452,103 @@ export class SpecSubmissionTracker {
     return required
   }
 
+  /**
+   * Record one observed route response. Called from `wrapExec` with the raw broker/probe result,
+   * so the evidence is host-observed and never parsed from tool text. Bounded to the last 64
+   * observations; duplicates are kept so repeat density stays visible (attempts vs distinct).
+   */
+  noteObservation(input: {
+    method?: string
+    pathAndQuery?: string
+    status?: number | null
+    bodySha256?: string | null
+    anomaly?: boolean
+    refuted?: boolean
+    staticCatchAll?: boolean
+  }): void {
+    const route = cleanSpecRoute(input)
+    if (!route) return
+    const raw = (input.pathAndQuery ?? '').trim()
+    const status = typeof input.status === 'number' && Number.isFinite(input.status) ? Math.trunc(input.status) : null
+    this.observations.push({
+      method: route.method,
+      path: route.path,
+      pathAndQuery: raw.slice(0, 320),
+      status,
+      bodySha256: typeof input.bodySha256 === 'string' && input.bodySha256 ? input.bodySha256.slice(0, 128) : null,
+      anomaly: input.anomaly === true,
+      refuted: input.refuted === true,
+      staticCatchAll: input.staticCatchAll === true,
+    })
+    if (this.observations.length > 64) this.observations.splice(0, this.observations.length - 64)
+  }
+
+  /** Aggregate the route ledger into the numbers the early-exit predicate and event report. */
+  observationSnapshot(): RouteObservationSnapshot {
+    const routeCounts = new Map<string, { route: SpecRouteEvidence; count: number }>()
+    const attemptKeys = new Set<string>()
+    const pathKeys = new Set<string>()
+    const paramKeys = new Set<string>()
+    const bodies = new Set<string>()
+    const statuses: number[] = []
+    let attempts = 0
+    let anomalyCount = 0
+    let stateChangeAttempts = 0
+    let staticCatchAll = false
+    let refutedHypotheses = 0
+    let targetRoute: SpecRouteEvidence | undefined
+    for (const observation of this.observations) {
+      attempts += 1
+      const key = `${observation.method} ${observation.path}`
+      pathKeys.add(key)
+      attemptKeys.add(`${key}?${(observation.pathAndQuery.split('?', 2)[1] ?? '')}`)
+      const params = (observation.pathAndQuery.split('?', 2)[1] ?? '')
+        .split('&')
+        .map(pair => (pair.split('=', 1)[0] ?? ''))
+        .filter(Boolean)
+        .sort()
+      paramKeys.add(params.join('&'))
+      if (observation.bodySha256) bodies.add(observation.bodySha256)
+      if (observation.status !== null) statuses.push(observation.status)
+      if (observation.anomaly) anomalyCount += 1
+      if (observation.staticCatchAll) staticCatchAll = true
+      if (observation.refuted) refutedHypotheses += 1
+      if (EARLY_EXIT_STATE_CHANGE_METHODS.has(observation.method) &&
+        observation.status !== null && !EARLY_EXIT_HARDENED_STATUSES.has(observation.status)) {
+        stateChangeAttempts += 1
+      }
+      const existing = routeCounts.get(key)
+      const count = (existing?.count ?? 0) + 1
+      routeCounts.delete(key)
+      routeCounts.set(key, {
+        route: { method: observation.method, path: observation.path, params: params.slice(0, 4) },
+        count,
+      })
+    }
+    // Highest observation count wins; ties resolve to the most recently touched route.
+    let best = 0
+    for (const entry of routeCounts.values()) {
+      if (entry.count >= best) {
+        best = entry.count
+        targetRoute = entry.route
+      }
+    }
+    return {
+      attempts,
+      distinctAttempts: attemptKeys.size,
+      distinctPaths: pathKeys.size,
+      distinctParams: paramKeys.size,
+      distinctBodies: bodies.size,
+      anomalyCount,
+      statuses,
+      denialStatuses: statuses.filter(status => EARLY_EXIT_HARDENED_STATUSES.has(status)),
+      stateChangeAttempts,
+      staticCatchAll,
+      refutedHypotheses,
+      ...(targetRoute ? { route: targetRoute } : {}),
+    }
+  }
+
   snapshot(): SpecSubmissionSnapshot {
     const target = this.state.route
     // Bind only when we have a non-root target route. Without one (batch/race/probe-only evidence)
@@ -431,6 +573,153 @@ export function specSubmissionPending(snapshot: SpecSubmissionSnapshot): boolean
 /** Settlement must refuse a leaning conclusion when the proof obligation is still open. */
 export function specSubmissionRequiredFor(snapshot: SpecSubmissionSnapshot): boolean {
   return specSubmissionPending(snapshot)
+}
+
+// ---------------------------------------------------------------------------
+// v7 M5 throughput: early-exit settlement on clearly clean/hardened routes
+// ---------------------------------------------------------------------------
+//
+// The single-step budget was raised 12→18 turns / 80→120 s because most held-out no-spec targets
+// were cap-truncated. The accepted cost is a higher p50. The remedy is not a lower ceiling: when a
+// route is *provably* hardened, stop probing at turn 5-6 and spend the reserved wrap-up turn on the
+// spec / coded proof gap instead of burning turns 7-18. The exit is evidence-gated (never vibes):
+// at least two distinct attempts on distinct paths/params, every status a hardened denial (or a
+// calibrated static catch-all, or a control-vs-probe refutation), and zero anomalies. It is blocked
+// while a spec submission is in flight, a complete_intent repair is in flight, or a free-text proof
+// gap is still uncoded, so an unearned exit can never suppress work in progress.
+
+/** Hardened/denial statuses: the route answers the same refusal to every attempt. */
+export const EARLY_EXIT_HARDENED_STATUSES: ReadonlySet<number> = new Set([401, 403, 404, 405, 410])
+/** Methods whose non-denial answer is a state change (blocks the static/catch-all reason). */
+export const EARLY_EXIT_STATE_CHANGE_METHODS: ReadonlySet<string> = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+/** Distinct attempts required before a route may be called clean. */
+export const EARLY_EXIT_MIN_ATTEMPTS = 2
+/** Settlement must be armed for at least this many turns before early exit is considered. */
+export const EARLY_EXIT_MIN_TURNS = 4
+/** Turns granted after the trigger to submit the spec/verify or coded gap and call complete_intent. */
+export const EARLY_EXIT_GRACE_TURNS = 2
+
+export type EarlyExitReason = 'hardened_denial' | 'static_no_state_change' | 'hypothesis_refuted'
+
+export type EarlyExitBlock =
+  | 'below_min_turns'
+  | 'insufficient_evidence'
+  | 'anomaly_recorded'
+  | 'spec_pending'
+  | 'repair_in_flight'
+  | 'unresolved_proof_gap'
+
+export type EarlyExitDecision =
+  | { eligible: false; blockedBy: EarlyExitBlock }
+  | { eligible: true; reason: EarlyExitReason; evidenceCount: number }
+
+export interface EarlyExitInput {
+  evidence: RouteObservationSnapshot
+  turnsUsed: number
+  maxTurns: number
+  minTurns?: number
+  /**
+   * A submitted spec/verify result is awaiting the reserved wrap-up turn (`specAttempts > 0` and
+   * the target route is not covered yet). The obligation must finish before we cut the session.
+   * A merely *probed* route with no attempt is not "pending" — that is exactly the case early exit
+   * accelerates into the reserved wrap-up turn.
+   */
+  specPending?: boolean
+  /** complete_intent was rejected without a spec/coded gap and the repair turn has not landed. */
+  repairInFlight?: boolean
+  /** A free-text (non-coded) proof gap is recorded: the obligation is still open. */
+  unresolvedProofGap?: boolean
+}
+
+/**
+ * Pure early-exit predicate. Order matters: turn floor, then work-in-flight blockers, then anomaly,
+ * then evidence sufficiency, then one of the three earned reasons.
+ */
+export function earlyExitEligible(input: EarlyExitInput): EarlyExitDecision {
+  const minTurns = input.minTurns ?? EARLY_EXIT_MIN_TURNS
+  if (input.turnsUsed < minTurns) return { eligible: false, blockedBy: 'below_min_turns' }
+  if (input.specPending) return { eligible: false, blockedBy: 'spec_pending' }
+  if (input.repairInFlight) return { eligible: false, blockedBy: 'repair_in_flight' }
+  if (input.unresolvedProofGap) return { eligible: false, blockedBy: 'unresolved_proof_gap' }
+  const evidence = input.evidence
+  if (evidence.anomalyCount > 0) return { eligible: false, blockedBy: 'anomaly_recorded' }
+  // At least two distinct attempts, on distinct routes or distinct parameter sets.
+  const distinctAttempts = evidence.attempts >= EARLY_EXIT_MIN_ATTEMPTS &&
+    evidence.distinctAttempts >= EARLY_EXIT_MIN_ATTEMPTS
+  if (!distinctAttempts) return { eligible: false, blockedBy: 'insufficient_evidence' }
+  const consistentDenial = evidence.statuses.length >= EARLY_EXIT_MIN_ATTEMPTS &&
+    evidence.statuses.every(status => EARLY_EXIT_HARDENED_STATUSES.has(status)) &&
+    evidence.stateChangeAttempts === 0
+  if (consistentDenial) return { eligible: true, reason: 'hardened_denial', evidenceCount: evidence.attempts }
+  if (evidence.staticCatchAll && evidence.stateChangeAttempts === 0) {
+    return { eligible: true, reason: 'static_no_state_change', evidenceCount: evidence.attempts }
+  }
+  if (evidence.refutedHypotheses > 0) {
+    return { eligible: true, reason: 'hypothesis_refuted', evidenceCount: evidence.attempts }
+  }
+  return { eligible: false, blockedBy: 'insufficient_evidence' }
+}
+
+/** Pure turn-accounting for the assignment stat: turns the session never spent probing. */
+export function earlyExitTurnsSaved(input: { turnsUsed: number; maxTurns: number; graceTurns?: number }): number {
+  const grace = input.graceTurns ?? EARLY_EXIT_GRACE_TURNS
+  return Math.max(0, Math.floor(input.maxTurns) - Math.floor(input.turnsUsed) - Math.max(0, grace))
+}
+
+/** Structured early-exit record emitted as `agent.early_exit` and stored on the assignment stat. */
+export interface EarlyExitEvent {
+  reason: EarlyExitReason
+  turnsUsed: number
+  maxTurns: number
+  /** Distinct route attempts that earned the exit (>=2). */
+  evidenceCount: number
+  /** Turns the session will not spend (`maxTurns - turnsUsed - grace`). */
+  turnsSaved: number
+  denialStatuses: readonly number[]
+  route?: SpecRouteEvidence
+}
+
+export function buildEarlyExitEvent(input: {
+  reason: EarlyExitReason
+  evidence: RouteObservationSnapshot
+  turnsUsed: number
+  maxTurns: number
+}): EarlyExitEvent {
+  return {
+    reason: input.reason,
+    turnsUsed: input.turnsUsed,
+    maxTurns: input.maxTurns,
+    evidenceCount: input.evidence.attempts,
+    turnsSaved: earlyExitTurnsSaved({ turnsUsed: input.turnsUsed, maxTurns: input.maxTurns }),
+    denialStatuses: [...input.evidence.denialStatuses],
+    ...(input.evidence.route ? { route: input.evidence.route } : {}),
+  }
+}
+
+/**
+ * Early-exit directive: replaces the 85% banner on the first post-trigger turn and says exactly
+ * why the wrap-up started early. The spec/coded-gap obligation is unchanged.
+ */
+export function earlyExitDirectiveMessage(input: EarlyExitEvent & {
+  proofTools?: readonly string[]
+  specDirective?: string
+}): string {
+  const typed = (input.proofTools ?? []).filter(name => name.trim())
+  const proofPath = typed.length
+    ? `submit the evidence via ${typed.join('/')} or propose_chain_finding/update_proposed_finding`
+    : 'submit the evidence via propose_chain_finding/update_proposed_finding'
+  const routeText = input.route ? ` ${input.route.method} ${input.route.path}` : ' the target route'
+  const reasonText = input.reason === 'hardened_denial'
+    ? `every attempt on${routeText} returned a consistent hardened denial (${input.denialStatuses.join('/') || 'denied'}) with no differential`
+    : input.reason === 'static_no_state_change'
+      ? `${routeText} is a calibrated static/catch-all route with no state change`
+      : `the class hypothesis on${routeText} was refuted by a control-vs-probe negative control`
+  return [
+    `[GUARDIAN EARLY EXIT — Turn ${input.turnsUsed}/${input.maxTurns}]`,
+    `Wrap-up started early (${input.reason}) because ${reasonText} across ${input.evidenceCount} distinct attempts with no anomaly recorded. ${input.turnsSaved} turn(s) saved; do not probe further.`,
+    `Network probing is now revoked. ${proofPath} (or record_coverage(status="needs_follow_up", proofGapReason="<code>")) and call complete_intent with status (proved | ruled_out | blocked | partial) and a concise summary.`,
+    ...(input.specDirective ? [input.specDirective] : []),
+  ].join(' ')
 }
 
 export type SpecSubmissionFunnelStage =
@@ -469,13 +758,20 @@ export function settlementToolBlock(input: {
   specPending?: boolean
   /** Pre-rendered settlement proof obligation naming the route + smallest spec. */
   specDirective?: string
+  /**
+   * Effective final turn. Defaults to `maxTurns`; an earned early exit passes
+   * `min(maxTurns, triggerTurn + EARLY_EXIT_GRACE_TURNS)` so the last grace turn is reserved for
+   * complete_intent while the turn before it can still run the one wrap-up guardian_verify.
+   */
+  finalTurn?: number
 }): string | undefined {
   if (!input.settling) return undefined
+  const finalTurn = input.finalTurn ?? input.maxTurns
   if (SETTLEMENT_REVOKED_TOOLS.has(input.name)) {
     return `Settlement wrap-up active (${input.turnsUsed}/${input.maxTurns} turns). ${input.name} is disabled during settlement. Finalize offline analysis, commit record_fact / record_coverage / propose_chain_finding, and call complete_intent.`
   }
-  if (input.turnsUsed >= input.maxTurns && SETTLEMENT_WRAPUP_TOOLS.has(input.name)) {
-    return `Final settlement turn (${input.turnsUsed}/${input.maxTurns}). ${input.name} is disabled on the final turn; commit results and call complete_intent.`
+  if (input.turnsUsed >= finalTurn && SETTLEMENT_WRAPUP_TOOLS.has(input.name)) {
+    return `Final settlement turn (${input.turnsUsed}/${finalTurn}). ${input.name} is disabled on the final turn; commit results and call complete_intent.`
   }
   if (input.specPending && SETTLEMENT_SPEC_PAUSED_TOOLS.has(input.name)) {
     return `${input.specDirective ? `${input.specDirective} ` : ''}${input.name} is paused during settlement while the proof obligation is open; call guardian_verify (or record a coded record_coverage proof gap) before complete_intent.`
@@ -2638,6 +2934,55 @@ export interface SpecSubmissionToolOptions {
   onRequired?: (info: { status: string; count: number; route?: SpecRouteEvidence }) => void
 }
 
+/** Read-only structural view of a broker/probe result (never a body): status + shape hash. */
+interface ObservedRouteResult {
+  status?: unknown
+  bodySha256?: unknown
+  verdict?: unknown
+  anomalies?: unknown
+  requestsSent?: unknown
+  calibration?: unknown
+  results?: unknown
+}
+
+function asObserved(value: unknown): ObservedRouteResult | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as ObservedRouteResult : undefined
+}
+
+function observedStatus(value: unknown): number | null {
+  const observed = asObserved(value)
+  return typeof observed?.status === 'number' && Number.isFinite(observed.status) ? Math.trunc(observed.status) : null
+}
+
+function observedBodySha(value: unknown): string | null {
+  const observed = asObserved(value)
+  return typeof observed?.bodySha256 === 'string' && observed.bodySha256 ? observed.bodySha256 : null
+}
+
+/** A differential `signal` verdict or any non-empty anomaly list is an anomaly, never a clean route. */
+function observedAnomaly(value: unknown): boolean {
+  const observed = asObserved(value)
+  if (!observed) return false
+  if (Array.isArray(observed.anomalies) && observed.anomalies.length > 0) return true
+  return observed.verdict === 'signal'
+}
+
+/** `no_signal` after a real control-vs-probe matrix (>=2 requests) refutes the class hypothesis. */
+function observedRefutation(value: unknown): boolean {
+  const observed = asObserved(value)
+  if (!observed) return false
+  const sent = typeof observed.requestsSent === 'number' ? observed.requestsSent : 0
+  return observed.verdict === 'no_signal' && sent >= 2 && !observedAnomaly(value)
+}
+
+function observedStaticCatchAll(value: unknown): boolean {
+  const observed = asObserved(value)
+  if (!observed) return false
+  const calibration = observed.calibration
+  return Boolean(calibration && typeof calibration === 'object' && !Array.isArray(calibration) &&
+    (calibration as { spaCatchall?: unknown }).spaCatchall === true)
+}
+
 export function buildWorkerTools(
   handlers: WorkerToolHandlers,
   scrub: (value: string) => string,
@@ -2657,11 +3002,14 @@ export function buildWorkerTools(
     fn: () => Promise<unknown>,
     signal: AbortSignal,
     control?: { terminate?: boolean },
+    /** Host-observed route ledger hook. Runs on the raw result, before any text rendering. */
+    observe?: (result: unknown) => void,
   ) => {
     try {
       const result = await fn()
       if (SPEC_SUBMISSION_TOOLS.has(toolName) && !ROUTE_BOUND_SPEC_TOOLS.has(toolName)) specSubmission?.tracker?.noteSpecAttempt()
       if (ROUTE_EVIDENCE_TOOLS.has(toolName)) specSubmission?.tracker?.noteProbe()
+      try { observe?.(result) } catch { /* evidence bookkeeping must never break a probe */ }
       const text = await formatToolOutput(result, toolName, scrub, inlineLimit, handlers.spillOutput, signal)
       return {
         output: [{ type: 'text' as const, text }],
@@ -2723,7 +3071,13 @@ export function buildWorkerTools(
             ...(args.origin ? { origin: args.origin } : {}),
           })
           return result
-        }), signal)
+        }), signal, undefined, result => specSubmission?.tracker?.noteObservation({
+          method: args.method,
+          pathAndQuery: args.pathAndQuery,
+          status: observedStatus(result),
+          bodySha256: observedBodySha(result),
+          anomaly: observedAnomaly(result),
+        }))
       },
     }))
   }
@@ -2751,7 +3105,19 @@ export function buildWorkerTools(
             }
           }),
         }
-        return wrapExec('request_http_batch', () => fn(normalized, signal), signal)
+        return wrapExec('request_http_batch', () => fn(normalized, signal), signal, undefined, result => {
+          const observed = asObserved(result)
+          const rows = Array.isArray(observed?.results) ? observed.results : []
+          normalized.requests.forEach((request, index) => {
+            specSubmission?.tracker?.noteObservation({
+              method: request.method,
+              pathAndQuery: request.pathAndQuery,
+              status: observedStatus(rows[index]),
+              bodySha256: observedBodySha(rows[index]),
+              anomaly: false,
+            })
+          })
+        })
       },
     }))
   }
@@ -3003,7 +3369,19 @@ export function buildWorkerTools(
       outputLimits,
       execute: (args, _api, ctx) => {
         const signal = combineSignal(ctx.abortSignal)
-        return wrapExec('probe_surface', () => fn(args, signal), signal)
+        return wrapExec('probe_surface', () => fn(args, signal), signal, undefined, result => {
+          const target = args.basePath ?? (args.mode === 'paths' ? args.candidates?.[0] : undefined)
+          if (!target) return
+          const observed = asObserved(result)
+          const anomalies = Array.isArray(observed?.anomalies) ? observed.anomalies.length : 0
+          specSubmission?.tracker?.noteObservation({
+            method: 'GET',
+            pathAndQuery: target,
+            status: null,
+            anomaly: anomalies > 0,
+            staticCatchAll: observedStaticCatchAll(result),
+          })
+        })
       },
     }))
   }
@@ -3040,7 +3418,13 @@ export function buildWorkerTools(
       outputLimits,
       execute: (args, _api, ctx) => {
         const signal = combineSignal(ctx.abortSignal)
-        return wrapExec('probe_differential', () => fn(args, signal), signal)
+        return wrapExec('probe_differential', () => fn(args, signal), signal, undefined, result => specSubmission?.tracker?.noteObservation({
+          method: args.method ?? 'GET',
+          pathAndQuery: args.pathAndQuery,
+          status: null,
+          anomaly: observedAnomaly(result),
+          refuted: observedRefutation(result),
+        }))
       },
     }))
   }
@@ -4074,6 +4458,11 @@ export interface RunAgentSessionOptions {
    * machine-readable record_coverage proof gap. Wire this to `agent.spec_submission_required`.
    */
   onSpecSubmissionRequired?: (info: { status: string; count: number; route?: SpecRouteEvidence }) => void
+  /**
+   * Called once when settlement starts early because the target route is provably clean/hardened.
+   * Wire this to the `agent.early_exit` run event and the `earlyExitTurnsSaved` assignment stat.
+   */
+  onEarlyExit?: (info: EarlyExitEvent) => void
   onProfileSuccess?: (profileId: string) => void
   onProfileFailure?: (profileId: string, err: string, hard: boolean) => void
   /** Opt-in agentic trace writer (see createAgentTrace). Nothing is recorded when omitted. */
@@ -4093,6 +4482,10 @@ export interface AgentSessionResult {
   specSubmissionRequired?: number
   /** Final spec-submission ledger (route evidence / spec attempts / coded gaps). */
   specSubmission?: SpecSubmissionSnapshot
+  /** Earned early exit (`agent.early_exit`): reason, turns used, evidence count, turns saved. */
+  earlyExit?: EarlyExitEvent
+  /** Turns the session never spent because settlement started early (0 when it did not). */
+  earlyExitTurnsSaved?: number
 }
 
 export async function runAgentSession(options: RunAgentSessionOptions): Promise<AgentSessionResult> {
@@ -4172,11 +4565,46 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   let completion: IntentCompletion | undefined
   /** Shared with the tool layer: route evidence, spec attempts and coded proof gaps. */
   const specTracker = new SpecSubmissionTracker()
+  /** Earned early exit; set at most once so the event/stat are never double counted. */
+  let earlyExit: EarlyExitEvent | undefined
+  /** Turn on which complete_intent was last rejected for a missing spec/gap (repair window). */
+  let repairTurn: number | undefined
   const specSnapshot = () => specTracker.snapshot()
   const specDirectiveForRun = () => {
     const snapshot = specSnapshot()
     return specSubmissionPending(snapshot) ? settlementSpecDirective(snapshot.route) : undefined
   }
+  /**
+   * Evidence-gated early exit, evaluated after every assistant turn. Distinct from the 85% banner:
+   * the route must have answered >=2 distinct attempts with a consistent hardened shape and no
+   * anomaly, and no spec submission / repair / uncoded proof gap may be in flight.
+   */
+  const evaluateEarlyExit = () => {
+    if (!enableSettlement || earlyExit || completion || !handlers.complete_intent) return
+    const evidence = specTracker.observationSnapshot()
+    if (!evidence.attempts) return
+    const snapshot = specSnapshot()
+    const decision = earlyExitEligible({
+      evidence,
+      turnsUsed,
+      maxTurns,
+      specPending: snapshot.specAttempts > 0 && !snapshot.targetCovered,
+      repairInFlight: repairTurn !== undefined && snapshot.codedProofGaps === 0 && !snapshot.targetCovered,
+      unresolvedProofGap: snapshot.proofGaps.some(gap => !gap.code),
+    })
+    if (!decision.eligible) return
+    earlyExit = buildEarlyExitEvent({ reason: decision.reason, evidence, turnsUsed, maxTurns })
+    settled = true
+    try { options.onEarlyExit?.(earlyExit) } catch { /* telemetry must never break a run */ }
+  }
+  /** Effective final turn: an early exit reserves one wrap-up verify turn, then one final turn. */
+  const finalTurnForRun = () => earlyExit
+    ? Math.min(maxTurns, earlyExit.turnsUsed + EARLY_EXIT_GRACE_TURNS)
+    : maxTurns
+  /** Result fields for an earned early exit; empty (absent) when settlement started normally. */
+  const earlyExitFields = () => earlyExit
+    ? { earlyExit, earlyExitTurnsSaved: earlyExit.turnsSaved }
+    : {}
 
   const registeredProofTools = handlers.guardian_verify
     ? ['guardian_verify']
@@ -4196,6 +4624,10 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
 
   const isSettling = () => {
     if (!enableSettlement) return false
+    if (earlyExit) {
+      settled = true
+      return true
+    }
     if (settlementDue({
       turnsUsed,
       settlementTurn,
@@ -4217,7 +4649,10 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     result => { completion = result },
     {
       tracker: specTracker,
-      ...(options.onSpecSubmissionRequired ? { onRequired: options.onSpecSubmissionRequired } : {}),
+      onRequired: (info: { status: string; count: number; route?: SpecRouteEvidence }) => {
+        repairTurn = turnsUsed
+        options.onSpecSubmissionRequired?.(info)
+      },
     },
   )
   // Extra tools have unknown semantics: keep them sequential so a round that calls one never races.
@@ -4242,7 +4677,13 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         }))
         const settlingNow = isSettling()
         const specDirective = specDirectiveForRun()
-        if (settlingNow) {
+        if (earlyExit) {
+          extraMessages.push({
+            role: 'user' as const,
+            content: earlyExitDirectiveMessage({ ...earlyExit, proofTools: registeredProofTools, ...(specDirective ? { specDirective } : {}) }),
+            timestamp: Date.now(),
+          })
+        } else if (settlingNow) {
           extraMessages.push({
             role: 'user' as const,
             content: settlementBannerMessage({ turnsUsed, maxTurns, proofTools: registeredProofTools, ...(specDirective ? { specDirective } : {}) }),
@@ -4316,11 +4757,12 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           }
         }
         const nowSettling = isSettling()
-        options.onTurn?.(turnsUsed, maxTurns, nowSettling)
+        evaluateEarlyExit()
+        options.onTurn?.(turnsUsed, maxTurns, nowSettling || Boolean(earlyExit))
       },
       onYield() {
         if (!requireCompleteIntent || completion) return undefined
-        if (turnsUsed >= maxTurns || nudgesUsed >= maxEmptyTurnNudges) return undefined
+        if (turnsUsed >= finalTurnForRun() || nudgesUsed >= maxEmptyTurnNudges) return undefined
         nudgesUsed += 1
         return {
           continue: [
@@ -4340,6 +4782,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           settling: isSettling(),
           turnsUsed,
           maxTurns,
+          finalTurn: finalTurnForRun(),
           ...(specPending ? { specPending, specDirective: settlementSpecDirective(snapshot.route) } : {}),
         })
         return block ? { block } : undefined
@@ -4446,6 +4889,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         status: 'completed',
         specSubmissionRequired: specTracker.snapshot().required,
         specSubmission: specTracker.snapshot(),
+        ...earlyExitFields(),
       }
     }
 
@@ -4460,6 +4904,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         status: 'turn_limit',
         specSubmissionRequired: specTracker.snapshot().required,
         specSubmission: specTracker.snapshot(),
+        ...earlyExitFields(),
       }
     }
 
@@ -4541,6 +4986,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       settled,
       nudgesUsed,
       status: requireCompleteIntent && !completion ? 'nudged_out' : 'completed',
+      ...earlyExitFields(),
     }
   } finally {
     await harness.close(BACKGROUND_CONTEXT)
