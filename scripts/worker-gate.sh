@@ -26,8 +26,8 @@ cd "$ROOT"
 # Guard the coordinator's main checkout: a subagent writing here instead of its worktree
 # corrupts production runs (seen: a TS parameter property broke `Execution --no-llm`).
 if [[ "$(git rev-parse --show-toplevel 2>/dev/null || true)" == "/home/omarchy/guardian" ]]; then
-  if [[ -n "$(git status --porcelain -uno 2>/dev/null | head -1)" ]]; then
-    echo "FAIL: main checkout has uncommitted tracked changes; subagents must work in their worktrees." >&2
+  if [[ "${WORKER_GATE_ALLOW_DIRTY_MAIN:-0}" != "1" && -n "$(git status --porcelain -uno 2>/dev/null | head -1)" ]]; then
+    echo "FAIL: main checkout has uncommitted tracked changes; subagents must work in their worktrees (coordinator override: WORKER_GATE_ALLOW_DIRTY_MAIN=1)." >&2
     git status --porcelain -uno | head -5 >&2
     exit 1
   fi
