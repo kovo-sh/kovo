@@ -11,6 +11,7 @@
  * builder mistake costs a bounded replay and can never persist an unverified finding.
  */
 import { randomBytes } from 'node:crypto'
+import { injectUniversalParam } from './probes/context.ts'
 import type { DifferentialProbeClass, DifferentialResult, SurfaceParamLocation } from './surface-engine.ts'
 
 export interface EngineParam {
@@ -316,7 +317,21 @@ interface MatrixRow {
 }
 
 const NEGATIVE_CONTROL_STATUS = [400, 401, 403, 404, 405, 409, 410, 422]
+/** A readback of a mutation's nonexistent identifier must be absent (never served). */
+const BOGUS_READBACK_ABSENT_STATUS = [404, 410]
 
+/**
+ * Identity-scoped object read. A cross-actor read of the *same addressed object* is proven by the
+ * victim object's own identifier appearing in the probe body: the response may echo unrelated
+ * per-actor fields (`actor`, `viewer`, request ids), so a byte/key-identical body comparison
+ * (`matchesOwnerJq`) rejects every real response whose body names the caller. This binds the proof
+ * to the object identity instead, and stays a content assertion (never a status assertion).
+ */
+function objectIdentityJq(stepId: string, id: string): string {
+  return `(.steps.${stepId}.body | contains(${jqStr(id)}))`
+}
+
+/** Same-object read where the served body is genuinely identical (byte or key/value equality). */
 function matchesOwnerJq(): string {
   return `((.steps.p1.body == .steps.c1.body) or (.steps.c1.json as $c | .steps.p1.json as $p | ` +
     `(($c | type) == "object") and (([$c | keys[]] | length) > 0) and ` +
@@ -325,8 +340,20 @@ function matchesOwnerJq(): string {
     `((.steps.c1.body | length) > 3) and (.steps.p1.body == .steps.c1.body)))`
 }
 
-function negativeControlJq(mutating: boolean): string {
-  if (mutating) return `((.steps.c2.status >= 400) and (.steps.c2.status < 500))`
+/**
+ * Negative control for an object-level mutation. A route may acknowledge a mutation of an
+ * id it does not have ("updated" response for an unknown record), so a 2xx is only admissible when
+ * a separate readback of that same bogus identifier is absent — the mutation demonstrably addressed
+ * nothing. A 4xx stays the primary shape (unchanged strength).
+ */
+function mutatingNegativeControlJq(bogusReadback: boolean): string {
+  const denied = `((.steps.c2.status >= 400) and (.steps.c2.status < 500))`
+  if (!bogusReadback) return denied
+  return `(${denied} or ((${is2xx('c2')}) and ((.steps.c3.status == 404) or (.steps.c3.status == 410))))`
+}
+
+function negativeControlJq(mutating: boolean, bogusReadback = false): string {
+  if (mutating) return mutatingNegativeControlJq(bogusReadback)
   return `(((.steps.c2.status >= 400) and (.steps.c2.status < 500)) or ((${is2xx('c2')}) and (.steps.c2.body != .steps.c1.body) and ((.steps.c2.body | length) > 2)))`
 }
 
@@ -338,33 +365,45 @@ interface AuthzReadback {
   path: string
 }
 
+interface AuthzReadbackTemplate {
+  /** Read route with its `{{id}}` placeholder still in place. */
+  template: string
+  /** Actor for the read when it is the mutated actor's own identity route. */
+  persona?: string
+}
+
 /**
  * A mutating authorization proof only becomes observable when a *separate read* shows the change;
  * the mutation's own response is an echo. Pick the read from what the hypothesis already knows:
  * an explicit harvested readback route, the object's REST detail route (dropping a trailing action
  * verb such as `/promote`), or the function's own surface for an elevated action.
  */
-function authzReadback(hyp: EngineHypothesis, functionLevel: boolean, id: string): AuthzReadback | null {
-  if (hyp.readbackPath) return { path: fillId(hyp.readbackPath, id) }
+function authzReadbackTemplate(hyp: EngineHypothesis, functionLevel: boolean): AuthzReadbackTemplate | null {
+  if (hyp.readbackPath) return { template: hyp.readbackPath, ...(hyp.readbackPersona ? { persona: hyp.readbackPersona } : {}) }
   const pathAndQuery = hyp.pathAndQuery
   const bare = pathAndQuery.split('?')[0]
   if (functionLevel) {
     if (!PRIVILEGED_ACTION_RE.test(bare)) return null
-    return { path: pathAndQuery }
+    return { template: pathAndQuery }
   }
   // Identifier in the query string: re-read the filtered collection with the same identifier.
   const queryAt = pathAndQuery.indexOf('?')
-  if (queryAt >= 0 && pathAndQuery.slice(queryAt).includes('{{id}}')) return { path: pathAndQuery }
+  if (queryAt >= 0 && pathAndQuery.slice(queryAt).includes('{{id}}')) return { template: pathAndQuery }
   const segs = bare.split('/')
   const placeholderIdx = segs.findIndex(seg => seg === '{{id}}' || /^\{[^}]+\}$/.test(seg) || /^:[A-Za-z_][A-Za-z0-9_]*$/.test(seg))
   if (placeholderIdx <= 0) return null
   // `/api/invoices/{{id}}` — the identifier is the object itself.
-  if (placeholderIdx === segs.length - 1) return { path: fillId(pathAndQuery, id) }
+  if (placeholderIdx === segs.length - 1) return { template: pathAndQuery }
   // `/api/admin/users/{{id}}/promote` — read the object under the elevated action verb.
   if (placeholderIdx === segs.length - 2 && PRIVILEGED_ACTION_RE.test(bare)) {
-    return { path: fillId(segs.slice(0, -1).join('/'), id) }
+    return { template: segs.slice(0, -1).join('/') }
   }
   return null
+}
+
+function authzReadback(hyp: EngineHypothesis, functionLevel: boolean, id: string): AuthzReadback | null {
+  const template = authzReadbackTemplate(hyp, functionLevel)
+  return template ? { path: fillId(template.template, id) } : null
 }
 
 interface BaselineWrite {
@@ -380,6 +419,30 @@ const BASELINE_EXCLUDED_FIELD_RE = /(?:^|[_-])(?:id|uuid|owner|tenant|org|team|r
 /** Scope/identity selectors: writing these changes which record is addressed, not its content. */
 const BASELINE_SELECTOR_FIELD_RE = /(?:^|[_-])(?:id|uuid|owner|tenant|org|team|role|roles|permissions?|email|password|token|secret|key|created|updated)(?:$|[_-])/i
 const BASELINE_STATE_FIELD_RE = /^(?:status|state|stage|phase|payment_state|fulfil?lment_state|lifecycle)$/i
+/** Columns a privileged-function mutation grants (role/plan/scope style escalation). */
+const PRIVILEGE_TARGET_FIELD_RE = /^(?:role|role_name|user_role|account_role|account_type|membership|plan|tier|level|scope|is_admin|is_owner|is_staff|admin|privilege|privileges|permissions|permission_level)$/i
+/** Literal values that name an elevated entitlement (never a benign content value). */
+const PRIVILEGE_LITERAL_RE = /^(?:admin|administrator|owner|superuser|root|staff)$/i
+
+/**
+ * A privileged-function mutation that *grants* an entitlement has to be replayable after the probe
+ * matrix has already applied the grant: re-sending `role:"admin"` reads back the same state and the
+ * persistence oracle (correctly) calls it an idempotent no-op. The control arm therefore restores a
+ * *non*-privileged baseline for the exact field the probe elevates, so the probe's value is the
+ * delta. The demotion is chosen below the function's declared required role and only for a body
+ * that carries a recognised elevated literal — a benign content write is never reinterpreted.
+ */
+function privilegeBaselineFor(bodyTemplate: unknown, requiredRole?: string | null): BaselineWrite | null {
+  if (!bodyTemplate || typeof bodyTemplate !== 'object' || Array.isArray(bodyTemplate)) return null
+  const entry = Object.entries(bodyTemplate as Record<string, unknown>).find(([field, value]) =>
+    PRIVILEGE_TARGET_FIELD_RE.test(field) && typeof value === 'string' && PRIVILEGE_LITERAL_RE.test(value))
+  if (!entry) return null
+  const [field, value] = entry
+  if (typeof value !== 'string') return null
+  const demotion = requiredRole === 'admin' ? 'member' : 'viewer'
+  if (value.toLowerCase() === demotion) return null
+  return { field, baselineValue: demotion, probeValue: value }
+}
 
 /**
  * A replay re-sends the body the probe matrix already applied, so the post-read equals the
@@ -388,6 +451,27 @@ const BASELINE_STATE_FIELD_RE = /^(?:status|state|stage|phase|payment_state|fulf
  * The field is chosen from the body the probe itself carried: numeric/free-text mutable fields
  * first, identity and enum-ish columns excluded.
  */
+/**
+ * The probe matrix must not escalate every record it lists, so its write body is the benign one the
+ * surface published. The replay of a *privileged function* therefore has to apply the entitlement
+ * the function exists to grant: without it the chain re-sends a no-op body and can never show a
+ * persisted escalation. Only a field the body already carries is escalated (never an invented name).
+ */
+function escalatePrivilegeBody(
+  bodyTemplate: unknown,
+  requiredRole?: string | null,
+): Record<string, unknown> | null {
+  if (!bodyTemplate || typeof bodyTemplate !== 'object' || Array.isArray(bodyTemplate)) return null
+  if (!requiredRole) return null
+  const entries = Object.entries(bodyTemplate as Record<string, unknown>)
+  const field = entries.find(([name, value]) =>
+    PRIVILEGE_TARGET_FIELD_RE.test(name) &&
+    (typeof value === 'string' || value === null || typeof value === 'number' || typeof value === 'boolean'))
+  if (!field) return null
+  const promoted = { ...(bodyTemplate as Record<string, unknown>), [field[0]]: requiredRole }
+  return String(field[1]).toLowerCase() === requiredRole ? null : promoted
+}
+
 function baselineWriteFor(bodyTemplate: unknown): BaselineWrite | null {
   if (!bodyTemplate || typeof bodyTemplate !== 'object' || Array.isArray(bodyTemplate)) return null
   const scalarEntries = Object.entries(bodyTemplate as Record<string, unknown>)
@@ -432,7 +516,7 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
   if (!owner || !other) return []
   const cwe = 'CWE-639'
   const title = 'Cross-actor object or function access'
-  const vulnClass = hyp.functionLevel ? 'bfla' : 'bola'
+  let vulnClass = hyp.functionLevel ? 'bfla' : 'bola'
   const matrix = Array.isArray(result.details.matrix) ? result.details.matrix as MatrixRow[] : null
   const hits = result.anomalies
     .filter(a => a.type === 'unauthorized_access')
@@ -452,12 +536,17 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) continue
     const mutating = method !== 'GET'
     const functionLevel = hit.functionLevel === true || hyp.functionLevel === true
+    const privilegedRoute = PRIVILEGED_ACTION_RE.test(hyp.endpoint.pathTemplate)
+    // A privileged function route that declares the role it requires is a vertical (BFLA) claim even
+    // when the route also addresses an object identifier; the replay proves a role escalation, so
+    // the class follows the invariant rather than the URL shape.
+    const verticalFunctionWrite = mutating && privilegedRoute && Boolean(hyp.authzRequiredRole)
     // Report the concrete cross-actor class (object read bolted to a real write impact) rather than
     // a generic category, so the finding's class matches the invariant the replay actually proved.
     const category = mutating
-      ? (functionLevel ? 'bfla' : 'cross_tenant_write')
+      ? (functionLevel || verticalFunctionWrite ? 'bfla' : 'cross_tenant_write')
       : (functionLevel ? 'bfla' : 'idor')
-    const privilegedRoute = PRIVILEGED_ACTION_RE.test(hyp.endpoint.pathTemplate)
+    if (verticalFunctionWrite) vulnClass = 'bfla'
     // A destructive matrix may have consumed the id it reported; the engine reserves one live
     // victim for privileged deletes so the replay can observe a real removal.
     const useReservedVictim = Boolean(hyp.reservedVictimId) && method === 'DELETE' && privilegedRoute && !functionLevel
@@ -491,10 +580,12 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     }
     if (!ownerOk || !probeOk) continue
 
-    const bodyTemplate = hyp.functionState?.body
+    const observedBody = hyp.functionState?.body
       ?? (hit.bodyTemplate !== undefined && hit.bodyTemplate !== null
         ? hit.bodyTemplate
         : (hyp.jsonBody ?? {}))
+    const escalatedBody = mutating && privilegedRoute ? escalatePrivilegeBody(observedBody, hyp.authzRequiredRole) : null
+    const bodyTemplate = escalatedBody ?? observedBody
     const realPath = functionLevel ? hyp.pathAndQuery : fillId(hyp.pathAndQuery, id)
     // A staging replay is still a mutation: every write step must carry the run-scoped tenant tag,
     // otherwise the scope contract refuses it and a real finding looks unverifiable.
@@ -510,28 +601,56 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     // A self-service function-state proof reads the *probe actor's own* identity, so a control write
     // by the privileged actor would mutate the wrong record; the mutation itself is the only write.
     const selfState = Boolean(hyp.functionState?.bindings?.length)
-    const baselineWrite = mutating && !functionLevel && !selfState && method !== 'DELETE' ? baselineWriteFor(bodyTemplate) : null
+    // The probe matrix already applied the body it reports. For a privileged entitlement grant the
+    // control arm must first restore a non-privileged value of the *same* field, otherwise the replay
+    // re-sends the already-persisted value and hides a real, non-idempotent escalation.
+    const privilegeBaseline = mutating && !functionLevel && !selfState && method !== 'DELETE'
+      ? privilegeBaselineFor(bodyTemplate, hyp.authzRequiredRole)
+      : null
+    const baselineWrite = privilegeBaseline ?? (mutating && !functionLevel && !selfState && method !== 'DELETE'
+      ? baselineWriteFor(bodyTemplate)
+      : null)
     const withValue = (value: string | number | boolean): unknown => (
       bodyTemplate && typeof bodyTemplate === 'object' && !Array.isArray(bodyTemplate)
         ? { ...(bodyTemplate as Record<string, unknown>), [baselineWrite!.field]: value }
         : bodyTemplate
     )
-    const neg = functionLevel || useReservedVictim || selfState ? null : negativeControlJq(mutating)
+    // A mutating proof must show the protected state changed in a *separate readback*, never the
+    // mutation's own acknowledgement. Roles: the privileged actor reads before and after, the lower
+    // role mutates in between; a function-level proof also lets the lower role re-read the function
+    // state so the change is visible to the actor that caused it.
+    const readbackTemplate = mutating ? authzReadbackTemplate(hyp, functionLevel) : null
+    const readback = readbackTemplate ? { path: fillId(readbackTemplate.template, id) } : null
+    // The bogus-id control is only observable through the same read route; a function-level proof
+    // has no object read to bind it to, and a reserved delete victim owns its own control.
+    const bogusReadbackTemplate = readbackTemplate && !functionLevel && !useReservedVictim && !selfState
+      ? readbackTemplate
+      : null
+    const readbackPersona = readbackTemplate?.persona ?? hyp.readbackPersona ?? owner
+    const neg = functionLevel || useReservedVictim || selfState
+      ? null
+      : negativeControlJq(mutating, Boolean(bogusReadbackTemplate))
     // For a privileged delete the bogus-id control may legitimately be a 200 no-op. Selectivity is
     // then proven by re-reading the reserved victim: it must still exist after the bogus delete.
     const deleteReservationJq = useReservedVictim
       ? `((( .steps.c2.status >= 400) and (.steps.c2.status < 500)) or ((${is2xx('c3')}) and (.steps.c3.body == .steps.c1.body)))`
       : null
-    // A mutating proof must show the protected state changed in a *separate readback*, never the
-    // mutation's own acknowledgement. Roles: the privileged actor reads before and after, the lower
-    // role mutates in between; a function-level proof also lets the lower role re-read the function
-    // state so the change is visible to the actor that caused it.
-    const readback = mutating ? authzReadback(hyp, functionLevel, id) : null
-    const readbackPersona = hyp.readbackPersona ?? owner
     const steps: Array<Record<string, unknown>> = []
+    const negativeId = matrix === null ? `guardian-none-${randomBytes(5).toString('hex')}` : bogusIdFor(id)
     const buildMutatingChain = (read: AuthzReadback) => {
+      // The baseline write precedes the negative controls: `findPersistence` treats the first
+      // successful control mutation as the comparison arm, and a 404 readback of a bogus object is
+      // not a state baseline for it. Keeping the write first leaves the attribution arm with no
+      // pre-read (nothing to compare), which is the honest reading.
+      if (baselineWrite) {
+        steps.push(stepOf(
+          hyp.endpoint.origin, 'w1', 'control',
+          `Authorized actor establishes the baseline "${baselineWrite.field}" value`,
+          { method: method as RequestParts['method'], pathAndQuery: realPath, jsonBody: withValue(baselineWrite.baselineValue), ...(writeHeaders ? { headers: writeHeaders } : {}) },
+          owner, stepExtra, [200, 201, 204],
+        ))
+      }
       if (!functionLevel) {
-        const negativeId = matrix === null ? `guardian-none-${randomBytes(5).toString('hex')}` : bogusIdFor(id)
         steps.push(stepOf(
           hyp.endpoint.origin, 'c2', 'control',
           `Authorized actor addresses a nonexistent identifier (${negativeId})`,
@@ -545,14 +664,18 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
           stepExtra,
           useReservedVictim ? undefined : NEGATIVE_CONTROL_STATUS,
         ))
-      }
-      if (baselineWrite) {
-        steps.push(stepOf(
-          hyp.endpoint.origin, 'w1', 'control',
-          `Authorized actor establishes the baseline "${baselineWrite.field}" value`,
-          { method: method as RequestParts['method'], pathAndQuery: realPath, jsonBody: withValue(baselineWrite.baselineValue), ...(writeHeaders ? { headers: writeHeaders } : {}) },
-          owner, stepExtra, [200, 201, 204],
-        ))
+        // A route that acknowledges an unknown identifier still has to prove selectivity: the same
+        // bogus identifier must be *absent* when read back (no object was mutated or created).
+        if (bogusReadbackTemplate) {
+          steps.push(stepOf(
+            hyp.endpoint.origin, 'c3', 'control',
+            `Authorized actor reads the same nonexistent identifier back (${negativeId})`,
+            { method: 'GET', pathAndQuery: fillId(bogusReadbackTemplate.template, negativeId) },
+            readbackPersona,
+            {},
+            BOGUS_READBACK_ABSENT_STATUS,
+          ))
+        }
       }
       // Self-service function state: re-establish the probe actor's own identity baseline before the
       // pre-read, so a state change caused by the *probe matrix* earlier in the run cannot mask the
@@ -674,8 +797,14 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     }
     const ownerJq = nonTrivial('c1', 3)
     const probeJq = nonTrivial('p1', 3)
+    // The non-owner arm is served the *same object*: the addressed identifier appears in the probe
+    // body (an echo of unrelated per-actor fields is allowed), or the served payload is genuinely
+    // identical. Publicness for this route was already vetoed from the matrix above.
+    const sameObjectJq = functionLevel
+      ? matchesOwnerJq()
+      : `((${objectIdentityJq('p1', id)}) or (${matchesOwnerJq()}))`
     const jq = `{ controlPassed: ((${ownerJq})${neg ? ` and (${neg})` : ''}), ` +
-      `confirmed: ((${probeJq})${neg ? ` and (${neg})` : ''} and (${matchesOwnerJq()})), ` +
+      `confirmed: ((${probeJq})${neg ? ` and (${neg})` : ''} and (${sameObjectJq})), ` +
       `observed: ("probe status=" + (.steps.p1.status | tostring)${neg ? ' + " bogus status=" + (.steps.c2.status | tostring)' : ''}), ` +
       'expected: "non-owner denied" }'
     if (!functionLevel) {
@@ -780,7 +909,14 @@ function synthSqlBoolean(hyp: EngineHypothesis, result: DifferentialResult): Syn
   }
   if (!result.anomalies.some(a => a.type === 'db_error_fingerprint')) return []
   if (hyp.location === 'graphql_var') return []
-  const out: SynthesizedEngineSpec[] = [{
+  // A structural database error is real signal, but the boolean recipe (which treats every 5xx arm
+  // as unstable) can never replay it. Render the canonical error-based chain instead: a benign
+  // control arm and a quote-terminated probe arm that must return a 5xx carrying the *dialect
+  // fingerprint* the probe observed. A bare 5xx is not admissible (the universal status-only ban
+  // still owns that), so a signal without a known dialect yields no error proof.
+  const errorChain = buildSqlErrorChain(hyp, result)
+  const out: SynthesizedEngineSpec[] = errorChain ? [errorChain] : []
+  out.push({
     kind: 'sql_boolean_diff',
     vulnClass: 'sqli',
     endpoint: hyp.endpoint.pathTemplate,
@@ -790,9 +926,96 @@ function synthSqlBoolean(hyp: EngineHypothesis, result: DifferentialResult): Syn
       quoteStyle: 'single',
       valueTemplate: "x' OR {{sql_expr}}-- -",
     },
-  }]
+  })
   for (const style of ['single_quote', 'numeric', 'double_quote', 'or_branch']) out.push(make(style))
   return out
+}
+
+/**
+ * Engine/dialect error strings for the injected construct, lower-cased for a case-insensitive
+ * `contains`. These are the *labels* the probe's own fingerprinting observed; the oracle re-tests
+ * the recorded response against its own engine fingerprint table, so a body that merely mentions a
+ * database name cannot pass both.
+ */
+const SQL_DIALECT_ERROR_TERMS: Record<string, readonly string[]> = {
+  sqlite: ['sqlite_error', 'sqlite3.operationalerror', 'unrecognized token', 'sqlite/jdbcdriver'],
+  postgresql: ['postgresql', 'psqlexception', 'org.postgresql', 'pg_query(', 'syntax error at or near', 'unterminated quoted string at or near'],
+  mysql: ['you have an error in your sql syntax', 'mysqlsyntaxerrorexception', 'er_parse_error', 'sqlstate[42000]', 'mariadb', 'mysql server'],
+  mssql: ['unclosed quotation mark after the character string', 'microsoft ole db provider for sql server', 'sqlserverexception', 'sqlclient.sqlexception', '[sql server]'],
+  oracle: ['ora-', 'oracle error'],
+}
+
+/**
+ * Gate an error-based SQL injection chain on a structural 5xx *and* the dialect fingerprint that
+ * matches the construct the probe injected. Returns null when the signal has no known dialect, so
+ * a bare 500 can never be rendered into a spec.
+ */
+export function buildSqlErrorChain(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec | null {
+  if (!hyp.param || !hyp.location) return null
+  const anomaly = result.anomalies.find(entry => entry.type === 'db_error_fingerprint')
+  const dialect = typeof anomaly?.dialect === 'string' ? anomaly.dialect.toLowerCase() : ''
+  const terms = SQL_DIALECT_ERROR_TERMS[dialect]
+  if (!anomaly || !terms || terms.length === 0) return null
+  const injected = (value: string) => injectUniversalParam({
+    pathAndQuery: hyp.pathAndQuery,
+    param: hyp.param!.name,
+    paramLocation: hyp.location!,
+    value,
+    method: hyp.method === 'DELETE' ? 'POST' : hyp.method,
+    ...(hyp.jsonBody ? { jsonBody: hyp.jsonBody } : {}),
+    ...(hyp.formBody ? { formBody: hyp.formBody } : {}),
+    ...(hyp.xmlTemplate ? { xmlTemplate: hyp.xmlTemplate } : {}),
+    ...(hyp.graphqlQuery ? { graphqlQuery: hyp.graphqlQuery } : {}),
+    ...(hyp.session ? { session: hyp.session } : {}),
+  })
+  const details = result.details as Record<string, unknown>
+  // Use the probe's own grounded baseline (it may be empty for a LIKE/opaque sink); the same value
+  // the probe sent is what makes the control arm and the quote arm differ by one construct only.
+  const baseline = typeof details.baselineValue === 'string'
+    ? details.baselineValue
+    : (hyp.baselineValue ?? '1')
+  const control = injected(baseline)
+  const probe = injected(`${baseline}'`)
+  const lowered = '(.steps.p1.body | ascii_downcase)'
+  const fingerprintJq = `(${terms.map(term => `(${lowered} | contains(${jqStr(term)}))`).join(' or ')})`
+  const stepRequest = (parts: ReturnType<typeof injected>, description: string, id: string, role: 'control' | 'probe') => ({
+    id,
+    role,
+    description,
+    request: {
+      origin: hyp.endpoint.origin,
+      method: parts.method,
+      pathAndQuery: parts.pathAndQuery,
+      ...(parts.body ? { textBody: parts.body } : {}),
+      ...(parts.headers ? { headers: parts.headers } : {}),
+      ...(hyp.ownerPersona ? { persona: hyp.ownerPersona } : {}),
+      followRedirects: false,
+    },
+  })
+  const assertionsJq = `{ controlPassed: ((${is2xx('c1')}) and ((.steps.c1.body | length) > 0)), ` +
+    `confirmed: ((.steps.p1.status >= 500) and (.steps.p1.body != .steps.c1.body) and ${fingerprintJq}), ` +
+    `observed: ("control status=" + (.steps.c1.status | tostring) + " probe status=" + (.steps.p1.status | tostring)), ` +
+    `expected: "a ${dialect} engine error fingerprint on the injected parameter" }`
+  return {
+    kind: 'http_chain',
+    vulnClass: 'sqli',
+    endpoint: hyp.endpoint.pathTemplate,
+    spec: {
+      ...baseFields(
+        hyp.endpoint.origin,
+        `SQL structural error differential · ${hyp.method} ${hyp.endpoint.pathTemplate.slice(0, 80)} (${hyp.param.name})`,
+        'CWE-89',
+        'sqli',
+        'high',
+        assertionsJq,
+      ),
+      kind: 'http_chain',
+      steps: [
+        stepRequest(control, `Benign value for parameter "${hyp.param.name}"`, 'c1', 'control'),
+        stepRequest(probe, `Quote-terminated value for parameter "${hyp.param.name}"`, 'p1', 'probe'),
+      ],
+    },
+  }
 }
 
 // ---------------------------------------------------------------------------------------------

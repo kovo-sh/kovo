@@ -40,7 +40,8 @@ The tree is deliberately written so the shipped extractors can see it:
 | `GET /v2/billing/invoices/:id` | 4-hop route → controller → service → repo (`WHERE id = ?` only) |
 | `GET /v2/reports/export?sort=` | 4-hop; repo concatenates `sort` into `ORDER BY` |
 | `PATCH /v3/admin/users/:id` | 4-hop; admin router mounted before `requireAdmin` |
-| `GET /v4/<service>/resource-<n>/:id` | 2,560 generated routes across 8 services (2,560 + 5 = 2,565 total) |
+| `GET /v3/admin/users`, `GET /v3/admin/users/:id` | legitimate admin-only user directory / record (persisted-change readback for the sink above) |
+| `GET /v4/<service>/resource-<n>/:id` | 2,560 generated routes across 8 services (2,560 + 7 = 2,567 total) |
 
 `fixture.resolve(path)` returns the mount chain, the four source hops and `hopCount`.
 Personas: `mono-alice` (tenant-alpha member), `mono-bob` (tenant-beta), `mono-admin`.
@@ -48,8 +49,8 @@ Personas: `mono-alice` (tenant-alpha member), `mono-bob` (tenant-beta), `mono-ad
 ## Briefing
 
 `fixture.api` publishes the **full declared catalog**: one entry per generated `/v4` operation
-(concrete path + method + `:id` param) plus the five hand-written routes. The harness turns that
-into an OpenAPI document with 2,565 operations; nothing is collapsed into a wildcard and the
+(concrete path + method + `:id` param) plus the seven hand-written routes. The harness turns that
+into an OpenAPI document with 2,567 operations; nothing is collapsed into a wildcard and the
 document stays well below `maxSpecBytes` (2 MiB), so declared ingestion parses it losslessly.
 
 ## Truth (never served)

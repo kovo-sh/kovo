@@ -290,15 +290,32 @@ function sourceFiles(repoVersion: 'v1' | 'v2' | 'v3'): Record<string, string> {
   if (repoVersion === 'v3') {
     files['services/admin/src/routes.ts'] = [
       "import { Router } from 'express'",
-      "import { updateUser } from './controllers/users'",
+      "import { requireAdmin } from './middleware/authz'",
+      "import { getUserRecord, listUserDirectory, updateUser } from './controllers/users'",
       '',
       'export const adminRouter = Router()',
+      "adminRouter.get('/admin/users', requireAdmin, listUserDirectory)",
+      "adminRouter.get('/admin/users/:id', requireAdmin, getUserRecord)",
       "adminRouter.patch('/admin/users/:id', updateUser)",
       '',
     ].join('\n')
     files['services/admin/src/controllers/users.ts'] = [
       "import type { Request, Response } from 'express'",
-      "import { setRole } from '../services/user-service'",
+      "import { listAdminUsers, loadAdminUser, setRole } from '../services/user-service'",
+      '',
+      'export async function listUserDirectory(req: Request, res: Response): Promise<void> {',
+      '  const users = await listAdminUsers()',
+      '  res.json({ users, actor: req.user?.id })',
+      '}',
+      '',
+      'export async function getUserRecord(req: Request, res: Response): Promise<void> {',
+      '  const user = await loadAdminUser(req.params.id)',
+      '  if (!user) {',
+      "    res.status(404).json({ error: 'not_found' })",
+      '    return',
+      '  }',
+      '  res.json({ ...user, actor: req.user?.id })',
+      '}',
       '',
       'export async function updateUser(req: Request, res: Response): Promise<void> {',
       '  const actor = req.user',
@@ -312,11 +329,19 @@ function sourceFiles(repoVersion: 'v1' | 'v2' | 'v3'): Record<string, string> {
       '',
     ].join('\n')
     files['services/admin/src/services/user-service.ts'] = [
-      "import { saveRole } from '../repos/user-repo'",
+      "import { findAllUsers, findUserById, saveRole } from '../repos/user-repo'",
       '',
       'export async function setRole(id: string, role: string) {',
       "  if (!['member', 'admin'].includes(role)) return null",
       '  return saveRole(id, role)',
+      '}',
+      '',
+      'export async function listAdminUsers() {',
+      '  return findAllUsers()',
+      '}',
+      '',
+      'export async function loadAdminUser(id: string) {',
+      '  return findUserById(id)',
       '}',
       '',
     ].join('\n')
@@ -326,6 +351,14 @@ function sourceFiles(repoVersion: 'v1' | 'v2' | 'v3'): Record<string, string> {
       'export async function saveRole(id: string, role: string) {',
       "  await db.run('UPDATE users SET role = ? WHERE id = ?', [role, id])",
       '  return { id, role }',
+      '}',
+      '',
+      'export async function findAllUsers() {',
+      "  return db.all('SELECT id, email, tenant, role FROM users')",
+      '}',
+      '',
+      'export async function findUserById(id: string) {',
+      "  return db.get('SELECT id, email, tenant, role FROM users WHERE id = ?', [id])",
       '}',
       '',
     ].join('\n')
@@ -405,7 +438,10 @@ export async function start(options: FixtureStartOptions = {}): Promise<Monorepo
   store.insert('invoices', { id: 'inv-alpha-1', tenant: 'tenant-alpha', total: 100, canary: 'rbs_fake_mono_alpha_invoice' })
   store.insert('invoices', { id: 'inv-beta-1', tenant: 'tenant-beta', total: 200, canary: 'rbs_fake_mono_beta_invoice_canary' })
   store.insert('reports', { id: 'rep-alpha-1', tenant: 'tenant-alpha', total: 10, created_at: '2026-01-01' })
-  store.insert('users', { id: 'mono-bob', tenant: 'tenant-beta', role: 'member' })
+  // The user table backs the admin read surface (list + detail). The planted sink mutates it.
+  for (const user of USERS) {
+    store.insert('users', { id: user.id, email: user.email, tenant: user.tenant, role: user.role })
+  }
 
   const tokens = new Map<string, UserRow>()
   USERS.forEach((user, index) => tokens.set(`mono_fake_${user.id}_${index}${index}${index}`, user))
@@ -469,6 +505,37 @@ export async function start(options: FixtureStartOptions = {}): Promise<Monorepo
     sendJson(ctx.res, 200, { user: updated ?? { id: ctx.params.id, role }, actor: user.id })
   })
 
+  // Legitimate admin reads of the user record. The planted sink above is the *mutation* whose
+  // router-level guard is mounted too late; these reads check the role inline, so a member can never
+  // observe the admin directory and the persisted effect of the mutation is observable to an admin.
+  const adminActor = (ctx: Ctx): UserRow | null => {
+    const user = actor(ctx)
+    if (!user) {
+      sendJson(ctx.res, 401, { error: 'unauthorized' })
+      return null
+    }
+    if (user.role !== 'admin') {
+      sendJson(ctx.res, 403, { error: 'admin_required' })
+      return null
+    }
+    return user
+  }
+  app.get('/v3/admin/users', (ctx) => {
+    const admin = adminActor(ctx)
+    if (!admin) return
+    sendJson(ctx.res, 200, { users: store.find('users', () => true), actor: admin.id })
+  })
+  app.get('/v3/admin/users/:id', (ctx) => {
+    const admin = adminActor(ctx)
+    if (!admin) return
+    const user = store.get('users', ctx.params.id)
+    if (!user) {
+      sendJson(ctx.res, 404, { error: 'not_found' })
+      return
+    }
+    sendJson(ctx.res, 200, { id: user.id, email: user.email, tenant: user.tenant, role: user.role, actor: admin.id })
+  })
+
   app.get('/v1/profile', (ctx) => {
     const user = actor(ctx)
     if (!user) {
@@ -523,6 +590,20 @@ export async function start(options: FixtureStartOptions = {}): Promise<Monorepo
       'services/admin/src/controllers/users.ts#updateUser',
       'services/admin/src/services/user-service.ts#setRole',
       'services/admin/src/repos/user-repo.ts#saveRole',
+    ] },
+    { method: 'GET', path: '/v3/admin/users', mounts: ['/v3', '/admin'], hops: [
+      'services/gateway/src/router.ts#app.use',
+      'services/admin/src/routes.ts#listUserDirectory',
+      'services/admin/src/controllers/users.ts#listUserDirectory',
+      'services/admin/src/services/user-service.ts#listAdminUsers',
+      'services/admin/src/repos/user-repo.ts#findAllUsers',
+    ] },
+    { method: 'GET', path: '/v3/admin/users/:id', mounts: ['/v3', '/admin'], hops: [
+      'services/gateway/src/router.ts#app.use',
+      'services/admin/src/routes.ts#getUserRecord',
+      'services/admin/src/controllers/users.ts#getUserRecord',
+      'services/admin/src/services/user-service.ts#loadAdminUser',
+      'services/admin/src/repos/user-repo.ts#findUserById',
     ] },
     { method: 'GET', path: '/v1/profile', mounts: ['/v1'] },
     { method: 'GET', path: '/v2/health', mounts: ['/v2'] },
@@ -588,6 +669,8 @@ export async function start(options: FixtureStartOptions = {}): Promise<Monorepo
     { origin: 'app', method: 'GET', path: '/v2/billing/invoices/:id', auth: 'user', notes: 'nested /v2 + /billing mount' },
     { origin: 'app', method: 'GET', path: '/v2/reports/export?sort=', auth: 'user', notes: 'CSV export; sort is a query parameter' },
     { origin: 'app', method: 'PATCH', path: '/v3/admin/users/:id', auth: 'user', notes: 'JSON {role}' },
+    { origin: 'app', method: 'GET', path: '/v3/admin/users', auth: 'admin', notes: 'admin-only user directory' },
+    { origin: 'app', method: 'GET', path: '/v3/admin/users/:id', auth: 'admin', notes: 'admin-only user record (readback)' },
     { origin: 'app', method: 'GET', path: '/v1/profile', auth: 'user' },
     { origin: 'app', method: 'GET', path: '/v2/health', auth: 'none', notes: 'liveness' },
   ]
