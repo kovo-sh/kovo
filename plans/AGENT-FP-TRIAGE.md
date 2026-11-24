@@ -21,6 +21,7 @@ the claim text. Raw bodies and candidate payloads are not reproduced here; probe
 | 2 | shopflow `POST /orders/:id/payments`, CWE-840 "non-idempotent double capture" | **Unintended, non-planted (bucket 2)** — reproduced serially, no concurrency needed | **harden** `src/orders.ts` capturePayment (one-shot ledger write) | — |
 | 3 | shopflow `GET /stores/:storeId/catalog/:id`, CWE-639 "anon reads the loyalty note" | **Verifier FP (bucket 1)**, ruled by `agents/catalog-public` | none here (see that branch) | `catalog-canary-public-read` |
 | 4 | opsportal `POST /journals/filter`, CWE-20 "unhandled 500" (also charged) | **Verifier FP (bucket 1)** — the 500 is the *planted* SQL interpolation choking on a non-numeric value | **none** (a 400 guard would neuter `og.log-filter-sqli`) | `error-status-only-injection` |
+| 5 | shopflow `PATCH /settings`, CWE-915 "arbitrary settings keys persist (role, providerKey)" (surfaced on the re-run cell) | **Unintended, non-planted (bucket 2)** — fixed-schema config replaced wholesale by caller JSON | **harden** `src/backoffice.ts` (allow-listed keys, merged, 400 for anything else) | — |
 
 ### 1 · opsportal cross-tenant ticket assign — verifier FP, not a fixture bug
 
@@ -130,17 +131,32 @@ for an authenticated cross-tenant write) and `error-status-only-injection` (a 5x
 as injection/SQLi confirmation). Until they land, opsportal's two remaining charges are
 verifier-side and **must not** be "fixed" by deflating the planted sites.
 
+### 5 · shopflow settings write — unintended, non-planted, hardened
+
+The first re-run of the cell surfaced a different charge (agentic variance): a CWE-915 claim that
+`PATCH /settings` persisted a nested key literally named `role` and read it back. Replay: the route is
+owner/admin-gated (viewer → 403) and tenant-scoped, but it replaced `settings_json` **wholesale** with
+caller JSON. The document is a fixed-schema merchant config (seeded `{currency, timezone}`) that is
+never read for authorization, so a persisted `role`/`providerKey` key is inert — but the route had no
+server-side allow-list, exactly as the claim's own remediation stated. Hardened: only
+`currency|timezone|locale|theme|dateFormat` are accepted, merged into the stored object, everything
+else is `400 unknown_setting`. The planted settings leak reads the `provider_key`/`webhook_secret`
+columns, so no target moves. Recorded in `benchmarks/CHANGELOG.md` as *unintended, non-planted, recall
+unchanged*.
+
 ---
 
 ## Changes in this branch
 
 - `benchmarks/realistic-bench/apps/shopflow/src/orders.ts` — capture is a one-shot ledger write
   (409 `already_captured` on a repeat; exactly one new payment row).
-- `benchmarks/CHANGELOG.md` — the hardening entry (*unintended, non-planted, recall unchanged*).
+- `benchmarks/realistic-bench/apps/shopflow/src/backoffice.ts` — `PATCH /settings` merges an
+  allow-listed config document and rejects any other key with 400.
+- `benchmarks/CHANGELOG.md` — both hardening entries (*unintended, non-planted, recall unchanged*).
 - `tests/v7-agent-fp-triage.test.ts` — one contract test per ruling: serial double-capture refused;
   capture is not a target; the planted opsportal assign stays exploitable; `/api/me` is target-free and
-  CWE-269 stays a sibling; the log-filter interpolation stays exploitable and a CWE-20 claim is not
-  the sqli target.
+  CWE-269 stays a sibling; settings reject unknown keys and preserve omitted ones; the log-filter
+  interpolation stays exploitable and a CWE-20 claim is not the sqli target.
 - No truth/`siteId` was added, relabelled or removed. N stays 58.
 
 ## Measurements

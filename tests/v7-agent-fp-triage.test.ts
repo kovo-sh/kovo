@@ -242,6 +242,39 @@ test('opsportal: GET /api/me is target-free; CWE-269 on the assign route is a si
 })
 
 // ---------------------------------------------------------------------------------------------
+// Ruling 2b: the settings document is fixed-schema; an unknown/protected-looking key is rejected.
+// ---------------------------------------------------------------------------------------------
+
+test('shopflow: settings accepts only known config keys and merges them', async () => {
+  const app = await startRealisticApp({ app: 'shopflow', seed: 1 })
+  try {
+    const owner = makeSolverCtx(app.origin, app.plan)
+    await owner.login('persona_a')
+    const path = buildPath(app.plan, 'updateSettings')
+
+    const unknown = await owner.fetch(path, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ settings: { role: 'store-owner-canary' } }),
+    })
+    assert.equal(unknown.status, 400, 'a security-looking key inside the config document is rejected')
+
+    const known = await owner.fetch(path, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ settings: { theme: 'dark' } }),
+    })
+    assert.equal(known.status, 200, 'an allow-listed key is accepted')
+
+    const read = await owner.fetch(buildPath(app.plan, 'getSettings'))
+    const body = (await read.json()) as { settings?: Record<string, unknown> }
+    assert.equal(body.settings?.['theme'], 'dark', 'the accepted key persisted')
+    assert.ok(!('role' in (body.settings ?? {})), 'the rejected key never persisted')
+    assert.ok('currency' in (body.settings ?? {}), 'omitted keys survive the merge (no wholesale replace)')
+  } finally {
+    await app.stop()
+  }
+})
+
+// ---------------------------------------------------------------------------------------------
 // Ruling 3: the log-filter 500 is the planted SQLi choking, not an input-validation bug.
 // ---------------------------------------------------------------------------------------------
 
