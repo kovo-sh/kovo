@@ -502,19 +502,12 @@ test('structural normalisation ignores rotating tokens but detects a real field 
   assert.deepEqual(intersectStructuralDeltas([delta.changedTokens, delta.changedTokens]), ['admin', 'user'])
 })
 
-test('sql_boolean_diff confirms a one-field delta inside a large HTML shell', async () => {
-  const fx = await fixture((req, _body, res) => {
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
-    if (url.pathname === '/shell') {
-      const value = url.searchParams.get('id') ?? ''
-      const match = /(\d+)=(\d+)/.exec(value)
-      const isTrue = value === '1' || (match !== null && match[1] === match[2])
-      res.setHeader('content-type', 'text/html; charset=utf-8')
-      res.end(bigShell(randomUUID(), isTrue ? 'admin' : 'user'))
-      return
-    }
-    res.statusCode = 404
-    res.end('not found')
+test('retired sql_boolean_diff without floorRecipe fails closed without executing legacy VM code', async () => {
+  let hits = 0
+  const fx = await fixture((_req, _body, res) => {
+    hits += 1
+    res.statusCode = 500
+    res.end('should not be reached')
   })
   try {
     const origin = fx.origin
@@ -551,19 +544,9 @@ test('sql_boolean_diff confirms a one-field delta inside a large HTML shell', as
       grant: grantFor(origin),
       signal: AbortSignal.timeout(30_000),
     })
-    assert.equal(result.verdict, 'confirmed', result.outcome.reason ?? '')
-    const sqlDiff = result.evidencePayload.sqlDiff as {
-      passed: boolean
-      structuralFieldDelta: boolean
-      structuralChangedTokens: number
-      rounds: Array<{ similarityTrueFalse: number; structuralDelta: boolean }>
-    }
-    assert.equal(sqlDiff.passed, true)
-    assert.equal(sqlDiff.structuralFieldDelta, true)
-    assert.ok(sqlDiff.structuralChangedTokens >= 2)
-    assert.ok(sqlDiff.rounds.every(round => round.structuralDelta))
-    // The token-set similarity alone would not separate these shells; the stable delta does.
-    assert.ok(sqlDiff.rounds.every(round => round.similarityTrueFalse > 0.75))
+    assert.equal(result.verdict, 'dismissed', result.outcome.reason ?? '')
+    assert.equal(result.outcome.reason, 'retired_legacy_spec_kind: use guardian_verify')
+    assert.equal(hits, 0)
   } finally {
     await fx.close()
   }

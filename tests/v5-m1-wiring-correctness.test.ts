@@ -674,60 +674,32 @@ test('M1.5: inline feedback carries exchange ids, key headers, bounded previews,
   assert.ok(roundTripped.stepBodyPreviews)
 })
 
-test('M1.5: sql_boolean_diff and sql_time_diff report every round summary', () => {
-  const booleanFeedback = buildInlineVerifyFeedback(
-    { kind: 'sql_boolean_diff' },
-    {
-      verdict: 'inconclusive',
-      outcome: { confirmed: false, controlPassed: true, observed: 'no divergence', expected: 'divergence', reason: 'Boolean differential did not hold across all 3 randomized rounds.' },
-      exchangeIds: [],
-      exchanges: [],
-      evidencePayload: {
-        kind: 'sql_boolean_diff',
-        sqlDiff: {
-          passed: false,
-          controlPassed: true,
-          rounds: [
-            { round: 1, pass: true, baseline: { status: 200 }, true: { status: 200 }, false: { status: 404 }, similarityBaselineTrue: 0.97, similarityTrueFalse: 0.2 },
-            { round: 2, pass: false, baseline: { status: 200 }, true: { status: 404 }, false: { status: 404 }, similarityBaselineTrue: 0.1, similarityTrueFalse: 1 },
-            { round: 3, pass: false, baseline: { status: 200 }, true: { status: 500 }, false: { status: 500 }, similarityBaselineTrue: 0.05, similarityTrueFalse: 0.99 },
-          ],
+test('M1.5: retired sql_boolean_diff and sql_time_diff feedback reports retired fail-closed verdict', () => {
+  for (const kind of ['sql_boolean_diff', 'sql_time_diff'] as const) {
+    const feedback = buildInlineVerifyFeedback(
+      { kind },
+      {
+        verdict: 'dismissed',
+        outcome: {
+          confirmed: false,
+          controlPassed: false,
+          observed: 'retired_legacy_spec_kind: use guardian_verify',
+          expected: 'Proof submitted via guardian_verify or a wired floor recipe.',
+          reason: 'retired_legacy_spec_kind: use guardian_verify',
         },
+        exchangeIds: [],
+        exchanges: [],
+        evidencePayload: { kind, retired: true, reason: 'retired_legacy_spec_kind: use guardian_verify' },
+        evidenceSha256: 'e',
       },
-      evidenceSha256: 'e',
-    },
-    1,
-    2,
-  )
-  assert.equal(booleanFeedback.sqlRoundSummaries?.length, 3)
-  assert.equal(booleanFeedback.sqlRoundSummaries?.[0].pass, true)
-  assert.equal(booleanFeedback.sqlRoundSummaries?.[1].trueStatus, 404)
-  assert.equal(booleanFeedback.sqlRoundSummaries?.[2].falseStatus, 500)
-
-  const timingFeedback = buildInlineVerifyFeedback(
-    { kind: 'sql_time_diff' },
-    {
-      verdict: 'inconclusive',
-      outcome: { confirmed: false, controlPassed: true, observed: 'no delay', expected: 'delay', reason: 'Timing differential below threshold.' },
-      exchangeIds: [],
-      exchanges: [],
-      evidencePayload: {
-        kind: 'sql_time_diff',
-        sqlTimeDiff: {
-          rounds: [
-            { round: 1, baseline: { status: 200 }, delayProbe: { status: 200 }, baselineMs: 12, probeMs: 40 },
-            { round: 2, baseline: { status: 200 }, delayProbe: { status: 200 }, baselineMs: 11, probeMs: 38 },
-          ],
-        },
-      },
-      evidenceSha256: 'e',
-    },
-    1,
-    2,
-  )
-  assert.equal(timingFeedback.sqlRoundSummaries?.length, 2)
-  assert.equal(timingFeedback.sqlRoundSummaries?.[0].delayProbeStatus, 200)
-  assert.equal(timingFeedback.sqlRoundSummaries?.[0].probeMs, 40)
+      1,
+      2,
+    )
+    assert.equal(feedback.verdict, 'dismissed')
+    assert.equal(feedback.controlPassed, false)
+    assert.equal(feedback.verificationKind, kind)
+    assert.match(feedback.assertionSummary?.reason ?? '', /retired_legacy_spec_kind/i)
+  }
 })
 
 test('M0: Phase-3 DSL refinement queues are retired from execution.ts', () => {

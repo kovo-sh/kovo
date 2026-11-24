@@ -747,6 +747,10 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
           const dbError = outcome.anomalies.find(a => a.type === 'db_error_fingerprint')
           if (outcome.verdict !== 'signal' || (!booleanSignal && !dbError)) continue
           const dialect = typeof dbError?.dialect === 'string' ? dbError.dialect : null
+          const truePred = isNumeric ? `${baselineValue} AND 7=7` : `${baselineValue}' AND '7'='7`
+          const falsePred = isNumeric ? `${baselineValue} AND 7=8` : `${baselineValue}' AND '7'='8`
+          const controlRecipePath = location === 'query' ? withQueryParam(item.ep.pathTemplate, candidate.name, truePred) : pathAndQuery
+          const probeRecipePath = location === 'query' ? withQueryParam(item.ep.pathTemplate, candidate.name, falsePred) : pathAndQuery
           if (this.recordDeterministicFinding({
             run: latest, assignment: claimed, asset,
             spec: {
@@ -762,6 +766,26 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
               paramName: candidate.name, paramLocation: location, baselineValue, quoteStyle,
               ...(jsonBody ? { jsonBody } : {}),
               assertionsJq: '{ controlPassed: true, confirmed: true, observed: "deterministic boolean differential", expected: "parameterized query" }',
+              recipe: {
+                recipeId: 'boolean_or_timing',
+                args: {
+                  origin: item.ep.origin,
+                  method,
+                  pathAndQuery,
+                  controlPathAndQuery: controlRecipePath,
+                  probePathAndQuery: probeRecipePath,
+                  vulnClass: 'sqli',
+                  mode: 'boolean',
+                  param: candidate.name,
+                  paramLocation: location,
+                  baselineValue,
+                  quoteStyle,
+                  ...(method === 'POST' && location === 'json'
+                    ? { controlJsonBody: { [candidate.name]: truePred }, probeJsonBody: { [candidate.name]: falsePred } }
+                    : {}),
+                  actor: { handle: personaHandles[0] ?? 'anonymous', role: personaHandles[0] ? 'member' : 'anonymous' },
+                },
+              },
             },
             factData: {
               subkind: 'differential_anomaly', probeClass: 'sqli_boolean', endpoint: item.ep.pathTemplate,

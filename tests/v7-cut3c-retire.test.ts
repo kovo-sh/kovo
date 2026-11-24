@@ -167,8 +167,11 @@ test('Cut 3c recipe wiring: redirect, browser_sink, and injection_fingerprint pe
   assert.equal(browserFixed.verdict, 'fixed')
 })
 
-test('Cut 3c-1 retirement: all 5 zero-producer legacy spec kinds fail closed without executing legacy VM code', async () => {
-  const retiredKinds = ['dns_takeover', 'tls_audit', 'browser_dom', 'ws_chain', 'upload_probe'] as const
+test('Cut 3c-1 & 3c-2 retirement: all 7 retired legacy spec kinds fail closed without executing legacy VM code', async () => {
+  const retiredKinds = [
+    'dns_takeover', 'tls_audit', 'browser_dom', 'ws_chain', 'upload_probe',
+    'sql_boolean_diff', 'sql_time_diff',
+  ] as const
   for (const kind of retiredKinds) {
     assert.ok(RETIRED_LEGACY_SPEC_KINDS.has(kind), `missing retired kind ${kind}`)
   }
@@ -235,6 +238,30 @@ test('Cut 3c-1 retirement: all 5 zero-producer legacy spec kinds fail closed wit
         request: { origin, method: 'GET' as const, pathAndQuery: '/files/1' },
       },
     },
+    {
+      ...base,
+      kind: 'sql_boolean_diff' as const,
+      targetOrigin: origin,
+      method: 'GET' as const,
+      pathAndQuery: '/search?q=1',
+      paramName: 'q',
+      paramLocation: 'query' as const,
+      baselineValue: '1',
+      quoteStyle: 'single' as const,
+    },
+    {
+      ...base,
+      kind: 'sql_time_diff' as const,
+      targetOrigin: origin,
+      method: 'GET' as const,
+      pathAndQuery: '/search?q=1',
+      paramName: 'q',
+      paramLocation: 'query' as const,
+      baselineValue: '1',
+      quoteStyle: 'single' as const,
+      dialect: 'postgres' as const,
+      delayMs: 1500,
+    },
   ]
 
   for (const spec of specs) {
@@ -254,4 +281,82 @@ test('Cut 3c-1 retirement: all 5 zero-producer legacy spec kinds fail closed wit
 
   assert.equal(transportHits, 0, 'retired legacy VM kinds must perform zero network/DNS/TLS operations')
   assert.equal(browserHits, 0, 'retired legacy VM kinds must perform zero browser operations')
+})
+
+test('Cut 3c-2 floorRecipe precedence: sql_boolean_diff with a boolean_or_timing floorRecipe verifies cleanly through ProofReceipt', async () => {
+  let fixed = false
+  const broker = new RequestBroker({
+    transport: async url => {
+      if (url.pathname === '/search') {
+        const q = url.searchParams.get('id') ?? ''
+        const isTrue = !fixed && (q === '1' || /1=1|(\d+)=\1/.test(q))
+        const body = isTrue
+          ? JSON.stringify({ items: [{ id: 1, name: 'alpha' }, { id: 2, name: 'beta' }] })
+          : JSON.stringify({ items: [] })
+        return { status: 200, headers: { 'content-type': 'application/json' }, body }
+      }
+      return { status: 404, headers: { 'content-type': 'text/plain' }, body: 'not found' }
+    },
+  })
+  const backend = new LinuxWorkerBackend()
+  const recipe = floorRecipeEnvelopeSchema.parse({
+    recipeId: 'boolean_or_timing',
+    args: {
+      origin,
+      method: 'GET',
+      pathAndQuery: '/search?id=1',
+      controlPathAndQuery: '/search?id=1%20AND%201%3D1',
+      probePathAndQuery: '/search?id=1%20AND%201%3D2',
+      vulnClass: 'sqli',
+      mode: 'boolean',
+      param: 'id',
+      paramLocation: 'query',
+      baselineValue: '1',
+      quoteStyle: 'single',
+      actor,
+    },
+  })
+  const spec = {
+    version: 1 as const,
+    kind: 'sql_boolean_diff' as const,
+    origin,
+    targetOrigin: origin,
+    title: 'Boolean differential backed by floorRecipe',
+    category: 'injection-input',
+    cwe: 'CWE-89',
+    severity: 'high' as const,
+    severityRationale: 'Verified via boolean_or_timing floor recipe.',
+    impact: 'Boolean SQL differential.',
+    remediation: 'Parameterize query.',
+    recheckInstructions: 'Replay recipe.',
+    method: 'GET' as const,
+    pathAndQuery: '/search?id=1',
+    paramName: 'id',
+    paramLocation: 'query' as const,
+    baselineValue: '1',
+    quoteStyle: 'single' as const,
+    assertionsJq: '{ controlPassed: true, confirmed: true, observed: "ok", expected: "ok" }',
+    recipe,
+  }
+
+  const confirmed = await verifyReplaySpec({
+    spec,
+    broker,
+    backend,
+    grant: labGrant(3),
+    signal: AbortSignal.timeout(5_000),
+  })
+  assert.equal(confirmed.verdict, 'confirmed', confirmed.outcome.reason ?? '')
+  assert.equal(confirmed.verificationTier, 'runtime_confirmed')
+  assert.equal(confirmed.receipt?.verification.confirmed, true)
+
+  fixed = true
+  const patched = await verifyReplaySpec({
+    spec,
+    broker,
+    backend,
+    grant: labGrant(3),
+    signal: AbortSignal.timeout(5_000),
+  })
+  assert.equal(patched.verdict, 'dismissed', patched.outcome.reason ?? '')
 })
