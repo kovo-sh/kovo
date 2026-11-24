@@ -3,18 +3,33 @@
  *
  * The agentic layer is throughput-starved: a specialist that spends its first turns rediscovering
  * routes/personas/baselines cannot spend them probing. This module renders a deliberately tiny,
- * deterministic packet (<= 1.5 KB) from data the session already has, so turn 1 can probe.
+ * deterministic packet (<= 1.5 KB; <= 4 KB when the caller expands a code slice) from data the
+ * session already has, so turn 1 can probe.
+ *
+ * v7 M1 adds an optional white-box `code` slice: mounts, input schema, auth chain and a 4–8 hop
+ * sink path with exact file:line. The slice is built by `buildCodeDataflowSlice` (program graph)
+ * and always re-fitted here to {@link ASSIGNMENT_BRIEF_CODE_MAX_BYTES}; `codeExpansion: 'full'`
+ * raises the slice and brief budgets for a coordinator-requested expansion.
  *
  * Invariants:
  *  - Pure: no I/O, no clock, no randomness.
  *  - Deterministic ordering: highest-signal material first, stable tie-breakers.
  *  - Hard byte cap: the returned text is always valid JSON and never exceeds
- *    {@link ASSIGNMENT_BRIEF_MAX_BYTES}; reduction is a fixed ladder, not a blind slice.
+ *    {@link ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE} (4 KB); reduction is a fixed ladder, not a
+ *    blind slice.
  *  - No secrets or response bodies: only names, status codes, top-level keys, and short scalar
  *    state/numeric samples. Secret-shaped keys/values and body-like fields are dropped.
  */
 
+import { renderCodeDataflowSlice, type CodeDataflowSlice } from './program-graph.ts'
+
 export const ASSIGNMENT_BRIEF_MAX_BYTES = 1536
+/** Hard ceiling for any brief (compact or expanded with a code slice). */
+export const ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE = 4096
+/** Default budget for the rendered dataflow slice inside a brief. */
+export const ASSIGNMENT_BRIEF_CODE_MAX_BYTES = 600
+/** Budget when the coordinator asks for the expanded slice (`codeExpansion: 'full'`). */
+export const ASSIGNMENT_BRIEF_CODE_EXPANDED_BYTES = 1600
 
 export type MissionKind =
   | 'det_lead_upgrade'
@@ -75,6 +90,16 @@ export interface AssignmentBriefInput {
   baseline?: AssignmentBriefBaseline
   alreadyConfirmedOnOrigin?: readonly AssignmentBriefConfirmedRef[]
   detLead?: AssignmentBriefDetLead
+  /**
+   * Compact white-box dataflow slice for the hypothesis route (built with
+   * `buildCodeDataflowSlice`). Always hard-truncated before rendering.
+   */
+  codeSlice?: CodeDataflowSlice
+  /**
+   * `compact` (default, 600 B slice, 1536 B brief) or `full` (1600 B slice, 4096 B brief) when
+   * the planner/coordinator explicitly asks to expand the code evidence.
+   */
+  codeExpansion?: 'compact' | 'full'
   /** 1 hypothesis cluster (1-3 linked routes) or 1 det_lead, by default. */
   targetCount?: number
   turnBudget?: number
@@ -221,6 +246,8 @@ interface WorkingState {
   baseline?: { status?: number; keys: string[]; sample: Array<[string, string | number | boolean]> }
   confirmed: Array<Record<string, unknown>>
   detLead?: Record<string, unknown>
+  code?: CodeDataflowSlice
+  codeBudget: number
 }
 
 function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<string, unknown> {
@@ -229,6 +256,7 @@ function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<
     origin: cleanText(input.origin.split(/[?#]/, 1)[0], 180),
     ...(state.detLead ? { detLead: state.detLead } : {}),
     routes: state.routes,
+    ...(state.code ? { code: state.code } : {}),
     ...(state.linked.length ? { linkedRoutes: state.linked } : {}),
     ...(state.personas.length
       ? {
@@ -326,6 +354,13 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
     })
     .slice(0, 10)
 
+  const codeBudget = input.codeExpansion === 'full'
+    ? ASSIGNMENT_BRIEF_CODE_EXPANDED_BYTES
+    : ASSIGNMENT_BRIEF_CODE_MAX_BYTES
+  const code = input.codeSlice
+    ? renderCodeDataflowSlice(input.codeSlice, codeBudget).slice
+    : undefined
+
   return {
     routes,
     linked,
@@ -333,6 +368,8 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
     ...(baseline ? { baseline } : {}),
     confirmed,
     ...(input.detLead ? { detLead: normalizeDetLead(input.detLead) } : {}),
+    ...(code ? { code } : {}),
+    codeBudget,
   }
 }
 
@@ -344,9 +381,12 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
  */
 export function buildAssignmentBriefPacket(
   input: AssignmentBriefInput,
-  maxBytes = ASSIGNMENT_BRIEF_MAX_BYTES,
+  maxBytes?: number,
 ): AssignmentBriefResult {
-  const cap = Math.max(128, Math.floor(maxBytes))
+  const defaultCap = input.codeExpansion === 'full'
+    ? ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE
+    : ASSIGNMENT_BRIEF_MAX_BYTES
+  const cap = Math.max(128, Math.min(Math.floor(maxBytes ?? defaultCap), ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE))
   const state = buildWorkingState(input)
   let truncated = false
 
@@ -393,6 +433,16 @@ export function buildAssignmentBriefPacket(
     if (state.routes[0]?.params?.length) {
       state.routes[0] = { ...state.routes[0], params: state.routes[0].params.slice(0, -1) }
       if (!state.routes[0].params?.length) delete state.routes[0].params
+      continue
+    }
+    if (state.code && state.codeBudget > 240) {
+      const nextBudget = Math.max(240, Math.floor(state.codeBudget * 0.6))
+      state.code = renderCodeDataflowSlice(state.code, nextBudget).slice
+      state.codeBudget = nextBudget
+      continue
+    }
+    if (state.code) {
+      state.code = undefined
       continue
     }
     if (state.detLead && typeof state.detLead.signalSummary === 'string' && state.detLead.signalSummary.length > 60) {
@@ -449,8 +499,8 @@ export function buildAssignmentBriefPacket(
   return { text: minimal, bytes: Buffer.byteLength(minimal, 'utf8'), truncated: true }
 }
 
-/** Render the compact packet as JSON text (always <= {@link ASSIGNMENT_BRIEF_MAX_BYTES}). */
-export function buildAssignmentBrief(input: AssignmentBriefInput, maxBytes = ASSIGNMENT_BRIEF_MAX_BYTES): string {
+/** Render the compact packet as JSON text (always <= {@link ASSIGNMENT_BRIEF_MAX_BYTES} unless expanded). */
+export function buildAssignmentBrief(input: AssignmentBriefInput, maxBytes?: number): string {
   return buildAssignmentBriefPacket(input, maxBytes).text
 }
 
