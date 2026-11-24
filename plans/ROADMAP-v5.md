@@ -888,3 +888,15 @@ Funnel (`--no-llm`, docker):
 **2 TP / 0 FP (100%)**, both `matched_ground_truth`. Acceptance met. Dispatch starvation also vanished: 0 dry stops, 24–35 ready steps queued, `ready_steps_stranded=0`.
 
 **Honest caveat:** the two confirmations currently ride two **bounded fallback shapes** in `execution.ts` (cap 3/run), because the canonical synthesizers cannot render actor-echo authz or fingerprinted SQL errors. `spec-authz` is converting them to canonical rules and then deleting the fallbacks; `mono-admin-bfla` also needs a fixture readback route (the fixture exposes none, so a persisted change cannot be observed).
+
+### 2026-11-24 — Cut 3b: rules landed, but **zero LOC deleted**, and the held-out floor is in doubt
+
+`cut3b-parity` merged (`16823d6`). It built the two missing receipt primitives:
+- **`status_differential`** (class `sqli_status`): ≥2 complete triangles, benign 2xx baseline, 2xx tautology, **<500** contradiction, same route/method, tautology-vs-contradiction contrast. Rejects a missing baseline, a 5xx contradiction, unstable status pairs, and non-injection classes. Also fixed a real bug in the shared contrast check: percent-encoded `%20AND%20` defeated the word boundary (now decodes first).
+- **Authz receipt support** reusing `assessImpactEvidence`: pre-mutation readback + post-GET delta, baseline write/reset, authenticated bogus-id/peer denial, collection-reference distinct control, DELETE-tombstone persistence, and reserved victim ids for privileged DELETE.
+
+**Deleted replay-verifier branches: 0, with a stated blocker.** Every wired family is still reached by **patch retest** (`retestReplaySpec`/`verifyReplaySpecInline` replay the persisted spec — deleting the kinds breaks 20/20 patch verification) and by the capability harness `scripts/benchmark-live.ts` (outside the lease — deleting breaks xben 25/25). So `replay-verifier.ts` stays **3,917 lines** and `execution.ts` 12,543. The earlier "delete the VM" goal is **not achievable by branch deletion alone**; it needs retest to move onto receipts first. That is a plan correction, not a stream failure.
+
+**Recalibration risk flagged (P0):** the stream measured `bd01209` at **26/58** held-out, not 28, with identical site sets except shopflow `settings-secret-disclosure` and `token-secret-disclosure`. On `2621bab` those confirmed because the authenticated `viewer` was served **persona_a's store `9ca676`**; on `bd01209` the same viewer request is served **persona_b's store `6ea2e7`**. The personas table is correct, so a **session/scope binding defect** is serving the wrong tenant — a cross-worker bleed that both costs recall and risks false cross-tenant claims.
+
+**Certificate impact:** the held-out 28/58 figure used in the certificate is **provisional** until a fresh floor audit on current main lands. `persona-binding` has been launched to bisect and fix the bleed; my own dev+held-out floor audit is running now on `16823d6`.
