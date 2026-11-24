@@ -866,3 +866,25 @@ Ranked fixes (smallest first): control-arm object rule (2 rows) → profile-awar
 Launched `proof-gap-route` (agent-session lease) for the biggest structural fix. The watchdog and trial-duplicate fixes need `execution.ts`, which `realism4-convert` holds — they are queued for the engine lane behind it.
 
 Two measurement caveats recorded in the doc: `og.ticket-assign-cross-write` **was** genuinely proved but the grader matched the finding to sibling `ticket-bola-read`; and every cell used 600 s, not the 15 min default.
+
+### 2026-11-24 — Realism #4 flipped 0/3 → **2/3 confirmed** at 100% precision (v7's #1 bet)
+
+`realism4-convert` merged (`0e64935`). The diagnosis was structural, not prompt-related:
+
+1. **Two slices never reached the engine.** Phase-0 ranked all three Tier-A sinks at priority 3, but `runDeterministicEngine` re-ranked by static risk and took a **120-route prefix**: the hand-written GET sinks scored 80/88 while 1,440 generated `/v4` routes scored 83/95, so billing/report were excluded before any hypothesis formed.
+2. **The dispatched slice had no object identifier.** Admin formed only `mass_assignment`, and its route has no readable collection (`GET /v3/admin/users/1 → 404`), so the authz matrix had no id. Billing has no collection route at all.
+3. **Signals appeared once the routes arrived, but the generic shapes could not express them** — authz `unauthorized_access` became `dismissed: probe status=200 bogus status=404` (the GET jq demands byte-identical bodies while the app echoes `actor`), and SQL `db_error_fingerprint` was rejected by the boolean recipe as `precondition_unsatisfied: 5xx`.
+
+Landed: `prioritizeCodeLeadTargets` (Tier-A leads above the 120-route prefix, cap unchanged), `deriveCodeLeadIdentifierTargets` (≤2 read-only identifier targets per object route from the route noun + declared tenant labels), engine-lane assignments carrying consumed `det_lead` fact ids, mandatory **Tier-A Round-1 seeding** (priority 90, cap 6, idempotent, multi-trial-exempt), `dry_rounds`/`coordinator_done` now only stopping **speculative** re-investigation, and `planner.coverage_at_stop` metrics `{stopReason, uncoveredTierAEndpointsAtStop, uninvestigatedFirstPassClassesAtStop, filteredByReason, remainingReadyAtStop, tierASeededAtStop, tierAUnseedable}`.
+
+Funnel (`--no-llm`, docker):
+
+| slice | dispatched | route hit | verify called | confirmed |
+|---|---:|---:|---:|---:|
+| mono-billing-bola | 0 → **2** | 0 → **2** | 0 → **1** | no → **yes** |
+| mono-report-sqli | 0 → **2** | 0 → **2** | 0 → **1** | no → **yes** |
+| mono-admin-bfla | 1 → 1 | 1 → 1 | 0 → 0 | no → no |
+
+**2 TP / 0 FP (100%)**, both `matched_ground_truth`. Acceptance met. Dispatch starvation also vanished: 0 dry stops, 24–35 ready steps queued, `ready_steps_stranded=0`.
+
+**Honest caveat:** the two confirmations currently ride two **bounded fallback shapes** in `execution.ts` (cap 3/run), because the canonical synthesizers cannot render actor-echo authz or fingerprinted SQL errors. `spec-authz` is converting them to canonical rules and then deleting the fallbacks; `mono-admin-bfla` also needs a fixture readback route (the fixture exposes none, so a persisted change cannot be observed).
