@@ -37,7 +37,7 @@ export interface EngineEndpoint {
 
 export type EngineIntent =
   | 'authz' | 'sqli' | 'ssti' | 'command_injection' | 'xxe' | 'ssrf' | 'traversal' | 'redirect' | 'xss' | 'graphql'
-  | 'mass_assignment' | 'cache' | 'stored_xss' | 'csrf' | 'workflow' | 'webhook' | 'auth_protocol' | 'secret_disclosure'
+  | 'mass_assignment' | 'cache' | 'stored_xss' | 'csrf' | 'workflow' | 'race' | 'webhook' | 'auth_protocol' | 'secret_disclosure'
 
 export interface EngineHypothesis {
   key: string
@@ -76,6 +76,14 @@ export interface EngineHypothesis {
   repeatTransition?: boolean
   /** workflow_invariant: numeric quantity field for a conserved-value bound. */
   quantityField?: string
+  /** Run-scoped headers (staging tenant/run tag) that every mutating replay step must carry. */
+  headers?: Record<string, string>
+  /** Multi-step client-price flow: producer route that mints the object the terminal route consumes. */
+  flowCreatePath?: string
+  /** Client-price-trust hypothesis: a terminal money route that trusts a caller-supplied price. */
+  priceTrust?: boolean
+  /** Synchronized state-changing burst hypothesis (TOCTOU / double-spend). */
+  raceBurst?: boolean
   /** Bound session handle used for CSRF replay (no Authorization/Cookie headers). */
   session?: string
   graphqlRoots?: string[]
@@ -423,7 +431,6 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
   const other = hyp.otherPersona
   if (!owner || !other) return []
   const cwe = 'CWE-639'
-  const category = 'broken-access-control'
   const title = 'Cross-actor object or function access'
   const vulnClass = hyp.functionLevel ? 'bfla' : 'bola'
   const matrix = Array.isArray(result.details.matrix) ? result.details.matrix as MatrixRow[] : null
@@ -445,6 +452,11 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) continue
     const mutating = method !== 'GET'
     const functionLevel = hit.functionLevel === true || hyp.functionLevel === true
+    // Report the concrete cross-actor class (object read bolted to a real write impact) rather than
+    // a generic category, so the finding's class matches the invariant the replay actually proved.
+    const category = mutating
+      ? (functionLevel ? 'bfla' : 'cross_tenant_write')
+      : (functionLevel ? 'bfla' : 'idor')
     const privilegedRoute = PRIVILEGED_ACTION_RE.test(hyp.endpoint.pathTemplate)
     // A destructive matrix may have consumed the id it reported; the engine reserves one live
     // victim for privileged deletes so the replay can observe a real removal.
@@ -484,10 +496,14 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
         ? hit.bodyTemplate
         : (hyp.jsonBody ?? {}))
     const realPath = functionLevel ? hyp.pathAndQuery : fillId(hyp.pathAndQuery, id)
+    // A staging replay is still a mutation: every write step must carry the run-scoped tenant tag,
+    // otherwise the scope contract refuses it and a real finding looks unverifiable.
+    const writeHeaders = mutating ? hyp.headers : undefined
     const parts: RequestParts = {
       method: method as RequestParts['method'],
       pathAndQuery: realPath,
       ...(mutating ? { jsonBody: bodyTemplate } : {}),
+      ...(writeHeaders ? { headers: writeHeaders } : {}),
     }
     const stepExtra = mutating && hyp.csrfBind ? { csrfBind: true } : {}
     const probePersona = hit.actor === 'anonymous' ? null : other
@@ -523,6 +539,7 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
             method: method as RequestParts['method'],
             pathAndQuery: fillId(hyp.pathAndQuery, negativeId),
             ...(mutating ? { jsonBody: bodyTemplate } : {}),
+            ...(writeHeaders ? { headers: writeHeaders } : {}),
           },
           owner,
           stepExtra,
@@ -533,7 +550,7 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
         steps.push(stepOf(
           hyp.endpoint.origin, 'w1', 'control',
           `Authorized actor establishes the baseline "${baselineWrite.field}" value`,
-          { method: method as RequestParts['method'], pathAndQuery: realPath, jsonBody: withValue(baselineWrite.baselineValue) },
+          { method: method as RequestParts['method'], pathAndQuery: realPath, jsonBody: withValue(baselineWrite.baselineValue), ...(writeHeaders ? { headers: writeHeaders } : {}) },
           owner, stepExtra, [200, 201, 204],
         ))
       }
@@ -547,7 +564,7 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
         steps.push(stepOf(
           hyp.endpoint.origin, 'w0', 'control',
           'Authorized actor restores its own identity baseline',
-          { method: method as RequestParts['method'], pathAndQuery: realPath, jsonBody: resetBody },
+          { method: method as RequestParts['method'], pathAndQuery: realPath, jsonBody: resetBody, ...(writeHeaders ? { headers: writeHeaders } : {}) },
           probePersona, stepExtra, [200, 201, 204],
         ))
       }
@@ -577,10 +594,10 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
           { method: 'GET', pathAndQuery: read.path }, probePersona, {}, [200, 403, 404],
         ))
       }
-      const jsonEquals = (stepId: string, field: string, value: string): string =>
-        `((.steps.${stepId}.json | if type == "object" then .[${jqStr(field)}] else null end) == ${jqStr(value)})`
-      const jsonDiffers = (stepId: string, field: string, value: string): string =>
-        `((.steps.${stepId}.json | if type == "object" then .[${jqStr(field)}] else null end) != ${jqStr(value)})`
+      const jsonEquals = (stepId: string, field: string, value: unknown): string =>
+        `((.steps.${stepId}.json | if type == "object" then .[${jqStr(field)}] else null end) == ${JSON.stringify(value)})`
+      const jsonDiffers = (stepId: string, field: string, value: unknown): string =>
+        `((.steps.${stepId}.json | if type == "object" then .[${jqStr(field)}] else null end) != ${JSON.stringify(value)})`
       // The actor's own identity read must show the bound field taking the value the mutation body
       // carried, and must not have shown it before. This is a field-bound state delta, not a
       // body-difference observation (a rotating nonce can never satisfy it).
@@ -589,11 +606,23 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
           .map(binding => `((${jsonEquals('p2', binding.field, binding.value)}) and (${jsonDiffers('c1', binding.field, binding.value)}))`)
           .join(' or ')
         : null
+      // Bind the post-read to the exact value this probe's mutation body carried. The baseline write
+      // immediately before the pre-read guarantees it differs, so this proves a fresh
+      // non-idempotent change and names the mutated field.
+      const probeFieldValue = baselineWrite && bodyTemplate && typeof bodyTemplate === 'object' && !Array.isArray(bodyTemplate)
+        ? (bodyTemplate as Record<string, unknown>)[baselineWrite.field]
+        : undefined
+      const fieldBoundDelta = baselineWrite && probeFieldValue !== undefined &&
+        String(probeFieldValue) !== String(baselineWrite.baselineValue)
+        ? `((${jsonEquals('p2', baselineWrite.field, probeFieldValue)}) and (${jsonEquals('c1', baselineWrite.field, baselineWrite.baselineValue)}))`
+        : null
       const persisted = method === 'DELETE'
         ? `(((.steps.p2.status >= 400) and (.steps.p2.status < 500)) or ((${is2xx('p2')}) and (.steps.p2.body != .steps.c1.body)))`
         : stateChanged
           ? `((${is2xx('p2')}) and (${stateChanged}))`
-          : `((${is2xx('p2')}) and (.steps.p2.body != .steps.c1.body))`
+          : fieldBoundDelta
+            ? `((${is2xx('p2')}) and (${fieldBoundDelta}))`
+            : `((${is2xx('p2')}) and (.steps.p2.body != .steps.c1.body))`
       const extraControl = [
         baselineWrite ? is2xx('w1') : null,
         resetBody ? is2xx('w0') : null,
@@ -1545,6 +1574,138 @@ function synthWorkflowStepSkip(hyp: EngineHypothesis, result: DifferentialResult
 }
 
 // ---------------------------------------------------------------------------------------------
+// Client-price tampering (multi-step checkout / commerce flow)
+// ---------------------------------------------------------------------------------------------
+
+function finiteNumber(value: unknown): number | null {
+  const n = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
+function safeFieldName(value: unknown): string | null {
+  return typeof value === 'string' && /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(value) ? value : null
+}
+
+/**
+ * A terminal money route charged a caller-supplied price instead of the server-issued one. The
+ * replay re-prices the *same server-created object* twice: once with the price the server itself
+ * minted (control) and once with the tampered value (probe). Both steps address the vulnerable
+ * endpoint, so the proof names exactly one target and cannot add unrelated routes to the report.
+ */
+function synthPriceTrust(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
+  const hit = result.anomalies.find(a => a.type === 'price_tampering')
+  if (!hit) return []
+  const path = typeof hit.path === 'string' && hit.path.startsWith('/') ? hit.path.split('?')[0]! : hyp.pathAndQuery.split('?')[0]!
+  const idField = safeFieldName(hit.idField)
+  const resourceId = typeof hit.resourceId === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(hit.resourceId) ? hit.resourceId : null
+  const priceField = safeFieldName(hit.priceField)
+  const serverPrice = finiteNumber(hit.serverPrice)
+  const tamperedPrice = finiteNumber(hit.tamperedPrice)
+  if (!idField || !resourceId || !priceField || serverPrice === null || tamperedPrice === null) return []
+  if (!(tamperedPrice < serverPrice)) return []
+  const chargedField = safeFieldName(hit.chargedField) ?? 'total'
+  const bodyFor = (price: number): Record<string, unknown> => ({ [idField]: resourceId, [priceField]: price })
+  const isCharged = (stepId: string, value: number): string =>
+    `((.steps.${stepId}.json | if type == "object" then .[${jqStr(chargedField)}] else null end) == ${value})`
+  const jq = `{ controlPassed: ((${is2xx('c1')}) and (${isCharged('c1', serverPrice)})), ` +
+    `confirmed: ((${is2xx('c1')}) and (${isCharged('c1', serverPrice)}) and (${is2xx('p1')}) and (${isCharged('p1', tamperedPrice)}) and (${is2xx('p2')}) and (${isCharged('p2', tamperedPrice)}))` +
+    `, observed: ("control " + ${jqStr(chargedField)} + "=" + (.steps.c1.json.${chargedField} | tostring) + " probe " + ${jqStr(chargedField)} + "=" + (.steps.p1.json.${chargedField} | tostring) + " repeat=" + (.steps.p2.status | tostring)), ` +
+    'expected: "the server-issued price is charged regardless of the client value, and the terminal payment transition is not single-use" }'
+  return [{
+    kind: 'http_chain',
+    vulnClass: 'price_tampering',
+    endpoint: hyp.endpoint.pathTemplate,
+    spec: {
+      ...baseFields(hyp.endpoint.origin, 'Client-supplied price trusted by the payment step (control vs probe on the server-priced object)', 'CWE-472', 'price_tampering', 'high', jq),
+      kind: 'http_chain',
+      steps: [
+        stepOf(hyp.endpoint.origin, 'c1', 'control', `Pay the server-priced object (${chargedField}=${serverPrice})`, {
+          method: 'POST', pathAndQuery: path, headers: hyp.headers, jsonBody: bodyFor(serverPrice),
+        }, hyp.ownerPersona, {}, [200, 201]),
+        stepOf(hyp.endpoint.origin, 'p1', 'probe', `Pay the same object with a tampered ${priceField} (${tamperedPrice})`, {
+          method: 'POST', pathAndQuery: path, headers: hyp.headers, jsonBody: bodyFor(tamperedPrice),
+        }, hyp.ownerPersona, {}, [200, 201]),
+        stepOf(hyp.endpoint.origin, 'p2', 'probe', `Replay the identical tampered payment on the already-paid object`, {
+          method: 'POST', pathAndQuery: path, headers: hyp.headers, jsonBody: bodyFor(tamperedPrice),
+        }, hyp.ownerPersona, {}, [200, 201]),
+      ],
+    },
+  }]
+}
+
+// ---------------------------------------------------------------------------------------------
+// Synchronized state-changing burst (TOCTOU / double-spend)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * N same-packet requests are all acknowledged, but a separate pre/post read of the conserved value
+ * shows a single debit. The replay rebuilds the over-count from scratch: a zero-value read of the
+ * balance, the synchronized burst, then a second zero-value read. The assertion is arithmetic
+ * (acknowledged transfers vs observed debit), never a status-only claim.
+ */
+function synthRaceBurst(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
+  const hit = result.anomalies.find(a => a.type === 'race_double_spend')
+  if (!hit) return []
+  const origin = typeof hit.raceOrigin === 'string' && /^https?:\/\//.test(hit.raceOrigin) ? hit.raceOrigin : hyp.endpoint.origin
+  const path = typeof hit.path === 'string' && hit.path.startsWith('/') ? hit.path.split('?')[0]! : hyp.pathAndQuery.split('?')[0]!
+  const amountField = safeFieldName(hit.amountField)
+  const balanceField = safeFieldName(hit.balanceField)
+  const transferredField = safeFieldName(hit.transferredField)
+  const amount = finiteNumber(hit.amount)
+  const size = finiteNumber(hit.burstSize)
+  if (!amountField || !balanceField || !transferredField || amount === null || amount <= 0) return []
+  if (size === null || size < 2 || size > 10) return []
+  const burstSize = Math.trunc(size)
+  const key = typeof hit.idempotencyKey === 'string' && /^[A-Za-z0-9_.:-]{1,80}$/.test(hit.idempotencyKey)
+    ? hit.idempotencyKey
+    : null
+  const bodyFor = (value: number): Record<string, unknown> => ({
+    [amountField]: value,
+    ...(key ? { idempotencyKey: key } : {}),
+  })
+  const readStep = (id: string, description: string) => ({
+    ...stepOf(origin, id, 'setup', description, {
+      method: 'POST', pathAndQuery: path, headers: hyp.headers, jsonBody: bodyFor(0),
+    }, hyp.ownerPersona, {}, [200, 201]),
+    extract: [{ varName: `${id}_balance`, from: 'json' as const, selector: balanceField }],
+  })
+  // race_burst evidence exposes ordered setup summaries under `.setup`, the burst under `.burst`
+  // and the post-check under `.postCheck`; there is no `.steps` object for this kind.
+  const preOk = `((.setup[0].status >= 200) and (.setup[0].status < 300))`
+  const postOk = `((.postCheck.status >= 200) and (.postCheck.status < 300))`
+  const transfersJq = `[.burst.results[] | select(.status == 200) | (.json.${transferredField} // 0)] | add`
+  const acknowledgedJq = `([.burst.results[] | select(.status == 200)] | length)`
+  const jq = `{ controlPassed: ((${preOk}) and (.setup[0].json.${balanceField} != null) and (${postOk}) and (.postCheck.json.${balanceField} != null)), ` +
+    `confirmed: ((${preOk}) and (${postOk}) and (.setup[0].json.${balanceField} != null) and (.postCheck.json.${balanceField} != null) ` +
+    `and ((.setup[0].json.${balanceField} - .postCheck.json.${balanceField}) == ${amount}) ` +
+    `and (${acknowledgedJq} == ${burstSize}) and (${transfersJq} >= ${burstSize * amount})), ` +
+    `observed: ("pre=" + (.setup[0].json.${balanceField} | tostring) + " post=" + (.postCheck.json.${balanceField} | tostring) + " acknowledged=" + (${acknowledgedJq} | tostring) + " transferred=" + (${transfersJq} | tostring)), ` +
+    'expected: "a serial client can transfer the balance once; the synchronized burst acknowledges every request but debits the balance once" }'
+  return [{
+    kind: 'race_burst',
+    vulnClass: 'race_double_spend',
+    endpoint: hyp.endpoint.pathTemplate,
+    spec: {
+      ...baseFields(origin, 'Synchronized burst double-spend: multiple transfers acknowledged against one balance debit', 'CWE-362', 'race_double_spend', 'critical', jq),
+      kind: 'race_burst',
+      setupSteps: [readStep('pre', 'Read the conserved balance with a zero-value transfer')],
+      burst: Array.from({ length: burstSize }, () => ({
+        origin,
+        method: 'POST' as const,
+        pathAndQuery: path,
+        ...(hyp.headers ? { headers: hyp.headers } : {}),
+        ...(hyp.ownerPersona ? { persona: hyp.ownerPersona } : {}),
+        jsonBody: bodyFor(amount),
+        followRedirects: false,
+      })),
+      postCheckStep: stepOf(origin, 'post', 'cleanup', 'Re-read the conserved balance after the burst', {
+        method: 'POST', pathAndQuery: path, headers: hyp.headers, jsonBody: bodyFor(0),
+      }, hyp.ownerPersona, {}, [200, 201]),
+    },
+  }]
+}
+
+// ---------------------------------------------------------------------------------------------
 
 const authMutationKinds = new Set(['alg_none', 'strip_signature', 'expired_replay', 'kid_inject', 'claim_swap', 'rs256_to_hs256_jwks'])
 
@@ -1644,6 +1805,10 @@ export function synthesizeEngineSpecs(hyp: EngineHypothesis, result: Differentia
       if (sensitiveRead.length > 0) return sensitiveRead
       return synthSecretDisclosure(hyp, result)
     }
+    // Capability proofs are keyed by the invariant they established, not by the probe family that
+    // happened to execute them (a workflow class owns both step-skip and price-trust evidence).
+    if (result.anomalies.some(anomaly => anomaly.type === 'race_double_spend')) return synthRaceBurst(hyp, result)
+    if (result.anomalies.some(anomaly => anomaly.type === 'price_tampering')) return synthPriceTrust(hyp, result)
     switch (hyp.probeClass) {
       case 'authz_matrix': return synthAuthz(hyp, result)
       case 'sqli_boolean': return synthSqlBoolean(hyp, result)
@@ -1693,6 +1858,8 @@ export function vulnClassOfSpec(spec: Record<string, unknown>): string {
     case 'CWE-1336': return 'ssti'
     case 'CWE-78': return 'command_injection'
     case 'CWE-840': return 'workflow_bypass'
+    case 'CWE-472': return 'price_tampering'
+    case 'CWE-362': return 'race_double_spend'
     case 'CWE-347': return 'jwt'
     case 'CWE-345': return 'webhook_forgery'
     default: return 'unknown'

@@ -17,6 +17,9 @@ export async function proveWritePathBola(
 ): Promise<Record<string, unknown> | null> {
   const { req, runner } = ctx
   if (!opts.ownerPersona || !opts.otherPersona) return null
+  // The write/restore legs are real mutations: carry the probe's request headers (the staging
+  // run/tenant tag lives there) so the scope contract authorizes them instead of refusing the proof.
+  const writeHeaders = { 'Content-Type': 'application/json', ...(req.headers ?? {}) }
   const target = req.pathAndQuery.replaceAll('{{id}}', encodeURIComponent(opts.id))
   const readBefore = await runner.send({
     origin: ctx.origin, method: 'GET', pathAndQuery: target, persona: opts.ownerPersona,
@@ -41,7 +44,7 @@ export async function proveWritePathBola(
     for (const writeBody of bodyShapes(field, expected)) {
       const write = await runner.send({
         origin: ctx.origin, method: opts.method, pathAndQuery: target, persona: opts.otherPersona,
-        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(writeBody),
+        headers: writeHeaders, body: JSON.stringify(writeBody),
         ...(req.session ? { session: req.session } : {}),
       })
       if (!write.ok) return null
@@ -61,7 +64,7 @@ export async function proveWritePathBola(
           for (const restoreBody of bodyShapes(field, original)) {
             const restore = await runner.send({
               origin: ctx.origin, method: opts.method, pathAndQuery: target, persona: opts.ownerPersona,
-              headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(restoreBody),
+              headers: writeHeaders, body: JSON.stringify(restoreBody),
               ...(req.session ? { session: req.session } : {}),
             })
             if (restore.ok) runner.stage(restore.ex)
@@ -73,7 +76,7 @@ export async function proveWritePathBola(
       const restoreBody = 'field' in writeBody ? { field: writeBody.field, value: original } : { [field]: original }
       const cleanup = await runner.send({
         origin: ctx.origin, method: opts.method, pathAndQuery: target, persona: opts.ownerPersona,
-        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(restoreBody),
+        headers: writeHeaders, body: JSON.stringify(restoreBody),
         ...(req.session ? { session: req.session } : {}),
       })
       if (cleanup.ok) runner.stage(cleanup.ex)
@@ -168,15 +171,28 @@ export async function diffAuthorizationMatrix(ctx: DiffContext): Promise<DiffOut
       // Id-selectivity gate: a value only identifies a resource when it differs from a random
       // nonexistent value. This keeps public/list pages and arbitrary query fields out of the matrix.
       const probeValue = `guardian-none-${randToken(8)}`
+      // A mutating route rejects an empty body with a schema error that masks the identifier
+      // differential. The selectivity gate and the owner reference must carry the same body the
+      // matrix will use, so a 2xx means the object was addressed (not that the route accepts junk).
+      const mutatingGate = method === 'POST' || method === 'PUT' || method === 'PATCH'
+      const gateBody = mutatingGate ? JSON.stringify(req.jsonBody ?? {}) : undefined
+      const gateHeaders = gateBody
+        ? { 'Content-Type': 'application/json', ...(req.headers ?? {}) }
+        : req.headers
       const missingEx = await runner.send({
         origin: ctx.origin, method, pathAndQuery: req.pathAndQuery.replaceAll('{{id}}', encodeURIComponent(probeValue)),
-        headers: req.headers, persona: req.ownerPersona,
+        headers: gateHeaders, persona: req.ownerPersona,
+        ...(gateBody ? { body: gateBody } : {}),
         ...(req.session ? { session: req.session } : {}),
       })
       if (missingEx.ok) runner.stage(missingEx.ex)
       const refPath = path
       const refEx = req.ownerPersona
-        ? await runner.send({ origin: ctx.origin, method, pathAndQuery: refPath, headers: req.headers, persona: req.ownerPersona, ...(req.session ? { session: req.session } : {}) })
+        ? await runner.send({
+            origin: ctx.origin, method, pathAndQuery: refPath, headers: gateHeaders, persona: req.ownerPersona,
+            ...(gateBody ? { body: gateBody } : {}),
+            ...(req.session ? { session: req.session } : {}),
+          })
         : null
       if (refEx?.ok) {
         runner.stage(refEx.ex)
