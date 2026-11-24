@@ -18,6 +18,8 @@ rows=""
 active=0
 mergeable=0
 blocked=0
+merge_now=""
+stale_dirty=
 while IFS= read -r wt; do
   [[ -z "$wt" ]] && continue
   [[ "$wt" == "$ROOT" ]] && continue
@@ -31,8 +33,14 @@ while IFS= read -r wt; do
   # Active = unmerged commits or uncommitted work. Merged clean branches are noise here.
   if [[ "$ahead" == "0" && "$dirty" == "clean" ]]; then continue; fi
   active=$((active+1))
-  if [[ "$ahead" != "0" && "$dirty" == "clean" ]]; then mergeable=$((mergeable+1)); fi
-  if [[ "$dirty" == "dirty" ]]; then blocked=$((blocked+1)); fi
+  if [[ "$ahead" != "0" && "$dirty" == "clean" ]]; then
+    mergeable=$((mergeable+1))
+    if (( age >= 900 )); then merge_now+="  $branch (committed $((age/60))m ago, clean, +$ahead)"$'\n'; fi
+  fi
+  if [[ "$dirty" == "dirty" ]]; then
+    blocked=$((blocked+1))
+    if (( age >= 1800 )); then stale_dirty+="  $branch (dirty, last commit $((age/60))m ago)"$'\n'; fi
+  fi
   rows+="$branch|$ahead|$dirty|$((age/60))m|$wt"$'\n'
 done < <(git worktree list --porcelain | awk '/^worktree / {print $2}')
 
@@ -55,6 +63,17 @@ else
   done
 fi
 printf 'mergeable (ahead, clean): %d    dirty/in-progress: %d\n' "$mergeable" "$blocked"
+if [[ -n "$merge_now" ]]; then
+  printf 'ACTION MERGE NOW (clean + ahead >=15m):\n%s' "$merge_now"
+fi
+if [[ -n "$stale_dirty" ]]; then
+  printf 'ACTION CHECKPOINT/SPLIT (dirty >=30m):\n%s' "$stale_dirty"
+fi
+ready_count="$(grep -c 'status: ready' plans/STREAM-BACKLOG.md 2>/dev/null || true)"
+ready_count="${ready_count:-0}"
+if (( active < 3 && ready_count > 0 )); then
+  printf 'ACTION UNDER-PARALLELIZED: %d active stream(s), %d ready backlog task(s) — dispatch disjoint work now\n' "$active" "$ready_count"
+fi
 
 printf 'leases held by active streams:\n'
 printf '%s' "$rows" | while IFS='|' read -r b a s age w; do

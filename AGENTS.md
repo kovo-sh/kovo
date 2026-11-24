@@ -29,6 +29,9 @@
 4. **Merge as streams finish.** Do not batch merges behind the slowest stream; integrate each completed stream and re-run the smoke floor.
 5. **Parallelize validation too.** Independent suites and benchmark legs (dev, held-out, agentic) run concurrently with isolated dirs. Use the smoke tier between tweaks; full matrices/gates only at batch boundaries.
 6. **Report the plan.** Before dispatching, state the parallel streams, their file leases, the merge order, and any serialization exception.
+7. **Feed the swarm from the backlog.** Keep `plans/STREAM-BACKLOG.md` current and maintain **≥3 active streams** whenever a `ready` task has a free lease. One stage per stream; split tasks touching >2 files or spanning >1 milestone. The pulse prints **UNDER-PARALLELIZED** when this is violated.
+8. **Merge clean branches within one pulse.** Any `clean + ahead` branch older than ~15 minutes is an **ACTION MERGE NOW**, not a later batch. Docs/tests/bench-only branches merge without waiting for the owner's report; code branches merge after `worker-gate.sh`.
+9. **Interrupt dirty streams at 30 minutes.** A dirty tree with no commit for 30 minutes is an **ACTION CHECKPOINT/SPLIT**; park or split it rather than waiting.
 
 Read-only audits, compatibility analysis, docs, and verifier-only changes are usually parallelizable even when the main engine is busy — use them.
 
