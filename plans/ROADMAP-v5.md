@@ -648,3 +648,18 @@ Landed: provenance-tagged params (`observed[:detail]`, `inferred_bundle[:sensiti
 Regression caught during validation: the first noise filter dropped dotted JSON body fields and lost held-out-saas `hos-08` (19/20); location-aware filtering restored 20/20.
 
 Next: `sqli-quota` fixes the substring bug and adds an **evidence-based** quota reservation (one slot for a sensitivity-checked reading param that would otherwise miss the quota; released when unused) — not a class-wide quota bump.
+
+### 2026-11-24 — confirmation invariant verified forward; one over-claim family remains
+
+`confirm-consistency` re-ran on the merged tree after aborting the stale pre-parser cells:
+
+| cell (held-out 1000042) | recall | precision | confirmed ⇒ diff confirms | conflicts / demotions |
+|---|---|---|---|---|
+| opsportal | 7/17 | **100%** | **7/7** | 0 / 0 |
+| shopflow | 9/19 | **81.8%** (2 unmatched) | **12/12** | 0 / 0 |
+
+`scripts/audit-confirmation-consistency.ts` reports `{confirmed, conflicts:0}` on both, all `evidenceKind=spec`. **No `InvariantError` fired in production** because every evidence write now persists the confirming diff *before* the finding write — which is the correct ordering, not a bypass. The reproduced defect (`e8c297e8`, mass assignment on `POST /api/spaces`) had `inconclusive`/`failed creator_list`: `executeInlineVerification` incremented the spec attempt (overwriting the anchor diff) and then skipped the update when `isAlreadyVerified`, returning stale `confirmed`. Fixed, and the FP autopsy now prefers the confirming anchor instead of the first (often failed) retry.
+
+**Remaining over-claim family is NOT a confirmation conflict** — it is a truth/oracle ambiguity, consistent across three runs: `oracleRulePassed: true` on public-catalog reads (`GET /api/v1/catalog`, `/api/v1/stores/:storeId/catalog/:productId`, `/api/v1/catalog/:id`) where an anon/non-owner body matches the owner body and carries a store token. New stream `catalog-public` must make a **truth ruling from the fixture source first**, then either (a) harden unintended tenant canaries out of publicly readable payloads + add a Tier-0 `catalog-canary-public-read` archetype, or (b) escalate as an operator decision if the route is genuinely private — no truth inflation either way.
+
+**Certification status:** agentic-lift claims remain halted. Opsportal's 7/17 equals its floor (0 lift) and shopflow's 2 FPs mean worst-run precision is not 100% yet.
