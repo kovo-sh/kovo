@@ -1493,19 +1493,21 @@ function synthSsti(hyp: EngineHypothesis, result: DifferentialResult): Synthesiz
  * Split-echo payload builders, keyed by the probe variant that actually executed on this target.
  *
  * The two verifier-minted halves must be (a) separated in the outbound request and (b) joined by the
- * target's own evaluation, so plain reflection cannot satisfy the proof. They are separated by an
- * empty quoted word (`''`): a shell's quoting pass deletes it and the halves become contiguous,
- * while a raw echo of the input still carries the quotes. Command substitution is deliberately not
- * used to join them: several interpreters (and the local shell model) render substitution output on
- * its own line, so the assembled nonce is non-contiguous even though the command executed — the
- * probe signal is real, but the proof would be lost.
+ * target's own evaluation, so plain reflection cannot satisfy the proof. For a command separator the
+ * join is an empty command substitution, `$(echo '')`: the shell evaluates it to nothing, so the
+ * halves become contiguous inside the `echo` argument, while the outbound request never contains the
+ * assembled token and a sanitizer that only strips quoting cannot assemble it either. Substitution
+ * output on its own line cannot be used to place the halves (several interpreters, including the
+ * local shell model, emit it as a separate line), which is why the probe signal was real but the old
+ * proof was dismissed. Substitution-shaped probe variants fall back to an empty quoted word inside
+ * the substitution: a shell deletes it and joins the halves there.
  */
 const splitEchoConnectors: Record<string, (base: string) => string> = {
-  semicolon_echo: base => `${base}; echo {{nonce_part1}}''{{nonce_part2}}`,
+  semicolon_echo: base => `${base}; echo {{nonce_part1}}$(echo ''){{nonce_part2}}`,
   subshell_echo: base => `${base}$(echo {{nonce_part1}}''{{nonce_part2}})`,
-  quote_break: base => `${base}"; echo {{nonce_part1}}''{{nonce_part2}}; "`,
-  quote_break_id: base => `${base}"; id; echo {{nonce_part1}}''{{nonce_part2}}; "`,
-  pipe_echo: base => `${base} | echo {{nonce_part1}}''{{nonce_part2}}`,
+  quote_break: base => `${base}"; echo {{nonce_part1}}$(echo ''){{nonce_part2}}; "`,
+  quote_break_id: base => `${base}"; id; echo {{nonce_part1}}$(echo ''){{nonce_part2}}; "`,
+  pipe_echo: base => `${base} | echo {{nonce_part1}}$(echo ''){{nonce_part2}}`,
   backtick_echo: base => `${base}\`echo {{nonce_part1}}''{{nonce_part2}}\``,
 }
 

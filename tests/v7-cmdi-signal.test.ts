@@ -51,7 +51,7 @@ type Json = Record<string, unknown>
 // Fixture: diagnostics runner with one real parameter and one decoy parameter
 // ---------------------------------------------------------------------------------------------
 
-type FixtureMode = 'vulnerable' | 'hardened' | 'reflection'
+type FixtureMode = 'vulnerable' | 'hardened' | 'reflection' | 'quote_strip'
 
 const HARDENED_HOST = /^[A-Za-z0-9.\-]{1,64}$/
 
@@ -103,6 +103,12 @@ async function startDiagnosticsFixture(mode: FixtureMode) {
       if (mode === 'reflection') {
         // Never evaluates: the raw input, including any metacharacters, is echoed back.
         json(res, 200, { output: `probe ${host}` })
+        return
+      }
+      if (mode === 'quote_strip') {
+        // Never evaluates, but a naive output filter deletes quote characters. A proof whose only
+        // join is an empty quoted word would be spoofed here; the evaluated substitution join is not.
+        json(res, 200, { output: `probe ${host.replaceAll("'", '').replaceAll('"', '')}` })
         return
       }
       const sim = simulateCommand('ping -c 1 {0}', [host])
@@ -326,10 +332,11 @@ test('command-injection signal synthesizes an evaluated nonce proof, not a refle
   }
   const primary = (rce[0]!.spec as Json).probeStep as { request: { jsonBody: Json } }
   const payload = String(primary.request.jsonBody.host)
-  // The two verifier-minted halves are separated by an empty quoted word: the shell deletes it,
-  // raw reflection keeps it. The assertion targets the template, not the minted token.
-  assert.match(payload, /; echo \{\{nonce_part1\}\}''\{\{nonce_part2\}\}$/)
-  assert.equal(payload.includes('$(echo'), false, 'primary proof does not depend on substitution rendering')
+  // The two verifier-minted halves are separated by an empty command substitution: the shell
+  // evaluates it to nothing and joins the halves, raw reflection keeps the literal `$(echo '')`.
+  // The assertion targets the template, not the minted token.
+  assert.match(payload, /; echo \{\{nonce_part1\}\}\$\(echo ''\)\{\{nonce_part2\}\}$/)
+  assert.equal(payload.includes('{{nonce_part1}}{{nonce_part2}}'), false, 'halves are never adjacent in the outbound request')
 
   const fallback = (rce[1]!.spec as Json).probeStep as { request: { jsonBody: Json } }
   assert.match(String(fallback.request.jsonBody.host), /\$\(echo \{\{nonce_part2\}\}\)/)
@@ -445,6 +452,19 @@ test('a hardened twin with the same parameter shape rejects the proof', async ()
     assert.equal(confirmed.length, 0, 'no confirmation on the shape-validated twin')
     assert.equal(report.confirmed, 0)
     assert.ok(report.rejectedSpecs > 0, 'the proof was attempted and rejected')
+  } finally { await fixture.close() }
+})
+
+test('a quote-stripping output filter cannot spoof the evaluated join', async () => {
+  const fixture = await startDiagnosticsFixture('quote_strip')
+  try {
+    const { report, confirmed } = await runEngine({
+      origin: fixture.origin,
+      outcomes: { endpointHost: 'signal', host: 'signal' },
+    })
+    assert.equal(confirmed.length, 0, 'deleting quotes leaves the substitution unassembled')
+    assert.equal(report.confirmed, 0)
+    assert.ok(report.rejectedSpecs > 0)
   } finally { await fixture.close() }
 })
 
