@@ -3379,10 +3379,19 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
  * therefore throws (and warns) instead of silently evaluating the DSL for a family the floor is
  * supposed to confirm through a receipt.
  *
- * The legacy branch itself stays in `verifyReplaySpec` for two non-product callers: the capability
- * harness in `scripts/` (which is maintenance-only and still synthesizes sql specs) and patch retest.
- * Deleting it requires migrating those first; that dependency is recorded in
- * `LEGACY_UNWIRED_SPECKINDS` and the Cut 3a report.
+ * The legacy branch itself stays in `verifyReplaySpec` because, after the retest migration
+ * (`retestReplaySpec` re-runs a persisted floor recipe and verifies a fresh receipt; the capability
+ * harness retests through that same entrypoint), it still has reachable callers:
+ *
+ *   1. `Execution`'s agent-facing `verify_replay_spec` / `propose_chain_finding` path
+ *      (`execution.ts` -> `verifyReplaySpec`), which accepts any of the 14 declarative kinds from the
+ *      investigator. This is the dominant caller and the reason the DSL cannot be deleted yet:
+ *      `guardian_verify` script confirmation is not wired into `AgentSession` in production.
+ *   2. The deterministic engine's still-unwired kinds, recorded in `LEGACY_UNWIRED_SPECKINDS`.
+ *   3. `retestReplaySpec`'s legacy fallback for a persisted spec with no recipe envelope (an
+ *      agent-authored proof, or a row written before Cut 3).
+ *
+ * Deleting the VM therefore needs (1) to move to Layer-3 script proofs first.
  */
 export class RecipeWiredLegacyCallError extends Error {
   readonly code = 'GUARDIAN_RECIPE_WIRED_LEGACY_CALL'
