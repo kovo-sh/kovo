@@ -737,3 +737,24 @@ The only **unintended** data was the vulnerable cache-poison twin resolving `cus
 Verifier (the general dismissal rule): `assessPublicness()` gates both the cross-tenant and read-disclosure branches — a successful **anonymous** read on the same route, or a non-owner payload **identical** to the owner reference (or differing only in publicly listed fields) is publicness. A genuine crossing survives when the payload binds an **owner-scoped identity** or carries a tenant/secret canary also served to the control.
 
 Measured: held-out shopflow **9/19 at 100% precision (0 unmatched)**, $0.484 — the two catalog FPs are gone with confirms unchanged. Tier-0 corpus **11/11 dismissed**. Dev floor reported 34/59 on its base (predates the quota merge); to be re-verified at 36/59 after the engine-lane merge.
+
+### 2026-11-24 — over-claim closure batch 1: status-only ban, publicness, anon-control ban
+
+Three precision streams merged in engine-lane order:
+
+**`status-diff-guard` (`98480cc` + coordinator wiring `31a3e2a`).** Root cause found in the artifact: the confirming rule was a model-authored jq `confirmed: ($r.steps["probe"].status == 500)` classified correctly as `status_only` but only **rejected for authz claims** — `injection-input` fell through as `claim: 'other'`. Now:
+- `assessStatusOnlyDivergence()` is called for **every** http_chain claim (coordinator wired it into `assessHttpChainProofStrength`), and `impactClass === 'injection'` joins the impact-gate set.
+- `assessInjectionImpact()` + `matchInjectionFingerprint()` (SQLite/Postgres/MySQL/MSSQL/Oracle/ORM, Mongo, template engines, shell, XML, filesystem), paired-boolean rounds, >3× timing, delivered OOB, and a narrow paired status-boolean exception (benign 2xx + tautology 2xx + contradiction 4xx) that keeps xben's 5 status-only targets.
+- Receipts: universal status-only rejection; injection classes route through `assessInjectionImpact`; new `redirect` rule (off-origin `Location` no control reaches, canary host match); receipt target route **and method** bound to the mutating probe.
+- `verify-rpc` rejects status-only claim sets for every class.
+- Result: dev 36/59 (3 runs, 0 spread, 100%), xben 25/25, held-out-saas 20/20 + 20/20 patches, held-out 28/58 @100%.
+
+**`catalog-public` (`8289fe8`, conflict-resolved with the status ban).** Truth ruling: `listProducts`, `getProduct`, `storeProductPage` are **intended public** storefront reads. The only unintended data was the cache-poison twin resolving a customer loyalty note for the anonymous fallback; scoped to the signed-in tenant, while the planted cross-tenant cache HIT still carries the owner canary. `assessPublicness()` is the general rule (anonymous success on the same route, or non-owner payload identical/modulo public fields ⇒ publicness; owner-scoped identity or a control-served canary defeats it). Held-out shopflow **9/19 @100%** (was 81.8%). Tier-0 corpus 11/11.
+
+**`agent-fp-triage` (`2c590ce`).** Per-claim rulings:
+- opsportal `GET /api/me` CWE-269 → **verifier FP**: serial replay showed the planted `og.ticket-assign-cross-write` idor works, but the claim declared `/api/me` (its first control step) and offered `anonAssign=401` as the control. Hardening would destroy a planted target, so no fixture change.
+- shopflow `POST /orders/:id/payments` → **unintended**: serial fresh-order replay was 200/200/200 with ledger 1→4. Now one-shot (`200/409/409`, ledger 1→2). CHANGELOG'd.
+- shopflow `PATCH /settings` → **unintended**: wholesale `settings_json` replacement let a key named `role` persist; now merges an allow-list and 400s otherwise (planted settings leak untouched).
+- shopflow held-out **11/19 @100% precision** after the fixes.
+
+**Coordinator follow-through:** added the reviewer's rule that an **anonymous 401 is not a peer control for a cross-tenant write** (`peerDenial` returns false when the control is unauthenticated and the mutation is cross-tenant), in both the authorization and business-logic assessors. Test updated to accept either rejection reason (both are valid).
