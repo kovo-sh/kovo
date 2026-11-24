@@ -184,11 +184,6 @@ export interface BrokerExchangeResult {
    */
   secretMatches?: SecretMatch[]
   tls?: TlsMetadata
-  /**
-   * Set when this exchange withheld a credential that belonged to another persona. Consumers must
-   * treat the exchange as evidence-invalid: it says nothing about the declared persona's scope.
-   */
-  personaScopeMismatch?: true
   observation: PublicObservation
 }
 
@@ -3033,8 +3028,6 @@ export class RequestBroker {
 
     const redirectOrigins = new Set<string>([url.origin])
     const redirectPaths: string[] = []
-    /** Any hop that withheld a foreign persona's session makes the whole exchange unusable. */
-    let scopeMismatch = false
     let activeMethod: BrokerHttpRequest['method'] = req.method
     let activeBody = prepared.preparedBody
     let includePersona = Boolean(personaHeaders && Object.keys(personaHeaders).length > 0)
@@ -3168,7 +3161,9 @@ export class RequestBroker {
           ...(req.runId ? { runId: req.runId } : {}),
           ...(this.options.storage ?? grant.storage ? { storage: (this.options.storage ?? grant.storage)! } : {}),
         })) {
-        scopeMismatch = true
+        // Fail closed: the request would be answered from another persona's session, so both the
+        // bytes on the wire and any claim drawn from them belong to the wrong actor. Send nothing.
+        deny(`Persona scope mismatch: the credential for "${personaHandle}" is the session of another persona; no request was sent. Re-mint this persona's login before scanning.`)
       }
       for (const [name, entry] of jarCookieByName) {
         if (!vaultCookies.has(name) || entry.writeCount > 1) mergedCookies.set(name, entry.value)
@@ -3419,7 +3414,6 @@ export class RequestBroker {
         bodyTruncated: Boolean(response.bodyTruncated),
         durationMs: Date.now() - started,
         secretMatches,
-        ...(scopeMismatch ? { personaScopeMismatch: true as const } : {}),
         ...(response.tls ? { tls: response.tls } : {}),
         observation: obs,
       }

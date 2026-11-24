@@ -156,16 +156,6 @@ class ProbeRunner {
         persona: this.persona,
         ...req,
       }, this.grant, this.signal)
-      // A persona-scope mismatch means the broker withheld a credential that belonged to another
-      // persona. The exchange proves nothing about the declared actor, so it can never be staged as
-      // evidence (and must never confirm a target).
-      if (ex.personaScopeMismatch) {
-        return {
-          ok: false,
-          kind: 'denied',
-          message: `Persona scope mismatch: the request declared "${this.persona ?? 'no persona'}" but carried another persona's session state; the exchange is evidence-invalid.`,
-        }
-      }
       return { ok: true, ex }
     } catch (err) {
       if (err instanceof BrokerCircuitOpen) this.stop('circuit_open')

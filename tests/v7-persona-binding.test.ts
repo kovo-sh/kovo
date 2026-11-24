@@ -20,8 +20,10 @@ import type { Grant, PublicAddress, RawHttpResponse } from '../src/server/broker
 import type { SecondOrderStore } from '../src/server/canary-broker.ts'
 import type { ResolvedPersona } from '../src/server/persona-vault.ts'
 import { probeDifferential } from '../src/server/surface-engine.ts'
+import { floorRecipe, runFloorRecipe } from '../src/server/floor-recipes.ts'
 
 const origin = 'https://tenanta.example'
+const ORIGIN_FOR_RECIPE = 'https://tenanta.example'
 const publicAddr: PublicAddress = { address: '93.184.216.34', family: 4 }
 
 function persona(handle: string, authKind: ResolvedPersona['authKind'], secret: string): ResolvedPersona {
@@ -101,6 +103,95 @@ test('a Set-Cookie rotation is scoped to the persona that received it, even unde
   assert.equal(broker.getPersonaScopeMismatches().length, 0, 'isolated jars need no mismatch')
 })
 
+test('interleaved personas on one route never observe each other tenant (own store, own claim)', async () => {
+  // A stateful origin: the store answered is the store pinned on the *session* the request carried.
+  const TENANT_BY_COOKIE = new Map<string, string>([
+    ['rb_sid=session_a', 'store-a'],
+    ['rb_sid=session_b', 'store-b'],
+  ])
+  const seen: Array<{ persona: string | null; cookie: string | null; store: string }> = []
+  const transport = async (
+    _url: URL,
+    _address: PublicAddress,
+    _signal: AbortSignal,
+    options?: { headers?: Record<string, string> },
+  ): Promise<RawHttpResponse> => {
+    const cookie = options?.headers?.Cookie ?? options?.headers?.cookie ?? null
+    // Interleaved act-as: writes pin the *caller's own session* to the requested store.
+    const store = (cookie ? TENANT_BY_COOKIE.get(cookie) : null) ?? 'anonymous'
+    const body = JSON.stringify({ store })
+    seen.push({ persona: null, cookie, store })
+    return { status: 200, headers: { 'content-type': 'application/json' }, body, bodyBytes: body.length }
+  }
+  const broker = new RequestBroker({ resolve: async () => [publicAddr], transport })
+  const grant = makeGrant([
+    persona('persona_a', 'cookie', 'rb_sid=session_a'),
+    persona('persona_b', 'cookie', 'rb_sid=session_b'),
+  ])
+  const signal = AbortSignal.timeout(30_000)
+  const read = async (handle: string) => {
+    const exchange = await broker.executeHttp(
+      { origin, method: 'GET', pathAndQuery: '/api/v1/settings', persona: handle },
+      grant,
+      signal,
+    )
+    return { store: (JSON.parse(exchange.body) as { store: string }).store }
+  }
+
+  // A/B/A/B interleaved on the same route in one run.
+  const results = [await read('persona_a'), await read('persona_b'), await read('persona_a'), await read('persona_b')]
+  assert.deepEqual(results.map(entry => entry.store), ['store-a', 'store-b', 'store-a', 'store-b'])
+  // Each persona sent only its own session cookie.
+  assert.deepEqual(seen.map(entry => entry.cookie), [
+    'rb_sid=session_a', 'rb_sid=session_b', 'rb_sid=session_a', 'rb_sid=session_b',
+  ])
+  assert.equal(broker.getPersonaScopeMismatches().length, 0, 'no scope disagreement to report')
+})
+
+test('a claim from an exchange served another persona scope is evidence-invalid, never TP or FP', async () => {
+  // The probe actor's declared tenant is store-a, but its credential is another persona's session
+  // (store-b). The origin answers store-b; that answer must never become a finding.
+  const TENANT_BY_COOKIE = new Map<string, string>([['rb_sid=session_b', 'store-b']])
+  const transport = async (
+    _url: URL,
+    _address: PublicAddress,
+    _signal: AbortSignal,
+    options?: { headers?: Record<string, string> },
+  ): Promise<RawHttpResponse> => {
+    const cookie = options?.headers?.Cookie ?? options?.headers?.cookie ?? null
+    const store = (cookie ? TENANT_BY_COOKIE.get(cookie) : null) ?? 'anonymous'
+    const body = JSON.stringify({ store, providerKey: `rbs_${store}_96d3cc9d2620` })
+    return { status: 200, headers: { 'content-type': 'application/json' }, body, bodyBytes: body.length }
+  }
+  const broker = new RequestBroker({ resolve: async () => [publicAddr], transport })
+  const grant = makeGrant([
+    // persona_a declares store-a but was minted persona_b's session (the bleed's signature).
+    persona('persona_a', 'cookie', 'rb_sid=session_b'),
+    persona('persona_b', 'cookie', 'rb_sid=session_b'),
+  ])
+  const signal = AbortSignal.timeout(30_000)
+
+  // persona_b legitimately establishes ownership of session_b first.
+  await broker.executeHttp({ origin, method: 'GET', pathAndQuery: '/api/v1/settings', persona: 'persona_b' }, grant, signal)
+
+  // Now the same login session is presented for persona_a. The broker fails closed, so the wrong
+  // tenant is never even fetched — not for a read, and not for a claim drawn from one.
+  await assert.rejects(
+    broker.executeHttp({ origin, method: 'GET', pathAndQuery: '/api/v1/settings', persona: 'persona_a' }, grant, signal),
+    /Persona scope mismatch/,
+  )
+  assert.equal(broker.getPersonaScopeMismatches().length, 1)
+
+  // The differential path likewise stages nothing: no exchange id, no anomaly, no finding.
+  const result = await probeDifferential(
+    { origin, pathAndQuery: '/api/v1/settings/1', probeClass: 'path_traversal_benign', persona: 'persona_a' },
+    broker, grant, undefined, signal,
+  )
+  assert.equal(result.verdict, 'inconclusive')
+  assert.equal(result.exchangeIds.length, 0, 'evidence-invalid exchanges are never staged')
+  assert.equal(result.anomalies.length, 0, 'a scope-mismatched response cannot become an anomaly')
+})
+
 test('two personas riding one server-side session raise broker.persona_scope_mismatch and are evidence-invalid', async () => {
   const { transport } = recordingTransport()
   const events: Array<{ kind: string; detail: Record<string, unknown> }> = []
@@ -120,10 +211,10 @@ test('two personas riding one server-side session raise broker.persona_scope_mis
   const request = (handle: string) => ({ origin, method: 'GET' as const, pathAndQuery: '/api/v1/settings', persona: handle })
 
   const first = await broker.executeHttp(request('persona_a'), grant, signal)
-  assert.equal(first.personaScopeMismatch, undefined, 'the first persona to use a session owns it')
+  assert.equal(first.status, 200, 'the first persona to use a session owns it')
 
-  const shared = await broker.executeHttp(request('viewer'), grant, signal)
-  assert.equal(shared.personaScopeMismatch, true, 'a second persona on the same session is flagged')
+  // The second persona must not be answered from the first persona's session at all.
+  await assert.rejects(broker.executeHttp(request('viewer'), grant, signal), /Persona scope mismatch/)
   const mismatches = broker.getPersonaScopeMismatches()
   assert.equal(mismatches.length, 1)
   assert.deepEqual(
@@ -134,9 +225,9 @@ test('two personas riding one server-side session raise broker.persona_scope_mis
   assert.equal(events[0]?.detail.expected, 'viewer')
   assert.equal(events[0]?.detail.observed, 'persona_a')
 
-  // A persona with its own session is unaffected, and the flag is not sticky.
+  // A persona with its own session is unaffected, and the record is not sticky.
   const own = await broker.executeHttp(request('persona_b'), grant, signal)
-  assert.equal(own.personaScopeMismatch, undefined, 'distinct sessions keep their own scope')
+  assert.equal(own.status, 200, 'distinct sessions keep their own scope')
   assert.equal(broker.getPersonaScopeMismatches().length, 1, 'mismatch records are reported once')
 })
 
@@ -172,4 +263,48 @@ test('the broker rejects a persona it cannot resolve instead of falling back to 
     broker.executeHttp({ origin, method: 'GET', pathAndQuery: '/api/v1/settings', persona: 'ghost' }, grant, AbortSignal.timeout(5_000)),
     BrokerDenied,
   )
+})
+
+test('an identity-assumption proof restores the actor baseline before the next persona probe', async () => {
+  // A session-scoped store: an act-as write pins the caller's *session* to the target store, and
+  // only a later write carrying the caller's own store puts it back (exactly the shape that made a
+  // viewer read another tenant after an authz proof).
+  const ACTOR_STORE = 'store-own'
+  const TARGET_STORE = 'store-victim'
+  const scopeByActor = new Map<string, string>()
+  const handle = (req: { actor: { handle: string }; jsonBody?: unknown; role: string }) => {
+    const actor = req.actor.handle
+    const store = (req.jsonBody as { store?: string } | undefined)?.store
+    if (store) {
+      scopeByActor.set(actor, store)
+      return { status: 200, json: { ok: true, actingAs: store }, body: JSON.stringify({ ok: true }), route: '/api/v1/admin/impersonate' }
+    }
+    const current = scopeByActor.get(actor) ?? ACTOR_STORE
+    return { status: 200, json: { actor, store: current }, body: JSON.stringify({ actor, store: current }), route: '/api/v1/session' }
+  }
+  const execution = await runFloorRecipe(floorRecipe('persisted_mutation', {
+    origin: ORIGIN_FOR_RECIPE,
+    method: 'POST',
+    pathAndQuery: '/api/v1/admin/impersonate',
+    vulnClass: 'bfla',
+    actor: { handle: 'viewer', role: 'viewer', tenant: 'tenant-a', auth: 'cookie' },
+    body: { store: TARGET_STORE },
+    reset: { body: { store: ACTOR_STORE } },
+    baselineMethod: 'GET',
+    baselinePathAndQuery: '/api/v1/session',
+    readbackMethod: 'GET',
+    readbackPathAndQuery: '/api/v1/session',
+  }), {
+    request: req => handle(req),
+    nextExchangeId: (() => { let n = 0; return () => `ex-${++n}` })(),
+  })
+
+  assert.equal(execution.result.verification.rule, 'impact')
+  assert.equal(scopeByActor.get('viewer'), ACTOR_STORE,
+    'the acting scope must be back to the actor own store after the proof')
+  assert.ok(execution.result.transcript.entries?.some(entry => entry.evidenceRole === 'state_restore'),
+    'the restore is recorded as its own cleanup exchange')
+  // The next persona read (a later credential-exposure probe) is served the actor's own tenant.
+  const nextRead = handle({ actor: { handle: 'viewer' }, role: 'control' }) as { json: { store: string } }
+  assert.equal(nextRead.json.store, ACTOR_STORE, 'the next read by this persona is served its own tenant')
 })
