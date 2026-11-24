@@ -5,8 +5,70 @@
  * hypothesis family onto the engine `det_lead` probe namespace and builds the fact payload.
  * Dedupe, caps and step creation stay in the lane (`queueDetLeadUpgradeSteps`).
  */
-import type { CodeToRuntimeHypothesis } from './program-graph.ts'
+import { renderCodeDataflowSlice } from './program-graph.ts'
+import type {
+  CodeDataflowSlice,
+  CodeSliceGuardDiff,
+  CodeToRuntimeHypothesis,
+} from './program-graph.ts'
 import type { Assignment, Run } from './store.ts'
+
+/**
+ * v7 whitebox hop: a det_lead fact carries the bounded code dataflow slice for its route so the
+ * agentic brief can render exact file:line evidence without a second graph walk. The persisted
+ * slice (plus its deduped `guardDiff` mirror) never exceeds this budget.
+ */
+export const DET_LEAD_CODE_SLICE_MAX_BYTES = 600
+
+/** Hypothesis shape produced by phase0-recon: the v7 slice rides on the hypothesis payload. */
+export type CodeSliceHypothesis = CodeToRuntimeHypothesis & { codeSlice?: CodeDataflowSlice }
+
+function dedupeGuardDiffs(diffs: readonly CodeSliceGuardDiff[] | undefined, limit = 2): CodeSliceGuardDiff[] {
+  const seen = new Set<string>()
+  const out: CodeSliceGuardDiff[] = []
+  for (const diff of diffs ?? []) {
+    const key = `${diff.kind}\u0000${diff.guard}\u0000${diff.symbol}\u0000${diff.sibling}\u0000${diff.at}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ ...diff })
+    if (out.length >= limit) break
+  }
+  return out
+}
+
+/**
+ * Build the additive fact-data fields for a hypothesis code slice.
+ *
+ * The slice is re-fitted through the deterministic byte ladder (never a blind JSON slice) and
+ * `guardDiff` is mirrored as a deduped top-level field so the upgrade queue/brief can read the
+ * sibling-guard contrast without walking the slice. The combined payload stays <= `maxBytes`.
+ */
+export function detLeadCodeSliceFactFields(
+  slice: CodeDataflowSlice | null | undefined,
+  maxBytes = DET_LEAD_CODE_SLICE_MAX_BYTES,
+): Record<string, unknown> {
+  if (!slice || typeof slice !== 'object') return {}
+  const cap = Math.max(64, Math.floor(maxBytes))
+  // The slice itself is the source of truth and is fitted at the full budget; the `guardDiff`
+  // mirror is added only when the combined payload still fits, never at the cost of evidence.
+  // Guard diffs are deduped before fitting so a repeated sibling contrast cannot crowd out hops.
+  const base: CodeDataflowSlice = slice.guardDiff?.length
+    ? { ...slice, guardDiff: dedupeGuardDiffs(slice.guardDiff, 3) }
+    : slice
+  const rendered = renderCodeDataflowSlice(base, cap)
+  const mirror = dedupeGuardDiffs(rendered.slice.guardDiff ?? [])
+  let fields: Record<string, unknown> = {
+    codeSlice: rendered.slice,
+    codeSliceBytes: rendered.bytes,
+    ...(mirror.length ? { guardDiff: mirror } : {}),
+  }
+  if (Buffer.byteLength(JSON.stringify(fields), 'utf8') > cap) {
+    // The mirror is redundant evidence (it also lives inside `codeSlice`); drop it before
+    // touching the slice so route/hops/sink remain intact.
+    fields = { codeSlice: rendered.slice, codeSliceBytes: rendered.bytes }
+  }
+  return fields
+}
 
 /** Map a Program-Graph code→runtime hypothesis onto the engine det_lead probe namespace. */
 export function codeHypothesisProbeClass(hypothesis: CodeToRuntimeHypothesis): string | null {
@@ -41,7 +103,7 @@ export interface CodeToRuntimeLead {
 }
 
 /** Build the `det_lead` fact payload for one hypothesis (null when it has no runtime binding). */
-export function codeToRuntimeLead(hypothesis: CodeToRuntimeHypothesis): CodeToRuntimeLead {
+export function codeToRuntimeLead(hypothesis: CodeSliceHypothesis): CodeToRuntimeLead {
   const path = typeof hypothesis.path === 'string' ? hypothesis.path : ''
   const method = typeof hypothesis.method === 'string' ? hypothesis.method.toUpperCase() : ''
   const runtime = method && path.startsWith('/') ? { method, path } : null
@@ -61,6 +123,7 @@ export function codeToRuntimeLead(hypothesis: CodeToRuntimeHypothesis): CodeToRu
       line: hypothesis.line,
       severity: hypothesis.severity,
       confidence: hypothesis.confidence,
+      ...detLeadCodeSliceFactFields(hypothesis.codeSlice),
     },
   }
 }
@@ -83,7 +146,7 @@ export function seedCodeToRuntimeLeads(
   storage: LeadStore,
   run: Run,
   assignment: Assignment,
-  hypotheses: readonly CodeToRuntimeHypothesis[],
+  hypotheses: readonly CodeSliceHypothesis[],
   seeded: Set<string>,
   fallbackOrigin: string,
 ): number {

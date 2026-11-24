@@ -82,7 +82,8 @@ import type {
 } from './agent-session.ts'
 import { createAgentTraceFromEnv } from './agent-trace.ts'
 import type { AgentTrace } from './agent-trace.ts'
-import { buildAssignmentBrief } from './assignment-brief.ts'
+import { assertAssignmentBriefSize, buildAssignmentBrief } from './assignment-brief.ts'
+import { ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE } from './assignment-brief.ts'
 import type { MissionKind } from './assignment-brief.ts'
 import {
   BrokerApprovalRequired,
@@ -130,7 +131,7 @@ import type { PersonaSessionClone } from './persona-auth.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
 import { crawlStateGraph, listEndpointsPaged, runPhase0Recon } from './phase0-recon.ts'
-import type { CodeToRuntimeHypothesis } from './program-graph.ts'
+import type { CodeDataflowSlice, CodeToRuntimeHypothesis } from './program-graph.ts'
 import {
   consumeBurstInstance,
   planTier3ApprovalTargets,
@@ -417,11 +418,22 @@ export interface CoordinatorSchedulerState {
   emptyRounds?: number
   coordinatorDone?: boolean
   pendingOob?: number
+  /** True when no ready/pending high-priority (det_lead / chain) step remains. */
+  highPriorityQueueEmpty?: boolean
+  /** Consecutive rounds with no new runtime_confirmed finding and no new chain primitive. */
+  consecutiveDryRounds?: number
 }
 
-/** Deterministic v6 scheduler guard: budget, requests, wall clock, K=2 empty rounds, done+OOB drain. */
+/**
+ * Deterministic v6/v7 scheduler guard: budget, requests, wall clock, K=2 empty rounds,
+ * improving-round precision stop, and done+OOB drain.
+ *
+ * The precision stop (v7) ends the planner when the high-priority queue is drained *and* two
+ * consecutive rounds produced no new runtime_confirmed finding and no new chain primitive. Budget,
+ * request, wall-clock and OOB-drain rules still take precedence, so late callbacks are never lost.
+ */
 export function coordinatorSchedulerDecision(state: CoordinatorSchedulerState): SchedulerDecision {
-  return decideNext({
+  const decision = decideNext({
     budgetExhausted: state.budgetExhausted,
     requestsLeft: state.budgetRequests > 0 ? state.budgetRequests - state.spentRequests : null,
     wallClockLeft: state.maxDurationMs > 0 ? state.startedAt + state.maxDurationMs - Date.now() : null,
@@ -429,6 +441,20 @@ export function coordinatorSchedulerDecision(state: CoordinatorSchedulerState): 
     coordinatorDone: state.coordinatorDone === true,
     pendingOob: state.pendingOob ?? 0,
   })
+  if (decision.decision === 'stop') return decision
+  const pending = state.pendingOob ?? 0
+  // A done coordinator with OOB subscriptions still draining keeps running (decideNext returned
+  // `continue` here), so the precision stop must not pre-empt the callback drain.
+  if (state.coordinatorDone === true && pending > 0) return decision
+  const dryRounds = state.consecutiveDryRounds ?? 0
+  if (state.highPriorityQueueEmpty === true && dryRounds >= DRY_ROUND_LIMIT) {
+    return {
+      decision: 'stop',
+      reason: 'diminishing_returns',
+      detail: `High-priority queue drained and ${dryRounds} consecutive dry round(s) produced no new runtime_confirmed finding or chain primitive.`,
+    }
+  }
+  return decision
 }
 
 /** Map chained hypotheses onto validated dispatch inputs (ordered by the planner's ranking). */
@@ -559,6 +585,87 @@ export const DET_LEAD_CONCURRENT_CAP = 2
 export const ASSIGNMENT_BOLA_QUEUE_MAX_ITEMS = 10
 /** Hard byte ceiling for the per-assignment BOLA queue slice (was 53 KB for the full queue). */
 export const ASSIGNMENT_BOLA_QUEUE_MAX_BYTES = 4096
+/**
+ * v7 precision guard: a `(normalizedRoute, vulnClass)` pair may be re-investigated at most this
+ * many times unless new chain-primitive/parent evidence unlocks another pass. Tail-scraping the
+ * same route/class is the dominant source of late-run false positives.
+ */
+export const REINVESTIGATION_CAP = 2
+/** Stop the planner after this many consecutive rounds with no new confirmed finding/chain primitive. */
+export const DRY_ROUND_LIMIT = 2
+
+/** Canonical `(normalizedRoute, vulnClass)` key for the reinvestigation guard. */
+export function reinvestigationKey(route: string, vulnClass: string): string {
+  const raw = (route ?? '').trim()
+  const withoutMethod = raw.replace(/^[A-Za-z]+\s+/, '')
+  const canonicalRoute = normalizeEndpointTemplate(withoutMethod.split(/[?#]/, 1)[0] ?? withoutMethod)
+  const canonicalClass = confirmedCategoryFamily((vulnClass ?? '').trim() || 'unknown')
+  return `${canonicalRoute}\u0000${canonicalClass}`
+}
+
+export interface ReinvestigationVerdict {
+  /** False means the scheduler must not queue another pass for this route/class. */
+  allowed: boolean
+  /** Investigation count *after* this call when allowed (the attempted count when capped). */
+  count: number
+  capped: boolean
+  /** New chain primitive / parent evidence bypassed (or re-opened) the cap. */
+  unlocked: boolean
+}
+
+/**
+ * Deterministic per-route+class reinvestigation counter. Pure bookkeeping: a caller records the
+ * attempt and obeys `allowed`. `unlocked` (new chain primitive or parent evidence) lets the
+ * investigation proceed beyond {@link REINVESTIGATION_CAP}.
+ */
+export class ReinvestigationGuard {
+  private readonly counts = new Map<string, number>()
+  private capped = 0
+  readonly cap: number
+
+  constructor(cap = REINVESTIGATION_CAP) {
+    this.cap = Math.max(1, Math.floor(cap))
+  }
+
+  countFor(key: string): number {
+    return this.counts.get(key) ?? 0
+  }
+
+  /** Record one investigation attempt for the route/class key. */
+  record(key: string, unlocked = false): ReinvestigationVerdict {
+    const previous = this.countFor(key)
+    const allowed = unlocked || previous < Math.max(1, this.cap)
+    if (!allowed) {
+      this.capped += 1
+      return { allowed: false, count: previous, capped: true, unlocked }
+    }
+    const count = previous + 1
+    this.counts.set(key, count)
+    return { allowed: true, count, capped: false, unlocked }
+  }
+
+  cappedCount(): number {
+    return this.capped
+  }
+
+  /** Snapshot of the capped counter and per-key counts (telemetry only). */
+  snapshot(): { capped: number; counts: Record<string, number> } {
+    return { capped: this.capped, counts: Object.fromEntries([...this.counts.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) }
+  }
+}
+
+/**
+ * Whether a det_lead's evidence unlocks another investigation of the same route/class: a chain
+ * primitive or parent evidence id means the assignment is escalating, not re-scraping.
+ */
+export function detLeadUnlocksReinvestigation(data: Record<string, unknown> | null | undefined): boolean {
+  if (!data) return false
+  if (typeof data.chainPrimitiveKind === 'string' && data.chainPrimitiveKind.trim()) return true
+  if (typeof data.chainPrimitive === 'string' && data.chainPrimitive.trim()) return true
+  if (Array.isArray(data.parentEvidenceIds) && data.parentEvidenceIds.length > 0) return true
+  if (Array.isArray(data.evidenceExchangeIds) && data.evidenceExchangeIds.length > 0) return true
+  return false
+}
 
 /** A lead only reaches the scheduler when a control contrast / near-miss exists. */
 export interface DetLeadEvidenceGate {
@@ -1911,6 +2018,12 @@ export class Execution {
   private readonly programGraphLeadsSeeded = new Set<string>()
   /** runId → consecutive planner rounds with zero dispatched work (K=2 diminishing-returns guard). */
   private readonly plannerEmptyRounds = new Map<string, number>()
+  /** runId → consecutive rounds with no new runtime_confirmed finding and no new chain primitive. */
+  private readonly plannerDryRounds = new Map<string, number>()
+  /** runId → last observed (confirmed findings, chain primitives) counts for dry-round accounting. */
+  private readonly plannerEvidenceFrontier = new Map<string, { confirmed: number; primitives: number }>()
+  /** runId → `(route, class)` reinvestigation guard (v7 precision; cap 2 unless evidence unlocks). */
+  private readonly reinvestigationGuards = new Map<string, ReinvestigationGuard>()
   private readonly recordedPersonaResources = new Map<string, Set<string>>()
   private readonly circuitNotified = new Set<string>()
   private readonly runAuthStarted = new Map<string, string>()
@@ -1968,6 +2081,8 @@ export class Execution {
   private readonly detLeadStepKeys = new Set<string>()
   /** Facts whose lead contract failed the contrast gate; emit the skip reason once. */
   private readonly detLeadGateRejected = new Set<string>()
+  /** det_lead fact ids whose capped reinvestigation was already reported (emit once per fact). */
+  private readonly cappedLeadReported = new Set<string>()
   /** Opt-in per-run agentic trace (only populated when GUARDIAN_TRACE_DIR / GUARDIAN_TRACE is set). */
   private readonly runTraces = new Map<string, AgentTrace>()
   private readonly onCheckpoint?: (event: { runId: string; checkpoint: ExecutionCheckpoint }) => void
@@ -5588,6 +5703,18 @@ export class Execution {
       const asset = run.candidates.find(c => c.origin === fact.origin && run.approved.includes(c.id))
       if (!asset) continue
       const category = detLeadCategory(probeClass)
+      // v7 precision guard: cap re-investigation of the same (route, class) at 2 unless the lead
+      // carries a new chain primitive / parent evidence that actually escalates the attempt.
+      const guardKey = reinvestigationKey(endpoint, category)
+      const verdict = this.reinvestigationGuardFor(run.id)
+        .record(guardKey, detLeadUnlocksReinvestigation(fact.data))
+      if (!verdict.allowed) {
+        if (!this.cappedLeadReported.has(fact.id)) {
+          this.cappedLeadReported.add(fact.id)
+          this.noteCappedReinvestigation(run, guardKey, verdict.count)
+        }
+        continue
+      }
       const reason = typeof fact.data.reason === 'string' ? fact.data.reason.slice(0, 200) : 'differential observation'
       const skills = detLeadSkills(probeClass)
       const title = `det_lead upgrade · ${probeClass} ${method} ${endpoint}`.slice(0, 180)
@@ -5660,8 +5787,17 @@ export class Execution {
         input.parentFacts.some(f => f.data?.kind === 'det_lead' && f.id === lead.exchangeId) ||
         (Boolean(lead.endpoint) && input.targetOrigins.includes(origin)),
       )
-      return buildAssignmentBrief({
-        missionKind: this.missionKindForStep(input.step, Boolean(parentDetLead)),
+      const missionKind = this.missionKindForStep(input.step, Boolean(parentDetLead))
+      // v7 whitebox hop: the persisted slice for this assignment's route reaches the brief.
+      // Compact by default; only chain / 4-hop assignments pay for the expanded slice.
+      const codeSlice = this.codeSliceForAssignment(input.run, input.step, input.parentFacts)
+      const codeExpansion: 'compact' | 'full' = missionKind === 'chain_step_2' ||
+        input.step.dependsOnStepIds.length > 0 ||
+        (codeSlice?.hops.length ?? 0) >= 4
+        ? 'full'
+        : 'compact'
+      const text = buildAssignmentBrief({
+        missionKind,
         origin,
         routes,
         personas,
@@ -5684,9 +5820,13 @@ export class Execution {
               },
             }
           : {}),
+        ...(codeSlice ? { codeSlice, codeExpansion } : {}),
         targetCount: routes.length > 1 ? 2 : 1,
         turnBudget: input.maxTurns,
       })
+      // The renderer owns the ladder; this assert turns a future regression into a loud failure.
+      assertAssignmentBriefSize(text, ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE)
+      return text
     } catch {
       return undefined
     }
@@ -5721,6 +5861,81 @@ export class Execution {
         halted: false,
       },
     )
+  }
+
+  /** Per-run reinvestigation guard (cap 2 per normalized route+class unless evidence unlocks). */
+  private reinvestigationGuardFor(runId: string): ReinvestigationGuard {
+    let guard = this.reinvestigationGuards.get(runId)
+    if (!guard) {
+      guard = new ReinvestigationGuard()
+      this.reinvestigationGuards.set(runId, guard)
+    }
+    return guard
+  }
+
+  /**
+   * True when no ready/pending high-priority step remains. High priority means the `det_lead`
+   * upgrade lane or a chain-primitive dispatch; ordinary class scans do not keep a drained planner
+   * alive on their own.
+   */
+  private highPriorityQueueEmpty(run: Pick<Run, 'id' | 'goalRevision'>): boolean {
+    try {
+      return !this.storage.listChainSteps(run.id, run.goalRevision).some(step =>
+        (step.status === 'ready' || step.status === 'pending') &&
+        (isDetLeadDispatchStep(step) ||
+          step.skills.some(skill => skill.startsWith('chain:') || skill === 'chain-primitives') ||
+          step.priority >= 88))
+    } catch {
+      return true
+    }
+  }
+
+  /** Record a capped reinvestigation attempt as telemetry (one event per run). */
+  private noteCappedReinvestigation(
+    run: Pick<Run, 'id'>,
+    key: string,
+    attempted: number,
+  ): void {
+    const guard = this.reinvestigationGuardFor(run.id)
+    try {
+      this.storage.event(
+        run.id,
+        'planner.capped_reinvestigations',
+        `Capped reinvestigation of ${key.replace('\u0000', ' ')} (attempt ${attempted + 1} > cap ${guard.cap}); no new chain primitive or parent evidence.`,
+        { routeClass: key, attempted: attempted + 1, cap: guard.cap, ...guard.snapshot() },
+      )
+    } catch { /* best-effort */ }
+  }
+
+  /**
+   * The stored white-box slice for an assignment's route, if any. Parent det_lead facts win; a
+   * fallback scan matches det_lead facts to routes the step explicitly names.
+   */
+  private codeSliceForAssignment(
+    run: Pick<Run, 'id'>,
+    step: Pick<ChainStep, 'title' | 'hypothesis'>,
+    parentFacts: readonly Fact[],
+  ): CodeDataflowSlice | undefined {
+    const mentioned = new Set(this.stepMentionedRoutes(step).map(route => normalizeEndpointTemplate(route)))
+    const text = `${step.title} ${step.hypothesis}`
+    const candidates = [
+      ...parentFacts.filter(fact => fact.data?.kind === 'det_lead'),
+      ...this.storage.listFacts(run.id, { includeTainted: false, limit: 200 })
+        .filter(fact => fact.data?.kind === 'det_lead'),
+    ]
+    for (const fact of candidates) {
+      const data = fact.data as Record<string, unknown> | undefined
+      const slice = data?.codeSlice as CodeDataflowSlice | undefined
+      if (!slice || typeof slice !== 'object' || !Array.isArray(slice.hops)) continue
+      const endpoint = typeof data?.endpoint === 'string' ? data.endpoint : ''
+      const route = normalizeEndpointTemplate(endpoint || slice.route)
+      const matched = mentioned.size
+        ? mentioned.has(route)
+        : Boolean(endpoint && text.includes(endpoint))
+      if (!matched) continue
+      return slice
+    }
+    return undefined
   }
 
   private seedCodeToRuntimeLeads(
@@ -7767,6 +7982,13 @@ export class Execution {
       },
     })
     const pendingOob = coordinator.queryFindings({ status: 'pending_oob', limit: 1 }).total
+    // v7 precision guard: remember the evidence frontier across rounds. A round that adds no
+    // runtime_confirmed finding and no chain primitive is dry; two consecutive dry rounds after the
+    // high-priority queue drains end the planner.
+    const evidenceFrontier = this.plannerEvidenceFrontier.get(run.id) ?? {
+      confirmed: coordinator.queryFindings({ status: 'confirmed', limit: 1 }).total,
+      primitives: coordinator.deriveChainPrimitives().length,
+    }
     const prompt = coordinatorPlannerPrompt({
       goal: updated.goal,
       roundNo,
@@ -7828,6 +8050,18 @@ export class Execution {
           .filter(candidate => validOrigins.includes(candidate.origin) && currentRun.approved.includes(candidate.id))
           .map(candidate => candidate.id)
         if (!assetIds.length) continue
+        // v7 precision guard: a plain re-emission of the same (route, class) is capped at 2
+        // investigations unless the step cites a chain primitive or parent evidence.
+        const guardRoutes = this.stepMentionedRoutes(step)
+        const guardKey = guardRoutes.length ? reinvestigationKey(guardRoutes[0], step.category) : ''
+        if (guardKey) {
+          const unlocked = step.dependsOnFactIds.length > 0 || step.dependsOnStepIds.length > 0
+          const verdict = this.reinvestigationGuardFor(run.id).record(guardKey, unlocked)
+          if (!verdict.allowed) {
+            this.noteCappedReinvestigation(run, guardKey, verdict.count)
+            continue
+          }
+        }
         // F2: a planner re-emission of a det_lead upgrade must not jump back above class steps.
         const leadBound = step.dependsOnFactIds.some(id => detLeadFactIds.has(id)) ||
           isDetLeadDispatchStep({ title: step.title, hypothesis: step.hypothesis })
@@ -7847,6 +8081,34 @@ export class Execution {
     // Deterministic scheduler guard outside the LLM: budget/requests/wall/K=2/done+pending OOB.
     const emptyRounds = addedCount === 0 ? (this.plannerEmptyRounds.get(run.id) ?? 0) + 1 : 0
     this.plannerEmptyRounds.set(run.id, emptyRounds)
+    const chainPrimitivesAfterRound = coordinator.deriveChainPrimitives().length
+    const confirmedAfterRound = coordinator.queryFindings({ status: 'confirmed', limit: 1 }).total
+    const newChainPrimitives = Math.max(0, chainPrimitivesAfterRound - evidenceFrontier.primitives)
+    const newRuntimeConfirmed = Math.max(0, confirmedAfterRound - evidenceFrontier.confirmed)
+    this.plannerEvidenceFrontier.set(run.id, {
+      confirmed: confirmedAfterRound,
+      primitives: chainPrimitivesAfterRound,
+    })
+    const dryRounds = newRuntimeConfirmed + newChainPrimitives > 0
+      ? 0
+      : (this.plannerDryRounds.get(run.id) ?? 0) + 1
+    this.plannerDryRounds.set(run.id, dryRounds)
+    const queueDrained = this.highPriorityQueueEmpty({
+      id: run.id,
+      goalRevision: this.storage.run(run.id).goalRevision,
+    })
+    this.storage.event(
+      run.id,
+      'planner.dry_rounds',
+      `Planner dry-round ${dryRounds}/${DRY_ROUND_LIMIT}: ${newRuntimeConfirmed} new confirmed, ${newChainPrimitives} new chain primitive(s)${queueDrained ? '; high-priority queue empty' : ''}.`,
+      {
+        consecutiveDryRounds: dryRounds,
+        limit: DRY_ROUND_LIMIT,
+        newRuntimeConfirmed,
+        newChainPrimitives,
+        highPriorityQueueEmpty: queueDrained,
+      },
+    )
     const latest = this.storage.run(run.id)
     const decision = coordinatorSchedulerDecision({
       budgetExhausted: this.storage.checkBudgetExceeded(run.id),
@@ -7857,6 +8119,8 @@ export class Execution {
       emptyRounds,
       coordinatorDone: parsedPlanner?.success ? parsedPlanner.data.done : false,
       pendingOob: coordinator.queryFindings({ status: 'pending_oob', limit: 1 }).total,
+      highPriorityQueueEmpty: queueDrained,
+      consecutiveDryRounds: dryRounds,
     })
     if (decision.decision === 'stop') this.plannerDoneRound.set(run.id, roundNo)
     this.tracePlannerDecision(run.id, {
@@ -7869,6 +8133,10 @@ export class Execution {
       roundNo, addedCount, chainSteps, bolaAutoSteps, secondOrderAutoSteps, detLeadSteps, toolDispatched,
       done: parsedPlanner?.success === true ? parsedPlanner.data.done : false,
       decision: decision.decision, reason: decision.reason,
+      terminationReason: decision.decision === 'stop' ? decision.reason : null,
+      consecutiveDryRounds: dryRounds,
+      highPriorityQueueEmpty: queueDrained,
+      cappedReinvestigations: this.reinvestigationGuardFor(run.id).cappedCount(),
       summary: parsedPlanner?.success ? parsedPlanner.data.summary.slice(0, 300) : compactText(answer, 300),
     })
   }
