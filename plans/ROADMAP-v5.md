@@ -492,3 +492,21 @@ Held-out rerun after fixture hardening (shopflow settings/admin-reviews owner+ad
 - **`oob_wiring_fnr` separated from `fixture_capability_recall`** (reviewer-accepted): #2 now reports wiring PASS with **0.0% OOB wiring FNR** (0 of 2 fired async-canary targets unconfirmed) and **50.0% capability recall FAIL** (2 of 4 planted: async SSRF + XXE confirmed; blind SQLi and the exfil chain missing). The old blended 33.3% is informational only, so an unrelated capability miss can never again look like an OOB wiring defect.
 - **#4 per-slice funnel** now pins the loss stage per slice: `mono-admin-bfla` was **dispatched and hit the mounted route but never reached verification**; `mono-billing-bola` and `mono-report-sqli` were **never requested**. That is not a brief-truncation signature — it is the same post-route proof-submission loss seen on held-out (19/23 `no_spec_submitted`).
 - Realism #3 re-verified PASS after the split (3 TP / 0 FP, 2 h2 single-packet bursts, 0 leaks), so the change is measurement-only.
+
+### 2026-11-24 — hourly check-in #12: hold the lift bar red; serialize the engine lane; capture FP evidence
+
+**Triage (accept/reject/defer):**
+
+| # | Recommendation | Verdict | Owner |
+|---|---|---|---|
+| 1 | Treat settlement enforcement as instrumentation, not the cure; first extract a **19-row × 7-column** table (turns/wall vs caps, `endReason`, statuses seen, personas tried, last 3 tools, anomaly-noted, vuln class) and let the dominant bucket choose the fix | **ACCEPT** | `spec-submission` |
+| 2 | Decision rule pre-committed: mostly turn/wall limit → 12→18 turns / 80→120 s + wrap-up verify; mostly 401/422 + concluded-clean → input/persona capability gap; mostly anomaly-noted-text-only → proof-submission friction | **ACCEPT** | `spec-submission` |
+| 3 | Serialize the three hot core files (`execution.ts`, `deterministic-specs.ts`, `replay-verifier.ts`) into ONE FIFO **Engine Lane**; keep leaf modules (`probes/*`, `agent-session`, `assignment-brief`, realism, smoke) parallel | **ACCEPT** | coordinator |
+| 4 | Engine-lane merge order: sqli-baseline → dispatch-funnel → spec-submission → cut3a | **ACCEPT** | coordinator |
+| 5 | **Hold the +6pp lift bar red.** Do not re-baseline again; the +6pp (+4 targets) sits inside the 19/23 proof-submission bottleneck | **ACCEPT** (no gate change) | certification |
+| 6 | Next capability target after the lane drains: **Realism #4**, smallest acceptable proof = 3/3 Tier-A slices dispatched **and** route-hit, `verify_called ≥ 2/3`, ≥2/3 4-hop sinks `runtime_confirmed` at 100% precision | **ACCEPT** | next stream |
+| 7 | Fixture hardening is valid only for unintended non-planted behavior; log every fixture security fix in a changelog | **ACCEPT** (created `benchmarks/CHANGELOG.md`) | coordinator |
+| 8 | **Real red flag:** unrecoverable acme FP because data dirs were cleaned. Embed a redacted proof summary for every unmatched finding into the `--out` JSON/meta **before** cleanup | **ACCEPT** | `spec-submission` (file added to lease) |
+| 9 | After Cut 3a parity, go **straight to Cut 3b** on the Engine Lane — do not pause to certify between them | **ACCEPT** | coordinator |
+
+**Solved with #12:** `benchmarks/CHANGELOG.md` records both shopflow hardening changes with the "unintended, non-planted, recall unchanged" rationale, so benchmark mutations stay auditable.
