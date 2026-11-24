@@ -19,7 +19,7 @@ import { declarativeReplaySpecSchema } from '../replay-spec.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
 import { probeDifferential, responseSimilarity } from './surface-engine.ts'
 import type { DifferentialProbeClass, DifferentialResult, ProbeDifferentialRequest, SurfaceParamLocation } from './surface-engine.ts'
-import { verifyReplaySpec } from './replay-verifier.ts'
+import { assertNotRecipeWiredLegacyCall, verifyReplaySpec } from './replay-verifier.ts'
 import type { ReplayVerificationResult } from './replay-verifier.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
@@ -27,6 +27,7 @@ import type { Store } from './store.ts'
 import type { WorkerBackend } from './worker-backend.ts'
 import { synthesizeEngineSpecs, vulnClassOfSpec } from './deterministic-specs.ts'
 import type { EngineEndpoint, EngineHypothesis, EngineParam, SynthesizedEngineSpec } from './deterministic-specs.ts'
+import { planFloorRecipe, recipeSpecRecord, recipeVerificationResult, runPlannedRecipe } from './floor-recipe-engine.ts'
 
 export type { EngineEndpoint, EngineHypothesis, EngineParam } from './deterministic-specs.ts'
 
@@ -4630,6 +4631,116 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
       }
       report.specsSubmitted += 1
       stats.specs += 1
+      // Cut 3a strict strangler: a wired kind/class pair runs its typed recipe and is confirmed by
+      // the receipt, never by `verifyReplaySpec`. The legacy synthesizer still supplies the
+      // candidate (kind/class attribution); it is not the confirmation artifact.
+      const candidateClass = candidate.vulnClass || vulnClassOfSpec(parsed.data as unknown as Record<string, unknown>)
+      const recipePlan = planFloorRecipe({
+        hypothesis: hyp,
+        probe,
+        specKind: candidate.kind,
+        vulnClass: candidateClass,
+        personas: input.personas,
+        ...(staging.headers ? { headers: staging.headers } : {}),
+      })
+      if (recipePlan) {
+        if (recipePlan.skipReason) {
+          report.rejectedSpecs += 1
+          stats.rejected += 1
+          rejections.push({
+            kind: candidate.kind,
+            verdict: 'inconclusive',
+            controlPassed: false,
+            observed: `recipe ${recipePlan.recipeId} not expressible`,
+            reason: recipePlan.skipReason,
+            exchangeIds: [],
+          })
+          log('deterministic_engine.recipe_skipped', `${recipePlan.recipeId} ${hyp.endpoint.pathTemplate}: ${recipePlan.skipReason}`, {
+            intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: recipePlan.recipeId,
+          })
+          continue
+        }
+        let execution: Awaited<ReturnType<typeof runPlannedRecipe>>
+        try {
+          execution = await runPlannedRecipe({
+            plan: recipePlan,
+            hypothesis: hyp,
+            broker: input.broker,
+            grant: input.grant,
+            signal: input.signal,
+            ...(input.runId ? { runId: input.runId } : {}),
+            ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
+            recordExchange: trackExchange,
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200)
+          report.notes.push(`recipe ${recipePlan.recipeId} ${hyp.endpoint.pathTemplate}: ${message}`)
+          log('deterministic_engine.recipe_error', `${recipePlan.recipeId} ${hyp.method} ${hyp.endpoint.pathTemplate}: ${message}`, {
+            intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: recipePlan.recipeId,
+          })
+          if (/outside the current assignment scope|run is paused|circuit is open/i.test(message)) {
+            report.stoppedReason = 'aborted'
+            break
+          }
+          continue
+        }
+        if (!execution.result.confirmed) {
+          const failure = execution.failure
+          report.rejectedSpecs += 1
+          stats.rejected += 1
+          rejections.push({
+            kind: candidate.kind,
+            verdict: 'inconclusive',
+            controlPassed: failure?.code !== 'precondition_unsatisfied',
+            observed: `recipe ${execution.result.recipeId}: ${failure?.code ?? 'rejected'}`,
+            reason: failure?.message ?? execution.result.verification.reason,
+            exchangeIds: [...execution.result.exchangeIds],
+          })
+          log('deterministic_engine.recipe_rejected', `${execution.result.recipeId} ${hyp.endpoint.pathTemplate} -> ${failure?.code ?? 'rejected'}: ${(failure?.message ?? execution.result.verification.reason).slice(0, 200)}`, {
+            intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: execution.result.recipeId,
+            missingRoles: failure?.missingRoles ?? [],
+          })
+          continue
+        }
+        const record = recipeSpecRecord(recipePlan, execution)
+        const recordParsed = declarativeReplaySpecSchema.safeParse(record.spec)
+        if (!recordParsed.success) {
+          report.notes.push(`recipe record ${recipePlan.recipeId} ${hyp.endpoint.pathTemplate}: ${recordParsed.error.issues[0]?.message ?? 'schema mismatch'}`)
+          log('deterministic_engine.recipe_record_invalid', `${recipePlan.recipeId} ${hyp.endpoint.pathTemplate}: ${recordParsed.error.issues[0]?.path.join('.') ?? 'schema'} ${recordParsed.error.issues[0]?.message ?? ''}`.slice(0, 300), {
+            intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: recipePlan.recipeId,
+          })
+          continue
+        }
+        const result = recipeVerificationResult(recipePlan, execution, [...execution.result.exchangeIds])
+        let recipePersistedId: string | null = null
+        try {
+          recipePersistedId = await input.onConfirmed({
+            hypothesis: hyp,
+            spec: recordParsed.data as unknown as DeclarativeReplaySpec,
+            specRecord: record,
+            vulnClass: recipePlan.vulnClass,
+            endpoint: hyp.endpoint.pathTemplate,
+            result,
+            exchangeIds: [...new Set([...probe.exchangeIds, ...execution.result.exchangeIds])],
+          })
+        } catch (error) {
+          report.notes.push(`persist recipe ${recipePlan.recipeId} ${hyp.endpoint.pathTemplate}: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
+          continue
+        }
+        confirmedThisHypothesis = true
+        log('deterministic_engine.recipe_confirmed', `${recipePlan.recipeId} ${hyp.method} ${hyp.endpoint.pathTemplate} -> ${execution.result.verification.rule}`, {
+          intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: recipePlan.recipeId,
+          vulnClass: recipePlan.vulnClass, exchanges: execution.result.exchangeIds.length,
+        })
+        if (!recipePersistedId) continue
+        report.confirmed += 1
+        stats.confirmed += 1
+        report.confirmedPairs.push({ endpoint: hyp.endpoint.pathTemplate, vulnClass: recipePlan.vulnClass })
+        break
+      }
+      // Hard no-fallback assertion: a wired pair must have been planned above. If a future edit
+      // bypasses recipe planning this throws (and warns) instead of silently using the DSL.
+      assertNotRecipeWiredLegacyCall(parsed.data)
       let replay: ReplayVerificationResult
       try {
         replay = await (input.verify ?? verifyReplaySpec)({

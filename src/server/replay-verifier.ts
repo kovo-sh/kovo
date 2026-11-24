@@ -45,6 +45,7 @@ import {
 import type { ActorIdentity, AmbientAuth, ImpactStep, PersonaCredentialSource } from './oracle-invariants.ts'
 import { verifyReceipt } from './proof-receipt.ts'
 import type { ProofReceipt, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
+import { wiredRecipeForSpecKind } from './floor-recipes.ts'
 
 // Re-exported for tests and callers that only import the verifier.
 export {
@@ -3325,6 +3326,64 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
 
 export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<ReplayVerificationResult> {
   const result = await verifyReplaySpecInner(params)
+  return withVerificationTier(result)
+}
+
+/**
+ * Cut 3a no-fallback invariant at the *product floor* boundary.
+ *
+ * The deterministic engine runs a wired family through its recipe; immediately before its legacy
+ * verifier call it asserts the candidate was not recipe-wired. A future edit that bypasses planning
+ * therefore throws (and warns) instead of silently evaluating the DSL for a family the floor is
+ * supposed to confirm through a receipt.
+ *
+ * The legacy branch itself stays in `verifyReplaySpec` for two non-product callers: the capability
+ * harness in `scripts/` (which is maintenance-only and still synthesizes sql specs) and patch retest.
+ * Deleting it requires migrating those first; that dependency is recorded in
+ * `LEGACY_UNWIRED_SPECKINDS` and the Cut 3a report.
+ */
+export class RecipeWiredLegacyCallError extends Error {
+  readonly code = 'GUARDIAN_RECIPE_WIRED_LEGACY_CALL'
+  readonly specKind: string
+  readonly vulnClass: string
+
+  constructor(specKind: string, vulnClass: string) {
+    super(`verifyReplaySpec() received a recipe-wired spec kind ${specKind}/${vulnClass}; the floor must confirm it through its ProofReceipt recipe, not the legacy DSL verifier.`)
+    this.name = 'RecipeWiredLegacyCallError'
+    this.specKind = specKind
+    this.vulnClass = vulnClass
+  }
+}
+
+/** The class a spec claims, in the vocabulary the recipe table uses. */
+export function recipeClassOfSpec(spec: DeclarativeReplaySpec): string | null {
+  switch (spec.kind) {
+    case 'sql_boolean_diff':
+    case 'sql_time_diff':
+      return 'sqli'
+    case 'race_burst':
+      return 'race_double_spend'
+    case 'http_chain':
+      return typeof spec.category === 'string' ? spec.category : null
+    default:
+      return null
+  }
+}
+
+/** Throw (and warn) when a wired pair would be routed to the legacy verifier. */
+export function assertNotRecipeWiredLegacyCall(spec: DeclarativeReplaySpec | unknown): void {
+  if (!spec || typeof spec !== 'object') return
+  const kind = (spec as { kind?: unknown }).kind
+  if (typeof kind !== 'string') return
+  const vulnClass = recipeClassOfSpec(spec as DeclarativeReplaySpec)
+  const recipe = vulnClass ? wiredRecipeForSpecKind(kind, vulnClass) : null
+  if (!recipe) return
+  const error = new RecipeWiredLegacyCallError(kind, vulnClass ?? 'unknown')
+  process.emitWarning(error.message, { code: error.code })
+  throw error
+}
+
+function withVerificationTier(result: ReplayVerificationResult): ReplayVerificationResult {
   const verificationTier: VerificationTier | undefined = result.verdict === 'static_verified'
     ? 'static_verified'
     : result.verdict === 'confirmed' ? 'runtime_confirmed' : undefined
@@ -3332,6 +3391,8 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
 }
 
 export async function retestReplaySpec(params: VerifyReplaySpecParams): Promise<RetestReplayResult> {
+  // Retest is a regression replay of an already-persisted proof (reproduced vs fixed), not a new
+  // confirmation, so it re-evaluates the recorded spec through the same replay used today.
   const replay = await verifyReplaySpec(params)
   const verdict: RetestVerdict = replay.verdict === 'confirmed' || replay.verdict === 'static_verified'
     ? 'reproduced'
