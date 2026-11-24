@@ -209,7 +209,7 @@ test('the stored slice reaches the assignment brief, compact by default and full
     parentFacts: [fact],
     confirmed: [],
     detLeads: [],
-    maxTurns: 12,
+    maxTurns: 18,
   }) as string | undefined
 
   const compact = briefFor(baseStep)
@@ -452,10 +452,10 @@ test('schema rejection names the exact missing field and repeats the required sh
 })
 
 // ============================================================================
-// 7. Turn cap: single-step stays 12; race/multi-step/chain get 20–30
+// 7. Turn cap: single-step is 18 (raised from 12 after the held-out turn-limit audit); race/multi-step/chain get 20–30
 // ============================================================================
 
-test('race and multi-step assignments get 20–30 turns; single-step stays 12', () => {
+test('race and multi-step assignments get 20–30 turns; single-step stays bounded at 18', () => {
   const single = planAssignmentBudget({
     routes: ['/api/items/:id'],
     parentEvidenceIds: [],

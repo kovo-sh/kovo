@@ -1402,10 +1402,12 @@ export function computeStepMaxTurns(
 // the contract is testable without a live run.
 // ============================================================================
 
-/** Turn budget for a single-route / single-step assignment (settlement fires at N-2). */
-export const SINGLE_STEP_ASSIGNMENT_MAX_TURNS = 12
-/** Wall cap for a single-step assignment; a slot must turn over inside ~80 s. */
-export const SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS = 80_000
+/** Turn budget for a single-route / single-step assignment (settlement fires at N-2).
+ * Raised 12 -> 18 on 2026-11-24: 14 of 19 held-out `no_spec_submitted` targets hit the turn cap while
+ * still probing or repairing a spec (7 of them mid-`verify_replay_spec`), so 12 truncated real work. */
+export const SINGLE_STEP_ASSIGNMENT_MAX_TURNS = 18
+/** Wall cap for a single-step assignment; a slot must turn over inside ~120 s. */
+export const SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS = 120_000
 /** Multi-step/race assignments need more turns than a single probe (observed 20–29). */
 export const MULTI_STEP_ASSIGNMENT_MIN_TURNS = 20
 export const MULTI_STEP_ASSIGNMENT_MAX_TURNS = 30
