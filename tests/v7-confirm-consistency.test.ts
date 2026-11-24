@@ -144,11 +144,14 @@ test('confirm-consistency: a confirmed write without confirming evidence is reje
     verifiedInline: false,
     lastVerificationDiff: feedback('inconclusive', 'control failed'),
   })
-  const saved = storage.upsertChainFinding(run, asset.id, confirmedFinding(findingId, 'Unproven owner write', 'CWE-639'), spec.id, [ORIGIN])
-  assert.equal(saved.status, 'inconclusive')
-  const row = storage.db.select().from(findings).get()!
-  assert.equal(row.verificationClass, 'open_proof_gap')
-  assert.equal(storage.confirmationConflictCount(run.id), 1)
+  assert.throws(
+    () => storage.upsertChainFinding(run, asset.id, confirmedFinding(findingId, 'Unproven owner write', 'CWE-639'), spec.id, [ORIGIN]),
+    (error: unknown) => error instanceof Error
+      && (error as { code?: string }).code === 'invariant.confirmation_evidence',
+    'a confirmed write contradicted by its persisted diff must throw a typed InvariantError',
+  )
+  assert.equal(storage.db.select().from(findings).get(), undefined, 'the rejected write must not persist')
+  assert.equal(storage.confirmationConflictCount(run.id), 0)
 })
 
 test('confirm-consistency: a confirmed trial with an inconclusive losing sibling keeps only the confirmed one', async (t) => {
@@ -188,10 +191,26 @@ test('confirm-consistency: existing confirmed evidence (floor artifact, receipt,
 
   // Legacy floor row: no persisted spec diff yet, but the deterministic-engine event is its anchor.
   const floorId = '00000000-0000-4000-8000-000000000005'
+  // Legacy floor rows predate spec diffs; the event is the anchor. New floor confirmations persist
+  // a confirming diff (see the engine wiring test), which is the stricter path.
   const floorSpec = storage.createReplaySpec(run, assignment, floorId, specFor('Floor confirmed'), [ORIGIN])
-  storage.upsertChainFinding(run, asset.id, confirmedFinding(floorId, 'Floor confirmed', 'CWE-915'), floorSpec.id, [ORIGIN], {
+  // Simulate a pre-guard database: legacy rows predate both the trigger and persisted spec diffs.
+  storage.client.exec('DROP TRIGGER IF EXISTS findings_confirmation_evidence_insert')
+  storage.db.insert(findings).values({
+    id: floorId,
+    runId: run.id,
+    assetId: asset.id,
+    goalRevision: run.goalRevision,
+    checkId: 'chain',
+    caseId: floorId,
+    findingKind: 'multi_step_chain',
+    replaySpecId: floorSpec.id,
     provenance: 'floor',
-  })
+    verificationClass: 'runtime_confirmed',
+    sourceOrigins: [ORIGIN],
+    verificationTier: 'runtime_confirmed',
+    finding: confirmedFinding(floorId, 'Floor confirmed', 'CWE-915'),
+  }).run()
   storage.event(run.id, 'deterministic_engine.confirmed', 'floor anchor', { findingId: floorId })
   assert.equal(storage.enforceConfirmationEvidence(run.id, floorId, 'fixture recheck'), false)
   let floorRow = storage.db.select().from(findings).all().find(r => r.id === floorId)!

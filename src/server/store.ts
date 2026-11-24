@@ -154,6 +154,19 @@ export function verificationClassForFinding(
 }
 
 /**
+ * Typed precision-integrity failure. Thrown when a write would persist a `confirmed` finding
+ * without persisted evidence that satisfies the oracle (a confirming replay diff or ProofReceipt).
+ */
+export class InvariantError extends Error {
+  readonly code: string
+  constructor(code: string, message: string) {
+    super(message)
+    this.name = 'InvariantError'
+    this.code = code
+  }
+}
+
+/**
  * A persisted replay verdict that satisfies a runtime oracle. Zero-LLM `confirmed` is the only
  * runtime-confirming verdict: `static_verified` belongs to the advisory tier and must never back a
  * `runtime_confirmed` claim.
@@ -1334,6 +1347,51 @@ export class Store {
       );
     `)
     this.client.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`)
+    this.initConfirmationGuards()
+  }
+
+  /**
+   * Database-level confirmation guard (defence in depth for the store invariant).
+   *
+   * A row may only be `verification_class = 'runtime_confirmed'` + `status = 'confirmed'` while the
+   * same database holds confirming evidence: the linked replay spec's persisted diff verdict is
+   * `confirmed`, a verified OOB ProofReceipt, or a baseline review. Direct SQL writers (migrations,
+   * ad-hoc scripts, future call sites) are aborted with `invariant.confirmation_evidence` instead of
+   * persisting a confirmed claim contradicted by its own evidence.
+   */
+  private initConfirmationGuards() {
+    if (!this.tableExists('findings') || !this.tableExists('replay_specs')) return
+    const guard = (name: string, event: 'INSERT' | 'UPDATE OF verification_class, replay_spec_id, finding, verification_tier') => `
+      CREATE TRIGGER IF NOT EXISTS ${name}
+      BEFORE ${event} ON findings
+      WHEN NEW.verification_class = 'runtime_confirmed'
+        AND json_extract(NEW.finding, '$.status') = 'confirmed'
+        AND coalesce(NEW.finding_kind, '') <> 'baseline_check'
+        AND coalesce(NEW.verification_tier, json_extract(NEW.finding, '$.verificationTier'), '') <> 'baseline_confirmed'
+        AND coalesce(json_extract(NEW.finding, '$.verification'), '') NOT LIKE 'ProofReceipt%'
+        AND NOT EXISTS (
+          SELECT 1 FROM replay_specs s
+          WHERE s.id = NEW.replay_spec_id
+            AND json_extract(s.last_verification_diff, '$.verdict') = 'confirmed'
+        )
+        ${this.tableExists('events') ? `AND NOT EXISTS (
+          SELECT 1 FROM events e
+          WHERE e.run_id = NEW.run_id
+            AND e.kind = 'oob.receipt_confirmed'
+            AND json_extract(e.detail, '$.findingId') = NEW.id
+        )` : ''}
+      BEGIN
+        SELECT RAISE(ABORT, 'invariant.confirmation_evidence');
+      END;
+    `
+    try {
+      this.client.exec(guard('findings_confirmation_evidence_insert', 'INSERT'))
+      this.client.exec(guard('findings_confirmation_evidence_update', 'UPDATE OF verification_class, replay_spec_id, finding, verification_tier'))
+    } catch (error) {
+      // Never block startup on an old SQLite build that lacks json_extract; the store-level
+      // InvariantError remains authoritative.
+      if (!/json_extract|syntax error/i.test((error as Error).message)) throw error
+    }
   }
 
   /**
@@ -3998,6 +4056,32 @@ export class Store {
   }
 
   /**
+   * Hard write gate: a confirmed finding may only be persisted when its own persisted evidence is
+   * confirming (linked spec diff `confirmed`, a verified ProofReceipt, or a baseline review).
+   * Throws `InvariantError('invariant.confirmation_evidence')` otherwise, so an inconclusive result
+   * can never structurally persist as confirmed.
+   */
+  assertConfirmationEvidence(runId: string, input: {
+    findingId: string
+    replaySpecId?: string | null
+    verification?: string
+    findingKind?: Finding['findingKind']
+    verificationTier?: VerificationTier | null
+    provenance?: FindingProvenance | null
+  }): ConfirmationEvidence {
+    const evidence = this.confirmationEvidenceFor(runId, input)
+    if (!evidence.backed) {
+      throw new InvariantError(
+        'invariant.confirmation_evidence',
+        `Invariant: a confirmed finding requires confirming persisted evidence `
+          + `(linked spec diff 'confirmed' or a verified ProofReceipt); got `
+          + `${evidence.kind} verdict '${evidence.verdict ?? 'none'}' for ${input.findingId}.`,
+      )
+    }
+    return evidence
+  }
+
+  /**
    * Precision-integrity invariant: a finding may only be persisted `runtime_confirmed` while its
    * own persisted evidence satisfies the oracle. When a later verdict downgrades that evidence the
    * finding is demoted to `open_proof_gap`/`inconclusive`, a loud `finding.confirmation_conflict`
@@ -4388,6 +4472,16 @@ export class Store {
     }
     const verificationClass = verificationClassForFinding(mergedFinding, patch.verificationClass)
     assertConfirmedVerificationClass(mergedFinding.status, verificationClass)
+    if (mergedFinding.status === 'confirmed') {
+      this.assertConfirmationEvidence(run.id, {
+        findingId: existing.id,
+        replaySpecId: patch.replaySpecId ?? existing.replaySpecId,
+        verification: mergedFinding.verification,
+        findingKind: existing.findingKind,
+        verificationTier: mergedFinding.verificationTier ?? existing.verificationTier,
+        provenance: existing.provenance,
+      })
+    }
     const persistedFinding = {
       ...mergedFinding,
       provenance: existing.provenance,
@@ -4632,11 +4726,13 @@ export class Store {
       run.id, storedFinding, targetRow, options.provenance, parentFindingIds,
     )
     const canonicalSpecId = storedFinding.replaySpecId ?? replaySpecId
-    // Fail closed: never persist a confirmed claim whose own evidence is not confirming. This is the
-    // chokepoint for every chain finding write (inline replay, floor, receipt promotion).
-    let confirmationConflict: ConfirmationEvidence | null = null
+    const verificationClass = verificationClassForFinding(storedFinding, options.verificationClass)
+    assertConfirmedVerificationClass(storedFinding.status, verificationClass)
+    // Hard gate: never persist a confirmed claim whose own evidence is not confirming. This is the
+    // chokepoint for every chain finding write (inline replay, floor, receipt promotion). It throws
+    // a typed InvariantError so an inconclusive result structurally cannot become confirmed.
     if (storedFinding.status === 'confirmed') {
-      const evidence = this.confirmationEvidenceFor(run.id, {
+      this.assertConfirmationEvidence(run.id, {
         findingId: storedFinding.id,
         replaySpecId: canonicalSpecId,
         verification: storedFinding.verification,
@@ -4644,18 +4740,7 @@ export class Store {
         verificationTier: storedFinding.verificationTier,
         provenance: options.provenance ?? targetRow?.provenance ?? null,
       })
-      if (evidence.contradicted) {
-        confirmationConflict = evidence
-        storedFinding.status = 'inconclusive'
-        storedFinding.verificationTier = undefined
-        storedFinding.confidence = 'low'
-        storedFinding.reason = `Confirmation conflict: confirmed claim persisted without confirming `
-          + `evidence (${evidence.kind}: ${evidence.verdict ?? 'no verdict'}).`
-          + (storedFinding.reason ? ` Prior: ${storedFinding.reason}` : '')
-      }
     }
-    const verificationClass = verificationClassForFinding(storedFinding, options.verificationClass)
-    assertConfirmedVerificationClass(storedFinding.status, verificationClass)
     const persistedFinding = {
       ...storedFinding,
       provenance,
@@ -4670,9 +4755,7 @@ export class Store {
       ...sourceOrigins,
     ])]
 
-    const verificationTier: VerificationTier | null = confirmationConflict
-      ? null
-      : storedFinding.verificationTier ??
+    const verificationTier: VerificationTier | null = storedFinding.verificationTier ??
         (storedFinding.status === 'static_verified'
           ? 'static_verified'
           : storedFinding.status === 'confirmed'
@@ -4752,26 +4835,6 @@ export class Store {
         provenance,
         verificationClass,
       })
-    if (confirmationConflict) {
-      const conflicts = this.confirmationConflictCount(run.id) + 1
-      this.event(
-        run.id,
-        'finding.confirmation_conflict',
-        `Rejected confirmed finding "${storedFinding.title.slice(0, 160)}" (${storedFinding.id}): `
-          + `persisted evidence is ${confirmationConflict.kind} (${confirmationConflict.verdict ?? 'no verdict'}).`,
-        {
-          findingId: storedFinding.id,
-          previousStatus: 'confirmed',
-          previousVerificationClass: 'runtime_confirmed',
-          replaySpecId: confirmationConflict.replaySpecId,
-          evidenceKind: confirmationConflict.kind,
-          evidenceVerdict: confirmationConflict.verdict,
-          provenance,
-          cause: 'confirmed write without confirming evidence',
-          conflictsForRun: conflicts,
-        },
-      )
-    }
     return persistedFinding
   }
 

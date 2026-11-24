@@ -50,6 +50,18 @@ if grep -q 'evaluateDispatchStop(' src/server/execution.ts \
   fail=1
 fi
 
+# Confirmation-consistency invariant (precision integrity): a confirmed finding may only persist
+# while its own persisted evidence confirms. Pins the store gate + DB trigger + demotion path so an
+# inconclusive result can never be persisted as a confirmed claim.
+step "confirmation-consistency invariant"
+if grep -q "invariant.confirmation_evidence" src/server/store.ts \
+   && grep -q 'findings_confirmation_evidence_insert' src/server/store.ts \
+   && grep -q 'enforceConfirmationEvidence(' src/server/store.ts \
+   && node --test tests/v7-confirm-consistency.test.ts >/dev/null 2>&1; then :; else
+  echo "FAILED: confirmation-consistency invariant (confirmed claim without confirming evidence)" >&2
+  fail=1
+fi
+
 # Fast contract invariants: planner/dedupe/orchestration behavior that engine-port broke.
 run "contract invariants" node --test \
   tests/v4-m7-orch.test.ts \
