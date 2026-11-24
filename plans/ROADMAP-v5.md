@@ -679,3 +679,26 @@ Next: `sqli-quota` fixes the substring bug and adds an **evidence-based** quota 
 Reservations confirmed on dev: acme `project-search-sqli` (rank 19 > quota 17) and `reflected-search-xss` (rank 11 > 10). Held-out: acme `sqli` (rank 22) and `xss` (rank 11) both confirmed. Opsportal reserved `sqli` (rank 33) and still did not confirm — reported, not hidden. xben 25/25; held-out-saas 20/20 + 20/20 patches.
 
 **Known follow-up (outside that lease):** the endpoint loader drops `endpoint_params.source`, so recon's `inferred_*:sensitive` tag is not readable by the engine; the reservation currently keys on the engine's own harvest differential (same paired evidence). A one-line loader change can wire the persisted tag once that file's lease frees.
+
+### 2026-11-24 — definitive held-out unified: 29/58 (+1) but precision 50% — the blocker is now agent-only over-claims
+
+First agentic run on the post-quota tree (`/tmp/heldout-unified-definitive`, seed 1000042, 600 s, K=6, kept dirs):
+
+| cell | recall | precision | unmatched |
+|---|---|---|---|
+| acme | 12/22 | 100% | 0 |
+| shopflow | 10/19 | **83.3%** | 2 |
+| opsportal | 7/17 | **87.5%** | 1 |
+| **total** | **29/58 (50.0%)** | — | **3** |
+
+Lift is **+1 over the 28/58 floor**. `scripts/audit-confirmation-consistency.ts` reports **0 confirmation conflicts** on all three cells (12/9/12 confirmed, all `evidenceKinds=spec`), so these are **semantic over-claims, not evidence bugs** — the invariant is holding.
+
+All four over-claim rows are `agent_only` provenance:
+1. **opsportal** `POST /api/journals/filter` CWE-20 — `control=200 probe=500`; a bare status divergence confirmed injection.
+2. **opsportal** `GET /api/me` CWE-269 — viewer of tenant `9ca676` reassigning a `6ea2e7` tenant ticket (`viewerWrite=200`, `anonAssign=401`).
+3. **shopflow** `/api/v1/stores/:storeId/catalog/:id` CWE-639 — anon `memberNote` equals the victim owner's (the public-catalog family).
+4. **shopflow** `POST /purchases/:order/charges` CWE-840 — `payments 6 → 8` with a second `200`.
+
+Actions: `status-diff-guard` closes the 5xx-only confirmation loophole generally (a status-only 2xx→5xx divergence may never confirm; injection needs a DB/error fingerprint, boolean/timing arm, or OOB callback, while payload-induced 5xx keeps counting as *probe* evidence). `agent-fp-triage` makes a truth ruling on 1 and 4 from the fixture source (genuine / unintended / over-claim) and forbids silent truth inflation. 3 is already owned by `catalog-public`.
+
+**Certification:** lift claims stay halted. Worst-run precision is the gate, and it is 83.3% on held-out until these are ruled and closed.
