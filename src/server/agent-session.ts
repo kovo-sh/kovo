@@ -74,6 +74,7 @@ import { listSkills, listSkillTags, loadSkill, searchSkills, selectPreInjectionS
 import type { DifferentialProbeClass, SurfaceWordlistName } from './surface-engine.ts'
 import type { SastEngine } from './worker-backend.ts'
 import type { MissionKind } from './assignment-brief.ts'
+import { renderSettlementSpecDirective } from './assignment-brief.ts'
 
 export const defaultInlineToolOutputBytes = 24 * 1024
 export const maxInlineToolOutputBytes = 64 * 1024
@@ -139,6 +140,7 @@ export function settlementNudgeMessage(input: {
   turn: number
   maxTurns: number
   proofTools?: readonly string[]
+  specDirective?: string
 }): string {
   const typed = (input.proofTools ?? []).filter(name => name.trim())
   const proofPath = typed.length
@@ -147,6 +149,7 @@ export function settlementNudgeMessage(input: {
   return [
     `[GUARDIAN SETTLEMENT NUDGE — Turn ${input.turn}/${input.maxTurns}]`,
     `Hard settlement starts at turn ${settlementNudgeTurnFor(input.maxTurns)} (N-2). ${proofPath}, or call complete_intent with status (proved | ruled_out | blocked | partial) and a concise summary. Do not start new exploration.`,
+    ...(input.specDirective ? [input.specDirective] : []),
   ].join(' ')
 }
 
@@ -155,6 +158,7 @@ export function settlementBannerMessage(input: {
   turnsUsed: number
   maxTurns: number
   proofTools?: readonly string[]
+  specDirective?: string
 }): string {
   const typed = (input.proofTools ?? []).filter(name => name.trim())
   const proofPath = typed.length
@@ -164,6 +168,7 @@ export function settlementBannerMessage(input: {
     `[GUARDIAN SETTLEMENT NOTICE — Turn ${input.turnsUsed}/${input.maxTurns}]`,
     'You have reached the 85% settlement threshold. Network probing tools (request_http, request_http_batch, request_http_race, browser_visit, probe_surface, probe_differential, run_safe_templates, probe_websocket) are now revoked; graph/query tools and guardian_verify remain available until the final turn.',
     `Use your remaining turns ONLY to: (1) finish offline analysis with derive_evidence/analyze_artifact/run_sast_scan/run_offline_script or query recorded facts/exchanges, (2) commit unrecorded facts via record_fact and 3-state closure entries via record_coverage (with enforcingControl or proofGapReason), (3) ${proofPath} and verify with guardian_verify, and (4) call complete_intent with your final status and summary.`,
+    ...(input.specDirective ? [input.specDirective] : []),
   ].join(' ')
 }
 
@@ -181,14 +186,206 @@ export const AGENTIC_CONTRACT_LINES = [
 const SETTLEMENT_REVOKED_TOOLS = new Set(['request_http', 'request_http_batch', 'request_http_race', 'requestHttpRace', 'browser_visit', 'browser_session', 'probe_surface', 'probe_differential', 'run_safe_templates', 'probe_websocket'])
 const SETTLEMENT_WRAPUP_TOOLS = new Set(['guardian_verify', 'verify_replay_spec', 'search_facts', 'search_exchanges', 'get_exchange', 'read_peer_trace', 'expand_digest', 'board_read', 'query_cves', 'load_skill'])
 
+/**
+ * Tools that count as route evidence (the worker actually requested a target route) and as spec
+ * submission (a persisted/attempted replay spec). Kept separate so a proof-gap settlement is only
+ * required when a route was really probed, never for a pure offline/static assignment.
+ */
+export const ROUTE_EVIDENCE_TOOLS: ReadonlySet<string> = new Set([
+  'request_http', 'request_http_batch', 'request_http_race', 'requestHttpRace', 'browser_visit',
+  'browser_session', 'probe_surface', 'probe_differential', 'run_safe_templates', 'probe_websocket',
+])
+export const SPEC_SUBMISSION_TOOLS: ReadonlySet<string> = new Set([
+  'guardian_verify', 'verify_replay_spec', 'propose_chain_finding', 'update_proposed_finding',
+  'prove_authz_read_diff', 'prove_state_mutation_diff', 'prove_business_invariant', 'prove_canary_or_redirect',
+])
+
+/**
+ * Offline/analysis tools paused during settlement while a probed route still has no spec. The
+ * reserved wrap-up turn is for one guardian_verify call or an explicit coded proof gap, not more
+ * analysis. Network tools are already revoked above; verification/closure tools stay available.
+ */
+const SETTLEMENT_SPEC_PAUSED_TOOLS = new Set([
+  'derive_evidence', 'analyze_artifact', 'run_sast_scan', 'run_offline_script',
+  'query_endpoints', 'query_program_graph', 'query_facts', 'query_findings',
+  'list_second_order_canaries', 'board_post', 'suggest_candidate_host',
+])
+
+/**
+ * Machine-readable proof-gap codes. A gap carrying one of these is a deliberate, auditable reason;
+ * a free-text-only gap cannot satisfy the settlement spec obligation (it is still recorded).
+ */
+export const SPEC_PROOF_GAP_CODES = [
+  'no_spec_shape',
+  'no_authenticated_persona',
+  'baseline_empty',
+  'no_control_path',
+  'runtime_unavailable',
+  'tier_blocked',
+  'out_of_scope',
+  'no_reproducible_signal',
+] as const
+export type SpecProofGapCode = typeof SPEC_PROOF_GAP_CODES[number]
+
+/** Extract a leading machine-readable proof-gap code, if present (e.g. `no_spec_shape: step request...`). */
+export function parseProofGapCode(reason: string | undefined | null): SpecProofGapCode | null {
+  const value = (reason ?? '').trim().toLowerCase()
+  if (!value) return null
+  const head = value.split(/[^a-z0-9_]+/, 1)[0] ?? ''
+  return (SPEC_PROOF_GAP_CODES as readonly string[]).includes(head) ? head as SpecProofGapCode : null
+}
+
+/** Route evidence captured from the first successful probe: method + path template + param names. */
+export interface SpecRouteEvidence {
+  method: string
+  path: string
+  params: readonly string[]
+  origin?: string
+}
+
+export interface SpecProofGapEntry {
+  reason: string
+  code: SpecProofGapCode | null
+  category?: string
+}
+
+export interface SpecSubmissionSnapshot {
+  /** Successful network probes in this session. */
+  probes: number
+  /** Last probed route (method/path/param names only). */
+  route?: SpecRouteEvidence
+  /** Accepted guardian_verify / verify_replay_spec / finding-spec submissions. */
+  specAttempts: number
+  /** Coded proof-gap entries (machine-readable reason) recorded via record_coverage. */
+  codedProofGaps: number
+  /** Every proof-gap entry, coded or free-text. */
+  proofGaps: readonly SpecProofGapEntry[]
+  /** complete_intent rejections caused by a missing spec/gap. */
+  required: number
+}
+
+const SPEC_ROUTE_PATH_RE = /^[A-Za-z0-9._~\-/[\]{}:@!$&()*+,;=%]*$/
+
+function cleanSpecRoute(input: { method?: string; pathAndQuery?: string; origin?: string }): SpecRouteEvidence | undefined {
+  const method = (input.method ?? '').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 10)
+  const raw = (input.pathAndQuery ?? '').trim()
+  if (!method || !raw) return undefined
+  const [pathPart, query = ''] = raw.split('?', 2)
+  const path = (pathPart ?? '/').slice(0, 160)
+  if (!path.startsWith('/') || !SPEC_ROUTE_PATH_RE.test(path)) return undefined
+  const params = [...new Set(query.split('&')
+    .map(pair => (pair.split('=', 1)[0] ?? '').replace(/[^A-Za-z0-9_.:[\]-]/g, ''))
+    .filter(Boolean))].slice(0, 4)
+  const origin = (input.origin ?? '').split(/[?#]/, 1)[0]?.slice(0, 120)
+  return { method, path, params, ...(origin && /^https?:\/\//i.test(origin) ? { origin } : {}) }
+}
+
+/**
+ * Per-assignment spec-submission ledger. Small, mutable and dependency-free so the tool layer and
+ * the settlement runner share one source of truth without touching session storage.
+ */
+export class SpecSubmissionTracker {
+  private state: SpecSubmissionSnapshot = { probes: 0, specAttempts: 0, codedProofGaps: 0, proofGaps: [], required: 0 }
+
+  noteProbe(): void {
+    this.state = { ...this.state, probes: this.state.probes + 1 }
+  }
+
+  noteRoute(input: { method?: string; pathAndQuery?: string; origin?: string }): void {
+    const route = cleanSpecRoute(input)
+    if (route) this.state = { ...this.state, route }
+  }
+
+  noteSpecAttempt(): void {
+    this.state = { ...this.state, specAttempts: this.state.specAttempts + 1 }
+  }
+
+  noteProofGap(input: { proofGapReason?: string; category?: string }): void {
+    const reason = (input.proofGapReason ?? '').trim()
+    if (reason.length < 5) return
+    const entry: SpecProofGapEntry = {
+      reason: reason.slice(0, 600),
+      code: parseProofGapCode(reason),
+      ...(input.category ? { category: input.category } : {}),
+    }
+    this.state = {
+      ...this.state,
+      proofGaps: [...this.state.proofGaps, entry].slice(-12),
+      codedProofGaps: this.state.codedProofGaps + (entry.code ? 1 : 0),
+    }
+  }
+
+  noteRequired(): number {
+    const required = this.state.required + 1
+    this.state = { ...this.state, required }
+    return required
+  }
+
+  snapshot(): SpecSubmissionSnapshot {
+    return {
+      ...this.state,
+      proofGaps: [...this.state.proofGaps],
+      ...(this.state.route ? { route: { ...this.state.route, params: [...this.state.route.params] } } : {}),
+    }
+  }
+}
+
+/** A probed route with neither a spec attempt nor a coded proof gap still owes a proof. */
+export function specSubmissionPending(snapshot: SpecSubmissionSnapshot): boolean {
+  return snapshot.probes > 0 && snapshot.specAttempts === 0 && snapshot.codedProofGaps === 0
+}
+
+/** Settlement must refuse a leaning conclusion when the proof obligation is still open. */
+export function specSubmissionRequiredFor(snapshot: SpecSubmissionSnapshot): boolean {
+  return specSubmissionPending(snapshot)
+}
+
+export type SpecSubmissionFunnelStage =
+  | 'no_route_hit'
+  | 'confirmed'
+  | 'verify_called'
+  | 'open_proof_gap'
+  | 'no_spec_submitted'
+
+/**
+ * Event-derived funnel classification for one target. A coded or free-text `proofGapReason` is
+ * `open_proof_gap` (the agent said why), distinct from `no_spec_submitted` (the agent skipped).
+ * Kept pure so the held-out autopsy and tests share one definition.
+ */
+export function classifySpecSubmission(input: {
+  routeHit: boolean
+  specSubmitted?: boolean
+  confirmed?: boolean
+  proofGapReason?: string | null
+}): SpecSubmissionFunnelStage {
+  if (!input.routeHit) return 'no_route_hit'
+  if (input.confirmed) return 'confirmed'
+  if (input.specSubmitted) return 'verify_called'
+  if ((input.proofGapReason ?? '').trim().length > 0) return 'open_proof_gap'
+  return 'no_spec_submitted'
+}
+
+
 /** Pure settlement gate shared by the tool hook and tests. */
-export function settlementToolBlock(input: { name: string; settling: boolean; turnsUsed: number; maxTurns: number }): string | undefined {
+export function settlementToolBlock(input: {
+  name: string
+  settling: boolean
+  turnsUsed: number
+  maxTurns: number
+  /** True when a probed route still has no spec attempt and no coded proof gap. */
+  specPending?: boolean
+  /** Pre-rendered settlement proof obligation naming the route + smallest spec. */
+  specDirective?: string
+}): string | undefined {
   if (!input.settling) return undefined
   if (SETTLEMENT_REVOKED_TOOLS.has(input.name)) {
     return `Settlement wrap-up active (${input.turnsUsed}/${input.maxTurns} turns). ${input.name} is disabled during settlement. Finalize offline analysis, commit record_fact / record_coverage / propose_chain_finding, and call complete_intent.`
   }
   if (input.turnsUsed >= input.maxTurns && SETTLEMENT_WRAPUP_TOOLS.has(input.name)) {
     return `Final settlement turn (${input.turnsUsed}/${input.maxTurns}). ${input.name} is disabled on the final turn; commit results and call complete_intent.`
+  }
+  if (input.specPending && SETTLEMENT_SPEC_PAUSED_TOOLS.has(input.name)) {
+    return `${input.specDirective ? `${input.specDirective} ` : ''}${input.name} is paused during settlement while the proof obligation is open; call guardian_verify (or record a coded record_coverage proof gap) before complete_intent.`
   }
   return undefined
 }
@@ -566,6 +763,33 @@ export function formatReplaySpecValidationIssues(
   const head = missing.length ? `Missing required field(s): ${missing.join(', ')}.\n` : ''
   return `${head}${lines.join('\n')}\nRequired shape: ${GUARDIAN_VERIFY_SPEC_SHAPE}`
 }
+
+/**
+ * Settlement proof obligation line (route + method + params + the smallest valid spec). Rendered
+ * only for the settlement nudge/banner and the reserved-turn block, never the byte-capped packet.
+ */
+export function settlementSpecDirective(route?: SpecRouteEvidence): string {
+  return renderSettlementSpecDirective(
+    route ? { method: route.method, path: route.path, params: route.params, ...(route.origin ? { origin: route.origin } : {}) } : undefined,
+    GUARDIAN_VERIFY_SPEC_SHAPE,
+    SPEC_PROOF_GAP_CODES,
+  )
+}
+
+/**
+ * complete_intent repair message for a leaning conclusion with route evidence but no spec and no
+ * coded proof gap. Names the exact missing field so the next turn is a one-shot repair.
+ */
+export function specSubmissionRequiredMessage(route?: SpecRouteEvidence): string {
+  const routeText = route ? ` for ${route.method} ${route.path}${route.params.length ? ` param=${route.params.join('|')}` : ''}` : ''
+  const codes = SPEC_PROOF_GAP_CODES.join(', ')
+  return [
+    `complete_intent rejected (agent.spec_submission_required): missing required field \`proofGapReason\` or a submitted replay spec${routeText}.`,
+    `You probed a route but never submitted a guardian_verify/verify_replay_spec result, so a proved/partial conclusion is unsupported.`,
+    `Repair now: call guardian_verify${routeText} (DeclarativeReplaySpec: ${GUARDIAN_VERIFY_SPEC_SHAPE}), or call record_coverage(status="needs_follow_up", proofGapReason="<code>") with one machine-readable code from: ${codes}.`,
+  ].join(' ')
+}
+
 
 const GUARDIAN_VERIFY_TOOL_DESCRIPTION_BASE =
   'Run a short TypeScript or Python verification script through Guardian’s Layer-1 RPC bridge and the independent transcript oracle. Confirmation requires two fresh-session runs whose signed exchanges satisfy every claimed assertion; the script’s stdout is never evidence. Prefer this over JSON-only proof specs: use ctx.http/ctx.browser/ctx.oob for setup, control vs probe requests, and assertions, then return ctx.result({ title, claims }). A `scriptPath` refers to a file you wrote into the workspace.'
@@ -2313,12 +2537,20 @@ const browserInteractiveActionSchema = obj({
   timeoutMs: opt(int({ minimum: 100, maximum: 15000 })),
 })
 
+export interface SpecSubmissionToolOptions {
+  /** Shared ledger; when omitted, spec enforcement and settlement reservation stay inert. */
+  tracker?: SpecSubmissionTracker
+  /** Called once per rejected simple conclusion so the caller can emit `agent.spec_submission_required`. */
+  onRequired?: (info: { status: string; count: number; route?: SpecRouteEvidence }) => void
+}
+
 export function buildWorkerTools(
   handlers: WorkerToolHandlers,
   scrub: (value: string) => string,
   rootSignal: AbortSignal,
   inlineLimit: number,
   onCompleteIntent: (completion: IntentCompletion) => void,
+  specSubmission?: SpecSubmissionToolOptions,
 ): ToolRegistration[] {
   const tools: ToolRegistration[] = []
   const outputLimits = { maxBytes: inlineLimit }
@@ -2334,6 +2566,8 @@ export function buildWorkerTools(
   ) => {
     try {
       const result = await fn()
+      if (SPEC_SUBMISSION_TOOLS.has(toolName)) specSubmission?.tracker?.noteSpecAttempt()
+      if (ROUTE_EVIDENCE_TOOLS.has(toolName)) specSubmission?.tracker?.noteProbe()
       const text = await formatToolOutput(result, toolName, scrub, inlineLimit, handlers.spillOutput, signal)
       return {
         output: [{ type: 'text' as const, text }],
@@ -2388,7 +2622,14 @@ export function buildWorkerTools(
       outputLimits,
       execute: (args, _api, ctx) => {
         const signal = combineSignal(ctx.abortSignal)
-        return wrapExec('request_http', () => fn(normalizeHttpArgs(args), signal), signal)
+        return wrapExec('request_http', () => fn(normalizeHttpArgs(args), signal).then(result => {
+          specSubmission?.tracker?.noteRoute({
+            method: args.method,
+            pathAndQuery: args.pathAndQuery,
+            ...(args.origin ? { origin: args.origin } : {}),
+          })
+          return result
+        }), signal)
       },
     }))
   }
@@ -3140,7 +3381,7 @@ export function buildWorkerTools(
         'Strict 3-State Closure Discipline (SPEC-v3 §4.5C):',
         '- status="reported": link to a confirmed or static_verified finding via linkedFindingId.',
         '- status="ruled_out": REQUIRES non-empty enforcingControl quoting the exact file:line in /repos or exact negative-control exchangeId proving the control runs on the attacker path (generic claims are rejected).',
-        '- status="needs_follow_up": REQUIRES non-empty proofGapReason explaining the exact blocker (e.g. missing Tier 2 persona, Tier 3 approval, or local-lab runtime) so the Coordinator Planner can follow up or surface it in Open Proof Gaps.',
+        '- status="needs_follow_up": REQUIRES a non-empty machine-readable proofGapReason (e.g. no_spec_shape, no_authenticated_persona, baseline_empty) explaining the exact blocker so the Coordinator Planner and the held-out autopsy can distinguish an honest gap from a silent skip.',
       ].join(' '),
       parameters: obj({
         origin: str({ maxLength: 256 }),
@@ -3148,7 +3389,7 @@ export function buildWorkerTools(
         status: oneOf(coverageStatuses),
         summary: str({ maxLength: 600 }),
         enforcingControl: opt(str({ description: 'REQUIRED when status="ruled_out": exact file:line in /repos or exact negative-control exchangeId.', maxLength: 500 })),
-        proofGapReason: opt(str({ description: 'REQUIRED when status="needs_follow_up": concrete reason the lead could not be confirmed or ruled out.', maxLength: 600 })),
+        proofGapReason: opt(str({ description: `REQUIRED when status="needs_follow_up": machine-readable code plus detail (${SPEC_PROOF_GAP_CODES.join('|')}) explaining the exact blocker.`, maxLength: 600 })),
         linkedFindingId: opt(str({ description: 'Finding ID when status="reported".', maxLength: 64 })),
       }),
       replay: 'safe',
@@ -3169,7 +3410,7 @@ export function buildWorkerTools(
             isError: true,
             output: [{
               type: 'text' as const,
-              text: 'record_coverage validation failed: status="needs_follow_up" REQUIRES a non-empty proofGapReason explaining what is needed to confirm or rule out this lead.',
+              text: `record_coverage validation failed: status="needs_follow_up" REQUIRES a non-empty proofGapReason explaining what is needed to confirm or rule out this lead. Use a machine-readable code so the settlement proof gap is auditable: ${SPEC_PROOF_GAP_CODES.join(', ')}.`,
             }],
           }
         }
@@ -3178,7 +3419,12 @@ export function buildWorkerTools(
           enforcingControl: args.enforcingControl?.trim() || undefined,
           proofGapReason: args.proofGapReason?.trim() || undefined,
           linkedFindingId: args.linkedFindingId?.trim() || undefined,
-        }, signal), signal)
+        }, signal).then(result => {
+          if (args.status === 'needs_follow_up' && args.proofGapReason?.trim()) {
+            specSubmission?.tracker?.noteProofGap({ proofGapReason: args.proofGapReason, category: args.category })
+          }
+          return result
+        }), signal)
       },
     }))
   }
@@ -3531,6 +3777,19 @@ export function buildWorkerTools(
       outputLimits,
       execute: async (args, _api, ctx) => {
         const signal = combineSignal(ctx.abortSignal)
+        const snapshot = specSubmission?.tracker?.snapshot()
+        if (snapshot && (args.status === 'proved' || args.status === 'partial') && specSubmissionRequiredFor(snapshot)) {
+          const count = specSubmission?.tracker?.noteRequired() ?? 0
+          specSubmission?.onRequired?.({
+            status: args.status,
+            count,
+            ...(snapshot.route ? { route: snapshot.route } : {}),
+          })
+          return {
+            isError: true,
+            output: [{ type: 'text' as const, text: specSubmissionRequiredMessage(snapshot.route) }],
+          }
+        }
         const completion: IntentCompletion = {
           status: args.status,
           summary: scrub(args.summary),
@@ -3703,6 +3962,11 @@ export interface RunAgentSessionOptions {
   onTurn?: (turn: number, maxTurns: number, settling: boolean) => void
   /** Executed before each model request; return extra user messages (e.g. a <board_delta> block). */
   onTurnStart?: (turn: number, maxTurns: number) => { messages?: readonly string[] } | void
+  /**
+   * Called when complete_intent is rejected because a probed route has neither a replay spec nor a
+   * machine-readable record_coverage proof gap. Wire this to `agent.spec_submission_required`.
+   */
+  onSpecSubmissionRequired?: (info: { status: string; count: number; route?: SpecRouteEvidence }) => void
   onProfileSuccess?: (profileId: string) => void
   onProfileFailure?: (profileId: string, err: string, hard: boolean) => void
   /** Opt-in agentic trace writer (see createAgentTrace). Nothing is recorded when omitted. */
@@ -3718,6 +3982,10 @@ export interface AgentSessionResult {
   nudgesUsed: number
   completion?: IntentCompletion
   status: 'completed' | 'turn_limit' | 'nudged_out'
+  /** complete_intent rejections for a leaning conclusion without spec or coded proof gap. */
+  specSubmissionRequired?: number
+  /** Final spec-submission ledger (route evidence / spec attempts / coded gaps). */
+  specSubmission?: SpecSubmissionSnapshot
 }
 
 export async function runAgentSession(options: RunAgentSessionOptions): Promise<AgentSessionResult> {
@@ -3795,6 +4063,13 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   let nudgesUsed = 0
   let settled = false
   let completion: IntentCompletion | undefined
+  /** Shared with the tool layer: route evidence, spec attempts and coded proof gaps. */
+  const specTracker = new SpecSubmissionTracker()
+  const specSnapshot = () => specTracker.snapshot()
+  const specDirectiveForRun = () => {
+    const snapshot = specSnapshot()
+    return specSubmissionPending(snapshot) ? settlementSpecDirective(snapshot.route) : undefined
+  }
 
   const registeredProofTools = handlers.guardian_verify
     ? ['guardian_verify']
@@ -3833,6 +4108,10 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     options.signal,
     inlineLimit,
     result => { completion = result },
+    {
+      tracker: specTracker,
+      ...(options.onSpecSubmissionRequired ? { onRequired: options.onSpecSubmissionRequired } : {}),
+    },
   )
   // Extra tools have unknown semantics: keep them sequential so a round that calls one never races.
   const allTools: ToolRegistration[] = [
@@ -3855,16 +4134,17 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           role: 'user' as const, content, timestamp: Date.now(),
         }))
         const settlingNow = isSettling()
+        const specDirective = specDirectiveForRun()
         if (settlingNow) {
           extraMessages.push({
             role: 'user' as const,
-            content: settlementBannerMessage({ turnsUsed, maxTurns, proofTools: registeredProofTools }),
+            content: settlementBannerMessage({ turnsUsed, maxTurns, proofTools: registeredProofTools, ...(specDirective ? { specDirective } : {}) }),
             timestamp: Date.now(),
           })
         } else if (handlers.complete_intent && turnsUsed + 1 === settlementNudgeTurn) {
           extraMessages.push({
             role: 'user' as const,
-            content: settlementNudgeMessage({ turn: turnsUsed + 1, maxTurns, proofTools: registeredProofTools }),
+            content: settlementNudgeMessage({ turn: turnsUsed + 1, maxTurns, proofTools: registeredProofTools, ...(specDirective ? { specDirective } : {}) }),
             timestamp: Date.now(),
           })
         }
@@ -3946,7 +4226,15 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     hook(ToolTask, {
       beforeTool(call) {
         if (!call.parent) toolStartedAt.set(call.id, Date.now())
-        const block = settlementToolBlock({ name: call.name, settling: isSettling(), turnsUsed, maxTurns })
+        const snapshot = specSnapshot()
+        const specPending = specSubmissionPending(snapshot)
+        const block = settlementToolBlock({
+          name: call.name,
+          settling: isSettling(),
+          turnsUsed,
+          maxTurns,
+          ...(specPending ? { specPending, specDirective: settlementSpecDirective(snapshot.route) } : {}),
+        })
         return block ? { block } : undefined
       },
       afterTool(call, result) {
@@ -4049,6 +4337,8 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         nudgesUsed,
         completion,
         status: 'completed',
+        specSubmissionRequired: specTracker.snapshot().required,
+        specSubmission: specTracker.snapshot(),
       }
     }
 
@@ -4061,6 +4351,8 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         settled,
         nudgesUsed,
         status: 'turn_limit',
+        specSubmissionRequired: specTracker.snapshot().required,
+        specSubmission: specTracker.snapshot(),
       }
     }
 
