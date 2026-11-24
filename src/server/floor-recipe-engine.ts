@@ -215,6 +215,45 @@ function planBooleanRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
     args: {} as FloorRecipeArgs,
   }
   if (!hyp.param) return { ...sketch, skipReason: 'sqli hypothesis has no injected parameter' }
+  // Time-based blind SQLi: the engine schedules this probe after a response-identical boolean arm.
+  // The recipe sends a benign control and the conditional-delay probe; the receipt `timing` rule
+  // decides (>3x separation against a <1s control), so a status change is never the signal.
+  const timingHit = input.probe.anomalies.find(anomaly => anomaly.type === 'sql_time_differential')
+  if (timingHit) {
+    const baseline = hyp.baselineValue ?? (typeof timingHit.baselineValue === 'string' ? timingHit.baselineValue : '1')
+    const dialectRaw = String(timingHit.dialect ?? '')
+    const dialect = ['mysql', 'postgres', 'sqlite', 'mssql'].includes(dialectRaw) ? dialectRaw : 'postgres'
+    const delayMs = Math.max(1500, Math.min(3000, Number(timingHit.delayMs) || 2500))
+    const seconds = (delayMs / 1000).toFixed(2)
+    const probeValue = dialect === 'mysql'
+      ? `${baseline}' AND SLEEP(${seconds})-- -`
+      : dialect === 'postgres'
+        ? `${baseline}' AND (SELECT 1 FROM pg_sleep(${seconds})) IS NULL-- -`
+        : dialect === 'mssql'
+          ? `${baseline}'; WAITFOR DELAY '0:0:${Math.max(1, Math.round(delayMs / 1000))}'-- -`
+          : `${baseline}' AND 1=LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(${delayMs * 25_000}))))-- -`
+    const control = requestFromInjection({ hyp, value: baseline })
+    const probe = requestFromInjection({ hyp, value: probeValue })
+    if (!control || !probe) return { ...sketch, skipReason: 'sqli timing injection point could not be expressed as a recipe request' }
+    const args: BooleanOrTimingArgs = {
+      mode: 'timing',
+      origin: hyp.endpoint.origin,
+      method: probe.method,
+      pathAndQuery: probe.pathAndQuery,
+      controlPathAndQuery: control.pathAndQuery,
+      probePathAndQuery: probe.pathAndQuery,
+      param: hyp.param.name,
+      vulnClass: 'sqli',
+      receiptClass: 'blind_sqli',
+      actor: floorActorFor(hyp.ownerPersona ?? null, input.personas),
+      baselineValue: baseline,
+      quoteStyle: 'single',
+      ...(control.jsonBody !== undefined ? { controlJsonBody: control.jsonBody } : {}),
+      ...(probe.jsonBody !== undefined ? { probeJsonBody: probe.jsonBody } : {}),
+      ...(input.headers ?? hyp.headers ? { headers: { ...(hyp.headers ?? {}), ...(input.headers ?? {}) } } : {}),
+    }
+    return { ...sketch, args, paramLocation: hyp.location ?? hyp.param.location }
+  }
   const hit = input.probe.anomalies.find(anomaly => anomaly.type === 'boolean_differential')
   // Prefer the operand the probe actually grounded (a literal from the target's own rows, or the
   // empty term of the tautology pair). A hypothesis default such as `1` is only the last resort.

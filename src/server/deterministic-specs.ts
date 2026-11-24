@@ -1976,6 +1976,71 @@ function synthAuthProtocol(hyp: EngineHypothesis, result: DifferentialResult): S
   if (!hit || !hyp.ownerPersona) return []
   const mutation = typeof hit.mutation === 'string' && authMutationKinds.has(hit.mutation) ? hit.mutation : 'alg_none'
   const path = hyp.pathAndQuery.split('?')[0] || hyp.pathAndQuery
+  // Forged-token transport: the probe minted the token itself from the caller's own claims and
+  // presented it in a header/body field, so the replay mints the same pair deterministically. The
+  // control keeps the declared HS256 header but carries a signature the target never issued; the
+  // probe is the unsigned (`alg:none`) token with the identical payload.
+  if (hit.type === 'jwt_authorization_forgery' || hit.type === 'jwt_body_token_bypass') {
+    const rawPayload = hit.payload && typeof hit.payload === 'object' && !Array.isArray(hit.payload)
+      ? hit.payload as Record<string, unknown>
+      : (hyp.identityClaims ?? {})
+    const payload: Record<string, string | number | boolean> = {}
+    for (const [key, value] of Object.entries(rawPayload)) {
+      if (!/^[A-Za-z0-9_.:-]{1,64}$/.test(key)) continue
+      if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+        payload[key] = typeof value === 'string' ? value.slice(0, 256) : value
+      }
+    }
+    if (Object.keys(payload).length === 0) return []
+    const declaredAlg = typeof hit.declaredAlg === 'string' && /^[A-Za-z0-9]{2,12}$/.test(hit.declaredAlg) ? hit.declaredAlg : 'HS256'
+    const transport = hit.transport === 'body' ? 'body' : 'header'
+    const field = typeof hit.tokenField === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(hit.tokenField) ? hit.tokenField : 'token'
+    const body = hit.body && typeof hit.body === 'object' && !Array.isArray(hit.body) ? hit.body as Record<string, unknown> : {}
+    // Header transport: the verifier mints both tokens from the same claims. The control keeps the
+    // server's declared algorithm with an empty (never-issuable) signature; the probe is the unsigned
+    // `alg:none` token. Nothing here carries a credential or a signing key.
+    const headerMints = [
+      { name: 'jwt_control', header: { alg: declaredAlg, typ: 'JWT' }, payload, signature: 'none' as const },
+      { name: 'jwt_unsigned', header: { alg: 'none', typ: 'JWT' }, payload, signature: 'none' as const },
+    ]
+    const request = (token: string): RequestParts => transport === 'body'
+      ? {
+          method: hyp.method === 'GET' ? 'POST' : hyp.method,
+          pathAndQuery: path,
+          headers: { 'Content-Type': 'application/json' },
+          jsonBody: { ...body, [field]: token },
+        }
+      : {
+          method: hyp.method,
+          pathAndQuery: path,
+          headers: { Authorization: `Bearer ${token}` },
+        }
+    const controlRequest = request('{{jwt_control}}')
+    const probeRequest = request('{{jwt_unsigned}}')
+    // Acceptance is the authenticated read itself: a data-bearing JSON object on the unsigned
+    // token, with the declared-algorithm/invalid-signature control denied. A bare status is never
+    // the confirmation.
+    const dataFieldCount = `([.steps.p1.json | to_entries[] | select((.key | test("^(?:ok|success|status|error|message|detail|reason|code)$"; "i")) | not)] | length)`
+    const jq = `{ controlPassed: ((.steps.c1.status == 401) or (.steps.c1.status == 403) or (.steps.c1.status == 400)), ` +
+      `confirmed: ((${is2xx('p1')}) and ((.steps.p1.json | type) == "object") and (${dataFieldCount} >= 1)), ` +
+      'observed: (("control_status=" + (.steps.c1.status | tostring) + " accepted_status=" + (.steps.p1.status | tostring) + " fields=" + ((.steps.p1.json // {}) | keys | join(",")))), ' +
+      'expected: "a token carrying the declared algorithm with an invalid signature is rejected; the unsigned alg=none token with the same claims is accepted and returns the authenticated data" }'
+    return [{
+      kind: 'auth_protocol_proof',
+      vulnClass: 'jwt',
+      endpoint: hyp.endpoint.pathTemplate,
+      spec: {
+        ...baseFields(hyp.endpoint.origin, 'JWT signature verification bypass (unsigned token accepted)', 'CWE-347', 'jwt', 'high', jq),
+        kind: 'auth_protocol_proof',
+        protocol: 'jwt',
+        tokenMints: headerMints,
+        steps: [
+          stepOf(hyp.endpoint.origin, 'c1', 'control', `Same claims under ${declaredAlg} with an invalid signature are rejected`, controlRequest, null, {}, [400, 401, 403]),
+          stepOf(hyp.endpoint.origin, 'p1', 'probe', `Unsigned alg=none token with the same claims is accepted`, probeRequest, null, {}, [200, 201, 204]),
+        ],
+      },
+    }]
+  }
   const jq = `{ controlPassed: ((.steps.c1.status >= 400) or (.steps.c1.status == 0)), ` +
     `confirmed: ${is2xx('p1')}, ` +
     'observed: (("probe_status=" + (.steps.p1.status | tostring))), ' +
@@ -2057,6 +2122,48 @@ function synthWebhook(hyp: EngineHypothesis, result: DifferentialResult): Synthe
 // ---------------------------------------------------------------------------------------------
 
 /** All schema-shaped candidate specs for a signal, most specific first. */
+/**
+ * Time-based blind SQLi: the engine only schedules this probe when the boolean arm produced no
+ * signal (a response-identical sink), so the spec exists purely to reach the typed
+ * `boolean_or_timing` timing recipe. Its declarative body is attribution; the recipe owns the proof.
+ */
+export function synthSqlTime(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
+  const hit = result.anomalies.find(anomaly => anomaly.type === 'sql_time_differential')
+  if (!hit || !hyp.param) return []
+  const dialectRaw = String(hit.dialect ?? '')
+  const dialect = ['postgres', 'mysql', 'sqlite', 'mssql'].includes(dialectRaw)
+    ? dialectRaw as 'postgres' | 'mysql' | 'sqlite' | 'mssql'
+    : 'postgres'
+  const delayMs = Math.max(1500, Math.min(3000, Number(hit.delayMs) || 2500))
+  return [{
+    kind: 'sql_time_diff',
+    vulnClass: 'sqli',
+    endpoint: hyp.endpoint.pathTemplate,
+    spec: {
+      ...baseFields(
+        hyp.endpoint.origin,
+        'Time-based blind SQL injection differential',
+        'CWE-89',
+        'injection-input',
+        'high',
+        '{ controlPassed: (.sqlTimeDiff.controlPassed == true), confirmed: (.sqlTimeDiff.passed == true) }',
+      ),
+      kind: 'sql_time_diff',
+      targetOrigin: hyp.endpoint.origin,
+      method: hyp.method === 'GET' ? 'GET' : hyp.method,
+      pathAndQuery: hyp.pathAndQuery.split('?')[0] || '/',
+      paramName: hyp.param.name,
+      paramLocation: hyp.location ?? 'query',
+      baselineValue: hyp.baselineValue ?? '1',
+      quoteStyle: 'single',
+      dialect,
+      delayMs,
+      ...(hyp.location === 'json' ? { jsonBody: hyp.jsonBody ?? {} } : {}),
+      ...(hyp.location === 'form' ? { jsonBody: hyp.jsonBody ?? {} } : {}),
+    },
+  }]
+}
+
 export function synthesizeEngineSpecs(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
   if (result.verdict !== 'signal') return []
   try {
@@ -2072,6 +2179,7 @@ export function synthesizeEngineSpecs(hyp: EngineHypothesis, result: Differentia
     switch (hyp.probeClass) {
       case 'authz_matrix': return synthAuthz(hyp, result)
       case 'sqli_boolean': return synthSqlBoolean(hyp, result)
+      case 'sqli_time_diff': return synthSqlTime(hyp, result)
       case 'ssti_math': return synthSsti(hyp, result)
       case 'command_injection': return synthCommandInjection(hyp, result)
       case 'workflow_invariant': return synthWorkflowStepSkip(hyp, result)

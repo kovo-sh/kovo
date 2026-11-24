@@ -110,10 +110,14 @@ test('staging surface forms write-BOLA, price-trust and race-burst hypotheses', 
   assert.equal(race!.intent, 'race')
   assert.equal(race!.raceBurst, true)
 
-  // Wide ephemeral-lab floors keep their original hypothesis set: the conversion probes are a
-  // staging-isolated capability, never extra surface on a live-lab floor.
+  // Disposable environments form the conversion probes; only a production read-only engagement
+  // refuses them. The benchmark's isolated lab is `ephemeral_lab`, which is exactly where a race or
+  // price-trust proof is legitimate — gating on `staging_isolated` alone made those classes
+  // unreachable on the held-out matrix.
   const ephemeral = enumerateHypotheses(endpoints, harvests, { tier: 3, personas, environmentMode: 'ephemeral_lab' })
-  assert.equal(ephemeral.some(hyp => hyp.priceTrust || hyp.raceBurst), false)
+  assert.equal(ephemeral.some(hyp => hyp.priceTrust || hyp.raceBurst), true)
+  const prod = enumerateHypotheses(endpoints, harvests, { tier: 3, personas, environmentMode: 'prod_readonly' })
+  assert.equal(prod.some(hyp => hyp.priceTrust || hyp.raceBurst), false)
 })
 
 test('price-trust proof names the caller price field and replays the terminal transition', () => {

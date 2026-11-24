@@ -2,10 +2,19 @@ import { z } from 'zod'
 import { findingSeverities, httpMethods, owaspCategories, personaHandle, scopedAssetOrigin } from './domain.ts'
 
 const forbiddenHeaderNames = /^(?:authorization|proxy-authorization|cookie)$/i
+/**
+ * A verifier-minted token is referenced as `Bearer {{mint_name}}`; the mint itself is declared in
+ * the spec's `tokenMints` and produced by the verifier. This is the only Authorization form a spec
+ * may carry: a literal token (issued or forged) can never be embedded.
+ */
+const mintedBearerHeader = /^Bearer \{\{[a-zA-Z_][a-zA-Z0-9_]{0,31}\}\}$/
 
 const safeHeaders = z.record(z.string().min(1).max(64), z.string().max(1024)).refine(
-  headers => Object.keys(headers).every(name => !forbiddenHeaderNames.test(name)),
-  'Do not place Authorization or Cookie headers in a replay spec; reference an approved persona handle instead.',
+  headers => Object.keys(headers).every(name => {
+    if (!forbiddenHeaderNames.test(name)) return true
+    return /^authorization$/i.test(name) && typeof headers[name] === 'string' && mintedBearerHeader.test(headers[name]!)
+  }),
+  'Do not place Authorization or Cookie headers in a replay spec; reference an approved persona handle (or a verifier-minted tokenMints entry) instead.',
 )
 
 const destructivePatterns = [
