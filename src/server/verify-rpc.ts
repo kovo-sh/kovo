@@ -39,9 +39,11 @@ import {
   assessImpactEvidence,
   assessMarkupImpact,
   assessMfaBypass,
+  assessStatusOnlyDivergence,
   classifyBoundaryClaim,
   classifyImpactDescriptor,
   isReadMethod,
+  matchInjectionFingerprint,
   normalizeRole,
   parseRoleLabel,
   assessReadDisclosure,
@@ -514,7 +516,7 @@ function isClaim(value: unknown): value is VerifyClaim {
       return Array.isArray(rec.exchangeIds) && rec.exchangeIds.length >= 2 &&
         rec.exchangeIds.every(v => typeof v === 'string')
     case 'impact': {
-      const knownClasses = new Set(['authorization', 'bfla', 'mass_assignment', 'csrf', 'business_logic', 'markup', 'disclosure'])
+      const knownClasses = new Set(['authorization', 'bfla', 'mass_assignment', 'csrf', 'business_logic', 'markup', 'disclosure', 'injection'])
       return typeof rec.probeExchangeId === 'string' &&
         typeof rec.impactClass === 'string' && knownClasses.has(rec.impactClass) &&
         (rec.controlExchangeIds === undefined || (Array.isArray(rec.controlExchangeIds) && rec.controlExchangeIds.every(v => typeof v === 'string'))) &&
@@ -1429,7 +1431,13 @@ export function describeMissingEvidence(check: VerifyClaimCheck): string[] {
       break
     }
     case 'impact': {
-      if (claim.impactClass === 'mass_assignment') {
+      if (claim.impactClass === 'injection') {
+        if (/fingerprint/i.test(detail)) missing.add('engine_error_fingerprint')
+        if (/boolean/i.test(detail)) missing.add('boolean_round_differential')
+        if (/timing|jitter/i.test(detail)) missing.add('timing_separation')
+        if (/out-of-band|callback/i.test(detail)) missing.add('oob_callback_hit')
+        if (/status-only|status divergence|semantic oracle/i.test(detail)) missing.add('injection_semantic_oracle')
+      } else if (claim.impactClass === 'mass_assignment') {
         if (Array.isArray(observed.persisted) && observed.persisted.length === 0) missing.add('persisted_field_delta')
         if (Array.isArray(observed.protectedFields) && observed.protectedFields.length === 0) missing.add('protected_field_delta')
         if (!Array.isArray(observed.persisted)) {
@@ -1509,6 +1517,88 @@ export function describeMissingEvidence(check: VerifyClaimCheck): string[] {
   return [...missing]
 }
 
+/** Materialize the signed transcript as the shared impact model (bodies included, bounded). */
+function transcriptStatusSteps(store: TranscriptStore): ImpactStep[] {
+  const out: ImpactStep[] = []
+  for (const record of store.list()) {
+    if (!record.request) continue
+    if (record.op !== 'http' && record.op !== 'http2') continue
+    const body = store.body(record.exchangeId) ?? ''
+    let json: unknown
+    if (body) {
+      try { json = JSON.parse(body) } catch { json = undefined }
+    }
+    const role = record.request.sessionRole
+    const arm: ImpactStep['arm'] = role === 'probe' || role === 'control' ? role : 'setup'
+    const handle = record.request.personaHandle ?? null
+    const label = record.request.actorRoleLabel ?? null
+    out.push({
+      id: record.exchangeId,
+      arm,
+      method: record.request.method.toUpperCase(),
+      route: (record.request.pathAndQuery || '/').split('?')[0],
+      pathAndQuery: record.request.pathAndQuery,
+      status: record.response ? Number(record.response.status) : null,
+      actor: {
+        handle,
+        role: normalizeRole(label ?? handle),
+        tenant: parseRoleLabel(label ?? handle ?? '').tenant ?? null,
+        auth: 'unknown',
+        sameSite: null,
+      },
+      ...(json !== undefined ? { json } : {}),
+      body,
+      requestHeaders: record.request.headers,
+      responseHeaders: record.response?.headers ?? null,
+      durationMs: record.durationMs,
+    })
+  }
+  return out
+}
+
+/** Text a claim's exchange actually produced (for fingerprint detection). */
+function claimEvidenceText(store: TranscriptStore, check: VerifyClaimCheck): string {
+  const claim = check.claim
+  const ids: string[] = []
+  if (claim.kind === 'status' || claim.kind === 'header' || claim.kind === 'body_contains' ||
+      claim.kind === 'jsonpath' || claim.kind === 'css' || claim.kind === 'dom_sentinel') {
+    ids.push(claim.exchangeId)
+  } else if (claim.kind === 'structural_diff') {
+    ids.push(...claim.controlIds, ...claim.variantIds)
+  } else if (claim.kind === 'race') {
+    ids.push(...claim.exchangeIds)
+  } else if (claim.kind === 'impact') {
+    ids.push(claim.probeExchangeId, ...(claim.controlExchangeIds ?? []), ...(claim.afterExchangeId ? [claim.afterExchangeId] : []))
+  } else if (claim.kind === 'boundary') {
+    ids.push(claim.controlExchangeId, claim.probeExchangeId)
+  } else if (claim.kind === 'mfa') {
+    ids.push(claim.enrolledExchangeId, claim.preChallengeExchangeId, claim.postChallengeExchangeId)
+  }
+  return ids.map(id => store.body(id) ?? '').join('\n').slice(0, 64 * 1024)
+}
+
+/** True when a passing claim carries evidence that stands without the HTTP status. */
+function hasStatusIndependentEvidence(store: TranscriptStore, check: VerifyClaimCheck): boolean {
+  if (!check.passed) return false
+  switch (check.claim.kind) {
+    case 'structural_diff':
+    case 'timing':
+    case 'oob':
+    case 'race':
+    case 'impact':
+    case 'boundary':
+    case 'mfa':
+    case 'dom_sentinel':
+      return true
+    case 'body_contains':
+    case 'jsonpath':
+    case 'header':
+      return matchInjectionFingerprint(claimEvidenceText(store, check)) !== null
+    default:
+      return false
+  }
+}
+
 export function evaluateClaims(
   store: TranscriptStore,
   claims: readonly VerifyClaim[],
@@ -1517,6 +1607,24 @@ export function evaluateClaims(
   const checks = claims.map(claim => evaluateClaim(store, claim, context))
   const failures = checks.filter(c => !c.passed).map(c => `${c.claim.kind}: ${c.detail}`)
   const claimed = context.claimedImpact
+  // Universal status-only guard: a failing probe is never confirmation by itself. A 2xx -> 4xx/5xx
+  // transition must be backed by an engine/parser fingerprint, a structural differential, a timing
+  // arm, a state delta or an OOB callback; otherwise the claim is a bare availability/error signal.
+  const statusSteps = transcriptStatusSteps(store)
+  const statusOnly = assessStatusOnlyDivergence(statusSteps)
+  if (statusOnly.statusOnly) {
+    const backed = checks.some(check => hasStatusIndependentEvidence(store, check))
+    if (!backed) {
+      failures.push(`confirmation: ${statusOnly.reason} A status-only divergence cannot confirm injection, XSS, SSRF, traversal or any other class; cite an engine/parser fingerprint, a stable structural differential, a timing separation, a persisted state delta or an OOB callback.`)
+    }
+  }
+  const injectionEvidencePassed = checks.some(check =>
+    check.passed && (
+      check.claim.kind === 'impact' && check.claim.impactClass === 'injection' ||
+      check.claim.kind === 'structural_diff' ||
+      check.claim.kind === 'timing' ||
+      check.claim.kind === 'oob' ||
+      matchInjectionFingerprint(claimEvidenceText(store, check)) !== null))
   // A boundary claim substitutes for impact evidence only when it crossed an actual denial/challenge;
   // an actor/precondition differential alone is not object-level impact.
   const boundaryClaimPassed = checks.some(check =>
@@ -1536,6 +1644,10 @@ export function evaluateClaims(
       const markup = implicitMarkupEvidence(store, claims, context)
       if (!markup.satisfied) {
         failures.push(`impact: markup claim dismissed — ${markup.reason}`)
+      }
+    } else if (claimed === 'injection') {
+      if (!injectionEvidencePassed) {
+        failures.push('impact: injection claim requires a positive semantic oracle — an engine/dialect error fingerprint, a paired boolean differential with a stable structural delta, a >3x timing arm, a verified OOB callback, or the paired status-boolean contrast. A status-only 2xx -> 4xx/5xx divergence is not proof.')
       }
     } else {
       failures.push(`impact: ${claimed} claim requires a passing impact-evidence claim for its class (boundary differential, repeated transition, protected-field readback or invariant event); status and echo claims are insufficient.`)
