@@ -1118,8 +1118,8 @@ export function computeStepMaxTurns(
 
 /** Turn budget for a single-route / single-step assignment (settlement fires at N-2). */
 export const SINGLE_STEP_ASSIGNMENT_MAX_TURNS = 12
-/** Wall cap for a single-step assignment; a slot must turn over inside ~90 s. */
-export const SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS = 85_000
+/** Wall cap for a single-step assignment; a slot must turn over inside ~80 s. */
+export const SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS = 80_000
 /** Multi-step/race assignments need more turns than a single probe (observed 20–29). */
 export const MULTI_STEP_ASSIGNMENT_MIN_TURNS = 20
 export const MULTI_STEP_ASSIGNMENT_MAX_TURNS = 30
