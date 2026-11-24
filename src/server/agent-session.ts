@@ -787,6 +787,7 @@ export function specSubmissionRequiredMessage(route?: SpecRouteEvidence): string
     `complete_intent rejected (agent.spec_submission_required): missing required field \`proofGapReason\` or a submitted replay spec${routeText}.`,
     `You probed a route but never submitted a guardian_verify/verify_replay_spec result, so a proved/partial conclusion is unsupported.`,
     `Repair now: call guardian_verify${routeText} (DeclarativeReplaySpec: ${GUARDIAN_VERIFY_SPEC_SHAPE}), or call record_coverage(status="needs_follow_up", proofGapReason="<code>") with one machine-readable code from: ${codes}.`,
+    'If the hypothesis genuinely cannot be proven, complete_intent(status="blocked") is accepted with a concise reason.',
   ].join(' ')
 }
 
