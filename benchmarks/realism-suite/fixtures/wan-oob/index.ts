@@ -10,6 +10,41 @@ import type { ApiRefEntry, FixtureStartOptions, Persona, StartedFixture } from '
 export const DEFAULT_JITTER_MS: [number, number] = [50, 300]
 export const DEFAULT_CALLBACK_DELAY_MS: [number, number] = [15_000, 30_000]
 
+/** Hard ceiling for the blind-SQLi branch's server-side delay (a probe never stalls a scan). */
+export const MAX_SQLI_DELAY_MS = 5000
+
+/**
+ * Parse the delay a time-based SQLi payload asks the database to sleep for.
+ *
+ * The fixture is a *timing* oracle for blind SQL injection: the injected branch must take a real,
+ * attacker-chosen amount of time while returning a byte-identical body. Only an explicit
+ * sleep/delay expression delays the response — ordinary boolean injections (including false ones)
+ * stay fast, so a scanner cannot "confirm" timing from a boolean payload.
+ *
+ * Supported shapes match the engine's payload families:
+ *  - MySQL `SLEEP(seconds)`
+ *  - PostgreSQL `pg_sleep(seconds)`
+ *  - MSSQL `WAITFOR DELAY 'h:m:s'`
+ *  - SQLite `RANDOMBLOB(bytes)` (the engine's busy-loop primitive, ~25 000 bytes per ms)
+ */
+export function injectedTimeDelayMs(query: string): number | null {
+  let q = query
+  try { q = decodeURIComponent(q) } catch { /* keep the raw value */ }
+  const clamp = (ms: number): number => Math.max(150, Math.min(MAX_SQLI_DELAY_MS, Math.round(ms)))
+  const seconds = /(?:^|[^a-z_])SLEEP\s*\(\s*([0-9]+(?:\.[0-9]+)?)\s*\)/i.exec(q)
+  if (seconds) return clamp(Number(seconds[1]) * 1000)
+  const pg = /pg_sleep\s*\(\s*([0-9]+(?:\.[0-9]+)?)\s*\)/i.exec(q)
+  if (pg) return clamp(Number(pg[1]) * 1000)
+  const waitfor = /WAITFOR\s+DELAY\s+'\s*(\d+):(\d+):(\d+(?:\.\d+)?)\s*'/i.exec(q)
+  if (waitfor) {
+    const total = Number(waitfor[1]) * 3600 + Number(waitfor[2]) * 60 + Number(waitfor[3])
+    return clamp(total * 1000)
+  }
+  const blob = /RANDOMBLOB\s*\(\s*(\d+)\s*\)/i.exec(q)
+  if (blob) return clamp(Number(blob[1]) / 25_000)
+  return null
+}
+
 export interface CallbackEvent {
   kind: 'ssrf' | 'xxe' | 'webhook' | 'sqli'
   token: string
@@ -99,14 +134,18 @@ export async function start(options: FixtureStartOptions = {}): Promise<WanOobFi
   backend.get('/v1/health', (ctx) => sendJson(ctx.res, 200, { ok: true, host: 'backend.local' }))
   backend.get('/v1/catalog/item/:id', (ctx) => sendJson(ctx.res, 200, { id: ctx.params.id, name: 'Parameterized item' }))
 
-  backend.get('/v1/catalog/search', (ctx) => {
+  backend.get('/v1/catalog/search', async (ctx) => {
     const q = ctx.query.get('q') ?? ''
     const injected = /('\s*(or|and)\b)|(union\s+select)|(--)/i.test(q)
     if (injected) {
       const token = `sqli-${hexToken(rng, 6)}`
       worker.schedule('sqli', token, () => fireCallback(collectorUrl('sqli', 'sqli', token)))
     }
-    // Blind: the injected and benign branches return the exact same shape.
+    // Blind timing oracle: a sleep/delay payload makes this branch genuinely slow, bounded to
+    // `MAX_SQLI_DELAY_MS`, while the body stays byte-identical to the benign branch. Boolean-only
+    // injections stay fast, so "injection noticed" never masquerades as a timing signal.
+    const delayMs = injectedTimeDelayMs(q)
+    if (delayMs !== null) await sleep(delayMs)
     sendJson(ctx.res, 200, { results: [], tookMs: 12, cursor: null })
   })
 
