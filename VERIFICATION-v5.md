@@ -7,8 +7,113 @@
 **Prior release:** [VERIFICATION-v4.md](VERIFICATION-v4.md)
 **Handover:** [HANDOVER-v5.md](HANDOVER-v5.md)
 **v5.1 integration:** in progress behind a default-off flag — see [§0](#0-v51-integration-in-progress). The v5.0 scorecards in §2–§3 are unchanged and remain the shipped numbers.
+**v7 planning snapshot:** current measured state and the smoke battery — see [§V7](#v7-planning-snapshot-2026-11-23--not-a-release-claim). It is a **planning record**, not a release claim.
 
 > The two scorecards are not interchangeable. Scorecard B is the deterministic engine harness. Scorecard A is the shipped `Execution` runtime. The 25/59 and 28/59 runtime numbers are a **v5.1 candidate**, not v5.0.
+>
+> Everything in §0–§11 is **historical** (v5.0 freeze + v5.1 integration record). The current line is v7 planning; its numbers live only in §V7 and are labelled with their measurement scope.
+
+---
+
+## v7 planning snapshot (2026-11-23) — not a release claim
+
+> **This section is new and supersedes nothing.** The v5.0 freeze record (§2–§3, §6) and the v5.1 integration record (§0) stay intact and historical. Nothing below is a release gate result, a certification, or a shipped number. It records what the v6 line measured, what it did not, and the battery/protocol v7 will use to turn a measurement into a claim.
+
+**Status:** v7 **planning**. Not certified. v6 remains the shipped baseline until v7 M0 passes its gates ([plans/v7.md](plans/v7.md)).
+
+### V7.1 Current measured numbers
+
+All product rows are real `Execution` on the 3-app realistic dev cells (acme-saas, shopflow, opsportal), seed 1, grey-box, Tier-3 local-lab, Docker verifier, wordlists off, serial unless noted.
+
+| Measure | Result | Scope / caveat |
+| :--- | :--- | :--- |
+| Product floor (`Execution --no-llm`) | **31 / 59 (52.5%)**, **100%** precision, 0 decoy/unmatched | acme 11, shopflow 11, opsportal 9 |
+| Floor determinism | **0 spread**, 3 repeats identical (site sets included); loaded runs match idle (`driftApps=0`) | Measured on the **26/59** tree; the **31/59** tree is not yet re-gated (M0) |
+| Agentic, 600 s ample budget, K=6 (**acme**) | **13 / 22 (59.1%)**, **100%** precision, **+2 net** | 25 investigations, 2,225 of 31,000 requests, $0.65 |
+| Agentic, 45 min, run 1 (**acme**) | **15 / 22 (68.2%)**, **88.2%** precision (2 unmatched), **+4 net** | 83 investigations, 4,288 of 112,000 requests, $2.99 |
+| Agentic, 45 min, kept rerun (**acme**) | **13 / 22 (59.1%)**, **92.9%** precision (1 unmatched), **+2 net** | $3.01 |
+| Agentic K=6 n=3, pre budget split (**acme ×3**) | **11 / 12 / 11 of 22**; precision **100% / 92.3% / 100%**; median lift **0** | $0.48–0.51; p50 assignment 53 s. Superseded by the ample-budget rows above |
+| XBEN-25 | **25 / 25**, 100% precision | Hard regression gate; restored this cycle from 24/25 |
+| held-out-saas | **20 / 20** + **20 / 20 patches** | Hard regression gate |
+| Procedural control (acme seed 42) | **16 / 22** | Deterministic capability harness, not the product |
+| Realism #2 / #3 / #4 | **0 capability confirms** | #3 and #4 wiring PASS; #2 was **wiring FAIL** at check-in #8 (no `pending_oob` registered) and is an M1 re-verify item, not a pass |
+| Salted held-out product floor | **23 / 58** | **Stale** — last measured before the floor restore; must be re-run before any held-out claim |
+| `execution.ts` size | ~**10.5K LOC** | DSL retirement not started |
+
+**Scope rule carried forward:** product capability is always reported as `Execution --no-llm` (deterministic floor) **and** agentic (increment over that floor), on dev **and** salted held-out. Harness/procedural numbers are secondary evidence, never the product score.
+
+### V7.2 Certification status
+
+**NOT CERTIFIED.** The v6 line is not certifiable as-is. The hard blockers are precision, incremental lift, and realism capability; determinism and preservation are pending re-gates.
+
+| Gate | Target | Measured | Status |
+| :--- | :--- | :--- | :--- |
+| Worst-run precision | 100% on every lift cell | **88.2%–92.9%** at the 45-min horizon (1–2 unmatched per run) | **FAIL** |
+| Incremental lift | ≥ +10 pp dev / ≥ +8 pp held-out | **+2 net** at 600 s; **+2..+4** at 45 min (acme only, of 22) | **FAIL** |
+| Floor determinism | spread ≤ 1 target (target 0) | 0 spread on the determinism tree; 31/59 tree not yet re-gated | **PASS pending re-gate** |
+| Floor preservation | ≥ 0.95 | 1.00 on the acme unified cell; not measured on shopflow/opsportal | **PARTIAL** |
+| Legacy regression | xben 25/25, held-out 20/20 + 20/20 | both hold | **PASS** |
+| Realism capability | ≥75% on #1–#4 | **0 confirms** | **FAIL** |
+| Chains | ≥ 4/6 | not re-measured in v6 | **UNMEASURED** |
+
+Two claims that must not be made: (a) "agentic adds +4 net" without saying it is acme-only at a 45-minute horizon where precision fell to 88.2%; (b) "realism is wired and working" — wiring and capability are separate results, and capability is zero.
+
+### V7.3 Smoke battery (adopted design)
+
+The fast battery answers one question: **did this change break the funnel, the precision boundary, or the floor?** It does not attempt to certify. Decoupled deliberately from "a smaller 45-minute scan".
+
+| Tier | Budget | Contents | Catches |
+| :--- | :--- | :--- | :--- |
+| **Tier 0** | < 90 s, $0 | `scripts/worker-gate.sh` (typecheck + fast contract invariants + targeted slice) and deterministic replay of past FP/over-claim archetypes through verifier → dedupe → scheduler | Type/contract breakage and regressions in previously-fixed over-claims, with no LLM and no Docker-heavy run |
+| **Tier 1** | ~6 min, ~$1, 4 parallel cells | Paired lift from post-floor snapshots (acme); one rotating second app (shopflow or opsportal); the **pre-exhausted precision trap**; one realism conversion micro-slice (async OOB / staging race / 4-hop) | Floor preservation, net-new lift shape, precision boundary, one live realism path |
+| **Tier 2** | 30–45 min | Cold 3-app dev n=3, salted held-out n=2, one 45-min endurance cell, realism suite, xben + held-out-saas | Cold Phase-A→B integration and multi-hour DB drift — the two known Tier-0/1 blind spots |
+
+**The precision trap.** A pre-exhausted cell whose correct answer is *zero* findings (all budget spent before the target is reachable). It must confirm **0**. Any confirmation from the trap is a precision failure regardless of recall. This is the cheapest guard against the reward-hacking and cross-talk failure modes already seen (control-denial pairing, `before != after` cross-worker reads, SDK helper bypass of host transcripts).
+
+**Tier-1 pass gates (all must hold):**
+
+1. **100% precision** on every lift cell, and **0** on the trap.
+2. **Paired net-new non-regression** versus the post-floor snapshot: no lost confirmed targets (a −1 is allowed only with a conversion gain and a clean rerun).
+3. **Conversion drop ≤ 10 pp** on the realism micro-slice.
+4. **0 crashes / 0 worker failures / 0 orphan containers or networks.**
+5. **Throughput floor:** p50 assignment ≤ 75 s and ≥ 12 completions per 300 s of Phase B.
+6. **Cost ceiling:** ≤ $0.80 per cell.
+
+**Anti-gaming rules:** rotate the second app every batch; fix general invariants, never trap-specific names or fixtures; a green smoke is *not* evidence of capability — only of non-regression.
+
+**Calibration (accepted, ~$22–24, deferred until M0 lands):** 8 deliberately-varied builds measured against a full reference run. Trust the battery only if Spearman ≥ 0.75 against the reference, 100% directional agreement for Δ ≥ 2 targets, and the trap catches every variant below 95% precision. Until that study is run, Tier 1 is a **regression tripwire**, not a predictive estimate.
+
+**Rejected techniques:** bootstrap confidence intervals on 22-target cells (4/10 — too noisy to gate on); frozen LLM-turn VCR replay (plumbing-only; never a recall signal).
+
+### V7.4 Known regressions fixed this cycle
+
+| Regression | Fix | Result |
+| :--- | :--- | :--- |
+| XBEN-25 fell to **24/25** after the verifier required pre/post readback (`xben-12` became `replay_spec_miss`) | Spec-side readback for `synthAuthz`; no gate weakening | **25/25** restored |
+| held-out-saas BFLA lost during floor hardening | Role-exclusive function-surface delta counts as vertical impact (restored held-out BFLA) | **20/20** + **20/20 patches** |
+| Floor fell **26/59** after hardening took it off its pre-hardening level (shopflow 7, opsportal 8) | All-occurrence XSS canary scan picking the strongest executable context (opsportal reflected XSS +1) | **31/59 (52.5%)** at 100% |
+| Floor repeat spread **29 / 30 / 33** | Canonical endpoint/probe/ID/persona ordering, state-clobber isolation, request-first termination with wall margin | **0 spread**, 3 identical repeats and site sets (26/59 tree), idle *and* loaded |
+| 3 unmatched FPs in the K=6 cell: a planted mass-assignment target labelled BOLA; two fixture XSS escape defects | Evidence-first impact classification (CWE-915) and fixture escaping | **100%** precision on K=6 |
+| Stored 2FA over-claim and `/api/admin/activity` false charge | Universal default-deny boundary + real MFA gate; `misclassifiedFindingIds` grader bucket (neither TP nor FP) | Over-claim dismissed; acme samples 100% precision |
+| **Open:** 45-min "invoice amount accepts negative values" claim | Triage in flight (genuine invariant bug vs echo/clamp) | **Unresolved** — reason the 45-min worst-run precision is not 100% |
+
+### V7.5 Honest limitations
+
+1. **One app carries the lift story.** Every agentic number above is acme-only. There is no 3-app agentic measurement on the current tree, so "+2 net" is not a +10 pp aggregate claim.
+2. **Longer horizon trades precision for recall.** 15/22 at 88.2% is not better than 13/22 at 100% until the unmatched claims are triaged. Worst-run precision at the horizon is the gate, not budget.
+3. **Budgets are not the constraint.** 3.8% of the agent request allowance, 13–30% of dollars, 1.1–1.7 req/s of a 50 RPS cap. Throughput and hypothesis/proof quality are.
+4. **Realism capability is 0.** #3/#4 wiring passes say the plumbing is connected; they say nothing about conversion. #2's wiring was still failing at last check.
+5. **The deterministic floor is not certified on the current tree.** 31/59 is measured; the 0-spread re-gate and floor preservation on all three apps are M0.
+6. **Salted held-out is stale.** 23/58 predates the floor restore; no held-out or gap claim is current.
+7. **Chains, white-box, and reason-bench are unmeasured in v6.** They remain Phase-2/M2 gates.
+8. **The smoke battery is not yet calibrated.** Tier 1 is a tripwire until the 8-variant study lands; Tier 2 blind spots (cold integration, DB drift) are real.
+9. **DSL retirement has not started.** `execution.ts` remains ~10.5K LOC; certification must not be run on code scheduled for deletion without deciding the order (M0 open decision).
+
+### V7.6 Reporting rule
+
+- §2–§3 and §6 are the **v5.0 freeze record**. §0 is the **v5.1 integration record**. Both are historical; do not update their numbers to match the current line.
+- Nothing in §V7 is a release claim. A v7 number becomes citable only when it is produced by the protocol in [plans/v7.md](plans/v7.md#certification-protocol-adopted) and the M0 gates are green.
+- Never cite a harness/procedural number as the product score; never cite a wiring pass as a capability result; never cite a per-app lift as an aggregate.
 
 ---
 
