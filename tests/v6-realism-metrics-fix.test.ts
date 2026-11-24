@@ -74,6 +74,7 @@ describe('latePromotions counts conversion events, not just the drain counter', 
       drainPromotedLate: 0,
       drainPromotedReceipts: 0,
       receiptConfirmed: 2,
+      pendingLatePromoted: null,
     }), 2)
   })
 
@@ -82,6 +83,7 @@ describe('latePromotions counts conversion events, not just the drain counter', 
       drainPromotedLate: null,
       drainPromotedReceipts: null,
       receiptConfirmed: 2,
+      pendingLatePromoted: null,
     }), 2)
   })
 
@@ -90,6 +92,7 @@ describe('latePromotions counts conversion events, not just the drain counter', 
       drainPromotedLate: 3,
       drainPromotedReceipts: 3,
       receiptConfirmed: 0,
+      pendingLatePromoted: null,
     }), 3)
   })
 
@@ -98,7 +101,17 @@ describe('latePromotions counts conversion events, not just the drain counter', 
       drainPromotedLate: 4,
       drainPromotedReceipts: null,
       receiptConfirmed: null,
+      pendingLatePromoted: null,
     }), 4)
+  })
+
+  test('relay promotions count when the run ends before the drain event', () => {
+    assert.equal(resolveLatePromotions({
+      drainPromotedLate: null,
+      drainPromotedReceipts: null,
+      receiptConfirmed: 0,
+      pendingLatePromoted: 1,
+    }), 1)
   })
 
   test('measured zero stays zero; fully unmeasured stays null (fail closed)', () => {
@@ -106,11 +119,13 @@ describe('latePromotions counts conversion events, not just the drain counter', 
       drainPromotedLate: 0,
       drainPromotedReceipts: 0,
       receiptConfirmed: 0,
+      pendingLatePromoted: null,
     }), 0)
     assert.equal(resolveLatePromotions({
       drainPromotedLate: null,
       drainPromotedReceipts: null,
       receiptConfirmed: null,
+      pendingLatePromoted: null,
     }), null)
   })
 

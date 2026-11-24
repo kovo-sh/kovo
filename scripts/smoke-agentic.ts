@@ -1550,6 +1550,15 @@ async function runTierOne(opts: SmokeArgs, report: SmokeReport): Promise<void> {
     cells: report.cells.length,
   }
   for (const cell of report.cells) if (cell.error) report.notes.push(`${cell.id}: ${cell.error}`)
+  const monorepoSlice = planMicroSlices(opts).find(slice => slice.fixture === 'monorepo-whitebox')
+  if (monorepoSlice && monorepoSlice.snapshot.state !== 'not-applicable' && !monorepoSlice.snapshot.used) {
+    report.notes.push(
+      `micro #4 post-recon snapshot ${monorepoSlice.snapshot.state}: ${monorepoSlice.snapshot.reason}`,
+    )
+  }
+  if (micro.latePromotions !== undefined) {
+    report.notes.push(`micro latePromotions=${micro.latePromotions ?? 'n/a'} (conversion events, not drain-only)`)
+  }
 }
 
 export function tierTwoCommand(): string[] {
@@ -1685,7 +1694,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   await runTierZero(opts, report)
 
   if (opts.dryRun) {
-    report.cells = planTierOne(opts).map(plan => emptyCell(plan))
+    report.cells = planTierOne(opts).map(plan => {
+      if (plan.kind !== 'micro') return emptyCell(plan)
+      const snapshot = planMicroSlices(opts)
+        .map(slice => formatSnapshotStatus(slice.snapshot, slice.timeoutSec))
+        .filter(label => label !== 'n/a')
+        .join('/') || 'n/a'
+      return emptyCell(plan, { snapshot })
+    })
     report.totals = { confirmed: 0, netNew: null, costUsd: 0, wallMs: 0, cells: report.cells.length }
     report.notes.push('dry-run: no model, worker, CLI or fixture runs were started')
     if (!report.tier0.pass) {

@@ -710,7 +710,8 @@ export interface WiringMetricValues {
   /**
    * Late OOB conversions promoted into findings. Counted from `oob.receipt_confirmed`
    * subscription events (authoritative) and the drain event's `promotedReceipts`; falls back to
-   * the bounded-drain `promotedLate` counter only when no conversion evidence exists.
+   * the bounded-drain `promotedLate` counter, then the relay's promoted late rows when the run
+   * ends before a drain event (wall cap / interruption).
    */
   latePromotions: number | null
   /** Blocking approval requests (manual/pending), never auto-review audit rows. */
@@ -1019,10 +1020,15 @@ export function resolveLatePromotions(input: {
   drainPromotedReceipts: number | null
   /** Distinct `oob.receipt_confirmed` subscriptions (null when the event log is unreadable). */
   receiptConfirmed: number | null
+  /** Late promotions observed directly in the durable `pending_oob` relay rows. */
+  pendingLatePromoted: number | null
 }): number | null {
   const converted = Math.max(input.receiptConfirmed ?? 0, input.drainPromotedReceipts ?? 0)
   if (converted > 0) return converted
   if (input.drainPromotedLate !== null) return input.drainPromotedLate
+  // A run can be finalized before the bounded drain records its event (wall cap / interruption).
+  // The relay rows still prove the promotion, so report it rather than a drain-only zero.
+  if (input.pendingLatePromoted !== null) return input.pendingLatePromoted
   if (input.receiptConfirmed !== null) return 0
   return null
 }
@@ -1248,7 +1254,12 @@ export function collectWiringMetrics(input: {
   const oob = readOobRunMetrics(input.dataDir, input.runId)
   // Conversion events are authoritative; the drain counter alone misses receipts converted before
   // the bounded drain started (see countReceiptPromotions).
-  const latePromotions = resolveLatePromotions({ drainPromotedLate, drainPromotedReceipts, receiptConfirmed })
+  const latePromotions = resolveLatePromotions({
+    drainPromotedLate,
+    drainPromotedReceipts,
+    receiptConfirmed,
+    pendingLatePromoted: oob?.latePromoted ?? null,
+  })
   const leads = readProgramGraphLeads(input.storage, input.runId)
 
   const approvalRequestsCreated = countSql(
