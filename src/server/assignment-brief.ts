@@ -81,6 +81,32 @@ export interface AssignmentBriefDetLead {
   verifyFailureReason?: string | null
 }
 
+/**
+ * Explicit settlement proof obligation for a hypothesis route: the exact mounted route, the
+ * declared input names, the authorization context and the sink expression. Names only — never
+ * values, bodies or secrets — so a specialist can build the replay spec without re-reading the
+ * graph or guessing the route shape.
+ */
+export interface AssignmentBriefProofObligation {
+  /** `METHOD /mounted/path` (as extracted), or a bare path. */
+  route: string
+  method?: string
+  /** Parameter NAMES only. */
+  params?: readonly string[]
+  /** `guarded` / `unguarded` from the mounted middleware chain. */
+  auth?: string
+  /** `sinkKind@file:line` of the dataflow terminus. */
+  sink?: string
+  /** `route -> ... -> sink` hop locations, already bounded by the caller. */
+  chain?: string
+  /** Exact control actor for the differential (persona handle). */
+  controlPersona?: string
+  /** Exact variant actor for the differential (persona handle). */
+  variantPersona?: string
+  /** Explicit deliverable: invoke guardian_verify(<tool>) or record a coded proofGapReason. */
+  deliverable?: string
+}
+
 export interface AssignmentBriefInput {
   missionKind: MissionKind
   origin: string
@@ -95,6 +121,8 @@ export interface AssignmentBriefInput {
    * `buildCodeDataflowSlice`). Always hard-truncated before rendering.
    */
   codeSlice?: CodeDataflowSlice
+  /** One explicit proof obligation naming the route, auth context and sink chain. */
+  proofObligation?: AssignmentBriefProofObligation
   /**
    * `compact` (default, 600 B slice, 1536 B brief) or `full` (1600 B slice, 4096 B brief) when
    * the planner/coordinator explicitly asks to expand the code evidence.
@@ -240,6 +268,34 @@ function normalizeConfirmed(ref: AssignmentBriefConfirmedRef): Record<string, un
   }
 }
 
+function normalizeProofObligation(
+  obligation: AssignmentBriefProofObligation,
+): Record<string, unknown> | undefined {
+  const raw = typeof obligation.route === 'string' ? obligation.route.trim().slice(0, 180) : ''
+  if (!raw) return undefined
+  const matched = /^([A-Za-z]{2,10})\s+(.*)$/.exec(raw)
+  const routeMethod = (obligation.method || matched?.[1] || '')
+    .toUpperCase().replace(/[^A-Z]/g, '').slice(0, 10)
+  const routePath = cleanPath(matched?.[2] ?? raw)
+  const params = [...new Set((obligation.params ?? []).map(cleanParamName).filter(Boolean))].slice(0, 8)
+  const auth = cleanText(obligation.auth, 16)
+  const sink = redactBriefText(obligation.sink, 96)
+  const chain = redactBriefText(obligation.chain, 200)
+  const controlPersona = cleanText(obligation.controlPersona, 48)
+  const variantPersona = cleanText(obligation.variantPersona, 48)
+  const deliverable = redactBriefText(obligation.deliverable, 240)
+  return {
+    route: `${routeMethod || 'ANY'} ${routePath}`,
+    ...(params.length ? { params } : {}),
+    ...(auth ? { auth } : {}),
+    ...(sink ? { sink } : {}),
+    ...(chain ? { chain } : {}),
+    ...(controlPersona ? { controlPersona } : {}),
+    ...(variantPersona ? { variantPersona } : {}),
+    ...(deliverable ? { deliverable } : {}),
+  }
+}
+
 function normalizeDetLead(lead: AssignmentBriefDetLead): Record<string, unknown> {
   return {
     probeClass: cleanText(lead.probeClass, 40) || 'unknown',
@@ -260,6 +316,7 @@ interface WorkingState {
   detLead?: Record<string, unknown>
   code?: CodeDataflowSlice
   codeBudget: number
+  proofObligation?: Record<string, unknown>
 }
 
 function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<string, unknown> {
@@ -267,6 +324,7 @@ function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<
     mission: input.missionKind,
     origin: cleanText(input.origin.split(/[?#]/, 1)[0], 180),
     ...(state.detLead ? { detLead: state.detLead } : {}),
+    ...(state.proofObligation ? { proofObligation: state.proofObligation } : {}),
     routes: state.routes,
     ...(state.code ? { code: state.code } : {}),
     ...(state.linked.length ? { linkedRoutes: state.linked } : {}),
@@ -372,6 +430,7 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
   const code = input.codeSlice
     ? renderCodeDataflowSlice(input.codeSlice, codeBudget).slice
     : undefined
+  const proofObligation = input.proofObligation ? normalizeProofObligation(input.proofObligation) : undefined
 
   return {
     routes,
@@ -381,6 +440,7 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
     confirmed,
     ...(input.detLead ? { detLead: normalizeDetLead(input.detLead) } : {}),
     ...(code ? { code } : {}),
+    ...(proofObligation ? { proofObligation } : {}),
     codeBudget,
   }
 }
@@ -445,6 +505,12 @@ export function buildAssignmentBriefPacket(
     if (state.routes[0]?.params?.length) {
       state.routes[0] = { ...state.routes[0], params: state.routes[0].params.slice(0, -1) }
       if (!state.routes[0].params?.length) delete state.routes[0].params
+      continue
+    }
+    // The obligation is a convenience wrapper over the code slice; drop it before any byte of the
+    // file:line evidence so a tight render can never lose the dataflow chain.
+    if (state.proofObligation) {
+      state.proofObligation = undefined
       continue
     }
     if (state.code && state.codeBudget > 240) {
