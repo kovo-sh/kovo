@@ -104,7 +104,15 @@ The +1 is `SQL injection differential · GET /api/v1/search` (shopflow), seeded 
 `GET /api/v1/search query=query` with `source=inferred_html:sensitive`, confirmed by the existing
 `sqli_boolean` differential and replay path as `floor/runtime_confirmed`.
 
-Per-source counts for that held-out shopflow cell (`phase0.param_discovery`):
+Per-source counts (`phase0.param_discovery`, dev seed 1 run 3):
+
+| app | observed | inferred_bundle | inferred_html | inferred_ast | sensitivity checked / passed / dead |
+| --- | --- | --- | --- | --- | --- |
+| acme-saas | 24 | 0 | 23 | 0 | 2 / 0 / 2 |
+| shopflow | 34 | 0 | 5 | 0 | 1 / 1 / 0 |
+| opsportal | 36 | 0 | 9 | 0 | 2 / 0 / 2 |
+
+Held-out shopflow cell (`phase0.param_discovery`):
 
 ```json
 {"observed":34,"inferred":5,"sensitivityPassed":1,
@@ -113,9 +121,13 @@ Per-source counts for that held-out shopflow cell (`phase0.param_discovery`):
 sensitivity: {"checked":1,"passed":1,"dropped":0}
 ```
 
-- **Inferred params that passed sensitivity:** 1 (`query`).
+- **Inferred params that passed sensitivity:** 1 (`query`, held-out shopflow and dev shopflow).
+  The other `inferred_html` rows are response-field-derived JSON body fields for write targets;
+  the three checked-but-dead query candidates on acme/ops were deleted.
 - **Confirmations from an inferred param:** 1 in dev seed 1 and 1 in salted held-out — both after
   the normal differential/replay verification, never from the inferred name alone.
+- No `inferred_bundle`/`inferred_ast` rows appeared in these three product cells (their JS had no
+  request literals); both tags are covered by `tests/v7-param-discovery.test.ts`.
 
 Capability suites:
 
