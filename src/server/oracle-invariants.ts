@@ -680,8 +680,16 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     isReadMethod(step.method) &&
     isSuccess(step.status) &&
     sameRoute(step, probe))
+  // A cross-tenant mutation makes an *unauthenticated* denial meaningless as an authorization
+  // control: a 401 for an anonymous caller proves the route requires authentication, not that the
+  // probe crossed an ownership boundary (the probe already authenticated). This was the
+  // `GET /api/me`-style misattribution where `anonAssign=401` was offered as the control for a
+  // viewer writing another tenant's ticket.
+  const crossTenantMutation = declaredResourceTenant !== null && probeTenant !== null && declaredResourceTenant !== probeTenant
   const peerDenial = (control: ImpactStep): boolean => {
     const tenant = control.actor.tenant ?? null
+    const unauthenticated = control.actor.handle === null && tenant === null
+    if (unauthenticated && crossTenantMutation && mutatingProbe !== undefined) return false
     if (tenant === null || probeTenant === null) return true
     return tenant === probeTenant ||
       (mirrorCorroborated && declaredResourceTenant !== null && tenant === declaredResourceTenant && declaredResourceTenant !== probeTenant)
@@ -1180,8 +1188,12 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     isReadMethod(step.method) &&
     isSuccess(step.status) &&
     sameRoute(step, mutatingProbe))
+  const crossTenantWrite = resourceTenant !== null && probeTenant !== null && resourceTenant !== probeTenant
   const peerDenial = (control: ImpactStep): boolean => {
     const tenant = control.actor.tenant ?? null
+    const unauthenticated = control.actor.handle === null && tenant === null
+    // `anon=401` proves authentication, not authorization, for a cross-tenant write.
+    if (unauthenticated && crossTenantWrite) return false
     if (tenant === null || probeTenant === null) return true
     return tenant === probeTenant ||
       (mirrorCorroborated && resourceTenant !== null && tenant === resourceTenant && resourceTenant !== probeTenant)

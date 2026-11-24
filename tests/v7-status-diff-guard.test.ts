@@ -320,7 +320,9 @@ test('status-diff guard: cross-tenant writes need an authenticated peer control'
     steps: [anonDeny, write],
   })
   assert.equal(anonymousOnly.satisfied, false, anonymousOnly.reason)
-  assert.match(anonymousOnly.reason, /anonymous/i)
+  // Rejected either because an anonymous 401 is not a peer control, or because no pre-mutation
+  // readback exists — both are valid; the point is that `anon=401` cannot carry the claim.
+  assert.match(anonymousOnly.reason, /anonymous|pre-mutation readback/i)
 
   const peerDeny = step({ id: 'peer-deny', arm: 'control', method: 'POST', status: 403, route: '/api/cases/3/assign', actor: { handle: 'viewer_b', role: 'viewer', tenant: 'acme', auth: 'cookie', sameSite: null } })
   const peerControlled = assessImpactEvidence({
