@@ -49,11 +49,13 @@
  * `LEGACY_UNWIRED_SPECKINDS` with the measured blocking reason; `wiredRecipeForSpecKind` is the
  * single source of truth for the guard.
  */
-import type { AmbientAuth, ImpactStep, RoleName } from './oracle-invariants.ts'
+import { matchInjectionFingerprint } from './oracle-invariants.ts'
+import type { AmbientAuth, ImpactStep, InjectionFamily, RoleName } from './oracle-invariants.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import { buildProofReceipt, verifyReceipt } from './proof-receipt.ts'
 import type {
   ProofReceipt,
+  ReceiptBrowserTrace,
   ReceiptOobEvent,
   ReceiptTranscript,
   ReceiptTranscriptEntry,
@@ -80,6 +82,16 @@ export const FLOOR_RECIPE_IDS: readonly FloorRecipeId[] = [
   'race_burst',
   'disclosure',
 ]
+
+/**
+ * Cut 3c/3d recipe ids. They are intentionally **not** in `FloorRecipeId` yet: the persisted
+ * envelope enum (`src/replay-spec.ts`) and the retest title table (`floor-recipe-engine.ts`) own that
+ * set, and both are outside this stream's lease. These recipes are complete and independently
+ * runnable/testable; registering them for persistence is a one-line follow-up in each of those two
+ * files (reported in the handoff).
+ */
+export type Cut3FloorRecipeId = 'redirect' | 'browser_sink' | 'injection_fingerprint'
+export const CUT3_FLOOR_RECIPE_IDS: readonly Cut3FloorRecipeId[] = ['redirect', 'browser_sink', 'injection_fingerprint']
 
 /** A persona the recipe sends as. Host-resolved in production; explicit in fixtures. */
 export interface FloorActor {
@@ -127,10 +139,22 @@ export interface FloorOobQuery {
 }
 
 /** The Layer-1 seam. Production supplies a broker adapter; tests supply fixtures. */
+export interface FloorBrowserInput {
+  origin: string
+  url: string
+  actor: FloorActor
+  marker?: string
+}
+
 export interface FloorRecipeDeps {
   request(spec: FloorRequestSpec): Promise<FloorExchange> | FloorExchange
   /** Durable callback lookup for the token the injection exchange carried. */
   oob?(query: FloorOobQuery): Promise<ReceiptOobEvent | null> | ReceiptOobEvent | null
+  /**
+   * Host-recorded browser trace for a Layer-3 sink proof. Optional: a recipe that needs it fails
+   * closed (`browser_trace`) rather than inventing trace ids.
+   */
+  browserTrace?(input: FloorBrowserInput): Promise<ReceiptBrowserTrace | null> | ReceiptBrowserTrace | null
   /** Stable id source; defaults to a per-run counter. */
   nextExchangeId?(): string
 }
@@ -272,6 +296,38 @@ export interface DisclosureArgs extends FloorRecipeBaseArgs {
   oracleEvents?: string[]
 }
 
+export interface RedirectArgs extends FloorRecipeBaseArgs {
+  actor: FloorActor
+  /** Same-origin control request; defaults to `pathAndQuery`. */
+  controlPathAndQuery?: string
+  /** Probe request carrying the attacker-controlled destination; defaults to `pathAndQuery`. */
+  probePathAndQuery?: string
+  /** Optional canary host the `Location` must match (a regex is derived from it). */
+  canaryHost?: string
+}
+
+export interface BrowserSinkArgs extends FloorRecipeBaseArgs {
+  actor: FloorActor
+  /** URL the browser session loads; defaults to `origin + pathAndQuery`. */
+  url?: string
+  /** Sink names the host trace must contain (e.g. `dom_xss`, `postmessage`). */
+  expectSinks?: readonly string[]
+  /** Marker the driver looks for in the trace (never a payload). */
+  marker?: string
+}
+
+export interface InjectionFingerprintArgs extends FloorRecipeBaseArgs {
+  actor: FloorActor
+  /** The injected value (the payload itself; sent only to the target). */
+  payload: string
+  /** Benign value for the control arm; defaults to `guardian-benign`. */
+  controlValue?: string
+  /** Injection family used to select the fingerprint vocabulary. */
+  family?: InjectionFamily
+  /** JSON body template; `param` is replaced per arm. */
+  jsonBody?: unknown
+}
+
 export interface FloorRecipeArgsMap {
   access_boundary: AccessBoundaryArgs
   persisted_mutation: PersistedMutationArgs
@@ -280,6 +336,14 @@ export interface FloorRecipeArgsMap {
   race_burst: RaceBurstArgs
   disclosure: DisclosureArgs
 }
+
+export interface Cut3FloorRecipeArgsMap {
+  redirect: RedirectArgs
+  browser_sink: BrowserSinkArgs
+  injection_fingerprint: InjectionFingerprintArgs
+}
+
+export type Cut3FloorRecipeArgs = Cut3FloorRecipeArgsMap[Cut3FloorRecipeId]
 
 export type FloorRecipeArgs = FloorRecipeArgsMap[FloorRecipeId]
 
@@ -307,6 +371,8 @@ export interface FloorRecipeContext {
   readonly exchangeIds: readonly string[]
   send(spec: FloorRequestSpec): Promise<FloorRecipeStep>
   oob(query: FloorOobQuery): Promise<ReceiptOobEvent | null>
+  /** Record (and cite) a host-recorded browser trace; null when the host produced none. */
+  browser(input: FloorBrowserInput): Promise<ReceiptBrowserTrace | null>
   /**
    * Record a preconditions the oracle needs that the receipt gate alone cannot name. Returns the
    * condition so a recipe can continue gathering the rest of the minimum evidence.
@@ -387,6 +453,7 @@ class RecipeContext implements FloorRecipeContext {
   private readonly deps: FloorRecipeDeps
   private readonly entries: ReceiptTranscriptEntry[] = []
   private readonly oobEvents: ReceiptOobEvent[] = []
+  private readonly traces: ReceiptBrowserTrace[] = []
   private exchangeCount = 0
 
   constructor(args: FloorRecipeArgs, deps: FloorRecipeDeps) {
@@ -403,7 +470,11 @@ class RecipeContext implements FloorRecipeContext {
   }
 
   transcript(): ReceiptTranscript {
-    return { entries: [...this.entries], oobEvents: [...this.oobEvents] }
+    return {
+      entries: [...this.entries],
+      oobEvents: [...this.oobEvents],
+      ...(this.traces.length > 0 ? { browserTraces: [...this.traces] } : {}),
+    }
   }
 
   async send(spec: FloorRequestSpec): Promise<FloorRecipeStep> {
@@ -472,6 +543,12 @@ class RecipeContext implements FloorRecipeContext {
     const event = this.deps.oob ? await this.deps.oob(query) : null
     if (event && !this.oobEvents.some(existing => existing.id === event.id)) this.oobEvents.push(event)
     return event
+  }
+
+  async browser(input: FloorBrowserInput): Promise<ReceiptBrowserTrace | null> {
+    const trace = this.deps.browserTrace ? await this.deps.browserTrace(input) : null
+    if (trace && !this.traces.some(existing => existing.id === trace.id)) this.traces.push(trace)
+    return trace
   }
 
   require(condition: boolean, role: string, message: string): boolean {
@@ -549,16 +626,16 @@ function targetOf(args: FloorRecipeBaseArgs): ProofReceipt['target'] {
 // Recipe definitions
 // ---------------------------------------------------------------------------
 
-interface FloorRecipeDefinition<A extends FloorRecipeArgs> {
+interface FloorRecipeDefinition<A extends FloorRecipeBaseArgs> {
   readonly id: FloorRecipeId
   run(args: A, ctx: FloorRecipeContext): Promise<ProofReceipt>
 }
 
-function defineRecipe<A extends FloorRecipeArgs>(
-  id: FloorRecipeId,
+function defineRecipe<A extends FloorRecipeBaseArgs>(
+  id: string,
   run: (args: A, ctx: FloorRecipeContext) => Promise<ProofReceipt>,
 ): FloorRecipeDefinition<A> {
-  return { id, run }
+  return { id: id as FloorRecipeId, run }
 }
 
 /**
@@ -996,6 +1073,209 @@ const disclosure = defineRecipe<DisclosureArgs>('disclosure', async (args, ctx) 
     ...(args.oracleEvents ? { oracleEvents: args.oracleEvents } : {}),
   })
 })
+
+
+// ---------------------------------------------------------------------------
+// Cut 3c/3d — redirect, browser sink, injection fingerprint
+// ---------------------------------------------------------------------------
+
+function headerValue(headers: Record<string, string> | null | undefined, name: string): string | null {
+  if (!headers) return null
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === name.toLowerCase() && typeof value === 'string' && value.length > 0) return value
+  }
+  return null
+}
+
+function hostOfLocation(location: string | null, origin: string): string | null {
+  if (!location) return null
+  try { return new URL(location, origin).host.toLowerCase() } catch { return null }
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function isRedirectStatus(status: number | null): boolean {
+  return status !== null && status >= 300 && status < 400
+}
+
+/** `http_chain` open_redirect / url_redirect → receipt `redirect` rule (off-origin Location). */
+const redirect = defineRecipe<RedirectArgs>('redirect', async (args, ctx) => {
+  const controlPath = args.controlPathAndQuery ?? args.pathAndQuery
+  const probePath = args.probePathAndQuery ?? args.pathAndQuery
+  const control = await ctx.send({
+    arm: 'control',
+    role: 'same_origin_control',
+    method: args.method,
+    pathAndQuery: controlPath,
+    actor: args.actor,
+    ...(args.headers ? { headers: args.headers } : {}),
+  })
+  const probe = await ctx.send({
+    arm: 'probe',
+    role: 'redirect_probe',
+    method: args.method,
+    pathAndQuery: probePath,
+    actor: args.actor,
+    ...(args.headers ? { headers: args.headers } : {}),
+  })
+  const probeLocation = headerValue(probe.exchange.responseHeaders, 'location')
+  const controlLocation = headerValue(control.exchange.responseHeaders, 'location')
+  const targetHost = hostOfLocation(args.origin, args.origin)
+  const probeHost = hostOfLocation(probeLocation, args.origin)
+  ctx.require(isRedirectStatus(probe.exchange.status), 'redirect_probe', `The probe returned ${probe.exchange.status ?? 'no status'} instead of a 3xx redirect.`)
+  ctx.require(Boolean(probeLocation), 'redirect_probe', 'The probe response carried no Location header; a 3xx status alone is not an open redirect.')
+  ctx.require(Boolean(probeHost) && probeHost !== targetHost, 'redirect_probe', `The Location ${probeLocation ?? '(none)'} stays on the target origin.`)
+  ctx.require(controlLocation !== probeLocation, 'same_origin_control', 'The same-origin control redirects to the same destination, so the destination is not attacker-controlled.')
+  return buildProofReceipt({
+    vulnClass: args.vulnClass,
+    target: targetOf(args),
+    exchangeIds: [control.exchangeId, probe.exchangeId],
+    browserTraceIds: [],
+    claimedDelta: `The probe redirected to ${probeLocation ?? 'no destination'} (off-origin) while the same-origin control ${controlLocation ? `redirected to ${controlLocation}` : 'stayed on origin'}.`,
+    ...(args.canaryHost ? { proofPatterns: [escapeRegex(args.canaryHost)] } : {}),
+  })
+})
+
+/** `browser_chain` / DOM sink → receipt `browser` rule over a host-recorded trace. */
+const browserSink = defineRecipe<BrowserSinkArgs>('browser_sink', async (args, ctx) => {
+  const url = args.url ?? `${args.origin.replace(/\/+$/, '')}${args.pathAndQuery}`
+  const browserClass = /^(?:browser_|dom_|postmessage)/i.test(args.vulnClass)
+  ctx.require(
+    browserClass,
+    'receipt_class',
+    `browser_sink needs a browser-class label (dom_*/browser_*/postmessage*); ${args.vulnClass} maps to a different receipt rule.`,
+  )
+  const trace = await ctx.browser({ origin: args.origin, url, actor: args.actor, ...(args.marker ? { marker: args.marker } : {}) })
+  ctx.require(trace !== null, 'browser_trace', 'No host-recorded browser trace was produced for this origin.')
+  const sinks = trace?.sinks ?? []
+  ctx.require(sinks.length > 0, 'browser_sink', 'The browser trace recorded no sink execution (DOM XSS, postMessage, storage write).')
+  if (args.expectSinks && args.expectSinks.length > 0) {
+    ctx.require(
+      args.expectSinks.some(sink => sinks.includes(sink)),
+      'browser_sink',
+      `The trace recorded ${sinks.join(', ') || 'no sinks'}; expected one of ${args.expectSinks.join(', ')}.`,
+    )
+  }
+  return buildProofReceipt({
+    vulnClass: args.vulnClass,
+    target: targetOf(args),
+    exchangeIds: [],
+    browserTraceIds: trace ? [trace.id] : [],
+    claimedDelta: `The recorded browser trace executed ${sinks.join(', ') || 'no sink'} on ${url}.`,
+  })
+})
+
+/** Fingerprinted SQL error / traversal / command injection → receipt `impact` rule (never status). */
+const injectionFingerprint = defineRecipe<InjectionFingerprintArgs>('injection_fingerprint', async (args, ctx) => {
+  const controlValue = args.controlValue ?? 'guardian-benign'
+  // The recipe owns the arm shapes: a query-located parameter is substituted in the query string,
+  // a JSON-located one in the body. An unmovable carrier fails closed rather than sending the same
+  // value twice (which would make a control/fingerprint comparison meaningless).
+  const armFor = (value: string): { pathAndQuery: string; jsonBody?: Record<string, unknown> } | null => {
+    if (args.jsonBody !== undefined) {
+      const base = args.jsonBody !== null && typeof args.jsonBody === 'object' && !Array.isArray(args.jsonBody)
+        ? { ...(args.jsonBody as Record<string, unknown>) }
+        : {}
+      if (args.param) base[args.param] = value
+      return { pathAndQuery: args.pathAndQuery, jsonBody: base }
+    }
+    if (!args.param) return null
+    try {
+      const url = new URL(args.pathAndQuery, 'http://guardian.invalid')
+      if (!url.searchParams.has(args.param)) return null
+      url.searchParams.set(args.param, value)
+      return { pathAndQuery: `${url.pathname}${url.search}` }
+    } catch {
+      return null
+    }
+  }
+  const controlArm = armFor(controlValue)
+  const probeArm = armFor(args.payload)
+  ctx.require(controlArm !== null && probeArm !== null, 'injection_probe', 'The injected parameter could not be moved (a query key or JSON body field is required).')
+  const control = await ctx.send({
+    arm: 'control',
+    role: 'benign_control',
+    method: args.method,
+    pathAndQuery: controlArm?.pathAndQuery ?? args.pathAndQuery,
+    actor: args.actor,
+    ...(controlArm?.jsonBody ? { jsonBody: controlArm.jsonBody } : {}),
+    ...(args.headers ? { headers: args.headers } : {}),
+  })
+  const probe = await ctx.send({
+    arm: 'probe',
+    role: 'injection_probe',
+    method: args.method,
+    pathAndQuery: probeArm?.pathAndQuery ?? args.pathAndQuery,
+    actor: args.actor,
+    ...(probeArm?.jsonBody ? { jsonBody: probeArm.jsonBody } : {}),
+    ...(args.headers ? { headers: args.headers } : {}),
+  })
+  const textOf = (step: FloorRecipeStep): string => {
+    const exchange = step.exchange
+    const parts = [exchange.body ?? '']
+    if (exchange.json !== undefined) parts.push(JSON.stringify(exchange.json))
+    if (exchange.carrierText) parts.push(exchange.carrierText)
+    return parts.join('\n')
+  }
+  const fingerprint = matchInjectionFingerprint(textOf(probe), args.family)
+  ctx.require(fingerprint !== null, 'injection_probe', 'The probe response carried no engine/parser error fingerprint; a status change alone is not injection.')
+  ctx.require(
+    fingerprint === null || !matchInjectionFingerprint(textOf(control), fingerprint.family),
+    'benign_control',
+    'The benign control produced the same engine error, so the fingerprint is infrastructure noise, not injection.',
+  )
+  if (fingerprint === null) {
+    return buildProofReceipt({
+      vulnClass: args.vulnClass,
+      target: targetOf(args),
+      exchangeIds: [control.exchangeId, probe.exchangeId],
+      browserTraceIds: [],
+      claimedDelta: 'The injection probe produced no engine/parser fingerprint, so no semantic oracle exists.',
+    })
+  }
+  return buildProofReceipt({
+    vulnClass: args.vulnClass,
+    target: targetOf(args),
+    exchangeIds: [control.exchangeId, probe.exchangeId],
+    browserTraceIds: [],
+    claimedDelta: `The ${args.family ?? 'injection'} payload produced a ${fingerprint.family}/${fingerprint.label} fingerprint (${fingerprint.text}) that the benign control did not.`,
+  })
+})
+
+const CUT3_DEFINITIONS: { readonly [K in Cut3FloorRecipeId]: FloorRecipeDefinition<Cut3FloorRecipeArgsMap[K]> } = {
+  redirect,
+  browser_sink: browserSink,
+  injection_fingerprint: injectionFingerprint,
+}
+
+export interface Cut3FloorRecipe {
+  readonly id: Cut3FloorRecipeId
+  readonly args: Cut3FloorRecipeArgs
+  run(ctx: FloorRecipeContext): Promise<ProofReceipt>
+}
+
+/** Build a typed Cut 3c/3d recipe instance (not yet registered for persistence; see the id note). */
+export function cut3FloorRecipe<K extends Cut3FloorRecipeId>(
+  id: K,
+  args: Cut3FloorRecipeArgsMap[K],
+): Cut3FloorRecipe {
+  const definition = CUT3_DEFINITIONS[id] as FloorRecipeDefinition<Cut3FloorRecipeArgsMap[K]>
+  return { id, args, run: ctx => definition.run(args, ctx) }
+}
+
+/** Run a Cut 3c/3d recipe through the same runner, receipt gate and failure vocabulary. */
+export async function runCut3Recipe(recipe: Cut3FloorRecipe, deps: FloorRecipeDeps): Promise<FloorRecipeExecution> {
+  return runFloorRecipe(
+    {
+      id: recipe.id as unknown as FloorRecipeId,
+      args: recipe.args as unknown as FloorRecipeArgs,
+      run: recipe.run,
+    },
+    deps,
+  )
+}
 
 const DEFINITIONS: { readonly [K in FloorRecipeId]: FloorRecipeDefinition<FloorRecipeArgsMap[K]> } = {
   access_boundary: accessBoundary,
