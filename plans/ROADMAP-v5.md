@@ -997,3 +997,17 @@ Measured (held-out shopflow, 600 s, K=6, isolated kept dirs): **8/19 at 100% pre
 Dev floor 36/59 (3 runs, 0 spread), xben 25/25, held-out-saas 20/20 + 20/20 patches.
 
 **Also launched `capability-misses`** for the four named held-out gaps (`api-jwt-alg-none`, `giftcard-race`, `coupon-reuse`, `inventory-oversell`) — one JWT boundary and three stateful race/workflow classes, the general-capability path to +4–5 held-out.
+
+### 2026-11-24 — retest migrated to receipts; the real VM pin is the **agent** proof path
+
+`retest-receipts` merged (`d3e043d`). What landed:
+- **Recipe envelope persisted** (`replay-spec.ts`: `floorRecipeEnvelopeSchema` = `{recipeId, args}`; `floor-recipe-engine.recipeSpecRecord()` embeds it), and `retestReplaySpec()` now **prefers the envelope**: re-runs the exact recipe → `verifyReceipt()` → `reproduced` / `fixed` / `inconclusive` (a `recipe_error` is never falsely "fixed"). Zero DSL calls for recipe rows.
+- **Capability harness** `scripts/benchmark-live.ts` now calls the product entrypoint `retestReplaySpec` instead of its own `verifyReplaySpecInline` loop.
+- Test proves the DSL verdict is genuinely bypassed: a deliberately false `assertionsJq` still retests `reproduced`, then `fixed` after hardening.
+- Parity: xben 25/25, held-out-saas 20/20 + **20/20 patches fixed** (isolation 4/4 on all 20), dev **36/59** 0-spread, held-out **26/58** at 100%.
+
+**But `<1.0K` was not reached, and the reason is a plan-level correction:** no legacy *branch* became unreachable, because the dominant caller is `Execution`'s **agent** `verify_replay_spec` / `propose_chain_finding` path, which accepts any of the 14 kinds. The agent half could not be migrated inside that lease because **production never wires a `guardian_verify` handler into `AgentSession`**, and there is **no persistence table for the verified script** (`schema.ts` has no such column). So agent proofs remain declarative specs — that interface is what pins the VM.
+
+**Independent confirmation of the floor erratum:** this stream measured salted held-out at **26/58** (11/8/7) on a clean tree, matching the cut3b sighting. The 28/58 in the #15 certificate is therefore an artifact of the persona-scope bleed, not current recall.
+
+**Launched `agent-script-proofs`** to do the actual M0-closing work: persist the verified agent proof script + receipt, wire the handler in production, make `verify_replay_spec`/`propose_chain_finding` receipt-first, then delete the legacy branches with parity held.
