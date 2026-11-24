@@ -144,6 +144,8 @@ import type {
 } from './tier3-approval.ts'
 import { drainPendingOob, scheduleFinalReport } from './oob-drain.ts'
 import type { OobDrainOptions, OobDrainResult } from './oob-drain.ts'
+import { buildOobReceipt, verifyReceipt } from './proof-receipt.ts'
+import type { ReceiptOobEvent } from './proof-receipt.ts'
 export { DEFAULT_OOB_DRAIN_MS, OOB_DRAIN_POLL_MS, resolveOobDrainMs } from './oob-drain.ts'
 import { ProbePlanRegistry, selectRankedProbeTargets } from './probe-plan.ts'
 import { graphLeadTargets, seedCodeToRuntimeLeads as seedGraphLeads } from './graph-leads.ts'
@@ -254,7 +256,7 @@ function alignFindingForEvidence(
   return { ...finding, cwe: label.cwe, category: label.category }
 }
 import { availableReviewChecks, parseReviewPlan, reviewPlanPrompt, standardChecks } from './review-plan.ts'
-import { approvalRequests, findings, messages, replaySpecs } from './schema.ts'
+import { approvalRequests, canaries, findings, messages, replaySpecs } from './schema.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
 import { tenantTagForRun } from './scope-policy.ts'
 import { dedupeCodeAuditSuspects, runThreeStageSemanticAudit, runVariantSweepForFinding, toChainStepInputs } from './semantic-audit.ts'
@@ -1723,6 +1725,49 @@ function createBroker(options: { storage: SecondOrderStore; canaryBroker: Canary
 }
 
 /** v6 Phase 1: map a deterministic probe class to the specialist category it best belongs to. */
+/**
+ * Classify a probe-minted canary purpose (`engine:ssrf:<param> (origin)`, `ssrf:<param>:http
+ * (origin)`, `xxe:general_entity (origin)`). Anything else (JWT/JKU, template, auth canaries) is
+ * not an async-injection proof and must not be converted into a finding.
+ */
+export function probeCanaryClass(purpose: string): { vulnClass: 'ssrf' | 'xxe'; origin: string; param: string | null } | null {
+  const origin = /\(([^()]+)\)\s*$/.exec(purpose)?.[1]?.trim()
+  if (!origin) return null
+  const match = /^(?:engine:)?(ssrf|xxe)(?::([^()\s]+))?/.exec(purpose)
+  if (!match) return null
+  const vulnClass = match[1] as 'ssrf' | 'xxe'
+  const segment = match[2] ?? ''
+  const variant = new Set(['http', 'dns', 'header', 'custom', 'general_entity', 'param_entity', 'svg_dtd'])
+  const param = vulnClass === 'ssrf' && segment && !variant.has(segment)
+    ? segment.split(':')[0] ?? null
+    : null
+  return { vulnClass, origin, param: param || null }
+}
+
+function receiptFindingTemplate(vulnClass: 'ssrf' | 'xxe', origin: string, param: string | null) {
+  const host = (() => { try { return new URL(origin).hostname } catch { return origin } })()
+  if (vulnClass === 'ssrf') {
+    return {
+      title: `Asynchronous server-side request forgery on ${host}${param ? ` (${param})` : ''}`,
+      severity: 'high' as const,
+      cwe: 'CWE-918',
+      category: 'ssrf-redirects' as const,
+      impact: 'A server-side fetch of an attacker-controlled URL completes after the HTTP response, so synchronous SSRF filtering and response-time evidence miss it.',
+      remediation: 'Resolve and allowlist outbound destinations against a strict scheme/host policy, block metadata and loopback ranges, and perform the fetch inside the request scope so failures are observable.',
+      recheck: 'Re-inject the same canary URL and confirm no callback is delivered to the Guardian relay after the response.',
+    }
+  }
+  return {
+    title: `Asynchronous XML external entity fetch on ${host}`,
+    severity: 'high' as const,
+    cwe: 'CWE-611',
+    category: 'injection-input' as const,
+    impact: 'An external entity is resolved by a background worker after the upload/preview response, enabling internal file or HTTP exfiltration.',
+    remediation: 'Disable DTD and external entity resolution in the XML parser and process imports synchronously with a non-network resolver.',
+    recheck: 'Re-submit the same DOCTYPE entity document and confirm the collector receives no request after the response.',
+  }
+}
+
 function detLeadCategory(probeClass: string): string {
   switch (probeClass) {
     case 'authz_matrix': return 'broken-access-control'
@@ -9938,19 +9983,245 @@ export class Execution {
    * and records `oobDrainMs` / `promotedLate` in run-event meta. It never waits when nothing is
    * pending, so local-lab benchmark runs keep their zero-latency behavior.
    */
+  /**
+   * v7 Realism #2: a callback that lands after the synchronous probe/verification window still
+   * confirms an async SSRF/XXE. The durable `pending_oob` promotion is host-observed evidence, so it
+   * becomes a ProofReceipt validated against the recorded injection exchange and only then a
+   * `runtime_confirmed` finding (never a model assertion).
+   */
+  private promoteReceiptOob(runId: string): number {
+    let promotions: ReturnType<CanaryBroker['promoteLate']>
+    try { promotions = this.canaryBroker.promoteLate({ runId }) } catch { return 0 }
+    if (promotions.length === 0) return 0
+    let run: Run
+    try { run = this.storage.run(runId) } catch { return 0 }
+    if (run.status !== 'running') return 0
+    const approved = this.approvedOriginsSet(run)
+    let converted = 0
+    for (const promotion of promotions) {
+      const subscription = promotion.subscription
+      let canary: typeof canaries.$inferSelect | undefined
+      try {
+        canary = this.storage.db.select().from(canaries).where(eq(canaries.id, subscription.canaryId)).get()
+      } catch { canary = undefined }
+      if (!canary) continue
+      const classified = probeCanaryClass(canary.purpose)
+      if (!classified) continue
+      if (!approved.has(classified.origin)) continue
+      // The exact request that carried the canary is the causal binding; a callback alone does not
+      // prove that this target reached the listener.
+      let carrier: ReturnType<Store['searchExchanges']>[number] | undefined
+      try {
+        carrier = this.storage.searchExchanges(runId, subscription.token, { approvedOrigins: approved, limit: 10 })
+          .find(ex => [ex.pathAndQuery, ex.bodyPreview, JSON.stringify(ex.reqHeaders ?? {})]
+            .some(text => String(text).includes(subscription.token)))
+      } catch { carrier = undefined }
+      if (!carrier) continue
+      const receipt = buildOobReceipt({
+        vulnClass: classified.vulnClass,
+        origin: classified.origin,
+        method: carrier.method,
+        pathAndQuery: carrier.pathAndQuery,
+        ...(classified.param ? { param: classified.param } : {}),
+        exchangeIds: [carrier.id],
+        oobEventId: subscription.id,
+        claimedDelta: `The target fetched the injected ${classified.vulnClass.toUpperCase()} canary after its HTTP response (durable ${promotion.stage} callback).`,
+      })
+      const oobEvent: ReceiptOobEvent = {
+        id: subscription.id,
+        callbackId: promotion.callback.callbackId,
+        canaryId: subscription.canaryId,
+        token: subscription.token,
+        targetOrigin: classified.origin,
+        delivered: true,
+        stage: promotion.stage,
+        receivedAtMs: promotion.callback.receivedAt,
+        latencyMs: promotion.latencyMs,
+      }
+      let body = carrier.bodyPreview
+      try { body = this.storage.getExchange(runId, carrier.id).body } catch { /* preview is enough */ }
+      const verification = verifyReceipt(receipt, {
+        entries: [{
+          exchangeId: carrier.id,
+          step: {
+            id: carrier.id,
+            arm: 'probe',
+            method: carrier.method,
+            route: carrier.pathAndQuery.split('?')[0],
+            pathAndQuery: carrier.pathAndQuery,
+            status: carrier.status,
+            actor: { handle: carrier.personaHandle, role: null, tenant: null, auth: 'unknown', sameSite: null },
+            body,
+            requestHeaders: carrier.reqHeaders ?? null,
+            responseHeaders: carrier.respHeaders ?? null,
+          },
+          carrierText: `${carrier.pathAndQuery}\n${JSON.stringify(carrier.reqHeaders ?? {})}\n${body}`,
+        }],
+        oobEvents: [oobEvent],
+      })
+      if (!verification.confirmed) {
+        try {
+          this.storage.event(runId, 'oob.receipt_rejected', `OOB promotion for canary ${subscription.canaryId} did not verify: ${verification.reason}`, {
+            canaryId: subscription.canaryId,
+            subscriptionId: subscription.id,
+            reason: verification.reason,
+          })
+        } catch { /* store closed */ }
+        continue
+      }
+      try {
+        if (this.persistReceiptFinding(run, {
+          vulnClass: classified.vulnClass,
+          origin: classified.origin,
+          param: classified.param,
+          carrier,
+          receipt,
+          verification,
+          subscriptionId: subscription.id,
+        })) converted += 1
+      } catch { /* persistence is best-effort; never fail the drain */ }
+    }
+    return converted
+  }
+
+  private persistReceiptFinding(run: Run, input: {
+    vulnClass: 'ssrf' | 'xxe'
+    origin: string
+    param: string | null
+    carrier: ReturnType<Store['searchExchanges']>[number]
+    receipt: ReturnType<typeof buildOobReceipt>
+    verification: ReturnType<typeof verifyReceipt>
+    subscriptionId: string
+  }): boolean {
+    const asset = run.candidates.find(candidate => candidate.origin === input.origin && run.approved.includes(candidate.id))
+    if (!asset) return false
+    const template = receiptFindingTemplate(input.vulnClass, input.origin, input.param)
+    const rows = this.storage.db.select().from(findings).where(and(
+      eq(findings.runId, run.id),
+      eq(findings.goalRevision, run.goalRevision),
+    )).all()
+    // One async callback per (origin, class) target: never let a repeated poll inflate findings.
+    const duplicate = rows.find(row => row.finding.origin === input.origin &&
+      row.finding.cwe === template.cwe &&
+      (row.finding.status === 'confirmed' || row.finding.status === 'static_verified'))
+    if (duplicate) return false
+
+    const assignment = this.storage.workerList(run.id).find(worker => worker.id === input.carrier.assignmentId)
+      ?? this.storage.workerList(run.id)[0]
+    if (!assignment) return false
+    const evidence = this.storage.addArtifact(
+      run,
+      assignment,
+      'replay',
+      `ProofReceipt · async ${input.vulnClass.toUpperCase()} · ${new URL(input.origin).hostname}`,
+      JSON.stringify({
+        receipt: input.receipt,
+        verification: input.verification,
+        carrierExchangeId: input.carrier.id,
+        oobSubscriptionId: input.subscriptionId,
+      }, null, 2),
+      `receipt:oob:${input.subscriptionId}`,
+      [],
+    )
+
+    // Prefer the replay spec whose probe carried this canary (it has the chain context), else keep
+    // `replay_spec_id` null for a receipt-only finding.
+    let specRow: ReplaySpecRow | undefined
+    try {
+      specRow = this.storage.listReplaySpecs(run.id).find(row => {
+        const text = JSON.stringify(row.spec)
+        return text.includes(input.subscriptionId) || text.includes(input.carrier.id)
+      })
+    } catch { specRow = undefined }
+    const existing = specRow
+      ? rows.find(row => row.id === specRow!.findingId)
+      : rows.find(row => row.finding.origin === input.origin && row.finding.cwe === template.cwe && row.finding.status !== 'confirmed')
+    const findingId = existing?.id ?? randomUUID()
+    const finding: Finding = {
+      ...(existing?.finding ?? {}),
+      id: findingId,
+      origin: input.origin,
+      title: template.title,
+      status: 'confirmed',
+      severity: template.severity,
+      reason: input.verification.reason,
+      remediation: template.remediation,
+      impact: template.impact,
+      recheck: template.recheck,
+      category: template.category,
+      cwe: template.cwe,
+      confidence: 'high',
+      verification: `ProofReceipt ${input.receipt.oobEventIds[0]} · ${input.verification.rule} rule · ${input.verification.reason}`,
+      verificationTier: 'runtime_confirmed',
+      findingKind: 'multi_step_chain',
+      replaySpecId: specRow?.id,
+      exchangeIds: [...new Set([...(existing?.finding.exchangeIds ?? []), input.carrier.id])],
+      evidenceIds: [...new Set([...(existing?.finding.evidenceIds ?? []), evidence.id])],
+      scopeRevision: run.scopeRevision,
+    }
+    if (specRow) {
+      this.storage.upsertChainFinding(run, asset.id, finding, specRow.id, specRow.sourceOrigins)
+    } else if (existing) {
+      this.storage.db.update(findings).set({
+        verificationTier: 'runtime_confirmed',
+        verificationClass: 'runtime_confirmed',
+        finding,
+      }).where(and(eq(findings.runId, run.id), eq(findings.id, findingId))).run()
+    } else {
+      this.storage.db.insert(findings).values({
+        id: findingId,
+        runId: run.id,
+        assetId: asset.id,
+        goalRevision: run.goalRevision,
+        checkId: 'chain',
+        caseId: '',
+        findingKind: 'multi_step_chain',
+        replaySpecId: null,
+        sourceOrigins: [input.origin],
+        verificationTier: 'runtime_confirmed',
+        provenance: 'agent_only',
+        verificationClass: 'runtime_confirmed',
+        finding,
+      }).run()
+    }
+    try {
+      this.storage.upsertCoverageEntry(run, assignment.id, {
+        origin: input.origin,
+        category: template.category,
+        status: 'reported',
+        summary: `Confirmed async ${input.vulnClass.toUpperCase()} via ProofReceipt ${input.subscriptionId}`,
+        linkedFindingId: findingId,
+      })
+      this.storage.event(run.id, 'oob.receipt_confirmed',
+        `Late ${input.vulnClass.toUpperCase()} callback promoted to a runtime_confirmed finding (${input.verification.reason.slice(0, 200)}).`, {
+          findingId,
+          oobSubscriptionId: input.subscriptionId,
+          exchangeId: input.carrier.id,
+          rule: input.verification.rule,
+        })
+    } catch { /* metrics/coverage are best-effort */ }
+    return true
+  }
+
   async drainPendingOob(
     runOrId: Pick<Run, 'id'> | string,
     options: OobDrainOptions = {},
   ): Promise<OobDrainResult> {
     const runId = typeof runOrId === 'string' ? runOrId : runOrId.id
+    // Convert already-delivered callbacks first: they may have landed while verification workers
+    // were finishing, before this drain started.
+    const early = this.promoteReceiptOob(runId)
     const result = await drainPendingOob(this.canaryBroker, runId, options)
+    // And again for callbacks that arrived during the bounded wait.
+    const late = this.promoteReceiptOob(runId)
+    const promotedReceipts = early + late
     this.lastOobDrain.set(runId, result)
     try {
       this.storage.event(
         runId,
         'oob.drain_complete',
-        `OOB drain finished in ${result.oobDrainMs} ms (${result.promotedLate} late callback(s) promoted, ${result.remaining} still pending).`,
-        { ...result },
+        `OOB drain finished in ${result.oobDrainMs} ms (${result.promotedLate} late callback(s) promoted, ${promotedReceipts} confirmed by ProofReceipt, ${result.remaining} still pending).`,
+        { ...result, promotedReceipts },
       )
     } catch { /* store closed */ }
     return result
