@@ -97,6 +97,8 @@ export interface ProgramGraph {
   edges: ProgramEdge[]
   globalMiddleware: string[]
   warnings: string[]
+  /** Bounded, value-free secret/IaC hints per route module (v7 white-box evidence). */
+  codeHints?: Record<string, CodeSliceHint[]>
 }
 
 export interface RouteSinkPath {
@@ -1521,6 +1523,7 @@ function buildGraph(
 
   const frameworks = [...new Set(routes.map(r => r.framework))]
   if (routes.some(r => r.framework === 'unknown')) warningsOut.push('Some routes were extracted with unknown framework.')
+  const codeHints = deriveGraphCodeHints(files, routes)
   return {
     repo,
     filesScanned: files.length,
@@ -1530,6 +1533,7 @@ function buildGraph(
     edges,
     globalMiddleware,
     warnings: warningsOut,
+    ...(Object.keys(codeHints).length ? { codeHints } : {}),
   }
 }
 
@@ -2078,6 +2082,49 @@ function fileInModule(file: string, module: string): boolean {
   return normalized.split('/').includes(module) || normalized.startsWith(`${module}/`)
 }
 
+/** Single fast prefilter so a repository-wide hint pass stays cheap on generated trees. */
+const HINT_PREFILTER_RE = /(?:AKIA|ASIA)[0-9A-Z]{16}|sk_(?:live|test)_[A-Za-z0-9]{8,}|-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----|:\/\/[^\s'"`]*:[^\s'"`@]+@|(?:api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|password|passwd|private[_-]?key)\s*[:=]\s*['"]|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|0\.0\.0\.0\/0|::\/0|privileged\s*:\s*true|hostNetwork\s*:\s*true|runAsUser\s*:\s*0|allow[_]?[Pp]rivilege[_]?[Ee]scalation\s*:\s*true/
+
+/**
+ * Build per-module hint blocks once per extraction. Files are prefilted, so generated route
+ * trees (thousands of files) cost one regex per file and no line scan unless a hint is present.
+ * Hints contain only `file:line` and a fixed note; matched text is never copied.
+ */
+export function deriveGraphCodeHints(
+  files: ReadonlyArray<{ path: string; content: string }>,
+  routes: readonly ProgramRoute[],
+  options: { maxModules?: number; maxHintsPerModule?: number } = {},
+): Record<string, CodeSliceHint[]> {
+  const modules = [...new Set(routes.map(route => routeModuleKey(route.path)).filter(Boolean))]
+    .sort()
+    .slice(0, Math.max(1, Math.min(options.maxModules ?? 200, 2000)))
+  if (!modules.length) return {}
+  const moduleSet = new Set(modules)
+  const byModule = new Map<string, Array<{ path: string; content: string }>>()
+  for (const file of files) {
+    const normalized = file.path.replaceAll('\\', '/').toLowerCase()
+    const segments = normalized.split('/')
+    for (const module of moduleSet) {
+      if (segments.includes(module) || normalized.startsWith(`${module}/`)) {
+        const list = byModule.get(module) ?? []
+        list.push(file)
+        byModule.set(module, list)
+      }
+    }
+  }
+  const out: Record<string, CodeSliceHint[]> = {}
+  const maxHints = Math.max(1, Math.min(options.maxHintsPerModule ?? 3, 8))
+  for (const module of modules) {
+    const candidates = byModule.get(module)
+    if (!candidates) continue
+    const scoped = candidates.filter(file => file.content.length <= 512 * 1024 && HINT_PREFILTER_RE.test(file.content))
+    if (!scoped.length) continue
+    const hints = collectModuleCodeHints(scoped, module, { limit: maxHints })
+    if (hints.length) out[module] = hints
+  }
+  return out
+}
+
 /**
  * Scan module sources for secret-shaped literals and IaC exposures on the route's module.
  * The returned hints carry a file:line and a value-free note: the matched text is never copied.
@@ -2193,7 +2240,7 @@ function buildSliceFromRoute(
   const module = routeModuleKey(route.path)
   const hints = options.files?.length
     ? collectModuleCodeHints(options.files, module, { limit: 2 })
-    : []
+    : (graph.codeHints?.[module] ?? []).slice(0, 2)
 
   return {
     route: `${route.method} ${route.path}`.slice(0, 180),

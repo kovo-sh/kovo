@@ -414,6 +414,13 @@ describe('v7 whitebox: secrets and IaC hints', () => {
     assert.ok(!packet.text.includes(SECRET_VALUE))
     assert.ok(!packet.text.includes('hunter2'))
     assert.match(packet.text, /"kind":"secret"/)
+
+    // Hints are also attached to the program graph at extraction time, so a caller without
+    // repository sources still gets them (values stay redacted).
+    const graph = graphFor(repo)
+    const fromGraph = buildCodeDataflowSlice(graph, `${BILLING_ROUTE[0]} ${BILLING_ROUTE[1]}`)
+    assert.ok((fromGraph?.hints?.length ?? 0) >= 1)
+    assert.ok(!JSON.stringify(fromGraph).includes(SECRET_VALUE))
   })
 })
 
