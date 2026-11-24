@@ -19,7 +19,7 @@
 
 > **This section is new and supersedes nothing.** The v5.0 freeze record (§2–§3, §6) and the v5.1 integration record (§0) stay intact and historical. Nothing below is a release gate result, a certification, or a shipped number. It records what the v6 line measured, what it did not, and the battery/protocol v7 will use to turn a measurement into a claim.
 
-**Status:** v7 **planning**. Not certified. v6 remains the shipped baseline until v7 M0 passes its gates ([plans/v7.md](plans/v7.md)).
+**Status:** v7 **M0-interim** (2026-11-24). Recorded: floor + legacy regression + realism wiring milestone (see V7.2). **Not certified for agentic lift** — held-out lift is 0 and 2 unmatched FPs remain. v6 remains the shipped baseline. Floor + realism numbers below supersede V7.1 from the 2026-11-23 snapshot.
 
 ### V7.1 Current measured numbers
 
