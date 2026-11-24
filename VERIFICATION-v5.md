@@ -27,9 +27,9 @@ All product rows are real `Execution` on the 3-app realistic dev cells (acme-saa
 
 | Measure | Result | Scope / caveat |
 | :--- | :--- | :--- |
-| Product floor (`Execution --no-llm`) | **34 / 59 (57.6%)**, **100%** precision, 0 decoy/unmatched | acme 12, shopflow 12, opsportal 10; post-Cut-3a, 3 runs, 0 spread, identical site-set hash |
+| Product floor (`Execution --no-llm`) | **36 / 59 (61.0%)**, **100%** precision, 0 decoy/unmatched | acme **14**, shopflow 12, opsportal 10; 3 runs, 0 spread, identical site-set hash |
 | Floor determinism | **0 spread**, 3 repeats identical (site sets included, `driftApps=0`) | Re-gated on the current tree |
-| Salted held-out product floor (seed 1000042) | **25 / 58 (43.1%)**, **100%** precision | acme 9, shopflow **9**, opsportal 7; the +1 came from an `inferred_html:sensitive` param on `/api/v1/search`, confirmed through the normal proof path |
+| Salted held-out product floor (seed 1000042) | **28 / 58 (48.3%)**, **100%** precision | acme **11**, shopflow **10**, opsportal 7; 2 runs, identical per-app; gains from inferred-param discovery and an evidence-based quota reservation, each confirmed through the normal proof path |
 | Agentic, 600 s generous, 3 apps dev | **35 / 59 (59.3%)**, **100%** precision, 0 unmatched, **+2 net** | acme 13 (+1), shopflow 12 (+1), opsportal 10 (**+0**); ~$1.0 total |
 | Agentic, 600 s generous, 3 apps salted held-out | **25 / 58**, **+1 net**, **100%** precision | acme 10, shopflow 8, opsportal 7; 19–23 investigations/app; pre-hardening run had 2 unmatched FPs |
 | Agentic rotation (shopflow, resumed, 300 s) | **3 / 19**, **100%** precision, p50 **77.5 s** | After injection-class precedence fix |
@@ -49,7 +49,7 @@ All product rows are real `Execution` on the 3-app realistic dev cells (acme-saa
 | Gate | Target | Measured | Status |
 | :--- | :--- | :--- | :--- |
 | **Floor** dev | 0 spread, 100% precision | 33/59, 3 identical repeats, 100% | **PASS** |
-| **Floor** salted held-out | 100% precision, no regression | **25/58**, 100%; re-verified under the store confirmation invariant | **PASS** |
+| **Floor** salted held-out | 100% precision, no regression | **28/58**, 100%, 2 identical runs; invariant-clean | **PASS** |
 | Legacy regression | xben 25/25, held-out 20/20 + 20/20 | both hold | **PASS** |
 | Realism wiring | #2–#4 wiring pass | #2 PASS, #3 PASS, #4 PASS | **PASS** |
 | Realism capability | ≥75% on #1–#4 | #3 PASS (3/3 confirms); #2 2/4 planted; #4 0/3 | **PARTIAL** |
