@@ -611,3 +611,23 @@ Validation on the reduced tree: dev **34/59** (3 runs, 0 spread, 100%), xben 25/
 - operator-visible invariant check added to `worker-gate.sh`.
 
 This is the certification blocker the spec-submission stream surfaced (a `runtime_confirmed` finding whose own diff said `inconclusive`). Claims remain halted until a clean held-out cell verifies forward.
+
+### 2026-11-24 — early-exit contract merged, but it did **not** buy throughput (honest negative)
+
+Merged `23d91a4` (contract + metric wiring). The clean-route predicate is deliberately conservative: ≥4 turns, before the 85% settlement turn, no pending spec / repair / unresolved gap, **zero anomalies anywhere**, ≥2 distinct attempts, and one earned reason (`hardened_denial` all-denial target family, `static_no_state_change` on a calibrated SPA catch-all, or `hypothesis_refuted` via a no-signal control-vs-probe).
+
+Measured on dev acme 600 s K=6:
+
+| | before | after |
+|---|---|---|
+| assignment p50 / p90 | 112.0 s / 159.9 s | **154.4 s / 186.4 s** |
+| turns/assignment | 14.0 | 14.7 |
+| specs submitted / route-hit | 14/17 (82%) | 12/17 (71%) |
+| confirms / precision | 14/22, 100% | 12/22, 100% |
+| early exits | — | **1/21** (`hypothesis_refuted`, 7 of 30 turns) |
+
+**Reading it straight:** turns/assignment did not rise, per-turn provider latency did (+31%) with 9 stall retries, and the completed-assignment p50 sample shrank to 5 — so this measurement does **not** support attributing the p50 rise to the early-exit change, and it also does not demonstrate a p50 win. The contract works (the one exit finished with a coded gap and zero `complete_intent` rejections), but the hit rate is low because most assignments' hottest route family mixes 200s with denials.
+
+**Do not widen the predicate for throughput yet.** A wider exit trades confirmations for slot turnover, and precision/recall outrank p50. Re-measure p50 on an idle box during the definitive run before deciding; if p50 still exceeds the 110 s gate, the next safe lever is warm-pool reuse and provider-stall handling, not earlier exits.
+
+Also fixed the cap-bump fallout in `tests/v6-phaseb-latency.test.ts` (it still asserted `maxTurns <= 12` / 75–90 s) to the current 18 turns / 90–120 s, and wired the early-exit stat into `AssignmentThroughputMetrics` + `agent.early_exit` events.
