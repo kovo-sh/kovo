@@ -11,8 +11,12 @@ Format:
 
 - [ ] P0 dispatch killer (opsportal 1/7, acme 2/19 planned steps stranded) + funnel invariant | status: active | lease: src/server/execution.ts, src/server/graph-leads.ts, scripts/worker-gate.sh, tests/v7-dispatch-funnel.test.ts | deps: - | stream: agents/dispatch-funnel
 - [ ] Cut 3a strict strangler (wire 6 recipe families, delete their VM branches, no-fallback assert) | status: active | lease: src/server/deterministic-engine.ts, src/server/deterministic-specs.ts, src/server/replay-verifier.ts, src/replay-spec.ts, src/server/floor-recipes.ts, tests/v7-cut3a.test.ts | deps: - | stream: agents/cut3a
-- [ ] Held-out zero-lift + 2 FP autopsy (5-stage funnel) | status: active | lease: benchmarks/realistic-bench/apps/{acme-saas,shopflow}/**, tests/**, plans/HELDOUT-LIFT.md | deps: - | stream: agents/heldout-lift
 - [ ] Realism gate split (oob_wiring_fnr vs fixture_capability_recall) + #4 3-number funnel | status: active | lease: scripts/benchmark-realism.ts, benchmarks/realism-suite/** (gates only), docs/SMOKE-BATTERY.md, tests/v6-realism-gates.test.ts | deps: - | stream: agents/realism-gates
+
+## Active additions (2026-11-24, post-autopsy)
+
+- [ ] SQLi boolean arms grounded in target's own baseline rows | status: active | lease: src/server/probes/injection.ts, tests/v7-sqli-baseline.test.ts | deps: - | stream: agents/sqli-baseline
+- [ ] Spec-or-proof-gap mandatory at settlement (19/23 route-hit targets submitted no spec) | status: active | lease: src/server/agent-session.ts, src/server/assignment-brief.ts, tests/v7-spec-submission.test.ts | deps: - | stream: agents/spec-submission
 
 ## Ready (dispatch when a lease frees)
 
@@ -39,4 +43,5 @@ Format:
 - [x] Realism #2 OOB attribution (traceId) + engine selection (query carriers, self-trigger) -> async SSRF+XXE confirmed | stream: agents/realism-oob, agents/realism-oob-engine
 - [x] Realism metrics: receipt promotions counted; micro-slice snapshot fallback | stream: agents/realism-metrics-fix
 - [x] Worker gate lease guard (dirty main checkout fails) | coordinator
+- [x] Held-out 5-stage funnel autopsy (loss = no_spec_submitted 19/23, not coverage) + shopflow owner/cart hardening -> held-out unified 25/58 @100% | stream: agents/heldout-lift
 - [x] Stale parity-diff worktree removed (plan archived to /tmp/opencode/PARITY-DIFF-SEED1.archived.md) | coordinator

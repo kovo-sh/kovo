@@ -466,3 +466,23 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 | 10 | Delete the 28h-stale `parity-diff` worktree | **ACCEPT** | coordinator (done; plan doc archived to /tmp/opencode/PARITY-DIFF-SEED1.archived.md) |
 
 **Consequence:** certification claim is versioned as **M0-interim (Floor + Realism-Wiring)**, not "agentic lift". Lift certification stays blocked until the funnel shows the true blocker and the +6pp bar is met.
+
+### 2026-11-24 — held-out autopsy: the loss is proof submission, not hypothesis coverage
+
+Event-derived funnel over all 34 held-out floor misses (salted seed 1000042, 600 s, K=6, kept data dirs; full report `plans/HELDOUT-LIFT.md`):
+
+| stage | acme | shop | ops | total | share |
+|---|---:|---:|---:|---:|---:|
+| floor misses | 13 | 11 | 10 | 34 | 100% |
+| dispatched | 9 | 10 | 9 | 28 | 82.4% |
+| target_route_hit | 7 | 8 | 8 | 23 | 67.6% |
+| verify_called | 1 | 2 | 1 | **4** | **11.8%** |
+| confirmed after floor | 1 | 0 | 0 | 1 | 2.9% |
+
+Codes: `no_route_hit` 11, **`no_spec_submitted` 19**, `dismissed/true` 2, inconclusive 2, confirmed 1. **23/34 targets were requested on the mounted route+method and only 4 produced a persisted replay spec.** So the dominant loss is post-route **proof submission**, not randomized-surface coverage. This reframes the whole M1 priority.
+
+Two concrete proof defects found: (a) shopflow `product-search-sqli` — true arm used a catalog term absent from the held-out data, both arms empty → dismissed; (b) opsportal `og.log-filter-sqli` — no persona bound, all three arms 401 → dismissed.
+
+Held-out rerun after fixture hardening (shopflow settings/admin-reviews owner+admin gate, cart ownership): **25/58 at 100% precision, 0 FPs** (acme 10, shopflow 8, opsportal 7) — first held-out **+1** with precision intact. Acme's earlier FP row was unrecoverable (`dataDirKept:false`); two subsequent clean reruns, still unexplained and tracked.
+
+**Streams launched:** `sqli-baseline` (ground boolean arms in the target's own baseline rows) and `spec-submission` (make spec-or-explicit-proof-gap mandatory at settlement; classify the 19 no-spec targets).
