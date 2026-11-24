@@ -44,7 +44,7 @@ While a multi-stream batch is in flight:
    - acceptance gate unmeasured → start the measurement;
    - otherwise say “nothing actionable” and stop.
 3. Do not invent work to fill the pulse. Silence is a valid result.
-4. The in-session reminder is a background `sleep 1800` timer that prints the pulse; relaunch it after each pulse. The same script is safe to run from cron if the session is not alive (read-only).
+4. The in-session reminder is a background `sleep 1800` timer that prints the pulse; relaunch it after each pulse. `consult.sh` stamps `~/.config/guardian/last-consult`, and the pulse prints **GEMINI CHECK-IN OVERDUE** when it is older than 60 minutes — that is the hard backstop; do not let a long benchmark batch hide it.
 
 ## Meta-process: product-first and the inner loop
 

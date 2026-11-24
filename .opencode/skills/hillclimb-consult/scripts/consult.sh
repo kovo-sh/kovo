@@ -49,6 +49,10 @@ while (( $(date +%s) < deadline )); do
   if (( seen_busy == 1 )); then
     echo "== reviewer reply ($pane) =="
     tmux capture-pane -p -t "$pane" -S -160
+    # Record the check-in time so the pulse can flag an overdue cadence.
+    stamp_dir="${HOME}/.config/guardian"
+    mkdir -p "$stamp_dir" 2>/dev/null || true
+    date +%s > "$stamp_dir/last-consult" 2>/dev/null || true
     exit 0
   fi
 done

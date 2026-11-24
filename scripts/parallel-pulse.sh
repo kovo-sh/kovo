@@ -63,6 +63,21 @@ printf '%s' "$rows" | while IFS='|' read -r b a s age w; do
   printf '  %-30s %s\n' "$b" "${files:-<no committed files yet>}"
 done
 
+stamp="${HOME}/.config/guardian/last-consult"
+if [[ -f "$stamp" ]]; then
+  last="$(cat "$stamp" 2>/dev/null || echo 0)"
+  case "$last" in ''|*[!0-9]*) last=0;; esac
+  age_h=$(( (now_epoch - last) / 3600 ))
+  age_m=$(( ((now_epoch - last) % 3600) / 60 ))
+  if (( now_epoch - last > 3600 )); then
+    printf 'GEMINI CHECK-IN OVERDUE: last consult %sh%sm ago — run the hillclimb-consult skill now\n' "$age_h" "$age_m"
+  else
+    printf 'last Gemini check-in: %sh%sm ago\n' "$age_h" "$age_m"
+  fi
+else
+  printf 'GEMINI CHECK-IN OVERDUE: no recorded consult — run the hillclimb-consult skill now\n'
+fi
+
 printf 'stale benchmark processes (>25 min; a 600 s cell should never run this long):\n'
 stale="$(ps -eo pid,etimes,args 2>/dev/null | grep -E 'benchmark-(realistic|recall|reason)|floor-repeat' | grep -v grep | awk '$2>1500 {print "  pid " $1 " age " int($2/60) "m"}')"
 if [[ -n "$stale" ]]; then printf '%s\n' "$stale"; else printf '  none\n'; fi

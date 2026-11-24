@@ -420,3 +420,8 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **45 min generous:** 15/22 (68.2%) @88.2% and kept-rerun 13/22 (59.1%) @92.9%, **+2..+4 net**, 83 investigations, **4,288 of 112,000 requests**, $2.99 of $10.
 - **Conclusion:** caps are not binding; the limits are model/tool throughput and hypothesis/proof quality. Longer horizons raise recall but also the FP rate (1–2 unmatched), so **worst-run precision at horizon is now the gate**, not budget.
 - **Follow-up:** triage the negative-invoice-amount claim (genuine invariant bug vs echo/clamp) and rerun 45 min; certification should use an ample-budget 600 s cell for the precision-clean number plus a long-horizon precision check.
+
+### 2026-11-23 — consultation cadence hardening
+
+- **Issue:** hourly Gemini check-ins lapsed after #8 because the background timer was not relaunched and long benchmark waits hid the gap.
+- **Fix:** `consult.sh` stamps `~/.config/guardian/last-consult` on every successful reply; `parallel-pulse.sh` prints **GEMINI CHECK-IN OVERDUE** when the stamp is missing or older than 60 minutes. The pulse is the backstop, so the cadence cannot silently lapse again.
