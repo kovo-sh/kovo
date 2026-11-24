@@ -412,3 +412,11 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Root cause caught by review:** Phase A floor consumes ~1,500–1,800 of the shared ~2,000 request budget, leaving ~20 agent assignments ~10–25 requests each. Decoupling floor/agent budgets is an instant win.
 - **v7 plan:** `plans/v7.md`. No fourth layer. Thesis = real-world conversion + white-box-first verification. M0 ProofReceipt + budget split + DSL retirement (3 cuts); M1 realism conversion #1–#4; M2 white-box dataflow + chains; M4 production ops. **Continuous scanning / persistent org graph deferred** (candidate v8).
 - **Cut for now:** multi-tenant SaaS, plugin SDK, ML priors, heavy UX. M1/M2 blocked behind M0 gates.
+
+### 2026-11-23 — budget decoupling: budget was never the constraint
+
+- **Implemented:** separate floor/agent request allowances scaled to duration (600 s: 6,000/25,000/31,000 total, $5; 45 min: 12,000/100,000/112,000, $10), 50 RPS lab cap, `agent_budget_exhausted` termination, per-phase accounting (no borrowing), no stale 2,000 literal.
+- **600 s generous run:** **13/22 (59.1%) at 100% precision**, +2 net, 25 investigations, 2,225 requests, $0.65.
+- **45 min generous:** 15/22 (68.2%) @88.2% and kept-rerun 13/22 (59.1%) @92.9%, **+2..+4 net**, 83 investigations, **4,288 of 112,000 requests**, $2.99 of $10.
+- **Conclusion:** caps are not binding; the limits are model/tool throughput and hypothesis/proof quality. Longer horizons raise recall but also the FP rate (1–2 unmatched), so **worst-run precision at horizon is now the gate**, not budget.
+- **Follow-up:** triage the negative-invoice-amount claim (genuine invariant bug vs echo/clamp) and rerun 45 min; certification should use an ample-budget 600 s cell for the precision-clean number plus a long-horizon precision check.
