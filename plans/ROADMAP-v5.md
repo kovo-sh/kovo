@@ -663,3 +663,19 @@ Next: `sqli-quota` fixes the substring bug and adds an **evidence-based** quota 
 **Remaining over-claim family is NOT a confirmation conflict** — it is a truth/oracle ambiguity, consistent across three runs: `oracleRulePassed: true` on public-catalog reads (`GET /api/v1/catalog`, `/api/v1/stores/:storeId/catalog/:productId`, `/api/v1/catalog/:id`) where an anon/non-owner body matches the owner body and carries a store token. New stream `catalog-public` must make a **truth ruling from the fixture source first**, then either (a) harden unintended tenant canaries out of publicly readable payloads + add a Tier-0 `catalog-canary-public-read` archetype, or (b) escalate as an operator decision if the route is genuinely private — no truth inflation either way.
 
 **Certification status:** agentic-lift claims remain halted. Opsportal's 7/17 equals its floor (0 lift) and shopflow's 2 FPs mean worst-run precision is not 100% yet.
+
+### 2026-11-24 — quota reservation: dev 36/59, held-out 28/58, both deterministic at 100% precision
+
+`sqli-quota` merged (`2621bab`). Two general fixes, no quota inflation:
+
+1. **`pathHasSearchHint` is token-based**, not substring: path segments split on `/`, then on `-_.`, and only whole tokens (`search`, `searches`, `lookup`, `find`, `filter`, `query`, `queries`, `browse`) match. Documented decisions: `catalog`, `catalogs`, `catalog-items` → no; `catalog-search`, `catalog/search`, `search`, `query` → yes; `logs`, `audit-log`, `journal` → no (file surfaces). The old regex matched `log` inside `catalog`, which is what let derived `catalog*` routes eat the SQLi quota.
+2. **Evidence-based quota reservation**: for each class, the best-ranked candidate whose query param passed a paired control-vs-probe differential but fell outside the quota gets **one reserved slot inside** the quota; the slot is **released to the normal ranking** when no such candidate exists (control test proves byte-identical selection then). The reserved candidate heads its class block, because the run-time `intentCaps` cut is a second, tighter cut applied in plan order — a reservation left at its low risk rank would be selected but never probed. Emits `engine.quota_reservation` (`class`, `reservedFor`, `released`, `rankBefore`, `rankAfter`, `quota`).
+
+| surface | before | after | precision | determinism |
+|---|---|---|---|---|
+| Dev seed 1 (3 runs) | 34/59 | **36/59** — acme **14/22** (+2), shopflow 12, opsportal 10 | 100%, 0 decoy/unmatched | **0 spread** |
+| Salted held-out 1000042 (2 runs) | 25/58 | **28/58 (48.3%)** — acme **11** (+2), shopflow **10** (+1), opsportal 7 | 100% | identical per-app and identical reservation decisions |
+
+Reservations confirmed on dev: acme `project-search-sqli` (rank 19 > quota 17) and `reflected-search-xss` (rank 11 > 10). Held-out: acme `sqli` (rank 22) and `xss` (rank 11) both confirmed. Opsportal reserved `sqli` (rank 33) and still did not confirm — reported, not hidden. xben 25/25; held-out-saas 20/20 + 20/20 patches.
+
+**Known follow-up (outside that lease):** the endpoint loader drops `endpoint_params.source`, so recon's `inferred_*:sensitive` tag is not readable by the engine; the reservation currently keys on the engine's own harvest differential (same paired evidence). A one-line loader change can wire the persisted tag once that file's lease frees.
