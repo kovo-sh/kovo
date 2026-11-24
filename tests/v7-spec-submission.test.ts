@@ -272,6 +272,15 @@ test('funnel classification distinguishes an explicit proof gap from a silent sk
   assert.equal(classifySpecSubmission({ routeHit: true }), 'no_spec_submitted')
 })
 
+test('the tracker names the most-probed route as the settlement target', () => {
+  const tracker = new SpecSubmissionTracker()
+  tracker.noteRoute({ method: 'GET', pathAndQuery: '/' })
+  tracker.noteRoute({ method: 'POST', pathAndQuery: '/v1/baskets/current/coupons?code=x' })
+  tracker.noteRoute({ method: 'POST', pathAndQuery: '/v1/baskets/current/coupons?code=y' })
+  tracker.noteRoute({ method: 'GET', pathAndQuery: '/v1/catalog?page=2' })
+  assert.deepEqual(tracker.snapshot().route, { method: 'POST', path: '/v1/baskets/current/coupons', params: ['code'] })
+})
+
 test('the settlement directive is pure, redacts values and keeps parameter names only', () => {
   const withValue = renderSettlementSpecDirective(
     { method: 'post', path: '/v1/baskets/current/coupons?code=SECRET-CANARY#frag', params: ['code=coupon-123', 'code'], origin: `${ORIGIN}/path?x=1` },

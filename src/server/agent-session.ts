@@ -286,6 +286,8 @@ function cleanSpecRoute(input: { method?: string; pathAndQuery?: string; origin?
  */
 export class SpecSubmissionTracker {
   private state: SpecSubmissionSnapshot = { probes: 0, specAttempts: 0, codedProofGaps: 0, proofGaps: [], required: 0 }
+  /** Probed route key → evidence + probe count; the most-probed route is the target proxy. */
+  private readonly routeCounts = new Map<string, { route: SpecRouteEvidence; count: number }>()
 
   noteProbe(): void {
     this.state = { ...this.state, probes: this.state.probes + 1 }
@@ -293,7 +295,22 @@ export class SpecSubmissionTracker {
 
   noteRoute(input: { method?: string; pathAndQuery?: string; origin?: string }): void {
     const route = cleanSpecRoute(input)
-    if (route) this.state = { ...this.state, route }
+    if (!route) return
+    const key = `${route.method} ${route.path}`
+    const existing = this.routeCounts.get(key)
+    const count = (existing?.count ?? 0) + 1
+    this.routeCounts.delete(key)
+    this.routeCounts.set(key, { route, count })
+    this.state = { ...this.state, route: this.targetRoute() }
+  }
+
+  /** Highest probe-count route (ties resolve to the most recent), so the directive names the target. */
+  private targetRoute(): SpecRouteEvidence | undefined {
+    let best: { route: SpecRouteEvidence; count: number } | undefined
+    for (const entry of this.routeCounts.values()) {
+      if (!best || entry.count >= best.count) best = entry
+    }
+    return best?.route
   }
 
   noteSpecAttempt(): void {
