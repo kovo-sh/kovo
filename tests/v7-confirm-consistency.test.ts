@@ -226,3 +226,34 @@ test('confirm-consistency: engine wiring routes every evidence write through the
   // The inline path reports the persisted status after the evidence write, never the stale row.
   assert.match(executionSource, /const verdictRow = findingRow/)
 })
+
+test('confirm-consistency: an FP autopsy attributes the confirming spec, not a failed retry', async () => {
+  const { buildFalsePositiveEvidence } = await import('../scripts/benchmark-realistic.ts')
+  const steps = (path: string) => [
+    { id: 'b1', role: 'control', request: { method: 'GET', pathAndQuery: path } },
+    { id: 'p1', role: 'probe', request: { method: 'POST', pathAndQuery: path } },
+  ]
+  const evidence = buildFalsePositiveEvidence({
+    findingIds: ['finding-1'],
+    findings: [{ id: 'finding-1', category: 'xss_stored', verificationStatus: 'runtime_confirmed' }],
+    replaySpecs: [
+      {
+        findingId: 'finding-1',
+        spec: { kind: 'http_chain', steps: steps('/api/testimonials') },
+        lastVerificationDiff: {
+          verdict: 'inconclusive',
+          failedStepId: 's2',
+          assertionSummary: { reason: 'csrf claim has no successful state-changing probe' },
+        },
+      },
+      {
+        findingId: 'finding-1',
+        spec: { kind: 'browser_chain', steps: steps('/api/testimonials') },
+        lastVerificationDiff: { verdict: 'confirmed' },
+      },
+    ],
+  })
+  assert.equal(evidence.length, 1)
+  assert.equal(evidence[0]!.oracleRulePassed, true, 'the confirming anchor backs the claim')
+  assert.ok(!/csrf/i.test(evidence[0]!.claimedDeltaSummary), 'an inconclusive retry must not be attributed to the finding')
+})
