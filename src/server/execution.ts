@@ -8498,8 +8498,16 @@ export class Execution {
         remainingSlots,
       )
       const dispatchableNewSteps = budgetedNewSteps.filter(step => !this.stepRepeatsConfirmedWork(step, confirmedForDispatch))
+      // Attribute the budget gate precisely: duplicate titles and unusable origins are their own
+      // funnel buckets; only the remaining drops are capacity (step-budget/crown-jewel share).
+      const existingTitles = new Set(existingSteps.map(step => step.title.trim().toLowerCase()))
+      const preBudgetDedupe = candidateSteps.filter(step => existingTitles.has(step.title.trim().toLowerCase())).length
+      const preBudgetNoAsset = candidateSteps.filter(step => step.origins.length === 0).length
+      const droppedAtBudget = Math.max(0, candidateSteps.length - budgetedNewSteps.length)
       funnel.planned += candidateSteps.length
-      funnel.filteredBudget += Math.max(0, candidateSteps.length - budgetedNewSteps.length)
+      funnel.filteredDedupe += Math.min(preBudgetDedupe, droppedAtBudget)
+      funnel.filteredNoAsset += Math.min(preBudgetNoAsset, Math.max(0, droppedAtBudget - preBudgetDedupe))
+      funnel.filteredBudget += Math.max(0, droppedAtBudget - preBudgetDedupe - preBudgetNoAsset)
       funnel.filteredAlreadyConfirmed += Math.max(0, budgetedNewSteps.length - dispatchableNewSteps.length)
       // Dependency sanitisation: a planner-emitted id that does not exist can never resolve, and
       // `refreshReadyChainSteps` requires every parent fact/step to exist. Drop unknown ids at
