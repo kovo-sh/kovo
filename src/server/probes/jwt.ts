@@ -155,8 +155,9 @@ export async function diffAuthProtocolAudit(
   const claims = req.identityClaims ?? {}
   const claimCandidates: Array<Record<string, unknown>> = []
   const subject = claims.email ?? claims.mail ?? claims.sub ?? claims.id ?? claims.userId
-  if (subject) claimCandidates.push({ sub: subject })
   const tenantClaim = claims.store ?? claims.tenant ?? claims.org ?? claims.workspace ?? claims.team
+  // The scope-bearing payload goes first: a server that binds the read to a tenant claim is only
+  // proven when the same claims are present in both the control and the forged token.
   if (tenantClaim || claims.role) {
     claimCandidates.push({
       ...(subject ? { sub: subject } : {}),
@@ -166,6 +167,7 @@ export async function diffAuthProtocolAudit(
       ...(claims.id ? { uid: claims.id } : {}),
     })
   }
+  if (subject) claimCandidates.push({ sub: subject })
   const b64u = (value: unknown): string => Buffer.from(JSON.stringify(value)).toString('base64url')
   const forge = (payload: Record<string, unknown>, alg: 'none' | 'HS256', signed: boolean): string => {
     const header = b64u({ alg, typ: 'JWT' })
@@ -191,6 +193,20 @@ export async function diffAuthProtocolAudit(
           const probeRes = await send(request(probe))
           if (!probeRes || probeRes.status < 200 || probeRes.status >= 300) continue
           if (controlRes.status === probeRes.status && responseSimilarity(controlRes.body, probeRes.body) >= 0.98) continue
+          // Positive acceptance signal: the accepted response must carry the authenticated read
+          // itself (a JSON object with data fields), not a bare status/ack. A status-only claim is
+          // never jwt evidence.
+          let acceptedJson: Record<string, unknown> | null = null
+          try {
+            const parsed: unknown = JSON.parse(probeRes.body)
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              acceptedJson = parsed as Record<string, unknown>
+            }
+          } catch { acceptedJson = null }
+          const dataFields = acceptedJson
+            ? Object.keys(acceptedJson).filter(field => !/^(?:ok|success|status|error|message|detail|reason|code)$/i.test(field))
+            : []
+          if (!acceptedJson || dataFields.length === 0) continue
           anomalies.push({
             type: transport === 'body' ? 'jwt_body_token_bypass' : 'jwt_authorization_forgery',
             path: req.pathAndQuery.split('?')[0],
@@ -206,8 +222,12 @@ export async function diffAuthProtocolAudit(
             acceptedStatus: probeRes.status,
             similarity: responseSimilarity(controlRes.body, probeRes.body),
             claims: Object.keys(payload),
+            payload,
+            dataFields: dataFields.slice(0, 8),
+            declaredAlg: 'HS256',
+            acceptedAlg: 'none',
           })
-          checks.push({ check: `jwt_forged_${transport}_${field}`, controlStatus: controlRes.status, acceptedStatus: probeRes.status, accepted: true })
+          checks.push({ check: `jwt_forged_${transport}_${field}`, controlStatus: controlRes.status, acceptedStatus: probeRes.status, dataFields: dataFields.slice(0, 8), accepted: true })
           detected = true
           break
         }

@@ -397,6 +397,24 @@ const hardWsTimeoutMs = 20_000
 const bodyPreviewLimit = 8192
 const defaultRequestTimeoutMs = 30_000
 const forbiddenCallerHeaders = /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding|x-guardian-trace-id)$/i
+/**
+ * A token-verification test needs to present a token the caller minted itself. Allow exactly the
+ * unsigned shape: a three-segment JWT whose signature segment is empty. Such a token cannot carry a
+ * real credential (it has no signature), cannot be replayed against a verifier that checks one, and
+ * is the positive-only material of an `alg:none` / signature-bypass probe. Every other caller-set
+ * Authorization value stays forbidden.
+ */
+function isSelfMintedBearer(name: string, value: string): boolean {
+  if (!/^authorization$/i.test(name)) return false
+  const match = /^Bearer\s+([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.\s*$/i.exec(value)
+  if (!match) return false
+  try {
+    const header = JSON.parse(Buffer.from(match[1]!, 'base64url').toString('utf8')) as { alg?: unknown }
+    return typeof header?.alg === 'string' && /^(?:none|HS256|HS384|HS512|RS256|RS384|RS512|ES256)$/.test(header.alg)
+  } catch {
+    return false
+  }
+}
 const wsGuid = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 const sessionHandleRegex = /^[a-z0-9_-]{1,32}$/
 const csrfCookieNameRegex = /^(?:xsrf-token|csrf[_-]?token|_csrf|csrf)$/i
@@ -2698,7 +2716,7 @@ export class RequestBroker {
 
     const cleanHeaders: Record<string, string> = {}
     for (const [k, v] of Object.entries(req.headers ?? {})) {
-      if (forbiddenCallerHeaders.test(k)) {
+      if (forbiddenCallerHeaders.test(k) && !isSelfMintedBearer(k, v)) {
         grant.audit('denied', initialOrigin)
         throw new BrokerDenied(`Header "${k}" cannot be set directly; reference an approved persona handle instead.`)
       }

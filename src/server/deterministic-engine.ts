@@ -2284,17 +2284,36 @@ export function enumerateHypotheses(
     }
 
     // --- Auth-protocol / JWT ----------------------------------------------------------------
-    // Evidence: the target returned 3-segment base64url values (or a session/token surface whose
-    // response carries them). The probe mutates the persona's own token; when the persona session
-    // is not a JWT, the broker refuses the mutation, so this cannot manufacture a finding.
+    // Evidence: the target returned 3-segment base64url values, or the route is a credential
+    // surface, or it is a reporting/integration read surface. Machine-to-machine report APIs are a
+    // canonical signed-token boundary even when the browser session is a cookie: the route exposes
+    // tenant-wide figures and authenticates the caller with a bearer token instead of the session.
+    // The probe compares a token carrying the server's declared algorithm with an invalid signature
+    // against an unsigned (`alg:none`) token carrying the same claims; acceptance must return the
+    // authenticated read itself, never a bare status.
     const identityClaims: Record<string, string> = {}
     for (const field of ['email', 'mail', 'sub', 'userId', 'id', 'tenant', 'org', 'store', 'workspace', 'team', 'role']) {
       const value = observedValues[field]?.[0]
       if (value && value.length <= 120) identityClaims[field] = value
     }
+    const tokenBoundarySurface =
+      /(?:^|\/)(?:reports?|analytics|metrics|statistics|stats|dashboards?|sales|revenue|ledger|integrations?|partners?)(?:\/|$)/i.test(bare)
     const jwtEvidence = options.tier >= 2 && method === 'GET' && picks.owner &&
-      ((observedEvidence.jwtValues?.length ?? 0) > 0 || credentialSurface)
+      ((observedEvidence.jwtValues?.length ?? 0) > 0 || credentialSurface || tokenBoundarySurface)
     if (jwtEvidence) {
+      // A token-boundary route denies the cookie-authenticated session, so its own harvest exposes
+      // no claims. Fall back to the persona's own scope (tenant/role) as the forged payload: the
+      // claims are the caller's existing authorization, never an escalation.
+      const claims: Record<string, string> = { ...identityClaims }
+      if (Object.keys(claims).length === 0 && picks.owner) {
+        const tenant = picks.owner.tenant
+        if (tenant) {
+          claims.tenant = tenant
+          claims.store = tenant
+        }
+        if (/^[A-Za-z0-9_.:-]{1,64}$/.test(picks.owner.handle)) claims.sub = picks.owner.handle
+        if (picks.owner.privilege) claims.role = picks.owner.privilege
+      }
       add({
         key: `auth_protocol|${endpoint.id}`,
         endpoint,
@@ -2304,9 +2323,10 @@ export function enumerateHypotheses(
         pathAndQuery: resolvedPath,
         ownerPersona: picks.owner?.handle,
         tokenFields: Object.keys(observedValues).filter(field => /(?:token|jwt|auth|credential)/i.test(field)).slice(0, 3),
-        ...(Object.keys(identityClaims).length > 0 ? { identityClaims } : {}),
+        ...(Object.keys(claims).length > 0 ? { identityClaims: claims } : {}),
         risk: endpointRiskScore(endpoint) + 18 +
           ((observedEvidence.jwtValues?.length ?? 0) > 0 ? 40 : 0) +
+          (tokenBoundarySurface ? 12 : 0) +
           (/(?:^|\/)(?:session|tokens?|auth|whoami|me)(?:\/|$)/i.test(bare) ? 16 : 0),
       })
     }
