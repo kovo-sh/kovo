@@ -974,3 +974,26 @@ An unsupported gap is rejected **once per route per assignment** with `agent.gap
 Measured (held-out shopflow, 600 s, K=6, isolated kept dirs): **8/19 at 100% precision**, 0 decoy/unmatched, route-hit→verify **10/14 (71.4%)**, 24 coded gaps recorded with **4 adjudicated: 0 accepted, 4 rejected** (`no_reproducible_signal` ×3, `out_of_scope` ×1) in 2 events; the worker re-called `complete_intent` and was accepted — the loop guard held.
 
 **A decoy FP appeared in the non-isolated sharing run** (88.9%): a same-tenant `viewer` BFLA mis-attributed to the cross-tenant `shipment-bola-write` decoy. That is the **persona/scope bleed** again, now observed on the precision side — which is exactly why `persona-binding` is fixing transport-level scope rather than reporting.
+
+### 2026-11-24 — Realism #4 is now **3/3 confirmed** and canonical (fallbacks deleted)
+
+`spec-authz` merged (`fe578db`). Both 4-hop confirmations are now produced by canonical spec synthesis, and the third slice was fixed properly:
+
+1. **Object-authz GET is identity-scoped**: `objectIdentityJq` requires the addressed victim identifier to appear in the non-owner body, OR-ed with the old byte/key-identical rule — so a response echoing `actor` confirms. Publicness veto and bogus-id negative control unchanged.
+2. **SQL error proof is fingerprint-bound**: `buildSqlErrorChain` renders a `http_chain` only when a known dialect was observed, asserting `status >= 500` **and** a dialect/engine term in the body. A bare 5xx still cannot render, and the status-only ban still rejects it (pinned by test).
+3. **Privileged function mutations prove persisted escalation**: benign matrix body, replay applies `authzRequiredRole` to the privilege field, control restores a non-privileged baseline first (idempotence), class `bfla`, and a 2xx bogus-id mutation is admissible only when that bogus id reads back 404/410 (`c3` control). Also fixed a real readback-borrowing bug: a cross-family route sharing only the identifier's **param name** was being borrowed as the readback (it pointed `PATCH /v3/admin/users/:id` at `/v2/billing/invoices/:id`).
+
+**Fallbacks deleted** (`execution.ts`, deletion-only, −281 lines): `CODE_LEAD_PROOF_FALLBACK_CAP`, `buildCodeLeadCrossTenantProof`, `buildCodeLeadSqlErrorProof`, `codeLeadMatrixRows`, `queueCodeLeadProofFallback`. Equivalence is direct: the run is identical with and without them (1,392 requests; no `code_lead_proof` event ever fired).
+
+**Fixture addition** (logged in `benchmarks/CHANGELOG.md` as a capability addition, planted BFLA untouched): admin-only `GET /v3/admin/users` + `/v3/admin/users/:id`, with the declared personas seeded.
+
+| realism #4 | before | after |
+|---|---|---|
+| dispatched / route-hit | 1/3, 1/3 | **3/3, 3/3** |
+| verify-called | 1/3 | **3/3** |
+| confirmed | 2/3 | **3/3 at 100%** (3 TP / 0 FP) |
+| chain `mono-tenant-takeover` | — | **2/2** |
+
+Dev floor 36/59 (3 runs, 0 spread), xben 25/25, held-out-saas 20/20 + 20/20 patches.
+
+**Also launched `capability-misses`** for the four named held-out gaps (`api-jwt-alg-none`, `giftcard-race`, `coupon-reuse`, `inventory-oversell`) — one JWT boundary and three stateful race/workflow classes, the general-capability path to +4–5 held-out.
