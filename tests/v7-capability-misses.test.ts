@@ -290,3 +290,139 @@ describe('capability-misses: minted bearer headers', () => {
     assert.equal(declarativeReplaySpecSchema.safeParse(spec({ Cookie: 'session=abc' })).success, false)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Funnel fixes: auth_protocol ranking, admin-only race readback, conserved ranking, timing hook
+// ---------------------------------------------------------------------------
+
+import { wiredRecipeForSpecKind } from '../src/server/floor-recipes.ts'
+import { planFloorRecipe } from '../src/server/floor-recipe-engine.ts'
+import { synthSqlTime } from '../src/server/deterministic-specs.ts'
+
+describe('capability-misses: token-boundary selection', () => {
+  test('a cookie-denied read outranks cookie-200 credential routes', () => {
+    const denied = endpoint({ method: 'GET', pathTemplate: '/api/v1/reports/sales', riskScore: 45 })
+    const cookieOk = endpoint({ method: 'GET', pathTemplate: '/api/v1/tokens/:credId', riskScore: 75 })
+    const surface = [denied, cookieOk]
+    const harvests = new Map<string, EndpointHarvest>([
+      [denied.id, harvest({ ownerReadStatus: 401 })],
+      [cookieOk.id, harvest({ ownerReadStatus: 200 })],
+    ])
+    const hypotheses = enumerateHypotheses(surface, harvests, { tier: 3, personas, environmentMode: 'ephemeral_lab' })
+    const auth = hypotheses.filter(candidate => candidate.intent === 'auth_protocol')
+    assert.ok(auth.length >= 2, 'both token-shaped routes form an auth_protocol hypothesis')
+    assert.equal(auth[0]!.endpoint.pathTemplate, '/api/v1/reports/sales', 'the cookie-denied read must rank first')
+  })
+})
+
+describe('capability-misses: race conversion ranking', () => {
+  test('checkout/cart conserved writes outrank speculative refund routes', () => {
+    const surface = [
+      endpoint({ method: 'POST', pathTemplate: '/api/v1/refunds/approve', riskScore: 60, params: [{ name: 'id', location: 'json' }] }),
+      endpoint({ method: 'POST', pathTemplate: '/api/v1/bags/:cartId/checkout', riskScore: 65, params: [{ name: 'quantity', location: 'json' }] }),
+    ]
+    const harvests = new Map<string, EndpointHarvest>([
+      ['POST:/api/v1/bags/:cartId/checkout', harvest({ otherIds: ['cart-1'], fields: ['quantity'], values: { quantity: ['1'] } })],
+    ])
+    const races = enumerateHypotheses(surface, harvests, { tier: 3, personas, environmentMode: 'ephemeral_lab' })
+      .filter(candidate => candidate.raceBurst)
+    assert.ok(races.length >= 2, 'both money-shaped writes form a race hypothesis')
+    assert.equal(races[0]!.endpoint.pathTemplate, '/api/v1/bags/:cartId/checkout', 'the conserved-resource write must rank first')
+  })
+})
+
+describe('capability-misses: admin-only race readback', () => {
+  test('an owner 403 on the collection does not abort the proof; an admin read provides the baseline', async () => {
+    const personasWithAdmin: EnginePersona[] = [
+      ...personas,
+      { handle: 'admin', roleLabel: 'admin (store)', privilege: 'admin', tenant: 'store-a' },
+    ]
+    const state = { balance: 16 }
+    const hypothesis = {
+      ...raceHypothesisFor(),
+      ownerPersona: 'owner',
+    }
+    const broker = {
+      httpTransport: { isHttp2Enabled: () => true },
+      executeHttp: async (req: { method: string; pathAndQuery: string; body?: string; persona?: string }) => {
+        const asExchange = (status: number, json: unknown) => ({
+          status, method: req.method, pathAndQuery: req.pathAndQuery, body: JSON.stringify(json), headers: {}, durationMs: 1, bytes: 1,
+        }) as never
+        if (req.method.toUpperCase() === 'GET') {
+          // The collection is admin-only; the item route is readable by its owner.
+          if (req.pathAndQuery === '/giftcards' && req.persona !== 'admin') return asExchange(403, { error: 'forbidden' })
+          if (req.pathAndQuery === '/giftcards' && req.persona === 'admin') return asExchange(200, [{ id: 'card-1', balance: state.balance }])
+          if (req.pathAndQuery.startsWith('/giftcards/card-1') && req.persona === 'owner') return asExchange(200, { id: 'card-1', balance: state.balance })
+          return asExchange(404, {})
+        }
+        const amount = Number((JSON.parse(req.body ?? '{}') as { amount?: number }).amount ?? 0)
+        if (amount === 0) return asExchange(200, { balance: state.balance })
+        if (state.balance < amount) return asExchange(409, { error: 'insufficient' })
+        state.balance -= amount
+        return asExchange(200, { balance: state.balance, redeem: amount })
+      },
+      executeRaceBurst: async (requests: Array<{ method: string; pathAndQuery: string; body: string }>) => {
+        const amount = Number((JSON.parse(requests[0]?.body ?? '{}') as { amount?: number }).amount ?? 0)
+        state.balance -= amount // racy: one debit for every acknowledgement
+        const shared = state.balance + amount * (requests.length - 1)
+        return {
+          summary: { spreadMs: 2, statusCounts: { '200': requests.length } },
+          results: requests.map(req => ({
+            status: 200, method: req.method, pathAndQuery: req.pathAndQuery, body: JSON.stringify({ balance: shared, redeem: amount }), headers: {}, durationMs: 1, bytes: 1,
+          }) as never),
+        }
+      },
+    } as unknown as DeterministicEngineInput['broker']
+    const input = {
+      runId: 'run-race-admin',
+      assignmentId: 'asg-race-admin',
+      signal: new AbortController().signal,
+      endpoints: [endpoint({ method: 'POST', pathTemplate: '/giftcards/:id/redeem', riskScore: 70 })],
+      personas: personasWithAdmin,
+      broker,
+      grant: {} as never,
+      backend: {} as never,
+      tier: 3,
+      environmentMode: 'ephemeral_lab',
+    } as unknown as DeterministicEngineInput
+    const result = await probeRaceDoubleSpend(hypothesis as never, input, () => undefined)
+    assert.equal(result.verdict, 'signal', result.summary)
+  })
+})
+
+describe('capability-misses: blind SQLi timing follow-up', () => {
+  test('a timing probe emits a spec that is wired to the timing recipe', () => {
+    const hyp = {
+      key: 'sqli_boolean|x|q',
+      endpoint: { id: 'GET:/api/v1/catalog/search', origin: 'http://127.0.0.1:4100', method: 'GET', pathTemplate: '/api/v1/catalog/search', params: [], riskScore: 50 },
+      probeClass: 'sqli_boolean',
+      intent: 'sqli',
+      method: 'GET',
+      pathAndQuery: '/api/v1/catalog/search?q=1',
+      param: { name: 'q', location: 'query' },
+      location: 'query',
+      baselineValue: 'widgets',
+      risk: 60,
+    } as never
+    const result = {
+      verdict: 'signal',
+      summary: 'timing',
+      anomalies: [{ type: 'sql_time_differential', dialect: 'sqlite', delayMs: 2500, controlPassed: true }],
+      details: {},
+      requestsSent: 8,
+      exchangeIds: [],
+      durationMs: 1,
+    } as never
+    const specs = synthSqlTime(hyp, result)
+    assert.equal(specs.length, 1)
+    assert.equal(specs[0]!.kind, 'sql_time_diff')
+    assert.equal(wiredRecipeForSpecKind('sql_time_diff', 'sqli'), 'boolean_or_timing')
+    const plan = planFloorRecipe({ hypothesis: hyp, probe: result, specKind: 'sql_time_diff', vulnClass: 'sqli', personas })
+    assert.ok(plan)
+    assert.equal(plan!.recipeId, 'boolean_or_timing')
+    const args = plan!.args as { mode?: string; receiptClass?: string; probePathAndQuery?: string }
+    assert.equal(args.mode, 'timing')
+    assert.equal(args.receiptClass, 'blind_sqli')
+    assert.match(String(args.probePathAndQuery), /BLOB/i)
+  })
+})

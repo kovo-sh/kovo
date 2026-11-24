@@ -1633,6 +1633,12 @@ export function recipeForSpecKind(specKind: string, vulnClass?: string | null): 
  */
 export const WIRED_SPECKIND_RECIPES: readonly SpecKindRecipeMapping[] = [
   {
+    specKind: 'sql_time_diff',
+    vulnClasses: ['sqli'],
+    recipe: 'boolean_or_timing',
+    note: 'Time-based blind SQLi: the engine schedules this probe only after a response-identical boolean arm, and the recipe carries the delay payload. Confirmation is the `timing` receipt rule (vulnClass blind_sqli, >3x separation), never a status.',
+  },
+  {
     specKind: 'sql_boolean_diff',
     vulnClasses: ['sqli'],
     recipe: 'boolean_or_timing',
@@ -1648,12 +1654,6 @@ export const WIRED_SPECKIND_RECIPES: readonly SpecKindRecipeMapping[] = [
 
 /** Rows whose recipe exists but that stay on the legacy verifier for a measured reason. */
 export const LEGACY_UNWIRED_SPECKINDS: readonly { specKind: string; vulnClasses: readonly string[]; recipe: FloorRecipeId; reason: string }[] = [
-  {
-    specKind: 'sql_time_diff',
-    vulnClasses: ['sqli'],
-    recipe: 'boolean_or_timing',
-    reason: 'Timing receipts are selected by vulnClass (`sql_time`), not by spec kind; the engine synthesizer never emits sql_time_diff, so wiring it would delete a branch with no producer before the receipt vocabulary is aligned.',
-  },
   {
     specKind: 'race_burst',
     vulnClasses: ['race_double_spend'],

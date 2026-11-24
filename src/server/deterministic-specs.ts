@@ -2122,6 +2122,48 @@ function synthWebhook(hyp: EngineHypothesis, result: DifferentialResult): Synthe
 // ---------------------------------------------------------------------------------------------
 
 /** All schema-shaped candidate specs for a signal, most specific first. */
+/**
+ * Time-based blind SQLi: the engine only schedules this probe when the boolean arm produced no
+ * signal (a response-identical sink), so the spec exists purely to reach the typed
+ * `boolean_or_timing` timing recipe. Its declarative body is attribution; the recipe owns the proof.
+ */
+export function synthSqlTime(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
+  const hit = result.anomalies.find(anomaly => anomaly.type === 'sql_time_differential')
+  if (!hit || !hyp.param) return []
+  const dialectRaw = String(hit.dialect ?? '')
+  const dialect = ['postgres', 'mysql', 'sqlite', 'mssql'].includes(dialectRaw)
+    ? dialectRaw as 'postgres' | 'mysql' | 'sqlite' | 'mssql'
+    : 'postgres'
+  const delayMs = Math.max(1500, Math.min(3000, Number(hit.delayMs) || 2500))
+  return [{
+    kind: 'sql_time_diff',
+    vulnClass: 'sqli',
+    endpoint: hyp.endpoint.pathTemplate,
+    spec: {
+      ...baseFields(
+        hyp.endpoint.origin,
+        'Time-based blind SQL injection differential',
+        'CWE-89',
+        'injection-input',
+        'high',
+        '{ controlPassed: (.sqlTimeDiff.controlPassed == true), confirmed: (.sqlTimeDiff.passed == true) }',
+      ),
+      kind: 'sql_time_diff',
+      targetOrigin: hyp.endpoint.origin,
+      method: hyp.method === 'GET' ? 'GET' : hyp.method,
+      pathAndQuery: hyp.pathAndQuery.split('?')[0] || '/',
+      paramName: hyp.param.name,
+      paramLocation: hyp.location ?? 'query',
+      baselineValue: hyp.baselineValue ?? '1',
+      quoteStyle: 'single',
+      dialect,
+      delayMs,
+      ...(hyp.location === 'json' ? { jsonBody: hyp.jsonBody ?? {} } : {}),
+      ...(hyp.location === 'form' ? { jsonBody: hyp.jsonBody ?? {} } : {}),
+    },
+  }]
+}
+
 export function synthesizeEngineSpecs(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
   if (result.verdict !== 'signal') return []
   try {
@@ -2137,6 +2179,7 @@ export function synthesizeEngineSpecs(hyp: EngineHypothesis, result: Differentia
     switch (hyp.probeClass) {
       case 'authz_matrix': return synthAuthz(hyp, result)
       case 'sqli_boolean': return synthSqlBoolean(hyp, result)
+      case 'sqli_time_diff': return synthSqlTime(hyp, result)
       case 'ssti_math': return synthSsti(hyp, result)
       case 'command_injection': return synthCommandInjection(hyp, result)
       case 'workflow_invariant': return synthWorkflowStepSkip(hyp, result)

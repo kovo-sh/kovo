@@ -102,6 +102,12 @@ export interface EndpointHarvest {
   rowIds?: Record<string, string>
   /** Structural response evidence: wire format and value shape, never a route-name assumption. */
   evidence?: HarvestEvidence
+  /**
+   * Status of the owner/member read of the route itself. A 401/403 on a GET is the universal
+   * signature of a Bearer/JWT-only API endpoint in front of a cookie-authenticated app, so it is
+   * selection evidence (never proof).
+   */
+  ownerReadStatus?: number
 }
 
 export interface HarvestEvidence {
@@ -2090,7 +2096,11 @@ export function enumerateHypotheses(
     // A state-changing route whose own shape moves money/stock. The burst probe runs a serial
     // control and a same-ticket burst against the *same* conserved field, so only a real
     // over-count/debit-once divergence can confirm.
-    const raceHint = /(?:^|[/_.-])(?:transfers?|payments?|debits?|credits?|withdrawals?|withdraw|refunds?|redeem|claims?|reserve|reservations?|stocks?|inventory|seats?|balances?|credits?|points?)(?:$|[/_.-])/i
+    const raceHint = /(?:^|[/_.-])(?:transfers?|payments?|debits?|credits?|withdrawals?|withdraw|refunds?|redeem|claims?|reserve|reservations?|stocks?|inventory|seats?|balances?|credits?|points?|checkouts?|carts?|bags?|baskets?|orders?|purchases?|coupons?)(?:$|[/_.-])/i
+    // Conserved-resource writes (checkout/cart/redeem/transfer) are the routes a synchronized burst
+    // can actually prove. They rank above speculative routes that spend a race slot and come back
+    // unmeasured.
+    const conservedResourceRoute = /(?:^|[/_.-])(?:checkouts?|carts?|bags?|baskets?|redeem|transfers?|payments?|purchases?|orders?|stocks?|inventory|balances?|credits?|points?)(?:$|[/_.-])/i.test(bare)
     const createOnly = /^(?:start|create|new|init|begin|prepare|open|quote|preview|estimate)$/i
     if (conversionEnvironment && method === 'POST' && options.tier >= 2 && !createOnly.test(lastSegment) &&
         !/__|cleanup|orphan|health|healthz/i.test(bare) && raceHint.test(bare)) {
@@ -2125,7 +2135,8 @@ export function enumerateHypotheses(
         ...(raceIds.length > 0 ? { resourceIds: raceIds } : {}),
         ...(raceRead ? { readbackPath: raceRead.pathTemplate.split('?')[0] || '/' } : {}),
         jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, undefined, coerceNumericBodies),
-        risk: endpointRiskScore(endpoint) + (observedFields.some(field => /amount|quantity|qty|count|balance|stock/i.test(field)) ? 18 : 6),
+        risk: endpointRiskScore(endpoint) + (observedFields.some(field => /amount|quantity|qty|count|balance|stock/i.test(field)) ? 18 : 6) +
+          (conservedResourceRoute ? 20 : 0),
       })
     }
 
@@ -2356,6 +2367,10 @@ export function enumerateHypotheses(
         ...(Object.keys(claims).length > 0 ? { identityClaims: claims } : {}),
         risk: endpointRiskScore(endpoint) + 18 +
           ((observedEvidence.jwtValues?.length ?? 0) > 0 ? 40 : 0) +
+          // A cookie session that is *denied* on this GET is the strongest structural signature of
+          // a Bearer/JWT-only endpoint. Rank it above the cookie-authenticated credential routes
+          // that otherwise fill the auth_protocol quota.
+          ((harvest?.ownerReadStatus === 401 || harvest?.ownerReadStatus === 403) ? 45 : 0) +
           (tokenBoundarySurface ? 12 : 0) +
           (/(?:^|\/)(?:session|tokens?|auth|whoami|me)(?:\/|$)/i.test(bare) ? 16 : 0),
       })
@@ -2611,6 +2626,8 @@ export function enumerateHypotheses(
 // ---------------------------------------------------------------------------------------------
 
 interface JsonHarvest {
+  /** HTTP status of the harvest read (a 401/403 is itself selection evidence for token endpoints). */
+  status: number
   ids: string[]
   fields: string[]
   values: Record<string, string[]>
@@ -2638,7 +2655,7 @@ function harvestJson(body: string): JsonHarvest {
   const rowIds: Record<string, string> = {}
   const evidence: HarvestEvidence = {}
   let parsed: unknown
-  try { parsed = JSON.parse(body) } catch { return { ids, fields: [], values, shapes, textValues, rowIds, body, evidence } }
+  try { parsed = JSON.parse(body) } catch { return { status: 200, ids, fields: [], values, shapes, textValues, rowIds, body, evidence } }
   const recordRow = (row: Record<string, unknown>): void => {
     let identifier: string | undefined
     const scalars: string[] = []
@@ -2710,6 +2727,7 @@ function harvestJson(body: string): JsonHarvest {
   }
   walk(parsed, 0)
   return {
+    status: 200,
     ids: [...new Set(ids)].filter(id => /^[A-Za-z0-9_.:-]{1,128}$/.test(id)),
     fields: [...new Set(Object.keys(values))],
     values,
@@ -2769,11 +2787,11 @@ class SurfaceHarvester {
         if (/xml/i.test(exchange.mediaType ?? '')) evidence.xml = true
         const headerNames = Object.keys(headers).map(name => name.toLowerCase())
         if (headerNames.length > 0) evidence.headerNames = headerNames.slice(0, 32)
-        return { ...harvested, evidence }
+        return { ...harvested, status: exchange.status, evidence }
       }
-      return { ids: [], fields: [], values: {}, shapes: {}, textValues: [], rowIds: {}, body: '', evidence: {} }
+      return { ids: [], fields: [], values: {}, shapes: {}, textValues: [], rowIds: {}, body: '', status: exchange.status, evidence: {} }
     } catch {
-      return { ids: [], fields: [], values: {}, shapes: {}, textValues: [], rowIds: {}, body: '', evidence: {} }
+      return { ids: [], fields: [], values: {}, shapes: {}, textValues: [], rowIds: {}, body: '', status: 0, evidence: {} }
     } finally {
       this.inflight.delete(pathAndQuery)
     }
@@ -2952,6 +2970,7 @@ async function harvestSurface(
       const own = await harvester.get(readPersona, bare)
       budget.requestsUsed += 1
       mergeHarvest(target, own)
+      if (target.ownerReadStatus === undefined) target.ownerReadStatus = own.status
       baseline = own
     }
     if (collection && collection !== '/' && (hasDynamicIdSegment(bare) || method !== 'GET')) {
@@ -3234,6 +3253,15 @@ export function buildProbeRequest(
         paramLocation: hyp.location,
         baselineValue: hyp.baselineValue,
         ...(hyp.location === 'json' ? { jsonBody: hyp.jsonBody ?? {} } : {}),
+      }
+    case 'sqli_time_diff':
+      return {
+        ...base,
+        ...(hyp.param ? { param: hyp.param.name } : {}),
+        paramLocation: hyp.location,
+        baselineValue: hyp.baselineValue ?? '1',
+        ...(hyp.location === 'json' ? { jsonBody: hyp.jsonBody ?? {} } : {}),
+        ...(hyp.location === 'form' ? { jsonBody: hyp.jsonBody ?? {} } : {}),
       }
     case 'ssti_math':
     case 'command_injection':
@@ -4001,13 +4029,13 @@ export async function probeRaceDoubleSpend(
     const id = track(exchange)
     if (typeof id === 'string') exchangeIds.push(id)
   }
-  const sendGet = async (origin: string, path: string): Promise<BrokerExchangeResult | null> => {
+  const sendGet = async (origin: string, path: string, persona?: string): Promise<BrokerExchangeResult | null> => {
     try {
       const exchange = await input.broker.executeHttp({
         origin,
         method: 'GET',
         pathAndQuery: path,
-        persona: hyp.ownerPersona,
+        ...(persona ?? hyp.ownerPersona ? { persona: persona ?? hyp.ownerPersona } : {}),
         timeoutMs: 10_000,
       }, input.grant, input.signal)
       requests += 1
@@ -4109,18 +4137,37 @@ export async function probeRaceDoubleSpend(
   let transferredField: string | null = null
 
   // Preferred baseline: read the conserved value through the family readback. This is read-only,
-  // so unlike the legacy shape probe it cannot mutate the state before the burst.
+  // so unlike the legacy shape probe it cannot mutate the state before the burst. A collection that
+  // only an admin may read must not abort the proof: fall back to an admin read, then to the
+  // concrete item route with the harvested id under both personas.
+  const adminPersona = input.personas.find(persona => persona.privilege === 'admin')?.handle
+  const readbackCandidates: Array<{ path: string; persona?: string }> = []
   if (hyp.readbackPath) {
-    for (const origin of origins) {
-      const read = await sendGet(origin, hyp.readbackPath)
-      if (!read || read.status < 200 || read.status >= 300) continue
-      const parsed = readableRecord(read.body)
-      const pair = numericEntries(parsed).find(([field]) => /balance|available|remaining|stock|on_?hand|quantity|credits?|points?/i.test(field))
-      if (!pair) continue
-      raceOrigin = origin
-      balanceField = pair[0]
-      baselineBalance = pair[1]
-      break
+    readbackCandidates.push({ path: hyp.readbackPath })
+    if (adminPersona && adminPersona !== hyp.ownerPersona) readbackCandidates.push({ path: hyp.readbackPath, persona: adminPersona })
+  }
+  if (resolvedId) {
+    readbackCandidates.push({ path: racePath.split('?')[0]! })
+    if (adminPersona && adminPersona !== hyp.ownerPersona) readbackCandidates.push({ path: racePath.split('?')[0]!, persona: adminPersona })
+  }
+  if (readbackCandidates.length > 0) {
+    for (const candidate of readbackCandidates) {
+      for (const origin of origins) {
+        const read = await sendGet(origin, candidate.path, candidate.persona)
+        if (!read || read.status < 200 || read.status >= 300) continue
+        const parsed = readableRecord(read.body)
+        const pair = numericEntries(parsed).find(([field]) => /balance|available|remaining|stock|on_?hand|quantity|credits?|points?/i.test(field))
+        if (!pair) continue
+        raceOrigin = origin
+        balanceField = pair[0]
+        baselineBalance = pair[1]
+        if (candidate.path !== hyp.readbackPath && candidate.persona && candidate.persona !== hyp.ownerPersona) {
+          // The item read is the authoritative object; keep its persona for the burst too.
+          hyp.ownerPersona = candidate.persona
+        }
+        break
+      }
+      if (raceOrigin) break
     }
     if (raceOrigin) {
       amountField = Object.keys(hyp.jsonBody ?? {})
@@ -4818,7 +4865,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     mass_assignment: capFor(6),
     csrf: capFor(4),
     workflow: capFor(3),
-    race: capFor(2),
+    race: capFor(6),
     ssti: capFor(3),
     command_injection: capFor(3),
     webhook: capFor(2),
@@ -4852,6 +4899,10 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
   // Request-count termination is the deterministic contract; the wall clock is only a safety net
   // with a fixed margin, so a slow host cannot silently truncate a different tail of the queue.
   const hardDeadlineMs = maxDurationMs + deterministicWallMarginMs
+  // Bounded blind-SQLi follow-ups: a response-identical boolean arm is the signature of a sink whose
+  // oracle is time, not content, so one timing probe is scheduled for that parameter.
+  let timingFollowUps = 0
+  const maxTimingFollowUps = 3
   for (const hyp of probeQueue) {
     if (input.signal.aborted) { report.stoppedReason = 'aborted'; break }
     if (Date.now() - started >= hardDeadlineMs) { report.stoppedReason = 'time'; break }
@@ -4958,7 +5009,25 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
       stoppedReason: probe.stoppedReason,
       summary: probe.summary.slice(0, 200),
     })
-    if (probe.verdict !== 'signal') continue
+    if (probe.verdict !== 'signal') {
+      if (!input.probe &&
+          hyp.probeClass === 'sqli_boolean' &&
+          probe.verdict === 'no_signal' &&
+          hyp.param &&
+          (hyp.location === 'query' || hyp.location === 'json' || hyp.location === 'form') &&
+          timingFollowUps < maxTimingFollowUps &&
+          maxRequests - budget.requestsUsed >= perProbeRequestFloor * 2) {
+        const followKey = `sqli_time_diff|${hyp.endpoint.id}|${hyp.param.name}`
+        if (!probeQueue.some(item => item.key === followKey)) {
+          timingFollowUps += 1
+          probeQueue.push({ ...hyp, key: followKey, probeClass: 'sqli_time_diff', intent: 'sqli' })
+          log('deterministic_engine.sqli_time_followup',
+            `sqli_boolean returned no_signal on ${hyp.method} ${hyp.endpoint.pathTemplate} param=${hyp.param.name}; scheduling one time-based follow-up.`,
+            { endpoint: hyp.endpoint.pathTemplate, method: hyp.method, param: hyp.param.name, scheduled: timingFollowUps })
+        }
+      }
+      continue
+    }
     report.signals += 1
     stats.signals += 1
 
