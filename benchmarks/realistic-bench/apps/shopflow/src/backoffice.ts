@@ -12,6 +12,13 @@ const guard = (ctx: ReqCtx): boolean => ctx.actor !== 'anonymous'
 
 export default function register(app: AppContext): void {
   const db = app.db
+  // Admin-namespaced/settings mutations are merchant-owner functions. A plain store member must not
+  // be able to change store configuration or moderate reviews; the auth-only guard made those safe
+  // defaults look like a latent BFLA to any differential scanner.
+  const privileged = (ctx: ReqCtx): boolean => {
+    const role = app.personaFor(ctx.actor)?.role
+    return role === 'owner' || role === 'admin'
+  }
 
   app.route('listCustomers', (ctx) => {
     if (!guard(ctx)) return ctx.json({ error: 'unauthorized' }, 401)
@@ -70,6 +77,7 @@ export default function register(app: AppContext): void {
 
   app.route('moderateReview', (ctx) => {
     if (!guard(ctx)) return ctx.json({ error: 'unauthorized' }, 401)
+    if (!privileged(ctx)) return ctx.json({ error: 'forbidden' }, 403)
     const row = app.findByExternalId('reviews', String(ctx.params[app.paramName('reviewId')] ?? ''))
     if (!row || row.store_id !== ctx.tenant) return ctx.json({ error: 'not_found' }, 404)
     db.run('UPDATE reviews SET approved = 1 WHERE id = ?', [row.id])
@@ -100,6 +108,7 @@ export default function register(app: AppContext): void {
 
   app.route('updateSettings', (ctx) => {
     if (!guard(ctx)) return ctx.json({ error: 'unauthorized' }, 401)
+    if (!privileged(ctx)) return ctx.json({ error: 'forbidden' }, 403)
     db.run('UPDATE store_config SET settings_json = ? WHERE store_id = ?', [JSON.stringify(body(ctx).settings ?? {}), ctx.tenant])
     return ctx.json({ ok: true })
   })
