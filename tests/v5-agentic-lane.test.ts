@@ -22,6 +22,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import type { Finding, InlineVerifyFeedback } from '../src/domain.ts'
 import { readTrace } from '../src/server/agent-trace.ts'
 import { proveAuthzReadDiff, validateProofInput } from '../src/server/proof-tools.ts'
+import { verifierRepairFeedback, withVerifierRepairFeedback } from '../src/server/agent-session.ts'
 import {
   computeDynamicStepBudget,
   countConsecutiveDrySteps,
@@ -57,7 +58,6 @@ type Internals = {
   alreadyConfirmedRefs: (run: Run, limit?: number) => Array<{ path: string; method?: string | null; cwe?: string | null }>
   detLeadSummaries: (run: Run) => Array<{ probeClass: string }>
   assignmentBriefForStep: (input: Record<string, unknown>) => string | undefined
-  submitProofSpec: (input: Record<string, unknown>) => Promise<unknown>
   executeInlineVerification: (input: Record<string, unknown>) => Promise<unknown>
   buildGrant: (job: unknown, run: Run, origins: ReadonlySet<string>) => { grant: unknown; currentSecrets: () => unknown[] }
   prePhase0SeededSteps: Map<string, boolean>
@@ -314,8 +314,6 @@ test('proof handler compiles a typed spec and verification failures carry repair
   const { storage, runId } = await startRun(t)
   const run = storage.run(runId)
   const origin = run.candidates.find(c => run.approved.includes(c.id))!.origin
-  const assignment = storage.makeWorker(run, 'investigation', run.candidates[0], 'proof worker', 'proof worker')
-  const claimed = storage.updateWorker(assignment.id, { status: 'running', lease: randomUUID() })!
   const execution = new Execution(storage)
   t.after(() => execution.stop())
 
@@ -337,6 +335,9 @@ test('proof handler compiles a typed spec and verification failures carry repair
   })
   assert.equal(proof.spec.kind, 'http_chain')
 
+  // The retired `submitProofSpec` compiler path is gone (M0 Cut 1); verification feedback is now
+  // surfaced by `withVerifierRepairFeedback`, which must attach a structured repair block to a
+  // failing outcome and must leave a confirmed outcome byte-identical.
   const feedback: InlineVerifyFeedback = {
     verdict: 'inconclusive',
     controlPassed: false,
@@ -344,26 +345,19 @@ test('proof handler compiles a typed spec and verification failures carry repair
     stepStatuses: [{ id: 'probe', role: 'probe', status: 200, bodyLen: 12 }],
     retriesRemaining: 2,
   }
-  internals(execution).executeInlineVerification = async input => ({
-    findingId: input.findingId,
-    replaySpecId: input.replaySpecId,
-    attemptCount: 1,
+  const failing = withVerifierRepairFeedback({
+    findingId: 'finding-proof-1',
+    replaySpecId: 'spec-1',
     status: 'inconclusive',
-    feedback,
-  })
-  const job = { assignment: claimed, origins: new Set([origin]), controller: new AbortController() }
-  const { grant, currentSecrets } = internals(execution).buildGrant(job, run, new Set([origin]))
-  const result = await internals(execution).submitProofSpec({
-    job, grant, currentSecrets, proof,
+    ...feedback,
   }) as Record<string, unknown>
-
-  assert.equal(result.status, 'inconclusive')
-  const repair = result.repair as Record<string, unknown>
+  const repair = verifierRepairFeedback(failing)
   assert.ok(repair, 'failed verification must return a structured repair block')
-  assert.equal(repair.failedRule, 'verdict:inconclusive')
-  assert.ok(typeof repair.suggestedFix === 'string' && String(repair.suggestedFix).length > 0)
-  const saved = storage.runDetail(runId).findings.find((f: Finding) => f.id === String(result.findingId))
-  assert.ok(saved, 'the typed proof persists a candidate finding before verification')
+  assert.equal(repair!.failedRule, 'verdict:inconclusive')
+  assert.ok(typeof repair!.suggestedFix === 'string' && String(repair!.suggestedFix).length > 0)
+
+  const confirmed = { findingId: 'finding-proof-2', status: 'confirmed', verdict: 'confirmed', controlPassed: true }
+  assert.deepEqual(withVerifierRepairFeedback(confirmed), confirmed)
 })
 
 test('occurred context builders: confirmed refs, leads and <=1.5 KB assignment brief', async (t) => {
