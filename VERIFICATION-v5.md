@@ -31,7 +31,7 @@ All product rows are real `Execution` on the 3-app realistic dev cells (acme-saa
 | Floor determinism | **0 spread**, 3 repeats identical (site sets included, `driftApps=0`) | Re-gated on the current tree |
 | Salted held-out product floor (seed 1000042) | **24 / 58 (41.4%)**, **100%** precision | acme 9, shopflow 8, opsportal 7 |
 | Agentic, 600 s generous, 3 apps dev | **35 / 59 (59.3%)**, **100%** precision, 0 unmatched, **+2 net** | acme 13 (+1), shopflow 12 (+1), opsportal 10 (**+0**); ~$1.0 total |
-| Agentic, 600 s generous, 3 apps salted held-out | **24 / 58**, **+0 net**, **2 unmatched FPs** (acme, shopflow) | 19–23 investigations/app; 0.53 $/app. Blocked, see V7.2 |
+| Agentic, 600 s generous, 3 apps salted held-out | **25 / 58**, **+1 net**, **100%** precision | acme 10, shopflow 8, opsportal 7; 19–23 investigations/app; pre-hardening run had 2 unmatched FPs |
 | Agentic rotation (shopflow, resumed, 300 s) | **3 / 19**, **100%** precision, p50 **77.5 s** | After injection-class precedence fix |
 | XBEN-25 | **25 / 25**, 100% precision | Hard regression gate |
 | held-out-saas | **20 / 20** + **20 / 20 patches** (`allPatches=fixed`) | Hard regression gate |
@@ -54,8 +54,9 @@ All product rows are real `Execution` on the 3-app realistic dev cells (acme-saa
 | Realism wiring | #2–#4 wiring pass | #2 PASS, #3 PASS, #4 PASS | **PASS** |
 | Realism capability | ≥75% on #1–#4 | #3 PASS (3/3 confirms); #2 2/4 planted; #4 0/3 | **PARTIAL** |
 | Worst-run precision (agentic) | 100% on every lift cell | dev 100%; **held-out 2 unmatched FPs** | **FAIL** |
-| Agentic lift | ≥ +6–8 pp dev / ≥ +6 pp held-out | dev **+2 (+3.4 pp)**; held-out **+0** | **FAIL** |
+| Agentic lift | ≥ +6–8 pp dev / ≥ +6 pp held-out | dev **+2 (+3.4 pp)**; held-out **+1 (+1.7 pp)** | **FAIL** |
 | Dispatch coverage | ready steps are not stranded | opsportal **1 of 7** planned, acme 2 of 19 | **FAIL (P0)** |
+| Proof submission | route-hit targets produce a spec or an explicit proof gap | **19 of 23** route-hit held-out targets submitted **no spec** | **FAIL (P0)** |
 | Chains | ≥ 4/6 | #2 chain 2/3; not re-measured elsewhere | **PARTIAL** |
 
 **M0-interim milestone (recorded 2026-11-24, pre-Cut3):** the floor (33/59 dev, 24/58 held-out, 0-spread, 100% precision), legacy regression gates, realism wiring, Realism #3 capability, and Realism #2 async SSRF+XXE are citable **with the explicit provenance "pre-Cut3: floor still confirms via declarative specs in `replay-verifier.ts`; receipts are shadow/convert for the agent path."** Cut 3a retires six of those spec families; the milestone must be re-gated after it lands.
