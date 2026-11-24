@@ -43,9 +43,11 @@
  * predicate, and `verifyReceipt()` requires a stable structural response difference after token
  * stripping, a stable control baseline, and no 5xx. Echo/nonce-only changes are rejected.
  *
- * Cut 3a wires only the rows in `WIRED_SPECKIND_RECIPES` (currently `sql_boolean_diff`). The other
- * rows above stay on the legacy verifier and are listed in `LEGACY_UNWIRED_SPECKINDS` with the
- * measured blocking reason; `wiredRecipeForSpecKind` is the single source of truth for the guard.
+ * Cut 3a wired `sql_boolean_diff`; Cut 3b adds the authorization families (`http_chain` +
+ * object/function access) with a bogus-id/peer denial control and a pre-read + post-read mutation
+ * readback. The other rows above stay on the legacy verifier and are listed in
+ * `LEGACY_UNWIRED_SPECKINDS` with the measured blocking reason; `wiredRecipeForSpecKind` is the
+ * single source of truth for the guard.
  */
 import type { AmbientAuth, ImpactStep, RoleName } from './oracle-invariants.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
@@ -149,6 +151,14 @@ export interface AccessBoundaryArgs extends FloorRecipeBaseArgs {
   probe: FloorActor
   /** Same-route control that must be denied; defaults to a peer of `probe`. */
   denied?: FloorActor
+  /**
+   * Control path the denied actor requests. Defaults to `pathAndQuery` (a same-route sibling arm).
+   * When a route only denies nonexistent identifiers, this is the bogus-id variant: the denial is
+   * still an authenticated negative control, and the impact oracle decides whether it is boundary
+   * evidence or merely selectivity.
+   */
+  deniedPathAndQuery?: string
+  deniedMethod?: string
   requiredRole?: RoleName
   resourceTenant?: string
   expectControlDenied?: boolean
@@ -164,6 +174,19 @@ export interface PersistedMutationArgs extends FloorRecipeBaseArgs {
   readbackPathAndQuery?: string
   readbackMethod?: string
   readbackActor?: FloorActor
+  /**
+   * Control write that puts the mutated field in a known-different state before the pre-read, so
+   * the probe's body is a genuine delta instead of re-sending the value the record already holds.
+   * Reuses the existing persistence oracle (`findPersistence`): the write is a control arm and its
+   * resulting value must differ from the probe's post-read.
+   */
+  baselineWrite?: { body: Record<string, unknown>; actor?: FloorActor; method?: string }
+  /**
+   * Control write restoring the probe actor's own state before the proof. Self-service function
+   * state (identity assumption) is a persistent session mutation, so without a reset the pre-read
+   * may already carry the target value and the replay looks like an idempotent no-op.
+   */
+  reset?: { body: Record<string, unknown>; actor?: FloorActor; method?: string }
   requiredRole?: RoleName
   resourceTenant?: string
   expectControlDenied?: boolean
@@ -172,19 +195,29 @@ export interface PersistedMutationArgs extends FloorRecipeBaseArgs {
 }
 
 export interface BooleanOrTimingArgs extends FloorRecipeBaseArgs {
-  /** `boolean` = control-vs-variant structural differential; `timing` = conditional delay. */
-  mode: 'boolean' | 'timing'
+  /**
+   * `boolean` = control-vs-variant structural differential; `timing` = conditional delay;
+   * `status` = the paired status-boolean triangle (benign 2xx baseline, 2xx tautology, <500
+   * contradiction) for sinks whose rows do not separate structurally.
+   */
+  mode: 'boolean' | 'timing' | 'status'
   actor?: FloorActor
   /** Path with the baseline (true) predicate; defaults to `pathAndQuery`. */
   controlPathAndQuery?: string
   /** Path with the injected/false predicate; defaults to `pathAndQuery`. */
   probePathAndQuery?: string
+  /** Status mode: path of the failing contradiction arm (defaults to `probePathAndQuery`). */
+  contradictionPathAndQuery?: string
   /** JSON body carrying the baseline value (JSON-located parameters cannot move a query string). */
   controlJsonBody?: unknown
   /** JSON body carrying the injected predicate. */
   probeJsonBody?: unknown
-  /** Paired rounds for the boolean rule (clamped to 2..4; timing ignores it). */
+  /** Status mode: JSON body of the contradiction arm. */
+  contradictionJsonBody?: unknown
+  /** Paired rounds for the boolean/status rules (clamped to 2..4; timing ignores it). */
   rounds?: number
+  /** Receipt class; defaults to `sqli` (boolean/timing) or `sqli_status` (status mode). */
+  receiptClass?: string
   /**
    * Operand the probe proved the predicate with. A response-grounded value (or the empty term of the
    * tautology pair) must travel onto the recorded spec so a patch retest replays the same pair
@@ -263,6 +296,8 @@ export interface FloorRecipeContext {
   readonly args: FloorRecipeArgs
   /** Exchanges recorded so far (bounded). */
   readonly steps: readonly FloorRecipeStep[]
+  /** Host exchange ids recorded so far, in order. */
+  readonly exchangeIds: readonly string[]
   send(spec: FloorRequestSpec): Promise<FloorRecipeStep>
   oob(query: FloorOobQuery): Promise<ReceiptOobEvent | null>
   /**
@@ -389,7 +424,7 @@ class RecipeContext implements FloorRecipeContext {
       pathAndQuery: spec.pathAndQuery,
       status: exchange.status,
       actor: {
-        handle: spec.actor.handle,
+        handle: ANONYMOUS_ACTOR_HANDLES.has(spec.actor.handle.trim().toLowerCase()) ? null : spec.actor.handle,
         role: spec.actor.role ?? null,
         tenant: spec.actor.tenant ?? null,
         auth: spec.actor.auth ?? 'unknown',
@@ -405,6 +440,7 @@ class RecipeContext implements FloorRecipeContext {
       ...(spec.headers ? { requestHeaders: spec.headers } : {}),
       ...(exchange.responseHeaders ? { responseHeaders: exchange.responseHeaders } : {}),
       ...(exchange.secretMatches?.length ? { secretMatches: exchange.secretMatches.slice(0, 16) } : {}),
+      evidenceRole: spec.role,
     }
     const recorded: FloorRecipeStep = {
       exchangeId,
@@ -420,6 +456,7 @@ class RecipeContext implements FloorRecipeContext {
       step,
       ...(exchange.durationMs !== undefined ? { durationMs: exchange.durationMs } : {}),
       carrierText: exchange.carrierText ?? carrierTextOf(spec),
+      evidenceRole: spec.role,
     })
     return recorded
   }
@@ -523,6 +560,7 @@ function defineRecipe<A extends FloorRecipeArgs>(
  * (or a role/tenant differential); the recipe asserts the boundary before the receipt gate sees it.
  */
 const accessBoundary = defineRecipe<AccessBoundaryArgs>('access_boundary', async (args, ctx) => {
+  const deniedActor = args.denied ?? peerOf(args.probe)
   const entitled = await ctx.send({
     arm: 'control',
     role: 'entitled_read',
@@ -534,9 +572,9 @@ const accessBoundary = defineRecipe<AccessBoundaryArgs>('access_boundary', async
   const denied = await ctx.send({
     arm: 'control',
     role: 'denied_control',
-    method: args.method,
-    pathAndQuery: args.pathAndQuery,
-    actor: args.denied ?? peerOf(args.probe),
+    method: args.deniedMethod ?? args.method,
+    pathAndQuery: args.deniedPathAndQuery ?? args.pathAndQuery,
+    actor: deniedActor,
     ...(args.headers ? { headers: args.headers } : {}),
   })
   const probe = await ctx.send({
@@ -558,7 +596,7 @@ const accessBoundary = defineRecipe<AccessBoundaryArgs>('access_boundary', async
     exchangeIds: [entitled.exchangeId, denied.exchangeId, probe.exchangeId],
     oobEventIds: [],
     browserTraceIds: [],
-    claimedDelta: `${args.probe.handle} was served ${args.method.toUpperCase()} ${pathOnly(args.pathAndQuery)} while a same-route peer control was denied.`,
+    claimedDelta: `${args.probe.handle} was served ${args.method.toUpperCase()} ${pathOnly(args.pathAndQuery)} while an authenticated control arm on the same ${args.deniedPathAndQuery ? 'resource family' : 'route'} was denied.`,
     ...(args.requiredRole ? { requiredRole: args.requiredRole } : {}),
     ...(args.resourceTenant ? { resourceTenant: args.resourceTenant } : {}),
     ...(args.expectControlDenied !== undefined ? { expectControlDenied: args.expectControlDenied } : {}),
@@ -577,6 +615,36 @@ const persistedMutation = defineRecipe<PersistedMutationArgs>('persisted_mutatio
   const readbackMethod = args.readbackMethod ?? baselineMethod
   const readbackActor = args.readbackActor ?? args.actor
   const bodyKeys = Object.keys(args.body).slice(0, 8)
+
+  // A self-service function state persists on the caller's own session, so a stale target value
+  // from the probe phase would make a correct mutation look like an idempotent no-op. The reset is
+  // a control write that restores the actor's own baseline before the pre-read.
+  if (args.reset) {
+    const reset = await ctx.send({
+      arm: 'control',
+      role: 'state_reset',
+      method: args.reset.method ?? args.method,
+      pathAndQuery: args.pathAndQuery,
+      actor: args.reset.actor ?? args.actor,
+      jsonBody: args.reset.body,
+      ...(args.headers ? { headers: args.headers } : {}),
+    })
+    ctx.require(isSuccess(reset.exchange.status), 'state_reset', `The state reset was not accepted (${reset.exchange.status ?? 'no status'}).`)
+  }
+  // A baseline write makes the probe body a genuine delta: the pre-read then holds a known
+  // different value, and the persistence oracle can attribute the post-read change to the probe.
+  if (args.baselineWrite) {
+    const baselineWrite = await ctx.send({
+      arm: 'control',
+      role: 'baseline_write',
+      method: args.baselineWrite.method ?? args.method,
+      pathAndQuery: args.pathAndQuery,
+      actor: args.baselineWrite.actor ?? args.actor,
+      jsonBody: args.baselineWrite.body,
+      ...(args.headers ? { headers: args.headers } : {}),
+    })
+    ctx.require(isSuccess(baselineWrite.exchange.status), 'baseline_write', `The baseline write was not accepted (${baselineWrite.exchange.status ?? 'no status'}).`)
+  }
 
   const baseline = await ctx.send({
     arm: 'control',
@@ -609,7 +677,7 @@ const persistedMutation = defineRecipe<PersistedMutationArgs>('persisted_mutatio
   return buildProofReceipt({
     vulnClass: args.vulnClass,
     target: targetOf(args),
-    exchangeIds: [baseline.exchangeId, probe.exchangeId, after.exchangeId],
+    exchangeIds: [...ctx.exchangeIds],
     oobEventIds: [],
     browserTraceIds: [],
     claimedDelta: `The probe persisted request field(s) ${bodyKeys.join(', ') || '(none)'} and a separate readback observed the change.`,
@@ -664,12 +732,71 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
     }
     ctx.require(!serverError, 'non_error_arm', 'A boolean differential arm returned a server error (5xx).')
     return buildProofReceipt({
-      vulnClass: 'sqli',
+      vulnClass: args.receiptClass ?? 'sqli',
       target: { ...targetOf(args), ...(param ? { param } : {}) },
       exchangeIds,
       oobEventIds: [],
       browserTraceIds: [],
       claimedDelta: `The boolean SQL predicate changed the response structure across ${rounds} paired rounds while the baseline predicate stayed stable.`,
+    })
+  }
+
+  if (args.mode === 'status') {
+    const param = args.param ?? deriveDifferingParam(controlPath, probePath)
+    ctx.require(
+      Boolean(param),
+      'injected_parameter',
+      'A status-only boolean proof must name the injected parameter (or vary exactly one query key).',
+    )
+    const rounds = Math.max(2, Math.min(4, Math.floor(args.rounds ?? 2)))
+    const contradictionPath = args.contradictionPathAndQuery ?? probePath
+    const exchangeIds: string[] = []
+    for (let round = 0; round < rounds; round += 1) {
+      // The benign baseline is what separates a predicate contrast from a single malformed request:
+      // it is the same request without the boolean operator and must answer 2xx.
+      const benign = await ctx.send({
+        arm: 'control',
+        role: 'benign_baseline',
+        method: args.method,
+        pathAndQuery: controlPath,
+        actor,
+        ...(args.headers ? { headers: args.headers } : {}),
+        ...(args.controlJsonBody !== undefined ? { jsonBody: args.controlJsonBody } : {}),
+      })
+      const tautology = await ctx.send({
+        arm: 'probe',
+        role: 'tautology',
+        method: args.method,
+        pathAndQuery: probePath,
+        actor,
+        ...(args.headers ? { headers: args.headers } : {}),
+        ...(args.probeJsonBody !== undefined ? { jsonBody: args.probeJsonBody } : {}),
+      })
+      const contradiction = await ctx.send({
+        arm: 'probe',
+        role: 'contradiction',
+        method: args.method,
+        pathAndQuery: contradictionPath,
+        actor,
+        ...(args.headers ? { headers: args.headers } : {}),
+        ...(args.contradictionJsonBody !== undefined ? { jsonBody: args.contradictionJsonBody } : {}),
+      })
+      exchangeIds.push(benign.exchangeId, tautology.exchangeId, contradiction.exchangeId)
+      ctx.require(isSuccess(benign.exchange.status), 'benign_baseline', `The benign baseline returned ${benign.exchange.status ?? 'no status'} instead of a 2xx.`)
+      ctx.require(isSuccess(tautology.exchange.status), 'tautology', `The tautology arm returned ${tautology.exchange.status ?? 'no status'} instead of a 2xx.`)
+      ctx.require(
+        contradiction.exchange.status !== null && contradiction.exchange.status >= 400 && contradiction.exchange.status < 500,
+        'contradiction',
+        `The contradiction arm returned ${contradiction.exchange.status ?? 'no status'}; only a 4xx predicate failure is the paired status shape (a 5xx is a malformed request).`,
+      )
+    }
+    return buildProofReceipt({
+      vulnClass: args.receiptClass ?? 'sqli_status',
+      target: { ...targetOf(args), ...(param ? { param } : {}) },
+      exchangeIds,
+      oobEventIds: [],
+      browserTraceIds: [],
+      claimedDelta: `The tautology predicate kept the benign status across ${rounds} rounds while the contradiction predicate failed on the same request shape.`,
     })
   }
 
@@ -693,7 +820,7 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
   })
 
   return buildProofReceipt({
-    vulnClass: args.vulnClass,
+    vulnClass: args.receiptClass ?? args.vulnClass,
     target: targetOf(args),
     exchangeIds: [control.exchangeId, probe.exchangeId],
     oobEventIds: [],
@@ -947,7 +1074,8 @@ function inferMissingRoles(
   const reason = verification.reason
   const cited = (transcript.entries ?? []).filter(entry => receipt.exchangeIds.includes(entry.exchangeId))
 
-  if (verification.rule === 'boolean') {
+  if (verification.rule === 'boolean' || verification.rule === 'status_differential') {
+    if (/benign 2xx baseline|benign_baseline|complete benign/.test(reason)) return ['benign_baseline']
     if (/paired control\/probe rounds|equal number/.test(reason)) return ['paired_rounds']
     if (/name the injected parameter/.test(reason)) return ['injected_parameter']
     if (/request shape/.test(reason)) return ['request_shape']
@@ -955,6 +1083,7 @@ function inferMissingRoles(
     if (/only difference was the injected predicate|rotating nonce/.test(reason)) return ['structural_delta']
     if (/unstable|moving baseline/.test(reason)) return ['stable_differential']
     if (/no structural response change/.test(reason)) return ['structural_delta']
+    if (verification.rule === 'status_differential') return ['contradiction']
     return ['boolean_arm']
   }
 
@@ -1195,18 +1324,18 @@ export const WIRED_SPECKIND_RECIPES: readonly SpecKindRecipeMapping[] = [
     specKind: 'sql_boolean_diff',
     vulnClasses: ['sqli'],
     recipe: 'boolean_or_timing',
-    note: 'Product floor: paired true/false predicate rounds confirmed by the boolean receipt rule. The legacy verifier branch is retained only for the capability harness (scripts/) and patch retest; deleting it requires migrating the harness first (routing it through this recipe measured 20/25 on xben because status-only boolean differentials are not yet expressible by the receipt rule).',
+    note: 'Product floor: paired true/false predicate rounds confirmed by the boolean receipt rule. The legacy verifier branch is retained only for the capability harness (scripts/) and patch retest; the live probe deliberately never emits a status-only signal, so the status_differential receipt rule is available for callers that do (xben harness migration), not selected by the floor.',
+  },
+  {
+    specKind: 'http_chain',
+    vulnClasses: ['bola', 'idor', 'bfla', 'authorization', 'cross_tenant_read', 'cross_tenant_write'],
+    recipe: 'access_boundary',
+    note: 'Reads: entitled read + probe read + authenticated denial control (same-route peer, or the bogus-id variant when the route only denies nonexistent ids). Mutations: baseline write/reset + pre-mutation readback + probe mutation + separate post-read, confirmed by the shared authorization oracle (persisted delta / cross-tenant entitlement).',
   },
 ]
 
 /** Rows whose recipe exists but that stay on the legacy verifier for a measured reason. */
 export const LEGACY_UNWIRED_SPECKINDS: readonly { specKind: string; vulnClasses: readonly string[]; recipe: FloorRecipeId; reason: string }[] = [
-  {
-    specKind: 'http_chain',
-    vulnClasses: ['bola', 'idor', 'bfla', 'authorization', 'cross_tenant_read', 'cross_tenant_write'],
-    recipe: 'access_boundary',
-    reason: 'Measured on dev seed 1: wiring the authz recipe lost 5/10 legacy authz confirmations (shopflow order/customer reads, shipment write, admin impersonate; opsportal ticket read). These routes never deny a third actor — the legacy proof is a bogus-id negative control plus a write readback — and the access_boundary recipe cannot yet express a same-route bogus-id control or a baseline-write/self-state readback. Kept legacy until those two evidence shapes exist.',
-  },
   {
     specKind: 'sql_time_diff',
     vulnClasses: ['sqli'],

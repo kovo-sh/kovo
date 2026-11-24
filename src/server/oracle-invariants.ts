@@ -131,6 +131,12 @@ export interface ImpactStep {
   secretMatches?: readonly string[]
   /** Host-recorded wall-clock duration (timing-differential evidence). */
   durationMs?: number
+  /**
+   * Evidence role the recipe asked this exchange to fill (`benign_baseline`, `tautology`,
+   * `contradiction`, `denied_control`, ...). Optional: the shared oracles infer what they can
+   * from arm/status/shape, and use the role only to pair the status-differential triangle.
+   */
+  evidenceRole?: string
 }
 
 /**
@@ -1843,10 +1849,17 @@ export function assessInjectionImpact(input: ImpactInput): ImpactAssessment {
       contradiction.status >= 400 && contradiction.status < 500
     const sameShape = sameInjectionRoute(tautology, contradiction) &&
       tautology.method.toUpperCase() === contradiction.method.toUpperCase()
+    // The request target is percent-encoded on the wire, so `%20AND%20` would defeat a bare word
+    // boundary. Decode before looking for the boolean operator (a failed decode leaves the raw text;
+    // the check only ever accepts a stronger match, never a weaker one).
+    const requestText = (step: ImpactStep): string => {
+      const raw = `${step.pathAndQuery ?? ''}${safeJson(step.requestJson)}`
+      try { return decodeURIComponent(raw) } catch { return raw }
+    }
     const contrast = Boolean(
       stepText(tautology) !== stepText(contradiction) &&
-      /\b(?:AND|OR)\b/i.test(`${tautology.pathAndQuery ?? ''}${safeJson(tautology.requestJson)}`) &&
-      /\b(?:AND|OR)\b/i.test(`${contradiction.pathAndQuery ?? ''}${safeJson(contradiction.requestJson)}`),
+      /\b(?:AND|OR)\b/i.test(requestText(tautology)) &&
+      /\b(?:AND|OR)\b/i.test(requestText(contradiction)),
     )
     if (benignOk && tautologyOk && contradictionFails && sameShape && contrast) {
       evidence.statusBoolean = true
