@@ -302,6 +302,18 @@ describe('Realism #4 per-slice funnel', () => {
     assert.equal(admin?.attribution, 'route_hit')
   })
 
+  test('repeated requests inside one replay spec count as one verification call', () => {
+    const artifacts = emptyArtifacts()
+    artifacts.verifications.push(
+      { specId: 1, method: 'GET', route: '/v2/reports/export', verdict: 'dismissed', rejectionCode: 'jq_error', attempts: 1 },
+      { specId: 1, method: 'GET', route: '/v2/reports/export', verdict: 'dismissed', rejectionCode: 'jq_error', attempts: 1 },
+      { specId: 2, method: 'GET', route: '/v2/reports/export', verdict: 'inconclusive', rejectionCode: 'inconclusive', attempts: 1 },
+    )
+    const rows = computeSliceFunnels({ slices: [slices[1]!], artifacts, confirmedIds: new Set() })
+    assert.equal(rows[0]?.verifyCalled, 2)
+    assert.deepEqual(rows[0]?.oracleRejectedBy, { jq_error: 1, inconclusive: 1 })
+  })
+
   test('renders the three funnel numbers plus the rejection histogram', () => {
     const lines = renderSliceFunnelMarkdown([
       {

@@ -1052,6 +1052,8 @@ export interface SliceFunnelArtifacts {
   hits: Array<{ assignmentId: string; method: string; route: string }>
   /** Replay verification calls, with the structural rejection code when the oracle said no. */
   verifications: Array<{
+    /** Replay-spec identity; repeated requests inside one spec count as one verification call. */
+    specId?: number
     method: string
     route: string
     verdict: string | null
@@ -1112,8 +1114,18 @@ export function computeSliceFunnels(input: {
     ])
     const verificationRows = input.artifacts.verifications
       .filter(row => sliceRouteMatches(slice.method, slice.route, row.method, row.route))
+    // One verification call per replay spec, even when several of its steps hit the route.
+    const seenSpecs = new Set<string>()
+    const verificationCalls = verificationRows.filter(row => {
+      const key = row.specId !== undefined
+        ? `spec:${row.specId}`
+        : `${row.method} ${row.route} ${row.verdict ?? ''} ${row.rejectionCode ?? ''}`
+      if (seenSpecs.has(key)) return false
+      seenSpecs.add(key)
+      return true
+    })
     const oracleRejectedBy: Record<string, number> = {}
-    for (const row of verificationRows) {
+    for (const row of verificationCalls) {
       if (!row.rejectionCode) continue
       oracleRejectedBy[row.rejectionCode] = (oracleRejectedBy[row.rejectionCode] ?? 0) + 1
     }
@@ -1130,7 +1142,7 @@ export function computeSliceFunnels(input: {
       route: slice.route,
       dispatched: dispatched.size,
       targetRouteHit: hitAssignments.size,
-      verifyCalled: verificationRows.length,
+      verifyCalled: verificationCalls.length,
       oracleRejectedBy,
       confirmed: input.confirmedIds.has(slice.id),
       attribution,
@@ -1218,7 +1230,7 @@ export function readSliceFunnelArtifacts(storage: Store, runId: string): SliceFu
     const specRows = storage.client.prepare(
       'select spec, last_verification_diff, attempt_count from replay_specs where run_id = ?',
     ).all(runId) as Array<{ spec?: unknown; last_verification_diff?: unknown; attempt_count?: unknown }>
-    for (const row of specRows) {
+    for (const [specIndex, row] of specRows.entries()) {
       let requests: Array<{ method: string; route: string }> = []
       try {
         collectSpecRequests(typeof row.spec === 'string' ? JSON.parse(row.spec) : row.spec, requests)
@@ -1231,6 +1243,7 @@ export function readSliceFunnelArtifacts(storage: Store, runId: string): SliceFu
       const attempts = Number(row.attempt_count)
       for (const request of requests) {
         verifications.push({
+          specId: specIndex,
           method: request.method,
           route: request.route,
           verdict,
