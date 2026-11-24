@@ -325,6 +325,13 @@ export interface WorkerBackend {
   containerStats?(): WorkerContainerStats | undefined
   /** Size the warm idle pool to the run's worker-slot count (one container per slot). */
   setWarmCapacity?(slots: number): void
+  /**
+   * Install the run's pool policy (run identity + credential generation). A changed policy
+   * discards idle containers instead of reusing them across runs, tenants, or secret rotations.
+   */
+  setWarmPoolPolicy?(policy: string): void
+  /** Remove idle warm containers on teardown instead of leaving them on the host. */
+  closeWarmPool?(): Promise<void>
 }
 
 function clamp(val: number | undefined, fallback: number, min: number, max: number): number {
@@ -688,7 +695,9 @@ function sharedWarmPool(input: {
   runLabel: string
   owner?: string
 }): WarmWorkerPool {
-  const key = `${input.cell}\0${input.image}\0${input.runLabel}`
+  // Owner (tenant/workspace) is part of the key: two tenants that happen to share a cell id and
+  // run label must never share an idle container.
+  const key = `${input.cell}\0${input.image}\0${input.runLabel}\0${input.owner ?? ''}`
   const existing = warmPools.get(key)
   if (existing) return existing
   const pool = new WarmWorkerPool(input)
@@ -928,7 +937,11 @@ export class LinuxWorkerBackend implements WorkerBackend {
   private readonly cell?: string
   private readonly docker: DockerRunner
   private readonly staleCreatedMs: number
-  private readonly warmPool?: WarmWorkerPool
+  private warmPool?: WarmWorkerPool
+  /** Last pool policy installed by Execution (run id + credential generation). */
+  private warmPoolPolicy?: string
+  /** Cumulative stats of pools retired by a policy change (metrics stay run-wide). */
+  private retiredPoolStats = { created: 0, reused: 0, failures: 0 }
   private readonly pooled = new Set<string>()
   private readonly activeContainers = new Set<string>()
   private readonly removals = new Map<string, Promise<void>>()
@@ -959,20 +972,68 @@ export class LinuxWorkerBackend implements WorkerBackend {
     if (workspace) {
       this.owner = createHash('sha256').update(workspace.id).update('\0').update(realpathSync(workspace.directory)).digest('hex')
     }
-    // Pool key: an explicit cell, else the workspace. A bare test backend (no workspace, no cell)
-    // never prewarms, so lifecycle stubs only see the calls they trigger.
-    const poolCell = this.cell ?? (this.owner ? `ws-${this.owner.slice(0, 12)}` : undefined)
-    if (poolCell && warmWorkersEnabled()) {
-      this.warmPool = sharedWarmPool({
-        cell: poolCell,
-        image: this.image,
-        dockerRunner: this.docker,
-        runLabel: this.runId ?? (this.owner ? `workspace-${this.owner.slice(0, 12)}` : `adhoc-${processSessionId.slice(0, 8)}`),
-        ...(this.owner ? { owner: this.owner } : {}),
-      })
-      // Kick the first create early; failure only disables the pool (cold path remains).
-      void this.warmPool.warm()
+    // The pool is installed lazily: Execution sets the run/credential policy before the first
+    // assignment, so prewarming under the default label would only create a container to discard.
+    this.installWarmPool(this.defaultWarmPolicy(), false)
+  }
+
+  /** Pool key: an explicit cell, else the workspace. A bare test backend never prewarms. */
+  private poolCell(): string | undefined {
+    return this.cell ?? (this.owner ? `ws-${this.owner.slice(0, 12)}` : undefined)
+  }
+
+  private defaultWarmPolicy(): string {
+    return this.runId ?? (this.owner ? `workspace-${this.owner.slice(0, 12)}` : `adhoc-${processSessionId.slice(0, 8)}`)
+  }
+
+  private installWarmPool(policy: string, warmNow = true): void {
+    const poolCell = this.poolCell()
+    if (!poolCell || !warmWorkersEnabled()) return
+    if (this.warmPool && this.warmPoolPolicy === policy) return
+    const previous = this.warmPool
+    if (previous) {
+      const stats = previous.stats
+      this.retiredPoolStats.created += stats.created
+      this.retiredPoolStats.reused += stats.reused
+      this.retiredPoolStats.failures += stats.failures
+      // Close removes idle containers; a session still holding one releases into a closed pool,
+      // which discards instead of reusing. Never carry an old-generation container forward.
+      void previous.close().catch(() => undefined)
     }
+    this.warmPoolPolicy = policy
+    this.pooled.clear()
+    this.warmPool = sharedWarmPool({
+      cell: poolCell,
+      image: this.image,
+      dockerRunner: this.docker,
+      runLabel: `${this.defaultWarmPolicy()}#${policy}`,
+      ...(this.owner ? { owner: this.owner } : {}),
+    })
+    // Kick the first create early; failure only disables the pool (cold path remains).
+    if (warmNow) void this.warmPool.warm()
+  }
+
+  /**
+   * Install the run's warm-pool policy: run identity + credential generation. A policy change
+   * (new run, tenant, secret rotation, scope/option change) retires the pool and rebuilds it, so
+   * an idle container created under earlier credentials is never reused.
+   */
+  setWarmPoolPolicy(policy: string): void {
+    const normalized = policy.trim()
+    if (!normalized) return
+    this.installWarmPool(normalized)
+  }
+
+  /** Shutdown seam: remove idle containers so a finished run leaves no warm pool behind. */
+  async closeWarmPool(): Promise<void> {
+    const pool = this.warmPool
+    this.warmPool = undefined
+    if (!pool) return
+    const stats = pool.stats
+    this.retiredPoolStats.created += stats.created
+    this.retiredPoolStats.reused += stats.reused
+    this.retiredPoolStats.failures += stats.failures
+    await pool.close().catch(() => undefined)
   }
 
   /** Warm-pool state (test/diagnostic seam; never contains secrets). */
@@ -984,8 +1045,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
   containerStats(): WorkerContainerStats {
     const pool = this.warmPool?.stats
     return {
-      created: (pool?.created ?? 0) + this.coldSessionCreates,
-      reused: (pool?.reused ?? 0),
+      created: this.retiredPoolStats.created + (pool?.created ?? 0) + this.coldSessionCreates,
+      reused: this.retiredPoolStats.reused + (pool?.reused ?? 0),
       sessions: this.sessionsServed,
       coldSessions: this.coldSessionCreates,
       idle: pool?.idle ?? 0,
