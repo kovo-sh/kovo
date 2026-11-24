@@ -46,10 +46,15 @@ import { appNames } from '../benchmarks/realistic-bench/lib/types.ts'
 import { startRealisticApp, briefingFor, gradeRun, renderScorecard } from '../benchmarks/realistic-bench/run.ts'
 import { assertLocalLabAllowed } from '../benchmarks/realistic-bench/lib/safety.ts'
 import { endpointMatches } from '../benchmarks/realistic-bench/grader/match.ts'
+import { maxRpsPerOriginCeiling } from '../src/domain.ts'
 import type { EndpointSource, Finding, ParamLocation } from '../src/domain.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
 import { resolveOobCallbackPorts, defaultWorkerConcurrency, resolveWorkerConcurrency, MAX_RUN_WORKER_CONCURRENCY } from './benchmark-env.ts'
-import { Execution } from '../src/server/execution.ts'
+import {
+  DEFAULT_AGENT_REQUEST_BUDGET,
+  DEFAULT_FLOOR_REQUEST_BUDGET,
+  Execution,
+} from '../src/server/execution.ts'
 import { projectReposDir } from '../src/server/github-connector.ts'
 import { privateModelProfiles } from '../src/server/model-settings.ts'
 import type { ResolvedModelProfile } from '../src/server/model-settings.ts'
@@ -86,6 +91,51 @@ export const DEFAULT_BUDGET_USD = 5
 export const DEFAULT_MAX_DURATION_MS = 15 * 60_000
 /** How many app/seed cells run in parallel. Scheduling only; never the in-run worker count. */
 export const DEFAULT_CONCURRENCY = 1
+/** Lab per-origin rate cap (hard cap; WAF/429 backoff still applies). 25k/600 s needs ~42 RPS. */
+export const DEFAULT_MAX_RPS = 50
+
+/**
+ * v6 budget split. The 2,000-request constant was a stale floor-era value: at K=6 it was spent by
+ * Phase A alone, leaving ~10-25 requests per agentic assignment. These allowances are **caps, not
+ * targets** — a run still stops on wall clock, USD or completion, and never spends a request just
+ * to reach the allowance.
+ *
+ * Calibrated anchors (linear between them, capped at the 45-minute values):
+ *   600 s  → floor  6,000 / agent  25,000 / total  31,000
+ *   45 min → floor 12,000 / agent 100,000 / total 112,000
+ */
+export const REQUEST_BUDGET_ANCHOR_MS = 600_000
+export const FLOOR_BUDGET_ANCHOR = 6_000
+export const AGENT_BUDGET_ANCHOR = 25_000
+export const FLOOR_BUDGET_CEILING = 12_000
+export const AGENT_BUDGET_CEILING = 100_000
+export { DEFAULT_AGENT_REQUEST_BUDGET, DEFAULT_FLOOR_REQUEST_BUDGET }
+
+const roundToHundred = (value: number): number => Math.max(100, Math.round(value / 100) * 100)
+
+/** Duration-scaled split allowances. Explicit flags/env always override this. */
+export function defaultRequestBudgets(maxDurationMs: number): {
+  floor: number
+  agent: number
+  total: number
+} {
+  const duration = Number.isFinite(maxDurationMs) && maxDurationMs > 0 ? maxDurationMs : REQUEST_BUDGET_ANCHOR_MS
+  const scale = duration / REQUEST_BUDGET_ANCHOR_MS
+  const floor = Math.min(FLOOR_BUDGET_CEILING, roundToHundred(FLOOR_BUDGET_ANCHOR * scale))
+  const agent = Math.min(AGENT_BUDGET_CEILING, roundToHundred(AGENT_BUDGET_ANCHOR * scale))
+  return { floor, agent, total: floor + agent }
+}
+
+/** Duration-scaled USD cap: $5 at 600 s, $10 at 45 min (linear between). */
+export function defaultBudgetUsd(maxDurationMs: number): number {
+  const duration = Number.isFinite(maxDurationMs) && maxDurationMs > 0 ? maxDurationMs : REQUEST_BUDGET_ANCHOR_MS
+  if (duration <= REQUEST_BUDGET_ANCHOR_MS) return DEFAULT_BUDGET_USD
+  const span = 2_700_000 - REQUEST_BUDGET_ANCHOR_MS
+  const extra = Math.min(5, Math.round((5 * (duration - REQUEST_BUDGET_ANCHOR_MS)) / span))
+  return DEFAULT_BUDGET_USD + Math.max(0, extra)
+}
+
+export const DEFAULT_TOTAL_REQUEST_BUDGET = defaultRequestBudgets(REQUEST_BUDGET_ANCHOR_MS).total
 
 export interface RealisticArgs {
   apps: AppName[]
@@ -94,6 +144,14 @@ export interface RealisticArgs {
   heldOut: boolean
   budgetUsd: number
   maxDurationMs: number
+  /** Phase-A (deterministic floor) request allowance. Never borrowed by Phase B. */
+  floorRequestBudget: number
+  /** Phase-B (agentic investigation) request allowance. Never borrowed by Phase A. */
+  agentRequestBudget: number
+  /** Hard run-total request cap (`runs.budget_requests`). Defaults to floor + agent. */
+  totalRequestBudget: number
+  /** Hard per-origin requests/second cap written to the run (default 50 for lab runs). */
+  maxRps: number
   outDir: string
   /** Parallel app/seed cells. */
   concurrency: number
@@ -138,8 +196,22 @@ Flags:
   --seeds <a,b,c>         comma-separated seeds
   --held-out              seeds are held-out (>= 1000000) and need GUARDIAN_RB_HELDOUT_SALT
   --mode <m>              black-box | grey-box | white-box (default: grey-box)
-  --budget-usd <n>        per-run USD budget (default: ${DEFAULT_BUDGET_USD})
+  --budget-usd <n>        per-run USD budget (default: $${DEFAULT_BUDGET_USD} at 600 s,
+                          $10 at 45 min; linear between)
   --max-duration-ms <n>   wall-clock cap per cell (default: ${DEFAULT_MAX_DURATION_MS})
+  --budget-requests <n>   hard run-total request cap written to runs.budget_requests
+                          (default: floor + agent; --total-request-budget is an alias)
+  --floor-request-budget <n>
+                          Phase-A deterministic-floor request allowance (default scales
+                          with --max-duration-ms: 6,000 at 600 s, 12,000 at 45 min).
+                          Phase B never borrows it.
+  --agent-request-budget <n>
+                          Phase-B agentic-investigation request allowance (default scales
+                          with --max-duration-ms: 25,000 at 600 s, 100,000 at 45 min).
+                          Phase A never borrows it.
+  --max-rps <n>           hard per-origin rate cap (default ${DEFAULT_MAX_RPS}; WAF/429
+                          backoff still applies). GUARDIAN_MAX_RPS is the env equivalent.
+  These are caps, not targets: wall/USD/completion still end the run.
   --out-dir <path>        artifact directory (default: .guardian/realistic-bench)
   --concurrency <n>       parallel app/seed cells (default: ${DEFAULT_CONCURRENCY})
   --worker-concurrency <n>
@@ -193,6 +265,9 @@ Environment:
   GUARDIAN_ALLOW_LOCAL_LAB=1   required to boot loopback lab origins
   GUARDIAN_RB_HELDOUT_SALT     required for --held-out (never logged/committed)
   GUARDIAN_DATA_DIR            default Guardian data dir (model profile source)
+  GUARDIAN_FLOOR_REQUEST_BUDGET / GUARDIAN_AGENT_REQUEST_BUDGET / GUARDIAN_TOTAL_REQUEST_BUDGET
+                               defaults for the split request budgets
+  GUARDIAN_MAX_RPS             hard per-origin rate cap (default 50)
 
 Parallel agentic matrix:
   --concurrency 3 --isolate-data-dir  gives each cell its own Store under
@@ -254,6 +329,19 @@ function parsePositiveInt(raw: string, flag: string): number {
   return n
 }
 
+/** flag > env > default, positive integers only. */
+function requestBudgetValue(
+  flagValue: string | undefined,
+  envValue: string | undefined,
+  fallback: number,
+  flag: string,
+): number {
+  if (flagValue !== undefined) return parsePositiveInt(flagValue, flag)
+  const fromEnv = envValue?.trim()
+  if (fromEnv) return parsePositiveInt(fromEnv, flag)
+  return fallback
+}
+
 /** In-run worker slots: engine ceiling is 16, and 0 would make the run inert. */
 export function parseWorkerConcurrency(raw: string): number {
   const n = parsePositiveInt(raw, '--worker-concurrency')
@@ -299,6 +387,8 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
 
   const known = new Set([
     'app', 'seed', 'seeds', 'held-out', 'mode', 'budget-usd', 'max-duration-ms',
+    'budget-requests', 'floor-request-budget', 'agent-request-budget', 'total-request-budget',
+    'max-rps',
     'out-dir', 'concurrency', 'worker-concurrency', 'data-dir', 'no-llm', 'no-conventional-wordlist', 'isolate-data-dir', 'keep-data-dirs',
     'allow-inert-workers', 'verifier', 'reuse-recon', 'refresh-recon', 'help',
     'snapshot-after-floor', 'resume-snapshot', 'snapshot-max-age-ms', 'snapshot-refresh',
@@ -309,9 +399,14 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
   }
 
   if (a.help === true) {
+    const defaults = defaultRequestBudgets(DEFAULT_MAX_DURATION_MS)
     return {
       apps: [...appNames], seeds: [1], mode: 'grey-box', heldOut: false,
-      budgetUsd: DEFAULT_BUDGET_USD, maxDurationMs: DEFAULT_MAX_DURATION_MS,
+      budgetUsd: defaultBudgetUsd(DEFAULT_MAX_DURATION_MS), maxDurationMs: DEFAULT_MAX_DURATION_MS,
+      floorRequestBudget: defaults.floor,
+      agentRequestBudget: defaults.agent,
+      totalRequestBudget: defaults.total,
+      maxRps: DEFAULT_MAX_RPS,
       outDir: resolve('.guardian/realistic-bench'), concurrency: DEFAULT_CONCURRENCY,
       workerConcurrency: defaultWorkerConcurrency(Boolean(a['no-llm'])),
       noLlm: Boolean(a['no-llm']), isolateDataDir: Boolean(a['isolate-data-dir']),
@@ -367,13 +462,45 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     }
   }
 
-  const budgetUsd = a['budget-usd'] === undefined ? DEFAULT_BUDGET_USD : Number(stringFlag(a, 'budget-usd'))
-  if (!Number.isFinite(budgetUsd) || budgetUsd < 0.1 || budgetUsd > 500) {
-    fail(`--budget-usd must be a number between 0.1 and 500 (got '${String(a['budget-usd'])}')`)
-  }
   const maxDurationMs = a['max-duration-ms'] === undefined
     ? DEFAULT_MAX_DURATION_MS
     : parsePositiveInt(stringFlag(a, 'max-duration-ms') ?? '', '--max-duration-ms')
+  // Duration-scaled defaults: $5/6k/25k at 600 s, $10/12k/100k at 45 min.
+  const scaledBudgets = defaultRequestBudgets(maxDurationMs)
+  // $5 default is preserved for the implicit 15-minute invocation; an explicit duration scales it
+  // ($5 at 600 s, $10 at 45 min) unless --budget-usd overrides.
+  const budgetUsd = a['budget-usd'] === undefined
+    ? (a['max-duration-ms'] === undefined ? DEFAULT_BUDGET_USD : defaultBudgetUsd(maxDurationMs))
+    : Number(stringFlag(a, 'budget-usd'))
+  if (!Number.isFinite(budgetUsd) || budgetUsd < 0.1 || budgetUsd > 500) {
+    fail(`--budget-usd must be a number between 0.1 and 500 (got '${String(a['budget-usd'])}')`)
+  }
+  // Split request budgets: flag > env > duration-scaled default. Phase A/B never borrow each other.
+  const floorRequestBudget = requestBudgetValue(
+    stringFlag(a, 'floor-request-budget'), env.GUARDIAN_FLOOR_REQUEST_BUDGET,
+    scaledBudgets.floor, '--floor-request-budget',
+  )
+  const agentRequestBudget = requestBudgetValue(
+    stringFlag(a, 'agent-request-budget'), env.GUARDIAN_AGENT_REQUEST_BUDGET,
+    scaledBudgets.agent, '--agent-request-budget',
+  )
+  if (stringFlag(a, 'budget-requests') !== undefined && stringFlag(a, 'total-request-budget') !== undefined) {
+    fail('use either --budget-requests or --total-request-budget, not both')
+  }
+  const totalRequestBudget = requestBudgetValue(
+    stringFlag(a, 'budget-requests') ?? stringFlag(a, 'total-request-budget'),
+    env.GUARDIAN_TOTAL_REQUEST_BUDGET,
+    floorRequestBudget + agentRequestBudget,
+    '--budget-requests',
+  )
+  const maxRps = requestBudgetValue(
+    stringFlag(a, 'max-rps'), env.GUARDIAN_MAX_RPS,
+    DEFAULT_MAX_RPS,
+    '--max-rps',
+  )
+  if (maxRps > maxRpsPerOriginCeiling) {
+    fail(`--max-rps must be between 1 and ${maxRpsPerOriginCeiling} (got '${maxRps}')`)
+  }
   const concurrency = a.concurrency === undefined
     ? DEFAULT_CONCURRENCY
     : parsePositiveInt(stringFlag(a, 'concurrency') ?? '', '--concurrency')
@@ -396,6 +523,10 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     heldOut,
     budgetUsd,
     maxDurationMs,
+    floorRequestBudget,
+    agentRequestBudget,
+    totalRequestBudget,
+    maxRps,
     outDir: isAbsolute(outDirRaw) ? outDirRaw : resolve(outDirRaw),
     concurrency,
     workerConcurrency,
@@ -930,6 +1061,90 @@ export function summarizeLeadFunnel(input: {
     if (statuses.includes('complete')) investigated += 1
   }
   return { emitted, queued: queued.size, dispatched, investigated, source: 'events' }
+}
+
+/**
+ * Split request-budget telemetry ingested from the run's own phase events. Meta is written before
+ * `engine.stop()` finalizes the run, so it must not rely on the final `deterministic_floor.summary`
+ * alone: `request_budget.floor_settled` / `request_budget.phase_ended` / `request_budget.agent_exhausted`
+ * are emitted exactly at the phase boundaries and are the authoritative source here.
+ */
+export interface RequestBudgetMeta {
+  mode: 'split' | 'single'
+  floorRequestBudget: number | null
+  agentRequestBudget: number | null
+  totalRequestBudget: number | null
+  floorRequests: number | null
+  agentRequests: number | null
+  totalRequests: number
+  floorBudgetExhausted: boolean
+  agentBudgetExhausted: boolean
+  /** Honest phase termination: `agent_budget_exhausted` when ready steps were left unfunded. */
+  terminationReason: string | null
+}
+
+export function summarizeRequestBudgets(input: {
+  events: ReadonlyArray<{ kind: string; detail?: Record<string, unknown> | null }>
+  spentRequests: number
+  floorRequestBudget?: number | null
+  agentRequestBudget?: number | null
+  totalRequestBudget?: number | null
+}): RequestBudgetMeta {
+  const num = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+  let floorRequests: number | null = null
+  let floorExhausted = false
+  let agentRequests: number | null = null
+  let spentAtFloorSettle: number | null = null
+  let agentExhausted = false
+  let terminationReason: string | null = null
+  let engineReportedFloor = 0
+  let sawEngineSummary = false
+  for (const event of input.events) {
+    const detail = event.detail ?? {}
+    if (event.kind === 'deterministic_engine.summary') {
+      const used = num(detail.requestsUsed)
+      if (used !== null) {
+        engineReportedFloor += used
+        sawEngineSummary = true
+      }
+    } else if (event.kind === 'request_budget.floor_settled') {
+      floorRequests = num(detail.floorRequests)
+      spentAtFloorSettle = num(detail.spentRequestsAtSettle)
+      if (detail.floorBudgetExhausted === true) floorExhausted = true
+    } else if (event.kind === 'request_budget.floor_exhausted') {
+      floorExhausted = true
+    } else if (event.kind === 'request_budget.phase_ended') {
+      const used = num(detail.agentRequests)
+      if (used !== null) agentRequests = used
+      if (detail.agentBudgetExhausted === true) agentExhausted = true
+      if (typeof detail.terminationReason === 'string') terminationReason = detail.terminationReason
+    } else if (event.kind === 'request_budget.agent_exhausted') {
+      agentExhausted = true
+      if (typeof detail.reason === 'string') terminationReason = detail.reason
+      const used = num(detail.agentRequests)
+      if (used !== null) agentRequests = used
+    }
+  }
+  if (floorRequests === null && sawEngineSummary) floorRequests = engineReportedFloor
+  // A wall stop mid-Phase-B never reaches `request_budget.phase_ended`; the settle event still
+  // gives an honest consumption delta (verification has not run yet).
+  if (agentRequests === null && spentAtFloorSettle !== null) {
+    agentRequests = Math.max(0, input.spentRequests - spentAtFloorSettle)
+  }
+  const split = input.floorRequestBudget != null || input.agentRequestBudget != null
+  return {
+    mode: split ? 'split' : 'single',
+    floorRequestBudget: input.floorRequestBudget ?? null,
+    agentRequestBudget: input.agentRequestBudget ?? null,
+    totalRequestBudget: input.totalRequestBudget ?? null,
+    floorRequests,
+    agentRequests,
+    totalRequests: input.spentRequests,
+    floorBudgetExhausted: floorExhausted,
+    agentBudgetExhausted: agentExhausted,
+    terminationReason,
+  }
 }
 
 /** An agentic run that never completed an investigation assignment is inert, not a result. */
@@ -2054,8 +2269,12 @@ export interface CellMeta {
   cellConcurrency: number
   /** In-run investigation worker slots handed to `Execution` (`runs.worker_concurrency`). */
   workerConcurrency: number
+  /** Hard per-origin rate cap written to the run. */
+  maxRpsPerOrigin: number
   /** Corrected det_lead funnel (queued vs. investigated to a verdict). */
   leadFunnel: LeadFunnelMetrics
+  /** Split Phase-A/Phase-B request budgets and their measured consumption. */
+  requestBudgets: RequestBudgetMeta
   reconCache: ReconCacheMeta
   snapshot: SnapshotRunMeta
   /** Checkpoint directory this run resumed from (null for a cold run). */
@@ -2498,8 +2717,9 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
         approvalPolicy: 'auto_review',
         approvedPersonaIds: personaIds,
         budgetUsd: args.budgetUsd,
-        budgetRequests: 2_000,
-        maxRpsPerOrigin: 10,
+        // Hard run-total cap. Phase allowances are enforced inside Execution (floor/agent split).
+        budgetRequests: args.totalRequestBudget,
+        maxRpsPerOrigin: args.maxRps,
         workerConcurrency: runWorkerConcurrency(args),
         workerMaxTurns: 30,
         multiTrialEnabled: true,
@@ -2519,8 +2739,8 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
         capabilityTier: plan.capabilityTier,
         approvedPersonaIds: personaIds,
         budgetUsd: args.budgetUsd,
-        budgetRequests: 2_000,
-        maxRpsPerOrigin: 10,
+        budgetRequests: args.totalRequestBudget,
+        maxRpsPerOrigin: args.maxRps,
       })
     }
 
@@ -2671,6 +2891,8 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       canaryBroker: canary,
       ...(backend ? { backend } : {}),
       deterministicOnly: args.noLlm,
+      floorRequestBudget: args.floorRequestBudget,
+      agentRequestBudget: args.agentRequestBudget,
       onCheckpoint: event => captureCheckpoint(event.checkpoint as SnapshotCheckpoint),
     })
     engine.start()
@@ -2748,10 +2970,18 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
 
     const finalRun = storage.run(runId)
     const detail = storage.runDetail(runId)
+    const runEvents = collectRunEvents(storage, runId)
     const leadFunnel = summarizeLeadFunnel({
-      events: collectRunEvents(storage, runId),
+      events: runEvents,
       assignments: detail.assignments,
       steps: detail.chainSteps,
+    })
+    const requestBudgets = summarizeRequestBudgets({
+      events: runEvents,
+      spentRequests: finalRun.spentRequests,
+      floorRequestBudget: args.floorRequestBudget,
+      agentRequestBudget: args.agentRequestBudget,
+      totalRequestBudget: finalRun.budgetRequests > 0 ? finalRun.budgetRequests : args.totalRequestBudget,
     })
 
     // Product contract: only runtime_confirmed findings are submittable evidence. Static,
@@ -2841,7 +3071,9 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       model,
       verifierBackend: backendKind,
       ...concurrencyMeta(args),
+      maxRpsPerOrigin: args.maxRps,
       leadFunnel,
+      requestBudgets,
       workerSessions: capability.supported,
       workerSessionsDetail: capability.detail,
       dataDirIsolated: Boolean(isolated),
@@ -2893,7 +3125,9 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
         verifierBackend: backendKind,
         cellConcurrency: args.concurrency,
         workerConcurrency: runWorkerConcurrency(args),
+        maxRpsPerOrigin: args.maxRps,
         budgetUsd: args.budgetUsd,
+        requestBudgets,
         timedOut: wait.timedOut,
         reconCache: recon.requested
           ? { key: recon.key, hit: recon.hit, refreshed: args.refreshRecon, phase0Skipped: recon.phase0Skipped }

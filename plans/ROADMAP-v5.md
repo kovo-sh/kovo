@@ -388,3 +388,35 @@ Root cause of the worker failures: Docker removal race in `src/server/worker-bac
 - **Certification protocol:** do not run the full matrix. Tune acme to ≥14–15/22 (≥+3–4 net-new, ≥50% proof conversion, 100% precision), smoke shopflow/opsportal at ≥+2–3 net-new each (aggregate ≥+6 targets / +10pp), then certify.
 - **Realism #2/#3:** real wiring bugs; `prove_oob_callback` and `prove_race_burst` should register `pending_oob` and execute the h2 barrier. Keep Phase-1 grey-box certification decoupled from Phase-3 realism gates, but fix both in this wiring sprint.
 - **Streams launched:** sdk-helpers, floor-regress, phaseb-diag (read-only diagnosis).
+
+### 2026-11-23 — hourly check-in #8: +9.1pp on acme, precision is the only gate
+
+- **Correction adopted:** K=6 acme 13/22 is **+9.1pp** over floor 11/22 (not +2pp), with 18 assignments queued/paused and 75% of budget unspent. Keep the +10pp dev / +8pp held-out bar; do not lower it.
+- **Precision first:** 3 unmatched FPs at K=6 (100% → 81.3%). Audit order: (1) repair-loop reward hacking (`control_denied` pairing / `expectControlDenied:false`), (2) concurrent cross-talk (`before!=after` caused by another worker — require this script's nonce in `after_get`), (3) SDK helper bypass of host transcript validation.
+- **Throughput second:** drive `verified_tp_per_100s_phase_b`; cut median assignment wall ~150 s → 70–90 s (warm workers across assignments, cap single-step assignments, check provider-stream stalls) to drain 12 ready/6 paused in the same window.
+- **Floor-regress before certification:** finish 26 → ≥31/59 so agentic lift is genuine, not picking up targets the floor lost to the hardening regression.
+- **Realism #2:** decouple from Phase-1 cert, but Layer-2 `ssrf_canary`/`xxe_canary` must also register non-immediate canaries into `pending_oob` so the fixture passes end-to-end; do not certify #2 via SDK unit tests alone.
+- **Structural red flags accepted:** per-assignment entity namespace + nonce-matched readbacks; host recomputation is the trust boundary (SDK is ergonomics only); check F3 still emits genuine leads on shopflow/opsportal/held-out; lock `v6-retire-dsl` (≥1,800 LOC) immediately after Phase 1.
+
+### 2026-11-23 — floor restored to 31/59; certification run started
+
+- **Floor (product --no-llm, serial, wordlist off, seed 1):** **31/59 (52.5%) at 100% precision**, 0 decoy/unmatched — acme 11, shopflow 11, opsportal 9. The 30→31 came from `xss-occurrence` (all-occurrence scan; opsportal search reflected XSS).
+- **Floor-hardening false negatives fixed (no loosening):** pre-probe-only denial controls (post-mutation readbacks are persistence evidence); credential-shape `proofPatterns` for free-text disclosure; role-exclusive function-surface delta for vertical BFLA. `store/scope/acting/account/org/identity` are protected identity fields.
+- **Regressions held:** held-out-saas 20/20 + 20/20 patches, xben 25/25, procedural acme 16/22.
+- **Certification measurement started:** K=6 unified acme ×3 sequential runs on merged main; gate = worst-run precision 100%, preservation ≥0.95, positive lift over 11/22, leads investigated when emitted, provenance complete.
+
+### 2026-11-23 — v7 planning + honest deterministic vs agentic numbers
+
+- **Numbers at planning time:** product floor 3-app **31/59 (52.5%) @100%**; agentic K=6 acme ×3 = **11 / 12 / 11 of 22**, precision **100% / 92.3% / 100%**, median lift **0**, $0.48–0.51, p50 assignment 53 s; realism #2/#3/#4 wiring PASS but **0 capability confirms**; xben 25/25, held-out 20/20 + 20/20; salted held-out product floor last 23/58 (not re-run).
+- **Certification verdict:** not certifiable — worst-run precision 92.3% (one unmatched cross-tenant mass-assign claim under triage) and median lift 0.
+- **Root cause caught by review:** Phase A floor consumes ~1,500–1,800 of the shared ~2,000 request budget, leaving ~20 agent assignments ~10–25 requests each. Decoupling floor/agent budgets is an instant win.
+- **v7 plan:** `plans/v7.md`. No fourth layer. Thesis = real-world conversion + white-box-first verification. M0 ProofReceipt + budget split + DSL retirement (3 cuts); M1 realism conversion #1–#4; M2 white-box dataflow + chains; M4 production ops. **Continuous scanning / persistent org graph deferred** (candidate v8).
+- **Cut for now:** multi-tenant SaaS, plugin SDK, ML priors, heavy UX. M1/M2 blocked behind M0 gates.
+
+### 2026-11-23 — budget decoupling: budget was never the constraint
+
+- **Implemented:** separate floor/agent request allowances scaled to duration (600 s: 6,000/25,000/31,000 total, $5; 45 min: 12,000/100,000/112,000, $10), 50 RPS lab cap, `agent_budget_exhausted` termination, per-phase accounting (no borrowing), no stale 2,000 literal.
+- **600 s generous run:** **13/22 (59.1%) at 100% precision**, +2 net, 25 investigations, 2,225 requests, $0.65.
+- **45 min generous:** 15/22 (68.2%) @88.2% and kept-rerun 13/22 (59.1%) @92.9%, **+2..+4 net**, 83 investigations, **4,288 of 112,000 requests**, $2.99 of $10.
+- **Conclusion:** caps are not binding; the limits are model/tool throughput and hypothesis/proof quality. Longer horizons raise recall but also the FP rate (1–2 unmatched), so **worst-run precision at horizon is now the gate**, not budget.
+- **Follow-up:** triage the negative-invoice-amount claim (genuine invariant bug vs echo/clamp) and rerun 45 min; certification should use an ample-budget 600 s cell for the precision-clean number plus a long-horizon precision check.

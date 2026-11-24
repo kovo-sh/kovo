@@ -232,7 +232,9 @@ export class TranscriptStore {
         method,
         pathAndQuery: record.request?.pathAndQuery ?? null,
         origin: record.request?.origin ?? null,
-        status: record.response?.status ?? null,
+        status: record.response?.status != null && Number.isFinite(Number(record.response.status))
+      ? Number(record.response.status)
+      : null,
         durationMs: record.durationMs,
         error: record.error ?? null,
         signature: record.signature,
@@ -828,7 +830,9 @@ function transcriptImpactStep(
     method: (record.request?.method ?? 'GET').toUpperCase(),
     route: (record.request?.pathAndQuery ?? '/').split('?')[0].replace(/\/+$/, '').toLowerCase() || '/',
     pathAndQuery: record.request?.pathAndQuery ?? '/',
-    status: record.response?.status ?? null,
+    status: record.response?.status != null && Number.isFinite(Number(record.response.status))
+      ? Number(record.response.status)
+      : null,
     actor,
     json,
     body: body ?? '',
@@ -855,17 +859,27 @@ function transcriptBoundaryStep(
   const handle = record.request?.personaHandle ?? null
   const roles = 'actorRoles' in claim ? claim.actorRoles : undefined
   const tenants = 'actorTenants' in claim ? claim.actorTenants : undefined
+  // Host-signed persona label wins; a handle alone is not a tenant ("alice" is not a tenant).
+  const signedLabel = record.request?.actorRoleLabel ?? null
+  const role = signedLabel !== null
+    ? normalizeRole(signedLabel) ?? normalizeRole(handle) ?? null
+    : normalizeRole(handle) ?? normalizeRole(roles?.[handle ?? '']) ?? null
+  const tenant = signedLabel !== null
+    ? parseRoleLabel(signedLabel).tenant ?? tenants?.[handle ?? ''] ?? null
+    : tenants?.[handle ?? ''] ?? parseRoleLabel(handle).tenant ?? null
   return {
     id,
     arm,
     method: (record.request?.method ?? 'GET').toUpperCase(),
     route: (record.request?.pathAndQuery ?? '/').split('?')[0].replace(/\/+$/, '').toLowerCase() || '/',
     pathAndQuery: record.request?.pathAndQuery ?? '/',
-    status: record.response?.status ?? null,
+    status: record.response?.status != null && Number.isFinite(Number(record.response.status))
+      ? Number(record.response.status)
+      : null,
     actor: {
       handle,
-      role: normalizeRole(roles?.[handle ?? '']) ?? normalizeRole(handle),
-      tenant: tenants?.[handle ?? ''] ?? parseRoleLabel(handle).tenant,
+      role,
+      tenant,
       auth: 'unknown',
       sameSite: null,
     },
@@ -1010,7 +1024,9 @@ function implicitMarkupEvidence(
       arm: (record.request?.sessionRole as ImpactStep['arm'] | null) ?? 'setup',
       method: (record.request?.method ?? 'GET').toUpperCase(),
       route: (record.request?.pathAndQuery ?? '/').split('?')[0],
-      status: record.response?.status ?? null,
+      status: record.response?.status != null && Number.isFinite(Number(record.response.status))
+      ? Number(record.response.status)
+      : null,
       actor: { handle: record.request?.personaHandle ?? null, role: normalizeRole(record.request?.personaHandle ?? null), tenant: null, auth: 'unknown', sameSite: null },
       body,
     })
@@ -1075,7 +1091,9 @@ function implicitReadDisclosure(
       id,
       arm: (record.request?.sessionRole as ImpactStep['arm'] | null) ?? 'setup',
       method: (record.request?.method ?? 'GET').toUpperCase(),
-      status: record.response?.status ?? null,
+      status: record.response?.status != null && Number.isFinite(Number(record.response.status))
+      ? Number(record.response.status)
+      : null,
       actor: {
         handle,
         role: normalizeRole(handle),
@@ -1618,7 +1636,7 @@ export function causalFingerprints(
         kind: claim.kind,
         method: probe?.request?.method ?? '',
         path: pathFingerprint(probe?.request?.pathAndQuery),
-        status: probe?.response?.status ?? null,
+        status: probe?.response?.status != null ? Number(probe.response.status) : null,
         expectation: { impactClass: claim.impactClass, oracleEvents: [...(claim.oracleEvents ?? [])].sort() },
         observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
       }
@@ -1629,7 +1647,7 @@ export function causalFingerprints(
         kind: claim.kind,
         method: probe?.request?.method ?? '',
         path: pathFingerprint(probe?.request?.pathAndQuery),
-        status: probe?.response?.status ?? null,
+        status: probe?.response?.status != null ? Number(probe.response.status) : null,
         expectation: { boundaryClass: claim.boundaryClass },
         observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
       }
@@ -1640,7 +1658,7 @@ export function causalFingerprints(
         kind: claim.kind,
         method: probe?.request?.method ?? '',
         path: pathFingerprint(probe?.request?.pathAndQuery),
-        status: probe?.response?.status ?? null,
+        status: probe?.response?.status != null ? Number(probe.response.status) : null,
         expectation: { minRounds: claim.minRounds ?? 3, minDeltaTokens: claim.minDeltaTokens ?? 1 },
         observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
       }
@@ -1651,7 +1669,7 @@ export function causalFingerprints(
         kind: claim.kind,
         method: probe?.request?.method ?? '',
         path: pathFingerprint(probe?.request?.pathAndQuery),
-        status: probe?.response?.status ?? null,
+        status: probe?.response?.status != null ? Number(probe.response.status) : null,
         expectation: { mode: claim.mode ?? null, minDistinctOutcomes: claim.minDistinctOutcomes ?? 2 },
         observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
       }
@@ -1662,7 +1680,7 @@ export function causalFingerprints(
         kind: claim.kind,
         method: probe?.request?.method ?? '',
         path: pathFingerprint(probe?.request?.pathAndQuery),
-        status: probe?.response?.status ?? null,
+        status: probe?.response?.status != null ? Number(probe.response.status) : null,
         expectation: { mfa: true },
         observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
       }

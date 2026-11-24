@@ -165,7 +165,9 @@ function persona(handle: 'alice' | 'bob', secret: string): ResolvedPersona {
   return {
     id: `persona-${handle}`,
     handle,
-    roleLabel: handle,
+    // Both personas are authenticated members of the same tenant: a denial for bob on
+    // alice's object is a genuine peer boundary, not an anonymous 401 artifact.
+    roleLabel: 'member (acme)',
     originAllowlist: [origin, h2Origin],
     authKind: 'header',
     headerName: 'X-User',

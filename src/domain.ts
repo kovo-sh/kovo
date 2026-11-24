@@ -16,9 +16,11 @@ export const defaultBudgetUsd = 25
 export const defaultBudgetRequests = 0
 export const defaultPublicBudgetRequests = 0
 export const defaultLabBudgetRequests = 0
-export const maxBudgetRequests = 25_000
+// Ceilings, not defaults. Authorized lab runs need generous request/rate caps so the budget is
+// never the binding constraint (the wall clock, USD cap and completion still end the run).
+export const maxBudgetRequests = 250_000
 export const defaultMaxRpsPerOrigin = 5
-export const maxRpsPerOriginCeiling = 20
+export const maxRpsPerOriginCeiling = 100
 export const defaultWorkerConcurrency = 6
 export const maxWorkerConcurrency = 16
 

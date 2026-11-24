@@ -93,8 +93,12 @@ export interface EndpointHarvest {
   activeQueryParams: string[]
   /** Identifiers observed on the lower-privileged (viewer) persona's own identity route. */
   viewerIds?: string[]
+  /** Scalar field values observed on the viewer persona's own identity route. */
+  viewerValues?: Record<string, string[]>
   /** Runtime value shape per field (url/path/xml/jwt/uuid/number/email/text). */
   shapes?: Record<string, ParamValueShape>
+  /** `scalar value -> record identifier` correlation from collection rows (own-row addressing). */
+  rowIds?: Record<string, string>
   /** Structural response evidence: wire format and value shape, never a route-name assumption. */
   evidence?: HarvestEvidence
 }
@@ -1170,6 +1174,67 @@ export interface EnumerateOptions {
   /** Request budget the probe loop may spend; used to size class quotas fairly. */
   maxRequests?: number
   classes?: ReadonlySet<string>
+  /** Actor identity routes per origin (self-service observable state for privileged mutations). */
+  identityProfiles?: ReadonlyMap<string, IdentityProfile>
+}
+
+/**
+ * The actor's own observable state: a GET identity route plus the scalar fields whose values differ
+ * between two personas (role/tenant/acting scope). A privileged mutation that widens or elevates the
+ * caller is provable only through this read, never through the mutation's own acknowledgement.
+ */
+export interface IdentityProfile {
+  path: string
+  /**
+   * `value` is the other persona's value (the mutation target); `own` is the probe actor's current
+   * value, used to re-establish a clean baseline before the proof. Both come from the harvest.
+   */
+  bindings: Array<{ field: string; value: string; own?: string }>
+}
+
+const IDENTITY_ROUTE_RE = /(?:^|\/)(?:me|session|whoami|profile|account)(?:\/|$)/i
+const IDENTITY_SCOPE_FIELD_RE = /(?:role|roles|tenant|tenant_id|team|team_id|org|org_id|account|store|workspace|space|company|plan|tier|admin|level)/i
+const IDENTITY_CREDENTIAL_FIELD_RE = /(?:token|secret|csrf|xsrf|password|nonce|otp|session|auth)/i
+const IDENTITY_CALLER_FIELD_RE = /^(?:actor|persona|user|username|email|name|logged_?in|authenticated)$/i
+
+/**
+ * Build per-origin identity profiles from the harvest. Only fields the target itself echoed for
+ * *both* personas are bound, and only where the values differ: the profile is evidence, not a guess.
+ */
+export function buildIdentityProfiles(
+  endpoints: readonly EngineEndpoint[],
+  harvests: ReadonlyMap<string, EndpointHarvest>,
+): Map<string, IdentityProfile> {
+  const profiles = new Map<string, IdentityProfile>()
+  for (const endpoint of endpoints) {
+    if (endpoint.method.toUpperCase() !== 'GET') continue
+    const bare = endpoint.pathTemplate.split('?')[0] || '/'
+    if (!IDENTITY_ROUTE_RE.test(bare)) continue
+    const harvest = harvests.get(endpoint.id)
+    if (!harvest) continue
+    const bindings: Array<{ field: string; value: string; own?: string }> = []
+    for (const [field, values] of Object.entries(harvest.otherValues ?? {})) {
+      if (!/^[A-Za-z0-9_.-]{1,64}$/.test(field)) continue
+      if (IDENTITY_CREDENTIAL_FIELD_RE.test(field) || IDENTITY_CALLER_FIELD_RE.test(field)) continue
+      const value = values[0]
+      if (!value || value.length > 64 || !/^[A-Za-z0-9_.:@-]+$/.test(value)) continue
+      const ownValues = harvest.viewerValues ?? harvest.values
+      const own = ownValues[field]?.[0]
+      if (own === value) continue
+      bindings.push({
+        field,
+        value,
+        ...(own && own.length <= 64 && /^[A-Za-z0-9_.:@-]+$/.test(own) ? { own } : {}),
+      })
+    }
+    if (bindings.length === 0) continue
+    bindings.sort((a, b) => {
+      const rank = (field: string): number => IDENTITY_SCOPE_FIELD_RE.test(field) ? 0 : 1
+      return rank(a.field) - rank(b.field) || a.field.localeCompare(b.field)
+    })
+    if (!profiles.has(endpoint.origin)) profiles.set(endpoint.origin, { path: bare, bindings: bindings.slice(0, 4) })
+  }
+  return profiles
 }
 
 function personaPicks(personas: readonly EnginePersona[]): {
@@ -1444,6 +1509,9 @@ export function enumerateHypotheses(
         })
         const requiredRole = method === 'GET' ? undefined : authzRequiredRoleFor(privileged, authzOwner, authzOther)
         const score = endpointRiskScore(endpoint) + (hasIdPath || objectIdParam ? 20 : 0) + (privileged ? 15 : 0)
+        const baseBody = mutating && /(?:role|grant|permission|privilege|promote|assign)(?:\/|$)/i.test(bare)
+          ? { ...siblingBody(harvest?.fields ?? [], harvest?.values ?? {}), role: 'admin', grant: 'admin', level: 'admin' }
+          : siblingBody(harvest?.fields ?? [], harvest?.values ?? {})
         add({
           key: `authz|${endpoint.id}|${objectIdParam?.name ?? (hasIdPath ? 'path' : 'fn')}`,
           endpoint,
@@ -1460,15 +1528,60 @@ export function enumerateHypotheses(
           ...(readback?.persona ? { readbackPersona: readback.persona } : {}),
           ...(requiredRole ? { authzRequiredRole: requiredRole } : {}),
           ...(reservedVictimId ? { reservedVictimId } : {}),
-          jsonBody: mutating && /(?:role|grant|permission|privilege|promote|assign)(?:\/|$)/i.test(bare)
-            ? { ...siblingBody(harvest?.fields ?? [], harvest?.values ?? {}), role: 'admin', grant: 'admin', level: 'admin' }
-            : siblingBody(harvest?.fields ?? [], harvest?.values ?? {}),
+          jsonBody: baseBody,
           ...(sensitiveRead && !mutating
             ? { secretScan: true, viewerPersona: picks.lower?.handle ?? authzOther.handle }
             : {}),
           ...(mutating ? { csrfBind: true } : {}),
           risk: score + (sensitiveRead ? 25 : 0),
         })
+        // A privileged mutation may act on the *caller's own* identity (impersonation, role grant)
+        // instead of the addressed object. The observable state is then the actor's identity read,
+        // and the mutation body carries the identity scope field the target itself echoed for the
+        // other persona. Only add this variant when no separate object readback exists: otherwise
+        // the primary proof covers the route and a second probe would only spend budget.
+        const sameSurfaceReadback = !readback || (readback.path.split('?')[0] || '/') === bare
+        const identity = mutating && privileged && Boolean(requiredRole) && sameSurfaceReadback
+          ? options.identityProfiles?.get(endpoint.origin)
+          : undefined
+        if (identity) {
+          const ownBody: Record<string, unknown> = { ...baseBody }
+          const targetBody: Record<string, unknown> = { ...baseBody }
+          const reset: Array<{ field: string; value: string }> = []
+          for (const binding of identity.bindings) {
+            if (binding.own !== undefined) ownBody[binding.field] = binding.own
+            targetBody[binding.field] = binding.value
+            if (binding.own !== undefined && binding.own !== binding.value) reset.push({ field: binding.field, value: binding.own })
+          }
+          const bindings = identity.bindings
+            .map(binding => ({ field: binding.field, value: targetBody[binding.field] }))
+            .filter((binding): binding is { field: string; value: string } =>
+              typeof binding.value === 'string' && binding.value.length > 0 && binding.value.length <= 64)
+          if (bindings.length > 0) {
+            add({
+              key: `authz-self|${endpoint.id}|${objectIdParam?.name ?? (hasIdPath ? 'path' : 'fn')}`,
+              endpoint,
+              probeClass: 'authz_matrix',
+              intent: 'authz',
+              method: method === 'POST' || method === 'DELETE' ? method : (method === 'PUT' || method === 'PATCH' ? method : 'GET'),
+              pathAndQuery,
+              ownerPersona: authzOwner.handle,
+              otherPersona: authzOther.handle,
+              resourceIds: ids,
+              functionLevel,
+              idParamName,
+              readbackPath: identity.path,
+              readbackPersona: authzOther.handle,
+              // The probe itself writes the actor's *own* identity value (no state change); the
+              // replay re-establishes that baseline and then applies the target value.
+              functionState: { bindings, ...(reset.length > 0 ? { reset } : {}), body: targetBody },
+              ...(requiredRole ? { authzRequiredRole: requiredRole } : {}),
+              jsonBody: ownBody,
+              ...(mutating ? { csrfBind: true } : {}),
+              risk: score,
+            })
+          }
+        }
       }
     }
 
@@ -2057,8 +2170,25 @@ export function enumerateHypotheses(
             ?? listIds.find(id => id !== viewerTarget)
             ?? viewerTarget)
           : null
-        const roleTarget = colleagueTarget ?? viewerTarget
-        const writer = viewerTarget ? picks.lower!.handle : picks.owner?.handle
+        // A self-service update route writes the *caller's* row regardless of the path id. When the
+        // collection correlates an identity handle to a record id, address that row so the readback
+        // observes the state the writer actually changed.
+        const selfRowId = (persona?: string): string | undefined => {
+          if (!persona) return undefined
+          const rows = harvest?.rowIds ?? {}
+          const direct = rows[persona]
+          if (direct && /^[A-Za-z0-9_.:-]{1,128}$/.test(direct)) return direct
+          const wanted = persona.toLowerCase()
+          for (const [value, id] of Object.entries(rows)) {
+            if (value.toLowerCase() === wanted && /^[A-Za-z0-9_.:-]{1,128}$/.test(id)) return id
+          }
+          return undefined
+        }
+        const selfUpdateTarget = isUpdate && roleField && picks.lower ? selfRowId(picks.lower.handle) : undefined
+        // A self-service write must address the writer's own row: a colleague row may not be
+        // addressable at all, and the escalation is the writer's own record changing.
+        const roleTarget = selfUpdateTarget ?? colleagueTarget ?? viewerTarget
+        const writer = (selfUpdateTarget ?? viewerTarget) ? picks.lower!.handle : picks.owner?.handle
         const targetPath = roleTarget && hasIdPath
           ? bare.replace(idSegmentRe, `/${encodeURIComponent(roleTarget)}`)
           : massPath
@@ -2130,6 +2260,12 @@ interface JsonHarvest {
   /** Runtime value shape per field (url/path/xml/jwt/uuid/number/email/text). */
   shapes: Record<string, ParamValueShape>
   textValues: string[]
+  /**
+   * Row correlation for collection responses: `scalar value -> record identifier`. Lets the engine
+   * address the *caller's own* row (e.g. an identity handle that appears as a column on the row)
+   * without a route- or app-specific lookup.
+   */
+  rowIds: Record<string, string>
   body: string
   evidence: HarvestEvidence
 }
@@ -2142,13 +2278,36 @@ function harvestJson(body: string): JsonHarvest {
   const values: Record<string, string[]> = {}
   const shapes: Record<string, ParamValueShape> = {}
   const textValues: string[] = []
+  const rowIds: Record<string, string> = {}
   const evidence: HarvestEvidence = {}
   let parsed: unknown
-  try { parsed = JSON.parse(body) } catch { return { ids, fields: [], values, shapes, textValues, body, evidence } }
+  try { parsed = JSON.parse(body) } catch { return { ids, fields: [], values, shapes, textValues, rowIds, body, evidence } }
+  const recordRow = (row: Record<string, unknown>): void => {
+    let identifier: string | undefined
+    const scalars: string[] = []
+    for (const [key, raw] of Object.entries(row)) {
+      if (typeof raw !== 'string' && typeof raw !== 'number') continue
+      const text = String(raw)
+      if (!text || text.length > 64) continue
+      if (scalars.length < 12) scalars.push(text)
+      if (identifier === undefined && /^(?:id|uuid|uid|ext_?id|extid|key|ref)$/i.test(key) &&
+          /^[A-Za-z0-9_.:-]{1,128}$/.test(text)) {
+        identifier = text
+      }
+    }
+    if (!identifier) return
+    for (const scalar of scalars) {
+      if (Object.keys(rowIds).length >= 64) break
+      if (!(scalar in rowIds)) rowIds[scalar] = identifier
+    }
+  }
   const walk = (node: unknown, depth: number): void => {
     if (depth > 5 || node === null || node === undefined) return
     if (Array.isArray(node)) {
-      for (const item of node.slice(0, 30)) walk(item, depth + 1)
+      for (const item of node.slice(0, 30)) {
+        if (item && typeof item === 'object' && !Array.isArray(item)) recordRow(item as Record<string, unknown>)
+        walk(item, depth + 1)
+      }
       return
     }
     if (typeof node !== 'object') return
@@ -2199,6 +2358,7 @@ function harvestJson(body: string): JsonHarvest {
     values,
     shapes,
     textValues: [...new Set(textValues)],
+    rowIds,
     body,
     evidence,
   }
@@ -2254,9 +2414,9 @@ class SurfaceHarvester {
         if (headerNames.length > 0) evidence.headerNames = headerNames.slice(0, 32)
         return { ...harvested, evidence }
       }
-      return { ids: [], fields: [], values: {}, shapes: {}, textValues: [], body: '', evidence: {} }
+      return { ids: [], fields: [], values: {}, shapes: {}, textValues: [], rowIds: {}, body: '', evidence: {} }
     } catch {
-      return { ids: [], fields: [], values: {}, shapes: {}, textValues: [], body: '', evidence: {} }
+      return { ids: [], fields: [], values: {}, shapes: {}, textValues: [], rowIds: {}, body: '', evidence: {} }
     } finally {
       this.inflight.delete(pathAndQuery)
     }
@@ -2264,7 +2424,17 @@ class SurfaceHarvester {
 }
 
 function emptyHarvest(): EndpointHarvest {
-  return { ownerIds: [], otherIds: [], fields: [], values: {}, otherValues: {}, seedValues: [], activeQueryParams: [], viewerIds: [] }
+  return { ownerIds: [], otherIds: [], fields: [], values: {}, otherValues: {}, seedValues: [], activeQueryParams: [], viewerIds: [], rowIds: {} }
+}
+
+function mergeRowIds(target: EndpointHarvest, next: JsonHarvest): void {
+  if (!next.rowIds) return
+  const rowIds = target.rowIds ?? {}
+  for (const [value, id] of Object.entries(next.rowIds)) {
+    if (Object.keys(rowIds).length >= 64) break
+    if (!(value in rowIds)) rowIds[value] = id
+  }
+  target.rowIds = rowIds
 }
 
 function mergeEvidence(target: EndpointHarvest, next: HarvestEvidence): void {
@@ -2298,6 +2468,7 @@ function mergeHarvest(target: EndpointHarvest, next: JsonHarvest): void {
     if (shape !== 'unknown' && !target.shapes[field]) target.shapes[field] = shape
   }
   for (const value of next.textValues) if (!target.seedValues.includes(value)) target.seedValues.push(value)
+  mergeRowIds(target, next)
   mergeEvidence(target, next.evidence)
 }
 
@@ -2310,6 +2481,7 @@ function mergeOtherHarvest(target: EndpointHarvest, next: JsonHarvest): void {
     for (const value of values) if (!bucket.includes(value)) bucket.push(value)
     target.otherValues[field] = bucket.slice(0, 4)
   }
+  mergeRowIds(target, next)
   mergeEvidence(target, next.evidence)
 }
 
@@ -2317,6 +2489,13 @@ function mergeViewerHarvest(target: EndpointHarvest, next: JsonHarvest): void {
   const ids = target.viewerIds ?? []
   for (const id of next.ids) if (!ids.includes(id)) ids.push(id)
   target.viewerIds = ids.slice(0, 4)
+  const viewerValues = target.viewerValues ?? {}
+  for (const [field, values] of Object.entries(next.values)) {
+    const bucket = viewerValues[field] ?? []
+    for (const value of values) if (!bucket.includes(value)) bucket.push(value)
+    viewerValues[field] = bucket.slice(0, 4)
+  }
+  target.viewerValues = viewerValues
 }
 
 async function harvestSurface(
@@ -2996,7 +3175,7 @@ async function probeSecondOrderSsrf(
       ...base,
       verdict: 'signal',
       summary: 'The stored URL was fetched by the target after the trigger step (second-order SSRF callback).',
-      anomalies: [{ type: 'canary_callback', variant: 'http', param: param.name }],
+      anomalies: [{ type: 'canary_callback', variant: 'http', param: param.name, token: minted.token, canaryId: minted.id }],
       details: { secondOrder: true, requests },
       requestsSent: requests,
       exchangeIds,
@@ -3180,6 +3359,195 @@ export function floorHypothesesForEnvironment(
   })
 }
 
+// ---------------------------------------------------------------------------
+// Durable OOB subscriptions for floor canary probes
+// ---------------------------------------------------------------------------
+
+/**
+ * Synchronous window a floor canary probe already polls for a callback on its own. A callback that
+ * arrives inside it is an `immediate` hit; anything after it is a `late` hit that must be promoted
+ * from the durable `pending_oob` row by the run-level drain.
+ */
+export const floorOobImmediateMs = 3_000
+
+/**
+ * Durable window a floor canary subscription stays promotable. Bounded (instead of the relay's
+ * 15 minute default) but long enough to outlive a normal probe→verification→finalize gap, so a
+ * callback delivered 15–30 s after the `202` is still promotable when the run-level drain runs.
+ */
+export const floorOobWindowMs = 180_000
+
+/** Probe classes whose probe layer mints canary URLs and therefore needs durable OOB correlation. */
+export function floorCanaryClass(probeClass: DifferentialProbeClass): boolean {
+  return probeClass === 'ssrf_canary' || probeClass === 'xxe_canary'
+}
+
+/** One floor canary and the durable `pending_oob` row that will catch its (possibly late) callback. */
+export interface FloorCanarySubscription {
+  token: string
+  canaryId: string
+  label: string
+  subscriptionId: string | null
+  stage: 'immediate' | 'late' | 'pending' | 'none'
+  promoted: boolean
+}
+
+export interface FloorCanaryTracker {
+  /** CanaryBroker facade that registers a durable subscription on every mint. */
+  broker: CanaryBroker
+  subscriptions: () => FloorCanarySubscription[]
+  /** Correlate the probe outcome, promote an observed hit, and annotate the evidence. */
+  finalize: (result: DifferentialResult) => void
+}
+
+/**
+ * Wrap the run's CanaryBroker so every canary a floor probe mints is also registered as a durable
+ * `pending_oob` subscription **before** the probe can put the canary URL on the wire.
+ *
+ * The probe layer keeps its own short poll: a callback inside `floorOobImmediateMs` is promoted
+ * immediately, while a miss deliberately leaves the subscription pending so the run-level drain
+ * can promote a late callback (the async-SSRF/XXE case). Subscriptions are keyed by
+ * `(runId, canary token)`; the relay's own `(run, canary, artifact)` uniqueness plus this map's
+ * guard mean a repeated mint for the same token can never double-register or double-count.
+ */
+export function trackFloorCanarySubscriptions(
+  canaryBroker: CanaryBroker,
+  input: {
+    runId: string
+    assignmentId: string
+    log?: (kind: string, message: string, data?: Record<string, unknown>) => void
+  },
+): FloorCanaryTracker {
+  const log = input.log ?? (() => {})
+  const byToken = new Map<string, FloorCanarySubscription>()
+  const registered = new Set<string>()
+
+  const broker = new Proxy(canaryBroker, {
+    get(target, prop) {
+      if (prop === 'mintCanary') {
+        return (...args: Parameters<CanaryBroker['mintCanary']>) => {
+          const minted = target.mintCanary(...args)
+          const key = `${minted.runId}\u0000${minted.token}`
+          if (registered.has(key)) return minted
+          registered.add(key)
+          let subscriptionId: string | null = null
+          try {
+            subscriptionId = target.subscribe({
+              runId: minted.runId,
+              assignmentId: input.assignmentId,
+              canaryId: minted.id,
+              token: minted.token,
+              // Empty artifact: a real async callback does not carry Guardian's artifact marker,
+              // and a truthy artifact would reject it at ingest. Token↔canary binding is the link.
+              artifact: '',
+              immediateMs: floorOobImmediateMs,
+              windowMs: floorOobWindowMs,
+            }).id
+          } catch {
+            // A relay that cannot persist must not break a synchronous canary proof.
+            subscriptionId = null
+          }
+          byToken.set(minted.token, {
+            token: minted.token,
+            canaryId: minted.id,
+            label: minted.label.slice(0, 120),
+            subscriptionId,
+            stage: subscriptionId ? 'pending' : 'none',
+            promoted: false,
+          })
+          log('deterministic_engine.oob_subscribed',
+            subscriptionId
+              ? `Durable pending_oob subscription ${subscriptionId} registered for floor canary ${minted.id}.`
+              : `Floor canary ${minted.id} could not register a durable pending_oob subscription.`,
+            {
+              canaryId: minted.id,
+              subscriptionId,
+              label: minted.label.slice(0, 120),
+              immediateMs: floorOobImmediateMs,
+              windowMs: floorOobWindowMs,
+            })
+          return minted
+        }
+      }
+      const value = Reflect.get(target, prop, target)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  }) as CanaryBroker
+
+  const finalize = (result: DifferentialResult): void => {
+    if (byToken.size === 0) return
+    const observed = new Set<string>()
+    for (const anomaly of result.anomalies) {
+      const token = [anomaly.token, anomaly.canaryToken, anomaly.canaryId]
+        .find((value): value is string => typeof value === 'string' && byToken.has(value))
+      if (token) observed.add(token)
+    }
+    // Only an observed hit is promoted here: a miss must stay pending for the run-level drain,
+    // and a global sweep on every probe would rob the drain of the late callback it exists for.
+    let promotions: ReturnType<CanaryBroker['promoteLate']> = []
+    if (observed.size > 0) {
+      try { promotions = canaryBroker.promoteLate({ runId: input.runId }) } catch { promotions = [] }
+    }
+    for (const promotion of promotions) {
+      log('deterministic_engine.oob_promoted',
+        `Floor canary ${promotion.subscription.canaryId} callback promoted (${promotion.stage}, ${promotion.latencyMs} ms after mint).`,
+        {
+          canaryId: promotion.subscription.canaryId,
+          subscriptionId: promotion.subscription.id,
+          stage: promotion.stage,
+          latencyMs: promotion.latencyMs,
+        })
+    }
+    for (const record of byToken.values()) {
+      const promotion = promotions.find(item => item.subscription.id === record.subscriptionId)
+      if (promotion) {
+        record.stage = promotion.stage
+        record.promoted = true
+      } else if (observed.has(record.token)) {
+        // The probe observed the callback in memory but the relay could not promote it (already
+        // claimed, rejected at ingest, or no relay). Record the observation without claiming a
+        // durable promotion that did not happen.
+        record.stage = 'immediate'
+        record.promoted = false
+      } else {
+        record.stage = record.subscriptionId ? 'pending' : 'none'
+      }
+    }
+
+    for (const anomaly of result.anomalies) {
+      const token = [anomaly.token, anomaly.canaryToken, anomaly.canaryId]
+        .find((value): value is string => typeof value === 'string' && byToken.has(value))
+      if (!token) continue
+      const record = byToken.get(token)!
+      anomaly.oobSubscriptionId = record.subscriptionId
+      anomaly.canaryProbeStage = record.stage
+      anomaly.promoted = record.promoted
+    }
+
+    const records = [...byToken.values()]
+    const primary = records.find(record => record.stage === 'late')
+      ?? records.find(record => record.stage === 'immediate')
+      ?? records[0]
+    result.details = {
+      ...result.details,
+      oob: records.map(record => ({
+        token: record.token,
+        canaryId: record.canaryId,
+        label: record.label,
+        subscriptionId: record.subscriptionId,
+        stage: record.stage,
+        promoted: record.promoted,
+      })),
+      ...(primary?.subscriptionId ? { oobSubscriptionId: primary.subscriptionId } : {}),
+      ...(primary ? { oobCanaryId: primary.canaryId } : {}),
+      ...(primary ? { canaryProbeStage: primary.stage } : {}),
+      promoted: records.some(record => record.promoted),
+    }
+  }
+
+  return { broker, subscriptions: () => [...byToken.values()], finalize }
+}
+
 export async function runDeterministicEngine(input: DeterministicEngineInput): Promise<DeterministicEngineReport> {
   const started = Date.now()
   const maxRequests = Math.max(0, input.maxRequests ?? defaultEngineMaxRequests)
@@ -3269,6 +3637,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     personas: input.personas,
     maxHypotheses: input.maxHypotheses ?? defaultEngineMaxHypotheses,
     maxRequests,
+    identityProfiles: buildIdentityProfiles(ranked, harvests),
     ...(input.classes ? { classes: input.classes } : {}),
   })
 
@@ -3308,10 +3677,23 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     auth_protocol: capFor(2),
   }
   const intentUsed: Record<string, number> = {}
+  // CSRF probes on sibling transitions of one resource family share the same session/cookie
+  // boundary, so probing every verb spends the intent quota on one family. Keep one per collection
+  // prefix and let the quota reach the other families; each hypothesis still probes its own route.
+  const probeQueue: EngineHypothesis[] = []
+  const csrfFamilies = new Set<string>()
+  for (const hyp of gatedHypotheses) {
+    if (hyp.intent === 'csrf') {
+      const family = `${hyp.endpoint.origin}|${collectionPathOf(hyp.endpoint.pathTemplate) ?? (hyp.endpoint.pathTemplate.split('?')[0] || '/')}`
+      if (csrfFamilies.has(family)) continue
+      csrfFamilies.add(family)
+    }
+    probeQueue.push(hyp)
+  }
   // Request-count termination is the deterministic contract; the wall clock is only a safety net
   // with a fixed margin, so a slow host cannot silently truncate a different tail of the queue.
   const hardDeadlineMs = maxDurationMs + deterministicWallMarginMs
-  for (const hyp of gatedHypotheses) {
+  for (const hyp of probeQueue) {
     if (input.signal.aborted) { report.stoppedReason = 'aborted'; break }
     if (Date.now() - started >= hardDeadlineMs) { report.stoppedReason = 'time'; break }
     if (budget.requestsUsed >= maxRequests) { report.stoppedReason = 'budget'; break }
@@ -3349,15 +3731,22 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
       continue
     }
     if (staging.action === 'tag') report.stagingTaggedMutations += 1
+    // Layer-2 floor canaries register a durable `pending_oob` subscription before the probe sends
+    // the canary URL, so a callback that arrives after the probe's short poll is promoted by the
+    // run-level drain instead of being lost.
+    const canaryTracker = input.canaryBroker && floorCanaryClass(hyp.probeClass)
+      ? trackFloorCanarySubscriptions(input.canaryBroker, { runId: input.runId, assignmentId: input.assignmentId, log })
+      : null
+    const probeCanaryBroker = canaryTracker?.broker ?? input.canaryBroker
     let probe: DifferentialResult
     try {
       probe = hyp.intent === 'secret_disclosure' && !hyp.secretScan && !input.probe
         ? await probeSecretExposure(hyp, input, trackExchange)
-        : hyp.probeClass === 'ssrf_canary' && hyp.triggerPath && input.canaryBroker && !input.probe
-          ? await probeSecondOrderSsrf(hyp, input, trackExchange)
+        : hyp.probeClass === 'ssrf_canary' && hyp.triggerPath && probeCanaryBroker && !input.probe
+          ? await probeSecondOrderSsrf(hyp, { ...input, canaryBroker: probeCanaryBroker }, trackExchange)
           : await (input.probe ?? probeDifferential)(
               { ...buildProbeRequest(hyp, maxProbeRequests, input, staging), onExchange: trackExchange },
-              input.broker, input.grant, input.canaryBroker, input.signal,
+              input.broker, input.grant, probeCanaryBroker, input.signal,
             )
     } catch (error) {
       const message = error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200)
@@ -3371,6 +3760,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
       }
       continue
     }
+    canaryTracker?.finalize(probe)
     report.hypothesesRun += 1
     stats.requests += probe.requestsSent
     log('deterministic_engine.probe', `${hyp.probeClass} ${hyp.method} ${hyp.endpoint.pathTemplate}${hyp.param ? ` param=${hyp.param.name}` : ''} -> ${probe.verdict}`, {
