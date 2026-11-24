@@ -1,0 +1,189 @@
+{
+  "version": 1,
+  "comment": "Past false-positive / over-claim archetypes replayed through the shared Oracle invariants. Every archetype MUST be dismissed (satisfied=false). Defensive QA only: synthetic transcript shapes, no live targets.",
+  "archetypes": [
+    {
+      "id": "2fa-without-enrollment",
+      "title": "OTP endpoint returns 2xx on an account with no enrollment",
+      "assessor": "mfa",
+      "expectedDismissal": "no control read shows the account is enrolled",
+      "input": {
+        "impactClass": "other",
+        "steps": [
+          {
+            "id": "pre",
+            "arm": "control",
+            "method": "GET",
+            "route": "/api/account",
+            "pathAndQuery": "/api/account",
+            "status": 401,
+            "actor": { "handle": "member_a", "role": "member", "tenant": "acme", "auth": "cookie", "sameSite": "lax" },
+            "body": "{\"error\":\"mfa_required\"}"
+          },
+          {
+            "id": "probe",
+            "arm": "probe",
+            "method": "POST",
+            "route": "/api/2fa/verify",
+            "pathAndQuery": "/api/2fa/verify",
+            "status": 200,
+            "actor": { "handle": "member_a", "role": "member", "tenant": "acme", "auth": "cookie", "sameSite": "lax" },
+            "requestJson": { "code": "000000" },
+            "json": { "ok": true, "verified": true }
+          },
+          {
+            "id": "post",
+            "arm": "probe",
+            "method": "GET",
+            "route": "/api/account",
+            "pathAndQuery": "/api/account",
+            "status": 200,
+            "actor": { "handle": "member_a", "role": "member", "tenant": "acme", "auth": "cookie", "sameSite": "lax" },
+            "json": { "id": "acct_1", "name": "Member A", "twofa_enabled": false }
+          }
+        ]
+      }
+    },
+    {
+      "id": "amount-negative-echo",
+      "title": "Checkout accepts a negative amount and echoes it in the response",
+      "assessor": "business_logic",
+      "expectedDismissal": "a mutation response echo is not a state delta",
+      "input": {
+        "impactClass": "business_logic",
+        "steps": [
+          {
+            "id": "probe",
+            "arm": "probe",
+            "method": "POST",
+            "route": "/api/checkout",
+            "pathAndQuery": "/api/checkout",
+            "status": 200,
+            "actor": { "handle": "member_a", "role": "member", "tenant": "acme", "auth": "cookie", "sameSite": "lax" },
+            "requestJson": { "amount": -1, "currency": "USD" },
+            "json": { "ok": true, "amount": -1, "currency": "USD" }
+          }
+        ]
+      }
+    },
+    {
+      "id": "bfla-2xx-only",
+      "title": "Lower role receives a 2xx from an admin read route (no differential, no data)",
+      "assessor": "bfla",
+      "expectedDismissal": "read-only proof lacks impact evidence",
+      "input": {
+        "impactClass": "bfla",
+        "requiredRole": "admin",
+        "steps": [
+          {
+            "id": "probe",
+            "arm": "probe",
+            "method": "GET",
+            "route": "/api/admin/users",
+            "pathAndQuery": "/api/admin/users",
+            "status": 200,
+            "actor": { "handle": "viewer_a", "role": "viewer", "tenant": "acme", "auth": "cookie", "sameSite": "lax" },
+            "json": { "ok": true, "users": [] }
+          }
+        ]
+      }
+    },
+    {
+      "id": "echo-mass-assign",
+      "title": "Protected role field is echoed by PATCH but never persisted",
+      "assessor": "mass_assignment",
+      "expectedDismissal": "no injected field was read back from the server",
+      "input": {
+        "impactClass": "mass_assignment",
+        "steps": [
+          {
+            "id": "before",
+            "arm": "control",
+            "method": "GET",
+            "route": "/api/users/42",
+            "pathAndQuery": "/api/users/42",
+            "status": 200,
+            "actor": { "handle": "member_a", "role": "member", "tenant": "acme", "auth": "cookie", "sameSite": "lax" },
+            "json": { "id": "42", "role": "member", "tenant_id": "acme" }
+          },
+          {
+            "id": "probe",
+            "arm": "probe",
+            "method": "PATCH",
+            "route": "/api/users/42",
+            "pathAndQuery": "/api/users/42",
+            "status": 200,
+            "actor": { "handle": "member_a", "role": "member", "tenant": "acme", "auth": "cookie", "sameSite": "lax" },
+            "requestJson": { "role": "admin" },
+            "json": { "ok": true, "role": "admin" }
+          },
+          {
+            "id": "after",
+            "arm": "control",
+            "method": "GET",
+            "route": "/api/users/42",
+            "pathAndQuery": "/api/users/42",
+            "status": 200,
+            "actor": { "handle": "member_a", "role": "member", "tenant": "acme", "auth": "cookie", "sameSite": "lax" },
+            "json": { "id": "42", "role": "member", "tenant_id": "acme" }
+          }
+        ]
+      }
+    },
+    {
+      "id": "bearer-csrf",
+      "title": "State-changing request is authenticated with a Bearer token (not CSRF-able)",
+      "assessor": "csrf",
+      "expectedDismissal": "cross-site form cannot attach bearer credentials",
+      "input": {
+        "impactClass": "csrf",
+        "targetOrigin": "https://acme.example",
+        "steps": [
+          {
+            "id": "probe",
+            "arm": "probe",
+            "method": "POST",
+            "route": "/api/transfer",
+            "pathAndQuery": "/api/transfer",
+            "status": 200,
+            "actor": { "handle": "member_a", "role": "member", "tenant": "acme", "auth": "bearer", "sameSite": null },
+            "requestHeaders": { "origin": "https://evil.example" },
+            "requestJson": { "amount": 10, "to": "acct_2" },
+            "json": { "ok": true, "amount": 10 }
+          }
+        ]
+      }
+    },
+    {
+      "id": "public-route-tenant-canary",
+      "title": "Public share route serves a canary to another tenant (by design, no private data)",
+      "assessor": "authorization",
+      "expectedDismissal": "route declares itself public and exposes no owner-scoped private attribute",
+      "input": {
+        "impactClass": "authorization",
+        "steps": [
+          {
+            "id": "other_tenant",
+            "arm": "control",
+            "method": "GET",
+            "route": "/api/public/docs/123",
+            "pathAndQuery": "/api/public/docs/123",
+            "status": 200,
+            "actor": { "handle": "member_b", "role": "member", "tenant": "acme-b", "auth": "cookie", "sameSite": "lax" },
+            "json": { "slug": "vendor-info", "canary": "rb_fake_public_canary" }
+          },
+          {
+            "id": "probe",
+            "arm": "probe",
+            "method": "GET",
+            "route": "/api/public/docs/123",
+            "pathAndQuery": "/api/public/docs/123",
+            "status": 200,
+            "actor": { "handle": "member_a", "role": "member", "tenant": "acme-a", "auth": "cookie", "sameSite": "lax" },
+            "json": { "slug": "vendor-info", "canary": "rb_fake_public_canary" }
+          }
+        ]
+      }
+    }
+  ]
+}
