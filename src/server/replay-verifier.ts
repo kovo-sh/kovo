@@ -33,6 +33,7 @@ import type { Store } from './store.ts'
 import type { WorkerBackend } from './worker-backend.ts'
 import {
   actorFromPersona,
+  assessAuthorizationImpact,
   assessBoundary,
   assessImpactEvidence,
   assessMassAssignmentImpact,
@@ -1307,6 +1308,23 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         const impactClass = massAssignmentEvidence?.required && massAssignmentEvidence.satisfied
           ? 'mass_assignment' as const
           : declaredImpactClass
+        // Cross-tenant evidence is object-level authorization when the *probe* actor sits outside
+        // the tenant that successfully read the same route (a victim control). A victim readback
+        // after a mass-assignment write is not a cross-tenant probe.
+        const probeStep = impactSteps.find(step => step.arm === 'probe') ?? null
+        const controlReadTenants = new Set<string>()
+        for (const step of impactSteps) {
+          if (step.arm !== 'control') continue
+          if (!/^(?:GET|HEAD|OPTIONS)$/i.test(step.method ?? '')) continue
+          if (step.status === null || step.status < 200 || step.status >= 300) continue
+          if (!probeStep || step.route !== probeStep.route) continue
+          if (step.actor.tenant) controlReadTenants.add(step.actor.tenant)
+        }
+        const crossTenantEvidence = Boolean(probeStep?.actor.tenant && controlReadTenants.size > 0 &&
+          !controlReadTenants.has(probeStep.actor.tenant))
+        const evidenceClassLabel = crossTenantEvidence && (impactClass === 'authorization' || impactClass === 'business_logic')
+          ? 'bola'
+          : impactClass
         // A control arm that binds a CSRF token is the engine's declared anti-CSRF defence for the
         // route, equivalent to the route's `csrf_state_change` oracle. It is a requirement, not
         // evidence: the persisted readback is still demanded below.
@@ -1397,7 +1415,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           ...(impactGate ? { impactGate } : {}),
           // Verified evidence class: lets the host align a mislabelled finding (e.g. a tenant_id
           // overpost reported as BOLA is mass assignment) with what the proof actually showed.
-          ...(impactGate?.required && impactGate.satisfied ? { evidenceClass: impactClass } : {}),
+          ...(impactGate?.required && impactGate.satisfied ? { evidenceClass: evidenceClassLabel } : {}),
           ...(boundaryGate ? { boundaryGate } : {}),
           proofStrength,
           endpointBinding,

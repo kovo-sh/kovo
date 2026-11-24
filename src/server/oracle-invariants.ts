@@ -208,16 +208,26 @@ function sameRoute(a: ImpactStep, b: ImpactStep): boolean {
   return (a.route ?? '') !== '' && a.route === b.route
 }
 
+/** True when the probe creates a new collection member (POST with no id-like final segment). */
+function isCreateShapedProbe(step: ImpactStep): boolean {
+  if ((step.method ?? '').toUpperCase() !== 'POST') return false
+  const path = (step.route ?? '').replace(/\/+$/, '')
+  const last = path.split('/').filter(Boolean).pop() ?? ''
+  return !/\d/.test(last)
+}
+
+
+
 // ---------------------------------------------------------------------------
 // Impact classification (title / category / CWE descriptors only)
 // ---------------------------------------------------------------------------
 
 const CSRF_RE = /\bcsrf\b|cross[- ]site\s+request\s+forgery|CWE-352/i
 const MASS_ASSIGN_RE = /mass[- ]?assign|over[- ]?post|CWE-915/i
-const AUTHZ_RE = /\b(?:bola|bfla|idor|broken[- ]access[- ]control|access[- ]control|authori[sz]ation|privilege[- ]escalation|privilege[- ]escalation|tenant[- ]isolation|vertical[- ]access|cross[- ]tenant)\b/i
+const AUTHZ_RE = /\b(?:bola|bfla|idor|broken[- ]access[- ]control|access[- ]control|authori[sz]ation|privilege[- ]escalation|tenant[- ]isolation|vertical[- ]access|cross[- ]tenant|per[- ]object|object[- ]ownership|ownership[- ]check|same[- ]tenant|cross[- ]object|another user'?s)\b/i
 const AUTHZ_CWE_RE = /^CWE-(?:269|284|285|362|566|639|862|863|1021|1220)$/i
-const BUSINESS_LOGIC_RE = /\b(?:business[- ]logic|workflow|step[- ]skip|state[- ]transition|invariant|business[- ]rule)\b/i
-const BUSINESS_LOGIC_CWE_RE = /^CWE-(?:840|841|472)$/i
+const BUSINESS_LOGIC_RE = /\b(?:business[- ]logic|workflow|step[- ]skip|state[- ]transition|invariant|business[- ]rule|safe[- ]integer|range validation|sign validation|negative (?:amount|value|invoice)|client-supplied amount)\b/i
+const BUSINESS_LOGIC_CWE_RE = /^CWE-(?:840|841|472|1284)$/i
 const MARKUP_RE = /\b(?:xss|cross[- ]site\s+scripting|html[- ]injection|markup[- ]injection|script[- ]injection|scripting)\b/i
 const MARKUP_CWE_RE = /^CWE-(?:79|80|83)$/i
 const DISCLOSURE_RE = /\b(?:disclosure|data[- ]leak|information[- ]leak|leak(?:ed|s|age)?|exposure|expos(?:ed|ure)|sensitive[- ]data|unauthori[sz]ed[- ]read)\b/i
@@ -493,13 +503,18 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
   // which is the app working, not a boundary the probe crossed.
   const probeTenant = probe?.actor.tenant ?? null
   const declaredResourceTenant = input.resourceTenant?.toLowerCase() ?? null
+  // A claim-declared resource tenant is untrusted: the mirror direction only counts when an actor
+  // in that tenant actually read the same resource successfully (a control on the same object).
+  const mirrorCorroborated = declaredResourceTenant !== null && probe !== undefined && steps.some(step =>
+    step.actor.tenant === declaredResourceTenant &&
+    isReadMethod(step.method) &&
+    isSuccess(step.status) &&
+    sameRoute(step, probe))
   const peerDenial = (control: ImpactStep): boolean => {
     const tenant = control.actor.tenant ?? null
     if (tenant === null || probeTenant === null) return true
-    // Same-tenant peer (vertical BFLA) or the mirrored cross-tenant direction: the denied control
-    // lives in the resource tenant the probe crossed into (B denied on A while A writes B).
     return tenant === probeTenant ||
-      (declaredResourceTenant !== null && tenant === declaredResourceTenant && declaredResourceTenant !== probeTenant)
+      (mirrorCorroborated && declaredResourceTenant !== null && tenant === declaredResourceTenant && declaredResourceTenant !== probeTenant)
   }
   const boundaryControlDenied = deniedControls.some(control =>
     peerDenial(control) &&
@@ -860,6 +875,14 @@ export function assessMassAssignmentImpact(input: ImpactInput): MassAssignmentAs
       evidence,
     }
   }
+  if (protectedFields.length > 0 && protectedFields.every(isPriceField) && !oracleDeclared) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: `A caller-chosen money value (${protectedFields.slice(0, 6).join(', ')}) persisted, but no catalog or invariant event binds it: a caller-supplied amount is not mass assignment of an entitlement.`,
+      evidence,
+    }
+  }
   if (!oracleDeclared && protectedFields.length === 0) {
     return { required: true, satisfied: false, reason: 'Mass-assignment claim requires the endpoint\'s declared impact event or a persisted protected-field change.', evidence }
   }
@@ -923,11 +946,16 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
   }
   const probeTenant = mutatingProbe.actor.tenant ?? null
   const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
+  const mirrorCorroborated = resourceTenant !== null && steps.some(step =>
+    step.actor.tenant === resourceTenant &&
+    isReadMethod(step.method) &&
+    isSuccess(step.status) &&
+    sameRoute(step, mutatingProbe))
   const peerDenial = (control: ImpactStep): boolean => {
     const tenant = control.actor.tenant ?? null
     if (tenant === null || probeTenant === null) return true
     return tenant === probeTenant ||
-      (resourceTenant !== null && tenant === resourceTenant && resourceTenant !== probeTenant)
+      (mirrorCorroborated && resourceTenant !== null && tenant === resourceTenant && resourceTenant !== probeTenant)
   }
   const boundaryControlDenied = steps.some(control =>
     control.arm === 'control' &&
@@ -990,6 +1018,18 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     }
   }
   labels.oracleDeclared = hasOracle(input.oracleEvents, ['invariant_violation', 'workflow_skip', 'race_double_spend', 'state_delta', 'privilege_escalation'])
+  // A create-time caller-chosen *money* value (invoice amount, price) is not an invariant: the app
+  // may legitimately accept it, and no control arm binds it. Require the endpoint's declared
+  // invariant event for price/amount-only persistences on create-shaped probes.
+  const priceOnly = labels.protectedFields.length > 0 && labels.protectedFields.every(isPriceField)
+  if (labels.persisted && priceOnly && !labels.oracleDeclared) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: `A caller-chosen money value (${labels.protectedFields.slice(0, 6).join(', ')}) persisted, but no invariant event is declared and no control arm binds the value: a caller-supplied amount is not an invariant violation.`,
+      evidence: labels,
+    }
+  }
   if (labels.persisted && (labels.protectedFields.length > 0 || labels.oracleDeclared)) {
     return {
       required: true,
@@ -1170,7 +1210,9 @@ export interface EvidenceClassLabel {
   category: string
 }
 
-const IMPACT_CLASS_LABELS: Partial<Record<ImpactClass, EvidenceClassLabel>> = {
+const IMPACT_CLASS_LABELS: Record<string, EvidenceClassLabel> = {
+  // Cross-tenant evidence is object-level authorization regardless of the model's business framing.
+  bola: { vulnClass: 'bola', cwe: 'CWE-639', category: 'broken-access-control' },
   mass_assignment: { vulnClass: 'mass_assignment', cwe: 'CWE-915', category: 'mass-assignment' },
   csrf: { vulnClass: 'csrf', cwe: 'CWE-352', category: 'csrf' },
   markup: { vulnClass: 'xss_stored', cwe: 'CWE-79', category: 'xss' },
@@ -1178,7 +1220,8 @@ const IMPACT_CLASS_LABELS: Partial<Record<ImpactClass, EvidenceClassLabel>> = {
   business_logic: { vulnClass: 'business_logic', cwe: 'CWE-840', category: 'business-logic' },
 }
 
-const IMPACT_CLASS_CWES: Partial<Record<ImpactClass, number[]>> = {
+const IMPACT_CLASS_CWES: Record<string, number[]> = {
+  bola: [639],
   mass_assignment: [915],
   csrf: [352],
   markup: [79, 80, 83],
@@ -1188,7 +1231,7 @@ const IMPACT_CLASS_CWES: Partial<Record<ImpactClass, number[]>> = {
 
 /** Label for a verified impact class, or null when the class has no single canonical label. */
 export function evidenceClassLabel(impactClass: string | null | undefined): EvidenceClassLabel | null {
-  return impactClass ? IMPACT_CLASS_LABELS[impactClass as ImpactClass] ?? null : null
+  return impactClass ? IMPACT_CLASS_LABELS[impactClass] ?? null : null
 }
 
 /**
@@ -1203,7 +1246,7 @@ export function alignClaimClass(
 ): EvidenceClassLabel | null {
   const label = evidenceClassLabel(impactClass)
   if (!label) return null
-  const family = IMPACT_CLASS_CWES[impactClass as ImpactClass] ?? []
+  const family = (impactClass ? IMPACT_CLASS_CWES[impactClass] : undefined) ?? []
   const declared = /(\d+)/.exec(claim.cwe ?? '')?.[1]
   if (declared !== undefined && family.includes(Number(declared))) return null
   return label
@@ -1495,13 +1538,27 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
     .map(step => boundarySignalOf(step, successFamilies))
     .filter((signal): signal is BoundarySignal => signal !== null)
     .filter(signal => firstProbeIndex < 0 || steps.indexOf(signal.step) < firstProbeIndex)
-  const probeActor = steps.find(step => step.arm === 'probe')?.actor ?? null
+  const probeStep = steps.find(step => step.arm === 'probe') ?? null
+  const probeActor = probeStep?.actor ?? null
   const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
-  const peerSignal = signals.find(entry => {
+  const boundaryMirrorCorroborated = resourceTenant !== null && probeStep !== null && steps.some(step =>
+    step.actor.tenant === resourceTenant && isReadMethod(step.method) && isSuccess(step.status) && sameRoute(step, probeStep))
+  // A post-mutation 404 readback (e.g. the control deletes the object, then reads it) is
+  // persistence evidence, not a boundary denial; drop signals that follow a control mutation on the
+  // same route.
+  const controlMutationIndexes = steps
+    .map((step, index) => (step.arm === 'control' && stepMutatesState(step) ? index : -1))
+    .filter(index => index >= 0)
+  const boundarySignals = signals.filter(entry => {
+    const at = steps.indexOf(entry.step)
+    if (at < 0) return true
+    return !controlMutationIndexes.some(mutatedAt => mutatedAt < at && sameRoute(steps[mutatedAt]!, entry.step))
+  })
+  const peerSignal = boundarySignals.find(entry => {
     const tenant = entry.step.actor.tenant ?? null
     if (tenant === null || probeActor?.tenant == null) return true
     return tenant === probeActor.tenant ||
-      (resourceTenant !== null && tenant === resourceTenant && resourceTenant !== probeActor.tenant)
+      (boundaryMirrorCorroborated && resourceTenant !== null && tenant === resourceTenant && resourceTenant !== probeActor.tenant)
   }) ?? null
   const signal = peerSignal ?? null
   const controlDenied = signal !== null

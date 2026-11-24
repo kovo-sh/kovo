@@ -41,6 +41,7 @@ import {
   assessMfaBypass,
   classifyBoundaryClaim,
   classifyImpactDescriptor,
+  isReadMethod,
   normalizeRole,
   parseRoleLabel,
   assessReadDisclosure,
@@ -1109,6 +1110,9 @@ function implicitReadDisclosure(
   const probe = steps.find(step => step.arm === 'probe') ??
     [...steps].reverse().find(step => step.json !== undefined && step.json !== null)
   if (!probe) return { satisfied: false, reason: 'no probe exchange carries a JSON body to inspect for an owner-scoped disclosure' }
+  if (!isReadMethod(probe.method)) {
+    return { satisfied: false, reason: 'the probe exchange is a state-changing request; a write needs a persisted-impact claim, not a read disclosure' }
+  }
   const disclosure = assessReadDisclosure({ steps, probe })
   return { satisfied: disclosure.satisfied, reason: disclosure.reason }
 }
@@ -1513,7 +1517,11 @@ export function evaluateClaims(
   const checks = claims.map(claim => evaluateClaim(store, claim, context))
   const failures = checks.filter(c => !c.passed).map(c => `${c.claim.kind}: ${c.detail}`)
   const claimed = context.claimedImpact
-  const boundaryClaimPassed = checks.some(check => check.passed && check.claim.kind === 'boundary')
+  // A boundary claim substitutes for impact evidence only when it crossed an actual denial/challenge;
+  // an actor/precondition differential alone is not object-level impact.
+  const boundaryClaimPassed = checks.some(check =>
+    check.passed && check.claim.kind === 'boundary' &&
+    (check.observed as { arm?: unknown } | undefined)?.arm === 'control_denied')
   const impactBacked = checks.some(check =>
     check.passed && check.claim.kind === 'impact' &&
     (check.claim.impactClass === claimed ||

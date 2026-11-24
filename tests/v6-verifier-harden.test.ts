@@ -1280,9 +1280,10 @@ test('units: a self-service workflow transition is not business-logic impact (K=
   assert.equal(selfService.satisfied, false)
   assert.match(selfService.reason, /self-service|non-protected/i)
 
-  // The planted billing tamper moves a *protected* price field: still impact.
+  // The planted billing tamper moves a *protected* price field and declares its invariant.
   const protectedPrice = assessBusinessLogicImpact({
     impactClass: 'business_logic',
+    oracleEvents: ['invariant_violation'],
     steps: [
       { id: 'before', arm: 'control', method: 'GET', route: '/api/billing', status: 200, actor: ownerActor, json: { plan: 'pro', price: 4900 } },
       { id: 'probe', arm: 'probe', method: 'PATCH', route: '/api/billing', status: 200, actor: ownerActor, requestJson: { price: 1 }, json: { ok: true } },
@@ -1535,6 +1536,11 @@ test('units: verified evidence class relabels a mislabelled claim (and only then
   assert.equal(alignClaimClass({ cwe: 'CWE-639' }, 'markup')?.cwe, 'CWE-79')
   assert.equal(alignClaimClass({ cwe: 'CWE-639' }, 'disclosure')?.cwe, 'CWE-200')
   assert.equal(alignClaimClass({ cwe: 'CWE-639' }, 'csrf')?.cwe, 'CWE-352')
+  // Cross-tenant evidence always lands on object-level authorization.
+  assert.deepEqual(alignClaimClass({ cwe: 'CWE-840' }, 'bola'), {
+    vulnClass: 'bola', cwe: 'CWE-639', category: 'broken-access-control',
+  })
+  assert.equal(alignClaimClass({ cwe: 'CWE-639' }, 'bola'), null)
   assert.equal(alignClaimClass({ cwe: 'CWE-472' }, 'business_logic'), null, 'same family keeps the more precise CWE')
   assert.deepEqual(evidenceClassLabel('mass_assignment'), {
     vulnClass: 'mass_assignment', cwe: 'CWE-915', category: 'mass-assignment',
@@ -1564,4 +1570,131 @@ test('verifier: a satisfied mass-assignment gate records evidenceClass on the pa
     assert.equal(res.verdict, 'confirmed', String(res.outcome.reason))
     assert.equal(res.evidencePayload.evidenceClass, 'mass_assignment')
   } finally { await fx.close() }
+})
+
+// ---------------------------------------------------------------------------
+// 13. Create-time caller-chosen money values are not invariants (45-min K=6 FP)
+// ---------------------------------------------------------------------------
+
+test('units: a negative-amount create is not a business-logic invariant without a declared event', () => {
+  const owner = { handle: 'persona_a', role: 'owner' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
+  const invoiceCreate = (amount: number) => ({
+    impactClass: 'business_logic' as const,
+    steps: [
+      { id: 'create_control', arm: 'control' as const, method: 'POST', route: '/api/invoices', status: 201, actor: owner, requestJson: { amount: 777 }, json: { id: 'ctl' } },
+      { id: 'read_control', arm: 'control' as const, method: 'GET', route: '/api/invoices/ctl', status: 200, actor: owner, json: { id: 'ctl', amount: 777 } },
+      { id: 'create_probe', arm: 'probe' as const, method: 'POST', route: '/api/invoices', status: 201, actor: owner, requestJson: { amount }, json: { id: 'prb' } },
+      { id: 'read_probe', arm: 'probe' as const, method: 'GET', route: '/api/invoices/prb', status: 200, actor: owner, json: { id: 'prb', amount } },
+    ],
+  })
+  const rejected = assessBusinessLogicImpact(invoiceCreate(-777))
+  assert.equal(rejected.required, true)
+  assert.equal(rejected.satisfied, false)
+  assert.match(rejected.reason, /caller-supplied amount|money value|invariant event/i)
+
+  // Same shape with the endpoint's invariant event declared is a legitimate proof.
+  const accepted = assessBusinessLogicImpact({ ...invoiceCreate(-777), oracleEvents: ['invariant_violation'] })
+  assert.equal(accepted.satisfied, true, accepted.reason)
+
+  // The planted billing tamper mutates one existing resource (PATCH) and declares its invariant.
+  const billing = assessBusinessLogicImpact({
+    impactClass: 'business_logic',
+    oracleEvents: ['invariant_violation'],
+    steps: [
+      { id: 'before', arm: 'control', method: 'GET', route: '/api/plans/current', status: 200, actor: owner, json: { plan: 'pro', price: 4900 } },
+      { id: 'probe', arm: 'probe', method: 'PATCH', route: '/api/plans/current', status: 200, actor: owner, requestJson: { price: 1 }, json: { ok: true } },
+      { id: 'after', arm: 'control', method: 'GET', route: '/api/plans/current', status: 200, actor: owner, json: { plan: 'pro', price: 1 } },
+    ],
+  })
+  assert.equal(billing.satisfied, true, billing.reason)
+
+  // Same-tenant amount edits on an existing invoice need the invariant event too (the 45-min FP).
+  const sameTenantAmount = assessBusinessLogicImpact({
+    impactClass: 'business_logic',
+    steps: [
+      { id: 'before', arm: 'control', method: 'GET', route: '/api/invoices/i1', status: 200, actor: owner, json: { id: 'i1', amount: 5000 } },
+      { id: 'probe', arm: 'probe', method: 'PATCH', route: '/api/invoices/i1', status: 200, actor: owner, requestJson: { amount: -99999 }, json: { ok: true } },
+      { id: 'after', arm: 'control', method: 'GET', route: '/api/invoices/i1', status: 200, actor: owner, json: { id: 'i1', amount: -99999 } },
+    ],
+  })
+  assert.equal(sameTenantAmount.satisfied, false, sameTenantAmount.reason)
+  assert.match(sameTenantAmount.reason, /caller-supplied amount|invariant event/i)
+})
+
+test('units: a create-time amount overpost is not mass assignment without a catalog or event', () => {
+  const owner = { handle: 'persona_a', role: 'owner' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
+  const steps = [
+    { id: 'control', arm: 'control' as const, method: 'POST', route: '/api/invoices', status: 201, actor: owner, requestJson: { amount: 777 }, json: { id: 'ctl' } },
+    { id: 'read_control', arm: 'control' as const, method: 'GET', route: '/api/invoices/ctl', status: 200, actor: owner, json: { id: 'ctl', amount: 777 } },
+    { id: 'probe', arm: 'probe' as const, method: 'POST', route: '/api/invoices', status: 201, actor: owner, requestJson: { amount: -777 }, json: { id: 'prb' } },
+    { id: 'after', arm: 'probe' as const, method: 'GET', route: '/api/invoices/prb', status: 200, actor: owner, json: { id: 'prb', amount: -777 } },
+  ]
+  // Note: the before/after reads address different resources; persistence alone does not bind a rule.
+  const rejected = assessMassAssignmentImpact({ impactClass: 'mass_assignment', steps })
+  assert.equal(rejected.satisfied, false, rejected.reason)
+  assert.match(rejected.reason, /caller-supplied amount|money value|catalog|invariant event/i)
+
+  const accepted = assessMassAssignmentImpact({ impactClass: 'mass_assignment', steps, oracleEvents: ['invariant_violation'] })
+  assert.equal(accepted.satisfied, true, accepted.reason)
+})
+
+// ---------------------------------------------------------------------------
+// 14. A claim-declared resource tenant cannot manufacture a mirror boundary
+// ---------------------------------------------------------------------------
+
+test('units: a cross-tenant 404 cannot be a boundary for a same-tenant viewer write', () => {
+  const owner = { handle: 'persona_a', role: 'owner' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
+  const other = { handle: 'persona_b', role: 'owner' as const, tenant: 'globex', auth: 'cookie' as const, sameSite: 'Lax' as const }
+  const viewer = { handle: 'viewer', role: 'viewer' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
+
+  // The 45-min FP: viewer writes its own tenant's space; persona_b's 404 is on that same object
+  // (tenant isolation working). The claim declares the resource tenant as globex to look mirrored.
+  const forged = assessAuthorizationImpact({
+    impactClass: 'authorization',
+    resourceTenant: 'globex',
+    steps: [
+      { id: 'owner_before', arm: 'control', method: 'GET', route: '/api/spaces/s1', status: 200, actor: owner, json: { id: 's1', name: 'Alpha' } },
+      { id: 'cross_control', arm: 'control', method: 'PATCH', route: '/api/spaces/s1', status: 404, actor: other, requestJson: { name: 'x' } },
+      { id: 'viewer_patch', arm: 'probe', method: 'PATCH', route: '/api/spaces/s1', status: 200, actor: viewer, requestJson: { name: 'x' } },
+      { id: 'owner_after', arm: 'control', method: 'GET', route: '/api/spaces/s1', status: 200, actor: owner, json: { id: 's1', name: 'x' } },
+    ],
+  })
+  assert.equal(forged.satisfied, false, forged.reason)
+
+  // The legitimate mirrored case: the other tenant owns the object and reads it, then acme writes it.
+  const genuine = assessAuthorizationImpact({
+    impactClass: 'authorization',
+    resourceTenant: 'globex',
+    steps: [
+      { id: 'own_read', arm: 'control', method: 'GET', route: '/api/invoices/i2', status: 200, actor: other, json: { id: 'i2', owner: 'persona_b' } },
+      { id: 'acme_write', arm: 'probe', method: 'PATCH', route: '/api/invoices/i2', status: 200, actor: viewer, requestJson: { status: 'void' } },
+      { id: 'after', arm: 'control', method: 'GET', route: '/api/invoices/i2', status: 200, actor: other, json: { id: 'i2', status: 'void' } },
+    ],
+  })
+  assert.equal(genuine.satisfied, true, genuine.reason)
+})
+
+test('parity: a boundary claim alone cannot confirm a same-tenant viewer write', async () => {
+  const fx = await startFixture()
+  const server = await startRpc(fx)
+  try {
+    const id = (res: RpcResponse) => (res.result as { exchangeId: string }).exchangeId
+    const before = id(await rpc(server, 'http', { path: '/api/projects/p1', persona: 'persona_a' }))
+    const cross = id(await rpc(server, 'http', { path: '/api/projects/p1', method: 'PATCH', body: JSON.stringify({ name: 'x' }), persona: 'persona_b' }))
+    const probe = id(await rpc(server, 'http', { path: '/api/projects/p1', method: 'PATCH', body: JSON.stringify({ name: 'x' }), persona: 'viewer' }))
+    const after = id(await rpc(server, 'http', { path: '/api/projects/p1', persona: 'persona_a' }))
+    const claims: VerifyClaim[] = [
+      { kind: 'status', exchangeId: before, expected: 200 },
+      { kind: 'status', exchangeId: cross, expected: 404 },
+      { kind: 'status', exchangeId: probe, expected: 200 },
+      { kind: 'jsonpath', exchangeId: after, path: 'name', equals: 'x' },
+      { kind: 'boundary', boundaryClass: 'access', controlExchangeId: cross, probeExchangeId: probe },
+    ]
+    const res = oracleFor(server, "Same-tenant viewer can modify another user's private space via PATCH /api/spaces/:id (missing per-object ownership/role check)", claims)
+    assert.equal(res.passed, false, 'a cross-tenant 404 plus a same-tenant write is not impact')
+    assert.match(res.failures.join(' '), /impact: authorization claim|state-changing request|persisted-impact/i)
+  } finally {
+    await server.close()
+    await fx.close()
+  }
 })
