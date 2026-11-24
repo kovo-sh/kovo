@@ -25,6 +25,10 @@ while IFS= read -r wt; do
   [[ "$wt" == "$ROOT" ]] && continue
   branch="$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
   [[ "$branch" == "HEAD" || -z "$branch" ]] && continue
+  # Archived/abandoned streams and other orchestrators' worktrees are not actionable.
+  case "$branch" in
+    agents/engine-port|agents/hybrid|m7-realistic|swarm-*|proto/*) continue;;
+  esac
   ahead="$(git rev-list --count "main..$branch" 2>/dev/null || echo 0)"
   dirty="clean"
   [[ -n "$(git -C "$wt" status --porcelain 2>/dev/null | head -1)" ]] && dirty="dirty"
