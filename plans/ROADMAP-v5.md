@@ -900,3 +900,23 @@ Funnel (`--no-llm`, docker):
 **Recalibration risk flagged (P0):** the stream measured `bd01209` at **26/58** held-out, not 28, with identical site sets except shopflow `settings-secret-disclosure` and `token-secret-disclosure`. On `2621bab` those confirmed because the authenticated `viewer` was served **persona_a's store `9ca676`**; on `bd01209` the same viewer request is served **persona_b's store `6ea2e7`**. The personas table is correct, so a **session/scope binding defect** is serving the wrong tenant — a cross-worker bleed that both costs recall and risks false cross-tenant claims.
 
 **Certificate impact:** the held-out 28/58 figure used in the certificate is **provisional** until a fresh floor audit on current main lands. `persona-binding` has been launched to bisect and fix the bleed; my own dev+held-out floor audit is running now on `16823d6`.
+
+### 2026-11-24 — per-route proof obligation: verify rate 12.5% → **69.2%** (the autopsy's #1 fix)
+
+`proof-gap-route` merged (`1b4b0df`). This is the largest single conversion jump of the cycle.
+
+**Mechanism:** the ledger keeps one obligation per **probed route family** (`METHOD` + ID-normalized path, so `/api/orders/1001` and `/api/orders/1002` collapse but `/api/admin/*` does not). `specSubmissionPending` now requires **every** obligation to be covered by a submitted spec/verify or to carry **its own** coded gap — a gap on route A no longer discharges route B. Assigned Tier-A/chain routes are accepted through `assignedTargetRoutes` and owe proof even if never probed.
+
+- `record_coverage` gained a required `route` argument; a gap binds to exactly one normalized route key, repeats are idempotent, and ambiguous bindings are rejected with `missing required field \`route\`` plus the probed-route list. Persisted reasons keep the machine code first and append `[route=METHOD /path]` for audit.
+- The reserved wrap-up now demands the **highest-value uncovered route** (anomaly → 2xx → probe density), not whichever was probed last.
+- `proofObligationStats()` exposes `{ probedRoutes, coveredRoutes, gapRoutes, demandedRoutes, dischargedByGap }`. The storage-event call site is in `execution.ts` (leased by `spec-authz`), so the callback forwarding is queued behind it — same pattern as the early-exit stat.
+
+| metric (held-out shopflow, 600 s, K=6) | before | after |
+|---|---|---|
+| **route-hit → verify_called** | **2/16 (12.5%)** | **9/13 (69.2%)** |
+| confirmed / precision | 8–9/19 | **10/19, 100%** |
+| cost | — | $0.5998 (29 assignments, 26 investigations) |
+
+Remaining missed route-hit targets: `api-jwt-alg-none`, `giftcard-race`, `coupon-reuse`, `inventory-oversell` — a useful, concrete list for the next capability pass rather than a vague "conversion is bad".
+
+**Expected effect on lift:** with 39 investigations at 12.5% verify we got +1. At ~69% verify the same investigation budget should produce several more confirmed targets — to be measured on the next full matrix once `spec-authz` and `persona-binding` land.
