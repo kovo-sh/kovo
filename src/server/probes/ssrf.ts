@@ -2,8 +2,18 @@
 import type { Grant } from '.././broker.ts'
 import type { CanaryBroker } from '.././canary-broker.ts'
 import { injectParam, isPrivateOrLoopbackHost, responseSimilarity } from './context.ts'
-import type { DiffContext, DiffOutcome } from './context.ts'
+import type { DiffContext, DiffOutcome, InjectedRequest } from './context.ts'
 import type { ProbeModule } from './registry.ts'
+
+/**
+ * Carry the canary token as the broker's correlation id. In a local lab the broker adds it to the
+ * outbound request as `X-Guardian-Trace-Id`, so the recorded exchange itself names the canary that
+ * was injected. That is what lets a callback arriving after the probe window be attributed to this
+ * exact request by the run-level OOB drain (the persisted request body is not indexed for search).
+ */
+function withCanaryCorrelation(req: InjectedRequest, token: string): InjectedRequest {
+  return { ...req, traceId: token } as InjectedRequest & { traceId: string }
+}
 
 
 
@@ -35,15 +45,15 @@ export async function diffCanaryCallback(ctx: DiffContext, canaryBroker: CanaryB
   for (const param of params) {
     const httpCanary = mint(`ssrf:${param}:http`)
     minted.push({ param, variant: 'http', token: httpCanary.token })
-    await send(injectParam({ ...req, param }, httpCanary.httpUrl))
+    await send(withCanaryCorrelation(injectParam({ ...req, param }, httpCanary.httpUrl), httpCanary.token))
     const dnsCanary = mint(`ssrf:${param}:dns`)
     minted.push({ param, variant: 'dns', token: dnsCanary.token })
-    await send(injectParam({ ...req, param }, `http://${dnsCanary.dnsHost}/`))
+    await send(withCanaryCorrelation(injectParam({ ...req, param }, `http://${dnsCanary.dnsHost}/`), dnsCanary.token))
   }
   if (req.injectHeaders) {
     const headerCanary = mint('ssrf:x-forwarded-host')
     minted.push({ param: 'X-Forwarded-Host', variant: 'header', token: headerCanary.token })
-    await send({ method: 'GET', pathAndQuery: req.pathAndQuery, headers: { ...(req.headers ?? {}), 'X-Forwarded-Host': headerCanary.dnsHost } })
+    await send(withCanaryCorrelation({ method: 'GET', pathAndQuery: req.pathAndQuery, headers: { ...(req.headers ?? {}), 'X-Forwarded-Host': headerCanary.dnsHost } }, headerCanary.token))
   }
 
   // In-band fallback: fetch a loopback origin published by the target's own config/discovery route.

