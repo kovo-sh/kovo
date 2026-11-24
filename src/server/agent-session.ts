@@ -520,10 +520,18 @@ export const GUARDIAN_VERIFY_CLASS_HINTS = [
 export const GUARDIAN_VERIFY_REPAIR_INSTRUCTION =
   'On failure read rejectedBy, missingEvidence, and transcriptSummary, then repair the script in the next turn; never abandon the candidate as an open proof gap.'
 
+/**
+ * Compact shape reminder for DeclarativeReplaySpec. Schema validation rejects a spec missing any of
+ * these before the verifier sees it, so the cheapest fix (40–80% of first calls) is emitting the
+ * complete shape on turn 1. Kept short because it rides on every worker prompt.
+ */
+export const GUARDIAN_VERIFY_SPEC_SHAPE =
+  'DeclarativeReplaySpec top-level: version, origin, title, category, cwe, severity, severityRationale, impact, remediation, recheckInstructions, assertionsJq, steps[]; each step needs id, role, description, request{origin, method, pathAndQuery}; add request.persona on control/probe steps when the proof is cross-actor.'
+
 /** Single compact line reused by the agentic prompt context (survives skill-catalog slimming). */
 export function guardianVerifyPromptHint(): string {
   const classes = GUARDIAN_VERIFY_CLASS_HINTS.map(([klass, helper]) => `${klass} -> ${helper}`).join('; ')
-  return `guardian_verify typed helpers: ${classes}. ${GUARDIAN_VERIFY_REPAIR_INSTRUCTION}`
+  return `guardian_verify typed helpers: ${classes}. ${GUARDIAN_VERIFY_REPAIR_INSTRUCTION} ${GUARDIAN_VERIFY_SPEC_SHAPE}`
 }
 
 /** Guidance block appended to the guardian_verify tool description. Bounded for prompt budget. */
@@ -532,8 +540,31 @@ export function guardianVerifyHelperGuidance(): string {
     'Typed helpers (prefer the helper for the class; each records the transcript roles the oracle checks):',
     ...GUARDIAN_VERIFY_HELPERS.map(helper => `- ${helper.name} — ${helper.use}`),
     `Class hints: ${GUARDIAN_VERIFY_CLASS_HINTS.map(([klass, helper]) => `${klass} -> ${helper}`).join('; ')}.`,
+    GUARDIAN_VERIFY_SPEC_SHAPE,
     GUARDIAN_VERIFY_REPAIR_INSTRUCTION,
   ].join('\n')
+}
+
+/**
+ * Render `declarativeReplaySpecSchema` issues for a repair turn. Missing required fields are named
+ * explicitly (the exact `spec.<path>` the worker must add) and the full required shape follows, so
+ * a retry is a one-shot repair instead of another partial spec.
+ */
+export function formatReplaySpecValidationIssues(
+  issues: readonly { path: readonly PropertyKey[]; message: string; code?: string }[],
+  rootLabel = 'spec',
+): string {
+  const missing: string[] = []
+  const lines = issues.map(issue => {
+    const field = `${rootLabel}.${issue.path.map(segment => String(segment)).join('.') || '(root)'}`
+    const absent = issue.code === 'invalid_type' && /received undefined/i.test(issue.message)
+    if (absent) missing.push(field)
+    return absent
+      ? `- ${field}: missing required field (${issue.message})`
+      : `- ${field}: ${issue.message}`
+  })
+  const head = missing.length ? `Missing required field(s): ${missing.join(', ')}.\n` : ''
+  return `${head}${lines.join('\n')}\nRequired shape: ${GUARDIAN_VERIFY_SPEC_SHAPE}`
 }
 
 const GUARDIAN_VERIFY_TOOL_DESCRIPTION_BASE =
@@ -3249,9 +3280,7 @@ export function buildWorkerTools(
         }
         const parsed = declarativeReplaySpecSchema.safeParse(args.replaySpec)
         if (!parsed.success) {
-          for (const i of parsed.error.issues) {
-            errors.push(`- replaySpec.${i.path.join('.') || '(root)'}: ${i.message}`)
-          }
+          errors.push(formatReplaySpecValidationIssues(parsed.error.issues, 'replaySpec'))
         }
         if (errors.length > 0) {
           return {
@@ -3304,12 +3333,11 @@ export function buildWorkerTools(
         if (args.replaySpec !== undefined) {
           const parsed = declarativeReplaySpecSchema.safeParse(args.replaySpec)
           if (!parsed.success) {
-            const issues = parsed.error.issues.map(i => `- replaySpec.${i.path.join('.') || '(root)'}: ${i.message}`).join('\n')
             return {
               isError: true,
               output: [{
                 type: 'text' as const,
-                text: `update_proposed_finding replaySpec validation failed:\n${issues}`,
+                text: `update_proposed_finding replaySpec validation failed:\n${formatReplaySpecValidationIssues(parsed.error.issues, 'replaySpec')}`,
               }],
             }
           }
@@ -3379,7 +3407,7 @@ export function buildWorkerTools(
     const fn = handlers.verify_replay_spec
     tools.push(defineTool({
       name: 'verify_replay_spec',
-      description: 'Execute a DeclarativeReplaySpec synchronously through Guardian’s Zero-LLM ReplayVerifier and return sanitized InlineVerifyFeedback (jqError, failedStepId, spaCatchallMatched, canaryTriggered, stepStatuses, retriesRemaining). Maximum 2 repair retries (3 attempts total) per hypothesis.',
+      description: `Execute a DeclarativeReplaySpec synchronously through Guardian’s Zero-LLM ReplayVerifier and return sanitized InlineVerifyFeedback (jqError, failedStepId, spaCatchallMatched, canaryTriggered, stepStatuses, retriesRemaining). Maximum 2 repair retries (3 attempts total) per hypothesis. ${GUARDIAN_VERIFY_SPEC_SHAPE}`,
       parameters: obj({
         spec: opt(unsafe<Record<string, unknown>>({
           type: 'object',
@@ -3408,12 +3436,11 @@ export function buildWorkerTools(
         }
         const parsed = declarativeReplaySpecSchema.safeParse(rawSpec)
         if (!parsed.success) {
-          const issues = parsed.error.issues.map(i => `- spec.${i.path.join('.') || '(root)'}: ${i.message}`).join('\n')
           return {
             isError: true,
             output: [{
               type: 'text' as const,
-              text: `verify_replay_spec validation failed. Fix these issues and retry:\n${issues}`,
+              text: `verify_replay_spec validation failed. Fix these issues and retry:\n${formatReplaySpecValidationIssues(parsed.error.issues)}`,
             }],
           }
         }

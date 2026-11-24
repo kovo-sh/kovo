@@ -25,13 +25,32 @@ import {
   measureAssignmentBriefBytes,
 } from '../src/server/assignment-brief.ts'
 import {
+  GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+  GUARDIAN_VERIFY_SPEC_SHAPE,
+  formatReplaySpecValidationIssues,
+  guardianVerifyHelperGuidance,
+  guardianVerifyPromptHint,
+} from '../src/server/agent-session.ts'
+import { declarativeReplaySpecSchema } from '../src/replay-spec.ts'
+import {
+  CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS,
+  CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS,
   DRY_ROUND_LIMIT,
   Execution,
+  MULTI_STEP_ASSIGNMENT_MAX_TURNS,
+  MULTI_STEP_ASSIGNMENT_MIN_TURNS,
+  PROVIDER_STALL_ABORT_FLOOR_MS,
   REINVESTIGATION_CAP,
   ReinvestigationGuard,
+  SINGLE_STEP_ASSIGNMENT_MAX_TURNS,
+  SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS,
   coordinatorSchedulerDecision,
   detLeadUnlocksReinvestigation,
+  isMultiStepAssignment,
+  planAssignmentBudget,
+  providerStallAbortMs,
   reinvestigationKey,
+  shouldRetryStalledAssignment,
 } from '../src/server/execution.ts'
 import {
   DET_LEAD_CODE_SLICE_MAX_BYTES,
@@ -371,4 +390,133 @@ test('seedCodeToRuntimeLeads remains usable as a pure helper', async t => {
   assert.equal(created, 1)
   assert.equal(seeded.size, 1)
   assert.equal(seedCodeToRuntimeLeads(storage, run, assignment, [adminHypothesis()], seeded, ORIGIN), 0)
+})
+
+// ============================================================================
+// 6. Spec-shape first-try guidance + exact repair feedback
+// ============================================================================
+
+test('guardian_verify guidance carries the required DeclarativeReplaySpec shape', () => {
+  const hint = guardianVerifyPromptHint()
+  assert.ok(hint.includes(GUARDIAN_VERIFY_SPEC_SHAPE))
+  for (const required of ['severityRationale', 'steps[]', 'description', 'request{origin', 'request.persona']) {
+    assert.ok(hint.includes(required), `prompt hint names ${required}`)
+  }
+  const guidance = guardianVerifyHelperGuidance()
+  assert.ok(guidance.includes('severityRationale'))
+  assert.ok(
+    Buffer.byteLength(guidance, 'utf8') <= GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+    'helper guidance stays inside its prompt budget',
+  )
+})
+
+test('schema rejection names the exact missing field and repeats the required shape', () => {
+  const parsed = declarativeReplaySpecSchema.safeParse({
+    version: 1,
+    origin: ORIGIN,
+    title: 'Missing severity rationale',
+    category: 'injection',
+    cwe: 'CWE-89',
+    severity: 'high',
+  })
+  assert.equal(parsed.success, false)
+  const text = formatReplaySpecValidationIssues(parsed.error!.issues)
+  assert.match(text, /Missing required field\(s\): .*spec\.severityRationale/, 'the missing top-level field is named')
+  assert.match(text, /spec\.steps/, 'the missing steps array is named')
+  assert.ok(text.includes('Required shape: '), 'the repair turn repeats the full shape')
+  assert.ok(text.includes('severityRationale'))
+
+  // Step-level fields are named too (description / request.origin).
+  const stepParsed = declarativeReplaySpecSchema.safeParse({
+    version: 1,
+    origin: ORIGIN,
+    title: 'Step shape',
+    category: 'injection',
+    cwe: 'CWE-89',
+    severity: 'high',
+    severityRationale: 'Differential evidence shows injection.',
+    impact: 'An attacker can read rows.',
+    remediation: 'Parameterize the query.',
+    recheckInstructions: 'Replay the same probe.',
+    assertionsJq: '.probe.status == 200',
+    steps: [{ id: 'probe', role: 'probe', request: { method: 'GET', pathAndQuery: '/api/items/1' } }],
+  })
+  assert.equal(stepParsed.success, false)
+  const stepText = formatReplaySpecValidationIssues(stepParsed.error!.issues)
+  assert.match(stepText, /spec\.steps\.0\.description: missing required field/)
+  assert.match(stepText, /spec\.steps\.0\.request\.origin: missing required field/)
+})
+
+// ============================================================================
+// 7. Turn cap: single-step stays 12; race/multi-step/chain get 20–30
+// ============================================================================
+
+test('race and multi-step assignments get 20–30 turns; single-step stays 12', () => {
+  const single = planAssignmentBudget({
+    routes: ['/api/items/:id'],
+    parentEvidenceIds: [],
+    dependsOnStepIds: [],
+    baseMaxTurns: 25,
+    baseWallClockMs: 160_000,
+  })
+  assert.equal(single.kind, 'single_step')
+  assert.equal(single.maxTurns, SINGLE_STEP_ASSIGNMENT_MAX_TURNS)
+  assert.equal(single.wallClockMs, SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS)
+
+  const race = planAssignmentBudget({
+    routes: ['/api/orders/:id'],
+    parentEvidenceIds: [],
+    dependsOnStepIds: [],
+    multiStep: true,
+    baseMaxTurns: 25,
+    baseWallClockMs: 160_000,
+  })
+  assert.equal(race.kind, 'chain', 'multi-step keeps the long wall cap')
+  assert.ok(race.maxTurns >= MULTI_STEP_ASSIGNMENT_MIN_TURNS && race.maxTurns <= MULTI_STEP_ASSIGNMENT_MAX_TURNS)
+  assert.ok(race.maxTurns >= 20, 'a 20–29 turn race worker is no longer truncated at 12')
+  assert.ok(race.wallClockMs >= CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS)
+  assert.ok(race.wallClockMs <= CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS)
+  assert.equal(race.settlementTurn, race.maxTurns - 2)
+
+  const chain = planAssignmentBudget({
+    routes: ['/a', '/b'],
+    parentEvidenceIds: ['fact-1'],
+    dependsOnStepIds: [],
+    baseMaxTurns: 40,
+    baseWallClockMs: 200_000,
+  })
+  assert.equal(chain.kind, 'chain')
+  assert.ok(chain.maxTurns >= 20 && chain.maxTurns <= 34)
+  assert.ok(chain.wallClockMs <= CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS)
+
+  assert.equal(isMultiStepAssignment({ skills: ['bola-idor-race'] }), true)
+  assert.equal(isMultiStepAssignment({ title: 'Cross-persona BOLA/IDOR matrix' }), true)
+  assert.equal(isMultiStepAssignment({ title: 'det_lead upgrade · authz_matrix PATCH /v3/admin/users/:id', category: 'broken-access-control' }), false)
+})
+
+// ============================================================================
+// 8. Provider-stall watchdog: one bounded requeue + exposed metrics
+// ============================================================================
+
+test('the stall watchdog retries once and exposes providerStallTurns/Retries', async t => {
+  assert.equal(shouldRetryStalledAssignment(0), true)
+  assert.equal(shouldRetryStalledAssignment(1), false, 'one requeue only')
+  assert.equal(shouldRetryStalledAssignment(2), false)
+  assert.equal(providerStallAbortMs(0, 0), 90_000, 'cold streams get the long floor')
+  assert.ok(providerStallAbortMs(2_000, 10) >= PROVIDER_STALL_ABORT_FLOOR_MS)
+
+  const { storage } = makeStore(t, 'guardian-v7-brief-stall-db-')
+  const { runId } = await approvedRun(storage)
+  const execution = new Execution(storage)
+  t.after(() => execution.stop())
+  internals(execution).providerStallTurnsByRun.set(runId, 3)
+  internals(execution).providerStallRetriesByRun.set(runId, 1)
+  internals(execution).recordAssignmentMetrics(runId, 'test')
+  const metrics = execution.getAssignmentThroughput(runId)
+  assert.ok(metrics, 'throughput metrics are readable')
+  assert.equal(metrics!.providerStallTurns, 3)
+  assert.equal(metrics!.providerStallRetries, 1)
+  const event = storage.eventsAfter(runId, 0, 500).find(e => e.kind === 'agentic.assignment_metrics')
+  assert.ok(event, 'metrics are mirrored into a run event')
+  assert.equal((event!.detail as Record<string, unknown>).providerStallRetries, 1)
 })

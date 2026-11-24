@@ -1120,6 +1120,21 @@ export function computeStepMaxTurns(
 export const SINGLE_STEP_ASSIGNMENT_MAX_TURNS = 12
 /** Wall cap for a single-step assignment; a slot must turn over inside ~90 s. */
 export const SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS = 85_000
+/** Multi-step/race assignments need more turns than a single probe (observed 20–29). */
+export const MULTI_STEP_ASSIGNMENT_MIN_TURNS = 20
+export const MULTI_STEP_ASSIGNMENT_MAX_TURNS = 30
+/** Multi-step evidence work: race bursts, cross-persona matrices, workflow/second-order chains. */
+const MULTI_STEP_ASSIGNMENT_RE = /\brace\b|race[_-]|bola|bfla|idor|cross[_-]?persona|multi[_-]?step|second[_-]?order|workflow|business[_-]?logic|chain|escalat/i
+/** Multi-step/race assignments keep the long wall cap (never the 85 s single-step cap). */
+export function isMultiStepAssignment(input: {
+  title?: string
+  hypothesis?: string
+  category?: string | null
+  skills?: readonly string[]
+}): boolean {
+  const skillText = (input.skills ?? []).join(' ')
+  return MULTI_STEP_ASSIGNMENT_RE.test(`${input.title ?? ''} ${input.hypothesis ?? ''} ${input.category ?? ''} ${skillText}`)
+}
 /** Multi-step chains that cite parent evidence keep the long cap (bounded below). */
 export const CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS = 120_000
 export const CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS = 180_000
@@ -1148,6 +1163,8 @@ export interface AssignmentBudgetInput {
   /** Upstream evidence the step cites (`dependsOnFactIds`; the chain signal). */
   parentEvidenceIds: readonly string[]
   dependsOnStepIds: readonly string[]
+  /** Race / cross-persona / multi-step evidence work (see `isMultiStepAssignment`). */
+  multiStep?: boolean
   baseMaxTurns: number
   baseWallClockMs: number
   singleStepWallClockMs?: number
@@ -1162,16 +1179,21 @@ export interface AssignmentBudget {
 }
 
 /**
- * Tight budget for a standalone step, long budget only for a chain that cites upstream evidence.
- * A step that names many routes but cites no evidence is still a standalone assignment: breadth is
- * not depth, and a wall-capped slot is more valuable than a wide, unanchored probe sweep.
+ * Tight budget for a standalone step, long budget for a chain that cites upstream evidence or a
+ * multi-step/race assignment. A step that names many routes but cites no evidence is still a
+ * standalone assignment: breadth is not depth, and a wall-capped slot is more valuable than a
+ * wide, unanchored probe sweep. Race/cross-persona matrices are not breadth — they need 20–30
+ * turns to reach the over-count/denied-control step, so they keep the long wall cap too.
  */
 export function planAssignmentBudget(input: AssignmentBudgetInput): AssignmentBudget {
   const chain = input.parentEvidenceIds.length > 0 || input.dependsOnStepIds.length > 0
+  const multiStep = input.multiStep === true
   const baseTurns = Math.max(4, Math.floor(input.baseMaxTurns))
   const baseWall = Math.max(20_000, Math.round(input.baseWallClockMs))
-  if (chain) {
-    const maxTurns = Math.max(18, Math.min(34, baseTurns))
+  if (chain || multiStep) {
+    const maxTurns = chain
+      ? Math.max(20, Math.min(34, baseTurns))
+      : Math.max(MULTI_STEP_ASSIGNMENT_MIN_TURNS, Math.min(MULTI_STEP_ASSIGNMENT_MAX_TURNS, baseTurns))
     return {
       kind: 'chain',
       maxTurns,
@@ -1218,6 +1240,8 @@ export interface AssignmentThroughputMetrics {
   /** Mean turns per observed investigation assignment. */
   turnsPerAssignment: number
   providerStallTurns: number
+  /** Bounded requeues triggered by the stall watchdog (max one per assignment). */
+  providerStallRetries: number
   turnLatencyP50: number
   turnLatencyP90: number
   containersLaunched: number
@@ -2066,6 +2090,7 @@ export class Execution {
   private readonly assignmentWallByRun = new Map<string, number[]>()
   private readonly turnLatencyByRun = new Map<string, number[]>()
   private readonly providerStallTurnsByRun = new Map<string, number>()
+  private readonly providerStallRetriesByRun = new Map<string, number>()
   private readonly lastAssignmentMetrics = new Map<string, AssignmentThroughputMetrics>()
   /** runId → first agent dispatch time after Phase A, for phase-timing telemetry. */
   private readonly agenticFloorDispatchedAt = new Map<string, number>()
@@ -5518,6 +5543,7 @@ export class Execution {
       assignmentWallSamples: walls.length,
       turnsPerAssignment: turns.length ? Math.round((turns.reduce((sum, n) => sum + n, 0) / turns.length) * 10) / 10 : 0,
       providerStallTurns: this.providerStallTurnsByRun.get(runId) ?? 0,
+      providerStallRetries: this.providerStallRetriesByRun.get(runId) ?? 0,
       turnLatencyP50: turnSummary.p50,
       turnLatencyP90: turnSummary.p90,
       containersLaunched: containers?.created ?? 0,
@@ -5532,7 +5558,7 @@ export class Execution {
       this.storage.event(
         runId,
         'agentic.assignment_metrics',
-        `Phase B throughput: ${metrics.assignmentsCompleted}/${metrics.assignmentsObserved} assignment(s) complete, p50 ${(metrics.assignmentWallP50 / 1000).toFixed(1)}s / p90 ${(metrics.assignmentWallP90 / 1000).toFixed(1)}s, ${metrics.turnsPerAssignment} turn(s)/assignment, ${metrics.providerStallTurns} stall turn(s), ${metrics.containersLaunched} container launch(es) / ${metrics.containersReused} reuse(s).`,
+        `Phase B throughput: ${metrics.assignmentsCompleted}/${metrics.assignmentsObserved} assignment(s) complete, p50 ${(metrics.assignmentWallP50 / 1000).toFixed(1)}s / p90 ${(metrics.assignmentWallP90 / 1000).toFixed(1)}s, ${metrics.turnsPerAssignment} turn(s)/assignment, ${metrics.providerStallTurns} stall turn(s) / ${metrics.providerStallRetries} bounded retry(ies), ${metrics.containersLaunched} container launch(es) / ${metrics.containersReused} reuse(s).`,
         { ...metrics },
       )
     } catch { /* metrics are best-effort */ }
@@ -8179,6 +8205,12 @@ export class Execution {
       routes: this.stepMentionedRoutes(step),
       parentEvidenceIds: step.dependsOnFactIds,
       dependsOnStepIds: step.dependsOnStepIds,
+      multiStep: isMultiStepAssignment({
+        title: step.title,
+        hypothesis: step.hypothesis,
+        category: step.category,
+        skills: step.skills,
+      }),
       baseMaxTurns: stepMaxTurns,
       baseWallClockMs: this.specialistWallClockMs(stepMaxTurns),
       singleStepWallClockMs: singleStepWallClockMs(),
@@ -8247,6 +8279,7 @@ export class Execution {
       if (job.stallAbort) {
         const attempt = job.assignment.attempt
         if (shouldRetryStalledAssignment(attempt)) {
+          this.providerStallRetriesByRun.set(run.id, (this.providerStallRetriesByRun.get(run.id) ?? 0) + 1)
           this.storage.transaction(() => {
             this.storage.updateWorker(assignment.id, {
               status: 'canceled',
@@ -8322,21 +8355,27 @@ export class Execution {
       if (stallTimer) { clearTimeout(stallTimer); stallTimer = undefined }
     }
     const stallAbortMs = () => providerStallAbortMs(percentile(turnLatencies, 50), turnLatencies.length)
+    /** Never let the watchdog outlive the assignment wall: leave 10 s (floor 15 s) to requeue. */
+    const stallDeadlineMs = () => {
+      const remainingWall = Math.max(0, budget.wallClockMs - (Date.now() - startedAt))
+      return Math.min(stallAbortMs(), Math.max(15_000, remainingWall - 10_000))
+    }
     const armStallTimer = (turn: number) => {
       clearStallTimer()
       generationStartedAt = Date.now()
       if (job.stallAbort) return
+      const thresholdMs = stallDeadlineMs()
       stallTimer = setTimeout(() => {
         if (!generationStartedAt) return
         const elapsed = Date.now() - generationStartedAt
         job.stallAbort = true
         try {
           this.storage.event(run.id, 'worker.provider_stall', `Provider stream stalled on turn ${turn} (${Math.round(elapsed / 1000)}s without a response); aborting to free the slot.`, {
-            assignmentId: job.assignment.id, stepId: step.id, turn, elapsedMs: elapsed, thresholdMs: stallAbortMs(),
+            assignmentId: job.assignment.id, stepId: step.id, turn, elapsedMs: elapsed, thresholdMs, stallAbortMs: stallAbortMs(), wallClockMs: budget.wallClockMs,
           })
         } catch { /* telemetry only */ }
         job.controller.abort(new Error('Provider stream stalled.'))
-      }, stallAbortMs())
+      }, thresholdMs)
       stallTimer.unref?.()
     }
     const recordTurnLatency = () => {
