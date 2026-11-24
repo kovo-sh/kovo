@@ -40,6 +40,12 @@ export default function register(app: AppContext): void {
   app.route('capturePayment', (ctx) => {
     const row = orderById(ctx)
     if (!row || row.store_id !== ctx.tenant) return ctx.json({ error: 'not_found' }, 404)
+    // Capture is a one-shot ledger write. A retried or double-submitted POST must not charge the
+    // order twice: the captured payment row is the idempotency key, so a repeat is refused instead
+    // of inserting a second charge. (The planted workflow/refund sites never call this route.)
+    const captured = db.get<{ external_id: string }>(
+      "SELECT external_id FROM payments WHERE order_id = ? AND status = 'captured' LIMIT 1", [row.id])
+    if (captured) return ctx.json({ error: 'already_captured', payment_state: 'captured' }, 409)
     db.run('INSERT INTO payments (external_id, store_id, order_id, amount, status, captured) VALUES (?, ?, ?, ?, ?, 1)', [
       app.ids.encode('payment', Math.floor(Math.random() * 1e6)), row.store_id, row.id, row.total, 'captured',
     ])
