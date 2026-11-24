@@ -230,14 +230,28 @@ export const SPEC_PROOF_GAP_CODES = [
   'out_of_scope',
   'no_reproducible_signal',
 ] as const
-export type SpecProofGapCode = typeof SPEC_PROOF_GAP_CODES[number]
+
+/**
+ * Accepted aliases for the same evidence contracts. Kept out of the canonical list because the
+ * settlement directive is byte-capped to eight codes; `parseProofGapCode` still recognizes them.
+ */
+export const SPEC_PROOF_GAP_ALIASES = [
+  'auth_blocked',
+  'endpoint_not_found',
+  'method_not_allowed',
+  'no_readback_surface',
+  'hardened_or_no_anomaly',
+] as const
+
+export type SpecProofGapCode = typeof SPEC_PROOF_GAP_CODES[number] | typeof SPEC_PROOF_GAP_ALIASES[number]
 
 /** Extract a leading machine-readable proof-gap code, if present (e.g. `no_spec_shape: step request...`). */
 export function parseProofGapCode(reason: string | undefined | null): SpecProofGapCode | null {
   const value = (reason ?? '').trim().toLowerCase()
   if (!value) return null
   const head = value.split(/[^a-z0-9_]+/, 1)[0] ?? ''
-  return (SPEC_PROOF_GAP_CODES as readonly string[]).includes(head) ? head as SpecProofGapCode : null
+  const known: readonly string[] = [...SPEC_PROOF_GAP_CODES, ...SPEC_PROOF_GAP_ALIASES]
+  return known.includes(head) ? head as SpecProofGapCode : null
 }
 
 /** Route evidence captured from the first successful probe: method + path template + param names. */
@@ -255,6 +269,30 @@ export interface SpecProofGapEntry {
   /** Stable `METHOD /family` proof-obligation key this gap is bound to. Required for a coded gap. */
   route?: string
 }
+
+/** Host-observed denial that can substantiate a proof gap without a completed exchange. */
+export type GapDenialKind = 'tier' | 'scope' | 'auth' | 'runtime'
+
+/** One route-scoped gap that failed deterministic validation against the exchange ledger. */
+export interface RejectedProofGap {
+  /** `METHOD normalized/path` the gap was bound to. */
+  key: string
+  code: SpecProofGapCode
+  /** Exact exchange evidence the transcript is missing for this route. */
+  missing: string
+}
+
+/**
+ * `agent.gap_validation` funnel stat: every coded proof gap is either substantiated by the
+ * host-observed Layer-1 exchange ledger for its route or rejected once at settlement.
+ */
+export interface GapValidationStats {
+  accepted: number
+  rejected: number
+  byCode: Record<string, { accepted: number; rejected: number }>
+}
+
+export type GapValidationEvent = GapValidationStats & { type: 'agent.gap_validation' }
 
 /** One route family's proof obligation: probed or assigned, and how it was discharged. */
 export interface ProofRouteObligation {
@@ -411,6 +449,16 @@ export interface RouteAttemptObservation {
   refuted: boolean
   /** SPA catch-all calibration flagged the path (same body for unknown paths, no per-path state). */
   staticCatchAll: boolean
+  /** Approved origin the exchange targeted, when the tool surfaced it. */
+  origin?: string
+  /** Authenticated persona handle that made the exchange, when the tool surfaced it. */
+  persona?: string
+  /** The matrix ran a control arm alongside the probe arm on this route. */
+  control?: boolean
+  /** This exchange was a differential probe arm on this route. */
+  differential?: boolean
+  /** Host-side denial (no exchange reached the app) that can explain a proof gap. */
+  denial?: GapDenialKind
 }
 
 /**
@@ -454,6 +502,9 @@ export interface RouteObservation {
   statuses: readonly number[]
   anomalyCount: number
 }
+
+/** State-changing methods: a non-denied answer is a mutation (not a readable readback). */
+const GAP_MUTATING_METHODS: ReadonlySet<string> = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 
 /**
  * Per-assignment spec-submission ledger. Small, mutable and dependency-free so the tool layer and
@@ -528,6 +579,12 @@ export class SpecSubmissionTracker {
   private readonly routeFamilies = new Map<string, RouteFamilyState>()
   /** Route-scoped coded gaps, at most one per family (idempotent). */
   private readonly gapByRoute = new Map<string, SpecProofGapEntry>()
+  /** First settlement verdict per route gap: rejected once, then accepted (never a loop). */
+  private readonly gapVerdicts = new Map<string, 'accepted' | 'rejected'>()
+  /** Gap-validation totals (accepted/rejected) emitted as `agent.gap_validation`. */
+  private readonly gapStats: GapValidationStats = { accepted: 0, rejected: 0, byCode: {} }
+  /** Origins the run is approved to test; used to substantiate `out_of_scope` gaps. */
+  private readonly approvedOrigins = new Set<string>()
   /** Route keys explicitly demanded (complete_intent rejection or the reserved wrap-up turn). */
   private readonly demandedRoutes = new Set<string>()
   /** Attempts whose spec shape could not be attributed to a route; treated as covering any target. */
@@ -724,6 +781,125 @@ export class SpecSubmissionTracker {
     if (key) this.demandedRoutes.add(key)
   }
 
+  /** Running `agent.gap_validation` totals (copies; the ledger itself stays private). */
+  gapValidationStats(): GapValidationStats {
+    const byCode: Record<string, { accepted: number; rejected: number }> = {}
+    for (const [code, entry] of Object.entries(this.gapStats.byCode)) {
+      byCode[code] = { accepted: entry.accepted, rejected: entry.rejected }
+    }
+    return { accepted: this.gapStats.accepted, rejected: this.gapStats.rejected, byCode }
+  }
+
+  /**
+   * Deterministic settlement gate: every coded `proofGapReason` must be substantiated by the
+   * host-observed Layer-1 exchange ledger for the route it is bound to. A route is rejected at
+   * most once per assignment (`gapVerdicts`), so an unsupported gap cannot loop complete_intent.
+   *
+   * Returns the newly rejected gaps plus the highest-value route the reserved wrap-up turn should
+   * target (an invalid gap is treated as an open obligation for that selection).
+   */
+  validateGapsForSettlement(): { rejected: RejectedProofGap[]; target?: ProofRouteObligation } {
+    const rejected: RejectedProofGap[] = []
+    for (const [key, entry] of this.gapByRoute) {
+      if (!entry.code) continue
+      if (this.gapVerdicts.has(key)) continue
+      const check = this.checkGapEvidence(key, entry.code)
+      if (check.ok) {
+        this.gapVerdicts.set(key, 'accepted')
+        this.recordGapVerdict(entry.code, true)
+      } else {
+        this.gapVerdicts.set(key, 'rejected')
+        this.recordGapVerdict(entry.code, false)
+        rejected.push({ key, code: entry.code, missing: check.missing })
+      }
+    }
+    const target = pickHighestValueRoute(this.obligationList().filter(obligation =>
+      !obligation.covered && (!obligation.gap || this.gapVerdicts.get(obligation.key) === 'rejected')))
+    return { rejected, ...(target ? { target } : {}) }
+  }
+
+  private recordGapVerdict(code: SpecProofGapCode, accepted: boolean): void {
+    if (accepted) this.gapStats.accepted += 1
+    else this.gapStats.rejected += 1
+    const entry = this.gapStats.byCode[code] ?? { accepted: 0, rejected: 0 }
+    if (accepted) entry.accepted += 1
+    else entry.rejected += 1
+    this.gapStats.byCode[code] = entry
+  }
+
+  /**
+   * Evidence contract for each machine-readable code, read only from the host-observed exchange
+   * ledger (status/persona/control/differential/denial). Bodies and worker prose are never read.
+   */
+  private checkGapEvidence(key: string, code: SpecProofGapCode):
+    { ok: true; evidence: string } | { ok: false; missing: string } {
+    const family = this.routeFamilies.get(key)
+    const routeObs = this.observations.filter(observation => proofRouteKey(observation.method, observation.path) === key)
+    const familyObs = family
+      ? this.observations.filter(observation => normalizeRouteFamily(observation.path) === family.family)
+      : routeObs
+    const statuses = routeObs.map(observation => observation.status).filter((status): status is number => status !== null)
+    const denial = statuses.some(status => status === 401 || status === 403)
+    const loginRedirect = statuses.some(status => status >= 300 && status < 400)
+    const personasSucceeded = new Set(routeObs
+      .filter(observation => observation.persona && observation.status !== null && observation.status >= 200 && observation.status < 300)
+      .map(observation => observation.persona!))
+    const mutatingProbe = familyObs.some(observation =>
+      GAP_MUTATING_METHODS.has(observation.method) && (observation.status === null || observation.status < 400))
+    const readableGet = familyObs.some(observation =>
+      observation.method === 'GET' && observation.status !== null && observation.status >= 200 && observation.status < 300)
+    const controlExchange = routeObs.some(observation => observation.control === true)
+    const differentialExchange = routeObs.some(observation => observation.differential === true)
+    const route = family?.route
+
+    switch (code) {
+      case 'no_authenticated_persona':
+      case 'auth_blocked':
+        if (!denial && !loginRedirect) return { ok: false, missing: 'a 401/403 or login-redirect exchange on this route' }
+        if (personasSucceeded.size >= 2) return { ok: false, missing: `fewer than two authenticated personas succeeding on this route (${personasSucceeded.size} succeeded)` }
+        return { ok: true, evidence: `${denial ? '401/403' : 'login-redirect'} denial with ${personasSucceeded.size} authenticated persona(s) succeeding` }
+      case 'endpoint_not_found':
+        if (!routeObs.some(observation => observation.status === 404)) return { ok: false, missing: 'a 404 response on this exact route+method' }
+        return { ok: true, evidence: '404 on the route+method' }
+      case 'method_not_allowed':
+        if (!routeObs.some(observation => observation.status === 405)) return { ok: false, missing: 'a 405 response on this exact route+method' }
+        return { ok: true, evidence: '405 on the route+method' }
+      case 'no_readback_surface':
+        if (!mutatingProbe) return { ok: false, missing: 'at least one non-denied mutating probe (POST/PUT/PATCH/DELETE) on the resource family' }
+        if (readableGet) return { ok: false, missing: 'zero readable GET endpoints in the resource family (a 2xx GET was observed)' }
+        return { ok: true, evidence: 'a mutating probe with no readable GET readback' }
+      case 'hardened_or_no_anomaly':
+      case 'no_reproducible_signal':
+        if (!controlExchange) return { ok: false, missing: 'a control exchange on this route' }
+        if (!differentialExchange) return { ok: false, missing: 'at least one differential probe exchange on this route' }
+        return { ok: true, evidence: 'control + differential probe exchanges on the route' }
+      case 'tier_blocked':
+        if (!routeObs.some(observation => observation.denial === 'tier')) return { ok: false, missing: 'a host tier-denied exchange (Tier 2/3/approval required)' }
+        return { ok: true, evidence: 'a tier-denied exchange' }
+      case 'out_of_scope':
+        if (routeObs.some(observation => observation.denial === 'scope')) return { ok: true, evidence: 'a scope-denied exchange' }
+        if (this.approvedOrigins.size > 0) {
+          if (route?.origin && this.approvedOrigins.has(route.origin)) {
+            return { ok: false, missing: `a route outside the approved origins (${route.origin} is approved)` }
+          }
+          return { ok: true, evidence: 'route outside the approved origin set' }
+        }
+        if (routeObs.length === 0) return { ok: true, evidence: 'route was never reachable inside the approved origin set' }
+        return { ok: false, missing: 'a route outside the approved origins (the route was reached in scope)' }
+      case 'runtime_unavailable':
+        if (routeObs.length === 0) return { ok: true, evidence: 'no exchange was possible on the route' }
+        if (routeObs.some(observation => observation.denial === 'runtime')) return { ok: true, evidence: 'a runtime-denied exchange' }
+        if (statuses.some(status => status >= 200 && status < 300)) return { ok: false, missing: 'evidence that the runtime is unavailable (a 2xx exchange was recorded)' }
+        return { ok: true, evidence: 'no successful exchange on the route' }
+      case 'no_spec_shape':
+      case 'baseline_empty':
+      case 'no_control_path':
+      default:
+        if (routeObs.length === 0) return { ok: false, missing: 'at least one recorded exchange on this route' }
+        return { ok: true, evidence: 'the route was exercised' }
+    }
+  }
+
   private obligationList(): ProofRouteObligation[] {
     const list: ProofRouteObligation[] = []
     for (const family of [...this.routeFamilies.values()].sort((a, b) => a.seq - b.seq)) {
@@ -790,11 +966,15 @@ export class SpecSubmissionTracker {
   noteObservation(input: {
     method?: string
     pathAndQuery?: string
+    origin?: string
     status?: number | null
     bodySha256?: string | null
     anomaly?: boolean
     refuted?: boolean
     staticCatchAll?: boolean
+    persona?: string
+    control?: boolean
+    differential?: boolean
   }): void {
     const route = cleanSpecRoute(input)
     if (!route) return
@@ -814,8 +994,44 @@ export class SpecSubmissionTracker {
       anomaly: input.anomaly === true,
       refuted: input.refuted === true,
       staticCatchAll: input.staticCatchAll === true,
+      ...(route.origin ? { origin: route.origin } : {}),
+      ...(input.persona ? { persona: input.persona } : {}),
+      ...(input.control === true ? { control: true } : {}),
+      ...(input.differential === true ? { differential: true } : {}),
     })
     if (this.observations.length > 64) this.observations.splice(0, this.observations.length - 64)
+  }
+
+  /**
+   * Record a host-side denial (tier/scope/auth/runtime) that reached Guardian but never the app.
+   * This is the transcript evidence that can substantiate a `tier_blocked`/`out_of_scope` gap;
+   * it never increments probe attempts.
+   */
+  noteDenial(input: { method?: string; pathAndQuery?: string; origin?: string; kind: GapDenialKind }): void {
+    const route = cleanSpecRoute(input)
+    if (!route) return
+    this.registerFamily(route)
+    this.observations.push({
+      method: route.method,
+      path: route.path,
+      pathAndQuery: (input.pathAndQuery ?? '').trim().slice(0, 320),
+      status: null,
+      bodySha256: null,
+      anomaly: false,
+      refuted: false,
+      staticCatchAll: false,
+      ...(route.origin ? { origin: route.origin } : {}),
+      denial: input.kind,
+    })
+    if (this.observations.length > 64) this.observations.splice(0, this.observations.length - 64)
+  }
+
+  /** Approved origins for this run (used only to substantiate `out_of_scope`). */
+  noteApprovedOrigins(origins?: readonly string[]): void {
+    for (const origin of origins ?? []) {
+      const clean = (origin ?? '').trim().replace(/\/+$/, '')
+      if (/^https?:\/\//i.test(clean)) this.approvedOrigins.add(clean)
+    }
   }
 
   /** Aggregate the route ledger into the numbers the early-exit predicate and event report. */
@@ -1520,6 +1736,24 @@ export function specSubmissionRequiredMessage(route?: SpecRouteEvidence): string
     `You probed a route but never submitted a guardian_verify/verify_replay_spec result covering it, so a proved/partial conclusion is unsupported. Each probed route owes its own proof; a gap on another route does not discharge this one.`,
     `Repair now: call guardian_verify${routeText} (DeclarativeReplaySpec: ${GUARDIAN_VERIFY_SPEC_SHAPE}), or call record_coverage(status="needs_follow_up"${routeArg}, proofGapReason="<code>") with one machine-readable code from: ${codes}.`,
     'If the hypothesis genuinely cannot be proven, complete_intent(status="blocked") is accepted with a concise reason.',
+  ].join(' ')
+}
+
+/**
+ * Settlement rejection for a coded proof gap that the Layer-1 exchange transcript does not
+ * substantiate. Names the exact missing evidence per route so the reserved wrap-up turn can either
+ * prove the route or record the exchange that justifies the gap.
+ */
+export function gapValidationRejectedMessage(
+  rejected: readonly RejectedProofGap[],
+  route?: SpecRouteEvidence,
+): string {
+  const evidence = rejected.map(gap => `- ${gap.code} on ${gap.key}: missing ${gap.missing}`).join('; ')
+  const routeText = route ? ` for ${route.method} ${route.path}` : ''
+  return [
+    `complete_intent rejected (agent.gap_validation): the coded proof gap is not supported by the recorded Layer-1 exchange transcript (${evidence}).`,
+    `Repair now: call guardian_verify${routeText} (DeclarativeReplaySpec: ${GUARDIAN_VERIFY_SPEC_SHAPE}), or probe the route to record the missing exchange and re-record the proof gap with the same route.`,
+    'Each route gap is validated once per assignment: a repeated unsupported gap will not block completion again. complete_intent(status="blocked") remains accepted.',
   ].join(' ')
 }
 
@@ -3326,6 +3560,19 @@ function observedStaticCatchAll(value: unknown): boolean {
     (calibration as { spaCatchall?: unknown }).spaCatchall === true)
 }
 
+/**
+ * Classify a host-side broker denial. Only used to substantiate a `tier_blocked`/`out_of_scope`/
+ * `runtime_unavailable` gap; the denial message itself is never persisted.
+ */
+function classifyBrokerDenial(error: unknown): GapDenialKind | null {
+  const message = error instanceof Error ? error.message : String(error)
+  if (/tier\s*[0-9]/i.test(message)) return 'tier'
+  if (/outside (the )?(current )?(assignment )?scope|escaped the requested origin|originAllowlist/i.test(message)) return 'scope'
+  if (/persona .*(not approved|not have|resolved|authenticated session)|authentication required/i.test(message)) return 'auth'
+  if (/runtime|not mounted|no such container|ECONNREFUSED|ENOTFOUND/i.test(message)) return 'runtime'
+  return null
+}
+
 export function buildWorkerTools(
   handlers: WorkerToolHandlers,
   scrub: (value: string) => string,
@@ -3347,6 +3594,8 @@ export function buildWorkerTools(
     control?: { terminate?: boolean },
     /** Host-observed route ledger hook. Runs on the raw result, before any text rendering. */
     observe?: (result: unknown) => void,
+    /** Host-side denial hook (tier/scope/auth/runtime) for a failed exchange, before scrubbing. */
+    observeError?: (error: unknown) => void,
   ) => {
     try {
       const result = await fn()
@@ -3360,6 +3609,7 @@ export function buildWorkerTools(
       }
     } catch (error) {
       if (rootSignal.aborted) throw error
+      try { observeError?.(error) } catch { /* denial bookkeeping must never break the error path */ }
       const msg = scrub(error instanceof Error ? error.message : String(error)).slice(0, 1600)
       return {
         isError: true,
@@ -3417,10 +3667,15 @@ export function buildWorkerTools(
         }), signal, undefined, result => specSubmission?.tracker?.noteObservation({
           method: args.method,
           pathAndQuery: args.pathAndQuery,
+          ...(args.origin ? { origin: args.origin } : {}),
+          ...(args.persona ? { persona: args.persona } : {}),
           status: observedStatus(result),
           bodySha256: observedBodySha(result),
           anomaly: observedAnomaly(result),
-        }))
+        }), error => {
+          const kind = classifyBrokerDenial(error)
+          if (kind) specSubmission?.tracker?.noteDenial({ method: args.method, pathAndQuery: args.pathAndQuery, ...(args.origin ? { origin: args.origin } : {}), kind })
+        })
       },
     }))
   }
@@ -3455,6 +3710,8 @@ export function buildWorkerTools(
             specSubmission?.tracker?.noteObservation({
               method: request.method,
               pathAndQuery: request.pathAndQuery,
+              ...(request.origin ? { origin: request.origin } : {}),
+              ...(request.persona ? { persona: request.persona } : {}),
               status: observedStatus(rows[index]),
               bodySha256: observedBodySha(rows[index]),
               anomaly: false,
@@ -3720,6 +3977,8 @@ export function buildWorkerTools(
           specSubmission?.tracker?.noteObservation({
             method: 'GET',
             pathAndQuery: target,
+            ...(args.origin ? { origin: args.origin } : {}),
+            ...(args.persona ? { persona: args.persona } : {}),
             status: null,
             anomaly: anomalies > 0,
             staticCatchAll: observedStaticCatchAll(result),
@@ -3764,10 +4023,18 @@ export function buildWorkerTools(
         return wrapExec('probe_differential', () => fn(args, signal), signal, undefined, result => specSubmission?.tracker?.noteObservation({
           method: args.method ?? 'GET',
           pathAndQuery: args.pathAndQuery,
+          ...(args.origin ? { origin: args.origin } : {}),
+          ...(args.persona ? { persona: args.persona } : {}),
           status: null,
           anomaly: observedAnomaly(result),
           refuted: observedRefutation(result),
-        }))
+          // A differential matrix always runs a control arm alongside the probe arm.
+          control: true,
+          differential: true,
+        }), error => {
+          const kind = classifyBrokerDenial(error)
+          if (kind) specSubmission?.tracker?.noteDenial({ method: args.method ?? 'GET', pathAndQuery: args.pathAndQuery, ...(args.origin ? { origin: args.origin } : {}), kind })
+        })
       },
     }))
   }
@@ -4634,6 +4901,29 @@ export function buildWorkerTools(
       execute: async (args, _api, ctx) => {
         const signal = combineSignal(ctx.abortSignal)
         const snapshot = specSubmission?.tracker?.snapshot()
+        if (snapshot && (args.status === 'proved' || args.status === 'partial')) {
+          // Validate every coded gap against the host-observed exchange ledger for its route.
+          // An unsupported gap is rejected once per route (never a loop) and the next turn is
+          // reserved for guardian_verify or for recording the missing exchange.
+          const gapCheck = specSubmission?.tracker?.validateGapsForSettlement()
+          if (gapCheck && gapCheck.rejected.length > 0) {
+            const count = specSubmission?.tracker?.noteRequired() ?? 0
+            const gapTarget = gapCheck.target
+            const target: SpecRouteEvidence | undefined = gapTarget
+              ? { method: gapTarget.method, path: gapTarget.path, params: [...gapTarget.params], ...(gapTarget.origin ? { origin: gapTarget.origin } : {}) }
+              : (snapshot.obligationTarget ?? snapshot.route)
+            if (target) specSubmission?.tracker?.noteDemand(proofRouteKey(target.method, target.path))
+            specSubmission?.onRequired?.({
+              status: args.status,
+              count,
+              ...(target ? { route: target } : {}),
+            })
+            return {
+              isError: true,
+              output: [{ type: 'text' as const, text: gapValidationRejectedMessage(gapCheck.rejected, target) }],
+            }
+          }
+        }
         if (snapshot && (args.status === 'proved' || args.status === 'partial') && specSubmissionRequiredFor(snapshot)) {
           const count = specSubmission?.tracker?.noteRequired() ?? 0
           // Demand the highest-value uncovered route, never whichever happened to be last.
@@ -4838,6 +5128,16 @@ export interface RunAgentSessionOptions {
    */
   onProofObligation?: (info: ProofObligationEvent) => void
   /**
+   * Coded proof-gap validation totals at session end. Wire this to the `agent.gap_validation` run
+   * event so the funnel distinguishes substantiated gaps from rejected gaming attempts.
+   */
+  onGapValidation?: (info: GapValidationEvent) => void
+  /**
+   * Approved origins for this assignment. Used only to substantiate an `out_of_scope` proof gap
+   * against the transcript; omitted means the scope allowlist is unknown.
+   */
+  approvedOrigins?: readonly string[]
+  /**
    * Tier-A/chain target routes the assignment requires proof for even when the worker never probes
    * them. Each is a route obligation with its own spec/verify or coded gap.
    */
@@ -4868,6 +5168,8 @@ export interface AgentSessionResult {
   specSubmission?: SpecSubmissionSnapshot
   /** Route-scoped proof coverage (`agent.proof_obligation` payload). */
   proofObligation?: ProofObligationStats
+  /** Coded proof-gap adjudication totals (`agent.gap_validation` payload). */
+  gapValidation?: GapValidationStats
   /** Earned early exit (`agent.early_exit`): reason, turns used, evidence count, turns saved. */
   earlyExit?: EarlyExitEvent
   /** Turns the session never spent because settlement started early (0 when it did not). */
@@ -4952,6 +5254,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   /** Shared with the tool layer: route evidence, spec attempts and coded proof gaps. */
   const specTracker = new SpecSubmissionTracker()
   specTracker.noteAssignedRoutes(options.assignedTargetRoutes)
+  specTracker.noteApprovedOrigins(options.approvedOrigins)
   /** Earned early exit; set at most once so the event/stat are never double counted. */
   let earlyExit: EarlyExitEvent | undefined
   /** Turn on which complete_intent was last rejected for a missing spec/gap (repair window). */
@@ -4972,7 +5275,9 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const finish = (result: AgentSessionResult): AgentSessionResult => {
     const stats = specTracker.proofObligationStats()
     try { options.onProofObligation?.({ type: 'agent.proof_obligation', ...stats }) } catch { /* telemetry only */ }
-    return { ...result, proofObligation: stats }
+    const gapValidation = specTracker.gapValidationStats()
+    try { options.onGapValidation?.({ type: 'agent.gap_validation', ...gapValidation }) } catch { /* telemetry only */ }
+    return { ...result, proofObligation: stats, gapValidation }
   }
   /**
    * Evidence-gated early exit, evaluated after every assistant turn. Distinct from the 85% banner:
