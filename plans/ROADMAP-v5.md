@@ -510,3 +510,29 @@ Held-out rerun after fixture hardening (shopflow settings/admin-reviews owner+ad
 | 9 | After Cut 3a parity, go **straight to Cut 3b** on the Engine Lane — do not pause to certify between them | **ACCEPT** | coordinator |
 
 **Solved with #12:** `benchmarks/CHANGELOG.md` records both shopflow hardening changes with the "unintended, non-planted, recall unchanged" rationale, so benchmark mutations stay auditable.
+
+### 2026-11-24 — engine lane merge 1+2: dispatch funnel fixed, Cut 3a partial (measured, not assumed)
+
+**`dispatch-funnel` (merged `5fdd8e0`).** Root causes, in the order the reviewer predicted:
+1. **Multi-trial fanout collapsed the slot pool** (not dedupe): priority steps were expanded 2–3× *before* slot allocation, so 7 planned / 6 slots became 2 hypotheses × 3 trials. Trials are now capped by `multiTrialSurplusSlots = fleet − distinctQueued` (7 or 19 queued on 6 slots ⇒ zero fanout; the M4.8 1-queued-6-slots contract preserved).
+2. Latent: a dry-round/coordinator-done stop could fire with an idle fleet. `evaluateDispatchStop` defers it; `planner.ready_steps_stranded` fires only when a guarded stop would abandon work with an idle fleet.
+3. Latent: unfiltered planner `dependsOnFactIds` left steps `pending` forever. Unknown ids are dropped at enqueue; blocked steps reported as `filteredDep`.
+4. **Opsportal's 1–2/7 had a fourth cause:** a route-scoped 5xx cooldown was treated as an origin `circuit_open`, pausing the whole run at ~161 s with 24 ready steps stranded. `circuitBreakAction` now keeps route cooldowns as evidence and only origin-wide trips pause.
+
+| app | distinct steps dispatched | ready stranded | recall | precision |
+|---|---|---|---|---|
+| opsportal before | 6 (2 hyp × 3 trials) | 24, run **paused** at 161 s | 10/18 | 100% |
+| opsportal after | **19 / 25** | 19 / 12 (wall-clock only) | 10–11/18 | 100% |
+| acme before | 7 | 17 | 13/22 | 100% |
+| acme after | **14** | 11 (wall-clock) | 13/22 | 100% |
+
+Funnel attribution is exact (`planned = enqueued + filtered*`, gap 0 every round), and the ≤11-line `worker-gate.sh` invariant is live.
+
+**`cut3a` (merged `3a8f4a5`) is a deliberate partial, with measured blockers.** What landed: recipe→broker adapter (real broker guards, probeClass, staging headers, host-recorded exchange ids), a planner/record/retest projection (`floor-recipe-engine.ts`), product wiring for `boolean_or_timing`, and a hard `assertNotRecipeWiredLegacyCall` guard.
+
+- Dev floor **34/59** (acme 12, shopflow **12**, opsportal 10), 3 runs, 0 spread, identical site-set hash, 100% precision. The +1 is `product-search-sqli` **via the boolean receipt**, i.e. a genuine product gain from the new path — not a harness trick.
+- Held-out 24/58 @100%, xben 25/25, held-out-saas 20/20 + 20/20 patches.
+- **Authz families stay on legacy because wiring them lost 5 dev confirmations** (routes deny only on bogus ids; writes need the legacy baseline-write/self-state readback). **The strictest variant (deleting the sql branch too) dropped xben to 20/25** — the receipt boolean rule cannot yet express status-only differentials. Reported rather than papered over.
+- `replay-verifier.ts` cannot reach <1.5K yet: 3,866 lines; `http_chain` alone carries 8/33 dev confirmations and patch retest.
+
+Follow-ups created: (a) status-divergent boolean receipt rule in `oracle-invariants.ts`, then delete the sql branch; (b) the no-model fallback in `execution.ts` still proposes sql specs (second producer of the retired path); (c) `scripts/benchmark-live.ts` still calls the legacy verifier.
