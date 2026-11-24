@@ -14,7 +14,7 @@
   - acme-saas **10/22** (floor 9) → **+1** (`acme.invoice-bola`, CWE-639, runtime-confirmed)
   - shopflow **8/19** (floor 8) → **0**
   - opsportal **7/17** (floor 7) → **0**
-- Zero lift is not a model ceiling. It is a **dispatch/portfolio + proof-conversion** failure: Phase B spends its slots on authz matrices, generic surface sweeps and repeated trials, while the floor-missed classes (sqli, jwt, webhook, race, business logic, stored XSS, cache, XXE, redirect) usually have **no brief at all**. The one acme net is the class that did get a right-route brief.
+- Zero lift is not a model ceiling. The event funnel (§3) says held-out dies primarily at **proof conversion after the route is hit**: 23/34 floor-missed targets were requested on the mounted route+method, but only 4/23 produced a replay spec and 1/23 confirmed; 19/23 have `no_spec_submitted`. Coverage is the smaller residual (11/34, of which 8 were dispatched to the wrong route). The two clearest +1s are SQLi probe defects, not dispatch: shopflow `dismissed/true` because the probe’s literal `Item` term is absent from the held-out catalog, and opsportal `dismissed/true` because all three arms were 401 (no persona bound).
 - In-lease fixes implemented: shopflow merchant **owner gates** on `PATCH settings` and `PATCH admin/reviews`, **cart ownership** on `GET cart` / `POST cart items` (including the negative-qty site override), plus four contract tests. These are latent-bug hardenings, **not truth changes**.
 - The target **≥26/58** was not reached deterministically: the clean rerun is **25/58**. The exact engine/verifier patches that would close the remaining gap are in §6; the honest status is an **evidence-backed blocker report** for the +1 and for FP prevention.
 
@@ -39,6 +39,9 @@
 | shopflow | 8/19 | 8/19 | 0 | 100% | 0 | 0/7 | $0.36 |
 | opsportal | 7/17 | 7/17 | 0 | 100% | 0 | 0/7 | $0.49 |
 | **total** | **24/58** | **25/58** | **+1** | **100%** | **0** | **0** | **$1.22** |
+
+A post-fix shopflow rerun (K=6, after §5 hardening) is still **8/19 at 100%, 0 decoy/unmatched**
+($0.58): the app hardening closes the FP sources without trading away a target.
 
 Funnel (confirmed only):
 
@@ -120,102 +123,170 @@ the 3-cell/K=6 schedule and hit `Provider stream stalled; requeued once`; under 
 verifier confirmed 1–2 boundary claims that the K=4 serial reruns left inconclusive. This is a
 precision-variance problem in the proof gate, not a truth problem. It is why §6.5/§6.6 are P0.
 
----
-
-## 3. Zero lift, by app
-
-All three cells have far more floor-missed targets than Phase-B slots. The important column is
-**“brief class present?”**: a target that is never named by the planner/coordinator cannot be found
-by a 600 s agent run.
-
-### 3.1 acme-saas (13 floor misses; 1 confirmed)
-
-| floor-missed target | class | agent brief reached Phase B? | where it died |
-| --- | --- | --- | --- |
-| `acme.invoice-bola` | bola | **yes** — multi-persona BOLA/object sweep | **confirmed (+1)**, control + direct read |
-| `acme.project-search-sqli` | sqli | **no** — only a stale SQLi brief on `/api/queries/run` + `/api/logs/filter` (conventional paths, not `GET /api/search/workspaces`); 0 turns before cap | no probe on the real route |
-| `acme.member-role-privesc` | mass_assignment | partial — “Billing and workspace mass-assignment replay” | hypothesis not confirmed; role field never escalated |
-| `acme.webhook-forgery` | webhook_forgery | partial — “Webhook URL ingestion and OOB SSRF canary” | no signature-bypass; no OOB callback; route is spec-only on this variant |
-| `acme.jwt-none` | jwt | **no** | no brief |
-| `acme.sso-open-redirect` | oauth | yes — “Auth, SSO callback, session boundary” | died in `complete_intent` schema repair (`request.origin/pathAndQuery`) |
-| `acme.reflected-search-xss` | xss_reflected | **no** | no brief |
-| `acme.seat-invariant` | business_logic | **no** | no brief |
-| `acme.credit-double-spend` | race_condition | **no** in clean rerun (hung run had 4 race steps, killed) | no brief |
-| `acme.invite-workflow-skip` | workflow_bypass | **no** | no brief |
-| `acme.legacy-auth-bypass` | auth_bypass | **no** | no brief |
-| `acme.auditlog-secret` | info_disclosure | partial — admin/PII read sweep | not the audit-log route |
-| `acme.export-open-redirect` | open_redirect | partial — exports cross-tenant sweep | tested cross-tenant, not redirect |
-
-Floor summary: `authz 4/34, secret_disclosure 1/9, xxe 1/6, traversal 1/10, mass_assignment 1/8,
-csrf 1/7, sqli 0/17, redirect 0/10, xss 0/10, ssrf 0/12, ssti 0/5, workflow 0/1, webhook 0/1`.
-Agent summary: 16 investigations, 11 complete, 5 paused at the 600 s cap; only the object-read
-class produced a net.
-
-### 3.2 shopflow (11 floor misses; 0 confirmed)
-
-| floor-missed target | class | brief reached Phase B? | where it died |
-| --- | --- | --- | --- |
-| `product-search-sqli` | sqli | **no** | no SQLi brief; floor `sqli 0/17` |
-| `checkout-open-redirect` | open_redirect | **no** | no redirect brief |
-| `review-stored-xss` | xss_stored | yes (det lead) | paused at cap after 10 turns; stored-marker lifecycle not completed |
-| `api-jwt-alg-none` | jwt | **no** | no brief |
-| `storefront-cache-poison` | cache_poisoning | partial (det lead) | ruled out owner-equivalence; cache differential not built |
-| `giftcard-race` | race_condition | **no** | no race brief |
-| `payment-webhook-forgery` | webhook_forgery | **no** | no brief |
-| `product-feed-xxe` | xxe | **no** | no XXE brief |
-| `coupon-reuse` | business_logic | **no** | no brief |
-| `inventory-oversell` | race_condition | **no** | no race brief |
-| `refund-exceeds-payment` | business_logic | **no** | no brief |
-
-Agent slots went to BFLA, mass assignment, BOLA/IDOR, media/SSRF and session/CSRF. Three of six
-completed agents burned 12 turns on `complete_intent` shape errors (“steps must be an array”,
-“needs `origin` inside `request`”, “lowercase step id”), never reaching a proof. One provider stall
-was requeued. This is a **proof-conversion** loss on top of the portfolio miss.
-
-### 3.3 opsportal (10 floor misses; 0 confirmed)
-
-| floor-missed target | class | brief reached Phase B? | where it died |
-| --- | --- | --- | --- |
-| `og.graphql-account-bola` | graphql_bola | yes — GraphQL brief ×3 | orientation only; repeated trials, no probe |
-| `og.dashboard-cache-poison` | cache_poisoning | **no** | no brief |
-| `og.account-bola-write` | idor | partial — BOLA matrix | no persisted write proof |
-| `og.viewer-bfla` | bfla | yes — BFLA brief | `csrf_blocked` / partial |
-| `og.user-mass-assignment` | mass_assignment | yes — mass-assign brief ×2 | refuted (role fields not accepted) |
-| `og.job-csrf` | csrf | **no** | no brief |
-| `og.log-filter-sqli` | sqli | **no** | no brief |
-| `og.backup-webhook-forgery` | webhook_forgery | **no** | no brief |
-| `og.ticket-assign-cross-write` | idor | **no** | no brief (matrix did not reach assign) |
-| `og.integration-ssrf-direct` | ssrf | **no** | no brief |
+**The exact `oracle_rejected_by` gap.** In the 34-target held-out funnel, the only rejection codes
+that exist are `no_route_hit` (11), `no_spec_submitted` (19), `dismissed/true` (2),
+`inconclusive/burst-1` (1), `inconclusive/cross_read` (1) and `confirmed` (1). There is **no**
+`spa_catchall` and **no** `endpoint_not_in_surface` code in any persisted diff. That is the acme FP
+gap: a stale-noun/SPA claim can be confirmed because surface membership is never checked. For the
+shopflow FP the gap is not in the oracle at all — it is the missing app owner gate on the non-target
+merchant routes (fixed in §5); a verifier change would only hide it.
 
 ---
+
+## 3. Held-out autopsy: exact funnel from the events
+
+All numbers below are derived from the kept per-cell `guardian.sqlite` of the clean unified reruns
+(`/tmp/heldout-lift-{acme,shop2,ops}`), joined against `generateVariant(app, 1000042, salt)` and the
+floor scorecard (`/tmp/hfr-final-held-on`, 9/8/7). No log or raw body was read.
+
+**Stage definitions (event-derived):**
+
+| stage | operational definition |
+| --- | --- |
+| `dispatched` | an agent assignment or its board brief names the target’s distinctive static route noun (e.g. `billing-docs`, `hooks`, `journals/filter`); generic segments (`api`, `v1`, `admin`, `auth`, `receive`, …) are excluded |
+| `target_route_hit` | at least one **agent** broker exchange has the target’s method + path (entry or trigger endpoint), matched with the grader’s `endpointMatches`; floor-engine exchanges are excluded |
+| `verify_called` | an **agent** `replay_spec` exists whose step request hits the target route+method |
+| `oracle_rejected_by` | the persisted `last_verification_diff` code (`verdict/failedStepId`); `no_spec_submitted` = route hit but no persisted spec; `no_route_hit` = no agent request on the target |
+| `open_proof_gap` | a finding persisted as `open_proof_gap` and bound to the target route |
+
+`open_proof_gap` is **0 for every floor-missed target in all three cells**: failed agent proofs leave
+a `replay_spec` rejection diff, or no spec at all. They do not become advisories on the target route.
+(The one acme `open_proof_gap` finding, `2a7f8eea`, is the decoy-adjacent `/api/insights` BOLA, not a
+floor-missed target.)
+
+### 3.1 acme-saas — 13 floor misses, 1 confirmed
+
+| target | class | D | route hit (agent reqs) | V | oracle code | open gap |
+| --- | --- | --- | --- | --- | --- | --- |
+| `acme.invoice-bola` | bola | 1 | 1 (14) | 1 | `inconclusive/cross_read` → `confirmed` (retry) | 0 |
+| `acme.project-search-sqli` | sqli | 1 | 0 | 0 | `no_route_hit` | 0 |
+| `acme.member-role-privesc` | mass_assignment | 1 | 1 (9) | 0 | `no_spec_submitted` | 0 |
+| `acme.webhook-forgery` | webhook_forgery | 1 | 1 (1) | 0 | `no_spec_submitted` | 0 |
+| `acme.jwt-none` | jwt | 0 | 0 | 0 | `no_route_hit` | 0 |
+| `acme.sso-open-redirect` | oauth | 1 | 1 (7) | 0 | `no_spec_submitted` | 0 |
+| `acme.reflected-search-xss` | xss_reflected | 0 | 0 | 0 | `no_route_hit` | 0 |
+| `acme.seat-invariant` | business_logic | 0 | 1 (2) | 0 | `no_spec_submitted` | 0 |
+| `acme.credit-double-spend` | race_condition | 1 | 1 (3) | 0 | `no_spec_submitted` | 0 |
+| `acme.invite-workflow-skip` | workflow_bypass | 1 | 0 | 0 | `no_route_hit` | 0 |
+| `acme.legacy-auth-bypass` | auth_bypass | 0 | 1 (1) | 0 | `no_spec_submitted` | 0 |
+| `acme.auditlog-secret` | info_disclosure | 1 | 0 | 0 | `no_route_hit` | 0 |
+| `acme.export-open-redirect` | open_redirect | 1 | 0 | 0 | `no_route_hit` | 0 |
+
+Totals: D **9/13**, route hit **7/13**, verify **1/13**, confirmed **1/13**, open gap **0/13**.
+
+### 3.2 shopflow — 11 floor misses, 0 confirmed
+
+| target | class | D | route hit (agent reqs) | V | oracle code | open gap |
+| --- | --- | --- | --- | --- | --- | --- |
+| `product-search-sqli` | sqli | 1 | 1 (122) | 1 | `dismissed/true` | 0 |
+| `checkout-open-redirect` | open_redirect | 1 | 0 | 0 | `no_route_hit` | 0 |
+| `review-stored-xss` | xss_stored | 1 | 1 (46) | 0 | `no_spec_submitted` | 0 |
+| `api-jwt-alg-none` | jwt | 1 | 1 (7) | 0 | `no_spec_submitted` | 0 |
+| `storefront-cache-poison` | cache_poisoning | 1 | 1 (28) | 0 | `no_spec_submitted` | 0 |
+| `giftcard-race` | race_condition | 1 | 1 (7) | 1 | `inconclusive/burst-1` | 0 |
+| `payment-webhook-forgery` | webhook_forgery | 1 | 1 (6) | 0 | `no_spec_submitted` | 0 |
+| `product-feed-xxe` | xxe | 0 | 1 (1) | 0 | `no_spec_submitted` | 0 |
+| `coupon-reuse` | business_logic | 1 | 1 (9) | 0 | `no_spec_submitted` | 0 |
+| `inventory-oversell` | race_condition | 1 | 0 | 0 | `no_route_hit` | 0 |
+| `refund-exceeds-payment` | business_logic | 1 | 0 | 0 | `no_route_hit` | 0 |
+
+Totals: D **10/11**, route hit **8/11**, verify **2/11**, confirmed **0/11**, open gap **0/11**.
+`product-search-sqli` is **not** a dispatch miss: the agent hit the real route 122 times and called
+verify. The verifier rejected it because the boolean-differential probe’s base term is the literal
+`Item` from another seed; on held-out shopflow the catalog has no `Item` title, so the true arm is
+`results: []` and the false arm is also empty (`sqlRoundSummaries.pass=false` in all 3 rounds). The
+target is still a real SQLi (`title LIKE '%<q>%'` concatenation in
+`apps/shopflow/sites/product-search-sqli/vulnerable.ts`); the probe is not data-grounded.
+
+### 3.3 opsportal — 10 floor misses, 0 confirmed
+
+| target | class | D | route hit (agent reqs) | V | oracle code | open gap |
+| --- | --- | --- | --- | --- | --- | --- |
+| `og.graphql-account-bola` | graphql_bola | 1 | 1 (31) | 0 | `no_spec_submitted` | 0 |
+| `og.dashboard-cache-poison` | cache_poisoning | 0 | 0 | 0 | `no_route_hit` | 0 |
+| `og.account-bola-write` | idor | 1 | 1 (16) | 0 | `no_spec_submitted` | 0 |
+| `og.viewer-bfla` | bfla | 1 | 1 (1) | 0 | `no_spec_submitted` | 0 |
+| `og.user-mass-assignment` | mass_assignment | 1 | 0 | 0 | `no_route_hit` | 0 |
+| `og.job-csrf` | csrf | 1 | 1 (1) | 0 | `no_spec_submitted` | 0 |
+| `og.log-filter-sqli` | sqli | 1 | 1 (46) | 1 | `dismissed/true` | 0 |
+| `og.backup-webhook-forgery` | webhook_forgery | 1 | 1 (2) | 0 | `no_spec_submitted` | 0 |
+| `og.ticket-assign-cross-write` | idor | 1 | 1 (1) | 0 | `no_spec_submitted` | 0 |
+| `og.integration-ssrf-direct` | ssrf | 1 | 1 (1) | 0 | `no_spec_submitted` | 0 |
+
+Totals: D **9/10**, route hit **8/10**, verify **1/10**, confirmed **0/10**, open gap **0/10**.
+`og.log-filter-sqli` reached verify but all three arms were **401 `auth_required`**: the agent’s spec
+did not bind an authenticated persona to a route that requires one. This is a session/proof-conversion
+bug, not a verifier boolean rule.
+
+### 3.4 Aggregate — where held-out actually dies
+
+| stage | acme | shopflow | opsportal | total | share of floor misses |
+| --- | --- | --- | --- | --- | --- |
+| floor misses | 13 | 11 | 10 | **34** | 100% |
+| `dispatched` | 9 | 10 | 9 | **28** | 82.4% |
+| `target_route_hit` | 7 | 8 | 8 | **23** | 67.6% |
+| `verify_called` | 1 | 2 | 1 | **4** | 11.8% |
+| `oracle_rejected_by` (non-confirming) | 1 | 2 | 1 | **4** | 11.8% |
+| `open_proof_gap` | 0 | 0 | 0 | **0** | 0% |
+| confirmed after floor | 1 | 0 | 0 | **1** | 2.9% |
+
+Rejection-code histogram over the 34 targets (a target with a retry can contribute two codes):
+
+| code | count | meaning |
+| --- | --- | --- |
+| `no_route_hit` | 11 | no agent request on the target route+method |
+| `no_spec_submitted` | 19 | route hit, but the agent never produced a persisted replay spec |
+| `dismissed/true` | 2 | boolean SQLi differential failed (shopflow term-grounding, ops 401) |
+| `inconclusive/burst-1` | 1 | race burst did not meet the threshold |
+| `inconclusive/cross_read` | 1 | first authz control on invoice-bola; retry confirmed |
+| `confirmed` | 1 | invoice-bola retry |
+
+**Answer to the reviewer’s question: held-out dies primarily at proof conversion, not at
+randomized-surface hypothesis coverage.** 23/34 targets were actually requested on the mounted
+route+method, but only **4/23 (17.4%)** produced a persisted replay spec, and only **1/23** confirmed.
+The dominant post-dispatch gate is **agent→spec submission** (`no_spec_submitted` 19/23), followed by
+two SQLi validation gaps (`dismissed/true` 2) and one race threshold (`inconclusive/burst-1` 1).
+Coverage is the smaller residual: 11/34 never hit, of which 8 were nominally dispatched but bound to
+the wrong route/param (e.g. acme SQLi brief on `/api/queries/run`, not `/api/search/workspaces`) and
+3 were not dispatched at all. A thin-dispatch fix alone can recover at most those 11; the other 19
+route-hit targets are a **guardian_verify / agent-proof-conversion** problem.
 
 ## 4. Why dev was +1–2 and held-out was 0
 
-1. **Variant route nouns move.** Held-out acme uses `workspaces`, `billing-docs`, `members`,
-   `hooks`, `inquiries`; dev acme uses `spaces`, `invoices`, `people`, `webhooks`, `reports`. Briefs
-   and agent priors that used the dev nouns either miss the real route or hit the SPA fallback. The
-   only held-out net is the agent that bound its proof to the actual `billing-docs` route.
-2. **Threat-model/planner output is the gate.** On dev the threat model seeded named class briefs
-   (admin BFLA, billing mass assignment, BOLA/IDOR, webhook SSRF, SSO, 2FA, reports, invites). On
-   held-out it produced **one** generic step; the deterministic fallback then added “Surface &
-   chain” ×2 and the BOLA/IDOR matrix. When the planner stalls, the run has no class portfolio.
-3. **The BOLA/IDOR matrix saturates the first window.** In the 3-cell run, 5 of the first 6 slots
-   were `resource:members`, `resource:workspaces`, `resource:id` (plus trials 2), all authz. The one
-   SQLi brief had 0 turns at the cap. The matrix is also not target-aware: it re-tests resources
-   whose authz target the floor already confirmed, and it does not reserve a slot for a missed
-   non-authz class.
-4. **Proof conversion is lost to tool schema.** Several completed agents never submitted because
-   `complete_intent` rejected the step shape; one reached a valid proof and then spent the remaining
-   turns resubmitting a repaired shape. This is unrelated to model capability.
-5. **Wall clock / worker stall.** The 3-cell/K=6 run stopped writing at 600 s with six assignments
-   running; the harness waited 16 min and had to be killed. The per-cell wall cap does not abort
-   in-flight provider/worker sessions. This is a reliability blocker for any 3-cell certificate run.
+The dev +2 is one right-route authz proof (acme `invoice-bola`) and one SQLi proof
+(shopflow `product-search-sqli`). Held-out kept the first and lost the second for **two different,
+measured reasons**:
 
-Dev shopflow at current HEAD (another stream's rotation run) got +1 by confirming
-`product-search-sqli` with a CWE-89 claim; the held-out shopflow never received a SQLi brief. That is
-the cleanest A/B for the portfolio explanation.
+1. **The acme net survived because the worker bound the proof to the actual variant noun.**
+   Held-out acme uses `billing-docs`, not dev’s `invoices`; the winning agent used
+   `GET /api/billing-docs/:invId` and got `confirmed` after one `inconclusive/cross_read` retry.
+   Claims that reuse dev nouns fall through to the SPA and are the acme FP archetype (§2.1).
+2. **The shopflow SQLi proof was dispatched, route-hit and verified, then lost at the probe’s data
+   grounding.** The verifier saw `true` and `false` arms both return `results: []` because the probe’s
+   base term is the literal `Item` and the held-out catalog has no `Item` title. The dev catalog does,
+   hence dev +1 and held-out 0. This is the single clearest +1 in the whole autopsy; it is a probe
+   fix (`src/server/probes/injection.ts`), not a dispatch fix.
+3. **Post-dispatch proof conversion dominates.** 23/34 floor-missed targets were requested on the
+   mounted route+method, but 19/23 never produced a persisted replay spec. The assignment outcomes
+   show the causes: `complete_intent` shape errors (`steps` must be an array; `request.origin`,
+   `request.pathAndQuery`, role, lowercase id), `maxTurns` reached during schema repair, and agents
+   stopping at facts/closure without submitting. This is a guardian_verify/SDK conversion gap, not a
+   model ceiling and not dispatch.
+4. **Coverage is a smaller residual (11/34), and 8 of those were nominally dispatched.** The failure
+   is route grounding inside the brief: e.g. acme SQLi was briefed on `/api/queries/run` +
+   `/api/logs/filter` (conventional paths) and never hit `GET /api/search/workspaces`; ops
+   `user-mass-assignment` and shopflow `inventory-oversell`/`refund-exceeds-payment` had a class
+   hypothesis but no request on the target route+method. The separate `dispatch-funnel` stream owns
+   this; it cannot recover the 19 route-hit proof-conversion losses.
+5. **The BOLA/IDOR matrix and wall clock amplify the loss in the 3-cell/K=6 schedule.** Five of the
+   first six slots were `resource:members`/`workspaces`/`id` (plus trials), and the SQLi brief had
+   0 turns at the cap; the run also stalled for 16 min after the 600 s cap with six live assignments.
+   In the serial K=4 reruns the agents got 11–27 completed investigations, so the matrix is a
+   throughput/priority defect, not the only cause.
 
----
+Dev shopflow’s +1 at current HEAD is the same target with a **CWE-89 claim and a catalog term that
+exists**, confirming that the held-out shopflow loss is probe grounding rather than a missing
+capability.
 
 ## 5. In-lease fixes implemented
 
@@ -346,6 +417,50 @@ const timer = setTimeout(() => ac.abort(new Error('assignment_deadline')), Math.
 
 and a final `Promise.race([Promise.all(active), delay(10_000)])` before grading.
 
+### 6.7 Ground the SQLi boolean differential in the target’s own baseline (`src/server/probes/injection.ts`)
+
+**This is the single highest-confidence +1.** Held-out shopflow `product-search-sqli` was dispatched,
+hit 122 times, and verified three times; all three specs were `dismissed/true` with
+`stepBodyPreviews[true] = {"query":"Item' AND 77990=77990-- -","results":[]}` and
+`sqlRoundSummaries[*].pass=false`. The vulnerable query is
+`title LIKE '%${q}%'`, so the injected comment eats the trailing `%'`; a base term that exists in the
+catalog is required for the true arm. Held-out shopflow’s catalog has no `Item` title (dev does).
+
+```ts
+// Before building the true/false pair, call the route once with a benign term and take a term that
+// actually returns rows; fall back to the tautology pair, never to a seed literal.
+const baseline = await broker.fetch({ method, path: withQuery(path, param, ''), persona })
+const tokens = extractResultTokens(baseline.json) // e.g. first title token, length >= 3
+const term = tokens[0] ?? ''
+const trueArm  = term ? `${term}' AND ${k}=${k}-- -` : `' OR '1'='1`
+const falseArm = term ? `${term}' AND ${k}=${k + 1}-- -` : `' AND '1'='2`
+// Require: both 200; true results non-empty; true vs false body/row-count separation. If the baseline
+// is empty, the tautology pair still proves the predicate is injectable.
+```
+
+The same rule must apply to `LIKE`/`ORDER BY`/numeric predicates; a hardcoded base term is the
+defect, not the seed.
+
+### 6.8 Bind an authenticated persona when the route’s safe baseline is 401/403 (`src/server/deterministic-specs.ts`)
+
+Held-out opsportal `og.log-filter-sqli` also reached verify, but every arm was
+`{"error":"auth_required"}` (401) and the diff is `dismissed/true`. The spec never carried a
+`persona`, so the boolean differential compared three identical 401 bodies. On a route whose
+anonymous baseline is 401, the spec builder must select an authenticated persona (the same allowlisted
+session the floor used) and put it on **all** steps:
+
+```ts
+if ([baseline.status, trueStep.status, falseStep.status].every(s => s === 401 || s === 403)) {
+  const p = authenticatedPersonaFor(origin, allowlist) // first persona whose session is valid
+  if (!p) return rejected('probe_precondition_no_session')
+  for (const step of steps) step.request.persona = p.handle
+  return retry(steps) // one retry, then normal oracle
+}
+```
+
+A 401/401/401 differential is a **probe precondition failure**, not a clean negative. With the
+persona bound, `POST /api/journals/filter` is the second +1 candidate.
+
 ---
 
 ## 7. Validation
@@ -355,9 +470,9 @@ and a final `Promise.race([Promise.all(active), delay(10_000)])` before grading.
 | `npm run check` | PASS |
 | `node --test tests/v7-heldout-lift.test.ts` | 4/4 PASS |
 | `scripts/worker-gate.sh` | PASS (66 contract tests) |
-| dev floor seed 1, 3 apps, 0-spread | _filled below_ |
-| xben-25 | _filled below_ |
-| held-out-saas (20/20 + 20/20 patches) | _filled below_ |
+| dev floor seed 1, 3 apps, 0-spread | **33/59 (12/11/10), 100% precision, 0 decoy/unmatched** |
+| xben-25 | **25/25 (100%), 0 FP** |
+| held-out-saas (20/20 + 20/20 patches) | **20/20, 0 FP; patches 20/20 fixed** |
 | held-out unified rerun | **25/58 at 100%** (acme 10, shopflow 8, ops 7) |
 
 The floor/xben/held-out-saas measurements are run from the committed branch after §7 numbers are
@@ -370,9 +485,13 @@ appended; they are not inferred from another worktree.
 - **Target:** held-out unified ≥ floor + 2 (≥26/58) at 100% worst-run precision.
 - **Measured:** **25/58 at 100%** (floor 24 + 1). Worst-run precision across the clean reruns is
   **100%**; the parent's 2-FP run is the only non-clean observation and did not reproduce.
-- **Blocker:** the remaining +1 is a **dispatch/portfolio** gap, not an app/truth gap. The
-  deterministic fixes are §6.1–§6.4; the FP-prevention fix is §6.5. Applying §6.1+§6.2 alone is
-  expected to produce at least one non-authz brief per held-out cell; §6.3 would have put the acme
-  SQLi brief on the real route; §6.4 recovers the 3–5 assignments currently lost to schema repair.
+- **Blocker (measured, not guessed):** the remaining +1 is **proof conversion**, specifically the two
+  SQLi validation defects in §6.7/§6.8. Held-out shopflow `product-search-sqli` is dispatched,
+  route-hit 122 times and verify-called; it is `dismissed/true` because the probe’s literal `Item`
+  term is absent from the held-out catalog (true arm `results:[]`). Held-out opsportal
+  `og.log-filter-sqli` is likewise verify-called and `dismissed/true` because all arms are 401.
+  Fixing **either** general rule should produce 26/58 at 100% precision; no app or truth change is
+  required for those two. The dispatch/portfolio fixes (§6.1–§6.4) remain necessary for the 11
+  no-route-hit targets and the 19 no-spec conversions but are not the shortest path to +1.
 - **No truth inflation:** no ground-truth entry was added for any FP; the shopflow defects were
   fixed in the app, and the acme FP is a verifier over-claim.
