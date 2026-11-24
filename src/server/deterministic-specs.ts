@@ -577,6 +577,18 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
           { method: 'GET', pathAndQuery: read.path }, probePersona, {}, [200, 403, 404],
         ))
       }
+      // Identity-assumption routes persist the acting scope on the caller's own session, so the
+      // proof would leave the instrument acting as the target tenant for every later read. Restore
+      // the baseline after the observation; the assertion only reads c1/p2, so cleanup cannot
+      // weaken it.
+      if (resetBody && probePersona) {
+        steps.push(stepOf(
+          hyp.endpoint.origin, 'w3', 'control',
+          'Authorized actor restores its own identity baseline after the proof',
+          { method: method as RequestParts['method'], pathAndQuery: realPath, jsonBody: resetBody },
+          probePersona, stepExtra, [200, 201, 204],
+        ))
+      }
       const jsonEquals = (stepId: string, field: string, value: string): string =>
         `((.steps.${stepId}.json | if type == "object" then .[${jqStr(field)}] else null end) == ${jqStr(value)})`
       const jsonDiffers = (stepId: string, field: string, value: string): string =>

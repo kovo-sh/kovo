@@ -693,6 +693,37 @@ export function pathHasRedirectHint(path: string): boolean {
   return /(?:^|[/_.-])(?:redirect|return|callback|continue|resume|sso|oauth|authorize|checkout|download|export|next)(?:$|[/_.-])/i.test(path)
 }
 
+/**
+ * Route shapes that hand the caller a new acting identity/scope (impersonation, act-as, tenant
+ * switch). Mutating probes on these routes can change the instrument's *own* session, so their
+ * bodies are restricted to benign content fields and the mass-assignment recipe (which exists to
+ * write scope/privilege fields) is not run there at all. Access control on such a route is still
+ * proven by the authz matrix; nothing is exempt from that.
+ */
+export const IDENTITY_ASSUMPTION_ROUTE_RE =
+  /(?:^|[/_.-])(?:impersonat\w*|act[-_]?as|sudo|assume[-_]?role|switch[-_]?(?:tenant|org|store|user|account)|sts)(?:$|[/_.-])/i
+
+/** Field names that select or change identity/scope rather than describing record content. */
+export function isIdentityAssignmentField(field: string): boolean {
+  const snake = field.replace(/[A-Z]/g, ch => '_' + ch.toLowerCase()).replace(/[-.]/g, '_')
+  return /^(?:is_?_?admin|admin|role|roles|permission|permissions|privilege|privileges|grant|level|tenant|tenant_id|org|org_id|store|store_id|team|team_id|account|account_id|owner|owner_id|scope|acting|act_as|workspace|workspace_id|user|user_id|actor|subject|email)$/.test(snake)
+}
+
+/** Drop identity/scope selectors from a probe body (shallow and one nested object level). */
+export function withoutIdentityFields(body: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const [field, value] of Object.entries(body)) {
+    if (isIdentityAssignmentField(field)) continue
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const nested = withoutIdentityFields(value as Record<string, unknown>)
+      if (Object.keys(nested).length > 0) out[field] = nested
+      continue
+    }
+    out[field] = value
+  }
+  return out
+}
+
 /** A ranking score for triage priority. Pure and stable; no network access. */
 export function endpointRiskScore(endpoint: EngineEndpoint): number {
   const bare = endpoint.pathTemplate.split('?')[0] || '/'
@@ -1386,6 +1417,11 @@ export function enumerateHypotheses(
     const hasIdPath = hasDynamicIdSegment(bare)
     const objectIdParam = inferred.find(p => p.location === 'query' && isObjectIdParam(p))
     const privileged = pathHasPrivilegedHint(bare)
+    // An identity-assumption endpoint (impersonation, act-as, tenant switch) persists the acting
+    // scope on the caller's own session. A probe body must therefore never carry a foreign
+    // identity/scope value there: the server would apply it and every later read by that persona
+    // would silently become another tenant's read.
+    const identityAssumption = IDENTITY_ASSUMPTION_ROUTE_RE.test(bare)
     const siblingEvidence = collectionEvidence.get(
       `${endpoint.origin}|${collectionPathOf(bare) ?? (hasIdPath ? '' : bare)}`,
     )
@@ -1509,9 +1545,15 @@ export function enumerateHypotheses(
         })
         const requiredRole = method === 'GET' ? undefined : authzRequiredRoleFor(privileged, authzOwner, authzOther)
         const score = endpointRiskScore(endpoint) + (hasIdPath || objectIdParam ? 20 : 0) + (privileged ? 15 : 0)
-        const baseBody = mutating && /(?:role|grant|permission|privilege|promote|assign)(?:\/|$)/i.test(bare)
-          ? { ...siblingBody(harvest?.fields ?? [], harvest?.values ?? {}), role: 'admin', grant: 'admin', level: 'admin' }
-          : siblingBody(harvest?.fields ?? [], harvest?.values ?? {})
+        const rawBaseBody = mutating && /(?:role|grant|permission|privilege|promote|assign)(?:\/|$)/i.test(bare)
+          ? { ...siblingBody(observedFields, observedValues), role: 'admin', grant: 'admin', level: 'admin' }
+          // Body evidence comes from the route's own harvest *and* its sibling collection read, so
+          // a write proof carries a real field the target publishes rather than an empty object
+          // (an empty PATCH is an acknowledged no-op and can never show a state delta).
+          : siblingBody(observedFields, observedValues)
+        // Identity-assumption routes accept a scope selector, and the server persists it on the
+        // caller's session. Strip it here so an access probe can never re-scope the instrument.
+        const baseBody = identityAssumption ? withoutIdentityFields(rawBaseBody) : rawBaseBody
         add({
           key: `authz|${endpoint.id}|${objectIdParam?.name ?? (hasIdPath ? 'path' : 'fn')}`,
           endpoint,
@@ -1573,10 +1615,13 @@ export function enumerateHypotheses(
               readbackPath: identity.path,
               readbackPersona: authzOther.handle,
               // The probe itself writes the actor's *own* identity value (no state change); the
-              // replay re-establishes that baseline and then applies the target value.
+              // replay re-establishes that baseline and then applies the target value. On a route
+              // that persists the acting scope on the caller's session, even the "own" value would
+              // rewrite it (and an unreliable own binding could re-scope the instrument), so the
+              // live probe carries benign content only.
               functionState: { bindings, ...(reset.length > 0 ? { reset } : {}), body: targetBody },
               ...(requiredRole ? { authzRequiredRole: requiredRole } : {}),
-              jsonBody: ownBody,
+              jsonBody: identityAssumption ? withoutIdentityFields(ownBody) : ownBody,
               ...(mutating ? { csrfBind: true } : {}),
               risk: score,
             })
@@ -1748,13 +1793,17 @@ export function enumerateHypotheses(
 
     // --- XXE --------------------------------------------------------------------------------
     // Eligibility is wire-format evidence: the route serves XML, or a declared/observed body value
-    // is XML-shaped. The route noun is only a priority tie-breaker.
+    // is XML-shaped. The route's own name is a *format* hint only (a legacy import/feed/SSO route
+    // consumes a document even when the declared surface never ships a sample); the canary probe is
+    // non-destructive and the oracle still has to prove entity resolution, so this never decides a
+    // finding by itself.
     const xmlBodyEvidence = Object.values(observedValues)
       .some(values => values.some(value => classifyValueShape(value) === 'xml'))
     const declaredXmlParam = inferred.some(param =>
       (param.location === 'json' || param.location === 'form') &&
       (paramNameShape(param.name) === 'xml' || param.observedShape === 'xml'))
-    if (method === 'POST' && (observedEvidence.xml === true || xmlBodyEvidence || declaredXmlParam)) {
+    const documentFormatHint = pathHasXmlHint(bare) && !pathHasUrlHint(bare) && !pathHasSearchHint(bare)
+    if (method === 'POST' && (observedEvidence.xml === true || xmlBodyEvidence || declaredXmlParam || documentFormatHint)) {
       add({
         key: `xxe_canary|${endpoint.id}`,
         endpoint,
@@ -1782,7 +1831,13 @@ export function enumerateHypotheses(
           ...published.filter(value => pattern.test(value)),
           ...fallbacks,
         ])].slice(0, 3)
-        return names.map(name => declaredBody.find(p => p.name === name) ?? inferredParam(name, 'json'))
+        return names
+          .map(name => declaredBody.find(p => p.name === name) ?? inferredParam(name, 'json'))
+          // A template/command payload only makes sense in a free-text carrier. Identifiers,
+          // paging and money/number fields cannot hold a rendered expression and their validators
+          // answer with a 5xx, so probing them is noise (and risks an availability trip).
+          .filter(param => isTextualParam(param.name) && paramNameShape(param.name) === 'text' &&
+            param.observedShape !== 'number' && param.observedShape !== 'uuid')
       }
       const templateShaped = Object.values(observedValues).some(values =>
         values.some(value => /\{\{|\$\{|<%|\{%/.test(value)))
@@ -2124,7 +2179,7 @@ export function enumerateHypotheses(
           : objectIdParam ? `${bare}?${encodeURIComponent(objectIdParam.name)}=${encodeURIComponent(ownerId)}`
             : null)
         : null
-    if (massPath) {
+    if (massPath && !identityAssumption) {
       const massFields = observedFields
       const privilegeField = /(role|roles|admin|permission|privilege|grant|level|tenant|tenant_id|owner|owner_id|team|team_id|org|org_id|plan|tier|verified|email_verified|is_admin|visibility|amount|total|price|payment_state|status|state)/i
       const fieldRank = (field: string): number =>
