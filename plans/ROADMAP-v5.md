@@ -1011,3 +1011,18 @@ Dev floor 36/59 (3 runs, 0 spread), xben 25/25, held-out-saas 20/20 + 20/20 patc
 **Independent confirmation of the floor erratum:** this stream measured salted held-out at **26/58** (11/8/7) on a clean tree, matching the cut3b sighting. The 28/58 in the #15 certificate is therefore an artifact of the persona-scope bleed, not current recall.
 
 **Launched `agent-script-proofs`** to do the actual M0-closing work: persist the verified agent proof script + receipt, wire the handler in production, make `verify_replay_spec`/`propose_chain_finding` receipt-first, then delete the legacy branches with parity held.
+
+### 2026-11-24 — `persona-binding` merged (`222bc90`): 26-vs-28 held-out erratum resolved to **28/58 @ 100%**
+
+`persona-binding` merged onto `main` @ `222bc90` (`swarm/persona-binding` @ `052a32f`). What landed:
+- Per-request session jar isolation keyed `(run, assignment, role, persona, session)` in `broker.ts` (+ `persona` forwarding in `scoped-browser.ts`), so `Set-Cookie` rotations never leak across personas even under a shared session label.
+- Fail-closed session-sharing guard (`notePersonaSessionSharing`) rejecting cross-persona session reuse with `BrokerDenied` before wire send + `broker.persona_scope_mismatch` structured event (`canary-broker.ts`).
+- Post-observation `state_restore` cleanup (`arm: 'cleanup'`) in `floor-recipes.ts` `persistedMutation` whenever `args.reset` is set, restoring the `w3` cleanup that `0df720d` (Cut 3b) dropped.
+
+**Measured (docker verifier, serialized, seed `1000042`, grey-box, 600 s cells):**
+- Salted held-out floor (`--no-llm`, budget `$2`): **28/58 (48.3%) — acme 11/22, shopflow 10/19, opsportal 7/17 @ 100% precision**, 0 decoy FPs, 0 unmatched FPs, 0 `broker.persona_scope_mismatch` events.
+- Shopflow held-out agentic repeat (K=6, budget `$5`, `deepseek/deepseek-v4.1-flash-1017`): **10/19 (52.6%)**, 0 decoy FPs, 0 `broker.persona_scope_mismatch`, `audit-confirmation-consistency` 0 conflicts (`12/12` confirmed).
+
+**Erratum resolution:** The 26-vs-28 certificate erratum resolves to **28/58** (`VERIFICATION-v5.md` §V7.1–V7.2 updated from `PROVISIONAL` to `PASS`). The `viewer` persona legitimately owns store `9ca676`; `0df720d` had dropped post-observation `state_restore`, leaving the session pinned to another store for subsequent probes.
+
+**Unrelated follow-up surfaced on the agentic cell:** 1 `agent_only` `http_chain` CWE-639 `unmatchedFalsePositive` on a public storefront read (public attribution field `author` defeating `assessPublicness` + multi-probe read selection / collection-only cross-tenant read gap) — closed in `oracle-invariants.ts` with Tier-0 FP corpus coverage.
