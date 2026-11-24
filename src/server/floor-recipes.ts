@@ -688,6 +688,24 @@ const persistedMutation = defineRecipe<PersistedMutationArgs>('persisted_mutatio
     (after.exchange.status === 404 || after.exchange.status === 410)
   ctx.require(after.exchange.json !== undefined || tombstone, 'post_mutation_read', 'The separate post-mutation GET recorded no JSON body.')
 
+  // An identity-assumption route (impersonate / act-as / tenant switch) pins the acting scope on
+  // the caller's *session*. The reset above re-establishes the actor's own baseline before the
+  // proof; the mutation itself then leaves the caller acting as the target tenant, so every later
+  // read by that persona would be served another tenant's data — the scope bleed. Restore the
+  // baseline again after the observation and before control returns to the run, so no later probe
+  // (by this persona or the next one) is served the wrong tenant.
+  if (args.reset) {
+    await ctx.send({
+      arm: 'cleanup',
+      role: 'state_restore',
+      method: args.reset.method ?? args.method,
+      pathAndQuery: args.pathAndQuery,
+      actor: args.reset.actor ?? args.actor,
+      jsonBody: args.reset.body,
+      ...(args.headers ? { headers: args.headers } : {}),
+    })
+  }
+
   return buildProofReceipt({
     vulnClass: args.vulnClass,
     target: targetOf(args),
