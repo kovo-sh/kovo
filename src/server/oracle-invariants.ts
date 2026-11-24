@@ -129,6 +129,31 @@ export interface ImpactStep {
   responseHeaders?: Record<string, string> | null
   /** Pre-redaction credential fingerprints (sha256 prefixes only) observed in this exchange. */
   secretMatches?: readonly string[]
+  /** Host-recorded wall-clock duration (timing-differential evidence). */
+  durationMs?: number
+}
+
+/**
+ * Evidence models for the injection family. A status change alone is never evidence; these are the
+ * only confirmation signals the shared oracle accepts for SQL/NoSQL/template/command/XXE/traversal.
+ */
+export interface InjectionEvidence {
+  /** Restrict fingerprints to the construct family the proof claims. */
+  family?: InjectionFamily
+  /** Injected parameter name (required for the paired boolean-differential arm). */
+  param?: string
+  /** Paired control/probe rounds (>=2) with a stable structural delta. */
+  rounds?: readonly BooleanDifferentialRound[]
+  /** Host-recorded control/probe durations for a jitter-tolerant timing arm. */
+  timing?: { controlMs: number; probeMs: number }
+  /** A verified out-of-band callback delivered after the injected marker reached the target. */
+  oobDelivered?: boolean
+  /**
+   * The narrow status-only boolean exception: a benign 2xx baseline, a 2xx tautology arm and a
+   * failing contradiction arm that differs only by the boolean predicate. A single malformed
+   * request that turns 200 into 500 is not this shape.
+   */
+  statusBoolean?: { benign: ImpactStep; tautology: ImpactStep; contradiction: ImpactStep }
 }
 
 export interface ImpactInput {
@@ -147,6 +172,8 @@ export interface ImpactInput {
    * nothing.
    */
   credentialPatterns?: readonly string[] | null
+  /** Extra injection-arm evidence (boolean rounds, timing, OOB, status-boolean exception). */
+  injection?: InjectionEvidence
 }
 
 export interface ImpactAssessment {
@@ -208,6 +235,14 @@ function sameRoute(a: ImpactStep, b: ImpactStep): boolean {
   return (a.route ?? '') !== '' && a.route === b.route
 }
 
+/** Same resource tree: equal route family, or a collection readback above the mutated item. */
+function relatedRoute(a: ImpactStep, b: ImpactStep): boolean {
+  const left = routeFamily(a.route ?? a.pathAndQuery ?? '')
+  const right = routeFamily(b.route ?? b.pathAndQuery ?? '')
+  if (!left || !right) return false
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`)
+}
+
 /** True when the probe creates a new collection member (POST with no id-like final segment). */
 function isCreateShapedProbe(step: ImpactStep): boolean {
   if ((step.method ?? '').toUpperCase() !== 'POST') return false
@@ -235,7 +270,7 @@ const MARKUP_CWE_RE = /^CWE-(?:79|80|83)$/i
 // Detection is by machine-readable label only: free-text "SQL injection" stays unmodelled ('other'),
 // as it always has, so a narrative word cannot promote an unrelated claim into an ungated class.
 const INJECTION_CWE_RE = /^CWE-(?:89|564|943)$/i
-const INJECTION_CATEGORY_RE = /^(?:sqli|sql[-_ ]?injection|blind[-_ ]?sqli)$/i
+const INJECTION_CATEGORY_RE = /^(?:sqli|sql[-_ ]?injection|blind[-_ ]?sqli|injection[-_ ]input)$/i
 const DISCLOSURE_RE = /\b(?:disclosure|data[- ]leak|information[- ]leak|leak(?:ed|s|age)?|exposure|expos(?:ed|ure)|sensitive[- ]data|unauthori[sz]ed[- ]read)\b/i
 const DISCLOSURE_CWE_RE = /^CWE-(?:200|359|522|532)$/i
 /**
@@ -547,10 +582,14 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
   const probeRank = roleRank(probe.actor.role)
   const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
   // A successful same-route read by an actor in *another* tenant binds the resource to that tenant.
+  // The control read must be on the same resource tree as the probe (the item route or its parent
+  // collection); a same-tenant `/api/me` read by two actors is not a victim readback for the object
+  // the probe mutated.
   const crossTenantControlRead = controls.some(control =>
     isReadMethod(control.method) &&
     isSuccess(control.status) &&
     control.json !== undefined &&
+    relatedRoute(control, probe) &&
     Boolean(control.actor.tenant && probe.actor.tenant && control.actor.tenant !== probe.actor.tenant))
   // A claim-declared `resourceTenant` is model-supplied; it only counts when a signed control arm
   // corroborates the boundary (a denial on the same route, or a read served to the other tenant).
@@ -589,6 +628,25 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
         satisfied: false,
         reason: `Mutating probe ${mutatingProbe.id} succeeded, but there is no privilege/ownership differential: ${escalationReason || 'the actor is in the resource tenant and no required role is exceeded'}. A same-tenant content write by ${probe.actor.role ?? 'an authenticated actor'} is in policy.`,
         evidence: base,
+      }
+    }
+    // A cross-tenant write needs a peer-entitlement control, not an anonymous 401: an unauthenticated
+    // rejection only proves the login gate works, not that an authenticated tenant's object boundary
+    // was crossed. A control read served to the resource tenant is the other legitimate baseline.
+    if (crossTenant && !vertical && !crossTenantControlRead) {
+      const authenticatedPeerDenial = deniedControls.some(control =>
+        sameRoute(control, mutatingProbe) &&
+        control.actor.handle !== null &&
+        (roleRank(control.actor.role) === null ||
+          roleRank(mutatingProbe.actor.role) === null ||
+          roleRank(control.actor.role)! <= roleRank(mutatingProbe.actor.role)!))
+      if (!authenticatedPeerDenial) {
+        return {
+          required: true,
+          satisfied: false,
+          reason: `Cross-tenant write ${mutatingProbe.id} is backed only by an anonymous/lower-evidence control; an unauthenticated 401 is not a tenant boundary. Add a denied control from an authenticated non-privileged actor in the same tenant as the probe, or a control read served to the resource tenant.`,
+          evidence: base,
+        }
       }
     }
     const persistence = findPersistence(steps, mutatingProbe)
@@ -750,6 +808,15 @@ export function assessReadDisclosure(args: {
   }
   const probeFields = flattenJson(probe.json)
   const controls = steps.filter(step => step.arm === 'control' && step.json !== undefined && step.json !== null)
+  // A public/anonymous read that returns the same body proves nothing about entitlement. Compare
+  // against every anonymous control on the route: the variant body must differ from it.
+  const anonymousBodies = steps
+    .filter(step => step.arm === 'control' && step.actor.handle === null && typeof step.body === 'string' && step.body.length > 0)
+    .map(step => step.body as string)
+  const probeBodyText = typeof probe.body === 'string' ? probe.body : safeJson(probe.json)
+  if (anonymousBodies.some(body => body === probeBodyText)) {
+    return { satisfied: false, fields: [], reason: 'The probe body is byte-identical to an anonymous control read, so the response is public data rather than an entitlement crossing.' }
+  }
   const probeBaseline = steps.find(step =>
     step !== probe &&
     isSuccess(step.status) &&
@@ -772,6 +839,8 @@ export function assessReadDisclosure(args: {
     const value = deRedactIdentity(rawValue.trim())
     if (!value || value === 'null' || value === 'undefined' || value === '0' || value === 'false' || value === 'true') continue
     if (probeIdentities.has(value)) continue
+    // A value an anonymous caller also receives is public, not a protected disclosure.
+    if (anonymousBodies.some(body => body.includes(rawValue) || body.includes(value))) continue
     if (OWNER_SCOPED_RE.test(leaf)) {
       const boundToControl = controlIdentities.has(value) ||
         controls.some(control => control.json != null && deRedactIdentity(flattenJson(control.json).get(path) ?? '') === value)
@@ -1379,6 +1448,264 @@ export function assessBooleanDifferential(input: {
 }
 
 // ---------------------------------------------------------------------------
+// Injection family (SQL/NoSQL/template/command/XXE/traversal)
+// ---------------------------------------------------------------------------
+
+export type InjectionFamily = 'sqli' | 'nosqli' | 'ssti' | 'cmdi' | 'xxe' | 'traversal' | 'injection'
+
+export interface InjectionFingerprintMatch {
+  family: InjectionFamily
+  /** Engine/dialect label (sqlite, postgres, mysql, mssql, oracle, mongo, template, shell, xml, fs). */
+  label: string
+  /** The matched text, bounded to 120 characters. */
+  text: string
+}
+
+/**
+ * Engine/dialect-specific error strings. A generic HTTP 500 (`{"error":"Internal Server Error"}`) is
+ * deliberately absent: only a fingerprint that names the injected construct's engine counts.
+ */
+const INJECTION_FINGERPRINTS: ReadonlyArray<{ family: InjectionFamily; label: string; re: RegExp }> = [
+  { family: 'sqli', label: 'sqlite', re: /\bSQLITE_(?:ERROR|CONSTRAINT|MISUSE|NOTADB)\b|sqlite3\.(?:Operational|Programming|Database)Error/i },
+  { family: 'sqli', label: 'postgres', re: /\b(?:PostgreSQL|pg_query|psycopg2|PG::\w+Error|syntax error at or near|unterminated quoted string|invalid input syntax for)\b/i },
+  { family: 'sqli', label: 'mysql', re: /\b(?:MySqlException|MySQLSyntaxErrorException|ER_PARSE_ERROR|You have an error in your SQL syntax|check the manual that corresponds to your (?:MariaDB|MySQL) server)\b/i },
+  { family: 'sqli', label: 'mssql', re: /\b(?:Microsoft OLE DB Provider for SQL Server|Incorrect syntax near|Unclosed quotation mark after the character string|SQLServerException)\b/i },
+  { family: 'sqli', label: 'oracle', re: /\bORA-\d{4,5}\b/i },
+  { family: 'sqli', label: 'orm', re: /\b(?:SQLAlchemy|sqlalchemy\.exc|PrismaClient(?:KnownRequest)?Error|SequelizeDatabaseError|Knex(?:Timeout)?Error)\b/i },
+  { family: 'nosqli', label: 'mongo', re: /\b(?:Mongo(?:Server|Parse|BulkWrite)Error|BSONTypeError|Cast to (?:ObjectId|number) failed|unknown top level operator|E11000 duplicate key)\b/i },
+  { family: 'ssti', label: 'template', re: /\b(?:TemplateSyntaxError|TemplateNotFound|jinja2\.exceptions|UndefinedError|freemarker\.(?:core|template)|FreeMarker template error|VelocityException|SpelEvaluationException|EL100[0-9]E|ognl\.|OGNL expression|Handlebars|Mustache|SmartyCompilerException|Twig\\Error|Thymeleaf|ERB)\b/i },
+  { family: 'cmdi', label: 'shell', re: /(?:\/bin\/(?:ba)?sh: |sh: \d+: |command not found|unexpected EOF while looking for matching|syntax error near unexpected token)/i },
+  { family: 'xxe', label: 'xml', re: /\b(?:SAXParseException|XMLSyntaxError|lxml\.etree|org\.xml\.sax|XPathEvalError|DOCTYPE is disallowed|Entity .* not defined|external entity)\b/i },
+  { family: 'traversal', label: 'fs', re: /\b(?:ENOENT|EACCES|ELOOP|No such file or directory|PathTraversalException|path traversal)\b/i },
+]
+
+/** First engine-specific fingerprint in `text`, optionally restricted to one construct family. */
+export function matchInjectionFingerprint(
+  text: string,
+  family?: InjectionFamily | null,
+): InjectionFingerprintMatch | null {
+  if (!text) return null
+  const bounded = text.slice(0, 32 * 1024)
+  for (const entry of INJECTION_FINGERPRINTS) {
+    if (family && family !== 'injection' && entry.family !== family) continue
+    const match = entry.re.exec(bounded)
+    if (!match) continue
+    return { family: entry.family, label: entry.label, text: match[0].slice(0, 120) }
+  }
+  return null
+}
+
+/** Response-only text: a fingerprint must come from the server's error, never an echoed request. */
+function responseText(step: ImpactStep): string {
+  const json = step.json === undefined ? '' : safeJson(step.json)
+  return `${step.body ?? ''}\n${json}`.slice(0, 32 * 1024)
+}
+
+function stepText(step: ImpactStep): string {
+  const request = step.requestJson === undefined ? '' : safeJson(step.requestJson)
+  return `${step.method ?? ''} ${step.pathAndQuery ?? ''}\n${responseText(step)}\n${request}`.slice(0, 32 * 1024)
+}
+
+function safeJson(value: unknown): string {
+  try { return JSON.stringify(value) } catch { return '' }
+}
+
+export interface StatusOnlyDivergence {
+  /** True when a probe arm failed (4xx/5xx) and its body carries no engine/parser fingerprint. */
+  statusOnly: boolean
+  reason: string
+  controlId: string | null
+  probeId: string | null
+  controlStatus: number | null
+  probeStatus: number | null
+  fingerprint: InjectionFingerprintMatch | null
+}
+
+/**
+ * Universal status-only guard. A failing probe (4xx/5xx) is never confirmation on its own: the
+ * response must carry an engine/parser fingerprint for the injected construct, or another
+ * evidence-bearing claim (structural differential, timing, OOB, state delta) must stand on its own.
+ * This is class-independent so a bare `2xx -> 5xx` cannot confirm XSS, SSRF, traversal or injection.
+ */
+export function assessStatusOnlyDivergence(steps: readonly ImpactStep[]): StatusOnlyDivergence {
+  const allProbes = steps.filter(step => step.arm === 'probe')
+  const probes = allProbes.filter(step => step.status !== null && step.status >= 400)
+  if (probes.length === 0) {
+    return {
+      statusOnly: false,
+      reason: 'No failing probe arm is part of this evidence set.',
+      controlId: null,
+      probeId: null,
+      controlStatus: null,
+      probeStatus: null,
+      fingerprint: null,
+    }
+  }
+  // A successful probe that returns data or a state delta is independent positive evidence; the
+  // failing sibling is then supporting context (e.g. a race burst's mixed outcomes), not the whole
+  // proof. Only an evidence set whose probe arms *all* failed falls under the status-only ban.
+  const substantive = (step: ImpactStep): boolean => {
+    if (Array.isArray(step.json)) return step.json.length > 0
+    if (step.json !== undefined && step.json !== null && typeof step.json === 'object') {
+      return Object.keys(step.json as Record<string, unknown>).length > 0
+    }
+    const body = (step.body ?? '').trim()
+    return body.length >= 16 && body !== '{}' && body !== '[]' && !/^"(?:ok|success|done)"$/i.test(body)
+  }
+  const hasPositiveProbe = allProbes.some(step =>
+    step.status !== null && step.status >= 200 && step.status < 300 && substantive(step))
+  if (hasPositiveProbe) {
+    return {
+      statusOnly: false,
+      reason: 'A successful probe arm carries data/state evidence; the failing arm is supporting context.',
+      controlId: null,
+      probeId: probes[0]?.id ?? null,
+      controlStatus: null,
+      probeStatus: probes[0]?.status ?? null,
+      fingerprint: null,
+    }
+  }
+  const controls = steps.filter(step => step.arm === 'control' || step.arm === 'setup')
+  for (const probe of probes) {
+    const fingerprint = matchInjectionFingerprint(responseText(probe))
+    if (fingerprint) continue
+    const route = routeFamily(probe.route ?? probe.pathAndQuery ?? '')
+    const control = [...controls].reverse().find(step =>
+      step.status !== null && step.status >= 200 && step.status < 300 &&
+      (!route || routeFamily(step.route ?? step.pathAndQuery ?? '') === route)) ?? null
+    return {
+      statusOnly: true,
+      reason: `The probe returned HTTP ${probe.status} without an engine/parser fingerprint; a status divergence from the control (${control ? `HTTP ${control.status}` : 'no successful control'}) is not proof of injection or any other class.`,
+      controlId: control?.id ?? null,
+      probeId: probe.id,
+      controlStatus: control?.status ?? null,
+      probeStatus: probe.status,
+      fingerprint: null,
+    }
+  }
+  return {
+    statusOnly: false,
+    reason: 'The failing probe arm carries an engine/parser fingerprint.',
+    controlId: null,
+    probeId: probes[0]?.id ?? null,
+    controlStatus: null,
+    probeStatus: probes[0]?.status ?? null,
+    fingerprint: matchInjectionFingerprint(responseText(probes[0]!)),
+  }
+}
+
+function sameInjectionRoute(a: ImpactStep, b: ImpactStep): boolean {
+  return routeFamily(a.route ?? a.pathAndQuery ?? '') === routeFamily(b.route ?? b.pathAndQuery ?? '')
+}
+
+/**
+ * Injection confirmation requires a positive semantic oracle:
+ *  - an engine/dialect error fingerprint present in the probe and absent from every control;
+ *  - a paired boolean differential with a stable structural delta across >=2 rounds;
+ *  - a timing arm outside the control envelope (>3x, control < 1s);
+ *  - a verified out-of-band callback; or
+ *  - the narrow status-only boolean exception (benign 2xx baseline + 2xx tautology + <500
+ *    contradiction, same request shape apart from the predicate).
+ * A single 200 -> 500 (or 200 -> 4xx) transition never confirms.
+ */
+export function assessInjectionImpact(input: ImpactInput): ImpactAssessment {
+  const steps = input.steps
+  const probes = steps.filter(step => step.arm === 'probe')
+  const controls = steps.filter(step => step.arm === 'control')
+  const evidence: Record<string, unknown> = {
+    family: input.injection?.family ?? 'injection',
+    fingerprint: null as InjectionFingerprintMatch | null,
+    booleanRounds: input.injection?.rounds?.length ?? 0,
+    timing: input.injection?.timing ?? null,
+    oobDelivered: input.injection?.oobDelivered === true,
+    statusBoolean: false,
+  }
+  if (probes.length === 0) {
+    return { required: true, satisfied: false, reason: 'Injection claim has no probe arm to assess.', evidence }
+  }
+  const controlText = controls.map(responseText).join('\n')
+  for (const probe of probes) {
+    const text = responseText(probe)
+    const fingerprint = matchInjectionFingerprint(text, input.injection?.family)
+    if (!fingerprint) continue
+    // A control that produces the same engine error is broken infrastructure, not injection.
+    if (matchInjectionFingerprint(controlText, fingerprint.family)) continue
+    evidence.fingerprint = fingerprint
+    return {
+      required: true,
+      satisfied: true,
+      reason: `The probe response carries a ${fingerprint.family}/${fingerprint.label} error fingerprint ("${fingerprint.text}") that no control arm produces; that is a semantic oracle, not a bare status change.`,
+      evidence,
+    }
+  }
+  if (input.injection?.rounds && input.injection.rounds.length >= 2) {
+    const assessment = assessBooleanDifferential({
+      rounds: input.injection.rounds,
+      param: input.injection.param ?? null,
+    })
+    if (assessment.satisfied) {
+      evidence.booleanRounds = input.injection.rounds.length
+      return {
+        required: true,
+        satisfied: true,
+        reason: `Injection boolean differential: ${assessment.reason}`,
+        evidence: { ...evidence, boolean: assessment.evidence },
+      }
+    }
+  }
+  const timing = input.injection?.timing
+  if (timing && timing.controlMs > 0 && timing.probeMs > 0) {
+    if (timing.controlMs < 1_000 && timing.probeMs >= Math.max(1_000, timing.controlMs * 3)) {
+      return {
+        required: true,
+        satisfied: true,
+        reason: `The probe arm took ${timing.probeMs} ms against a ${timing.controlMs} ms control (>3x separation); a jitter-tolerant timing oracle.`,
+        evidence,
+      }
+    }
+  }
+  if (input.injection?.oobDelivered) {
+    return {
+      required: true,
+      satisfied: true,
+      reason: 'A verified out-of-band callback was delivered after the injected marker reached the target.',
+      evidence,
+    }
+  }
+  const statusBoolean = input.injection?.statusBoolean
+  if (statusBoolean) {
+    const { benign, tautology, contradiction } = statusBoolean
+    const benignOk = isSuccess(benign.status)
+    const tautologyOk = isSuccess(tautology.status)
+    const contradictionFails = contradiction.status !== null &&
+      contradiction.status >= 400 && contradiction.status < 500
+    const sameShape = sameInjectionRoute(tautology, contradiction) &&
+      tautology.method.toUpperCase() === contradiction.method.toUpperCase()
+    const contrast = Boolean(
+      stepText(tautology) !== stepText(contradiction) &&
+      /\b(?:AND|OR)\b/i.test(`${tautology.pathAndQuery ?? ''}${safeJson(tautology.requestJson)}`) &&
+      /\b(?:AND|OR)\b/i.test(`${contradiction.pathAndQuery ?? ''}${safeJson(contradiction.requestJson)}`),
+    )
+    if (benignOk && tautologyOk && contradictionFails && sameShape && contrast) {
+      evidence.statusBoolean = true
+      return {
+        required: true,
+        satisfied: true,
+        reason: `Status-only boolean exception: the benign baseline (${benign.status}) and tautology arm (${tautology.status}) are 2xx while the contradiction arm fails (${contradiction.status}) on the same request shape; this is a paired predicate contrast, not a single malformed request.`,
+        evidence,
+      }
+    }
+  }
+  const divergence = assessStatusOnlyDivergence(steps)
+  return {
+    required: true,
+    satisfied: false,
+    reason: `Injection claim has no positive semantic oracle: ${divergence.reason} Add an engine/dialect error fingerprint, a paired boolean differential with a stable structural delta, a >3x timing arm, a verified OOB callback, or the paired status-boolean contrast (benign 2xx baseline + 2xx tautology + <500 contradiction).`,
+    evidence: { ...evidence, statusOnly: divergence.statusOnly, statusReason: divergence.reason },
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Markup / script execution
 // ---------------------------------------------------------------------------
 
@@ -1528,6 +1855,8 @@ export function assessImpactEvidence(input: ImpactInput): ImpactAssessment {
       return assessBusinessLogicImpact(input)
     case 'markup':
       return assessMarkupImpact(input)
+    case 'injection':
+      return assessInjectionImpact(input)
     default:
       return { required: false, satisfied: true, reason: 'Not an authorization/impact claim.' }
   }

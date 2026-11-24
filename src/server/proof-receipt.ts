@@ -14,7 +14,14 @@
  */
 import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
-import { assessBooleanDifferential, assessImpactEvidence, knownOracleEvent } from './oracle-invariants.ts'
+import {
+  assessBooleanDifferential,
+  assessImpactEvidence,
+  assessStatusOnlyDivergence,
+  knownOracleEvent,
+  routeFamily,
+  stepMutatesState,
+} from './oracle-invariants.ts'
 import type { BooleanDifferentialArm, BooleanDifferentialRound, ImpactClass, ImpactInput, ImpactStep, RoleName } from './oracle-invariants.ts'
 
 export const receiptIdSchema = z.string().trim().min(1).max(128)
@@ -89,7 +96,7 @@ export interface ReceiptVerification {
   confirmed: boolean
   vulnClass: string
   /** Rule family used to validate the receipt. */
-  rule: 'impact' | 'oob' | 'timing' | 'boolean' | 'browser' | 'none'
+  rule: 'impact' | 'oob' | 'timing' | 'boolean' | 'browser' | 'redirect' | 'none'
   reason: string
   observed: string
   expected: string
@@ -99,6 +106,7 @@ export interface ReceiptVerification {
 const OOB_CLASS_RE = /^(?:ssrf|xxe|blind_ssrf|blind_xxe|oob|webhook_forgery)$/i
 const TIMING_CLASS_RE = /^(?:blind_sqli|sqli_time|sql_time|timing|race)$/i
 const BOOLEAN_CLASS_RE = /^(?:sqli|sql_boolean|sql_boolean_diff|boolean_sqli|boolean_differential)$/i
+const REDIRECT_CLASS_RE = /^(?:open_redirect|redirect|url_redirect|unvalidated_redirect)$/i
 
 const IMPACT_CLASS_BY_VULN: Readonly<Record<string, ImpactClass>> = {
   bola: 'authorization',
@@ -124,6 +132,19 @@ const IMPACT_CLASS_BY_VULN: Readonly<Record<string, ImpactClass>> = {
   disclosure: 'disclosure',
   info_disclosure: 'disclosure',
   secret_disclosed: 'disclosure',
+  // Injection family: the oracle needs an engine fingerprint, a paired boolean/timing arm or OOB
+  // evidence. A bare 2xx -> 4xx/5xx transition is rejected like every other class.
+  injection: 'injection',
+  'injection-input': 'injection',
+  injection_input: 'injection',
+  nosqli: 'injection',
+  nosql_injection: 'injection',
+  ssti: 'injection',
+  template_injection: 'injection',
+  command_injection: 'injection',
+  cmdi: 'injection',
+  path_traversal: 'injection',
+  directory_traversal: 'injection',
 }
 
 /** Classify a receipt's vulnerability label into the shared impact model (or a non-impact rule). */
@@ -131,6 +152,7 @@ export function receiptRuleFor(vulnClass: string): { rule: ReceiptVerification['
   if (OOB_CLASS_RE.test(vulnClass)) return { rule: 'oob' }
   if (BOOLEAN_CLASS_RE.test(vulnClass)) return { rule: 'boolean' }
   if (TIMING_CLASS_RE.test(vulnClass)) return { rule: 'timing' }
+  if (REDIRECT_CLASS_RE.test(vulnClass)) return { rule: 'redirect' }
   const impactClass = IMPACT_CLASS_BY_VULN[vulnClass.toLowerCase()]
   if (impactClass) return { rule: 'impact', impactClass }
   if (/^browser_|^dom_|^postmessage/i.test(vulnClass)) return { rule: 'browser' }
@@ -154,6 +176,23 @@ function normalizePath(value: string | undefined): string {
 
 function routeOf(step: ImpactStep): string {
   return normalizePath(step.route ?? step.pathAndQuery ?? '')
+}
+
+function headerValue(headers: Record<string, string> | null | undefined, name: string): string | null {
+  if (!headers) return null
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === name.toLowerCase() && typeof value === 'string' && value.length > 0) return value
+  }
+  return null
+}
+
+function locationOf(step: ImpactStep): string | null {
+  return headerValue(step.responseHeaders, 'location')
+}
+
+function hostOf(value: string | null, base?: string | null): string | null {
+  if (!value) return null
+  try { return new URL(value, base ?? 'http://guardian.invalid').host.toLowerCase() } catch { return null }
 }
 
 /**
@@ -296,8 +335,8 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     if (controls.length === 0 || probes.length === 0) {
       return reject(receipt, rule, 'A timing receipt needs at least one control arm and one probe arm.')
     }
-    const controlMs = Math.max(...controls.map(entry => entry.durationMs ?? 0))
-    const probeMs = Math.max(...probes.map(entry => entry.durationMs ?? 0))
+    const controlMs = Math.max(...controls.map(entry => entry.durationMs ?? entry.step.durationMs ?? 0))
+    const probeMs = Math.max(...probes.map(entry => entry.durationMs ?? entry.step.durationMs ?? 0))
     if (controlMs <= 0 || probeMs <= 0) return reject(receipt, rule, 'Timing receipt exchanges must record their wall-clock duration.')
     if (controlMs >= 1_000) return reject(receipt, rule, `The control took ${controlMs} ms, so a delay is not distinguishable from normal latency.`)
     if (probeMs < Math.max(1_000, controlMs * 3)) {
@@ -331,9 +370,59 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     }
   }
 
+  if (rule === 'redirect') {
+    if (receipt.exchangeIds.length === 0) return reject(receipt, rule, 'A redirect receipt needs at least one recorded exchange.')
+    const entries = receipt.exchangeIds.map(id => entriesById.get(id)!)
+    const probe = entries.find(entry => entry.step.arm === 'probe') ?? entries[entries.length - 1]!
+    const location = locationOf(probe.step)
+    if (!location) return reject(receipt, rule, 'The cited exchange carries no Location header; a 3xx status alone is not an open redirect.')
+    const targetHost = hostOf(receipt.target.origin)
+    const locationHost = hostOf(location, receipt.target.origin)
+    if (!locationHost || locationHost === targetHost) {
+      return reject(receipt, rule, 'The redirect stays on the target origin (or has no host); a local 3xx is not an open redirect.')
+    }
+    const controlLocations = entries
+      .filter(entry => entry !== probe)
+      .map(entry => locationOf(entry.step))
+      .filter((value): value is string => Boolean(value))
+    if (controlLocations.includes(location)) {
+      return reject(receipt, rule, 'The control arm redirects to the same off-origin destination, so the destination is not attacker-controlled.')
+    }
+    const canaryPattern = (receipt.proofPatterns ?? []).find(pattern => {
+      try { return new RegExp(pattern).test(location) } catch { return false }
+    })
+    return {
+      confirmed: true,
+      vulnClass: receipt.vulnClass,
+      rule,
+      reason: `The probe response redirects to an off-origin host (${locationHost}) that no control arm reaches${canaryPattern ? ' and the Location matches the proof-declared canary host' : ''}; the 3xx is backed by a destination change, not status alone.`,
+      observed: receipt.claimedDelta,
+      expected: 'the marker-bearing request stays local',
+      evidence: { locationHost, canaryPattern: canaryPattern ?? null },
+    }
+  }
+
   // Impact rules: re-run the shared oracle model over the recorded steps.
   if (receipt.exchangeIds.length === 0) return reject(receipt, rule, 'An impact receipt needs at least one recorded exchange.')
   const steps = receipt.exchangeIds.map(id => entriesById.get(id)!.step)
+  const statusOnly = assessStatusOnlyDivergence(steps)
+  if (statusOnly.statusOnly) {
+    return reject(receipt, rule, `Bare status-only divergence (${statusOnly.controlStatus ?? 'no control'} -> ${statusOnly.probeStatus}): ${statusOnly.reason} A 4xx/5xx probe is only supporting evidence; confirmation needs a fingerprint, structural differential, timing arm, state delta or OOB callback.`)
+  }
+  // Bind the receipt target to the mutating exchange the claim actually made: a GET used as a
+  // readback baseline must never become the finding's route for a write.
+  const mutatingProbe = steps.find(step =>
+    step.arm === 'probe' && stepMutatesState(step) && step.status !== null && step.status >= 200 && step.status < 300)
+  if (mutatingProbe && receipt.target.pathAndQuery) {
+    const targetRoute = normalizePath(receipt.target.pathAndQuery)
+    const probeRoute = routeOf(mutatingProbe)
+    if (targetRoute && probeRoute && probeRoute !== targetRoute) {
+      return reject(receipt, rule, `The receipt target (${targetRoute}) is not the mutating probe exchange (${probeRoute}); a readback/GET used as evidence must not become the finding route.`)
+    }
+    if (receipt.target.method && receipt.target.method.toUpperCase() !== mutatingProbe.method.toUpperCase()) {
+      return reject(receipt, rule, `The receipt target method (${receipt.target.method}) is not the mutating probe method (${mutatingProbe.method}); a read used as evidence must not become the write's finding method.`)
+    }
+  }
   const oracleEvents = (receipt.oracleEvents ?? []).filter(knownOracleEvent)
   const input: ImpactInput = {
     impactClass: impactClass!,
