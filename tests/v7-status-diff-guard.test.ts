@@ -320,6 +320,17 @@ test('status-diff guard: cross-tenant writes need an authenticated peer control'
     steps: [peerDeny, before, write, after],
   })
   assert.equal(peerControlled.satisfied, true, peerControlled.reason)
+
+  // A collection readback above the mutated item is still the victim's evidence: the shopflow
+  // shipment write reads `GET /api/shipments` and patches `PATCH /api/shipments/:id`.
+  const listBefore = step({ id: 'list-before', arm: 'control', method: 'GET', status: 200, route: '/api/shipments', actor: ownerB, json: { shipments: [{ id: 3, status: 'packed' }] } })
+  const itemWrite = step({ id: 'item-write', arm: 'probe', method: 'PATCH', status: 200, route: '/api/shipments/3', actor: viewer, requestJson: { status: 'shipped' }, json: { ok: true } })
+  const listAfter = step({ id: 'list-after', arm: 'control', method: 'GET', status: 200, route: '/api/shipments', actor: ownerB, json: { shipments: [{ id: 3, status: 'shipped' }] } })
+  const collectionReadback = assessImpactEvidence({
+    impactClass: 'authorization',
+    steps: [listBefore, itemWrite, listAfter],
+  })
+  assert.equal(collectionReadback.satisfied, true, collectionReadback.reason)
 })
 
 test('status-diff guard: the receipt target is bound to the mutating exchange, not a GET baseline', () => {

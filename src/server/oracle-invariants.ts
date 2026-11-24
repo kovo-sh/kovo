@@ -1495,10 +1495,15 @@ export function matchInjectionFingerprint(
   return null
 }
 
-function stepText(step: ImpactStep): string {
+/** Response-only text: a fingerprint must come from the server's error, never an echoed request. */
+function responseText(step: ImpactStep): string {
   const json = step.json === undefined ? '' : safeJson(step.json)
+  return `${step.body ?? ''}\n${json}`.slice(0, 32 * 1024)
+}
+
+function stepText(step: ImpactStep): string {
   const request = step.requestJson === undefined ? '' : safeJson(step.requestJson)
-  return `${step.method ?? ''} ${step.pathAndQuery ?? ''}\n${step.body ?? ''}\n${json}\n${request}`.slice(0, 32 * 1024)
+  return `${step.method ?? ''} ${step.pathAndQuery ?? ''}\n${responseText(step)}\n${request}`.slice(0, 32 * 1024)
 }
 
 function safeJson(value: unknown): string {
@@ -1562,7 +1567,7 @@ export function assessStatusOnlyDivergence(steps: readonly ImpactStep[]): Status
   }
   const controls = steps.filter(step => step.arm === 'control' || step.arm === 'setup')
   for (const probe of probes) {
-    const fingerprint = matchInjectionFingerprint(stepText(probe))
+    const fingerprint = matchInjectionFingerprint(responseText(probe))
     if (fingerprint) continue
     const route = routeFamily(probe.route ?? probe.pathAndQuery ?? '')
     const control = [...controls].reverse().find(step =>
@@ -1585,7 +1590,7 @@ export function assessStatusOnlyDivergence(steps: readonly ImpactStep[]): Status
     probeId: probes[0]?.id ?? null,
     controlStatus: null,
     probeStatus: probes[0]?.status ?? null,
-    fingerprint: matchInjectionFingerprint(stepText(probes[0]!)),
+    fingerprint: matchInjectionFingerprint(responseText(probes[0]!)),
   }
 }
 
@@ -1618,9 +1623,9 @@ export function assessInjectionImpact(input: ImpactInput): ImpactAssessment {
   if (probes.length === 0) {
     return { required: true, satisfied: false, reason: 'Injection claim has no probe arm to assess.', evidence }
   }
-  const controlText = controls.map(stepText).join('\n')
+  const controlText = controls.map(responseText).join('\n')
   for (const probe of probes) {
-    const text = stepText(probe)
+    const text = responseText(probe)
     const fingerprint = matchInjectionFingerprint(text, input.injection?.family)
     if (!fingerprint) continue
     // A control that produces the same engine error is broken infrastructure, not injection.
