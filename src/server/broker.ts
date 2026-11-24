@@ -184,6 +184,11 @@ export interface BrokerExchangeResult {
    */
   secretMatches?: SecretMatch[]
   tls?: TlsMetadata
+  /**
+   * Set when this exchange withheld a credential that belonged to another persona. Consumers must
+   * treat the exchange as evidence-invalid: it says nothing about the declared persona's scope.
+   */
+  personaScopeMismatch?: true
   observation: PublicObservation
 }
 
@@ -402,6 +407,11 @@ const sessionHandleRegex = /^[a-z0-9_-]{1,32}$/
 const csrfCookieNameRegex = /^(?:xsrf-token|csrf[_-]?token|_csrf|csrf)$/i
 const csrfInputNameRegex = /^(?:_csrf|csrf[_-]?token|csrfmiddlewaretoken|__RequestVerificationToken|authenticity_token|_token)$/i
 const canaryUrlRegex = /^\/c\/guardian-canary-[a-f0-9]{24}$/i
+/**
+ * Cookie names that carry a server-side session handle. Excludes CSRF/tracking names: a stateless
+ * double-submit token may legitimately repeat across identities, while a session id may not.
+ */
+const sessionCookieNameRegex = /^(?![_.-]*(?:csrf|xsrf|_ga|_gid|amplitude|sentry))(?=[^=]*(?:sid|session|sess|jwt|auth|access_token|refresh_token|id_token))[A-Za-z0-9_.-]{1,64}$/i
 
 interface JarCookieEntry {
   key: string
@@ -454,10 +464,24 @@ interface SessionJar {
   assignmentId: string
   role: string
   session: string
+  /** Persona that owns every credential in this jar (request-level, never ambient). */
+  persona?: string
   scopeRevision: number
   cookies: Map<string, JarCookieEntry>
   csrfTokens: Map<string, StoredCsrfToken>
   lastUsedAt: number
+}
+
+/**
+ * Jar identity: one jar per (worker session, group role, persona, session label).
+ *
+ * Persona scope is a **request attribute**, never ambient state: `RequestBroker.executeHttp(req)`
+ * carries `req.persona` on every call, and the jar it may read or write is derived exclusively from
+ * that value. Two personas therefore can never observe each other's Set-Cookie rotations even when
+ * a caller passes the same `session` label for both.
+ */
+function sessionJarKey(assignmentKey: string, role: string, persona: string | undefined, session: string | undefined): string {
+  return `${assignmentKey}\0${role}\0${persona ? `p:${persona}` : 'p:'}\0${session ? `s:${session}` : 's:'}`
 }
 
 function normalizeCookiePath(rawPath: string | undefined, requestPathname: string): string {
@@ -1627,6 +1651,10 @@ export class RequestBroker {
   private readonly origins = new Map<string, OriginHealth>()
   private readonly routeCircuits = new Map<string, RouteHealth>()
   private readonly sessionJars = new Map<string, SessionJar>()
+  private readonly personaScopeMismatches: Array<{ origin: string; expected: string; observed: string; source: string }> = []
+  private readonly personaScopeMismatchKeys = new Set<string>()
+  /** origin\0cookieName\0valueHash → persona that first presented it (session ownership). */
+  private readonly personaSessionOwners = new Map<string, string>()
   private readonly redactedSecrets = new Map<string, NamedSecret>()
   private readonly seenGcbTokens = new Map<string, { probeClass: string; verifyUsed: boolean }>()
   private readonly transportConfig: TransportConfig
@@ -1669,6 +1697,86 @@ export class RequestBroker {
 
   getRegisteredSecrets(): NamedSecret[] {
     return [...this.redactedSecrets.values()]
+  }
+
+  /**
+   * Persona-scope mismatches observed on the wire (diagnostics/tests). A mismatch means the
+   * exchange cannot have been served the declared persona's scope; it is flagged so no proof can
+   * cite it.
+   */
+  getPersonaScopeMismatches(): Array<{ origin: string; expected: string; observed: string; source: string }> {
+    return [...this.personaScopeMismatches]
+  }
+
+  /**
+   * Detect two personas riding one server-side session. The login-minted session cookie is the
+   * server's handle on one identity: if a second persona presents the same value for the same origin
+   * then at most one of them is served its declared scope. Returns true on a disagreement.
+   */
+  private notePersonaSessionSharing(input: {
+    origin: string
+    persona: string
+    cookies: ReadonlyMap<string, string>
+    runId?: string
+    storage?: SecondOrderStore
+  }): boolean {
+    let shared = false
+    for (const [name, value] of input.cookies) {
+      if (!sessionCookieNameRegex.test(name) || value.length < 8) continue
+      const key = `${input.origin}\0${name}\0${createHash('sha256').update(value).digest('hex').slice(0, 16)}`
+      const owner = this.personaSessionOwners.get(key)
+      if (owner === undefined) {
+        if (this.personaSessionOwners.size >= 4_096) {
+          const oldest = this.personaSessionOwners.keys().next().value
+          if (oldest !== undefined) this.personaSessionOwners.delete(oldest)
+        }
+        this.personaSessionOwners.set(key, input.persona)
+        continue
+      }
+      if (owner === input.persona) continue
+      shared = true
+      this.notePersonaScopeMismatch({
+        origin: input.origin,
+        expected: input.persona,
+        observed: owner,
+        source: `vault_session:${name}`,
+        ...(input.runId ? { runId: input.runId } : {}),
+        ...(input.storage ? { storage: input.storage } : {}),
+      })
+    }
+    return shared
+  }
+
+  /**
+   * Record a transport-level persona/scope disagreement. Structured event first, then in-memory
+   * diagnostics: the caller must treat the exchange as evidence-invalid (never a confirmation).
+   */
+  private notePersonaScopeMismatch(input: {
+    origin: string
+    expected: string
+    observed: string
+    source: string
+    runId?: string
+    storage?: SecondOrderStore
+  }): void {
+    const key = `${input.origin}\0${input.expected}\0${input.observed}\0${input.source}`
+    if (this.personaScopeMismatchKeys.has(key)) return
+    this.personaScopeMismatchKeys.add(key)
+    this.personaScopeMismatches.push({
+      origin: input.origin,
+      expected: input.expected,
+      observed: input.observed,
+      source: input.source,
+    })
+    try {
+      const storage = input.storage ?? this.options.storage
+      storage?.event?.(
+        input.runId ?? null,
+        'broker.persona_scope_mismatch',
+        `Persona "${input.expected}" presented session state belonging to "${input.observed}"; the exchange is evidence-invalid.`,
+        { origin: input.origin, expected: input.expected, observed: input.observed, source: input.source },
+      )
+    } catch { /* telemetry is best-effort; the exchange is already flagged */ }
   }
 
   private registerSecret(label: string, value: string | undefined) {
@@ -1737,12 +1845,17 @@ export class RequestBroker {
     req: BrokerHttpRequest,
     grant: Grant,
   ): SessionJar | undefined {
-    if (req.session === undefined) return undefined
+    // Persona scope is per-request: the jar key carries the persona, so a Set-Cookie rotation is
+    // scoped strictly back to the persona that received it.
+    const persona = req.persona ?? req.personaHandle
+    // A jar exists only for requests that carry or need session state. Creating one eagerly for
+    // every persona read would evict the CSRF/setup jars the probe families rely on.
+    if (req.session === undefined && (persona === undefined || req.csrfBind === undefined)) return undefined
     const runId = req.runId ?? 'default'
     const assignmentId = req.assignmentId ?? 'default'
     const role = req.sessionGroupRole ?? 'default'
     const assignmentKey = `${runId}\0${assignmentId}`
-    const jarKey = `${assignmentKey}\0${role}\0${req.session}`
+    const jarKey = sessionJarKey(assignmentKey, role, persona, req.session)
     const effectiveRevision = Math.max(this.latestScopeRevision, req.scopeRevision ?? grant.scopeRevision ?? 0)
 
     const existing = this.sessionJars.get(jarKey)
@@ -1771,7 +1884,7 @@ export class RequestBroker {
     // Only `setup` jars may seed `control` or `probe` via deep-clone on first access;
     // `control` and `probe` remain strictly isolated from each other.
     if (role === 'control' || role === 'probe') {
-      const setupKey = `${assignmentKey}\0setup\0${req.session}`
+      const setupKey = sessionJarKey(assignmentKey, 'setup', persona, req.session)
       const setupJar = this.sessionJars.get(setupKey)
       if (setupJar) {
         for (const [k, v] of setupJar.cookies.entries()) cookies.set(k, { ...v })
@@ -1785,7 +1898,8 @@ export class RequestBroker {
       runId,
       assignmentId,
       role,
-      session: req.session,
+      session: req.session ?? persona ?? 'default',
+      ...(persona ? { persona } : {}),
       scopeRevision: effectiveRevision,
       cookies,
       csrfTokens,
@@ -1876,13 +1990,13 @@ export class RequestBroker {
 
   /** Internal helper for ScopedBrowser: non-HttpOnly jar cookies applicable to `origin` (never logged/serialized). */
   sessionCookiesForBrowser(
-    scope: { session?: string; runId?: string; assignmentId?: string; sessionGroupRole?: string },
+    scope: { session?: string; persona?: string; runId?: string; assignmentId?: string; sessionGroupRole?: string },
     origin: string,
   ): BrowserMirrorCookie[] {
-    if (!scope.session) return []
+    if (!scope.session && !scope.persona) return []
     const assignmentKey = `${scope.runId ?? 'default'}\0${scope.assignmentId ?? 'default'}`
-    const jarKey = `${assignmentKey}\0${scope.sessionGroupRole ?? 'default'}\0${scope.session}`
-    const jar = this.sessionJars.get(jarKey)
+    const role = scope.sessionGroupRole ?? 'default'
+    const jar = this.sessionJars.get(sessionJarKey(assignmentKey, role, scope.persona, scope.session))
     if (!jar) return []
     let parsed: URL
     try {
@@ -2919,6 +3033,8 @@ export class RequestBroker {
 
     const redirectOrigins = new Set<string>([url.origin])
     const redirectPaths: string[] = []
+    /** Any hop that withheld a foreign persona's session makes the whole exchange unusable. */
+    let scopeMismatch = false
     let activeMethod: BrokerHttpRequest['method'] = req.method
     let activeBody = prepared.preparedBody
     let includePersona = Boolean(personaHeaders && Object.keys(personaHeaders).length > 0)
@@ -3040,6 +3156,20 @@ export class RequestBroker {
         }
       }
       const vaultCookies = personaCookieRaw ? parseCookieHeaderPairs(personaCookieRaw) : new Map<string, string>()
+      // A session cookie is the server's handle on one identity. Two different personas presenting
+      // the *same* login-minted session cookie are the same server session, so at most one of them
+      // can be served its declared scope. Record it, withhold nothing (the credential is the
+      // declared persona's own), and mark the exchange evidence-invalid.
+      if (personaHandle && vaultCookies.size > 0 &&
+        this.notePersonaSessionSharing({
+          origin: url.origin,
+          persona: personaHandle,
+          cookies: vaultCookies,
+          ...(req.runId ? { runId: req.runId } : {}),
+          ...(this.options.storage ?? grant.storage ? { storage: (this.options.storage ?? grant.storage)! } : {}),
+        })) {
+        scopeMismatch = true
+      }
       for (const [name, entry] of jarCookieByName) {
         if (!vaultCookies.has(name) || entry.writeCount > 1) mergedCookies.set(name, entry.value)
       }
@@ -3289,6 +3419,7 @@ export class RequestBroker {
         bodyTruncated: Boolean(response.bodyTruncated),
         durationMs: Date.now() - started,
         secretMatches,
+        ...(scopeMismatch ? { personaScopeMismatch: true as const } : {}),
         ...(response.tls ? { tls: response.tls } : {}),
         observation: obs,
       }

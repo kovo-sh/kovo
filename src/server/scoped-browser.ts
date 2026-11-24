@@ -1590,6 +1590,7 @@ export class ScopedBrowser {
           const recordedId = state.onExchange?.(exchange)
           if (typeof recordedId === 'string' && recordedId) state.exchangeIds.push(recordedId)
           await mirrorJarCookies(runtime.context, this.broker, {
+            ...(state.persona ? { persona: state.persona } : {}),
             ...(state.session ? { session: state.session } : {}),
             ...(state.runId ? { runId: state.runId } : {}),
             ...(state.assignmentId ? { assignmentId: state.assignmentId } : {}),
@@ -2103,6 +2104,7 @@ export class ScopedBrowser {
             const recordedId = req.onExchange?.(exchange)
             if (typeof recordedId === 'string' && recordedId) exchangeIds.push(recordedId)
             await mirrorJarCookies(context, this.broker, {
+              ...(req.persona ? { persona: req.persona } : {}),
               session: req.session,
               runId: req.runId,
               assignmentId: req.assignmentId,
@@ -2948,6 +2950,7 @@ export class ScopedBrowser {
               const recordedId = cur.step.onExchange?.(exchange)
               if (typeof recordedId === 'string' && recordedId) stepExchangeIds.push(recordedId)
               await mirrorJarCookies(context, this.broker, {
+                ...(cur.step.persona ? { persona: cur.step.persona } : {}),
                 session: cur.step.session ?? sessionId,
                 runId: cur.step.runId,
                 assignmentId: cur.step.assignmentId,

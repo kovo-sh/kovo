@@ -77,6 +77,11 @@ export interface SecondOrderStore {
     },
   ): SecondOrderCanaryRecord
   listSecondOrderCanaries(runId: string, status?: 'planted' | 'surfaced' | 'verified'): SecondOrderCanaryRecord[]
+  /**
+   * Structured run event sink. Optional so embedding harnesses can supply only the canary API; the
+   * broker uses it best-effort for transport-level invariants (e.g. persona scope mismatches).
+   */
+  event?(runId: string | null, kind: string, message: string, detail?: Record<string, unknown>): unknown
   runDetail?(runId: string): {
     run: { id: string; scopeRevision: number }
     assignments: Array<{ id: string; goalRevision: number; sourceOrigins: string[] }>
