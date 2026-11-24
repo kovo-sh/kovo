@@ -31,7 +31,7 @@ All product rows are real `Execution` on the 3-app realistic dev cells (acme-saa
 | Floor determinism | **0 spread**, 3 repeats identical (site sets included, `driftApps=0`) | Re-gated on the current tree |
 | Salted held-out product floor (seed 1000042) | **28 / 58 (48.3%)**, **100%** precision | acme **11**, shopflow **10**, opsportal 7; 2 runs, identical per-app; gains from inferred-param discovery and an evidence-based quota reservation, each confirmed through the normal proof path |
 | Agentic, 600 s generous, 3 apps dev | **35 / 59 (59.3%)**, **100%** precision, 0 unmatched, **+2 net** | acme 13 (+1), shopflow 12 (+1), opsportal 10 (**+0**); ~$1.0 total |
-| Agentic, 600 s generous, 3 apps salted held-out | **25 / 58**, **+1 net**, **100%** precision | acme 10, shopflow 8, opsportal 7; 19–23 investigations/app; pre-hardening run had 2 unmatched FPs |
+| Agentic, 600 s generous, 3 apps salted held-out | **29 / 58 (50.0%)**, **+1 net**, **100%** precision, 0 unmatched, 0 decoy | acme 11, shopflow **11**, opsportal 7; floor 28/58; 39 investigations; first fully quotable precision run |
 | Agentic rotation (shopflow, resumed, 300 s) | **3 / 19**, **100%** precision, p50 **77.5 s** | After injection-class precedence fix |
 | XBEN-25 | **25 / 25**, 100% precision | Hard regression gate |
 | held-out-saas | **20 / 20** + **20 / 20 patches** (`allPatches=fixed`) | Hard regression gate |
@@ -53,8 +53,8 @@ All product rows are real `Execution` on the 3-app realistic dev cells (acme-saa
 | Legacy regression | xben 25/25, held-out 20/20 + 20/20 | both hold | **PASS** |
 | Realism wiring | #2–#4 wiring pass | #2 PASS, #3 PASS, #4 PASS | **PASS** |
 | Realism capability | ≥75% on #1–#4 | #3 PASS (3/3 confirms); #2 2/4 planted; #4 0/3 | **PARTIAL** |
-| Worst-run precision (agentic) | 100% on every lift cell | dev 100%; **held-out 2 unmatched FPs** | **FAIL** |
-| **Total Product Recall** (unified `Execution`, 100% worst-run precision) | ≥ **40/59 dev** and ≥ **32/58** salted held-out | dev unified not re-measured on the 36/59 tree; held-out unified **29/58** but precision 50% | **FAIL** |
+| Worst-run precision (agentic) | 100% on every lift cell | **held-out 3-app run at 100%** (0 unmatched, 0 decoy); dev 100% | **PASS** |
+| **Total Product Recall** (unified `Execution`, 100% worst-run precision) | ≥ **40/59 dev** and ≥ **32/58** salted held-out | held-out unified **29/58** at 100% precision (floor 28); dev unified measuring | **FAIL (recall)** |
 | Frozen floor reference | 36/59 dev, 28/58 held-out (snapshot, not a moving target) | **36/59** dev, **28/58** held-out, both 100% | **PASS** |
 | Anti-inert agentic guard | ≥ +4 net-new over the frozen floor, plus reason-bench lift | held-out **+1**; reason-bench unmeasured | **FAIL** |
 | Dispatch coverage | ready steps are not stranded | fixed: opsportal 6→**19–25** distinct steps, acme 7→**14**; stranded only at wall-clock; invariant live in worker-gate | **PASS** |
