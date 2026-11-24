@@ -18,6 +18,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { test } from 'node:test'
 import { eq } from 'drizzle-orm'
 
+import type { DeclarativeReplaySpec } from '../src/replay-spec.ts'
 import type { Finding, ReportBody } from '../src/domain.ts'
 import { Store, STORE_SCHEMA_VERSION, verificationClassForFinding } from '../src/server/store.ts'
 import * as tables from '../src/server/schema.ts'
@@ -41,6 +42,22 @@ function finding(origin: string, overrides: Partial<Finding> = {}): Finding {
   }
 }
 
+/** Confirm-consistency fixture: a persisted replay spec whose diff verdict is `confirmed`. */
+function confirmingSpecId(
+  storage: Store,
+  run: ReturnType<Store['run']>,
+  worker: ReturnType<Store['makeWorker']>,
+  origin: string,
+  findingId: string,
+): string {
+  return storage.createReplaySpec(run, worker, findingId, {
+    version: 1, kind: 'http_chain', origin, title: 'Confirmation fixture',
+  } as unknown as DeclarativeReplaySpec, [origin], {
+    verifiedInline: true,
+    lastVerificationDiff: { verdict: 'confirmed', controlPassed: true, stepStatuses: [], retriesRemaining: 0 },
+  }).id
+}
+
 async function setup(t: Parameters<typeof makeStore>[0], label: string) {
   const { dir, storage } = makeStore(t, `guardian-v6-provenance-${label}-`)
   const { runId } = await setupApprovedRun(storage, { budgetRequests: 500 })
@@ -48,7 +65,7 @@ async function setup(t: Parameters<typeof makeStore>[0], label: string) {
   const asset = run.candidates[0]!
   const worker = storage.makeWorker(run, 'investigation', asset, 'Provenance', 'Provenance test')
   const artifact = storage.addArtifact(run, worker, 'replay', 'Proof', '{}')
-  return { dir, storage, runId, asset, origin: asset.origin, artifact }
+  return { dir, storage, runId, run, worker, asset, origin: asset.origin, artifact }
 }
 
 test('v6 provenance: schema columns exist with additive defaults', async t => {
@@ -77,7 +94,7 @@ test('v6 provenance: schema columns exist with additive defaults', async t => {
 })
 
 test('v6 provenance: confirmed + static verification class is rejected by the store', async t => {
-  const { storage, runId, asset, origin, artifact } = await setup(t, 'reject')
+  const { storage, run, runId, worker, asset, origin, artifact } = await setup(t, 'reject')
   assert.throws(
     () => storage.upsertChainFinding(
       storage.run(runId),
@@ -92,8 +109,10 @@ test('v6 provenance: confirmed + static verification class is rejected by the st
   assert.equal(storage.runDetail(runId).findings.length, 0, 'rejected write must not persist')
 
   // The database CHECK constraint is the last line of defence for direct writers.
+  const savedFinding = finding(origin, { evidenceIds: [artifact.id] })
   const saved = storage.upsertChainFinding(
-    storage.run(runId), asset.id, finding(origin, { evidenceIds: [artifact.id] }), randomUUID(), [origin],
+    storage.run(runId), asset.id, savedFinding,
+    confirmingSpecId(storage, run, worker, origin, savedFinding.id), [origin],
   )
   assert.throws(
     () => storage.client.prepare("UPDATE findings SET verification_class = 'static_advisory' WHERE id = ?").run(saved.id),
@@ -129,17 +148,18 @@ test('v6 provenance: static proof persists as an advisory and never as confirmed
 })
 
 test('v6 provenance: floor, agent_only and chain_from_floor are counted separately', async t => {
-  const { storage, runId, asset, origin, artifact } = await setup(t, 'counts')
+  const { storage, runId, worker, asset, origin, artifact } = await setup(t, 'counts')
   const run = storage.run(runId)
+  const specFor = (id: string) => confirmingSpecId(storage, run, worker, origin, id)
 
   const floorParent = finding(origin, { evidenceIds: [artifact.id], fingerprintHash: 'fp-floor' })
   storage.upsertChainFinding(
-    run, asset.id, floorParent, randomUUID(), [origin],
+    run, asset.id, floorParent, specFor(floorParent.id), [origin],
     { provenance: 'floor', verificationClass: 'runtime_confirmed' },
   )
 
   const agentOnly = finding(origin, { evidenceIds: [artifact.id], fingerprintHash: 'fp-agent' })
-  storage.upsertChainFinding(run, asset.id, agentOnly, randomUUID(), [origin])
+  storage.upsertChainFinding(run, asset.id, agentOnly, specFor(agentOnly.id), [origin])
 
   const chain = finding(origin, {
     evidenceIds: [artifact.id],
@@ -147,7 +167,7 @@ test('v6 provenance: floor, agent_only and chain_from_floor are counted separate
     title: 'Privilege escalation from floor-confirmed primitive',
   })
   const chained = storage.upsertChainFinding(
-    run, asset.id, chain, randomUUID(), [origin],
+    run, asset.id, chain, specFor(chain.id), [origin],
     { parentFindingIds: [floorParent.id] },
   )
 
@@ -165,10 +185,11 @@ test('v6 provenance: floor, agent_only and chain_from_floor are counted separate
 })
 
 test('v6 provenance: a chain without a floor parent stays agent_only', async t => {
-  const { storage, runId, asset, origin, artifact } = await setup(t, 'chain-no-parent')
+  const { storage, runId, worker, asset, origin, artifact } = await setup(t, 'chain-no-parent')
   const run = storage.run(runId)
+  const specFor = (id: string) => confirmingSpecId(storage, run, worker, origin, id)
   const agentParent = finding(origin, { evidenceIds: [artifact.id], fingerprintHash: 'fp-agent-parent' })
-  storage.upsertChainFinding(run, asset.id, agentParent, randomUUID(), [origin])
+  storage.upsertChainFinding(run, asset.id, agentParent, specFor(agentParent.id), [origin])
 
   const orphanChain = finding(origin, {
     evidenceIds: [artifact.id],
@@ -176,21 +197,21 @@ test('v6 provenance: a chain without a floor parent stays agent_only', async t =
     title: 'Downstream chain without a floor primitive',
   })
   const saved = storage.upsertChainFinding(
-    run, asset.id, orphanChain, randomUUID(), [origin],
+    run, asset.id, orphanChain, specFor(orphanChain.id), [origin],
     { parentFindingIds: [agentParent.id] },
   )
   assert.equal((saved as Finding & { provenance?: string }).provenance, 'agent_only')
 
   const bogus = finding(origin, { evidenceIds: [artifact.id], fingerprintHash: 'fp-bogus', title: 'No parent exists' })
   const bogusSaved = storage.upsertChainFinding(
-    run, asset.id, bogus, randomUUID(), [origin],
+    run, asset.id, bogus, specFor(bogus.id), [origin],
     { parentFindingIds: [randomUUID()] },
   )
   assert.equal((bogusSaved as Finding & { provenance?: string }).provenance, 'agent_only')
 })
 
 test('v6 provenance: duplicate agent re-discovery of a floor finding is suppressed', async t => {
-  const { storage, runId, asset, origin, artifact } = await setup(t, 'floor-immutable')
+  const { storage, runId, worker, asset, origin, artifact } = await setup(t, 'floor-immutable')
   const run = storage.run(runId)
   const floorFinding = finding(origin, {
     evidenceIds: [artifact.id],
@@ -199,7 +220,7 @@ test('v6 provenance: duplicate agent re-discovery of a floor finding is suppress
     severity: 'high',
   })
   const savedFloor = storage.upsertChainFinding(
-    run, asset.id, floorFinding, randomUUID(), [origin],
+    run, asset.id, floorFinding, confirmingSpecId(storage, run, worker, origin, floorFinding.id), [origin],
     { provenance: 'floor', verificationClass: 'runtime_confirmed' },
   )
   const before = storage.db.select().from(tables.findings).all()
@@ -228,14 +249,15 @@ test('v6 provenance: duplicate agent re-discovery of a floor finding is suppress
 })
 
 test('v6 provenance: report counts are correct and advisories stay out of confirmed', async t => {
-  const { storage, runId, asset, origin, artifact } = await setup(t, 'report')
+  const { storage, runId, worker, asset, origin, artifact } = await setup(t, 'report')
   const run = storage.run(runId)
+  const specFor = (id: string) => confirmingSpecId(storage, run, worker, origin, id)
   const floor = finding(origin, { evidenceIds: [artifact.id], fingerprintHash: 'fp-r-floor' })
-  storage.upsertChainFinding(run, asset.id, floor, randomUUID(), [origin], { provenance: 'floor' })
+  storage.upsertChainFinding(run, asset.id, floor, specFor(floor.id), [origin], { provenance: 'floor' })
   const agent = finding(origin, { evidenceIds: [artifact.id], fingerprintHash: 'fp-r-agent' })
-  storage.upsertChainFinding(run, asset.id, agent, randomUUID(), [origin])
+  storage.upsertChainFinding(run, asset.id, agent, specFor(agent.id), [origin])
   const chain = finding(origin, { evidenceIds: [artifact.id], fingerprintHash: 'fp-r-chain', title: 'Chained downstream impact' })
-  storage.upsertChainFinding(run, asset.id, chain, randomUUID(), [origin], { parentFindingIds: [floor.id] })
+  storage.upsertChainFinding(run, asset.id, chain, specFor(chain.id), [origin], { parentFindingIds: [floor.id] })
   const advisory = finding(origin, {
     evidenceIds: [artifact.id], status: 'static_verified', verificationTier: 'static_verified', title: 'Static advisory', fingerprintHash: 'fp-r-static',
   })
@@ -282,7 +304,7 @@ test('v6 provenance: legacy database without provenance columns backfills and re
     evidenceIds: [artifact.id], status: 'static_verified', verificationTier: 'static_verified',
     title: 'Legacy static', fingerprintHash: 'fp-legacy-static',
   })
-  seeded.upsertChainFinding(run, asset.id, floor, randomUUID(), [origin], { provenance: 'floor' })
+  seeded.upsertChainFinding(run, asset.id, floor, confirmingSpecId(seeded, run, worker, origin, floor.id), [origin], { provenance: 'floor' })
   seeded.upsertChainFinding(run, asset.id, staticLegacy, randomUUID(), [origin])
   seeded.event(runId, 'deterministic_engine.confirmed', 'legacy floor marker', { findingId: floor.id })
   seeded.close()

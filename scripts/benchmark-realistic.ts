@@ -823,7 +823,11 @@ export function buildFalsePositiveEvidence(
   for (const findingId of wanted) {
     const finding = input.findings.find(row => row.id === findingId)
     if (!finding) continue
-    const spec = input.replaySpecs.find(row => row.findingId === findingId)
+    // A finding may carry several specs (failed repair attempts plus the confirming anchor). The
+    // proof that backed a confirmed claim is the confirming one; prefer it so the autopsy never
+    // attributes an inconclusive retry to a finding whose oracle actually passed.
+    const spec = input.replaySpecs.find(row => row.findingId === findingId && row.lastVerificationDiff?.verdict === 'confirmed')
+      ?? input.replaySpecs.find(row => row.findingId === findingId)
     const diff = spec?.lastVerificationDiff ?? null
     const steps = spec ? specStepsWithIds(spec.spec) : []
     const findingExchanges = (finding.exchangeIds ?? [])

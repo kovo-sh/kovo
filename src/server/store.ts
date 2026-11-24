@@ -153,6 +153,39 @@ export function verificationClassForFinding(
   return requested === 'open_proof_gap' || requested === undefined ? 'open_proof_gap' : requested
 }
 
+/**
+ * Typed precision-integrity failure. Thrown when a write would persist a `confirmed` finding
+ * without persisted evidence that satisfies the oracle (a confirming replay diff or ProofReceipt).
+ */
+export class InvariantError extends Error {
+  readonly code: string
+  constructor(code: string, message: string) {
+    super(message)
+    this.name = 'InvariantError'
+    this.code = code
+  }
+}
+
+/**
+ * A persisted replay verdict that satisfies a runtime oracle. Zero-LLM `confirmed` is the only
+ * runtime-confirming verdict: `static_verified` belongs to the advisory tier and must never back a
+ * `runtime_confirmed` claim.
+ */
+export function replayVerdictConfirmsRuntime(verdict: string | null | undefined): boolean {
+  return verdict === 'confirmed'
+}
+
+/** Where a runtime_confirmed finding's persisted proof currently lives. */
+export interface ConfirmationEvidence {
+  /** True only when the persisted evidence satisfies the oracle for the claimed class. */
+  backed: boolean
+  /** True when a persisted spec verdict explicitly contradicts the confirmed claim. */
+  contradicted: boolean
+  kind: 'spec' | 'receipt' | 'baseline' | 'floor_artifact' | 'none'
+  verdict: string | null
+  replaySpecId: string | null
+}
+
 export interface FindingProvenanceOptions {
   /** Explicit attribution. `floor` is reserved for the deterministic floor's own confirmations. */
   provenance?: FindingProvenance
@@ -1314,6 +1347,51 @@ export class Store {
       );
     `)
     this.client.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`)
+    this.initConfirmationGuards()
+  }
+
+  /**
+   * Database-level confirmation guard (defence in depth for the store invariant).
+   *
+   * A row may only be `verification_class = 'runtime_confirmed'` + `status = 'confirmed'` while the
+   * same database holds confirming evidence: the linked replay spec's persisted diff verdict is
+   * `confirmed`, a verified OOB ProofReceipt, or a baseline review. Direct SQL writers (migrations,
+   * ad-hoc scripts, future call sites) are aborted with `invariant.confirmation_evidence` instead of
+   * persisting a confirmed claim contradicted by its own evidence.
+   */
+  private initConfirmationGuards() {
+    if (!this.tableExists('findings') || !this.tableExists('replay_specs')) return
+    const guard = (name: string, event: 'INSERT' | 'UPDATE OF verification_class, replay_spec_id, finding, verification_tier') => `
+      CREATE TRIGGER IF NOT EXISTS ${name}
+      BEFORE ${event} ON findings
+      WHEN NEW.verification_class = 'runtime_confirmed'
+        AND json_extract(NEW.finding, '$.status') = 'confirmed'
+        AND coalesce(NEW.finding_kind, '') <> 'baseline_check'
+        AND coalesce(NEW.verification_tier, json_extract(NEW.finding, '$.verificationTier'), '') <> 'baseline_confirmed'
+        AND coalesce(json_extract(NEW.finding, '$.verification'), '') NOT LIKE 'ProofReceipt%'
+        AND NOT EXISTS (
+          SELECT 1 FROM replay_specs s
+          WHERE s.id = NEW.replay_spec_id
+            AND json_extract(s.last_verification_diff, '$.verdict') = 'confirmed'
+        )
+        ${this.tableExists('events') ? `AND NOT EXISTS (
+          SELECT 1 FROM events e
+          WHERE e.run_id = NEW.run_id
+            AND e.kind = 'oob.receipt_confirmed'
+            AND json_extract(e.detail, '$.findingId') = NEW.id
+        )` : ''}
+      BEGIN
+        SELECT RAISE(ABORT, 'invariant.confirmation_evidence');
+      END;
+    `
+    try {
+      this.client.exec(guard('findings_confirmation_evidence_insert', 'INSERT'))
+      this.client.exec(guard('findings_confirmation_evidence_update', 'UPDATE OF verification_class, replay_spec_id, finding, verification_tier'))
+    } catch (error) {
+      // Never block startup on an old SQLite build that lacks json_extract; the store-level
+      // InvariantError remains authoritative.
+      if (!/json_extract|syntax error/i.test((error as Error).message)) throw error
+    }
   }
 
   /**
@@ -3914,6 +3992,154 @@ export class Store {
     )).orderBy(desc(tables.replaySpecs.createdAt)).all()
   }
 
+  /** How many confirmed claims this run demoted after their persisted evidence stopped confirming. */
+  confirmationConflictCount(runId: string): number {
+    const row = this.db.select({ count: sql<number>`count(*)` }).from(tables.events).where(and(
+      eq(tables.events.runId, runId), eq(tables.events.kind, 'finding.confirmation_conflict'),
+    )).get()
+    return Number(row?.count ?? 0)
+  }
+
+  /**
+   * Resolve the persisted proof that backs a runtime claim. A `confirmed` finding is only valid when
+   * one of these holds: its linked replay spec's persisted diff verdict is `confirmed`; a verified
+   * OOB ProofReceipt promoted it; or (legacy floor rows only, before spec diffs were persisted) the
+   * deterministic-engine confirmation event exists and no later spec verdict contradicts it.
+   * Baseline checks are evidenced by their coverage review, not a replay spec.
+   */
+  private confirmationEvidenceFor(runId: string, input: {
+    findingId: string
+    replaySpecId?: string | null
+    verification?: string
+    findingKind?: Finding['findingKind']
+    verificationTier?: VerificationTier | null
+    provenance?: FindingProvenance | null
+  }): ConfirmationEvidence {
+    const replaySpecId = input.replaySpecId ?? null
+    if (input.findingKind === 'baseline_check' || input.verificationTier === 'baseline_confirmed') {
+      return { backed: true, contradicted: false, kind: 'baseline', verdict: 'baseline_confirmed', replaySpecId }
+    }
+    const spec = replaySpecId
+      ? this.db.select().from(tables.replaySpecs).where(and(
+          eq(tables.replaySpecs.runId, runId), eq(tables.replaySpecs.id, replaySpecId),
+        )).get()
+      : undefined
+    const verdict = spec?.lastVerificationDiff?.verdict ?? null
+    if (replayVerdictConfirmsRuntime(verdict)) {
+      return { backed: true, contradicted: false, kind: 'spec', verdict, replaySpecId }
+    }
+    const receipt = typeof input.verification === 'string' && input.verification.startsWith('ProofReceipt')
+      ? true
+      : Boolean(this.db.select({ id: tables.events.id }).from(tables.events).where(and(
+          eq(tables.events.runId, runId),
+          eq(tables.events.kind, 'oob.receipt_confirmed'),
+          sql`json_extract(${tables.events.detail}, '$.findingId') = ${input.findingId}`,
+        )).get())
+    if (receipt) return { backed: true, contradicted: false, kind: 'receipt', verdict, replaySpecId }
+    // Legacy floor confirmations predate persisted spec diffs: their deterministic-engine event (or
+    // the floor's own in-flight confirmation write) is the anchor. An explicit non-confirming diff
+    // still wins (it is the later, contradicting write).
+    if (verdict === null) {
+      if (input.provenance === 'floor') {
+        return { backed: true, contradicted: false, kind: 'floor_artifact', verdict: null, replaySpecId }
+      }
+      const floorEvent = this.db.select({ id: tables.events.id }).from(tables.events).where(and(
+        eq(tables.events.runId, runId),
+        eq(tables.events.kind, 'deterministic_engine.confirmed'),
+        sql`json_extract(${tables.events.detail}, '$.findingId') = ${input.findingId}`,
+      )).get()
+      if (floorEvent) return { backed: true, contradicted: false, kind: 'floor_artifact', verdict: null, replaySpecId }
+    }
+    // An explicit non-confirming verdict is a contradiction. A missing verdict/spec is unknown
+    // (legacy rows and fixtures), not a conflict: there is nothing to contradict.
+    return { backed: false, contradicted: verdict !== null, kind: 'none', verdict, replaySpecId }
+  }
+
+  /**
+   * Hard write gate: a confirmed finding may only be persisted when its own persisted evidence is
+   * confirming (linked spec diff `confirmed`, a verified ProofReceipt, or a baseline review).
+   * Throws `InvariantError('invariant.confirmation_evidence')` otherwise, so an inconclusive result
+   * can never structurally persist as confirmed.
+   */
+  assertConfirmationEvidence(runId: string, input: {
+    findingId: string
+    replaySpecId?: string | null
+    verification?: string
+    findingKind?: Finding['findingKind']
+    verificationTier?: VerificationTier | null
+    provenance?: FindingProvenance | null
+  }): ConfirmationEvidence {
+    const evidence = this.confirmationEvidenceFor(runId, input)
+    if (!evidence.backed) {
+      throw new InvariantError(
+        'invariant.confirmation_evidence',
+        `Invariant: a confirmed finding requires confirming persisted evidence `
+          + `(linked spec diff 'confirmed' or a verified ProofReceipt); got `
+          + `${evidence.kind} verdict '${evidence.verdict ?? 'none'}' for ${input.findingId}.`,
+      )
+    }
+    return evidence
+  }
+
+  /**
+   * Precision-integrity invariant: a finding may only be persisted `runtime_confirmed` while its
+   * own persisted evidence satisfies the oracle. When a later verdict downgrades that evidence the
+   * finding is demoted to `open_proof_gap`/`inconclusive`, a loud `finding.confirmation_conflict`
+   * event is emitted, and the per-run conflict counter is incremented. Never leaves a confirmed
+   * claim whose persisted diff says otherwise.
+   */
+  enforceConfirmationEvidence(runId: string, findingId: string, cause: string): boolean {
+    const row = this.db.select().from(tables.findings).where(and(
+      eq(tables.findings.runId, runId), eq(tables.findings.id, findingId),
+    )).get()
+    if (!row) return false
+    if (row.verificationClass !== 'runtime_confirmed' || row.finding.status !== 'confirmed') return false
+    const evidence = this.confirmationEvidenceFor(runId, {
+      findingId: row.id,
+      replaySpecId: row.replaySpecId,
+      verification: row.finding.verification,
+      findingKind: row.findingKind,
+      verificationTier: row.finding.verificationTier ?? row.verificationTier,
+      provenance: row.provenance,
+    })
+    if (evidence.backed || !evidence.contradicted) return false
+    const conflicts = this.confirmationConflictCount(runId) + 1
+    const demoted: Finding = {
+      ...row.finding,
+      status: 'inconclusive',
+      verificationTier: undefined,
+      confidence: 'low',
+      reason: `Confirmation conflict: ${cause}; the persisted evidence no longer satisfies the `
+        + `${row.finding.category ?? 'claimed'} oracle (${evidence.kind}: ${evidence.verdict ?? 'no verdict'}).`
+        + (row.finding.reason ? ` Prior: ${row.finding.reason}` : ''),
+    }
+    this.transaction(() => {
+      this.db.update(tables.findings).set({
+        verificationClass: 'open_proof_gap',
+        verificationTier: null,
+        finding: demoted,
+      }).where(and(eq(tables.findings.runId, runId), eq(tables.findings.id, findingId))).run()
+      this.event(
+        runId,
+        'finding.confirmation_conflict',
+        `Demoted confirmed finding "${row.finding.title.slice(0, 160)}" (${row.id}): ${cause}; `
+          + `persisted evidence is ${evidence.kind} (${evidence.verdict ?? 'no verdict'}).`,
+        {
+          findingId: row.id,
+          previousStatus: 'confirmed',
+          previousVerificationClass: 'runtime_confirmed',
+          replaySpecId: evidence.replaySpecId,
+          evidenceKind: evidence.kind,
+          evidenceVerdict: evidence.verdict,
+          provenance: row.provenance,
+          cause,
+          conflictsForRun: conflicts,
+        },
+      )
+    }, { behavior: 'immediate' })
+    return true
+  }
+
   incrementReplaySpecAttempt(
     id: string,
     feedback: InlineVerifyFeedback,
@@ -3938,12 +4164,44 @@ export class Store {
             ...(updated.sourceOrigins ? { sourceOrigins: [...new Set(updated.sourceOrigins)] } : {}),
           }
         : {}
-      return this.db.update(tables.replaySpecs).set({
+      const row = this.db.update(tables.replaySpecs).set({
         attemptCount: sql`${tables.replaySpecs.attemptCount} + 1`,
         verifiedInline: verified,
         lastVerificationDiff: cleanFeedback,
         ...specPatch,
       }).where(eq(tables.replaySpecs.id, id)).returning().get()!
+      // A retry that no longer confirms must not leave the finding's confirmed claim backed by a
+      // non-confirming diff. Demote (and count) instead of silently keeping the old status.
+      if (cleanFeedback.verdict !== 'confirmed') {
+        this.enforceConfirmationEvidence(
+          existing.runId,
+          existing.findingId,
+          `replay spec attempt ${row.attemptCount} returned ${cleanFeedback.verdict}`,
+        )
+      }
+      return row
+    }, { behavior: 'immediate' })
+  }
+
+  /**
+   * Persist a verification diff on an existing spec (Phase-3 retest path). Shares the confirmation
+   * invariant with `incrementReplaySpecAttempt`: a non-confirming write demotes a confirmed claim.
+   */
+  recordReplaySpecVerification(
+    runId: string,
+    replaySpecId: string,
+    feedback: InlineVerifyFeedback,
+    cause: string,
+  ): ReplaySpecRow {
+    return this.transaction(() => {
+      const row = this.db.update(tables.replaySpecs).set({ lastVerificationDiff: feedback }).where(and(
+        eq(tables.replaySpecs.runId, runId), eq(tables.replaySpecs.id, replaySpecId),
+      )).returning().get()
+      if (!row) throw new Error('Replay spec not found.')
+      if (feedback.verdict !== 'confirmed') {
+        this.enforceConfirmationEvidence(runId, row.findingId, cause)
+      }
+      return row
     }, { behavior: 'immediate' })
   }
 
@@ -4214,6 +4472,16 @@ export class Store {
     }
     const verificationClass = verificationClassForFinding(mergedFinding, patch.verificationClass)
     assertConfirmedVerificationClass(mergedFinding.status, verificationClass)
+    if (mergedFinding.status === 'confirmed') {
+      this.assertConfirmationEvidence(run.id, {
+        findingId: existing.id,
+        replaySpecId: patch.replaySpecId ?? existing.replaySpecId,
+        verification: mergedFinding.verification,
+        findingKind: existing.findingKind,
+        verificationTier: mergedFinding.verificationTier ?? existing.verificationTier,
+        provenance: existing.provenance,
+      })
+    }
     const persistedFinding = {
       ...mergedFinding,
       provenance: existing.provenance,
@@ -4457,8 +4725,22 @@ export class Store {
     const provenance = this.resolveFindingProvenance(
       run.id, storedFinding, targetRow, options.provenance, parentFindingIds,
     )
+    const canonicalSpecId = storedFinding.replaySpecId ?? replaySpecId
     const verificationClass = verificationClassForFinding(storedFinding, options.verificationClass)
     assertConfirmedVerificationClass(storedFinding.status, verificationClass)
+    // Hard gate: never persist a confirmed claim whose own evidence is not confirming. This is the
+    // chokepoint for every chain finding write (inline replay, floor, receipt promotion). It throws
+    // a typed InvariantError so an inconclusive result structurally cannot become confirmed.
+    if (storedFinding.status === 'confirmed') {
+      this.assertConfirmationEvidence(run.id, {
+        findingId: storedFinding.id,
+        replaySpecId: canonicalSpecId,
+        verification: storedFinding.verification,
+        findingKind: storedFinding.findingKind,
+        verificationTier: storedFinding.verificationTier,
+        provenance: options.provenance ?? targetRow?.provenance ?? null,
+      })
+    }
     const persistedFinding = {
       ...storedFinding,
       provenance,
@@ -4466,7 +4748,6 @@ export class Store {
       verificationStatus: verificationClass,
     } as Finding
 
-    const canonicalSpecId = storedFinding.replaySpecId ?? replaySpecId
     const cleanOrigins = [...new Set([
       storedFinding.origin,
       ...(targetRow?.sourceOrigins ?? []),
@@ -4475,11 +4756,11 @@ export class Store {
     ])]
 
     const verificationTier: VerificationTier | null = storedFinding.verificationTier ??
-      (storedFinding.status === 'static_verified'
-        ? 'static_verified'
-        : storedFinding.status === 'confirmed'
-          ? 'runtime_confirmed'
-          : targetRow?.verificationTier ?? null)
+        (storedFinding.status === 'static_verified'
+          ? 'static_verified'
+          : storedFinding.status === 'confirmed'
+            ? 'runtime_confirmed'
+            : targetRow?.verificationTier ?? null)
 
     if (verificationTier) storedFinding.verificationTier = verificationTier
     // A finding promoted to runtime-confirmed must not retain the static tier marker.
