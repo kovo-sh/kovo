@@ -487,6 +487,115 @@
       }
     ]
   }
+},
+{
+  "id": "public-item-attribution-read",
+  "title": "Cross-tenant read of a public storefront item carrying a plain display author name",
+  "assessor": "authorization",
+  "expectedDismissal": "identical non-owner payload with only a plain display attribution field (not bound to an owner principal, email, or canary) is publicness, not a cross-tenant crossing",
+  "input": {
+    "impactClass": "authorization",
+    "steps": [
+      {
+        "id": "owner_list",
+        "arm": "control",
+        "method": "GET",
+        "route": "/api/v1/testimonials",
+        "pathAndQuery": "/api/v1/testimonials",
+        "status": 200,
+        "actor": {
+          "handle": "persona_a",
+          "role": "owner",
+          "tenant": "9ca676",
+          "auth": "cookie",
+          "sameSite": "lax"
+        },
+        "json": {
+          "reviews": [
+            {
+              "external_id": "628888",
+              "product_id": 1,
+              "author": "Jess",
+              "approved": 1
+            }
+          ]
+        }
+      },
+      {
+        "id": "owner_item",
+        "arm": "control",
+        "method": "GET",
+        "route": "/api/v1/testimonials/:id",
+        "pathAndQuery": "/api/v1/testimonials/628888",
+        "status": 200,
+        "actor": {
+          "handle": "persona_a",
+          "role": "owner",
+          "tenant": "9ca676",
+          "auth": "cookie",
+          "sameSite": "lax"
+        },
+        "json": {
+          "id": 1,
+          "external_id": "628888",
+          "store_id": "9ca676",
+          "product_id": 1,
+          "author": "Jess",
+          "body": "<p>Loved it</p>",
+          "approved": 1
+        }
+      },
+      {
+        "id": "probe_list",
+        "arm": "probe",
+        "method": "GET",
+        "route": "/api/v1/testimonials",
+        "pathAndQuery": "/api/v1/testimonials",
+        "status": 200,
+        "actor": {
+          "handle": "persona_b",
+          "role": "owner",
+          "tenant": "6ea2e7",
+          "auth": "cookie",
+          "sameSite": "lax"
+        },
+        "json": {
+          "reviews": [
+            {
+              "external_id": "771122",
+              "product_id": 2,
+              "author": "Pat",
+              "approved": 1
+            }
+          ]
+        }
+      },
+      {
+        "id": "probe_item",
+        "arm": "probe",
+        "method": "GET",
+        "route": "/api/v1/testimonials/:id",
+        "pathAndQuery": "/api/v1/testimonials/628888",
+        "status": 200,
+        "actor": {
+          "handle": "persona_b",
+          "role": "owner",
+          "tenant": "6ea2e7",
+          "auth": "cookie",
+          "sameSite": "lax"
+        },
+        "json": {
+          "id": 1,
+          "external_id": "628888",
+          "store_id": "9ca676",
+          "product_id": 1,
+          "author": "Jess",
+          "body": "<p>Loved it</p>",
+          "approved": 1
+        }
+      }
+    ]
+  }
 }
 ]
 }

@@ -29,7 +29,7 @@ All product rows are real `Execution` on the 3-app realistic dev cells (acme-saa
 | :--- | :--- | :--- |
 | Product floor (`Execution --no-llm`) | **36 / 59 (61.0%)**, **100%** precision, 0 decoy/unmatched | acme **14**, shopflow 12, opsportal 10; 3 runs, 0 spread, identical site-set hash |
 | Floor determinism | **0 spread**, 3 repeats identical (site sets included, `driftApps=0`) | Re-gated on the current tree |
-| Salted held-out product floor (seed 1000042) | **26 / 58 (44.8%)**, **100%** precision | acme 11, shopflow 8, opsportal 7; 28/58 not reproducible on main — see erratum note; gains from inferred-param discovery and quota reservation remain valid |
+| Salted held-out product floor (seed 1000042) | **28 / 58 (48.3%)**, **100%** precision, 0 decoy/unmatched | acme 11, shopflow **10**, opsportal 7; 0 `broker.persona_scope_mismatch` events; `persona-binding` (`222bc90`) resolved the 26-vs-28 erratum (viewer legitimately owns `9ca676`; `0df720d` had dropped `state_restore`) |
 | Agentic, 600 s generous, 3 apps dev | **35 / 59 (59.3%)**, **100%** precision, 0 unmatched, **+2 net** | acme 13 (+1), shopflow 12 (+1), opsportal 10 (**+0**); ~$1.0 total |
 | Agentic, 600 s generous, 3 apps salted held-out | **29 / 58 (50.0%)**, **+1 net**, **100%** precision, 0 unmatched, 0 decoy | acme 11, shopflow **11**, opsportal 7; floor 28/58; 39 investigations; first fully quotable precision run |
 | Agentic rotation (shopflow, resumed, 300 s) | **3 / 19**, **100%** precision, p50 **77.5 s** | After injection-class precedence fix |
@@ -51,7 +51,7 @@ All product rows are real `Execution` on the 3-app realistic dev cells (acme-saa
 | Gate | Target | Measured | Status |
 | :--- | :--- | :--- | :--- |
 | **Floor** dev | 0 spread, 100% precision | **36/59 (61.0%)**, 3 runs, 0 spread, identical site sets | **PASS** |
-| **Floor** salted held-out | 100% precision, no regression | **26/58 (44.8%)** on main, 100% — *provisional* pending the persona-scope bisect (an earlier 28/58 is not reproducible) | **PROVISIONAL** |
+| **Floor** salted held-out | 100% precision, no regression | **28/58 (48.3%)** (11/10/7) on `main` @ `222bc90` (`persona-binding`), **100%** precision, 0 decoy/unmatched FPs, 0 `broker.persona_scope_mismatch` events — 26-vs-28 erratum resolved (viewer legitimately owns `9ca676`; `0df720d` had dropped `state_restore`) | **PASS** |
 | Worst-run precision (agentic) | 100% on every cell | dev **36/59** and held-out **29/58**, both **100%**, 0 unmatched / 0 decoy / 0 misclassified | **PASS** |
 | Confirmation integrity | no confirmed finding with a non-confirming diff | store-level `InvariantError`; `audit-confirmation-consistency` clean on every kept cell | **PASS** |
 | Legacy regression | xben 25/25, held-out 20/20 + 20/20 patches | holds on every validation run | **PASS** |
@@ -112,6 +112,7 @@ The fast battery answers one question: **did this change break the funnel, the p
 | Floor repeat spread **29 / 30 / 33** | Canonical endpoint/probe/ID/persona ordering, state-clobber isolation, request-first termination with wall margin | **0 spread**, 3 identical repeats and site sets (26/59 tree), idle *and* loaded |
 | 3 unmatched FPs in the K=6 cell: a planted mass-assignment target labelled BOLA; two fixture XSS escape defects | Evidence-first impact classification (CWE-915) and fixture escaping | **100%** precision on K=6 |
 | Stored 2FA over-claim and `/api/admin/activity` false charge | Universal default-deny boundary + real MFA gate; `misclassifiedFindingIds` grader bucket (neither TP nor FP) | Over-claim dismissed; acme samples 100% precision |
+| Salted held-out floor dropped **28/58 → 26/58** (shopflow 10 → 8; 26-vs-28 certificate erratum) | `persona-binding` (`222bc90`): per-request `(run, assignment, role, persona, session)` broker jars + fail-closed `broker.persona_scope_mismatch` + `floor-recipes.ts` post-observation `state_restore` | **28/58 (48.3%, 11/10/7) @ 100%** precision, 0 decoy/unmatched FPs, 0 `broker.persona_scope_mismatch` events; erratum resolved |
 | **Open:** 45-min "invoice amount accepts negative values" claim | Triage in flight (genuine invariant bug vs echo/clamp) | **Unresolved** — reason the 45-min worst-run precision is not 100% |
 
 ### V7.5 Honest limitations

@@ -345,18 +345,19 @@ export function assessPublicness(args: { steps: readonly ImpactStep[]; probe: Im
       for (const [path, value] of probeFlat) if (referenceFlat.get(path) !== value) differing.add(path)
       for (const path of referenceFlat.keys()) if (!probeFlat.has(path)) differing.add(path)
       const leaves = [...differing].map(path => (path.replace(/\[\d+\]/g, '').split('.').pop() ?? '').toLowerCase())
-      differingOnlyPublic = differing.size > 0 && leaves.every(leaf => listing.has(leaf)) && !leaves.some(leaf => IDENTITY_FIELD_RE.test(leaf))
+      differingOnlyPublic = differing.size > 0 && leaves.every(leaf => listing.has(leaf)) && !leaves.some(leaf => PRINCIPAL_IDENTITY_FIELD_RE.test(leaf))
       if (!differingOnlyPublic) continue
     }
     // A genuine victim-owned attribute or canary in the shared payload defeats publicness.
+    // Plain content-attribution labels (e.g. a display `author` on a public review or comment)
+    // only bind an owner when the value actually carries an email, canary, or reference principal.
     const ownerBound = probeFlat
       ? [...probeFlat.entries()].some(([path, value]) => {
         if (!value || value === 'null') return false
         // Bound when the same value is served to a *control* actor (the owner reference read).
         if (!controlFlats.some(flat => flat.get(path) === value)) return false
         const leaf = (path.replace(/\[\d+\]/g, '').split('.').pop() ?? '').toLowerCase()
-        if (CANARY_VALUE_RE.test(value)) return true
-        return IDENTITY_FIELD_RE.test(leaf) && reference.actor.handle !== null
+        return isOwnerBoundIdentity(leaf, value, reference)
       })
       : false
     if (ownerBound) continue
@@ -452,10 +453,69 @@ const PROTECTED_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:tenant(?:_?id)?|owner(?:_?id)?
  */
 const FUNCTION_SURFACE_RE = /(?:^|\/)(?:admin(?:istrator)?|internal|manage|management|staff|superuser|privileged|backoffice|permissions?|roles?|grants?|scopes?|impersonate|feature[-_]?flags?)(?:\/|$)/i
 const PRICE_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:price(?:_?cents)?|amount(?:_?cents)?|cost(?:_?cents)?)$/i
-const IDENTITY_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:owner(?:_?id)?|tenant(?:_?id)?|user(?:_?id)?|email|username|subject|created_?by|author)$/i
+/**
+ * Account/tenant ownership identifiers that bind an object to a specific principal. Kept distinct
+ * from public content-attribution labels (`author`, `subject`) so a public review/comment naming
+ * a display author does not defeat publicness unless its value carries an email, canary, or
+ * reference principal identity.
+ */
+const PRINCIPAL_IDENTITY_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:owner(?:_?id)?|tenant(?:_?id)?|user(?:_?id)?|email|username|created_?by)$/i
+const ATTRIBUTION_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:author|subject)$/i
+const EMAIL_VALUE_RE = /^[^\s@]{1,64}@[^\s@]{1,128}\.[a-z]{2,24}$/i
 const SECRET_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:secret|api_?key|access_?token|token|password|hash|private_?note|note|internal|ssn)$/i
 /** Tenant/secret canary value shape emitted by the lab canary registry (`rbc_`/`rbs_`). */
 const CANARY_VALUE_RE = /\brb[cs]_[a-z0-9]+_[0-9a-f]{6,}\b/i
+
+function isOwnerBoundIdentity(leaf: string, value: string, reference?: ImpactStep | null): boolean {
+  if (CANARY_VALUE_RE.test(value)) return true
+  if (reference && reference.actor.handle === null) return false
+  if (PRINCIPAL_IDENTITY_FIELD_RE.test(leaf)) return true
+  if (ATTRIBUTION_FIELD_RE.test(leaf)) {
+    const normalized = deRedactIdentity(value.trim())
+    if (EMAIL_VALUE_RE.test(normalized)) return true
+    if (reference) {
+      const refHandle = reference.actor.handle?.toLowerCase() ?? null
+      const refTenant = reference.actor.tenant?.toLowerCase() ?? null
+      if ((refHandle !== null && normalized === refHandle) || (refTenant !== null && normalized === refTenant)) return true
+    }
+  }
+  return false
+}
+
+/**
+ * When a read-only chain marks both a collection listing and a child item read as `probe` steps
+ * (e.g. actor B lists its own collection, then fetches actor A's item), pick the target item read
+ * rather than the prerequisite listing so publicness and cross-tenant checks inspect the claimed
+ * object.
+ */
+function selectPrimaryReadProbe(probeReads: readonly ImpactStep[], controls: readonly ImpactStep[]): ImpactStep | undefined {
+  if (probeReads.length <= 1) return probeReads[0]
+  let best = probeReads[0]!
+  for (const candidate of probeReads.slice(1)) {
+    const bestFamily = routeFamily(best.route ?? best.pathAndQuery ?? '')
+    const candidateFamily = routeFamily(candidate.route ?? candidate.pathAndQuery ?? '')
+    if (bestFamily && candidateFamily && candidateFamily.startsWith(`${bestFamily}/`)) {
+      best = candidate
+      continue
+    }
+    const bestHasExactControl = controls.some(control =>
+      isReadMethod(control.method) &&
+      isSuccess(control.status) &&
+      control.actor.handle !== best.actor.handle &&
+      sameRoute(control, best) &&
+      (control.pathAndQuery === undefined || best.pathAndQuery === undefined || control.pathAndQuery === best.pathAndQuery))
+    const candidateHasExactControl = controls.some(control =>
+      isReadMethod(control.method) &&
+      isSuccess(control.status) &&
+      control.actor.handle !== candidate.actor.handle &&
+      sameRoute(control, candidate) &&
+      (control.pathAndQuery === undefined || candidate.pathAndQuery === undefined || control.pathAndQuery === candidate.pathAndQuery))
+    if (!bestHasExactControl && candidateHasExactControl) {
+      best = candidate
+    }
+  }
+  return best
+}
 
 export function isProtectedField(path: string): boolean {
   const leaf = path.split('.').pop()?.toLowerCase() ?? ''
@@ -688,7 +748,8 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
   const requiredRole = normalizeRole(input.requiredRole)
   const requiredRank = roleRank(requiredRole)
   const mutatingProbe = probeSuccesses.find(step => stepMutatesState(step)) ?? null
-  const probe = mutatingProbe ?? probeSuccesses.find(step => isReadMethod(step.method)) ?? probeSuccesses[0] ?? probes[0]
+  const primaryReadProbe = selectPrimaryReadProbe(probeSuccesses.filter(step => isReadMethod(step.method)), controls)
+  const probe = mutatingProbe ?? primaryReadProbe ?? probeSuccesses[0] ?? probes[0]
   // A denial proves *this actor* is unentitled only when the denied control is a peer of the probe
   // (same tenant, or both unknown). A cross-tenant control that is denied shows tenant isolation,
   // which is the app working, not a boundary the probe crossed.
@@ -883,6 +944,37 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
         satisfied: false,
         reason: `Cross-tenant claim dismissed (publicness): ${publicness.reason}.`,
         evidence: base,
+      }
+    }
+    // A cross-tenant read backed ONLY by a parent-collection listing (no same-route owner
+    // reference to compare for publicness and no denied control on the route) must expose an
+    // owner-scoped principal identifier, tenant canary, or secret fingerprint; otherwise any
+    // public item fetched after listing another tenant's collection would bypass publicness.
+    const sameRouteControlRead = controls.some(control =>
+      isReadMethod(control.method) &&
+      isSuccess(control.status) &&
+      control.json !== undefined &&
+      sameRoute(control, probe) &&
+      Boolean(control.actor.tenant && probe.actor.tenant && control.actor.tenant !== probe.actor.tenant))
+    if (!sameRouteControlRead && !boundaryControlDenied && !roleDifferential) {
+      const probeFlat = probe.json !== undefined && probe.json !== null && typeof probe.json === 'object'
+        ? flattenJson(probe.json)
+        : null
+      const hasSecretMatch = (probe.secretMatches?.length ?? 0) > 0
+      const hasPrincipalOrCanary = hasSecretMatch || (probeFlat
+        ? [...probeFlat.entries()].some(([path, value]) => {
+          if (!value || value === 'null') return false
+          const leaf = (path.replace(/\[\d+\]/g, '').split('.').pop() ?? '').toLowerCase()
+          return isOwnerBoundIdentity(leaf, value)
+        })
+        : false)
+      if (!hasPrincipalOrCanary) {
+        return {
+          required: true,
+          satisfied: false,
+          reason: 'Cross-tenant claim dismissed (publicness): no same-route owner reference or denied control establishes non-publicness on this route, and the response exposes no owner-scoped principal identifier or tenant canary.',
+          evidence: base,
+        }
       }
     }
     return {
