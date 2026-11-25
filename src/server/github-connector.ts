@@ -16,22 +16,85 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, relative, resolve, sep } from 'node:path'
+import { dirname, join, relative, resolve, sep } from 'node:path'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import { mineSecurityRelevantCommitDiffs, type CommitDiffSignal } from './program-graph.ts'
 
 export const DEFAULT_GITHUB_PAT_PATH = join(homedir(), '.config', 'guardian-fixtures', 'github.pat')
 export const DEFAULT_GITHUB_MAX_AUTO_SELECT = 10
+export const DEFAULT_GITHUB_BASE_URL = 'https://github.com'
+export const DEFAULT_GITHUB_API_BASE_URL = 'https://api.github.com'
+const GITHUB_REFRESH_LEEWAY_MS = 5 * 60 * 1000
+const MAX_PENDING_DEVICE_FLOWS = 32
 
 export type GithubPatSource = 'vault' | 'fixture'
-export type GithubPatKind = 'fine_grained' | 'classic' | 'unknown'
+export type GithubPatKind = 'fine_grained' | 'classic' | 'github_app' | 'unknown'
+export type GithubAuthKind = 'github_app_device' | 'pat'
 
 export interface GithubPatStatus {
   configured: boolean
   source: GithubPatSource | null
   tokenKind: GithubPatKind | null
 }
+
+export interface GithubAuthStatus extends GithubPatStatus {
+  authKind: GithubAuthKind | null
+  login: string | null
+  expiresAt: string | null
+  githubDeviceFlowConfigured: boolean
+  clientIdSource: 'env' | 'vault' | null
+}
+
+export interface StoredGithubVaultCredential {
+  accessToken: string
+  refreshToken?: string
+  expiresAt?: string
+  refreshTokenExpiresAt?: string
+  clientId?: string
+  login?: string
+  authKind: GithubAuthKind
+}
+
+export interface StartGithubDeviceFlowOptions {
+  dataDir?: string
+  clientId?: string
+  githubBaseUrl?: string
+  apiBaseUrl?: string
+  fetchImpl?: typeof fetch
+  signal?: AbortSignal
+}
+
+export interface StartGithubDeviceFlowResult {
+  flowId: string
+  userCode: string
+  verificationUri: string
+  expiresIn: number
+  intervalSec: number
+}
+
+export interface PollGithubDeviceFlowOptions {
+  dataDir?: string
+  githubBaseUrl?: string
+  apiBaseUrl?: string
+  fetchImpl?: typeof fetch
+  signal?: AbortSignal
+}
+
+export type PollGithubDeviceFlowResult =
+  | { status: 'pending'; intervalSec: number }
+  | { status: 'slow_down'; intervalSec: number }
+  | { status: 'expired'; error: string }
+  | { status: 'denied'; error: string }
+  | { status: 'error'; error: string }
+  | {
+      status: 'authorized'
+      login: string | null
+      authKind: 'github_app_device'
+      repoCount: number
+      expiresAt: string | null
+      accountStatus: GithubAuthStatus
+    }
 
 export interface AccessibleGithubRepo {
   fullName: string
@@ -45,6 +108,7 @@ export interface ListAccessibleGithubReposOptions {
   dataDir?: string
   patPath?: string
   apiBaseUrl?: string
+  githubBaseUrl?: string
   fetchImpl?: typeof fetch
   maxRepos?: number
   signal?: AbortSignal
@@ -105,6 +169,7 @@ export interface GithubSyncOptions {
   dataDir?: string
   patPath?: string
   apiBaseUrl?: string
+  githubBaseUrl?: string
   gitBaseUrl?: string
   cloneDir?: string
   fetchImpl?: typeof fetch
@@ -230,11 +295,116 @@ function vaultGithubPatPath(dataDir: string): string {
   return join(assertValidDataDir(dataDir), 'credentials', 'github.pat')
 }
 
+function vaultGithubAppConfigPath(dataDir: string): string {
+  return join(assertValidDataDir(dataDir), 'credentials', 'github-app.json')
+}
+
 export function classifyGithubPatKind(token: string): GithubPatKind {
   const trimmed = token.trim()
   if (trimmed.startsWith('github_pat_')) return 'fine_grained'
-  if (/^gh[pousr]_/.test(trimmed)) return 'classic'
+  if (trimmed.startsWith('ghu_')) return 'github_app'
+  if (/^gh[posr]_/.test(trimmed)) return 'classic'
   return 'unknown'
+}
+
+function writeAtomic0600(filePath: string, content: string): void {
+  const dir = dirname(filePath)
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  chmodSync(dir, 0o700)
+
+  const tmpPath = join(dir, `.tmp-${randomUUID()}`)
+  try {
+    writeFileSync(tmpPath, content, { encoding: 'utf8', mode: 0o600 })
+    chmodSync(tmpPath, 0o600)
+    renameSync(tmpPath, filePath)
+    chmodSync(filePath, 0o600)
+  } finally {
+    if (existsSync(tmpPath)) {
+      try { rmSync(tmpPath, { force: true }) } catch { /* best-effort */ }
+    }
+  }
+}
+
+function validateTokenString(raw: string, label = 'GitHub token'): string {
+  const token = raw.trim()
+  if (!token || token.length < 10 || token.length > 512 || /[\s\0]/.test(token)) {
+    throw new Error(`${label} must be a single non-empty token without whitespace.`)
+  }
+  return token
+}
+
+function validateGithubClientId(raw: string): string {
+  const clientId = raw.trim()
+  if (!clientId || clientId.length < 6 || clientId.length > 128 || !/^[a-zA-Z0-9._-]+$/.test(clientId)) {
+    throw new Error('GitHub App Client ID must be 6–128 alphanumeric, dot, dash, or underscore characters.')
+  }
+  return clientId
+}
+
+function readOwnerOnlyFile(filePath: string, label: string): string {
+  const stat = statSync(filePath)
+  if (!stat.isFile() || stat.size === 0) {
+    throw new Error(`${label} is missing or empty.`)
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    throw new Error(`${label} must have owner-only 0600 permissions.`)
+  }
+  accessSync(filePath, constants.R_OK)
+  return readFileSync(filePath, 'utf8').trim()
+}
+
+export function saveGithubClientId(dataDir: string, rawClientId: string): string {
+  const clientId = validateGithubClientId(rawClientId)
+  writeAtomic0600(vaultGithubAppConfigPath(dataDir), `${JSON.stringify({ clientId }, null, 2)}\n`)
+  return clientId
+}
+
+function readVaultGithubClientId(dataDir?: string): string | null {
+  if (!dataDir) return null
+  const patPath = vaultGithubPatPath(dataDir)
+  if (existsSync(patPath)) {
+    try {
+      const cred = readGithubVaultCredential(patPath)
+      if (cred.clientId) return validateGithubClientId(cred.clientId)
+    } catch {
+      // Fall through to github-app.json
+    }
+  }
+  const appConfigPath = vaultGithubAppConfigPath(dataDir)
+  if (existsSync(appConfigPath)) {
+    try {
+      const raw = readOwnerOnlyFile(appConfigPath, 'GitHub App config file')
+      const parsed = JSON.parse(raw) as { clientId?: unknown }
+      if (typeof parsed.clientId === 'string' && parsed.clientId.trim()) {
+        return validateGithubClientId(parsed.clientId)
+      }
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+export function resolveGithubClientId(
+  dataDir?: string,
+  explicitClientId?: string,
+): { clientId: string | null; source: 'input' | 'env' | 'vault' | null } {
+  if (typeof explicitClientId === 'string' && explicitClientId.trim()) {
+    return { clientId: validateGithubClientId(explicitClientId), source: 'input' }
+  }
+  const envClientId = process.env.GUARDIAN_GITHUB_CLIENT_ID?.trim()
+  if (envClientId) {
+    try {
+      return { clientId: validateGithubClientId(envClientId), source: 'env' }
+    } catch {
+      return { clientId: null, source: null }
+    }
+  }
+  const vaultClientId = readVaultGithubClientId(dataDir)
+  if (vaultClientId) {
+    return { clientId: vaultClientId, source: 'vault' }
+  }
+  return { clientId: null, source: null }
 }
 
 /**
@@ -249,20 +419,79 @@ export function resolveGithubPatPath(dataDir?: string): string {
   return DEFAULT_GITHUB_PAT_PATH
 }
 
-function readGithubPat(patPath = DEFAULT_GITHUB_PAT_PATH): string {
-  const stat = statSync(patPath)
-  if (!stat.isFile() || stat.size === 0) {
-    throw new Error('GitHub PAT file is missing or empty.')
+export function readGithubVaultCredential(patPath = DEFAULT_GITHUB_PAT_PATH): StoredGithubVaultCredential {
+  const raw = readOwnerOnlyFile(patPath, 'GitHub PAT file')
+  if (raw.startsWith('{')) {
+    let parsed: Record<string, unknown>
+    try {
+      parsed = JSON.parse(raw) as Record<string, unknown>
+    } catch {
+      throw new Error('GitHub credential file contains malformed JSON.')
+    }
+    if (typeof parsed.accessToken !== 'string') {
+      throw new Error('GitHub credential file does not contain a valid access token.')
+    }
+    const accessToken = validateTokenString(parsed.accessToken, 'GitHub access token')
+    const refreshToken = typeof parsed.refreshToken === 'string' && parsed.refreshToken.trim()
+      ? validateTokenString(parsed.refreshToken, 'GitHub refresh token')
+      : undefined
+    const expiresAt = typeof parsed.expiresAt === 'string' && Number.isFinite(Date.parse(parsed.expiresAt))
+      ? parsed.expiresAt
+      : undefined
+    const refreshTokenExpiresAt = typeof parsed.refreshTokenExpiresAt === 'string' && Number.isFinite(Date.parse(parsed.refreshTokenExpiresAt))
+      ? parsed.refreshTokenExpiresAt
+      : undefined
+    const clientId = typeof parsed.clientId === 'string' && parsed.clientId.trim()
+      ? validateGithubClientId(parsed.clientId)
+      : undefined
+    const login = typeof parsed.login === 'string' && parsed.login.trim()
+      ? parsed.login.trim().slice(0, 100)
+      : undefined
+    const authKind: GithubAuthKind = parsed.authKind === 'github_app_device' ? 'github_app_device' : 'pat'
+    return {
+      accessToken,
+      ...(refreshToken ? { refreshToken } : {}),
+      ...(expiresAt ? { expiresAt } : {}),
+      ...(refreshTokenExpiresAt ? { refreshTokenExpiresAt } : {}),
+      ...(clientId ? { clientId } : {}),
+      ...(login ? { login } : {}),
+      authKind,
+    }
   }
-  if ((stat.mode & 0o077) !== 0) {
-    throw new Error('GitHub PAT file must have owner-only 0600 permissions.')
-  }
-  accessSync(patPath, constants.R_OK)
-  const pat = readFileSync(patPath, 'utf8').trim()
-  if (!pat || pat.length < 10) {
+  if (!raw || raw.length < 10) {
     throw new Error('GitHub PAT file does not contain a valid token.')
   }
-  return pat
+  return {
+    accessToken: raw,
+    authKind: 'pat',
+  }
+}
+
+function readGithubPat(patPath = DEFAULT_GITHUB_PAT_PATH): string {
+  return readGithubVaultCredential(patPath).accessToken
+}
+
+export function saveGithubVaultCredential(
+  dataDir: string,
+  credential: StoredGithubVaultCredential,
+): GithubAuthStatus {
+  const accessToken = validateTokenString(credential.accessToken, 'GitHub access token')
+  const normalized: StoredGithubVaultCredential = {
+    accessToken,
+    ...(credential.refreshToken ? { refreshToken: validateTokenString(credential.refreshToken, 'GitHub refresh token') } : {}),
+    ...(credential.expiresAt && Number.isFinite(Date.parse(credential.expiresAt)) ? { expiresAt: credential.expiresAt } : {}),
+    ...(credential.refreshTokenExpiresAt && Number.isFinite(Date.parse(credential.refreshTokenExpiresAt))
+      ? { refreshTokenExpiresAt: credential.refreshTokenExpiresAt }
+      : {}),
+    ...(credential.clientId ? { clientId: validateGithubClientId(credential.clientId) } : {}),
+    ...(credential.login && credential.login.trim() ? { login: credential.login.trim().slice(0, 100) } : {}),
+    authKind: credential.authKind === 'github_app_device' ? 'github_app_device' : 'pat',
+  }
+  writeAtomic0600(vaultGithubPatPath(dataDir), `${JSON.stringify(normalized, null, 2)}\n`)
+  if (normalized.clientId) {
+    saveGithubClientId(dataDir, normalized.clientId)
+  }
+  return getGithubAuthStatus(dataDir)
 }
 
 export function saveGithubPat(dataDir: string, rawToken: string): GithubPatStatus {
@@ -270,22 +499,7 @@ export function saveGithubPat(dataDir: string, rawToken: string): GithubPatStatu
   if (!token || token.length < 10 || token.length > 512 || /[\s\0]/.test(token)) {
     throw new Error('GitHub PAT must be a single non-empty token without whitespace.')
   }
-  const credDir = join(assertValidDataDir(dataDir), 'credentials')
-  mkdirSync(credDir, { recursive: true, mode: 0o700 })
-  chmodSync(credDir, 0o700)
-
-  const patPath = join(credDir, 'github.pat')
-  const tmpPath = join(credDir, `.github.pat.tmp-${randomUUID()}`)
-  try {
-    writeFileSync(tmpPath, `${token}\n`, { encoding: 'utf8', mode: 0o600 })
-    chmodSync(tmpPath, 0o600)
-    renameSync(tmpPath, patPath)
-    chmodSync(patPath, 0o600)
-  } finally {
-    if (existsSync(tmpPath)) {
-      try { rmSync(tmpPath, { force: true }) } catch { /* best-effort */ }
-    }
-  }
+  writeAtomic0600(vaultGithubPatPath(dataDir), `${token}\n`)
   return {
     configured: true,
     source: 'vault',
@@ -335,6 +549,495 @@ export function getGithubPatStatus(dataDir?: string, explicitPatPath?: string): 
   }
 }
 
+export function getGithubAuthStatus(dataDir?: string, explicitPatPath?: string): GithubAuthStatus {
+  const resolvedClient = resolveGithubClientId(dataDir)
+  const clientIdSource = resolvedClient.source === 'env' || resolvedClient.source === 'vault'
+    ? resolvedClient.source
+    : null
+  const baseUnconfigured: GithubAuthStatus = {
+    configured: false,
+    source: null,
+    tokenKind: null,
+    authKind: null,
+    login: null,
+    expiresAt: null,
+    githubDeviceFlowConfigured: Boolean(resolvedClient.clientId),
+    clientIdSource,
+  }
+
+  const readStatusFromPath = (targetPath: string, source: GithubPatSource): GithubAuthStatus => {
+    const cred = readGithubVaultCredential(targetPath)
+    const effectiveClient = cred.clientId
+      ? { clientId: cred.clientId, source: (clientIdSource ?? 'vault') as 'env' | 'vault' }
+      : { clientId: resolvedClient.clientId, source: clientIdSource }
+    return {
+      configured: true,
+      source,
+      tokenKind: classifyGithubPatKind(cred.accessToken),
+      authKind: cred.authKind,
+      login: cred.login ?? null,
+      expiresAt: cred.expiresAt ?? null,
+      githubDeviceFlowConfigured: Boolean(effectiveClient.clientId),
+      clientIdSource: effectiveClient.source,
+    }
+  }
+
+  if (explicitPatPath) {
+    try {
+      const source: GithubPatSource = resolve(explicitPatPath) === resolve(DEFAULT_GITHUB_PAT_PATH) ? 'fixture' : 'vault'
+      return readStatusFromPath(explicitPatPath, source)
+    } catch {
+      return baseUnconfigured
+    }
+  }
+  if (dataDir) {
+    const vaultPath = vaultGithubPatPath(dataDir)
+    if (existsSync(vaultPath)) {
+      try {
+        return readStatusFromPath(vaultPath, 'vault')
+      } catch {
+        return baseUnconfigured
+      }
+    }
+  }
+  try {
+    return readStatusFromPath(DEFAULT_GITHUB_PAT_PATH, 'fixture')
+  } catch {
+    return baseUnconfigured
+  }
+}
+
+interface PendingDeviceFlow {
+  flowId: string
+  deviceCode: string
+  clientId: string
+  intervalSec: number
+  expiresAtMs: number
+  createdAtMs: number
+  githubBaseUrl: string
+  apiBaseUrl: string
+  dataDir?: string
+}
+
+const pendingDeviceFlows = new Map<string, PendingDeviceFlow>()
+const inFlightTokenRefreshes = new Map<string, Promise<StoredGithubVaultCredential>>()
+
+function prunePendingDeviceFlows(nowMs = Date.now()): void {
+  for (const [id, flow] of pendingDeviceFlows) {
+    if (flow.expiresAtMs <= nowMs) {
+      pendingDeviceFlows.delete(id)
+    }
+  }
+  while (pendingDeviceFlows.size >= MAX_PENDING_DEVICE_FLOWS) {
+    let oldestId: string | undefined
+    let oldestTime = Infinity
+    for (const [id, flow] of pendingDeviceFlows) {
+      if (flow.createdAtMs < oldestTime) {
+        oldestTime = flow.createdAtMs
+        oldestId = id
+      }
+    }
+    if (!oldestId) break
+    pendingDeviceFlows.delete(oldestId)
+  }
+}
+
+async function resolveFreshGithubCredential(options: {
+  dataDir?: string
+  patPath?: string
+  githubBaseUrl?: string
+  fetchImpl?: typeof fetch
+  signal?: AbortSignal
+} = {}): Promise<StoredGithubVaultCredential> {
+  const effectivePath = options.patPath ?? resolveGithubPatPath(options.dataDir)
+  const cred = readGithubVaultCredential(effectivePath)
+  if (!cred.expiresAt || !cred.refreshToken) {
+    return cred
+  }
+  const expiresAtMs = Date.parse(cred.expiresAt)
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs - Date.now() > GITHUB_REFRESH_LEEWAY_MS) {
+    return cred
+  }
+
+  const clientId = cred.clientId ?? resolveGithubClientId(options.dataDir).clientId
+  if (!clientId) {
+    return cred
+  }
+
+  const existing = inFlightTokenRefreshes.get(effectivePath)
+  if (existing) return existing
+
+  const refreshPromise = (async (): Promise<StoredGithubVaultCredential> => {
+    const nowMs = Date.now()
+    if (cred.refreshTokenExpiresAt) {
+      const refreshExpMs = Date.parse(cred.refreshTokenExpiresAt)
+      if (Number.isFinite(refreshExpMs) && refreshExpMs <= nowMs) {
+        throw new Error('GitHub session refresh token expired. Please sign in with GitHub again.')
+      }
+    }
+
+    const secrets: NamedSecret[] = [
+      { value: cred.accessToken, placeholder: '[redacted]' },
+      { value: cred.refreshToken!, placeholder: '[redacted]' },
+    ]
+    const githubBase = (options.githubBaseUrl ?? DEFAULT_GITHUB_BASE_URL).replace(/\/+$/, '')
+    const fetchFn = options.fetchImpl ?? fetch
+    const reqSignal = options.signal
+      ? AbortSignal.any([options.signal, AbortSignal.timeout(20_000)])
+      : AbortSignal.timeout(20_000)
+
+    const res = await fetchFn(`${githubBase}/login/oauth/access_token`, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'Guardian/2 read-only repo connector',
+      },
+      body: new URLSearchParams({
+        client_id: clientId,
+        grant_type: 'refresh_token',
+        refresh_token: cred.refreshToken!,
+      }).toString(),
+      signal: reqSignal,
+    })
+
+    const rawText = await res.text().catch(() => '')
+    let parsed: Record<string, unknown> = {}
+    try {
+      parsed = rawText ? JSON.parse(rawText) as Record<string, unknown> : {}
+    } catch {
+      parsed = {}
+    }
+
+    if (typeof parsed.access_token === 'string') {
+      secrets.push({ value: parsed.access_token, placeholder: '[redacted]' })
+    }
+    if (typeof parsed.refresh_token === 'string') {
+      secrets.push({ value: parsed.refresh_token, placeholder: '[redacted]' })
+    }
+
+    if (!res.ok || typeof parsed.error === 'string') {
+      const detail = redact(
+        String(parsed.error_description || parsed.error || rawText || `HTTP ${res.status}`),
+        secrets,
+      ).slice(0, 240)
+      throw new Error(`GitHub token refresh failed (${res.status}): ${detail}. Please sign in with GitHub again.`)
+    }
+
+    if (typeof parsed.access_token !== 'string' || parsed.access_token.trim().length < 10) {
+      throw new Error('GitHub token refresh response did not include a valid access token.')
+    }
+
+    const refreshedNowMs = Date.now()
+    const newAccessToken = validateTokenString(parsed.access_token, 'GitHub access token')
+    const newRefreshToken = typeof parsed.refresh_token === 'string' && parsed.refresh_token.trim()
+      ? validateTokenString(parsed.refresh_token, 'GitHub refresh token')
+      : cred.refreshToken
+    const newExpiresAt = typeof parsed.expires_in === 'number' && Number.isFinite(parsed.expires_in) && parsed.expires_in > 0
+      ? new Date(refreshedNowMs + parsed.expires_in * 1000).toISOString()
+      : cred.expiresAt
+    const newRefreshExpiresAt = typeof parsed.refresh_token_expires_in === 'number'
+      && Number.isFinite(parsed.refresh_token_expires_in)
+      && parsed.refresh_token_expires_in > 0
+      ? new Date(refreshedNowMs + parsed.refresh_token_expires_in * 1000).toISOString()
+      : cred.refreshTokenExpiresAt
+
+    const updated: StoredGithubVaultCredential = {
+      accessToken: newAccessToken,
+      ...(newRefreshToken ? { refreshToken: newRefreshToken } : {}),
+      ...(newExpiresAt ? { expiresAt: newExpiresAt } : {}),
+      ...(newRefreshExpiresAt ? { refreshTokenExpiresAt: newRefreshExpiresAt } : {}),
+      clientId,
+      ...(cred.login ? { login: cred.login } : {}),
+      authKind: cred.authKind,
+    }
+
+    writeAtomic0600(effectivePath, `${JSON.stringify(updated, null, 2)}\n`)
+    return updated
+  })()
+
+  inFlightTokenRefreshes.set(effectivePath, refreshPromise)
+  try {
+    return await refreshPromise
+  } finally {
+    inFlightTokenRefreshes.delete(effectivePath)
+  }
+}
+
+export async function startGithubDeviceFlow(
+  input: StartGithubDeviceFlowOptions = {},
+): Promise<StartGithubDeviceFlowResult> {
+  input.signal?.throwIfAborted()
+  const resolved = resolveGithubClientId(input.dataDir, input.clientId)
+  if (!resolved.clientId) {
+    throw new Error('GitHub App Client ID is required. Set GUARDIAN_GITHUB_CLIENT_ID or enter your GitHub App Client ID.')
+  }
+  const clientId = resolved.clientId
+  if (input.clientId && input.dataDir) {
+    saveGithubClientId(input.dataDir, clientId)
+  }
+
+  const githubBase = (input.githubBaseUrl ?? DEFAULT_GITHUB_BASE_URL).replace(/\/+$/, '')
+  const apiBase = (input.apiBaseUrl ?? DEFAULT_GITHUB_API_BASE_URL).replace(/\/+$/, '')
+  const fetchFn = input.fetchImpl ?? fetch
+  const reqSignal = input.signal
+    ? AbortSignal.any([input.signal, AbortSignal.timeout(20_000)])
+    : AbortSignal.timeout(20_000)
+
+  const res = await fetchFn(`${githubBase}/login/device/code`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': 'Guardian/2 read-only repo connector',
+    },
+    body: new URLSearchParams({ client_id: clientId }).toString(),
+    signal: reqSignal,
+  })
+
+  const rawText = await res.text().catch(() => '')
+  let parsed: Record<string, unknown> = {}
+  try {
+    parsed = rawText ? JSON.parse(rawText) as Record<string, unknown> : {}
+  } catch {
+    parsed = {}
+  }
+
+  const secrets: NamedSecret[] = typeof parsed.device_code === 'string' && parsed.device_code
+    ? [{ value: parsed.device_code, placeholder: '[redacted]' }]
+    : []
+
+  if (!res.ok || typeof parsed.error === 'string') {
+    const detail = redact(
+      String(parsed.error_description || parsed.error || rawText || `HTTP ${res.status}`),
+      secrets,
+    ).slice(0, 240)
+    throw new Error(`GitHub device authorization failed to start (${res.status}): ${detail}`)
+  }
+
+  const deviceCode = typeof parsed.device_code === 'string' ? parsed.device_code.trim() : ''
+  const userCode = typeof parsed.user_code === 'string' ? parsed.user_code.trim() : ''
+  const verificationUri = typeof parsed.verification_uri === 'string' ? parsed.verification_uri.trim() : ''
+  if (!deviceCode || !userCode || !verificationUri) {
+    throw new Error('GitHub device authorization response was missing required fields.')
+  }
+
+  const expiresIn = typeof parsed.expires_in === 'number' && Number.isFinite(parsed.expires_in) && parsed.expires_in > 0
+    ? Math.floor(parsed.expires_in)
+    : 900
+  const intervalSec = typeof parsed.interval === 'number' && Number.isFinite(parsed.interval) && parsed.interval >= 1
+    ? Math.ceil(parsed.interval)
+    : 5
+
+  const nowMs = Date.now()
+  prunePendingDeviceFlows(nowMs)
+  const flowId = randomUUID()
+  pendingDeviceFlows.set(flowId, {
+    flowId,
+    deviceCode,
+    clientId,
+    intervalSec,
+    expiresAtMs: nowMs + expiresIn * 1000,
+    createdAtMs: nowMs,
+    githubBaseUrl: githubBase,
+    apiBaseUrl: apiBase,
+    dataDir: input.dataDir,
+  })
+
+  return {
+    flowId,
+    userCode,
+    verificationUri,
+    expiresIn,
+    intervalSec,
+  }
+}
+
+export async function pollGithubDeviceFlow(
+  flowId: string,
+  options: PollGithubDeviceFlowOptions = {},
+): Promise<PollGithubDeviceFlowResult> {
+  options.signal?.throwIfAborted()
+  const flow = pendingDeviceFlows.get(flowId)
+  if (!flow) {
+    return { status: 'expired', error: 'GitHub sign-in session expired or was cancelled.' }
+  }
+  const nowMs = Date.now()
+  if (nowMs >= flow.expiresAtMs) {
+    pendingDeviceFlows.delete(flowId)
+    return { status: 'expired', error: 'GitHub device code expired. Start sign-in again.' }
+  }
+
+  const githubBase = (options.githubBaseUrl ?? flow.githubBaseUrl).replace(/\/+$/, '')
+  const apiBase = (options.apiBaseUrl ?? flow.apiBaseUrl).replace(/\/+$/, '')
+  const fetchFn = options.fetchImpl ?? fetch
+  const reqSignal = options.signal
+    ? AbortSignal.any([options.signal, AbortSignal.timeout(20_000)])
+    : AbortSignal.timeout(20_000)
+
+  const secrets: NamedSecret[] = [{ value: flow.deviceCode, placeholder: '[redacted]' }]
+
+  const res = await fetchFn(`${githubBase}/login/oauth/access_token`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': 'Guardian/2 read-only repo connector',
+    },
+    body: new URLSearchParams({
+      client_id: flow.clientId,
+      device_code: flow.deviceCode,
+      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+    }).toString(),
+    signal: reqSignal,
+  })
+
+  const rawText = await res.text().catch(() => '')
+  let parsed: Record<string, unknown> = {}
+  try {
+    parsed = rawText ? JSON.parse(rawText) as Record<string, unknown> : {}
+  } catch {
+    parsed = {}
+  }
+
+  if (typeof parsed.access_token === 'string' && parsed.access_token) {
+    secrets.push({ value: parsed.access_token, placeholder: '[redacted]' })
+  }
+  if (typeof parsed.refresh_token === 'string' && parsed.refresh_token) {
+    secrets.push({ value: parsed.refresh_token, placeholder: '[redacted]' })
+  }
+
+  if (!res.ok) {
+    const detail = redact(
+      String(parsed.error_description || parsed.error || rawText || `HTTP ${res.status}`),
+      secrets,
+    ).slice(0, 240)
+    return { status: 'error', error: `GitHub token polling failed (${res.status}): ${detail}` }
+  }
+
+  const errCode = typeof parsed.error === 'string' ? parsed.error : ''
+  if (errCode === 'authorization_pending') {
+    return { status: 'pending', intervalSec: flow.intervalSec }
+  }
+  if (errCode === 'slow_down') {
+    const suggested = typeof parsed.interval === 'number' && Number.isFinite(parsed.interval)
+      ? Math.ceil(parsed.interval)
+      : flow.intervalSec + 5
+    flow.intervalSec = Math.max(flow.intervalSec + 1, suggested)
+    return { status: 'slow_down', intervalSec: flow.intervalSec }
+  }
+  if (errCode === 'expired_token') {
+    pendingDeviceFlows.delete(flowId)
+    return {
+      status: 'expired',
+      error: redact(String(parsed.error_description || 'GitHub device code expired. Start sign-in again.'), secrets).slice(0, 240),
+    }
+  }
+  if (errCode === 'access_denied') {
+    pendingDeviceFlows.delete(flowId)
+    return {
+      status: 'denied',
+      error: redact(String(parsed.error_description || 'GitHub authorization was denied.'), secrets).slice(0, 240),
+    }
+  }
+  if (errCode) {
+    pendingDeviceFlows.delete(flowId)
+    return {
+      status: 'error',
+      error: redact(String(parsed.error_description || errCode), secrets).slice(0, 240),
+    }
+  }
+
+  if (typeof parsed.access_token !== 'string' || parsed.access_token.trim().length < 10) {
+    pendingDeviceFlows.delete(flowId)
+    return { status: 'error', error: 'GitHub did not return a valid access token.' }
+  }
+
+  const accessToken = validateTokenString(parsed.access_token, 'GitHub access token')
+  const refreshToken = typeof parsed.refresh_token === 'string' && parsed.refresh_token.trim()
+    ? validateTokenString(parsed.refresh_token, 'GitHub refresh token')
+    : undefined
+  const authNowMs = Date.now()
+  const expiresAt = typeof parsed.expires_in === 'number' && Number.isFinite(parsed.expires_in) && parsed.expires_in > 0
+    ? new Date(authNowMs + parsed.expires_in * 1000).toISOString()
+    : undefined
+  const refreshTokenExpiresAt = typeof parsed.refresh_token_expires_in === 'number'
+    && Number.isFinite(parsed.refresh_token_expires_in)
+    && parsed.refresh_token_expires_in > 0
+    ? new Date(authNowMs + parsed.refresh_token_expires_in * 1000).toISOString()
+    : undefined
+
+  // Best-effort lookup of GitHub username for UI badge
+  let login: string | null = null
+  try {
+    const userRes = await fetchFn(`${apiBase}/user`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'Guardian/2 read-only repo connector',
+      },
+      signal: options.signal
+        ? AbortSignal.any([options.signal, AbortSignal.timeout(10_000)])
+        : AbortSignal.timeout(10_000),
+    })
+    if (userRes.ok) {
+      const userJson = await userRes.json() as { login?: unknown }
+      if (typeof userJson.login === 'string' && userJson.login.trim()) {
+        login = userJson.login.trim().slice(0, 100)
+      }
+    }
+  } catch {
+    // Non-fatal: login badge is optional
+  }
+
+  const effectiveDataDir = options.dataDir ?? flow.dataDir
+  if (!effectiveDataDir) {
+    pendingDeviceFlows.delete(flowId)
+    throw new Error('Workspace data directory is required to store GitHub credentials.')
+  }
+
+  const accountStatus = saveGithubVaultCredential(effectiveDataDir, {
+    accessToken,
+    ...(refreshToken ? { refreshToken } : {}),
+    ...(expiresAt ? { expiresAt } : {}),
+    ...(refreshTokenExpiresAt ? { refreshTokenExpiresAt } : {}),
+    clientId: flow.clientId,
+    ...(login ? { login } : {}),
+    authKind: 'github_app_device',
+  })
+
+  pendingDeviceFlows.delete(flowId)
+
+  let repoCount = 0
+  try {
+    const listed = await listAccessibleGithubRepos({
+      dataDir: effectiveDataDir,
+      apiBaseUrl: apiBase,
+      githubBaseUrl: githubBase,
+      fetchImpl: fetchFn,
+      signal: options.signal,
+    })
+    repoCount = listed.repos.length
+  } catch {
+    // Non-fatal: token is stored; caller can refresh repo list separately
+  }
+
+  return {
+    status: 'authorized',
+    login,
+    authKind: 'github_app_device',
+    repoCount,
+    expiresAt: expiresAt ?? null,
+    accountStatus,
+  }
+}
+
+export function cancelGithubDeviceFlow(flowId: string): { cancelled: boolean } {
+  return { cancelled: pendingDeviceFlows.delete(flowId) }
+}
+
 export function hasGithubPat(patPathOrOptions?: string | { dataDir?: string; patPath?: string }): boolean {
   if (typeof patPathOrOptions === 'object' && patPathOrOptions !== null) {
     return getGithubPatStatus(patPathOrOptions.dataDir, patPathOrOptions.patPath).configured
@@ -375,11 +1078,20 @@ export async function listAccessibleGithubRepos(
   options: ListAccessibleGithubReposOptions = {},
 ): Promise<ListAccessibleGithubReposResult> {
   options.signal?.throwIfAborted()
-  const patPath = options.patPath ?? resolveGithubPatPath(options.dataDir)
-  const pat = readGithubPat(patPath)
+  const cred = await resolveFreshGithubCredential({
+    dataDir: options.dataDir,
+    patPath: options.patPath,
+    githubBaseUrl: options.githubBaseUrl,
+    fetchImpl: options.fetchImpl,
+    signal: options.signal,
+  })
+  const pat = cred.accessToken
   const tokenKind = classifyGithubPatKind(pat)
-  const secrets: NamedSecret[] = [{ value: pat, placeholder: '[redacted]' }]
-  const apiBase = (options.apiBaseUrl ?? 'https://api.github.com').replace(/\/+$/, '')
+  const secrets: NamedSecret[] = [
+    { value: pat, placeholder: '[redacted]' },
+    ...(cred.refreshToken ? [{ value: cred.refreshToken, placeholder: '[redacted]' }] : []),
+  ]
+  const apiBase = (options.apiBaseUrl ?? DEFAULT_GITHUB_API_BASE_URL).replace(/\/+$/, '')
   const fetchFn = options.fetchImpl ?? fetch
   const maxRepos = Math.max(1, Math.min(Math.floor(options.maxRepos ?? 200), 500))
   const perPage = Math.min(100, maxRepos)
@@ -395,6 +1107,34 @@ export async function listAccessibleGithubRepos(
   const repos: AccessibleGithubRepo[] = []
   const seen = new Set<string>()
   let truncated = false
+
+  const appendRepoBatch = (batch: Array<{
+    full_name?: unknown
+    private?: unknown
+    default_branch?: unknown
+    updated_at?: unknown
+    description?: unknown
+  }>) => {
+    for (const item of batch) {
+      if (repos.length >= maxRepos) {
+        truncated = true
+        break
+      }
+      const fullName = typeof item.full_name === 'string' ? item.full_name.trim() : ''
+      if (!fullName || !repoFullNamePattern.test(fullName) || seen.has(fullName)) continue
+      seen.add(fullName)
+      const description = typeof item.description === 'string' && item.description.trim()
+        ? redact(item.description.trim(), secrets).slice(0, 240)
+        : null
+      repos.push({
+        fullName,
+        private: Boolean(item.private),
+        defaultBranch: typeof item.default_branch === 'string' && item.default_branch.trim() ? item.default_branch.trim() : 'main',
+        updatedAt: typeof item.updated_at === 'string' && item.updated_at.trim() ? item.updated_at.trim() : null,
+        description,
+      })
+    }
+  }
 
   for (let page = 1; page <= maxPages; page += 1) {
     options.signal?.throwIfAborted()
@@ -420,25 +1160,7 @@ export async function listAccessibleGithubRepos(
     }>
     if (!Array.isArray(batch) || batch.length === 0) break
 
-    for (const item of batch) {
-      if (repos.length >= maxRepos) {
-        truncated = true
-        break
-      }
-      const fullName = typeof item.full_name === 'string' ? item.full_name.trim() : ''
-      if (!fullName || !repoFullNamePattern.test(fullName) || seen.has(fullName)) continue
-      seen.add(fullName)
-      const description = typeof item.description === 'string' && item.description.trim()
-        ? redact(item.description.trim(), secrets).slice(0, 240)
-        : null
-      repos.push({
-        fullName,
-        private: Boolean(item.private),
-        defaultBranch: typeof item.default_branch === 'string' && item.default_branch.trim() ? item.default_branch.trim() : 'main',
-        updatedAt: typeof item.updated_at === 'string' && item.updated_at.trim() ? item.updated_at.trim() : null,
-        description,
-      })
-    }
+    appendRepoBatch(batch)
 
     if (batch.length < perPage) break
     if (repos.length >= maxRepos) {
@@ -447,6 +1169,65 @@ export async function listAccessibleGithubRepos(
         truncated = true
       }
       break
+    }
+  }
+
+  // GitHub App user-to-server tokens expose installation repositories via /user/installations.
+  // Merge those when /user/repos is empty or when authenticated via GitHub App Device Flow.
+  if ((repos.length === 0 || cred.authKind === 'github_app_device' || tokenKind === 'github_app') && repos.length < maxRepos) {
+    try {
+      options.signal?.throwIfAborted()
+      const instSignal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(20_000)]) : AbortSignal.timeout(20_000)
+      const instRes = await fetchFn(`${apiBase}/user/installations?per_page=100`, {
+        method: 'GET',
+        headers,
+        signal: instSignal,
+      })
+      if (instRes.ok) {
+        const instPayload = await instRes.json() as { installations?: Array<{ id?: unknown }> }
+        const installations = Array.isArray(instPayload.installations) ? instPayload.installations : []
+        for (const installation of installations.slice(0, 20)) {
+          if (repos.length >= maxRepos) {
+            truncated = true
+            break
+          }
+          const instId = typeof installation.id === 'number' && Number.isSafeInteger(installation.id) && installation.id > 0
+            ? installation.id
+            : null
+          if (!instId) continue
+          for (let page = 1; page <= maxPages && repos.length < maxRepos; page += 1) {
+            options.signal?.throwIfAborted()
+            const repoSignal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(20_000)]) : AbortSignal.timeout(20_000)
+            const repoRes = await fetchFn(
+              `${apiBase}/user/installations/${instId}/repositories?per_page=${perPage}${page > 1 ? `&page=${page}` : ''}`,
+              { method: 'GET', headers, signal: repoSignal },
+            )
+            if (!repoRes.ok) break
+            const repoPayload = await repoRes.json() as {
+              repositories?: Array<{
+                full_name?: unknown
+                private?: unknown
+                default_branch?: unknown
+                updated_at?: unknown
+                description?: unknown
+              }>
+            }
+            const batch = Array.isArray(repoPayload.repositories) ? repoPayload.repositories : []
+            if (batch.length === 0) break
+            appendRepoBatch(batch)
+            if (batch.length < perPage) break
+            if (repos.length >= maxRepos) {
+              const linkHeader = repoRes.headers?.get?.('link') ?? ''
+              if (linkHeader.includes('rel="next"') || page === maxPages) {
+                truncated = true
+              }
+              break
+            }
+          }
+        }
+      }
+    } catch {
+      // Best-effort fallback for GitHub App installations; keep any /user/repos results intact.
     }
   }
 
@@ -1119,11 +1900,19 @@ export async function cloneGithubRepos(
     throw new Error('Invalid repository clone root directory.')
   }
 
-  const pat = readGithubPat(options.patPath ?? resolveGithubPatPath(options.dataDir))
+  const cred = await resolveFreshGithubCredential({
+    dataDir: options.dataDir,
+    patPath: options.patPath,
+    githubBaseUrl: options.githubBaseUrl,
+    fetchImpl: options.fetchImpl,
+    signal,
+  })
+  const pat = cred.accessToken
   const basicAuth = Buffer.from(`x-access-token:${pat}`, 'utf8').toString('base64')
   const secrets: NamedSecret[] = [
     { value: pat, placeholder: '[redacted]' },
     { value: basicAuth, placeholder: '[redacted]' },
+    ...(cred.refreshToken ? [{ value: cred.refreshToken, placeholder: '[redacted]' }] : []),
   ]
   const gitBase = (options.gitBaseUrl ?? 'https://github.com').replace(/\/+$/, '')
   const gitBaseUrl = new URL(gitBase)
@@ -1286,9 +2075,19 @@ export async function syncGithubRepos(
   }
 
   signal?.throwIfAborted()
-  const pat = readGithubPat(options.patPath ?? resolveGithubPatPath(options.dataDir))
-  const secrets: NamedSecret[] = [{ value: pat, placeholder: '[redacted]' }]
-  const apiBase = (options.apiBaseUrl ?? 'https://api.github.com').replace(/\/+$/, '')
+  const cred = await resolveFreshGithubCredential({
+    dataDir: options.dataDir,
+    patPath: options.patPath,
+    githubBaseUrl: options.githubBaseUrl,
+    fetchImpl: options.fetchImpl,
+    signal,
+  })
+  const pat = cred.accessToken
+  const secrets: NamedSecret[] = [
+    { value: pat, placeholder: '[redacted]' },
+    ...(cred.refreshToken ? [{ value: cred.refreshToken, placeholder: '[redacted]' }] : []),
+  ]
+  const apiBase = (options.apiBaseUrl ?? DEFAULT_GITHUB_API_BASE_URL).replace(/\/+$/, '')
   const fetchFn = options.fetchImpl ?? fetch
   const maxFilesPerRepo = Math.max(1, Math.min(options.maxFilesPerRepo ?? defaultMaxFilesPerRepo, 80))
   const maxFileBytes = Math.max(1024, Math.min(options.maxFileBytes ?? defaultMaxFileBytes, 2 * 1024 * 1024))

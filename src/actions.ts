@@ -18,12 +18,15 @@ import {
 } from './domain.ts'
 import { execution } from './server/execution.ts'
 import {
+  cancelGithubDeviceFlow,
   clearGithubPat,
   defaultSelectedRepoNames,
-  getGithubPatStatus,
+  getGithubAuthStatus,
   listAccessibleGithubRepos,
+  pollGithubDeviceFlow,
   projectReposDir,
   saveGithubPat,
+  startGithubDeviceFlow,
   syncGithubRepos,
 } from './server/github-connector.ts'
 import { assertLocalLabAllowed, LabRunner } from './server/lab-runner.ts'
@@ -49,7 +52,7 @@ import { readWorkerSession, testPersonaAuth } from './server/worker-session-read
 
 export const workspaceData = createServerFn({ method: 'GET' }).handler(() => {
   const db = store()
-  const githubPatStatus = getGithubPatStatus(db.directory)
+  const githubPatStatus = getGithubAuthStatus(db.directory)
   const workspaceList = db.listWorkspace()
   const workspaceId = workspaceList.workspace.id
 
@@ -202,7 +205,7 @@ export const projectData = createServerFn({ method: 'GET' })
   .validator(z.object({ projectId: id }))
   .handler(({ data }) => {
     const db = store()
-    const githubPatStatus = getGithubPatStatus(db.directory)
+    const githubPatStatus = getGithubAuthStatus(db.directory)
     return {
       ...db.projectDetail(data.projectId),
       hasGithubPat: githubPatStatus.configured,
@@ -244,17 +247,47 @@ export const removeProjectSpec = createServerFn({ method: 'POST' })
   .validator(z.object({ requestId: id, projectId: id, specId: id }))
   .handler(({ data }) => store().deleteProjectSpec(data))
 
+export const getGithubStatus = createServerFn({ method: 'GET' })
+  .handler(() => getGithubAuthStatus(store().directory))
+
+export const startGithubDeviceFlowAction = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    clientId: z.string().trim().min(6, 'Enter a valid GitHub App Client ID.').max(128).optional(),
+  }).optional())
+  .handler(async ({ data }) => {
+    const db = store()
+    return startGithubDeviceFlow({
+      dataDir: db.directory,
+      ...(data?.clientId ? { clientId: data.clientId } : {}),
+    })
+  })
+
+export const pollGithubDeviceFlowAction = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    flowId: z.string().trim().min(1).max(128),
+  }))
+  .handler(async ({ data }) => {
+    const db = store()
+    return pollGithubDeviceFlow(data.flowId, { dataDir: db.directory })
+  })
+
+export const cancelGithubDeviceFlowAction = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    flowId: z.string().trim().min(1).max(128),
+  }))
+  .handler(({ data }) => cancelGithubDeviceFlow(data.flowId))
+
 export const saveGithubToken = createServerFn({ method: 'POST' })
   .validator(z.object({
     token: z.string().trim().min(10, 'Enter a valid GitHub personal access token.').max(512),
   }))
   .handler(async ({ data }) => {
     const db = store()
-    const status = saveGithubPat(db.directory, data.token)
+    saveGithubPat(db.directory, data.token)
     try {
       const listed = await listAccessibleGithubRepos({ dataDir: db.directory })
       return {
-        status,
+        status: getGithubAuthStatus(db.directory),
         repos: listed.repos,
         defaultSelected: defaultSelectedRepoNames(listed.repos),
         truncated: listed.truncated,
@@ -269,18 +302,25 @@ export const saveGithubToken = createServerFn({ method: 'POST' })
   })
 
 export const clearGithubToken = createServerFn({ method: 'POST' })
-  .handler(() => clearGithubPat(store().directory))
+  .handler(() => {
+    const db = store()
+    const res = clearGithubPat(db.directory)
+    return {
+      cleared: res.cleared,
+      status: getGithubAuthStatus(db.directory),
+    }
+  })
 
 export const listGithubRepositories = createServerFn({ method: 'GET' })
   .handler(async () => {
     const db = store()
-    const status = getGithubPatStatus(db.directory)
+    const status = getGithubAuthStatus(db.directory)
     if (!status.configured) {
       return { status, repos: [], defaultSelected: [], truncated: false }
     }
     const listed = await listAccessibleGithubRepos({ dataDir: db.directory })
     return {
-      status,
+      status: getGithubAuthStatus(db.directory),
       repos: listed.repos,
       defaultSelected: defaultSelectedRepoNames(listed.repos),
       truncated: listed.truncated,
