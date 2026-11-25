@@ -231,21 +231,331 @@ export function createChainOracle(options: ChainOracleOptions): ChainOracle {
     return obs
   }
 
+  const isAttackerEligible = (spec: ChainSpec, actor: PersonaId): boolean =>
+    spec.attackerPersonaSet.includes(actor) && !spec.forbiddenShortcutPersonas.includes(actor)
+
   const sortedHops = (chainId: string): HopObservation[] =>
     hops.filter((h) => h.chainId === chainId).sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq))
-
-  const findEdge = (
-    chainId: string, fromHopId: string, toHopId: string, kind: CausalEdgeKind, minTs: number,
-  ): EdgeObservation | undefined =>
-    edges
-      .filter((e) => e.chainId === chainId && e.fromHopId === fromHopId && e.toHopId === toHopId && e.kind === kind)
-      .filter((e) => e.ts >= minTs)
-      .sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq))[0]
 
   const hasControl = (chainId: string, fromHopId: string, toHopId: string, entityId: string): boolean =>
     controls.some((c) =>
       c.chainId === chainId && c.fromHopId === fromHopId && c.toHopId === toHopId &&
       c.entityId === entityId && c.result === 'failed_without_predecessor')
+
+  const edgeFailureReason = (
+    chainId: string,
+    from: HopObservation,
+    to: HopObservation,
+    expectedKind: CausalEdgeKind,
+    edge: EdgeObservation,
+  ): string | null => {
+    if (edge.kind === 'value_binding') {
+      if (!from.artifactDigest || from.artifactDigest !== edge.fromArtifactDigest || edge.toConsumedDigest !== from.artifactDigest) {
+        return `value_binding mismatch ${from.hopId} -> ${to.hopId}`
+      }
+      return null
+    }
+    if (edge.kind === 'derived_crypto_binding') {
+      if (!edge.derivedFromDigest || edge.derivedFromDigest !== from.artifactDigest) {
+        return `derived_crypto_binding attestation mismatch ${from.hopId} -> ${to.hopId}`
+      }
+      return null
+    }
+    if (edge.kind === 'state_transition_binding') {
+      if (!edge.entityId || !from.entityId || !to.entityId || edge.entityId !== from.entityId || from.entityId !== to.entityId) {
+        return `state_transition_binding shared entity mismatch ${from.hopId} -> ${to.hopId}`
+      }
+      if (!hasControl(chainId, from.hopId, to.hopId, edge.entityId)) {
+        return `state_transition_binding lacks clean ablation control ${from.hopId} -> ${to.hopId}`
+      }
+      return null
+    }
+    if (edge.kind === 'async_pivot_binding') {
+      if (edge.runId !== options.runId || edge.pollObserved !== true) {
+        return `async_pivot_binding lacks run-scoped poll correlation ${from.hopId} -> ${to.hopId}`
+      }
+      return null
+    }
+    void expectedKind
+    return null
+  }
+
+  type ChainResolution =
+    | {
+      ok: true
+      hops: HopObservation[]
+      edges: EdgeObservation[]
+      terminal: TerminalObservation
+    }
+    | {
+      ok: false
+      hopsObserved: number
+      missingHopIds: string[]
+      failureReason: string
+      dropReason: HopDropReason
+    }
+
+  interface ReachableNode {
+    hop: HopObservation
+    prev: ReachableNode | null
+    edge: EdgeObservation | null
+  }
+
+  const MAX_TRANSITION_CHECKS = 20_000
+
+  const resolveChain = (spec: ChainSpec): ChainResolution => {
+    const chainId = spec.id
+    const ordered = sortedHops(chainId)
+    const chainTerminals = terminals
+      .filter((t) =>
+        t.chainId === chainId &&
+        t.service === spec.terminal.service &&
+        t.routeKey === spec.terminal.routeKey &&
+        t.kind === spec.terminal.kind)
+      .sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq))
+    const attackerTerminals = chainTerminals.filter((t) => isAttackerEligible(spec, t.actor))
+    const disallowedTerminals = chainTerminals.filter((t) => !isAttackerEligible(spec, t.actor))
+
+    if (spec.hops.length === 0) {
+      const terminal = attackerTerminals[0]
+      if (terminal) return { ok: true, hops: [], edges: [], terminal }
+      const badTerminal = disallowedTerminals[0]
+      if (badTerminal) {
+        return {
+          ok: false,
+          hopsObserved: 0,
+          missingHopIds: [],
+          failureReason: `terminal executed by disallowed persona '${badTerminal.actor}'`,
+          dropReason: 'persona_shortcut_rejected',
+        }
+      }
+      return {
+        ok: false,
+        hopsObserved: 0,
+        missingHopIds: [],
+        failureReason: `terminal ${spec.terminal.kind} at ${spec.terminal.service}:${spec.terminal.routeKey} not observed`,
+        dropReason: 'terminal_not_observed',
+      }
+    }
+
+    const edgesByKey = new Map<string, EdgeObservation[]>()
+    for (const edge of edges) {
+      if (edge.chainId !== chainId) continue
+      const edgeKey = `${edge.fromHopId}\0${edge.toHopId}\0${edge.kind}`
+      const list = edgesByKey.get(edgeKey)
+      if (list) list.push(edge)
+      else edgesByKey.set(edgeKey, [edge])
+    }
+    for (const list of edgesByKey.values()) {
+      list.sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq))
+    }
+
+    const matchEdge = (
+      from: HopObservation,
+      to: HopObservation,
+      expectedKind: CausalEdgeKind | undefined,
+    ): { edge?: EdgeObservation; failureReason?: string } => {
+      if (!expectedKind) {
+        return { failureReason: `hop ${to.hopId} has no declared edge binding` }
+      }
+      const candidates = edgesByKey.get(`${from.hopId}\0${to.hopId}\0${expectedKind}`) ?? []
+      let sawCandidateAfterFrom = false
+      let firstFailure: string | undefined
+      for (const candidate of candidates) {
+        if (candidate.ts < from.ts || candidate.ts < to.ts) continue
+        sawCandidateAfterFrom = true
+        const reason = edgeFailureReason(chainId, from, to, expectedKind, candidate)
+        if (reason === null) return { edge: candidate }
+        if (!firstFailure) firstFailure = reason
+      }
+      if (!sawCandidateAfterFrom) {
+        return { failureReason: `missing ${expectedKind} edge ${from.hopId} -> ${to.hopId}` }
+      }
+      return { failureReason: firstFailure ?? `missing ${expectedKind} edge ${from.hopId} -> ${to.hopId}` }
+    }
+
+    const attackerHopCandidates: HopObservation[][] = []
+    const disallowedHopCandidates: HopObservation[][] = []
+    for (const expected of spec.hops) {
+      const matching = ordered.filter((h) =>
+        h.hopId === expected.hopId && h.service === expected.service && h.routeKey === expected.routeKey)
+      attackerHopCandidates.push(matching.filter((h) => isAttackerEligible(spec, h.actor)))
+      disallowedHopCandidates.push(matching.filter((h) => !isAttackerEligible(spec, h.actor)))
+    }
+
+    // Phase 1: forward reachability strictly over attacker-eligible hops + valid causal edges.
+    // Dominance pruning on (artifactDigest, entityId) keeps earliest reachable ts per signature
+    // without losing any reachable valid causal path.
+    const hopSig = (h: HopObservation): string => `${h.artifactDigest}\0${h.entityId ?? ''}`
+    const reachable: ReachableNode[][] = []
+    const firstLayer: ReachableNode[] = []
+    const seenFirst = new Set<string>()
+    for (const hop of attackerHopCandidates[0]!) {
+      const sig = hopSig(hop)
+      if (seenFirst.has(sig)) continue
+      seenFirst.add(sig)
+      firstLayer.push({ hop, prev: null, edge: null })
+    }
+    reachable.push(firstLayer)
+
+    let transitionChecks = 0
+    let maxAttackerDepth = firstLayer.length > 0 ? 1 : 0
+    let stallEdgeFailure: string | undefined
+
+    for (let i = 1; i < spec.hops.length; i++) {
+      const prevLayer = reachable[i - 1]!
+      if (prevLayer.length === 0) break
+
+      const expectedKind = spec.hops[i]!.edgeFromPrevious
+      const nextLayer: ReachableNode[] = []
+      const seenNext = new Set<string>()
+      let layerFailure: string | undefined
+
+      for (const to of attackerHopCandidates[i]!) {
+        const sig = hopSig(to)
+        if (seenNext.has(sig)) continue
+        let matched: ReachableNode | null = null
+        for (const prevNode of prevLayer) {
+          if (prevNode.hop.ts > to.ts) break
+          if (transitionChecks >= MAX_TRANSITION_CHECKS) break
+          transitionChecks += 1
+          const res = matchEdge(prevNode.hop, to, expectedKind)
+          if (res.edge) {
+            matched = { hop: to, prev: prevNode, edge: res.edge }
+            break
+          }
+          if (res.failureReason && (!layerFailure || (layerFailure.startsWith('missing ') && !res.failureReason.startsWith('missing ')))) {
+            layerFailure = res.failureReason
+          }
+        }
+        if (matched) {
+          seenNext.add(sig)
+          nextLayer.push(matched)
+        }
+      }
+
+      reachable.push(nextLayer)
+      if (nextLayer.length === 0) {
+        stallEdgeFailure = layerFailure
+        break
+      }
+      maxAttackerDepth = i + 1
+    }
+
+    if (maxAttackerDepth === spec.hops.length) {
+      const lastLayer = reachable[spec.hops.length - 1]!
+      const bestLastNode = lastLayer[0]!
+      const terminal = attackerTerminals.find((t) => t.ts >= bestLastNode.hop.ts)
+      if (terminal) {
+        const matchedHops: HopObservation[] = []
+        const matchedEdges: EdgeObservation[] = []
+        let cursor: ReachableNode | null = bestLastNode
+        while (cursor) {
+          matchedHops.push(cursor.hop)
+          if (cursor.edge) matchedEdges.push(cursor.edge)
+          cursor = cursor.prev
+        }
+        matchedHops.reverse()
+        matchedEdges.reverse()
+        return { ok: true, hops: matchedHops, edges: matchedEdges, terminal }
+      }
+
+      // Attacker completed all hops + causal edges, but no attacker-eligible terminal matched.
+      const disallowedTerminal = disallowedTerminals.find((t) => t.ts >= bestLastNode.hop.ts)
+      if (disallowedTerminal) {
+        return {
+          ok: false,
+          hopsObserved: spec.hops.length,
+          missingHopIds: [],
+          failureReason: `terminal executed by disallowed persona '${disallowedTerminal.actor}'`,
+          dropReason: 'persona_shortcut_rejected',
+        }
+      }
+      return {
+        ok: false,
+        hopsObserved: spec.hops.length,
+        missingHopIds: [],
+        failureReason: `terminal ${spec.terminal.kind} at ${spec.terminal.service}:${spec.terminal.routeKey} not observed`,
+        dropReason: 'terminal_not_observed',
+      }
+    }
+
+    // Phase 2: no complete attacker-eligible path; report accurate attacker prefix depth & drop reason.
+    const missing = spec.hops.slice(maxAttackerDepth).map((h) => h.hopId)
+    const nextExpected = spec.hops[maxAttackerDepth]!
+
+    if (maxAttackerDepth === 0) {
+      const disallowedFirst = disallowedHopCandidates[0]![0]
+      if (disallowedFirst) {
+        return {
+          ok: false,
+          hopsObserved: 0,
+          missingHopIds: missing,
+          failureReason: `hop ${nextExpected.hopId} executed by disallowed persona '${disallowedFirst.actor}'`,
+          dropReason: 'persona_shortcut_rejected',
+        }
+      }
+      const disallowedTerminal = disallowedTerminals[0]
+      if (disallowedTerminal) {
+        return {
+          ok: false,
+          hopsObserved: 0,
+          missingHopIds: missing,
+          failureReason: `terminal executed by disallowed persona '${disallowedTerminal.actor}'`,
+          dropReason: 'persona_shortcut_rejected',
+        }
+      }
+      return {
+        ok: false,
+        hopsObserved: 0,
+        missingHopIds: missing,
+        failureReason: `hop ${nextExpected.hopId} (${nextExpected.service}:${nextExpected.routeKey}) not observed in order`,
+        dropReason: 'capability_not_extracted',
+      }
+    }
+
+    const minPrevTs = reachable[maxAttackerDepth - 1]![0]!.hop.ts
+    const attackerReachedNextInOrder = attackerHopCandidates[maxAttackerDepth]!.some((h) => h.ts >= minPrevTs)
+    if (attackerReachedNextInOrder) {
+      return {
+        ok: false,
+        hopsObserved: maxAttackerDepth,
+        missingHopIds: missing,
+        failureReason: stallEdgeFailure ?? `missing ${nextExpected.edgeFromPrevious ?? 'declared'} edge ${spec.hops[maxAttackerDepth - 1]!.hopId} -> ${nextExpected.hopId}`,
+        dropReason: 'edge_binding_rejected',
+      }
+    }
+
+    const disallowedNext = disallowedHopCandidates[maxAttackerDepth]!.find((h) => h.ts >= minPrevTs)
+    if (disallowedNext) {
+      return {
+        ok: false,
+        hopsObserved: maxAttackerDepth,
+        missingHopIds: missing,
+        failureReason: `hop ${nextExpected.hopId} executed by disallowed persona '${disallowedNext.actor}'`,
+        dropReason: 'persona_shortcut_rejected',
+      }
+    }
+
+    const disallowedTerminal = disallowedTerminals.find((t) => t.ts >= minPrevTs)
+    if (disallowedTerminal) {
+      return {
+        ok: false,
+        hopsObserved: maxAttackerDepth,
+        missingHopIds: missing,
+        failureReason: `terminal executed by disallowed persona '${disallowedTerminal.actor}'`,
+        dropReason: 'persona_shortcut_rejected',
+      }
+    }
+
+    return {
+      ok: false,
+      hopsObserved: maxAttackerDepth,
+      missingHopIds: missing,
+      failureReason: `hop ${nextExpected.hopId} (${nextExpected.service}:${nextExpected.routeKey}) not observed in order`,
+      dropReason: 'pivot_not_discovered',
+    }
+  }
 
   const failure = (
     spec: ChainSpec, hopsObserved: number, missing: string[], reason: string, dropReason: HopDropReason,
@@ -265,92 +575,9 @@ export function createChainOracle(options: ChainOracleOptions): ChainOracle {
   const evaluate = (rawChainId: string): ChainEvaluation => {
     const chainId = canonicalChainId(rawChainId)
     const spec = specFor(chainId)
-    const ordered = sortedHops(chainId)
-    const completedHops: HopObservation[] = []
-    let lastTs = Number.NEGATIVE_INFINITY
-
-    for (let i = 0; i < spec.hops.length; i++) {
-      const expected = spec.hops[i]!
-      const found = ordered.find((h) =>
-        h.hopId === expected.hopId && h.ts >= lastTs &&
-        h.service === expected.service && h.routeKey === expected.routeKey)
-      if (!found) {
-        const missing = spec.hops.slice(i).map((h) => h.hopId)
-        return failure(
-          spec, completedHops.length, missing,
-          `hop ${expected.hopId} (${expected.service}:${expected.routeKey}) not observed in order`,
-          i === 0 ? 'capability_not_extracted' : 'pivot_not_discovered',
-        )
-      }
-      if (!spec.attackerPersonaSet.includes(found.actor) || spec.forbiddenShortcutPersonas.includes(found.actor)) {
-        return failure(
-          spec, completedHops.length, spec.hops.slice(i).map((h) => h.hopId),
-          `hop ${expected.hopId} executed by disallowed persona '${found.actor}'`,
-          'persona_shortcut_rejected',
-        )
-      }
-      completedHops.push(found)
-      lastTs = found.ts
-    }
-
-    for (let i = 1; i < completedHops.length; i++) {
-      const from = completedHops[i - 1]!
-      const to = completedHops[i]!
-      const expectedKind = spec.hops[i]!.edgeFromPrevious
-      if (!expectedKind) {
-        return failure(spec, i, spec.hops.slice(i).map((h) => h.hopId), `hop ${to.hopId} has no declared edge binding`, 'edge_binding_rejected')
-      }
-      const edge = findEdge(chainId, from.hopId, to.hopId, expectedKind, from.ts)
-      if (!edge) {
-        return failure(
-          spec, i, spec.hops.slice(i).map((h) => h.hopId),
-          `missing ${expectedKind} edge ${from.hopId} -> ${to.hopId}`,
-          'edge_binding_rejected',
-        )
-      }
-      if (edge.kind === 'value_binding') {
-        if (!from.artifactDigest || from.artifactDigest !== edge.fromArtifactDigest || edge.toConsumedDigest !== from.artifactDigest) {
-          return failure(spec, i, spec.hops.slice(i).map((h) => h.hopId), `value_binding mismatch ${from.hopId} -> ${to.hopId}`, 'edge_binding_rejected')
-        }
-      } else if (edge.kind === 'derived_crypto_binding') {
-        if (!edge.derivedFromDigest || edge.derivedFromDigest !== from.artifactDigest) {
-          return failure(spec, i, spec.hops.slice(i).map((h) => h.hopId), `derived_crypto_binding attestation mismatch ${from.hopId} -> ${to.hopId}`, 'edge_binding_rejected')
-        }
-      } else if (edge.kind === 'state_transition_binding') {
-        if (!edge.entityId || !from.entityId || !to.entityId || edge.entityId !== from.entityId || from.entityId !== to.entityId) {
-          return failure(spec, i, spec.hops.slice(i).map((h) => h.hopId), `state_transition_binding shared entity mismatch ${from.hopId} -> ${to.hopId}`, 'edge_binding_rejected')
-        }
-        if (!hasControl(chainId, from.hopId, to.hopId, edge.entityId)) {
-          return failure(spec, i, spec.hops.slice(i).map((h) => h.hopId), `state_transition_binding lacks clean ablation control ${from.hopId} -> ${to.hopId}`, 'edge_binding_rejected')
-        }
-      } else if (edge.kind === 'async_pivot_binding') {
-        if (edge.runId !== options.runId || edge.pollObserved !== true) {
-          return failure(spec, i, spec.hops.slice(i).map((h) => h.hopId), `async_pivot_binding lacks run-scoped poll correlation ${from.hopId} -> ${to.hopId}`, 'edge_binding_rejected')
-        }
-      }
-    }
-
-    const lastHop = completedHops[completedHops.length - 1]!
-    const terminal = terminals
-      .filter((t) => t.chainId === chainId && t.ts >= lastHop.ts &&
-        t.service === spec.terminal.service && t.routeKey === spec.terminal.routeKey && t.kind === spec.terminal.kind)
-      .sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq))[0]
-    if (!terminal) {
-      return {
-        chainId: spec.id,
-        completed: false,
-        confirmed: false,
-        hopsObserved: completedHops.length,
-        hopsTotal: spec.hops.length,
-        missingHopIds: [],
-        terminalObserved: false,
-        failureReason: `terminal ${spec.terminal.kind} at ${spec.terminal.service}:${spec.terminal.routeKey} not observed`,
-        dropReason: 'terminal_not_observed',
-        receiptVerified: false,
-      }
-    }
-    if (spec.forbiddenShortcutPersonas.includes(terminal.actor) || !spec.attackerPersonaSet.includes(terminal.actor)) {
-      return failure(spec, completedHops.length, [], `terminal executed by disallowed persona '${terminal.actor}'`, 'persona_shortcut_rejected')
+    const resolution = resolveChain(spec)
+    if (!resolution.ok) {
+      return failure(spec, resolution.hopsObserved, resolution.missingHopIds, resolution.failureReason, resolution.dropReason)
     }
 
     const receipt = receipts.get(chainId)
@@ -359,11 +586,11 @@ export function createChainOracle(options: ChainOracleOptions): ChainOracle {
       chainId: spec.id,
       completed: true,
       confirmed: receiptCheck.ok,
-      hopsObserved: completedHops.length,
+      hopsObserved: resolution.hops.length,
       hopsTotal: spec.hops.length,
       missingHopIds: [],
       terminalObserved: true,
-      terminalAt: terminal.ts,
+      terminalAt: resolution.terminal.ts,
       failureReason: receiptCheck.ok ? undefined : `receipt rejected: ${receiptCheck.reason}`,
       dropReason: receiptCheck.ok ? undefined : 'replay_failed',
       receiptVerified: receiptCheck.ok,
@@ -428,30 +655,24 @@ export function createChainOracle(options: ChainOracleOptions): ChainOracle {
   ): CompositeProofReceipt => {
     const chainId = canonicalChainId(rawChainId)
     const spec = specFor(chainId)
-    const evaluation = evaluate(chainId)
-    if (!evaluation.completed) {
-      throw new Error(`cannot mint receipt for ${chainId}: ${evaluation.failureReason ?? 'incomplete'}`)
+    const resolution = resolveChain(spec)
+    if (!resolution.ok) {
+      throw new Error(`cannot mint receipt for ${chainId}: ${resolution.failureReason}`)
     }
-    const ordered = sortedHops(chainId)
-    const used: ReceiptHop[] = []
-    let lastTs = Number.NEGATIVE_INFINITY
-    for (const expected of spec.hops) {
-      const obs = ordered.find((h) =>
-        h.hopId === expected.hopId && h.ts >= lastTs && h.service === expected.service && h.routeKey === expected.routeKey
-      )
-      if (!obs) throw new Error(`cannot mint receipt for ${chainId}: hop ${expected.hopId} disappeared`)
-      used.push({
-        hopId: obs.hopId, service: obs.service, routeKey: obs.routeKey,
-        actor: obs.actor, ts: obs.ts, artifactDigest: obs.artifactDigest,
-      })
-      lastTs = obs.ts
-    }
+    const used: ReceiptHop[] = resolution.hops.map((obs) => ({
+      hopId: obs.hopId,
+      service: obs.service,
+      routeKey: obs.routeKey,
+      actor: obs.actor,
+      ts: obs.ts,
+      artifactDigest: obs.artifactDigest,
+    }))
     const causalEdges: ReceiptEdge[] = []
     for (let i = 1; i < spec.hops.length; i++) {
       const from = spec.hops[i - 1]!
       const to = spec.hops[i]!
       const kind = to.edgeFromPrevious!
-      const edge = findEdge(chainId, from.hopId, to.hopId, kind, used[i - 1]!.ts)
+      const edge = resolution.edges[i - 1]
       const fromDigest = used[i - 1]!.artifactDigest
       const evidenceDigest = sha256(stable({
         kind,
@@ -465,10 +686,7 @@ export function createChainOracle(options: ChainOracleOptions): ChainOracle {
       }))
       causalEdges.push({ fromHopId: from.hopId, toHopId: to.hopId, kind, evidenceDigest })
     }
-    const terminal = terminals
-      .filter((t) => t.chainId === chainId && t.ts >= used[used.length - 1]!.ts &&
-        t.service === spec.terminal.service && t.routeKey === spec.terminal.routeKey && t.kind === spec.terminal.kind)
-      .sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq))[0]!
+    const terminal = resolution.terminal
     const unsigned: Omit<CompositeProofReceipt, 'signature'> = {
       chainId,
       terminalVulnClass: spec.vulnClass,

@@ -280,3 +280,244 @@ test('missing expected chains are reported as false negatives with drop reasons'
   assert.equal(card.recall, 0)
   assert.equal(card.dropReasons.capability_not_extracted, 1)
 })
+
+test('control-arm owner_a noise on H1 and terminal does not poison a later clean attacker DAG', () => {
+  const chain = oracle()
+  // Phase A control-arm noise by forbidden shortcut persona at t=1..2
+  chain.recordHop({
+    chainId: 'T-C1', hopId: 'h1', service: 'edge', routeKey: 'r.h1',
+    actor: 'owner_a', artifactDigest: 'owner-noise-a1', entityId: 'ent-owner', ts: 1,
+  })
+  chain.recordTerminal({
+    chainId: 'T-C1', service: 'edge', routeKey: 'r.final', kind: 'cross_tenant_export',
+    actor: 'owner_a', entityId: 'ent-owner', ts: 2,
+  })
+  // Interleaved control-arm edge noise during attacker execution window
+  chain.recordEdge({
+    chainId: 'T-C1', fromHopId: 'h1', toHopId: 'h2', kind: 'value_binding',
+    fromArtifactDigest: 'owner-noise-a1', toConsumedDigest: 'owner-noise-a1', ts: 1005,
+  })
+  // Clean attacker-eligible full DAG at t=1000..1050
+  recordLineage(chain)
+
+  const before = chain.evaluate('T-C1')
+  assert.equal(before.completed, true)
+  assert.equal(before.terminalObserved, true)
+  assert.equal(before.hopsObserved, 5)
+  assert.notEqual(before.dropReason, 'persona_shortcut_rejected')
+
+  const receipt = chain.mintReceipt('T-C1')
+  assert.equal(chain.verifyReceipt(receipt).ok, true)
+  assert.equal(receipt.hops[0]!.actor, 'member_a')
+  assert.equal(receipt.hops[0]!.ts, 1000)
+  assert.equal(receipt.terminalImpact.ts, 1050)
+
+  const after = chain.evaluate('T-C1')
+  assert.equal(after.confirmed, true)
+  assert.equal(after.receiptVerified, true)
+  assert.equal(after.dropReason, undefined)
+})
+
+test('earlier unlinked attacker probe of H1 does not shadow a later linked attacker DAG', () => {
+  const chain = oracle()
+  // Earlier unlinked attacker probe at t=5 (and dead-end H1->H2 attempt at t=5..6)
+  chain.recordHop({
+    chainId: 'T-C1', hopId: 'h1', service: 'edge', routeKey: 'r.h1',
+    actor: 'member_b', artifactDigest: 'probe-unlinked-a1', entityId: 'ent-probe', ts: 5,
+  })
+  chain.recordHop({
+    chainId: 'T-C1', hopId: 'h2', service: 'api', routeKey: 'r.h2',
+    actor: 'member_b', artifactDigest: 'probe-unlinked-a2', entityId: 'ent-probe', ts: 6,
+  })
+  chain.recordEdge({
+    chainId: 'T-C1', fromHopId: 'h1', toHopId: 'h2', kind: 'value_binding',
+    fromArtifactDigest: 'probe-unlinked-a1', toConsumedDigest: 'probe-unlinked-a1', ts: 6,
+  })
+  // Later full linked attacker DAG at t=1000..1050
+  recordLineage(chain)
+
+  const before = chain.evaluate('T-C1')
+  assert.equal(before.completed, true)
+  assert.equal(before.hopsObserved, 5)
+  assert.equal(before.terminalObserved, true)
+
+  const receipt = chain.mintReceipt('T-C1')
+  assert.equal(chain.verifyReceipt(receipt).ok, true)
+  assert.equal(receipt.hops[0]!.artifactDigest, 'a1')
+  assert.equal(receipt.hops[0]!.ts, 1000)
+  assert.equal(receipt.hops[1]!.artifactDigest, 'a2')
+  assert.equal(receipt.hops[1]!.ts, 1010)
+
+  const after = chain.evaluate('T-C1')
+  assert.equal(after.confirmed, true)
+  assert.equal(after.receiptVerified, true)
+})
+
+test('shortcut-only chain executed by owner_a is still rejected with persona_shortcut_rejected', () => {
+  const chain = oracle()
+  const base = 1000
+  chain.recordHop({
+    chainId: 'T-C1', hopId: 'h1', service: 'edge', routeKey: 'r.h1',
+    actor: 'owner_a', artifactDigest: 'a1', entityId: 'ent', ts: base,
+  })
+  chain.recordHop({
+    chainId: 'T-C1', hopId: 'h2', service: 'api', routeKey: 'r.h2',
+    actor: 'owner_a', artifactDigest: 'a2', entityId: 'ent', ts: base + 10,
+  })
+  chain.recordEdge({
+    chainId: 'T-C1', fromHopId: 'h1', toHopId: 'h2', kind: 'value_binding',
+    fromArtifactDigest: 'a1', toConsumedDigest: 'a1', ts: base + 10,
+  })
+  chain.recordHop({
+    chainId: 'T-C1', hopId: 'h3', service: 'api', routeKey: 'r.h3',
+    actor: 'owner_a', artifactDigest: 'a3', entityId: 'ent', ts: base + 20,
+  })
+  chain.recordEdge({
+    chainId: 'T-C1', fromHopId: 'h2', toHopId: 'h3', kind: 'derived_crypto_binding',
+    fromArtifactDigest: 'a2', toConsumedDigest: '', derivedFromDigest: 'a2', ts: base + 20,
+  })
+  chain.recordHop({
+    chainId: 'T-C1', hopId: 'h4', service: 'worker', routeKey: 'r.h4',
+    actor: 'owner_a', artifactDigest: 'a4', entityId: 'ent', ts: base + 30,
+  })
+  chain.recordEdge({
+    chainId: 'T-C1', fromHopId: 'h3', toHopId: 'h4', kind: 'state_transition_binding',
+    fromArtifactDigest: 'a3', toConsumedDigest: 'a3', entityId: 'ent', ts: base + 30,
+  })
+  chain.recordControl({
+    chainId: 'T-C1', fromHopId: 'h3', toHopId: 'h4', entityId: 'ent',
+    result: 'failed_without_predecessor', ts: base + 30,
+  })
+  chain.recordHop({
+    chainId: 'T-C1', hopId: 'h5', service: 'edge', routeKey: 'r.h5',
+    actor: 'owner_a', artifactDigest: 'a5', entityId: 'ent', ts: base + 40,
+  })
+  chain.recordEdge({
+    chainId: 'T-C1', fromHopId: 'h4', toHopId: 'h5', kind: 'async_pivot_binding',
+    fromArtifactDigest: 'a4', toConsumedDigest: 'a4', runId: 'run-test',
+    pollObserved: true, ts: base + 40,
+  })
+  chain.recordTerminal({
+    chainId: 'T-C1', service: 'edge', routeKey: 'r.final', kind: 'cross_tenant_export',
+    actor: 'owner_a', entityId: 'ent', ts: base + 50,
+  })
+
+  const evaluation = chain.evaluate('T-C1')
+  assert.equal(evaluation.completed, false)
+  assert.equal(evaluation.confirmed, false)
+  assert.equal(evaluation.hopsObserved, 0)
+  assert.equal(evaluation.dropReason, 'persona_shortcut_rejected')
+  assert.throws(() => chain.mintReceipt('T-C1'), /disallowed persona/)
+
+  // Mid-chain shortcut: attacker executes H1->H2, then switches to owner_a for H3
+  const mid = oracle()
+  mid.recordHop({
+    chainId: 'T-C1', hopId: 'h1', service: 'edge', routeKey: 'r.h1',
+    actor: 'member_a', artifactDigest: 'a1', entityId: 'ent', ts: base,
+  })
+  mid.recordHop({
+    chainId: 'T-C1', hopId: 'h2', service: 'api', routeKey: 'r.h2',
+    actor: 'member_a', artifactDigest: 'a2', entityId: 'ent', ts: base + 10,
+  })
+  mid.recordEdge({
+    chainId: 'T-C1', fromHopId: 'h1', toHopId: 'h2', kind: 'value_binding',
+    fromArtifactDigest: 'a1', toConsumedDigest: 'a1', ts: base + 10,
+  })
+  mid.recordHop({
+    chainId: 'T-C1', hopId: 'h3', service: 'api', routeKey: 'r.h3',
+    actor: 'owner_a', artifactDigest: 'a3', entityId: 'ent', ts: base + 20,
+  })
+  const midEval = mid.evaluate('T-C1')
+  assert.equal(midEval.completed, false)
+  assert.equal(midEval.hopsObserved, 2)
+  assert.equal(midEval.dropReason, 'persona_shortcut_rejected')
+})
+
+test('partial attacker progress with owner_a recon noise reports accurate hopsObserved and dropReason', () => {
+  const chain = oracle()
+  // Phase A owner_a noise on H1 and terminal
+  chain.recordHop({
+    chainId: 'T-C1', hopId: 'h1', service: 'edge', routeKey: 'r.h1',
+    actor: 'owner_a', artifactDigest: 'owner-a1', entityId: 'ent-owner', ts: 1,
+  })
+  chain.recordTerminal({
+    chainId: 'T-C1', service: 'edge', routeKey: 'r.final', kind: 'cross_tenant_export',
+    actor: 'owner_a', entityId: 'ent-owner', ts: 2,
+  })
+  // Attacker cleanly executes H1 -> H2 and never reaches H3
+  chain.recordHop({
+    chainId: 'T-C1', hopId: 'h1', service: 'edge', routeKey: 'r.h1',
+    actor: 'member_a', artifactDigest: 'a1', entityId: 'ent', ts: 20,
+  })
+  chain.recordHop({
+    chainId: 'T-C1', hopId: 'h2', service: 'api', routeKey: 'r.h2',
+    actor: 'member_a', artifactDigest: 'a2', entityId: 'ent', ts: 25,
+  })
+  chain.recordEdge({
+    chainId: 'T-C1', fromHopId: 'h1', toHopId: 'h2', kind: 'value_binding',
+    fromArtifactDigest: 'a1', toConsumedDigest: 'a1', ts: 25,
+  })
+
+  const evaluation = chain.evaluate('T-C1')
+  assert.equal(evaluation.completed, false)
+  assert.equal(evaluation.hopsObserved, 2)
+  assert.deepEqual(evaluation.missingHopIds, ['h3', 'h4', 'h5'])
+  assert.equal(evaluation.dropReason, 'pivot_not_discovered')
+
+  // Attacker reaches all 5 hops cleanly with earlier owner_a terminal noise, but no attacker terminal
+  const noTerminal = oracle()
+  noTerminal.recordHop({
+    chainId: 'T-C1', hopId: 'h1', service: 'edge', routeKey: 'r.h1',
+    actor: 'owner_a', artifactDigest: 'owner-a1', entityId: 'ent-owner', ts: 1,
+  })
+  noTerminal.recordTerminal({
+    chainId: 'T-C1', service: 'edge', routeKey: 'r.final', kind: 'cross_tenant_export',
+    actor: 'owner_a', entityId: 'ent-owner', ts: 2,
+  })
+  noTerminal.recordHop({
+    chainId: 'T-C1', hopId: 'h1', service: 'edge', routeKey: 'r.h1',
+    actor: 'member_a', artifactDigest: 'a1', entityId: 'ent', ts: 100,
+  })
+  noTerminal.recordHop({
+    chainId: 'T-C1', hopId: 'h2', service: 'api', routeKey: 'r.h2',
+    actor: 'member_a', artifactDigest: 'a2', entityId: 'ent', ts: 110,
+  })
+  noTerminal.recordEdge({
+    chainId: 'T-C1', fromHopId: 'h1', toHopId: 'h2', kind: 'value_binding',
+    fromArtifactDigest: 'a1', toConsumedDigest: 'a1', ts: 110,
+  })
+  noTerminal.recordHop({
+    chainId: 'T-C1', hopId: 'h3', service: 'api', routeKey: 'r.h3',
+    actor: 'member_a', artifactDigest: 'a3', entityId: 'ent', ts: 120,
+  })
+  noTerminal.recordEdge({
+    chainId: 'T-C1', fromHopId: 'h2', toHopId: 'h3', kind: 'derived_crypto_binding',
+    fromArtifactDigest: 'a2', toConsumedDigest: '', derivedFromDigest: 'a2', ts: 120,
+  })
+  noTerminal.recordHop({
+    chainId: 'T-C1', hopId: 'h4', service: 'worker', routeKey: 'r.h4',
+    actor: 'member_a', artifactDigest: 'a4', entityId: 'ent', ts: 130,
+  })
+  noTerminal.recordEdge({
+    chainId: 'T-C1', fromHopId: 'h3', toHopId: 'h4', kind: 'state_transition_binding',
+    fromArtifactDigest: 'a3', toConsumedDigest: 'a3', entityId: 'ent', ts: 130,
+  })
+  noTerminal.recordControl({
+    chainId: 'T-C1', fromHopId: 'h3', toHopId: 'h4', entityId: 'ent',
+    result: 'failed_without_predecessor', ts: 130,
+  })
+  noTerminal.recordHop({
+    chainId: 'T-C1', hopId: 'h5', service: 'edge', routeKey: 'r.h5',
+    actor: 'member_a', artifactDigest: 'a5', entityId: 'ent', ts: 140,
+  })
+  noTerminal.recordEdge({
+    chainId: 'T-C1', fromHopId: 'h4', toHopId: 'h5', kind: 'async_pivot_binding',
+    fromArtifactDigest: 'a4', toConsumedDigest: 'a4', runId: 'run-test',
+    pollObserved: true, ts: 140,
+  })
+  const noTermEval = noTerminal.evaluate('T-C1')
+  assert.equal(noTermEval.completed, false)
+  assert.equal(noTermEval.hopsObserved, 5)
+  assert.deepEqual(noTermEval.missingHopIds, [])
+  assert.equal(noTermEval.dropReason, 'terminal_not_observed')
+})
