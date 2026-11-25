@@ -646,7 +646,7 @@ export const MULTIHOP_HARDENED_TWIN_RULE =
   'If a terminal guard holds cleanly, do NOT file a standalone finding on benign Hop 1-2; call record_coverage(status="ruled_out", proofGapReason="invariant_enforced_hardened") and complete_intent.'
 
 export const MULTIHOP_OPTIONAL_HELPERS_NOTE =
-  'Crypto/async hops: ctx.hmac_sign({ secretHandle, payload, alg: "sha256", encoding: "hex" }) | ctx.jwt_sign({ secretHandle, claims, alg: "HS256", hopReceiptId, slot }) -> derived_crypto_binding; ctx.await_async({ pollRequest, matchPredicate, triggerExchangeId, correlationId, profile: "fast_lab" }) -> async_pivot_binding; state mutation -> state_transition_binding (ablationExchangeIds).'
+  'Crypto/async hops: ctx.hmac_sign({ secretHandle, payload, alg: "sha256", encoding: "hex" }) | ctx.jwt_sign({ secretHandle, claims, alg: "HS256", hopReceiptId, slot }) -> derived_crypto_binding; ctx.await_async({ pollRequest, matchPredicate, triggerExchangeId, correlationId, profile: "fast_lab" }) -> async_pivot_binding; state mutation -> state_transition_binding (entityId, ablationExchangeIds).'
 
 export const MULTIHOP_HMAC_SIGN_PATTERN =
   'const sig = await ctx.hmac_sign({ secretHandle: cap.handle, payload: body, alg: "sha256", encoding: "hex" }) // send sig.signature -> derived_crypto_binding'
@@ -716,7 +716,7 @@ export const MULTIHOP_MODE_A_TS_RECIPE = [
 ].join('\n')
 
 const COMPACT_MULTIHOP_MODE_A_RECIPE =
-  'ctrl=http_send(target,{as:"member_b",role:"control"}); h1=http_send(hop1,{as:"member_b",role:"probe"}); cap=seal_capability({exchange:h1,hopReceiptId:"1",slot:"tok",jsonPath:"$.token"}); h2=http_send(target,{capability:cap.handle,role:"probe"}); prove_composite({chainId,terminalVulnClass,hops,causalEdges,terminalImpact,replayMode:"fresh_clean_replay"}); (+hmac_sign/jwt_sign/await_async if needed)'
+  'ctrl=http_send(target,{as:"member_b",role:"control"}); h1=http_send(hop1,{as:"member_b",role:"probe"}); cap=seal_capability({exchange:h1,hopReceiptId:"1",slot:"tok",jsonPath:"$.token"}); h2=http_send(target,{capability:cap.handle,role:"probe"}); prove_composite({chainId,terminalVulnClass,hops:[{hopId,target:{origin,method,pathAndQuery},exchangeIds,claimedDelta}],causalEdges:[{kind:"value_binding",fromHopId,toHopId,capabilityHandle}|{kind:"state_transition_binding",fromHopId,toHopId,entityId,ablationExchangeIds}],terminalImpact,replayMode:"fresh_clean_replay"}); (+hmac_sign/jwt_sign/await_async if needed)'
 
 export function isMultiHopBriefInput(input: Pick<AssignmentBriefInput, 'missionKind' | 'hopCheckpoint'>): boolean {
   return Boolean(input.hopCheckpoint)
@@ -933,6 +933,14 @@ export function buildAssignmentBriefPacket(
     }
     truncated = true
 
+    // Compact the Mode-A multi-hop proof contract before dropping linkedRoutes or shrinking
+    // secondary material so follow-on hop endpoints and chain lineage coexist inside the 4 KB budget.
+    if (state.multiHopProofContract && !state.multiHopContractCompacted) {
+      state.multiHopProofContract = buildMultiHopProofContract(true, input)
+      state.multiHopContractCompacted = true
+      continue
+    }
+
     // Secondary material first.
     if (state.linked.length) {
       state.linked.pop()
@@ -971,13 +979,6 @@ export function buildAssignmentBriefPacket(
     // file:line evidence or hopCheckpoint so a tight render can never lose chain continuity.
     if (state.proofObligation) {
       state.proofObligation = undefined
-      continue
-    }
-    // Compact the Mode-A multi-hop proof contract before shrinking code slices or hopCheckpoints
-    // so both the recipe/provenance rules and chain lineage coexist inside the 4 KB budget.
-    if (state.multiHopProofContract && !state.multiHopContractCompacted) {
-      state.multiHopProofContract = buildMultiHopProofContract(true, input)
-      state.multiHopContractCompacted = true
       continue
     }
     if (state.code && state.codeBudget > 240) {
