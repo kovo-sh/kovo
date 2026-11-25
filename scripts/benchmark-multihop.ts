@@ -1435,8 +1435,8 @@ function bumpRejectReason(map: Map<string, number>, raw: unknown, delta = 1): vo
  */
 export function sanitizeRejectSignature(raw: unknown): string | null {
   if (typeof raw !== 'string') return null
-  const redacted = redact(raw)
-  const lines = redacted
+  const pemScrubbed = raw.replace(/-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\n]*PRIVATE KEY-----/g, '[redacted]')
+  const lines = pemScrubbed
     .split(/\r?\n/)
     .map(l => l.trim())
     .filter(Boolean)
@@ -1448,12 +1448,15 @@ export function sanitizeRejectSignature(raw: unknown): string | null {
     const errLine = lines.find(l => /\b(?:[A-Z][A-Za-z0-9]*Error|Exception|ERR_[A-Z0-9_]+|AssertionError)\b/.test(l))
     if (errLine) picked = errLine
   }
-  let s = picked
+  // Strip raw HTTP/HTML/JSON bodies BEFORE heuristic `redact()` so `Authorization: ...` patterns
+  // cannot swallow the `body={` marker and leave trailing JSON fields exposed.
+  const bodyStripped = picked
     .replace(/^CompositeProofReceipt rejected at stage ['"][^'"]+['"]:\s*/i, '')
     .replace(/\b(body|responseBody|response|payload)\s*[:=]\s*(?:[\[{<]|["'][\[{<]).*$/i, '$1=<redacted>')
     .replace(/<!DOCTYPE[^>]*>.*$/i, '<html>')
     .replace(/<(?:html|head|body)\b[^>]*>.*$/i, '<html>')
     .replace(/\bHTTP\/\d(?:\.\d)?\s+\d{3}\b.*$/i, '<http>')
+  let s = redact(bodyStripped)
     .replace(/\b(authorization|cookie|set-cookie|token|secret|password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?id)\s*[:=]\s*(?:Bearer\s+|Basic\s+)?[^\s,;}"']+/gi, '$1=<redacted>')
     .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9._-]+/g, '<redacted>')
     .replace(/\{[^{}]{32,}\}/g, '<json>')
