@@ -99,6 +99,11 @@ export async function handleApi(
       sendJson(res, 404, { error: 'unknown org' })
       return
     }
+    // The member roster (emails and roles) is visible to members of that org only.
+    if (!roleOf(state, session, tenantId)) {
+      sendJson(res, 403, { error: 'not a member of this org' })
+      return
+    }
     sendJson(res, 200, {
       members: state.users
         .filter((user) => user.rolesByTenant[tenantId])
@@ -195,13 +200,27 @@ export async function handleApi(
     const session = auth(state, req, res)
     if (!session) return
     const body = parseJson<{ scopes?: string[] }>(await readBody(req))
+    const scopes = Array.isArray(body?.scopes) && body.scopes.length > 0 ? body.scopes : ['scim.read']
+    if (scopes.some((scope) => scope !== 'scim.read' && scope !== 'scim.write')) {
+      sendJson(res, 400, { error: 'scopes must be scim.read or scim.write' })
+      return
+    }
+    // Provisioning tokens are an org administration credential: admins may read the directory,
+    // and only owners may mint write (role-changing) tokens.
+    const creatorRole = roleOf(state, session, session.tenantId)
+    const allowed = scopes.includes('scim.write') ? creatorRole === 'owner' : creatorRole === 'owner' || creatorRole === 'admin'
+    if (!allowed) {
+      state.emit('scim.token_denied', { tenantId: session.tenantId, reason: 'insufficient_role', runId }, session.originPersona)
+      sendJson(res, 403, { error: 'SCIM token administration requires an org owner' })
+      return
+    }
     const token = mintToken('mh_fake_scim_')
     const record: ScimTokenRecord = {
       id: mintToken('mh_scim_id_'),
       token,
       tenantId: session.tenantId,
       userId: session.userId,
-      scopes: body?.scopes ?? ['scim.read'],
+      scopes,
       revoked: false,
       botInitiated: false,
       runId,
@@ -215,6 +234,11 @@ export async function handleApi(
   if (match(url, method, at('/scim/tokens'))) {
     const session = auth(state, req, res)
     if (!session) return
+    const listerRole = roleOf(state, session, session.tenantId)
+    if (listerRole !== 'owner' && listerRole !== 'admin') {
+      sendJson(res, 403, { error: 'SCIM token listing requires owner or admin' })
+      return
+    }
     sendJson(res, 200, {
       tokens: state.scimTokens
         .filter((token) => token.tenantId === session.tenantId)
@@ -225,13 +249,19 @@ export async function handleApi(
 
   const revokeScim = match(url, method, at('/scim/tokens/:id/revoke'))
   if (revokeScim) {
+    const session = auth(state, req, res)
+    if (!session) return
+    // Unknown and foreign token ids share one 404: revocation is limited to the token's own org
+    // (its creator, or an owner/admin of that org).
     const token = state.scimTokens.find((item) => item.id === revokeScim[0])
-    if (!token) {
+    const actorRole = token ? roleOf(state, session, token.tenantId) : null
+    if (!token || token.tenantId !== session.tenantId || !actorRole
+      || (token.userId !== session.userId && actorRole !== 'owner' && actorRole !== 'admin')) {
       sendJson(res, 404, { error: 'unknown token' })
       return
     }
     token.revoked = true
-    state.emit('scim.token_revoked', { tokenId: token.id, tenantId: token.tenantId, runId })
+    state.emit('scim.token_revoked', { tokenId: token.id, tenantId: token.tenantId, runId }, session.originPersona)
     sendJson(res, 200, { ok: true })
     return
   }
@@ -255,9 +285,15 @@ export async function handleApi(
       return
     }
     const body = parseJson<{ role?: string; tenant?: string }>(await readBody(req))
-    const tenantId = (body?.tenant ? tenantBySlug(state, body.tenant) : null) ?? token.tenantId
+    const tenantId = body?.tenant ? tenantBySlug(state, body.tenant) : token.tenantId
     if (!tenantId) {
       sendJson(res, 400, { error: 'unknown tenant' })
+      return
+    }
+    // A provisioning token only administers the org it was issued for.
+    if (tenantId !== token.tenantId) {
+      state.emit('scim.patch_denied', { reason: 'tenant_scope', tokenId: token.id, runId })
+      sendJson(res, 403, { error: 'SCIM token is not valid for this tenant' })
       return
     }
     const role = body?.role
@@ -458,21 +494,46 @@ export async function handleApi(
     return
   }
 
-  const benign: Record<string, unknown> = {
-    '/customers': { customers: [{ id: 'mh_cus_1', tenant: 'org_a' }, { id: 'mh_cus_2', tenant: 'org_b' }] },
-    '/plans': { plans: [{ id: 'team' }, { id: 'enterprise' }] },
-    '/notifications': { notifications: [{ id: 'mh_note_1', kind: 'doc.shared' }] },
-    '/settings': { settings: { locale: 'en-US', retentionDays: 90 } },
-    '/folders': { folders: [{ id: 'mh_fld_1', name: 'shared' }] },
-    '/groups': { groups: [{ id: 'mh_grp_1', name: 'engineering' }] },
-    '/webhooks': { webhooks: [{ id: 'mh_wh_1', events: ['doc.created'] }] },
-    '/integrations': { integrations: [{ id: 'mh_int_1', kind: 'scim' }] },
-    '/audit': { events: state.audit.slice(-40).map((event) => ({ kind: event.kind, ts: event.ts })) },
-    '/pats': { tokens: state.pats.map((pat) => ({ id: pat.id, scopes: pat.scopes, revoked: pat.revoked })) },
+  if (match(url, method, at('/audit'))) {
+    const session = auth(state, req, res)
+    if (!session) return
+    const role = roleOf(state, session, session.tenantId)
+    if (role !== 'owner' && role !== 'admin') {
+      sendJson(res, 403, { error: 'audit log requires owner or admin' })
+      return
+    }
+    sendJson(res, 200, {
+      events: state.audit
+        .filter((event) => event.detail.tenantId === session.tenantId)
+        .slice(-40)
+        .map((event) => ({ kind: event.kind, ts: event.ts })),
+    })
+    return
+  }
+
+  const benign: Record<string, (tenantId: TenantKey, userId: string) => unknown> = {
+    '/customers': (tenantId) => ({
+      customers: [{ id: 'mh_cus_1', tenant: 'org_a' }, { id: 'mh_cus_2', tenant: 'org_b' }]
+        .filter((customer) => customer.tenant === tenantId),
+    }),
+    '/plans': () => ({ plans: [{ id: 'team' }, { id: 'enterprise' }] }),
+    '/notifications': () => ({ notifications: [{ id: 'mh_note_1', kind: 'doc.shared' }] }),
+    '/settings': () => ({ settings: { locale: 'en-US', retentionDays: 90 } }),
+    '/folders': () => ({ folders: [{ id: 'mh_fld_1', name: 'shared' }] }),
+    '/groups': () => ({ groups: [{ id: 'mh_grp_1', name: 'engineering' }] }),
+    '/webhooks': () => ({ webhooks: [{ id: 'mh_wh_1', events: ['doc.created'] }] }),
+    '/integrations': () => ({ integrations: [{ id: 'mh_int_1', kind: 'scim' }] }),
+    '/pats': (_tenantId, userId) => ({
+      tokens: state.pats
+        .filter((pat) => pat.userId === userId)
+        .map((pat) => ({ id: pat.id, scopes: pat.scopes, revoked: pat.revoked })),
+    }),
   }
   for (const [path, payload] of Object.entries(benign)) {
     if (match(url, method, at(path))) {
-      sendJson(res, 200, payload)
+      const session = auth(state, req, res)
+      if (!session) return
+      sendJson(res, 200, payload(session.tenantId, session.userId))
       return
     }
   }

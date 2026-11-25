@@ -195,8 +195,13 @@ test('renewable lifecycle hooks, X-Guardian-Run-Id tagging and fast-lab async la
     const scimId = scim.json<{ id: string }>().id
     assert.equal((await ctx.http('api', `${prefix}/scim/tokens/${scimId}/revoke`, { method: 'POST', token: owner })).status, 200)
 
+    const serviceHeaders = { 'x-service-token': ctx.hmac(lab.plan.secrets.serviceToken, 'service') }
+    assert.equal((await ctx.http('docs-worker', '/jobs/export', {
+      method: 'POST', body: { tenantId: 'org_a' },
+    })).status, 401)
     const created = await ctx.http('docs-worker', '/jobs/export', {
       method: 'POST',
+      headers: serviceHeaders,
       body: { tenantId: 'org_a', userId: lab.plan.personas.owner_a.userId },
     })
     assert.equal(created.status, 202)
@@ -211,10 +216,11 @@ test('renewable lifecycle hooks, X-Guardian-Run-Id tagging and fast-lab async la
     assert.equal(job.runId, lab.runId)
 
     const second = await ctx.http('docs-worker', '/jobs/export', {
-      method: 'POST', body: { tenantId: 'org_a', folderName: 'shared' },
+      method: 'POST', headers: serviceHeaders, body: { tenantId: 'org_a', folderName: 'shared' },
     })
     const secondId = second.json<{ jobId: string }>().jobId
-    assert.equal((await ctx.http('docs-worker', `/jobs/${secondId}/cancel`, { method: 'POST' })).status, 200)
+    assert.equal((await ctx.http('docs-worker', `/jobs/${secondId}/cancel`, { method: 'POST' })).status, 401)
+    assert.equal((await ctx.http('docs-worker', `/jobs/${secondId}/cancel`, { method: 'POST', headers: serviceHeaders })).status, 200)
     const afterCancel = await ctx.http('docs-worker', `/jobs/${secondId}`)
     assert.equal(afterCancel.json<{ job: { status: string } }>().job.status, 'cancelled')
   } finally {

@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { readBody, parseJson, sendJson, sendText, runIdOf, match, parseUrl } from './http.ts'
 import type { JobRecord, LabState, TenantKey } from './shared.ts'
-import { digest } from './policy.ts'
+import { digest, serviceAuthorized } from './policy.ts'
 import { tenantById } from './state.ts'
 
 function newJob(
@@ -70,11 +70,19 @@ export async function handleDocsWorker(
     return
   }
   if (match(url, method, '/jobs')) {
+    if (!serviceAuthorized(state, req)) {
+      sendJson(res, 401, { error: 'service token required' })
+      return
+    }
     sendJson(res, 200, { jobs: state.jobs.map(jobView) })
     return
   }
 
   if (method === 'POST' && match(url, method, '/jobs/export')) {
+    if (!serviceAuthorized(state, req)) {
+      sendJson(res, 401, { error: 'service token required' })
+      return
+    }
     const body = parseJson<{
       tenantId?: string; userId?: string; folderName?: string; preDemotion?: boolean; runId?: string
     }>(await readBody(req))
@@ -144,6 +152,10 @@ export async function handleDocsWorker(
 
   const cancel = match(url, method, '/jobs/:id/cancel')
   if (cancel) {
+    if (!serviceAuthorized(state, req)) {
+      sendJson(res, 401, { error: 'service token required' })
+      return
+    }
     const job = state.jobs.find((item) => item.id === cancel[0])
     if (!job) {
       sendJson(res, 404, { error: 'unknown job' })
@@ -164,6 +176,10 @@ export async function handleDocsWorker(
     return
   }
   if (match(url, method, '/audit')) {
+    if (!serviceAuthorized(state, req)) {
+      sendJson(res, 401, { error: 'service token required' })
+      return
+    }
     sendJson(res, 200, { events: state.audit.slice(-50).map((event) => ({ kind: event.kind, ts: event.ts })) })
     return
   }

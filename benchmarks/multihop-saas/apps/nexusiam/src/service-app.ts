@@ -108,6 +108,10 @@ export async function handleApp(
   }
 
   if (match(url, method, '/v1/moderation/queue')) {
+    if (!serviceAuthorized(state, req)) {
+      sendJson(res, 401, { error: 'service token required' })
+      return
+    }
     sendJson(res, 200, {
       queue: state.comments.map((comment) => ({
         id: comment.id, tenantId: comment.tenantId, rawStored: comment.rawStored,
@@ -123,7 +127,11 @@ export async function handleApp(
       sendJson(res, 401, { error: 'session required' })
       return
     }
-    const collected = state.collected.find((item) => item.commentId === inbox[0] && item.runId === runId)
+    // Moderation material for a comment is shown only to that comment's author.
+    const authored = state.comments.find((item) => item.id === inbox[0] && item.authorUserId === session.userId)
+    const collected = authored
+      ? state.collected.find((item) => item.commentId === authored.id && item.runId === runId)
+      : undefined
     if (!collected) {
       sendJson(res, 404, { error: 'no collected material' })
       return
