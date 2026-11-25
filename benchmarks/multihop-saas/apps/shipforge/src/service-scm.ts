@@ -8,7 +8,7 @@ import type {
   BuildRecord, DeliveryRecord, InviteRecord, LabRole, LabState, PatRecord, SessionRecord, TenantKey,
   WebhookRecord,
 } from './shared.ts'
-import { authenticate, authorizeHeader, digest, patByToken } from './policy.ts'
+import { authenticate, authorizeHeader, digest, hasTenantMembership, patByToken } from './policy.ts'
 import { projectById, tenantBySlug } from './state.ts'
 
 export interface ScmDeps {
@@ -195,7 +195,7 @@ export async function handleScm(
     }
     sendJson(res, 200, {
       repos: state.projects
-        .filter((project) => project.tenantId === session.tenantId || project.visibility === 'shared')
+        .filter((project) => hasTenantMembership(state, session, project.tenantId))
         .map((project) => ({
           id: project.id, slug: project.slug, name: project.name,
           visibility: project.visibility, state: project.state,
@@ -207,13 +207,13 @@ export async function handleScm(
   const repoGet = match(url, method, '/repos/:id')
   if (repoGet) {
     const session = authenticate(state, req)
-    const project = projectById(state, repoGet[0]!)
-    if (!project) {
-      sendJson(res, 404, { error: 'unknown repository' })
+    if (!session) {
+      sendJson(res, 401, { error: 'session required' })
       return
     }
-    if (!session && project.visibility !== 'shared') {
-      sendJson(res, 401, { error: 'session required' })
+    const project = projectById(state, repoGet[0]!)
+    if (!project || !hasTenantMembership(state, session, project.tenantId)) {
+      sendJson(res, 404, { error: 'unknown repository' })
       return
     }
     sendJson(res, 200, { repo: project })
@@ -343,7 +343,7 @@ export async function handleScm(
       return
     }
     const webhook = state.webhooks.find((item) => item.id === deliveryLog[1] && item.projectId === deliveryLog[0])
-    if (!webhook) {
+    if (!webhook || !hasTenantMembership(state, session, webhook.tenantId)) {
       sendJson(res, 404, { error: 'unknown webhook' })
       return
     }

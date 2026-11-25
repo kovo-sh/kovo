@@ -49,6 +49,10 @@ export function roleOf(state: LabState, session: SessionRecord, tenantId: Tenant
   return user.rolesByTenant[tenantId] ?? null
 }
 
+export function hasTenantMembership(state: LabState, session: SessionRecord, tenantId: TenantKey): boolean {
+  return session.tenantId === tenantId || roleOf(state, session, tenantId) !== null
+}
+
 export function permissionsFor(role: LabRole | null): string[] {
   if (role === null) return []
   switch (role) {
