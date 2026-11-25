@@ -22,8 +22,20 @@ import {
   verificationTierLabels,
 } from '../report-summary.ts'
 import { buildCoverageGapReport, formatCoverageGapMarkdown } from './coverage-gaps.ts'
+import type { CompositeProofReceipt } from './composite-receipt.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
-import { exportRunReceiptBundle, verifyProofReceiptBundle } from './receipt-export.ts'
+import {
+  buildPortableCompositeReceiptRecord,
+  exportRunReceiptBundle,
+  extractStoreCompositeReceipts,
+  isPortableCompositeReceiptRecord,
+  verifyProofReceiptBundle,
+} from './receipt-export.ts'
+import type {
+  CompositeReceiptExportInput,
+  PortableCompositeEdgeBinding,
+  PortableCompositeReceiptRecord,
+} from './receipt-export.ts'
 import { redact, redactHeaders, redactZdr } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import { isReportSource, projectReportEvidence } from './report-evidence.ts'
@@ -69,9 +81,165 @@ function linkTo({ number }: Attachment) {
 
 export { exportRunReceiptBundle, verifyProofReceiptBundle }
 
+export type CompositeChainMarkdownInput =
+  | PortableCompositeReceiptRecord
+  | CompositeProofReceipt
+  | CompositeReceiptExportInput
+
+export interface FormatCompositeChainMarkdownOptions {
+  secrets?: readonly NamedSecret[]
+  zdr?: boolean
+}
+
+function scrubMarkdownText(value: string, secrets: readonly NamedSecret[], zdr: boolean): string {
+  return zdr ? redactZdr(value, secrets) : redact(value, secrets)
+}
+
+function codeSpan(value: string, secrets: readonly NamedSecret[], zdr: boolean): string {
+  const clean = scrubMarkdownText(value, secrets, zdr).replace(/[`\r\n]+/g, ' ').trim()
+  return `\`${clean}\``
+}
+
+function normalizeCompositeForMarkdown(
+  item: CompositeChainMarkdownInput,
+  secrets: readonly NamedSecret[],
+  zdr: boolean,
+): PortableCompositeReceiptRecord {
+  if (isPortableCompositeReceiptRecord(item)) {
+    return item
+  }
+  const input: CompositeReceiptExportInput = 'receipt' in item && 'hops' in item.receipt
+    ? item
+    : { receipt: item as CompositeProofReceipt }
+  return buildPortableCompositeReceiptRecord(input, { secrets, zdr })
+}
+
+function formatEdgeBindingDetail(
+  edge: PortableCompositeEdgeBinding,
+  secrets: readonly NamedSecret[],
+  zdr: boolean,
+): string {
+  const d = edge.bindingDetail
+  if (edge.kind === 'value_binding') {
+    const parts: string[] = []
+    if (d.capabilityHandle) parts.push(`capability ${codeSpan(d.capabilityHandle, secrets, zdr)}`)
+    if (d.valueDigest) parts.push(`digest ${codeSpan(d.valueDigest.slice(0, 16) + '...', secrets, zdr)}`)
+    return parts.join(', ') || 'host-signed value handoff'
+  }
+  if (edge.kind === 'derived_crypto_binding') {
+    const parts: string[] = []
+    if (d.sourceCapabilityId) parts.push(`source ${codeSpan(d.sourceCapabilityId, secrets, zdr)}`)
+    if (d.derivedCapabilityId) parts.push(`derived ${codeSpan(d.derivedCapabilityId, secrets, zdr)}`)
+    if (d.alg) parts.push(`alg ${codeSpan(d.alg, secrets, zdr)}`)
+    return parts.join(', ') || 'host-attested crypto derivation'
+  }
+  if (edge.kind === 'state_transition_binding') {
+    const parts: string[] = []
+    if (d.entityId) parts.push(`entity ${codeSpan(d.entityId, secrets, zdr)}`)
+    if (d.mutationKind) parts.push(`mutation ${codeSpan(d.mutationKind, secrets, zdr)}`)
+    if (d.ablationExchangeIds?.length) parts.push(`${d.ablationExchangeIds.length} ablation control(s)`)
+    return parts.join(', ') || 'clean-session ablation state transition'
+  }
+  const parts: string[] = []
+  if (d.channel) parts.push(`channel ${codeSpan(d.channel, secrets, zdr)}`)
+  if (d.correlationId) parts.push(`correlation ${codeSpan(d.correlationId, secrets, zdr)}`)
+  return parts.join(', ') || 'async pivot correlation'
+}
+
+/**
+ * Render multi-hop `CompositeProofReceipt` DAG chains cleanly in Markdown:
+ * `Hop 1 -> Hop 2 -> ... -> Terminal Impact`, actor/surface per hop, causal edge binding kind,
+ * Mode-A / Mode-B verification badge, and `patchBrokeHopId` when retested against a patch.
+ */
+export function formatCompositeChainMarkdown(
+  receipts: readonly CompositeChainMarkdownInput[],
+  options: FormatCompositeChainMarkdownOptions = {},
+): string {
+  if (!receipts.length) return ''
+  const secrets = options.secrets ?? []
+  const zdr = options.zdr === true
+
+  const lines: string[] = ['## Multi-Hop Causal Chains', '']
+  for (const raw of receipts) {
+    const record = normalizeCompositeForMarkdown(raw, secrets, zdr)
+    const heading = record.title
+      ? `${inline(scrubMarkdownText(record.title, secrets, zdr), secrets)} (${codeSpan(record.chainId, secrets, zdr)})`
+      : `Chain ${codeSpan(record.chainId, secrets, zdr)} — ${codeSpan(record.terminalVulnClass, secrets, zdr)}`
+
+    const modeBadge = record.replayMode === 'fresh_clean_replay'
+      ? (record.confirmed ? '`[Mode-A Verified]` (fresh_clean_replay)' : '`[Mode-A Unverified]` (fresh_clean_replay)')
+      : (record.confirmed ? '`[Mode-B Verified]` (one_shot_transcript)' : '`[Mode-B Unverified]` (one_shot_transcript)')
+
+    const hopSequence = record.hops
+      .map(hop => `Hop ${hop.order} (${codeSpan(hop.hopId, secrets, zdr)})`)
+      .join(' -> ')
+
+    lines.push(
+      `### ${heading}`, '',
+      `- **Terminal class** ${codeSpan(record.terminalVulnClass, secrets, zdr)}${record.severity ? ` · **Severity** ${inline(record.severity, secrets)}` : ''}${record.cwe ? ` · **CWE** ${codeSpan(record.cwe, secrets, zdr)}` : ''} · **Hops** ${record.hopCount}`,
+      `- **Verification** ${modeBadge}${record.verificationReason ? ` — ${inline(scrubMarkdownText(record.verificationReason, secrets, zdr), secrets)}` : ''}`,
+    )
+    if (record.patchBrokeHopId) {
+      const verdictText = record.patchRetestVerdict ? ` (${record.patchRetestVerdict})` : ''
+      lines.push(
+        `- **Patch retest** Chain broken at ${codeSpan(record.patchBrokeHopId, secrets, zdr)} (\`patchBrokeHopId\`: ${codeSpan(record.patchBrokeHopId, secrets, zdr)})${verdictText}`,
+      )
+    }
+    lines.push(
+      `- **DAG path** ${hopSequence} -> **Terminal Impact** (${codeSpan(record.terminalImpact.terminalHopId, secrets, zdr)})`,
+      '',
+      '| Hop | Hop ID | Surface | Actor | Target | Causal Binding | Delta |',
+      '| :--- | :--- | :--- | :--- | :--- | :--- | :--- |',
+    )
+
+    const incomingByHop = new Map<string, PortableCompositeEdgeBinding[]>()
+    for (const edge of record.causalEdges) {
+      const arr = incomingByHop.get(edge.toHopId) ?? []
+      arr.push(edge)
+      incomingByHop.set(edge.toHopId, arr)
+    }
+
+    for (const hop of record.hops) {
+      const incoming = incomingByHop.get(hop.hopId) ?? []
+      const bindingCell = incoming.length > 0
+        ? incoming.map(e => `${codeSpan(e.fromHopId, secrets, zdr)} --[${codeSpan(e.kind, secrets, zdr)}]-->`).join('; ')
+        : 'Root'
+      const targetStr = `${hop.method ? `${hop.method} ` : ''}${hop.origin}${hop.pathAndQuery ?? ''}`
+      const actorCell = hop.actor ? codeSpan(hop.actor, secrets, zdr) : '_derived-capability_'
+      const hopTag = [
+        `Hop ${hop.order}`,
+        ...(hop.hopId === record.terminalImpact.terminalHopId ? ['**(Terminal)**'] : []),
+        ...(record.patchBrokeHopId === hop.hopId ? ['**(Patch broke here)**'] : []),
+      ].join(' ')
+      lines.push(
+        `| ${hopTag} | ${codeSpan(hop.hopId, secrets, zdr)} | ${codeSpan(hop.surface, secrets, zdr)} | ${actorCell} | ${codeSpan(targetStr, secrets, zdr)} | ${bindingCell} | ${inline(scrubMarkdownText(hop.claimedDelta, secrets, zdr), secrets)} |`,
+      )
+    }
+
+    lines.push(
+      '',
+      `- **Terminal Impact** (${codeSpan(record.terminalImpact.terminalHopId, secrets, zdr)}): ${inline(scrubMarkdownText(record.terminalImpact.claimedImpact, secrets, zdr), secrets)}`,
+    )
+    if (record.causalEdges.length > 0) {
+      lines.push('', '#### Causal Edge Bindings', '')
+      for (const edge of record.causalEdges) {
+        const verifiedTag = edge.verified === true ? ' · verified' : edge.verified === false ? ' · unverified' : ''
+        lines.push(
+          `- ${codeSpan(edge.fromHopId, secrets, zdr)} -> ${codeSpan(edge.toHopId, secrets, zdr)} (${codeSpan(edge.kind, secrets, zdr)}${verifiedTag}) — ${formatEdgeBindingDetail(edge, secrets, zdr)}`,
+        )
+      }
+    }
+    lines.push('')
+  }
+
+  const raw = lines.join('\n')
+  return zdr ? redactZdr(raw, secrets) : redact(raw, secrets)
+}
+
 export interface ExportReportMarkdownOptions {
   zdr?: boolean
   tenantId?: string
+  compositeReceipts?: readonly CompositeChainMarkdownInput[]
 }
 
 export function exportReportMarkdown(
@@ -391,6 +559,21 @@ export function exportReportMarkdown(
       )
     }
     lines.push('')
+  }
+
+  const findingsMetaById = new Map(findings.map(f => [f.id, { title: f.title, severity: f.severity, cwe: f.cwe ?? null }]))
+  const storeCompositeInputs = extractStoreCompositeReceipts([...runSpecs.values()], runRetests, findingsMetaById)
+  const compositeByChain = new Map<string, PortableCompositeReceiptRecord>()
+  const addCompositeIfInScope = (item: CompositeChainMarkdownInput) => {
+    const normalized = normalizeCompositeForMarkdown(item, secrets, options.zdr === true)
+    if (normalized.hops.some(h => !approved.has(h.origin))) return
+    compositeByChain.set(normalized.chainId, normalized)
+  }
+  for (const item of storeCompositeInputs) addCompositeIfInScope(item)
+  for (const item of options.compositeReceipts ?? []) addCompositeIfInScope(item)
+  const compositeChains = [...compositeByChain.values()].sort((a, b) => a.chainId.localeCompare(b.chainId))
+  if (compositeChains.length > 0) {
+    lines.push(formatCompositeChainMarkdown(compositeChains, { secrets, zdr: options.zdr === true }))
   }
 
   if (confirmedFindings.length || staticVerifiedFindings.length) {

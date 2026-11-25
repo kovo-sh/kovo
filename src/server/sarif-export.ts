@@ -3,11 +3,21 @@ import { and, desc, eq } from 'drizzle-orm'
 import type { Finding, OwaspCategory } from '../domain.ts'
 import { deduplicateChainFindings, owaspCategoryTitles } from '../report-summary.ts'
 import { computeFindingFingerprint } from './dedupe.ts'
+import type { CompositeProofReceipt } from './composite-receipt.ts'
 import { privateModelProfiles } from './model-settings.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
-import { redact } from './redact.ts'
+import {
+  buildPortableCompositeReceiptRecord,
+  extractStoreCompositeReceipts,
+  isPortableCompositeReceiptRecord,
+} from './receipt-export.ts'
+import type {
+  CompositeReceiptExportInput,
+  PortableCompositeReceiptRecord,
+} from './receipt-export.ts'
+import { redact, redactPii } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
-import { brokerExchanges, findings as findingsTable, replaySpecs, reports } from './schema.ts'
+import { brokerExchanges, findings as findingsTable, replaySpecs, reports, retestRuns } from './schema.ts'
 import type { Store } from './store.ts'
 
 export interface SarifCodeLocation {
@@ -17,6 +27,16 @@ export interface SarifCodeLocation {
   endLine?: number
   snippet?: string
   label?: string
+}
+
+export type SarifCompositeReceiptInput =
+  | CompositeProofReceipt
+  | PortableCompositeReceiptRecord
+  | CompositeReceiptExportInput
+
+export interface SarifCodeFlowOptions {
+  secrets?: readonly NamedSecret[]
+  zdr?: boolean
 }
 
 export interface SarifFindingInput extends Omit<Finding, 'status' | 'codeLocations' | 'verificationTier' | 'fingerprintHash' | 'counterevidence' | 'confidenceRationale' | 'severityChangeConditions' | 'runtimeProofGap'> {
@@ -29,6 +49,7 @@ export interface SarifFindingInput extends Omit<Finding, 'status' | 'codeLocatio
   severityChangeConditions?: string | null
   codeLocations?: SarifCodeLocation[] | null
   endpoint?: string | null
+  compositeReceipt?: SarifCompositeReceiptInput | null
 }
 
 export interface SarifPatchInput {
@@ -89,6 +110,28 @@ export interface SarifLocation {
     fullyQualifiedName: string
     kind: string
   }>
+  message?: { text: string }
+}
+
+export interface SarifThreadFlowLocation {
+  executionOrder: number
+  location: SarifLocation
+  kinds?: string[]
+  importance?: 'essential' | 'important' | 'unimportant'
+  properties?: {
+    guardian: Record<string, unknown>
+  }
+}
+
+export interface SarifThreadFlow {
+  id: string
+  message?: { text: string }
+  locations: SarifThreadFlowLocation[]
+}
+
+export interface SarifCodeFlow {
+  message?: { text: string }
+  threadFlows: SarifThreadFlow[]
 }
 
 export interface SarifArtifactChange {
@@ -111,6 +154,7 @@ export interface SarifResult {
   level: 'error' | 'warning' | 'note' | 'none'
   message: { text: string }
   locations: SarifLocation[]
+  codeFlows?: SarifCodeFlow[]
   partialFingerprints?: Record<string, string>
   fixes?: SarifFix[]
   properties: {
@@ -153,11 +197,18 @@ export interface SarifBuildInput {
   findings: readonly SarifFindingInput[]
   coverageEntries?: readonly SarifCoverageInput[]
   patches?: readonly SarifPatchInput[]
+  compositeReceipts?: readonly SarifCompositeReceiptInput[]
   replaySpecShaById?: ReadonlyMap<string, string>
   approvedExchangeIds?: ReadonlySet<string>
   executionSuccessful?: boolean
   generatedAtIso?: string
   secrets?: readonly NamedSecret[]
+  zdr?: boolean
+}
+
+export interface ExportReportSarifOptions {
+  compositeReceipts?: readonly SarifCompositeReceiptInput[]
+  zdr?: boolean
 }
 
 const CHECK_ID_TO_CWE: Record<string, { cwe: string; name: string }> = {
@@ -322,25 +373,159 @@ function parseArtifactChangesFromPatch(patch: SarifPatchInput, secrets: readonly
   return changes
 }
 
-function redactDeep<T>(value: T, secrets: readonly NamedSecret[]): T {
+function scrubSarifText(value: string, secrets: readonly NamedSecret[], zdr: boolean): string {
+  return zdr ? redactPii(value, { secrets }) : redact(value, secrets)
+}
+
+function redactDeep<T>(value: T, secrets: readonly NamedSecret[], zdr = false): T {
   if (typeof value === 'string') {
-    return redact(value, secrets) as unknown as T
+    return scrubSarifText(value, secrets, zdr) as unknown as T
   }
   if (Array.isArray(value)) {
-    return value.map(item => redactDeep(item, secrets)) as unknown as T
+    return value.map(item => redactDeep(item, secrets, zdr)) as unknown as T
   }
   if (value && typeof value === 'object') {
     const out: Record<string, unknown> = {}
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (v !== undefined) out[k] = redactDeep(v, secrets)
+      if (v !== undefined) out[k] = redactDeep(v, secrets, zdr)
     }
     return out as T
   }
   return value
 }
 
+function normalizeCompositeForSarif(
+  item: SarifCompositeReceiptInput,
+  secrets: readonly NamedSecret[],
+  zdr: boolean,
+): PortableCompositeReceiptRecord {
+  if (isPortableCompositeReceiptRecord(item)) {
+    return item
+  }
+  const input: CompositeReceiptExportInput = 'receipt' in item && 'hops' in item.receipt
+    ? item
+    : { receipt: item as CompositeProofReceipt }
+  return buildPortableCompositeReceiptRecord(input, { secrets, zdr })
+}
+
+/**
+ * Convert one or more `CompositeProofReceipt` DAGs into OASIS SARIF 2.1.0 `codeFlows` /
+ * `threadFlows` with topologically ordered hop locations (surface + route + causal binding kind)
+ * and zero secret leakage.
+ */
+export function compositeReceiptsToSarifCodeFlows(
+  receiptOrReceipts: SarifCompositeReceiptInput | readonly SarifCompositeReceiptInput[],
+  options: SarifCodeFlowOptions = {},
+): SarifCodeFlow[] {
+  const items = Array.isArray(receiptOrReceipts)
+    ? receiptOrReceipts as readonly SarifCompositeReceiptInput[]
+    : [receiptOrReceipts as SarifCompositeReceiptInput]
+  if (items.length === 0) return []
+
+  const secrets = options.secrets ?? []
+  const zdr = options.zdr === true
+  const codeFlows: SarifCodeFlow[] = []
+
+  for (const raw of items) {
+    const record = normalizeCompositeForSarif(raw, secrets, zdr)
+    const incomingByHop = new Map<string, Array<{ fromHopId: string; kind: string }>>()
+    const outgoingByHop = new Map<string, Array<{ toHopId: string; kind: string }>>()
+    for (const edge of record.causalEdges) {
+      const inc = incomingByHop.get(edge.toHopId) ?? []
+      inc.push({ fromHopId: edge.fromHopId, kind: edge.kind })
+      incomingByHop.set(edge.toHopId, inc)
+      const out = outgoingByHop.get(edge.fromHopId) ?? []
+      out.push({ toHopId: edge.toHopId, kind: edge.kind })
+      outgoingByHop.set(edge.fromHopId, out)
+    }
+
+    const threadFlowLocations: SarifThreadFlowLocation[] = record.hops.map(hop => {
+      const incoming = incomingByHop.get(hop.hopId) ?? []
+      const outgoing = outgoingByHop.get(hop.hopId) ?? []
+      const incomingBindingKinds = incoming.map(e => e.kind)
+      const outgoingBindingKinds = outgoing.map(e => e.kind)
+      const route = hop.pathAndQuery || '/'
+      const methodPrefix = hop.method ? `${hop.method} ` : ''
+      const isTerminal = hop.hopId === record.terminalImpact.terminalHopId
+      const patchBrokeHere = record.patchBrokeHopId === hop.hopId
+
+      const bindingClause = incoming.length > 0
+        ? ` via ${incoming.map(e => `${e.kind} from ${e.fromHopId}`).join(', ')}`
+        : ' (root hop)'
+      const actorClause = hop.actor ? ` [actor: ${hop.actor}]` : ''
+      const suffixFlags = [
+        ...(isTerminal ? ['[Terminal Impact]'] : []),
+        ...(patchBrokeHere ? [`[Patch broke chain at ${hop.hopId}]`] : []),
+      ].join(' ')
+
+      const locationText = [
+        `Hop ${hop.order}/${record.hops.length} (${hop.hopId}) [${hop.surface}] ${methodPrefix}${hop.origin}${route}${bindingClause}${actorClause}: ${hop.claimedDelta}`,
+        ...(suffixFlags ? [suffixFlags] : []),
+      ].join(' ')
+
+      const kinds = [
+        hop.surface,
+        ...(incomingBindingKinds.length > 0 ? incomingBindingKinds : ['entry']),
+        ...(isTerminal ? ['terminal_impact'] : []),
+      ]
+
+      return {
+        executionOrder: hop.order,
+        location: {
+          logicalLocations: [
+            {
+              name: `${hop.surface}:${methodPrefix}${route}`,
+              fullyQualifiedName: `${hop.origin}::${hop.surface}::${route}::${hop.hopId}`,
+              kind: hop.surface,
+            },
+          ],
+          message: { text: locationText },
+        },
+        kinds,
+        importance: hop.order === 1 || isTerminal ? 'essential' : 'important',
+        properties: {
+          guardian: {
+            chainId: record.chainId,
+            hopId: hop.hopId,
+            hopIndex: hop.order,
+            surface: hop.surface,
+            origin: hop.origin,
+            method: hop.method,
+            route,
+            actor: hop.actor,
+            incomingBindingKinds,
+            outgoingBindingKinds,
+            isTerminal,
+            ...(patchBrokeHere ? { patchBrokeHopId: hop.hopId } : {}),
+          },
+        },
+      }
+    })
+
+    const modeLabel = record.replayMode === 'fresh_clean_replay' ? 'Mode-A fresh_clean_replay' : 'Mode-B one_shot_transcript'
+    const patchClause = record.patchBrokeHopId ? `; patchBrokeHopId=${record.patchBrokeHopId}` : ''
+    const flowMsg = `Multi-hop causal chain ${record.chainId} (${record.hops.length} hops, ${record.terminalVulnClass}, ${modeLabel}${patchClause}): ${record.terminalImpact.claimedImpact}`
+
+    codeFlows.push({
+      message: { text: flowMsg },
+      threadFlows: [
+        {
+          id: record.chainId,
+          message: {
+            text: `${record.hops.map(h => `${h.hopId}[${h.surface}]`).join(' -> ')} -> Terminal Impact`,
+          },
+          locations: threadFlowLocations,
+        },
+      ],
+    })
+  }
+
+  return redactDeep(codeFlows, secrets, zdr)
+}
+
 export function buildSarifLog(input: SarifBuildInput): SarifLog {
   const secrets = input.secrets ?? []
+  const zdr = input.zdr === true
   const approved = new Set(input.approvedOrigins)
   const rules: SarifReportingDescriptor[] = []
   const ruleIndexById = new Map<string, number>()
@@ -363,6 +548,18 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
     const arr = patchesByFinding.get(patch.findingId) ?? []
     arr.push(patch)
     patchesByFinding.set(patch.findingId, arr)
+  }
+
+  const compositeByFinding = new Map<string, PortableCompositeReceiptRecord[]>()
+  for (const rawComp of input.compositeReceipts ?? []) {
+    const normalized = normalizeCompositeForSarif(rawComp, secrets, zdr)
+    if (normalized.hops.some(h => !approved.has(h.origin))) continue
+    if (!normalized.findingId) continue
+    const arr = compositeByFinding.get(normalized.findingId) ?? []
+    if (!arr.some(existing => existing.chainId === normalized.chainId)) {
+      arr.push(normalized)
+      compositeByFinding.set(normalized.findingId, arr)
+    }
   }
 
   const results: SarifResult[] = []
@@ -485,6 +682,25 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
       secrets,
     )
 
+    const matchedComposites: PortableCompositeReceiptRecord[] = []
+    const seenChainIds = new Set<string>()
+    for (const comp of compositeByFinding.get(finding.id) ?? []) {
+      if (!seenChainIds.has(comp.chainId)) {
+        seenChainIds.add(comp.chainId)
+        matchedComposites.push(comp)
+      }
+    }
+    if (finding.compositeReceipt) {
+      const normalized = normalizeCompositeForSarif(finding.compositeReceipt, secrets, zdr)
+      if (!normalized.hops.some(h => !approved.has(h.origin)) && !seenChainIds.has(normalized.chainId)) {
+        seenChainIds.add(normalized.chainId)
+        matchedComposites.push(normalized)
+      }
+    }
+    const codeFlows = matchedComposites.length > 0
+      ? compositeReceiptsToSarifCodeFlows(matchedComposites, { secrets, zdr })
+      : []
+
     results.push({
       ruleId: ruleMeta.id,
       ruleIndex,
@@ -492,6 +708,7 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
       level,
       message: { text: messageText },
       locations,
+      ...(codeFlows.length > 0 ? { codeFlows } : {}),
       partialFingerprints: {
         'guardian/v3/fingerprint': fp,
         'primaryLocationLineHash': createHash('sha256').update(`${finding.id}:${fp}`).digest('hex').slice(0, 32),
@@ -509,6 +726,16 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
           ...(runtimeProofGap ? { runtimeProofGap } : {}),
           exchangeIds: approvedExchanges,
           ...(replaySpecSha256 ? { replaySpecSha256 } : {}),
+          ...(matchedComposites.length > 0
+            ? {
+                compositeChains: matchedComposites.map(c => ({
+                  chainId: c.chainId,
+                  hopCount: c.hopCount,
+                  replayMode: c.replayMode,
+                  ...(c.patchBrokeHopId ? { patchBrokeHopId: c.patchBrokeHopId } : {}),
+                })),
+              }
+            : {}),
           ...(finding.counterevidence ? { counterevidence: finding.counterevidence } : {}),
           ...(finding.confidenceRationale ? { confidenceRationale: finding.confidenceRationale } : {}),
           ...(finding.severityChangeConditions ? { severityChangeConditions: finding.severityChangeConditions } : {}),
@@ -619,7 +846,7 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
     ],
   }
 
-  return redactDeep(log, secrets)
+  return redactDeep(log, secrets, zdr)
 }
 
 function hydrateFindingsForSarif(storage: Store, runId: string, baseFindings: readonly Finding[]): SarifFindingInput[] {
@@ -671,6 +898,7 @@ export function exportReportSarif(
   runId: string,
   reportId?: string,
   extraSecrets: readonly NamedSecret[] = [],
+  options: ExportReportSarifOptions = {},
 ): { filename: string; content: string; log: SarifLog } {
   const run = storage.run(runId)
   const report = reportId
@@ -718,10 +946,23 @@ export function exportReportSarif(
 
   const enrichedFindings = hydrateFindingsForSarif(storage, run.id, baseFindings)
 
+  const specRows = storage.db.select().from(replaySpecs).where(eq(replaySpecs.runId, run.id)).all()
+  const retestRows = storage.db.select().from(retestRuns)
+    .where(eq(retestRuns.runId, run.id))
+    .orderBy(desc(retestRuns.createdAt))
+    .all()
   const replaySpecShaById = new Map<string, string>()
-  for (const specRow of storage.db.select().from(replaySpecs).where(eq(replaySpecs.runId, run.id)).all()) {
+  for (const specRow of specRows) {
     replaySpecShaById.set(specRow.id, specRow.specSha256)
   }
+
+  const findingsMetaById = new Map(
+    enrichedFindings.map(f => [f.id, { title: f.title, severity: f.severity, cwe: f.cwe ?? null }]),
+  )
+  const compositeReceipts: SarifCompositeReceiptInput[] = [
+    ...extractStoreCompositeReceipts(specRows, retestRows, findingsMetaById),
+    ...(options.compositeReceipts ?? []),
+  ]
 
   const approvedExchangeIds = new Set<string>()
   for (const ex of storage.db.select().from(brokerExchanges).where(eq(brokerExchanges.runId, run.id)).all()) {
@@ -746,15 +987,18 @@ export function exportReportSarif(
     findings: enrichedFindings,
     coverageEntries: covEntries,
     patches,
+    ...(compositeReceipts.length > 0 ? { compositeReceipts } : {}),
     replaySpecShaById,
     approvedExchangeIds,
     executionSuccessful: run.status !== 'failed',
     generatedAtIso: new Date(report ? report.createdAt : Date.now()).toISOString(),
     secrets: allSecrets,
+    ...(options.zdr !== undefined ? { zdr: options.zdr } : {}),
   })
 
   // Final defense-in-depth redaction pass on the serialized SARIF JSON string.
-  const content = redact(JSON.stringify(log, null, 2), allSecrets) + '\n'
+  const serialized = JSON.stringify(log, null, 2)
+  const content = (options.zdr ? redactPii(serialized, { secrets: allSecrets }) : redact(serialized, allSecrets)) + '\n'
   const finalLog = JSON.parse(content) as SarifLog
   return {
     filename: `guardian-report-${run.id.slice(0, 8)}-v${reportVersion}.sarif.json`,
