@@ -8,6 +8,7 @@ import {
   type OwaspCategory,
   type ThreatModelSummary,
 } from '../domain.ts'
+import { matchesMultiHopStepSignal } from './agent-prompts.ts'
 import {
   classifyHostTier,
   routeStepToSpecialist,
@@ -1598,20 +1599,9 @@ export function chainLaneDispatchRank(
 
 /** Identify genuine multi-hop / depth >= 2 chain steps eligible for dedicated frontier slot reservation. */
 export function isMultiHopChainStep(
-  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'category' | 'skills' | 'dependsOnStepIds'>,
+  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'category' | 'skills' | 'dependsOnStepIds' | 'dependsOnFactIds'>,
 ): boolean {
-  if ((step.dependsOnStepIds?.length ?? 0) > 0) return true
-  if ((step.skills ?? []).some(skill =>
-    skill === 'multihop-chains'
-    || skill === 'chain-primitives'
-    || skill.startsWith('chain:')
-    || skill.startsWith(CHAIN_CONTINUATION_SKILL_PREFIX)
-    || skill.startsWith('checkpoint_cap:'),
-  )) {
-    return true
-  }
-  const text = `${step.title} ${step.hypothesis ?? ''} ${step.category ?? ''}`
-  return /\[chain_hops=|\bhopCheckpoint\b|\bmulti[- ]?hop\b|\bchain_step\b|\bchain_continuation\b/i.test(text)
+  return matchesMultiHopStepSignal(step)
 }
 
 /** Map a step onto the round-robin lane it competes in. */
@@ -2324,7 +2314,7 @@ export function singleStepWallClockMs(env: NodeJS.ProcessEnv = process.env): num
  *    quickly and never starve the multi-hop frontier.
  */
 export function resolveWorkerWallClockMs(
-  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'category' | 'skills' | 'dependsOnStepIds'>,
+  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'category' | 'skills' | 'dependsOnStepIds' | 'dependsOnFactIds'>,
   runDurationMs?: number,
   options: { singleStepWallClockMs?: number } = {},
 ): number {
