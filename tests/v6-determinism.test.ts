@@ -229,7 +229,7 @@ test('Phase A runs the deep floor sequentially before any agent dispatch', async
 
   internals(execution).driveInvestigation(storage.run(runId), [{ id: 'profile', model: 'mock' }])
   assert.equal(floorCalls.length, 1, 'floor starts first')
-  assert.equal(floorCalls[0].maxDurationMs, 168_000, 'Phase A cap = min(180 s, 28% of wall)')
+  assert.equal(floorCalls[0].maxDurationMs, 72_000, 'Phase A cap = min(75 s, 12% of wall)')
   assert.equal(dispatched.length, 0, 'no agent dispatch while the floor is in flight')
 
   releaseFloor()

@@ -16,6 +16,7 @@ import { test } from 'node:test'
 import { BrokerApprovalRequired, BrokerDenied, RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'
 import type { ResolvedPersona } from '../src/server/persona-vault.ts'
+import { LocalJqBackend } from '../scripts/benchmark-backend.ts'
 import { browserSinkEnvelopeFromSteps } from '../src/server/floor-recipes.ts'
 import { verifyReplaySpec } from '../src/server/replay-verifier.ts'
 import { ScopedBrowser } from '../src/server/scoped-browser.ts'
@@ -767,28 +768,39 @@ test('v3 ReplayVerifier requireControlNonError: unexpected 404/503 yields inconc
 
   await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const broker = new RequestBroker({ rejectUnauthorized: false })
-    const backend = new LinuxWorkerBackend()
+    const backend = new LocalJqBackend()
     const grant = makeLabGrant(origin, { tier: 1 })
     const sig = AbortSignal.timeout(45_000)
 
-    const basePostureSpec = (pathAndQuery: string, extra: Record<string, unknown> = {}) => ({
+    const basePostureSpec = (pathAndQuery: string, stepExpectedStatus?: number) => ({
       version: 1 as const,
       kind: 'http_chain' as const,
       origin,
       title: 'Security header posture check',
-      category: 'misconfig-exposure',
+      category: 'security-misconfiguration',
       cwe: 'CWE-693',
       severity: 'low' as const,
       severityRationale: 'Missing Content-Security-Policy header.',
-      impact: 'Reduced defense-in-depth against script injection.',
+      impact: 'Reduced browser security-header defense-in-depth.',
       remediation: 'Add a strict Content-Security-Policy response header.',
       recheckInstructions: 'Verify header on live 200 response.',
       steps: [
-        { id: 'control', role: 'control' as const, description: 'Baseline GET', request: { origin, method: 'GET' as const, pathAndQuery } },
-        { id: 'probe', role: 'probe' as const, description: 'Probe GET', request: { origin, method: 'GET' as const, pathAndQuery } },
+        {
+          id: 'control',
+          role: 'control' as const,
+          description: 'Baseline GET',
+          request: { origin, method: 'GET' as const, pathAndQuery },
+          ...(stepExpectedStatus !== undefined ? { expectedStatus: stepExpectedStatus } : {}),
+        },
+        {
+          id: 'probe',
+          role: 'probe' as const,
+          description: 'Probe GET',
+          request: { origin, method: 'GET' as const, pathAndQuery },
+          ...(stepExpectedStatus !== undefined ? { expectedStatus: stepExpectedStatus } : {}),
+        },
       ],
       assertionsJq: '{ controlPassed: true, confirmed: ((.steps.probe.headers["content-security-policy"] // "") == ""), observed: ("status=" + (.steps.probe.status | tostring)), expected: "csp header present" }',
-      ...extra,
     })
 
     // Unexpected 404 -> inconclusive
@@ -815,7 +827,7 @@ test('v3 ReplayVerifier requireControlNonError: unexpected 404/503 yields inconc
 
     // Explicit expectedStatus: 404 opts in to checking 404 response behavior
     const explicit404 = await verifyReplaySpec({
-      spec: basePostureSpec('/gone', { expectedStatus: 404 }),
+      spec: basePostureSpec('/gone', 404),
       broker,
       backend,
       grant,

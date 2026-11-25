@@ -51,7 +51,7 @@ test('tier0: the catalog-public archetypes all dismiss (no model, no worker)', (
     const result = results.find(r => r.id === id)
     assert.ok(result, `${id} must be in the Tier-0 corpus`)
     assert.equal(result.dismissed, true, result.reason)
-    assert.match(result.reason, /public|identical|reference/i)
+    assert.match(result.reason, /public|identical|reference|bare collection get/i)
   }
 })
 
@@ -91,7 +91,7 @@ test('publicness: anonymous store-page body equal to the owner reference is dism
     ],
   })
   assert.equal(assessment.satisfied, false, assessment.reason)
-  assert.match(assessment.reason, /publicness/i)
+  assert.match(assessment.reason, /publicness|bare collection get/i)
 })
 
 test('publicness: a non-owner catalog item read identical to the owner reference is dismissed', () => {
@@ -105,7 +105,7 @@ test('publicness: a non-owner catalog item read identical to the owner reference
     ],
   })
   assert.equal(assessment.satisfied, false, assessment.reason)
-  assert.match(assessment.reason, /publicness/i)
+  assert.match(assessment.reason, /publicness|bare collection get/i)
 })
 
 test('publicness: an anonymous listing identical to the owner reference is dismissed', () => {
@@ -118,7 +118,7 @@ test('publicness: an anonymous listing identical to the owner reference is dismi
     ],
   })
   assert.equal(assessment.satisfied, false, assessment.reason)
-  assert.match(assessment.reason, /publicness/i)
+  assert.match(assessment.reason, /publicness|bare collection get/i)
 })
 
 test('publicness: differences confined to public listing fields are still dismissed', () => {

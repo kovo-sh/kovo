@@ -304,10 +304,14 @@ test('runChainPlanner buffers 2 waves on Round 1 and never increments dryRounds 
 
   const { runId, run } = await setupApprovedRun(storage, { seeds: [origin] })
   storage.updateRun(runId, { phase: 'investigation', status: 'running', workerConcurrency: 6, multiTrialEnabled: false })
-  for (let i = 1; i <= 14; i += 1) {
+  const routes = [
+    'billing', 'orders', 'reports', 'admin', 'users', 'webhooks', 'payouts',
+    'exports', 'invoices', 'tokens', 'settings', 'accounts', 'catalog', 'transfers',
+  ]
+  for (let i = 0; i < routes.length; i += 1) {
     storage.upsertEndpoint({
       runId, scopeRevision: run.scopeRevision, origin, method: 'POST',
-      pathTemplate: `/api/v1/resource-${i}/action`, source: 'openapi', riskScore: 80 - i,
+      pathTemplate: `/api/v1/${routes[i]}/action`, source: 'openapi', riskScore: 80 - i,
     })
   }
 

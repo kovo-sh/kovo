@@ -60,7 +60,7 @@ function html(res: ServerResponse, status: number, body: string): void {
 function persona(handle: string, origin: string): ResolvedPersona {
   return {
     id: handle, handle, roleLabel: handle, originAllowlist: [origin], authKind: 'header',
-    headerName: 'X-Persona', secret: handle, canaryMarkers: [],
+    headerName: 'X-Persona', secret: `tok-${handle}`, canaryMarkers: [],
   }
 }
 
@@ -102,7 +102,7 @@ function ordersFixture(hardened: boolean) {
   return fixture((req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
     if (url.pathname !== '/api/orders/42') return json(res, 404, { error: 'not_found' })
-    const actor = req.headers['x-persona']
+    const actor = String(req.headers['x-persona'] ?? '').replace(/^tok-/, '')
     if (!actor) return json(res, 401, { error: 'unauthorized' })
     if (hardened && actor !== 'owner') return json(res, 403, { error: 'forbidden' })
     return json(res, 200, { id: 42, owner: 'owner', privateNote: 'OWNER-ONLY-v5-proof' })
@@ -154,7 +154,7 @@ function accountFixture(hardened: boolean) {
     if (url.pathname !== '/api/accounts/7') return json(res, 404, { error: 'not_found' })
     if (req.method === 'GET') return json(res, 200, { id: 7, role })
     if (req.method !== 'PATCH') return json(res, 405, { error: 'method_not_allowed' })
-    const actor = req.headers['x-persona']
+    const actor = String(req.headers['x-persona'] ?? '').replace(/^tok-/, '')
     if (hardened && actor !== 'owner') return json(res, 403, { error: 'forbidden' })
     role = 'admin'
     return json(res, 200, { ok: true })

@@ -75,7 +75,7 @@ test('evaluateTier3Approval enforces strict and yolo policies deterministically 
   assert.equal(llmCalled, false)
 })
 
-test('auto_review Stage 1A always escalates DELETE, multipart, rce_proof, and high-risk mutations', async () => {
+test('auto_review Stage 1A always escalates DELETE, multipart, rce_proof, and compressed/oversized bodies (keyword escalation retired)', async () => {
   let llmCalls = 0
   const llmCall = async () => {
     llmCalls += 1
@@ -86,11 +86,8 @@ test('auto_review Stage 1A always escalates DELETE, multipart, rce_proof, and hi
     { method: 'DELETE', pathAndQuery: '/api/items/42' },
     { method: 'POST', pathAndQuery: '/api/files', hasMultipart: true },
     { method: 'POST', pathAndQuery: '/api/render', isRceProof: true },
-    { method: 'POST', pathAndQuery: '/api/billing/cancel', personaHandle: 'user_a' },
-    { method: 'POST', pathAndQuery: '/api/stripe/refund', personaHandle: 'user_a' },
-    { method: 'POST', pathAndQuery: '/api/admin/roles', personaHandle: 'user_a' },
-    { method: 'POST', pathAndQuery: '/api/account/password/reset', personaHandle: 'user_a' },
-    { method: 'POST', pathAndQuery: '/api/settings', personaHandle: 'user_a', bodyPreview: '{"action":"revoke","webhook":"https://x"}' },
+    { method: 'POST', pathAndQuery: '/api/items', personaHandle: 'user_a', hasCompressedBody: true },
+    { method: 'POST', pathAndQuery: '/api/items', personaHandle: 'user_a', bodyPreview: 'x'.repeat(65 * 1024) },
   ]
 
   for (const tc of cases) {
@@ -106,6 +103,18 @@ test('auto_review Stage 1A always escalates DELETE, multipart, rce_proof, and hi
     assert.equal(res.usedLlm, false)
   }
   assert.equal(llmCalls, 0)
+
+  // Retired keyword escalation (v6 M-32): English words in path/body no longer hard-escalate.
+  const keywordRes = await evaluateTier3Approval({
+    policy: 'auto_review',
+    origin: 'https://app.example.com',
+    method: 'POST',
+    pathAndQuery: '/api/billing/cancel',
+    personaHandle: 'user_a',
+    llmCall: async () => JSON.stringify({ decision: 'approve', riskLevel: 'low', reason: 'Judge approved benign route' }),
+  })
+  assert.equal(keywordRes.decision, 'approve')
+  assert.equal(keywordRes.stage, 'safety_judge')
 })
 
 test('auto_review Stage 1B fast-paths benign unauth POST, read-only GraphQL/search, and approved patterns', async () => {

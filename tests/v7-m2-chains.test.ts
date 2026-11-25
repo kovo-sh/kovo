@@ -670,19 +670,21 @@ describe('v7 M2: white-box-first default when sourceDir / mountedRepos is mounte
     assert.equal(sampleLead.data.policyDiff, true)
 
     // Seed 10 distinct white-box Program-Graph leads (> TIER_A_MAX_SEEDED_STEPS=6).
-    for (let i = 0; i < 10; i += 1) {
+    const serviceNames = ['billing', 'orders', 'reports', 'admin', 'users', 'webhooks', 'payouts', 'exports', 'invoices', 'tokens']
+    for (let i = 0; i < serviceNames.length; i += 1) {
+      const svc = serviceNames[i]!
       storage.addFact(run, worker, {
         kind: 'note',
         origin: ORIGIN,
-        summary: `Program-graph middleware_policy_diff on /v1/svc-${i}/action`,
+        summary: `Program-graph middleware_policy_diff on /v1/${svc}/action`,
         data: {
           kind: 'det_lead',
           source: 'program_graph',
           policyDiff: true,
           probeClass: 'authz_matrix',
           method: 'POST',
-          endpoint: `/v1/svc-${i}/action`,
-          reason: `missing tenant guard on /v1/svc-${i}/action`,
+          endpoint: `/v1/${svc}/action`,
+          reason: `missing tenant guard on /v1/${svc}/action`,
         },
       })
     }

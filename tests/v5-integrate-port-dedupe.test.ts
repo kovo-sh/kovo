@@ -184,6 +184,25 @@ describe('store chain dedupe', () => {
     })
     const run = storage.run(runId)
     const asset = run.candidates[0]
+    const worker = storage.makeWorker(run, 'investigation', asset, 'Dedupe', 'Verify dedupe')
+
+    const makeConfirmedSpec = (findingId: string, pathAndQuery: string) => storage.createReplaySpec(
+      storage.run(runId),
+      worker,
+      findingId,
+      httpChainSpec(pathAndQuery) as never,
+      [origin],
+      {
+        verifiedInline: true,
+        lastVerificationDiff: {
+          verdict: 'confirmed',
+          controlPassed: true,
+          stepStatuses: [],
+          assertionSummary: { observed: 'ok', expected: 'denied' },
+          retriesRemaining: 0,
+        },
+      },
+    ).id
 
     const finding = (over: Partial<Finding>): Finding => ({
       id: randomUUID(),
@@ -203,15 +222,16 @@ describe('store chain dedupe', () => {
 
     const invoicesHash = computeFindingFingerprint({ origin, cwe: 'CWE-639', endpoint: '/api/invoices/1', method: 'GET', param: 'id' }).hash
     const ordersHash = computeFindingFingerprint({ origin, cwe: 'CWE-639', endpoint: '/api/orders/1', method: 'GET', param: 'id' }).hash
-    const invoices = storage.upsertChainFinding(run, asset.id, finding({ fingerprintHash: invoicesHash }), 'spec-1', [origin])
-    const orders = storage.upsertChainFinding(run, asset.id, finding({ fingerprintHash: ordersHash }), 'spec-2', [origin])
+    const invoicesFinding = finding({ fingerprintHash: invoicesHash })
+    const ordersFinding = finding({ fingerprintHash: ordersHash })
+    const invoices = storage.upsertChainFinding(run, asset.id, invoicesFinding, makeConfirmedSpec(invoicesFinding.id, '/api/invoices/1'), [origin])
+    const orders = storage.upsertChainFinding(run, asset.id, ordersFinding, makeConfirmedSpec(ordersFinding.id, '/api/orders/1'), [origin])
     assert.notEqual(orders.id, invoices.id, 'two BOLA routes must remain distinct rows')
 
     const corsHashA = computeFindingFingerprint({ origin, cwe: 'CWE-942', endpoint: '/a' }).hash
     const corsHashB = computeFindingFingerprint({ origin, cwe: 'CWE-942', endpoint: '/b' }).hash
-    const corsA = storage.upsertChainFinding(run, asset.id, finding({
-      fingerprintHash: corsHashA, cwe: 'CWE-942', category: 'cors-client-side', title: 'CORS on /a',
-    }), 'spec-3', [origin])
+    const corsAFinding = finding({ fingerprintHash: corsHashA, cwe: 'CWE-942', category: 'cors-client-side', title: 'CORS on /a' })
+    const corsA = storage.upsertChainFinding(run, asset.id, corsAFinding, makeConfirmedSpec(corsAFinding.id, '/a'), [origin])
     const corsB = storage.upsertChainFinding(run, asset.id, finding({
       fingerprintHash: corsHashB, cwe: 'CWE-942', category: 'cors-client-side', title: 'CORS on /b', status: 'pending',
     }), 'spec-4', [origin])

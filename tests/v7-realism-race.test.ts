@@ -293,9 +293,9 @@ test('write-BOLA replay binds the exact mutated field to a fresh non-idempotent 
     steps: Array<{ id: string; role: string; request: { method: string; pathAndQuery: string; jsonBody?: Record<string, unknown>; headers?: Record<string, string> } }>
   }
   assert.equal(body.category, 'cross_tenant_write')
-  assert.deepEqual(body.steps.map(step => step.id), ['c2', 'w1', 'c1', 'p1', 'p2'])
-  const baseline = body.steps[1]!.request.jsonBody!.total as number
-  const probe = body.steps[3]!.request.jsonBody!.total as number
+  assert.deepEqual(body.steps.map(step => step.id), ['w1', 'c2', 'c3', 'c1', 'p1', 'p2'])
+  const baseline = body.steps[0]!.request.jsonBody!.total as number
+  const probe = body.steps[4]!.request.jsonBody!.total as number
   assert.equal(typeof baseline, 'number', 'baseline value keeps its numeric JSON type')
   assert.equal(typeof probe, 'number', 'probe value keeps its numeric JSON type')
   assert.equal(probe, 100, 'the probe writes the observed mutation value')
@@ -303,8 +303,8 @@ test('write-BOLA replay binds the exact mutated field to a fresh non-idempotent 
   assert.match(body.assertionsJq, /\["total"\]/, 'the assertion names the mutated field')
   assert.match(body.assertionsJq, new RegExp(`== ${probe}\\b`), 'the assertion binds the exact non-idempotent probe value')
   assert.match(body.assertionsJq, new RegExp(`== ${baseline}\\b`), 'the assertion binds the control baseline value')
-  assert.equal(body.steps[3]!.request.headers?.['x-kovo-run-id'], 'run-1', 'the cross-actor write carries the staging tag')
-  assert.equal(body.steps[3]!.request.pathAndQuery, '/v1/invoices/inv-alpha-1')
+  assert.equal(body.steps[4]!.request.headers?.['x-kovo-run-id'], 'run-1', 'the cross-actor write carries the staging tag')
+  assert.equal(body.steps[4]!.request.pathAndQuery, '/v1/invoices/inv-alpha-1')
 })
 
 test('hypothesis enumeration is stable across input order', () => {

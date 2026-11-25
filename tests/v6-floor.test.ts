@@ -140,7 +140,7 @@ test('agentic run starts the deep floor first and dispatches agents only after i
 
   assert.equal(lane.calls.length, 1, 'the floor runs on an agentic run without an opt-in flag')
   assert.equal(dispatched.length, 0, 'specialist dispatch waits for Phase A to settle')
-  assert.equal(lane.calls[0].maxDurationMs, 168_000, 'Phase A budget = min(180 s, 28% x maxDuration)')
+  assert.equal(lane.calls[0].maxDurationMs, 72_000, 'Phase A budget = min(75 s, 12% x maxDuration)')
   const steps = storage.listChainSteps(runId, storage.run(runId).goalRevision)
   assert.ok(steps.every(step => step.status !== 'canceled'), 'the floor never cancels steps')
 
@@ -198,7 +198,7 @@ test('det_lead facts become prioritized upgrade assignments bound to their fact'
     kind: 'note',
     origin,
     summary: 'lead',
-    data: { kind: 'det_lead', source: 'deterministic_engine', probeClass: 'ssrf_canary', endpoint: '/v2/relay', method: 'POST', reason: 'canary-shaped parameter observed' },
+    data: { kind: 'det_lead', source: 'deterministic_engine', probeClass: 'ssrf_canary', endpoint: '/v2/relay', method: 'POST', leadEvidenceKind: 'near_miss', reason: 'canary-shaped parameter observed' },
   })
   const execution = new Execution(storage)
   t.after(() => execution.stop())
@@ -211,7 +211,7 @@ test('det_lead facts become prioritized upgrade assignments bound to their fact'
   assert.ok(upgrade, 'upgrade step created')
   assert.equal(upgrade!.dependsOnFactIds.length, 1, 'upgrade is bound to its originating fact')
   assert.equal(upgrade!.status, 'ready')
-  assert.equal(upgrade!.priority, 88)
+  assert.equal(upgrade!.priority, 55)
   assert.equal(storage.run(runId).dynamicStepBudget, null, 'the upgrade path does not write dynamicStepBudget')
   assert.equal(internals(execution).detLeadConsumed.size, 1)
   assert.ok(storage.eventsAfter(runId, 0).some(e => e.kind === 'deterministic_lane.lead_consumed'))
@@ -223,7 +223,23 @@ test('det_lead facts become prioritized upgrade assignments bound to their fact'
   // A lead whose (route, family) the floor already confirmed is not re-dispatched as new work.
   const confirmedSpec = sqlSpec(origin, 'q')
   const findingId = randomUUID()
-  const specRow = storage.createReplaySpec(storage.run(runId), claimed, findingId, confirmedSpec, [origin])
+  const specRow = storage.createReplaySpec(
+    storage.run(runId),
+    claimed,
+    findingId,
+    confirmedSpec,
+    [origin],
+    {
+      verifiedInline: true,
+      lastVerificationDiff: {
+        verdict: 'confirmed',
+        controlPassed: true,
+        stepStatuses: [],
+        assertionSummary: { observed: 'ok', expected: 'denied' },
+        retriesRemaining: 0,
+      },
+    },
+  )
   storage.upsertChainFinding(storage.run(runId), run.candidates[0].id, {
     id: findingId,
     origin,

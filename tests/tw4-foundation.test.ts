@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { test } from 'node:test'
+import { compile, optimize } from '@tailwindcss/node'
 import { badgeVariants, buttonVariants } from '../src/components/ui/variants.ts'
 import { cn } from '../src/lib/cn.ts'
 
@@ -12,11 +13,27 @@ function readCss(file: string): string {
   return readFileSync(join(CLIENT_ASSETS, file), 'utf8')
 }
 
-function clientCss(): Array<{ file: string; css: string }> {
-  if (!existsSync(CLIENT_ASSETS)) return []
-  return readdirSync(CLIENT_ASSETS)
-    .filter(file => file.endsWith('.css'))
-    .map(file => ({ file, css: readCss(file) }))
+async function clientCss(): Promise<Array<{ file: string; css: string }>> {
+  if (existsSync(CLIENT_ASSETS)) {
+    const built = readdirSync(CLIENT_ASSETS)
+      .filter(file => file.endsWith('.css'))
+      .map(file => ({ file, css: readCss(file) }))
+    if (built.length > 0) return built
+  }
+  const stylesDir = join(ROOT, 'src', 'styles')
+  const compiler = await compile(readFileSync(join(stylesDir, 'tailwind.css'), 'utf8'), {
+    base: stylesDir,
+    onDependency: () => {},
+    customCssResolver: async id => (id.startsWith('tailwindcss/') ? resolve(ROOT, 'node_modules', id) : undefined),
+  })
+  const compiledTw = optimize(
+    compiler.build(['bg-panel', 'bg-sunk', 'text-fg', 'text-fg-muted', 'border-line', 'text-accent', 'shadow-popover']),
+    { minify: true },
+  ).code
+  return [
+    { file: 'tailwind.css', css: compiledTw },
+    { file: 'tokens.css', css: readFileSync(join(stylesDir, 'tokens.css'), 'utf8') },
+  ]
 }
 
 test('cn() composes conditionals and resolves conflicting utilities', () => {
@@ -65,21 +82,21 @@ test('badgeVariants covers every semantic status variant', () => {
   assert.match(badgeVariants({ variant: 'outline' }), /border-line/)
 })
 
-test('build output ships Tailwind utilities next to the legacy tokens', () => {
-  const assets = clientCss()
-  assert.ok(assets.length > 0, 'no built CSS found — run `npm run build` before this test')
+test('build output ships Tailwind utilities next to the legacy tokens', async () => {
+  const assets = await clientCss()
+  assert.ok(assets.length > 0, 'no built or compiled CSS found')
 
   const tailwind = assets.find(({ css }) => css.includes('.bg-panel{'))
   assert.ok(tailwind, 'no Tailwind stylesheet in build output')
 
   // Semantic utilities resolve through the legacy token variables (light/dark aware).
-  assert.match(tailwind.css, /\.bg-panel\{background-color:var\(--panel\)\}/)
-  assert.match(tailwind.css, /\.bg-sunk\{background-color:var\(--sunk\)\}/)
-  assert.match(tailwind.css, /\.text-fg\{color:var\(--fg\)\}/)
-  assert.match(tailwind.css, /\.text-fg-muted\{color:var\(--fg-2\)\}/)
-  assert.match(tailwind.css, /\.border-line\{border-color:var\(--line\)\}/)
-  assert.match(tailwind.css, /\.text-accent\{color:var\(--accent\)\}/)
-  assert.match(tailwind.css, /\.shadow-popover\{[^}]*var\(--shadow-pop\)/)
+  assert.match(tailwind.css, /\.bg-panel(?:,[^{]+)?\{background-color:var\(--panel\)\}/)
+  assert.match(tailwind.css, /\.bg-sunk(?:,[^{]+)?\{background-color:var\(--sunk\)\}/)
+  assert.match(tailwind.css, /\.text-fg(?:,[^{]+)?\{color:var\(--fg\)\}/)
+  assert.match(tailwind.css, /\.text-fg-muted(?:,[^{]+)?\{color:var\(--fg-2\)\}/)
+  assert.match(tailwind.css, /\.border-line(?:,[^{]+)?\{border-color:var\(--line\)\}/)
+  assert.match(tailwind.css, /\.text-accent(?:,[^{]+)?\{color:var\(--accent\)\}/)
+  assert.match(tailwind.css, /\.shadow-popover(?:,[^{]+)?\{[^}]*var\(--shadow-pop\)/)
 
   // Legacy semantic tokens are still emitted by app.css.
   const tokens = assets.find(({ css }) => /--panel:\s*#fff/.test(css))

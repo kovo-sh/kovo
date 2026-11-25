@@ -238,7 +238,9 @@ test('the stat counts saved turns and the final turn stays reserved for complete
   assert.equal(settlementToolBlock({ name: 'kovo_verify', settling: true, turnsUsed: triggerTurn, maxTurns: 18, finalTurn }), undefined,
     'the reserved wrap-up verify turn still fires')
   assert.match(settlementToolBlock({ name: 'request_http', settling: true, turnsUsed: triggerTurn, maxTurns: 18, finalTurn }) ?? '', /disabled during settlement/)
-  assert.match(settlementToolBlock({ name: 'kovo_verify', settling: true, turnsUsed: finalTurn, maxTurns: 18, finalTurn }) ?? '', /Final settlement turn/)
+  assert.match(settlementToolBlock({ name: 'verify_replay_spec', settling: true, turnsUsed: finalTurn, maxTurns: 18, finalTurn }) ?? '', /Final settlement turn/)
+  assert.equal(settlementToolBlock({ name: 'kovo_verify', settling: true, turnsUsed: finalTurn, maxTurns: 18, finalTurn }), undefined,
+    'kovo_verify stays available on the final turn as primary proof submission tool')
   // Without early exit the legacy maxTurns behaviour is unchanged.
   assert.equal(settlementToolBlock({ name: 'kovo_verify', settling: true, turnsUsed: 11, maxTurns: 18 }), undefined)
 })

@@ -319,16 +319,16 @@ describe('deterministic engine orchestrator', () => {
 
   test('only a confirmed replay reaches the persistence callback', async () => {
     const confirmed: Array<{ vulnClass: string; endpoint: string; status: string }> = []
+    const broker = {
+      executeHttp: async (req: { origin: string; method: string; pathAndQuery: string; persona?: string }) => {
+        if (req.pathAndQuery.includes('/api/invoices/') && !req.pathAndQuery.endsWith('/inv_1')) {
+          return { ...fakeExchange(req), status: 404, body: '{"error":"not_found"}', bodyBytes: 21 }
+        }
+        return fakeExchange({ ...req, persona: 'persona-a' })
+      },
+    } as unknown as RequestBroker
     const report = await runDeterministicEngine(baseInput({
-      verify: async params => ({
-        verdict: (params.spec as { kind: string }).kind === 'http_chain' ? 'confirmed' : 'dismissed',
-        verificationTier: 'runtime_confirmed',
-        outcome: { confirmed: true, controlPassed: true, observed: 'cross-tenant body', expected: 'non-owner denied' },
-        exchangeIds: ['verify-1'],
-        exchanges: [],
-        evidencePayload: {},
-        evidenceSha256: 'sha',
-      }) as never,
+      broker,
       onConfirmed: input => {
         confirmed.push({ vulnClass: input.vulnClass, endpoint: input.endpoint, status: input.result.verdict })
         return 'finding-1'

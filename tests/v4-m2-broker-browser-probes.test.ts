@@ -21,6 +21,7 @@ import { differentialProbeClasses, probeParamLocations } from '../src/server/age
 import { BrokerDenied, RequestBroker } from '../src/server/broker.ts'
 import type { Grant, PublicAddress } from '../src/server/broker.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
+import { planFloorRecipe, runPlannedRecipe } from '../src/server/floor-recipe-engine.ts'
 import { createProjectPersona, resolveRunPersonas } from '../src/server/persona-vault.ts'
 import { verifyReplaySpec, verifyReplaySpecInline } from '../src/server/replay-verifier.ts'
 import { ScopedBrowser } from '../src/server/scoped-browser.ts'
@@ -338,12 +339,12 @@ test('M2.1 session jar isolation: regex BVA, LRU caps, origin/path/secure scopin
         version: 1,
         kind: 'http_chain',
         origin: fx1.origin,
-        title: 'Session jar setup vs control vs probe isolation',
-        category: 'broken-access-control',
-        cwe: 'CWE-384',
+        title: 'Jar setup vs control vs probe isolation',
+        category: 'misconfig-exposure',
+        cwe: 'CWE-693',
         severity: 'medium',
         severityRationale: 'Verify setup->probe jar sharing and control isolation.',
-        impact: 'Session isolation',
+        impact: 'Jar isolation',
         remediation: 'Isolate sessions',
         recheckInstructions: 'Re-run',
         steps: [
@@ -807,7 +808,7 @@ test('M2.7 & M2.8 universal encodings + expanded sqli_boolean + sql_time_diff (#
 
   await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     for (const loc of ['form', 'xml'] as const) {
-      const rv = await verifyReplaySpec({
+      const legacyRv = await verifyReplaySpec({
         spec: {
           version: 1, kind: 'sql_boolean_diff', origin: fx.origin, targetOrigin: fx.origin,
           title: `Boolean diff (${loc})`, category: 'injection-input', cwe: 'CWE-89', severity: 'high',
@@ -818,7 +819,37 @@ test('M2.7 & M2.8 universal encodings + expanded sqli_boolean + sql_time_diff (#
         },
         broker, backend: createJqBackend(), grant, signal: sig,
       })
-      assert.equal(rv.verdict, 'confirmed', `Expected sql_boolean_diff (${loc}) to confirm`)
+      assert.equal(legacyRv.verdict, 'dismissed')
+      assert.equal(legacyRv.outcome.reason, 'retired_legacy_spec_kind: use kovo_verify')
+
+      const hyp = {
+        key: `sqli|${loc}`,
+        endpoint: {
+          id: `POST:${loc}`,
+          origin: fx.origin,
+          method: 'POST',
+          pathTemplate: loc === 'form' ? '/bool-form' : '/bool-xml',
+          params: [{ name: loc === 'form' ? 'q' : 'id', location: loc }],
+        },
+        probeClass: 'sqli_boolean',
+        intent: 'sqli',
+        method: 'POST',
+        pathAndQuery: loc === 'form' ? '/bool-form' : '/bool-xml',
+        param: { name: loc === 'form' ? 'q' : 'id', location: loc },
+        location: loc,
+        baselineValue: '1',
+        ...(loc === 'form' ? { formBody: { q: '1' } } : { xmlTemplate: '<req><id>{{value}}</id></req>' }),
+        risk: 80,
+      } as never
+      const probe = {
+        probeClass: 'sqli_boolean', origin: fx.origin, pathAndQuery: loc === 'form' ? '/bool-form' : '/bool-xml',
+        verdict: 'signal', summary: 'boolean diff', anomalies: [{ type: 'boolean_differential', style: 'single_quote' }],
+        details: {}, requestsSent: 0, exchangeIds: [], stoppedReason: null, notes: [], durationMs: 0,
+      } as never
+      const plan = planFloorRecipe({ hypothesis: hyp, probe, specKind: 'sql_boolean_diff', vulnClass: 'sqli', personas: [] })
+      assert.ok(plan && !plan.skipReason, `Expected boolean recipe plan for ${loc}: ${plan?.skipReason}`)
+      const exec = await runPlannedRecipe({ plan, hypothesis: hyp, broker, grant, signal: sig })
+      assert.equal(exec.result.confirmed, true, `Expected boolean recipe (${loc}) to confirm: ${exec.result.verification.reason}`)
     }
 
     // sql_time_diff schema bounds
@@ -836,47 +867,47 @@ test('M2.7 & M2.8 universal encodings + expanded sqli_boolean + sql_time_diff (#
       resolve: async () => [publicAddr],
       transport: async () => { pubHits += 1; return { status: 200, headers: {}, body: 'ok' } },
     })
-    const pubRes = await verifyReplaySpec({
-      spec: {
-        version: 1, kind: 'sql_time_diff', origin: appOrigin, targetOrigin: appOrigin,
-        title: 'Public gated', category: 'injection-input', cwe: 'CWE-89', severity: 'high',
-        severityRationale: 'gated check', impact: 'SQL injection timing impact.', remediation: 'Use parameterized queries', recheckInstructions: 'recheck',
-        pathAndQuery: '/time?id=1', paramName: 'id', paramLocation: 'query', delayMs: 1600,
-        assertionsJq: '{ controlPassed: true, confirmed: true, observed: "x", expected: "y" }',
-      },
-      broker: pubBroker, backend: createJqBackend(), grant: makePublicGrant(appOrigin, { tier: 2 }), signal: sig,
-    })
+    const pubHyp = {
+      key: 'sqli|time-pub',
+      endpoint: { id: 'GET:/time', origin: appOrigin, method: 'GET', pathTemplate: '/time', params: [{ name: 'id', location: 'query' }] },
+      probeClass: 'sqli_time_diff', intent: 'sqli', method: 'GET', pathAndQuery: '/time?id=1',
+      param: { name: 'id', location: 'query' }, location: 'query', baselineValue: '1', risk: 80,
+    } as never
+    const pubProbe = {
+      probeClass: 'sqli_time_diff', origin: appOrigin, pathAndQuery: '/time?id=1',
+      verdict: 'signal', summary: 'timing', anomalies: [{ type: 'sql_time_differential', dialect: 'postgres', delayMs: 1600 }],
+      details: {}, requestsSent: 0, exchangeIds: [], stoppedReason: null, notes: [], durationMs: 0,
+    } as never
+    const pubPlan = planFloorRecipe({ hypothesis: pubHyp, probe: pubProbe, specKind: 'sql_time_diff', vulnClass: 'sqli', personas: [] })
+    assert.ok(pubPlan && !pubPlan.skipReason)
+    await assert.rejects(() => runPlannedRecipe({
+      plan: pubPlan, hypothesis: pubHyp, broker: pubBroker, grant: makePublicGrant(appOrigin, { tier: 2 }), signal: sig,
+    }))
     assert.equal(pubHits, 0)
-    assert.equal(pubRes.verdict, 'inconclusive')
 
-    // Local-lab clean non-overlapping delay confirms
+    // Local-lab clean non-overlapping delay confirms via wired floor recipe
     jitterMode = false
-    const timeOk = await verifyReplaySpec({
-      spec: {
-        version: 1, kind: 'sql_time_diff', origin: fx.origin, targetOrigin: fx.origin,
-        title: 'Time diff pass', category: 'injection-input', cwe: 'CWE-89', severity: 'high',
-        severityRationale: '3 non-overlapping rounds', impact: 'SQL injection timing impact.', remediation: 'Parameterize', recheckInstructions: 'Replay',
-        pathAndQuery: '/time?id=1', paramName: 'id', paramLocation: 'query', delayMs: 1600, dialect: 'postgres',
-        assertionsJq: '{ controlPassed: .sqlTimeDiff.controlPassed, confirmed: .sqlTimeDiff.passed, observed: "delayed", expected: "constant" }',
-      },
-      broker, backend: createJqBackend(), grant, signal: sig,
-    })
-    assert.equal(timeOk.verdict, 'confirmed')
+    const timeHyp = {
+      key: 'sqli|time',
+      endpoint: { id: 'GET:/time', origin: fx.origin, method: 'GET', pathTemplate: '/time', params: [{ name: 'id', location: 'query' }] },
+      probeClass: 'sqli_time_diff', intent: 'sqli', method: 'GET', pathAndQuery: '/time?id=1',
+      param: { name: 'id', location: 'query' }, location: 'query', baselineValue: '1', risk: 80,
+    } as never
+    const timeProbe = {
+      probeClass: 'sqli_time_diff', origin: fx.origin, pathAndQuery: '/time?id=1',
+      verdict: 'signal', summary: 'timing', anomalies: [{ type: 'sql_time_differential', dialect: 'postgres', delayMs: 1600 }],
+      details: {}, requestsSent: 0, exchangeIds: [], stoppedReason: null, notes: [], durationMs: 0,
+    } as never
+    const timePlan = planFloorRecipe({ hypothesis: timeHyp, probe: timeProbe, specKind: 'sql_time_diff', vulnClass: 'sqli', personas: [] })
+    assert.ok(timePlan && !timePlan.skipReason)
+    const timeOk = await runPlannedRecipe({ plan: timePlan, hypothesis: timeHyp, broker, grant, signal: sig })
+    assert.equal(timeOk.result.confirmed, true, timeOk.result.verification.reason)
 
-    // Jittery/overlapping baseline dismisses
+    // Jittery/overlapping baseline does not confirm
     jitterMode = true
     flip = 0
-    const timeJitter = await verifyReplaySpec({
-      spec: {
-        version: 1, kind: 'sql_time_diff', origin: fx.origin, targetOrigin: fx.origin,
-        title: 'Time diff jitter', category: 'injection-input', cwe: 'CWE-89', severity: 'high',
-        severityRationale: 'Should dismiss on overlap', impact: 'No confirmed timing differential.', remediation: 'No action needed.', recheckInstructions: 'Replay',
-        pathAndQuery: '/time?id=1', paramName: 'id', paramLocation: 'query', delayMs: 1600, dialect: 'postgres',
-        assertionsJq: '{ controlPassed: .sqlTimeDiff.controlPassed, confirmed: .sqlTimeDiff.passed, observed: "overlap", expected: "clean" }',
-      },
-      broker, backend: createJqBackend(), grant, signal: sig,
-    })
-    assert.equal(timeJitter.verdict, 'dismissed')
+    const timeJitter = await runPlannedRecipe({ plan: timePlan, hypothesis: timeHyp, broker, grant, signal: sig })
+    assert.equal(timeJitter.result.confirmed, false)
   })
 })
 
