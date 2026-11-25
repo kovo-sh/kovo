@@ -131,6 +131,10 @@ export async function handleBilling(
       sendJson(res, 403, { error: 'finance role required' })
       return true
     }
+    if (payout.status !== 'draft') {
+      sendJson(res, 409, { error: 'payout is not a draft' })
+      return true
+    }
     // An unverified session may only act on drafts it owns; ownership must be rebound first.
     if (!session.emailVerified && payout.createdBy !== session.userId) {
       state.emit('payout.approve_denied', {

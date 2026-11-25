@@ -96,11 +96,13 @@ function persona(
   }
 }
 
+const DRAFT_PAYOUT_COUNT = 6
+
 function makeIds(p: Prng, financeEmail: string): DomainIds {
   return {
     templateId: p.token('mh_tpl_', 5),
     invoiceId: p.token('mh_inv_', 5),
-    payoutIds: [p.token('mh_pay_', 5), p.token('mh_pay_', 5)],
+    payoutIds: Array.from({ length: DRAFT_PAYOUT_COUNT }, () => p.token('mh_pay_', 5)),
     pendingFinanceEmail: financeEmail,
     pendingFinanceEmailNormalized: financeEmail.normalize('NFKC'),
   }
