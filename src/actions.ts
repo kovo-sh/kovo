@@ -50,9 +50,95 @@ import { readWorkerSession, testPersonaAuth } from './server/worker-session-read
 export const workspaceData = createServerFn({ method: 'GET' }).handler(() => {
   const db = store()
   const githubPatStatus = getGithubPatStatus(db.directory)
+  const workspaceList = db.listWorkspace()
+  const workspaceId = workspaceList.workspace.id
+
+  const runCountRows = db.client.prepare(`
+    select project_id as projectId, count(*) as runCount
+    from runs
+    where workspace_id = ?
+    group by project_id
+  `).all(workspaceId) as { projectId: string; runCount: number }[]
+  const runCounts = new Map(runCountRows.map(r => [r.projectId, Number(r.runCount)]))
+
+  const hostCountRows = db.client.prepare(`
+    select a.project_id as projectId, count(*) as hostCount
+    from project_assets a
+    join projects p on p.id = a.project_id
+    where p.workspace_id = ?
+    group by a.project_id
+  `).all(workspaceId) as { projectId: string; hostCount: number }[]
+  const hostCounts = new Map(hostCountRows.map(r => [r.projectId, Number(r.hostCount)]))
+
+  const latestRunRows = db.client.prepare(`
+    select r.id as id, r.project_id as projectId, r.goal as goal, r.status as status, r.phase as phase,
+      r.created_at as startedAt,
+      (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
+        and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
+      (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findingCount
+    from runs r
+    where r.workspace_id = ?
+      and r.id = (
+        select r2.id from runs r2
+        where r2.project_id = r.project_id and r2.workspace_id = r.workspace_id
+        order by r2.created_at desc, r2.rowid desc
+        limit 1
+      )
+  `).all(workspaceId) as {
+    id: string; projectId: string; goal: string; status: string; phase: string
+    startedAt: number; confirmedCount: number; findingCount: number
+  }[]
+  const latestRuns = new Map(latestRunRows.map(r => [r.projectId, {
+    id: r.id,
+    goal: r.goal,
+    status: r.status,
+    phase: r.phase,
+    startedAt: Number(r.startedAt),
+    confirmedCount: Number(r.confirmedCount),
+    findingCount: Number(r.findingCount),
+  }]))
+
+  const recentRunRows = db.client.prepare(`
+    select r.id as id, r.project_id as projectId, p.name as projectName, r.goal as goal,
+      r.status as status, r.phase as phase, r.created_at as startedAt,
+      (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
+        and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
+      (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findings
+    from runs r
+    join projects p on p.id = r.project_id
+    where r.workspace_id = ?
+    order by r.created_at desc, r.rowid desc
+    limit 15
+  `).all(workspaceId) as {
+    id: string; projectId: string; projectName: string; goal: string; status: string; phase: string
+    startedAt: number; confirmedCount: number; findings: number
+  }[]
+
+  const profiles = listModelProfiles(db)
+  const hasModel = modelReady(db)
+  const enabledProfiles = profiles.filter(p => p.enabled)
+  const poolHealth: 'healthy' | 'degraded' | 'unconfigured' = !hasModel
+    ? 'unconfigured'
+    : enabledProfiles.length > 0 && enabledProfiles.every(p => p.healthState === 'closed')
+      ? 'healthy'
+      : 'degraded'
+
   return {
-    ...db.listWorkspace(),
-    hasModel: modelReady(),
+    workspace: workspaceList.workspace,
+    projects: workspaceList.projects.map(project => ({
+      ...project,
+      runCount: runCounts.get(project.id) ?? 0,
+      hostCount: hostCounts.get(project.id) ?? project.seeds.length,
+      latestRun: latestRuns.get(project.id) ?? null,
+    })),
+    recentRuns: recentRunRows.map(r => ({
+      ...r,
+      startedAt: Number(r.startedAt),
+      confirmedCount: Number(r.confirmedCount),
+      findings: Number(r.findings),
+    })),
+    hasModel,
+    poolHealth,
     hasGithubPat: githubPatStatus.configured,
     githubPatStatus,
   }
