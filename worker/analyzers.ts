@@ -169,20 +169,22 @@ function isAstNode(v: unknown): v is AstNode {
 function walkAst(node: unknown, visit: (n: AstNode, ancestors: AstNode[]) => void, ancestors: AstNode[] = []): void {
   if (!node || typeof node !== 'object') return
   if (Array.isArray(node)) {
-    for (const item of node) walkAst(item, visit, ancestors)
+    for (let i = 0; i < node.length; i += 1) walkAst(node[i], visit, ancestors)
     return
   }
   const rec = node as AstNode
   if (typeof rec.type === 'string') {
     visit(rec, ancestors)
     ancestors.push(rec)
-    for (const [k, v] of Object.entries(rec)) {
+    for (const k in rec) {
       if (k === 'span' || k === 'loc' || k === 'type') continue
+      const v = rec[k]
       if (v && typeof v === 'object') walkAst(v, visit, ancestors)
     }
     ancestors.pop()
   } else {
-    for (const v of Object.values(rec)) {
+    for (const k in rec) {
+      const v = rec[k]
       if (v && typeof v === 'object') walkAst(v, visit, ancestors)
     }
   }
@@ -323,21 +325,41 @@ function extractJsxStringAttr(attr: unknown): string | null {
   return null
 }
 
-function lineNumberAtOffset(content: string, offset?: number): number | undefined {
+function buildLineOffsets(content: string): number[] {
+  const offsets: number[] = []
+  let idx = content.indexOf('\n')
+  while (idx !== -1) {
+    offsets.push(idx)
+    idx = content.indexOf('\n', idx + 1)
+  }
+  return offsets
+}
+
+function lineNumberAtOffset(content: string, offset?: number, lineOffsets?: readonly number[]): number | undefined {
   if (typeof offset !== 'number' || offset < 0) return undefined
-  let line = 1
   const end = Math.min(offset, content.length)
+  if (lineOffsets) {
+    let lo = 0
+    let hi = lineOffsets.length
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1
+      if (lineOffsets[mid] < end) lo = mid + 1
+      else hi = mid
+    }
+    return lo + 1
+  }
+  let line = 1
   for (let i = 0; i < end; i += 1) {
     if (content.charCodeAt(i) === 10) line += 1
   }
   return line
 }
 
-function nodeLine(node: AstNode, content: string): number | undefined {
+function nodeLine(node: AstNode, content: string, lineOffsets?: readonly number[]): number | undefined {
   const loc = node.loc as { start?: { line?: number } } | undefined
   if (typeof loc?.start?.line === 'number') return loc.start.line
   const span = node.span as SwcSpan | undefined
-  if (typeof span?.start === 'number') return lineNumberAtOffset(content, span.start)
+  if (typeof span?.start === 'number') return lineNumberAtOffset(content, span.start, lineOffsets)
   return undefined
 }
 
@@ -428,6 +450,7 @@ export function jsHarvest(content: string, sourceName = '', options?: JsHarvestO
   const { ast, kind: parserUsed } = parseJsTsAst(content)
 
   if (ast) {
+    const lineOffsets = buildLineOffsets(content)
     // Pass 0: collect simple top-level/local string variable assignments for `fetch(e, ...)` resolution
     const stringConsts = new Map<string, string>()
     walkAst(ast, node => {
@@ -442,7 +465,15 @@ export function jsHarvest(content: string, sourceName = '', options?: JsHarvestO
 
     // Pass 1: single AST walk for routes, HTTP/RPC calls, GraphQL, Next-Action, feature flags, DOM sinks
     walkAst(ast, node => {
-      const line = nodeLine(node, content)
+      let cachedLine: number | undefined
+      let lineResolved = false
+      const getLine = (): number | undefined => {
+        if (!lineResolved) {
+          cachedLine = nodeLine(node, content, lineOffsets)
+          lineResolved = true
+        }
+        return cachedLine
+      }
 
       // 1. Router config objects: { path: '...' }
       if (node.type === 'KeyValueProperty' || node.type === 'Property') {
@@ -450,7 +481,7 @@ export function jsHarvest(content: string, sourceName = '', options?: JsHarvestO
         if (key === 'path' || key === 'route' || key === 'endpoint') {
           const val = resolveStringValue(node.value, stringConsts)
           if (val && val.startsWith('/') && val.length <= 200) {
-            routes.push({ path: maskSecretsInText(val), kind: 'router', line })
+            routes.push({ path: maskSecretsInText(val), kind: 'router', line: getLine() })
             astPaths.push(val)
           }
         }
@@ -470,11 +501,11 @@ export function jsHarvest(content: string, sourceName = '', options?: JsHarvestO
         const attrName = getPropName(node.name)
         if (attrName === 'dangerouslySetInnerHTML') {
           astDomSinks.push('dangerouslySetInnerHTML')
-          domSinkDetails.push({ kind: 'dangerouslySetInnerHTML', line })
+          domSinkDetails.push({ kind: 'dangerouslySetInnerHTML', line: getLine() })
         } else if (attrName === 'path' || attrName === 'to' || attrName === 'href') {
           const val = extractJsxStringAttr(node.value)
           if (val && val.startsWith('/') && val.length <= 200) {
-            routes.push({ path: maskSecretsInText(val), kind: 'jsx', line })
+            routes.push({ path: maskSecretsInText(val), kind: 'jsx', line: getLine() })
             astPaths.push(val)
           }
         }
@@ -492,7 +523,7 @@ export function jsHarvest(content: string, sourceName = '', options?: JsHarvestO
           (parts.length === 1 || /^(?:router|history|navigation|Router|NextResponse)$/i.test(parts[0] ?? ''))) {
           const dest = resolveStringValue(args[0], stringConsts)
           if (dest && dest.startsWith('/')) {
-            routes.push({ path: maskSecretsInText(dest), kind: 'nav', line })
+            routes.push({ path: maskSecretsInText(dest), kind: 'nav', line: getLine() })
             astPaths.push(dest)
           }
         }
@@ -513,7 +544,7 @@ export function jsHarvest(content: string, sourceName = '', options?: JsHarvestO
             }
           }
           if (url) {
-            httpCalls.push({ client: 'fetch', url: maskSecretsInText(url), method, bodyKeys, line })
+            httpCalls.push({ client: 'fetch', url: maskSecretsInText(url), method, bodyKeys, line: getLine() })
             if (url.startsWith('/')) astPaths.push(url)
           }
         }
@@ -525,7 +556,7 @@ export function jsHarvest(content: string, sourceName = '', options?: JsHarvestO
             const method = last.toUpperCase()
             const bodyKeys = ['POST', 'PUT', 'PATCH'].includes(method) ? extractBodyKeysFromExpr(args[1]) : []
             if (url) {
-              httpCalls.push({ client: 'axios', url: maskSecretsInText(url), method, bodyKeys, line })
+              httpCalls.push({ client: 'axios', url: maskSecretsInText(url), method, bodyKeys, line: getLine() })
               if (url.startsWith('/')) astPaths.push(url)
             }
           } else if (parts.length === 1 && args[0]) {
@@ -538,7 +569,7 @@ export function jsHarvest(content: string, sourceName = '', options?: JsHarvestO
               if (p.key === 'data' || p.key === 'params') bodyKeys = extractBodyKeysFromExpr(p.value)
             }
             if (url) {
-              httpCalls.push({ client: 'axios', url: maskSecretsInText(url), method, bodyKeys, line })
+              httpCalls.push({ client: 'axios', url: maskSecretsInText(url), method, bodyKeys, line: getLine() })
               if (url.startsWith('/')) astPaths.push(url)
             }
           }
@@ -552,7 +583,7 @@ export function jsHarvest(content: string, sourceName = '', options?: JsHarvestO
             const url = `/trpc/${procPath}`
             const method = last.toLowerCase().includes('mutat') ? 'POST' : 'GET'
             const bodyKeys = extractBodyKeysFromExpr(args[0])
-            httpCalls.push({ client: 'trpc', url, method, bodyKeys, line })
+            httpCalls.push({ client: 'trpc', url, method, bodyKeys, line: getLine() })
             astPaths.push(url)
           }
         }
@@ -576,15 +607,15 @@ export function jsHarvest(content: string, sourceName = '', options?: JsHarvestO
           astDomSinks.push('message-listener')
           const missingOrigin = args[1] ? !subtreeHasOriginCheck(args[1]) : false
           if (missingOrigin) astDomSinks.push('message-listener-missing-origin')
-          domSinkDetails.push({ kind: 'message-listener', line, missingOriginCheck: missingOrigin })
+          domSinkDetails.push({ kind: 'message-listener', line: getLine(), missingOriginCheck: missingOrigin })
         }
         if (last === 'postMessage') {
           astDomSinks.push('postMessage')
-          domSinkDetails.push({ kind: 'postMessage', line })
+          domSinkDetails.push({ kind: 'postMessage', line: getLine() })
         }
         if (joined === 'eval' || joined === 'document.write' || joined === 'document.writeln' || joined === 'window.open') {
           astDomSinks.push(joined)
-          domSinkDetails.push({ kind: joined, line })
+          domSinkDetails.push({ kind: joined, line: getLine() })
         }
       }
 
@@ -607,15 +638,15 @@ export function jsHarvest(content: string, sourceName = '', options?: JsHarvestO
         const prop = leftParts[leftParts.length - 1] ?? ''
         if (prop === 'innerHTML' || prop === 'outerHTML') {
           astDomSinks.push(prop)
-          domSinkDetails.push({ kind: prop, line })
+          domSinkDetails.push({ kind: prop, line: getLine() })
         } else if (prop === 'onmessage') {
           astDomSinks.push('message-listener')
           const missingOrigin = node.right ? !subtreeHasOriginCheck(node.right) : false
           if (missingOrigin) astDomSinks.push('message-listener-missing-origin')
-          domSinkDetails.push({ kind: 'message-listener', line, missingOriginCheck: missingOrigin })
+          domSinkDetails.push({ kind: 'message-listener', line: getLine(), missingOriginCheck: missingOrigin })
         } else if (leftParts.join('.') === 'document.domain') {
           astDomSinks.push('document.domain')
-          domSinkDetails.push({ kind: 'document.domain', line })
+          domSinkDetails.push({ kind: 'document.domain', line: getLine() })
         }
       }
 
@@ -648,7 +679,7 @@ export function jsHarvest(content: string, sourceName = '', options?: JsHarvestO
     ...[...content.matchAll(/["'`](\/(?:api|v[1-9]\d*|graphql|trpc|auth|oauth|sso|admin|internal|debug|upload|webhook|billing|account|user|session|_next\/data)[a-zA-Z0-9_./:${}-]{0,140})["'`]/g)].map(m => m[1]),
     ...[...content.matchAll(/(?:fetch|axios\.(?:get|post|put|patch|delete)|url\s*:\s*)\(\s*["'`](\/[a-zA-Z0-9_./:${}?=&-]{1,160})["'`]/g)].map(m => m[1]),
   ]
-  const apiPaths = uniq([...astPaths, ...regexApiPaths].map(maskSecretsInText), 200)
+  const apiPaths = uniq([...astPaths, ...regexApiPaths], 200).map(maskSecretsInText)
   const adminPaths = uniq(
     [...apiPaths, ...routes.map(r => r.path)].filter(p => ADMIN_PATH_RE.test(p)),
     80,
@@ -1286,12 +1317,17 @@ function detectGuardsAndSanitizers(
   return { guards, sanitizers }
 }
 
-function extractBodyRange(node: AstNode, content: string): { startLine: number; endLine: number; text: string } {
+function extractBodyRange(
+  node: AstNode,
+  content: string,
+  lineOffsets?: readonly number[],
+  preSplitLines?: readonly string[],
+): { startLine: number; endLine: number; text: string } {
   const loc = node.loc as { start?: { line?: number }; end?: { line?: number } } | undefined
   const span = node.span as SwcSpan | undefined
-  const startLine = loc?.start?.line ?? lineNumberAtOffset(content, span?.start) ?? 1
-  const endLine = loc?.end?.line ?? lineNumberAtOffset(content, span?.end) ?? startLine
-  const lines = content.split('\n')
+  const startLine = loc?.start?.line ?? lineNumberAtOffset(content, span?.start, lineOffsets) ?? 1
+  const endLine = loc?.end?.line ?? lineNumberAtOffset(content, span?.end, lineOffsets) ?? startLine
+  const lines = preSplitLines ?? content.split('\n')
   const text = lines.slice(Math.max(0, startLine - 1), Math.min(lines.length, endLine)).join('\n')
   return { startLine, endLine, text }
 }
@@ -1782,6 +1818,8 @@ export function buildCallGraphFromFiles(
     if (isJsTs) {
       const { ast } = parseJsTsAst(f.content)
       if (ast) {
+        const lineOffsets = buildLineOffsets(f.content)
+        const fileLines = f.content.split('\n')
         // Imports, require() bindings and env string constants.
         walkAst(ast, node => {
           if (node.type === 'ImportDeclaration' && isAstNode(node.source)) {
@@ -1817,7 +1855,7 @@ export function buildCallGraphFromFiles(
               const args = getCallArgs(node)
               const routePath = resolveStringValue(args[0])
               if (routePath && routePath.startsWith('/')) {
-                const { startLine, endLine, text } = extractBodyRange(node, f.content)
+                const { startLine, endLine, text } = extractBodyRange(node, f.content, lineOffsets, fileLines)
                 pendingRoutes.push({
                   file: f.file,
                   line: startLine,
@@ -1895,10 +1933,11 @@ export function buildCallGraphFromFiles(
                     }
                   })
                   if (protectedProc) importMap.set('__trpcProtected', '__trpcProtected')
+                  const trpcLine = nodeLine(node, f.content, lineOffsets) ?? 1
                   pendingRoutes.push({
                     file: f.file,
-                    line: nodeLine(node, f.content) ?? 1,
-                    text: f.content.split('\n').slice((nodeLine(node, f.content) ?? 1) - 1, (nodeLine(node, f.content) ?? 1) + 24).join('\n'),
+                    line: trpcLine,
+                    text: fileLines.slice(trpcLine - 1, trpcLine + 24).join('\n'),
                     method: 'POST',
                     routePath: `/trpc/${routerName}.${prop.key}`,
                     symbol: `TRPC ${routerName}.${prop.key}`,
@@ -1936,7 +1975,7 @@ export function buildCallGraphFromFiles(
               const methodName = getPropName(rawMember.key ?? rawMember.id) ?? 'method'
               const mDecs = decoratorInfo(rawMember)
               const routeDec = mDecs.find(d => NEST_ROUTE_DECORATORS[d.name])
-              const { startLine, endLine, text } = extractBodyRange(rawMember, f.content)
+              const { startLine, endLine, text } = extractBodyRange(rawMember, f.content, lineOffsets, fileLines)
               const methodGuards = mDecs
                 .filter(d => /Guard|Roles|Secured|PreAuthorize|UseGuards|Auth/i.test(d.name))
                 .flatMap(d => [d.name, ...d.argStrings, ...collectRouteGuardNames(d.args)])
@@ -1984,8 +2023,8 @@ export function buildCallGraphFromFiles(
               if (!isAstNode(prop.value) || prop.value.type !== 'ObjectExpression') continue
               for (const resolver of getObjectProps(prop.value)) {
                 const resolverValue = isAstNode(resolver.value) ? resolver.value : node
-                const line = nodeLine(resolverValue, f.content) ?? nodeLine(node, f.content) ?? 1
-                const text = f.content.split('\n').slice(line - 1, line + 24).join('\n')
+                const line = nodeLine(resolverValue, f.content, lineOffsets) ?? nodeLine(node, f.content, lineOffsets) ?? 1
+                const text = fileLines.slice(line - 1, line + 24).join('\n')
                 pendingRoutes.push({
                   file: f.file,
                   line,
@@ -2014,7 +2053,7 @@ export function buildCallGraphFromFiles(
             fnNode = node.init
           }
           if (fnName && fnNode) {
-            const { startLine, endLine, text } = extractBodyRange(fnNode, f.content)
+            const { startLine, endLine, text } = extractBodyRange(fnNode, f.content, lineOffsets, fileLines)
             const rangeKey = `${f.file}:${startLine}:${fnName}`
             if (registeredRouteKeys.has(rangeKey)) return
             registeredRouteKeys.add(rangeKey)

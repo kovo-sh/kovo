@@ -154,6 +154,85 @@ function lineNumberAt(text: string, index: number): number {
   return line
 }
 
+function buildNewlineOffsets(text: string): number[] {
+  const offsets: number[] = []
+  let idx = text.indexOf('\n')
+  while (idx !== -1) {
+    offsets.push(idx)
+    idx = text.indexOf('\n', idx + 1)
+  }
+  return offsets
+}
+
+function lineAtFromOffsets(offsets: readonly number[], index: number, textLength: number): number {
+  const end = Math.min(Math.max(0, index), textLength)
+  let lo = 0
+  let hi = offsets.length
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1
+    if (offsets[mid] < end) lo = mid + 1
+    else hi = mid
+  }
+  return lo + 1
+}
+
+interface DelimiterIndex {
+  braceOpens: number[]
+  braceClose: Map<number, number>
+  parenClose: Map<number, number>
+}
+
+/** Single-pass O(n) delimiter matcher for `{}` and `()`, skipping strings and comments. */
+function buildDelimiterIndex(text: string): DelimiterIndex {
+  const braceOpens: number[] = []
+  const braceClose = new Map<number, number>()
+  const parenClose = new Map<number, number>()
+  const braceStack: number[] = []
+  const parenStack: number[] = []
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (ch === '"' || ch === "'" || ch === '`') {
+      i = skipQuoted(text, i) - 1
+      continue
+    }
+    if (ch === '/' && text[i + 1] === '/') {
+      const nl = text.indexOf('\n', i)
+      i = nl < 0 ? text.length : nl
+      continue
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2)
+      i = end < 0 ? text.length : end + 1
+      continue
+    }
+    if (ch === '{') {
+      braceOpens.push(i)
+      braceStack.push(i)
+    } else if (ch === '}') {
+      const open = braceStack.pop()
+      if (open !== undefined) braceClose.set(open, i)
+    } else if (ch === '(') {
+      parenStack.push(i)
+    } else if (ch === ')') {
+      const open = parenStack.pop()
+      if (open !== undefined) parenClose.set(open, i)
+    }
+  }
+  return { braceOpens, braceClose, parenClose }
+}
+
+/** First `{` index at or after `fromIndex` in O(log n). */
+function nextBraceOpen(braceOpens: readonly number[], fromIndex: number): number {
+  let lo = 0
+  let hi = braceOpens.length
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1
+    if (braceOpens[mid] < fromIndex) lo = mid + 1
+    else hi = mid
+  }
+  return lo < braceOpens.length ? braceOpens[lo] : -1
+}
+
 function skipQuoted(text: string, start: number): number {
   const quote = text[start]
   let i = start + 1
@@ -240,10 +319,22 @@ function argsAtCall(text: string, openParenIndex: number): { args: string[]; clo
 function stringLiteralValue(token: string | undefined): string | null {
   if (!token) return null
   const trimmed = token.trim()
-  const match = /^(['"`])((?:\\.|(?!\1).)*)\1$/s.exec(trimmed)
-  if (!match) return null
-  const raw = match[2]
-  if (match[1] === '`' && raw.includes('${')) return null
+  if (trimmed.length < 2) return null
+  const quote = trimmed[0]
+  if (quote !== "'" && quote !== '"' && quote !== '`') return null
+  const end = trimmed.length - 1
+  if (trimmed[end] !== quote) return null
+  for (let i = 1; i < end; i += 1) {
+    const ch = trimmed[i]
+    if (ch === '\\') {
+      if (i + 1 >= end) return null
+      i += 1
+      continue
+    }
+    if (ch === quote) return null
+  }
+  const raw = trimmed.slice(1, end)
+  if (quote === '`' && raw.includes('${')) return null
   return raw.replace(/\\(['"`\\])/g, '$1')
 }
 
@@ -298,7 +389,7 @@ function flattenMiddlewareTokens(tokens: readonly string[]): string[] {
       out.push(...flattenMiddlewareTokens(splitTopLevel(trimmed, 1, trimmed.length - 1)))
       continue
     }
-    if (/^(?:async\s+)?(?:function\b|\(|\(?[\w$,\s]*\)?\s*=>)/.test(trimmed)) continue
+    if (/^(?:async\s+)?(?:function\b|\(|[\w$,\s]*(?:\)\s*)?=>)/.test(trimmed)) continue
     const normalized = trimmed.replace(/\s+/g, ' ')
     if (!out.includes(normalized)) out.push(normalized)
   }
@@ -447,9 +538,107 @@ function detectSinks(body: string): Array<{ kind: ProgramSinkKind; index: number
   return hits
 }
 
+const JS_METHOD_MODIFIERS = new Set(['public', 'private', 'protected', 'static', 'async', 'readonly'])
+const JAVA_VISIBILITY_MODIFIERS = new Set(['public', 'protected', 'private'])
+
+function isJsIdentStart(code: number): boolean {
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95 || code === 36
+}
+
+function isJsIdentPart(code: number): boolean {
+  return isJsIdentStart(code) || (code >= 48 && code <= 57)
+}
+
+function isJavaIdentStart(code: number): boolean {
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95
+}
+
+function isJavaIdentPart(code: number): boolean {
+  return isJavaIdentStart(code) || (code >= 48 && code <= 57)
+}
+
+function isJavaTypePrefixChar(code: number): boolean {
+  return isJavaIdentPart(code)
+    || code === 32 || code === 9 // space, tab
+    || code === 60 || code === 62 // < >
+    || code === 91 || code === 93 // [ ]
+    || code === 44 || code === 46 || code === 63 // , . ?
+}
+
+function isWsChar(code: number): boolean {
+  return code === 32 || code === 9 || code === 10 || code === 13 || code === 12 || code === 11
+}
+
+/** Linear-time O(n) Java/Kotlin method header scanner (no backtracking regexes). */
+function scanJavaMethodHeaders(
+  content: string,
+  requireVisibility = false,
+): Array<{ name: string; index: number; openParen: number }> {
+  const matches: Array<{ name: string; index: number; openParen: number }> = []
+  const len = content.length
+  let lineStart = 0
+  while (lineStart < len) {
+    const nl = content.indexOf('\n', lineStart)
+    const lineEnd = nl < 0 ? len : nl
+    let p = lineStart
+    while (p < lineEnd && (content.charCodeAt(p) === 32 || content.charCodeAt(p) === 9 || content.charCodeAt(p) === 13)) p += 1
+    const nextLineStart = nl < 0 ? len : nl + 1
+
+    if (p < lineEnd) {
+      const c0 = content.charCodeAt(p)
+      const c1 = p + 1 < lineEnd ? content.charCodeAt(p + 1) : 0
+      const isCommentOrAnnotation = c0 === 64 || c0 === 42 || (c0 === 47 && (c1 === 47 || c1 === 42))
+      if (!isCommentOrAnnotation) {
+        const openParen = content.indexOf('(', p)
+        if (openParen > p && openParen < lineEnd) {
+          let nameEnd = openParen - 1
+          while (nameEnd >= p && (content.charCodeAt(nameEnd) === 32 || content.charCodeAt(nameEnd) === 9)) nameEnd -= 1
+          nameEnd += 1
+          let nameStart = nameEnd
+          while (nameStart > p && isJavaIdentPart(content.charCodeAt(nameStart - 1))) nameStart -= 1
+          if (nameStart < nameEnd && isJavaIdentStart(content.charCodeAt(nameStart))) {
+            let prefixEnd = nameStart
+            while (prefixEnd > p && (content.charCodeAt(prefixEnd - 1) === 32 || content.charCodeAt(prefixEnd - 1) === 9)) prefixEnd -= 1
+            if (prefixEnd < nameStart && prefixEnd > p) {
+              let validPrefix = true
+              let hasWord = false
+              for (let k = p; k < prefixEnd; k += 1) {
+                const ck = content.charCodeAt(k)
+                if (!isJavaTypePrefixChar(ck)) {
+                  validPrefix = false
+                  break
+                }
+                if (isJavaIdentPart(ck)) hasWord = true
+              }
+              if (validPrefix && hasWord) {
+                let visOk = true
+                if (requireVisibility) {
+                  let wEnd = p
+                  while (wEnd < prefixEnd && isJavaIdentPart(content.charCodeAt(wEnd))) wEnd += 1
+                  visOk = JAVA_VISIBILITY_MODIFIERS.has(content.slice(p, wEnd))
+                }
+                if (visOk) {
+                  const name = content.slice(nameStart, nameEnd)
+                  if (!CALL_KEYWORDS.has(name)) {
+                    matches.push({ name, index: p, openParen })
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    lineStart = nextLineStart
+  }
+  return matches
+}
+
 function extractJsFunctions(file: string, content: string): ProgramFunction[] {
   const out: ProgramFunction[] = []
   const seen = new Set<number>()
+  const newlineOffsets = buildNewlineOffsets(content)
+  const { braceOpens, braceClose, parenClose } = buildDelimiterIndex(content)
 
   const push = (name: string | undefined, startIndex: number, bodyOpen: number, bodyClose: number) => {
     if (!name || bodyOpen < 0 || bodyClose < 0 || seen.has(startIndex)) return
@@ -458,8 +647,8 @@ function extractJsFunctions(file: string, content: string): ProgramFunction[] {
     out.push({
       name,
       file,
-      line: lineNumberAt(content, startIndex),
-      endLine: lineNumberAt(content, bodyClose),
+      line: lineAtFromOffsets(newlineOffsets, startIndex, content.length),
+      endLine: lineAtFromOffsets(newlineOffsets, bodyClose, content.length),
       startIndex,
       endIndex: bodyClose,
       calls: collectCalls(maskCode(body, false)),
@@ -467,27 +656,111 @@ function extractJsFunctions(file: string, content: string): ProgramFunction[] {
     })
   }
 
-  for (const match of content.matchAll(/(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/g)) {
+  for (const match of content.matchAll(/(?:export[ \t]+)?(?:async[ \t]+)?function[ \t]+([A-Za-z_$][\w$]*)[ \t]*\(/g)) {
     const name = match[1]
-    const open = content.indexOf('{', match.index + match[0].length)
-    const close = open >= 0 ? findMatching(content, open) : -1
+    const openParen = match.index + match[0].length - 1
+    const closeParen = parenClose.get(openParen)
+    const open = nextBraceOpen(braceOpens, closeParen !== undefined ? closeParen + 1 : openParen + 1)
+    const close = open >= 0 ? (braceClose.get(open) ?? -1) : -1
     push(name, match.index, open, close)
   }
-  for (const match of content.matchAll(/(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/g)) {
+  for (const match of content.matchAll(/(?:export[ \t]+)?(?:const|let|var)[ \t]+([A-Za-z_$][\w$]*)[ \t]*=[ \t]*(?:async[ \t]*)?/g)) {
     const name = match[1]
-    const afterArrow = content.indexOf('=>', match.index) + 2
-    const open = content.indexOf('{', afterArrow)
+    let pos = match.index + match[0].length
+    if (pos >= content.length) continue
+    const ch = content.charCodeAt(pos)
+    if (ch === 40) { // '('
+      const cp = parenClose.get(pos)
+      if (cp === undefined) continue
+      pos = cp + 1
+    } else if (isJsIdentStart(ch)) {
+      pos += 1
+      while (pos < content.length && isJsIdentPart(content.charCodeAt(pos))) pos += 1
+    } else {
+      continue
+    }
+    while (pos < content.length && isWsChar(content.charCodeAt(pos))) pos += 1
+    if (!content.startsWith('=>', pos)) continue
+    const afterArrow = pos + 2
+    const open = nextBraceOpen(braceOpens, afterArrow)
     if (open >= 0 && open - afterArrow < 200) {
-      const close = findMatching(content, open)
+      const close = braceClose.get(open) ?? -1
       push(name, match.index, open, close)
     }
   }
-  for (const match of content.matchAll(/(?:^|\n)\s*(?:public|private|protected|static|async|readonly|\s)*([A-Za-z_$][\w$]*)\s*\([^;{}]*\)\s*(?::\s*[^{}]+)?\{/g)) {
-    const name = match[1]
-    if (CALL_KEYWORDS.has(name)) continue
-    const open = content.indexOf('{', match.index + match[0].length - 1)
-    const close = findMatching(content, open)
-    push(name, match.index, open, close)
+
+  // Linear-time line scanner for class/object method declarations (replaces backtracking regex).
+  let noReturnBraceUntil = -1
+  let lineStart = 0
+  const len = content.length
+  while (lineStart < len) {
+    const nl = content.indexOf('\n', lineStart)
+    const lineEnd = nl < 0 ? len : nl
+    const nextLineStart = nl < 0 ? len : nl + 1
+
+    let p = lineStart
+    while (p < lineEnd && (content.charCodeAt(p) === 32 || content.charCodeAt(p) === 9 || content.charCodeAt(p) === 13)) p += 1
+    const declStart = p
+
+    let name: string | undefined
+    while (p < lineEnd && isJsIdentStart(content.charCodeAt(p))) {
+      const tokStart = p
+      p += 1
+      while (p < lineEnd && isJsIdentPart(content.charCodeAt(p))) p += 1
+      const tok = content.slice(tokStart, p)
+      const wsStart = p
+      while (p < lineEnd && (content.charCodeAt(p) === 32 || content.charCodeAt(p) === 9)) p += 1
+      if (p < lineEnd && content.charCodeAt(p) === 40) { // '('
+        name = tok
+        break
+      }
+      if (p > wsStart && JS_METHOD_MODIFIERS.has(tok)) continue
+      break
+    }
+
+    if (name && !CALL_KEYWORDS.has(name) && p < lineEnd && content.charCodeAt(p) === 40) {
+      const openParen = p
+      const closeParen = parenClose.get(openParen)
+      if (closeParen !== undefined && closeParen > openParen && closeParen - openParen <= 4096) {
+        let k = closeParen + 1
+        while (k < len && isWsChar(content.charCodeAt(k))) k += 1
+        let ok = true
+        if (k < len && content.charCodeAt(k) === 58) { // ':' return type annotation
+          k += 1
+          while (k < len && isWsChar(content.charCodeAt(k))) k += 1
+          if (k < noReturnBraceUntil) {
+            ok = false
+          } else {
+            const rtStart = k
+            while (k < len) {
+              const ck = content.charCodeAt(k)
+              if (ck === 123) break // '{'
+              if (ck === 125 || ck === 59) { // '}' or ';'
+                noReturnBraceUntil = k
+                ok = false
+                break
+              }
+              k += 1
+            }
+            if (k >= len) {
+              noReturnBraceUntil = len
+              ok = false
+            } else if (k === rtStart) {
+              ok = false
+            }
+          }
+        }
+        if (ok && k < len && content.charCodeAt(k) === 123) { // '{'
+          const paramSlice = content.slice(openParen + 1, closeParen)
+          if (!paramSlice.includes(';')) {
+            const close = braceClose.get(k) ?? -1
+            push(name, declStart, k, close)
+          }
+        }
+      }
+    }
+
+    lineStart = nextLineStart
   }
   return out
 }
@@ -531,22 +804,38 @@ function extractPythonFunctions(file: string, content: string): ProgramFunction[
 
 function extractBraceFunctions(file: string, content: string, language: 'java' | 'go'): ProgramFunction[] {
   const out: ProgramFunction[] = []
-  const pattern = language === 'go'
-    ? /func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\(/g
-    : /(?:public|private|protected|static|final|synchronized|native|\s)+[\w<>[\],.?\s]+\s+([A-Za-z_]\w*)\s*\(/g
-  for (const match of content.matchAll(pattern)) {
-    const name = match[1]
-    if (!name || CALL_KEYWORDS.has(name)) continue
-    const open = content.indexOf('{', match.index + match[0].length)
-    if (open < 0) continue
-    const close = findMatching(content, open)
-    if (close < 0) continue
+  const newlineOffsets = buildNewlineOffsets(content)
+  const { braceOpens, braceClose, parenClose } = buildDelimiterIndex(content)
+
+  const emit = (name: string, startIndex: number, openParen: number) => {
+    if (!name || CALL_KEYWORDS.has(name)) return
+    const closeParen = parenClose.get(openParen)
+    const open = nextBraceOpen(braceOpens, closeParen !== undefined ? closeParen + 1 : openParen + 1)
+    if (open < 0) return
+    const close = braceClose.get(open) ?? -1
+    if (close < 0) return
     const body = content.slice(open, close + 1)
     out.push({
-      name, file, line: lineNumberAt(content, match.index), endLine: lineNumberAt(content, close),
-      startIndex: match.index, endIndex: close,
-      calls: collectCalls(maskCode(body, false)), guardNames: guardIdentifiers(body),
+      name,
+      file,
+      line: lineAtFromOffsets(newlineOffsets, startIndex, content.length),
+      endLine: lineAtFromOffsets(newlineOffsets, close, content.length),
+      startIndex,
+      endIndex: close,
+      calls: collectCalls(maskCode(body, false)),
+      guardNames: guardIdentifiers(body),
     })
+  }
+
+  if (language === 'go') {
+    for (const match of content.matchAll(/func[ \t]+(?:\([^)\n]{0,200}\)[ \t]*)?([A-Za-z_]\w*)[ \t]*\(/g)) {
+      emit(match[1], match.index, match.index + match[0].length - 1)
+    }
+    return out
+  }
+
+  for (const header of scanJavaMethodHeaders(content, false)) {
+    emit(header.name, header.index, header.openParen)
   }
   return out
 }
@@ -1107,16 +1396,16 @@ function extractSpring(file: string, content: string, out: Extraction): boolean 
       else methods = ['ANY']
       const decoratorStart = bodyOpen + 1 + routeMatch.index
       const region = content.slice(decoratorStart, Math.min(content.length, decoratorStart + 1500))
-      const handlerMatch = /(?:public|protected|private)\s+(?:static\s+|final\s+|synchronized\s+)*[\w<>[\],.?\s]+\s+([A-Za-z_]\w*)\s*\(/g
+      const javaHandlers = scanJavaMethodHeaders(region, true)
       let handler = 'anonymous'
       let signature = ''
       let methodDecorators = ''
-      for (const hm of region.matchAll(handlerMatch)) {
-        handler = hm[1]
-        const signatureOpen = decoratorStart + (hm.index ?? 0) + hm[0].length - 1
+      if (javaHandlers.length > 0) {
+        const hm = javaHandlers[0]
+        handler = hm.name
+        const signatureOpen = decoratorStart + hm.openParen
         signature = argsAtCall(content, signatureOpen).args.join(', ')
         methodDecorators = region.slice(0, hm.index)
-        break
       }
       const methodGuards = decoratorGuards(methodDecorators)
       const input = inputFromSignature(signature)
@@ -1368,6 +1657,11 @@ function extractFile(file: string, content: string): Extraction {
 // Mount resolution + graph assembly
 // ============================================================================
 
+const MAX_ROUTER_MOUNT_DEPTH = 12
+const MAX_ROUTER_MOUNT_STEPS = 10_000
+const MAX_MOUNT_PATH_LENGTH = 2048
+const MAX_MOUNTED_ROUTES = 5000
+
 function resolveMountedRoutes(extractions: readonly Extraction[]): { routes: ProgramRoute[]; warnings: string[] } {
   const routers = new Map<string, RouterDef>()
   const mounts: MountSpec[] = []
@@ -1378,10 +1672,15 @@ function resolveMountedRoutes(extractions: readonly Extraction[]): { routes: Pro
   }
 
   const byName = new Map<string, RouterDef[]>()
+  const routerStems: Array<{ router: RouterDef; stem: string }> = []
   for (const router of routers.values()) {
     const list = byName.get(router.name) ?? []
     list.push(router)
     byName.set(router.name, list)
+    routerStems.push({
+      router,
+      stem: router.file.replaceAll('\\', '/').replace(/\.(?:[cm]?[jt]sx?)$/, ''),
+    })
   }
   const resolveChild = (mount: MountSpec): RouterDef | undefined => {
     if (mount.childKey && routers.has(mount.childKey)) return routers.get(mount.childKey)
@@ -1389,7 +1688,7 @@ function resolveMountedRoutes(extractions: readonly Extraction[]): { routes: Pro
     if (candidates.length === 1) return candidates[0]
     if (mount.childFile) {
       const target = mount.childFile.replaceAll('\\', '/')
-      const inTarget = [...routers.values()].filter(c => c.file.replaceAll('\\', '/').replace(/\.(?:[cm]?[jt]sx?)$/, '').endsWith(target))
+      const inTarget = routerStems.filter(c => c.stem.endsWith(target)).map(c => c.router)
       if (inTarget.length === 1) return inTarget[0]
       const exported = inTarget.filter(c => c.exported)
       if (exported.length === 1) return exported[0]
@@ -1397,32 +1696,110 @@ function resolveMountedRoutes(extractions: readonly Extraction[]): { routes: Pro
     return undefined
   }
 
+  const mountsByParent = new Map<string, Array<{ mount: MountSpec; child: RouterDef }>>()
+  const hasParent = new Set<string>()
+  let cycleWarnings = 0
+  let depthWarned = false
+  let stepsWarned = false
+  let pathWarned = false
+
+  for (const mount of mounts) {
+    const child = resolveChild(mount)
+    if (!child || !mount.parentKey || !routers.has(mount.parentKey)) continue
+    if (child.key === mount.parentKey) {
+      if (cycleWarnings < 10) {
+        warnings.push(`Skipped self-mounting router cycle on ${child.key} at ${mount.file}:${mount.line}`)
+        cycleWarnings += 1
+      }
+      continue
+    }
+    const list = mountsByParent.get(mount.parentKey) ?? []
+    list.push({ mount, child })
+    mountsByParent.set(mount.parentKey, list)
+    hasParent.add(child.key)
+  }
+
   const bases = new Map<string, string>()
   for (const router of routers.values()) bases.set(router.key, router.prefix)
   const mountChain = new Map<string, MountSpec[]>()
+  const settled = new Set<string>()
+  let steps = 0
 
-  for (let pass = 0; pass < 12; pass += 1) {
-    let changed = false
-    for (const mount of mounts) {
-      const child = resolveChild(mount)
-      if (!child) continue
-      const parentBase = mount.parentKey
-        ? bases.get(mount.parentKey)
-        : undefined
-      if (parentBase === undefined) continue
-      const nextBase = joinPaths(joinPaths(parentBase, mount.prefix), child.prefix)
-      if (bases.get(child.key) !== nextBase) {
-        bases.set(child.key, nextBase)
-        mountChain.set(child.key, [...(mount.parentKey ? mountChain.get(mount.parentKey) ?? [] : []), mount])
-        changed = true
+  const walk = (
+    routerKey: string,
+    currentBase: string,
+    chain: MountSpec[],
+    pathVisited: Set<string>,
+    depth: number,
+  ): void => {
+    if (steps >= MAX_ROUTER_MOUNT_STEPS) {
+      if (!stepsWarned) {
+        warnings.push(`Router mount expansion capped at ${MAX_ROUTER_MOUNT_STEPS} steps`)
+        stepsWarned = true
       }
+      return
     }
-    if (!changed) break
+    steps += 1
+    settled.add(routerKey)
+    bases.set(routerKey, currentBase)
+    mountChain.set(routerKey, chain)
+
+    if (depth >= MAX_ROUTER_MOUNT_DEPTH) {
+      if (!depthWarned && (mountsByParent.get(routerKey)?.length ?? 0) > 0) {
+        warnings.push(`Router mount depth capped at ${MAX_ROUTER_MOUNT_DEPTH} levels`)
+        depthWarned = true
+      }
+      return
+    }
+
+    const children = mountsByParent.get(routerKey)
+    if (!children) return
+    for (const { mount, child } of children) {
+      if (pathVisited.has(child.key)) {
+        if (cycleWarnings < 10) {
+          warnings.push(`Skipped cyclic router mount ${routerKey} -> ${child.key} at ${mount.file}:${mount.line}`)
+          cycleWarnings += 1
+        }
+        continue
+      }
+      if (settled.has(child.key)) continue
+      const nextBase = joinPaths(joinPaths(currentBase, mount.prefix), child.prefix)
+      if (nextBase.length > MAX_MOUNT_PATH_LENGTH) {
+        if (!pathWarned) {
+          warnings.push(`Skipped mounted path exceeding ${MAX_MOUNT_PATH_LENGTH} chars on ${child.key}`)
+          pathWarned = true
+        }
+        continue
+      }
+      pathVisited.add(child.key)
+      walk(child.key, nextBase, [...chain, mount], pathVisited, depth + 1)
+      pathVisited.delete(child.key)
+    }
+  }
+
+  // First traverse from zero-in-degree root routers (normal apps & lassos).
+  for (const router of routers.values()) {
+    if (hasParent.has(router.key) || settled.has(router.key)) continue
+    walk(router.key, router.prefix, [], new Set([router.key]), 0)
+  }
+  // Then traverse any remaining pure-cycle components without an external root.
+  for (const router of routers.values()) {
+    if (settled.has(router.key)) continue
+    walk(router.key, router.prefix, [], new Set([router.key]), 0)
   }
 
   const routes: ProgramRoute[] = []
+  const seen = new Set<string>()
+  let routeCapWarned = false
   for (const extraction of extractions) {
     for (const raw of extraction.routes) {
+      if (routes.length >= MAX_MOUNTED_ROUTES) {
+        if (!routeCapWarned) {
+          warnings.push(`Mounted routes capped at ${MAX_MOUNTED_ROUTES}`)
+          routeCapWarned = true
+        }
+        break
+      }
       const base = raw.routerKey ? bases.get(raw.routerKey) ?? '' : ''
       const path = raw.routerKey ? joinPaths(base, raw.path) : raw.path
       const chain = raw.routerKey ? mountChain.get(raw.routerKey) ?? [] : []
@@ -1430,6 +1807,8 @@ function resolveMountedRoutes(extractions: readonly Extraction[]): { routes: Pro
       const router = raw.routerKey ? routers.get(raw.routerKey) : undefined
       const middleware = [...new Set([...(router?.middleware ?? []), ...chain.flatMap(m => m.middleware), ...raw.middleware])]
       const id = `route:${raw.method}:${path}:${raw.file}:${raw.line}`
+      if (seen.has(id)) continue
+      seen.add(id)
       routes.push({
         id,
         framework: raw.framework,
@@ -1445,14 +1824,9 @@ function resolveMountedRoutes(extractions: readonly Extraction[]): { routes: Pro
         extraction: raw.extraction,
       })
     }
+    if (routes.length >= MAX_MOUNTED_ROUTES) break
   }
-  const seen = new Set<string>()
-  const deduped = routes.filter(route => {
-    if (seen.has(route.id)) return false
-    seen.add(route.id)
-    return true
-  })
-  return { routes: deduped, warnings }
+  return { routes, warnings }
 }
 
 function buildGraph(
@@ -1462,11 +1836,11 @@ function buildGraph(
   globalMiddleware: string[],
   warnings: string[],
 ): ProgramGraph {
-  const { routes } = resolveMountedRoutes(extractions)
+  const { routes, warnings: mountWarnings } = resolveMountedRoutes(extractions)
   const functions = extractions.flatMap(e => e.functions)
   const nodes: ProgramNode[] = []
   const edges: ProgramEdge[] = []
-  const warningsOut = [...warnings]
+  const warningsOut = [...warnings, ...mountWarnings]
 
   const fnByFile = new Map<string, Map<string, ProgramFunction>>()
   const fnByName = new Map<string, ProgramFunction[]>()
@@ -2341,7 +2715,7 @@ const SECRET_HINT_PATTERNS: ReadonlyArray<{ re: RegExp; note: string }> = [
   { re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/, note: 'cloud access key' },
   { re: /\bsk_(?:live|test)_[A-Za-z0-9]{8,}\b/, note: 'payment secret key' },
   { re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/, note: 'private key block' },
-  { re: /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp):\/\/[^\s'"`]*:[^\s'"`@]+@/i, note: 'credentialed conn-string' },
+  { re: /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp):\/\/[^\s'"`:@/]{0,128}:[^\s'"`@]{1,256}@/i, note: 'credentialed conn-string' },
   { re: /\b(?:jwt[_-]?secret|signing[_-]?secret|webhook[_-]?secret|hmac[_-]?secret)\b\s*[:=]\s*['"][^'"\n]{6,}['"]/i, note: 'hardcoded JWT/signing secret' },
   { re: /\b(?:api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|password|passwd|private[_-]?key)\b\s*[:=]\s*['"][^'"\n]{8,}['"]/i, note: 'secret-shaped assignment' },
   { re: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/, note: 'forge access token' },
@@ -2367,7 +2741,7 @@ function fileInModule(file: string, module: string): boolean {
 }
 
 /** Single fast prefilter so a repository-wide hint pass stays cheap on generated trees. */
-const HINT_PREFILTER_RE = /(?:AKIA|ASIA)[0-9A-Z]{16}|sk_(?:live|test)_[A-Za-z0-9]{8,}|-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----|:\/\/[^\s'"`]*:[^\s'"`@]+@|(?:jwt[_-]?secret|signing[_-]?secret|webhook[_-]?secret|hmac[_-]?secret|api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|password|passwd|private[_-]?key)\s*[:=]\s*['"]|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|0\.0\.0\.0\/0|::\/0|privileged\s*:\s*true|hostNetwork\s*:\s*true|runAsUser\s*:\s*0|allow[_]?[Pp]rivilege[_]?[Ee]scalation\s*:\s*true|(?:CAP_)?SYS_ADMIN|"(?:Action|Principal)"\s*:\s*"\*"|NODE_TLS_REJECT_UNAUTHORIZED\s*[:=]\s*['"]?0/
+const HINT_PREFILTER_RE = /(?:AKIA|ASIA)[0-9A-Z]{16}|sk_(?:live|test)_[A-Za-z0-9]{8,}|-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----|:\/\/[^\s'"`:@/]{0,128}:[^\s'"`@]{1,256}@|(?:jwt[_-]?secret|signing[_-]?secret|webhook[_-]?secret|hmac[_-]?secret|api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|password|passwd|private[_-]?key)[ \t]{0,32}[:=][ \t]{0,32}['"]|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|0\.0\.0\.0\/0|::\/0|privileged[ \t]{0,32}:[ \t]{0,32}true|hostNetwork[ \t]{0,32}:[ \t]{0,32}true|runAsUser[ \t]{0,32}:[ \t]{0,32}0|allow[_]?[Pp]rivilege[_]?[Ee]scalation[ \t]{0,32}:[ \t]{0,32}true|(?:CAP_)?SYS_ADMIN|"(?:Action|Principal)"[ \t]{0,32}:[ \t]{0,32}"\*"|NODE_TLS_REJECT_UNAUTHORIZED[ \t]{0,32}[:=][ \t]{0,32}['"]?0/i
 
 /**
  * Scan repository sources (including root/infra/k8s/terraform/docker/.env files outside route

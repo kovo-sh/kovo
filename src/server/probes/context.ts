@@ -42,6 +42,122 @@ export type StopReason = 'circuit_open' | 'aborted' | 'budget' | 'approval_requi
 
 
 
+const EPHEMERAL_KEY_SUFFIX_RE = /(?:(?:request|trace|correlation|span)[_-]?id|etag|server[_-]?time|request[_-]?time)$/i
+const EPHEMERAL_KEY_CONTAINS_RE = /csrf|xsrf|nonce/i
+
+function isWsCode(code: number): boolean {
+  return code === 32 || code === 9 || code === 10 || code === 13 || code === 12 || code === 11
+}
+
+function isKeyCharCode(code: number): boolean {
+  return (code >= 48 && code <= 57) // 0-9
+    || (code >= 65 && code <= 90) // A-Z
+    || (code >= 97 && code <= 122) // a-z
+    || code === 95 // _
+    || code === 36 // $
+    || code === 45 // -
+}
+
+function isUnquotedValueEndCode(code: number): boolean {
+  return isWsCode(code) || code === 44 || code === 59 || code === 38 || code === 125 || code === 60 // , ; & } <
+}
+
+function isEphemeralKey(key: string): boolean {
+  if (key.length < 4) return false
+  const tail = key.length > 16 ? key.slice(-16) : key
+  if (EPHEMERAL_KEY_SUFFIX_RE.test(tail)) return true
+  return EPHEMERAL_KEY_CONTAINS_RE.test(key)
+}
+
+/**
+ * Single-pass O(n) replacement for keyed ephemeral scalars (request/trace ids,
+ * nonces, ETag-ish values, server clocks) — eliminates regex backtracking on
+ * large response bodies while preserving exact normalization semantics.
+ */
+function maskKeyedEphemeralValues(body: string): string {
+  const len = body.length
+  let chunks: string[] | null = null
+  let copyFrom = 0
+  let floor = 0
+  let i = 0
+
+  while (i < len) {
+    const ch = body.charCodeAt(i)
+    if (ch !== 58 && ch !== 61) { // ':' or '='
+      i += 1
+      continue
+    }
+
+    // Walk backwards from separator (bounded by `floor` so every char is scanned at most once).
+    let kEnd = i - 1
+    while (kEnd >= floor && isWsCode(body.charCodeAt(kEnd))) kEnd -= 1
+    if (kEnd >= floor) {
+      const q = body.charCodeAt(kEnd)
+      if (q === 34 || q === 39) kEnd -= 1 // optional closing " or '
+    }
+    const keyEnd = kEnd + 1
+    let kStart = kEnd
+    while (kStart >= floor && isKeyCharCode(body.charCodeAt(kStart))) kStart -= 1
+    const keyStart = kStart + 1
+
+    const sepNext = i + 1
+    floor = sepNext
+
+    if (keyEnd - keyStart < 4 || !isEphemeralKey(body.slice(keyStart, keyEnd))) {
+      i = sepNext
+      continue
+    }
+
+    // Scan forward past optional whitespace to the value start.
+    let valStart = sepNext
+    while (valStart < len && isWsCode(body.charCodeAt(valStart))) valStart += 1
+    if (valStart >= len) break
+
+    let valEnd = -1
+    const vCode = body.charCodeAt(valStart)
+    if (vCode === 34) { // "..." with \" escapes
+      let p = valStart + 1
+      while (p < len) {
+        const c = body.charCodeAt(p)
+        if (c === 92) { // '\'
+          p += 2
+          continue
+        }
+        if (c === 34) {
+          valEnd = p + 1
+          break
+        }
+        p += 1
+      }
+    } else if (vCode === 39) { // '...'
+      const close = body.indexOf("'", valStart + 1)
+      if (close !== -1) valEnd = close + 1
+    }
+
+    if (valEnd < 0) {
+      // Unquoted scalar: [^\s,;&}<]+
+      let p = valStart
+      while (p < len && !isUnquotedValueEndCode(body.charCodeAt(p))) p += 1
+      if (p > valStart) valEnd = p
+    }
+
+    if (valEnd < 0) {
+      i = sepNext
+      continue
+    }
+
+    if (!chunks) chunks = []
+    chunks.push(body.slice(copyFrom, valStart), '"<ephemeral>"')
+    copyFrom = valEnd
+    floor = valEnd
+    i = valEnd
+  }
+
+  if (!chunks) return body
+  chunks.push(body.slice(copyFrom))
+  return chunks.join('')
+}
+
 /**
  * Mask values that legitimately rotate between two requests to the same endpoint: request/trace
  * ids, CSRF nonces, ETags, ISO-8601 timestamps and epoch-ms values. Masking is deliberately
@@ -50,12 +166,7 @@ export type StopReason = 'circuit_open' | 'aborted' | 'budget' | 'approval_requi
  */
 export function normalizeEphemeralNoise(body: string): string {
   if (!body) return body
-  let out = body
-  // Keyed ephemeral scalars (request/trace ids, nonces, ETag-ish values, server clocks).
-  out = out.replace(
-    /(["']?(?:[A-Za-z0-9_$-]*(?:request|trace|correlation|span)[_-]?id|[A-Za-z0-9_$-]*(?:csrf|xsrf|nonce)[A-Za-z0-9_$-]*|etag|server[_-]?time|request[_-]?time)["']?\s*[:=]\s*)("(?:[^"\\]|\\.)*"|'[^']*'|[^\s,;&}<]+)/gi,
-    '$1"<ephemeral>"',
-  )
+  let out = maskKeyedEphemeralValues(body)
   // ISO-8601 timestamps anywhere (a per-request clock value, not a resource identity).
   out = out.replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})\b/g, '<ephemeral>')
   // Epoch milliseconds (>= 2001) are runtime clocks; smaller numbers stay meaningful.
@@ -68,7 +179,27 @@ export function normalizeEphemeralNoise(body: string): string {
 /** Token-set Jaccard similarity of two response bodies (1 = identical). */
 export function responseSimilarity(a: string, b: string): number {
   if (a === b) return 1
-  const tok = (s: string) => new Set(normalizeEphemeralNoise(s).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).slice(0, 4000))
+  const tok = (s: string): Set<string> => {
+    const norm = normalizeEphemeralNoise(s)
+    const set = new Set<string>()
+    let count = 0
+    let start = -1
+    for (let i = 0; i <= norm.length && count < 4000; i += 1) {
+      const code = i < norm.length ? norm.charCodeAt(i) : 0
+      const isAlnum =
+        (code >= 48 && code <= 57)
+        || (code >= 65 && code <= 90)
+        || (code >= 97 && code <= 122)
+      if (isAlnum) {
+        if (start < 0) start = i
+      } else if (start >= 0) {
+        set.add(norm.slice(start, i).toLowerCase())
+        count += 1
+        start = -1
+      }
+    }
+    return set
+  }
   const ta = tok(a)
   const tb = tok(b)
   if (ta.size === 0 && tb.size === 0) {
