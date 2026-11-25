@@ -524,6 +524,8 @@ const MARKUP_CWE_RE = /^CWE-(?:79|80|83)$/i
 // as it always has, so a narrative word cannot promote an unrelated claim into an ungated class.
 const INJECTION_CWE_RE = /^CWE-(?:89|564|943)$/i
 const INJECTION_CATEGORY_RE = /^(?:sqli|sql[-_ ]?injection|blind[-_ ]?sqli|injection[-_ ]input)$/i
+const OPEN_REDIRECT_CWE_RE = /^CWE-601$/i
+const OPEN_REDIRECT_CATEGORY_RE = /^(?:open[-_ ]?redirect|url[-_ ]?redirect|unvalidated[-_ ]?redirect)$/i
 const DISCLOSURE_RE = /\b(?:disclosure|data[- ]leak|information[- ]leak|leak(?:ed|s|age)?|exposure|expos(?:ed|ure)|sensitive[- ]data|unauthori[sz]ed[- ]read)\b/i
 const DISCLOSURE_CWE_RE = /^CWE-(?:200|359|522|532)$/i
 /**
@@ -551,6 +553,11 @@ export function classifyImpactDescriptor(parts: {
   // narrative ("cross-store data disclosure") can rebrand it as information disclosure.
   if (INJECTION_CWE_RE.test(parts.cwe ?? '') ||
       INJECTION_CATEGORY_RE.test((parts.category ?? '').trim())) return 'injection'
+  // Open redirect has its own redirect receipt rule and must never be rebranded as disclosure
+  // when its narrative mentions exposure or phishing/token leak.
+  if (OPEN_REDIRECT_CWE_RE.test(parts.cwe ?? '') ||
+      OPEN_REDIRECT_CATEGORY_RE.test((parts.category ?? '').trim()) ||
+      /\bopen[- ]redirect\b/i.test(parts.title ?? '')) return 'other'
   if (/\b(?:vertical|bfla|function[- ]level|privilege[- ]escalation)\b/i.test(text) ||
       /^CWE-(?:269|285|862|863)$/i.test(parts.cwe ?? '')) return 'bfla'
   // Business-logic/workflow claims carry their own impact model (invariant, repeat transition,
@@ -1690,6 +1697,7 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
       for (const token of value.slice(0, 256).match(/[A-Za-z0-9_-]{8,64}/g) ?? []) sent.add(token)
     }
   }
+  labels.oracleDeclared = hasOracle(input.oracleEvents, ['invariant_violation', 'workflow_skip', 'race_double_spend', 'state_delta', 'privilege_escalation'])
   const afterFields = afterRead?.json !== undefined ? flattenJson(afterRead.json) : new Map<string, string>()
   const attributable = labels.changedFields.some(path => sent.has(afterFields.get(path) ?? '')) ||
     (afterRead !== null && [...sent].some(token => String(afterRead.body ?? '').includes(token)))
@@ -1701,7 +1709,6 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
       evidence: labels,
     }
   }
-  labels.oracleDeclared = hasOracle(input.oracleEvents, ['invariant_violation', 'workflow_skip', 'race_double_spend', 'state_delta', 'privilege_escalation'])
   // A create-time caller-chosen *money* value (invoice amount, price) is not an invariant: the app
   // may legitimately accept it, and no control arm binds it. Require the endpoint's declared
   // invariant event for price/amount-only persistences on create-shaped probes.
@@ -1745,6 +1752,8 @@ export interface BooleanDifferentialArm {
   method?: string
   pathAndQuery?: string
   requestJson?: unknown
+  /** Raw non-JSON request body (e.g. application/x-www-form-urlencoded or application/xml). */
+  requestBody?: string
   requestHeaders?: Record<string, string> | null
   json?: unknown
   body?: string
@@ -1889,9 +1898,61 @@ function decodedText(value: string): string {
   try { return decodeURIComponent(value) } catch { return value }
 }
 
+function paramValueFromTextBody(rawBody: string | undefined, param: string): string | null {
+  if (!rawBody || !rawBody.trim()) return null
+  const trimmed = rawBody.trim()
+  const wanted = param.split('.').pop() ?? param
+  if (trimmed.startsWith('<')) {
+    const esc = wanted.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const match = new RegExp(`<${esc}(?:\\s[^>]*)?>([\\s\\S]*?)</${esc}>`, 'i').exec(trimmed)
+    if (match?.[1] !== undefined) {
+      return match[1]
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&amp;/g, '&')
+    }
+  }
+  if (trimmed.includes('=')) {
+    try {
+      const sp = new URLSearchParams(trimmed)
+      if (sp.has(param)) return sp.get(param)
+      if (wanted !== param && sp.has(wanted)) return sp.get(wanted)
+    } catch { /* ignore */ }
+  }
+  return null
+}
+
+function maskTextBodyParam(rawBody: string | undefined, param: string): string | null {
+  if (!rawBody || !rawBody.trim()) return null
+  const trimmed = rawBody.trim()
+  const wanted = param.split('.').pop() ?? param
+  if (trimmed.startsWith('<')) {
+    const esc = wanted.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return trimmed.replace(new RegExp(`(<${esc}(?:\\s[^>]*)?>)[\\s\\S]*?(</${esc}>)`, 'gi'), '$1{{injected}}$2')
+  }
+  if (trimmed.includes('=')) {
+    try {
+      const sp = new URLSearchParams(trimmed)
+      if (sp.has(param)) sp.set(param, '{{injected}}')
+      else if (wanted !== param && sp.has(wanted)) sp.set(wanted, '{{injected}}')
+      return [...sp.entries()].map(([k, v]) => `${k}=${v}`).sort().join('&')
+    } catch { /* ignore */ }
+  }
+  return trimmed
+}
+
+function rawTextBodyOf(arm: BooleanDifferentialArm): string | undefined {
+  if (typeof arm.requestBody === 'string' && arm.requestBody.length > 0) return arm.requestBody
+  if (typeof arm.requestJson === 'string' && arm.requestJson.length > 0) return arm.requestJson
+  return undefined
+}
+
 function injectedParamValue(arm: BooleanDifferentialArm, param: string): string | null {
   return paramValueFromQuery(arm.pathAndQuery, param) ??
     paramValueFromJson(arm.requestJson, param) ??
+    paramValueFromTextBody(rawTextBodyOf(arm), param) ??
     paramValueFromHeader(arm.requestHeaders, param)
 }
 
@@ -1976,10 +2037,12 @@ function canonicalHeaders(headers: Record<string, string> | null | undefined, pa
 }
 
 function requestShape(arm: BooleanDifferentialArm, param: string): string {
+  const rawBody = rawTextBodyOf(arm)
   return JSON.stringify({
     method: (arm.method ?? '').toUpperCase(),
     path: maskedPath(arm.pathAndQuery, param),
-    json: arm.requestJson === undefined ? null : maskJsonParam(arm.requestJson, param),
+    json: arm.requestJson === undefined || typeof arm.requestJson === 'string' ? null : maskJsonParam(arm.requestJson, param),
+    body: rawBody === undefined ? null : maskTextBodyParam(rawBody, param),
     headers: canonicalHeaders(arm.requestHeaders, param),
   })
 }

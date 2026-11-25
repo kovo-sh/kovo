@@ -14,6 +14,7 @@
  */
 import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
+import { HostFactLog } from './host-fact-log.ts'
 import {
   assessBooleanDifferential,
   assessImpactEvidence,
@@ -22,7 +23,6 @@ import {
   hasForeignTenantOrOwnerDisclosure,
   isObjectScopedRequest,
   knownOracleEvent,
-  parseRoleLabel,
   routeFamily,
   stepMutatesState,
 } from './oracle-invariants.ts'
@@ -336,15 +336,31 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     }
     const param = receipt.target.param ?? deriveDifferingParam(controls[0]!, probes[0]!)
     if (!param) return reject(receipt, rule, 'A boolean differential must name the injected parameter.')
-    const toArm = (entry: ReceiptTranscriptEntry): BooleanDifferentialArm => ({
-      status: entry.step.status,
-      method: entry.step.method,
-      pathAndQuery: entry.step.pathAndQuery,
-      ...(entry.step.requestJson !== undefined ? { requestJson: entry.step.requestJson } : {}),
-      requestHeaders: entry.step.requestHeaders ?? null,
-      ...(entry.step.json !== undefined ? { json: entry.step.json } : {}),
-      ...(entry.step.body !== undefined ? { body: entry.step.body } : {}),
-    })
+    const extractCarrierRequestBody = (entry: ReceiptTranscriptEntry): string | undefined => {
+      if (typeof entry.step.requestJson === 'string' && entry.step.requestJson.length > 0) return entry.step.requestJson
+      if (entry.step.requestJson !== undefined || !entry.carrierText) return undefined
+      const lines = entry.carrierText.split('\n').map(l => l.trim()).filter(Boolean)
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        const line = lines[i]!
+        if (/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\//i.test(line)) continue
+        if (/^[A-Za-z0-9-]+:\s/.test(line)) continue
+        return line
+      }
+      return undefined
+    }
+    const toArm = (entry: ReceiptTranscriptEntry): BooleanDifferentialArm => {
+      const requestBody = extractCarrierRequestBody(entry)
+      return {
+        status: entry.step.status,
+        method: entry.step.method,
+        pathAndQuery: entry.step.pathAndQuery,
+        ...(entry.step.requestJson !== undefined ? { requestJson: entry.step.requestJson } : {}),
+        ...(requestBody !== undefined ? { requestBody } : {}),
+        requestHeaders: entry.step.requestHeaders ?? null,
+        ...(entry.step.json !== undefined ? { json: entry.step.json } : {}),
+        ...(entry.step.body !== undefined ? { body: entry.step.body } : {}),
+      }
+    }
     const rounds: BooleanDifferentialRound[] = controls.map((control, index) => ({
       control: toArm(control),
       probe: toArm(probes[index]!),
@@ -1567,41 +1583,6 @@ export interface ScriptProofExchange {
   responseHeaders?: Record<string, string> | null
 }
 
-function deriveHostAmbientAuth(exchange: ScriptProofExchange): ImpactStep['actor']['auth'] {
-  if (exchange.ambientAuth && exchange.ambientAuth !== 'unknown') return exchange.ambientAuth
-  const headers = exchange.requestHeaders
-  if (headers) {
-    const auth = headerValue(headers, 'authorization')
-    const cookie = headerValue(headers, 'cookie')
-    if (cookie && !auth) return 'cookie'
-    if (auth) return /^bearer\s+/i.test(auth) ? 'bearer' : 'header'
-    if (headerValue(headers, 'x-api-key') || headerValue(headers, 'x-auth-token')) return 'header'
-  }
-  return 'unknown'
-}
-
-function extractSameSiteFromSetCookie(setCookie: string | null): string | null {
-  if (!setCookie) return null
-  const m = /;\s*samesite\s*=\s*(strict|lax|none)\b/i.exec(setCookie)
-  if (!m?.[1]) return null
-  const lower = m[1].toLowerCase()
-  return lower === 'strict' ? 'Strict' : lower === 'lax' ? 'Lax' : 'None'
-}
-
-function deriveHostSameSite(exchange: ScriptProofExchange, allExchanges: readonly ScriptProofExchange[]): string | null {
-  if (exchange.sessionSameSite !== undefined) return exchange.sessionSameSite
-  const own = extractSameSiteFromSetCookie(headerValue(exchange.responseHeaders, 'set-cookie'))
-  if (own) return own
-  const exchangeOrigin = normalizeOrigin(exchange.origin)
-  for (const item of allExchanges) {
-    if (exchangeOrigin && item.origin && normalizeOrigin(item.origin) !== exchangeOrigin) continue
-    if (exchange.personaHandle && item.personaHandle && item.personaHandle !== exchange.personaHandle) continue
-    const found = extractSameSiteFromSetCookie(headerValue(item.responseHeaders, 'set-cookie'))
-    if (found) return found
-  }
-  return null
-}
-
 const IMPACT_CLASS_TO_VULN_CLASS: Readonly<Record<string, string>> = {
   authorization: 'authorization',
   bfla: 'bfla',
@@ -1621,127 +1602,42 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.length > 0) : []
 }
 
-function impactStepOf(
-  exchange: ScriptProofExchange,
-  overrides?: {
-    arm?: ImpactStep['arm']
-    requestJson?: unknown
-    ambientAuth?: ImpactStep['actor']['auth']
-    sameSite?: string | null
-  },
-): ImpactStep {
-  const roleLabel = exchange.actorRoleLabel ?? null
-  const parsed = parseRoleLabel(roleLabel ?? exchange.personaHandle ?? null)
-  const arm = overrides?.arm ?? (exchange.sessionRole === 'control' || exchange.sessionRole === 'probe' ||
-    exchange.sessionRole === 'cleanup' || exchange.sessionRole === 'setup'
-    ? exchange.sessionRole
-    : 'setup')
-  let json: unknown
-  if (exchange.body !== undefined) {
-    try { json = JSON.parse(exchange.body) } catch { json = undefined }
-  }
-  return {
-    id: exchange.exchangeId,
-    arm,
-    method: (exchange.method || 'GET').toUpperCase(),
-    route: (exchange.pathAndQuery || '/').split('?')[0],
-    pathAndQuery: exchange.pathAndQuery || '/',
-    status: exchange.status,
-    actor: {
-      handle: exchange.personaHandle ?? null,
-      role: parsed.role,
-      tenant: parsed.tenant,
-      auth: overrides?.ambientAuth ?? 'unknown',
-      sameSite: overrides?.sameSite ?? null,
-    },
-    ...(json !== undefined ? { json } : {}),
-    ...(exchange.body !== undefined ? { body: exchange.body } : {}),
-    ...(overrides?.requestJson !== undefined ? { requestJson: overrides.requestJson } : {}),
-    ...(exchange.requestHeaders ? { requestHeaders: exchange.requestHeaders } : {}),
-    ...(exchange.responseHeaders ? { responseHeaders: exchange.responseHeaders } : {}),
-    ...(exchange.durationMs !== undefined ? { durationMs: exchange.durationMs } : {}),
-  }
-}
-
 /**
- * Derive a receipt from a confirmed script run. `claims` are the oracle-checked claim objects the
- * SDK returned (already re-evaluated against the signed transcript); they are used only to name the
- * class, the target and the exchange set. Every cited id must exist in `exchanges`.
+ * Derive a receipt from a confirmed script run. `claims` are used only to select the class,
+ * target, and exchange IDs; all request bodies, actor roles/tenants, ambient auth, SameSite,
+ * and exchange ordering are derived strictly from the immutable `HostFactLog`.
  */
 export function buildAgentScriptReceipt(input: {
   claims: readonly Record<string, unknown>[]
   exchanges: readonly ScriptProofExchange[]
+  /** Optional pre-populated immutable HostFactLog (takes precedence over `exchanges`). */
+  factLog?: HostFactLog
   /** Host-recorded OOB callback events (for `kind === 'oob'` claims). */
   oobEvents?: readonly ReceiptOobEvent[]
   origin: string
   title: string
-}): { receipt: ProofReceipt; transcript: ReceiptTranscript } | null {
+}): {
+  receipt: ProofReceipt
+  transcript: ReceiptTranscript
+  factLog: HostFactLog
+  armOverrides: Map<string, ImpactStep['arm']>
+  evidenceRoleOverrides?: Map<string, string>
+} | null {
+  const factLog = input.factLog ?? HostFactLog.fromScriptExchanges(input.exchanges, input.oobEvents)
   const byId = new Map(input.exchanges.map(exchange => [exchange.exchangeId, exchange]))
-  const orderById = new Map(input.exchanges.map((exchange, index) => [exchange.exchangeId, index]))
-  const hostOrderOf = (id: string): number => {
-    const ex = byId.get(id)
-    if (ex && typeof ex.seq === 'number' && Number.isFinite(ex.seq)) return ex.seq
-    return orderById.get(id) ?? 0
-  }
+  const hasExchange = (id: string): boolean => Boolean(factLog.getExchange(id) || byId.has(id))
   const sortByHostOrder = (ids: readonly string[]): string[] =>
-    [...new Set(ids)].sort((a, b) => {
-      const diff = hostOrderOf(a) - hostOrderOf(b)
-      if (diff !== 0) return diff
-      const startA = byId.get(a)?.startedAt ?? 0
-      const startB = byId.get(b)?.startedAt ?? 0
-      return startA - startB
-    })
+    factLog.orderedExchanges(ids).map(fact => fact.exchangeId)
   const buildTranscript = (
     armOverrides: ReadonlyMap<string, ImpactStep['arm']>,
     extra?: {
-      requestJsonById?: ReadonlyMap<string, unknown>
       evidenceRoleOverrides?: ReadonlyMap<string, string>
     },
-  ): ReceiptTranscript => ({
-    entries: input.exchanges.map(exchange => {
-      // C-5 / H-13: Host-recorded `exchange.requestBody` ALWAYS takes precedence and can never
-      // be overridden by `requestJsonById` or script-declared `claim.requestBody`.
-      const hostReq = exchange.requestBody !== undefined && exchange.requestBody !== null
-        ? (() => { try { return JSON.parse(exchange.requestBody) } catch { return exchange.requestBody } })()
-        : undefined
-      const perExchangeReq = hostReq !== undefined
-        ? hostReq
-        : extra?.requestJsonById?.has(exchange.exchangeId)
-          ? extra.requestJsonById.get(exchange.exchangeId)
-          : undefined
-      const hostAmbientAuth = deriveHostAmbientAuth(exchange)
-      const hostSameSite = deriveHostSameSite(exchange, input.exchanges)
-      const carrierParts = [
-        exchange.pathAndQuery ?? '',
-        exchange.requestHeaders ? JSON.stringify(exchange.requestHeaders) : '',
-        exchange.requestBody ?? '',
-        exchange.body ?? '',
-      ].filter(Boolean)
-      return {
-        exchangeId: exchange.exchangeId,
-        step: impactStepOf(exchange, {
-          ...(armOverrides.has(exchange.exchangeId) ? { arm: armOverrides.get(exchange.exchangeId)! } : {}),
-          ...(perExchangeReq !== undefined ? { requestJson: perExchangeReq } : {}),
-          ambientAuth: hostAmbientAuth,
-          sameSite: hostSameSite,
-        }),
-        ...(exchange.durationMs !== undefined ? { durationMs: exchange.durationMs } : {}),
-        ...(exchange.op ? { op: exchange.op } : {}),
-        seq: hostOrderOf(exchange.exchangeId),
-        ...(exchange.startedAt !== undefined ? { startedAt: exchange.startedAt } : {}),
-        ...(exchange.endedAt !== undefined ? { endedAt: exchange.endedAt } : {}),
-        ...(exchange.origin ? { origin: exchange.origin } : {}),
-        ...(exchange.consumedCapabilityId !== undefined ? { consumedCapabilityId: exchange.consumedCapabilityId } : {}),
-        ...(exchange.consumedCapabilities !== undefined ? { consumedCapabilities: exchange.consumedCapabilities } : {}),
-        ...(exchange.sessionId !== undefined ? { sessionId: exchange.sessionId } : {}),
-        ...(carrierParts.length > 0 ? { carrierText: carrierParts.join('\n') } : {}),
-        ...(extra?.evidenceRoleOverrides?.has(exchange.exchangeId)
-          ? { evidenceRole: extra.evidenceRoleOverrides.get(exchange.exchangeId)! }
-          : exchange.sessionRole ? { evidenceRole: exchange.sessionRole } : {}),
-      }
-    }),
+  ): ReceiptTranscript => factLog.toReceiptTranscript({
+    armOverrides,
+    ...(extra?.evidenceRoleOverrides ? { evidenceRoleOverrides: extra.evidenceRoleOverrides } : {}),
   })
-  const cited = (ids: readonly string[]) => ids.filter(id => byId.has(id))
+  const cited = (ids: readonly string[]) => ids.filter(hasExchange)
 
   for (const claim of input.claims) {
     if (recordField(claim, 'kind') !== 'impact') continue
@@ -1800,8 +1696,6 @@ export function buildAgentScriptReceipt(input: {
         }
       }
     }
-    const requiredRole = recordField(claim, 'requiredRole')
-    const resourceTenant = recordField(claim, 'resourceTenant')
     const proofPatterns = stringArray(recordField(claim, 'proofPatterns')).filter(p => p.length >= 4 && p.length <= 200).slice(0, 4)
     return {
       receipt: buildProofReceipt({
@@ -1815,15 +1709,13 @@ export function buildAgentScriptReceipt(input: {
         oobEventIds: [],
         browserTraceIds: [],
         claimedDelta: `${input.title} — script claims ${impactClass} impact over ${exchangeIds.length} host-recorded exchange(s).`.slice(0, 1200),
-        ...(requiredRole === 'viewer' || requiredRole === 'member' || requiredRole === 'admin' || requiredRole === 'owner'
-          ? { requiredRole }
-          : {}),
-        ...(typeof resourceTenant === 'string' && resourceTenant ? { resourceTenant } : {}),
         ...(recordField(claim, 'expectControlDenied') === true ? { expectControlDenied: true } : {}),
         ...(hostOracleEvents.length ? { oracleEvents: hostOracleEvents } : {}),
         ...(proofPatterns.length ? { proofPatterns } : {}),
       }),
       transcript,
+      factLog,
+      armOverrides,
     }
   }
 
@@ -1892,6 +1784,8 @@ export function buildAgentScriptReceipt(input: {
         expectControlDenied,
       }),
       transcript,
+      factLog,
+      armOverrides,
     }
   }
 
@@ -1915,20 +1809,16 @@ export function buildAgentScriptReceipt(input: {
       recordField(c, 'text') === marker &&
       typeof recordField(c, 'exchangeId') === 'string' &&
       recordField(c, 'exchangeId') !== probeId &&
-      byId.has(recordField(c, 'exchangeId') as string))
+      hasExchange(recordField(c, 'exchangeId') as string))
     if (!absent) continue
     const controlId = recordField(absent, 'exchangeId') as string
-    const exchangeIds = [controlId, probeId].sort((a, b) => (orderById.get(a) ?? 0) - (orderById.get(b) ?? 0))
+    const exchangeIds = sortByHostOrder([controlId, probeId])
     const armOverrides = new Map<string, ImpactStep['arm']>([
       [controlId, 'control'],
       [probeId, 'probe'],
     ])
-    const requestJsonById = new Map<string, unknown>()
-    const controlReqBody = recordField(absent, 'controlRequestBody') ?? recordField(absent, 'requestBody') ?? recordField(present, 'controlRequestBody')
-    const probeReqBody = recordField(present, 'probeRequestBody') ?? recordField(present, 'requestBody')
-    if (controlReqBody !== undefined) requestJsonById.set(controlId, controlReqBody)
-    if (probeReqBody !== undefined) requestJsonById.set(probeId, probeReqBody)
-    const transcript = buildTranscript(armOverrides, requestJsonById.size ? { requestJsonById } : undefined)
+    // Request bodies come strictly from immutable HostFactLog — never from worker claim scalars.
+    const transcript = buildTranscript(armOverrides)
     const rawExplicit = typeof recordField(present, 'vulnClass') === 'string'
       ? (recordField(present, 'vulnClass') as string).trim().toLowerCase()
       : ''
@@ -1957,6 +1847,8 @@ export function buildAgentScriptReceipt(input: {
         proofPatterns: [marker],
       }),
       transcript,
+      factLog,
+      armOverrides,
     }
   }
 
@@ -1991,6 +1883,8 @@ export function buildAgentScriptReceipt(input: {
           claimedDelta: `${input.title} — paired boolean differential over ${controls.length} recorded round(s).`.slice(0, 1200),
         }),
         transcript,
+        factLog,
+        armOverrides,
       }
     }
     if (kind === 'timing') {
@@ -2038,6 +1932,8 @@ export function buildAgentScriptReceipt(input: {
           claimedDelta: `${input.title} — timing separation over ${controls.length}/${variants.length} recorded arms.`.slice(0, 1200),
         }),
         transcript,
+        factLog,
+        armOverrides,
       }
     }
     if (kind === 'conserved_balance' || kind === 'race') {
@@ -2122,6 +2018,9 @@ export function buildAgentScriptReceipt(input: {
             : {}),
         }),
         transcript,
+        factLog,
+        armOverrides,
+        evidenceRoleOverrides,
       }
     }
   }
@@ -2227,6 +2126,7 @@ export function buildAgentScriptReceipt(input: {
       ...(oobEvent.targetOrigin ? {} : { targetOrigin: primaryCarrier?.origin || input.origin }),
       ...(injectedAtMs !== undefined && oobEvent.injectedAtMs === undefined ? { injectedAtMs } : {}),
     }
+    factLog.recordOobEvent(normalizedOobEvent)
     return {
       receipt: buildOobReceipt({
         vulnClass,
@@ -2242,6 +2142,8 @@ export function buildAgentScriptReceipt(input: {
         ...baseTranscript,
         oobEvents: [normalizedOobEvent],
       },
+      factLog,
+      armOverrides,
     }
   }
 

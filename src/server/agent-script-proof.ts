@@ -9,7 +9,7 @@
 import { createHash } from 'node:crypto'
 import { agentScriptProofEnvelopeSchema } from '../replay-spec.ts'
 import type { AgentScriptProofEnvelope } from '../replay-spec.ts'
-import type { BrokerExchangeResult, Grant, RequestBroker } from './broker.ts'
+import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
 import {
   compositeProofReceiptSchema,
@@ -18,9 +18,12 @@ import {
   type CompositeVerifyOptions,
   type HostSignedTranscript,
 } from './composite-receipt.ts'
-import { DerivedCapabilityVault, scrubDerivedSecrets, type DerivedCapabilityMeta } from './derived-custody.ts'
-import { buildAgentScriptReceipt, verifyReceipt } from './proof-receipt.ts'
+import { DerivedCapabilityVault, type DerivedCapabilityMeta } from './derived-custody.ts'
+import { createEgressSanitizer, type EgressSanitizer } from './egress-sanitizer.ts'
+import { HostFactLog } from './host-fact-log.ts'
+import { buildAgentScriptReceipt } from './proof-receipt.ts'
 import type { ProofReceipt, ReceiptVerification, ScriptProofExchange } from './proof-receipt.ts'
+import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
 import {
   TranscriptStore,
   VerifyRpcServer,
@@ -134,27 +137,64 @@ function extractHopActors(receipt: CompositeProofReceipt, transcript: HostSigned
   return actors
 }
 
-function transcriptToScriptExchanges(transcript: TranscriptStore, vault: DerivedCapabilityVault): ScriptProofExchange[] {
-  return transcript.list().flatMap(record => {
-    if (record.op === 'oob' || record.op === 'browser') return []
-    const request = record.request
-    if (!request) return []
-    const rawBody = transcript.body(record.exchangeId)
-    const body = rawBody !== undefined ? scrubDerivedSecrets(rawBody, vault) : undefined
+interface CapturedRequestBody {
+  method: string
+  origin: string
+  pathAndQuery: string
+  body: string
+}
+
+function correlateCapturedRequestBodies(
+  transcript: TranscriptStore,
+  captured: readonly CapturedRequestBody[],
+): Map<string, string> {
+  const byId = new Map<string, string>()
+  if (captured.length === 0) return byId
+  const remaining = [...captured]
+  for (const rec of transcript.list()) {
+    if (!rec.request || (rec.op !== 'http' && rec.op !== 'http2' && rec.op !== 'race')) continue
+    const method = rec.request.method.toUpperCase()
+    const origin = rec.request.origin
+    const pq = rec.request.pathAndQuery
+    const idx = remaining.findIndex(item => item.method === method && item.origin === origin && item.pathAndQuery === pq)
+    if (idx >= 0) {
+      byId.set(rec.exchangeId, remaining[idx]!.body)
+      remaining.splice(idx, 1)
+    }
+  }
+  return byId
+}
+
+function factLogToScriptExchanges(factLog: HostFactLog, sanitizer: EgressSanitizer): ScriptProofExchange[] {
+  return factLog.orderedExchanges().flatMap(fact => {
+    if (fact.op === 'browser') return []
+    const workerView = factLog.buildWorkerView(fact.exchangeId, sanitizer, 'worker_rpc')
+    const body = workerView?.responseBody ?? undefined
+    const requestBody = fact.rawRequestBody
     return [{
-      exchangeId: record.exchangeId,
-      op: record.op,
-      method: request.method,
-      pathAndQuery: request.pathAndQuery,
-      origin: request.origin,
-      status: record.response?.status ?? null,
-      durationMs: record.durationMs,
-      personaHandle: request.personaHandle ?? null,
-      sessionRole: request.sessionRole ?? null,
-      actorRoleLabel: request.actorRoleLabel ?? null,
+      exchangeId: fact.exchangeId,
+      ...(fact.op ? { op: fact.op } : {}),
+      seq: fact.seq,
+      ...(fact.startedAt !== undefined ? { startedAt: fact.startedAt } : {}),
+      ...(fact.endedAt !== undefined ? { endedAt: fact.endedAt } : {}),
+      method: fact.method,
+      pathAndQuery: fact.pathAndQuery,
+      origin: fact.origin,
+      status: fact.status,
+      durationMs: fact.durationMs,
+      personaHandle: fact.actor,
+      sessionRole: fact.sessionRole ?? null,
+      actorRoleLabel: fact.actorRoleLabel ?? null,
+      ambientAuth: fact.ambientAuth,
+      sessionSameSite: fact.sameSite,
+      ...(fact.consumedCapabilityId !== undefined ? { consumedCapabilityId: fact.consumedCapabilityId } : {}),
+      ...(fact.consumedCapabilities ? { consumedCapabilities: [...fact.consumedCapabilities] } : {}),
+      ...(fact.sessionId !== undefined ? { sessionId: fact.sessionId } : {}),
+      ...(fact.artifact !== undefined ? { artifact: fact.artifact } : {}),
       ...(body !== undefined ? { body } : {}),
-      requestHeaders: request.headers ?? null,
-      responseHeaders: record.response?.headers ?? null,
+      ...(requestBody !== null ? { requestBody } : {}),
+      requestHeaders: { ...fact.requestHeaders },
+      responseHeaders: { ...fact.responseHeaders },
     }]
   })
 }
@@ -218,11 +258,13 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
   const vault = guardVaultAgainstPlaceholderReseal(
     params.capabilityVault ?? params.v8Vault ?? new DerivedCapabilityVault({ runId: safeVaultRunId(params.runId) }),
   )
+  const workerSanitizer = createEgressSanitizer({ capabilityVaults: [vault] })
   const handlesBefore = new Set(vault.list().map(meta => meta.handle))
 
   type AttemptCapture = {
     claims: Record<string, unknown>[]
     transcript: TranscriptStore
+    factLog: HostFactLog
     hostTranscript: HostSignedTranscript | null
     composites: V8CompositeProofBundle[]
     title: string | null
@@ -232,8 +274,37 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
   const attempts = new Map<1 | 2, AttemptCapture>()
 
   const openAttempt = async (input: { attempt: 1 | 2; nonce: string }): Promise<VerifyAttemptSession> => {
+    const capturedReqBodies: CapturedRequestBody[] = []
+    const recordReqBody = (req: BrokerHttpRequest) => {
+      if (typeof req.body === 'string' && req.body.length > 0) {
+        capturedReqBodies.push({
+          method: (req.method || 'GET').toUpperCase(),
+          origin: req.origin,
+          pathAndQuery: req.pathAndQuery,
+          body: req.body,
+        })
+      }
+    }
+    const observingBroker = new Proxy(params.broker, {
+      get(target, prop) {
+        if (prop === 'executeHttp') {
+          return (req: BrokerHttpRequest, grant: Grant, signal: AbortSignal) => {
+            recordReqBody(req)
+            return target.executeHttp(req, grant, signal)
+          }
+        }
+        if (prop === 'executeBatch') {
+          return (reqs: readonly BrokerHttpRequest[], grant: Grant, signal: AbortSignal) => {
+            for (const req of reqs) recordReqBody(req)
+            return target.executeBatch(reqs, grant, signal)
+          }
+        }
+        const value = Reflect.get(target, prop, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
     const server = new CapturingVerifyRpcServer({
-      broker: params.broker,
+      broker: observingBroker,
       grant: params.grant,
       runId: params.runId,
       assignmentId: params.assignmentId,
@@ -283,10 +354,18 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
         const claims = Array.isArray(resObj.claims)
           ? resObj.claims.filter((claim): claim is Record<string, unknown> => Boolean(claim) && typeof claim === 'object' && !Array.isArray(claim))
           : []
+        const hostTranscript = server.buildHostSignedTranscript()
+        const rawRequestBodies = correlateCapturedRequestBodies(server.transcript, capturedReqBodies)
+        const factLog = HostFactLog.fromTranscriptStore(server.transcript, {
+          rawRequestBodies,
+          hostTranscript,
+          sanitizer: workerSanitizer,
+        })
         attempts.set(input.attempt, {
           claims,
           transcript: server.transcript,
-          hostTranscript: server.buildHostSignedTranscript(),
+          factLog,
+          hostTranscript,
           composites: [...server.getVerifiedComposites()],
           title: typeof resObj.title === 'string' && resObj.title.trim() ? resObj.title.trim() : null,
           severity: typeof resObj.severity === 'string' && resObj.severity.trim() ? resObj.severity.trim() : null,
@@ -350,7 +429,7 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
       && confirmedComp1.receipt.hops.length === confirmedComp2.receipt.hops.length
     const chosenCapture = a2 ?? a1!
     const chosenComposite = confirmedComp2
-    const exchanges = transcriptToScriptExchanges(chosenCapture.transcript, vault)
+    const exchanges = factLogToScriptExchanges(chosenCapture.factLog, workerSanitizer)
     const attribution = {
       claimTitle: chosenCapture.title ?? verdict.claimTitle ?? params.title?.trim() ?? `${chosenComposite.receipt.terminalVulnClass} multi-hop chain`,
       severity: chosenCapture.severity,
@@ -412,7 +491,7 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
     ?? null
   if (!verdict.confirmed && rejectedComposite) {
     const capture = a2 ?? a1
-    const exchanges = capture ? transcriptToScriptExchanges(capture.transcript, vault) : []
+    const exchanges = capture ? factLogToScriptExchanges(capture.factLog, workerSanitizer) : []
     return {
       verdict: {
         ...verdict,
@@ -444,7 +523,7 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
   if (!passing) {
     return {
       verdict,
-      exchanges: latestCapture ? transcriptToScriptExchanges(latestCapture.transcript, vault) : [],
+      exchanges: latestCapture ? factLogToScriptExchanges(latestCapture.factLog, workerSanitizer) : [],
       receipt: null,
       compositeReceipt: null,
       vulnClass: null,
@@ -463,7 +542,7 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
     severity: captured.severity,
     description: captured.description,
   }
-  const exchanges = transcriptToScriptExchanges(captured.transcript, vault)
+  const exchanges = factLogToScriptExchanges(captured.factLog, workerSanitizer)
   const origin = exchanges.find(exchange => exchange.sessionRole === 'probe')?.origin
     ?? exchanges[0]?.origin
     ?? params.targetOrigins[0]
@@ -471,6 +550,7 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
   const built = buildAgentScriptReceipt({
     claims: captured.claims,
     exchanges,
+    factLog: captured.factLog,
     origin,
     title: params.title?.trim() || verdict.claimTitle || 'Agent script proof',
   })
@@ -495,7 +575,27 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
       ...attribution,
     }
   }
-  const verification = verifyReceipt(built.receipt, built.transcript)
+  const oracleRes = defaultTerminalOracleRegistry.evaluate(
+    built.factLog,
+    {
+      kind: 'single_hop',
+      receipt: built.receipt,
+      armOverrides: built.armOverrides,
+      ...(built.evidenceRoleOverrides ? { evidenceRoleOverrides: built.evidenceRoleOverrides } : {}),
+    },
+    {
+      strictHostDerivation: true,
+      ...(built.receipt.oracleEvents?.length ? { trustedOracleEvents: built.receipt.oracleEvents } : {}),
+    },
+  )
+  const verification: ReceiptVerification = oracleRes.singleHop ?? {
+    confirmed: oracleRes.confirmed,
+    vulnClass: built.receipt.vulnClass,
+    rule: 'none',
+    reason: oracleRes.reason,
+    observed: built.receipt.claimedDelta,
+    expected: 'host-custody verified single-hop receipt',
+  }
   if (!verification.confirmed) {
     return {
       verdict: {

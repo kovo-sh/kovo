@@ -23,6 +23,7 @@ import {
 } from './oracle-invariants.ts'
 import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, ActorIdentity } from './oracle-invariants.ts'
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
+import { deriveAmbientAuthFromHeaders, type HostFactLog } from './host-fact-log.ts'
 import { compileSafeClaimRegex, MAX_CLAIM_REGEX_HAYSTACK } from './safe-regex.ts'
 export { compileSafeClaimRegex } from './safe-regex.ts'
 
@@ -157,6 +158,7 @@ export class TranscriptStore {
   private readonly secret: Buffer
   private readonly records = new Map<string, VerifyTranscriptRecord>()
   private readonly bodies = new Map<string, string>()
+  private readonly requestBodies = new Map<string, string>()
   private readonly compositeVerifications = new Map<string, TranscriptCompositeVerification>()
   private seq = 0
 
@@ -215,6 +217,7 @@ export class TranscriptStore {
     error?: string
     errorCode?: 'denied' | 'failed' | 'approval_required'
     body?: string
+    rawRequestBody?: string
   }): VerifyTranscriptRecord {
     this.seq += 1
     const exchangeId = `gx-${randomUUID()}`
@@ -235,12 +238,15 @@ export class TranscriptStore {
     if (typeof input.body === 'string' && input.body.length > 0) {
       this.bodies.set(exchangeId, input.body.slice(0, MAX_RECORDED_BODY_BYTES))
     }
-    // Bounded memory: oldest metadata is kept (it is tiny) but old bodies are evicted first.
+    if (typeof input.rawRequestBody === 'string' && input.rawRequestBody.length > 0) {
+      this.requestBodies.set(exchangeId, input.rawRequestBody.slice(0, MAX_RECORDED_BODY_BYTES))
+    }
     if (this.records.size > MAX_TRANSCRIPT_EXCHANGES) {
       const oldest = this.records.keys().next().value
       if (oldest !== undefined) {
         this.records.delete(oldest)
         this.bodies.delete(oldest)
+        this.requestBodies.delete(oldest)
       }
     }
     return record
@@ -254,12 +260,8 @@ export class TranscriptStore {
     return this.bodies.get(exchangeId)
   }
 
-  /** Retroactively scrub all stored bodies (e.g. after sealing a newly discovered derived secret). */
-  rescrubBodies(scrubber: (body: string) => string): void {
-    for (const [id, text] of this.bodies.entries()) {
-      const scrubbed = scrubber(text)
-      if (scrubbed !== text) this.bodies.set(id, scrubbed)
-    }
+  requestBody(exchangeId: string): string | undefined {
+    return this.requestBodies.get(exchangeId)
   }
 
   list(): VerifyTranscriptRecord[] {
@@ -505,6 +507,8 @@ export interface VerifyClaimContext {
   claimedImpact?: ImpactClass
   /** Boundary class declared by the proof title/description; auth claims need a `boundary` claim. */
   claimedBoundary?: BoundaryClass
+  /** Optional immutable HostFactLog; when present, all step facts derive exclusively from it. */
+  factLog?: HostFactLog
 }
 
 export interface VerifyCanaryCheck {
@@ -918,7 +922,13 @@ function transcriptImpactStep(
   id: string,
   arm: ImpactStep['arm'],
   defaultSameSite: string | null,
+  factLog?: HostFactLog,
 ): ImpactStep | null {
+  const hostFact = factLog?.getExchange(id)
+  if (hostFact) {
+    const step = factLog!.toImpactStep(id, { arm })
+    return step ? ({ ...step, seq: hostFact.seq } as ImpactStep & { seq: number }) : null
+  }
   const record = store.get(id)
   if (!record) return null
   const body = store.body(id)
@@ -932,12 +942,16 @@ function transcriptImpactStep(
   const tenant = signedLabel !== null
     ? parseRoleLabel(signedLabel).tenant ?? parseRoleLabel(handle).tenant ?? null
     : parseRoleLabel(handle).tenant ?? claim.actorTenants?.[handle ?? ''] ?? null
+  const hostAuth = deriveAmbientAuthFromHeaders(record.request?.headers)
+  const hostSameSite = sameSiteFromRecord(record) ?? defaultSameSite
+  const hostRawReq = store.requestBody(id)
+  const requestJson = hostRawReq !== undefined ? (parseJsonBody(hostRawReq) ?? hostRawReq) : claim.requestBody
   const actor: ActorIdentity = {
     handle,
     role,
     tenant,
-    auth: (claim.ambient?.kind ?? 'unknown') as AmbientAuth,
-    sameSite: claim.ambient?.sameSite ?? defaultSameSite,
+    auth: hostAuth !== 'unknown' ? hostAuth : ((claim.ambient?.kind ?? 'unknown') as AmbientAuth),
+    sameSite: hostSameSite ?? claim.ambient?.sameSite ?? null,
   }
   return {
     id,
@@ -949,7 +963,7 @@ function transcriptImpactStep(
     actor,
     json,
     body: body ?? '',
-    requestJson: claim.requestBody,
+    requestJson,
     requestHeaders: record.request?.headers ?? null,
     responseHeaders: record.response?.headers ?? null,
     ...(record.seq !== undefined ? { seq: record.seq } : {}),
@@ -961,7 +975,13 @@ function transcriptBoundaryStep(
   claim: Extract<VerifyClaim, { kind: 'boundary' | 'impact' | 'mfa' }>,
   id: string,
   arm: ImpactStep['arm'],
+  factLog?: HostFactLog,
 ): ImpactStep | null {
+  const hostFact = factLog?.getExchange(id)
+  if (hostFact) {
+    const step = factLog!.toImpactStep(id, { arm })
+    return step ? ({ ...step, seq: hostFact.seq } as ImpactStep & { seq: number }) : null
+  }
   const record = store.get(id)
   if (!record) return null
   const body = store.body(id)
@@ -984,7 +1004,7 @@ function transcriptBoundaryStep(
     route: (record.request?.pathAndQuery ?? '/').split('?')[0].replace(/\/+$/, '').toLowerCase() || '/',
     pathAndQuery: record.request?.pathAndQuery ?? '/',
     status: recordStatus(record),
-    actor: { handle, role, tenant, auth: 'unknown', sameSite: null },
+    actor: { handle, role, tenant, auth: deriveAmbientAuthFromHeaders(record.request?.headers), sameSite: sameSiteFromRecord(record) },
     json,
     body: body ?? '',
     requestHeaders: record.request?.headers ?? null,
@@ -1054,8 +1074,8 @@ function evaluateBoundaryClaim(store: TranscriptStore, claim: Extract<VerifyClai
   const okId = (id: string) => (!context.allowedExchangeIds || context.allowedExchangeIds.has(id)) && Boolean(store.get(id))
   if (!okId(claim.controlExchangeId)) return { claim, passed: false, detail: `Unknown control exchange ${claim.controlExchangeId} for a boundary claim.` }
   if (!okId(claim.probeExchangeId)) return { claim, passed: false, detail: `Unknown probe exchange ${claim.probeExchangeId} for a boundary claim.` }
-  const control = transcriptBoundaryStep(store, claim, claim.controlExchangeId, 'control')
-  const probe = transcriptBoundaryStep(store, claim, claim.probeExchangeId, 'probe')
+  const control = transcriptBoundaryStep(store, claim, claim.controlExchangeId, 'control', context.factLog)
+  const probe = transcriptBoundaryStep(store, claim, claim.probeExchangeId, 'probe', context.factLog)
   if (!control || !probe) return { claim, passed: false, detail: 'Boundary claim references an unreadable exchange.' }
   const assessment = assessBoundary({
     boundaryClass: claim.boundaryClass,
@@ -1127,7 +1147,7 @@ function evaluateImpactClaim(
   const steps: ImpactStep[] = []
   const add = (id: string | undefined, arm: ImpactStep['arm']) => {
     if (!id) return
-    const step = transcriptImpactStep(store, claim, id, arm, defaultSameSite)
+    const step = transcriptImpactStep(store, claim, id, arm, defaultSameSite, context.factLog)
     if (step) steps.push(step)
   }
   add(claim.beforeExchangeId, 'control')
@@ -1139,10 +1159,10 @@ function evaluateImpactClaim(
   const assessment = assessImpactEvidence({
     impactClass: claim.impactClass,
     steps,
-    requiredRole: claim.requiredRole ?? null,
-    resourceTenant: claim.resourceTenant ?? null,
+    requiredRole: context.factLog ? null : (claim.requiredRole ?? null),
+    resourceTenant: context.factLog ? null : (claim.resourceTenant ?? null),
     expectControlDenied: claim.expectControlDenied,
-    oracleEvents: claim.oracleEvents,
+    oracleEvents: context.factLog ? [] : claim.oracleEvents,
     targetOrigin: probeRecord?.request?.origin ?? null,
   })
   if (assessment.required && assessment.satisfied && claim.impactClass !== 'injection' && claim.impactClass !== 'markup' && claim.impactClass !== 'csrf') {
