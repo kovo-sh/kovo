@@ -156,6 +156,25 @@ function transcriptToScriptExchanges(transcript: TranscriptStore, vault: Derived
   })
 }
 
+function normalizeCompositeForBundle(
+  receipt: CompositeProofReceipt,
+  verification: CompositeReceiptVerification,
+): CompositeProofReceipt {
+  const effSummary = receipt.terminalImpact.summary && receipt.terminalImpact.summary.length > 0
+    ? receipt.terminalImpact.summary
+    : receipt.terminalImpact.claimedImpact
+  const terminalImpact = effSummary
+    ? { ...receipt.terminalImpact, summary: effSummary, claimedImpact: receipt.terminalImpact.claimedImpact || effSummary }
+    : receipt.terminalImpact
+  const termEndpoint = verification.terminalEndpoint?.trim() || ''
+  const hops = termEndpoint
+    ? receipt.hops.map(h => (h.hopId === terminalImpact.terminalHopId && !h.target.pathAndQuery
+        ? { ...h, target: { ...h.target, pathAndQuery: termEndpoint } }
+        : h))
+    : receipt.hops
+  return { ...receipt, hops, terminalImpact }
+}
+
 /** Subclass capturing host-verified CompositeProofReceipt bundles without instance monkey-patching. */
 class CapturingVerifyRpcServer extends VerifyRpcServer {
   private readonly verifiedComposites: V8CompositeProofBundle[] = []
@@ -168,10 +187,13 @@ class CapturingVerifyRpcServer extends VerifyRpcServer {
     const parsed = compositeProofReceiptSchema.safeParse(rawReceipt)
     if (parsed.success) {
       const hostTranscript = this.buildHostSignedTranscript()
+      const normalized = verification.confirmed
+        ? normalizeCompositeForBundle(parsed.data, verification)
+        : parsed.data
       this.verifiedComposites.push({
-        receipt: parsed.data,
+        receipt: normalized,
         verification,
-        hopActors: extractHopActors(parsed.data, hostTranscript),
+        hopActors: extractHopActors(normalized, hostTranscript),
       })
     }
     return verification
@@ -588,7 +610,10 @@ export async function retestPersistedAgentScript(
       scriptSha256: envelope.scriptSha256,
       transcriptDigests: result.transcriptDigests,
       receipt: result.receipt?.verification ?? result.compositeReceipt?.verification ?? null,
-      ...(result.compositeReceipt ? { compositeReceipt: result.compositeReceipt.receipt } : {}),
+      ...(result.compositeReceipt ? {
+        compositeReceipt: result.compositeReceipt.receipt,
+        compositeVerification: result.compositeReceipt.verification,
+      } : {}),
     },
     evidenceSha256: createHash('sha256').update(JSON.stringify({
       script: envelope.scriptSha256,

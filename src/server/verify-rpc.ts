@@ -2013,7 +2013,10 @@ export class VerifyRpcServer {
     const termHop = hops.find(h => asRecord(h)?.hopId === terminalHopId) ?? hops[hops.length - 1]
     const termHopObj = asRecord(termHop)
     const termTarget = asRecord(termHopObj?.target)
-    const route = typeof termTarget?.pathAndQuery === 'string' ? termTarget.pathAndQuery : null
+    const rawRoute = typeof termTarget?.pathAndQuery === 'string' && termTarget.pathAndQuery.trim()
+      ? termTarget.pathAndQuery.trim()
+      : null
+    const route = rawRoute ?? verdict.terminalEndpoint ?? null
     const strIds = (v: unknown): string[] => Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.length > 0) : []
     const exchangeIds = [...new Set([
       ...hops.flatMap(h => strIds(asRecord(h)?.exchangeIds)),
@@ -2064,6 +2067,7 @@ export class VerifyRpcServer {
     }
     return this.scrubRecord({
       ...verdict,
+      ...(route && !verdict.terminalEndpoint ? { terminalEndpoint: route } : {}),
       ok: verdict.confirmed,
       verified: verdict.confirmed,
       verificationId: recorded.verificationId,

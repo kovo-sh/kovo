@@ -592,8 +592,40 @@ function serializeCompositeProofReceiptRow(
   compositeVerification: CompositeReceiptVerification
   hopActors: Record<string, string | null>
 } {
-  const { receipt: comp, verification: compVer, hopActors } = bundle
-  const terminalHop = comp.hops.find(h => h.hopId === comp.terminalImpact.terminalHopId) ?? comp.hops[comp.hops.length - 1]!
+  const { receipt: rawComp, verification: rawVer, hopActors } = bundle
+  const terminalHop = rawComp.hops.find(h => h.hopId === rawComp.terminalImpact.terminalHopId) ?? rawComp.hops[rawComp.hops.length - 1]!
+  const terminalEndpoint = rawVer.terminalEndpoint ?? terminalHop.target.pathAndQuery ?? null
+  const summaryText = rawComp.terminalImpact.summary && rawComp.terminalImpact.summary.length > 0
+    ? rawComp.terminalImpact.summary
+    : rawComp.terminalImpact.claimedImpact
+  const comp: CompositeProofReceipt = {
+    ...rawComp,
+    hops: terminalEndpoint && !terminalHop.target.pathAndQuery
+      ? rawComp.hops.map(h => (h.hopId === terminalHop.hopId ? { ...h, target: { ...h.target, pathAndQuery: terminalEndpoint } } : h))
+      : rawComp.hops,
+    terminalImpact: {
+      ...rawComp.terminalImpact,
+      claimedImpact: rawComp.terminalImpact.claimedImpact || summaryText,
+      ...(summaryText ? { summary: summaryText } : {}),
+    },
+  }
+  const compVer: CompositeReceiptVerification = {
+    ...rawVer,
+    confirmed: Boolean(rawVer.confirmed),
+    chainId: rawVer.chainId || comp.chainId,
+    terminalVulnClass: rawVer.terminalVulnClass || comp.terminalVulnClass,
+    replayMode: rawVer.replayMode || comp.replayMode,
+    modeBVerified: Boolean(rawVer.modeBVerified),
+    hopCount: typeof rawVer.hopCount === 'number' && rawVer.hopCount > 0 ? rawVer.hopCount : comp.hops.length,
+    verifiedEdges: Array.isArray(rawVer.verifiedEdges) ? rawVer.verifiedEdges : [],
+    reason: rawVer.reason || `CompositeProofReceipt confirmed (${comp.hops.length} hop(s), mode=${comp.replayMode}).`,
+    ...(rawVer.terminalOracleFamily !== undefined
+      ? { terminalOracleFamily: rawVer.terminalOracleFamily }
+      : comp.terminalImpact.oracleFamily
+        ? { terminalOracleFamily: comp.terminalImpact.oracleFamily }
+        : {}),
+    ...(terminalEndpoint ? { terminalEndpoint } : {}),
+  }
   const allExchangeIds = [...new Set([
     ...comp.hops.flatMap(h => h.exchangeIds),
     ...comp.terminalImpact.preChainControlExchangeIds,
@@ -607,7 +639,7 @@ function serializeCompositeProofReceiptRow(
           target: {
             origin: terminalHop.target.origin,
             ...(terminalHop.target.method ? { method: terminalHop.target.method } : {}),
-            ...(terminalHop.target.pathAndQuery ? { pathAndQuery: terminalHop.target.pathAndQuery } : {}),
+            ...(terminalEndpoint ? { pathAndQuery: terminalEndpoint } : {}),
             ...(terminalHop.target.param ? { param: terminalHop.target.param } : {}),
           },
           exchangeIds: allExchangeIds,
@@ -1660,6 +1692,8 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
           compositeReceipt: cleanCompositeBundle.receipt,
           compositeVerification: cleanCompositeBundle.verification,
           hopActors: cleanCompositeBundle.hopActors,
+          ...(cleanCompositeBundle.verification.terminalOracleFamily ? { terminalOracleFamily: cleanCompositeBundle.verification.terminalOracleFamily } : {}),
+          ...(cleanCompositeBundle.verification.terminalEndpoint ? { terminalEndpoint: cleanCompositeBundle.verification.terminalEndpoint } : {}),
         },
       } : {}),
       scopeRevision: run.scopeRevision,
@@ -1672,7 +1706,12 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       artifactId: artifact.id,
       scriptSha256,
       receiptRule: cleanCompositeBundle ? `composite:${cleanCompositeBundle.receipt.replayMode}` : (verification?.rule ?? null),
-      ...(cleanCompositeBundle ? { chainId: cleanCompositeBundle.receipt.chainId, hopCount: cleanCompositeBundle.receipt.hops.length } : {}),
+      ...(cleanCompositeBundle ? {
+        chainId: cleanCompositeBundle.receipt.chainId,
+        hopCount: cleanCompositeBundle.receipt.hops.length,
+        ...(cleanCompositeBundle.verification.terminalOracleFamily ? { terminalOracleFamily: cleanCompositeBundle.verification.terminalOracleFamily } : {}),
+        ...(cleanCompositeBundle.verification.terminalEndpoint ? { terminalEndpoint: cleanCompositeBundle.verification.terminalEndpoint } : {}),
+      } : {}),
       transcriptDigests: proof.transcriptDigests,
     })
     return {
@@ -1807,8 +1846,16 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       sourceOrigins: specRow.sourceOrigins,
       secrets: params.currentSecrets(),
     })
-    const receiptRow = confirmed && result.compositeReceipt?.verification.confirmed
-      ? serializeCompositeProofReceiptRow(result.compositeReceipt, result.receipt)
+    const reverifySecrets: NamedSecret[] = [...params.currentSecrets(), ...vaultScrubDescriptors(this.capabilityVaultFor(run.id))]
+    const cleanReverifyComposite: V8CompositeProofBundle | null = confirmed && result.compositeReceipt?.verification.confirmed
+      ? {
+          receipt: redactJsonValue(result.compositeReceipt.receipt, reverifySecrets),
+          verification: redactJsonValue(result.compositeReceipt.verification, reverifySecrets),
+          hopActors: result.compositeReceipt.hopActors,
+        }
+      : null
+    const receiptRow = cleanReverifyComposite
+      ? serializeCompositeProofReceiptRow(cleanReverifyComposite, result.receipt)
       : confirmed && result.receipt
         ? serializeProofReceiptRow(result.receipt)
         : confirmed
@@ -1823,17 +1870,28 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     })
 
     if (findingRow) {
-      const nextFinding: Finding = {
+      const nextFinding: Finding & { evidence?: Record<string, unknown> } = {
         ...findingRow.finding,
         status,
         verificationTier,
-        reason: result.verdict.detail || result.verdict.reason,
+        reason: cleanReverifyComposite?.verification.reason ?? (result.verdict.detail || result.verdict.reason),
         confidence: confirmed ? 'high' : 'low',
         verification: confirmed
-          ? `ProofReceipt · ${result.receipt?.verification.rule ?? 'script'} rule · ${result.receipt?.verification.reason ?? result.verdict.reason}`
+          ? cleanReverifyComposite
+            ? `ProofReceipt (Composite) ${cleanReverifyComposite.receipt.chainId} · ${cleanReverifyComposite.verification.hopCount} hops · ${cleanReverifyComposite.receipt.replayMode} · ${cleanReverifyComposite.verification.reason}`
+            : `ProofReceipt · ${result.receipt?.verification.rule ?? 'script'} rule · ${result.receipt?.verification.reason ?? result.verdict.reason}`
           : `Agent script proof re-verification returned ${status} (${result.verdict.reason}).`,
         exchangeIds: result.exchanges.map(exchange => exchange.exchangeId),
         replaySpecId: updatedSpec.id,
+        ...(cleanReverifyComposite ? {
+          evidence: {
+            compositeReceipt: cleanReverifyComposite.receipt,
+            compositeVerification: cleanReverifyComposite.verification,
+            hopActors: cleanReverifyComposite.hopActors,
+            ...(cleanReverifyComposite.verification.terminalOracleFamily ? { terminalOracleFamily: cleanReverifyComposite.verification.terminalOracleFamily } : {}),
+            ...(cleanReverifyComposite.verification.terminalEndpoint ? { terminalEndpoint: cleanReverifyComposite.verification.terminalEndpoint } : {}),
+          },
+        } : {}),
         scopeRevision: run.scopeRevision,
       }
       if (confirmed) {
