@@ -69,13 +69,15 @@ export function useNav(): NavApi {
   return v
 }
 
-export function NavProvider({ runId, view, sel, go, switchRun, children }: {
+export function NavProvider({ runId, view, sel, go, switchRun, hasPendingApprovals = false, children }: {
   runId: string
   view: ViewId
   sel: Sel | null
   /** Write view + selection to the URL. `push` adds a history entry (view switches). */
   go: (view: ViewId, sel: Sel | null, push: boolean) => void
   switchRun: (runId: string, view?: ViewId) => void
+  /** When false on `report`, default the right pane collapsed so the document has full width. */
+  hasPendingApprovals?: boolean
   children: ReactNode
 }) {
   const remembered = useRef(new Map<ViewId, Sel | null>())
@@ -84,31 +86,52 @@ export function NavProvider({ runId, view, sel, go, switchRun, children }: {
   const [chat, setChat] = useState(false)
   const [chatContext, setChatContext] = useState<ChatContext | null>(null)
   const [paneAnim, setPaneAnim] = useState<'up' | 'left'>('up')
-  const [paneCollapsed, setPaneCollapsed] = useState(false)
+  const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null)
+  const [reportOverride, setReportOverride] = useState<boolean | null>(null)
   const cur = useRef({ view, sel })
   cur.current = { view, sel }
 
   useEffect(() => {
     try {
-      if (localStorage.getItem(PANE_COLLAPSED_KEY) === '1') setPaneCollapsed(true)
+      const saved = localStorage.getItem(PANE_COLLAPSED_KEY)
+      if (saved === '1') setUserCollapsed(true)
+      else if (saved === '0') setUserCollapsed(false)
     } catch { /* ignore */ }
   }, [])
 
-  const writePaneCollapsed = useCallback((next: boolean) => {
-    setPaneCollapsed(next)
+  // Reset the temporary report override when switching views.
+  useEffect(() => {
+    setReportOverride(null)
+  }, [view])
+
+  const reportAutoCollapse = view === 'report' && !hasPendingApprovals && !sel && !chat
+  const paneCollapsed = reportAutoCollapse
+    ? (reportOverride ?? true)
+    : (userCollapsed ?? false)
+
+  const writeUserCollapsed = useCallback((next: boolean) => {
+    setUserCollapsed(next)
     try { localStorage.setItem(PANE_COLLAPSED_KEY, next ? '1' : '0') } catch { /* ignore */ }
   }, [])
 
   const togglePane = useCallback(() => {
-    setPaneCollapsed(prev => {
-      const next = !prev
-      try { localStorage.setItem(PANE_COLLAPSED_KEY, next ? '1' : '0') } catch { /* ignore */ }
-      return next
-    })
-  }, [])
+    const next = !paneCollapsed
+    if (reportAutoCollapse) {
+      setReportOverride(next)
+    } else {
+      writeUserCollapsed(next)
+    }
+  }, [paneCollapsed, reportAutoCollapse, writeUserCollapsed])
 
-  const expandPane = useCallback(() => writePaneCollapsed(false), [writePaneCollapsed])
-  const collapsePane = useCallback(() => writePaneCollapsed(true), [writePaneCollapsed])
+  const expandPane = useCallback(() => {
+    setReportOverride(false)
+    if (userCollapsed) writeUserCollapsed(false)
+  }, [userCollapsed, writeUserCollapsed])
+
+  const collapsePane = useCallback(() => {
+    setReportOverride(true)
+    writeUserCollapsed(true)
+  }, [writeUserCollapsed])
 
   const setView = useCallback((v: ViewId, opts?: { sel?: Sel | null }) => {
     const next = opts && 'sel' in opts ? opts.sel ?? null : remembered.current.get(v) ?? null

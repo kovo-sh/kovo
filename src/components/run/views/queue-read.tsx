@@ -5,8 +5,9 @@ import { useState } from 'react'
 import type { ReactNode } from 'react'
 
 import { approvalPolicyMeta, capabilityTierMeta } from '../../run-state.ts'
-import { useFullExchange, useRun, useRunModel } from '../data.tsx'
-import { LinkRow, Section } from '../display.tsx'
+import { formatExchangeAsCurl } from '../../curl-parser.ts'
+import { loadExchange, useFullExchange, useRun, useRunModel } from '../data.tsx'
+import { Disclosure, LinkRow, Section } from '../display.tsx'
 import { cap, capF, fmtDate, fmtN, fmtRel, fmtTime, fmtUsd, host, plural, prettyBody, words } from '../format.ts'
 import { CovSwatch, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
@@ -14,6 +15,7 @@ import type { IconName } from '../icons.tsx'
 import { CHECK_HEADERS, COV_L, covCat, normFStatus, PHASE_LABEL, prettyCat, SEV_LABEL, stLabel } from '../meta.ts'
 import type { Approval, Exchange, FindingRow, QueueItem, RunModel } from '../model.ts'
 import { useLinks } from '../nav.tsx'
+import { useToast } from '../toast.tsx'
 
 type FindingItem = Extract<QueueItem, { kind: 'finding' }>
 type ApprovalItem = Extract<QueueItem, { kind: 'approval' }>
@@ -176,6 +178,46 @@ function evidenceFor(model: RunModel, it: FindingItem) {
 
 const obsText = (v: unknown) => v == null ? null : typeof v === 'string' ? v : JSON.stringify(v)
 
+/** Inline Copy-as-cURL button sourced from a finding's primary cited exchange. */
+export function CopyCurlButton({ exchangeId }: { exchangeId: string | undefined }) {
+  const { detail } = useRun()
+  const model = useRunModel()
+  const toast = useToast()
+  const [busy, setBusy] = useState(false)
+  if (!exchangeId) return null
+  const summary = model.exchangeById.get(exchangeId)
+  const copy = async () => {
+    setBusy(true)
+    try {
+      const full = await loadExchange(detail.run.id, exchangeId).catch(() => null)
+      const ex = full ?? summary
+      if (!ex) {
+        toast.show('Exchange details unavailable', { tone: 'error' })
+        return
+      }
+      const cmd = formatExchangeAsCurl({
+        method: ex.method,
+        origin: ex.origin,
+        pathAndQuery: ex.pathAndQuery,
+        reqHeaders: full?.reqHeaders,
+        personaHandle: ex.personaHandle,
+      })
+      await navigator.clipboard?.writeText(cmd)
+      toast.show('Copied as cURL', {
+        icon: 'check',
+        sub: full ? `${ex.method} ${host(ex.origin)}${ex.pathAndQuery}` : 'Request URL copied',
+      })
+    } catch {
+      toast.show('Could not copy to clipboard', { tone: 'error' })
+    } finally {
+      setBusy(false)
+    }
+  }
+  return <button type="button" className="btn" disabled={busy} onClick={() => void copy()} title="Copy primary request as a sanitized cURL command">
+    <Icon name="copy" />{busy ? 'Copying…' : 'Copy as cURL'}
+  </button>
+}
+
 export function ReadFinding({ it }: { it: FindingItem }) {
   const model = useRunModel()
   const F = it.finding
@@ -185,6 +227,8 @@ export function ReadFinding({ it }: { it: FindingItem }) {
   const ev = evidenceFor(model, it)
   const ws = [...new Set(it.list.flatMap(f => model.findingWorkers.get(f.id) ?? []))]
   const cat = covCat(F.category)
+  const codeLocs = F.codeLocations ?? []
+  const primaryExchangeId = ev.ids[0]
   let groups: [string, string[]][] = []
   if (it.bundle) {
     const g = new Map<string, string[]>()
@@ -195,25 +239,23 @@ export function ReadFinding({ it }: { it: FindingItem }) {
     groups = [...g]
   }
   const obs = obsText(F.check?.observed)
+  const techCount = [ev.ids.length ? plural(ev.ids.length, 'exchange') : '', ws.length ? plural(ws.length, 'worker') : ''].filter(Boolean).join(' · ')
   return <>
     <div className="kicker">
       <span className="sevlab"><SevGlyph sev={it.sev} />{SEV_LABEL[it.sev]}</span><span>·</span><VState status={it.status} /><span>·</span>
       <span>{chain ? 'Multi-step chain' : 'Baseline check'}</span>
       {F.cwe && <><span>·</span><span className="mono">{F.cwe}</span></>}
-      {F.confidence && <><span>·</span><span>{cap(F.confidence)} confidence</span></>}
     </div>
     <h2 className="rtitle">{F.title}</h2>
     <div className="rorigins">
       {it.origins.slice(0, 6).map(o => <span key={o} className="tag mono" style={{ fontSize: 11 }}>{host(o)}</span>)}
       {it.origins.length > 6 && <span className="tag">+{it.origins.length - 6} more</span>}
     </div>
-    {(F.impact || F.reason || it.bundle) && <Section title="Narrative">
-      {F.impact && <p className="lead">{F.impact}</p>}
-      {F.reason && <p>{F.reason}</p>}
-      {it.bundle && <p>The same baseline result was recorded on {it.origins.length} origins. A decision here applies to all of them.</p>}
-    </Section>}
-    {(F.check || F.verification) && <Section title="Check" right={chain ? 'Replay verdict' : 'Expected vs observed'}>
-      {F.check && <div className="cmp">
+
+    {(F.reason || F.check || it.bundle) && <Section title="What happened">
+      {F.reason && <p className="lead">{F.reason}</p>}
+      {it.bundle && <p className="qf-note">Same baseline result across {it.origins.length} origins — one decision applies to all of them.</p>}
+      {F.check && (F.check.expected || obs !== null) && <div className="cmp">
         <div><span>Expected</span><span>{F.check.expected || '—'}</span></div>
         <div><span>Observed</span><span className={'obs' + (obs != null ? ' mono' : '')}>{obs ?? <span style={{ color: 'var(--fg-3)' }}>Not recorded</span>}</span></div>
       </div>}
@@ -223,24 +265,48 @@ export function ReadFinding({ it }: { it: FindingItem }) {
           <span className="num">{hs.length}</span>
         </div>)}
       </div>}
-      {F.verification && <p>{F.verification}</p>}
     </Section>}
-    <Section title="Evidence" right={<span className="num">{plural(ev.ids.length, 'exchange')}</span>}>
-      {ev.inferred && ev.ids.length > 0 && <p className="qf-note">Not cited directly. Baseline responses for {ev.ids.length > 1 ? 'these origins' : 'this origin'}{hl.length ? <>, <span className="mono">{hl[0]}</span> highlighted</> : null}.</p>}
-      {ev.ids.length
-        ? ev.ids.slice(0, 8).map(id => <ExchangeRow key={id} id={id} summary={model.exchangeById.get(id)} hl={hl} />)
-        : <p>No exchanges recorded for {it.origins.length > 1 ? 'these origins' : 'this origin'}.</p>}
-      {ev.ids.length > 8 && <p className="qf-note">+{ev.ids.length - 8} more cited exchanges.</p>}
-    </Section>
-    {(F.remediation || F.recheck) && <Section title="Remediation">
+
+    {F.impact && <Section title="Why it matters">
+      <p>{F.impact}</p>
+    </Section>}
+
+    {(F.remediation || F.recheck || codeLocs.length > 0 || primaryExchangeId) && <Section title="How to fix & verify">
       {F.remediation && <p>{F.remediation}</p>}
       {F.recheck && <p><b className="ctx-strong">Recheck.</b> {F.recheck}</p>}
+      {codeLocs.length > 0 && <div className="floc-list">
+        {codeLocs.map((c, i) => <div key={i} className="floc">
+          <div className="floc-h mono"><Icon name="node" /><span className="p">{c.repo}/{c.file}</span><span className="r num">L{c.startLine}{c.endLine !== c.startLine ? '–' + c.endLine : ''}</span></div>
+          {c.label && <div className="floc-l">{c.label}</div>}
+          {c.snippet && <pre className="block mono">{c.snippet}</pre>}
+        </div>)}
+      </div>}
+      {primaryExchangeId && <div className="fverify">
+        <CopyCurlButton exchangeId={primaryExchangeId} />
+      </div>}
     </Section>}
-    <Section title="Coordinator context" right="What the run knows">
-      <CoordinatorContext origins={it.origins} findings={it.list} category={cat} />
-    </Section>
-    <FoundBy workers={ws} />
-    {it.origins.length === 1 && cat && <OnSurface origin={it.origins[0]} category={cat} />}
+
+    <Disclosure title="Technical details & raw evidence" right={techCount || undefined}>
+      {F.verification && <Section title="Verification"><p>{F.verification}</p></Section>}
+      {F.counterevidence && <Section title="Counterevidence"><p>{F.counterevidence}</p></Section>}
+      {(F.confidenceRationale || F.severityChangeConditions || F.runtimeProofGap) && <Section title="Confidence & proof">
+        {F.confidenceRationale && <p>{F.confidenceRationale}</p>}
+        {F.severityChangeConditions && <p><b className="ctx-strong">Severity would change if</b> {F.severityChangeConditions}</p>}
+        {F.runtimeProofGap && <p><b className="ctx-strong">Runtime proof gap.</b> {F.runtimeProofGap}</p>}
+      </Section>}
+      <Section title="Coordinator context" right="What the run knows">
+        <CoordinatorContext origins={it.origins} findings={it.list} category={cat} />
+      </Section>
+      <FoundBy workers={ws} />
+      {it.origins.length === 1 && cat && <OnSurface origin={it.origins[0]} category={cat} />}
+      <Section title="Exchanges" right={<span className="num">{plural(ev.ids.length, 'exchange')}</span>}>
+        {ev.inferred && ev.ids.length > 0 && <p className="qf-note">Baseline responses for {ev.ids.length > 1 ? 'these origins' : 'this origin'}{hl.length ? <>, <span className="mono">{hl[0]}</span> highlighted</> : null}.</p>}
+        {ev.ids.length
+          ? ev.ids.slice(0, 8).map(id => <ExchangeRow key={id} id={id} summary={model.exchangeById.get(id)} hl={hl} />)
+          : <p>No exchanges recorded for {it.origins.length > 1 ? 'these origins' : 'this origin'}.</p>}
+        {ev.ids.length > 8 && <p className="qf-note">+{ev.ids.length - 8} more cited exchanges.</p>}
+      </Section>
+    </Disclosure>
   </>
 }
 

@@ -113,6 +113,24 @@ export function Section({ title, right, children }: { title: ReactNode; right?: 
   return <div className="sec"><h4>{title}{right != null && <>{' '}<span className="r">{right}</span></>}</h4>{children}</div>
 }
 
+/** Collapsible progressive-disclosure block (`.disc`). */
+export function Disclosure({ title, right, defaultOpen = false, children }: {
+  title: ReactNode
+  right?: ReactNode
+  defaultOpen?: boolean
+  children: ReactNode
+}) {
+  const [open, setOpen] = useState(defaultOpen)
+  return <div className={'disc' + (open ? ' open' : '')}>
+    <button type="button" className="disc-h" aria-expanded={open} onClick={() => setOpen(o => !o)}>
+      <Icon name="chev" />
+      <span>{title}</span>
+      {right != null && <span className="r">{right}</span>}
+    </button>
+    {open && <div className="disc-b">{children}</div>}
+  </div>
+}
+
 /** Key/value property grid for inspectors (F's `.props`). */
 export function Props({ rows }: { rows: [ReactNode, ReactNode, (() => void)?][] }) {
   return <div className="props">

@@ -102,7 +102,7 @@ function runDecision(deps: ActDeps, key: string, act: DecisionAct, opts: { simil
     q.decide(key, act, {
       command,
       message: decisionMessage(it, act, opts.similar),
-      sub: command ? 'Sends when this closes' : it.kind === 'finding' || it.kind === 'follow' ? 'Saved in this browser only · ' + it.title : it.title,
+      sub: command ? 'Sends when this closes' : it.kind === 'finding' || it.kind === 'follow' ? 'Saved locally in this browser · ' + it.title : it.title,
       onUndo: () => {
         setMotion({ enter: key })
         setTimeout(() => { if (motion.enter === key) setMotion({ enter: null }) }, 600)
@@ -305,7 +305,7 @@ function QRow({ it, sec, cur, motion: m, onSelect, onAct, onAsk }: {
     <span className="qt"><QTitle it={it} /></span>
     <span className="meta">{meta.map((x, i) => <span key={i} className="qm">{i > 0 && <span className="qdot">·</span>}{x}</span>)}</span>
     {sec !== 'done' && <span className="acts">
-      {acts.map(([a, l, k, p]) => <button key={a} type="button" className={'qbtn' + (p ? ' pri' : '')} title={`${l} (${k.toUpperCase()})${localOnly(it, model) ? ' · local triage, saved in this browser only' : ''}`} onClick={e => { e.stopPropagation(); onAct(a) }}>
+      {acts.map(([a, l, k, p]) => <button key={a} type="button" className={'qbtn' + (p ? ' pri' : '')} title={`${l} (${k.toUpperCase()})${localOnly(it, model) ? ' · Saved locally in this browser' : ''}`} onClick={e => { e.stopPropagation(); onAct(a) }}>
         {l}<Kbd>{k.toUpperCase()}</Kbd>
       </button>)}
       <button type="button" className="qbtn icon" title="Ask coordinator (C)" aria-label="Ask coordinator" onClick={e => { e.stopPropagation(); onAsk() }}><Icon name="chat" /></button>
@@ -379,7 +379,7 @@ function QueueInspector({ sel }: InspectorProps) {
   let banner: ReactNode = null
   if (dec) {
     banner = <div className="banner"><Icon name={ACTIONS[dec.act].icon} />
-      <span>{ACTIONS[dec.act].label} by you · {fmtTimeS(dec.at)}{dec.state === 'pending' ? ' · sending when the undo window closes' : dec.state === 'sent' ? ' · sent to Kovo Hunter' : dec.state === 'local' ? ' · saved in this browser only, not sent to Kovo Hunter' : ''}</span>
+      <span>{ACTIONS[dec.act].label} by you · {fmtTimeS(dec.at)}{dec.state === 'pending' ? ' · sending when the undo window closes' : dec.state === 'sent' ? ' · sent to Kovo Hunter' : dec.state === 'local' ? ' · Saved locally in this browser' : ''}</span>
       {dec.state !== 'sent' && <button type="button" className="btn ghost" onClick={() => q.reopen(it.key)}><Icon name="undo" />Move back</button>}
     </div>
   } else if (sec === 'done' && it.kind === 'finding') {
@@ -404,7 +404,7 @@ function QueueInspector({ sel }: InspectorProps) {
       </div></PaneBody>
       <div className={'abar' + (stamped ? ' stamped' : '')}>
         {acts.map(([a, l, k, p]) => <button key={a} type="button" className={'btn' + (p ? ' ink' : '')} onClick={() => decide(it.key, a)}
-          title={localOnly(it, model) ? 'Local triage: saved in this browser only, not sent to Kovo Hunter' : undefined}>
+          title={localOnly(it, model) ? 'Saved locally in this browser' : undefined}>
           <Icon name={icon(a)} />{l}<Kbd>{k.toUpperCase()}</Kbd>
         </button>)}
         {it.kind === 'approval' && sec !== 'done' && <button type="button" className="btn ghost" title="Approve this request and future requests to the same endpoint pattern"

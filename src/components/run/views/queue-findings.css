@@ -44,6 +44,7 @@
 .rw .frow{cursor:pointer}
 .rw .frow>.tag{flex:none}
 .rw .frow .fdec{flex:none;white-space:nowrap}
+.rw .frow .c-cat{flex:none;max-width:155px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;color:var(--fg-3)}
 .rw .ghead .gtally{display:inline-flex;gap:5px;align-items:center}
 .rw .fgrp{position:relative}
 .rw .fvirt .ghead{position:absolute}
@@ -57,8 +58,9 @@
 .rw .fretest b{font-weight:500;color:var(--fg)}
 .rw .fretest .muted{color:var(--fg-3)}
 .rw .fretest+.fretest{border-top:1px dashed var(--line)}
-.rw .fverify{display:flex;align-items:center;gap:10px;margin:6px 0 12px}
+.rw .fverify{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0 10px}
 .rw .fverify .muted{color:var(--fg-3);font-size:12px}
+.rw .floc-list{margin-top:6px}
 .rw .floc{margin-bottom:10px}
 .rw .floc-h{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--fg-2);min-height:24px}
 .rw .floc-h .ico{color:var(--fg-3);flex:none}

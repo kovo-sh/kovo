@@ -55,7 +55,7 @@ export function PaneFooter({ children, stamped }: { children: ReactNode; stamped
 export function FallbackInspector({ sel }: InspectorProps) {
   return <>
     <PaneHeader title={sel.kind.charAt(0).toUpperCase() + sel.kind.slice(1)} sub={<span className="mono">{sel.id.slice(0, 12)}</span>} />
-    <PaneBody><EmptyState icon="node" title="TODO">The {sel.kind} inspector is built by its view.</EmptyState></PaneBody>
+    <PaneBody><EmptyState icon="node" title="Details unavailable">Detailed inspection for this {sel.kind} item isn’t available yet.</EmptyState></PaneBody>
   </>
 }
 

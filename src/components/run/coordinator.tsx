@@ -16,7 +16,8 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalS
 import type { ReactNode } from 'react'
 import { canonicalBoardHandles, maxBoardBodyLength, parseBoardMentions, specialistProfileByHandle } from '../../domain.ts'
 import type { BoardMessageKind } from '../../domain.ts'
-import { boardKindLabels, boardRoleLabels, boardStateMeta } from '../run-state.ts'
+import { boardRoleLabels, boardStateMeta } from '../run-state.ts'
+import { Dropdown } from './controls.tsx'
 import { useRun, useRunModel } from './data.tsx'
 import { ACTIONS, approvalCommand, useDecisions } from './decisions.tsx'
 import { Kbd } from './display.tsx'
@@ -31,15 +32,26 @@ import { useToast } from './toast.tsx'
 
 type BoardMessage = Detail['boardMessages'][number]
 type BoardMember = Detail['boardMembers'][number]
-type Filter = 'all' | 'handoffs' | 'blockers' | 'approvals' | string
+type Filter = 'all' | 'approvals' | 'verdicts' | string
 type RefKind = 'fact' | 'exchange' | 'finding' | 'step'
 
-const FILTERS: [Filter, string][] = [['all', 'All'], ['handoffs', 'Handoffs & Verdicts'], ['blockers', 'Blockers'], ['approvals', 'Approvals']]
+const FILTERS: [Filter, string][] = [['all', 'All'], ['approvals', 'Approvals'], ['verdicts', 'Verdicts']]
+
+const QUIET_KIND_LABELS: Record<BoardMessageKind, string> = {
+  brief: 'Brief',
+  claim: 'Claim',
+  handoff: 'Handoff',
+  lead: 'Lead',
+  blocker: 'Blocker',
+  approval: 'Approval',
+  verdict: 'Verdict',
+  status: 'Status',
+  note: 'Note',
+}
 
 function matches(m: BoardMessage, f: Filter) {
   if (f === 'all') return true
-  if (f === 'handoffs') return m.kind === 'handoff' || m.kind === 'verdict'
-  if (f === 'blockers') return m.kind === 'blocker'
+  if (f === 'verdicts') return m.kind === 'verdict' || m.kind === 'handoff'
   if (f === 'approvals') return m.kind === 'approval' || Boolean(m.refApprovalId)
   return m.authorHandle === f || m.mentions.includes(f)
 }
@@ -133,25 +145,45 @@ function ApprovalsCard() {
   </div>
 }
 
-// ---------------------------------------------------------------- roster
+// ---------------------------------------------------------------- agents dropdown (merged into compact filter bar)
 
-function Roster({ members, filter, setFilter }: { members: BoardMember[]; filter: Filter; setFilter: (f: Filter) => void }) {
+function AgentsDropdown({ members, filter, setFilter }: { members: BoardMember[]; filter: Filter; setFilter: (f: Filter) => void }) {
   const links = useLinks()
-  return <div className="b-roster" data-testid="board-roster" aria-label="Board roster">
-    {members.map(m => {
-      const meta = boardStateMeta[m.state as keyof typeof boardStateMeta] ?? boardStateMeta.waiting
-      const on = filter === m.handle
-      const profile = m.specialistProfile ?? specialistProfileByHandle[m.handle]
-      return <span key={m.id} className={'b-mem st-' + m.state + (on ? ' on' : '')} data-handle={m.handle} data-state={m.state}>
-        <button type="button" aria-pressed={on} title={`${profile ?? boardRoleLabels[m.role] ?? m.role} · ${meta.label} · show only @${m.handle}`}
-          onClick={() => setFilter(on ? 'all' : m.handle)}>
-          <i className="b-dot" aria-hidden="true" /><span>@{m.handle}</span><span className="b-st">{meta.label}</span>
-        </button>
-        {m.activeAssignmentId && m.state !== 'retired' && <button type="button" className="b-go" aria-label={`Inspect @${m.handle}`} title={`Open @${m.handle}'s worker in Workflow`}
-          onClick={() => links.worker(m.activeAssignmentId!)}><Icon name="ext" size={12} /></button>}
-      </span>
-    })}
-  </div>
+  const activeAgent = members.find(m => m.handle === filter)
+  const workingCount = members.filter(m => m.state === 'working').length
+  return <Dropdown
+    className="b-agents-dd"
+    menuClassName="b-agents-menu"
+    btnClassName={'b-f b-agents-btn' + (activeAgent ? ' on' : '')}
+    title="Filter by agent or jump to an active worker"
+    label={<>
+      {workingCount > 0 && <i className="b-dot working" aria-hidden="true" />}
+      <span>{activeAgent ? '@' + activeAgent.handle : `Agents (${members.length})`}</span>
+    </>}
+  >
+    {close => <div data-testid="board-roster" aria-label="Board roster">
+      {activeAgent && <button type="button" className="dd-item" onClick={() => { setFilter('all'); close() }}>
+        <span>All agents</span>
+      </button>}
+      {members.map(m => {
+        const meta = boardStateMeta[m.state as keyof typeof boardStateMeta] ?? boardStateMeta.waiting
+        const on = filter === m.handle
+        const profile = m.specialistProfile ?? specialistProfileByHandle[m.handle]
+        return <div key={m.id} className={'b-ag-row st-' + m.state + (on ? ' on' : '')} data-handle={m.handle} data-state={m.state}>
+          <button type="button" className="dd-item b-ag-pick" aria-pressed={on}
+            title={`${profile ?? boardRoleLabels[m.role] ?? m.role} · ${meta.label}`}
+            onClick={() => { setFilter(on ? 'all' : m.handle); close() }}>
+            <i className="b-dot" aria-hidden="true" />
+            <span className="b-ag-h">@{m.handle}</span>
+            <span className="ct">{meta.label}</span>
+          </button>
+          {m.activeAssignmentId && m.state !== 'retired' && <button type="button" className="icon-btn b-ag-go"
+            aria-label={`Inspect @${m.handle}`} title={`Open @${m.handle}'s worker in Workflow`}
+            onClick={() => { close(); links.worker(m.activeAssignmentId!) }}><Icon name="ext" size={12} /></button>}
+        </div>
+      })}
+    </div>}
+  </Dropdown>
 }
 
 // ---------------------------------------------------------------- timeline items
@@ -242,10 +274,9 @@ function BoardPost({ m, filter, setFilter }: { m: BoardMessage; filter: Filter; 
     <div style={{ minWidth: 0 }}>
       <div className="who">
         <span>{op ? 'You' : '@' + m.authorHandle}</span>
-        <span className={'b-kind k-' + m.kind}>{boardKindLabels[m.kind as BoardMessageKind] ?? m.kind.toUpperCase()}</span>
-        {!op && <span className="muted">{boardRoleLabels[m.authorRole] ?? m.authorRole}</span>}
-        {m.tainted && <span className="b-kind k-blocker" title="Scope revoked: excluded from future specialist wakes">TAINTED</span>}
-        <span className="muted num">{fmtTime(m.createdAt)}</span>
+        <span className={'b-kind k-' + m.kind}>{QUIET_KIND_LABELS[m.kind as BoardMessageKind] ?? cap(m.kind)}</span>
+        {m.tainted && <span className="b-kind k-outdated" title="Scope revoked: excluded from future specialist wakes">Outdated</span>}
+        <span className="muted num" style={{ marginLeft: 'auto' }}>{fmtTime(m.createdAt)}</span>
       </div>
       <MessageBody text={m.body} />
       {(mentions.length > 0 || m.replyToSeq) && <div className="b-meta">
@@ -423,8 +454,6 @@ export function BoardPane() {
     : r.status === 'paused' || r.status === 'budget_paused'
       ? `Run paused in ${(PHASE_LABEL[r.phase] ?? r.phase).toLowerCase()}, round ${r.roundNo}.` + (openApprovals.length ? ' ' + capF(words(openApprovals.length)) + ' approval request' + (openApprovals.length > 1 ? 's are' : ' is') + ' waiting on you.' : '')
       : null
-  const handleChips = handles.filter(h => h !== 'coordinator' && h !== 'all' && (members.some(m => m.handle === h) || board.some(m => m.authorHandle === h || m.mentions.includes(h))))
-
   return <div className="board" data-testid="board-pane">
     <div className="pane-h">
       <div className="ptabs" role="group" aria-label="Pane">
@@ -433,11 +462,13 @@ export function BoardPane() {
       </div>
       <span className="hint"><StatusGlyph status={r.status === 'complete' ? 'complete' : r.status} /><span>{runStatusLabel(r.status)}</span></span>
     </div>
-    <Roster members={members} filter={filter} setFilter={setFilter} />
     <ApprovalsCard />
-    <div className="b-filters" role="group" aria-label="Board filters">
-      {FILTERS.map(([k, l]) => <button key={k} type="button" className={'b-f' + (filter === k ? ' on' : '')} aria-pressed={filter === k} onClick={() => setFilter(k)}>{l}</button>)}
-      {handleChips.map(h => <button key={h} type="button" className={'b-f' + (filter === h ? ' on' : '')} aria-pressed={filter === h} onClick={() => setFilter(filter === h ? 'all' : h)}>@{h}</button>)}
+    <div className="b-bar" role="group" aria-label="Board filters">
+      <div className="b-bar-tabs">
+        {FILTERS.map(([k, l]) => <button key={k} type="button" className={'b-f' + (filter === k ? ' on' : '')} aria-pressed={filter === k} onClick={() => setFilter(k)}>{l}</button>)}
+      </div>
+      <span className="tb-sp" />
+      <AgentsDropdown members={members} filter={filter} setFilter={setFilter} />
     </div>
     <div className="chat-wrap">
       <div className="pane-body" ref={scroller}>

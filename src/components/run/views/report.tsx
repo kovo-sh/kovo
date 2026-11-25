@@ -15,7 +15,7 @@ import {
 import { capabilityTierMeta } from '../../run-state.ts'
 import { Dropdown } from '../controls.tsx'
 import { useRun, useRunModel, useVerdict } from '../data.tsx'
-import { EmptyState, Tag } from '../display.tsx'
+import { Disclosure, EmptyState, Tag } from '../display.tsx'
 import { fmtDate, fmtN, fmtUsd, host, plural, readRunUrlParam, syncRunUrlParam } from '../format.ts'
 import { CovSwatch, SevGlyph, StatusGlyph, TierBars } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
@@ -44,8 +44,8 @@ const CHECK_SHORT: Record<string, string> = {
 const checkGlyph = (st: string) => st === 'met' ? 'complete' : st === 'gap' ? 'needs_follow_up' : st === 'inconclusive' ? 'inconclusive' : st === 'untested' ? 'untested' : 'not_applicable'
 const REPLAY: Record<string, string> = {
   http_chain: 'HTTP chain replay', dns_takeover: 'DNS takeover replay', tls_audit: 'TLS audit replay', browser_dom: 'Browser DOM replay',
-  browser_chain: 'Interactive browser chain', race_burst: 'Race-condition burst', rce_proof: 'Non-destructive RCE proof',
-  sql_boolean_diff: 'SQLi boolean differential', ws_chain: 'WebSocket chain replay', upload_probe: 'Upload pipeline probe', static_ast_proof: 'Deterministic static AST proof',
+  browser_chain: 'Interactive browser chain', race_burst: 'Race-condition burst', rce_proof: 'Non-destructive execution proof',
+  sql_boolean_diff: 'SQL injection differential', ws_chain: 'WebSocket chain replay', upload_probe: 'Upload pipeline check', static_ast_proof: 'Static code analysis',
 }
 
 export function ReportView() {
@@ -218,13 +218,15 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
       <div><div className="k">Findings</div><div className="v">{fs.length}</div></div>
       <div><div className="k">Confirmed by replay</div><div className="v">{conf}</div></div>
       <div><div className="k">Requests</div><div className="v">{fmtN(m?.requestsUsed)}</div></div>
-      <div><div className="k">Chain steps</div><div className="v">{fmtN(m?.chainStepsCompleted)}{m && m.chainStepsUntested > 0 && <span className="rp-vs"> +{m.chainStepsUntested} untested</span>}</div></div>
+      <div><div className="k">Verified steps</div><div className="v">{fmtN(m?.chainStepsCompleted)}{m && m.chainStepsUntested > 0 && <span className="rp-vs"> · {m.chainStepsUntested} remaining</span>}</div></div>
       <div><div className="k">Spent</div><div className="v">{fmtUsd(m?.spentUsd)}</div></div>
     </div>
     <p className="rp-meta">
-      {plural(runtimeConf, 'runtime-confirmed finding')}{staticVerified ? ` · ${plural(staticVerified, 'static-verified finding')}` : ''}{chainConfirmed ? ` · ${plural(chainConfirmed, 'multi-step chain')}` : ''}
-      {covLine ? <> · {covLine}</> : null}<br />
-      {plural(b.scope.length, 'approved host')} · scope revision {b.scopeRevision} · goal revision {b.goalRevision}{m ? ` · ${fmtN(m.turnsUsed)} turns · ${fmtN(m.factsRecorded)} facts` : ''}
+      {plural(b.scope.length, 'approved host')}
+      {runtimeConf ? ` · ${plural(runtimeConf, 'runtime-confirmed finding')}` : ''}
+      {staticVerified ? ` · ${plural(staticVerified, 'static-verified finding')}` : ''}
+      {chainConfirmed ? ` · ${plural(chainConfirmed, 'multi-step chain')}` : ''}
+      {covLine ? <> · {covLine}</> : null}
     </p>
 
     {priority && <div className="banner rp-fix">
@@ -271,24 +273,28 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
           {isOpen && <tr className="rp-fd"><td /><td colSpan={3}>
             <div className="rp-tags">
               <Tag><SevGlyph sev={f.severity} />{SEV_LABEL[f.severity] ?? f.severity}</Tag>
-              <Tag><StatusGlyph status={st} />{stLabel(f.status)}</Tag>
-              {tier && <Tag>{verificationTierLabels[tier]}</Tag>}
-              {rk && <Tag icon="replay">{rk}</Tag>}
-              {f.confidence && <Tag>Confidence {f.confidence}</Tag>}
-              {(f.chainFactIds?.length ?? 0) > 0 && <Tag icon="chain">{f.chainFactIds!.length} chain facts</Tag>}
+              <Tag tone={st === 'confirmed' ? 'accent' : undefined}><StatusGlyph status={st} />{stLabel(f.status)}</Tag>
             </div>
             {f.check && <div className="cmp"><div><span>Expected</span><span>{f.check.expected}</span></div><div><span>Observed</span><span className="obs mono">{f.check.observed ?? <span className="muted">Unavailable</span>}</span></div></div>}
             <dl className="rp-dl">
               {(!f.check || f.status !== 'confirmed') && <><dt>{st === 'confirmed' ? 'Observation' : 'Reason'}</dt><dd>{f.reason}</dd></>}
               {f.impact && <><dt>Impact</dt><dd>{f.impact}</dd></>}
-              {f.confidenceRationale && <><dt>Confidence</dt><dd>{f.confidenceRationale}</dd></>}
-              {f.counterevidence && <><dt>Counterevidence</dt><dd>{f.counterevidence}</dd></>}
-              {f.runtimeProofGap && <><dt>Proof gap</dt><dd>{f.runtimeProofGap}</dd></>}
               {(f.codeLocations?.length ?? 0) > 0 && <><dt>Code</dt><dd className="mono">{f.codeLocations!.map(l => `${l.repo}/${l.file}:${l.startLine}${l.endLine > l.startLine ? '-' + l.endLine : ''}`).join(', ')}</dd></>}
-              {f.verification && <><dt>Verification</dt><dd>{f.verification}</dd></>}
               <dt>{st === 'confirmed' ? 'Remediation' : 'Follow-up'}</dt><dd>{f.remediation}</dd>
               {f.recheck && <><dt>Check the fix</dt><dd>{f.recheck}</dd></>}
             </dl>
+            {(tier || rk || f.confidence || f.confidenceRationale || f.counterevidence || f.runtimeProofGap || f.verification || (f.chainFactIds?.length ?? 0) > 0) && <Disclosure title="Verification details" right={rk ?? (tier ? verificationTierLabels[tier] : undefined)}>
+              <dl className="rp-dl" style={{ marginBottom: 0 }}>
+                {tier && <><dt>Tier</dt><dd>{verificationTierLabels[tier]}</dd></>}
+                {rk && <><dt>Method</dt><dd>{rk}</dd></>}
+                {f.confidence && <><dt>Confidence</dt><dd>{f.confidence}{f.confidenceRationale ? ' — ' + f.confidenceRationale : ''}</dd></>}
+                {!f.confidence && f.confidenceRationale && <><dt>Confidence</dt><dd>{f.confidenceRationale}</dd></>}
+                {f.verification && <><dt>Verification</dt><dd>{f.verification}</dd></>}
+                {f.counterevidence && <><dt>Counterevidence</dt><dd>{f.counterevidence}</dd></>}
+                {f.runtimeProofGap && <><dt>Proof gap</dt><dd>{f.runtimeProofGap}</dd></>}
+                {(f.chainFactIds?.length ?? 0) > 0 && <><dt>Linked facts</dt><dd>{plural(f.chainFactIds!.length, 'recorded fact')}</dd></>}
+              </dl>
+            </Disclosure>}
             {(rt || canRetest) && <div className="banner rp-rt">
               {rt ? <><StatusGlyph status={rt.verdict === 'fixed' ? 'complete' : rt.verdict === 'reproduced' ? 'failed' : 'inconclusive'} />
                 <span><b>{retestVerdictLabels[rt.verdict]}</b> <span className="muted">· {rt.summary} · {fmtDate(rt.createdAt)}</span></span></>

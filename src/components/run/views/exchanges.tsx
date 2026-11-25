@@ -333,7 +333,7 @@ function ExchangeInspector({ sel }: InspectorProps) {
           {[method || null, status || null, t ? fmtAgo(t) : null].filter(Boolean).join(' · ') || 'Details'}
         </span>
       }
-      extra={<button type="button" className="icon-btn" title="Copy as cURL" aria-label="Copy as cURL" onClick={copyCurl}><Icon name="download" />cURL</button>}
+      extra={<button type="button" className="icon-btn" title="Copy as cURL" aria-label="Copy as cURL" onClick={copyCurl}><Icon name="copy" />cURL</button>}
     />
     <PaneBody><div className="d">
       <div className="d-meta">
