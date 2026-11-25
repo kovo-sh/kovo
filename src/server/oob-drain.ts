@@ -38,6 +38,58 @@ export interface OobDrainOptions {
   /** Injected clock (fake-clock tests); defaults to `Date.now`. */
   now?: () => number
   sleep?: (ms: number) => Promise<void>
+  /** Optional abort signal to cancel waiting early (e.g. run stopped/deleted). */
+  signal?: AbortSignal
+}
+
+const activeDrainControllers = new Map<string, Set<AbortController>>()
+const activeFinalizingRuns = new Set<string>()
+
+/** True while a run has an active OOB drain poll or async finalization in flight. */
+export function isOobDrainActive(runId: string): boolean {
+  return activeFinalizingRuns.has(runId) || (activeDrainControllers.get(runId)?.size ?? 0) > 0
+}
+
+/** Abort any in-flight OOB drain poll for `runId` (called when stopping/deleting a run). */
+export function cancelOobDrainForRun(runId: string): void {
+  const controllers = activeDrainControllers.get(runId)
+  if (!controllers) return
+  for (const controller of [...controllers]) {
+    try { controller.abort(new Error('Run deleted during OOB drain.')) } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Identify benign race errors raised when a run is deleted concurrently while async finalization
+ * or OOB drain is completing. Genuine unexpected storage failures (e.g. disk I/O, corruption)
+ * return `false` so they are never silently swallowed.
+ */
+export function isDeletedRunRaceError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const err = error as { message?: unknown; code?: unknown; errstr?: unknown; cause?: unknown }
+  const message = typeof err.message === 'string' ? err.message : ''
+  const errstr = typeof err.errstr === 'string' ? err.errstr : ''
+  const code = typeof err.code === 'string' ? err.code : ''
+  if (/\brun not found\b/i.test(message)) return true
+  if (/FOREIGN KEY constraint failed/i.test(message) || /FOREIGN KEY constraint failed/i.test(errstr)) return true
+  if (code === 'SQLITE_CONSTRAINT_FOREIGNKEY') return true
+  if (err.cause && err.cause !== error) return isDeletedRunRaceError(err.cause)
+  return false
+}
+
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve()
+  return new Promise<void>(resolve => {
+    const onAbort = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 /** Promote late callbacks within a bounded grace window and report the drained metrics. */
@@ -46,8 +98,17 @@ export async function drainPendingOob(
   runId: string,
   options: OobDrainOptions = {},
 ): Promise<OobDrainResult> {
+  const controller = new AbortController()
+  let set = activeDrainControllers.get(runId)
+  if (!set) {
+    set = new Set()
+    activeDrainControllers.set(runId, set)
+  }
+  set.add(controller)
+  const signal = options.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal
+
   const now = options.now ?? (() => Date.now())
-  const sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)))
+  const sleep = options.sleep ?? ((ms: number) => abortableSleep(ms, signal))
   const graceMs = Math.max(0, options.graceMs ?? resolveOobDrainMs())
   const pollMs = Math.max(1, options.pollMs ?? OOB_DRAIN_POLL_MS)
   const started = now()
@@ -60,18 +121,28 @@ export async function drainPendingOob(
   const pendingCount = (): number => {
     try { return relay.pending(runId).length } catch { return 0 }
   }
-  promote()
-  let remaining = pendingCount()
-  const maxPolls = Math.ceil(graceMs / pollMs) + 2
-  let polls = 0
-  while (remaining > 0 && now() - started < graceMs && polls < maxPolls) {
-    polls += 1
-    const budget = graceMs - (now() - started)
-    await sleep(Math.max(1, Math.min(pollMs, budget)))
+
+  try {
+    if (signal.aborted) {
+      return { oobDrainMs: 0, promotedLate: 0, remaining: pendingCount() }
+    }
     promote()
-    remaining = pendingCount()
+    let remaining = pendingCount()
+    const maxPolls = Math.ceil(graceMs / pollMs) + 2
+    let polls = 0
+    while (!signal.aborted && remaining > 0 && now() - started < graceMs && polls < maxPolls) {
+      polls += 1
+      const budget = graceMs - (now() - started)
+      await sleep(Math.max(1, Math.min(pollMs, budget)))
+      if (signal.aborted) break
+      promote()
+      remaining = pendingCount()
+    }
+    return { oobDrainMs: Math.max(0, now() - started), promotedLate, remaining }
+  } finally {
+    set.delete(controller)
+    if (set.size === 0) activeDrainControllers.delete(runId)
   }
-  return { oobDrainMs: Math.max(0, now() - started), promotedLate, remaining }
 }
 
 /** Minimal store surface needed to finalize a verification report. */
@@ -92,6 +163,8 @@ export interface FinalizeHost {
   lastDrain: Map<string, OobDrainResult>
   /** Optional drain entry point (tests/benchmarks can substitute a fake-clock drain). */
   drain?: (runId: string) => Promise<OobDrainResult>
+  /** Optional observer for unexpected non-deletion storage errors during async finalization. */
+  onError?: (error: unknown) => void
 }
 
 /**
@@ -107,27 +180,66 @@ export function scheduleFinalReport(host: FinalizeHost, run: Run): void {
     return
   }
   host.draining.add(run.id)
+  activeFinalizingRuns.add(run.id)
   const drain = host.drain ?? ((runId: string) => drainPendingOob(host.relay, runId))
-  void drain(run.id)
-    .then((result) => {
-      host.lastDrain.set(run.id, result)
+  void (async () => {
+    try {
+      try {
+        const result = await drain(run.id)
+        host.lastDrain.set(run.id, result)
+      } catch (error) {
+        if (isDeletedRunRaceError(error)) {
+          host.lastDrain.delete(run.id)
+          return
+        }
+        // Transient drain failure must not block report finalization when the run still exists.
+      }
       commitFinalReport(host, run)
-    })
-    .catch(() => { commitFinalReport(host, run) })
-    .finally(() => { host.draining.delete(run.id) })
+    } catch (error) {
+      if (isDeletedRunRaceError(error)) {
+        host.lastDrain.delete(run.id)
+        return
+      }
+      if (host.onError) {
+        host.onError(error)
+      } else {
+        console.error('[kovo] OOB report finalization failed for run', run.id, error)
+      }
+    } finally {
+      host.draining.delete(run.id)
+      activeFinalizingRuns.delete(run.id)
+    }
+  })()
 }
 
-function commitFinalReport(host: FinalizeHost, run: Run): void {
-  host.storage.transaction(() => {
-    const current = host.storage.run(run.id)
-    if (current.status !== 'running' || current.phase !== 'verification') return
-    const complete = host.storage.updateRun(current.id, { phase: 'complete', status: 'complete' })
-    host.storage.writeReport(complete, false)
-    const drain = host.lastDrain.get(current.id)
-    const drainNote = drain && drain.promotedLate > 0
-      ? ` ${drain.promotedLate} late async callback(s) were promoted before finalizing.`
-      : ''
-    host.storage.message(current.id, current.coordinatorId, 'kovo',
-      `Verification finished. The complete report is ready.${drainNote}`)
-  }, { behavior: 'immediate' })
+export function commitFinalReport(host: FinalizeHost, run: Run): void {
+  try {
+    host.storage.transaction(() => {
+      let current: Run
+      try {
+        current = host.storage.run(run.id)
+      } catch (error) {
+        if (isDeletedRunRaceError(error)) {
+          host.lastDrain.delete(run.id)
+          return
+        }
+        throw error
+      }
+      if (current.status !== 'running' || current.phase !== 'verification') return
+      const complete = host.storage.updateRun(current.id, { phase: 'complete', status: 'complete' })
+      host.storage.writeReport(complete, false)
+      const drain = host.lastDrain.get(current.id)
+      const drainNote = drain && drain.promotedLate > 0
+        ? ` ${drain.promotedLate} late async callback(s) were promoted before finalizing.`
+        : ''
+      host.storage.message(current.id, current.coordinatorId, 'kovo',
+        `Verification finished. The complete report is ready.${drainNote}`)
+    }, { behavior: 'immediate' })
+  } catch (error) {
+    if (isDeletedRunRaceError(error)) {
+      host.lastDrain.delete(run.id)
+      return
+    }
+    throw error
+  }
 }
