@@ -601,14 +601,27 @@ test('enqueueHopContinuationOnRotation persists <= 2 KB v8.hop_checkpoint.v1 che
   assert.match(parsed.hopCheckpoint?.nextGoal?.goal ?? '', /DO NOT re-read source|ctx\.prove_composite/i)
 })
 
-test('planRoundRobinDispatch prioritizes continuation steps at the very top of the chain frontier lane', () => {
-  const coldHighPriorityChain: DispatchLaneStep = {
+test('planRoundRobinDispatch fairly interleaves unstarted source/planner chains ahead of sealed depth-1 continuations and generic Wave-1 stubs', () => {
+  const coldPlannerChain: DispatchLaneStep = {
     id: 'chain-cold-1',
     seq: 1,
     priority: 100,
     title: 'Fresh cold chain hypothesis',
     category: 'broken-access-control',
     hypothesis: 'Investigate cross-service chain [chain_hops=h1->h2->h3]',
+    skills: ['multihop-chains', 'chain-primitives'],
+    dependsOnFactIds: [],
+    dependsOnStepIds: [],
+    sourceOrigins: [ORIGIN],
+    trialIndex: 0,
+  }
+  const wave1Stub: DispatchLaneStep = {
+    id: 'chain-wave1-stub',
+    seq: 2,
+    priority: 96,
+    title: 'Wave-1 chain · Cross-service boundary chain (edge/http)',
+    category: 'broken-access-control',
+    hypothesis: '[chain_hops=3] [lane=chain] [inv_hyp=inv-1] [cap=cap:hop_synth:edge] Multi-hop invariant chain',
     skills: ['multihop-chains', 'chain-primitives'],
     dependsOnFactIds: [],
     dependsOnStepIds: [],
@@ -622,7 +635,12 @@ test('planRoundRobinDispatch prioritizes continuation steps at the very top of t
     title: 'Verified Hop 1-2 continuation [continuation #1]',
     category: 'broken-access-control',
     hypothesis: HOP_CONTINUATION_DIRECTIVE,
-    skills: ['multihop-chains', 'chain-primitives', `${CHAIN_CONTINUATION_SKILL_PREFIX}1`],
+    skills: [
+      'multihop-chains',
+      'chain-primitives',
+      `${CHAIN_CONTINUATION_SKILL_PREFIX}1`,
+      `${CHECKPOINT_CAP_SKILL_PREFIX}cap:hop_cont_1:derived_signer`,
+    ],
     dependsOnFactIds: ['f-cp'],
     dependsOnStepIds: ['chain-parent-1'],
     sourceOrigins: [ORIGIN],
@@ -630,7 +648,7 @@ test('planRoundRobinDispatch prioritizes continuation steps at the very top of t
   }
   const routeSweep: DispatchLaneStep = {
     id: 'route-1',
-    seq: 2,
+    seq: 3,
     priority: 99,
     title: 'Single-route access sweep',
     category: 'broken-access-control',
@@ -642,8 +660,12 @@ test('planRoundRobinDispatch prioritizes continuation steps at the very top of t
     trialIndex: 0,
   }
 
-  const plan = planRoundRobinDispatch([coldHighPriorityChain, routeSweep, contStep], 2)
-  assert.equal(plan.ordered[0]?.id, 'chain-cont-1', 'continuation step must rank strictly first in the chain frontier lane')
+  const withPlanner = planRoundRobinDispatch([wave1Stub, coldPlannerChain, routeSweep, contStep], 3)
+  assert.equal(withPlanner.ordered[0]?.id, 'chain-cold-1', 'unstarted planner multi-hop chain must rank first')
+  assert.equal(withPlanner.ordered[1]?.id, 'chain-cont-1', 'depth-1 sealed continuation must outrank generic Wave-1 boundary stub')
+
+  const vsWave1Only = planRoundRobinDispatch([wave1Stub, routeSweep, contStep], 2)
+  assert.equal(vsWave1Only.ordered[0]?.id, 'chain-cont-1', 'depth-1 sealed continuation must beat generic Wave-1 stub in chain lane')
 })
 
 test('Live Execution automatically enqueues and dispatches a hop-continuation step when a progressing multi-hop worker rotates, and skips stalled zero-progress chains', async (t) => {

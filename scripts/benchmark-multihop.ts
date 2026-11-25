@@ -377,6 +377,7 @@ Flags:
   --budget-usd <n>          per-cell USD budget (default: ${DEFAULT_BUDGET_USD})
   --max-duration-ms <n|10m|30m|60m>
                             wall-clock cap per cell (default: ${Math.round(DEFAULT_MAX_DURATION_MS / 60_000)}m)
+  --duration-min <n>        alias for --max-duration-ms <n * 60000> (minutes, 1..360)
   --concurrency <n>         parallel app/seed cells (default: ${DEFAULT_CONCURRENCY})
   --data-dir <path>         Guardian data dir (default: $GUARDIAN_DATA_DIR)
   --isolate-data-dir        per-cell isolated data dir (credentials symlinked, key never copied)
@@ -511,7 +512,7 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
 
   const known = new Set([
     'app', 'seed', 'seeds', 'held-out', 'mode', 'no-llm', 'verifier', 'isolate-data-dir',
-    'concurrency', 'budget-usd', 'max-duration-ms', 'data-dir', 'keep-data-dirs',
+    'concurrency', 'budget-usd', 'max-duration-ms', 'duration-min', 'data-dir', 'keep-data-dirs',
     'allow-inert-workers', 'snapshot-after-floor', 'resume-snapshot', 'snapshot-max-age-ms',
     'snapshot-refresh', 'allow-heldout-snapshot', 'floor-from', 'curve-from', 'out-dir',
     'json', 'md', 'list-seeds', 'help',
@@ -576,9 +577,25 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
   if (!Number.isFinite(budgetUsd) || budgetUsd < 0.1 || budgetUsd > 500) {
     fail(`--budget-usd must be a number between 0.1 and 500 (got '${String(a['budget-usd'])}')`)
   }
-  const maxDurationMs = a['max-duration-ms'] === undefined
-    ? DEFAULT_MAX_DURATION_MS
-    : parseDurationMs(stringFlag(a, 'max-duration-ms') ?? '', '--max-duration-ms')
+  if (a['max-duration-ms'] !== undefined && a['duration-min'] !== undefined) {
+    fail('use either --max-duration-ms or --duration-min, not both')
+  }
+  let maxDurationMs = DEFAULT_MAX_DURATION_MS
+  if (a['max-duration-ms'] !== undefined) {
+    maxDurationMs = parseDurationMs(stringFlag(a, 'max-duration-ms') ?? '', '--max-duration-ms')
+  } else if (a['duration-min'] !== undefined) {
+    const rawMin = stringFlag(a, 'duration-min')
+    if (rawMin === undefined) fail('--duration-min requires a positive number of minutes')
+    const minutes = Number(rawMin.trim())
+    if (!Number.isFinite(minutes) || minutes <= 0) {
+      fail(`--duration-min must be a positive number of minutes (got '${rawMin}')`)
+    }
+    const ms = Math.round(minutes * 60_000)
+    if (ms < 60_000 || ms > 6 * 3_600_000) {
+      fail(`--duration-min must be between 1 and 360 minutes (got '${rawMin}')`)
+    }
+    maxDurationMs = ms
+  }
   const concurrency = a.concurrency === undefined
     ? DEFAULT_CONCURRENCY
     : parsePositiveInt(stringFlag(a, 'concurrency') ?? '', '--concurrency')
@@ -2812,6 +2829,7 @@ export async function runCell(
       canaryBroker: canary,
       ...(backend ? { backend } : {}),
       deterministicOnly: args.noLlm,
+      maxDurationMs: args.maxDurationMs,
       onCheckpoint: event => captureCheckpoint(event.checkpoint),
     })
     engine.start()

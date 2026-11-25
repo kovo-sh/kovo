@@ -154,7 +154,10 @@ import {
   percentile,
   summarizeTurnLatencies,
   requeueInterruptedAssignments,
+  CODE_AUDIT_WAVE1_MAX_STEPS,
   convertCodeAuditSuspectsToChainSteps,
+  dedupePromotableCodeAuditFacts,
+  isPromotableCodeAuditFact,
   type FrontierWaveController,
   type DeterministicSweepMode,
   type PhaseRequestBudgets,
@@ -346,8 +349,11 @@ export function promoteSemanticAuditSuspects(
 }
 
 /**
- * Final suspect roll-up for the code audit. When the interactive auditor recorded zero facts of
- * its own, semantic-audit suspects are preserved instead of returning an empty audit.
+ * Final suspect roll-up for the code audit. Collects both explicit `code_audit_suspect` facts AND
+ * any non-tainted cross-cutting defect facts authored by the code-audit assignment (or recorded
+ * during its window) so multi-service authz/boundary/secret defects are promoted immediately into
+ * Wave 1. When the interactive auditor recorded zero promotable facts of its own, semantic-audit
+ * suspects are preserved instead of returning an empty audit.
  */
 export function settleCodeAuditSuspects(input: {
   storage: Store
@@ -356,10 +362,27 @@ export function settleCodeAuditSuspects(input: {
   approvedOrigins: ReadonlySet<string>
   semanticSuspects: readonly SemanticAuditSuspect[]
   preInteractiveFactIds: ReadonlySet<string>
+  auditStartedAtMs?: number
 }): { suspects: Fact[]; promoted: Fact[]; interactiveRecorded: number } {
-  const read = (): Fact[] => input.storage
-    .listFacts(input.run.id, { includeTainted: false, kind: 'code_audit_suspect', limit: 100 })
-    .filter(fact => input.approvedOrigins.has(fact.origin))
+  const read = (): Fact[] => {
+    const explicitSuspects = input.storage
+      .listFacts(input.run.id, { includeTainted: false, kind: 'code_audit_suspect', limit: 200 })
+      .filter(fact => input.approvedOrigins.has(fact.origin))
+    const explicitIds = new Set(explicitSuspects.map(fact => fact.id))
+    const allFacts = input.storage
+      .listFacts(input.run.id, { includeTainted: false, limit: 500 })
+      .filter(fact => input.approvedOrigins.has(fact.origin))
+    const crossCuttingFacts = allFacts.filter(fact => {
+      if (explicitIds.has(fact.id)) return false
+      const authoredByAudit = fact.assignmentId === input.assignment.id
+      const recordedInWindow = !input.preInteractiveFactIds.has(fact.id)
+        && input.auditStartedAtMs !== undefined
+        && fact.createdAt >= input.auditStartedAtMs
+      if (!authoredByAudit && !recordedInWindow) return false
+      return isPromotableCodeAuditFact(fact)
+    })
+    return dedupePromotableCodeAuditFacts([...explicitSuspects, ...crossCuttingFacts])
+  }
   let suspects = read()
   const interactiveRecorded = suspects.filter(fact => !input.preInteractiveFactIds.has(fact.id)).length
   let promoted: Fact[] = []
@@ -2105,7 +2128,7 @@ export class Execution {
       }
 
       const preInteractiveSuspectIds = new Set(
-        this.storage.listFacts(run.id, { includeTainted: false, kind: 'code_audit_suspect', limit: 500 })
+        this.storage.listFacts(run.id, { includeTainted: false, limit: 500 })
           .map(fact => fact.id),
       )
       const remainingAuditWallMs = Math.max(0, auditWallMs - Math.max(0, Date.now() - startedAt))
@@ -2172,6 +2195,7 @@ export class Execution {
         approvedOrigins,
         semanticSuspects,
         preInteractiveFactIds: preInteractiveSuspectIds,
+        auditStartedAtMs: startedAt,
       })
       if (settled.promoted.length) {
         this.safeEvent(run.id, 'code_audit.semantic_suspects_preserved',
@@ -2180,7 +2204,10 @@ export class Execution {
       }
       const suspects = settled.suspects
       const hostTiers = computeHostTiers([...approvedOrigins], threatModel)
-      const stepsCreated = convertCodeAuditSuspectsToChainSteps(this.storage, latestRun, suspects, hostTiers)
+      const stepsCreated = convertCodeAuditSuspectsToChainSteps(this.storage, latestRun, suspects, hostTiers, {
+        maxSteps: CODE_AUDIT_WAVE1_MAX_STEPS,
+        promoteMultiHop: true,
+      })
 
       const outcomeText = sessionResult.completion
         ? `[${sessionResult.completion.status}] ${sessionResult.completion.summary} (${suspects.length} suspects → ${stepsCreated.length} targeted chain steps)`

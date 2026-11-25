@@ -1481,8 +1481,16 @@ export function isDetLeadDispatchStep(step: Pick<DispatchLaneStep, 'title' | 'hy
 
 /** Prefix on `ChainStep.skills` tracking automatic hop-continuation depth (`chain_continuation:1`, `:2`). */
 export const CHAIN_CONTINUATION_SKILL_PREFIX = 'chain_continuation:'
-/** Maximum automatic hop-continuation steps enqueued per rotated multi-hop chain lineage. */
+/** Maximum automatic hop-continuation steps enqueued per source/planner chain lineage that sealed a capability handle. */
 export const MAX_CHAIN_CONTINUATIONS = 2
+/** Maximum automatic hop-continuation steps enqueued for generic Wave-1 heuristic boundary chains. */
+export const MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS = 1
+/** Maximum targeted multi-hop steps promoted immediately into Wave 1 from Source-First Code Audit. */
+export const CODE_AUDIT_WAVE1_MAX_STEPS = 6
+
+const SEALED_HOP_CAP_HANDLE_RE = /\bcap:hop_(?!synth:)[A-Za-z0-9._-]+:[A-Za-z0-9._-]+/
+const SOURCE_AUDIT_ORIGIN_TEXT_RE = /\b(?:source[- ]first code audit|source audit verify|semantic audit|code_audit_suspect|code_audit|source_audit|semantic_audit)\b/i
+const CAUSAL_ARROW_HYPOTHESIS_RE = /->|→|=>/
 
 /** Extract the continuation depth (`0` for original steps, `1..N` for continuation steps). */
 export function extractContinuationDepth(step: { skills?: readonly string[] }): number {
@@ -1498,6 +1506,90 @@ export function extractContinuationDepth(step: { skills?: readonly string[] }): 
 /** True when a step is an automatic hop-continuation step carrying a verified checkpoint. */
 export function isChainContinuationStep(step: { skills?: readonly string[] }): boolean {
   return extractContinuationDepth(step) > 0
+}
+
+/** True when a step originates from code_audit / source_audit / semantic_audit. */
+export function hasSourceAuditOrigin(
+  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'skills'>,
+): boolean {
+  if ((step.skills ?? []).some(skill =>
+    skill === 'source-first-audit'
+    || skill === 'code_audit'
+    || skill === 'source_audit'
+    || skill === 'semantic_audit',
+  )) {
+    return true
+  }
+  return SOURCE_AUDIT_ORIGIN_TEXT_RE.test(`${step.title} ${step.hypothesis ?? ''}`)
+}
+
+/**
+ * True when a step is a generic Wave-1 heuristic boundary stub (`Wave-1 chain · ...` without
+ * `dependsOnFactIds` at depth 0 or concrete source-audit suspect linkage), including any
+ * continuation spawned from such a stub.
+ */
+export function isGenericWave1BoundaryChainStep(
+  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'skills' | 'dependsOnFactIds'>,
+): boolean {
+  if (hasSourceAuditOrigin(step)) return false
+  const isWave1StubMarker = /^wave-1\s+chain\b/i.test(step.title)
+    || /\[inv_hyp=[^\]]+\]/i.test(step.hypothesis ?? '')
+    || (step.skills ?? []).includes('wave1-boundary-stub')
+  if (!isWave1StubMarker) return false
+  if (extractContinuationDepth(step) === 0 && (step.dependsOnFactIds?.length ?? 0) > 0) return false
+  return true
+}
+
+/**
+ * True when a chain step is backed by concrete source-audit findings, upstream facts
+ * (`dependsOnFactIds`), or a planner-synthesized causal arrow hypothesis (as opposed to a generic
+ * Wave-1 heuristic boundary stub).
+ */
+export function isHighSignalSourceOrPlannerChainStep(
+  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'skills' | 'dependsOnFactIds'>,
+): boolean {
+  if (isGenericWave1BoundaryChainStep(step)) return false
+  if (hasSourceAuditOrigin(step)) return true
+  if ((step.dependsOnFactIds?.length ?? 0) > 0) return true
+  if ((step.skills ?? []).some(skill => skill.startsWith('chain:'))) return true
+  return CAUSAL_ARROW_HYPOTHESIS_RE.test(`${step.title} ${step.hypothesis ?? ''}`)
+}
+
+/**
+ * True when a step carries a runtime-sealed `cap:hop_*` capability handle from `CapabilityLedger`
+ * (excluding static `cap:hop_synth:*` invariant seeds).
+ */
+export function hasSealedHopCapability(
+  step: Pick<DispatchLaneStep, 'hypothesis' | 'skills'>,
+): boolean {
+  if ((step.skills ?? []).some(skill =>
+    skill.startsWith('checkpoint_cap:')
+    && SEALED_HOP_CAP_HANDLE_RE.test(skill.slice('checkpoint_cap:'.length)),
+  )) {
+    return true
+  }
+  return SEALED_HOP_CAP_HANDLE_RE.test(step.hypothesis ?? '')
+}
+
+/**
+ * Fair multi-hop frontier interleaving rank within the `chain` lane (lower = higher priority):
+ *  0. Unstarted (`depth === 0`) source-audit / planner-synthesized multi-hop chains,
+ *  1. `depth === 1` continuations that sealed a `cap:hop_*` capability handle,
+ *  2. Remaining unstarted (`depth === 0`) Wave-1 boundary chains,
+ *  3. `depth === 1` continuations without a sealed `cap:hop_*` handle,
+ *  4. `depth >= 2` continuations (only after distinct chains have had their first shot).
+ */
+export function chainLaneDispatchRank(
+  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'skills' | 'dependsOnFactIds'>,
+): number {
+  const depth = extractContinuationDepth(step)
+  if (depth === 0) {
+    return isHighSignalSourceOrPlannerChainStep(step) ? 0 : 2
+  }
+  if (depth === 1) {
+    return hasSealedHopCapability(step) ? 1 : 3
+  }
+  return 4
 }
 
 /** Identify genuine multi-hop / depth >= 2 chain steps eligible for dedicated frontier slot reservation. */
@@ -1582,11 +1674,15 @@ export function planRoundRobinDispatch<T extends DispatchLaneStep>(
     else lanes.get(lane)!.push(step)
   }
   for (const lane of lanes.values()) lane.sort((a, b) => compareDispatchSteps(a, b, options.hostTiers))
-  // Prioritize automatic hop-continuation steps at the very top of the chain frontier lane so
-  // verified H1–H2 checkpoints resume H3–H5 immediately ahead of fresh cold chain hypotheses.
+  // Fair multi-hop frontier interleaving within the chain lane:
+  // 0: unstarted (depth 0) source-audit / planner-synthesized multi-hop chains,
+  // 1: depth-1 continuations carrying a sealed cap:hop_* capability handle,
+  // 2: remaining unstarted (depth 0) Wave-1 boundary chains,
+  // 3: depth-1 continuations without a sealed capability handle,
+  // 4: depth >= 2 continuations (never preempt unstarted source/planner or Wave-1 chains).
   lanes.get('chain')!.sort((a, b) =>
-    Number(isChainContinuationStep(b)) - Number(isChainContinuationStep(a))
-    || extractContinuationDepth(b) - extractContinuationDepth(a)
+    chainLaneDispatchRank(a) - chainLaneDispatchRank(b)
+    || Number(isGenericWave1BoundaryChainStep(a)) - Number(isGenericWave1BoundaryChainStep(b))
     || compareDispatchSteps(a, b, options.hostTiers),
   )
   duplicateTrials.sort((a, b) => compareDispatchSteps(a.step, b.step, options.hostTiers))
@@ -1617,7 +1713,13 @@ export function planRoundRobinDispatch<T extends DispatchLaneStep>(
         whiteBoxCandidates.push({ lane, step: queue.splice(idx, 1)[0]! })
       }
     }
-    whiteBoxCandidates.sort((a, b) => compareDispatchSteps(a.step, b.step, options.hostTiers))
+    whiteBoxCandidates.sort((a, b) =>
+      Number(isChainContinuationStep(a.step)) - Number(isChainContinuationStep(b.step))
+      || (a.lane === 'chain' && b.lane === 'chain'
+        ? chainLaneDispatchRank(a.step) - chainLaneDispatchRank(b.step)
+        : 0)
+      || compareDispatchSteps(a.step, b.step, options.hostTiers),
+    )
     const remainingWhiteBox: Array<{ lane: DispatchLane; step: T }> = []
     for (const entry of whiteBoxCandidates) {
       if (ordered.length < capacity) {
@@ -2590,11 +2692,117 @@ function sinkCategoryAndSkills(sinkKind: string): { category: OwaspCategory; ski
   }
 }
 
+const CODE_AUDIT_DEFECT_SIGNAL_RE = /\b(?:missing|absent|omits?|lacks?|without|bypass(?:es|able)?|unauthenticated|unverified|untrusted|forged?|spoof(?:ed|ing)?|broken|weak|improper|unsafe|inject(?:ion|able)?|idor|bola|bfla|ssrf|csrf|xss|sqli|rce|desync|smuggl(?:ing|ed)?|asymmetry|asymmetric|mismatch|inconsistent|cross[- ]?tenant|privilege\s+escalation|escalat(?:e|ion)|unauthorized|state[- ]?machine|creator\/approver|self[- ]?approv|replay|race\s+condition|toctou|mass\s+assignment|leak(?:s|ed|ing)?|expos(?:e|es|ed|ure)|plaintext|in[- ]?log|log\s+sink|cache\s+poison|trust[- ]?boundary|secret|token|signing\s+key|hmac|jwt|credential|api[- ]?key|private[- ]?key)\b/i
+const CODE_AUDIT_BOUNDARY_SINK_RE = /\b(?:cross[- ]?service|multi[- ]?service|multi[- ]?hop|downstream|upstream|outbound[- ]?fetch|async[- ]?worker|background\s+worker|queue\s+consumer|webhook|graphql|websocket|sse|stream|proxy|edge\s+gateway|internal\s+service|x-forwarded|forwarded[- ]?header|cache[- ]?key|storage\s+sink|export\s+sink|server\s+action)\b/i
+const CODE_AUDIT_NON_DEFECT_SUBKINDS = new Set(['hop_checkpoint', 'chain_hop'])
+
+/**
+ * Identify non-tainted facts produced during Source-First Code Audit that describe a concrete
+ * security defect, authz asymmetry, trust-boundary leak, secret/token exposure, or multi-service
+ * sink — even when recorded under a general fact kind rather than `code_audit_suspect`.
+ */
+export function isPromotableCodeAuditFact(fact: {
+  kind: string
+  summary: string
+  data: unknown
+  tainted?: boolean
+}): boolean {
+  if (fact.tainted) return false
+  const kind = String(fact.kind)
+  const data = (fact.data && typeof fact.data === 'object' ? fact.data : {}) as Record<string, unknown>
+  if (data.source === 'deterministic_engine') return false
+  const subkind = typeof data.subkind === 'string' ? data.subkind : ''
+  if (CODE_AUDIT_NON_DEFECT_SUBKINDS.has(subkind)) return false
+  if (kind === 'code_audit_suspect' || subkind === 'code_audit_suspect') return true
+  if (kind === 'tech_fingerprint') return false
+
+  const dataPieces: string[] = []
+  for (const key of [
+    'hypothesis', 'defect', 'vulnerability', 'authCheck', 'ownershipCheck', 'sinkKind',
+    'routeOrAction', 'endpoint', 'path', 'file', 'impact', 'trustBoundary', 'asymmetry',
+    'category', 'title', 'detail', 'notes', 'summary',
+  ]) {
+    const val = data[key]
+    if (typeof val === 'string' && val.trim()) dataPieces.push(val.trim())
+  }
+  const combined = `${fact.summary} ${dataPieces.join(' ')}`.slice(0, 2400)
+  if (CODE_AUDIT_DEFECT_SIGNAL_RE.test(combined)) return true
+  if (CODE_AUDIT_BOUNDARY_SINK_RE.test(combined)) {
+    const hasConcreteAnchor = Boolean(
+      (typeof data.file === 'string' && data.file.trim())
+      || (typeof data.routeOrAction === 'string' && data.routeOrAction.trim())
+      || (typeof data.endpoint === 'string' && data.endpoint.trim())
+      || (typeof data.sinkKind === 'string' && data.sinkKind.trim())
+      || /\/[A-Za-z0-9_\-.:{}[\]]+\/[A-Za-z0-9_\-.:{}[\]]+/.test(combined)
+      || /\b[A-Za-z0-9_-]+\.(?:ts|tsx|js|jsx|py|go|java|rb):\d+\b/.test(combined),
+    )
+    if (hasConcreteAnchor) return true
+  }
+  return false
+}
+
+/**
+ * Deduplicate promotable code-audit facts, keeping explicit `code_audit_suspect` facts ahead of
+ * general cross-cutting facts and collapsing duplicates by `(repo, file, line, sinkKind)`,
+ * normalized endpoint+sink, or normalized summary prefix.
+ */
+export function dedupePromotableCodeAuditFacts<T extends { id: string; kind: string; summary: string; data: unknown }>(
+  facts: readonly T[],
+): T[] {
+  const ordered = [...facts].sort((a, b) => {
+    const aExplicit = String(a.kind) === 'code_audit_suspect' || (a.data as Record<string, unknown> | undefined)?.subkind === 'code_audit_suspect'
+    const bExplicit = String(b.kind) === 'code_audit_suspect' || (b.data as Record<string, unknown> | undefined)?.subkind === 'code_audit_suspect'
+    return Number(bExplicit) - Number(aExplicit)
+  })
+  const byLocation = dedupeCodeAuditSuspects(ordered)
+  const seenKeys = new Set<string>()
+  const out: T[] = []
+  for (const fact of byLocation) {
+    const data = (fact.data && typeof fact.data === 'object' ? fact.data : {}) as Record<string, unknown>
+    const file = typeof data.file === 'string' ? data.file.trim().toLowerCase() : ''
+    const line = typeof data.line === 'number' && Number.isFinite(data.line) ? String(data.line) : ''
+    const sink = typeof data.sinkKind === 'string' ? data.sinkKind.trim().toLowerCase() : ''
+    let key: string
+    if (file) {
+      // Preserve distinct source locations (matching `codeAuditSuspectLocationKey`), while collapsing
+      // duplicate explicit suspects and plain notes that cite the exact same file:line:sink.
+      key = `loc:${file}:${line}:${sink}`
+    } else {
+      const endpoint = typeof data.endpoint === 'string' && data.endpoint.trim()
+        ? normalizeEndpointTemplate(data.endpoint.trim())
+        : typeof data.routeOrAction === 'string' && data.routeOrAction.trim()
+          ? normalizeEndpointTemplate(data.routeOrAction.trim())
+          : ''
+      const summaryKey = fact.summary.trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 96)
+      key = endpoint && sink
+        ? `ep:${endpoint}:${sink}`
+        : summaryKey
+          ? `sum:${summaryKey}`
+          : `id:${fact.id}`
+    }
+    if (seenKeys.has(key)) continue
+    seenKeys.add(key)
+    out.push(fact)
+  }
+  return out
+}
+
+function inferSinkKindFromFactText(text: string): string {
+  const lower = text.toLowerCase()
+  if (/\bwebhook\b|hmac|x-signature|x-hub-signature/.test(lower)) return 'webhook'
+  if (/\boutbound[- ]?fetch\b|\bssrf\b|internal\s+service|proxy|redirect/.test(lower)) return 'outbound_fetch'
+  if (/\bjwt\b|\boauth\b|\boidc\b|signing\s+key|auth[-_ ]?config|token\s+(?:mint|forg|leak|expos)/.test(lower)) return 'auth_config'
+  if (/\bupload\b|\bstorage\b|\bbucket\b|\bexport\b/.test(lower)) return 'upload_storage'
+  if (/\bsql\b|db[._]query|raw\s+query|injection/.test(lower)) return 'db_query'
+  return 'api_route'
+}
+
 export function convertCodeAuditSuspectsToChainSteps(
   storage: Store,
   run: Run,
   suspects: readonly Fact[],
   hostTiers?: Record<string, HostTier>,
+  options: { maxSteps?: number; promoteMultiHop?: boolean } = {},
 ): ChainStep[] {
   const approvedOrigins = new Set(run.candidates.filter(c => run.approved.includes(c.id)).map(c => c.origin))
   const existingSteps = storage.listChainSteps(run.id, run.goalRevision)
@@ -2602,8 +2810,10 @@ export function convertCodeAuditSuspectsToChainSteps(
   const coveredFactIds = new Set(existingSteps.flatMap(s => s.dependsOnFactIds))
   const created: ChainStep[] = []
   let totalSteps = existingSteps.length
+  const maxSteps = options.maxSteps !== undefined ? Math.max(0, Math.floor(options.maxSteps)) : Number.POSITIVE_INFINITY
 
-  for (const fact of dedupeCodeAuditSuspects(suspects)) {
+  for (const fact of dedupePromotableCodeAuditFacts(suspects)) {
+    if (created.length >= maxSteps) break
     if (totalSteps >= hardChainStepsCeiling) break
     if (fact.tainted || !approvedOrigins.has(fact.origin)) continue
     if (coveredFactIds.has(fact.id)) continue
@@ -2614,18 +2824,21 @@ export function convertCodeAuditSuspectsToChainSteps(
     const routeOrAction = typeof data.routeOrAction === 'string' && data.routeOrAction.trim()
       ? data.routeOrAction.trim()
       : ''
+    const summaryRoutes = templatesMentionedInText(fact.summary)
     const endpointHint = typeof data.endpoint === 'string' && data.endpoint.trim()
       ? data.endpoint.trim()
-      : routeOrAction
+      : routeOrAction || summaryRoutes[0] || ''
     const fileLoc = typeof data.file === 'string' && data.file.trim()
       ? `${data.file.trim()}${typeof data.line === 'number' ? `:${data.line}` : ''}`
       : ''
-    const sinkKind = typeof data.sinkKind === 'string' ? data.sinkKind : 'api_route'
-    const authCheck = typeof data.authCheck === 'string' ? data.authCheck : 'unknown'
-    const ownershipCheck = typeof data.ownershipCheck === 'string' ? data.ownershipCheck : 'unknown'
     const hypothesisBody = typeof data.hypothesis === 'string' && data.hypothesis.trim()
       ? data.hypothesis.trim()
       : fact.summary
+    const sinkKind = typeof data.sinkKind === 'string' && data.sinkKind.trim()
+      ? data.sinkKind.trim()
+      : inferSinkKindFromFactText(`${fact.summary} ${hypothesisBody} ${endpointHint}`)
+    const authCheck = typeof data.authCheck === 'string' ? data.authCheck : 'unknown'
+    const ownershipCheck = typeof data.ownershipCheck === 'string' ? data.ownershipCheck : 'unknown'
 
     const host = new URL(fact.origin).hostname
     const title = routeOrAction
@@ -2645,7 +2858,12 @@ export function convertCodeAuditSuspectsToChainSteps(
       endpoint: endpointHint,
       sinkKind,
     })
-    const missingAuthOrOwner = /missing|none|weak|bypass|absent|unverified|no /i.test(`${authCheck} ${ownershipCheck}`)
+    const stepSkills = options.promoteMultiHop
+      ? [...new Set([...mapped.skills, 'multihop-chains', 'chain-primitives'])]
+      : mapped.skills
+    const missingAuthOrOwner = /missing|none|weak|bypass|absent|unverified|no |asymmetry|leak|expos|untrusted|forged|spoof/i.test(
+      `${authCheck} ${ownershipCheck} ${fact.summary}`,
+    )
     const isCrown = (hostTiers?.[fact.origin] ?? classifyHostTier(fact.origin)) === 'crown_jewel'
     const priority = missingAuthOrOwner ? (isCrown ? 96 : 92) : (isCrown ? 90 : 85)
 
@@ -2662,7 +2880,7 @@ export function convertCodeAuditSuspectsToChainSteps(
       category: explicitCategory,
       priority,
       targetAssetIds: [asset.id],
-      skills: mapped.skills,
+      skills: stepSkills,
       dependsOnFactIds: [fact.id],
       sourceOrigins: [fact.origin],
       specialistProfile,
