@@ -121,6 +121,11 @@ function normalizeArmTarget(
     ...(role ? { sessionGroupRole: role } : {}),
     ...(followRedirects !== undefined ? { followRedirects } : {}),
     ...(merged.capability !== undefined ? { capability: merged.capability } : {}),
+    ...(typeof merged.entityId === 'string' && merged.entityId.trim() ? { entityId: merged.entityId.trim() } : {}),
+    ...(typeof merged.correlationId === 'string' && merged.correlationId.trim() ? { correlationId: merged.correlationId.trim() } : {}),
+    ...(Array.isArray(merged.correlationIds) ? { correlationIds: merged.correlationIds } : {}),
+    ...(typeof merged.evidenceRole === 'string' && merged.evidenceRole.trim() ? { evidenceRole: merged.evidenceRole.trim() } : {}),
+    ...(typeof merged.replayAttempt === 'string' && merged.replayAttempt.trim() ? { replayAttempt: merged.replayAttempt.trim() } : {}),
   }
 }
 
@@ -661,12 +666,18 @@ export async function handleProveRace(host: ProveHandlerHost, args: Record<strin
   }
 
   const sessionBase = typeof args.session === 'string' && args.session ? args.session : undefined
+  const topEntityId = typeof args.entityId === 'string' && args.entityId.trim() ? args.entityId.trim() : undefined
+  const topCorrelationId = typeof args.correlationId === 'string' && args.correlationId.trim() ? args.correlationId.trim() : undefined
+  const topCorrelationIds = Array.isArray(args.correlationIds) ? args.correlationIds : undefined
   let firstRequestBody: unknown = undefined
   const normalizedRequests = rawRequests.map((req, index) => {
     const normalized = normalizeArmTarget(host.defaultOrigin, req, {
       sessionGroupRole: 'probe',
       session: sessionBase ?? `race-${index}`,
     })
+    if (topEntityId && normalized.entityId === undefined) normalized.entityId = topEntityId
+    if (topCorrelationId && normalized.correlationId === undefined) normalized.correlationId = topCorrelationId
+    if (topCorrelationIds && normalized.correlationIds === undefined) normalized.correlationIds = topCorrelationIds
     if (index === 0 && typeof normalized.body === 'string') {
       firstRequestBody = parseJsonSafe(normalized.body) ?? normalized.body
     }
@@ -693,7 +704,10 @@ export async function handleProveRace(host: ProveHandlerHost, args: Record<strin
     mode?: 'h2-single-packet' | 'http1-fallback'
     fallbackReason?: string | null
     summary?: Record<string, unknown>
-    results?: Array<{ exchangeId: string; status: number; durationMs: number; bodySha256: string }>
+    results?: Array<{
+      exchangeId: string; status: number; durationMs: number; bodySha256: string
+      consumedCapabilityId?: string; consumedCapabilities?: string[]; derivedFromCapabilityIds?: string[]
+    }>
   }
   const mode = raceRes.mode ?? 'http1-fallback'
   const exchanges = (raceRes.results ?? []).map(item => ({
@@ -701,6 +715,9 @@ export async function handleProveRace(host: ProveHandlerHost, args: Record<strin
     status: item.status,
     durationMs: item.durationMs,
     bodySha256: item.bodySha256,
+    ...(item.consumedCapabilityId ? { consumedCapabilityId: item.consumedCapabilityId } : {}),
+    ...(item.consumedCapabilities?.length ? { consumedCapabilities: item.consumedCapabilities } : {}),
+    ...(item.derivedFromCapabilityIds?.length ? { derivedFromCapabilityIds: item.derivedFromCapabilityIds } : {}),
   }))
 
   let post: ProveHttpExchangeResult | null = null
