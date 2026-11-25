@@ -1487,6 +1487,10 @@ export const MAX_CHAIN_CONTINUATIONS = 2
 export const MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS = 1
 /** Maximum targeted multi-hop steps promoted immediately into Wave 1 from Source-First Code Audit. */
 export const CODE_AUDIT_WAVE1_MAX_STEPS = 6
+/** Maximum distinct sibling code-audit suspects attached to each Wave-1 multi-hop step. */
+export const MAX_CODE_AUDIT_SIBLING_LEADS = 4
+/** Maximum composite multi-service chain steps synthesized from complementary code-audit sinks. */
+export const MAX_SYNTHESIZED_CODE_AUDIT_COMPOSITE_STEPS = 2
 
 const SEALED_HOP_CAP_HANDLE_RE = /\bcap:hop_(?!synth:)[A-Za-z0-9._-]+:[A-Za-z0-9._-]+/
 const SOURCE_AUDIT_ORIGIN_TEXT_RE = /\b(?:source[- ]first code audit|source audit verify|semantic audit|code_audit_suspect|code_audit|source_audit|semantic_audit)\b/i
@@ -2797,6 +2801,300 @@ function inferSinkKindFromFactText(text: string): string {
   return 'api_route'
 }
 
+type CodeAuditChainRole =
+  | 'outbound_fetch'
+  | 'signing_webhook'
+  | 'info_disclosure'
+  | 'auth_session'
+  | 'privileged_mutation'
+  | 'async_worker'
+
+interface NormalizedCodeAuditSuspect {
+  fact: Fact
+  asset: Run['candidates'][number]
+  explicitSuspect: boolean
+  routeOrAction: string
+  endpointHint: string
+  fileLoc: string
+  serviceScope: string
+  hypothesisBody: string
+  sinkKind: string
+  authCheck: string
+  ownershipCheck: string
+  explicitCategory: string
+  mappedSkills: string[]
+  isCrown: boolean
+  missingAuthOrOwner: boolean
+  host: string
+  roles: ReadonlySet<CodeAuditChainRole>
+}
+
+const COMPOSITE_CODE_AUDIT_TITLE_PREFIX = 'Source audit composite chain ·'
+const CODE_AUDIT_SIBLING_BLOCK_MAX_CHARS = 680
+
+function inferServiceScopeFromSuspect(fileLoc: string, endpointHint: string, origin: string): string {
+  const cleanFile = fileLoc.replace(/:\d+$/, '').replace(/^\/+/, '')
+  if (cleanFile) {
+    const parts = cleanFile.split('/').filter(Boolean)
+    if (parts.length >= 2 && /^(?:services|apps|packages|microservices|workers|modules|src)$/i.test(parts[0]!)) {
+      return `${parts[0]!.toLowerCase()}/${parts[1]!.toLowerCase()}`
+    }
+    if (parts.length >= 2) return parts[0]!.toLowerCase()
+  }
+  const routeSeg = endpointHint.replace(/^[A-Z]+\s+/, '').split('/').filter(Boolean)[0]
+  const host = (() => {
+    try { return new URL(origin).hostname.toLowerCase() } catch { return origin.toLowerCase() }
+  })()
+  return routeSeg ? `${host}/${routeSeg.toLowerCase()}` : host
+}
+
+function classifyCodeAuditChainRoles(input: {
+  sinkKind: string
+  text: string
+}): ReadonlySet<CodeAuditChainRole> {
+  const roles = new Set<CodeAuditChainRole>()
+  const sink = input.sinkKind.toLowerCase()
+  const lower = input.text.toLowerCase()
+
+  if (
+    sink === 'outbound_fetch'
+    || sink === 'redirect'
+    || /\b(?:outbound[- ]?fetch|ssrf|url[- ]?fetch|render(?:er)?|headless|pdf|open\s+redirect|redirect\s+to|edge\s+proxy|reverse\s+proxy|follows?\s+redirects?)\b/.test(lower)
+  ) {
+    roles.add('outbound_fetch')
+  }
+  if (
+    sink === 'webhook'
+    || /\b(?:webhook|hmac|x-signature|x-hub-signature|signature\s+verif|signing[- ]?key|signing[- ]?secret|signing[- ]?material|jwt\s+(?:sign|forg|mint)|jwks|hs256|rs256)\b/.test(lower)
+  ) {
+    roles.add('signing_webhook')
+  }
+  if (
+    /\b(?:leak(?:s|ed|ing)?|expos(?:e|es|ed|ure)|disclos(?:e|es|ed|ure)|plaintext|in[- ]?log|log\s+sink|debug\s+endpoint|diagnostic|directory\s+(?:listing|leak|expos)|enumerat(?:e|ion)|cache[- ]?key|cache\s+(?:deception|poison))\b/.test(lower)
+  ) {
+    roles.add('info_disclosure')
+  }
+  if (
+    sink === 'auth_config'
+    || /\b(?:session|jwt|oauth|oidc|sso|saml|invite|magic[- ]?link|impersonat|x-forwarded|forwarded[- ]?(?:role|user|identity|header)|trust[- ]?boundary|role[- ]?grant|roles\/grant|token\s+(?:mint|forg|exchange|leak|expos)|revok(?:e|ed|ation)|cookie\s+scope)\b/.test(lower)
+  ) {
+    roles.add('auth_session')
+  }
+  if (
+    sink === 'upload_storage'
+    || sink === 'db_query'
+    || /\b(?:transfer|payout|approve|self[- ]?approv|ledger|refund|credit|debit|billing|admin|roles\/grant|export|batch|delete|mutat(?:e|ion)|write|state[- ]?machine|creator\/approver|mass\s+assignment|cross[- ]?tenant|bola|bfla|idor|escalat(?:e|ion)|missing\s+authz?)\b/.test(lower)
+  ) {
+    roles.add('privileged_mutation')
+  }
+  if (
+    /\b(?:async[- ]?worker|background\s+worker|queue|job|export|deliver|render(?:er)?|webhook|sse|stream|poll|callback)\b/.test(lower)
+  ) {
+    roles.add('async_worker')
+  }
+  return roles
+}
+
+function compactSuspectCue(text: string, maxLen = 78): string {
+  const cleaned = text.replace(/\s+/g, ' ').trim()
+  return cleaned.length <= maxLen ? cleaned : `${cleaned.slice(0, maxLen - 1).trimEnd()}…`
+}
+
+function selectCrossServiceSiblingLeads(
+  anchor: Pick<NormalizedCodeAuditSuspect, 'serviceScope' | 'sinkKind' | 'fileLoc' | 'roles'>,
+  pool: readonly NormalizedCodeAuditSuspect[],
+  excludeFactIds: ReadonlySet<string>,
+  maxSiblings = MAX_CODE_AUDIT_SIBLING_LEADS,
+): NormalizedCodeAuditSuspect[] {
+  const scored = pool
+    .filter(item => !excludeFactIds.has(item.fact.id))
+    .map((item, idx) => {
+      let score = 0
+      if (item.serviceScope !== anchor.serviceScope) score += 4
+      if (item.sinkKind !== anchor.sinkKind) score += 3
+      if (item.fileLoc && item.fileLoc !== anchor.fileLoc) score += 2
+      for (const role of item.roles) {
+        if (!anchor.roles.has(role)) {
+          score += 2
+          break
+        }
+      }
+      if (item.explicitSuspect) score += 1
+      return { item, score, idx }
+    })
+    .sort((a, b) => (b.score - a.score) || (a.idx - b.idx))
+  return scored.slice(0, maxSiblings).map(entry => entry.item)
+}
+
+function formatCrossServiceSiblingLeadsBlock(siblings: readonly NormalizedCodeAuditSuspect[]): string {
+  if (!siblings.length) return ''
+  const prefix = 'Cross-Service Sibling Leads (chain across these if composable): '
+  const parts: string[] = []
+  let totalLen = prefix.length
+  for (let i = 0; i < siblings.length; i += 1) {
+    const sib = siblings[i]!
+    const label = sib.endpointHint || sib.routeOrAction || compactSuspectCue(sib.fact.summary, 48)
+    const loc = sib.fileLoc || sib.host
+    const cue = compactSuspectCue(sib.fact.summary, 68)
+    const entry = `[S${i + 1}] ${label} (${loc}, sink=${sib.sinkKind}): ${cue}`
+    const sepLen = parts.length ? 3 : 0
+    if (totalLen + sepLen + entry.length > CODE_AUDIT_SIBLING_BLOCK_MAX_CHARS) {
+      if (!parts.length) {
+        parts.push(entry.slice(0, Math.max(48, CODE_AUDIT_SIBLING_BLOCK_MAX_CHARS - prefix.length)))
+      }
+      break
+    }
+    parts.push(entry)
+    totalLen += sepLen + entry.length
+  }
+  return parts.length ? `${prefix}${parts.join(' | ')}` : ''
+}
+
+interface SynthesizedCompositeSpec {
+  key: string
+  title: string
+  category: string
+  hops: NormalizedCodeAuditSuspect[]
+  priority: number
+}
+
+function synthesizeCompositeCodeAuditChains(
+  candidates: readonly NormalizedCodeAuditSuspect[],
+  maxComposites: number,
+): SynthesizedCompositeSpec[] {
+  if (candidates.length < 2 || maxComposites <= 0) return []
+  const composites: SynthesizedCompositeSpec[] = []
+  const usedInPriorComposite = new Set<string>()
+  const emittedSignatures = new Set<string>()
+
+  const pickCandidate = (
+    predicate: (c: NormalizedCodeAuditSuspect) => boolean,
+    excludeIds: ReadonlySet<string>,
+    anchor?: NormalizedCodeAuditSuspect,
+  ): NormalizedCodeAuditSuspect | undefined => {
+    const matching = candidates
+      .filter(c => !excludeIds.has(c.fact.id) && predicate(c))
+      .map((c, idx) => {
+        let score = 0
+        if (!usedInPriorComposite.has(c.fact.id)) score += 4
+        if (anchor && c.serviceScope !== anchor.serviceScope) score += 3
+        if (anchor && c.fileLoc && c.fileLoc !== anchor.fileLoc) score += 2
+        if (anchor && c.sinkKind !== anchor.sinkKind) score += 2
+        if (c.explicitSuspect) score += 1
+        return { c, score, idx }
+      })
+      .sort((a, b) => (b.score - a.score) || (a.idx - b.idx))
+    return matching[0]?.c
+  }
+
+  const recordComposite = (
+    key: string,
+    label: string,
+    category: string,
+    hops: NormalizedCodeAuditSuspect[],
+  ) => {
+    if (composites.length >= maxComposites || hops.length < 2) return
+    const sig = [...hops.map(h => h.fact.id)].sort().join('|')
+    if (emittedSignatures.has(sig)) return
+    emittedSignatures.add(sig)
+    for (const h of hops) usedInPriorComposite.add(h.fact.id)
+    const host = hops[0]!.host
+    composites.push({
+      key,
+      title: `${COMPOSITE_CODE_AUDIT_TITLE_PREFIX} ${label} (${host})`,
+      category,
+      hops,
+      priority: Math.max(96, 98 - composites.length),
+    })
+  }
+
+  // Pattern 1: Outbound-Fetch / SSRF + Internal Signing / Webhook (+ optional privileged terminal)
+  {
+    const used = new Set<string>()
+    const entry = pickCandidate(c => c.roles.has('outbound_fetch'), used)
+    if (entry) {
+      used.add(entry.fact.id)
+      const pivot = pickCandidate(c => c.roles.has('signing_webhook'), used, entry)
+      if (pivot) {
+        used.add(pivot.fact.id)
+        const terminal = pickCandidate(c => c.roles.has('privileged_mutation'), used, pivot)
+          ?? pickCandidate(c => c.roles.has('auth_session'), used, pivot)
+        const hops = terminal ? [entry, pivot, terminal] : [entry, pivot]
+        recordComposite(
+          'outbound_signing_webhook',
+          terminal ? 'Outbound/SSRF -> Signing/Webhook -> Terminal Impact' : 'Outbound/SSRF -> Signing/Webhook Pivot',
+          terminal ? 'broken-access-control' : 'auth-identity',
+          hops,
+        )
+      }
+    }
+  }
+
+  // Pattern 2: Info-Disclosure / Cache + Auth/Invite/Session + Privileged Mutation
+  if (composites.length < maxComposites) {
+    const used = new Set<string>()
+    const leak = pickCandidate(c => c.roles.has('info_disclosure') && c.sinkKind !== 'auth_config', used)
+      ?? pickCandidate(c => c.roles.has('info_disclosure'), used)
+    if (leak) used.add(leak.fact.id)
+    const authPivot = pickCandidate(c => c.roles.has('auth_session') && c.sinkKind === 'auth_config', used, leak)
+      ?? pickCandidate(c => c.roles.has('auth_session'), used, leak)
+    if (authPivot) used.add(authPivot.fact.id)
+    const terminal = pickCandidate(c => c.roles.has('privileged_mutation'), used, authPivot ?? leak)
+    const hops = [leak, authPivot, terminal].filter((h): h is NormalizedCodeAuditSuspect => Boolean(h))
+    const distinctScopes = new Set(hops.map(h => h.serviceScope)).size
+    const distinctSinks = new Set(hops.map(h => h.sinkKind)).size
+    const hasCrossBoundaryDiversity = Boolean(leak && (authPivot || terminal)) || distinctScopes >= 2 || distinctSinks >= 2
+    if (hops.length >= 2 && hasCrossBoundaryDiversity) {
+      const label = leak && authPivot && terminal
+        ? 'Disclosure -> Auth/Session -> Privileged Mutation'
+        : leak && authPivot
+          ? 'Disclosure -> Auth/Session Pivot'
+          : leak && terminal
+            ? 'Disclosure -> Privileged Cross-Tenant Pivot'
+            : 'Auth/Session -> Privileged Mutation Pivot'
+      recordComposite('disclosure_auth_mutation', label, 'broken-access-control', hops)
+    }
+  }
+
+  // Pattern 3 (Fallback): General cross-service multi-sink pivot when >=2 distinct services & sinks coexist
+  if (composites.length < maxComposites) {
+    const distinctServices = new Set(candidates.map(c => c.serviceScope))
+    const distinctSinks = new Set(candidates.map(c => c.sinkKind))
+    if (distinctServices.size >= 2 && distinctSinks.size >= 2) {
+      const used = new Set<string>()
+      const first = pickCandidate(
+        c => c.roles.has('outbound_fetch') || c.roles.has('info_disclosure') || c.roles.has('async_worker'),
+        used,
+      ) ?? pickCandidate(() => true, used)
+      if (first) {
+        used.add(first.fact.id)
+        const second = pickCandidate(
+          c => c.serviceScope !== first.serviceScope && c.sinkKind !== first.sinkKind,
+          used,
+          first,
+        )
+        if (second) {
+          used.add(second.fact.id)
+          const third = pickCandidate(
+            c => c.roles.has('privileged_mutation') && c.serviceScope !== second.serviceScope,
+            used,
+            second,
+          )
+          const hops = third ? [first, second, third] : [first, second]
+          recordComposite(
+            'cross_service_multi_sink',
+            `Cross-Service ${first.sinkKind} -> ${second.sinkKind}${third ? ` -> ${third.sinkKind}` : ''} Pivot`,
+            'broken-access-control',
+            hops,
+          )
+        }
+      }
+    }
+  }
+
+  return composites
+}
+
 export function convertCodeAuditSuspectsToChainSteps(
   storage: Store,
   run: Run,
@@ -2811,16 +3109,16 @@ export function convertCodeAuditSuspectsToChainSteps(
   const created: ChainStep[] = []
   let totalSteps = existingSteps.length
   const maxSteps = options.maxSteps !== undefined ? Math.max(0, Math.floor(options.maxSteps)) : Number.POSITIVE_INFINITY
+  const promoteMultiHop = options.promoteMultiHop === true
 
+  const normalized: NormalizedCodeAuditSuspect[] = []
   for (const fact of dedupePromotableCodeAuditFacts(suspects)) {
-    if (created.length >= maxSteps) break
-    if (totalSteps >= hardChainStepsCeiling) break
     if (fact.tainted || !approvedOrigins.has(fact.origin)) continue
-    if (coveredFactIds.has(fact.id)) continue
     const asset = run.candidates.find(c => c.origin === fact.origin && run.approved.includes(c.id))
     if (!asset) continue
 
     const data = fact.data as Partial<CodeAuditSuspectData> & Record<string, unknown>
+    const explicitSuspect = String(fact.kind) === 'code_audit_suspect' || data.subkind === 'code_audit_suspect'
     const routeOrAction = typeof data.routeOrAction === 'string' && data.routeOrAction.trim()
       ? data.routeOrAction.trim()
       : ''
@@ -2839,54 +3137,168 @@ export function convertCodeAuditSuspectsToChainSteps(
       : inferSinkKindFromFactText(`${fact.summary} ${hypothesisBody} ${endpointHint}`)
     const authCheck = typeof data.authCheck === 'string' ? data.authCheck : 'unknown'
     const ownershipCheck = typeof data.ownershipCheck === 'string' ? data.ownershipCheck : 'unknown'
-
     const host = new URL(fact.origin).hostname
-    const title = routeOrAction
-      ? `Source audit verify · ${routeOrAction.slice(0, 90)} (${host})`
-      : `Source audit verify · ${fact.summary.slice(0, 80)} (${host})`
-    if (existingTitles.has(title.toLowerCase())) continue
-
     const mapped = sinkCategoryAndSkills(sinkKind)
     const explicitCategory = typeof data.category === 'string' && data.category.trim()
       ? data.category.trim()
       : mapped.category
-    const specialistProfile = routeStepToSpecialist({
-      title: `${fact.summary} ${title}`,
-      hypothesis: hypothesisBody,
-      category: explicitCategory,
-      skills: mapped.skills,
-      endpoint: endpointHint,
-      sinkKind,
-    })
-    const stepSkills = options.promoteMultiHop
-      ? [...new Set([...mapped.skills, 'multihop-chains', 'chain-primitives'])]
-      : mapped.skills
     const missingAuthOrOwner = /missing|none|weak|bypass|absent|unverified|no |asymmetry|leak|expos|untrusted|forged|spoof/i.test(
       `${authCheck} ${ownershipCheck} ${fact.summary}`,
     )
     const isCrown = (hostTiers?.[fact.origin] ?? classifyHostTier(fact.origin)) === 'crown_jewel'
-    const priority = missingAuthOrOwner ? (isCrown ? 96 : 92) : (isCrown ? 90 : 85)
+    const serviceScope = inferServiceScopeFromSuspect(fileLoc, endpointHint, fact.origin)
+    const roles = classifyCodeAuditChainRoles({
+      sinkKind,
+      text: `${fact.summary} ${hypothesisBody} ${endpointHint} ${fileLoc}`,
+    })
 
-    const hypothesis = [
-      `Source-First Code Audit suspect${fileLoc ? ` at ${fileLoc}` : ''}${endpointHint ? ` targeting ${endpointHint}` : ''}.`,
-      `Auth check: ${authCheck}; Ownership check: ${ownershipCheck}; Sink: ${sinkKind}.`,
+    normalized.push({
+      fact,
+      asset,
+      explicitSuspect,
+      routeOrAction,
+      endpointHint,
+      fileLoc,
+      serviceScope,
       hypothesisBody,
-      'Verify live reachability with negative control + differential probe (and cross-persona BOLA check if Tier >= 2) and submit a DeclarativeReplaySpec if confirmed.',
-    ].join(' ')
+      sinkKind,
+      authCheck,
+      ownershipCheck,
+      explicitCategory,
+      mappedSkills: mapped.skills,
+      isCrown,
+      missingAuthOrOwner,
+      host,
+      roles,
+    })
+  }
+
+  // 1. When promoting multi-hop Wave-1 chains, synthesize up to 2 composite multi-service steps
+  //    from complementary sink categories so Turn-1 workers execute end-to-end 3-5 hop chains.
+  if (promoteMultiHop && normalized.length >= 2 && maxSteps > 0) {
+    const compositeBudget = Math.min(MAX_SYNTHESIZED_CODE_AUDIT_COMPOSITE_STEPS, maxSteps)
+    const composites = synthesizeCompositeCodeAuditChains(normalized, compositeBudget)
+    for (const comp of composites) {
+      if (created.length >= maxSteps) break
+      if (totalSteps >= hardChainStepsCeiling) break
+      if (existingTitles.has(comp.title.toLowerCase())) continue
+
+      const hopFactIds = comp.hops.map(h => h.fact.id)
+      const hopIdSet = new Set(hopFactIds)
+      const remainingSiblings = selectCrossServiceSiblingLeads(
+        comp.hops[comp.hops.length - 1]!,
+        normalized,
+        hopIdSet,
+        Math.max(0, MAX_CODE_AUDIT_SIBLING_LEADS - Math.max(0, hopFactIds.length - 1)),
+      )
+      const siblingBlock = formatCrossServiceSiblingLeadsBlock(remainingSiblings)
+      const hopSequence = comp.hops
+        .map((h, idx) => {
+          const target = h.endpointHint || h.routeOrAction || compactSuspectCue(h.fact.summary, 44)
+          const loc = h.fileLoc || h.host
+          return `Hop ${idx + 1} (${target}, ${loc}, sink=${h.sinkKind}): ${compactSuspectCue(h.hypothesisBody, 110)}`
+        })
+        .join(' -> ')
+      const dependsOnFactIds = [
+        ...new Set([...hopFactIds, ...remainingSiblings.map(s => s.fact.id)]),
+      ].slice(0, MAX_CODE_AUDIT_SIBLING_LEADS + 1)
+      const sourceOrigins = [...new Set(comp.hops.map(h => h.fact.origin))]
+      const targetAssetIds = [...new Set(comp.hops.map(h => h.asset.id))]
+      const skills = [
+        ...new Set([
+          'source-first-audit',
+          'multihop-chains',
+          'chain-primitives',
+          ...comp.hops.flatMap(h => h.mappedSkills),
+        ]),
+      ]
+      const specialistProfile = routeStepToSpecialist({
+        title: comp.title,
+        hypothesis: hopSequence,
+        category: comp.category,
+        skills,
+        endpoint: comp.hops[0]!.endpointHint,
+        sinkKind: comp.hops[0]!.sinkKind,
+      })
+      const hypothesisParts = [
+        `[chain_hops=${Math.max(3, comp.hops.length)}] Multi-service composite code-audit chain: ${hopSequence}.`,
+        'Execute end-to-end via guardian_verify from ONE starting low-privilege persona (or anonymous / freshly derived credential; never use a target-tenant persona on the probe arm): seal intermediate handles/keys with ctx.seal_capability, use ctx.hmac_sign / ctx.jwt_sign / ctx.await_async across signing/async boundaries, and confirm the full DAG via ctx.prove_composite (Mode A fresh_clean_replay) — never stop at an intermediate info-disclosure.',
+      ]
+      if (siblingBlock) hypothesisParts.push(siblingBlock)
+
+      const step = storage.addChainStep(run, {
+        title: comp.title,
+        hypothesis: hypothesisParts.join(' '),
+        category: comp.category,
+        priority: comp.priority,
+        targetAssetIds,
+        skills,
+        dependsOnFactIds,
+        sourceOrigins,
+        specialistProfile,
+      })
+      existingTitles.add(comp.title.toLowerCase())
+      created.push(step)
+      totalSteps += 1
+    }
+  }
+
+  // 2. Emit individual targeted steps for the remaining budget, enriching each Wave-1 multi-hop
+  //    step with a compact Cross-Service Sibling Leads block + sibling dependsOnFactIds.
+  for (const item of normalized) {
+    if (created.length >= maxSteps) break
+    if (totalSteps >= hardChainStepsCeiling) break
+    if (coveredFactIds.has(item.fact.id)) continue
+
+    const title = item.routeOrAction
+      ? `Source audit verify · ${item.routeOrAction.slice(0, 90)} (${item.host})`
+      : `Source audit verify · ${item.fact.summary.slice(0, 80)} (${item.host})`
+    if (existingTitles.has(title.toLowerCase())) continue
+
+    const specialistProfile = routeStepToSpecialist({
+      title: `${item.fact.summary} ${title}`,
+      hypothesis: item.hypothesisBody,
+      category: item.explicitCategory,
+      skills: item.mappedSkills,
+      endpoint: item.endpointHint,
+      sinkKind: item.sinkKind,
+    })
+    const stepSkills = promoteMultiHop
+      ? [...new Set([...item.mappedSkills, 'multihop-chains', 'chain-primitives'])]
+      : item.mappedSkills
+    const priority = item.missingAuthOrOwner ? (item.isCrown ? 96 : 92) : (item.isCrown ? 90 : 85)
+
+    const siblings = promoteMultiHop
+      ? selectCrossServiceSiblingLeads(item, normalized, new Set([item.fact.id]), MAX_CODE_AUDIT_SIBLING_LEADS)
+      : []
+    const siblingBlock = promoteMultiHop ? formatCrossServiceSiblingLeadsBlock(siblings) : ''
+    const dependsOnFactIds = promoteMultiHop
+      ? [item.fact.id, ...siblings.map(s => s.fact.id)]
+      : [item.fact.id]
+
+    const hypothesisParts = [
+      `Source-First Code Audit suspect${item.fileLoc ? ` at ${item.fileLoc}` : ''}${item.endpointHint ? ` targeting ${item.endpointHint}` : ''}.`,
+      `Auth check: ${item.authCheck}; Ownership check: ${item.ownershipCheck}; Sink: ${item.sinkKind}.`,
+      item.hypothesisBody,
+      promoteMultiHop
+        ? 'Verify live reachability via guardian_verify from ONE starting low-privilege persona (never use a target-tenant persona on the probe arm): seal intermediate handles/tokens/keys with ctx.seal_capability, chain across sibling services (using ctx.hmac_sign/ctx.jwt_sign/ctx.await_async as needed), and confirm the full DAG via ctx.prove_composite (Mode A fresh_clean_replay) — never stop at an intermediate info-disclosure when downstream pivots are reachable.'
+        : 'Verify live reachability with negative control + differential probe (and cross-persona BOLA check if Tier >= 2) and submit a DeclarativeReplaySpec if confirmed.',
+    ]
+    if (siblingBlock) hypothesisParts.push(siblingBlock)
 
     const step = storage.addChainStep(run, {
       title,
-      hypothesis,
-      category: explicitCategory,
+      hypothesis: hypothesisParts.join(' '),
+      category: item.explicitCategory,
       priority,
-      targetAssetIds: [asset.id],
+      targetAssetIds: [item.asset.id],
       skills: stepSkills,
-      dependsOnFactIds: [fact.id],
-      sourceOrigins: [fact.origin],
+      dependsOnFactIds,
+      sourceOrigins: [item.fact.origin],
       specialistProfile,
     })
     existingTitles.add(title.toLowerCase())
-    coveredFactIds.add(fact.id)
+    coveredFactIds.add(item.fact.id)
     created.push(step)
     totalSteps += 1
   }

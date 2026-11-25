@@ -850,7 +850,7 @@ test('runSourceFirstCodeAudit promotes explicit suspects AND cross-cutting defec
 
   for (const step of res.stepsCreated) {
     assert.equal(step.status, 'ready')
-    assert.equal(step.dependsOnFactIds.length, 1, `step "${step.title}" must link its source-audit fact via dependsOnFactIds`)
+    assert.ok(step.dependsOnFactIds.length >= 1, `step "${step.title}" must link its source-audit fact(s) via dependsOnFactIds`)
     assert.equal(isMultiHopChainStep(step), true, `promoted step "${step.title}" must be multi-hop eligible`)
     assert.equal(classifyDispatchLane(step), 'chain', `promoted step "${step.title}" must dispatch in the chain lane`)
     assert.equal(chainLaneDispatchRank(step), 0, `promoted step "${step.title}" must hold top Rank 0 priority`)
