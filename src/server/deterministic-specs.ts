@@ -11,6 +11,7 @@
  * builder mistake costs a bounded replay and can never persist an unverified finding.
  */
 import { randomBytes } from 'node:crypto'
+import { browserSinkEnvelopeFromSteps } from './floor-recipes.ts'
 import { injectUniversalParam } from './probes/context.ts'
 import type { DifferentialProbeClass, DifferentialResult, SurfaceParamLocation } from './surface-engine.ts'
 
@@ -1660,6 +1661,13 @@ function synthReflectedXss(hyp: EngineHypothesis, result: DifferentialResult): S
   const jq = '{ controlPassed: (.steps.c1.status >= 200 and .steps.c1.status < 400 and (.steps.c1.title != .canaryToken) and (([(.steps.c1.domSinkTraces // [])[] | select(.containsCanary)] | length) == 0)), ' +
     'confirmed: ((.steps.p1.status >= 200 and .steps.p1.status < 400) and ((.steps.p1.title == .canaryToken) or (([(.steps.p1.domSinkTraces // [])[] | select(.containsCanary)] | length) >= 1))), ' +
     'observed: ("probe title=" + (.steps.p1.title // "" | tostring)), expected: "reflected input is inert text" }'
+  const steps = [
+    { id: 'c1', role: 'control', description: 'Render the page with a benign parameter value', origin: hyp.endpoint.origin, ...persona, pathAndQuery: controlPath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 300 },
+    { id: 'p1', role: 'probe', description: 'Render the page with an executable marker payload', origin: hyp.endpoint.origin, ...persona, pathAndQuery: probePath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 800 },
+  ]
+  // Cut 3d: the same steps carry the `browser_sink` envelope, so confirmation is the host-recorded
+  // canary sink receipt rather than a declarative assertion over the legacy browser VM.
+  const recipe = browserSinkEnvelopeFromSteps({ origin: hyp.endpoint.origin, vulnClass: 'dom_xss', steps })
   return [{
     kind: 'browser_chain',
     vulnClass: 'xss_reflected',
@@ -1667,10 +1675,8 @@ function synthReflectedXss(hyp: EngineHypothesis, result: DifferentialResult): S
     spec: {
       ...baseFields(hyp.endpoint.origin, 'Reflected cross-site scripting (executed marker)', 'CWE-79', 'xss', 'high', jq),
       kind: 'browser_chain',
-      steps: [
-        { id: 'c1', role: 'control', description: 'Render the page with a benign parameter value', origin: hyp.endpoint.origin, ...persona, pathAndQuery: controlPath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 300 },
-        { id: 'p1', role: 'probe', description: 'Render the page with an executable marker payload', origin: hyp.endpoint.origin, ...persona, pathAndQuery: probePath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 800 },
-      ],
+      steps,
+      ...(recipe ? { recipe } : {}),
     },
   }]
 }

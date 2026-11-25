@@ -6,6 +6,7 @@
 import { randomBytes } from 'node:crypto'
 import { appendQuery, baseFields, is2xx, jqStr, sessionFields, stepOf } from './benchmark-specs-common.ts'
 import type { RequestParts, SynthesizedSpec } from './benchmark-specs-common.ts'
+import { browserSinkEnvelopeFromSteps } from '../src/server/floor-recipes.ts'
 import { fillPlaceholders, hasPathPlaceholder, probePathFor, siblingValue } from './benchmark-probes.ts'
 import type { HypothesisOutcome, ProbeEnv } from './benchmark-probes.ts'
 
@@ -541,15 +542,20 @@ export function synthUrlDomXss(o: HypothesisOutcome, env: ProbeEnv): Synthesized
   const jq = '{ controlPassed: (.steps.c1.status >= 200 and .steps.c1.status < 400 and (.steps.c1.title != .canaryToken) and (([(.steps.c1.domSinkTraces // [])[] | select(.containsCanary)] | length) == 0)), ' +
     'confirmed: ((.steps.p1.status >= 200 and .steps.p1.status < 400) and ((.steps.p1.title == .canaryToken) or (([(.steps.p1.domSinkTraces // [])[] | select(.containsCanary)] | length) >= 1))), ' +
     'observed: ("probe sink hits=" + (([(.steps.p1.domSinkTraces // [])[] | select(.containsCanary)] | length) | tostring)), expected: "URL input is rendered as inert text" }'
+  const steps = [
+    { id: 'c1', role: 'control', description: 'Render the page with a benign query value', ...params, pathAndQuery: controlPath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 300 },
+    { id: 'p1', role: 'probe', description: 'Render the page with an executable query payload', ...params, pathAndQuery: probePath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 900 },
+  ]
+  // Cut 3d: confirmation runs the `browser_sink` recipe (host-recorded canary sink), not the
+  // legacy browser VM; the steps above remain the attribution shape.
+  const recipe = browserSinkEnvelopeFromSteps({ origin: env.origin, vulnClass: 'dom_xss', steps })
   return [{
     kind: 'browser_chain',
     spec: {
       ...baseFields(env, 'DOM-based cross-site scripting via URL query sink', 'CWE-79', 'xss', 'high', jq),
       kind: 'browser_chain',
-      steps: [
-        { id: 'c1', role: 'control', description: 'Render the page with a benign query value', ...params, pathAndQuery: controlPath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 300 },
-        { id: 'p1', role: 'probe', description: 'Render the page with an executable query payload', ...params, pathAndQuery: probePath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 900 },
-      ],
+      steps,
+      ...(recipe ? { recipe } : {}),
     },
   }]
 }
@@ -624,12 +630,14 @@ export function synthDomXss(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpe
     ...stepBase, action: 'dom_xss_sink_hook', waitAfterLoadMs: 300,
   })
 
+  const recipe = browserSinkEnvelopeFromSteps({ origin: env.origin, vulnClass: 'dom_xss', steps })
   return [{
     kind: 'browser_chain',
     spec: {
       ...baseFields(env, 'DOM-based cross-site scripting via interactive sink', 'CWE-79', 'xss', 'high', jq),
       kind: 'browser_chain',
       steps,
+      ...(recipe ? { recipe } : {}),
     },
   }]
 }
@@ -662,15 +670,18 @@ export function synthReflectedXss(o: HypothesisOutcome, env: ProbeEnv): Synthesi
   const jq = '{ controlPassed: (.steps.c1.status >= 200 and .steps.c1.status < 400 and (.steps.c1.title != .canaryToken) and (([(.steps.c1.domSinkTraces // [])[] | select(.containsCanary)] | length) == 0)), ' +
     'confirmed: ((.steps.p1.status >= 200 and .steps.p1.status < 400) and ((.steps.p1.title == .canaryToken) or (([(.steps.p1.domSinkTraces // [])[] | select(.containsCanary)] | length) >= 1))), ' +
     'observed: ("probe title=" + (.steps.p1.title // "" | tostring)), expected: "reflected input is inert text" }'
+  const steps = [
+    { id: 'c1', role: 'control', description: 'Render the page with a benign parameter value', ...params, pathAndQuery: controlPath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 300 },
+    { id: 'p1', role: 'probe', description: 'Render the page with an executable marker payload', ...params, pathAndQuery: probePath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 800 },
+  ]
+  const recipe = browserSinkEnvelopeFromSteps({ origin: env.origin, vulnClass: 'dom_xss', steps })
   return [{
     kind: 'browser_chain',
     spec: {
       ...baseFields(env, 'Reflected cross-site scripting (executed marker)', 'CWE-79', 'xss', 'high', jq),
       kind: 'browser_chain',
-      steps: [
-        { id: 'c1', role: 'control', description: 'Render the page with a benign parameter value', ...params, pathAndQuery: controlPath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 300 },
-        { id: 'p1', role: 'probe', description: 'Render the page with an executable marker payload', ...params, pathAndQuery: probePath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 800 },
-      ],
+      steps,
+      ...(recipe ? { recipe } : {}),
     },
   }]
 }

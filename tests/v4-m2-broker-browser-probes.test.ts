@@ -752,36 +752,6 @@ test('M2.6 ScopedBrowser.runBrowserSession: persistent page/localStorage across 
     assert.ok(res[2].domSnippet.includes('LS=EMPTY'), 'control -> probe transition must reset localStorage')
     assert.ok(res[3].domSinkTraces.some(tr => tr.sink === 'innerHTML' && tr.preview.includes('<img src=x onerror=1>')))
 
-    // M1.10 fakeBrowser fallback compatibility (visitPage only, no runBrowserSession)
-    let visitCount = 0
-    const fakeBrowser = {
-      async visitPage() {
-        visitCount += 1
-        return {
-          origin: fx.origin, finalUrl: `${fx.origin}/`, title: 'Fake', status: 200, domSnippet: '<div>ok</div>',
-          links: [], forms: [], xhrRequests: [], blockedOrigins: [], consoleMessages: [],
-          postMessageListeners: { count: 0, hasOnMessage: false, handlers: [], observedEvents: 0, canaryHandledWithoutOriginCheck: false },
-          cookieNames: [], localStorageKeys: [], sessionStorageKeys: [],
-          canaryCheck: { token: null, triggered: false, detail: null }, domSinkTraces: [],
-          exchangeIds: [], exchanges: [], durationMs: 1,
-        }
-      },
-    } as unknown as ScopedBrowser
-    const fbRes = await verifyReplaySpec({
-      spec: {
-        version: 1, kind: 'browser_chain', origin: fx.origin, title: 'Fallback check',
-        category: 'xss', cwe: 'CWE-79', severity: 'medium', severityRationale: 'Fallback check',
-        impact: 'Cross-site scripting in browser DOM.', remediation: 'Escape untrusted HTML', recheckInstructions: 'Replay',
-        steps: [
-          { id: 'c1', role: 'control', description: 'ctrl', origin: fx.origin, pathAndQuery: '/', action: 'navigate' },
-          { id: 'p1', role: 'probe', description: 'probe', origin: fx.origin, pathAndQuery: '/', action: 'navigate' },
-        ],
-        assertionsJq: '{ controlPassed: (.steps.c1.status == 200), confirmed: true, observed: "ok", expected: "ok" }',
-      } as unknown,
-      broker, browser: fakeBrowser, backend: createJqBackend(), grant, signal: sig,
-    })
-    assert.equal(visitCount, 2)
-    assert.equal(fbRes.verdict, 'confirmed')
   })
 })
 

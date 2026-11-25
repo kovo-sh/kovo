@@ -32,7 +32,8 @@
  * | `sql_boolean_diff`     | sqli                                      | `boolean_or_timing`  | boolean rule: >=2 paired rounds, stable structural change |
  * | `sql_time_diff`        | sqli                                      | `boolean_or_timing`  | timing rule, >3x separation |
  * | `race_burst`           | race_double_spend                         | `race_burst`         | repeated terminal transition + divergent burst outcomes |
- * | `browser_chain`        | xss_* / dom_*                             | — (no recipe)        | browser-trace receipts are a separate cut |
+ * | `browser_chain`        | xss_* / dom_* (navigate/fill/click)       | `browser_sink`       | browser rule: host-recorded trace with the canary in an executable sink |
+ * | `browser_chain`        | protocol (postMessage/fetch/builtin)      | — (no recipe)        | claim is not expressible as a sink trace |
  * | `rce_proof`            | ssti / command_injection                  | — (no recipe)        | not expressible by the receipt impact model |
  * | `auth_protocol_proof`  | jwt / oauth / webhook_forgery             | — (no recipe)        | proof-script path stays for protocol forgery |
  * | `cache_differential`   | cache_poisoning                           | — (no recipe)        | no receipt rule |
@@ -49,6 +50,7 @@
  * `LEGACY_UNWIRED_SPECKINDS` with the measured blocking reason; `wiredRecipeForSpecKind` is the
  * single source of truth for the guard.
  */
+import { createHash } from 'node:crypto'
 import { matchInjectionFingerprint } from './oracle-invariants.ts'
 import type { AmbientAuth, ImpactStep, InjectionFamily, RoleName } from './oracle-invariants.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
@@ -166,6 +168,16 @@ export interface FloorRecipeDeps {
    * closed (`browser_trace`) rather than inventing trace ids.
    */
   browserTrace?(input: FloorBrowserInput): Promise<ReceiptBrowserTrace | null> | ReceiptBrowserTrace | null
+  /**
+   * Execute an ordered browser session (navigate/fill/click) and return the canary-bearing traces.
+   * Optional: a recipe that needs it fails closed (`browser_trace`).
+   */
+  browserSession?(input: {
+    origin: string
+    steps: readonly FloorBrowserStep[]
+    canaryToken: string
+    actor: FloorActor
+  }): Promise<FloorBrowserSessionResult | null> | FloorBrowserSessionResult | null
   /** Stable id source; defaults to a per-run counter. */
   nextExchangeId?(): string
 }
@@ -378,6 +390,21 @@ export interface RedirectArgs extends FloorRecipeBaseArgs {
   canaryHost?: string
 }
 
+export interface FloorBrowserStep {
+  role: 'control' | 'probe'
+  action: 'navigate' | 'fill' | 'click'
+  pathAndQuery?: string
+  selector?: string
+  value?: string
+  waitAfterLoadMs?: number
+}
+
+export interface FloorBrowserSessionResult {
+  traces: ReceiptBrowserTrace[]
+  /** True when a cited probe trace recorded the canary reaching an executable sink. */
+  sinkHit: boolean
+}
+
 export interface BrowserSinkArgs extends FloorRecipeBaseArgs {
   actor: FloorActor
   /** URL the browser session loads; defaults to `origin + pathAndQuery`. */
@@ -386,6 +413,10 @@ export interface BrowserSinkArgs extends FloorRecipeBaseArgs {
   expectSinks?: readonly string[]
   /** Marker the driver looks for in the trace (never a payload). */
   marker?: string
+  /** Ordered browser steps (navigate / fill / click); `{{canary_token}}` is interpolated. */
+  steps?: readonly FloorBrowserStep[]
+  /** Verifier-minted canary substituted into the steps and required in the probe sink. */
+  canaryToken?: string
 }
 
 export interface InjectionFingerprintArgs extends FloorRecipeBaseArgs {
@@ -448,6 +479,13 @@ export interface FloorRecipeContext {
   oob(query: FloorOobQuery): Promise<ReceiptOobEvent | null>
   /** Record (and cite) a host-recorded browser trace; null when the host produced none. */
   browser(input: FloorBrowserInput): Promise<ReceiptBrowserTrace | null>
+  /** Run an ordered browser session through the host seam. */
+  browserSession(input: {
+    origin: string
+    steps: readonly FloorBrowserStep[]
+    canaryToken: string
+    actor: FloorActor
+  }): Promise<FloorBrowserSessionResult | null>
   /**
    * Record a preconditions the oracle needs that the receipt gate alone cannot name. Returns the
    * condition so a recipe can continue gathering the rest of the minimum evidence.
@@ -652,6 +690,19 @@ class RecipeContext implements FloorRecipeContext {
     const trace = this.deps.browserTrace ? await this.deps.browserTrace(input) : null
     if (trace && !this.traces.some(existing => existing.id === trace.id)) this.traces.push(trace)
     return trace
+  }
+
+  async browserSession(input: {
+    origin: string
+    steps: readonly FloorBrowserStep[]
+    canaryToken: string
+    actor: FloorActor
+  }): Promise<FloorBrowserSessionResult | null> {
+    const result = this.deps.browserSession ? await this.deps.browserSession(input) : null
+    if (result) for (const trace of result.traces) {
+      if (!this.traces.some(existing => existing.id === trace.id)) this.traces.push(trace)
+    }
+    return result
   }
 
   require(condition: boolean, role: string, message: string): boolean {
@@ -1316,17 +1367,56 @@ const redirect = defineRecipe<RedirectArgs>('redirect', async (args, ctx) => {
 
 /** `browser_chain` / DOM sink → receipt `browser` rule over a host-recorded trace. */
 const browserSink = defineRecipe<BrowserSinkArgs>('browser_sink', async (args, ctx) => {
-  const url = args.url ?? `${args.origin.replace(/\/+$/, '')}${args.pathAndQuery}`
   const browserClass = /^(?:browser_|dom_|postmessage)/i.test(args.vulnClass)
   ctx.require(
     browserClass,
     'receipt_class',
     `browser_sink needs a browser-class label (dom_*/browser_*/postmessage*); ${args.vulnClass} maps to a different receipt rule.`,
   )
-  const trace = await ctx.browser({ origin: args.origin, url, actor: args.actor, ...(args.marker ? { marker: args.marker } : {}) })
-  ctx.require(trace !== null, 'browser_trace', 'No host-recorded browser trace was produced for this origin.')
-  const sinks = trace?.sinks ?? []
-  ctx.require(sinks.length > 0, 'browser_sink', 'The browser trace recorded no sink execution (DOM XSS, postMessage, storage write).')
+  // Verifier-minted canary: deterministic for the same proof inputs, and never a stored literal.
+  const canaryToken = args.canaryToken
+    ?? `guardian-dom-${createHash('sha256').update(`${args.origin}|${args.pathAndQuery}|${args.vulnClass}`).digest('hex').slice(0, 10)}`
+  const interpolate = (value: string | undefined): string | undefined => value?.replaceAll('{{canary_token}}', canaryToken)
+
+  if (!args.steps || args.steps.length === 0) {
+    // Single-visit proof (no interaction): the host records one page trace.
+    const url = args.url ?? `${args.origin.replace(/\/+$/, '')}${args.pathAndQuery}`
+    const trace = await ctx.browser({ origin: args.origin, url, actor: args.actor, ...(args.marker ? { marker: args.marker } : {}) })
+    ctx.require(trace !== null, 'browser_trace', 'No host-recorded browser trace was produced for this origin.')
+    const sinks = trace?.sinks ?? []
+    ctx.require(sinks.length > 0, 'browser_sink', 'The browser trace recorded no sink execution (DOM XSS, postMessage, storage write).')
+    if (args.expectSinks && args.expectSinks.length > 0) {
+      ctx.require(
+        args.expectSinks.some(sink => sinks.includes(sink)),
+        'browser_sink',
+        `The trace recorded ${sinks.join(', ') || 'no sinks'}; expected one of ${args.expectSinks.join(', ')}.`,
+      )
+    }
+    return buildProofReceipt({
+      vulnClass: args.vulnClass,
+      target: targetOf(args),
+      exchangeIds: [],
+      browserTraceIds: trace ? [trace.id] : [],
+      claimedDelta: `The recorded browser trace executed ${sinks.join(', ') || 'no sink'} on ${url}.`,
+    })
+  }
+
+  const normalized = args.steps.map(step => ({
+    ...step,
+    ...(step.pathAndQuery !== undefined ? { pathAndQuery: interpolate(step.pathAndQuery) } : {}),
+    ...(step.value !== undefined ? { value: interpolate(step.value) } : {}),
+  }))
+  const controlSteps = normalized.filter(step => step.role === 'control')
+  const probeSteps = normalized.filter(step => step.role !== 'control')
+  if (controlSteps.length > 0) {
+    const control = await ctx.browserSession({ origin: args.origin, steps: controlSteps, canaryToken, actor: args.actor })
+    ctx.require(control !== null, 'browser_control', 'The control browser session produced no trace.')
+    ctx.require(control?.sinkHit !== true, 'browser_control', 'The control session recorded the canary in an executable sink, so the payload is not the cause.')
+  }
+  const result = await ctx.browserSession({ origin: args.origin, steps: probeSteps, canaryToken, actor: args.actor })
+  ctx.require(result !== null, 'browser_trace', 'No host-recorded browser session trace was produced for this origin.')
+  ctx.require(result?.sinkHit === true, 'browser_sink', 'The probe session did not record the canary reaching an executable DOM sink.')
+  const sinks = [...new Set((result?.traces ?? []).flatMap(trace => trace.sinks ?? []))]
   if (args.expectSinks && args.expectSinks.length > 0) {
     ctx.require(
       args.expectSinks.some(sink => sinks.includes(sink)),
@@ -1338,10 +1428,77 @@ const browserSink = defineRecipe<BrowserSinkArgs>('browser_sink', async (args, c
     vulnClass: args.vulnClass,
     target: targetOf(args),
     exchangeIds: [],
-    browserTraceIds: trace ? [trace.id] : [],
-    claimedDelta: `The recorded browser trace executed ${sinks.join(', ') || 'no sink'} on ${url}.`,
+    browserTraceIds: (result?.traces ?? []).map(trace => trace.id),
+    claimedDelta: `The probe browser session recorded ${sinks.join(', ') || 'the canary'} reaching an executable sink after ${probeSteps.length} step(s).`,
   })
 })
+
+const SIMPLE_BROWSER_ACTIONS = new Set(['navigate', 'fill', 'click', 'dom_xss_sink_hook'])
+
+/**
+ * True when a browser spec carries a protocol proof (postMessage origin check, credentialed
+ * cross-origin fetch, built-in DOM/storage assertion). Those stay on the framework verifier; only
+ * navigate/fill/click DOM-sink proofs map onto the `browser_sink` recipe.
+ */
+export function isProtocolBrowserSpec(steps: ReadonlyArray<Record<string, unknown>> | undefined): boolean {
+  if (!steps || steps.length === 0) return false
+  return steps.some(step => {
+    const action = typeof step.action === 'string' ? step.action : 'navigate'
+    if (!SIMPLE_BROWSER_ACTIONS.has(action)) return true
+    return step.builtinCheck !== undefined ||
+      step.fetchTarget !== undefined ||
+      step.postMessagePayload !== undefined ||
+      step.postMessageOrigin !== undefined
+  })
+}
+
+/** Map a navigate/fill/click `browser_chain` spec onto the browser_sink recipe envelope. */
+export function browserSinkEnvelopeFromSteps(input: {
+  origin: string
+  vulnClass: string
+  steps: ReadonlyArray<Record<string, unknown>>
+}): { recipeId: 'browser_sink'; args: BrowserSinkArgs } | null {
+  // A protocol proof must never be flattened into a DOM-sink recipe: its assertion (origin check,
+  // credentialed fetch, built-in result) is not expressible here, so the caller stays on the
+  // framework verifier instead of silently dropping the claim.
+  if (isProtocolBrowserSpec(input.steps)) return null
+  const mapped: FloorBrowserStep[] = []
+  for (const step of input.steps) {
+    const action = typeof step.action === 'string' ? step.action : 'navigate'
+    if (!SIMPLE_BROWSER_ACTIONS.has(action)) return null
+    // `dom_xss_sink_hook` is a snapshot, not an interaction: the recipe arms the sink hook on every
+    // visited page and requires the canary in the probe trace, so the step maps to nothing.
+    if (action === 'dom_xss_sink_hook') continue
+    const role = step.role === 'control' ? 'control' : 'probe'
+    const pathAndQuery = typeof step.pathAndQuery === 'string' && step.pathAndQuery.startsWith('/') ? step.pathAndQuery : undefined
+    const selector = typeof step.selector === 'string' && step.selector.length > 0 ? step.selector : undefined
+    const value = typeof step.value === 'string' ? step.value : undefined
+    const waitAfterLoadMs = typeof step.waitAfterLoadMs === 'number' ? step.waitAfterLoadMs : undefined
+    if (action !== 'navigate' && !selector) return null
+    mapped.push({
+      role,
+      action: action as FloorBrowserStep['action'],
+      ...(pathAndQuery ? { pathAndQuery } : {}),
+      ...(selector ? { selector } : {}),
+      ...(value !== undefined ? { value } : {}),
+      ...(waitAfterLoadMs !== undefined ? { waitAfterLoadMs } : {}),
+    })
+  }
+  const firstProbe = mapped.find(step => step.role === 'probe')
+  if (!firstProbe) return null
+  const actorHandle = typeof input.steps[0]?.persona === 'string' ? String(input.steps[0].persona) : 'anonymous'
+  return {
+    recipeId: 'browser_sink',
+    args: {
+      origin: input.origin,
+      method: 'GET',
+      pathAndQuery: firstProbe.pathAndQuery ?? '/',
+      vulnClass: input.vulnClass,
+      actor: { handle: actorHandle },
+      steps: mapped,
+    },
+  }
+}
 
 /** Fingerprinted SQL error / traversal / command injection → receipt `impact` rule (never status). */
 const injectionFingerprint = defineRecipe<InjectionFingerprintArgs>('injection_fingerprint', async (args, ctx) => {
@@ -1887,7 +2044,7 @@ export const SPEC_KIND_RECIPES: readonly SpecKindRecipeMapping[] = [
     recipe: 'race_burst',
     note: 'Identical terminal transitions accepted twice plus a divergent outcome set; business-logic receipt rule.',
   },
-  { specKind: 'browser_chain', vulnClasses: [], recipe: null, note: 'Browser-trace receipts (dom_*/xss_*) are a separate cut; keep the browser spec path.' },
+  { specKind: 'browser_chain', vulnClasses: [], recipe: null, note: 'Navigate/fill/click DOM-sink proofs are wired to `browser_sink` (see WIRED_SPECKIND_RECIPES); protocol proofs (postMessage/fetch/builtin) keep the browser spec path.' },
   { specKind: 'rce_proof', vulnClasses: [], recipe: null, note: 'No receipt rule for command execution/template evaluation.' },
   { specKind: 'auth_protocol_proof', vulnClasses: [], recipe: null, note: 'Token/protocol forgery proof scripts stay on the proof-script path.' },
   { specKind: 'cache_differential', vulnClasses: [], recipe: null, note: 'No receipt rule for cache poisoning.' },
@@ -1930,6 +2087,12 @@ export const WIRED_SPECKIND_RECIPES: readonly SpecKindRecipeMapping[] = [
     vulnClasses: ['sqli'],
     recipe: 'boolean_or_timing',
     note: 'Product floor: paired true/false predicate rounds confirmed by the boolean receipt rule. The legacy verifier branch is retained only for the capability harness (scripts/) and patch retest; the live probe deliberately never emits a status-only signal, so the status_differential receipt rule is available for callers that do (xben harness migration), not selected by the floor.',
+  },
+  {
+    specKind: 'browser_chain',
+    vulnClasses: ['xss', 'xss_reflected', 'xss_stored', 'dom_xss'],
+    recipe: 'browser_sink',
+    note: 'Cut 3d: navigate/fill/click DOM-sink proofs run the browser_sink recipe, which requires a host-recorded trace with the verifier canary in an executable sink. Protocol proofs (postMessage origin check, credentialed cross-origin fetch, built-in DOM/storage assertions) keep the framework verifier branch and are deliberately not wired here.',
   },
   {
     specKind: 'http_chain',

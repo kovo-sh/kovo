@@ -18,10 +18,12 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { baseFields, bogusIdFor } from './deterministic-specs.ts'
 import type { EngineHypothesis, Severity, SynthesizedEngineSpec } from './deterministic-specs.ts'
+import { ScopedBrowser } from './scoped-browser.ts'
+import type { BrowserSessionStep } from './scoped-browser.ts'
 import type { EnginePersona } from './deterministic-engine.ts'
 import type { DifferentialResult } from './surface-engine.ts'
 import { injectUniversalParam } from './probes/context.ts'
-import { CUT3_FLOOR_RECIPE_IDS, cut3FloorRecipe, floorRecipe, runCut3Recipe, runFloorRecipe, wiredRecipeForSpecKind } from './floor-recipes.ts'
+import { CUT3_FLOOR_RECIPE_IDS, browserSinkEnvelopeFromSteps, cut3FloorRecipe, floorRecipe, isProtocolBrowserSpec, runCut3Recipe, runFloorRecipe, wiredRecipeForSpecKind } from './floor-recipes.ts'
 import type {
   AccessBoundaryArgs,
   BooleanOrTimingArgs,
@@ -95,6 +97,8 @@ export interface FloorRecipePlanInput {
   personas: readonly EnginePersona[]
   /** Run-scoped headers (staging tenant/run tag) applied to every recipe exchange. */
   headers?: Record<string, string>
+  /** The synthesized legacy candidate, when the planner needs its request steps (browser specs). */
+  candidateSpec?: Record<string, unknown>
 }
 
 const ANONYMOUS_HANDLE = 'anon'
@@ -560,6 +564,27 @@ function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
  * pair that cannot be expressed returns a plan with `skipReason` so the engine records a named
  * rejection instead of silently taking the legacy path.
  */
+function planBrowserRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
+  const hyp = input.hypothesis
+  const sketch: FloorRecipePlan = {
+    recipeId: 'browser_sink',
+    specKind: input.specKind,
+    vulnClass: input.vulnClass || 'dom_xss',
+    endpoint: hyp.endpoint.pathTemplate,
+    args: {} as FloorRecipeArgs,
+  }
+  const spec = input.candidateSpec
+  const steps = Array.isArray(spec?.steps) ? spec!.steps as Array<Record<string, unknown>> : null
+  if (!steps || steps.length === 0) return { ...sketch, skipReason: 'browser spec carried no steps to replay' }
+  // Protocol browser proofs (postMessage/fetch/builtin) have no recipe model yet and stay on the
+  // framework verifier; only navigate/fill/click DOM proofs migrate.
+  if (isProtocolBrowserSpec(steps)) return { ...sketch, skipReason: 'protocol browser proof (postMessage/fetch/builtin) stays on the framework verifier' }
+  const origin = typeof steps[0]?.origin === 'string' ? String(steps[0].origin) : hyp.endpoint.origin
+  const envelope = browserSinkEnvelopeFromSteps({ origin, vulnClass: 'dom_xss', steps })
+  if (!envelope) return { ...sketch, skipReason: 'browser spec steps could not be expressed as a browser_sink recipe' }
+  return { ...sketch, vulnClass: envelope.args.vulnClass, args: envelope.args }
+}
+
 export function planFloorRecipe(input: FloorRecipePlanInput): FloorRecipePlan | null {
   const recipe = wiredRecipeForSpecKind(input.specKind, input.vulnClass)
   if (!recipe) return null
@@ -567,6 +592,7 @@ export function planFloorRecipe(input: FloorRecipePlanInput): FloorRecipePlan | 
     case 'boolean_or_timing': return planBooleanRecipe(input)
     case 'race_burst':
     case 'conserved_balance': return planRaceRecipe(input)
+    case 'browser_sink': return planBrowserRecipe(input)
     case 'access_boundary':
     case 'persisted_mutation': return planAuthzRecipe(input)
     default: return {
@@ -584,6 +610,59 @@ export function planFloorRecipe(input: FloorRecipePlanInput): FloorRecipePlan | 
 // Recipe execution through the broker
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * Host seam for browser recipes: run an ordered navigate/fill/click session through the same
+ * `ScopedBrowser` the framework verifier uses and return only the traces whose canary reached an
+ * executable sink. The recipe still owns the confirmation rule; this only records evidence.
+ */
+export function browserSessionSeam(input: {
+  browser: ScopedBrowser
+  grant: Grant
+  signal: AbortSignal
+  origin: string
+  runId?: string
+}): NonNullable<FloorRecipeDeps['browserSession']> {
+  return async session => {
+    if (typeof input.browser.runBrowserSession !== 'function') return null
+    const sessionSteps: BrowserSessionStep[] = session.steps.map((step, index) => ({
+      id: `b${index + 1}`,
+      role: step.role,
+      origin: input.origin,
+      ...(step.pathAndQuery !== undefined ? { pathAndQuery: step.pathAndQuery } : {}),
+      action: step.action,
+      ...(step.selector !== undefined ? { selector: step.selector } : {}),
+      ...(step.value !== undefined ? { value: step.value } : {}),
+      ...(step.waitAfterLoadMs !== undefined ? { waitAfterLoadMs: step.waitAfterLoadMs } : {}),
+      canaryToken: session.canaryToken,
+      checkKind: 'dom_xss' as const,
+      enableSinkHook: true,
+      ...(input.runId ? { runId: input.runId } : {}),
+    }))
+    const visits = await input.browser.runBrowserSession(sessionSteps, input.grant, input.signal)
+    const traces: Array<{ id: string; origin: string; sinks: string[] }> = []
+    let sinkHit = false
+    visits.forEach((visit, index) => {
+      if (!visit) return
+      const hits = visit.domSinkTraces.filter(trace => trace.containsCanary)
+      // Two non-sink execution channels the legacy verifier already accepted: the driver's canary
+      // flag, and an exact document-title match. The title is compared by equality (never
+      // containment) so a server-side reflection of the payload into `<title>` cannot satisfy it;
+      // only a handler that assigned the canary to `document.title` can.
+      const titleHit = visit.title === session.canaryToken
+      if (!hits.length && !visit.canaryCheck.triggered && !titleHit) return
+      sinkHit = true
+      traces.push({
+        id: `browser-${index + 1}`,
+        origin: input.origin,
+        sinks: hits.length > 0
+          ? [...new Set(hits.map(trace => `dom_xss:${trace.sink}`))]
+          : titleHit ? ['canary:title'] : ['canary:executed'],
+      })
+    })
+    return { traces, sinkHit }
+  }
+}
+
 export interface RunPlannedRecipeInput {
   plan: FloorRecipePlan
   hypothesis: EngineHypothesis
@@ -593,6 +672,8 @@ export interface RunPlannedRecipeInput {
   assignmentId?: string
   runId?: string
   headers?: Record<string, string>
+  /** Scoped browser used by browser recipes; omitted by callers that never plan one. */
+  browser?: ScopedBrowser
   recordExchange?: (exchange: BrokerExchangeResult) => string | void
 }
 
@@ -609,7 +690,11 @@ export async function runPlannedRecipe(input: RunPlannedRecipeInput): Promise<Fl
     ...(input.headers ? { headers: input.headers } : {}),
     ...(input.recordExchange ? { recordExchange: input.recordExchange } : {}),
   })
-  return executeFloorRecipeById(input.plan.recipeId, input.plan.args, deps)
+  const browser = input.browser ?? new ScopedBrowser(input.broker)
+  const withBrowser: FloorRecipeDeps = input.plan.recipeId === 'browser_sink'
+    ? { ...deps, browserSession: browserSessionSeam({ browser, grant: input.grant, signal: input.signal, origin: input.plan.args.origin || input.hypothesis.endpoint.origin, ...(input.runId ? { runId: input.runId } : {}) }) }
+    : deps
+  return executeFloorRecipeById(input.plan.recipeId, input.plan.args, withBrowser)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -932,6 +1017,7 @@ export async function retestPersistedRecipe(input: {
   probeClass?: string
   recordExchange?: (exchange: BrokerExchangeResult) => string | void
   browserTrace?: FloorRecipeDeps['browserTrace']
+  browserSession?: FloorRecipeDeps['browserSession']
 }): Promise<{ verdict: RetestVerdict; execution: FloorRecipeExecution | null; replay: ReplayVerificationResult }> {
   const args = input.envelope.args as unknown as PersistedFloorRecipeArgs
   const plan: FloorRecipePlan = {
@@ -953,9 +1039,11 @@ export async function retestPersistedRecipe(input: {
       ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
       ...(input.recordExchange ? { recordExchange: input.recordExchange } : {}),
     })
-    const deps: FloorRecipeDeps = input.browserTrace
-      ? { ...baseDeps, browserTrace: input.browserTrace }
-      : baseDeps
+    const deps: FloorRecipeDeps = {
+      ...baseDeps,
+      ...(input.browserTrace ? { browserTrace: input.browserTrace } : {}),
+      ...(input.browserSession ? { browserSession: input.browserSession } : {}),
+    }
     execution = await executeFloorRecipeById(input.envelope.recipeId, args, deps)
   } catch (error) {
     // A recipe that cannot execute at all is not evidence the vulnerability is gone.

@@ -24,6 +24,10 @@ Format:
 - [ ] Pre-existing suite: `tests/v5-engine-coverage.test.ts` 2 failures (content vs template param pick; OR-branch baseline) | lease: tests + engine | deps: - | stream: -
 - [ ] Pre-existing hang: `tests/v4-m4-surface-orchestration.test.ts` file-level teardown >15 min | lease: tests | deps: - | stream: -
 
+## Blocked (needs a test-migration stream first)
+
+- [ ] `browser-vm-delete` — delete the remaining `browser_chain` interaction half of the legacy VM. Blocked: five e2e suites drive navigate/fill/click/dom-sink proofs through `verifyReplaySpec` directly (v3-protocol-browser, v4-e2e T2-05e/T3-05/T3-20, v4-m2 M2.6); each must move onto a `browser_sink` envelope + real `runBrowserSession` before the branch can go. | status: blocked | lease: replay-verifier, tests | stream: agents/cut3d-browser-retire
+
 ## Sequence after the current batch
 
 1. Persona fix → **Tier-1 smoke (~6 min, ~$1.30, precision trap)** → full dev+held-out agentic matrix (serialized).
