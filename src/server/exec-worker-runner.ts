@@ -1813,7 +1813,11 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         this.completeWorker(job.assignment, latestRun, outcomeText, [], undefined, currentSecrets())
         this.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: job.assignment.id })
       }, { behavior: 'immediate' })
-      if (sessionResult.status === 'wall_clock_rotated' && isMultiHopChainStep(step) && !confirmedDuringAssignment) {
+      const isWallClockRotated = sessionResult.status === 'wall_clock_rotated'
+      const isNonConfirmedSealedExit = !confirmedDuringAssignment
+        && sessionSealedCapHandles.length > 0
+        && (sessionResult.status === 'completed' || sessionResult.status === 'turn_limit' || sessionResult.status === 'nudged_out')
+      if (!confirmedDuringAssignment && ((isWallClockRotated && isMultiHopChainStep(step)) || isNonConfirmedSealedExit)) {
         try {
           const recordedFacts = this.storage.listFacts(run.id, { includeTainted: false, limit: 500 })
             .filter(f => f.assignmentId === job.assignment.id)
@@ -1843,6 +1847,8 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             recordedFacts,
             recordedExchanges,
             sealedCapHandles,
+            trigger: isWallClockRotated ? 'wall_clock_rotated' : 'sealed_handle_exit',
+            allowNonChainWithSealedCap: isNonConfirmedSealedExit,
           })
         } catch { /* continuation checkpointing is best-effort and must never fail worker completion */ }
       }

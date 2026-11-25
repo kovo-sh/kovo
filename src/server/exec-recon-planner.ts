@@ -106,6 +106,7 @@ import {
   reinvestigationKey,
   selectUncoveredHighRiskEndpoints,
   stripJsonFences,
+  synthesizeRuntimeCompositeWave1Steps,
   templatesMentionedInText,
   threatModelResponseSchema,
   type BolaTestQueueItem,
@@ -113,6 +114,7 @@ import {
   type DispatchStopReason,
   type FrontierWaveControllerOptions,
   type ReinvestigationGuard,
+  type RuntimeCompositeApiDependencyInput,
 } from './exec-dispatch.ts'
 import {
   ExecServiceModule,
@@ -132,6 +134,7 @@ import {
   createGraphCoordinator,
   formatChainHopsBrief,
   type ChainHop,
+  type CoordinatorApiDependency,
   type CoordinatorDeps,
   type CoordinatorEndpoint,
   type CoordinatorProgramGraph,
@@ -139,15 +142,17 @@ import {
   type GraphCoordinator,
 } from './graph-coordinator.ts'
 import {
+  buildRuntimeDiscoveryInput,
   classifySurface,
+  extractRuntimeCatalogFromFacts,
   inferRuntimeInvariantHypotheses,
   synthesizeInvariants,
+  synthesizePostFloorRuntimeInvariants,
   toCapabilityLedgerSeeds,
   type CapabilitySeedRecord,
   type InvariantHypothesis,
-  type PersonaSurfaceObservation,
+  type RuntimeApiDependency,
   type RuntimeDiscoveryInput,
-  type RuntimeOpenApiOperation,
   type SourceFileInput,
   type SynthesizeInvariantsResult,
   type SynthesizerMode,
@@ -986,11 +991,13 @@ export interface EnqueueHopContinuationInput {
   recordedExchanges: readonly HopContinuationExchangeRef[]
   sealedCapHandles: readonly string[]
   maxContinuations?: number
+  trigger?: 'wall_clock_rotated' | 'sealed_handle_exit'
+  allowNonChainWithSealedCap?: boolean
 }
 
 export interface EnqueueHopContinuationResult {
   enqueued: boolean
-  reason?: 'not_multi_hop_chain' | 'already_confirmed' | 'max_continuations_reached' | 'no_concrete_progress' | 'already_enqueued' | 'dispatch_filtered'
+  reason?: 'not_multi_hop_chain' | 'already_confirmed' | 'max_continuations_reached' | 'no_concrete_progress' | 'already_enqueued' | 'duplicate_sealed_handles' | 'dispatch_filtered'
   continuationStep?: ChainStep
   continuationDepth?: number
   checkpointCapId?: string
@@ -1022,6 +1029,11 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   private readonly persistedStepCheckpoints = new Map<string, { checkpointCapId?: string; checkpointJson?: string }>()
   private readonly invariantsSeededRuns = new Set<string>()
   private readonly wave1InvariantChainsPromoted = new Set<string>()
+  private readonly seededHypothesisIdsByRun = new Map<string, Set<string>>()
+  private readonly runtimeSynthesisWatermark = new Map<string, string>()
+  private readonly postFloorInvariantsSyncedRuns = new Set<string>()
+  private readonly runtimeCompositeSeededRuns = new Set<string>()
+  private readonly emittedSealedHandleSets = new Map<string, Set<string>>()
   private readonly plannerSeenCausalEdges = new Map<string, Set<string>>()
   private readonly detLeadStepKeys = new Set<string>()
   private readonly detLeadGateRejected = new Set<string>()
@@ -1132,6 +1144,12 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       }
     }
     this.invariantsSeededRuns.add(run.id)
+    const seededIds = this.seededHypothesisIdsByRun.get(run.id) ?? new Set<string>()
+    for (const h of synthesis.hypotheses) seededIds.add(h.id)
+    this.seededHypothesisIdsByRun.set(run.id, seededIds)
+    if (!options.runtime) {
+      this.runtimeSynthesisWatermark.set(run.id, this.computeRuntimeSynthesisWatermark(run.id))
+    }
 
     const shouldPromote = options.promoteWave1Chains !== false && run.capabilityTier > 0
     const wave1ChainStepIds = shouldPromote
@@ -1348,55 +1366,70 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   }
 
   /**
-   * Ensure Wave-1 invariant chain steps are promoted before Phase B's first dispatch tick
-   * (idempotent no-op when threat modeling already promoted them).
+   * Ensure Wave-1 invariant chain steps are promoted before Phase B's first dispatch tick, and
+   * incrementally synthesize new grey-box/runtime invariants & Wave-1 composites after Phase A
+   * floor settles without letting pre-floor runs suppress post-floor differentials.
    */
-  ensureWave1InvariantChainSteps(run: Run, approvedOrigins: ReadonlySet<string>): number {
-    if (run.capabilityTier <= 0 || this.wave1InvariantChainsPromoted.has(run.id)) return 0
-    const res = this.seedCapabilityLedgerInvariants(run, {
-      approvedOrigins,
-      promoteWave1Chains: true,
-    })
-    return res.wave1ChainStepsCreated
+  ensureWave1InvariantChainSteps(
+    run: Run,
+    approvedOrigins: ReadonlySet<string>,
+    options: { postFloor?: boolean } = {},
+  ): number {
+    if (run.capabilityTier <= 0) return 0
+    const sourceMounted = this.host.projectReposMount(run.projectId).mountedRepos.length > 0
+    if (!this.invariantsSeededRuns.has(run.id)) {
+      const res = this.seedCapabilityLedgerInvariants(run, {
+        approvedOrigins,
+        promoteWave1Chains: true,
+      })
+      let compositeCount = 0
+      if (!sourceMounted) {
+        compositeCount = this.promoteRuntimeCompositeWave1Steps(run, approvedOrigins)
+      }
+      if (options.postFloor) this.postFloorInvariantsSyncedRuns.add(run.id)
+      return res.wave1ChainStepsCreated + compositeCount
+    }
+    return this.syncPostFloorRuntimeInvariants(run, approvedOrigins, {
+      sourceMounted,
+      postFloor: options.postFloor,
+    }).wave1StepsCreated
   }
 
-  private collectRuntimeDiscoveryInput(
+  private computeRuntimeSynthesisWatermark(runId: string): string {
+    const countOf = (table: 'endpoints' | 'facts' | 'broker_exchanges' | 'api_dependencies'): number => {
+      try {
+        const row = this.storage.client.prepare(`SELECT COUNT(*) AS cnt FROM ${table} WHERE run_id = ?`).get(runId) as { cnt?: number } | undefined
+        return Number(row?.cnt ?? 0)
+      } catch {
+        return 0
+      }
+    }
+    let graphDeps = 0
+    try { graphDeps = this.host.endpointGraphCatalog(runId).apiDependencies.length } catch { /* ignore */ }
+    return `${countOf('endpoints')}|${countOf('facts')}|${countOf('broker_exchanges')}|${countOf('api_dependencies')}|${graphDeps}`
+  }
+
+  private collectRuntimeDiscoveryBundle(
     run: Run,
     approvedOrigins: ReadonlySet<string>,
     specs: ReturnType<Store['listProjectSpecsFull']>,
-  ): Omit<RuntimeDiscoveryInput, 'mode'> {
+  ) {
     const endpoints = this.storage.listEndpoints(run.id, { limit: 200 })
       .filter(ep => approvedOrigins.size === 0 || approvedOrigins.has(ep.origin))
-    const openApiOperations: RuntimeOpenApiOperation[] = endpoints.map(ep => ({
-      method: ep.method,
-      path: ep.pathTemplate,
-      serviceOrigin: ep.origin,
-      ...(ep.authRequirement && !/^(?:none|public|anonymous)$/i.test(ep.authRequirement.trim())
-        ? { security: [{ [ep.authRequirement.trim()]: [] }] }
-        : {}),
-    }))
-
-    for (const spec of specs.slice(0, 8)) {
-      if (spec.kind !== 'openapi') continue
-      try {
-        const parsed = JSON.parse(spec.content) as { paths?: Record<string, Record<string, { operationId?: string; security?: Array<Record<string, string[]>> }>> }
-        for (const [pathKey, methods] of Object.entries(parsed.paths ?? {})) {
-          if (!methods || typeof methods !== 'object') continue
-          for (const [method, op] of Object.entries(methods)) {
-            if (!/^(?:get|post|put|patch|delete|options|head)$/i.test(method)) continue
-            openApiOperations.push({
-              method: method.toUpperCase(),
-              path: pathKey,
-              ...(op?.operationId ? { operationId: op.operationId } : {}),
-              ...(Array.isArray(op?.security) ? { security: op.security } : {}),
-              ...(spec.origin ? { serviceOrigin: spec.origin } : {}),
-            })
-          }
-        }
-      } catch { /* non-JSON OpenAPI specs are handled elsewhere */ }
+    const originByRouteKey = new Map<string, string>()
+    for (const ep of endpoints) {
+      const routeKey = `${ep.method.toUpperCase()} ${ep.pathTemplate}`
+      if (!originByRouteKey.has(routeKey)) originByRouteKey.set(routeKey, ep.origin)
     }
+    const facts = this.pageAll((offset, limit) =>
+      this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
+      .filter(fact => approvedOrigins.size === 0 || approvedOrigins.has(fact.origin))
+    const { catalogFacts, allApiDeps, extraApiDeps } = this.mergeGraphApiDependencies(run.id, approvedOrigins, originByRouteKey, facts)
 
-    const personaObservations: PersonaSurfaceObservation[] = []
+    let brokerExchanges: Array<{
+      origin: string; method: string; pathAndQuery: string; status: number
+      personaHandle: string | null; respHeadersJson: string | null
+    }> = []
     try {
       const rows = this.storage.client.prepare(`
         SELECT origin, method, path_and_query AS pathAndQuery, status, persona_handle AS personaHandle, resp_headers AS respHeadersJson
@@ -1404,31 +1437,223 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         WHERE run_id = ?
         ORDER BY created_at DESC
         LIMIT 120
-      `).all(run.id) as Array<{
-        origin: string; method: string; pathAndQuery: string; status: number
-        personaHandle: string | null; respHeadersJson: string | null
-      }>
-      for (const row of rows) {
-        if (approvedOrigins.size > 0 && !approvedOrigins.has(row.origin)) continue
-        const pathOnly = row.pathAndQuery.split(/[?#]/, 1)[0] || '/'
-        let responseHeaders: Record<string, string> | undefined
-        if (row.respHeadersJson) {
-          try { responseHeaders = JSON.parse(row.respHeadersJson) as Record<string, string> } catch { /* ignore */ }
-        }
-        personaObservations.push({
-          persona: row.personaHandle?.trim() || 'anonymous',
-          surface: classifySurface(pathOnly, row.method),
-          serviceOrigin: row.origin,
-          method: row.method.toUpperCase(),
-          path: pathOnly,
-          status: row.status,
-          ...(responseHeaders ? { responseHeaders } : {}),
-          isBatch: /\/(?:batch|bulk|multi)(?:\/|$)/i.test(pathOnly),
-        })
-      }
+      `).all(run.id) as typeof brokerExchanges
+      brokerExchanges = rows.filter(row => approvedOrigins.size === 0 || approvedOrigins.has(row.origin))
     } catch { /* best-effort runtime observation scan */ }
 
-    return { personaObservations, openApiOperations }
+    return { endpoints, facts, catalogFacts, allApiDeps, extraApiDeps, brokerExchanges, specs }
+  }
+
+  private collectRuntimeDiscoveryInput(
+    run: Run,
+    approvedOrigins: ReadonlySet<string>,
+    specs: ReturnType<Store['listProjectSpecsFull']>,
+  ): Omit<RuntimeDiscoveryInput, 'mode'> {
+    const bundle = this.collectRuntimeDiscoveryBundle(run, approvedOrigins, specs)
+    return buildRuntimeDiscoveryInput({
+      approvedOrigins,
+      endpoints: bundle.endpoints,
+      specs: bundle.specs,
+      facts: bundle.facts,
+      brokerExchanges: bundle.brokerExchanges,
+      apiDependencies: bundle.extraApiDeps,
+    })
+  }
+
+  private promoteRuntimeCompositeWave1Steps(
+    run: Run,
+    approvedOrigins: ReadonlySet<string>,
+    bundle?: ReturnType<ExecReconPlanner['collectRuntimeDiscoveryBundle']>,
+  ): number {
+    if (run.capabilityTier <= 0) return 0
+    const specs = bundle?.specs ?? this.storage.listProjectSpecsFull(run.projectId)
+    const resolvedBundle = bundle ?? this.collectRuntimeDiscoveryBundle(run, approvedOrigins, specs)
+    const approvedAssets = run.candidates.filter(c => approvedOrigins.has(c.origin) && run.approved.includes(c.id))
+    const hostTiers = computeHostTiers([...approvedOrigins], approvedAssets.map(classifyHostHeuristic))
+    const apiDependencies: RuntimeCompositeApiDependencyInput[] = resolvedBundle.allApiDeps.map(d => ({
+      producer: d.producer,
+      consumer: d.consumer,
+      resourceKey: d.resourceKey,
+      ...(d.producerOrigin ? { producerOrigin: d.producerOrigin } : {}),
+      ...(d.consumerOrigin ? { consumerOrigin: d.consumerOrigin } : {}),
+      ...(d.personaHandle !== undefined ? { personaHandle: d.personaHandle } : {}),
+    }))
+    const created = synthesizeRuntimeCompositeWave1Steps(this.storage, run, {
+      sourceMounted: false,
+      facts: resolvedBundle.facts,
+      endpoints: resolvedBundle.endpoints,
+      apiDependencies,
+      specs: resolvedBundle.specs,
+      hostTiers,
+    })
+    this.runtimeCompositeSeededRuns.add(run.id)
+    return created.length
+  }
+
+  /**
+   * Incrementally run `synthesizePostFloorRuntimeInvariants` + `synthesizeRuntimeCompositeWave1Steps`
+   * after Phase A floor settles or whenever new runtime facts/exchanges/dependencies arrive.
+   */
+  syncPostFloorRuntimeInvariants(
+    run: Run,
+    approvedOrigins: ReadonlySet<string>,
+    options: { sourceMounted?: boolean; postFloor?: boolean } = {},
+  ): { seededCount: number; wave1StepsCreated: number } {
+    if (run.capabilityTier <= 0) return { seededCount: 0, wave1StepsCreated: 0 }
+    const sourceMounted = options.sourceMounted ?? this.host.projectReposMount(run.projectId).mountedRepos.length > 0
+    const watermark = this.computeRuntimeSynthesisWatermark(run.id)
+    const forcePostFloor = Boolean(options.postFloor) && !this.postFloorInvariantsSyncedRuns.has(run.id)
+    const needsComposite = !sourceMounted && !this.runtimeCompositeSeededRuns.has(run.id)
+    if (!forcePostFloor && !needsComposite && this.runtimeSynthesisWatermark.get(run.id) === watermark) {
+      return { seededCount: 0, wave1StepsCreated: 0 }
+    }
+
+    const specs = this.storage.listProjectSpecsFull(run.projectId)
+    const bundle = this.collectRuntimeDiscoveryBundle(run, approvedOrigins, specs)
+    const ledger = this.storage.capabilityLedger(run.id)
+    const existingHypIds = new Set<string>(this.seededHypothesisIdsByRun.get(run.id) ?? [])
+    for (const node of ledger.listCapabilities()) {
+      const hypId = node.metadata?.hypothesisId
+      if (typeof hypId === 'string' && hypId) existingHypIds.add(hypId)
+    }
+    for (const step of this.storage.listChainSteps(run.id, run.goalRevision)) {
+      const m = /\[inv_hyp=([^\]]+)\]/.exec(step.hypothesis)
+      if (m?.[1]) existingHypIds.add(m[1])
+    }
+
+    const mode: 'grey-box' | 'black-box' = run.approvedPersonaIds.length > 0 || specs.length > 0 ? 'grey-box' : 'black-box'
+    const res = synthesizePostFloorRuntimeInvariants({
+      mode,
+      approvedOrigins,
+      endpoints: bundle.endpoints,
+      specs: bundle.specs,
+      facts: bundle.facts,
+      brokerExchanges: bundle.brokerExchanges,
+      apiDependencies: bundle.extraApiDeps,
+      existingHypothesisIds: existingHypIds,
+      maxHypotheses: 64,
+    })
+
+    const defaultOrigin = [...approvedOrigins][0] ?? 'unknown'
+    const capIdByHypothesisId = new Map<string, string>()
+    let seededCount = 0
+    for (const seed of res.capabilitySeeds) {
+      const input = seedRecordToLedgerInput(seed, defaultOrigin)
+      capIdByHypothesisId.set(seed.metadata.hypothesisId, input.capId)
+      if (ledger.getCapability(input.capId)) continue
+      try {
+        ledger.addCapability(input)
+        seededCount += 1
+      } catch { /* fail-closed ledger validation */ }
+    }
+    for (const hyp of res.hypotheses) existingHypIds.add(hyp.id)
+    this.seededHypothesisIdsByRun.set(run.id, existingHypIds)
+
+    let wave1InvariantCreated = 0
+    if (res.newHypotheses.length > 0) {
+      const createdIds = this.promoteInvariantHypothesesToWave1ChainSteps(run, {
+        mode: res.mode,
+        runtimeParity: res.runtimeParity,
+        hypotheses: res.newHypotheses,
+        capabilitySeeds: res.capabilitySeeds,
+      }, {
+        approvedOrigins,
+        capIdByHypothesisId,
+        maxSteps: 6,
+      })
+      wave1InvariantCreated = createdIds.length
+    }
+
+    let compositeCreated = 0
+    if (!sourceMounted) {
+      compositeCreated = this.promoteRuntimeCompositeWave1Steps(run, approvedOrigins, bundle)
+    }
+
+    this.runtimeSynthesisWatermark.set(run.id, watermark)
+    if (options.postFloor) this.postFloorInvariantsSyncedRuns.add(run.id)
+    const wave1StepsCreated = wave1InvariantCreated + compositeCreated
+    if (seededCount > 0 || wave1StepsCreated > 0) {
+      try {
+        this.storage.event(
+          run.id,
+          'invariants.post_floor_synthesized',
+          `Post-floor synthesis (${mode}) added ${seededCount} new capability seed(s) and ${wave1StepsCreated} Wave-1 chain step(s).`,
+          {
+            mode,
+            newHypotheses: res.newHypotheses.length,
+            seededCount,
+            wave1InvariantCreated,
+            compositeCreated,
+          },
+        )
+      } catch { /* telemetry is best-effort */ }
+    }
+    return { seededCount, wave1StepsCreated }
+  }
+
+  private collectCoordinatorApiDependencies(run: Run): CoordinatorApiDependency[] {
+    const approvedOrigins = this.host.approvedOriginsSet(run)
+    const endpoints = this.storage.listEndpoints(run.id, { limit: 200 })
+      .filter(ep => approvedOrigins.size === 0 || approvedOrigins.has(ep.origin))
+    const originByRouteKey = new Map<string, string>()
+    for (const ep of endpoints) {
+      const key = `${ep.method.toUpperCase()} ${ep.pathTemplate}`
+      if (!originByRouteKey.has(key)) originByRouteKey.set(key, ep.origin)
+    }
+    const facts = this.pageAll((offset, limit) =>
+      this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
+      .filter(fact => approvedOrigins.size === 0 || approvedOrigins.has(fact.origin))
+    return this.mergeGraphApiDependencies(run.id, approvedOrigins, originByRouteKey, facts).allApiDeps
+  }
+
+  private mergeGraphApiDependencies(
+    runId: string,
+    approvedOrigins: ReadonlySet<string>,
+    originByRouteKey: ReadonlyMap<string, string>,
+    facts: readonly Fact[],
+  ): { catalogFacts: ReturnType<typeof extractRuntimeCatalogFromFacts>; allApiDeps: RuntimeApiDependency[]; extraApiDeps: RuntimeApiDependency[] } {
+    const catalogFacts = extractRuntimeCatalogFromFacts(facts, approvedOrigins)
+    const seenDeps = new Set<string>()
+    const allApiDeps: RuntimeApiDependency[] = []
+    const extraApiDeps: RuntimeApiDependency[] = []
+    const depKey = (d: Pick<RuntimeApiDependency, 'producer' | 'consumer' | 'resourceKey' | 'producerOrigin' | 'consumerOrigin'>) =>
+      `${d.producerOrigin ?? ''}|${d.producer}|${d.consumerOrigin ?? ''}|${d.consumer}|${d.resourceKey}`
+
+    for (const d of catalogFacts.apiDependencies) {
+      const key = depKey(d)
+      if (seenDeps.has(key)) continue
+      seenDeps.add(key)
+      allApiDeps.push(d)
+    }
+
+    let rawGraphDeps: unknown[] = []
+    try { rawGraphDeps = this.host.endpointGraphCatalog(runId).apiDependencies } catch { /* ignore */ }
+    for (const raw of rawGraphDeps) {
+      if (!raw || typeof raw !== 'object') continue
+      const d = raw as Partial<RuntimeApiDependency>
+      if (typeof d.producer !== 'string' || typeof d.consumer !== 'string' || typeof d.resourceKey !== 'string') continue
+      const producerOrigin = d.producerOrigin ?? originByRouteKey.get(d.producer)
+      const consumerOrigin = d.consumerOrigin ?? originByRouteKey.get(d.consumer)
+      if (approvedOrigins.size > 0 && ((producerOrigin && !approvedOrigins.has(producerOrigin)) || (consumerOrigin && !approvedOrigins.has(consumerOrigin)))) {
+        continue
+      }
+      const normalized: RuntimeApiDependency = {
+        producer: d.producer,
+        consumer: d.consumer,
+        resourceKey: d.resourceKey,
+        ...(producerOrigin ? { producerOrigin } : {}),
+        ...(consumerOrigin ? { consumerOrigin } : {}),
+        ...(d.personaHandle !== undefined ? { personaHandle: d.personaHandle } : {}),
+        ...(Array.isArray(d.observedTransitions) ? { observedTransitions: d.observedTransitions } : {}),
+        ...(typeof d.testedBola === 'boolean' ? { testedBola: d.testedBola } : {}),
+      }
+      const key = depKey(normalized)
+      if (seenDeps.has(key)) continue
+      seenDeps.add(key)
+      allApiDeps.push(normalized)
+      extraApiDeps.push(normalized)
+    }
+    return { catalogFacts, allApiDeps, extraApiDeps }
   }
 
   /** Sync extracted typed ChainHops into CapabilityLedger as quarantined capability_only nodes. */
@@ -3047,6 +3272,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       listEndpoints: endpoints,
       listFacts: () => this.pageAll((offset, limit) =>
         this.storage.listFacts(run.id, { includeTainted: false, limit, offset })),
+      listApiDependencies: () => this.collectCoordinatorApiDependencies(run),
       listFindings: () => this.storage.db.select().from(findings).where(eq(findings.runId, run.id)).all()
         .map(row => ({
           id: row.id, origin: row.finding.origin, title: row.finding.title, status: row.finding.status,
@@ -3204,7 +3430,10 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
    */
   enqueueHopContinuationOnRotation(input: EnqueueHopContinuationInput): EnqueueHopContinuationResult {
     const { run, step, assignment } = input
-    if (!isMultiHopChainStep(step)) {
+    const allowNonChainSealedExit = input.trigger === 'sealed_handle_exit'
+      && Boolean(input.allowNonChainWithSealedCap)
+      && input.sealedCapHandles.length > 0
+    if (!isMultiHopChainStep(step) && !allowNonChainSealedExit) {
       return { enqueued: false, reason: 'not_multi_hop_chain' }
     }
     if (input.confirmed) {
@@ -3233,19 +3462,25 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const uniqueHandles = [...new Set(candidateHandles)]
 
     // Prefer the most recent derived sealed capability handle present in SQLite CapabilityLedger
-    // for this chain lineage (excluding static_analysis / cap:hop_synth:* invariant seeds).
+    // for this chain lineage (excluding static_analysis / attacker_seed / cap:hop_synth:* / cap:hop_seed_*).
     const ledgerHandles = uniqueHandles.filter(id => ledgerNodeById.has(id))
     const derivedLedgerHandles = ledgerHandles.filter(id => {
       const node = ledgerNodeById.get(id)
-      return Boolean(node && node.provenance !== 'static_analysis' && !id.startsWith('cap:hop_synth:'))
+      return Boolean(
+        node
+        && node.provenance !== 'static_analysis'
+        && node.provenance !== 'attacker_seed'
+        && !id.startsWith('cap:hop_synth:')
+        && !id.startsWith('cap:hop_seed_'),
+      )
     })
 
-    // Cap generic Wave-1 heuristic boundary chains to 1 continuation (never 2); allow 2 continuations
-    // only for source/planner-backed multi-hop chains that actually sealed >= 1 cap:hop_* handle
-    // in CapabilityLedger.
+    // Cap unsealed / generic heuristic chains at 1 continuation; lift the cap to `requestedMax`
+    // whenever `hasSealedLedgerCap` (`derivedLedgerHandles.length > 0`) so active multi-hop
+    // chains with sealed capabilities are never prematurely cut off at 1 continuation.
     const isGenericWave1 = isGenericWave1BoundaryChainStep(step)
     const hasSealedLedgerCap = derivedLedgerHandles.length > 0
-    const maxContinuations = isGenericWave1 || !hasSealedLedgerCap
+    const maxContinuations = !hasSealedLedgerCap
       ? Math.min(requestedMax, MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS)
       : requestedMax
     if (currentDepth >= maxContinuations) {
@@ -3270,6 +3505,45 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         reason: 'already_enqueued',
         continuationStep: existingContinuation,
         continuationDepth: nextDepth,
+      }
+    }
+
+    // Deduplicate identical sealed handle sets on non-rotation exits so a worker that exits via
+    // complete_intent / max_turns without sealing any new handle cannot loop infinitely.
+    const stepById = new Map(existingSteps.map(s => [s.id, s]))
+    let lineageRootId = step.id
+    const visitedLineage = new Set<string>([step.id])
+    for (let hop = 0; hop < 8; hop += 1) {
+      const cur = stepById.get(lineageRootId)
+      const parentId = cur?.dependsOnStepIds.find(id => stepById.has(id) && !visitedLineage.has(id))
+      if (!parentId) break
+      visitedLineage.add(parentId)
+      lineageRootId = parentId
+    }
+    const lineageKey = `${run.id}:${lineageRootId}`
+    const handleSignatureList = (derivedLedgerHandles.length ? derivedLedgerHandles : uniqueHandles)
+      .slice()
+      .sort()
+    const handleSetSignature = handleSignatureList.join('|')
+    if (input.trigger === 'sealed_handle_exit' && handleSetSignature) {
+      const seenSets = this.emittedSealedHandleSets.get(lineageKey)
+      if (seenSets?.has(handleSetSignature)) {
+        return { enqueued: false, reason: 'duplicate_sealed_handles', continuationDepth: currentDepth }
+      }
+      if (currentDepth >= 1) {
+        const inheritedHandles = new Set<string>(stepCapId ? [stepCapId] : [])
+        for (const factId of step.dependsOnFactIds) {
+          const cpFact = this.storage.listFacts(run.id, { includeTainted: false, limit: 500 })
+            .find(f => f.id === factId && f.data?.subkind === 'hop_checkpoint')
+          const brief = parseHopCheckpointJson(cpFact?.data?.checkpointBrief ?? cpFact?.data?.checkpointJson)
+          for (const h of brief?.capabilityHandles ?? []) {
+            if (DERIVED_CAPABILITY_HANDLE_RE.test(h)) inheritedHandles.add(h)
+          }
+        }
+        const incoming = input.sealedCapHandles.filter(h => DERIVED_CAPABILITY_HANDLE_RE.test(h))
+        if (incoming.length > 0 && incoming.every(h => inheritedHandles.has(h))) {
+          return { enqueued: false, reason: 'duplicate_sealed_handles', continuationDepth: currentDepth }
+        }
       }
     }
 
@@ -3409,10 +3683,10 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         capabilities: ['http'],
         parentEvidenceIds: parentFactIds,
         skills,
-        priority: isGenericWave1
-          ? Math.min(step.priority, 88)
-          : hasSealedLedgerCap
-            ? Math.min(100, Math.max(step.priority, 95))
+        priority: hasSealedLedgerCap
+          ? Math.min(100, Math.max(step.priority, 95))
+          : isGenericWave1
+            ? Math.min(step.priority, 88)
             : Math.min(step.priority, 90),
         budgetUsd: stepBudgetUsd,
         ...(primaryCapId ? { checkpointCapId: primaryCapId } : {}),
@@ -3432,6 +3706,11 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const created = afterSteps.find(s => !beforeIds.has(s.id))
     if (!created) {
       return { enqueued: false, reason: 'dispatch_filtered', continuationDepth: nextDepth }
+    }
+    if (handleSetSignature) {
+      const seenSets = this.emittedSealedHandleSets.get(lineageKey) ?? new Set<string>()
+      seenSets.add(handleSetSignature)
+      this.emittedSealedHandleSets.set(lineageKey, seenSets)
     }
 
     try {
@@ -3671,8 +3950,12 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const ledger = this.storage.capabilityLedger(run.id)
     const controller = this.frontierControllerFor(run.id)
     this.syncChainHopsToLedger(ledger, hops)
+    const sourceMounted = this.host.projectReposMount(run.projectId).mountedRepos.length > 0
+    const apiDependencies = this.collectCoordinatorApiDependencies(run)
     const hypotheses = coordinator.planChainRound({
       hops,
+      apiDependencies,
+      sourceMounted,
       maxHops: 6,
       limit: Math.min(12, remaining),
       capabilityLedger: ledger,
@@ -3731,7 +4014,18 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     if (!this.invariantsSeededRuns.has(updated.id)) {
       try {
         this.seedCapabilityLedgerInvariants(updated, { approvedOrigins })
+        if (!sourceMounted && updated.capabilityTier > 0) {
+          const addedComposites = this.promoteRuntimeCompositeWave1Steps(updated, approvedOrigins)
+          funnel.planned += addedComposites
+          funnel.enqueued += addedComposites
+        }
       } catch { /* additive Layer-2 synthesis */ }
+    } else {
+      try {
+        const postSync = this.syncPostFloorRuntimeInvariants(updated, approvedOrigins, { sourceMounted })
+        funnel.planned += postSync.wave1StepsCreated
+        funnel.enqueued += postSync.wave1StepsCreated
+      } catch { /* incremental post-floor synthesis is additive */ }
     }
     let tierAPlannerSteps = 0
     if (sourceMounted) {
@@ -3767,7 +4061,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     // yielded >= 2 composable typed ChainHop artifacts. Deterministic hypotheses dispatch *before*
     // the LLM turn so a planner failure can never leave an empty window.
     let chainSteps = 0
-    if (roundNo >= 2 || coordinator.extractChainHops(roundNo).length >= 2) {
+    const greyBoxApiDeps = !sourceMounted ? this.collectCoordinatorApiDependencies(updated) : []
+    if (roundNo >= 2 || coordinator.extractChainHops(roundNo).length >= 2 || (!sourceMounted && (greyBoxApiDeps.length >= 1 || approvedOrigins.size >= 2))) {
       try { chainSteps = this.dispatchChainRound(updated, coordinator, dynamicStepBudget, factIds, funnel) } catch { /* additive */ }
     }
 

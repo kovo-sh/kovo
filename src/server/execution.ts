@@ -1497,6 +1497,8 @@ export class Execution {
       return {
         producer: producer ? `${producer.method} ${producer.pathTemplate}` : dep.producerEndpointId,
         consumer: consumer ? `${consumer.method} ${consumer.pathTemplate}` : dep.consumerEndpointId,
+        ...(producer?.origin ? { producerOrigin: producer.origin } : {}),
+        ...(consumer?.origin ? { consumerOrigin: consumer.origin } : {}),
         resourceKey: dep.resourceKey, personaHandle: dep.personaHandle, testedBola: dep.testedBola,
       }
     })
@@ -2818,6 +2820,7 @@ export class Execution {
       this.reconPlanner.ensureWave1InvariantChainSteps(
         this.storage.run(run.id),
         this.approvedOriginsSet(run),
+        { postFloor: this.agenticLaneCompleted.has(this.deterministicLaneKey(run)) },
       )
     } catch { /* invariant chain promotion is additive */ }
 
