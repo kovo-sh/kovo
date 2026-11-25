@@ -164,7 +164,8 @@
   }
   const estimate = () => {
     const w = frame.clientWidth || frame.parentElement.clientWidth
-    return Math.round(w * 810 / 1440) + 40 + (w <= 720 ? 82 : 0)
+    // ≤ 720 px the replay switches to its 4:5 focus crop (see replay/hero.js)
+    return w <= 720 ? Math.min(Math.round(w * 1.25), 640) + 48 + 88 : Math.round(w * 810 / 1440) + 40
   }
   let gotHeight = false
   const sizeFrame = () => { if (!gotHeight) frame.style.height = estimate() + 'px' }
