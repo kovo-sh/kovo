@@ -158,8 +158,9 @@ function collectEntryDigests(entry: HostTranscriptEntry, side: 'response' | 'req
   } else {
     for (const d of entry.injectedRequestDigests ?? []) digests.add(d.toLowerCase())
     collectLeaves(entry.step.requestJson, leaves); collectHeaderTokens(entry.step.requestHeaders, leaves)
-    const q = entry.step.pathAndQuery?.indexOf('?') ?? -1
-    if (q >= 0 && entry.step.pathAndQuery) for (const v of new URLSearchParams(entry.step.pathAndQuery.slice(q + 1)).values()) if (v) leaves.add(v)
+    const pq = entry.step.pathAndQuery ?? '', q = pq.indexOf('?')
+    for (const seg of (q >= 0 ? pq.slice(0, q) : pq).split('/')) if (seg) { leaves.add(seg); try { const d = decodeURIComponent(seg); if (d !== seg) leaves.add(d) } catch { /* ignore */ } }
+    if (q >= 0) for (const v of new URLSearchParams(pq.slice(q + 1)).values()) if (v) leaves.add(v)
   }
   for (const leaf of leaves) digests.add(sha256Hex(leaf))
   return digests
@@ -299,21 +300,18 @@ function collectHopOutputs(hop: HopReceipt, idx: IndexedTranscript): HopOutputEv
 
 function matchOrderedPair(
   outputs: readonly HopOutputEvent[], reqs: readonly HostTranscriptEntry[],
-  matchOut: (o: HopOutputEvent) => boolean, matchReq: (r: HostTranscriptEntry) => boolean,
+  matchOut: (o: HopOutputEvent) => boolean, matchReq: (r: HostTranscriptEntry, o: HopOutputEvent) => boolean | 'out_of_order',
 ): { ok: true; pair: { from: string; to: string; tFrom: number; tTo: number } } | { ok: false; outOfOrder: boolean; missingTs?: string } {
   let outOfOrder = false
-  for (const o of outputs) {
-    if (!matchOut(o)) continue
-    for (const r of reqs) {
-      if (!matchReq(r)) continue
-      if (!isFiniteTs(r.timestampMs)) return { ok: false, outOfOrder: false, missingTs: r.exchangeId }
-      if (o.timestampMs <= r.timestampMs) return { ok: true, pair: { from: o.sourceId, to: r.exchangeId, tFrom: o.timestampMs, tTo: r.timestampMs } }
-      outOfOrder = true
-    }
+  for (const o of outputs) if (matchOut(o)) for (const r of reqs) {
+    const hit = matchReq(r, o)
+    if (!hit) continue
+    if (!isFiniteTs(r.timestampMs)) return { ok: false, outOfOrder: false, missingTs: r.exchangeId }
+    if (hit === true && o.timestampMs <= r.timestampMs) return { ok: true, pair: { from: o.sourceId, to: r.exchangeId, tFrom: o.timestampMs, tTo: r.timestampMs } }
+    outOfOrder = true
   }
   return { ok: false, outOfOrder }
 }
-
 function verifyValueBinding(
   base: EdgeBase, edge: Extract<CausalEdgeBinding, { kind: 'value_binding' }>,
   fromHop: HopReceipt, toHop: HopReceipt, idx: IndexedTranscript,
@@ -322,17 +320,18 @@ function verifyValueBinding(
   const reqs = toHop.exchangeIds.filter(id => !edge.targetExchangeId || id === edge.targetExchangeId).map(id => idx.entriesById.get(id)!)
   if (outputs.length === 0) return edgeFail(base, `fromHop "${fromHop.hopId}" has no timestamped host outputs.`)
   if (reqs.length === 0) return edgeFail(base, `toHop "${toHop.hopId}" has no host exchange records.`)
-
   const ev: Record<string, unknown> = {}
   if (edge.capabilityHandle) {
-    const cap = edge.capabilityHandle
-    const m = matchOrderedPair(outputs, reqs, o => o.capabilities.has(cap), r => r.consumedCapabilities?.includes(cap) ?? false)
+    const cap = edge.capabilityHandle, matchCap = (r: HostTranscriptEntry, o: HopOutputEvent): boolean | 'out_of_order' => {
+      if ((r.consumedCapabilities?.includes(cap) ?? false) || r.actorPersona === cap) return true
+      const atts = (r.cryptoAttestations ?? []).filter(a => (a.derivedFromCapabilityId === cap || a.derivedCapabilityId === cap) && SHA256_RE.test(a.artifactDigest.toLowerCase()) && isFiniteTs(a.timestampMs))
+      return atts.length === 0 ? false : atts.some(a => o.timestampMs <= a.timestampMs && (!isFiniteTs(r.timestampMs) || a.timestampMs <= r.timestampMs)) ? true : 'out_of_order'
+    }, m = matchOrderedPair(outputs, reqs, o => o.capabilities.has(cap), matchCap)
     if (!m.ok) return edgeFail(base, m.missingTs ? `toHop "${m.missingTs}" missing timestampMs.` : m.outOfOrder ? `value_binding handle "${cap}" violated monotonic ordering (t_i > t_j).` : `value_binding handle "${cap}" not matched.`)
     ev.capabilityHandle = cap; ev.handlePair = m.pair
   }
   if (edge.valueDigest) {
-    const dig = edge.valueDigest.toLowerCase()
-    const m = matchOrderedPair(outputs, reqs, o => o.digests.has(dig), r => collectEntryDigests(r, 'request').has(dig))
+    const dig = edge.valueDigest.toLowerCase(), m = matchOrderedPair(outputs, reqs, o => o.digests.has(dig), r => collectEntryDigests(r, 'request').has(dig))
     if (!m.ok) return edgeFail(base, m.missingTs ? `toHop "${m.missingTs}" missing timestampMs.` : m.outOfOrder ? 'value_binding digest violated monotonic ordering (t_i > t_j).' : 'value_binding sha256 digest not matched.')
     ev.valueDigest = dig; ev.digestPair = m.pair
   }
