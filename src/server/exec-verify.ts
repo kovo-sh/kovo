@@ -23,6 +23,7 @@ import { accessPolicyReviews } from './access-policy-checks.ts'
 import { BrokerDenied, type BrokerExchangeResult, type Grant, type RequestBroker } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
 import {
+  LEGACY_PYTHON_PROOF_REASON,
   runAgentScriptProof,
   safeVaultRunId,
   type AgentScriptProofParams,
@@ -1786,11 +1787,14 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     run: Run
     assignment: Assignment
     script: string
-    runtime: 'ts' | 'python'
+    runtime: 'ts'
     title?: string
     proof: AgentScriptProofResult | V8AgentScriptProofResult
     secrets: readonly NamedSecret[]
   }): { findingId: string; replaySpecId: string; receiptId: string | null } {
+    if (input.runtime !== 'ts') {
+      throw new Error(`Unsupported guardian_verify runtime: ${String(input.runtime)}. guardian_verify supports TypeScript only (runtime='ts').`)
+    }
     const { run, assignment, proof } = input
     const compositeBundle = 'compositeReceipt' in proof ? proof.compositeReceipt : null
     const singleConfirmed = Boolean(proof.receipt && proof.receipt.verification.confirmed)
@@ -2205,6 +2209,64 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     const origin = (persisted.origin || specRow.spec.origin || '').trim()
     const approved = this.host.approvedOriginsSet(run)
     if (!origin || !approved.has(origin)) return null
+
+    if (envelope.runtime !== 'ts' || proof.runtime !== 'ts') {
+      const status: Finding['status'] = 'inconclusive'
+      const feedback: InlineVerifyFeedback = {
+        verdict: 'inconclusive',
+        controlPassed: false,
+        assertionSummary: {
+          observed: LEGACY_PYTHON_PROOF_REASON,
+          expected: 'the persisted script reproduces the confirmation and its receipt re-validates',
+          reason: LEGACY_PYTHON_PROOF_REASON,
+        },
+        stepStatuses: [],
+        retriesRemaining: maxInlineVerifyRetries,
+      }
+      const updatedSpec = this.storage.incrementReplaySpecAttempt(specRow.id, feedback, {
+        spec: specRow.spec,
+        sourceOrigins: specRow.sourceOrigins,
+        secrets: params.currentSecrets(),
+      })
+      this.storage.setReplaySpecProof(run.id, updatedSpec.id, {
+        ...proof,
+        replaySpecId: updatedSpec.id,
+        verdict: 'inconclusive',
+        receipt: null,
+        createdAt: Date.now(),
+      })
+      if (findingRow) {
+        this.storage.updateProposedFinding(run, findingRow.id, {
+          replaySpecId: updatedSpec.id,
+          verificationTier: null,
+          finding: {
+            status,
+            verificationTier: undefined,
+            reason: LEGACY_PYTHON_PROOF_REASON,
+            confidence: 'low',
+            verification: `Agent script proof re-verification returned inconclusive (${LEGACY_PYTHON_PROOF_REASON}).`,
+            exchangeIds: [],
+          },
+        })
+      }
+      this.host.postVerificationVerdict(run, {
+        replaySpecId: updatedSpec.id,
+        findingId: findingRow?.id ?? null,
+        title: findingRow?.finding.title ?? 'Agent script proof',
+        status,
+        feedback,
+        assignmentId: updatedSpec.assignmentId ?? params.job.assignment.id,
+        refStepId: params.job.assignment.stepId,
+        attempt: updatedSpec.attemptCount,
+      })
+      return {
+        findingId: findingRow?.id ?? specRow.findingId,
+        replaySpecId: updatedSpec.id,
+        attemptCount: updatedSpec.attemptCount,
+        status,
+        feedback,
+      }
+    }
 
     const result = await this.runAgentScriptProof({
       script: envelope.script,

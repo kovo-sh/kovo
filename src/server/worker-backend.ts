@@ -226,7 +226,7 @@ export const offlineScriptResultSchema = z.object({
 })
 
 export const verifyScriptRequestSchema = z.object({
-  runtime: z.enum(['ts', 'python']),
+  runtime: z.literal('ts'),
   code: z.string().min(1).max(256 * 1024),
   nonce: z.string().regex(/^[a-f0-9]{16,128}$/i),
   title: z.string().max(300).optional(),
@@ -234,7 +234,7 @@ export const verifyScriptRequestSchema = z.object({
 })
 
 export const verifyScriptResultSchema = z.object({
-  runtime: z.enum(['ts', 'python']),
+  runtime: z.literal('ts'),
   exitCode: z.number().int(),
   result: z.unknown(),
   stdout: z.string().max(256 * 1024),
@@ -502,7 +502,7 @@ function readOneShotRef(dir: string, rawRef: unknown): Record<string, unknown> {
   return parsed as Record<string, unknown>
 }
 
-const verifySdkFiles = ['guardian_verify.ts', 'guardian_verify.py'] as const
+const verifySdkFiles = ['guardian_verify.ts'] as const
 /**
  * The worker image predates the SDK, so the host stages it per call. This keeps the container
  * filesystem immutable and makes the SDK version auditable alongside the verifier that ran it.

@@ -46,9 +46,12 @@ export interface V8CompositeProofBundle {
   hopActors: Record<string, string | null>
 }
 
+export const LEGACY_PYTHON_PROOF_REASON =
+  "Legacy Python agent_script proof is no longer supported; re-verify with TypeScript (runtime='ts')."
+
 export interface AgentScriptProofParams {
   script: string
-  runtime: 'ts' | 'python'
+  runtime: 'ts'
   title?: string
   broker: RequestBroker
   grant: Grant
@@ -205,6 +208,9 @@ class CapturingVerifyRpcServer extends VerifyRpcServer {
 }
 
 export async function runAgentScriptProof(params: AgentScriptProofParams): Promise<AgentScriptProofResult> {
+  if (params.runtime !== 'ts') {
+    throw new Error(`Unsupported guardian_verify runtime: ${String(params.runtime)}. guardian_verify supports TypeScript only (runtime='ts').`)
+  }
   const code = params.script.trim()
   if (!code) throw new Error('An agent proof script is required.')
   if (Buffer.byteLength(code) > 64 * 1024) throw new Error('The agent proof script exceeds the 64 KiB limit.')
@@ -303,7 +309,7 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
   }
 
   const verdict = await verifyScript({
-    candidate: { name: `agent-proof-${params.runId}.${params.runtime === 'python' ? 'py' : 'ts'}`, runtime: params.runtime, code },
+    candidate: { name: `agent-proof-${params.runId}.ts`, runtime: 'ts', code },
     openAttempt,
     signal: params.signal,
   })
@@ -532,6 +538,34 @@ export async function retestPersistedAgentScript(
     compositeVerifyOptions?: Omit<CompositeVerifyOptions, 'signingKey'>
   },
 ): Promise<RetestReplayResult> {
+  if (envelope.runtime !== 'ts') {
+    const replay: ReplayVerificationResult = {
+      verdict: 'inconclusive',
+      outcome: {
+        confirmed: false,
+        controlPassed: false,
+        observed: LEGACY_PYTHON_PROOF_REASON,
+        expected: 'the persisted proof script reproduces its confirmation',
+        reason: LEGACY_PYTHON_PROOF_REASON,
+      },
+      exchangeIds: [],
+      exchanges: [],
+      evidencePayload: {
+        mode: 'agent_script',
+        runtime: envelope.runtime,
+        scriptSha256: envelope.scriptSha256,
+        transcriptDigests: [],
+        receipt: null,
+      },
+      evidenceSha256: createHash('sha256').update(JSON.stringify({
+        script: envelope.scriptSha256,
+        digests: [],
+        verdict: 'inconclusive',
+        reason: 'legacy_python_unsupported',
+      })).digest('hex'),
+    }
+    return { verdict: 'inconclusive', replay }
+  }
   const origin = params.origin?.trim() ?? ''
   const result = await runAgentScriptProof({
     script: envelope.script,
