@@ -112,10 +112,11 @@ def _rpc(op: str, args: dict[str, Any], timeout: float = 60.0) -> Any:
 
 
 def _parse_json_safe(body: str) -> Any:
-    if not body or not body.strip():
+    cleaned = body.lstrip("\ufeff").strip() if isinstance(body, str) else ""
+    if not cleaned:
         return None
     try:
-        return json.loads(body)
+        return json.loads(cleaned)
     except (ValueError, TypeError):
         return None
 
@@ -126,7 +127,7 @@ class Exchange(_AttrDict):
     def __init__(self, raw: Optional[dict[str, Any]] = None) -> None:
         base = dict(raw or {})
         body = str(base.get("body", "") or "")
-        parsed = base["json"] if "json" in base and base["json"] is not None else _parse_json_safe(body)
+        parsed = base["json"] if base.get("json") is not None else _parse_json_safe(body)
         ex_id = str(base.get("exchangeId", base.get("exchange_id", "")) or "")
         base.update({
             "exchangeId": ex_id, "exchange_id": ex_id,

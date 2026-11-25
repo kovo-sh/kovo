@@ -317,19 +317,33 @@ function extractInlineHttpOptions(input: unknown): HttpOptions {
   for (const k of ['session', 'role', 'arm', 'followRedirects', 'timeoutMs', 'capability', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'entityId', 'correlationIds', 'evidenceRole', 'replayAttempt'] as const) {
     if (r[k] !== undefined) (out as Record<string, unknown>)[k] = r[k]
   }
+  for (const [src, dst] of [['capability_target', 'capabilityTarget'], ['capability_header_name', 'capabilityHeaderName'], ['capability_cookie_name', 'capabilityCookieName'], ['capability_query_param', 'capabilityQueryParam']] as const) {
+    if (r[src] !== undefined && (out as Record<string, unknown>)[dst] === undefined) (out as Record<string, unknown>)[dst] = r[src]
+  }
   return out
 }
 
 function parseJsonSafe(body: unknown): unknown {
-  if (typeof body !== 'string' || !body.trim()) return null
-  try { return JSON.parse(body) } catch { return null }
+  if (typeof body !== 'string') return null
+  const cleaned = body.replace(/^\uFEFF/, '').trim()
+  if (!cleaned) return null
+  try { return JSON.parse(cleaned) } catch { return null }
 }
 
-function hydrateExchange(raw: HttpExchange): HttpExchange {
+export function hydrateExchange(raw: HttpExchange): HttpExchange {
   if (!raw || typeof raw !== 'object') return raw
   const body = typeof raw.body === 'string' ? raw.body : ''
-  const parsed = raw.json !== undefined ? raw.json : parseJsonSafe(body)
+  const parsed = raw.json != null ? raw.json : parseJsonSafe(body)
   return { ...raw, body, text: body, json: parsed, data: parsed, headers: raw.headers && typeof raw.headers === 'object' ? raw.headers : {} }
+}
+
+function hydrateFields<T extends Record<string, unknown>>(res: T, keys: readonly string[]): T {
+  const out: Record<string, unknown> = { ...res }
+  for (const k of keys) {
+    const v = out[k]
+    if (v && typeof v === 'object' && !Array.isArray(v) && 'exchangeId' in (v as Record<string, unknown>)) out[k] = hydrateExchange(v as HttpExchange)
+  }
+  return out as T
 }
 
 function resolveCapHandle(value: unknown): string {
@@ -400,8 +414,13 @@ export class VerifyContext {
   private buildHttpRpcArgs(input: HttpTarget, options: HttpOptions = {}): { args: Record<string, unknown>; timeoutMs: number } {
     const target = splitTarget(input, this.defaultOrigin)
     const merged: HttpOptions = { ...extractInlineHttpOptions(input), ...options }
+    const mr = merged as Record<string, unknown>
     const { body, headers } = normalizeBodyAndHeaders(merged.body, merged.headers)
     const persona = merged.as ?? merged.persona
+    const capTarget = merged.capabilityTarget ?? mr.capability_target
+    const capHeader = merged.capabilityHeaderName ?? mr.capability_header_name
+    const capCookie = merged.capabilityCookieName ?? mr.capability_cookie_name
+    const capQuery = merged.capabilityQueryParam ?? mr.capability_query_param
     return {
       args: {
         ...(target.origin ? { origin: target.origin } : {}),
@@ -414,10 +433,10 @@ export class VerifyContext {
         ...((merged.role ?? merged.arm) ? { sessionGroupRole: merged.role ?? merged.arm } : {}),
         ...(merged.followRedirects !== undefined ? { followRedirects: merged.followRedirects } : {}),
         ...(merged.capability !== undefined ? { capability: merged.capability } : {}),
-        ...(merged.capabilityTarget ? { capabilityTarget: merged.capabilityTarget } : {}),
-        ...(merged.capabilityHeaderName ? { capabilityHeaderName: merged.capabilityHeaderName } : {}),
-        ...(merged.capabilityCookieName ? { capabilityCookieName: merged.capabilityCookieName } : {}),
-        ...(merged.capabilityQueryParam ? { capabilityQueryParam: merged.capabilityQueryParam } : {}),
+        ...(capTarget ? { capabilityTarget: capTarget } : {}),
+        ...(capHeader ? { capabilityHeaderName: capHeader } : {}),
+        ...(capCookie ? { capabilityCookieName: capCookie } : {}),
+        ...(capQuery ? { capabilityQueryParam: capQuery } : {}),
         ...(merged.entityId ? { entityId: merged.entityId } : {}),
         ...(merged.correlationIds?.length ? { correlationIds: merged.correlationIds } : {}),
         ...(merged.evidenceRole ? { evidenceRole: merged.evidenceRole } : {}),
@@ -675,7 +694,7 @@ export class VerifyContext {
     if (!input || typeof input !== 'object') {
       throw new Error('prove_access_boundary requires { controlPersona?, probePersona?, route, method?, boundaryClass?, vulnClass?, expectControlDenied? }.')
     }
-    const res = await rpc('prove.accessBoundary', input as Record<string, unknown>, 70_000) as AccessBoundaryProof
+    const res = hydrateFields(await rpc('prove.accessBoundary', input as Record<string, unknown>, 70_000) as Record<string, unknown>, ['control', 'probe']) as unknown as AccessBoundaryProof
     if (res.claim) this.claims.push(res.claim)
     return res
   }
@@ -692,7 +711,7 @@ export class VerifyContext {
       delete payload.expect_delta
       payload.hasCustomExpectFn = true
     }
-    const res = await rpc('prove.persistedMutation', payload, 70_000) as PersistedMutationProof
+    const res = hydrateFields(await rpc('prove.persistedMutation', payload, 70_000) as Record<string, unknown>, ['before', 'mutation', 'after']) as unknown as PersistedMutationProof
     if (res.claim) this.claims.push(res.claim)
     if (expectFn && !Boolean(expectFn(res.delta.before, res.delta.after, res.delta))) {
       const missingEvidence = [...new Set([...res.missingEvidence, 'expected_delta'])]
@@ -707,6 +726,9 @@ export class VerifyContext {
     }
     const res = await rpc('prove.differential', input as Record<string, unknown>, 120_000) as DifferentialProof
     if (res.claim) this.claims.push(res.claim)
+    if (res.exchanges) {
+      res.exchanges = { control: res.exchanges.control.map(hydrateExchange), variant: res.exchanges.variant.map(hydrateExchange) }
+    }
     return res
   }
 
@@ -751,7 +773,7 @@ export class VerifyContext {
     const raw = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>
     const reqCount = Array.isArray(raw.requests) ? raw.requests.length : 0
     const rpcTimeout = Math.max(40_000, Math.min(80_000, 25_000 + reqCount * 2_000))
-    const res = await rpc('prove.race', raw, rpcTimeout) as RaceBurstProof
+    const res = hydrateFields(await rpc('prove.race', raw, rpcTimeout) as Record<string, unknown>, ['baseline', 'post', 'serial', 'serialPost']) as unknown as RaceBurstProof
     if (res.claim && Array.isArray(res.claim.exchangeIds) && res.claim.exchangeIds.length >= 2) this.claims.push(res.claim)
     return res
   }
@@ -760,7 +782,7 @@ export class VerifyContext {
     if (!input || typeof input !== 'object') {
       throw new Error('prove_injection_differential requires { control, probe, expectedOutput?, vulnClass? }.')
     }
-    const res = await rpc('prove.injection', input as Record<string, unknown>, 70_000) as InjectionDifferentialProof
+    const res = hydrateFields(await rpc('prove.injection', input as Record<string, unknown>, 70_000) as Record<string, unknown>, ['control', 'probe']) as unknown as InjectionDifferentialProof
     if (Array.isArray(res.claims)) this.claims.push(...res.claims)
     else if (res.claim) this.claims.push(res.claim)
     return res

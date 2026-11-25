@@ -98,6 +98,8 @@ export interface BrokerHttpRequest {
   secrets?: readonly NamedSecret[]
   maxBodyBytes?: number
   timeoutMs?: number
+  /** Host-only in-process hook delivering pre-redaction response body & headers strictly for host capability sealing. Never exposed on BrokerExchangeResult. */
+  onRawResponse?: (raw: { body: string; headers: Record<string, string> }) => void
 }
 
 export interface BrokerWebsocketRequest {
@@ -3459,6 +3461,9 @@ export class RequestBroker {
       // for logs/LLMs but erases what a disclosure verifier needs. Only bounded fingerprints leave
       // this scope; raw values stay in memory for the duration of the scan.
       const rawResponseHeaders = normalizeHeaders(response.headers)
+      if (req.onRawResponse) {
+        try { req.onRawResponse({ body: rawBody, headers: { ...rawResponseHeaders } }) } catch { /* host hook must never abort exchange */ }
+      }
       const secretMatches = [
         ...scanSecrets(rawBody, { secrets: effectiveSecrets }),
         ...scanSecretHeaders(rawResponseHeaders, { secrets: effectiveSecrets }),
