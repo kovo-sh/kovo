@@ -442,7 +442,7 @@ export async function installWebSocketGuard(
   context: Pick<PlaywrightContext, 'routeWebSocket'> & Partial<Pick<PlaywrightContext, 'addInitScript'>>,
   options: {
     canRead: (origin: string) => boolean
-    allowLocalLab: boolean
+    allowLocalLab: boolean | (() => boolean)
     audit?: (decision: 'denied', origin: string) => void
   },
 ): Promise<void> {
@@ -457,10 +457,11 @@ export async function installWebSocketGuard(
   }
   await context.routeWebSocket('**/*', async ws => {
     let origin: string
+    const allowLocalLab = typeof options.allowLocalLab === 'function' ? options.allowLocalLab() : options.allowLocalLab
     try {
       const url = new URL(ws.url())
       const secure = url.protocol === 'wss:'
-      if (!secure && !(options.allowLocalLab && url.protocol === 'ws:')) {
+      if (!secure && !(allowLocalLab && url.protocol === 'ws:')) {
         options.audit?.('denied', url.origin)
         await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
         return
@@ -977,6 +978,10 @@ interface PooledRuntime {
   sockets: Map<string, BrowserWebSocketRecord>
   cdp: PlaywrightCdpSession | null
   active: PooledVisitState | null
+  /** Mutable per-checkout grant bound on visit start and cleared on release (never stale across assignments). */
+  activeGrant: Grant | null
+  /** Mutable per-checkout local-lab flag paired with `activeGrant`. */
+  activeAllowLocalLab: boolean
   lastUsed: number
 }
 
@@ -1481,10 +1486,8 @@ export class ScopedBrowser {
   private async ensurePooledContext(
     browser: PlaywrightBrowserLike,
     req: BrowserVisitRequest,
-    grant: Grant,
     initialOrigin: string,
     bundle: BrowserSessionBundle | null,
-    allowLocalLab: boolean,
   ): Promise<PooledRuntime> {
     const key = `${req.runId ?? 'default'}::${req.persona ? `persona:${req.persona}` : 'anonymous'}`
     const existing = this.pooled.get(key)
@@ -1502,6 +1505,9 @@ export class ScopedBrowser {
       }
       if (oldest) {
         this.pooled.delete(oldest.key)
+        oldest.active = null
+        oldest.activeGrant = null
+        oldest.activeAllowLocalLab = false
         await oldest.cdp?.detach?.().catch(() => undefined)
         await oldest.page.close().catch(() => undefined)
         await oldest.context.close().catch(() => undefined)
@@ -1517,15 +1523,6 @@ export class ScopedBrowser {
       userAgent: 'KovoHunter/6 pooled scoped inspector',
     })
     this.poolStats.contextsCreated += 1
-    await context.addInitScript(postMessageInstrumentationScript)
-    await context.addInitScript(browserWebRtcGuardScript)
-    await installWebSocketGuard(context, {
-      canRead: origin => grant.canRead(origin),
-      allowLocalLab,
-      audit: (decision, origin) => grant.audit(decision, origin),
-    })
-    const storageSeed = bundle?.initScript ?? seedStorageInitScript(bundle, initialOrigin)
-    if (storageSeed) await context.addInitScript(storageSeed)
 
     const runtime: PooledRuntime = {
       key,
@@ -1535,12 +1532,25 @@ export class ScopedBrowser {
       sockets: new Map(),
       cdp: null,
       active: null,
+      activeGrant: null,
+      activeAllowLocalLab: false,
       lastUsed: Date.now(),
     }
 
+    await context.addInitScript(postMessageInstrumentationScript)
+    await context.addInitScript(browserWebRtcGuardScript)
+    await installWebSocketGuard(context, {
+      canRead: origin => Boolean(runtime.activeGrant?.canRead(origin)),
+      allowLocalLab: () => runtime.activeAllowLocalLab,
+      audit: (decision, origin) => { runtime.activeGrant?.audit(decision, origin) },
+    })
+    const storageSeed = bundle?.initScript ?? seedStorageInitScript(bundle, initialOrigin)
+    if (storageSeed) await context.addInitScript(storageSeed)
+
     await context.route('**/*', async route => {
       const state = runtime.active
-      if (!state) {
+      const activeGrant = runtime.activeGrant
+      if (!state || !activeGrant) {
         await route.abort('blockedbyclient').catch(() => undefined)
         return
       }
@@ -1556,14 +1566,14 @@ export class ScopedBrowser {
         url: rawUrl,
         body: request.postData(),
         tier: state.tier,
-        canRead: origin => grant.canRead(origin),
-        allowLocalLab,
+        canRead: origin => activeGrant.canRead(origin),
+        allowLocalLab: runtime.activeAllowLocalLab,
         assetScope: state.assetScope,
-        scopePolicy: grant.scopePolicy,
+        scopePolicy: activeGrant.scopePolicy,
       })
       if (!decision.allowed) {
         try { state.blockedOrigins.add(new URL(rawUrl).origin) } catch { /* ignore */ }
-        try { grant.audit('denied', new URL(rawUrl).origin) } catch { /* ignore */ }
+        try { activeGrant.audit('denied', new URL(rawUrl).origin) } catch { /* ignore */ }
         await route.abort('blockedbyclient').catch(() => undefined)
         return
       }
@@ -1586,7 +1596,7 @@ export class ScopedBrowser {
           state.validatedFetch &&
           state.validatedFetch.credentials === 'include' &&
           parsedUrl.origin === state.validatedFetch.origin &&
-          Boolean(grant.personas?.get(state.persona)?.originAllowlist.includes(parsedUrl.origin))
+          Boolean(activeGrant.personas?.get(state.persona)?.originAllowlist.includes(parsedUrl.origin))
         ) {
           personaForRequest = state.persona
         }
@@ -1608,7 +1618,7 @@ export class ScopedBrowser {
           followRedirects: true,
           secrets: state.secrets,
           timeoutMs: Math.max(2_000, 20_000),
-        }, decision.assetHydration ? assetScopedGrant(grant, parsedUrl.origin) : grant, state.signal ?? AbortSignal.timeout(25_000))
+        }, decision.assetHydration ? assetScopedGrant(activeGrant, parsedUrl.origin) : activeGrant, state.signal ?? AbortSignal.timeout(25_000))
         if (!decision.assetHydration) {
           state.exchanges.push(exchange)
           const recordedId = state.onExchange?.(exchange)
@@ -1743,7 +1753,7 @@ export class ScopedBrowser {
       const timeoutMs = Math.max(2_000, Math.min(req.timeoutMs ?? maxBrowserTimeoutMs, maxBrowserTimeoutMs))
       const secrets = [...collectSecrets(req, grant), ...this.broker.getRegisteredSecrets()]
       const bundle = await this.resolveBundle(req, grant, initialOrigin)
-      const runtime = await this.ensurePooledContext(browser, req, grant, initialOrigin, bundle, allowLocalLab)
+      const runtime = await this.ensurePooledContext(browser, req, initialOrigin, bundle)
       const state: PooledVisitState = {
         origin: initialOrigin,
         ...(req.persona ? { persona: req.persona } : {}),
@@ -1768,6 +1778,8 @@ export class ScopedBrowser {
         signal,
       }
       runtime.active = state
+      runtime.activeGrant = grant
+      runtime.activeAllowLocalLab = allowLocalLab
       runtime.lastUsed = Date.now()
       runtime.sockets.clear()
 
@@ -1899,6 +1911,8 @@ export class ScopedBrowser {
         })
       } finally {
         runtime.active = null
+        runtime.activeGrant = null
+        runtime.activeAllowLocalLab = false
       }
     }
     return results
@@ -1907,6 +1921,9 @@ export class ScopedBrowser {
   /** Close every pooled context and the single Chromium process. Idempotent. */
   async close(): Promise<void> {
     for (const entry of this.pooled.values()) {
+      entry.active = null
+      entry.activeGrant = null
+      entry.activeAllowLocalLab = false
       await entry.cdp?.detach?.().catch(() => undefined)
       await entry.page.close().catch(() => undefined)
       await entry.context.close().catch(() => undefined)

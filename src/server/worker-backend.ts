@@ -49,8 +49,36 @@ const createdAtNamespace = 'dev.kovo.created-at'
 /** Matrix cells label every container so the cell reaper can remove exactly its own. */
 const cellNamespace = 'dev.kovo.cell'
 const warmNamespace = 'dev.kovo.warm'
+/** Host PID that created/owns the container; stale sweep never reaps live-PID containers. */
+export const WORKER_OWNER_PID_LABEL = 'kovo.owner_pid'
+/** Pool or backend instance id stamped on containers for ownership attribution. */
+export const WORKER_POOL_INSTANCE_LABEL = 'kovo.pool_instance'
 /** A container may legitimately sit in `created` only for the create→start instant. */
 const DEFAULT_STALE_CREATED_MS = 120_000
+
+/**
+ * Return `true` if host `pid` is still alive, `false` when definitely dead (`ESRCH`).
+ * `EPERM` means the process exists under another UID, so we fail safe and treat it as alive.
+ */
+export function isOwnerPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code
+    if (code === 'ESRCH') return false
+    return true
+  }
+}
+
+function parseOwnerPid(raw: string | undefined): number | null {
+  if (!raw) return null
+  const trimmed = raw.trim()
+  if (!/^\d+$/.test(trimmed)) return null
+  const pid = Number(trimmed)
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : null
+}
 const processSessionId = randomUUID()
 const liveContainers = new Set<string>()
 const liveStagedRepoDirs = new Set<string>()
@@ -752,6 +780,8 @@ interface ContainerArgsInput {
   owner?: string
   cell?: string
   warm?: boolean
+  ownerPid?: number
+  poolInstanceId?: string
   options?: WorkerSessionOptions
   /** One-shot only: host tmpfs dir bind-mounted at /kovo-ipc for large-output pointers. */
   ipcDir?: string
@@ -1055,6 +1085,8 @@ export function workerContainerCreateArgs(input: ContainerArgsInput): string[] {
     ...(input.owner ? ['--label', `${workerNamespace}=${input.owner}`] : []),
     ...(input.cell ? ['--label', `${cellNamespace}=${input.cell}`] : []),
     ...(input.warm ? ['--label', `${warmNamespace}=1`] : []),
+    '--label', `${WORKER_OWNER_PID_LABEL}=${input.ownerPid ?? process.pid}`,
+    ...(input.poolInstanceId ? ['--label', `${WORKER_POOL_INSTANCE_LABEL}=${input.poolInstanceId}`] : []),
     '--label', `${sessionNamespace}=${processSessionId}`,
     '--label', `${createdAtNamespace}=` + Date.now(),
     input.image,
@@ -1140,6 +1172,7 @@ function sharedWarmPool(input: {
  */
 export class WarmWorkerPool {
   readonly cell: string
+  readonly instanceId: string = randomUUID()
   private readonly image: string
   private readonly docker: DockerRunner
   private readonly runLabel: string
@@ -1266,6 +1299,8 @@ export class WarmWorkerPool {
         ...(this.owner ? { owner: this.owner } : {}),
         cell: this.cell,
         warm: true,
+        ownerPid: process.pid,
+        poolInstanceId: this.instanceId,
         options: this.effectiveCreateOptions(),
       }), AbortSignal.timeout(15_000))
       if (this.closed) {
@@ -1369,6 +1404,7 @@ export class WarmWorkerPool {
 }
 
 export class LinuxWorkerBackend implements WorkerBackend {
+  private readonly instanceId = randomUUID()
   private readonly image: string
   private readonly owner?: string
   private readonly runId?: string
@@ -1376,6 +1412,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
   private readonly docker: DockerRunner
   private readonly spawnSession: (name: string) => ChildProcess
   private readonly staleCreatedMs: number
+  private readonly isPidAlive: (pid: number) => boolean
   private warmPool?: WarmWorkerPool
   /** Last pool policy installed by Execution (run id + credential generation). */
   private warmPoolPolicy?: string
@@ -1394,7 +1431,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
   private coldSessionCreates = 0
   private reclaiming?: Promise<void>
 
-  constructor({ image = 'kovo-worker:v4', workspace, runId, dockerRunner, sessionSpawner, staleCreatedMs, cell }: {
+  constructor({ image = 'kovo-worker:v4', workspace, runId, dockerRunner, sessionSpawner, staleCreatedMs, cell, isPidAlive }: {
     image?: string
     workspace?: { id: string; directory: string }
     runId?: string
@@ -1409,6 +1446,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
      * and enables the best-effort warm session pool unless `KOVO_WARM_WORKERS=0`.
      */
     cell?: string
+    /** Test seam: check whether a container owner PID is alive (defaults to `isOwnerPidAlive`). */
+    isPidAlive?: (pid: number) => boolean
   } = {}) {
     this.image = image
     this.runId = runId
@@ -1418,6 +1457,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       stdio: ['pipe', 'pipe', 'pipe'],
     }))
     this.staleCreatedMs = Math.max(0, staleCreatedMs ?? DEFAULT_STALE_CREATED_MS)
+    this.isPidAlive = isPidAlive ?? isOwnerPidAlive
     const cellId = cell ?? process.env.KOVO_CELL_ID
     this.cell = cellId && cellId.trim() ? cellId.trim() : undefined
     if (workspace) {
@@ -1595,8 +1635,11 @@ export class LinuxWorkerBackend implements WorkerBackend {
   /**
    * Remove kovo containers abandoned before use (`created`) or after they stopped
    * (`exited`/`dead`) — e.g. a SIGKILLed test process or a crashed CLI. Running (`Up`)
-   * containers are left alone: they may belong to a concurrent stream. Only containers
-   * older than the grace window are touched so an in-flight create is never killed.
+   * containers are left alone: they may belong to a concurrent stream.
+   *
+   * Ownership safety: containers stamped with `kovo.owner_pid` are ONLY swept when that owner PID
+   * is provably dead (`ESRCH`), so parallel processes never reap another live process's idle
+   * warm-pool containers. Legacy unlabelled containers are only swept past `staleCreatedMs`.
    */
   private async removeStaleCreated() {
     const signal = AbortSignal.timeout(5_000)
@@ -1605,7 +1648,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
       rows = await this.docker([
         'container', 'ls', '--all', '--no-trunc',
         '--filter', 'status=created', '--filter', 'status=exited', '--filter', 'status=dead',
-        '--format', '{{.ID}}\t{{.Names}}\t{{.Label "dev.kovo.created-at"}}\t{{.CreatedAt}}',
+        '--format',
+        `{{.ID}}\t{{.Names}}\t{{.Label "${createdAtNamespace}"}}\t{{.CreatedAt}}\t{{.Label "${WORKER_OWNER_PID_LABEL}"}}\t{{.Label "${WORKER_POOL_INSTANCE_LABEL}"}}`,
       ], signal)
     } catch {
       return
@@ -1614,11 +1658,19 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const stale: string[] = []
     for (const row of rows.trim().split('\n')) {
       if (!row) continue
-      const [id, name, createdLabel, createdAt] = row.split('\t')
+      const [id, name, createdLabel, createdAt, ownerPidLabel] = row.split('\t')
       if (!/^[a-f0-9]{64}$/.test(id) || !workerName.test(name)) continue
       // Never reap a container this process created: pool-parked idle containers sit in `created`
-      // state between assignments and are removed by the pool, not by the stale sweep.
+      // or `exited` state between assignments and are removed by the pool, not by the stale sweep.
       if (this.activeContainers.has(name) || liveContainers.has(name)) continue
+      const ownerPid = parseOwnerPid(ownerPidLabel)
+      if (ownerPid !== null) {
+        // Container belongs to a labeled process: NEVER kill another live process's containers.
+        if (this.isPidAlive(ownerPid)) continue
+        stale.push(id)
+        continue
+      }
+      // Unlabelled legacy container: only sweep after the safe grace threshold.
       const stamped = Number(createdLabel)
       const age = Number.isFinite(stamped) && stamped > 0 ? now - stamped : now - Date.parse(createdAt)
       if (!Number.isFinite(age) || age < this.staleCreatedMs) continue
@@ -1638,15 +1690,17 @@ export class LinuxWorkerBackend implements WorkerBackend {
     try {
       const rows = await this.docker([
         'container', 'ls', '--all', '--no-trunc', '--filter', `label=${workerNamespace}=${owner}`,
-        '--format', '{{.ID}}\t{{.Names}}\t{{.Label "dev.kovo.created-at"}}\t{{.CreatedAt}}\t{{.Label "dev.kovo.session"}}',
+        '--format',
+        `{{.ID}}\t{{.Names}}\t{{.Label "${createdAtNamespace}"}}\t{{.CreatedAt}}\t{{.Label "${sessionNamespace}"}}\t{{.Label "${WORKER_OWNER_PID_LABEL}"}}`,
       ], signal)
       inactive = rows.trim().split('\n').flatMap(row => {
         if (!row) return []
-        const [id, name, _createdLabel, _createdAt, session] = row.split('\t')
+        const [id, name, _createdLabel, _createdAt, session, ownerPidLabel] = row.split('\t')
         if (!/^[a-f0-9]{64}$/.test(id) || !workerName.test(name)) return []
-        // Never touch this process's own containers: a concurrent run/session may be between
-        // create and start. Cross-process leftovers are reclaimed regardless of age.
-        if (this.activeContainers.has(name) || session === processSessionId) return []
+        // Never touch this process's own containers or any live sibling process's containers.
+        if (this.activeContainers.has(name) || liveContainers.has(name) || session === processSessionId) return []
+        const ownerPid = parseOwnerPid(ownerPidLabel)
+        if (ownerPid !== null && this.isPidAlive(ownerPid)) return []
         return [id]
       })
     } catch {
@@ -1671,6 +1725,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
       runLabel: runLabelValue,
       ...(this.owner ? { owner: this.owner } : {}),
       ...(this.cell ? { cell: this.cell } : {}),
+      ownerPid: process.pid,
+      poolInstanceId: this.instanceId,
       ...(options ? { options } : {}),
       ...(ipcDir ? { ipcDir } : {}),
     })

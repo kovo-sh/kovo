@@ -11,6 +11,7 @@ import {
   initCapabilityLedgerSchema,
   type CapabilityLedgerOptions,
 } from './capability-ledger.ts'
+import { cancelOobDrainForRun, isDeletedRunRaceError, isOobDrainActive } from './oob-drain.ts'
 import { listProjectPersonas } from './persona-vault.ts'
 import * as tables from './schema.ts'
 import { FindingsRepository } from './store-findings.ts'
@@ -1493,7 +1494,10 @@ export class Store {
   runShellSummary(...args: Parameters<RunsRepository['runShellSummary']>) { return this.runsRepo.runShellSummary(...args) }
   isRunActive(...args: Parameters<RunsRepository['isRunActive']>) { return this.runsRepo.isRunActive(...args) }
   listActiveRunIdsForProject(...args: Parameters<RunsRepository['listActiveRunIdsForProject']>) { return this.runsRepo.listActiveRunIdsForProject(...args) }
-  deleteRun(...args: Parameters<RunsRepository['deleteRun']>) { return this.runsRepo.deleteRun(...args) }
+  deleteRun(...args: Parameters<RunsRepository['deleteRun']>) {
+    cancelOobDrainForRun(args[0])
+    return this.runsRepo.deleteRun(...args)
+  }
   runDetail(...args: Parameters<RunsRepository['runDetail']>) { return this.runsRepo.runDetail(...args) }
   workerList(...args: Parameters<RunsRepository['workerList']>) { return this.runsRepo.workerList(...args) }
   runnable() { return this.runsRepo.runnable() }
@@ -1638,13 +1642,16 @@ async function stopRunsBeforeDelete(
   waitTimeoutMs = 2_500,
 ): Promise<void> {
   for (const runId of runIds) {
+    cancelOobDrainForRun(runId)
     try {
       const current = db.run(runId)
       if (!['complete', 'stopped'].includes(current.status)) {
         db.command({ requestId: randomUUID(), runId, action: 'stop' })
       }
-    } catch {
-      // Run may already be stopped or absent.
+    } catch (error) {
+      // Run may already be stopped, ended, or concurrently deleted; never swallow unexpected storage bugs.
+      const msg = error instanceof Error ? error.message : ''
+      if (!isDeletedRunRaceError(error) && !/already ended/i.test(msg)) throw error
     }
     await labRunner.stopLabTarget(runId).catch(() => undefined)
   }
@@ -1653,7 +1660,10 @@ async function stopRunsBeforeDelete(
   const deadline = Date.now() + Math.max(0, waitTimeoutMs)
   while (Date.now() < deadline) {
     const stillActive = runIds.some(runId =>
-      db.isRunActive(runId) || Boolean(exec.getLabTargetHandle(runId)) || Boolean(labRunner.getTarget(runId)),
+      db.isRunActive(runId)
+      || isOobDrainActive(runId)
+      || Boolean(exec.getLabTargetHandle(runId))
+      || Boolean(labRunner.getTarget(runId)),
     )
     if (!stillActive) break
     await new Promise(resolve => setTimeout(resolve, 100))
@@ -1668,6 +1678,7 @@ export async function deleteRunWithActiveGuard(
   input: { runId: string; stopActive?: boolean; waitTimeoutMs?: number },
 ): Promise<{ deleted: boolean; projectId: string; runId: string }> {
   const isActive = db.isRunActive(input.runId)
+    || isOobDrainActive(input.runId)
     || Boolean(exec.getLabTargetHandle(input.runId))
     || Boolean(labRunner.getTarget(input.runId))
   if (isActive && !input.stopActive) {
@@ -1676,6 +1687,7 @@ export async function deleteRunWithActiveGuard(
   if (isActive && input.stopActive) {
     await stopRunsBeforeDelete(db, exec, labRunner, [input.runId], input.waitTimeoutMs)
   } else {
+    cancelOobDrainForRun(input.runId)
     await labRunner.stopLabTarget(input.runId).catch(() => undefined)
   }
   const result = db.deleteRun(input.runId)
@@ -1697,7 +1709,10 @@ export async function deleteProjectWithActiveGuard(
   }
   const allRunIds = detail.runs.map(r => r.id)
   const activeRunIds = allRunIds.filter(runId =>
-    db.isRunActive(runId) || Boolean(exec.getLabTargetHandle(runId)) || Boolean(labRunner.getTarget(runId)),
+    db.isRunActive(runId)
+    || isOobDrainActive(runId)
+    || Boolean(exec.getLabTargetHandle(runId))
+    || Boolean(labRunner.getTarget(runId)),
   )
   if (activeRunIds.length > 0 && !input.stopActive) {
     throw new Error(
@@ -1708,6 +1723,7 @@ export async function deleteProjectWithActiveGuard(
     await stopRunsBeforeDelete(db, exec, labRunner, activeRunIds, input.waitTimeoutMs)
   } else {
     for (const runId of allRunIds) {
+      cancelOobDrainForRun(runId)
       await labRunner.stopLabTarget(runId).catch(() => undefined)
     }
   }
