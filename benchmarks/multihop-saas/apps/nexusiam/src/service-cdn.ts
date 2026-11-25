@@ -2,7 +2,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { sendJson, sendText, header, runIdOf, match, parseUrl } from './http.ts'
 import type { CacheEntry, LabState } from './shared.ts'
-import { authenticate, digest, ensureDelegation } from './policy.ts'
+import { authenticate, digest, ensureDelegation, roleOf } from './policy.ts'
 
 function profileCss(slug: string, role: string): string {
   return `.profile-${slug}{--workspace-role:${role};display:grid}\n`
@@ -45,7 +45,10 @@ export async function handleCdn(
     const session = authenticate(state, req)
     const requesterTenant = session?.tenantId ?? 'org_c'
     const authorization = header(req, 'authorization')
-    const delegation = session ? ensureDelegation(state, session.userId, session.tenantId) : null
+    // Workspace delegations are issued only to sessions whose user holds a live role in that tenant.
+    const delegation = session && roleOf(state, session, session.tenantId)
+      ? ensureDelegation(state, session.userId, session.tenantId)
+      : null
     const cacheKey = state.profile.cacheIgnoresAuth ? url.pathname : `${url.pathname}|${authorization}`
     let entry: CacheEntry | undefined = state.cache.get(cacheKey)
     if (!entry) {

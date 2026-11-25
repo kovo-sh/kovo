@@ -227,6 +227,16 @@ export interface JobRecord {
   processed: boolean
 }
 
+/** An authorization code issued by /authorize, keyed by the raw code in LabState.authCodes. */
+export interface AuthCodeRecord {
+  codeDigest: string
+  /** Issued for a share-link handoff (the `next` target was a share path). */
+  shareHandoff: boolean
+  /** Delivered to the share-link handler, which links the delegated client. */
+  linked: boolean
+  runId: string
+}
+
 export interface CacheEntry {
   path: string
   delegationKey: string
@@ -252,6 +262,9 @@ export interface LabState {
   docs: DocRecord[]
   jobs: JobRecord[]
   cache: Map<string, CacheEntry>
+  authCodes: Map<string, AuthCodeRecord>
+  /** Folder names surfaced by search facets; share metadata resolves folders from this index. */
+  indexedFolders: Set<string>
   audit: AuditEvent[]
   listeners: Array<(event: AuditEvent) => void>
   seq: number
