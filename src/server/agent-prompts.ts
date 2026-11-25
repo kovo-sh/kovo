@@ -2718,6 +2718,44 @@ export function patchReviewerPrompt(input: PatchReviewerPromptInput): string {
   })
 }
 
+export interface MultiHopStepMatchInput {
+  title: string
+  hypothesis?: string | null
+  category?: string | null
+  skills?: readonly string[]
+  dependsOnStepIds?: readonly string[]
+  dependsOnFactIds?: readonly string[]
+}
+
+const MULTI_HOP_STEP_TEXT_RE =
+  /\[chain_hops=|\bhopCheckpoint\b|\bmulti[- ]?hop\b|\bchain_step\b|\bchain_continuation\b|\bclean[- ]?session\s+chain\b|\bcompose\s+verified\s+intermediates\b|\bcausal\s+proof\b|\bproof\s+gap\b|\bfinal\s+confirm(?:ation)?\b|\bcomposite\s+(?:chain|proof)\b/i
+
+const MULTI_HOP_STAGE_ARROW_RE =
+  /(?:\/[A-Za-z0-9._:{}/-]+|[A-Za-z][A-Za-z0-9_./:-]{1,})(?:\s+[A-Za-z0-9_./:-]{1,24}){0,3}\s*(?:(?<!-)->|→)\s*(?:\d+[.)]\s*)?(?:\/[A-Za-z0-9._:{}/-]+|[A-Za-z][A-Za-z0-9_./:-]{1,})/
+
+/**
+ * Shared multi-hop step matcher used by both `isMultiHopChainStep` (dispatch/wall-clock) and
+ * `workerInvestigationPrompt` (`multiHopDirectives`) so late-wave planner multi-stage steps
+ * receive both the scaled 270s–300s wall-clock window and full composite verification directives.
+ */
+export function matchesMultiHopStepSignal(step: MultiHopStepMatchInput): boolean {
+  if ((step.dependsOnStepIds?.length ?? 0) > 0) return true
+  if ((step.dependsOnFactIds?.length ?? 0) >= 2) return true
+  if ((step.skills ?? []).some(skill =>
+    skill === 'multihop-chains'
+    || skill === 'chain-primitives'
+    || skill.startsWith('chain:')
+    || skill.startsWith('chain_continuation:')
+    || skill.startsWith('checkpoint_cap:'),
+  )) {
+    return true
+  }
+  const text = `${step.title} ${step.hypothesis ?? ''} ${step.category ?? ''}`
+  if (MULTI_HOP_STEP_TEXT_RE.test(text)) return true
+  if ((text.includes('->') || text.includes('→')) && MULTI_HOP_STAGE_ARROW_RE.test(text)) return true
+  return false
+}
+
 export function workerInvestigationPrompt(input: {
   goal: string
   step: {
@@ -2727,6 +2765,8 @@ export function workerInvestigationPrompt(input: {
     category: string
     skills: readonly string[]
     specialistProfile?: SpecialistProfile | null
+    dependsOnStepIds?: readonly string[]
+    dependsOnFactIds?: readonly string[]
   }
   origins: readonly string[]
   capabilityTier: CapabilityTier
@@ -2752,21 +2792,23 @@ export function workerInvestigationPrompt(input: {
   // Slim the skill catalog: a specialist only needs its own matching playbooks. The 41-skill
   // catalog dump was pure schema/token cost on every turn.
   const matchingSkills = specialistConfig ? [...new Set(specialistConfig.skills)] : undefined
-  const isMultiHopStep = input.step.skills.some(skill =>
-    skill === 'multihop-chains'
-    || skill === 'chain-primitives'
-    || skill.startsWith('chain:')
-    || skill.startsWith('chain_continuation:')
-    || skill.startsWith('checkpoint_cap:'),
-  ) || /\[chain_hops=|\bmulti[- ]?hop\b|\b(?:Hop|Stage)\s+1\b[\s\S]{0,120}(?:->|→)\s*(?:Hop|Stage)\s+2\b/i.test(
-    `${input.step.title} ${input.step.hypothesis}`,
-  )
+  const isMultiHopStep = matchesMultiHopStepSignal({
+    title: input.step.title,
+    hypothesis: input.step.hypothesis,
+    category: input.step.category,
+    skills: input.step.skills,
+    dependsOnStepIds: input.step.dependsOnStepIds,
+    dependsOnFactIds: input.step.dependsOnFactIds
+      ?? (input.parentFacts?.length ? input.parentFacts.map(f => f.id) : undefined),
+  })
   return JSON.stringify({
     task: 'defensive chain investigation',
     ...(specialistConfig ? { specialistProfile: specialistConfig.id, specialistFocus: specialistConfig.focusPrompt } : {}),
     ...(isMultiHopStep
       ? {
           multiHopDirectives: {
+            requiredCompositeProof: 'For this multi-hop step, you MUST verify the end-to-end causal chain with ctx.seal_capability(...) + ctx.prove_composite(...) (using ctx.hmac_sign / ctx.jwt_sign / ctx.await_async / ctx.prove_race_burst as intermediate hop primitives inside the SAME script) — do NOT substitute a standalone single-hop prove_access_boundary / prove_persisted_mutation call as your final proof.',
+            compositeCallSignature: 'ctx.seal_capability({ exchangeId, slot, jsonPath, kind }) -> ctx.hmac_sign/jwt_sign/await_async -> ctx.prove_composite({ chainId, terminalVulnClass, replayMode: "fresh_clean_replay", hops, causalEdges, terminalImpact })',
             noPrematureSingleHop: 'Never stop at an intermediate single-hop info-disclosure, handle, directory leak, job creation, cache prime, or link/token generation when downstream cross-service/auth/state-machine pivots are reachable — seal it via ctx.seal_capability(...) and continue in the SAME verification script through Stages 2-4 to final readback or persisted state change and ctx.prove_composite(...).',
             singleOriginProbeArm: 'All probe-arm hops must run as a single starting low-privilege persona (or anonymous / freshly derived credential); never use a target-tenant persona on the probe arm to mint handles for your starting persona (use target-tenant personas only for baseline/readback checks).',
             cryptoAndAsyncHelpers: 'Invoke ctx.hmac_sign / ctx.jwt_sign whenever crossing signing or token-forgery boundaries, ctx.await_async whenever polling async/background-job convergence, and ctx.prove_race_burst for concurrent settlement/conservation boundaries, then confirm the full DAG via ctx.prove_composite({ ..., replayMode: "fresh_clean_replay" }).',
