@@ -29,7 +29,7 @@ import {
   classifyImpactDescriptor,
 } from './oracle-invariants.ts'
 import type { PersonaCredentialSource } from './oracle-invariants.ts'
-import { proofReceiptMode } from './proof-receipt.ts'
+import { MAX_REPLAY_REGEX_HAYSTACK_LENGTH, isSafeRegexPattern, proofReceiptMode, safeRegexTest, validateReplayAgentScriptEnvelope, validateReplayRecipeEnvelope } from './proof-receipt.ts'
 import type { ProofReceipt, ProofReceiptMode, ReceiptVerification } from './proof-receipt.ts'
 import { persistedAgentScriptOf, retestPersistedAgentScript } from './agent-script-proof.ts'
 import {
@@ -76,7 +76,7 @@ export {
   impactStepsFromStepsOut,
   inconclusiveResult,
 } from './floor-recipe-engine.ts'
-export { proofReceiptMode } from './proof-receipt.ts'
+export { MAX_REPLAY_REGEX_HAYSTACK_LENGTH, MAX_REPLAY_REGEX_PATTERN_LENGTH, isSafeRegexPattern, proofReceiptMode, safeRegexTest } from './proof-receipt.ts'
 export type { ProofReceiptMode } from './proof-receipt.ts'
 export type {
   BflaImpactAssessment,
@@ -129,6 +129,8 @@ export interface VerifyReplaySpecParams {
   runId?: string
   assignmentId?: string
   onExchange?: (exchange: BrokerExchangeResult) => string | void
+  /** Trust level for `recipe`/`agentScript` envelopes (`'untrusted'` blocks model-supplied envelopes). */
+  envelopeTrust?: 'host_persisted' | 'untrusted'
 }
 
 export interface ReplayVerificationResult {
@@ -181,9 +183,9 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
   }
   const spec = parsed.data
 
-  // 2. Policy & scope validation
+  // 2. Policy & scope validation (H-5: always enforce scope on `spec.origin`, even for static_ast_proof).
   const isStatic = spec.kind === 'static_ast_proof'
-  const origins = replaySpecOrigins(spec)
+  const origins = [...new Set([...replaySpecOrigins(spec), spec.origin])]
   for (const origin of origins) {
     if (!grant.canRead(origin)) {
       grant.audit('denied', origin)
@@ -194,18 +196,19 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     grant.audit('denied', spec.origin)
     return inconclusiveResult('Replay spec rejected by Kovo Hunter destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
   }
-  const tier = grant.tier ?? 1
-  if (tier === 0 && !isStatic) {
+  if ((grant.tier ?? 1) === 0 && !isStatic) {
     return inconclusiveResult('Live replay verification is disabled in Tier 0.', exchanges, exchangeIds, { kind: spec.kind })
   }
 
-  // Floor-recipe dispatch runs BEFORE retired legacy VM rejection so recipe-backed specs
-  // (e.g. `sql_boolean_diff`/`sql_time_diff` with a `boolean_or_timing` floorRecipe envelope)
-  // verify cleanly through ProofReceipt while bare legacy VM specs fail closed below.
+  // Floor-recipe dispatch runs BEFORE retired legacy VM rejection (H-5 validated first).
   const persistedRecipe = persistedRecipeOf(params.spec)
   if (persistedRecipe) {
-    const result = await runPersistedFloorRecipe(persistedRecipe, params, spec.origin)
-    return result.replay
+    const recipeCheck = validatePersistedRecipeEnvelope(spec, persistedRecipe, grant, params)
+    if (!recipeCheck.ok) {
+      grant.audit('denied', persistedRecipe.origin || spec.origin)
+      return inconclusiveResult(recipeCheck.reason, exchanges, exchangeIds, { kind: spec.kind, recipeId: persistedRecipe.envelope.recipeId })
+    }
+    return (await runPersistedFloorRecipe(persistedRecipe, params, spec.origin)).replay
   }
 
   if (RETIRED_LEGACY_SPEC_KINDS.has(spec.kind)) {
@@ -323,7 +326,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
             const batchExchangeIds = batchResults.map(ex => recordExchange(ex)).filter((id): id is string => Boolean(id))
             rememberStep(step.id, batchReqs, batchResults)
             const first = batchResults[0]
-            if (first) extractVariables(step, first, vars)
+            if (first) extractVariablesSafe(step, first, vars)
             const stepEntry: Record<string, unknown> = {
               id: step.id,
               role: step.role,
@@ -345,7 +348,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
             const ex = await broker.executeHttp(brokerReq, grant, signal)
             const exchangeId = recordExchange(ex)
             rememberStep(step.id, [brokerReq], [ex])
-            extractVariables(step, ex, vars)
+            extractVariablesSafe(step, ex, vars)
             const stepEntry: Record<string, unknown> = {
               id: step.id,
               role: step.role,
@@ -610,16 +613,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
             const body = entry && typeof entry === 'object' && typeof (entry as { body?: unknown }).body === 'string'
               ? (entry as { body: string }).body
               : ''
-            proofMatches[id] = spec.proofPatterns.map(pattern => {
-              // Harden the in-process matcher against pathological regexes: bounded length (schema),
-              // no nested quantifiers, and only the first 16 KiB of the body.
-              if (/\((?:\?:)?[^)]*[+*][^)]*\)[+*?]/.test(pattern)) return false
-              try {
-                return new RegExp(pattern).test(body.slice(0, 16 * 1024))
-              } catch {
-                return false
-              }
-            })
+            proofMatches[id] = spec.proofPatterns.map(pattern => safeRegexTest(pattern, body))
           }
         }
         evidencePayload = {
@@ -923,43 +917,77 @@ async function runPersistedFloorRecipe(
   })
 }
 
+function extractVariablesSafe(step: ReplayStep, exchange: BrokerExchangeResult, vars: Record<string, string>): void {
+  if (!step.extract?.length) return
+  const safe = step.extract.filter(item => item.from !== 'regex' || isSafeRegexPattern(item.selector))
+  if (!safe.length) return
+  const safeEx = safe.some(i => i.from === 'regex') && exchange.body.length > MAX_REPLAY_REGEX_HAYSTACK_LENGTH
+    ? { ...exchange, body: exchange.body.slice(0, MAX_REPLAY_REGEX_HAYSTACK_LENGTH) } : exchange
+  extractVariables(safe.length === step.extract.length ? step : { ...step, extract: safe }, safeEx, vars)
+}
+
+function validatePersistedRecipeEnvelope(
+  spec: Pick<DeclarativeReplaySpec, 'kind' | 'origin'>,
+  persisted: NonNullable<ReturnType<typeof persistedRecipeOf>>,
+  grant: Grant,
+  params: VerifyReplaySpecParams,
+) {
+  return validateReplayRecipeEnvelope({
+    specKind: spec.kind, specOrigin: spec.origin, recipeId: persisted.envelope.recipeId,
+    recipeArgs: persisted.envelope.args, recipeOrigin: persisted.origin,
+    envelopeTrust: params.envelopeTrust, tier: grant.tier ?? 1,
+    canRead: o => grant.canRead(o), hasDestructive: hasDestructiveContent,
+    ...(params.storage && params.runId ? {
+      hasStoredMatch: () => {
+        const wanted = JSON.stringify(persisted.envelope)
+        return params.storage!.listReplaySpecs(params.runId!).some(r => { const s = persistedRecipeOf(r.spec); return Boolean(s && JSON.stringify(s.envelope) === wanted) })
+      },
+    } : {}),
+  })
+}
+
 export async function retestReplaySpec(params: VerifyReplaySpecParams): Promise<RetestReplayResult> {
-  // Cut 3 retest receipts: a spec confirmed by a typed floor recipe carries that recipe, so retest
-  // re-runs the recipe and validates a fresh ProofReceipt.
   const persisted = persistedRecipeOf(params.spec)
   if (persisted) {
+    const parsedSpec = declarativeReplaySpecSchema.safeParse(params.spec)
+    const specLike = parsedSpec.success ? { kind: parsedSpec.data.kind, origin: parsedSpec.data.origin } : { kind: persisted.kind as DeclarativeReplaySpec['kind'], origin: persisted.origin }
+    const recipeCheck = validatePersistedRecipeEnvelope(specLike, persisted, params.grant, params)
+    if (!recipeCheck.ok) {
+      params.grant.audit('denied', persisted.origin || specLike.origin)
+      return { verdict: 'inconclusive', replay: inconclusiveResult(recipeCheck.reason, [], [], { kind: specLike.kind, recipeId: persisted.envelope.recipeId }) }
+    }
     const result = await runPersistedFloorRecipe(persisted, params)
     return { verdict: result.verdict, replay: result.replay }
   }
-  // v7 M5 agent script proofs: the persisted row carries the Layer-3 script, so retest re-runs that
-  // script through the same fresh-session double-run and re-validates a fresh receipt. The
-  // declarative shape on the row is attribution only and is never re-interpreted.
   const agentScript = persistedAgentScriptOf(params.spec)
   if (agentScript) {
+    const scriptCheck = validateReplayAgentScriptEnvelope({
+      specKind: params.spec && typeof params.spec === 'object' ? (params.spec as { kind?: unknown }).kind : undefined,
+      origin: agentScript.origin, verdict: agentScript.envelope.verdict, envelopeTrust: params.envelopeTrust,
+      tier: params.grant.tier ?? 1, canRead: o => params.grant.canRead(o),
+      ...(params.storage && params.runId ? {
+        hasStoredMatch: () => params.storage!.listReplaySpecs(params.runId!).some(r => {
+          const p = params.storage!.replaySpecProof(params.runId!, r.id)
+          return Boolean(p && p.verdict === 'confirmed' && p.scriptSha256 === agentScript.envelope.scriptSha256)
+        }),
+      } : {}),
+    })
+    if (!scriptCheck.ok) {
+      params.grant.audit('denied', agentScript.origin)
+      return { verdict: 'inconclusive', replay: inconclusiveResult(scriptCheck.reason, [], [], { kind: 'agent_script' }) }
+    }
     return retestPersistedAgentScript(agentScript.envelope, { ...params, origin: agentScript.origin } as VerifyReplaySpecParams & { origin?: string })
   }
-  // Retest is a regression replay of an already-persisted proof (reproduced vs fixed), not a new
-  // confirmation, so it re-evaluates the recorded spec through the same replay used today.
   const replay = await verifyReplaySpec(params)
-  const verdict: RetestVerdict = replay.verdict === 'confirmed' || replay.verdict === 'static_verified'
-    ? 'reproduced'
-    : replay.verdict === 'dismissed'
-      ? 'fixed'
-      : 'inconclusive'
+  const verdict: RetestVerdict = replay.verdict === 'confirmed' || replay.verdict === 'static_verified' ? 'reproduced' : replay.verdict === 'dismissed' ? 'fixed' : 'inconclusive'
   return { verdict, replay }
 }
 
-/** Read the persisted agent-script envelope from a (not-yet-validated) spec. */
-/** Read the persisted recipe envelope from a (not-yet-validated) spec. */
 function persistedRecipeOf(spec: unknown): { envelope: FloorRecipeEnvelope; kind: string; origin: string } | null {
   if (!spec || typeof spec !== 'object' || Array.isArray(spec)) return null
   const record = spec as Record<string, unknown>
   const parsed = floorRecipeEnvelopeSchema.safeParse(record.recipe)
   if (!parsed.success) return null
-  return {
-    envelope: parsed.data,
-    kind: typeof record.kind === 'string' ? record.kind : parsed.data.recipeId,
-    origin: typeof record.origin === 'string' ? record.origin : '',
-  }
+  return { envelope: parsed.data, kind: typeof record.kind === 'string' ? record.kind : parsed.data.recipeId, origin: typeof record.origin === 'string' ? record.origin : '' }
 }
 
