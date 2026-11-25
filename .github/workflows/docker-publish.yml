@@ -1,0 +1,173 @@
+name: Publish Docker Images
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  docker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Prepare image names and tags
+        id: prep
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          short_sha="${GITHUB_SHA::7}"
+          echo "owner=${owner}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
+            echo "push=false" >> "$GITHUB_OUTPUT"
+            echo "load=true" >> "$GITHUB_OUTPUT"
+            echo "worker_image=ghcr.io/${owner}/kovo-worker:pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+            echo "hunter_image=ghcr.io/${owner}/kovo-hunter:pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+            echo "push=true" >> "$GITHUB_OUTPUT"
+            echo "load=false" >> "$GITHUB_OUTPUT"
+            echo "worker_image=ghcr.io/${owner}/kovo-worker:${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "hunter_image=ghcr.io/${owner}/kovo-hunter:${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+            echo "push=true" >> "$GITHUB_OUTPUT"
+            echo "load=false" >> "$GITHUB_OUTPUT"
+            echo "worker_image=ghcr.io/${owner}/kovo-worker:sha-${short_sha}" >> "$GITHUB_OUTPUT"
+            echo "hunter_image=ghcr.io/${owner}/kovo-hunter:sha-${short_sha}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up QEMU
+        if: github.event_name != 'pull_request'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for kovo-worker
+        id: meta-worker
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-worker
+          tags: |
+            type=raw,value=pr-${{ github.event.number }},enable=${{ github.event_name == 'pull_request' }}
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+
+      - name: Build and push kovo-worker
+        id: build-worker
+        uses: docker/build-push-action@v6
+        with:
+          context: ./worker
+          file: ./worker/Dockerfile
+          platforms: ${{ steps.prep.outputs.platforms }}
+          push: ${{ steps.prep.outputs.push == 'true' }}
+          load: ${{ steps.prep.outputs.load == 'true' }}
+          tags: ${{ steps.meta-worker.outputs.tags }}
+          labels: ${{ steps.meta-worker.outputs.labels }}
+          cache-from: type=gha,scope=kovo-worker
+          cache-to: type=gha,mode=max,scope=kovo-worker
+          sbom: ${{ steps.prep.outputs.push == 'true' }}
+          provenance: ${{ steps.prep.outputs.push == 'true' && 'mode=max' || 'false' }}
+
+      - name: Attest kovo-worker provenance
+        if: steps.prep.outputs.push == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-worker
+          subject-digest: ${{ steps.build-worker.outputs.digest }}
+          push-to-registry: true
+
+      - name: Smoke-test kovo-worker (UID 10001 + bridge handshake)
+        if: github.event_name == 'pull_request'
+        env:
+          KOVO_WORKER_IMAGE: ${{ steps.prep.outputs.worker_image }}
+        run: bash scripts/docker-smoke.sh
+
+      - name: Extract metadata for kovo-hunter
+        id: meta-hunter
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-hunter
+          tags: |
+            type=raw,value=pr-${{ github.event.number }},enable=${{ github.event_name == 'pull_request' }}
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+
+      - name: Build and push kovo-hunter
+        id: build-hunter
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ steps.prep.outputs.platforms }}
+          push: ${{ steps.prep.outputs.push == 'true' }}
+          load: ${{ steps.prep.outputs.load == 'true' }}
+          build-args: |
+            KOVO_WORKER_IMAGE=${{ steps.prep.outputs.worker_image }}
+          tags: ${{ steps.meta-hunter.outputs.tags }}
+          labels: ${{ steps.meta-hunter.outputs.labels }}
+          cache-from: type=gha,scope=kovo-hunter
+          cache-to: type=gha,mode=max,scope=kovo-hunter
+          sbom: ${{ steps.prep.outputs.push == 'true' }}
+          provenance: ${{ steps.prep.outputs.push == 'true' && 'mode=max' || 'false' }}
+
+      - name: Attest kovo-hunter provenance
+        if: steps.prep.outputs.push == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-hunter
+          subject-digest: ${{ steps.build-hunter.outputs.digest }}
+          push-to-registry: true
+
+      - name: Smoke-test kovo-hunter startup health check
+        if: github.event_name == 'pull_request'
+        env:
+          KOVO_HUNTER_IMAGE: ${{ steps.prep.outputs.hunter_image }}
+        run: |
+          set -euo pipefail
+          cid="$(docker run -d --rm -p 18000:8000 "$KOVO_HUNTER_IMAGE")"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          uid="$(docker exec "$cid" id -u)"
+          test "$uid" != "0"
+          docker exec "$cid" docker --version
+          for i in $(seq 1 30); do
+            if docker exec "$cid" node -e "fetch('http://127.0.0.1:8000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"; then
+              echo "kovo-hunter /health OK"
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$cid" >&2 || true
+          exit 1
