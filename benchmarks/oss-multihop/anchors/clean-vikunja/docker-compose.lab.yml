@@ -1,0 +1,53 @@
+# Isolated Docker Compose lab harness for oss-clean-vikunja-01 (Vikunja clean negative control).
+# Enforces hard 0-FP precision gate (maxAllowedFindings: 0) with --internal network isolation,
+# loopback-only ephemeral port binding, and synthetic oss_lab_* credentials.
+#
+# Clean patched control target: APP_IMAGE=vikunja/vikunja APP_TAG=0.24.4
+
+networks:
+  lab_internal:
+    driver: bridge
+    internal: true
+
+services:
+  vikunja_app:
+    image: "${APP_IMAGE:-vikunja/vikunja}:${APP_TAG:-0.24.4}"
+    ports:
+      - "127.0.0.1:0:3456"
+    networks:
+      - lab_internal
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    depends_on:
+      - vikunja_db
+    environment:
+      VIKUNJA_SERVICE_JWTSECRET: "oss_lab_vikunja_jwt_01"
+      VIKUNJA_DATABASE_TYPE: "postgres"
+      VIKUNJA_DATABASE_HOST: "vikunja_db"
+      VIKUNJA_DATABASE_DATABASE: "vikunja_clean"
+      VIKUNJA_DATABASE_USER: "oss_lab_user"
+      VIKUNJA_DATABASE_PASSWORD: "oss_lab_pg_clean_01"
+      OSS_LAB_MEMBER_CRED: "oss_lab_vikunja_member_a"
+      OSS_LAB_OWNER_CRED: "oss_lab_vikunja_owner_b"
+    labels:
+      guardian.oss_lab.target: "oss-clean-vikunja-01"
+      guardian.oss_lab.split: "clean_control"
+      guardian.oss_lab.egress_policy: "deny_all_internal_only"
+
+  vikunja_db:
+    image: "postgres:16.4-alpine"
+    networks:
+      - lab_internal
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    environment:
+      POSTGRES_DB: "vikunja_clean"
+      POSTGRES_USER: "oss_lab_user"
+      POSTGRES_PASSWORD: "oss_lab_pg_clean_01"
+    labels:
+      guardian.oss_lab.target: "oss-clean-vikunja-01"
+      guardian.oss_lab.role: "db"
