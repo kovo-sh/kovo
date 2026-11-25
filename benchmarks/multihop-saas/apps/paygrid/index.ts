@@ -7,7 +7,7 @@ import { generateDomainVariant } from '../../lib/domain-variant.ts'
 import { materialize } from '../../lib/materialize.ts'
 import type {
   AppName, BenchMode, Briefing, DomainVariant, GroundTruth, LabMode, OracleExport, PersonaId,
-  ServiceId, ServiceTopology,
+  ServiceTopology,
 } from '../../lib/types.ts'
 import { assertLocalLabAllowed } from '../../lib/safety.ts'
 import { createLabState } from './src/state.ts'
@@ -33,7 +33,7 @@ export interface StartedPaygrid {
   plan: DomainVariant
   groundTruth: GroundTruth
   oracle: ChainOracle
-  origins: Record<ServiceId, string>
+  origins: Record<string, string>
   entryOrigin: string
   sourceDir: string
   briefing(mode: BenchMode): Briefing
@@ -46,7 +46,7 @@ const GREY_BRIEFING: PersonaId[] = [
   'owner_a', 'member_a', 'viewer_a', 'dual_member', 'member_b', 'revoked_or_demoted',
 ]
 
-function topology(origins: Record<ServiceId, string>): ServiceTopology[] {
+function topology(origins: Record<string, string>): ServiceTopology[] {
   return [
     { id: 'edge', role: 'public entry / cdn', internal: false, origin: origins.edge },
     { id: 'api', role: 'tenant REST + GraphQL', internal: false, origin: origins.api },
