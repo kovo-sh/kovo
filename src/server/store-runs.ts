@@ -573,7 +573,13 @@ export class RunsRepository {
     const scopePolicy = this.scopePolicy(run)
     const approvedOrigins = this.approvedOriginsFor(run)
     // A board post may cite a benign IdP/CDN hop without being out of scope.
-    const sourceOrigins = [...new Set(input.sourceOrigins ?? approvedOrigins)]
+    // Operator posts default empty/omitted sourceOrigins to the run's approved origins
+    // so cold @specialist mentions can wake specialists against the active scope.
+    const sourceOrigins = [...new Set(
+      input.sourceOrigins !== undefined
+        ? (input.authorRole === 'operator' && input.sourceOrigins.length === 0 ? approvedOrigins : input.sourceOrigins)
+        : approvedOrigins,
+    )]
     if (sourceOrigins.some(origin => !isProvenanceOriginAllowed(scopePolicy, origin))) {
       throw new Error('Board message references an origin outside approved scope.')
     }
@@ -1910,7 +1916,9 @@ export class RunsRepository {
     }
     if (status === 'running') {
       this.session.db.update(tables.assignments).set({ status: 'queued', lease: null, leaseExpiresAt: null }).where(and(
-        eq(tables.assignments.runId, run.id), inArray(tables.assignments.status, ['paused', 'failed']),
+        eq(tables.assignments.runId, run.id),
+        eq(tables.assignments.goalRevision, run.goalRevision),
+        eq(tables.assignments.status, 'paused'),
       )).run()
     }
   }
@@ -2533,6 +2541,7 @@ export class RunsRepository {
               kind: targets.length === 1 && targets[0] === 'coordinator' ? 'note' : 'handoff',
               body: input.message,
               mentions: targets,
+              sourceOrigins: [...this.approvedOriginsFor(run)],
             })
           } catch {
             // Board mirroring is advisory; legacy operator messaging must never regress.
@@ -2567,6 +2576,7 @@ export class RunsRepository {
             body: input.body,
             mentions,
             replyToSeq: input.replyToSeq ?? null,
+            sourceOrigins: [...this.approvedOriginsFor(run)],
           })
           break
         }

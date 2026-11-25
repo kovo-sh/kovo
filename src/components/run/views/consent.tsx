@@ -1,7 +1,7 @@
 // Consent sheet for waiting runs (rendered by Overview), and the scope
 // editor it shares with the header's "Edit scope" dialog (@base-ui/react Dialog).
 import { Link } from '@tanstack/react-router'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { approvalPolicies, canReviewScope, maxBudgetRequests, maxRpsPerOriginCeiling, maxScopeHosts } from '../../../domain.ts'
 import type { ApprovalPolicy, CapabilityTier } from '../../../domain.ts'
@@ -22,6 +22,8 @@ import { useToast } from '../toast.tsx'
 import { cn, runBtn, RW } from '../tw.ts'
 import { LabPanel } from './lab.tsx'
 
+const PUBLIC_MAX_RPS_CAP = 20
+
 interface Draft {
   assetIds: string[]
   capabilityTier: CapabilityTier
@@ -30,6 +32,27 @@ interface Draft {
   budgetUsd: number
   budgetRequests: number
   maxRpsPerOrigin: number
+}
+
+/**
+ * Resolve default checked candidate IDs for scope review.
+ * When `projectDefaultScope` is non-empty, explicit project defaults override `!thirdParty`
+ * so previously approved third-party hosts stay checked on subsequent runs.
+ */
+export function defaultScopeAssetIds(
+  run: {
+    scopeRevision: number
+    approved: readonly string[]
+    candidates: readonly { id: string; origin: string; thirdParty: boolean; dnsSource?: unknown }[]
+  },
+  projectDefaultScope: readonly string[],
+): string[] {
+  if (run.scopeRevision > 0) return [...run.approved]
+  if (projectDefaultScope.length > 0) {
+    const saved = new Set(projectDefaultScope)
+    return run.candidates.filter(a => saved.has(a.origin)).map(a => a.id)
+  }
+  return run.candidates.filter(a => !a.thirdParty && !a.dnsSource).map(a => a.id)
 }
 
 /** Hosts and default selection for the scope sheet, per phase. */
@@ -48,25 +71,41 @@ function useScopeModel() {
         source: c.source,
         externalCname: c.dnsSource?.externalAliases?.[0] ?? null,
       }))
-    const defaults = r.scopeRevision > 0 ? [...r.approved]
-      : r.candidates.filter(a => !a.thirdParty && (p.defaultScope.length ? p.defaultScope.includes(a.origin) : !a.dnsSource)).map(a => a.id)
+    const defaults = defaultScopeAssetIds(r, p.defaultScope)
     return { discovery, hosts, defaults }
   }, [r, p])
 }
 
-function initialDraft(r: ReturnType<typeof useRun>['detail']['run'], defaults: string[]): Draft {
+function initialDraft(r: ReturnType<typeof useRun>['detail']['run'], defaults: string[], rpsMax: number): Draft {
   return {
     assetIds: defaults, capabilityTier: r.capabilityTier, approvalPolicy: r.approvalPolicy ?? 'auto_review',
-    approvedPersonaIds: [...r.approvedPersonaIds], budgetUsd: r.budgetUsd, budgetRequests: r.budgetRequests, maxRpsPerOrigin: r.maxRpsPerOrigin,
+    approvedPersonaIds: [...r.approvedPersonaIds], budgetUsd: r.budgetUsd, budgetRequests: r.budgetRequests,
+    maxRpsPerOrigin: Math.min(r.maxRpsPerOrigin, rpsMax),
   }
 }
 
-function scopeCommand(r: ReturnType<typeof useRun>['detail']['run'], d: Draft, saveProject = false): Command {
+function scopeCommand(
+  r: ReturnType<typeof useRun>['detail']['run'],
+  d: Draft,
+  opts: { saveProject?: boolean; scopeOnly?: boolean; expectedScopeRevision?: number } = {},
+): Command {
+  const { saveProject = false, scopeOnly = false, expectedScopeRevision = r.scopeRevision } = opts
   return {
-    action: 'scope', assetIds: d.assetIds, expectedScopeRevision: r.scopeRevision, consent: true, saveProject,
-    capabilityTier: d.capabilityTier, approvalPolicy: d.approvalPolicy,
+    action: 'scope',
+    assetIds: d.assetIds,
+    expectedScopeRevision,
+    consent: true,
+    saveProject,
+    capabilityTier: d.capabilityTier,
     approvedPersonaIds: d.capabilityTier >= 2 ? d.approvedPersonaIds : [],
-    budgetUsd: d.budgetUsd, budgetRequests: d.budgetRequests, maxRpsPerOrigin: d.maxRpsPerOrigin,
+    ...(scopeOnly
+      ? {}
+      : {
+          approvalPolicy: d.approvalPolicy,
+          budgetUsd: d.budgetUsd,
+          budgetRequests: d.budgetRequests,
+          maxRpsPerOrigin: d.maxRpsPerOrigin,
+        }),
   }
 }
 
@@ -74,47 +113,56 @@ const selectClass =
   'mt-[3px] h-[26px] max-w-full rounded-control border-0 bg-panel px-1.5 font-sans text-[12.5px] font-medium text-fg shadow-hairline outline-none focus:shadow-[0_0_0_1px_var(--accent-line),0_0_0_3px_var(--accent-soft)]'
 
 /**
- * The scope card: testing mode / budget / approvals / rate / workers / test accounts,
+ * The scope card: testing mode / test accounts (plus budget / approvals / rate on consent),
  * the host grid, and a footer with the primary action. Editable when `editing`.
  */
-function ScopeCard({ editing, draft, setDraft, footer, inDialog = false }: {
+function ScopeCard({ editing, draft, setDraft, footer, inDialog = false, scopeOnly = false }: {
   editing: boolean
   draft: Draft
   setDraft: (fn: (d: Draft) => Draft) => void
   footer: ReactNode
   inDialog?: boolean
+  scopeOnly?: boolean
 }) {
   const { detail } = useRun()
-  const r = detail.run
+  const rpsMax = detail.project.environment === 'local-lab' ? maxRpsPerOriginCeiling : PUBLIC_MAX_RPS_CAP
   const { discovery, hosts } = useScopeModel()
   const selected = new Set(draft.assetIds)
   const shownHosts = editing || discovery ? hosts : hosts.filter(h => selected.has(h.id))
   const canEditConfig = editing && !discovery
-  const kvItems: [string, ReactNode][] = [
-    ['Testing mode', canEditConfig
-      ? <select className={selectClass} value={draft.capabilityTier} onChange={e => setDraft(d => ({ ...d, capabilityTier: Number(e.target.value) as CapabilityTier }))} aria-label="Testing mode">
-        {([0, 1, 2, 3] as const).map(t => <option key={t} value={t}>{capabilityTierMeta[t].name}</option>)}
-      </select>
-      : <span title={capabilityTierMeta[draft.capabilityTier].summary}>{capabilityTierMeta[draft.capabilityTier].name}</span>],
-    ['Budget', canEditConfig
-      ? <span className="mt-[3px] flex gap-1">
-        <input className={cn(RW.fieldInput, 'num h-[26px] w-[74px]')} type="number" min={0.1} max={500} step="any" value={draft.budgetUsd} aria-label="Budget USD" onChange={e => setDraft(d => ({ ...d, budgetUsd: Number(e.target.value) }))} />
-        <input className={cn(RW.fieldInput, 'num h-[26px] w-[74px]')} type="number" min={0} max={maxBudgetRequests} step={1} value={draft.budgetRequests} aria-label="Request cap (0 = uncapped)" title="Request cap (0 = uncapped)" onChange={e => setDraft(d => ({ ...d, budgetRequests: Number(e.target.value) }))} />
-      </span>
-      : <>{fmtUsd(draft.budgetUsd)} · {draft.budgetRequests ? fmtN(draft.budgetRequests) + ' requests' : 'uncapped requests'}</>],
-    ['Approvals', canEditConfig && draft.capabilityTier === 3
-      ? <select className={selectClass} value={draft.approvalPolicy} onChange={e => setDraft(d => ({ ...d, approvalPolicy: e.target.value as ApprovalPolicy }))} aria-label="Approval policy">
-        {approvalPolicies.map(p => <option key={p} value={p}>{approvalPolicyMeta[p].label}</option>)}
-      </select>
-      : draft.capabilityTier === 3
-        ? <span title={approvalPolicyMeta[draft.approvalPolicy].summary}>{approvalPolicyMeta[draft.approvalPolicy].label}</span>
-        : <span className="font-normal text-fg-subtle" title="Approval policy only applies to Active Testing (Tier 3)">Not needed (read-only)</span>],
-    ['Rate limit', canEditConfig
-      ? <input className={cn(RW.fieldInput, 'num mt-[3px] h-[26px] w-[74px]')} type="number" min={1} max={maxRpsPerOriginCeiling} step={1} value={draft.maxRpsPerOrigin} aria-label="Requests per second per origin" onChange={e => setDraft(d => ({ ...d, maxRpsPerOrigin: Number(e.target.value) }))} />
-      : <>{draft.maxRpsPerOrigin} req/s per origin</>],
-    ['Workers', <>{r.workerConcurrency} concurrent · {r.workerMaxTurns} turns</>],
-    ['Test accounts', draft.approvedPersonaIds.length && draft.capabilityTier >= 2 ? plural(draft.approvedPersonaIds.length, 'test account') : 'None (anonymous)'],
-  ]
+  const kvItems: [string, ReactNode][] = scopeOnly
+    ? [
+        ['Testing mode', canEditConfig
+          ? <select className={selectClass} value={draft.capabilityTier} onChange={e => setDraft(d => ({ ...d, capabilityTier: Number(e.target.value) as CapabilityTier }))} aria-label="Testing mode">
+            {([0, 1, 2, 3] as const).map(t => <option key={t} value={t}>{capabilityTierMeta[t].name}</option>)}
+          </select>
+          : <span title={capabilityTierMeta[draft.capabilityTier].summary}>{capabilityTierMeta[draft.capabilityTier].name}</span>],
+        ['Test accounts', draft.approvedPersonaIds.length && draft.capabilityTier >= 2 ? plural(draft.approvedPersonaIds.length, 'test account') : 'None (anonymous)'],
+      ]
+    : [
+        ['Testing mode', canEditConfig
+          ? <select className={selectClass} value={draft.capabilityTier} onChange={e => setDraft(d => ({ ...d, capabilityTier: Number(e.target.value) as CapabilityTier }))} aria-label="Testing mode">
+            {([0, 1, 2, 3] as const).map(t => <option key={t} value={t}>{capabilityTierMeta[t].name}</option>)}
+          </select>
+          : <span title={capabilityTierMeta[draft.capabilityTier].summary}>{capabilityTierMeta[draft.capabilityTier].name}</span>],
+        ['Budget', canEditConfig
+          ? <span className="mt-[3px] flex gap-1">
+            <input className={cn(RW.fieldInput, 'num h-[26px] w-[74px]')} type="number" min={0.1} max={500} step="any" value={draft.budgetUsd} aria-label="Budget USD" onChange={e => setDraft(d => ({ ...d, budgetUsd: Number(e.target.value) }))} />
+            <input className={cn(RW.fieldInput, 'num h-[26px] w-[74px]')} type="number" min={0} max={maxBudgetRequests} step={1} value={draft.budgetRequests} aria-label="Request cap (0 = uncapped)" title="Request cap (0 = uncapped)" onChange={e => setDraft(d => ({ ...d, budgetRequests: Number(e.target.value) }))} />
+          </span>
+          : <>{fmtUsd(draft.budgetUsd)} · {draft.budgetRequests ? fmtN(draft.budgetRequests) + ' requests' : 'uncapped requests'}</>],
+        ['Approvals', canEditConfig && draft.capabilityTier === 3
+          ? <select className={selectClass} value={draft.approvalPolicy} onChange={e => setDraft(d => ({ ...d, approvalPolicy: e.target.value as ApprovalPolicy }))} aria-label="Approval policy">
+            {approvalPolicies.map(p => <option key={p} value={p}>{approvalPolicyMeta[p].label}</option>)}
+          </select>
+          : draft.capabilityTier === 3
+            ? <span title={approvalPolicyMeta[draft.approvalPolicy].summary}>{approvalPolicyMeta[draft.approvalPolicy].label}</span>
+            : <span className="font-normal text-fg-subtle" title="Approval policy only applies to Active Testing (Tier 3)">Not needed (read-only)</span>],
+        ['Rate limit', canEditConfig
+          ? <input className={cn(RW.fieldInput, 'num mt-[3px] h-[26px] w-[74px]')} type="number" min={1} max={rpsMax} step={1} value={draft.maxRpsPerOrigin} aria-label="Requests per second per origin" onChange={e => setDraft(d => ({ ...d, maxRpsPerOrigin: Math.min(rpsMax, Math.max(1, Number(e.target.value))) }))} />
+          : <>{Math.min(draft.maxRpsPerOrigin, rpsMax)} req/s per origin</>],
+        ['Test accounts', draft.approvedPersonaIds.length && draft.capabilityTier >= 2 ? plural(draft.approvedPersonaIds.length, 'test account') : 'None (anonymous)'],
+      ]
 
   return <div className={inDialog ? 'overflow-hidden bg-panel' : RW.sheet}>
     <div className={RW.sheetH}>
@@ -132,9 +180,17 @@ function ScopeCard({ editing, draft, setDraft, footer, inDialog = false }: {
         <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={() => setDraft(d => ({ ...d, assetIds: [] }))}>Clear</button>
       </span>}
     </div>
-    <div className="num grid grid-cols-3 border-b border-line">
+    <div className={cn('num grid border-b border-line', scopeOnly ? 'grid-cols-2' : 'grid-cols-3')}>
       {kvItems.map(([k, v], i) => (
-        <div key={k} className={cn('px-4 py-2.5', i % 3 !== 2 && 'border-r border-line', i >= 3 && 'border-t border-line')}>
+        <div
+          key={k}
+          className={cn(
+            'px-4 py-2.5',
+            scopeOnly
+              ? i === 0 && 'border-r border-line'
+              : cn(i % 3 !== 2 && i !== kvItems.length - 1 && 'border-r border-line', i >= 3 && 'border-t border-line', i === 4 && 'col-span-2'),
+          )}
+        >
           <div className="text-[11.5px] text-fg-subtle">{k}</div>
           <div className="font-medium text-fg">{v}</div>
         </div>
@@ -211,18 +267,19 @@ export function ConsentView() {
   const { detail } = useRun()
   const q = useDecisions()
   const r = detail.run
+  const rpsMax = detail.project.environment === 'local-lab' ? maxRpsPerOriginCeiling : PUBLIC_MAX_RPS_CAP
   const { discovery, hosts, defaults } = useScopeModel()
   const [editing, setEditing] = useState(false)
   const syncKey = `${r.id}:${r.phase}:${r.scopeRevision}:${defaults.join(',')}`
   const [syncedKey, setSyncedKey] = useState(syncKey)
-  const [draft, setDraftState] = useState<Draft>(() => initialDraft(r, defaults))
+  const [draft, setDraftState] = useState<Draft>(() => initialDraft(r, defaults, rpsMax))
   const setDraft = (fn: (d: Draft) => Draft) => setDraftState(fn)
   const ck = consentKey(r)
   const decision = q.get(ck)
   const scoped = Boolean(decision)
   if (syncedKey !== syncKey && !editing && !scoped) {
     setSyncedKey(syncKey)
-    setDraftState(initialDraft(r, defaults))
+    setDraftState(initialDraft(r, defaults, rpsMax))
   }
   const nw = (r.goal || '').split(/\s+/).filter(Boolean).length
   const count = discovery ? hosts.length : draft.assetIds.length
@@ -283,7 +340,7 @@ export function ConsentView() {
             {scoped
               ? decision!.state !== 'sent' && <button type="button" className={runBtn()} onClick={() => q.reopen(ck)}><Icon name="undo" />Undo</button>
               : <>
-                <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => { if (editing) setDraftState(initialDraft(r, defaults)); setEditing(!editing) }}>{editing ? 'Reset' : 'Edit scope'}</button>
+                {!discovery && <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => { if (editing) setDraftState(initialDraft(r, defaults, rpsMax)); setEditing(!editing) }}>{editing ? 'Reset' : 'Edit scope'}</button>}
                 <button type="button" className={runBtn({ variant: 'primary' })} disabled={!canApprove} onClick={approve}>
                   Approve &amp; start<Kbd inverted className="ml-0.5">A</Kbd>
                 </button>
@@ -313,29 +370,79 @@ export function ConsentView() {
 
 /** Header "Edit scope" dialog for runs past consent: save a scope revision or add a candidate host. */
 export function ScopeOverlay() {
-  const { detail, send, pending } = useRun()
+  const { detail, send, refresh, pending } = useRun()
   const overlays = useOverlays()
   const toast = useToast()
   const r = detail.run
+  const rpsMax = detail.project.environment === 'local-lab' ? maxRpsPerOriginCeiling : PUBLIC_MAX_RPS_CAP
   const { discovery, defaults } = useScopeModel()
-  const [draft, setDraftState] = useState<Draft>(() => initialDraft(r, defaults))
+  const [draft, setDraftState] = useState<Draft>(() => initialDraft(r, defaults, rpsMax))
+  const [draftRevision, setDraftRevision] = useState(r.scopeRevision)
   const [saveProject, setSaveProject] = useState(false)
   const [adding, setAdding] = useState(false)
   const [origin, setOrigin] = useState('')
   const [source, setSource] = useState('')
   const [thirdParty, setThirdParty] = useState(false)
   const [err, setErr] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [saveErr, setSaveErr] = useState('')
+  const [conflict, setConflict] = useState(false)
+  const [reloading, setReloading] = useState(false)
+  const [pendingReload, setPendingReload] = useState(false)
   const editable = canReviewScope(r.phase, r.status) && !discovery
-  useShortcuts([{ key: 'Escape', allowInInput: true, run: () => overlays.closeScope() }], { priority: 100, exclusive: true })
-  const save = () => {
-    const command = scopeCommand(r, draft, saveProject)
-    overlays.closeScope()
-    toast.undoable({ message: `Saving scope revision ${r.scopeRevision + 1} (${plural(draft.assetIds.length, 'host')})`, icon: 'globe', sub: 'Sends when this closes', commit: () => send(command) })
+  const isRevisionConflict = conflict || r.scopeRevision !== draftRevision
+
+  useEffect(() => {
+    if (!pendingReload) return
+    setDraftState(initialDraft(r, defaults, rpsMax))
+    setDraftRevision(r.scopeRevision)
+    setPendingReload(false)
+  }, [pendingReload, r, defaults, rpsMax])
+
+  useShortcuts([{ key: 'Escape', allowInInput: true, run: () => { if (!saving) overlays.closeScope() } }], { priority: 100, exclusive: true })
+
+  const reloadLatestScope = async () => {
+    setReloading(true)
+    setSaveErr('')
+    setConflict(false)
+    try {
+      await refresh()
+    } finally {
+      setReloading(false)
+      setPendingReload(true)
+    }
   }
-  return <Dialog open onOpenChange={open => { if (!open) overlays.closeScope() }}>
+
+  const save = async () => {
+    if (saving || !editable) return
+    const command = scopeCommand(r, draft, {
+      saveProject,
+      scopeOnly: true,
+      expectedScopeRevision: draftRevision,
+    })
+    setSaving(true)
+    setSaveErr('')
+    setConflict(false)
+    try {
+      await send(command)
+      toast.show(`Saved scope revision ${draftRevision + 1} (${plural(draft.assetIds.length, 'host')})`, { icon: 'globe' })
+      overlays.closeScope()
+    } catch (failure) {
+      const msg = failure instanceof Error ? failure.message : 'Could not save scope revision.'
+      setSaveErr(msg)
+      if (/scope changed|scope_revision|revision/i.test(msg)) {
+        setConflict(true)
+      }
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return <Dialog open closeOnEscape={!saving} onOpenChange={open => { if (!open && !saving) overlays.closeScope() }}>
     <DialogContent className="max-h-[80vh] max-w-[720px] overflow-auto rounded-2xl border-line-2 p-0" aria-label="Edit scope">
       <ScopeCard
         inDialog
+        scopeOnly
         editing={editable}
         draft={draft}
         setDraft={fn => setDraftState(fn)}
@@ -363,16 +470,29 @@ export function ScopeOverlay() {
               <button type="submit" className={runBtn()} disabled={pending > 0}>Add for review</button>
             </div>
           </form>}
+          {isRevisionConflict && <div className="flex items-center gap-2.5 border-t border-line bg-warn-soft px-4 py-2.5 text-[12px] leading-[17px] text-fg" role="alert">
+            <Icon name="alert" className="flex-none text-warn" />
+            <span className="min-w-0 flex-1">
+              {saveErr || `Scope changed on the server (now revision ${r.scopeRevision}) while you were editing.`} Reload the latest scope before saving.
+            </span>
+            <button type="button" className={runBtn({ size: 'xs' })} disabled={reloading || saving} onClick={() => void reloadLatestScope()}>
+              {reloading ? 'Reloading…' : 'Reload latest scope'}
+            </button>
+          </div>}
+          {!isRevisionConflict && saveErr && <div className="flex items-center gap-2 border-t border-line px-4 py-2 text-[12px] text-danger" role="alert">
+            <Icon name="alert" className="flex-none" />
+            <span>{saveErr}</span>
+          </div>}
           <div className={RW.sheetF}>
             {editable
               ? <label className="mr-auto flex cursor-pointer select-none items-center gap-2 text-[12px] text-fg-subtle">
-                <input className="m-0 size-[13px] accent-[var(--accent)]" type="checkbox" checked={saveProject} onChange={e => setSaveProject(e.target.checked)} />
+                <input className="m-0 size-[13px] accent-[var(--accent)]" type="checkbox" disabled={saving} checked={saveProject} onChange={e => setSaveProject(e.target.checked)} />
                 Save as the project default
               </label>
               : <span className="mr-auto text-[12px] text-fg-subtle">{discovery ? 'Scope is reviewed after discovery.' : `Scope can’t change while the run is ${runStatusLabel(r.status).toLowerCase()}.`}</span>}
-            {r.phase !== 'complete' && !discovery && !adding && <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => setAdding(true)}><Icon name="plus" />Add host</button>}
-            <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => overlays.closeScope()}>Close</button>
-            {editable && <button type="button" className={runBtn({ variant: 'primary' })} disabled={!draft.assetIds.length || draft.assetIds.length > maxScopeHosts} onClick={save}>{r.phase === 'review' ? 'Approve scope' : 'Save scope revision'}</button>}
+            {r.phase !== 'complete' && !discovery && !adding && <button type="button" className={runBtn({ variant: 'ghost' })} disabled={saving} onClick={() => setAdding(true)}><Icon name="plus" />Add host</button>}
+            <button type="button" className={runBtn({ variant: 'ghost' })} disabled={saving} onClick={() => overlays.closeScope()}>Close</button>
+            {editable && <button type="button" className={runBtn({ variant: 'primary' })} disabled={saving || reloading || isRevisionConflict || !draft.assetIds.length || draft.assetIds.length > maxScopeHosts} onClick={() => void save()}>{saving ? 'Saving…' : (r.phase === 'review' ? 'Approve scope' : 'Save scope revision')}</button>}
           </div>
         </>}
       />

@@ -1,17 +1,18 @@
 // Run line header: breadcrumb with goal, then status · phase track · round ·
 // budget meter · request meter · testing mode and hosts · elapsed. Items drop by
-// priority when the line overflows. Primary action + "…" menu carry every
-// run-level command: resume/pause, budget, approval policy, scope, goal
-// revision, approve-all, exports, lab runner, stop, delete.
+// priority when the line overflows. Primary action + "…" menu carry run-level
+// commands: resume/pause, budget, approval policy, scope, goal revision,
+// exports, stop, delete.
 import { Link, useNavigate, useRouter } from '@tanstack/react-router'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { FormEvent, ReactNode, RefObject } from 'react'
-import { checkRunLabHealthAction, downloadReportMarkdown, exportSarifAction, removeRun, startRunLabAction, stopRunLabAction } from '../../actions.ts'
+import { downloadReportMarkdown, exportSarifAction, removeRun } from '../../actions.ts'
 import { approvalPolicies, maxBudgetRequests, maxRpsPerOriginCeiling } from '../../domain.ts'
 import type { ApprovalPolicy } from '../../domain.ts'
 import { approvalPolicyMeta, capabilityTierMeta } from '../run-state.ts'
 import { Dialog, DialogContent, DialogTitle } from '../ui/dialog.tsx'
 import { useRun, useRunModel } from './data.tsx'
+import type { Command } from './data.tsx'
 import { Tag } from './display.tsx'
 import { fmtAgo, fmtDur, fmtFullDateTime, fmtN, fmtTime, fmtUsd, host, plural, short } from './format.ts'
 import { PhaseTrack, StatusGlyph, TierBars } from './glyphs.tsx'
@@ -25,6 +26,42 @@ import { useNav } from './nav.tsx'
 import { useOverlays } from './overlays.tsx'
 import { useToast } from './toast.tsx'
 import { cn, runBtn, runDdItem, RW } from './tw.ts'
+
+export const PUBLIC_MAX_RPS_CAP = 20
+
+/** Live RPS slider ceiling: polite cap (20) on public targets, 100 on local-lab. */
+export function effectiveRpsCap(environment: string): number {
+  return environment === 'local-lab' ? maxRpsPerOriginCeiling : PUBLIC_MAX_RPS_CAP
+}
+
+/** Build a `raise_budget` command omitting unchanged budget fields so RPS-only edits succeed near cap. */
+export function buildBudgetCommand(
+  run: { status: string; budgetUsd: number; spentUsd: number; budgetRequests: number; spentRequests: number; maxRpsPerOrigin: number },
+  draft: { usd: number; unlimited: boolean; cap: number; rps: number },
+  rpsMax: number,
+): Extract<Command, { action: 'raise_budget' }> | null {
+  const usdChanged = draft.usd !== run.budgetUsd
+  const nextBudgetRequests = draft.unlimited ? 0 : Math.min(maxBudgetRequests, Math.round(draft.cap))
+  const reqChanged = nextBudgetRequests !== run.budgetRequests
+  const clampedRps = Math.min(rpsMax, Math.max(1, Math.round(draft.rps)))
+  const rpsChanged = clampedRps !== run.maxRpsPerOrigin
+  const isBudgetPaused = run.status === 'budget_paused'
+  if (!usdChanged && !reqChanged && !rpsChanged && !isBudgetPaused) return null
+  const cmd: Extract<Command, { action: 'raise_budget' }> = {
+    action: 'raise_budget',
+    resume: isBudgetPaused,
+  }
+  if (usdChanged || (isBudgetPaused && run.spentUsd >= run.budgetUsd)) {
+    cmd.budgetUsd = draft.usd
+  }
+  if (reqChanged || (isBudgetPaused && run.budgetRequests > 0 && run.spentRequests >= run.budgetRequests)) {
+    cmd.budgetRequests = draft.unlimited ? 0 : Math.max(run.spentRequests + 1, nextBudgetRequests)
+  }
+  if (rpsChanged) {
+    cmd.maxRpsPerOrigin = clampedRps
+  }
+  return cmd
+}
 
 type Popover = 'menu' | 'budget' | 'policy' | 'scope' | 'goal' | null
 
@@ -65,7 +102,7 @@ const rlBtnClass =
   'group/rlb mr-3 inline-flex h-3.5 flex-none cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-none border-0 border-r border-line bg-transparent p-0 pr-3 font-sans text-[12.5px] font-normal text-inherit shadow-none last:border-r-0 data-[lastv=true]:border-r-0 hover:bg-transparent'
 
 export function RunHeader() {
-  const { detail, send, pending, refresh } = useRun()
+  const { detail, send, pending } = useRun()
   const model = useRunModel()
   const nav = useNav()
   const toast = useToast()
@@ -89,10 +126,9 @@ export function RunHeader() {
   const rPct = r.budgetRequests ? r.spentRequests / r.budgetRequests : 0
   const scopeN = model.scopeOrigins.length
   const editable = !['complete', 'stopped', 'failed'].includes(r.status)
-  const isActiveRun = r.status === 'running'
+  const hasActiveWorkers = r.status === 'running'
     || detail.assignments.some(a => a.status === 'running' || a.status === 'waiting_approval')
-    || Boolean(detail.labTarget)
-  const pendingApprovals = detail.approvals.filter(a => a.status === 'pending')
+  const hasRunningLab = Boolean(detail.labTarget)
   useFitRunline(rl, [r.status, r.phase, r.spentUsd, r.spentRequests, scopeN])
 
   useEffect(() => {
@@ -124,16 +160,6 @@ export function RunHeader() {
       <span>{label}</span>
       {opts.right != null && <span className="ml-auto text-[11.5px] text-fg-subtle">{opts.right}</span>}
     </button>
-
-  const lab = detail.project.environment === 'local-lab'
-  const labAct = async (fn: () => Promise<{ message?: string } | unknown>, ok: string) => {
-    setPop(null)
-    try {
-      const res = await fn() as { message?: string }
-      toast.show(res?.message ?? ok)
-      await refresh()
-    } catch (e) { toast.show(e instanceof Error ? e.message : 'Lab action failed', { tone: 'error' }) }
-  }
 
   return <header className="flex-none border-b border-line px-[18px]">
     <div className="flex h-11 min-w-0 items-center gap-2">
@@ -184,10 +210,6 @@ export function RunHeader() {
           {r.capabilityTier === 3 && item('shield', 'Approval policy…', () => setPop('policy'), { right: approvalPolicyMeta[r.approvalPolicy ?? 'auto_review'].short })}
           {item('globe', 'Scope hosts…', () => setPop('scope'), { right: plural(scopeN, 'host') })}
           {item('edit', 'Revise goal…', () => setPop('goal'), { disabled: !editable })}
-          {pendingApprovals.length > 0 && item('check', `Approve all pending (${pendingApprovals.length})`, () => {
-            setPop(null)
-            toast.undoable({ message: `Approving ${plural(pendingApprovals.length, 'pending request')}`, icon: 'check', sub: 'Sends when this closes', commit: () => send({ action: 'approve_all_pending' }) })
-          })}
           <div className={RW.menuSep} />
           {item('chat', 'Open the board', () => { setPop(null); nav.openChat(null) }, { right: 'C' })}
           {model.report && item('download', 'Download report (Markdown)', () => {
@@ -198,13 +220,6 @@ export function RunHeader() {
             setPop(null)
             exportSarifAction({ data: { runId: r.id, reportId: model.report!.id } }).then(res => download(res.content, res.filename, 'application/sarif+json; charset=utf-8'), () => toast.show('Could not export SARIF', { tone: 'error' }))
           })}
-          {lab && <>
-            <div className={RW.menuSep} />
-            {detail.labTarget
-              ? item('stop', 'Stop local lab', () => void labAct(() => stopRunLabAction({ data: { runId: r.id } }), 'Lab stack stopped'))
-              : item('play', 'Start local lab', () => void labAct(() => startRunLabAction({ data: { runId: r.id } }), 'Lab started'), { disabled: !detail.localLabEnvEnabled || !detail.project.labConfig?.enabled })}
-            {item('activity', 'Lab health check', () => void labAct(() => checkRunLabHealthAction({ data: { runId: r.id } }), 'Health checked'))}
-          </>}
           <div className={RW.menuSep} />
           {editable && r.status !== 'waiting' && item('stop', 'Stop run', () => {
             setPop(null)
@@ -222,7 +237,8 @@ export function RunHeader() {
       </span>
     </div>
     {deleteOpen && <DeleteRunDialog
-      isActive={isActiveRun}
+      hasActiveWorkers={hasActiveWorkers}
+      hasRunningLab={hasRunningLab}
       onClose={() => setDeleteOpen(false)}
       onDeleted={async () => {
         setDeleteOpen(false)
@@ -289,16 +305,31 @@ function BudgetPopover({ onClose }: { onClose: () => void }) {
   const { detail, send, pending } = useRun()
   const r = detail.run
   const editable = !['complete', 'stopped', 'failed'].includes(r.status)
+  const isLocalLab = detail.project.environment === 'local-lab'
+  const rpsMax = effectiveRpsCap(detail.project.environment)
   const [usd, setUsd] = useState(r.status === 'budget_paused' ? Math.min(500, Math.max(r.budgetUsd + 10, Math.ceil(r.spentUsd + 10))) : r.budgetUsd)
-  const [rps, setRps] = useState(r.maxRpsPerOrigin)
+  const [rps, setRps] = useState(() => Math.min(r.maxRpsPerOrigin, rpsMax))
   const [unlimited, setUnlimited] = useState(r.budgetRequests === 0)
   const [cap, setCap] = useState(r.budgetRequests > 0 ? r.budgetRequests : Math.max(r.spentRequests + 1000, 2500))
   const [err, setErr] = useState('')
+  const usdChanged = usd !== r.budgetUsd
+  const nextBudgetRequests = unlimited ? 0 : Math.min(maxBudgetRequests, Math.round(cap))
+  const reqChanged = nextBudgetRequests !== r.budgetRequests
+  const minUsd = r.status === 'budget_paused' || usdChanged
+    ? Math.max(0.1, Number((r.spentUsd + 0.01).toFixed(2)))
+    : Math.max(0.1, Math.min(r.budgetUsd, Number((r.spentUsd + 0.01).toFixed(2))))
+  const minReqCap = r.status === 'budget_paused' || reqChanged
+    ? r.spentRequests + 1
+    : Math.min(r.budgetRequests || 1, r.spentRequests + 1)
   const submit = (e: FormEvent) => {
     e.preventDefault()
-    const budgetRequests = unlimited ? 0 : Math.max(r.spentRequests + 1, Math.min(maxBudgetRequests, Math.round(cap)))
+    const cmd = buildBudgetCommand(r, { usd, unlimited, cap, rps }, rpsMax)
+    if (!cmd) {
+      onClose()
+      return
+    }
     setErr('')
-    send({ action: 'raise_budget', budgetUsd: usd, budgetRequests, maxRpsPerOrigin: rps, resume: r.status === 'budget_paused' })
+    send(cmd)
       .then(onClose, (x: unknown) => setErr(x instanceof Error ? x.message : 'Could not update the budget'))
   }
   return <form onSubmit={submit}>
@@ -314,11 +345,12 @@ function BudgetPopover({ onClose }: { onClose: () => void }) {
       <p>Spent {fmtUsd(r.spentUsd)} · {fmtN(r.spentRequests)} requests · {fmtN(r.turnsUsed)} turns. Changes apply without restarting workers.</p>
       <label className="flex flex-col gap-1 text-[12px] text-fg-muted">
         <span className="flex items-center gap-1.5">Spend cap (USD)</span>
-        <input className={cn(RW.fieldInput, 'num')} type="number" min={Math.max(0.1, Number((r.spentUsd + 0.1).toFixed(2)))} max={500} step="any" disabled={!editable} value={usd} onChange={e => setUsd(Number(e.target.value))} />
+        <input className={cn(RW.fieldInput, 'num')} type="number" min={minUsd} max={500} step="any" disabled={!editable} value={usd} onChange={e => setUsd(Number(e.target.value))} />
       </label>
       <label className="flex flex-col gap-1 text-[12px] text-fg-muted">
         <span className="flex items-center gap-1.5">Rate limit<span className="num ml-auto text-fg-subtle">{rps} req/s per origin</span></span>
-        <input className="w-full accent-[var(--accent)]" type="range" min={1} max={maxRpsPerOriginCeiling} step={1} disabled={!editable} value={rps} onChange={e => setRps(Number(e.target.value))} />
+        <input className="w-full accent-[var(--accent)]" type="range" min={1} max={rpsMax} step={1} disabled={!editable} value={rps} onChange={e => setRps(Number(e.target.value))} />
+        {!isLocalLab && <span className="text-[11px] text-fg-subtle">Public targets are capped at {PUBLIC_MAX_RPS_CAP} req/s per origin.</span>}
       </label>
       <label className="flex cursor-pointer select-none items-center gap-2 text-[12.5px] text-fg-muted">
         <input className="m-0 size-[13px] accent-[var(--accent)]" type="checkbox" checked={unlimited} disabled={!editable} onChange={e => setUnlimited(e.target.checked)} />
@@ -326,7 +358,7 @@ function BudgetPopover({ onClose }: { onClose: () => void }) {
       </label>
       {!unlimited && <label className="flex flex-col gap-1 text-[12px] text-fg-muted">
         <span className="flex items-center gap-1.5">Request cap</span>
-        <input className={cn(RW.fieldInput, 'num')} type="number" min={r.spentRequests + 1} max={maxBudgetRequests} step={1} disabled={!editable} value={cap} onChange={e => setCap(Number(e.target.value))} />
+        <input className={cn(RW.fieldInput, 'num')} type="number" min={minReqCap} max={maxBudgetRequests} step={1} disabled={!editable} value={cap} onChange={e => setCap(Number(e.target.value))} />
       </label>}
     </PopShell>
   </form>
@@ -373,7 +405,7 @@ function ScopePopover({ onClose, onEdit }: { onClose: () => void; onEdit: () => 
     sub={`${plural(model.scopeOrigins.length, 'host')} · revision ${r.scopeRevision}`}
     footer={<>
       <button type="button" className={runBtn({ variant: 'ghost' })} onClick={onClose}>Close</button>
-      <button type="button" className={runBtn()} onClick={onEdit}><Icon name="edit" />{r.status === 'waiting' ? 'Review scope' : 'Edit scope'}</button>
+      {r.phase !== 'consent' && <button type="button" className={runBtn()} onClick={onEdit}><Icon name="edit" />{r.status === 'waiting' ? 'Review scope' : 'Edit scope'}</button>}
     </>}
   >
     <p>{capabilityTierMeta[r.capabilityTier].name}. {capabilityTierMeta[r.capabilityTier].summary}</p>
@@ -412,8 +444,9 @@ function GoalPopover({ onClose }: { onClose: () => void }) {
   </form>
 }
 
-function DeleteRunDialog({ isActive, onClose, onDeleted }: {
-  isActive: boolean
+function DeleteRunDialog({ hasActiveWorkers, hasRunningLab, onClose, onDeleted }: {
+  hasActiveWorkers: boolean
+  hasRunningLab: boolean
   onClose: () => void
   onDeleted: () => Promise<void>
 }) {
@@ -424,6 +457,15 @@ function DeleteRunDialog({ isActive, onClose, onDeleted }: {
   const [err, setErr] = useState('')
   const totalFindings = model.findings.length
   const confirmedFindings = model.findings.filter(f => ['confirmed', 'verified', 'static_verified'].includes(f.status)).length
+  const isActive = hasActiveWorkers || hasRunningLab
+  const dialogTitle = hasActiveWorkers ? 'Stop & delete run' : hasRunningLab ? 'Stop lab & delete run' : 'Delete run'
+  const activeWarning = hasActiveWorkers && hasRunningLab
+    ? 'This run has active workers and a running local lab container. Confirming will stop active workers and clean up the lab container before deleting.'
+    : hasActiveWorkers
+      ? 'This run has active workers running. Confirming will stop active workers before deleting.'
+      : 'This run still has a running local lab container. Confirming will stop and clean up the lab container before deleting.'
+  const confirmIdleLabel = hasActiveWorkers ? 'Stop & delete run' : hasRunningLab ? 'Stop lab & delete run' : 'Delete run'
+  const confirmBusyLabel = hasActiveWorkers ? 'Stopping & deleting…' : hasRunningLab ? 'Stopping lab & deleting…' : 'Deleting…'
 
   useShortcuts([{ key: 'Escape', allowInInput: true, run: () => { if (!deleting) onClose() } }], { priority: 100, exclusive: true })
 
@@ -444,7 +486,7 @@ function DeleteRunDialog({ isActive, onClose, onDeleted }: {
     <DialogContent className="max-w-[460px] overflow-hidden rounded-2xl border-line-2 p-0" role="alertdialog">
       <div className={RW.sheetH}>
         <Icon name="trash" className="text-danger" />
-        <DialogTitle className="text-[13.5px] font-medium text-fg">{isActive ? 'Stop & delete run' : 'Delete run'}</DialogTitle>
+        <DialogTitle className="text-[13.5px] font-medium text-fg">{dialogTitle}</DialogTitle>
         <button
           type="button"
           className={cn(runBtn({ variant: 'ghost' }), 'ml-auto px-1.5')}
@@ -472,7 +514,7 @@ function DeleteRunDialog({ isActive, onClose, onDeleted }: {
         </div>
         {isActive && <div className="flex items-start gap-2 rounded-lg bg-warn-soft px-[11px] py-[9px] text-[12px] leading-[17px] text-fg shadow-[inset_0_0_0_1px_var(--warn-line)]" role="status">
           <Icon name="alert" className="mt-0.5 flex-none text-warn" />
-          <span>This run is currently active. Confirming will stop active workers and clean up containers before deleting.</span>
+          <span>{activeWarning}</span>
         </div>}
         {err && <p className="m-0 text-[12px] text-danger" role="alert">{err}</p>}
       </div>
@@ -480,7 +522,7 @@ function DeleteRunDialog({ isActive, onClose, onDeleted }: {
         <button type="button" className={runBtn({ variant: 'ghost' })} disabled={deleting} onClick={onClose}>Cancel</button>
         <button type="button" className={runBtn({ variant: 'dangerSolid' })} disabled={deleting} onClick={() => void handleConfirm()}>
           <Icon name="trash" />
-          {deleting ? (isActive ? 'Stopping & deleting…' : 'Deleting…') : (isActive ? 'Stop & delete run' : 'Delete run')}
+          {deleting ? confirmBusyLabel : confirmIdleLabel}
         </button>
       </div>
     </DialogContent>
