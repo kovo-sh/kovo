@@ -1,0 +1,91 @@
+# Kovo Hunter — Option B Sibling-Container (Docker-outside-of-Docker) Deployment
+#
+# Runs Kovo Hunter without Docker-in-Docker or privileged mode. A restricted
+# socket proxy on an internal-only bridge network mediates Docker API calls for
+# spawning isolated, `--network none`, UID-10001 sibling worker containers.
+#
+# Quick start:
+#   docker compose up
+#
+# Local source build:
+#   docker compose up --build
+
+services:
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:0.3
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      # Minimal API surface needed to pull images and create/start/stop/remove worker containers.
+      CONTAINERS: "1"
+      IMAGES: "1"
+      POST: "1"
+      INFO: "1"
+      PING: "1"
+      # Explicitly disable all dangerous or unneeded Docker APIs.
+      AUTH: "0"
+      BUILD: "0"
+      COMMIT: "0"
+      CONFIGS: "0"
+      DISTRIBUTION: "0"
+      EVENTS: "0"
+      EXEC: "0"
+      GRPC: "0"
+      NETWORKS: "0"
+      NODES: "0"
+      PLUGINS: "0"
+      SECRETS: "0"
+      SERVICES: "0"
+      SESSION: "0"
+      SWARM: "0"
+      SYSTEM: "0"
+      TASKS: "0"
+      VOLUMES: "0"
+    networks:
+      - docker_socket_net
+
+  kovo-hunter:
+    image: ghcr.io/wwwillchen/kovo-hunter:${KOVO_VERSION:-latest}
+    build:
+      context: .
+    restart: unless-stopped
+    depends_on:
+      - docker-proxy
+    ports:
+      - "${KOVO_PORT:-8000}:8000"
+    environment:
+      PORT: "8000"
+      DOCKER_HOST: tcp://docker-proxy:2375
+      KOVO_DATA_DIR: /data
+      KOVO_WORKER_AUTO_PULL: "1"
+      KOVO_CONTAINER_SCRATCH_DIR: /scratch
+      # Default mode (works out of the box on macOS Docker Desktop, WSL2, and Linux):
+      # Named volume + per-session `volume-subpath` (requires Docker Engine 26.0+).
+      # Each worker container receives ONLY its own `<sessionId>` subpath, never `/scratch` root.
+      KOVO_WORKER_SCRATCH_VOLUME: ${KOVO_WORKER_SCRATCH_VOLUME:-kovo_scratch}
+      # Alternative host bind-mount mode (useful for older Docker daemons or inspecting scratch files):
+      #   1. Comment out `KOVO_WORKER_SCRATCH_VOLUME` above and the `kovo_scratch:/scratch` volume below.
+      #   2. Uncomment `KOVO_HOST_SCRATCH_DIR` below and set an ABSOLUTE host path in `.env`
+      #      (e.g. `KOVO_HOST_SCRATCH_DIR=/tmp/kovo-scratch`).
+      #   3. Mount `${KOVO_HOST_SCRATCH_DIR}:/scratch` below.
+      # KOVO_HOST_SCRATCH_DIR: ${KOVO_HOST_SCRATCH_DIR:-}
+    volumes:
+      - kovo_data:/data
+      - kovo_scratch:/scratch
+      # Bind-mount alternative (see comment above):
+      # - ${KOVO_HOST_SCRATCH_DIR}:/scratch
+    networks:
+      - default
+      - docker_socket_net
+
+volumes:
+  kovo_data:
+  kovo_scratch:
+    name: ${KOVO_WORKER_SCRATCH_VOLUME:-kovo_scratch}
+
+networks:
+  default:
+  docker_socket_net:
+    driver: bridge
+    internal: true

@@ -14,7 +14,7 @@ import {
   rmSync,
   statSync,
 } from 'node:fs'
-import { basename, dirname, join, relative, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, posix, relative, sep } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { z } from 'zod'
@@ -95,10 +95,12 @@ function removeLiveStagedRepoDirs() {
 }
 function removeLiveContainers(budgetMs = 4_000) {
   const deadline = Date.now() + budgetMs
+  let env: NodeJS.ProcessEnv | undefined
+  try { env = dockerEnv() } catch { env = undefined }
   for (const container of [...liveContainers]) {
     const remaining = deadline - Date.now()
     if (remaining <= 0) break
-    try { spawnSync('docker', ['container', 'rm', '--force', container], { stdio: 'ignore', timeout: Math.min(5_000, remaining) }) } catch { /* best-effort */ }
+    try { spawnSync('docker', ['container', 'rm', '--force', container], { stdio: 'ignore', ...(env ? { env } : {}), timeout: Math.min(5_000, remaining) }) } catch { /* best-effort */ }
     liveContainers.delete(container)
   }
   removeLiveStagedRepoDirs()
@@ -455,20 +457,288 @@ function clamp(val: number | undefined, fallback: number, min: number, max: numb
   return Math.max(min, Math.min(max, val))
 }
 
-function dockerHost() {
-  const host = process.env.DOCKER_HOST || 'unix:///var/run/docker.sock'
-  if (!/^unix:\/\/\/[^/?#\r\n][^?#\r\n]*$/.test(host)) {
-    throw new Error('Kovo Hunter requires a local Docker Unix socket.')
-  }
-  return host
+function isDoodScratchConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(env.KOVO_HOST_SCRATCH_DIR?.trim() || env.KOVO_WORKER_SCRATCH_VOLUME?.trim())
 }
 
-function dockerEnv() {
-  return {
-    PATH: process.env.PATH,
-    DOCKER_HOST: dockerHost(),
-    XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
+function parseDockerTcpHost(host: string): { hostname: string; port: number } | null {
+  if (/[\0\r\n\s]/.test(host)) return null
+  const m = /^tcp:\/\/(\[[^\]]+\]|[^:/?#\r\n]+):(\d{1,5})$/.exec(host)
+  if (!m) return null
+  const port = Number(m[2])
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null
+  return { hostname: m[1].toLowerCase(), port }
+}
+
+function isLocalDockerProxyTcp(host: string): boolean {
+  const parsed = parseDockerTcpHost(host)
+  if (!parsed) return false
+  return parsed.hostname === 'docker-proxy'
+    || parsed.hostname === 'localhost'
+    || parsed.hostname === '127.0.0.1'
+    || parsed.hostname === '[::1]'
+}
+
+export function dockerHost(env: NodeJS.ProcessEnv = process.env): string {
+  const host = env.DOCKER_HOST?.trim() || 'unix:///var/run/docker.sock'
+  if (/^unix:\/\/\/[^/?#\r\n][^?#\r\n]*$/.test(host)) {
+    return host
   }
+  if ((isDoodScratchConfigured(env) && parseDockerTcpHost(host) !== null) || isLocalDockerProxyTcp(host)) {
+    return host
+  }
+  throw new Error('Kovo Hunter requires a local Docker Unix socket.')
+}
+
+export function dockerEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return {
+    PATH: env.PATH,
+    DOCKER_HOST: dockerHost(env),
+    XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR,
+  }
+}
+
+export type DoodScratchConfig =
+  | {
+      mode: 'host_bind'
+      containerScratchDir: string
+      hostScratchDir: string
+    }
+  | {
+      mode: 'volume_subpath'
+      containerScratchDir: string
+      volumeName: string
+    }
+
+const DOCKER_VOLUME_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/
+const SCRATCH_SESSION_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/
+
+function hasDotDotSegment(rawPath: string): boolean {
+  return rawPath.split(/[\\/]+/).includes('..')
+}
+
+function resolveWithExistingAncestor(targetPath: string): string {
+  const normalized = posix.resolve(targetPath)
+  if (existsSync(normalized)) {
+    return realpathSync(normalized)
+  }
+  const tail: string[] = []
+  let cursor = normalized
+  while (cursor !== '/' && !existsSync(cursor)) {
+    tail.unshift(posix.basename(cursor))
+    cursor = posix.dirname(cursor)
+  }
+  const base = existsSync(cursor) ? realpathSync(cursor) : cursor
+  return posix.join(base, ...tail)
+}
+
+function normalizeHostScratchRoot(rawHostPath: string): string {
+  if (/[\0,\r\n]/.test(rawHostPath) || hasDotDotSegment(rawHostPath)) {
+    throw new Error('Invalid KOVO_HOST_SCRATCH_DIR path.')
+  }
+  if (!/^(?:\/|[A-Za-z]:[\\/])/.test(rawHostPath)) {
+    throw new Error('KOVO_HOST_SCRATCH_DIR must be an absolute host path.')
+  }
+  if (/^[A-Za-z]:[\\/]/.test(rawHostPath)) {
+    const trimmed = rawHostPath.replace(/[\\/]+$/, '')
+    return trimmed.length === 2 ? `${trimmed}/` : trimmed.replace(/\\/g, '/')
+  }
+  const normalized = posix.resolve(rawHostPath)
+  if (normalized === '/') {
+    throw new Error('KOVO_HOST_SCRATCH_DIR must not be root "/".')
+  }
+  return normalized
+}
+
+export function resolveDoodScratchConfig(env: NodeJS.ProcessEnv = process.env): DoodScratchConfig | null {
+  const hostScratchRaw = env.KOVO_HOST_SCRATCH_DIR?.trim() || ''
+  const volumeRaw = env.KOVO_WORKER_SCRATCH_VOLUME?.trim() || ''
+  if (!hostScratchRaw && !volumeRaw) {
+    return null
+  }
+  const containerRaw = env.KOVO_CONTAINER_SCRATCH_DIR?.trim() || '/scratch'
+  if (/[\0,\r\n]/.test(containerRaw) || !containerRaw.startsWith('/') || hasDotDotSegment(containerRaw)) {
+    throw new Error('Invalid KOVO_CONTAINER_SCRATCH_DIR path.')
+  }
+  const containerScratchDir = posix.resolve(containerRaw)
+  if (containerScratchDir === '/') {
+    throw new Error('KOVO_CONTAINER_SCRATCH_DIR must not be root "/".')
+  }
+  if (hostScratchRaw) {
+    return {
+      mode: 'host_bind',
+      containerScratchDir,
+      hostScratchDir: normalizeHostScratchRoot(hostScratchRaw),
+    }
+  }
+  if (!DOCKER_VOLUME_NAME_RE.test(volumeRaw)) {
+    throw new Error('Invalid KOVO_WORKER_SCRATCH_VOLUME name.')
+  }
+  return {
+    mode: 'volume_subpath',
+    containerScratchDir,
+    volumeName: volumeRaw,
+  }
+}
+
+function assertValidScratchSessionId(sessionId: string): string {
+  if (!SCRATCH_SESSION_ID_RE.test(sessionId) || sessionId === '.' || sessionId === '..') {
+    throw new Error('Invalid worker scratch session identifier.')
+  }
+  return sessionId
+}
+
+function relativeScratchSubpath(containerBase: string, containerPath: string): string {
+  if (/[\0,\r\n]/.test(containerPath) || !containerPath.startsWith('/') || hasDotDotSegment(containerPath)) {
+    throw new Error('Invalid worker scratch mount path.')
+  }
+  const resolvedBase = resolveWithExistingAncestor(containerBase)
+  const resolvedTarget = resolveWithExistingAncestor(containerPath)
+  const rel = posix.relative(resolvedBase, resolvedTarget)
+  if (!rel || rel === '.' || rel === '..' || rel.startsWith('../') || isAbsolute(rel) || hasDotDotSegment(rel)) {
+    throw new Error('Worker scratch mount must target a per-session subdirectory within KOVO_CONTAINER_SCRATCH_DIR.')
+  }
+  return rel
+}
+
+export function prepareSessionScratchDir(
+  sessionId: string,
+  subdir?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const config = resolveDoodScratchConfig(env)
+  if (!config) {
+    throw new Error('Sibling-container scratch mode is not configured.')
+  }
+  const safeSession = assertValidScratchSessionId(sessionId)
+  const baseDir = config.containerScratchDir
+  mkdirSync(baseDir, { recursive: true, mode: 0o755 })
+  const sessionDir = join(baseDir, safeSession)
+  mkdirSync(sessionDir, { recursive: true, mode: 0o755 })
+  chmodSync(sessionDir, 0o755)
+  let targetDir = sessionDir
+  if (subdir !== undefined) {
+    if (/[\0,\r\n]/.test(subdir) || subdir.startsWith('/') || subdir.startsWith('\\') || hasDotDotSegment(subdir)) {
+      throw new Error('Invalid worker scratch subdirectory.')
+    }
+    const parts = subdir.split(/[\\/]+/).filter(Boolean)
+    if (parts.length === 0) {
+      throw new Error('Invalid worker scratch subdirectory.')
+    }
+    targetDir = join(sessionDir, ...parts)
+    mkdirSync(targetDir, { recursive: true, mode: 0o755 })
+    chmodSync(targetDir, 0o755)
+  }
+  relativeScratchSubpath(baseDir, targetDir)
+  return targetDir
+}
+
+export function resolveDoodMountArg(
+  containerPath: string,
+  targetPath: string,
+  options: { readonly?: boolean; env?: NodeJS.ProcessEnv } = {},
+): string {
+  if (/[\0,\r\n]/.test(targetPath) || !targetPath.startsWith('/')) {
+    throw new Error('Invalid worker container mount target.')
+  }
+  const readonlySuffix = options.readonly ? ',readonly' : ''
+  const config = resolveDoodScratchConfig(options.env)
+  if (!config) {
+    if (/[\0,\r\n]/.test(containerPath)) {
+      throw new Error('Invalid host mount path.')
+    }
+    return `type=bind,source=${realpathSync(containerPath)},target=${targetPath}${readonlySuffix}`
+  }
+  const rel = relativeScratchSubpath(config.containerScratchDir, containerPath)
+  if (config.mode === 'host_bind') {
+    const hostPath = posix.join(config.hostScratchDir, rel)
+    return `type=bind,source=${hostPath},target=${targetPath}${readonlySuffix}`
+  }
+  return `type=volume,source=${config.volumeName},target=${targetPath},volume-subpath=${rel}${readonlySuffix}`
+}
+
+export function workerAutoPullEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.KOVO_WORKER_AUTO_PULL?.trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
+}
+
+const DEFAULT_WORKER_PULL_TIMEOUT_MS = 300_000
+const inflightImagePulls = new WeakMap<DockerRunner, Map<string, Promise<void>>>()
+
+function workerPullTimeoutMs(explicit?: number, env: NodeJS.ProcessEnv = process.env): number {
+  if (explicit !== undefined && Number.isFinite(explicit)) {
+    return clamp(explicit, DEFAULT_WORKER_PULL_TIMEOUT_MS, 1_000, 900_000)
+  }
+  const fromEnv = Number(env.KOVO_WORKER_PULL_TIMEOUT_MS)
+  if (Number.isFinite(fromEnv) && fromEnv > 0) {
+    return clamp(fromEnv, DEFAULT_WORKER_PULL_TIMEOUT_MS, 1_000, 900_000)
+  }
+  return DEFAULT_WORKER_PULL_TIMEOUT_MS
+}
+
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error('Aborted'))
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      reject(signal.reason instanceof Error ? signal.reason : new Error('Aborted'))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      value => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(value)
+      },
+      err => {
+        signal.removeEventListener('abort', onAbort)
+        reject(err)
+      },
+    )
+  })
+}
+
+export async function ensureWorkerImageAvailable(
+  image: string,
+  dockerRunner: DockerRunner,
+  signal: AbortSignal,
+  options: { env?: NodeJS.ProcessEnv; pullTimeoutMs?: number } = {},
+): Promise<void> {
+  const env = options.env ?? process.env
+  if (!workerAutoPullEnabled(env)) return
+  signal.throwIfAborted()
+  if (!image || /[\s\0\r\n]/.test(image) || image.startsWith('-')) {
+    throw new Error('Invalid worker container image reference.')
+  }
+  let perRunner = inflightImagePulls.get(dockerRunner)
+  if (!perRunner) {
+    perRunner = new Map<string, Promise<void>>()
+    inflightImagePulls.set(dockerRunner, perRunner)
+  }
+  const existing = perRunner.get(image)
+  if (existing) {
+    await raceWithAbort(existing, signal)
+    return
+  }
+  const timeoutMs = workerPullTimeoutMs(options.pullTimeoutMs, env)
+  const task = (async () => {
+    try {
+      await dockerRunner(['image', 'inspect', image], AbortSignal.timeout(10_000))
+      return
+    } catch {
+      // Missing locally (or inspect failed): attempt bounded pull once.
+    }
+    try {
+      await dockerRunner(['pull', image], AbortSignal.timeout(timeoutMs))
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      throw new Error(`Failed to pull worker image "${image}": ${detail}`)
+    }
+  })().finally(() => {
+    perRunner?.delete(image)
+  })
+  perRunner.set(image, task)
+  await raceWithAbort(task, signal)
 }
 
 const workerFailureGuidance = 'Build the local worker image and check Docker availability.'
@@ -511,12 +781,31 @@ const resultRefSchema = z.object({
 })
 const oneShotRefSchema = resultRefSchema.extend({ path: z.string().regex(oneShotRefPath) })
 
-/** Per-one-shot tmpfs directory bind-mounted at `/kovo-ipc` (host-readable). */
-function makeOneShotIpcDir(): string {
+/** Per-one-shot tmpfs (or per-session DooD scratch) directory mounted at `/kovo-ipc`. */
+function makeOneShotIpcDir(sessionId?: string, env: NodeJS.ProcessEnv = process.env): { ipcDir: string; cleanupDir: string } {
+  const dood = resolveDoodScratchConfig(env)
+  if (dood) {
+    const sid = sessionId ?? `ipc-${randomUUID()}`
+    const ipcDir = prepareSessionScratchDir(sid, 'ipc', env)
+    chmodSync(ipcDir, 0o777)
+    return { ipcDir, cleanupDir: ipcDir }
+  }
   const base = existsSync('/dev/shm') ? '/dev/shm' : tmpdir()
   const dir = mkdtempSync(join(base, 'kovo-ipc-'))
   chmodSync(dir, 0o777)
-  return dir
+  return { ipcDir: dir, cleanupDir: dir }
+}
+
+function cleanupSessionSubdir(dir: string, env: NodeJS.ProcessEnv = process.env): void {
+  try { rmSync(dir, { recursive: true, force: true }) } catch { /* ignore */ }
+  const dood = resolveDoodScratchConfig(env)
+  if (!dood) return
+  const parent = dirname(dir)
+  try {
+    if (parent !== dood.containerScratchDir && existsSync(parent) && readdirSync(parent).length === 0) {
+      rmSync(parent, { recursive: true, force: true })
+    }
+  } catch { /* ignore */ }
 }
 
 function readOneShotRef(dir: string, rawRef: unknown): Record<string, unknown> {
@@ -783,8 +1072,10 @@ interface ContainerArgsInput {
   ownerPid?: number
   poolInstanceId?: string
   options?: WorkerSessionOptions
-  /** One-shot only: host tmpfs dir bind-mounted at /kovo-ipc for large-output pointers. */
+  /** One-shot only: host tmpfs (or DooD scratch) dir mounted at /kovo-ipc for large-output pointers. */
   ipcDir?: string
+  /** Optional environment override for sibling-container (DooD) mount resolution. */
+  env?: NodeJS.ProcessEnv
 }
 
 export interface PreparedReposMount {
@@ -892,10 +1183,15 @@ function reposTreeNeedsStaging(resolvedRoot: string): boolean {
   return inspect(resolvedRoot)
 }
 
-function stageReadableReposTree(resolvedRoot: string): { mountDir: string; excludedCount: number } {
-  const rawStageDir = mkdtempSync(join(tmpdir(), 'kovo-repos-'))
-  chmodSync(rawStageDir, 0o755)
-  const mountDir = realpathSync(rawStageDir)
+function stageReadableReposTree(resolvedRoot: string, targetDir?: string): { mountDir: string; excludedCount: number } {
+  let mountDir: string
+  if (targetDir) {
+    mountDir = realpathSync(targetDir)
+  } else {
+    const rawStageDir = mkdtempSync(join(tmpdir(), 'kovo-repos-'))
+    chmodSync(rawStageDir, 0o755)
+    mountDir = realpathSync(rawStageDir)
+  }
   let excludedCount = 0
 
   const copyDir = (srcDir: string, dstDir: string) => {
@@ -937,14 +1233,27 @@ function stageReadableReposTree(resolvedRoot: string): { mountDir: string; exclu
   return { mountDir, excludedCount }
 }
 
+function isInsideScratchSubdir(containerScratchDir: string, candidate: string): boolean {
+  try {
+    relativeScratchSubpath(containerScratchDir, candidate)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /**
  * Validate and prepare a host `reposDir` for a read-only `/repos` bind mount into the non-root
  * Docker worker (`UID 10001`). When the host tree lacks `o+rx` on directories or `o+r` on
- * non-secret files (e.g. created under host `umask 0077` or `0o700`), stages a clean read-only
+ * non-secret files (e.g. created under host `umask 0077` or `0o700`), or when running in DooD
+ * sibling-container scratch mode outside `KOVO_CONTAINER_SCRATCH_DIR`, stages a clean read-only
  * copy with explicit `0o755`/`0o644` permissions while excluding credential/token files and
  * leaving original host files (including `0600` secrets) completely unmodified.
  */
-export function prepareReposMount(reposDir?: string): PreparedReposMount | null {
+export function prepareReposMount(
+  reposDir?: string,
+  doodOptions?: { sessionId?: string; env?: NodeJS.ProcessEnv },
+): PreparedReposMount | null {
   if (!reposDir) return null
   if (/[\0,\r\n]/.test(reposDir)) {
     throw new Error('Invalid repository mount path.')
@@ -958,7 +1267,10 @@ export function prepareReposMount(reposDir?: string): PreparedReposMount | null 
   if (/[\0,\r\n]/.test(resolved)) {
     throw new Error('Invalid resolved repository mount path.')
   }
-  if (!reposTreeNeedsStaging(resolved)) {
+  const env = doodOptions?.env ?? process.env
+  const dood = resolveDoodScratchConfig(env)
+  const needsDoodStage = dood !== null && !isInsideScratchSubdir(dood.containerScratchDir, resolved)
+  if (!needsDoodStage && !reposTreeNeedsStaging(resolved)) {
     return {
       mountDir: resolved,
       staged: false,
@@ -966,7 +1278,10 @@ export function prepareReposMount(reposDir?: string): PreparedReposMount | null 
       cleanup() { /* direct mount: never remove caller's directory */ },
     }
   }
-  const { mountDir, excludedCount } = stageReadableReposTree(resolved)
+  const stageTarget = dood
+    ? prepareSessionScratchDir(doodOptions?.sessionId ?? `repos-${randomUUID()}`, 'repos', env)
+    : undefined
+  const { mountDir, excludedCount } = stageReadableReposTree(resolved, stageTarget)
   trackLiveStagedRepoDir(mountDir)
   let cleaned = false
   return {
@@ -977,12 +1292,12 @@ export function prepareReposMount(reposDir?: string): PreparedReposMount | null 
       if (cleaned) return
       cleaned = true
       liveStagedRepoDirs.delete(mountDir)
-      try { rmSync(mountDir, { recursive: true, force: true }) } catch { /* best-effort */ }
+      cleanupSessionSubdir(mountDir, env)
     },
   }
 }
 
-function resolveReposMountArgs(reposDir?: string): string[] {
+function resolveReposMountArgs(reposDir?: string, env?: NodeJS.ProcessEnv): string[] {
   if (!reposDir) return []
   if (/[\0,\r\n]/.test(reposDir)) {
     throw new Error('Invalid repository mount path.')
@@ -996,7 +1311,7 @@ function resolveReposMountArgs(reposDir?: string): string[] {
   if (/[\0,\r\n]/.test(resolved)) {
     throw new Error('Invalid resolved repository mount path.')
   }
-  return ['--mount', `type=bind,source=${resolved},target=/repos,readonly`]
+  return ['--mount', resolveDoodMountArg(resolved, '/repos', { readonly: true, env })]
 }
 
 /**
@@ -1039,11 +1354,11 @@ export function ensureRpcMountReadable(rpcDir: string): string {
  * the only egress a `--network none` verification script needs; the rest of the container stays
  * read-only and the script never receives a persona credential (Layer 1 injects it).
  */
-function resolveRpcMountArgs(rpcDir?: string): string[] {
+function resolveRpcMountArgs(rpcDir?: string, env?: NodeJS.ProcessEnv): string[] {
   if (!rpcDir) return []
   const resolved = ensureRpcMountReadable(rpcDir)
   return [
-    '--mount', `type=bind,source=${resolved},target=${VERIFY_RPC_CONTAINER_DIR},readonly`,
+    '--mount', resolveDoodMountArg(resolved, VERIFY_RPC_CONTAINER_DIR, { readonly: true, env }),
     '--env', `${VERIFY_RPC_SOCKET_ENV}=${VERIFY_RPC_CONTAINER_DIR}/${VERIFY_RPC_SOCKET_NAME}`,
     '--env', `${VERIFY_RPC_TOKEN_ENV}=${VERIFY_RPC_CONTAINER_DIR}/${VERIFY_RPC_TOKEN_NAME}`,
     '--env', `${VERIFY_RPC_CONTEXT_ENV}=${VERIFY_RPC_CONTAINER_DIR}/${VERIFY_RPC_CONTEXT_NAME}`,
@@ -1072,11 +1387,11 @@ export function workerContainerCreateArgs(input: ContainerArgsInput): string[] {
     '--cpus', String(cpus),
     '--memory', `${memoryMb}m`, '--memory-swap', `${memoryMb}m`,
     '--tmpfs', `/tmp:rw,nosuid,nodev,noexec,size=${tmpfsMb}m,mode=1777`,
-    ...resolveReposMountArgs(options?.reposDir),
-    ...resolveRpcMountArgs(options?.rpcMountDir),
+    ...resolveReposMountArgs(options?.reposDir, input.env),
+    ...resolveRpcMountArgs(options?.rpcMountDir, input.env),
     ...(input.ipcDir
       ? [
-          '--mount', `type=bind,source=${realpathSync(input.ipcDir)},target=/kovo-ipc`,
+          '--mount', resolveDoodMountArg(realpathSync(input.ipcDir), '/kovo-ipc', { readonly: false, env: input.env }),
           '--env', 'KOVO_IPC_DIR=/kovo-ipc',
         ]
       : []),
@@ -1282,7 +1597,7 @@ export class WarmWorkerPool {
   private effectiveCreateOptions(): WorkerSessionOptions {
     if (!this.options.reposDir) return this.options
     if (this.preparedRepos === undefined) {
-      this.preparedRepos = prepareReposMount(this.options.reposDir)
+      this.preparedRepos = prepareReposMount(this.options.reposDir, { sessionId: `warm-${this.instanceId}` })
     }
     return this.preparedRepos ? { ...this.options, reposDir: this.preparedRepos.mountDir } : this.options
   }
@@ -1290,6 +1605,7 @@ export class WarmWorkerPool {
   private async create(): Promise<void> {
     const name = 'kovo-' + randomUUID()
     try {
+      await ensureWorkerImageAvailable(this.image, this.docker, AbortSignal.timeout(DEFAULT_WORKER_PULL_TIMEOUT_MS))
       await this.docker(workerContainerCreateArgs({
         image: this.image,
         name,
@@ -1431,7 +1747,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
   private coldSessionCreates = 0
   private reclaiming?: Promise<void>
 
-  constructor({ image = 'kovo-worker:v4', workspace, runId, dockerRunner, sessionSpawner, staleCreatedMs, cell, isPidAlive }: {
+  constructor(input: {
     image?: string
     workspace?: { id: string; directory: string }
     runId?: string
@@ -1449,7 +1765,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
     /** Test seam: check whether a container owner PID is alive (defaults to `isOwnerPidAlive`). */
     isPidAlive?: (pid: number) => boolean
   } = {}) {
-    this.image = image
+    const { image = 'kovo-worker:v4', workspace, runId, dockerRunner, sessionSpawner, staleCreatedMs, cell, isPidAlive } = input
+    this.image = input.image ?? (process.env.KOVO_WORKER_IMAGE?.trim() || image)
     this.runId = runId
     this.docker = dockerRunner ?? docker
     this.spawnSession = sessionSpawner ?? (name => spawn('docker', ['container', 'start', '--attach', '--interactive', name], {
@@ -1512,7 +1829,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     this.retireWarmRepos(previousRepos)
     let poolOptions: WorkerSessionOptions | undefined
     if (options?.reposDir) {
-      const prepared = prepareReposMount(options.reposDir)
+      const prepared = prepareReposMount(options.reposDir, { sessionId: `pool-${this.instanceId}` })
       if (prepared) {
         this.preparedWarmRepos = {
           sourceDir: nextReposSource ?? prepared.mountDir,
@@ -1737,15 +2054,17 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const job = jobSchema.parse(rawJob)
     const payload = JSON.stringify(job)
     if (Buffer.byteLength(payload) > 16 * 1024 * 1024) throw new Error('Worker inputs exceeded their limit.')
+    await ensureWorkerImageAvailable(this.image, this.docker, signal)
     await this.reclaimInactive()
     signal.throwIfAborted()
     const name = 'kovo-' + randomUUID()
     const timeoutMs = (job.timeoutMs ?? 60_000) + 10_000
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
-    // One-shot containers exit before a pointer can be read via `docker exec`, so bind a host
-    // tmpfs and read the spilled payload directly (validated by size + sha256).
-    const ipcDir = makeOneShotIpcDir()
-    const preparedRepos = prepareReposMount(options?.reposDir)
+    // One-shot containers exit before a pointer can be read via `docker exec`, so mount a host
+    // tmpfs (or isolated DooD session subdir) and read the spilled payload directly (size + sha256).
+    const scratchSessionId = `run-${randomUUID()}`
+    const { ipcDir, cleanupDir } = makeOneShotIpcDir(scratchSessionId)
+    const preparedRepos = prepareReposMount(options?.reposDir, { sessionId: scratchSessionId })
     const effectiveOptions = preparedRepos ? { ...options, reposDir: preparedRepos.mountDir } : options
     this.activeContainers.add(name)
     trackLiveContainer(name)
@@ -1758,7 +2077,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       }
       return resultSchema.parse(parsed)
     } finally {
-      try { rmSync(ipcDir, { recursive: true, force: true }) } catch { /* ignore */ }
+      cleanupSessionSubdir(cleanupDir)
       await this.removeContainer(name)
       preparedRepos?.cleanup()
       this.activeContainers.delete(name)
@@ -1775,12 +2094,13 @@ export class LinuxWorkerBackend implements WorkerBackend {
     signal.throwIfAborted()
     const req = astVerifyRequestSchema.parse(rawReq)
     const payload = JSON.stringify({ op: 'ast_verify', ...req })
+    await ensureWorkerImageAvailable(this.image, this.docker, signal)
     await this.reclaimInactive()
     signal.throwIfAborted()
     const name = 'kovo-' + randomUUID()
     const timeoutMs = (req.timeoutMs ?? 30_000) + 15_000
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
-    const preparedRepos = prepareReposMount(options?.reposDir)
+    const preparedRepos = prepareReposMount(options?.reposDir, { sessionId: `ast-${randomUUID()}` })
     const effectiveOptions = preparedRepos ? { ...options, reposDir: preparedRepos.mountDir } : options
     this.activeContainers.add(name)
     trackLiveContainer(name)
@@ -1798,6 +2118,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
 
   async openSession(assignmentId: string, signal: AbortSignal, options?: WorkerSessionOptions): Promise<WorkerSession> {
     signal.throwIfAborted()
+    await ensureWorkerImageAvailable(this.image, this.docker, signal)
     await this.reclaimInactive()
     signal.throwIfAborted()
     // Warm pool first (best-effort): a pre-created session container skips the create
@@ -1847,7 +2168,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const cleanupRepos = () => { preparedRepos?.cleanup() }
     if (!pooled) {
       try {
-        preparedRepos = prepareReposMount(options?.reposDir)
+        preparedRepos = prepareReposMount(options?.reposDir, { sessionId: `sess-${randomUUID()}` })
         const effectiveOptions = preparedRepos ? { ...options, reposDir: preparedRepos.mountDir } : options
         await this.docker(this.containerCreateArgs(name, assignmentId, ['--session'], effectiveOptions), AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
       } catch (error) {
