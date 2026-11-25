@@ -1671,7 +1671,7 @@ test('M1.9 Regression: base64/base64url secret scrubbing, credentialPatterns sec
   assert.equal(tel.sinkEventsCount, 0)
 })
 
-test('M1.10 Regression: browser_chain control -> setup/cleanup -> probe rejects omitted pathAndQuery in Zod and clears lastPathAndQuery in verifier', async t => {
+test('M1.10 Regression: browser_chain control -> setup/cleanup -> probe rejects omitted pathAndQuery in Zod', async t => {
   const base = {
     ...replayBase(),
     kind: 'browser_chain' as const,
@@ -1700,56 +1700,6 @@ test('M1.10 Regression: browser_chain control -> setup/cleanup -> probe rejects 
   })
   assert.equal(probeToControl.success, false, 'probe -> cleanup -> control omitting pathAndQuery must be rejected')
 
-  // Verify replay-verifier.ts handles resetContext: true across control -> setup -> probe without leaking /control-page
-  const visitedPaths: string[] = []
-  const fakeBrowser = {
-    async visitPage(req: { origin: string; pathAndQuery: string }) {
-      visitedPaths.push(req.pathAndQuery)
-      return {
-        origin: req.origin,
-        finalUrl: `${req.origin}${req.pathAndQuery}`,
-        title: 'Page',
-        status: 200,
-        domSnippet: '<div>ok</div>',
-        links: [],
-        forms: [],
-        blockedOrigins: [],
-        cookieNames: [],
-        localStorageKeys: [],
-        sessionStorageKeys: [],
-        postMessageListeners: [],
-        canaryCheck: { token: '', triggered: false, matchedLocations: [] },
-        domSinkTraces: [],
-        actionResults: [],
-        builtinResults: {},
-        exchanges: [],
-        consoleMessages: [],
-        xhrRequests: [],
-        allRequests: [],
-      }
-    },
-  } as unknown as ScopedBrowser
-  const fx = await httpFixture((_req, res) => { res.writeHead(200).end('ok') })
-  t.after(() => fx.close())
-
-  const resetSetupSpec: DeclarativeReplaySpec = {
-    ...base,
-    spaCatchallControl: false,
-    steps: [
-      { id: 'c1', role: 'control', description: 'Control', origin: appOrigin, pathAndQuery: '/control-page', action: 'navigate' },
-      { id: 's1', role: 'setup', description: 'Setup reset', origin: appOrigin, pathAndQuery: '/setup-page', resetContext: true, action: 'navigate' },
-      { id: 'p1', role: 'probe', description: 'Probe reuse setup', origin: appOrigin, action: 'click', selector: '#btn' },
-    ],
-  }
-  await verifyReplaySpec({
-    spec: resetSetupSpec,
-    broker: makeFixtureBroker(fx.port),
-    browser: fakeBrowser,
-    backend: createJqBackend(),
-    grant: makeGrant(),
-    signal: AbortSignal.timeout(10_000),
-  })
-  assert.deepEqual(visitedPaths, ['/control-page', '/setup-page', '/setup-page'], 'resetContext: true on setup must bind probe to /setup-page, not /control-page')
 })
 
 test('M1.11 Regression: update_proposed_finding does not reset exhausted findings to pending & finding.reason/verification redact secrets', async t => {

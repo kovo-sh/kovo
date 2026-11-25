@@ -5204,6 +5204,9 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
         specKind: candidate.kind,
         vulnClass: candidateClass,
         personas: input.personas,
+        // Browser recipes replay the candidate's own step list; the synthesizer remains the source
+        // of the interaction shape while the recipe owns confirmation.
+        ...(candidate.kind === 'browser_chain' ? { candidateSpec: candidate.spec as unknown as Record<string, unknown> } : {}),
         ...(staging.headers ? { headers: staging.headers } : {}),
       })
       if (recipePlan) {
@@ -5231,6 +5234,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
             broker: input.broker,
             grant: input.grant,
             signal: input.signal,
+            ...(input.browser ? { browser: input.browser } : {}),
             ...(input.runId ? { runId: input.runId } : {}),
             ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
             recordExchange: trackExchange,

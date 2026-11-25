@@ -8,12 +8,17 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
 import {
+  browserSinkEnvelopeFromSteps,
   cut3FloorRecipe,
+  isProtocolBrowserSpec,
   runCut3Recipe,
+  wiredRecipeForSpecKind,
   type FloorExchange,
   type FloorRecipeDeps,
   type FloorRequestSpec,
 } from '../src/server/floor-recipes.ts'
+import { browserSessionSeam } from '../src/server/floor-recipe-engine.ts'
+import type { ScopedBrowser } from '../src/server/scoped-browser.ts'
 import { synthSqlBoolean, synthSqlTime } from '../scripts/benchmark-specs-sql.ts'
 import type { HypothesisOutcome, ProbeEnv } from '../scripts/benchmark-probes.ts'
 
@@ -141,6 +146,149 @@ describe('cut3cd: browser_sink recipe', () => {
       depsFor(() => ({ status: 200 }), { browserTrace: () => ({ id: 'trace-3', origin, sinks: ['storage_write'] }) }),
     )
     assert.equal(mismatched.result.confirmed, false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Cut 3d: navigate/fill/click browser proofs run the browser_sink recipe
+// ---------------------------------------------------------------------------
+
+describe('cut3cd: browser_chain -> browser_sink envelope', () => {
+  const domSteps = [
+    { id: 'c1', role: 'control', description: 'control', origin, pathAndQuery: '/portal', action: 'navigate' },
+    { id: 'p1', role: 'probe', description: 'fill', origin, pathAndQuery: '/portal', action: 'fill', selector: '#q', value: '{{canary_token}}' },
+    { id: 'p2', role: 'probe', description: 'click', origin, pathAndQuery: '/portal', action: 'click', selector: '#go' },
+    { id: 'p3', role: 'probe', description: 'snapshot', origin, pathAndQuery: '/portal', action: 'dom_xss_sink_hook' },
+  ]
+
+  test('maps navigate/fill/click onto recipe steps and treats the sink snapshot as implicit', () => {
+    const envelope = browserSinkEnvelopeFromSteps({ origin, vulnClass: 'dom_xss', steps: domSteps })
+    assert.ok(envelope)
+    assert.equal(envelope.recipeId, 'browser_sink')
+    assert.equal(envelope.args.vulnClass, 'dom_xss')
+    assert.deepEqual(envelope.args.steps?.map(step => step.action), ['navigate', 'fill', 'click'])
+    assert.equal(envelope.args.steps?.[1]?.value, '{{canary_token}}')
+    assert.equal(envelope.args.steps?.[0]?.role, 'control')
+    assert.equal(envelope.args.steps?.[1]?.role, 'probe')
+  })
+
+  test('the wired mapping sends browser_chain xss to browser_sink', () => {
+    assert.equal(wiredRecipeForSpecKind('browser_chain', 'xss'), 'browser_sink')
+    assert.equal(wiredRecipeForSpecKind('browser_chain', 'xss_reflected'), 'browser_sink')
+    // Protocol classes are not wired: they stay on the framework verifier.
+    assert.equal(wiredRecipeForSpecKind('browser_chain', 'cors_client_side'), null)
+  })
+
+  test('protocol proofs are excluded rather than flattened', () => {
+    const postMessage = [{ id: 'p', role: 'probe', description: 'pm', origin, pathAndQuery: '/', action: 'postmessage_probe' }]
+    const fetchStep = [{ id: 'p', role: 'probe', description: 'cors', origin, pathAndQuery: '/', action: 'same_site_fetch', fetchTarget: { origin, pathAndQuery: '/api', method: 'GET', credentials: 'include' } }]
+    const builtin = [{ id: 'p', role: 'probe', description: 'storage', origin, pathAndQuery: '/', action: 'navigate', builtinCheck: 'storage_keys' }]
+    for (const steps of [postMessage, fetchStep, builtin]) {
+      assert.equal(isProtocolBrowserSpec(steps), true)
+      assert.equal(browserSinkEnvelopeFromSteps({ origin, vulnClass: 'dom_xss', steps }), null)
+    }
+    assert.equal(isProtocolBrowserSpec(domSteps), false)
+  })
+
+  test('confirms only when the probe session recorded the canary in an executable sink', async () => {
+    const envelope = browserSinkEnvelopeFromSteps({ origin, vulnClass: 'dom_xss', steps: domSteps })!
+    const sessions: Array<{ steps: number; hit: boolean }> = []
+    const deps = depsFor(() => ({ status: 200 }), {
+      browserSession: input => {
+        const hit = input.steps.some(step => step.role === 'probe')
+        sessions.push({ steps: input.steps.length, hit })
+        return { traces: hit ? [{ id: 'trace-probe', origin, sinks: ['dom_xss:innerHTML'] }] : [], sinkHit: hit }
+      },
+    })
+    const execution = await runCut3Recipe(cut3FloorRecipe('browser_sink', envelope.args), deps)
+    assert.equal(execution.result.confirmed, true, execution.result.verification.reason)
+    assert.equal(execution.result.verification.rule, 'browser')
+    assert.deepEqual(execution.receipt.browserTraceIds, ['trace-probe'])
+    assert.equal(sessions.length, 2, 'a control session runs before the probe session')
+    assert.equal(sessions[0]?.hit, false)
+  })
+
+  test('fails closed when the probe session recorded no canary sink', async () => {
+    const envelope = browserSinkEnvelopeFromSteps({ origin, vulnClass: 'dom_xss', steps: domSteps })!
+    const execution = await runCut3Recipe(
+      cut3FloorRecipe('browser_sink', envelope.args),
+      depsFor(() => ({ status: 200 }), { browserSession: () => ({ traces: [], sinkHit: false }) }),
+    )
+    assert.equal(execution.result.confirmed, false)
+    assert.ok(execution.failure?.missingRoles.includes('browser_sink'), JSON.stringify(execution.failure))
+  })
+
+  test('fails closed when the control session already hits the sink', async () => {
+    const envelope = browserSinkEnvelopeFromSteps({ origin, vulnClass: 'dom_xss', steps: domSteps })!
+    const execution = await runCut3Recipe(
+      cut3FloorRecipe('browser_sink', envelope.args),
+      depsFor(() => ({ status: 200 }), { browserSession: () => ({ traces: [{ id: 't', origin, sinks: ['dom_xss:innerHTML'] }], sinkHit: true }) }),
+    )
+    assert.equal(execution.result.confirmed, false)
+    assert.ok(execution.failure?.missingRoles.includes('browser_control'), JSON.stringify(execution.failure))
+  })
+})
+
+describe('cut3cd: browser session seam evidence channels', () => {
+  const visit = (overrides: Record<string, unknown>) => ({
+    origin,
+    finalUrl: `${origin}/portal`,
+    title: 'Portal',
+    status: 200,
+    domSnippet: '<div></div>',
+    links: [],
+    forms: [],
+    xhrRequests: [],
+    blockedOrigins: [],
+    consoleMessages: [],
+    postMessageListeners: { count: 0, hasOnMessage: false, handlers: [], observedEvents: 0, canaryHandledWithoutOriginCheck: false },
+    cookieNames: [],
+    localStorageKeys: [],
+    sessionStorageKeys: [],
+    canaryCheck: { token: null, triggered: false, detail: null },
+    domSinkTraces: [],
+    exchangeIds: [],
+    exchanges: [],
+    durationMs: 1,
+    ...overrides,
+  })
+
+  function seam(visits: unknown[]) {
+    const browser = { async runBrowserSession() { return visits } } as unknown as ScopedBrowser
+    return browserSessionSeam({ browser, grant: {} as never, signal: AbortSignal.timeout(1000), origin })
+  }
+
+  test('cites an exact document-title canary assignment as execution evidence', async () => {
+    const result = await seam([visit({ title: 'guardian-dom-abc123' })])({
+      origin,
+      steps: [{ role: 'probe', action: 'navigate', pathAndQuery: '/' }],
+      canaryToken: 'guardian-dom-abc123',
+      actor,
+    })
+    assert.equal(result?.sinkHit, true)
+    assert.deepEqual(result?.traces[0]?.sinks, ['canary:title'])
+  })
+
+  test('a title that merely contains the canary text is not execution evidence', async () => {
+    const result = await seam([visit({ title: 'Search results for guardian-dom-abc123' })])({
+      origin,
+      steps: [{ role: 'probe', action: 'navigate', pathAndQuery: '/' }],
+      canaryToken: 'guardian-dom-abc123',
+      actor,
+    })
+    assert.equal(result?.sinkHit, false)
+    assert.deepEqual(result?.traces, [])
+  })
+
+  test('cites a DOM sink trace with the canary', async () => {
+    const result = await seam([visit({ domSinkTraces: [{ sink: 'innerHTML', preview: 'x', containsCanary: true, timestamp: 1 }] })])({
+      origin,
+      steps: [{ role: 'probe', action: 'navigate', pathAndQuery: '/' }],
+      canaryToken: 'guardian-dom-abc123',
+      actor,
+    })
+    assert.equal(result?.sinkHit, true)
+    assert.deepEqual(result?.traces[0]?.sinks, ['dom_xss:innerHTML'])
   })
 })
 

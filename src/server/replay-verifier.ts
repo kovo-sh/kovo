@@ -43,8 +43,8 @@ import type { ProofReceipt, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVe
 import { buildAgentScriptReceipt } from './proof-receipt.ts'
 import { TranscriptStore, VerifyRpcServer, verifyScript } from './verify-rpc.ts'
 import type { VerifyAttemptSession, VerifyVerdict } from './verify-rpc.ts'
-import { wiredRecipeForSpecKind } from './floor-recipes.ts'
-import { retestPersistedRecipe } from './floor-recipe-engine.ts'
+import { isProtocolBrowserSpec, wiredRecipeForSpecKind } from './floor-recipes.ts'
+import { browserSessionSeam, retestPersistedRecipe } from './floor-recipe-engine.ts'
 
 // Re-exported for tests and callers that only import the verifier.
 export {
@@ -1718,7 +1718,6 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
       const consoleMessages: Array<{ stepId: string; role: string; type: 'error' | 'warning'; text: string }> = []
       const requests: Array<{ stepId: string; role: string; method: string; url: string; origin: string; resourceType: string; status: number | null }> = []
       const domSinkTraces: Array<{ stepId: string; role: string } & BrowserDomSinkTrace> = []
-      const domResults: Record<string, unknown>[] = []
       const probeSnapshots: Array<{
         id: string
         primaryExchange?: BrokerExchangeResult
@@ -1796,23 +1795,6 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         for (const trace of visit.domSinkTraces) {
           domSinkTraces.push({ stepId: step.id, role: step.role, ...trace })
         }
-        domResults.push({
-          stepId: step.id,
-          role: step.role,
-          action: step.action,
-          origin: visit.origin,
-          finalUrl: visit.finalUrl,
-          status: visit.status,
-          title: visit.title,
-          selectorResult: visit.selectorResult ?? null,
-          canaryCheck: visit.canaryCheck,
-          domSinkTraces: visit.domSinkTraces,
-          actionResults: visit.actionResults ?? [],
-          builtinResults: visit.builtinResults ?? {},
-          postMessageListeners: visit.postMessageListeners,
-          fetchResult: visit.fetchResult ?? null,
-          redirectSummary: visit.redirectSummary ?? null,
-        })
         if (step.role === 'control' && !firstControlStep) firstControlStep = stepEntry
         if (step.role === 'probe') {
           if (!firstProbeStep) firstProbeStep = stepEntry
@@ -1834,122 +1816,64 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         }
       }
 
-      if (typeof (scopedBrowser as { runBrowserSession?: unknown }).runBrowserSession === 'function') {
-        const sessionSteps: BrowserSessionStep[] = spec.steps.map(step => {
-          const postMessagePayload = step.postMessagePayload !== undefined
-            ? interpolateValue(step.postMessagePayload, vars)
-            : undefined
-          const resolvedCheckKind = step.checkKind
-            ?? (step.action === 'postmessage_probe' ? 'postmessage'
-              : (step.action === 'dom_check' || step.action === 'dom_xss_sink_hook') ? 'dom_xss'
-                : undefined)
-          const stepActions = buildStepActions(step)
-          return {
-            id: step.id,
-            role: step.role,
-            description: step.description,
-            origin: step.origin,
-            pathAndQuery: step.pathAndQuery !== undefined ? interpolateString(step.pathAndQuery, vars) : undefined,
-            reusePage: step.reusePage,
-            resetContext: step.resetContext,
-            persona: step.persona,
-            session: step.session,
-            csrfBind: step.csrfBind,
-            traceId: step.traceId,
-            runId: params.runId,
-            assignmentId,
-            action: step.action,
-            checkKind: resolvedCheckKind,
-            canaryToken,
-            selector: step.selector,
-            value: step.value !== undefined ? interpolateString(step.value, vars) : undefined,
-            builtinCheck: step.builtinCheck,
-            urlPattern: step.urlPattern ? interpolateString(step.urlPattern, vars) : undefined,
-            enableSinkHook: Boolean(step.enableSinkHook || step.action === 'dom_xss_sink_hook'),
-            actions: stepActions.length > 0 ? stepActions : undefined,
-            fetchTarget: step.action === 'same_site_fetch' ? step.fetchTarget : undefined,
-            postMessageOrigin: step.action === 'postmessage_probe'
-              ? (step.postMessageOrigin ?? 'https://untrusted-origin.invalid')
-              : step.postMessageOrigin,
-            postMessagePayload,
-            waitAfterLoadMs: step.waitAfterLoadMs,
-            onExchange: ex => {
-              exchanges.push(ex)
-              const id = params.onExchange?.(ex)
-              if (typeof id === 'string' && id) exchangeIds.push(id)
-              return id
-            },
-          }
-        })
-        const visits = await scopedBrowser.runBrowserSession(sessionSteps, grant, signal)
-        for (let i = 0; i < spec.steps.length; i += 1) {
-          const visit = visits[i]
-          if (visit) recordVisitStep(spec.steps[i], visit)
+      if (typeof (scopedBrowser as { runBrowserSession?: unknown }).runBrowserSession !== 'function') {
+        // Production always supplies runBrowserSession; a visitPage-only object is a test double,
+        // and a browser proof must never be confirmed from a partial session.
+        return inconclusiveResult(
+          'The browser implementation exposes no session runner; browser_chain needs runBrowserSession.',
+          exchanges, exchangeIds, { kind: spec.kind },
+        )
+      }
+      const sessionSteps: BrowserSessionStep[] = spec.steps.map(step => {
+        const postMessagePayload = step.postMessagePayload !== undefined
+          ? interpolateValue(step.postMessagePayload, vars)
+          : undefined
+        const resolvedCheckKind = step.checkKind
+          ?? (step.action === 'postmessage_probe' ? 'postmessage'
+            : (step.action === 'dom_check' || step.action === 'dom_xss_sink_hook') ? 'dom_xss'
+              : undefined)
+        const stepActions = buildStepActions(step)
+        return {
+          id: step.id,
+          role: step.role,
+          description: step.description,
+          origin: step.origin,
+          pathAndQuery: step.pathAndQuery !== undefined ? interpolateString(step.pathAndQuery, vars) : undefined,
+          reusePage: step.reusePage,
+          resetContext: step.resetContext,
+          persona: step.persona,
+          session: step.session,
+          csrfBind: step.csrfBind,
+          traceId: step.traceId,
+          runId: params.runId,
+          assignmentId,
+          action: step.action,
+          checkKind: resolvedCheckKind,
+          canaryToken,
+          selector: step.selector,
+          value: step.value !== undefined ? interpolateString(step.value, vars) : undefined,
+          builtinCheck: step.builtinCheck,
+          urlPattern: step.urlPattern ? interpolateString(step.urlPattern, vars) : undefined,
+          enableSinkHook: Boolean(step.enableSinkHook || step.action === 'dom_xss_sink_hook'),
+          actions: stepActions.length > 0 ? stepActions : undefined,
+          fetchTarget: step.action === 'same_site_fetch' ? step.fetchTarget : undefined,
+          postMessageOrigin: step.action === 'postmessage_probe'
+            ? (step.postMessageOrigin ?? 'https://untrusted-origin.invalid')
+            : step.postMessageOrigin,
+          postMessagePayload,
+          waitAfterLoadMs: step.waitAfterLoadMs,
+          onExchange: ex => {
+            exchanges.push(ex)
+            const id = params.onExchange?.(ex)
+            if (typeof id === 'string' && id) exchangeIds.push(id)
+            return id
+          },
         }
-      } else {
-        // Fallback for unit-test mocks (e.g. M1.10 fakeBrowser) implementing only visitPage()
-        let lastPathAndQuery: string | undefined
-        let activeRole: 'control' | 'probe' | null = null
-        let lastPersona: string | undefined
-        let lastOrigin: string | undefined
-
-        for (const step of spec.steps) {
-          signal.throwIfAborted()
-          if (step.resetContext === true) {
-            activeRole = null
-          }
-          const resetGroupBoundary =
-            (step.role === 'control' && activeRole === 'probe') ||
-            (step.role === 'probe' && activeRole === 'control') ||
-            lastPersona !== (step.persona ?? undefined) ||
-            lastOrigin !== step.origin ||
-            step.resetContext === true ||
-            step.reusePage === false
-          if (resetGroupBoundary) {
-            lastPathAndQuery = undefined
-          }
-          const rawPath = step.pathAndQuery ?? lastPathAndQuery ?? '/'
-          const pathAndQuery = interpolateString(rawPath, vars)
-          lastPathAndQuery = pathAndQuery
-          if (step.role === 'control' || step.role === 'probe') {
-            activeRole = step.role
-          }
-          lastPersona = step.persona ?? undefined
-          lastOrigin = step.origin
-          const postMessagePayload = step.postMessagePayload !== undefined
-            ? interpolateValue(step.postMessagePayload, vars)
-            : undefined
-          const resolvedCheckKind = step.checkKind
-            ?? (step.action === 'postmessage_probe' ? 'postmessage'
-              : (step.action === 'dom_check' || step.action === 'dom_xss_sink_hook') ? 'dom_xss'
-                : undefined)
-          const enableSinkHook = Boolean(step.enableSinkHook || step.action === 'dom_xss_sink_hook')
-          const stepActions = buildStepActions(step)
-
-          const visit = await scopedBrowser.visitPage({
-            origin: step.origin,
-            pathAndQuery,
-            persona: step.persona,
-            checkKind: resolvedCheckKind,
-            canaryToken,
-            selector: step.selector,
-            postMessageOrigin: step.action === 'postmessage_probe'
-              ? (step.postMessageOrigin ?? 'https://untrusted-origin.invalid')
-              : step.postMessageOrigin,
-            postMessagePayload,
-            sameSiteFetch: step.action === 'same_site_fetch' ? step.fetchTarget : undefined,
-            actions: stepActions.length > 0 ? stepActions : undefined,
-            enableSinkHook,
-            waitAfterLoadMs: step.waitAfterLoadMs,
-            onExchange: ex => {
-              exchanges.push(ex)
-              const id = params.onExchange?.(ex)
-              if (typeof id === 'string' && id) exchangeIds.push(id)
-              return id
-            },
-          }, grant, signal)
-          recordVisitStep(step, visit)
-        }
+      })
+      const visits = await scopedBrowser.runBrowserSession(sessionSteps, grant, signal)
+      for (let i = 0; i < spec.steps.length; i += 1) {
+        const visit = visits[i]
+        if (visit) recordVisitStep(spec.steps[i], visit)
       }
 
       let spaCatchall: Record<string, unknown> | undefined
@@ -1998,7 +1922,6 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         consoleMessages,
         requests,
         domSinkTraces,
-        domResults,
         ...(firstControlStep ? { control: firstControlStep } : {}),
         ...(firstProbeStep ? { probe: firstProbeStep } : {}),
         ...(spaCatchall ? { spaCatchall } : {}),
@@ -2753,6 +2676,13 @@ export function assertNotRecipeWiredLegacyCall(spec: DeclarativeReplaySpec | unk
   if (!spec || typeof spec !== 'object') return
   const kind = (spec as { kind?: unknown }).kind
   if (typeof kind !== 'string') return
+  // Only navigate/fill/click DOM-sink proofs are wired to `browser_sink`. A protocol browser proof
+  // (postMessage/fetch/builtin) legitimately stays on the framework verifier and must not trip the
+  // no-fallback guard.
+  if (kind === 'browser_chain') {
+    const steps = (spec as { steps?: unknown }).steps
+    if (Array.isArray(steps) && isProtocolBrowserSpec(steps as Array<Record<string, unknown>>)) return
+  }
   const vulnClass = recipeClassOfSpec(spec as DeclarativeReplaySpec)
   const recipe = vulnClass ? wiredRecipeForSpecKind(kind, vulnClass) : null
   if (!recipe) return
@@ -2787,6 +2717,15 @@ async function runPersistedFloorRecipe(
     ...(params.runId ? { runId: params.runId } : {}),
     ...(params.assignmentId ? { assignmentId: params.assignmentId } : {}),
     ...(params.onExchange ? { recordExchange: (exchange: BrokerExchangeResult) => params.onExchange?.(exchange) } : {}),
+    // Browser recipes run through the same scoped browser the framework verifier uses; the trace
+    // returned to the receipt is host-recorded and only counts a canary that reached a sink.
+    browserSession: browserSessionSeam({
+      browser: params.browser ?? new ScopedBrowser(params.broker),
+      grant: params.grant,
+      signal: params.signal,
+      origin,
+      ...(params.runId ? { runId: params.runId } : {}),
+    }),
   })
 }
 
