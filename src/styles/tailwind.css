@@ -1,0 +1,133 @@
+/* =====================================================================
+   Guardian design system — Tailwind CSS v4 entry point.
+
+   This file is the *additive* foundation for the class-variance-authority
+   primitives in src/components/ui/*. It intentionally does NOT ship
+   Tailwind preflight: the legacy stylesheets (app.css, project.css,
+   run.css, settings.css) already carry their own unlayered base reset and
+   are still the source of truth for every route that has not been
+   migrated yet.
+
+   Cascade contract
+   ----------------
+   - `theme` is a layer, so the legacy `tokens.css` custom properties
+     (unlayered) always win for names that overlap (e.g. --shadow-sm).
+   - No `base` reset is emitted at all: legacy CSS owns the only base reset.
+     Border utilities still work because Tailwind initialises --tw-border-style
+     to `solid` in its properties layer.
+   - `utilities` are emitted unlayered on purpose: the new DS primitives are
+     the only markup that carries them, while legacy CSS keeps winning
+     same-specificity ties for the old routes.
+
+   Semantic colours map 1:1 to the semantic tokens in tokens.css and use
+   `var()` indirection, so `bg-panel`, `text-fg`, `border-line` and friends
+   switch automatically between light and dark via html[data-theme].
+   ===================================================================== */
+
+@layer theme, base, components, utilities;
+
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css";
+
+@source "../";
+
+/* Dark variant follows the app's persisted theme ("light" | "dark" | "system"). */
+@custom-variant dark (&:where([data-theme=dark], [data-theme=dark] *, [data-appearance=dark], [data-appearance=dark] *));
+
+@theme inline {
+  /* Surfaces --------------------------------------------------------- */
+  --color-bg: var(--bg);
+  --color-rail: var(--rail);
+  --color-panel: var(--panel);
+  --color-sunk: var(--sunk);
+  --color-raise: var(--raise);
+  --color-canvas: var(--canvas);
+  --color-paper: var(--paper);
+  --color-pane: var(--pane);
+  --color-surface: var(--surface);
+  --color-code-bg: var(--code-bg);
+
+  /* Interaction states ----------------------------------------------- */
+  --color-hover: var(--hover);
+  --color-press: var(--press);
+  --color-sel: var(--sel);
+  --color-selection: var(--selection);
+  --color-scrim: var(--scrim);
+
+  /* Foreground ------------------------------------------------------- */
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-2);
+  --color-fg-subtle: var(--fg-3);
+  --color-fg-faint: var(--fg-4);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+
+  /* Lines ------------------------------------------------------------ */
+  --color-line: var(--line);
+  --color-line-2: var(--line-2);
+  --color-line-strong: var(--line-strong);
+  --color-sel-line: var(--sel-line);
+  --color-focus: var(--focus);
+
+  /* Accent ----------------------------------------------------------- */
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-line: var(--accent-line);
+  --color-on-accent: var(--on-accent);
+  --color-trace: var(--trace);
+  --color-trace-soft: var(--trace-soft);
+
+  /* Status ----------------------------------------------------------- */
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-warn-line: var(--warn-line);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-crit: var(--crit);
+  --color-high: var(--high);
+  --color-med: var(--med);
+  --color-low: var(--low);
+  --color-info: var(--info);
+
+  /* Typography ------------------------------------------------------- */
+  --font-sans: "InterG", Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "JetBrainsMono Nerd Font", Menlo, Consolas, monospace;
+  --font-serif: "Instrument Serif", ui-serif, Georgia, Cambria, serif;
+
+  /* The app root is 13px, not 16px — express the scale in px so utilities
+     keep the exact pixel metrics used by the legacy stylesheets. */
+  --spacing: 4px;
+  --text-xs: 11px;
+  --text-xs--line-height: 16px;
+  --text-sm: 12px;
+  --text-sm--line-height: 18px;
+  --text-base: 13px;
+  --text-base--line-height: 20px;
+  --text-lg: 15px;
+  --text-lg--line-height: 22px;
+  --text-xl: 20px;
+  --text-xl--line-height: 26px;
+
+  /* Radii ------------------------------------------------------------ */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 10px;
+  --radius-2xl: 12px;
+  --radius-control: 6px;
+  --radius-card: 10px;
+  --radius-pill: 9999px;
+
+  /* Elevation (renamed so they never shadow the legacy --shadow-* names) */
+  --shadow-hairline: var(--shadow-sm);
+  --shadow-surface: var(--shadow-card);
+  --shadow-popover: var(--shadow-pop);
+
+  /* Motion ----------------------------------------------------------- */
+  --ease-guardian: var(--ease);
+  --ease-spring: var(--spring);
+  --default-transition-duration: var(--d1);
+}
