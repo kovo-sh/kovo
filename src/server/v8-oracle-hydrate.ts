@@ -127,6 +127,28 @@ function lookupOracleRecord(id: string, idx: HydratableTranscriptIndex, fallback
   return undefined
 }
 
+/** Verify that a `HostSignedRecord` matches the host-transcript record for `rec.id` field-for-field. */
+export function matchesHydratedRecord(
+  rec: HostSignedRecord,
+  idx: HydratableTranscriptIndex,
+  fallbackSig: string,
+): boolean {
+  const expected = lookupOracleRecord(rec.id, idx, fallbackSig)
+  if (!expected) return false
+  return rec.hostSignature === expected.hostSignature
+    && rec.timestampMs === expected.timestampMs
+    && rec.status === expected.status
+    && rec.method === expected.method
+    && rec.route === expected.route
+    && rec.body === expected.body
+    && rec.json === expected.json
+    && rec.artifactDigest === expected.artifactDigest
+    && rec.actorId === expected.actorId
+    && rec.tenantId === expected.tenantId
+    && rec.capabilityHandle === expected.capabilityHandle
+    && rec.derivedFromCapabilityId === expected.derivedFromCapabilityId
+}
+
 function hydrateRecordValue(raw: unknown, idx: HydratableTranscriptIndex, fallbackSig: string): unknown {
   if (raw === undefined || raw === null) return undefined
   if (typeof raw === 'string') {
@@ -135,17 +157,22 @@ function hydrateRecordValue(raw: unknown, idx: HydratableTranscriptIndex, fallba
   }
   if (typeof raw === 'object' && !Array.isArray(raw)) {
     const obj = raw as Record<string, unknown>
-    if (typeof obj.hostSignature === 'string') return raw
-    if (typeof obj.exchangeId === 'string' && obj.exchangeId.trim()) {
-      return lookupOracleRecord(obj.exchangeId.trim(), idx, fallbackSig)
-    }
-    if (typeof obj.id === 'string' && obj.id.trim()) {
-      const found = lookupOracleRecord(obj.id.trim(), idx, fallbackSig)
-      if (found) return found
-      return 'timestampMs' in obj ? raw : undefined
-    }
+    const id = typeof obj.exchangeId === 'string' && obj.exchangeId.trim()
+      ? obj.exchangeId.trim()
+      : typeof obj.id === 'string' && obj.id.trim()
+        ? obj.id.trim()
+        : ''
+    if (!id) return undefined
+    const found = lookupOracleRecord(id, idx, fallbackSig)
+    if (found) return found
+    // Never trust caller-supplied inline record fields (`status`/`timestampMs`/`json`/`body`/`artifactDigest`):
+    // fail closed when absent from `idx`, keeping only an unverified id/sig stub when `hostSignature` was
+    // supplied so signature verification rejects it explicitly.
+    return typeof obj.hostSignature === 'string'
+      ? { id, hostSignature: obj.hostSignature, timestampMs: 1 }
+      : undefined
   }
-  return raw
+  return undefined
 }
 
 function hydrateSingleField(
