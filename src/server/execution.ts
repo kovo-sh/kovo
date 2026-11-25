@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { and, eq } from 'drizzle-orm'
 import {
@@ -31,6 +32,7 @@ import {
   injectBoardTurnInstructions,
   listSkills,
   loadSkill,
+  parseNegativeEdgeGapReason,
   resolveSpecialistProfile,
   routeStepToSpecialist,
   selectPreInjectionSkills,
@@ -58,7 +60,9 @@ import {
   type Grant,
 } from './broker.ts'
 import { CanaryBroker, scanSecondOrderMarkers, type SecondOrderStore } from './canary-broker.ts'
+import { DERIVED_CAPABILITY_HANDLE_RE, type NegativeEdge } from './capability-ledger.ts'
 import { hasCuratedAdvisory, queryCves, templateIdsForCves } from './cve-broker.ts'
+import { DerivedCapabilityVault, vaultScrubDescriptors } from './derived-custody.ts'
 import {
   createProviderLlmCall,
   evaluateSubmissionDedupe,
@@ -87,7 +91,7 @@ import {
 import { DETERMINISTIC_PARAM_HINT_RE, ExecFloorLane } from './exec-floor-lane.ts'
 import { ExecReconPlanner } from './exec-recon-planner.ts'
 import { ExecVerifier } from './exec-verify.ts'
-export { agentProofAttribution, probeCanaryClass } from './exec-verify.ts'
+export { agentProofAttribution, probeCanaryClass, runV8AgentScriptProof, syncVerifyArtifactsToLedger } from './exec-verify.ts'
 import { listMountedRepos, parseDependenciesFromFile, projectReposDir } from './github-connector.ts'
 export { decideNext } from './graph-coordinator.ts'
 import { seedCodeToRuntimeLeads as seedGraphLeads } from './graph-leads.ts'
@@ -107,7 +111,7 @@ import type { CodeDataflowSlice, CodeToRuntimeHypothesis } from './program-graph
 import { resolveProfileNoTokenWatchdogMs } from './provider-stream.ts'
 import { BudgetExceededError } from './provider.ts'
 import { redact, type NamedSecret } from './redact.ts'
-import { buildInlineVerifyFeedback, runAgentScriptProof } from './replay-verifier.ts'
+import { buildInlineVerifyFeedback } from './replay-verifier.ts'
 import { approvalRequests, findings } from './schema.ts'
 import { tenantTagForRun } from './scope-policy.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
@@ -175,6 +179,8 @@ import {
   requeueInterruptedAssignments,
   convertCodeAuditSuspectsToChainSteps,
   buildBolaTestQueue,
+  nextPlannerDryRounds,
+  type FrontierWaveController,
   type DeterministicSweepMode,
   type PhaseRequestBudgets,
   type DispatchStopReason,
@@ -414,6 +420,8 @@ export class Execution {
   private readonly floorLane: ExecFloorLane
   private readonly verifier: ExecVerifier
   private readonly reconPlanner: ExecReconPlanner
+  /** v8 Layer-1 run-scoped derived capability custody shared across all VerifyRpcServer worker sessions. */
+  private readonly capabilityVaults = new Map<string, DerivedCapabilityVault>()
   private safetyTimer?: NodeJS.Timeout
   private reclaimTimer?: NodeJS.Timeout
   private unsubWake?: () => void
@@ -493,6 +501,7 @@ export class Execution {
         const verdictRow = findingRow ? findFindingRow(this.storage, runId, findingRow.id) : undefined
         return verdictRow
       },
+      capabilityVaultFor: runId => this.capabilityVaultFor(runId),
     })
     this.reconPlanner = new ExecReconPlanner({
       ...core, labRunner: this.labRunner, maxDurationMs: this.maxDurationMs,
@@ -1050,6 +1059,203 @@ export class Execution {
   private queueTierALeadSteps(...a: Parameters<ExecReconPlanner['queueTierALeadSteps']>) { return this.reconPlanner.queueTierALeadSteps(...a) }
   private queueDetLeadUpgradeSteps(...a: Parameters<ExecReconPlanner['queueDetLeadUpgradeSteps']>) { return this.reconPlanner.queueDetLeadUpgradeSteps(...a) }
   private assignmentBriefForStep(...a: Parameters<ExecReconPlanner['assignmentBriefForStep']>) { return this.reconPlanner.assignmentBriefForStep(...a) }
+
+  /** Return (or lazily create) the single run-scoped Layer-1 DerivedCapabilityVault shared across all workers. */
+  capabilityVaultFor(runId: string): DerivedCapabilityVault {
+    let vault = this.capabilityVaults.get(runId)
+    if (!vault) {
+      const safeRunId = /^[A-Za-z0-9._-]{1,128}$/.test(runId)
+        ? runId
+        : runId.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 128) || 'run'
+      const persistPath = existsSync(this.storage.directory)
+        ? join(this.storage.directory, 'capability-vaults', `${safeRunId}.json`)
+        : undefined
+      vault = new DerivedCapabilityVault({
+        runId: safeRunId,
+        ...(persistPath ? { persistPath } : {}),
+      })
+      this.capabilityVaults.set(runId, vault)
+    }
+    return vault
+  }
+
+  /** Return the run-scoped v8 FrontierWaveController bound to Store's CapabilityLedger. */
+  frontierControllerFor(runId: string): FrontierWaveController {
+    return this.reconPlanner.frontierControllerFor(runId)
+  }
+
+  /**
+   * Record a negative-edge settlement (`invariant_enforced_hardened` | `control_blocked_cleanly` |
+   * `decoy_guard_verified`) into `CapabilityLedger` and `FrontierWaveController` so dead-end
+   * branches prune after 2 strikes and sibling workers skip re-probing them.
+   */
+  recordNegativeEdgeCoverage(
+    runId: string,
+    input: {
+      origin: string
+      category: string
+      summary: string
+      proofGapReason?: string
+      route?: string
+      enforcingControl?: string
+      preconditionCapIds?: readonly string[]
+      branchKey?: string
+      hypothesisClass?: string
+      exchangeIds?: readonly string[]
+      assignmentId?: string
+    },
+  ): { recorded: boolean; pruned: boolean; attemptCount: number; negativeEdge?: NegativeEdge } {
+    const reason = parseNegativeEdgeGapReason(input.proofGapReason)
+    if (!reason) return { recorded: false, pruned: false, attemptCount: 0 }
+
+    const ledger = this.storage.capabilityLedger(runId)
+    const controller = this.reconPlanner.frontierControllerFor(runId)
+    const targetSurfaceKey = input.route?.trim()
+      ? input.route.trim()
+      : `${input.origin}:${input.category}`
+    const hypothesisClass = input.hypothesisClass?.trim() || input.category
+    const branchKey = input.branchKey?.trim() || ''
+
+    const extractedHandles = [
+      ...(input.preconditionCapIds ?? []),
+      ...(`${input.summary} ${input.proofGapReason ?? ''}`.match(/cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+/g) ?? []),
+    ].map(h => h.trim()).filter(h => DERIVED_CAPABILITY_HANDLE_RE.test(h))
+    const uniqueHandles = [...new Set(extractedHandles)]
+
+    const extractedExchanges = [
+      ...(input.exchangeIds ?? []),
+      ...(`${input.enforcingControl ?? ''} ${input.summary}`.match(/\b(?:gx|ex)[_-][A-Za-z0-9._-]{2,80}\b/g) ?? []),
+    ].map(id => id.trim()).filter(Boolean)
+    const falsifiedByExchangeIds = extractedExchanges.length > 0
+      ? [...new Set(extractedExchanges)]
+      : [`cov_${input.assignmentId ?? 'worker'}_${Date.now()}`]
+
+    let negativeEdge: NegativeEdge
+    if (branchKey && controller.scheduler.getBranch(branchKey)) {
+      const outcome = controller.recordPivotOutcome({
+        branchKey,
+        targetSurfaceKey,
+        hypothesisClass,
+        status: 'failed',
+        failureReason: reason,
+        falsifiedByExchangeIds,
+      })
+      if (uniqueHandles.length > 0 && outcome.ledgerNegativeEdge) {
+        const recordedCaps = new Set(outcome.ledgerNegativeEdge.preconditionCapIds)
+        const differs = uniqueHandles.length !== recordedCaps.size || uniqueHandles.some(h => !recordedCaps.has(h))
+        negativeEdge = differs
+          ? ledger.recordNegativeEdge({
+              preconditionCapIds: uniqueHandles,
+              targetSurfaceKey,
+              hypothesisClass,
+              falsifiedByExchangeIds,
+              reason,
+              forcePrune: outcome.pruned,
+              notes: input.summary.slice(0, 240),
+            })
+          : outcome.ledgerNegativeEdge
+      } else {
+        negativeEdge = outcome.ledgerNegativeEdge ?? ledger.recordNegativeEdge({
+          preconditionCapIds: uniqueHandles.length > 0 ? uniqueHandles : [`branch:${branchKey}`],
+          targetSurfaceKey,
+          hypothesisClass,
+          falsifiedByExchangeIds,
+          reason,
+          forcePrune: outcome.pruned,
+          notes: input.summary.slice(0, 240),
+        })
+      }
+      controller.syncNegativeEdgesFromLedger()
+    } else {
+      const preconditionCapIds = uniqueHandles.length > 0
+        ? uniqueHandles
+        : [branchKey ? `branch:${branchKey}` : `surface:${targetSurfaceKey}`]
+      negativeEdge = ledger.recordNegativeEdge({
+        preconditionCapIds,
+        targetSurfaceKey,
+        hypothesisClass,
+        falsifiedByExchangeIds,
+        reason,
+        notes: input.summary.slice(0, 240),
+      })
+      controller.syncNegativeEdgesFromLedger()
+    }
+
+    this.safeEvent(
+      runId,
+      'frontier.negative_edge',
+      `Negative edge recorded (${reason}) on ${targetSurfaceKey} [${hypothesisClass}] (strike ${negativeEdge.attemptCount}${negativeEdge.pruned ? ', PRUNED' : ''}).`,
+      {
+        reason,
+        targetSurfaceKey,
+        hypothesisClass,
+        preconditionCapIds: negativeEdge.preconditionCapIds,
+        attemptCount: negativeEdge.attemptCount,
+        pruned: negativeEdge.pruned,
+        ...(branchKey ? { branchKey } : {}),
+      },
+    )
+    return {
+      recorded: true,
+      pruned: negativeEdge.pruned,
+      attemptCount: negativeEdge.attemptCount,
+      negativeEdge,
+    }
+  }
+
+  /**
+   * Evaluate round-level verified `HopReceipt` reach expansion via `FrontierWaveController` and
+   * feed the count into `nextPlannerDryRounds` so Phase B advances multi-hop chains before terminal confirmation.
+   */
+  evaluateFrontierProgressForRound(
+    runId: string,
+    input: {
+      roundNo: number
+      previousDryRounds: number
+      newRuntimeConfirmed: number
+      newChainPrimitives: number
+      completedInvestigations: number
+      previousCompletedInvestigations: number
+      verifiedHopReachExpansions?: number
+    },
+  ): { verifiedHopReachExpansions: number; dryRounds: number } {
+    const controller = this.reconPlanner.frontierControllerFor(runId)
+    const ledger = this.storage.capabilityLedger(runId)
+    let expansions = input.verifiedHopReachExpansions
+    if (expansions === undefined) {
+      const hopEvents = ledger.listCausalEdges().map(edge => {
+        const postNode = edge.postconditionCapId ? ledger.getCapability(edge.postconditionCapId) : null
+        return {
+          hopReceiptId: edge.hopReceiptId,
+          branchKey: edge.postconditionCapId ?? edge.edgeId,
+          depth: Math.max(1, edge.preconditionCapIds.length + 1),
+          hostVerified: true,
+          tenantScope: postNode?.tenantScope ?? edge.actorContext.tenantScope ?? 'default_tenant',
+          ...(edge.actorContext.roleLabel ? { roleLabel: edge.actorContext.roleLabel } : {}),
+          serviceOrigin: postNode?.serviceOrigin ?? edge.actorContext.serviceOrigin ?? 'unknown',
+          surface: postNode?.surface ?? 'http',
+          ...(postNode ? { capabilityId: postNode.capId } : {}),
+        }
+      })
+      const decision = hopEvents.length > 0
+        ? controller.evaluateWaveProgress({
+            completedAssignments: Math.max(0, input.completedInvestigations - input.previousCompletedInvestigations),
+            verifiedHopReceipts: hopEvents,
+          })
+        : null
+      expansions = decision?.reachDelta.newHopReceiptIds.length ?? 0
+    }
+    const dryRounds = nextPlannerDryRounds({
+      roundNo: input.roundNo,
+      previousDryRounds: input.previousDryRounds,
+      newRuntimeConfirmed: input.newRuntimeConfirmed,
+      newChainPrimitives: input.newChainPrimitives,
+      completedInvestigations: input.completedInvestigations,
+      previousCompletedInvestigations: input.previousCompletedInvestigations,
+      verifiedHopReachExpansions: expansions,
+    })
+    return { verifiedHopReachExpansions: expansions, dryRounds }
+  }
 
   /**
    * Scan a brokered HTTP exchange (response body + headers) for second-order canary markers.
@@ -1869,7 +2075,16 @@ export class Execution {
         const currentApproved = this.approvedOriginsSet(curRun)
         const cleanOrigin = this.parseOriginForRun(curRun, args.origin)
         if (!currentApproved.has(cleanOrigin)) throw new BrokerDenied(`Origin ${cleanOrigin} is not approved.`)
-        const ext = args as typeof args & { enforcingControl?: string; proofGapReason?: string; linkedFindingId?: string }
+        const ext = args as typeof args & {
+          enforcingControl?: string
+          proofGapReason?: string
+          linkedFindingId?: string
+          route?: string
+          preconditionCapIds?: string[]
+          branchKey?: string
+          hypothesisClass?: string
+          exchangeIds?: string[]
+        }
         if (args.status === 'ruled_out' && !ext.enforcingControl?.trim()) {
           throw new Error('record_coverage with status "ruled_out" requires a non-empty enforcingControl (exact file:line or negative-control exchangeId proving the control runs on the attacker path).')
         }
@@ -1882,7 +2097,26 @@ export class Execution {
           proofGapReason: args.status === 'needs_follow_up' ? (ext.proofGapReason?.trim() || args.summary) : ext.proofGapReason,
           linkedFindingId: ext.linkedFindingId,
         })
-        return { id: entry.id, origin: entry.origin, category: entry.category, status: entry.status }
+        const neg = this.recordNegativeEdgeCoverage(curRun.id, {
+          origin: cleanOrigin,
+          category: args.category,
+          summary: args.summary,
+          proofGapReason: ext.proofGapReason,
+          route: ext.route,
+          enforcingControl: ext.enforcingControl,
+          preconditionCapIds: ext.preconditionCapIds,
+          branchKey: ext.branchKey,
+          hypothesisClass: ext.hypothesisClass,
+          exchangeIds: ext.exchangeIds,
+          assignmentId: job.assignment.id,
+        })
+        return {
+          id: entry.id,
+          origin: entry.origin,
+          category: entry.category,
+          status: entry.status,
+          ...(neg.recorded ? { negativeEdgeRecorded: true, pruned: neg.pruned, attemptCount: neg.attemptCount } : {}),
+        }
       },
       complete_intent: async (completion: Parameters<NonNullable<WorkerToolHandlers['complete_intent']>>[0]) => ({ recorded: true, status: completion.status }),
     } satisfies Partial<WorkerToolHandlers>
@@ -4740,21 +4974,49 @@ export class Execution {
               throw new Error('guardian_verify requires `script` (inline) or `scriptPath` (a file in the mounted workspace).')
             }
             const approved = this.approvedOriginsSet(curRun)
-            const proof = await runAgentScriptProof({
+            const runVault = this.capabilityVaultFor(curRun.id)
+            const proof = await this.verifier.runAgentScriptProof({
               script,
               runtime,
               ...(args.title?.trim() ? { title: args.title.trim() } : {}),
-              broker: this.broker,
               grant,
-              backend: this.backend,
               runId: curRun.id,
               assignmentId: job.assignment.id,
               targetOrigins: [...approved].slice(0, 8),
               signal: job.controller.signal,
-              canaryBroker: this.canaryBroker,
+              capabilityVault: runVault,
               ...(args.timeoutMs ? { timeoutMs: args.timeoutMs } : {}),
             })
-            if (!proof.verdict.confirmed) return summarizeGuardianVerifyOutcome(proof.verdict)
+            // Always persist newly sealed Layer-1 capabilities & verified hops into CapabilityLedger
+            // (intermediate capabilities stay strictly `capability_only` quarantined!).
+            const ledgerSync = this.verifier.syncVerifyArtifactsToLedger({
+              runId: curRun.id,
+              proof,
+              defaultOrigin: [...approved][0] ?? '',
+            })
+            if (ledgerSync.newCapabilityCount > 0 || ledgerSync.newEdgeCount > 0) {
+              this.schedulePlanner(curRun.id)
+            }
+            const v8Meta = {
+              ...(ledgerSync.sealedCapabilities.length ? { sealedCapabilities: ledgerSync.sealedCapabilities } : {}),
+              ...(ledgerSync.verifiedHops.length ? { verifiedHops: ledgerSync.verifiedHops } : {}),
+              ...(proof.compositeReceipt ? {
+                compositeReceipt: {
+                  chainId: proof.compositeReceipt.receipt.chainId,
+                  terminalVulnClass: proof.compositeReceipt.receipt.terminalVulnClass,
+                  hopCount: proof.compositeReceipt.receipt.hops.length,
+                  replayMode: proof.compositeReceipt.receipt.replayMode,
+                  confirmed: proof.compositeReceipt.verification.confirmed,
+                  ...(proof.compositeReceipt.verification.failedStage
+                    ? { failedStage: proof.compositeReceipt.verification.failedStage }
+                    : {}),
+                  verifiedEdgeCount: proof.compositeReceipt.verification.verifiedEdges.filter(e => e.verified).length,
+                },
+              } : {}),
+            }
+            if (!proof.verdict.confirmed) {
+              return summarizeGuardianVerifyOutcome({ ...proof.verdict, ...v8Meta })
+            }
             const persisted = this.persistAgentScriptProof({
               run: curRun,
               assignment: job.assignment,
@@ -4762,10 +5024,12 @@ export class Execution {
               runtime,
               title: args.title?.trim() || proof.claimTitle || undefined,
               proof,
-              secrets: currentSecrets(),
+              secrets: [...currentSecrets(), ...vaultScrubDescriptors(runVault)],
             })
+            this.schedulePlanner(curRun.id)
             return summarizeGuardianVerifyOutcome({
               ...proof.verdict,
+              ...v8Meta,
               detail: `${proof.verdict.detail} Finding ${persisted.findingId} cites ${persisted.receiptId ? `ProofReceipt ${persisted.receiptId}` : 'the persisted script proof'} (replay spec ${persisted.replaySpecId}).`
                 .trim(),
             })
@@ -4822,16 +5086,6 @@ export class Execution {
       const sinkKind = parentFacts
         .map(f => (typeof f.data?.sinkKind === 'string' ? f.data.sinkKind : ''))
         .find(Boolean)
-      const preInjectedSkills = selectPreInjectionSkills({
-        profileSkills: specialistConfig.skills,
-        techTags: [...new Set(techTags)],
-        ...(sinkKind ? { sinkKind } : {}),
-        category: step.category,
-        title: step.title,
-        hypothesis: step.hypothesis,
-        limit: 2,
-      })
-
       const confirmedRefs = this.alreadyConfirmedRefs(run)
       const unconfirmedHardSurface = this.reconPlanner.unconfirmedHardSurfaceRefs(run, confirmedRefs)
       const detLeads = this.detLeadSummaries(run)
@@ -4844,6 +5098,21 @@ export class Execution {
         confirmed: confirmedRefs,
         detLeads,
         maxTurns: job.assignment.maxTurns,
+      })
+      const hasHopCheckpoint = Boolean(assignmentBrief && /\b(?:hopCheckpoint|cap:hop_|doNotRediscover)\b/.test(assignmentBrief))
+      const isMultiHopStep = hasHopCheckpoint
+        || step.dependsOnStepIds.length > 0
+        || step.skills.some(s => s === 'multihop-chains' || s === 'chain-primitives' || s.startsWith('chain:'))
+      const preInjectedSkills = selectPreInjectionSkills({
+        profileSkills: specialistConfig.skills,
+        techTags: [...new Set(techTags)],
+        ...(sinkKind ? { sinkKind } : {}),
+        category: step.category,
+        title: step.title,
+        hypothesis: step.hypothesis,
+        ...(hasHopCheckpoint ? { hasHopCheckpoint: true } : {}),
+        ...(isMultiHopStep ? { multiHop: true, hopDepth: Math.max(2, step.dependsOnStepIds.length + 1) } : {}),
+        limit: 2,
       })
       const runTrace = this.ensureRunTrace(run, profiles)
       const assignedTargetRoutes = extractAssignedTargetRoutes({
