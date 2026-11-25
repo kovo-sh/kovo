@@ -3,11 +3,11 @@ Tags: multihop, multi-hop, chaining, chain, capability-ledger, composite-receipt
 Summary: Verify 3-6 hop CompositeProofReceipt chains via ctx.seal_capability, ctx.hmac_sign/jwt_sign, ctx.await_async, and ctx.prove_composite.
 
 ## 1. Quick-Reference Contract
-1. **Origin (No Collusion):** Use `verifiedHops`/`cap:hop_<id>:<slot>`. ALL probe hops run as ONE low-priv/anonymous/derived persona; NEVER `owner`/`admin`/target-tenant on probe arm.
-2. **One-Script End-to-End (No Premature Filing):** Once routes are known, run Stage 1->2->3->4->`ctx.prove_composite` in ONE script; NEVER stop at leaks, job creation, cache prime, or link/token stubs.
+1. **Origin/Tokens:** ONE low-priv/derived probe persona (NEVER `owner`/`admin`); minted token: `kind:"bearer_token"`, `{capability:{handle,target:"bearer"}}`, OMIT `as`.
+2. **One-Script:** Stage 1->2->3->4->`ctx.prove_composite` in ONE script; NEVER stop at leaks, job creation, cache prime, or link/token stubs.
 3. **Helpers:** `ctx.seal_capability`, `ctx.hmac_sign`/`ctx.jwt_sign`, `ctx.await_async`, `ctx.prove_race_burst`.
-4. **Control Order:** Run denied `role:"control"` BEFORE Stage 1 (or fresh sibling entity) for `state_transition_binding` (`cleanSession=true`).
-5. **DAG/Twins:** `ctx.prove_composite` (`fresh_clean_replay`) + `ctx.result`; blocked -> `record_coverage(proofGapReason="invariant_enforced_hardened")`.
+4. **Control/Econ:** Denied `role:"control"` BEFORE Stage 1 (`state_transition_binding`); `economic_conservation`: baseline BEFORE & final AFTER (`baselineReadbackExchangeId`/`finalReadbackExchangeId`).
+5. **DAG/Twins:** All `hops[]` reach `terminalHopId` via `causalEdges[]` (no orphan hops); `fresh_clean_replay`+`ctx.result`; blocked->`invariant_enforced_hardened`.
 
 ## 2. Working from a Pre-Hydrated `hopCheckpoint`
 Your `AssignmentBrief` may include a bounded (`<= 2 KB`) `hopCheckpoint` object:
@@ -24,7 +24,8 @@ Whenever a host-signed HTTP exchange, GraphQL response, SSE event, browser trace
    - Python inputs: `ctx.seal_capability(exchange_or_id, slot, hop_receipt_id=..., json_path=..., header=..., cookie=..., regex=..., value=..., kind=..., ttl_ms=..., default_header_name=..., default_cookie_name=..., allowed_origins=...)`.
    - Output: `{ handle, meta, exchangeId, sealExchangeId, scrubbedPreview }` where `handle` is opaque `cap:hop_<id>:<slot>` and `meta.sha256Prefix` holds the truncated digest (raw bytes remain host-side and are scrubbed from prompts/transcripts).
 2. Inject the sealed capability into Hop `k+1` via Layer-1 request options: `ctx.http_send(target, { capability: "cap:hop_<id>:<slot>", capabilityTarget?: "bearer" | "header" | "cookie" | "url", capabilityHeaderName?, capabilityCookieName?, capabilityQueryParam?, role: "probe" })` (or `{ capability: { handle, target?, headerName?, cookieName?, queryParam? } }`).
-3. Layer 1 performs the injection host-side and records `consumedCapabilityId` in the host-signed transcript, enabling deterministic `value_binding` verification.
+3. **Derived Session Token Injection Rule:** Whenever Hop `k` mints or exchanges a session token or bearer credential, seal it with `kind: "bearer_token"` and send Hop `k+1` with `{ capability: { handle, target: "bearer" }, role: "probe" }` (or `{ headers: { Authorization: "Bearer " + handle }, role: "probe" }`) and **OMIT `as` / `persona`** so the derived session authenticates cleanly without being confused with or overwritten by a pre-seeded persona.
+4. Layer 1 performs the injection host-side and records `consumedCapabilityId` in the host-signed transcript, enabling deterministic `value_binding` verification.
 
 ## 4. Host-Side Cryptographic Derivation (`ctx.hmac_sign` / `ctx.jwt_sign`)
 When a multi-hop workflow requires signing a webhook body, token, or request with a sealed `hmac_key` / `signing_salt` (`cap:hop_<id>:<slot>`), stay in the **same script** after sealing Hop 1–2 and execute Hops 3–5 directly:
@@ -147,8 +148,9 @@ await ctx.prove_composite({
 return ctx.result({ title: '4-hop cross-service signing and async export pivot' })
 ```
 
-### The 4 Typed Causal Edge Bindings
-Every non-root hop must connect causally via host-signed transcript evidence:
+### The 4 Typed Causal Edge Bindings & Connected-DAG Rule (`dag_topology`)
+- **Connected-DAG Rule (`dag_topology`):** Every hop listed in `hops[]` MUST be connected by `causalEdges[]` on a directed path reaching `terminalImpact.terminalHopId`. NEVER include unused or orphan exploratory hops in `hops[]` — keep baseline reads, pre-chain controls, and ablation probes in `preChainControlExchangeIds`, `postChainReadbackExchangeIds`, `ablationExchangeIds`, or `terminalImpact.oracleInput` rather than listing disconnected hops in `hops[]`.
+- Every non-root hop must connect causally via host-signed transcript evidence:
 1. **`value_binding`:** `{ kind: "value_binding", fromHopId, toHopId, capabilityHandle?, valueDigest?, sourceExchangeId?, targetExchangeId? }` — verbatim `cap:hop_<id>:<slot>` handle or `sha256(extractedValue)` observed in Hop `i` output and injected into Hop `j` request (`t_i <= t_j`).
 2. **`derived_crypto_binding`:** `{ kind: "derived_crypto_binding", fromHopId, toHopId, sourceCapabilityId, derivedCapabilityId?, alg? }` — backed by a host-signed `derivedFromCapabilityId` attestation from `ctx.hmac_sign`, `ctx.jwt_sign`, or host-tracked token exchange.
 3. **`state_transition_binding`:** `{ kind: "state_transition_binding", fromHopId, toHopId, entityId, ablationExchangeIds: [cleanAblation.exchangeId], mutationKind? }` — Hop `i` mutates shared entity/cache state without issuing a new token; **`ablationExchangeIds` is MANDATORY** and must prove in a clean session (`cleanSession=true`) that running Hop `j` *without* Hop `i` fails cleanly (`401`/`403`/`404`/`409`/`412`/`422`), whereas `Hop i -> Hop j` succeeds. **Clean-Control Order Rule:** ALWAYS execute `const cleanAblation = await ctx.http_send('/api/v1/target', { as: 'member_b', role: 'control', entityId })` **BEFORE** Stage 1 mutates shared/cache state (or against a fresh untouched sibling entity with matching `entityId`) — running the control *after* Stage 1 marks the session dirty (`cleanSession=false`) and fails `state_transition_binding`.
@@ -170,7 +172,41 @@ Every non-root hop must connect causally via host-signed transcript evidence:
 Verify terminal impact against the applicable invariant family:
 - `dual_tenant_abac`: cross-tenant / dual-org role matrix violations or partial-authz batch operations.
 - `temporal_revocation`: revoked/demoted credential denied (`401`/`403`) on primary surface yet honored on a secondary surface (SSE, async export, stale invite).
-- `economic_conservation`: host-verified baseline -> sequence -> readback conservation violation (excess balance, refund > paid, unauthorized discount).
+- `economic_conservation`: host-verified baseline -> sequence -> readback conservation violation (`balance_minting`, `over_refund`, `underpaid_fulfillment`, `ineligible_discount`). **Required 3-step Baseline + Final Readback Pattern:**
+  1. Read baseline balance/state **BEFORE** the chain (`role: "control"`), citing its `exchangeId` in `preChainControlExchangeIds` and `terminalImpact.oracleInput.baselineReadbackExchangeId`.
+  2. Execute the mutating or race hops (`ctx.http_send` / `ctx.prove_race_burst`), citing their `exchangeId`s in `oracleInput.actionExchangeIds`.
+  3. Read final balance/state **AFTER** the chain, citing its `exchangeId` in `postChainReadbackExchangeIds` and `terminalImpact.oracleInput.finalReadbackExchangeId`, and pass `{ equation, balancesBefore/balancesAfter/authorizedDeposits` (or `paidAmount`/`refundedAmounts`, `paidAmount`/`fulfilledValue`/`fulfillmentState`, `subtotalAmount`/`requiredThreshold`/`discountApplied`), `baselineReadbackExchangeId, finalReadbackExchangeId, actionExchangeIds }` in `terminalImpact.oracleInput` — the host automatically hydrates the host-signed `HostSignedRecord` objects directly from those exchange IDs (never fabricate `hostSignature` in script code).
+
+```ts
+// Economic conservation pattern (balance_minting / over_refund / underpaid_fulfillment / ineligible_discount)
+const base = await ctx.http_send('/api/v1/ledger/balance', { as: 'member_b', role: 'control' })
+const act1 = await ctx.http_send('/api/v1/ledger/credit', { method: 'POST', as: 'member_b', role: 'probe', body: { amount: 100 } })
+const after = await ctx.http_send('/api/v1/ledger/balance', { as: 'member_b', role: 'control' })
+await ctx.prove_composite({
+  chainId: 'chain-econ-conservation-1',
+  terminalVulnClass: 'economic_conservation',
+  replayMode: 'fresh_clean_replay',
+  hops: [
+    { hopId: 'hop_1', surface: 'http', target: { origin: ctx.targetOrigin, method: 'POST', pathAndQuery: '/api/v1/ledger/credit' }, exchangeIds: [act1.exchangeId], claimedDelta: 'Unconserved credit/payout executed.', producedCapabilities: [], consumedCapabilities: [] },
+  ],
+  causalEdges: [],
+  terminalImpact: {
+    terminalHopId: 'hop_1',
+    claimedImpact: 'Final balance exceeds baseline + authorizedDeposits.',
+    preChainControlExchangeIds: [base.exchangeId],
+    postChainReadbackExchangeIds: [after.exchangeId],
+    oracleInput: {
+      equation: 'balance_minting',
+      balancesBefore: { acct: base.json?.balance ?? 0 },
+      balancesAfter: { acct: after.json?.balance ?? 0 },
+      authorizedDeposits: 0,
+      baselineReadbackExchangeId: base.exchangeId,
+      finalReadbackExchangeId: after.exchangeId,
+      actionExchangeIds: [act1.exchangeId],
+    },
+  },
+})
+```
 - `cryptographic_scope_replay`: tampered signature denied, valid `(tenantB, scopeB)` signature accepted under `(tenantA, scopeA)`.
 - `parser_cache_differential`: clean control denied, parser-differential or cache-primed sequence succeeds.
 - `cross_surface_pivot`: multi-surface chain spanning API/GraphQL, browser/review-bot traces, webhook/worker SSRF, or IdP redirects.
