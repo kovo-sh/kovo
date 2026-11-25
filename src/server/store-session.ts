@@ -717,8 +717,14 @@ export function safeJsonParse<T>(raw: string, fallback: T): T {
   }
 }
 
+/** Minimum SQLite `busy_timeout` (ms) enforced when high-concurrency Phase-B workers run. */
+export const HIGH_CONCURRENCY_SQLITE_BUSY_TIMEOUT_MS = 15_000
+
+const busyRetrySleepBuffer = new Int32Array(new SharedArrayBuffer(4))
+
 /** Bounded synchronous retry wrapper for transient SQLite BUSY/LOCKED errors. */
-export function withBusyRetry<T>(fn: () => T, maxAttempts = 3): T {
+export function withBusyRetry<T>(fn: () => T, maxAttempts = 6, baseBackoffMs = 5): T {
+  const attempts = Math.max(1, Math.floor(maxAttempts))
   let attempt = 0
   for (;;) {
     try {
@@ -727,7 +733,11 @@ export function withBusyRetry<T>(fn: () => T, maxAttempts = 3): T {
       attempt += 1
       const message = error instanceof Error ? error.message : String(error)
       const isBusy = /SQLITE_BUSY|database is locked/i.test(message)
-      if (!isBusy || attempt >= maxAttempts) throw error
+      if (!isBusy || attempt >= attempts) throw error
+      if (baseBackoffMs > 0) {
+        const delayMs = Math.min(100, Math.max(1, Math.floor(baseBackoffMs * attempt)))
+        try { Atomics.wait(busyRetrySleepBuffer, 0, 0, delayMs) } catch { /* ignore on restricted runtimes */ }
+      }
     }
   }
 }
@@ -893,6 +903,7 @@ export interface DbSession {
   readonly isFlushing: boolean
   transaction<T>(fn: () => T, options?: { behavior?: 'deferred' | 'immediate' | 'exclusive' }): T
   operate<Result extends { id: string }>(input: { requestId: string }, apply: () => Result): Result
+  ensureHighConcurrencyPragmas(minBusyTimeoutMs?: number): { journalMode: string; busyTimeoutMs: number }
   flushNow(): void
   enqueueExchange(item: PendingExchangeWrite): void
   tableExists(table: string): boolean
@@ -1057,6 +1068,32 @@ export class StoreSession implements DbSession {
   }
 
   /**
+   * Ensure SQLite WAL mode and a `busy_timeout >= minBusyTimeoutMs` (default 15s) are active
+   * before high-concurrency Phase-B worker pools write events, facts, exchanges, and findings.
+   */
+  ensureHighConcurrencyPragmas(minBusyTimeoutMs = HIGH_CONCURRENCY_SQLITE_BUSY_TIMEOUT_MS): {
+    journalMode: string
+    busyTimeoutMs: number
+  } {
+    const targetTimeout = clampInteger(minBusyTimeoutMs, 10_000, 60_000)
+    const journalRow = this.client.prepare('PRAGMA journal_mode').get() as { journal_mode?: string } | undefined
+    let journalMode = String(journalRow?.journal_mode ?? '').toLowerCase()
+    if (journalMode && journalMode !== 'wal' && journalMode !== 'memory') {
+      withBusyRetry(() => this.client.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;'))
+      const updated = this.client.prepare('PRAGMA journal_mode').get() as { journal_mode?: string } | undefined
+      journalMode = String(updated?.journal_mode ?? journalMode).toLowerCase()
+    }
+    const busyRow = this.client.prepare('PRAGMA busy_timeout').get() as { timeout?: number } | undefined
+    let busyTimeoutMs = Number(busyRow?.timeout ?? 0)
+    if (!Number.isFinite(busyTimeoutMs) || busyTimeoutMs < targetTimeout) {
+      withBusyRetry(() => this.client.exec(`PRAGMA busy_timeout = ${targetTimeout};`))
+      const updatedBusy = this.client.prepare('PRAGMA busy_timeout').get() as { timeout?: number } | undefined
+      busyTimeoutMs = Number(updatedBusy?.timeout ?? targetTimeout)
+    }
+    return { journalMode, busyTimeoutMs }
+  }
+
+  /**
    * Durably flush every queued exchange write. Called by tests, teardown, snapshot capture and
    * every read-after-write path (`getExchange`, `runDetail`, `searchExchanges`, report authoring).
    * Safe to call repeatedly; a no-op when the queue is empty.
@@ -1073,10 +1110,10 @@ export class StoreSession implements DbSession {
     const batch = this.pendingExchanges.splice(0, this.pendingExchanges.length)
     this._flushing = true
     try {
-      this.client.exec('BEGIN IMMEDIATE')
+      withBusyRetry(() => this.client.exec('BEGIN IMMEDIATE'))
       try {
         this.applyExchangeBatch(batch)
-        this.client.exec('COMMIT')
+        withBusyRetry(() => this.client.exec('COMMIT'))
       } catch (error) {
         try { this.client.exec('ROLLBACK') } catch { /* ignore */ }
         this.pendingExchanges.unshift(...batch)
@@ -1176,10 +1213,15 @@ export class StoreSession implements DbSession {
       // Preserve write ordering: never open a transaction while exchange writes are pending.
       this.flushNow()
       this._txDepth += 1
-      this.client.exec('BEGIN IMMEDIATE')
+      try {
+        withBusyRetry(() => this.client.exec('BEGIN IMMEDIATE'))
+      } catch (error) {
+        this._txDepth -= 1
+        throw error
+      }
       try {
         const result = fn()
-        this.client.exec('COMMIT')
+        withBusyRetry(() => this.client.exec('COMMIT'))
         return result
       } catch (error) {
         try { this.client.exec('ROLLBACK') } catch { /* ignore */ }
@@ -1239,9 +1281,9 @@ export class StoreSession implements DbSession {
   }
 
   event(runId: string | null, kind: string, message: string, detail: Record<string, unknown> = {}) {
-    const inserted = this.db.insert(tables.events).values({
+    const inserted = withBusyRetry(() => this.db.insert(tables.events).values({
       workspaceId: this.workspace.id, runId, kind, message: redact(message), detail, createdAt: Date.now(),
-    }).returning().get()
+    }).returning().get())
     const payload: RunEventPayload = {
       id: inserted.id,
       kind: inserted.kind,

@@ -142,7 +142,11 @@ import {
   isDetLeadDispatchStep,
   isMultiHopChainStep,
   planRoundRobinDispatch,
+  PHASE_B_MIN_CONCURRENCY_FLOOR,
+  PhaseBConcurrencyController,
+  parseEnvPhaseBConcurrencyOverride,
   resolveEffectivePhaseBConcurrency,
+  type PhaseBConcurrencySnapshot,
   countConsecutiveDrySteps,
   computeHostTiers,
   computeStepMaxTurns,
@@ -256,6 +260,8 @@ export interface ExecutionOptions {
   agentRequestBudget?: number
   /** Optional per-assignment wall-clock cap override (primarily for deterministic rotation tests). */
   assignmentWallClockOverrideMs?: number
+  /** Optional explicit Phase-B worker concurrency override (takes precedence over dynamic AIMD). */
+  workerConcurrencyOverride?: number
 }
 
 export type ExecutionCheckpoint = 'phase0' | 'deterministic-lane' | 'post-floor' | 'planner-round'
@@ -542,6 +548,9 @@ export class Execution {
   private readonly runTraces = new Map<string, AgentTrace>()
   private readonly onCheckpoint?: (event: { runId: string; checkpoint: ExecutionCheckpoint }) => void
   private readonly assignmentWallClockOverrideMs?: number
+  private readonly workerConcurrencyOverride?: number
+  /** runId → dynamic AIMD Phase-B worker concurrency controller (ceiling 12 on 16c/11GiB hosts). */
+  private readonly phaseBControllers = new Map<string, PhaseBConcurrencyController>()
   /** v5 M5: chain-scoped warm specialist lifecycle (pure in-memory; mirrored to board_members). */
   private readonly warm = new WarmSpecialistController()
   /** v6 staging counters (per run): tagged mutations, locally skipped untaggable probes, cleanup. */
@@ -580,6 +589,10 @@ export class Execution {
     this.onCheckpoint = options.onCheckpoint
     const wallOverride = Number(options.assignmentWallClockOverrideMs)
     this.assignmentWallClockOverrideMs = Number.isFinite(wallOverride) && wallOverride > 0 ? Math.max(1, Math.floor(wallOverride)) : undefined
+    const concOverride = Number(options.workerConcurrencyOverride)
+    this.workerConcurrencyOverride = Number.isFinite(concOverride) && concOverride > 0
+      ? Math.max(1, Math.min(maxWorkerConcurrency, Math.floor(concOverride)))
+      : undefined
     this.phaseRequestBudgets = resolvePhaseRequestBudgets({
       ...(options.floorRequestBudget !== undefined ? { floorRequestBudget: options.floorRequestBudget } : {}),
       ...(options.agentRequestBudget !== undefined ? { agentRequestBudget: options.agentRequestBudget } : {}),
@@ -759,6 +772,7 @@ export class Execution {
   start() {
     if (this.safetyTimer) return
     this.stopped = false
+    try { this.storage.session.ensureHighConcurrencyPragmas() } catch { /* pragmas are best-effort */ }
     if (this.isCanaryListenerConfigured()) {
       void this.canaryBroker.startListener({ enableDns: this.isCanaryDnsConfigured() }).catch(() => undefined)
     }
@@ -852,6 +866,7 @@ export class Execution {
       try { trace.closeTrace() } catch { /* tracing must never break shutdown */ }
     }
     this.runTraces.clear()
+    this.phaseBControllers.clear()
     this.agenticLaneJobs.clear()
     this.agenticLaneStopping.clear()
     this.personaAuth.stopAll()
@@ -1135,6 +1150,9 @@ export class Execution {
       },
       audit: (outcome, origin, status) => {
         if (outcome === 'allowed') job.origins.add(origin)
+        const ctrl = this.phaseBControllers.get(run.id)
+        if (ctrl && outcome === 'observed' && typeof status === 'number') ctrl.recordTargetOutcome(status)
+        if (ctrl && outcome === 'circuit_open') ctrl.recordPressure('target_503')
         this.storage.event(run.id, 'broker.' + outcome,
           `Broker ${outcome} for ${new URL(origin).hostname}${status ? ` (${status})` : ''}.`,
           { assignmentId: job.assignment.id, origin, status })
@@ -3157,18 +3175,29 @@ export class Execution {
     const configuredConc = Math.max(1, Math.min(maxWorkerConcurrency, run.workerConcurrency || defaultWorkerConcurrency))
     const readyPrimarySteps = readySteps.filter(step => !(typeof step.trialIndex === 'number' && step.trialIndex > 0)).length
     const readyChainSteps = readySteps.filter(step => isMultiHopChainStep(step)).length
-    const maxConc = resolveEffectivePhaseBConcurrency({
-      configuredConcurrency: configuredConc,
-      readyPrimarySteps,
-      readyChainSteps,
-      budgetUsdRemaining: Math.max(0, run.budgetUsd - run.spentUsd),
-      budgetRequestsRemaining: Math.max(0, run.budgetRequests - run.spentRequests),
-      maxRpsPerOrigin: run.maxRpsPerOrigin,
-    })
+    const activeForRun = [...this.active.values()].filter(j => j.assignment.runId === run.id && j.assignment.phase === 'investigation').length
+    const budgetUsdRemaining = Math.max(0, run.budgetUsd - run.spentUsd)
+    const budgetRequestsRemaining = Math.max(0, run.budgetRequests - run.spentRequests)
+    const controller = this.phaseBControllerFor(run)
+    const explicitOverride = this.workerConcurrencyOverride ?? parseEnvPhaseBConcurrencyOverride()
+    const tightControlBounds = run.maxRpsPerOrigin < PHASE_B_MIN_CONCURRENCY_FLOOR
+      || budgetRequestsRemaining < PHASE_B_MIN_CONCURRENCY_FLOOR * 10
+      || (configuredConc === 1 && readyPrimarySteps + activeForRun < PHASE_B_MIN_CONCURRENCY_FLOOR && !(readyChainSteps >= 1 && readyPrimarySteps + activeForRun >= 2))
+    const maxConc = explicitOverride !== undefined
+      ? explicitOverride
+      : tightControlBounds
+        ? resolveEffectivePhaseBConcurrency({
+            configuredConcurrency: configuredConc,
+            readyPrimarySteps,
+            readyChainSteps,
+            budgetUsdRemaining,
+            budgetRequestsRemaining,
+            maxRpsPerOrigin: run.maxRpsPerOrigin,
+          })
+        : controller.getEffectiveConcurrency({ remainingBudgetUsd: budgetUsdRemaining })
     // One warm session container per worker slot: assignments reuse stopped containers instead of
     // paying a cold `container create` each dispatch.
     try { this.backend.setWarmCapacity?.(maxConc) } catch { /* pooling is best-effort */ }
-    const activeForRun = [...this.active.values()].filter(j => j.assignment.runId === run.id && j.assignment.phase === 'investigation').length
     // Honest Phase-B termination: once the agent allowance is gone, dispatch stops and the phase
     // ends as `agent_budget_exhausted` even when ready steps remain (they cannot afford a request).
     // In-flight assignments keep their lease; the handoff waits for them to settle.
@@ -3207,11 +3236,20 @@ export class Execution {
       hostTiers,
       tierALeadIds: this.tierAStepIds,
     })
-    let dispatched = 0
+    const activeStepIds = new Set(
+      [...this.active.values()]
+        .filter(job => job.assignment.runId === run.id && job.assignment.phase === 'investigation' && typeof job.assignment.stepId === 'string')
+        .map(job => job.assignment.stepId!),
+    )
+    const dispatchedStepIds: string[] = []
+    const dispatchedSet = new Set<string>()
     for (const step of dispatchPlan.ordered) {
+      if (activeStepIds.has(step.id) || dispatchedSet.has(step.id)) continue
+      dispatchedSet.add(step.id)
       this.startInvestigationStep(run, step, profiles)
-      dispatched += 1
+      dispatchedStepIds.push(step.id)
     }
+    const dispatched = dispatchedStepIds.length
     if (dispatched > 0) {
       try {
         this.storage.event(
@@ -3225,6 +3263,7 @@ export class Execution {
             slots,
             effectiveConcurrency: maxConc,
             configuredConcurrency: configuredConc,
+            aimd: controller.snapshot(budgetUsdRemaining),
             readySteps: readySteps.length,
             readyChainSteps,
             activeChainCount,
@@ -3233,7 +3272,7 @@ export class Execution {
             activeLeadCount,
             leadConcurrentCap: DET_LEAD_CONCURRENT_CAP,
             deferredLeads: dispatchPlan.deferredLeads,
-            stepIds: dispatchPlan.ordered.slice(0, dispatched).map(step => step.id),
+            stepIds: dispatchedStepIds,
           },
         )
       } catch { /* telemetry is best-effort */ }
@@ -3553,7 +3592,16 @@ export class Execution {
 
     this.postCoordinatorBrief(run, effectiveStep, boardHandle, targetOrigins)
 
+    let workerErrored = false
     void this.runInvestigationWorker(job, effectiveStep, targetOrigins, profiles, budget).catch(error => {
+      workerErrored = true
+      const msg = error instanceof Error ? error.message : String(error)
+      const ctrl = this.phaseBControllers.get(run.id)
+      if (ctrl) {
+        if (/\b429\b|rate[\s_-]?limit/i.test(msg)) ctrl.recordPressure('llm_429')
+        else if (/docker|container|openSession|spawn|EAGAIN|ENOMEM/i.test(msg)) ctrl.recordPressure('container_spawn_error')
+        else if (/timeout|timed out|ETIMEDOUT/i.test(msg)) ctrl.recordPressure('target_timeout')
+      }
       this.workerRunner.handleInvestigationWorkerError(run, job, effectiveStep, resolvedSpecialistId, budget, error)
     }).finally(() => {
       this.active.delete(assignment.id)
@@ -3563,7 +3611,14 @@ export class Execution {
       let shouldPlan = true
       try {
         const latestRun = this.storage.run(run.id)
-        const maxConc = Math.max(1, Math.min(maxWorkerConcurrency, latestRun.workerConcurrency || defaultWorkerConcurrency))
+        const ctrl = this.phaseBControllers.get(run.id)
+        const remainingUsd = Math.max(0, latestRun.budgetUsd - latestRun.spentUsd)
+        if (ctrl && !workerErrored && !job.stallAbort) {
+          ctrl.recordCleanCompletion({ remainingBudgetUsd: remainingUsd })
+        }
+        const maxConc = ctrl
+          ? ctrl.getEffectiveConcurrency({ remainingBudgetUsd: remainingUsd })
+          : Math.max(1, Math.min(maxWorkerConcurrency, latestRun.workerConcurrency || defaultWorkerConcurrency))
         const readySteps = this.storage.listChainSteps(run.id, latestRun.goalRevision)
           .filter(s => s.status === 'ready').length
         const newFact = this.storage.listFacts(run.id, { includeTainted: false, limit: 500 }).length > baselineFacts
@@ -3573,6 +3628,31 @@ export class Execution {
       if (shouldPlan) this.schedulePlanner(run.id)
       this.scheduleWake()
     })
+  }
+
+  private phaseBControllerFor(run: Run): PhaseBConcurrencyController {
+    let controller = this.phaseBControllers.get(run.id)
+    if (!controller) {
+      const explicitCeiling = run.workerConcurrency > defaultWorkerConcurrency ? run.workerConcurrency : undefined
+      controller = new PhaseBConcurrencyController({
+        ...(this.workerConcurrencyOverride !== undefined ? { explicitOverride: this.workerConcurrencyOverride } : {}),
+        ...(explicitCeiling !== undefined ? { ceiling: explicitCeiling } : {}),
+      })
+      this.phaseBControllers.set(run.id, controller)
+    }
+    return controller
+  }
+
+  /** Read-only snapshot of the run's dynamic AIMD Phase-B concurrency controller. */
+  getPhaseBConcurrencySnapshot(runId: string): PhaseBConcurrencySnapshot | undefined {
+    const controller = this.phaseBControllers.get(runId)
+    if (!controller) return undefined
+    try {
+      const run = this.storage.run(runId)
+      return controller.snapshot(Math.max(0, run.budgetUsd - run.spentUsd))
+    } catch {
+      return controller.snapshot()
+    }
   }
 
   private buildBrokeredTransportHandlers(ctx: ExecBrokeredTransportContext): Partial<WorkerToolHandlers> {
