@@ -55,7 +55,9 @@ import {
   deleteRunWithActiveGuard,
   store,
 } from './server/store.ts'
+import type { Store } from './server/store.ts'
 import { runDiscoverySubdomainsForRun } from './server/subdomain-discovery.ts'
+import type { RunDiscoverySubdomainsResult } from './server/subdomain-discovery.ts'
 import { readWorkerSession, resolvePrimaryLabRepoDir, testPersonaAuth } from './server/worker-session-reader.ts'
 
 export const workspaceData = createServerFn({ method: 'GET' }).handler(() => {
@@ -343,13 +345,111 @@ export const readWorkerSessionAction = createServerFn({ method: 'GET' })
 
 // --- Runs, Commands, Exchanges, Artifacts & Reports ---
 
+export const SUBDOMAIN_DISCOVERY_TIMEOUT_MS = 30_000
+
+/** True when a `discovery.subdomains_started` event has no subsequent `discovery.subdomains_discovered`. */
+export function isSubdomainDiscoveryPendingFromEvents(
+  events: readonly { id: number; kind: string }[],
+): boolean {
+  let lastStartedId = -1
+  let lastDiscoveredId = -1
+  for (const ev of events) {
+    if (ev.kind === 'discovery.subdomains_started' && ev.id > lastStartedId) lastStartedId = ev.id
+    if (ev.kind === 'discovery.subdomains_discovered' && ev.id > lastDiscoveredId) lastDiscoveredId = ev.id
+  }
+  return lastStartedId > lastDiscoveredId
+}
+
+/**
+ * Emit `discovery.subdomains_started` and execute subdomain discovery asynchronously in the
+ * background so navigation returns immediately. Always guarantees a matching
+ * `discovery.subdomains_discovered` event on completion, skip, or error.
+ */
+export function launchSubdomainDiscoveryInBackground(
+  db: Store,
+  runId: string,
+  runDiscovery: () => Promise<RunDiscoverySubdomainsResult>,
+  timeoutMs = SUBDOMAIN_DISCOVERY_TIMEOUT_MS,
+): Promise<void> {
+  let startedEventId = 0
+  try {
+    db.event(
+      runId,
+      'discovery.subdomains_started',
+      'Discovering subdomains in the background (CT logs + DNS)…',
+      { timeoutMs },
+    )
+    const recent = db.eventsAfter(runId, 0, 1000)
+    startedEventId = recent.at(-1)?.id ?? 0
+  } catch {
+    // Store may be unavailable; still return a resolved promise so callers never reject.
+    return Promise.resolve()
+  }
+
+  return Promise.resolve()
+    .then(() => runDiscovery())
+    .then(result => {
+      try {
+        const after = db.eventsAfter(runId, startedEventId, 100)
+        if (!after.some(ev => ev.kind === 'discovery.subdomains_discovered')) {
+          db.event(
+            runId,
+            'discovery.subdomains_discovered',
+            result.skipped
+              ? `Subdomain discovery skipped (${result.reason ?? 'ineligible'}).`
+              : `Subdomain discovery finished (${result.addedOrigins.length} newly added).`,
+            {
+              skipped: result.skipped,
+              reason: result.reason ?? null,
+              discoveredCount: result.discovery.discovered.length,
+              addedCount: result.addedOrigins.length,
+              thirdPartyCount: result.thirdPartyOrigins.length,
+              addedOrigins: result.addedOrigins,
+              thirdPartyOrigins: result.thirdPartyOrigins,
+              warnings: result.discovery.warnings,
+            },
+          )
+        }
+      } catch {
+        // Store may have closed before background discovery settled.
+      }
+    })
+    .catch(err => {
+      try {
+        db.event(
+          runId,
+          'discovery.subdomains_discovered',
+          `Subdomain discovery finished with warning: ${err instanceof Error ? err.message : String(err)}`,
+          {
+            error: err instanceof Error ? err.message : String(err),
+            discoveredCount: 0,
+            addedCount: 0,
+            thirdPartyCount: 0,
+            addedOrigins: [],
+            thirdPartyOrigins: [],
+          },
+        )
+      } catch {
+        // Store may have closed before background discovery rejected.
+      }
+    })
+}
+
 export const runData = createServerFn({ method: 'GET' })
   .validator(z.object({ runId: id }))
   .handler(({ data }) => {
     const db = store()
     const detail = db.runDetail(data.runId)
+    const subdomainDiscoveryPending = detail.run.phase === 'review'
+      ? isSubdomainDiscoveryPendingFromEvents(db.eventsAfter(data.runId, 0, 1000))
+      : false
+    const includeSubdomainOrigins = db.projectDetail(detail.run.projectId).assets
+      .filter(a => a.includeSubdomains && !a.thirdParty)
+      .map(a => a.origin)
     return {
       ...detail,
+      subdomainDiscoveryPending,
+      includeSubdomainOrigins,
       labTarget: serializeLabTarget(execution().labRunner.getTarget(data.runId)),
       localLabEnvEnabled: isLocalLabEnvEnabled(),
       hasModel: modelReady(db),
@@ -375,13 +475,52 @@ export const createRun = createServerFn({ method: 'POST' }).validator(newRun)
           action: 'discover',
           consent: true,
         })
-        await runDiscoverySubdomainsForRun(db, created.id, { timeoutMs: 15_000 })
+        void launchSubdomainDiscoveryInBackground(
+          db,
+          created.id,
+          () => runDiscoverySubdomainsForRun(db, created.id, { timeoutMs: SUBDOMAIN_DISCOVERY_TIMEOUT_MS }),
+          SUBDOMAIN_DISCOVERY_TIMEOUT_MS,
+        )
       }
     } catch {
       // Auto-discovery must never fail run creation; the run still exists and can be reviewed/discovered.
     }
     return created
   })
+
+/** Testable core for `createRun` instant navigation + non-blocking async subdomain discovery. */
+export function createRunWithAsyncDiscovery(
+  db: Store,
+  data: z.infer<typeof newRun>,
+  options: {
+    discover: typeof runDiscoverySubdomainsForRun
+    timeoutMs?: number
+  },
+): { created: ReturnType<Store['createRun']>; discoveryPromise: Promise<void> | null } {
+  const created = db.createRun(data)
+  let discoveryPromise: Promise<void> | null = null
+  try {
+    const run = db.run(created.id)
+    if (run.phase === 'consent' && run.status === 'waiting') {
+      db.command({
+        requestId: globalThis.crypto.randomUUID(),
+        runId: created.id,
+        action: 'discover',
+        consent: true,
+      })
+      const timeoutMs = options.timeoutMs ?? SUBDOMAIN_DISCOVERY_TIMEOUT_MS
+      discoveryPromise = launchSubdomainDiscoveryInBackground(
+        db,
+        created.id,
+        () => options.discover(db, created.id, { timeoutMs }),
+        timeoutMs,
+      )
+    }
+  } catch {
+    // Auto-discovery must never fail run creation; the run still exists and can be reviewed/discovered.
+  }
+  return { created, discoveryPromise }
+}
 
 export const removeRun = createServerFn({ method: 'POST' })
   .validator(z.object({
@@ -405,11 +544,12 @@ export const commandRun = createServerFn({ method: 'POST' }).validator(runComman
     })()
     const result = db.command(data, data.action !== 'message' || modelReady())
     if (shouldDiscoverSubdomains) {
-      try {
-        await runDiscoverySubdomainsForRun(db, data.runId, { timeoutMs: 15_000 })
-      } catch {
-        // Passive subdomain discovery must never fail the discover command.
-      }
+      void launchSubdomainDiscoveryInBackground(
+        db,
+        data.runId,
+        () => runDiscoverySubdomainsForRun(db, data.runId, { timeoutMs: SUBDOMAIN_DISCOVERY_TIMEOUT_MS }),
+        SUBDOMAIN_DISCOVERY_TIMEOUT_MS,
+      )
     }
     execution().wake()
     return result

@@ -3,7 +3,7 @@
 import { Link } from '@tanstack/react-router'
 import { useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { approvalPolicies, canReviewScope, maxBudgetRequests, maxRpsPerOriginCeiling, maxScopeHosts } from '../../../domain.ts'
+import { canReviewScope, maxBudgetRequests, maxRpsPerOriginCeiling, maxScopeHosts } from '../../../domain.ts'
 import type { ApprovalPolicy, CapabilityTier } from '../../../domain.ts'
 import { approvalPolicyMeta, capabilityTierMeta } from '../../run-state.ts'
 import { Dialog, DialogContent, DialogTitle } from '../../ui/dialog.tsx'
@@ -23,6 +23,22 @@ import { cn, runBtn, RW } from '../tw.ts'
 import { LabPanel } from './lab.tsx'
 
 const PUBLIC_MAX_RPS_CAP = 20
+const MAX_AUTO_SELECT_HOSTS = 30
+const LARGE_HOST_FILTER_THRESHOLD = 8
+
+type ScanModeKey = 'passive' | 'supervised' | 'autonomous'
+
+const SCAN_MODE_OPTIONS: readonly { key: ScanModeKey; label: string; summary: string }[] = [
+  { key: 'passive', label: 'Passive', summary: 'Read-only checks (plus bound test accounts); never mutates state.' },
+  { key: 'supervised', label: 'Supervised', summary: 'Safe active checks automatically; pauses for approval before risky writes.' },
+  { key: 'autonomous', label: 'Autonomous', summary: 'All in-scope active probes automatically with hard safety guardrails enforced.' },
+]
+
+function draftScanMode(d: { capabilityTier: CapabilityTier; approvalPolicy: ApprovalPolicy }): ScanModeKey {
+  if (d.capabilityTier === 3 && d.approvalPolicy === 'yolo') return 'autonomous'
+  if (d.capabilityTier === 3) return 'supervised'
+  return 'passive'
+}
 
 interface Draft {
   assetIds: string[]
@@ -36,23 +52,135 @@ interface Draft {
 
 /**
  * Resolve default checked candidate IDs for scope review.
- * When `projectDefaultScope` is non-empty, explicit project defaults override `!thirdParty`
- * so previously approved third-party hosts stay checked on subsequent runs.
+ * - Honors `run.approved` when `scopeRevision > 0`.
+ * - Preserves saved `projectDefaultScope` hosts (including explicitly approved third-party hosts).
+ * - Does NOT exclude `subdomain_discovery` or `phase0_ct_discovery` hosts via `!a.dnsSource`;
+ *   only bulk BIND DNS zone imports and third-party CNAMEs stay unchecked by default.
+ * - When a parent seed has `includeSubdomains: true`, pre-selects first-party live subdomains
+ *   up to Top 30 ranked by signal (seeds, repo/spec matches, and high-value prefixes first).
  */
 export function defaultScopeAssetIds(
   run: {
     scopeRevision: number
     approved: readonly string[]
-    candidates: readonly { id: string; origin: string; thirdParty: boolean; dnsSource?: unknown }[]
+    candidates: readonly {
+      id: string
+      origin: string
+      source?: string
+      thirdParty: boolean
+      includeSubdomains?: boolean
+      dnsSource?: unknown
+    }[]
   },
   projectDefaultScope: readonly string[],
+  options?: {
+    includeSubdomainOrigins?: readonly string[]
+    maxAutoSelect?: number
+  },
 ): string[] {
   if (run.scopeRevision > 0) return [...run.approved]
+
+  const cap = Math.max(1, Math.min(options?.maxAutoSelect ?? 30, 30))
+
+  const extractHostname = (origin: string): string => {
+    try {
+      return new URL(origin).hostname.toLowerCase().replace(/\.$/, '')
+    } catch {
+      return origin.replace(/^https?:\/\//i, '').replace(/\/.*$/, '').replace(/:\d+$/, '').toLowerCase().replace(/\.$/, '')
+    }
+  }
+
+  const apexForOrigin = (origin: string): string => {
+    const h = extractHostname(origin)
+    return h.startsWith('www.') && h.split('.').length >= 3 ? h.slice(4) : h
+  }
+
+  const isDiscoveredSubdomain = (source?: string): boolean =>
+    source === 'subdomain_discovery' || source === 'phase0_ct_discovery' || source === 'phase0_subdomain_discovery'
+
+  const isBulkDnsImport = (c: { source?: string; dnsSource?: unknown }): boolean =>
+    Boolean(c.dnsSource) && !isDiscoveredSubdomain(c.source)
+
+  const wildcardApexes = new Set<string>()
+  for (const origin of options?.includeSubdomainOrigins ?? []) {
+    const apex = apexForOrigin(origin)
+    if (apex) wildcardApexes.add(apex)
+  }
+  for (const c of run.candidates) {
+    if (c.includeSubdomains && !c.thirdParty) {
+      const apex = apexForOrigin(c.origin)
+      if (apex) wildcardApexes.add(apex)
+    }
+  }
+
+  const matchesWildcardParent = (origin: string): boolean => {
+    if (wildcardApexes.size === 0) return false
+    const h = extractHostname(origin)
+    for (const apex of wildcardApexes) {
+      if (h === apex || h.endsWith(`.${apex}`)) return true
+    }
+    return false
+  }
+
+  const HIGH_VALUE_TIER1 = new Set([
+    'api', 'app', 'auth', 'admin', 'billing', 'oauth', 'sso', 'login', 'portal', 'dashboard', 'console', 'graphql', 'gateway', 'accounts', 'account',
+  ])
+  const HIGH_VALUE_TIER2 = new Set([
+    'www', 'pay', 'payments', 'checkout', 'mcp', 'cloud', 'engine', 'internal', 'staging', 'stage', 'dev', 'beta', 'sandbox', 'studio', 'web', 'my', 'id', 'identity', 'token', 'webhooks', 'webhook',
+  ])
+  const NOISY_SUBDOMAIN_RE = /^(?:pr-\d+|deploy-preview-\d+|preview-\d+|[a-z0-9-]+-\d{3,})(?:\.|$)/i
+
+  const signalRank = (c: { origin: string; source?: string; dnsSource?: unknown }): number => {
+    const src = (c.source ?? '').toLowerCase()
+    if (src === 'project seed' || (!c.dnsSource && !isDiscoveredSubdomain(c.source))) return 1000
+    if (/repo|spec|openapi|swagger|github|graphql/.test(src)) return 850
+    const h = extractHostname(c.origin)
+    const firstLabel = h.split('.')[0] ?? ''
+    if (NOISY_SUBDOMAIN_RE.test(h)) return 50
+    if (HIGH_VALUE_TIER1.has(firstLabel)) return 700
+    if (HIGH_VALUE_TIER2.has(firstLabel)) return 550
+    const depth = h.split('.').length
+    return Math.max(100, 400 - depth * 40)
+  }
+
+  const pickRanked = (
+    list: readonly { id: string; origin: string; source?: string; dnsSource?: unknown }[],
+    limit: number,
+  ): string[] => {
+    if (list.length <= limit) return list.map(c => c.id)
+    const ranked = list
+      .map((c, idx) => ({ id: c.id, score: signalRank(c), idx }))
+      .sort((a, b) => (b.score - a.score) || (a.idx - b.idx))
+      .slice(0, limit)
+    const chosen = new Set(ranked.map(r => r.id))
+    return list.filter(c => chosen.has(c.id)).map(c => c.id)
+  }
+
   if (projectDefaultScope.length > 0) {
     const saved = new Set(projectDefaultScope)
-    return run.candidates.filter(a => saved.has(a.origin)).map(a => a.id)
+    const savedIds = run.candidates.filter(a => saved.has(a.origin)).map(a => a.id)
+    if (wildcardApexes.size === 0) return savedIds
+    const savedSet = new Set(savedIds)
+    const extraSubs = run.candidates.filter(
+      a => !savedSet.has(a.id) && !a.thirdParty && isDiscoveredSubdomain(a.source) && matchesWildcardParent(a.origin),
+    )
+    const remaining = Math.max(0, cap - savedIds.length)
+    if (remaining === 0 || extraSubs.length === 0) return savedIds
+    return [...savedIds, ...pickRanked(extraSubs, remaining)]
   }
-  return run.candidates.filter(a => !a.thirdParty && !a.dnsSource).map(a => a.id)
+
+  const hasExplicitParentConfig = options?.includeSubdomainOrigins !== undefined
+  const eligible = run.candidates.filter(a => {
+    if (a.thirdParty) return false
+    if (isBulkDnsImport(a)) return false
+    if (isDiscoveredSubdomain(a.source)) {
+      if (wildcardApexes.size > 0) return matchesWildcardParent(a.origin)
+      return !hasExplicitParentConfig
+    }
+    return true
+  })
+
+  return pickRanked(eligible, cap)
 }
 
 /** Hosts and default selection for the scope sheet, per phase. */
@@ -60,20 +188,25 @@ function useScopeModel() {
   const { detail } = useRun()
   const r = detail.run
   const p = detail.project
+  const includeSubdomainOrigins = detail.includeSubdomainOrigins ?? []
   return useMemo(() => {
     const discovery = r.phase === 'consent'
     const hosts = discovery
-      ? p.seeds.map(s => ({ id: s, origin: s, thirdParty: false, source: 'Project seed', externalCname: null as string | null }))
+      ? p.seeds.map(s => ({ id: s, origin: s, thirdParty: false, source: 'Project seed', externalCname: null as string | null, dnsSource: null as unknown }))
       : r.candidates.map(c => ({
         id: c.id,
         origin: c.origin,
         thirdParty: c.thirdParty,
         source: c.source,
         externalCname: c.dnsSource?.externalAliases?.[0] ?? null,
+        dnsSource: c.dnsSource ?? null,
       }))
-    const defaults = defaultScopeAssetIds(r, p.defaultScope)
-    return { discovery, hosts, defaults }
-  }, [r, p])
+    const defaults = defaultScopeAssetIds(r, p.defaultScope, {
+      includeSubdomainOrigins,
+      maxAutoSelect: MAX_AUTO_SELECT_HOSTS,
+    })
+    return { discovery, hosts, defaults, includeSubdomainOrigins }
+  }, [r, p, includeSubdomainOrigins])
 }
 
 function initialDraft(r: ReturnType<typeof useRun>['detail']['run'], defaults: string[], rpsMax: number): Draft {
@@ -109,62 +242,161 @@ function scopeCommand(
   }
 }
 
-const selectClass =
-  'mt-[3px] h-[26px] max-w-full rounded-control border-0 bg-panel px-1.5 font-sans text-[12.5px] font-medium text-fg shadow-hairline outline-none focus:shadow-[0_0_0_1px_var(--accent-line),0_0_0_3px_var(--accent-soft)]'
+/**
+ * Determine whether background subdomain discovery is currently in flight for a run in review.
+ * Combines the `runData` snapshot flag (`initialPending`) with live SSE events so the banner
+ * shows immediately on instant navigation and clears as soon as `discovery.subdomains_discovered` arrives.
+ */
+export function isSubdomainDiscoveryActive(
+  phase: string,
+  initialPending: boolean | undefined,
+  events: readonly { id: number; kind: string }[],
+): boolean {
+  if (phase !== 'review') return false
+  let liveStartedId = -1
+  let liveDiscoveredId = -1
+  for (const ev of events) {
+    if (ev.kind === 'discovery.subdomains_started' && ev.id > liveStartedId) liveStartedId = ev.id
+    if (ev.kind === 'discovery.subdomains_discovered' && ev.id > liveDiscoveredId) liveDiscoveredId = ev.id
+  }
+  if (liveDiscoveredId > liveStartedId) return false
+  if (liveStartedId > liveDiscoveredId) return true
+  return Boolean(initialPending)
+}
 
 /**
- * The scope card: testing mode / test accounts (plus budget / approvals / rate on consent),
- * the host grid, and a footer with the primary action. Editable when `editing`.
+ * The scope card: compact read-only-styled scan config KV bar, target domains & subdomains
+ * checklist (with live discovery banner & search/quick-select bar), bind test accounts section,
+ * and a footer with the primary action.
  */
-function ScopeCard({ editing, draft, setDraft, footer, inDialog = false, scopeOnly = false }: {
+function ScopeCard({
+  editing,
+  draft,
+  setDraft,
+  onHostsTouched,
+  footer,
+  inDialog = false,
+  scopeOnly = false,
+}: {
   editing: boolean
   draft: Draft
   setDraft: (fn: (d: Draft) => Draft) => void
+  onHostsTouched?: () => void
   footer: ReactNode
   inDialog?: boolean
   scopeOnly?: boolean
 }) {
-  const { detail } = useRun()
+  const { detail, events } = useRun()
   const rpsMax = detail.project.environment === 'local-lab' ? maxRpsPerOriginCeiling : PUBLIC_MAX_RPS_CAP
-  const { discovery, hosts } = useScopeModel()
+  const { discovery, hosts, includeSubdomainOrigins } = useScopeModel()
+  const [hostQuery, setHostQuery] = useState('')
+  const [editingBudget, setEditingBudget] = useState(false)
+  const discoveringSubdomains = isSubdomainDiscoveryActive(detail.run.phase, detail.subdomainDiscoveryPending, events)
   const selected = new Set(draft.assetIds)
   const shownHosts = editing || discovery ? hosts : hosts.filter(h => selected.has(h.id))
   const canEditConfig = editing && !discovery
-  const kvItems: [string, ReactNode][] = scopeOnly
-    ? [
-        ['Testing mode', canEditConfig
-          ? <select className={selectClass} value={draft.capabilityTier} onChange={e => setDraft(d => ({ ...d, capabilityTier: Number(e.target.value) as CapabilityTier }))} aria-label="Testing mode">
-            {([0, 1, 2, 3] as const).map(t => <option key={t} value={t}>{capabilityTierMeta[t].name}</option>)}
-          </select>
-          : <span title={capabilityTierMeta[draft.capabilityTier].summary}>{capabilityTierMeta[draft.capabilityTier].name}</span>],
-        ['Test accounts', draft.approvedPersonaIds.length && draft.capabilityTier >= 2 ? plural(draft.approvedPersonaIds.length, 'test account') : 'None (anonymous)'],
-      ]
-    : [
-        ['Testing mode', canEditConfig
-          ? <select className={selectClass} value={draft.capabilityTier} onChange={e => setDraft(d => ({ ...d, capabilityTier: Number(e.target.value) as CapabilityTier }))} aria-label="Testing mode">
-            {([0, 1, 2, 3] as const).map(t => <option key={t} value={t}>{capabilityTierMeta[t].name}</option>)}
-          </select>
-          : <span title={capabilityTierMeta[draft.capabilityTier].summary}>{capabilityTierMeta[draft.capabilityTier].name}</span>],
-        ['Budget', canEditConfig
-          ? <span className="mt-[3px] flex gap-1">
-            <input className={cn(RW.fieldInput, 'num h-[26px] w-[74px]')} type="number" min={0.1} max={500} step="any" value={draft.budgetUsd} aria-label="Budget USD" onChange={e => setDraft(d => ({ ...d, budgetUsd: Number(e.target.value) }))} />
-            <input className={cn(RW.fieldInput, 'num h-[26px] w-[74px]')} type="number" min={0} max={maxBudgetRequests} step={1} value={draft.budgetRequests} aria-label="Request cap (0 = uncapped)" title="Request cap (0 = uncapped)" onChange={e => setDraft(d => ({ ...d, budgetRequests: Number(e.target.value) }))} />
-          </span>
-          : <>{fmtUsd(draft.budgetUsd)} · {draft.budgetRequests ? fmtN(draft.budgetRequests) + ' requests' : 'uncapped requests'}</>],
-        ['Approvals', canEditConfig && draft.capabilityTier === 3
-          ? <select className={selectClass} value={draft.approvalPolicy} onChange={e => setDraft(d => ({ ...d, approvalPolicy: e.target.value as ApprovalPolicy }))} aria-label="Approval policy">
-            {approvalPolicies.map(p => <option key={p} value={p}>{approvalPolicyMeta[p].label}</option>)}
-          </select>
-          : draft.capabilityTier === 3
-            ? <span title={approvalPolicyMeta[draft.approvalPolicy].summary}>{approvalPolicyMeta[draft.approvalPolicy].label}</span>
-            : <span className="font-normal text-fg-subtle" title="Approval policy only applies to Active Testing (Tier 3)">Not needed (read-only)</span>],
-        ['Rate limit', canEditConfig
-          ? <input className={cn(RW.fieldInput, 'num mt-[3px] h-[26px] w-[74px]')} type="number" min={1} max={rpsMax} step={1} value={draft.maxRpsPerOrigin} aria-label="Requests per second per origin" onChange={e => setDraft(d => ({ ...d, maxRpsPerOrigin: Math.min(rpsMax, Math.max(1, Number(e.target.value))) }))} />
-          : <>{Math.min(draft.maxRpsPerOrigin, rpsMax)} req/s per origin</>],
-        ['Test accounts', draft.approvedPersonaIds.length && draft.capabilityTier >= 2 ? plural(draft.approvedPersonaIds.length, 'test account') : 'None (anonymous)'],
-      ]
+  const scanMode = draftScanMode(draft)
+
+  const trimmedQuery = hostQuery.trim().toLowerCase()
+  const filteredHosts = useMemo(() => {
+    if (!trimmedQuery) return hosts
+    return hosts.filter(h =>
+      host(h.origin).toLowerCase().includes(trimmedQuery)
+      || h.origin.toLowerCase().includes(trimmedQuery)
+      || h.source.toLowerCase().includes(trimmedQuery)
+      || (h.externalCname ?? '').toLowerCase().includes(trimmedQuery),
+    )
+  }, [hosts, trimmedQuery])
+
+  const setScanMode = (nextMode: ScanModeKey) => {
+    setDraft(d => {
+      if (nextMode === 'passive') {
+        return {
+          ...d,
+          capabilityTier: d.approvedPersonaIds.length > 0 ? 2 : 1,
+          approvalPolicy: 'auto_review',
+        }
+      }
+      if (nextMode === 'supervised') {
+        return {
+          ...d,
+          capabilityTier: 3,
+          approvalPolicy: d.approvalPolicy === 'strict' ? 'strict' : 'auto_review',
+        }
+      }
+      return {
+        ...d,
+        capabilityTier: 3,
+        approvalPolicy: 'yolo',
+      }
+    })
+  }
+
+  const selectHighSignal = () => {
+    onHostsTouched?.()
+    const ranked = defaultScopeAssetIds(
+      { scopeRevision: 0, approved: [], candidates: detail.run.candidates },
+      [],
+      {
+        includeSubdomainOrigins: includeSubdomainOrigins.length > 0 ? includeSubdomainOrigins : detail.project.seeds,
+        maxAutoSelect: MAX_AUTO_SELECT_HOSTS,
+      },
+    )
+    setDraft(d => ({ ...d, assetIds: ranked }))
+  }
+
+  const selectAllFirstParty = () => {
+    onHostsTouched?.()
+    setDraft(d => ({
+      ...d,
+      assetIds: hosts.filter(h => !h.thirdParty).slice(0, maxScopeHosts).map(h => h.id),
+    }))
+  }
+
+  const selectNone = () => {
+    onHostsTouched?.()
+    setDraft(d => ({ ...d, assetIds: [] }))
+  }
+
+  const toggleHost = (hostId: string, checked: boolean) => {
+    onHostsTouched?.()
+    setDraft(d => ({
+      ...d,
+      assetIds: checked
+        ? (d.assetIds.includes(hostId) ? d.assetIds : [...d.assetIds, hostId])
+        : d.assetIds.filter(x => x !== hostId),
+    }))
+  }
+
+  const togglePersona = (personaId: string, checked: boolean) => {
+    setDraft(d => {
+      const nextPersonas = checked
+        ? (d.approvedPersonaIds.includes(personaId) ? d.approvedPersonaIds : [...d.approvedPersonaIds, personaId])
+        : d.approvedPersonaIds.filter(x => x !== personaId)
+      const nextTier: CapabilityTier = d.capabilityTier === 0
+        ? 0
+        : d.capabilityTier === 3
+          ? 3
+          : nextPersonas.length > 0 ? 2 : 1
+      return { ...d, approvedPersonaIds: nextPersonas, capabilityTier: nextTier }
+    })
+  }
+
+  const modeSummary = scanMode === 'passive'
+    ? capabilityTierMeta[draft.capabilityTier].summary
+    : scanMode === 'supervised'
+      ? approvalPolicyMeta[draft.approvalPolicy === 'strict' ? 'strict' : 'auto_review'].summary
+      : approvalPolicyMeta.yolo.summary
+
+  const compactPillClass = (active: boolean) => cn(
+    'cursor-pointer rounded-[5px] border-0 px-2 py-[2px] font-sans text-[12px] font-medium transition-colors duration-[var(--d1)]',
+    active
+      ? 'bg-panel text-fg shadow-hairline'
+      : 'bg-transparent text-fg-subtle hover:text-fg',
+  )
 
   return <div className={inDialog ? 'overflow-hidden bg-panel' : RW.sheet}>
+    {/* Sheet header */}
     <div className={RW.sheetH}>
       <Icon name="globe" />
       {inDialog
@@ -175,81 +407,251 @@ function ScopeCard({ editing, draft, setDraft, footer, inDialog = false, scopeOn
           ? plural(hosts.length, 'host') + ' from project seeds'
           : `${selected.size} of ${plural(hosts.length, 'discovered host')} selected`}
       </span>
-      {editing && !discovery && <span className="ml-auto flex gap-1">
-        <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={() => setDraft(d => ({ ...d, assetIds: hosts.filter(h => !h.thirdParty).slice(0, maxScopeHosts).map(h => h.id) }))}>First-party</button>
-        <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={() => setDraft(d => ({ ...d, assetIds: [] }))}>Clear</button>
-      </span>}
+      {editing && !discovery && hosts.length <= LARGE_HOST_FILTER_THRESHOLD && (
+        <span className="ml-auto flex gap-1">
+          <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={selectHighSignal}>High-signal</button>
+          <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={selectAllFirstParty}>All first-party</button>
+          <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={selectNone}>None</button>
+        </span>
+      )}
     </div>
+
+    {/* (a) Compact Scan Config KV bar */}
     <div className={cn('num grid border-b border-line', scopeOnly ? 'grid-cols-2' : 'grid-cols-3')}>
-      {kvItems.map(([k, v], i) => (
-        <div
-          key={k}
-          className={cn(
-            'px-4 py-2.5',
-            scopeOnly
-              ? i === 0 && 'border-r border-line'
-              : cn(i % 3 !== 2 && i !== kvItems.length - 1 && 'border-r border-line', i >= 3 && 'border-t border-line', i === 4 && 'col-span-2'),
-          )}
-        >
-          <div className="text-[11.5px] text-fg-subtle">{k}</div>
-          <div className="font-medium text-fg">{v}</div>
-        </div>
-      ))}
-    </div>
-    {canEditConfig && detail.personas.length > 0 && <div className="flex flex-col gap-2 border-t border-line px-4 pb-3 pt-2.5">
-      <span className="text-[12px] text-fg-subtle">Bind test accounts{draft.capabilityTier < 2 ? ' (requires Authenticated or Active mode)' : ''}</span>
-      {detail.personas.map(p => <label key={p.id} className="flex cursor-pointer select-none items-center gap-2 text-[12.5px] text-fg-muted">
-        <input
-          className="m-0 size-[13px] accent-[var(--accent)]"
-          type="checkbox"
-          disabled={draft.capabilityTier < 2}
-          checked={draft.approvedPersonaIds.includes(p.id)}
-          onChange={e => setDraft(d => ({ ...d, approvedPersonaIds: e.target.checked ? [...d.approvedPersonaIds, p.id] : d.approvedPersonaIds.filter(x => x !== p.id) }))}
-        />
-        <b className="font-medium text-fg">{p.handle}</b> · {p.roleLabel}
-      </label>)}
-    </div>}
-    {editing && !discovery
-      ? <div className="grid max-h-[224px] grid-cols-3 overflow-auto p-2 font-mono text-[12px]">
-        {hosts.map(h => {
-          const on = selected.has(h.id)
-          return <label
-            key={h.id}
-            className={cn(
-              'flex cursor-pointer items-center gap-[7px] overflow-hidden whitespace-nowrap rounded-[4px] px-2 py-[3px] hover:bg-hover',
-              on ? 'text-fg-muted' : 'text-fg-faint',
-            )}
-            title={`${h.origin} · ${h.source}`}
-          >
-            <input
-              className="m-0 flex-none accent-[var(--accent)]"
-              type="checkbox"
-              aria-label={'Include ' + host(h.origin)}
-              checked={on}
-              onChange={e => setDraft(d => ({ ...d, assetIds: e.target.checked ? [...d.assetIds, h.id] : d.assetIds.filter(x => x !== h.id) }))}
-            />
-            <span className="truncate">{host(h.origin)}</span>
-            {h.thirdParty && <span className="ml-1 text-[10.5px] text-fg-subtle" title={h.externalCname ? `Third-party CNAME (${h.externalCname}) — unchecked by default` : 'Third-party host — unchecked by default'}>
-              {h.externalCname ? `Third-party CNAME (${h.externalCname})` : '3P'}
-            </span>}
-          </label>
-        })}
+      <div className="border-r border-line px-4 py-2.5">
+        <div className="mb-1 text-[11.5px] text-fg-subtle">Scan mode</div>
+        {canEditConfig
+          ? <div className="inline-flex items-center gap-0.5 rounded-[7px] bg-sunk p-0.5" role="group" aria-label="Scan mode">
+              {SCAN_MODE_OPTIONS.map(opt => (
+                <button
+                  key={opt.key}
+                  type="button"
+                  title={opt.summary}
+                  aria-pressed={scanMode === opt.key}
+                  className={compactPillClass(scanMode === opt.key)}
+                  onClick={() => setScanMode(opt.key)}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          : <div className="font-medium text-fg" title={modeSummary}>
+              {SCAN_MODE_OPTIONS.find(o => o.key === scanMode)?.label ?? capabilityTierMeta[draft.capabilityTier].name}
+            </div>}
       </div>
+
+      {scopeOnly
+        ? <div className="px-4 py-2.5">
+            <div className="mb-1 text-[11.5px] text-fg-subtle">Test accounts</div>
+            <div className="font-medium text-fg">
+              {draft.approvedPersonaIds.length && draft.capabilityTier >= 2 ? plural(draft.approvedPersonaIds.length, 'test account') : 'None (anonymous)'}
+            </div>
+          </div>
+        : <>
+            <div className="border-r border-line px-4 py-2.5">
+              <div className="mb-1 flex items-center justify-between text-[11.5px] text-fg-subtle">
+                <span>Budget / RPS</span>
+                {canEditConfig && (
+                  <button
+                    type="button"
+                    className="cursor-pointer border-0 bg-transparent p-0 font-sans text-[11px] font-medium text-fg-subtle hover:text-fg"
+                    onClick={() => setEditingBudget(b => !b)}
+                  >
+                    {editingBudget ? 'Done' : 'Adjust'}
+                  </button>
+                )}
+              </div>
+              {canEditConfig && editingBudget
+                ? <div className="flex flex-wrap items-center gap-1.5 text-[12px] text-fg-muted">
+                    <label className="inline-flex items-center gap-1 rounded-[5px] bg-sunk px-1.5 py-[2px] shadow-hairline">
+                      <span className="text-fg-subtle">$</span>
+                      <input
+                        className="num w-[46px] border-0 bg-transparent p-0 font-sans text-[12px] font-medium text-fg outline-none"
+                        type="number"
+                        min={0.1}
+                        max={500}
+                        step="any"
+                        value={draft.budgetUsd}
+                        aria-label="Budget USD"
+                        onChange={e => setDraft(d => ({ ...d, budgetUsd: Number(e.target.value) }))}
+                      />
+                    </label>
+                    <label className="inline-flex items-center gap-1 rounded-[5px] bg-sunk px-1.5 py-[2px] shadow-hairline" title="Requests per second per origin">
+                      <input
+                        className="num w-[34px] border-0 bg-transparent p-0 font-sans text-[12px] font-medium text-fg outline-none"
+                        type="number"
+                        min={1}
+                        max={rpsMax}
+                        step={1}
+                        value={Math.min(draft.maxRpsPerOrigin, rpsMax)}
+                        aria-label="Requests per second per origin"
+                        onChange={e => setDraft(d => ({ ...d, maxRpsPerOrigin: Math.min(rpsMax, Math.max(1, Number(e.target.value))) }))}
+                      />
+                      <span className="text-fg-subtle">req/s</span>
+                    </label>
+                    <label className="inline-flex items-center gap-1 rounded-[5px] bg-sunk px-1.5 py-[2px] shadow-hairline" title="Request cap (0 = uncapped)">
+                      <input
+                        className="num w-[50px] border-0 bg-transparent p-0 font-sans text-[12px] font-medium text-fg outline-none"
+                        type="number"
+                        min={0}
+                        max={maxBudgetRequests}
+                        step={1}
+                        value={draft.budgetRequests}
+                        aria-label="Request cap (0 = uncapped)"
+                        onChange={e => setDraft(d => ({ ...d, budgetRequests: Number(e.target.value) }))}
+                      />
+                      <span className="text-fg-subtle">reqs</span>
+                    </label>
+                  </div>
+                : <button
+                    type="button"
+                    disabled={!canEditConfig}
+                    onClick={() => canEditConfig && setEditingBudget(true)}
+                    className={cn(
+                      'inline-flex items-center gap-1 border-0 bg-transparent p-0 text-left font-sans text-[12.5px] font-medium text-fg',
+                      canEditConfig && 'cursor-pointer rounded-[4px] hover:underline',
+                    )}
+                    title={canEditConfig ? 'Click to adjust budget, request cap, and rate limit' : undefined}
+                  >
+                    <span>{fmtUsd(draft.budgetUsd)}</span>
+                    <span className="text-fg-subtle">·</span>
+                    <span>{Math.min(draft.maxRpsPerOrigin, rpsMax)} req/s</span>
+                    {draft.budgetRequests > 0 && <><span className="text-fg-subtle">·</span><span>{fmtN(draft.budgetRequests)} reqs</span></>}
+                  </button>}
+            </div>
+
+            <div className="px-4 py-2.5">
+              <div className="mb-1 text-[11.5px] text-fg-subtle">Approvals</div>
+              {canEditConfig && scanMode === 'supervised'
+                ? <select
+                    className="h-[22px] max-w-full cursor-pointer rounded-[5px] border-0 bg-sunk px-1.5 font-sans text-[12px] font-medium text-fg shadow-hairline outline-none"
+                    value={draft.approvalPolicy === 'strict' ? 'strict' : 'auto_review'}
+                    onChange={e => setDraft(d => ({ ...d, approvalPolicy: e.target.value as ApprovalPolicy }))}
+                    aria-label="Approval policy"
+                  >
+                    <option value="auto_review">{approvalPolicyMeta.auto_review.label}</option>
+                    <option value="strict">{approvalPolicyMeta.strict.label}</option>
+                  </select>
+                : <div className="font-medium text-fg" title={modeSummary}>
+                    {scanMode === 'autonomous'
+                      ? 'Auto-approve in scope'
+                      : scanMode === 'supervised'
+                        ? approvalPolicyMeta[draft.approvalPolicy].label
+                        : <span className="font-normal text-fg-subtle">Not needed (read-only)</span>}
+                  </div>}
+            </div>
+          </>}
+    </div>
+
+    {/* (b) Target Domains & Subdomains */}
+    {discoveringSubdomains && (
+      <div
+        className="flex items-center gap-2 border-b border-line bg-accent-soft/40 px-4 py-2 text-[12px] text-fg-muted"
+        role="status"
+        aria-live="polite"
+        data-testid="subdomain-discovery-banner"
+      >
+        <span
+          className="inline-block size-3 flex-none animate-spin rounded-full border-[1.5px] border-accent border-t-transparent motion-reduce:animate-none"
+          aria-hidden="true"
+        />
+        <span>
+          Discovering subdomains (CT logs + DNS)…
+          <span className="num ml-1.5 text-fg-subtle">· {plural(hosts.length, 'host')} found</span>
+        </span>
+      </div>
+    )}
+
+    {editing && !discovery && hosts.length > LARGE_HOST_FILTER_THRESHOLD && (
+      <div className="flex flex-wrap items-center gap-2 border-b border-line bg-sunk/40 px-3 py-1.5">
+        <div className="relative flex min-w-[160px] flex-1 items-center">
+          <Icon name="search" size={12} className="pointer-events-none absolute left-2 text-fg-subtle" />
+          <input
+            type="search"
+            value={hostQuery}
+            onChange={e => setHostQuery(e.target.value)}
+            placeholder={`Filter ${hosts.length} hosts…`}
+            aria-label="Filter hosts"
+            className="h-[24px] w-full rounded-[5px] border-0 bg-panel pl-7 pr-2 font-sans text-[12px] text-fg shadow-hairline outline-none placeholder:text-fg-faint focus:shadow-[0_0_0_1px_var(--accent-line),0_0_0_3px_var(--accent-soft)]"
+          />
+        </div>
+        <div className="flex flex-none items-center gap-1">
+          <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={selectHighSignal}>High-signal</button>
+          <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={selectAllFirstParty}>All first-party</button>
+          <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={selectNone}>None</button>
+        </div>
+      </div>
+    )}
+
+    {editing && !discovery
+      ? <div className="grid max-h-[240px] grid-cols-3 overflow-auto p-2 font-mono text-[12px]">
+          {filteredHosts.map(h => {
+            const on = selected.has(h.id)
+            return <label
+              key={h.id}
+              className={cn(
+                'flex cursor-pointer items-center gap-[7px] overflow-hidden whitespace-nowrap rounded-[4px] px-2 py-[3px] hover:bg-hover',
+                on ? 'text-fg-muted' : 'text-fg-faint',
+              )}
+              title={`${h.origin} · ${h.source}`}
+            >
+              <input
+                className="m-0 flex-none accent-[var(--accent)]"
+                type="checkbox"
+                aria-label={'Include ' + host(h.origin)}
+                checked={on}
+                onChange={e => toggleHost(h.id, e.target.checked)}
+              />
+              <span className="truncate">{host(h.origin)}</span>
+              {h.thirdParty && <span className="ml-1 text-[10.5px] text-fg-subtle" title={h.externalCname ? `Third-party CNAME (${h.externalCname}) — unchecked by default` : 'Third-party host — unchecked by default'}>
+                {h.externalCname ? `Third-party CNAME (${h.externalCname})` : '3P'}
+              </span>}
+            </label>
+          })}
+          {filteredHosts.length === 0 && (
+            <span className="col-span-3 px-2 py-2 font-sans text-[12px] text-fg-subtle">
+              No hosts match “{hostQuery}”.
+            </span>
+          )}
+        </div>
       : <div className="grid max-h-[224px] grid-cols-3 overflow-auto p-2 font-mono text-[12px]">
-        {shownHosts.map(h => <span key={h.id} className="truncate px-2 py-[3px] text-fg-muted" title={`${h.origin} · ${h.source}`}>{host(h.origin)}</span>)}
-        {!shownHosts.length && <span className="px-2 py-[3px] text-fg-subtle">No hosts selected.</span>}
-        {!discovery && hosts.length > shownHosts.length && (
-          <span className="col-span-3 px-2 pt-1 font-sans text-[11.5px] text-fg-subtle">
-            {plural(hosts.length - shownHosts.length, 'discovered host')} unchecked by default (e.g. third-party or subdomains). Click Edit scope to review all {hosts.length}.
-          </span>
-        )}
-      </div>}
+          {shownHosts.map(h => <span key={h.id} className="truncate px-2 py-[3px] text-fg-muted" title={`${h.origin} · ${h.source}`}>{host(h.origin)}</span>)}
+          {!shownHosts.length && <span className="px-2 py-[3px] text-fg-subtle">No hosts selected.</span>}
+          {!discovery && hosts.length > shownHosts.length && (
+            <span className="col-span-3 px-2 pt-1 font-sans text-[11.5px] text-fg-subtle">
+              {plural(hosts.length - shownHosts.length, 'discovered host')} unchecked by default (e.g. third-party or subdomains). Click Edit scope to review all {hosts.length}.
+            </span>
+          )}
+        </div>}
+
     {editing && discovery && <div className="flex flex-col gap-2 border-t border-line px-4 pb-3 pt-2.5">
       <span className="text-[12px] text-fg-subtle">
         Discovery runs on the project seeds. Hosts it finds come back here for scope review; edit the seeds on the{' '}
         <Link to="/projects/$projectId" params={{ projectId: detail.project.id }} className="underline">project page</Link>.
       </span>
     </div>}
+
+    {/* (c) Bind Test Accounts — cleanly separated from Target Domains by a crisp divider */}
+    {canEditConfig && detail.personas.length > 0 && <div className="flex flex-col gap-2 border-t border-line px-4 pb-3 pt-2.5">
+      <span className="text-[12px] font-medium text-fg-subtle">
+        Bind test accounts
+        {draft.capabilityTier === 0 ? ' (unavailable in Offline mode)' : draft.approvedPersonaIds.length > 0 ? ` · ${draft.approvedPersonaIds.length} selected` : ''}
+      </span>
+      <div className="flex flex-wrap gap-x-4 gap-y-1.5">
+        {detail.personas.map(p => <label key={p.id} className="flex cursor-pointer select-none items-center gap-2 text-[12.5px] text-fg-muted">
+          <input
+            className="m-0 size-[13px] accent-[var(--accent)]"
+            type="checkbox"
+            disabled={draft.capabilityTier === 0}
+            checked={draft.approvedPersonaIds.includes(p.id)}
+            onChange={e => togglePersona(p.id, e.target.checked)}
+          />
+          <b className="font-medium text-fg">{p.handle}</b> · {p.roleLabel}
+        </label>)}
+      </div>
+    </div>}
+
+    {/* (d) Primary CTA footer */}
     {footer}
   </div>
 }
@@ -269,18 +671,33 @@ export function ConsentView() {
   const r = detail.run
   const rpsMax = detail.project.environment === 'local-lab' ? maxRpsPerOriginCeiling : PUBLIC_MAX_RPS_CAP
   const { discovery, hosts, defaults } = useScopeModel()
-  const [editing, setEditing] = useState(false)
-  const syncKey = `${r.id}:${r.phase}:${r.scopeRevision}:${defaults.join(',')}`
-  const [syncedKey, setSyncedKey] = useState(syncKey)
+  // Default directly into editable scope review on `phase === 'review'` (no extra click required).
+  const [editing, setEditing] = useState(!discovery)
+  const [userTouchedHosts, setUserTouchedHosts] = useState(false)
+  const runSyncKey = `${r.id}:${r.phase}:${r.scopeRevision}`
+  const [syncedRunKey, setSyncedRunKey] = useState(runSyncKey)
+  const defaultsKey = defaults.join(',')
+  const [syncedDefaultsKey, setSyncedDefaultsKey] = useState(defaultsKey)
   const [draft, setDraftState] = useState<Draft>(() => initialDraft(r, defaults, rpsMax))
   const setDraft = (fn: (d: Draft) => Draft) => setDraftState(fn)
   const ck = consentKey(r)
   const decision = q.get(ck)
   const scoped = Boolean(decision)
-  if (syncedKey !== syncKey && !editing && !scoped) {
-    setSyncedKey(syncKey)
+
+  // Reset full draft and default editing state when run/phase/revision transitions.
+  if (syncedRunKey !== runSyncKey && !scoped) {
+    setSyncedRunKey(runSyncKey)
+    setSyncedDefaultsKey(defaultsKey)
+    setUserTouchedHosts(false)
+    setEditing(!discovery)
     setDraftState(initialDraft(r, defaults, rpsMax))
+  } else if (syncedDefaultsKey !== defaultsKey && !userTouchedHosts && !scoped) {
+    // Auto-check newly streamed first-party subdomains (up to Top 30) unless the user has manually toggled hosts,
+    // preserving any Scan Mode / Budget / RPS / Persona edits already made in `draft`.
+    setSyncedDefaultsKey(defaultsKey)
+    setDraftState(prev => ({ ...prev, assetIds: defaults }))
   }
+
   const nw = (r.goal || '').split(/\s+/).filter(Boolean).length
   const count = discovery ? hosts.length : draft.assetIds.length
   const overLimit = draft.assetIds.length > maxScopeHosts
@@ -304,7 +721,6 @@ export function ConsentView() {
       command,
       message: discovery ? `Discovery approved for ${plural(hosts.length, 'host')}` : `Scope approved for ${plural(count, 'host')} (${capabilityTierMeta[draft.capabilityTier].short})`,
     })
-    setEditing(false)
   }
   useShortcuts([{ key: 'a', run: () => { if (!canApprove) return false; approve() } }])
 
@@ -332,6 +748,7 @@ export function ConsentView() {
         editing={editing}
         draft={draft}
         setDraft={setDraft}
+        onHostsTouched={() => setUserTouchedHosts(true)}
         footer={
           <div className={RW.sheetF}>
             <span className="mr-auto text-[12px] text-fg-subtle">
@@ -340,7 +757,7 @@ export function ConsentView() {
             {scoped
               ? decision!.state !== 'sent' && <button type="button" className={runBtn()} onClick={() => q.reopen(ck)}><Icon name="undo" />Undo</button>
               : <>
-                {!discovery && <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => { if (editing) setDraftState(initialDraft(r, defaults, rpsMax)); setEditing(!editing) }}>{editing ? 'Reset' : 'Edit scope'}</button>}
+                {!discovery && <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => { if (editing) { setUserTouchedHosts(false); setDraftState(initialDraft(r, defaults, rpsMax)) } else { setEditing(true) } }}>{editing ? 'Reset' : 'Edit scope'}</button>}
                 <button type="button" className={runBtn({ variant: 'primary' })} disabled={!canApprove} onClick={approve}>
                   Approve &amp; start<Kbd inverted className="ml-0.5">A</Kbd>
                 </button>

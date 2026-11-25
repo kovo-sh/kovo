@@ -5,10 +5,10 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { join, resolve } from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { globalKillSwitch } from '../src/server/kill-switch.ts'
+import { configureGlobalKillSwitch, globalKillSwitch } from '../src/server/kill-switch.ts'
 import type { GlobalKillSwitch } from '../src/server/kill-switch.ts'
 import { exportRunReceiptBundle } from '../src/server/receipt-export.ts'
-import { TenantIsolationError } from '../src/server/store.ts'
+import { store, TenantIsolationError } from '../src/server/store.ts'
 import type { Store } from '../src/server/store.ts'
 
 const maxBody = 8 * 1024 * 1024
@@ -354,7 +354,8 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
     // v7 M4 Production Ops: global < 2s kill-switch control endpoint.
     if (path.pathname === killSwitchPath) {
       if (method === 'GET' || method === 'HEAD') {
-        const state = killSwitch.status()
+        const queryTenantId = path.searchParams.get('tenantId')?.trim() || null
+        const state = killSwitch.status(queryTenantId)
         return sendJson(res, 200, state)
       }
       if (method !== 'POST') return reject(res, 405, 'Method not allowed.')
@@ -380,7 +381,7 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
             tenantId,
             now: now(),
           })
-        : killSwitch.reset({ resetBy: 'operator:http', now: now() })
+        : killSwitch.reset({ resetBy: 'operator:http', ...(tenantId ? { tenantId } : {}), now: now() })
       if (storeHandle) {
         try {
           storeHandle.appendTenantAuditLog({
@@ -549,11 +550,18 @@ async function main() {
 
   initialize()
 
+  const sharedStore = store()
+  const sharedKillSwitch = configureGlobalKillSwitch({
+    filePath: join(directory, 'kill-switch.json'),
+  })
+
   const local = createKovoLocalServer({
     app,
     directory,
     port,
     publicOrigin: process.env.KOVO_PUBLIC_ORIGIN || undefined,
+    killSwitch: sharedKillSwitch,
+    store: sharedStore,
   })
 
   const origin = process.env.KOVO_PUBLIC_ORIGIN || `http://127.0.0.1:${port}`
