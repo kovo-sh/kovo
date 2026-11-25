@@ -36,6 +36,33 @@ function processJob(state: LabState, job: JobRecord): void {
   job.status = 'ready'
 }
 
+// Requesters that observed each job in the ready state through a status poll.
+const readyPolls = new WeakMap<JobRecord, Set<string>>()
+
+function readyPollsFor(job: JobRecord): Set<string> {
+  let polls = readyPolls.get(job)
+  if (!polls) {
+    polls = new Set<string>()
+    readyPolls.set(job, polls)
+  }
+  return polls
+}
+
+function headerOf(req: IncomingMessage, name: string): string {
+  const value = req.headers[name]
+  return (Array.isArray(value) ? value[0] : value) ?? ''
+}
+
+function requesterOf(req: IncomingMessage): string {
+  return headerOf(req, 'x-lab-requester')
+}
+
+// Relayed reads carry the caller tenant; jobs owned by another tenant are not visible.
+function tenantMatches(req: IncomingMessage, job: JobRecord): boolean {
+  const tenant = headerOf(req, 'x-lab-tenant')
+  return !tenant || tenant === job.tenantId
+}
+
 function jobView(job: JobRecord): Record<string, string | number | boolean> {
   return {
     id: job.id,
@@ -107,11 +134,12 @@ export async function handleDocsWorker(
   const jobById = match(url, method, '/jobs/:id')
   if (jobById) {
     const job = state.jobs.find((item) => item.id === jobById[0])
-    if (!job) {
+    if (!job || !tenantMatches(req, job)) {
       sendJson(res, 404, { error: 'unknown job' })
       return
     }
     processJob(state, job)
+    if (job.status === 'ready') readyPollsFor(job).add(requesterOf(req))
     state.emit('worker.job_polled', {
       jobId: job.id,
       kind: job.kind,
@@ -127,13 +155,17 @@ export async function handleDocsWorker(
   const jobResult = match(url, method, '/jobs/:id/result')
   if (jobResult) {
     const job = state.jobs.find((item) => item.id === jobResult[0])
-    if (!job) {
+    if (!job || !tenantMatches(req, job)) {
       sendJson(res, 404, { error: 'unknown job' })
       return
     }
     processJob(state, job)
     if (job.status !== 'ready' || !state.profile.exportJobExfiltrates) {
       sendJson(res, 409, { error: 'artifact not available', status: job.status })
+      return
+    }
+    if (!readyPollsFor(job).has(requesterOf(req))) {
+      sendJson(res, 409, { error: 'poll the job status until ready before downloading', status: job.status })
       return
     }
     state.emit('worker.job_result', {
