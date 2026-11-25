@@ -43,6 +43,7 @@ import type {
   SubmittedFinding,
 } from '../benchmarks/realistic-bench/lib/types.ts'
 import { assertLocalLabAllowed } from '../benchmarks/realistic-bench/lib/safety.ts'
+import { maxWorkerConcurrency } from '../src/domain.ts'
 import type { Finding } from '../src/domain.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
 import type { CompositeProofReceipt, CompositeReceiptVerification } from '../src/server/composite-receipt.ts'
@@ -339,6 +340,8 @@ export interface MultihopArgs {
   maxDurationMs: number
   outDir: string
   concurrency: number
+  /** Explicit in-run Execution worker slot override (1..16); omitted lets Execution dynamic AIMD scale. */
+  workerConcurrency?: number
   dataDir?: string
   noLlm: boolean
   isolateDataDir: boolean
@@ -379,8 +382,11 @@ Flags:
                             wall-clock cap per cell (default: ${Math.round(DEFAULT_MAX_DURATION_MS / 60_000)}m)
   --duration-min <n>        alias for --max-duration-ms <n * 60000> (minutes, 1..360)
   --concurrency <n>         parallel app/seed cells (default: ${DEFAULT_CONCURRENCY})
+  --worker-concurrency <n>  override in-run Execution worker slots (1..${maxWorkerConcurrency}; omitted = dynamic AIMD)
   --data-dir <path>         Guardian data dir (default: $GUARDIAN_DATA_DIR)
-  --isolate-data-dir        per-cell isolated data dir (credentials symlinked, key never copied)
+  --isolate-data-dir        per-cell isolated data dir (default ON for --verifier docker;
+                            credentials symlinked, key never copied)
+  --no-isolate-data-dir     disable default per-cell data-dir isolation for --verifier docker
   --keep-data-dirs          keep isolated per-cell data dirs after grading
   --allow-inert-workers     override fail-fast guard for model profile + local-jq (still exits 2)
   --snapshot-after-floor <dir>
@@ -503,6 +509,11 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
       continue
     }
     if (!arg.startsWith('--')) fail(`unexpected argument '${arg}'`)
+    const eq = arg.indexOf('=')
+    if (eq > 2) {
+      a[arg.slice(2, eq)] = arg.slice(eq + 1)
+      continue
+    }
     const key = arg.slice(2)
     if (!key) fail('empty flag')
     const next = argv[i + 1]
@@ -511,8 +522,10 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
   }
 
   const known = new Set([
-    'app', 'seed', 'seeds', 'held-out', 'mode', 'no-llm', 'verifier', 'isolate-data-dir',
-    'concurrency', 'budget-usd', 'max-duration-ms', 'duration-min', 'data-dir', 'keep-data-dirs',
+    'app', 'seed', 'seeds', 'held-out', 'mode', 'no-llm', 'verifier',
+    'isolate-data-dir', 'no-isolate-data-dir',
+    'concurrency', 'worker-concurrency', 'budget-usd', 'max-duration-ms', 'duration-min',
+    'data-dir', 'keep-data-dirs',
     'allow-inert-workers', 'snapshot-after-floor', 'resume-snapshot', 'snapshot-max-age-ms',
     'snapshot-refresh', 'allow-heldout-snapshot', 'floor-from', 'curve-from', 'out-dir',
     'json', 'md', 'list-seeds', 'help',
@@ -601,10 +614,36 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
     : parsePositiveInt(stringFlag(a, 'concurrency') ?? '', '--concurrency')
   if (concurrency > 16) fail('--concurrency must be <= 16')
 
-  const snapshotAfterFloorRaw = stringFlag(a, 'snapshot-after-floor')
-  if (a['snapshot-after-floor'] === true) fail('--snapshot-after-floor requires a directory argument')
-  const resumeSnapshotRaw = stringFlag(a, 'resume-snapshot')
-  if (a['resume-snapshot'] === true) fail('--resume-snapshot requires a directory argument')
+  let workerConcurrency: number | undefined
+  if (a['worker-concurrency'] !== undefined) {
+    const rawWorkerConc = stringFlag(a, 'worker-concurrency')
+    if (rawWorkerConc === undefined) {
+      fail(`--worker-concurrency requires an integer between 1 and ${maxWorkerConcurrency}`)
+    }
+    const parsedWorkerConc = Number(rawWorkerConc.trim())
+    if (!Number.isInteger(parsedWorkerConc) || parsedWorkerConc < 1 || parsedWorkerConc > maxWorkerConcurrency) {
+      fail(`--worker-concurrency must be an integer between 1 and ${maxWorkerConcurrency} (got '${rawWorkerConc}')`)
+    }
+    workerConcurrency = parsedWorkerConc
+  }
+
+  if (a['isolate-data-dir'] === true && a['no-isolate-data-dir'] === true) {
+    fail('use either --isolate-data-dir or --no-isolate-data-dir, not both')
+  }
+  const isolateDataDir = a['isolate-data-dir'] === true
+    ? true
+    : a['no-isolate-data-dir'] === true
+      ? false
+      : verifierRaw === 'docker'
+
+  const snapshotAfterFloorRaw = stringFlag(a, 'snapshot-after-floor')?.trim()
+  if (a['snapshot-after-floor'] !== undefined && !snapshotAfterFloorRaw) {
+    fail('--snapshot-after-floor requires a directory argument')
+  }
+  const resumeSnapshotRaw = stringFlag(a, 'resume-snapshot')?.trim()
+  if (a['resume-snapshot'] !== undefined && !resumeSnapshotRaw) {
+    fail('--resume-snapshot requires a directory argument')
+  }
   if (snapshotAfterFloorRaw && resumeSnapshotRaw) {
     fail('use either --snapshot-after-floor or --resume-snapshot, not both')
   }
@@ -629,9 +668,10 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
     maxDurationMs,
     outDir: isAbsolute(outDirRaw) ? outDirRaw : resolve(outDirRaw),
     concurrency,
+    ...(workerConcurrency !== undefined ? { workerConcurrency } : {}),
     ...(dataDirRaw ? { dataDir: isAbsolute(dataDirRaw) ? dataDirRaw : resolve(dataDirRaw) } : {}),
     noLlm,
-    isolateDataDir: a['isolate-data-dir'] === true,
+    isolateDataDir,
     keepDataDirs: a['keep-data-dirs'] === true,
     allowInertWorkers: a['allow-inert-workers'] === true,
     verifier: verifierRaw,
@@ -2601,6 +2641,18 @@ export function createCleanupRegistry(onError?: (error: unknown) => void): Clean
   }
 }
 
+/**
+ * Resolve the optional in-run `workerConcurrency` override passed into `Store.createRun`.
+ * Returning `undefined` omits the override so `Execution`'s dynamic AIMD Phase-B controller
+ * auto-scales worker slots instead of clamping single-app runs to cell `--concurrency`.
+ */
+export function resolveMultihopWorkerConcurrency(
+  args: Pick<MultihopArgs, 'workerConcurrency'>,
+): number | undefined {
+  if (args.workerConcurrency === undefined || !Number.isFinite(args.workerConcurrency)) return undefined
+  return Math.max(1, Math.min(maxWorkerConcurrency, Math.trunc(args.workerConcurrency)))
+}
+
 export function cellKeys(args: Pick<MultihopArgs, 'apps' | 'seeds'>): Array<{ app: MultihopAppName; seed: number }> {
   const cells: Array<{ app: MultihopAppName; seed: number }> = []
   for (const app of args.apps) for (const seed of args.seeds) cells.push({ app, seed })
@@ -2879,7 +2931,10 @@ export async function runCell(
         }
       }
 
-      const createdRun = storage.createRun({
+      const workerConcurrency = resolveMultihopWorkerConcurrency(args)
+      const createRunInput: Omit<Parameters<Store['createRun']>[0], 'workerConcurrency'> & {
+        workerConcurrency?: number
+      } = {
         requestId: randomUUID(),
         projectId,
         goal: plan.mission,
@@ -2890,10 +2945,11 @@ export async function runCell(
         budgetUsd: args.budgetUsd,
         budgetRequests: 5_000,
         maxRpsPerOrigin: 15,
-        workerConcurrency: Math.min(4, Math.max(1, args.concurrency)),
+        ...(workerConcurrency !== undefined ? { workerConcurrency } : {}),
         workerMaxTurns: 40,
         multiTrialEnabled: true,
-      })
+      }
+      const createdRun = storage.createRun(createRunInput as Parameters<Store['createRun']>[0])
       runId = createdRun.id
 
       storage.command({ requestId: randomUUID(), runId, action: 'discover', consent: true })
