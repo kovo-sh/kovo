@@ -5,6 +5,7 @@ import { BrokerDenied, RequestBroker } from './broker.ts'
 import type { BrokerExchangeResult, Grant } from './broker.ts'
 import { scanSecondOrderMarkers } from './canary-broker.ts'
 import type { SecondOrderStore } from './canary-broker.ts'
+import { cookieRecordsFromHeader } from './persona-auth.ts'
 import { buildPersonaBrowserAttachment, personaSecrets } from './persona-vault.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
@@ -1064,21 +1065,44 @@ export function personaSessionBundle(grant: Grant, persona: string | undefined, 
     try {
       const attachment = buildPersonaBrowserAttachment(resolved, origin)
       if (attachment) {
+        const cookies = attachment.cookies.map(cookie => ({
+          name: cookie.name,
+          value: cookie.value,
+          domain: cookie.domain,
+          path: cookie.path,
+          secure: cookie.secure,
+          httpOnly: cookie.httpOnly,
+          ...(cookie.sameSite ? { sameSite: cookie.sameSite } : {}),
+          ...(cookie.expires !== undefined ? { expires: cookie.expires } : {}),
+        }))
+        const headers: Record<string, string> = { ...attachment.headers }
+        // A cookie-auth persona stores a raw Cookie header. A pooled context must own the jar
+        // instead: split the header into individual HttpOnly cookies and never forward it.
+        const rawCookieHeader = headers.Cookie ?? headers.cookie
+        if (rawCookieHeader) {
+          if (cookies.length === 0) {
+            for (const record of cookieRecordsFromHeader(rawCookieHeader, origin)) {
+              cookies.push({
+                name: record.name,
+                value: record.value,
+                domain: record.domain,
+                path: record.path,
+                secure: record.secure === true,
+                httpOnly: record.httpOnly === true,
+                ...(record.sameSite ? { sameSite: record.sameSite } : {}),
+                ...(record.expires !== undefined ? { expires: record.expires } : {}),
+              })
+            }
+          }
+          delete headers.Cookie
+          delete headers.cookie
+        }
         return {
-          cookies: attachment.cookies.map(cookie => ({
-            name: cookie.name,
-            value: cookie.value,
-            domain: cookie.domain,
-            path: cookie.path,
-            secure: cookie.secure,
-            httpOnly: cookie.httpOnly,
-            ...(cookie.sameSite ? { sameSite: cookie.sameSite } : {}),
-            ...(cookie.expires !== undefined ? { expires: cookie.expires } : {}),
-          })),
+          ...(cookies.length > 0 ? { cookies } : {}),
           ...(attachment.storage?.localStorage ? { localStorage: attachment.storage.localStorage } : {}),
           ...(attachment.storage?.sessionStorage ? { sessionStorage: attachment.storage.sessionStorage } : {}),
           ...(attachment.initScript ? { initScript: attachment.initScript } : {}),
-          ...(Object.keys(attachment.headers).length > 0 ? { headers: attachment.headers } : {}),
+          ...(Object.keys(headers).length > 0 ? { headers } : {}),
         }
       }
     } catch {

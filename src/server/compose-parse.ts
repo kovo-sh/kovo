@@ -224,7 +224,7 @@ class LineCursor {
 // Scalar / flow helpers
 // ---------------------------------------------------------------------------
 
-export function readQuotedScalar(text: string, start: number, lineNumber?: number): { value: string; next: number } {
+function readQuotedScalar(text: string, start: number, lineNumber?: number): { value: string; next: number } {
   const quote = text[start]
   let out = ''
   let i = start + 1

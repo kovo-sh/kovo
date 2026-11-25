@@ -307,6 +307,48 @@ function extractSetCookies(headers: Headers): Map<string, string> {
   return map
 }
 
+/**
+ * Parse a raw `Cookie:` header secret into Playwright-compatible cookie records scoped to one
+ * origin. A cookie-auth persona stores the header verbatim (`sid=abc; theme=dark`); a pooled browser
+ * context needs individual HttpOnly cookies, not a header it is forbidden to forward.
+ */
+export function cookieRecordsFromHeader(
+  cookieHeader: string | null | undefined,
+  origin: string,
+): PersonaCookieRecord[] {
+  if (!cookieHeader || typeof cookieHeader !== 'string') return []
+  let host = ''
+  let secure = true
+  try {
+    const url = new URL(origin)
+    host = url.hostname
+    secure = url.protocol === 'https:'
+  } catch {
+    return []
+  }
+  if (!host) return []
+  const out: PersonaCookieRecord[] = []
+  const seen = new Set<string>()
+  for (const pair of cookieHeader.split(';').slice(0, 32)) {
+    const eq = pair.indexOf('=')
+    if (eq <= 0) continue
+    const name = pair.slice(0, eq).trim()
+    const value = pair.slice(eq + 1).trim()
+    if (!name || !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name) || /[\r\n\0;]/.test(value)) continue
+    if (seen.has(name)) continue
+    seen.add(name)
+    out.push({
+      name: name.slice(0, 256),
+      value: value.slice(0, 4096),
+      domain: host,
+      path: '/',
+      httpOnly: true,
+      secure,
+    })
+  }
+  return out
+}
+
 function cookiesToHeader(cookies: ReadonlyMap<string, string>): string {
   return [...cookies.entries()].map(([k, v]) => `${k}=${v}`).join('; ')
 }
