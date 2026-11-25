@@ -1094,7 +1094,37 @@ def _write_result(value: dict[str, Any]) -> None:
         pass
 
 
-def run(script: VerificationScript) -> None:
+def _normalize_proof_result(ctx: VerifyContext, returned: Any, default_title: Optional[str] = None) -> dict[str, Any]:
+    fallback_title = (default_title.strip() if isinstance(default_title, str) and default_title.strip() else "Verification script proof")[:300]
+    if isinstance(returned, ProofResult):
+        payload = returned.to_json()
+        if not payload.get("claims") and ctx.claims:
+            payload["claims"] = list(ctx.claims)
+        return payload
+    if isinstance(returned, dict) and isinstance(returned.get("claims"), list):
+        title = str(returned.get("title") or "").strip()[:300] or fallback_title
+        severity = str(returned.get("severity") or "high").strip()[:32] or "high"
+        claims = returned["claims"] if returned["claims"] else list(ctx.claims)
+        out: dict[str, Any] = {
+            "sdk": "guardian_verify.py",
+            "nonce": str(returned.get("nonce") or ctx.nonce),
+            "title": title,
+            "severity": severity,
+            "claims": claims,
+        }
+        if returned.get("description"):
+            out["description"] = str(returned["description"])[:4000]
+        return out
+    return {
+        "sdk": "guardian_verify.py",
+        "nonce": ctx.nonce,
+        "title": fallback_title,
+        "severity": "high",
+        "claims": list(ctx.claims),
+    }
+
+
+def run(script: VerificationScript, default_title: Optional[str] = None) -> None:
     """Run the 3-hook contract and emit the claims document. Stdout is never evidence."""
     ctx = VerifyContext()
     try:
@@ -1107,8 +1137,30 @@ def run(script: VerificationScript) -> None:
         _write_result({"sdk": "guardian_verify.py", "nonce": ctx.nonce, "error": str(error)[:2000], "claims": []})
         print(f"guardian_verify: {error}", file=sys.stderr)
         sys.exit(1)
-    _write_result(result.to_json())
-    print(f"guardian_verify: {len(result.claims)} transcript-backed claim(s) recorded")
+    normalized = _normalize_proof_result(ctx, result, default_title)
+    _write_result(normalized)
+    print(f"guardian_verify: {len(normalized['claims'])} transcript-backed claim(s) recorded")
+
+
+def run_entrypoint(
+    entry: Any,
+    *,
+    setup: Optional[Callable[[VerifyContext], None]] = None,
+    cleanup: Optional[Callable[[VerifyContext], None]] = None,
+    default_title: Optional[str] = None,
+) -> None:
+    """Run an inline function `verify(ctx)` or `VerificationScript` and emit the proof document."""
+    if isinstance(entry, VerificationScript):
+        run(entry, default_title=default_title)
+        return
+    if callable(entry):
+        run(VerificationScript(verify=entry, setup=setup if callable(setup) else None, cleanup=cleanup if callable(cleanup) else None), default_title=default_title)
+        return
+    ctx = VerifyContext()
+    message = "guardian_verify script must define verify(ctx) or call ctx.prove_* directly."
+    _write_result({"sdk": "guardian_verify.py", "nonce": ctx.nonce, "error": message, "claims": []})
+    print(f"guardian_verify: {message}", file=sys.stderr)
+    sys.exit(1)
 
 
 __all__ = [
@@ -1123,4 +1175,5 @@ __all__ = [
     "VerifyContext",
     "define",
     "run",
+    "run_entrypoint",
 ]

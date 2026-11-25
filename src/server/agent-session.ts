@@ -1821,8 +1821,21 @@ export function gapValidationRejectedMessage(
 }
 
 
+export const GUARDIAN_VERIFY_USAGE_HINT =
+  'Inline TS scripts receive `ctx` directly (no imports required): `await ctx.prove_access_boundary({ controlPersona, probePersona, route }); return ctx.result({ title: "..." })` (or `export default async (ctx) => { ... }`).'
+
+const GUARDIAN_VERIFY_TS_EXAMPLE = [
+  'Working inline TS example (`ctx` is pre-injected — no imports needed; `export default async (ctx) => ...` also works):',
+  '```ts',
+  'const proof = await ctx.prove_access_boundary({',
+  '  controlPersona: "user_b", probePersona: "user_a", route: "/api/v1/items/1",',
+  '})',
+  'return ctx.result({ title: "Cross-tenant item read (CWE-639)", severity: "high" })',
+  '```',
+].join('\n')
+
 const GUARDIAN_VERIFY_TOOL_DESCRIPTION_BASE =
-  'Run a short TypeScript or Python verification script through Guardian’s Layer-1 RPC bridge and the independent transcript oracle. Confirmation requires two fresh-session runs whose signed exchanges satisfy every claimed assertion; the script’s stdout is never evidence. Confirmation BOTH proves AND persists the confirmed finding directly (with ProofReceipt / proof_kind="agent_script") — no propose_chain_finding or verify_replay_spec call is needed. Pass `script` inline (works with or without a mounted repo; `scriptPath` only reads from a mounted workspace): call a typed helper (ctx.prove_access_boundary / ctx.prove_persisted_mutation / ctx.prove_boolean_or_timing_diff / ctx.prove_injection_differential / ctx.prove_oob_callback / ctx.prove_race_burst) or ctx.http/ctx.browser/ctx.oob, then return ctx.result({ title }).'
+  `Run a short TypeScript or Python verification script through Guardian’s Layer-1 RPC bridge and the independent transcript oracle. Confirmation requires two fresh-session runs whose signed exchanges satisfy every claimed assertion; the script’s stdout is never evidence. Confirmation BOTH proves AND persists the confirmed finding directly (with ProofReceipt / proof_kind="agent_script") — no propose_chain_finding or verify_replay_spec call is needed. Pass \`script\` inline (works with or without a mounted repo; \`scriptPath\` only reads from a mounted workspace): call a typed helper (ctx.prove_access_boundary / ctx.prove_persisted_mutation / ctx.prove_boolean_or_timing_diff / ctx.prove_injection_differential / ctx.prove_oob_callback / ctx.prove_race_burst) or ctx.http/ctx.browser/ctx.oob, then return ctx.result({ title }).\n\n${GUARDIAN_VERIFY_TS_EXAMPLE}`
 
 /** Runtime DeclarativeReplaySpec kinds rejected on legacy tools while `guardian_verify` is active. */
 export const GUARDIAN_VERIFY_ENFORCED_RUNTIME_KINDS: ReadonlySet<string> = new Set([
@@ -1846,7 +1859,7 @@ function preferredHelperForLegacyKind(kind: string): string {
 /** Crisp 1-line tool-boundary error steering runtime specs to `guardian_verify` when active. */
 export function guardianVerifyRedirectMessage(kind: string): string {
   const helper = preferredHelperForLegacyKind(kind)
-  return `Runtime DeclarativeReplaySpec "${kind}" is disabled while guardian_verify is active — call guardian_verify(script="export default async (ctx) => { await ctx.${helper}({ ... }); return ctx.result({ title: '...' }) }", runtime="ts") instead (guardian_verify BOTH proves AND persists the confirmed finding with ProofReceipt; only static_ast_proof is accepted on legacy spec tools).`
+  return `Runtime DeclarativeReplaySpec "${kind}" is disabled while guardian_verify is active — call guardian_verify(script="await ctx.${helper}({ ... }); return ctx.result({ title: '...' })", runtime="ts") instead (\`ctx\` is pre-injected, and \`export default async (ctx) => ...\` also works; guardian_verify BOTH proves AND persists the confirmed finding with ProofReceipt; only static_ast_proof is accepted on legacy spec tools).`
 }
 
 export const GUARDIAN_VERIFY_TOOL_DESCRIPTION =
@@ -1893,6 +1906,12 @@ export interface GuardianVerifyToolResult {
   missingEvidence: string[]
   /** Compact role-labelled transcript so a repair can be made in one turn. */
   transcriptSummary: unknown[]
+  /** Script exit code surfaced on execution/proof-document failure. */
+  exitCode?: number
+  /** Bounded, redacted first 400 chars of script stderr on execution/proof-document failure. */
+  stderrPreview?: string
+  /** Actionable 1-line usage hint surfaced on `claims_missing` / execution failure. */
+  usageHint?: string
 }
 
 export type GuardianVerifyHandler = (
@@ -1904,6 +1923,12 @@ function stringList(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 }
 
+function boundedRedactedStderr(raw: string, maxChars = 400): string {
+  const cleaned = redact(raw).replace(/\u001b\[[0-9;]*m/g, '').trim()
+  if (!cleaned) return ''
+  return cleaned.length <= maxChars ? cleaned : `${cleaned.slice(0, Math.max(0, maxChars - 3))}...`
+}
+
 /**
  * Normalize a verifyScript verdict (or an already-compact result) into the tool contract and
  * downgrade any `confirmed: true` that is not backed by two signature-valid, oracle-passed
@@ -1913,8 +1938,9 @@ export function summarizeGuardianVerifyOutcome(value: unknown): GuardianVerifyTo
   const rec = value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {}
-  const attempts: GuardianVerifyAttemptSummary[] = (Array.isArray(rec.attempts) ? rec.attempts : [])
+  const rawAttempts = (Array.isArray(rec.attempts) ? rec.attempts : [])
     .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
+  const attempts: GuardianVerifyAttemptSummary[] = rawAttempts
     .map((item, index) => ({
       attempt: typeof item.attempt === 'number' ? item.attempt : index + 1,
       oraclePassed: item.oraclePassed === true,
@@ -1963,6 +1989,25 @@ export function summarizeGuardianVerifyOutcome(value: unknown): GuardianVerifyTo
       failures.push(detail)
     }
   }
+  const reportedExitCode = typeof rec.exitCode === 'number' ? rec.exitCode : undefined
+  const attemptExitCode = attempts.find(attempt => attempt.exitCode !== 0)?.exitCode ?? attempts[0]?.exitCode
+  const exitCode = reportedExitCode ?? attemptExitCode
+  const rawStderr = typeof rec.stderrPreview === 'string' && rec.stderrPreview.trim()
+    ? rec.stderrPreview
+    : rawAttempts
+        .map(item => (typeof item.stderr === 'string' ? item.stderr : (typeof item.stderrPreview === 'string' ? item.stderrPreview : '')))
+        .find(text => text.trim().length > 0) ?? ''
+  const stderrPreview = boundedRedactedStderr(rawStderr)
+  const isScriptFailure = !confirmed && (
+    reason === 'claims_missing'
+    || reason === 'execution_failed'
+    || missingEvidence.includes('valid_proof_document')
+    || (typeof exitCode === 'number' && exitCode !== 0)
+    || stderrPreview.length > 0
+  )
+  const usageHint = isScriptFailure
+    ? (typeof rec.usageHint === 'string' && rec.usageHint.trim() ? rec.usageHint.trim() : GUARDIAN_VERIFY_USAGE_HINT)
+    : undefined
   return {
     confirmed,
     reason,
@@ -1976,6 +2021,9 @@ export function summarizeGuardianVerifyOutcome(value: unknown): GuardianVerifyTo
     rejectedBy,
     missingEvidence,
     transcriptSummary,
+    ...(isScriptFailure && typeof exitCode === 'number' ? { exitCode } : {}),
+    ...(isScriptFailure ? { stderrPreview } : {}),
+    ...(usageHint ? { usageHint } : {}),
   }
 }
 

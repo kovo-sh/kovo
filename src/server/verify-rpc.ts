@@ -33,6 +33,7 @@ import { lookup } from 'node:dns/promises'
 import ipaddr from 'ipaddr.js'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import { buildPersonaHeader } from './persona-vault.ts'
+import { redact } from './redact.ts'
 import { structuralDiff, intersectStructuralDeltas } from './verify-support.ts'
 import {
   assessBoundary,
@@ -2082,8 +2083,14 @@ export class VerifyRpcServer {
     }
     const body = typeof args.body === 'string' ? args.body : undefined
     if (body !== undefined && Buffer.byteLength(body) > 2 * 1024 * 1024) throw new Error('Request body exceeds 2 MiB.')
-    const persona = typeof args.persona === 'string' ? args.persona
-      : typeof args.as === 'string' ? args.as : undefined
+    const rawPersona = typeof args.persona === 'string' ? args.persona.trim()
+      : typeof args.as === 'string' ? args.as.trim() : undefined
+    const isAnonSentinel = Boolean(
+      rawPersona
+      && ['anonymous', 'anon', 'unauthenticated', 'none'].includes(rawPersona.toLowerCase())
+      && !this.options.grant.personas?.has(rawPersona),
+    )
+    const persona = rawPersona && !isAnonSentinel ? rawPersona : undefined
     const session = typeof args.session === 'string' ? args.session : undefined
     const role = typeof args.sessionGroupRole === 'string' ? args.sessionGroupRole : undefined
     if (role !== undefined && !['setup', 'control', 'probe', 'cleanup'].includes(role)) throw new Error('Invalid session group role.')
@@ -2611,10 +2618,166 @@ export class VerifyRpcServer {
 // Independent re-run: verifyScript()
 // ---------------------------------------------------------------------------
 
+export const GUARDIAN_VERIFY_STDERR_PREVIEW_MAX_CHARS = 400
+
+export const GUARDIAN_VERIFY_USAGE_HINT =
+  'Inline TS scripts receive `ctx` directly (no imports required): `await ctx.prove_access_boundary({ controlPersona, probePersona, route }); return ctx.result({ title: "..." })` (or `export default async (ctx) => { ... }`).'
+
+/** Redact credential-shaped tokens and bound stderr preview to 400 chars for repair feedback. */
+export function redactStderrPreview(raw: string, maxChars = GUARDIAN_VERIFY_STDERR_PREVIEW_MAX_CHARS): string {
+  const cleaned = redact(raw ?? '').replace(/\u001b\[[0-9;]*m/g, '').trim()
+  if (!cleaned) return ''
+  return cleaned.length <= maxChars ? cleaned : `${cleaned.slice(0, Math.max(0, maxChars - 3))}...`
+}
+
+function normalizeTsSdkImports(code: string): string {
+  return code
+    .replace(/(\bfrom\s*)(['"])(?:\.\/)?guardian_verify(?:\.(?:ts|mts|js|mjs))?\2/g, "$1'./guardian_verify.ts'")
+    .replace(/\bimport\(\s*(['"])(?:\.\/)?guardian_verify(?:\.(?:ts|mts|js|mjs))?\1\s*\)/g, "import('./guardian_verify.ts')")
+}
+
+function splitLeadingTsImports(code: string): { imports: string; body: string } {
+  const lines = code.split(/\r?\n/)
+  const importLines: string[] = []
+  let i = 0
+  let inBlockComment = false
+  let inImport = false
+  while (i < lines.length) {
+    const line = lines[i]!
+    const trimmed = line.trim()
+    if (inImport) {
+      importLines.push(line)
+      if (/\bfrom\s*['"][^'"]+['"]\s*;?$/.test(trimmed) || /^import\s*['"][^'"]+['"]\s*;?$/.test(trimmed)) {
+        inImport = false
+      }
+      i += 1
+      continue
+    }
+    if (inBlockComment) {
+      importLines.push(line)
+      if (trimmed.includes('*/')) inBlockComment = false
+      i += 1
+      continue
+    }
+    if (!trimmed || trimmed.startsWith('//')) {
+      importLines.push(line)
+      i += 1
+      continue
+    }
+    if (trimmed.startsWith('/*')) {
+      importLines.push(line)
+      if (!trimmed.includes('*/')) inBlockComment = true
+      i += 1
+      continue
+    }
+    if (/^import\s+(?!\()/.test(trimmed)) {
+      importLines.push(line)
+      const completeSingle = /\bfrom\s*['"][^'"]+['"]\s*;?$/.test(trimmed)
+        || /^import\s*['"][^'"]+['"]\s*;?$/.test(trimmed)
+        || /^import\s+\w+\s*=\s*require\(/.test(trimmed)
+      if (!completeSingle) inImport = true
+      i += 1
+      continue
+    }
+    break
+  }
+  const hasRealImport = importLines.some(line => /^\s*import\s+(?!\()/.test(line))
+  if (!hasRealImport) return { imports: '', body: code }
+  return {
+    imports: importLines.join('\n'),
+    body: lines.slice(i).join('\n'),
+  }
+}
+
+/**
+ * Normalize an inline `guardian_verify` script so every documented authoring style works identically:
+ *   1. Explicit `runVerification(...)` / `runEntrypoint(...)` / `GUARDIAN_PROOF_RESULT_FILE` -> run as-is (with SDK import paths normalized).
+ *   2. `export default async (ctx) => ...` / `export default defineVerification(...)` / `export default { verify(ctx) {} }` -> invoke via `runEntrypoint`.
+ *   3. Named `export async function verify(ctx)` / `async function verify(ctx)` -> invoke via `runEntrypoint`.
+ *   4. Bare inline script body using `ctx` (`await ctx.prove_access_boundary(...)`) -> wrap in `runEntrypoint(async (ctx) => { ... })`.
+ *   5. Standalone scripts without `ctx` (e.g. stdout-only or raw probes) -> run verbatim (fail closed as `claims_missing`).
+ *
+ * Idempotent: calling twice produces the exact same output. Never fabricates claims.
+ */
+export function prepareVerifyScript(rawCode: string, runtime: 'ts' | 'python', defaultTitle?: string): string {
+  const trimmed = rawCode.trim()
+  if (!trimmed) return rawCode
+  const titleLiteral = JSON.stringify(defaultTitle?.trim() || 'Verification script proof')
+
+  if (runtime === 'python') {
+    if (/\b(?:run|run_entrypoint|_guardian_run)\s*\(/.test(trimmed) || /\bGUARDIAN_PROOF_RESULT_FILE\b/.test(trimmed)) {
+      return rawCode
+    }
+    if (/^[ \t]*def\s+verify\s*\(/m.test(trimmed)) {
+      return [
+        rawCode,
+        '',
+        'from guardian_verify import run_entrypoint as _guardian_run',
+        `_guardian_run(verify, setup=globals().get("setup"), cleanup=globals().get("cleanup"), default_title=${titleLiteral})`,
+        '',
+      ].join('\n')
+    }
+    if (/\bctx\b/.test(trimmed)) {
+      const indented = rawCode
+        .split(/\r?\n/)
+        .map(line => (line.trim() ? `    ${line}` : ''))
+        .join('\n')
+      return [
+        'from guardian_verify import run_entrypoint as _guardian_run',
+        '',
+        'def _guardian_inline_verify(ctx):',
+        indented,
+        '',
+        `_guardian_run(_guardian_inline_verify, default_title=${titleLiteral})`,
+        '',
+      ].join('\n')
+    }
+    return rawCode
+  }
+
+  // TypeScript runtime
+  const normalized = normalizeTsSdkImports(rawCode)
+  if (
+    /\b(?:runVerification|runEntrypoint|__guardian_run)\s*\(/.test(normalized)
+    || /\bGUARDIAN_PROOF_RESULT_FILE\b/.test(normalized)
+  ) {
+    return normalized
+  }
+
+  const needsDefineAlias = /\bdefineVerification\s*\(/.test(normalized)
+    && !/\bimport\b[^;]*\bdefineVerification\b/.test(normalized)
+  const sdkImport = needsDefineAlias
+    ? "import { defineVerification, runEntrypoint as __guardian_run } from './guardian_verify.ts'\n"
+    : "import { runEntrypoint as __guardian_run } from './guardian_verify.ts'\n"
+
+  if (/^[ \t]*export\s+default\b/m.test(normalized)) {
+    const rewritten = normalized.replace(/^([ \t]*)export\s+default\s+/m, '$1const __guardian_default_export = ')
+    return `${sdkImport}${rewritten}\n;\nawait __guardian_run(__guardian_default_export, ${titleLiteral})\n`
+  }
+
+  const hasExportVerify = /^[ \t]*export\s+(?:(?:async\s+)?function\s+verify\s*\(|(?:const|let|var)\s+verify\s*=)/m.test(normalized)
+  const hasTopLevelVerify = /^[ \t]*(?:async\s+)?function\s+verify\s*\(/m.test(normalized)
+  if (hasExportVerify || hasTopLevelVerify) {
+    const hasSetup = /^[ \t]*(?:export\s+)?(?:(?:async\s+)?function\s+setup\s*\(|(?:const|let|var)\s+setup\s*=)/m.test(normalized)
+    const hasCleanup = /^[ \t]*(?:export\s+)?(?:(?:async\s+)?function\s+cleanup\s*\(|(?:const|let|var)\s+cleanup\s*=)/m.test(normalized)
+    const hooks = ['verify', ...(hasSetup ? ['setup'] : []), ...(hasCleanup ? ['cleanup'] : [])].join(', ')
+    return `${sdkImport}${normalized}\n;\nawait __guardian_run({ ${hooks} }, ${titleLiteral})\n`
+  }
+
+  if (/\bctx\b/.test(normalized)) {
+    const { imports, body } = splitLeadingTsImports(normalized)
+    const prefix = imports ? `${sdkImport}${imports}\n` : sdkImport
+    return `${prefix}await __guardian_run(async (ctx) => {\n${body}\n}, ${titleLiteral})\n`
+  }
+
+  return normalized
+}
+
 export interface VerificationCandidate {
   name: string
   runtime: 'ts' | 'python'
   code: string
+  title?: string
 }
 
 export interface AttemptExecution {
@@ -2663,7 +2826,7 @@ export interface VerifyAttemptReport {
   missingEvidence: string[]
   /** Role-labelled transcript summary (control/probe/... ids, statuses, personas). */
   transcriptSummary: TranscriptSummary[]
-  /** Last 2 KiB of script stderr, useful when the helper throws before returning claims. */
+  /** Last 2 KiB of redacted script stderr, useful when the helper throws before returning claims. */
   stderr?: string
 }
 
@@ -2677,6 +2840,12 @@ export interface VerifyVerdict {
   rejectedBy: string | null
   missingEvidence: string[]
   transcriptSummary: TranscriptSummary[]
+  /** Script exit code when the attempt failed or produced no valid proof document. */
+  exitCode?: number
+  /** Bounded, redacted first 400 chars of script stderr on execution/proof-document failure. */
+  stderrPreview?: string
+  /** Actionable 1-line usage hint surfaced on `claims_missing` / execution failure. */
+  usageHint?: string
 }
 
 export interface VerifyScriptOptions {
@@ -2705,6 +2874,11 @@ async function runAttempt(
     const timeout = AbortSignal.timeout(options.timeoutMs ?? 120_000)
     const deadline = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout
     const execution = await session.execute(options.candidate, deadline)
+    const rawResultError = execution.result && typeof execution.result === 'object' && !Array.isArray(execution.result)
+      && typeof (execution.result as { error?: unknown }).error === 'string'
+      ? (execution.result as { error: string }).error
+      : ''
+    const rawStderr = execution.stderr.trim() ? execution.stderr : rawResultError
     const base = {
       attempt,
       nonce,
@@ -2722,7 +2896,7 @@ async function runAttempt(
       rejectedBy: null as string | null,
       missingEvidence: [] as string[],
       transcriptSummary: session.transcript.summaries(),
-      stderr: execution.stderr.slice(0, 2_000),
+      stderr: redact(rawStderr).slice(0, 2_000),
     }
     if (execution.timedOut) {
       return { report: { ...base, failures: ['Verification script timed out.'], rejectedBy: 'execution', missingEvidence: ['script_completion'] }, fingerprints: [] }
@@ -2825,17 +2999,26 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
   const detailBase = `first=${first.report.oraclePassed ? 'pass' : 'fail'} second=${second.report.oraclePassed ? 'pass' : 'fail'}`
   // The repair contract: name the rejecting validator, the exact missing evidence, and the
   // role-labelled transcript, so the agent can repair in one turn instead of guessing.
-  const feedback = () => {
+  const feedback = (includeScriptDiagnostics = false) => {
     const failed = attempts.filter(report => !report.oraclePassed)
     const source = failed.length > 0 ? failed : attempts
+    const failingExit = source.find(report => report.exitCode !== 0)?.exitCode ?? source[0]?.exitCode
+    const rawStderr = source.map(report => report.stderr ?? '').find(text => text.trim().length > 0) ?? ''
+    const stderrPreview = redactStderrPreview(rawStderr)
+    const showDiagnostics = includeScriptDiagnostics || (typeof failingExit === 'number' && failingExit !== 0) || stderrPreview.length > 0
     return {
       rejectedBy: source.find(report => report.rejectedBy !== null)?.rejectedBy ?? null,
       missingEvidence: [...new Set(source.flatMap(report => report.missingEvidence))],
       transcriptSummary: source[0]?.transcriptSummary ?? [],
+      ...(showDiagnostics && typeof failingExit === 'number' ? { exitCode: failingExit } : {}),
+      ...(showDiagnostics ? { stderrPreview } : {}),
+      ...(includeScriptDiagnostics ? { usageHint: GUARDIAN_VERIFY_USAGE_HINT } : {}),
     }
   }
-  const withFeedback = <T extends Omit<VerifyVerdict, 'rejectedBy' | 'missingEvidence' | 'transcriptSummary'>>(value: T): VerifyVerdict =>
-    ({ ...value, ...feedback() })
+  const withFeedback = <T extends Omit<VerifyVerdict, 'rejectedBy' | 'missingEvidence' | 'transcriptSummary'>>(
+    value: T,
+    includeScriptDiagnostics = false,
+  ): VerifyVerdict => ({ ...value, ...feedback(includeScriptDiagnostics) })
 
   if (first.report.nonce === second.report.nonce) {
     return withFeedback({ confirmed: false, reason: 'nonce_reuse', detail: 'Both attempts used the same nonce; sessions were not fresh.', attempts, disagreements: [], claimTitle: first.report.title })
@@ -2844,10 +3027,30 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
     return withFeedback({ confirmed: false, reason: 'nonce_mismatch', detail: 'A proof document did not match its fresh attempt nonce.', attempts, disagreements: [], claimTitle: first.report.title })
   }
   if (attempts.some(a => a.claimCount === 0)) {
-    return withFeedback({ confirmed: false, reason: 'claims_missing', detail: 'At least one run returned no transcript-backed claims.', attempts, disagreements: [], claimTitle: first.report.title })
+    const diag = feedback(true)
+    const suffix = diag.stderrPreview
+      ? ` (exitCode=${diag.exitCode ?? 0}: ${diag.stderrPreview.slice(0, 200)})`
+      : (typeof diag.exitCode === 'number' && diag.exitCode !== 0 ? ` (exitCode=${diag.exitCode})` : '')
+    return withFeedback({
+      confirmed: false,
+      reason: 'claims_missing',
+      detail: `At least one run returned no transcript-backed claims${suffix}.`,
+      attempts,
+      disagreements: [],
+      claimTitle: first.report.title,
+    }, true)
   }
   if (attempts.some(a => a.exitCode !== 0)) {
-    return withFeedback({ confirmed: false, reason: 'execution_failed', detail: `A verification run exited non-zero (${detailBase}).`, attempts, disagreements: [], claimTitle: first.report.title })
+    const diag = feedback(true)
+    const suffix = diag.stderrPreview ? `: ${diag.stderrPreview.slice(0, 200)}` : ''
+    return withFeedback({
+      confirmed: false,
+      reason: 'execution_failed',
+      detail: `A verification run exited non-zero (${detailBase}, exitCode=${diag.exitCode ?? 1}${suffix}).`,
+      attempts,
+      disagreements: [],
+      claimTitle: first.report.title,
+    }, true)
   }
   if (!attempts.every(a => a.signaturesValid)) {
     return withFeedback({ confirmed: false, reason: 'transcript_mismatch', detail: 'A transcript failed signature verification.', attempts, disagreements: [], claimTitle: first.report.title })
@@ -2981,7 +3184,8 @@ export async function runCandidateLocally(
     copySdkFiles(options.sdkDir, dir)
     const extension = candidate.runtime === 'python' ? '.py' : '.ts'
     const scriptPath = join(dir, `candidate${extension}`)
-    writeFileSync(scriptPath, candidate.code, { mode: 0o600 })
+    const preparedCode = prepareVerifyScript(candidate.code, candidate.runtime, candidate.title)
+    writeFileSync(scriptPath, preparedCode, { mode: 0o600 })
     const command = candidate.runtime === 'python'
       ? (options.pythonPath ?? 'python3')
       : (options.nodePath ?? process.execPath)

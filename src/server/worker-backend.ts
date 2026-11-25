@@ -15,6 +15,7 @@ import {
   VERIFY_RPC_SOCKET_NAME,
   VERIFY_RPC_TOKEN_ENV,
   VERIFY_RPC_TOKEN_NAME,
+  prepareVerifyScript,
 } from './verify-rpc.ts'
 
 const pathSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}(?:\/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}){0,3}$/)
@@ -143,6 +144,7 @@ export const verifyScriptRequestSchema = z.object({
   runtime: z.enum(['ts', 'python']),
   code: z.string().min(1).max(256 * 1024),
   nonce: z.string().regex(/^[a-f0-9]{16,128}$/i),
+  title: z.string().max(300).optional(),
   timeoutMs: z.number().int().min(1_000).max(120_000).optional(),
 })
 
@@ -1509,8 +1511,16 @@ export class LinuxWorkerBackend implements WorkerBackend {
       },
       async verifyScript(rawReq, opSignal) {
         const parsed = verifyScriptRequestSchema.parse(rawReq)
+        const preparedCode = prepareVerifyScript(parsed.code, parsed.runtime, parsed.title)
         const timeoutMs = (parsed.timeoutMs ?? 90_000) + 15_000
-        const res = await request({ op: 'verify', ...parsed, sdkFiles: readVerifySdkFiles() }, opSignal, timeoutMs)
+        const res = await request({
+          op: 'verify',
+          runtime: parsed.runtime,
+          code: preparedCode,
+          nonce: parsed.nonce,
+          ...(parsed.timeoutMs !== undefined ? { timeoutMs: parsed.timeoutMs } : {}),
+          sdkFiles: readVerifySdkFiles(),
+        }, opSignal, timeoutMs)
         return verifyScriptResultSchema.parse(res.result)
       },
       async verifyStaticAst(rawReq, opSignal) {
