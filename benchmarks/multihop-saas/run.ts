@@ -1173,19 +1173,43 @@ function resolveReceiptChainId(
   addTerminalCandidate(terminalHop?.target?.pathAndQuery, terminalHop?.target?.method)
   if (!terminalCandidates.length) return null
 
-  const matchingSpecs = chainSpecs.filter((spec) =>
-    candidateChainIds.has(spec.chainId)
-    && terminalCandidates.some((cand) =>
-      spec.terminalEndpoints.some((tmpl) => endpointMatchesTemplate(cand, tmpl)),
-    ),
-  )
+  const matchSpecsForCandidates = (candidates: readonly ParsedEndpointCandidate[]): ResolvedChainMatchSpec[] =>
+    chainSpecs.filter((spec) =>
+      candidateChainIds.has(spec.chainId)
+      && candidates.some((cand) =>
+        spec.terminalEndpoints.some((tmpl) => endpointMatchesTemplate(cand, tmpl)),
+      ),
+    )
+
+  let effectiveTerminalHop = terminalHop
+  let readbackTailHop: NonNullable<typeof hops>[number] | undefined
+  let matchingSpecs = matchSpecsForCandidates(terminalCandidates)
+
+  // Post-mutation readback fallback: if the final hop is a read-only GET verification/readback
+  // (e.g. GET /me, GET /orgs/..., GET /profile) that matched no chain terminal, allow resolving
+  // against the penultimate hop while requiring >= 3 hops so at least one upstream hop remains.
+  if (!matchingSpecs.length && hops && hops.length >= 3) {
+    const lastHop = hops[hops.length - 1]!
+    const penultimateHop = hops[hops.length - 2]!
+    const lastParsed = parseEndpointCandidate(lastHop.target?.pathAndQuery, lastHop.target?.method)
+    const penultimateCand = parseEndpointCandidate(penultimateHop.target?.pathAndQuery, penultimateHop.target?.method)
+    if (lastParsed?.method === 'GET' && penultimateCand) {
+      const penultimateMatches = matchSpecsForCandidates([penultimateCand])
+      if (penultimateMatches.length > 0) {
+        matchingSpecs = penultimateMatches
+        effectiveTerminalHop = penultimateHop
+        readbackTailHop = lastHop
+      }
+    }
+  }
+
   if (!matchingSpecs.length) return null
   if (matchingSpecs.length === 1) return matchingSpecs[0]!.chainId
 
   const upstreamCandidates: ParsedEndpointCandidate[] = []
   const seenUp = new Set<string>()
   for (const hop of hops ?? []) {
-    if (hop === terminalHop) continue
+    if (hop === effectiveTerminalHop || hop === readbackTailHop) continue
     const parsed = parseEndpointCandidate(hop.target?.pathAndQuery, hop.target?.method)
     if (!parsed) continue
     const key = `${parsed.method ?? '*'} ${parsed.path}`
@@ -1329,6 +1353,28 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
   })
 
   const confirmedChainIds = new Set(chains.filter((c) => c.twoSideConfirmed).map((c) => c.chainId))
+  const shortcutViolationChainIds = new Set(
+    chains.filter((c) => c.forbiddenShortcutViolation).map((c) => c.chainId),
+  )
+  const shortcutFindingIds = new Set<string>()
+  const shortcutReceiptFallbackIds = new Set<string>()
+  const chainSpecById = new Map(chainSpecs.map((spec) => [spec.chainId, spec]))
+  if (gt.labMode === 'vulnerable' && shortcutViolationChainIds.size > 0) {
+    for (const chain of chains) {
+      if (!chain.forbiddenShortcutViolation) continue
+      for (const fid of chain.matchedFindingIds) shortcutFindingIds.add(fid)
+    }
+    for (const receipt of receipts) {
+      const resolvedChain = resolvedChainByReceipt.get(receipt)
+      const matchedChainId = (receipt.chainId && shortcutViolationChainIds.has(receipt.chainId))
+        ? receipt.chainId
+        : (resolvedChain && shortcutViolationChainIds.has(resolvedChain) ? resolvedChain : null)
+      if (!matchedChainId) continue
+      if (receipt.findingId) shortcutFindingIds.add(receipt.findingId)
+      else shortcutReceiptFallbackIds.add(`receipt:${receipt.chainId}`)
+    }
+  }
+
   const allSpecChainIds = new Set(chainSpecs.map((spec) => spec.chainId))
   const resolvedTwins = resolveProductTwins(gt)
   const twinClaimFindingIds = new Set<string>()
@@ -1336,6 +1382,9 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
     const matchedIds: string[] = []
     const isTwinMode = gt.labMode === 'hardened' || gt.twinId === decoy.twinId
     const baseChainConfirmed = confirmedChainIds.has(decoy.baseChainId)
+    const isVulnerableShortcutBase =
+      gt.labMode === 'vulnerable' && !isTwinMode && shortcutViolationChainIds.has(decoy.baseChainId)
+    const baseChainSpec = chainSpecById.get(decoy.baseChainId)
 
     for (const receipt of receipts) {
       const receiptId = receipt.findingId ?? `receipt:${receipt.chainId}`
@@ -1343,6 +1392,10 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
       const resolvedChainForReceipt = resolvedChainByReceipt.get(receipt)
         ?? resolveReceiptChainId(receipt, allSpecChainIds, chainSpecs, oracleObservedByChain)
       const matchedBaseChain = resolvedChainForReceipt === decoy.baseChainId
+      if (isVulnerableShortcutBase && (receipt.chainId === decoy.baseChainId || matchedBaseChain)) {
+        // Vulnerable-mode shortcut on the base chain is a strict precision/shortcut FP, not a hardened twin hit.
+        continue
+      }
       const receiptMatchesTwin = receipt.chainId === decoy.twinId
         || ((receipt.chainId === decoy.baseChainId || matchedBaseChain) && (isTwinMode || !baseChainConfirmed))
       if (receiptMatchesTwin) {
@@ -1357,6 +1410,26 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
       const id = f.findingId ?? f.id ?? `finding:${i}`
       if (!isTwinMode && confirmedFindingIds.has(id)) continue
       if (matchedIds.includes(id)) continue
+      if (isVulnerableShortcutBase) {
+        const eps = findingEndpoints(f)
+        const hitsBaseTerminal = Boolean(
+          baseChainSpec
+          && eps.some((ep) => {
+            const parsed = parseEndpointCandidate(ep.path, ep.method)
+            return parsed
+              ? baseChainSpec.terminalEndpoints.some((tmpl) => endpointMatchesTemplate(parsed, tmpl))
+              : false
+          }),
+        )
+        if (
+          shortcutFindingIds.has(id)
+          || f.chainId === decoy.baseChainId
+          || hitsBaseTerminal
+          || eps.length === 0
+        ) {
+          continue
+        }
+      }
       if (findingMatchesTwin(f, decoy, { isTwinMode, baseChainConfirmed })) {
         matchedIds.push(id)
         twinClaimFindingIds.add(id)
@@ -1378,15 +1451,33 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
     hardenedTwins.filter((t) => t.falsePositive).length,
   )
   let unmatchedFalsePositives = 0
+  const countedFindingIds = new Set<string>()
   for (let i = 0; i < findings.length; i++) {
     const f = findings[i]!
     const id = f.findingId ?? f.id ?? `finding:${i}`
+    countedFindingIds.add(id)
+    if (f.id) countedFindingIds.add(f.id)
+    if (f.findingId) countedFindingIds.add(f.findingId)
     if (gt.labMode === 'hardened') {
       if (!twinClaimFindingIds.has(id)) hardenedTwinDecoyFps += 1
       continue
     }
     if (confirmedFindingIds.has(id) || twinClaimFindingIds.has(id)) continue
     unmatchedFalsePositives += 1
+  }
+  if (gt.labMode === 'vulnerable') {
+    for (const id of shortcutFindingIds) {
+      if (!countedFindingIds.has(id) && !confirmedFindingIds.has(id) && !twinClaimFindingIds.has(id)) {
+        countedFindingIds.add(id)
+        unmatchedFalsePositives += 1
+      }
+    }
+    for (const id of shortcutReceiptFallbackIds) {
+      if (!countedFindingIds.has(id) && !twinClaimFindingIds.has(id)) {
+        countedFindingIds.add(id)
+        unmatchedFalsePositives += 1
+      }
+    }
   }
 
   const dropReasons = emptyProductDropReasons()

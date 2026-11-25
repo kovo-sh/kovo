@@ -664,6 +664,133 @@ function existingRowHasCompositeProof(
   return Boolean(pr && typeof pr === 'object' && pr.compositeReceipt)
 }
 
+export interface SupersessionEndpointSpec {
+  origin: string
+  method: string | null
+  normalizedEndpoint: string
+}
+
+function parseSupersessionEndpoint(
+  origin: unknown,
+  rawMethod: unknown,
+  rawPath: unknown,
+): SupersessionEndpointSpec | null {
+  if (typeof origin !== 'string' || !origin.trim()) return null
+  const parsed = parseEndpointAndMethodCandidate(rawPath)
+  if (!parsed) return null
+  return {
+    origin: origin.trim(),
+    method: parsed.method ?? normalizeMethodToken(rawMethod),
+    normalizedEndpoint: normalizeEndpointTemplate(parsed.endpoint),
+  }
+}
+
+function dedupeSupersessionEndpoints(endpoints: readonly SupersessionEndpointSpec[]): SupersessionEndpointSpec[] {
+  const out: SupersessionEndpointSpec[] = []
+  const seen = new Set<string>()
+  for (const ep of endpoints) {
+    const key = `${normalizeOrigin(ep.origin)}|${ep.method ?? '*'}|${ep.normalizedEndpoint}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(ep)
+  }
+  return out
+}
+
+export function extractCompositeUpstreamEndpoints(receipt: CompositeProofReceipt): SupersessionEndpointSpec[] {
+  if (!Array.isArray(receipt.hops) || receipt.hops.length < 2) return []
+  const terminalHop = receipt.hops.find(h => h.hopId === receipt.terminalImpact?.terminalHopId)
+    ?? receipt.hops[receipt.hops.length - 1]
+  const out: SupersessionEndpointSpec[] = []
+  for (const hop of receipt.hops) {
+    if (hop === terminalHop) continue
+    const parsed = parseSupersessionEndpoint(hop.target?.origin, hop.target?.method, hop.target?.pathAndQuery)
+    if (parsed) out.push(parsed)
+  }
+  return dedupeSupersessionEndpoints(out)
+}
+
+function extractExistingFindingEndpointsForSupersession(
+  row: typeof findings.$inferSelect,
+  specRow?: ReplaySpecRow,
+): SupersessionEndpointSpec[] {
+  const findingObj = row.finding as Finding & { evidence?: Record<string, unknown> }
+  const ev = findingObj.evidence && typeof findingObj.evidence === 'object' ? findingObj.evidence : undefined
+  const proofReceiptObj = specRow?.proofReceipt && typeof specRow.proofReceipt === 'object'
+    ? specRow.proofReceipt as unknown as Record<string, unknown>
+    : undefined
+  const specObj = specRow?.spec && typeof specRow.spec === 'object'
+    ? specRow.spec as unknown as Record<string, unknown>
+    : undefined
+  const compReceipt = (ev?.compositeReceipt ?? proofReceiptObj?.compositeReceipt ?? specObj?.compositeReceipt) as CompositeProofReceipt | undefined
+  if (compReceipt && Array.isArray(compReceipt.hops) && compReceipt.hops.length > 0) {
+    const hopEndpoints: SupersessionEndpointSpec[] = []
+    for (const hop of compReceipt.hops) {
+      const parsed = parseSupersessionEndpoint(
+        hop.target?.origin || row.finding.origin,
+        hop.target?.method,
+        hop.target?.pathAndQuery,
+      )
+      if (!parsed) return []
+      hopEndpoints.push(parsed)
+    }
+    return dedupeSupersessionEndpoints(hopEndpoints)
+  }
+
+  const singleReceipt = specRow?.proofReceipt?.receipt
+  if (singleReceipt?.target?.pathAndQuery) {
+    const parsed = parseSupersessionEndpoint(
+      singleReceipt.target.origin || row.finding.origin,
+      singleReceipt.target.method,
+      singleReceipt.target.pathAndQuery,
+    )
+    if (parsed) return [parsed]
+  }
+
+  const spec = specRow?.spec
+  if (spec) {
+    if (spec.kind === 'http_chain') {
+      const probeSteps = spec.steps.filter(step => step.role === 'probe')
+      const targetSteps = probeSteps.length > 0 ? probeSteps : spec.steps.slice(-1)
+      const stepEndpoints = targetSteps
+        .map(step => parseSupersessionEndpoint(step.request.origin || row.finding.origin, step.request.method, step.request.pathAndQuery))
+        .filter((ep): ep is SupersessionEndpointSpec => Boolean(ep))
+      if (stepEndpoints.length > 0) return dedupeSupersessionEndpoints(stepEndpoints)
+    } else if (spec.kind === 'rce_proof') {
+      const parsed = parseSupersessionEndpoint(
+        spec.probeStep.request.origin || row.finding.origin,
+        spec.probeStep.request.method,
+        spec.probeStep.request.pathAndQuery,
+      )
+      if (parsed) return [parsed]
+    } else {
+      const extracted = extractSpecEndpointAndMethod(spec, { exchanges: [] })
+      if (extracted.endpoint) {
+        const parsed = parseSupersessionEndpoint(row.finding.origin, extracted.method, extracted.endpoint)
+        if (parsed) return [parsed]
+      }
+    }
+  }
+
+  const compVer = (ev?.compositeVerification ?? proofReceiptObj?.compositeVerification) as CompositeReceiptVerification | undefined
+  const fallback = parseSupersessionEndpoint(row.finding.origin, null, ev?.terminalEndpoint ?? compVer?.terminalEndpoint)
+  return fallback ? [fallback] : []
+}
+
+export function isEndpointSubsetOfUpstream(
+  earlierEndpoints: readonly SupersessionEndpointSpec[],
+  upstreamEndpoints: readonly SupersessionEndpointSpec[],
+): boolean {
+  if (!earlierEndpoints.length || !upstreamEndpoints.length) return false
+  return earlierEndpoints.every(ep =>
+    upstreamEndpoints.some(up =>
+      ep.normalizedEndpoint === up.normalizedEndpoint
+      && methodsCompatibleForAgentProofDedupe(ep.method, up.method)
+      && originsEquivalentForAgentProofDedupe(ep.origin, up.origin, ep.normalizedEndpoint),
+    ),
+  )
+}
+
 /**
  * Confirmation attribution for an agent script proof: reporting vocabulary for a class whose
  * confirmation came from the script's receipt. Only labels/CWE/copy — never a verification input.
@@ -2213,7 +2340,10 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     const upsertOrigins = existingDup
       ? [...new Set([...existingDup.sourceOrigins, origin])]
       : [origin]
-    this.storage.upsertChainFinding(run, upsertAssetId, finding, canonicalSpecId, upsertOrigins)
+    const savedFinding = this.storage.upsertChainFinding(run, upsertAssetId, finding, canonicalSpecId, upsertOrigins)
+    if (cleanCompositeBundle) {
+      this.supersedeUpstreamCompositeFindings(run, savedFinding.id, cleanCompositeBundle.receipt)
+    }
     recordReportedFindingCoverage(this.storage, run, assignment.id, origin, attribution.category, `Confirmed via agent script proof: ${cleanTitle}`, findingId, (r, o) => this.host.permitted(r, o))
     this.storage.event(run.id, 'agent.script_proof_confirmed', `Agent script proof confirmed a ${attribution.label} finding on ${origin}.`, {
       findingId,
@@ -2237,6 +2367,44 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       replaySpecId: canonicalSpecId,
       receiptId: cleanCompositeBundle?.receipt.chainId ?? receipt?.exchangeIds[0] ?? null,
     }
+  }
+
+  private supersedeUpstreamCompositeFindings(
+    run: Run,
+    newFindingId: string,
+    receipt: CompositeProofReceipt,
+  ): string[] {
+    const upstreamEndpoints = extractCompositeUpstreamEndpoints(receipt)
+    if (!upstreamEndpoints.length) return []
+
+    const rows = this.storage.db.select().from(findings).where(eq(findings.runId, run.id)).all()
+    if (!rows.length) return []
+
+    const allSpecs = this.storage.listReplaySpecs(run.id)
+    const specById = new Map(allSpecs.map(s => [s.id, s]))
+    const specByFindingId = new Map<string, ReplaySpecRow>()
+    for (const spec of allSpecs) {
+      if (!specByFindingId.has(spec.findingId)) specByFindingId.set(spec.findingId, spec)
+    }
+
+    const supersededIds: string[] = []
+    for (const row of rows) {
+      if (row.id === newFindingId) continue
+      if (row.supersededByFindingId || row.finding.supersededByFindingId) continue
+      if (row.finding.status !== 'confirmed') continue
+      if (row.provenance === 'floor') continue
+
+      const linkedSpec = (row.replaySpecId ? specById.get(row.replaySpecId) : undefined)
+        ?? specByFindingId.get(row.id)
+      const earlierEndpoints = extractExistingFindingEndpointsForSupersession(row, linkedSpec)
+      if (!isEndpointSubsetOfUpstream(earlierEndpoints, upstreamEndpoints)) continue
+
+      this.storage.updateProposedFinding(run, row.id, {
+        supersededByFindingId: newFindingId,
+      })
+      supersededIds.push(row.id)
+    }
+    return supersededIds
   }
 
   private findCorroboratingAgentProofFinding(
@@ -2518,7 +2686,10 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       }
       if (confirmed) {
         const assetId = findingRow.assetId
-        this.storage.upsertChainFinding(run, assetId, nextFinding, updatedSpec.id, specRow.sourceOrigins)
+        const savedFinding = this.storage.upsertChainFinding(run, assetId, nextFinding, updatedSpec.id, specRow.sourceOrigins)
+        if (cleanReverifyComposite) {
+          this.supersedeUpstreamCompositeFindings(run, savedFinding.id, cleanReverifyComposite.receipt)
+        }
       } else {
         this.storage.updateProposedFinding(run, findingRow.id, {
           replaySpecId: updatedSpec.id,
