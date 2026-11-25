@@ -1286,13 +1286,101 @@ export class VerifyContext {
     }
   }
 
-  /** snake_case aliases matching the documented helper contract. */
-  prove_access_boundary(input: AccessBoundaryInput): Promise<AccessBoundaryProof> { return this.proveAccessBoundary(input) }
-  prove_persisted_mutation(input: PersistedMutationInput): Promise<PersistedMutationProof> { return this.provePersistedMutation(input) }
-  prove_boolean_or_timing_diff(input: BooleanOrTimingDiffInput): Promise<DifferentialProof> { return this.proveBooleanOrTimingDiff(input) }
-  prove_injection_differential(input: Parameters<VerifyContext['proveInjectionDifferential']>[0]) { return this.proveInjectionDifferential(input) }
-  prove_oob_callback(input: OobCallbackInput): Promise<OobCallbackProof> { return this.proveOobCallback(input) }
-  prove_race_burst(input: RaceBurstInput): Promise<RaceBurstProof> { return this.proveRaceBurst(input) }
+  /** snake_case aliases matching the documented helper contract (also accept snake_case keys or positional args). */
+  prove_access_boundary(
+    inputOrControl: AccessBoundaryInput | Record<string, unknown> | string,
+    probePersona?: string,
+    route?: HttpTarget,
+    options?: Partial<AccessBoundaryInput>,
+  ): Promise<AccessBoundaryProof> {
+    if (typeof inputOrControl === 'string') {
+      return this.proveAccessBoundary({
+        ...(options ?? {}),
+        controlPersona: inputOrControl,
+        probePersona: probePersona ?? '',
+        route: route ?? '/',
+      })
+    }
+    const raw = inputOrControl as Record<string, unknown>
+    return this.proveAccessBoundary({
+      ...(raw as unknown as AccessBoundaryInput),
+      controlPersona: String(raw.controlPersona ?? raw.control_persona ?? ''),
+      probePersona: String(raw.probePersona ?? raw.probe_persona ?? ''),
+      route: (raw.route ?? raw.url ?? raw.path ?? '/') as HttpTarget,
+      ...((raw.expectControlDenied ?? raw.expect_control_denied) !== undefined
+        ? { expectControlDenied: Boolean(raw.expectControlDenied ?? raw.expect_control_denied) }
+        : {}),
+      ...((raw.controlOptions ?? raw.control_options) ? { controlOptions: (raw.controlOptions ?? raw.control_options) as HttpOptions } : {}),
+      ...((raw.probeOptions ?? raw.probe_options) ? { probeOptions: (raw.probeOptions ?? raw.probe_options) as HttpOptions } : {}),
+      ...((raw.controlSession ?? raw.control_session) ? { controlSession: String(raw.controlSession ?? raw.control_session) } : {}),
+      ...((raw.probeSession ?? raw.probe_session) ? { probeSession: String(raw.probeSession ?? raw.probe_session) } : {}),
+      ...((raw.boundaryClass ?? raw.boundary_class) ? { boundaryClass: (raw.boundaryClass ?? raw.boundary_class) as 'auth' | 'access' } : {}),
+      ...((raw.actorRoles ?? raw.actor_roles) ? { actorRoles: (raw.actorRoles ?? raw.actor_roles) as Record<string, string> } : {}),
+      ...((raw.actorTenants ?? raw.actor_tenants) ? { actorTenants: (raw.actorTenants ?? raw.actor_tenants) as Record<string, string> } : {}),
+    })
+  }
+  prove_persisted_mutation(input: PersistedMutationInput | Record<string, unknown>): Promise<PersistedMutationProof> {
+    const raw = input as Record<string, unknown>
+    return this.provePersistedMutation({
+      ...(raw as unknown as PersistedMutationInput),
+      readRoute: (raw.readRoute ?? raw.read_route ?? '/') as HttpTarget,
+      mutation: (raw.mutation ?? raw.write ?? '/') as PersistedMutationInput['mutation'],
+      fieldPath: String(raw.fieldPath ?? raw.field_path ?? ''),
+      expectDelta: (raw.expectDelta !== undefined ? raw.expectDelta : raw.expect_delta) as PersistedMutationInput['expectDelta'],
+      ...((raw.readPersona ?? raw.read_persona) ? { readPersona: String(raw.readPersona ?? raw.read_persona) } : {}),
+      ...((raw.mutatePersona ?? raw.mutate_persona) ? { mutatePersona: String(raw.mutatePersona ?? raw.mutate_persona) } : {}),
+      ...((raw.readMethod ?? raw.read_method) ? { readMethod: String(raw.readMethod ?? raw.read_method) } : {}),
+      ...((raw.readSession ?? raw.read_session) ? { readSession: String(raw.readSession ?? raw.read_session) } : {}),
+      ...((raw.impactClass ?? raw.impact_class) ? { impactClass: (raw.impactClass ?? raw.impact_class) as PersistedMutationInput['impactClass'] } : {}),
+      ...((raw.requiredRole ?? raw.required_role) ? { requiredRole: String(raw.requiredRole ?? raw.required_role) } : {}),
+      ...((raw.resourceTenant ?? raw.resource_tenant) ? { resourceTenant: String(raw.resourceTenant ?? raw.resource_tenant) } : {}),
+      ...((raw.oracleEvents ?? raw.oracle_events) ? { oracleEvents: (raw.oracleEvents ?? raw.oracle_events) as string[] } : {}),
+      ...((raw.actorRoles ?? raw.actor_roles) ? { actorRoles: (raw.actorRoles ?? raw.actor_roles) as Record<string, string> } : {}),
+      ...((raw.actorTenants ?? raw.actor_tenants) ? { actorTenants: (raw.actorTenants ?? raw.actor_tenants) as Record<string, string> } : {}),
+    })
+  }
+  prove_boolean_or_timing_diff(input: BooleanOrTimingDiffInput | Record<string, unknown>): Promise<DifferentialProof> {
+    const raw = input as Record<string, unknown>
+    return this.proveBooleanOrTimingDiff({
+      ...(raw as unknown as BooleanOrTimingDiffInput),
+      control: raw.control as BooleanOrTimingDiffInput['control'],
+      variant: raw.variant as BooleanOrTimingDiffInput['variant'],
+      mode: ((raw.mode as 'boolean' | 'timing' | undefined) ?? 'boolean'),
+      ...((raw.minSimilarityDelta ?? raw.min_similarity_delta) !== undefined ? { minSimilarityDelta: Number(raw.minSimilarityDelta ?? raw.min_similarity_delta) } : {}),
+      ...((raw.minDeltaTokens ?? raw.min_delta_tokens) !== undefined ? { minDeltaTokens: Number(raw.minDeltaTokens ?? raw.min_delta_tokens) } : {}),
+      ...((raw.maxSimilarity ?? raw.max_similarity) !== undefined ? { maxSimilarity: Number(raw.maxSimilarity ?? raw.max_similarity) } : {}),
+      ...((raw.maxPValue ?? raw.max_p_value) !== undefined ? { maxPValue: Number(raw.maxPValue ?? raw.max_p_value) } : {}),
+    })
+  }
+  prove_injection_differential(input: Parameters<VerifyContext['proveInjectionDifferential']>[0] | Record<string, unknown>) {
+    const raw = input as Record<string, unknown>
+    return this.proveInjectionDifferential({
+      ...(raw as unknown as Parameters<VerifyContext['proveInjectionDifferential']>[0]),
+      control: raw.control as DifferentialArmInput | HttpTarget,
+      probe: (raw.probe ?? raw.variant) as DifferentialArmInput | HttpTarget,
+      ...((raw.expectedOutput ?? raw.expected_output) !== undefined ? { expectedOutput: String(raw.expectedOutput ?? raw.expected_output) } : {}),
+      ...((raw.vulnClass ?? raw.vuln_class) !== undefined ? { vulnClass: String(raw.vulnClass ?? raw.vuln_class) } : {}),
+    })
+  }
+  prove_oob_callback(input: OobCallbackInput | Record<string, unknown>): Promise<OobCallbackProof> {
+    const raw = input as Record<string, unknown>
+    return this.proveOobCallback({
+      ...(raw as unknown as OobCallbackInput),
+      inject: raw.inject as OobCallbackInput['inject'],
+      ...((raw.timeoutMs ?? raw.timeout_ms) !== undefined ? { timeoutMs: Number(raw.timeoutMs ?? raw.timeout_ms) } : {}),
+      ...((raw.immediateMs ?? raw.immediate_ms) !== undefined ? { immediateMs: Number(raw.immediateMs ?? raw.immediate_ms) } : {}),
+      ...((raw.windowMs ?? raw.window_ms) !== undefined ? { windowMs: Number(raw.windowMs ?? raw.window_ms) } : {}),
+    })
+  }
+  prove_race_burst(input: RaceBurstInput | Record<string, unknown>): Promise<RaceBurstProof> {
+    const raw = input as Record<string, unknown>
+    return this.proveRaceBurst({
+      ...(raw as unknown as RaceBurstInput),
+      requests: raw.requests as RaceBurstInput['requests'],
+      ...((raw.minDistinctOutcomes ?? raw.min_distinct_outcomes) !== undefined ? { minDistinctOutcomes: Number(raw.minDistinctOutcomes ?? raw.min_distinct_outcomes) } : {}),
+      ...((raw.expectAllSuccess ?? raw.expect_all_success) !== undefined ? { expectAllSuccess: Boolean(raw.expectAllSuccess ?? raw.expect_all_success) } : {}),
+    })
+  }
 
   result(input: { title: string; severity?: string; description?: string }): ProofResult {
     if (!input.title || !input.title.trim()) throw new Error('Proof result requires a title.')
@@ -1309,9 +1397,13 @@ export class VerifyContext {
 
 export interface VerificationScript {
   setup?(ctx: VerifyContext): Promise<void> | void
-  verify(ctx: VerifyContext): Promise<ProofResult> | ProofResult
+  verify(ctx: VerifyContext): Promise<ProofResult | unknown> | ProofResult | unknown
   cleanup?(ctx: VerifyContext): Promise<void> | void
 }
+
+export type VerificationEntrypoint =
+  | VerificationScript
+  | ((ctx: VerifyContext) => Promise<ProofResult | unknown> | ProofResult | unknown)
 
 export function defineVerification(script: VerificationScript): VerificationScript {
   return script
@@ -1326,10 +1418,37 @@ function writeResult(value: unknown): void {
   writeFileSync(path, JSON.stringify(value), { mode: 0o600 })
 }
 
+function normalizeProofResult(ctx: VerifyContext, returned: unknown, defaultTitle?: string): ProofResult {
+  const fallbackTitle = (defaultTitle && defaultTitle.trim() ? defaultTitle.trim() : 'Verification script proof').slice(0, 300)
+  if (returned && typeof returned === 'object' && !Array.isArray(returned)) {
+    const rec = returned as Record<string, unknown>
+    if (Array.isArray(rec.claims)) {
+      const title = typeof rec.title === 'string' && rec.title.trim() ? rec.title.trim().slice(0, 300) : fallbackTitle
+      const severity = typeof rec.severity === 'string' && rec.severity.trim() ? rec.severity.trim().slice(0, 32) : 'high'
+      const claims = rec.claims.length > 0 ? (rec.claims as VerifyClaim[]) : [...ctx.claims]
+      return {
+        sdk: 'guardian_verify.ts',
+        nonce: typeof rec.nonce === 'string' && rec.nonce ? rec.nonce : ctx.nonce,
+        title,
+        severity,
+        ...(typeof rec.description === 'string' && rec.description ? { description: rec.description.slice(0, 4000) } : {}),
+        claims,
+      }
+    }
+  }
+  return {
+    sdk: 'guardian_verify.ts',
+    nonce: ctx.nonce,
+    title: fallbackTitle,
+    severity: 'high',
+    claims: [...ctx.claims],
+  }
+}
+
 /** Run the 3-hook contract and emit the claims document. Never prints success as evidence. */
-export async function runVerification(script: VerificationScript): Promise<void> {
+export async function runVerification(script: VerificationScript, defaultTitle?: string): Promise<void> {
   const ctx = new VerifyContext()
-  let result: ProofResult | null = null
+  let result: unknown = null
   try {
     await script.setup?.(ctx)
     result = await script.verify(ctx)
@@ -1341,6 +1460,28 @@ export async function runVerification(script: VerificationScript): Promise<void>
     process.exitCode = 1
     return
   }
-  writeResult(result)
-  process.stdout.write(`guardian_verify: ${result.claims.length} transcript-backed claim(s) recorded\n`)
+  const normalized = normalizeProofResult(ctx, result, defaultTitle)
+  writeResult(normalized)
+  process.stdout.write(`guardian_verify: ${normalized.claims.length} transcript-backed claim(s) recorded\n`)
+}
+
+/**
+ * Run either an inline callback `(ctx) => ...` or a `{ setup?, verify, cleanup? }` script object.
+ * Used by the inline script wrapper so bare bodies and `export default` scripts emit the exact
+ * same signed-transcript proof document as `runVerification(defineVerification(...))`.
+ */
+export async function runEntrypoint(entry: VerificationEntrypoint, defaultTitle?: string): Promise<void> {
+  if (typeof entry === 'function') {
+    await runVerification({ verify: entry }, defaultTitle)
+    return
+  }
+  if (entry && typeof entry === 'object' && typeof entry.verify === 'function') {
+    await runVerification(entry, defaultTitle)
+    return
+  }
+  const ctx = new VerifyContext()
+  const message = 'guardian_verify script must export a default async (ctx) => ... function, an object with verify(ctx), or execute ctx.prove_* directly.'
+  writeResult({ sdk: 'guardian_verify.ts', nonce: ctx.nonce, error: message, claims: [] })
+  process.stderr.write(`guardian_verify: ${message}\n`)
+  process.exitCode = 1
 }

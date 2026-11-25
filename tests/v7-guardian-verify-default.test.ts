@@ -5,21 +5,36 @@
  * feedback.
  */
 import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
+import { once } from 'node:events'
+import { createServer } from 'node:http'
+import { dirname, join } from 'node:path'
 import { test } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import {
   GUARDIAN_VERIFY_TOOL_DESCRIPTION,
+  GUARDIAN_VERIFY_USAGE_HINT,
   SPECIALIST_COMMON_TOOLS,
   SPECIALIST_PROFILES,
   buildWorkerTools,
   filterHandlersForSpecialist,
   proofToolHandlerNames,
+  summarizeGuardianVerifyOutcome,
   verifierRepairFeedback,
   withVerifierRepairFeedback,
   workerSessionInstructions,
 } from '../src/server/agent-session.ts'
 import type { WorkerToolHandlers } from '../src/server/agent-session.ts'
+import { RequestBroker } from '../src/server/broker.ts'
+import type { Grant } from '../src/server/broker.ts'
 import { agentProofAttribution } from '../src/server/exec-verify.ts'
+import type { ResolvedPersona } from '../src/server/persona-vault.ts'
 import { buildAgentScriptReceipt, verifyReceipt, type ScriptProofExchange } from '../src/server/proof-receipt.ts'
+import { createLocalAttemptFactory, prepareVerifyScript, verifyScript } from '../src/server/verify-rpc.ts'
+import { makeLabGrant } from './v4-tier-helpers.ts'
+
+process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+const SDK_DIR = join(dirname(fileURLToPath(import.meta.url)), '../worker/guardian_verify')
 
 function fullHandlers(withGuardianVerify: boolean): WorkerToolHandlers {
   const noop = async () => ({ ok: true })
@@ -259,4 +274,283 @@ test('guardian_verify ProofReceipt cleanly supports BOLA (CWE-639) boundary clai
   assert.ok(reflectedBuilt)
   const reflectedVerdict = verifyReceipt(reflectedBuilt.receipt, reflectedBuilt.transcript)
   assert.equal(reflectedVerdict.confirmed, false, 'raw reflection must fail closed')
+})
+
+async function startBoundaryFixture(): Promise<{ origin: string; grant: Grant; close: () => Promise<void> }> {
+  const server = createServer((req, res) => {
+    const auth = req.headers.authorization ?? ''
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    res.setHeader('content-type', 'application/json')
+    if (url.pathname === '/api/v1/items/1' && req.method === 'GET') {
+      if (auth === 'Bearer tok-user-a') {
+        res.statusCode = 200
+        res.end(JSON.stringify({
+          id: 'item-1',
+          owner_id: 'owner-acme',
+          tenant_id: 'acme',
+          email: 'owner@acme.example',
+          secretNote: 'private-acme-record-001',
+        }))
+        return
+      }
+      res.statusCode = 403
+      res.end(JSON.stringify({ error: 'forbidden' }))
+      return
+    }
+    res.statusCode = 404
+    res.end(JSON.stringify({ error: 'not found' }))
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const port = (server.address() as { port: number }).port
+  const origin = `http://127.0.0.1:${port}`
+  const persona = (handle: string, roleLabel: string, secret: string): ResolvedPersona => ({
+    id: `persona-${handle}`,
+    handle,
+    roleLabel,
+    originAllowlist: [origin],
+    authKind: 'bearer',
+    headerName: 'Authorization',
+    secret,
+    canaryMarkers: [],
+  })
+  const personas = new Map<string, ResolvedPersona>([
+    ['user_a', persona('user_a', 'member (beta)', 'tok-user-a')],
+    ['user_b', persona('user_b', 'viewer (beta)', 'tok-user-b')],
+  ])
+  const grant = makeLabGrant(origin, { tier: 2, personas })
+  return {
+    origin,
+    grant,
+    close: async () => {
+      server.closeAllConnections()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    },
+  }
+}
+
+test('inline TS guardian_verify scripts execute and confirm for bare ctx body, export default, and explicit import styles', async t => {
+  const fixture = await startBoundaryFixture()
+  t.after(() => fixture.close())
+  const makeFactory = () => createLocalAttemptFactory({
+    sdkDir: SDK_DIR,
+    createRpcOptions() {
+      return {
+        broker: new RequestBroker({ rejectUnauthorized: false }),
+        grant: fixture.grant,
+        runId: `run-inline-ts-${randomUUID().slice(0, 8)}`,
+        assignmentId: 'assignment-inline-ts',
+        targetOrigins: [fixture.origin],
+      }
+    },
+  })
+
+  // Tool description includes a concise working inline TS example matching the wrapper contract.
+  assert.match(GUARDIAN_VERIFY_TOOL_DESCRIPTION, /ctx\.prove_access_boundary/)
+  assert.match(GUARDIAN_VERIFY_TOOL_DESCRIPTION, /return ctx\.result\(/)
+
+  // 1. Bare inline TS body (no imports, no export default, no runVerification)
+  const bareVerdict = await verifyScript({
+    candidate: {
+      name: 'bare.ts',
+      runtime: 'ts',
+      code: `
+const proof = await ctx.prove_access_boundary({
+  controlPersona: 'user_b',
+  probePersona: 'user_a',
+  route: '/api/v1/items/1',
+})
+return ctx.result({ title: 'Cross-tenant item read (CWE-639)', severity: 'high' })
+`,
+    },
+    openAttempt: makeFactory(),
+  })
+  assert.equal(bareVerdict.confirmed, true, `${bareVerdict.reason}: ${bareVerdict.detail} | stderr=${bareVerdict.stderrPreview ?? ''}`)
+  assert.equal(bareVerdict.attempts.length, 2)
+  assert.equal(bareVerdict.attempts[0]!.oraclePassed, true)
+  assert.equal(bareVerdict.attempts[1]!.oraclePassed, true)
+
+  // 2. Bare inline TS body with snake_case keys and omitted return ctx.result(...)
+  const bareNoReturnVerdict = await verifyScript({
+    candidate: {
+      name: 'bare-no-return.ts',
+      runtime: 'ts',
+      title: 'Cross-tenant item read auto-result',
+      code: `
+await ctx.prove_access_boundary({
+  control_persona: 'user_b',
+  probe_persona: 'user_a',
+  route: '/api/v1/items/1',
+})
+`,
+    },
+    openAttempt: makeFactory(),
+  })
+  assert.equal(bareNoReturnVerdict.confirmed, true, `${bareNoReturnVerdict.reason}: ${bareNoReturnVerdict.detail}`)
+  assert.equal(bareNoReturnVerdict.claimTitle, 'Cross-tenant item read auto-result')
+
+  // 3. `export default async (ctx) => { ... }` style (previously exited 0 with claims_missing)
+  const exportDefaultVerdict = await verifyScript({
+    candidate: {
+      name: 'export-default.ts',
+      runtime: 'ts',
+      code: `
+export default async (ctx) => {
+  await ctx.prove_access_boundary({
+    controlPersona: 'user_b',
+    probePersona: 'user_a',
+    route: '/api/v1/items/1',
+  })
+  return ctx.result({ title: 'Export default cross-tenant read (CWE-639)', severity: 'high' })
+}
+`,
+    },
+    openAttempt: makeFactory(),
+  })
+  assert.equal(exportDefaultVerdict.confirmed, true, `${exportDefaultVerdict.reason}: ${exportDefaultVerdict.detail}`)
+  assert.equal(exportDefaultVerdict.attempts[0]!.claimCount, 1)
+
+  // 4. Explicit import (even extensionless `'guardian_verify'`) + `export default defineVerification(...)`
+  const importExportVerdict = await verifyScript({
+    candidate: {
+      name: 'import-export.ts',
+      runtime: 'ts',
+      code: `
+import { defineVerification } from 'guardian_verify'
+
+export default defineVerification({
+  async verify(ctx) {
+    await ctx.prove_access_boundary({
+      controlPersona: 'user_b',
+      probePersona: 'user_a',
+      route: '/api/v1/items/1',
+    })
+    return ctx.result({ title: 'Import/export defineVerification read (CWE-639)', severity: 'high' })
+  },
+})
+`,
+    },
+    openAttempt: makeFactory(),
+  })
+  assert.equal(importExportVerdict.confirmed, true, `${importExportVerdict.reason}: ${importExportVerdict.detail}`)
+
+  // 5. Python bare inline script parity
+  const pyBareVerdict = await verifyScript({
+    candidate: {
+      name: 'bare.py',
+      runtime: 'python',
+      title: 'Python bare inline BOLA read',
+      code: `
+ctx.prove_access_boundary('user_b', 'user_a', '/api/v1/items/1')
+`,
+    },
+    openAttempt: makeFactory(),
+  })
+  assert.equal(pyBareVerdict.confirmed, true, `${pyBareVerdict.reason}: ${pyBareVerdict.detail}`)
+
+  // 6. prepareVerifyScript is idempotent across styles
+  const onceWrapped = prepareVerifyScript(`await ctx.prove_access_boundary({ controlPersona: 'user_b', probePersona: 'user_a', route: '/api/v1/items/1' })`, 'ts')
+  assert.equal(prepareVerifyScript(onceWrapped, 'ts'), onceWrapped)
+})
+
+test('failing and zero-claim inline TS scripts fail closed and surface bounded, redacted exitCode + stderrPreview + usageHint', async t => {
+  const fixture = await startBoundaryFixture()
+  t.after(() => fixture.close())
+  const makeFactory = () => createLocalAttemptFactory({
+    sdkDir: SDK_DIR,
+    createRpcOptions() {
+      return {
+        broker: new RequestBroker({ rejectUnauthorized: false }),
+        grant: fixture.grant,
+        runId: `run-inline-fail-${randomUUID().slice(0, 8)}`,
+        assignmentId: 'assignment-inline-fail',
+        targetOrigins: [fixture.origin],
+      }
+    },
+  })
+
+  // 1. Runtime error containing a secret-like token must be redacted and bounded to <= 400 chars
+  const leakedToken = 'Bearer super_secret_inline_token_987654321'
+  const noisyTail = 'X'.repeat(600)
+  const runtimeFailVerdict = await verifyScript({
+    candidate: {
+      name: 'runtime-fail.ts',
+      runtime: 'ts',
+      code: `
+await ctx.http('/api/v1/items/1', { as: 'user_a' })
+throw new Error('custom_probe_boom ${leakedToken} ${noisyTail}')
+`,
+    },
+    openAttempt: makeFactory(),
+  })
+  assert.equal(runtimeFailVerdict.confirmed, false)
+  assert.equal(runtimeFailVerdict.reason, 'claims_missing')
+  assert.equal(runtimeFailVerdict.exitCode, 1)
+  assert.ok(runtimeFailVerdict.stderrPreview && runtimeFailVerdict.stderrPreview.includes('custom_probe_boom'))
+  assert.ok(runtimeFailVerdict.stderrPreview.length <= 400, `stderrPreview must be <= 400 chars, got ${runtimeFailVerdict.stderrPreview.length}`)
+  assert.equal(runtimeFailVerdict.stderrPreview.includes('super_secret_inline_token_987654321'), false, 'stderrPreview must redact Bearer tokens')
+  assert.match(runtimeFailVerdict.stderrPreview, /\[redacted\]/)
+  assert.equal(runtimeFailVerdict.usageHint, GUARDIAN_VERIFY_USAGE_HINT)
+
+  // Summarization preserves exitCode, stderrPreview, and usageHint idempotently across double-summary
+  const summary1 = summarizeGuardianVerifyOutcome(runtimeFailVerdict)
+  const summary2 = summarizeGuardianVerifyOutcome(summary1)
+  for (const summary of [summary1, summary2]) {
+    assert.equal(summary.confirmed, false)
+    assert.equal(summary.exitCode, 1)
+    assert.ok(summary.stderrPreview && summary.stderrPreview.includes('custom_probe_boom'))
+    assert.equal(summary.stderrPreview.includes('super_secret_inline_token_987654321'), false)
+    assert.ok(summary.stderrPreview.length <= 400)
+    assert.equal(summary.usageHint, GUARDIAN_VERIFY_USAGE_HINT)
+  }
+
+  // 2. Zero-claim script (makes an HTTP call but records no claims) still fails closed
+  const zeroClaimsVerdict = await verifyScript({
+    candidate: {
+      name: 'zero-claims.ts',
+      runtime: 'ts',
+      code: `
+await ctx.http('/api/v1/items/1', { as: 'user_a' })
+console.log('confirmed: true')
+`,
+    },
+    openAttempt: makeFactory(),
+  })
+  assert.equal(zeroClaimsVerdict.confirmed, false)
+  assert.equal(zeroClaimsVerdict.reason, 'claims_missing')
+  assert.ok(zeroClaimsVerdict.usageHint, 'zero-claim failure must surface usageHint')
+
+  // 3. Syntax error surfaces non-zero exitCode + stderrPreview through guardian_verify tool output
+  const syntaxFailVerdict = await verifyScript({
+    candidate: {
+      name: 'syntax-fail.ts',
+      runtime: 'ts',
+      code: `await ctx.prove_access_boundary({ unclosed: `,
+    },
+    openAttempt: makeFactory(),
+  })
+  assert.equal(syntaxFailVerdict.confirmed, false)
+  assert.equal(syntaxFailVerdict.reason, 'claims_missing')
+  assert.notEqual(syntaxFailVerdict.exitCode, 0)
+  assert.ok(syntaxFailVerdict.stderrPreview && syntaxFailVerdict.stderrPreview.length > 0 && syntaxFailVerdict.stderrPreview.length <= 400)
+
+  const tools = buildWorkerTools({
+    guardian_verify: async () => syntaxFailVerdict,
+  }, v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {})
+  const gvTool = tools.find(tool => tool.name === 'guardian_verify')!
+  const toolOut = await gvTool.execute(
+    { script: 'await ctx.prove_access_boundary({ unclosed: ' } as never,
+    {} as never,
+    { abortSignal: AbortSignal.timeout(5_000) } as never,
+  ) as { output: Array<{ text?: string }> }
+  const payload = JSON.parse(toolOut.output[0]?.text ?? '{}') as {
+    confirmed: boolean
+    exitCode?: number
+    stderrPreview?: string
+    usageHint?: string
+  }
+  assert.equal(payload.confirmed, false)
+  assert.notEqual(payload.exitCode, 0)
+  assert.ok(payload.stderrPreview && payload.stderrPreview.length > 0 && payload.stderrPreview.length <= 400)
+  assert.equal(payload.usageHint, GUARDIAN_VERIFY_USAGE_HINT)
 })
