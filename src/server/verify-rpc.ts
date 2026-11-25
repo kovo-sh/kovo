@@ -33,7 +33,9 @@ import ipaddr from 'ipaddr.js'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import { buildPersonaHeader } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
-import { redact } from './redact.ts'
+import { redact, redactHeaders } from './redact.ts'
+import { globalKillSwitch, KillSwitchTrippedError, type GlobalKillSwitch } from './kill-switch.ts'
+import { evaluateScopeRequest } from './scope-policy.ts'
 import {
   DerivedCapabilityVault,
   awaitAsyncConvergence,
@@ -367,6 +369,7 @@ export class VerifyRpcServer {
   private readonly asyncPollRecords = new Map<string, HostAsyncPollRecord>()
   private readonly mutatedSessions = new Set<string>()
   private readonly mutatedSessionEntities = new Set<string>()
+  private readonly mintedCanaryIds = new Map<string, string>()
   private lastHostTsMs = 0
   private server: ReturnType<typeof createServer> | null = null
   private hostDirValue = ''
@@ -594,6 +597,7 @@ export class VerifyRpcServer {
     if (!requested) throw new Error('No target origin is configured for this verification session.')
     let url: URL
     try { url = new URL(requested) } catch { throw new Error('Target origin is malformed.') }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('Destination protocol is outside the current assignment scope.')
     const origin = url.origin
     if (!this.options.grant.canRead(origin)) throw new Error('Destination is outside the current assignment scope.')
     return { origin, url }
@@ -628,6 +632,7 @@ export class VerifyRpcServer {
     if (Object.keys(rawHeaders).length > MAX_HEADERS) throw new Error('Too many request headers.')
     for (const [k, v] of Object.entries(rawHeaders)) {
       if (typeof v !== 'string' || v.length > MAX_HEADER_VALUE || /[\r\n\0]/.test(k) || /[\r\n\0]/.test(v)) throw new Error('Invalid request header.')
+      if (k.trimStart().startsWith(':')) continue
       headers[k] = v
     }
     const body = typeof args.body === 'string' ? args.body : undefined
@@ -1218,16 +1223,17 @@ export class VerifyRpcServer {
       const h2 = await this.executeHttp2(prep.applied.brokerRequest, signal, prep.applied.grant)
       this.recordSessionMutation(prep.sessionKey, prep.applied.brokerRequest.method, prep.entityIds, prep.isControlOrAblation, h2.status)
       const body = this.scrub(h2.body)
+      const safeHeaders = this.scrubRecord(redactHeaders(h2.headers))
       const record = this.transcript.record({
         op: 'http2', startedAt: started, durationMs: h2.durationMs, request: prep.requestMeta, body,
         response: {
-          status: h2.status, headers: this.scrubRecord(h2.headers), bodyBytes: Buffer.byteLength(h2.body),
-          bodySha256: createHash('sha256').update(body).digest('hex'), mediaType: h2.headers['content-type'] ?? 'application/octet-stream',
+          status: h2.status, headers: safeHeaders, bodyBytes: Buffer.byteLength(h2.body),
+          bodySha256: createHash('sha256').update(body).digest('hex'), mediaType: safeHeaders['content-type'] ?? 'application/octet-stream',
         },
       })
-      this.recordRequestProvenance(record.exchangeId, started, args, prep.applied.brokerRequest, prep.requestMeta, { body: h2.body, respHeaders: h2.headers }, prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession)
+      this.recordRequestProvenance(record.exchangeId, started, args, prep.applied.brokerRequest, prep.requestMeta, { body: h2.body, respHeaders: h2.rawHeaders }, prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession)
       return this.scrubRecord({
-        exchangeId: record.exchangeId, status: h2.status, headers: h2.headers, body: body.slice(0, 512 * 1024),
+        exchangeId: record.exchangeId, status: h2.status, headers: safeHeaders, body: body.slice(0, 512 * 1024),
         bodyBytes: Buffer.byteLength(h2.body), bodySha256: record.response?.bodySha256, durationMs: h2.durationMs,
         mediaType: record.response?.mediaType, protocol: 'h2',
         ...(prep.applied.attestation?.consumedCapabilityId ? { consumedCapabilityId: prep.applied.attestation.consumedCapabilityId } : {}),
@@ -1236,22 +1242,26 @@ export class VerifyRpcServer {
       })
     } catch (error) {
       const msg = this.scrub(error instanceof Error ? error.message : 'HTTP/2 exchange failed.')
-      const record = this.transcript.record({ op: 'http2', startedAt: started, durationMs: Date.now() - started, request: prep.requestMeta, error: msg, errorCode: /scope|denied|approval|forbidden|outside|header/i.test(msg) ? 'denied' : 'failed' })
+      const record = this.transcript.record({ op: 'http2', startedAt: started, durationMs: Date.now() - started, request: prep.requestMeta, error: msg, errorCode: /scope|denied|approval|forbidden|outside|header|kill.?switch/i.test(msg) ? 'denied' : 'failed' })
       throw new Error(`${record.exchangeId}: ${msg}`)
     }
   }
 
-  /** HTTP/2 stays on the same grant: scope, persona injection, method approval. */
-  private async executeHttp2(req: BrokerHttpRequest, signal: AbortSignal, grant: Grant = this.options.grant): Promise<{ status: number; headers: Record<string, string>; body: string; durationMs: number }> {
+  /** HTTP/2 stays on the same grant: kill switch, scope, persona injection, method approval. */
+  private async executeHttp2(req: BrokerHttpRequest, signal: AbortSignal, grant: Grant = this.options.grant): Promise<{ status: number; headers: Record<string, string>; rawHeaders: Record<string, string>; body: string; durationMs: number }> {
+    const ks = (this.options.broker as unknown as { options?: { killSwitch?: GlobalKillSwitch } })?.options?.killSwitch ?? globalKillSwitch
+    const tenantId = grant.tenantId ?? null
+    ks.assertAllowed(tenantId)
     const localLab = Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
-    let url: URL
-    try {
-      url = new URL(req.pathAndQuery, req.origin)
-    } catch { throw new Error('Request origin or path is malformed.') }
-    if (url.origin !== new URL(req.origin).origin) throw new Error('Request path escaped the requested origin.')
-    if (!grant.canRead(url.origin)) throw new Error('Destination is outside the current assignment scope.')
+    let url: URL, originUrl: URL
+    try { originUrl = new URL(req.origin); url = new URL(req.pathAndQuery, originUrl) } catch { throw new Error('Request origin or path is malformed.') }
     const protocolOk = url.protocol === 'https:' || (localLab && url.protocol === 'http:')
     if (!protocolOk || url.username || url.password || url.hash) throw new Error('HTTP/2 destination is outside the current assignment scope.')
+    if (url.origin !== originUrl.origin || !grant.canRead(url.origin)) throw new Error('Destination is outside the current assignment scope.')
+    if (grant.scopePolicy) {
+      const decision = evaluateScopeRequest(grant.scopePolicy, { origin: url.origin, method: req.method, pathAndQuery: req.pathAndQuery, body: req.body ?? null, headers: req.headers })
+      if (!decision.allowed) throw new Error(decision.reason)
+    }
     if (!localLab && url.port && url.port !== '443') {
       const numeric = Number(url.port)
       if (!Number.isInteger(numeric) || !(grant.allowedPorts ?? []).includes(numeric)) throw new Error('HTTP/2 destination port is not approved for this run.')
@@ -1266,17 +1276,16 @@ export class VerifyRpcServer {
     if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS') {
       const tier = grant.tier ?? 1
       if (tier < 2) throw new Error('HTTP/2 state changes require Tier 2 or higher.')
-      const approved = grant.isStateChangeApproved?.(url.origin, req.method, req.pathAndQuery, {
-        personaHandle: req.persona ?? req.personaHandle ?? null,
-        body: req.body ?? null,
-      })
+      const approved = grant.isStateChangeApproved?.(url.origin, req.method, req.pathAndQuery, { personaHandle: req.persona ?? req.personaHandle ?? null, body: req.body ?? null })
       if (!approved) throw new Error('Tier 3 operator approval required for this HTTP/2 state change.')
     }
     const forwarded = new Set(['authorization', 'proxy-authorization', 'cookie', 'host', 'content-length', 'transfer-encoding', 'x-kovo-trace-id'])
     const headers: Record<string, string> = {}
     for (const [key, value] of Object.entries(req.headers ?? {})) {
-      if (forwarded.has(key.toLowerCase())) throw new Error(`Header "${key}" cannot be set directly; reference an approved persona handle instead.`)
-      headers[key] = value
+      if (key.trimStart().startsWith(':')) continue
+      const lower = key.toLowerCase()
+      if (forwarded.has(lower)) throw new Error(`Header "${key}" cannot be set directly; reference an approved persona handle instead.`)
+      headers[lower] = value
     }
     const personaHandle = req.persona ?? req.personaHandle
     if (personaHandle) {
@@ -1284,23 +1293,25 @@ export class VerifyRpcServer {
       if (!persona) throw new Error(`Persona "${personaHandle}" is not approved for this run.`)
       const injected = buildPersonaHeader(persona, url.origin)
       if (!injected) throw new Error(`Persona "${personaHandle}" does not have an active authenticated session.`)
-      Object.assign(headers, injected)
+      for (const [k, v] of Object.entries(injected)) headers[k.toLowerCase()] = v
     }
+    const ksBound = ks.bindSignal(signal, tenantId)
     const started = Date.now()
-    const authority = `${url.protocol}//${url.host}`
-    const client = h2Connect(authority, { rejectUnauthorized: true })
+    const client = h2Connect(`${url.protocol}//${url.host}`, { rejectUnauthorized: true })
     try {
-      signal.throwIfAborted()
+      ksBound.signal.throwIfAborted()
       const aborted = new Promise<never>((_resolve, reject) => {
-        signal.addEventListener('abort', () => reject(new Error('HTTP/2 request timed out.')), { once: true })
+        ksBound.signal.addEventListener('abort', () => reject(ksBound.signal.reason instanceof KillSwitchTrippedError ? ksBound.signal.reason : new Error('HTTP/2 request timed out.')), { once: true })
       })
       const responsePromise = new Promise<{ status: number; headers: Record<string, string>; body: string }>((resolve, reject) => {
         client.once('error', reject)
         const stream = client.request({
-          ':method': req.method,
-          ':path': req.pathAndQuery,
-          ...(req.body ? { 'content-length': String(Buffer.byteLength(req.body)) } : {}),
           ...headers,
+          ...(req.body ? { 'content-length': String(Buffer.byteLength(req.body)) } : {}),
+          ':method': req.method,
+          ':path': `${url.pathname}${url.search}`,
+          ':authority': url.host,
+          ':scheme': url.protocol.replace(':', ''),
         })
         let status = 0
         let responseHeaders: Record<string, string> = {}
@@ -1316,22 +1327,17 @@ export class VerifyRpcServer {
         })
         stream.on('data', (chunk: Buffer) => {
           captured += chunk.length
-          if (captured > 2 * 1024 * 1024) {
-            stream.close(h2constants.NGHTTP2_CANCEL)
-            reject(new Error('HTTP/2 response exceeded the 2 MiB verification limit.'))
-            return
-          }
+          if (captured > 2 * 1024 * 1024) { stream.close(h2constants.NGHTTP2_CANCEL); reject(new Error('HTTP/2 response exceeded the 2 MiB verification limit.')); return }
           chunks.push(chunk)
         })
         stream.once('error', reject)
         stream.once('end', () => resolve({ status, headers: responseHeaders, body: Buffer.concat(chunks).toString('utf8') }))
-        if (req.body) stream.end(req.body)
-        else stream.end()
+        stream.end(req.body || undefined)
       })
       const response = await Promise.race([responsePromise, aborted])
-      return { ...response, durationMs: Date.now() - started }
+      return { status: response.status, headers: redactHeaders(response.headers), rawHeaders: response.headers, body: response.body, durationMs: Date.now() - started }
     } finally {
-      client.close()
+      client.close(); ksBound.release()
     }
   }
 
@@ -1480,9 +1486,10 @@ export class VerifyRpcServer {
     const action = typeof args.action === 'string' ? args.action : 'mint'
     if (action === 'mint') {
       const label = typeof args.label === 'string' ? args.label.slice(0, 80) : 'verify'
-      const origin = typeof args.origin === 'string' ? args.origin : undefined
+      const origin = typeof args.origin === 'string' && args.origin ? args.origin : this.options.targetOrigins?.[0]
       const started = Date.now()
-      const minted = canary.mintCanary(this.options.runId, label, origin, { assignmentId: this.options.assignmentId })
+      const minted = canary.mintCanary(this.options.runId, label, origin, { assignmentId: this.options.assignmentId }) as ReturnType<VerifyCanaryBroker['mintCanary']> & { id?: string }
+      if (typeof minted.id === 'string' && minted.id) this.mintedCanaryIds.set(minted.token.toLowerCase(), minted.id)
       const record = this.transcript.record({
         op: 'oob',
         startedAt: started,
@@ -1490,24 +1497,22 @@ export class VerifyRpcServer {
         request: { origin: origin ?? '', method: 'MINT', pathAndQuery: '/', headers: {}, bodyBytes: 0, bodySha256: createHash('sha256').update('').digest('hex'), nonce: this.nonce },
         artifact: { kind: 'oob-mint', token: minted.token, url: minted.httpUrl, dnsHost: minted.dnsHost, hit: false },
       })
-      return this.scrubRecord({ exchangeId: record.exchangeId, token: minted.token, url: minted.httpUrl, dnsHost: minted.dnsHost })
+      return this.scrubRecord({ exchangeId: record.exchangeId, token: minted.token, url: minted.httpUrl, dnsHost: minted.dnsHost, ...(minted.id ? { canaryId: minted.id } : {}) })
     }
     if (action === 'subscribe') {
       const token = typeof args.token === 'string' ? args.token.trim().toLowerCase() : ''
       if (!token) throw new Error('oob subscribe requires a canary token.')
-      if (!canary.subscribe) {
-        throw new Error('OOB relay does not expose durable pending_oob subscriptions; a late callback cannot be promoted.')
-      }
-      const exchangeId = typeof args.exchangeId === 'string' ? args.exchangeId : ''
+      if (!canary.subscribe) throw new Error('OOB relay does not expose durable pending_oob subscriptions; a late callback cannot be promoted.')
+      const artifact = typeof args.artifact === 'string' ? args.artifact : ''
       const immediateMs = typeof args.immediateMs === 'number' ? Math.max(0, Math.min(args.immediateMs, 30_000)) : undefined
       const windowMs = typeof args.windowMs === 'number' ? Math.max(1_000, Math.min(args.windowMs, 30 * 60_000)) : undefined
       const started = Date.now()
       const subscription = canary.subscribe({
         runId: this.options.runId,
         assignmentId: this.options.assignmentId,
-        canaryId: typeof args.canaryId === 'string' && args.canaryId ? args.canaryId : token,
+        canaryId: typeof args.canaryId === 'string' && args.canaryId ? args.canaryId : (this.mintedCanaryIds.get(token) ?? token),
         token,
-        artifact: exchangeId,
+        artifact,
         ...(immediateMs !== undefined ? { immediateMs } : {}),
         ...(windowMs !== undefined ? { windowMs } : {}),
       })
