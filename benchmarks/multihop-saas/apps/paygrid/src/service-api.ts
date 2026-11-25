@@ -136,6 +136,11 @@ export async function handleApi(
       sendJson(res, 404, { error: 'unknown org' })
       return
     }
+    // Invite records carry raw pending emails and redemption tokens: only tenant members may list.
+    if (!roleOf(state, session, tenantId)) {
+      sendJson(res, 403, { error: 'not a member of this tenant' })
+      return
+    }
     if (method === 'GET') {
       sendJson(res, 200, { invites: state.invites.filter((invite) => invite.tenantId === tenantId) })
       return
@@ -143,7 +148,7 @@ export async function handleApi(
     const raw = await readBody(req)
     const response = await deps.egress.fetch('idp', '/invites', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-guardian-run-id': runId },
+      headers: { 'content-type': 'application/json', 'x-guardian-run-id': runId, authorization: `Bearer ${session.token}` },
       body: JSON.stringify({ ...(parseJson<Record<string, unknown>>(raw) ?? {}), tenant: state.orgs[tenantId].slug }),
     })
     await proxy(res, response)
@@ -156,7 +161,7 @@ export async function handleApi(
     if (!session) return
     const response = await deps.egress.fetch('idp', `/invites/${encodeURIComponent(revokeInvite[1]!)}/revoke`, {
       method: 'POST',
-      headers: { 'x-guardian-run-id': runId },
+      headers: { 'x-guardian-run-id': runId, authorization: `Bearer ${session.token}` },
     })
     await proxy(res, response)
     return
@@ -201,6 +206,16 @@ export async function handleApi(
     const tenantId = tenantById(state, exportsRoute[0]!)
     if (!tenantId) {
       sendJson(res, 404, { error: 'unknown org' })
+      return
+    }
+    // Tenant membership is a hard gate: cached permissions may only adjust a user's role inside a
+    // tenant they already belong to, never grant access to a foreign one.
+    const memberRole = roleOf(state, session, tenantId)
+    if (!memberRole) {
+      state.emit('export.membership_denied', {
+        tenantId, reason: 'not_member', runId,
+      }, session.originPersona)
+      sendJson(res, 403, { error: 'not a member of this tenant' })
       return
     }
     if (method === 'GET') {
@@ -258,9 +273,22 @@ export async function handleApi(
     const session = auth(state, req, res)
     if (!session) return
     const job = state.jobs.find((item) => item.id === exportUrl[0] && item.kind === 'export')
-    if (!job) {
+    // Ownership: a signed link may only be minted for an export job of the caller's session tenant.
+    if (!job || job.tenantId !== session.tenantId || !roleOf(state, session, job.tenantId)) {
       sendJson(res, 404, { error: 'unknown export' })
       return
+    }
+    if (state.profile.strictExportPath) {
+      // Strict mode: minting re-checks the caller's actual (uncached) role in the job tenant before
+      // handing out a download link.
+      const actual = permissionsFor(roleOf(state, session, job.tenantId))
+      if (!actual.includes('admin') && !actual.includes('member')) {
+        state.emit('export.url_denied', {
+          jobId: job.id, tenantId: job.tenantId, reason: 'insufficient_role', runId,
+        }, session.originPersona)
+        sendJson(res, 403, { error: 'export link requires admin or member' })
+        return
+      }
     }
     const slug = state.orgs[job.tenantId].slug
     const fileName = job.artifactKey ?? state.orgs[job.tenantId].treasuryFile
