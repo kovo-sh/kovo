@@ -136,10 +136,15 @@ function CreateProjectSheet({
           setEnvironment(next)
           if (next !== 'public') setIncludeSubdomains(false)
         }}>
-          <option value="public">Public HTTPS (global unicast IPs only)</option>
-          <option value="local-lab">Local Lab (opt-in loopback/private staging when enabled)</option>
+          <option value="public">Public website (HTTPS only)</option>
+          <option value="local-lab">Local Lab (localhost or private staging, when enabled)</option>
         </NativeSelect>
-        <span className="muted">Local lab requires server-side GUARDIAN_ALLOW_LOCAL_LAB=1 to permit loopback or RFC1918 targets.</span>
+        <span
+          className="muted"
+          title="Requires server-side GUARDIAN_ALLOW_LOCAL_LAB=1 to allow localhost or private-network targets."
+        >
+          Local lab targets (localhost or private network addresses) are blocked by default unless enabled on the server.
+        </span>
       </label>
 
       {environment === 'public' && <div className="field-grid">
@@ -153,7 +158,7 @@ function CreateProjectSheet({
           <span>Include subdomains (<code>*.domain</code>)</span>
         </label>
         <span className="sh-hint">
-          Uses passive CT-log discovery + live DNS in Phase 0 to admit live first-party subdomains into scope. Managed third-party SaaS CNAMEs (e.g. GitBook, Webflow, Shopify, Zendesk) stay excluded unless you explicitly approve them.
+          Discovers your live subdomains automatically before testing begins. Third-party hosted services (such as GitBook, Webflow, Shopify, or Zendesk) stay excluded unless you explicitly approve them.
         </span>
       </div>}
 
@@ -169,7 +174,7 @@ function CreateProjectSheet({
 
     <div className="sheet-f" style={isModal ? { flex: 'none' } : undefined}>
       <span className="muted">
-        {submitStatus || 'Scope stays fail-closed until approved.'}
+        {submitStatus || 'All hosts stay blocked by default until you approve scope.'}
       </span>
       {canCancel && <Button type="button" disabled={action.pending} onClick={onClose}>Cancel</Button>}
       <Button type="submit" variant="default" disabled={action.pending}>
@@ -264,7 +269,7 @@ function Workspace() {
     {!hasModel && <div className="rbanner warn" role="status">
       <Icon name="alert" />
       <span className="grow">
-        <b>Connect a model to run assessments.</b> Configure one or more OpenRouter or compatible LLM profiles for coordinator and worker reviews.
+        <b>Connect an AI model to run assessments.</b> Add an OpenRouter or compatible model profile in Settings.
       </span>
       <Link className="btn" to="/settings" search={{}}>
         Set up model
@@ -275,7 +280,7 @@ function Workspace() {
     {hasModel && poolHealth === 'degraded' && <div className="rbanner warn" role="status">
       <Icon name="alert" />
       <span className="grow">
-        <b>Model failover pool degraded.</b> One or more enabled profiles have an active circuit breaker cooldown.
+        <b>Some model profiles are temporarily unavailable.</b> One or more enabled models are cooling down after recent errors.
       </span>
       <Link className="btn" to="/settings" search={{}}>
         Model settings
@@ -378,7 +383,7 @@ function Workspace() {
             <Link
               to="/projects/$projectId"
               params={{ projectId: project.id }}
-              hash="new-run"
+              search={{ newRun: '1' }}
               className="btn primary"
             >
               New run
