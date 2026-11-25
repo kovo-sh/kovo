@@ -19,6 +19,7 @@ import {
   computeEfficiencyMetrics,
   evaluateAntiHeuristicGate,
   evaluateTwoSideConfirmation,
+  formatMultihopPersonaRoleLabel,
   loadMultihopRuntime,
   parseMultihopArgs,
   pickLoginPath,
@@ -27,6 +28,8 @@ import {
 } from '../scripts/benchmark-multihop.ts'
 import type { MultihopCellMeta, MultihopChainVerdict, SubmittedCompositeProof } from '../scripts/benchmark-multihop.ts'
 import { PreflightError, emptySnapshotMeta } from '../scripts/benchmark-realistic.ts'
+import { parseRoleLabel } from '../src/server/oracle-invariants.ts'
+import { tenantLabelsFromRoleLabels } from '../src/server/exec-dispatch.ts'
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
 
@@ -426,9 +429,13 @@ describe('v8 multihop-saas product runner (scripts/benchmark-multihop.ts)', () =
           assert.equal(card.chainsTotal, 4)
           assert.equal(card.chainsConfirmed, 0)
           assert.equal(card.precision, 1)
+          assert.equal(card.hardenedTwinsTotal, 3)
+          assert.equal(card.hardenedTwinDecoyFps, 0)
+          assert.equal(card.hardenedTwins?.length, 3)
           assert.equal(card.unmatchedFalsePositives, 0)
           assert.equal(card.chains?.length, 4)
           assert.match(runtime.renderScorecard(card, 'md'), /Hop-Depth Funnel/)
+          assert.match(runtime.renderScorecard(card, 'md'), /## Hardened Twins/)
           assert.doesNotThrow(() => JSON.parse(runtime.renderScorecard(card, 'json')))
         } finally {
           await started.stop()
@@ -436,6 +443,288 @@ describe('v8 multihop-saas product runner (scripts/benchmark-multihop.ts)', () =
           await started.stop()
         }
       }
+    } finally {
+      if (prevAllow === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
+      else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prevAllow
+    }
+  })
+
+  it('populates 3 hardened twins per archetype (9 across dev, 12 across all), catches decoy FPs strictly, and wires tenant-scoped personas without admin_bot', async () => {
+    const prevAllow = process.env.GUARDIAN_ALLOW_LOCAL_LAB
+    process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+    try {
+      const runtime = await loadMultihopRuntime()
+      const expectedTwinsByApp: Record<string, string[]> = {
+        paygrid: ['PG-D1', 'PG-D2', 'PG-D3'],
+        shipforge: ['SF-D1', 'SF-D2', 'SF-D3'],
+        nexusiam: ['NX-D1', 'NX-D2', 'NX-D3'],
+        connecthub: ['CH-D1', 'CH-D2', 'CH-D3'],
+      }
+      const decoyProbeByApp: Record<string, { twinId: string; method: string; path: (prefix: string) => string; vulnClass: string }> = {
+        paygrid: {
+          twinId: 'PG-D1',
+          method: 'GET',
+          path: (p) => `${p}/directory/orgs/acme-seed`,
+          vulnClass: 'info_disclosure',
+        },
+        shipforge: {
+          twinId: 'SF-D1',
+          method: 'POST',
+          path: () => '/repos/repo-123/preview-builds',
+          vulnClass: 'info_disclosure',
+        },
+        nexusiam: {
+          twinId: 'NX-D3',
+          method: 'GET',
+          path: () => '/public/profile/acme-seed.css',
+          vulnClass: 'cache_deception',
+        },
+        connecthub: {
+          twinId: 'CH-D1',
+          method: 'POST',
+          path: () => '/authorize',
+          vulnClass: 'oauth',
+        },
+      }
+
+      const makeCellMeta = (
+        appName: 'paygrid' | 'shipforge' | 'nexusiam' | 'connecthub',
+        card: ReturnType<typeof runtime.gradeRun>,
+      ): MultihopCellMeta => ({
+        schemaVersion: 1,
+        app: appName,
+        sealed: appName === 'connecthub',
+        seed: 1,
+        seedSet: 'dev',
+        mode: 'white-box',
+        cell: `${appName}-seed1-white-box`,
+        llm: 'deterministic-no-llm',
+        origin: 'http://127.0.0.1:40000',
+        publicOrigins: ['http://127.0.0.1:40000'],
+        loginPath: '/login',
+        gitSha: 'deadbeef',
+        model: { mode: 'deterministic-no-llm', profiles: [] },
+        verifierBackend: 'local-jq',
+        workerSessions: false,
+        workerSessionsDetail: 'replay-only',
+        dataDirIsolated: false,
+        dataDirSource: null,
+        isolatedProfileNames: [],
+        dataDirKept: false,
+        budgetUsd: 5,
+        maxDurationMs: 1_800_000,
+        startedAt: 0,
+        endedAt: 1000,
+        durationMs: 1000,
+        timedOut: false,
+        terminalStatus: 'complete',
+        terminalPhase: 'done',
+        runId: 'r1',
+        projectId: 'p1',
+        chainsTotal: card.chainsTotal,
+        chainsOracleObserved: card.chainsOracleObserved ?? 0,
+        chainsCompositeConfirmed: card.chainsCompositeConfirmed ?? 0,
+        chainsConfirmed: card.chainsConfirmed,
+        oracleOnlyCount: 0,
+        receiptOnlyCount: 0,
+        shortcutViolations: 0,
+        modeBViolations: 0,
+        recall: card.recall ?? 0,
+        precision: card.precision,
+        hardenedTwinsTotal: card.hardenedTwinsTotal ?? 0,
+        hardenedTwinDecoyFps: card.hardenedTwinDecoyFps ?? 0,
+        unmatchedFalsePositives: card.unmatchedFalsePositives,
+        costUsd: 0,
+        tpPerDollar: null,
+        tpPer10m: 0,
+        hopFunnel: buildHopDepthFunnel(card.chains ?? []),
+        depthBreakdown: {
+          hops3to4: { targets: 3, confirmed: 0, recall: 0 },
+          hops5to6: { targets: 1, confirmed: 0, recall: 0 },
+        },
+        chains: card.chains ?? [],
+        hardenedTwins: card.hardenedTwins ?? [],
+        assignmentsCompleted: 0,
+        assignmentsTotal: 0,
+        investigationCompleted: 0,
+        facts: 0,
+        findingsPersisted: 0,
+        findingsSubmitted: 0,
+        compositeReceiptsExtracted: 0,
+        endpointsDiscovered: 10,
+        requestCount: 0,
+        oracleEventCount: 0,
+        inert: false,
+        snapshot: emptySnapshotMeta(),
+        resumedFrom: null,
+        snapshotSkippedMs: 0,
+        notes: [],
+        shutdown: { engineBusy: 0, appStopped: true, canaryStopped: true },
+      })
+
+      const devCleanCells: MultihopCellMeta[] = []
+      const allCleanCells: MultihopCellMeta[] = []
+
+      for (const appName of ['paygrid', 'shipforge', 'nexusiam', 'connecthub'] as const) {
+        const started = await runtime.startMultihopApp({ app: appName, seed: 1 })
+        try {
+          const white = runtime.briefingFor(started, 'white-box')
+          // All 6 non-bot personas present, never admin_bot, each carrying tenantId + role + orgSlug
+          assert.equal(white.personas.length, 6, `${appName} white-box should expose 6 non-bot personas`)
+          assert.deepEqual(
+            white.personas.map(p => p.id),
+            ['owner_a', 'member_a', 'viewer_a', 'dual_member', 'member_b', 'revoked_or_demoted'],
+          )
+          assert.ok(!white.personas.some(p => p.id === 'admin_bot' || p.role === 'bot'))
+          for (const p of white.personas) {
+            assert.ok(p.tenantId === 'org_a' || p.tenantId === 'org_b', `${appName}/${p.id} missing tenantId`)
+            assert.equal(p.tenantId, p.tenant)
+            assert.ok(typeof p.orgSlug === 'string' && p.orgSlug.length > 0, `${appName}/${p.id} missing orgSlug`)
+          }
+
+          // planCell emits Execution-parseable tenant-scoped roleLabels ending with (org_a)/(org_b)
+          const loginPath = pickLoginPath(white)
+          const planned = planCell(white, loginPath)
+          assert.equal(planned.personas.length, 6)
+          const parsedTenants = tenantLabelsFromRoleLabels(planned.personas.map(p => p.roleLabel))
+          assert.deepEqual(parsedTenants, ['org_a', 'org_b'], `${appName} should extract org_a & org_b`)
+          for (const p of planned.personas) {
+            const parsed = parseRoleLabel(p.roleLabel)
+            assert.equal(parsed.tenant, p.tenantId, `${appName}/${p.handle} parseRoleLabel tenant mismatch: ${p.roleLabel}`)
+            assert.ok(parsed.role !== null, `${appName}/${p.handle} parseRoleLabel role missing: ${p.roleLabel}`)
+            assert.match(p.roleLabel, /\((?:org_a|org_b)\)$/, `${appName}/${p.handle} roleLabel must end with (tenantId)`)
+            assert.ok(p.orgSlug && p.roleLabel.includes(`slug=${p.orgSlug}`), `${appName}/${p.handle} should include orgSlug`)
+          }
+          const dual = planned.personas.find(p => p.handle === 'dual_member')!
+          assert.equal(dual.tenantId, 'org_a')
+          assert.match(dual.roleLabel, /^admin \[.*memberships=admin:org_a,viewer:org_b\] \(org_a\)$/)
+
+          // Defense-in-depth: injecting admin_bot into a briefing fails closed in planCell
+          assert.throws(
+            () => planCell({
+              ...white,
+              personas: [
+                ...white.personas,
+                { id: 'admin_bot', email: 'bot@org-c.example', password: 'pw', tenant: 'org_c', role: 'admin' },
+              ],
+            }, loginPath),
+            /admin_bot/,
+          )
+
+          // Clean run: 3 hardened twins, 0 decoy FPs, precision=1
+          const cleanCard = runtime.gradeRun({
+            groundTruth: started.groundTruth,
+            findings: [],
+            compositeReceipts: [],
+            oracleEvents: started.oracle.events(),
+            requestLog: started.oracle.requests(),
+            egressLog: started.oracle.egress?.() ?? [],
+            ...(started.oracle.export ? { oracleExport: started.oracle.export() } : {}),
+            telemetry: { startedAtMs: 0, endedAtMs: 100, totalCostUsd: 0, budgetUsd: 5, budgetExhausted: false },
+            mode: 'white-box',
+          })
+          assert.equal(cleanCard.hardenedTwinsTotal, 3, `${appName} must report 3 hardened twins`)
+          assert.equal(cleanCard.hardenedTwinDecoyFps, 0)
+          assert.deepEqual(
+            cleanCard.hardenedTwins?.map(t => t.twinId),
+            expectedTwinsByApp[appName],
+          )
+          assert.ok(cleanCard.hardenedTwins?.every(t => t.falsePositive === false))
+
+          const cleanMeta = makeCellMeta(appName, cleanCard)
+          allCleanCells.push(cleanMeta)
+          if (appName !== 'connecthub') devCleanCells.push(cleanMeta)
+
+          // Synthetic finding hitting a hardened twin's decoy endpoint MUST increment hardenedTwinDecoyFps and fail precision gate
+          const prefix = (white.apiReference?.find(r => r.path.includes('/me'))?.path ?? '/v1/me').replace(/\/me$/, '')
+          const probe = decoyProbeByApp[appName]!
+          const poisonedCard = runtime.gradeRun({
+            groundTruth: started.groundTruth,
+            findings: [{
+              id: `syn-decoy-${appName}`,
+              title: 'Synthetic decoy hit',
+              vulnClass: probe.vulnClass,
+              endpoints: [{ method: probe.method, path: probe.path(prefix) }],
+              status: 'confirmed',
+              submittedAtMs: 50,
+            }],
+            compositeReceipts: [],
+            oracleEvents: started.oracle.events(),
+            requestLog: started.oracle.requests(),
+            egressLog: started.oracle.egress?.() ?? [],
+            ...(started.oracle.export ? { oracleExport: started.oracle.export() } : {}),
+            telemetry: { startedAtMs: 0, endedAtMs: 100, totalCostUsd: 0, budgetUsd: 5, budgetExhausted: false },
+            mode: 'white-box',
+          })
+          assert.equal(poisonedCard.hardenedTwinsTotal, 3)
+          assert.equal(poisonedCard.hardenedTwinDecoyFps, 1, `${appName} synthetic decoy finding must trigger hardenedTwinDecoyFps=1`)
+          assert.equal(poisonedCard.unmatchedFalsePositives, 0, `${appName} decoy FP must not double-count as unmatched`)
+          assert.equal(poisonedCard.precision, 0)
+          const hitTwin = poisonedCard.hardenedTwins?.find(t => t.twinId === probe.twinId)
+          assert.ok(hitTwin, `${appName} missing verdict for ${probe.twinId}`)
+          assert.equal(hitTwin.falsePositive, true)
+          assert.deepEqual(hitTwin.matchedFindingIds, [`syn-decoy-${appName}`])
+
+          const poisonedAgg = aggregateMultihopCells([makeCellMeta(appName, poisonedCard)])
+          assert.equal(poisonedAgg.hardenedTwinsTotal, 3)
+          assert.equal(poisonedAgg.hardenedTwinDecoyFps, 1)
+          assert.equal(poisonedAgg.hardenedTwinGatePassed, false)
+
+          // Unrelated non-twin endpoint finding stays unmatchedFalsePositives=1, hardenedTwinDecoyFps=0
+          if (appName === 'paygrid') {
+            const unrelatedCard = runtime.gradeRun({
+              groundTruth: started.groundTruth,
+              findings: [{
+                id: 'syn-unrelated-bola',
+                title: 'Unrelated invoice BOLA FP',
+                vulnClass: 'bola',
+                endpoints: [{ method: 'GET', path: `${prefix}/invoices/inv_123` }],
+                status: 'confirmed',
+                submittedAtMs: 50,
+              }],
+              compositeReceipts: [],
+              oracleEvents: started.oracle.events(),
+              requestLog: started.oracle.requests(),
+              egressLog: started.oracle.egress?.() ?? [],
+              ...(started.oracle.export ? { oracleExport: started.oracle.export() } : {}),
+              telemetry: { startedAtMs: 0, endedAtMs: 100, totalCostUsd: 0, budgetUsd: 5, budgetExhausted: false },
+              mode: 'white-box',
+            })
+            assert.equal(unrelatedCard.hardenedTwinsTotal, 3)
+            assert.equal(unrelatedCard.hardenedTwinDecoyFps, 0)
+            assert.equal(unrelatedCard.unmatchedFalsePositives, 1)
+            assert.equal(unrelatedCard.precision, 0)
+          }
+        } finally {
+          await started.stop()
+        }
+      }
+
+      // Aggregate totals: 9 across dev (--app dev), 12 across all (--app all)
+      const devAgg = aggregateMultihopCells(devCleanCells)
+      assert.equal(devAgg.hardenedTwinsTotal, 9)
+      assert.equal(devAgg.hardenedTwinDecoyFps, 0)
+      assert.equal(devAgg.hardenedTwinGatePassed, true)
+
+      const allAgg = aggregateMultihopCells(allCleanCells)
+      assert.equal(allAgg.hardenedTwinsTotal, 12)
+      assert.equal(allAgg.hardenedTwinDecoyFps, 0)
+      assert.equal(allAgg.hardenedTwinGatePassed, true)
+
+      // Pure helper sanity check
+      assert.equal(
+        formatMultihopPersonaRoleLabel({
+          id: 'member_b',
+          email: 'member@acme-corp.example',
+          password: 'pw',
+          tenant: 'org_b',
+          tenantId: 'org_b',
+          orgSlug: 'acme-corp',
+          role: 'member',
+          rolesByTenant: { org_b: 'member' },
+        }),
+        'member [slug=acme-corp] (org_b)',
+      )
     } finally {
       if (prevAllow === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
       else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prevAllow
