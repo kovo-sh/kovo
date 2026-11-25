@@ -528,7 +528,46 @@ function readVerifiedSessionFile(path: string): { session: MintedPersonaSession;
   return { session, mtimeMs: stat.mtimeMs, ino: stat.ino }
 }
 
-export function readLoginCredentialFile(path: string): {
+/**
+ * Normalize a user-pasted Clerk `__client` cookie value.
+ * Accepts a raw token string, `__client=<value>` (with optional attributes),
+ * or a full `Cookie:` / `Set-Cookie:` header containing `__client=<value>`.
+ */
+export function normalizeClerkClientCookie(raw: string): string {
+  let text = raw.trim()
+  if (!text) return ''
+  text = text.replace(/^(?:set-)?cookie\s*:\s*/i, '').trim()
+  if (!text) return ''
+
+  const parts = text.split(';')
+  for (const part of parts) {
+    const trimmed = part.trim()
+    const match = /^__client\s*=\s*(.+)$/i.exec(trimmed)
+    if (match) {
+      let val = match[1].trim()
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1).trim()
+      }
+      if (!val || /[\r\n\0\s]/.test(val)) return ''
+      return val
+    }
+  }
+
+  // Multi-cookie header without a __client entry is not a valid __client token.
+  if (text.includes(';')) return ''
+  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+    text = text.slice(1, -1).trim()
+  }
+  if (!text || /[\r\n\0\s]/.test(text)) return ''
+  // Reject another single named cookie (e.g. `__session=abc`), while still allowing base64 `=` padding.
+  if (text.includes('=') && !/^[A-Za-z0-9+/_.-]+={1,2}$/.test(text)) return ''
+  return text
+}
+
+export function readLoginCredentialFile(
+  path: string,
+  options: { allowEmptyEmail?: boolean } = {},
+): {
   email: string
   password: string
   mtimeMs: number
@@ -541,8 +580,17 @@ export function readLoginCredentialFile(path: string): {
   } catch {
     throw new Error('Persona login credential file is corrupted.')
   }
-  if (typeof parsed.email !== 'string' || !parsed.email || typeof parsed.password !== 'string' || !parsed.password) {
-    throw new Error('Persona login credential file is missing email or password.')
+  if (
+    typeof parsed.email !== 'string' ||
+    (!options.allowEmptyEmail && !parsed.email) ||
+    typeof parsed.password !== 'string' ||
+    !parsed.password
+  ) {
+    throw new Error(
+      options.allowEmptyEmail
+        ? 'Persona login credential file is missing credential secret.'
+        : 'Persona login credential file is missing email or password.',
+    )
   }
   return { email: parsed.email, password: parsed.password, mtimeMs, ino }
 }
@@ -692,13 +740,23 @@ export function createProjectPersona(storage: Store, input: z.output<typeof crea
     let storedLoginConfig: PersonaLoginConfig | null = null
 
     if (input.authKind === 'login') {
-      if (!input.loginConfig?.email) {
+      const isClerkClient = input.loginConfig?.adapter === 'clerk_client'
+      if (!input.loginConfig || (!isClerkClient && !input.loginConfig.email)) {
         throw new Error('Email and login configuration are required for Email + Password personas.')
       }
-      const email = input.loginConfig.email.trim()
+      const email = input.loginConfig.email?.trim() ?? ''
+      let password = input.secret
+      if (isClerkClient) {
+        const normalized = normalizeClerkClientCookie(input.secret)
+        if (!normalized) {
+          throw new Error('Paste a valid Clerk __client cookie value (raw token, __client=<value>, or Cookie header containing __client=…).')
+        }
+        password = normalized
+      }
+      const { email: _omitEmail, ...restLoginConfig } = input.loginConfig
       storedLoginConfig = {
-        ...input.loginConfig,
-        email,
+        ...restLoginConfig,
+        ...(email ? { email } : {}),
       }
       if (email && !canaryMarkers.some(m => m.toLowerCase() === email.toLowerCase()) && canaryMarkers.length < 16) {
         canaryMarkers.push(email)
@@ -706,7 +764,7 @@ export function createProjectPersona(storage: Store, input: z.output<typeof crea
       const payload: LoginCredentialFilePayload = {
         v: 1,
         email,
-        password: input.secret,
+        password,
       }
       fileBody = JSON.stringify(payload)
     } else {
@@ -798,7 +856,8 @@ export function resolveRunPersonas(storage: Store, projectId: string, approvedPe
     const path = join(storage.directory, 'credentials', row.credentialId)
 
     if (row.authKind === 'login') {
-      const { password, mtimeMs, ino } = readLoginCredentialFile(path)
+      const allowEmptyEmail = row.loginConfig?.adapter === 'clerk_client'
+      const { password, mtimeMs, ino } = readLoginCredentialFile(path, { allowEmptyEmail })
       const sessionPath = path + '.session'
       const sessionRead = readVerifiedSessionFile(sessionPath)
       const history: string[] = [password]

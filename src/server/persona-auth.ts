@@ -6,6 +6,7 @@ import type { IncomingHttpHeaders } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import ipaddr from 'ipaddr.js'
 import {
+  normalizeClerkClientCookie,
   normalizePersonaBundle,
   readLoginCredentialFile,
   resolveRunPersonas,
@@ -1654,13 +1655,15 @@ export class PersonaAuthManager {
       throw new PersonaAuthError('AUTH_FAILED', `Persona "${persona.handle}" is missing login configuration or credential file.`)
     }
 
-    const { email, password } = readLoginCredentialFile(persona.secretPath)
+    const config = persona.loginConfig
+    const { email, password } = readLoginCredentialFile(persona.secretPath, {
+      allowEmptyEmail: config.adapter === 'clerk_client',
+    })
     const targetOrigin = persona.originAllowlist[0]
     if (!targetOrigin) {
       throw new PersonaAuthError('AUTH_FAILED', `Persona "${persona.handle}" has no allowlisted origin configured.`)
     }
 
-    const config = persona.loginConfig
     let adapter: Exclude<PersonaLoginAdapter, 'auto'> | 'oidc'
     let detectedClerkFapiOrigin: string | null = null
 
@@ -1702,6 +1705,8 @@ export class PersonaAuthManager {
         return await this.authenticateOidc(persona, config, email, password, targetOrigin, signal)
       case 'clerk':
         return await this.authenticateClerk(persona, config, email, password, targetOrigin, detectedClerkFapiOrigin, signal)
+      case 'clerk_client':
+        return await this.authenticateClerkClientCookie(persona, config, password, targetOrigin, signal)
       case 'supabase':
         return await this.authenticateSupabase(persona, config, email, password, targetOrigin, signal)
       case 'json':
@@ -1719,6 +1724,7 @@ export class PersonaAuthManager {
     signal?: AbortSignal,
   ): Promise<string> {
     const allowlist = persona.originAllowlist
+    let operatorOriginFallback: string | null = null
     if (config.loginUrl) {
       const parsed = new URL(config.loginUrl)
       // If operator supplied a Clerk FAPI URL (e.g. https://clerk.dyad.sh), use its origin directly.
@@ -1730,10 +1736,14 @@ export class PersonaAuthManager {
       if (parsed.origin !== targetOrigin || /^clerk\./i.test(parsed.hostname) || parsed.pathname.includes('/v1/client')) {
         return parsed.origin
       }
+      if (isLoopbackLiteral(parsed.hostname)) {
+        operatorOriginFallback = parsed.origin
+      }
     }
     if (detectedFapiOrigin && isClerkCredentialHost(detectedFapiOrigin, allowlist, config.loginUrl)) return detectedFapiOrigin
     const inspected = await this.inspectTargetOrigin(targetOrigin, allowlist, signal)
     if (inspected.clerkFapiOrigin) return inspected.clerkFapiOrigin
+    if (operatorOriginFallback) return operatorOriginFallback
     // Only the target origin's registrable domain may host its Clerk instance, and only when the
     // apex is a real registrable domain — never a shared tenant suffix (github.io, vercel.app…)
     // and never a bare last-two-label host (the old `co.uk` bug).
@@ -1758,6 +1768,235 @@ export class PersonaAuthManager {
     return derived
   }
 
+  private clerkFapiAllowlist(
+    persona: ResolvedPersona,
+    config: PersonaLoginConfig,
+    fapiOrigin: string,
+  ): readonly string[] {
+    if (!config.loginUrl) return persona.originAllowlist
+    try {
+      const parsed = new URL(config.loginUrl)
+      if (
+        parsed.protocol === 'https:' &&
+        parsed.origin === fapiOrigin &&
+        /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.clerk\.accounts\.dev$/i.test(normalizeHostname(parsed.hostname))
+      ) {
+        return [...persona.originAllowlist, fapiOrigin]
+      }
+    } catch {
+      // Ignore malformed loginUrl; assertCredentialTarget will reject it.
+    }
+    return persona.originAllowlist
+  }
+
+  private createClerkTokenMinter(params: {
+    persona: ResolvedPersona
+    fapiOrigin: string
+    targetOrigin: string
+    clerkAllowlist: readonly string[]
+    sessionId: string
+    initialClientCookie: string
+    authHeaderToken?: string
+    email: string
+    extraSecrets?: readonly string[]
+  }): {
+    mintFreshToken: () => Promise<{ jwt: string; expiresAt: number }>
+    getClientCookie: () => string
+  } {
+    let clientCookie = params.initialClientCookie
+    let jwt = ''
+    const extraSecrets = (params.extraSecrets ?? []).filter(Boolean)
+
+    const mintFreshToken = async (): Promise<{ jwt: string; expiresAt: number }> => {
+      if (!params.sessionId) {
+        throw new PersonaAuthError('AUTH_FAILED', 'Clerk sign-in did not return a session ID for token refresh.')
+      }
+      const tokenHeaders: Record<string, string> = {
+        Accept: 'application/json',
+        Origin: params.targetOrigin,
+      }
+      if (clientCookie) tokenHeaders.Cookie = `__client=${clientCookie}`
+      else if (params.authHeaderToken) tokenHeaders.Authorization = params.authHeaderToken
+
+      const tokenUrl = `${params.fapiOrigin}/v1/client/sessions/${encodeURIComponent(params.sessionId)}/tokens`
+      const tokenTarget = await this.assertCredentialTarget(tokenUrl, params.clerkAllowlist, 'Clerk token URL')
+      const tokRes = await this.credentialFetch(
+        tokenUrl,
+        { method: 'POST', headers: tokenHeaders },
+        tokenTarget.addresses,
+      )
+      const tokText = await tokRes.text()
+      rejectUnexpectedRedirect(tokRes, 'Clerk token refresh')
+      checkResponseForCaptchaOrMfa(tokText, params.fapiOrigin, params.email)
+      if (!tokRes.ok) {
+        throw new PersonaAuthError(
+          'AUTH_FAILED',
+          `Clerk token refresh failed (${tokRes.status}): ${sanitizeErrorText(tokText, [...extraSecrets, clientCookie, jwt])}`,
+        )
+      }
+      let tokJson: Record<string, unknown> = {}
+      try {
+        tokJson = tokText ? (JSON.parse(tokText) as Record<string, unknown>) : {}
+      } catch {
+        throw new PersonaAuthError('AUTH_FAILED', 'Clerk token refresh returned non-JSON response.')
+      }
+      const rotatedCookies = extractSetCookies(tokRes.headers)
+      const rotatedClient = rotatedCookies.get('__client')
+      const previousClientCookie = clientCookie
+      if (rotatedClient) clientCookie = rotatedClient
+
+      const freshJwt = typeof tokJson.jwt === 'string' ? tokJson.jwt : ''
+      if (!freshJwt) {
+        throw new PersonaAuthError('AUTH_FAILED', 'Clerk token refresh response did not contain a JWT.')
+      }
+      const claims = decodeJwtPayload(freshJwt)
+      const iat = claims?.iat ?? Math.floor(Date.now() / 1000)
+      const expiresAt = claims?.exp ? claims.exp * 1000 : Date.now() + 55_000
+      const cookieHeader = `__session=${freshJwt}; __client_uat=${iat}`
+      const scrubTokens = [
+        freshJwt,
+        previousClientCookie,
+        clientCookie,
+        rotatedClient ?? '',
+        params.authHeaderToken ?? '',
+        ...extraSecrets,
+      ].filter(Boolean)
+      writePersonaSessionFile(params.persona.sessionPath!, {
+        headerType: 'cookie',
+        value: cookieHeader,
+        expiresAt,
+        adapterUsed: 'clerk',
+        scrubTokens,
+      })
+      jwt = freshJwt
+      return { jwt: freshJwt, expiresAt }
+    }
+
+    return {
+      mintFreshToken,
+      getClientCookie: () => clientCookie,
+    }
+  }
+
+  private async authenticateClerkClientCookie(
+    persona: ResolvedPersona,
+    config: PersonaLoginConfig,
+    rawClientCookie: string,
+    targetOrigin: string,
+    signal?: AbortSignal,
+  ): Promise<AuthenticateResult> {
+    const initialClientCookie = normalizeClerkClientCookie(rawClientCookie)
+    if (!initialClientCookie) {
+      throw new PersonaAuthError(
+        'INVALID_CREDENTIALS',
+        'Clerk __client cookie is empty or invalid. Copy the __client cookie value from DevTools → Application → Cookies on clerk.<yourdomain> or *.clerk.accounts.dev.',
+      )
+    }
+
+    const fapiOrigin = await this.resolveClerkFapiOrigin(persona, config, targetOrigin, null, signal)
+    if (!isClerkCredentialHost(fapiOrigin, persona.originAllowlist, config.loginUrl)) {
+      throw new PersonaAuthError('AUTH_FAILED', `Clerk Frontend API host ${fapiOrigin} is outside the persona origin allowlist.`)
+    }
+    const clerkAllowlist = this.clerkFapiAllowlist(persona, config, fapiOrigin)
+    const clientUrl = `${fapiOrigin}/v1/client`
+    const clientTarget = await this.assertCredentialTarget(clientUrl, clerkAllowlist, 'Clerk client URL')
+
+    const res = await this.credentialFetch(
+      clientUrl,
+      {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Origin: targetOrigin,
+          Cookie: `__client=${initialClientCookie}`,
+        },
+      },
+      clientTarget.addresses,
+      signal,
+    )
+
+    const rawText = await res.text()
+    rejectUnexpectedRedirect(res, 'Clerk client lookup')
+    let body: Record<string, unknown> = {}
+    try {
+      body = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : {}
+    } catch {
+      // Non-JSON response handled below
+    }
+
+    const actorLabel = config.email || persona.handle
+    checkResponseForCaptchaOrMfa(rawText, fapiOrigin, actorLabel)
+    const errors = Array.isArray(body.errors) ? (body.errors as Array<Record<string, unknown>>) : []
+    for (const errObj of errors) {
+      const joined = `${String(errObj.code ?? '')} ${String(errObj.message ?? '')} ${String(errObj.long_message ?? '')}`
+      checkResponseForCaptchaOrMfa(joined, fapiOrigin, actorLabel)
+    }
+
+    if (!res.ok || errors.length > 0) {
+      const firstErr = errors[0]
+      const errMsg = String(firstErr?.long_message || firstErr?.message || firstErr?.code || `HTTP ${res.status}`)
+      const isInvalid = res.status === 401 || res.status === 403 || res.status === 422 || /client|session|cookie|unauthorized|expired/i.test(errMsg)
+      throw new PersonaAuthError(
+        isInvalid ? 'INVALID_CREDENTIALS' : 'AUTH_FAILED',
+        `Clerk __client cookie lookup failed (${res.status}): ${sanitizeErrorText(errMsg, [rawClientCookie, initialClientCookie])}`,
+      )
+    }
+
+    const respObj = (body.response && typeof body.response === 'object')
+      ? (body.response as Record<string, unknown>)
+      : (body.client && typeof body.client === 'object')
+        ? (body.client as Record<string, unknown>)
+        : body
+    const sessions = Array.isArray(respObj.sessions)
+      ? (respObj.sessions as Array<Record<string, unknown>>)
+      : []
+    const usableSessions = sessions.filter(s => {
+      if (typeof s.id !== 'string' || !s.id) return false
+      if (typeof s.status === 'string' && /^(?:ended|expired|revoked|removed|abandoned)$/i.test(s.status)) return false
+      return true
+    })
+    const lastActiveId = typeof respObj.last_active_session_id === 'string' && respObj.last_active_session_id
+      ? respObj.last_active_session_id
+      : ''
+    const matchedLastActive = lastActiveId ? usableSessions.find(s => s.id === lastActiveId) : undefined
+    const sessionId =
+      (matchedLastActive && typeof matchedLastActive.id === 'string' ? matchedLastActive.id : '') ||
+      (lastActiveId && sessions.length === 0 ? lastActiveId : '') ||
+      (typeof usableSessions[0]?.id === 'string' ? (usableSessions[0].id as string) : '')
+
+    if (!sessionId) {
+      throw new PersonaAuthError(
+        'INVALID_CREDENTIALS',
+        'Clerk __client cookie has no active session (cookie may be expired or signed out). Sign in again in your browser and copy a fresh __client cookie from DevTools.',
+      )
+    }
+
+    const rotatedCookies = extractSetCookies(res.headers)
+    const effectiveClientCookie = rotatedCookies.get('__client') || initialClientCookie
+    const { mintFreshToken } = this.createClerkTokenMinter({
+      persona,
+      fapiOrigin,
+      targetOrigin,
+      clerkAllowlist,
+      sessionId,
+      initialClientCookie: effectiveClientCookie,
+      email: actorLabel,
+      extraSecrets: [rawClientCookie, initialClientCookie, effectiveClientCookie],
+    })
+
+    const { expiresAt } = await mintFreshToken()
+    const refreshIntervalSec = config.refreshIntervalSec ?? DEFAULT_CLERK_REFRESH_SEC
+    return {
+      personaId: persona.id,
+      handle: persona.handle,
+      adapterUsed: 'clerk',
+      headerType: 'cookie',
+      expiresAt,
+      refreshIntervalSec,
+      refresh: async () => { await mintFreshToken() },
+    }
+  }
+
   private async authenticateClerk(
     persona: ResolvedPersona,
     config: PersonaLoginConfig,
@@ -1768,8 +2007,9 @@ export class PersonaAuthManager {
     signal?: AbortSignal,
   ): Promise<AuthenticateResult> {
     const fapiOrigin = await this.resolveClerkFapiOrigin(persona, config, targetOrigin, detectedClerkFapiOrigin, signal)
+    const clerkAllowlist = this.clerkFapiAllowlist(persona, config, fapiOrigin)
     const signInUrl = `${fapiOrigin}/v1/client/sign_ins`
-    const signInTarget = await this.assertCredentialTarget(signInUrl, persona.originAllowlist, 'Clerk sign-in URL')
+    const signInTarget = await this.assertCredentialTarget(signInUrl, clerkAllowlist, 'Clerk sign-in URL')
     const form = new URLSearchParams({
       identifier: email,
       password,
@@ -1827,7 +2067,7 @@ export class PersonaAuthManager {
     }
 
     const cookies = extractSetCookies(res.headers)
-    let clientCookie = cookies.get('__client') ?? ''
+    const clientCookie = cookies.get('__client') ?? ''
     const authHeaderToken = res.headers.get('authorization') ?? ''
 
     const clientObj = (body.client && typeof body.client === 'object')
@@ -1857,59 +2097,17 @@ export class PersonaAuthManager {
       cookies.get('__session') ||
       ''
 
-    const mintFreshToken = async (): Promise<{ jwt: string; expiresAt: number }> => {
-      if (!sessionId) {
-        throw new PersonaAuthError('AUTH_FAILED', 'Clerk sign-in did not return a session ID for token refresh.')
-      }
-      const tokenHeaders: Record<string, string> = {
-        Accept: 'application/json',
-        Origin: targetOrigin,
-      }
-      if (clientCookie) tokenHeaders.Cookie = `__client=${clientCookie}`
-      else if (authHeaderToken) tokenHeaders.Authorization = authHeaderToken
-
-      const tokenUrl = `${fapiOrigin}/v1/client/sessions/${encodeURIComponent(sessionId)}/tokens`
-      const tokenTarget = await this.assertCredentialTarget(tokenUrl, persona.originAllowlist, 'Clerk token URL')
-      const tokRes = await this.credentialFetch(
-        tokenUrl,
-        { method: 'POST', headers: tokenHeaders },
-        tokenTarget.addresses,
-      )
-      const tokText = await tokRes.text()
-      rejectUnexpectedRedirect(tokRes, 'Clerk token refresh')
-      checkResponseForCaptchaOrMfa(tokText, fapiOrigin, email)
-      if (!tokRes.ok) {
-        throw new PersonaAuthError('AUTH_FAILED', `Clerk token refresh failed (${tokRes.status}): ${sanitizeErrorText(tokText, [password, clientCookie, jwt])}`)
-      }
-      let tokJson: Record<string, unknown> = {}
-      try {
-        tokJson = tokText ? (JSON.parse(tokText) as Record<string, unknown>) : {}
-      } catch {
-        throw new PersonaAuthError('AUTH_FAILED', 'Clerk token refresh returned non-JSON response.')
-      }
-      const rotatedCookies = extractSetCookies(tokRes.headers)
-      const rotatedClient = rotatedCookies.get('__client')
-      if (rotatedClient) clientCookie = rotatedClient
-
-      const freshJwt = typeof tokJson.jwt === 'string' ? tokJson.jwt : ''
-      if (!freshJwt) {
-        throw new PersonaAuthError('AUTH_FAILED', 'Clerk token refresh response did not contain a JWT.')
-      }
-      const claims = decodeJwtPayload(freshJwt)
-      const iat = claims?.iat ?? Math.floor(Date.now() / 1000)
-      const expiresAt = claims?.exp ? claims.exp * 1000 : Date.now() + 55_000
-      const cookieHeader = `__session=${freshJwt}; __client_uat=${iat}`
-      const scrubTokens = [freshJwt, clientCookie, rotatedClient ?? '', authHeaderToken].filter(Boolean)
-      writePersonaSessionFile(persona.sessionPath!, {
-        headerType: 'cookie',
-        value: cookieHeader,
-        expiresAt,
-        adapterUsed: 'clerk',
-        scrubTokens,
-      })
-      jwt = freshJwt
-      return { jwt: freshJwt, expiresAt }
-    }
+    const { mintFreshToken, getClientCookie } = this.createClerkTokenMinter({
+      persona,
+      fapiOrigin,
+      targetOrigin,
+      clerkAllowlist,
+      sessionId,
+      initialClientCookie: clientCookie,
+      authHeaderToken,
+      email,
+      extraSecrets: [password],
+    })
 
     let expiresAt: number
     if (!jwt) {
@@ -1938,7 +2136,7 @@ export class PersonaAuthManager {
     }
 
     const refreshIntervalSec = config.refreshIntervalSec ?? DEFAULT_CLERK_REFRESH_SEC
-    const canRefresh = Boolean(sessionId && (clientCookie || authHeaderToken))
+    const canRefresh = Boolean(sessionId && (getClientCookie() || authHeaderToken))
     return {
       personaId: persona.id,
       handle: persona.handle,
