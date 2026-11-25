@@ -11,7 +11,7 @@ const credentialPatterns = [
   /-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\n]*PRIVATE KEY-----/g,
   /\b(?:authorization|proxy-authorization|cookie|set-cookie)\s*:\s*[^\n\r"]+/gi,
   /\bBearer\s+[a-z0-9._~+/=-]{8,}/gi,
-  /("(?:[^"\n\r\\]*[_-])?(?:password|api[_-]?key|token|secret|session[_-]?(?:id|key)|client[_-]?secret|service[_-]?role[_-]?key)"\s*:\s*)(?:(null|\{|\[)|"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false)|(?<![A-Za-z0-9])(?:password|api[_-]?key|token|secret|session[_-]?(?:id|key)|client[_-]?secret|service[_-]?role[_-]?key)["']?\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'[^']*'|[^\s&,;}]+)/gi,
+  /("[A-Za-z0-9_-]*(?:password|passwd|api[_-]?key|signing[_-]?key|private[_-]?key|token|secret|session[_-]?(?:id|key)|service[_-]?role[_-]?key)"\s*:\s*)(?:(null|\{|\[)|"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false)|(?<![A-Za-z0-9_-])[A-Za-z0-9_-]*(?:password|passwd|api[_-]?key|signing[_-]?key|private[_-]?key|token|secret|session[_-]?(?:id|key)|service[_-]?role[_-]?key)["']?\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'[^']*'|[^\s&,;}"']+)/gi,
 ]
 
 export function redact(text: string, secrets: readonly NamedSecret[] = []): string {
@@ -376,14 +376,15 @@ function scrubSensitiveSubtree(value: unknown): unknown {
   return value
 }
 
+const sensitiveCredentialKeyPattern = /^(?:[A-Za-z0-9_-]*(?:password|passwd|api[_-]?key|signing[_-]?key|private[_-]?key|token|secret|session[_-]?(?:id|key)|service[_-]?role[_-]?key)|credentials?|authorization|cookie|set-cookie)$/i
+
 export function redactJsonValue<T>(value: T, secrets: readonly NamedSecret[] = []): T {
   if (typeof value === 'string') return redact(value, secrets) as unknown as T
   if (Array.isArray(value)) return value.map(item => redactJsonValue(item, secrets)) as unknown as T
   if (value && typeof value === 'object') {
     const out: Record<string, unknown> = {}
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      const sensitiveKey = /^(?:password|api[_-]?key|x-api-key|x-auth-token|x-csrf-token|x-xsrf-token|token|access[_-]?token|refresh[_-]?token|id[_-]?token|bearer[_-]?token|secret|client[_-]?secret|service[_-]?role[_-]?key|private[_-]?key|session[_-]?(?:id|key)|credentials?|authorization|cookie|set-cookie)$/i.test(k)
-      out[k] = sensitiveKey ? scrubSensitiveSubtree(v) : redactJsonValue(v, secrets)
+      out[k] = sensitiveCredentialKeyPattern.test(k) ? scrubSensitiveSubtree(v) : redactJsonValue(v, secrets)
     }
     return out as T
   }
@@ -485,8 +486,7 @@ export function redactZdrJsonValue<T>(value: T, options: PiiRedactionOptions = {
   if (value && typeof value === 'object') {
     const out: Record<string, unknown> = {}
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      const isCredentialKey = /^(?:password|api[_-]?key|x-api-key|x-auth-token|x-csrf-token|x-xsrf-token|token|access[_-]?token|refresh[_-]?token|id[_-]?token|bearer[_-]?token|secret|client[_-]?secret|service[_-]?role[_-]?key|private[_-]?key|session[_-]?(?:id|key)|credentials?|authorization|cookie|set-cookie)$/i.test(k)
-      if (isCredentialKey) {
+      if (sensitiveCredentialKeyPattern.test(k)) {
         out[k] = scrubSensitiveSubtree(v)
       } else if (sensitivePiiKeyPattern.test(k)) {
         out[k] = typeof v === 'string' || typeof v === 'number' ? '[pii:redacted]' : scrubSensitiveSubtree(v)

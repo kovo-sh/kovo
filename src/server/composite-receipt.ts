@@ -590,15 +590,17 @@ function dispatchDefaultV8Oracle(
     if (!terminalCtrl || !rootEx || !termEx) return rejectFam(`v8_oracle_failed (${family}): missing_pivot_control_or_terminal_record`, ['pre_chain_control_denied', TERMINAL_IMPACT_UNPROVEN_HINT])
     const hops: CrossSurfaceHop[] = dag.topoOrder.map((hopId, i) => {
       const h = dag.hopsById.get(hopId)!, edge = (dag.incomingByHop.get(hopId) ?? [])[0]?.edge
+      const outCorr = receipt.causalEdges.find(e => e.fromHopId === hopId && (e.kind === 'async_pivot_binding' || e.kind === 'state_transition_binding'))
+      const outArt = receipt.causalEdges.find(e => e.fromHopId === hopId && (e.kind === 'value_binding' || e.kind === 'derived_crypto_binding'))
       const ex = (i === dag.topoOrder.length - 1 ? termEx : h.exchangeIds.map(id => idx.entriesById.get(id)!).find(e => e.step.arm === 'probe')) ?? idx.entriesById.get(h.exchangeIds[0]!)!
       const rec = toOracleRecord(ex, sig), abl = edge?.kind === 'state_transition_binding' ? idx.entriesById.get(edge.ablationExchangeIds[0]!) : undefined
+      const corr = (edge?.kind === 'async_pivot_binding' ? edge.correlationId : edge?.kind === 'state_transition_binding' ? edge.entityId : undefined) ?? (outCorr?.kind === 'async_pivot_binding' ? outCorr.correlationId : outCorr?.kind === 'state_transition_binding' ? outCorr.entityId : undefined) ?? ex.correlationIds?.[0] ?? h.entityId
+      const emitted = (outArt?.kind === 'value_binding' ? (outArt.capabilityHandle ?? outArt.valueDigest) : outArt?.kind === 'derived_crypto_binding' ? outArt.sourceCapabilityId : undefined) ?? h.producedCapabilities[0] ?? rec.artifactDigest
       return {
         surface: h.surface, role: i === dag.topoOrder.length - 1 ? 'terminal_impact' : h.surface === 'browser' ? 'browser_dom_trace' : h.surface === 'webhook' ? 'oob_callback' : 'trigger_write',
-        record: rec, ...(edge ? { bindingKind: edge.kind } : {}), emittedArtifactDigest: h.producedCapabilities[0] ?? rec.artifactDigest,
+        record: rec, ...(edge ? { bindingKind: edge.kind } : {}), emittedArtifactDigest: emitted, ...(corr ? { correlationToken: corr } : {}),
         ...(edge?.kind === 'value_binding' ? { consumedArtifactDigest: edge.capabilityHandle ?? edge.valueDigest ?? h.consumedCapabilities[0] } : {}),
-        ...(edge?.kind === 'derived_crypto_binding' ? { derivedFromCapabilityId: edge.sourceCapabilityId } : {}),
-        ...(edge?.kind === 'async_pivot_binding' ? { correlationToken: edge.correlationId } : {}),
-        ...(edge?.kind === 'state_transition_binding' ? { correlationToken: edge.entityId, ...(abl ? { ablationControlDenied: toOracleRecord(abl, sig) } : {}) } : {}),
+        ...(edge?.kind === 'derived_crypto_binding' ? { derivedFromCapabilityId: edge.sourceCapabilityId } : {}), ...(edge?.kind === 'state_transition_binding' && abl ? { ablationControlDenied: toOracleRecord(abl, sig) } : {}),
       }
     })
     const dec = evaluateV8OracleFamily('cross_surface_pivot', {
