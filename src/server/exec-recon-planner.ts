@@ -178,6 +178,12 @@ import {
 import type { NamedSecret } from './redact.ts'
 import { responseReview } from './response-checks.ts'
 import { availableReviewChecks, parseReviewPlan, reviewPlanPrompt, standardChecks } from './review-plan.ts'
+import {
+  HOST_PLANNER_PRODUCER,
+  isTrustedHostControlFact,
+  type SpawnTaskOptions,
+  type SupervisedTask,
+} from './run-actor.ts'
 import { findings, messages } from './schema.ts'
 import { runVariantSweepForFinding } from './semantic-audit.ts'
 import type { StaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
@@ -579,6 +585,12 @@ export interface ExecReconPlannerHost extends ExecCoreServices {
   codeSliceForAssignment: (run: Pick<Run, 'id'>, step: Pick<ChainStep, 'title' | 'hypothesis'>, parentFacts: readonly Fact[]) => CodeDataflowSlice | undefined
   shouldCoordinatorAnswer: (content: string) => boolean
   resetBoardHops: (run: Run) => void
+  spawnRunTask?: <T = void>(
+    runId: string,
+    label: string,
+    fn: (signal: AbortSignal) => Promise<T> | T,
+    options?: SpawnTaskOptions,
+  ) => SupervisedTask<T>
 }
 
 /**
@@ -2345,8 +2357,9 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   /** All deterministic lead facts for the run (not only parent-fact dependencies). */
   detLeadSummaries(run: Run): DetLeadSummary[] {
     try {
-      const facts = this.storage.listFacts(run.id, { includeTainted: false, limit: 200 })
-        .filter(f => f.data?.kind === 'det_lead')
+      const facts = this.pageAll((offset, limit) =>
+        this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
+        .filter(f => isTrustedHostControlFact(f, 'det_lead'))
       return detLeadsFromParentFacts(facts)
     } catch {
       return []
@@ -2571,10 +2584,12 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
    */
   /** Program-Graph code leads carrying a dataflow slice, RBAC policy diff, or static secret/IaC lead. */
   tierALeadFacts(run: Pick<Run, 'id'>): Fact[] {
-    return this.storage.listFacts(run.id, { includeTainted: false, limit: 200 })
+    return this.pageAll((offset, limit) =>
+      this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
       .filter(fact => {
+        if (!isTrustedHostControlFact(fact, 'det_lead')) return false
         const data = fact.data
-        if (data?.kind !== 'det_lead' || data.source !== 'program_graph') return false
+        if (data?.source !== 'program_graph') return false
         const slice = data.codeSlice as { hops?: unknown } | undefined
         const hasSlice = Boolean(slice && Array.isArray(slice.hops) && slice.hops.length > 0)
         const hasPolicyDiff = (Array.isArray(data.guardDiff) && data.guardDiff.length > 0) || data.policyDiff === true
@@ -2679,7 +2694,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   queueDetLeadUpgradeSteps(run: Run, approvedOrigins: ReadonlySet<string>, budget: number): number {
     const confirmedKeys = new Set(this.alreadyConfirmedRefs(run, 100).map(ref =>
       `${normalizeConfirmedRouteTemplate(ref.path)}|${confirmedCategoryFamily(ref.probeClass ?? '')}`))
-    const facts = [...this.storage.listFacts(run.id, { includeTainted: false, limit: 200 })]
+    const facts = [...this.pageAll((offset, limit) =>
+      this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))]
       .sort((a, b) => {
         const keyOf = (fact: typeof a) =>
           `${fact.data?.source === 'program_graph' ? '0' : '1'}\u0000${String(fact.data?.endpoint ?? '')}\u0000${String(fact.data?.method ?? '')}\u0000${String(fact.data?.probeClass ?? '')}\u0000${fact.id}`
@@ -2691,7 +2707,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     let created = 0
     for (const fact of facts) {
       if (slots <= 0 || created >= 4) break
-      if (fact.data?.kind !== 'det_lead' || !approvedOrigins.has(fact.origin) || boundFactIds.has(fact.id)) continue
+      if (!isTrustedHostControlFact(fact, 'det_lead') || !approvedOrigins.has(fact.origin) || boundFactIds.has(fact.id)) continue
       const endpoint = typeof fact.data.endpoint === 'string' ? fact.data.endpoint : ''
       const probeClass = typeof fact.data.probeClass === 'string' ? fact.data.probeClass : ''
       const method = typeof fact.data.method === 'string' ? fact.data.method.toUpperCase() : 'GET'
@@ -2833,7 +2849,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         }
       })
       const parentDetLead = input.detLeads.find(lead =>
-        input.parentFacts.some(f => f.data?.kind === 'det_lead' && f.id === lead.exchangeId) ||
+        input.parentFacts.some(f => isTrustedHostControlFact(f, 'det_lead') && f.id === lead.exchangeId) ||
         (Boolean(lead.endpoint) && input.targetOrigins.includes(origin)),
       )
       const missionKind = parentChainHops.length > 0 && input.step.dependsOnFactIds.length > 0
@@ -2863,8 +2879,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
             `${hop.artifactKind}:${hop.artifactRef}${hop.stateAfter ? `[${hop.stateBefore ?? '*'}->${hop.stateAfter}]` : ''}`).join('→')
         : ''
       // v8: Resolve canonical <= 2 KB HopCheckpointBrief from SQLite CapabilityLedger (restart-safe)
-      // or persisted step/fact checkpoint metadata, without 480 B truncation or 'artifact' skip.
-      const checkpointFact = input.parentFacts.find(f => !f.tainted && f.data?.subkind === 'hop_checkpoint')
+      // or persisted host-authored checkpoint metadata, without 480 B truncation or 'artifact' skip.
+      const checkpointFact = input.parentFacts.find(f => isTrustedHostControlFact(f, 'hop_checkpoint'))
       const cachedCheckpoint = this.persistedStepCheckpoints.get(input.step.id)
       const persistedBrief = parseHopCheckpointJson(checkpointFact?.data?.checkpointBrief ?? checkpointFact?.data?.checkpointJson)
         ?? parseHopCheckpointJson(cachedCheckpoint?.checkpointJson)
@@ -3134,6 +3150,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
               origin: step.origins[0] ?? run.candidates[0]?.origin ?? '',
               summary: `Hop checkpoint (${checkpointCapId ?? parsedBrief?.brief.branchKey ?? 'branch'})`,
               data: {
+                producer: HOST_PLANNER_PRODUCER,
+                source: HOST_PLANNER_PRODUCER,
                 subkind: 'hop_checkpoint',
                 ...(checkpointCapId ? { checkpointCapId } : {}),
                 ...(checkpointJson ? { checkpointJson } : {}),
@@ -3373,7 +3391,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       ...input.recordedFacts.map(f => f.id),
     ])].slice(0, 12)
     const liveFactIds = new Set(
-      this.storage.listFacts(run.id, { includeTainted: false, limit: 500 }).map(f => f.id),
+      this.pageAll((offset, limit) =>
+        this.storage.listFacts(run.id, { includeTainted: false, limit, offset })).map(f => f.id),
     )
 
     const beforeIds = new Set(existingSteps.map(s => s.id))
@@ -3757,7 +3776,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       this.storage.listFacts(fresh.id, { includeTainted: false, limit, offset }))
       .filter(fact => approvedOrigins.has(fact.origin))
     const detLeadFactIds = new Set(allUntaintedFacts
-      .filter(fact => fact.data?.kind === 'det_lead')
+      .filter(fact => isTrustedHostControlFact(fact, 'det_lead'))
       .map(fact => fact.id))
     const personas = [...resolveRunPersonas(this.storage, updated.projectId, updated.approvedPersonaIds).values()]
       .map(persona => ({ handle: persona.handle, roleLabel: persona.roleLabel, originAllowlist: persona.originAllowlist }))
@@ -4235,33 +4254,42 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       turnsUsed: run.turnsUsed,
     })
 
-    void agentTurn({
-      directory: this.storage.directory,
-      sessionId: run.coordinatorId,
-      requestId: `${next.id}:${run.goalRevision}:${run.scopeRevision}`,
-      profiles: resolveProfilePoolForRole('fast', profiles),
-      scenario: 'coordinator',
-      roleAffinity: 'fast',
-      thinkingLevel: 'off',
-      prompt,
-      signal: controller.signal,
-      ...llmRunHooks(this.storage, run.id),
-    }).then(answer => {
-      if (!this.host.currentCoordinator(run.id, task)) return
-      this.storage.transaction(() => {
-        this.storage.message(run.id, run.coordinatorId, 'coordinator', answer, next.id)
-        this.storage.event(run.id, 'coordinator.reply', 'The coordinator replied.')
-      })
-    }).catch(() => {
-      if (!this.host.currentCoordinator(run.id, task)) return
-      this.storage.transaction(() => {
-        this.storage.message(run.id, run.coordinatorId, 'kovo',
-          'The coordinator could not reach the model. Review the workflow for current progress.', next.id)
-        this.storage.event(run.id, 'coordinator.unavailable', 'The coordinator could not complete its reply.')
-      })
-    }).finally(() => {
-      this.host.coordinator.delete(run.id)
-    })
+    const runTurn = async (signal: AbortSignal) => {
+      try {
+        const answer = await agentTurn({
+          directory: this.storage.directory,
+          sessionId: run.coordinatorId,
+          requestId: `${next.id}:${run.goalRevision}:${run.scopeRevision}`,
+          profiles: resolveProfilePoolForRole('fast', profiles),
+          scenario: 'coordinator',
+          roleAffinity: 'fast',
+          thinkingLevel: 'off',
+          prompt,
+          signal,
+          ...llmRunHooks(this.storage, run.id),
+        })
+        if (!this.host.currentCoordinator(run.id, task)) return
+        this.storage.transaction(() => {
+          this.storage.message(run.id, run.coordinatorId, 'coordinator', answer, next.id)
+          this.storage.event(run.id, 'coordinator.reply', 'The coordinator replied.')
+        })
+      } catch {
+        if (!this.host.currentCoordinator(run.id, task)) return
+        this.storage.transaction(() => {
+          this.storage.message(run.id, run.coordinatorId, 'kovo',
+            'The coordinator could not reach the model. Review the workflow for current progress.', next.id)
+          this.storage.event(run.id, 'coordinator.unavailable', 'The coordinator could not complete its reply.')
+        })
+      } finally {
+        this.host.coordinator.delete(run.id)
+      }
+    }
+
+    if (this.host.spawnRunTask) {
+      this.host.spawnRunTask(run.id, 'coordinator', runTurn, { controller })
+    } else {
+      void runTurn(controller.signal)
+    }
   }
 
 }

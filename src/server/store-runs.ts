@@ -1108,27 +1108,39 @@ export class RunsRepository {
 
   refreshReadyChainSteps(runId: string, goalRevision: number) {
     const steps = this.listChainSteps(runId, goalRevision)
-    const stepById = new Map(steps.map(s => [s.id, s]))
+    const stepById = new Map(steps.map(s => [s.id, { ...s }]))
     const runFacts = new Map(
       this.session.db.select({ id: tables.facts.id, tainted: tables.facts.tainted }).from(tables.facts)
         .where(eq(tables.facts.runId, runId)).all().map(f => [f.id, f]),
     )
-    for (const step of steps) {
-      if (step.status !== 'pending') continue
-      const taintedDep = step.dependsOnStepIds.some(sid => {
-        const s = stepById.get(sid)
-        return s && (s.status === 'tainted' || s.status === 'canceled')
-      }) || step.dependsOnFactIds.some(fid => runFacts.get(fid)?.tainted)
-      if (taintedDep) {
-        this.updateChainStep(step.id, { status: 'tainted' })
-        continue
+    // Fixed-point propagation so transitive chains (A blocked/canceled/tainted -> B -> C)
+    // resolve in one pass and circuit-open steps (M-12) can never wedge driveInvestigation.
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const step of stepById.values()) {
+        if (step.status !== 'pending') continue
+        const taintedDep = step.dependsOnStepIds.some(sid => {
+          const s = stepById.get(sid)
+          return s && (s.status === 'tainted' || s.status === 'canceled' || s.status === 'blocked')
+        }) || step.dependsOnFactIds.some(fid => runFacts.get(fid)?.tainted)
+        if (taintedDep) {
+          this.updateChainStep(step.id, { status: 'tainted' })
+          step.status = 'tainted'
+          changed = true
+          continue
+        }
+        const ready = step.dependsOnStepIds.every(sid => stepById.get(sid)?.status === 'complete') &&
+          step.dependsOnFactIds.every(fid => {
+            const f = runFacts.get(fid)
+            return f && !f.tainted
+          })
+        if (ready) {
+          this.updateChainStep(step.id, { status: 'ready' })
+          step.status = 'ready'
+          changed = true
+        }
       }
-      const ready = step.dependsOnStepIds.every(sid => stepById.get(sid)?.status === 'complete') &&
-        step.dependsOnFactIds.every(fid => {
-          const f = runFacts.get(fid)
-          return f && !f.tainted
-        })
-      if (ready) this.updateChainStep(step.id, { status: 'ready' })
     }
   }
 

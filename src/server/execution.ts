@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { and, eq } from 'drizzle-orm'
+import { getAppRuntime, type AppRuntime } from './app-runtime.ts'
 import {
   assetOriginForEnvironment,
   defaultWorkerConcurrency,
@@ -24,7 +25,6 @@ import {
   AGENTIC_SPECIALIST_MAX_TURNS,
   AGENTIC_SPECIALIST_WALL_CLOCK_MS,
   codeAuditPrompt,
-  defaultCodeAuditMaxTurns,
   resolveSpecialistProfile,
   routeStepToSpecialist,
   runAgentSession,
@@ -51,7 +51,6 @@ import { hasCuratedAdvisory, queryCves, templateIdsForCves } from './cve-broker.
 import { DerivedCapabilityVault } from './derived-custody.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
 import {
-  cleanupStagedEntities,
   extractCreatedId,
   stagingProbeTag,
   tagStagingEntityBody,
@@ -80,7 +79,7 @@ export { agentProofAttribution, probeCanaryClass, runV8AgentScriptProof, syncVer
 import { listMountedRepos, parseDependenciesFromFile, projectReposDir } from './github-connector.ts'
 export { decideNext } from './graph-coordinator.ts'
 import { seedCodeToRuntimeLeads as seedGraphLeads } from './graph-leads.ts'
-import { LabRunner, type LabTargetHandle } from './lab-runner.ts'
+import { getSharedLabRunner, type LabRunner, type LabTargetHandle } from './lab-runner.ts'
 import {
   privateModelProfiles,
   resolveProfilePoolForRole,
@@ -95,10 +94,62 @@ import type { CodeDataflowSlice, CodeToRuntimeHypothesis } from './program-graph
 import { BudgetExceededError } from './provider.ts'
 import { redact, type NamedSecret } from './redact.ts'
 import { buildInlineVerifyFeedback } from './replay-verifier.ts'
+import {
+  HOST_PLANNER_PRODUCER,
+  PHASE_A_FLOOR_MAX_WALL_CLOCK_MS,
+  PHASE_A_FLOOR_WALL_CLOCK_SHARE,
+  PLANNER_BACKOFF_BASE_MS,
+  PLANNER_BACKOFF_CAP_MS,
+  PLANNER_MAX_CONSECUTIVE_ERRORS,
+  PhaseRequestBudgetTracker,
+  RunActor,
+  RunTier3ApprovalCoordinator,
+  codeAuditSettlementMessage,
+  computePlannerBackoffMs,
+  deriveRunActorState,
+  installRunActorRejectionGuard,
+  isTrustedHostControlFact,
+  recordRunAssignmentMetrics,
+  recordRunFloorMetrics,
+  resolvePhaseAFloorWallClockMs,
+  resolveSourceAuditMaxTurns,
+  resolveSourceAuditSettlementMs,
+  resolveSourceAuditWallClockMs,
+  settleCodeAuditSuspects,
+  teardownRunStaging,
+  type RunActorDisposeOptions,
+  type SpawnTaskOptions,
+  type SupervisedTask,
+  type TerminalRunActorState,
+} from './run-actor.ts'
+export {
+  PHASE_A_FLOOR_MAX_WALL_CLOCK_MS,
+  PHASE_A_FLOOR_MIN_WALL_CLOCK_MS,
+  PHASE_A_FLOOR_WALL_CLOCK_SHARE,
+  PLANNER_BACKOFF_BASE_MS,
+  PLANNER_BACKOFF_CAP_MS,
+  PLANNER_MAX_CONSECUTIVE_ERRORS,
+  SOURCE_AUDIT_DEFAULT_WALL_CLOCK_MS,
+  SOURCE_AUDIT_MAX_WALL_CLOCK_MS,
+  SOURCE_AUDIT_MIN_WALL_CLOCK_MS,
+  SOURCE_AUDIT_SETTLEMENT_SHARE,
+  SOURCE_AUDIT_SHORT_RUN_MAX_TURNS,
+  SOURCE_AUDIT_SHORT_RUN_THRESHOLD_MS,
+  SOURCE_AUDIT_WALL_CLOCK_SHARE,
+  codeAuditSettlementMessage,
+  computePlannerBackoffMs,
+  promoteSemanticAuditSuspects,
+  resolvePhaseAFloorWallClockMs,
+  resolveSourceAuditMaxTurns,
+  resolveSourceAuditSettlementMs,
+  resolveSourceAuditWallClockMs,
+  settleCodeAuditSuspects,
+} from './run-actor.ts'
+import type { RunDrainReport } from './run-context.ts'
 import { approvalRequests, findings } from './schema.ts'
 import { tenantTagForRun } from './scope-policy.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
-import { codeAuditSuspectLocationKey, runThreeStageSemanticAudit, toChainStepInputs, type SemanticAuditSuspect } from './semantic-audit.ts'
+import { runThreeStageSemanticAudit, toChainStepInputs, type SemanticAuditSuspect } from './semantic-audit.ts'
 import { cloneWorkerPersona } from './session-isolation.ts'
 import { buildStaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
 import {
@@ -156,13 +207,9 @@ import {
   resolveWorkerWallClockMs,
   singleStepWallClockMs,
   planAssignmentBudget,
-  percentile,
-  summarizeTurnLatencies,
   requeueInterruptedAssignments,
   CODE_AUDIT_WAVE1_MAX_STEPS,
   convertCodeAuditSuspectsToChainSteps,
-  dedupePromotableCodeAuditFacts,
-  isPromotableCodeAuditFact,
   type FrontierWaveController,
   type DeterministicSweepMode,
   type PhaseRequestBudgets,
@@ -273,195 +320,11 @@ export interface ExecutionOptions {
   plannerBackoffBaseMs?: number
   plannerBackoffCapMs?: number
   plannerMaxConsecutiveErrors?: number
-}
-
-export const PLANNER_BACKOFF_BASE_MS = 500
-export const PLANNER_BACKOFF_CAP_MS = 15_000
-export const PLANNER_MAX_CONSECUTIVE_ERRORS = 7
-
-/** Exponential backoff for consecutive planner failures: 500ms -> 1s -> 2s -> 4s -> 8s -> 15s cap. */
-export function computePlannerBackoffMs(
-  consecutiveErrors: number,
-  baseMs = PLANNER_BACKOFF_BASE_MS,
-  capMs = PLANNER_BACKOFF_CAP_MS,
-): number {
-  if (!Number.isFinite(consecutiveErrors) || consecutiveErrors <= 0) return 0
-  const exp = Math.min(30, Math.max(0, Math.floor(consecutiveErrors) - 1))
-  return Math.min(capMs, baseMs * (2 ** exp))
+  /** Optional AppRuntime composition root (defaults to `getAppRuntime()`). */
+  runtime?: AppRuntime
 }
 
 export type ExecutionCheckpoint = 'phase0' | 'deterministic-lane' | 'post-floor' | 'planner-round'
-
-export const SOURCE_AUDIT_DEFAULT_WALL_CLOCK_MS = 120_000
-export const SOURCE_AUDIT_MIN_WALL_CLOCK_MS = 45_000
-export const SOURCE_AUDIT_MAX_WALL_CLOCK_MS = 90_000
-export const SOURCE_AUDIT_WALL_CLOCK_SHARE = 0.15
-export const SOURCE_AUDIT_SHORT_RUN_THRESHOLD_MS = 15 * 60_000
-export const SOURCE_AUDIT_SHORT_RUN_MAX_TURNS = 8
-/** Code-audit settle prompt fires at 60% of the audit cap (54s of 90s), leaving ~36s to record. */
-export const SOURCE_AUDIT_SETTLEMENT_SHARE = 0.6
-export const PHASE_A_FLOOR_MIN_WALL_CLOCK_MS = 15_000
-export const PHASE_A_FLOOR_MAX_WALL_CLOCK_MS = 75_000
-export const PHASE_A_FLOOR_WALL_CLOCK_SHARE = 0.12
-
-/**
- * Proportional wall-clock cap for Phase 1B Source-First Code Audit so Phase A never consumes half
- * of a timed run before Phase B dispatches Wave 1 workers.
- */
-export function resolveSourceAuditWallClockMs(maxDurationMs?: number): number {
-  if (typeof maxDurationMs === 'number' && Number.isFinite(maxDurationMs) && maxDurationMs > 0) {
-    return Math.max(
-      SOURCE_AUDIT_MIN_WALL_CLOCK_MS,
-      Math.min(SOURCE_AUDIT_MAX_WALL_CLOCK_MS, Math.floor(maxDurationMs * SOURCE_AUDIT_WALL_CLOCK_SHARE)),
-    )
-  }
-  return SOURCE_AUDIT_DEFAULT_WALL_CLOCK_MS
-}
-
-/** Cap interactive code-audit turns to <= 8 on short timed runs (<= 15m). */
-export function resolveSourceAuditMaxTurns(workerMaxTurns?: number, maxDurationMs?: number): number {
-  const base = Math.max(6, Math.min(workerMaxTurns || defaultCodeAuditMaxTurns, defaultCodeAuditMaxTurns))
-  if (typeof maxDurationMs === 'number' && Number.isFinite(maxDurationMs) && maxDurationMs > 0 && maxDurationMs <= SOURCE_AUDIT_SHORT_RUN_THRESHOLD_MS) {
-    return Math.min(base, SOURCE_AUDIT_SHORT_RUN_MAX_TURNS)
-  }
-  return base
-}
-
-/** 60% settlement prompt threshold for the interactive code audit (54s on a 90s cap). */
-export function resolveSourceAuditSettlementMs(auditWallMs: number): number {
-  const wall = Math.max(1, Math.floor(auditWallMs))
-  return Math.max(1, Math.min(Math.floor(wall * SOURCE_AUDIT_SETTLEMENT_SHARE), wallClockSettlementMs(wall)))
-}
-
-/**
- * Explicit wrap-up directive for the Source-First Code Auditor: stop reading, commit the highest
- * signal suspects as facts, then complete. Partial suspects beat an empty audit.
- */
-export function codeAuditSettlementMessage(auditSettlementMs: number): string {
-  const seconds = Math.max(1, Math.round(auditSettlementMs / 1000))
-  return [
-    `[CODE AUDIT SETTLEMENT — ${seconds}s]`,
-    'STOP reading more files now. Do NOT open another repository file, grep sweep, or broad source walk.',
-    'Immediately call record_fact(kind="code_audit_suspect") for your top 3-6 highest-signal defects — cross-service trust boundaries, multi-tenant authz or cache-key asymmetries, entity creator/approver state-machine transitions, signing/webhook verification boundaries, and async-worker outbound-fetch or secret-in-log sinks — one fact per defect with the exact repo/file/line and sinkKind.',
-    'After those facts are recorded, call complete_intent with status partial|blocked and a concise summary. Recording partial suspects is strictly better than an empty audit.',
-  ].join(' ')
-}
-
-/**
- * Promote semantic-audit suspects into code_audit_suspect facts, deduped by location against every
- * fact already in the store. Safety net for the case where the interactive auditor rotates at its
- * wall-clock deadline without recording anything of its own.
- */
-export function promoteSemanticAuditSuspects(
-  storage: Store,
-  run: Run,
-  assignment: Assignment,
-  suspects: readonly SemanticAuditSuspect[],
-  approvedOrigins: ReadonlySet<string>,
-): Fact[] {
-  if (!suspects.length) return []
-  const existing = storage.listFacts(run.id, { includeTainted: true, kind: 'code_audit_suspect', limit: 500 })
-  const seen = new Set(existing.map(fact => codeAuditSuspectLocationKey({
-    ...(fact.data as Record<string, unknown>), id: fact.id,
-  })))
-  const created: Fact[] = []
-  for (const suspect of suspects) {
-    if (!approvedOrigins.has(suspect.origin)) continue
-    const key = codeAuditSuspectLocationKey(suspect)
-    if (seen.has(key)) continue
-    seen.add(key)
-    created.push(storage.addFact(run, assignment, {
-      kind: 'code_audit_suspect',
-      origin: suspect.origin,
-      summary: `[semantic ${suspect.stage}] ${suspect.file}:${suspect.line} (${suspect.sinkKind}) — ${suspect.hypothesis}`,
-      data: suspect.data as unknown as Record<string, unknown>,
-    }))
-  }
-  return created
-}
-
-/**
- * Final suspect roll-up for the code audit. Collects both explicit `code_audit_suspect` facts AND
- * any non-tainted cross-cutting defect facts authored by the code-audit assignment (or recorded
- * during its window) so multi-service authz/boundary/secret defects are promoted immediately into
- * Wave 1. When the interactive auditor recorded zero promotable facts of its own, semantic-audit
- * suspects are preserved instead of returning an empty audit.
- */
-export function settleCodeAuditSuspects(input: {
-  storage: Store
-  run: Run
-  assignment: Assignment
-  approvedOrigins: ReadonlySet<string>
-  semanticSuspects: readonly SemanticAuditSuspect[]
-  preInteractiveFactIds: ReadonlySet<string>
-  auditStartedAtMs?: number
-}): { suspects: Fact[]; promoted: Fact[]; interactiveRecorded: number } {
-  const read = (): Fact[] => {
-    const explicitSuspects = input.storage
-      .listFacts(input.run.id, { includeTainted: false, kind: 'code_audit_suspect', limit: 200 })
-      .filter(fact => input.approvedOrigins.has(fact.origin))
-    const explicitIds = new Set(explicitSuspects.map(fact => fact.id))
-    const allFacts = input.storage
-      .listFacts(input.run.id, { includeTainted: false, limit: 500 })
-      .filter(fact => input.approvedOrigins.has(fact.origin))
-    const crossCuttingFacts = allFacts.filter(fact => {
-      if (explicitIds.has(fact.id)) return false
-      const authoredByAudit = fact.assignmentId === input.assignment.id
-      const recordedInWindow = !input.preInteractiveFactIds.has(fact.id)
-        && input.auditStartedAtMs !== undefined
-        && fact.createdAt >= input.auditStartedAtMs
-      if (!authoredByAudit && !recordedInWindow) return false
-      return isPromotableCodeAuditFact(fact)
-    })
-    return dedupePromotableCodeAuditFacts([...explicitSuspects, ...crossCuttingFacts])
-  }
-  let suspects = read()
-  const interactiveRecorded = suspects.filter(fact => !input.preInteractiveFactIds.has(fact.id)).length
-  let promoted: Fact[] = []
-  if (interactiveRecorded === 0 && input.semanticSuspects.length) {
-    promoted = promoteSemanticAuditSuspects(
-      input.storage, input.run, input.assignment, input.semanticSuspects, input.approvedOrigins,
-    )
-    if (promoted.length) suspects = read()
-  }
-  return { suspects, promoted, interactiveRecorded }
-}
-
-/**
- * Proportional Phase A deterministic floor wall-clock cap for agentic runs (`hasProfiles: true`).
- * `--no-llm` runs (`hasProfiles: false`) return `undefined` so they retain full floor budget.
- */
-export function resolvePhaseAFloorWallClockMs(
-  maxDurationMs: number | undefined,
-  options: { hasProfiles: boolean },
-): number | undefined {
-  if (!options.hasProfiles) return undefined
-  if (typeof maxDurationMs === 'number' && Number.isFinite(maxDurationMs) && maxDurationMs > 0) {
-    return Math.max(
-      PHASE_A_FLOOR_MIN_WALL_CLOCK_MS,
-      Math.min(PHASE_A_FLOOR_MAX_WALL_CLOCK_MS, Math.floor(maxDurationMs * PHASE_A_FLOOR_WALL_CLOCK_SHARE)),
-    )
-  }
-  return PHASE_A_FLOOR_MAX_WALL_CLOCK_MS
-}
-
-/** Per-run accounting for the split request budgets (never persisted; telemetry only). */
-interface PhaseRequestState {
-  floorBudget: number
-  agentBudget: number
-  /** `run.spentRequests` when the floor started; Phase-A/Phase-B spend are deltas from here. */
-  baselineRequests: number
-  /** Phase-A requests frozen when the floor settles. */
-  floorRequests: number
-  floorSettled: boolean
-  floorBudgetExhausted: boolean
-  agentBudgetExhausted: boolean
-  agentExhaustedReported: boolean
-  floorExhaustedReported: boolean
-  /** Phase-B spend frozen when investigation ends, so verification traffic is not misattributed. */
-  agentSettled: boolean
-  agentRequests: number
-}
 
 export class Execution {
   private readonly storage: Store
@@ -574,9 +437,12 @@ export class Execution {
   private readonly agenticFloorFinishedAt = new Map<string, number>()
   /** v6 budget split: null = legacy single shared budget. */
   private readonly phaseRequestBudgets: PhaseRequestBudgets | null
-  private readonly phaseRequestState = new Map<string, PhaseRequestState>()
-  /** runId → honest investigation termination reason when a phase budget ends the phase. */
-  private readonly phaseTerminationReason = new Map<string, string>()
+  private readonly budgetTracker: PhaseRequestBudgetTracker
+  private readonly runtime: AppRuntime
+  private readonly ownsLabRunner: boolean
+  /** Explicit per-run `RunActor` FSM + structured `TaskSupervisor` registry. */
+  private readonly actors = new Map<string, RunActor>()
+  private releaseRejectionGuard: (() => void) | null = null
   private readonly detLeadConsumed = new Set<string>()
   /** Tier-A Program-Graph facts/steps: seeded first, exempt from the generic lead cap. */
   private readonly tierAFactIds = new Set<string>()
@@ -603,6 +469,7 @@ export class Execution {
   private readonly verifier: ExecVerifier
   private readonly reconPlanner: ExecReconPlanner
   private readonly workerRunner: ExecWorkerRunner
+  private readonly tier3Approvals: RunTier3ApprovalCoordinator
   /** v8 Layer-1 run-scoped derived capability custody shared across all VerifyRpcServer worker sessions. */
   private readonly capabilityVaults = new Map<string, DerivedCapabilityVault>()
   private safetyTimer?: NodeJS.Timeout
@@ -646,7 +513,17 @@ export class Execution {
       ...(options.floorRequestBudget !== undefined ? { floorRequestBudget: options.floorRequestBudget } : {}),
       ...(options.agentRequestBudget !== undefined ? { agentRequestBudget: options.agentRequestBudget } : {}),
     })
+    this.budgetTracker = new PhaseRequestBudgetTracker(
+      this.storage,
+      this.phaseRequestBudgets,
+      (runId, kind, message, detail) => this.safeEvent(runId, kind, message, detail),
+    )
     this.canaryBroker = options.canaryBroker ?? new CanaryBroker({ storage })
+    this.runtime = options.runtime ?? getAppRuntime({
+      dataDir: storage.directory,
+      store: storage,
+      canaryBroker: this.canaryBroker,
+    })
     this.personaAuth = options.personaAuth ?? new PersonaAuthManager()
     this.broker = options.broker ?? createBroker({ storage, canaryBroker: this.canaryBroker })
     if (!options.broker) {
@@ -677,7 +554,8 @@ export class Execution {
     this.backend = options.backend ?? new LinuxWorkerBackend({
       workspace: { id: storage.workspace.id, directory: storage.directory },
     })
-    this.labRunner = options.labRunner ?? new LabRunner()
+    this.ownsLabRunner = Boolean(options.labRunner)
+    this.labRunner = options.labRunner ?? getSharedLabRunner()
     const core: ExecCoreServices = {
       storage: this.storage, broker: this.broker, browser: this.browser,
       canaryBroker: this.canaryBroker, backend: this.backend,
@@ -764,6 +642,7 @@ export class Execution {
       codeSliceForAssignment: (run, step, facts) => this.codeSliceForAssignment(run, step, facts),
       shouldCoordinatorAnswer: content => this.shouldCoordinatorAnswer(content),
       resetBoardHops: run => this.board.resetBoardHops(run),
+      spawnRunTask: (runId, label, fn, opts) => this.spawnRunTask(runId, label, fn, opts),
     })
     this.workerRunner = new ExecWorkerRunner({
       ...core, personaAuth: this.personaAuth, board: this.board, verifier: this.verifier, reconPlanner: this.reconPlanner,
@@ -796,6 +675,20 @@ export class Execution {
       detLeadSummaries: (...a) => this.detLeadSummaries(...a),
       assignmentBriefForStep: (...a) => this.assignmentBriefForStep(...a),
       buildBrokeredTransportHandlers: ctx => this.buildBrokeredTransportHandlers(ctx),
+    })
+    this.tier3Approvals = new RunTier3ApprovalCoordinator({
+      storage: this.storage,
+      broker: this.broker,
+      active: this.active,
+      pendingTier3ApprovalKeys: this.pendingTier3ApprovalKeys,
+      stateChangeApprovals: this.stateChangeApprovals,
+      burstApprovalInstances: this.burstApprovalInstances,
+      authorize: job => this.authorize(job),
+      check: job => this.check(job),
+      phaseRequestRemaining: run => this.phaseRequestRemaining(run),
+      postApprovalCard: (run, aid, input, secrets) => this.postApprovalCard(run, aid, input, secrets),
+      postApprovalResolution: (run, aid, input) => this.postApprovalResolution(run, aid, input),
+      scheduleWake: () => this.scheduleWake(),
     })
   }
 
@@ -849,9 +742,148 @@ export class Execution {
     return assetOriginForEnvironment(project.environment).parse(raw)
   }
 
+  /** Return the active `RunActor` for `runId`, if initialized. */
+  getRunActor(runId: string): RunActor | undefined {
+    return this.actors.get(runId)
+  }
+
+  /**
+   * Ensure a per-run `RunActor` + `RunContext` exists and owns structured resource disposal
+   * (staging cleanup, capability vault RAM+disk eviction, OOB unsubscribe, persona refreshers,
+   * lab target teardown, trace close, and timer cancellation).
+   */
+  private ensureRunActor(runOrId: Run | string): RunActor {
+    const runId = typeof runOrId === 'string' ? runOrId : runOrId.id
+    const existing = this.actors.get(runId)
+    if (existing && !existing.isDisposed) return existing
+
+    let run: Run | undefined = typeof runOrId === 'string' ? undefined : runOrId
+    if (!run) {
+      try { run = this.storage.run(runId) } catch { run = undefined }
+    }
+    let tenantId: string | null = null
+    if (run) {
+      try { tenantId = this.storage.project(run.projectId).tenantId ?? null } catch { tenantId = null }
+    }
+    const initialState = run ? deriveRunActorState(run) : 'queued'
+    const context = this.runtime.getRunContext(runId) ?? this.runtime.createRunContext(runId, { tenantId })
+    const actor = new RunActor({ context, initialState })
+
+    actor.registerResource('staging:teardown', () => teardownRunStaging({
+      runId,
+      storage: this.storage,
+      broker: this.broker,
+      stagingGrants: this.stagingGrants,
+      stagingTaggedMutations: this.stagingTaggedMutations,
+      stagingUntaggedSkipped: this.stagingUntaggedSkipped,
+      stagingCleaned: this.stagingCleaned,
+      stagingCreatedEntities: this.stagingCreatedEntities,
+    }))
+    actor.registerResource('capability-vault:evict', () => {
+      this.evictCapabilityVault(runId)
+    })
+    actor.registerResource('persona-auth:stop', () => {
+      this.personaAuth.stopRunRefreshers(runId)
+      this.runAuthStarted.delete(runId)
+      const inflight = this.runAuthInFlight.get(runId)
+      if (inflight) {
+        try { inflight.abort() } catch { /* ignore */ }
+        this.runAuthInFlight.delete(runId)
+      }
+    })
+    actor.registerResource('lab:stop', async () => {
+      if (!this.startedLabRuns.has(runId) && !this.startedLabHandles.has(runId)) return
+      this.startedLabRuns.delete(runId)
+      this.startedLabHandles.delete(runId)
+      await this.labRunner.stopLabTarget(runId).catch(() => undefined)
+    })
+    actor.registerResource('oob:canary-unsubscribe', () => {
+      try { this.canaryBroker.unsubscribeRun(runId) } catch { /* ignore */ }
+    })
+    actor.registerResource('trace:close', () => {
+      const trace = this.runTraces.get(runId)
+      if (trace) {
+        this.runTraces.delete(runId)
+        try { trace.closeTrace() } catch { /* ignore */ }
+      }
+    })
+    actor.registerResource('run-state:cleanup', () => {
+      const timer = this.plannerTimers.get(runId)
+      if (timer) {
+        clearTimeout(timer)
+        this.plannerTimers.delete(runId)
+      }
+      this.plannerDirty.delete(runId)
+      this.plannerErrorState.delete(runId)
+      this.phaseBControllers.delete(runId)
+      this.budgetTracker.deleteRun(runId)
+      if (this.actors.get(runId) === actor) {
+        this.actors.delete(runId)
+      }
+    })
+
+    this.actors.set(runId, actor)
+    return actor
+  }
+
+  /** Spawn a structured async job bound to the run's `RunActor` + `TaskSupervisor`. */
+  private spawnRunTask<T = void>(
+    runId: string,
+    label: string,
+    fn: (signal: AbortSignal) => Promise<T> | T,
+    options?: SpawnTaskOptions,
+  ): SupervisedTask<T> {
+    return this.ensureRunActor(runId).spawn(label, fn, options)
+  }
+
+  private evictCapabilityVault(runId: string): void {
+    this.capabilityVaults.delete(runId)
+    const safeRunId = /^[A-Za-z0-9._-]{1,128}$/.test(runId)
+      ? runId
+      : runId.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 128) || 'run'
+    const diskPath = existsSync(this.storage.directory)
+      ? join(this.storage.directory, 'capability-vaults', `${safeRunId}.json`)
+      : undefined
+    if (diskPath) {
+      try { rmSync(diskPath, { force: true }) } catch { /* best-effort disk eviction */ }
+    }
+  }
+
+  /**
+   * Deterministically abort + drain all supervised jobs and dispose the run's `RunContext`
+   * (evicting `capabilityVaults` RAM + disk, unsubscribing OOB, and releasing lab/auth resources).
+   */
+  async disposeRun(runId: string, options: RunActorDisposeOptions = {}): Promise<RunDrainReport | null> {
+    const actor = this.actors.get(runId)
+    let report: RunDrainReport | null = null
+    if (actor) {
+      report = await actor.drainAndDispose(options)
+      if (this.actors.get(runId) === actor) this.actors.delete(runId)
+    } else if (this.runtime.getRunContext(runId)) {
+      report = await this.runtime.disposeRunContext(runId, options.timeoutMs)
+    }
+    this.evictCapabilityVault(runId)
+    try { this.canaryBroker.unsubscribeRun(runId) } catch { /* ignore */ }
+    return report
+  }
+
+  /**
+   * Drain and dispose all in-flight tasks for `runId` before deleting its SQLite rows and disk files
+   * (`M-16` / `H-26`: zero orphaned tasks write against a deleted run).
+   */
+  async deleteRun(runId: string): Promise<{ deleted: boolean; projectId: string; runId: string; drainReport: RunDrainReport | null }> {
+    const drainReport = await this.disposeRun(runId, {
+      terminalState: 'canceled',
+      reason: 'run deleted',
+    })
+    const deleted = this.storage.deleteRun(runId)
+    return { ...deleted, drainReport }
+  }
+
   start() {
     if (this.safetyTimer) return
     this.stopped = false
+    this.releaseRejectionGuard ??= installRunActorRejectionGuard()
     try { this.storage.session.ensureHighConcurrencyPragmas() } catch { /* pragmas are best-effort */ }
     if (this.isCanaryListenerConfigured()) {
       void this.canaryBroker.startListener({ enableDns: this.isCanaryDnsConfigured() }).catch(() => undefined)
@@ -872,12 +904,10 @@ export class Execution {
 
   async stop() {
     this.stopped = true
-    // Finalize the floor summary for every run this engine touched, including runs stopped by the
-    // wall-clock/driver before Phase 3 (partial reports). This is the "run finalize" emission the
-    // preservation gate reads; per-phase snapshots keep their own reason.
     try {
       const runIds = new Set<string>([
         ...[...this.active.values()].map(job => job.assignment.runId),
+        ...this.actors.keys(),
         ...this.laneStartedAt.keys(),
         ...this.laneWallByRun.keys(),
         ...this.agenticFloorDispatchedAt.keys(),
@@ -888,41 +918,34 @@ export class Execution {
         try { this.recordDispatchFunnelSummary(runId) } catch { /* metrics are best-effort */ }
       }
     } catch { /* store may be unavailable during teardown */ }
-    // v6 staging: agent-tool mutations captured a grant while tagging; hand the run tag back to the
-    // target's declared cleanup hook so no tagged entity outlives the run. Best-effort only.
-    if (this.stagingGrants.size > 0) {
-      for (const [runId, grant] of this.stagingGrants) {
-        try {
-          if ((this.stagingTaggedMutations.get(runId) ?? 0) <= 0) continue
-          const removed = await cleanupStagedEntities({
-            endpoints: this.storage.listEndpoints(runId),
-            runId,
-            broker: this.broker,
-            grant,
-            signal: AbortSignal.timeout(8_000),
-            log: (kind, message, data) => {
-              try { this.storage.event(runId, kind, message, data ?? {}) } catch { /* run may be gone */ }
-            },
-          })
-          if (removed > 0) this.stagingCleaned.set(runId, (this.stagingCleaned.get(runId) ?? 0) + removed)
-          this.storage.event(runId, 'staging.teardown', `Staging teardown cleaned ${removed} tagged entit${removed === 1 ? 'y' : 'ies'}.`, {
-            stagingTaggedMutations: this.stagingTaggedMutations.get(runId) ?? 0,
-            stagingUntaggedSkipped: this.stagingUntaggedSkipped.get(runId) ?? 0,
-            stagingCleaned: this.stagingCleaned.get(runId) ?? 0,
-          })
-        } catch { /* teardown is best-effort; never block shutdown */ }
-      }
-      this.stagingGrants.clear()
-      this.stagingCreatedEntities.clear()
-      this.stagingTaggedMutations.clear()
-      this.stagingUntaggedSkipped.clear()
-      this.stagingCleaned.clear()
-    }
+
     this.wakeScheduled = false
     this.unsubWake?.()
     this.unsubWake = undefined
     if (this.safetyTimer) { clearInterval(this.safetyTimer); this.safetyTimer = undefined }
     if (this.reclaimTimer) { clearInterval(this.reclaimTimer); this.reclaimTimer = undefined }
+
+    // Abort & drain every active RunActor + RunContext deterministically before clearing residual state.
+    const activeActors = [...this.actors.values()]
+    this.actors.clear()
+    await Promise.allSettled(
+      activeActors.map(actor => actor.drainAndDispose({ terminalState: 'canceled', reason: 'execution stopped' })),
+    )
+
+    // Tear down any remaining staging grants not covered by an actor.
+    for (const runId of [...this.stagingGrants.keys()]) {
+      await teardownRunStaging({
+        runId,
+        storage: this.storage,
+        broker: this.broker,
+        stagingGrants: this.stagingGrants,
+        stagingTaggedMutations: this.stagingTaggedMutations,
+        stagingUntaggedSkipped: this.stagingUntaggedSkipped,
+        stagingCleaned: this.stagingCleaned,
+        stagingCreatedEntities: this.stagingCreatedEntities,
+      })
+    }
+
     for (const timer of this.plannerTimers.values()) clearTimeout(timer)
     this.plannerTimers.clear()
     this.plannerErrorState.clear()
@@ -936,8 +959,6 @@ export class Execution {
     for (const lane of this.agenticLaneJobs.values()) {
       try { lane.controller.abort(new Error('execution stopped')) } catch { /* already aborted */ }
     }
-    // No idle warm container may outlive the run: a 29 GB host cannot accumulate one pool per
-    // benchmark cell. Sessions still finishing release into the closed pool and remove themselves.
     try { await this.backend.closeWarmPool?.() } catch { /* teardown is best-effort */ }
     for (const [assignmentId, tracked] of this.workerSessionClones) {
       for (const entry of tracked) entry.clone.dispose()
@@ -947,16 +968,27 @@ export class Execution {
       try { trace.closeTrace() } catch { /* tracing must never break shutdown */ }
     }
     this.runTraces.clear()
-    this.capabilityVaults.clear()
+    for (const runId of [...this.capabilityVaults.keys()]) {
+      this.evictCapabilityVault(runId)
+      try { this.canaryBroker.unsubscribeRun(runId) } catch { /* ignore */ }
+    }
     this.phaseBControllers.clear()
     this.agenticLaneJobs.clear()
     this.agenticLaneStopping.clear()
     this.overlappedFloorAssignmentIds.clear()
     this.personaAuth.stopAll()
-    await this.labRunner.stopAll().catch(() => undefined)
+    if (this.ownsLabRunner) {
+      await this.labRunner.stopAll().catch(() => undefined)
+    } else {
+      const labRunIds = [...new Set([...this.startedLabRuns, ...this.startedLabHandles.keys()])]
+      await Promise.allSettled(labRunIds.map(runId => this.labRunner.stopLabTarget(runId)))
+    }
     this.startedLabRuns.clear()
     this.startedLabHandles.clear()
     await this.canaryBroker.stopListener().catch(() => undefined)
+    const releaseGuard = this.releaseRejectionGuard
+    this.releaseRejectionGuard = null
+    try { releaseGuard?.() } catch { /* ignore */ }
   }
 
   getLabTargetHandle(runId: string): LabTargetHandle | undefined {
@@ -1543,471 +1575,24 @@ export class Execution {
     }
   }
 
-  private planTier3Approval(
-    run: Run,
-    requests: Parameters<typeof planTier3ApprovalTargets>[1],
-    options: Parameters<typeof planTier3ApprovalTargets>[2] = {},
-  ) {
-    return planTier3ApprovalTargets(run, requests, options)
+  private planTier3Approval(...a: Parameters<RunTier3ApprovalCoordinator['planTargets']>) {
+    return this.tier3Approvals.planTargets(...a)
   }
 
-  private async executeApprovedBrokerGroup<T>(
-    job: Active,
-    requests: BrokerHttpRequest[],
-    signal: AbortSignal,
-    options: {
-      isRaceBurst: boolean
-      rationale: string
-      requestPreview: string
-      denyLabel: string
-      secrets: readonly NamedSecret[]
-      execute: () => Promise<T>
-    },
-  ): Promise<T> {
-    const run = this.check(job)
-    if (options.isRaceBurst) {
-      const phaseRemaining = this.phaseRequestRemaining(run)
-      if (phaseRemaining !== null && requests.length > phaseRemaining) {
-        throw new BudgetExceededError('Race burst would exceed the agent request budget.')
-      }
-    }
-    const approvalPlan = planTier3ApprovalTargets(run, requests, { isRaceBurst: options.isRaceBurst })
-    try {
-      return await options.execute()
-    } catch (err) {
-      if (!(err instanceof BrokerApprovalRequired)) throw err
-      const distinctTargets = approvalPlan.targets
-      const multiTarget = distinctTargets.length > 1
-      const approvedGrants: Array<Parameters<typeof registerStateChangeGrant>[3]> = []
-      for (let idx = 0; idx < distinctTargets.length; idx += 1) {
-        const target = distinctTargets[idx]!
-        const targetPreview = multiTarget
-          ? JSON.stringify({
-              batchItem: `${idx + 1}/${distinctTargets.length}`,
-              totalRequests: requests.length,
-              instances: target.instances,
-              method: target.method,
-              origin: target.origin,
-              pathAndQuery: target.pathAndQuery,
-              persona: target.personaHandle,
-              bodyPreview: target.bodyPreview?.slice(0, 300) ?? null,
-              hasMultipart: target.hasMultipart,
-            }, null, 2)
-          : options.requestPreview
-        const approval = await this.waitForTier3Approval(job, {
-          origin: target.origin,
-          method: target.method,
-          pathAndQuery: target.pathAndQuery,
-          personaHandle: target.personaHandle,
-          rationale: multiTarget
-            ? `${options.rationale} (target ${idx + 1}/${distinctTargets.length}: ${target.method.toUpperCase()} ${target.pathAndQuery})`
-            : options.rationale,
-          requestPreview: targetPreview,
-          bodyPreview: target.bodyPreview,
-          bodyHash: target.bodyHash,
-          headers: target.headers,
-          hasMultipart: target.hasMultipart,
-          ...(options.isRaceBurst ? { isRaceBurst: true } : {}),
-          approvalInstances: target.instances,
-          deferGrant: multiTarget,
-          secrets: options.secrets,
-        }, signal)
-        if (!approval.approved) {
-          throw new BrokerDenied(
-            approval.deniedReason
-              ? `Tier 3 Safety Judge denied ${options.denyLabel} probe: ${approval.deniedReason}`
-              : `Tier 3 ${options.denyLabel} request was denied or expired.`,
-          )
-        }
-        if (multiTarget && approval.grantTarget) {
-          approvedGrants.push(approval.grantTarget)
-        }
-      }
-      if (multiTarget) {
-        const freshRun = this.check(job)
-        for (const grantTarget of approvedGrants) {
-          registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, freshRun, grantTarget)
-        }
-      }
-      return await options.execute()
-    }
+  private executeApprovedRaceBurst(...a: Parameters<RunTier3ApprovalCoordinator['executeApprovedRaceBurst']>) {
+    return this.tier3Approvals.executeApprovedRaceBurst(...a)
   }
 
-  /** Execute a synchronized race burst, resolving the whole burst with one approval decision. */
-  private executeApprovedRaceBurst(
-    job: Active,
-    requests: BrokerHttpRequest[],
-    grant: Grant,
-    signal: AbortSignal,
-    options: {
-      stepTitle: string
-      rationale?: string
-      secrets: readonly NamedSecret[]
-      execute?: () => Promise<BrokerRaceBurstResult>
-    },
-  ): Promise<BrokerRaceBurstResult> {
-    return this.executeApprovedBrokerGroup(job, requests, signal, {
-      isRaceBurst: true,
-      rationale: options.rationale ?? `Tier 3 concurrent race burst (${requests.length}x) during step "${options.stepTitle}"`,
-      requestPreview: JSON.stringify({ count: requests.length, sample: requests[0] }, null, 2),
-      denyLabel: 'race-burst',
-      secrets: options.secrets,
-      execute: options.execute ?? (() => this.broker.executeRaceBurst(requests, grant, signal)),
-    })
+  private executeApprovedBatch(...a: Parameters<RunTier3ApprovalCoordinator['executeApprovedBatch']>) {
+    return this.tier3Approvals.executeApprovedBatch(...a)
   }
 
-  /** Execute a synchronized batch, resolving the whole batch with one approval decision. */
-  private executeApprovedBatch(
-    job: Active,
-    requests: BrokerHttpRequest[],
-    grant: Grant,
-    signal: AbortSignal,
-    options: {
-      stepTitle: string
-      rationale?: string
-      secrets: readonly NamedSecret[]
-      execute?: () => Promise<BrokerExchangeResult[]>
-    },
-  ): Promise<BrokerExchangeResult[]> {
-    return this.executeApprovedBrokerGroup(job, requests, signal, {
-      isRaceBurst: false,
-      rationale: options.rationale ?? `Tier 3 synchronized batch (${requests.length} requests) during step "${options.stepTitle}"`,
-      requestPreview: JSON.stringify({
-        count: requests.length,
-        items: requests.map((request, index) => ({
-          index,
-          method: request.method,
-          origin: request.origin,
-          pathAndQuery: request.pathAndQuery,
-          persona: request.persona ?? null,
-          bodyPreview: request.body?.slice(0, 300) ?? null,
-          multipartPartsCount: request.multipartParts?.length ?? 0,
-        })),
-      }, null, 2),
-      denyLabel: 'batch',
-      secrets: options.secrets,
-      execute: options.execute ?? (() => this.broker.executeBatch(requests, grant, signal)),
-    })
+  private waitForTier3Approval(...a: Parameters<RunTier3ApprovalCoordinator['waitForTier3Approval']>) {
+    return this.tier3Approvals.waitForTier3Approval(...a)
   }
 
-  private async waitForTier3Approval(
-    job: Active,
-    input: {
-      origin: string
-      method: string
-      pathAndQuery: string
-      personaHandle?: string | null
-      rationale: string
-      requestPreview: string
-      bodyPreview?: string | null
-      /** Precomputed body/parts digest (must match the broker's computeStateChangeBodyHash). */
-      bodyHash?: string | null
-      headers?: Record<string, string>
-      hasMultipart?: boolean
-      isRceProof?: boolean
-      isRaceBurst?: boolean
-      /** Single-use instances of the primary fingerprint this decision covers (default 1). */
-      approvalInstances?: number
-      /**
-       * Deprecated: distinct sibling targets can never piggyback on one approval decision.
-       * Passing a non-empty array fails closed so unjudged targets are never granted.
-       */
-      additionalApprovalTargets?: Array<{
-        origin: string
-        method: string
-        pathAndQuery: string
-        personaHandle?: string | null
-        bodyHash?: string | null
-        hasMultipart?: boolean
-        instances?: number
-      }>
-      /** When true, return the approved grant descriptor without registering it yet (used by multi-target groups). */
-      deferGrant?: boolean
-      secrets: readonly NamedSecret[]
-    },
-    signal: AbortSignal,
-  ): Promise<{ approved: boolean; deniedReason?: string; grantTarget?: Parameters<typeof registerStateChangeGrant>[3] }> {
-    const run = this.check(job)
-    const project = this.storage.project(run.projectId)
-    if (run.capabilityTier < 3) {
-      throw new BrokerDenied('This operation requires Capability Tier 3.')
-    }
-    if (input.additionalApprovalTargets && input.additionalApprovalTargets.length > 0) {
-      return {
-        approved: false,
-        deniedReason: 'Distinct batch targets must each be evaluated individually; piggybacking additionalApprovalTargets is forbidden.',
-      }
-    }
-
-    // NOTE: local-lab auto-approval is decided exclusively below by evaluateTier3Approval so
-    // that every auto-approved action is origin-bound, respects an explicit `strict` policy,
-    // and is persisted as an audit record attributed to 'auto-review:local-lab'.
-
-    const activePatterns = (run.approvedEndpointPatterns ?? []).filter(
-      p => p.scopeRevision === undefined || p.scopeRevision === run.scopeRevision,
-    )
-    const evaluation = await evaluateTier3Approval({
-      policy: run.approvalPolicy ?? 'auto_review',
-      origin: input.origin,
-      method: input.method,
-      pathAndQuery: input.pathAndQuery,
-      personaHandle: input.personaHandle ?? null,
-      rationale: input.rationale,
-      bodyPreview: input.bodyPreview ?? null,
-      headers: input.headers,
-      hasMultipart: input.hasMultipart,
-      isRceProof: input.isRceProof,
-      isRaceBurst: input.isRaceBurst,
-      environment: project.environment,
-      approvedPatterns: activePatterns,
-      profiles: resolveProfilePoolForRole('fast', this.storage),
-      signal,
-      secrets: input.secrets,
-      onUsage: usage => {
-        this.storage.recordLlmSpend(run.id, {
-          usd: usage.costUsd,
-          tokens: usage.inputTokens + usage.outputTokens,
-        })
-      },
-    })
-
-    const grantTarget = (approvalId?: string) => ({
-      origin: input.origin,
-      method: input.method,
-      pathAndQuery: input.pathAndQuery,
-      personaHandle: input.personaHandle ?? null,
-      bodyHash: input.bodyHash,
-      bodyPreview: input.bodyPreview ?? null,
-      hasMultipart: input.hasMultipart,
-      isRaceBurst: input.isRaceBurst,
-      isRceProof: input.isRceProof,
-      ...(approvalId ? { approvalId } : {}),
-      instances: input.approvalInstances,
-    })
-
-    const baseApproval = {
-      origin: input.origin, method: input.method, pathAndQuery: input.pathAndQuery,
-      personaHandle: input.personaHandle, rationale: input.rationale,
-      requestPreview: input.requestPreview, riskLevel: evaluation.riskLevel,
-      policyNote: evaluation.reason, secrets: input.secrets,
-    }
-    if (evaluation.decision === 'approve' || evaluation.decision === 'deny') {
-      const approved = evaluation.decision === 'approve'
-      this.storage.recordAutoApprovalDecision(run, job.assignment, {
-        ...baseApproval,
-        decision: approved ? 'approved' : 'denied',
-        decidedBy: approved ? (evaluation.decidedBy === 'operator' ? 'auto-review:rule' : evaluation.decidedBy) : 'auto-review:judge',
-      })
-      if (!approved) return { approved: false, deniedReason: evaluation.reason }
-      const targetGrant = grantTarget()
-      if (!input.deferGrant) {
-        registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, targetGrant)
-      }
-      return { approved: true, grantTarget: targetGrant }
-    }
-
-    const approvalKey = [
-      run.id, run.scopeRevision, input.origin, input.method.toUpperCase(), input.pathAndQuery,
-      input.personaHandle ?? '', input.isRceProof ? 'rce' : '', input.isRaceBurst ? 'race' : '', input.bodyPreview ?? '',
-    ].join('\0')
-    if (this.pendingTier3ApprovalKeys.has(approvalKey)) {
-      return {
-        approved: false,
-        deniedReason: 'An identical Tier 3 probe is already awaiting operator approval; duplicate parallel trial suppressed.',
-      }
-    }
-    this.pendingTier3ApprovalKeys.add(approvalKey)
-
-    let decision: 'approved' | 'denied' | 'canceled' | 'expired'
-    let postedApprovalId: string | undefined
-    try {
-      const req = this.storage.createApprovalRequest(run, job.assignment, baseApproval)
-      postedApprovalId = req.id
-      this.postApprovalCard(run, job.assignment.id, {
-        approvalId: req.id,
-        origin: input.origin,
-        method: input.method,
-        pathAndQuery: input.pathAndQuery,
-        rationale: input.rationale,
-      }, input.secrets)
-
-      // v6 Layer-1: non-blocking operator opt-in. Persist `awaiting_approval` and release the worker
-      // slot immediately; the coroutine waits on the durable decision, not on a busy worker.
-      try {
-        this.storage.parkWorkerForApproval(run, job.assignment.id)
-        this.active.delete(job.assignment.id)
-        this.scheduleWake()
-      } catch { /* an already-parked or terminal worker keeps its state */ }
-
-      decision = await new Promise<'approved' | 'denied' | 'canceled' | 'expired'>((resolveDecision, rejectDecision) => {
-        const checkCurrent = () => {
-          try {
-            const latest = this.storage.getApprovalRequest(run.id, req.id)
-            if (latest.status !== 'pending') {
-              cleanup()
-              resolveDecision(latest.status)
-              return true
-            }
-            if (Date.now() >= latest.expiresAt) {
-              this.storage.db.update(approvalRequests).set({ status: 'expired', decidedAt: Date.now() })
-                .where(eq(approvalRequests.id, req.id)).run()
-              cleanup()
-              resolveDecision('expired')
-              return true
-            }
-          } catch (err) {
-            cleanup()
-            rejectDecision(err)
-            return true
-          }
-          return false
-        }
-
-        const unsub = this.storage.onRunEvent(run.id, () => { checkCurrent() })
-        const timer = setInterval(() => { checkCurrent() }, 1_000)
-        timer.unref?.()
-        const onAbort = () => {
-          cleanup()
-          rejectDecision(signal.reason instanceof Error ? signal.reason : new Error('Aborted while waiting for approval.'))
-        }
-        const cleanup = () => {
-          unsub()
-          clearInterval(timer)
-          signal.removeEventListener('abort', onAbort)
-        }
-        signal.addEventListener('abort', onAbort, { once: true })
-        if (signal.aborted) {
-          onAbort()
-          return
-        }
-        checkCurrent()
-      })
-    } finally {
-      this.pendingTier3ApprovalKeys.delete(approvalKey)
-    }
-
-    if (postedApprovalId) {
-      this.postApprovalResolution(run, job.assignment.id, {
-        approvalId: postedApprovalId,
-        decision,
-        origin: input.origin,
-        method: input.method,
-        pathAndQuery: input.pathAndQuery,
-      })
-    }
-    if (decision === 'approved') {
-      // Resume the parked worker with a fresh lease and re-enter the scheduler. The exact
-      // single-use ledger remains: the durable operator lease is route-scoped and auditable.
-      try {
-        const resumed = this.storage.resumeParkedWorker(this.storage.run(run.id), job.assignment.id)
-        job.assignment = resumed
-        this.active.set(resumed.id, job)
-        this.scheduleWake()
-      } catch {
-        if (this.authorize(job)) {
-          try { this.storage.updateWorker(job.assignment.id, { status: 'running', approvalParkedAt: null }) } catch { /* ignore */ }
-        }
-      }
-      // A human/operator approval authorizes exactly this fingerprint once; broader reuse requires
-      // an explicit operator pattern (approve_similar_endpoint), never a prefix match on the card.
-      const targetGrant = grantTarget(postedApprovalId)
-      if (!input.deferGrant) {
-        registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, targetGrant)
-      }
-      return { approved: true, grantTarget: targetGrant }
-    } else {
-      // A denied/expired/canceled decision ends this assignment and settles its chain step so
-      // neither investigation nor verification wedges waiting on a permanently blocked worker.
-      this.terminateApprovalBlockedAssignment(run.id, job.assignment.id, decision)
-    }
-    return { approved: false }
-  }
-
-  private terminateApprovalBlockedAssignment(
-    runId: string,
-    assignmentId: string,
-    decision: 'denied' | 'expired' | 'canceled',
-  ): void {
-    try {
-      this.storage.transaction(() => {
-        const current = this.storage.worker(assignmentId)
-        if (current.status !== 'complete' && current.status !== 'canceled' && current.status !== 'failed') {
-          this.storage.updateWorker(assignmentId, {
-            status: 'failed',
-            approvalParkedAt: null,
-            lease: null,
-            leaseExpiresAt: null,
-            outcome: `Tier 3 approval ${decision}.`,
-          })
-        }
-        if (current.phase === 'investigation' && current.stepId) {
-          const latestRun = this.storage.run(runId)
-          const step = this.storage.listChainSteps(latestRun.id, latestRun.goalRevision)
-            .find(s => s.id === current.stepId)
-          if (step && ['pending', 'ready', 'running'].includes(step.status)) {
-            this.storage.updateChainStep(step.id, {
-              status: 'canceled',
-              assignedWorkerId: assignmentId,
-            })
-            this.storage.refreshReadyChainSteps(latestRun.id, latestRun.goalRevision)
-          }
-        }
-      }, { behavior: 'immediate' })
-    } catch { /* worker or run may already be terminal or removed */ }
-    this.active.delete(assignmentId)
-    this.scheduleWake()
-  }
-
-  /**
-   * Reconcile parked `waiting_approval` workers whose approval request has already been denied,
-   * expired, or canceled (including after a restart or outside an active `waitForTier3Approval`
-   * coroutine), and settle any investigation chain steps orphaned on a terminal worker.
-   */
   private reconcileSettledApprovalWorkers(run: Run): void {
-    const now = Date.now()
-    const workers = this.storage.workerList(run.id)
-    const waitingWorkers = workers.filter(w => w.status === 'waiting_approval' && !this.active.has(w.id))
-    if (waitingWorkers.length > 0) {
-      const requests = this.storage.listApprovalRequests(run.id)
-      for (const worker of waitingWorkers) {
-        const forWorker = requests.filter(r => r.assignmentId === worker.id)
-        if (!forWorker.length) continue
-        let hasLivePending = false
-        for (const req of forWorker) {
-          if (req.status !== 'pending') continue
-          if (now >= req.expiresAt) {
-            try {
-              this.storage.db.update(approvalRequests).set({ status: 'expired', decidedAt: now })
-                .where(eq(approvalRequests.id, req.id)).run()
-              req.status = 'expired'
-              req.decidedAt = now
-            } catch { /* ignore */ }
-          } else {
-            hasLivePending = true
-          }
-        }
-        if (hasLivePending) continue
-        const latest = [...forWorker].sort((a, b) => (b.decidedAt ?? b.createdAt) - (a.decidedAt ?? a.createdAt))[0]
-        if (latest && (latest.status === 'denied' || latest.status === 'expired' || latest.status === 'canceled')) {
-          this.terminateApprovalBlockedAssignment(run.id, worker.id, latest.status)
-        }
-      }
-    }
-
-    if (run.phase === 'investigation') {
-      const workerById = new Map(this.storage.workerList(run.id).map(w => [w.id, w]))
-      for (const step of this.storage.listChainSteps(run.id, run.goalRevision)) {
-        if (step.status !== 'running' || !step.assignedWorkerId) continue
-        if (this.active.has(step.assignedWorkerId)) continue
-        const assigned = workerById.get(step.assignedWorkerId)
-        if (!assigned) continue
-        if (assigned.status === 'complete') {
-          this.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: assigned.id })
-        } else if (assigned.status === 'failed' || assigned.status === 'canceled') {
-          this.storage.updateChainStep(step.id, { status: 'canceled', assignedWorkerId: assigned.id })
-        }
-      }
-    }
+    this.tier3Approvals.reconcileSettledApprovalWorkers(run)
   }
 
   // --- Event-Driven Scheduler ---
@@ -2080,31 +1665,34 @@ export class Execution {
       }
     }
 
-    // Tear down LabRunner containers for any runs no longer active
-    for (const runId of [...this.startedLabRuns]) {
-      try {
-        const current = this.storage.run(runId)
-        if (current.status === 'complete' || current.status === 'failed' || current.status === 'stopped') {
-          this.startedLabRuns.delete(runId)
-          this.startedLabHandles.delete(runId)
-          void this.labRunner.stopLabTarget(runId).catch(() => undefined)
-        }
-      } catch {
-        this.startedLabRuns.delete(runId)
-        this.startedLabHandles.delete(runId)
-        void this.labRunner.stopLabTarget(runId).catch(() => undefined)
-      }
-    }
-
-    // M-28: evict cached in-memory capability vaults for finalized, failed, stopped, or deleted runs
-    for (const runId of [...this.capabilityVaults.keys()]) {
+    // Tear down LabRunner containers and dispose RunActors/RunContexts for runs no longer active
+    const trackedRunIds = new Set<string>([
+      ...this.actors.keys(),
+      ...this.startedLabRuns,
+      ...this.capabilityVaults.keys(),
+    ])
+    for (const runId of trackedRunIds) {
       try {
         const current = this.storage.run(runId)
         if (current.status === 'complete' || current.status === 'failed' || current.status === 'stopped' || current.phase === 'complete') {
-          this.capabilityVaults.delete(runId)
+          const terminalState: TerminalRunActorState =
+            current.status === 'failed' ? 'failed'
+              : current.status === 'stopped' ? 'canceled'
+                : 'completed'
+          this.evictCapabilityVault(runId)
+          void this.disposeRun(runId, { terminalState, reason: `run ${current.status}` }).catch(() => undefined)
+        } else {
+          const actor = this.actors.get(runId)
+          if (actor && !actor.isTerminal) {
+            const targetState = deriveRunActorState(current)
+            if (actor.canTransitionTo(targetState)) {
+              actor.syncState(targetState, `wake:${current.status}:${current.phase}`)
+            }
+          }
         }
       } catch {
-        this.capabilityVaults.delete(runId)
+        this.evictCapabilityVault(runId)
+        void this.disposeRun(runId, { terminalState: 'canceled', reason: 'run unavailable' }).catch(() => undefined)
       }
     }
 
@@ -2120,6 +1708,11 @@ export class Execution {
     // 3. Process runnable runs
     const profiles = privateModelProfiles(this.storage)
     for (const run of this.storage.runnable()) {
+      const actor = this.ensureRunActor(run)
+      const desiredState = deriveRunActorState(run)
+      if (!actor.isTerminal && actor.canTransitionTo(desiredState)) {
+        actor.syncState(desiredState, `runnable:${run.status}:${run.phase}`)
+      }
       if (this.storage.checkBudgetExceeded(run.id)) continue
       this.ensureVariantSweepsForConfirmedFindings(run)
       this.routeOperatorBoardMessages(run)
@@ -2178,55 +1771,58 @@ export class Execution {
     const controller = new AbortController()
     this.runAuthInFlight.set(run.id, controller)
 
-    void this.personaAuth.startRunRefreshers(
-      this.storage,
-      run.id,
-      run.projectId,
-      run.approvedPersonaIds,
-      controller.signal,
-    ).then(() => {
+    this.spawnRunTask(run.id, 'persona-auth', async signal => {
       try {
-        const current = this.storage.run(run.id)
-        if (current.status === 'running' && this.runAuthKey(current) === key) {
-          this.runAuthStarted.set(run.id, key)
-        } else {
+        await this.personaAuth.startRunRefreshers(
+          this.storage,
+          run.id,
+          run.projectId,
+          run.approvedPersonaIds,
+          signal,
+        )
+        try {
+          const current = this.storage.run(run.id)
+          if (current.status === 'running' && this.runAuthKey(current) === key) {
+            this.runAuthStarted.set(run.id, key)
+          } else {
+            this.personaAuth.stopRunRefreshers(run.id)
+          }
+        } catch {
           this.personaAuth.stopRunRefreshers(run.id)
         }
-      } catch {
+      } catch (error) {
         this.personaAuth.stopRunRefreshers(run.id)
-      }
-    }).catch(error => {
-      this.personaAuth.stopRunRefreshers(run.id)
-      if (controller.signal.aborted) return
-      let secrets: NamedSecret[] = []
-      try {
-        secrets = personaSecrets(resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds))
-      } catch {
-        secrets = []
-      }
-      const msg = redact(error instanceof Error ? error.message : String(error), secrets).slice(0, 320)
-      try {
-        this.storage.transaction(() => {
-          const current = this.storage.run(run.id)
-          if (current.status !== 'running') return
-          this.storage.setStatus(current, 'paused')
-          this.storage.event(run.id, 'persona.auth_failed', `Persona login failed; run paused: ${msg}`, {
-            error: msg,
+        if (signal.aborted) return
+        let secrets: NamedSecret[] = []
+        try {
+          secrets = personaSecrets(resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds))
+        } catch {
+          secrets = []
+        }
+        const msg = redact(error instanceof Error ? error.message : String(error), secrets).slice(0, 320)
+        try {
+          this.storage.transaction(() => {
+            const current = this.storage.run(run.id)
+            if (current.status !== 'running') return
+            this.storage.setStatus(current, 'paused')
+            this.storage.event(run.id, 'persona.auth_failed', `Persona login failed; run paused: ${msg}`, {
+              error: msg,
+            })
+            this.storage.message(
+              run.id,
+              run.coordinatorId,
+              'kovo',
+              `Paused run because Email + Password persona authentication failed: ${msg}`,
+            )
           })
-          this.storage.message(
-            run.id,
-            run.coordinatorId,
-            'kovo',
-            `Paused run because Email + Password persona authentication failed: ${msg}`,
-          )
-        })
-      } catch {
-        // Ignore if run/storage closed
+        } catch {
+          // Ignore if run/storage closed
+        }
+      } finally {
+        this.runAuthInFlight.delete(run.id)
+        this.scheduleWake()
       }
-    }).finally(() => {
-      this.runAuthInFlight.delete(run.id)
-      this.scheduleWake()
-    })
+    }, { controller })
   }
 
   // --- Phase 1: Round-0 Threat Model & Initial Baseline Checks ---
@@ -2235,19 +1831,23 @@ export class Execution {
     const controller = new AbortController()
     const task: CoordinatorTask = { controller, goalRevision: run.goalRevision, scopeRevision: run.scopeRevision }
     this.threatModeling.set(run.id, task)
-    void this.reconPlanner.runThreatModel(run, profiles, task).catch(error => {
-      if (!this.currentCoordinator(run.id, task)) return
-      const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
-      this.storage.transaction(() => {
-        const current = this.storage.run(run.id)
-        this.storage.setStatus(current, 'failed')
-        this.storage.event(run.id, 'threat_model.failed', `Threat modeling failed: ${msg}`)
-        this.storage.writeReport(this.storage.run(run.id), true)
-      })
-    }).finally(() => {
-      this.threatModeling.delete(run.id)
-      this.scheduleWake()
-    })
+    this.spawnRunTask(run.id, 'threat-model', async () => {
+      try {
+        await this.reconPlanner.runThreatModel(run, profiles, task)
+      } catch (error) {
+        if (!this.currentCoordinator(run.id, task)) return
+        const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
+        this.storage.transaction(() => {
+          const current = this.storage.run(run.id)
+          this.storage.setStatus(current, 'failed')
+          this.storage.event(run.id, 'threat_model.failed', `Threat modeling failed: ${msg}`)
+          this.storage.writeReport(this.storage.run(run.id), true)
+        })
+      } finally {
+        this.threatModeling.delete(run.id)
+        this.scheduleWake()
+      }
+    }, { controller })
   }
 
   /** Correlate dependencies from uploaded/synced specs via the CVE broker (curated + remote). */
@@ -2562,7 +2162,8 @@ export class Execution {
 
     const steps = this.storage.listChainSteps(run.id, run.goalRevision)
     const highSignalFacts = new Set(
-      this.storage.listFacts(run.id, { includeTainted: false, limit: 500 })
+      this.reconPlanner.pageAll((offset, limit) =>
+        this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
         .filter(f => {
           const kind = String(f.kind)
           const subkind = typeof f.data?.subkind === 'string' ? f.data.subkind : ''
@@ -2692,13 +2293,17 @@ export class Execution {
     if (locs.length === 0) return
 
     this.variantSweepInFlight.add(findingRow.id)
-    void this.reconPlanner.runPostConfirmationVariantSweep(run, findingRow, reposDir, mountedRepos)
-      .catch(() => { /* best-effort variant sweep */ })
-      .finally(() => {
+    this.spawnRunTask(run.id, `variant-sweep:${findingRow.id}`, async () => {
+      try {
+        await this.reconPlanner.runPostConfirmationVariantSweep(run, findingRow, reposDir, mountedRepos)
+      } catch {
+        /* best-effort variant sweep */
+      } finally {
         this.variantSweepInFlight.delete(findingRow.id)
         this.variantSweptFindings.add(findingRow.id)
         this.scheduleWake()
-      })
+      }
+    })
   }
 
   private deterministicLaneKey(run: Pick<Run, 'id' | 'goalRevision' | 'scopeRevision'>): string {
@@ -2797,44 +2402,47 @@ export class Execution {
       )
     } catch { /* run may be gone */ }
     this.traceLifecycle(run.id, 'lane_start', { deadlineMs, maxDurationMs: this.maxDurationMs, mode: this.deterministicSweep })
-    holder.promise = this.runEngineInvestigation(run, {
-      signal: controller.signal,
-      maxDurationMs: deadlineMs,
-      allowThreatModelPhase,
-      onAssignment: id => {
-        holder.assignmentId = id
-        this.agenticLaneAssignmentIds.add(id)
-        if (allowThreatModelPhase) this.overlappedFloorAssignmentIds.add(id)
-      },
-    })
-      .catch(error => {
-        if (controller.signal.aborted) return
+    const laneTask = this.spawnRunTask(run.id, 'deterministic-floor', async signal => {
+      try {
+        await this.runEngineInvestigation(run, {
+          signal,
+          maxDurationMs: deadlineMs,
+          allowThreatModelPhase,
+          onAssignment: id => {
+            holder.assignmentId = id
+            this.agenticLaneAssignmentIds.add(id)
+            if (allowThreatModelPhase) this.overlappedFloorAssignmentIds.add(id)
+          },
+        })
+      } catch (error) {
+        if (signal.aborted) return
         try {
           const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
           this.storage.event(run.id, 'deterministic_lane.failed', `Deterministic floor failed: ${msg}`)
         } catch { /* run may be gone */ }
-      })
-      .finally(() => {
+      } finally {
         this.agenticLaneJobs.delete(run.id)
         this.agenticLaneStopping.delete(run.id)
         if (holder.assignmentId) this.overlappedFloorAssignmentIds.delete(holder.assignmentId)
         // M-10: do not mark Phase A completed when aborted (e.g. pause mid-floor), so resume re-runs it.
-        if (!controller.signal.aborted) {
+        if (!signal.aborted) {
           this.agenticLaneCompleted.add(key)
         }
         this.agenticFloorFinishedAt.set(run.id, Date.now())
-        this.traceLifecycle(run.id, 'lane_end', { aborted: controller.signal.aborted, deadlineMs })
-        try { this.settleFloorRequestPhase(run.id, controller.signal.aborted ? 'floor_aborted' : 'floor_complete') } catch { /* metrics only */ }
-        try { this.recordFloorMetrics(run.id, controller.signal.aborted ? 'floor_aborted' : 'floor_complete') } catch { /* metrics only */ }
+        this.traceLifecycle(run.id, 'lane_end', { aborted: signal.aborted, deadlineMs })
+        try { this.settleFloorRequestPhase(run.id, signal.aborted ? 'floor_aborted' : 'floor_complete') } catch { /* metrics only */ }
+        try { this.recordFloorMetrics(run.id, signal.aborted ? 'floor_aborted' : 'floor_complete') } catch { /* metrics only */ }
         this.laneStartedAt.delete(run.id)
         try {
           const latest = this.storage.run(run.id)
-          if (!controller.signal.aborted && latest.status === 'running' && latest.phase === 'investigation') {
+          if (!signal.aborted && latest.status === 'running' && latest.phase === 'investigation') {
             this.notifyCheckpoint(run.id, 'post-floor')
           }
         } catch { /* run may be gone */ }
         try { this.scheduleWake() } catch { /* scheduler stopped */ }
-      })
+      }
+    }, { controller })
+    holder.promise = laneTask.promise.then(() => undefined, () => undefined)
     return true
   }
 
@@ -2861,348 +2469,50 @@ export class Execution {
       .finally(() => { if (timer) clearTimeout(timer) })
   }
 
-  // --- v6 split request budgets (Phase A floor / Phase B agents) ------------------------------
+  // --- v6 split request budgets & telemetry (delegated to run-actor.ts) -----------------------
 
-  private beginRequestPhase(run: Run, phase: 'floor' | 'agent'): PhaseRequestState | null {
-    if (!this.phaseRequestBudgets) return null
-    const existing = this.phaseRequestState.get(run.id)
-    if (existing) return existing
-    const state: PhaseRequestState = {
-      floorBudget: this.phaseRequestBudgets.floor,
-      agentBudget: this.phaseRequestBudgets.agent,
-      baselineRequests: run.spentRequests,
-      floorRequests: 0,
-      floorSettled: phase === 'agent',
-      floorBudgetExhausted: false,
-      agentBudgetExhausted: false,
-      agentExhaustedReported: false,
-      floorExhaustedReported: false,
-      agentSettled: false,
-      agentRequests: 0,
-    }
-    this.phaseRequestState.set(run.id, state)
-    this.safeEvent(
-      run.id, 'request_budget.phase_started',
-      phase === 'floor'
-        ? `Phase A request allowance ${state.floorBudget}; Phase B allowance ${state.agentBudget} (split budgets; no borrowing).`
-        : `Phase B request allowance ${state.agentBudget} (no Phase-A floor in this run).`,
-      {
-        phase, floorRequestBudget: state.floorBudget, agentRequestBudget: state.agentBudget,
-        totalRequestBudget: run.budgetRequests > 0 ? run.budgetRequests : null, spentRequestsAtStart: state.baselineRequests,
-      },
-    )
-    return state
-  }
-
-  private beginFloorRequestPhase(run: Run): PhaseRequestState | null { return this.beginRequestPhase(run, 'floor') }
-  private beginAgentRequestPhase(run: Run): PhaseRequestState | null { return this.beginRequestPhase(run, 'agent') }
-
-  /** Freeze Phase-A spend and expose the Phase-B allowance. Idempotent. */
-  private settleFloorRequestPhase(runId: string, reason: string): void {
-    const state = this.phaseRequestState.get(runId)
-    if (!state || state.floorSettled) return
-    let run: Run
-    try { run = this.storage.run(runId) } catch { return }
-    state.floorRequests = Math.max(0, run.spentRequests - state.baselineRequests)
-    state.floorSettled = true
-    state.floorBudgetExhausted = state.floorRequests >= state.floorBudget
-    this.safeEvent(
-      runId, 'request_budget.floor_settled',
-      `Phase A used ${state.floorRequests}/${state.floorBudget} request(s); Phase B allowance is ${state.agentBudget}.`,
-      {
-        phase: 'floor', reason, floorRequests: state.floorRequests, floorRequestBudget: state.floorBudget,
-        agentRequestBudget: state.agentBudget, totalRequestBudget: run.budgetRequests > 0 ? run.budgetRequests : null,
-        spentRequestsAtStart: state.baselineRequests, spentRequestsAtSettle: run.spentRequests,
-        floorBudgetExhausted: state.floorBudgetExhausted,
-      },
-    )
-    if (state.floorBudgetExhausted && !state.floorExhaustedReported) {
-      state.floorExhaustedReported = true
-      this.safeEvent(
-        runId, 'request_budget.floor_exhausted',
-        `Phase A floor exhausted its ${state.floorBudget}-request allowance; Phase B keeps its own allowance.`,
-        { phase: 'floor', floorRequests: state.floorRequests, floorRequestBudget: state.floorBudget },
-      )
-    }
-  }
-
-  /** Freeze Phase-B spend when agentic investigation ends. Idempotent. */
-  private settleAgentRequestPhase(runId: string, reason: string): void {
-    const state = this.phaseRequestState.get(runId)
-    if (!state || !state.floorSettled || state.agentSettled) return
-    let run: Run
-    try { run = this.storage.run(runId) } catch { return }
-    state.agentRequests = Math.max(0, run.spentRequests - state.baselineRequests - state.floorRequests)
-    state.agentSettled = true
-    if (state.agentRequests >= state.agentBudget) state.agentBudgetExhausted = true
-    this.safeEvent(
-      runId, 'request_budget.phase_ended',
-      `Phase B used ${state.agentRequests}/${state.agentBudget} request(s) (floor ${state.floorRequests}/${state.floorBudget}).`,
-      {
-        phase: 'agent', reason, agentRequests: state.agentRequests, agentRequestBudget: state.agentBudget,
-        floorRequests: state.floorRequests, floorRequestBudget: state.floorBudget,
-        totalRequestBudget: run.budgetRequests > 0 ? run.budgetRequests : null,
-        agentBudgetExhausted: state.agentBudgetExhausted,
-        terminationReason: this.phaseTerminationReason.get(runId) ?? null,
-      },
-    )
-  }
-
-  /**
-   * Requests the current phase may still spend. Legacy mode = remaining run budget. Split mode =
-   * `min(run budget remaining, phase allowance remaining)`; phases never borrow from each other.
-   */
-  private phaseRequestRemaining(run: Run): number | null {
-    const runRemaining = run.budgetRequests > 0 ? Math.max(0, run.budgetRequests - run.spentRequests) : null
-    if (!this.phaseRequestBudgets) return runRemaining
-    const state = this.phaseRequestState.get(run.id)
-    if (!state) return runRemaining
-    const spent = Math.max(0, run.spentRequests - state.baselineRequests)
-    const phaseRemaining = state.floorSettled
-      ? Math.max(0, state.agentBudget - Math.max(0, spent - state.floorRequests))
-      : Math.max(0, state.floorBudget - spent)
-    if (state.floorSettled && phaseRemaining <= 0) state.agentBudgetExhausted = true
-    return runRemaining === null ? phaseRemaining : Math.min(phaseRemaining, runRemaining)
-  }
-
-  /** Honest telemetry snapshot for metrics (`deterministic_floor.summary`) and tests. */
-  private requestBudgetSnapshot(runId: string, floorReportedRequests: number): {
-    requestBudgetMode: 'split' | 'single'
-    floorRequests: number
-    floorRequestBudget: number | null
-    agentRequests: number | null
-    agentRequestBudget: number | null
-    totalRequestBudget: number | null
-    floorBudgetExhausted: boolean
-    agentBudgetExhausted: boolean
-    terminationReason: string | null
-  } {
-    let run: Pick<Run, 'spentRequests' | 'budgetRequests'>
-    try { run = this.storage.run(runId) } catch { run = { spentRequests: 0, budgetRequests: 0 } }
-    const state = this.phaseRequestState.get(runId) ?? null
-    const totalRequestBudget = run.budgetRequests > 0 ? run.budgetRequests : null
-    const terminationReason = this.phaseTerminationReason.get(runId) ?? null
-    if (!this.phaseRequestBudgets) {
-      return {
-        requestBudgetMode: 'single',
-        floorRequests: floorReportedRequests,
-        floorRequestBudget: null,
-        agentRequests: Math.max(0, run.spentRequests - floorReportedRequests),
-        agentRequestBudget: null,
-        totalRequestBudget,
-        floorBudgetExhausted: false,
-        agentBudgetExhausted: false,
-        terminationReason,
-      }
-    }
-    const floorRequests = state?.floorSettled
-      ? state.floorRequests
-      : Math.max(0, run.spentRequests - (state?.baselineRequests ?? run.spentRequests))
-    const agentRequests = state
-      ? state.agentSettled
-        ? state.agentRequests
-        : Math.max(0, run.spentRequests - state.baselineRequests - floorRequests)
-      : 0
-    return {
-      requestBudgetMode: 'split',
-      floorRequests,
-      floorRequestBudget: state?.floorBudget ?? this.phaseRequestBudgets.floor,
-      agentRequests,
-      agentRequestBudget: state?.agentBudget ?? this.phaseRequestBudgets.agent,
-      totalRequestBudget,
-      floorBudgetExhausted: state?.floorBudgetExhausted ?? false,
-      agentBudgetExhausted: state?.agentBudgetExhausted ?? false,
-      terminationReason,
-    }
-  }
-
-  /**
-   * Report an exhausted Phase-B allowance once. Dispatch already stopped; this records why the
-   * investigation phase ended instead of letting a wall-clock stop mislabel it.
-   */
+  private beginFloorRequestPhase(run: Run) { return this.budgetTracker.beginPhase(run, 'floor') }
+  private beginAgentRequestPhase(run: Run) { return this.budgetTracker.beginPhase(run, 'agent') }
+  private settleFloorRequestPhase(runId: string, reason: string): void { this.budgetTracker.settleFloor(runId, reason) }
+  private settleAgentRequestPhase(runId: string, reason: string): void { this.budgetTracker.settleAgent(runId, reason) }
+  private phaseRequestRemaining(run: Run): number | null { return this.budgetTracker.remaining(run) }
   private reportAgentBudgetExhausted(run: Run, readySteps: number, activeAssignments: number): void {
-    const state = this.phaseRequestState.get(run.id)
-    if (!state || !state.agentBudgetExhausted || state.agentExhaustedReported) return
-    state.agentExhaustedReported = true
-    this.phaseTerminationReason.set(run.id, 'agent_budget_exhausted')
-    const snapshot = this.requestBudgetSnapshot(run.id, 0)
-    this.safeEvent(
-      run.id, 'request_budget.agent_exhausted',
-      `Phase B agent request allowance exhausted (${snapshot.agentRequests}/${snapshot.agentRequestBudget}); `
-      + `${readySteps} ready step(s) left undispatched, ${activeAssignments} assignment(s) still in flight.`,
-      {
-        phase: 'agent', reason: 'agent_budget_exhausted',
-        agentRequests: snapshot.agentRequests, agentRequestBudget: snapshot.agentRequestBudget,
-        floorRequests: snapshot.floorRequests, floorRequestBudget: snapshot.floorRequestBudget,
-        readySteps, activeAssignments,
-      },
-    )
+    this.budgetTracker.reportAgentExhausted(run, readySteps, activeAssignments)
   }
 
-  /**
-   * Record the v6 Phase-1 gate counters (observed attribution, never asserted capability):
-   *  - `floorConfirmed`  findings whose id was emitted by a `deterministic_engine.confirmed` event,
-   *  - `floorStandaloneExpected` confirmations the floor itself reported (same deep policy as
-   *    `--no-llm`), so preservation is measurable without re-running the benchmark,
-   *  - `agenticConfirmed` every other confirmed finding,
-   *  - `floorLeadsEmitted`/`floorLeadsConsumed` det_lead signals and upgraded assignments,
-   *  - `laneWallMs` and phase timings for the sequential Phase A floor.
-   */
   private recordFloorMetrics(runId: string, reason: string): void {
-    const deterministicIds = new Set<string>()
-    let floorRequests = 0
-    let floorStandaloneExpected = 0
-    let floorLeadsEmitted = 0
-    // Paginate: a deep floor emits >3k broker/probe events, so a single capped page silently
-    // misses the summary/confirmation events at the tail.
-    let after = 0
-    for (;;) {
-      const page = this.storage.eventsAfter(runId, after, 1_000)
-      if (!page.length) break
-      for (const event of page) {
-        if (event.kind === 'deterministic_engine.confirmed') {
-          const id = event.detail?.findingId
-          if (typeof id === 'string') deterministicIds.add(id)
-        } else if (event.kind === 'deterministic_engine.summary') {
-          const used = Number(event.detail?.requestsUsed)
-          if (Number.isFinite(used) && used > 0) floorRequests += used
-          const confirmed = Number(event.detail?.confirmed)
-          if (Number.isFinite(confirmed) && confirmed > 0) floorStandaloneExpected += confirmed
-        } else if (event.kind === 'deterministic_engine.lead') {
-          floorLeadsEmitted += 1
-        }
-      }
-      after = page[page.length - 1]!.id
-      if (page.length < 1_000) break
-    }
-    let floorConfirmed = 0
-    let agenticConfirmed = 0
-    try {
-      const rows = this.storage.db.select().from(findings).where(eq(findings.runId, runId)).all()
-      for (const row of rows) {
-        if (row.finding.status !== 'confirmed') continue
-        if (deterministicIds.has(row.id)) floorConfirmed += 1
-        else agenticConfirmed += 1
-      }
-    } catch { /* run may be gone */ }
-    const startedAt = this.laneStartedAt.get(runId)
-    const laneWallMs = startedAt ? Math.max(0, Date.now() - startedAt) : (this.laneWallByRun.get(runId) ?? 0)
-    if (startedAt) this.laneWallByRun.set(runId, laneWallMs)
-    const floorStartedAt = this.agenticFloorStartedAt.get(runId) ?? startedAt ?? null
-    const floorFinishedAt = this.agenticFloorFinishedAt.get(runId)
-      ?? (floorStartedAt !== null ? floorStartedAt + laneWallMs : null)
-    const preservationRatio = floorStandaloneExpected > 0
-      ? Number((floorConfirmed / floorStandaloneExpected).toFixed(4))
-      : (floorConfirmed > 0 ? 1 : 0)
-    const dispatchedAt = this.agenticFloorDispatchedAt.get(runId)
-    const phaseTimings = {
-      floorStartedAt,
-      floorFinishedAt,
-      floorMs: floorStartedAt !== null && floorFinishedAt !== null ? Math.max(0, floorFinishedAt - floorStartedAt) : laneWallMs,
-      agentDispatchAt: dispatchedAt ?? null,
-      dispatchAfterFloorMs: dispatchedAt && floorFinishedAt ? Math.max(0, dispatchedAt - floorFinishedAt) : null,
-    }
-    // Split-budget accounting: when the floor settled, its measured request delta is authoritative;
-    // legacy mode keeps the engine-reported sum so existing preservation metrics are unchanged.
-    const budget = this.requestBudgetSnapshot(runId, floorRequests)
-    const detail = {
-      reason,
-      floorConfirmed,
-      floorStandaloneExpected,
-      preservationRatio,
-      agenticConfirmed,
-      floorLeadsEmitted,
-      floorLeadsConsumed: this.detLeadConsumed.size,
-      laneWallMs,
-      floorRequests: budget.floorRequests,
-      floorRequestBudget: budget.floorRequestBudget,
-      agentRequests: budget.agentRequests,
-      agentRequestBudget: budget.agentRequestBudget,
-      totalRequestBudget: budget.totalRequestBudget,
-      requestBudgetMode: budget.requestBudgetMode,
-      floorBudgetExhausted: budget.floorBudgetExhausted,
-      agentBudgetExhausted: budget.agentBudgetExhausted,
-      terminationReason: budget.terminationReason,
-      requestBudgets: budget,
-      phaseTimings,
-    }
-    this.safeEvent(
-      runId, 'deterministic_lane.metrics',
-      `Floor ${floorConfirmed} confirmed / agentic ${agenticConfirmed} confirmed; ${this.detLeadConsumed.size} det_lead(s) consumed; lane ${Math.round(laneWallMs / 1000)}s.`,
-      detail,
-    )
-    this.safeEvent(
-      runId, 'deterministic_floor.summary',
-      `Floor ${floorConfirmed}/${floorStandaloneExpected} preserved (${(preservationRatio * 100).toFixed(0)}%), ${floorLeadsEmitted} lead(s) emitted / ${this.detLeadConsumed.size} consumed, ${budget.floorRequests} floor request(s)${budget.floorRequestBudget !== null ? `/${budget.floorRequestBudget}` : ''}, ${budget.agentRequests ?? 0} agent request(s)${budget.agentRequestBudget !== null ? `/${budget.agentRequestBudget}` : ''}, Phase A ${Math.round(laneWallMs / 1000)}s${budget.terminationReason ? `, stopped: ${budget.terminationReason}` : ''}.`,
-      detail,
-    )
+    recordRunFloorMetrics({
+      storage: this.storage,
+      safeEvent: (id, kind, msg, detail) => this.safeEvent(id, kind, msg, detail),
+      laneStartedAt: this.laneStartedAt,
+      laneWallByRun: this.laneWallByRun,
+      agenticFloorStartedAt: this.agenticFloorStartedAt,
+      agenticFloorFinishedAt: this.agenticFloorFinishedAt,
+      agenticFloorDispatchedAt: this.agenticFloorDispatchedAt,
+      detLeadConsumed: this.detLeadConsumed,
+      requestBudgetSnapshot: (id, floorReqs) => this.budgetTracker.snapshot(id, floorReqs),
+    }, runId, reason)
   }
 
-  /**
-   * Phase-B throughput telemetry (observed, never asserted): assignment wall p50/p90, turns per
-   * assignment, provider stall turns, and container launches/reuse. `verified_tp_per_100s_phase_b`
-   * is driven by these, so they must be readable without parsing raw logs.
-   */
   private recordAssignmentMetrics(runId: string, reason: string): AssignmentThroughputMetrics | null {
-    let workers: Assignment[] = []
-    try {
-      workers = this.storage.workerList(runId).filter(worker => worker.phase === 'investigation')
-    } catch { return null }
-    const walls = this.assignmentWallByRun.get(runId) ?? []
-    const completedWalls = this.completedAssignmentWallByRun.get(runId) ?? []
-    const turnSamples = this.turnLatencyByRun.get(runId) ?? []
-    const turnSummary = summarizeTurnLatencies(turnSamples)
-    const containers = this.backend.containerStats?.()
-    const turns = workers.map(worker => worker.turnsUsed)
-    const metrics: AssignmentThroughputMetrics = {
-      reason,
-      assignmentsObserved: workers.length,
-      assignmentsCompleted: workers.filter(worker => worker.status === 'complete').length,
-      assignmentsPausedAtStop: workers.filter(worker => worker.status === 'paused').length,
-      assignmentWallP50: Math.round(percentile(walls, 50)),
-      assignmentWallP90: Math.round(percentile(walls, 90)),
-      assignmentWallSamples: walls.length,
-      completedAssignmentWallP50: Math.round(percentile(completedWalls, 50)),
-      completedAssignmentWallSamples: completedWalls.length,
-      turnsPerAssignment: turns.length ? Math.round((turns.reduce((sum, n) => sum + n, 0) / turns.length) * 10) / 10 : 0,
-      earlyExitTurnsSaved: this.earlyExitTurnsSavedByRun.get(runId) ?? 0,
-      providerStallTurns: this.providerStallTurnsByRun.get(runId) ?? 0,
-      providerStallRetries: this.providerStallRetriesByRun.get(runId) ?? 0,
-      providerStallTimeouts: this.providerStallTimeoutsByRun.get(runId) ?? 0,
-      providerStallWallSavedMs: this.providerStallWallSavedByRun.get(runId) ?? 0,
-      turnLatencyP50: turnSummary.p50,
-      turnLatencyP90: turnSummary.p90,
-      containersLaunched: containers?.created ?? 0,
-      containersReused: containers?.reused ?? 0,
-      containerSessions: containers?.sessions ?? 0,
-      coldContainerSessions: containers?.coldSessions ?? 0,
-      idleWarmContainers: containers?.idle ?? 0,
-      warmCapacity: containers?.capacity ?? 0,
-      containerReuseHitRate: containers && containers.sessions > 0
-        ? Math.round((containers.reused / containers.sessions) * 1000) / 1000
-        : 0,
-      warmPoolPolicyRotations: this.warmPoolPolicyRotationsByRun.get(runId) ?? 0,
-      wallClockRotations: this.wallClockRotationsByRun.get(runId) ?? 0,
-      ...(this.proofObligationByRun.has(runId) ? { proofObligation: { ...this.proofObligationByRun.get(runId)! } } : {}),
-      ...(this.gapValidationByRun.has(runId)
-        ? {
-            gapValidation: {
-              accepted: this.gapValidationByRun.get(runId)!.accepted,
-              rejected: this.gapValidationByRun.get(runId)!.rejected,
-              byCode: Object.fromEntries(
-                Object.entries(this.gapValidationByRun.get(runId)!.byCode).map(([k, v]) => [k, { ...v }]),
-              ),
-            },
-          }
-        : {}),
-    }
-    this.lastAssignmentMetrics.set(runId, metrics)
-    this.safeEvent(
-      runId, 'agentic.assignment_metrics',
-      `Phase B throughput: ${metrics.assignmentsCompleted}/${metrics.assignmentsObserved} assignment(s) complete, p50 ${(metrics.assignmentWallP50 / 1000).toFixed(1)}s / p90 ${(metrics.assignmentWallP90 / 1000).toFixed(1)}s, ${metrics.turnsPerAssignment} turn(s)/assignment, ${metrics.providerStallTurns} stall turn(s) / ${metrics.providerStallRetries} bounded retry(ies) / ${metrics.providerStallTimeouts} no-token timeout(s) (${(metrics.providerStallWallSavedMs / 1000).toFixed(1)}s saved), ${metrics.containersLaunched} container launch(es) / ${metrics.containersReused} reuse(s) (${(metrics.containerReuseHitRate * 100).toFixed(0)}% hit rate, ${metrics.idleWarmContainers}/${metrics.warmCapacity} idle).`,
-      { ...metrics },
-    )
-    return metrics
+    return recordRunAssignmentMetrics({
+      storage: this.storage,
+      backend: this.backend,
+      safeEvent: (id, kind, msg, detail) => this.safeEvent(id, kind, msg, detail),
+      assignmentWallByRun: this.assignmentWallByRun,
+      completedAssignmentWallByRun: this.completedAssignmentWallByRun,
+      turnLatencyByRun: this.turnLatencyByRun,
+      earlyExitTurnsSavedByRun: this.earlyExitTurnsSavedByRun,
+      providerStallTurnsByRun: this.providerStallTurnsByRun,
+      providerStallRetriesByRun: this.providerStallRetriesByRun,
+      providerStallTimeoutsByRun: this.providerStallTimeoutsByRun,
+      providerStallWallSavedByRun: this.providerStallWallSavedByRun,
+      warmPoolPolicyRotationsByRun: this.warmPoolPolicyRotationsByRun,
+      wallClockRotationsByRun: this.wallClockRotationsByRun,
+      proofObligationByRun: this.proofObligationByRun,
+      gapValidationByRun: this.gapValidationByRun,
+      lastAssignmentMetrics: this.lastAssignmentMetrics,
+    }, runId, reason)
   }
 
   /** Last recorded Phase-B throughput metrics for a run (test/benchmark seam). */
@@ -3387,9 +2697,10 @@ export class Execution {
     const mentioned = new Set(this.reconPlanner.stepMentionedRoutes(step).map(route => normalizeEndpointTemplate(route)))
     const text = `${step.title} ${step.hypothesis}`
     const candidates = [
-      ...parentFacts.filter(fact => fact.data?.kind === 'det_lead'),
-      ...this.storage.listFacts(run.id, { includeTainted: false, limit: 200 })
-        .filter(fact => fact.data?.kind === 'det_lead'),
+      ...parentFacts.filter(fact => isTrustedHostControlFact(fact, 'det_lead')),
+      ...this.reconPlanner.pageAll((offset, limit) =>
+        this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
+        .filter(fact => isTrustedHostControlFact(fact, 'det_lead')),
     ]
     for (const fact of candidates) {
       const data = fact.data as Record<string, unknown> | undefined
@@ -3411,8 +2722,18 @@ export class Execution {
     assignment: Assignment,
     hypotheses: readonly CodeToRuntimeHypothesis[],
   ): number {
+    // M-47: Stamp explicit host planner provenance on seeded Program-Graph det_lead facts.
+    const hostLeadStore = {
+      addFact: (r: Run, a: Assignment, input: { kind: 'note'; origin: string; summary: string; data: Record<string, unknown> }) =>
+        this.storage.addFact(r, a, {
+          ...input,
+          data: { ...input.data, producer: HOST_PLANNER_PRODUCER },
+        }),
+      event: (runId: string, kind: string, message: string, detail?: Record<string, unknown>) =>
+        this.storage.event(runId, kind, message, detail),
+    }
     return seedGraphLeads(
-      this.storage,
+      hostLeadStore,
       run,
       assignment,
       hypotheses,
@@ -3426,10 +2747,13 @@ export class Execution {
 
     if (!profiles.length) {
       // Explicit --no-llm mode runs the deterministic engine. Without that flag the legacy M1
-      // no-profile fallback stays byte-for-byte unchanged; it is suppressed while a worker is
-      // parked awaiting an operator decision, because the run is not idle, it is blocked on a human.
+      // no-profile fallback stays byte-for-byte unchanged; it is suppressed while any worker is
+      // active or parked awaiting an operator decision (prevents deterministic-mode approval race).
+      const hasLiveWorker =
+        [...this.active.values()].some(j => j.assignment.runId === run.id && j.assignment.phase === 'investigation') ||
+        this.storage.parkedWorkerCount(run.id) > 0
       if (this.deterministicOnly) this.driveEngineInvestigation(run)
-      else if (this.storage.parkedWorkerCount(run.id) === 0) this.driveDeterministicInvestigation(run)
+      else if (!hasLiveWorker) this.driveDeterministicInvestigation(run)
       return
     }
     // Always compute & persist dynamic step budget clamp(24, crownJewels*2 + suspects, 200)
@@ -3498,16 +2822,22 @@ export class Execution {
     } catch { /* invariant chain promotion is additive */ }
 
     const steps = this.storage.listChainSteps(run.id, run.goalRevision)
+    let anyCircuitBlocked = false
     const readySteps = steps
       .filter(s => s.status === 'ready')
       .filter(s => !(s.assignedWorkerId && this.active.has(s.assignedWorkerId)))
       .filter(s => {
         if (s.sourceOrigins.length > 0 && s.sourceOrigins.every(o => this.broker.isCircuitOpen(o))) {
           this.storage.updateChainStep(s.id, { status: 'blocked' })
+          anyCircuitBlocked = true
           return false
         }
         return true
       })
+    // M-12: Propagate blocked status to pending dependents immediately so circuit-open steps never wedge driveInvestigation.
+    if (anyCircuitBlocked) {
+      this.storage.refreshReadyChainSteps(run.id, run.goalRevision)
+    }
 
     const configuredConc = Math.max(1, Math.min(maxWorkerConcurrency, run.workerConcurrency || defaultWorkerConcurrency))
     const readyPrimarySteps = readySteps.filter(step => !(typeof step.trialIndex === 'number' && step.trialIndex > 0)).length
@@ -3544,7 +2874,7 @@ export class Execution {
     // In-flight assignments keep their lease; the handoff waits for them to settle.
     const freshRun = this.storage.run(run.id)
     this.phaseRequestRemaining(freshRun)
-    const phaseState = this.phaseRequestState.get(run.id)
+    const phaseState = this.budgetTracker.stateByRun.get(run.id)
     if (this.phaseRequestBudgets && phaseState?.floorSettled && phaseState.agentBudgetExhausted) {
       this.reportAgentBudgetExhausted(freshRun, readySteps.length, activeForRun)
       if (activeForRun === 0) this.advanceToVerification(run)
@@ -3667,14 +2997,15 @@ export class Execution {
   ) {
     if (this.deterministicCompleted.has(key) || this.deterministicInFlight.has(key)) return
     this.deterministicInFlight.add(key)
-    void execPass()
-      .catch(error => {
+    this.spawnRunTask(run.id, `deterministic:${eventPrefix}`, async () => {
+      try {
+        await execPass()
+      } catch (error) {
         try {
           const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
           this.storage.event(run.id, `${eventPrefix}.failed`, `${label} failed: ${msg}`)
         } catch { /* store closed or run removed */ }
-      })
-      .finally(() => {
+      } finally {
         this.deterministicInFlight.delete(key)
         this.deterministicCompleted.add(key)
         onFinallyBeforeAdvance?.()
@@ -3693,7 +3024,8 @@ export class Execution {
         } catch { /* store closed or run removed */ }
         try { this.notifyCheckpoint(run.id, 'deterministic-lane') } catch { /* best-effort */ }
         try { this.scheduleWake() } catch { /* scheduler already stopped */ }
-      })
+      }
+    })
   }
 
   private driveDeterministicInvestigation(run: Run) {
@@ -3818,6 +3150,7 @@ export class Execution {
     }, effectiveDelayMs)
     timer.unref?.()
     this.plannerTimers.set(runId, timer)
+    try { this.ensureRunActor(runId).registerTimer('planner-debounce', timer) } catch { /* ignore */ }
   }
 
   private startChainPlanner(run: Run, profiles: readonly ResolvedModelProfile[]) {
@@ -3826,12 +3159,11 @@ export class Execution {
     const controller = new AbortController()
     const task: CoordinatorTask = { controller, goalRevision: run.goalRevision, scopeRevision: run.scopeRevision }
     this.plannerTasks.set(run.id, task)
-    void Promise.resolve()
-      .then(() => this.runChainPlanner(run, profiles, task))
-      .then(() => {
+    this.spawnRunTask(run.id, 'chain-planner', async () => {
+      try {
+        await this.runChainPlanner(run, profiles, task)
         this.plannerErrorState.delete(run.id)
-      })
-      .catch(error => {
+      } catch (error) {
         if (!this.currentCoordinator(run.id, task) || task.controller.signal.aborted) return
         const prev = this.getPlannerErrorState(run.id, run.goalRevision)
         const consecutiveErrors = (prev?.consecutiveErrors ?? 0) + 1
@@ -3867,8 +3199,7 @@ export class Execution {
             { consecutiveErrors, maxConsecutiveErrors: this.plannerMaxConsecutiveErrors, backoffMs, error: msg },
           )
         }
-      })
-      .finally(() => {
+      } finally {
         this.plannerTasks.delete(run.id)
         try {
           const latest = this.storage.run(run.id)
@@ -3877,7 +3208,8 @@ export class Execution {
           }
         } catch { /* run/store may already be gone */ }
         this.scheduleWake()
-      })
+      }
+    }, { controller })
   }
 
   private startInvestigationStep(run: Run, step: ChainStep, profiles: readonly ResolvedModelProfile[]) {
@@ -4001,41 +3333,45 @@ export class Execution {
     this.postCoordinatorBrief(run, effectiveStep, boardHandle, targetOrigins)
 
     let workerErrored = false
-    void this.runInvestigationWorker(job, effectiveStep, targetOrigins, profiles, budget).catch(error => {
-      workerErrored = true
-      const msg = error instanceof Error ? error.message : String(error)
-      const ctrl = this.phaseBControllers.get(run.id)
-      if (ctrl) {
-        if (/\b429\b|rate[\s_-]?limit/i.test(msg)) ctrl.recordPressure('llm_429')
-        else if (/docker|container|openSession|spawn|EAGAIN|ENOMEM/i.test(msg)) ctrl.recordPressure('container_spawn_error')
-        else if (/timeout|timed out|ETIMEDOUT/i.test(msg)) ctrl.recordPressure('target_timeout')
-      }
-      this.workerRunner.handleInvestigationWorkerError(run, job, effectiveStep, resolvedSpecialistId, budget, error)
-    }).finally(() => {
-      this.active.delete(assignment.id)
-      try { this.board.finishBoardMember(this.storage.run(run.id), assignment.id) } catch { /* run may be gone */ }
-      // Avoid premature mid-wave planner triggers when Wave 2+ still buffers >= maxConc ready steps
-      // and this assignment produced no new fact or finding.
-      let shouldPlan = true
+    this.spawnRunTask(run.id, `investigation:${assignment.id}`, async () => {
       try {
-        const latestRun = this.storage.run(run.id)
+        await this.runInvestigationWorker(job, effectiveStep, targetOrigins, profiles, budget)
+      } catch (error) {
+        workerErrored = true
+        const msg = error instanceof Error ? error.message : String(error)
         const ctrl = this.phaseBControllers.get(run.id)
-        const remainingUsd = Math.max(0, latestRun.budgetUsd - latestRun.spentUsd)
-        if (ctrl && !workerErrored && !job.stallAbort) {
-          ctrl.recordCleanCompletion({ remainingBudgetUsd: remainingUsd })
+        if (ctrl) {
+          if (/\b429\b|rate[\s_-]?limit/i.test(msg)) ctrl.recordPressure('llm_429')
+          else if (/docker|container|openSession|spawn|EAGAIN|ENOMEM/i.test(msg)) ctrl.recordPressure('container_spawn_error')
+          else if (/timeout|timed out|ETIMEDOUT/i.test(msg)) ctrl.recordPressure('target_timeout')
         }
-        const maxConc = ctrl
-          ? ctrl.getEffectiveConcurrency({ remainingBudgetUsd: remainingUsd })
-          : Math.max(1, Math.min(maxWorkerConcurrency, latestRun.workerConcurrency || defaultWorkerConcurrency))
-        const readySteps = this.storage.listChainSteps(run.id, latestRun.goalRevision)
-          .filter(s => s.status === 'ready').length
-        const newFact = this.storage.listFacts(run.id, { includeTainted: false, limit: 500 }).length > baselineFacts
-        const newFinding = this.storage.db.select().from(findings).where(eq(findings.runId, run.id)).all().length > baselineFindings
-        shouldPlan = readySteps < maxConc || newFact || newFinding
-      } catch { /* run may be gone */ }
-      if (shouldPlan) this.schedulePlanner(run.id)
-      this.scheduleWake()
-    })
+        this.workerRunner.handleInvestigationWorkerError(run, job, effectiveStep, resolvedSpecialistId, budget, error)
+      } finally {
+        this.active.delete(assignment.id)
+        try { this.board.finishBoardMember(this.storage.run(run.id), assignment.id) } catch { /* run may be gone */ }
+        // Avoid premature mid-wave planner triggers when Wave 2+ still buffers >= maxConc ready steps
+        // and this assignment produced no new fact or finding.
+        let shouldPlan = true
+        try {
+          const latestRun = this.storage.run(run.id)
+          const ctrl = this.phaseBControllers.get(run.id)
+          const remainingUsd = Math.max(0, latestRun.budgetUsd - latestRun.spentUsd)
+          if (ctrl && !workerErrored && !job.stallAbort) {
+            ctrl.recordCleanCompletion({ remainingBudgetUsd: remainingUsd })
+          }
+          const maxConc = ctrl
+            ? ctrl.getEffectiveConcurrency({ remainingBudgetUsd: remainingUsd })
+            : Math.max(1, Math.min(maxWorkerConcurrency, latestRun.workerConcurrency || defaultWorkerConcurrency))
+          const readySteps = this.storage.listChainSteps(run.id, latestRun.goalRevision)
+            .filter(s => s.status === 'ready').length
+          const newFact = this.storage.listFacts(run.id, { includeTainted: false, limit: 500 }).length > baselineFacts
+          const newFinding = this.storage.db.select().from(findings).where(eq(findings.runId, run.id)).all().length > baselineFindings
+          shouldPlan = readySteps < maxConc || newFact || newFinding
+        } catch { /* run may be gone */ }
+        if (shouldPlan) this.schedulePlanner(run.id)
+        this.scheduleWake()
+      }
+    }, { controller: job.controller })
   }
 
   private phaseBControllerFor(run: Run): PhaseBConcurrencyController {
@@ -4532,10 +3868,12 @@ export class Execution {
       try {
         const current = this.storage.run(run.id)
         if (current.status === 'complete' || current.phase === 'complete') {
-          this.capabilityVaults.delete(run.id)
+          this.evictCapabilityVault(run.id)
+          void this.disposeRun(run.id, { terminalState: 'completed', reason: 'final report written' }).catch(() => undefined)
         }
       } catch {
-        this.capabilityVaults.delete(run.id)
+        this.evictCapabilityVault(run.id)
+        void this.disposeRun(run.id, { terminalState: 'completed', reason: 'final report written' }).catch(() => undefined)
       }
     }
   }
@@ -4545,7 +3883,13 @@ export class Execution {
     // and fast-settle first, then commit the phase transition exactly once.
     if (this.agenticLaneStopping.has(run.id)) return
     if (this.agenticLaneJobs.has(run.id)) {
-      void this.abortAgenticLane(run, 'phase-2 complete').finally(() => this.commitVerificationPhase(run))
+      this.spawnRunTask(run.id, 'advance-to-verification', async () => {
+        try {
+          await this.abortAgenticLane(run, 'phase-2 complete')
+        } finally {
+          this.commitVerificationPhase(run)
+        }
+      })
       return
     }
     this.commitVerificationPhase(run)
@@ -4575,9 +3919,15 @@ export class Execution {
         `Investigation complete${openProofGaps.length ? ` (${openProofGaps.length} open proof ${openProofGaps.length === 1 ? 'gap' : 'gaps'} surfaced)` : ''}. Deterministic Zero-LLM verification is replaying every proposed finding and checking baselines.`)
     }, { behavior: 'immediate' })
     try {
+      const actor = this.actors.get(run.id)
+      if (actor && !actor.isTerminal && actor.canTransitionTo('verifying')) {
+        actor.syncState('verifying', 'investigation complete')
+      }
+    } catch { /* actor state sync is best-effort */ }
+    try {
       this.settleAgentRequestPhase(
         run.id,
-        this.phaseTerminationReason.get(run.id) === 'agent_budget_exhausted'
+        this.budgetTracker.terminationReasonByRun.get(run.id) === 'agent_budget_exhausted'
           ? 'agent_budget_exhausted'
           : 'investigation_complete',
       )
@@ -4674,17 +4024,26 @@ export class Execution {
     if (!claimed) return
     const job: Active = { assignment: claimed, origins: new Set(claimed.sourceOrigins), controller: new AbortController() }
     this.active.set(claimed.id, job)
-    void work(job).catch(error => {
-      if (skipIfUnauthorized && (!this.authorize(job) || job.controller.signal.aborted)) return
-      const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 400)
-      this.storage.transaction(() => {
-        this.storage.updateWorker(claimed.id, { status: 'failed', outcome: msg, lease: null, leaseExpiresAt: null })
-        this.storage.event(run.id, `${eventPrefix}.failed`, `${failureLabel}: ${msg}`, { assignmentId: claimed.id })
-      })
-    }).finally(() => {
-      this.active.delete(claimed.id)
-      this.scheduleWake()
-    })
+    const runWork = async () => {
+      try {
+        await work(job)
+      } catch (error) {
+        if (skipIfUnauthorized && (!this.authorize(job) || job.controller.signal.aborted)) return
+        const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 400)
+        this.storage.transaction(() => {
+          this.storage.updateWorker(claimed.id, { status: 'failed', outcome: msg, lease: null, leaseExpiresAt: null })
+          this.storage.event(run.id, `${eventPrefix}.failed`, `${failureLabel}: ${msg}`, { assignmentId: claimed.id })
+        })
+      } finally {
+        this.active.delete(claimed.id)
+        this.scheduleWake()
+      }
+    }
+    if (eventPrefix === 'worker') {
+      this.spawnRunTask(run.id, `verification:${claimed.id}`, runWork, { controller: job.controller })
+    } else {
+      void runWork()
+    }
   }
 
   private startVerificationWorker(run: Run, worker: Assignment) {
@@ -4781,6 +4140,7 @@ export class Execution {
               },
               baselineExpectStatus: [200, 201, 204],
             } : {}),
+            sanitizedRepoDir: labHandle.sanitizedRepoDir,
           }
         }
       } catch {
