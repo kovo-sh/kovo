@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { cn } from '../../lib/cn.ts'
 import type { GithubAppInstallationSummary, GithubAuthKind, GithubPatKind } from '../../server/github-connector.ts'
-import '../settings/settings.css'
+import { Badge } from '../ui/badge.tsx'
+import { Button, buttonVariants } from '../ui/button.tsx'
 
 export interface GithubInstallBannerProps {
   authKind?: GithubAuthKind | null
@@ -19,7 +21,7 @@ export interface GithubInstallBannerProps {
 function OrgRepoLockIcon() {
   return (
     <svg
-      className="gh-inst-icon"
+      className="block shrink-0"
       width="16"
       height="16"
       viewBox="0 0 16 16"
@@ -145,26 +147,40 @@ export function GithubInstallBanner({
   const isGithubApp = authKind === 'github_app_device' || tokenKind === 'github_app'
   const installedList = Array.isArray(installations) ? installations : []
 
-  const modClasses = `${compact ? ' gh-inst-compact' : ''}${flush ? ' gh-inst-flush' : ''}`
+  const flushSurfaceClasses =
+    'rounded-none border-0 border-t border-line [.pw-repo-sheet_&]:border-t-0 [.pw-repo-sheet_&]:border-b [.pw-repo-sheet_&]:border-line'
 
   if (needsAppInstall) {
     return (
       <div
-        className={`gh-inst-banner${modClasses}`}
+        className={cn(
+          'flex flex-col bg-sunk text-fg',
+          compact ? 'gap-2 px-3 py-2.5' : 'gap-2.5 px-3.5 py-3',
+          flush ? flushSurfaceClasses : 'rounded-lg border border-line-2',
+        )}
         role="region"
         aria-label="GitHub App repository access"
         data-testid="github-install-banner"
       >
-        <div className="gh-inst-head">
-          <span className="gh-inst-icon-badge" aria-hidden="true">
+        <div className="flex min-w-0 items-start gap-2.5">
+          <span
+            className="inline-flex size-7 flex-none items-center justify-center rounded-[7px] border border-line-2 bg-panel text-fg-muted"
+            aria-hidden="true"
+          >
             <OrgRepoLockIcon />
           </span>
-          <div className="gh-inst-copy">
-            <strong className="gh-inst-title">Missing private repos or orgs?</strong>
-            <p className="gh-inst-body">
+          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+            <strong className="text-[13px] font-semibold leading-[18px] text-fg">
+              Missing private repos or orgs?
+            </strong>
+            <p className="m-0 text-[12px] leading-[18px] text-fg-muted">
               {login ? (
                 <>
-                  You&apos;re signed in as <code className="gh-inst-login">@{login}</code>, but the GitHub App isn&apos;t installed on any account or organization yet — so only public repos appear.
+                  You&apos;re signed in as{' '}
+                  <code className="rounded-sm border border-line-2 bg-panel px-[5px] py-px font-mono text-[11.5px] text-fg">
+                    @{login}
+                  </code>
+                  , but the GitHub App isn&apos;t installed on any account or organization yet — so only public repos appear.
                 </>
               ) : (
                 <>
@@ -174,10 +190,10 @@ export function GithubInstallBanner({
             </p>
           </div>
         </div>
-        <div className="gh-inst-actions">
+        <div className="flex flex-wrap items-center gap-2">
           {installUrl && (
             <a
-              className="gh-inst-btn primary"
+              className={cn(buttonVariants({ variant: 'default' }), 'px-2.5 text-[12px] no-underline')}
               href={installUrl}
               target="_blank"
               rel="noopener noreferrer"
@@ -186,9 +202,10 @@ export function GithubInstallBanner({
               Choose orgs &amp; repos on GitHub ↗
             </a>
           )}
-          <button
+          <Button
             type="button"
-            className="gh-inst-btn"
+            variant="outline"
+            className="px-2.5 text-[12px]"
             disabled={loading}
             onClick={() => {
               cleanupRef.current?.()
@@ -197,9 +214,9 @@ export function GithubInstallBanner({
             }}
           >
             {loading ? 'Refreshing…' : 'Refresh repos'}
-          </button>
+          </Button>
           {awaitingReturn && !loading && (
-            <span className="gh-inst-hint" role="status">
+            <span className="text-[11.5px] text-fg-subtle" role="status">
               Will refresh automatically when you return from GitHub.
             </span>
           )}
@@ -211,13 +228,17 @@ export function GithubInstallBanner({
   if (installedList.length > 0) {
     return (
       <div
-        className={`gh-inst-bar${modClasses}`}
+        className={cn(
+          'flex flex-wrap items-center justify-between gap-2.5 bg-sunk text-[12px] text-fg-muted',
+          compact ? 'px-2.5 py-1.5' : 'px-[11px] py-2',
+          flush ? flushSurfaceClasses : 'rounded-lg border border-line',
+        )}
         role="region"
         aria-label="Installed GitHub accounts and organizations"
         data-testid="github-install-bar"
       >
-        <div className="gh-inst-chips">
-          <span className="gh-inst-bar-label">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+          <span className="inline-flex items-center gap-1.5 text-[12px] font-medium text-fg-subtle">
             <OrgRepoLockIcon />
             <span>Installed on</span>
           </span>
@@ -227,7 +248,7 @@ export function GithubInstallBanner({
             return inst.htmlUrl ? (
               <a
                 key={inst.id}
-                className="gh-inst-chip gh-inst-chip-link"
+                className="inline-flex h-[22px] items-center gap-1 whitespace-nowrap rounded-full border border-line-2 bg-panel px-2 text-[11.5px] font-medium text-fg no-underline transition-colors hover:border-accent-line hover:text-accent"
                 href={inst.htmlUrl}
                 target="_blank"
                 rel="noopener noreferrer"
@@ -237,21 +258,29 @@ export function GithubInstallBanner({
                 {label}
               </a>
             ) : (
-              <span key={inst.id} className="gh-inst-chip" title={title}>
+              <Badge
+                key={inst.id}
+                variant="neutral"
+                className="h-[22px] bg-panel px-2 font-medium text-fg"
+                title={title}
+              >
                 {label}
-              </span>
+              </Badge>
             )
           })}
           {typeof privateRepoCount === 'number' && privateRepoCount > 0 && (
-            <span className="gh-inst-private-count">
+            <Badge
+              variant="neutral"
+              className="bg-panel text-[11px] font-medium tabular-nums text-fg-muted"
+            >
               {privateRepoCount} private
-            </span>
+            </Badge>
           )}
         </div>
-        <div className="gh-inst-bar-actions">
+        <div className="flex flex-none flex-wrap items-center gap-2">
           {installUrl && (
             <a
-              className="gh-inst-link"
+              className="whitespace-nowrap text-[12px] font-medium text-accent no-underline hover:underline"
               href={installUrl}
               target="_blank"
               rel="noopener noreferrer"
@@ -260,9 +289,10 @@ export function GithubInstallBanner({
               Manage orgs &amp; repos on GitHub ↗
             </a>
           )}
-          <button
+          <Button
             type="button"
-            className="gh-inst-btn ghost"
+            variant="ghost"
+            className="h-6 px-[7px] text-[12px]"
             disabled={loading}
             onClick={() => {
               cleanupRef.current?.()
@@ -271,7 +301,7 @@ export function GithubInstallBanner({
             }}
           >
             {loading ? 'Refreshing…' : 'Refresh'}
-          </button>
+          </Button>
         </div>
       </div>
     )
@@ -280,13 +310,17 @@ export function GithubInstallBanner({
   if (isGithubApp && (installUrl || loading)) {
     return (
       <div
-        className={`gh-inst-bar${modClasses}`}
+        className={cn(
+          'flex flex-wrap items-center justify-between gap-2.5 bg-sunk text-[12px] text-fg-muted',
+          compact ? 'px-2.5 py-1.5' : 'px-[11px] py-2',
+          flush ? flushSurfaceClasses : 'rounded-lg border border-line',
+        )}
         role="region"
         aria-label="GitHub App repository access"
         data-testid="github-install-bar"
       >
-        <div className="gh-inst-chips">
-          <span className="gh-inst-bar-label">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+          <span className="inline-flex items-center gap-1.5 text-[12px] font-medium text-fg-subtle">
             <OrgRepoLockIcon />
             <span>
               {loading
@@ -295,10 +329,10 @@ export function GithubInstallBanner({
             </span>
           </span>
         </div>
-        <div className="gh-inst-bar-actions">
+        <div className="flex flex-none flex-wrap items-center gap-2">
           {installUrl && (
             <a
-              className="gh-inst-link"
+              className="whitespace-nowrap text-[12px] font-medium text-accent no-underline hover:underline"
               href={installUrl}
               target="_blank"
               rel="noopener noreferrer"
@@ -307,9 +341,10 @@ export function GithubInstallBanner({
               Choose orgs &amp; repos on GitHub ↗
             </a>
           )}
-          <button
+          <Button
             type="button"
-            className="gh-inst-btn ghost"
+            variant="ghost"
+            className="h-6 px-[7px] text-[12px]"
             disabled={loading}
             onClick={() => {
               cleanupRef.current?.()
@@ -318,7 +353,7 @@ export function GithubInstallBanner({
             }}
           >
             {loading ? 'Refreshing…' : 'Refresh'}
-          </button>
+          </Button>
         </div>
       </div>
     )

@@ -1,9 +1,16 @@
 import { useEffect, useState } from 'react'
 import { saveModel, testModel } from '../../actions.ts'
-import { useAction } from '../common.tsx'
-import { Icon } from '../run/icons.tsx'
 import { DEFAULT_PROVIDER, roleAffinities, thinkingLevels } from '../../domain.ts'
 import type { PublicModelProfile, RoleAffinity, ThinkingLevel } from '../../domain.ts'
+import { cn } from '../../lib/cn.ts'
+import { useAction } from '../common.tsx'
+import { Icon } from '../run/icons.tsx'
+import { Badge } from '../ui/badge.tsx'
+import { Button } from '../ui/button.tsx'
+import { Checkbox } from '../ui/checkbox.tsx'
+import { Dialog, DialogContent, DialogTitle } from '../ui/dialog.tsx'
+import { Disclosure, DisclosureContent, DisclosureTrigger } from '../ui/disclosure.tsx'
+import { Input, NativeSelect } from '../ui/input.tsx'
 
 export interface ModelProfileSheetProps {
   open: boolean
@@ -15,21 +22,26 @@ export interface ModelProfileSheetProps {
 
 type SetupMode = 'default' | 'custom'
 
+const FIELD_CLASS = 'flex flex-col gap-1 text-[12px] font-medium text-fg-muted'
+const SELECT_CLASS = 'w-full bg-panel font-normal text-fg'
+const CLOSE_ICON_CLASS =
+  'block size-3.5 shrink-0 fill-none stroke-current [stroke-width:1.5] [stroke-linecap:round] [stroke-linejoin:round]'
+
 function OpenRouterIllustration() {
   return (
     <svg
-      className="sw-mode-art"
+      className="block h-10 w-16 flex-none text-fg"
       viewBox="0 0 64 40"
       fill="none"
       aria-hidden="true"
     >
-      <rect x="1.5" y="1.5" width="61" height="37" rx="7" fill="var(--sw-sunk)" stroke="var(--sw-line-2)" strokeWidth="1.2" />
-      <path d="M14 20h10.5c3.5 0 4.5-7 9-7H47" stroke="var(--sw-accent)" strokeWidth="1.6" strokeLinecap="round" />
-      <path d="M14 20h10.5c3.5 0 4.5 7 9 7H47" stroke="var(--sw-fg-4)" strokeWidth="1.3" strokeLinecap="round" strokeDasharray="2.5 2.5" />
-      <circle cx="14" cy="20" r="3" fill="var(--sw-panel)" stroke="currentColor" strokeWidth="1.5" />
-      <circle cx="49" cy="13" r="3.25" fill="var(--sw-accent)" />
-      <circle cx="49" cy="27" r="2.75" fill="var(--sw-panel)" stroke="var(--sw-fg-3)" strokeWidth="1.3" />
-      <path d="M31.5 11.2 34 13l-2.5 1.8" stroke="var(--sw-accent)" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+      <rect x="1.5" y="1.5" width="61" height="37" rx="7" fill="var(--sunk)" stroke="var(--line-2)" strokeWidth="1.2" />
+      <path d="M14 20h10.5c3.5 0 4.5-7 9-7H47" stroke="var(--accent)" strokeWidth="1.6" strokeLinecap="round" />
+      <path d="M14 20h10.5c3.5 0 4.5 7 9 7H47" stroke="var(--fg-4)" strokeWidth="1.3" strokeLinecap="round" strokeDasharray="2.5 2.5" />
+      <circle cx="14" cy="20" r="3" fill="var(--panel)" stroke="currentColor" strokeWidth="1.5" />
+      <circle cx="49" cy="13" r="3.25" fill="var(--accent)" />
+      <circle cx="49" cy="27" r="2.75" fill="var(--panel)" stroke="var(--fg-3)" strokeWidth="1.3" />
+      <path d="M31.5 11.2 34 13l-2.5 1.8" stroke="var(--accent)" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   )
 }
@@ -37,16 +49,16 @@ function OpenRouterIllustration() {
 function CustomProviderIllustration() {
   return (
     <svg
-      className="sw-mode-art"
+      className="block h-10 w-16 flex-none text-fg"
       viewBox="0 0 64 40"
       fill="none"
       aria-hidden="true"
     >
-      <rect x="1.5" y="1.5" width="61" height="37" rx="7" fill="var(--sw-sunk)" stroke="var(--sw-line-2)" strokeWidth="1.2" />
-      <path d="M12 13h40M12 20h40M12 27h40" stroke="var(--sw-line-strong)" strokeWidth="1.4" strokeLinecap="round" />
-      <circle cx="24" cy="13" r="3.2" fill="var(--sw-panel)" stroke="var(--sw-accent)" strokeWidth="1.6" />
-      <circle cx="40" cy="20" r="3.2" fill="var(--sw-panel)" stroke="currentColor" strokeWidth="1.5" />
-      <circle cx="29" cy="27" r="3.2" fill="var(--sw-panel)" stroke="currentColor" strokeWidth="1.5" />
+      <rect x="1.5" y="1.5" width="61" height="37" rx="7" fill="var(--sunk)" stroke="var(--line-2)" strokeWidth="1.2" />
+      <path d="M12 13h40M12 20h40M12 27h40" stroke="var(--line-strong)" strokeWidth="1.4" strokeLinecap="round" />
+      <circle cx="24" cy="13" r="3.2" fill="var(--panel)" stroke="var(--accent)" strokeWidth="1.6" />
+      <circle cx="40" cy="20" r="3.2" fill="var(--panel)" stroke="currentColor" strokeWidth="1.5" />
+      <circle cx="29" cy="27" r="3.2" fill="var(--panel)" stroke="currentColor" strokeWidth="1.5" />
     </svg>
   )
 }
@@ -71,17 +83,6 @@ export function ModelProfileSheet({
     setAdvancedOpen(Boolean(editing))
     setFormKey(k => k + 1)
   }, [open, editing])
-
-  useEffect(() => {
-    if (!open) return
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key === 'Escape' && !action.pending) onClose()
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [open, action.pending, onClose])
-
-  if (!open) return null
 
   const isEditing = Boolean(editing)
   const isDefaultMode = !isEditing && mode === 'default'
@@ -111,33 +112,41 @@ export function ModelProfileSheet({
   }
 
   return (
-    <div
-      className="sw-overlay"
-      role="presentation"
-      onMouseDown={event => {
-        if (event.target === event.currentTarget && !action.pending) onClose()
+    <Dialog
+      open={open}
+      closeOnEscape={!action.pending}
+      onOpenChange={(nextOpen, details) => {
+        if (!nextOpen) {
+          if (action.pending) {
+            details.cancel()
+            return
+          }
+          onClose()
+        }
       }}
     >
-      <div className="sw-modal" role="dialog" aria-modal="true" aria-labelledby="model-profile-sheet-title">
-        <div className="sw-modal-h">
+      <DialogContent className="flex max-h-[calc(100vh-48px)] max-w-[620px] flex-col overflow-hidden rounded-2xl border-line-2 bg-raise p-0">
+        <div className="flex flex-none items-center justify-between gap-3 border-b border-line px-4 py-3">
           <div>
-            <h2 id="model-profile-sheet-title">
+            <DialogTitle className="text-[14px] font-semibold tracking-[-0.01em] text-fg">
               {isEditing ? `Edit profile · ${editing!.name}` : 'Add model profile'}
-            </h2>
+            </DialogTitle>
           </div>
-          <button
+          <Button
             type="button"
-            className="sw-btn ghost sm"
+            variant="ghost"
+            className="size-6 min-w-6 rounded-[5px] p-0 text-fg-subtle"
             disabled={action.pending}
             onClick={onClose}
             aria-label="Close modal"
           >
-            <Icon name="close" size={14} />
-          </button>
+            <Icon name="close" size={14} className={CLOSE_ICON_CLASS} />
+          </Button>
         </div>
 
         <form
           key={formKey}
+          className="flex min-h-0 flex-1 flex-col"
           onInput={() => setFeedback('')}
           onSubmit={event => {
             event.preventDefault()
@@ -158,7 +167,7 @@ export function ModelProfileSheet({
               protocol: form.get('protocol') === 'messages' ? 'messages' as const : 'responses' as const,
               key: String(form.get('key') ?? ''),
               priority: Number(form.get('priority') ?? nextPriority),
-              enabled: isDefaultMode ? form.has('enabled') : form.has('enabled'),
+              enabled: form.has('enabled'),
               contextWindow: Number(form.get('contextWindow') ?? DEFAULT_PROVIDER.contextWindow),
               maxTokens: Number(form.get('maxTokens') ?? DEFAULT_PROVIDER.maxTokens),
               thinkingLevel,
@@ -182,23 +191,32 @@ export function ModelProfileSheet({
             )
           }}
         >
-          <div className="sw-modal-b">
+          <div className="flex max-h-[calc(82vh-108px)] flex-col gap-[13px] overflow-y-auto p-4">
             {!isEditing && (
-              <div className="sw-mode-grid" role="radiogroup" aria-label="Provider setup mode">
+              <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2" role="radiogroup" aria-label="Provider setup mode">
                 <button
                   type="button"
                   role="radio"
                   aria-checked={mode === 'default'}
-                  className={'sw-mode-card' + (mode === 'default' ? ' active' : '')}
+                  className={cn(
+                    'flex h-auto w-full cursor-pointer flex-col gap-2.5 whitespace-normal rounded-[9px] border px-[13px] py-3 text-left font-normal shadow-none transition-colors',
+                    mode === 'default'
+                      ? 'border-accent-line bg-accent-soft text-fg hover:bg-accent-soft'
+                      : 'border-line-2 bg-panel text-fg hover:border-line-strong hover:bg-hover',
+                  )}
                   onClick={() => selectMode('default')}
                 >
-                  <div className="sw-mode-card-top">
+                  <div className="flex w-full items-start justify-between gap-2">
                     <OpenRouterIllustration />
-                    <span className="sw-tag accent">Recommended</span>
+                    <Badge variant="accent" className="font-medium">Recommended</Badge>
                   </div>
-                  <div className="sw-mode-card-copy">
-                    <strong>Default · OpenRouter</strong>
-                    <span>DeepSeek V4.1 Flash via OpenRouter — fast, high-recall default</span>
+                  <div className="flex flex-col gap-[3px]">
+                    <strong className="text-[13px] font-semibold leading-[18px] text-fg">
+                      Default · OpenRouter
+                    </strong>
+                    <span className="text-[11.5px] leading-4 text-fg-muted">
+                      DeepSeek V4.1 Flash via OpenRouter — fast, high-recall default
+                    </span>
                   </div>
                 </button>
 
@@ -206,16 +224,25 @@ export function ModelProfileSheet({
                   type="button"
                   role="radio"
                   aria-checked={mode === 'custom'}
-                  className={'sw-mode-card' + (mode === 'custom' ? ' active' : '')}
+                  className={cn(
+                    'flex h-auto w-full cursor-pointer flex-col gap-2.5 whitespace-normal rounded-[9px] border px-[13px] py-3 text-left font-normal shadow-none transition-colors',
+                    mode === 'custom'
+                      ? 'border-accent-line bg-accent-soft text-fg hover:bg-accent-soft'
+                      : 'border-line-2 bg-panel text-fg hover:border-line-strong hover:bg-hover',
+                  )}
                   onClick={() => selectMode('custom')}
                 >
-                  <div className="sw-mode-card-top">
+                  <div className="flex w-full items-start justify-between gap-2">
                     <CustomProviderIllustration />
-                    <span className="sw-tag">Flexible</span>
+                    <Badge variant="neutral" className="font-medium">Flexible</Badge>
                   </div>
-                  <div className="sw-mode-card-copy">
-                    <strong>Custom provider</strong>
-                    <span>OpenAI, Anthropic, local Ollama/vLLM, or any compatible endpoint</span>
+                  <div className="flex flex-col gap-[3px]">
+                    <strong className="text-[13px] font-semibold leading-[18px] text-fg">
+                      Custom provider
+                    </strong>
+                    <span className="text-[11.5px] leading-4 text-fg-muted">
+                      OpenAI, Anthropic, local Ollama/vLLM, or any compatible endpoint
+                    </span>
                   </div>
                 </button>
               </div>
@@ -227,17 +254,24 @@ export function ModelProfileSheet({
                 <input type="hidden" name="model" value={DEFAULT_PROVIDER.model} />
                 <input type="hidden" name="protocol" value={DEFAULT_PROVIDER.protocol} />
 
-                <div className="sw-preset-bar" aria-label="Pre-filled OpenRouter defaults">
-                  <span className="sw-tag solid sw-mono">openrouter.ai/api/v1</span>
-                  <span className="sw-tag solid sw-mono">{DEFAULT_PROVIDER.model}</span>
-                  <span className="sw-tag">Responses</span>
+                <div
+                  className="flex flex-wrap items-center gap-1.5 rounded-lg border border-line bg-sunk px-[11px] py-[9px]"
+                  aria-label="Pre-filled OpenRouter defaults"
+                >
+                  <Badge variant="neutral" className="bg-panel font-mono font-medium text-fg-muted">
+                    openrouter.ai/api/v1
+                  </Badge>
+                  <Badge variant="neutral" className="bg-panel font-mono font-medium text-fg-muted">
+                    {DEFAULT_PROVIDER.model}
+                  </Badge>
+                  <Badge variant="neutral" className="font-medium">Responses</Badge>
                 </div>
 
-                <label className="sw-fld">
-                  <span className="sw-fld-row">
+                <label className={FIELD_CLASS}>
+                  <span className="flex items-center justify-between gap-2">
                     <span>OpenRouter API key</span>
                     <a
-                      className="sw-ext-link"
+                      className="text-[11.5px] font-medium text-accent no-underline hover:underline"
                       href="https://openrouter.ai/keys"
                       target="_blank"
                       rel="noopener noreferrer"
@@ -245,8 +279,8 @@ export function ModelProfileSheet({
                       Get an API key ↗
                     </a>
                   </span>
-                  <input
-                    className="sw-input sw-mono"
+                  <Input
+                    className="w-full font-mono"
                     name="key"
                     type="password"
                     required
@@ -256,146 +290,149 @@ export function ModelProfileSheet({
                     autoFocus
                     placeholder="sk-or-v1-..."
                   />
-                  <small title="Stored privately on this machine">
+                  <small className="text-[11.5px] font-normal text-fg-subtle" title="Stored privately on this machine">
                     Stored privately on your machine; never returned to the browser or target environments.
                   </small>
                 </label>
 
-                <details className="sw-details">
-                  <summary className="sw-details-sum">Customize profile name &amp; limits</summary>
-                  <div className="sw-details-body">
-                    <div className="sw-grid-3">
-                      <label className="sw-fld">
-                        Profile name
-                        <input className="sw-input" name="name" required maxLength={160} defaultValue={DEFAULT_PROVIDER.name} />
-                      </label>
-                      <label className="sw-fld">
-                        Priority (higher tried first)
-                        <input
-                          className="sw-input sw-num"
-                          name="priority"
-                          type="number"
-                          min={0}
-                          max={1000}
-                          step={1}
-                          required
-                          defaultValue={defaults.priority}
-                        />
-                      </label>
-                      <label className="sw-fld">
-                        Role affinity
-                        <select className="sw-select" name="roleAffinity" defaultValue={DEFAULT_PROVIDER.roleAffinity}>
-                          <option value="any">Any (all roles)</option>
-                          <option value="reasoning">Reasoning (audit, repair, patch)</option>
-                          <option value="tactical">Tactical (specialists, planner)</option>
-                          <option value="fast">Fast (triage, dedupe)</option>
-                        </select>
-                      </label>
-                    </div>
+                <div className="overflow-hidden rounded-lg border border-line bg-sunk">
+                  <Disclosure>
+                    <DisclosureTrigger className="rounded-none bg-transparent px-3 py-2 text-[12px] font-medium text-fg-muted shadow-none hover:bg-hover hover:text-fg">
+                      Customize profile name &amp; limits
+                    </DisclosureTrigger>
+                    <DisclosureContent keepMounted className="flex flex-col gap-2.5 border-t border-line p-3 data-[closed]:hidden">
+                      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+                        <label className={FIELD_CLASS}>
+                          Profile name
+                          <Input className="w-full" name="name" required maxLength={160} defaultValue={DEFAULT_PROVIDER.name} />
+                        </label>
+                        <label className={FIELD_CLASS}>
+                          Priority (higher tried first)
+                          <Input
+                            className="w-full tabular-nums"
+                            name="priority"
+                            type="number"
+                            min={0}
+                            max={1000}
+                            step={1}
+                            required
+                            defaultValue={defaults.priority}
+                          />
+                        </label>
+                        <label className={FIELD_CLASS}>
+                          Role affinity
+                          <NativeSelect className={SELECT_CLASS} name="roleAffinity" defaultValue={DEFAULT_PROVIDER.roleAffinity}>
+                            <option value="any">Any (all roles)</option>
+                            <option value="reasoning">Reasoning (audit, repair, patch)</option>
+                            <option value="tactical">Tactical (specialists, planner)</option>
+                            <option value="fast">Fast (triage, dedupe)</option>
+                          </NativeSelect>
+                        </label>
+                      </div>
 
-                    <label className="sw-chk">
-                      <input
-                        type="checkbox"
-                        name="enabled"
-                        defaultChecked
-                        aria-label="Enable this profile for automatic failover"
-                      />
-                      Enable this profile for automatic failover
-                    </label>
+                      <label className="inline-flex cursor-pointer select-none items-center gap-2 text-[12.5px] font-[450] text-fg-muted">
+                        <Checkbox
+                          name="enabled"
+                          defaultChecked
+                          aria-label="Enable this profile for automatic failover"
+                        />
+                        Enable this profile for automatic failover
+                      </label>
 
-                    <div className="sw-grid-3">
-                      <label className="sw-fld">
-                        Context window
-                        <input
-                          className="sw-input sw-num"
-                          name="contextWindow"
-                          type="number"
-                          min={32000}
-                          max={2000000}
-                          step={1}
-                          required
-                          defaultValue={DEFAULT_PROVIDER.contextWindow}
-                        />
-                      </label>
-                      <label className="sw-fld">
-                        Max output tokens
-                        <input
-                          className="sw-input sw-num"
-                          name="maxTokens"
-                          type="number"
-                          min={512}
-                          max={393216}
-                          step={1}
-                          required
-                          defaultValue={DEFAULT_PROVIDER.maxTokens}
-                        />
-                      </label>
-                      <label className="sw-fld">
-                        Thinking level
-                        <select className="sw-select" name="thinkingLevel" defaultValue={DEFAULT_PROVIDER.thinkingLevel}>
-                          <option value="off">Off</option>
-                          <option value="low">Low</option>
-                          <option value="medium">Medium</option>
-                          <option value="high">High</option>
-                        </select>
-                      </label>
-                    </div>
+                      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+                        <label className={FIELD_CLASS}>
+                          Context window
+                          <Input
+                            className="w-full tabular-nums"
+                            name="contextWindow"
+                            type="number"
+                            min={32000}
+                            max={2000000}
+                            step={1}
+                            required
+                            defaultValue={DEFAULT_PROVIDER.contextWindow}
+                          />
+                        </label>
+                        <label className={FIELD_CLASS}>
+                          Max output tokens
+                          <Input
+                            className="w-full tabular-nums"
+                            name="maxTokens"
+                            type="number"
+                            min={512}
+                            max={393216}
+                            step={1}
+                            required
+                            defaultValue={DEFAULT_PROVIDER.maxTokens}
+                          />
+                        </label>
+                        <label className={FIELD_CLASS}>
+                          Thinking level
+                          <NativeSelect className={SELECT_CLASS} name="thinkingLevel" defaultValue={DEFAULT_PROVIDER.thinkingLevel}>
+                            <option value="off">Off</option>
+                            <option value="low">Low</option>
+                            <option value="medium">Medium</option>
+                            <option value="high">High</option>
+                          </NativeSelect>
+                        </label>
+                      </div>
 
-                    <div className="sw-grid-3">
-                      <label className="sw-fld">
-                        Input cost ($ / 1M)
-                        <input
-                          className="sw-input sw-num"
-                          name="inputCostPerMtok"
-                          type="number"
-                          min={0}
-                          max={500}
-                          step="any"
-                          required
-                          defaultValue={DEFAULT_PROVIDER.inputCostPerMtok}
-                        />
-                      </label>
-                      <label className="sw-fld">
-                        Cached input ($ / 1M)
-                        <input
-                          className="sw-input sw-num"
-                          name="cachedInputCostPerMtok"
-                          type="number"
-                          min={0}
-                          max={500}
-                          step="any"
-                          required
-                          defaultValue={DEFAULT_PROVIDER.cachedInputCostPerMtok}
-                        />
-                      </label>
-                      <label className="sw-fld">
-                        Output cost ($ / 1M)
-                        <input
-                          className="sw-input sw-num"
-                          name="outputCostPerMtok"
-                          type="number"
-                          min={0}
-                          max={500}
-                          step="any"
-                          required
-                          defaultValue={DEFAULT_PROVIDER.outputCostPerMtok}
-                        />
-                      </label>
-                    </div>
-                  </div>
-                </details>
+                      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+                        <label className={FIELD_CLASS}>
+                          Input cost ($ / 1M)
+                          <Input
+                            className="w-full tabular-nums"
+                            name="inputCostPerMtok"
+                            type="number"
+                            min={0}
+                            max={500}
+                            step="any"
+                            required
+                            defaultValue={DEFAULT_PROVIDER.inputCostPerMtok}
+                          />
+                        </label>
+                        <label className={FIELD_CLASS}>
+                          Cached input ($ / 1M)
+                          <Input
+                            className="w-full tabular-nums"
+                            name="cachedInputCostPerMtok"
+                            type="number"
+                            min={0}
+                            max={500}
+                            step="any"
+                            required
+                            defaultValue={DEFAULT_PROVIDER.cachedInputCostPerMtok}
+                          />
+                        </label>
+                        <label className={FIELD_CLASS}>
+                          Output cost ($ / 1M)
+                          <Input
+                            className="w-full tabular-nums"
+                            name="outputCostPerMtok"
+                            type="number"
+                            min={0}
+                            max={500}
+                            step="any"
+                            required
+                            defaultValue={DEFAULT_PROVIDER.outputCostPerMtok}
+                          />
+                        </label>
+                      </div>
+                    </DisclosureContent>
+                  </Disclosure>
+                </div>
               </>
             ) : (
               <>
-                <div className="sw-grid-3">
-                  <label className="sw-fld">
+                <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+                  <label className={FIELD_CLASS}>
                     Profile name
-                    <input className="sw-input" name="name" required maxLength={160} defaultValue={defaults.name} />
+                    <Input className="w-full" name="name" required maxLength={160} defaultValue={defaults.name} />
                   </label>
-                  <label className="sw-fld">
+                  <label className={FIELD_CLASS}>
                     Priority (higher tried first)
-                    <input
-                      className="sw-input sw-num"
+                    <Input
+                      className="w-full tabular-nums"
                       name="priority"
                       type="number"
                       min={0}
@@ -405,42 +442,47 @@ export function ModelProfileSheet({
                       defaultValue={defaults.priority}
                     />
                   </label>
-                  <label className="sw-fld">
+                  <label className={FIELD_CLASS}>
                     Role affinity
-                    <select className="sw-select" name="roleAffinity" defaultValue={defaults.roleAffinity}>
+                    <NativeSelect className={SELECT_CLASS} name="roleAffinity" defaultValue={defaults.roleAffinity}>
                       <option value="any">Any (all roles)</option>
                       <option value="reasoning">Reasoning (audit, repair, patch)</option>
                       <option value="tactical">Tactical (specialists, planner)</option>
                       <option value="fast">Fast (triage, dedupe)</option>
-                    </select>
+                    </NativeSelect>
                   </label>
                 </div>
 
-                <label className="sw-fld">
+                <label className={FIELD_CLASS}>
                   Base URL
-                  <input className="sw-input sw-mono" name="endpoint" type="url" required defaultValue={defaults.endpoint} />
+                  <Input className="w-full font-mono" name="endpoint" type="url" required defaultValue={defaults.endpoint} />
                 </label>
 
-                <div className="sw-grid-2">
-                  <label className="sw-fld">
+                <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                  <label className={FIELD_CLASS}>
                     Model ID
-                    <input className="sw-input sw-mono" name="model" required defaultValue={defaults.model} />
+                    <Input className="w-full font-mono" name="model" required defaultValue={defaults.model} />
                   </label>
-                  <label className="sw-fld">
+                  <label className={FIELD_CLASS}>
                     Protocol
-                    <select className="sw-select" name="protocol" defaultValue={defaults.protocol}>
+                    <NativeSelect className={SELECT_CLASS} name="protocol" defaultValue={defaults.protocol}>
                       <option value="responses">OpenAI Responses</option>
                       <option value="messages">Anthropic Messages</option>
-                    </select>
+                    </NativeSelect>
                   </label>
                 </div>
 
-                <label className="sw-fld">
+                <label className={FIELD_CLASS}>
                   <span>
-                    API key {isEditing && <small>(optional — leave blank to keep stored key)</small>}
+                    API key{' '}
+                    {isEditing && (
+                      <small className="text-[11.5px] font-normal text-fg-subtle">
+                        (optional — leave blank to keep stored key)
+                      </small>
+                    )}
                   </span>
-                  <input
-                    className="sw-input"
+                  <Input
+                    className="w-full"
                     name="key"
                     type="password"
                     required={!isEditing}
@@ -449,14 +491,13 @@ export function ModelProfileSheet({
                     autoComplete="off"
                     placeholder={isEditing ? 'Leave blank to keep existing API key' : 'Enter your provider key'}
                   />
-                  <small title="Stored privately on this machine">
+                  <small className="text-[11.5px] font-normal text-fg-subtle" title="Stored privately on this machine">
                     Stored privately on your machine; never returned to the browser or target environments.
                   </small>
                 </label>
 
-                <label className="sw-chk">
-                  <input
-                    type="checkbox"
+                <label className="inline-flex cursor-pointer select-none items-center gap-2 text-[12.5px] font-[450] text-fg-muted">
+                  <Checkbox
                     name="enabled"
                     defaultChecked={defaults.enabled}
                     aria-label="Enable this profile for automatic failover"
@@ -464,122 +505,129 @@ export function ModelProfileSheet({
                   Enable this profile for automatic failover
                 </label>
 
-                <button
-                  type="button"
-                  className="sw-adv-btn"
-                  aria-expanded={advancedOpen}
-                  onClick={() => setAdvancedOpen(v => !v)}
-                >
-                  <span aria-hidden="true">{advancedOpen ? '▾' : '▸'}</span>
-                  Limits &amp; pricing
-                </button>
+                <Disclosure open={advancedOpen} onOpenChange={setAdvancedOpen}>
+                  <DisclosureTrigger className="-ml-1.5 h-6 w-auto gap-1.5 rounded-[5px] bg-transparent px-1.5 py-0 text-[12px] font-medium text-fg-muted shadow-none hover:bg-hover hover:text-fg">
+                    Limits &amp; pricing
+                  </DisclosureTrigger>
 
-                <div className="sw-adv-panel" hidden={!advancedOpen}>
-                  <div className="sw-grid-3">
-                    <label className="sw-fld">
-                      Context window
-                      <input
-                        className="sw-input sw-num"
-                        name="contextWindow"
-                        type="number"
-                        min={32000}
-                        max={2000000}
-                        step={1}
-                        required
-                        defaultValue={defaults.contextWindow}
-                      />
-                    </label>
-                    <label className="sw-fld">
-                      Max output tokens
-                      <input
-                        className="sw-input sw-num"
-                        name="maxTokens"
-                        type="number"
-                        min={512}
-                        max={393216}
-                        step={1}
-                        required
-                        defaultValue={defaults.maxTokens}
-                      />
-                    </label>
-                    <label className="sw-fld">
-                      Thinking level
-                      <select className="sw-select" name="thinkingLevel" defaultValue={defaults.thinkingLevel}>
-                        <option value="off">Off</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                      </select>
-                    </label>
-                  </div>
+                  <DisclosureContent
+                    keepMounted
+                    className="mt-2 flex flex-col gap-2.5 rounded-lg border border-line bg-sunk p-3 data-[closed]:hidden"
+                  >
+                    <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+                      <label className={FIELD_CLASS}>
+                        Context window
+                        <Input
+                          className="w-full tabular-nums"
+                          name="contextWindow"
+                          type="number"
+                          min={32000}
+                          max={2000000}
+                          step={1}
+                          required
+                          defaultValue={defaults.contextWindow}
+                        />
+                      </label>
+                      <label className={FIELD_CLASS}>
+                        Max output tokens
+                        <Input
+                          className="w-full tabular-nums"
+                          name="maxTokens"
+                          type="number"
+                          min={512}
+                          max={393216}
+                          step={1}
+                          required
+                          defaultValue={defaults.maxTokens}
+                        />
+                      </label>
+                      <label className={FIELD_CLASS}>
+                        Thinking level
+                        <NativeSelect className={SELECT_CLASS} name="thinkingLevel" defaultValue={defaults.thinkingLevel}>
+                          <option value="off">Off</option>
+                          <option value="low">Low</option>
+                          <option value="medium">Medium</option>
+                          <option value="high">High</option>
+                        </NativeSelect>
+                      </label>
+                    </div>
 
-                  <div className="sw-grid-3">
-                    <label className="sw-fld">
-                      Input cost ($ / 1M tokens)
-                      <input
-                        className="sw-input sw-num"
-                        name="inputCostPerMtok"
-                        type="number"
-                        min={0}
-                        max={500}
-                        step="any"
-                        required
-                        defaultValue={defaults.inputCostPerMtok}
-                      />
-                    </label>
-                    <label className="sw-fld">
-                      Cached input ($ / 1M tokens)
-                      <input
-                        className="sw-input sw-num"
-                        name="cachedInputCostPerMtok"
-                        type="number"
-                        min={0}
-                        max={500}
-                        step="any"
-                        required
-                        defaultValue={defaults.cachedInputCostPerMtok}
-                      />
-                    </label>
-                    <label className="sw-fld">
-                      Output cost ($ / 1M tokens)
-                      <input
-                        className="sw-input sw-num"
-                        name="outputCostPerMtok"
-                        type="number"
-                        min={0}
-                        max={500}
-                        step="any"
-                        required
-                        defaultValue={defaults.outputCostPerMtok}
-                      />
-                    </label>
-                  </div>
-                </div>
+                    <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+                      <label className={FIELD_CLASS}>
+                        Input cost ($ / 1M tokens)
+                        <Input
+                          className="w-full tabular-nums"
+                          name="inputCostPerMtok"
+                          type="number"
+                          min={0}
+                          max={500}
+                          step="any"
+                          required
+                          defaultValue={defaults.inputCostPerMtok}
+                        />
+                      </label>
+                      <label className={FIELD_CLASS}>
+                        Cached input ($ / 1M tokens)
+                        <Input
+                          className="w-full tabular-nums"
+                          name="cachedInputCostPerMtok"
+                          type="number"
+                          min={0}
+                          max={500}
+                          step="any"
+                          required
+                          defaultValue={defaults.cachedInputCostPerMtok}
+                        />
+                      </label>
+                      <label className={FIELD_CLASS}>
+                        Output cost ($ / 1M tokens)
+                        <Input
+                          className="w-full tabular-nums"
+                          name="outputCostPerMtok"
+                          type="number"
+                          min={0}
+                          max={500}
+                          step="any"
+                          required
+                          defaultValue={defaults.outputCostPerMtok}
+                        />
+                      </label>
+                    </div>
+                  </DisclosureContent>
+                </Disclosure>
               </>
             )}
 
-            {action.error && <p role="alert" className="sw-msg-err">{action.error}</p>}
-            {feedback && <p role="status" className="sw-msg-ok">{feedback}</p>}
+            {action.error && (
+              <p role="alert" className="m-0 whitespace-pre-wrap text-[12px] text-danger">
+                {action.error}
+              </p>
+            )}
+            {feedback && (
+              <p role="status" className="m-0 text-[12px] text-ok">
+                {feedback}
+              </p>
+            )}
           </div>
 
-          <div className="sw-modal-f">
-            <span className="sw-muted" style={{ fontSize: '11.5px' }}>
+          <div className="flex flex-wrap items-center justify-between gap-2.5 border-t border-line bg-sunk px-4 py-2.5">
+            <span className="text-[11.5px] text-fg-subtle">
               Automatic failover only switches providers before a response begins streaming.
             </span>
-            <div className="sw-modal-f-acts">
-              <button type="button" className="sw-btn ghost" disabled={action.pending} onClick={onClose}>
+            <div className="ml-auto flex items-center gap-1.5">
+              <Button type="button" variant="ghost" disabled={action.pending} onClick={onClose}>
                 Cancel
-              </button>
-              <button type="submit" value="test" className="sw-btn" disabled={action.pending}>
+              </Button>
+              <Button type="submit" value="test" variant="outline" disabled={action.pending}>
                 Test connection
-              </button>
-              <button type="submit" value="save" className="sw-btn primary" disabled={action.pending}>
+              </Button>
+              <Button type="submit" value="save" variant="default" disabled={action.pending}>
                 {isEditing ? 'Update profile' : 'Save model'}
-              </button>
+              </Button>
             </div>
           </div>
         </form>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   )
 }
