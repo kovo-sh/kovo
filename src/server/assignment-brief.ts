@@ -22,20 +22,25 @@
  */
 
 import { renderCodeDataflowSlice, type CodeDataflowSlice } from './program-graph.ts'
+import { redact } from './redact.ts'
 
 export const ASSIGNMENT_BRIEF_MAX_BYTES = 1536
-/** Hard ceiling for any brief (compact or expanded with a code slice). */
+/** Hard ceiling for any brief (compact or expanded with a code slice / hop checkpoint). */
 export const ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE = 4096
 /** Default budget for the rendered dataflow slice inside a brief. */
 export const ASSIGNMENT_BRIEF_CODE_MAX_BYTES = 600
 /** Budget when the coordinator asks for the expanded slice (`codeExpansion: 'full'`). */
 export const ASSIGNMENT_BRIEF_CODE_EXPANDED_BYTES = 1600
+/** Hard ceiling for an embedded v8 hop-checkpoint brief inside an assignment brief. */
+export const ASSIGNMENT_BRIEF_HOP_CHECKPOINT_MAX_BYTES = 2048
+export const HOP_CHECKPOINT_SCHEMA_V1 = 'v8.hop_checkpoint.v1' as const
 
 export type MissionKind =
   | 'det_lead_upgrade'
   | 'workflow_skip'
   | 'business_logic'
   | 'chain_step_2'
+  | 'multihop_chain'
   | 'second_order'
   | 'class_scan'
 
@@ -109,6 +114,80 @@ export interface AssignmentBriefProofObligation {
   deliverable?: string
 }
 
+export interface AssignmentBriefCheckpointHop {
+  hop: number
+  receiptId: string
+  /** Opaque `cap:...` handle only; raw secret values are scrubbed/replaced. */
+  capId: string
+  kind?: string
+  surface?: string
+  service?: string
+  tenant?: string
+  actor?: string
+  role?: string
+  at?: string
+  binding?: string
+}
+
+export interface AssignmentBriefCheckpointNextGoal {
+  targetSurfaceKey?: string
+  surface?: string
+  service?: string
+  endpoint: string
+  method?: string
+  hypothesisClass?: string
+  expectedBinding?: string
+  targetTenant?: string
+  targetRole?: string
+  goal: string
+}
+
+export interface AssignmentBriefPrunedBranch {
+  surface: string
+  hypothesis?: string
+  reason: string
+}
+
+export interface AssignmentBriefHopCheckpoint {
+  schema?: string
+  branchKey: string
+  depth: number
+  targetHop?: number
+  mode?: 'pivot' | 'fuse' | 'discover' | 'sweep'
+  evi?: number
+  verifiedHops?: readonly AssignmentBriefCheckpointHop[]
+  omittedEarlierHops?: number
+  /** Opaque `cap:...` handles only; raw secrets are scrubbed. */
+  capabilityHandles?: readonly string[]
+  fuseWithBranchKey?: string
+  nextGoal: AssignmentBriefCheckpointNextGoal
+  prunedBranches?: readonly AssignmentBriefPrunedBranch[]
+  /** Always rendered as `true` so specialists continue from parent hops instead of rediscovering Hop 1. */
+  doNotRediscover?: true
+}
+
+export interface RenderedHopCheckpoint {
+  schema: string
+  branchKey: string
+  depth: number
+  targetHop: number
+  mode: 'pivot' | 'fuse' | 'discover' | 'sweep'
+  evi?: number
+  verifiedHops: AssignmentBriefCheckpointHop[]
+  omittedEarlierHops?: number
+  capabilityHandles: string[]
+  fuseWithBranchKey?: string
+  nextGoal: AssignmentBriefCheckpointNextGoal
+  prunedBranches?: AssignmentBriefPrunedBranch[]
+  doNotRediscover: true
+}
+
+export interface FittedHopCheckpointResult {
+  checkpoint: RenderedHopCheckpoint
+  bytes: number
+  truncated: boolean
+}
+
 export interface AssignmentBriefInput {
   missionKind: MissionKind
   origin: string
@@ -123,6 +202,11 @@ export interface AssignmentBriefInput {
    * `buildCodeDataflowSlice`). Always hard-truncated before rendering.
    */
   codeSlice?: CodeDataflowSlice
+  /**
+   * Bounded v8 multi-hop checkpoint (`<= 2 KB`, opaque `cap:...` handles, verified parent hops,
+   * next-hop pivot target, `doNotRediscover: true`). Always scrubbed and fitted before rendering.
+   */
+  hopCheckpoint?: AssignmentBriefHopCheckpoint
   /** One explicit proof obligation naming the route, auth context and sink chain. */
   proofObligation?: AssignmentBriefProofObligation
   /**
@@ -155,11 +239,20 @@ export interface SettlementSpecTarget {
 
 const SECRET_KEY_RE = /(?:secret|token|passw|pwd|api[_-]?key|authorization|cookie|session|jwt|bearer|credential|private[_-]?key|client[_-]?secret)/i
 const BODY_KEY_RE = /(?:body|content|html|snippet|payload|response|raw|markup|text)/i
-const SECRET_VALUE_RE = /^(?:bearer\s+)?[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$|^(?:sk|pk|ghp|gho|ghs|xox[baprs])_[A-Za-z0-9_-]{10,}$/i
-const JWT_RE = /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g
-const BEARER_RE = /(bearer\s+)[A-Za-z0-9._~+/=-]{12,}/gi
-const NAMED_SECRET_RE = /((?:secret|token|password|passwd|api[_-]?key|access[_-]?key)=)[^\s&"']+/gi
-const KEY_PREFIX_RE = /\b(?:sk|pk|ghp|gho|ghs|xox[baprs])_[A-Za-z0-9_-]{10,}/g
+const SECRET_VALUE_RE =
+  /^(?:bearer\s+)?[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$|^(?:sk|pk|ghp|gho|ghs|ghu|ghr|xox[baprs])_[A-Za-z0-9_-]{10,}$|^(?:sk-or-v1|sk-ant|sk-proj)-[A-Za-z0-9_-]{8,}$|^github_pat_[A-Za-z0-9_]{10,}$|^AKIA[0-9A-Z]{16}$/i
+const JWT_RE = /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?/g
+const BEARER_RE = /(bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi
+const NAMED_SECRET_RE =
+  /((?:secret|token|password|passwd|api[_-]?key|access[_-]?key|signing[_-]?salt|hmac[_-]?key|client[_-]?secret|session[_-]?(?:id|key|token)|cookie|sig(?:nature)?|auth)[ \t]*[:=][ \t]*)[^\s&"',;]+/gi
+const KEY_PREFIX_RE =
+  /\b(?:(?:sk|pk|ghp|gho|ghs|ghu|ghr|xox[baprs])_[A-Za-z0-9_-]{10,}|(?:sk-or-v1|sk-ant|sk-proj)-[A-Za-z0-9_-]{8,}|github_pat_[A-Za-z0-9_]{10,}|AKIA[0-9A-Z]{16})\b/g
+const PEM_KEY_RE = /-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-\n]*PRIVATE KEY-----|$)/g
+const RAW_HEX_SECRET_RE = /(?<![A-Za-z0-9_:-])[0-9a-fA-F]{40,}(?![A-Za-z0-9_:-])/g
+const OPAQUE_CAP_HANDLE_RE =
+  /^cap:(?:hop_[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}|[A-Za-z0-9][A-Za-z0-9._-]{1,63}:[A-Za-z0-9][A-Za-z0-9._-]{1,63})$/
+const OPAQUE_CAP_HANDLE_GLOBAL_RE =
+  /\bcap:(?:hop_[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}|[A-Za-z0-9][A-Za-z0-9._-]{1,63}:[A-Za-z0-9][A-Za-z0-9._-]{1,63})\b/g
 
 function cleanText(value: unknown, maxBytes: number): string {
   if (typeof value !== 'string') return ''
@@ -167,16 +260,40 @@ function cleanText(value: unknown, maxBytes: number): string {
   return truncateUtf8Head(flattened, maxBytes)
 }
 
-/** Remove token-shaped fragments and body-like key/value pairs from free text. */
+/** Validate an opaque v8 capability handle (`cap:hop_<id>:<slot>` or `cap:<ns>:<slot>`), rejecting raw secrets. */
+export function sanitizeCapabilityHandle(value: unknown): string {
+  if (typeof value !== 'string') return ''
+  const trimmed = value.trim()
+  if (!trimmed || trimmed.length > 128) return ''
+  if (!OPAQUE_CAP_HANDLE_RE.test(trimmed)) return ''
+  if (isSecretValue(trimmed) || JWT_RE.test(trimmed) || KEY_PREFIX_RE.test(trimmed)) return ''
+  // Reset stateful global regexes after `.test()`.
+  JWT_RE.lastIndex = 0
+  KEY_PREFIX_RE.lastIndex = 0
+  return trimmed
+}
+
+/** Remove token-shaped fragments and body-like key/value pairs from free text while preserving valid opaque `cap:...` handles. */
 export function redactBriefText(value: unknown, maxBytes = 200): string {
   let text = cleanText(value, maxBytes * 2)
   if (!text) return ''
-  text = text
+  // Protect valid opaque `cap:...` handles from key:value redaction patterns before scrubbing.
+  const preservedHandles: string[] = []
+  text = text.replace(OPAQUE_CAP_HANDLE_GLOBAL_RE, match => {
+    const clean = sanitizeCapabilityHandle(match)
+    if (!clean) return '[redacted]'
+    const idx = preservedHandles.push(clean) - 1
+    return `\u0001CAP${idx}\u0002`
+  })
+  text = redact(text)
+    .replace(PEM_KEY_RE, '[redacted-key]')
     .replace(JWT_RE, '[redacted-jwt]')
     .replace(BEARER_RE, '$1[redacted]')
     .replace(KEY_PREFIX_RE, '[redacted]')
     .replace(NAMED_SECRET_RE, '$1[redacted]')
+    .replace(RAW_HEX_SECRET_RE, '[redacted-hex]')
     .replace(/\b(?:body|html|content)\s*[:=]\s*[^\s]+/gi, '[body omitted]')
+  text = text.replace(/\u0001CAP(\d+)\u0002/g, (_m, idx) => preservedHandles[Number(idx)] ?? '')
   return truncateUtf8Head(text, maxBytes)
 }
 
@@ -311,6 +428,205 @@ function normalizeDetLead(lead: AssignmentBriefDetLead): Record<string, unknown>
   }
 }
 
+const VALID_CHECKPOINT_MODES = new Set(['pivot', 'fuse', 'discover', 'sweep'] as const)
+
+function cleanCheckpointEndpoint(value: unknown, maxBytes = 120): string {
+  if (typeof value !== 'string') return '/'
+  const trimmed = value.trim()
+  if (!trimmed) return '/'
+  const methodMatch = /^([A-Za-z]{2,10})\s+(.*)$/.exec(trimmed)
+  if (methodMatch) {
+    const method = methodMatch[1]!.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 10)
+    const pathPart = redactBriefText(cleanPath(methodMatch[2]!), Math.max(16, maxBytes - method.length - 1))
+    return truncateUtf8Head(`${method} ${pathPart || '/'}`, maxBytes)
+  }
+  const stripped = trimmed.split(/[?#]/, 1)[0] || '/'
+  const scrubbed = redactBriefText(stripped, maxBytes).replace(/\s+/g, '')
+  if (!scrubbed) return '/'
+  return scrubbed.startsWith('/') ? scrubbed : `/${scrubbed}`
+}
+
+function normalizeCheckpointHop(hop: AssignmentBriefCheckpointHop, compact = false): AssignmentBriefCheckpointHop {
+  const hopNum = Number.isFinite(hop.hop) ? Math.max(1, Math.min(8, Math.trunc(hop.hop))) : 1
+  const receiptId = redactBriefText(hop.receiptId, 48) || `hop-${hopNum}`
+  const capId = sanitizeCapabilityHandle(hop.capId) || `cap:redacted:hop_${hopNum}`
+  const out: AssignmentBriefCheckpointHop = { hop: hopNum, receiptId, capId }
+  const kind = redactBriefText(hop.kind, 32)
+  const surface = redactBriefText(hop.surface, 24)
+  const service = redactBriefText(hop.service, 48)
+  const tenant = redactBriefText(hop.tenant, 36)
+  const actor = redactBriefText(hop.actor, 36)
+  if (kind) out.kind = kind
+  if (surface) out.surface = surface
+  if (service) out.service = service
+  if (tenant) out.tenant = tenant
+  if (actor) out.actor = actor
+  if (!compact) {
+    const role = redactBriefText(hop.role, 32)
+    const at = hop.at ? cleanCheckpointEndpoint(hop.at, 72) : ''
+    const binding = redactBriefText(hop.binding, 32)
+    if (role) out.role = role
+    if (at) out.at = at
+    if (binding) out.binding = binding
+  }
+  return out
+}
+
+/**
+ * Scrub and deterministically fit a v8 `hopCheckpoint` to `<= maxBytes` (hard cap `<= 2048 B`).
+ * Preserves valid opaque `cap:...` handles, parent hops, next-hop pivot target, and `doNotRediscover: true`
+ * while stripping all raw secrets and query-string credentials.
+ */
+export function fitHopCheckpointForBrief(
+  input: AssignmentBriefHopCheckpoint,
+  maxBytes = ASSIGNMENT_BRIEF_HOP_CHECKPOINT_MAX_BYTES,
+): FittedHopCheckpointResult {
+  const cap = Math.max(256, Math.min(Math.floor(maxBytes), ASSIGNMENT_BRIEF_HOP_CHECKPOINT_MAX_BYTES))
+  const mode = input.mode && VALID_CHECKPOINT_MODES.has(input.mode) ? input.mode : 'pivot'
+  const depth = Number.isFinite(input.depth) ? Math.max(0, Math.min(8, Math.trunc(input.depth))) : 0
+  const targetHop = Number.isFinite(input.targetHop)
+    ? Math.max(1, Math.min(8, Math.trunc(input.targetHop!)))
+    : Math.max(1, Math.min(8, depth + 1))
+  const branchKey = redactBriefText(input.branchKey, 64) || 'branch-0'
+  const fuseWithBranchKey = input.fuseWithBranchKey ? redactBriefText(input.fuseWithBranchKey, 64) : ''
+  const evi = typeof input.evi === 'number' && Number.isFinite(input.evi)
+    ? Number(Math.max(0, input.evi).toFixed(6))
+    : undefined
+
+  const orderedInputHops = [...(input.verifiedHops ?? [])].sort((a, b) => (a.hop - b.hop) || a.receiptId.localeCompare(b.receiptId))
+  const baseOmitted = typeof input.omittedEarlierHops === 'number' && Number.isFinite(input.omittedEarlierHops)
+    ? Math.max(0, Math.trunc(input.omittedEarlierHops))
+    : 0
+
+  // Collect only valid opaque `cap:...` handles (from explicit list + verified hops).
+  const handleSet = new Set<string>()
+  for (const h of input.capabilityHandles ?? []) {
+    const clean = sanitizeCapabilityHandle(h)
+    if (clean) handleSet.add(clean)
+  }
+  for (const hop of orderedInputHops) {
+    const clean = sanitizeCapabilityHandle(hop.capId)
+    if (clean) handleSet.add(clean)
+  }
+  const allHandles = [...handleSet].slice(0, 16)
+
+  const prunedBranches: AssignmentBriefPrunedBranch[] = (input.prunedBranches ?? [])
+    .slice(0, 8)
+    .map(b => ({
+      surface: redactBriefText(b.surface, 72) || 'unknown',
+      ...(b.hypothesis ? { hypothesis: redactBriefText(b.hypothesis, 48) } : {}),
+      reason: redactBriefText(b.reason, 48) || 'invariant_enforced_hardened',
+    }))
+
+  const makeNextGoal = (goalBytes: number, endpointBytes: number, includeOptional: boolean): AssignmentBriefCheckpointNextGoal => {
+    const ng = input.nextGoal
+    const method = ng.method ? ng.method.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 10) : ''
+    const out: AssignmentBriefCheckpointNextGoal = {
+      endpoint: cleanCheckpointEndpoint(ng.endpoint, endpointBytes),
+      goal: redactBriefText(ng.goal, goalBytes) || 'Advance next hop',
+    }
+    if (method) out.method = method
+    const surface = redactBriefText(ng.surface, 24)
+    const service = redactBriefText(ng.service, 48)
+    const hypothesisClass = redactBriefText(ng.hypothesisClass, 48)
+    if (surface) out.surface = surface
+    if (service) out.service = service
+    if (hypothesisClass) out.hypothesisClass = hypothesisClass
+    if (includeOptional) {
+      const targetSurfaceKey = redactBriefText(ng.targetSurfaceKey, 80)
+      const expectedBinding = redactBriefText(ng.expectedBinding, 32)
+      const targetTenant = redactBriefText(ng.targetTenant, 36)
+      const targetRole = redactBriefText(ng.targetRole, 32)
+      if (targetSurfaceKey) out.targetSurfaceKey = targetSurfaceKey
+      if (expectedBinding) out.expectedBinding = expectedBinding
+      if (targetTenant) out.targetTenant = targetTenant
+      if (targetRole) out.targetRole = targetRole
+    }
+    return out
+  }
+
+  const build = (
+    hops: AssignmentBriefCheckpointHop[],
+    omitted: number,
+    handles: string[],
+    pruned: AssignmentBriefPrunedBranch[],
+    goalBytes: number,
+    endpointBytes: number,
+    includeOptional: boolean,
+  ): RenderedHopCheckpoint => ({
+    schema: HOP_CHECKPOINT_SCHEMA_V1,
+    branchKey,
+    depth,
+    targetHop,
+    mode,
+    ...(includeOptional && evi !== undefined ? { evi } : {}),
+    verifiedHops: hops,
+    ...(omitted > 0 ? { omittedEarlierHops: omitted } : {}),
+    capabilityHandles: handles,
+    ...(includeOptional && fuseWithBranchKey ? { fuseWithBranchKey } : {}),
+    nextGoal: makeNextGoal(goalBytes, endpointBytes, includeOptional),
+    ...(pruned.length ? { prunedBranches: pruned } : {}),
+    doNotRediscover: true,
+  })
+
+  const measure = (cp: RenderedHopCheckpoint) => Buffer.byteLength(JSON.stringify(cp), 'utf8')
+
+  const full = build(
+    orderedInputHops.map(h => normalizeCheckpointHop(h, false)),
+    baseOmitted,
+    allHandles,
+    prunedBranches,
+    180,
+    96,
+    true,
+  )
+  const fullBytes = measure(full)
+  if (fullBytes <= cap) return { checkpoint: full, bytes: fullBytes, truncated: false }
+
+  const passes = [
+    { compact: false, goalBytes: 180, endpointBytes: 96, opt: true, keepPruned: true },
+    { compact: false, goalBytes: 160, endpointBytes: 88, opt: true, keepPruned: false },
+    { compact: true, goalBytes: 110, endpointBytes: 64, opt: false, keepPruned: false },
+    { compact: true, goalBytes: 64, endpointBytes: 48, opt: false, keepPruned: false },
+  ] as const
+
+  for (const pass of passes) {
+    const hops = orderedInputHops.map(h => normalizeCheckpointHop(h, pass.compact))
+    const pruned = pass.keepPruned ? prunedBranches.slice(0, 2) : []
+    for (let keep = hops.length; keep >= 0; keep -= 1) {
+      const slice = keep === 0 ? [] : hops.slice(hops.length - keep)
+      const omitted = baseOmitted + (hops.length - slice.length)
+      const handles = keep === 0 ? allHandles.slice(-Math.min(allHandles.length, 4)) : allHandles
+      const candidate = build(slice, omitted, handles, pruned, pass.goalBytes, pass.endpointBytes, pass.opt)
+      const bytes = measure(candidate)
+      if (bytes <= cap) return { checkpoint: candidate, bytes, truncated: true }
+    }
+  }
+
+  // Final guaranteed-under-cap fallback preserving opaque handle + target + doNotRediscover.
+  const minimal: RenderedHopCheckpoint = {
+    schema: HOP_CHECKPOINT_SCHEMA_V1,
+    branchKey: truncateUtf8Head(branchKey, 24),
+    depth,
+    targetHop,
+    mode,
+    verifiedHops: [],
+    ...(baseOmitted + orderedInputHops.length > 0 ? { omittedEarlierHops: baseOmitted + orderedInputHops.length } : {}),
+    capabilityHandles: allHandles.slice(-1).map(h => truncateUtf8Head(h, 48)),
+    nextGoal: {
+      endpoint: cleanCheckpointEndpoint(input.nextGoal.endpoint, 32),
+      goal: redactBriefText(input.nextGoal.goal, 28) || 'Advance hop',
+    },
+    doNotRediscover: true,
+  }
+  const minimalBytes = measure(minimal)
+  if (minimalBytes <= cap) return { checkpoint: minimal, bytes: minimalBytes, truncated: true }
+  minimal.capabilityHandles = []
+  minimal.nextGoal = { endpoint: '/', goal: 'Pivot' }
+  minimal.branchKey = truncateUtf8Head(branchKey, 12)
+  return { checkpoint: minimal, bytes: measure(minimal), truncated: true }
+}
+
 interface WorkingState {
   routes: AssignmentBriefRoute[]
   linked: AssignmentBriefRoute[]
@@ -320,6 +636,8 @@ interface WorkingState {
   detLead?: Record<string, unknown>
   code?: CodeDataflowSlice
   codeBudget: number
+  hopCheckpoint?: RenderedHopCheckpoint
+  hopCheckpointBudget: number
   proofObligation?: Record<string, unknown>
 }
 
@@ -328,6 +646,7 @@ function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<
     mission: input.missionKind,
     origin: cleanText(input.origin.split(/[?#]/, 1)[0], 180),
     ...(state.detLead ? { detLead: state.detLead } : {}),
+    ...(state.hopCheckpoint ? { hopCheckpoint: state.hopCheckpoint } : {}),
     ...(state.proofObligation ? { proofObligation: state.proofObligation } : {}),
     routes: state.routes,
     ...(state.code ? { code: state.code } : {}),
@@ -439,6 +758,10 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
   const code = input.codeSlice
     ? renderCodeDataflowSlice(input.codeSlice, codeBudget).slice
     : undefined
+  const hopCheckpointBudget = ASSIGNMENT_BRIEF_HOP_CHECKPOINT_MAX_BYTES
+  const fittedCheckpoint = input.hopCheckpoint
+    ? fitHopCheckpointForBrief(input.hopCheckpoint, hopCheckpointBudget)
+    : undefined
   const proofObligation = input.proofObligation ? normalizeProofObligation(input.proofObligation) : undefined
 
   return {
@@ -449,27 +772,29 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
     confirmed,
     ...(input.detLead ? { detLead: normalizeDetLead(input.detLead) } : {}),
     ...(code ? { code } : {}),
+    ...(fittedCheckpoint ? { hopCheckpoint: fittedCheckpoint.checkpoint } : {}),
     ...(proofObligation ? { proofObligation } : {}),
     codeBudget,
+    hopCheckpointBudget,
   }
 }
 
 /**
  * Render the brief plus deterministic reduction metadata.
  *
- * The reduction ladder keeps the highest-signal material longest: det_lead, then the top route(s),
- * then personas/confirmed refs, then baseline keys/samples, then linked routes (secondary).
+ * The reduction ladder keeps the highest-signal material longest: det_lead, hopCheckpoint,
+ * then the top route(s), then personas/confirmed refs, then baseline keys/samples, then linked routes.
  */
 export function buildAssignmentBriefPacket(
   input: AssignmentBriefInput,
   maxBytes?: number,
 ): AssignmentBriefResult {
-  const defaultCap = input.codeExpansion === 'full'
+  const defaultCap = input.codeExpansion === 'full' || Boolean(input.hopCheckpoint)
     ? ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE
     : ASSIGNMENT_BRIEF_MAX_BYTES
   const cap = Math.max(128, Math.min(Math.floor(maxBytes ?? defaultCap), ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE))
   const state = buildWorkingState(input)
-  let truncated = false
+  let truncated = Boolean(input.hopCheckpoint && fitHopCheckpointForBrief(input.hopCheckpoint, state.hopCheckpointBudget).truncated)
 
   const render = () => JSON.stringify(renderPacket(input, state))
   const fits = (text: string) => Buffer.byteLength(text, 'utf8') <= cap
@@ -517,7 +842,7 @@ export function buildAssignmentBriefPacket(
       continue
     }
     // The obligation is a convenience wrapper over the code slice; drop it before any byte of the
-    // file:line evidence so a tight render can never lose the dataflow chain.
+    // file:line evidence or hopCheckpoint so a tight render can never lose chain continuity.
     if (state.proofObligation) {
       state.proofObligation = undefined
       continue
@@ -528,8 +853,19 @@ export function buildAssignmentBriefPacket(
       state.codeBudget = nextBudget
       continue
     }
+    if (state.hopCheckpoint && input.hopCheckpoint && state.hopCheckpointBudget > 384) {
+      const nextHopBudget = Math.max(384, Math.floor(state.hopCheckpointBudget * 0.65))
+      state.hopCheckpoint = fitHopCheckpointForBrief(input.hopCheckpoint, nextHopBudget).checkpoint
+      state.hopCheckpointBudget = nextHopBudget
+      continue
+    }
     if (state.code) {
       state.code = undefined
+      continue
+    }
+    if (state.hopCheckpoint && input.hopCheckpoint && state.hopCheckpointBudget > 256) {
+      state.hopCheckpoint = fitHopCheckpointForBrief(input.hopCheckpoint, 256).checkpoint
+      state.hopCheckpointBudget = 256
       continue
     }
     if (state.detLead && typeof state.detLead.signalSummary === 'string' && state.detLead.signalSummary.length > 60) {
@@ -568,6 +904,10 @@ export function buildAssignmentBriefPacket(
     }
     if (state.routes.length) {
       state.routes.pop()
+      continue
+    }
+    if (state.hopCheckpoint) {
+      state.hopCheckpoint = undefined
       continue
     }
 
