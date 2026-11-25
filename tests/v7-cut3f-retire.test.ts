@@ -16,6 +16,7 @@ import * as verifier from '../src/server/replay-verifier.ts'
 import * as agentScript from '../src/server/agent-script-proof.ts'
 import * as feedback from '../src/server/replay-feedback.ts'
 import * as engine from '../src/server/floor-recipe-engine.ts'
+import * as proofReceipt from '../src/server/proof-receipt.ts'
 import {
   LEGACY_UNWIRED_SPECKINDS,
   WIRED_SPECKIND_RECIPES,
@@ -104,7 +105,8 @@ describe('cut3f: re-export surface', () => {
     assert.equal(verifier.buildInlineVerifyFeedback, feedback.buildInlineVerifyFeedback)
     assert.equal(verifier.verifyReplaySpecInline, feedback.verifyReplaySpecInline)
     assert.equal(verifier.inconclusiveResult, engine.inconclusiveResult)
-    assert.equal(verifier.proofReceiptMode, engine.proofReceiptMode)
+    assert.equal(verifier.proofReceiptMode, proofReceipt.proofReceiptMode)
+    assert.equal(verifier.proofReceiptMode({} as NodeJS.ProcessEnv), 'strict')
     assert.ok(verifier.RETIRED_LEGACY_SPEC_KINDS.has('browser_chain'))
   })
 })

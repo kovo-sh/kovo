@@ -29,8 +29,7 @@ import {
   withVerifierRepairFeedback,
   runAgentSession,
 } from '../src/server/agent-session.ts'
-import type { CompiledProof, ProofToolName } from '../src/server/proof-tools.ts'
-import { describeProofTools } from '../src/server/proof-tools.ts'
+import { proofToolNames } from '../src/server/proof-tools.ts'
 
 const origin = 'https://app.example.invalid'
 
@@ -44,35 +43,11 @@ function toolByName(tools: ReturnType<typeof buildWorkerTools>, name: string) {
   return tools.find(tool => tool.name === name)
 }
 
-function textOf(result: { output?: readonly { type: string; text?: string }[] }): string {
-  return (result.output ?? [])
-    .filter(part => part.type === 'text')
-    .map(part => part.text ?? '')
-    .join('\n')
-}
-
-const validAuthzInput = {
-  origin,
-  ownerPersona: 'user_a',
-  attackerPersona: 'user_b',
-  endpoint: '/api/orders/{resourceId}',
-  resourceId: 'order-1234',
-  identifierPath: 'id',
-}
-
-async function invoke(tool: NonNullable<ReturnType<typeof toolByName>>, args: Record<string, unknown>) {
-  return tool.execute(
-    args as never,
-    {} as never,
-    { abortSignal: AbortSignal.timeout(5_000) } as never,
-  ) as Promise<{ output?: readonly { type: string; text?: string }[]; isError?: boolean }>
-}
-
 // ============================================================================
-// 1. Tool list: typed proof tools are opt-in per handler
+// 1. Tool list: retired prove_* JSON-to-DSL compilers are never registered
 // ============================================================================
 
-test('proof tools are absent without handlers and present for exactly the supplied handlers', () => {
+test('retired prove_* JSON-to-DSL compiler tools are never registered even when handlers are supplied', () => {
   const withoutProofs = buildWorkerTools(
     { complete_intent: async () => ({ ok: true }) },
     value => value,
@@ -83,45 +58,21 @@ test('proof tools are absent without handlers and present for exactly the suppli
   for (const name of proofToolHandlerNames) assert.equal(toolByName(withoutProofs, name), undefined)
   assert.ok(toolByName(withoutProofs, 'complete_intent'), 'complete_intent stays available')
 
-  const handlers = {
-    prove_authz_read_diff: async () => ({ ok: true }),
-    prove_business_invariant: async () => ({ ok: true }),
-  }
-  const withProofs = buildWorkerTools(
+  const handlers = Object.fromEntries(proofToolHandlerNames.map(name => [name, async () => ({ ok: true })]))
+  const withLegacyHandlers = buildWorkerTools(
     { ...handlers, complete_intent: async () => ({ ok: true }) },
     value => value,
     AbortSignal.timeout(5_000),
     24 * 1024,
     () => {},
   )
-  assert.ok(toolByName(withProofs, 'prove_authz_read_diff'))
-  assert.ok(toolByName(withProofs, 'prove_business_invariant'))
-  assert.equal(toolByName(withProofs, 'prove_state_mutation_diff'), undefined)
-  assert.equal(toolByName(withProofs, 'prove_canary_or_redirect'), undefined)
-})
-
-test('proof tool names, required fields and one-line usage mirror describeProofTools', () => {
-  const handlers = Object.fromEntries(proofToolHandlerNames.map(name => [name, async () => ({ ok: true })]))
-  const tools = buildWorkerTools(
-    handlers,
-    value => value,
-    AbortSignal.timeout(5_000),
-    24 * 1024,
-    () => {},
-  )
-  const described = describeProofTools()
   for (const name of proofToolHandlerNames) {
-    const tool = toolByName(tools, name)
-    assert.ok(tool, `${name} must be registered`)
-    const schema = tool.parameters as unknown as { required?: string[] }
-    const expected = described.find(entry => entry.name === name)!
-    assert.deepEqual(schema.required, [...expected.inputSchema.required], `${name} required fields`)
-    assert.ok(tool.description.startsWith(expected.usage), `${name} exposes its one-line usage`)
-    assert.match(tool.description, /ok: false, errors/)
+    assert.equal(toolByName(withLegacyHandlers, name), undefined, `retired ${name} must not register`)
   }
+  assert.deepEqual([...proofToolNames], [])
 })
 
-test('legacy raw-spec submission tools are never removed', () => {
+test('legacy raw-spec submission tools are available when kovo_verify is absent', () => {
   const tools = buildWorkerTools(
     { propose_chain_finding: async () => ({ ok: true }), verify_replay_spec: async () => ({ ok: true }) },
     value => value,
@@ -133,78 +84,13 @@ test('legacy raw-spec submission tools are never removed', () => {
   assert.ok(toolByName(tools, 'verify_replay_spec'))
 })
 
-test('proof tools join the base bundle without re-expanding the slim skill catalog', () => {
-  // v6 fluid bundles replaced the per-profile `allowedTools` allowlist (plans/better-architecture.md
-  // §3.3), so the typed-proof guarantee is asserted through the resolved bundle instead.
+test('specialist profiles keep a slim skill catalog and deduplicated bundle tools', () => {
   for (const [id, profile] of Object.entries(SPECIALIST_PROFILES)) {
     const tools = investigatorTools(capabilityBundlesFor('', profile.capabilities))
-    assert.ok(tools.includes('prove_authz_read_diff'), `${id} must allow typed proofs through the base bundle`)
     assert.ok(profile.skills.length >= 2 && profile.skills.length < 10, `${id} keeps a slim skill list`)
     assert.equal(new Set(profile.skills).size, profile.skills.length, `${id} has no duplicate skills`)
     assert.equal(new Set(tools).size, tools.length, `${id} has no duplicate bundle tool entries`)
   }
-})
-
-// ============================================================================
-// 2. Validation errors are structured and never reach the handler
-// ============================================================================
-
-test('invalid proof input returns { ok:false, errors[] } and does not call the handler', async () => {
-  let calls = 0
-  const tools = buildWorkerTools(
-    {
-      prove_authz_read_diff: async () => {
-        calls += 1
-        return { ok: true }
-      },
-    },
-    value => value,
-    AbortSignal.timeout(5_000),
-    24 * 1024,
-    () => {},
-  )
-  const tool = toolByName(tools, 'prove_authz_read_diff')!
-  const result = await invoke(tool, {
-    ...validAuthzInput,
-    attackerPersona: 'user_a',
-  })
-  assert.equal(calls, 0, 'handler must not run on validation failure')
-  const parsed = JSON.parse(textOf(result)) as {
-    ok: boolean
-    errors: Array<{ field: string; code: string; message: string; fix: string }>
-  }
-  assert.equal(parsed.ok, false)
-  assert.ok(parsed.errors.length > 0)
-  for (const issue of parsed.errors) {
-    assert.equal(typeof issue.field, 'string')
-    assert.equal(typeof issue.code, 'string')
-    assert.ok(issue.message)
-    assert.ok(issue.fix)
-  }
-  assert.ok(parsed.errors.some(issue => issue.field === 'attackerPersona'), 'conflicting roles is repairable in one turn')
-})
-
-test('a valid proof forwards the compiled spec to the handler and returns its outcome', async () => {
-  let received: CompiledProof | undefined
-  const tools = buildWorkerTools(
-    {
-      prove_authz_read_diff: async (proof) => {
-        received = proof
-        return { ok: true, exchangeIds: ['ex-proof-1'], verdict: 'confirmed' }
-      },
-    },
-    value => value,
-    AbortSignal.timeout(5_000),
-    24 * 1024,
-    () => {},
-  )
-  const result = await invoke(toolByName(tools, 'prove_authz_read_diff')!, validAuthzInput)
-  assert.ok(received, 'handler receives the compiled proof')
-  assert.equal(received!.spec.kind, 'http_chain')
-  assert.ok(received!.assertionsJq.length > 0)
-  assert.equal(typeof received!.spaCatchallControl, 'boolean')
-  assert.ok(received!.rationale.length > 0)
-  assert.deepEqual(JSON.parse(textOf(result)), { ok: true, exchangeIds: ['ex-proof-1'], verdict: 'confirmed' })
 })
 
 // ============================================================================
@@ -497,7 +383,6 @@ test('the N-2 nudge is injected on turn N-2 and the 85% banner follows', async (
   t.after(() => server.close())
 
   const maxTurns = 6
-  const proofHandler = async () => ({ ok: true })
   await runAgentSession({
     directory: dir,
     sessionId: 'settlement-nudge',
@@ -510,7 +395,7 @@ test('the N-2 nudge is injected on turn N-2 and the 85% banner follows', async (
     requireCompleteIntent: false,
     handlers: {
       record_fact: async () => ({ ok: true }),
-      prove_authz_read_diff: proofHandler,
+      kovo_verify: async () => ({ confirmed: true, reason: 'confirmed', detail: 'ok', attempts: [] }),
       complete_intent: async () => ({ ok: true }),
     },
   })
@@ -521,12 +406,12 @@ test('the N-2 nudge is injected on turn N-2 and the 85% banner follows', async (
   const nudgeBody = serialized.find(body => body.includes('SETTLEMENT NUDGE'))
   assert.ok(nudgeBody, 'a settlement nudge must be injected')
   assert.ok(nudgeBody!.includes(`Turn ${nudgeTurn}/${maxTurns}`), 'nudge fires at N-2')
-  assert.ok(nudgeBody!.includes('prove_authz_read_diff'), 'nudge offers the registered typed proof tool')
+  assert.ok(nudgeBody!.includes('kovo_verify'), 'nudge offers the registered kovo_verify tool')
   assert.ok(nudgeBody!.includes('complete_intent'))
 
   const bannerBody = serialized.find(body => body.includes('SETTLEMENT NOTICE'))
   assert.ok(bannerBody, 'the 85% settlement banner still fires')
-  assert.ok(bannerBody!.includes('prove_authz_read_diff'))
+  assert.ok(bannerBody!.includes('kovo_verify'))
 })
 
 test('a proof tool name is only advertised in settlement text when its handler exists', () => {
@@ -534,7 +419,3 @@ test('a proof tool name is only advertised in settlement text when its handler e
   assert.equal(message.includes('prove_authz_read_diff'), false)
   assert.match(message, /propose_chain_finding/)
 })
-
-// Keep the proof tool name union referenced so an accidental schema rename fails the typecheck.
-const _proofNames: ProofToolName[] = [...proofToolHandlerNames]
-assert.equal(_proofNames.length, 4)

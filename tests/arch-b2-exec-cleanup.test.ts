@@ -23,12 +23,7 @@ import { fileURLToPath } from 'node:url'
 import { Execution } from '../src/server/execution.ts'
 import { ExecWorkerRunner } from '../src/server/exec-worker-runner.ts'
 import { LabRunner } from '../src/server/lab-runner.ts'
-import {
-  describeProofTools,
-  proofToolNames,
-  proveAuthzReadDiff,
-  validateProofInput,
-} from '../src/server/proof-tools.ts'
+import { proofToolNames } from '../src/server/proof-tools.ts'
 import { Store } from '../src/server/store.ts'
 import type { Assignment, ChainStep, Run } from '../src/server/store.ts'
 import type { AssignmentBudget } from '../src/server/exec-dispatch.ts'
@@ -82,37 +77,19 @@ test('B2.1: execution.ts <= 4,500 LOC, clean ExecWorkerRunner seam, no circular 
   assert.equal(typeof ExecWorkerRunner.prototype.runInvestigationWorker, 'function')
 })
 
-test('B2.2: proof-tools.ts prunes unreferenced type exports while preserving all live callers', () => {
+test('B2.2: proof-tools.ts is retired to a minimal type-only stub with zero legacy JSON-to-DSL compilers', () => {
   const src = readFileSync(join(REPO_ROOT, 'src/server/proof-tools.ts'), 'utf8')
   const exportNames = [...src.matchAll(/^export\s+(?:const|type|interface|class|function)\s+([A-Za-z0-9_]+)/gm)].map(m => m[1]!).sort()
 
-  const expectedLiveExports = [
+  const expectedStubExports = [
     'CompiledProof',
-    'ProofCompileError',
     'ProofToolName',
-    'describeProofTools',
     'proofToolNames',
-    'proveAuthzReadDiff',
-    'proveBusinessInvariant',
-    'proveCanaryOrRedirect',
-    'proveStateMutationDiff',
-    'validateProofInput',
   ].sort()
 
-  assert.deepEqual(exportNames, expectedLiveExports, 'proof-tools.ts must export only live-referenced symbols')
-  assert.deepEqual(describeProofTools().map(d => d.name), [...proofToolNames])
-  assert.equal(validateProofInput('prove_authz_read_diff', { origin: 'https://app.example.invalid' }).ok, false)
-
-  const compiled = proveAuthzReadDiff({
-    origin: 'https://app.example.invalid',
-    ownerPersona: 'alice',
-    attackerPersona: 'bob',
-    endpoint: '/api/items/{resourceId}',
-    resourceId: 'item-88421',
-    identifierPath: 'id',
-  })
-  assert.equal(compiled.spec.kind, 'http_chain')
-  assert.equal(compiled.spec.steps.length, 2)
+  assert.deepEqual(exportNames, expectedStubExports, 'proof-tools.ts must export only the minimal retirement stub')
+  assert.deepEqual([...proofToolNames], [])
+  assert.ok(src.split('\n').length <= 30, 'retired proof-tools.ts must stay <= 30 LOC')
 })
 
 test('B2.3: ExecWorkerRunner preserves record_coverage 2-strike negative-edge pruning, stall retry/rotation, completeWorker & LabRunner/vault custody', async (t) => {
