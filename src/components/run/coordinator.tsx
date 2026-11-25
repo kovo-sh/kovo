@@ -113,11 +113,11 @@ function ApprovalsCard() {
   const open = pending.filter(a => !q.get('ap:' + a.id))
   const settled = (id: string) => q.get('ap:' + id)?.state === 'sent'
   const shown = pending.slice().sort((a, b) => Number(settled(a.id)) - Number(settled(b.id))).slice(0, 3)
-  return <div className="approvals" data-testid="board-approvals" aria-label="Pending Tier 3 approvals">
+  return <div className="approvals" data-testid="board-approvals" aria-label="Pending state-change approvals">
     <div className="ap-card">
       <div className="ap-h">
         <StatusGlyph status={open.length ? 'paused' : 'complete'} />
-        <span>{open.length ? 'Tier 3 approvals' : 'Tier 3 approvals decided'}</span>
+        <span title="State-changing requests requiring approval (Tier 3)">{open.length ? 'Pending approvals' : 'Approvals decided'}</span>
         <span className="muted num">{open.length} of {pending.length} open</span>
         <button type="button" className="btn ghost go" style={{ height: 24 }} onClick={() => {
           const first = q.sections.decide[0]
@@ -205,7 +205,7 @@ function RefDetail({ kind, id }: { kind: RefKind; id: string }) {
 
 function InlineApproval({ a }: { a: Approval }) {
   return <div className="b-apin" data-testid="board-approval-inline">
-    <div className="b-apin-h"><Icon name="shield" /><span>Tier 3 approval</span><span className="muted">· {cap(a.status)}</span></div>
+    <div className="b-apin-h" title="State-changing request (Tier 3)"><Icon name="shield" /><span>Approval request</span><span className="muted">· {cap(a.status)}</span></div>
     <ApprovalRow a={a} />
   </div>
 }
@@ -216,14 +216,24 @@ function BoardPost({ m, filter, setFilter }: { m: BoardMessage; filter: Filter; 
   const op = m.authorRole === 'operator'
   const approval = m.refApprovalId ? model.approvalById.get(m.refApprovalId) : undefined
   const mentions = m.mentions.filter(h => h !== 'coordinator' || !op)
-  const chip = (kind: RefKind, id: string, label: string) => {
+  const chip = (kind: RefKind, id: string, label: string, tip: string) => {
     const on = open?.kind === kind && open.id === id
-    return <button key={kind + ':' + id} type="button" className={'b-ref' + (on ? ' on' : '')} data-ref-kind={kind} data-ref-id={id} aria-pressed={on}
+    return <button key={kind + ':' + id} type="button" className={'b-ref' + (on ? ' on' : '')} data-ref-kind={kind} data-ref-id={id} aria-pressed={on} title={tip}
       onClick={() => setOpen(on ? null : { kind, id })}><Icon name={kind === 'exchange' ? 'exchanges' : kind === 'finding' ? 'findings' : kind === 'step' ? 'workflow' : 'fact'} size={12} />{label}</button>
   }
-  const refLabel = (kind: RefKind, id: string) => kind === 'fact' ? (model.factById.get(id)?.kind ?? 'fact') + ' ' + short(id)
-    : kind === 'exchange' ? (model.exchangeById.get(id) ? model.exchangeById.get(id)!.method + ' ' + model.exchangeById.get(id)!.pathAndQuery : 'exchange ' + short(id))
-      : kind === 'finding' ? (model.findingById.get(id)?.title ?? 'finding ' + short(id)) : 'step #' + (model.stepById.get(id)?.seq ?? short(id))
+  const refLabel = (kind: RefKind, id: string) => {
+    if (kind === 'fact') {
+      const f = model.factById.get(id)
+      return f ? cap(f.kind) + ' · ' + host(f.origin) : 'Recorded fact'
+    }
+    if (kind === 'exchange') {
+      const ex = model.exchangeById.get(id)
+      return ex ? ex.method + ' ' + ex.pathAndQuery : 'HTTP exchange'
+    }
+    if (kind === 'finding') return model.findingById.get(id)?.title ?? 'Finding'
+    const step = model.stepById.get(id)
+    return step ? 'Step #' + step.seq : 'Plan step'
+  }
   const refs: [RefKind, string][] = [...m.refFactIds.map(id => ['fact', id] as [RefKind, string]), ...m.refExchangeIds.map(id => ['exchange', id] as [RefKind, string]),
     ...m.refFindingIds.map(id => ['finding', id] as [RefKind, string]), ...(m.refStepId ? [['step', m.refStepId] as [RefKind, string]] : [])]
   const role = m.authorRole === 'coordinator' ? 'co' : op ? 'op' : ''
@@ -242,7 +252,7 @@ function BoardPost({ m, filter, setFilter }: { m: BoardMessage; filter: Filter; 
         {m.replyToSeq && <span className="muted num" data-testid="board-reply">↳ #{m.replyToSeq}</span>}
         {mentions.map(h => <button key={h} type="button" className={'b-men' + (filter === h ? ' on' : '')} onClick={() => setFilter(filter === h ? 'all' : h)}>@{h}</button>)}
       </div>}
-      {refs.length > 0 && <div className="b-meta" aria-label="Evidence references">{refs.map(([k, id]) => chip(k, id, refLabel(k, id)))}</div>}
+      {refs.length > 0 && <div className="b-meta" aria-label="Evidence references">{refs.map(([k, id]) => chip(k, id, refLabel(k, id), `${cap(k)} · ID ${id}`))}</div>}
       {open && <RefDetail kind={open.kind} id={open.id} />}
       {approval && <InlineApproval a={approval} />}
     </div>
@@ -271,7 +281,7 @@ function ThreadMessage({ m }: { m: Message }) {
       </div>
     </div>
   }
-  const who = m.role === 'operator' ? ['You', 'op', 'Y'] : m.role === 'coordinator' ? ['Coordinator', 'co', 'C'] : m.role === 'worker' ? [model.workerById.get(m.threadId)?.title ?? 'Worker', '', 'W'] : ['Guardian', '', 'G']
+  const who = m.role === 'operator' ? ['You', 'op', 'Y'] : m.role === 'coordinator' ? ['Coordinator', 'co', 'C'] : m.role === 'worker' ? [model.workerById.get(m.threadId)?.title ?? 'Worker', '', 'W'] : ['Kovo Hunter', '', 'K']
   const evidence = (m.evidenceIds ?? []).map(id => model.evidenceById.get(id)).filter(e => !!e)
   return <div className={'msg' + (m.role === 'guardian' ? ' sys' : '')} data-source="thread" data-role={m.role}>
     <span className={'av ' + who[1]}>{who[1] === 'co' ? <svg viewBox="0 0 14 14" width="12" height="12" aria-hidden="true"><circle cx="7" cy="7" r="2.5" fill="currentColor" /></svg> : who[2]}</span>
@@ -411,7 +421,7 @@ export function BoardPane() {
   const statusNote = r.status === 'waiting'
     ? `Waiting for ${r.phase === 'review' ? 'scope approval' : 'consent'} before planning. Review the ${plural(model.surface.origins.length, 'proposed host')} in the main view.`
     : r.status === 'paused' || r.status === 'budget_paused'
-      ? `Run paused in ${(PHASE_LABEL[r.phase] ?? r.phase).toLowerCase()}, round ${r.roundNo}.` + (openApprovals.length ? ' ' + capF(words(openApprovals.length)) + ' Tier 3 request' + (openApprovals.length > 1 ? 's are' : ' is') + ' waiting on you.' : '')
+      ? `Run paused in ${(PHASE_LABEL[r.phase] ?? r.phase).toLowerCase()}, round ${r.roundNo}.` + (openApprovals.length ? ' ' + capF(words(openApprovals.length)) + ' approval request' + (openApprovals.length > 1 ? 's are' : ' is') + ' waiting on you.' : '')
       : null
   const handleChips = handles.filter(h => h !== 'coordinator' && h !== 'all' && (members.some(m => m.handle === h) || board.some(m => m.authorHandle === h || m.mentions.includes(h))))
 
@@ -448,7 +458,7 @@ export function BoardPane() {
               {m.ctx && <span className="ctxchip" style={{ margin: '4px 0 0', animation: 'none' }}><span>{m.ctx}</span></span>}
             </div>
           </div>)}
-          {statusNote && filter === 'all' && <div className="msg sys"><span className="av">G</span><div><div className="who">Guardian<span className="muted">now</span></div><div className="body">{statusNote}</div></div></div>}
+          {statusNote && filter === 'all' && <div className="msg sys"><span className="av">K</span><div><div className="who">Kovo Hunter<span className="muted">now</span></div><div className="body">{statusNote}</div></div></div>}
         </div>
       </div>
     </div>

@@ -4,18 +4,19 @@
 // Verify Fix retest, verified patch generation), baseline checks by origin,
 // coverage by category, threat-model ranking, open proof gaps, patch
 // proposals, gaps and methodology. Evidence opens in the inspector.
-import { Fragment, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import { downloadReportMarkdown, exportSarifAction, generatePatchAction } from '../../../actions.ts'
-import type { Finding as ReportFinding } from '../../../domain.ts'
+import type { CapabilityTier, Finding as ReportFinding } from '../../../domain.ts'
 import {
   callerCompatibilityLabels, capabilityTierLabel, checkLabels, dynamicRetestLabels, findingVerificationTier,
   owaspCategoryTitles, owaspStatusLabels, patchStatusLabels, reportEvidenceSource, reportHighlights, reportPlanLabel,
   retestVerdictLabels, verificationTierLabels,
 } from '../../../report-summary.ts'
+import { capabilityTierMeta } from '../../run-state.ts'
 import { Dropdown } from '../controls.tsx'
 import { useRun, useRunModel, useVerdict } from '../data.tsx'
 import { EmptyState, Tag } from '../display.tsx'
-import { fmtDate, fmtN, fmtUsd, host, plural } from '../format.ts'
+import { fmtDate, fmtN, fmtUsd, host, plural, readRunUrlParam, syncRunUrlParam } from '../format.ts'
 import { CovSwatch, SevGlyph, StatusGlyph, TierBars } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { CATS, COV_L, FSTAT_ORDER, normFStatus, PHASE_LABEL, prettyCat, RISKL, SEV, SEV_COL, SEV_LABEL, SEV_ORDER, stLabel } from '../meta.ts'
@@ -52,7 +53,31 @@ export function ReportView() {
   const nav = useNav()
   const r = detail.run
   const reports = detail.reports
-  const [version, setVersion] = useViewState<number | null>('report.version', null)
+  const latestVersion = useMemo(() => reports.reduce((max, x) => Math.max(max, x.version), 0), [reports])
+  const [version, setVersionState] = useViewState<number | null>('report.version', null)
+  const setVersion = useCallback((v: number) => {
+    setVersionState(v)
+    syncRunUrlParam('version', v === latestVersion ? null : String(v))
+  }, [setVersionState, latestVersion])
+  useEffect(() => {
+    const parseVer = (raw: string | null) => {
+      if (!raw) return null
+      const n = Number(raw)
+      return Number.isInteger(n) && reports.some(x => x.version === n) ? n : null
+    }
+    const fromUrl = parseVer(readRunUrlParam('version'))
+    if (fromUrl != null) {
+      if (fromUrl !== version) setVersionState(fromUrl)
+    } else if (version != null && version !== latestVersion) {
+      syncRunUrlParam('version', String(version))
+    }
+    const onPop = () => {
+      setVersionState(parseVer(readRunUrlParam('version')))
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reports.length, latestVersion])
   const rep = reports.find(x => x.version === version) ?? reports.slice().sort((a, b) => b.version - a.version)[0]
   if (!rep) {
     const msg = r.status === 'waiting'
@@ -112,18 +137,18 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
   const exportMd = async () => {
     setExporting(true)
     try { const x = await downloadReportMarkdown({ data: { runId: detail.run.id, reportId: rep.id } }); download(x.content, x.filename, 'text/markdown; charset=utf-8'); toast.show('Exported Markdown', { icon: 'download', sub: x.filename }) }
-    catch { toast.show('Guardian could not export this report. Try again.', { tone: 'error' }) }
+    catch { toast.show('Kovo Hunter could not export this report. Try again.', { tone: 'error' }) }
     finally { setExporting(false) }
   }
   const exportSarif = async () => {
     setExporting(true)
     try { const x = await exportSarifAction({ data: { runId: detail.run.id, reportId: rep.id } }); download(x.content, x.filename, 'application/sarif+json; charset=utf-8'); toast.show('Exported SARIF 2.1.0', { icon: 'download', sub: x.filename }) }
-    catch { toast.show('Guardian could not export SARIF 2.1.0 for this report. Try again.', { tone: 'error' }) }
+    catch { toast.show('Kovo Hunter could not export SARIF 2.1.0 for this report. Try again.', { tone: 'error' }) }
     finally { setExporting(false) }
   }
   const exportText = () => {
     const lines = [
-      `Guardian ${rep.partial ? 'partial report' : 'complete report'} • Version ${rep.version}`, '',
+      `Kovo Hunter ${rep.partial ? 'partial report' : 'complete report'} • Version ${rep.version}`, '',
       verdict.hed, ...(covLine ? [covLine] : []), '', b.goal, '',
       reportEvidenceSource(detail.run.sourceMode, b.selectedChecks, b.capabilityTier),
       `Capability tier: ${capabilityTierLabel(b.capabilityTier)}`, `Scope revision ${b.scopeRevision} · Goal revision ${b.goalRevision}`,
@@ -151,13 +176,13 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
         ...(c.checks ?? []).flatMap(ch => [`  ${ch.title} · ${checkLabels[ch.status]}`, ...(ch.status === 'untested' ? [] : [`    Observed: ${ch.observed ?? 'Unavailable'}`]), `    Expected: ${ch.expected}`, `    ${ch.reason}`])]),
       '', 'Coverage gaps', ...b.gaps,
     ]
-    download(lines.join('\n'), `guardian-report-${rep.version}.txt`, 'text/plain')
+    download(lines.join('\n'), `kovo-hunter-report-${rep.version}.txt`, 'text/plain')
     toast.show('Exported plain text', { icon: 'download' })
   }
   const patch = async (f: ReportFinding) => {
     setPatching(f.id)
     try { await generatePatchAction({ data: { runId: detail.run.id, findingId: f.id, repo: f.codeLocations?.[0]?.repo } }); toast.show('Verified patch generated', { icon: 'check', sub: f.title }) }
-    catch (e) { toast.show(e instanceof Error ? e.message : 'Guardian could not generate a verified patch.', { tone: 'error' }) }
+    catch (e) { toast.show(e instanceof Error ? e.message : 'Kovo Hunter could not generate a verified patch.', { tone: 'error' }) }
     finally { setPatching(null) }
   }
 
@@ -172,7 +197,7 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
 
   return <div className="doc"><article className="doc-in" aria-label={rep.partial ? 'Partial report' : 'Complete report'}>
     <div className="rp-top">
-      <span className="eyebrow"><Icon name="report" />Report v{rep.version} · {fmtDate(rep.createdAt)} · Tier {b.capabilityTier}</span>
+      <span className="eyebrow" title={`Tier ${b.capabilityTier}`}><Icon name="report" />Report v{rep.version} · {fmtDate(rep.createdAt)} · {capabilityTierMeta[b.capabilityTier as CapabilityTier]?.short ?? capabilityTierLabel(b.capabilityTier)}</span>
       {rep.partial ? <Tag tone="warn" title="Saved as a checkpoint before verification finished">Partial</Tag> : <Tag>Final</Tag>}
       <span className="tb-sp" />
       {versions.length > 1 && <Dropdown label={<><span className="dim">Version</span><span>v{rep.version}</span></>} menuClassName="small">
@@ -267,7 +292,7 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
             {(rt || canRetest) && <div className="banner rp-rt">
               {rt ? <><StatusGlyph status={rt.verdict === 'fixed' ? 'complete' : rt.verdict === 'reproduced' ? 'failed' : 'inconclusive'} />
                 <span><b>{retestVerdictLabels[rt.verdict]}</b> <span className="muted">· {rt.summary} · {fmtDate(rt.createdAt)}</span></span></>
-                : <span className="muted">A deterministic Zero-LLM replay spec is ready for fix verification.</span>}
+                : <span className="muted">An automated replay check is ready for fix verification.</span>}
               {canRetest && <button type="button" className="btn" disabled={pending > 0 || queued}
                 onClick={e => { e.stopPropagation(); void send({ action: 'retest_finding', findingId: f.id }).then(() => toast.show('Verify Fix queued', { icon: 'replay', sub: f.title }), () => {}) }}>
                 <Icon name="replay" />{queued ? 'Verifying fix…' : 'Verify Fix'}</button>}
@@ -367,7 +392,7 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
 
     <h2>Methodology and limitations</h2>
     <p className="rp-p">{reportEvidenceSource(detail.run.sourceMode, b.selectedChecks, b.capabilityTier)}{reportPlanLabel(b.selectedChecks) ? ' ' + reportPlanLabel(b.selectedChecks) : ''}</p>
-    <p className="rp-p">Kovo Hunter evaluated only the approved hosts, capability tier ({capabilityTierLabel(b.capabilityTier)}), test accounts and recorded evidence in this report. Model commentary and CVE version matches only create hypotheses; every confirmed finding requires deterministic Zero-LLM replay verification against a clean control check.</p>
+    <p className="rp-p">Kovo Hunter evaluated only the approved hosts, testing mode ({capabilityTierMeta[b.capabilityTier as CapabilityTier]?.name ?? capabilityTierLabel(b.capabilityTier)}), test accounts, and recorded evidence in this report. AI observations and version matches only create hypotheses; every confirmed finding requires deterministic automated replay verification against a clean control check.</p>
     <p className="rp-p muted">Inconclusive, ruled-out, not-applicable and untested categories remain visible rather than counting as passes. This evidence-led review does not guarantee that no other vulnerability exists.</p>
   </article></div>
 }

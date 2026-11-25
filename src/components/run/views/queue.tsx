@@ -12,6 +12,7 @@
 // the run is live; finding triage is local (no server API), persisted per run.
 import { useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from 'react'
 import type { ReactNode } from 'react'
+import { capabilityTierMeta } from '../../run-state.ts'
 import { useRunModel } from '../data.tsx'
 import { ACTIONS, actionsFor, approvalCommand, useDecisions } from '../decisions.tsx'
 import type { DecisionAct, DecisionsApi } from '../decisions.tsx'
@@ -262,8 +263,8 @@ function QTitle({ it }: { it: QueueItem }) {
 }
 
 function QMeta({ it, model }: { it: QueueItem; model: RunModel }): ReactNode[] {
-  if (it.kind === 'approval') return ['Tier 3 request', it.ap.status === 'pending' ? 'Expires ' + fmtTime(it.ap.expiresAt) : cap(it.ap.status)]
-  if (it.kind === 'consent') return [plural(model.detail.project.seeds.length, 'seed host'), 'Tier ' + model.run.capabilityTier, fmtUsd(model.run.budgetUsd)]
+  if (it.kind === 'approval') return ['Approval request', it.ap.status === 'pending' ? 'Expires ' + fmtTime(it.ap.expiresAt) : cap(it.ap.status)]
+  if (it.kind === 'consent') return [plural(model.detail.project.seeds.length, 'seed host'), capabilityTierMeta[model.run.capabilityTier].short, fmtUsd(model.run.budgetUsd)]
   if (it.kind === 'follow') return [<span key="h" className="mono">{host(it.cov.origin)}</span>, prettyCat(it.cov.category)]
   return [
     it.bundle ? <span key="o" className="tag num">{it.origins.length} origins</span> : <span key="h" className="mono">{host(it.origins[0])}</span>,
@@ -339,7 +340,7 @@ function DoneRows({ items, selKey }: { items: QueueItem[]; selKey: string | null
   return <>
     {main.map(row)}
     {log.length > 0 && <>
-      <div className="qsub"><Icon name="shield" /><span>Auto-approved by policy</span><span className="ct num">{log.length}</span><span className="sub">Audit log of Tier 3 requests the policy let through</span></div>
+      <div className="qsub"><Icon name="shield" /><span>Auto-approved by policy</span><span className="ct num">{log.length}</span><span className="sub">Audit log of active test requests the policy approved automatically</span></div>
       {log.map(row)}
     </>}
   </>
@@ -378,11 +379,11 @@ function QueueInspector({ sel }: InspectorProps) {
   let banner: ReactNode = null
   if (dec) {
     banner = <div className="banner"><Icon name={ACTIONS[dec.act].icon} />
-      <span>{ACTIONS[dec.act].label} by you · {fmtTimeS(dec.at)}{dec.state === 'pending' ? ' · sending when the undo window closes' : dec.state === 'sent' ? ' · sent to Guardian' : dec.state === 'local' ? ' · saved in this browser only, not sent to Guardian' : ''}</span>
+      <span>{ACTIONS[dec.act].label} by you · {fmtTimeS(dec.at)}{dec.state === 'pending' ? ' · sending when the undo window closes' : dec.state === 'sent' ? ' · sent to Kovo Hunter' : dec.state === 'local' ? ' · saved in this browser only, not sent to Kovo Hunter' : ''}</span>
       {dec.state !== 'sent' && <button type="button" className="btn ghost" onClick={() => q.reopen(it.key)}><Icon name="undo" />Move back</button>}
     </div>
   } else if (sec === 'done' && it.kind === 'finding') {
-    banner = <div className="banner"><StatusGlyph status={normFStatus(it.status)} /><span>{it.status === 'dismissed' ? 'Dismissed by verification.' : 'Confirmed by Zero-LLM replay. Nothing to decide.'}</span></div>
+    banner = <div className="banner"><StatusGlyph status={normFStatus(it.status)} /><span>{it.status === 'dismissed' ? 'Dismissed by verification.' : 'Confirmed by automated replay. Nothing to decide.'}</span></div>
   } else if (sec === 'done' && it.kind === 'approval') {
     banner = <div className="banner"><StatusGlyph status={it.ap.status} /><span>{cap(it.ap.status)}{it.ap.decidedBy ? ' by ' + it.ap.decidedBy : ''}{it.ap.decidedAt ? ' · ' + fmtTimeS(it.ap.decidedAt) : ''}.</span></div>
   }
@@ -403,7 +404,7 @@ function QueueInspector({ sel }: InspectorProps) {
       </div></PaneBody>
       <div className={'abar' + (stamped ? ' stamped' : '')}>
         {acts.map(([a, l, k, p]) => <button key={a} type="button" className={'btn' + (p ? ' ink' : '')} onClick={() => decide(it.key, a)}
-          title={localOnly(it, model) ? 'Local triage: saved in this browser only, not sent to Guardian' : undefined}>
+          title={localOnly(it, model) ? 'Local triage: saved in this browser only, not sent to Kovo Hunter' : undefined}>
           <Icon name={icon(a)} />{l}<Kbd>{k.toUpperCase()}</Kbd>
         </button>)}
         {it.kind === 'approval' && sec !== 'done' && <button type="button" className="btn ghost" title="Approve this request and future requests to the same endpoint pattern"

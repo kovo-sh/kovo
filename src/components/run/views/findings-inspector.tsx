@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useRun, useRunModel } from '../data.tsx'
 import { ACTIONS, useDecisions } from '../decisions.tsx'
 import { EmptyState, LinkRow, Props, Section, Tag } from '../display.tsx'
-import { cap, fmtDate, fmtTimeS, host, plural, short } from '../format.ts'
+import { cap, fmtDate, fmtTimeS, host, plural } from '../format.ts'
 import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { covCat, normFStatus, prettyCat, SEV_LABEL, stLabel } from '../meta.ts'
@@ -53,7 +53,7 @@ function VerifyFix({ f }: { f: FindingRow }) {
   }
   const diff = replay?.lastVerificationDiff as unknown
   return <Section title="Replay" right={replay ? (replay.verifiedInline ? 'Verified inline' : plural(replay.attemptCount, 'attempt')) : undefined}>
-    {replay && <p>Declarative replay spec <span className="mono">{short(replay.id)}</span> over {replay.sourceOrigins.map(host).join(', ')}. Zero-LLM: it re-sends the recorded requests and checks the assertion, no model involved.</p>}
+    {replay && <p title={`Replay spec ${replay.id}`}>Automated verification replay over {replay.sourceOrigins.map(host).join(', ')}. Re-sends the recorded HTTP requests directly and checks the response — no AI model involved.</p>}
     {diff != null && <p className="qf-note">Last verification: <span className="mono">{text(diff).slice(0, 240)}</span></p>}
     {retests.map(r => <div key={r.id} className="fretest">
       <StatusGlyph status={RETEST_ST[r.verdict] ?? r.verdict} />
@@ -76,7 +76,7 @@ export function FindingInspector({ sel }: InspectorProps) {
   const f = model.findingById.get(sel.id)
   if (!f) {
     return <>
-      <PaneHeader title="Finding" sub={<span className="mono">{short(sel.id)}</span>} />
+      <PaneHeader title="Finding" sub={<span title={`Finding ${sel.id}`}>Not found</span>} />
       <PaneBody><EmptyState icon="findings" title="Finding not found">It may have been superseded since the run refreshed.</EmptyState></PaneBody>
     </>
   }
@@ -93,7 +93,7 @@ export function FindingInspector({ sel }: InspectorProps) {
   const obs = f.check?.observed
   const codeLocs = f.codeLocations ?? []
   return <>
-    <PaneHeader title="Finding" sub={<span className="mono">{short(f.id)}</span>} />
+    <PaneHeader title="Finding" sub={<span title={`Finding ${f.id}`}>{SEV_LABEL[f.severity] ?? f.severity} · {host(f.origin)}</span>} />
     <PaneBody><div className="d">
       {dec && <div className="banner"><Icon name={ACTIONS[dec.act].icon} />
         <span>{ACTIONS[dec.act].label} by you · {fmtTimeS(dec.at)} · local triage, saved in this browser only</span>

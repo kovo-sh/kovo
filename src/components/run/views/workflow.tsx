@@ -7,7 +7,7 @@ import type { ReactNode } from 'react'
 import { Dropdown, FilterBox, Tabs } from '../controls.tsx'
 import { useRun, useRunModel } from '../data.tsx'
 import { EmptyState, Kbd, KbdGroup, Seg } from '../display.tsx'
-import { fmtN, host, plural } from '../format.ts'
+import { fmtN, host, plural, readRunUrlParam, syncRunUrlParam } from '../format.ts'
 import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
@@ -23,6 +23,7 @@ import { isLive, QUEUE_ID, setExpanded, useWorkflowLayout } from './workflow-lay
 
 type Filter = 'all' | 'live' | 'complete' | 'findings' | 'failed'
 type Mode = 'graph' | 'list'
+const isWorkflowMode = (v: string | null): v is Mode => v === 'graph' || v === 'list'
 type Group = 'phase' | 'step' | 'status' | 'none'
 const GROUPS: [Group, string][] = [['phase', 'Phase'], ['step', 'Plan step'], ['status', 'Status'], ['none', 'None']]
 
@@ -32,10 +33,29 @@ export function WorkflowView() {
   const nav = useNav()
   const L = useWorkflowLayout()
   const runId = detail.run.id
-  const [mode, setMode] = useViewState<Mode>('wf.mode', 'graph')
+  const [mode, setModeState] = useViewState<Mode>('wf.mode', 'graph')
   const [filter, setFilter] = useViewState<Filter>('wf.filter', 'all')
   const [query, setQuery] = useViewState('wf.q', '')
   const [replay, setReplay] = useState(false)
+  const setMode = useCallback((next: Mode) => {
+    setModeState(next)
+    syncRunUrlParam('mode', next === 'graph' ? null : next)
+  }, [setModeState])
+  useEffect(() => {
+    const fromUrl = readRunUrlParam('mode')
+    if (isWorkflowMode(fromUrl)) {
+      if (fromUrl !== mode) setModeState(fromUrl)
+    } else if (mode !== 'graph') {
+      syncRunUrlParam('mode', mode)
+    }
+    const onPop = () => {
+      const u = readRunUrlParam('mode')
+      setModeState(isWorkflowMode(u) ? u : 'graph')
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
   const filterRef = useRef<HTMLInputElement>(null)
   const assignments = detail.assignments
 
@@ -176,23 +196,23 @@ function GroupMenu() {
   </Dropdown>
 }
 
-/** Cold-graph digests (LSM-compacted summaries of older facts), from the original trace. */
+/** Memory summaries (cold-graph digests: compacted summaries of older facts). */
 function DigestMenu() {
   const { detail } = useRun()
   const nav = useNav()
   const ds = detail.digests
   const active = ds.filter(d => d.active).length
-  return <Dropdown icon="archive" title="Cold-graph digests: compacted summaries of older facts" menuClassName="wf-dg-menu"
+  return <Dropdown icon="archive" title="Memory summaries (cold-graph digests): compacted summaries of older facts" menuClassName="wf-dg-menu"
     btnClassName={'btn ghost dd-btn' + (nav.sel?.kind === 'digest' ? ' on' : '')}
-    label={<><span className="dim wf-lbl">Digests</span><span className="num">{active || ds.length}</span></>}>
+    label={<><span className="dim wf-lbl">Summaries</span><span className="num">{active || ds.length}</span></>}>
     {close => <>
-      <div className="dd-sec">Cold-graph digests<span className="num" style={{ marginLeft: 'auto', fontWeight: 400 }}>{active} active · {ds.length} total</span></div>
+      <div className="dd-sec">Memory summaries<span className="num" style={{ marginLeft: 'auto', fontWeight: 400 }}>{active} active · {ds.length} total</span></div>
       {ds.map(d => <button key={d.id} type="button" role="menuitem" className={'dd-item wf-dg-item' + (nav.sel?.kind === 'digest' && nav.sel.id === d.id ? ' on' : '')}
         onClick={() => { close(); nav.select({ kind: 'digest', id: d.id }) }}>
-        <span className="wf-dg-t">Round {d.roundNo} · {d.level} digest{!d.active && <span className="dim"> · superseded</span>}</span>
+        <span className="wf-dg-t">Round {d.roundNo} · {d.level} summary{!d.active && <span className="dim"> · superseded</span>}</span>
         <span className="ct num">{plural(d.coveredFactIds.length, 'fact')} · {d.coveredAssignmentIds.length} w</span>
       </button>)}
-      <p className="wf-dg-note">Selecting a digest highlights the workers it covers.</p>
+      <p className="wf-dg-note">Selecting a summary highlights the workers it covers.</p>
     </>}
   </Dropdown>
 }

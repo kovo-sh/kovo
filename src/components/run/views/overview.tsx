@@ -1,13 +1,14 @@
 // Overview (B's written verdict at A's density). Waiting runs render the consent sheet.
 import { useMemo, useState } from 'react'
 import type { CSSProperties } from 'react'
+import { capabilityTierMeta } from '../../run-state.ts'
 import { useRun, useRunModel, useVerdict } from '../data.tsx'
 import { useDecisions } from '../decisions.tsx'
 import { HostLabel } from '../display.tsx'
 import { fmtDate, fmtDur, fmtN, fmtTime, fmtTok, fmtUsd, host } from '../format.ts'
 import { CovSwatch, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
-import { PHASE_LABEL, SEV, SEV_COL, SEV_LABEL, TIER_LINE } from '../meta.ts'
+import { PHASE_LABEL, SEV, SEV_COL, SEV_LABEL } from '../meta.ts'
 import type { ViewId } from '../meta.ts'
 import { bySeriousness, coverageCounts, trafficHistogram } from '../model.ts'
 import { AnimatedNumber, Meter } from '../motion.tsx'
@@ -68,7 +69,7 @@ function RunOverview() {
       <span className="sep">·</span>
       <span>{rep && !live ? `Report v${rep.version} · ${fmtDate(rep.createdAt)}` : `As of ${fmtDate(model.end)}`}</span>
       <span className="sep">·</span>
-      <span>{TIER_LINE[r.capabilityTier] ?? 'Tier ' + r.capabilityTier}</span>
+      <span title={`Tier ${r.capabilityTier} · ${capabilityTierMeta[r.capabilityTier].name}`}>{capabilityTierMeta[r.capabilityTier].short}</span>
     </div>
     <h1 className="hed">{v.hed}</h1>
     {worst && <p className="dek">
@@ -86,7 +87,7 @@ function RunOverview() {
         {long && <button type="button" className="linkbtn" onClick={() => setGoalOpen(!goalOpen)}>{goalOpen ? 'Show less' : 'Show full goal'}</button>}
       </div>
       <div>
-        <h3>What Guardian found</h3>
+        <h3>What Kovo Hunter found</h3>
         <div className="tally num">
           {tally.map(([sev, k]) => [
             <span key={sev + 'l'} className={'l' + (k ? '' : ' z')}><SevGlyph sev={sev} />{SEV_LABEL[sev]}</span>,
@@ -167,7 +168,7 @@ function RunOverview() {
         </div>
         <div className="ov-sec">
           <h4>Traffic<span className="ct num">{fmtN(counts.exchanges)} exchanges</span><Go to="exchanges">Exchanges</Go></h4>
-          <div className="hist" title="Brokered exchanges over time; red marks requests the broker denied">
+          <div className="hist" title="HTTP exchanges over time; red marks requests blocked by scope or rate limits">
             {hist.bins.map((b, i) => <i key={i} style={{ height: Math.max(1.5, (b[0] + b[1]) / hist.max * 40).toFixed(1) + 'px', animationDelay: `${i * 8}ms` }} title={`${b[0]} exchanges${b[1] ? ', ' + b[1] + ' denied' : ''}`}>
               {b[1] > 0 && <em style={{ height: Math.max(2, b[1] / (b[0] + b[1]) * 100) + '%' }} />}
             </i>)}

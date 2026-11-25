@@ -6,7 +6,7 @@ import { readGraphDigest, readWorkerSessionAction } from '../../../actions.ts'
 import type { WorkerSessionData } from '../../../server/worker-session-reader.ts'
 import { useRun, useRunModel } from '../data.tsx'
 import { EmptyState, LinkRow, Props, Section, Tag } from '../display.tsx'
-import { fmtDate, fmtN, fmtRel, fmtTimeS, host, plural, short } from '../format.ts'
+import { fmtAgo, fmtDate, fmtFullDateTime, fmtN, fmtRel, fmtTimeS, host, plural } from '../format.ts'
 import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { normFStatus, PHASE_LABEL, prettyCat, stLabel } from '../meta.ts'
@@ -47,6 +47,7 @@ function LineageRow({ L, id, other }: { L: WfLayout; id: string; other: string }
 }
 
 function FactItem({ f }: { f: Fact }) {
+  const model = useRunModel()
   const links = useLinks()
   const [open, setOpen] = useState(false)
   return <div className="ctx-item">
@@ -55,8 +56,19 @@ function FactItem({ f }: { f: Fact }) {
       <div className="ct"><b>{f.kind}</b> · <span className="mono">{host(f.origin)}</span>{f.tainted && <Tag className="wf-taint">tainted</Tag>}</div>
       <div className="cb">{f.summary}</div>
       <div className="wf-chips">
-        {f.exchangeIds.slice(0, 6).map(x => <button key={x} type="button" className="wf-chip mono" onClick={() => links.exchange(x)} title="Open the exchange">ex:{short(x)}<Icon name="arrowR" /></button>)}
-        {f.evidenceIds.slice(0, 6).map(x => <button key={x} type="button" className="wf-chip mono" onClick={() => links.evidence(x)} title="Open the evidence">ev:{short(x)}<Icon name="ext" /></button>)}
+        {f.exchangeIds.slice(0, 6).map(x => {
+          const ex = model.exchangeById.get(x)
+          const label = ex ? `${ex.method} ${ex.pathAndQuery.length > 28 ? ex.pathAndQuery.slice(0, 27) + '…' : ex.pathAndQuery} · ${ex.status}` : 'HTTP exchange'
+          const tip = ex ? `${ex.method} ${ex.origin}${ex.pathAndQuery} (${ex.status}) · ID ${x}` : `Open HTTP exchange · ID ${x}`
+          return <button key={x} type="button" className="wf-chip" onClick={() => links.exchange(x)} title={tip}>{label}<Icon name="arrowR" /></button>
+        })}
+        {f.evidenceIds.slice(0, 6).map(x => {
+          const ev = model.evidenceById.get(x)
+          const rawTitle = ev?.title ?? 'Evidence record'
+          const label = rawTitle.length > 30 ? rawTitle.slice(0, 29) + '…' : rawTitle
+          const tip = ev ? `${ev.title} (${ev.kind}) · ID ${x}` : `Open evidence · ID ${x}`
+          return <button key={x} type="button" className="wf-chip" onClick={() => links.evidence(x)} title={tip}>{label}<Icon name="ext" /></button>
+        })}
         <button type="button" className="wf-chip" onClick={() => setOpen(o => !o)} aria-expanded={open}>{open ? 'Hide data' : 'Data'}<Icon name={open ? 'chevU' : 'chevD'} /></button>
       </div>
       {open && <pre className="block mono wf-json">{JSON.stringify(f.data, null, 2)}</pre>}
@@ -192,7 +204,7 @@ export function WorkerInspector({ sel }: InspectorProps) {
   const a = model.workerById.get(sel.id)
   const session = useWorkerSession(detail.run.id, a)
   if (!a) {
-    return <><PaneHeader title="Worker" sub={<span className="mono">{short(sel.id)}</span>} />
+    return <><PaneHeader title="Worker" sub={<span title={`Worker ${sel.id}`}>Not found</span>} />
       <PaneBody><EmptyState icon="workers" title="Worker not found">It is not part of this run’s current data.</EmptyState></PaneBody></>
   }
   const step = a.stepId ? model.stepById.get(a.stepId) : model.stepByWorker.get(a.id)
@@ -211,7 +223,7 @@ export function WorkerInspector({ sel }: InspectorProps) {
   const nTurns = session.data ? session.data.turns.length : a.turnsUsed
   const nArts = session.data?.artifacts.length ?? 0
   return <>
-    <PaneHeader title="Worker" sub={<span className="mono">{short(a.id)}</span>}
+    <PaneHeader title="Worker" sub={<span title={`Worker ${a.id} · Started ${fmtFullDateTime(a.createdAt)}`} suppressHydrationWarning>{PHASE_LABEL[a.phase] ?? a.phase} · {fmtAgo(a.createdAt)}</span>}
       extra={<button type="button" className="icon-btn" title="Center in graph (↵)" aria-label="Center in graph" onClick={() => requestCamera({ type: 'center', id: rid })}><Icon name="fit" /></button>} />
     <PaneBody><div className="d">
       <div className="d-meta">
@@ -385,10 +397,10 @@ export function DigestInspector({ sel }: InspectorProps) {
       .then(data => setLoad({ state: 'done', data }), () => setLoad({ state: 'error' }))
   }
   return <>
-    <PaneHeader title="Graph digest" sub={'Round ' + d.roundNo} />
+    <PaneHeader title="Memory summary" sub={<span title={`Cold-graph digest ${d.id}`}>Round {d.roundNo}</span>} />
     <PaneBody><div className="d">
-      <div className="d-meta"><Tag>{d.level === 'major' ? 'Major' : 'Minor'} compaction</Tag><Tag tone={d.active ? undefined : 'warn'}>{d.active ? 'Active' : 'Superseded'}</Tag></div>
-      <h2>Cold-graph digest · round {d.roundNo}</h2>
+      <div className="d-meta"><Tag title="LSM compaction level">{d.level === 'major' ? 'Major' : 'Minor'} compaction</Tag><Tag tone={d.active ? undefined : 'warn'}>{d.active ? 'Active' : 'Superseded'}</Tag></div>
+      <h2 title="Cold-graph digest: compacted summary of older facts">Memory summary · round {d.roundNo}</h2>
       <Props rows={[
         ['Facts', fmtN(d.coveredFactIds.length)],
         ['Workers', fmtN(d.coveredAssignmentIds.length)],

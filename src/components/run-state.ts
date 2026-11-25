@@ -16,24 +16,24 @@ export const phaseNames: Record<Phase, string> = {
 
 export const capabilityTierMeta: Record<CapabilityTier, { name: string; short: string; summary: string }> = {
   0: {
-    name: 'Tier 0 · Offline Prepared',
-    short: 'Tier 0 · Offline',
-    summary: 'Zero live network traffic. Prepared metadata, DNS zone exports, lockfiles, and access policy records only.',
+    name: 'Offline Review',
+    short: 'Offline',
+    summary: 'No live network traffic. Reviews prepared exports, DNS records, lockfiles, and access policies only.',
   },
   1: {
-    name: 'Tier 1 · Deep Read-Only + Safe Probes',
-    short: 'Tier 1 · Read-Only',
-    summary: 'Approved GET/HEAD/OPTIONS, JS/API harvesting, scoped browser inspection, live DNS/TLS, CVE correlation, and benign read-only differential probes.',
+    name: 'Read-Only Scan',
+    short: 'Read-Only',
+    summary: 'Safe read-only HTTP checks, JavaScript and API discovery, scoped browser inspection, live DNS/TLS checks, and benign verification probes.',
   },
   2: {
-    name: 'Tier 2 · Multi-Persona Validation',
-    short: 'Tier 2 · Multi-Persona',
-    summary: 'Tier 1 plus opaque persona auth injection on allowlisted origins and bounded synchronized bursts for BOLA/IDOR, RBAC, and session checks.',
+    name: 'Authenticated Testing',
+    short: 'Authenticated',
+    summary: 'Includes read-only checks plus signed-in testing with your test accounts on approved hosts for cross-account access, role, and session checks.',
   },
   3: {
-    name: 'Tier 3 · Approval-Gated State & Execution',
-    short: 'Tier 3 · Approval-Gated',
-    summary: 'Tier 2 plus policy-gated state probes and strictly non-destructive RCE proof-of-execution.',
+    name: 'Active Testing (Approval-Gated)',
+    short: 'Active (Gated)',
+    summary: 'Includes authenticated testing plus approval-gated state checks and strictly non-destructive proof-of-execution verification.',
   },
 }
 
@@ -47,19 +47,19 @@ export const approvalPolicyMeta: Record<ApprovalPolicy, {
     label: 'Auto-Review',
     short: 'Auto-Review',
     optionLabel: 'Auto-Review (Recommended)',
-    summary: 'Fast-paths benign/read-only probes, evaluates grey-area writes via an independent Safety-Judge LLM, and always escalates DELETE, uploads, billing/admin, and RCE probes.',
+    summary: 'Fast-paths safe read-only checks, reviews write requests with an independent safety checker, and always asks you before deletes, uploads, billing/admin actions, or execution checks.',
   },
   yolo: {
-    label: 'YOLO',
-    short: 'YOLO',
-    optionLabel: 'YOLO (Autonomous)',
-    summary: 'Auto-approves all in-scope Tier 3 probes with full audit logging. Hard broker invariants (scope, SSRF/RFC1918 block, destructive/webshell denylist, RPS cap, circuit breakers) remain enforced.',
+    label: 'Autonomous',
+    short: 'Autonomous',
+    optionLabel: 'Autonomous (Auto-approve in scope)',
+    summary: 'Automatically approves all in-scope active checks with full audit logging. Hard safety guardrails (approved hosts only, private network block, destructive denylist, rate limits, and circuit breakers) remain enforced.',
   },
   strict: {
-    label: 'Strict',
-    short: 'Strict',
-    optionLabel: 'Strict (Manual HITL)',
-    summary: 'Every Tier 3 state-changing probe pauses and requires explicit manual operator approval.',
+    label: 'Manual Approval',
+    short: 'Manual',
+    optionLabel: 'Manual (Approve every write)',
+    summary: 'Pauses and requires your explicit approval before every state-changing test request.',
   },
 }
 

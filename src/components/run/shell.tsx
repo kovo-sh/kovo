@@ -1,13 +1,13 @@
 // The run workspace shell: providers, rail, run line header, view outlet,
 // resizable inspector pane, global keyboard model, palette, toasts.
-import { useNavigate } from '@tanstack/react-router'
+import { Link, useNavigate } from '@tanstack/react-router'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { BoardPane, useBoardSeen } from './coordinator.tsx'
 import { RunDataProvider, useRun } from './data.tsx'
 import type { Detail } from './model.ts'
 import { DecisionsProvider, useDecisions } from './decisions.tsx'
-import { fmtUsd, fmtN } from './format.ts'
+import { fmtUsd, fmtN, RUN_SUBMODE_PARAMS } from './format.ts'
 import { RunHeader } from './header.tsx'
 import { Icon } from './icons.tsx'
 import { KeyboardProvider, useShortcuts } from './keyboard.tsx'
@@ -35,8 +35,29 @@ export function landingView(d: Detail): ViewId {
 export function RunShell({ detail, view, sel }: { detail: Detail; view: ViewId; sel: Sel | null }) {
   const navigate = useNavigate()
   const runId = detail.run.id
+  const curViewRef = useRef(view)
+  curViewRef.current = view
   const go = useCallback((v: ViewId, s: Sel | null, push: boolean) => {
-    void navigate({ to: '/runs/$runId', params: { runId }, search: { view: v, sel: s ? selKey(s) : undefined }, replace: !push, resetScroll: false })
+    const keepSubModes: [string, string][] = []
+    if (v === curViewRef.current && typeof window !== 'undefined') {
+      const sp = new URLSearchParams(window.location.search)
+      for (const k of RUN_SUBMODE_PARAMS) {
+        const val = sp.get(k)
+        if (val) keepSubModes.push([k, val])
+      }
+    }
+    void navigate({ to: '/runs/$runId', params: { runId }, search: { view: v, sel: s ? selKey(s) : undefined }, replace: !push, resetScroll: false }).then(() => {
+      if (!keepSubModes.length || typeof window === 'undefined') return
+      const url = new URL(window.location.href)
+      let changed = false
+      for (const [k, val] of keepSubModes) {
+        if (url.searchParams.get(k) !== val) {
+          url.searchParams.set(k, val)
+          changed = true
+        }
+      }
+      if (changed) window.history.replaceState(window.history.state, '', url.pathname + url.search + url.hash)
+    })
   }, [navigate, runId])
   const switchRun = useCallback((id: string, v?: ViewId) => {
     void navigate({ to: '/runs/$runId', params: { runId: id }, search: v ? { view: v } : {} })
@@ -158,9 +179,9 @@ function RunBanners() {
     {model.needsModel && <div className="rbanner warn" role="status">
       <Icon name="alert" />
       <span className="grow"><b>Connect a model to continue.</b> No enabled model profile; settings bring you back here.</span>
-      <a className="btn" href={`/settings?runId=${encodeURIComponent(r.id)}`}>Set up model<Icon name="arrowR" /></a>
+      <Link className="btn" to="/settings" search={{ runId: r.id }}>Set up model<Icon name="arrowR" /></Link>
     </div>}
-    {connection === 'reconnecting' && <div className="rbanner" role="status"><Icon name="activity" /><span className="grow">Reconnecting to Guardian… the view keeps the last data it had.</span></div>}
+    {connection === 'reconnecting' && <div className="rbanner" role="status"><Icon name="activity" /><span className="grow">Reconnecting to Kovo Hunter… the view keeps the last data it had.</span></div>}
   </>
 }
 

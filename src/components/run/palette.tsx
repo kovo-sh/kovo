@@ -7,11 +7,12 @@
 // Sections render in this order: Views, Runs, Findings, Workers, Hosts, Actions
 // (any other section name is appended). With an empty query the palette shows
 // Views, Runs, Actions and the top five findings.
+import { useNavigate } from '@tanstack/react-router'
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useRun } from './data.tsx'
 import { Kbd, KbdGroup } from './display.tsx'
-import { host, modKey, runLabel, short } from './format.ts'
+import { fmtAgo, fmtFullDateTime, host, modKey, runLabel, short } from './format.ts'
 import { SevGlyph, StatusGlyph } from './glyphs.tsx'
 import { Icon } from './icons.tsx'
 import type { IconName } from './icons.tsx'
@@ -95,6 +96,7 @@ function Highlight({ text, q }: { text: string; q: string }) {
 
 function useBaseCommands(): PaletteCommand[] {
   const { model, runs } = useRun()
+  const navigate = useNavigate()
   const nav = useNav()
   const links = useLinks()
   const pal = usePalette()
@@ -103,10 +105,11 @@ function useBaseCommands(): PaletteCommand[] {
     const out: PaletteCommand[] = []
     VIEWS.forEach(v => out.push({ id: 'view.' + v.id, section: 'Views', label: 'Go to ' + v.label, icon: v.icon, keys: ['G', v.key.toUpperCase()], run: () => nav.setView(v.id) }))
     runs.forEach(r => out.push({
-      id: 'run.' + r.id, section: 'Runs', label: runLabel(r.goal), sub: r.goal + ' ' + r.projectName,
-      icon: <StatusGlyph status={r.status} />, right: short(r.id) + ' · ' + runStatusLabel(r.status), run: () => nav.switchRun(r.id),
+      id: 'run.' + r.id, section: 'Runs', label: runLabel(r.goal), sub: r.goal + ' ' + r.projectName + ' ' + r.id,
+      icon: <StatusGlyph status={r.status} />, right: r.projectName + ' · ' + fmtAgo(r.createdAt) + ' · ' + runStatusLabel(r.status), run: () => nav.switchRun(r.id),
     }))
     out.push({ id: 'act.chat', section: 'Actions', label: 'Open the board · message the coordinator', icon: 'chat', keys: ['C'], run: () => nav.openChat(null) })
+    out.push({ id: 'act.settings', section: 'Actions', label: 'Open settings', icon: 'sliders', run: () => void navigate({ to: '/settings', search: { runId: model.run.id } }) })
     out.push({ id: 'act.pane', section: 'Actions', label: nav.paneCollapsed ? 'Show right panel' : 'Hide right panel', icon: 'panelR', keys: [']'], run: () => nav.togglePane() })
     out.push({ id: 'act.theme', section: 'Actions', label: 'Toggle light / dark theme', icon: theme === 'dark' ? 'sun' : 'moon', keys: ['⇧', 'T'], run: toggle })
     out.push({ id: 'act.help', section: 'Actions', label: 'Show keyboard shortcuts', icon: 'keyboard', keys: ['?'], run: pal.openHelp })
@@ -120,13 +123,13 @@ function useBaseCommands(): PaletteCommand[] {
       id: 'h.' + o.origin, section: 'Hosts', label: o.host, icon: <span style={{ color: 'var(--fg-3)', display: 'flex' }}><Icon name="globe" /></span>, right: RISKL[o.tier], run: () => links.host(o.origin),
     }))
     return out
-  }, [model, runs, nav, links, pal, theme, toggle])
+  }, [model, runs, navigate, nav, links, pal, theme, toggle])
 }
 
 function Palette({ prefill }: { prefill: string }) {
   const pal = usePalette()
   const base = useBaseCommands()
-  const { model } = useRun()
+  const { detail, model } = useRun()
   const [q, setQ] = useState(prefill)
   const [idx, setIdx] = useState(0)
   const listRef = useRef<HTMLDivElement>(null)
@@ -165,7 +168,7 @@ function Palette({ prefill }: { prefill: string }) {
             else if (e.key === 'ArrowUp' || (e.ctrlKey && e.key === 'p')) { e.preventDefault(); setIdx(Math.max(0, cur - 1)) }
             else if (e.key === 'Enter') { e.preventDefault(); run(cur) }
           }} />
-        <span className="pal-scope mono">{short(model.run.id)}</span>
+        <span className="pal-scope" title={`${detail.project.name} · Started ${fmtFullDateTime(model.run.createdAt)} · Run ${short(model.run.id)}`} suppressHydrationWarning>{detail.project.name} · {fmtAgo(model.run.createdAt)}</span>
       </div>
       <div className="pal-list" ref={listRef} role="listbox">
         {!items.length && <div className="pal-empty">No matches for “{q}”</div>}

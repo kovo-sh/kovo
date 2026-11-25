@@ -153,7 +153,7 @@ export function DecisionsProvider({ children }: { children: ReactNode }) {
 
   const reopen = useCallback((key: string) => {
     const d = all[key]
-    if (d && d.state === 'sent') { toast.show('Already sent to Guardian; it can’t be moved back.'); return }
+    if (d && d.state === 'sent') { toast.show('Already sent to Kovo Hunter; it can’t be moved back.'); return }
     if (d?.state === 'pending') { toast.undoLast(); return }
     order.current = order.current.filter(k => k !== key)
     update(prev => { const n = { ...prev }; delete n[key]; return n })

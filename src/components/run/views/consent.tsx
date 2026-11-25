@@ -22,7 +22,6 @@ import { cap, fmtN, fmtUsd, host, plural, words } from '../format.ts'
 import { StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
-import { TIER_SHORT } from '../meta.ts'
 import { useOverlays } from '../overlays.tsx'
 import { LabPanel } from './lab.tsx'
 import { useToast } from '../toast.tsx'
@@ -102,11 +101,11 @@ function ScopeCard({ editing, draft, setDraft, footer }: {
       </span>}
     </div>
     <div className="kv num">
-      {kv('Capability', canEditConfig
-        ? <select value={draft.capabilityTier} onChange={e => setDraft(d => ({ ...d, capabilityTier: Number(e.target.value) as CapabilityTier }))} aria-label="Capability tier">
-          {([0, 1, 2, 3] as const).map(t => <option key={t} value={t}>{capabilityTierMeta[t].short}</option>)}
+      {kv('Testing mode', canEditConfig
+        ? <select value={draft.capabilityTier} onChange={e => setDraft(d => ({ ...d, capabilityTier: Number(e.target.value) as CapabilityTier }))} aria-label="Testing mode">
+          {([0, 1, 2, 3] as const).map(t => <option key={t} value={t}>{capabilityTierMeta[t].name}</option>)}
         </select>
-        : <>Tier {draft.capabilityTier} · {TIER_SHORT[draft.capabilityTier]}</>)}
+        : <span title={`Tier ${draft.capabilityTier}`}>{capabilityTierMeta[draft.capabilityTier].name}</span>)}
       {kv('Budget', canEditConfig
         ? <span style={{ display: 'flex', gap: 4 }}>
           <input className="field-in num" type="number" min={0.1} max={500} step="any" value={draft.budgetUsd} aria-label="Budget USD" style={{ width: 74, height: 26 }} onChange={e => setDraft(d => ({ ...d, budgetUsd: Number(e.target.value) }))} />
@@ -125,7 +124,7 @@ function ScopeCard({ editing, draft, setDraft, footer }: {
       {kv('Test accounts', draft.approvedPersonaIds.length && draft.capabilityTier >= 2 ? plural(draft.approvedPersonaIds.length, 'test account') : 'None (anonymous)')}
     </div>
     {canEditConfig && detail.personas.length > 0 && <div className="sheet-x">
-      <span className="muted">Bind test accounts{draft.capabilityTier < 2 ? ' (Tier 2 or 3)' : ''}</span>
+      <span className="muted">Bind test accounts{draft.capabilityTier < 2 ? ' (requires Authenticated or Active mode)' : ''}</span>
       {detail.personas.map(p => <label key={p.id} className="chk">
         <input type="checkbox" disabled={draft.capabilityTier < 2} checked={draft.approvedPersonaIds.includes(p.id)}
           onChange={e => setDraft(d => ({ ...d, approvedPersonaIds: e.target.checked ? [...d.approvedPersonaIds, p.id] : d.approvedPersonaIds.filter(x => x !== p.id) }))} />
@@ -151,7 +150,7 @@ function ScopeCard({ editing, draft, setDraft, footer }: {
   </div>
 }
 
-const STEPS: [string, string][] = [['Consent', 'Approve hosts, tier and budget.'], ['Threat model', 'Rank hosts by attack surface.'], ['Investigation', 'Workers probe through the broker.'], ['Verification', 'Zero-LLM replay of every finding.'], ['Report', 'Findings, coverage and gaps.']]
+const STEPS: [string, string][] = [['Consent', 'Approve hosts, mode, and budget.'], ['Threat model', 'Rank hosts by attack surface.'], ['Investigation', 'Workers test through the safety proxy.'], ['Verification', 'Automated replay confirms every finding.'], ['Report', 'Findings, coverage, and gaps.']]
 
 /** Overview for a waiting run: "Nothing has been sent yet." */
 export function ConsentView() {
@@ -175,7 +174,7 @@ export function ConsentView() {
     const command: Command = discovery ? { action: 'discover', consent: true } : scopeCommand(r, draft)
     q.decide(ck, 'scope', {
       command,
-      message: discovery ? `Discovery approved for ${plural(hosts.length, 'host')}` : `Scope approved for ${plural(count, 'host')} at Tier ${draft.capabilityTier}`,
+      message: discovery ? `Discovery approved for ${plural(hosts.length, 'host')}` : `Scope approved for ${plural(count, 'host')} (${capabilityTierMeta[draft.capabilityTier].short})`,
     })
     setEditing(false)
   }
@@ -187,11 +186,11 @@ export function ConsentView() {
   return <div className="consent"><div className="consent-in">
     <span className="eyebrow"><StatusGlyph status={scoped ? 'complete' : 'waiting'} />{eyebrow}</span>
     <div className="display">Nothing has been sent <em>yet.</em></div>
-    <p className="lede">The coordinator received the goal “{r.goal}” and is holding until you approve the {discovery ? 'discovery' : 'scope'} below. No request leaves the broker before that.</p>
+    <p className="lede">The coordinator received the goal “{r.goal}” and is holding until you approve the {discovery ? 'discovery' : 'scope'} below. No request leaves Kovo Hunter before that.</p>
     {nw < 6 && <div className="callout"><Icon name="alert" /><div>This goal is {words(nw)} word{nw === 1 ? '' : 's'} long. The coordinator will plan broadly across all {plural(count, 'host')}. Sharpen it in the coordinator chat to focus the {fmtUsd(draft.budgetUsd)} budget.</div></div>}
     <ScopeCard editing={editing} draft={draft} setDraft={setDraft} footer={
       <div className="sheet-f">
-        <span className="muted">{overLimit ? `Choose up to ${maxScopeHosts} hosts.` : draft.capabilityTier === 3 ? 'Tier 3 requests will still ask before sending.' : `Approving authorizes a scoped defensive assessment at Tier ${draft.capabilityTier}.`}</span>
+        <span className="muted">{overLimit ? `Choose up to ${maxScopeHosts} hosts.` : draft.capabilityTier === 3 ? 'State-changing requests will still ask before sending.' : `Approving authorizes a scoped defensive assessment (${capabilityTierMeta[draft.capabilityTier].short}).`}</span>
         {scoped
           ? decision!.state !== 'sent' && <button type="button" className="btn" onClick={() => q.reopen(ck)}><Icon name="undo" />Undo</button>
           : <>
