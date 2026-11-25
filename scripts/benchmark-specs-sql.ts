@@ -88,6 +88,23 @@ function booleanModeFor(o: HypothesisOutcome): 'boolean' | 'status' {
   return statusOnly ? 'status' : 'boolean'
 }
 
+/** Write a value at a dotted JSON path (`filter.name` -> `{ filter: { name } }`). */
+function setDottedPath(target: Record<string, unknown>, path: string, value: unknown): void {
+  const parts = path.split('.').map(part => part.trim()).filter(Boolean)
+  if (parts.length <= 1) {
+    target[path] = value
+    return
+  }
+  let node = target
+  for (const key of parts.slice(0, -1)) {
+    const next = node[key]
+    node = next !== null && typeof next === 'object' && !Array.isArray(next)
+      ? next as Record<string, unknown>
+      : (node[key] = {} as Record<string, unknown>)
+  }
+  node[parts[parts.length - 1]!] = value
+}
+
 function cut3RecipeEnvelope(
   o: HypothesisOutcome,
   env: ProbeEnv,
@@ -177,16 +194,15 @@ function cut3RecipeEnvelope(
     }
     if (location === 'graphql_var') {
       const variables = { ...((fields.jsonBody as { variables?: Record<string, unknown> } | undefined)?.variables ?? {}) }
-      variables[fields.paramName] = value
+      setDottedPath(variables, fields.paramName, value)
       return {
         pathAndQuery: fields.pathAndQuery,
         jsonBody: { ...(o.ctx?.graphqlQuery ? { query: o.ctx.graphqlQuery } : {}), variables },
       }
     }
-    return {
-      pathAndQuery: fields.pathAndQuery,
-      jsonBody: { ...((fields.jsonBody as Record<string, unknown> | undefined) ?? {}), [fields.paramName]: value },
-    }
+    const body = { ...((fields.jsonBody as Record<string, unknown> | undefined) ?? {}) }
+    setDottedPath(body, fields.paramName, value)
+    return { pathAndQuery: fields.pathAndQuery, jsonBody: body }
   }
   const baseline = selection.baselineValue
   const delayMs = Math.max(1500, Math.min(3000, Math.round(selection.delayMs ?? 2500)))

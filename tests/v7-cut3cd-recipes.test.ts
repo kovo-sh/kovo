@@ -403,3 +403,31 @@ describe('cut3cd: SQL recipe carrier coverage', () => {
     assert.match(String((args.probeRequest as { pathAndQuery?: string }).pathAndQuery), /RANDOMBLOB|SLEEP|pg_sleep|WAITFOR/)
   })
 })
+
+describe('cut3cd: dotted JSON parameter carriers', () => {
+  test('a nested parameter is written as a nested object, not a literal dotted key', () => {
+    const outcome = {
+      hyp: {
+        endpoint: { origin, path: '/api/v1/analytics/query', method: 'POST', params: [{ name: 'filter.name', location: 'json' }] },
+        method: 'POST',
+        path: '/api/v1/analytics/query',
+        param: { name: 'filter.name', location: 'json' },
+        location: 'json',
+      },
+      verdict: 'signal',
+      anomalies: [{ type: 'sql_time_differential', style: 'single_quote', dialect: 'sqlite', delayMs: 1500, baselineValue: 'load' }],
+      details: {},
+      csrfRejected: false,
+      contextReset: false,
+      tierBlocked: false,
+      requests: 4,
+      ctx: { baseline: 'load' },
+    } as unknown as HypothesisOutcome
+    const specs = synthSqlTime(outcome, { origin, owner: 'owner', caps: { sessionAndCsrf: false }, session: 's' } as unknown as ProbeEnv)
+    const args = (specs[0]!.spec as { recipe: { args: Record<string, unknown> } }).recipe.args
+    const probe = args.probeRequest as { jsonBody?: { filter?: { name?: string } } }
+    assert.ok(probe.jsonBody?.filter, 'the injected value must live under body.filter')
+    assert.match(String(probe.jsonBody?.filter?.name), /RANDOMBLOB|SLEEP|pg_sleep|WAITFOR/)
+    assert.equal((probe.jsonBody as Record<string, unknown>)['filter.name'], undefined, 'no literal dotted key')
+  })
+})
