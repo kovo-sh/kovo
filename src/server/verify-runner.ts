@@ -40,9 +40,9 @@ import type {
 export const GUARDIAN_VERIFY_STDERR_PREVIEW_MAX_CHARS = 400
 
 export const GUARDIAN_VERIFY_USAGE_HINT =
-  'Inline TS scripts receive `ctx` directly (no imports required): `await ctx.prove_access_boundary({ controlPersona, probePersona, route }); return ctx.result({ title: "..." })` (or `export default async (ctx) => { ... }`). Python `ctx.*` helpers are synchronous (no `await` needed).'
+  'Inline TS scripts receive `ctx` directly (no imports required): `await ctx.prove_access_boundary({ controlPersona, probePersona, route }); return ctx.result({ title: "..." })` (or `export default async (ctx) => { ... }`).'
 
-/** Strip accidental outer markdown code fences (```ts ... ``` / ```python ... ```) from LLM scripts. */
+/** Strip accidental outer markdown code fences (```ts ... ```) from LLM scripts. */
 function stripCodeFences(rawCode: string): string {
   const trimmed = rawCode.trim()
   const match = /^```[a-zA-Z0-9_-]*[ \t]*\r?\n([\s\S]*?)\r?\n```$/.exec(trimmed)
@@ -125,43 +125,14 @@ function splitLeadingTsImports(code: string): { imports: string; body: string } 
  *
  * Idempotent: calling twice produces the exact same output. Never fabricates claims.
  */
-export function prepareVerifyScript(rawCode: string, runtime: 'ts' | 'python', defaultTitle?: string): string {
+export function prepareVerifyScript(rawCode: string, runtime: 'ts' = 'ts', defaultTitle?: string): string {
+  if (runtime !== 'ts') {
+    throw new Error(`Unsupported verification runtime: ${String(runtime)}. guardian_verify supports TypeScript only (runtime='ts').`)
+  }
   const unfenced = stripCodeFences(rawCode)
   const trimmed = unfenced.trim()
   if (!trimmed) return rawCode
   const titleLiteral = JSON.stringify(defaultTitle?.trim() || 'Verification script proof')
-
-  if (runtime === 'python') {
-    if (/\b(?:run|run_entrypoint|_guardian_run)\s*\(/.test(trimmed) || /\bGUARDIAN_PROOF_RESULT_FILE\b/.test(trimmed)) {
-      return unfenced
-    }
-    if (/^[ \t]*(?:async\s+)?def\s+verify\s*\(/m.test(trimmed)) {
-      return [
-        unfenced,
-        '',
-        'from guardian_verify import run_entrypoint as _guardian_run',
-        `_guardian_run(verify, setup=globals().get("setup"), cleanup=globals().get("cleanup"), default_title=${titleLiteral})`,
-        '',
-      ].join('\n')
-    }
-    if (/\bctx\b/.test(trimmed)) {
-      const defPrefix = /\bawait\b/.test(trimmed) ? 'async def' : 'def'
-      const indented = unfenced
-        .split(/\r?\n/)
-        .map(line => (line.trim() ? `    ${line}` : ''))
-        .join('\n')
-      return [
-        'from guardian_verify import run_entrypoint as _guardian_run',
-        '',
-        `${defPrefix} _guardian_inline_verify(ctx):`,
-        indented,
-        '',
-        `_guardian_run(_guardian_inline_verify, default_title=${titleLiteral})`,
-        '',
-      ].join('\n')
-    }
-    return unfenced
-  }
 
   // TypeScript runtime
   const normalized = normalizeTsSdkImports(unfenced)
@@ -211,7 +182,7 @@ export function prepareVerifyScript(rawCode: string, runtime: 'ts' | 'python', d
 
 export interface VerificationCandidate {
   name: string
-  runtime: 'ts' | 'python'
+  runtime: 'ts'
   code: string
   title?: string
 }
@@ -733,13 +704,12 @@ const SCRIPT_OUTPUT_MAX_BYTES = 512 * 1024
 
 function copySdkFiles(sdkDir: string, targetDir: string) {
   if (!existsSync(sdkDir)) throw new Error('guardian_verify SDK directory is missing.')
-  for (const file of ['guardian_verify.ts', 'guardian_verify.py']) {
-    const source = join(sdkDir, file)
-    if (!existsSync(source)) continue
-    if (statSync(source).size > 256 * 1024) throw new Error('SDK file exceeds the size limit.')
-    copyFileSync(source, join(targetDir, basename(file)))
-    chmodSync(join(targetDir, basename(file)), 0o644)
-  }
+  const file = 'guardian_verify.ts'
+  const source = join(sdkDir, file)
+  if (!existsSync(source)) throw new Error('guardian_verify.ts SDK file is missing.')
+  if (statSync(source).size > 256 * 1024) throw new Error('SDK file exceeds the size limit.')
+  copyFileSync(source, join(targetDir, basename(file)))
+  chmodSync(join(targetDir, basename(file)), 0o644)
 }
 
 
@@ -754,7 +724,6 @@ export interface LocalAttemptServer {
 export interface LocalAttemptFactoryBaseOptions {
   sdkDir: string
   nodePath?: string
-  pythonPath?: string
   timeoutMs?: number
   /** Cap for stdout/stderr returned to the verifier (script stdout is never evidence anyway). */
   maxOutputBytes?: number
@@ -778,7 +747,6 @@ export function buildLocalAttemptFactory(
           nonce: input.nonce,
           sdkDir: options.sdkDir,
           ...(options.nodePath ? { nodePath: options.nodePath } : {}),
-          ...(options.pythonPath ? { pythonPath: options.pythonPath } : {}),
           ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
           ...(options.maxOutputBytes ? { maxOutputBytes: options.maxOutputBytes } : {}),
           signal,
@@ -798,7 +766,6 @@ export interface RunCandidateLocallyOptions {
   nonce: string
   sdkDir: string
   nodePath?: string
-  pythonPath?: string
   timeoutMs?: number
   maxOutputBytes?: number
   signal?: AbortSignal
@@ -808,18 +775,18 @@ export async function runCandidateLocally(
   candidate: VerificationCandidate,
   options: RunCandidateLocallyOptions,
 ): Promise<AttemptExecution> {
+  if (candidate.runtime !== 'ts') {
+    throw new Error(`Unsupported verification runtime: ${String(candidate.runtime)}. guardian_verify supports TypeScript only (runtime='ts').`)
+  }
   const dir = mkdtempSync(join(tmpdir(), 'guardian-verify-candidate-'))
   const resultPath = join(dir, 'result.json')
   try {
     copySdkFiles(options.sdkDir, dir)
-    const extension = candidate.runtime === 'python' ? '.py' : '.ts'
-    const scriptPath = join(dir, `candidate${extension}`)
-    const preparedCode = prepareVerifyScript(candidate.code, candidate.runtime, candidate.title)
+    const scriptPath = join(dir, 'candidate.ts')
+    const preparedCode = prepareVerifyScript(candidate.code, 'ts', candidate.title)
     writeFileSync(scriptPath, preparedCode, { mode: 0o600 })
-    const command = candidate.runtime === 'python'
-      ? (options.pythonPath ?? 'python3')
-      : (options.nodePath ?? process.execPath)
-    const args = candidate.runtime === 'python' ? ['-s', scriptPath] : [scriptPath]
+    const command = options.nodePath ?? process.execPath
+    const args = [scriptPath]
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       [VERIFY_RPC_SOCKET_ENV]: options.socketPath,

@@ -60,16 +60,16 @@ export interface OfflineScriptResult {
 
 /** guardian_verify script execution (Layer-3 SDK staged into the sandbox at call time). */
 export interface VerifyScriptRequest {
-  runtime: 'ts' | 'python'
+  runtime: 'ts'
   code: string
   nonce: string
-  /** SDK source files (zero-dep TS/Python) written next to the script. */
+  /** SDK source files (zero-dep TypeScript) written next to the script. */
   sdkFiles?: Array<{ name: string; content: string }>
   timeoutMs?: number
 }
 
 export interface VerifyScriptResult {
-  runtime: 'ts' | 'python'
+  runtime: 'ts'
   exitCode: number
   /** Parsed proof document (claims only; stdout is never evidence). */
   result: unknown
@@ -151,7 +151,7 @@ const maxToolCaptureBytes = 8 * 1024 * 1024
 // so the spill threshold must stay meaningfully below that.
 const IPC_SPILL_THRESHOLD = 48 * 1024
 const IPC_SPILL_DIR = process.env.GUARDIAN_IPC_DIR || '/tmp/guardian-ipc'
-const cleanSdkName = /^guardian_verify\.(?:ts|py)$/
+const cleanSdkName = /^guardian_verify\.ts$/
 const cleanPath = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}(?:\/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}){0,3}$/
 const cleanOutputName = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/
 const cleanRepoName = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}(?:\/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}){0,3}$/
@@ -1235,15 +1235,16 @@ async function runOfflineScript(req: OfflineScriptRequest, inputDirectory: strin
 // ============================================================================
 
 async function runVerifyScript(req: VerifyScriptRequest): Promise<VerifyScriptResult> {
-  if (req.runtime !== 'ts' && req.runtime !== 'python') throw new Error('Unsupported verification runtime.')
+  if (req.runtime !== 'ts') {
+    throw new Error(`Unsupported verification runtime: ${String(req.runtime)}. guardian_verify supports TypeScript only (runtime='ts').`)
+  }
   if (typeof req.code !== 'string' || !req.code.trim()) throw new Error('Verification script code must be non-empty.')
   if (Buffer.byteLength(req.code) > maxScriptCodeBytes) throw new Error('Verification script exceeds 256 KiB limit.')
   if (typeof req.nonce !== 'string' || !/^[a-f0-9]{16,128}$/i.test(req.nonce)) throw new Error('Verification nonce is invalid.')
   const timeoutMs = Math.max(1_000, Math.min(req.timeoutMs ?? 90_000, 120_000))
   const dir = await mkdtemp(join(tmpdir(), 'guardian-verify-'))
   const resultPath = join(dir, 'result.json')
-  const extension = req.runtime === 'python' ? '.py' : '.ts'
-  const scriptPath = join(dir, 'candidate' + extension)
+  const scriptPath = join(dir, 'candidate.ts')
   try {
     await writeFile(scriptPath, req.code, { mode: 0o600 })
     let sdkBytes = 0
@@ -1254,13 +1255,7 @@ async function runVerifyScript(req: VerifyScriptRequest): Promise<VerifyScriptRe
       if (sdkBytes > 512 * 1024) throw new Error('Verification SDK files exceed the size limit.')
       await writeFile(join(dir, file.name), file.content, { mode: 0o600 })
     }
-    const cmd = req.runtime === 'python'
-      ? (existsSync(join(VENV_BIN, 'python3')) ? join(VENV_BIN, 'python3') : 'python3')
-      : process.execPath
-    const args = req.runtime === 'python'
-      ? ['-s', scriptPath]
-      : ['--max-old-space-size=256', scriptPath]
-    const res = await execTool(cmd, args, {
+    const res = await execTool(process.execPath, ['--max-old-space-size=256', scriptPath], {
       cwd: dir,
       timeoutMs,
       maxBytes: maxOutputBytes,
@@ -1280,7 +1275,7 @@ async function runVerifyScript(req: VerifyScriptRequest): Promise<VerifyScriptRe
       result = null
     }
     return {
-      runtime: req.runtime,
+      runtime: 'ts',
       exitCode: res.exitCode,
       result,
       stdout: secretMask(res.stdout).slice(0, maxOutputBytes),
