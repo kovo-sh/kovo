@@ -11,9 +11,9 @@ import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib'
 import ipaddr from 'ipaddr.js'
 import { referrerPolicies } from '../domain.ts'
 import type { ApprovalPolicy, ApprovedEndpointPattern, CapabilityTier, HttpMethod, PreparedObservation } from '../domain.ts'
-import { cacheBusterValueRegex, containsDestructivePayload, containsWebshellSignature } from '../replay-spec.ts'
+import { cacheBusterValueRegex, containsWebshellSignature } from '../replay-spec.ts'
 import type { AuthMutation, CsrfBind } from '../replay-spec.ts'
-import { computeStateChangeBodyHash, isLocalLabAutoApprovalOrigin } from './approval-judge.ts'
+import { isLocalLabAutoApprovalOrigin } from './approval-judge.ts'
 import type { StateChangeApprovalContext } from './approval-judge.ts'
 import { scanSecondOrderMarkers } from './canary-broker.ts'
 import type { CanaryBroker, SecondOrderStore } from './canary-broker.ts'
@@ -21,8 +21,14 @@ import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
 import { redact, redactHeaders, scanSecretHeaders, scanSecrets } from './redact.ts'
 import type { NamedSecret, SecretMatch } from './redact.ts'
-import { evaluateScopeRequest, isVerifiedReadOnlyGraphqlQuery, originRoleFor } from './scope-policy.ts'
-import type { EnvironmentMode, ScopeHook, ScopePolicy } from './scope-policy.ts'
+import type { ScopeHook, ScopePolicy } from './scope-policy.ts'
+import {
+  defaultRequestAdmissionEngine,
+  hasDestructiveContent,
+  isLocalLabEnabled,
+  RequestAdmissionEngine,
+} from './request-admission.ts'
+import type { AdmissionDecision, AdmissionRequest } from './request-admission.ts'
 import { globalKillSwitch, KillSwitchTrippedError } from './kill-switch.ts'
 import type { GlobalKillSwitch } from './kill-switch.ts'
 import {
@@ -405,9 +411,10 @@ export type BrokerOptions = {
   reauth?: (personaHandle: string, runId?: string, origin?: string) => Promise<boolean | void>
   /** v7 M4: optional kill-switch instance (defaults to process-wide `globalKillSwitch`). */
   killSwitch?: GlobalKillSwitch
+  /** Canonical request admission engine (defaults to `defaultRequestAdmissionEngine`). */
+  admissionEngine?: RequestAdmissionEngine
 }
 
-const maxPathLength = 8192
 const maxRedirects = 8
 const defaultMaxBodyBytes = 1024 * 1024
 const hardMaxBodyBytes = 2 * 1024 * 1024
@@ -420,25 +427,6 @@ const defaultWsTimeoutMs = 10_000
 const hardWsTimeoutMs = 20_000
 const bodyPreviewLimit = 8192
 const defaultRequestTimeoutMs = 30_000
-const forbiddenCallerHeaders = /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding|x-kovo-trace-id)$/i
-/**
- * A token-verification test needs to present a token the caller minted itself. Allow exactly the
- * unsigned shape: a three-segment JWT whose signature segment is empty. Such a token cannot carry a
- * real credential (it has no signature), cannot be replayed against a verifier that checks one, and
- * is the positive-only material of an `alg:none` / signature-bypass probe. Every other caller-set
- * Authorization value stays forbidden.
- */
-function isSelfMintedBearer(name: string, value: string): boolean {
-  if (!/^authorization$/i.test(name)) return false
-  const match = /^Bearer\s+([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.\s*$/i.exec(value)
-  if (!match) return false
-  try {
-    const header = JSON.parse(Buffer.from(match[1]!, 'base64url').toString('utf8')) as { alg?: unknown }
-    return typeof header?.alg === 'string' && /^(?:none|HS256|HS384|HS512|RS256|RS384|RS512|ES256)$/.test(header.alg)
-  } catch {
-    return false
-  }
-}
 const wsGuid = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 const sessionHandleRegex = /^[a-z0-9_-]{1,32}$/
 const csrfCookieNameRegex = /^(?:xsrf-token|csrf[_-]?token|_csrf|csrf)$/i
@@ -737,62 +725,6 @@ function extractCsrfFromBody(mediaType: string, body: string): Omit<StoredCsrfTo
   return null
 }
 
-function matchesSandboxWriteAllowlist(
-  origin: string,
-  pathname: string,
-  rawPathAndQuery: string,
-  patterns: readonly ApprovedEndpointPattern[],
-): boolean {
-  const rawPathOnly = rawPathAndQuery.split('?')[0] ?? rawPathAndQuery
-  if (
-    rawPathOnly.includes('..') ||
-    /%2e/i.test(rawPathOnly) ||
-    /%25/i.test(rawPathOnly) ||
-    pathname.includes('..') ||
-    /[\r\n\0\\]/.test(rawPathOnly)
-  ) {
-    return false
-  }
-  // Iteratively decode up to 3 passes to catch double/triple-encoded path traversal
-  let decoded = rawPathOnly
-  for (let pass = 0; pass < 3; pass += 1) {
-    let next: string
-    try {
-      next = decodeURIComponent(decoded)
-    } catch {
-      return false
-    }
-    if (next.includes('..') || /[\r\n\0\\]/.test(next)) return false
-    if (next === decoded) break
-    decoded = next
-  }
-  for (const pattern of patterns) {
-    let patOrigin: string
-    try {
-      patOrigin = new URL(pattern.origin).origin
-    } catch {
-      continue
-    }
-    if (patOrigin !== origin) continue
-    const patMethod = (pattern.method || 'POST').toUpperCase()
-    if (patMethod !== 'POST' && patMethod !== '*') continue
-
-    const rawPat = (pattern.pathPattern || '').trim()
-    if (!rawPat || !rawPat.startsWith('/')) continue
-    if (rawPat === '/*') return true
-    if (rawPat.endsWith('/*')) {
-      const prefix = rawPat.slice(0, -2)
-      if (pathname === prefix || pathname.startsWith(`${prefix}/`)) return true
-    } else if (rawPat.endsWith('*')) {
-      const prefix = rawPat.slice(0, -1)
-      if (pathname.startsWith(prefix)) return true
-    } else if (pathname === rawPat) {
-      return true
-    }
-  }
-  return false
-}
-
 function decodeJwtSegmentJson(seg: string): Record<string, unknown> | null {
   try {
     const raw = Buffer.from(seg, 'base64url').toString('utf8')
@@ -866,23 +798,6 @@ const errorInducingProbePattern = /(?:sqli|ssti|xxe|xpath|ldap|nosql|injection|t
 
 function isErrorInducingProbe(probeClass: string | undefined): boolean {
   return Boolean(probeClass && errorInducingProbePattern.test(probeClass))
-}
-
-function hasDestructiveContent(text: string): boolean {
-  if (containsDestructivePayload(text)) return true
-  try {
-    const decoded = decodeURIComponent(text.replaceAll('+', ' '))
-    if (decoded !== text && containsDestructivePayload(decoded)) return true
-  } catch {
-    // Malformed percent-encoding; still check simple + replacement.
-    const plusDecoded = text.replaceAll('+', ' ')
-    if (plusDecoded !== text && containsDestructivePayload(plusDecoded)) return true
-  }
-  return false
-}
-
-function allowLocalLab(grant: Grant): boolean {
-  return Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
 }
 
 export function isPublicAddress({ address }: PublicAddress): boolean {
@@ -986,40 +901,6 @@ function sessionCookiePolicy(headers: IncomingHttpHeaders): PublicObservation['s
   if (allSecure && allHttpOnly) return 'secure-httponly'
   if (allSecure) return 'secure-only'
   return 'insecure'
-}
-
-/**
- * Non-default ports are refused on public targets unless the operator explicitly
- * allowlists them (grant.allowedPorts) or exports KOVO_ALLOWED_PORTS=8080,8443.
- * This keeps the port invariant while permitting authorized staging origins.
- */
-function operatorApprovedPorts(): number[] {
-  const raw = process.env.KOVO_ALLOWED_PORTS
-  if (!raw) return []
-  const out: number[] = []
-  for (const part of raw.split(',')) {
-    const n = Number(part.trim())
-    if (Number.isInteger(n) && n > 0 && n <= 65535) out.push(n)
-  }
-  return out
-}
-
-function portAllowed(port: string, protocol: string, allowedPorts?: readonly number[]): boolean {
-  if (!port) return true
-  const defaultPort = protocol === 'https:' ? '443' : '80'
-  if (port === defaultPort) return true
-  const numeric = Number(port)
-  if (!Number.isInteger(numeric)) return false
-  return Boolean(allowedPorts?.includes(numeric)) || operatorApprovedPorts().includes(numeric)
-}
-
-function safeUrl(url: URL, allowQuery: boolean, localLab: boolean, allowedPorts?: readonly number[]): boolean {
-  const validProtocol = url.protocol === 'https:' || (localLab && url.protocol === 'http:')
-  if (!validProtocol || url.username || url.password || url.hash) return false
-  if (!localLab && !portAllowed(url.port, url.protocol, allowedPorts)) return false
-  if (!allowQuery && !localLab && url.search) return false
-  const full = url.pathname + url.search
-  return full.length <= maxPathLength && !url.pathname.startsWith('//') && !/[\r\n\0]/.test(full)
 }
 
 const routeUuidSegment = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -1746,6 +1627,7 @@ export class RequestBroker {
   private readonly seenGcbTokens = new Map<string, { probeClass: string; verifyUsed: boolean }>()
   private readonly transportConfig: TransportConfig
   private readonly httpTransport: Transport
+  private readonly admissionEngine: RequestAdmissionEngine
   /** Per-run scope revision floor so bumping Run A's scope never invalidates Run B. */
   private readonly latestScopeRevisionByRun = new Map<string, number>()
   private reauthHandler?: BrokerOptions['reauth']
@@ -1755,6 +1637,11 @@ export class RequestBroker {
     this.reauthHandler = options.reauth
     this.transportConfig = resolveTransportConfig(process.env, options.transportConfig)
     this.httpTransport = options.transport ?? createHttpTransport(this.transportConfig, defaultTransport)
+    this.admissionEngine = options.admissionEngine ?? defaultRequestAdmissionEngine
+  }
+
+  getAdmissionEngine(): RequestAdmissionEngine {
+    return this.admissionEngine
   }
 
   /** Attach or replace the broker's persona 401 re-authentication callback. */
@@ -2528,19 +2415,72 @@ export class RequestBroker {
     }
   }
 
-  /**
-   * Origin reachability for grants that carry a v6 scope policy. Target origins still require the
-   * run's `canRead` allowlist; auth/asset origins are transit-only and their allowed verbs are
-   * enforced by `evaluateScopeRequest` at the request boundary. Without a policy this is the
-   * unchanged v5 `canRead` check.
-   */
-  private originInGrantScope(grant: Grant, origin: string): boolean {
-    if (grant.scopePolicy) {
-      const role = originRoleFor(grant.scopePolicy, origin)
-      if (!role) return false
-      if (role === 'auth' || role === 'asset') return true
+  private toAdmissionRequest(req: BrokerHttpRequest, opts: { raceBurst?: boolean } = {}): AdmissionRequest {
+    return {
+      kind: 'http',
+      origin: req.origin,
+      method: req.method,
+      pathAndQuery: req.pathAndQuery,
+      headers: req.headers,
+      body: req.body,
+      multipartParts: req.multipartParts,
+      personaHandle: req.persona ?? req.personaHandle ?? null,
+      authMutation: req.authMutation,
+      scopeHook: req.scopeHook ?? null,
+      isRaceBurst: opts.raceBurst === true,
+      runId: req.runId,
+      assignmentId: req.assignmentId,
     }
-    return grant.canRead(origin)
+  }
+
+  private enforceAdmission(
+    decision: AdmissionDecision,
+    req: { pathAndQuery: string; persona?: string; secrets?: readonly NamedSecret[]; runId?: string },
+    grant: Grant,
+  ): asserts decision is AdmissionDecision & { outcome: 'allow'; normalizedOrigin: string; parsedUrl: URL } {
+    if (decision.outcome === 'allow') return
+    if (decision.outcome === 'require_approval') {
+      if (decision.matchedRule === 'tier3_redirect_approval_required' && decision.normalizedOrigin) {
+        this.auditDenied(
+          grant,
+          decision.normalizedOrigin,
+          {
+            reason: decision.reason,
+            method: decision.normalizedMethod,
+            path: req.pathAndQuery,
+            ...(req.persona ? { persona: req.persona } : {}),
+          },
+          req.secrets,
+        )
+      }
+      throw new BrokerApprovalRequired(decision.normalizedOrigin!, decision.normalizedMethod, req.pathAndQuery)
+    }
+    if (
+      decision.normalizedOrigin &&
+      (decision.reasonCode === 'out_of_scope' ||
+        decision.reasonCode === 'port_not_allowed' ||
+        decision.reasonCode === 'protocol_not_allowed')
+    ) {
+      this.purgeSessionJars(req.runId ?? grant.scopePolicy?.runId ?? undefined, decision.normalizedOrigin)
+    }
+    if (
+      decision.normalizedOrigin &&
+      decision.reasonCode !== 'tier_offline' &&
+      decision.reasonCode !== 'malformed_origin'
+    ) {
+      this.auditDenied(
+        grant,
+        decision.normalizedOrigin,
+        {
+          reason: decision.reason,
+          method: decision.normalizedMethod,
+          path: req.pathAndQuery,
+          ...(req.persona ? { persona: req.persona } : {}),
+        },
+        req.secrets,
+      )
+    }
+    throw new BrokerDenied(decision.reason)
   }
 
   private auditDenied(
@@ -2580,7 +2520,7 @@ export class RequestBroker {
     const resolve = this.options.resolve ?? ((host: string) => lookup(host, { all: true, order: 'verbatim' }))
     const addresses = await withAbort(resolve(hostname), deadline)
     deadline.throwIfAborted()
-    const localLab = allowLocalLab(grant)
+    const localLab = isLocalLabEnabled(grant)
     // Link-local ranges (169.254.0.0/16 incl. cloud metadata, fe80::/10) are never legitimate
     // targets — not even in an authorized local-lab. This guard stays fail-closed regardless of
     // Tier-3 auto-approval or KOVO_ALLOW_LOCAL_LAB.
@@ -2613,10 +2553,10 @@ export class RequestBroker {
 
   async readPublicRoot(grant: Grant, signal: AbortSignal): Promise<PublicObservation> {
     if (!grant.origin) throw new BrokerDenied('Grant origin is required for readPublicRoot.')
-    const tier = grant.tier ?? 1
-    if (tier === 0) throw new BrokerDenied('Live HTTP requests are disabled in Tier 0 (offline prepared mode).')
+    const initial = this.admissionEngine.admit({ kind: 'public_root', origin: grant.origin, method: 'GET', pathAndQuery: '/', allowQuery: false }, grant)
+    this.enforceAdmission(initial, { pathAndQuery: '/' }, grant)
 
-    const localLab = allowLocalLab(grant)
+    const localLab = Boolean(initial.localLab)
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(15_000)])
     const transport = this.httpTransport
     let url = new URL('/', grant.origin)
@@ -2630,12 +2570,8 @@ export class RequestBroker {
     }
     const check = () => {
       deadline.throwIfAborted()
-      if (grant.scopePolicy && originRoleFor(grant.scopePolicy, url.origin) !== 'target') {
-        deny('Passive root discovery is only permitted for target origins.')
-      }
-      if (!safeUrl(url, false, localLab, grant.allowedPorts) || !this.originInGrantScope(grant, url.origin)) {
-        deny('Destination is outside the current assignment scope.')
-      }
+      const hop = this.admissionEngine.admitScopeHop(url, grant, { allowQuery: false, requireTargetRole: true })
+      if (!hop.allowed) deny(hop.reason)
     }
     for (let redirect = 0; redirect <= 3; redirect += 1) {
       check()
@@ -2685,7 +2621,11 @@ export class RequestBroker {
     return deny('The public response exceeded the redirect limit.')
   }
 
-  private prepareHttpRequest(req: BrokerHttpRequest, grant: Grant, options: { raceBurst?: boolean } = {}): {
+  private prepareHttpRequest(
+    req: BrokerHttpRequest,
+    grant: Grant,
+    options: { raceBurst?: boolean; preAdmitted?: AdmissionDecision } = {},
+  ): {
     initialOrigin: string
     url: URL
     localLab: boolean
@@ -2717,264 +2657,45 @@ export class RequestBroker {
       }
     }
 
-    const localLab = allowLocalLab(grant)
-    let initialOrigin: string
-    let url: URL
-    try {
-      initialOrigin = new URL(req.origin).origin
-      url = new URL(req.pathAndQuery, initialOrigin)
-    } catch {
-      throw new BrokerDenied('Request origin or path is malformed.')
-    }
-
     const personaHandle = req.persona ?? req.personaHandle
-    const deny: (reason: string) => never = (reason: string): never => {
-      this.auditDenied(
-        grant,
-        initialOrigin,
-        {
-          reason,
-          method: req.method,
-          path: req.pathAndQuery,
-          ...(personaHandle ? { persona: personaHandle } : {}),
-        },
-        req.secrets,
-      )
-      throw new BrokerDenied(reason)
-    }
+    const admissionReq = this.toAdmissionRequest(req, options)
+    const auditCtx = { pathAndQuery: req.pathAndQuery, persona: personaHandle, secrets: req.secrets, runId: req.runId }
 
-    if (!req.pathAndQuery.startsWith('/') || req.pathAndQuery.startsWith('//') ||
-        req.pathAndQuery.length > maxPathLength || /[\r\n\0]/.test(req.pathAndQuery)) {
-      deny('Request path is invalid or exceeds Kovo Hunter 8 KiB limit.')
-    }
-    if (url.origin !== initialOrigin) {
-      deny('Request path escaped the requested origin.')
-    }
-    if (!safeUrl(url, true, localLab, grant.allowedPorts) || !this.originInGrantScope(grant, initialOrigin)) {
-      this.purgeSessionJars(req.runId ?? grant.scopePolicy?.runId ?? undefined, initialOrigin)
-      deny('Destination is outside the current assignment scope.')
-    }
-
-    if (req.probeClass === 'cache_poison_deception' || req.probeClass === 'cache_differential') {
-      const gcb = url.searchParams.get('_gcb')
-      if (!gcb || !cacheBusterValueRegex.test(gcb)) {
-        deny('Cache probes require a unique ?_gcb=<16-36 hex/uuid> cache-buster query parameter.')
+    // Pre-flight static admission when persona or cache-buster checks must fail before consuming
+    // single-use Tier-3 approval grants.
+    let decision = options.preAdmitted
+    if (!decision && (personaHandle || req.probeClass === 'cache_poison_deception' || req.probeClass === 'cache_differential')) {
+      const pre = this.admissionEngine.admit(admissionReq, grant, { evaluateConsumingHooks: false })
+      this.enforceAdmission(pre, auditCtx, grant)
+      const preOrigin = pre.normalizedOrigin
+      const preUrl = pre.parsedUrl
+      if (req.probeClass === 'cache_poison_deception' || req.probeClass === 'cache_differential') {
+        this.validateCacheBuster(req, preUrl, preOrigin, personaHandle, grant)
       }
-      const seen = this.seenGcbTokens.get(gcb.toLowerCase())
-      if (seen) {
-        if (req.probeClass === 'cache_differential' && req.cacheVerify === true && !seen.verifyUsed) {
-          seen.verifyUsed = true
-        } else {
-          deny('Reusing an already-used _gcb cache-buster token is forbidden.')
-        }
-      } else {
-        if (this.seenGcbTokens.size >= 10_000) {
-          const oldest = this.seenGcbTokens.keys().next().value
-          if (oldest !== undefined) this.seenGcbTokens.delete(oldest)
-        }
-        this.seenGcbTokens.set(gcb.toLowerCase(), { probeClass: req.probeClass, verifyUsed: false })
+      if (personaHandle) {
+        this.resolvePersonaHeadersForRequest(req, grant, preOrigin, personaHandle)
       }
     }
 
-    // Destructive payload denylist check across path (raw + URL-decoded), headers, body, and multipartParts
-    const serializedHeaders = Object.entries(req.headers ?? {}).map(([k, v]) => `${k}: ${v}`).join('\n')
-    if (
-      hasDestructiveContent(req.pathAndQuery) ||
-      hasDestructiveContent(serializedHeaders) ||
-      (req.body !== undefined && hasDestructiveContent(req.body))
-    ) {
-      deny('Request blocked by Kovo Hunter destructive-payload denylist.')
+    if (!decision) {
+      decision = this.admissionEngine.admit(admissionReq, grant)
     }
-    if (req.authMutation?.kind === 'kid_inject' && hasDestructiveContent(req.authMutation.value)) {
-      deny('authMutation kid_inject blocked by Kovo Hunter destructive-payload denylist.')
-    }
-    if (req.authMutation?.kind === 'jku_x5u_canary') {
-      const candidateUrl = req.authMutation.url ?? req.authMutation.value
-      if (candidateUrl && (hasDestructiveContent(candidateUrl) || /[\r\n\0]/.test(candidateUrl))) {
-        deny('authMutation jku_x5u_canary blocked by Kovo Hunter destructive-payload denylist.')
-      }
-    }
+    this.enforceAdmission(decision, auditCtx, grant)
 
+    const initialOrigin = decision.normalizedOrigin
+    const url = decision.parsedUrl
+    const localLab = Boolean(decision.localLab)
+    const hasCompressedBody = Boolean(decision.classification?.hasCompressedBody)
+
+    if (options.preAdmitted && (req.probeClass === 'cache_poison_deception' || req.probeClass === 'cache_differential')) {
+      this.validateCacheBuster(req, url, initialOrigin, personaHandle, grant)
+    }
+    const resolvedPersonaHeaders = personaHandle
+      ? this.resolvePersonaHeadersForRequest(req, grant, initialOrigin, personaHandle)
+      : undefined
+
+    const cleanHeaders: Record<string, string> = { ...(req.headers ?? {}) }
     const hasMultipart = Array.isArray(req.multipartParts) && req.multipartParts.length > 0
-    if (hasMultipart && req.body !== undefined) {
-      deny('Specify either body or multipartParts, not both.')
-    }
-
-    if (req.authMutation) {
-      if (tier < 2) {
-        deny('Broker authMutation primitives require Tier 2 or higher.')
-      }
-      if (!personaHandle) {
-        deny('authMutation requires an approved persona handle.')
-      }
-    }
-
-    let resolvedPersonaHeaders: Record<string, string> | undefined
-    if (personaHandle) {
-      if (tier < 2) {
-        deny('Persona-authenticated requests require Tier 2 or higher.')
-      }
-      if (grant.personas) {
-        const persona = grant.personas.get(personaHandle)
-        if (!persona) {
-          deny(`Persona "${personaHandle}" is not approved for this run.`)
-        }
-        const injected = buildPersonaHeader(persona, initialOrigin)
-        if (!injected) {
-          if (!persona.originAllowlist.includes(initialOrigin)) {
-            deny(`Origin ${initialOrigin} is not in persona "${personaHandle}" originAllowlist.`)
-          }
-          deny(`Persona "${personaHandle}" does not have an active authenticated session yet.`)
-        }
-        resolvedPersonaHeaders = { ...injected }
-      } else if (req.personaHeaders && Object.keys(req.personaHeaders).length > 0) {
-        resolvedPersonaHeaders = { ...req.personaHeaders }
-      } else {
-        deny(`Persona "${personaHandle}" could not be resolved from run grant.`)
-      }
-    }
-
-    const isReadOnlyMethod = req.method === 'GET' || req.method === 'HEAD' ||
-      (req.method === 'OPTIONS' && (req.body === undefined || req.body === ''))
-    const callerContentType = Object.entries(req.headers ?? {})
-      .find(([k]) => k.toLowerCase() === 'content-type')?.[1] ?? ''
-    const callerContentEncoding = Object.entries(req.headers ?? {})
-      .find(([k]) => k.toLowerCase() === 'content-encoding')?.[1] ?? ''
-    const hasMultipartContentType = /^\s*multipart\//i.test(callerContentType)
-    const hasCompressedBody = callerContentEncoding.trim() !== '' && !/^identity$/i.test(callerContentEncoding.trim())
-
-    // v6 Layer-1: one policy decision for every request shape (including reads, so active probing
-    // of auth/asset origins is refused here rather than only in the mutation gate).
-    //
-    // Explicit `prod_readonly` / `staging_isolated` contracts (via `setEnvironmentMode()` or a
-    // standalone unit-test grant) keep strict v6 contract enforcement. For derived Tier-3 runs
-    // where Tier + Approval Policy is the single source of truth, authorized Tier-3 writes flow
-    // cleanly through `approvalPolicy` (`yolo` = autonomous, `auto_review` = safe auto + ask risky,
-    // `strict` = ask every write) while hard scope boundaries (out-of-scope, auth/asset origins,
-    // routeDenylist) always stay enforced.
-    const approvalMeta = this.resolveGrantApprovalContext(grant)
-    let contractApproved = false
-    if (grant.scopePolicy) {
-      const effectiveScopePolicy: ScopePolicy =
-        approvalMeta.liveEnvironmentMode && approvalMeta.liveEnvironmentMode !== grant.scopePolicy.mode
-          ? { ...grant.scopePolicy, mode: approvalMeta.liveEnvironmentMode }
-          : grant.scopePolicy
-      const decision = evaluateScopeRequest(effectiveScopePolicy, {
-        origin: initialOrigin,
-        method: req.method,
-        pathAndQuery: req.pathAndQuery,
-        body: req.body ?? null,
-        headers: req.headers,
-        hook: req.scopeHook ?? null,
-      })
-      const contractApplies = effectiveScopePolicy.mode !== 'ephemeral_lab'
-      const verifiedGraphqlRead = req.method === 'POST' &&
-        !hasMultipart && !hasMultipartContentType && !hasCompressedBody &&
-        isVerifiedReadOnlyGraphqlQuery(req.pathAndQuery, req.body ?? null, req.headers)
-      const isStructuralMutation = req.method === 'DELETE' || hasMultipart || hasMultipartContentType || hasCompressedBody
-      // Durable route leases can never pre-authorize race bursts or compressed bodies: race bursts
-      // must consume their exact single-use burst quota and compressed bodies always escalate.
-      const leaseAuthorizesRoute = !options.raceBurst && !hasCompressedBody &&
-        grant.approvalLeases?.(initialOrigin, req.method, req.pathAndQuery) === true
-      const sandboxPostAllowed = !hasMultipart && !hasMultipartContentType &&
-        req.method === 'POST' && tier === 2 &&
-        grant.sandboxWriteAllowlist !== undefined &&
-        matchesSandboxWriteAllowlist(initialOrigin, url.pathname, req.pathAndQuery, grant.sandboxWriteAllowlist)
-
-      if (decision.allowed) {
-        if (isReadOnlyMethod || verifiedGraphqlRead) {
-          contractApproved = contractApplies
-        } else if (approvalMeta.explicitEnvironmentMode) {
-          // Explicit v6 environment contract (or ephemeral lab): preserve contract semantics verbatim.
-          contractApproved = contractApplies || leaseAuthorizesRoute
-        } else if (!contractApplies) {
-          contractApproved = leaseAuthorizesRoute
-        } else if (approvalMeta.effectivePolicy === 'yolo') {
-          contractApproved = true
-        } else if (approvalMeta.effectivePolicy === 'strict') {
-          contractApproved = leaseAuthorizesRoute
-        } else {
-          // auto_review: durable leases and safe tagged writes auto-approve; DELETE / multipart /
-          // compressed / race-burst requests still flow through approvalPatterns / Safety Judge / HITL.
-          contractApproved =
-            leaseAuthorizesRoute ||
-            (!isStructuralMutation && !options.raceBurst)
-        }
-      } else {
-        // A durable operator lease may authorize a route the environment contract would otherwise
-        // refuse. It can never widen origin scope or permit active auth/asset probing.
-        const leaseEligible = contractApplies &&
-          decision.code !== 'out_of_scope' &&
-          decision.code !== 'auth_origin_active_probe' &&
-          decision.code !== 'asset_origin_active_probe'
-        const leased = leaseEligible && leaseAuthorizesRoute
-        if (leased) {
-          contractApproved = true
-        } else if (decision.code === 'readonly_environment' && sandboxPostAllowed) {
-          // Tier-2 project sandboxWriteAllowlist explicitly authorizes this non-multipart POST.
-          contractApproved = false
-        } else if (
-          decision.code === 'staging_untagged_mutation' &&
-          !approvalMeta.explicitEnvironmentMode &&
-          tier >= 3
-        ) {
-          // Derived Tier-3 run: let `approvalPolicy` decide instead of hard-failing untagged writes.
-          contractApproved = approvalMeta.effectivePolicy === 'yolo'
-        } else {
-          deny(decision.reason)
-        }
-      }
-      if (contractApproved && !isReadOnlyMethod && !verifiedGraphqlRead && tier < 3) {
-        deny(`Method ${req.method} requires Tier 3 (approval-gated state validation).`)
-      }
-    }
-
-    if (!contractApproved && (!isReadOnlyMethod || hasMultipart)) {
-      // The only pre-approval fast path is the explicit Tier-2 sandbox write allowlist (an operator
-      // configuration), never a caller-supplied path heuristic. Every other non-GET/HEAD request
-      // goes through the exact-fingerprint approval hook.
-      const sandboxPostAllowed = !hasMultipart && !hasMultipartContentType &&
-        req.method === 'POST' && tier === 2 && (
-          grant.sandboxWriteAllowlist !== undefined
-            ? matchesSandboxWriteAllowlist(initialOrigin, url.pathname, req.pathAndQuery, grant.sandboxWriteAllowlist)
-            : localLab
-        )
-      if (!sandboxPostAllowed) {
-        if (tier < 3) {
-          deny(
-            hasMultipart || hasMultipartContentType
-              ? 'Multipart uploads require Tier 3 (approval-gated state validation).'
-              : `Method ${req.method} requires Tier 3 (approval-gated state validation).`,
-          )
-        }
-        const approvalContext: StateChangeApprovalContext = {
-          personaHandle: personaHandle ?? null,
-          body: req.body ?? null,
-          bodyHash: computeStateChangeBodyHash(req.body, req.multipartParts),
-          hasMultipart: hasMultipart || hasMultipartContentType,
-          isRaceBurst: options.raceBurst === true,
-          hasCompressedBody,
-        }
-        const approved = grant.isStateChangeApproved
-          ? grant.isStateChangeApproved(initialOrigin, req.method, req.pathAndQuery, approvalContext)
-          : localLab
-        if (!approved) {
-          throw new BrokerApprovalRequired(initialOrigin, req.method, req.pathAndQuery)
-        }
-      }
-    }
-
-    const cleanHeaders: Record<string, string> = {}
-    for (const [k, v] of Object.entries(req.headers ?? {})) {
-      if (forbiddenCallerHeaders.test(k) && !isSelfMintedBearer(k, v)) {
-        deny(`Header "${k}" cannot be set directly; reference an approved persona handle instead.`)
-      }
-      if (/[\r\n\0]/.test(k) || /[\r\n\0]/.test(v)) {
-        deny('Invalid request header.')
-      }
-      cleanHeaders[k] = v
-    }
-
     let preparedBody = req.body
     if (hasMultipart) {
       try {
@@ -3023,37 +2744,73 @@ export class RequestBroker {
     }
   }
 
-  private resolveGrantApprovalContext(grant: Grant): {
-    effectivePolicy: ApprovalPolicy | undefined
-    liveEnvironmentMode: EnvironmentMode | undefined
-    explicitEnvironmentMode: boolean
-  } {
-    let effectivePolicy = grant.approvalPolicy
-    let liveEnvironmentMode: EnvironmentMode | undefined
-    let explicitEnvironmentMode = false
-    const runId = grant.scopePolicy?.runId
-    const store = grant.storage as {
-      run?: (id: string) => { approvalPolicy?: ApprovalPolicy; environmentMode?: EnvironmentMode }
-      eventsAfter?: (id: string, after: number, limit?: number) => Array<{ kind: string }>
-    } | undefined
-    if (runId && store && typeof store.run === 'function') {
-      try {
-        const liveRun = store.run(runId)
-        if (liveRun.approvalPolicy) effectivePolicy = liveRun.approvalPolicy
-        if (liveRun.environmentMode) liveEnvironmentMode = liveRun.environmentMode
-        if (typeof store.eventsAfter === 'function') {
-          explicitEnvironmentMode = store.eventsAfter(runId, 0, 500).some(e => e.kind === 'scope.environment_mode')
-        }
-      } catch {
-        // Stub store without run record: fall back to static grant fields.
-        explicitEnvironmentMode = grant.approvalPolicy === undefined
+  private validateCacheBuster(
+    req: BrokerHttpRequest,
+    url: URL,
+    initialOrigin: string,
+    personaHandle: string | undefined,
+    grant: Grant,
+  ): void {
+    const deny: (reason: string) => never = (reason: string): never => {
+      this.auditDenied(
+        grant,
+        initialOrigin,
+        { reason, method: req.method, path: req.pathAndQuery, ...(personaHandle ? { persona: personaHandle } : {}) },
+        req.secrets,
+      )
+      throw new BrokerDenied(reason)
+    }
+    const gcb = url.searchParams.get('_gcb')
+    if (!gcb || !cacheBusterValueRegex.test(gcb)) {
+      deny('Cache probes require a unique ?_gcb=<16-36 hex/uuid> cache-buster query parameter.')
+    }
+    const seen = this.seenGcbTokens.get(gcb.toLowerCase())
+    if (seen) {
+      if (req.probeClass === 'cache_differential' && req.cacheVerify === true && !seen.verifyUsed) {
+        seen.verifyUsed = true
+      } else {
+        deny('Reusing an already-used _gcb cache-buster token is forbidden.')
       }
     } else {
-      // Standalone grant without a live store (e.g. unit tests): treat scopePolicy.mode as explicit
-      // unless the caller explicitly supplied `grant.approvalPolicy`.
-      explicitEnvironmentMode = grant.approvalPolicy === undefined
+      if (this.seenGcbTokens.size >= 10_000) {
+        const oldest = this.seenGcbTokens.keys().next().value
+        if (oldest !== undefined) this.seenGcbTokens.delete(oldest)
+      }
+      this.seenGcbTokens.set(gcb.toLowerCase(), { probeClass: req.probeClass!, verifyUsed: false })
     }
-    return { effectivePolicy, liveEnvironmentMode, explicitEnvironmentMode }
+  }
+
+  private resolvePersonaHeadersForRequest(
+    req: Pick<BrokerHttpRequest, 'method' | 'pathAndQuery' | 'personaHeaders' | 'secrets'>,
+    grant: Grant,
+    initialOrigin: string,
+    personaHandle: string,
+  ): Record<string, string> {
+    const deny: (reason: string) => never = (reason: string): never => {
+      this.auditDenied(
+        grant,
+        initialOrigin,
+        { reason, method: req.method, path: req.pathAndQuery, persona: personaHandle },
+        req.secrets,
+      )
+      throw new BrokerDenied(reason)
+    }
+    if (grant.personas) {
+      const persona = grant.personas.get(personaHandle)
+      if (!persona) deny(`Persona "${personaHandle}" is not approved for this run.`)
+      const injected = buildPersonaHeader(persona, initialOrigin)
+      if (!injected) {
+        if (!persona.originAllowlist.includes(initialOrigin)) {
+          deny(`Origin ${initialOrigin} is not in persona "${personaHandle}" originAllowlist.`)
+        }
+        deny(`Persona "${personaHandle}" does not have an active authenticated session yet.`)
+      }
+      return { ...injected }
+    }
+    if (req.personaHeaders && Object.keys(req.personaHeaders).length > 0) {
+      return { ...req.personaHeaders }
+    }
+    deny(`Persona "${personaHandle}" could not be resolved from run grant.`)
   }
 
   private async applyAuthMutationIfNeeded(
@@ -3374,9 +3131,10 @@ export class RequestBroker {
     const check = () => {
       ks.assertAllowed(grant.tenantId ?? null)
       deadline.throwIfAborted()
-      if (!safeUrl(url, true, localLab, grant.allowedPorts) || !this.originInGrantScope(grant, url.origin)) {
+      const hop = this.admissionEngine.admitScopeHop(url, grant, { allowQuery: true })
+      if (!hop.allowed) {
         this.purgeSessionJars(req.runId ?? grant.scopePolicy?.runId ?? undefined, url.origin)
-        deny('Destination is outside the current assignment scope.')
+        deny(hop.reason)
       }
     }
     /**
@@ -3390,91 +3148,32 @@ export class RequestBroker {
           (activeMethod === 'OPTIONS' && (activeBody === undefined || activeBody === ''))) return
       const targetPathAndQuery = `${target.pathname}${target.search}`
       const multipart = Array.isArray(req.multipartParts) && req.multipartParts.length > 0
-      const hasMultipartHeader = /^\s*multipart\//i.test(
-        Object.entries(cleanHeaders).find(([k]) => k.toLowerCase() === 'content-type')?.[1] ?? '',
-      )
-      if (grant.scopePolicy) {
-        const approvalMeta = this.resolveGrantApprovalContext(grant)
-        const effectiveScopePolicy: ScopePolicy =
-          approvalMeta.liveEnvironmentMode && approvalMeta.liveEnvironmentMode !== grant.scopePolicy.mode
-            ? { ...grant.scopePolicy, mode: approvalMeta.liveEnvironmentMode }
-            : grant.scopePolicy
-        const decision = evaluateScopeRequest(effectiveScopePolicy, {
-          origin: target.origin,
-          method: activeMethod,
-          pathAndQuery: targetPathAndQuery,
-          body: bodyForHop ?? null,
-          headers: cleanHeaders,
-          redirectHop: true,
-          hook: req.scopeHook ?? null,
-        })
-        const contractApplies = effectiveScopePolicy.mode !== 'ephemeral_lab'
-        if (!decision.allowed) {
-          const leaseEligible = contractApplies &&
-            decision.code !== 'out_of_scope' &&
-            decision.code !== 'auth_origin_active_probe' &&
-            decision.code !== 'asset_origin_active_probe'
-          const leased = leaseEligible &&
-            grant.approvalLeases?.(target.origin, activeMethod, targetPathAndQuery) === true
-          if (leased) return
-          if (
-            decision.code === 'staging_untagged_mutation' &&
-            !approvalMeta.explicitEnvironmentMode &&
-            (grant.tier ?? 1) >= 3
-          ) {
-            if (approvalMeta.effectivePolicy === 'yolo') return
-          } else {
-            this.auditDenied(
-              grant,
-              target.origin,
-              {
-                reason: decision.reason,
-                method: activeMethod,
-                path: targetPathAndQuery,
-                ...(includePersona && personaHandle ? { persona: personaHandle } : {}),
-              },
-              req.secrets,
-            )
-            throw new BrokerDenied(decision.reason)
-          }
-        } else if (contractApplies) {
-          if (approvalMeta.explicitEnvironmentMode) {
-            // Explicit environment contract authorized the redirect target; no per-request approval popup.
-            return
-          }
-          if (approvalMeta.effectivePolicy === 'yolo') return
-          if (grant.approvalLeases?.(target.origin, activeMethod, targetPathAndQuery) === true) return
-          const isStructural = activeMethod === 'DELETE' || multipart || hasMultipartHeader || hasCompressedBody
-          if (approvalMeta.effectivePolicy !== 'strict' && !isStructural) return
-        }
-      }
-      const context: StateChangeApprovalContext = {
+      const hopDecision = this.admissionEngine.admit({
+        kind: 'http',
+        origin: target.origin,
+        method: activeMethod,
+        pathAndQuery: targetPathAndQuery,
+        headers: cleanHeaders,
+        body: multipart ? undefined : bodyForHop,
+        multipartParts: multipart ? req.multipartParts : undefined,
         personaHandle: includePersona ? (personaHandle ?? null) : null,
-        body: multipart ? null : (bodyForHop ?? null),
-        bodyHash: multipart
-          ? computeStateChangeBodyHash(req.body, req.multipartParts)
-          : computeStateChangeBodyHash(bodyForHop ?? null),
-        hasMultipart: multipart,
+        scopeHook: req.scopeHook ?? null,
+        redirectHop: true,
         isRaceBurst: options.raceBurst === true,
-        hasCompressedBody,
-      }
-      const approved = grant.isStateChangeApproved
-        ? grant.isStateChangeApproved(target.origin, activeMethod, targetPathAndQuery, context)
-        : localLab
-      if (!approved) {
-        this.auditDenied(
-          grant,
-          target.origin,
-          {
-            reason: `Approval required for state-changing redirect ${activeMethod} ${targetPathAndQuery}.`,
-            method: activeMethod,
-            path: targetPathAndQuery,
-            ...(includePersona && personaHandle ? { persona: personaHandle } : {}),
-          },
-          req.secrets,
-        )
-        throw new BrokerApprovalRequired(target.origin, activeMethod, targetPathAndQuery)
-      }
+        checkCallerHeaders: false,
+        runId: req.runId,
+        assignmentId: req.assignmentId,
+      }, grant)
+      this.enforceAdmission(
+        hopDecision,
+        {
+          pathAndQuery: targetPathAndQuery,
+          ...(includePersona && personaHandle ? { persona: personaHandle } : {}),
+          secrets: req.secrets,
+          runId: req.runId,
+        },
+        grant,
+      )
     }
 
     for (let redirect = 0; redirect <= maxRedirects; redirect += 1) {
@@ -3835,35 +3534,13 @@ export class RequestBroker {
 
   async executeBatch(reqs: readonly BrokerHttpRequest[], grant: Grant, signal: AbortSignal): Promise<BrokerExchangeResult[]> {
     this.getKillSwitch().assertAllowed(grant.tenantId ?? null)
-    const tier = grant.tier ?? 1
-    if (tier < 2) {
-      throw new BrokerDenied('Synchronized parallel batches (executeBatch) require Tier 2 or Tier 3.')
-    }
-    if (reqs.length < 2 || reqs.length > 10) {
-      throw new BrokerDenied('executeBatch requires between 2 and 10 requests.')
-    }
     signal.throwIfAborted()
 
-    // Check scope and circuit breakers up-front before firing the synchronized burst.
+    // Check circuit breakers & concurrent batch locks before consuming per-target approvals.
     const uniqueOrigins = new Set<string>()
     for (const req of reqs) {
-      const origin = new URL(req.origin).origin
-      if (!this.originInGrantScope(grant, origin)) {
-        const reason = `Origin ${origin} is outside the current assignment scope.`
-        const persona = req.persona ?? req.personaHandle
-        this.auditDenied(
-          grant,
-          origin,
-          {
-            reason,
-            method: req.method,
-            path: req.pathAndQuery,
-            ...(persona ? { persona } : {}),
-          },
-          req.secrets,
-        )
-        throw new BrokerDenied(reason)
-      }
+      let origin: string
+      try { origin = new URL(req.origin).origin } catch { continue }
       const state = this.health(origin, resolveGrantMaxRps(grant, 5))
       if (this.isCircuitOpen(origin)) {
         throw new BrokerCircuitOpen(origin, state.openReason ?? 'Origin circuit is open.')
@@ -3872,9 +3549,31 @@ export class RequestBroker {
       uniqueOrigins.add(origin)
     }
 
-    // Prepare and authorize EVERY request up-front before releasing any bytes onto the wire,
-    // so an unapproved or denied sibling never lets an earlier batch item transmit.
-    const preparedList = reqs.map(req => ({ req, prepared: this.prepareHttpRequest(req, grant) }))
+    // H-4: Admit EVERY target individually through RequestAdmissionEngine up-front before releasing
+    // any bytes onto the wire, so an unapproved or denied sibling never lets an earlier item send.
+    const batchDecision = this.admissionEngine.admitBatch(
+      reqs.map(req => this.toAdmissionRequest(req)),
+      grant,
+      { isRaceBurst: false },
+    )
+    if (!batchDecision.allowed) {
+      const idx = batchDecision.failedIndex
+      const failedReq = idx !== null ? reqs[idx] : undefined
+      const failedDec = idx !== null ? batchDecision.decisions[batchDecision.decisions.length - 1] : undefined
+      if (failedReq && failedDec) {
+        this.enforceAdmission(
+          failedDec,
+          { pathAndQuery: failedReq.pathAndQuery, persona: failedReq.persona ?? failedReq.personaHandle, secrets: failedReq.secrets, runId: failedReq.runId },
+          grant,
+        )
+      }
+      throw new BrokerDenied(batchDecision.reason)
+    }
+
+    const preparedList = reqs.map((req, idx) => ({
+      req,
+      prepared: this.prepareHttpRequest(req, grant, { preAdmitted: batchDecision.decisions[idx] }),
+    }))
 
     for (const origin of uniqueOrigins) {
       const state = this.health(origin, resolveGrantMaxRps(grant, 5))
@@ -3901,17 +3600,32 @@ export class RequestBroker {
   ): Promise<BrokerRaceBurstResult> {
     this.getKillSwitch().assertAllowed(grant.tenantId ?? null)
     const tier = grant.tier ?? 1
-    if (tier < 2) {
-      throw new BrokerDenied('Safe race-condition burst execution (executeRaceBurst) requires Tier 2 or Tier 3.')
-    }
-    if (!Array.isArray(requests) || requests.length < 2 || requests.length > 10) {
-      throw new BrokerDenied('executeRaceBurst requires between 2 and 10 requests.')
-    }
     signal.throwIfAborted()
 
-    // 1. Validate every request up-front (scope, destructive payload denylist, Tier 2/3 method rules,
-    //    Tier 3 HITL approvals, persona originAllowlist, forbidden headers) before sending any bytes.
-    const preparedList = requests.map(req => ({ req, prepared: this.prepareHttpRequest(req, grant, { raceBurst: true }) }))
+    // 1. Validate every request up-front through RequestAdmissionEngine (H-4 per-target validation)
+    //    before sending any bytes.
+    const batchDecision = this.admissionEngine.admitBatch(
+      requests.map(req => this.toAdmissionRequest(req, { raceBurst: true })),
+      grant,
+      { isRaceBurst: true },
+    )
+    if (!batchDecision.allowed) {
+      const idx = batchDecision.failedIndex
+      const failedReq = idx !== null ? requests[idx] : undefined
+      const failedDec = idx !== null ? batchDecision.decisions[batchDecision.decisions.length - 1] : undefined
+      if (failedReq && failedDec) {
+        this.enforceAdmission(
+          failedDec,
+          { pathAndQuery: failedReq.pathAndQuery, persona: failedReq.persona ?? failedReq.personaHandle, secrets: failedReq.secrets, runId: failedReq.runId },
+          grant,
+        )
+      }
+      throw new BrokerDenied(batchDecision.reason)
+    }
+    const preparedList = requests.map((req, idx) => ({
+      req,
+      prepared: this.prepareHttpRequest(req, grant, { raceBurst: true, preAdmitted: batchDecision.decisions[idx] }),
+    }))
 
     const countsByOrigin = new Map<string, number>()
     const hostsToResolve = new Map<string, { origin: string; method: string; path: string; persona?: string; secrets?: readonly NamedSecret[] }>()
@@ -4013,19 +3727,9 @@ export class RequestBroker {
   }
 
   async inspectDns(origin: string, grant: Grant, signal: AbortSignal): Promise<DnsInspectionResult> {
-    const tier = grant.tier ?? 1
-    if (tier === 0) throw new BrokerDenied('Live DNS inspection is disabled in Tier 0 (offline prepared mode).')
-    const parsed = new URL(origin)
-    if (grant.scopePolicy && originRoleFor(grant.scopePolicy, parsed.origin) !== 'target') {
-      const reason = 'Passive DNS/TLS inspection is only permitted for target origins.'
-      this.auditDenied(grant, parsed.origin, { reason, method: 'DNS', path: '/' })
-      throw new BrokerDenied(reason)
-    }
-    if (!this.originInGrantScope(grant, parsed.origin)) {
-      const reason = 'Destination is outside the current assignment scope.'
-      this.auditDenied(grant, parsed.origin, { reason, method: 'DNS', path: '/' })
-      throw new BrokerDenied(reason)
-    }
+    const decision = this.admissionEngine.admit({ kind: 'dns', origin, method: 'DNS', pathAndQuery: '/' }, grant)
+    this.enforceAdmission(decision, { pathAndQuery: '/' }, grant)
+    const parsed = decision.parsedUrl
 
     const started = Date.now()
     const records = await this.withKillSwitch(signal, grant, async (ksSignal, ks) => {
@@ -4066,15 +3770,9 @@ export class RequestBroker {
   }
 
   async inspectTls(origin: string, grant: Grant, signal: AbortSignal): Promise<TlsInspectionResult> {
-    const tier = grant.tier ?? 1
-    if (tier === 0) throw new BrokerDenied('Live TLS inspection is disabled in Tier 0 (offline prepared mode).')
-    const parsed = new URL(origin)
-    if (parsed.protocol !== 'https:' || !this.originInGrantScope(grant, parsed.origin) ||
-        (grant.scopePolicy && originRoleFor(grant.scopePolicy, parsed.origin) !== 'target')) {
-      const reason = 'TLS inspection requires an approved HTTPS origin.'
-      this.auditDenied(grant, parsed.origin, { reason, method: 'TLS', path: '/' })
-      throw new BrokerDenied(reason)
-    }
+    const decision = this.admissionEngine.admit({ kind: 'tls', origin, method: 'TLS', pathAndQuery: '/' }, grant)
+    this.enforceAdmission(decision, { pathAndQuery: '/' }, grant)
+    const parsed = decision.parsedUrl
 
     const started = Date.now()
     const { chosen, tls } = await this.withKillSwitch(signal, grant, async (ksSignal, ks) => {
@@ -4110,99 +3808,37 @@ export class RequestBroker {
     signal: AbortSignal,
   ): Promise<BrokerWebsocketResult> {
     const tier = grant.tier ?? 1
-    if (tier === 0) throw new BrokerDenied('Live WebSocket probing is disabled in Tier 0 (offline prepared mode).')
-
-    const localLab = allowLocalLab(grant)
-    let initialOrigin: string
-    let url: URL
-    try {
-      const normalizedOrigin = req.origin.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
-      initialOrigin = new URL(normalizedOrigin).origin
-      url = new URL(req.pathAndQuery, initialOrigin)
-    } catch {
-      throw new BrokerDenied('WebSocket origin or path is malformed.')
-    }
-
     const personaHandle = req.persona ?? req.personaHandle
-    const deny: (reason: string) => never = (reason: string): never => {
-      this.auditDenied(
-        grant,
-        initialOrigin,
-        {
-          reason,
-          method: 'WS',
-          path: req.pathAndQuery,
-          ...(personaHandle ? { persona: personaHandle } : {}),
-        },
-        req.secrets,
-      )
-      throw new BrokerDenied(reason)
-    }
-
-    if (
-      !req.pathAndQuery.startsWith('/') ||
-      req.pathAndQuery.startsWith('//') ||
-      req.pathAndQuery.length > maxPathLength ||
-      /[\r\n\0]/.test(req.pathAndQuery)
-    ) {
-      deny('WebSocket path is invalid or exceeds Kovo Hunter 8 KiB limit.')
-    }
-    if (url.origin !== initialOrigin || !safeUrl(url, true, localLab, grant.allowedPorts) || !this.originInGrantScope(grant, initialOrigin)) {
-      deny('WebSocket destination is outside the current assignment scope.')
-    }
-    if (grant.scopePolicy && originRoleFor(grant.scopePolicy, initialOrigin) !== 'target') {
-      deny('WebSocket sessions are only permitted for target origins.')
-    }
-
     const sendMessages = (req.sendMessages ?? []).slice(0, hardWsMaxFrames)
-    const serializedInputs = [
-      req.pathAndQuery,
-      req.originHeader ?? '',
-      ...Object.entries(req.headers ?? {}).map(([k, v]) => `${k}: ${v}`),
-      ...sendMessages,
-    ].join('\n')
-    if (hasDestructiveContent(serializedInputs)) {
-      deny('WebSocket probe blocked by Kovo Hunter destructive-payload denylist.')
-    }
+    const decision = this.admissionEngine.admit({
+      kind: 'websocket',
+      origin: req.origin,
+      method: 'WS',
+      pathAndQuery: req.pathAndQuery,
+      headers: req.headers,
+      personaHandle: personaHandle ?? null,
+      wsSendMessages: sendMessages,
+      wsOriginHeader: req.originHeader,
+    }, grant)
+    this.enforceAdmission(decision, { pathAndQuery: req.pathAndQuery, persona: personaHandle, secrets: req.secrets }, grant)
 
-    let resolvedPersonaHeaders: Record<string, string> | undefined
-    if (personaHandle) {
-      if (tier < 2) {
-        deny('Persona-authenticated WebSocket probes require Tier 2 or higher.')
-      }
-      if (grant.personas) {
-        const persona = grant.personas.get(personaHandle)
-        if (!persona) {
-          deny(`Persona "${personaHandle}" is not approved for this run.`)
-        }
-        const injected = buildPersonaHeader(persona, initialOrigin)
-        if (!injected) {
-          if (!persona.originAllowlist.includes(initialOrigin)) {
-            deny(`Origin ${initialOrigin} is not in persona "${personaHandle}" originAllowlist.`)
-          }
-          deny(`Persona "${personaHandle}" does not have an active authenticated session yet.`)
-        }
-        resolvedPersonaHeaders = injected
-      } else if (req.personaHeaders && Object.keys(req.personaHeaders).length > 0) {
-        resolvedPersonaHeaders = req.personaHeaders
-      } else {
-        deny(`Persona "${personaHandle}" could not be resolved from run grant.`)
-      }
-    }
+    const initialOrigin = decision.normalizedOrigin
+    const url = decision.parsedUrl
+    const localLab = Boolean(decision.localLab)
+    const resolvedPersonaHeaders = personaHandle
+      ? this.resolvePersonaHeadersForRequest(
+          { method: 'WS' as HttpMethod, pathAndQuery: req.pathAndQuery, personaHeaders: req.personaHeaders, secrets: req.secrets },
+          grant,
+          initialOrigin,
+          personaHandle,
+        )
+      : undefined
 
-    const cleanHeaders: Record<string, string> = {}
-    for (const [k, v] of Object.entries(req.headers ?? {})) {
-      if (forbiddenCallerHeaders.test(k)) {
-        deny(`Header "${k}" cannot be set directly; reference an approved persona handle instead.`)
-      }
-      if (/[\r\n\0]/.test(k) || /[\r\n\0]/.test(v)) {
-        deny('Invalid WebSocket request header.')
-      }
-      cleanHeaders[k] = v
-    }
+    const cleanHeaders: Record<string, string> = { ...(req.headers ?? {}) }
     const effectiveOriginHeader = req.originHeader ?? cleanHeaders.Origin ?? cleanHeaders.origin ?? initialOrigin
     if (/[\r\n\0]/.test(effectiveOriginHeader)) {
-      deny('Invalid WebSocket Origin header.')
+      this.auditDenied(grant, initialOrigin, { reason: 'Invalid WebSocket Origin header.', method: 'WS', path: req.pathAndQuery, ...(personaHandle ? { persona: personaHandle } : {}) }, req.secrets)
+      throw new BrokerDenied('Invalid WebSocket Origin header.')
     }
     cleanHeaders.Origin = effectiveOriginHeader
 
