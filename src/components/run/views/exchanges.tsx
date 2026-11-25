@@ -139,7 +139,7 @@ export function ExchangesView() {
     const out: Item[] = []
     ;[...m.entries()].sort((a, b) => group === 'origin' ? host(a[0]).localeCompare(host(b[0])) : a[0].localeCompare(b[0])).forEach(([k, list]) => {
       const ck = group + ':' + k
-      out.push({ type: 'head', key: 'h:' + ck, label: group === 'origin' ? host(k) || '—' : k === '' ? 'Anonymous' : k === '(denied)' ? 'Denied (no persona)' : k, count: list.length, icon: group === 'origin' ? 'globe' : 'lock' })
+      out.push({ type: 'head', key: 'h:' + ck, label: group === 'origin' ? host(k) || '—' : k === '' ? 'Anonymous' : k === '(denied)' ? 'Denied (no test account)' : k, count: list.length, icon: group === 'origin' ? 'globe' : 'lock' })
       if (!collapsed[ck]) list.forEach(r => out.push({ type: 'row', key: r.id, r }))
     })
     return out
@@ -152,7 +152,7 @@ export function ExchangesView() {
   const active: [string, string, () => void][] = [
     ...(method ? [['Method', method, () => setMethod('')] as [string, string, () => void]] : []),
     ...(origin ? [['Origin', host(origin), () => setOrigin('')] as [string, string, () => void]] : []),
-    ...(persona ? [['Persona', persona === '-' ? 'Anonymous' : persona, () => setPersona('')] as [string, string, () => void]] : []),
+    ...(persona ? [['Test account', persona === '-' ? 'Anonymous' : persona, () => setPersona('')] as [string, string, () => void]] : []),
   ]
   const allowedCount = rows.filter(r => !r.denied).length
   const height = (it: Item) => (it.type === 'head' ? 32 : 36)
@@ -178,13 +178,13 @@ export function ExchangesView() {
       <span className="tb-sp" />
       <FilterBox value={q} onChange={setQ} placeholder="Filter" onEnter={() => ids[0] && nav.select({ kind: 'exchange', id: ids[0] })} />
       <Dropdown icon="sliders" title="Grouping (⇧G cycles) and filters" menuClassName="sf-ddw"
-        label={<><span className="dim">Group</span><span>{group === 'none' ? 'Time' : group === 'origin' ? 'Origin' : 'Persona'}</span>{active.length > 0 && <span className="sf-ddn num">{active.length}</span>}</>}>
+        label={<><span className="dim">Group</span><span>{group === 'none' ? 'Time' : group === 'origin' ? 'Origin' : 'Test account'}</span>{active.length > 0 && <span className="sf-ddn num">{active.length}</span>}</>}>
         <div className="dd-sec">Grouping<span className="kbd-group" style={{ marginLeft: 'auto' }}><span className="kbd">⇧</span><span className="kbd">G</span></span></div>
-        <Seg<Group> value={group} onChange={setGroup} options={[{ value: 'none', label: 'Time' }, { value: 'origin', label: 'Origin' }, { value: 'persona', label: 'Persona' }]} />
+        <Seg<Group> value={group} onChange={setGroup} options={[{ value: 'none', label: 'Time' }, { value: 'origin', label: 'Origin' }, { value: 'persona', label: 'Test account' }]} />
         <div className="dd-sec">Method</div>
         <div className="sf-chips">{[['', rows.filter(r => !r.denied).length] as [string, number], ...facets.methods].map(([m, n]) =>
           <button key={m || 'all'} type="button" className={'sf-chip' + (method === m ? ' on' : '')} onClick={() => setMethod(m)}>{m || 'All'}<span className="num">{fmtN(n)}</span></button>)}</div>
-        <div className="dd-sec">Persona</div>
+        <div className="dd-sec">Test account</div>
         <div className="sf-chips">{[['', 0] as [string, number], ...facets.personas].map(([p, n]) => {
           const v = p === '' && n ? '-' : p
           return <button key={v || 'all'} type="button" className={'sf-chip' + (persona === v ? ' on' : '')} onClick={() => setPersona(v)}>

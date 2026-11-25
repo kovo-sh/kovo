@@ -78,15 +78,15 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
     setCurlNote(parsed.summary)
   }
 
-  return <section aria-label="Persona vault">
+  return <section aria-label="Test accounts">
     <div className="pw-sec-head">
       <div>
-        <h2>Persona vault <span className="muted num">({personas.length})</span></h2>
+        <h2>Test accounts <span className="muted num">({personas.length})</span></h2>
         <p>Opaque test accounts for Tier 2/3 validation. Secrets are stored locally at 0600 and injected only on allowlisted origins.</p>
       </div>
       <div className="pw-sec-actions">
         <button type="button" className="pw-btn primary" onClick={() => { setModalOpen(true); setNotice('') }}>
-          Add persona
+          Add test account
         </button>
       </div>
     </div>
@@ -132,7 +132,7 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
                     requestId: crypto.randomUUID(),
                     projectId: project.id,
                     personaId: persona.id,
-                  } }), () => setNotice(`Removed persona "${persona.handle}".`))
+                  } }), () => setNotice(`Removed test account "${persona.handle}".`))
                 }}
               >
                 Delete
@@ -143,8 +143,8 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
       </div>
     ) : (
       <div className="pw-empty">
-        <p>No personas configured yet. Add User A &amp; User B for authenticated BOLA/IDOR checks.</p>
-        <button type="button" className="pw-btn primary" onClick={() => setModalOpen(true)}>Add first persona</button>
+        <p>No test accounts configured yet. Add User A &amp; User B for authenticated BOLA/IDOR checks.</p>
+        <button type="button" className="pw-btn primary" onClick={() => setModalOpen(true)}>Add first test account</button>
       </div>
     )}
 
@@ -152,7 +152,7 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
       className="pw-overlay"
       role="dialog"
       aria-modal="true"
-      aria-label="Add test persona"
+      aria-label="Add test account"
       onMouseDown={e => { if (e.target === e.currentTarget) setModalOpen(false) }}
     >
       <form
@@ -183,13 +183,13 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
           } }), created => {
             resetForm()
             setModalOpen(false)
-            setNotice(`Saved persona "${created.handle}". Secret stored in local 0600 vault.`)
+            setNotice(`Saved test account "${created.handle}". Secret stored in local 0600 vault.`)
             onPersonaCreated(created)
           })
         }}
       >
         <div className="pw-sheet-h">
-          <span>Add test persona</span>
+          <span>Add test account</span>
           <div className="pw-sec-actions">
             <button type="button" className="pw-btn ghost" onClick={() => prefillPair('user_a')}>Prefill User A</button>
             <button type="button" className="pw-btn ghost" onClick={() => prefillPair('user_b')}>Prefill User B</button>
@@ -286,14 +286,14 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
           <label className="pw-fld">Canary markers (optional, comma-separated)
             <input className="pw-in mono" name="canaryMarkers" value={canaries} onChange={e => setCanaries(e.target.value)}
               placeholder="tenant-a-canary@example.test, org_alpha_001" />
-            <small>Strings that indicate cross-tenant data leakage if seen by another persona.</small>
+            <small>Strings that indicate cross-tenant data leakage if seen by another test account.</small>
           </label>
           <FormError error={personaAction.error} />
         </div>
         <div className="pw-sheet-f">
           <span className="hint">Stored in local 0600 vault; never enters LLM prompts.</span>
           <button type="button" className="pw-btn ghost" onClick={() => setModalOpen(false)}>Cancel</button>
-          <button type="submit" className="pw-btn primary" disabled={personaAction.pending}>Save persona</button>
+          <button type="submit" className="pw-btn primary" disabled={personaAction.pending}>Save test account</button>
         </div>
       </form>
     </div>}

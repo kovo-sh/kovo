@@ -122,10 +122,10 @@ function ScopeCard({ editing, draft, setDraft, footer }: {
         ? <input className="field-in num" type="number" min={1} max={maxRpsPerOriginCeiling} step={1} value={draft.maxRpsPerOrigin} aria-label="Requests per second per origin" style={{ width: 74, height: 26 }} onChange={e => setDraft(d => ({ ...d, maxRpsPerOrigin: Number(e.target.value) }))} />
         : <>{draft.maxRpsPerOrigin} req/s per origin</>)}
       {kv('Workers', <>{r.workerConcurrency} concurrent · {r.workerMaxTurns} turns</>)}
-      {kv('Personas', draft.approvedPersonaIds.length && draft.capabilityTier >= 2 ? plural(draft.approvedPersonaIds.length, 'persona') : 'None (anonymous)')}
+      {kv('Test accounts', draft.approvedPersonaIds.length && draft.capabilityTier >= 2 ? plural(draft.approvedPersonaIds.length, 'test account') : 'None (anonymous)')}
     </div>
     {canEditConfig && detail.personas.length > 0 && <div className="sheet-x">
-      <span className="muted">Bind test personas{draft.capabilityTier < 2 ? ' (Tier 2 or 3)' : ''}</span>
+      <span className="muted">Bind test accounts{draft.capabilityTier < 2 ? ' (Tier 2 or 3)' : ''}</span>
       {detail.personas.map(p => <label key={p.id} className="chk">
         <input type="checkbox" disabled={draft.capabilityTier < 2} checked={draft.approvedPersonaIds.includes(p.id)}
           onChange={e => setDraft(d => ({ ...d, approvedPersonaIds: e.target.checked ? [...d.approvedPersonaIds, p.id] : d.approvedPersonaIds.filter(x => x !== p.id) }))} />
