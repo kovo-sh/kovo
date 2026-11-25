@@ -234,13 +234,23 @@ export class ProjectsRepository {
       SELECT r.id AS runId,
         (SELECT count(*) FROM findings f WHERE f.run_id = r.id AND f.superseded_by_finding_id IS NULL) AS findingCount,
         (SELECT count(*) FROM findings f WHERE f.run_id = r.id AND f.superseded_by_finding_id IS NULL
-          AND json_extract(f.finding, '$.status') IN ('confirmed', 'verified', 'static_verified')) AS confirmedCount
+          AND json_extract(f.finding, '$.status') IN ('confirmed', 'verified', 'static_verified')) AS confirmedCount,
+        (SELECT count(*) FROM assignments a WHERE a.run_id = r.id AND a.status IN ('running', 'waiting_approval')) AS activeAssignments,
+        (SELECT count(*) FROM lab_containers lc WHERE lc.run_id = r.id AND lc.status = 'running') AS activeLabContainers
       FROM runs r
       WHERE r.project_id = ? AND r.workspace_id = ?
-    `).all(projectId, this.session.workspace.id) as { runId: string; findingCount: number; confirmedCount: number }[]
+    `).all(projectId, this.session.workspace.id) as {
+      runId: string
+      findingCount: number
+      confirmedCount: number
+      activeAssignments: number
+      activeLabContainers: number
+    }[]
     const findingCounts = new Map(findingCountRows.map(r => [r.runId, {
       findingCount: Number(r.findingCount),
       confirmedCount: Number(r.confirmedCount),
+      activeAssignments: Number(r.activeAssignments),
+      activeLabContainers: Number(r.activeLabContainers),
     }]))
     return {
       project,
@@ -253,6 +263,7 @@ export class ProjectsRepository {
           ...r,
           findingCount: counts?.findingCount ?? 0,
           confirmedCount: counts?.confirmedCount ?? 0,
+          isActive: r.status === 'running' || (counts?.activeAssignments ?? 0) > 0 || (counts?.activeLabContainers ?? 0) > 0,
         }
       }),
     }
@@ -345,7 +356,7 @@ export class ProjectsRepository {
         name: redact(input.name),
         environment,
         seeds: validatedSeeds,
-        defaultScope: [],
+        defaultScope: validatedSeeds,
         labConfig,
         sandboxWriteAllowlist: input.sandboxWriteAllowlist ?? [],
         createdAt: Date.now(),
@@ -475,6 +486,32 @@ export class ProjectsRepository {
         includeSubdomains: nextIncludeSubdomains,
         approvedInDefaultScope: nextDefaultScope.includes(asset.origin),
       }
+    })
+  }
+
+  deleteProjectAsset(input: { requestId: string; projectId: string; assetId: string }) {
+    return this.session.operate(input, () => {
+      const project = this.project(input.projectId)
+      const asset = this.session.db.select().from(tables.projectAssets)
+        .where(and(eq(tables.projectAssets.projectId, project.id), eq(tables.projectAssets.id, input.assetId)))
+        .get()
+      if (!asset) throw new Error('Project asset not found.')
+
+      this.session.db.delete(tables.projectAssets).where(eq(tables.projectAssets.id, asset.id)).run()
+      const nextDefaultScope = project.defaultScope.filter(origin => origin !== asset.origin)
+      const nextSeeds = project.seeds.filter(origin => origin !== asset.origin)
+      if (nextDefaultScope.length !== project.defaultScope.length || nextSeeds.length !== project.seeds.length) {
+        this.session.db.update(tables.projects)
+          .set({ defaultScope: nextDefaultScope, seeds: nextSeeds })
+          .where(eq(tables.projects.id, project.id))
+          .run()
+      }
+      this.session.event(null, 'inventory.asset_deleted', `Removed host ${asset.origin} from project inventory.`, {
+        projectId: project.id,
+        assetId: asset.id,
+        origin: asset.origin,
+      })
+      return { id: asset.id, origin: asset.origin }
     })
   }
 

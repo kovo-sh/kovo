@@ -75,22 +75,28 @@ function CreateProjectSheet({
             environment: nextEnv,
             includeSubdomains: nextEnv === 'public' ? includeSubdomains : false,
           } })
+          let syncError: string | undefined
           if (reposToSync.length > 0) {
             setSubmitStatus(`Syncing ${reposToSync.length} ${reposToSync.length === 1 ? 'repo' : 'repos'}…`)
             try {
               await syncGithubRepositories({ data: { projectId: project.id, repos: reposToSync } })
-            } catch {
-              // Non-blocking: still open the newly created project cleanly so the user can retry sync if needed.
+            } catch (err) {
+              // Non-blocking: still open the newly created project cleanly and surface a retryable error banner.
+              syncError = err instanceof Error ? err.message : 'Initial GitHub repository sync failed.'
             }
           }
-          return project
-        }, async project => {
+          return { project, syncError }
+        }, async ({ project, syncError }) => {
           setSubmitStatus('')
           setEnvironment('public')
           setIncludeSubdomains(true)
           setSelectedRepos([])
           onClose()
-          await navigate({ to: '/projects/$projectId', params: { projectId: project.id } })
+          await navigate({
+            to: '/projects/$projectId',
+            params: { projectId: project.id },
+            search: syncError ? { syncError: syncError.slice(0, 300) } : {},
+          })
         }).finally(() => setSubmitStatus(''))
       }}
     >
@@ -342,7 +348,7 @@ function Workspace() {
           <b className="font-medium text-fg">Some model profiles are temporarily unavailable.</b> One or more enabled models are cooling down after recent errors.
         </span>
         <Link className={buttonVariants({ variant: 'outline' })} to="/settings" search={{}}>
-          Model settings
+          Settings
           <Icon name="arrowR" />
         </Link>
       </div>

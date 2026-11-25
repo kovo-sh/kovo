@@ -1,5 +1,7 @@
 import { createFileRoute, Link, useLocation, useNavigate, useRouter } from '@tanstack/react-router'
-import { useEffect, useState } from 'react'
+import { createServerFn } from '@tanstack/react-start'
+import { useEffect, useMemo, useState } from 'react'
+import { z } from 'zod'
 import { projectData, removeProject, testPersonaAuthAction } from '../actions.ts'
 import { Icon } from '../components/run/icons.tsx'
 import { ProjectGuardrailsTab } from '../components/project/ProjectGuardrailsTab.tsx'
@@ -8,7 +10,7 @@ import { ProjectNewRunSheet } from '../components/project/ProjectNewRunSheet.tsx
 import { ProjectOverviewTab } from '../components/project/ProjectOverviewTab.tsx'
 import { ProjectPersonasTab } from '../components/project/ProjectPersonasTab.tsx'
 import { ProjectSourcesTab } from '../components/project/ProjectSourcesTab.tsx'
-import type { PersonaTestState, ProjectTabId } from '../components/project/types.ts'
+import type { PersonaTestState, ProjectLoaderData, ProjectTabId } from '../components/project/types.ts'
 import { isProjectTab, PROJECT_TABS, safeHost } from '../components/project/types.ts'
 import { Badge } from '../components/ui/badge.tsx'
 import { Button, buttonVariants } from '../components/ui/button.tsx'
@@ -27,18 +29,29 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '../components/ui/dropdown-menu.tsx'
-import type { PublicPersona } from '../domain.ts'
+import { id, type PublicPersona } from '../domain.ts'
 import { cn } from '../lib/cn.ts'
+
+const removeProjectAsset = createServerFn({ method: 'POST' })
+  .validator(z.object({ requestId: id, projectId: id, assetId: id }))
+  .handler(async ({ data }) => {
+    const { store } = await import('../server/store.ts')
+    return store().projectsRepo.deleteProjectAsset(data)
+  })
 
 type ProjectSearch = {
   tab?: ProjectTabId
   newRun?: string
+  syncError?: string
 }
 
 export const Route = createFileRoute('/projects/$projectId')({
   validateSearch: (search: Record<string, unknown>): ProjectSearch => ({
     ...(isProjectTab(search.tab) ? { tab: search.tab } : {}),
     ...(search.newRun === '1' || search.newRun === 1 || search.newRun === true ? { newRun: '1' } : {}),
+    ...(typeof search.syncError === 'string' && search.syncError.trim().length > 0
+      ? { syncError: search.syncError.trim().slice(0, 300) }
+      : {}),
   }),
   loader: ({ params }) => projectData({ data: { projectId: params.projectId } }),
   component: ProjectPage,
@@ -46,6 +59,10 @@ export const Route = createFileRoute('/projects/$projectId')({
 
 function ProjectPage() {
   const data = Route.useLoaderData()
+  return <ProjectPageContent key={data.project.id} data={data} />
+}
+
+function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
   const { project, assets, personas, specs, runs } = data
   const search = Route.useSearch()
   const location = useLocation()
@@ -55,13 +72,41 @@ function ProjectPage() {
   const activeTab: ProjectTabId = search.tab ?? 'overview'
   const hashWantsNewRun = location.hash === 'new-run' || location.hash === '#new-run'
   const [newRunOpen, setNewRunOpen] = useState(() => Boolean(search.newRun) || hashWantsNewRun)
+  const [syncErrorBanner, setSyncErrorBanner] = useState(() => search.syncError ?? '')
   const [deleteProjectOpen, setDeleteProjectOpen] = useState(false)
   const [deletingProject, setDeletingProject] = useState(false)
   const [deleteProjectError, setDeleteProjectError] = useState('')
   const [selectedPersonaIds, setSelectedPersonaIds] = useState<string[]>(() => personas.map(p => p.id))
   const [personaTests, setPersonaTests] = useState<Record<string, PersonaTestState>>({})
 
-  const activeRunsCount = runs.filter(r => r.status === 'running').length
+  const validPersonaIds = useMemo(() => new Set(personas.map(p => p.id)), [personas])
+  const activeSelectedPersonaIds = useMemo(
+    () => selectedPersonaIds.filter(pid => validPersonaIds.has(pid)),
+    [selectedPersonaIds, validPersonaIds],
+  )
+
+  useEffect(() => {
+    setSelectedPersonaIds(prev => {
+      const filtered = prev.filter(pid => validPersonaIds.has(pid))
+      return filtered.length === prev.length ? prev : filtered
+    })
+  }, [validPersonaIds])
+
+  useEffect(() => {
+    if (!search.syncError) return
+    setSyncErrorBanner(search.syncError)
+    void navigate({
+      to: '/projects/$projectId',
+      params: { projectId: project.id },
+      search: {
+        ...(search.tab ? { tab: search.tab } : {}),
+        ...(search.newRun ? { newRun: search.newRun } : {}),
+      },
+      replace: true,
+    })
+  }, [search.syncError, search.tab, search.newRun, project.id, navigate])
+
+  const activeRunsCount = runs.filter(r => r.isActive || r.status === 'running').length
   const totalFindings = runs.reduce((sum, r) => sum + r.findingCount, 0)
   const totalConfirmed = runs.reduce((sum, r) => sum + r.confirmedCount, 0)
 
@@ -234,16 +279,58 @@ function ProjectPage() {
         </nav>
       </div>
 
+      {syncErrorBanner && (
+        <div
+          role="alert"
+          className="flex flex-wrap items-center gap-2.5 border-b border-warn-line bg-warn-soft px-3.5 py-2 text-[12.5px] text-fg md:px-[22px]"
+        >
+          <Icon name="alert" size={14} className="flex-none text-warn" />
+          <span className="min-w-0 flex-1">
+            <strong className="font-medium">Initial GitHub repository sync failed:</strong>{' '}
+            <span className="text-fg-muted">{syncErrorBanner}</span>
+          </span>
+          <div className="flex flex-none items-center gap-1.5">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                setSyncErrorBanner('')
+                selectTab('sources')
+              }}
+            >
+              Retry in Source &amp; Specs
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setSyncErrorBanner('')}
+            >
+              Dismiss
+            </Button>
+          </div>
+        </div>
+      )}
+
       <div className="w-full max-w-[1020px] flex-1 px-3.5 pb-12 pt-4 md:px-6 md:pb-16 md:pt-[22px]">
         {activeTab === 'overview' && (
           <ProjectOverviewTab
+            key={project.id}
             data={data}
             onSelectTab={selectTab}
           />
         )}
-        {activeTab === 'inventory' && <ProjectInventoryTab data={data} />}
+        {activeTab === 'inventory' && (
+          <ProjectInventoryTab
+            key={project.id}
+            data={data}
+            onDeleteAsset={assetId =>
+              removeProjectAsset({ data: { requestId: crypto.randomUUID(), projectId: project.id, assetId } })
+            }
+          />
+        )}
         {activeTab === 'personas' && (
           <ProjectPersonasTab
+            key={project.id}
             data={data}
             personaTests={personaTests}
             onTestPersona={persona => void handleTestPersonaAuth(persona)}
@@ -252,15 +339,16 @@ function ProjectPage() {
             }}
           />
         )}
-        {activeTab === 'sources' && <ProjectSourcesTab data={data} />}
-        {activeTab === 'guardrails' && <ProjectGuardrailsTab data={data} />}
+        {activeTab === 'sources' && <ProjectSourcesTab key={project.id} data={data} />}
+        {activeTab === 'guardrails' && <ProjectGuardrailsTab key={project.id} data={data} />}
       </div>
 
       <ProjectNewRunSheet
+        key={project.id}
         open={newRunOpen}
         onClose={() => setNewRunOpen(false)}
         data={data}
-        selectedPersonaIds={selectedPersonaIds}
+        selectedPersonaIds={activeSelectedPersonaIds}
         setSelectedPersonaIds={setSelectedPersonaIds}
         personaTests={personaTests}
         onTestPersona={persona => void handleTestPersonaAuth(persona)}

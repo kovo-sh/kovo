@@ -187,19 +187,6 @@ function GithubSetupSvg({ ready }: { ready: boolean }) {
   )
 }
 
-function AllowlistSetupSvg({ ready }: { ready: boolean }) {
-  const accent = ready ? 'var(--ok)' : 'var(--accent)'
-  const border = ready ? 'color-mix(in srgb, var(--ok) 35%, var(--line-2))' : 'var(--line-2)'
-  return (
-    <svg width="36" height="26" viewBox="0 0 36 26" fill="none" aria-hidden="true" className="mb-1 block text-fg">
-      <rect x="0.75" y="0.75" width="34.5" height="24.5" rx="5.5" fill="var(--sunk)" stroke={border} strokeWidth="1.1" />
-      <path d="M7.5 9.25h9.5M7.5 13h7.5M7.5 16.75h9.5" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
-      <circle cx="24.5" cy="13" r="5" fill="var(--panel)" stroke={accent} strokeWidth="1.3" />
-      <path d="M22.3 13.1 23.8 14.6 26.8 11.4" stroke={accent} strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
-}
-
 export function ProjectOverviewTab({ data, onSelectTab }: Props) {
   const { project, assets, personas, specs, runs, githubPatStatus } = data
   const router = useRouter()
@@ -233,14 +220,6 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
       description: 'Add source code to enrich vulnerability analysis.',
       art: <GithubSetupSvg ready={false} />,
     },
-    {
-      id: 'guardrails' as const,
-      done: allowlistCount > 0,
-      title: plural(allowlistCount, 'approved write rule'),
-      pending: 'Approve write rules',
-      description: 'Allow safe test mutations on staging without risking real data.',
-      art: <AllowlistSetupSvg ready={false} />,
-    },
   ]
   const pendingSetup = setupItems.filter(item => !item.done)
   const completedSetup = setupItems.length - pendingSetup.length
@@ -260,7 +239,7 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
 
   async function confirmDeleteRun() {
     if (!runToDelete || deletingRun) return
-    const isActive = runToDelete.status === 'running'
+    const isActive = Boolean(runToDelete.isActive || runToDelete.status === 'running')
     setDeletingRun(true)
     setDeleteError('')
     try {
@@ -274,7 +253,7 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
     }
   }
 
-  const isRunToDeleteActive = runToDelete?.status === 'running'
+  const isRunToDeleteActive = Boolean(runToDelete && (runToDelete.isActive || runToDelete.status === 'running'))
 
   return (
     <>
@@ -306,9 +285,11 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
           <span>
             <b className="font-semibold text-fg-muted">{specs.length}</b> specs
           </span>
-          <span>
-            <b className="font-semibold text-fg-muted">{allowlistCount}</b> write rules
-          </span>
+          {allowlistCount > 0 && (
+            <span>
+              <b className="font-semibold text-fg-muted">{allowlistCount}</b> write rules
+            </span>
+          )}
           {thirdPartyCount > 0 && (
             <span>
               <b className="font-semibold text-fg-muted">{thirdPartyCount}</b> third-party
@@ -367,9 +348,9 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
             Setup complete
           </span>
           <span className="tabular-nums text-fg-subtle">
-            {plural(personas.length, 'test account')} · {plural(specs.length, 'repo snapshot')} · {plural(allowlistCount, 'approved write rule')}
+            {plural(personas.length, 'test account')} · {plural(specs.length, 'repo snapshot')}
           </span>
-          <Button type="button" variant="ghost" className="ml-auto" onClick={() => onSelectTab('guardrails')}>
+          <Button type="button" variant="ghost" className="ml-auto" onClick={() => onSelectTab('personas')}>
             Review
           </Button>
         </div>

@@ -340,7 +340,6 @@ export function ProjectGuardrailsTab({ data }: Props) {
                       <option value="POST">POST</option>
                       <option value="PUT">PUT</option>
                       <option value="PATCH">PATCH</option>
-                      <option value="GET">GET</option>
                     </NativeSelect>
                   </label>
                   <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
