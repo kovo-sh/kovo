@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import { resolve4, resolve6, resolveCname } from 'node:dns/promises'
 import { isIP } from 'node:net'
 import type { Candidate, DnsSource } from '../domain.ts'
@@ -9,6 +10,8 @@ export interface DnsLookupResult {
 }
 
 export type SubdomainDnsResolver = (hostname: string, signal?: AbortSignal) => Promise<DnsLookupResult>
+
+export type SubdomainDiscoverySource = 'crt.sh' | 'certspotter' | 'hackertarget' | 'dns_sweep'
 
 export interface ThirdPartyCnameClassification {
   thirdParty: boolean
@@ -26,15 +29,20 @@ export interface DiscoveredSubdomain {
   thirdParty: boolean
   thirdPartyVendor: string | null
   cnameTarget: string | null
+  sources?: SubdomainDiscoverySource[]
 }
 
 export interface SubdomainDiscoveryOptions {
   fetchImpl?: typeof fetch
   dnsResolver?: SubdomainDnsResolver
   ctTimeoutMs?: number
+  certspotterTimeoutMs?: number
+  hackerTargetTimeoutMs?: number
+  retryDelayMs?: number
   dnsTimeoutMs?: number
   dnsConcurrency?: number
   maxCandidates?: number
+  wildcardProbeLabel?: string
   signal?: AbortSignal
 }
 
@@ -43,6 +51,7 @@ export interface SubdomainDiscoveryResult {
   queriedApexes: string[]
   skippedOrigins: string[]
   warnings: string[]
+  wildcardApexes?: string[]
 }
 
 /**
@@ -94,10 +103,32 @@ const SKIPPED_LOCAL_SUFFIXES = ['.localhost', '.local', '.internal', '.test', '.
 const VALID_HOSTNAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/
 const PRIORITY_PREFIXES = ['www', 'api', 'app', 'auth', 'admin', 'portal', 'dashboard', 'account', 'accounts', 'login', 'sso', 'staging', 'dev', 'docs', 'blog', 'status']
 
-const DEFAULT_CT_TIMEOUT_MS = 8_000
+/**
+ * Curated high-value first-party subdomain prefixes probed during wildcard-safe DNS sweeps
+ * so discovery stays resilient even when every external passive CT API is rate-limited or down.
+ */
+export const COMMON_SUBDOMAIN_PREFIXES: readonly string[] = [
+  'www', 'api', 'app', 'auth', 'login', 'sso', 'account', 'accounts', 'clerk',
+  'admin', 'dashboard', 'console', 'portal', 'docs', 'blog', 'status', 'mail',
+  'staging', 'stage', 'dev', 'beta', 'preview', 'sandbox', 'test',
+  'cdn', 'static', 'assets', 'media', 'files', 'uploads',
+  'ws', 'realtime', 'graphql', 'webhooks',
+  'billing', 'pay', 'checkout', 'shop', 'store',
+  'support', 'help', 'community', 'forum', 'careers', 'jobs', 'about',
+  'chat', 'ai', 'cloud', 'mcp', 'hub', 'lab', 'studio', 'play', 'demo', 'academy',
+  'internal', 'ops', 'git', 'code',
+]
+
+const CRT_RETRYABLE_STATUSES = new Set([429, 502, 503, 504])
+const DEFAULT_CT_TIMEOUT_MS = 15_000
+const DEFAULT_CERTSPOTTER_TIMEOUT_MS = 10_000
+const DEFAULT_HACKERTARGET_TIMEOUT_MS = 8_000
+const DEFAULT_RETRY_DELAY_MS = 350
 const DEFAULT_DNS_TIMEOUT_MS = 3_000
-const DEFAULT_DNS_CONCURRENCY = 8
-const DEFAULT_MAX_CANDIDATES = 40
+const DEFAULT_DNS_CONCURRENCY = 12
+const DEFAULT_MAX_CANDIDATES = 80
+const DEFAULT_RUN_DISCOVERY_TIMEOUT_MS = 15_000
+const DISCOVERY_USER_AGENT = 'KovoHunter/2 passive subdomain discovery'
 
 function normalizeHostname(raw: string): string {
   return raw.trim().toLowerCase().replace(/\.+$/, '')
@@ -174,6 +205,53 @@ function candidateRank(hostname: string, apex: string): [number, number, string]
   return [priorityIdx >= 0 ? priorityIdx : PRIORITY_PREFIXES.length + depth, hostname.length, hostname]
 }
 
+function normalizeCandidateHost(raw: string, normalizedApex: string, excludedHosts: ReadonlySet<string>): string | null {
+  const suffix = `.${normalizedApex}`
+  let host = normalizeHostname(raw)
+  if (!host) return null
+  if (host.startsWith('*.')) host = host.slice(2)
+  if (!host || host.includes('*') || host.includes('@')) return null
+  if (!host.endsWith(suffix)) return null
+  if (host.length > 253 || !VALID_HOSTNAME_RE.test(host)) return null
+  if (excludedHosts.has(host)) return null
+  return host
+}
+
+function rankAndCapCandidates(
+  hosts: Iterable<string>,
+  normalizedApex: string,
+  maxCandidates: number,
+): string[] {
+  const deduped = [...new Set(hosts)]
+  deduped.sort((a, b) => {
+    const [ar0, ar1, ar2] = candidateRank(a, normalizedApex)
+    const [br0, br1, br2] = candidateRank(b, normalizedApex)
+    if (ar0 !== br0) return ar0 - br0
+    if (ar1 !== br1) return ar1 - br1
+    return ar2.localeCompare(br2)
+  })
+  return deduped.slice(0, Math.max(1, Math.min(Math.floor(maxCandidates), 200)))
+}
+
+function collectCtHosts(
+  entries: readonly { name_value?: unknown; common_name?: unknown }[],
+  normalizedApex: string,
+  excludedHosts: ReadonlySet<string>,
+): string[] {
+  const found = new Set<string>()
+  const consider = (raw: string) => {
+    for (const piece of raw.split(/[\r\n\s,]+/)) {
+      const host = normalizeCandidateHost(piece, normalizedApex, excludedHosts)
+      if (host) found.add(host)
+    }
+  }
+  for (const entry of entries) {
+    if (typeof entry?.name_value === 'string') consider(entry.name_value)
+    if (typeof entry?.common_name === 'string') consider(entry.common_name)
+  }
+  return [...found]
+}
+
 export function extractCtCandidates(
   entries: readonly { name_value?: unknown; common_name?: unknown }[],
   apex: string,
@@ -181,40 +259,79 @@ export function extractCtCandidates(
   maxCandidates = DEFAULT_MAX_CANDIDATES,
 ): string[] {
   const normalizedApex = normalizeHostname(apex)
-  const suffix = `.${normalizedApex}`
-  const found = new Set<string>()
-
-  const consider = (raw: string) => {
-    for (const piece of raw.split(/[\r\n\s,]+/)) {
-      let host = normalizeHostname(piece)
-      if (!host) continue
-      if (host.startsWith('*.')) host = host.slice(2)
-      if (!host || host.includes('*') || host.includes('@')) continue
-      if (!host.endsWith(suffix)) continue
-      if (host.length > 253 || !VALID_HOSTNAME_RE.test(host)) continue
-      if (excludedHosts.has(host)) continue
-      found.add(host)
-    }
-  }
-
-  for (const entry of entries) {
-    if (typeof entry?.name_value === 'string') consider(entry.name_value)
-    if (typeof entry?.common_name === 'string') consider(entry.common_name)
-  }
+  const found = new Set<string>(collectCtHosts(entries, normalizedApex, excludedHosts))
 
   const wwwHost = `www.${normalizedApex}`
   if (!excludedHosts.has(wwwHost) && VALID_HOSTNAME_RE.test(wwwHost)) {
     found.add(wwwHost)
   }
 
-  const sorted = [...found].sort((a, b) => {
-    const [ar0, ar1, ar2] = candidateRank(a, normalizedApex)
-    const [br0, br1, br2] = candidateRank(b, normalizedApex)
-    if (ar0 !== br0) return ar0 - br0
-    if (ar1 !== br1) return ar1 - br1
-    return ar2.localeCompare(br2)
+  return rankAndCapCandidates(found, normalizedApex, maxCandidates)
+}
+
+export function extractCertspotterCandidates(
+  entries: readonly { dns_names?: unknown }[],
+  apex: string,
+  excludedHosts: ReadonlySet<string>,
+  maxCandidates = DEFAULT_MAX_CANDIDATES,
+): string[] {
+  const normalizedApex = normalizeHostname(apex)
+  const found = new Set<string>()
+  for (const entry of entries) {
+    if (!Array.isArray(entry?.dns_names)) continue
+    for (const raw of entry.dns_names) {
+      if (typeof raw !== 'string') continue
+      const host = normalizeCandidateHost(raw, normalizedApex, excludedHosts)
+      if (host) found.add(host)
+    }
+  }
+  return rankAndCapCandidates(found, normalizedApex, maxCandidates)
+}
+
+export function extractHackerTargetCandidates(
+  body: string,
+  apex: string,
+  excludedHosts: ReadonlySet<string>,
+  maxCandidates = DEFAULT_MAX_CANDIDATES,
+): { hosts: string[]; rateLimitedOrError: string | null } {
+  const normalizedApex = normalizeHostname(apex)
+  const trimmed = body.trim()
+  if (!trimmed) return { hosts: [], rateLimitedOrError: null }
+  if (/^(?:API count exceeded|error\b)/i.test(trimmed)) {
+    return { hosts: [], rateLimitedOrError: trimmed.slice(0, 120) }
+  }
+  const found = new Set<string>()
+  for (const line of trimmed.split(/\r?\n/)) {
+    const cleanLine = line.trim()
+    if (!cleanLine || /API count exceeded/i.test(cleanLine)) continue
+    const commaIdx = cleanLine.indexOf(',')
+    if (commaIdx <= 0) continue
+    const hostToken = cleanLine.slice(0, commaIdx)
+    const host = normalizeCandidateHost(hostToken, normalizedApex, excludedHosts)
+    if (host) found.add(host)
+  }
+  return { hosts: rankAndCapCandidates(found, normalizedApex, maxCandidates), rateLimitedOrError: null }
+}
+
+function combineSignals(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  return signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
+}
+
+async function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal?.aborted) return
+  await new Promise<void>(resolve => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    timer.unref?.()
+    const onAbort = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
   })
-  return sorted.slice(0, Math.max(1, Math.min(Math.floor(maxCandidates), 200)))
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
@@ -270,7 +387,11 @@ async function mapWithConcurrency<T, R>(
 }
 
 /**
- * Passive CT-log (`crt.sh`) + live DNS subdomain discovery for public HTTPS origins.
+ * Multi-source resilient passive + wildcard-safe DNS subdomain discovery for public HTTPS origins:
+ * - `crt.sh` (15s timeout, 1 fast retry on 429/502/503/504)
+ * - Certspotter public issuances API (10s timeout)
+ * - HackerTarget hostsearch API (8s timeout)
+ * - Wildcard-safe common-prefix DNS sweep (~60 high-value prefixes, skipped if random label resolves)
  * Skips localhost, IP literals, `.local`/`.internal`/`.test`/`.invalid`, HTTP, and non-standard
  * ports with zero network calls. Gracefully degrades on CT-log errors/rate-limits/offline.
  */
@@ -279,9 +400,12 @@ export async function discoverSubdomainsForOrigins(
   options: SubdomainDiscoveryOptions = {},
 ): Promise<SubdomainDiscoveryResult> {
   const fetchFn = options.fetchImpl ?? fetch
-  const ctTimeoutMs = Math.max(500, Math.min(options.ctTimeoutMs ?? DEFAULT_CT_TIMEOUT_MS, 20_000))
-  const dnsTimeoutMs = Math.max(500, Math.min(options.dnsTimeoutMs ?? DEFAULT_DNS_TIMEOUT_MS, 10_000))
-  const dnsConcurrency = Math.max(1, Math.min(options.dnsConcurrency ?? DEFAULT_DNS_CONCURRENCY, 16))
+  const ctTimeoutMs = Math.max(500, Math.min(options.ctTimeoutMs ?? DEFAULT_CT_TIMEOUT_MS, 30_000))
+  const certspotterTimeoutMs = Math.max(500, Math.min(options.certspotterTimeoutMs ?? DEFAULT_CERTSPOTTER_TIMEOUT_MS, 20_000))
+  const hackerTargetTimeoutMs = Math.max(500, Math.min(options.hackerTargetTimeoutMs ?? DEFAULT_HACKERTARGET_TIMEOUT_MS, 20_000))
+  const retryDelayMs = Math.max(0, Math.min(options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS, 3_000))
+  const dnsTimeoutMs = Math.max(200, Math.min(options.dnsTimeoutMs ?? DEFAULT_DNS_TIMEOUT_MS, 10_000))
+  const dnsConcurrency = Math.max(1, Math.min(options.dnsConcurrency ?? DEFAULT_DNS_CONCURRENCY, 24))
   const maxCandidates = Math.max(1, Math.min(options.maxCandidates ?? DEFAULT_MAX_CANDIDATES, 200))
   const dnsResolver: SubdomainDnsResolver = options.dnsResolver
     ?? ((host, sig) => defaultSubdomainDnsResolver(host, sig, dnsTimeoutMs))
@@ -309,86 +433,261 @@ export async function discoverSubdomainsForOrigins(
   }
 
   if (apexToParent.size === 0 || options.signal?.aborted) {
-    return { discovered: [], queriedApexes: [], skippedOrigins, warnings: [] }
+    return { discovered: [], queriedApexes: [], skippedOrigins, warnings: [], wildcardApexes: [] }
   }
 
   const queriedApexes = [...apexToParent.keys()]
   const warnings: string[] = []
+  const wildcardApexes: string[] = []
   const discovered: DiscoveredSubdomain[] = []
   const seenOrigins = new Set<string>(origins)
 
   for (const apex of queriedApexes) {
     if (options.signal?.aborted) break
     const parentOrigin = apexToParent.get(apex)!
-    let ctEntries: Array<{ name_value?: unknown; common_name?: unknown }> = []
+    const apexErrors: string[] = []
+    const dnsInFlight = new Map<string, Promise<DnsLookupResult>>()
+    const resolvedDns = new Map<string, DnsLookupResult>()
+    const sourcesByHost = new Map<string, Set<SubdomainDiscoverySource>>()
 
-    try {
-      const reqSignal = options.signal
-        ? AbortSignal.any([options.signal, AbortSignal.timeout(ctTimeoutMs)])
-        : AbortSignal.timeout(ctTimeoutMs)
-      const url = `https://crt.sh/?q=%25.${encodeURIComponent(apex)}&output=json`
-      const res = await fetchFn(url, {
-        method: 'GET',
-        headers: {
-          Accept: 'application/json',
-          'User-Agent': 'KovoHunter/2 passive subdomain discovery',
-        },
-        signal: reqSignal,
-      })
-      if (!res.ok) {
-        warnings.push(`crt.sh returned HTTP ${res.status} for ${apex}; falling back to www probe only.`)
-      } else {
-        const parsed = await res.json().catch(() => null)
-        if (Array.isArray(parsed)) {
-          ctEntries = parsed as Array<{ name_value?: unknown; common_name?: unknown }>
-        } else {
-          warnings.push(`crt.sh returned non-array payload for ${apex}.`)
-        }
+    const probeLabel = (options.wildcardProbeLabel ?? `kovo-nx-${randomBytes(6).toString('hex')}`)
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, '') || `kovo-nx-${randomBytes(6).toString('hex')}`
+    const probeHost = `${probeLabel}.${apex}`
+
+    const recordSource = (hostname: string, source: SubdomainDiscoverySource) => {
+      if (hostname === probeHost || excludedHosts.has(hostname)) return
+      let set = sourcesByHost.get(hostname)
+      if (!set) {
+        set = new Set<SubdomainDiscoverySource>()
+        sourcesByHost.set(hostname, set)
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'CT lookup failed'
-      warnings.push(`crt.sh lookup failed for ${apex}: ${msg.slice(0, 140)}`)
+      set.add(source)
     }
 
-    const candidates = extractCtCandidates(ctEntries, apex, excludedHosts, maxCandidates)
-    if (candidates.length === 0) continue
+    const resolveHostCached = (hostname: string): Promise<DnsLookupResult> => {
+      const existing = dnsInFlight.get(hostname)
+      if (existing) return existing
+      const pending = (async (): Promise<DnsLookupResult> => {
+        if (options.signal?.aborted) return { cnames: [], addresses: [] }
+        try {
+          const raw = await withTimeout(
+            dnsResolver(hostname, options.signal),
+            dnsTimeoutMs,
+            { cnames: [], addresses: [] },
+          )
+          const normalized: DnsLookupResult = {
+            cnames: (raw.cnames ?? []).map(normalizeHostname).filter(Boolean),
+            addresses: (raw.addresses ?? []).filter(Boolean),
+          }
+          resolvedDns.set(hostname, normalized)
+          return normalized
+        } catch {
+          const empty: DnsLookupResult = { cnames: [], addresses: [] }
+          resolvedDns.set(hostname, empty)
+          return empty
+        }
+      })()
+      dnsInFlight.set(hostname, pending)
+      return pending
+    }
 
-    const resolved = await mapWithConcurrency(candidates, dnsConcurrency, async hostname => {
-      if (options.signal?.aborted) return null
+    const resolveSourceCandidates = async (hosts: readonly string[], source: SubdomainDiscoverySource) => {
+      if (hosts.length === 0) return
+      for (const host of hosts) recordSource(host, source)
+      await mapWithConcurrency(hosts, dnsConcurrency, async hostname => {
+        if (options.signal?.aborted) return
+        await resolveHostCached(hostname)
+      })
+    }
+
+    // 1. Wildcard DNS check + common-prefix sweep (runs concurrently with passive HTTP CT sources)
+    const wildcardSweepTask = (async () => {
+      if (options.signal?.aborted) return
+      let isWildcard = false
       try {
-        const dns = await withTimeout(
-          dnsResolver(hostname, options.signal),
+        const probe = await withTimeout(
+          dnsResolver(probeHost, options.signal),
           dnsTimeoutMs,
           { cnames: [], addresses: [] },
         )
-        const cnames = (dns.cnames ?? []).map(normalizeHostname).filter(Boolean)
-        const addresses = (dns.addresses ?? []).filter(Boolean)
-        if (cnames.length === 0 && addresses.length === 0) return null
-        const classification = classifyThirdPartyCname(cnames)
-        return {
-          hostname,
-          origin: `https://${hostname}`,
-          parentOrigin,
-          apexDomain: apex,
-          cnames,
-          addresses,
-          thirdParty: classification.thirdParty,
-          thirdPartyVendor: classification.matchedVendor,
-          cnameTarget: classification.cnameTarget,
-        } satisfies DiscoveredSubdomain
+        const probeCnames = (probe.cnames ?? []).map(normalizeHostname).filter(Boolean)
+        const probeAddrs = (probe.addresses ?? []).filter(Boolean)
+        isWildcard = probeCnames.length > 0 || probeAddrs.length > 0
       } catch {
-        return null
+        isWildcard = false
       }
-    })
+      if (isWildcard) {
+        wildcardApexes.push(apex)
+        return
+      }
+      const sweepHosts = COMMON_SUBDOMAIN_PREFIXES
+        .map(prefix => `${prefix}.${apex}`)
+        .filter(host => !excludedHosts.has(host) && VALID_HOSTNAME_RE.test(host))
+      await mapWithConcurrency(sweepHosts, dnsConcurrency, async hostname => {
+        if (options.signal?.aborted) return
+        const res = await resolveHostCached(hostname)
+        if (res.cnames.length > 0 || res.addresses.length > 0) {
+          recordSource(hostname, 'dns_sweep')
+        }
+      })
+    })()
 
-    for (const item of resolved) {
-      if (!item || seenOrigins.has(item.origin)) continue
-      seenOrigins.add(item.origin)
-      discovered.push(item)
+    // 2. Primary passive CT source: crt.sh (15s timeout, 1 fast retry on 429/502/503/504)
+    const crtTask = (async () => {
+      if (options.signal?.aborted) return
+      const url = `https://crt.sh/?q=%25.${encodeURIComponent(apex)}&output=json`
+      const startedAt = Date.now()
+      try {
+        let res = await fetchFn(url, {
+          method: 'GET',
+          headers: {
+            Accept: 'application/json',
+            'User-Agent': DISCOVERY_USER_AGENT,
+          },
+          signal: combineSignals(options.signal, ctTimeoutMs),
+        })
+        if (CRT_RETRYABLE_STATUSES.has(res.status) && !options.signal?.aborted) {
+          await res.body?.cancel().catch(() => undefined)
+          await sleepAbortable(retryDelayMs, options.signal)
+          const remainingMs = ctTimeoutMs - (Date.now() - startedAt)
+          if (!options.signal?.aborted && remainingMs > 250) {
+            res = await fetchFn(url, {
+              method: 'GET',
+              headers: {
+                Accept: 'application/json',
+                'User-Agent': DISCOVERY_USER_AGENT,
+              },
+              signal: combineSignals(options.signal, remainingMs),
+            })
+          }
+        }
+        if (!res.ok) {
+          apexErrors.push(`crt.sh returned HTTP ${res.status}`)
+          return
+        }
+        const parsed = await res.json().catch(() => null)
+        if (!Array.isArray(parsed)) {
+          apexErrors.push('crt.sh returned non-array payload')
+          return
+        }
+        const ctHosts = rankAndCapCandidates(
+          collectCtHosts(parsed as Array<{ name_value?: unknown; common_name?: unknown }>, apex, excludedHosts),
+          apex,
+          maxCandidates,
+        )
+        await resolveSourceCandidates(ctHosts, 'crt.sh')
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'CT lookup failed'
+        apexErrors.push(`crt.sh lookup failed: ${msg.slice(0, 120)}`)
+      }
+    })()
+
+    // 3. Backup passive CT source: Certspotter public issuances API (10s timeout)
+    const certspotterTask = (async () => {
+      if (options.signal?.aborted) return
+      const url = `https://api.certspotter.com/v1/issuances?domain=${encodeURIComponent(apex)}&include_subdomains=true&expand=dns_names`
+      try {
+        const res = await fetchFn(url, {
+          method: 'GET',
+          headers: {
+            Accept: 'application/json',
+            'User-Agent': DISCOVERY_USER_AGENT,
+          },
+          signal: combineSignals(options.signal, certspotterTimeoutMs),
+        })
+        if (!res.ok) {
+          apexErrors.push(`certspotter returned HTTP ${res.status}`)
+          return
+        }
+        const parsed = await res.json().catch(() => null)
+        if (!Array.isArray(parsed)) {
+          apexErrors.push('certspotter returned non-array payload')
+          return
+        }
+        const hosts = extractCertspotterCandidates(
+          parsed as Array<{ dns_names?: unknown }>,
+          apex,
+          excludedHosts,
+          maxCandidates,
+        )
+        await resolveSourceCandidates(hosts, 'certspotter')
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Certspotter lookup failed'
+        apexErrors.push(`certspotter lookup failed: ${msg.slice(0, 120)}`)
+      }
+    })()
+
+    // 4. Backup passive source: HackerTarget hostsearch API (8s timeout)
+    const hackerTargetTask = (async () => {
+      if (options.signal?.aborted) return
+      const url = `https://api.hackertarget.com/hostsearch/?q=${encodeURIComponent(apex)}`
+      try {
+        const res = await fetchFn(url, {
+          method: 'GET',
+          headers: {
+            Accept: 'text/plain',
+            'User-Agent': DISCOVERY_USER_AGENT,
+          },
+          signal: combineSignals(options.signal, hackerTargetTimeoutMs),
+        })
+        if (!res.ok) {
+          apexErrors.push(`hackertarget returned HTTP ${res.status}`)
+          return
+        }
+        const text = await res.text().catch(() => '')
+        const { hosts, rateLimitedOrError } = extractHackerTargetCandidates(text, apex, excludedHosts, maxCandidates)
+        if (rateLimitedOrError) {
+          apexErrors.push(`hackertarget unavailable (${rateLimitedOrError})`)
+          return
+        }
+        await resolveSourceCandidates(hosts, 'hackertarget')
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'HackerTarget lookup failed'
+        apexErrors.push(`hackertarget lookup failed: ${msg.slice(0, 120)}`)
+      }
+    })()
+
+    await Promise.all([wildcardSweepTask, crtTask, certspotterTask, hackerTargetTask])
+
+    if (apexErrors.length > 0) {
+      warnings.push(`Passive subdomain discovery issues for ${apex}: ${apexErrors.join('; ')}.`)
+    }
+
+    // Union & dedupe all live resolved subdomains across every source
+    const liveHosts: string[] = []
+    for (const hostname of sourcesByHost.keys()) {
+      const dns = resolvedDns.get(hostname)
+      if (!dns) continue
+      if (dns.cnames.length === 0 && dns.addresses.length === 0) continue
+      liveHosts.push(hostname)
+    }
+
+    const rankedLiveHosts = rankAndCapCandidates(liveHosts, apex, maxCandidates)
+    for (const hostname of rankedLiveHosts) {
+      const origin = `https://${hostname}`
+      if (seenOrigins.has(origin)) continue
+      const dns = resolvedDns.get(hostname)
+      if (!dns) continue
+      const classification = classifyThirdPartyCname(dns.cnames)
+      seenOrigins.add(origin)
+      discovered.push({
+        hostname,
+        origin,
+        parentOrigin,
+        apexDomain: apex,
+        cnames: dns.cnames,
+        addresses: dns.addresses,
+        thirdParty: classification.thirdParty,
+        thirdPartyVendor: classification.matchedVendor,
+        cnameTarget: classification.cnameTarget,
+        sources: [...(sourcesByHost.get(hostname) ?? [])],
+      })
     }
   }
 
-  return { discovered, queriedApexes, skippedOrigins, warnings }
+  return { discovered, queriedApexes, skippedOrigins, warnings, wildcardApexes }
 }
 
 export interface AppliedSubdomainDiscovery {
@@ -492,4 +791,132 @@ export function applyDiscoveredSubdomainsToRun(
   )
 
   return { admitted, candidatesOnly, thirdParty, admittedOrigins, candidateOrigins, thirdPartyOrigins }
+}
+
+export interface RunDiscoverySubdomainsOptions extends SubdomainDiscoveryOptions {
+  timeoutMs?: number
+}
+
+export interface RunDiscoverySubdomainsResult {
+  skipped: boolean
+  reason?: string
+  discovery: SubdomainDiscoveryResult
+  addedOrigins: string[]
+  thirdPartyOrigins: string[]
+  totalCandidates: number
+}
+
+/**
+ * Pre-scope-review subdomain discovery for a run:
+ * - Skips `local-lab`, `prepared`, non-https, localhost, and private/IP literal seeds with zero network calls.
+ * - Discovers live subdomains across multi-source passive CT APIs + wildcard-safe common-prefix DNS sweep.
+ * - Persists discovered hosts into `project_assets` and `run.candidates` (unapproved until scope approval)
+ *   so the Scope Review screen displays all live subdomains immediately.
+ */
+export async function runDiscoverySubdomainsForRun(
+  storage: Store,
+  runId: string,
+  options: RunDiscoverySubdomainsOptions = {},
+): Promise<RunDiscoverySubdomainsResult> {
+  const run = storage.run(runId)
+  const detail = storage.projectDetail(run.projectId)
+  const { project } = detail
+
+  const emptyDiscovery: SubdomainDiscoveryResult = {
+    discovered: [],
+    queriedApexes: [],
+    skippedOrigins: [],
+    warnings: [],
+    wildcardApexes: [],
+  }
+
+  if (project.environment !== 'public') {
+    return {
+      skipped: true,
+      reason: 'non_public_environment',
+      discovery: emptyDiscovery,
+      addedOrigins: [],
+      thirdPartyOrigins: [],
+      totalCandidates: run.candidates.length,
+    }
+  }
+
+  if (run.sourceMode === 'prepared') {
+    return {
+      skipped: true,
+      reason: 'prepared_source_mode',
+      discovery: emptyDiscovery,
+      addedOrigins: [],
+      thirdPartyOrigins: [],
+      totalCandidates: run.candidates.length,
+    }
+  }
+
+  const seedOrigins = [...new Set([
+    ...project.seeds,
+    ...detail.assets
+      .filter(a => !a.thirdParty && !a.dnsSource && !a.source.startsWith('phase0_') && !a.source.startsWith('subdomain_discovery'))
+      .map(a => a.origin),
+  ])]
+
+  if (!seedOrigins.some(isPublicDiscoverableOrigin)) {
+    return {
+      skipped: true,
+      reason: 'no_public_seeds',
+      discovery: {
+        ...emptyDiscovery,
+        skippedOrigins: seedOrigins,
+      },
+      addedOrigins: [],
+      thirdPartyOrigins: [],
+      totalCandidates: run.candidates.length,
+    }
+  }
+
+  const timeoutMs = Math.max(500, Math.min(options.timeoutMs ?? DEFAULT_RUN_DISCOVERY_TIMEOUT_MS, 60_000))
+  const boundedSignal = combineSignals(options.signal, timeoutMs)
+
+  const discovery = await discoverSubdomainsForOrigins(seedOrigins, {
+    ...options,
+    signal: boundedSignal,
+  })
+
+  const addedOrigins: string[] = []
+  const thirdPartyOrigins: string[] = []
+
+  for (const sub of discovery.discovered) {
+    const dnsSource = buildDnsSource(sub)
+    const latestRun = storage.run(runId)
+    const res = storage.suggestCandidateHost(latestRun, sub.origin, 'subdomain_discovery', sub.thirdParty, dnsSource)
+    if (res.added) {
+      addedOrigins.push(sub.origin)
+      if (sub.thirdParty) thirdPartyOrigins.push(sub.origin)
+    }
+  }
+
+  const finalRun = storage.run(runId)
+  storage.event(
+    runId,
+    'discovery.subdomains_discovered',
+    `Subdomain discovery checked ${discovery.queriedApexes.length} apex ${discovery.queriedApexes.length === 1 ? 'domain' : 'domains'}: ${discovery.discovered.length} live (${addedOrigins.length} newly added to scope review, ${thirdPartyOrigins.length} third-party CNAME).`,
+    {
+      queriedApexes: discovery.queriedApexes,
+      skippedOrigins: discovery.skippedOrigins,
+      wildcardApexes: discovery.wildcardApexes ?? [],
+      discoveredCount: discovery.discovered.length,
+      addedCount: addedOrigins.length,
+      thirdPartyCount: thirdPartyOrigins.length,
+      addedOrigins,
+      thirdPartyOrigins,
+      warnings: discovery.warnings,
+    },
+  )
+
+  return {
+    skipped: false,
+    discovery,
+    addedOrigins,
+    thirdPartyOrigins,
+    totalCandidates: finalRun.candidates.length,
+  }
 }
