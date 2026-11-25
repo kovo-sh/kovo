@@ -16,6 +16,40 @@ function mint(prefix: string): string {
   return `${prefix}${randomBytes(9).toString('hex')}`
 }
 
+/** Authorization codes handed out by /authorize and not yet exchanged, per lab state. */
+const issuedCodes = new WeakMap<LabState, Set<string>>()
+
+function codesOf(state: LabState): Set<string> {
+  let codes = issuedCodes.get(state)
+  if (!codes) {
+    codes = new Set()
+    issuedCodes.set(state, codes)
+  }
+  return codes
+}
+
+function tenantRole(state: LabState, session: SessionRecord, tenantId: TenantKey): LabRole | null {
+  return state.users.find((user) => user.id === session.userId)?.rolesByTenant[tenantId] ?? null
+}
+
+/** Invitation, token and audit administration is limited to tenant owners and admins. */
+function tenantAdmin(state: LabState, session: SessionRecord, tenantId: TenantKey): boolean {
+  const role = tenantRole(state, session, tenantId)
+  return role === 'owner' || role === 'admin'
+}
+
+/** Registered client callbacks live on the lab loopback interface. */
+function redirectRegistered(redirect: string): boolean {
+  if (!redirect) return true
+  try {
+    const parsed = new URL(redirect)
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:')
+      && (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost')
+  } catch {
+    return false
+  }
+}
+
 function issueSession(
   state: LabState, userIndex: number, tenantId: TenantKey, role: LabRole,
   originPersona: SessionRecord['originPersona'], runId: string,
@@ -91,10 +125,32 @@ export async function handleIdp(
     return
   }
 
+  if (match(url, method, '/sessions/revoke')) {
+    // Revocation needs a live session; an explicit token may only name one of the caller's own sessions.
+    const caller = authenticate(state, req)
+    if (!caller) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
+    const body = parseJson<{ token?: string }>(await readBody(req))
+    const target = body?.token ? state.sessions.get(body.token) : caller
+    if (target && target.userId === caller.userId) {
+      target.revoked = true
+      state.emit('session.revoked', { sessionDigest: digest(target.token), runId }, target.originPersona)
+    }
+    sendJson(res, 200, { ok: true })
+    return
+  }
+
   const sessionParams = match(url, method, '/sessions/:id')
   if (sessionParams) {
+    const caller = authenticate(state, req)
+    if (!caller) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
     const session = state.sessions.get(sessionParams[0]!)
-    if (!session) {
+    if (!session || session.userId !== caller.userId) {
       sendJson(res, 404, { error: 'unknown session' })
       return
     }
@@ -105,26 +161,21 @@ export async function handleIdp(
     return
   }
 
-  if (match(url, method, '/sessions/revoke')) {
-    const body = parseJson<{ token?: string }>(await readBody(req))
-    const target = body?.token ? state.sessions.get(body.token) : authenticate(state, req)
-    if (target) {
-      target.revoked = true
-      state.emit('session.revoked', { sessionDigest: digest(target.token), runId }, target.originPersona)
-    }
-    sendJson(res, 200, { ok: true })
-    return
-  }
-
   if (match(url, method, '/authorize')) {
     const next = url.search.get('next') ?? ''
     const redirect = url.search.get('redirect_uri') ?? ''
+    if (!redirectRegistered(redirect)) {
+      state.emit('idp.authorize_denied', { reason: 'redirect_uri_not_registered', next, runId })
+      sendJson(res, 400, { error: 'redirect_uri is not registered for this client' })
+      return
+    }
     if (!state.profile.redirectSubpathAccepted && next) {
       state.emit('idp.authorize_denied', { reason: 'redirect_not_allowlisted', next, runId })
       sendJson(res, 400, { error: 'redirect target is not allowlisted' })
       return
     }
     const code = mint('mh_fake_code_')
+    codesOf(state).add(code)
     const openRedirect = state.profile.redirectSubpathAccepted && next.startsWith('/s/')
     state.emit('idp.authorize_redirect', {
       codeDigest: digest(code),
@@ -143,8 +194,16 @@ export async function handleIdp(
 
   if (method === 'POST' && match(url, method, '/token')) {
     const body = parseJson<{ code?: string }>(await readBody(req))
+    // Codes are single-use and must have been issued by /authorize.
+    const codes = codesOf(state)
+    if (!body?.code || !codes.has(body.code)) {
+      state.emit('idp.token_denied', { reason: 'invalid_grant', runId })
+      sendJson(res, 400, { error: 'invalid_grant' })
+      return
+    }
+    codes.delete(body.code)
     const token = mint('mh_fake_oidc_')
-    state.emit('idp.token_exchanged', { codeDigest: body?.code ? digest(body.code) : '', runId })
+    state.emit('idp.token_exchanged', { codeDigest: digest(body.code), runId })
     sendJson(res, 200, { access_token: token, token_type: 'Bearer', expires_in: 3600, scope: 'openid profile' })
     return
   }
@@ -219,12 +278,23 @@ export async function handleIdp(
       sendJson(res, 400, { error: 'tenant and email required' })
       return
     }
+    const role = (body.role ?? 'member') as LabRole
+    if (role !== 'admin' && role !== 'member' && role !== 'viewer') {
+      sendJson(res, 400, { error: 'role must be admin, member or viewer' })
+      return
+    }
+    // Issuing an invite is a privileged act reserved for owners and admins of the target tenant.
+    if (!tenantAdmin(state, session, tenantId)) {
+      state.emit('invite.create_denied', { tenantId, reason: 'insufficient_role', runId }, session.originPersona)
+      sendJson(res, 403, { error: 'invite requires owner or admin' })
+      return
+    }
     const invite: InviteRecord = {
       id: mint('mh_inv_'),
       tenantId,
       emailRaw: body.email,
       emailNormalized: normalizeEmail(body.email),
-      role: (body.role as LabRole | undefined) ?? 'member',
+      role,
       verified: true,
       revoked: false,
       stale: false,
@@ -239,18 +309,28 @@ export async function handleIdp(
 
   const revokeInvite = match(url, method, '/invites/:id/revoke')
   if (revokeInvite) {
+    const actor = authenticate(state, req)
+    if (!actor) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
     const invite = state.invites.find((item) => item.id === revokeInvite[0])
-    if (!invite) {
+    if (!invite || !tenantAdmin(state, actor, invite.tenantId)) {
       sendJson(res, 404, { error: 'unknown invite' })
       return
     }
     invite.revoked = true
-    state.emit('invite.revoked', { inviteId: invite.id, tenantId: invite.tenantId, runId })
+    state.emit('invite.revoked', { inviteId: invite.id, tenantId: invite.tenantId, runId }, actor.originPersona)
     sendJson(res, 200, { ok: true })
     return
   }
 
   if (method === 'POST' && match(url, method, '/invites/redeem')) {
+    const session = authenticate(state, req)
+    if (!session) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
     const body = parseJson<{ token?: string }>(await readBody(req))
     const invite = state.invites.find((item) => item.token === body?.token && !item.revoked)
     if (!invite) {
@@ -263,8 +343,7 @@ export async function handleIdp(
       sendJson(res, 403, { error: 'invite is no longer valid' })
       return
     }
-    const session = authenticate(state, req)
-    const originPersona = session?.originPersona ?? 'member_b'
+    const originPersona = session.originPersona
     const userIndex = state.users.findIndex((user) => user.personaKey === originPersona)
     if (userIndex < 0) {
       sendJson(res, 403, { error: 'invite not redeemable' })
@@ -293,11 +372,16 @@ export async function handleIdp(
       sendJson(res, 401, { error: 'session required' })
       return
     }
+    const requestedTenant = body?.tenant ? tenantBySlug(state, body.tenant) : null
+    if (body?.tenant && (!requestedTenant || !tenantRole(state, session, requestedTenant))) {
+      sendJson(res, 403, { error: 'not a member of this tenant' })
+      return
+    }
     const pat: PatRecord = {
       id: mint('mh_pat_'),
       token: mint('mh_fake_pat_'),
       userId: session.userId,
-      tenantId: (body?.tenant ? tenantBySlug(state, body.tenant) : null) ?? session.tenantId,
+      tenantId: requestedTenant ?? session.tenantId,
       scopes: body?.scopes ?? ['read'],
       revoked: false,
       runId,
@@ -314,25 +398,45 @@ export async function handleIdp(
       sendJson(res, 401, { error: 'session required' })
       return
     }
-    sendJson(res, 200, { tokens: state.pats.map((pat) => ({ id: pat.id, scopes: pat.scopes, revoked: pat.revoked })) })
+    sendJson(res, 200, {
+      tokens: state.pats
+        .filter((pat) => pat.userId === session.userId)
+        .map((pat) => ({ id: pat.id, scopes: pat.scopes, revoked: pat.revoked })),
+    })
     return
   }
 
   const revokePat = match(url, method, '/pats/:id/revoke')
   if (revokePat) {
+    // Unknown and foreign ids share one 404; only the holder or an owner/admin of its tenant may revoke.
+    const actor = authenticate(state, req)
+    if (!actor) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
     const pat = state.pats.find((item) => item.id === revokePat[0])
-    if (!pat) {
+    if (!pat || (pat.userId !== actor.userId && !tenantAdmin(state, actor, pat.tenantId))) {
       sendJson(res, 404, { error: 'unknown token' })
       return
     }
     pat.revoked = true
-    state.emit('pat.revoked', { patId: pat.id, tenantId: pat.tenantId, runId })
+    state.emit('pat.revoked', { patId: pat.id, tenantId: pat.tenantId, runId }, actor.originPersona)
     sendJson(res, 200, { ok: true })
     return
   }
 
   if (match(url, method, '/users')) {
-    sendJson(res, 200, { users: state.users.map((user) => ({ id: user.id, tenant: user.tenantId, roles: user.rolesByTenant })) })
+    // Directory lookups are scoped to the caller's current tenant.
+    const viewer = authenticate(state, req)
+    if (!viewer) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
+    sendJson(res, 200, {
+      users: state.users
+        .filter((user) => user.rolesByTenant[viewer.tenantId])
+        .map((user) => ({ id: user.id, tenant: viewer.tenantId, role: user.rolesByTenant[viewer.tenantId] })),
+    })
     return
   }
   if (match(url, method, '/scopes')) {
@@ -344,7 +448,21 @@ export async function handleIdp(
     return
   }
   if (match(url, method, '/audit')) {
-    sendJson(res, 200, { events: state.audit.slice(-50).map((event) => ({ kind: event.kind, ts: event.ts })) })
+    const viewer = authenticate(state, req)
+    if (!viewer) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
+    if (!tenantAdmin(state, viewer, viewer.tenantId)) {
+      sendJson(res, 403, { error: 'audit log requires owner or admin' })
+      return
+    }
+    sendJson(res, 200, {
+      events: state.audit
+        .filter((event) => event.detail.tenantId === viewer.tenantId)
+        .slice(-50)
+        .map((event) => ({ kind: event.kind, ts: event.ts })),
+    })
     return
   }
   if (match(url, method, '/tenants')) {
