@@ -626,7 +626,15 @@ export async function handleApi(
       }
       const manifest = body?.manifest ?? ''
       const signature = body?.signature ?? ''
-      if (!manifest || !safeEqualHex(signature, hmacHex(state.plan.secrets.prodSigningKey, manifest))) {
+      // Manifests verify against the current signing key version and the originally provisioned
+      // version, so rotation does not invalidate manifests signed before it took effect.
+      const signingSecret = state.secrets.find((item) => item.id === state.plan.ids.victimSecretId)
+      const keyVersions = [...new Set([signingSecret?.value ?? '', state.plan.secrets.prodSigningKey])]
+        .filter(Boolean)
+      const signingKey = manifest
+        ? keyVersions.find((key) => safeEqualHex(signature, hmacHex(key, manifest))) ?? ''
+        : ''
+      if (!signingKey) {
         state.emit('release.signature_denied', { deploymentId: deployment.id, runId })
         sendJson(res, 403, { error: 'release manifest signature is not valid' })
         return
@@ -641,7 +649,7 @@ export async function handleApi(
         releaseId,
         releaseDigest: digest(`${releaseId}:${manifest}`),
         signedWith: 'prod-signing-key',
-        keyDigest: digest(state.plan.secrets.prodSigningKey),
+        keyDigest: digest(signingKey),
         approval: 'automation',
         version: body?.version ?? '2026.11.0',
         runId,

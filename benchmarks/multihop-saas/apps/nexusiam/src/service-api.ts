@@ -33,6 +33,23 @@ function mintToken(prefix: string): string {
   return `${prefix}${randomBytes(9).toString('hex')}`
 }
 
+// Export jobs each session resolved through a share link handle, per lab instance.
+const exportLineage = new WeakMap<LabState, Map<string, Set<string>>>()
+
+function exportLineageFor(state: LabState, sessionToken: string): Set<string> {
+  let bySession = exportLineage.get(state)
+  if (!bySession) {
+    bySession = new Map()
+    exportLineage.set(state, bySession)
+  }
+  let jobs = bySession.get(sessionToken)
+  if (!jobs) {
+    jobs = new Set()
+    bySession.set(sessionToken, jobs)
+  }
+  return jobs
+}
+
 function serviceToken(state: LabState): string {
   return hmacHex(state.plan.secrets.serviceToken, 'service')
 }
@@ -431,6 +448,7 @@ export async function handleApi(
       jobId: state.plan.nexus.exportJobId,
       runId,
     }, session.originPersona)
+    exportLineageFor(state, session.token).add(state.plan.nexus.exportJobId)
     sendJson(res, 200, {
       linkId: shareMetadata[0]!,
       folder,
@@ -446,9 +464,20 @@ export async function handleApi(
   if (exportResult || exportStatus) {
     const session = auth(state, req, res)
     if (!session) return
-    const jobId = encodeURIComponent((exportResult ?? exportStatus)![0]!)
+    const rawJobId = (exportResult ?? exportStatus)![0]!
+    // Export jobs are addressable only by sessions that resolved them through a share link handle.
+    if (!exportLineageFor(state, session.token).has(rawJobId)) {
+      sendJson(res, 404, { error: 'unknown export' })
+      return
+    }
+    const jobId = encodeURIComponent(rawJobId)
+    // The worker scopes job reads to the caller tenant and tracks status polls per requester.
     const response = await deps.egress.fetch('docs-worker', exportResult ? `/jobs/${jobId}/result` : `/jobs/${jobId}`, {
-      headers: { 'x-guardian-run-id': runId },
+      headers: {
+        'x-guardian-run-id': runId,
+        'x-lab-tenant': session.tenantId,
+        'x-lab-requester': digest(`requester:${session.token}`),
+      },
     })
     const text = await response.text()
     res.writeHead(response.status, { 'content-type': response.headers.get('content-type') ?? 'application/json' })
