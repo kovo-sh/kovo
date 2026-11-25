@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   cancelGithubDeviceFlowAction,
   listGithubRepositories,
@@ -7,10 +7,10 @@ import {
   startGithubDeviceFlowAction,
 } from '../../actions.ts'
 import { Icon } from '../run/icons.tsx'
-import { Checkbox } from '../ui/checkbox.tsx'
 import { Input } from '../ui/input.tsx'
 import type { GithubAppInstallationSummary } from '../../server/github-connector.ts'
 import { GithubInstallBanner } from './GithubInstallBanner.tsx'
+import { GroupedRepoPicker } from './GroupedRepoPicker.tsx'
 import type { DiscoveredGithubRepo } from './types.ts'
 
 export interface GithubPatStatusSummary {
@@ -61,18 +61,33 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
-/** Theme-aware repo + code-branch + security lens illustration (light & dark). */
-function GithubBannerSvg({ connected }: { connected: boolean }) {
-  const accent = connected ? 'var(--ok)' : 'var(--accent)'
-  const accentSoft = connected ? 'var(--ok-soft)' : 'var(--accent-soft)'
-  const accentLine = connected
-    ? 'color-mix(in srgb, var(--ok) 45%, transparent)'
-    : 'var(--accent-line)'
+/** Crisp 16px monochrome GitHub mark for compact connected header bar. */
+function GithubMarkIcon() {
+  return (
+    <svg
+      className="cp-gh-mark"
+      width="16"
+      height="16"
+      viewBox="0 0 16 16"
+      fill="currentColor"
+      aria-hidden="true"
+    >
+      <path
+        fillRule="evenodd"
+        clipRule="evenodd"
+        d="M8 1C4.13 1 1 4.13 1 8c0 3.09 2.01 5.71 4.79 6.64.35.06.48-.15.48-.34 0-.17-.01-.72-.01-1.31-1.76.32-2.21-.43-2.35-.83-.08-.2-.42-.83-.72-.99-.24-.13-.59-.46-.01-.47.55-.01.94.51 1.07.72.63 1.05 1.63.76 2.03.58.06-.45.25-.76.45-.93-1.56-.18-3.19-.78-3.19-3.47 0-.76.27-1.39.72-1.88-.07-.18-.32-.89.07-1.85 0 0 .59-.19 1.93.72a6.7 6.7 0 0 1 3.51 0c1.34-.91 1.93-.72 1.93-.72.39.96.14 1.67.07 1.85.45.49.72 1.11.72 1.88 0 2.7-1.64 3.29-3.2 3.47.25.22.47.64.47 1.3 0 .94-.01 1.69-.01 1.93 0 .19.13.41.48.34A7.002 7.002 0 0 0 15 8c0-3.87-3.13-7-7-7Z"
+      />
+    </svg>
+  )
+}
+
+/** Refined neutral-ink repo + branch + security lens illustration (light & dark). */
+function GithubBannerSvg() {
   return (
     <svg
       className="cp-gh-art"
-      width="58"
-      height="44"
+      width="54"
+      height="40"
       viewBox="0 0 58 44"
       fill="none"
       aria-hidden="true"
@@ -90,46 +105,34 @@ function GithubBannerSvg({ connected }: { connected: boolean }) {
       />
       {/* Window header bar */}
       <path d="M1.6 11.5H40.4" stroke="var(--line)" strokeWidth="1.1" />
-      <circle cx="7" cy="7.5" r="1.4" fill="var(--fg-4)" />
-      <circle cx="11.5" cy="7.5" r="1.4" fill="var(--fg-4)" />
-      <circle cx="16" cy="7.5" r="1.4" fill="var(--fg-4)" />
+      <circle cx="7" cy="7.5" r="1.3" fill="var(--fg-4)" />
+      <circle cx="11.5" cy="7.5" r="1.3" fill="var(--fg-4)" />
+      <circle cx="16" cy="7.5" r="1.3" fill="var(--fg-4)" />
 
       {/* Git branch graph inside repo card */}
-      <circle cx="11.5" cy="18.5" r="2.2" fill="var(--panel)" stroke="currentColor" strokeWidth="1.4" />
-      <circle cx="11.5" cy="30" r="2.2" fill="var(--panel)" stroke="currentColor" strokeWidth="1.4" />
-      <circle cx="21.5" cy="21" r="2.2" fill={accent} />
-      <path d="M11.5 20.7V27.8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-      <path d="M11.5 27.8C11.5 24.4 21.5 25.2 21.5 23.2" stroke={accent} strokeWidth="1.4" strokeLinecap="round" />
+      <circle cx="11.5" cy="18.5" r="2.1" fill="var(--panel)" stroke="currentColor" strokeWidth="1.35" />
+      <circle cx="11.5" cy="30" r="2.1" fill="var(--panel)" stroke="currentColor" strokeWidth="1.35" />
+      <path d="M11.5 20.6V27.9" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
+      <path d="M11.5 27.9C11.5 24.4 21.5 25.2 21.5 23.1" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
+      <circle cx="21.5" cy="21" r="2.2" fill="var(--accent)" />
 
       {/* Subtle code lines */}
-      <rect x="27" y="17.5" width="9" height="2.4" rx="1.2" fill="var(--line-strong)" />
-      <rect x="27" y="23" width="7" height="2.4" rx="1.2" fill="var(--line-2)" />
-      <rect x="27" y="28.5" width="8.5" height="2.4" rx="1.2" fill="var(--line-2)" />
+      <rect x="27" y="17.5" width="9" height="2.2" rx="1.1" fill="var(--line-strong)" />
+      <rect x="27" y="23" width="7" height="2.2" rx="1.1" fill="var(--line-2)" />
+      <rect x="27" y="28.5" width="8.5" height="2.2" rx="1.1" fill="var(--line-2)" />
 
-      {/* Overlapping shield / security magnifier badge */}
+      {/* Overlapping neutral security lens badge */}
       <circle
         cx="43"
         cy="28"
-        r="12.5"
+        r="11.5"
         fill="var(--panel)"
-        stroke={accentLine}
-        strokeWidth="1.35"
+        stroke="var(--line-strong)"
+        strokeWidth="1.25"
       />
-      <circle cx="43" cy="28" r="10" fill={accentSoft} />
-      {connected ? (
-        <path
-          d="M38.8 28.2L41.6 31L47.4 25.1"
-          stroke={accent}
-          strokeWidth="1.9"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-      ) : (
-        <>
-          <circle cx="41.8" cy="26.8" r="4.1" stroke={accent} strokeWidth="1.65" />
-          <path d="M44.9 29.9L47.8 32.8" stroke={accent} strokeWidth="1.75" strokeLinecap="round" />
-        </>
-      )}
+      <circle cx="43" cy="28" r="9" fill="var(--sunk)" />
+      <circle cx="41.8" cy="26.8" r="3.9" stroke="var(--fg-2)" strokeWidth="1.55" />
+      <path d="M44.7 29.7L47.5 32.5" stroke="var(--fg-2)" strokeWidth="1.65" strokeLinecap="round" />
     </svg>
   )
 }
@@ -239,16 +242,6 @@ export function CreateProjectGithubBlock({
     return () => { cancelled = true }
   }, [patStatus.configured, reposLoaded, onChangeSelectedRepos])
 
-  const filteredRepos = useMemo(() => {
-    const q = search.trim().toLowerCase()
-    if (!q) return repos
-    return repos.filter(r =>
-      r.fullName.toLowerCase().includes(q) ||
-      r.defaultBranch.toLowerCase().includes(q) ||
-      (r.description?.toLowerCase().includes(q) ?? false),
-    )
-  }, [repos, search])
-
   async function handleStartDeviceFlow() {
     if (startingDeviceFlow || savingToken || disabled) return
     const trimmedClientId = clientIdInput.trim()
@@ -325,16 +318,6 @@ export function CreateProjectGithubBlock({
     }
   }
 
-  function toggleRepo(fullName: string, checked: boolean) {
-    if (checked) {
-      if (selectedRepos.includes(fullName)) return
-      if (selectedRepos.length >= MAX_SYNC_REPOS) return
-      onChangeSelectedRepos([...selectedRepos, fullName])
-    } else {
-      onChangeSelectedRepos(selectedRepos.filter(n => n !== fullName))
-    }
-  }
-
   if (!patStatus.configured) {
     return (
       <div className={`cp-gh-card${expandedConnect ? ' open' : ''}`}>
@@ -348,7 +331,7 @@ export function CreateProjectGithubBlock({
           aria-expanded={expandedConnect}
           disabled={disabled}
         >
-          <GithubBannerSvg connected={false} />
+          <GithubBannerSvg />
           <span className="cp-gh-copy">
             <span className="cp-gh-title-row">
               <strong>Connect GitHub</strong>
@@ -489,23 +472,18 @@ export function CreateProjectGithubBlock({
 
   return (
     <div className="cp-gh-card connected">
-      <div className="cp-gh-connected-head">
-        <GithubBannerSvg connected={true} />
-        <div className="cp-gh-copy">
-          <div className="cp-gh-title-row">
-            <strong>GitHub repositories</strong>
-            <span className="tag ok">{connectionBadge(patStatus)}</span>
-            {selectedRepos.length > 0 && (
-              <span className="tag accent num">{selectedRepos.length} selected</span>
-            )}
-          </div>
-          <span className="cp-gh-sub">
-            Select repos to include in security analysis
-          </span>
+      <div className="cp-gh-connected-bar">
+        <div className="cp-gh-connected-left">
+          <GithubMarkIcon />
+          <strong className="cp-gh-connected-title">GitHub</strong>
+          <span className="cp-gh-login-pill">{connectionBadge(patStatus)}</span>
+          {selectedRepos.length > 0 && (
+            <span className="cp-gh-sel-pill num">{selectedRepos.length} selected</span>
+          )}
         </div>
         <button
           type="button"
-          className="btn ghost"
+          className="btn ghost cp-gh-refresh-btn"
           disabled={loadingRepos || disabled}
           onClick={() => void handleRefresh()}
         >
@@ -513,91 +491,42 @@ export function CreateProjectGithubBlock({
         </button>
       </div>
 
-      <div className="cp-gh-panel">
-        <GithubInstallBanner
-          authKind={patStatus.authKind}
-          tokenKind={patStatus.tokenKind}
-          login={patStatus.login}
-          installUrl={patStatus.installUrl}
-          installations={patStatus.installations}
-          privateRepoCount={patStatus.privateRepoCount}
-          needsAppInstall={patStatus.needsAppInstall}
-          loading={loadingRepos}
-          onRefresh={() => void handleRefresh()}
-          compact
-        />
+      <GithubInstallBanner
+        authKind={patStatus.authKind}
+        tokenKind={patStatus.tokenKind}
+        login={patStatus.login}
+        installUrl={patStatus.installUrl}
+        installations={patStatus.installations}
+        privateRepoCount={patStatus.privateRepoCount}
+        needsAppInstall={patStatus.needsAppInstall}
+        loading={loadingRepos}
+        onRefresh={() => void handleRefresh()}
+        compact
+        flush
+      />
+
+      <div className="cp-gh-connected-body">
         {loadingRepos && !reposLoaded ? (
-          <span className="muted">Loading repositories…</span>
+          <div className="cp-gh-state">
+            <span className="muted">Loading repositories…</span>
+          </div>
         ) : error ? (
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+          <div className="cp-gh-state cp-gh-state-err">
             <span role="alert" className="cp-gh-err">{error}</span>
             <button type="button" className="btn ghost" onClick={() => void handleRefresh()}>Retry</button>
           </div>
-        ) : repos.length === 0 ? (
-          <span className="muted">No repositories found. You can sync repos later in the project.</span>
         ) : (
-          <>
-            {repos.length > 1 && (
-              <div className="cp-gh-input-row">
-                <Input
-                  type="search"
-                  value={search}
-                  onChange={e => setSearch(e.target.value)}
-                  placeholder="Filter repositories…"
-                  aria-label="Filter GitHub repositories"
-                  disabled={disabled}
-                  style={{ flex: 1, minWidth: 150 }}
-                />
-                <button
-                  type="button"
-                  className="btn ghost"
-                  disabled={disabled || filteredRepos.length === 0}
-                  onClick={() => onChangeSelectedRepos(filteredRepos.slice(0, MAX_SYNC_REPOS).map(r => r.fullName))}
-                >
-                  Select all
-                </button>
-                {selectedRepos.length > 0 && (
-                  <button
-                    type="button"
-                    className="btn ghost"
-                    disabled={disabled}
-                    onClick={() => onChangeSelectedRepos([])}
-                  >
-                    Clear
-                  </button>
-                )}
-              </div>
-            )}
-
-            <div className="cp-gh-repo-list" role="group" aria-label="Accessible GitHub repositories">
-              {filteredRepos.length === 0 ? (
-                <div className="cp-gh-repo-empty">No repositories match “{search.trim()}”.</div>
-              ) : filteredRepos.map((repo, idx) => {
-                const checked = selectedRepos.includes(repo.fullName)
-                const atCap = !checked && selectedRepos.length >= MAX_SYNC_REPOS
-                return (
-                  <label
-                    key={repo.fullName}
-                    className={`checkbox cp-gh-repo-item${checked ? ' on' : ''}`}
-                    style={{
-                      borderTop: idx === 0 ? 'none' : '1px solid var(--line)',
-                      cursor: atCap || disabled ? 'default' : 'pointer',
-                      opacity: atCap ? 0.55 : 1,
-                    }}
-                  >
-                    <Checkbox
-                      checked={checked}
-                      disabled={disabled || atCap}
-                      aria-label={`Select repository ${repo.fullName}`}
-                      onCheckedChange={next => toggleRepo(repo.fullName, Boolean(next))}
-                    />
-                    <span className="mono cp-gh-repo-name">{repo.fullName}</span>
-                    <span className="tag solid">{repo.private ? 'private' : 'public'}</span>
-                  </label>
-                )
-              })}
-            </div>
-          </>
+          <GroupedRepoPicker
+            repos={repos}
+            selectedRepos={selectedRepos}
+            onChangeSelectedRepos={onChangeSelectedRepos}
+            search={search}
+            onSearchChange={setSearch}
+            maxSelectable={MAX_SYNC_REPOS}
+            disabled={disabled}
+            variant="compact"
+            emptyMessage="No repositories found. You can sync repos later in the project."
+          />
         )}
       </div>
     </div>

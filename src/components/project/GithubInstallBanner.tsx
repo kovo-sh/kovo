@@ -13,6 +13,7 @@ export interface GithubInstallBannerProps {
   loading?: boolean
   onRefresh: () => void
   compact?: boolean
+  flush?: boolean
 }
 
 function OrgRepoLockIcon() {
@@ -74,6 +75,7 @@ export function GithubInstallBanner({
   loading = false,
   onRefresh,
   compact = false,
+  flush = false,
 }: GithubInstallBannerProps) {
   const [awaitingReturn, setAwaitingReturn] = useState(false)
   const onRefreshRef = useRef(onRefresh)
@@ -143,10 +145,12 @@ export function GithubInstallBanner({
   const isGithubApp = authKind === 'github_app_device' || tokenKind === 'github_app'
   const installedList = Array.isArray(installations) ? installations : []
 
+  const modClasses = `${compact ? ' gh-inst-compact' : ''}${flush ? ' gh-inst-flush' : ''}`
+
   if (needsAppInstall) {
     return (
       <div
-        className={`gh-inst-banner${compact ? ' gh-inst-compact' : ''}`}
+        className={`gh-inst-banner${modClasses}`}
         role="region"
         aria-label="GitHub App repository access"
         data-testid="github-install-banner"
@@ -207,7 +211,7 @@ export function GithubInstallBanner({
   if (installedList.length > 0) {
     return (
       <div
-        className={`gh-inst-bar${compact ? ' gh-inst-compact' : ''}`}
+        className={`gh-inst-bar${modClasses}`}
         role="region"
         aria-label="Installed GitHub accounts and organizations"
         data-testid="github-install-bar"
@@ -276,7 +280,7 @@ export function GithubInstallBanner({
   if (isGithubApp && (installUrl || loading)) {
     return (
       <div
-        className={`gh-inst-bar${compact ? ' gh-inst-compact' : ''}`}
+        className={`gh-inst-bar${modClasses}`}
         role="region"
         aria-label="GitHub App repository access"
         data-testid="github-install-bar"
