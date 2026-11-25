@@ -757,9 +757,32 @@ test('CompositePatchRetestProof redacts secrets and grades OSS M4 >= 80% closure
   )
   assert.equal(verifyCompositePatchRetestProofIntegrity(fixedProof), true)
 
+  const vulnReceipt = {
+    ...receipt,
+    hops: receipt.hops.map(h => h.hopId === 'hop-4' ? { ...h, exchangeIds: ['ex-ctrl-4', 'ex-4'] } : h),
+    terminalImpact: { ...receipt.terminalImpact, terminalExchangeId: 'ex-4', preChainControlExchangeIds: ['ex-ctrl-4'] },
+  }
+  const vulnBaseRunner = makeUnpatchedRunner()
   const vulnProof = await retestCompositeChainPatch({
-    receipt,
-    runner: makeUnpatchedRunner(),
+    receipt: vulnReceipt,
+    runner: {
+      replayHop(ctx) {
+        const res = vulnBaseRunner.replayHop(ctx)
+        if (ctx.hop.hopId === 'hop-4' && !('then' in res)) {
+          return {
+            ...res,
+            entries: [
+              signedEntry('ex-ctrl-4', makeStep({ id: 'ex-ctrl-4', arm: 'control', method: 'POST', status: 403, pathAndQuery: '/api/v1/settlements/execute', json: { error: 'forbidden' } }), {
+                timestampMs: 900,
+                actorPersona: 'member_a',
+              }),
+              ...(res.entries ?? []),
+            ],
+          }
+        }
+        return res
+      },
+    },
     verifyOptions: { attackerPersonas: ['member_a'], signingKey: SIGNING_KEY },
   })
   const inconclusiveProof = await retestCompositeChainPatch({
