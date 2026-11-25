@@ -40,9 +40,7 @@ function toStepStatusItem(
     ? Math.max(0, Math.round(entry.bodyBytes))
     : typeof entry.body === 'string'
       ? Buffer.byteLength(entry.body, 'utf8')
-      : typeof entry.domSnippet === 'string'
-        ? Buffer.byteLength(entry.domSnippet, 'utf8')
-        : 0
+      : 0
   return {
     id,
     role,
@@ -166,6 +164,25 @@ export function buildInlineVerifyFeedback(
   const kind = spec && typeof spec === 'object' && 'kind' in spec && typeof (spec as { kind?: unknown }).kind === 'string'
     ? (spec as { kind: string }).kind
     : (typeof payload.kind === 'string' ? payload.kind : '')
+
+  // Retired legacy DSL kinds fail closed immediately: skip dead step/SPA/header/body enrichment
+  // and report retriesRemaining=0 so agents switch to guardian_verify instead of retrying DSL.
+  if (payload.retired === true) {
+    const retiredReason = replay.outcome.reason ?? (typeof payload.reason === 'string' ? payload.reason : '')
+    return redactJsonValue({
+      verdict: replay.verdict,
+      ...(replay.verificationTier ? { verificationTier: replay.verificationTier } : {}),
+      controlPassed: false,
+      assertionSummary: {
+        observed: redact(replay.outcome.observed, secrets).slice(0, 400),
+        expected: redact(replay.outcome.expected, secrets).slice(0, 400),
+        ...(retiredReason ? { reason: redact(retiredReason, secrets).slice(0, 400) } : {}),
+      },
+      stepStatuses: [],
+      retriesRemaining: 0,
+      ...(kind ? { verificationKind: kind } : {}),
+    } satisfies EnrichedInlineVerifyFeedback, secrets)
+  }
 
   const stepStatuses: InlineVerifyFeedback['stepStatuses'] = []
   if (payload.steps && typeof payload.steps === 'object' && !Array.isArray(payload.steps)) {

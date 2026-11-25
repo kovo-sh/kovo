@@ -80,17 +80,26 @@ test('guardian_verify is exposed on every specialist profile and prioritized bef
     const pIdx = names.indexOf('propose_chain_finding')
     const vIdx = names.indexOf('verify_replay_spec')
     assert.ok(gIdx >= 0, `${id} registers guardian_verify`)
-    assert.ok(gIdx < pIdx && gIdx < vIdx, `${id} registers guardian_verify before propose_chain_finding and verify_replay_spec`)
+    assert.ok(gIdx < pIdx, `${id} registers guardian_verify before propose_chain_finding`)
+    assert.equal(vIdx, -1, `${id} hides legacy verify_replay_spec by default when guardian_verify is active`)
+
+    // Explicit opt-in exposes verify_replay_spec after guardian_verify for legacy/static tests.
+    const optedIn = buildWorkerTools(scoped, v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {}, { allowLegacyReplaySpec: true })
+    const optNames = optedIn.map(t => t.name)
+    assert.ok(optNames.indexOf('guardian_verify') < optNames.indexOf('verify_replay_spec'), `${id} registers guardian_verify before opted-in verify_replay_spec`)
   }
 })
 
 test('tool descriptions mark verify_replay_spec and propose_chain_finding as legacy fallback only when guardian_verify is active', () => {
   const withTools = buildWorkerTools(fullHandlers(true), v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {})
-  const withVrs = withTools.find(t => t.name === 'verify_replay_spec')!
+  assert.equal(withTools.find(t => t.name === 'verify_replay_spec'), undefined, 'verify_replay_spec is omitted by default while guardian_verify is active')
   const withPropose = withTools.find(t => t.name === 'propose_chain_finding')!
-  assert.match(withVrs.description, /LEGACY FALLBACK.*guardian_verify/i)
   assert.match(withPropose.description, /LEGACY FALLBACK.*guardian_verify/i)
   assert.match(withPropose.description, /proof_kind="agent_script"/)
+
+  const withOptInTools = buildWorkerTools(fullHandlers(true), v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {}, { allowLegacyReplaySpec: true })
+  const withVrs = withOptInTools.find(t => t.name === 'verify_replay_spec')!
+  assert.match(withVrs.description, /LEGACY FALLBACK.*guardian_verify/i)
 
   const withoutTools = buildWorkerTools(fullHandlers(false), v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {})
   const withoutVrs = withoutTools.find(t => t.name === 'verify_replay_spec')!
@@ -173,8 +182,14 @@ test('when guardian_verify is active, propose_chain_finding and verify_replay_sp
     verify_replay_spec: async () => { verifyCalls += 1; return { ok: true } },
   }, v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {})
 
+  assert.equal(activeTools.find(t => t.name === 'verify_replay_spec'), undefined, 'verify_replay_spec is hidden by default when guardian_verify is active')
   const proposeTool = activeTools.find(t => t.name === 'propose_chain_finding')!
-  const verifyTool = activeTools.find(t => t.name === 'verify_replay_spec')!
+
+  const optedInTools = buildWorkerTools({
+    guardian_verify: async () => ({ confirmed: true, attempts: [] }),
+    verify_replay_spec: async () => { verifyCalls += 1; return { ok: true } },
+  }, v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {}, { allowLegacyReplaySpec: true })
+  const verifyTool = optedInTools.find(t => t.name === 'verify_replay_spec')!
 
   const rejectedPropose = await proposeTool.execute({
     replaySpec: httpChainSpec(),
