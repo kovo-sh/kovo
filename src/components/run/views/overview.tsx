@@ -1,18 +1,20 @@
-// Overview (B's written verdict at A's density). Waiting runs render the consent sheet.
+// Overview: written verdict, severity tally, confidence meter, key stats,
+// queue summary, top findings, workflow summary, traffic histogram, coverage.
+// Waiting runs render the consent sheet.
 import { useMemo, useState } from 'react'
-import type { CSSProperties } from 'react'
 import { capabilityTierMeta } from '../../run-state.ts'
 import { useRun, useRunModel, useVerdict } from '../data.tsx'
 import { useDecisions } from '../decisions.tsx'
 import { HostLabel } from '../display.tsx'
 import { fmtDate, fmtN, fmtTime, fmtTok, host, plural } from '../format.ts'
-import { CovSwatch, SevGlyph, StatusGlyph } from '../glyphs.tsx'
+import { CovSwatch, LiveDot, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { PHASE_LABEL, SEV, SEV_COL, SEV_LABEL } from '../meta.ts'
 import type { ViewId } from '../meta.ts'
 import { bySeriousness, coverageCounts, trafficHistogram } from '../model.ts'
 import { AnimatedNumber, Meter } from '../motion.tsx'
 import { useLinks, useNav } from '../nav.tsx'
+import { cn, covBarBgClass, runBtn } from '../tw.ts'
 import { ConsentView } from './consent.tsx'
 import { LabPanel } from './lab.tsx'
 
@@ -25,7 +27,9 @@ export function OverviewView() {
 
 function Go({ to, children }: { to: ViewId; children: string }) {
   const nav = useNav()
-  return <button type="button" className="go" onClick={() => nav.setView(to)}>{children}<Icon name="arrowR" /></button>
+  return <button type="button" className={cn(runBtn({ variant: 'link', size: 'none' }), 'ml-auto')} onClick={() => nav.setView(to)}>
+    {children}<Icon name="arrowR" />
+  </button>
 }
 
 function RunOverview() {
@@ -67,143 +71,257 @@ function RunOverview() {
     ? runningWorkers.slice(0, 2).map(w => w.title).join(' · ') + (runningWorkers.length > 2 ? ` +${runningWorkers.length - 2} more` : '')
     : `${PHASE_LABEL[r.phase] ?? r.phase} · Round ${r.roundNo}`
 
-  return <div className="ov"><div className="ov-in">
-    {r.status === 'running' && <div className="live-bar" role="status" aria-live="polite">
-      <span className="live" aria-hidden="true" />
-      <span className="live-k">What Kovo Hunter is doing now</span>
-      <span className="live-v" title={liveSummary}>
-        {runningWorkers.length > 0 && <b className="num">{plural(runningWorkers.length, 'active worker')} · </b>}
-        {liveSummary}
-      </span>
-      <button type="button" className="linkbtn live-go" onClick={() => runningWorkers[0] ? links.worker(runningWorkers[0].id) : nav.setView('workflow')}>
-        {runningWorkers.length > 0 ? 'Inspect' : 'Workflow'}<Icon name="arrowR" />
-      </button>
-    </div>}
-    <div className="ov-eyebrow num">
-      <span style={{ color: 'var(--fg-2)', fontWeight: 500 }}>{r.status === 'complete' ? 'Run summary' : 'Provisional summary'}</span>
-      <span className="sep">·</span>
-      <span>{rep && !live ? `Report v${rep.version} · ${fmtDate(rep.createdAt)}` : `As of ${fmtDate(model.end)}`}</span>
-      <span className="sep">·</span>
-      <span title={`Tier ${r.capabilityTier} · ${capabilityTierMeta[r.capabilityTier].name}`}>{capabilityTierMeta[r.capabilityTier].short}</span>
-    </div>
-    <h1 className="hed">{v.hed}</h1>
-    {worst && <p className="dek">
-      <span className="k">{live ? 'Most severe so far' : 'Most serious'}</span>
-      <SevGlyph sev={worst.severity} />
-      <a role="link" tabIndex={0} title={worst.title} onClick={() => links.finding(worst.id)} onKeyDown={e => { if (e.key === 'Enter') links.finding(worst.id) }}>{worst.title.replace(/\.$/, '')}</a>
-      <span className="h mono">{host(worst.origin)}</span>
-    </p>}
-    {v.dek && <p className="dek" style={{ marginTop: 4 }}><span style={{ color: 'var(--fg-2)' }}>{v.dek}</span></p>}
+  return <div className="min-h-0 flex-1 overflow-auto">
+    <div className="max-w-[980px] px-6 pb-14 pt-[22px]">
+      {r.status === 'running' && <div className="mb-3.5 flex min-h-9 min-w-0 items-center gap-2.5 rounded-lg bg-accent-soft px-3 py-1.5 text-[12.5px] shadow-[inset_0_0_0_1px_var(--accent-line)]" role="status" aria-live="polite">
+        <LiveDot />
+        <span className="flex-none whitespace-nowrap font-medium text-fg">What Kovo Hunter is doing now</span>
+        <span className="min-w-0 flex-1 truncate text-fg-muted" title={liveSummary}>
+          {runningWorkers.length > 0 && <b className="num font-medium text-fg">{plural(runningWorkers.length, 'active worker')} · </b>}
+          {liveSummary}
+        </span>
+        <button
+          type="button"
+          className={cn(runBtn({ variant: 'link', size: 'none' }), 'flex-none font-medium text-accent hover:text-fg')}
+          onClick={() => runningWorkers[0] ? links.worker(runningWorkers[0].id) : nav.setView('workflow')}
+        >
+          {runningWorkers.length > 0 ? 'Inspect' : 'Workflow'}<Icon name="arrowR" />
+        </button>
+      </div>}
 
-    <div className="trio">
-      <div>
-        <h3>What was asked</h3>
-        <p className={'ask' + (!long || goalOpen ? ' open' : '')}>{goal}</p>
-        {long && <button type="button" className="linkbtn" onClick={() => setGoalOpen(!goalOpen)}>{goalOpen ? 'Show less' : 'Show full goal'}</button>}
+      <div className="num mb-2 flex items-center gap-2 overflow-hidden whitespace-nowrap text-[12px] text-fg-subtle">
+        <span className="font-medium text-fg-muted">{r.status === 'complete' ? 'Run summary' : 'Provisional summary'}</span>
+        <span className="text-fg-faint">·</span>
+        <span>{rep && !live ? `Report v${rep.version} · ${fmtDate(rep.createdAt)}` : `As of ${fmtDate(model.end)}`}</span>
+        <span className="text-fg-faint">·</span>
+        <span title={capabilityTierMeta[r.capabilityTier].name}>{capabilityTierMeta[r.capabilityTier].short}</span>
       </div>
-      <div>
-        <h3>What Kovo Hunter found</h3>
-        <div className="tally num">
-          {tally.map(([sev, k]) => [
-            <span key={sev + 'l'} className={'l' + (k ? '' : ' z')}><SevGlyph sev={sev} />{SEV_LABEL[sev]}</span>,
-            <span key={sev + 'b'} className="bar"><TallyBar id={'ov.t.' + sev} value={k / maxT} color={SEV_COL[sev] === 'var(--fg-4)' ? 'var(--fg-3)' : SEV_COL[sev]} /></span>,
-            <span key={sev + 'n'} className={'n' + (k ? '' : ' z')}>{k}</span>,
-          ])}
+
+      <h1 className="m-0 max-w-[820px] text-pretty text-[18px] font-semibold leading-[26px] tracking-[-0.017em] text-fg">{v.hed}</h1>
+      {worst && <p className="m-0 mt-1.5 flex min-w-0 items-center gap-2 text-[13px] leading-5 text-fg-muted">
+        <span className="flex-none text-fg-subtle">{live ? 'Most severe so far' : 'Most serious'}</span>
+        <SevGlyph sev={worst.severity} />
+        <a
+          className="min-w-0 cursor-pointer truncate border-b border-line-strong text-fg no-underline hover:border-fg-muted"
+          role="link"
+          tabIndex={0}
+          title={worst.title}
+          onClick={() => links.finding(worst.id)}
+          onKeyDown={e => { if (e.key === 'Enter') links.finding(worst.id) }}
+        >
+          {worst.title.replace(/\.$/, '')}
+        </a>
+        <span className="flex-none font-mono text-[12px] text-fg-subtle">{host(worst.origin)}</span>
+      </p>}
+      {v.dek && <p className="m-0 mt-1 flex min-w-0 items-center gap-2 text-[13px] leading-5 text-fg-muted"><span>{v.dek}</span></p>}
+
+      <div className="mt-[18px] grid grid-cols-[1.15fr_1fr_1fr] border-y border-line max-[1180px]:grid-cols-2">
+        <div className="min-w-0 pb-3.5 pr-[18px] pt-3 max-[1180px]:col-span-full max-[1180px]:border-b max-[1180px]:border-line max-[1180px]:pr-0">
+          <h3 className="m-0 mb-1.5 text-[11.5px] font-medium text-fg-subtle">What was asked</h3>
+          <p className={cn('m-0 text-[12.5px] leading-[19px] text-fg-muted', long && !goalOpen && 'line-clamp-4')}>{goal}</p>
+          {long && <button type="button" className={cn(runBtn({ variant: 'link', size: 'none' }), 'mt-1')} onClick={() => setGoalOpen(!goalOpen)}>{goalOpen ? 'Show less' : 'Show full goal'}</button>}
+        </div>
+        <div className="min-w-0 border-l border-line px-[18px] pb-3.5 pt-3 max-[1180px]:border-l-0 max-[1180px]:pl-0">
+          <h3 className="m-0 mb-1.5 text-[11.5px] font-medium text-fg-subtle">What Kovo Hunter found</h3>
+          <div className="num grid grid-cols-[62px_1fr_26px] items-center gap-x-2 gap-y-[3px] text-[12px]">
+            {tally.map(([sev, k]) => [
+              <span key={sev + 'l'} className={cn('flex items-center gap-1.5', k ? 'text-fg-muted' : 'text-fg-faint')}><SevGlyph sev={sev} />{SEV_LABEL[sev]}</span>,
+              <span key={sev + 'b'} className="block h-1 overflow-hidden rounded-[3px] bg-line">
+                <TallyBar id={'ov.t.' + sev} value={k / maxT} color={SEV_COL[sev] === 'var(--fg-4)' ? 'var(--fg-3)' : SEV_COL[sev]} />
+              </span>,
+              <span key={sev + 'n'} className={cn('text-right', k ? 'text-fg-muted' : 'text-fg-faint')}>{k}</span>,
+            ])}
+          </div>
+        </div>
+        <div className="min-w-0 border-l border-line pb-3.5 pl-[18px] pt-3">
+          <h3 className="m-0 mb-1.5 text-[11.5px] font-medium text-fg-subtle">How confident</h3>
+          <div className="mb-1.5 flex items-center gap-2 text-[15px] font-semibold tracking-[-0.01em] text-fg">{v.conf.word}</div>
+          {v.conf.seg.length > 0 && <div className="mb-2 flex h-[5px] gap-0.5 overflow-hidden rounded-[4px] bg-line" title={v.conf.seg.filter(x => x[0]).map(x => x[2] + ' ' + x[0]).join(' · ')}>
+            {v.conf.seg.filter(x => x[0]).map(x => <b key={x[2]} className="block h-full" style={{ flex: x[0] / segT, background: x[1] }} />)}
+          </div>}
+          <p className="m-0 text-[12.5px] leading-[19px] text-fg-muted">{v.conf.text}</p>
         </div>
       </div>
-      <div>
-        <h3>How confident</h3>
-        <div className="confw">{v.conf.word}</div>
-        {v.conf.seg.length > 0 && <div className="cmeter" title={v.conf.seg.filter(x => x[0]).map(x => x[2] + ' ' + x[0]).join(' · ')}>
-          {v.conf.seg.filter(x => x[0]).map(x => <b key={x[2]} style={{ flex: x[0] / segT, background: x[1] }} />)}
-        </div>}
-        <p>{v.conf.text}</p>
+
+      <div className="num grid grid-cols-3 border-b border-line">
+        <div className="min-w-0 pb-[11px] pr-3.5 pt-2.5">
+          <div className="flex items-center gap-1.5 whitespace-nowrap text-[11.5px] text-fg-subtle">Tokens</div>
+          <div className="whitespace-nowrap text-[15px] font-medium leading-[22px] tracking-[-0.01em] text-fg">
+            <AnimatedNumber id="ov.tok" value={r.spentTokens} format={x => fmtTok(Math.round(x))} />
+            <small className="ml-[3px] text-[12px] font-normal text-fg-subtle">{fmtN(r.turnsUsed)} turns</small>
+          </div>
+        </div>
+        <div className="min-w-0 border-l border-line px-3.5 pb-[11px] pt-2.5">
+          <div className="flex items-center gap-1.5 whitespace-nowrap text-[11.5px] text-fg-subtle">Workers</div>
+          <div className="whitespace-nowrap text-[15px] font-medium leading-[22px] tracking-[-0.01em] text-fg">
+            <AnimatedNumber id="ov.wk" value={detail.assignments.length} />
+            <small className="ml-[3px] text-[12px] font-normal text-fg-subtle">{runningWorkers.length ? `${fmtN(runningWorkers.length)} running · ` : ''}{fmtN(done)} complete</small>
+          </div>
+        </div>
+        <div className="min-w-0 border-l border-line pb-[11px] pl-3.5 pt-2.5">
+          <div className="flex items-center gap-1.5 whitespace-nowrap text-[11.5px] text-fg-subtle">Facts · evidence</div>
+          <div className="whitespace-nowrap text-[15px] font-medium leading-[22px] tracking-[-0.01em] text-fg">
+            <AnimatedNumber id="ov.fa" value={detail.facts.length} />
+            <small className="ml-[3px] text-[12px] font-normal text-fg-subtle">· {fmtN(detail.evidence.length)}</small>
+          </div>
+        </div>
       </div>
-    </div>
 
-    <div className="stats stats-3 num">
-      <div><div className="k">Tokens</div><div className="v"><AnimatedNumber id="ov.tok" value={r.spentTokens} format={x => fmtTok(Math.round(x))} /><small>{fmtN(r.turnsUsed)} turns</small></div></div>
-      <div><div className="k">Workers</div><div className="v"><AnimatedNumber id="ov.wk" value={detail.assignments.length} /><small>{runningWorkers.length ? `${fmtN(runningWorkers.length)} running · ` : ''}{fmtN(done)} complete</small></div></div>
-      <div><div className="k">Facts · evidence</div><div className="v"><AnimatedNumber id="ov.fa" value={detail.facts.length} /><small>· {fmtN(detail.evidence.length)}</small></div></div>
-    </div>
+      <div className="mt-1.5 grid grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)] gap-x-7 max-[1180px]:grid-cols-1">
+        <div>
+          <div className="pt-4">
+            <h4 className="m-0 mb-1.5 flex items-center gap-2 text-[12px] font-medium text-fg-muted">
+              Needs you<Go to="queue">Open queue</Go>
+            </h4>
+            {needsAny
+              ? <div className="grid grid-cols-3 overflow-hidden rounded-lg border border-line">
+                {([['decide', 'Decide', 'To approve or deny'], ['review', 'Review', 'Unverified findings'], ['follow', 'Follow up', 'Flagged coverage']] as const).map(([k, l, sub], idx) => {
+                  const hot = k === 'decide' && s.decide.length > 0
+                  return <button
+                    key={k}
+                    type="button"
+                    className={cn(
+                      'flex h-auto cursor-pointer flex-col items-start gap-px whitespace-normal rounded-none border-0 bg-transparent px-3 py-[9px] text-left font-sans shadow-none transition-colors duration-[var(--d1)] hover:bg-hover',
+                      idx > 0 && 'border-l border-line',
+                    )}
+                    onClick={() => openQueue(k)}
+                  >
+                    <span className={cn('num flex items-center gap-[7px] text-[15px] font-medium leading-[22px]', hot ? 'text-warn' : 'text-fg')}>
+                      {hot && <StatusGlyph status="paused" />}
+                      <AnimatedNumber id={'ov.q.' + k} value={s[k].length} />
+                      <span className="text-[12.5px] font-medium text-fg-muted">{l}</span>
+                    </span>
+                    <span className="text-[11.5px] font-normal text-fg-subtle">{sub}</span>
+                  </button>
+                })}
+              </div>
+              : <div className="flex items-center gap-2.5 rounded-lg border border-line px-3 py-2.5 text-[12.5px] text-fg-muted">
+                <StatusGlyph status="complete" />Nothing needs you. Every finding is decided or verified.
+              </div>}
+          </div>
 
-    <div className="ov-grid">
-      <div>
-        <div className="ov-sec">
-          <h4>Needs you<Go to="queue">Open queue</Go></h4>
-          {needsAny
-            ? <div className="needs">
-              {([['decide', 'Decide', 'To approve or deny'], ['review', 'Review', 'Unverified findings'], ['follow', 'Follow up', 'Flagged coverage']] as const).map(([k, l, sub]) => {
-                const hot = k === 'decide' && s.decide.length > 0
-                return <button key={k} type="button" className={hot ? 'hot' : ''} onClick={() => openQueue(k)}>
-                  <span className="n num">{hot && <StatusGlyph status="paused" />}<AnimatedNumber id={'ov.q.' + k} value={s[k].length} /><span style={{ fontSize: 12.5, fontWeight: 500, color: 'var(--fg-2)' }}>{l}</span></span>
-                  <span className="l">{sub}</span>
-                </button>
-              })}
+          <div className="pt-4">
+            <h4 className="m-0 mb-1.5 flex items-center gap-2 text-[12px] font-medium text-fg-muted">
+              Most serious findings
+              <span className="num font-normal text-fg-subtle">{top.length} of {model.findings.length}</span>
+              <Go to="findings">All findings</Go>
+            </h4>
+            <div className="border-t border-line">
+              {top.map(f => <div
+                key={f.id}
+                className="flex h-[34px] cursor-pointer items-center gap-2.5 border-b border-line pl-0.5 pr-1 transition-colors duration-[var(--d1)] hover:bg-hover"
+                role="button"
+                tabIndex={0}
+                onClick={() => links.finding(f.id)}
+                onKeyDown={e => { if (e.key === 'Enter') links.finding(f.id) }}
+              >
+                <span className="inline-flex size-3.5 flex-none items-center justify-center"><SevGlyph sev={f.severity} /></span>
+                <span className="inline-flex size-3.5 flex-none items-center justify-center" title={f.status}><StatusGlyph status={f.status === 'static_verified' ? 'confirmed' : f.status} /></span>
+                <span className="min-w-0 flex-1 truncate text-fg">{f.title}</span>
+                <span className="w-[130px] flex-none truncate text-right font-mono text-[12px] text-fg-subtle max-[1180px]:hidden">
+                  <HostLabel host={host(f.origin)} quiet max={22} />
+                </span>
+              </div>)}
+              {!top.length && <p className="my-2 text-[12.5px] text-fg-subtle">{live ? 'No findings drafted yet.' : 'No findings.'}</p>}
             </div>
-            : <div className="needs done"><StatusGlyph status="complete" />Nothing needs you. Every finding is decided or verified.</div>}
-        </div>
-        <div className="ov-sec">
-          <h4>Most serious findings<span className="ct num">{top.length} of {model.findings.length}</span><Go to="findings">All findings</Go></h4>
-          <div className="ov-list">
-            {top.map(f => <div key={f.id} className="row" role="button" tabIndex={0} onClick={() => links.finding(f.id)} onKeyDown={e => { if (e.key === 'Enter') links.finding(f.id) }}>
-              <span className="g"><SevGlyph sev={f.severity} /></span>
-              <span className="g" title={f.status}><StatusGlyph status={f.status === 'static_verified' ? 'confirmed' : f.status} /></span>
-              <span className="title">{f.title}</span>
-              <span className="c-host mono" style={{ width: 130 }}><HostLabel host={host(f.origin)} quiet max={22} /></span>
-            </div>)}
-            {!top.length && <p style={{ color: 'var(--fg-3)', fontSize: 12.5, margin: '8px 0' }}>{live ? 'No findings drafted yet.' : 'No findings.'}</p>}
           </div>
         </div>
-      </div>
-      <div>
-        <LabPanel />
-        <div className="ov-sec">
-          <h4>Workflow<span className="ct num">{fmtN(detail.assignments.length)} workers</span><Go to="workflow">Graph</Go></h4>
-          <div className="flow" role="button" tabIndex={0} title="Open the workflow graph" onClick={() => nav.setView('workflow')} onKeyDown={e => { if (e.key === 'Enter') nav.setView('workflow') }}>
-            {phases.map((p, i) => {
-              const ws = model.workflow.byPhase.get(p) ?? []
-              if (!ws.length && p === 'retest') return null
-              const dn = ws.filter(a => a.status === 'complete').length
-              const pz = ws.filter(a => a.status === 'paused' || a.status === 'waiting_approval').length
-              const run = ws.filter(a => a.status === 'running').length
-              const fl = ws.filter(a => a.status === 'failed').length
-              return <div key={p} className="fr">
-                <span className="k">{PHASE_LABEL[p] ?? p}</span>
-                <span className="bar"><i style={{ width: `${ws.length / maxP * 100}%`, animationDelay: `${i * 60}ms` }} />{pz > 0 && <i className="pz" style={{ width: `${pz / maxP * 100}%`, animationDelay: `${i * 60}ms` }} />}</span>
-                <span className="v num">{ws.length}</span>
-                <span className="s num">{ws.length ? (pz ? pz + ' paused' : run ? run + ' running' : fl ? fl + ' failed' : dn === ws.length ? 'done' : dn + ' done') : '—'}</span>
-              </div>
-            })}
-            {rep && <div className="fr"><span className="k">Report</span><span className="bar"><i style={{ width: '4%', background: 'var(--fg)' }} /></span><span className="v num">v{rep.version}</span><span className="s">{rep.partial ? 'partial' : 'ready'}</span></div>}
+
+        <div>
+          <LabPanel />
+          <div className="pt-4">
+            <h4 className="m-0 mb-1.5 flex items-center gap-2 text-[12px] font-medium text-fg-muted">
+              Workflow
+              <span className="num font-normal text-fg-subtle">{fmtN(detail.assignments.length)} workers</span>
+              <Go to="workflow">Graph</Go>
+            </h4>
+            <div
+              className="cursor-pointer rounded-lg border border-line px-2.5 py-1 transition-colors duration-[var(--d1)] hover:border-line-strong"
+              role="button"
+              tabIndex={0}
+              title="Open the workflow graph"
+              onClick={() => nav.setView('workflow')}
+              onKeyDown={e => { if (e.key === 'Enter') nav.setView('workflow') }}
+            >
+              {phases.map(p => {
+                const ws = model.workflow.byPhase.get(p) ?? []
+                if (!ws.length && p === 'retest') return null
+                const dn = ws.filter(a => a.status === 'complete').length
+                const pz = ws.filter(a => a.status === 'paused' || a.status === 'waiting_approval').length
+                const run = ws.filter(a => a.status === 'running').length
+                const fl = ws.filter(a => a.status === 'failed').length
+                return <div key={p} className="grid h-6 grid-cols-[104px_1fr_30px_58px] items-center gap-2.5 text-[12px]">
+                  <span className="truncate text-fg-muted">{PHASE_LABEL[p] ?? p}</span>
+                  <span className="relative h-1 overflow-hidden rounded-[2px] bg-line">
+                    <i className="absolute inset-y-0 left-0 block rounded-[2px] bg-fg-subtle" style={{ width: `${ws.length / maxP * 100}%` }} />
+                    {pz > 0 && <i className="absolute inset-y-0 left-0 block rounded-[2px] bg-warn" style={{ width: `${pz / maxP * 100}%` }} />}
+                  </span>
+                  <span className="num text-right font-medium text-fg">{ws.length}</span>
+                  <span className="num whitespace-nowrap text-[11.5px] text-fg-subtle">
+                    {ws.length ? (pz ? pz + ' paused' : run ? run + ' running' : fl ? fl + ' failed' : dn === ws.length ? 'done' : dn + ' done') : '—'}
+                  </span>
+                </div>
+              })}
+              {rep && <div className="grid h-6 grid-cols-[104px_1fr_30px_58px] items-center gap-2.5 text-[12px]">
+                <span className="truncate text-fg-muted">Report</span>
+                <span className="relative h-1 overflow-hidden rounded-[2px] bg-line">
+                  <i className="absolute inset-y-0 left-0 block rounded-[2px] bg-fg" style={{ width: '4%' }} />
+                </span>
+                <span className="num text-right font-medium text-fg">v{rep.version}</span>
+                <span className="whitespace-nowrap text-[11.5px] text-fg-subtle">{rep.partial ? 'partial' : 'ready'}</span>
+              </div>}
+            </div>
           </div>
-        </div>
-        <div className="ov-sec">
-          <h4>Traffic<span className="ct num">{fmtN(counts.exchanges)} exchanges</span><Go to="exchanges">Exchanges</Go></h4>
-          <div className="hist" title="HTTP exchanges over time; red marks requests blocked by scope or rate limits">
-            {hist.bins.map((b, i) => <i key={i} style={{ height: Math.max(1.5, (b[0] + b[1]) / hist.max * 40).toFixed(1) + 'px', animationDelay: `${i * 8}ms` }} title={`${b[0]} exchanges${b[1] ? ', ' + b[1] + ' denied' : ''}`}>
-              {b[1] > 0 && <em style={{ height: Math.max(2, b[1] / (b[0] + b[1]) * 100) + '%' }} />}
-            </i>)}
+
+          <div className="pt-4">
+            <h4 className="m-0 mb-1.5 flex items-center gap-2 text-[12px] font-medium text-fg-muted">
+              Traffic
+              <span className="num font-normal text-fg-subtle">{fmtN(counts.exchanges)} exchanges</span>
+              <Go to="exchanges">Exchanges</Go>
+            </h4>
+            <div className="flex h-11 items-end gap-0.5 overflow-hidden border-b border-line" title="HTTP exchanges over time; red marks requests blocked by scope or rate limits">
+              {hist.bins.map((b, i) => <i
+                key={i}
+                className="relative min-h-px flex-1 overflow-hidden rounded-t-[1px] bg-fg-faint"
+                style={{ height: Math.max(1.5, (b[0] + b[1]) / hist.max * 40).toFixed(1) + 'px' }}
+                title={`${b[0]} exchanges${b[1] ? ', ' + b[1] + ' denied' : ''}`}
+              >
+                {b[1] > 0 && <em className="absolute inset-x-0 top-0 bg-danger" style={{ height: Math.max(2, b[1] / (b[0] + b[1]) * 100) + '%' }} />}
+              </i>)}
+            </div>
+            <div className="num mt-[3px] flex justify-between text-[11px] text-fg-subtle">
+              <span>{fmtTime(hist.t0)}</span>
+              <span>{fmtTime(hist.t0 + (hist.t1 - hist.t0) / 2)}</span>
+              <span>{fmtTime(hist.t1)}</span>
+            </div>
           </div>
-          <div className="hist-ax num"><span>{fmtTime(hist.t0)}</span><span>{fmtTime(hist.t0 + (hist.t1 - hist.t0) / 2)}</span><span>{fmtTime(hist.t1)}</span></div>
-        </div>
-        <div className="ov-sec">
-          <h4>Coverage<span className="ct num">{fmtN(detail.coverageEntries.length)} cells</span><Go to="surface">Surface</Go></h4>
-          {cov.length
-            ? <>
-              <div className="stack" style={{ width: '100%', height: 6, margin: '2px 0 8px' }}>{cov.map(c => <i key={c.status} className={'bg-' + c.status} style={{ flex: c.count }} title={`${c.label} ${c.count}`} />)}</div>
-              <div className="legend num" style={{ fontSize: 12, color: 'var(--fg-2)', gap: '6px 14px' }}>
-                {cov.map(c => <span key={c.status}><CovSwatch status={c.status} size={[14, 11]} />{c.label} <span style={{ color: 'var(--fg-3)' }}>{c.count}</span></span>)}
-              </div>
-            </>
-            : <p style={{ color: 'var(--fg-3)', fontSize: 12.5, margin: 0 }}>No coverage recorded yet.</p>}
+
+          <div className="pt-4">
+            <h4 className="m-0 mb-1.5 flex items-center gap-2 text-[12px] font-medium text-fg-muted">
+              Coverage
+              <span className="num font-normal text-fg-subtle">{fmtN(detail.coverageEntries.length)} cells</span>
+              <Go to="surface">Surface</Go>
+            </h4>
+            {cov.length
+              ? <>
+                <div className="mb-2 mt-0.5 flex h-1.5 w-full gap-0.5 overflow-hidden rounded-full">
+                  {cov.map(c => <i key={c.status} className={cn('block h-full', covBarBgClass(c.status))} style={{ flex: c.count }} title={`${c.label} ${c.count}`} />)}
+                </div>
+                <div className="num flex flex-wrap gap-x-3.5 gap-y-1.5 text-[12px] text-fg-muted">
+                  {cov.map(c => <span key={c.status} className="inline-flex items-center gap-1.5">
+                    <CovSwatch status={c.status} size={[14, 11]} />{c.label} <span className="text-fg-subtle">{c.count}</span>
+                  </span>)}
+                </div>
+              </>
+              : <p className="m-0 text-[12.5px] text-fg-subtle">No coverage recorded yet.</p>}
+          </div>
         </div>
       </div>
     </div>
-  </div></div>
+  </div>
 }
 
 /** Tally bar that grows from its previous value (keyed per severity so it animates on run switch). */
 function TallyBar({ id, value, color }: { id: string; value: number; color: string }) {
-  return <Meter id={id} value={value} warn={false} wide className="tally-m" style={{ '--bar': color } as CSSProperties} />
+  return <Meter id={id} value={value} warn={false} wide className="block h-full rounded-[3px] bg-transparent" barColor={color} />
 }

@@ -1,24 +1,16 @@
 // Toasts and undo. One toast at a time, bottom centre, springs up.
 //
-//   const toast = useToast()
-//   toast.show('Grouped by origin')                              // 2 s
-//   toast.show('Could not send', { tone: 'error' })               // 4 s
-//   toast.undoable({                                              // 6 s with progress bar
-//     message: 'Approved POST engine.dyad.sh/…', icon: 'check',
-//     commit: () => send({ action: 'decide_approval', … }),       // runs when the window closes
-//     undo: () => restoreLocalState(),                            // runs on Undo / Z / ⌘Z
-//   })
-//
 // Deferred commits: an undoable action's `commit` runs when its toast
 // expires, when another undoable replaces it, or when the run unmounts.
 // Until then Undo cancels it, so nothing is sent. This is how real,
 // irreversible commands (approvals, consent, stop) get an undo window.
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
+import { Kbd } from './display.tsx'
 import { Icon } from './icons.tsx'
 import type { IconName } from './icons.tsx'
-import { Kbd } from './display.tsx'
-import { T } from './motion.tsx'
+import { T, useReducedMotion } from './motion.tsx'
+import { cn } from './tw.ts'
 
 export interface ToastOptions {
   icon?: IconName
@@ -66,6 +58,23 @@ export function useToast(): ToastApi {
 }
 
 let nextId = 1
+
+function ToastProgress({ ms }: { ms: number }) {
+  const rm = useReducedMotion()
+  const [shrunk, setShrunk] = useState(false)
+  useEffect(() => {
+    if (rm) return
+    const raf = requestAnimationFrame(() => setShrunk(true))
+    return () => cancelAnimationFrame(raf)
+  }, [rm])
+  return <span
+    className="absolute bottom-0 left-0 h-0.5 w-full origin-left bg-[color-mix(in_srgb,var(--panel)_45%,transparent)] transition-transform ease-linear motion-reduce:transition-none"
+    style={{
+      transform: shrunk ? 'scaleX(0)' : 'scaleX(1)',
+      transitionDuration: ms + 'ms',
+    }}
+  />
+}
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<Item[]>([])
@@ -137,13 +146,29 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 
   return <ToastContext.Provider value={api}>
     {children}
-    <div className="toasts" role="status" aria-live="polite">
-      {items.map(t => <div key={t.id} className={'toast' + (t.out ? ' out' : '')} style={t.tone === 'error' ? { background: 'var(--bad)' } : undefined}>
-        {t.icon && <span style={{ display: 'flex', opacity: 0.8 }}><Icon name={t.icon} /></span>}
-        <div className="tx">{t.message}{t.sub && <small>{t.sub}</small>}</div>
+    <div className="pointer-events-none fixed bottom-5 left-1/2 z-[60] flex -translate-x-1/2 flex-col items-center gap-2" role="status" aria-live="polite">
+      {items.map(t => <div
+        key={t.id}
+        className={cn(
+          'pointer-events-auto relative flex min-w-[280px] max-w-[520px] items-center gap-2.5 overflow-hidden rounded-[9px] py-2 pl-3 pr-2 text-[12.5px] shadow-[0_10px_30px_-10px_rgba(0,0,0,.4)] transition-[opacity,transform] duration-[var(--d2)] ease-guardian',
+          t.tone === 'error' ? 'bg-danger text-white' : 'bg-fg text-panel',
+          t.out ? 'translate-y-2 opacity-0' : 'translate-y-0 opacity-100',
+        )}
+      >
+        {t.icon && <span className="flex opacity-80"><Icon name={t.icon} /></span>}
+        <div className="min-w-0 flex-1">
+          {t.message}
+          {t.sub && <small className="block truncate text-[11.5px] text-current opacity-65">{t.sub}</small>}
+        </div>
         {t.undo && <>
-          <button type="button" className="undo" onClick={t.undo}>Undo <Kbd>Z</Kbd></button>
-          <span className="prog" style={{ animationDuration: t.ms + 'ms' }} />
+          <button
+            type="button"
+            className="inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-control border-0 bg-[color-mix(in_srgb,var(--panel)_14%,transparent)] px-2 font-sans text-[12.5px] font-medium text-panel shadow-none transition-colors duration-[var(--d1)] hover:bg-[color-mix(in_srgb,var(--panel)_22%,transparent)]"
+            onClick={t.undo}
+          >
+            Undo <Kbd inverted>Z</Kbd>
+          </button>
+          <ToastProgress ms={t.ms} />
         </>}
       </div>)}
     </div>

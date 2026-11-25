@@ -92,7 +92,6 @@ export const PHASE_LABEL: Record<string, string> = {
 export const PHASE_ORDER: Record<string, number> = { discovery: 0, threat_model: 1, investigation: 2, verification: 3, retest: 4 }
 
 export const TIER_SHORT: Record<number, string> = { 0: 'Offline', 1: 'Read-only', 2: 'Authenticated', 3: 'Active, with approval' }
-export const TIER_LINE: Record<number, string> = { 0: 'Tier 0 · offline', 1: 'Tier 1 · read-only', 2: 'Tier 2 · authenticated', 3: 'Tier 3 · active with approval' }
 
 /** Response headers each baseline check inspects (for highlighting in exchange headers). */
 export const CHECK_HEADERS: Record<string, string[]> = {

@@ -9,10 +9,11 @@ import { EmptyState, LinkRow, Props, Section, Skeleton, Tag } from '../display.t
 import { fmtAgo, fmtEventKind, fmtFullDateTime, fmtRel, fmtTimeS, host } from '../format.ts'
 import { EventGlyph, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import type { RunEvent } from '../model.ts'
+import { useReducedMotion } from '../motion.tsx'
 import { useLinks, useListNav, useNav, useViewState } from '../nav.tsx'
 import { PaneBody, PaneHeader } from '../pane.tsx'
 import type { InspectorMap, InspectorProps } from '../pane.tsx'
-import { useReducedMotion } from '../motion.tsx'
+import { cn, runBtn, RW } from '../tw.ts'
 
 type Fam = 'all' | 'broker' | 'worker' | 'finding' | 'planner' | 'other'
 export function actFam(k: string): Exclude<Fam, 'all'> {
@@ -58,15 +59,22 @@ export function ActivityView() {
 
   if (eventsReady && !events.length) {
     return <EmptyState icon="activity" title="Quiet so far"
-      action={detail.run.status === 'waiting' ? <button type="button" className="btn" onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
+      action={detail.run.status === 'waiting' ? <button type="button" className={runBtn()} onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
       Run events stream here newest first: planner rounds, HTTP requests, worker lifecycle, and verification.
     </EmptyState>
   }
   return <>
-    <div className="toolbar">
+    <div className={RW.toolbar}>
       <Tabs tabs={tabs} value={tab} onChange={setTab} />
-      <span className="tb-sp" />
-      {detail.run.status === 'running' && <span className="sf-live" title="New events stream in live"><i />Live</span>}
+      {detail.run.status === 'running' && (
+        <span className="mr-1 inline-flex items-center gap-1.5 text-[12px] text-fg-subtle" title="New events stream in live">
+          <span className="relative inline-block size-1.5 flex-none" aria-hidden="true">
+            <span className="absolute inset-0 rounded-full bg-ok" />
+            <span className="absolute -inset-[3px] animate-ping rounded-full border border-ok opacity-50 motion-reduce:animate-none" />
+          </span>
+          Live
+        </span>
+      )}
       <FilterBox value={q} onChange={setQ} onEnter={() => ids[0] && nav.select({ kind: 'event', id: ids[0] })} />
     </div>
     {!eventsReady && !events.length ? <Skeleton /> :
@@ -75,12 +83,22 @@ export function ActivityView() {
         render={(e, _i, style) => {
           const id = String(e.id)
           const label = fmtEventKind(e.kind)
-          return <div key={id} style={style} data-id={id} className={'row' + (selId === id ? ' cur' : '') + (!rm && e.id > fresh ? ' sf-fresh' : '')}
-            onClick={() => nav.select({ kind: 'event', id })}>
-            <span className="c-time mono num" title={fmtFullDateTime(e.createdAt)}>{fmtRel(e.createdAt, model.base)}</span>
-            <span className="g"><EventGlyph kind={e.kind} /></span>
-            <span className="c-kind" title={`${e.kind} · Event #${e.id}`}>{label}</span>
-            <span className={'title' + (e.kind === 'broker.denied' || e.kind === 'worker.failed' ? ' sf-bad' : '')}>{e.message}</span>
+          const isBad = e.kind === 'broker.denied' || e.kind === 'worker.failed'
+          return <div
+            key={id}
+            style={style}
+            data-id={id}
+            className={cn(
+              RW.row,
+              selId === id && RW.rowCur,
+              !rm && e.id > fresh && 'transition-[background-color,opacity] duration-700 ease-guardian starting:bg-accent-soft starting:opacity-0',
+            )}
+            onClick={() => nav.select({ kind: 'event', id })}
+          >
+            <span className="w-16 flex-none font-mono text-[12px] tabular-nums text-fg-subtle" title={fmtFullDateTime(e.createdAt)}>{fmtRel(e.createdAt, model.base)}</span>
+            <span className="inline-flex size-3.5 flex-none items-center justify-center"><EventGlyph kind={e.kind} /></span>
+            <span className="w-[132px] flex-none truncate text-fg-subtle" title={`${e.kind} · Event #${e.id}`}>{label}</span>
+            <span className={cn('min-w-0 flex-1 truncate', isBad ? 'text-danger' : 'text-fg')}>{e.message}</span>
           </div>
         }} />}
   </>
@@ -97,7 +115,7 @@ function EventInspector({ sel }: InspectorProps) {
   const e = useMemo(() => events.find(x => String(x.id) === sel.id), [events, sel.id])
   if (!e) return <>
     <PaneHeader title="Activity event" sub={<span title={`Event #${sel.id}`}>Not found</span>} />
-    <PaneBody>{eventsReady ? <EmptyState icon="activity" title="Event not found">It may belong to another run.</EmptyState> : <div className="d"><Skeleton rows={5} /></div>}</PaneBody>
+    <PaneBody>{eventsReady ? <EmptyState icon="activity" title="Event not found">It may belong to another run.</EmptyState> : <div className={RW.detail}><Skeleton rows={5} /></div>}</PaneBody>
   </>
   const d = e.detail ?? {}
   const rel: ReactNode[] = []
@@ -105,7 +123,7 @@ function EventInspector({ sel }: InspectorProps) {
   if (exId) {
     const ex = model.exchangeById.get(exId)
     rel.push(<LinkRow key="ex" icon="exchanges" title={`Exchange ${exId}`} onClick={() => links.exchange(exId)}>
-      {ex ? <><span className="mono">{ex.method} {ex.pathAndQuery}</span> <span className="muted num">· {ex.status}</span></> : 'Open HTTP exchange'}
+      {ex ? <><span className="font-mono text-[12px]">{ex.method} {ex.pathAndQuery}</span> <span className="tabular-nums text-fg-subtle">· {ex.status}</span></> : 'Open HTTP exchange'}
     </LinkRow>)
   }
   if (e.kind === 'broker.denied' || e.kind === 'broker.circuit_open') rel.push(<LinkRow key="den" icon="exchanges" onClick={() => links.exchange('ev:' + e.id)}>Show in Exchanges</LinkRow>)
@@ -119,7 +137,7 @@ function EventInspector({ sel }: InspectorProps) {
   const ap = apId ? model.approvalById.get(apId) : undefined
   if (ap) {
     rel.push(<LinkRow key="ap" icon="queue" title={`Approval ${ap.id}`} onClick={() => links.queueItem('ap:' + ap.id)}>
-      Approval: <span className="mono">{ap.method} {ap.pathAndQuery}</span>
+      Approval: <span className="font-mono text-[12px]">{ap.method} {ap.pathAndQuery}</span>
     </LinkRow>)
   }
   for (const k of ['evidenceId', 'artifactId', 'analysisEvidenceId']) {
@@ -127,20 +145,20 @@ function EventInspector({ sel }: InspectorProps) {
     if (v && model.evidenceById.has(v)) rel.push(<LinkRow key={k} icon="fact" trailing="chevR" onClick={() => links.evidence(v)}>{model.evidenceById.get(v)!.title}</LinkRow>)
   }
   const origin = str(d.origin)
-  if (origin) rel.push(<LinkRow key="o" icon="surface" onClick={() => links.host(origin)}><span className="mono">{host(origin)}</span> on the surface map</LinkRow>)
+  if (origin) rel.push(<LinkRow key="o" icon="surface" onClick={() => links.host(origin)}><span className="font-mono text-[12px]">{host(origin)}</span> on the surface map</LinkRow>)
   if (str(d.reportId) || e.kind.startsWith('report.')) rel.push(<LinkRow key="r" icon="report" onClick={() => links.report()}>Open the report</LinkRow>)
   const label = fmtEventKind(e.kind)
   return <>
     <PaneHeader title={label} sub={<span title={`${fmtFullDateTime(e.createdAt)} · Event #${e.id} (${e.kind})`} suppressHydrationWarning>{fmtAgo(e.createdAt)}</span>} />
-    <PaneBody><div className="d">
-      <div className="d-meta"><Tag title={e.kind}><EventGlyph kind={e.kind} />{label}</Tag></div>
-      <h2 style={{ fontSize: 14, lineHeight: '21px', fontWeight: 500 }}>{e.message}</h2>
+    <PaneBody><div className={RW.detail}>
+      <div className="mb-2.5 flex flex-wrap gap-1.5"><Tag title={e.kind}><EventGlyph kind={e.kind} />{label}</Tag></div>
+      <h2 className="m-0 mb-3 break-words text-[14px] font-medium leading-[21px] text-fg">{e.message}</h2>
       <Props rows={[
-        ['Time', <span className="num" title={fmtFullDateTime(e.createdAt)}>{fmtTimeS(e.createdAt)} <span className="mono muted">{fmtRel(e.createdAt, model.base)}</span></span>],
-        ['Event key', <span className="mono muted" title={`Event #${e.id}`}>{e.kind} · #{e.id}</span>],
+        ['Time', <span className="tabular-nums" title={fmtFullDateTime(e.createdAt)}>{fmtTimeS(e.createdAt)} <span className="font-mono text-[12px] text-fg-subtle">{fmtRel(e.createdAt, model.base)}</span></span>],
+        ['Event key', <span className="font-mono text-[12px] text-fg-subtle" title={`Event #${e.id}`}>{e.kind} · #{e.id}</span>],
       ]} />
       {rel.length > 0 && <Section title="Related">{rel}</Section>}
-      <Section title="Detail"><pre className="block mono">{JSON.stringify(d, null, 2)}</pre></Section>
+      <Section title="Detail"><pre className={RW.pre}>{JSON.stringify(d, null, 2)}</pre></Section>
     </div></PaneBody>
   </>
 }

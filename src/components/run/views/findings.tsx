@@ -22,6 +22,7 @@ import { useListNav, useNav, useViewState } from '../nav.tsx'
 import type { InspectorMap } from '../pane.tsx'
 import { usePaletteCommands } from '../palette.tsx'
 import { useToast } from '../toast.tsx'
+import { cn, runBtn, runDec, RW } from '../tw.ts'
 import { FindingInspector, useFindingQueueKey } from './findings-inspector.tsx'
 
 type Group = 'severity' | 'origin' | 'status' | 'none'
@@ -54,7 +55,7 @@ function groupOf(items: FindingRow[], g: Group): G[] | null {
   return [...m.entries()].sort((a, b) => order(a[0], b[0])).map(([k, list]) => ({
     key: k,
     label: g === 'severity' ? (SEV_LABEL[k] ?? k) : g === 'status' ? stLabel(k) : k,
-    glyph: g === 'severity' ? <SevGlyph sev={k} /> : g === 'status' ? <StatusGlyph status={k} /> : <span style={{ color: 'var(--fg-3)', display: 'inline-flex' }}><Icon name="globe" /></span>,
+    glyph: g === 'severity' ? <SevGlyph sev={k} /> : g === 'status' ? <StatusGlyph status={k} /> : <span className="inline-flex text-fg-subtle"><Icon name="globe" /></span>,
     items: list,
   }))
 }
@@ -67,13 +68,30 @@ function VerdictStrip() {
   const nav = useNav()
   const [open, setOpen] = useViewState('findings.vstrip', true)
   if (model.run.status === 'waiting') return null
-  return <div className={'vstrip' + (open ? '' : ' closed')} role="button" tabIndex={0} aria-expanded={open}
-    title={(open ? 'Collapse' : 'Expand') + ' the run summary'} onClick={() => setOpen(!open)}
-    onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setOpen(!open) } }}>
-    <Icon name="chev" />
-    <span className="h">{v.hed}</span>
-    <span className="conf">{v.conf.word === 'Not yet assessed' ? v.conf.word : v.conf.word + ' confidence'}</span>
-    <button type="button" className="linkbtn" style={{ margin: 0 }} onClick={e => { e.stopPropagation(); nav.setView('overview') }}>Overview<Icon name="arrowR" /></button>
+  return <div
+    className={cn(
+      'flex min-w-0 flex-none cursor-pointer select-none items-center gap-2.5 border-b border-line pl-[18px] pr-3 text-[12.5px] text-fg-muted hover:text-fg',
+      open ? 'h-9 bg-sunk' : 'h-7 bg-transparent',
+    )}
+    role="button"
+    tabIndex={0}
+    aria-expanded={open}
+    title={(open ? 'Collapse' : 'Expand') + ' the run summary'}
+    onClick={() => setOpen(!open)}
+    onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setOpen(!open) } }}
+  >
+    <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-guardian', !open && '-rotate-90')} />
+    {open ? <>
+      <span className="min-w-0 flex-1 truncate font-medium text-fg">{v.hed}</span>
+      <span className="inline-flex flex-none items-center gap-1.5 text-fg-subtle">{v.conf.word === 'Not yet assessed' ? v.conf.word : v.conf.word + ' confidence'}</span>
+    </> : <span className="flex-1 text-[12px] text-fg-subtle">Run summary</span>}
+    <button
+      type="button"
+      className={runBtn({ variant: 'link', size: 'none' })}
+      onClick={e => { e.stopPropagation(); nav.setView('overview') }}
+    >
+      Overview<Icon name="arrowR" />
+    </button>
   </div>
 }
 
@@ -92,16 +110,15 @@ function Toolbar({ tabs, tab, setTab, filter, setFilter, filterRef, onFilterEnte
   sort: Sort
   setSort: (s: Sort) => void
 }) {
-  return <div className="toolbar">
+  return <div className={RW.toolbar}>
     <Tabs tabs={tabs} value={tab} onChange={setTab} label="Filter findings by status" />
-    <span className="tb-sp" />
     <FilterBox ref={filterRef} value={filter} onChange={setFilter} onEnter={onFilterEnter} label="Filter findings" />
     <Dropdown icon="sliders" title="Display options (⇧G cycles grouping)"
-      label={<><span className="dim">Group</span><span>{GROUPS.find(g => g[0] === group)?.[1]}</span></>}>
-      <div className="dd-sec">Grouping<KbdGroup keys={['⇧', 'G']} style={{ marginLeft: 'auto' }} /></div>
-      <Seg<Group> value={group} onChange={setGroup} options={GROUPS.map(([value, label]) => ({ value, label }))} />
-      <div className="dd-sec">Ordering</div>
-      <Seg<Sort> value={sort} onChange={setSort} options={SORTS.map(([value, label]) => ({ value, label }))} />
+      label={<><span className="text-fg-subtle">Group</span><span>{GROUPS.find(g => g[0] === group)?.[1]}</span></>}>
+      <div className={RW.ddSec}>Grouping<KbdGroup keys={['⇧', 'G']} className="ml-auto" /></div>
+      <Seg<Group> value={group} onChange={setGroup} options={GROUPS.map(([value, label]) => ({ value, label }))} fullWidth />
+      <div className={RW.ddSec}>Ordering</div>
+      <Seg<Sort> value={sort} onChange={setSort} options={SORTS.map(([value, label]) => ({ value, label }))} fullWidth />
     </Dropdown>
   </div>
 }
@@ -117,24 +134,47 @@ function FindingRowView({ f, group, cur, onClick, style, local }: {
   local?: string | null
 }) {
   const st = normFStatus(f.status)
-  return <div className={'row frow' + (cur ? ' cur' : '')} data-id={f.id} onClick={onClick} style={style} aria-selected={cur}>
-    {group !== 'severity' && <span className="g" title={SEV_LABEL[f.severity] ?? f.severity}><SevGlyph sev={f.severity} /></span>}
-    <span className="g" title={stLabel(st)}><StatusGlyph status={st} /></span>
-    <span className="title">{f.title}</span>
-    {local && <span className="dec fdec" title="Saved locally in this browser">{local}</span>}
-    {f.category && <span className="c-cat">{prettyCat(f.category)}</span>}
-    {group !== 'origin' && <span className="c-host mono">{host(f.origin)}</span>}
+  return <div
+    className={cn(RW.row, 'cursor-pointer', cur && RW.rowCur)}
+    data-id={f.id}
+    onClick={onClick}
+    style={style}
+    aria-selected={cur}
+  >
+    {group !== 'severity' && <span className="inline-flex size-3.5 flex-none items-center justify-center" title={SEV_LABEL[f.severity] ?? f.severity}><SevGlyph sev={f.severity} /></span>}
+    <span className="inline-flex size-3.5 flex-none items-center justify-center" title={stLabel(st)}><StatusGlyph status={st} /></span>
+    <span className="min-w-0 flex-1 truncate text-fg">{f.title}</span>
+    {local && <span className={cn(runDec(), 'flex-none whitespace-nowrap')} title="Saved locally in this browser">{local}</span>}
+    {f.category && <span className="max-w-[155px] flex-none truncate text-[12px] text-fg-subtle">{prettyCat(f.category)}</span>}
+    {group !== 'origin' && <span className="w-[150px] flex-none truncate text-right font-mono text-[12px] text-fg-subtle max-[1320px]:w-[120px] max-[1180px]:hidden">{host(f.origin)}</span>}
   </div>
 }
 
-function GroupHead({ g, group, collapsed, onToggle, style }: { g: G; group: Group; collapsed: boolean; onToggle: () => void; style?: CSSProperties }) {
+function GroupHead({ g, group, collapsed, onToggle, style, className }: {
+  g: G
+  group: Group
+  collapsed: boolean
+  onToggle: () => void
+  style?: CSSProperties
+  className?: string
+}) {
   const t: Partial<Record<FindingDisplayStatus, number>> = {}
   for (const f of g.items) { const s = normFStatus(f.status); t[s] = (t[s] ?? 0) + 1 }
-  return <div className={'ghead' + (collapsed ? ' collapsed' : '')} role="button" tabIndex={0} aria-expanded={!collapsed} style={style}
-    onClick={onToggle} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle() } }}>
-    <Icon name="chev" /><span className="g">{g.glyph}</span><span>{g.label}</span><span className="ct num">{g.items.length}</span>
-    {group !== 'status' && <span className="gbar num">
-      {STATUS_KEYS.filter(k => t[k]).map(k => <span key={k} className="gtally" title={stLabel(k)}><StatusGlyph status={k} />{t[k]}</span>)}
+  return <div
+    className={cn(RW.ghead, className)}
+    role="button"
+    tabIndex={0}
+    aria-expanded={!collapsed}
+    style={style}
+    onClick={onToggle}
+    onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle() } }}
+  >
+    <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-guardian', collapsed && '-rotate-90')} />
+    <span className="inline-flex size-3.5 flex-none items-center justify-center">{g.glyph}</span>
+    <span>{g.label}</span>
+    <span className="font-normal tabular-nums text-fg-subtle">{g.items.length}</span>
+    {group !== 'status' && <span className="ml-auto flex items-center gap-2 font-normal tabular-nums text-fg-subtle">
+      {STATUS_KEYS.filter(k => t[k]).map(k => <span key={k} className="inline-flex items-center gap-[5px]" title={stLabel(k)}><StatusGlyph status={k} />{t[k]}</span>)}
     </span>}
   </div>
 }
@@ -248,7 +288,7 @@ export function FindingsView() {
       else if (top + ROW_H > el.scrollTop + el.clientHeight) el.scrollTop = top + ROW_H - el.clientHeight
       return
     }
-    el.querySelector<HTMLElement>(`.row[data-id="${CSS.escape(selId)}"]`)?.scrollIntoView({ block: 'nearest' })
+    el.querySelector<HTMLElement>(`[data-id="${CSS.escape(selId)}"]`)?.scrollIntoView({ block: 'nearest' })
   }, [selId, index, virtual, flatEntries, offsets, groups])
 
   const toggle = (g: G) => setCollapsed(c => ({ ...c, [ck(g)]: !c[ck(g)] }))
@@ -261,7 +301,7 @@ export function FindingsView() {
       <VerdictStrip />
       {toolbar}
       <EmptyState icon="findings" title="No findings yet"
-        action={model.run.status === 'waiting' ? <button type="button" className="btn" onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
+        action={model.run.status === 'waiting' ? <button type="button" className={runBtn()} onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
         Findings appear here as workers propose them; each one is verified by automated replay before it is marked confirmed.
       </EmptyState>
     </>
@@ -269,26 +309,26 @@ export function FindingsView() {
 
   let body: ReactNode
   if (!items.length) {
-    body = <EmptyState icon="search" title="Nothing matches" style={{ paddingTop: 80, alignItems: 'flex-start' }}>Try a different filter or switch tabs.</EmptyState>
+    body = <EmptyState icon="search" title="Nothing matches" className="items-start pt-20">Try a different filter or switch tabs.</EmptyState>
   } else if (virtual) {
     // current group head pinned at the top while scrolling (heads in the window scroll normally)
     let pinned: G | null = null
     if (groups) for (let i = win[0]; i >= 0; i--) { const e = flatEntries[i]; if (e?.t === 'h') { pinned = e.g; break } }
     body = <>
-      {pinned && <div className="fpin"><GroupHead g={pinned} group={group} collapsed={!!collapsed[ck(pinned)]} onToggle={() => toggle(pinned!)} /></div>}
-      <div className="vl-spacer" style={{ height: offsets[offsets.length - 1], position: 'relative' }}>
+      {pinned && <div className="sticky top-0 z-[3] h-0"><GroupHead g={pinned} group={group} collapsed={!!collapsed[ck(pinned)]} onToggle={() => toggle(pinned!)} className="relative" /></div>}
+      <div className="relative w-full" style={{ height: offsets[offsets.length - 1] }}>
         {flatEntries.slice(win[0], win[1]).map((e, j) => {
           const i = win[0] + j
           const style: CSSProperties = { position: 'absolute', top: offsets[i], left: 0, right: 0, height: e.t === 'h' ? HEAD_H : ROW_H }
           return e.t === 'h'
-            ? <GroupHead key={'h:' + e.g.key} g={e.g} group={group} collapsed={!!collapsed[ck(e.g)]} onToggle={() => toggle(e.g)} style={{ ...style, position: 'absolute' }} />
+            ? <GroupHead key={'h:' + e.g.key} g={e.g} group={group} collapsed={!!collapsed[ck(e.g)]} onToggle={() => toggle(e.g)} className="absolute" style={style} />
             : <FindingRowView key={e.f.id} f={e.f} group={group} cur={e.f.id === selId} onClick={() => select(e.f.id)} style={style} local={localLabel(e.f)} />
         })}
       </div>
     </>
   } else {
     body = groups
-      ? groups.map(g => <div key={g.key} className="fgrp">
+      ? groups.map(g => <div key={g.key} className="relative">
         <GroupHead g={g} group={group} collapsed={!!collapsed[ck(g)]} onToggle={() => toggle(g)} />
         {!collapsed[ck(g)] && g.items.map(f => <FindingRowView key={f.id} f={f} group={group} cur={f.id === selId} onClick={() => select(f.id)} local={localLabel(f)} />)}
       </div>)
@@ -297,7 +337,7 @@ export function FindingsView() {
   return <>
     <VerdictStrip />
     {toolbar}
-    <div className={'list' + (virtual ? ' fvirt' : '')} ref={listRef} tabIndex={-1}>{body}</div>
+    <div className={RW.list} ref={listRef} tabIndex={-1}>{body}</div>
   </>
 }
 

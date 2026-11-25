@@ -1,8 +1,7 @@
-// Theme integration. The app already decides the theme with
-// html[data-appearance] = light | dark | system (localStorage
+// Theme integration. The app decides the theme with html[data-appearance]
+// = light | dark | system and html[data-theme] = light | dark (localStorage
 // `guardian-appearance`, applied before first paint by __root.tsx).
-// The run workspace reads and writes that same setting; run.css keys its
-// palettes off it. There is no second theme system.
+// Tailwind v4 dark: variants and tokens.css both key off these attributes.
 import { useCallback, useEffect, useState } from 'react'
 
 export type Theme = 'light' | 'dark'
@@ -12,25 +11,37 @@ function resolve(): Theme {
   if (typeof document === 'undefined') return 'light'
   const a = document.documentElement.dataset.appearance
   if (a === 'dark' || a === 'light') return a
+  const t = document.documentElement.dataset.theme
+  if (t === 'dark' || t === 'light') return t
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+}
+
+function syncTheme(mode?: Theme | 'system'): Theme {
+  if (typeof document === 'undefined') return 'light'
+  if (mode) document.documentElement.dataset.appearance = mode
+  const resolved = resolve()
+  if (document.documentElement.dataset.theme !== resolved) {
+    document.documentElement.dataset.theme = resolved
+  }
+  return resolved
 }
 
 /** Effective theme (resolved from `system`) and a toggle that persists an explicit choice. */
 export function useTheme() {
   const [theme, setTheme] = useState<Theme>('light')
   useEffect(() => {
-    setTheme(resolve())
+    setTheme(syncTheme())
     const mq = window.matchMedia('(prefers-color-scheme: dark)')
-    const sync = () => setTheme(resolve())
+    const sync = () => setTheme(syncTheme())
     mq.addEventListener('change', sync)
     const mo = new MutationObserver(sync)
-    mo.observe(document.documentElement, { attributes: true, attributeFilter: ['data-appearance'] })
+    mo.observe(document.documentElement, { attributes: true, attributeFilter: ['data-appearance', 'data-theme'] })
     return () => { mq.removeEventListener('change', sync); mo.disconnect() }
   }, [])
   const toggle = useCallback(() => {
     const next: Theme = resolve() === 'dark' ? 'light' : 'dark'
     try { localStorage.setItem(KEY, next) } catch { /* private mode */ }
-    document.documentElement.dataset.appearance = next
+    setTheme(syncTheme(next))
   }, [])
   return { theme, toggle }
 }

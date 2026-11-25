@@ -53,7 +53,7 @@ export const approvalPolicyMeta: Record<ApprovalPolicy, {
     label: 'Autonomous',
     short: 'Autonomous',
     optionLabel: 'Autonomous (Auto-approve in scope)',
-    summary: 'Automatically approves all in-scope active checks with full audit logging. Hard safety guardrails (approved hosts only, private network block, destructive denylist, rate limits, and circuit breakers) remain enforced.',
+    summary: 'Automatically approves all in-scope active checks with full audit logging. Hard safety guardrails (approved hosts only, private network block, destructive denylist, rate limits, and safety pauses) remain enforced.',
   },
   strict: {
     label: 'Manual Approval',

@@ -1,5 +1,5 @@
 // Workflow inspectors (Agent W): worker (summary · transcript · evidence),
-// stack, queued steps, single chain step, and cold-graph digest.
+// stack, queued steps, single chain step, and memory summary digest.
 import { useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { readGraphDigest, readWorkerSessionAction } from '../../../actions.ts'
@@ -16,6 +16,7 @@ import { useLinks, useNav, useViewState } from '../nav.tsx'
 import { ExchangeLink, PaneBody, PaneFooter, PaneHeader } from '../pane.tsx'
 import type { InspectorProps } from '../pane.tsx'
 import { useToast } from '../toast.tsx'
+import { cn, runBtn, runIconBtn, RW } from '../tw.ts'
 import { aggStatus, LiveGlyph } from './workflow-graph.tsx'
 import { isLive, nodeLineage, QUEUE_ID, queuedSteps, requestCamera, setExpanded, useExpanded, useWorkflowLayout } from './workflow-layout.ts'
 import type { WfLayout } from './workflow-layout.ts'
@@ -23,12 +24,25 @@ import type { WfLayout } from './workflow-layout.ts'
 const OPEN_STEP = ['pending', 'ready', 'running', 'blocked']
 const runEnded = (s: string) => s === 'complete' || s === 'stopped' || s === 'failed'
 
+const WF_H2 = 'm-0 mb-3 break-words text-[15px] font-semibold leading-[22px] tracking-[-0.012em] text-fg'
+const WF_META = 'mb-2.5 flex flex-wrap gap-1.5'
+const WF_CHIP = 'inline-flex h-5 cursor-pointer items-center gap-[3px] rounded-[5px] border-0 bg-transparent px-1.5 font-sans text-[11px] font-normal text-fg-subtle shadow-[inset_0_0_0_1px_var(--line-2)] transition-[background-color,color] duration-[var(--d1)] hover:bg-hover hover:text-fg'
+const WF_SPIN = 'size-3 flex-none rounded-full border-[1.5px] border-line-strong border-t-fg-muted animate-spin'
+const WF_LOAD = 'my-3.5 flex items-center gap-2 text-[12.5px] text-fg-subtle'
+const WF_NONE = 'my-3 text-[12.5px] text-fg-subtle'
+const WF_MORE = 'my-1 mb-2! text-[12px]! text-fg-subtle!'
+const WF_PRE_JSON = cn(RW.pre, 'my-1.5 mb-1 max-h-[260px] text-[11.5px] leading-[17px]')
+const WF_ORIGINS = 'rw-wrap font-mono text-[11.5px] whitespace-normal break-all'
+const WF_TG = 'inline-flex size-3.5 items-center justify-center'
+const WF_CTX = 'flex flex-col divide-y divide-dashed divide-line'
+const WF_CTX_ITEM = 'grid grid-cols-[18px_minmax(0,1fr)] gap-2 py-[7px] text-[12px] leading-[18px]'
+
 function FindingRows({ list, max = 10 }: { list: readonly FindingRow[]; max?: number }) {
   const links = useLinks()
   return <>
-    {list.slice(0, max).map(f => <LinkRow key={f.id} glyph={<span style={{ display: 'inline-flex', gap: 6 }}><SevGlyph sev={f.severity} /><StatusGlyph status={normFStatus(f.status)} /></span>}
-      right={<span className="mono">{host(f.origin)}</span>} trailing={null} onClick={() => links.finding(f.id)}>{f.title}</LinkRow>)}
-    {list.length > max && <p className="wf-more">+{list.length - max} more</p>}
+    {list.slice(0, max).map(f => <LinkRow key={f.id} glyph={<span className="inline-flex gap-1.5"><SevGlyph sev={f.severity} /><StatusGlyph status={normFStatus(f.status)} /></span>}
+      right={<span className="font-mono text-[12px]">{host(f.origin)}</span>} trailing={null} onClick={() => links.finding(f.id)}>{f.title}</LinkRow>)}
+    {list.length > max && <p className={WF_MORE}>+{list.length - max} more</p>}
   </>
 }
 
@@ -50,28 +64,31 @@ function FactItem({ f }: { f: Fact }) {
   const model = useRunModel()
   const links = useLinks()
   const [open, setOpen] = useState(false)
-  return <div className="ctx-item">
-    <span className="ci"><Icon name="fact" /></span>
-    <div style={{ minWidth: 0 }}>
-      <div className="ct"><b>{f.kind}</b> · <span className="mono">{host(f.origin)}</span>{f.tainted && <Tag className="wf-taint">tainted</Tag>}</div>
-      <div className="cb">{f.summary}</div>
-      <div className="wf-chips">
+  return <div className={WF_CTX_ITEM}>
+    <span className="pt-0.5 text-fg-subtle"><Icon name="fact" /></span>
+    <div className="min-w-0">
+      <div className="text-[11.5px] text-fg-subtle">
+        <b className="font-medium text-fg-muted">{f.kind}</b> · <span className="font-mono text-[11.5px]">{host(f.origin)}</span>
+        {f.tainted && <Tag className="ml-1.5 h-4 text-danger">tainted</Tag>}
+      </div>
+      <div className="line-clamp-3 text-fg-muted">{f.summary}</div>
+      <div className="mt-[5px] flex flex-wrap gap-1">
         {f.exchangeIds.slice(0, 6).map(x => {
           const ex = model.exchangeById.get(x)
           const label = ex ? `${ex.method} ${ex.pathAndQuery.length > 28 ? ex.pathAndQuery.slice(0, 27) + '…' : ex.pathAndQuery} · ${ex.status}` : 'HTTP exchange'
           const tip = ex ? `${ex.method} ${ex.origin}${ex.pathAndQuery} (${ex.status}) · ID ${x}` : `Open HTTP exchange · ID ${x}`
-          return <button key={x} type="button" className="wf-chip" onClick={() => links.exchange(x)} title={tip}>{label}<Icon name="arrowR" /></button>
+          return <button key={x} type="button" className={WF_CHIP} onClick={() => links.exchange(x)} title={tip}>{label}<Icon name="arrowR" size={10} /></button>
         })}
         {f.evidenceIds.slice(0, 6).map(x => {
           const ev = model.evidenceById.get(x)
           const rawTitle = ev?.title ?? 'Evidence record'
           const label = rawTitle.length > 30 ? rawTitle.slice(0, 29) + '…' : rawTitle
           const tip = ev ? `${ev.title} (${ev.kind}) · ID ${x}` : `Open evidence · ID ${x}`
-          return <button key={x} type="button" className="wf-chip" onClick={() => links.evidence(x)} title={tip}>{label}<Icon name="ext" /></button>
+          return <button key={x} type="button" className={WF_CHIP} onClick={() => links.evidence(x)} title={tip}>{label}<Icon name="ext" size={10} /></button>
         })}
-        <button type="button" className="wf-chip" onClick={() => setOpen(o => !o)} aria-expanded={open}>{open ? 'Hide data' : 'Data'}<Icon name={open ? 'chevU' : 'chevD'} /></button>
+        <button type="button" className={WF_CHIP} onClick={() => setOpen(o => !o)} aria-expanded={open}>{open ? 'Hide data' : 'Data'}<Icon name={open ? 'chevU' : 'chevD'} size={10} /></button>
       </div>
-      {open && <pre className="block mono wf-json">{JSON.stringify(f.data, null, 2)}</pre>}
+      {open && <pre className={WF_PRE_JSON}>{JSON.stringify(f.data, null, 2)}</pre>}
     </div>
   </div>
 }
@@ -97,39 +114,65 @@ function Transcript({ a, s }: { a: Assignment; s: SessionState }) {
   const model = useRunModel()
   const [open, setOpen] = useState<Record<string, boolean>>({})
   const turns = s.data?.turns ?? []
-  if (s.loading && !turns.length) return <div className="wf-load"><span className="wf-spin" />Loading the durable session…</div>
+  if (s.loading && !turns.length) return <div className={WF_LOAD}><span className={WF_SPIN} />Loading the durable session…</div>
   if (!turns.length) {
     const msgs = model.detail.messages.filter(m => m.threadId === a.id && m.content.trim() !== (a.outcome ?? '').trim())
     if (msgs.length) {
-      return <div className="wt">{msgs.map(m => <div key={m.id} className="wt-turn">
-        <div className="wt-h"><span className="wt-n">{m.role}</span><span className="sp" /><span className="mono">{fmtTimeS(m.createdAt)}</span></div>
-        <p className="wt-text">{m.content}</p>
+      return <div className="flex flex-col pt-1">{msgs.map(m => <div key={m.id} className="border-b border-line pb-2.5 pt-3 last:border-b-0">
+        <div className="mb-1.5 flex items-center gap-2 text-[11.5px] text-fg-subtle">
+          <span className="font-semibold capitalize text-fg-muted">{m.role}</span>
+          <span className="flex-1" />
+          <span className="font-mono text-[11.5px]">{fmtTimeS(m.createdAt)}</span>
+        </div>
+        <p className="m-0 mb-2 whitespace-pre-wrap break-words text-[12.5px] leading-[19px] text-fg">{m.content}</p>
       </div>)}</div>
     }
-    return <p className="wf-none">{s.error ? 'The session transcript could not be read.' : a.status === 'queued' ? 'This worker has not taken a turn yet.' : 'No durable session transcript was recorded for this worker.'}</p>
+    return <p className={WF_NONE}>{s.error ? 'The session transcript could not be read.' : a.status === 'queued' ? 'This worker has not taken a turn yet.' : 'No durable session transcript was recorded for this worker.'}</p>
   }
-  return <div className="wt">
-    {turns.map(t => <div key={t.turn} className="wt-turn">
-      <div className="wt-h"><span className="wt-n">Turn {t.turn}</span>
-        {t.durationMs != null && <span className="num">{(t.durationMs / 1000).toFixed(1)}s</span>}
-        <span className="sp" />{t.timestamp != null && <span className="mono">{fmtRel(t.timestamp, model.base)}</span>}</div>
-      {t.thinking && <p className="wt-think">{t.thinking}</p>}
-      {t.text && t.text !== a.outcome && <p className="wt-text">{t.text}</p>}
+  return <div className="flex flex-col pt-1">
+    {turns.map(t => <div key={t.turn} className="border-b border-line pb-2.5 pt-3 last:border-b-0">
+      <div className="mb-1.5 flex items-center gap-2 text-[11.5px] text-fg-subtle">
+        <span className="font-semibold capitalize text-fg-muted">Turn {t.turn}</span>
+        {t.durationMs != null && <span className="tabular-nums">{(t.durationMs / 1000).toFixed(1)}s</span>}
+        <span className="flex-1" />
+        {t.timestamp != null && <span className="font-mono text-[11.5px]">{fmtRel(t.timestamp, model.base)}</span>}
+      </div>
+      {t.thinking && <p className="m-0 mb-2 whitespace-pre-wrap break-words border-l-2 border-line-2 pl-2.5 text-[12px] leading-[18px] text-fg-subtle">{t.thinking}</p>}
+      {t.text && t.text !== a.outcome && <p className="m-0 mb-2 whitespace-pre-wrap break-words text-[12.5px] leading-[19px] text-fg">{t.text}</p>}
       {t.tools.map(tc => {
         const k = t.turn + ':' + tc.id
-        return <div key={tc.id} className={'wt-tool tk-' + tc.status}>
-          <div className="wt-tool-h"><Icon name={tc.status === 'finding' ? 'findings' : tc.status === 'error' ? 'alert' : 'node'} />
-            <span className="mono wt-tn">{tc.name}</span><span className={'wt-st s-' + tc.status}>{tc.status}</span>
-            <span className="sp" />{tc.durationMs != null && <span className="num">{fmtN(tc.durationMs)} ms</span>}</div>
-          {tc.argsPreview && <div className="wt-args mono">{tc.argsPreview}</div>}
+        return <div
+          key={tc.id}
+          className={cn(
+            'mt-1.5 rounded-[7px] px-[9px] pb-2 pt-[7px]',
+            tc.status === 'finding'
+              ? 'bg-panel shadow-[inset_0_0_0_1px_var(--line-strong)]'
+              : tc.status === 'error'
+                ? 'bg-sunk shadow-[inset_0_0_0_1px_var(--bad-line,var(--line-strong))]'
+                : 'bg-sunk shadow-[inset_0_0_0_1px_var(--line)]',
+          )}
+        >
+          <div className="flex items-center gap-1.5 text-[11.5px] text-fg-subtle">
+            <Icon name={tc.status === 'finding' ? 'findings' : tc.status === 'error' ? 'alert' : 'node'} size={12} />
+            <span className="font-mono text-[11.5px] font-medium text-fg">{tc.name}</span>
+            <span className={cn(
+              'text-[11px]',
+              tc.status === 'error' ? 'text-danger' : tc.status === 'finding' ? 'font-medium text-fg' : tc.status === 'pending' ? 'text-warn' : 'text-fg-subtle',
+            )}>{tc.status}</span>
+            <span className="flex-1" />
+            {tc.durationMs != null && <span className="tabular-nums">{fmtN(tc.durationMs)} ms</span>}
+          </div>
+          {tc.argsPreview && <div className="my-1 mb-0.5 line-clamp-3 break-all font-mono text-[11px] leading-4 text-fg-muted">{tc.argsPreview}</div>}
           {tc.resultPreview && <>
-            <button type="button" className="wf-chip" onClick={() => setOpen(o => ({ ...o, [k]: !o[k] }))} aria-expanded={!!open[k]}>{open[k] ? 'Hide result' : 'Show result'}<Icon name={open[k] ? 'chevU' : 'chevD'} /></button>
-            {open[k] && <pre className="block mono wf-json">{tc.resultPreview}</pre>}
+            <button type="button" className={cn(WF_CHIP, 'mt-[5px]')} onClick={() => setOpen(o => ({ ...o, [k]: !o[k] }))} aria-expanded={!!open[k]}>
+              {open[k] ? 'Hide result' : 'Show result'}<Icon name={open[k] ? 'chevU' : 'chevD'} size={10} />
+            </button>
+            {open[k] && <pre className={WF_PRE_JSON}>{tc.resultPreview}</pre>}
           </>}
         </div>
       })}
     </div>)}
-    {s.loading && <div className="wf-load"><span className="wf-spin" />Refreshing…</div>}
+    {s.loading && <div className={WF_LOAD}><span className={WF_SPIN} />Refreshing…</div>}
   </div>
 }
 
@@ -142,20 +185,29 @@ function Artifacts({ s }: { s: SessionState }) {
     {arts.map((art, i) => {
       const isOpen = open[art.id] ?? i === 0
       const shell = !!art.command
-      return <div key={art.id} className={'wf-art' + (isOpen ? ' open' : '')}>
-        <button type="button" className="wf-art-h" onClick={() => setOpen(o => ({ ...o, [art.id]: !isOpen }))} aria-expanded={isOpen}>
-          {shell ? <span className={'wf-exit' + (art.exitStatus ? ' bad' : '')}>exit {art.exitStatus ?? 0}</span> : <Tag>{art.kind}</Tag>}
-          <code className="wf-cmd">{shell ? art.command : art.title}</code>
-          <Icon name={isOpen ? 'chevU' : 'chevD'} />
+      return <div key={art.id} className="mb-1.5 overflow-hidden rounded-[7px] shadow-[inset_0_0_0_1px_var(--line)]">
+        <button
+          type="button"
+          className="flex min-h-8 w-full cursor-pointer items-center gap-2 rounded-none border-0 bg-transparent px-[9px] text-left font-sans text-fg-subtle shadow-none transition-colors duration-[var(--d1)] hover:bg-hover"
+          onClick={() => setOpen(o => ({ ...o, [art.id]: !isOpen }))}
+          aria-expanded={isOpen}
+        >
+          {shell
+            ? <span className={cn('inline-flex h-[18px] flex-none items-center rounded-[9px] bg-sunk px-1.5 font-mono text-[10.5px] shadow-[inset_0_0_0_1px_var(--line-2)]', art.exitStatus ? 'text-danger' : 'text-fg-muted')}>exit {art.exitStatus ?? 0}</span>
+            : <Tag>{art.kind}</Tag>}
+          <code className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-fg">{shell ? art.command : art.title}</code>
+          <Icon name={isOpen ? 'chevU' : 'chevD'} size={12} />
         </button>
-        {isOpen && <div className="wf-art-b">
-          <div className="wf-art-bar"><span>{art.title} · {fmtTimeS(art.createdAt)}</span>
-            <button type="button" className="btn ghost" style={{ height: 22 }} onClick={() => links.evidence(art.id)}>Open<Icon name="ext" /></button></div>
+        {isOpen && <div className="border-t border-line px-[9px] pb-2">
+          <div className="flex items-center justify-between gap-2 pt-1.5 text-[11.5px] text-fg-subtle">
+            <span>{art.title} · {fmtTimeS(art.createdAt)}</span>
+            <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={() => links.evidence(art.id)}>Open<Icon name="ext" /></button>
+          </div>
           {shell ? <>
-            {art.stdout && <pre className="block mono wf-json">{art.stdout}</pre>}
-            {art.stderr && <pre className="block mono wf-json wf-stderr">{art.stderr}</pre>}
-            {!art.stdout && !art.stderr && <p className="wf-none">No stdout or stderr.</p>}
-          </> : <pre className="block mono wf-json">{art.preview || '(empty artifact)'}</pre>}
+            {art.stdout && <pre className={WF_PRE_JSON}>{art.stdout}</pre>}
+            {art.stderr && <pre className={cn(WF_PRE_JSON, 'text-danger')}>{art.stderr}</pre>}
+            {!art.stdout && !art.stderr && <p className={WF_NONE}>No stdout or stderr.</p>}
+          </> : <pre className={WF_PRE_JSON}>{art.preview || '(empty artifact)'}</pre>}
         </div>}
       </div>
     })}
@@ -184,10 +236,10 @@ function useCancelStep(step: ChainStep | undefined) {
 function CancelFooter({ step, label }: { step: ChainStep; label?: ReactNode }) {
   const c = useCancelStep(step)
   if (!c.can && !c.pending) return null
-  return <PaneFooter stamped={c.pending ? <><Icon name="stop" />Canceling step #{step.seq}… <span className="wf-dim" style={{ fontWeight: 400 }}>Z to undo</span></> : undefined}>
-    <span className="wf-foot-t">{label ?? <>Step #{step.seq} · {stLabel(step.status)}</>}</span>
-    <span className="sp" />
-    <button type="button" className="btn" onClick={c.cancel} title="Cancel this chain step (the worker stops and the step is not retried)"><Icon name="stop" />Cancel step</button>
+  return <PaneFooter stamped={c.pending ? <><Icon name="stop" />Canceling step #{step.seq}… <span className="ml-1 font-normal text-fg-subtle">Z to undo</span></> : undefined}>
+    <span className="min-w-0 truncate text-[12px] text-fg-subtle">{label ?? <>Step #{step.seq} · {stLabel(step.status)}</>}</span>
+    <span className="flex-1" />
+    <button type="button" className={runBtn()} onClick={c.cancel} title="Cancel this chain step (the worker stops and the step is not retried)"><Icon name="stop" />Cancel step</button>
   </PaneFooter>
 }
 
@@ -223,52 +275,86 @@ export function WorkerInspector({ sel }: InspectorProps) {
   const nTurns = session.data ? session.data.turns.length : a.turnsUsed
   const nArts = session.data?.artifacts.length ?? 0
   return <>
-    <PaneHeader title="Worker" sub={<span title={`Worker ${a.id} · Started ${fmtFullDateTime(a.createdAt)}`} suppressHydrationWarning>{PHASE_LABEL[a.phase] ?? a.phase} · {fmtAgo(a.createdAt)}</span>}
-      extra={<button type="button" className="icon-btn" title="Center in graph (↵)" aria-label="Center in graph" onClick={() => requestCamera({ type: 'center', id: rid })}><Icon name="fit" /></button>} />
-    <PaneBody><div className="d">
-      <div className="d-meta">
-        <Tag><span className="wf-tg"><LiveGlyph status={a.status} /></span>{stLabel(a.status)}</Tag>
+    <PaneHeader
+      title="Worker"
+      sub={<span title={`Worker ${a.id} · Started ${fmtFullDateTime(a.createdAt)}`} suppressHydrationWarning>{PHASE_LABEL[a.phase] ?? a.phase} · {fmtAgo(a.createdAt)}</span>}
+      extra={<button type="button" className={runIconBtn()} title="Center in graph (↵)" aria-label="Center in graph" onClick={() => requestCamera({ type: 'center', id: rid })}><Icon name="fit" /></button>}
+    />
+    <PaneBody><div className={RW.detail}>
+      <div className={WF_META}>
+        <Tag><span className={WF_TG}><LiveGlyph status={a.status} dotClassName="size-[7px]" /></span>{stLabel(a.status)}</Tag>
         <Tag>{PHASE_LABEL[a.phase] ?? a.phase}</Tag>
-        {step && <Tag className="num">Step #{step.seq} · P{step.priority}</Tag>}
+        {step && <Tag className="tabular-nums">Step #{step.seq} · P{step.priority}</Tag>}
         {step?.category && <Tag>{prettyCat(step.category)}</Tag>}
         {a.attempt > 0 && <Tag>Attempt {a.attempt + 1}</Tag>}
         {hist && <Tag tone="warn">{hist}</Tag>}
       </div>
-      <h2>{a.title}</h2>
+      <h2 className={WF_H2}>{a.title}</h2>
       <Props rows={[
         ['Turns', <><Meter id="wf.turns" value={pct} warn={isLive(a) && pct > 0.8} />{a.turnsUsed} of {a.maxTurns}</>],
-        ['Requests', <>{fmtN(a.requestsUsed)}{exs.length > 0 && <span className="wf-dim">· {exs.length} in the loaded window</span>}</>],
-        ...(a.sourceOrigins.length ? [['Origins', <span className="mono wf-origins" title={a.sourceOrigins.join('\n')}>{a.sourceOrigins.slice(0, 6).map(host).join(', ')}{a.sourceOrigins.length > 6 ? ' +' + (a.sourceOrigins.length - 6) : ''}</span>] as [ReactNode, ReactNode]] : []),
-        ['Started', <>{fmtDate(a.createdAt)} <span className="wf-dim mono">{fmtRel(a.createdAt, model.base)}</span></>],
+        ['Requests', <>{fmtN(a.requestsUsed)}{exs.length > 0 && <span className="text-fg-subtle">· {exs.length} in the loaded window</span>}</>],
+        ...(a.sourceOrigins.length ? [['Origins', <span className={WF_ORIGINS} title={a.sourceOrigins.join('\n')}>{a.sourceOrigins.slice(0, 6).map(host).join(', ')}{a.sourceOrigins.length > 6 ? ' +' + (a.sourceOrigins.length - 6) : ''}</span>] as [ReactNode, ReactNode]] : []),
+        ['Started', <>{fmtDate(a.createdAt)} <span className="font-mono text-[12px] text-fg-subtle">{fmtRel(a.createdAt, model.base)}</span></>],
         ['Lineage', <>{lin.up.size} upstream · {[...lin.down].filter(x => x !== 'report').length} downstream</>],
       ]} />
-      {g && <div className="banner"><Icon name="workflow" /><span>Part of the stack <b className="wf-b">{g.title}</b> × {g.members.length}</span>
-        <button type="button" className="btn ghost" style={{ height: 24 }} onClick={() => setExpanded(detail.run.id, g.id, !expanded.has(g.id))}>{expanded.has(g.id) ? 'Collapse' : 'Expand'}</button></div>}
+      {g && <div className="mb-3 flex items-center gap-2 rounded-[7px] bg-sunk px-2.5 py-2 text-[12px] text-fg-muted shadow-[inset_0_0_0_1px_var(--line)]">
+        <Icon name="workflow" />
+        <span>Part of the stack <b className="font-medium text-fg">{g.title}</b> × {g.members.length}</span>
+        <button
+          type="button"
+          className={cn(runBtn({ variant: 'ghost', size: 'sm' }), 'ml-auto')}
+          onClick={() => setExpanded(detail.run.id, g.id, !expanded.has(g.id))}
+        >
+          {expanded.has(g.id) ? 'Collapse' : 'Expand'}
+        </button>
+      </div>}
 
-      <div className="tabs wf-itabs" role="tablist" aria-label="Worker sections">
-        <button type="button" role="tab" aria-selected={tab === 'summary'} className={'tab' + (tab === 'summary' ? ' on' : '')} onClick={() => setTab('summary')}>Summary</button>
-        <button type="button" role="tab" aria-selected={tab === 'transcript'} className={'tab' + (tab === 'transcript' ? ' on' : '')} onClick={() => setTab('transcript')}>Transcript<span className="ct num">{nTurns}</span></button>
-        <button type="button" role="tab" aria-selected={tab === 'evidence'} className={'tab' + (tab === 'evidence' ? ' on' : '')} onClick={() => setTab('evidence')}>Evidence<span className="ct num">{facts.length + exs.length + nArts}</span></button>
+      <div
+        className="sticky top-0 z-[2] -mx-[18px] mt-1 flex gap-0.5 overflow-visible border-b border-line bg-panel px-[18px] py-2 [&+.rw-sec]:border-t-0"
+        role="tablist"
+        aria-label="Worker sections"
+      >
+        {([
+          ['summary', 'Summary', null],
+          ['transcript', 'Transcript', nTurns],
+          ['evidence', 'Evidence', facts.length + exs.length + nArts],
+        ] as const).map(([k, label, ct]) => {
+          const on = tab === k
+          return <button
+            key={k}
+            type="button"
+            role="tab"
+            aria-selected={on}
+            className={cn(
+              'inline-flex h-6 flex-none cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-control border-0 px-[9px] font-sans text-[12.5px] font-medium shadow-none transition-[background-color,color] duration-[var(--d1)]',
+              on ? 'bg-press text-fg hover:bg-press' : 'bg-transparent text-fg-muted hover:bg-hover hover:text-fg',
+            )}
+            onClick={() => setTab(k)}
+          >
+            {label}
+            {ct !== null && <span className="font-normal text-fg-subtle tabular-nums">{ct}</span>}
+          </button>
+        })}
       </div>
 
       {tab === 'summary' && <>
         {a.objective && <Section title="Objective"><p>{a.objective}</p></Section>}
         {step?.hypothesis && step.hypothesis !== a.objective && <Section title="Hypothesis"><p>{step.hypothesis}</p>
-          {step.skills.length > 0 && <div className="chip-row">{step.skills.map(s => <Tag key={s} mono>{s}</Tag>)}</div>}</Section>}
-        {a.outcome && <Section title="Outcome"><p className="lead">{a.outcome}</p></Section>}
+          {step.skills.length > 0 && <div className="mb-2.5 flex flex-wrap gap-[5px]">{step.skills.map(s => <Tag key={s} mono>{s}</Tag>)}</div>}</Section>}
+        {a.outcome && <Section title="Outcome"><p className="text-fg!">{a.outcome}</p></Section>}
         {ups.length > 0 && <Section title="Upstream" right={ups.length}>{ups.slice(0, 8).map(w => <LineageRow key={w} L={L} id={rid} other={w} />)}</Section>}
         {downs.length > 0 && <Section title="Downstream" right={downs.length}>{downs.slice(0, 8).map(w => <LineageRow key={w} L={L} id={rid} other={w} />)}</Section>}
         {fs.length > 0 && <Section title="Findings" right={fs.length}><FindingRows list={fs} /></Section>}
-        {msgs.length > 0 && <Section title="Worker report">{msgs.map(m => <pre key={m.id} className="block wf-report">{m.content}</pre>)}</Section>}
-        {!a.objective && !a.outcome && !ups.length && !downs.length && !fs.length && !msgs.length && <p className="wf-none">Nothing recorded yet.</p>}
+        {msgs.length > 0 && <Section title="Worker report">{msgs.map(m => <pre key={m.id} className={cn(RW.pre, 'break-words font-sans text-[12.5px] leading-[19px]')}>{m.content}</pre>)}</Section>}
+        {!a.objective && !a.outcome && !ups.length && !downs.length && !fs.length && !msgs.length && <p className={WF_NONE}>Nothing recorded yet.</p>}
       </>}
       {tab === 'transcript' && <Transcript a={a} s={session} />}
       {tab === 'evidence' && <>
-        {facts.length > 0 && <Section title="Facts" right={facts.length}><div className="ctx">{facts.map(f => <FactItem key={f.id} f={f} />)}</div></Section>}
+        {facts.length > 0 && <Section title="Facts" right={facts.length}><div className={WF_CTX}>{facts.map(f => <FactItem key={f.id} f={f} />)}</div></Section>}
         <Artifacts s={session} />
         {exs.length > 0 && <Section title="Exchanges" right={exs.length < a.requestsUsed ? exs.length + ' of ' + fmtN(a.requestsUsed) : exs.length}>
           <ExchangeRows list={exs} /></Section>}
-        {!facts.length && !exs.length && !nArts && <p className="wf-none">{session.loading ? 'Loading…' : 'No facts, artifacts or exchanges recorded by this worker.'}</p>}
+        {!facts.length && !exs.length && !nArts && <p className={WF_NONE}>{session.loading ? 'Loading…' : 'No facts, artifacts or exchanges recorded by this worker.'}</p>}
       </>}
     </div></PaneBody>
     {step && <CancelFooter step={step} label={<>Step #{step.seq} · {isLive(a) ? stLabel(a.status) : stLabel(step.status)}</>} />}
@@ -276,7 +362,7 @@ export function WorkerInspector({ sel }: InspectorProps) {
 }
 
 function ExchangeRows({ list }: { list: readonly { id: string }[] }) {
-  return <>{list.slice(0, 40).map(e => <ExchangeLink key={e.id} id={e.id} />)}{list.length > 40 && <p className="wf-more">+{list.length - 40} more in Exchanges</p>}</>
+  return <>{list.slice(0, 40).map(e => <ExchangeLink key={e.id} id={e.id} />)}{list.length > 40 && <p className={WF_MORE}>+{list.length - 40} more in Exchanges</p>}</>
 }
 
 // ---------------------------------------------------------------- stack
@@ -298,11 +384,14 @@ export function StackInspector({ sel }: InspectorProps) {
   const exp = expanded.has(g.id)
   const lin = L.byId.has(g.id) ? nodeLineage(L, g.id) : null
   return <>
-    <PaneHeader title="Stack" sub={PHASE_LABEL[g.phase] ?? g.phase}
-      extra={<button type="button" className="btn ghost" style={{ height: 24 }} onClick={() => setExpanded(detail.run.id, g.id, !exp)}><Icon name={exp ? 'minus' : 'plus'} />{exp ? 'Collapse' : 'Expand'}</button>} />
-    <PaneBody><div className="d">
-      <div className="d-meta">{[...st.entries()].map(([k, n]) => <Tag key={k} className="num"><span className="wf-tg"><LiveGlyph status={k} /></span>{n} {stLabel(k).toLowerCase()}</Tag>)}</div>
-      <h2>{g.title} <span className="wf-x">× {ms.length}</span></h2>
+    <PaneHeader
+      title="Stack"
+      sub={PHASE_LABEL[g.phase] ?? g.phase}
+      extra={<button type="button" className={runBtn({ variant: 'ghost', size: 'sm' })} onClick={() => setExpanded(detail.run.id, g.id, !exp)}><Icon name={exp ? 'minus' : 'plus'} />{exp ? 'Collapse' : 'Expand'}</button>}
+    />
+    <PaneBody><div className={RW.detail}>
+      <div className={WF_META}>{[...st.entries()].map(([k, n]) => <Tag key={k} className="tabular-nums"><span className={WF_TG}><LiveGlyph status={k} dotClassName="size-[7px]" /></span>{n} {stLabel(k).toLowerCase()}</Tag>)}</div>
+      <h2 className={WF_H2}>{g.title} <span className="font-normal text-fg-subtle">× {ms.length}</span></h2>
       <Props rows={[
         ['Requests', fmtN(ms.reduce((s, a) => s + a.requestsUsed, 0))],
         ['Facts', fmtN(fa)],
@@ -315,7 +404,7 @@ export function StackInspector({ sel }: InspectorProps) {
         {ms.map(a => {
           const nf = (model.workerFindings.get(a.id) ?? []).length
           return <LinkRow key={a.id} glyph={<LiveGlyph status={a.status} />} trailing={null}
-            right={<span className="num">{fmtN(a.requestsUsed)} req{nf ? ' · ' + plural(nf, 'finding') : ''}</span>}
+            right={<span className="tabular-nums">{fmtN(a.requestsUsed)} req{nf ? ' · ' + plural(nf, 'finding') : ''}</span>}
             onClick={() => nav.select({ kind: 'worker', id: a.id }, { push: true })}>{a.title.split(' · ').slice(1).join(' · ') || a.title}</LinkRow>
         })}
       </Section>
@@ -333,17 +422,20 @@ export function StepsInspector() {
   const byStatus = new Map<string, number>()
   steps.forEach(s => byStatus.set(s.status, (byStatus.get(s.status) ?? 0) + 1))
   return <>
-    <PaneHeader title="Queued steps" sub={steps.length}
-      extra={<button type="button" className="icon-btn" title="Center in graph" aria-label="Center in graph" onClick={() => requestCamera({ type: 'center', id: QUEUE_ID })}><Icon name="fit" /></button>} />
-    <PaneBody><div className="d">
-      <div className="d-meta">{[...byStatus.entries()].map(([k, n]) => <Tag key={k} className="num"><StatusGlyph status={k} />{n} {stLabel(k).toLowerCase()}</Tag>)}
-        {canceled > 0 && <Tag className="num"><StatusGlyph status="canceled" />{canceled} canceled</Tag>}</div>
-      <h2>Planned chain steps, not yet dispatched</h2>
-      <p className="wf-lead">The coordinator queued these steps; each becomes a worker when its dependencies are met and the run is running. Open one to review its hypothesis or cancel it.</p>
+    <PaneHeader
+      title="Queued steps"
+      sub={steps.length}
+      extra={<button type="button" className={runIconBtn()} title="Center in graph" aria-label="Center in graph" onClick={() => requestCamera({ type: 'center', id: QUEUE_ID })}><Icon name="fit" /></button>}
+    />
+    <PaneBody><div className={RW.detail}>
+      <div className={WF_META}>{[...byStatus.entries()].map(([k, n]) => <Tag key={k} className="tabular-nums"><StatusGlyph status={k} />{n} {stLabel(k).toLowerCase()}</Tag>)}
+        {canceled > 0 && <Tag className="tabular-nums"><StatusGlyph status="canceled" />{canceled} canceled</Tag>}</div>
+      <h2 className={WF_H2}>Planned chain steps, not yet dispatched</h2>
+      <p className="-mt-1 mb-3.5 text-[12.5px] leading-[19px] text-fg-muted">The coordinator queued these steps; each becomes a worker when its dependencies are met and the run is running. Open one to review its hypothesis or cancel it.</p>
       {steps.length ? <Section title="Steps" right={steps.length}>
         {steps.map(s => <LinkRow key={s.id} glyph={<StatusGlyph status={s.status} />} sub={prettyCat(s.category)} trailing="chevR"
-          right={<span className="num">#{s.seq} · P{s.priority}</span>} onClick={() => nav.select({ kind: 'step', id: s.id }, { push: true })}>{s.title}</LinkRow>)}
-      </Section> : <p className="wf-none">Every planned step has been dispatched.</p>}
+          right={<span className="tabular-nums">#{s.seq} · P{s.priority}</span>} onClick={() => nav.select({ kind: 'step', id: s.id }, { push: true })}>{s.title}</LinkRow>)}
+      </Section> : <p className={WF_NONE}>Every planned step has been dispatched.</p>}
     </div></PaneBody>
   </>
 }
@@ -358,28 +450,32 @@ export function StepInspector({ sel }: InspectorProps) {
   const factDeps = s.dependsOnFactIds.map(id => model.factById.get(id)).filter((x): x is Fact => !!x)
   return <>
     <PaneHeader title="Step" sub={'#' + s.seq} />
-    <PaneBody><div className="d">
-      <div className="d-meta"><Tag><StatusGlyph status={s.status} />{stLabel(s.status)}</Tag><Tag className="num">Step #{s.seq} · P{s.priority}</Tag><Tag>{prettyCat(s.category)}</Tag>
-        {s.specialistProfile && <Tag>{s.specialistProfile}</Tag>}</div>
-      <h2>{s.title}</h2>
+    <PaneBody><div className={RW.detail}>
+      <div className={WF_META}>
+        <Tag><StatusGlyph status={s.status} />{stLabel(s.status)}</Tag>
+        <Tag className="tabular-nums">Step #{s.seq} · P{s.priority}</Tag>
+        <Tag>{prettyCat(s.category)}</Tag>
+        {s.specialistProfile && <Tag>{s.specialistProfile}</Tag>}
+      </div>
+      <h2 className={WF_H2}>{s.title}</h2>
       <Props rows={[
-        ['Planned', <>{fmtDate(s.createdAt)} <span className="wf-dim mono">{fmtRel(s.createdAt, model.base)}</span></>],
-        ...(s.sourceOrigins.length ? [['Origins', <span className="mono wf-origins">{s.sourceOrigins.slice(0, 6).map(host).join(', ')}</span>] as [ReactNode, ReactNode]] : []),
+        ['Planned', <>{fmtDate(s.createdAt)} <span className="font-mono text-[12px] text-fg-subtle">{fmtRel(s.createdAt, model.base)}</span></>],
+        ...(s.sourceOrigins.length ? [['Origins', <span className={WF_ORIGINS}>{s.sourceOrigins.slice(0, 6).map(host).join(', ')}</span>] as [ReactNode, ReactNode]] : []),
         ['Scope', 'Revision ' + s.scopeRevision],
       ]} />
-      <Section title="Hypothesis"><p>{s.hypothesis}</p>{s.skills.length > 0 && <div className="chip-row">{s.skills.map(k => <Tag key={k} mono>{k}</Tag>)}</div>}</Section>
+      <Section title="Hypothesis"><p>{s.hypothesis}</p>{s.skills.length > 0 && <div className="mb-2.5 flex flex-wrap gap-[5px]">{s.skills.map(k => <Tag key={k} mono>{k}</Tag>)}</div>}</Section>
       {worker && <Section title="Worker"><LinkRow glyph={<LiveGlyph status={worker.status} />} trailing={null} onClick={() => nav.select({ kind: 'worker', id: worker.id }, { push: true })}>{worker.title}</LinkRow></Section>}
       {deps.length > 0 && <Section title="Depends on steps" right={deps.length}>
-        {deps.map(d => <LinkRow key={d.id} glyph={<StatusGlyph status={d.status} />} right={<span className="num">#{d.seq}</span>} trailing={null}
+        {deps.map(d => <LinkRow key={d.id} glyph={<StatusGlyph status={d.status} />} right={<span className="tabular-nums">#{d.seq}</span>} trailing={null}
           onClick={() => nav.select(d.assignedWorkerId ? { kind: 'worker', id: d.assignedWorkerId } : { kind: 'step', id: d.id }, { push: true })}>{d.title}</LinkRow>)}
       </Section>}
-      {factDeps.length > 0 && <Section title="Depends on facts" right={factDeps.length}><div className="ctx">{factDeps.map(f => <FactItem key={f.id} f={f} />)}</div></Section>}
+      {factDeps.length > 0 && <Section title="Depends on facts" right={factDeps.length}><div className={WF_CTX}>{factDeps.map(f => <FactItem key={f.id} f={f} />)}</div></Section>}
     </div></PaneBody>
     <CancelFooter step={s} />
   </>
 }
 
-// ---------------------------------------------------------------- graph digest
+// ---------------------------------------------------------------- memory summary digest
 
 type DigestLoad = Awaited<ReturnType<typeof readGraphDigest>>
 export function DigestInspector({ sel }: InspectorProps) {
@@ -397,30 +493,38 @@ export function DigestInspector({ sel }: InspectorProps) {
       .then(data => setLoad({ state: 'done', data }), () => setLoad({ state: 'error' }))
   }
   return <>
-    <PaneHeader title="Memory summary" sub={<span title={`Cold-graph digest ${d.id}`}>Round {d.roundNo}</span>} />
-    <PaneBody><div className="d">
-      <div className="d-meta"><Tag title="LSM compaction level">{d.level === 'major' ? 'Major' : 'Minor'} compaction</Tag><Tag tone={d.active ? undefined : 'warn'}>{d.active ? 'Active' : 'Superseded'}</Tag></div>
-      <h2 title="Cold-graph digest: compacted summary of older facts">Memory summary · round {d.roundNo}</h2>
+    <PaneHeader title="Memory summary" sub={<span title={`Saved workspace snapshot digest ${d.id}`}>Round {d.roundNo}</span>} />
+    <PaneBody><div className={RW.detail}>
+      <div className={WF_META}>
+        <Tag title="Storage history level">{d.level === 'major' ? 'Major' : 'Minor'} compaction</Tag>
+        <Tag tone={d.active ? undefined : 'warn'}>{d.active ? 'Active' : 'Superseded'}</Tag>
+      </div>
+      <h2 className={WF_H2} title="Saved workspace snapshot digest: compacted summary of older facts">Memory summary · round {d.roundNo}</h2>
       <Props rows={[
         ['Facts', fmtN(d.coveredFactIds.length)],
         ['Workers', fmtN(d.coveredAssignmentIds.length)],
-        ['Compacted', <>{fmtDate(d.createdAt)} <span className="wf-dim mono">{fmtRel(d.createdAt, model.base)}</span></>],
-        ['Signature', <span className="mono">{d.signatureHash.slice(0, 16)}</span>],
+        ['Compacted', <>{fmtDate(d.createdAt)} <span className="font-mono text-[12px] text-fg-subtle">{fmtRel(d.createdAt, model.base)}</span></>],
+        ['Signature', <span className="font-mono text-[12px]">{d.signatureHash.slice(0, 16)}</span>],
       ]} />
-      <Section title="Summary"><p className="lead">{d.summary}</p></Section>
+      <Section title="Summary"><p className="text-fg!">{d.summary}</p></Section>
       <Section title="Covered facts" right={d.coveredFactIds.length}>
-        {load.state === 'idle' && <button type="button" className="btn" onClick={fetchFacts}><Icon name="download" />Load covered facts</button>}
-        {load.state === 'loading' && <div className="wf-load"><span className="wf-spin" />Loading facts…</div>}
-        {load.state === 'error' && <p>Could not load the digest’s facts. <button type="button" className="linkbtn" onClick={fetchFacts}>Retry</button></p>}
+        {load.state === 'idle' && <button type="button" className={runBtn()} onClick={fetchFacts}><Icon name="download" />Load covered facts</button>}
+        {load.state === 'loading' && <div className={WF_LOAD}><span className={WF_SPIN} />Loading facts…</div>}
+        {load.state === 'error' && <p>Could not load the digest’s facts. <button type="button" className={runBtn({ variant: 'link', size: 'none' })} onClick={fetchFacts}>Retry</button></p>}
         {load.state === 'done' && (load.data.facts.length
-          ? <div className="ctx">{load.data.facts.map(f => <div key={f.id} className="ctx-item"><span className="ci"><Icon name="fact" /></span>
-            <div style={{ minWidth: 0 }}><div className="ct"><b>{f.kind}</b> · <span className="mono">{host(f.origin)}</span></div><div className="cb">{f.summary}</div></div></div>)}</div>
-          : <p className="wf-none">No untainted facts remain under this digest.</p>)}
+          ? <div className={WF_CTX}>{load.data.facts.map(f => <div key={f.id} className={WF_CTX_ITEM}>
+            <span className="pt-0.5 text-fg-subtle"><Icon name="fact" /></span>
+            <div className="min-w-0">
+              <div className="text-[11.5px] text-fg-subtle"><b className="font-medium text-fg-muted">{f.kind}</b> · <span className="font-mono text-[11.5px]">{host(f.origin)}</span></div>
+              <div className="line-clamp-3 text-fg-muted">{f.summary}</div>
+            </div>
+          </div>)}</div>
+          : <p className={WF_NONE}>No untainted facts remain under this digest.</p>)}
       </Section>
       {workers.length > 0 && <Section title="Covered workers" right={workers.length}>
         {workers.slice(0, 30).map(a => <LinkRow key={a.id} glyph={<LiveGlyph status={a.status} />} right={PHASE_LABEL[a.phase] ?? a.phase} trailing={null}
           onClick={() => nav.select({ kind: 'worker', id: a.id }, { push: true })}>{a.title}</LinkRow>)}
-        {workers.length > 30 && <p className="wf-more">+{workers.length - 30} more</p>}
+        {workers.length > 30 && <p className={WF_MORE}>+{workers.length - 30} more</p>}
       </Section>}
     </div></PaneBody>
   </>

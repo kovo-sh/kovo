@@ -6,7 +6,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import type { CSSProperties, PointerEvent as RPointerEvent } from 'react'
 import { useRun } from '../data.tsx'
 import { clamp, fmtDate, fmtN, fmtRel, firstSentence, host, plural } from '../format.ts'
-import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
+import { LiveDot, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
 import { PHASE_LABEL, stLabel } from '../meta.ts'
@@ -14,6 +14,7 @@ import { worstSeverity } from '../model.ts'
 import type { FindingRow, RunModel } from '../model.ts'
 import { DUR, EASE_CSS, ease, reducedMotion, T } from '../motion.tsx'
 import { useTheme } from '../theme.ts'
+import { cn, runIconBtn } from '../tw.ts'
 import { allNodes, bounds, edgePath, hotEdges, isLive, LOD_K, nodeLineage, onCameraRequest, replaySpans, WF } from './workflow-layout.ts'
 import type { WfEdge, WfLayout, WfNode } from './workflow-layout.ts'
 
@@ -84,66 +85,196 @@ function nodeInfo(m: RunModel, L: WfLayout): Map<string, NodeInfo> {
 }
 
 /** Status glyph, or a pulsing dot for running / a breathing amber dot for paused. */
-function LiveGlyph({ status }: { status: string }) {
-  if (status === 'running') return <span className="live" title="Running" />
-  if (status === 'paused' || status === 'waiting_approval') return <span className="live paused" title={stLabel(status)} />
+function LiveGlyph({ status, dotClassName }: { status: string; dotClassName?: string }) {
+  if (status === 'running') return <span className="inline-flex items-center justify-center" title="Running"><LiveDot className={dotClassName} /></span>
+  if (status === 'paused' || status === 'waiting_approval') return <span className="inline-flex items-center justify-center" title={stLabel(status)}><LiveDot paused className={dotClassName} /></span>
   return <StatusGlyph status={status} />
 }
 /** Live glyph plus the replay variant (shown while the replay frontier passes the node). */
 function Lv({ status }: { status: string }) {
-  return <span className="g lv"><span className="lv-now"><LiveGlyph status={status} /></span><span className="lv-rp"><span className="live" /></span></span>
+  return <span className="inline-flex size-3.5 flex-none items-center justify-center">
+    <span className="contents group-data-[rp=live]/node:hidden"><LiveGlyph status={status} /></span>
+    <span className="hidden group-data-[rp=live]/node:contents"><LiveDot /></span>
+  </span>
 }
 
-const NodeCard = memo(function NodeCard({ n, info, cls, reportSub }: { n: WfNode; info?: NodeInfo; cls: string; reportSub?: string }) {
+function tickBgClass(status: string): string {
+  switch (status) {
+    case 'paused':
+    case 'waiting_approval':
+      return 'bg-warn'
+    case 'failed':
+      return 'bg-danger'
+    case 'running':
+      return 'bg-accent'
+    case 'queued':
+      return 'bg-line-strong'
+    case 'ready':
+      return 'bg-fg-subtle'
+    case 'canceled':
+      return 'bg-line-2'
+    default:
+      return 'bg-fg-faint'
+  }
+}
+
+const NODE_BASE = 'group/node absolute flex h-[var(--nh)] w-[var(--nw)] cursor-pointer select-none flex-col gap-[3px] rounded-[9px] px-[11px] pb-2 pt-[9px] transition-[opacity,box-shadow,transform] duration-[var(--d2)] ease-guardian group-data-[lod]/wf:justify-center group-data-[lod]/wf:px-3.5 group-data-[lod]/wf:py-2.5 data-[rp=hidden]:pointer-events-none data-[rp=hidden]:scale-[.94] data-[rp=hidden]:opacity-0!'
+const NODE_STACK_LAYERS = "before:content-[''] before:absolute before:inset-x-1.5 before:-bottom-[5px] before:-z-[1] before:h-2 before:rounded-b-[9px] before:bg-panel before:shadow-surface after:content-[''] after:absolute after:inset-x-3 after:-bottom-2.5 after:-z-[2] after:h-2 after:rounded-b-[9px] after:bg-panel after:opacity-70 after:shadow-surface"
+const NODE_TOP = 'flex h-4 min-w-0 items-center gap-1.5 whitespace-nowrap text-[11.5px] group-data-[lod]/wf:hidden'
+const NODE_TITLE = 'line-clamp-2 min-h-[34px] text-[12.5px] font-medium leading-[17px] group-data-[lod]/wf:min-h-0 group-data-[lod]/wf:text-[21px] group-data-[lod]/wf:leading-[27px]'
+const NODE_BOT = 'mt-auto flex items-center gap-2 whitespace-nowrap text-[11px] tabular-nums group-data-[lod]/wf:hidden'
+const NODE_BADGE = 'inline-flex h-[17px] items-center gap-1 rounded-[9px] bg-sunk px-1.5 text-[11px] font-medium text-fg-muted shadow-[inset_0_0_0_1px_var(--line-2)]'
+const NODE_BADGE_F = 'inline-flex h-[17px] items-center gap-1 rounded-[9px] bg-panel px-1.5 text-[11px] font-medium text-fg shadow-[inset_0_0_0_1px_var(--line-2)]'
+
+interface NodeFlags {
+  sel: boolean
+  hot: boolean
+  nomatch: boolean
+  member: boolean
+  hist: boolean
+}
+
+const NodeCard = memo(function NodeCard({ n, info, flags, reportSub }: { n: WfNode; info?: NodeInfo; flags: NodeFlags; reportSub?: string }) {
   const style: CSSProperties = { left: n.x, top: n.y }
+  const opacityCls = flags.hot ? 'opacity-100' : flags.nomatch ? 'opacity-25' : 'group-data-[focus]/wf:opacity-30'
+  const status = info?.status ?? 'complete'
+  const paused = status === 'paused' || status === 'waiting_approval'
+  const shadowCls = flags.sel
+    ? 'shadow-[0_0_0_1.5px_var(--accent),0_0_0_4px_var(--accent-soft),0_6px_16px_-6px_rgba(0,0,0,.18)]'
+    : paused
+      ? 'shadow-[0_0_0_1px_var(--warn-line),var(--shadow-card)] hover:shadow-[0_0_0_1px_var(--line-strong),0_4px_12px_-4px_rgba(0,0,0,.14)]'
+      : 'shadow-surface hover:shadow-[0_0_0_1px_var(--line-strong),0_4px_12px_-4px_rgba(0,0,0,.14)]'
+
   if (n.kind === 'report') {
-    return <div className={'node report' + cls} data-n="report" style={style} role="button" aria-label="Open the report">
-      <div className="nt"><span className="g"><Icon name="report" /></span><span className="id">Report</span><span className="h">{fmtDate(n.createdAt)}</span></div>
-      <div className="nn">{reportSub}</div>
-      <div className="nb"><span>Open the report</span><span className="sp" /><Icon name="arrowR" /></div>
+    return <div
+      className={cn(NODE_BASE, 'border-0 bg-fg text-panel', shadowCls, opacityCls)}
+      data-n="report"
+      data-wf-kind="report"
+      style={style}
+      role="button"
+      aria-label="Open the report"
+    >
+      <div className={cn(NODE_TOP, 'text-[color-mix(in_srgb,var(--panel)_60%,transparent)]')}>
+        <span className="inline-flex size-3.5 flex-none items-center justify-center"><Icon name="report" /></span>
+        <span className="flex-none">Report</span>
+        <span className="ml-auto min-w-0 truncate text-[11px]">{fmtDate(n.createdAt)}</span>
+      </div>
+      <div className={cn(NODE_TITLE, 'text-panel')}>{reportSub}</div>
+      <div className={cn(NODE_BOT, 'text-[color-mix(in_srgb,var(--panel)_60%,transparent)]')}>
+        <span>Open the report</span><span className="flex-1" /><Icon name="arrowR" />
+      </div>
     </div>
   }
   const i = info!
   const nf = i.findings.length
-  const badge = nf > 0 && <span className="nbadge f"><SevGlyph sev={worstSeverity(i.findings)} />{nf}</span>
+  const badge = nf > 0 && <span className={NODE_BADGE_F}><SevGlyph sev={worstSeverity(i.findings)} />{nf}</span>
+  const lodBadge = nf > 0 && <div className="absolute -right-[7px] -top-[7px] hidden gap-[3px] group-data-[lod]/wf:flex">
+    <span className="flex h-[22px] min-w-[22px] items-center justify-center rounded-[11px] bg-fg px-1.5 text-[13px] font-semibold text-panel">{nf}</span>
+  </div>
+
   if (n.kind === 'stack' || n.kind === 'queue') {
     const ticks = n.kind === 'stack' ? n.members!.slice(0, 40).map(a => a.status) : n.steps!.slice(0, 40).map(s => s.status === 'ready' ? 'ready' : 'queued')
-    return <div className={'node stack' + (n.kind === 'queue' ? ' queue' : '') + ' st-' + i.status + cls} data-n={n.id} style={style} role="button" aria-label={titleOf(n)}>
-      <div className="nt">
-        {n.kind === 'stack' ? <Lv status={i.status} /> : <span className="g"><Icon name="queue" /></span>}
-        <span className="id num" data-def={n.kind === 'stack' ? i.idLabel + ' · ' + plural(i.hosts, 'host') : undefined}>
+    return <div
+      className={cn(
+        NODE_BASE,
+        NODE_STACK_LAYERS,
+        n.kind === 'queue' ? 'bg-[color-mix(in_srgb,var(--panel)_70%,var(--sunk))]' : 'bg-panel',
+        shadowCls,
+        opacityCls,
+      )}
+      data-n={n.id}
+      data-wf-kind={n.kind}
+      style={style}
+      role="button"
+      aria-label={titleOf(n)}
+    >
+      <div className={cn(NODE_TOP, 'text-fg-subtle')}>
+        {n.kind === 'stack'
+          ? <Lv status={i.status} />
+          : <span className="inline-flex size-3.5 flex-none items-center justify-center text-fg-subtle"><Icon name="queue" /></span>}
+        <span
+          className="flex-none tabular-nums"
+          data-wf-id=""
+          data-def={n.kind === 'stack' ? i.idLabel + ' · ' + plural(i.hosts, 'host') : undefined}
+        >
           {n.kind === 'stack' ? i.idLabel + ' · ' + plural(i.hosts, 'host') : i.idLabel + ' waiting'}
         </span>
-        {n.kind === 'stack' && <button type="button" className="h xbtn" data-wfexpand={n.id} title="Expand the stack (double-click)">Expand</button>}
+        {n.kind === 'stack' && (
+          <button
+            type="button"
+            className="ml-auto inline-flex h-[18px] flex-none cursor-pointer items-center rounded-[5px] border-0 bg-panel px-1.5 font-sans text-[11px] font-normal text-fg-muted shadow-[inset_0_0_0_1px_var(--line-2)] transition-[background-color,color] duration-[var(--d1)] hover:bg-sunk hover:text-fg"
+            data-wfexpand={n.id}
+            title="Expand the stack (double-click)"
+          >
+            Expand
+          </button>
+        )}
       </div>
-      <div className="nn">{n.kind === 'stack' ? n.g!.title : 'Queued chain steps'}</div>
-      <div className="nb num">
-        <span className="ticks">{ticks.map((s, k) => <i key={k} className={'t-' + s} />)}</span>
+      <div className={cn(NODE_TITLE, n.kind === 'queue' ? 'text-fg-muted' : i.status === 'failed' ? 'text-danger' : 'text-fg')}>
+        {n.kind === 'stack' ? n.g!.title : 'Queued chain steps'}
+      </div>
+      <div className={cn(NODE_BOT, 'text-fg-subtle')}>
+        <span className="flex items-center gap-[1.5px]" data-wf-ticks="">
+          {ticks.map((s, k) => <i key={k} className={cn('h-[9px] w-[3px] rounded-[1px] transition-opacity duration-[var(--d2)]', tickBgClass(s))} />)}
+        </span>
         {n.kind === 'stack' ? <span>{fmtN(i.reqs)} req</span> : <span>Not yet dispatched</span>}
-        <span className="sp" />
-        {i.facts > 0 && <span className="nbadge">{fmtN(i.facts)} facts</span>}
+        <span className="flex-1" />
+        {i.facts > 0 && <span className={NODE_BADGE}>{fmtN(i.facts)} facts</span>}
         {badge}
       </div>
-      {nf > 0 && <div className="lodb"><span>{nf}</span></div>}
+      {lodBadge}
     </div>
   }
   const a = n.a!
-  return <div className={'node st-' + a.status + cls} data-n={n.id} style={style} role="button" aria-label={a.title + ', ' + stLabel(a.status)}>
-    <div className="nt"><Lv status={a.status} /><span className="id mono">{i.idLabel}</span>
-      {i.hist ? <span className="h hist-l">{i.hist}</span> : <span className="h mono">{i.host}</span>}</div>
-    <div className="nn">{a.title}</div>
-    <div className="nb num">
-      <span>{a.turnsUsed}/{a.maxTurns} turns</span><span>{fmtN(a.requestsUsed)} req</span><span className="sp" />
-      {i.facts > 0 && <span className="nbadge">{plural(i.facts, 'fact')}</span>}
+  return <div
+    className={cn(
+      NODE_BASE,
+      flags.member ? 'bg-[color-mix(in_srgb,var(--panel)_88%,var(--sunk))]' : 'bg-panel',
+      flags.hist && '[background-image:repeating-linear-gradient(135deg,transparent_0_6px,color-mix(in_srgb,var(--fg)_3%,transparent)_6px_7px)]',
+      shadowCls,
+      opacityCls,
+    )}
+    data-n={n.id}
+    data-wf-kind="worker"
+    style={style}
+    role="button"
+    aria-label={a.title + ', ' + stLabel(a.status)}
+  >
+    <div className={cn(NODE_TOP, 'text-fg-subtle')}>
+      <Lv status={a.status} />
+      <span className="flex-none font-mono text-[11.5px]" data-wf-id="">{i.idLabel}</span>
+      {i.hist
+        ? <span className="ml-auto min-w-0 truncate font-sans text-[11px] text-warn">{i.hist}</span>
+        : <span className="ml-auto min-w-0 truncate font-mono text-[11px]">{i.host}</span>}
+    </div>
+    <div className={cn(NODE_TITLE, a.status === 'failed' ? 'text-danger' : flags.hist ? 'text-fg-muted' : 'text-fg')}>
+      {a.title}
+    </div>
+    <div className={cn(NODE_BOT, 'text-fg-subtle')}>
+      <span>{a.turnsUsed}/{a.maxTurns} turns</span>
+      <span>{fmtN(a.requestsUsed)} req</span>
+      <span className="flex-1" />
+      {i.facts > 0 && <span className={NODE_BADGE}>{plural(i.facts, 'fact')}</span>}
       {badge}
     </div>
-    {nf > 0 && <div className="lodb"><span>{nf}</span></div>}
+    {lodBadge}
   </div>
 })
 
 const Edge = memo(function Edge({ d, e, hot }: { d: string; e: WfEdge; hot: boolean }) {
-  return <path className={'edge' + (e.kind === 'causal' ? ' causal' : '') + (e.kind === 'report' ? ' rep' : '') + (hot ? ' hot' : '')}
-    data-e={e.key} d={d} pathLength={e.kind !== 'causal' ? 1 : undefined} markerEnd={hot ? 'url(#rw-wf-ahh)' : 'url(#rw-wf-ah)'} />
+  return <path
+    className={cn(
+      'fill-none transition-[opacity,stroke,stroke-width] duration-[var(--d2)] ease-guardian data-[rp=hidden]:hidden',
+      e.kind === 'causal' && '[stroke-dasharray:4_3]',
+      hot
+        ? cn('opacity-100 stroke-accent', e.kind === 'causal' ? '[stroke-width:1.6]' : '[stroke-width:1.8]')
+        : cn('[stroke-width:1.3] group-data-[focus]/wf:opacity-[.12]', e.kind === 'report' ? 'stroke-[var(--edge-2)]' : 'stroke-[var(--edge)]'),
+    )}
+    data-e={e.key}
+    d={d}
+    pathLength={e.kind !== 'causal' ? 1 : undefined}
+    markerEnd={hot ? 'url(#rw-wf-ahh)' : 'url(#rw-wf-ah)'}
+  />
 })
 
 export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand, onReport, replay, onReplayClose }: GraphProps) {
@@ -388,7 +519,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     const nodes = allNodes(L)
     const prev = prevPos.current
     const els = new Map<string, HTMLElement>()
-    cv.querySelectorAll<HTMLElement>('.node[data-n]').forEach(el => els.set(el.dataset.n!, el))
+    cv.querySelectorAll<HTMLElement>('[data-n]').forEach(el => els.set(el.dataset.n!, el))
     const edgeEls = new Map<string, SVGPathElement>()
     cv.querySelectorAll<SVGPathElement>('path[data-e]').forEach(el => edgeEls.set(el.dataset.e!, el))
     const W = L.W || 1
@@ -463,7 +594,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     const t = rp.current.t
     let started = 0
     for (const n of allNodes(Lc)) {
-      const el = cv.querySelector<HTMLElement>(`.node[data-n="${CSS.escape(n.id)}"]`)
+      const el = cv.querySelector<HTMLElement>(`[data-n="${CSS.escape(n.id)}"]`)
       const s = spans.get(n.id)
       if (!el || !s) continue
       const vis = s.t0 <= t
@@ -474,10 +605,10 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
       if (n.kind === 'stack' && s.spans) {
         const k = s.spans.filter(x => x[0] <= t).length
         started += k
-        const idEl = el.querySelector<HTMLElement>('.id')
+        const idEl = el.querySelector<HTMLElement>('[data-wf-id]')
         const txt = (k < s.spans.length ? k + ' of ' : '') + s.spans.length + ' workers'
         if (idEl && idEl.textContent !== txt) idEl.textContent = txt
-        el.querySelectorAll<HTMLElement>('.ticks i').forEach((ti, j) => { ti.style.opacity = s.spans![j] && s.spans![j][0] <= t ? '' : '0.2' })
+        el.querySelectorAll<HTMLElement>('[data-wf-ticks] i').forEach((ti, j) => { ti.style.opacity = s.spans![j] && s.spans![j][0] <= t ? '' : '0.2' })
       }
     }
     const shown = rp.current.shown
@@ -540,8 +671,8 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     const cv = cvRef.current
     if (!cv) return
     cv.querySelectorAll<HTMLElement>('[data-rp]').forEach(el => el.removeAttribute('data-rp'))
-    cv.querySelectorAll<HTMLElement>('.node.stack .id[data-def]').forEach(el => { el.textContent = el.dataset.def ?? el.textContent })
-    cv.querySelectorAll<HTMLElement>('.ticks i').forEach(el => { el.style.opacity = '' })
+    cv.querySelectorAll<HTMLElement>('[data-wf-id][data-def]').forEach(el => { el.textContent = el.dataset.def ?? el.textContent })
+    cv.querySelectorAll<HTMLElement>('[data-wf-ticks] i').forEach(el => { el.style.opacity = '' })
   }, [])
 
   useEffect(() => {
@@ -595,7 +726,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
 
   // ------------------------------------------------------------ pointer: pan, hover, click
   const drag = useRef<{ x: number; y: number; cx: number; cy: number; moved: boolean; id: number; node: string | null; expand: string | null } | null>(null)
-  const hideTip = () => tipRef.current?.classList.remove('on')
+  const hideTip = () => tipRef.current?.removeAttribute('data-open')
   const showTip = (n: WfNode, x: number, y: number) => {
     const tip = tipRef.current
     if (!tip) return
@@ -607,18 +738,18 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     const vw = window.innerWidth
     tip.style.left = Math.min(x + 14, vw - 316) + 'px'
     tip.style.top = (y + 16) + 'px'
-    tip.classList.add('on')
+    tip.dataset.open = ''
   }
   const onPointerDown = (e: RPointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return
     const c = cam.current
     if (!c) return
     const t = e.target as Element
-    if (t.closest('.wf-float')) return
+    if (t.closest('[data-wf-float]')) return
     hideTip()
     drag.current = {
       x: e.clientX, y: e.clientY, cx: c.x, cy: c.y, moved: false, id: e.pointerId,
-      node: (t.closest('.node[data-n]') as HTMLElement | null)?.dataset.n ?? null,
+      node: (t.closest('[data-n]') as HTMLElement | null)?.dataset.n ?? null,
       expand: (t.closest('[data-wfexpand]') as HTMLElement | null)?.dataset.wfexpand ?? null,
     }
     camAnim.current()
@@ -631,7 +762,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
       if (!d.moved && Math.hypot(dx, dy) > 4) {
         d.moved = true
         vpRef.current?.setPointerCapture(d.id)
-        vpRef.current?.classList.add('panning')
+        vpRef.current?.setAttribute('data-panning', '')
         hideTip()
         if (hoverRef.current) setHover(null)
       }
@@ -639,8 +770,8 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
       return
     }
     const t = e.target as Element
-    const el = t.closest('.node[data-n]') as HTMLElement | null
-    const id = el && !t.closest('.wf-float') ? el.dataset.n! : null
+    const el = t.closest('[data-n]') as HTMLElement | null
+    const id = el && !t.closest('[data-wf-float]') ? el.dataset.n! : null
     if (id !== hoverRef.current) setHover(id)
     const n = id ? Lref.current.byId.get(id) : null
     if (n) showTip(n, e.clientX, e.clientY)
@@ -649,7 +780,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
   const onPointerUp = () => {
     const d = drag.current
     drag.current = null
-    vpRef.current?.classList.remove('panning')
+    vpRef.current?.removeAttribute('data-panning')
     if (!d || d.moved) return
     if (d.expand) { onExpand(d.expand, true); return }
     if (d.node === 'report') { onReport(); return }
@@ -662,7 +793,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     const vp = vpRef.current
     if (!vp) return
     const onWheel = (e: WheelEvent) => {
-      if ((e.target as Element).closest('.wf-float')) return
+      if ((e.target as Element).closest('[data-wf-float]')) return
       e.preventDefault()
       hideTip()
       camAnim.current()
@@ -741,85 +872,205 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
   const steps = model.detail.chainSteps
   const stepsDone = steps.filter(s => s.status === 'complete').length
   const svgW = L.W + 200, svgH = L.H + 200
-  return <div className={'wf' + (focus ? ' focus' : '') + (lod ? ' lod' : '') + (replay ? ' replaying' : '')}>
-    <div ref={vpRef} className="wf-vp" tabIndex={0} aria-label="Workflow graph. Arrow keys move between workers."
-      onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}
+  return <div
+    className="group/wf @container/wf relative flex min-h-0 flex-1 flex-col"
+    data-focus={focus ? '' : undefined}
+    data-lod={lod ? '' : undefined}
+    data-replaying={replay ? '' : undefined}
+  >
+    <div
+      ref={vpRef}
+      className="relative min-h-0 flex-1 cursor-grab touch-none overflow-hidden bg-canvas outline-none focus-visible:shadow-[inset_0_0_0_2px_var(--accent-line)] data-[panning]:cursor-grabbing"
+      style={{
+        backgroundImage: 'radial-gradient(var(--dot) 1px, transparent 1.2px)',
+        backgroundSize: 'calc(20px * var(--k, 1)) calc(20px * var(--k, 1))',
+        backgroundPosition: 'var(--bx, 0) var(--by, 0)',
+      }}
+      tabIndex={0}
+      aria-label="Workflow graph. Arrow keys move between workers."
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
       onScroll={e => { e.currentTarget.scrollLeft = 0; e.currentTarget.scrollTop = 0 }}
-      onPointerCancel={() => { drag.current = null; vpRef.current?.classList.remove('panning') }}
+      onPointerCancel={() => { drag.current = null; vpRef.current?.removeAttribute('data-panning') }}
       onPointerLeave={() => { if (!drag.current && hoverRef.current) setHover(null); hideTip() }}
-      onDoubleClick={e => { const el = (e.target as Element).closest('.node.stack:not(.queue)') as HTMLElement | null; if (el?.dataset.n) onExpand(el.dataset.n, true) }}>
-      <div ref={cvRef} className="wf-cv" style={{ '--nw': WF.NW + 'px', '--nh': WF.NH + 'px' } as CSSProperties}>
-        <svg className="wf-svg" width={svgW} height={svgH} aria-hidden="true">
+      onDoubleClick={e => { const el = (e.target as Element).closest('[data-wf-kind="stack"]') as HTMLElement | null; if (el?.dataset.n) onExpand(el.dataset.n, true) }}
+    >
+      <div ref={cvRef} className="absolute left-0 top-0 origin-top-left will-change-transform" style={{ '--nw': WF.NW + 'px', '--nh': WF.NH + 'px' } as CSSProperties}>
+        <svg className="pointer-events-none absolute left-0 top-0 overflow-visible" width={svgW} height={svgH} aria-hidden="true">
           <defs>
-            <marker id="rw-wf-ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 1 7 4 0 7Z" className="wf-arrow" /></marker>
-            <marker id="rw-wf-ahh" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 1 7 4 0 7Z" className="wf-arrow-hot" /></marker>
+            <marker id="rw-wf-ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 1 7 4 0 7Z" className="fill-[var(--edge)]" /></marker>
+            <marker id="rw-wf-ahh" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 1 7 4 0 7Z" className="fill-accent" /></marker>
           </defs>
           {L.edges.map(e => <Edge key={e.key} e={e} d={edgePath(L, e)} hot={!!focus?.edges.has(e.key)} />)}
         </svg>
-        {L.heads.map(h => <div key={h.phase} className={'ph-h' + (h.live && h.phase === detail.run.phase ? ' cur' : '')} style={{ left: h.x, top: 0, width: h.w }}>
-          <span className="t">{h.phase === 'report' ? 'Report' : PHASE_LABEL[h.phase] ?? h.phase}
-            <span className="c num">{h.phase === 'report' ? 'v' + (model.report?.version ?? '') : h.n ? h.done + ' of ' + h.n + ' complete' : 'No workers'}{h.earlier ? ' · ' + h.earlier + ' earlier' : ''}</span></span>
-          <span className="bar"><i style={{ '--v': h.n ? h.done / h.n : 0 } as CSSProperties} /></span>
-          {h.expanded.map(g => <button key={g.id} type="button" className="ph-col wf-float" onClick={() => onExpand(g.id, false)}>
-            <Icon name="minus" />Collapse {g.title.toLowerCase()} · {g.members.length}</button>)}
-        </div>)}
-        {allNodes(L).map(n => {
-          const cls = (n.id === selId ? ' sel' : '') + (focus?.nodes.has(n.id) ? ' hot' : '') + (nomatch.has(n.id) ? ' nomatch' : '')
-            + (n.kind === 'worker' && L.stacks.of.has(n.id) ? ' member' : '') + (n.kind === 'worker' && L.history.has(n.id) ? ' hist' : '')
-          return <NodeCard key={n.id} n={n} info={info.get(n.id)} cls={cls} reportSub={reportSub} />
+        {L.heads.map(h => {
+          const isCur = h.live && h.phase === detail.run.phase
+          return <div key={h.phase} className="absolute flex flex-col gap-1.5 px-0.5" style={{ left: h.x, top: 0, width: h.w }}>
+            <span className="flex items-baseline gap-2 whitespace-nowrap text-[13px] font-semibold text-fg">
+              {h.phase === 'report' ? 'Report' : PHASE_LABEL[h.phase] ?? h.phase}
+              <span className="text-[12px] font-normal text-fg-subtle tabular-nums">
+                {h.phase === 'report' ? 'v' + (model.report?.version ?? '') : h.n ? h.done + ' of ' + h.n + ' complete' : 'No workers'}
+                {h.earlier ? ' · ' + h.earlier + ' earlier' : ''}
+              </span>
+              {isCur && <span className="ml-0.5 text-[11px] font-medium text-accent">Current</span>}
+            </span>
+            <span className="h-[3px] overflow-hidden rounded-[2px] bg-line-2">
+              <i
+                className={cn('block h-full origin-left transition-transform duration-500 ease-guardian', isCur ? 'bg-accent' : 'bg-fg-subtle')}
+                style={{ transform: `scaleX(${h.n ? h.done / h.n : 0})` }}
+              />
+            </span>
+            {h.expanded.map(g => <button
+              key={g.id}
+              type="button"
+              data-wf-float=""
+              className="mt-0.5 inline-flex h-5 cursor-pointer items-center gap-[5px] self-start rounded-[5px] border-0 bg-panel pl-[5px] pr-[7px] font-sans text-[11px] font-normal text-fg-muted shadow-hairline transition-colors duration-[var(--d1)] hover:bg-panel hover:text-fg"
+              onClick={() => onExpand(g.id, false)}
+            >
+              <Icon name="minus" size={11} />Collapse {g.title.toLowerCase()} · {g.members.length}
+            </button>)}
+          </div>
         })}
+        {allNodes(L).map(n => <NodeCard
+          key={n.id}
+          n={n}
+          info={info.get(n.id)}
+          flags={{
+            sel: n.id === selId,
+            hot: !!focus?.nodes.has(n.id),
+            nomatch: nomatch.has(n.id),
+            member: n.kind === 'worker' && L.stacks.of.has(n.id),
+            hist: n.kind === 'worker' && L.history.has(n.id),
+          }}
+          reportSub={reportSub}
+        />)}
       </div>
-      {!L.nodes.length && <div className="wf-empty"><span className="wf-dim">No workers match.</span></div>}
+      {!L.nodes.length && <div className="pointer-events-none absolute inset-0 flex items-center justify-center"><span className="text-[12.5px] text-fg-subtle">No workers match.</span></div>}
     </div>
 
-    <div className="wf-phnav wf-float" role="navigation" aria-label="Phases">
-      {L.heads.map((h, i) => <span key={h.phase} style={{ display: 'contents' }}>
-        {i > 0 && <span className="sep"><Icon name="chevR" /></span>}
-        <button type="button" className={i === phaseCur ? 'on' : ''} onClick={() => {
-          const c = cam.current
-          if (c) { rp.current.follow = false; camTo({ k: c.k, x: 24 - h.x * c.k, y: c.y }) }
-        }}>{h.phase === 'report' ? 'Report' : PHASE_LABEL[h.phase] ?? h.phase}{h.phase !== 'report' && <span className="num">{h.n + h.earlier}</span>}</button>
+    <div
+      data-wf-float=""
+      className="absolute left-3 top-2.5 z-[3] flex h-7 max-w-[calc(100%-24px)] items-center gap-0 overflow-hidden rounded-lg bg-raise px-[3px] shadow-popover"
+      role="navigation"
+      aria-label="Phases"
+    >
+      {L.heads.map((h, i) => <span key={h.phase} className="contents">
+        {i > 0 && <span className="flex text-fg-faint"><Icon name="chevR" /></span>}
+        <button
+          type="button"
+          className={cn(
+            'inline-flex h-[22px] cursor-pointer items-center gap-[5px] whitespace-nowrap rounded-[5px] border-0 px-[7px] font-sans text-[12px] font-normal shadow-none transition-[background-color,color] duration-[var(--d1)]',
+            i === phaseCur
+              ? 'bg-press text-fg hover:bg-press'
+              : 'bg-transparent text-fg-subtle hover:bg-hover hover:text-fg',
+          )}
+          onClick={() => {
+            const c = cam.current
+            if (c) { rp.current.follow = false; camTo({ k: c.k, x: 24 - h.x * c.k, y: c.y }) }
+          }}
+        >
+          {h.phase === 'report' ? 'Report' : PHASE_LABEL[h.phase] ?? h.phase}
+          {h.phase !== 'report' && <span className={cn('text-[11px] tabular-nums', i === phaseCur ? 'text-fg-subtle' : 'text-fg-faint')}>{h.n + h.earlier}</span>}
+        </button>
       </span>)}
     </div>
 
-    <div className="wf-ctrl wf-float">
-      <div className="wf-pill">
-        <button type="button" className="icon-btn" title="Zoom out (−)" aria-label="Zoom out" onClick={() => centerZoom(1 / 1.2)}><Icon name="minus" /></button>
-        <span className="zl num" ref={zlRef}>100%</span>
-        <button type="button" className="icon-btn" title="Zoom in (+)" aria-label="Zoom in" onClick={() => centerZoom(1.2)}><Icon name="plus" /></button>
-        <button type="button" className="icon-btn" title="Fit graph (0)" aria-label="Fit graph" onClick={fit}><Icon name="fit" /></button>
+    <div data-wf-float="" className="absolute bottom-3 left-3 z-[3] flex items-end gap-1.5 group-data-[replaying]/wf:hidden">
+      <div className="flex h-[30px] items-center gap-0.5 rounded-lg bg-raise px-[3px] shadow-popover">
+        <button type="button" className={cn(runIconBtn({ size: 'sm' }), 'px-1.5')} title="Zoom out (−)" aria-label="Zoom out" onClick={() => centerZoom(1 / 1.2)}><Icon name="minus" /></button>
+        <span className="min-w-11 text-center text-[12px] text-fg-muted tabular-nums" ref={zlRef}>100%</span>
+        <button type="button" className={cn(runIconBtn({ size: 'sm' }), 'px-1.5')} title="Zoom in (+)" aria-label="Zoom in" onClick={() => centerZoom(1.2)}><Icon name="plus" /></button>
+        <button type="button" className={cn(runIconBtn({ size: 'sm' }), 'px-1.5')} title="Fit graph (0)" aria-label="Fit graph" onClick={fit}><Icon name="fit" /></button>
       </div>
-      <div className="wf-legend">
-        <span><svg width="22" height="6" aria-hidden="true"><path d="M1 3h20" stroke="var(--fg-3)" strokeWidth="1.4" /></svg>Handoff</span>
-        <span><svg width="22" height="6" aria-hidden="true"><path d="M1 3h20" stroke="var(--fg-3)" strokeWidth="1.4" strokeDasharray="4 3" /></svg>Causal · facts</span>
-        <span className="num wf-legend-n">{plural(nLinks, 'link')}{steps.length > 0 && <> · {stepsDone}/{steps.length} steps</>}</span>
+      <div className="flex h-[30px] items-center gap-3 whitespace-nowrap rounded-lg bg-raise px-2.5 text-[11.5px] text-fg-subtle shadow-popover @max-[560px]/wf:hidden">
+        <span className="inline-flex items-center gap-1.5"><svg width="22" height="6" aria-hidden="true"><path d="M1 3h20" stroke="var(--fg-3)" strokeWidth="1.4" /></svg>Handoff</span>
+        <span className="inline-flex items-center gap-1.5"><svg width="22" height="6" aria-hidden="true"><path d="M1 3h20" stroke="var(--fg-3)" strokeWidth="1.4" strokeDasharray="4 3" /></svg>Causal · facts</span>
+        <span className="text-fg-faint tabular-nums @max-[720px]/wf:hidden">{plural(nLinks, 'link')}{steps.length > 0 && <> · {stepsDone}/{steps.length} steps</>}</span>
       </div>
     </div>
 
-    <div className="mini wf-float" title="Minimap: click or drag to move"
+    <div
+      data-wf-float=""
+      className="absolute bottom-3 right-3 z-[3] h-[124px] w-[200px] cursor-pointer overflow-hidden rounded-lg bg-raise shadow-popover @max-[720px]/wf:h-24 @max-[720px]/wf:w-[150px]"
+      title="Minimap: click or drag to move"
       onPointerDown={e => { miniDown.current = true; e.currentTarget.setPointerCapture(e.pointerId); miniGo(e, true) }}
       onPointerMove={e => { if (miniDown.current) miniGo(e, false) }}
-      onPointerUp={() => { miniDown.current = false }}>
-      <canvas ref={miniRef} />
+      onPointerUp={() => { miniDown.current = false }}
+    >
+      <canvas ref={miniRef} className="block size-full" />
     </div>
 
-    {replay && <div className="replay wf-float" role="group" aria-label="Replay">
-      <button type="button" className="play" title="Play / pause (Space)" aria-label={rpUi.playing ? 'Pause' : 'Play'} onClick={togglePlay}><Icon name={rpUi.playing ? 'pause' : 'play'} /></button>
-      <span className="time mono num" ref={rpTimeRef}>+00:00</span>
-      <div className="scrub" ref={scrubRef}
+    {replay && <div
+      data-wf-float=""
+      className="absolute bottom-3 left-3 right-[224px] z-[4] flex h-12 items-center gap-2.5 rounded-card bg-raise pl-1.5 pr-2.5 shadow-popover @max-[720px]/wf:right-[174px]"
+      role="group"
+      aria-label="Replay"
+    >
+      <button
+        type="button"
+        className="flex size-8 flex-none cursor-pointer items-center justify-center rounded-lg border-0 bg-transparent text-fg shadow-none transition-colors duration-[var(--d1)] hover:bg-hover"
+        title="Play / pause (Space)"
+        aria-label={rpUi.playing ? 'Pause' : 'Play'}
+        onClick={togglePlay}
+      >
+        <Icon name={rpUi.playing ? 'pause' : 'play'} />
+      </button>
+      <span className="min-w-[58px] font-mono text-[12px] text-fg tabular-nums" ref={rpTimeRef}>+00:00</span>
+      <div
+        className="relative h-8 min-w-[120px] flex-1 cursor-pointer"
+        ref={scrubRef}
         onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); scrubTo(e.clientX) }}
-        onPointerMove={e => { if (e.buttons & 1) scrubTo(e.clientX) }}>
-        <span className="tr" /><span className="fill" />
-        {[...rspan.spans.entries()].filter(([id]) => id !== 'report').map(([id, s]) => <i key={id} className="tk w" style={{ left: ((s.t0 - rspan.t0) / (rspan.t1 - rspan.t0 || 1) * 100).toFixed(2) + '%' }} />)}
-        {timeline.verified.map((t, i) => <i key={'f' + i} className="tk f" title="Finding verified" style={{ left: ((t - rspan.t0) / (rspan.t1 - rspan.t0 || 1) * 100).toFixed(2) + '%' }} />)}
-        <span className="knob" />
+        onPointerMove={e => { if (e.buttons & 1) scrubTo(e.clientX) }}
+      >
+        <span className="absolute inset-x-0 top-[15px] h-[3px] rounded-[2px] bg-line-2" />
+        <span
+          className="absolute left-0 top-[15px] h-[3px] w-full origin-left rounded-[2px] bg-fg-muted"
+          style={{ transform: 'scaleX(var(--p, 0))' }}
+        />
+        {[...rspan.spans.entries()].filter(([id]) => id !== 'report').map(([id, s]) => (
+          <i key={id} className="absolute top-2 h-1 w-px bg-fg-faint" style={{ left: ((s.t0 - rspan.t0) / (rspan.t1 - rspan.t0 || 1) * 100).toFixed(2) + '%' }} />
+        ))}
+        {timeline.verified.map((t, i) => (
+          <i key={'f' + i} className="absolute top-5 h-[7px] w-px bg-fg-muted" title="Finding verified" style={{ left: ((t - rspan.t0) / (rspan.t1 - rspan.t0 || 1) * 100).toFixed(2) + '%' }} />
+        ))}
+        <span
+          className="absolute top-2.5 -ml-[6.5px] size-[13px] rounded-full bg-panel shadow-[0_0_0_1.5px_var(--fg),0_1px_3px_rgba(0,0,0,.2)]"
+          style={{ left: 'calc(var(--p, 0) * 100%)' }}
+        />
       </div>
-      <span className="stats2 num" ref={rpStatsRef} />
-      <div className="seg spd">{[1, 2, 4].map(s => <button key={s} type="button" className={rpUi.speed === s ? 'on' : ''} onClick={() => setSpeed(s)}>{s}×</button>)}</div>
-      <button type="button" className="icon-btn" title="Close replay (⇧R)" aria-label="Close replay" onClick={onReplayClose}><Icon name="close" /></button>
+      <span
+        className="flex gap-2.5 whitespace-nowrap text-[11.5px] text-fg-subtle tabular-nums [&_b]:font-medium [&_b]:text-fg-muted @max-[720px]/wf:[&>span:nth-child(n+2)]:hidden @max-[560px]/wf:hidden"
+        ref={rpStatsRef}
+      />
+      <div className="inline-flex h-[26px] flex-none items-center rounded-control bg-sunk p-0.5 text-[11.5px] shadow-[inset_0_0_0_1px_var(--line)]">
+        {[1, 2, 4].map(s => (
+          <button
+            key={s}
+            type="button"
+            className={cn(
+              'inline-flex h-[22px] cursor-pointer items-center justify-center rounded-[4px] border-0 px-2 font-sans text-[11.5px] font-medium transition-[background-color,color,box-shadow] duration-[var(--d1)]',
+              rpUi.speed === s
+                ? 'bg-raise text-fg shadow-[0_0_0_1px_var(--line-2),0_1px_2px_rgba(0,0,0,.05)] hover:bg-raise'
+                : 'bg-transparent text-fg-muted shadow-none hover:bg-transparent hover:text-fg',
+            )}
+            onClick={() => setSpeed(s)}
+          >
+            {s}×
+          </button>
+        ))}
+      </div>
+      <button type="button" className={runIconBtn()} title="Close replay (⇧R)" aria-label="Close replay" onClick={onReplayClose}><Icon name="close" /></button>
     </div>}
 
-    <div className="tip" ref={tipRef} role="tooltip"><b /><div className="o" style={{ marginTop: 3 }} /></div>
+    <div
+      className="pointer-events-none fixed z-[80] max-w-[300px] translate-y-0.5 rounded-[7px] bg-raise px-[9px] py-[7px] text-[12px] leading-[17px] text-fg-muted opacity-0 shadow-popover transition-[opacity,transform] duration-[var(--d1)] data-[open]:translate-y-0 data-[open]:opacity-100 [&_b]:font-medium [&_b]:text-fg"
+      ref={tipRef}
+      role="tooltip"
+    >
+      <b />
+      <div className="mt-[3px] text-fg-subtle" />
+    </div>
   </div>
 }
 
