@@ -1,14 +1,13 @@
-# Multi-Hop Causal Chain Verification Playbook
+# Multi-Hop Chain Playbook
 Tags: multihop, multi-hop, chaining, chain, capability-ledger, composite-receipt, hop-checkpoint, derived-custody, async-pivot, hardened-twin
-Summary: Verify 3-6 hop chains via ctx.seal_capability, ctx.hmac_sign/ctx.jwt_sign, ctx.await_async, and CompositeProofReceipt DAGs (ctx.prove_composite) with zero-FP hardened-twin discipline.
+Summary: Verify 3-6 hop CompositeProofReceipt chains via ctx.seal_capability, ctx.hmac_sign/jwt_sign, ctx.await_async, and ctx.prove_composite.
 
 ## 1. Quick-Reference Contract
-1. **Checkpoint (`doNotRediscover: true`):** Start from `verifiedHops` + `cap:hop_<id>:<slot>`; never rediscover Hop 1.
-2. **Attacker-Origin:** Start Hop 1 from a low-priv/cross-tenant persona (never `owner`/`admin` on attack arm).
-3. **Seal & Inject:** `ctx.seal_capability({ exchange, slot, jsonPath|header|cookie|regex|value })` -> `ctx.http_send(path, { capability })`.
-4. **Derive & Async:** `ctx.hmac_sign`/`ctx.jwt_sign` (`derivedFromCapabilityId`); `ctx.await_async` (`tTriggerMs <= tObservedMs`).
-5. **DAG:** `ctx.prove_composite` (1–8 hops, `fresh_clean_replay`) + `return ctx.result({ title })`.
-6. **Hardened Twins:** Never emit standalone `CWE-200` on `capability_only` hops; settle enforced guards with `record_coverage(proofGapReason="invariant_enforced_hardened")`.
+1. **Origin:** Continue from `verifiedHops` + `cap:hop_<id>:<slot>` (`doNotRediscover`); low-priv Hop 1 (never `owner`/`admin`).
+2. **Seal & Continue:** Hop 1-2 handles/keys/signed URLs -> `ctx.seal_capability({ exchange, slot, jsonPath|header|cookie|regex|value })` & run Hops 3-5 in SAME script; NEVER `ctx.prove_composite` on a Hop-2 stub!
+3. **Crypto:** `ctx.hmac_sign({ secretHandle, payload, alg: "sha256" })` | `ctx.jwt_sign({ secretHandle, claims, alg: "HS256", hopReceiptId, slot })` -> `derived_crypto_binding`.
+4. **Async:** `ctx.await_async({ pollRequest, matchPredicate, triggerExchangeId, correlationId, profile: "fast_lab" })` -> `async_pivot_binding`.
+5. **DAG/Twins:** `ctx.prove_composite` (`fresh_clean_replay`) + `ctx.result`; blocked -> `record_coverage(proofGapReason="invariant_enforced_hardened")`.
 
 ## 2. Working from a Pre-Hydrated `hopCheckpoint`
 Your `AssignmentBrief` may include a bounded (`<= 2 KB`) `hopCheckpoint` object:
@@ -28,9 +27,9 @@ Whenever a host-signed HTTP exchange, GraphQL response, SSE event, browser trace
 3. Layer 1 performs the injection host-side and records `consumedCapabilityId` in the host-signed transcript, enabling deterministic `value_binding` verification.
 
 ## 4. Host-Side Cryptographic Derivation (`ctx.hmac_sign` / `ctx.jwt_sign`)
-When a multi-hop workflow requires signing a webhook body, token, or request with sealed `signing_material` (`cap:hop_<id>:<slot>`):
-- **HMAC signing:** Call `ctx.hmac_sign({ secretHandle: "cap:hop_<id>:<slot>", payload, alg: "sha256" | "sha384" | "sha512", encoding: "hex" | "base64" | "base64url" })` (Python: `ctx.hmac_sign(secret_handle, payload, alg="sha256", encoding="hex")`). Returns `{ exchangeId, signature, attestation: { derivedFromCapabilityId, alg, encoding, payloadDigest, signatureDigest, sourceSecretDigest, runId, timestampMs } }`.
-- **JWT signing:** Call `ctx.jwt_sign({ secretHandle: "cap:hop_<id>:<slot>", claims, header?, alg: "HS256" | "HS384" | "HS512", hopReceiptId?, slot?, ttlMs?, allowedOrigins? })` (Python: `ctx.jwt_sign(secret_handle, claims, alg="HS256", header=..., hop_receipt_id=..., slot=...)`). Returns `{ exchangeId, derivedHandle, attestation: { derivedFromCapabilityId, derivedHandle, ... } }`, sealing the minted token as child `derivedHandle` (`cap:hop_<id>:<slot>`).
+When a multi-hop workflow requires signing a webhook body, token, or request with sealed `signing_material` (`cap:hop_<id>:<slot>`), stay in the **same script** after sealing Hop 1–2 and execute Hops 3–5 directly:
+- **HMAC signing (1-line pattern):** `const sig = await ctx.hmac_sign({ secretHandle: cap.handle, payload, alg: "sha256", encoding: "hex" })` (supports `sha256`/`sha384`/`sha512`, `hex`/`base64`/`base64url`; Python: `ctx.hmac_sign(secret_handle, payload, alg="sha256", encoding="hex")`). Returns `{ exchangeId, signature, attestation: { derivedFromCapabilityId, alg, encoding, payloadDigest, signatureDigest, sourceSecretDigest, runId, timestampMs } }`.
+- **JWT signing (1-line pattern):** `const minted = await ctx.jwt_sign({ secretHandle: cap.handle, claims, alg: "HS256", hopReceiptId: "2", slot: "jwt" })` (optional `header`, `ttlMs`, `allowedOrigins`; supports `HS256`/`HS384`/`HS512`; Python: `ctx.jwt_sign(secret_handle, claims, alg="HS256", header=..., hop_receipt_id=..., slot=...)`). Returns `{ exchangeId, derivedHandle, attestation: { derivedFromCapabilityId, derivedHandle, ... } }`, sealing the minted token as child `derivedHandle` (`cap:hop_<id>:<slot>`).
 - Both helpers emit a host-signed `derivedFromCapabilityId` attestation in the transcript so `derived_crypto_binding` verifies end-to-end lineage without exposing raw key bytes to the worker.
 - For cryptographic scope-replay verification, always capture three host-signed observations:
   1. Tampered/invalid signature is rejected (`401`/`403`) — rules out signature-skip decoys.
@@ -39,8 +38,9 @@ When a multi-hop workflow requires signing a webhook body, token, or request wit
 
 ## 5. Bounded Async Worker Pivots (`ctx.await_async`)
 For asynchronous cross-service hops (document/PDF renderers, webhook delivery logs, batch export workers, async queues, or simulated review-bot workflows) where side effects converge on an internal service rather than an external OOB collector:
+- **Do NOT stop at Hop 2:** Obtaining a job/export ID, queued status, or signed URL is an intermediate capability — seal it with `ctx.seal_capability`, poll with `ctx.await_async` or fetch the derived URL in the **same script** to prove unauthorized foreign-tenant data exposure or privileged state mutation, and only then call `ctx.prove_composite`!
 - Trigger the async action in Hop `i` and pass `triggerExchangeId: triggerEx.exchangeId` (or `tTriggerMs`) plus run-scoped `correlationId` / `entityId`.
-- Call `ctx.await_async({ pollRequest, matchPredicate?, profile: "fast_lab" | "wan", timeoutMs?, intervalMs?, maxAttempts?, triggerExchangeId?, tTriggerMs?, correlationId?, correlationIds?, entityId? })` (Python: `ctx.await_async(poll_request, match_predicate=..., profile=..., timeout_ms=..., interval_ms=..., trigger_exchange_id=..., correlation_id=..., entity_id=...)`):
+- **1-line pattern:** `const pol = await ctx.await_async({ pollRequest, matchPredicate, profile: "fast_lab", triggerExchangeId: h1.exchangeId, correlationId: id })` (optional `timeoutMs`, `intervalMs`, `maxAttempts`, `tTriggerMs`, `correlationIds`, `entityId`; profiles `"fast_lab"` | `"wan"`; Python: `ctx.await_async(poll_request, match_predicate=..., profile=..., timeout_ms=..., interval_ms=..., trigger_exchange_id=..., correlation_id=..., entity_id=...)`):
   - `fast_lab`: default/max `5,000 ms` (`150 ms` interval).
   - `wan`: default/max `30,000 ms` (`500 ms` interval).
   - `matchPredicate` supports `{ status?, bodyContains?, bodyMatches?, jsonPath?, equals?, in?, matches?, header?: { name, equals?, matches? } }`.

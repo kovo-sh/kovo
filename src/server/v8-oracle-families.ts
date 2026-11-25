@@ -34,51 +34,77 @@ const DEFAULT_TOL = 1e-6
 const MAX_PIVOT_HOPS = 8
 const FINALIZED_STATES = new Set(['fulfilled', 'completed', 'captured', 'released', 'settled', 'paid', 'shipped', 'delivered', 'disbursed'])
 const ERROR_ONLY_KEYS = new Set(['error', 'errors', 'message', 'detail', 'code', 'status', 'statusCode', 'ok', 'success'])
-const STUB_META_KEYS = new Set([
-  'ok', 'success', 'error', 'errors', 'message', 'detail', 'code', 'status', 'statuscode', 'state',
-  'accepted', 'queued', 'pending', 'created', 'updated', 'cached', 'hit', 'primed', 'id',
-  'jobid', 'job_id', 'exportid', 'export_id', 'taskid', 'task_id', 'requestid', 'request_id',
-  'handle', 'token', 'signedurl', 'signed_url', 'downloadurl', 'download_url', 'exporturl', 'export_url',
-  'pollurl', 'poll_url', 'statusurl', 'status_url', 'artifacturl', 'artifact_url', 'url', 'href', 'link',
-  'location', 'path', 'filekey', 'file_key', 'createdat', 'created_at', 'updatedat', 'updated_at',
-  'expiresat', 'expires_at', 'ttl', 'format', 'type', 'kind', 'scope', 'tenantid', 'tenant_id',
-  'orgid', 'org_id', 'workspaceid', 'workspace_id', 'ownerid', 'owner_id', 'userid', 'user_id',
-  'actorid', 'actor_id', 'role', 'roles', 'permissions', 'count', 'total', 'size', 'progress', 'poll',
-])
-const JOB_CACHE_SIGNAL_KEYS = new Set([
-  'jobid', 'job_id', 'exportid', 'export_id', 'taskid', 'task_id', 'downloadurl', 'download_url',
-  'signedurl', 'signed_url', 'exporturl', 'export_url', 'pollurl', 'poll_url', 'statusurl', 'status_url',
-  'artifacturl', 'artifact_url', 'url', 'href', 'queued', 'pending', 'accepted', 'cached', 'primed',
-  'permissions', 'roles',
-])
-const PENDING_STATE_RE = /^(?:queued|pending|processing|accepted|created|scheduled|running|in_progress|started|primed|cached|ok)$/i
-const WRAPPER_KEYS = new Set(['job', 'export', 'task', 'result', 'data'])
+const wordSet = (s: string) => new Set(s.split(' '))
+const STUB_META_KEYS = wordSet('ok success error errors message detail code status statuscode state accepted queued pending created updated cached hit miss primed ready completed done enqueued dispatched scheduled id jobid job_id exportid export_id taskid task_id requestid request_id batchid batch_id runid run_id workflowid workflow_id correlationid correlation_id traceid trace_id handle token exporttoken export_token cachetoken cache_token downloadtoken download_token accesstoken access_token signedurl signed_url presignedurl presigned_url signeddownloadurl signed_download_url downloadurl download_url exporturl export_url accessurl access_url pollurl poll_url statusurl status_url artifacturl artifact_url fileurl file_url url href link self next location path filepath file_path filekey file_key objectkey object_key storagekey storage_key key bucket prefix tenantprefix tenant_prefix filename file_name contenttype content_type mimetype mime_type cachekey cache_key cachestatus cache_status cachehit cache_hit etag version region method createdat created_at updatedat updated_at startedat started_at completedat completed_at finishedat finished_at expiresat expires_at expiresin expires_in expires expiry ttl eta format type kind scope scopes tenant tenantid tenant_id org orgid org_id organization organizationid organization_id workspace workspaceid workspace_id ownerid owner_id userid user_id actorid actor_id createdby created_by requestedby requested_by role roles permissions count total size bytes length rowcount row_count recordcount record_count itemcount item_count progress poll queue queuename queue_name worker checksum sha256 hash digest signature sig nonce note hint label description')
+const JOB_CACHE_SIGNAL_KEYS = wordSet('jobid job_id exportid export_id taskid task_id batchid batch_id workflowid workflow_id downloadurl download_url signedurl signed_url presignedurl presigned_url signeddownloadurl signed_download_url exporturl export_url accessurl access_url pollurl poll_url statusurl status_url artifacturl artifact_url fileurl file_url url href location exporttoken export_token cachetoken cache_token downloadtoken download_token filekey file_key objectkey object_key storagekey storage_key filepath file_path tenantprefix tenant_prefix bucket queued pending accepted cached primed cachekey cache_key cachestatus cache_status cachehit cache_hit expiresin expires_in expiresat expires_at permissions roles poll queue queuename queue_name job export exports task download presigned cache')
+const WRAPPER_KEYS = wordSet('data result job export exports task download artifact file cache meta metadata links _links link presigned signed upload batch workflow run response info headers fields params')
+const TENANT_MARKER_KEYS = wordSet('tenant tenantid tenant_id org orgid org_id organizationid organization_id workspaceid workspace_id ownertenant ownertenantid owner_tenant_id merchantid merchant_id')
+const PENDING_STATE_RE = /^(?:queued|pending|processing|accepted|created|scheduled|running|in_progress|started|primed|cached|hit|miss|ok)$/i
+const STUB_URL_VAL_RE = /^(?:https?:\/\/|\/[a-z0-9._~/-]*\/(?:download|export|presign|signed|file|artifact|job|status|poll)\b)/i
+const BARE_ACK_BODY_RE = /^(?:ok|queued|accepted|pending|primed|cached|created|done|true|https?:\/\/\S+|\/\S+)$/i
+
+function scanStubNode(node: unknown, depth: number): { allStub: boolean; hasSignal: boolean; hasState: boolean; hasCreateKey: boolean; count: number } {
+  const fail = { allStub: false, hasSignal: false, hasState: false, hasCreateKey: false, count: 1 }
+  if (depth > 4 || node == null) return { allStub: true, hasSignal: false, hasState: false, hasCreateKey: false, count: 0 }
+  let hasSignal = false, hasState = false, hasCreateKey = false, count = 0
+  if (Array.isArray(node)) {
+    if (node.every(x => x === null || typeof x !== 'object')) return { allStub: true, hasSignal, hasState, hasCreateKey, count: node.length }
+    for (const item of node) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return fail
+      const sub = scanStubNode(item, depth + 1); if (!sub.allStub) return sub
+      hasSignal ||= sub.hasSignal; hasState ||= sub.hasState; hasCreateKey ||= sub.hasCreateKey; count += sub.count
+    }
+    return { allStub: true, hasSignal, hasState, hasCreateKey, count }
+  }
+  if (typeof node !== 'object') return fail
+  for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+    if (v === null || v === undefined || v === '' || (Array.isArray(v) && v.length === 0)) continue
+    const lk = k.toLowerCase()
+    if (!STUB_META_KEYS.has(lk) && !WRAPPER_KEYS.has(lk)) return fail
+    if (JOB_CACHE_SIGNAL_KEYS.has(lk)) hasSignal = true
+    if (typeof v === 'object') {
+      const sub = scanStubNode(v, depth + 1); if (!sub.allStub) return sub
+      hasSignal ||= sub.hasSignal; hasState ||= sub.hasState; hasCreateKey ||= sub.hasCreateKey; count += sub.count
+    } else {
+      count += 1
+      if ((lk === 'status' || lk === 'state' || lk === 'cachestatus' || lk === 'cache_status') && typeof v === 'string' && PENDING_STATE_RE.test(v.trim())) hasState = true
+      if (typeof v === 'string' && STUB_URL_VAL_RE.test(v.trim())) hasSignal = true
+      if (/^(?:id|status|state|url|location|handle|path|key)$/i.test(lk)) hasCreateKey = true
+    }
+  }
+  return { allStub: true, hasSignal, hasState, hasCreateKey, count }
+}
+
+export function extractTenantMarkers(json: unknown, body?: string): Set<string> {
+  const out = new Set<string>()
+  let val = json
+  if (val === undefined && typeof body === 'string' && /^[\[{]/.test(body.trim())) try { val = JSON.parse(body) } catch { val = undefined }
+  const walk = (v: unknown, d: number): void => {
+    if (d > 4 || out.size > 32 || v == null) return
+    if (Array.isArray(v)) { for (const x of v) walk(x, d + 1); return }
+    if (typeof v === 'object') for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+      if (typeof x === 'string' && x.trim() && TENANT_MARKER_KEYS.has(k.toLowerCase())) out.add(x.trim().toLowerCase())
+      else if (x && typeof x === 'object') walk(x, d + 1)
+    }
+  }
+  walk(val, 0); return out
+}
 
 export function isJobOrHandleStub(json: unknown, body?: string, status?: number | null, method?: string): boolean {
   let val = json
-  if (val === undefined && typeof body === 'string' && body.trim().startsWith('{')) {
-    try { val = JSON.parse(body) } catch { val = undefined }
-  }
-  if (!val || typeof val !== 'object' || Array.isArray(val)) return false
-  let obj = val as Record<string, unknown>
-  const topKeys = Object.keys(obj)
-  if (topKeys.length === 1 && WRAPPER_KEYS.has(topKeys[0]!.toLowerCase())) {
-    const inner = obj[topKeys[0]!]
-    if (inner && typeof inner === 'object' && !Array.isArray(inner)) obj = inner as Record<string, unknown>
-  }
-  const entries = Object.entries(obj).filter(([, v]) => v !== null && v !== undefined && v !== '' && !(Array.isArray(v) && v.length === 0))
-  if (entries.length === 0) return true
-  if (!entries.every(([k]) => STUB_META_KEYS.has(k.toLowerCase()))) return false
-  const hasSignalKey = entries.some(([k]) => JOB_CACHE_SIGNAL_KEYS.has(k.toLowerCase()))
-  const stateVal = typeof obj.status === 'string' ? obj.status : (typeof obj.state === 'string' ? obj.state : '')
-  const isCreation = (status === 201 || status === 202) || (Boolean(method) && /^(?:POST|PUT)$/i.test(method!) && entries.some(([k]) => /^(?:id|status|state|url|location|handle)$/i.test(k)))
-  return hasSignalKey || isCreation || (Boolean(stateVal) && PENDING_STATE_RE.test(stateVal.trim()))
+  const trimmed = typeof body === 'string' ? body.trim() : ''
+  if (val === undefined && trimmed && /^[\[{]/.test(trimmed)) try { val = JSON.parse(trimmed) } catch { val = undefined }
+  if (val === undefined || val === null) return Boolean(trimmed && BARE_ACK_BODY_RE.test(trimmed))
+  if (typeof val !== 'object') return typeof val === 'string' && BARE_ACK_BODY_RE.test(val.trim())
+  const scan = scanStubNode(val, 0)
+  if (!scan.allStub) return false
+  if (scan.count === 0) return true
+  const isCreation = (status === 201 || status === 202) || (Boolean(method) && /^(?:POST|PUT)$/i.test(method!) && scan.hasCreateKey)
+  return scan.hasSignal || isCreation || scan.hasState
 }
 
-const ok = (family: V8OracleFamily, subRule: string, reason: string, evidence: Record<string, unknown>): V8OracleDecision =>
-  ({ family, subRule, required: true, satisfied: true, reason, evidence })
-const deny = (family: V8OracleFamily, reason: string, subRule?: string, evidence?: Record<string, unknown>): V8OracleDecision =>
-  ({ family, subRule, required: true, satisfied: false, reason, evidence })
+const ok = (family: V8OracleFamily, subRule: string, reason: string, evidence: Record<string, unknown>): V8OracleDecision => ({ family, subRule, required: true, satisfied: true, reason, evidence })
+const deny = (family: V8OracleFamily, reason: string, subRule?: string, evidence?: Record<string, unknown>): V8OracleDecision => ({ family, subRule, required: true, satisfied: false, reason, evidence })
 const normStr = (v: string | null | undefined): string => (typeof v === 'string' ? v.trim() : '')
 const normKey = (v: string | null | undefined): string => normStr(v).toLowerCase()
 const normRoute = (r: string | null | undefined): string => (normStr(r).split('?')[0] ?? '').replace(/\/+$/, '').toLowerCase()
@@ -92,15 +118,10 @@ function checkRecord(record: HostSignedRecord | null | undefined, label: string,
   if (!normStr(record.id)) return `empty_${label}_id`
   if (normStr(record.hostSignature).length < MIN_SIG_LEN) return `unsigned_${label}_record`
   if (!Number.isFinite(record.timestampMs) || record.timestampMs <= 0) return `invalid_${label}_timestamp`
-  if (verify && !verify(record)) return `invalid_${label}_signature`
-  return null
+  return verify && !verify(record) ? `invalid_${label}_signature` : null
 }
-
 function checkRecords(pairs: readonly [HostSignedRecord | null | undefined, string][], verify?: SignatureVerifier): string | null {
-  for (const [rec, label] of pairs) {
-    const err = checkRecord(rec, label, verify)
-    if (err) return err
-  }
+  for (const [rec, label] of pairs) { const err = checkRecord(rec, label, verify); if (err) return err }
   return null
 }
 
@@ -183,6 +204,7 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
     if (input.sourceControlDenied && !isDenied(input.sourceControlDenied.status)) return deny(f, 'source_control_not_denied', sub)
     if (!isOk(input.transferRecord.status)) return deny(f, 'transfer_not_accepted', sub)
     if (!isOk(input.postTransferReadback.status)) return deny(f, 'readback_not_accepted', sub)
+    if (isJobOrHandleStub(input.postTransferReadback.json, input.postTransferReadback.body, input.postTransferReadback.status, input.postTransferReadback.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
     if (input.postTransferReadback.timestampMs < input.transferRecord.timestampMs) return deny(f, 'non_monotonic_readback_timestamp', sub)
     if (normKey(input.observedOwnerTenantId) !== dst) return deny(f, 'transfer_not_persisted_to_dest_tenant', sub)
 
@@ -209,6 +231,8 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
     if (input.bledAccess.timestampMs < input.primeAction.timestampMs) return deny(f, 'non_monotonic_bled_timestamp', sub)
     if (input.observedTenantId && normKey(input.observedTenantId) !== target) return deny(f, 'observed_tenant_mismatch', sub)
     if (isJobOrHandleStub(input.bledAccess.json, input.bledAccess.body, input.bledAccess.status, input.bledAccess.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
+    const bledTenants = extractTenantMarkers(input.bledAccess.json, input.bledAccess.body)
+    if (bledTenants.size > 0 && bledTenants.has(prime) && !bledTenants.has(target)) return deny(f, 'bled_access_own_tenant_only', sub)
     if (!normStr(input.targetRecordId) && !hasSubstantivePayload(input.bledAccess)) return deny(f, 'bled_access_missing_substantive_data', sub)
 
     return ok(f, sub, 'dual_org_permission_cache_bleed_confirmed', {
@@ -234,16 +258,21 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
     if (!isDenied(input.singleForeignControlDenied.status)) return deny(f, 'single_foreign_control_not_denied', sub)
     if (!isOk(input.batchRequest.status)) return deny(f, 'batch_request_denied_or_failed', sub)
 
-    const foreignRead = new Set((input.returnedForeignIds ?? []).map(normStr)).has(foreignId) &&
+    const foreignRead = !isJobOrHandleStub(input.batchRequest.json, input.batchRequest.body, input.batchRequest.status, input.batchRequest.method) &&
+      new Set((input.returnedForeignIds ?? []).map(normStr)).has(foreignId) &&
       (input.foreignDataObserved === true || hasSubstantivePayload(input.batchRequest))
     let foreignMut = false
     if (input.postMutationReadback) {
       const mutErr = checkRecord(input.postMutationReadback, 'post_mutation_readback', input.verifySignature)
       if (mutErr) return deny(f, mutErr, sub)
+      if (isJobOrHandleStub(input.postMutationReadback.json, input.postMutationReadback.body, input.postMutationReadback.status, input.postMutationReadback.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
       foreignMut = isOk(input.postMutationReadback.status) &&
         input.postMutationReadback.timestampMs >= input.batchRequest.timestampMs && input.foreignMutationPersisted === true
     }
-    if (!foreignRead && !foreignMut) return deny(f, 'foreign_record_not_returned_or_mutated', sub)
+    if (!foreignRead && !foreignMut) {
+      if (isJobOrHandleStub(input.batchRequest.json, input.batchRequest.body, input.batchRequest.status, input.batchRequest.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
+      return deny(f, 'foreign_record_not_returned_or_mutated', sub)
+    }
 
     return ok(f, sub, 'batch_partial_authorization_bypass_confirmed', {
       actorId: input.actor.actorId, ownTenantId: ownTenant, foreignTenantId: foreignTenant, foreignRecordId: foreignId,
@@ -516,6 +545,7 @@ export function evaluateParserCacheDifferential(input: ParserCacheDifferentialIn
       if (mutErr) return deny(f, mutErr, sub)
       if (!isOk(input.postMutationReadback!.status)) return deny(f, 'mutation_readback_failed', sub)
       if (input.postMutationReadback!.timestampMs < input.differentialProbe.timestampMs) return deny(f, 'mutation_readback_precedes_probe', sub)
+      if (isJobOrHandleStub(input.postMutationReadback!.json, input.postMutationReadback!.body, input.postMutationReadback!.status, input.postMutationReadback!.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
       if (input.mutationPersisted !== true) return deny(f, 'mutation_not_persisted', sub)
     } else {
       if (isJobOrHandleStub(input.differentialProbe.json, input.differentialProbe.body, input.differentialProbe.status, input.differentialProbe.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
@@ -687,26 +717,21 @@ export function evaluateCrossSurfacePivot(input: CrossSurfacePivotInput): V8Orac
     if (rbErr) return deny(f, rbErr, sub)
     if (!isOk(rb!.status)) return deny(f, 'post_impact_readback_failed', sub)
     if (rb!.timestampMs < lastHop.record.timestampMs) return deny(f, 'post_impact_readback_precedes_terminal_hop', sub)
+    if (isJobOrHandleStub(rb!.json, rb!.body, rb!.status, rb!.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
+  } else if (isJobOrHandleStub(lastHop.record.json, lastHop.record.body, lastHop.record.status, lastHop.record.method)) {
+    return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
   }
-
   return ok(f, sub, 'cross_surface_causal_pivot_confirmed', {
     attackerActorId: input.attackerOriginPersona.actorId, hopCount: hops.length, surfaces: Array.from(surfaces),
-    impactKind: sub, impactDigest: input.terminalImpact.impactDigest,
-    preChainControlId: input.preChainControlDenied.id, terminalHopId: lastHop.record.id,
+    impactKind: sub, impactDigest: input.terminalImpact.impactDigest, preChainControlId: input.preChainControlDenied.id, terminalHopId: lastHop.record.id,
   })
 }
 
 /* ─────────────────────────── Unified Dispatcher ──────────────────────────── */
-
 export interface V8OracleInputMap {
-  dual_tenant_abac: DualTenantAbacInput
-  temporal_revocation: TemporalRevocationInput
-  economic_conservation: EconomicConservationInput
-  cryptographic_scope_replay: CryptographicScopeReplayInput
-  parser_cache_differential: ParserCacheDifferentialInput
-  cross_surface_pivot: CrossSurfacePivotInput
+  dual_tenant_abac: DualTenantAbacInput; temporal_revocation: TemporalRevocationInput; economic_conservation: EconomicConservationInput
+  cryptographic_scope_replay: CryptographicScopeReplayInput; parser_cache_differential: ParserCacheDifferentialInput; cross_surface_pivot: CrossSurfacePivotInput
 }
-
 export function evaluateV8OracleFamily<F extends V8OracleFamily>(family: F, input: V8OracleInputMap[F]): V8OracleDecision {
   switch (family) {
     case 'dual_tenant_abac': return evaluateDualTenantAbac(input as DualTenantAbacInput)

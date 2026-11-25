@@ -629,7 +629,9 @@ export function fitHopCheckpointForBrief(
 
 export interface AssignmentBriefMultiHopContract {
   attackerOriginRule: string
+  continueChainRule: string
   optionalHelpers?: string
+  helperPatterns?: string[]
   modeATsRecipe: string
   hardenedTwinRule: string
 }
@@ -637,11 +639,63 @@ export interface AssignmentBriefMultiHopContract {
 export const MULTIHOP_ATTACKER_ORIGIN_RULE =
   'Start Hop 1 strictly from a low-privilege or cross-tenant persona (member/viewer/cross-org); NEVER use a pre-seeded owner/admin persona on the attack arm (reserve owner/admin strictly for control comparison).'
 
+export const MULTIHOP_CONTINUE_CHAIN_RULE =
+  'If Hop 1-2 yields a job/export handle, signing material, or signed URL, seal it (ctx.seal_capability) and continue Hops 3-5 in the SAME script (ctx.await_async / ctx.hmac_sign / ctx.jwt_sign / follow URL) rather than calling ctx.prove_composite prematurely on Hop 2.'
+
 export const MULTIHOP_HARDENED_TWIN_RULE =
   'If a terminal guard holds cleanly, do NOT file a standalone finding on benign Hop 1-2; call record_coverage(status="ruled_out", proofGapReason="invariant_enforced_hardened") and complete_intent.'
 
 export const MULTIHOP_OPTIONAL_HELPERS_NOTE =
-  'Crypto/async hops: ctx.hmac_sign({ secretHandle, payload, alg }) | ctx.jwt_sign({ secretHandle, claims, alg, hopReceiptId, slot }) -> derived_crypto_binding; ctx.await_async({ pollRequest, matchPredicate, triggerExchangeId, correlationId, profile: "fast_lab" }) -> async_pivot_binding; state mutation -> state_transition_binding (ablationExchangeIds).'
+  'Crypto/async hops: ctx.hmac_sign({ secretHandle, payload, alg: "sha256", encoding: "hex" }) | ctx.jwt_sign({ secretHandle, claims, alg: "HS256", hopReceiptId, slot }) -> derived_crypto_binding; ctx.await_async({ pollRequest, matchPredicate, triggerExchangeId, correlationId, profile: "fast_lab" }) -> async_pivot_binding; state mutation -> state_transition_binding (ablationExchangeIds).'
+
+export const MULTIHOP_HMAC_SIGN_PATTERN =
+  'const sig = await ctx.hmac_sign({ secretHandle: cap.handle, payload: body, alg: "sha256", encoding: "hex" }) // send sig.signature -> derived_crypto_binding'
+
+export const MULTIHOP_JWT_SIGN_PATTERN =
+  'const minted = await ctx.jwt_sign({ secretHandle: cap.handle, claims: { sub: "svc", scope: "admin" }, alg: "HS256", hopReceiptId: "2", slot: "jwt" }) // use capability: minted.derivedHandle -> derived_crypto_binding'
+
+export const MULTIHOP_AWAIT_ASYNC_PATTERN =
+  'const pol = await ctx.await_async({ pollRequest: { path: "/api/jobs/" + id, as: "member_b", role: "probe" }, matchPredicate: { status: 200, jsonPath: "$.status", equals: "completed" }, triggerExchangeId: h1.exchangeId, correlationId: id, profile: "fast_lab" }) // -> async_pivot_binding (pollRecordId: pol.pollRecordId)'
+
+const CRYPTO_HELPER_SIGNAL_RE = /\b(?:webhook|hmac|sign(?:ing|ature|ed)?|secret|salt|jwt|jws|oidc|oauth|token|assertion|bearer|key|crypto|forge)\b/i
+const ASYNC_HELPER_SIGNAL_RE = /\b(?:async|job|export|worker|queue|poll|pdf|render|ssrf|callback|webhook|batch|settlement|ledger|report|download|presign(?:ed)?|signed[_-]?url|storage|cdn)\b/i
+
+function detectMultiHopHelperPatterns(input?: AssignmentBriefInput, compact = false): string[] {
+  if (!input) return []
+  const parts: string[] = []
+  for (const r of [...(input.routes ?? []), ...(input.linkedRoutes ?? [])]) {
+    parts.push(r.path, ...(r.params ?? []))
+  }
+  if (input.hopCheckpoint) {
+    const ng = input.hopCheckpoint.nextGoal
+    parts.push(ng.endpoint, ng.goal, ng.surface ?? '', ng.hypothesisClass ?? '', ng.expectedBinding ?? '')
+    for (const vh of input.hopCheckpoint.verifiedHops ?? []) {
+      parts.push(vh.kind ?? '', vh.surface ?? '', vh.at ?? '', vh.binding ?? '')
+    }
+  }
+  if (input.proofObligation) {
+    parts.push(input.proofObligation.route, input.proofObligation.sink ?? '', input.proofObligation.chain ?? '', input.proofObligation.deliverable ?? '')
+  }
+  if (input.detLead) parts.push(input.detLead.probeClass, input.detLead.signalSummary)
+  if (input.codeSlice) parts.push(input.codeSlice.route ?? '', input.codeSlice.sink?.kind ?? '', input.codeSlice.sink?.at ?? '')
+  const corpus = parts.join(' ')
+  if (!corpus.trim()) return []
+  const patterns: string[] = []
+  if (CRYPTO_HELPER_SIGNAL_RE.test(corpus)) {
+    patterns.push(
+      compact ? 'ctx.hmac_sign({ secretHandle: cap.handle, payload: body, alg: "sha256", encoding: "hex" })' : MULTIHOP_HMAC_SIGN_PATTERN,
+      compact ? 'ctx.jwt_sign({ secretHandle: cap.handle, claims, alg: "HS256", hopReceiptId: "2", slot: "jwt" })' : MULTIHOP_JWT_SIGN_PATTERN,
+    )
+  }
+  if (ASYNC_HELPER_SIGNAL_RE.test(corpus)) {
+    patterns.push(
+      compact
+        ? 'ctx.await_async({ pollRequest: { path, as: "member_b", role: "probe" }, matchPredicate: { status: 200 }, triggerExchangeId: h1.exchangeId, correlationId: id, profile: "fast_lab" })'
+        : MULTIHOP_AWAIT_ASYNC_PATTERN,
+    )
+  }
+  return patterns
+}
 
 /** Exact Mode-A TypeScript guardian_verify recipe (<= 18 lines, live SDK parameter names). */
 export const MULTIHOP_MODE_A_TS_RECIPE = [
@@ -671,17 +725,22 @@ export function isMultiHopBriefInput(input: Pick<AssignmentBriefInput, 'missionK
     || input.missionKind === 'second_order'
 }
 
-export function buildMultiHopProofContract(compact = false): AssignmentBriefMultiHopContract {
+export function buildMultiHopProofContract(compact = false, input?: AssignmentBriefInput): AssignmentBriefMultiHopContract {
+  const helperPatterns = detectMultiHopHelperPatterns(input, compact)
   if (compact) {
     return {
       attackerOriginRule: 'Start Hop 1 from low-priv/cross-tenant persona (never owner/admin on attack arm).',
+      continueChainRule: 'Seal Hop 1-2 handle/URL/key (ctx.seal_capability) and continue Hops 3-5 in SAME script (await_async/hmac_sign/jwt_sign); never prove_composite on Hop-2 stub.',
+      ...(helperPatterns.length ? { helperPatterns } : {}),
       modeATsRecipe: COMPACT_MULTIHOP_MODE_A_RECIPE,
       hardenedTwinRule: 'If terminal guard holds, no Hop 1-2 standalone finding; record_coverage(status="ruled_out", proofGapReason="invariant_enforced_hardened") + complete_intent.',
     }
   }
   return {
     attackerOriginRule: MULTIHOP_ATTACKER_ORIGIN_RULE,
+    continueChainRule: MULTIHOP_CONTINUE_CHAIN_RULE,
     optionalHelpers: MULTIHOP_OPTIONAL_HELPERS_NOTE,
+    ...(helperPatterns.length ? { helperPatterns } : {}),
     modeATsRecipe: MULTIHOP_MODE_A_TS_RECIPE,
     hardenedTwinRule: MULTIHOP_HARDENED_TWIN_RULE,
   }
@@ -826,7 +885,7 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
     ? fitHopCheckpointForBrief(input.hopCheckpoint, hopCheckpointBudget)
     : undefined
   const proofObligation = input.proofObligation ? normalizeProofObligation(input.proofObligation) : undefined
-  const multiHopProofContract = isMultiHopBriefInput(input) ? buildMultiHopProofContract(false) : undefined
+  const multiHopProofContract = isMultiHopBriefInput(input) ? buildMultiHopProofContract(false, input) : undefined
 
   return {
     routes,
@@ -917,7 +976,7 @@ export function buildAssignmentBriefPacket(
     // Compact the Mode-A multi-hop proof contract before shrinking code slices or hopCheckpoints
     // so both the recipe/provenance rules and chain lineage coexist inside the 4 KB budget.
     if (state.multiHopProofContract && !state.multiHopContractCompacted) {
-      state.multiHopProofContract = buildMultiHopProofContract(true)
+      state.multiHopProofContract = buildMultiHopProofContract(true, input)
       state.multiHopContractCompacted = true
       continue
     }

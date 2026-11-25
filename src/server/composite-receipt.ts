@@ -9,7 +9,7 @@ import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
 import { parseRoleLabel, routeFamily, stepReadsState } from './oracle-invariants.ts'
 import { proofReceiptSchema, receiptIdSchema, verifyReceipt } from './proof-receipt.ts'
-import { evaluateV8OracleFamily, isJobOrHandleStub } from './v8-oracle-families.ts'
+import { evaluateV8OracleFamily, extractTenantMarkers, isJobOrHandleStub } from './v8-oracle-families.ts'
 import type { CrossSurfaceHop, CrossSurfacePivotInput, HostSignedRecord as V8OracleRecord, V8OracleFamily, V8OracleInputMap } from './v8-oracle-families.ts'
 import type { ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 
@@ -108,26 +108,13 @@ const CONSUMED_STATE_RE =
 const ABLATION_DENIED_STATUSES = new Set([401, 403, 404, 409, 412, 422])
 const DENIED_CONTROL_STATUSES = new Set([401, 403, 404])
 const SHA256_RE = /^[0-9a-f]{64}$/
-const TENANT_KEYS = new Set(['tenant', 'tenantid', 'tenant_id', 'org', 'orgid', 'org_id', 'workspaceid', 'workspace_id', 'ownertenant', 'ownertenantid', 'owner_tenant_id'])
-const STRICT_TERMINAL_CLASS_RE = /^(?:dual_tenant_abac|parser_cache_differential|temporal_revocation|economic_conservation|cryptographic_scope_replay|cross_surface_pivot)$|dual[_-]?tenant|abac|cache[_-]?(?:bleed|poison|deception|diff)|parser[_-]?diff|smuggl|cwe[-_]?444|cwe[-_]?639|\bidor\b|\bbola\b/i
+const CROSS_TENANT_CLASS_RE =
+  /^(?:dual_tenant_abac|parser_cache_differential)$|dual[_-]?tenant|cross[_-]?tenant|tenant[_-]?(?:isolation|bleed|leak|export)|abac|cache[_-]?(?:bleed|poison|deception|diff|bypass)|export[_-]?(?:bypass|leak|disclosure)|presign|cwe[-_]?(?:444|639)|\bidor\b|\bbola\b/i
+const STRICT_TERMINAL_CLASS_RE =
+  /^(?:dual_tenant_abac|parser_cache_differential|temporal_revocation|economic_conservation|cryptographic_scope_replay|cross_surface_pivot)$|dual[_-]?tenant|cross[_-]?tenant[_-]?(?:export|data|access|leak|bleed|disclosure|pivot)|tenant[_-]?(?:isolation|bleed|leak|export)|abac|cache[_-]?(?:bleed|poison|deception|diff|bypass)|parser[_-]?diff|smuggl|presign|export[_-]?(?:bypass|leak|disclosure)|broken[_-]?access|access[_-]?control|authz[_-]?bypass|authorization[_-]?bypass|info(?:rmation)?[_-]?disclosure|data[_-]?exposure|cwe[-_]?(?:200|269|284|285|345|436|444|522|639|668|862|863)|\bidor\b|\bbola\b/i
 const TERMINAL_IMPACT_UNPROVEN_HINT =
-  "terminal_impact_unproven: creating a job/handle or priming cache is an intermediate capability, not terminal impact — follow the derived handle/URL to prove unauthorized foreign-tenant data read or privileged mutation, or call record_coverage(status='ruled_out', proofGapReason='invariant_enforced_hardened') if the terminal guard blocks access"
-
-function collectTenantMarkers(value: unknown, out: Set<string>, depth = 0): void {
-  if (depth > 3 || out.size > 32 || value == null) return
-  if (Array.isArray(value)) { for (const x of value) collectTenantMarkers(x, out, depth + 1); return }
-  if (typeof value !== 'object') return
-  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    if (typeof v === 'string' && v.trim() && TENANT_KEYS.has(k.toLowerCase())) out.add(v.trim().toLowerCase())
-    else if (v && typeof v === 'object') collectTenantMarkers(v, out, depth + 1)
-  }
-}
-function entryTenants(entry: HostTranscriptEntry): Set<string> {
-  const out = new Set<string>()
-  let json = entry.step.json
-  if (json === undefined && typeof entry.step.body === 'string' && entry.step.body.trim().startsWith('{')) try { json = JSON.parse(entry.step.body) } catch { json = undefined }
-  collectTenantMarkers(json, out); return out
-}
+  "terminal_impact_unproven: obtaining a job/export handle, signed URL, or cache ack is an intermediate capability (seal with ctx.seal_capability), NOT terminal impact — fetch the target resource with the derived URL/handle to prove unauthorized foreign-tenant data exposure or privileged state mutation, or settle with record_coverage(status='ruled_out', proofGapReason='invariant_enforced_hardened') if blocked"
+const ANON_ACTOR_RE = /^(?:anon(?:ymous)?|unauth(?:enticated)?|guest)$/i
 export const sha256Hex = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex')
 function canonicalStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value)
@@ -570,22 +557,28 @@ function toOracleRecord(e: HostTranscriptEntry, fallbackSig: string): V8OracleRe
 
 function dispatchDefaultV8Oracle(
   receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, termEx: HostTranscriptEntry | undefined, options: CompositeVerifyOptions,
-): { ok: true; family: V8OracleFamily } | { ok: false; reason: string; rejectedBy: string; missingEvidence: string[] } | null {
+  terminalCtrl: HostTranscriptEntry | undefined, postMutRb: HostTranscriptEntry | undefined,
+): { ok: true; family: V8OracleFamily; explicit: boolean } | { ok: false; reason: string; rejectedBy: string; missingEvidence: string[] } | null {
   const ti = receipt.terminalImpact
   const family = ti.oracleFamily ?? (V8_ORACLE_FAMILY_SET.has(receipt.terminalVulnClass) ? receipt.terminalVulnClass as V8OracleFamily : null)
   if (!family) return null
-  const verifySignature = options.signingKey ? (rec: V8OracleRecord): boolean => { const e = idx.entriesById.get(rec.id); return e ? e.hostSignature === rec.hostSignature : rec.hostSignature.length >= 8 } : undefined
+  const verifySignature = options.signingKey ? (rec: V8OracleRecord): boolean => {
+    const e = idx.entriesById.get(rec.id) ?? idx.oobById.get(rec.id) ?? idx.tracesById.get(rec.id) ?? idx.pollsById.get(rec.id)
+    return Boolean(e && e.hostSignature === rec.hostSignature)
+  } : undefined
+  const mapFail = (reason: string) => (reason === 'terminal_impact_unproven_intermediate_stub' || reason === 'bled_access_own_tenant_only')
+    ? { ok: false as const, reason: TERMINAL_IMPACT_UNPROVEN_HINT, rejectedBy: 'terminal_impact_unproven', missingEvidence: [TERMINAL_IMPACT_UNPROVEN_HINT] }
+    : { ok: false as const, reason: `v8_oracle_failed (${family}): ${reason}`, rejectedBy: `v8_oracle_${family}`, missingEvidence: [reason] }
   const explicitInput = ti.oracleInput ?? options.v8OracleInput
   if (explicitInput) {
     const dec = evaluateV8OracleFamily(family, { ...explicitInput, ...(verifySignature ? { verifySignature } : {}) } as V8OracleInputMap[typeof family])
-    return dec.satisfied ? { ok: true, family } : { ok: false, reason: `v8_oracle_failed (${family}): ${dec.reason}`, rejectedBy: `v8_oracle_${family}`, missingEvidence: [dec.reason] }
+    return dec.satisfied ? { ok: true, family, explicit: true } : mapFail(dec.reason)
   }
   if (family !== 'cross_surface_pivot' || receipt.hops.length < 2) return null
   const sig = options.signingKey ? '' : 'host-verified-sig'
-  const ctrl = ti.preChainControlExchangeIds.map(id => idx.entriesById.get(id)).find((e): e is HostTranscriptEntry => Boolean(e))
   const rootHop = dag.hopsById.get(dag.roots[0]!)!
   const rootEx = rootHop.exchangeIds.map(id => idx.entriesById.get(id)!).find(e => e.step.arm === 'probe') ?? idx.entriesById.get(rootHop.exchangeIds[0]!)
-  if (!ctrl || !rootEx || !termEx) return { ok: false, reason: `v8_oracle_failed (${family}): missing_pivot_control_or_terminal_record`, rejectedBy: `v8_oracle_${family}`, missingEvidence: ['pre_chain_control_denied', 'cross_surface_pivot'] }
+  if (!terminalCtrl || !rootEx || !termEx) return { ok: false, reason: `v8_oracle_failed (${family}): missing_pivot_control_or_terminal_record`, rejectedBy: `v8_oracle_${family}`, missingEvidence: ['pre_chain_control_denied', TERMINAL_IMPACT_UNPROVEN_HINT] }
   const hops: CrossSurfaceHop[] = dag.topoOrder.map((hopId, i) => {
     const h = dag.hopsById.get(hopId)!, edge = (dag.incomingByHop.get(hopId) ?? [])[0]?.edge
     const ex = (i === dag.topoOrder.length - 1 ? termEx : h.exchangeIds.map(id => idx.entriesById.get(id)!).find(e => e.step.arm === 'probe')) ?? idx.entriesById.get(h.exchangeIds[0]!)!
@@ -599,13 +592,12 @@ function dispatchDefaultV8Oracle(
       ...(edge?.kind === 'state_transition_binding' ? { correlationToken: edge.entityId, ...(abl ? { ablationControlDenied: toOracleRecord(abl, sig) } : {}) } : {}),
     }
   })
-  const postRb = ti.postChainReadbackExchangeIds.map(id => idx.entriesById.get(id)).find((e): e is HostTranscriptEntry => Boolean(e && e.exchangeId !== termEx.exchangeId))
   const dec = evaluateV8OracleFamily('cross_surface_pivot', {
     attackerOriginPersona: { actorId: actorOf(rootEx) ?? 'attacker', role: roleOf(rootEx) ?? 'member', tenantId: rootEx.step.actor.tenant ?? null, isPrivilegedPreSeeded: false },
-    preChainControlDenied: toOracleRecord(ctrl, sig), hops, ...(verifySignature ? { verifySignature } : {}),
-    terminalImpact: { kind: postRb ? 'privileged_mutation' : 'privileged_read', verified: true, impactDigest: sha256Hex(termEx.step.body ?? JSON.stringify(termEx.step.json ?? termEx.exchangeId)), ...(postRb ? { postImpactReadback: toOracleRecord(postRb, sig) } : {}) },
+    preChainControlDenied: toOracleRecord(terminalCtrl, sig), hops, ...(verifySignature ? { verifySignature } : {}),
+    terminalImpact: { kind: postMutRb ? 'privileged_mutation' : 'privileged_read', verified: true, impactDigest: sha256Hex(termEx.step.body ?? JSON.stringify(termEx.step.json ?? termEx.exchangeId)), ...(postMutRb ? { postImpactReadback: toOracleRecord(postMutRb, sig) } : {}) },
   } satisfies CrossSurfacePivotInput)
-  return dec.satisfied ? { ok: true, family } : { ok: false, reason: `v8_oracle_failed (${family}): ${dec.reason}`, rejectedBy: `v8_oracle_${family}`, missingEvidence: [dec.reason] }
+  return dec.satisfied ? { ok: true, family, explicit: false } : mapFail(dec.reason)
 }
 
 function verifyTerminalImpactGate(
@@ -622,66 +614,61 @@ function verifyTerminalImpactGate(
     return { ok: false, reason: `terminalExchangeId "${ti.terminalExchangeId}" does not belong to terminal hop "${termHop.hopId}".`, rejectedBy: 'terminal_exchange_invalid', missingEvidence: ['terminal_exchange_in_final_hop'] }
   }
   let terminalVerification: ReceiptVerification | undefined
-  if (ti.proofReceipt) {
-    terminalVerification = verifyReceipt(ti.proofReceipt, hostTranscript)
-    if (!terminalVerification.confirmed) return { ok: false, reason: terminalVerification.reason, terminalVerification }
-  }
-  if (options.verifyTerminalImpact) {
-    const verdict = options.verifyTerminalImpact(receipt, hostTranscript)
-    if (!verdict.confirmed) return { ok: false, reason: verdict.reason, terminalVerification }
-  }
+  if (ti.proofReceipt) { terminalVerification = verifyReceipt(ti.proofReceipt, hostTranscript); if (!terminalVerification.confirmed) return { ok: false, reason: terminalVerification.reason, terminalVerification } }
+  if (options.verifyTerminalImpact) { const v = options.verifyTerminalImpact(receipt, hostTranscript); if (!v.confirmed) return { ok: false, reason: v.reason, terminalVerification } }
   if (ti.proofReceipt || options.verifyTerminalImpact) return { ok: true, terminalVerification }
-
-  const termEx = ti.terminalExchangeId
-    ? idx.entriesById.get(ti.terminalExchangeId)!
-    : [...termHop.exchangeIds].reverse().map(id => idx.entriesById.get(id)!).find(e => e.step.arm === 'probe' && is2xx(e.step.status))
-  const v8Default = dispatchDefaultV8Oracle(receipt, dag, idx, termEx, options)
-  if (v8Default) return v8Default.ok ? { ok: true } : v8Default
-  if (ti.terminalExchangeId && (!termEx || termEx.step.arm === 'control' || !is2xx(termEx.step.status))) {
-    return { ok: false, reason: `terminalExchangeId "${ti.terminalExchangeId}" is not a succeeding probe exchange.`, rejectedBy: 'terminal_impact_unproven', missingEvidence: [TERMINAL_IMPACT_UNPROVEN_HINT] }
+  const termEx = ti.terminalExchangeId ? idx.entriesById.get(ti.terminalExchangeId)! : [...termHop.exchangeIds].reverse().map(id => idx.entriesById.get(id)!).find(e => e.step.arm === 'probe' && is2xx(e.step.status))
+  const failUnproven = (reason = TERMINAL_IMPACT_UNPROVEN_HINT, extra?: string[]) => ({ ok: false as const, reason, rejectedBy: 'terminal_impact_unproven', missingEvidence: extra ? [...extra, TERMINAL_IMPACT_UNPROVEN_HINT] : [TERMINAL_IMPACT_UNPROVEN_HINT] })
+  if (ti.terminalExchangeId && (!termEx || termEx.step.arm === 'control' || !is2xx(termEx.step.status))) return failUnproven(`terminalExchangeId "${ti.terminalExchangeId}" is not a succeeding probe exchange.`)
+  if (termEx && (termEx.evidenceRole === 'host_capability_op' || termEx.evidenceRole === 'host_crypto_op')) return failUnproven()
+  const attackerTenants = new Set<string>()
+  for (const rId of dag.roots) for (const exId of dag.hopsById.get(rId)!.exchangeIds) {
+    const e = idx.entriesById.get(exId)!
+    if (e.step.arm === 'probe') { const t = (e.step.actor.tenant ?? parseRoleLabel(e.actorRoleLabel ?? e.actorPersona ?? '').tenant ?? '').trim().toLowerCase(); if (t) attackerTenants.add(t) }
   }
+  const isCrossTenantCls = CROSS_TENANT_CLASS_RE.test(receipt.terminalVulnClass)
+  const isOwnTenantOnly = (e: HostTranscriptEntry): boolean => { const ts = extractTenantMarkers(e.step.json, e.step.body); return ts.size > 0 && attackerTenants.size > 0 && [...ts].every(t => attackerTenants.has(t)) }
+  const postMutRb = (!termEx || !stepReadsState(termEx.step)) ? ti.postChainReadbackExchangeIds.map(id => idx.entriesById.get(id)).find((e): e is HostTranscriptEntry => {
+    if (!e || (termEx && e.exchangeId === termEx.exchangeId)) return false
+    const mono = !termEx || !isFiniteTs(termEx.timestampMs) || (isFiniteTs(e.timestampMs) && e.timestampMs >= termEx.timestampMs)
+    const isRead = stepReadsState(e.step) || e.step.arm === 'control' || e.step.evidenceRole === 'post_chain_readback'
+    const hasData = e.step.json !== undefined || (typeof e.step.body === 'string' && e.step.body.trim().length > 0)
+    return is2xx(e.step.status) && mono && isRead && hasData && !isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method) && (!isCrossTenantCls || !isOwnTenantOnly(e))
+  }) : undefined
+  const hasPostMutation = Boolean(postMutRb), termHopSet = new Set(termHop.exchangeIds)
+  const nonTermExSet = new Set(receipt.hops.filter(h => h.hopId !== termHop.hopId).flatMap(h => h.exchangeIds).filter(id => !termHopSet.has(id)))
+  const termFam = routeFamily(termEx?.step.route ?? termEx?.step.pathAndQuery ?? termHop.target.pathAndQuery ?? '')
+  const termActor = termEx ? actorOf(termEx) : null, termAuthd = Boolean(termActor && !ANON_ACTOR_RE.test(termActor))
+  const ctrlCandidates = [...ti.preChainControlExchangeIds, ...termHop.exchangeIds, ...receipt.causalEdges.flatMap(ed => ed.kind === 'state_transition_binding' && ed.toHopId === termHop.hopId ? ed.ablationExchangeIds : [])]
+  const terminalCtrl = ctrlCandidates.map(id => idx.entriesById.get(id)).find((c): c is HostTranscriptEntry => {
+    if (!c || (termEx && c.exchangeId === termEx.exchangeId) || nonTermExSet.has(c.exchangeId)) return false
+    if ((c.step.arm !== 'control' && c.replayAttempt !== 'ablation_control') || typeof c.step.status !== 'number' || !DENIED_CONTROL_STATUSES.has(c.step.status)) return false
+    const ca = actorOf(c); if (c.step.status === 401 && termAuthd && (!ca || ANON_ACTOR_RE.test(ca))) return false
+    const cf = routeFamily(c.step.route ?? c.step.pathAndQuery ?? '')
+    return !termFam || (Boolean(cf) && cf === termFam)
+  })
+  const hasCleanDeniedCtrl = Boolean(terminalCtrl)
+  const v8Default = dispatchDefaultV8Oracle(receipt, dag, idx, termEx, options, terminalCtrl, postMutRb)
+  if (v8Default && !v8Default.ok) return v8Default
+  if (v8Default?.explicit && v8Default.family === 'economic_conservation') return { ok: true }
   const hasOob = termHop.oobEventIds.some(id => idx.oobById.get(id)?.delivered === true)
   const hasBrowser = termHop.browserTraceIds.some(id => (idx.tracesById.get(id)?.sinks?.length ?? 0) > 0)
   const hasAsyncEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'async_pivot_binding' && e.verified)
   const hasDerivedCryptoEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'derived_crypto_binding' && e.verified)
-  if (!termEx && !hasOob && !hasBrowser && !hasAsyncEdge) {
-    return { ok: false, reason: `Terminal hop "${termHop.hopId}" has no succeeding terminal evidence.`, rejectedBy: 'terminal_impact_unproven', missingEvidence: [TERMINAL_IMPACT_UNPROVEN_HINT] }
-  }
-  const hasPostMutation = ti.postChainReadbackExchangeIds.some(id => {
-    if (termEx && id === termEx.exchangeId) return false
-    const e = idx.entriesById.get(id)!
-    const mono = !termEx || !isFiniteTs(termEx.timestampMs) || (isFiniteTs(e.timestampMs) && e.timestampMs >= termEx.timestampMs)
-    const isRead = stepReadsState(e.step) || e.step.arm === 'control' || e.step.evidenceRole === 'post_chain_readback'
-    const hasData = e.step.json !== undefined || (typeof e.step.body === 'string' && e.step.body.trim().length > 0)
-    return is2xx(e.step.status) && mono && isRead && hasData && !isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method)
-  })
-  const termFam = routeFamily(termEx?.step.route ?? termEx?.step.pathAndQuery ?? termHop.target.pathAndQuery ?? '')
-  const ctrlCandidates = [...ti.preChainControlExchangeIds, ...termHop.exchangeIds, ...receipt.causalEdges.flatMap(ed => ed.kind === 'state_transition_binding' && ed.toHopId === termHop.hopId ? ed.ablationExchangeIds : [])]
-  const hasCleanDeniedCtrl = ctrlCandidates.some(id => {
-    if (termEx && id === termEx.exchangeId) return false
-    const c = idx.entriesById.get(id)
-    if (!c || (c.step.arm !== 'control' && c.replayAttempt !== 'ablation_control') || typeof c.step.status !== 'number' || !DENIED_CONTROL_STATUSES.has(c.step.status)) return false
-    const cf = routeFamily(c.step.route ?? c.step.pathAndQuery ?? '')
-    return !termFam || !cf || cf === termFam || Boolean(termHop.entityId && entryMatchesEntity(c, termHop.entityId))
-  })
-  const attackerTenants = new Set<string>()
-  for (const rId of dag.roots) for (const exId of dag.hopsById.get(rId)!.exchangeIds) {
-    const e = idx.entriesById.get(exId)!
-    if (e.step.arm !== 'probe') continue
-    const t = (e.step.actor.tenant ?? parseRoleLabel(e.actorRoleLabel ?? e.actorPersona ?? '').tenant ?? '').trim().toLowerCase()
-    if (t) attackerTenants.add(t)
-  }
-  const respTenants = termEx ? entryTenants(termEx) : new Set<string>()
+  const hasAnyDerivedCrypto = verifiedEdges.some(e => e.kind === 'derived_crypto_binding' && e.verified)
+  if (!termEx && !hasOob && !hasBrowser && !hasAsyncEdge) return failUnproven(`Terminal hop "${termHop.hopId}" has no succeeding terminal evidence.`)
   const hasBody = Boolean(termEx && (termEx.step.json !== undefined || (typeof termEx.step.body === 'string' && termEx.step.body.trim().length > 0)))
   const isStub = Boolean(termEx && hasBody && isJobOrHandleStub(termEx.step.json, termEx.step.body, termEx.step.status, termEx.step.method))
-  if (isStub && !hasPostMutation) return { ok: false, reason: TERMINAL_IMPACT_UNPROVEN_HINT, rejectedBy: 'terminal_impact_unproven', missingEvidence: [TERMINAL_IMPACT_UNPROVEN_HINT] }
-  const ownTenantOnly = respTenants.size > 0 && attackerTenants.size > 0 && [...respTenants].every(t => attackerTenants.has(t))
-  if (termEx && ownTenantOnly && !hasPostMutation && !hasCleanDeniedCtrl) return { ok: false, reason: TERMINAL_IMPACT_UNPROVEN_HINT, rejectedBy: 'terminal_impact_unproven', missingEvidence: [TERMINAL_IMPACT_UNPROVEN_HINT] }
-  if (STRICT_TERMINAL_CLASS_RE.test(receipt.terminalVulnClass)) {
+  if (isStub && !hasPostMutation) return failUnproven()
+  const ownTenantOnly = Boolean(termEx && isOwnTenantOnly(termEx))
+  if (termEx && ownTenantOnly && !hasPostMutation && (isCrossTenantCls || receipt.terminalVulnClass === 'cross_surface_pivot' || !hasCleanDeniedCtrl)) return failUnproven()
+  const needsStrict = STRICT_TERMINAL_CLASS_RE.test(receipt.terminalVulnClass)
+    || (hasBody && !hasOob && !hasBrowser && !hasAsyncEdge && !hasAnyDerivedCrypto && !['business_logic', 'ssrf'].includes(receipt.terminalVulnClass.toLowerCase()))
+  if (needsStrict) {
     if (!hasCleanDeniedCtrl && !hasOob && !hasBrowser && !(receipt.terminalVulnClass === 'cryptographic_scope_replay' && hasDerivedCryptoEdge)) {
-      return { ok: false, reason: `Missing clean denied control (401/403/404) on terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, rejectedBy: 'terminal_impact_unproven', missingEvidence: ['clean_denied_control_401_403_404', TERMINAL_IMPACT_UNPROVEN_HINT] }
+      return failUnproven(`Missing clean denied control (401/403/404) on exact terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['clean_denied_control_401_403_404'])
     }
-    if (termEx && !hasPostMutation && (!hasBody || isStub || ownTenantOnly)) return { ok: false, reason: TERMINAL_IMPACT_UNPROVEN_HINT, rejectedBy: 'terminal_impact_unproven', missingEvidence: [TERMINAL_IMPACT_UNPROVEN_HINT] }
+    if (termEx && !hasPostMutation && (!hasBody || isStub || (ownTenantOnly && (isCrossTenantCls || receipt.terminalVulnClass === 'cross_surface_pivot')))) return failUnproven()
   }
   return { ok: true }
 }
