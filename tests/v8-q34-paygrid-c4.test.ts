@@ -3,7 +3,7 @@
 // Hop 1 duplicate-key cap bypass. Normal orders must capture atomically (economic conservation holds);
 // only orders that went through the parser differential reach the racy legacy capture path. The same
 // audit closed a single-hop self-approval of seeded payouts by verified staff (PG-C1 shortcut).
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

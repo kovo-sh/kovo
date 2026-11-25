@@ -120,7 +120,7 @@ describe('wiring — staging safety (#3)', () => {
     }, 'broker-denied-mutations-zero'), 'fail')
   })
 
-  test('FAIL when cleanup leaves guardian-qa- entities', () => {
+  test('FAIL when cleanup leaves kovo-qa- entities', () => {
     assert.equal(criterionStatus('staging-concurrency', {
       approvalBlocks: 0,
       brokerDeniedMutations: 0,

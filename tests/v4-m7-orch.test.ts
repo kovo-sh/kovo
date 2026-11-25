@@ -46,13 +46,13 @@ describe('M7 orchestration: config knobs', () => {
 
   test('env values are read and concurrency is clamped; overrides win', () => {
     const env = {
-      GUARDIAN_BENCH_MAX_REQUESTS: '1200',
-      GUARDIAN_BENCH_DEADLINE_MS: '60000',
-      GUARDIAN_BENCH_PROBE_CONCURRENCY: '99',
-      GUARDIAN_BENCH_VERIFY_CONCURRENCY: '99',
-      GUARDIAN_BENCH_SLOW_PROBES: '6',
-      GUARDIAN_BENCH_CLASS_CAP: 'path_traversal_benign=2,sqli_boolean=9',
-      GUARDIAN_BENCH_CLASS_ENDPOINT_CAP: 'cache_poison_deception=2',
+      KOVO_BENCH_MAX_REQUESTS: '1200',
+      KOVO_BENCH_DEADLINE_MS: '60000',
+      KOVO_BENCH_PROBE_CONCURRENCY: '99',
+      KOVO_BENCH_VERIFY_CONCURRENCY: '99',
+      KOVO_BENCH_SLOW_PROBES: '6',
+      KOVO_BENCH_CLASS_CAP: 'path_traversal_benign=2,sqli_boolean=9',
+      KOVO_BENCH_CLASS_ENDPOINT_CAP: 'cache_poison_deception=2',
     }
     const cfg = resolveBenchOrchestrationConfig(env, { maxRequests: 900, probeConcurrency: 3 })
     assert.equal(cfg.maxRequests, 900)
@@ -67,11 +67,11 @@ describe('M7 orchestration: config knobs', () => {
 
   test('invalid and out-of-range env values fall back to safe bounds, not crashes', () => {
     const cfg = resolveBenchOrchestrationConfig({
-      GUARDIAN_BENCH_MAX_REQUESTS: 'nope',
-      GUARDIAN_BENCH_DEADLINE_MS: '',
-      GUARDIAN_BENCH_PROBE_CONCURRENCY: '0',
-      GUARDIAN_BENCH_VERIFY_CONCURRENCY: '-3',
-      GUARDIAN_BENCH_SLOW_PROBES: '900',
+      KOVO_BENCH_MAX_REQUESTS: 'nope',
+      KOVO_BENCH_DEADLINE_MS: '',
+      KOVO_BENCH_PROBE_CONCURRENCY: '0',
+      KOVO_BENCH_VERIFY_CONCURRENCY: '-3',
+      KOVO_BENCH_SLOW_PROBES: '900',
     })
     assert.equal(cfg.maxRequests, 6000)
     assert.equal(cfg.deadlineMs, 480_000)
@@ -295,7 +295,7 @@ describe('M7 orchestration: CLI flags', () => {  test('recall CLI parses the new
       maxRequests: 1500, deadlineMs: 120000, probeConcurrency: 6, verifyConcurrency: 3, slowProbes: 8,
     })
     assert.match(benchmarkCliHelp(), /--probe-concurrency/)
-    assert.match(benchmarkCliHelp(), /GUARDIAN_BENCH_MAX_REQUESTS/)
+    assert.match(benchmarkCliHelp(), /KOVO_BENCH_MAX_REQUESTS/)
   })
 
   test('recall CLI rejects malformed counts and out-of-range concurrency', () => {
@@ -348,7 +348,7 @@ describe('M7 orchestration: all-patches verdict uses baseline spec replay', () =
 
   test('a fresh always-on finding does not mark a patched vuln as regressed when baseline specs dismiss', async () => {
     const calls = { runFull: 0 }
-    const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_BENCH_ALLPATCH_FRESH: undefined }, () => verifyPatchesLive({
+    const summary = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_BENCH_ALLPATCH_FRESH: undefined }, () => verifyPatchesLive({
       manifest,
       baseline,
       // Even though a fresh run would re-confirm both ids, the replay evidence is authoritative.
@@ -370,7 +370,7 @@ describe('M7 orchestration: all-patches verdict uses baseline spec replay', () =
   })
 
   test('optional fresh discovery reports unattributed findings as newly confirming, never still confirming', async () => {
-    const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_BENCH_ALLPATCH_FRESH: '1' }, () => verifyPatchesLive({
+    const summary = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_BENCH_ALLPATCH_FRESH: '1' }, () => verifyPatchesLive({
       manifest,
       baseline,
       hooks: hooks({
@@ -386,7 +386,7 @@ describe('M7 orchestration: all-patches verdict uses baseline spec replay', () =
   })
 
   test('a baseline spec that still confirms is a genuine regression', async () => {
-    const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_BENCH_ALLPATCH_FRESH: undefined }, () => verifyPatchesLive({
+    const summary = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_BENCH_ALLPATCH_FRESH: undefined }, () => verifyPatchesLive({
       manifest,
       baseline,
       hooks: hooks({
@@ -402,7 +402,7 @@ describe('M7 orchestration: all-patches verdict uses baseline spec replay', () =
   })
 
   test('transport failures make the all-patches pass inconclusive, not regressed', async () => {
-    const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_BENCH_ALLPATCH_FRESH: undefined }, () => verifyPatchesLive({
+    const summary = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_BENCH_ALLPATCH_FRESH: undefined }, () => verifyPatchesLive({
       manifest,
       baseline,
       hooks: hooks({

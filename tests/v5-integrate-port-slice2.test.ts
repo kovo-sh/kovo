@@ -24,7 +24,7 @@ import type { Run } from '../src/server/store.ts'
 import { makeStore, setupApprovedRun, withEnv } from './v4-tier-helpers.ts'
 
 // scopedAssetOrigin accepts loopback origins only when local-lab mode is enabled.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 type EngineInternals = {
   driveInvestigation: (run: Run, profiles: readonly unknown[]) => void
@@ -124,7 +124,7 @@ test('v6: K=6 consecutive dry steps no longer halt while budget and work remain'
   const execution = new Execution(storage)
   // The planner keeps the investigation phase open; a dry streak is telemetry, never a kill.
   ;(internals(execution) as unknown as Record<string, unknown>).schedulePlanner = () => undefined
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => {
     internals(execution).driveInvestigation(current, [{ id: 'profile', model: 'test' }])
   })
   assert.equal(

@@ -21,7 +21,7 @@ import { Store } from '../src/server/store.ts'
 import type { Run } from '../src/server/store.ts'
 
 // The fixture Store creates a loopback-seeded project, which requires local-lab consent.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 interface Fixture {
   directory: string
@@ -30,7 +30,7 @@ interface Fixture {
 }
 
 function makeFixture(): Fixture {
-  const directory = mkdtempSync(join(tmpdir(), 'guardian-recon-cache-'))
+  const directory = mkdtempSync(join(tmpdir(), 'kovo-recon-cache-'))
   const store = new Store(directory)
   const project = store.createProject({
     requestId: randomUUID(),
@@ -320,7 +320,7 @@ test('capture: rows created after Phase-0 completion are excluded', () => {
 
 test('security: cache files contain no persona password or session value', () => {
   const fixture = makeFixture()
-  const cacheDir = mkdtempSync(join(tmpdir(), 'guardian-recon-cache-dir-'))
+  const cacheDir = mkdtempSync(join(tmpdir(), 'kovo-recon-cache-dir-'))
   try {
     seedSurface(fixture.store, fixture.run)
     const password = 'C4nary-Passw0rd-9f2'
@@ -348,7 +348,7 @@ test('security: cache files contain no persona password or session value', () =>
 
 test('security: registered secrets are redacted out of cached rows before write', () => {
   const fixture = makeFixture()
-  const cacheDir = mkdtempSync(join(tmpdir(), 'guardian-recon-cache-redact-'))
+  const cacheDir = mkdtempSync(join(tmpdir(), 'kovo-recon-cache-redact-'))
   try {
     const password = 'Leak-Me-Passw0rd-42'
     fixture.store.upsertEndpoint({
@@ -392,7 +392,7 @@ test('security: validation rejects hand-written auth secret material', () => {
 
 test('miss: absent, corrupt, mismatched and tampered snapshots fall back cleanly', () => {
   const fixture = makeFixture()
-  const cacheDir = mkdtempSync(join(tmpdir(), 'guardian-recon-cache-miss-'))
+  const cacheDir = mkdtempSync(join(tmpdir(), 'kovo-recon-cache-miss-'))
   try {
     seedSurface(fixture.store, fixture.run)
     const { snapshot } = capture(fixture)
@@ -439,7 +439,7 @@ test('miss: absent, corrupt, mismatched and tampered snapshots fall back cleanly
 
 test('miss: refresh path ignores a valid snapshot without throwing', () => {
   const fixture = makeFixture()
-  const cacheDir = mkdtempSync(join(tmpdir(), 'guardian-recon-cache-refresh-'))
+  const cacheDir = mkdtempSync(join(tmpdir(), 'kovo-recon-cache-refresh-'))
   try {
     seedSurface(fixture.store, fixture.run)
     const { snapshot } = capture(fixture)
@@ -458,8 +458,8 @@ test('miss: refresh path ignores a valid snapshot without throwing', () => {
 test('surface paths: only query-free, payload-free app paths are replayable', () => {
   assert.equal(surfaceReplayPath('/api/orders?q=1'), '/api/orders')
   assert.equal(surfaceReplayPath('/api/orders/ord_123'), '/api/orders/ord_123')
-  assert.equal(surfaceReplayPath('/.guardian-cal-abc123'), null)
-  assert.equal(surfaceReplayPath('/rest/.guardian-cal-abc123'), null)
+  assert.equal(surfaceReplayPath('/.kovo-cal-abc123'), null)
+  assert.equal(surfaceReplayPath('/rest/.kovo-cal-abc123'), null)
   assert.equal(surfaceReplayPath('/api/leak/[[persona-password]]'), null)
   assert.equal(surfaceReplayPath('/api/<script>alert(1)</script>'), null)
   assert.equal(surfaceReplayPath('https://elsewhere.example/steal'), null)
@@ -480,7 +480,7 @@ test('surface affirmation: replays cached GET paths and reports counts', async (
     const origin = `http://127.0.0.1:${address.port}`
     const result = await replayReconSurface({
       origin,
-      paths: ['/api/orders?q=1', '/api/users', '/api/users', '/.guardian-cal-x', '/api/%3Cscript%3E'],
+      paths: ['/api/orders?q=1', '/api/users', '/api/users', '/.kovo-cal-x', '/api/%3Cscript%3E'],
     })
     assert.deepEqual(result, { attempted: 3, completed: 3, failed: 0 })
     assert.deepEqual(hits.sort(), ['GET /api/%3Cscript%3E', 'GET /api/orders', 'GET /api/users'])

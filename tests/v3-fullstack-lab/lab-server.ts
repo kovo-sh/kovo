@@ -1,5 +1,5 @@
 /**
- * Guardian v3 — Suite B deterministic Full-Stack Lab fixture server (SPEC-v3 §8 Suite B).
+ * Kovo Hunter v3 — Suite B deterministic Full-Stack Lab fixture server (SPEC-v3 §8 Suite B).
  *
  * A single in-process Node HTTP + WebSocket server emulating a modern Next.js + Express +
  * GraphQL-ish + WebSocket SaaS app with 12 planted High/Critical vulnerability classes and
@@ -505,7 +505,7 @@ export async function createSuiteBLab(options: SuiteBLabOptions = {}) {
     // ---- unknown API → real 404 ----
     if (path.startsWith('/api/')) return json(res, 404, { error: 'not_found' })
 
-    // ---- D2: SPA catch-all for everything else (/, /actuator/env, /.guardian-cal-*, ...) ----
+    // ---- D2: SPA catch-all for everything else (/, /actuator/env, /.kovo-cal-*, ...) ----
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }).end(INDEX_HTML)
   }
 

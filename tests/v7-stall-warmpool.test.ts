@@ -98,8 +98,8 @@ test('no-token watchdog fires once after silence and never after a token reset',
   t.mock.timers.enable({ apis: ['setTimeout'] })
   assert.equal(PROVIDER_STALL_NO_TOKEN_MS, 28_000, 'product default is inside the 25–30 s window')
   assert.equal(resolveProviderStallNoTokenMs({}), 28_000)
-  assert.equal(resolveProviderStallNoTokenMs({ GUARDIAN_PROVIDER_NO_TOKEN_MS: '30000' }), 30_000)
-  assert.equal(resolveProviderStallNoTokenMs({ GUARDIAN_PROVIDER_NO_TOKEN_MS: '1' }), 5_000, 'lower bound')
+  assert.equal(resolveProviderStallNoTokenMs({ KOVO_PROVIDER_NO_TOKEN_MS: '30000' }), 30_000)
+  assert.equal(resolveProviderStallNoTokenMs({ KOVO_PROVIDER_NO_TOKEN_MS: '1' }), 5_000, 'lower bound')
 
   const fired: Array<{ turn: number; thresholdMs: number }> = []
   const watchdog = new ProviderNoTokenWatchdog({
@@ -151,7 +151,7 @@ test('a clean session returns its container to the pool and is reused', async ()
   const docker = dockerStub()
   const pool = new WarmWorkerPool({
     cell: 'cell-reuse',
-    image: 'guardian-worker:test',
+    image: 'kovo-worker:test',
     dockerRunner: docker.runner,
     runLabel: 'run-a',
     capacity: 1,
@@ -171,7 +171,7 @@ test('a failed cleanup discards the container instead of pooling it', async () =
   const docker = dockerStub()
   const pool = new WarmWorkerPool({
     cell: 'cell-dirty',
-    image: 'guardian-worker:test',
+    image: 'kovo-worker:test',
     dockerRunner: docker.runner,
     runLabel: 'run-a',
     capacity: 1,
@@ -252,15 +252,15 @@ test('teardown removes idle warm containers from the host', async () => {
 
 test('warm capacity is bounded up to 12 to match dynamic worker concurrency', () => {
   assert.equal(MAX_WARM_POOL_CAPACITY, 12)
-  assert.equal(warmPoolCapacity({ GUARDIAN_WARM_SLOTS: '6' }), 6)
-  assert.equal(warmPoolCapacity({ GUARDIAN_WARM_SLOTS: '12' }), 12)
-  assert.equal(warmPoolCapacity({ GUARDIAN_WARM_SLOTS: '99' }), 12, 'hard ceiling')
+  assert.equal(warmPoolCapacity({ KOVO_WARM_SLOTS: '6' }), 6)
+  assert.equal(warmPoolCapacity({ KOVO_WARM_SLOTS: '12' }), 12)
+  assert.equal(warmPoolCapacity({ KOVO_WARM_SLOTS: '99' }), 12, 'hard ceiling')
   assert.equal(warmPoolCapacity({}), 1, 'platform default before Execution sizes the pool')
 
   const docker = dockerStub()
   const pool = new WarmWorkerPool({
     cell: 'cell-cap-12',
-    image: 'guardian-worker:test',
+    image: 'kovo-worker:test',
     dockerRunner: docker.runner,
     runLabel: 'run-cap',
     capacity: 12,
@@ -274,9 +274,9 @@ test('warm scratch reset wipes regular files, single-dot hidden files, and doubl
   assert.match(WARM_SCRATCH_RESET_COMMAND, /\/tmp\/\*/)
   assert.match(WARM_SCRATCH_RESET_COMMAND, /\/tmp\/\.\[!\.\]\*/)
   assert.match(WARM_SCRATCH_RESET_COMMAND, /\/tmp\/\.\.\?\*/)
-  assert.doesNotMatch(WARM_SCRATCH_RESET_COMMAND, /\/repos|\/guardian-rpc|\/guardian-ipc/)
+  assert.doesNotMatch(WARM_SCRATCH_RESET_COMMAND, /\/repos|\/kovo-rpc|\/kovo-ipc/)
 
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-warm-reset-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-warm-reset-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   writeFileSync(join(dir, 'scratch.txt'), 'a')
   writeFileSync(join(dir, '.hidden'), 'b')
@@ -323,7 +323,7 @@ function fakeSessionSpawner(onStop?: Map<string, () => void>) {
 }
 
 test('white-box reposDir reuses warm containers, resets /tmp, bypasses on rpcMountDir, and cleans up staged mounts', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'guardian-warm-wb-'))
+  const root = mkdtempSync(join(tmpdir(), 'kovo-warm-wb-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))
 
   // Restrictive host mode (0o700) forces prepareReposMount() to stage a clean container-readable copy.
@@ -394,8 +394,8 @@ test('white-box reposDir reuses warm containers, resets /tmp, bypasses on rpcMou
   assert.equal(backend.warmPoolStats?.idle, 1, 'warm container remains untouched in idle pool')
   assert.equal(createCalls().length, 2, 'cold create runs for rpcMountDir session')
   assert.ok(
-    createCalls()[1]!.some(arg => arg.includes('target=/guardian-rpc,readonly')),
-    'cold rpc session mounts per-call /guardian-rpc',
+    createCalls()[1]!.some(arg => arg.includes('target=/kovo-rpc,readonly')),
+    'cold rpc session mounts per-call /kovo-rpc',
   )
   await sRpc.close()
 
@@ -417,7 +417,7 @@ test('white-box reposDir reuses warm containers, resets /tmp, bypasses on rpcMou
 // ============================================================================
 
 test('throughput metrics expose timeouts, wall saved and container reuse hit rate', async t => {
-  const { storage } = makeStore(t, 'guardian-v7-stall-warmpool-db-') as { storage: Store }
+  const { storage } = makeStore(t, 'kovo-v7-stall-warmpool-db-') as { storage: Store }
   const setup = await setupApprovedRun(storage, { seeds: ['https://stall.warmpool.test'], tier: 3, budgetRequests: 900 })
   storage.updateRun(setup.runId, { phase: 'investigation', status: 'running' })
   const execution = new Execution(storage)

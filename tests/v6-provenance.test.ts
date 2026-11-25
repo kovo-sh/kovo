@@ -59,7 +59,7 @@ function confirmingSpecId(
 }
 
 async function setup(t: Parameters<typeof makeStore>[0], label: string) {
-  const { dir, storage } = makeStore(t, `guardian-v6-provenance-${label}-`)
+  const { dir, storage } = makeStore(t, `kovo-v6-provenance-${label}-`)
   const { runId } = await setupApprovedRun(storage, { budgetRequests: 500 })
   const run = storage.run(runId)
   const asset = run.candidates[0]!
@@ -288,7 +288,7 @@ test('v6 provenance: report counts are correct and advisories stay out of confir
 })
 
 test('v6 provenance: legacy database without provenance columns backfills and reads', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v6-provenance-legacy-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v6-provenance-legacy-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
 
   const seeded = new Store(dir)
@@ -310,7 +310,7 @@ test('v6 provenance: legacy database without provenance columns backfills and re
   seeded.close()
 
   // Rebuild findings as a pre-v6 table (no provenance / verification_class columns).
-  const raw = new DatabaseSync(join(dir, 'guardian.sqlite'))
+  const raw = new DatabaseSync(join(dir, 'kovo.sqlite'))
   const rows = raw.prepare('SELECT * FROM findings').all() as Array<Record<string, unknown>>
   raw.exec(`
     DROP INDEX IF EXISTS findings_provenance;

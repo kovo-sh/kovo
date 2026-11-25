@@ -11,7 +11,7 @@ test.setTimeout(90_000)
 const origin = 'https://board-e2e.example'
 
 test('renders the mandatory Board tab with seeded roster, messages, evidence chips, approvals, and routes the composer', async ({ page }) => {
-  const directory = mkdtempSync(join(tmpdir(), 'guardian-v5-board-e2e-'))
+  const directory = mkdtempSync(join(tmpdir(), 'kovo-v5-board-e2e-'))
   const store = new Store(directory)
   const { id: projectId } = store.createProject({
     requestId: randomUUID(), name: 'Board E2E', seeds: [origin], environment: 'public',

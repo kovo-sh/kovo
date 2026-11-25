@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { once } from 'node:events'
 import {
-  createGuardianLocalServer,
+  createKovoLocalServer,
   isBootstrapAuthorized,
   isSessionAuthorized,
 } from '../scripts/serve.ts'
@@ -42,11 +42,11 @@ async function availablePort(): Promise<number> {
 async function startLocalServer(directory: string) {
   const port = await availablePort()
   let appFetches = 0
-  const local = createGuardianLocalServer({
+  const local = createKovoLocalServer({
     app: {
       fetch: async () => {
         appFetches += 1
-        return new Response('<html><body>guardian app</body></html>', {
+        return new Response('<html><body>kovo app</body></html>', {
           headers: { 'content-type': 'text/html; charset=utf-8' },
         })
       },
@@ -65,7 +65,7 @@ async function startLocalServer(directory: string) {
 }
 
 test('local session cookie is never issued to a bare local HTML/API request', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-local-bootstrap-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-local-bootstrap-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const app = await startLocalServer(dir)
   t.after(() => app.close())
@@ -86,7 +86,7 @@ test('local session cookie is never issued to a bare local HTML/API request', as
 })
 
 test('one-time bootstrap URL exchanges an owner secret for the session cookie exactly once', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-local-bootstrap-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-local-bootstrap-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const app = await startLocalServer(dir)
   t.after(() => app.close())
@@ -100,7 +100,7 @@ test('one-time bootstrap URL exchanges an owner secret for the session cookie ex
   assert.equal(bootstrap.status, 303)
   assert.equal(bootstrap.headers.get('location'), '/?view=overview')
   const setCookie = bootstrap.headers.get('set-cookie') ?? ''
-  assert.match(setCookie, /^guardian_local=[a-f0-9]{64}; Path=\/; HttpOnly; SameSite=Strict/)
+  assert.match(setCookie, /^kovo_local=[a-f0-9]{64}; Path=\/; HttpOnly; SameSite=Strict/)
   assert.equal(setCookie.includes('Secure'), false, 'Loopback HTTP must not mark the cookie Secure')
   assert.equal(existsSync(join(dir, 'bootstrap')), false, 'Bootstrap secret must be consumed after first use')
 
@@ -111,7 +111,7 @@ test('one-time bootstrap URL exchanges an owner secret for the session cookie ex
   const cookie = setCookie.split(';')[0]
   const authenticated = await fetch(`${app.origin}/`, { redirect: 'manual', headers: { Cookie: cookie } })
   assert.equal(authenticated.status, 200)
-  assert.match(await authenticated.text(), /guardian app/)
+  assert.match(await authenticated.text(), /kovo app/)
   assert.equal(authenticated.headers.get('set-cookie'), null, 'An existing session must not be re-minted')
   assert.equal(app.appFetches(), 1)
 
@@ -123,9 +123,9 @@ test('one-time bootstrap URL exchanges an owner secret for the session cookie ex
 
 test('session/bootstrap token comparison is strict and malformed cookies are rejected', () => {
   const token = 'a'.repeat(64)
-  assert.equal(isSessionAuthorized(`guardian_local=${token}`, token), true)
-  assert.equal(isSessionAuthorized(`guardian_local=${'b'.repeat(64)}`, token), false)
-  assert.equal(isSessionAuthorized(`guardian_local=${token.slice(0, 63)}`, token), false)
+  assert.equal(isSessionAuthorized(`kovo_local=${token}`, token), true)
+  assert.equal(isSessionAuthorized(`kovo_local=${'b'.repeat(64)}`, token), false)
+  assert.equal(isSessionAuthorized(`kovo_local=${token.slice(0, 63)}`, token), false)
   assert.equal(isSessionAuthorized(undefined, token), false)
   assert.equal(isBootstrapAuthorized(token, token), true)
   assert.equal(isBootstrapAuthorized('b'.repeat(64), token), false)
@@ -148,7 +148,7 @@ test('registrable domain is public-suffix aware and never collapses to a bare tw
 })
 
 test('Clerk discovery rejects an out-of-scope publishable-key host and falls back to the eTLD+1', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-clerk-scope-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-clerk-scope-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -207,7 +207,7 @@ test('Clerk discovery rejects an out-of-scope publishable-key host and falls bac
 })
 
 test('credential POSTs never follow redirects and are rejected before replay', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-login-redirect-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-login-redirect-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -249,7 +249,7 @@ test('credential POSTs never follow redirects and are rejected before replay', a
 })
 
 test('credential destinations are refused when out of scope or resolving to private/metadata addresses', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-login-ssrf-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-login-ssrf-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -308,7 +308,7 @@ test('credential destinations are refused when out of scope or resolving to priv
 })
 
 test('provider discovery does not follow redirects to attacker-controlled hosts', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-provider-redirect-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-provider-redirect-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -351,7 +351,7 @@ test('provider discovery does not follow redirects to attacker-controlled hosts'
 })
 
 test('form login blocks off-scope subresources and DNS-rebound origins before they load', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-form-egress-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-form-egress-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())

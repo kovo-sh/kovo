@@ -87,7 +87,7 @@ async function httpFixture(
   }
 }
 
-function makeTempStore(prefix = 'guardian-m2-') {
+function makeTempStore(prefix = 'kovo-m2-') {
   const dir = mkdtempSync(join(tmpdir(), prefix))
   const storage = new Store(dir)
   return {
@@ -161,7 +161,7 @@ function makeSignedJwt(header: Record<string, unknown>, payload: Record<string, 
 function createJqBackend(): WorkerBackend {
   return {
     async run(job, signal) {
-      const dir = mkdtempSync(join(tmpdir(), 'guardian-m2-jq-'))
+      const dir = mkdtempSync(join(tmpdir(), 'kovo-m2-jq-'))
       try {
         for (const f of job.files) {
           writeFileSync(join(dir, f.name.replace(/\//g, '_')), f.content, 'utf8')
@@ -269,7 +269,7 @@ test('M2.1 session jar isolation: regex BVA, LRU caps, origin/path/secure scopin
   const broker = new RequestBroker({ rejectUnauthorized: false })
   const sig = AbortSignal.timeout(15_000)
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const { projectId, runId, assignmentId } = setupApprovedRun(tmp.storage, fx1.origin)
 
     const { id: personaId } = createProjectPersona(tmp.storage, {
@@ -415,7 +415,7 @@ test('M2.2 csrfBind: extracts XSRF cookie, meta, hidden input, JSON token; rotat
   const grant = makeLabGrant(fx.origin, { isIdempotentPostAllowed: () => true })
   const sig = AbortSignal.timeout(15_000)
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     // Rotation on cookie XSRF-TOKEN -> binds X-XSRF-TOKEN with newest token
     await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/cookie-init', session: 'c-rot' }, grant, sig)
     await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/cookie-init', session: 'c-rot' }, grant, sig)
@@ -493,7 +493,7 @@ test('M2.3 authMutation: all 7 primitives mutate JWT on wire, mint canary when u
   const broker = new RequestBroker({ rejectUnauthorized: false, canaryBroker: canary })
   const sig = AbortSignal.timeout(15_000)
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const { projectId, runId, assignmentId } = setupApprovedRun(tmp.storage, fx.origin)
     const { id: pid } = createProjectPersona(tmp.storage, {
       requestId: randomUUID(),
@@ -546,7 +546,7 @@ test('M2.3 authMutation: all 7 primitives mutate JWT on wire, mint canary when u
         assert.equal(parts[2], createHmac('sha256', publicPem).update(`${parts[0]}.${parts[1]}`).digest('base64url'))
       }
       if (mut.kind === 'kid_inject') assert.equal(hdr.kid, 'key-override')
-      if (mut.kind === 'jku_x5u_canary') assert.match(String(hdr.jku), /\/c\/guardian-canary-[a-f0-9]{24}/)
+      if (mut.kind === 'jku_x5u_canary') assert.match(String(hdr.jku), /\/c\/kovo-canary-[a-f0-9]{24}/)
       if (mut.kind === 'claim_swap') assert.equal(pay.role, 'admin')
 
       assert.ok(!JSON.stringify(ex).includes(origJwt), `Original JWT leaked in exchange for ${mut.kind}`)
@@ -597,7 +597,7 @@ test('M2.4 Tier-2 sandboxWriteAllowlist: explicit [] blocks even in local-lab, w
   const broker = new RequestBroker({ rejectUnauthorized: false })
   const sig = AbortSignal.timeout(10_000)
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     await assert.rejects(
       broker.executeHttp({ origin: fx.origin, method: 'POST', pathAndQuery: '/api/search', body: '{}' }, makeLabGrant(fx.origin, { tier: 2, sandboxWriteAllowlist: [] }), sig),
       BrokerDenied,
@@ -650,7 +650,7 @@ test('M2.5 ?_gcb= enforcement and cache_differential (#13) confirms cached poiso
   const grant = makeLabGrant(fx.origin)
   const sig = AbortSignal.timeout(15_000)
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     await assert.rejects(broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/home', probeClass: 'cache_poison_deception' }, grant, sig), BrokerDenied)
     await assert.rejects(broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/home?_gcb=short', probeClass: 'cache_poison_deception' }, grant, sig), BrokerDenied)
 
@@ -737,7 +737,7 @@ test('M2.6 ScopedBrowser.runBrowserSession: persistent page/localStorage across 
   })
   const sig = AbortSignal.timeout(45_000)
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const res = await browser.runBrowserSession([
       { id: 'c1', role: 'control', origin: fx.origin, pathAndQuery: '/', action: 'fill', selector: '#inp', value: 'safe-ctrl' },
       { id: 'c2', role: 'control', origin: fx.origin, reusePage: true, action: 'click', selector: '#btn', builtinCheck: 'storage_keys' },
@@ -805,7 +805,7 @@ test('M2.7 & M2.8 universal encodings + expanded sqli_boolean + sql_time_diff (#
   assert.equal(probeParamLocations.length, 7)
   assert.equal(differentialProbeClasses.length, 14)
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     for (const loc of ['form', 'xml'] as const) {
       const rv = await verifyReplaySpec({
         spec: {
@@ -898,7 +898,7 @@ test('M2.9 & M2.10 new probe classes and auth_protocol_proof OOB jku_x5u_canary'
       return
     }
     if (u.pathname === '/xxe') {
-      const m = /https?:\/\/[^\s"'>]+guardian-canary-[a-f0-9]+[^\s"'>]*/i.exec(body)
+      const m = /https?:\/\/[^\s"'>]+kovo-canary-[a-f0-9]+[^\s"'>]*/i.exec(body)
       if (m) await fetch(m[0]).catch(() => {})
       res.setHeader('Content-Type', 'application/xml')
       res.end('<ok/>')
@@ -931,7 +931,7 @@ test('M2.9 & M2.10 new probe classes and auth_protocol_proof OOB jku_x5u_canary'
   const broker = new RequestBroker({ rejectUnauthorized: false, canaryBroker: canary })
   const sig = AbortSignal.timeout(20_000)
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const { projectId, runId } = setupApprovedRun(tmp.storage, fx.origin)
     const { id: pid } = createProjectPersona(tmp.storage, {
       requestId: randomUUID(), projectId, handle: 'jku_p', roleLabel: 'User',
@@ -1004,7 +1004,7 @@ test('M2.11 & M2.12 second-order canary ledger (cross-endpoint/persona vs same-e
   const grant = makeLabGrant(fx.origin)
   const sig = AbortSignal.timeout(30_000)
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const { runId, assignmentId } = setupApprovedRun(tmp.storage, fx.origin)
     const minted = canary.mintSecondOrderCanary({
       runId,

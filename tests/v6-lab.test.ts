@@ -10,7 +10,7 @@
  *   3. Native Docker-network proxy: a trusted proxy container on the per-run `--internal` network
  *      reached by the host over a Unix-socket handshake. Zero published ports, loopback-only host
  *      listener, no per-connection `docker exec`.
- *   4. Persisted container IDs with `dev.guardian.run` / `dev.guardian.lab` labels, label-based
+ *   4. Persisted container IDs with `dev.kovo.run` / `dev.kovo.lab` labels, label-based
  *      orphan reaping and idempotent `recover()` for crash/restart cleanup.
  *
  * No Docker daemon is required: every assertion here is a pure spec, filesystem check, or a local
@@ -386,8 +386,8 @@ test('v6 writable overlays: per-run named volume backing is named, labelled and 
     backing: 'volume',
     nonce: 'deadbeef',
   })
-  assert.equal(overlay.volumeName, 'guardian-lab-vol-abc12345run-db-deadbeef')
-  assert.deepEqual(overlay.mountArgs, ['--mount', 'type=volume,source=guardian-lab-vol-abc12345run-db-deadbeef,target=/var/lib/postgresql/data'])
+  assert.equal(overlay.volumeName, 'kovo-lab-vol-abc12345run-db-deadbeef')
+  assert.deepEqual(overlay.mountArgs, ['--mount', 'type=volume,source=kovo-lab-vol-abc12345run-db-deadbeef,target=/var/lib/postgresql/data'])
   assert.equal(
     overlay.tmpfsArgs.some(spec => spec.startsWith('/var/lib/postgresql/data:')),
     false,
@@ -395,7 +395,7 @@ test('v6 writable overlays: per-run named volume backing is named, labelled and 
   )
 
   // Per-run naming is deterministic only with an explicit nonce and never collides across runs.
-  assert.equal(labDataVolumeName('run-a', 'db', 'cafe0001'), 'guardian-lab-vol-runa-db-cafe0001')
+  assert.equal(labDataVolumeName('run-a', 'db', 'cafe0001'), 'kovo-lab-vol-runa-db-cafe0001')
   assert.notEqual(labDataVolumeName('run-a', 'db'), labDataVolumeName('run-b', 'db'))
 
   assert.throws(
@@ -426,8 +426,8 @@ test('v6 database detection and SQLite URL rewrite', () => {
 
 test('v6 run args: DB services drop --read-only and get writable tmpfs; app services stay read-only', () => {
   const base = {
-    containerName: 'guardian-lab-db-abc',
-    networkName: 'guardian-lab-run-abc',
+    containerName: 'kovo-lab-db-abc',
+    networkName: 'kovo-lab-run-abc',
     runId: 'run-1',
     serviceName: 'db',
     imageName: 'postgres:16',
@@ -465,12 +465,12 @@ test('v6 run args: DB services drop --read-only and get writable tmpfs; app serv
 
 test('v6 proxy: container joins the internal network with zero published ports and full hardening', () => {
   const args = buildLabProxyRunArgs({
-    containerName: 'guardian-lab-proxy-abc',
-    networkName: 'guardian-lab-run-abc',
+    containerName: 'kovo-lab-proxy-abc',
+    networkName: 'kovo-lab-run-abc',
     runId: 'run-1',
-    proxyDir: '/tmp/guardian-lab-proxy-run-abc123',
+    proxyDir: '/tmp/kovo-lab-proxy-run-abc123',
     user: '1000:1000',
-    targetHost: 'guardian-lab-app-abc',
+    targetHost: 'kovo-lab-app-abc',
     targetPort: 8080,
     socketMode: '600',
   })
@@ -478,7 +478,7 @@ test('v6 proxy: container joins the internal network with zero published ports a
   assert.equal(args.includes('--publish'), false)
   assert.equal(args.includes('--network-mode'), false)
   const networkIndex = args.indexOf('--network')
-  assert.equal(args[networkIndex + 1], 'guardian-lab-run-abc', 'proxy joins the per-run internal network')
+  assert.equal(args[networkIndex + 1], 'kovo-lab-run-abc', 'proxy joins the per-run internal network')
   assert.equal(args[args.indexOf('--user') + 1], '1000:1000')
   assert.deepEqual(args.filter((_, index) => args[index - 1] === '--cap-drop'), ['ALL'])
   assert.ok(args.join(' ').includes('no-new-privileges'))
@@ -486,8 +486,8 @@ test('v6 proxy: container joins the internal network with zero published ports a
   assert.ok(args.includes(`${LAB_LABELS.lab}=1`))
   assert.ok(args.includes(`${LAB_LABELS.run}=run-1`))
   assert.ok(args.includes(`${LAB_LABELS.role}=proxy`))
-  assert.ok(args.join(' ').includes('type=bind,source=/tmp/guardian-lab-proxy-run-abc123,target=/guardian-proxy'))
-  const hostEnvIndex = args.indexOf('GUARDIAN_PROXY_TARGET_HOST=guardian-lab-app-abc')
+  assert.ok(args.join(' ').includes('type=bind,source=/tmp/kovo-lab-proxy-run-abc123,target=/kovo-proxy'))
+  const hostEnvIndex = args.indexOf('KOVO_PROXY_TARGET_HOST=kovo-lab-app-abc')
   assert.ok(hostEnvIndex > 0, 'target host is passed as one argv entry')
   assert.equal(args[hostEnvIndex - 1], '-e', 'env is passed via -e VALUE, never string-concatenated')
 
@@ -502,7 +502,7 @@ test('v6 proxy: container joins the internal network with zero published ports a
 })
 
 test('v6 proxy: per-run network is --internal with inhibit_ipv4 and run labels', () => {
-  const args = buildLabNetworkCreateArgs('run-1', 'guardian-lab-run-abc')
+  const args = buildLabNetworkCreateArgs('run-1', 'kovo-lab-run-abc')
   assert.deepEqual(args.slice(0, 4), ['network', 'create', '--driver', 'bridge'])
   assert.ok(args.includes('--internal'))
   assert.ok(args.includes('com.docker.network.bridge.inhibit_ipv4=true'))
@@ -515,8 +515,8 @@ test('v6 proxy: host listener binds loopback only and relays over the Unix-socke
   const proxyDir = createLabProxyDir('run-proxy-test', resolveLabContainerUser())
   t.after(() => rmSync(proxyDir, { recursive: true, force: true }))
   assert.equal(statSync(proxyDir).mode & 0o777, 0o700, 'proxy handshake dir is owner-only')
-  writeLabProxyTarget(proxyDir, 'guardian-lab-app-abc', 8080)
-  assert.equal(readFileSync(join(proxyDir, 'target'), 'utf8'), 'guardian-lab-app-abc:8080\n')
+  writeLabProxyTarget(proxyDir, 'kovo-lab-app-abc', 8080)
+  assert.equal(readFileSync(join(proxyDir, 'target'), 'utf8'), 'kovo-lab-app-abc:8080\n')
 
   // Stand in for the proxy container: a Unix-socket echo server inside the handshake dir.
   const socketPath = join(proxyDir, 'proxy.sock')
@@ -548,7 +548,7 @@ interface FakeDockerState {
   containers: string[]
   networks: string[]
   volumes: string[]
-  /** Label scan results for `ps -aq --filter label=dev.guardian.lab=1`. */
+  /** Label scan results for `ps -aq --filter label=dev.kovo.lab=1`. */
   labContainers?: string[]
   labRunIds?: string[]
 }
@@ -591,7 +591,7 @@ function fakeDocker(state: FakeDockerState): { runner: DockerRunner; calls: stri
 }
 
 test('v6 recovery: persisted labels/ids drive orphan reaping and repeated recovery is idempotent', async t => {
-  const workspace = makeTempDir(t, 'guardian-v6-recover-')
+  const workspace = makeTempDir(t, 'kovo-v6-recover-')
   const stateDir = join(workspace, 'state')
   const repoDir = join(workspace, `${LAB_PATHS.repoPrefix}recover`)
   const proxyDir = join(workspace, `${LAB_PATHS.proxyPrefix}recover`)
@@ -602,11 +602,11 @@ test('v6 recovery: persisted labels/ids drive orphan reaping and repeated recove
   const record: LabRunRecord = {
     version: 1,
     runId,
-    networkName: 'guardian-lab-runrecover1-abcd',
-    containerNames: ['guardian-lab-app-aaaaaaaaaa'],
+    networkName: 'kovo-lab-runrecover1-abcd',
+    containerNames: ['kovo-lab-app-aaaaaaaaaa'],
     containerIds: ['aaaaaaaaaaa1'],
-    proxyContainerName: 'guardian-lab-proxy-abcd',
-    volumes: ['guardian-lab-vol-runrecover1-db-deadbeef'],
+    proxyContainerName: 'kovo-lab-proxy-abcd',
+    volumes: ['kovo-lab-vol-runrecover1-db-deadbeef'],
     sanitizedRepoDir: repoDir,
     telemetryDir,
     ownsTelemetryDir: true,
@@ -621,8 +621,8 @@ test('v6 recovery: persisted labels/ids drive orphan reaping and repeated recove
 
   const fake = fakeDocker({
     containers: ['bbbbbbbbbbb2'],
-    networks: ['guardian-lab-runrecover1-abcd'],
-    volumes: ['guardian-lab-vol-runrecover1-db-deadbeef'],
+    networks: ['kovo-lab-runrecover1-abcd'],
+    volumes: ['kovo-lab-vol-runrecover1-db-deadbeef'],
   })
   const runner = new LabRunner({ docker: fake.runner, stateDir })
 
@@ -648,11 +648,11 @@ test('v6 recovery: persisted labels/ids drive orphan reaping and repeated recove
 })
 
 test('v6 recovery: recoverAll finds crashed runs by the lab label even without a persisted record', async t => {
-  const workspace = makeTempDir(t, 'guardian-v6-recover-all-')
+  const workspace = makeTempDir(t, 'kovo-v6-recover-all-')
   const stateDir = join(workspace, 'state')
   const fake = fakeDocker({
     containers: ['ccccccccccc3'],
-    networks: ['guardian-lab-crashed-99'],
+    networks: ['kovo-lab-crashed-99'],
     volumes: [],
     labContainers: ['ccccccccccc3'],
     labRunIds: ['crashed-run-99'],
@@ -668,7 +668,7 @@ test('v6 recovery: recoverAll finds crashed runs by the lab label even without a
 })
 
 test('v6 recovery: temp-dir cleanup refuses symlinks and unexpected names', async t => {
-  const workspace = makeTempDir(t, 'guardian-v6-safe-rm-')
+  const workspace = makeTempDir(t, 'kovo-v6-safe-rm-')
   const okDir = join(workspace, `${LAB_PATHS.repoPrefix}ok`)
   mkdirSync(okDir)
   assert.equal(safeRemoveLabTempDir(okDir), true)
@@ -692,11 +692,11 @@ test('v6 recovery: temp-dir cleanup refuses symlinks and unexpected names', asyn
 })
 
 test('v6 recovery: state records are bounded, 0600 and reject unsafe run ids', async t => {
-  const stateDir = makeTempDir(t, 'guardian-v6-state-')
+  const stateDir = makeTempDir(t, 'kovo-v6-state-')
   const record: LabRunRecord = {
     version: 1,
     runId: 'run-state-1',
-    networkName: 'guardian-lab-runstate1-abcd',
+    networkName: 'kovo-lab-runstate1-abcd',
     containerNames: [],
     containerIds: [],
     volumes: [],
@@ -720,7 +720,7 @@ test('v6 recovery: state records are bounded, 0600 and reject unsafe run ids', a
 
 test('v6 lifecycle: SIGINT/SIGTERM reaper is exported and stopAll is safe with no active runs', async () => {
   const fake = fakeDocker({ containers: [], networks: [], volumes: [] })
-  const runner = new LabRunner({ docker: fake.runner, stateDir: mkdtempSync(join(tmpdir(), 'guardian-v6-stop-')) })
+  const runner = new LabRunner({ docker: fake.runner, stateDir: mkdtempSync(join(tmpdir(), 'kovo-v6-stop-')) })
   await runner.stopAll()
   assert.deepEqual(runner.listTargets(), [])
   assert.equal(typeof runner.reapSyncAll, 'function')
@@ -839,7 +839,7 @@ function fakeLabDocker(options: { proxyFails?: boolean } = {}): {
 }
 
 test('v6 store wiring: a launched container and the proxy are recorded, then deleted on normal stop', async t => {
-  const workspace = makeTempDir(t, 'guardian-v6-store-stop-')
+  const workspace = makeTempDir(t, 'kovo-v6-store-stop-')
   const repoDir = join(workspace, 'repo')
   mkdirSync(repoDir, { recursive: true })
   writeFileSync(join(repoDir, 'server.js'), "require('http').createServer((_q, r) => r.end('ok')).listen(8080)\n")
@@ -850,8 +850,8 @@ test('v6 store wiring: a launched container and the proxy are recorded, then del
   const runner = new LabRunner({ docker: fake.runner, stateDir })
   const runId = 'run-lifecycle-1'
 
-  const previous = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  const previous = process.env.KOVO_ALLOW_LOCAL_LAB
+  process.env.KOVO_ALLOW_LOCAL_LAB = '1'
   try {
     const handle = await runner.startLabTarget({
       runId,
@@ -881,13 +881,13 @@ test('v6 store wiring: a launched container and the proxy are recorded, then del
     assert.equal(fake.live.size, 0, 'normal stop removes every container')
     assert.equal(existsSync(handle.sanitizedRepoDir), false)
   } finally {
-    if (previous === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = previous
+    if (previous === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = previous
   }
 })
 
 test('v6 store wiring: an unexpected start failure marks the launched container orphaned', async t => {
-  const workspace = makeTempDir(t, 'guardian-v6-store-orphan-')
+  const workspace = makeTempDir(t, 'kovo-v6-store-orphan-')
   const repoDir = join(workspace, 'repo')
   mkdirSync(repoDir, { recursive: true })
   writeFileSync(join(repoDir, 'server.js'), "require('http').createServer((_q, r) => r.end('ok')).listen(8080)\n")
@@ -897,8 +897,8 @@ test('v6 store wiring: an unexpected start failure marks the launched container 
   const runner = new LabRunner({ docker: fake.runner, stateDir: join(workspace, 'state') })
   const runId = 'run-lifecycle-orphan'
 
-  const previous = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  const previous = process.env.KOVO_ALLOW_LOCAL_LAB
+  process.env.KOVO_ALLOW_LOCAL_LAB = '1'
   try {
     await assert.rejects(
       runner.startLabTarget({
@@ -923,60 +923,60 @@ test('v6 store wiring: an unexpected start failure marks the launched container 
     assert.equal(rows[0].status, 'orphaned', 'unexpected-exit containers are marked orphaned, not silently dropped')
     assert.equal(fake.live.size, 0, 'failure cleanup still removes the container process')
   } finally {
-    if (previous === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = previous
+    if (previous === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = previous
   }
 })
 
 test('v6 store wiring: reclaimPersisted removes a recovered orphan and clears its row (label-scoped)', async t => {
-  const workspace = makeTempDir(t, 'guardian-v6-reclaim-')
+  const workspace = makeTempDir(t, 'kovo-v6-reclaim-')
   const store = fakeLabStore()
-  store.recordLabContainer({ runId: 'run-crashed-7', containerName: 'guardian-lab-app-crashed', imageName: 'node:24', status: 'orphaned' })
+  store.recordLabContainer({ runId: 'run-crashed-7', containerName: 'kovo-lab-app-crashed', imageName: 'node:24', status: 'orphaned' })
   const fake = fakeLabDocker()
   // Simulate the orphan still running on the same run label.
-  fake.live.set('guardian-lab-app-crashed', 'c000000000007')
-  fake.labels.set('guardian-lab-app-crashed', 'run-crashed-7')
+  fake.live.set('kovo-lab-app-crashed', 'c000000000007')
+  fake.labels.set('kovo-lab-app-crashed', 'run-crashed-7')
   const runner = new LabRunner({ docker: fake.runner, stateDir: join(workspace, 'state') })
 
   const result = await runner.reclaimPersisted(
-    [{ runId: 'run-crashed-7', containerName: 'guardian-lab-app-crashed' }],
+    [{ runId: 'run-crashed-7', containerName: 'kovo-lab-app-crashed' }],
     store,
   )
   assert.equal(result.removed, 1)
   assert.equal(result.mismatched, 0)
-  assert.equal(fake.live.has('guardian-lab-app-crashed'), false)
+  assert.equal(fake.live.has('kovo-lab-app-crashed'), false)
   assert.equal(store.listLabContainers('run-crashed-7').length, 0, 'reclaimed row is deleted')
 
   // Label-scoped: a container whose label names a *different* run is never removed.
-  fake.live.set('guardian-lab-app-other', 'c000000000008')
-  fake.labels.set('guardian-lab-app-other', 'run-other')
+  fake.live.set('kovo-lab-app-other', 'c000000000008')
+  fake.labels.set('kovo-lab-app-other', 'run-other')
   const mismatched = await runner.reclaimPersisted(
-    [{ runId: 'run-crashed-7', containerName: 'guardian-lab-app-other' }],
+    [{ runId: 'run-crashed-7', containerName: 'kovo-lab-app-other' }],
     store,
   )
   assert.equal(mismatched.removed, 0)
   assert.equal(mismatched.mismatched, 1)
-  assert.equal(fake.live.has('guardian-lab-app-other'), true, 'cross-run containers are never removed')
+  assert.equal(fake.live.has('kovo-lab-app-other'), true, 'cross-run containers are never removed')
 
   // Idempotent: an already-gone container is skipped, not an error.
-  const again = await runner.reclaimPersisted([{ runId: 'run-crashed-7', containerName: 'guardian-lab-app-gone' }], store)
+  const again = await runner.reclaimPersisted([{ runId: 'run-crashed-7', containerName: 'kovo-lab-app-gone' }], store)
   assert.equal(again.removed, 0)
   assert.equal(again.skipped, 1)
   await fake.close()
 })
 
 test('v6 store wiring: recover(runId, storage) deletes rows alongside label-driven removal', async t => {
-  const workspace = makeTempDir(t, 'guardian-v6-recover-rows-')
+  const workspace = makeTempDir(t, 'kovo-v6-recover-rows-')
   const store = fakeLabStore()
-  store.recordLabContainer({ runId: 'run-recover-rows', containerName: 'guardian-lab-app-rows', imageName: 'node:24' })
+  store.recordLabContainer({ runId: 'run-recover-rows', containerName: 'kovo-lab-app-rows', imageName: 'node:24' })
   const fake = fakeLabDocker()
-  fake.live.set('guardian-lab-app-rows', 'c000000000009')
+  fake.live.set('kovo-lab-app-rows', 'c000000000009')
   const runner = new LabRunner({ docker: fake.runner, stateDir: join(workspace, 'state') })
   // The fake's `ps` returns no ids and there is no crash record, so the registry row itself names
   // the container that must be reclaimed.
   const result = await runner.recover('run-recover-rows', store)
   assert.equal(result.containersRemoved, 1, 'registry-named orphan is removed even without a crash record')
-  assert.equal(fake.live.has('guardian-lab-app-rows'), false)
+  assert.equal(fake.live.has('kovo-lab-app-rows'), false)
   assert.equal(store.listLabContainers('run-recover-rows').length, 0, 'recover clears the registry rows for the run')
   await fake.close()
 })
@@ -987,14 +987,14 @@ test('v6 store wiring: recover(runId, storage) deletes rows alongside label-driv
 
 test('v6 security invariants: non-root user parsing, read-only telemetry mount, DB overlay uid guard', () => {
   for (const bad of ['00:00', '0:1000', '1000:0', 'root:root', '1000', '1000:1000:0']) {
-    assert.throws(() => resolveLabContainerUser({ GUARDIAN_LAB_USER: bad }), /non-root|numeric|rejected/i)
+    assert.throws(() => resolveLabContainerUser({ KOVO_LAB_USER: bad }), /non-root|numeric|rejected/i)
   }
-  assert.equal(resolveLabContainerUser({ GUARDIAN_LAB_USER: '1000:1000' }), '1000:1000')
+  assert.equal(resolveLabContainerUser({ KOVO_LAB_USER: '1000:1000' }), '1000:1000')
   const fallback = resolveLabContainerUser({})
   assert.notEqual(fallback.split(':')[0], '0')
 
   assert.deepEqual(buildIastTelemetryMountArgs('/host/telemetry', false), [
-    '--mount', 'type=bind,source=/host/telemetry,target=/var/run/guardian-iast,readonly',
+    '--mount', 'type=bind,source=/host/telemetry,target=/var/run/kovo-iast,readonly',
   ])
   assert.equal(buildIastTelemetryMountArgs('/host/telemetry', true).some(arg => arg.endsWith(',readonly')), false)
 

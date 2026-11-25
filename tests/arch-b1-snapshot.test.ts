@@ -64,7 +64,7 @@ function createSyntheticWorkspace(t: { after: (fn: () => void) => void }): {
   reposDir: string
   outsideDir: string
 } {
-  const root = makeTempDir(t, 'guardian-b1-snap-')
+  const root = makeTempDir(t, 'kovo-b1-snap-')
   const reposDir = join(root, 'repos')
   const outsideDir = join(root, 'outside')
   const repoRoot = join(reposDir, 'acme', 'shop')

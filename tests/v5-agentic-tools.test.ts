@@ -34,7 +34,7 @@ import { describeProofTools } from '../src/server/proof-tools.ts'
 
 const origin = 'https://app.example.invalid'
 
-function tempDir(t: { after: (fn: () => void) => void }, prefix = 'guardian-v5-agentic-tools-'): string {
+function tempDir(t: { after: (fn: () => void) => void }, prefix = 'kovo-v5-agentic-tools-'): string {
   const dir = mkdtempSync(join(tmpdir(), prefix))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   return dir

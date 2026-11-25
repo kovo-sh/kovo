@@ -364,7 +364,7 @@ function writeArgs(): PersistedMutationArgs {
     vulnClass: 'cross_tenant_write',
     actor: WRITE_PROBE,
     body: { status: 'pending', external_id: 'ship-1' },
-    baselineWrite: { body: { status: 'guardian-baseline', external_id: 'ship-1' }, actor: WRITE_OWNER, method: 'PATCH' },
+    baselineWrite: { body: { status: 'kovo-baseline', external_id: 'ship-1' }, actor: WRITE_OWNER, method: 'PATCH' },
     baselineMethod: 'GET',
     baselinePathAndQuery: '/api/v1/shipments',
     readbackMethod: 'GET',
@@ -374,7 +374,7 @@ function writeArgs(): PersistedMutationArgs {
 }
 
 test('persisted_mutation confirms an authz write through a fresh baseline write and post-GET delta', async () => {
-  let state = 'guardian-baseline'
+  let state = 'kovo-baseline'
   const execution = await runFloorRecipe(floorRecipe('persisted_mutation', writeArgs()), {
     request: req => {
       if (req.method === 'GET') {
@@ -651,7 +651,7 @@ test('the no-fallback assertion refuses the legacy DSL for every wired authz pai
     assert.throws(
       () => assertNotRecipeWiredLegacyCall({ kind: 'http_chain', category: vulnClass }),
       (error: unknown) => error instanceof RecipeWiredLegacyCallError &&
-        error.code === 'GUARDIAN_RECIPE_WIRED_LEGACY_CALL',
+        error.code === 'KOVO_RECIPE_WIRED_LEGACY_CALL',
       `${vulnClass} must not reach verifyReplaySpec`,
     )
   }

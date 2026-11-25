@@ -14,7 +14,7 @@
  *   4. Unified `proof-receipt.ts` re-exports (`verifyReceipt`, `singleReceiptToComposite`,
  *      `verifyCompositeReceipt`, `verifyReceiptUnified`) with 1-hop backward compatibility.
  *   5. Unified `oracle-invariants.ts` re-exports of `evaluateV8OracleFamily` across all 6 families.
- *   6. TypeScript (`guardian_verify.ts`) SDK helpers
+ *   6. TypeScript (`kovo_verify.ts`) SDK helpers
  *      (`seal_capability`, `hmac_sign`, `jwt_sign`, `await_async`, `prove_composite`,
  *      `http_send`/`request` with `capability=`) end-to-end against a live `VerifyRpcServer`.
  */
@@ -57,11 +57,11 @@ import {
   VerifyRpcServer,
 } from '../src/server/verify-rpc.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const execFileAsync = promisify(execFile)
 const REPO_ROOT = resolve(new URL('..', import.meta.url).pathname)
-const SDK_DIR = join(REPO_ROOT, 'worker', 'guardian_verify')
+const SDK_DIR = join(REPO_ROOT, 'worker', 'kovo_verify')
 
 const RAW_SIGNING_SALT = 's_v8_wire_l1_hmac_salt_9f8e7d6c5b4a'
 
@@ -745,7 +745,7 @@ test('oracle-invariants.ts re-exports evaluateV8OracleFamily for all 6 v8 famili
   assert.equal(d6.satisfied, true)
 })
 
-test('worker/guardian_verify TS SDK helpers work end-to-end against VerifyRpcServer', async (t) => {
+test('worker/kovo_verify TS SDK helpers work end-to-end against VerifyRpcServer', async (t) => {
   const fixture = await startMultiHopFixture()
   t.after(() => fixture.close())
 
@@ -763,7 +763,7 @@ test('worker/guardian_verify TS SDK helpers work end-to-end against VerifyRpcSer
   await rpcServer.start()
   t.after(() => rpcServer.close())
 
-  const workDir = mkdtempSync(join(tmpdir(), 'guardian-v8-sdk-test-'))
+  const workDir = mkdtempSync(join(tmpdir(), 'kovo-v8-sdk-test-'))
   t.after(() => rmSync(workDir, { recursive: true, force: true }))
 
   const env = {
@@ -778,7 +778,7 @@ test('worker/guardian_verify TS SDK helpers work end-to-end against VerifyRpcSer
   const tsScriptPath = join(workDir, 'verify_ts.ts')
   writeFileSync(tsScriptPath, `
 import assert from 'node:assert/strict'
-import { VerifyContext } from ${JSON.stringify(join(SDK_DIR, 'guardian_verify.ts'))}
+import { VerifyContext } from ${JSON.stringify(join(SDK_DIR, 'kovo_verify.ts'))}
 
 const ctx = new VerifyContext()
 const h1 = await ctx.http_send('/api/debug/runtime-meta', { as: 'member_b', role: 'probe' })

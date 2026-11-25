@@ -4,19 +4,19 @@
  * Held-out autopsy (seed 1000042, K=6): 23 targets had a real agent request on the target
  * route+method, but only 4 produced a persisted replay spec and 19 were `no_spec_submitted`.
  * These tests pin the enforcement that turns "route hit → silent skip" into
- * "route hit → one reserved guardian_verify attempt, or a machine-readable proof gap":
+ * "route hit → one reserved kovo_verify attempt, or a machine-readable proof gap":
  *
  *   1. complete_intent(proved|partial) is rejected without a spec or a coded proofGapReason;
  *   2. a coded record_coverage proof gap is accepted and recorded (`open_proof_gap` in the funnel);
  *   3. a submitted spec needs no extra prompt;
- *   4. settlement reserves the wrap-up turn for guardian_verify and still revokes probe tools;
+ *   4. settlement reserves the wrap-up turn for kovo_verify and still revokes probe tools;
  *   5. the funnel classifier distinguishes `open_proof_gap` from `no_spec_submitted`.
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import {
-  GUARDIAN_VERIFY_SPEC_SHAPE,
+  KOVO_VERIFY_SPEC_SHAPE,
   SPEC_PROOF_GAP_CODES,
   SpecSubmissionTracker,
   buildWorkerTools,
@@ -62,7 +62,7 @@ function fixture() {
   const coverage: Array<Record<string, unknown>> = []
   const tools = buildWorkerTools({
     request_http: async () => ({ exchangeId: 'ex-1', status: 200 }),
-    guardian_verify: async () => ({ oraclePassed: true, attempts: [] }),
+    kovo_verify: async () => ({ oraclePassed: true, attempts: [] }),
     record_coverage: async args => {
       coverage.push(args as unknown as Record<string, unknown>)
       return { id: 'cov-1', status: args.status }
@@ -106,8 +106,8 @@ test('complete_intent(proved) without a spec or coded proof gap is rejected, cou
   assert.match(text, /agent\.spec_submission_required/)
   assert.match(text, /missing required field `proofGapReason`/, 'the exact missing field is named')
   assert.ok(text.includes('POST /v1/baskets/current/coupons param=code'), 'the repair names the probed route+method+param')
-  assert.match(text, /guardian_verify\(script=/, 'the repair guides inline guardian_verify when active')
-  assert.doesNotMatch(text, /\bverify_replay_spec\b|DeclarativeReplaySpec/, 'active guardian_verify repair scrubs legacy replay-spec mentions')
+  assert.match(text, /kovo_verify\(script=/, 'the repair guides inline kovo_verify when active')
+  assert.doesNotMatch(text, /\bverify_replay_spec\b|DeclarativeReplaySpec/, 'active kovo_verify repair scrubs legacy replay-spec mentions')
   assert.equal(completions.length, 0, 'the complete_intent handler is never called for a rejected conclusion')
   assert.equal(tracker.snapshot().required, 1, 'the rejection is counted on the assignment ledger')
   assert.equal(requiredCalls.length, 1)
@@ -197,11 +197,11 @@ test('every declared proof-gap code parses and shares the record_coverage error 
 // 3. A submitted spec needs no extra prompt
 // ============================================================================
 
-test('a successful guardian_verify attempt clears the obligation and complete_intent proceeds', async () => {
+test('a successful kovo_verify attempt clears the obligation and complete_intent proceeds', async () => {
   const { tracker, completions, tools } = fixture()
   await probeRoute(tools)
 
-  const verify = await invoke(toolByName(tools, 'guardian_verify')!, {
+  const verify = await invoke(toolByName(tools, 'kovo_verify')!, {
     script: 'return ctx.result({ title: "coupon reuse", claims: [] })',
     runtime: 'ts',
   })
@@ -286,13 +286,13 @@ test('replaySpecRouteSteps extracts requests from mixed spec shapes', () => {
 test('the settlement directive names route+method+param and the smallest valid spec', () => {
   const directive = settlementSpecDirective(ROUTE)
   assert.match(directive, /POST \/v1\/baskets\/current\/coupons param=code/)
-  assert.ok(directive.includes(GUARDIAN_VERIFY_SPEC_SHAPE), 'the smallest valid spec shape is included')
+  assert.ok(directive.includes(KOVO_VERIFY_SPEC_SHAPE), 'the smallest valid spec shape is included')
   assert.match(directive, /reserved/i)
   assert.match(directive, /record_coverage\(status="needs_follow_up"/)
   for (const code of SPEC_PROOF_GAP_CODES) assert.ok(directive.includes(code), `directive lists ${code}`)
 
-  const banner = settlementBannerMessage({ turnsUsed: 10, maxTurns: 12, proofTools: ['guardian_verify'], specDirective: directive })
-  const nudge = settlementNudgeMessage({ turn: 10, maxTurns: 12, proofTools: ['guardian_verify'], specDirective: directive })
+  const banner = settlementBannerMessage({ turnsUsed: 10, maxTurns: 12, proofTools: ['kovo_verify'], specDirective: directive })
+  const nudge = settlementNudgeMessage({ turn: 10, maxTurns: 12, proofTools: ['kovo_verify'], specDirective: directive })
   assert.ok(banner.includes('POST /v1/baskets/current/coupons param=code'))
   assert.ok(nudge.includes('POST /v1/baskets/current/coupons param=code'))
 })
@@ -306,7 +306,7 @@ test('settlement pauses offline analysis while a probed route still owes a spec'
   assert.match(analysis!, /paused during settlement/)
   assert.match(analysis!, /POST \/v1\/baskets\/current\/coupons/)
 
-  assert.equal(settlementToolBlock({ name: 'guardian_verify', ...base }), undefined, 'guardian_verify is never paused')
+  assert.equal(settlementToolBlock({ name: 'kovo_verify', ...base }), undefined, 'kovo_verify is never paused')
   assert.equal(settlementToolBlock({ name: 'record_coverage', ...base }), undefined, 'a coded gap can still be recorded')
   assert.equal(settlementToolBlock({ name: 'complete_intent', ...base }), undefined, 'complete_intent stays reachable (it enforces)')
 
@@ -319,9 +319,9 @@ test('settlement pauses offline analysis while a probed route still owes a spec'
   assert.equal(settlementToolBlock({ name: 'derive_evidence', ...base, specPending: false }), undefined)
 })
 
-test('the final turn does not re-enable guardian_verify or probe tools', () => {
+test('the final turn does not re-enable kovo_verify or probe tools', () => {
   const directive = settlementSpecDirective(ROUTE)
-  for (const name of ['request_http', 'guardian_verify', 'verify_replay_spec']) {
+  for (const name of ['request_http', 'kovo_verify', 'verify_replay_spec']) {
     const block = settlementToolBlock({
       name, settling: true, turnsUsed: 12, maxTurns: 12, specPending: true, specDirective: directive,
     })
@@ -354,7 +354,7 @@ test('the tracker names the most-probed route as the settlement target', () => {
 test('the settlement directive is pure, redacts values and keeps parameter names only', () => {
   const withValue = renderSettlementSpecDirective(
     { method: 'post', path: '/v1/baskets/current/coupons?code=SECRET-CANARY#frag', params: ['code=coupon-123', 'code'], origin: `${ORIGIN}/path?x=1` },
-    GUARDIAN_VERIFY_SPEC_SHAPE,
+    KOVO_VERIFY_SPEC_SHAPE,
     SPEC_PROOF_GAP_CODES,
   )
   assert.match(withValue, /POST \/v1\/baskets\/current\/coupons param=code/)
@@ -363,7 +363,7 @@ test('the settlement directive is pure, redacts values and keeps parameter names
   assert.doesNotMatch(withValue, /\/path\?x=1/)
   assert.equal(withValue, renderSettlementSpecDirective(
     { method: 'post', path: '/v1/baskets/current/coupons?code=SECRET-CANARY#frag', params: ['code=coupon-123', 'code'], origin: `${ORIGIN}/path?x=1` },
-    GUARDIAN_VERIFY_SPEC_SHAPE,
+    KOVO_VERIFY_SPEC_SHAPE,
     SPEC_PROOF_GAP_CODES,
   ))
 })

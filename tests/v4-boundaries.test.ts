@@ -1,5 +1,5 @@
 /**
- * Guardian v4 Zero-Trust Boundary Suite (SPEC-v4 §2 invariants, §7 threat model, §8 release gates).
+ * Kovo Hunter v4 Zero-Trust Boundary Suite (SPEC-v4 §2 invariants, §7 threat model, §8 release gates).
  *
  * Covers all 8 mandatory v4 zero-trust boundary controls:
  *   V4-B1: session-jar isolation, BVA, control/probe separation, scope revocation purge, zero leak
@@ -181,7 +181,7 @@ interface V4TranspilerModule {
 
 async function loadV4Module<T>(relPathFromRepoRoot: string, description: string): Promise<T> {
   const abs = join(repoRootDir, relPathFromRepoRoot)
-  assert.ok(existsSync(abs), `Required Guardian v4 module missing (${description}): ${abs}`)
+  assert.ok(existsSync(abs), `Required Kovo Hunter v4 module missing (${description}): ${abs}`)
   return (await import(pathToFileURL(abs).href)) as T
 }
 
@@ -290,7 +290,7 @@ function setupProjectAndRun(dir: string, env: 'public' | 'local-lab', origin: st
 // ============================================================================
 
 test('V4-B1 session-jar isolation: regex BVA, origin/jar cookie scoping, control vs probe isolation, scope revocation purge, and zero raw cookie leaks', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v4-b1-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v4-b1-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
 
   const secretCookie = 'SECRET_JAR_COOKIE_123_NEVER_LEAK'
@@ -358,7 +358,7 @@ test('V4-B1 session-jar isolation: regex BVA, origin/jar cookie scoping, control
   })
   t.after(() => server2.close())
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const { storage, projectId, runId, assignmentId } = setupProjectAndRun(dir, 'local-lab', server1.origin, 2)
     t.after(() => storage.close())
 
@@ -678,7 +678,7 @@ test('V4-B1 session-jar isolation: regex BVA, origin/jar cookie scoping, control
 // ============================================================================
 
 test('V4-B2 authMutation redaction: all 7 kinds mutate on the wire, reject missing persona/tier<2, and leak 0 original or mutated JWT bytes', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v4-b2-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v4-b2-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
 
   const { publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
@@ -718,7 +718,7 @@ test('V4-B2 authMutation redaction: all 7 kinds mutate on the wire, reject missi
     'persona-original-hmac-secret',
   )
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const { storage, projectId, runId, assignmentId } = setupProjectAndRun(dir, 'local-lab', server.origin, 2)
     t.after(() => storage.close())
 
@@ -821,7 +821,7 @@ test('V4-B2 authMutation redaction: all 7 kinds mutate on the wire, reject missi
         assert.ok(
           typeof decodedHeader.jku === 'string' &&
             decodedHeader.jku.startsWith(canaryInfo.effectiveBaseUrl!) &&
-            /\/c\/guardian-canary-[a-f0-9]{24}/.test(decodedHeader.jku),
+            /\/c\/kovo-canary-[a-f0-9]{24}/.test(decodedHeader.jku),
           'jku header must start with CanaryBroker effectiveBaseUrl and carry a minted canary token',
         )
       }
@@ -829,7 +829,7 @@ test('V4-B2 authMutation redaction: all 7 kinds mutate on the wire, reject missi
         assert.ok(
           typeof decodedHeader.x5u === 'string' &&
             decodedHeader.x5u.startsWith(canaryInfo.effectiveBaseUrl!) &&
-            /\/c\/guardian-canary-[a-f0-9]{24}/.test(decodedHeader.x5u),
+            /\/c\/kovo-canary-[a-f0-9]{24}/.test(decodedHeader.x5u),
           'x5u header must start with CanaryBroker effectiveBaseUrl and carry a minted canary token',
         )
       }
@@ -941,7 +941,7 @@ test('V4-B3 cache-buster ?_gcb= enforcement: probeDifferential auto-appends _gcb
   })
   t.after(() => cacheServer.close())
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const grant = makeLabGrant(cacheServer.origin, { tier: 2 })
     const sig = AbortSignal.timeout(30_000)
@@ -1085,8 +1085,8 @@ test('V4-B3 cache-buster ?_gcb= enforcement: probeDifferential auto-appends _gcb
         recheckInstructions: 'Re-run cache_differential check.',
         controlPath: '/landing?_gcb={{control_gcb}}',
         probePath: '/landing?_gcb={{probe_gcb}}',
-        poisonHeaders: { 'X-Forwarded-Host': 'poison.guardian.invalid' },
-        assertionsJq: '{ controlPassed: (.control.status == 200 and (.control.body | contains("clean-origin"))), confirmed: (.verify.status == 200 and (.verify.headers["x-cache"] == "HIT") and (.verify.body | contains("poison.guardian.invalid"))), observed: .verify.bodyPreview, expected: "clean-origin without X-Cache HIT" }',
+        poisonHeaders: { 'X-Forwarded-Host': 'poison.kovo.invalid' },
+        assertionsJq: '{ controlPassed: (.control.status == 200 and (.control.body | contains("clean-origin"))), confirmed: (.verify.status == 200 and (.verify.headers["x-cache"] == "HIT") and (.verify.body | contains("poison.kovo.invalid"))), observed: .verify.bodyPreview, expected: "clean-origin without X-Cache HIT" }',
       } as unknown,
       broker,
       backend: new LinuxWorkerBackend(),
@@ -1102,7 +1102,7 @@ test('V4-B3 cache-buster ?_gcb= enforcement: probeDifferential auto-appends _gcb
 // ============================================================================
 
 test('V4-B4 Tier-2 sandboxWriteAllowlist: public defaults to [], allowlist permits safe JSON/form/GraphQL/Next-Action POST, still blocks DELETE/multipart/non-allowlist/destructive', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v4-b4-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v4-b4-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
 
   const receivedPosts: Array<{ path: string; contentType: string; nextAction: string | undefined; body: string }> = []
@@ -1138,7 +1138,7 @@ test('V4-B4 Tier-2 sandboxWriteAllowlist: public defaults to [], allowlist permi
   assert.deepEqual(JSON.parse(allowCol.sandbox_write_allowlist ?? 'null'), [], 'public project must default sandboxWriteAllowlist to []')
 
   // 2. RequestBroker Tier-2 allowlist behavior
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const sig = AbortSignal.timeout(30_000)
 
@@ -1366,7 +1366,7 @@ test('V4-B4 Tier-2 sandboxWriteAllowlist: public defaults to [], allowlist permi
 // ============================================================================
 
 test('V4-B5 LabRunner multi-service --internal isolation: rejects unsafe compose directives, enforces local-lab+env, verifies inhibit_ipv4/CapDrop/inter-service/seed/zero orphans', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'guardian-v4-b5-'))
+  const root = mkdtempSync(join(tmpdir(), 'kovo-v4-b5-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))
 
   const repoDir = join(root, 'multi-lab')
@@ -1423,7 +1423,7 @@ test('V4-B5 LabRunner multi-service --internal isolation: rejects unsafe compose
     { label: 'host_bind_mount', yaml: 'services:\n  app:\n    image: node:24-bookworm-slim\n    volumes:\n      - /etc:/host-etc\n' },
   ]
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     for (const bad of unsafeComposeScenarios) {
       const badRunId = randomUUID()
       const badCompose = `docker-compose.${bad.label}.yml`
@@ -1444,16 +1444,16 @@ test('V4-B5 LabRunner multi-service --internal isolation: rejects unsafe compose
         /privileged|network_mode|cap_add|ports|volume|bind|forbidden|unsafe/i,
         `Unsafe compose directive "${bad.label}" must be rejected`,
       )
-      const created = (await exec('docker', ['ps', '-aq', '--filter', `label=dev.guardian.run=${badRunId}`])).stdout.trim()
+      const created = (await exec('docker', ['ps', '-aq', '--filter', `label=dev.kovo.run=${badRunId}`])).stdout.trim()
       assert.equal(created, '', `Rejected compose (${bad.label}) must spawn 0 containers`)
     }
   })
 
-  // 2. Enforce environment === 'local-lab' AND GUARDIAN_ALLOW_LOCAL_LAB=1 (including direct startLabTarget({ environment: 'public' }))
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: undefined }, () => {
-    assert.throws(() => assertLocalLabAllowed('local-lab'), /GUARDIAN_ALLOW_LOCAL_LAB/)
+  // 2. Enforce environment === 'local-lab' AND KOVO_ALLOW_LOCAL_LAB=1 (including direct startLabTarget({ environment: 'public' }))
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: undefined }, () => {
+    assert.throws(() => assertLocalLabAllowed('local-lab'), /KOVO_ALLOW_LOCAL_LAB/)
   })
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     assert.throws(() => assertLocalLabAllowed('public'), /forbidden/)
     await assert.rejects(
       runner.startLabTarget({
@@ -1464,13 +1464,13 @@ test('V4-B5 LabRunner multi-service --internal isolation: rejects unsafe compose
         signal: AbortSignal.timeout(30_000),
       }),
       /forbidden|public|local-lab/i,
-      'startLabTarget must reject environment: public directly even with GUARDIAN_ALLOW_LOCAL_LAB=1',
+      'startLabTarget must reject environment: public directly even with KOVO_ALLOW_LOCAL_LAB=1',
     )
   })
 
   // 3. Valid multi-service launch with seedCommand + host 0.0.0.0 bridge gateway check
   const runId = randomUUID()
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const handle = (await runner.startLabTarget({
       runId,
       environment: 'local-lab',
@@ -1500,7 +1500,7 @@ test('V4-B5 LabRunner multi-service --internal isolation: rejects unsafe compose
     )
 
     // Verify all containers on this run have CapDrop: ALL, no-new-privileges, zero PortBindings
-    const containerIds = (await exec('docker', ['ps', '-q', '--filter', `label=dev.guardian.run=${runId}`]))
+    const containerIds = (await exec('docker', ['ps', '-q', '--filter', `label=dev.kovo.run=${runId}`]))
       .stdout.trim().split(/\s+/).filter(Boolean)
     assert.ok(containerIds.length >= 2, `Expected >=2 containers (app + sidecar) for multi-service stack, got ${containerIds.length}`)
 
@@ -1576,7 +1576,7 @@ test('V4-B5 LabRunner multi-service --internal isolation: rejects unsafe compose
 
     // Verify 0 orphan containers & networks after stopAll()
     await runner.stopAll()
-    const leftContainers = (await exec('docker', ['ps', '-aq', '--filter', `label=dev.guardian.run=${runId}`])).stdout.trim()
+    const leftContainers = (await exec('docker', ['ps', '-aq', '--filter', `label=dev.kovo.run=${runId}`])).stdout.trim()
     const leftNetworks = (await exec('docker', ['network', 'ls', '-q', '--filter', `name=${handle.networkName}`])).stdout.trim()
     assert.equal(leftContainers, '', 'stopAll() must leave 0 orphan lab containers')
     assert.equal(leftNetworks, '', 'stopAll() must leave 0 orphan lab networks')
@@ -1599,7 +1599,7 @@ test('V4-B5 LabRunner multi-service --internal isolation: rejects unsafe compose
 
     const composeNetInspect = JSON.parse((await exec('docker', ['network', 'inspect', composeHandle.networkName])).stdout)[0]
     assert.equal(composeNetInspect.Internal, true, 'dockerComposeFile lab network must be --internal')
-    const composeCids = (await exec('docker', ['ps', '-q', '--filter', `label=dev.guardian.run=${composeRunId}`]))
+    const composeCids = (await exec('docker', ['ps', '-q', '--filter', `label=dev.kovo.run=${composeRunId}`]))
       .stdout.trim().split(/\s+/).filter(Boolean)
     assert.ok(composeCids.length >= 2, `Expected >=2 containers for dockerComposeFile stack, got ${composeCids.length}`)
     const composeSidecarBody = await (await fetch(`${composeHandle.origin}/sidecar`)).text()
@@ -1610,7 +1610,7 @@ test('V4-B5 LabRunner multi-service --internal isolation: rejects unsafe compose
       'dockerComposeFile seedCommand must populate seededPersonas',
     )
     await runner.stopLabTarget(composeRunId)
-    const composeLeft = (await exec('docker', ['ps', '-aq', '--filter', `label=dev.guardian.run=${composeRunId}`])).stdout.trim()
+    const composeLeft = (await exec('docker', ['ps', '-aq', '--filter', `label=dev.kovo.run=${composeRunId}`])).stdout.trim()
     const composeNetLeft = (await exec('docker', ['network', 'ls', '-q', '--filter', `name=${composeHandle.networkName}`])).stdout.trim()
     assert.equal(composeLeft, '', 'stopLabTarget(composeRunId) must leave 0 orphan containers')
     assert.equal(composeNetLeft, '', 'stopLabTarget(composeRunId) must leave 0 orphan networks')
@@ -1622,7 +1622,7 @@ test('V4-B5 LabRunner multi-service --internal isolation: rejects unsafe compose
 // ============================================================================
 
 test('V4-B6 IAST telemetry: rejects public projects, masks secrets & caps at 64 KiB, and ReplayVerifier never reads /evidence/lab-telemetry/', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v4-b6-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v4-b6-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
 
   const benignServer = await startLoopbackServer((_req, res) => {
@@ -1653,7 +1653,7 @@ test('V4-B6 IAST telemetry: rejects public projects, masks secrets & caps at 64 
   )
 
   // 2. local-lab IAST secret scrubbing + 64 KiB cap + ReplayVerifier isolation
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const labDir = join(dir, 'lab-iast')
     mkdirSync(labDir)
     const { storage, projectId, runId, assignmentId } = setupProjectAndRun(labDir, 'local-lab', benignServer.origin, 2)
@@ -1728,10 +1728,10 @@ test('V4-B6 IAST telemetry: rejects public projects, masks secrets & caps at 64 
     assert.ok(iastRows.length >= 1, 'lab_telemetry table must persist sanitized telemetry metadata')
     assert.ok(!dbText.includes(personaSecret) && !dbText.includes(RAW_AWS) && !dbText.includes(RAW_STRIPE))
 
-    // 2b. RequestBroker X-Guardian-Trace-Id gating (local-lab sends header; public strips/omits it) & LabRunner iastEnabled wiring
+    // 2b. RequestBroker X-Kovo-Trace-Id gating (local-lab sends header; public strips/omits it) & LabRunner iastEnabled wiring
     const seenTraceHeaders: Array<string | undefined> = []
     const traceServer = await startLoopbackServer((req, res) => {
-      const h = req.headers['x-guardian-trace-id']
+      const h = req.headers['x-kovo-trace-id']
       seenTraceHeaders.push(typeof h === 'string' ? h : undefined)
       res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ok: true }))
     })
@@ -1745,13 +1745,13 @@ test('V4-B6 IAST telemetry: rejects public projects, masks secrets & caps at 64 
       pathAndQuery: '/trace-check',
       traceId: traceProbeId,
     }), makeLabGrant(traceServer.origin, { tier: 2, allowLocalLab: true }), AbortSignal.timeout(15_000))
-    assert.equal(seenTraceHeaders.at(-1), traceProbeId, 'RequestBroker must inject X-Guardian-Trace-Id on local-lab requests')
+    assert.equal(seenTraceHeaders.at(-1), traceProbeId, 'RequestBroker must inject X-Kovo-Trace-Id on local-lab requests')
 
     let publicSawTraceHeader: string | undefined
     const publicTraceBroker = new RequestBroker({
       resolve: async () => [{ address: '93.184.216.34', family: 4 }],
       transport: async (_url, _addr, _sig, opts) => {
-        publicSawTraceHeader = opts?.headers?.['x-guardian-trace-id'] ?? opts?.headers?.['X-Guardian-Trace-Id']
+        publicSawTraceHeader = opts?.headers?.['x-kovo-trace-id'] ?? opts?.headers?.['X-Kovo-Trace-Id']
         return { status: 200, headers: { 'content-type': 'application/json' }, body: '{"ok":true}' }
       },
     })
@@ -1765,7 +1765,7 @@ test('V4-B6 IAST telemetry: rejects public projects, masks secrets & caps at 64 
       allowLocalLab: false,
       canRead: o => o === 'https://public-trace.example.invalid',
     }), AbortSignal.timeout(15_000))
-    assert.equal(publicSawTraceHeader, undefined, 'RequestBroker must omit/strip X-Guardian-Trace-Id on public (allowLocalLab: false) requests')
+    assert.equal(publicSawTraceHeader, undefined, 'RequestBroker must omit/strip X-Kovo-Trace-Id on public (allowLocalLab: false) requests')
 
     const iastRepoDir = join(dir, 'iast-lab-repo')
     mkdirSync(iastRepoDir, { recursive: true })
@@ -1773,7 +1773,7 @@ test('V4-B6 IAST telemetry: rejects public projects, masks secrets & caps at 64 
       "const http = require('http')",
       "http.createServer((req, res) => {",
       "  if (req.url === '/health') return res.end('ok')",
-      "  res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ trace: req.headers['x-guardian-trace-id'] ?? null }))",
+      "  res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ trace: req.headers['x-kovo-trace-id'] ?? null }))",
       "}).listen(8080, '0.0.0.0')",
       '',
     ].join('\n'))
@@ -1803,7 +1803,7 @@ test('V4-B6 IAST telemetry: rejects public projects, masks secrets & caps at 64 
       traceId: `iast-live-${randomUUID()}`,
     }), makeLabGrant(iastHandle.origin, { tier: 2, allowLocalLab: true }), AbortSignal.timeout(15_000))
     assert.equal(iastEx.status, 200)
-    assert.match(iastEx.body, /iast-live-/, 'Live local-lab target must receive X-Guardian-Trace-Id from RequestBroker')
+    assert.match(iastEx.body, /iast-live-/, 'Live local-lab target must receive X-Kovo-Trace-Id from RequestBroker')
     await iastRunner.stopAll()
 
     // 3. Forged /evidence/lab-telemetry/ + forged SQLite lab_telemetry row must NEVER cause ReplayVerifier to confirm
@@ -1891,7 +1891,7 @@ test('V4-B6 IAST telemetry: rejects public projects, masks secrets & caps at 64 
 // ============================================================================
 
 test('V4-B7 Nuclei transpiler Zod rejection: blocks non-HTTP, 3rd-party OAST, metadata IP, destructive & unreviewed mutating; rewrites interactsh; verifies src/templates/compiled/', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v4-b7-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v4-b7-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
 
   // 1. Direct Zod gate checks via parseSafeTemplateYaml on dangerous Nuclei-derived shapes
@@ -2012,7 +2012,7 @@ test('V4-B7 Nuclei transpiler Zod rejection: blocks non-HTTP, 3rd-party OAST, me
     )
   }
 
-  // 2. Transpiler module safety filter + {{interactsh-url}} -> {{guardian_canary_http}} rewrite
+  // 2. Transpiler module safety filter + {{interactsh-url}} -> {{kovo_canary_http}} rewrite
   const transpiler = await loadV4Module<V4TranspilerModule>(
     'scripts/transpile-nuclei-templates.ts',
     'M3 Nuclei transpiler',
@@ -2042,7 +2042,7 @@ test('V4-B7 Nuclei transpiler Zod rejection: blocks non-HTTP, 3rd-party OAST, me
       'info:',
       '  name: Safe SSRF Canary Check',
       '  severity: high',
-      '  description: Valid HTTP template rewriting interactsh-url to guardian_canary_http.',
+      '  description: Valid HTTP template rewriting interactsh-url to kovo_canary_http.',
       '  tags: cve,nextjs,ssrf',
       'http:',
       '  - method: GET',
@@ -2067,7 +2067,7 @@ test('V4-B7 Nuclei transpiler Zod rejection: blocks non-HTTP, 3rd-party OAST, me
   const emittedFiles = readdirSync(outDir).filter(f => /\.ya?ml$/i.test(f))
   assert.equal(emittedFiles.length, 1, 'Only the single valid HTTP template may be emitted')
   const emittedYaml = readFileSync(join(outDir, emittedFiles[0]), 'utf8')
-  assert.ok(emittedYaml.includes('{{guardian_canary_http}}'), 'Transpiler must rewrite {{interactsh-url}} -> {{guardian_canary_http}}')
+  assert.ok(emittedYaml.includes('{{kovo_canary_http}}'), 'Transpiler must rewrite {{interactsh-url}} -> {{kovo_canary_http}}')
   assert.ok(!emittedYaml.includes('interactsh'), 'Transpiled YAML must not retain interactsh placeholder')
   const parsedEmitted = parseSafeTemplateYaml(emittedYaml)
   assert.equal(parsedEmitted.id, 'cve-2024-99999-ssrf')
@@ -2085,7 +2085,7 @@ test('V4-B7 Nuclei transpiler Zod rejection: blocks non-HTTP, 3rd-party OAST, me
 // ============================================================================
 
 test('V4-B8 inline verify Zero-LLM integrity: rejects hardcoded nonces/LLM claims, scrubs secrets from feedback, enforces maxInlineVerifyRetries=2, keeps static_ast_proof as static_verified', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v4-b8-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v4-b8-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const reposDir = join(dir, 'repos')
   mkdirSync(reposDir)
@@ -2099,7 +2099,7 @@ test('V4-B8 inline verify Zero-LLM integrity: rejects hardcoded nonces/LLM claim
       res.writeHead(404, { 'Content-Type': 'text/plain' }).end('Not Found')
       return
     }
-    if (url.pathname === '/spa' || url.pathname.startsWith('/.guardian-nonexistent-')) {
+    if (url.pathname === '/spa' || url.pathname.startsWith('/.kovo-nonexistent-')) {
       res.writeHead(200, { 'Content-Type': 'text/html' }).end('<!doctype html><html><body><div id="root">SPA Shell</div></body></html>')
       return
     }
@@ -2136,7 +2136,7 @@ test('V4-B8 inline verify Zero-LLM integrity: rejects hardcoded nonces/LLM claim
     'src/server/replay-verifier.ts',
   )
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const { storage, projectId, runId, assignmentId } = setupProjectAndRun(dir, 'local-lab', server.origin, 3)
     t.after(() => storage.close())
 

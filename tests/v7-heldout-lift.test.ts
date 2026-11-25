@@ -24,7 +24,7 @@ import { buildPath, makeSolverCtx } from '../benchmarks/realistic-bench/apps/sho
 import type { SubmittedFinding } from '../benchmarks/realistic-bench/lib/types.ts'
 import { endpointMatches } from '../benchmarks/realistic-bench/grader/match.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 test('shopflow: viewer cannot mutate settings or moderate reviews; owner/admin still can', async () => {
   const app = await startRealisticApp({ app: 'shopflow', seed: 1 })

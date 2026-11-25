@@ -50,7 +50,7 @@ function filteredKeys(
   ))
 }
 
-function tempDir(t: { after: (fn: () => void) => void }, prefix = 'guardian-v6-fluid-'): string {
+function tempDir(t: { after: (fn: () => void) => void }, prefix = 'kovo-v6-fluid-'): string {
   const dir = mkdtempSync(join(tmpdir(), prefix))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   return dir
@@ -65,7 +65,7 @@ test('base bundle always carries HTTP, graph/query, SAST/read, and verification 
   assert.deepEqual(bundles, ['http'])
   const base = investigatorTools(bundles)
   for (const name of ['request_http', 'request_http_batch', 'run_sast_scan', 'search_facts',
-    'search_exchanges', 'get_exchange', 'expand_digest', 'guardian_verify', 'verify_replay_spec',
+    'search_exchanges', 'get_exchange', 'expand_digest', 'kovo_verify', 'verify_replay_spec',
     'probe_differential', 'board_post', 'board_read']) {
     assert.ok(base.includes(name as never), `base bundle must include ${name}`)
   }
@@ -90,11 +90,11 @@ test('workflow investigator receives browser + verify + HTTP', () => {
   const keys = filteredKeys(
     'business-logic-race-specialist',
     'Stored DOM sink reached through a checkout workflow replay',
-    'browser_visit', 'browser_session', 'guardian_verify', 'request_http', 'request_http_race',
+    'browser_visit', 'browser_session', 'kovo_verify', 'request_http', 'request_http_race',
     'search_facts',
   )
   assert.ok(keys.includes('browser_visit') && keys.includes('browser_session'))
-  assert.ok(keys.includes('guardian_verify'))
+  assert.ok(keys.includes('kovo_verify'))
   assert.ok(keys.includes('request_http') && keys.includes('request_http_race'))
   assert.ok(keys.includes('search_facts'), 'graph/query stays available')
 })
@@ -103,9 +103,9 @@ test('injection investigator receives OOB + HTTP', () => {
   const keys = filteredKeys(
     'injection-parser-specialist',
     'Blind SSRF and XXE callback through the XML parser',
-    'mint_canary', 'check_canary', 'mint_second_order_canary', 'guardian_verify', 'request_http',
+    'mint_canary', 'check_canary', 'mint_second_order_canary', 'kovo_verify', 'request_http',
   )
-  for (const name of ['mint_canary', 'check_canary', 'mint_second_order_canary', 'guardian_verify', 'request_http']) {
+  for (const name of ['mint_canary', 'check_canary', 'mint_second_order_canary', 'kovo_verify', 'request_http']) {
     assert.ok(keys.includes(name), `injection bundle must include ${name}`)
   }
 })
@@ -115,25 +115,25 @@ test('authz investigator receives HTTP + graph/query without browser escalation'
     'bola-bfla-specialist',
     'Cross-tenant IDOR on /orders/{id}',
     'request_http', 'request_http_batch', 'search_facts', 'get_exchange', 'expand_digest',
-    'browser_visit', 'guardian_verify',
+    'browser_visit', 'kovo_verify',
   )
-  for (const name of ['request_http', 'request_http_batch', 'search_facts', 'get_exchange', 'expand_digest', 'guardian_verify']) {
+  for (const name of ['request_http', 'request_http_batch', 'search_facts', 'get_exchange', 'expand_digest', 'kovo_verify']) {
     assert.ok(keys.includes(name), `authz investigator must keep ${name}`)
   }
   assert.ok(!keys.includes('browser_visit'), 'bundles are additive, not blanket: no browser without a client-side shape')
 })
 
-test('no specialist is missing guardian_verify when the handler exists', () => {
+test('no specialist is missing kovo_verify when the handler exists', () => {
   for (const [id, profile] of Object.entries(SPECIALIST_PROFILES)) {
     const keys = Object.keys(filterHandlersForSpecialist(
-      handlersFor('guardian_verify', 'request_http', 'search_facts', ...proofToolHandlerNames) as never,
+      handlersFor('kovo_verify', 'request_http', 'search_facts', ...proofToolHandlerNames) as never,
       profile,
     ))
-    assert.ok(keys.includes('guardian_verify'), `${id} must keep guardian_verify`)
+    assert.ok(keys.includes('kovo_verify'), `${id} must keep kovo_verify`)
     assert.ok(keys.includes('request_http'), `${id} must keep batched HTTP`)
     assert.ok(keys.includes('search_facts'), `${id} must keep graph/query search`)
     for (const proof of proofToolHandlerNames) {
-      assert.ok(!keys.includes(proof), `${id} hides JSON proof compilers when guardian_verify exists`)
+      assert.ok(!keys.includes(proof), `${id} hides JSON proof compilers when kovo_verify exists`)
     }
   }
 })
@@ -291,14 +291,14 @@ test('network calls stay sequential within one round', async (t) => {
 // 3. Settlement: revoke probes, keep read/query/verify until the final turn
 // ============================================================================
 
-test('settlement revokes network probes but keeps queries and guardian_verify', () => {
+test('settlement revokes network probes but keeps queries and kovo_verify', () => {
   const atSettlement = { settling: true, turnsUsed: 20, maxTurns: 30 }
   for (const name of ['request_http', 'request_http_batch', 'request_http_race', 'browser_visit',
     'browser_session', 'probe_surface', 'probe_differential', 'run_safe_templates', 'probe_websocket']) {
     assert.ok(settlementToolBlock({ name, ...atSettlement }), `${name} must be revoked during settlement`)
   }
   for (const name of ['search_facts', 'search_exchanges', 'get_exchange', 'read_peer_trace',
-    'expand_digest', 'board_read', 'query_cves', 'guardian_verify', 'verify_replay_spec']) {
+    'expand_digest', 'board_read', 'query_cves', 'kovo_verify', 'verify_replay_spec']) {
     assert.equal(settlementToolBlock({ name, ...atSettlement }), undefined, `${name} must survive settlement`)
   }
   for (const name of ['record_fact', 'record_coverage', 'propose_chain_finding', 'complete_intent']) {
@@ -308,7 +308,7 @@ test('settlement revokes network probes but keeps queries and guardian_verify', 
 
 test('final turn also revokes read/query/verify wrap-up tools', () => {
   const finalTurn = { settling: true, turnsUsed: 30, maxTurns: 30 }
-  for (const name of ['search_facts', 'expand_digest', 'guardian_verify']) {
+  for (const name of ['search_facts', 'expand_digest', 'kovo_verify']) {
     assert.match(settlementToolBlock({ name, ...finalTurn }) ?? '', /final turn/i)
   }
   assert.equal(settlementToolBlock({ name: 'record_fact', ...finalTurn }), undefined)

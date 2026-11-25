@@ -2,7 +2,7 @@
  * v8 Queue #30 End-to-End Multi-Stage Workflow Consolidation & Cross-Service Synthesis Tests.
  *
  * Verifies (Docker-free, real SQLite WAL `Store`, zero benchmark contamination):
- *  1. `guardianVerifyHelperGuidance()`, `GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN`,
+ *  1. `kovoVerifyHelperGuidance()`, `KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN`,
  *     `workerInvestigationPrompt()`, `workerSessionInstructions()`, and `src/skills/multihop-chains.md`:
  *     - Instruct workers never to stop at intermediate artifacts (job creation, cache priming, or
  *       link/token generation) and always continue in the SAME script through `ctx.await_async`,
@@ -11,8 +11,8 @@
  *       ctx.prove_composite(...)` in ONE cohesive script once source routes are known).
  *     - Enforce `state_transition_binding` clean-control order (run baseline denied control
  *       `role: "control"` BEFORE Stage 1 or on a fresh untouched sibling entity).
- *     - Stay strictly within all prompt budgets (`guardianVerifyHelperGuidance() <= 2048 B`,
- *       `guardianVerifyPromptHint() <= 512 B`, pattern `<= 12` lines, pre-injected excerpt keeps
+ *     - Stay strictly within all prompt budgets (`kovoVerifyHelperGuidance() <= 2048 B`,
+ *       `kovoVerifyPromptHint() <= 512 B`, pattern `<= 12` lines, pre-injected excerpt keeps
  *       all Section-1 directives including `invariant_enforced_hardened`).
  *     - Never reference nonexistent `ctx.race(` (always use live SDK `ctx.prove_race_burst`).
  *  2. `convertCodeAuditSuspectsToChainSteps`:
@@ -34,11 +34,11 @@ import { resolve } from 'node:path'
 import { test } from 'node:test'
 
 import {
-  GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-  GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN,
-  GUARDIAN_VERIFY_TOOL_DESCRIPTION,
-  guardianVerifyHelperGuidance,
-  guardianVerifyPromptHint,
+  KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+  KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN,
+  KOVO_VERIFY_TOOL_DESCRIPTION,
+  kovoVerifyHelperGuidance,
+  kovoVerifyPromptHint,
   workerInvestigationPrompt,
   workerSessionInstructions,
 } from '../src/server/agent-prompts.ts'
@@ -63,14 +63,14 @@ const REPO_ROOT = resolve(new URL('..', import.meta.url).pathname)
 const ORIGIN = 'https://workflow.example.invalid'
 
 test('Q30.1: prompts, tool guidance, and multihop-chains.md enforce single-script 3-5 stage workflows and clean-control ordering within strict budgets', () => {
-  const guidance = guardianVerifyHelperGuidance()
-  const hint = guardianVerifyPromptHint()
-  const patternLines = GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.split('\n')
+  const guidance = kovoVerifyHelperGuidance()
+  const hint = kovoVerifyPromptHint()
+  const patternLines = KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.split('\n')
 
   // Strict prompt/pattern byte and line budgets.
   assert.ok(
-    Buffer.byteLength(guidance, 'utf8') <= GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-    `guardianVerifyHelperGuidance() is ${Buffer.byteLength(guidance, 'utf8')} B (> ${GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES} B)`,
+    Buffer.byteLength(guidance, 'utf8') <= KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+    `kovoVerifyHelperGuidance() is ${Buffer.byteLength(guidance, 'utf8')} B (> ${KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES} B)`,
   )
   assert.ok(Buffer.byteLength(hint, 'utf8') <= 512, `hint is ${Buffer.byteLength(hint, 'utf8')} B (> 512 B)`)
   assert.ok(patternLines.length <= 12, `pattern has ${patternLines.length} lines (> 12)`)
@@ -82,10 +82,10 @@ test('Q30.1: prompts, tool guidance, and multihop-chains.md enforce single-scrip
   assert.match(guidance, /clean denied control BEFORE Stage 1/i)
 
   // Pattern, tool description, and active system prompt teach all 3 Queue #30 rules.
-  const sysPrompt = workerSessionInstructions('worker-investigation', { hasGuardianVerify: true })
+  const sysPrompt = workerSessionInstructions('worker-investigation', { hasKovoVerify: true })
   for (const [label, text] of [
-    ['GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
-    ['GUARDIAN_VERIFY_TOOL_DESCRIPTION', GUARDIAN_VERIFY_TOOL_DESCRIPTION],
+    ['KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
+    ['KOVO_VERIFY_TOOL_DESCRIPTION', KOVO_VERIFY_TOOL_DESCRIPTION],
     ['workerSessionInstructions', sysPrompt],
   ] as const) {
     assert.match(text, /job creation, cache priming, or link\/token generation/i, `${label} missing no-intermediate-artifact rule`)
@@ -124,7 +124,7 @@ test('Q30.1: prompts, tool guidance, and multihop-chains.md enforce single-scrip
   assert.ok(stagePrompt.multiHopDirectives, 'Stage 1 -> Stage 2 step must receive multiHopDirectives')
   assert.match(stagePrompt.multiHopDirectives!.noPrematureSingleHop ?? '', /job creation, cache prime, or link\/token generation/i)
   assert.match(stagePrompt.multiHopDirectives!.cryptoAndAsyncHelpers ?? '', /ctx\.prove_race_burst/)
-  assert.match(stagePrompt.multiHopDirectives!.singleScriptConsolidation ?? '', /ONE cohesive multi-stage guardian_verify script.*Stage 1 -> Stage 2 -> Stage 3 -> Stage 4 -> ctx\.prove_composite/i)
+  assert.match(stagePrompt.multiHopDirectives!.singleScriptConsolidation ?? '', /ONE cohesive multi-stage kovo_verify script.*Stage 1 -> Stage 2 -> Stage 3 -> Stage 4 -> ctx\.prove_composite/i)
   assert.match(stagePrompt.multiHopDirectives!.stateTransitionControlOrder ?? '', /state_transition_binding.*role: "control".*BEFORE Stage 1.*fresh untouched sibling entity/i)
 
   const singlePrompt = JSON.parse(workerInvestigationPrompt({
@@ -255,7 +255,7 @@ test('Q30.2: convertCodeAuditSuspectsToChainSteps synthesizes cache/permission +
     assert.equal(classifyDispatchLane(comp), 'chain')
     assert.equal(chainLaneDispatchRank(comp), 0)
     assert.match(comp.hypothesis, /Stage 1 .* -> .*Stage 2 .* -> .*Stage 3 .* -> Terminal Verification/)
-    assert.match(comp.hypothesis, /Verify ALL stages in ONE guardian_verify script/i)
+    assert.match(comp.hypothesis, /Verify ALL stages in ONE kovo_verify script/i)
     assert.match(comp.hypothesis, /run clean denied control BEFORE Stage 1/i)
     assert.match(comp.hypothesis, /ctx\.seal_capability/)
     assert.match(comp.hypothesis, /ctx\.hmac_sign\/ctx\.jwt_sign\/ctx\.await_async\/ctx\.prove_race_burst/)

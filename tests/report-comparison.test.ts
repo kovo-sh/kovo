@@ -11,7 +11,7 @@ const primary = 'https://portal.example'
 const secondary = 'https://audit.portal.example'
 
 async function comparison(t: TestContext) {
-  const directory = await mkdtemp(join(tmpdir(), 'guardian-comparison-'))
+  const directory = await mkdtemp(join(tmpdir(), 'kovo-comparison-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
   const write = async (path: string, data: string | object) => {
     const content = typeof data === 'string' ? data : JSON.stringify(data)
@@ -36,7 +36,7 @@ async function comparison(t: TestContext) {
       overlappingObservations: !index,
       capturedEvidence: { fixture: id },
     })
-    async function product(name: 'guardian' | 'artex') {
+    async function product(name: 'kovo' | 'artex') {
       const runId = id + '-' + name
       const reportId = runId + '-report'
       const report = await write(runId + '.md', '# Synthetic report\n- **Run** ' + runId + '\n- **Report version** 1\n')
@@ -59,16 +59,16 @@ async function comparison(t: TestContext) {
       if (name === 'artex' && !index) verdicts[0] = { asset: primary, issue: 'export', verdict: 'untested' }
       return { version: 'fixture-revision', model: 'fixture-model', report, runRecord, inputSha256: input.sha256, verdicts }
     }
-    const guardian = await product('guardian')
+    const kovo = await product('kovo')
     const artex = await product('artex')
     const correct: Record<string, string> = index ? { coverage: 'correct' } : {
       priority: 'correct', remediation: 'correct', impact: 'correct', evidence: 'correct', recheck: 'correct', coverage: 'correct',
     }
     scenarios.push({
-      id, input, cases: cases[index], guardian, artex, heldOut: id === 'multi-host',
+      id, input, cases: cases[index], kovo, artex, heldOut: id === 'multi-host',
       reviews: [{
         reader: 'fixture-reader',
-        guardian: { reportSha256: guardian.report.sha256, tasks: { ...correct } },
+        kovo: { reportSha256: kovo.report.sha256, tasks: { ...correct } },
         artex: { reportSha256: artex.report.sha256, tasks: { ...correct } },
       }],
     })
@@ -83,40 +83,40 @@ async function comparison(t: TestContext) {
 
 test('compares matched reports and counts duplicates and missed finding severity', async t => {
   const fixture = await comparison(t)
-  const { guardian, artex } = fixture.manifest.scenarios[0]
-  delete guardian.verdicts[1].severity
+  const { kovo, artex } = fixture.manifest.scenarios[0]
+  delete kovo.verdicts[1].severity
   artex.verdicts[1].severity = 'low'
-  guardian.verdicts.push({ ...guardian.verdicts[0] })
+  kovo.verdicts.push({ ...kovo.verdicts[0] })
   const score = await fixture.score()
   assert.equal(score.status, 'passed')
-  assert.equal(score.accuracy.guardian?.duplicates, 1)
-  assert.equal(score.accuracy.guardian?.precision, 1)
-  assert.equal(score.accuracy.guardian?.recall, 1)
+  assert.equal(score.accuracy.kovo?.duplicates, 1)
+  assert.equal(score.accuracy.kovo?.precision, 1)
+  assert.equal(score.accuracy.kovo?.recall, 1)
   assert.equal(score.accuracy.artex?.recall, 0.5)
   assert.equal(score.accuracy.artex?.missesBySeverity.high, 1)
-  assert.deepEqual(score.accuracy.guardian?.severityRatings, { correct: 1, incorrect: 0, ungraded: 1 })
+  assert.deepEqual(score.accuracy.kovo?.severityRatings, { correct: 1, incorrect: 0, ungraded: 1 })
   assert.deepEqual(score.accuracy.artex?.severityRatings, { correct: 0, incorrect: 1, ungraded: 0 })
   assert.equal(score.readers.pairs, 4)
-  assert.deepEqual(score.readers.results.coverage, { guardian: 4, artex: 4 })
+  assert.deepEqual(score.readers.results.coverage, { kovo: 4, artex: 4 })
   assert.deepEqual(score.accuracy.seriousFindingIssues, [])
 })
 
 test('fails the scorecard for a missed or incorrectly rated serious finding', async t => {
   const fixture = await comparison(t)
-  const { cases, guardian } = fixture.manifest.scenarios[0]
-  const confirmed = guardian.verdicts[0]
+  const { cases, kovo } = fixture.manifest.scenarios[0]
+  const confirmed = kovo.verdicts[0]
   const issue = { scenario: 'multi-host', asset: primary, issue: 'export' }
 
-  guardian.verdicts[0] = { asset: primary, issue: 'export', verdict: 'untested' }
+  kovo.verdicts[0] = { asset: primary, issue: 'export', verdict: 'untested' }
   const missed = await fixture.score()
-  assert.equal(missed.accuracy.guardian?.precision, missed.accuracy.artex?.precision)
-  assert.equal(missed.accuracy.guardian?.recall, missed.accuracy.artex?.recall)
+  assert.equal(missed.accuracy.kovo?.precision, missed.accuracy.artex?.precision)
+  assert.equal(missed.accuracy.kovo?.recall, missed.accuracy.artex?.recall)
   assert.equal(missed.status, 'failed')
   assert.deepEqual(missed.accuracy.seriousFindingIssues, [{
     ...issue, expectedSeverity: 'high', reportedVerdict: 'untested', reportedSeverity: null,
   }])
 
-  guardian.verdicts[0] = { ...confirmed, severity: undefined }
+  kovo.verdicts[0] = { ...confirmed, severity: undefined }
   const ungraded = await fixture.score()
   assert.equal(ungraded.accuracy.status, 'failed')
   assert.deepEqual(ungraded.accuracy.seriousFindingIssues, [{
@@ -124,8 +124,8 @@ test('fails the scorecard for a missed or incorrectly rated serious finding', as
   }])
 
   cases[0].severity = 'critical'
-  guardian.verdicts[0] = confirmed
-  const path = 'guardian-only.json'
+  kovo.verdicts[0] = confirmed
+  const path = 'kovo-only.json'
   await fixture.write(path, {
     ...fixture.manifest,
     scenarios: fixture.manifest.scenarios.map(({ artex, ...scenario }) => ({ ...scenario, reviews: [] })),
@@ -137,7 +137,7 @@ test('fails the scorecard for a missed or incorrectly rated serious finding', as
     ...issue, expectedSeverity: 'critical', reportedVerdict: 'confirmed', reportedSeverity: 'high',
   }])
 
-  guardian.verdicts[0].severity = 'critical'
+  kovo.verdicts[0].severity = 'critical'
   const corrected = await fixture.score()
   assert.equal(corrected.status, 'passed')
   assert.deepEqual(corrected.accuracy.seriousFindingIssues, [])
@@ -147,7 +147,7 @@ test('fails the scorecard when a report overstates coverage', async t => {
   const fixture = await comparison(t)
   const baseline = await fixture.score()
   const [, , missing, stopped] = fixture.manifest.scenarios
-  for (const product of ['guardian', 'artex'] as const) {
+  for (const product of ['kovo', 'artex'] as const) {
     missing[product].verdicts[0].verdict = 'met'
     stopped[product].verdicts[0].verdict = 'inconclusive'
   }
@@ -155,8 +155,8 @@ test('fails the scorecard when a report overstates coverage', async t => {
   assert.equal(score.status, 'failed')
   assert.equal(score.evidence.status, 'passed')
   assert.equal(score.readers.status, 'passed')
-  assert.equal(score.accuracy.guardian?.precision, baseline.accuracy.guardian?.precision)
-  assert.equal(score.accuracy.guardian?.recall, baseline.accuracy.guardian?.recall)
+  assert.equal(score.accuracy.kovo?.precision, baseline.accuracy.kovo?.precision)
+  assert.equal(score.accuracy.kovo?.recall, baseline.accuracy.kovo?.recall)
   assert.deepEqual(score.accuracy.coverageOverclaims, [
     { scenario: 'missing', asset: primary, issue: 'export', expected: 'inconclusive', reported: 'met' },
     { scenario: 'stopped', asset: primary, issue: 'export', expected: 'untested', reported: 'inconclusive' },
@@ -168,7 +168,7 @@ test('keeps assessment pending for renderer-only data or missing reader reviews'
   fixture.manifest.mode = 'report-only'
   const renderer = await fixture.score()
   assert.equal(renderer.status, 'pending')
-  assert.equal(renderer.accuracy.guardian, null)
+  assert.equal(renderer.accuracy.kovo, null)
   assert.equal(renderer.readers.status, 'passed')
   fixture.manifest.mode = 'assessment'
   fixture.manifest.scenarios[0].heldOut = false
@@ -186,15 +186,15 @@ test('keeps assessment pending for renderer-only data or missing reader reviews'
 test('fails a scope claim, unsupported evidence, and a lower reader score', async t => {
   const fixture = await comparison(t)
   const entry = fixture.manifest.scenarios[0]
-  entry.guardian.verdicts[0].evidence = 'missing'
-  entry.guardian.verdicts.push({ asset: 'https://outside.example', issue: 'export', verdict: 'confirmed', evidence: 'supported' })
-  entry.reviews[0].guardian.tasks.recheck = 'incorrect'
+  entry.kovo.verdicts[0].evidence = 'missing'
+  entry.kovo.verdicts.push({ asset: 'https://outside.example', issue: 'export', verdict: 'confirmed', evidence: 'supported' })
+  entry.reviews[0].kovo.tasks.recheck = 'incorrect'
   const score = await fixture.score()
   assert.equal(score.status, 'failed')
-  assert.equal(score.accuracy.guardian?.falseConfirmations, 1)
+  assert.equal(score.accuracy.kovo?.falseConfirmations, 1)
   assert.deepEqual(score.evidence.issues.map(issue => issue.reason), ['missing', 'out-of-scope'])
   assert.equal(score.readers.status, 'failed')
-  assert.deepEqual(score.readers.results.recheck, { guardian: 0, artex: 1 })
+  assert.deepEqual(score.readers.results.recheck, { kovo: 0, artex: 1 })
 })
 
 test('requires a paired coverage grade on an interrupted report', async t => {
@@ -208,13 +208,13 @@ test('requires a paired coverage grade on an interrupted report', async t => {
   assert.deepEqual(missing.readers.awaitingReview, ['stopped'])
 
   entry.reviews = reviews
-  reviews[0].guardian.tasks.coverage = 'incorrect'
+  reviews[0].kovo.tasks.coverage = 'incorrect'
   const failed = await fixture.score()
   assert.equal(failed.readers.status, 'failed')
-  assert.deepEqual(failed.readers.results.coverage, { guardian: 3, artex: 4 })
-  assert.deepEqual(failed.readers.byScenario[3].tasks, [{ task: 'coverage', pairs: 1, guardian: 0, artex: 1 }])
+  assert.deepEqual(failed.readers.results.coverage, { kovo: 3, artex: 4 })
+  assert.deepEqual(failed.readers.byScenario[3].tasks, [{ task: 'coverage', pairs: 1, kovo: 0, artex: 1 }])
 
-  reviews[0].guardian.tasks.priority = 'correct'
+  reviews[0].kovo.tasks.priority = 'correct'
   await assert.rejects(fixture.score(), /Invalid comparison manifest/)
 })
 
@@ -274,24 +274,24 @@ test('validates scopes at the time of each recorded read', async t => {
 
 test('rejects a correctly hashed recording from another scope, report version, or stopping point', async t => {
   const fixture = await comparison(t)
-  const { input, guardian } = fixture.manifest.scenarios[3]
+  const { input, kovo } = fixture.manifest.scenarios[3]
   const events = [
     { id: 1, kind: 'run.created' },
     { id: 2, kind: 'scope.approved', scope: [primary] },
-    { id: 3, kind: 'report.partial', reportVersion: 1, reportId: 'stopped-guardian-report' },
+    { id: 3, kind: 'report.partial', reportVersion: 1, reportId: 'stopped-kovo-report' },
   ]
   const audit = {
-    runId: 'stopped-guardian', reportVersion: 1, reportId: 'stopped-guardian-report',
+    runId: 'stopped-kovo', reportVersion: 1, reportId: 'stopped-kovo-report',
     status: 'stopped', approval: { eventId: 2, scope: [primary] }, events,
   }
   const record = async () => {
-    const recording = await fixture.write('guardian-recording.json', audit)
-    guardian.runRecord = await fixture.write('guardian-reviewed-run.json', {
-      inputSha256: input.sha256, reportSha256: guardian.report.sha256, recording,
+    const recording = await fixture.write('kovo-recording.json', audit)
+    kovo.runRecord = await fixture.write('kovo-reviewed-run.json', {
+      inputSha256: input.sha256, reportSha256: kovo.report.sha256, recording,
     })
   }
   await record()
-  assert.equal((await fixture.score()).scenarios[3].guardian?.recordingAudit, 'verified')
+  assert.equal((await fixture.score()).scenarios[3].kovo?.recordingAudit, 'verified')
   events[1].scope = [secondary]
   await record()
   await assert.rejects(fixture.score(), /recording for a different approved scope/)
@@ -302,7 +302,7 @@ test('rejects a correctly hashed recording from another scope, report version, o
   events[1].id = 2
   audit.reportVersion = events[2].reportVersion = 2
   await record()
-  await assert.rejects(fixture.score(), /recording for a different Guardian report version/)
+  await assert.rejects(fixture.score(), /recording for a different Kovo(?: Hunter)? report version/)
   audit.reportVersion = events[2].reportVersion = 1
   audit.status = 'complete'
   events[2].kind = 'report.complete'
@@ -312,10 +312,10 @@ test('rejects a correctly hashed recording from another scope, report version, o
 
 test('rejects modified artifacts and report paths outside the comparison directory', async t => {
   const fixture = await comparison(t)
-  const [{ guardian }] = fixture.manifest.scenarios
-  await fixture.write(guardian.report.path, 'File changed after review.')
+  const [{ kovo }] = fixture.manifest.scenarios
+  await fixture.write(kovo.report.path, 'File changed after review.')
   await assert.rejects(fixture.score(), /SHA-256 mismatch/)
   await symlink(import.meta.filename, join(fixture.directory, 'external.md'))
-  guardian.report.path = 'external.md'
+  kovo.report.path = 'external.md'
   await assert.rejects(fixture.score(), /file inside the comparison directory/)
 })

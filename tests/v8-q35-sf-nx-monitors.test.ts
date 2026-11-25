@@ -7,7 +7,7 @@
 //  3. Public-origin reachability: every chain completes using only the grey-box public origins
 //     (internal-only runner / registry.internal / docs-worker are reached through public relays),
 //     while hardened mode and every twin stay silent.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

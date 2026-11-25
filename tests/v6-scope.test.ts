@@ -72,7 +72,7 @@ function transportStub(calls: Array<{ method: string; url: string }>) {
     if (url.hostname === new URL(appOrigin).hostname && url.pathname === '/login') {
       return {
         status: 302,
-        headers: { location: `${idpOrigin}/oauth/authorize?client_id=guardian` },
+        headers: { location: `${idpOrigin}/oauth/authorize?client_id=kovo` },
         body: '',
       }
     }
@@ -88,7 +88,7 @@ function brokerFor(calls: Array<{ method: string; url: string }>): RequestBroker
 }
 
 function makeStorage(t: { after(fn: () => void): void }): { storage: Store; dir: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v6-scope-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v6-scope-'))
   const storage = new Store(dir)
   t.after(() => {
     try { storage.close() } catch { /* already closed */ }
@@ -114,7 +114,7 @@ test('v6 scope: role model classifies target/auth/asset origins and refuses acti
   assert.equal(idpProbe.code, 'auth_origin_active_probe')
 
   const idpRedirect = evaluateScopeRequest(scope, {
-    origin: idpOrigin, method: 'GET', pathAndQuery: '/oauth/authorize?client_id=guardian', redirectHop: true,
+    origin: idpOrigin, method: 'GET', pathAndQuery: '/oauth/authorize?client_id=kovo', redirectHop: true,
   })
   assert.equal(idpRedirect.allowed, true)
 
@@ -160,7 +160,7 @@ test('v6 scope: prod_readonly blocks mutations but permits verified read-only Gr
 })
 
 test('v6 scope: staging_isolated requires the run tenant tag or setup/cleanup, and honours the denylist', () => {
-  const tag = 'guardian-qa-run-scope-1-'
+  const tag = 'kovo-qa-run-scope-1-'
   const scope = policy({ mode: 'staging_isolated', tenantTag: tag, routeDenylist: ['/billing/charge'] })
   const untagged = evaluateScopeRequest(scope, {
     origin: appOrigin, method: 'POST', pathAndQuery: '/api/items', body: '{"name":"x"}',
@@ -219,7 +219,7 @@ test('v6 scope: broker refuses a prod_readonly mutation without ever opening an 
 test('v6 scope: broker allows a run-tagged staging mutation and refuses a denylisted route', async () => {
   const calls: Array<{ method: string; url: string }> = []
   const broker = brokerFor(calls)
-  const tag = 'guardian-qa-run-scope-1-'
+  const tag = 'kovo-qa-run-scope-1-'
   const grant = grantFor(policy({
     mode: 'staging_isolated',
     tenantTag: tag,
@@ -443,9 +443,9 @@ test('v6 scope: approval judge follows the environment contract and never escala
     origin: appOrigin,
     method: 'POST',
     pathAndQuery: '/api/items',
-    bodyPreview: '{"tenant":"guardian-qa-run-scope-1-x"}',
+    bodyPreview: '{"tenant":"kovo-qa-run-scope-1-x"}',
     mode: 'staging_isolated',
-    tenantTag: 'guardian-qa-run-scope-1-',
+    tenantTag: 'kovo-qa-run-scope-1-',
   })
   assert.equal(tagged.decision, 'approve')
   assert.equal(tagged.stage, 'environment_contract')
@@ -455,16 +455,16 @@ test('v6 scope: approval judge follows the environment contract and never escala
     origin: appOrigin,
     method: 'POST',
     pathAndQuery: '/billing/charge',
-    bodyPreview: '{"tenant":"guardian-qa-run-scope-1-x"}',
+    bodyPreview: '{"tenant":"kovo-qa-run-scope-1-x"}',
     mode: 'staging_isolated',
-    tenantTag: 'guardian-qa-run-scope-1-',
+    tenantTag: 'kovo-qa-run-scope-1-',
     routeDenylist: ['/billing/charge'],
   })
   assert.equal(denylisted.decision, 'deny')
 })
 
 test('v6 scope: awaiting_approval parks with the slot released and persists across reopen', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v6-park-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v6-park-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   let storage = new Store(dir)
   const { runId } = await setupApprovedRun(storage, { seeds: [appOrigin], tier: 3, environment: 'public' })
@@ -516,7 +516,7 @@ test('v6 scope: operator approval grants a durable route lease (not a 60 s body 
 })
 
 test('v6 scope: legacy approved allowlist migrates into targetOrigins on reopen', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v6-legacy-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v6-legacy-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const first = new Store(dir)
   const { runId } = await setupApprovedRun(first, { seeds: [appOrigin], tier: 3, environment: 'public' })

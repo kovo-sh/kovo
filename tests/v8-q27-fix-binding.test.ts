@@ -36,7 +36,7 @@ import {
   VerifyRpcServer,
 } from '../src/server/verify-rpc.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SIGNING_KEY = 'q27-fix-binding-unit-test-signing-key-0123456789'
@@ -157,7 +157,7 @@ async function startFixtureServer() {
 
 test('inline cap:... handles resolve across path, query, Authorization, Cookie, custom headers, and JSON body with full attestation & redaction', async () => {
   const { server, origin, received, secrets } = await startFixtureServer()
-  const hostDir = mkdtempSync(join(tmpdir(), 'guardian-q27-'))
+  const hostDir = mkdtempSync(join(tmpdir(), 'kovo-q27-'))
   let nowMs = 1_700_000_000_000
   const vault = new DerivedCapabilityVault({ runId: 'run-q27-inline', now: () => nowMs })
   const broker = new RequestBroker()

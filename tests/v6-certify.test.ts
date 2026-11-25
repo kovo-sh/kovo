@@ -518,7 +518,7 @@ describe('class hygiene gate', () => {
 
 describe('--from-dir ingestion', () => {
   test('parses real-shaped summary, per-cell meta and events DB', () => {
-    const root = mkdtempSync(join(tmpdir(), 'guardian-certify-'))
+    const root = mkdtempSync(join(tmpdir(), 'kovo-certify-'))
     try {
       const card: ScorecardLike = {
         app: 'acme-saas', seed: 1, seedSet: 'dev', mode: 'grey-box',
@@ -533,7 +533,7 @@ describe('--from-dir ingestion', () => {
       }))
       const dbDir = join(root, 'data', 'acme-saas-seed1-grey-box')
       mkdirSync(dbDir, { recursive: true })
-      const db = new DatabaseSync(join(dbDir, 'guardian.sqlite'))
+      const db = new DatabaseSync(join(dbDir, 'kovo.sqlite'))
       db.exec('create table events (kind text, detail text)')
       db.exec('create table facts (data text)')
       db.prepare('insert into events (kind, detail) values (?, ?)').run(
@@ -585,7 +585,7 @@ describe('--from-dir ingestion', () => {
   })
 
   test('parses findings provenance, advisories and contract leaks from a report', () => {
-    const root = mkdtempSync(join(tmpdir(), 'guardian-certify-'))
+    const root = mkdtempSync(join(tmpdir(), 'kovo-certify-'))
     try {
       const card: ScorecardLike = {
         app: 'acme-saas', seed: 1, seedSet: 'dev', mode: 'grey-box',
@@ -620,7 +620,7 @@ describe('--from-dir ingestion', () => {
   })
 
   test('static_only scorecard outcomes land in advisories, never recall', () => {
-    const root = mkdtempSync(join(tmpdir(), 'guardian-certify-'))
+    const root = mkdtempSync(join(tmpdir(), 'kovo-certify-'))
     try {
       const card: ScorecardLike = {
         app: 'acme-saas', seed: 1, seedSet: 'dev', mode: 'grey-box',
@@ -645,7 +645,7 @@ describe('--from-dir ingestion', () => {
   })
 
   test('report-level provenance counts are accepted without finding-level rows', () => {
-    const root = mkdtempSync(join(tmpdir(), 'guardian-certify-'))
+    const root = mkdtempSync(join(tmpdir(), 'kovo-certify-'))
     try {
       const card: ScorecardLike = {
         app: 'acme-saas', seed: 1, seedSet: 'dev', mode: 'grey-box',
@@ -665,7 +665,7 @@ describe('--from-dir ingestion', () => {
   })
 
   test('a summary.json wins over sibling per-cell scorecards (no double count)', () => {
-    const root = mkdtempSync(join(tmpdir(), 'guardian-certify-'))
+    const root = mkdtempSync(join(tmpdir(), 'kovo-certify-'))
     try {
       const card: ScorecardLike = {
         app: 'acme-saas', seed: 1, seedSet: 'dev', mode: 'grey-box',
@@ -683,7 +683,7 @@ describe('--from-dir ingestion', () => {
   })
 
   test('missing directory is rejected', () => {
-    const missing = join(tmpdir(), `guardian-certify-missing-${Date.now()}`)
+    const missing = join(tmpdir(), `kovo-certify-missing-${Date.now()}`)
     assert.equal(existsSync(missing), false)
     assert.throws(() => ingestFromDirs([missing], {}), /does not exist/)
   })

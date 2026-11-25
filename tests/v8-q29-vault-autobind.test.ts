@@ -26,7 +26,7 @@ import { RequestBroker, type Grant } from '../src/server/broker.ts'
 import { DerivedCapabilityVault } from '../src/server/derived-custody.ts'
 import { VERIFY_NONCE_HEADER, VERIFY_RPC_HEADER, VerifyRpcServer } from '../src/server/verify-rpc.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const ORDER_ID = 'ord_7Kq2xZ9mVb41'
@@ -105,7 +105,7 @@ async function startFixture() {
 }
 
 async function startRpc(origin: string, runId: string, nowFn?: () => number) {
-  const hostDir = mkdtempSync(join(tmpdir(), 'guardian-q29-'))
+  const hostDir = mkdtempSync(join(tmpdir(), 'kovo-q29-'))
   const vault = new DerivedCapabilityVault({ runId, ...(nowFn ? { now: nowFn } : {}) })
   const rpc = new VerifyRpcServer({
     runId, assignmentId: 'assign-q29', broker: new RequestBroker(), grant: makeGrant(origin),

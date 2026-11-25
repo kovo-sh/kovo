@@ -1,6 +1,6 @@
 // v5 M6: OOB callback wiring for the graded realistic-bench harness.
 // The app's contained egress only reaches loopback ports it was started with; the harness must
-// create the Guardian canary listener first, pass that exact port to the app, and reuse the same
+// create the Kovo Hunter canary listener first, pass that exact port to the app, and reuse the same
 // broker for SSRF/XXE verification. Unregistered loopback ports must stay blocked.
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -11,11 +11,11 @@ import { resolveOobCallbackPorts, createEngineEnv } from '../scripts/benchmark-e
 import { profileCaps } from '../scripts/benchmark-probes.ts'
 import type { CanaryBroker } from '../src/server/canary-broker.ts'
 import {
-  runGuardianAgainstMaterialized, startOobCanaryBroker,
-} from '../benchmarks/realistic-bench/guardian-adapter.ts'
-import type { EngineModuleLike } from '../benchmarks/realistic-bench/guardian-adapter.ts'
+  runKovoAgainstMaterialized, startOobCanaryBroker,
+} from '../benchmarks/realistic-bench/kovo-adapter.ts'
+import type { EngineModuleLike } from '../benchmarks/realistic-bench/kovo-adapter.ts'
 import { briefingFor, startRealisticApp } from '../benchmarks/realistic-bench/run.ts'
-import { loginPersonas } from '../benchmarks/realistic-bench/guardian-login.ts'
+import { loginPersonas } from '../benchmarks/realistic-bench/kovo-login.ts'
 import type { Briefing, SiteMode, StartedApp } from '../benchmarks/realistic-bench/lib/types.ts'
 import shopflow from '../benchmarks/realistic-bench/apps/shopflow/index.ts'
 import { blueprint as shopflowBlueprint } from '../benchmarks/realistic-bench/apps/shopflow/truth/blueprint.ts'
@@ -23,11 +23,11 @@ import { generateVariant } from '../benchmarks/realistic-bench/generator/variant
 import { buildGroundTruth } from '../benchmarks/realistic-bench/generator/groundtruth.ts'
 
 function withLocalLab<T>(fn: () => Promise<T>): Promise<T> {
-  const prev = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  const prev = process.env.KOVO_ALLOW_LOCAL_LAB
+  process.env.KOVO_ALLOW_LOCAL_LAB = '1'
   return fn().finally(() => {
-    if (prev === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prev
+    if (prev === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = prev
   })
 }
 
@@ -113,7 +113,7 @@ test('OOB wiring: registered canary port accepts an SSRF callback; an unregister
   })
 })
 
-test('OOB wiring: a simulated OOB callback correlates to its Guardian token', async () => {
+test('OOB wiring: a simulated OOB callback correlates to its Kovo Hunter token', async () => {
   const oob = await startOobCanaryBroker()
   try {
     const broker = oob.broker as {
@@ -170,7 +170,7 @@ test('OOB wiring exposes no listener secret material', async () => {
     }
     const minted = broker.mintCanary('oob-test', 'leak-check')
     const surface = JSON.stringify({ port: oob.port, handleKeys: Object.keys(oob), base: broker.listenerInfo().localBaseUrl })
-    assert.doesNotMatch(surface, /secret|guardian-canary-[a-f0-9]{24}/i, 'the wiring handle exposes neither the signing secret nor a minted token')
+    assert.doesNotMatch(surface, /secret|kovo-canary-[a-f0-9]{24}/i, 'the wiring handle exposes neither the signing secret nor a minted token')
     assert.equal(typeof oob.port, 'number')
     assert.equal(new URL(minted.httpUrl).port, String(oob.port))
   } finally {
@@ -211,7 +211,7 @@ test('OOB wiring: adapter forwards the same broker and never serializes persona 
       stop: async () => undefined,
     }
     try {
-      const result = await runGuardianAgainstMaterialized({
+      const result = await runKovoAgainstMaterialized({
         treeDir, seed: 1, app: 'acme-saas', profileMode: 'v4-full', verifierBackend: 'local-jq', started, oobCanary: oob,
       }, {
         loadEngine: async () => engine,

@@ -57,13 +57,13 @@ import type {
 } from '../src/server/worker-backend.ts'
 import { setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SIGNING_KEY = 'a1-engine-test-hmac-key-0123456789abcdef'
 
 function makeStore(t: { after: (fn: () => void) => void }): { storage: Store; dir: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-arch-a1-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-arch-a1-'))
   const storage = new Store(dir)
   t.after(() => {
     try { storage.close() } catch { /* already closed in restart test */ }
@@ -574,7 +574,7 @@ test('A1.3: runV8AgentScriptProof is collapsed into unified runAgentScriptProof 
           return {
             runtime: req.runtime,
             result: {
-              sdk: 'guardian_verify.ts',
+              sdk: 'kovo_verify.ts',
               title: 'Composite JWT scope replay',
               claims: verObj.verificationId ? [{ kind: 'composite_receipt', verificationId: verObj.verificationId, chainId: compositeReceipt.chainId, terminalVulnClass: compositeReceipt.terminalVulnClass, exchangeIds: [ctrlId, h1Id, mintedObj.exchangeId, h3Id] }] : [],
             },

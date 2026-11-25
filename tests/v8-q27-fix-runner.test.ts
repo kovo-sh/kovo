@@ -23,12 +23,12 @@ import { createLocalAttemptFactory } from '../src/server/verify-rpc.ts'
 import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'
 import type { ResolvedPersona } from '../src/server/persona-vault.ts'
-import { summarizeGuardianVerifyOutcome } from '../src/server/agent-prompts.ts'
+import { summarizeKovoVerifyOutcome } from '../src/server/agent-prompts.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const SDK_DIR = join(REPO_ROOT, 'worker/guardian_verify')
+const SDK_DIR = join(REPO_ROOT, 'worker/kovo_verify')
 
 function makeMockOpenAttempt(
   populate: (transcript: TranscriptStore, attempt: 1 | 2, nonce: string) => void,
@@ -86,8 +86,8 @@ test('clean exit (0) with 0 claims and host-sealed capability returns checkpoint
         })
       },
       (_attempt, nonce) => ({
-        result: { sdk: 'guardian_verify.ts', nonce, title: 'Hop 1 seal', claims: [] },
-        stdout: 'guardian_verify: 0 transcript-backed claim(s) recorded\n',
+        result: { sdk: 'kovo_verify.ts', nonce, title: 'Hop 1 seal', claims: [] },
+        stdout: 'kovo_verify: 0 transcript-backed claim(s) recorded\n',
         stderr: '',
         exitCode: 0,
         durationMs: 12,
@@ -105,7 +105,7 @@ test('clean exit (0) with 0 claims and host-sealed capability returns checkpoint
   assert.ok(verdict.usageHint && verdict.usageHint.includes('cap:hop_1:signing_key'))
   assert.match(verdict.usageHint, /ctx\.prove_composite/)
 
-  const summary = summarizeGuardianVerifyOutcome(verdict)
+  const summary = summarizeKovoVerifyOutcome(verdict)
   assert.equal(summary.confirmed, false)
   assert.equal(summary.reason, 'checkpoint_only')
   assert.equal(summary.rejectedBy, 'checkpoint')
@@ -144,7 +144,7 @@ test('clean exit (0) with 0 claims and crypto / async_poll / extended host ops r
         })
       },
       (_attempt, nonce) => ({
-        result: { sdk: 'guardian_verify.ts', nonce, claims: [] },
+        result: { sdk: 'kovo_verify.ts', nonce, claims: [] },
         stdout: '',
         stderr: '',
         exitCode: 0,
@@ -186,7 +186,7 @@ test('clean exit (0) with 0 claims and crypto / async_poll / extended host ops r
         })
       },
       (_attempt, nonce) => ({
-        result: { sdk: 'guardian_verify.ts', nonce, claims: [] },
+        result: { sdk: 'kovo_verify.ts', nonce, claims: [] },
         stdout: '',
         stderr: '',
         exitCode: 0,
@@ -229,7 +229,7 @@ test('clean exit (0) with 0 claims and crypto / async_poll / extended host ops r
         })
       },
       (_attempt, nonce) => ({
-        result: { sdk: 'guardian_verify.ts', nonce, claims: [] },
+        result: { sdk: 'kovo_verify.ts', nonce, claims: [] },
         stdout: '',
         stderr: '',
         exitCode: 0,
@@ -251,7 +251,7 @@ test('clean exit (0) with 0 claims and crypto / async_poll / extended host ops r
         Object.assign(transcript as unknown as Record<string, unknown>, { capabilitiesSealed: 1, polls: [{ id: 'p-1' }] })
       },
       (_attempt, nonce) => ({
-        result: { sdk: 'guardian_verify.ts', nonce, claims: [] },
+        result: { sdk: 'kovo_verify.ts', nonce, claims: [] },
         stdout: '',
         stderr: '',
         exitCode: 0,
@@ -293,7 +293,7 @@ test('plain zero-claim run (and forged stdout without host transcript ops) still
         })
       },
       (_attempt, nonce) => ({
-        result: { sdk: 'guardian_verify.ts', nonce, claims: [], sealedCapabilities: ['cap:hop_1:forged'] },
+        result: { sdk: 'kovo_verify.ts', nonce, claims: [], sealedCapabilities: ['cap:hop_1:forged'] },
         stdout: 'Checkpoint saved (sealed: cap:hop_1:forged)\n',
         stderr: '',
         exitCode: 0,
@@ -335,9 +335,9 @@ test('non-zero exit or result.error maps rejectedBy to execution with real error
         })
       },
       (_attempt, nonce) => ({
-        result: { sdk: 'guardian_verify.ts', nonce, error: 'RPC crypto.hmacSign requires secretHandle.', claims: [] },
+        result: { sdk: 'kovo_verify.ts', nonce, error: 'RPC crypto.hmacSign requires secretHandle.', claims: [] },
         stdout: '',
-        stderr: 'guardian_verify: RPC crypto.hmacSign requires secretHandle.\n',
+        stderr: 'kovo_verify: RPC crypto.hmacSign requires secretHandle.\n',
         exitCode: 1,
         durationMs: 14,
       }),
@@ -377,7 +377,7 @@ test('non-zero exit or result.error maps rejectedBy to execution with real error
         })
       },
       (_attempt, nonce) => ({
-        result: { sdk: 'guardian_verify.ts', nonce, error: 'RPC capability.seal failed: unsupported kind', claims: [] },
+        result: { sdk: 'kovo_verify.ts', nonce, error: 'RPC capability.seal failed: unsupported kind', claims: [] },
         stdout: '',
         stderr: '',
         exitCode: 0,
@@ -423,7 +423,7 @@ test('non-zero exit or result.error maps rejectedBy to execution with real error
       },
       (_attempt, nonce) => ({
         result: {
-          sdk: 'guardian_verify.ts',
+          sdk: 'kovo_verify.ts',
           nonce,
           title: 'crashed cleanup',
           claims: [{ kind: 'status', exchangeId: 'gx-nonexistent', expected: 200 }],
@@ -483,7 +483,7 @@ test('failed latestCompositeVerification ALWAYS takes precedence over checkpoint
     openAttempt: makeMockOpenAttempt(
       populateFailedComposite,
       (_attempt, nonce) => ({
-        result: { sdk: 'guardian_verify.ts', nonce, title: 'Composite attempt', claims: [] },
+        result: { sdk: 'kovo_verify.ts', nonce, title: 'Composite attempt', claims: [] },
         stdout: '',
         stderr: '',
         exitCode: 0,
@@ -502,7 +502,7 @@ test('failed latestCompositeVerification ALWAYS takes precedence over checkpoint
     openAttempt: makeMockOpenAttempt(
       populateFailedComposite,
       (_attempt, nonce) => ({
-        result: { sdk: 'guardian_verify.ts', nonce, error: 'AssertionError: composite rejected', claims: [] },
+        result: { sdk: 'kovo_verify.ts', nonce, error: 'AssertionError: composite rejected', claims: [] },
         stdout: '',
         stderr: 'AssertionError: composite rejected\n',
         exitCode: 1,

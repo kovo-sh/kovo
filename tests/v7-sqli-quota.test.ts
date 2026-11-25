@@ -79,7 +79,7 @@ test('search hint matches whole route tokens only, never a substring', () => {
     ['/api/v1/query', true],
     // Query-string keys are parameters, not route shape: `inferEndpointParams` already reads them,
     // so the hint predicate ignores the query string entirely.
-    ['/api/v1/products?query=guardian', false],
+    ['/api/v1/products?query=kovo', false],
     ['/api/v1/catalog', false],
     ['/api/v1/catalogs', false],
     ['/api/v1/catalog-items', false],

@@ -5,7 +5,7 @@ import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { createGuardianLocalServer } from '../scripts/serve.ts'
+import { createKovoLocalServer } from '../scripts/serve.ts'
 import { purgeExpiredArtifacts } from '../src/server/artifact-ttl.ts'
 import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant, Transport } from '../src/server/broker.ts'
@@ -34,7 +34,7 @@ import { Store, TenantIsolationError } from '../src/server/store.ts'
 const appOrigin = 'https://target.example.test'
 
 function tempDir(prefix: string): string {
-  return mkdtempSync(join(tmpdir(), `guardian-${prefix}-`))
+  return mkdtempSync(join(tmpdir(), `kovo-${prefix}-`))
 }
 
 function makeGrant(overrides: Partial<Grant> = {}): Grant {
@@ -850,8 +850,8 @@ test('M4: portable ProofReceipt export signs/verifies, enforces ZDR & tenant iso
     TenantIsolationError,
   )
 
-  // 2. Live authenticated HTTP ops endpoints via createGuardianLocalServer
-  const local = createGuardianLocalServer({
+  // 2. Live authenticated HTTP ops endpoints via createKovoLocalServer
+  const local = createKovoLocalServer({
     app: { fetch: () => new Response('ok', { status: 200 }) },
     directory: join(dir, 'server-auth'),
     port: 0,
@@ -864,7 +864,7 @@ test('M4: portable ProofReceipt export signs/verifies, enforces ZDR & tenant iso
   // Re-bind allowedOrigins with actual ephemeral port by constructing server on the bound port
   await new Promise<void>(resolve => local.server.close(() => resolve()))
 
-  const live = createGuardianLocalServer({
+  const live = createKovoLocalServer({
     app: { fetch: () => new Response('ok', { status: 200 }) },
     directory: join(dir, 'server-auth-live'),
     port,
@@ -886,7 +886,7 @@ test('M4: portable ProofReceipt export signs/verifies, enforces ZDR & tenant iso
     assert.equal(bootRes.status, 303)
     const setCookie = bootRes.headers.get('set-cookie') ?? ''
     const cookie = setCookie.split(';')[0]!
-    assert.match(cookie, /^guardian_local=[a-f0-9]{64}$/)
+    assert.match(cookie, /^kovo_local=[a-f0-9]{64}$/)
 
     // GET /api/ops/kill-switch -> initially inactive
     const statusBefore = await fetch(`${baseUrl}/api/ops/kill-switch`, { headers: { cookie } })
@@ -921,7 +921,7 @@ test('M4: portable ProofReceipt export signs/verifies, enforces ZDR & tenant iso
     })
     assert.equal(exportOk.status, 200)
     assert.match(exportOk.headers.get('cache-control') ?? '', /no-store/)
-    assert.match(exportOk.headers.get('content-disposition') ?? '', /guardian-receipts-/)
+    assert.match(exportOk.headers.get('content-disposition') ?? '', /kovo-receipts-/)
     const httpBundle = await exportOk.json()
     const httpJson = JSON.stringify(httpBundle)
     assert.ok(!httpJson.includes('victim@corp.example'))
@@ -930,7 +930,7 @@ test('M4: portable ProofReceipt export signs/verifies, enforces ZDR & tenant iso
 
     // Verify default workspace HMAC signature matches
     const defaultSecret = createHash('sha256')
-      .update(`guardian.receipt-export.v1\0${storage.workspace.id}`)
+      .update(`kovo.receipt-export.v1\0${storage.workspace.id}`)
       .digest('hex')
     assert.deepEqual(
       verifyProofReceiptBundle(httpBundle, { algorithm: 'hmac-sha256', secret: defaultSecret }),

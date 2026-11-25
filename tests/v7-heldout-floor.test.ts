@@ -88,7 +88,7 @@ test('held-out floor: a differential probe carries its class into the brokered r
   const result = await probeDifferential(
     {
       origin: ORIGIN,
-      pathAndQuery: '/api/items?q=guardian',
+      pathAndQuery: '/api/items?q=kovo',
       method: 'GET',
       probeClass: 'sqli_boolean',
       param: 'q',

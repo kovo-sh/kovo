@@ -1,5 +1,5 @@
 /**
- * Guardian v3 boundary suite (SPEC-v3 §2 invariants, §7 threat model, §9 exit gates).
+ * Kovo Hunter v3 boundary suite (SPEC-v3 §2 invariants, §7 threat model, §9 exit gates).
  *
  * Part A — subsystems that do not depend on RequestBroker v3:
  *   A1 hardened air-gapped worker (real Docker): flags, UID, SAST masking, offline scripts, static AST re-verification
@@ -97,11 +97,11 @@ function baseFinding(overrides: Partial<Finding> = {}): Finding {
 }
 
 // ============================================================================
-// A1. Hardened air-gapped worker (guardian-worker:local v3) — real Docker
+// A1. Hardened air-gapped worker (kovo-worker:local v3) — real Docker
 // ============================================================================
 
 test('A1 worker v3: --network none/read-only/cap-drop ALL/no-new-privileges/UID 10001 with v3 limits, masked SAST, offline scripts, static AST re-verification', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'guardian-v3-worker-'))
+  const root = mkdtempSync(join(tmpdir(), 'kovo-v3-worker-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))
   const reposDir = join(root, 'repos')
   mkdirSync(reposDir, { recursive: true })
@@ -117,7 +117,7 @@ test('A1 worker v3: --network none/read-only/cap-drop ALL/no-new-privileges/UID 
 
   let containerId = ''
   for (let i = 0; i < 60 && !containerId; i++) {
-    containerId = (await exec('docker', ['ps', '-q', '--filter', `label=dev.guardian.assignment=${assignmentId}`])).stdout.trim()
+    containerId = (await exec('docker', ['ps', '-q', '--filter', `label=dev.kovo.assignment=${assignmentId}`])).stdout.trim()
     if (!containerId) await delay(50)
   }
   assert.ok(containerId, 'session container must be running')
@@ -218,18 +218,18 @@ test('A1 worker v3: --network none/read-only/cap-drop ALL/no-new-privileges/UID 
 // A2. local-lab gating + live --internal lab isolation (Invariant #7)
 // ============================================================================
 
-test('A2 local-lab origin gating: public projects never relax; lab origins need local-lab + GUARDIAN_ALLOW_LOCAL_LAB=1', async () => {
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: undefined }, () => {
+test('A2 local-lab origin gating: public projects never relax; lab origins need local-lab + KOVO_ALLOW_LOCAL_LAB=1', async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: undefined }, () => {
     for (const bad of ['http://127.0.0.1:8080', 'https://example.com:8443', 'https://10.0.0.5', 'http://example.com']) {
       assert.equal(publicAssetOrigin.safeParse(bad).success, false, `public must reject ${bad}`)
       assert.equal(scopedAssetOrigin.safeParse(bad).success, false, `scoped must reject ${bad} without env`)
     }
     assert.equal(labAssetOrigin.safeParse('http://127.0.0.1:8080').success, false)
     assert.equal(assetOriginForEnvironment('local-lab').safeParse('http://127.0.0.1:8080').success, false)
-    assert.throws(() => assertLocalLabAllowed('local-lab'), /GUARDIAN_ALLOW_LOCAL_LAB/)
+    assert.throws(() => assertLocalLabAllowed('local-lab'), /KOVO_ALLOW_LOCAL_LAB/)
     assert.equal(publicAssetOrigin.parse('example.com'), 'https://example.com')
   })
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => {
     assert.equal(labAssetOrigin.parse('http://127.0.0.1:8080'), 'http://127.0.0.1:8080')
     assert.equal(labAssetOrigin.parse('http://localhost:3000'), 'http://localhost:3000')
     assert.equal(labAssetOrigin.safeParse('http://169.254.169.254').success, false, 'metadata IP never allowed')
@@ -259,22 +259,22 @@ function labRepo(root: string): string {
 }
 
 test('A2 LabRunner: hard-blocked on public / without env; live --internal target is cap-dropped, sanitized, egress-blocked, patchable, and leaves no orphans', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'guardian-v3-lab-'))
+  const root = mkdtempSync(join(tmpdir(), 'kovo-v3-lab-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))
   const repoDir = labRepo(root)
   const runner = new LabRunner()
   const runId = randomUUID()
   t.after(() => runner.stopAll())
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     await assert.rejects(runner.startLabTarget({ runId, environment: 'public', repoDir }), /forbidden/)
   })
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: undefined }, async () => {
-    await assert.rejects(runner.startLabTarget({ runId, environment: 'local-lab', repoDir }), /GUARDIAN_ALLOW_LOCAL_LAB/)
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: undefined }, async () => {
+    await assert.rejects(runner.startLabTarget({ runId, environment: 'local-lab', repoDir }), /KOVO_ALLOW_LOCAL_LAB/)
   })
-  assert.equal((await exec('docker', ['ps', '-aq', '--filter', `label=dev.guardian.run=${runId}`])).stdout.trim(), '', 'blocked starts must create nothing')
+  assert.equal((await exec('docker', ['ps', '-aq', '--filter', `label=dev.kovo.run=${runId}`])).stdout.trim(), '', 'blocked starts must create nothing')
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const handle = await runner.startLabTarget({
       runId, environment: 'local-lab', repoDir,
       labConfig: { internalPort: 8080, healthPath: '/health', image: 'node:24-bookworm-slim' },
@@ -317,13 +317,13 @@ test('A2 LabRunner: hard-blocked on public / without env; live --internal target
     await assert.rejects(runner.rebuildWithPatch(runId, '--- a/../../etc/passwd\n+++ b/../../etc/passwd\n@@ -1 +1 @@\n-x\n+y\n'), /Unsafe|escapes/)
 
     await runner.stopAll()
-    assert.equal((await exec('docker', ['ps', '-aq', '--filter', `label=dev.guardian.run=${runId}`])).stdout.trim(), '')
+    assert.equal((await exec('docker', ['ps', '-aq', '--filter', `label=dev.kovo.run=${runId}`])).stdout.trim(), '')
     assert.equal((await exec('docker', ['network', 'ls', '-q', '--filter', `name=${handle.networkName}`])).stdout.trim(), '')
   })
 })
 
 test('A2 LabRunner Invariant #7: lab app container has zero access to host services (bridge gateway)', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'guardian-v3-lab-host-'))
+  const root = mkdtempSync(join(tmpdir(), 'kovo-v3-lab-host-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))
   const repoDir = labRepo(root)
   const runner = new LabRunner()
@@ -331,7 +331,7 @@ test('A2 LabRunner Invariant #7: lab app container has zero access to host servi
   const host = await hostFixture('0.0.0.0')
   t.after(() => host.close())
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const handle = await runner.startLabTarget({
       runId: randomUUID(), environment: 'local-lab', repoDir,
       labConfig: { internalPort: 8080, healthPath: '/health', image: 'node:24-bookworm-slim' },
@@ -414,7 +414,7 @@ test('A3 dedupe: structural fingerprint rejects duplicates, normalizes IDs, upgr
 // ============================================================================
 
 test('A4 patch workflow: attacker_only patch approved; breaks_callers patch withheld (offline AND even when an LLM reviewer approves it); repo never mutated', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'guardian-v3-patch-'))
+  const root = mkdtempSync(join(tmpdir(), 'kovo-v3-patch-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))
   const reposDir = join(root, 'repos')
   mkdirSync(reposDir)
@@ -529,21 +529,21 @@ test('A5 SARIF 2.1.0: valid structure, tier separation, approved-only fixes, non
 
   const results = log.runs[0].results
   const fails = results.filter(r => r.kind === 'fail')
-  assert.deepEqual(fails.map(r => r.properties.guardian.findingId).sort(), ['f-runtime', 'f-static'])
-  const runtime = fails.find(r => r.properties.guardian.findingId === 'f-runtime')!
-  const stat = fails.find(r => r.properties.guardian.findingId === 'f-static')!
-  assert.equal(runtime.properties.guardian.verificationTier, 'runtime_confirmed')
-  assert.equal(stat.properties.guardian.verificationTier, 'static_verified')
-  assert.ok(stat.properties.guardian.runtimeProofGap)
-  assert.notEqual(stat.properties.guardian.status, 'confirmed')
+  assert.deepEqual(fails.map(r => r.properties.kovo.findingId).sort(), ['f-runtime', 'f-static'])
+  const runtime = fails.find(r => r.properties.kovo.findingId === 'f-runtime')!
+  const stat = fails.find(r => r.properties.kovo.findingId === 'f-static')!
+  assert.equal(runtime.properties.kovo.verificationTier, 'runtime_confirmed')
+  assert.equal(stat.properties.kovo.verificationTier, 'static_verified')
+  assert.ok(stat.properties.kovo.runtimeProofGap)
+  assert.notEqual(stat.properties.kovo.status, 'confirmed')
   assert.equal(runtime.ruleId, 'CWE-639')
-  assert.equal(runtime.properties.guardian.replaySpecSha256, 'a'.repeat(64))
-  assert.deepEqual(runtime.properties.guardian.exchangeIds, ['ex-1'], 'only approved-scope exchanges are exported')
+  assert.equal(runtime.properties.kovo.replaySpecSha256, 'a'.repeat(64))
+  assert.deepEqual(runtime.properties.kovo.exchangeIds, ['ex-1'], 'only approved-scope exchanges are exported')
   assert.equal(runtime.fixes?.length, 1, 'approved patch emits SARIF fixes')
   assert.equal(stat.fixes, undefined, 'withheld patches never emit fixes')
   assert.equal(runtime.locations[0].physicalLocation?.artifactLocation.uri, 'northstar-app/app/actions/invoice.ts')
 
-  const coverage = results.filter(r => r.properties.guardian.recordType === 'coverage_entry')
+  const coverage = results.filter(r => r.properties.kovo.recordType === 'coverage_entry')
   assert.deepEqual(coverage.map(r => r.kind).sort(), ['notApplicable', 'open', 'pass', 'pass'])
   assert.ok(coverage.every(r => r.level === 'none'), 'non-failing rows must have level "none"')
   const rule = log.runs[0].tool.driver.rules.find(r => r.id === 'CWE-639')!
@@ -571,12 +571,12 @@ test('A6 CLI: exit codes 0/1/2, --help, flag validation, local-lab gate, 0600 pe
   assert.equal((await run(['scan', '--bogus-flag'])).code, 1)
   assert.equal((await run(['scan', '--tier', '7', '--origin', 'example.com'])).code, 1)
   assert.equal((await run(['scan'])).code, 1, 'no target is a usage error')
-  const labBlocked = await run(['scan', '--local-lab', '--origin', 'http://127.0.0.1:8080'], { GUARDIAN_ALLOW_LOCAL_LAB: undefined })
+  const labBlocked = await run(['scan', '--local-lab', '--origin', 'http://127.0.0.1:8080'], { KOVO_ALLOW_LOCAL_LAB: undefined })
   assert.equal(labBlocked.code, 1)
-  assert.match(labBlocked.stderr, /GUARDIAN_ALLOW_LOCAL_LAB/)
-  assert.equal((await run(['scan', '--origin', 'http://127.0.0.1:8080'], { GUARDIAN_ALLOW_LOCAL_LAB: undefined })).code, 1, 'public scans reject lab origins')
+  assert.match(labBlocked.stderr, /KOVO_ALLOW_LOCAL_LAB/)
+  assert.equal((await run(['scan', '--origin', 'http://127.0.0.1:8080'], { KOVO_ALLOW_LOCAL_LAB: undefined })).code, 1, 'public scans reject lab origins')
 
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v3-cli-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v3-cli-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const loose = join(dir, 'loose.json')
   writeFileSync(loose, JSON.stringify({ secret: 'cli-persona-secret-9911', authKind: 'bearer' }))
@@ -664,7 +664,7 @@ test('B1 surface-engine & safe templates: 100% broker-routed, SPA calibration, c
     '    words: [ok]',
   ].join('\n')), TemplateValidationError)
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const grant = makeLabGrant(lab.origin, { tier: 2 })
     const sig = AbortSignal.timeout(30_000)
@@ -733,7 +733,7 @@ test('B2 RequestBroker v3: DELETE & multipart/form-data hard-blocked at Tiers 0-
     }],
   ])
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const sig = AbortSignal.timeout(15_000)
 
@@ -819,7 +819,7 @@ test('B3 probeWebsocket & interactive ScopedBrowser: 100% broker-proxied, origin
     }],
   ])
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const sig = AbortSignal.timeout(30_000)
 
@@ -887,7 +887,7 @@ test('B3 probeWebsocket & interactive ScopedBrowser: 100% broker-proxied, origin
     const iaOrigin = `http://127.0.0.1:${iaAddr.port}`
 
     const browser = new ScopedBrowser(broker)
-    const canary = 'guardianSinkMarker9876'
+    const canary = 'kovoSinkMarker9876'
     const visit = await browser.visitPage({
       origin: iaOrigin,
       pathAndQuery: '/',
@@ -948,7 +948,7 @@ test('B4 dual HTTP + authoritative UDP DNS CanaryBroker receives both protocols 
 })
 
 test('B5 ReplayVerifier v3: static_ast_proof strictly static_verified (never confirmed); requireControlNonError returns inconclusive on unexpected 404/5xx', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'guardian-v3-ver-'))
+  const root = mkdtempSync(join(tmpdir(), 'kovo-v3-ver-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))
   const reposDir = join(root, 'repos')
   mkdirSync(reposDir)
@@ -1001,7 +1001,7 @@ test('B5 ReplayVerifier v3: static_ast_proof strictly static_verified (never con
   if (!addr404 || typeof addr404 === 'string') throw new Error('no address')
   const origin404 = `http://127.0.0.1:${addr404.port}`
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const posture404 = await verifyReplaySpec({
       spec: {
         version: 1,
@@ -1031,15 +1031,15 @@ test('B5 ReplayVerifier v3: static_ast_proof strictly static_verified (never con
 })
 
 test('B6 v2->v3 SQLite auto-migration & Store 3-state closure persistence', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v3-store-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v3-store-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const v2SmokeDb = join(repoRootDir, '.guardian', 'dyad-v2-smoke', 'data', 'guardian.sqlite')
+  const v2SmokeDb = join(repoRootDir, '.kovo', 'dyad-v2-smoke', 'data', 'kovo.sqlite')
 
   // If the read-only v2 smoke DB exists, copy it to /tmp and verify lossless v3 auto-migration (NEVER touching original!)
   if (existsSync(v2SmokeDb)) {
     const copyDir = join(dir, 'v2-copy')
     mkdirSync(copyDir)
-    copyFileSync(v2SmokeDb, join(copyDir, 'guardian.sqlite'))
+    copyFileSync(v2SmokeDb, join(copyDir, 'kovo.sqlite'))
     const migrated = new Store(copyDir)
     t.after(() => migrated.close())
     const { projects } = migrated.listWorkspace()

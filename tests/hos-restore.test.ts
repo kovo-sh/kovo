@@ -14,7 +14,7 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
 // Replay specs for loopback lab origins are only schema-valid in local-lab mode.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import {
   actionStateTokens,

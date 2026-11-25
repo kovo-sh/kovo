@@ -1,5 +1,5 @@
 /**
- * Guardian v5 M5 (board-tools stream) — specialist board tools & warm-specialist lifecycle.
+ * Kovo Hunter v5 M5 (board-tools stream) — specialist board tools & warm-specialist lifecycle.
  *
  * Covers plans/message-board.md §5–6 and plans/v5.md §5.2:
  *   - board_post/board_read availability across all 7 specialist profiles;
@@ -42,7 +42,7 @@ const originB = 'https://tools-b.example'
 const SECRET = 'BOARD_TOOLS_SECRET_COOKIE_987'
 
 function makeRun(t: { after: (fn: () => void) => void }, origins: readonly string[] = [originA]) {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v5-board-tools-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v5-board-tools-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const store = new Store(dir)
   t.after(() => store.close())

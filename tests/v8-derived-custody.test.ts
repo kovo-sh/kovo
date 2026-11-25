@@ -89,7 +89,7 @@ test('DerivedCapabilityVault seals secrets behind opaque handles without leaking
 })
 
 test('DerivedCapabilityVault enforces 0600 persistence and run-scoped isolation', (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-custody-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-custody-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const persistPath = join(dir, 'nested', 'custody.json')
 

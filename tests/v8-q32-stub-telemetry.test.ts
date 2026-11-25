@@ -6,7 +6,7 @@
  *     exchange cited by `ti.proofReceipt`. Rejects fail-closed with `terminal_impact_unproven`
  *     unless a non-stub `postMutRb` or delivered OOB/browser sink proves terminal impact.
  *  2. Sanitized `topRejectDetails` telemetry in `scripts/benchmark-multihop.ts`:
- *     top 12 most frequent sanitized failure signatures across `guardian_verify` / `composite.verify`,
+ *     top 12 most frequent sanitized failure signatures across `kovo_verify` / `composite.verify`,
  *     normalizing UUIDs / gx-IDs / cap-handles / ports / numbers to `<id>`, capped <= 140 chars,
  *     and never leaking raw HTTP bodies or secrets.
  */
@@ -266,10 +266,10 @@ test('sanitizeRejectSignature normalizes UUIDs/gx-IDs/cap-handles/ports/numbers,
   assert.ok(!htmlLeak.includes('secret customer PII'))
 })
 
-test('extractMultihopRunTelemetry & aggregateMultihopTelemetry compute top-12 sanitized topRejectDetails across events and guardian_verify sessions', () => {
-  const tempDir = mkdtempSync(join(tmpdir(), 'guardian-q32-telemetry-'))
+test('extractMultihopRunTelemetry & aggregateMultihopTelemetry compute top-12 sanitized topRejectDetails across events and kovo_verify sessions', () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'kovo-q32-telemetry-'))
   try {
-    const dbPath = join(tempDir, 'guardian.sqlite')
+    const dbPath = join(tempDir, 'kovo.sqlite')
     const db = new DatabaseSync(dbPath)
     db.exec(`
       CREATE TABLE runs (id TEXT PRIMARY KEY, created_at INTEGER);
@@ -293,18 +293,18 @@ test('extractMultihopRunTelemetry & aggregateMultihopTelemetry compute top-12 sa
     }), t0 + 3000)
     // Add 13 distinct synthetic reject signatures to verify top-12 truncation.
     for (let i = 1; i <= 13; i++) {
-      insEv.run('r-q32', 'guardian_verify.failed', JSON.stringify({
+      insEv.run('r-q32', 'kovo_verify.failed', JSON.stringify({
         rejectedBy: 'dag_topology',
         detail: `Distinct topology defect alpha_${String.fromCharCode(64 + i)} on hop_${i}`,
       }), t0 + 4000 + i)
     }
 
-    // Add agent-sessions SQLite with guardian_verify execution stderr + terminal_impact rejections.
+    // Add agent-sessions SQLite with kovo_verify execution stderr + terminal_impact rejections.
     const sessionsDir = join(tempDir, 'agent-sessions')
     mkdirSync(sessionsDir, { recursive: true })
     const sessDb = new DatabaseSync(join(sessionsDir, 'sess-q32.sqlite'))
     sessDb.exec('CREATE TABLE entries (id INTEGER PRIMARY KEY AUTOINCREMENT, commit_seq INTEGER NOT NULL, record TEXT NOT NULL)')
-    const gvToolCall = (id: string) => ({ role: 'assistant', content: [{ type: 'toolCall', id, name: 'guardian_verify', arguments: { script: 'await ctx.prove_composite({})' } }] })
+    const gvToolCall = (id: string) => ({ role: 'assistant', content: [{ type: 'toolCall', id, name: 'kovo_verify', arguments: { script: 'await ctx.prove_composite({})' } }] })
     const sessRecord = {
       model: [
         gvToolCall('tc-1'),

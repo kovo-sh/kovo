@@ -169,19 +169,19 @@ async function h1Fixture(): Promise<H1Fixture> {
 
 test('v6 transport: HTTP/2, proxy, mTLS and header-profile configuration fail closed', async t => {
   assert.equal(resolveTransportConfig({}).http2, false)
-  assert.equal(resolveTransportConfig({ GUARDIAN_HTTP2: '1' }).http2, true)
-  assert.equal(resolveTransportConfig({ GUARDIAN_HTTP2: '0' }).http2, false)
-  assert.throws(() => resolveTransportConfig({ GUARDIAN_HTTP2: 'yes' }), TransportConfigError)
+  assert.equal(resolveTransportConfig({ KOVO_HTTP2: '1' }).http2, true)
+  assert.equal(resolveTransportConfig({ KOVO_HTTP2: '0' }).http2, false)
+  assert.throws(() => resolveTransportConfig({ KOVO_HTTP2: 'yes' }), TransportConfigError)
 
-  assert.throws(() => resolveTransportConfig({ GUARDIAN_EGRESS_PROXY: 'ftp://proxy.example' }), TransportConfigError)
-  assert.throws(() => resolveTransportConfig({ GUARDIAN_EGRESS_PROXY: 'not a url' }), TransportConfigError)
-  assert.throws(() => resolveTransportConfig({ GUARDIAN_EGRESS_PROXY: 'http://' }), TransportConfigError)
-  const proxy = resolveTransportConfig({ GUARDIAN_EGRESS_PROXY: 'socks5h://user:pass@proxy.example:1081' })
+  assert.throws(() => resolveTransportConfig({ KOVO_EGRESS_PROXY: 'ftp://proxy.example' }), TransportConfigError)
+  assert.throws(() => resolveTransportConfig({ KOVO_EGRESS_PROXY: 'not a url' }), TransportConfigError)
+  assert.throws(() => resolveTransportConfig({ KOVO_EGRESS_PROXY: 'http://' }), TransportConfigError)
+  const proxy = resolveTransportConfig({ KOVO_EGRESS_PROXY: 'socks5h://user:pass@proxy.example:1081' })
   assert.equal(proxy.proxy?.protocol, 'socks5h:')
   assert.equal(proxy.proxy?.port, 1081)
   assert.ok(proxy.proxy?.authorization?.startsWith('Basic '))
 
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v6-mtls-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v6-mtls-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
   const keyPath = join(dir, 'client.key')
@@ -189,39 +189,39 @@ test('v6 transport: HTTP/2, proxy, mTLS and header-profile configuration fail cl
   writeFileSync(keyPath, privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(), { mode: 0o600 })
   writeFileSync(certPath, '-----BEGIN CERTIFICATE-----\nnot-a-real-cert\n-----END CERTIFICATE-----\n')
 
-  assert.throws(() => resolveTransportConfig({ GUARDIAN_MTLS_CERT: certPath }), TransportConfigError)
-  assert.throws(() => resolveTransportConfig({ GUARDIAN_MTLS_KEY: keyPath }), TransportConfigError)
+  assert.throws(() => resolveTransportConfig({ KOVO_MTLS_CERT: certPath }), TransportConfigError)
+  assert.throws(() => resolveTransportConfig({ KOVO_MTLS_KEY: keyPath }), TransportConfigError)
   assert.throws(
-    () => resolveTransportConfig({ GUARDIAN_MTLS_CERT: join(dir, 'missing.crt'), GUARDIAN_MTLS_KEY: keyPath }),
+    () => resolveTransportConfig({ KOVO_MTLS_CERT: join(dir, 'missing.crt'), KOVO_MTLS_KEY: keyPath }),
     TransportConfigError,
   )
-  const mtls = resolveTransportConfig({ GUARDIAN_MTLS_CERT: certPath, GUARDIAN_MTLS_KEY: keyPath })
+  const mtls = resolveTransportConfig({ KOVO_MTLS_CERT: certPath, KOVO_MTLS_KEY: keyPath })
   assert.equal(mtls.mtls?.certPath, certPath)
   assert.match(mtls.mtls?.key ?? '', /BEGIN PRIVATE KEY/)
 
-  assert.throws(() => resolveTransportConfig({ GUARDIAN_AUTHORIZED_HEADERS: '{bad json' }), TransportConfigError)
+  assert.throws(() => resolveTransportConfig({ KOVO_AUTHORIZED_HEADERS: '{bad json' }), TransportConfigError)
   assert.throws(
-    () => resolveTransportConfig({ GUARDIAN_AUTHORIZED_HEADERS: JSON.stringify({ Host: 'evil.example' }) }),
+    () => resolveTransportConfig({ KOVO_AUTHORIZED_HEADERS: JSON.stringify({ Host: 'evil.example' }) }),
     TransportConfigError,
   )
   assert.throws(
-    () => resolveTransportConfig({ GUARDIAN_AUTHORIZED_HEADERS: JSON.stringify({ 'X-Test': 'a\r\nInjected: 1' }) }),
+    () => resolveTransportConfig({ KOVO_AUTHORIZED_HEADERS: JSON.stringify({ 'X-Test': 'a\r\nInjected: 1' }) }),
     TransportConfigError,
   )
   const profile = resolveTransportConfig({
-    GUARDIAN_USER_AGENT: 'Authorized-Scanner/1.0',
-    GUARDIAN_AUTHORIZED_HEADERS: JSON.stringify({ 'Accept-Language': 'en-US' }),
+    KOVO_USER_AGENT: 'Authorized-Scanner/1.0',
+    KOVO_AUTHORIZED_HEADERS: JSON.stringify({ 'Accept-Language': 'en-US' }),
   })
   assert.equal(profile.headerProfile?.userAgent, 'Authorized-Scanner/1.0')
   assert.equal(profile.headerProfile?.headers['Accept-Language'], 'en-US')
 
   // Broker construction must fail closed on a bad environment, not silently downgrade.
-  await withEnv({ GUARDIAN_EGRESS_PROXY: 'http://proxy.example:3128' }, () => {
+  await withEnv({ KOVO_EGRESS_PROXY: 'http://proxy.example:3128' }, () => {
     const valid = new RequestBroker({ resolve: async () => [localAddr] })
     assert.match(valid.getTransportSummary().proxy ?? '', /^http:\/\/proxy\.example:3128$/)
     valid.closeTransport()
   })
-  await withEnv({ GUARDIAN_EGRESS_PROXY: 'ftp://proxy.example' }, () => {
+  await withEnv({ KOVO_EGRESS_PROXY: 'ftp://proxy.example' }, () => {
     assert.throws(() => new RequestBroker({ resolve: async () => [localAddr] }), TransportConfigError)
   })
 })
@@ -231,7 +231,7 @@ test('v6 transport: HTTP/2, proxy, mTLS and header-profile configuration fail cl
 // ---------------------------------------------------------------------------
 
 test('v6 transport: HTTP/2 GET/POST round trip reuses one pooled session; HTTP/1.1 fallback works', async t => {
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const h2 = await h2Fixture()
     t.after(() => h2.close())
     const broker = new RequestBroker({
@@ -283,12 +283,12 @@ test('v6 transport: HTTP/2 GET/POST round trip reuses one pooled session; HTTP/1
 })
 
 test('v6 transport: configured authorized User-Agent replaces the hardcoded default only when set', async t => {
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const h2 = await h2Fixture()
     t.after(() => h2.close())
     const profile = resolveTransportConfig({
-      GUARDIAN_USER_AGENT: 'Authorized-Scanner/9.1',
-      GUARDIAN_AUTHORIZED_HEADERS: JSON.stringify({ 'X-Scope-Approval': 'run-42' }),
+      KOVO_USER_AGENT: 'Authorized-Scanner/9.1',
+      KOVO_AUTHORIZED_HEADERS: JSON.stringify({ 'X-Scope-Approval': 'run-42' }),
     })
     const broker = new RequestBroker({
       resolve: async () => [localAddr],
@@ -303,12 +303,12 @@ test('v6 transport: configured authorized User-Agent replaces the hardcoded defa
     const defaultBroker = new RequestBroker({ resolve: async () => [localAddr], transportConfig: { http2: true } })
     t.after(() => defaultBroker.closeTransport())
     await defaultBroker.executeHttp({ origin: h2.origin, method: 'GET', pathAndQuery: '/default' }, grant, AbortSignal.timeout(10_000))
-    assert.match(h2.userAgents[1] ?? '', /^Guardian\//, 'unconfigured runs keep the defensive default UA')
+    assert.match(h2.userAgents[1] ?? '', /^Kovo(?:Hunter)?\//, 'unconfigured runs keep the defensive default UA')
   })
 })
 
 test('v6 transport: opt-in egress proxy carries requests and never silently bypasses', async t => {
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const seen: Array<{ path?: string; host?: string; proxyAuth?: string }> = []
     const proxy = createServer((req, res) => {
       seen.push({
@@ -329,7 +329,7 @@ test('v6 transport: opt-in egress proxy carries requests and never silently bypa
     t.after(() => h1.close())
 
     const config = resolveTransportConfig({
-      GUARDIAN_EGRESS_PROXY: `http://user:pass@127.0.0.1:${proxyPort}`,
+      KOVO_EGRESS_PROXY: `http://user:pass@127.0.0.1:${proxyPort}`,
     })
     const broker = new RequestBroker({
       resolve: async () => [localAddr],
@@ -352,7 +352,7 @@ test('v6 transport: opt-in egress proxy carries requests and never silently bypa
     // An HTTPS proxy cannot carry a plaintext target; fail closed instead of bypassing it.
     const httpsProxyBroker = new RequestBroker({
       resolve: async () => [localAddr],
-      transportConfig: { http2: false, proxy: resolveTransportConfig({ GUARDIAN_EGRESS_PROXY: 'https://127.0.0.1:9' }).proxy },
+      transportConfig: { http2: false, proxy: resolveTransportConfig({ KOVO_EGRESS_PROXY: 'https://127.0.0.1:9' }).proxy },
     })
     t.after(() => httpsProxyBroker.closeTransport())
     await assert.rejects(
@@ -372,7 +372,7 @@ test('v6 transport: opt-in egress proxy carries requests and never silently bypa
 // ---------------------------------------------------------------------------
 
 test('v6 transport: HTTP/2 race burst uses one connection and releases stream headers together', async t => {
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const h2 = await h2Fixture()
     t.after(() => h2.close())
     const broker = new RequestBroker({ resolve: async () => [localAddr], transportConfig: { http2: true } })
@@ -563,7 +563,7 @@ test('v6 transport: circuit state is exposed per origin and per route for diagno
 // ---------------------------------------------------------------------------
 
 test('v6 transport: h2 path keeps scope denial, per-instance approvals and race-burst approvals', async t => {
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const h2 = await h2Fixture()
     t.after(() => h2.close())
     const broker = new RequestBroker({ resolve: async () => [localAddr], transportConfig: { http2: true } })
@@ -668,7 +668,7 @@ test('v6 transport: WebSocket session awaits frames, reassembles continuations a
   const json = await session.nextJson<{ next: boolean }>(5_000)
   assert.deepEqual(json, { next: true })
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     // Opt-in broker wiring: turns are ignored unless wsSessionEnabled is set.
     const brokerDefault = new RequestBroker({ resolve: async () => [localAddr], transportConfig: { http2: false } })
     const brokerOptIn = new RequestBroker({

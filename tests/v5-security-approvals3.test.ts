@@ -61,13 +61,13 @@ async function waitForPendingCard(storage: Store, runId: string, timeoutMs = 8_0
 }
 
 async function makeHarness(t: Parameters<typeof startHttpFixture>[0]) {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-exec-approvals-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-exec-approvals-'))
   const storage = new Store(dir)
-  // Local-lab project (so the broker may dial the loopback fixture). GUARDIAN_ALLOW_LOCAL_LAB
+  // Local-lab project (so the broker may dial the loopback fixture). KOVO_ALLOW_LOCAL_LAB
   // enables the broker's loopback transport but every test below uses the strict policy, which
   // disables local-lab auto-approval: the exact single-use ledger must authorize each request.
-  const previousAllowLab = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  const previousAllowLab = process.env.KOVO_ALLOW_LOCAL_LAB
+  process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
   const fixture = await startHttpFixture(t, (_req, _body, res) => {
     res.setHeader('Content-Type', 'application/json')
@@ -84,8 +84,8 @@ async function makeHarness(t: Parameters<typeof startHttpFixture>[0]) {
     await execution.stop()
     storage.close()
     rmSync(dir, { recursive: true, force: true })
-    if (previousAllowLab === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = previousAllowLab
+    if (previousAllowLab === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = previousAllowLab
   })
   const { runId } = await setupApprovedRun(storage, {
     seeds: [fixture.origin],

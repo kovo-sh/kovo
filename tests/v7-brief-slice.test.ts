@@ -25,11 +25,11 @@ import {
   measureAssignmentBriefBytes,
 } from '../src/server/assignment-brief.ts'
 import {
-  GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-  GUARDIAN_VERIFY_SPEC_SHAPE,
+  KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+  KOVO_VERIFY_SPEC_SHAPE,
   formatReplaySpecValidationIssues,
-  guardianVerifyHelperGuidance,
-  guardianVerifyPromptHint,
+  kovoVerifyHelperGuidance,
+  kovoVerifyPromptHint,
 } from '../src/server/agent-session.ts'
 import { declarativeReplaySpecSchema } from '../src/replay-spec.ts'
 import { findings as findingsTable } from '../src/server/schema.ts'
@@ -137,7 +137,7 @@ async function approvedRun(storage: Store) {
 // ============================================================================
 
 test('phase-0 code slices persist bounded, deduped and idempotently on det_lead facts', async t => {
-  const { storage } = makeStore(t, 'guardian-v7-brief-db-')
+  const { storage } = makeStore(t, 'kovo-v7-brief-db-')
   const { run, assignment } = await approvedRun(storage)
   const execution = new Execution(storage)
   t.after(() => execution.stop())
@@ -184,7 +184,7 @@ test('phase-0 code slices persist bounded, deduped and idempotently on det_lead 
 // ============================================================================
 
 test('the stored slice reaches the assignment brief, compact by default and full for chain steps', async t => {
-  const { storage } = makeStore(t, 'guardian-v7-brief-wire-db-')
+  const { storage } = makeStore(t, 'kovo-v7-brief-wire-db-')
   const { run, runId, assignment } = await approvedRun(storage)
   const execution = new Execution(storage)
   t.after(() => execution.stop())
@@ -275,7 +275,7 @@ test('reinvestigation guard caps the third pass per route/class unless evidence 
 })
 
 test('the det_lead scheduler queues two same-route investigations and caps the third', async t => {
-  const { storage } = makeStore(t, 'guardian-v7-brief-cap-db-')
+  const { storage } = makeStore(t, 'kovo-v7-brief-cap-db-')
   const { run, runId, assignment } = await approvedRun(storage)
   const execution = new Execution(storage)
   t.after(() => execution.stop())
@@ -362,7 +362,7 @@ test('a new chain primitive resets the dry-round streak', () => {
 // ============================================================================
 
 test('persisted slices do not change the floor lead ranking', async t => {
-  const { storage } = makeStore(t, 'guardian-v7-brief-floor-db-')
+  const { storage } = makeStore(t, 'kovo-v7-brief-floor-db-')
   const { run, assignment } = await approvedRun(storage)
   const execution = new Execution(storage)
   t.after(() => execution.stop())
@@ -387,7 +387,7 @@ test('persisted slices do not change the floor lead ranking', async t => {
 })
 
 test('seedCodeToRuntimeLeads remains usable as a pure helper', async t => {
-  const { storage } = makeStore(t, 'guardian-v7-brief-pure-db-')
+  const { storage } = makeStore(t, 'kovo-v7-brief-pure-db-')
   const { run, assignment } = await approvedRun(storage)
   const seeded = new Set<string>()
   const created = seedCodeToRuntimeLeads(storage, run, assignment, [adminHypothesis()], seeded, ORIGIN)
@@ -400,16 +400,16 @@ test('seedCodeToRuntimeLeads remains usable as a pure helper', async t => {
 // 6. Spec-shape first-try guidance + exact repair feedback
 // ============================================================================
 
-test('guardian_verify guidance carries the required DeclarativeReplaySpec shape', () => {
-  const hint = guardianVerifyPromptHint()
-  assert.ok(hint.includes(GUARDIAN_VERIFY_SPEC_SHAPE))
+test('kovo_verify guidance carries the required DeclarativeReplaySpec shape', () => {
+  const hint = kovoVerifyPromptHint()
+  assert.ok(hint.includes(KOVO_VERIFY_SPEC_SHAPE))
   for (const required of ['severityRationale', 'steps[]', 'description', 'request{origin', 'request.persona']) {
     assert.ok(hint.includes(required), `prompt hint names ${required}`)
   }
-  const guidance = guardianVerifyHelperGuidance()
+  const guidance = kovoVerifyHelperGuidance()
   assert.ok(guidance.includes('severityRationale'))
   assert.ok(
-    Buffer.byteLength(guidance, 'utf8') <= GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+    Buffer.byteLength(guidance, 'utf8') <= KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
     'helper guidance stays inside its prompt budget',
   )
 })
@@ -523,7 +523,7 @@ test('the stall watchdog retries once and exposes providerStallTurns/Retries', a
   assert.equal(providerStallAbortMs(0, 0), 90_000, 'cold streams get the long floor')
   assert.ok(providerStallAbortMs(2_000, 10) >= PROVIDER_STALL_ABORT_FLOOR_MS)
 
-  const { storage } = makeStore(t, 'guardian-v7-brief-stall-db-')
+  const { storage } = makeStore(t, 'kovo-v7-brief-stall-db-')
   const { runId } = await approvedRun(storage)
   const execution = new Execution(storage)
   t.after(() => execution.stop())
@@ -544,7 +544,7 @@ test('the stall watchdog retries once and exposes providerStallTurns/Retries', a
 // ============================================================================
 
 test('async SSRF/XXE receipt findings use the canonical category and match truth', async t => {
-  const { storage } = makeStore(t, 'guardian-v7-receipt-category-db-')
+  const { storage } = makeStore(t, 'kovo-v7-receipt-category-db-')
   const { run, runId, assignment } = await approvedRun(storage)
   const execution = new Execution(storage)
   t.after(() => execution.stop())

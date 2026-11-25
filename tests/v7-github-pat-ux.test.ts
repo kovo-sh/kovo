@@ -20,7 +20,7 @@ function tempDataDir(prefix: string): string {
 }
 
 test('vault GitHub PAT lifecycle: 0700 dir, 0600 file, status, clear, and fallback only when absent', () => {
-  const dataDir = tempDataDir('guardian-gh-pat-')
+  const dataDir = tempDataDir('kovo-gh-pat-')
   const rawToken = 'github_pat_11EXAMPLE_VAULT_TOKEN_SECRET_9876543210'
   try {
     // Before save: resolve falls back to DEFAULT_GITHUB_PAT_PATH
@@ -90,7 +90,7 @@ test('vault GitHub PAT lifecycle: 0700 dir, 0600 file, status, clear, and fallba
 })
 
 test('saveGithubPat rejects malformed tokens without echoing raw input', () => {
-  const dataDir = tempDataDir('guardian-gh-invalid-')
+  const dataDir = tempDataDir('kovo-gh-invalid-')
   const badToken = 'github_pat_with space_SECRET_DO_NOT_ECHO'
   try {
     assert.throws(
@@ -109,7 +109,7 @@ test('saveGithubPat rejects malformed tokens without echoing raw input', () => {
 })
 
 test('listAccessibleGithubRepos paginates up to maxRepos, classifies tokenKind, and redacts secrets', async () => {
-  const dataDir = tempDataDir('guardian-gh-list-')
+  const dataDir = tempDataDir('kovo-gh-list-')
   const rawToken = 'github_pat_11LIST_TOKEN_SECRET_XYZ987654321'
   try {
     saveGithubPat(dataDir, rawToken)
@@ -180,7 +180,7 @@ test('listAccessibleGithubRepos paginates up to maxRepos, classifies tokenKind, 
 })
 
 test('listAccessibleGithubRepos classifies unknown and classic token kinds via explicit patPath', async () => {
-  const dir = tempDataDir('guardian-gh-kind-')
+  const dir = tempDataDir('kovo-gh-kind-')
   const patPath = join(dir, 'custom.pat')
   try {
     writeFileSync(patPath, 'custom_token_without_prefix_123456\n', { mode: 0o600 })
@@ -216,7 +216,7 @@ test('defaultSelectedRepoNames selects all when <= maxAutoSelect and none when >
 })
 
 test('syncGithubRepos uses vault PAT via dataDir option', async () => {
-  const dataDir = tempDataDir('guardian-gh-sync-')
+  const dataDir = tempDataDir('kovo-gh-sync-')
   const rawToken = 'github_pat_11SYNC_VAULT_TOKEN_999888777666'
   try {
     mkdirSync(dataDir, { recursive: true })

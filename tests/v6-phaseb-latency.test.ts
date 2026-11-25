@@ -41,7 +41,7 @@ import {
 import type { DockerRunner } from '../src/server/worker-backend.ts'
 import { makeStore, setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const origin = 'https://app.example.invalid'
 
@@ -120,9 +120,9 @@ test('budget: the settlement nudge still fires at N-2 for every budget', () => {
 
 test('budget: the single-step wall override stays inside the turnover window', () => {
   assert.equal(singleStepWallClockMs({} as NodeJS.ProcessEnv), SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS)
-  assert.equal(singleStepWallClockMs({ GUARDIAN_SINGLE_STEP_WALL_CLOCK_MS: '78000' } as NodeJS.ProcessEnv), 78_000)
-  assert.equal(singleStepWallClockMs({ GUARDIAN_SINGLE_STEP_WALL_CLOCK_MS: '5000' } as NodeJS.ProcessEnv), 30_000)
-  assert.equal(singleStepWallClockMs({ GUARDIAN_SINGLE_STEP_WALL_CLOCK_MS: '900000' } as NodeJS.ProcessEnv), 120_000)
+  assert.equal(singleStepWallClockMs({ KOVO_SINGLE_STEP_WALL_CLOCK_MS: '78000' } as NodeJS.ProcessEnv), 78_000)
+  assert.equal(singleStepWallClockMs({ KOVO_SINGLE_STEP_WALL_CLOCK_MS: '5000' } as NodeJS.ProcessEnv), 30_000)
+  assert.equal(singleStepWallClockMs({ KOVO_SINGLE_STEP_WALL_CLOCK_MS: '900000' } as NodeJS.ProcessEnv), 120_000)
 })
 
 // ============================================================================
@@ -183,7 +183,7 @@ test('warm pool: three assignments reuse one container (one launch, two reuses)'
   const { runner, creates } = stubPoolDocker()
   const pool = new WarmWorkerPool({
     cell: 'cell-a',
-    image: 'guardian-worker:v4',
+    image: 'kovo-worker:v4',
     dockerRunner: runner,
     runLabel: 'run-a',
     capacity: 1,
@@ -208,7 +208,7 @@ test('warm pool: a two-slot pool serves many assignments with two launches', asy
   const { runner, creates } = stubPoolDocker()
   const pool = new WarmWorkerPool({
     cell: 'cell-slots',
-    image: 'guardian-worker:v4',
+    image: 'kovo-worker:v4',
     dockerRunner: runner,
     runLabel: 'run-slots',
     capacity: 2,
@@ -243,7 +243,7 @@ test('warm pool: a container that is still running is removed, never parked', as
 
 test('warm pool: the reset command touches only container scratch', () => {
   assert.match(WARM_SCRATCH_RESET_COMMAND, /\/tmp/)
-  assert.doesNotMatch(WARM_SCRATCH_RESET_COMMAND, /\/repos|\/guardian-rpc|\/guardian-ipc/)
+  assert.doesNotMatch(WARM_SCRATCH_RESET_COMMAND, /\/repos|\/kovo-rpc|\/kovo-ipc/)
   assert.match(WARM_SCRATCH_RESET_COMMAND, /rm -rf/)
 })
 

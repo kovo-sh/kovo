@@ -34,7 +34,7 @@ import { tenantLabelsFromRoleLabels } from '../src/server/exec-dispatch.ts'
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
 
 function makeTempTree(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v8-contam-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v8-contam-'))
   mkdirSync(join(dir, 'src', 'server'), { recursive: true })
   mkdirSync(join(dir, 'src', 'skills'), { recursive: true })
   return dir
@@ -186,7 +186,7 @@ describe('v8 multihop-saas product runner (scripts/benchmark-multihop.ts)', () =
 
     assert.throws(
       () => parseMultihopArgs(['--held-out', '--seed', '1000001'], {}),
-      /GUARDIAN_RB_HELDOUT_SALT/,
+      /KOVO_RB_HELDOUT_SALT/,
     )
   })
 
@@ -382,8 +382,8 @@ describe('v8 multihop-saas product runner (scripts/benchmark-multihop.ts)', () =
   })
 
   it('bridges benchmarks/multihop-saas/run.ts cleanly across paygrid, shipforge, and nexusiam', async () => {
-    const prevAllow = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+    const prevAllow = process.env.KOVO_ALLOW_LOCAL_LAB
+    process.env.KOVO_ALLOW_LOCAL_LAB = '1'
     try {
       const runtime = await loadMultihopRuntime()
       const seeds = (await runtime.listSeeds()) as { apps: string[]; dev: number[] }
@@ -444,14 +444,14 @@ describe('v8 multihop-saas product runner (scripts/benchmark-multihop.ts)', () =
         }
       }
     } finally {
-      if (prevAllow === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-      else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prevAllow
+      if (prevAllow === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+      else process.env.KOVO_ALLOW_LOCAL_LAB = prevAllow
     }
   })
 
   it('populates 3 hardened twins per archetype (9 across dev, 12 across all), catches decoy FPs strictly, and wires tenant-scoped personas without admin_bot', async () => {
-    const prevAllow = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+    const prevAllow = process.env.KOVO_ALLOW_LOCAL_LAB
+    process.env.KOVO_ALLOW_LOCAL_LAB = '1'
     try {
       const runtime = await loadMultihopRuntime()
       const expectedTwinsByApp: Record<string, string[]> = {
@@ -726,8 +726,8 @@ describe('v8 multihop-saas product runner (scripts/benchmark-multihop.ts)', () =
         'member [slug=acme-corp] (org_b)',
       )
     } finally {
-      if (prevAllow === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-      else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prevAllow
+      if (prevAllow === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+      else process.env.KOVO_ALLOW_LOCAL_LAB = prevAllow
     }
   })
 })

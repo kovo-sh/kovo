@@ -6,7 +6,7 @@
  *     `Execution`'s dynamic AIMD Phase-B worker concurrency controller instead of clamping
  *     single-app runs to `Math.min(4, Math.max(1, args.concurrency))`).
  *  2. `--isolate-data-dir` / `--no-isolate-data-dir` default safety for `--verifier docker`
- *     so parallel single-app Docker processes never share `GUARDIAN_DATA_DIR` / `owner` SHA-256
+ *     so parallel single-app Docker processes never share `KOVO_DATA_DIR` / `owner` SHA-256
  *     and never kill each other's live worker containers.
  *  3. `--snapshot-after-floor` / `--resume-snapshot` / `--snapshot-max-age-ms` /
  *     `--snapshot-refresh` / `--allow-heldout-snapshot` CLI parsing & conflict guards.
@@ -84,7 +84,7 @@ describe('Stream D: benchmark-multihop CLI dynamic AIMD & Docker isolation safet
   })
 
   it('defaults isolateDataDir=true whenever --verifier docker is used unless --no-isolate-data-dir is passed', () => {
-    const env = { GUARDIAN_DATA_DIR: '/tmp/shared-guardian-data' }
+    const env = { KOVO_DATA_DIR: '/tmp/shared-kovo-data' }
 
     // Default for --verifier docker: isolated automatically even for single-app concurrency=1
     const dockerDefault = parseMultihopArgs(['--app', 'paygrid', '--verifier', 'docker'], env)

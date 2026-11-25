@@ -13,7 +13,7 @@ import { createV2FixtureServer, E2E_CREDENTIAL } from './v2-fixture-server.ts'
 test.setTimeout(90_000)
 
 function readDb<T>(directory: string, fn: (db: DatabaseSync) => T): T {
-  const db = new DatabaseSync(join(directory, 'guardian.sqlite'), { readOnly: true })
+  const db = new DatabaseSync(join(directory, 'kovo.sqlite'), { readOnly: true })
   try {
     return fn(db)
   } finally {
@@ -63,7 +63,7 @@ async function createModelProfile(
  */
 test('configures, displays across reload, and edits roleAffinity across multiple model profiles with SQLite persistence', async ({ page }) => {
   const fixture = await createV2FixtureServer({ scenario: 'chain_cve' })
-  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  const app = await createApp({ KOVO_NETWORK_FIXTURE: fixture.origin })
 
   try {
     await app.start()
@@ -162,13 +162,13 @@ test('configures, displays across reload, and edits roleAffinity across multiple
 })
 
 /**
- * 2. Fail-closed public & unset GUARDIAN_ALLOW_LOCAL_LAB gating + default sandbox_write_allowlist = []
+ * 2. Fail-closed public & unset KOVO_ALLOW_LOCAL_LAB gating + default sandbox_write_allowlist = []
  */
-test('enforces fail-closed public gating when GUARDIAN_ALLOW_LOCAL_LAB is unset and defaults sandbox_write_allowlist to []', async ({ page }) => {
+test('enforces fail-closed public gating when KOVO_ALLOW_LOCAL_LAB is unset and defaults sandbox_write_allowlist to []', async ({ page }) => {
   const fixture = await createV2FixtureServer({ scenario: 'chain_cve' })
-  // Explicitly clear an inherited GUARDIAN_ALLOW_LOCAL_LAB=1 (the release-gate script exports
+  // Explicitly clear an inherited KOVO_ALLOW_LOCAL_LAB=1 (the release-gate script exports
   // it for lab suites): this test's contract is the unset environment.
-  const publicApp = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin, GUARDIAN_ALLOW_LOCAL_LAB: '' })
+  const publicApp = await createApp({ KOVO_NETWORK_FIXTURE: fixture.origin, KOVO_ALLOW_LOCAL_LAB: '' })
 
   try {
     await publicApp.start()
@@ -190,7 +190,7 @@ test('enforces fail-closed public gating when GUARDIAN_ALLOW_LOCAL_LAB is unset 
     expect(publicRow?.labConfig).toBeNull()
     expect(JSON.parse(publicRow?.allowlist ?? '[]')).toEqual([])
 
-    // Attempting to configure a local-lab project without GUARDIAN_ALLOW_LOCAL_LAB=1 must fail closed in both layers
+    // Attempting to configure a local-lab project without KOVO_ALLOW_LOCAL_LAB=1 must fail closed in both layers
     await page.getByRole('link', { name: 'Projects', exact: true }).click()
     const newProjectBtn = page.getByRole('button', { name: 'New project', exact: true })
     await expect(newProjectBtn).toBeVisible()
@@ -202,7 +202,7 @@ test('enforces fail-closed public gating when GUARDIAN_ALLOW_LOCAL_LAB is unset 
     await page.getByLabel('Seed hosts').fill('http://127.0.0.1:8080')
     await page.getByRole('button', { name: 'Create project', exact: true }).click()
 
-    await expect(page.getByRole('alert')).toContainText(/GUARDIAN_ALLOW_LOCAL_LAB=1/i, { timeout: 15_000 })
+    await expect(page.getByRole('alert')).toContainText(/KOVO_ALLOW_LOCAL_LAB=1/i, { timeout: 15_000 })
     await expect(page.getByRole('heading', { name: 'Blocked Local Lab' })).toHaveCount(0)
     const rejectedRow = readDb(publicApp.directory, db =>
       db.prepare('SELECT id FROM projects WHERE name = ?').get('Blocked Local Lab') as { id: string } | undefined,
@@ -237,8 +237,8 @@ test('enforces fail-closed public gating when GUARDIAN_ALLOW_LOCAL_LAB is unset 
 test('persists local-lab LabRunner config and sandboxWriteAllowlist across reload and renders LabRunner controls on Run Overview', async ({ page }) => {
   const fixture = await createV2FixtureServer({ scenario: 'chain_cve' })
   const labApp = await createApp({
-    GUARDIAN_NETWORK_FIXTURE: fixture.origin,
-    GUARDIAN_ALLOW_LOCAL_LAB: '1',
+    KOVO_NETWORK_FIXTURE: fixture.origin,
+    KOVO_ALLOW_LOCAL_LAB: '1',
   })
 
   try {
@@ -378,7 +378,7 @@ test('persists local-lab LabRunner config and sandboxWriteAllowlist across reloa
 test('populates endpoints, endpoint_params, and api_dependencies and renders Surface Graph in the run workspace', async ({ page }) => {
   const requests: string[] = []
   const fixture = await createV4SurfaceFixture(requests)
-  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  const app = await createApp({ KOVO_NETWORK_FIXTURE: fixture.origin })
 
   try {
     await app.start()
@@ -507,9 +507,9 @@ async function createV4SurfaceFixture(requests: string[]) {
       res.end(await upstream.text())
       return
     }
-    const targetHref = String(req.headers['x-guardian-fixture-target'] ?? '')
+    const targetHref = String(req.headers['x-kovo-fixture-target'] ?? '')
     if (!targetHref) {
-      res.writeHead(400).end('Missing x-guardian-fixture-target')
+      res.writeHead(400).end('Missing x-kovo-fixture-target')
       return
     }
     requests.push(`${req.method ?? 'GET'} ${targetHref}`)

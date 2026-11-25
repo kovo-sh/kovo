@@ -1,5 +1,5 @@
 /**
- * Unit tests for Guardian v8 M2/M3/M4 Scaling & Certification Scorecard CLI (`scripts/certify-v8.ts`).
+ * Unit tests for Kovo Hunter v8 M2/M3/M4 Scaling & Certification Scorecard CLI (`scripts/certify-v8.ts`).
  *
  * Covers:
  *  - M2 PASS & FAIL cases (WB lift < +15 pp, 1 twin FP in 1 of 3 repeats fails worst-run precision,
@@ -38,7 +38,7 @@ import {
 } from '../scripts/certify-v8.ts'
 
 const REPO_ROOT = join(import.meta.dirname, '..')
-const tempRoot = mkdtempSync(join(tmpdir(), 'guardian-v8-certify-test-'))
+const tempRoot = mkdtempSync(join(tmpdir(), 'kovo-v8-certify-test-'))
 process.on('exit', () => rmSync(tempRoot, { recursive: true, force: true }))
 
 // ---------------------------------------------------------------------------
@@ -738,7 +738,7 @@ test('M4 PASS: full certification (Dev + Salted Held-Out + Sealed + OSS + Effici
 
   // Verify CALIBRATION-v8.md rendering contains all required sections & metrics
   const md = renderCalibrationMarkdown(report)
-  assert.match(md, /# Guardian v8 Calibration & Certification Scorecard \(M4\)/)
+  assert.match(md, /# Kovo(?: Hunter)? v8 Calibration & Certification Scorecard \(M4\)/)
   assert.match(md, /\*\*Verdict:\*\* \*\*PASS\*\*/)
   assert.match(md, /## M4 Gate Checklist/)
   assert.match(md, /## Per-Mode Breakdown/)
@@ -1005,7 +1005,7 @@ test('CLI end-to-end: PASS writes CALIBRATION-v8.md and JSON with exit 0; FAIL e
   const jsonContent = JSON.parse(readFileSync(outJson, 'utf8')) as { verdict: string; gate: string }
   assert.equal(jsonContent.verdict, 'PASS')
   assert.equal(jsonContent.gate, 'm4')
-  assert.match(mdContent, /Guardian v8 Calibration & Certification Scorecard \(M4\)/)
+  assert.match(mdContent, /Kovo(?: Hunter)? v8 Calibration & Certification Scorecard \(M4\)/)
 
   // Verify JSON renderer round-trips cleanly
   const sampleReport = evaluateV8Certification({

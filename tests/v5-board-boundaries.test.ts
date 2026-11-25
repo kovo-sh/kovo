@@ -1,5 +1,5 @@
 /**
- * Guardian v5 M5 Phase 1 — Swarm Message Board security boundary suite.
+ * Kovo Hunter v5 M5 Phase 1 — Swarm Message Board security boundary suite.
  *
  * Mandatory invariants (plans/message-board.md §6):
  *   B1 write-time secret redaction (DB + SSE)
@@ -23,7 +23,7 @@ const originB = 'https://board-b.example'
 const SECRET = 'COOKIE_VALUE_BOARD_SECRET_123'
 
 function makeStore(t: { after: (fn: () => void) => void }) {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v5-board-bounds-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v5-board-bounds-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const store = new Store(dir)
   t.after(() => store.close())

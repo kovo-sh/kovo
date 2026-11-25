@@ -23,7 +23,7 @@ import { synthSqlBoolean, synthSqlTime } from '../scripts/benchmark-specs-sql.ts
 import type { HypothesisOutcome, ProbeEnv } from '../scripts/benchmark-probes.ts'
 
 // Floor recipes run in the local lab; the receipt schema accepts loopback only with that flag.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const origin = 'http://127.0.0.1:4300'
 const actor = { handle: 'owner', role: 'member' as const, tenant: 'store-a' }
@@ -259,10 +259,10 @@ describe('cut3cd: browser session seam evidence channels', () => {
   }
 
   test('cites an exact document-title canary assignment as execution evidence', async () => {
-    const result = await seam([visit({ title: 'guardian-dom-abc123' })])({
+    const result = await seam([visit({ title: 'kovo-dom-abc123' })])({
       origin,
       steps: [{ role: 'probe', action: 'navigate', pathAndQuery: '/' }],
-      canaryToken: 'guardian-dom-abc123',
+      canaryToken: 'kovo-dom-abc123',
       actor,
     })
     assert.equal(result?.sinkHit, true)
@@ -270,10 +270,10 @@ describe('cut3cd: browser session seam evidence channels', () => {
   })
 
   test('a title that merely contains the canary text is not execution evidence', async () => {
-    const result = await seam([visit({ title: 'Search results for guardian-dom-abc123' })])({
+    const result = await seam([visit({ title: 'Search results for kovo-dom-abc123' })])({
       origin,
       steps: [{ role: 'probe', action: 'navigate', pathAndQuery: '/' }],
-      canaryToken: 'guardian-dom-abc123',
+      canaryToken: 'kovo-dom-abc123',
       actor,
     })
     assert.equal(result?.sinkHit, false)
@@ -284,7 +284,7 @@ describe('cut3cd: browser session seam evidence channels', () => {
     const result = await seam([visit({ domSinkTraces: [{ sink: 'innerHTML', preview: 'x', containsCanary: true, timestamp: 1 }] })])({
       origin,
       steps: [{ role: 'probe', action: 'navigate', pathAndQuery: '/' }],
-      canaryToken: 'guardian-dom-abc123',
+      canaryToken: 'kovo-dom-abc123',
       actor,
     })
     assert.equal(result?.sinkHit, true)

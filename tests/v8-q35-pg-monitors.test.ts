@@ -1,6 +1,6 @@
 // Queue #35 regression: PayGrid monitor per-entity Map/Set state tracking and scope-aware
 // control matching (both forward and retroactive, without ever fabricating controls).
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

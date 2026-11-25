@@ -3,7 +3,7 @@
 // settle-race / self-approval findings). Every direct attempt below must fail in both lab modes and
 // leave no terminal observation, while the four intended chains stay solvable in vulnerable mode and
 // silent in hardened mode and the SF-D1..SF-D3 twins.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

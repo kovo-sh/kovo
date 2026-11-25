@@ -1,8 +1,8 @@
 /**
- * Guardian v4 Opaque-Box 4-Tier E2E Test Suite
+ * Kovo Hunter v4 Opaque-Box 4-Tier E2E Test Suite
  *
  * Implements the full 4-tier Category-Partition + BVA + Pairwise + Workload matrix
- * covering 100% of the 28 Guardian v4 Feature Inventory items in PROJECT.md:
+ * covering 100% of the 28 Kovo Hunter v4 Feature Inventory items in PROJECT.md:
  *   - Tier 1 (T1-01a..e .. T1-28a..e): 140 Category-Partition & BVA tests
  *   - Tier 2 (T2-01a..e .. T2-28a..e): 140 Pairwise Component Integration tests
  *   - Tier 3 (T3-01 .. T3-28):         28 Cross-Feature Full E2E Workflows
@@ -65,7 +65,7 @@ import { createApp } from './app.ts'
 import { validateSarif21 } from './v3-fullstack-lab/sarif-validate.ts'
 import {
   asBrokerRequest,
-  assertZeroGuardianOrphans,
+  assertZeroKovoOrphans,
   baseReplaySpecFields,
   decodeJwtParts,
   dockerAvailable,
@@ -140,7 +140,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
         { id: 'prb', role: 'probe', description: 'Private item', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/api/item?id=priv' } },
       ],
     }
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyInline({
         runId,
         spec,
@@ -197,7 +197,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
         { id: 'p1', role: 'probe', description: 'Probe', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/p' } },
       ],
     }
-    const r3 = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const r3 = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyInline({
         spec,
         attemptCount: 3,
@@ -211,7 +211,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     assert.equal(fb3.retriesRemaining, 0)
 
     const reqsBefore4 = fx.requests.length
-    const r4 = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const r4 = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyInline({
         spec,
         attemptCount: 4,
@@ -236,7 +236,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     const verifyInline = requireExport<(params: Record<string, unknown>) => Promise<Record<string, unknown>>>(
       rvMod, 'verifyReplaySpecInline', 'src/server/replay-verifier.ts',
     )
-    const secretTok = 'guardian-secret-inline-token-xyz987'
+    const secretTok = 'kovo-secret-inline-token-xyz987'
     const fx = await startHttpFixture(t, (_req, _b, res) => {
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ leaked: secretTok }))
@@ -255,7 +255,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
         { id: 'p1', role: 'probe', description: 'Probe', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/p', persona: 'p_inline' } },
       ],
     }
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyInline({
         spec,
         attemptCount: 1,
@@ -274,7 +274,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     const verifyInline = requireExport<(params: Record<string, unknown>) => Promise<Record<string, unknown>>>(
       rvMod, 'verifyReplaySpecInline', 'src/server/replay-verifier.ts',
     )
-    const repoDir = makeTempDir(t, 'guardian-v4-static-inline-')
+    const repoDir = makeTempDir(t, 'kovo-v4-static-inline-')
     chmodSync(repoDir, 0o755)
     writeLabRepoFixture(join(repoDir, 'app-repo'), { withVulns: true })
     const spec = {
@@ -315,19 +315,19 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin)
 
-    const ok1 = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const ok1 = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/', session: 'a' }, grant, AbortSignal.timeout(5000)),
     )
     assert.equal(ok1.status, 200)
 
-    const ok32 = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const ok32 = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/', session: 'jar_0123456789abcdef0123456789ab' }, grant, AbortSignal.timeout(5000)),
     )
     assert.equal(ok32.status, 200)
 
     for (const bad of ['', 'jar_0123456789abcdef0123456789abc', '../escape', 'jar space']) {
       await assert.rejects(
-        () => withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+        () => withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
           broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/', session: bad }, grant, AbortSignal.timeout(5000)),
         ),
         BrokerDenied,
@@ -347,7 +347,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/bake-many', session: 'cap-jar', assignmentId: 'a1' }, grant, AbortSignal.timeout(5000))
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/echo', session: 'cap-jar', assignmentId: 'a1' }, grant, AbortSignal.timeout(5000))
       const sentCookie = String(fx.requests.at(-1)?.headers.cookie ?? '')
@@ -367,7 +367,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/api/login', session: 'path-jar' }, grant, AbortSignal.timeout(5000))
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/api/me', session: 'path-jar' }, grant, AbortSignal.timeout(5000))
       assert.match(String(fx.requests.at(-1)?.headers.cookie ?? ''), /api_sid=/)
@@ -392,7 +392,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin, { personas: personaMap, secrets: [{ placeholder: '[redacted]', value: 'VAULT_JWT_AUTHORITATIVE' }] })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/login', session: 'prec-jar', persona: 'vault_user' }, grant, AbortSignal.timeout(5000))
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/me', session: 'prec-jar', persona: 'vault_user' }, grant, AbortSignal.timeout(5000))
       const last = fx.requests.at(-1)!
@@ -411,7 +411,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     let allow = true
     const grant = makeLabGrant(fx.origin, { canRead: o => allow && o === fx.origin })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/login', session: 'rev-jar' }, grant, AbortSignal.timeout(5000))
       allow = false
       await assert.rejects(
@@ -439,7 +439,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin, { isIdempotentPostAllowed: () => true })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/form', session: 'csrf-a' }, grant, AbortSignal.timeout(5000))
       await broker.executeHttp({
         origin: fx.origin, method: 'POST', pathAndQuery: '/submit', session: 'csrf-a', csrfBind: true,
@@ -462,7 +462,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin, { isIdempotentPostAllowed: () => true })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/page', session: 'csrf-b' }, grant, AbortSignal.timeout(5000))
       await broker.executeHttp({
         origin: fx.origin, method: 'POST', pathAndQuery: '/api/action', session: 'csrf-b', csrfBind: true,
@@ -485,7 +485,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin, { isIdempotentPostAllowed: () => true })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/login', session: 'csrf-c' }, grant, AbortSignal.timeout(5000))
       await broker.executeHttp({
         origin: fx.origin, method: 'POST', pathAndQuery: '/login', session: 'csrf-c', csrfBind: true,
@@ -508,7 +508,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin, { isIdempotentPostAllowed: () => true })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/init', session: 'csrf-d' }, grant, AbortSignal.timeout(5000))
       await broker.executeHttp({
         origin: fx.origin, method: 'POST', pathAndQuery: '/save', session: 'csrf-d',
@@ -523,7 +523,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     const fx = await startHttpFixture(t, (_req, _b, res) => res.end('ok'))
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin, { isIdempotentPostAllowed: () => true })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       broker.executeHttp({
         origin: fx.origin, method: 'POST', pathAndQuery: '/ping', session: 'csrf-e', csrfBind: true,
         headers: { 'Content-Type': 'application/json' }, body: '{"ping":1}',
@@ -577,7 +577,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       { id: 's1', role: 'probe', description: 'Set storage', origin: fx.origin, pathAndQuery: '/set', action: 'navigate', builtinCheck: 'storage_keys' },
       { id: 's2', role: 'probe', description: 'Reset context', origin: fx.origin, pathAndQuery: '/check', resetContext: true, action: 'navigate', builtinCheck: 'storage_keys' },
     ]
-    const results = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const results = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runSession(steps, makeLabGrant(fx.origin), AbortSignal.timeout(30_000)),
     )
     assert.equal(results.length, 2)
@@ -597,7 +597,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const browser = new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false })) as unknown as V4ScopedBrowserContract
     const runSession = requireMethod<V4ScopedBrowserContract['runBrowserSession']>(browser, 'runBrowserSession', 'ScopedBrowser')
-    const results = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const results = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runSession([
         { id: 'c1', role: 'control', description: 'Control set', origin: fx.origin, pathAndQuery: '/set', action: 'navigate', builtinCheck: 'storage_keys' },
         { id: 'p1', role: 'probe', description: 'Probe check', origin: fx.origin, pathAndQuery: '/check', action: 'navigate', builtinCheck: 'storage_keys' },
@@ -628,7 +628,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const browser = new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false })) as unknown as V4ScopedBrowserContract
     const runSession = requireMethod<V4ScopedBrowserContract['runBrowserSession']>(browser, 'runBrowserSession', 'ScopedBrowser')
-    const results = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const results = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runSession([
         { id: 's1', role: 'probe', description: 'Persona A', origin: fx.origin, pathAndQuery: '/set', persona: 'p_one', action: 'navigate', builtinCheck: 'storage_keys' },
         { id: 's2', role: 'probe', description: 'Persona B', origin: fx.origin, pathAndQuery: '/check', persona: 'p_two', action: 'navigate', builtinCheck: 'storage_keys' },
@@ -678,7 +678,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     const fx = await startHttpFixture(t, (_req, _b, res) => res.end('ok'))
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     await assert.rejects(
-      () => withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+      () => withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
         broker.executeHttp({
           origin: fx.origin, method: 'GET', pathAndQuery: '/api/me',
           authMutation: { kind: 'alg_none' },
@@ -715,7 +715,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     await assert.rejects(
-      () => withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+      () => withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
         broker.executeHttp({
           origin: fx.origin, method: 'GET', pathAndQuery: '/api/me', persona: 'u1',
           authMutation: { kind: 'kid_inject', value: '; rm -rf /' },
@@ -735,7 +735,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       personas: [{ handle: 'u1', roleLabel: 'User', authKind: 'bearer', secret: jwt }],
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       broker.executeHttp({
         origin: fx.origin, method: 'GET', pathAndQuery: '/api/me', persona: 'u1',
         authMutation: { kind: 'expired_replay', skewSeconds: 7200 },
@@ -836,7 +836,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const { storage: sLow } = makeStore(t)
     const { runId: rLow } = await setupApprovedRun(sLow, { seeds: [fxLow.origin], budgetRequests: 100 })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runPhase0({
         storage: sLow, runId: rLow, scopeRevision: 1, tier: 1, origins: [fxLow.origin], budgetRequests: 100,
         broker: new RequestBroker({ rejectUnauthorized: false }), grant: makeLabGrant(fxLow.origin, { tier: 1 }),
@@ -851,7 +851,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const { storage: sHigh } = makeStore(t)
     const { runId: rHigh } = await setupApprovedRun(sHigh, { seeds: [fxHigh.origin], budgetRequests: 10_000 })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runPhase0({
         storage: sHigh, runId: rHigh, scopeRevision: 1, tier: 1, origins: [fxHigh.origin], budgetRequests: 10_000,
         broker: new RequestBroker({ rejectUnauthorized: false }), grant: makeLabGrant(fxHigh.origin, { tier: 1 }),
@@ -872,7 +872,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin], budgetRequests: 500 })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runPhase0({
         storage, runId, scopeRevision: 1, tier: 1, origins: [fx.origin], budgetRequests: 500,
         broker: new RequestBroker({ rejectUnauthorized: false }), grant: makeLabGrant(fx.origin, { tier: 1 }),
@@ -891,7 +891,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       mod, 'runPhase0Recon', 'src/server/phase0-recon.ts',
     )
     const fx = await startHttpFixture(t, (_req, _b, res) => res.end('ok'))
-    const dir = makeTempDir(t, 'guardian-v4-fw-')
+    const dir = makeTempDir(t, 'kovo-v4-fw-')
     mkdirSync(join(dir, 'repo/app/api/orders'), { recursive: true })
     writeFileSync(join(dir, 'repo/app/api/orders/route.ts'), `export async function GET() { return Response.json([]) }\nexport async function POST() { return Response.json({}) }`)
     writeFileSync(join(dir, 'repo/express.ts'), `app.get('/api/v1/users/:id', authMw, handler)`)
@@ -900,7 +900,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     writeFileSync(join(dir, 'repo/server.go'), `r.GET("/healthz", healthHandler)`)
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin], tier: 0 })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runPhase0({
         storage, runId, scopeRevision: 1, tier: 0, origins: [fx.origin], reposDir: dir,
         broker: new RequestBroker({ rejectUnauthorized: false }), grant: makeLabGrant(fx.origin, { tier: 0 }),
@@ -936,7 +936,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin], budgetRequests: 10_000 })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runPhase0({
         storage, runId, scopeRevision: 1, tier: 1, origins: [fx.origin], budgetRequests: 10_000,
         broker: new RequestBroker({ rejectUnauthorized: false }), grant: makeLabGrant(fx.origin, { tier: 1 }),
@@ -956,11 +956,11 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       mod, 'runPhase0Recon', 'src/server/phase0-recon.ts',
     )
     const fx = await startHttpFixture(t, (_req, _b, res) => res.end('ok'))
-    const repoDir = makeTempDir(t, 'guardian-v4-t0-')
+    const repoDir = makeTempDir(t, 'kovo-v4-t0-')
     writeLabRepoFixture(join(repoDir, 'app'), { withVulns: true })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin], tier: 0 })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runPhase0({
         storage, runId, scopeRevision: 1, tier: 0, origins: [fx.origin], reposDir: repoDir,
         broker: new RequestBroker({ rejectUnauthorized: false }), grant: makeLabGrant(fx.origin, { tier: 0 }),
@@ -984,7 +984,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       crawl({
         storage, runId, scopeRevision: 1, origin: fx.origin, maxPages: 2, maxDepth: 4,
         browser: new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false })),
@@ -1005,7 +1005,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       crawl({
         storage, runId, scopeRevision: 1, origin: fx.origin, maxPages: 25, maxDepth: 0,
         browser: new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false })),
@@ -1027,7 +1027,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       crawl({
         storage, runId, scopeRevision: 1, origin: fx.origin, maxPages: 5, maxDepth: 1,
         browser: new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false })),
@@ -1052,7 +1052,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       crawl({
         storage, runId, scopeRevision: 1, origin: fx.origin, maxPages: 3, maxDepth: 1,
         browser: new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false })),
@@ -1076,7 +1076,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       crawl({
         storage, runId, scopeRevision: 1, origin: fx.origin, maxPages: 5, maxDepth: 2,
         browser: new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false })),
@@ -1216,12 +1216,12 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     assert.match(serialized, /innerHTML|postMessage/i)
   })
 
-  // --- Feature 12: guardian-worker:v4 Hardened Offline Toolchain ---
+  // --- Feature 12: kovo-worker:v4 Hardened Offline Toolchain ---
 
-  test('T1-12a: worker-backend.ts & worker/Dockerfile configure guardian-worker:v4 and TRIVY_CACHE_DIR', () => {
+  test('T1-12a: worker-backend.ts & worker/Dockerfile configure kovo-worker:v4 and TRIVY_CACHE_DIR', () => {
     const backendSrc = readFileSync(resolve(repoRoot, 'src/server/worker-backend.ts'), 'utf8')
     const dockerfile = readFileSync(resolve(repoRoot, 'worker/Dockerfile'), 'utf8')
-    assert.match(backendSrc, /guardian-worker:v4/)
+    assert.match(backendSrc, /kovo-worker:v4/)
     assert.match(dockerfile, /TRIVY_CACHE_DIR="?\/opt\/trivy-cache"?/)
   })
 
@@ -1255,7 +1255,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
 
   test('T1-12e: LinuxWorkerBackend rejects /repos path traversal before launching container', async (t) => {
     const backend = new LinuxWorkerBackend()
-    const repoDir = makeTempDir(t, 'guardian-v4-trav-')
+    const repoDir = makeTempDir(t, 'kovo-v4-trav-')
     await assert.rejects(
       () => runWorkerSast(backend as never, { repo: '../etc', engines: ['opengrep'], reposDir: repoDir }),
       /invalid|traversal|repository/i,
@@ -1267,7 +1267,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
   test('T1-13a: Stage-1 ProjectSecuritySpec schema captures sources, authGuards, sanitizers, sinks, invariants', async (t) => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon is required for Stage-1 semantic audit')
     const backend = new LinuxWorkerBackend()
-    const repoDir = makeTempDir(t, 'guardian-v4-s1-spec-')
+    const repoDir = makeTempDir(t, 'kovo-v4-s1-spec-')
     const appDir = join(repoDir, 'app')
     mkdirSync(join(appDir, 'src'), { recursive: true })
     writeFileSync(join(appDir, 'src/auth.ts'), `export function requireSession(req: any) { return req.session }`)
@@ -1287,7 +1287,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
   test('T1-13b: Stage-1 generates dynamic Opengrep rule YAML from custom ORM/auth wrapper spec', async (t) => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon is required for dynamic Opengrep rule audit')
     const backend = new LinuxWorkerBackend()
-    const repoDir = makeTempDir(t, 'guardian-v4-s1-dyn-')
+    const repoDir = makeTempDir(t, 'kovo-v4-s1-dyn-')
     const appDir = join(repoDir, 'app')
     mkdirSync(join(appDir, 'src'), { recursive: true })
     writeFileSync(join(appDir, 'src/handler.ts'), `export function handle(req: any, customDb: any) { return customDb.unsafeExec("SELECT * FROM users WHERE q=" + req.query.q) }`)
@@ -1329,11 +1329,11 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
   })
 
   test('T1-13d: Stage-3 git-history security miner filters security-fix commits and ignores docs commits', async (t) => {
-    const repoDir = makeTempDir(t, 'guardian-v4-git-miner-')
+    const repoDir = makeTempDir(t, 'kovo-v4-git-miner-')
     const appDir = join(repoDir, 'app')
     mkdirSync(appDir, { recursive: true })
     await exec('git', ['init'], { cwd: appDir })
-    await exec('git', ['config', 'user.email', 'test@guardian.local'], { cwd: appDir })
+    await exec('git', ['config', 'user.email', 'test@kovo.local'], { cwd: appDir })
     await exec('git', ['config', 'user.name', 'Test'], { cwd: appDir })
     writeFileSync(join(appDir, 'README.md'), '# app\n')
     await exec('git', ['add', '.'], { cwd: appDir })
@@ -1364,7 +1364,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     await exec('cp', ['-r', appDir, targetRepo])
 
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 15_000
@@ -1383,7 +1383,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
   test('T1-13e: Stage-2 path dominance evaluator distinguishes guarded vs unguarded entrypoint-to-sink paths', async (t) => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon is required for Stage-2 path dominance check')
     const backend = new LinuxWorkerBackend()
-    const repoDir = makeTempDir(t, 'guardian-v4-dom-')
+    const repoDir = makeTempDir(t, 'kovo-v4-dom-')
     const appDir = join(repoDir, 'app')
     mkdirSync(join(appDir, 'src'), { recursive: true })
     writeFileSync(join(appDir, 'src/guarded.ts'), `export function guardedRead(db: any, req: any) { requireTenant(req); return db.query("SELECT * FROM invoices WHERE id = '" + req.query.id + "'"); }`)
@@ -1422,7 +1422,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
   test('T1-14b: LabRunner rejects malicious compose topologies (privileged, host network, ports, bind mounts, SYS_ADMIN)', async (t) => {
     const runner = new LabRunner()
     t.after(async () => { await runner.stopAll() })
-    const repo = makeTempDir(t, 'guardian-v4-badcompose-')
+    const repo = makeTempDir(t, 'kovo-v4-badcompose-')
     writeLabRepoFixture(repo)
     const maliciousPayloads: V4LabConfig[] = [
       { enabled: true, services: [{ name: 'app', image: 'node:24', privileged: true } as never] },
@@ -1433,7 +1433,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     ]
     for (const cfg of maliciousPayloads) {
       await assert.rejects(
-        () => withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+        () => withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
           runner.startLabTarget({ runId: randomUUID(), environment: 'local-lab', repoDir: repo, labConfig: cfg as LabConfig }),
         ),
         /forbidden|privileged|host|port|volume|cap|malicious|unsafe/i,
@@ -1441,21 +1441,21 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     }
   })
 
-  test('T1-14c: LabRunner enforces project.environment === local-lab and GUARDIAN_ALLOW_LOCAL_LAB=1', async () => {
+  test('T1-14c: LabRunner enforces project.environment === local-lab and KOVO_ALLOW_LOCAL_LAB=1', async () => {
     assert.throws(() => assertLocalLabAllowed('public'), /local-lab/i)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: undefined }, () => {
-      assert.throws(() => assertLocalLabAllowed('local-lab'), /GUARDIAN_ALLOW_LOCAL_LAB/)
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: undefined }, () => {
+      assert.throws(() => assertLocalLabAllowed('local-lab'), /KOVO_ALLOW_LOCAL_LAB/)
     })
   })
 
   test('T1-14d: LabRunner rejects multi-service stack exceeding 6 containers per run', async (t) => {
     const runner = new LabRunner()
     t.after(async () => { await runner.stopAll() })
-    const repo = makeTempDir(t, 'guardian-v4-maxsvc-')
+    const repo = makeTempDir(t, 'kovo-v4-maxsvc-')
     writeLabRepoFixture(repo)
     const services = Array.from({ length: 7 }, (_, i) => ({ name: `svc_${i}`, image: 'node:24-bookworm-slim', internalPort: 3000 + i }))
     await assert.rejects(
-      () => withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+      () => withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
         runner.startLabTarget({
           runId: randomUUID(),
           environment: 'local-lab',
@@ -1470,12 +1470,12 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
   test('T1-14e: LabRunner SAFE_ENV_KEY validation rejects dangerous env vars (LD_PRELOAD, PATH, lowercase)', async (t) => {
     const runner = new LabRunner()
     t.after(async () => { await runner.stopAll() })
-    const repo = makeTempDir(t, 'guardian-v4-badenv-')
+    const repo = makeTempDir(t, 'kovo-v4-badenv-')
     writeLabRepoFixture(repo)
     const badEnvs: Array<Record<string, string>> = [{ LD_PRELOAD: '/tmp/evil.so' }, { PATH: '/tmp' }, { 'bad-key': '1' }]
     for (const badEnv of badEnvs) {
       await assert.rejects(
-        () => withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+        () => withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
           runner.startLabTarget({
             runId: randomUUID(),
             environment: 'local-lab',
@@ -1562,20 +1562,20 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     assert.ok(statSync(res.filePath).size <= 65_536)
   })
 
-  test('T1-15d: X-Guardian-Trace-Id is injected on local-lab IAST requests and omitted on public projects', async (t) => {
+  test('T1-15d: X-Kovo-Trace-Id is injected on local-lab IAST requests and omitted on public projects', async (t) => {
     const fx = await startHttpFixture(t, (_req, _b, res) => res.end('ok'))
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp(
         { origin: fx.origin, method: 'GET', pathAndQuery: '/traced', traceId: 'trace-abc-123' },
         makeLabGrant(fx.origin),
         AbortSignal.timeout(5000),
       )
     })
-    assert.equal(fx.requests.at(-1)!.headers['x-guardian-trace-id'], 'trace-abc-123')
+    assert.equal(fx.requests.at(-1)!.headers['x-kovo-trace-id'], 'trace-abc-123')
 
     const pubBroker = makeVirtualPublicBroker((_url, opts) => {
-      assert.equal(opts?.headers?.['x-guardian-trace-id'], undefined)
+      assert.equal(opts?.headers?.['x-kovo-trace-id'], undefined)
       return { status: 200, headers: {}, body: 'ok' }
     }) as unknown as V4BrokerContract
     await pubBroker.executeHttp(
@@ -1596,7 +1596,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     mkdirSync(telemetryDir, { recursive: true })
     writeFileSync(join(telemetryDir, 'forged.json'), JSON.stringify({ sqli_confirmed: true, confirmed: true, sinkEvents: [{ vulnerable: true }] }))
 
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -1645,7 +1645,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ rows: [] }))
     })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'sqli_boolean',
@@ -1666,7 +1666,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
   })
 
   test('T1-16c: sqlTimeDiffReplaySpecSchema (#14) enforces bounded delayMs (1500..3000ms)', async () => {
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => {
       const okSpec = declarativeReplaySpecSchema.safeParse({
         ...baseReplaySpecFields('http://127.0.0.1:9'),
         kind: 'sql_time_diff',
@@ -1777,19 +1777,19 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     const grant = makeLabGrant(fx.origin, { tier: 3 })
 
     mode = 'pass'
-    const okRes = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const okRes = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({ spec: baseSpec as unknown as Parameters<typeof verifyReplaySpec>[0]['spec'], broker, backend, grant, signal: AbortSignal.timeout(45_000) }),
     )
     assert.equal(okRes.verdict, 'confirmed')
 
     mode = 'jitter'
-    const jitterRes = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const jitterRes = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({ spec: baseSpec as unknown as Parameters<typeof verifyReplaySpec>[0]['spec'], broker, backend, grant, signal: AbortSignal.timeout(45_000) }),
     )
     assert.notEqual(jitterRes.verdict, 'confirmed')
 
     mode = 'short'
-    const shortRes = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const shortRes = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({ spec: baseSpec as unknown as Parameters<typeof verifyReplaySpec>[0]['spec'], broker, backend, grant, signal: AbortSignal.timeout(45_000) }),
     )
     assert.notEqual(shortRes.verdict, 'confirmed')
@@ -1810,7 +1810,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
         { handle: 'other', roleLabel: 'Other', authKind: 'bearer', secret: 'tok-other' },
       ],
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'authz_matrix',
@@ -1857,7 +1857,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       res.setHeader('Content-Type', 'application/json')
       res.end(body || '{"ok":true}')
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'workflow_invariant',
@@ -1888,7 +1888,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       }
       res.end(JSON.stringify({ status: 'draft' }))
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'workflow_invariant',
@@ -1910,7 +1910,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
 
   test('T1-17e: cross-tenant BOLA sweeper returns inconclusive/no-op when fewer than 2 personas exist', async (t) => {
     const fx = await startHttpFixture(t, (_req, _b, res) => res.end('{}'))
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'authz_matrix',
@@ -1951,7 +1951,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       if (body.includes('__schema')) { res.end(JSON.stringify(introspection)); return }
       res.end(JSON.stringify({ data: { user: { id: '1', org: { billingInvoices: [] } } } }))
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         { probeClass: 'graphql_audit', origin: fx.origin, pathAndQuery: '/graphql', testMutations: true } as unknown as Parameters<typeof probeDifferential>[0],
         new RequestBroker({ rejectUnauthorized: false }),
@@ -1975,7 +1975,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ data: { searchItems: [] } }))
     })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         { probeClass: 'graphql_audit', origin: fx.origin, pathAndQuery: '/graphql', sdl } as unknown as Parameters<typeof probeDifferential>[0],
         new RequestBroker({ rejectUnauthorized: false }),
@@ -2001,7 +2001,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ data: {} }))
     })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'graphql_audit',
@@ -2037,7 +2037,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ data: { user: { id: '1', org: { id: 'o1', billingInvoices: [] } } } }))
     })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         { probeClass: 'graphql_audit', origin: fx.origin, pathAndQuery: '/graphql', sdl } as unknown as Parameters<typeof probeDifferential>[0],
         new RequestBroker({ rejectUnauthorized: false }),
@@ -2085,7 +2085,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
         res.setHeader('Content-Type', 'text/html')
         res.end(ctx.render(q))
       })
-      const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+      const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
         probeDifferential(
           { probeClass: 'xss_context', origin: fx.origin, pathAndQuery: '/search?q=hi', param: 'q' } as unknown as Parameters<typeof probeDifferential>[0],
           new RequestBroker({ rejectUnauthorized: false }),
@@ -2138,7 +2138,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
   })
 
   test('T1-19d: declarativeReplaySpecSchema validates sql_time_diff (#14) and rejects delayMs > 3000', async () => {
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => {
       const ok = declarativeReplaySpecSchema.safeParse({
         ...baseReplaySpecFields('http://127.0.0.1:9'),
         kind: 'sql_time_diff',
@@ -2173,7 +2173,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
   test('T1-19e: xxe_canary rejects /etc/passwd and file:// payloads and requires CanaryBroker placeholder', async (t) => {
     const fx = await startHttpFixture(t, (_req, _b, res) => res.end('ok'))
     await assert.rejects(
-      () => withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+      () => withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
         probeDifferential(
           {
             probeClass: 'xxe_canary',
@@ -2275,7 +2275,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false, storage }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin, { personas: personaMap })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/search', persona: 'user_a', runId, assignmentId: aid }, grant, AbortSignal.timeout(5000))
       assert.equal(v4.listSecondOrderCanaries(runId, 'surfaced').length, 0, 'Same-endpoint + same-persona reflection must not mark surfaced')
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/admin/users', persona: 'admin', runId, assignmentId: aid }, grant, AbortSignal.timeout(5000))
@@ -2315,8 +2315,8 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     const transpileDir = requireExport<(inDir: string, outDir: string) => Promise<{ transpiled: number; rejected: Array<{ file: string; reason: string }> }>>(
       mod, 'transpileNucleiDirectory', 'scripts/transpile-nuclei-templates.ts',
     )
-    const inDir = makeTempDir(t, 'guardian-v4-nuc-1a-in-')
-    const outDir = makeTempDir(t, 'guardian-v4-nuc-1a-out-')
+    const inDir = makeTempDir(t, 'kovo-v4-nuc-1a-in-')
+    const outDir = makeTempDir(t, 'kovo-v4-nuc-1a-out-')
     for (const proto of ['network', 'code', 'headless', 'javascript']) {
       writeFileSync(join(inDir, `bad-${proto}.yaml`), `id: bad-${proto}\ninfo:\n  name: Bad ${proto}\n  severity: high\n${proto}:\n  - input: test\n`)
     }
@@ -2331,8 +2331,8 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     const transpileDir = requireExport<(inDir: string, outDir: string) => Promise<{ transpiled: number; rejected: Array<{ file: string; reason: string }> }>>(
       mod, 'transpileNucleiDirectory', 'scripts/transpile-nuclei-templates.ts',
     )
-    const inDir = makeTempDir(t, 'guardian-v4-nuc-1b-in-')
-    const outDir = makeTempDir(t, 'guardian-v4-nuc-1b-out-')
+    const inDir = makeTempDir(t, 'kovo-v4-nuc-1b-in-')
+    const outDir = makeTempDir(t, 'kovo-v4-nuc-1b-out-')
     for (const [i, domain] of ['abc.oastify.com', 'xyz.interact.sh', 'webhook.site/123'].entries()) {
       writeFileSync(
         join(inDir, `bad-oast-${i}.yaml`),
@@ -2349,8 +2349,8 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     const transpileDir = requireExport<(inDir: string, outDir: string) => Promise<{ transpiled: number; rejected: Array<{ file: string; reason: string }> }>>(
       mod, 'transpileNucleiDirectory', 'scripts/transpile-nuclei-templates.ts',
     )
-    const inDir = makeTempDir(t, 'guardian-v4-nuc-1c-in-')
-    const outDir = makeTempDir(t, 'guardian-v4-nuc-1c-out-')
+    const inDir = makeTempDir(t, 'kovo-v4-nuc-1c-in-')
+    const outDir = makeTempDir(t, 'kovo-v4-nuc-1c-out-')
     for (const [i, host] of ['169.254.169.254', '127.0.0.1', '10.0.0.5'].entries()) {
       writeFileSync(
         join(inDir, `bad-ip-${i}.yaml`),
@@ -2367,8 +2367,8 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     const transpileDir = requireExport<(inDir: string, outDir: string) => Promise<{ transpiled: number; rejected: Array<{ file: string; reason: string }> }>>(
       mod, 'transpileNucleiDirectory', 'scripts/transpile-nuclei-templates.ts',
     )
-    const inDir = makeTempDir(t, 'guardian-v4-nuc-1d-in-')
-    const outDir = makeTempDir(t, 'guardian-v4-nuc-1d-out-')
+    const inDir = makeTempDir(t, 'kovo-v4-nuc-1d-in-')
+    const outDir = makeTempDir(t, 'kovo-v4-nuc-1d-out-')
     writeFileSync(join(inDir, 'destructive.yaml'), `id: bad-rm\ninfo:\n  name: Bad RM\n  severity: critical\nhttp:\n  - method: GET\n    path:\n      - "{{BaseURL}}/run?cmd=rm%20-rf%20/"\n    matchers:\n      - type: word\n        words:\n          - "done"\n`)
     writeFileSync(join(inDir, 'mutating.yaml'), `id: bad-del\ninfo:\n  name: Bad DELETE\n  severity: high\nhttp:\n  - method: DELETE\n    path:\n      - "{{BaseURL}}/api/users/1"\n    matchers:\n      - type: word\n        words:\n          - "deleted"\n`)
     const res = await transpileDir(inDir, outDir)
@@ -2376,13 +2376,13 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     assert.equal(res.rejected.length, 2)
   })
 
-  test('T1-21e: Nuclei transpiler rewrites {{interactsh-url}} -> {{guardian_canary_http}} and passes parseSafeTemplateYaml', async (t) => {
+  test('T1-21e: Nuclei transpiler rewrites {{interactsh-url}} -> {{kovo_canary_http}} and passes parseSafeTemplateYaml', async (t) => {
     const mod = await loadV4Module('scripts/transpile-nuclei-templates.ts')
     const transpileDir = requireExport<(inDir: string, outDir: string) => Promise<{ transpiled: number; rejected: Array<{ file: string; reason: string }> }>>(
       mod, 'transpileNucleiDirectory', 'scripts/transpile-nuclei-templates.ts',
     )
-    const inDir = makeTempDir(t, 'guardian-v4-nuc-1e-in-')
-    const outDir = makeTempDir(t, 'guardian-v4-nuc-1e-out-')
+    const inDir = makeTempDir(t, 'kovo-v4-nuc-1e-in-')
+    const outDir = makeTempDir(t, 'kovo-v4-nuc-1e-out-')
     writeFileSync(
       join(inDir, 'good.yaml'),
       [
@@ -2408,7 +2408,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     const files = readdirSync(outDir).filter(f => /\.ya?ml$/i.test(f))
     assert.equal(files.length, 1)
     const yaml = readFileSync(join(outDir, files[0]), 'utf8')
-    assert.ok(yaml.includes('{{guardian_canary_http}}'))
+    assert.ok(yaml.includes('{{kovo_canary_http}}'))
     const parsed = parseSafeTemplateYaml(yaml)
     assert.equal(parsed.id, 'cve-2024-99999-canary-ssrf')
   })
@@ -2443,7 +2443,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       }
       storage.updateRun(runId, { phase: 'investigation', status: 'running' })
       const engine = new Execution(storage)
-      await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+      await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
         engine.start()
         engine.wake()
         const deadline = Date.now() + 8_000
@@ -2470,7 +2470,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       }
       storage.updateRun(runId, { phase: 'investigation', status: 'running' })
       const engine = new Execution(storage)
-      await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+      await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
         engine.start()
         engine.wake()
         await delay(200)
@@ -2505,7 +2505,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     }
     storage.updateRun(runId, { phase: 'investigation', status: 'running' })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 8_000
@@ -2549,7 +2549,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     v4.upsertEndpoint({ runId, scopeRevision: 1, origin: 'http://127.0.0.1:9', method: 'GET', pathTemplate: '/fresh-low', source: 'spa_crawl', riskScore: 30, coveragePct: 0 })
     storage.updateRun(runId, { phase: 'investigation', status: 'running' })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 8_000
@@ -2604,7 +2604,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     storage.updateRun(runId, { phase: 'investigation', status: 'running' })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 8_000
@@ -2653,7 +2653,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     storage.updateRun(runId, { phase: 'investigation', status: 'running' })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 8_000
@@ -2702,7 +2702,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     storage.updateRun(runId, { phase: 'investigation', status: 'running' })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       await delay(500)
@@ -2735,7 +2735,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     storage.updateRun(runId, { phase: 'investigation', status: 'running' })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       await delay(500)
@@ -2781,7 +2781,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       title: 'Critical Single', hypothesis: 'crit', category: 'injection-input', priority: 99, targetAssetIds: assetIds,
     })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       await delay(400)
@@ -2807,7 +2807,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       title: 'Bounded Fanout', hypothesis: 'crit', category: 'injection-input', priority: 99, targetAssetIds: assetIds,
     })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       await delay(400)
@@ -2947,7 +2947,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       mod, 'runBenchmarkSuite', 'scripts/benchmark-recall.ts',
     )
     const { storage } = makeStore(t)
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runSuite({ suite: 'xben-25', dryRun: true, storage }),
     )
     const f = res.funnelCounts
@@ -2982,7 +2982,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     })
     const outJson = join(dir, 'diff.json')
     const outMd = join(dir, 'diff.md')
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runSuite({ suite: 'xben-25', dryRun: true, baselineSha: 'aaa111', gitSha: 'bbb222', storage, outJson, outMd }),
     )
     assert.ok(existsSync(outJson))
@@ -3072,7 +3072,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
       mod, 'runBenchmarkSuite', 'scripts/benchmark-recall.ts',
     )
     const { storage } = makeStore(t)
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runSuite({ suite: 'held-out-saas', dryRun: true, storage }),
     )
     assert.equal(res.targetsTotal, 20)
@@ -3080,14 +3080,14 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
     assert.equal(res.falsePositiveCount, 0)
   })
 
-  test('T1-27e: benchmark-recall refuses to execute local-lab benchmarks when GUARDIAN_ALLOW_LOCAL_LAB != 1', async () => {
+  test('T1-27e: benchmark-recall refuses to execute local-lab benchmarks when KOVO_ALLOW_LOCAL_LAB != 1', async () => {
     const mod = await loadV4Module('scripts/benchmark-recall.ts')
     const runSuite = requireExport<(opts: { suite: string }) => Promise<unknown>>(
       mod, 'runBenchmarkSuite', 'scripts/benchmark-recall.ts',
     )
     await assert.rejects(
-      () => withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: undefined }, () => runSuite({ suite: 'held-out-saas' })),
-      /GUARDIAN_ALLOW_LOCAL_LAB/,
+      () => withEnv({ KOVO_ALLOW_LOCAL_LAB: undefined }, () => runSuite({ suite: 'held-out-saas' })),
+      /KOVO_ALLOW_LOCAL_LAB/,
     )
   })
 
@@ -3104,10 +3104,10 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
   })
 
   test('T1-28b: v4 Store opens legacy v3 SQLite DB and preserves 100% of existing projects/runs/findings/profiles', async (t) => {
-    const dir = makeTempDir(t, 'guardian-v3-mig-')
-    const srcDb = resolve(repoRoot, '.guardian/dyad-v2-smoke/data/guardian.sqlite')
+    const dir = makeTempDir(t, 'kovo-v3-mig-')
+    const srcDb = resolve(repoRoot, '.kovo/dyad-v2-smoke/data/kovo.sqlite')
     if (existsSync(srcDb)) {
-      copyFileSync(srcDb, join(dir, 'guardian.sqlite'))
+      copyFileSync(srcDb, join(dir, 'kovo.sqlite'))
     } else {
       const seed = new Store(dir)
       const now = Date.now()
@@ -3123,7 +3123,7 @@ describe('Tier 1 — Category-Partition & BVA (140 cases)', () => {
           VALUES ('find-legacy-1', 'run-legacy-1', 'asset-1', 1, 'chain', 'legacy-1', 'multi_step_chain', '["http://127.0.0.1:9"]', 'runtime_confirmed', '{"id":"find-legacy-1","title":"Legacy Finding","status":"confirmed"}');
       `)
       seed.close()
-      const raw = new DatabaseSync(join(dir, 'guardian.sqlite'))
+      const raw = new DatabaseSync(join(dir, 'kovo.sqlite'))
       for (const tbl of ['benchmark_runs', 'lab_telemetry', 'second_order_canaries', 'api_dependencies', 'endpoint_params', 'endpoints']) {
         raw.exec(`DROP TABLE IF EXISTS ${tbl};`)
       }
@@ -3249,7 +3249,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
         { id: 'p1', role: 'probe', description: 'Probe', request: { origin: fx.origin, method: 'GET', pathAndQuery: '/?id=priv' } },
       ],
     }
-    const res1 = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res1 = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyInline({
         spec: { ...baseSpec, assertionsJq: '.steps[0].broken(((' },
         attemptCount: 1,
@@ -3263,7 +3263,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     assert.notEqual(fb1.verdict, 'confirmed')
     assert.ok(fb1.jqError && fb1.jqError.length > 0)
 
-    const res2 = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res2 = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyInline({
         spec: { ...baseSpec, assertionsJq: '{ controlPassed: (.steps.c1.json.leaked == false), confirmed: (.steps.p1.json.leaked == true), observed: ("leaked=" + (.steps.p1.json.leaked | tostring)), expected: "leaked=false" }' },
         attemptCount: 2,
@@ -3287,7 +3287,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       res.statusCode = req.url === '/missing' ? 404 : 200
       res.end('resp')
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyInline({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -3321,7 +3321,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       res.setHeader('Content-Type', 'text/html')
       res.end(spaShell)
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyInline({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -3376,7 +3376,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       .run(aid, runId, randomUUID(), Date.now())
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       const ex1 = await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/login', session: 'jar-main', runId, assignmentId: aid }, grant, AbortSignal.timeout(5000))
       const ex2 = await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/me', session: 'jar-main', runId, assignmentId: aid }, grant, AbortSignal.timeout(5000))
       assert.equal(JSON.parse(ex2.body).authed, true)
@@ -3395,7 +3395,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ cookieSeen: req.headers.cookie ?? 'none' }))
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -3433,7 +3433,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(originA.origin, { canRead: o => o === originA.origin || o === originB.origin })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: originA.origin, method: 'GET', pathAndQuery: '/login', session: 'redir-jar' }, grant, AbortSignal.timeout(5000))
       await broker.executeHttp({ origin: originA.origin, method: 'GET', pathAndQuery: '/redir', session: 'redir-jar', followRedirects: true }, grant, AbortSignal.timeout(5000))
       assert.equal(originB.requests.at(-1)?.headers.cookie ?? undefined, undefined)
@@ -3452,7 +3452,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     storage.client.prepare(`INSERT INTO assignments (id, run_id, phase, status, scope_revision, goal_revision, session_id, parent_fact_ids, source_origins, title, objective, created_at) VALUES (?, ?, 'investigation', 'running', 1, 0, ?, '[]', '[]', 't', 'o', ?)`)
       .run(aid, runId, randomUUID(), Date.now())
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       const ex = await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/1', session: 'scrub-jar' }, makeLabGrant(fx.origin), AbortSignal.timeout(5000))
       storage.recordExchange({
         runId,
@@ -3512,7 +3512,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin, { isIdempotentPostAllowed: () => true })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/form', session: 'f-csrf' }, grant, AbortSignal.timeout(5000))
       const post = await broker.executeHttp({
         origin: fx.origin, method: 'POST', pathAndQuery: '/submit', session: 'f-csrf', csrfBind: true,
@@ -3535,7 +3535,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin, { isIdempotentPostAllowed: () => true })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/', session: 'j-csrf' }, grant, AbortSignal.timeout(5000))
       const post = await broker.executeHttp({
         origin: fx.origin, method: 'POST', pathAndQuery: '/api/save', session: 'j-csrf', csrfBind: true,
@@ -3560,7 +3560,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin, { isIdempotentPostAllowed: () => true })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/init', session: 'ds-jar' }, grant, AbortSignal.timeout(5000))
       const post = await broker.executeHttp({
         origin: fx.origin, method: 'POST', pathAndQuery: '/act', session: 'ds-jar', csrfBind: true,
@@ -3586,7 +3586,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       }
       res.end(JSON.stringify({ protectedOk: req.url?.includes('admin') }))
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -3621,7 +3621,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin, { isIdempotentPostAllowed: () => true })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/t1', session: 'rot-jar' }, grant, AbortSignal.timeout(5000))
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/t2', session: 'rot-jar' }, grant, AbortSignal.timeout(5000))
       const post = await broker.executeHttp({
@@ -3644,7 +3644,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const browser = new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false })) as unknown as V4ScopedBrowserContract
     const runSession = requireMethod<V4ScopedBrowserContract['runBrowserSession']>(browser, 'runBrowserSession', 'ScopedBrowser')
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runSession([
         { id: 's1', role: 'probe', description: 'Fill name', origin: fx.origin, pathAndQuery: '/', action: 'fill', selector: '#name', value: 'wizard-user' },
         { id: 's2', role: 'probe', description: 'Click go', origin: fx.origin, reusePage: true, action: 'click', selector: '#go' },
@@ -3666,7 +3666,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const browser = new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false })) as unknown as V4ScopedBrowserContract
     const runSession = requireMethod<V4ScopedBrowserContract['runBrowserSession']>(browser, 'runBrowserSession', 'ScopedBrowser')
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runSession([
         { id: 's1', role: 'probe', description: 'Open', origin: fx.origin, pathAndQuery: '/', action: 'navigate' },
         { id: 's2', role: 'probe', description: 'Trigger XHR', origin: fx.origin, reusePage: true, action: 'click', selector: '#load' },
@@ -3684,7 +3684,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const browser = new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false })) as unknown as V4ScopedBrowserContract
     const runSession = requireMethod<V4ScopedBrowserContract['runBrowserSession']>(browser, 'runBrowserSession', 'ScopedBrowser')
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runSession([
         { id: 's1', role: 'probe', description: 'Load page', origin: fx.origin, pathAndQuery: '/', action: 'navigate' },
       ], makeLabGrant(fx.origin), AbortSignal.timeout(30_000)),
@@ -3703,7 +3703,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const browser = new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false })) as unknown as V4ScopedBrowserContract
     const runSession = requireMethod<V4ScopedBrowserContract['runBrowserSession']>(browser, 'runBrowserSession', 'ScopedBrowser')
-    const results = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const results = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runSession([
         { id: 's1', role: 'probe', description: 'Login', origin: fx.origin, pathAndQuery: '/login', action: 'navigate' },
         { id: 's2', role: 'probe', description: 'Next', origin: fx.origin, pathAndQuery: '/dash', action: 'navigate' },
@@ -3730,7 +3730,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     ]
     const recipe = browserSinkEnvelopeFromSteps({ origin: fx.origin, vulnClass: 'dom_xss', steps })
     assert.ok(recipe, 'expected browser_sink recipe envelope for T2-05e')
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -3761,7 +3761,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin, { personas: personaMap, secrets: [{ placeholder: '[redacted]', value: jwt }] })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/1', persona: 'jwt_u', authMutation: { kind: 'alg_none' } }, grant, AbortSignal.timeout(5000))
       const tok1 = String(fx.requests[0].headers.authorization).slice(7)
       assert.equal(decodeJwtParts(tok1).header.alg, 'none')
@@ -3792,7 +3792,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       personas: [{ handle: 'rs_u', roleLabel: 'User', authKind: 'bearer', secret: jwt }],
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       broker.executeHttp({
         origin: fx.origin, method: 'GET', pathAndQuery: '/api/me', persona: 'rs_u',
         authMutation: { kind: 'rs256_to_hs256_jwks', jwksUrl: `${fx.origin}/.well-known/jwks.json` },
@@ -3823,7 +3823,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const minted = canaryBroker.mintCanary(runId, 'jku-test', fx.origin, { storage })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       broker.executeHttp({
         origin: fx.origin, method: 'GET', pathAndQuery: '/api/me', persona: 'jku_u',
         authMutation: { kind: 'jku_x5u_canary', header: 'jku', value: minted.httpUrl },
@@ -3845,7 +3845,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       personas: [{ handle: 'sec_u', roleLabel: 'User', authKind: 'bearer', secret: origJwt }],
     })
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
-    const ex = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const ex = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       broker.executeHttp({
         origin: fx.origin, method: 'GET', pathAndQuery: '/echo', persona: 'sec_u',
         authMutation: { kind: 'alg_none' },
@@ -3875,7 +3875,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       seeds: [fx.origin],
       personas: [{ handle: 'jwt_user', roleLabel: 'User', authKind: 'bearer', secret: jwt }],
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -3943,7 +3943,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
   test('T2-07d: local-lab environment auto-allows safe non-destructive POST at Tier 2', async (t) => {
     const fx = await startHttpFixture(t, (_req, _b, res) => res.end('{"created":true}'))
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       broker.executeHttp(
         { origin: fx.origin, method: 'POST', pathAndQuery: '/api/orders', headers: { 'Content-Type': 'application/json' }, body: '{"item":1}' },
         makeLabGrant(fx.origin, { tier: 2 }),
@@ -3960,7 +3960,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false, circuit5xxThreshold: 3 }) as unknown as V4BrokerContract
     const grant = makeLabGrant(fx.origin, { tier: 2, sandboxWriteAllowlist: [{ origin: fx.origin, method: 'POST', pathPattern: '/*' }] })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       for (let i = 0; i < 2; i += 1) {
         const res = await broker.executeHttp({ origin: fx.origin, method: 'POST', pathAndQuery: '/api/search', body: '{}' }, grant, AbortSignal.timeout(5000))
         assert.equal(res.status, 503)
@@ -3994,7 +3994,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runPhase0({
         storage, runId, scopeRevision: 1, tier: 2, origins: [fx.origin],
         broker: new RequestBroker({ rejectUnauthorized: false }), grant: makeLabGrant(fx.origin),
@@ -4024,7 +4024,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runPhase0({
         storage, runId, scopeRevision: 1, tier: 2, origins: [fx.origin],
         broker: new RequestBroker({ rejectUnauthorized: false }), grant: makeLabGrant(fx.origin),
@@ -4041,12 +4041,12 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       mod, 'runPhase0Recon', 'src/server/phase0-recon.ts',
     )
     const fx = await startHttpFixture(t, (_req, _b, res) => res.end('ok'))
-    const repoDir = makeTempDir(t, 'guardian-v4-p0-repo-')
+    const repoDir = makeTempDir(t, 'kovo-v4-p0-repo-')
     mkdirSync(join(repoDir, 'app/routes'), { recursive: true })
     writeFileSync(join(repoDir, 'app/routes/server.ts'), `app.get('/api/repo-discovered-route', h)`)
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runPhase0({
         storage, runId, scopeRevision: 1, tier: 2, origins: [fx.origin], reposDir: repoDir,
         broker: new RequestBroker({ rejectUnauthorized: false }), grant: makeLabGrant(fx.origin),
@@ -4069,7 +4069,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    const out = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const out = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runPhase0({
         storage, runId, scopeRevision: 1, tier: 1, origins: [fx.origin],
         broker: new RequestBroker({ rejectUnauthorized: false }), grant: makeLabGrant(fx.origin, { tier: 1 }),
@@ -4092,7 +4092,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runPhase0({
         storage, runId, scopeRevision: 1, tier: 1, origins: [fx.origin],
         broker: new RequestBroker({ rejectUnauthorized: false }),
@@ -4124,7 +4124,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
         { handle: 'persona_b', roleLabel: 'B', authKind: 'bearer', secret: 'tok-b' },
       ],
     })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       crawl({
         storage, runId, scopeRevision: 1, origin: fx.origin, maxPages: 5, maxDepth: 2,
         personas: ['persona_a', 'persona_b'],
@@ -4150,7 +4150,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       crawl({
         storage, runId, scopeRevision: 1, origin: fx.origin, maxPages: 3, maxDepth: 1,
         browser: new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false })),
@@ -4172,7 +4172,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       crawl({
         storage, runId, scopeRevision: 1, origin: fx.origin, maxPages: 3, maxDepth: 1,
         browser: new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false })),
@@ -4194,7 +4194,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       crawl({
         storage, runId, scopeRevision: 1, origin: fx.origin, maxPages: 25, maxDepth: 3, budgetRemaining: 2,
         browser: new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false })),
@@ -4215,7 +4215,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       crawl({
         storage, runId, scopeRevision: 1, origin: fx.origin, maxPages: 10, maxDepth: 2,
         browser: new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false, circuit5xxThreshold: 2 })),
@@ -4304,7 +4304,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     storage.updateRun(runId, { phase: 'investigation', status: 'running' })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 10_000
@@ -4397,7 +4397,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runPhase0Recon({
         storage, runId, origins: [fx.origin], broker: new RequestBroker({ rejectUnauthorized: false }),
         grant: makeLabGrant(fx.origin), signal: AbortSignal.timeout(15_000),
@@ -4406,12 +4406,12 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     assert.ok((storage as unknown as V4StoreContract).listEndpoints(runId).some(e => String(e.pathTemplate ?? e.path_template).includes('/api/hidden-feature-flag')))
   })
 
-  // --- Feature 12: guardian-worker:v4 Hardened Offline Toolchain ---
+  // --- Feature 12: kovo-worker:v4 Hardened Offline Toolchain ---
 
-  test('T2-12a: guardian-worker:v4 runs curated offline Opengrep ruleset with --network none', async (t) => {
+  test('T2-12a: kovo-worker:v4 runs curated offline Opengrep ruleset with --network none', async (t) => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon required for T2-12a')
     const backend = new LinuxWorkerBackend()
-    const repoDir = makeTempDir(t, 'guardian-v4-sast-')
+    const repoDir = makeTempDir(t, 'kovo-v4-sast-')
     writeLabRepoFixture(join(repoDir, 'app'), { withVulns: true })
     const res = await runWorkerSast(backend as never, { repo: 'app', engines: ['opengrep'], reposDir: repoDir }) as {
       engineStatus: Record<string, { ok: boolean }>; findings: unknown[]
@@ -4420,10 +4420,10 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     assert.ok(res.findings.length >= 1)
   })
 
-  test('T2-12b: guardian-worker:v4 trivy-fs runs offline scan against /opt/trivy-cache on vulnerable lockfile', async (t) => {
+  test('T2-12b: kovo-worker:v4 trivy-fs runs offline scan against /opt/trivy-cache on vulnerable lockfile', async (t) => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon required for T2-12b')
     const backend = new LinuxWorkerBackend()
-    const repoDir = makeTempDir(t, 'guardian-v4-trivy-')
+    const repoDir = makeTempDir(t, 'kovo-v4-trivy-')
     const appDir = join(repoDir, 'app')
     mkdirSync(appDir, { recursive: true })
     writeFileSync(join(appDir, 'package.json'), JSON.stringify({ name: 'vuln-pkg', version: '1.0.0', dependencies: { lodash: '4.17.15' } }))
@@ -4454,7 +4454,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
   test('T2-12d: gitleaks/trufflehog SAST findings mask raw AWS/Stripe secrets in maskedPreview', async (t) => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon required for T2-12d')
     const backend = new LinuxWorkerBackend()
-    const repoDir = makeTempDir(t, 'guardian-v4-secrets-')
+    const repoDir = makeTempDir(t, 'kovo-v4-secrets-')
     const appDir = join(repoDir, 'app')
     mkdirSync(appDir, { recursive: true })
     writeFileSync(join(appDir, 'config.ts'), `export const STRIPE = "${RAW_STRIPE_SECRET}";\nexport const AWS = "${RAW_AWS_SECRET}";\n`)
@@ -4467,7 +4467,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
   test('T2-12e: verifyStaticAst confirms planted line range and rejects non-matching line range', async (t) => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon required for T2-12e')
     const backend = new LinuxWorkerBackend()
-    const repoDir = makeTempDir(t, 'guardian-v4-astv-')
+    const repoDir = makeTempDir(t, 'kovo-v4-astv-')
     writeLabRepoFixture(join(repoDir, 'app'), { withVulns: true })
     const ok = await backend.verifyStaticAst(
       randomUUID(),
@@ -4496,7 +4496,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
   test('T2-13a: Stage-1 infers custom ORM/auth middleware wrappers into ProjectSecuritySpec', async (t) => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon required for T2-13a')
     const backend = new LinuxWorkerBackend()
-    const repoDir = makeTempDir(t, 'guardian-v4-iris-')
+    const repoDir = makeTempDir(t, 'kovo-v4-iris-')
     const appDir = join(repoDir, 'app')
     mkdirSync(join(appDir, 'src'), { recursive: true })
     writeFileSync(join(appDir, 'src/auth.ts'), `export function requireOrgMembership(req: any) { return req.user?.orgId }`)
@@ -4514,7 +4514,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
   test('T2-13b: Stage-2 sinkpoint-backward interprocedural traversal traces entrypoint -> helper -> SQL sink across 2 files', async (t) => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon required for T2-13b')
     const backend = new LinuxWorkerBackend()
-    const repoDir = makeTempDir(t, 'guardian-v4-taint-')
+    const repoDir = makeTempDir(t, 'kovo-v4-taint-')
     const appDir = join(repoDir, 'app')
     mkdirSync(join(appDir, 'src'), { recursive: true })
     writeFileSync(join(appDir, 'src/repo.ts'), `export function findInvoice(db: any, id: string) { return db.query("SELECT * FROM invoices WHERE id = " + id) }`)
@@ -4527,11 +4527,11 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
   })
 
   test('T2-13c: Stage-3 git-history miner scans mounted repo commits for security fix patterns', async (t) => {
-    const repoRoot = makeTempDir(t, 'guardian-v4-gitmine-')
+    const repoRoot = makeTempDir(t, 'kovo-v4-gitmine-')
     const dir = join(repoRoot, 'app')
     mkdirSync(dir, { recursive: true })
     await exec('git', ['init'], { cwd: dir })
-    await exec('git', ['config', 'user.email', 'test@guardian.local'], { cwd: dir })
+    await exec('git', ['config', 'user.email', 'test@kovo.local'], { cwd: dir })
     await exec('git', ['config', 'user.name', 'Test'], { cwd: dir })
     writeFileSync(join(dir, 'a.ts'), 'export const a = 1;')
     await exec('git', ['add', '.'], { cwd: dir })
@@ -4557,7 +4557,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     mkdirSync(join(dataDir, 'repos', projectId, 'local'), { recursive: true })
     await exec('cp', ['-r', dir, join(dataDir, 'repos', projectId, 'local', 'app')])
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 15_000
@@ -4574,7 +4574,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
   })
 
   test('T2-13d: post-confirmation Variant Sweep synthesizes structural query and discovers sibling route', async (t) => {
-    const repoRoot = makeTempDir(t, 'guardian-v4-variant-')
+    const repoRoot = makeTempDir(t, 'kovo-v4-variant-')
     const appSrc = join(repoRoot, 'app')
     writeLabRepoFixture(appSrc, { withVulns: true })
     writeFileSync(join(appSrc, 'src', 'billing.ts'), `export async function getBilling(db: { query: (s: string) => unknown }, id: string) {\n  return db.query("SELECT * FROM billing WHERE id = '" + id + "'")\n}\n`)
@@ -4616,7 +4616,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       codeLocations: [{ repo: 'local/app', file: 'src/orders.ts', startLine: 1, endLine: 3 }],
     }, specRow.id, ['http://127.0.0.1:9'])
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 15_000
@@ -4661,10 +4661,10 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon required for T2-14a')
     const runner = new LabRunner()
     t.after(() => runner.stopAll())
-    const repo = makeTempDir(t, 'guardian-v4-compose-')
+    const repo = makeTempDir(t, 'kovo-v4-compose-')
     writeLabRepoFixture(repo, { withCompose: true })
     const runId = randomUUID()
-    const handle = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const handle = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runner.startLabTarget({
         runId,
         environment: 'local-lab',
@@ -4684,7 +4684,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const net = JSON.parse(netJson)[0] as { Internal: boolean; Options?: Record<string, string> }
     assert.equal(net.Internal, true)
     assert.equal(net.Options?.['com.docker.network.bridge.inhibit_ipv4'], 'true')
-    const { stdout: runningIds } = await exec('docker', ['ps', '-q', '--filter', `label=dev.guardian.run=${runId}`])
+    const { stdout: runningIds } = await exec('docker', ['ps', '-q', '--filter', `label=dev.kovo.run=${runId}`])
     const cids = runningIds.trim().split('\n').filter(Boolean)
     assert.ok(cids.length >= 2, `Expected >=2 multi-service containers for run, got ${cids.length}`)
     const appCid = handle.containerName || cids[0]
@@ -4694,18 +4694,18 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       exec('docker', ['exec', appCid, 'node', '-e', `fetch('http://1.1.1.1',{signal:AbortSignal.timeout(1500)}).then(()=>process.exit(0)).catch(()=>process.exit(1))`]),
     )
     await runner.stopAll()
-    await assertZeroGuardianOrphans(runId)
+    await assertZeroKovoOrphans(runId)
   })
 
   test('T2-14b: LabRunner seedCommand populates synthetic personas into handle.seededPersonas', async (t) => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon required for T2-14b')
     const runner = new LabRunner()
     t.after(() => runner.stopAll())
-    const repo = makeTempDir(t, 'guardian-v4-seed-')
+    const repo = makeTempDir(t, 'kovo-v4-seed-')
     writeLabRepoFixture(repo)
     writeFileSync(join(repo, 'seed.mjs'), `console.log(JSON.stringify({ personas: [{ handle: 'persona_a', roleLabel: 'Tenant A', authKind: 'bearer', secret: 'tok-a' }] }))`)
     const runId = randomUUID()
-    const handle = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const handle = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runner.startLabTarget({
         runId,
         environment: 'local-lab',
@@ -4721,10 +4721,10 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon required for T2-14c')
     const runner = new LabRunner()
     t.after(() => runner.stopAll())
-    const repo = makeTempDir(t, 'guardian-v4-rebuild-')
+    const repo = makeTempDir(t, 'kovo-v4-rebuild-')
     writeLabRepoFixture(repo)
     const runId = randomUUID()
-    const h1 = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const h1 = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runner.startLabTarget({
         runId, environment: 'local-lab', repoDir: repo,
         labConfig: { enabled: true, dockerfile: 'Dockerfile', internalPort: 3000, healthPath: '/health' },
@@ -4738,7 +4738,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       '-    const id = u.searchParams.get(\'id\') || \'1\'',
       '+    const id = String(Number(u.searchParams.get(\'id\') || \'1\'))',
     ].join('\n')
-    const h2 = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const h2 = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runner.rebuildWithPatch(runId, diff),
     )
     assert.equal(h2.origin, h1.origin)
@@ -4752,7 +4752,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     assert.equal(opts.sarifPath, '/tmp/out.sarif')
   })
 
-  test('T2-14e: HTTP updateProjectLabConfig RPC persists multi-service labConfig when GUARDIAN_ALLOW_LOCAL_LAB=1', async (t) => {
+  test('T2-14e: HTTP updateProjectLabConfig RPC persists multi-service labConfig when KOVO_ALLOW_LOCAL_LAB=1', async (t) => {
     const { storage } = makeStore(t)
     const { projectId } = await setupApprovedRun(storage, { environment: 'local-lab' })
     const cfg: V4LabConfig = {
@@ -4763,7 +4763,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       iastRuntime: 'node',
       services: [{ name: 'app', dockerfile: 'Dockerfile', internalPort: 3000 }],
     }
-    const updated = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const updated = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       storage.updateProjectLabConfig({ requestId: randomUUID(), projectId, labConfig: cfg as LabConfig }),
     )
     assert.equal((updated.labConfig as V4LabConfig | null)?.iastEnabled, true)
@@ -4805,14 +4805,14 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     assert.ok(Number(eps[0].coveragePct ?? eps[0].coverage_pct) > 0)
   })
 
-  test('T2-15c: IAST Node runtime hook captures SQL sink syntax error tagged with X-Guardian-Trace-Id', async (t) => {
+  test('T2-15c: IAST Node runtime hook captures SQL sink syntax error tagged with X-Kovo-Trace-Id', async (t) => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon is required for LabRunner IAST runtime hook test')
     const runner = new LabRunner()
     t.after(() => runner.stopAll())
-    const repo = makeTempDir(t, 'guardian-v4-iast-node-')
+    const repo = makeTempDir(t, 'kovo-v4-iast-node-')
     writeLabRepoFixture(repo)
     const runId = randomUUID()
-    const handle = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const handle = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runner.startLabTarget({
         runId,
         environment: 'local-lab',
@@ -4823,7 +4823,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const { storage } = makeStore(t)
     const broker = new RequestBroker({ rejectUnauthorized: false }) as unknown as V4BrokerContract
     const traceId = `trace-${randomUUID().slice(0, 8)}`
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       broker.executeHttp(
         { origin: handle.origin, method: 'GET', pathAndQuery: "/api/orders?id=1'", traceId, runId },
         makeLabGrant(handle.origin),
@@ -4834,7 +4834,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const rows = (storage as unknown as V4StoreContract).listLabTelemetry(runId)
     assert.ok(files.length >= 1 || rows.length >= 1, 'Expected IAST Node telemetry to record sink/route hit')
     await runner.stopAll()
-    await assertZeroGuardianOrphans(runId)
+    await assertZeroKovoOrphans(runId)
   })
 
   test('T2-15d: coverage-driven planner prioritizes endpoints with coverage_pct = 0', async (t) => {
@@ -4881,7 +4881,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const grant = makeLabGrant(fx.origin, { isIdempotentPostAllowed: () => true })
-    const formRes = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const formRes = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'sqli_boolean', origin: fx.origin, pathAndQuery: '/search',
@@ -4890,7 +4890,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
         broker, grant, undefined, AbortSignal.timeout(15_000),
       ),
     )
-    const xmlRes = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const xmlRes = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'sqli_boolean', origin: fx.origin, pathAndQuery: '/xml-search',
@@ -4911,7 +4911,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       res.end(JSON.stringify({ found: match || val === '1' }))
     })
     for (const loc of ['path', 'header'] as const) {
-      const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+      const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
         verifyReplaySpec({
           spec: {
             ...baseReplaySpecFields(fx.origin),
@@ -4942,7 +4942,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       if (/SLEEP|pg_sleep|WAITFOR|randomblob/i.test(id)) await delay(1600)
       res.end('ok')
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'sqli_time_diff', origin: fx.origin, pathAndQuery: '/items?id=1',
@@ -4979,7 +4979,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const parsed = declarativeReplaySpecSchema.safeParse(spec)
     assert.equal(parsed.success, true, parsed.success ? '' : parsed.error.message)
 
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: parsed.data,
         broker: new RequestBroker({ rejectUnauthorized: false }),
@@ -5002,7 +5002,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const grant = makeLabGrant(fx.origin, { isIdempotentPostAllowed: () => true })
     for (const loc of ['json', 'form', 'graphql_var'] as const) {
-      await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+      await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
         probeDifferential(
           {
             probeClass: 'sqli_boolean', origin: fx.origin, pathAndQuery: '/api/q',
@@ -5036,7 +5036,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
         { handle: 'persona_b', roleLabel: 'B', authKind: 'bearer', secret: 'tok-b' },
       ],
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'authz_matrix', origin: fx.origin, pathAndQuery: '/api/orders/{{id}}',
@@ -5076,7 +5076,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const dep = v4.recordApiDependency({ runId, producerEndpointId: prod.id, consumerEndpointId: cons.id, resourceKey: 'id', personaHandle: 'persona_a' })
     const grant = makeLabGrant(fx.origin, { tier: 3, personas: personaMap, isStateChangeApproved: () => true })
     const broker = new RequestBroker({ rejectUnauthorized: false })
-    const out = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const out = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'authz_matrix',
@@ -5109,7 +5109,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       res.statusCode = 404
       res.end('{}')
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -5140,7 +5140,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       redeemed += 1
       res.end(JSON.stringify({ redeemed: true, count: redeemed }))
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -5170,7 +5170,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       res.statusCode = 403
       res.end('forbidden')
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'authz_matrix', origin: fx.origin, pathAndQuery: '/api/items/{{id}}',
@@ -5209,7 +5209,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
         { handle: 'user_b', roleLabel: 'B', authKind: 'bearer', secret: 'tok-b' },
       ],
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'graphql_audit', origin: fx.origin, pathAndQuery: '/graphql',
@@ -5235,7 +5235,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       }
       res.end(JSON.stringify({ data: { search: [] } }))
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'sqli_boolean', origin: fx.origin, pathAndQuery: '/graphql',
@@ -5278,7 +5278,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       if (body.includes('__schema')) { res.statusCode = 403; res.end('{"errors":["introspection disabled"]}'); return }
       res.end(JSON.stringify({ data: { secretReport: { csv: 'a,b' } } }))
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'graphql_audit', origin: fx.origin, pathAndQuery: '/graphql',
@@ -5311,7 +5311,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
         { handle: 'persona_b', roleLabel: 'B', authKind: 'bearer', secret: 'tok-b' },
       ],
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -5340,7 +5340,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       res.setHeader('Content-Type', 'text/html')
       res.end(`<html><body><div id="msg"></div><script>document.getElementById("msg").innerHTML = ${JSON.stringify(q)};</script></body></html>`)
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'xss_context', origin: fx.origin, pathAndQuery: '/search?q=hi', param: 'q',
@@ -5371,7 +5371,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       res.statusCode = 400
       res.end('invalid_request')
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'auth_protocol_audit', origin: fx.origin, pathAndQuery: '/oauth/authorize?client_id=app&redirect_uri=https://app.example.invalid/cb',
@@ -5390,14 +5390,14 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     await canary.startListener({ host: '127.0.0.1', port: 0 })
     t.after(() => canary.stopListener())
     const fx = await startHttpFixture(t, async (_req, body, res) => {
-      const m = /https?:\/\/[^\s"'>]+guardian-canary-[a-f0-9]+[^\s"'>]*/i.exec(body)
+      const m = /https?:\/\/[^\s"'>]+kovo-canary-[a-f0-9]+[^\s"'>]*/i.exec(body)
       if (m) await fetch(m[0]).catch(() => {})
       res.setHeader('Content-Type', 'application/xml')
       res.end('<ok/>')
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'xxe_canary', origin: fx.origin, pathAndQuery: '/api/xml',
@@ -5424,7 +5424,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       }
       res.end(JSON.stringify({ id: 'u1', role }))
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       probeDifferential(
         {
           probeClass: 'mass_assignment', origin: fx.origin, pathAndQuery: '/api/profile',
@@ -5457,7 +5457,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       res.setHeader('X-Cache', 'MISS')
       res.end('host=clean')
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -5501,7 +5501,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       injectedOrigin: fx.origin, injectedEndpoint: '/profile', injectedParam: 'bio', injectedPersona: 'user_a',
     })
     const broker = new RequestBroker({ rejectUnauthorized: false, storage }) as unknown as V4BrokerContract
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/admin/audit', runId, assignmentId: aid }, makeLabGrant(fx.origin), AbortSignal.timeout(5000)),
     )
     const surfaced = v4.listSecondOrderCanaries(runId, 'surfaced')
@@ -5532,7 +5532,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false, storage })
     const browser = new ScopedBrowser(broker)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       browser.visitPage({ origin: fx.origin, pathAndQuery: '/admin/feed', persona: 'admin_b', runId, assignmentId: aid } as never, makeLabGrant(fx.origin, { personas: personaMap }), AbortSignal.timeout(30_000)),
     )
     const surfaced = v4.listSecondOrderCanaries(runId, 'surfaced')
@@ -5581,7 +5581,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       injectedOrigin: fx.origin, injectedEndpoint: '/comments', injectedParam: 'body', injectedPersona: 'user_a',
     })
     const broker = new RequestBroker({ rejectUnauthorized: false, storage }) as unknown as V4BrokerContract
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       broker.executeHttp(
         { origin: fx.origin, method: 'GET', pathAndQuery: '/admin/export', persona: 'admin', runId, assignmentId: aid },
         makeLabGrant(fx.origin, { personas: personaMap }),
@@ -5610,7 +5610,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     ]
     const recipe = browserSinkEnvelopeFromSteps({ origin: fx.origin, vulnClass: 'xss_stored', canaryToken: marker, steps })
     assert.ok(recipe, 'expected browser_sink recipe envelope for T2-20e')
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -5636,8 +5636,8 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const transpileDir = requireExport<(inDir: string, outDir: string) => Promise<{ transpiled: number; rejected: Array<{ file: string; reason: string }> }>>(
       mod, 'transpileNucleiDirectory', 'scripts/transpile-nuclei-templates.ts',
     )
-    const inDir = makeTempDir(t, 'guardian-v4-nuc-in-')
-    const outDir = makeTempDir(t, 'guardian-v4-nuc-out-')
+    const inDir = makeTempDir(t, 'kovo-v4-nuc-in-')
+    const outDir = makeTempDir(t, 'kovo-v4-nuc-out-')
     writeFileSync(join(inDir, 'good.yaml'), `id: cve-2024-11111\ninfo:\n  name: Sample Exposure\n  severity: medium\n  tags: nextjs,exposure\nhttp:\n  - method: GET\n    path:\n      - "{{BaseURL}}/.next/trace"\n    matchers:\n      - type: word\n        words:\n          - "webpack"\n`)
     writeFileSync(join(inDir, 'bad.yaml'), `id: bad-net\ninfo:\n  name: Bad Network\n  severity: high\nnetwork:\n  - inputs: [{ data: "hi" }]\n`)
     const res = await transpileDir(inDir, outDir)
@@ -5672,7 +5672,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       res.statusCode = 404
       res.end('not found')
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_TEMPLATES_DIR: compiledDir }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_TEMPLATES_DIR: compiledDir }, () =>
       runSafeTemplates(
         {
           origin: fx.origin,
@@ -5697,7 +5697,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       res.setHeader('Content-Type', 'text/html')
       res.end('<!doctype html><html><body><div id="app">SPA Catchall Shell</div></body></html>')
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_TEMPLATES_DIR: compiledDir }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_TEMPLATES_DIR: compiledDir }, () =>
       runSafeTemplates(
         {
           origin: fx.origin,
@@ -5745,7 +5745,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       })
     }
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 3_500
@@ -5792,7 +5792,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     }
     storage.updateRun(runId, { phase: 'investigation', status: 'running' })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 3_500
@@ -5850,7 +5850,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       .run(randomUUID(), runId, now, now)
     storage.updateRun(runId, { phase: 'investigation', status: 'running' })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 3_500
@@ -5882,7 +5882,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       .run(randomUUID(), runId, now, now)
     storage.updateRun(runId, { phase: 'investigation', status: 'running' })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 3_500
@@ -5914,7 +5914,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       .run(randomUUID(), runId, now, now)
     storage.updateRun(runId, { phase: 'investigation', status: 'running' })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 3_500
@@ -5946,7 +5946,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       .run(randomUUID(), runId, now, now)
     storage.updateRun(runId, { phase: 'investigation', status: 'running' })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 3_500
@@ -6004,7 +6004,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     }, storage, { skipConnectionCheck: true })
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 12_000
@@ -6082,7 +6082,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       .run(s1, runId, JSON.stringify([fx.origin]), gid, now + 1, now + 1)
     storage.updateRun(runId, { phase: 'investigation', status: 'running', workerConcurrency: 1 })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 50_000
@@ -6118,7 +6118,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       inputCostPerMtok: 0, cachedInputCostPerMtok: 0, outputCostPerMtok: 0,
     }, storage, { skipConnectionCheck: true })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       await delay(600)
@@ -6200,7 +6200,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
       .run(randomUUID(), runId, JSON.stringify([fx.origin]), gid, now + 1, now + 1)
     storage.updateRun(runId, { phase: 'investigation', status: 'running', workerConcurrency: 1 })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 50_000
@@ -6297,7 +6297,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const fx = await startHttpFixture(t, (_req, _body, res) => { res.statusCode = 404; res.end('not found') })
     await setupApprovedRun(storage, { seeds: [fx.origin] })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 10_000
@@ -6347,7 +6347,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const runBenchmarkSuite = requireExport<(opts: Record<string, unknown>) => Promise<Record<string, unknown>>>(
       mod, 'runBenchmarkSuite', 'scripts/benchmark-recall.ts',
     )
-    const outDir = makeTempDir(t, 'guardian-v4-bdiff-')
+    const outDir = makeTempDir(t, 'kovo-v4-bdiff-')
     const outJson = join(outDir, 'diff.json')
     const outMd = join(outDir, 'diff.md')
     const { storage } = makeStore(t)
@@ -6364,7 +6364,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
   })
 
   test('T2-26e: benchmark-recall CLI parser supports --suite, --baseline-sha, --out-json, --out-md', async (t) => {
-    const outDir = makeTempDir(t, 'guardian-v4-bcli-')
+    const outDir = makeTempDir(t, 'kovo-v4-bcli-')
     const outJson = join(outDir, 'cli.json')
     const outMd = join(outDir, 'cli.md')
     const cli = await exec('node', [
@@ -6385,7 +6385,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const runner = new LabRunner()
     t.after(() => runner.stopAll())
     const runId = randomUUID()
-    const handle = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const handle = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runner.startLabTarget({
         runId,
         environment: 'local-lab',
@@ -6396,7 +6396,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const resp = await fetch(`${handle.origin}/health`)
     assert.equal(resp.status, 200)
     await runner.stopAll()
-    await assertZeroGuardianOrphans(runId)
+    await assertZeroKovoOrphans(runId)
   })
 
   test('T2-27b: Held-Out SaaS Lab exposes planted BOLA/SQLi/GraphQL/XXE/JWT endpoints to RequestBroker', async () => {
@@ -6437,7 +6437,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const runId = randomUUID()
     const runner = new LabRunner()
     t.after(async () => { await runner.stopAll() })
-    const handle = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const handle = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runner.startLabTarget({
         runId,
         environment: 'local-lab',
@@ -6448,7 +6448,7 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     const resp = await fetch(`${handle.origin}/health`)
     assert.equal(resp.status, 200)
     await runner.stopAll()
-    await assertZeroGuardianOrphans(runId)
+    await assertZeroKovoOrphans(runId)
   })
 
   // --- Feature 28: Drizzle SQLite v4 Schema & Lossless Migration ---
@@ -6500,11 +6500,11 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
 
   test('T2-28d: Store process-lock.sqlite prevents concurrent conflicting Store instances on same directory', async (t) => {
     const { dir } = makeStore(t)
-    assert.throws(() => new Store(dir), /Another Guardian server is using this data directory/)
+    assert.throws(() => new Store(dir), /Another Kovo(?: Hunter)? server is using this data directory/)
   })
 
   test('T2-28e: Store WAL journal mode and v4 schema tables survive close -> reopen cycle losslessly', async (t) => {
-    const dir = makeTempDir(t, 'guardian-v4-reopen-')
+    const dir = makeTempDir(t, 'kovo-v4-reopen-')
     let savedRunId = ''
     {
       const s1 = new Store(dir)
@@ -6555,7 +6555,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       ],
     }
     const row = storage.createReplaySpec(run, assignment, randomUUID(), brokenSpec, [fx.origin])
-    const r1 = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const r1 = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyInline({
         runId, assignmentId: aid, replaySpecId: row.id, spec: brokenSpec, attemptCount: 1,
         broker: new RequestBroker({ rejectUnauthorized: false }), backend: new LinuxWorkerBackend(),
@@ -6570,7 +6570,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       ...brokenSpec,
       assertionsJq: '{ controlPassed: (.steps.c1.json.exposed == false), confirmed: (.steps.p1.json.exposed == true), observed: ("exposed=" + (.steps.p1.json.exposed | tostring)), expected: "exposed=false" }',
     }
-    const r2 = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const r2 = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyInline({
         runId, assignmentId: aid, replaySpecId: row.id, spec: repairedSpec, attemptCount: 2,
         broker: new RequestBroker({ rejectUnauthorized: false }), backend: new LinuxWorkerBackend(),
@@ -6596,7 +6596,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -6637,7 +6637,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       const parsed = JSON.parse(body || '{}') as { tenant?: string }
       res.end(JSON.stringify({ tenantData: parsed.tenant === 'other' ? 'LEAKED_OTHER' : 'OWN' }))
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -6677,7 +6677,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     ]
     const recipe = browserSinkEnvelopeFromSteps({ origin: fx.origin, vulnClass: 'dom_xss', steps })
     assert.ok(recipe, 'expected browser_sink recipe envelope for T3-05')
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -6710,7 +6710,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       seeds: [fx.origin],
       personas: [{ handle: 'alice', roleLabel: 'User', authKind: 'bearer', secret: origJwt }],
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -6742,7 +6742,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       res.end(JSON.stringify({ invoice: 'inv_b', secretTotal: 10 }))
     })
     const allowlist: ApprovedEndpointPattern[] = [{ origin: fx.origin, method: 'POST', pathPattern: '/dashboard' }]
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -6776,12 +6776,12 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       res.setHeader('Content-Type', 'text/html')
       res.end('<html><body>ok</body></html>')
     })
-    const repoDir = makeTempDir(t, 'guardian-v4-t3-p0-')
+    const repoDir = makeTempDir(t, 'kovo-v4-t3-p0-')
     mkdirSync(join(repoDir, 'web/app/api/internal-sync'), { recursive: true })
     writeFileSync(join(repoDir, 'web/app/api/internal-sync/route.ts'), 'export async function POST() { return Response.json({}) }')
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runPhase0({
         storage, runId, scopeRevision: 1, tier: 2, origins: [fx.origin], reposDir: repoDir,
         broker: new RequestBroker({ rejectUnauthorized: false }), grant: makeLabGrant(fx.origin),
@@ -6812,7 +6812,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       seeds: [fx.origin],
       personas: [{ handle: 'admin', roleLabel: 'Admin', authKind: 'bearer', secret: 'admin-tok' }],
     })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       crawl({
         storage, runId, scopeRevision: 1, origin: fx.origin, personas: ['admin'], maxPages: 10, maxDepth: 2,
         browser: new ScopedBrowser(new RequestBroker({ rejectUnauthorized: false })),
@@ -6846,7 +6846,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
         { handle: 'persona_b', roleLabel: 'B', authKind: 'bearer', secret: 'tok-b' },
       ],
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -6899,7 +6899,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     })
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin] })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runPhase0({
         storage, runId, scopeRevision: 1, tier: 1, origins: [fx.origin],
         broker: new RequestBroker({ rejectUnauthorized: false }), grant: makeLabGrant(fx.origin, { tier: 1 }),
@@ -6913,7 +6913,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
   test('T3-12: Offline worker detects planted CVE in package-lock.json via Trivy + Opengrep sink under --network none', async (t) => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon required for T3-12')
     const backend = new LinuxWorkerBackend()
-    const repoDir = makeTempDir(t, 'guardian-v4-t3-worker-')
+    const repoDir = makeTempDir(t, 'kovo-v4-t3-worker-')
     const appDir = join(repoDir, 'svc')
     writeLabRepoFixture(appDir, { withVulns: true })
     writeFileSync(join(appDir, 'package.json'), JSON.stringify({ name: 'svc', version: '1.0.0', dependencies: { lodash: '4.17.15' } }))
@@ -6930,7 +6930,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
   })
 
   test('T3-13: Variant Sweep after 1 confirmed BOLA auto-discovers & confirms sibling unguarded route', async (t) => {
-    const srcRoot = makeTempDir(t, 'guardian-v4-t3-variant-')
+    const srcRoot = makeTempDir(t, 'kovo-v4-t3-variant-')
     mkdirSync(join(srcRoot, 'src'), { recursive: true })
     writeFileSync(join(srcRoot, 'src/invoices.ts'), `export function readInvoice(db: any, id: string) { return db.findUnique({ where: { id } }) }\n`)
     writeFileSync(join(srcRoot, 'src/payments.ts'), `export function readPayment(db: any, id: string) { return db.findUnique({ where: { id } }) }\n`)
@@ -6965,7 +6965,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       codeLocations: [{ repo: 'local/app', file: 'src/invoices.ts', startLine: 1, endLine: 1 }],
     }, specRow.id, ['http://127.0.0.1:9'])
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 4_000
@@ -6977,14 +6977,14 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     assert.ok(storage.listChainSteps(runId).some(s => /payments\.ts/i.test(JSON.stringify(s))))
   })
 
-  test('T3-14: guardian scan --local-lab boots app+sidecar, seeds personas, confirms vuln, rebuilds & verifies fix', async (t) => {
+  test('T3-14: kovo-hunter scan --local-lab boots app+sidecar, seeds personas, confirms vuln, rebuilds & verifies fix', async (t) => {
     assert.equal(await dockerAvailable(), true, 'Docker daemon required for T3-14')
     const runner = new LabRunner()
     t.after(() => runner.stopAll())
-    const repo = makeTempDir(t, 'guardian-v4-t3-lab-')
+    const repo = makeTempDir(t, 'kovo-v4-t3-lab-')
     writeLabRepoFixture(repo, { withCompose: true, withVulns: true })
     const runId = randomUUID()
-    const handle = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const handle = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runner.startLabTarget({
         runId, environment: 'local-lab', repoDir: repo,
         labConfig: { enabled: true, dockerfile: 'Dockerfile', internalPort: 3000, healthPath: '/health' },
@@ -6999,7 +6999,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
         { id: 'p1', role: 'probe', description: 'SQLi syntax error', request: { origin: handle.origin, method: 'GET', pathAndQuery: "/api/orders?id=1'" } },
       ],
     }
-    const confirmed = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const confirmed = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: vulnSpec, broker: new RequestBroker({ rejectUnauthorized: false }),
         backend: new LinuxWorkerBackend(), grant: makeLabGrant(handle.origin), signal: AbortSignal.timeout(30_000),
@@ -7016,10 +7016,10 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       '+    const id = String(parseInt(u.searchParams.get(\'id\') || \'1\', 10) || 1)',
       '+    if (false) { res.statusCode = 500; res.end(\'\'); return }',
     ].join('\n')
-    const rebuilt = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => runner.rebuildWithPatch(runId, fixDiff))
+    const rebuilt = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => runner.rebuildWithPatch(runId, fixDiff))
     assert.equal(rebuilt.origin, handle.origin)
     const { retestReplaySpec } = await import('../src/server/replay-verifier.ts')
-    const after = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const after = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       retestReplaySpec({
         spec: vulnSpec, broker: new RequestBroker({ rejectUnauthorized: false }),
         backend: new LinuxWorkerBackend(), grant: makeLabGrant(handle.origin), signal: AbortSignal.timeout(30_000),
@@ -7027,7 +7027,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     )
     assert.equal(after.verdict, 'fixed')
     await runner.stopAll()
-    await assertZeroGuardianOrphans(runId)
+    await assertZeroKovoOrphans(runId)
   })
 
   test('T3-15: Blind 500 SQL error diagnosed via IAST sink telemetry, then confirmed Zero-LLM', async (t) => {
@@ -7063,7 +7063,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     })
     const telemetry = (storage as unknown as V4StoreContract).listLabTelemetry(runId)
     assert.equal(telemetry.length, 1)
-    const verified = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const verified = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -7091,7 +7091,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ rows: isTrue ? ['row1'] : [] }))
     })
-    const boolVerdict = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const boolVerdict = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -7105,7 +7105,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     )
     assert.equal(boolVerdict.verdict, 'confirmed')
 
-    const timeVerdict = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const timeVerdict = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -7136,7 +7136,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
         { handle: 'persona_b', roleLabel: 'B', authKind: 'bearer', secret: 'tok-b' },
       ],
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -7170,7 +7170,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       seeds: [fx.origin],
       personas: [{ handle: 'persona_b', roleLabel: 'B', authKind: 'bearer', secret: 'tok-b' }],
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -7217,7 +7217,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
         return
       }
       if (u.pathname === '/xml') {
-        const m = /https?:\/\/[^\s"'>]+guardian-canary-[a-f0-9]+[^\s"'>]*/i.exec(body)
+        const m = /https?:\/\/[^\s"'>]+kovo-canary-[a-f0-9]+[^\s"'>]*/i.exec(body)
         if (m) await fetch(m[0]).catch(() => {})
         res.end('<ok/>')
       }
@@ -7226,7 +7226,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     const backend = new LinuxWorkerBackend()
     const grant = makeLabGrant(fx.origin, { isIdempotentPostAllowed: () => true })
 
-    const rMass = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const rMass = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin), kind: 'http_chain',
@@ -7242,7 +7242,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     )
     assert.equal(rMass.verdict, 'confirmed')
 
-    const rCache = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const rCache = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin), kind: 'cache_differential',
@@ -7257,7 +7257,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     )
     assert.equal(rCache.verdict, 'confirmed')
 
-    const rXxe = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const rXxe = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin), kind: 'http_chain',
@@ -7305,7 +7305,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
 
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const browser = new ScopedBrowser(broker)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp(asBrokerRequest({ origin: fx.origin, method: 'POST', pathAndQuery: '/profile', persona: 'persona_a', body: JSON.stringify({ bio: `<img src=x onerror=1>${marker}` }), runId, assignmentId: aid }), makeLabGrant(fx.origin, { personas: personaMap, isIdempotentPostAllowed: () => true }), AbortSignal.timeout(5000))
       const steps = [
         { id: 'c1', role: 'control', description: 'Clean view', origin: fx.origin, pathAndQuery: '/', persona: 'persona_b', action: 'navigate' },
@@ -7342,7 +7342,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       res.setHeader('Content-Type', 'text/html')
       res.end('<html><body><div id="__next">SPA Shell</div></body></html>')
     })
-    const spaRes = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_TEMPLATES_DIR: compiledDir }, () =>
+    const spaRes = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_TEMPLATES_DIR: compiledDir }, () =>
       runSafeTemplates(
         { origin: fxSpa.origin, techFingerprint: ['nextjs'], maxTemplates: 50, templatesDir: compiledDir },
         new RequestBroker({ rejectUnauthorized: false }), makeLabGrant(fxSpa.origin, { tier: 1 }), undefined, AbortSignal.timeout(30_000),
@@ -7363,7 +7363,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       res.statusCode = 404
       res.end('not found')
     })
-    const cveRes = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_TEMPLATES_DIR: compiledDir }, () =>
+    const cveRes = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_TEMPLATES_DIR: compiledDir }, () =>
       runSafeTemplates(
         { origin: fxCve.origin, techFingerprint: tmpl.tech, maxTemplates: 150, templatesDir: compiledDir },
         new RequestBroker({ rejectUnauthorized: false }), makeLabGrant(fxCve.origin, { tier: 1 }), undefined, AbortSignal.timeout(30_000),
@@ -7395,7 +7395,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       storage.addFact(run, assignment, { kind: 'code_audit_suspect', origin: 'http://127.0.0.1:9', summary: `Lead ${i}`, data: { endpoint: `/api/s/${i}`, severity: 'high', category: 'injection-input' } })
     }
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 3_500
@@ -7496,7 +7496,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       .run(s1, runId, JSON.stringify([fx.origin]), gid, now + 1, now + 1)
     storage.updateRun(runId, { phase: 'investigation', status: 'running', workerConcurrency: 1 })
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 50_000
@@ -7538,7 +7538,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     const { dir, storage } = makeStore(t)
     const outJson = join(dir, 'bench.json')
     const outMd = join(dir, 'bench.md')
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runSuite({ suite: 'xben-25', dryRun: true, storage, outJson, outMd }),
     )
     assert.ok(existsSync(outJson))
@@ -7553,18 +7553,18 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
       mod, 'runBenchmarkSuite', 'scripts/benchmark-recall.ts',
     )
     const { storage } = makeStore(t)
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runSuite({ suite: 'held-out-saas', dryRun: true, storage }),
     )
     assert.equal(res.falsePositiveCount, 0)
     assert.equal(res.funnelCounts.targetVulns, 20)
   })
 
-  test('T3-28: Legacy v3 guardian.sqlite opened by v4 Store auto-migrates losslessly and completes v4 ops', async (t) => {
-    const dir = makeTempDir(t, 'guardian-v4-t3-mig-')
-    const srcDb = resolve(repoRoot, '.guardian/dyad-v2-smoke/data/guardian.sqlite')
+  test('T3-28: Legacy v3 kovo.sqlite opened by v4 Store auto-migrates losslessly and completes v4 ops', async (t) => {
+    const dir = makeTempDir(t, 'kovo-v4-t3-mig-')
+    const srcDb = resolve(repoRoot, '.kovo/dyad-v2-smoke/data/kovo.sqlite')
     if (existsSync(srcDb)) {
-      copyFileSync(srcDb, join(dir, 'guardian.sqlite'))
+      copyFileSync(srcDb, join(dir, 'kovo.sqlite'))
     } else {
       const seed = new Store(dir)
       const now = Date.now()
@@ -7574,7 +7574,7 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
           VALUES ('proj-t3-1', '${wsId}', 'Legacy T3 Project', '["http://127.0.0.1:9"]', '[]', ${now});
       `)
       seed.close()
-      const raw = new DatabaseSync(join(dir, 'guardian.sqlite'))
+      const raw = new DatabaseSync(join(dir, 'kovo.sqlite'))
       for (const tbl of ['benchmark_runs', 'lab_telemetry', 'second_order_canaries', 'api_dependencies', 'endpoint_params', 'endpoints']) {
         raw.exec(`DROP TABLE IF EXISTS ${tbl};`)
       }
@@ -7608,11 +7608,11 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
 
 describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 cases)', () => {
   test('T4-01: SIGKILL crash recovery preserves v4 endpoints, api_dependencies, second_order_canaries, replay_specs.attempt_count and pauses running workers', async (t) => {
-    const dir = makeTempDir(t, 'guardian-v4-sigkill-')
+    const dir = makeTempDir(t, 'kovo-v4-sigkill-')
     let savedRunId = ''
     let savedAid = ''
     {
-      const app = await createApp({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, dir)
+      const app = await createApp({ KOVO_ALLOW_LOCAL_LAB: '1' }, dir)
       t.after(() => app.dispose())
       await app.start()
       await app.stop('SIGKILL')
@@ -7670,7 +7670,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     let postRevokeRequests = 0
     const grant = makeLabGrant(fx.origin, { canRead: o => inScope && o === fx.origin })
 
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp({ origin: fx.origin, method: 'GET', pathAndQuery: '/login', session: 'storm-jar', runId }, grant, AbortSignal.timeout(5000))
       const countBeforeRevoke = fx.requests.length
 
@@ -7709,7 +7709,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const grant = makeLabGrant(fx.origin, { maxRpsPerOrigin: 5, isIdempotentPostAllowed: () => true })
 
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       const burst = await broker.executeRaceBurst(
         Array.from({ length: 10 }, (_, i) => ({ origin: fx.origin, method: 'POST', pathAndQuery: `/race/${i}`, body: '{}' })),
         grant,
@@ -7763,7 +7763,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     assert.equal(steps.length, 40)
     assert.ok(steps.length > 32)
     const engine = new Execution(storage)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 3_500
@@ -7791,7 +7791,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage, { seeds: [fx.origin], budgetRequests: 200 })
     const cap = 30 // 15% of 200
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runPhase0({
         storage, runId, scopeRevision: 1, tier: 1, origins: [fx.origin], budgetRequests: 200,
         broker: new RequestBroker({ rejectUnauthorized: false }), grant: makeLabGrant(fx.origin, { tier: 1 }),
@@ -7806,7 +7806,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     const ingestTelemetry = requireExport<(input: Record<string, unknown>) => { filePath: string; bytesWritten: number }>(
       labMod, 'ingestLabTelemetry', 'src/server/lab-runner.ts',
     )
-    const dir = makeTempDir(t, 'guardian-v4-iast-flood-')
+    const dir = makeTempDir(t, 'kovo-v4-iast-flood-')
     const { storage } = makeStore(t)
     const { runId } = await setupApprovedRun(storage)
     const v4 = storage as unknown as V4StoreContract
@@ -7852,7 +7852,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
       res.setHeader('Content-Type', 'text/html')
       res.end('<!doctype html><html><body><div id="root">Universal SPA Shell</div></body></html>')
     })
-    const spaRes = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_TEMPLATES_DIR: compiledDir }, () =>
+    const spaRes = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_TEMPLATES_DIR: compiledDir }, () =>
       runSafeTemplates(
         {
           origin: spa.origin, techFingerprint: ['generic', 'nextjs'], maxTemplates: 200, templatesDir: compiledDir,
@@ -7869,7 +7869,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
       res.statusCode = 500
       res.end('server error')
     })
-    const errRes = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_TEMPLATES_DIR: compiledDir }, () =>
+    const errRes = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_TEMPLATES_DIR: compiledDir }, () =>
       runSafeTemplates(
         {
           origin: errSrv.origin, techFingerprint: ['generic'], maxTemplates: 100, templatesDir: compiledDir,
@@ -7884,7 +7884,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     assert.ok(errRes && typeof errRes === 'object')
   })
 
-  test('T4-08: Full CLI guardian scan --local-lab --sarif lifecycle produces valid SARIF 2.1.0, Markdown, summary.json & exit code 2', async (t) => {
+  test('T4-08: Full CLI kovo-hunter scan --local-lab --sarif lifecycle produces valid SARIF 2.1.0, Markdown, summary.json & exit code 2', async (t) => {
     const fx = await startHttpFixture(t, (req, _b, res) => {
       res.setHeader('Content-Type', 'application/json')
       const u = new URL(req.url ?? '/', fx.origin)
@@ -7931,7 +7931,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
         argumentsJson: JSON.stringify({ status: 'proved', summary: 'Phase completed cleanly.' }),
       }
     })
-    const outDir = makeTempDir(t, 'guardian-v4-cli-')
+    const outDir = makeTempDir(t, 'kovo-v4-cli-')
     const dataDir = join(outDir, 'data')
     mkdirSync(dataDir, { recursive: true, mode: 0o700 })
     const seedStorage = new Store(dataDir)
@@ -7958,13 +7958,13 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
         timeout: 120_000,
         env: {
           ...process.env,
-          GUARDIAN_ALLOW_LOCAL_LAB: '1',
+          KOVO_ALLOW_LOCAL_LAB: '1',
           OPENAI_BASE_URL: llm.endpoint,
           OPENAI_API_KEY: 'sk-cli-mock-12345678',
         },
       }, (error, _stdout, stderr) => {
         if (error && typeof (error as { code?: unknown }).code !== 'number') return rejectExit(error)
-        if (stderr && process.env.GUARDIAN_WORKER_DEBUG === '1') process.stderr.write(stderr.slice(0, 2_000))
+        if (stderr && process.env.KOVO_WORKER_DEBUG === '1') process.stderr.write(stderr.slice(0, 2_000))
         resolveExit(error ? Number((error as { code: number }).code) : 0)
       })
     })
@@ -7982,7 +7982,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
   })
 
   test('T4-09: Live createApp() HTTP API + SSE /api/runs/$runId/events Last-Event-ID replay & zero secret leaks', async (t) => {
-    const dir = makeTempDir(t, 'guardian-v4-app-sse-')
+    const dir = makeTempDir(t, 'kovo-v4-app-sse-')
     const secretMarker = 'SSE_SECRET_TOKEN_DO_NOT_LEAK_999'
     let savedRunId = ''
     let savedProjectId = ''
@@ -8002,12 +8002,12 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
       storage.close()
     }
 
-    const app = await createApp({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, dir)
+    const app = await createApp({ KOVO_ALLOW_LOCAL_LAB: '1' }, dir)
     t.after(() => app.dispose())
     await app.start()
 
     const localToken = readFileSync(join(dir, 'local-session'), 'utf8').trim()
-    const authHeaders = { Cookie: `guardian_local=${localToken}` }
+    const authHeaders = { Cookie: `kovo_local=${localToken}` }
     for (const path of ['/health', '/', '/settings', `/projects/${savedProjectId}`, `/runs/${savedRunId}`]) {
       const resp = await fetch(`${app.url}${path}`, { headers: authHeaders })
       assert.equal(resp.status, 200, `Expected 200 on live SSR route ${path}, got ${resp.status}`)
@@ -8045,10 +8045,10 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     assert.equal(await dockerAvailable(), true, 'Docker daemon required for T4-10')
     const runner = new LabRunner()
     t.after(() => runner.stopAll())
-    const repo = makeTempDir(t, 'guardian-v4-patch-loop-')
+    const repo = makeTempDir(t, 'kovo-v4-patch-loop-')
     writeLabRepoFixture(repo, { withVulns: true })
     const runId = randomUUID()
-    const handle = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const handle = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runner.startLabTarget({
         runId, environment: 'local-lab', repoDir: repo,
         labConfig: { enabled: true, dockerfile: 'Dockerfile', internalPort: 3000, healthPath: '/health' },
@@ -8063,7 +8063,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
         { id: 'p1', role: 'probe', description: 'Quote injection', request: { origin: handle.origin, method: 'GET', pathAndQuery: "/api/orders?id=1'" } },
       ],
     }
-    const before = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const before = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec, broker: new RequestBroker({ rejectUnauthorized: false }), backend: new LinuxWorkerBackend(),
         grant: makeLabGrant(handle.origin), signal: AbortSignal.timeout(30_000),
@@ -8081,11 +8081,11 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
       '+    const id = String(parseInt(u.searchParams.get(\'id\') || \'1\', 10) || 1)',
       '+    if (false) { res.statusCode = 500; res.end(\'\'); return }',
     ].join('\n')
-    const rebuilt = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => runner.rebuildWithPatch(runId, fixDiff))
+    const rebuilt = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => runner.rebuildWithPatch(runId, fixDiff))
     assert.equal(rebuilt.origin, handle.origin)
 
     const { retestReplaySpec } = await import('../src/server/replay-verifier.ts')
-    const after = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const after = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       retestReplaySpec({
         spec, broker: new RequestBroker({ rejectUnauthorized: false }), backend: new LinuxWorkerBackend(),
         grant: makeLabGrant(handle.origin), signal: AbortSignal.timeout(30_000),
@@ -8093,7 +8093,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     )
     assert.equal(after.verdict, 'fixed')
     await runner.stopAll()
-    await assertZeroGuardianOrphans(runId)
+    await assertZeroKovoOrphans(runId)
   })
 
   test('T4-11: Second-order cross-persona & cross-endpoint sweep across 20 concurrent requests confirms Stored XSS via ScopedBrowser', async (t) => {
@@ -8130,7 +8130,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     const broker = new RequestBroker({ rejectUnauthorized: false, storage })
     const browser = new ScopedBrowser(broker)
     const grant = makeLabGrant(fx.origin, { personas: personaMap, isIdempotentPostAllowed: () => true })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp(asBrokerRequest({ origin: fx.origin, method: 'POST', pathAndQuery: '/comments', persona: 'persona_a', body: JSON.stringify({ text: `<img src=x onerror=1>${marker}` }), runId, assignmentId: aid }), grant, AbortSignal.timeout(5000))
       await Promise.all(
         Array.from({ length: 18 }, (_, i) =>
@@ -8198,7 +8198,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
         { handle: 'persona_b', roleLabel: 'B', authKind: 'bearer', secret: 'tok-b' },
       ],
     })
-    const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin), kind: 'http_chain',
@@ -8216,7 +8216,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
       }),
     )
     assert.equal(res.verdict, 'confirmed')
-    const raceRes = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const raceRes = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
@@ -8245,11 +8245,11 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     const { dir, storage } = makeStore(t)
     const outJson = join(dir, 't4-13-diff.json')
     const outMd = join(dir, 't4-13-diff.md')
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runSuite({ suite: 'xben-25', dryRun: true, profileMode: 'v3-baseline', gitSha: 'sha-v3', storage }),
     )
     await delay(5)
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runSuite({ suite: 'xben-25', dryRun: true, profileMode: 'v4-full', gitSha: 'sha-v4', baselineSha: 'sha-v3', storage, outJson, outMd }),
     )
     const rows = (storage as unknown as V4StoreContract).listBenchmarkRuns('xben-25', 10)
@@ -8266,7 +8266,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     assert.equal(await dockerAvailable(), true, 'Docker daemon required for T4-14')
     const labRunId = randomUUID()
     const backend = new LinuxWorkerBackend({ runId: labRunId })
-    const repoDir = makeTempDir(t, 'guardian-v4-escape-')
+    const repoDir = makeTempDir(t, 'kovo-v4-escape-')
     writeLabRepoFixture(join(repoDir, 'app'))
     chmodSync(repoDir, 0o755)
     chmodSync(join(repoDir, 'app'), 0o755)
@@ -8276,7 +8276,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     const session = await backend.openSession(workerAssignmentId, AbortSignal.timeout(45_000), { reposDir: repoDir, pidsLimit: 64 })
     let res: { exitCode: number; stdout: string; stderr: string }
     try {
-      const { stdout: cidOut } = await exec('docker', ['ps', '-aq', '--filter', `label=dev.guardian.assignment=${workerAssignmentId}`])
+      const { stdout: cidOut } = await exec('docker', ['ps', '-aq', '--filter', `label=dev.kovo.assignment=${workerAssignmentId}`])
       const workerCid = cidOut.trim().split('\n')[0]?.trim()
       assert.ok(workerCid, 'Expected worker container for docker inspect')
       const { stdout: inspectOut } = await exec('docker', ['inspect', '--format', '{{.HostConfig.PidsLimit}}', workerCid])
@@ -8318,7 +8318,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     const hostPort = (hostSrv.address() as { port: number }).port
     const runner = new LabRunner()
     t.after(() => runner.stopAll())
-    const labHandle = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+    const labHandle = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
       runner.startLabTarget({
         runId: labRunId,
         environment: 'local-lab',
@@ -8333,7 +8333,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
 
     // Probe 3: LabRunner rejects privileged/host-escape compose and leaves 0 orphans
     await assert.rejects(
-      () => withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+      () => withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
         runner.startLabTarget({
           runId: randomUUID(),
           environment: 'local-lab',
@@ -8344,6 +8344,6 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
       /privileged|forbidden|unsafe/i,
     )
     await runner.stopAll()
-    await assertZeroGuardianOrphans()
+    await assertZeroKovoOrphans()
   })
 })

@@ -59,7 +59,7 @@ import { Store, type ChainStep, type Run } from '../src/server/store.ts'
 import type { WorkerBackend, WorkerSession } from '../src/server/worker-backend.ts'
 import { makeStore, setupApprovedRun, stopExecution, withEnv } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const ORIGIN = 'https://app.example.invalid'
 
@@ -340,7 +340,7 @@ test('Execution emits 270s wall-clock budget for multi-hop chain step vs 120s fo
   storage.updateRun(runId, { phase: 'investigation', status: 'running', workerConcurrency: 3, multiTrialEnabled: false })
 
   const engine = new Execution(storage, { backend: stubBackend(), deterministicSweep: false, maxDurationMs: 900_000 })
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     engine.start()
     engine.wake()
     const deadline = Date.now() + 4_000
@@ -754,7 +754,7 @@ test('Live Execution automatically enqueues and dispatches a hop-continuation st
     assignmentWallClockOverrideMs: 220,
   })
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     engine.start()
     engine.wake()
     const deadline = Date.now() + 5_000
@@ -787,7 +787,7 @@ test('Live Execution automatically enqueues and dispatches a hop-continuation st
 // ============================================================================
 
 test('buildWorkspaceSourceDigest produces a <= 8 KB multi-service route/guard/sink map and injects it into Turn 1 of runSourceFirstCodeAudit', async (t) => {
-  const reposDir = mkdtempSync(join(tmpdir(), 'guardian-digest-repo-'))
+  const reposDir = mkdtempSync(join(tmpdir(), 'kovo-digest-repo-'))
   t.after(() => rmSync(reposDir, { recursive: true, force: true }))
 
   mkdirSync(join(reposDir, 'acme', 'platform', 'services', 'edge'), { recursive: true })
@@ -847,7 +847,7 @@ export async function onJob(job: { callbackUrl: string }) {
   assert.match(digest, /Key Sinks & Handlers/, 'digest must list key sinks with file:line')
 
   // Stress bound: large workspace with 180 routes still stays strictly <= 8 KB
-  const bigDir = mkdtempSync(join(tmpdir(), 'guardian-digest-big-'))
+  const bigDir = mkdtempSync(join(tmpdir(), 'kovo-digest-big-'))
   t.after(() => rmSync(bigDir, { recursive: true, force: true }))
   mkdirSync(join(bigDir, 'svc', 'routes'), { recursive: true })
   const bigRoutes = Array.from({ length: 180 }, (_, i) =>
@@ -896,7 +896,7 @@ export async function onJob(job: { callbackUrl: string }) {
   t.after(() => engine.stop())
   internals(engine).projectReposMount = () => ({ reposDir, mountedRepos: ['acme/platform'] })
 
-  await withEnv({ GUARDIAN_STAGE1_LLM: '0' }, async () => {
+  await withEnv({ KOVO_STAGE1_LLM: '0' }, async () => {
     await engine.runSourceFirstCodeAudit(run, [], profiles, new AbortController().signal)
   })
 

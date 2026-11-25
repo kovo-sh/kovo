@@ -19,11 +19,11 @@ import { formHypotheses, profileCaps } from '../scripts/benchmark-probes.ts'
 import type { DiscoveredEndpoint } from '../scripts/benchmark-probes.ts'
 
 async function withLocalLab<T>(fn: () => Promise<T>): Promise<T> {
-  const prev = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  const prev = process.env.KOVO_ALLOW_LOCAL_LAB
+  process.env.KOVO_ALLOW_LOCAL_LAB = '1'
   try { return await fn() } finally {
-    if (prev === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prev
+    if (prev === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = prev
   }
 }
 
@@ -191,7 +191,7 @@ test('webhook: an attacker-supplied inline signing key is reported with a reject
       assert.equal(hit.controlRejected, true)
       assert.equal(hit.acceptanceAck, true)
       const accepted = hit.body as Record<string, unknown>
-      assert.ok(typeof accepted.key === 'string' && String(accepted.key).startsWith('guardian_whk_'))
+      assert.ok(typeof accepted.key === 'string' && String(accepted.key).startsWith('kovo_whk_'))
       assert.ok(typeof accepted.signature === 'string')
       assert.ok(typeof accepted.ts === 'string')
     } finally {

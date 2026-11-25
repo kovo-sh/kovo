@@ -3,7 +3,7 @@
  *
  * HIGH #2 residual — `safeResolveUnderRoot`/patch application must fail closed on dangling
  *   symlinks and must never write through an existing path.
- * MEDIUM #7 — `GUARDIAN_LAB_USER` must be parsed numerically, and IAST telemetry must be a unique,
+ * MEDIUM #7 — `KOVO_LAB_USER` must be parsed numerically, and IAST telemetry must be a unique,
  *   owner-only, per-run mount that is read-only when telemetry is off and fails fast on uid mismatch.
  */
 import assert from 'node:assert/strict'
@@ -67,8 +67,8 @@ function createDiff(relPath: string, content: string): string {
 // ============================================================================
 
 test('safeResolveUnderRoot rejects dangling symlink components (leaf and nested dir)', t => {
-  const root = makeTempDir(t, 'guardian-lab2-resolve-')
-  const outside = makeTempDir(t, 'guardian-lab2-resolve-out-')
+  const root = makeTempDir(t, 'kovo-lab2-resolve-')
+  const outside = makeTempDir(t, 'kovo-lab2-resolve-out-')
 
   symlinkSync(join(outside, 'not-yet-created.ts'), join(root, 'dangling.ts'))
   symlinkSync(join(outside, 'missing-dir'), join(root, 'dangling-dir'))
@@ -82,8 +82,8 @@ test('safeResolveUnderRoot rejects dangling symlink components (leaf and nested 
 })
 
 test('create-file patch cannot be written through a dangling symlink', t => {
-  const root = makeTempDir(t, 'guardian-lab2-create-link-')
-  const outside = makeTempDir(t, 'guardian-lab2-create-link-out-')
+  const root = makeTempDir(t, 'kovo-lab2-create-link-')
+  const outside = makeTempDir(t, 'kovo-lab2-create-link-out-')
   const escapeTarget = join(outside, 'escaped.ts')
   symlinkSync(escapeTarget, join(root, 'dangling.ts'))
 
@@ -96,8 +96,8 @@ test('create-file patch cannot be written through a dangling symlink', t => {
 })
 
 test('modify hunk cannot be applied through a dangling symlink', t => {
-  const root = makeTempDir(t, 'guardian-lab2-modify-link-')
-  const outside = makeTempDir(t, 'guardian-lab2-modify-link-out-')
+  const root = makeTempDir(t, 'kovo-lab2-modify-link-')
+  const outside = makeTempDir(t, 'kovo-lab2-modify-link-out-')
   const escapeTarget = join(outside, 'escaped.ts')
   symlinkSync(escapeTarget, join(root, 'dangling.ts'))
 
@@ -109,8 +109,8 @@ test('modify hunk cannot be applied through a dangling symlink', t => {
 })
 
 test('existing-file overwrite through a link is refused', t => {
-  const root = makeTempDir(t, 'guardian-lab2-overwrite-link-')
-  const outside = makeTempDir(t, 'guardian-lab2-overwrite-link-out-')
+  const root = makeTempDir(t, 'kovo-lab2-overwrite-link-')
+  const outside = makeTempDir(t, 'kovo-lab2-overwrite-link-out-')
   const victim = join(outside, 'victim.ts')
   writeFileSync(victim, 'export const value = "original"\n')
   symlinkSync(victim, join(root, 'victim.ts'))
@@ -123,8 +123,8 @@ test('existing-file overwrite through a link is refused', t => {
 })
 
 test('nested symlinked directory is refused for create and modify hunks', t => {
-  const root = makeTempDir(t, 'guardian-lab2-nested-link-')
-  const outside = makeTempDir(t, 'guardian-lab2-nested-link-out-')
+  const root = makeTempDir(t, 'kovo-lab2-nested-link-')
+  const outside = makeTempDir(t, 'kovo-lab2-nested-link-out-')
   symlinkSync(outside, join(root, 'linked-dir'))
 
   assert.throws(
@@ -141,7 +141,7 @@ test('nested symlinked directory is refused for create and modify hunks', t => {
 })
 
 test('legitimate create and modify hunks still apply inside the root', t => {
-  const root = makeTempDir(t, 'guardian-lab2-legit-')
+  const root = makeTempDir(t, 'kovo-lab2-legit-')
   writeFileSync(join(root, 'app.ts'), 'export const value = "original"\n')
   mkdirSync(join(root, 'src'), { recursive: true })
   writeFileSync(join(root, 'src', 'existing.ts'), 'export const flag = false\n')
@@ -171,20 +171,20 @@ test('legitimate create and modify hunks still apply inside the root', t => {
 })
 
 // ============================================================================
-// MEDIUM #7a — GUARDIAN_LAB_USER numeric parsing
+// MEDIUM #7a — KOVO_LAB_USER numeric parsing
 // ============================================================================
 
 test('resolveLabContainerUser rejects numeric-root and non-numeric forms', () => {
   for (const bad of ['00:00', '000:1000', '0:1000', '1000:0', '0000:0000', '-1:0', 'root:root', 'nobody', '1000', '1000:1000:0']) {
     assert.throws(
-      () => resolveLabContainerUser({ GUARDIAN_LAB_USER: bad }),
+      () => resolveLabContainerUser({ KOVO_LAB_USER: bad }),
       /non-root|numeric|rejected/i,
-      `GUARDIAN_LAB_USER=${JSON.stringify(bad)} must be rejected`,
+      `KOVO_LAB_USER=${JSON.stringify(bad)} must be rejected`,
     )
   }
 
-  assert.equal(resolveLabContainerUser({ GUARDIAN_LAB_USER: '1000:1000' }), '1000:1000')
-  assert.equal(resolveLabContainerUser({ GUARDIAN_LAB_USER: '01000:01000' }), '1000:1000')
+  assert.equal(resolveLabContainerUser({ KOVO_LAB_USER: '1000:1000' }), '1000:1000')
+  assert.equal(resolveLabContainerUser({ KOVO_LAB_USER: '01000:01000' }), '1000:1000')
 
   const fallback = resolveLabContainerUser({})
   assert.match(fallback, /^\d+:\d+$/)
@@ -197,7 +197,7 @@ test('resolveLabContainerUser rejects numeric-root and non-numeric forms', () =>
 // ============================================================================
 
 test('two lab runs receive distinct 0700 telemetry dirs under the shared base', t => {
-  const base = join(makeTempDir(t, 'guardian-lab2-telemetry-'), 'evidence', 'lab-telemetry')
+  const base = join(makeTempDir(t, 'kovo-lab2-telemetry-'), 'evidence', 'lab-telemetry')
 
   const first = createPerRunIastTelemetryDir(base, 'run-one')
   const second = createPerRunIastTelemetryDir(base, 'run-two')
@@ -213,15 +213,15 @@ test('two lab runs receive distinct 0700 telemetry dirs under the shared base', 
 
 test('IAST telemetry mount is read-only when telemetry is not enabled', () => {
   const off = buildIastTelemetryMountArgs('/host/telemetry', false)
-  assert.deepEqual(off, ['--mount', 'type=bind,source=/host/telemetry,target=/var/run/guardian-iast,readonly'])
+  assert.deepEqual(off, ['--mount', 'type=bind,source=/host/telemetry,target=/var/run/kovo-iast,readonly'])
 
   const on = buildIastTelemetryMountArgs('/host/telemetry', true)
-  assert.deepEqual(on, ['--mount', 'type=bind,source=/host/telemetry,target=/var/run/guardian-iast'])
+  assert.deepEqual(on, ['--mount', 'type=bind,source=/host/telemetry,target=/var/run/kovo-iast'])
   assert.equal(on.some(a => a.endsWith(',readonly')), false)
 })
 
 test('telemetry dirs stay bounded: old per-run dirs are pruned', t => {
-  const base = join(makeTempDir(t, 'guardian-lab2-prune-'), 'lab-telemetry')
+  const base = join(makeTempDir(t, 'kovo-lab2-prune-'), 'lab-telemetry')
   mkdirSync(base, { recursive: true, mode: 0o700 })
 
   const created: string[] = []
@@ -239,8 +239,8 @@ test('telemetry dirs stay bounded: old per-run dirs are pruned', t => {
   assert.ok(remaining.every(name => name.startsWith('run-')))
 })
 
-test('mismatched GUARDIAN_LAB_USER fails fast instead of silently losing IAST data', t => {
-  const base = join(makeTempDir(t, 'guardian-lab2-mismatch-'), 'lab-telemetry')
+test('mismatched KOVO_LAB_USER fails fast instead of silently losing IAST data', t => {
+  const base = join(makeTempDir(t, 'kovo-lab2-mismatch-'), 'lab-telemetry')
   const uid = typeof process.getuid === 'function' ? process.getuid() : undefined
   if (uid === 0 || uid === undefined) {
     // Root can chown the dir to any container user, so the mismatch case does not exist.
@@ -254,7 +254,7 @@ test('mismatched GUARDIAN_LAB_USER fails fast instead of silently losing IAST da
     (err: unknown) => {
       assert.ok(err instanceof Error)
       assert.match(err.message, /IAST telemetry dir/i)
-      assert.match(err.message, /GUARDIAN_LAB_USER/)
+      assert.match(err.message, /KOVO_LAB_USER/)
       return true
     },
   )
@@ -263,6 +263,6 @@ test('mismatched GUARDIAN_LAB_USER fails fast instead of silently losing IAST da
   const dir = join(base, 'run-check')
   mkdirSync(dir, { mode: 0o700 })
   chmodSync(dir, 0o700)
-  assert.throws(() => assertIastTelemetryDirWritable(dir, otherUser), /GUARDIAN_LAB_USER/)
+  assert.throws(() => assertIastTelemetryDirWritable(dir, otherUser), /KOVO_LAB_USER/)
   assert.doesNotThrow(() => assertIastTelemetryDirWritable(dir, `${uid}:${gid}`))
 })

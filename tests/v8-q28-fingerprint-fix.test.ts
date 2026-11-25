@@ -431,7 +431,7 @@ test('verifyScript confirms dual fresh composite runs with volatile entity IDs a
       })
       return {
         result: {
-          sdk: 'guardian_verify.ts',
+          sdk: 'kovo_verify.ts',
           nonce,
           title: `Order ${orderId} overcredit (${nonce})`,
           claims: [
@@ -494,7 +494,7 @@ test('verifyScript still rejects genuinely different proof titles or when one fr
       })
       return {
         result: {
-          sdk: 'guardian_verify.ts',
+          sdk: 'kovo_verify.ts',
           nonce,
           title: attempt === 1 ? `Order ${orderId} overcredit` : `Invoice ${orderId} cross-tenant disclosure`,
           claims: [
@@ -551,7 +551,7 @@ test('verifyScript still rejects genuinely different proof titles or when one fr
       })
       return {
         result: {
-          sdk: 'guardian_verify.ts',
+          sdk: 'kovo_verify.ts',
           nonce,
           title: `Order ${orderId} overcredit`,
           claims: [

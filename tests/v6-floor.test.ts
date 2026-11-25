@@ -39,7 +39,7 @@ import type { EngineEndpoint, EngineParam } from '../src/server/deterministic-en
 import type { ChainStep, Run } from '../src/server/store.ts'
 import { makeStore, setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 type LaneOptions = {
   lane?: boolean
@@ -118,9 +118,9 @@ test('floor lane resolver defaults ON; explicit false/env 0 is the operator kill
   assert.equal(resolveFloorLaneMode(true, {}), 'on')
   assert.equal(resolveFloorLaneMode('always', {}), 'always')
   assert.equal(resolveFloorLaneMode(false, {}), 'off')
-  assert.equal(resolveFloorLaneMode(undefined, { GUARDIAN_DETERMINISTIC_SWEEP: '0' }), 'off')
-  assert.equal(resolveFloorLaneMode(undefined, { GUARDIAN_DETERMINISTIC_SWEEP: 'off' }), 'off')
-  assert.equal(resolveFloorLaneMode(undefined, { GUARDIAN_DETERMINISTIC_SWEEP: '1' }), 'on')
+  assert.equal(resolveFloorLaneMode(undefined, { KOVO_DETERMINISTIC_SWEEP: '0' }), 'off')
+  assert.equal(resolveFloorLaneMode(undefined, { KOVO_DETERMINISTIC_SWEEP: 'off' }), 'off')
+  assert.equal(resolveFloorLaneMode(undefined, { KOVO_DETERMINISTIC_SWEEP: '1' }), 'on')
   // The legacy parser is retained unchanged for callers that pin the v5 opt-in semantics.
   assert.equal(resolveDeterministicSweepMode(undefined, {}), 'off')
 })

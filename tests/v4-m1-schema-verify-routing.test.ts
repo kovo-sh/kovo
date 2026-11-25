@@ -111,7 +111,7 @@ function createJqBackend(onRun?: () => void): WorkerBackend {
   return {
     async run(job, signal) {
       onRun?.()
-      const dir = mkdtempSync(join(tmpdir(), 'guardian-jq-unit-'))
+      const dir = mkdtempSync(join(tmpdir(), 'kovo-jq-unit-'))
       try {
         for (const f of job.files) {
           writeFileSync(join(dir, f.name.replace(/\//g, '_')), f.content, 'utf8')
@@ -251,15 +251,15 @@ function sseResponsesPayload(text: string, toolCalls: Array<{ name: string; args
 // ============================================================================
 
 test('M1.1 Lossless v3->v4 (and v2->v4) SQLite auto-migration, idempotency, indexes, and all 19 Store methods', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m1-store-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m1-store-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
 
   // A. If v2 smoke DB exists, verify lossless v2 -> v4 auto-migration on a temp copy
-  const v2SmokeDb = join(repoRootDir, '.guardian', 'dyad-v2-smoke', 'data', 'guardian.sqlite')
+  const v2SmokeDb = join(repoRootDir, '.kovo', 'dyad-v2-smoke', 'data', 'kovo.sqlite')
   if (existsSync(v2SmokeDb)) {
     const v2CopyDir = join(dir, 'v2-copy')
     mkdirSync(v2CopyDir, { recursive: true })
-    copyFileSync(v2SmokeDb, join(v2CopyDir, 'guardian.sqlite'))
+    copyFileSync(v2SmokeDb, join(v2CopyDir, 'kovo.sqlite'))
     const migratedV2 = new Store(v2CopyDir)
     assert.ok(migratedV2.listWorkspace().projects.length > 0, 'v2->v4 migration must preserve existing projects')
     migratedV2.close()
@@ -286,7 +286,7 @@ test('M1.1 Lossless v3->v4 (and v2->v4) SQLite auto-migration, idempotency, inde
   `)
   preStore.close()
 
-  const preDb = new DatabaseSync(join(v3Dir, 'guardian.sqlite'))
+  const preDb = new DatabaseSync(join(v3Dir, 'kovo.sqlite'))
   for (const tbl of ['benchmark_runs', 'lab_telemetry', 'second_order_canaries', 'api_dependencies', 'endpoint_params', 'endpoints']) {
     preDb.exec(`DROP TABLE IF EXISTS ${tbl};`)
   }
@@ -505,7 +505,7 @@ test('M1.1 Lossless v3->v4 (and v2->v4) SQLite auto-migration, idempotency, inde
 // ============================================================================
 
 test('M1.2 roleAffinity tiered routing: priority vs role precedence, single-profile & open-circuit fallback, and thinking defaults', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m1-routing-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m1-routing-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -687,7 +687,7 @@ test('M1.2 roleAffinity tiered routing: priority vs role precedence, single-prof
 // ============================================================================
 
 test('M1.3 browser_chain optional pathAndQuery after step 1 enforces session-continuity rules cleanly', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m1-bchain-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m1-bchain-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -803,7 +803,7 @@ test('M1.3 browser_chain optional pathAndQuery after step 1 enforces session-con
 // ============================================================================
 
 test('M1.4 verifyReplaySpecInline diagnostics (jqError, requireControlNonError, SPA catchall, canaryTriggered), secret redaction, 3-attempt cap & static_ast_proof tier lock', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m1-inline-diag-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m1-inline-diag-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const bearerSecret = 'PERSONA_A_RAW_BEARER_SECRET_XYZ123'
   const cookieSecret = 'SESSION_COOKIE_RAW_SECRET_ABC789'
@@ -817,7 +817,7 @@ test('M1.4 verifyReplaySpecInline diagnostics (jqError, requireControlNonError, 
       res.writeHead(404, { 'Content-Type': 'text/plain' }).end(`missing Cookie: sid=${cookieSecret}`)
       return
     }
-    if (req.url?.startsWith('/spa') || req.url?.startsWith('/.guardian-nonexistent-')) {
+    if (req.url?.startsWith('/spa') || req.url?.startsWith('/.kovo-nonexistent-')) {
       const html = '<!doctype html><html><head><title>App</title></head><body><div id="root">Welcome to the SPA shell application dashboard content</div></body></html>'
       res.writeHead(200, { 'Content-Type': 'text/html' }).end(html)
       return
@@ -965,7 +965,7 @@ test('M1.4 verifyReplaySpecInline diagnostics (jqError, requireControlNonError, 
 // ============================================================================
 
 test('M1.5 Worker inline repair loop: propose_chain_finding(verifyNow=true) -> jqError feedback -> verify_replay_spec -> confirmed (and static_ast_proof stays static_verified)', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m1-inline-loop-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m1-inline-loop-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -1163,7 +1163,7 @@ test('M1.5 Worker inline repair loop: propose_chain_finding(verifyNow=true) -> j
 
 test('M1.6 Phase-3 Focused Refinement Turn: positive 8-turn repair confirms AND negative closure stays unconfirmed with max 1 refinement worker', async t => {
   for (const mode of ['positive', 'negative'] as const) {
-    const dir = mkdtempSync(join(tmpdir(), `guardian-m1-refine-${mode}-`))
+    const dir = mkdtempSync(join(tmpdir(), `kovo-m1-refine-${mode}-`))
     t.after(() => rmSync(dir, { recursive: true, force: true }))
     const storage = new Store(dir)
     t.after(() => storage.close())
@@ -1341,7 +1341,7 @@ test('M1.6 Phase-3 Focused Refinement Turn: positive 8-turn repair confirms AND 
 })
 
 test('M1.7 Real --network none LinuxWorkerBackend end-to-end verification with verifyReplaySpecInline', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m1-docker-inline-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m1-docker-inline-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const fx = await httpFixture((req, res) => {
     if (req.url === '/c') {
@@ -1380,7 +1380,7 @@ test('M1.7 Real --network none LinuxWorkerBackend end-to-end verification with v
 // ============================================================================
 
 test('M1.8 Regression: openai-responses reasoningEffort wire forwarding & open-circuit healthy primarySettings', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m1-reg-routing-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m1-reg-routing-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
 
   const capturedBodies: Array<Record<string, unknown>> = []
@@ -1543,7 +1543,7 @@ test('M1.8 Regression: openai-responses reasoningEffort wire forwarding & open-c
 })
 
 test('M1.9 Regression: base64/base64url secret scrubbing, credentialPatterns secret=..., redactJsonValue keys, and NaN store guards', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m1-reg-redact-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m1-reg-redact-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -1703,7 +1703,7 @@ test('M1.10 Regression: browser_chain control -> setup/cleanup -> probe rejects 
 })
 
 test('M1.11 Regression: update_proposed_finding does not reset exhausted findings to pending & finding.reason/verification redact secrets', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m1-reg-exhaust-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m1-reg-exhaust-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -1878,7 +1878,7 @@ test('M1.11 Regression: update_proposed_finding does not reset exhausted finding
 
 test('M1.12 Regression: Phase-3 refinement gets independent verification allowance (even when attemptCount === 3), caps at 3 refinement attempts, and persists update_proposed_finding(verifyNow=false)', async t => {
   for (const scenario of ['exhausted-from-investigation', 'verify-now-false', 'refinement-own-retry-cap'] as const) {
-    const dir = mkdtempSync(join(tmpdir(), `guardian-m1-reg-p3-${scenario}-`))
+    const dir = mkdtempSync(join(tmpdir(), `kovo-m1-reg-p3-${scenario}-`))
     t.after(() => rmSync(dir, { recursive: true, force: true }))
     const storage = new Store(dir)
     t.after(() => storage.close())
@@ -2039,7 +2039,7 @@ test('M1.12 Regression: Phase-3 refinement gets independent verification allowan
 
 test('M1.13 Regression: exhausted update_proposed_finding(verifyNow=false) & propose_chain_finding dedupe-merge preserve dismissed status without orphan specs', async t => {
   for (const mode of ['update-verify-now-false', 'dedupe-propose-after-exhaust'] as const) {
-    const dir = mkdtempSync(join(tmpdir(), `guardian-m1-reg-m13-${mode}-`))
+    const dir = mkdtempSync(join(tmpdir(), `kovo-m1-reg-m13-${mode}-`))
     t.after(() => rmSync(dir, { recursive: true, force: true }))
     const storage = new Store(dir)
     t.after(() => storage.close())
@@ -2236,7 +2236,7 @@ test('M1.13 Regression: exhausted update_proposed_finding(verifyNow=false) & pro
 
 test('M1.14 Regression: Phase-3 refinement caps verify_replay_spec x3 + update_proposed_finding(verifyNow=false) and prevents driveVerification duplicate-worker race', async t => {
   for (const scenario of ['exhausted-verify-now-false', 'no-duplicate-worker-race'] as const) {
-    const dir = mkdtempSync(join(tmpdir(), `guardian-m1-reg-m14-${scenario}-`))
+    const dir = mkdtempSync(join(tmpdir(), `kovo-m1-reg-m14-${scenario}-`))
     t.after(() => rmSync(dir, { recursive: true, force: true }))
     const storage = new Store(dir)
     t.after(() => storage.close())
@@ -2390,7 +2390,7 @@ test('M1.14 Regression: Phase-3 refinement caps verify_replay_spec x3 + update_p
 })
 
 test('M1.15 Regression: completeWorker/redact.ts secret scrubbing (base64/base64url, *_secret=, sensitive subtrees) & store.ts Number.isFinite guards', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m1-reg-m15-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m1-reg-m15-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())

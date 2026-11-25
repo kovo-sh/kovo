@@ -31,7 +31,7 @@ import type { Grant } from '../src/server/broker.ts'
 import { synthesizeEngineSpecs } from '../src/server/deterministic-specs.ts'
 import { makeLabGrant, makeStore, setupApprovedRun, startHttpFixture, withEnv } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const origin = 'http://127.0.0.1:4100'
 
@@ -42,12 +42,12 @@ function endpoint(over: Partial<EngineEndpoint> & Pick<EngineEndpoint, 'method' 
 describe('conventional wordlist switch', () => {
   test('defaults ON for local-lab compatibility', () => {
     assert.equal(conventionalWordlistEnabled({}), true)
-    assert.equal(conventionalWordlistEnabled({ GUARDIAN_CONVENTIONAL_WORDLIST: '' }), true)
-    assert.equal(conventionalWordlistEnabled({ GUARDIAN_CONVENTIONAL_WORDLIST: 'on' }), true)
+    assert.equal(conventionalWordlistEnabled({ KOVO_CONVENTIONAL_WORDLIST: '' }), true)
+    assert.equal(conventionalWordlistEnabled({ KOVO_CONVENTIONAL_WORDLIST: 'on' }), true)
   })
 
   test('explicit OFF values disable only wordlist-only endpoints', () => {    for (const value of ['0', 'off', 'false', 'no', ' OFF ']) {
-      assert.equal(conventionalWordlistEnabled({ GUARDIAN_CONVENTIONAL_WORDLIST: value }), false, value)
+      assert.equal(conventionalWordlistEnabled({ KOVO_CONVENTIONAL_WORDLIST: value }), false, value)
     }
     const surface = [
       endpoint({ method: 'GET', pathTemplate: '/api/declared', source: 'openapi' }),
@@ -82,7 +82,7 @@ describe('conventional wordlist switch', () => {
 
 describe('lossless declared API-reference ingestion', () => {
   test('keeps DELETE, PATCH and body-only POST with declared methods, deduped', (t: TestContext) => {
-    const { storage } = makeStore(t, 'guardian-heldout-gap-')
+    const { storage } = makeStore(t, 'kovo-heldout-gap-')
     const project = storage.createProject({
       requestId: randomUUID(),
       name: 'declared surface',
@@ -232,7 +232,7 @@ describe('lossless declared API-reference ingestion', () => {
     const webhook = synthesizeEngineSpecs({
       key: 'wh', endpoint: receiver, probeClass: 'webhook_signature_bypass', intent: 'webhook',
       method: 'POST', pathAndQuery: '/api/events/receive', ownerPersona: 'persona-a',
-      webhookBody: { event: 'guardian.verification' }, risk: 60,
+      webhookBody: { event: 'kovo.verification' }, risk: 60,
     }, {
       probeClass: 'webhook_signature_bypass', origin, pathAndQuery: '/api/events/receive', verdict: 'signal',
       summary: 'accepted', anomalies: [{
@@ -273,11 +273,11 @@ describe('response-driven sibling derivation', () => {
       res.end(JSON.stringify({ error: 'not found' }))
     })
 
-    const { storage } = makeStore(t, 'guardian-heldout-gap-sibling-')
+    const { storage } = makeStore(t, 'kovo-heldout-gap-sibling-')
     const setup = await setupApprovedRun(storage, { seeds: [fx.origin], budgetRequests: 900 })
     const grant: Grant = makeLabGrant(fx.origin, { tier: 1 })
 
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_RECON_SIBLINGS: '1' }, () => runPhase0Recon({
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_RECON_SIBLINGS: '1' }, () => runPhase0Recon({
       storage,
       runId: setup.runId,
       scopeRevision: setup.run.scopeRevision,

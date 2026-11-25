@@ -9,7 +9,7 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
 // scopedAssetOrigin accepts loopback http origins only under the local-lab gate.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { declarativeReplaySpecSchema } from '../src/replay-spec.ts'
 import { synthesizeSpec } from '../scripts/benchmark-specs.ts'
@@ -163,7 +163,7 @@ describe('M7 spec synthesis: authz, GraphQL, SSRF, JWT', () => {
     const steps = built.spec.steps as Array<{ id: string; request: { pathAndQuery: string } }>
     assert.equal(steps.length, 3)
     assert.equal(steps[0].id, 'c2')
-    assert.match(steps[0].request.pathAndQuery, /guardian-none-/)
+    assert.match(steps[0].request.pathAndQuery, /kovo-none-/)
   })
 
   test('graphql introspection becomes a schema-exposure http_chain', () => {

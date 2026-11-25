@@ -118,7 +118,7 @@ describe('M7 held-out: verifyPatchesLive orchestration', () => {
       onReplay: patchedIds => replayCalls.push(patchedIds),
       launch: launcher,
     })
-    const summary: PatchVerificationSummary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
+    const summary: PatchVerificationSummary = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
       manifest: manifest(),
       launcher,
       hooks,
@@ -172,7 +172,7 @@ describe('M7 held-out: verifyPatchesLive orchestration', () => {
       fixedByPatch: (_id, patchedIds) => patchedIds.length > 0,
       allPatchesFindings: [],
     })
-    const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
+    const summary = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
       manifest: manifest(),
       launcher: fakeLauncher(['hos-01', 'hos-02', 'hos-03'], calls),
       hooks,
@@ -193,7 +193,7 @@ describe('M7 held-out: verifyPatchesLive orchestration', () => {
       // the decoy has no patch and keeps confirming.
       fixedByPatch: (id, patchedIds) => id === 'hos-d1' ? false : !(patchedIds.length > 1 && id === 'hos-02'),
     })
-    const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
+    const summary = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
       manifest: manifest(),
       launcher: fakeLauncher(['hos-01', 'hos-02', 'hos-03'], calls),
       hooks,
@@ -210,7 +210,7 @@ describe('M7 held-out: verifyPatchesLive orchestration', () => {
 describe('M7 held-out: verifyPatchesLive error paths', () => {
   test('launcher failure during the baseline yields a skipped summary instead of throwing', async () => {
     const launcher = async () => { throw new Error('lab server failed to boot') }
-    const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
+    const summary = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
       manifest: manifest(),
       launcher,
     }))
@@ -228,7 +228,7 @@ describe('M7 held-out: verifyPatchesLive error paths', () => {
       fixedByPatch: () => true,
       launch: fakeLauncher(['hos-01', 'hos-02', 'hos-03'], calls),
     })
-    const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
+    const summary = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
       manifest: manifest([
         { id: 'hos-01', patchId: 'hos-01' },
         { id: 'hos-99', patchId: 'hos-99' },
@@ -258,7 +258,7 @@ describe('M7 held-out: verifyPatchesLive error paths', () => {
       fixedByPatch: () => true,
       replayErrorsFor: ['hos-01'],
     })
-    const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
+    const summary = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
       manifest: manifest([{ id: 'hos-01', patchId: 'hos-01' }]),
       launcher: fakeLauncher(['hos-01'], calls),
       hooks,
@@ -279,7 +279,7 @@ describe('M7 held-out: verifyPatchesLive error paths', () => {
       replayHangsFor: ['hos-02'],
     })
     const started = Date.now()
-    const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
+    const summary = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
       manifest: manifest(),
       launcher: fakeLauncher(['hos-01', 'hos-02', 'hos-03'], calls),
       hooks,
@@ -304,7 +304,7 @@ describe('M7 held-out: verifyPatchesLive error paths', () => {
         return await base.replayAll!({ findings, patchedIds, timeoutMs: 2_000, signal: new AbortController().signal })
       },
     }
-    const summary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
+    const summary = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
       manifest: manifest(),
       launcher: fakeLauncher(['hos-01', 'hos-02', 'hos-03'], calls),
       hooks,
@@ -319,13 +319,13 @@ describe('M7 held-out: verifyPatchesLive error paths', () => {
   })
 
   test('refuses to run without the local-lab gate and skips manifests without patches', async () => {
-    const gated = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: undefined }, () => verifyPatchesLive({
+    const gated = await withEnv({ KOVO_ALLOW_LOCAL_LAB: undefined }, () => verifyPatchesLive({
       manifest: manifest(),
       launcher: async () => { throw new Error('must not be called') },
     }))
-    assert.match(gated.skippedReason ?? '', /GUARDIAN_ALLOW_LOCAL_LAB/)
+    assert.match(gated.skippedReason ?? '', /KOVO_ALLOW_LOCAL_LAB/)
 
-    const noPatches = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
+    const noPatches = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
       manifest: manifest([{ id: 'hos-01' }, { id: 'hos-d1', isDecoy: true }]),
       launcher: async () => { throw new Error('must not be called') },
     }))

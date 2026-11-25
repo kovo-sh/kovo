@@ -196,7 +196,7 @@ test('auto_review Stage 2 independent Safety Judge handles approve, escalate_hum
     method: 'POST',
     pathAndQuery: '/api/profile/update',
     personaHandle: 'user_a',
-    bodyPreview: '{"displayName":"Guardian Probe"}',
+    bodyPreview: '{"displayName":"Kovo Hunter Probe"}',
     rationale: 'Verify CSRF protection on profile update.',
     offline: false,
     llmCall: async ({ userPrompt }) => {
@@ -312,7 +312,7 @@ test('auto_review Stage 2 independent Safety Judge handles approve, escalate_hum
 })
 
 test('Store supports set_approval_policy, approve_similar_endpoint, approve_all_pending, and audit trail', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-approval-store-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-approval-store-'))
   const storage = new Store(dir)
   try {
     const project = storage.createProject({
@@ -457,20 +457,20 @@ test('Store supports set_approval_policy, approve_similar_endpoint, approve_all_
   }
 })
 
-test('Store.initV3Schema auto-migrates existing .guardian/dyad-v2-smoke SQLite cleanly', () => {
-  const sourceDir = resolve('.guardian/dyad-v2-smoke/data')
-  const sourceDb = join(sourceDir, 'guardian.sqlite')
+test('Store.initV3Schema auto-migrates existing .kovo/dyad-v2-smoke SQLite cleanly', () => {
+  const sourceDir = resolve('.kovo/dyad-v2-smoke/data')
+  const sourceDb = join(sourceDir, 'kovo.sqlite')
   if (!existsSync(sourceDb)) {
     // Skip gracefully only if smoke DB does not exist in a fresh checkout
     return
   }
 
-  const tempDir = mkdtempSync(join(tmpdir(), 'guardian-migrate-smoke-'))
+  const tempDir = mkdtempSync(join(tmpdir(), 'kovo-migrate-smoke-'))
   try {
-    copyFileSync(sourceDb, join(tempDir, 'guardian.sqlite'))
+    copyFileSync(sourceDb, join(tempDir, 'kovo.sqlite'))
     for (const suffix of ['-wal', '-shm']) {
       if (existsSync(sourceDb + suffix)) {
-        copyFileSync(sourceDb + suffix, join(tempDir, 'guardian.sqlite' + suffix))
+        copyFileSync(sourceDb + suffix, join(tempDir, 'kovo.sqlite' + suffix))
       }
     }
 

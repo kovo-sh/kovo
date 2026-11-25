@@ -18,7 +18,7 @@ async function availablePort() {
 }
 
 export async function createApp(env: NodeJS.ProcessEnv = {}, existingDirectory?: string) {
-  const directory = existingDirectory ?? await mkdtemp(join(tmpdir(), 'guardian-e2e-'))
+  const directory = existingDirectory ?? await mkdtemp(join(tmpdir(), 'kovo-e2e-'))
   const port = await availablePort()
   const url = `http://127.0.0.1:${port}`
   let processHandle: ChildProcess | undefined
@@ -33,7 +33,7 @@ export async function createApp(env: NodeJS.ProcessEnv = {}, existingDirectory?:
       bootstrapSecret = ''
       const child = spawn(process.execPath, ['scripts/serve.ts'], {
         cwd: process.cwd(),
-        env: { ...process.env, GUARDIAN_OFFLINE: '1', GUARDIAN_PUBLIC_ORIGIN: '', ...env, PORT: String(port), GUARDIAN_DATA_DIR: directory },
+        env: { ...process.env, KOVO_OFFLINE: '1', KOVO_PUBLIC_ORIGIN: '', ...env, PORT: String(port), KOVO_DATA_DIR: directory },
         stdio: ['ignore', 'pipe', 'pipe'],
       })
       processHandle = child
@@ -56,7 +56,7 @@ export async function createApp(env: NodeJS.ProcessEnv = {}, existingDirectory?:
         }
         await delay(70)
       }
-      throw new Error('Guardian startup failed.\n' + output)
+      throw new Error('Kovo Hunter startup failed.\n' + output)
     },
     /** Open the app through the single-use local bootstrap (sets the session cookie). */
     async open(page: Page) {

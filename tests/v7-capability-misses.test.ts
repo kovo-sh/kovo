@@ -628,7 +628,7 @@ describe('capability-misses: inventory checkout shape', () => {
 
 describe('capability-misses: JWT control transport', () => {
   test('the control token is self-minted (empty signature) yet still rejected by the target', async () => {
-    process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+    process.env.KOVO_ALLOW_LOCAL_LAB = '1'
     const seen: string[] = []
     const { diffAuthProtocolAudit } = await import('../src/server/probes/jwt.ts')
     const ctx = {

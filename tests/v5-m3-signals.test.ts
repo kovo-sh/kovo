@@ -21,11 +21,11 @@ import {
 import type { DiscoveredEndpoint } from '../scripts/benchmark-probes.ts'
 
 async function withLocalLab<T>(fn: () => Promise<T>): Promise<T> {
-  const prev = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  const prev = process.env.KOVO_ALLOW_LOCAL_LAB
+  process.env.KOVO_ALLOW_LOCAL_LAB = '1'
   try { return await fn() } finally {
-    if (prev === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prev
+    if (prev === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = prev
   }
 }
 

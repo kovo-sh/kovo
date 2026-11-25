@@ -45,7 +45,7 @@ import {
 } from '../scripts/smoke-multihop.ts'
 
 const REPO_ROOT = join(import.meta.dirname, '..')
-const tempRoot = mkdtempSync(join(tmpdir(), 'guardian-v8-smoke-test-'))
+const tempRoot = mkdtempSync(join(tmpdir(), 'kovo-v8-smoke-test-'))
 process.on('exit', () => rmSync(tempRoot, { recursive: true, force: true }))
 
 function makeFunnel(overrides: Partial<HopDepthFunnel> = {}): HopDepthFunnel {
@@ -497,7 +497,7 @@ test('baseline JSON loads cleanly and compact table + Markdown summary render fu
     notes: [],
   }
   const md = renderV8MarkdownSummary(report)
-  assert.match(md, /# Guardian v8 Multi-Hop Smoke Battery/)
+  assert.match(md, /# Kovo(?: Hunter)? v8 Multi-Hop Smoke Battery/)
   assert.match(md, /`hardened-twin-trap-zero`/)
   assert.match(md, /H1=6 -> H2=5 -> H3=4 -> H4\+=2 -> FinalOracle=3 -> CompositeReceiptConfirmed=3/)
 })

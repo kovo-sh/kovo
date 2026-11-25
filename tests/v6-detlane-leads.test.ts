@@ -41,7 +41,7 @@ import {
 } from '../src/server/graph-leads.ts'
 import { detLeadsFromParentFacts } from '../src/server/agent-session.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const origin = 'http://127.0.0.1:4100'
 

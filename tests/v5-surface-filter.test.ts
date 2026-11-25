@@ -19,7 +19,7 @@ import { Store } from '../src/server/store.ts'
 import type { Run } from '../src/server/store.ts'
 import { makeStore, setupApprovedRun, withEnv } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const origin = 'http://127.0.0.1:9'
 
@@ -171,7 +171,7 @@ test('stored DELETE routes reach the engine surface instead of being filtered ou
   })
 
   const execution = new Execution(storage, { deterministicOnly: true })
-  await withEnv({ GUARDIAN_DETERMINISTIC_ENGINE: '0' }, () =>
+  await withEnv({ KOVO_DETERMINISTIC_ENGINE: '0' }, () =>
     internals(execution).runEngineInvestigation(storage.run(runId)),
   )
 

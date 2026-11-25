@@ -7,7 +7,7 @@ import { configureModel, downloadReport, openScopeReview, openView, saveScope } 
 import { createV2FixtureServer, E2E_COOKIE_SECRET, E2E_CREDENTIAL } from './v2-fixture-server.ts'
 
 function withDb<T>(directory: string, fn: (db: DatabaseSync) => T): T {
-  const db = new DatabaseSync(join(directory, 'guardian.sqlite'))
+  const db = new DatabaseSync(join(directory, 'kovo.sqlite'))
   try { return fn(db) } finally { db.close() }
 }
 
@@ -15,7 +15,7 @@ test.setTimeout(90_000)
 
 test('end-to-end multi-step chain discovery, CVE-2025-29927 Zero-LLM replay verification, Verify Fix retest, Persona Vault, and portable Markdown export', async ({ page }) => {
   const fixture = await createV2FixtureServer({ scenario: 'chain_cve' })
-  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  const app = await createApp({ KOVO_NETWORK_FIXTURE: fixture.origin })
   const personaSecret = 'opaque-e2e-persona-bearer-secret-44109'
 
   try {
@@ -104,7 +104,7 @@ test('end-to-end multi-step chain discovery, CVE-2025-29927 Zero-LLM replay veri
 test('surfaces Tier 3 HITL approval card and blocks state-changing probe until operator clicks Approve probe', async ({ page }) => {
   test.setTimeout(180_000)
   const fixture = await createV2FixtureServer({ scenario: 'tier3_approval' })
-  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  const app = await createApp({ KOVO_NETWORK_FIXTURE: fixture.origin })
 
   try {
     await app.start()
@@ -161,7 +161,7 @@ test('surfaces Tier 3 HITL approval card and blocks state-changing probe until o
 
 test('recovers cleanly from SIGKILL crash into paused and resumes without duplicating baseline requests', async ({ page }) => {
   const fixture = await createV2FixtureServer({ scenario: 'chain_cve', holdTargetPath: '/app.js' })
-  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  const app = await createApp({ KOVO_NETWORK_FIXTURE: fixture.origin })
 
   try {
     await app.start()
@@ -207,7 +207,7 @@ test('recovers cleanly from SIGKILL crash into paused and resumes without duplic
 
 test('enforces mid-chain scope revocation and omits revoked host from subsequent report export', async ({ page }) => {
   const fixture = await createV2FixtureServer({ scenario: 'two_host_revoke', holdTargetPath: '/app.js' })
-  const app = await createApp({ GUARDIAN_NETWORK_FIXTURE: fixture.origin })
+  const app = await createApp({ KOVO_NETWORK_FIXTURE: fixture.origin })
 
   try {
     await app.start()

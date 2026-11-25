@@ -1,5 +1,5 @@
 /**
- * Guardian v5.1 — agentic trace capture + metrics contract suite.
+ * Kovo Hunter v5.1 — agentic trace capture + metrics contract suite.
  *
  * Covers the trace store layout, content-addressed blob dedupe, deterministic redaction,
  * event schema round-trip, 4 KiB preview bounds, best-effort failure, and the nine metrics
@@ -41,7 +41,7 @@ const canarySecret = 'CANARY_TOKEN_9f8e7d6c'
 const rawCookieHeader = 'rawcookieval123456'
 const rawBearer = 'zzzzzzzzzzzzzzzz'
 
-function tempDir(t: { after: (fn: () => void) => void }, prefix = 'guardian-v5-trace-'): string {
+function tempDir(t: { after: (fn: () => void) => void }, prefix = 'kovo-v5-trace-'): string {
   const dir = mkdtempSync(join(tmpdir(), prefix))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   return dir
@@ -407,7 +407,7 @@ function buildSyntheticTrace(
 ): { dir: string; metrics: TraceMetrics; base: number } {
   const base = 1_700_000_000_000
   let clock = base
-  const dir = tempDir(t, 'guardian-v5-trace-metrics-')
+  const dir = tempDir(t, 'kovo-v5-trace-metrics-')
   const trace = createAgentTrace({
     dir,
     now: () => clock,
@@ -593,7 +593,7 @@ test('--gate passes the synthetic trace and fails on precision, decoy, or throug
   )
 
   // End-to-end: a decoy verdict and a verifier false positive both trip the gate.
-  const decoyDir = tempDir(t, 'guardian-v5-trace-gate-')
+  const decoyDir = tempDir(t, 'kovo-v5-trace-gate-')
   const decoyTrace = createAgentTrace({
     dir: decoyDir,
     manifest: { gitSha: 'test-sha', app: 'gate', startedAtMs: 1_000 },
@@ -649,21 +649,21 @@ test('sub-minute traces clamp assignments/10 min instead of extrapolating', (t) 
   assert.equal(metrics.assignmentsPer10Min, 10)
 })
 
-test('trace opt-in is off by default and honours GUARDIAN_TRACE_DIR / GUARDIAN_TRACE=1', (t) => {
+test('trace opt-in is off by default and honours KOVO_TRACE_DIR / KOVO_TRACE=1', (t) => {
   assert.deepEqual(resolveTraceConfig({}), { enabled: false, dir: null })
-  assert.deepEqual(resolveTraceConfig({ GUARDIAN_TRACE: '0' }), { enabled: false, dir: null })
+  assert.deepEqual(resolveTraceConfig({ KOVO_TRACE: '0' }), { enabled: false, dir: null })
   assert.deepEqual(
-    resolveTraceConfig({ GUARDIAN_TRACE_DIR: '/tmp/explicit-trace' }),
+    resolveTraceConfig({ KOVO_TRACE_DIR: '/tmp/explicit-trace' }),
     { enabled: true, dir: '/tmp/explicit-trace' },
   )
   assert.deepEqual(
-    resolveTraceConfig({ GUARDIAN_TRACE: '1', GUARDIAN_TRACE_ROOT: '/tmp/root', GUARDIAN_TRACE_ID: 'id1' }),
+    resolveTraceConfig({ KOVO_TRACE: '1', KOVO_TRACE_ROOT: '/tmp/root', KOVO_TRACE_ID: 'id1' }),
     { enabled: true, dir: '/tmp/root/id1' },
   )
   assert.equal(createAgentTraceFromEnv({ app: 'unit' }, {}), null)
 
-  const envDir = tempDir(t, 'guardian-v5-trace-env-')
-  const fromEnv = createAgentTraceFromEnv({ gitSha: 'test-sha', app: 'unit' }, { GUARDIAN_TRACE_DIR: envDir })
+  const envDir = tempDir(t, 'kovo-v5-trace-env-')
+  const fromEnv = createAgentTraceFromEnv({ gitSha: 'test-sha', app: 'unit' }, { KOVO_TRACE_DIR: envDir })
   assert.ok(fromEnv)
   fromEnv.recordLifecycle('lane_start', { lane: 'recon' })
   fromEnv.closeTrace()

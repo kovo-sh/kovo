@@ -30,7 +30,7 @@ import {
 } from '../src/server/run-snapshot.ts'
 import { parseRealisticArgs } from '../scripts/benchmark-realistic.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const OLD_ORIGIN = 'http://127.0.0.1:4100'
 const NEW_ORIGIN = 'http://127.0.0.1:5200'
@@ -62,7 +62,7 @@ interface Fixture {
 }
 
 function temporaryRoot(): string {
-  return mkdtempSync(join(tmpdir(), 'guardian-snapshot-'))
+  return mkdtempSync(join(tmpdir(), 'kovo-snapshot-'))
 }
 
 function seedFixture(): Fixture {
@@ -221,7 +221,7 @@ function seedFixture(): Fixture {
     + 'status, created_at, surfaced_at) '
     + 'values (?, ?, ?, ?, ?, ?, ?, ?, null, null, null, null, ?, ?, null)',
   ).run(
-    randomUUID(), runId, worker.id, 'guardian-canary-2nd-fixture', OLD_ORIGIN, '/api/orders',
+    randomUUID(), runId, worker.id, 'kovo-canary-2nd-fixture', OLD_ORIGIN, '/api/orders',
     'note', 'persona_a', 'planted', Date.now(),
   )
 
@@ -592,7 +592,7 @@ test('snapshot files are owner-only and contain no cookies, session values or se
     capture(fixture)
     const modes = snapshotFileModes(fixture.snapshotDir)
     assert.equal(modes['.'], 0o700)
-    assert.equal(modes['guardian.sqlite'], 0o600)
+    assert.equal(modes['kovo.sqlite'], 0o600)
     assert.equal(modes['snapshot.json'], 0o600)
     assert.equal(modes['target.json'], 0o600)
 
@@ -601,11 +601,11 @@ test('snapshot files are owner-only and contain no cookies, session values or se
     for (const body of [snapshotBody, targetBody]) {
       assert.ok(!body.includes(PASSWORD))
       assert.ok(!/"(?:cookie|set-cookie|authorization|password|token|bearer)"\s*:/i.test(body))
-      assert.ok(!body.includes('guardian-canary-'))
+      assert.ok(!body.includes('kovo-canary-'))
     }
     // The DB copy only holds rows the engine already redacted; the persona password never
     // reaches the run database at all.
-    const dbBytes = readFileSync(join(fixture.snapshotDir, 'guardian.sqlite'))
+    const dbBytes = readFileSync(join(fixture.snapshotDir, 'kovo.sqlite'))
     assert.equal(dbBytes.includes(Buffer.from(PASSWORD)), false)
     assert.ok(existsSync(join(fixture.snapshotDir, 'target.json')))
   } finally {

@@ -5,7 +5,7 @@
 // 3. api only honours the edge-computed amount header on requests carrying this instance's
 //    edge bridge credential; a direct caller cannot supply it.
 // The reference solvers stay 4/4 in vulnerable mode and hardened + PG-D1..D3 stay terminal-silent.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

@@ -116,7 +116,7 @@ export async function collectReportBenchmark(
   const fixture = benchmarkScenarios[scenario]
   const input: BenchmarkInput = fixture.input
   const runId = new URL(url).pathname.split('/')[2]
-  const db = new DatabaseSync(join(directory, 'guardian.sqlite'), { readOnly: true })
+  const db = new DatabaseSync(join(directory, 'kovo.sqlite'), { readOnly: true })
   let report: ReportBody
   let recording: ReportResult['recording']
   try {
@@ -137,10 +137,10 @@ export async function collectReportBenchmark(
   expect(recording.phase).toBe(fixture.partial ? 'analysis' : 'complete')
   expect(recording.events.some(row => row.kind === 'verification.started')).toBe(!fixture.partial)
   const markdown = exportFile.content
-  expect(exportFile.name).toBe('guardian-report-' + runId.slice(0, 8) + '-v' + fixture.version + '.md')
+  expect(exportFile.name).toBe('kovo-report-' + runId.slice(0, 8) + '-v' + fixture.version + '.md')
   expect(markdown).toContain('**Run** ' + runId)
   expect(markdown).toContain('**Report version** ' + fixture.version)
-  expect(markdown.startsWith('# Guardian ' + (fixture.partial ? 'partial' : 'complete') + ' report\n')).toBe(true)
+  expect(markdown).toMatch(new RegExp('^# Kovo(?: Hunter)? (?:v3 )?' + (fixture.partial ? 'partial' : 'complete') + ' report\\n'))
   const expectedHosts = [...fixture.input.scope].sort()
   expect(report.goal).toBe(fixture.input.goal)
   expect([...recording.approval.scope].sort()).toEqual(expectedHosts)

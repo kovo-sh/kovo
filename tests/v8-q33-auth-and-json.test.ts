@@ -28,10 +28,10 @@ import {
   VERIFY_RPC_TOKEN_ENV,
   VerifyRpcServer,
 } from '../src/server/verify-rpc.ts'
-import { VerifyContext, hydrateExchange } from '../worker/guardian_verify/guardian_verify.ts'
-import type { HttpExchange } from '../worker/guardian_verify/guardian_verify.ts'
+import { VerifyContext, hydrateExchange } from '../worker/kovo_verify/kovo_verify.ts'
+import type { HttpExchange } from '../worker/kovo_verify/kovo_verify.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -403,7 +403,7 @@ test('capability.seal falls back to regex on non-JSON when both jsonPath and reg
 test('LOC ceilings and zero v8 benchmark contamination hold', () => {
   const loc = (rel: string) => readFileSync(join(REPO_ROOT, rel), 'utf8').trimEnd().split('\n').length
   assert.ok(loc('src/server/verify-rpc.ts') <= 2300, `verify-rpc.ts LOC=${loc('src/server/verify-rpc.ts')} > 2300`)
-  assert.ok(loc('worker/guardian_verify/guardian_verify.ts') <= 900, `guardian_verify.ts LOC=${loc('worker/guardian_verify/guardian_verify.ts')} > 900`)
+  assert.ok(loc('worker/kovo_verify/kovo_verify.ts') <= 900, `kovo_verify.ts LOC=${loc('worker/kovo_verify/kovo_verify.ts')} > 900`)
 
   const scan = scanSourceTreeForContamination(REPO_ROOT)
   assert.equal(scan.ok, true, `Unexpected contamination: ${JSON.stringify(scan.hits)}`)

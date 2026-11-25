@@ -7,13 +7,13 @@
  *  2. Full re-export identity parity between `agent-prompts.ts` and `agent-session.ts` (zero
  *     broken external imports), preserving `codeAuditPrompt`'s incremental `record_fact` policy
  *     and `v8-sdk-adoption`'s 4 KB brief cap & v8 multi-hop SDK helpers.
- *  3. Legacy `verify_replay_spec` is omitted from LLM tool schemas whenever `guardian_verify` is
+ *  3. Legacy `verify_replay_spec` is omitted from LLM tool schemas whenever `kovo_verify` is
  *     active (preventing LLM DSL dilution), while `allowLegacyReplaySpec: true` explicitly opts
- *     it back in and replay-only sessions without `guardian_verify` keep it available.
+ *     it back in and replay-only sessions without `kovo_verify` keep it available.
  *  4. `propose_chain_finding` trims retired/runtime DSL schemas from its tool description while
- *     `guardian_verify` is active, keeping `static_ast_proof` usable.
+ *     `kovo_verify` is active, keeping `static_ast_proof` usable.
  *  5. `runAgentSession` never sends `verify_replay_spec` in the LLM tool definitions when
- *     `guardian_verify` is active.
+ *     `kovo_verify` is active.
  *  6. `replay-feedback.ts` short-circuits retired legacy DSL payloads cleanly with
  *     `retriesRemaining: 0` and redacted `assertionSummary`, with zero v8 contamination.
  */
@@ -53,10 +53,10 @@ test('C1.1: agent-session.ts is decomposed below 4,000 LOC (and <= 4,200 LOC cei
     'export function codeAuditPrompt(',
     'export function workerSessionInstructions(',
     'export function buildAgenticPromptContext(',
-    'export function guardianVerifyHelperGuidance(',
-    'export function guardianVerifyPromptHint(',
-    'export const GUARDIAN_VERIFY_MULTIHOP_HELPERS',
-    'export const GUARDIAN_VERIFY_TOOL_DESCRIPTION',
+    'export function kovoVerifyHelperGuidance(',
+    'export function kovoVerifyPromptHint(',
+    'export const KOVO_VERIFY_MULTIHOP_HELPERS',
+    'export const KOVO_VERIFY_TOOL_DESCRIPTION',
     'export const scenarioInstructions:',
   ]) {
     assert.ok(promptsSource.includes(decl), `agent-prompts.ts must own ${decl}`)
@@ -69,17 +69,17 @@ test('C1.2: agent-session.ts maintains strict re-export identity parity with age
     'codeAuditPrompt',
     'scenarioInstructions',
     'workerSessionInstructions',
-    'GUARDIAN_VERIFY_HELPERS',
-    'GUARDIAN_VERIFY_CLASS_HINTS',
-    'GUARDIAN_VERIFY_MULTIHOP_HELPERS',
-    'GUARDIAN_VERIFY_TOOL_DESCRIPTION',
-    'GUARDIAN_VERIFY_USAGE_HINT',
-    'GUARDIAN_VERIFY_REPAIR_INSTRUCTION',
-    'GUARDIAN_VERIFY_SPEC_SHAPE',
-    'GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES',
-    'guardianVerifyHelperGuidance',
-    'guardianVerifyPromptHint',
-    'guardianVerifyRedirectMessage',
+    'KOVO_VERIFY_HELPERS',
+    'KOVO_VERIFY_CLASS_HINTS',
+    'KOVO_VERIFY_MULTIHOP_HELPERS',
+    'KOVO_VERIFY_TOOL_DESCRIPTION',
+    'KOVO_VERIFY_USAGE_HINT',
+    'KOVO_VERIFY_REPAIR_INSTRUCTION',
+    'KOVO_VERIFY_SPEC_SHAPE',
+    'KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES',
+    'kovoVerifyHelperGuidance',
+    'kovoVerifyPromptHint',
+    'kovoVerifyRedirectMessage',
     'buildAgenticPromptContext',
     'coordinatorPrompt',
     'threatModelPrompt',
@@ -93,7 +93,7 @@ test('C1.2: agent-session.ts maintains strict re-export identity parity with age
     'SPECIALIST_COMMON_TOOLS',
     'filterHandlersForSpecialist',
     'routeStepToSpecialist',
-    'summarizeGuardianVerifyOutcome',
+    'summarizeKovoVerifyOutcome',
     'verifierRepairFeedback',
     'withVerifierRepairFeedback',
     'proposeChainFindingDescription',
@@ -146,17 +146,17 @@ test('C1.2: agent-session.ts maintains strict re-export identity parity with age
   assert.equal(ctx.evidenceBrief, packet.text)
 })
 
-test('C1.3: verify_replay_spec is hidden from tool schemas when guardian_verify is active (preventing LLM DSL dilution)', () => {
+test('C1.3: verify_replay_spec is hidden from tool schemas when kovo_verify is active (preventing LLM DSL dilution)', () => {
   const noop = async () => ({ ok: true })
   const handlers: agentSession.WorkerToolHandlers = {
-    guardian_verify: noop,
+    kovo_verify: noop,
     verify_replay_spec: noop,
     propose_chain_finding: noop,
     update_proposed_finding: noop,
     complete_intent: noop,
   }
 
-  // Default active guardian_verify path: verify_replay_spec MUST be omitted.
+  // Default active kovo_verify path: verify_replay_spec MUST be omitted.
   const activeTools = agentSession.buildWorkerTools(
     handlers,
     v => v,
@@ -165,8 +165,8 @@ test('C1.3: verify_replay_spec is hidden from tool schemas when guardian_verify 
     () => {},
   )
   const activeNames = activeTools.map(t => t.name)
-  assert.ok(activeNames.includes('guardian_verify'))
-  assert.equal(activeNames.includes('verify_replay_spec'), false, 'verify_replay_spec must be omitted when guardian_verify is active')
+  assert.ok(activeNames.includes('kovo_verify'))
+  assert.equal(activeNames.includes('verify_replay_spec'), false, 'verify_replay_spec must be omitted when kovo_verify is active')
 
   // propose_chain_finding stays available for static_ast_proof with a trimmed, non-diluting description.
   const proposeTool = activeTools.find(t => t.name === 'propose_chain_finding')!
@@ -177,11 +177,11 @@ test('C1.3: verify_replay_spec is hidden from tool schemas when guardian_verify 
   assert.doesNotMatch(
     proposeTool.description,
     /\b(?:verify_replay_spec|http_chain|dns_takeover|tls_audit|browser_dom|ws_chain|upload_probe)\b/,
-    'active guardian_verify propose_chain_finding description must not mention legacy verify_replay_spec or retired/runtime DSL kinds',
+    'active kovo_verify propose_chain_finding description must not mention legacy verify_replay_spec or retired/runtime DSL kinds',
   )
 
   // Retired fail-closed DSL kinds are scrubbed from proposeChainFindingDescription in all modes,
-  // while active legacy replay kinds remain intact when guardian_verify is absent.
+  // while active legacy replay kinds remain intact when kovo_verify is absent.
   const legacyOnlyProposeDesc = agentPrompts.proposeChainFindingDescription(false)
   assert.match(legacyOnlyProposeDesc, /\bhttp_chain\b/)
   assert.doesNotMatch(
@@ -190,30 +190,30 @@ test('C1.3: verify_replay_spec is hidden from tool schemas when guardian_verify 
     'retired fail-closed DSL kinds must stay scrubbed even in legacy replay-only mode',
   )
 
-  // Proof-gap repair nudges scrub verify_replay_spec / DeclarativeReplaySpec when guardian_verify is active,
-  // while keeping legacy replay-only sessions intact when guardian_verify is absent.
+  // Proof-gap repair nudges scrub verify_replay_spec / DeclarativeReplaySpec when kovo_verify is active,
+  // while keeping legacy replay-only sessions intact when kovo_verify is absent.
   const sampleRoute = { method: 'POST', path: '/api/v1/orders/:id', params: ['amount'] }
-  const activeReqNudge = agentPrompts.specSubmissionRequiredMessage(sampleRoute, { hasGuardianVerify: true })
-  assert.match(activeReqNudge, /guardian_verify\(script=/)
+  const activeReqNudge = agentPrompts.specSubmissionRequiredMessage(sampleRoute, { hasKovoVerify: true })
+  assert.match(activeReqNudge, /kovo_verify\(script=/)
   assert.doesNotMatch(activeReqNudge, /\bverify_replay_spec\b|DeclarativeReplaySpec/)
-  const legacyReqNudge = agentPrompts.specSubmissionRequiredMessage(sampleRoute, { hasGuardianVerify: false })
+  const legacyReqNudge = agentPrompts.specSubmissionRequiredMessage(sampleRoute, { hasKovoVerify: false })
   assert.match(legacyReqNudge, /\bverify_replay_spec\b/)
-  assert.ok(legacyReqNudge.includes(agentPrompts.GUARDIAN_VERIFY_SPEC_SHAPE))
+  assert.ok(legacyReqNudge.includes(agentPrompts.KOVO_VERIFY_SPEC_SHAPE))
 
   const activeGapNudge = agentPrompts.gapValidationRejectedMessage(
     [{ key: 'POST /api/v1/orders/:id', code: 'auth_blocked', missing: 'a 401/403' }],
     sampleRoute,
-    { hasGuardianVerify: true },
+    { hasKovoVerify: true },
   )
-  assert.match(activeGapNudge, /guardian_verify\(script=/)
+  assert.match(activeGapNudge, /kovo_verify\(script=/)
   assert.doesNotMatch(activeGapNudge, /\bverify_replay_spec\b|DeclarativeReplaySpec/)
   const legacyGapNudge = agentPrompts.gapValidationRejectedMessage(
     [{ key: 'POST /api/v1/orders/:id', code: 'auth_blocked', missing: 'a 401/403' }],
     sampleRoute,
-    { hasGuardianVerify: false },
+    { hasKovoVerify: false },
   )
   assert.match(legacyGapNudge, /\bverify_replay_spec\b/)
-  assert.ok(legacyGapNudge.includes(agentPrompts.GUARDIAN_VERIFY_SPEC_SHAPE))
+  assert.ok(legacyGapNudge.includes(agentPrompts.KOVO_VERIFY_SPEC_SHAPE))
 
   // Explicit allowLegacyReplaySpec opt-in re-exposes verify_replay_spec (for legacy/static tests).
   const optedInTools = agentSession.buildWorkerTools(
@@ -226,7 +226,7 @@ test('C1.3: verify_replay_spec is hidden from tool schemas when guardian_verify 
   )
   assert.ok(optedInTools.some(t => t.name === 'verify_replay_spec'))
 
-  // Without guardian_verify (replay-only mode), verify_replay_spec remains registered by default.
+  // Without kovo_verify (replay-only mode), verify_replay_spec remains registered by default.
   const legacyOnlyTools = agentSession.buildWorkerTools(
     { verify_replay_spec: noop, propose_chain_finding: noop, complete_intent: noop },
     v => v,
@@ -237,8 +237,8 @@ test('C1.3: verify_replay_spec is hidden from tool schemas when guardian_verify 
   assert.ok(legacyOnlyTools.some(t => t.name === 'verify_replay_spec'))
 })
 
-test('C1.4: runAgentSession omits verify_replay_spec from LLM request tool definitions when guardian_verify is active', async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-arch-c1-'))
+test('C1.4: runAgentSession omits verify_replay_spec from LLM request tool definitions when kovo_verify is active', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-arch-c1-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
 
   const seenToolNames: string[][] = []
@@ -287,7 +287,7 @@ test('C1.4: runAgentSession omits verify_replay_spec from LLM request tool defin
     enableSettlement: false,
     requireCompleteIntent: false,
     handlers: {
-      guardian_verify: noop,
+      kovo_verify: noop,
       verify_replay_spec: noop,
       propose_chain_finding: noop,
       complete_intent: noop,
@@ -295,8 +295,8 @@ test('C1.4: runAgentSession omits verify_replay_spec from LLM request tool defin
   })
 
   assert.equal(seenToolNames.length, 1)
-  assert.ok(seenToolNames[0]!.includes('guardian_verify'))
-  assert.equal(seenToolNames[0]!.includes('verify_replay_spec'), false, 'LLM must not receive verify_replay_spec when guardian_verify is active')
+  assert.ok(seenToolNames[0]!.includes('kovo_verify'))
+  assert.equal(seenToolNames[0]!.includes('verify_replay_spec'), false, 'LLM must not receive verify_replay_spec when kovo_verify is active')
 })
 
 test('C1.5: replay-feedback.ts short-circuits retired DSL payloads with retriesRemaining=0 and zero v8 contamination', () => {
@@ -307,13 +307,13 @@ test('C1.5: replay-feedback.ts short-circuits retired DSL payloads with retriesR
       outcome: {
         confirmed: false,
         controlPassed: false,
-        observed: 'retired_legacy_spec_kind: use guardian_verify',
-        expected: 'Proof submitted via guardian_verify.',
-        reason: 'retired_legacy_spec_kind: use guardian_verify',
+        observed: 'retired_legacy_spec_kind: use kovo_verify',
+        expected: 'Proof submitted via kovo_verify.',
+        reason: 'retired_legacy_spec_kind: use kovo_verify',
       },
       exchangeIds: [],
       exchanges: [],
-      evidencePayload: { kind: 'browser_chain', retired: true, reason: 'retired_legacy_spec_kind: use guardian_verify' },
+      evidencePayload: { kind: 'browser_chain', retired: true, reason: 'retired_legacy_spec_kind: use kovo_verify' },
       evidenceSha256: 'retired-sha',
     },
     1,

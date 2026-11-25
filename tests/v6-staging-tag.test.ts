@@ -73,8 +73,8 @@ test('v6 staging-tag: mutating probe carries the run tag on values and headers, 
     jsonBody: hyp.jsonBody,
   })
   assert.equal(staging.action, 'tag')
-  assert.equal(staging.headers?.['x-guardian-run-id'], runId)
-  assert.equal(staging.headers?.['x-guardian-tenant-tag'], tenantTag)
+  assert.equal(staging.headers?.['x-kovo-run-id'], runId)
+  assert.equal(staging.headers?.['x-kovo-tenant-tag'], tenantTag)
   assert.equal(staging.jsonBody?.name, `${tenantTag}cart`)
   assert.equal(staging.jsonBody?.title, `${tenantTag}probe`)
   assert.equal(staging.jsonBody?.total, 249, 'numeric prices are never rewritten')
@@ -177,7 +177,7 @@ test('v6 staging-tag: an untaggable identity mutation is skipped instead of reac
 test('v6 prod_readonly still refuses staging writes and ephemeral remains open', () => {
   const readonly = evaluateScopeRequest(
     stagingPolicy({ mode: 'prod_readonly', tenantTag: null }),
-    { origin, method: 'POST', pathAndQuery: '/v1/checkout/start', body: JSON.stringify({ name: `${tenantTag}cart` }), headers: { 'x-guardian-tenant-tag': tenantTag } },
+    { origin, method: 'POST', pathAndQuery: '/v1/checkout/start', body: JSON.stringify({ name: `${tenantTag}cart` }), headers: { 'x-kovo-tenant-tag': tenantTag } },
   )
   assert.equal(readonly.allowed, false)
   assert.equal(readonly.code, 'readonly_environment')
@@ -251,8 +251,8 @@ test('v6 staging-tag: engine counts tagged vs skipped mutations and never sends 
   assert.equal(captured.some(req => /\/login$/.test(req.pathAndQuery)), false, 'skipped probe never reaches the probe layer')
   const orders = captured.find(req => req.pathAndQuery === '/api/admin/orders')
   assert.ok(orders)
-  assert.equal(orders!.headers?.['x-guardian-tenant-tag'], tenantTag)
-  assert.equal(orders!.headers?.['x-guardian-run-id'], runId)
+  assert.equal(orders!.headers?.['x-kovo-tenant-tag'], tenantTag)
+  assert.equal(orders!.headers?.['x-kovo-run-id'], runId)
 })
 
 test('v6 staging-tag: cleanup falls back to the next in-scope origin when the label is mis-mapped', async () => {
@@ -309,7 +309,7 @@ test('v6 staging-tag: run-scoped cleanup hook removes tagged entities only', asy
       const queryRunId = url.searchParams.get('runId') ?? ''
       let removed = 0
       for (const id of [...entities]) {
-        if (id.startsWith(`guardian-qa-${queryRunId}-`)) {
+        if (id.startsWith(`kovo-qa-${queryRunId}-`)) {
           entities.delete(id)
           removed += 1
         }

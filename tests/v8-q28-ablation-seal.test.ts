@@ -29,9 +29,9 @@ import {
   VERIFY_RPC_TOKEN_ENV,
   VerifyRpcServer,
 } from '../src/server/verify-rpc.ts'
-import { VerifyContext } from '../worker/guardian_verify/guardian_verify.ts'
+import { VerifyContext } from '../worker/kovo_verify/kovo_verify.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const MEMBER_A_SECRET = 'member-a-q28-secret-token-01'
@@ -482,7 +482,7 @@ test('LOC ceilings and zero v8 benchmark contamination hold across all touched f
   const loc = (rel: string) => readFileSync(join(REPO_ROOT, rel), 'utf8').trimEnd().split('\n').length
   assert.ok(loc('src/server/verify-rpc.ts') <= 2300, `verify-rpc.ts LOC=${loc('src/server/verify-rpc.ts')} > 2300`)
   assert.ok(loc('src/server/composite-receipt.ts') <= 750, `composite-receipt.ts LOC=${loc('src/server/composite-receipt.ts')} > 750`)
-  assert.ok(loc('worker/guardian_verify/guardian_verify.ts') <= 900, `guardian_verify.ts LOC=${loc('worker/guardian_verify/guardian_verify.ts')} > 900`)
+  assert.ok(loc('worker/kovo_verify/kovo_verify.ts') <= 900, `kovo_verify.ts LOC=${loc('worker/kovo_verify/kovo_verify.ts')} > 900`)
 
   const scan = scanSourceTreeForContamination(REPO_ROOT)
   assert.equal(scan.ok, true, `Unexpected contamination: ${JSON.stringify(scan.hits)}`)

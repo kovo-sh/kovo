@@ -17,7 +17,7 @@
  *     - Synthesizes 0 composites for homogeneous single-category batches and remains idempotent
  *       across repeated invocations.
  *     - Keeps `buildAssignmentBriefPacket` bounded <= 4 KB (`ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE`).
- *  3. Fix C (`workerInvestigationPrompt`, `GUARDIAN_VERIFY_*`, `src/skills/multihop-chains.md`):
+ *  3. Fix C (`workerInvestigationPrompt`, `KOVO_VERIFY_*`, `src/skills/multihop-chains.md`):
  *     - Instructs multi-hop workers never to stop at intermediate single-hop disclosures/handles
  *       when downstream cross-service/auth/state-machine pivots are reachable.
  *     - Explicitly prohibits cross-tenant probe-arm collusion (single starting low-privilege
@@ -32,12 +32,12 @@ import { resolve } from 'node:path'
 import { test } from 'node:test'
 
 import {
-  GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-  GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN,
-  GUARDIAN_VERIFY_TOOL_DESCRIPTION,
+  KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+  KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN,
+  KOVO_VERIFY_TOOL_DESCRIPTION,
   codeAuditPrompt,
-  guardianVerifyHelperGuidance,
-  guardianVerifyPromptHint,
+  kovoVerifyHelperGuidance,
+  kovoVerifyPromptHint,
   workerInvestigationPrompt,
   workerSessionInstructions,
 } from '../src/server/agent-prompts.ts'
@@ -317,22 +317,22 @@ test('Fix B: homogeneous single-category suspects synthesize 0 composites while 
 // 3. Fix C: Anti-Premature-Filing, No-Collusion & Crypto/Async Recipe + Clean Lint
 // ============================================================================
 
-test('Fix C: workerInvestigationPrompt, GUARDIAN_VERIFY guidance, and multihop-chains.md enforce no-premature-filing, single-origin probe arm, and crypto/async recipe', () => {
+test('Fix C: workerInvestigationPrompt, KOVO_VERIFY guidance, and multihop-chains.md enforce no-premature-filing, single-origin probe arm, and crypto/async recipe', () => {
   // Budget invariants stay strictly satisfied.
-  const guidance = guardianVerifyHelperGuidance()
-  const hint = guardianVerifyPromptHint()
-  const patternLines = GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.split('\n')
+  const guidance = kovoVerifyHelperGuidance()
+  const hint = kovoVerifyPromptHint()
+  const patternLines = KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.split('\n')
   assert.ok(
-    Buffer.byteLength(guidance, 'utf8') <= GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-    `guidance ${Buffer.byteLength(guidance, 'utf8')} B > ${GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES} B`,
+    Buffer.byteLength(guidance, 'utf8') <= KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+    `guidance ${Buffer.byteLength(guidance, 'utf8')} B > ${KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES} B`,
   )
   assert.ok(Buffer.byteLength(hint, 'utf8') <= 512, `hint ${Buffer.byteLength(hint, 'utf8')} B > 512 B`)
   assert.ok(patternLines.length <= 12, `pattern has ${patternLines.length} lines (must be <= 12)`)
 
   // Tool description, helper guidance, and active system prompt all enforce both rules.
-  const sysPrompt = workerSessionInstructions('worker-investigation', { hasGuardianVerify: true })
+  const sysPrompt = workerSessionInstructions('worker-investigation', { hasKovoVerify: true })
   for (const [label, text] of [
-    ['GUARDIAN_VERIFY_TOOL_DESCRIPTION', GUARDIAN_VERIFY_TOOL_DESCRIPTION],
+    ['KOVO_VERIFY_TOOL_DESCRIPTION', KOVO_VERIFY_TOOL_DESCRIPTION],
     ['workerSessionInstructions', sysPrompt],
   ] as const) {
     assert.match(text, /NEVER stop at or file an intermediate single-hop info-disclosure/i, `${label} missing no-premature-filing rule`)

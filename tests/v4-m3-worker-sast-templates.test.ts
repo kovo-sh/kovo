@@ -63,7 +63,7 @@ async function dockerHasImage(image: string): Promise<boolean> {
 }
 
 function makeTestStore(t: test.TestContext) {
-  const dir = makeTempDir(t, 'guardian-m3-store-')
+  const dir = makeTempDir(t, 'kovo-m3-store-')
   const storage = new Store(dir)
   const { id: projectId } = storage.createProject({
     requestId: randomUUID(),
@@ -97,10 +97,10 @@ function makeTestStore(t: test.TestContext) {
 }
 
 // ============================================================================
-// Suite 1: guardian-worker:v4 Hardened Offline Toolchain & worker-backend.ts
+// Suite 1: kovo-worker:v4 Hardened Offline Toolchain & worker-backend.ts
 // ============================================================================
 
-test('M3-T1: worker/Dockerfile & worker-backend.ts enforce guardian-worker:v4, TRIVY_CACHE_DIR, and 1536m/256 defaults', () => {
+test('M3-T1: worker/Dockerfile & worker-backend.ts enforce kovo-worker:v4, TRIVY_CACHE_DIR, and 1536m/256 defaults', () => {
   const dockerfile = readFileSync(join(repoRoot, 'worker', 'Dockerfile'), 'utf8')
   const backendSrc = readFileSync(join(repoRoot, 'src', 'server', 'worker-backend.ts'), 'utf8')
   const workerPkg = JSON.parse(readFileSync(join(repoRoot, 'worker', 'package.json'), 'utf8')) as { dependencies: Record<string, string> }
@@ -108,14 +108,14 @@ test('M3-T1: worker/Dockerfile & worker-backend.ts enforce guardian-worker:v4, T
 
   assert.match(dockerfile, /TRIVY_CACHE_DIR="\/opt\/trivy-cache"/)
   assert.match(dockerfile, /USER 10001:10001/)
-  assert.match(backendSrc, /image = 'guardian-worker:v4'/)
+  assert.match(backendSrc, /image = 'kovo-worker:v4'/)
   assert.match(backendSrc, /1536/)
   assert.match(backendSrc, /256/)
   assert.match(backendSrc, /4096/)
   assert.match(backendSrc, /384/)
   assert.ok(workerPkg.dependencies['@swc/core'], 'worker/package.json must include @swc/core')
   assert.ok(workerPkg.dependencies.acorn, 'worker/package.json must include acorn')
-  assert.ok(rootPkg.scripts['worker:build']?.includes('guardian-worker:v4'))
+  assert.ok(rootPkg.scripts['worker:build']?.includes('kovo-worker:v4'))
   assert.ok(rootPkg.scripts['templates:transpile']?.includes('transpile-nuclei-templates.ts'))
 })
 
@@ -145,12 +145,12 @@ test('M3-T2: worker/rules/opengrep contains >= 1,500 deduplicated rules across >
   }
   assert.ok(ruleIds.size >= 1500, `Expected >= 1,500 curated Opengrep rules, got ${ruleIds.size}`)
 
-  if (!(await dockerHasImage('guardian-worker:v4'))) {
-    t.skip('guardian-worker:v4 image not built')
+  if (!(await dockerHasImage('kovo-worker:v4'))) {
+    t.skip('kovo-worker:v4 image not built')
     return
   }
 
-  const reposDir = makeTempDir(t, 'guardian-m3-og-')
+  const reposDir = makeTempDir(t, 'kovo-m3-og-')
   const appDir = join(reposDir, 'app')
   mkdirSync(join(appDir, 'src'), { recursive: true })
   writeFileSync(join(appDir, 'src', 'vuln.ts'), `export function q(db: any, req: any) { return db.query("SELECT * FROM users WHERE id=" + req.query.id); }\n`)
@@ -166,11 +166,11 @@ test('M3-T2: worker/rules/opengrep contains >= 1,500 deduplicated rules across >
 })
 
 test('M3-T3: trivy-fs runs offline CVE + misconfig scan against /opt/trivy-cache under --network none --read-only', async (t) => {
-  if (!(await dockerHasImage('guardian-worker:v4'))) {
-    t.skip('guardian-worker:v4 image not built')
+  if (!(await dockerHasImage('kovo-worker:v4'))) {
+    t.skip('kovo-worker:v4 image not built')
     return
   }
-  const reposDir = makeTempDir(t, 'guardian-m3-trivy-')
+  const reposDir = makeTempDir(t, 'kovo-m3-trivy-')
   const appDir = join(reposDir, 'app')
   mkdirSync(appDir, { recursive: true })
   writeFileSync(join(appDir, 'package.json'), JSON.stringify({ name: 'trivy-test', version: '1.0.0', dependencies: { lodash: '4.17.15' } }))
@@ -196,12 +196,12 @@ test('M3-T3: trivy-fs runs offline CVE + misconfig scan against /opt/trivy-cache
   assert.ok(res.findings.some(f => f.file.includes('Dockerfile') || /DS-?0002|DS-?0026/i.test(f.ruleId)), 'Expected Trivy offline misconfig check on Dockerfile')
 })
 
-test('M3-T4: guardian-worker:v4 masks secrets, blocks traversal, and denies network/RO-mount writes', async (t) => {
-  if (!(await dockerHasImage('guardian-worker:v4'))) {
-    t.skip('guardian-worker:v4 image not built')
+test('M3-T4: kovo-worker:v4 masks secrets, blocks traversal, and denies network/RO-mount writes', async (t) => {
+  if (!(await dockerHasImage('kovo-worker:v4'))) {
+    t.skip('kovo-worker:v4 image not built')
     return
   }
-  const reposDir = makeTempDir(t, 'guardian-m3-sec-')
+  const reposDir = makeTempDir(t, 'kovo-m3-sec-')
   const appDir = join(reposDir, 'app')
   mkdirSync(appDir, { recursive: true })
   writeFileSync(join(appDir, 'secrets.ts'), `export const A = "${TEST_AWS_KEY}";\nexport const S = "${TEST_STRIPE_KEY}";\n`)
@@ -315,8 +315,8 @@ test('M3-T6: jsHarvest recovers .map source maps with size caps, masks secrets, 
 })
 
 test('M3-T7: live --network none --read-only session.analyze("js-harvest") executes @swc/core under UID 10001:10001', async (t) => {
-  if (!(await dockerHasImage('guardian-worker:v4'))) {
-    t.skip('guardian-worker:v4 image not built')
+  if (!(await dockerHasImage('kovo-worker:v4'))) {
+    t.skip('kovo-worker:v4 image not built')
     return
   }
   const backend = new LinuxWorkerBackend()
@@ -350,8 +350,8 @@ test('M3-T8: buildCallGraphFromFiles & live session.callGraph trace multi-file r
   assert.equal(guarded.isUnguardedPath, true)
   assert.ok(guarded.dominatingGuards.includes('requireOrgMembership'))
 
-  if (!(await dockerHasImage('guardian-worker:v4'))) return
-  const reposDir = makeTempDir(t, 'guardian-m3-cg-')
+  if (!(await dockerHasImage('kovo-worker:v4'))) return
+  const reposDir = makeTempDir(t, 'kovo-m3-cg-')
   const appDir = join(reposDir, 'app')
   mkdirSync(join(appDir, 'src', 'routes'), { recursive: true })
   for (const f of files) writeFileSync(join(appDir, f.file), f.content)
@@ -404,9 +404,9 @@ test('M3-T9: Stage-1 rule sanitization rejects ReDoS/anchors/fix:/wildcards and 
   assert.ok(det.spec.authTenantGuards.some(g => g.name === 'requireOrgMembership'))
   assert.ok(det.candidateRules.some(r => r.id.includes('unsafeexec')))
 
-  if (!(await dockerHasImage('guardian-worker:v4'))) return
+  if (!(await dockerHasImage('kovo-worker:v4'))) return
   const { storage, run, assignment } = makeTestStore(t)
-  const reposDir = makeTempDir(t, 'guardian-m3-s1-')
+  const reposDir = makeTempDir(t, 'kovo-m3-s1-')
   const appDir = join(reposDir, 'app')
   mkdirSync(join(appDir, 'src'), { recursive: true })
   writeFileSync(join(appDir, 'src', 'auth.ts'), 'export function requireOrgMembership(req: any) { return req.user.orgId; }\n')
@@ -503,15 +503,15 @@ test('M3-T10: Stage-2 path dominance detects partialGuards and rankAndBudgetAudi
 
 test('M3-T11: Stage-3 git-history miner & post-confirmation Variant Sweep preserve Zero-LLM invariant', async (t) => {
   const { storage, run, assignment } = makeTestStore(t)
-  const reposDir = makeTempDir(t, 'guardian-m3-s3-')
+  const reposDir = makeTempDir(t, 'kovo-m3-s3-')
   const appDir = join(reposDir, 'app')
   mkdirSync(join(appDir, 'src'), { recursive: true })
   writeFileSync(join(appDir, 'README.md'), '# hello\n')
   writeFileSync(join(appDir, 'src', 'orders.ts'), `export function getOrder(db: any, id: string) {\n  return db.query("SELECT * FROM orders WHERE id = '" + id + "'");\n}\n`)
   writeFileSync(join(appDir, 'src', 'billing.ts'), `export function getBilling(db: any, id: string) {\n  return db.query("SELECT * FROM billing WHERE id = '" + id + "'");\n}\n`)
 
-  if (!(await dockerHasImage('guardian-worker:v4'))) {
-    t.skip('guardian-worker:v4 image not built')
+  if (!(await dockerHasImage('kovo-worker:v4'))) {
+    t.skip('kovo-worker:v4 image not built')
     return
   }
 
@@ -538,7 +538,7 @@ test('M3-T11: Stage-3 git-history miner & post-confirmation Variant Sweep preser
 
   // 2. With .git history: filters security commits and ignores docs commits
   await execFile('git', ['init'], { cwd: appDir })
-  await execFile('git', ['config', 'user.email', 'test@guardian.local'], { cwd: appDir })
+  await execFile('git', ['config', 'user.email', 'test@kovo.local'], { cwd: appDir })
   await execFile('git', ['config', 'user.name', 'Tester'], { cwd: appDir })
   await execFile('git', ['add', 'README.md'], { cwd: appDir })
   await execFile('git', ['commit', '-m', 'docs: update README'], { cwd: appDir })
@@ -627,7 +627,7 @@ test('M3-T13: loader.ts safety gate blocks destructive, webshell, private IP, OA
     '  body: "{}"',
     'control:',
     '  method: GET',
-    '  path: /.guardian-none-{{rand}}',
+    '  path: /.kovo-none-{{rand}}',
     'matchers:',
     '  - type: word',
     '    part: body',
@@ -650,8 +650,8 @@ test('M3-T13: loader.ts safety gate blocks destructive, webshell, private IP, OA
 })
 
 test('M3-T14: transpileNucleiTemplate & transpileNucleiDirectory enforce safety filters and rewrite interactsh placeholders', async (t) => {
-  const inDir = makeTempDir(t, 'guardian-m3-nuc-in-')
-  const outDir = makeTempDir(t, 'guardian-m3-nuc-out-')
+  const inDir = makeTempDir(t, 'kovo-m3-nuc-in-')
+  const outDir = makeTempDir(t, 'kovo-m3-nuc-out-')
 
   writeFileSync(join(inDir, 'dns-bad.yaml'), 'id: bad-dns\ninfo:\n  name: DNS\n  severity: high\ndns:\n  - name: "{{FQDN}}"\n')
   writeFileSync(join(inDir, 'dsl-bad.yaml'), 'id: bad-dsl\ninfo:\n  name: DSL Only\n  severity: medium\nhttp:\n  - method: GET\n    path: ["{{BaseURL}}/a"]\n    matchers:\n      - type: dsl\n        dsl: ["status_code == 200"]\n')
@@ -681,12 +681,12 @@ test('M3-T14: transpileNucleiTemplate & transpileNucleiDirectory enforce safety 
   assert.equal(report.rejected.length, 3)
 
   const emitted = readFileSync(join(outDir, 'cve-2025-12345-raw.yaml'), 'utf8')
-  assert.ok(emitted.includes('{{guardian_canary_http}}'))
+  assert.ok(emitted.includes('{{kovo_canary_http}}'))
   assert.ok(emitted.includes('{{rand}}'))
   assert.ok(!emitted.includes('interactsh'))
   const parsed = parseSafeTemplateYaml(emitted)
   assert.equal(parsed.request.headers['X-Probe'], '{{rand}}')
-  assert.ok(parsed.control?.path?.includes('guardian-none-{{rand}}'))
+  assert.ok(parsed.control?.path?.includes('kovo-none-{{rand}}'))
 
   // Direct transpileNucleiTemplate check
   assert.equal(transpileNucleiTemplate('id: x\ninfo:\n  name: Bad\n  severity: high\nhttp:\n  - method: POST\n    path: ["/a"]\n    matchers:\n      - type: word\n        words: [ok]\n').ok, false)

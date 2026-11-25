@@ -487,7 +487,7 @@ describe('v7 M2: typed multi-round ChainHop composition (5 synthetic multi-step 
   })
 
   test('Scenario 5 (Store + ExecReconPlanner integration): dispatchChainRound persists ChainHop facts & injects them into follow-on brief', async (t) => {
-    const { storage } = makeStore(t, 'guardian-v7-m2-chain-')
+    const { storage } = makeStore(t, 'kovo-v7-m2-chain-')
     const setup = await setupApprovedRun(storage, { seeds: [ORIGIN_A], tier: 2 })
     const run = storage.run(setup.runId)
     const asset = run.candidates.find(c => c.origin === ORIGIN_A)!
@@ -659,7 +659,7 @@ describe('v7 M2: white-box-first default when sourceDir / mountedRepos is mounte
   })
 
   test('queueTierALeadSteps seeds > legacy cap (up to WHITEBOX_TIER_A_MAX_SEEDED_STEPS) when source is mounted', async (t) => {
-    const { storage } = makeStore(t, 'guardian-v7-m2-wb-')
+    const { storage } = makeStore(t, 'kovo-v7-m2-wb-')
     const setup = await setupApprovedRun(storage, { seeds: [ORIGIN], tier: 2 })
     const run = storage.run(setup.runId)
     const asset = run.candidates.find(c => c.origin === ORIGIN)!

@@ -146,7 +146,7 @@ test('arch-c3 store export parity: store.ts preserves 100% of public runtime exp
 })
 
 test('arch-c3 runtime facade parity: Store delegates through shared DbSession to projectsRepo, runsRepo, findingsRepo', t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-arch-c3-store-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-arch-c3-store-'))
   const s = new Store(dir, { ftsMode: 'preview' })
   t.after(() => {
     s.close()

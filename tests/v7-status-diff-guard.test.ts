@@ -273,7 +273,7 @@ test('status-diff guard: boolean, timing and OOB receipt paths are unchanged', (
   assert.equal(timingVerdict.rule, 'timing')
 
   // OOB: a delivered callback tied to the carrying exchange still confirms.
-  const token = 'guardian-canary-0123456789abcdef01234567'
+  const token = 'kovo-canary-0123456789abcdef01234567'
   const oobVerdict = verifyReceipt({
     vulnClass: 'ssrf',
     target: { origin, method: 'GET', pathAndQuery: '/api/fetch' },

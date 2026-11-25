@@ -27,7 +27,7 @@ import type { EndpointHarvest, EngineEndpoint, EngineParam } from '../src/server
 import { graphLeadTargets } from '../src/server/graph-leads.ts'
 import { makeStore, setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 type LaneOptions = { signal?: AbortSignal; maxDurationMs?: number; onAssignment?: (assignmentId: string) => void }
 

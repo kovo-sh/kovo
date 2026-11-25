@@ -71,14 +71,14 @@ const bundleSession: MintedPersonaSession = {
       },
     ],
     storage: {
-      localStorage: { 'guardian.bundle.token': 'storage-jwt-value-abcdef123456' },
+      localStorage: { 'kovo.bundle.token': 'storage-jwt-value-abcdef123456' },
       sessionStorage: { 'session-hint': 'session-storage-value-11223344' },
     },
   },
 }
 
 function makeStorage(t: { after(fn: () => void): void }): Store {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v6-auth-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v6-auth-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -166,7 +166,7 @@ function makeInteractiveBrowser(options: MockBrowserOptions): {
       if (selector.includes('one-time-code')) return options.otp && phase === 'submitted' && !otpDone ? 1 : 0
       if (selector.includes('password')) return 1
       if (selector.includes('type="email"') || selector.includes('identifier')) return 1
-      if (selector.includes('data-guardian-sso')) return options.ssoButton ? 1 : 0
+      if (selector.includes('data-kovo-sso')) return options.ssoButton ? 1 : 0
       if (selector.includes('button[type="submit"]')) return 1
       return 0
     },
@@ -285,7 +285,7 @@ test('HttpOnly cookies and storage hydrate into a browser attachment and survive
   assert.ok(app.cookies.every(cookie => cookie.name !== 'api_token'), 'api cookie must not attach to app origin')
   assert.deepEqual(app.storage?.localStorage, bundleSession.bundle?.storage?.localStorage)
   assert.deepEqual(app.storage?.sessionStorage, bundleSession.bundle?.storage?.sessionStorage)
-  assert.ok(app.initScript?.includes('guardian.bundle.token'))
+  assert.ok(app.initScript?.includes('kovo.bundle.token'))
 
   const api = buildPersonaBrowserAttachment(resolved, apiOrigin)
   assert.ok(api)
@@ -396,7 +396,7 @@ test('OIDC login traverses only allowlisted authOrigins, captures HttpOnly cooki
   const storage = makeStorage(t)
   const { projectId, persona } = makeLoginPersona(storage, {
     origins: [appOrigin, idpOrigin],
-    loginUrl: `${idpOrigin}/oauth2/authorize?client_id=guardian`,
+    loginUrl: `${idpOrigin}/oauth2/authorize?client_id=kovo`,
     adapter: 'auto',
     email: 'sso@example.com',
     loginExtra: { authOrigins: ['https://evil.example.net'], totpSeed: 'JBSWY3DPEHPK3PXP' },
@@ -457,7 +457,7 @@ test('TOTP generation follows RFC 6238 and accepts otpauth URIs', () => {
   const seed = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'
   assert.equal(generateTotp(seed, { digits: 8, atMs: 59_000 }), '94287082')
   assert.equal(generateTotp(seed, { digits: 8, atMs: 1_111_111_109_000 }), '07081804')
-  assert.ok(normalizeTotpSeed(`otpauth://totp/Guardian:test?secret=${seed}&issuer=Guardian`))
+  assert.ok(normalizeTotpSeed(`otpauth://totp/Kovo:test?secret=${seed}&issuer=Kovo`))
   assert.equal(normalizeTotpSeed('not a base32 secret!'), null)
   assert.throws(() => generateTotp('bad seed!'), (err: unknown) => err instanceof PersonaAuthError)
 })

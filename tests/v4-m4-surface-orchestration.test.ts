@@ -63,7 +63,7 @@ function createLocalJqBackend(): WorkerBackend {
       return { exitCode: 0, stdout: '{}', stderr: '', outputs: {} }
     }
     const filter = match[1].replaceAll("'\"'\"'", "'")
-    const dir = mkdtempSync(join(tmpdir(), 'guardian-m4-jq-'))
+    const dir = mkdtempSync(join(tmpdir(), 'kovo-m4-jq-'))
     try {
       const inPath = join(dir, 'replay-results.json')
       writeFileSync(inPath, payloadFile.content, 'utf8')
@@ -152,7 +152,7 @@ function createLocalJqBackend(): WorkerBackend {
 // ============================================================================
 
 test('M4.1 extractStaticFrameworkRoutes detects all 11 frameworks with params, sinks & guards', (t) => {
-  const repoDir = makeTempDir(t, 'guardian-m4-frameworks-')
+  const repoDir = makeTempDir(t, 'kovo-m4-frameworks-')
   const write = (rel: string, content: string) => {
     const full = join(repoDir, rel)
     mkdirSync(join(full, '..'), { recursive: true })
@@ -186,7 +186,7 @@ test('M4.1 extractStaticFrameworkRoutes detects all 11 frameworks with params, s
 })
 
 test('M4.2 runPhase0Recon enforces min(floor(15% * budgetRequests), 250) cap, Tier-0 offline mode, and OpenAPI/JS/dependency discovery', async (t) => {
-  const repoDir = makeTempDir(t, 'guardian-m4-p0-repo-')
+  const repoDir = makeTempDir(t, 'kovo-m4-p0-repo-')
   mkdirSync(join(repoDir, 'app/api/secret'), { recursive: true })
   writeFileSync(join(repoDir, 'app/api/secret/route.ts'), 'export async function GET() { return new Response("ok") }\n')
 
@@ -227,7 +227,7 @@ test('M4.2 runPhase0Recon enforces min(floor(15% * budgetRequests), 250) cap, Ti
   // Tier 0: zero live HTTP requests, static routes populated
   const { storage: s0 } = makeStore(t)
   const { runId: r0 } = await setupApprovedRun(s0, { seeds: [fx.origin], tier: 0, budgetRequests: 100 })
-  const res0 = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+  const res0 = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
     runPhase0Recon({
       storage: s0,
       runId: r0,
@@ -250,7 +250,7 @@ test('M4.2 runPhase0Recon enforces min(floor(15% * budgetRequests), 250) cap, Ti
   // Tier 1 with tight budgetRequests = 80 -> perOriginCap = floor(80 * 0.15) = 12
   const { storage: s1 } = makeStore(t)
   const { runId: r1 } = await setupApprovedRun(s1, { seeds: [fx.origin], tier: 1, budgetRequests: 80 })
-  const res1 = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+  const res1 = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
     runPhase0Recon({
       storage: s1,
       runId: r1,
@@ -336,7 +336,7 @@ test('M4.3 crawlStateGraph crawls personas, intercepts XHR/forms/CSRF/postMessag
   t.after(() => browser.close())
   const grant = makeLabGrant(fx.origin, { tier: 2, personas: personaMap })
 
-  const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+  const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
     crawlStateGraph({
       storage,
       runId,
@@ -417,7 +417,7 @@ test('M4.4 GraphQL SDL fuzzer parses nested types, respects non-DoS bounds, dete
   })
 
   // Nested BOLA via SDL fallback when introspection is disabled + strict non-DoS bounds
-  const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+  const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
     probeDifferential(
       {
         probeClass: 'graphql_audit',
@@ -487,7 +487,7 @@ test('M4.5 sqli_boolean over graphql_var preserves SQL error dialect signal with
     }
     res.end(JSON.stringify({ data: { search: [] } }))
   })
-  const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+  const res = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
     probeDifferential(
       {
         probeClass: 'sqli_boolean',
@@ -795,7 +795,7 @@ test('M4.8 computeMultiTrialFanout BVA and live Execution multi-trial early stop
   storage.updateRun(runId, { phase: 'investigation', status: 'running', workerConcurrency: 2, multiTrialEnabled: true })
 
   const engine = new Execution(storage, { backend: createLocalJqBackend() })
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     engine.start()
     try {
       engine.wake()
@@ -849,9 +849,9 @@ test('M4.9 Execution wires LabRunner startLabTarget -> expose origin -> teardown
       return {
         targetId: 'lab-mock-1',
         runId: params.runId,
-        networkName: 'guardian-lab-mock',
-        containerName: 'guardian-lab-app',
-        containerNames: ['guardian-lab-app'],
+        networkName: 'kovo-lab-mock',
+        containerName: 'kovo-lab-app',
+        containerNames: ['kovo-lab-app'],
         containerIp: '172.30.0.2',
         imageName: 'node:24-bookworm-slim',
         origin: fx.origin,
@@ -871,7 +871,7 @@ test('M4.9 Execution wires LabRunner startLabTarget -> expose origin -> teardown
 
   storage.updateRun(runId, { phase: 'threat_model', status: 'running' })
   const engine = new Execution(storage, { labRunner: mockLabRunner, backend: createLocalJqBackend() })
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     engine.start()
     try {
       engine.wake()
@@ -939,7 +939,7 @@ test('M4.10 replay-verifier requireControlNonError under CWE-639 allows explicit
   const backend = createLocalJqBackend()
   const grant = makeLabGrant(fx.origin)
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     // 1. Control=200, Probe=500 asserted in jq -> confirmed even under CWE-639 default requireControlNonError=true
     const confirmed = await verifyReplaySpec({ spec, broker, backend, grant, signal: AbortSignal.timeout(15_000) })
     assert.equal(confirmed.verdict, 'confirmed', `Expected confirmed, got ${confirmed.verdict}: ${confirmed.outcome.reason}`)

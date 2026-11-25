@@ -30,11 +30,11 @@ import {
   verifyScript,
 } from '../src/server/verify-rpc.ts'
 import type { VerifyClaim } from '../src/server/verify-rpc.ts'
-import { VerifyContext } from '../worker/guardian_verify/guardian_verify.ts'
+import { VerifyContext } from '../worker/kovo_verify/kovo_verify.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
-const SDK_DIR = join(REPO_ROOT, 'worker', 'guardian_verify')
+const SDK_DIR = join(REPO_ROOT, 'worker', 'kovo_verify')
 const ALICE = 'alice-thin-sdk-secret-1'
 const BOB = 'bob-thin-sdk-secret-2'
 
@@ -137,22 +137,22 @@ const describeVerdict = (v: Awaited<ReturnType<typeof verifyScript>>) =>
 // ---------------------------------------------------------------------------
 
 test('thin SDK stays within LOC budget and carries zero duplicated stats/normalization/oracle scoring', () => {
-  const ts = readFileSync(join(SDK_DIR, 'guardian_verify.ts'), 'utf8')
+  const ts = readFileSync(join(SDK_DIR, 'kovo_verify.ts'), 'utf8')
   const rpcSrc = readFileSync(join(REPO_ROOT, 'src/server/verify-rpc.ts'), 'utf8')
   const loc = (text: string) => text.trimEnd().split('\n').length
-  assert.ok(loc(ts) <= 900, `guardian_verify.ts is ${loc(ts)} LOC (must be <= 900)`)
+  assert.ok(loc(ts) <= 900, `kovo_verify.ts is ${loc(ts)} LOC (must be <= 900)`)
 
   for (const forbidden of [/\bmannWhitneyU\b/, /\bfunction erf\b/, /\bnormalCdf\b/, /\bfunction median\b/, /\bfunction mad\b/, /STRUCTURAL_[A-Z_]+_RE/, /normalizeStructuralTokens/, /\bchangedTokens\b/, /\btokenSet\b/]) {
-    assert.equal(forbidden.test(ts), false, `guardian_verify.ts must not duplicate ${forbidden}`)
+    assert.equal(forbidden.test(ts), false, `kovo_verify.ts must not duplicate ${forbidden}`)
   }
   // TS SDK delegates every prove_* helper to the host `prove.*` RPCs.
   for (const op of ['prove.accessBoundary', 'prove.persistedMutation', 'prove.differential', 'prove.oob', 'prove.race', 'prove.injection']) {
-    assert.ok(ts.includes(`'${op}'`), `guardian_verify.ts must call ${op}`)
+    assert.ok(ts.includes(`'${op}'`), `kovo_verify.ts must call ${op}`)
     assert.ok(rpcSrc.includes(`op === '${op}'`), `verify-rpc.ts must dispatch ${op}`)
   }
   // Backward-compatible method names and aliases survive.
   for (const method of ['prove_access_boundary(', 'proveAccessBoundary(', 'prove_persisted_mutation(', 'prove_boolean_or_timing_diff(', 'prove_oob_callback(', 'prove_race_burst(', 'prove_injection_differential(', 'prove_composite(', 'proveComposite(', 'seal_capability(', 'hmac_sign(', 'jwt_sign(', 'await_async(']) {
-    assert.ok(ts.includes(method), `guardian_verify.ts missing ${method}`)
+    assert.ok(ts.includes(method), `kovo_verify.ts missing ${method}`)
   }
 })
 

@@ -37,14 +37,14 @@ import type {
 } from '../src/server/program-graph.ts'
 import { makeLabGrant, makeStore, setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const ORIGIN = 'https://wire.whitebox.test'
 const BILLING_ROUTE = ['GET', '/v2/billing/invoices/:id'] as const
 const ADMIN_ROUTE = ['PATCH', '/v3/admin/users/:id'] as const
 
 function writeRepo(t: TestContext, files: Record<string, string>): string {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v7-wire-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v7-wire-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   for (const [path, content] of Object.entries(files)) {
     const full = join(dir, path)
@@ -167,7 +167,7 @@ function sliceFor(hypotheses: readonly CodeSliceHypothesis[], method: string, pa
 }
 
 async function runWireRecon(t: TestContext, reposDir: string | undefined, maxCodeSlices?: number) {
-  const { storage } = makeStore(t, 'guardian-v7-wire-db-')
+  const { storage } = makeStore(t, 'kovo-v7-wire-db-')
   const setup = await setupApprovedRun(storage, { seeds: [ORIGIN], tier: 0, budgetRequests: 900 })
   const grant: Grant = makeLabGrant(ORIGIN, { tier: 0 })
   const result = await runPhase0Recon({

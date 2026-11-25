@@ -1,5 +1,5 @@
 /**
- * Unit tests for Guardian v8 structured multi-hop funnel & telemetry extraction
+ * Unit tests for Kovo Hunter v8 structured multi-hop funnel & telemetry extraction
  * (`scripts/benchmark-multihop.ts`) and end-to-end compatibility with
  * `scripts/certify-v8.ts` (`evaluateV8Certification`, `loadMultihopInputs`).
  *
@@ -34,7 +34,7 @@ import {
   normalizeCell,
 } from '../scripts/certify-v8.ts'
 
-function createGuardianFixtureDb(path = ':memory:'): DatabaseSync {
+function createKovoFixtureDb(path = ':memory:'): DatabaseSync {
   const db = new DatabaseSync(path)
   db.exec(`
     CREATE TABLE runs (
@@ -254,7 +254,7 @@ function buildCellReport(opts: {
 
 describe('extractMultihopRunTelemetry (SQLite fixture extraction)', () => {
   it('extracts Phase-timing, Scheduler/Dead-End-Waste, CapabilityLedger, and v8-SDK-Adoption metrics accurately with run isolation', () => {
-    const db = createGuardianFixtureDb()
+    const db = createKovoFixtureDb()
     try {
       const t0 = 1_750_000_000_000
       const runId = 'run-main'
@@ -333,8 +333,8 @@ describe('extractMultihopRunTelemetry (SQLite fixture extraction)', () => {
         t0 + 400_000,
       )
 
-      // v8 SDK RPC / guardian_verify events
-      insEv.run(runId, 'guardian_verify.called', 'gv 1', JSON.stringify({ callId: 'c1' }), t0 + 200_000)
+      // v8 SDK RPC / kovo_verify events
+      insEv.run(runId, 'kovo_verify.called', 'gv 1', JSON.stringify({ callId: 'c1' }), t0 + 200_000)
       insEv.run(runId, 'verify_rpc.call', 'seal', JSON.stringify({ op: 'capability.seal', ok: true }), t0 + 201_000)
       insEv.run(runId, 'verify_rpc.call', 'seal', JSON.stringify({ op: 'capability.seal', ok: true }), t0 + 202_000)
       insEv.run(runId, 'verify_rpc.call', 'hmac', JSON.stringify({ op: 'crypto.hmacSign', ok: true }), t0 + 203_000)
@@ -347,7 +347,7 @@ describe('extractMultihopRunTelemetry (SQLite fixture extraction)', () => {
         JSON.stringify({ op: 'composite.verify', confirmed: false, failedStage: 'edge_binding_rejected' }),
         t0 + 206_000,
       )
-      insEv.run(runId, 'guardian_verify.called', 'gv 2', JSON.stringify({ callId: 'c2' }), t0 + 250_000)
+      insEv.run(runId, 'kovo_verify.called', 'gv 2', JSON.stringify({ callId: 'c2' }), t0 + 250_000)
       insEv.run(
         runId,
         'verify_rpc.call',
@@ -364,7 +364,7 @@ describe('extractMultihopRunTelemetry (SQLite fixture extraction)', () => {
       )
       insEv.run(
         runId,
-        'guardian_verify.rejected',
+        'kovo_verify.rejected',
         'gv reject',
         JSON.stringify({ callId: 'c3', rejectedBy: 'oracle_failed' }),
         t0 + 270_000,
@@ -457,7 +457,7 @@ describe('extractMultihopRunTelemetry (SQLite fixture extraction)', () => {
         compositeReceiptsCount: 1,
       })
 
-      assert.equal(tel.v8SdkAdoption.guardianVerifyCalls, 3)
+      assert.equal(tel.v8SdkAdoption.kovoVerifyCalls, 3)
       assert.equal(tel.v8SdkAdoption.sealCapabilityCalls, 2)
       assert.equal(tel.v8SdkAdoption.hmacSignCalls, 1)
       assert.equal(tel.v8SdkAdoption.jwtSignCalls, 1)
@@ -481,7 +481,7 @@ describe('extractMultihopRunTelemetry (SQLite fixture extraction)', () => {
       assert.equal(emptyTel.phaseTiming.totalWallMs, 0)
       assert.equal(emptyTel.scheduler.deadEndWastePct, 0)
       assert.equal(emptyTel.capabilityLedger.nodesTotal, 0)
-      assert.equal(emptyTel.v8SdkAdoption.guardianVerifyCalls, 0)
+      assert.equal(emptyTel.v8SdkAdoption.kovoVerifyCalls, 0)
       assert.deepEqual(emptyTel.v8SdkAdoption.topRejectReasons, [])
     } finally {
       emptyDb.close()
@@ -526,10 +526,10 @@ describe('extractMultihopRunTelemetry (SQLite fixture extraction)', () => {
   })
 
   it('extracts structured v8 SDK helper counts and rejection reasons from read-only agent-sessions SQLite without leaking scripts', () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'guardian-v8-telemetry-sess-'))
+    const tempDir = mkdtempSync(join(tmpdir(), 'kovo-v8-telemetry-sess-'))
     try {
-      const dbPath = join(tempDir, 'guardian.sqlite')
-      const db = createGuardianFixtureDb(dbPath)
+      const dbPath = join(tempDir, 'kovo.sqlite')
+      const db = createKovoFixtureDb(dbPath)
       const t0 = 1_750_000_000_000
       db.prepare('INSERT INTO runs (id, created_at) VALUES (?, ?)').run('r-sess', t0)
       db.prepare('INSERT INTO assignments (id, run_id, phase, status, session_id, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(
@@ -548,7 +548,7 @@ describe('extractMultihopRunTelemetry (SQLite fixture extraction)', () => {
               {
                 type: 'toolCall',
                 id: 'tc-1',
-                name: 'guardian_verify',
+                name: 'kovo_verify',
                 arguments: {
                   runtime: 'ts',
                   script: [
@@ -579,7 +579,7 @@ describe('extractMultihopRunTelemetry (SQLite fixture extraction)', () => {
       const tel = extractMultihopRunTelemetry(db, 'r-sess', { dataDir: tempDir })
       db.close()
 
-      assert.equal(tel.v8SdkAdoption.guardianVerifyCalls, 1)
+      assert.equal(tel.v8SdkAdoption.kovoVerifyCalls, 1)
       assert.equal(tel.v8SdkAdoption.sealCapabilityCalls, 1)
       assert.equal(tel.v8SdkAdoption.hmacSignCalls, 1)
       assert.equal(tel.v8SdkAdoption.jwtSignCalls, 1)
@@ -622,7 +622,7 @@ describe('Markdown Telemetry Summary & certify-v8.ts compatibility', () => {
         compositeReceiptsCount: 2,
       },
       v8SdkAdoption: {
-        guardianVerifyCalls: 6,
+        kovoVerifyCalls: 6,
         sealCapabilityCalls: 5,
         hmacSignCalls: 2,
         jwtSignCalls: 1,
@@ -662,7 +662,7 @@ describe('Markdown Telemetry Summary & certify-v8.ts compatibility', () => {
   })
 
   it('feeds benchmark-multihop.ts report & meta JSON directly into scripts/certify-v8.ts (M3 PASS and FAIL on waste > 5%) without field mismatches', () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'guardian-v8-certify-bridge-'))
+    const tempDir = mkdtempSync(join(tmpdir(), 'kovo-v8-certify-bridge-'))
     try {
       const devApps: readonly MultihopAppName[] = ['paygrid', 'shipforge', 'nexusiam']
       const makeTel = (deadEndReprobes: number, totalPhaseBAssignments: number): MultihopRunTelemetry => ({
@@ -694,7 +694,7 @@ describe('Markdown Telemetry Summary & certify-v8.ts compatibility', () => {
           compositeReceiptsCount: 2,
         },
         v8SdkAdoption: {
-          guardianVerifyCalls: 4,
+          kovoVerifyCalls: 4,
           sealCapabilityCalls: 4,
           hmacSignCalls: 1,
           jwtSignCalls: 1,

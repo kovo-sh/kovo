@@ -43,9 +43,9 @@ import {
   VERIFY_RPC_TOKEN_ENV,
   VerifyRpcServer,
 } from '../src/server/verify-rpc.ts'
-import { VerifyContext } from '../worker/guardian_verify/guardian_verify.ts'
+import { VerifyContext } from '../worker/kovo_verify/kovo_verify.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const ORIGIN = 'http://127.0.0.1:49888'
 

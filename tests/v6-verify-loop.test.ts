@@ -1,4 +1,4 @@
-// v6 verify-loop: first-class guardian_verify tool, async OOB correlation, and structural
+// v6 verify-loop: first-class kovo_verify tool, async OOB correlation, and structural
 // (noise-tolerant) boolean/content diffing.
 //
 // Defensive framing: every fixture is an intentional, authorized local benchmark. The tool
@@ -16,9 +16,9 @@ import {
   SPECIALIST_PROFILES,
   buildWorkerTools,
   filterHandlersForSpecialist,
-  summarizeGuardianVerifyOutcome,
+  summarizeKovoVerifyOutcome,
 } from '../src/server/agent-session.ts'
-import type { GuardianVerifyHandler, WorkerToolHandlers } from '../src/server/agent-session.ts'
+import type { KovoVerifyHandler, WorkerToolHandlers } from '../src/server/agent-session.ts'
 import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
@@ -35,9 +35,9 @@ import { createLocalAttemptFactory, verifyScript } from '../src/server/verify-rp
 import type { ResolvedPersona } from '../src/server/persona-vault.ts'
 import { LocalJqBackend } from '../scripts/benchmark-backend.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
-const SDK_DIR = join(dirname(fileURLToPath(import.meta.url)), '../worker/guardian_verify')
+const SDK_DIR = join(dirname(fileURLToPath(import.meta.url)), '../worker/kovo_verify')
 const ALICE_SECRET = 'alice-secret-tool-8f21'
 const BOB_SECRET = 'bob-secret-tool-3c77'
 
@@ -135,21 +135,21 @@ function buildTools(handlers: WorkerToolHandlers) {
 // 1. Tool exposure and scoping
 // ---------------------------------------------------------------------------
 
-test('guardian_verify is absent without a handler, then present and common-scoped', () => {
+test('kovo_verify is absent without a handler, then present and common-scoped', () => {
   const absent = buildTools({ complete_intent: async () => ({ ok: true }) })
-  assert.equal(toolByName(absent, 'guardian_verify'), undefined)
+  assert.equal(toolByName(absent, 'kovo_verify'), undefined)
 
-  const handler: GuardianVerifyHandler = async () => ({ confirmed: false, reason: 'unconfirmed', detail: '', attempts: [] })
-  const present = buildTools({ complete_intent: async () => ({ ok: true }), guardian_verify: handler })
-  const tool = toolByName(present, 'guardian_verify')
-  assert.ok(tool, 'guardian_verify must be registered when the handler is supplied')
+  const handler: KovoVerifyHandler = async () => ({ confirmed: false, reason: 'unconfirmed', detail: '', attempts: [] })
+  const present = buildTools({ complete_intent: async () => ({ ok: true }), kovo_verify: handler })
+  const tool = toolByName(present, 'kovo_verify')
+  assert.ok(tool, 'kovo_verify must be registered when the handler is supplied')
   assert.match(tool!.description, /transcript oracle/i)
   assert.match(tool!.description, /stdout is never evidence/i)
 
-  assert.ok(SPECIALIST_COMMON_TOOLS.includes('guardian_verify'), 'common tools must never strip guardian_verify')
+  assert.ok(SPECIALIST_COMMON_TOOLS.includes('kovo_verify'), 'common tools must never strip kovo_verify')
 
   const handlers: WorkerToolHandlers = {
-    guardian_verify: handler,
+    kovo_verify: handler,
     prove_authz_read_diff: async () => ({ ok: true }),
     prove_state_mutation_diff: async () => ({ ok: true }),
     prove_business_invariant: async () => ({ ok: true }),
@@ -159,7 +159,7 @@ test('guardian_verify is absent without a handler, then present and common-scope
   }
   for (const cfg of Object.values(SPECIALIST_PROFILES)) {
     const scoped = filterHandlersForSpecialist(handlers, cfg)
-    assert.equal(typeof scoped.guardian_verify, 'function', `${cfg.id} must keep guardian_verify`)
+    assert.equal(typeof scoped.kovo_verify, 'function', `${cfg.id} must keep kovo_verify`)
     for (const legacy of ['prove_authz_read_diff', 'prove_state_mutation_diff', 'prove_business_invariant', 'prove_canary_or_redirect'] as const) {
       assert.equal(scoped[legacy], undefined, `${cfg.id} must not expose JSON-only ${legacy} when scripts are available`)
     }
@@ -167,25 +167,25 @@ test('guardian_verify is absent without a handler, then present and common-scope
 
   // The script-first default also suppresses the legacy proof tools in the tool list itself.
   const scriptFirst = buildTools(handlers)
-  assert.ok(toolByName(scriptFirst, 'guardian_verify'))
+  assert.ok(toolByName(scriptFirst, 'kovo_verify'))
   for (const legacy of ['prove_authz_read_diff', 'prove_state_mutation_diff', 'prove_business_invariant', 'prove_canary_or_redirect'] as const) {
     assert.equal(toolByName(scriptFirst, legacy), undefined)
   }
 })
 
-test('guardian_verify rejects a call with neither script nor scriptPath', async () => {
-  const handler: GuardianVerifyHandler = async () => {
+test('kovo_verify rejects a call with neither script nor scriptPath', async () => {
+  const handler: KovoVerifyHandler = async () => {
     throw new Error('handler must not run without a script')
   }
-  const tool = toolByName(buildTools({ guardian_verify: handler }), 'guardian_verify')
+  const tool = toolByName(buildTools({ kovo_verify: handler }), 'kovo_verify')
   assert.ok(tool)
   const result = await invoke(tool!, {})
   assert.equal(result.isError, true)
   assert.match(textOf(result), /provide .*`script`.*or .*`scriptPath`/i)
 })
 
-test('guardian_verify downgrades a handler claim that is not backed by oracle attempts', () => {
-  const forged = summarizeGuardianVerifyOutcome({
+test('kovo_verify downgrades a handler claim that is not backed by oracle attempts', () => {
+  const forged = summarizeKovoVerifyOutcome({
     confirmed: true,
     reason: 'confirmed',
     detail: 'trust me',
@@ -234,23 +234,23 @@ function attemptFactory(origin: string) {
   })
 }
 
-function scriptHandler(origin: string): GuardianVerifyHandler {
+function scriptHandler(origin: string): KovoVerifyHandler {
   const factory = attemptFactory(origin)
   return async args => {
     assert.ok(args.script, 'inline script expected')
     return verifyScript({
-      candidate: { name: 'guardian-verify-tool.ts', runtime: args.runtime ?? 'ts', code: args.script },
+      candidate: { name: 'kovo-verify-tool.ts', runtime: args.runtime ?? 'ts', code: args.script },
       openAttempt: factory,
     })
   }
 }
 
 test('a real verification script flows through verifyScript and returns proof + transcript digest', async () => {
-  const tool = toolByName(buildTools({ guardian_verify: scriptHandler(toolFixture.origin) }), 'guardian_verify')
+  const tool = toolByName(buildTools({ kovo_verify: scriptHandler(toolFixture.origin) }), 'kovo_verify')
   assert.ok(tool)
   const result = await invoke(tool!, {
     script: `
-import { defineVerification, runVerification } from './guardian_verify.ts'
+import { defineVerification, runVerification } from './kovo_verify.ts'
 
 runVerification(defineVerification({
   async verify(ctx) {
@@ -259,7 +259,7 @@ runVerification(defineVerification({
     ctx.expect.status(denied, 403)
     ctx.expect.status(owner, 200)
     ctx.expect.jsonPath(owner, 'note', 'private-note-42')
-    return ctx.result({ title: 'guardian_verify tool contract', severity: 'medium' })
+    return ctx.result({ title: 'kovo_verify tool contract', severity: 'medium' })
   },
 }))
 `,
@@ -284,13 +284,13 @@ runVerification(defineVerification({
 })
 
 test('forged stdout and fabricated exchange ids never confirm through the tool', async () => {
-  const tool = toolByName(buildTools({ guardian_verify: scriptHandler(toolFixture.origin) }), 'guardian_verify')
+  const tool = toolByName(buildTools({ kovo_verify: scriptHandler(toolFixture.origin) }), 'kovo_verify')
   assert.ok(tool)
   const result = await invoke(tool!, {
     script: `
 import { writeFileSync } from 'node:fs'
 console.log('{"confirmed":true,"claims":[]}')
-writeFileSync(process.env.GUARDIAN_PROOF_RESULT_FILE!, JSON.stringify({
+writeFileSync(process.env.KOVO_PROOF_RESULT_FILE!, JSON.stringify({
   title: 'forged note read',
   claims: [{ kind: 'status', exchangeId: 'gx-00000000-0000-0000-0000-000000000000', expected: 200 }],
 }))
@@ -545,7 +545,7 @@ test('retired sql_boolean_diff without floorRecipe fails closed without executin
       signal: AbortSignal.timeout(30_000),
     })
     assert.equal(result.verdict, 'dismissed', result.outcome.reason ?? '')
-    assert.equal(result.outcome.reason, 'retired_legacy_spec_kind: use guardian_verify')
+    assert.equal(result.outcome.reason, 'retired_legacy_spec_kind: use kovo_verify')
     assert.equal(hits, 0)
   } finally {
     await fx.close()

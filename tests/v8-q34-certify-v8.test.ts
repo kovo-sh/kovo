@@ -53,7 +53,7 @@ import {
   type V7RegressionFloorInput,
 } from '../scripts/certify-v8.ts'
 
-const tempRoot = mkdtempSync(join(tmpdir(), 'guardian-v8-q34-certify-'))
+const tempRoot = mkdtempSync(join(tmpdir(), 'kovo-v8-q34-certify-'))
 process.on('exit', () => rmSync(tempRoot, { recursive: true, force: true }))
 
 const DEV_APPS: readonly MultihopAppName[] = ['paygrid', 'shipforge', 'nexusiam']
@@ -255,7 +255,7 @@ function makeRealisticCellMeta(opts: BuildCellOptions): MultihopCellMeta {
         compositeReceiptsCount: chainsConfirmed,
       },
       v8SdkAdoption: {
-        guardianVerifyCalls: 10,
+        kovoVerifyCalls: 10,
         sealCapabilityCalls: 4,
         hmacSignCalls: 1,
         jwtSignCalls: 1,
@@ -949,7 +949,7 @@ test('M4 PASS: end-to-end CLI with MultihopReport + OSS directory + v7 floor gen
   mkdirSync(ossDir, { recursive: true })
 
   // Create a dangling credential symlink inside a sibling dir to prove directory traversal never crashes
-  symlinkSync('/nonexistent/guardian/cred-file', join(runsDir, 'data-with-broken-link', 'model-key.json'))
+  symlinkSync('/nonexistent/kovo/cred-file', join(runsDir, 'data-with-broken-link', 'model-key.json'))
 
   const cells = makePassingM4Cells()
   const floorCells = cells.filter((c) => c.llm === 'deterministic-no-llm')
@@ -989,7 +989,7 @@ test('M4 PASS: end-to-end CLI with MultihopReport + OSS directory + v7 floor gen
   const json = JSON.parse(readFileSync(outJson, 'utf8')) as { verdict: string; failedChecks: unknown[] }
   assert.equal(json.verdict, 'PASS')
   assert.equal(json.failedChecks.length, 0)
-  assert.match(md, /# Guardian v8 Calibration & Certification Scorecard \(M4\)/)
+  assert.match(md, /# Kovo(?: Hunter)? v8 Calibration & Certification Scorecard \(M4\)/)
   assert.match(md, /`two_side_replay_integrity`/)
   assert.match(md, /`m4_v7_realistic_spread`/)
 })

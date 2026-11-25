@@ -63,7 +63,7 @@ import type {
 } from '../src/server/worker-backend.ts'
 import { setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SIGNING_KEY = 'unit-test-q26-provenance-soundness-key-0123456789'
@@ -544,7 +544,7 @@ test('end-to-end: VerifyRpcServer rejects cross-tenant collusion and persists no
     await new Promise<void>(resolveClose => server.close(() => resolveClose()))
   })
 
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v8-q26-prov-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v8-q26-prov-'))
   const storage = new Store(dir)
   t.after(() => {
     storage.close()
@@ -602,7 +602,7 @@ test('end-to-end: VerifyRpcServer rejects cross-tenant collusion and persists no
     assert.equal(verObj.failedStage, 'attacker_provenance')
     return {
       runtime: req.runtime,
-      result: { sdk: 'guardian_verify.ts', nonce: req.nonce, claims: [verObj.claim] },
+      result: { sdk: 'kovo_verify.ts', nonce: req.nonce, claims: [verObj.claim] },
       stdout: '', stderr: '', exitCode: 0, durationMs: 5, timedOut: false,
     }
   })
@@ -675,7 +675,7 @@ test('end-to-end: VerifyRpcServer rejects cross-tenant collusion and persists no
     return {
       runtime: req.runtime,
       result: {
-        sdk: 'guardian_verify.ts',
+        sdk: 'kovo_verify.ts',
         nonce: req.nonce,
         title: 'Cross-tenant export token bypass exposing tenant_a records',
         severity: 'high',

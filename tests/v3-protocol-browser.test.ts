@@ -1,5 +1,5 @@
 /**
- * Guardian v3 protocol & interactive browser loopback unit tests:
+ * Kovo Hunter v3 protocol & interactive browser loopback unit tests:
  *   1. RequestBroker.probeWebsocket + verifyReplaySpec (ws_chain)
  *   2. RequestBroker benign multipartParts upload + verifyReplaySpec (upload_probe)
  *   3. ScopedBrowser.visitPage interactive actions (fill, click, wait_for_selector, dom_xss_sink_hook)
@@ -221,7 +221,7 @@ test('v3 WebSocket: probeWebsocket origin/scope/bounds/redaction & ws_chain repl
     }],
   ])
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const backend = new LinuxWorkerBackend()
     const sig = AbortSignal.timeout(45_000)
@@ -335,7 +335,7 @@ test('v3 WebSocket: probeWebsocket origin/scope/bounds/redaction & ws_chain repl
       signal: sig,
     })
     assert.equal(wsRetired.verdict, 'dismissed')
-    assert.equal(wsRetired.outcome.reason, 'retired_legacy_spec_kind: use guardian_verify')
+    assert.equal(wsRetired.outcome.reason, 'retired_legacy_spec_kind: use kovo_verify')
     assert.equal(wsRetired.exchanges.length, 0)
   })
 })
@@ -416,7 +416,7 @@ test('v3 upload: Tier 3 gating, webshell & 256 KiB rejection, and upload_probe i
   if (!addr || typeof addr === 'string') throw new Error('no address')
   const origin = `http://127.0.0.1:${addr.port}`
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const backend = new LinuxWorkerBackend()
     const sig = AbortSignal.timeout(45_000)
@@ -512,7 +512,7 @@ test('v3 upload: Tier 3 gating, webshell & 256 KiB rejection, and upload_probe i
         method: 'POST' as const,
         pathAndQuery: uploadPath,
         fieldName: 'file',
-        filename: 'guardian-benign.svg',
+        filename: 'kovo-benign.svg',
         contentType: 'image/svg+xml',
         contentTemplate: '<svg xmlns="http://www.w3.org/2000/svg"><text>{{upload_nonce}}</text></svg>',
         extract: [{ varName: 'upload_id', from: 'json' as const, selector: 'id' }],
@@ -541,7 +541,7 @@ test('v3 upload: Tier 3 gating, webshell & 256 KiB rejection, and upload_probe i
       signal: sig,
     })
     assert.equal(uploadRetired.verdict, 'dismissed')
-    assert.equal(uploadRetired.outcome.reason, 'retired_legacy_spec_kind: use guardian_verify')
+    assert.equal(uploadRetired.outcome.reason, 'retired_legacy_spec_kind: use kovo_verify')
     assert.equal(uploadRetired.exchanges.length, 0)
     assert.equal(cleanupCalls, 0)
     assert.equal(uploads.size, 0)
@@ -622,13 +622,13 @@ test('v3 ScopedBrowser & browser_chain: 100% broker-proxied, out-of-scope abort,
   if (!appAddr || typeof appAddr === 'string') throw new Error('no app address')
   const appOrigin = `http://127.0.0.1:${appAddr.port}`
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const browser = new ScopedBrowser(broker)
     const backend = new LinuxWorkerBackend()
     const sig = AbortSignal.timeout(60_000)
 
-    const canary = 'guardianInteractiveCanary7331'
+    const canary = 'kovoInteractiveCanary7331'
     let auditedAllowed = 0
     let auditedDenied = 0
     const grant = makeLabGrant(appOrigin, {
@@ -765,7 +765,7 @@ test('v3 ReplayVerifier requireControlNonError: unexpected 404/503 yields inconc
   if (!addr || typeof addr === 'string') throw new Error('no address')
   const origin = `http://127.0.0.1:${addr.port}`
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const backend = new LinuxWorkerBackend()
     const grant = makeLabGrant(origin, { tier: 1 })

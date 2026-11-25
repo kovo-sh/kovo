@@ -25,7 +25,7 @@ import { retestReplaySpec } from '../src/server/replay-verifier.ts'
 import { LocalJqBackend } from '../scripts/benchmark-backend.ts'
 import { makeLabGrant } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 interface Fixture {
   origin: string

@@ -36,10 +36,10 @@ import {
 } from '../scripts/smoke-agentic.ts'
 import { setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const ORIGIN = 'http://127.0.0.1:9'
-const tempRoot = mkdtempSync(join(tmpdir(), 'guardian-realism-metrics-fix-'))
+const tempRoot = mkdtempSync(join(tmpdir(), 'kovo-realism-metrics-fix-'))
 after(() => rmSync(tempRoot, { recursive: true, force: true }))
 
 /** Minimal `pending_oob` relay shape read by the harness. */

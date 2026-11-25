@@ -430,7 +430,7 @@ describe('program graph: reverse call graph and hypotheses', () => {
 
 describe('github connector: preserved history and diff mining', () => {
   test('clones with bounded depth, keeps sanitized .git, and mines security-relevant commits', { timeout: 45_000 }, async t => {
-    const work = makeTempDir(t, 'guardian-v6-git-')
+    const work = makeTempDir(t, 'kovo-v6-git-')
     const source = join(work, 'source')
     const origin = join(work, 'origin')
     const bare = join(origin, 'acme', 'app.git')
@@ -440,8 +440,8 @@ describe('github connector: preserved history and diff mining', () => {
     mkdirSync(source, { recursive: true })
     mkdirSync(join(origin, 'acme'), { recursive: true })
     execFileSync('git', ['init', '-b', 'main', source], { stdio: 'ignore' })
-    git(source, ['config', 'user.email', 'test@guardian.local'])
-    git(source, ['config', 'user.name', 'Guardian Test'])
+    git(source, ['config', 'user.email', 'test@kovo.local'])
+    git(source, ['config', 'user.name', 'Kovo Hunter Test'])
     writeTree(source, {
       'package.json': JSON.stringify({ name: 'app', dependencies: { express: '^4.19.0' } }),
       'routes/users.ts': "router.get('/users/:id', requireAuth, getUser)\n",

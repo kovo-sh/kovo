@@ -17,11 +17,11 @@ import { formHypotheses, profileCaps } from '../scripts/benchmark-probes.ts'
 import type { DiscoveredEndpoint } from '../scripts/benchmark-probes.ts'
 
 async function withLocalLab<T>(fn: () => Promise<T>): Promise<T> {
-  const prev = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  const prev = process.env.KOVO_ALLOW_LOCAL_LAB
+  process.env.KOVO_ALLOW_LOCAL_LAB = '1'
   try { return await fn() } finally {
-    if (prev === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prev
+    if (prev === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = prev
   }
 }
 
@@ -118,7 +118,7 @@ test('csrf_state_change: tokenless cross-origin write with read-back signals', a
       assert.equal(hit.method, 'POST')
       assert.equal(hit.bodyField, 'name')
       assert.equal(hit.stateField, 'name')
-      assert.ok(String(hit.expectedValue).startsWith('guardian_state_'))
+      assert.ok(String(hit.expectedValue).startsWith('kovo_state_'))
       assert.equal(hit.controlValue, 'Acme Baseline')
     } finally { await fx.close() }
   })
@@ -154,7 +154,7 @@ async function webhookFixture(vulnerable: boolean) {
     if (req.method === 'POST' && url.pathname === '/receive') {
       const sig = String(req.headers['x-webhook-signature'] ?? '')
       if (!vulnerable && !sig.startsWith('v1=')) return json(res, 401, { error: 'bad_signature' })
-      events.push({ type: 'guardian.probe' })
+      events.push({ type: 'kovo.probe' })
       return json(res, 200, { ok: true })
     }
     json(res, 404, { error: 'not_found' })

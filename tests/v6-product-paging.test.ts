@@ -1,5 +1,5 @@
 /**
- * Guardian v6 — product-side paging (lossless ingestion view + probe-candidate selection).
+ * Kovo Hunter v6 — product-side paging (lossless ingestion view + probe-candidate selection).
  *
  * Regression for the monorepo fixture finding: Phase-0 declared-surface ingestion read only the
  * store's default 500-row page (reporting ~246 of 2,565 declared ops), and probe selection was
@@ -36,7 +36,7 @@ interface Fixture {
 }
 
 function makeStore(t: { after: (fn: () => void) => void }, label: string): Fixture {
-  const dir = mkdtempSync(join(tmpdir(), `guardian-v6-paging-${label}-`))
+  const dir = mkdtempSync(join(tmpdir(), `kovo-v6-paging-${label}-`))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const store = new Store(dir)
   t.after(() => store.close())

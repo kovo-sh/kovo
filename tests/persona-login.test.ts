@@ -45,7 +45,7 @@ function makeGrant(overrides: Partial<Grant> = {}): Grant {
 }
 
 test('Clerk FAPI login, automatic token refresh rotation, header injection, zero secret leakage, and clean deletion', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-persona-clerk-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-persona-clerk-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -58,7 +58,7 @@ test('Clerk FAPI login, automatic token refresh rotation, header injection, zero
   })
 
   const rawPassword = 'UltraSecretClerkPassword!42'
-  const email = 'guardian-a@northstar.example'
+  const email = 'kovo-a@northstar.example'
   const clientCookie = 'clerk_client_cookie_super_secret_token_9876543210'
   const iat1 = 1_760_000_100
   const exp1 = iat1 + 60
@@ -96,7 +96,7 @@ test('Clerk FAPI login, automatic token refresh rotation, header injection, zero
   assert.ok(!JSON.stringify(listed).includes(rawPassword))
 
   // SQLite file contains zero passwords
-  const sqliteRaw = readFileSync(join(dir, 'guardian.sqlite'))
+  const sqliteRaw = readFileSync(join(dir, 'kovo.sqlite'))
   assert.ok(!sqliteRaw.includes(rawPassword), 'Raw password must never be stored in SQLite.')
 
   // Credential file is strictly 0600 JSON { v: 1, email, password }
@@ -241,7 +241,7 @@ test('Clerk FAPI login, automatic token refresh rotation, header injection, zero
   assert.ok(!scrubbed.includes(jwt2), 'Rotated JWT not scrubbed!')
 
   // Verify SQLite STILL has zero password, __client, or JWTs
-  const sqliteAfter = readFileSync(join(dir, 'guardian.sqlite'))
+  const sqliteAfter = readFileSync(join(dir, 'kovo.sqlite'))
   assert.ok(!sqliteAfter.includes(rawPassword))
   assert.ok(!sqliteAfter.includes(clientCookie))
   assert.ok(!sqliteAfter.includes(jwt1))
@@ -286,7 +286,7 @@ test('Clerk FAPI login, automatic token refresh rotation, header injection, zero
 })
 
 test('Clerk adapter immediately refuses CAPTCHA / Cloudflare Turnstile and MFA without writing session', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-persona-captcha-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-persona-captcha-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -345,7 +345,7 @@ test('Clerk adapter immediately refuses CAPTCHA / Cloudflare Turnstile and MFA w
 })
 
 test('JSON API (Set-Cookie & Bearer) and Supabase login + refresh rotation with zero secret leaks', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-persona-json-supa-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-persona-json-supa-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -516,7 +516,7 @@ test('JSON API (Set-Cookie & Bearer) and Supabase login + refresh rotation with 
 })
 
 test('Form adapter aborts immediately BEFORE interacting when CAPTCHA/Turnstile is present, and succeeds on clean login forms', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-persona-form-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-persona-form-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())

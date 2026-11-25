@@ -1,5 +1,5 @@
 /**
- * Guardian v5 M5 Phase 1 — Swarm Message Board schema & store suite.
+ * Kovo Hunter v5 M5 Phase 1 — Swarm Message Board schema & store suite.
  *
  * Covers: lossless v2–v4 → v5 auto-migration, roster seeding/upsert, IMMEDIATE seq
  * allocation, mention parsing/validation, filters, runDetail hydration, and operator
@@ -19,7 +19,7 @@ const originA = 'https://board-a.example'
 const originB = 'https://board-b.example'
 
 function makeStore(t: { after: (fn: () => void) => void }) {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v5-board-store-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v5-board-store-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const store = new Store(dir)
   t.after(() => store.close())
@@ -39,7 +39,7 @@ test('v5 board schema auto-migrates a v4 database without losing rows and re-cre
   store.message(runId, store.run(runId).coordinatorId, 'operator', 'Legacy coordinator question')
   store.close()
 
-  const raw = new DatabaseSync(join(dir, 'guardian.sqlite'))
+  const raw = new DatabaseSync(join(dir, 'kovo.sqlite'))
   raw.exec('DROP TABLE board_messages; DROP TABLE board_members;')
   const beforeRuns = (raw.prepare('SELECT COUNT(*) AS c FROM runs').get() as { c: number }).c
   const beforeMessages = (raw.prepare('SELECT COUNT(*) AS c FROM messages').get() as { c: number }).c

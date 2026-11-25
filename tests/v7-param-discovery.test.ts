@@ -35,7 +35,7 @@ import { makeLabGrant, makeStore, setupApprovedRun, startHttpFixture, withEnv } 
 const BASE = '/api/v7'
 
 async function withLocalLab<T>(fn: () => Promise<T>): Promise<T> {
-  return withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, fn)
+  return withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, fn)
 }
 
 function json(res: ServerResponse, status: number, body: unknown): void {
@@ -63,7 +63,7 @@ async function runRecon(
     res.setHeader('Content-Type', 'text/plain')
     res.end('not found')
   })
-  const { storage } = makeStore(t, `guardian-v7-param-discovery-${label}-`)
+  const { storage } = makeStore(t, `kovo-v7-param-discovery-${label}-`)
   const setup = await setupApprovedRun(storage, { seeds: [fx.origin], budgetRequests: 900 })
   const result = await withLocalLab(() => runPhase0Recon({
     storage,

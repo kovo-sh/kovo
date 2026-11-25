@@ -62,7 +62,7 @@ async function withUmask077Async<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 test('materialize sets explicit 0o755 dirs (including created ancestors) and 0o644 files under umask 0077', () => {
-  const scratch = mkdtempSync(join(tmpdir(), 'guardian-mat-umask-'))
+  const scratch = mkdtempSync(join(tmpdir(), 'kovo-mat-umask-'))
   try {
     withUmask077(() => {
       const outRoot = join(scratch, 'nested-out-root')
@@ -106,7 +106,7 @@ test('materialize sets explicit 0o755 dirs (including created ancestors) and 0o6
 })
 
 test('prepareReposMount stages 0o700/0o600 repos into container-readable 0o755/0o644 copy under umask 0077 while excluding secrets', () => {
-  const scratch = mkdtempSync(join(tmpdir(), 'guardian-repos-eacces-'))
+  const scratch = mkdtempSync(join(tmpdir(), 'kovo-repos-eacces-'))
   try {
     withUmask077(() => {
       // Simulate host umask 0077 + locked-down /repos/bench/<app> layout.
@@ -215,7 +215,7 @@ test('prepareReposMount stages 0o700/0o600 repos into container-readable 0o755/0
 })
 
 test('prepareReposMount binds directly without copying when tree is already 0o755/0o644 and clean, but stages if .git/config has tokens', () => {
-  const scratch = mkdtempSync(join(tmpdir(), 'guardian-repos-clean-'))
+  const scratch = mkdtempSync(join(tmpdir(), 'kovo-repos-clean-'))
   try {
     const reposDir = join(scratch, 'clean-repos')
     const appDir = join(reposDir, 'acme', 'demo')
@@ -259,7 +259,7 @@ test('prepareReposMount binds directly without copying when tree is already 0o75
 })
 
 test('LinuxWorkerBackend run() and verifyStaticAst() mount staged readable /repos and clean up afterwards', async () => {
-  const scratch = mkdtempSync(join(tmpdir(), 'guardian-repos-backend-'))
+  const scratch = mkdtempSync(join(tmpdir(), 'kovo-repos-backend-'))
   try {
     await withUmask077Async(async () => {
       const reposDir = join(scratch, 'restricted-repos')

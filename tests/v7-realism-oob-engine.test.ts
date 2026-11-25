@@ -65,7 +65,7 @@ afterEach(() => {
 })
 
 function localBroker(): CanaryBroker {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-realism-oob-engine-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-realism-oob-engine-'))
   tempDirs.push(dir)
   const broker = new CanaryBroker({ oobDirectory: dir })
   brokers.push(broker)
@@ -372,7 +372,7 @@ test('realism oob: the engine names the injected canary on the carrying request 
   // A self-trigger write is the trigger: control + probe sends only, no redundant sibling calls.
   const lifecycleSends = sent.filter(req => req.pathAndQuery === '/svc/jobs/verify'
     && typeof req.body === 'string'
-    && (req.body.includes('guardian-control.invalid') || [...tokens].some(token => req.body!.includes(token))))
+    && (req.body.includes('kovo-control.invalid') || [...tokens].some(token => req.body!.includes(token))))
   assert.equal(lifecycleSends.length, 2 * carrying.length,
     'one control and one canary send per self-triggering hypothesis, no redundant sibling call')
   assert.ok(!sent.some(req => req.pathAndQuery.includes('{{id}}')))

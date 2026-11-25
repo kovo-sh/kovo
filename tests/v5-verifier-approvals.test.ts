@@ -1,4 +1,4 @@
-process.env.GUARDIAN_ALLOW_LOCAL_LAB ??= '1'
+process.env.KOVO_ALLOW_LOCAL_LAB ??= '1'
 /**
  * v5.1 — Tier-3 approval consumption contract for the ReplayVerifier.
  *
@@ -13,7 +13,7 @@ import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { test } from 'node:test'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { authorizeStateChange, StateChangeApprovalLedger } from '../src/server/approval-judge.ts'
 import type { StateChangeApprovalContext } from '../src/server/approval-judge.ts'

@@ -1,4 +1,4 @@
-process.env.GUARDIAN_ALLOW_LOCAL_LAB ??= '1'
+process.env.KOVO_ALLOW_LOCAL_LAB ??= '1'
 /**
  * Architecture Wave 2 Proposal B2 (`Execution` Decomposition & Dead Code Retirement) Tests.
  *
@@ -39,7 +39,7 @@ import { setupApprovedRun, stopExecution } from './v4-tier-helpers.ts'
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 
 function makeStore(t: { after: (fn: () => void) => void }): Store {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-arch-b2-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-arch-b2-'))
   const storage = new Store(dir)
   t.after(() => {
     try { storage.close() } catch { /* already closed */ }

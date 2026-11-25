@@ -2,7 +2,7 @@
  * v8 Queue #27 — SDK Ergonomics & Documented Recipe Tests (Defect #3 from #391).
  *
  * Defensive QA: loopback fixture + real `VerifyRpcServer` exercising the TypeScript
- * `guardian_verify` SDK across positional, single-object, snake_case, camelCase, and flat-arg
+ * `kovo_verify` SDK across positional, single-object, snake_case, camelCase, and flat-arg
  * calling conventions, result aliases (`.handle`/`.token`/
  * `.derivedHandle`/`.cap_id`), and documented recipe accuracy in `multihop-chains.md` and
  * `agent-prompts.ts`.
@@ -17,10 +17,10 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import {
-  GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-  GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN,
-  GUARDIAN_VERIFY_TOOL_DESCRIPTION,
-  guardianVerifyHelperGuidance,
+  KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+  KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN,
+  KOVO_VERIFY_TOOL_DESCRIPTION,
+  kovoVerifyHelperGuidance,
 } from '../src/server/agent-prompts.ts'
 import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'
@@ -33,12 +33,12 @@ import {
   VerifyRpcServer,
 } from '../src/server/verify-rpc.ts'
 import { scanSourceTreeForContamination } from '../scripts/check-v8-contamination.ts'
-import { VerifyContext } from '../worker/guardian_verify/guardian_verify.ts'
+import { VerifyContext } from '../worker/kovo_verify/kovo_verify.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const SDK_DIR = join(REPO_ROOT, 'worker', 'guardian_verify')
+const SDK_DIR = join(REPO_ROOT, 'worker', 'kovo_verify')
 
 const MEMBER_B_SECRET = 'member-b-ergo-secret-01'
 const SIGNING_KEY = 'ergo-hmac-jwt-signing-secret-key-01'
@@ -261,18 +261,18 @@ test('TS SDK hmac_sign, jwt_sign, and await_async support options objects, posit
 test('Documented recipes use valid DERIVED_SECRET_KINDS, stay within LOC/byte budgets, and have zero contamination', () => {
   const playbook = readFileSync(join(REPO_ROOT, 'src/skills/multihop-chains.md'), 'utf8')
   const prompts = readFileSync(join(REPO_ROOT, 'src/server/agent-prompts.ts'), 'utf8')
-  const tsSdk = readFileSync(join(SDK_DIR, 'guardian_verify.ts'), 'utf8')
+  const tsSdk = readFileSync(join(SDK_DIR, 'kovo_verify.ts'), 'utf8')
 
   const loc = (text: string) => text.trimEnd().split('\n').length
-  assert.ok(loc(tsSdk) <= 900, `guardian_verify.ts is ${loc(tsSdk)} LOC (> 900)`)
+  assert.ok(loc(tsSdk) <= 900, `kovo_verify.ts is ${loc(tsSdk)} LOC (> 900)`)
 
-  const guidance = guardianVerifyHelperGuidance()
+  const guidance = kovoVerifyHelperGuidance()
   assert.ok(
-    Buffer.byteLength(guidance, 'utf8') <= GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-    `guardianVerifyHelperGuidance() is ${Buffer.byteLength(guidance, 'utf8')} B (> ${GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES} B)`,
+    Buffer.byteLength(guidance, 'utf8') <= KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+    `kovoVerifyHelperGuidance() is ${Buffer.byteLength(guidance, 'utf8')} B (> ${KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES} B)`,
   )
-  assert.ok(GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.split('\n').length <= 12)
-  assert.ok(GUARDIAN_VERIFY_TOOL_DESCRIPTION.includes('kind: "hmac_key"'))
+  assert.ok(KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.split('\n').length <= 12)
+  assert.ok(KOVO_VERIFY_TOOL_DESCRIPTION.includes('kind: "hmac_key"'))
 
   // Line ~104 fix: invalid 'signing_material' must not appear; valid 'hmac_key' must be used in the 4-hop recipe
   assert.equal(playbook.includes('signing_material'), false, 'multihop-chains.md must not reference invalid kind signing_material')
