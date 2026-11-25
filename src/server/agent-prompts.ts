@@ -975,7 +975,7 @@ export function guardianVerifyHelperGuidance(): string {
     'Typed helpers (prefer the helper for the class; each records the transcript roles the oracle checks):',
     ...GUARDIAN_VERIFY_HELPERS.map(helper => `- ${helper.name} — ${helper.use}`),
     `Class hints: ${GUARDIAN_VERIFY_CLASS_HINTS.map(([klass, helper]) => `${klass} -> ${helper}`).join('; ')}.`,
-    'Multi-hop chains (2-6 hops): ALWAYS seal intermediate artifacts via ctx.seal_capability, inject host-side via ctx.http_send({ ..., capability }), derive crypto via ctx.hmac_sign / ctx.jwt_sign, poll async workers via ctx.await_async, and confirm the full DAG via ctx.prove_composite (Mode A: replayMode="fresh_clean_replay"). Never stop at a single-hop disclosure/handle when downstream pivots are reachable. Run ALL probe-arm hops as ONE low-priv/cross-tenant persona (or anonymous/derived cred) — never pre-seeded owner/admin or target-tenant personas on the attack arm.',
+    'Multi-hop chains (2-6 hops): Run ALL stages in ONE script — NEVER stop at a single-hop disclosure/handle, job creation, or cache prime; seal via ctx.seal_capability, inject via ctx.http_send({ ..., capability }), continue through ctx.hmac_sign / ctx.jwt_sign / ctx.await_async / ctx.prove_race_burst to final readback/state change, and confirm via ctx.prove_composite (Mode A: replayMode="fresh_clean_replay"). Run clean denied control BEFORE Stage 1. Run ALL probe-arm hops as ONE low-priv/cross-tenant persona (or anonymous/derived cred) — never pre-seeded owner/admin or target-tenant personas on the attack arm.',
     GUARDIAN_VERIFY_SPEC_SHAPE,
     GUARDIAN_VERIFY_REPAIR_INSTRUCTION,
   ].join('\n')
@@ -1106,6 +1106,9 @@ export const GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN = [
   '- Terminal impact: ALWAYS run a clean pre-chain denied `control` (`role: "control"`, HTTP `401`/`403`/`404`) on the exact terminal route (`preChainControlExchangeIds`) AND fetch actual foreign-tenant business records or persisted state-mutation readback (`postChainReadbackExchangeIds`) — NEVER stop at a job handle, export stub, or signed URL.',
   '- No premature single-hop filing: NEVER stop at or file an intermediate single-hop info-disclosure, handle, or directory leak when downstream cross-service/auth/state-machine pivots are reachable — seal it via `ctx.seal_capability(...)` and continue through Hops 2-4 to `ctx.prove_composite(...)`.',
   '- Single-origin probe arm (no cross-tenant collusion): ALL probe-arm hops MUST run as a single starting low-privilege persona (or anonymous / freshly derived credential); NEVER use a target-tenant persona on the probe arm to mint handles for your starting persona (use target-tenant personas only for baseline/readback checks).',
+  '- Never stop at intermediate artifacts: job creation, cache priming, or link/token generation is ONLY an intermediate stage — continue in the SAME verification script via `ctx.await_async`, `ctx.hmac_sign`/`ctx.jwt_sign`, or `ctx.prove_race_burst` to the final foreign-tenant readback or persisted state change.',
+  '- White-box single-script consolidation: once source routes across services are known from code-audit facts, write ONE cohesive multi-stage `guardian_verify` script covering Stage 1 -> Stage 2 -> Stage 3 -> Stage 4 -> `ctx.prove_composite(...)` instead of spending 10+ turns probing isolated stages one by one.',
+  '- `state_transition_binding` clean-control order: ALWAYS run the baseline denied control (`role: "control"`) on the target route BEFORE Stage 1 mutates state (or on a fresh untouched sibling entity with matching `entityId`) and pass it in `ablationExchangeIds` so `cleanSession=true` passes on the first try.',
 ].join('\n')
 
 const GUARDIAN_VERIFY_TOOL_DESCRIPTION_BASE =
@@ -2755,7 +2758,7 @@ export function workerInvestigationPrompt(input: {
     || skill.startsWith('chain:')
     || skill.startsWith('chain_continuation:')
     || skill.startsWith('checkpoint_cap:'),
-  ) || /\[chain_hops=|\bmulti[- ]?hop\b|\bHop\s+1\b[\s\S]{0,120}(?:->|→)\s*Hop\s+2\b/i.test(
+  ) || /\[chain_hops=|\bmulti[- ]?hop\b|\b(?:Hop|Stage)\s+1\b[\s\S]{0,120}(?:->|→)\s*(?:Hop|Stage)\s+2\b/i.test(
     `${input.step.title} ${input.step.hypothesis}`,
   )
   return JSON.stringify({
@@ -2764,9 +2767,11 @@ export function workerInvestigationPrompt(input: {
     ...(isMultiHopStep
       ? {
           multiHopDirectives: {
-            noPrematureSingleHop: 'Never stop at an intermediate single-hop info-disclosure, handle, or directory leak when downstream cross-service/auth/state-machine pivots are reachable — seal it via ctx.seal_capability(...) and continue through Hops 2-4 to ctx.prove_composite(...).',
+            noPrematureSingleHop: 'Never stop at an intermediate single-hop info-disclosure, handle, directory leak, job creation, cache prime, or link/token generation when downstream cross-service/auth/state-machine pivots are reachable — seal it via ctx.seal_capability(...) and continue in the SAME verification script through Stages 2-4 to final readback or persisted state change and ctx.prove_composite(...).',
             singleOriginProbeArm: 'All probe-arm hops must run as a single starting low-privilege persona (or anonymous / freshly derived credential); never use a target-tenant persona on the probe arm to mint handles for your starting persona (use target-tenant personas only for baseline/readback checks).',
-            cryptoAndAsyncHelpers: 'Invoke ctx.hmac_sign / ctx.jwt_sign whenever crossing signing or token-forgery boundaries and ctx.await_async whenever waiting on background-job/async-worker convergence, then confirm the full DAG via ctx.prove_composite({ ..., replayMode: "fresh_clean_replay" }).',
+            cryptoAndAsyncHelpers: 'Invoke ctx.hmac_sign / ctx.jwt_sign whenever crossing signing or token-forgery boundaries, ctx.await_async whenever polling async/background-job convergence, and ctx.prove_race_burst for concurrent settlement/conservation boundaries, then confirm the full DAG via ctx.prove_composite({ ..., replayMode: "fresh_clean_replay" }).',
+            singleScriptConsolidation: 'Once source routes across services are known from code-audit facts, write ONE cohesive multi-stage guardian_verify script covering Stage 1 -> Stage 2 -> Stage 3 -> Stage 4 -> ctx.prove_composite(...) instead of running isolated single-stage checks across 10+ turns.',
+            stateTransitionControlOrder: 'For state_transition_binding edges, run the baseline denied control (role: "control") BEFORE Stage 1 mutates shared/cache state (or on a fresh untouched sibling entity with matching entityId) and cite it in ablationExchangeIds so clean-session verification passes on the first try.',
           },
         }
       : {}),
