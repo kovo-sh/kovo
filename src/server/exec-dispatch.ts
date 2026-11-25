@@ -1325,10 +1325,53 @@ export function detLeadEvidenceGate(data: Record<string, unknown> | null | undef
 
 export type DispatchLane = 'lead' | 'route' | 'workflow' | 'business_logic' | 'race' | 'chain' | 'other'
 
-/** Non-lead lanes in round-robin order. Leads are seeded first, capped, then these cycle. */
+/** Non-lead lanes in round-robin order. Multi-hop chains lead so they never starve behind route sweeps. */
 export const DISPATCH_LANE_ORDER: readonly Exclude<DispatchLane, 'lead'>[] = [
-  'route', 'workflow', 'business_logic', 'race', 'chain', 'other',
+  'chain', 'route', 'workflow', 'business_logic', 'race', 'other',
 ]
+
+/** Minimum Phase-B worker concurrency when >= 3 distinct primary steps are ready and budget/RPS allow. */
+export const PHASE_B_MIN_CONCURRENCY_FLOOR = 3
+
+export interface EffectivePhaseBConcurrencyInput {
+  configuredConcurrency: number
+  /** Distinct primary (`trialIndex <= 0`) ready steps waiting in the Phase-B queue. */
+  readyPrimarySteps: number
+  /** Ready multi-hop chain steps (`isMultiHopChainStep`) waiting in the Phase-B queue. */
+  readyChainSteps?: number
+  /** Remaining USD budget for the run (omitted = unconstrained). */
+  budgetUsdRemaining?: number
+  /** Remaining request budget for the run (omitted = unconstrained). */
+  budgetRequestsRemaining?: number
+  /** Configured per-origin RPS limit (omitted = unconstrained). */
+  maxRpsPerOrigin?: number
+  /** Optional concurrency ceiling (defaults to `maxWorkerConcurrency`). */
+  maxConcurrency?: number
+}
+
+/**
+ * Resolve effective Phase-B specialist concurrency so a low caller default (e.g., cell concurrency
+ * `1` passed as `workerConcurrency`) cannot starve a queued multi-hop frontier behind a single
+ * worker when >= 3 distinct primary steps are ready and budget/RPS headroom allow parallel slots.
+ */
+export function resolveEffectivePhaseBConcurrency(input: EffectivePhaseBConcurrencyInput): number {
+  const ceiling = Math.max(1, Math.min(maxWorkerConcurrency, Math.floor(input.maxConcurrency ?? maxWorkerConcurrency)))
+  const base = Math.max(1, Math.min(ceiling, Math.floor(input.configuredConcurrency || defaultWorkerConcurrency)))
+  const readyPrimary = Math.max(0, Math.floor(input.readyPrimarySteps))
+  const readyChains = Math.max(0, Math.floor(input.readyChainSteps ?? 0))
+  const usdOk = input.budgetUsdRemaining === undefined || input.budgetUsdRemaining > 0.05
+  const reqOk = input.budgetRequestsRemaining === undefined || input.budgetRequestsRemaining >= PHASE_B_MIN_CONCURRENCY_FLOOR * 10
+  const rpsOk = input.maxRpsPerOrigin === undefined || input.maxRpsPerOrigin >= PHASE_B_MIN_CONCURRENCY_FLOOR
+  if (usdOk && reqOk && rpsOk) {
+    if (readyPrimary >= PHASE_B_MIN_CONCURRENCY_FLOOR) {
+      return Math.min(ceiling, Math.max(base, PHASE_B_MIN_CONCURRENCY_FLOOR))
+    }
+    if (readyChains >= 1 && readyPrimary >= 2 && base < 2) {
+      return Math.min(ceiling, 2)
+    }
+  }
+  return base
+}
 
 export interface DispatchLaneStep {
   id: string
@@ -1367,6 +1410,10 @@ export interface RoundRobinDispatchOptions {
   whiteBoxStepIds?: ReadonlySet<string>
   /** Allow leads past the cap only when no non-lead ready step remains (default true). */
   allowLeadOverflow?: boolean
+  /** Dedicated frontier slots reserved for ready multi-hop chain steps before generic lead/route fill. */
+  chainReservedSlots?: number
+  /** Multi-hop chain assignments already in flight; subtracted from the chain reservation. */
+  activeChainCount?: number
 }
 
 export interface RoundRobinDispatchPlan<T extends DispatchLaneStep> {
@@ -1432,6 +1479,18 @@ export function isDetLeadDispatchStep(step: Pick<DispatchLaneStep, 'title' | 'hy
     /\blead upgrade\b/i.test(text)
 }
 
+/** Identify genuine multi-hop / depth >= 2 chain steps eligible for dedicated frontier slot reservation. */
+export function isMultiHopChainStep(
+  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'category' | 'skills' | 'dependsOnStepIds'>,
+): boolean {
+  if ((step.dependsOnStepIds?.length ?? 0) > 0) return true
+  if ((step.skills ?? []).some(skill => skill === 'multihop-chains' || skill === 'chain-primitives' || skill.startsWith('chain:'))) {
+    return true
+  }
+  const text = `${step.title} ${step.hypothesis ?? ''} ${step.category ?? ''}`
+  return /\[chain_hops=|\bhopCheckpoint\b|\bmulti[- ]?hop\b|\bchain_step\b/i.test(text)
+}
+
 /** Map a step onto the round-robin lane it competes in. */
 export function classifyDispatchLane(
   step: DispatchLaneStep,
@@ -1439,7 +1498,7 @@ export function classifyDispatchLane(
 ): DispatchLane {
   if (isDetLeadDispatchStep(step)) return 'lead'
   const text = `${step.title} ${step.hypothesis ?? ''} ${step.category ?? ''} ${(step.skills ?? []).join(' ')}`.toLowerCase()
-  if ((step.dependsOnStepIds?.length ?? 0) > 0 || /\bchain\b|second[\s_-]?order|cross[\s_-]?host|escalat/.test(text)) return 'chain'
+  if (isMultiHopChainStep(step) || /\bchain\b|second[\s_-]?order|cross[\s_-]?host|cross[\s_-]?origin|escalat/.test(text)) return 'chain'
   if (/\brace\b|concurren|toctou|double[\s_-]?spend|simultaneous|parallel/.test(text)) return 'race'
   if (/\bworkflow\b|state[\s_-]?machine|transition|invite|onboard|checkout[\s_-]?flow|approval[\s_-]?bypass/.test(text)) return 'workflow'
   if (/\bbusiness\b|invariant|quantity|price|seat|credit|balance|discount|coupon|refund|quota|entitlement/.test(text)) return 'business_logic'
@@ -1549,6 +1608,30 @@ export function planRoundRobinDispatch<T extends DispatchLaneStep>(
       tierASelected += 1
     }
   }
+  // Dedicated frontier slots for ready multi-hop / depth >= 2 chain steps so synthesized chains
+  // never starve behind generic det_lead or single-route BOLA sweeps.
+  const chainQueue = lanes.get('chain')!
+  const readyMultiHopCount = chainQueue.filter(step => isMultiHopChainStep(step)).length
+  const nonChainPrimaryCount = leadQueue.length +
+    DISPATCH_LANE_ORDER.filter(lane => lane !== 'chain').reduce((sum, lane) => sum + lanes.get(lane)!.length, 0)
+  const defaultChainReserve = readyMultiHopCount > 0
+    ? (capacity >= 3 ? Math.max(1, Math.ceil(capacity / 2)) : 1)
+    : 0
+  const rawChainReserve = options.chainReservedSlots !== undefined
+    ? Math.max(0, Math.floor(options.chainReservedSlots))
+    : defaultChainReserve
+  const maxChainReserve = nonChainPrimaryCount > 0 && capacity >= 2
+    ? Math.min(rawChainReserve, capacity - 1)
+    : rawChainReserve
+  const chainReserveRemaining = Math.max(0, maxChainReserve - Math.max(0, Math.floor(options.activeChainCount ?? 0)))
+  let chainReservedSelected = 0
+  for (let idx = 0; idx < chainQueue.length && ordered.length < capacity && chainReservedSelected < chainReserveRemaining;) {
+    if (!isMultiHopChainStep(chainQueue[idx]!)) { idx += 1; continue }
+    ordered.push(chainQueue.splice(idx, 1)[0]!)
+    selectedByLane.chain += 1
+    chainReservedSelected += 1
+  }
+
   while (ordered.length < capacity && leadQueue.length > 0 && selectedByLane.lead - tierASelected < leadCap) {
     ordered.push(leadQueue.shift()!)
     selectedByLane.lead += 1
@@ -2190,6 +2273,8 @@ export interface AssignmentThroughputMetrics {
   containerReuseHitRate: number
   /** Warm pools retired because the run/tenant/credential-generation policy changed. */
   warmPoolPolicyRotations: number
+  /** Clean bounded worker rotations enforced when an assignment hit its hard `wallClockMs` deadline. */
+  wallClockRotations?: number
   /** Aggregated per-route proof-obligation stats forwarded from specialist sessions. */
   proofObligation?: {
     probedRoutes: number
