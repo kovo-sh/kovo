@@ -1,5 +1,5 @@
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { listModels, removeModelProfile, saveModel, testModel, toggleModelProfile } from '../actions.ts'
 import { FormError, Status, timeText, useAction } from '../components/common.tsx'
 import { Button } from '../components/ui/button.tsx'
@@ -257,5 +257,225 @@ function ModelPage() {
         </Button>
       </div>
     </form>
+
+    <DevicesSessionSection />
   </main>
+}
+
+interface PairingLinkResponse {
+  url: string
+  expiresAt: string
+  ttlSeconds: number
+}
+
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return false
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function readAuthError(response: Response, fallback: string): Promise<string> {
+  if (response.status === 401) return 'Local session expired. Open Guardian using the startup login URL.'
+  if (response.status === 404) return 'Local session controls are only available when running the Guardian local server.'
+  try {
+    const contentType = response.headers.get('content-type') ?? ''
+    if (contentType.includes('application/json')) {
+      const body = await response.json() as { error?: string }
+      if (body.error) return body.error
+    } else {
+      const text = (await response.text()).trim()
+      if (text) return text
+    }
+  } catch {
+    // Fall back to default message
+  }
+  return fallback
+}
+
+function DevicesSessionSection() {
+  const [pairingPending, setPairingPending] = useState(false)
+  const [pairingLink, setPairingLink] = useState<PairingLinkResponse | null>(null)
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'fallback'>('idle')
+  const [rotatePending, setRotatePending] = useState(false)
+  const [confirmRotate, setConfirmRotate] = useState(false)
+  const [statusMessage, setStatusMessage] = useState('')
+  const [errorMessage, setErrorMessage] = useState('')
+  const urlInputRef = useRef<HTMLInputElement | null>(null)
+
+  async function handleMintPairingLink() {
+    if (pairingPending) return
+    setPairingPending(true)
+    setErrorMessage('')
+    setStatusMessage('')
+    try {
+      const response = await fetch('/_guardian/auth/pairing-link', {
+        method: 'POST',
+        credentials: 'same-origin',
+      })
+      if (!response.ok) {
+        throw new Error(await readAuthError(response, 'Could not generate a one-time login link.'))
+      }
+      const data = await response.json() as PairingLinkResponse
+      setPairingLink(data)
+      const copied = await copyTextToClipboard(data.url)
+      if (copied) {
+        setCopyState('copied')
+        setStatusMessage('One-time login link copied to clipboard.')
+      } else {
+        setCopyState('fallback')
+        setStatusMessage('Clipboard access was denied. Use the Copy button or copy the link below manually.')
+      }
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Could not generate a one-time login link.')
+    } finally {
+      setPairingPending(false)
+    }
+  }
+
+  async function handleCopyExisting() {
+    if (!pairingLink) return
+    setErrorMessage('')
+    const copied = await copyTextToClipboard(pairingLink.url)
+    if (copied) {
+      setCopyState('copied')
+      setStatusMessage('One-time login link copied to clipboard.')
+      return
+    }
+    urlInputRef.current?.focus()
+    urlInputRef.current?.select()
+    let execCopied = false
+    try {
+      execCopied = typeof document !== 'undefined' && document.execCommand('copy')
+    } catch {
+      execCopied = false
+    }
+    if (execCopied) {
+      setCopyState('copied')
+      setStatusMessage('One-time login link copied to clipboard.')
+    } else {
+      setCopyState('fallback')
+      setStatusMessage('Select the link above and press Ctrl+C / Cmd+C to copy.')
+    }
+  }
+
+  async function handleRotateSession() {
+    if (rotatePending) return
+    setRotatePending(true)
+    setErrorMessage('')
+    setStatusMessage('')
+    try {
+      const response = await fetch('/_guardian/auth/rotate-session', {
+        method: 'POST',
+        credentials: 'same-origin',
+      })
+      if (!response.ok) {
+        throw new Error(await readAuthError(response, 'Could not sign out other devices.'))
+      }
+      setConfirmRotate(false)
+      setPairingLink(null)
+      setCopyState('idle')
+      setStatusMessage('All other devices have been signed out and pending login links cleared. This browser stays signed in.')
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Could not sign out other devices.')
+    } finally {
+      setRotatePending(false)
+    }
+  }
+
+  return <section className="form-card stacked-section" aria-labelledby="devices-session-heading">
+    <div className="section-heading">
+      <div>
+        <p className="eyebrow">Multi-device local access</p>
+        <h2 id="devices-session-heading">Devices &amp; local session</h2>
+      </div>
+      <span className="badge">Owner session active</span>
+    </div>
+
+    <p className="muted">
+      Sign in another browser on this machine or via your configured HTTPS proxy without exposing your long-lived session file.
+      Single-use link expires in 5 minutes — never shares your permanent session cookie.
+    </p>
+
+    <div className="toolbar" style={{ flexWrap: 'wrap', gap: '10px' }}>
+      <Button type="button" variant="default" disabled={pairingPending || rotatePending} onClick={() => void handleMintPairingLink()}>
+        {pairingPending ? 'Generating link…' : 'Copy login link for another device'}
+      </Button>
+      {!confirmRotate && (
+        <Button
+          type="button"
+          variant="outline"
+          className="btn-danger"
+          disabled={rotatePending || pairingPending}
+          onClick={() => {
+            setErrorMessage('')
+            setStatusMessage('')
+            setConfirmRotate(true)
+          }}
+        >
+          Sign out other devices
+        </Button>
+      )}
+    </div>
+
+    {pairingLink && (
+      <div className="inline-personas-box">
+        <div className="section-heading">
+          <strong>One-time device login link</strong>
+          <span className="badge badge-attention">
+            Expires {timeText(Date.parse(pairingLink.expiresAt))}
+          </span>
+        </div>
+        <div className="curl-parse-row">
+          <Input
+            ref={urlInputRef}
+            readOnly
+            aria-label="One-time device login URL"
+            value={pairingLink.url}
+            onFocus={event => event.currentTarget.select()}
+          />
+          <Button type="button" variant="outline" onClick={() => void handleCopyExisting()}>
+            {copyState === 'copied' ? 'Copied' : 'Copy'}
+          </Button>
+        </div>
+        <p className="muted small-note">
+          Single-use link expires in 5 minutes — never shares your permanent session cookie.
+        </p>
+      </div>
+    )}
+
+    {confirmRotate && (
+      <div className="inline-personas-box" role="region" aria-label="Confirm sign out other devices">
+        <p>
+          <strong>Sign out all other devices?</strong> This rotates the local session token, immediately revokes every other browser,
+          and invalidates any unused login links. This browser remains signed in.
+        </p>
+        <div className="toolbar">
+          <Button
+            type="button"
+            variant="outline"
+            className="btn-danger"
+            disabled={rotatePending}
+            onClick={() => void handleRotateSession()}
+          >
+            {rotatePending ? 'Signing out…' : 'Confirm sign out'}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            disabled={rotatePending}
+            onClick={() => setConfirmRotate(false)}
+          >
+            Cancel
+          </Button>
+        </div>
+      </div>
+    )}
+
+    <FormError error={errorMessage} />
+    {statusMessage && <p role="status">{statusMessage}</p>}
+  </section>
 }
