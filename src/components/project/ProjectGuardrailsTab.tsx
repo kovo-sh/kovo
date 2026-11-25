@@ -228,10 +228,10 @@ export function ProjectGuardrailsTab({ data }: Props) {
             <Checkbox
               checked={labIastEnabled}
               disabled={!labAllowed || labAction.pending}
-              aria-label="Enable runtime telemetry (IAST)"
+              aria-label="Enable runtime telemetry"
               onCheckedChange={checked => setLabIastEnabled(Boolean(checked))}
             />
-            <span title="Redacted local-lab IAST sink and coverage side-channel">
+            <span title="Redacted local-lab runtime telemetry sink and coverage side-channel">
               Enable runtime telemetry (capture redacted code coverage and sink traces in the local lab)
             </span>
           </label>

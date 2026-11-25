@@ -123,36 +123,10 @@ code, pre, kbd, .mono {
 .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 small, .muted { color: var(--fg-3); }
 
-/* Shared button data-variant/size primitives (src/components/ui/button.tsx) */
-button[data-variant=default] {
-  background: var(--accent);
-  color: var(--accent-fg);
-  box-shadow: none;
-  font-weight: 500;
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-button[data-variant=default]:hover {
-  background: var(--accent);
-  filter: brightness(1.06);
-}
-button[data-variant=ghost] {
-  background: transparent;
-  box-shadow: none;
-  color: var(--fg-2);
-}
-button[data-variant=ghost]:hover,
-button[data-slot=dropdown-menu-trigger][data-popup-open] {
+/* Dropdown trigger open highlight — kept at (0,0,1) via :where() so Tailwind utilities win */
+button:where([data-slot=dropdown-menu-trigger][data-popup-open]) {
   background: var(--hover);
   color: var(--fg);
-}
-button[data-size=icon] {
-  display: inline-grid;
-  place-items: center;
-  flex: none;
-  width: 28px;
-  height: 28px;
-  padding: 0;
 }
 .sr-only {
   position: absolute;

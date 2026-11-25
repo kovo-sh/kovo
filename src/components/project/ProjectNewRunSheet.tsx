@@ -20,7 +20,7 @@ import { cn } from '../../lib/cn.ts'
 import { FormError, useAction } from '../common.tsx'
 import { parseCurlOrHeader } from '../curl-parser.ts'
 import { Icon } from '../run/icons.tsx'
-import { approvalPolicyMeta } from '../run-state.ts'
+import { approvalPolicyMeta, capabilityTierMeta } from '../run-state.ts'
 import { Badge } from '../ui/badge.tsx'
 import { Button } from '../ui/button.tsx'
 import { Checkbox } from '../ui/checkbox.tsx'
@@ -38,25 +38,16 @@ import type { PersonaTestState, ProjectLoaderData } from './types.ts'
 import { formatPersonaAuthBadge, LOGIN_URL_PLACEHOLDERS } from './types.ts'
 
 const SCAN_DEPTH_LABELS: Record<CapabilityTier, { short: string; option: string }> = {
-  0: { short: 'Offline Audit', option: 'Offline Audit — no live traffic (imported specs & files only)' },
-  1: { short: 'Safe Audit', option: 'Safe Audit — read-only surface map & passive checks' },
-  2: { short: 'Core Pentest', option: 'Core Pentest — authenticated multi-account checks' },
-  3: { short: 'Active Pentest', option: 'Active Pentest — approval-gated active verification' },
+  0: { short: capabilityTierMeta[0].name, option: `${capabilityTierMeta[0].name} — no live traffic (imported specs & files only)` },
+  1: { short: capabilityTierMeta[1].name, option: `${capabilityTierMeta[1].name} — read-only surface map & passive checks` },
+  2: { short: capabilityTierMeta[2].name, option: `${capabilityTierMeta[2].name} — authenticated multi-account checks` },
+  3: { short: capabilityTierMeta[3].name, option: `${capabilityTierMeta[3].name} — approval-gated active verification` },
 }
 
-const APPROVAL_POLICY_COPY: Record<ApprovalPolicy, { label: string; desc: string }> = {
-  auto_review: {
-    label: 'Smart Review',
-    desc: 'Auto-approves safe checks and asks before risky actions.',
-  },
-  strict: {
-    label: 'Ask Every Time',
-    desc: 'Pauses for your approval before every state-changing action.',
-  },
-  yolo: {
-    label: 'Autonomous',
-    desc: 'Runs in-scope active checks automatically with full audit logs.',
-  },
+const APPROVAL_POLICY_DESC: Record<ApprovalPolicy, string> = {
+  auto_review: 'Auto-approves safe checks and asks before risky actions.',
+  strict: 'Pauses for your approval before every state-changing action.',
+  yolo: 'Runs in-scope active checks automatically with full audit logs.',
 }
 
 interface Props {
@@ -94,7 +85,7 @@ const MODES: Record<ModeKey, ModePreset> = {
     concurrency: 4,
     maxTurns: 40,
     goal: 'Map public endpoints, API routes, and client bundles, and verify read-only exposures without state-changing requests.',
-    label: 'Safe Audit',
+    label: capabilityTierMeta[1].name,
     badge: 'Read-only',
     desc: 'Surface map & passive checks. Zero writes.',
     badgeVariant: 'neutral',
@@ -107,7 +98,7 @@ const MODES: Record<ModeKey, ModePreset> = {
     concurrency: 6,
     maxTurns: 150,
     goal: 'Check authentication, cross-account access controls, and business logic across approved hosts using paired test accounts.',
-    label: 'Core Pentest',
+    label: capabilityTierMeta[2].name,
     badge: 'Recommended',
     desc: 'Auth, access-control & logic checks with test accounts.',
     badgeVariant: 'accent',
@@ -120,7 +111,7 @@ const MODES: Record<ModeKey, ModePreset> = {
     concurrency: 4,
     maxTurns: 120,
     goal: 'Verify high-impact state changes, race conditions, and active proofs with human approval before risky requests.',
-    label: 'Active Pentest',
+    label: capabilityTierMeta[3].name,
     badge: 'Approval-gated',
     desc: 'Full active proofs with human approval.',
     badgeVariant: 'warn',
@@ -633,7 +624,6 @@ export function ProjectNewRunSheet({
                 <div className="grid grid-cols-1 gap-[7px] sm:grid-cols-3">
                   {approvalPolicies.map(policy => {
                     const meta = approvalPolicyMeta[policy]
-                    const copy = APPROVAL_POLICY_COPY[policy]
                     const active = approvalPolicy === policy
                     return (
                       <button
@@ -651,12 +641,12 @@ export function ProjectNewRunSheet({
                         title={meta.summary}
                       >
                         <span className="flex w-full items-center justify-between gap-1.5">
-                          <b className="text-[12.5px] font-semibold text-fg">{copy.label}</b>
+                          <b className="text-[12.5px] font-semibold text-fg">{meta.label}</b>
                           {policy === 'auto_review' && <Badge variant="ok">Default</Badge>}
                           {policy === 'strict' && <Badge variant="neutral" className="bg-sunk">Manual</Badge>}
                           {policy === 'yolo' && <Badge variant="warn">Auto</Badge>}
                         </span>
-                        <small className="text-[11.5px] font-normal leading-4 text-fg-subtle">{copy.desc}</small>
+                        <small className="text-[11.5px] font-normal leading-4 text-fg-subtle">{APPROVAL_POLICY_DESC[policy]}</small>
                       </button>
                     )
                   })}
