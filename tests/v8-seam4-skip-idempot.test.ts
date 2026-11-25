@@ -13,8 +13,8 @@
 //
 // Only public origins (grey-box briefing entry origins) are contacted. Request bodies for hop
 // inputs are harvested at runtime from the reference solvers' own transcripts, so this file holds no
-// probe literals. Reproductions listed in KNOWN_UNMERGED_GAPS (fix in flight, #502) or KNOWN_GAPS
-// (reported by this seam) are surfaced as diagnostics; anything else fails the suite.
+// probe literals. Every skip, sequential-idempotence, and settled-payout invariant is strictly
+// enforced with zero gap waivers.
 process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
@@ -269,44 +269,6 @@ interface VariantResult {
   personaRuns: number
   violations: Violation[]
 }
-
-interface KnownGap {
-  app: AppKey
-  route: string
-  repro: string
-  observedStatus: string
-}
-
-const KNOWN_GAPS: Record<string, KnownGap> = {
-  'paygrid-pg-c2-skip-hop1': {
-    app: 'paygrid',
-    route: 'POST {prefix}/invoices/:id/render -> GET {prefix}/jobs/:id(/trace) -> POST {prefix}/webhooks/settlement',
-    repro: 'Fresh vulnerable PayGrid lab: skip Hop 1 (PATCH /invoice-templates/:id); as member_a call POST /invoices/:id/render, poll GET /jobs/:id (already leaks webhookSigningSalt in job.trace) + GET /jobs/:id/trace, then sign POST /webhooks/settlement -> 200 accepted and credits org_a ledger (0 oracle terminals). Root cause: paygrid/src/service-worker.ts processJob() invokes vault.internal /internal/render-hook regardless of template.rawStored.',
-    observedStatus: 'jobs=200 (salt leaked), trace=200 (salt leaked), webhooks/settlement=200',
-  },
-  'nexusiam-nx-c3-skip-hop3': {
-    app: 'nexusiam',
-    route: 'GET {prefix}/docs/:id/content',
-    repro: 'Fresh vulnerable NexusIAM lab: execute NX-C3 s1 for the delegation key, omit s2 and/or s3, use the knowable privateDocId, then call GET /docs/:id/content with delegation headers as member_b, viewer_a, or member_a. The content handler does not require the listing or doc-open hops.',
-    observedStatus: 'docs/:id/content=200 (canary leaked)',
-  },
-  'paygrid-third-pass-payout-capacity': {
-    app: 'paygrid',
-    route: 'GET {prefix}/payouts -> POST {prefix}/payouts/:id/approve',
-    repro: 'Single vulnerable PayGrid lab: run PG-C1..C4 three times sequentially; domain-variant.ts only seeds 2 draft payoutIds, so Pass 3 finds 0 draft payouts and PG-C1 returns null.',
-    observedStatus: 'pass 3 receipt=null, terminals=2->2, distinct=2',
-  },
-  'paygrid-settled-payout-reapproval': {
-    app: 'paygrid',
-    route: 'POST {prefix}/payouts/:id/approve',
-    repro: 'Fresh vulnerable PayGrid lab: complete PG-C1 on a draft payout, retain its settled entityId, resolve a fresh finance session, then PATCH /payouts/:id/rebind and POST /payouts/:id/approve on that same entity. Rebind is rejected, but approval lacks a settled-status guard.',
-    observedStatus: 'rebind=409, approve(fresh)=200, terminals=1->1',
-  },
-}
-const KNOWN_UNMERGED_GAPS = {
-  nxC4MissingPoll: 'NX-C4 s2-ran/s3-skipped export result reachability (#502)',
-  sfC1Rotation: 'SF-C1 pass 2/3 signing-key rotation (#502)',
-} as const
 
 function required<T>(value: T | undefined, label: string): T {
   if (value === undefined) throw new Error(`missing ${label}`)
@@ -1009,10 +971,9 @@ const CHAIN_DEFS: ChainDef[] = [
       const orderId = state.artifacts.orderId ?? fake(state, 'order')
       const request = harvested(state, 'pg-c4-settle')
       request.token = token
-      return await Promise.all([
-        state.ctx.http('api', `${state.plan.routePrefix}/orders/${orderId}/settle-race`, request),
-        state.ctx.http('api', `${state.plan.routePrefix}/orders/${orderId}/settle-race`, request),
-      ])
+      return await Promise.all(
+        Array.from({ length: 4 }, () => state.ctx.http('api', `${state.plan.routePrefix}/orders/${orderId}/settle-race`, request)),
+      )
     },
   },
   {
@@ -1166,20 +1127,6 @@ function scanLeaks(state: RunState, records: CallRecord[], variant: string): Vio
   return violations
 }
 
-function isKnownNxC4Gap(chain: string, executed: number[]): boolean {
-  return chain === 'NX-C4' && executed.includes(1) && !executed.includes(2)
-}
-
-function knownPartAGapKey(chain: string, executed: number[]): keyof typeof KNOWN_GAPS | null {
-  if (chain === 'PG-C2' && !executed.includes(0) && executed.includes(1) && executed.includes(2)) {
-    return 'paygrid-pg-c2-skip-hop1'
-  }
-  if (chain === 'NX-C3' && executed.includes(0) && (!executed.includes(1) || !executed.includes(2))) {
-    return 'nexusiam-nx-c3-skip-hop3'
-  }
-  return null
-}
-
 function terminalRoute(state: RunState, chain: ChainDef): string {
   const spec = required(BLUEPRINTS[state.app].find((item) => item.id === chain.id), `${chain.id} blueprint`)
   const relayedOnApi = chain.id === 'PG-C2' || chain.id === 'SF-C3' || chain.id === 'NX-C4'
@@ -1249,14 +1196,22 @@ async function runControl(chain: ChainDef, requests: Requests): Promise<Violatio
   const log: CallRecord[] = []
   try {
     const state = makeState(chain.app, chain.id, publicContext(chain.app, lab, log), requests)
-    for (const step of chain.steps) await step(state)
-    const label = variantLabel(chain, chain.steps.map((_, index) => index), chain.attacker)
-    const responses = await chain.terminal(state, chain.attacker)
+    const maxAttempts = chain.id === 'PG-C4' ? 3 : 1
+    let responses: Resp[] = []
+    let completed = false
+    let any2xx = false
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      for (const step of chain.steps) await step(state)
+      responses = await chain.terminal(state, chain.attacker)
+      completed = lab.oracle.evaluate(chain.id).completed
+      any2xx = responses.some((response) => response.status >= 200 && response.status < 300)
+      if (completed || !any2xx) break
+    }
     const violations: Violation[] = []
-    if (!lab.oracle.evaluate(chain.id).completed) {
+    if (!completed) {
       violations.push({ chain: chain.id, variant: 'full control', kind: 'control_incomplete', route: terminalRoute(state, chain), status: 'incomplete' })
     }
-    if (!responses.some((response) => response.status >= 200 && response.status < 300)) {
+    if (!any2xx) {
       violations.push({
         chain: chain.id, variant: 'full control', kind: 'control_terminal_not_2xx', route: terminalRoute(state, chain),
         status: responses.map((response) => response.status).join(','),
@@ -1280,7 +1235,7 @@ test('Part A: strict-prefix and single-omission controls across all 12 chains', 
     ...variantsFor(chain).map((executed) => ({ kind: 'variant' as const, chain, executed })),
     { kind: 'control' as const, chain },
   ])
-  const results = await pool(work, 16, async (item) => {
+  const results = await pool(work, 8, async (item) => {
     const requests = required(harvestedByApp.get(item.chain.app), `${item.chain.app} harvested requests`)
     return item.kind === 'variant'
       ? { kind: 'variant' as const, result: await runVariant(item.chain, item.executed, requests) }
@@ -1294,17 +1249,7 @@ test('Part A: strict-prefix and single-omission controls across all 12 chains', 
       continue
     }
     for (const violation of result.result.violations) {
-      const line = violationLine(violation)
-      if (isKnownNxC4Gap(violation.chain, result.result.executed)) {
-        t.diagnostic(`${KNOWN_UNMERGED_GAPS.nxC4MissingPoll}: ${line}`)
-      } else {
-        const knownKey = knownPartAGapKey(violation.chain, result.result.executed)
-        if (knownKey) {
-          t.diagnostic(`KNOWN_GAPS ${knownKey}: ${line}`)
-        } else {
-          unexpected.push(line)
-        }
-      }
+      unexpected.push(violationLine(violation))
     }
   }
   const summary = apps.map((app) => {
@@ -1353,14 +1298,7 @@ for (const app of ['paygrid', 'shipforge', 'nexusiam'] as const) {
             }
           }
           for (const violation of violations) {
-            const line = violationLine(violation)
-            if (app === 'shipforge' && chainId === 'SF-C1' && pass > 1) {
-              t.diagnostic(`${KNOWN_UNMERGED_GAPS.sfC1Rotation}: ${line}`)
-            } else if (app === 'paygrid' && chainId === 'PG-C1' && pass === 3 && afterEvents.length <= before) {
-              t.diagnostic(`KNOWN_GAPS paygrid-third-pass-payout-capacity: ${line}`)
-            } else {
-              unexpected.push(line)
-            }
+            unexpected.push(violationLine(violation))
           }
         }
       }
@@ -1373,11 +1311,7 @@ for (const app of ['paygrid', 'shipforge', 'nexusiam'] as const) {
             chain: 'PG-C1', variant: 'passes 1-3 PG-C1 sequential', kind: 'payout_entity_not_distinct',
             route, status: `distinct=${new Set(ids).size}`,
           }
-          if (payoutIdsByPass[2]?.length === 0 && new Set(ids).size === 2) {
-            t.diagnostic(`KNOWN_GAPS paygrid-third-pass-payout-capacity: ${violationLine(violation)}`)
-          } else {
-            unexpected.push(violationLine(violation))
-          }
+          unexpected.push(violationLine(violation))
         }
       }
       assert.equal(unexpected.length, 0, `unexpected sequential-idempotence violations:\n${[...new Set(unexpected)].join('\n')}`)
@@ -1420,16 +1354,8 @@ test('PG-C1: a settled payout cannot be rebound and re-approved with a fresh fin
     if (after > before) {
       violations.push({ chain: 'PG-C1', variant: 'settled payout rebind+approve', kind: 'settled_payout_terminal', route: `${route}/approve`, status: `${before}->${after}` })
     }
-    if (violations.length > 0) {
-      const lines = violations.map(violationLine)
-      if (rebound.status === 409 && approved.status === 200 && after === before) {
-        for (const line of lines) t.diagnostic(`KNOWN_GAPS paygrid-settled-payout-reapproval: ${line}`)
-      } else {
-        assert.fail(`unexpected settled-payout behavior:\n${lines.join('\n')}`)
-      }
-    } else {
-      t.diagnostic(`PG-C1 settled payout rejected: rebind=${rebound.status}, approve=${approved.status}, terminals=${before}->${after}`)
-    }
+    assert.equal(violations.length, 0, `unexpected settled-payout behavior:\n${violations.map(violationLine).join('\n')}`)
+    t.diagnostic(`PG-C1 settled payout rejected: rebind=${rebound.status}, approve=${approved.status}, terminals=${before}->${after}`)
   } finally {
     await lab.stop()
   }

@@ -150,22 +150,6 @@ const APPS: AppAdapter[] = [
   },
 ]
 
-// Known benchmark-app gaps found by this harness (documented in the report, owned outside this
-// file's lease). Entries are exact; anything new fails the suite.
-const KNOWN_GAPS = {
-  // SF-C1 h4 `api.secretsBatch` with mutate rotates the victim secret's stored value
-  // (shipforge/src/service-api.ts ~L506) while `api.productionRelease` keeps verifying against the
-  // original plan signing key (~L629): only the first pass per lab instance can release, so a
-  // concurrent worker / dual replay of SF-C1 on the same instance gets 403.
-  singleShotChains: new Set<string>(['SF-C1']),
-  // nexusiam `api.exportResult` relays `/jobs/:id/result` to docs-worker with session-only auth
-  // (nexusiam/src/service-api.ts ~L444); docs-worker serves the ready seeded export (canary)
-  // with no tenant / persona / poll-lineage check (service-docs-worker.ts ~L127). Any
-  // authenticated outsider holding the seeded export job id reads the victim canary directly,
-  // and the oracle records no terminal (the monitor requires h3 lineage).
-  canaryLeakRoutes: new Set<string>(['nexusiam:api.exportResult']),
-}
-
 const summary: Record<string, Record<string, unknown>> = {}
 function note(app: string, key: string, value: unknown): void {
   summary[app] ??= {}
@@ -325,16 +309,11 @@ for (const app of APPS) {
       for (const chain of app.chains) {
         const evaluation = lab.oracle.evaluate(chain.id)
         assert.equal(evaluation.confirmed, true, `${chain.id}: ${evaluation.failureReason ?? 'unconfirmed'} under concurrency`)
-        const singleShot = KNOWN_GAPS.singleShotChains.has(chain.id)
         const passReceipts = [passA[chain.id], passB[chain.id]]
         for (const [index, receipt] of passReceipts.entries()) {
-          if (!receipt) {
-            assert.ok(singleShot, `${chain.id}: pass ${index ? 'B' : 'A'} returned no receipt under concurrency`)
-            continue
-          }
+          assert.ok(receipt, `${chain.id}: pass ${index ? 'B' : 'A'} returned no receipt under concurrency`)
           assert.equal(lab.oracle.verifyReceipt(receipt).ok, true, `${chain.id}: pass ${index ? 'B' : 'A'} receipt invalid`)
         }
-        assert.ok(passReceipts.some(Boolean), `${chain.id}: no pass confirmed under concurrency`)
         const terminals = exported.events.terminals.filter((t) => t.chainId === chain.id)
         rows.push({
           chain: chain.id,
@@ -344,8 +323,7 @@ for (const app of APPS) {
           passReceipts: passReceipts.filter(Boolean).length,
         })
         // Each pass drives its own terminal impact; a scalar monitor overwrite collapses this to 1.
-        assert.ok(terminals.length >= (singleShot ? 1 : 2), `${chain.id}: expected a terminal per pass, saw ${terminals.length}`)
-        if (singleShot && passReceipts.every(Boolean)) note(app.name, `fixed:${chain.id}`, 'single-shot gap no longer reproduces; drop it from KNOWN_GAPS')
+        assert.ok(terminals.length >= 2, `${chain.id}: expected a terminal per pass, saw ${terminals.length}`)
       }
       note(app.name, 'concurrency', rows)
     })
@@ -551,8 +529,7 @@ for (const app of APPS) {
       assert.deepEqual(exported.events.edges.map((e) => `${e.chainId}:${e.fromHopId}>${e.toHopId}`), [], `${app.name}: causal edge formed without Hop 1`)
       assert.equal(exported.confirmed.length, 0)
       assert.deepEqual(secretEchoes, [], `${app.name}: host secret echoed by a direct route`)
-      const unknownLeaks = canaryLeaks.filter((leak) => !KNOWN_GAPS.canaryLeakRoutes.has(`${app.name}:${leak.split(':')[0]}`))
-      assert.deepEqual(unknownLeaks, [], `${app.name}: victim canary reached an outsider directly`)
+      assert.deepEqual(canaryLeaks, [], `${app.name}: victim canary reached an outsider directly`)
       assert.deepEqual(terminalAccepts, [], `${app.name}: chain terminal accepted the attacker persona directly`)
       assert.deepEqual(anonSensitiveAccepts, [], `${app.name}: authenticated route served seeded entity data to an anonymous control`)
     })

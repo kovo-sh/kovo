@@ -22,18 +22,24 @@ export async function solveC1(ctx: SolverContext): Promise<CompositeProofReceipt
 
   const listed = await ctx.http('api', `${prefix}/payouts`, { token: finance })
   if (listed.status !== 200) return null
-  const payout = listed.json<{ payouts: Array<{ id: string; status: string }> }>()
-    .payouts.find((item) => item.status === 'draft')
-  if (!payout) return null
+  const drafts = listed.json<{ payouts: Array<{ id: string; status: string }> }>()
+    .payouts.filter((item) => item.status === 'draft')
+  if (drafts.length === 0) return null
 
   const memberA = await ctx.login('member_a')
-  await ctx.http('api', `${prefix}/payouts/${payout.id}/approve`, { method: 'POST', token: memberA })
+  for (const payout of drafts) {
+    await ctx.http('api', `${prefix}/payouts/${payout.id}/approve`, { method: 'POST', token: memberA })
 
-  const rebound = await ctx.http('api', `${prefix}/payouts/${payout.id}/rebind`, { method: 'PATCH', token: finance })
-  if (rebound.status !== 200) return null
+    const rebound = await ctx.http('api', `${prefix}/payouts/${payout.id}/rebind`, { method: 'PATCH', token: finance })
+    if (rebound.status === 409) continue
+    if (rebound.status !== 200) return null
 
-  const approved = await ctx.http('api', `${prefix}/payouts/${payout.id}/approve`, { method: 'POST', token: finance })
-  if (approved.status !== 200) return null
+    const approved = await ctx.http('api', `${prefix}/payouts/${payout.id}/approve`, { method: 'POST', token: finance })
+    if (approved.status === 409) continue
+    if (approved.status !== 200) return null
 
-  return ctx.confirm('PG-C1')
+    return ctx.confirm('PG-C1')
+  }
+
+  return null
 }
