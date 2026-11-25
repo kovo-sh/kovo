@@ -13,8 +13,8 @@ import {
 } from '../../actions.ts'
 import { maxSpecBytes } from '../../domain.ts'
 import { formatHumanTime, FormError, useAction } from '../common.tsx'
-import { Checkbox } from '../ui/checkbox.tsx'
 import { GithubInstallBanner } from './GithubInstallBanner.tsx'
+import { GroupedRepoPicker } from './GroupedRepoPicker.tsx'
 import type { DiscoveredGithubRepo, ProjectLoaderData } from './types.ts'
 import { safeHost } from './types.ts'
 
@@ -237,14 +237,6 @@ export function ProjectSourcesTab({ data }: Props) {
     if (!reposLoaded) loadGithubRepos()
   }
 
-  function toggleSelectedRepo(fullName: string, checked: boolean) {
-    setSelectedRepos(prev =>
-      checked
-        ? (prev.includes(fullName) ? prev : [...prev, fullName])
-        : prev.filter(name => name !== fullName),
-    )
-  }
-
   async function onSpecFileSelected(file: File | undefined) {
     if (!file) return
     if (file.size > maxSpecBytes) {
@@ -256,14 +248,6 @@ export function ProjectSourcesTab({ data }: Props) {
     setSpecContent(text)
   }
 
-  const needle = repoSearch.trim().toLowerCase()
-  const filteredRepos = needle
-    ? discoveredRepos.filter(r =>
-      r.fullName.toLowerCase().includes(needle) ||
-      (r.description?.toLowerCase().includes(needle) ?? false) ||
-      r.defaultBranch.toLowerCase().includes(needle),
-    )
-    : discoveredRepos
   const maxSyncBatch = 20
   const showBroadNote = discoveredRepos.length > 10 || githubPatStatus.tokenKind === 'classic'
 
@@ -474,7 +458,7 @@ export function ProjectSourcesTab({ data }: Props) {
       </div>
     </div>}
 
-    {githubPatStatus.configured && !editingGithubToken && repoPickerOpen && <div className="pw-sheet" style={{ marginBottom: 16 }}>
+    {githubPatStatus.configured && !editingGithubToken && repoPickerOpen && <div className="pw-sheet pw-repo-sheet" style={{ marginBottom: 16 }}>
       <div className="pw-sheet-h">
         <span>Select repositories to sync</span>
         <div className="pw-sec-actions">
@@ -506,23 +490,25 @@ export function ProjectSourcesTab({ data }: Props) {
           )}
         </div>
       </div>
-      <div className="pw-sheet-b">
+
+      <GithubInstallBanner
+        authKind={liveGithubStatus.authKind}
+        tokenKind={liveGithubStatus.tokenKind}
+        login={liveGithubStatus.login}
+        installUrl={liveGithubStatus.installUrl}
+        installations={liveGithubStatus.installations}
+        privateRepoCount={liveGithubStatus.privateRepoCount}
+        needsAppInstall={liveGithubStatus.needsAppInstall}
+        loading={githubAction.pending}
+        onRefresh={loadGithubRepos}
+        flush
+      />
+
+      <div className="pw-repo-subbar">
         <p className="muted" style={{ margin: 0, fontSize: 12 }}>
           Read-only shallow clone + automatic OpenAPI, GraphQL, route, and lockfile extraction.
           {reposTruncated && ' Showing the 200 most recently updated repositories.'}
         </p>
-
-        <GithubInstallBanner
-          authKind={liveGithubStatus.authKind}
-          tokenKind={liveGithubStatus.tokenKind}
-          login={liveGithubStatus.login}
-          installUrl={liveGithubStatus.installUrl}
-          installations={liveGithubStatus.installations}
-          privateRepoCount={liveGithubStatus.privateRepoCount}
-          needsAppInstall={liveGithubStatus.needsAppInstall}
-          loading={githubAction.pending}
-          onRefresh={loadGithubRepos}
-        />
 
         {githubPatStatus.source === 'fixture' && (
           <p
@@ -544,79 +530,36 @@ export function ProjectSourcesTab({ data }: Props) {
               : 'Consider scoping a read-only token or GitHub App installation to only the target repositories.'}
           </span>
         </div>}
-
-        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-          <input
-            className="pw-in"
-            style={{ flex: 1, minWidth: 200 }}
-            type="search"
-            value={repoSearch}
-            onChange={e => setRepoSearch(e.target.value)}
-            placeholder="Filter repositories by name, branch, or description…"
-            aria-label="Filter GitHub repositories"
-          />
-          <button
-            type="button"
-            className="pw-btn ghost"
-            disabled={githubAction.pending || filteredRepos.length === 0}
-            onClick={() => setSelectedRepos(filteredRepos.slice(0, maxSyncBatch).map(r => r.fullName))}
-          >
-            Select all{filteredRepos.length > maxSyncBatch ? ` (first ${maxSyncBatch})` : filteredRepos.length > 0 ? ` (${filteredRepos.length})` : ''}
-          </button>
-          <button
-            type="button"
-            className="pw-btn ghost"
-            disabled={githubAction.pending || selectedRepos.length === 0}
-            onClick={() => setSelectedRepos([])}
-          >
-            Clear
-          </button>
-        </div>
-
-        {githubAction.pending && !reposLoaded ? (
-          <p className="muted" style={{ margin: 0 }}>Discovering accessible repositories…</p>
-        ) : filteredRepos.length > 0 ? (
-          <ul className="pw-repo-list" aria-label="Accessible GitHub repositories">
-            {filteredRepos.map(repo => {
-              const checked = selectedRepos.includes(repo.fullName)
-              const updated = formatHumanTime(repo.updatedAt)
-              return <li key={repo.fullName} className="pw-repo-row">
-                <label className="pw-repo-label">
-                  <Checkbox
-                    checked={checked}
-                    aria-label={`Select repository ${repo.fullName}`}
-                    onCheckedChange={next => toggleSelectedRepo(repo.fullName, Boolean(next))}
-                  />
-                  <span className="pw-repo-meta">
-                    <span className="pw-row-title">
-                      <strong className="mono">{repo.fullName}</strong>
-                      <span className="pw-tag solid">{repo.private ? 'private' : 'public'}</span>
-                      <span className="pw-tag accent">{repo.defaultBranch}</span>
-                      {updated.label && (
-                        <span className="muted num" style={{ fontSize: 11.5 }} title={updated.full}>
-                          Updated {updated.label}
-                        </span>
-                      )}
-                    </span>
-                    {repo.description && <small className="muted" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{repo.description}</small>}
-                  </span>
-                </label>
-              </li>
-            })}
-          </ul>
-        ) : (
-          <p className="muted" style={{ margin: 0 }}>
-            {discoveredRepos.length === 0
-              ? 'No repositories were returned for this account. Verify the GitHub App installation or token grants Contents: Read-only on at least one repository.'
-              : `No repositories match "${repoSearch.trim()}".`}
-          </p>
-        )}
-
-        {selectedRepos.length > maxSyncBatch && (
-          <p role="alert" className="err" style={{ margin: 0 }}>Select at most {maxSyncBatch} repositories per sync batch.</p>
-        )}
-        <FormError error={githubAction.error} />
       </div>
+
+      {githubAction.pending && !reposLoaded ? (
+        <div className="pw-repo-state">
+          <span className="muted">Discovering accessible repositories…</span>
+        </div>
+      ) : (
+        <GroupedRepoPicker
+          repos={discoveredRepos}
+          selectedRepos={selectedRepos}
+          onChangeSelectedRepos={setSelectedRepos}
+          search={repoSearch}
+          onSearchChange={setRepoSearch}
+          maxSelectable={maxSyncBatch}
+          disabled={githubAction.pending}
+          variant="detailed"
+          searchPlaceholder="Filter repositories by name, branch, or description…"
+          emptyMessage="No repositories were returned for this account. Verify the GitHub App installation or token grants Contents: Read-only on at least one repository."
+        />
+      )}
+
+      {(selectedRepos.length > maxSyncBatch || githubAction.error) && (
+        <div className="pw-repo-errors">
+          {selectedRepos.length > maxSyncBatch && (
+            <p role="alert" className="err" style={{ margin: 0 }}>Select at most {maxSyncBatch} repositories per sync batch.</p>
+          )}
+          <FormError error={githubAction.error} />
+        </div>
+      )}
+
       <div className="pw-sheet-f">
         <span className="hint num">{selectedRepos.length} of {discoveredRepos.length} selected</span>
         <button type="button" className="pw-btn ghost" onClick={() => setRepoPickerOpen(false)}>Close</button>
