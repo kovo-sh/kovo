@@ -12,6 +12,44 @@ export interface ModelProfileSheetProps {
   onSaved: (message: string) => void | Promise<void>
 }
 
+type SetupMode = 'default' | 'custom'
+
+function OpenRouterIllustration() {
+  return (
+    <svg
+      className="sw-mode-art"
+      viewBox="0 0 64 40"
+      fill="none"
+      aria-hidden="true"
+    >
+      <rect x="1.5" y="1.5" width="61" height="37" rx="7" fill="var(--sw-sunk)" stroke="var(--sw-line-2)" strokeWidth="1.2" />
+      <path d="M14 20h10.5c3.5 0 4.5-7 9-7H47" stroke="var(--sw-accent)" strokeWidth="1.6" strokeLinecap="round" />
+      <path d="M14 20h10.5c3.5 0 4.5 7 9 7H47" stroke="var(--sw-fg-4)" strokeWidth="1.3" strokeLinecap="round" strokeDasharray="2.5 2.5" />
+      <circle cx="14" cy="20" r="3" fill="var(--sw-panel)" stroke="currentColor" strokeWidth="1.5" />
+      <circle cx="49" cy="13" r="3.25" fill="var(--sw-accent)" />
+      <circle cx="49" cy="27" r="2.75" fill="var(--sw-panel)" stroke="var(--sw-fg-3)" strokeWidth="1.3" />
+      <path d="M31.5 11.2 34 13l-2.5 1.8" stroke="var(--sw-accent)" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function CustomProviderIllustration() {
+  return (
+    <svg
+      className="sw-mode-art"
+      viewBox="0 0 64 40"
+      fill="none"
+      aria-hidden="true"
+    >
+      <rect x="1.5" y="1.5" width="61" height="37" rx="7" fill="var(--sw-sunk)" stroke="var(--sw-line-2)" strokeWidth="1.2" />
+      <path d="M12 13h40M12 20h40M12 27h40" stroke="var(--sw-line-strong)" strokeWidth="1.4" strokeLinecap="round" />
+      <circle cx="24" cy="13" r="3.2" fill="var(--sw-panel)" stroke="var(--sw-accent)" strokeWidth="1.6" />
+      <circle cx="40" cy="20" r="3.2" fill="var(--sw-panel)" stroke="currentColor" strokeWidth="1.5" />
+      <circle cx="29" cy="27" r="3.2" fill="var(--sw-panel)" stroke="currentColor" strokeWidth="1.5" />
+    </svg>
+  )
+}
+
 export function ModelProfileSheet({
   open,
   editing,
@@ -20,12 +58,14 @@ export function ModelProfileSheet({
   onSaved,
 }: ModelProfileSheetProps) {
   const action = useAction()
+  const [mode, setMode] = useState<SetupMode>('default')
   const [feedback, setFeedback] = useState('')
   const [advancedOpen, setAdvancedOpen] = useState(Boolean(editing))
   const [formKey, setFormKey] = useState(0)
 
   useEffect(() => {
     if (!open) return
+    setMode(editing ? 'custom' : 'default')
     setFeedback('')
     setAdvancedOpen(Boolean(editing))
     setFormKey(k => k + 1)
@@ -42,12 +82,16 @@ export function ModelProfileSheet({
 
   if (!open) return null
 
+  const isEditing = Boolean(editing)
+  const isDefaultMode = !isEditing && mode === 'default'
+
+  const nextPriority = profiles.length === 0 ? 100 : Math.max(10, Math.min(...profiles.map(p => p.priority)) - 10)
   const defaults = editing ?? {
-    name: profiles.length === 0 ? DEFAULT_PROVIDER.name : `Fallback profile ${profiles.length + 1}`,
+    name: isDefaultMode || profiles.length === 0 ? DEFAULT_PROVIDER.name : `Custom profile ${profiles.length + 1}`,
     endpoint: DEFAULT_PROVIDER.endpoint,
     model: DEFAULT_PROVIDER.model,
     protocol: DEFAULT_PROVIDER.protocol,
-    priority: profiles.length === 0 ? 100 : Math.max(10, Math.min(...profiles.map(p => p.priority)) - 10),
+    priority: nextPriority,
     enabled: true,
     contextWindow: DEFAULT_PROVIDER.contextWindow,
     maxTokens: DEFAULT_PROVIDER.maxTokens,
@@ -56,6 +100,13 @@ export function ModelProfileSheet({
     inputCostPerMtok: DEFAULT_PROVIDER.inputCostPerMtok,
     cachedInputCostPerMtok: DEFAULT_PROVIDER.cachedInputCostPerMtok,
     outputCostPerMtok: DEFAULT_PROVIDER.outputCostPerMtok,
+  }
+
+  function selectMode(next: SetupMode) {
+    if (next === mode) return
+    setMode(next)
+    setFeedback('')
+    setFormKey(k => k + 1)
   }
 
   return (
@@ -70,7 +121,7 @@ export function ModelProfileSheet({
         <div className="sw-modal-h">
           <div>
             <h2 id="model-profile-sheet-title">
-              {editing ? `Edit profile · ${editing.name}` : profiles.length ? 'Add model profile' : 'Connect model provider'}
+              {isEditing ? `Edit profile · ${editing!.name}` : 'Add model profile'}
             </h2>
           </div>
           <button
@@ -101,12 +152,12 @@ export function ModelProfileSheet({
             const data = {
               ...(editing ? { id: editing.id } : {}),
               name: String(form.get('name') ?? '').trim() || DEFAULT_PROVIDER.name,
-              endpoint: String(form.get('endpoint')),
-              model: String(form.get('model')),
+              endpoint: String(form.get('endpoint') ?? DEFAULT_PROVIDER.endpoint),
+              model: String(form.get('model') ?? DEFAULT_PROVIDER.model),
               protocol: form.get('protocol') === 'messages' ? 'messages' as const : 'responses' as const,
-              key: String(form.get('key')),
-              priority: Number(form.get('priority') ?? 100),
-              enabled: form.has('enabled'),
+              key: String(form.get('key') ?? ''),
+              priority: Number(form.get('priority') ?? nextPriority),
+              enabled: isDefaultMode ? form.has('enabled') : form.has('enabled'),
               contextWindow: Number(form.get('contextWindow') ?? DEFAULT_PROVIDER.contextWindow),
               maxTokens: Number(form.get('maxTokens') ?? DEFAULT_PROVIDER.maxTokens),
               thinkingLevel,
@@ -131,172 +182,376 @@ export function ModelProfileSheet({
           }}
         >
           <div className="sw-modal-b">
-            <div className="sw-grid-3">
-              <label className="sw-fld">
-                Profile name
-                <input className="sw-input" name="name" required maxLength={160} defaultValue={defaults.name} />
-              </label>
-              <label className="sw-fld">
-                Priority (higher tried first)
-                <input
-                  className="sw-input sw-num"
-                  name="priority"
-                  type="number"
-                  min={0}
-                  max={1000}
-                  step={1}
-                  required
-                  defaultValue={defaults.priority}
-                />
-              </label>
-              <label className="sw-fld">
-                Role affinity
-                <select className="sw-select" name="roleAffinity" defaultValue={defaults.roleAffinity}>
-                  <option value="any">Any (all roles)</option>
-                  <option value="reasoning">Reasoning (audit, repair, patch)</option>
-                  <option value="tactical">Tactical (specialists, planner)</option>
-                  <option value="fast">Fast (triage, dedupe)</option>
-                </select>
-              </label>
-            </div>
+            {!isEditing && (
+              <div className="sw-mode-grid" role="radiogroup" aria-label="Provider setup mode">
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={mode === 'default'}
+                  className={'sw-mode-card' + (mode === 'default' ? ' active' : '')}
+                  onClick={() => selectMode('default')}
+                >
+                  <div className="sw-mode-card-top">
+                    <OpenRouterIllustration />
+                    <span className="sw-tag accent">Recommended</span>
+                  </div>
+                  <div className="sw-mode-card-copy">
+                    <strong>Default · OpenRouter</strong>
+                    <span>DeepSeek V4.1 Flash via OpenRouter — fast, high-recall default</span>
+                  </div>
+                </button>
 
-            <label className="sw-fld">
-              <span>
-                API key {editing && <small>(optional — leave blank to keep stored key)</small>}
-              </span>
-              <input
-                className="sw-input"
-                name="key"
-                type="password"
-                required={!editing}
-                minLength={editing ? undefined : 8}
-                maxLength={512}
-                autoComplete="off"
-                placeholder={editing ? 'Leave blank to keep existing API key' : 'Enter your provider key'}
-              />
-              <small>Stored locally in 0600 credential files; never returned to the browser or target containers.</small>
-            </label>
-
-            <label className="sw-chk">
-              <input
-                type="checkbox"
-                name="enabled"
-                defaultChecked={defaults.enabled}
-                aria-label="Enable this profile in the failover pool"
-              />
-              Enable this profile in the failover pool
-            </label>
-
-            <button
-              type="button"
-              className="sw-adv-btn"
-              aria-expanded={advancedOpen}
-              onClick={() => setAdvancedOpen(v => !v)}
-            >
-              <span aria-hidden="true">{advancedOpen ? '▾' : '▸'}</span>
-              Advanced provider settings
-            </button>
-
-            <div className="sw-adv-panel" hidden={!advancedOpen}>
-              <div className="sw-grid-2">
-                <label className="sw-fld">
-                  Model ID
-                  <input className="sw-input sw-mono" name="model" required defaultValue={defaults.model} />
-                </label>
-                <label className="sw-fld">
-                  Protocol
-                  <select className="sw-select" name="protocol" defaultValue={defaults.protocol}>
-                    <option value="responses">OpenAI Responses</option>
-                    <option value="messages">Anthropic Messages</option>
-                  </select>
-                </label>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={mode === 'custom'}
+                  className={'sw-mode-card' + (mode === 'custom' ? ' active' : '')}
+                  onClick={() => selectMode('custom')}
+                >
+                  <div className="sw-mode-card-top">
+                    <CustomProviderIllustration />
+                    <span className="sw-tag">Flexible</span>
+                  </div>
+                  <div className="sw-mode-card-copy">
+                    <strong>Custom provider</strong>
+                    <span>OpenAI, Anthropic, local Ollama/vLLM, or any compatible endpoint</span>
+                  </div>
+                </button>
               </div>
+            )}
 
-              <label className="sw-fld">
-                Base URL
-                <input className="sw-input sw-mono" name="endpoint" type="url" required defaultValue={defaults.endpoint} />
-              </label>
+            {isDefaultMode ? (
+              <>
+                <input type="hidden" name="endpoint" value={DEFAULT_PROVIDER.endpoint} />
+                <input type="hidden" name="model" value={DEFAULT_PROVIDER.model} />
+                <input type="hidden" name="protocol" value={DEFAULT_PROVIDER.protocol} />
 
-              <div className="sw-grid-3">
-                <label className="sw-fld">
-                  Context window
-                  <input
-                    className="sw-input sw-num"
-                    name="contextWindow"
-                    type="number"
-                    min={32000}
-                    max={2000000}
-                    step={1}
-                    required
-                    defaultValue={defaults.contextWindow}
-                  />
-                </label>
-                <label className="sw-fld">
-                  Max output tokens
-                  <input
-                    className="sw-input sw-num"
-                    name="maxTokens"
-                    type="number"
-                    min={512}
-                    max={393216}
-                    step={1}
-                    required
-                    defaultValue={defaults.maxTokens}
-                  />
-                </label>
-                <label className="sw-fld">
-                  Thinking level
-                  <select className="sw-select" name="thinkingLevel" defaultValue={defaults.thinkingLevel}>
-                    <option value="off">Off</option>
-                    <option value="low">Low</option>
-                    <option value="medium">Medium</option>
-                    <option value="high">High</option>
-                  </select>
-                </label>
-              </div>
+                <div className="sw-preset-bar" aria-label="Pre-filled OpenRouter defaults">
+                  <span className="sw-tag solid sw-mono">openrouter.ai/api/v1</span>
+                  <span className="sw-tag solid sw-mono">{DEFAULT_PROVIDER.model}</span>
+                  <span className="sw-tag">Responses</span>
+                </div>
 
-              <div className="sw-grid-3">
                 <label className="sw-fld">
-                  Input cost ($ / 1M tokens)
+                  <span className="sw-fld-row">
+                    <span>OpenRouter API key</span>
+                    <a
+                      className="sw-ext-link"
+                      href="https://openrouter.ai/keys"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      Get an API key ↗
+                    </a>
+                  </span>
                   <input
-                    className="sw-input sw-num"
-                    name="inputCostPerMtok"
-                    type="number"
-                    min={0}
-                    max={500}
-                    step="any"
+                    className="sw-input sw-mono"
+                    name="key"
+                    type="password"
                     required
-                    defaultValue={defaults.inputCostPerMtok}
+                    minLength={8}
+                    maxLength={512}
+                    autoComplete="off"
+                    autoFocus
+                    placeholder="sk-or-v1-..."
                   />
+                  <small>Stored locally in 0600 credential files; never returned to the browser or target containers.</small>
                 </label>
+
+                <details className="sw-details">
+                  <summary className="sw-details-sum">Customize profile name &amp; limits</summary>
+                  <div className="sw-details-body">
+                    <div className="sw-grid-3">
+                      <label className="sw-fld">
+                        Profile name
+                        <input className="sw-input" name="name" required maxLength={160} defaultValue={DEFAULT_PROVIDER.name} />
+                      </label>
+                      <label className="sw-fld">
+                        Priority (higher tried first)
+                        <input
+                          className="sw-input sw-num"
+                          name="priority"
+                          type="number"
+                          min={0}
+                          max={1000}
+                          step={1}
+                          required
+                          defaultValue={defaults.priority}
+                        />
+                      </label>
+                      <label className="sw-fld">
+                        Role affinity
+                        <select className="sw-select" name="roleAffinity" defaultValue={DEFAULT_PROVIDER.roleAffinity}>
+                          <option value="any">Any (all roles)</option>
+                          <option value="reasoning">Reasoning (audit, repair, patch)</option>
+                          <option value="tactical">Tactical (specialists, planner)</option>
+                          <option value="fast">Fast (triage, dedupe)</option>
+                        </select>
+                      </label>
+                    </div>
+
+                    <label className="sw-chk">
+                      <input
+                        type="checkbox"
+                        name="enabled"
+                        defaultChecked
+                        aria-label="Enable this profile in the failover pool"
+                      />
+                      Enable this profile in the failover pool
+                    </label>
+
+                    <div className="sw-grid-3">
+                      <label className="sw-fld">
+                        Context window
+                        <input
+                          className="sw-input sw-num"
+                          name="contextWindow"
+                          type="number"
+                          min={32000}
+                          max={2000000}
+                          step={1}
+                          required
+                          defaultValue={DEFAULT_PROVIDER.contextWindow}
+                        />
+                      </label>
+                      <label className="sw-fld">
+                        Max output tokens
+                        <input
+                          className="sw-input sw-num"
+                          name="maxTokens"
+                          type="number"
+                          min={512}
+                          max={393216}
+                          step={1}
+                          required
+                          defaultValue={DEFAULT_PROVIDER.maxTokens}
+                        />
+                      </label>
+                      <label className="sw-fld">
+                        Thinking level
+                        <select className="sw-select" name="thinkingLevel" defaultValue={DEFAULT_PROVIDER.thinkingLevel}>
+                          <option value="off">Off</option>
+                          <option value="low">Low</option>
+                          <option value="medium">Medium</option>
+                          <option value="high">High</option>
+                        </select>
+                      </label>
+                    </div>
+
+                    <div className="sw-grid-3">
+                      <label className="sw-fld">
+                        Input cost ($ / 1M)
+                        <input
+                          className="sw-input sw-num"
+                          name="inputCostPerMtok"
+                          type="number"
+                          min={0}
+                          max={500}
+                          step="any"
+                          required
+                          defaultValue={DEFAULT_PROVIDER.inputCostPerMtok}
+                        />
+                      </label>
+                      <label className="sw-fld">
+                        Cached input ($ / 1M)
+                        <input
+                          className="sw-input sw-num"
+                          name="cachedInputCostPerMtok"
+                          type="number"
+                          min={0}
+                          max={500}
+                          step="any"
+                          required
+                          defaultValue={DEFAULT_PROVIDER.cachedInputCostPerMtok}
+                        />
+                      </label>
+                      <label className="sw-fld">
+                        Output cost ($ / 1M)
+                        <input
+                          className="sw-input sw-num"
+                          name="outputCostPerMtok"
+                          type="number"
+                          min={0}
+                          max={500}
+                          step="any"
+                          required
+                          defaultValue={DEFAULT_PROVIDER.outputCostPerMtok}
+                        />
+                      </label>
+                    </div>
+                  </div>
+                </details>
+              </>
+            ) : (
+              <>
+                <div className="sw-grid-3">
+                  <label className="sw-fld">
+                    Profile name
+                    <input className="sw-input" name="name" required maxLength={160} defaultValue={defaults.name} />
+                  </label>
+                  <label className="sw-fld">
+                    Priority (higher tried first)
+                    <input
+                      className="sw-input sw-num"
+                      name="priority"
+                      type="number"
+                      min={0}
+                      max={1000}
+                      step={1}
+                      required
+                      defaultValue={defaults.priority}
+                    />
+                  </label>
+                  <label className="sw-fld">
+                    Role affinity
+                    <select className="sw-select" name="roleAffinity" defaultValue={defaults.roleAffinity}>
+                      <option value="any">Any (all roles)</option>
+                      <option value="reasoning">Reasoning (audit, repair, patch)</option>
+                      <option value="tactical">Tactical (specialists, planner)</option>
+                      <option value="fast">Fast (triage, dedupe)</option>
+                    </select>
+                  </label>
+                </div>
+
                 <label className="sw-fld">
-                  Cached input ($ / 1M tokens)
-                  <input
-                    className="sw-input sw-num"
-                    name="cachedInputCostPerMtok"
-                    type="number"
-                    min={0}
-                    max={500}
-                    step="any"
-                    required
-                    defaultValue={defaults.cachedInputCostPerMtok}
-                  />
+                  Base URL
+                  <input className="sw-input sw-mono" name="endpoint" type="url" required defaultValue={defaults.endpoint} />
                 </label>
+
+                <div className="sw-grid-2">
+                  <label className="sw-fld">
+                    Model ID
+                    <input className="sw-input sw-mono" name="model" required defaultValue={defaults.model} />
+                  </label>
+                  <label className="sw-fld">
+                    Protocol
+                    <select className="sw-select" name="protocol" defaultValue={defaults.protocol}>
+                      <option value="responses">OpenAI Responses</option>
+                      <option value="messages">Anthropic Messages</option>
+                    </select>
+                  </label>
+                </div>
+
                 <label className="sw-fld">
-                  Output cost ($ / 1M tokens)
+                  <span>
+                    API key {isEditing && <small>(optional — leave blank to keep stored key)</small>}
+                  </span>
                   <input
-                    className="sw-input sw-num"
-                    name="outputCostPerMtok"
-                    type="number"
-                    min={0}
-                    max={500}
-                    step="any"
-                    required
-                    defaultValue={defaults.outputCostPerMtok}
+                    className="sw-input"
+                    name="key"
+                    type="password"
+                    required={!isEditing}
+                    minLength={isEditing ? undefined : 8}
+                    maxLength={512}
+                    autoComplete="off"
+                    placeholder={isEditing ? 'Leave blank to keep existing API key' : 'Enter your provider key'}
                   />
+                  <small>Stored locally in 0600 credential files; never returned to the browser or target containers.</small>
                 </label>
-              </div>
-            </div>
+
+                <label className="sw-chk">
+                  <input
+                    type="checkbox"
+                    name="enabled"
+                    defaultChecked={defaults.enabled}
+                    aria-label="Enable this profile in the failover pool"
+                  />
+                  Enable this profile in the failover pool
+                </label>
+
+                <button
+                  type="button"
+                  className="sw-adv-btn"
+                  aria-expanded={advancedOpen}
+                  onClick={() => setAdvancedOpen(v => !v)}
+                >
+                  <span aria-hidden="true">{advancedOpen ? '▾' : '▸'}</span>
+                  Limits &amp; pricing
+                </button>
+
+                <div className="sw-adv-panel" hidden={!advancedOpen}>
+                  <div className="sw-grid-3">
+                    <label className="sw-fld">
+                      Context window
+                      <input
+                        className="sw-input sw-num"
+                        name="contextWindow"
+                        type="number"
+                        min={32000}
+                        max={2000000}
+                        step={1}
+                        required
+                        defaultValue={defaults.contextWindow}
+                      />
+                    </label>
+                    <label className="sw-fld">
+                      Max output tokens
+                      <input
+                        className="sw-input sw-num"
+                        name="maxTokens"
+                        type="number"
+                        min={512}
+                        max={393216}
+                        step={1}
+                        required
+                        defaultValue={defaults.maxTokens}
+                      />
+                    </label>
+                    <label className="sw-fld">
+                      Thinking level
+                      <select className="sw-select" name="thinkingLevel" defaultValue={defaults.thinkingLevel}>
+                        <option value="off">Off</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <div className="sw-grid-3">
+                    <label className="sw-fld">
+                      Input cost ($ / 1M tokens)
+                      <input
+                        className="sw-input sw-num"
+                        name="inputCostPerMtok"
+                        type="number"
+                        min={0}
+                        max={500}
+                        step="any"
+                        required
+                        defaultValue={defaults.inputCostPerMtok}
+                      />
+                    </label>
+                    <label className="sw-fld">
+                      Cached input ($ / 1M tokens)
+                      <input
+                        className="sw-input sw-num"
+                        name="cachedInputCostPerMtok"
+                        type="number"
+                        min={0}
+                        max={500}
+                        step="any"
+                        required
+                        defaultValue={defaults.cachedInputCostPerMtok}
+                      />
+                    </label>
+                    <label className="sw-fld">
+                      Output cost ($ / 1M tokens)
+                      <input
+                        className="sw-input sw-num"
+                        name="outputCostPerMtok"
+                        type="number"
+                        min={0}
+                        max={500}
+                        step="any"
+                        required
+                        defaultValue={defaults.outputCostPerMtok}
+                      />
+                    </label>
+                  </div>
+                </div>
+              </>
+            )}
 
             {action.error && <p role="alert" className="sw-msg-err">{action.error}</p>}
             {feedback && <p role="status" className="sw-msg-ok">{feedback}</p>}
@@ -314,7 +569,7 @@ export function ModelProfileSheet({
                 Test connection
               </button>
               <button type="submit" value="save" className="sw-btn primary" disabled={action.pending}>
-                {editing ? 'Update profile' : 'Save model'}
+                {isEditing ? 'Update profile' : 'Save model'}
               </button>
             </div>
           </div>

@@ -250,7 +250,9 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
             >
               <Icon name="sliders" />
               <span className="lbl">Model settings</span>
-              <span className={'sh-health-dot ' + data.poolHealth} aria-hidden="true" />
+              {data.poolHealth !== 'healthy' && (
+                <span className={'sh-health-dot ' + data.poolHealth} aria-hidden="true" />
+              )}
             </Link>
           </nav>
 

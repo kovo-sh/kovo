@@ -12,10 +12,12 @@
 //   nav.openChat({ label, key })                   // coordinator chat in the pane, optional context chip
 //
 // Prefer the typed helpers in `useLinks()` for cross-links between views.
-import { createContext, useCallback, useContext, useMemo, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useShortcuts } from './keyboard.tsx'
 import type { ViewId } from './meta.ts'
+
+const PANE_COLLAPSED_KEY = 'guardian-run-pane-collapsed'
 
 export interface Sel { kind: string; id: string }
 export const selKey = (s: Sel) => s.kind + ':' + s.id
@@ -52,6 +54,11 @@ export interface NavApi {
   closeChat: () => void
   /** Inspector entrance for the next pane change ('left' slides in, used by queue advance). */
   paneAnim: 'up' | 'left'
+  /** Right sidebar (inspector / board) collapsed state, persisted in localStorage. */
+  paneCollapsed: boolean
+  togglePane: () => void
+  expandPane: () => void
+  collapsePane: () => void
   switchRun: (runId: string, view?: ViewId) => void
 }
 
@@ -77,34 +84,60 @@ export function NavProvider({ runId, view, sel, go, switchRun, children }: {
   const [chat, setChat] = useState(false)
   const [chatContext, setChatContext] = useState<ChatContext | null>(null)
   const [paneAnim, setPaneAnim] = useState<'up' | 'left'>('up')
+  const [paneCollapsed, setPaneCollapsed] = useState(false)
   const cur = useRef({ view, sel })
   cur.current = { view, sel }
+
+  useEffect(() => {
+    try {
+      if (localStorage.getItem(PANE_COLLAPSED_KEY) === '1') setPaneCollapsed(true)
+    } catch { /* ignore */ }
+  }, [])
+
+  const writePaneCollapsed = useCallback((next: boolean) => {
+    setPaneCollapsed(next)
+    try { localStorage.setItem(PANE_COLLAPSED_KEY, next ? '1' : '0') } catch { /* ignore */ }
+  }, [])
+
+  const togglePane = useCallback(() => {
+    setPaneCollapsed(prev => {
+      const next = !prev
+      try { localStorage.setItem(PANE_COLLAPSED_KEY, next ? '1' : '0') } catch { /* ignore */ }
+      return next
+    })
+  }, [])
+
+  const expandPane = useCallback(() => writePaneCollapsed(false), [writePaneCollapsed])
+  const collapsePane = useCallback(() => writePaneCollapsed(true), [writePaneCollapsed])
 
   const setView = useCallback((v: ViewId, opts?: { sel?: Sel | null }) => {
     const next = opts && 'sel' in opts ? opts.sel ?? null : remembered.current.get(v) ?? null
     setChat(false)
     setPaneAnim('up')
+    if (opts && 'sel' in opts && opts.sel) expandPane()
     if (v === cur.current.view && sameSel(next, cur.current.sel)) return
     go(v, next, v !== cur.current.view)
-  }, [go])
+  }, [go, expandPane])
 
   const select = useCallback((s: Sel | null, opts?: { push?: boolean; anim?: 'up' | 'left' }) => {
     setChat(false)
     setPaneAnim(opts?.anim ?? 'up')
+    if (s) expandPane()
     const { view: v, sel: prev } = cur.current
     if (sameSel(s, prev)) return
     if (opts?.push && prev) setStack(st => [...st, { view: v, sel: prev }])
     go(v, s, false)
-  }, [go])
+  }, [go, expandPane])
 
   const open = useCallback((v: ViewId, s: Sel, opts?: { push?: boolean }) => {
     setChat(false)
     setPaneAnim('up')
+    expandPane()
     const { view: pv, sel: prev } = cur.current
     if (pv === v && sameSel(prev, s)) return
     if ((opts?.push ?? true) && prev) setStack(st => [...st, { view: pv, sel: prev }])
     go(v, s, v !== pv)
-  }, [go])
+  }, [go, expandPane])
 
   const stackRef = useRef(stack)
   stackRef.current = stack
@@ -126,13 +159,17 @@ export function NavProvider({ runId, view, sel, go, switchRun, children }: {
     if (cur.current.sel) go(cur.current.view, null, false)
   }, [go])
 
-  const openChat = useCallback((ctx?: ChatContext | null) => { setChatContext(ctx ?? null); setChat(true) }, [])
+  const openChat = useCallback((ctx?: ChatContext | null) => {
+    setChatContext(ctx ?? null)
+    setChat(true)
+    expandPane()
+  }, [expandPane])
   const closeChat = useCallback(() => { setChat(false) }, [])
 
   const value = useMemo<NavApi>(() => ({
     runId, view, sel, stack, setView, select, open, back, close,
-    chat, chatContext, openChat, closeChat, paneAnim, switchRun,
-  }), [runId, view, sel, stack, setView, select, open, back, close, chat, chatContext, openChat, closeChat, paneAnim, switchRun])
+    chat, chatContext, openChat, closeChat, paneAnim, paneCollapsed, togglePane, expandPane, collapsePane, switchRun,
+  }), [runId, view, sel, stack, setView, select, open, back, close, chat, chatContext, openChat, closeChat, paneAnim, paneCollapsed, togglePane, expandPane, collapsePane, switchRun])
   return <NavContext.Provider value={value}>{children}</NavContext.Provider>
 }
 

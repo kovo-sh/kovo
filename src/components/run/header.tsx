@@ -119,6 +119,17 @@ export function RunHeader() {
         {action}
         <button type="button" className="btn ghost" title="More actions" aria-label="More actions" aria-haspopup="menu" aria-expanded={pop === 'menu'} style={{ padding: '0 6px' }}
           onClick={() => setPop(pop === 'menu' ? null : 'menu')}><Icon name="dots" /></button>
+        <button
+          type="button"
+          className={'btn ghost' + (nav.paneCollapsed ? '' : ' on')}
+          title={nav.paneCollapsed ? 'Show panel (])' : 'Hide panel (])'}
+          aria-label={nav.paneCollapsed ? 'Show panel' : 'Hide panel'}
+          aria-pressed={!nav.paneCollapsed}
+          style={{ padding: '0 6px' }}
+          onClick={() => nav.togglePane()}
+        >
+          <Icon name="panelR" />
+        </button>
         {pop === 'menu' && <div className="menu" role="menu">
           {item('budget', 'Budget and rate limit…', () => setPop('budget'), { right: fmtUsd(r.budgetUsd) })}
           {r.capabilityTier === 3 && item('shield', 'Approval policy…', () => setPop('policy'), { right: approvalPolicyMeta[r.approvalPolicy ?? 'auto_review'].short })}
