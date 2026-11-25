@@ -238,9 +238,6 @@ export const intentLeaseMs = 30 * 60_000
 export const deterministicFloorMaxWallClockMs = 180_000
 /** Phase A may consume at most this share of the run's wall clock (25–30% target). */
 export const deterministicFloorWallClockShare = 0.28
-/** Keep the legacy lane names as aliases so external diagnostics keep compiling. */
-export const deterministicLaneMaxWallClockMs = deterministicFloorMaxWallClockMs
-export const deterministicLaneWallClockShare = deterministicFloorWallClockShare
 export type DeterministicSweepMode = 'off' | 'on' | 'always'
 
 /**
