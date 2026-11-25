@@ -1081,7 +1081,7 @@ const GUARDIAN_VERIFY_SIGNATURES = [
   'Multi-hop chain SDK helpers (2-6 hops, Mode A fresh_clean_replay, attacker-eligible low-priv/cross-tenant origin ONLY — never pre-seeded owner on attack arm):',
   '- ctx.seal_capability({ exchange | exchangeId, slot, hopReceiptId?, jsonPath | header | cookie | regex | value, kind? }) -> { handle: "cap:hop_<id>:<slot>" }',
   '- ctx.http_send(target, { method?, headers?, body?, as?, role?, capability?: handle | { handle, target?, headerName?, cookieName?, queryParam? }, entityId?, correlationIds? })',
-  '- ctx.hmac_sign({ secretHandle, payload, alg?, encoding? }) -> { exchangeId, signature, attestation } | ctx.jwt_sign({ secretHandle, claims, alg?, header?, hopReceiptId?, slot? }) -> { exchangeId, derivedHandle, attestation }',
+  '- ctx.hmac_sign({ secretHandle, payload, alg?, encoding? }) -> { exchangeId, signature, handle, attestation } | ctx.jwt_sign({ secretHandle, claims, alg?, header?, hopReceiptId?, slot? }) -> { exchangeId, derivedHandle, handle, token, attestation }',
   '- ctx.await_async({ pollRequest, matchPredicate?, profile?: "fast_lab"|"wan", timeoutMs?, intervalMs?, triggerExchangeId?, correlationId?, entityId? }) -> { pollRecordId, converged, exchangeId, exchange }',
   '- ctx.prove_composite({ chainId, terminalVulnClass, hops, causalEdges, terminalImpact, replayMode: "fresh_clean_replay" }) — verifies 1-8 hop DAG (value_binding | derived_crypto_binding | state_transition_binding | async_pivot_binding).',
 ].join('\n')
@@ -1098,9 +1098,9 @@ const GUARDIAN_VERIFY_TS_EXAMPLE = [
 
 export const GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN = [
   'Multi-Hop Cryptographic & Async Pivot Pattern (exact SDK calls + edge_binding & terminal-impact rules):',
-  '- Seal upstream secret/artifact: `const s = await ctx.seal_capability({ exchange: h1, hopReceiptId: "h1", slot: "key", jsonPath: "$.key" })` -> `s.handle`.',
+  '- Seal upstream secret/artifact: `const s = await ctx.seal_capability({ exchange: h1, hopReceiptId: "h1", slot: "key", jsonPath: "$.key", kind: "hmac_key" })` -> `s.handle`.',
   '- Host-side HMAC: `const sig = await ctx.hmac_sign({ secretHandle: s.handle, payload, alg: "sha256" })` -> cite `sig.exchangeId` in hop + `{ kind: "derived_crypto_binding", fromHopId, toHopId, sourceCapabilityId: s.handle, alg: "sha256" }`.',
-  '- Host-side JWT: `const jwt = await ctx.jwt_sign({ secretHandle: s.handle, claims, alg: "HS256", hopReceiptId: "h2", slot: "jwt" })` -> seals `jwt.derivedHandle` for `derived_crypto_binding` and downstream `ctx.http_send(..., { capability: jwt.derivedHandle })` (`value_binding`).',
+  '- Host-side JWT: `const jwt = await ctx.jwt_sign({ secretHandle: s.handle, claims, alg: "HS256", hopReceiptId: "h2", slot: "jwt" })` -> seals `jwt.derivedHandle` (`jwt.handle`/`jwt.token`) for `derived_crypto_binding` and downstream `ctx.http_send(..., { capability: jwt.derivedHandle })` (`value_binding`).',
   '- Async worker poll: `const p = await ctx.await_async({ pollRequest, matchPredicate, triggerExchangeId: h1.exchangeId, correlationId })` -> cite `p.pollRecordId` + `correlationId` in `{ kind: "async_pivot_binding", fromHopId, toHopId, correlationId, channel: "poll_convergence", pollRecordId: p.pollRecordId }`.',
   '- `edge_binding`: bind every edge `capabilityHandle`/`sourceCapabilityId`/`derivedCapabilityId`/`correlationId` to the exact upstream sealed handle or derived output and cite producing/consuming `exchangeIds` in monotonic order.',
   '- Terminal impact: ALWAYS run a clean pre-chain denied `control` (`role: "control"`, HTTP `401`/`403`/`404`) on the exact terminal route (`preChainControlExchangeIds`) AND fetch actual foreign-tenant business records or persisted state-mutation readback (`postChainReadbackExchangeIds`) — NEVER stop at a job handle, export stub, or signed URL.',
@@ -2766,7 +2766,7 @@ export function workerInvestigationPrompt(input: {
           multiHopDirectives: {
             noPrematureSingleHop: 'Never stop at an intermediate single-hop info-disclosure, handle, or directory leak when downstream cross-service/auth/state-machine pivots are reachable — seal it via ctx.seal_capability(...) and continue through Hops 2-4 to ctx.prove_composite(...).',
             singleOriginProbeArm: 'All probe-arm hops must run as a single starting low-privilege persona (or anonymous / freshly derived credential); never use a target-tenant persona on the probe arm to mint handles for your starting persona (use target-tenant personas only for baseline/readback checks).',
-            cryptoAndAsyncHelpers: 'Invoke ctx.hmac_sign / ctx.jwt_sign whenever crossing signing or token-forgery boundaries and ctx.await_async whenever waiting on background-job/async-worker convergence, then confirm the full DAG via ctx.prove_composite(replayMode="fresh_clean_replay").',
+            cryptoAndAsyncHelpers: 'Invoke ctx.hmac_sign / ctx.jwt_sign whenever crossing signing or token-forgery boundaries and ctx.await_async whenever waiting on background-job/async-worker convergence, then confirm the full DAG via ctx.prove_composite({ ..., replayMode: "fresh_clean_replay" }).',
           },
         }
       : {}),

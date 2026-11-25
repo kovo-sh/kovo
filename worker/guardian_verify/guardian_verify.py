@@ -19,13 +19,25 @@ from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
 
-class _AwaitableDict(dict):
-    """Dict that also supports `await` so inline Python scripts work with or without `await`."""
+class _AttrDict(dict):
+    """Dict supporting attribute access (exact + snake_case->camelCase) and `await`."""
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self:
+            return self[name]
+        parts = name.split("_")
+        camel = parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:])
+        if camel in self:
+            return self[camel]
+        raise AttributeError(name)
 
     def __await__(self):  # type: ignore[no-untyped-def]
         if False:
             yield None
         return self
+
+
+_AwaitableDict = _AttrDict
 
 
 class VerificationError(RuntimeError):
@@ -257,6 +269,22 @@ def _wrap_exchanges(res: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any
     return out
 
 
+def _pick(d: dict[str, Any], *keys: str) -> Any:
+    return next((d[k] for k in keys if k in d and d[k] is not None), None)
+
+
+def _cap_handle(v: Any) -> str:
+    return str(_pick(v, "handle", "derivedHandle", "cap_id") or "") if isinstance(v, dict) else ("" if v is None else str(v))
+
+
+def _norm_pred(raw: Any, expect_status: Any = None) -> Optional[dict[str, Any]]:
+    pred: dict[str, Any] = {"bodyContains": raw} if isinstance(raw, str) else ({"status": raw} if isinstance(raw, (int, list)) else (dict(raw) if isinstance(raw, dict) else {}))
+    for src, dst in (("body_contains", "bodyContains"), ("body_matches", "bodyMatches"), ("json_path", "jsonPath"), ("expect_status", "status"), ("expectStatus", "status")):
+        if src in pred and dst not in pred: pred[dst] = pred.pop(src)
+    if expect_status is not None and "status" not in pred: pred["status"] = expect_status
+    return pred or None
+
+
 class VerifyContext:
     def __init__(self) -> None:
         context = _read_context()
@@ -325,89 +353,78 @@ class VerifyContext:
     def request(self, target: Any, **options: Any) -> Exchange:
         return self.http_send(target, **options)
 
-    def seal_capability(
-        self, exchange_or_id: Any, slot: str, *, hop_receipt_id: Optional[str] = None, hop_id: Optional[str] = None,
-        json_path: Optional[str] = None, header: Optional[str] = None, cookie: Optional[str] = None,
-        regex: Optional[str] = None, value: Optional[str] = None, kind: Optional[str] = None,
-        ttl_ms: Optional[int] = None, default_header_name: Optional[str] = None,
-        default_cookie_name: Optional[str] = None, allowed_origins: Optional[list[str]] = None, **kwargs: Any,
-    ) -> dict[str, Any]:
-        exchange_id = exchange_or_id.exchange_id if isinstance(exchange_or_id, Exchange) else str(exchange_or_id)
-        args: dict[str, Any] = {"exchangeId": exchange_id, "slot": slot}
-        for dst, val in (
-            ("hopReceiptId", hop_receipt_id or kwargs.get("hopReceiptId")), ("hopId", hop_id or kwargs.get("hopId")),
-            ("jsonPath", json_path or kwargs.get("jsonPath")), ("header", header), ("cookie", cookie),
-            ("regex", regex), ("kind", kind), ("defaultHeaderName", default_header_name or kwargs.get("defaultHeaderName")),
-            ("defaultCookieName", default_cookie_name or kwargs.get("defaultCookieName")),
-        ):
-            if val:
-                args[dst] = val
-        if value is not None:
-            args["value"] = value
-        ttl = ttl_ms if ttl_ms is not None else kwargs.get("ttlMs")
-        if ttl is not None:
-            args["ttlMs"] = ttl
-        ao = allowed_origins or kwargs.get("allowedOrigins")
-        if ao:
-            args["allowedOrigins"] = list(ao)
-        return _AwaitableDict(_rpc("capability.seal", args, 30.0))
+    def seal_capability(self, exchange_or_id: Any = None, slot: Optional[str] = None, *, hop_receipt_id: Optional[str] = None, hop_id: Optional[str] = None, json_path: Optional[str] = None, header: Optional[str] = None, cookie: Optional[str] = None, regex: Optional[str] = None, value: Optional[str] = None, kind: Optional[str] = None, ttl_ms: Optional[int] = None, default_header_name: Optional[str] = None, default_cookie_name: Optional[str] = None, allowed_origins: Optional[list[str]] = None, **kwargs: Any) -> dict[str, Any]:
+        is_opt = isinstance(exchange_or_id, dict) and (slot is None or any(k in exchange_or_id for k in ("slot", "exchange", "exchange_id", "jsonPath", "json_path", "header", "cookie", "regex", "value")))
+        m = {**(exchange_or_id if is_opt else {}), **kwargs}
+        ex_src = _pick(m, "exchange", "exchangeId", "exchange_id") if (is_opt or exchange_or_id is None) else exchange_or_id
+        exchange_id = ex_src.exchange_id if isinstance(ex_src, Exchange) else (str(_pick(ex_src, "exchangeId", "exchange_id") or "") if isinstance(ex_src, dict) else str(ex_src or ""))
+        args: dict[str, Any] = {"exchangeId": exchange_id, "slot": slot if slot is not None else m.get("slot")}
+        for dst, val in (("hopReceiptId", hop_receipt_id or _pick(m, "hopReceiptId", "hop_receipt_id")), ("hopId", hop_id or _pick(m, "hopId", "hop_id")), ("jsonPath", json_path or _pick(m, "jsonPath", "json_path")), ("header", header or m.get("header")), ("cookie", cookie or m.get("cookie")), ("regex", regex or m.get("regex")), ("kind", kind or m.get("kind")), ("defaultHeaderName", default_header_name or _pick(m, "defaultHeaderName", "default_header_name")), ("defaultCookieName", default_cookie_name or _pick(m, "defaultCookieName", "default_cookie_name"))):
+            if val: args[dst] = val
+        val_raw = value if value is not None else m.get("value")
+        if val_raw is not None: args["value"] = val_raw
+        ttl = ttl_ms if ttl_ms is not None else _pick(m, "ttlMs", "ttl_ms")
+        if ttl is not None: args["ttlMs"] = ttl
+        ao = allowed_origins or _pick(m, "allowedOrigins", "allowed_origins")
+        if ao: args["allowedOrigins"] = list(ao)
+        res = dict(_rpc("capability.seal", args, 30.0) or {})
+        if "handle" in res and "cap_id" not in res: res["cap_id"] = res["handle"]
+        return _AttrDict(res)
 
-    def hmac_sign(self, secret_handle: str, payload: str, alg: str = "sha256", encoding: str = "hex") -> dict[str, Any]:
-        return _AwaitableDict(_rpc("crypto.hmacSign", {"secretHandle": secret_handle, "payload": payload, "alg": alg, "encoding": encoding}, 30.0))
+    def hmac_sign(self, secret_handle: Any = None, payload: Any = None, alg: Any = None, encoding: Optional[str] = None, **kwargs: Any) -> dict[str, Any]:
+        is_opt = isinstance(secret_handle, dict) and payload is None and any(k in secret_handle for k in ("secretHandle", "secret_handle", "keyHandle", "key_handle", "payload", "message", "body"))
+        m = {**(secret_handle if is_opt else {}), **(alg if isinstance(alg, dict) else {}), **kwargs}
+        sh = _cap_handle(_pick(m, "secretHandle", "secret_handle", "keyHandle", "key_handle") if (is_opt or secret_handle is None) else secret_handle)
+        raw_p = payload if payload is not None else _pick(m, "payload", "message", "body")
+        p_str = raw_p if isinstance(raw_p, str) else ("" if raw_p is None else json.dumps(raw_p))
+        alg_v = (alg if isinstance(alg, str) else None) or _pick(m, "alg", "algorithm") or "sha256"
+        res = dict(_rpc("crypto.hmacSign", {"secretHandle": sh, "payload": p_str, "alg": alg_v, "encoding": encoding or m.get("encoding") or "hex"}, 30.0) or {})
+        h = res.get("handle") or res.get("derivedHandle") or res.get("signature")
+        res.setdefault("handle", h); res.setdefault("derivedHandle", h)
+        return _AttrDict(res)
 
-    def jwt_sign(
-        self, secret_handle: str, claims: dict[str, Any], alg: str = "HS256", *,
-        header: Optional[dict[str, Any]] = None, hop_receipt_id: Optional[str] = None, slot: Optional[str] = None,
-        ttl_ms: Optional[int] = None, allowed_origins: Optional[list[str]] = None, **kwargs: Any,
-    ) -> dict[str, Any]:
-        args: dict[str, Any] = {"secretHandle": secret_handle, "claims": dict(claims), "alg": alg}
-        if header is not None:
-            args["header"] = dict(header)
-        if hop_receipt_id or kwargs.get("hopReceiptId"):
-            args["hopReceiptId"] = hop_receipt_id or kwargs.get("hopReceiptId")
-        if slot:
-            args["slot"] = slot
-        ttl = ttl_ms if ttl_ms is not None else kwargs.get("ttlMs")
-        if ttl is not None:
-            args["ttlMs"] = ttl
-        ao = allowed_origins or kwargs.get("allowedOrigins")
-        if ao:
-            args["allowedOrigins"] = list(ao)
-        return _AwaitableDict(_rpc("crypto.jwtSign", args, 30.0))
+    def jwt_sign(self, secret_handle: Any = None, claims: Any = None, alg: Any = None, *, header: Optional[dict[str, Any]] = None, hop_receipt_id: Optional[str] = None, slot: Optional[str] = None, ttl_ms: Optional[int] = None, allowed_origins: Optional[list[str]] = None, **kwargs: Any) -> dict[str, Any]:
+        is_opt = isinstance(secret_handle, dict) and claims is None and any(k in secret_handle for k in ("secretHandle", "secret_handle", "keyHandle", "key_handle", "claims", "payload"))
+        m = {**(secret_handle if is_opt else {}), **(alg if isinstance(alg, dict) else {}), **kwargs}
+        sh = _cap_handle(_pick(m, "secretHandle", "secret_handle", "keyHandle", "key_handle") if (is_opt or secret_handle is None) else secret_handle)
+        c_val = claims if claims is not None else _pick(m, "claims", "payload")
+        alg_v = (alg if isinstance(alg, str) else None) or _pick(m, "alg", "algorithm") or "HS256"
+        args: dict[str, Any] = {"secretHandle": sh, "claims": dict(c_val) if isinstance(c_val, dict) else {}, "alg": alg_v}
+        hdr = header if header is not None else m.get("header")
+        if hdr is not None: args["header"] = dict(hdr)
+        for dst, val in (("hopReceiptId", hop_receipt_id or _pick(m, "hopReceiptId", "hop_receipt_id")), ("slot", slot or m.get("slot"))):
+            if val: args[dst] = val
+        ttl = ttl_ms if ttl_ms is not None else _pick(m, "ttlMs", "ttl_ms")
+        if ttl is not None: args["ttlMs"] = ttl
+        ao = allowed_origins or _pick(m, "allowedOrigins", "allowed_origins")
+        if ao: args["allowedOrigins"] = list(ao)
+        res = dict(_rpc("crypto.jwtSign", args, 30.0) or {})
+        dh = res.get("derivedHandle")
+        res.setdefault("handle", dh); res.setdefault("token", dh)
+        return _AttrDict(res)
 
-    def await_async(
-        self, poll_request: Any, match_predicate: Optional[dict[str, Any]] = None, *,
-        profile: Optional[str] = None, timeout_ms: Optional[int] = None, interval_ms: Optional[int] = None,
-        max_attempts: Optional[int] = None, trigger_exchange_id: Optional[str] = None, t_trigger_ms: Optional[int] = None,
-        correlation_id: Optional[str] = None, correlation_ids: Optional[list[str]] = None,
-        entity_id: Optional[str] = None, **kwargs: Any,
-    ) -> dict[str, Any]:
-        poll_args, _ = self._build_http_args(poll_request, {})
+    def await_async(self, poll_request: Any = None, match_predicate: Any = None, *, profile: Optional[str] = None, timeout_ms: Optional[int] = None, interval_ms: Optional[int] = None, max_attempts: Optional[int] = None, trigger_exchange_id: Optional[str] = None, t_trigger_ms: Optional[int] = None, correlation_id: Optional[str] = None, correlation_ids: Optional[list[str]] = None, entity_id: Optional[str] = None, **kwargs: Any) -> dict[str, Any]:
+        m = {**(poll_request if isinstance(poll_request, dict) else {}), **kwargs}
+        nested = _pick(m, "pollRequest", "poll_request", "request")
+        target = nested if nested is not None else (poll_request if poll_request is not None else m)
+        poll_args, _ = self._build_http_args(target, m if isinstance(target, str) else {})
         args: dict[str, Any] = {"pollRequest": poll_args}
-        mp = match_predicate if match_predicate is not None else kwargs.get("matchPredicate")
-        if mp is not None:
-            args["matchPredicate"] = dict(mp)
-        if profile:
-            args["profile"] = profile
-        t_ms = timeout_ms if timeout_ms is not None else kwargs.get("timeoutMs")
-        for dst, val in (
-            ("timeoutMs", t_ms), ("intervalMs", interval_ms if interval_ms is not None else kwargs.get("intervalMs")),
-            ("maxAttempts", max_attempts if max_attempts is not None else kwargs.get("maxAttempts")),
-            ("tTriggerMs", t_trigger_ms if t_trigger_ms is not None else kwargs.get("tTriggerMs")),
-        ):
-            if val is not None:
-                args[dst] = val
-        trig = trigger_exchange_id or kwargs.get("triggerExchangeId")
-        if trig:
-            args["triggerExchangeId"] = trig.exchange_id if isinstance(trig, Exchange) else str(trig)
-        if correlation_id or kwargs.get("correlationId"):
-            args["correlationId"] = correlation_id or kwargs.get("correlationId")
-        cids = correlation_ids or kwargs.get("correlationIds")
-        if cids:
-            args["correlationIds"] = list(cids)
-        if entity_id or kwargs.get("entityId"):
-            args["entityId"] = entity_id or kwargs.get("entityId")
-        return _AwaitableDict(_rpc("async.awaitResult", args, max((float(t_ms) / 1000.0 if t_ms else 30.0) + 10.0, 15.0)))
+        mp = _norm_pred(match_predicate if match_predicate is not None else _pick(m, "matchPredicate", "match_predicate", "match", "predicate", "until"), _pick(m, "expectStatus", "expect_status"))
+        if mp is not None: args["matchPredicate"] = mp
+        prof = profile or m.get("profile")
+        if prof: args["profile"] = prof
+        t_ms = timeout_ms if timeout_ms is not None else _pick(m, "timeoutMs", "timeout_ms")
+        for dst, val in (("timeoutMs", t_ms), ("intervalMs", interval_ms if interval_ms is not None else _pick(m, "intervalMs", "interval_ms")), ("maxAttempts", max_attempts if max_attempts is not None else _pick(m, "maxAttempts", "max_attempts")), ("tTriggerMs", t_trigger_ms if t_trigger_ms is not None else _pick(m, "tTriggerMs", "t_trigger_ms"))):
+            if val is not None: args[dst] = val
+        trig = trigger_exchange_id or _pick(m, "triggerExchangeId", "trigger_exchange_id")
+        if trig: args["triggerExchangeId"] = trig.exchange_id if isinstance(trig, Exchange) else (str(_pick(trig, "exchangeId", "exchange_id") or "") if isinstance(trig, dict) else str(trig))
+        for dst, val in (("correlationId", correlation_id or _pick(m, "correlationId", "correlation_id")), ("entityId", entity_id or _pick(m, "entityId", "entity_id"))):
+            if val: args[dst] = val
+        cids = correlation_ids or _pick(m, "correlationIds", "correlation_ids")
+        if cids: args["correlationIds"] = list(cids)
+        res = dict(_rpc("async.awaitResult", args, max((float(t_ms) / 1000.0 if t_ms else 30.0) + 10.0, 15.0)) or {})
+        if isinstance(res.get("exchange"), dict): res["exchange"] = _AttrDict(res["exchange"])
+        return _AttrDict(res)
 
     def prove_composite(self, receipt: dict[str, Any]) -> dict[str, Any]:
         payload = receipt if isinstance(receipt, dict) and "receipt" in receipt else {"receipt": receipt}

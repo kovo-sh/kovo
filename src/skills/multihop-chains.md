@@ -27,9 +27,9 @@ Whenever a host-signed HTTP exchange, GraphQL response, SSE event, browser trace
 3. Layer 1 performs the injection host-side and records `consumedCapabilityId` in the host-signed transcript, enabling deterministic `value_binding` verification.
 
 ## 4. Host-Side Cryptographic Derivation (`ctx.hmac_sign` / `ctx.jwt_sign`)
-When a multi-hop workflow requires signing a webhook body, token, or request with sealed `signing_material` (`cap:hop_<id>:<slot>`), stay in the **same script** after sealing Hop 1–2 and execute Hops 3–5 directly:
-- **HMAC signing (1-line pattern):** `const sig = await ctx.hmac_sign({ secretHandle: cap.handle, payload, alg: "sha256", encoding: "hex" })` (supports `sha256`/`sha384`/`sha512`, `hex`/`base64`/`base64url`; Python: `ctx.hmac_sign(secret_handle, payload, alg="sha256", encoding="hex")`). Returns `{ exchangeId, signature, attestation: { derivedFromCapabilityId, alg, encoding, payloadDigest, signatureDigest, sourceSecretDigest, runId, timestampMs } }`.
-- **JWT signing (1-line pattern):** `const minted = await ctx.jwt_sign({ secretHandle: cap.handle, claims, alg: "HS256", hopReceiptId: "2", slot: "jwt" })` (optional `header`, `ttlMs`, `allowedOrigins`; supports `HS256`/`HS384`/`HS512`; Python: `ctx.jwt_sign(secret_handle, claims, alg="HS256", header=..., hop_receipt_id=..., slot=...)`). Returns `{ exchangeId, derivedHandle, attestation: { derivedFromCapabilityId, derivedHandle, ... } }`, sealing the minted token as child `derivedHandle` (`cap:hop_<id>:<slot>`).
+When a multi-hop workflow requires signing a webhook body, token, or request with a sealed `hmac_key` / `signing_salt` (`cap:hop_<id>:<slot>`), stay in the **same script** after sealing Hop 1–2 and execute Hops 3–5 directly:
+- **HMAC signing (1-line pattern):** `const sig = await ctx.hmac_sign({ secretHandle: cap.handle, payload, alg: "sha256", encoding: "hex" })` (supports `sha256`/`sha384`/`sha512`, `hex`/`base64`/`base64url`; Python: `ctx.hmac_sign(secret_handle, payload, alg="sha256", encoding="hex")`). Returns `{ exchangeId, signature, handle, derivedHandle, attestation: { derivedFromCapabilityId, alg, encoding, payloadDigest, signatureDigest, sourceSecretDigest, runId, timestampMs } }`.
+- **JWT signing (1-line pattern):** `const minted = await ctx.jwt_sign({ secretHandle: cap.handle, claims, alg: "HS256", hopReceiptId: "2", slot: "jwt" })` (optional `header`, `ttlMs`, `allowedOrigins`; supports `HS256`/`HS384`/`HS512`; Python: `ctx.jwt_sign(secret_handle, claims, alg="HS256", header=..., hop_receipt_id=..., slot=...)`). Returns `{ exchangeId, derivedHandle, handle, token, attestation: { derivedFromCapabilityId, derivedHandle, ... } }`, sealing the minted token as child `derivedHandle` (`cap:hop_<id>:<slot>`, aliased as `handle` / `token`).
 - Both helpers emit a host-signed `derivedFromCapabilityId` attestation in the transcript so `derived_crypto_binding` verifies end-to-end lineage without exposing raw key bytes to the worker.
 - For cryptographic scope-replay verification, always capture three host-signed observations:
   1. Tampered/invalid signature is rejected (`401`/`403`) — rules out signature-skip decoys.
@@ -101,7 +101,7 @@ Use this exact pattern whenever a chain crosses signing, token-forgery, or backg
 const preDenied = await ctx.http_send('/api/v1/exports/foreign-item', { as: 'member_b', role: 'control' })
 // Hop 1: low-priv persona retrieves intermediate signing material (seal it; do NOT file as standalone CWE-200)
 const h1 = await ctx.http_send('/api/v1/service-meta', { as: 'member_b', role: 'probe' })
-const keyCap = await ctx.seal_capability({ exchange: h1, hopReceiptId: '1', slot: 'signing_key', jsonPath: '$.signingKey', kind: 'signing_material' })
+const keyCap = await ctx.seal_capability({ exchange: h1, hopReceiptId: '1', slot: 'signing_key', jsonPath: '$.signingKey', kind: 'hmac_key' })
 // Hop 2: derive host-attested HMAC signature (or forged JWT via ctx.jwt_sign) and trigger async job
 const payload = JSON.stringify({ action: 'export', tenant: 'target_org', correlationId: 'corr-1' })
 const sig = await ctx.hmac_sign({ secretHandle: keyCap.handle, payload, alg: 'sha256', encoding: 'hex' })
