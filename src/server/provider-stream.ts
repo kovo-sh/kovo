@@ -49,6 +49,11 @@ export interface StreamSanitizeOptions {
   secrets?: readonly NamedSecret[]
   responseLimit?: number
   /**
+   * Called once as soon as the first non-empty body chunk arrives from upstream, so callers can
+   * disarm connect / first-event timers without aborting an active stream mid-body.
+   */
+  onFirstChunk?: () => void
+  /**
    * Called in real time as each upstream SSE data frame arrives (before end-of-stream redaction
    * buffering completes). Used to reset provider idle/no-token watchdogs so active streams are
    * never misclassified as stalled.
@@ -58,6 +63,8 @@ export interface StreamSanitizeOptions {
 
 const replacement = '[redacted]'
 const credentialField = /^(?:authorization|proxy-authorization|cookie|set-cookie|password|api[_-]?key|token|session[_-]?(?:id|key)|client[_-]?secret|service[_-]?role[_-]?key)$/i
+const rawCookieField = /^(?:cookie|set-cookie)$/i
+type FragmentMode = 'text' | 'json_args' | 'raw_args'
 const terminalEvents = new Set(['response.completed', 'response.incomplete', 'response.failed', 'message_stop', 'error'])
 const messageEvents = new Set([
   'message_start', 'message_delta', 'message_stop', 'content_block_start', 'content_block_delta', 'content_block_stop',
@@ -91,6 +98,43 @@ function fragment(owner: Fields | undefined, field: string): Fragment | undefine
   return owner && typeof text === 'string' ? { owner, field, text } : undefined
 }
 
+/**
+ * Redacts only the exact provider API key and registered vault/persona secrets (including
+ * URL-encoded and base64/base64url variants) without applying heuristic credential regexes.
+ * Used for model tool-call arguments so legitimate scripts, canary tokens, and auth probes
+ * containing parameter or variable names like `token`, `password`, or `secret` are not corrupted.
+ */
+export function redactExactSecrets(value: string, key: string, secrets: readonly NamedSecret[] = []): string {
+  let out = key ? value.replaceAll(key, replacement) : value
+  for (const secret of secrets) {
+    if (!secret.value || secret.value.length < 4) continue
+    out = out.replaceAll(secret.value, secret.placeholder)
+    const encoded = encodeURIComponent(secret.value)
+    if (encoded !== secret.value && encoded.length >= 6) out = out.replaceAll(encoded, secret.placeholder)
+    const b64 = Buffer.from(secret.value, 'utf8').toString('base64')
+    if (b64 !== secret.value && b64.length >= 4) out = out.replaceAll(b64, secret.placeholder)
+    const b64url = Buffer.from(secret.value, 'utf8').toString('base64url')
+    if (b64url !== secret.value && b64url !== b64 && b64url.length >= 4) out = out.replaceAll(b64url, secret.placeholder)
+  }
+  return out
+}
+
+function sanitizeToolArgumentValue(
+  value: unknown,
+  key: string,
+  secrets: readonly NamedSecret[] = [],
+): unknown {
+  if (typeof value === 'string') return redactExactSecrets(value, key, secrets)
+  if (Array.isArray(value)) return value.map(item => sanitizeToolArgumentValue(item, key, secrets))
+  const record = fields(value)
+  if (!record) return value
+  return Object.fromEntries(Object.entries(record).map(([name, item]) => {
+    const safeName = redactExactSecrets(name, key, secrets)
+    if (rawCookieField.test(name) && typeof item === 'string') return [safeName, replacement]
+    return [safeName, sanitizeToolArgumentValue(item, key, secrets)]
+  }))
+}
+
 function redactArguments(value: string, key: string, secrets: readonly NamedSecret[]): string {
   if (!value.trim()) return value
   let parsed: unknown
@@ -99,7 +143,7 @@ function redactArguments(value: string, key: string, secrets: readonly NamedSecr
   } catch {
     return '{}'
   }
-  const safe = JSON.stringify(sanitizeProviderValue(parsed, key, undefined, secrets))
+  const safe = JSON.stringify(sanitizeToolArgumentValue(parsed, key, secrets))
   return safe === JSON.stringify(parsed) ? value : safe
 }
 
@@ -108,11 +152,15 @@ function prepareFragments(
   key: string,
   prepared: Prepared,
   secrets: readonly NamedSecret[],
-  json = false,
+  mode: FragmentMode = 'text',
 ) {
   if (!items.length) return
   const joined = items.map(item => item.text).join('')
-  const safe = json ? redactArguments(joined, key, secrets) : redactProviderText(joined, key, secrets)
+  const safe = mode === 'json_args'
+    ? redactArguments(joined, key, secrets)
+    : mode === 'raw_args'
+      ? redactExactSecrets(joined, key, secrets)
+      : redactProviderText(joined, key, secrets)
   let offset = 0
   for (const [index, item] of items.entries()) {
     const end = index === items.length - 1 ? undefined : offset + item.text.length
@@ -151,18 +199,32 @@ export function sanitizeProviderValue(
     ) {
       return [safeName, redactArguments(item, key, secrets)]
     }
+    if (
+      name === 'input' && typeof item === 'string' &&
+      (record.type === 'custom_tool_call' || record.type === 'response.custom_tool_call_input.done')
+    ) {
+      return [safeName, redactExactSecrets(item, key, secrets)]
+    }
+    if (name === 'input' && record.type === 'tool_use') {
+      return [safeName, sanitizeToolArgumentValue(item, key, secrets)]
+    }
     return [safeName, sanitizeProviderValue(item, key, prepared, secrets)]
   }))
 }
 
 function prepareDeltas(frames: Frame[], key: string, secrets: readonly NamedSecret[]): Prepared {
-  const groups = new Map<string, { json: boolean; parts: Fragment[] }>()
+  const groups = new Map<string, { mode: FragmentMode; parts: Fragment[] }>()
   function add(protocol: 'responses' | 'messages', index: unknown, channel: string, part: Fragment | undefined) {
     if (!part) return
     const id = JSON.stringify([protocol, index, channel])
     let group = groups.get(id)
     if (!group) {
-      group = { json: channel === 'arguments' || channel === 'partial_json', parts: [] }
+      const mode: FragmentMode = (channel === 'arguments' || channel === 'partial_json')
+        ? 'json_args'
+        : channel === 'input'
+          ? 'raw_args'
+          : 'text'
+      group = { mode, parts: [] }
       groups.set(id, group)
     }
     group.parts.push(part)
@@ -186,7 +248,7 @@ function prepareDeltas(frames: Frame[], key: string, secrets: readonly NamedSecr
     }
   }
   const prepared: Prepared = new WeakMap()
-  for (const group of groups.values()) prepareFragments(group.parts, key, prepared, secrets, group.json)
+  for (const group of groups.values()) prepareFragments(group.parts, key, prepared, secrets, group.mode)
   return prepared
 }
 
@@ -228,6 +290,7 @@ export function sanitizeProviderStream(
   responseLimitArg?: number,
 ): ReadableStream<Uint8Array> {
   const secrets = isSecretList(secretsOrOptions) ? secretsOrOptions : (secretsOrOptions.secrets ?? [])
+  const onFirstChunk = isSecretList(secretsOrOptions) ? undefined : secretsOrOptions.onFirstChunk
   const onActivity = isSecretList(secretsOrOptions) ? undefined : secretsOrOptions.onActivity
   const requestedLimit = isSecretList(secretsOrOptions)
     ? (responseLimitArg ?? defaultStreamResponseLimit)
@@ -238,6 +301,7 @@ export function sanitizeProviderStream(
   let size = 0
   let finished = false
   let trailingCr = false
+  let sawFirstChunk = false
   const frames: Frame[] = []
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
@@ -285,6 +349,12 @@ export function sanitizeProviderStream(
 
   return body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
+      if (!sawFirstChunk && chunk.byteLength > 0) {
+        sawFirstChunk = true
+        if (onFirstChunk) {
+          try { onFirstChunk() } catch { /* first-chunk signal must never break the stream */ }
+        }
+      }
       size += chunk.byteLength
       if (size > responseLimit) throw new Error('The model response exceeded Kovo Hunter’s size limit.')
       append(decoder.decode(chunk, { stream: true }), controller)
