@@ -16,10 +16,10 @@ export const Route = createRootRoute({
     ],
     links: [
       { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' },
-      // Design-system utilities load before the legacy sheet so same-specificity
-      // legacy rules keep winning on routes that have not been migrated yet.
-      { rel: 'stylesheet', href: designSystemStyles },
+      // Base tokens and element defaults load before Tailwind v4 utilities so
+      // utility classes always win cleanly on same-specificity ties.
       { rel: 'stylesheet', href: appStyles },
+      { rel: 'stylesheet', href: designSystemStyles },
     ],
   }),
   component: Shell,

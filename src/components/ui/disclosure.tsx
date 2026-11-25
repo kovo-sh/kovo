@@ -17,7 +17,7 @@ export function DisclosureTrigger({ className, children, ...props }: Collapsible
     <CollapsiblePrimitive.Trigger
       data-slot="disclosure-trigger"
       className={cn(
-        'group flex w-full cursor-pointer items-center gap-2 rounded-control px-2 py-1.5 text-left font-sans text-[12.5px] font-medium text-fg',
+        'group flex h-auto w-full cursor-pointer items-center gap-2 rounded-control border-0 bg-transparent px-2 py-1.5 text-left font-sans text-[12.5px] font-medium text-fg shadow-none',
         'transition-colors duration-[var(--d1)] ease-guardian hover:bg-hover',
         className,
       )}

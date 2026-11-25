@@ -155,6 +155,7 @@ function Palette({ prefill }: { prefill: string }) {
       className="max-w-[620px] overflow-hidden rounded-2xl border-line-2 bg-raise p-0"
       aria-label="Command palette"
     >
+      <DialogTitle className="sr-only">Run command palette</DialogTitle>
       <div className="flex h-[50px] items-center gap-2.5 border-b border-line px-4 text-fg-subtle">
         <Icon name="search" />
         <input

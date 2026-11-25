@@ -4,7 +4,7 @@ import { removeRun } from '../../actions.ts'
 import { cn } from '../../lib/cn.ts'
 import { Icon } from '../run/icons.tsx'
 import { runStatusLabel } from '../run/meta.ts'
-import { formatUsd, phaseNames } from '../run-state.ts'
+import { capabilityTierMeta, formatUsd, phaseNames } from '../run-state.ts'
 import { formatFullDateTime, formatRelativeTime, useNow } from '../shell/AppShell.tsx'
 import { Badge } from '../ui/badge.tsx'
 import { Button } from '../ui/button.tsx'
@@ -24,13 +24,6 @@ import { formatGithubPatBadge } from './types.ts'
 interface Props {
   data: ProjectLoaderData
   onSelectTab: (tab: ProjectTabId) => void
-}
-
-const RUN_MODE_LABEL: Record<number, string> = {
-  0: 'Offline Audit',
-  1: 'Safe Audit',
-  2: 'Core Pentest',
-  3: 'Active Pentest',
 }
 
 const SETUP_GRID_COLS: Record<number, string> = {
@@ -258,12 +251,12 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
       : `Latest run ${runStatusLabel(latestRun!.status)}`
   const postureSub = latestRun
     ? [
-      RUN_MODE_LABEL[latestRun.capabilityTier] ?? 'Standard',
+      capabilityTierMeta[latestRun.capabilityTier]?.name ?? 'Standard',
       phaseNames[latestRun.phase],
       plural(completedRuns, 'completed run'),
       formatRelativeTime(latestRun.createdAt, { compact: false, now }),
     ].join(' · ')
-    : 'No scans yet — start with a Safe Audit to map the surface.'
+    : `No scans yet — start with a ${capabilityTierMeta[1].name} to map the surface.`
 
   async function confirmDeleteRun() {
     if (!runToDelete || deletingRun) return
@@ -409,7 +402,7 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
                       <span className="truncate">{run.goal}</span>
                     </span>
                     <span className="text-[12px] tabular-nums text-fg-subtle">
-                      {RUN_MODE_LABEL[run.capabilityTier] ?? 'Standard'} · {phaseNames[run.phase]}
+                      {capabilityTierMeta[run.capabilityTier]?.name ?? 'Standard'} · {phaseNames[run.phase]}
                       {run.findingCount > 0 ? ` · ${plural(run.findingCount, 'finding')}` : ''}
                       {run.confirmedCount > 0 ? ` (${run.confirmedCount} confirmed)` : ''}
                       {' '}· {run.turnsUsed} turns · {run.spentRequests} reqs · {formatUsd(run.spentUsd)}
@@ -449,7 +442,7 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
             <EmptyState
               icon={<RunsEmptySvg />}
               title="No runs yet"
-              description={`Start a Safe Audit to map your surface, or run a Core Pentest with test accounts to verify access controls across ${project.name}. Use New run in the header to begin.`}
+              description={`Start a ${capabilityTierMeta[1].name} to map your surface, or run ${capabilityTierMeta[2].name} with test accounts to verify access controls across ${project.name}. Use New run in the header to begin.`}
               className="max-w-[440px] py-9 [&_[data-slot=empty-state-icon]]:size-auto [&_[data-slot=empty-state-icon]>svg]:h-[88px] [&_[data-slot=empty-state-icon]>svg]:w-[180px]"
             />
           </div>
