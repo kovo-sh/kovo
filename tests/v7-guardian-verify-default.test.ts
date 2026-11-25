@@ -18,6 +18,7 @@ import {
   SPECIALIST_COMMON_TOOLS,
   SPECIALIST_PROFILES,
   buildWorkerTools,
+  coordinatorPlannerPrompt,
   filterHandlersForSpecialist,
   proofToolHandlerNames,
   summarizeGuardianVerifyOutcome,
@@ -26,6 +27,7 @@ import {
   workerSessionInstructions,
 } from '../src/server/agent-session.ts'
 import type { WorkerToolHandlers } from '../src/server/agent-session.ts'
+import { buildAssignmentBrief } from '../src/server/assignment-brief.ts'
 import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'
 import { agentProofAttribution } from '../src/server/exec-verify.ts'
@@ -667,4 +669,81 @@ test('TS wrapper edge cases (markdown fences, inline semicolon export default, s
     openAttempt: makeFactory(),
   })
   assert.equal(pyAsyncDefVerdict.confirmed, true, `${pyAsyncDefVerdict.reason}: ${pyAsyncDefVerdict.detail} | stderr=${pyAsyncDefVerdict.stderrPreview ?? ''}`)
+})
+
+test('guardian_verify tool accepts code/source aliases, returns 1-line JSON example on missing script, and flags repeated validation loops', async () => {
+  const receivedScripts: string[] = []
+  const handlers: WorkerToolHandlers = {
+    guardian_verify: async args => {
+      receivedScripts.push(args.script ?? '')
+      return { confirmed: false, reason: 'oracle_failed', detail: 'stub' }
+    },
+    record_fact: async () => ({}),
+    record_coverage: async () => ({}),
+    complete_intent: async () => ({}),
+  }
+  const tools = buildWorkerTools(handlers, v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {})
+  const gvTool = tools.find(tool => tool.name === 'guardian_verify')
+  assert.ok(gvTool, 'guardian_verify tool must be built')
+
+  const execCtx = { abortSignal: new AbortController().signal } as Parameters<typeof gvTool.execute>[2]
+  const dummyApi = {} as Parameters<typeof gvTool.execute>[1]
+
+  // 1. `code` alias normalizes to `script`
+  const viaCode = await gvTool.execute({ code: "await ctx.prove_access_boundary({ route: '/api/a' })", runtime: 'ts' }, dummyApi, execCtx)
+  assert.equal(viaCode.isError ?? false, false)
+  assert.equal(receivedScripts[0], "await ctx.prove_access_boundary({ route: '/api/a' })")
+
+  // 2. `source` alias normalizes to `script`
+  const viaSource = await gvTool.execute({ source: "await ctx.prove_access_boundary({ route: '/api/b' })", runtime: 'ts' }, dummyApi, execCtx)
+  assert.equal(viaSource.isError ?? false, false)
+  assert.equal(receivedScripts[1], "await ctx.prove_access_boundary({ route: '/api/b' })")
+
+  // 3. Missing script returns actionable 1-line JSON call example and triggers loop-stop guidance on 3rd failure
+  const err1 = await gvTool.execute({ runtime: 'ts' }, dummyApi, execCtx)
+  assert.equal(err1.isError, true)
+  const text1 = (err1.output ?? []).map(o => ('text' in o ? o.text : '')).join('')
+  assert.match(text1, /Example call: \{"script":/)
+  assert.equal(text1.includes('stop retrying malformed calls'), false)
+
+  await gvTool.execute({ runtime: 'ts' }, dummyApi, execCtx)
+  const err3 = await gvTool.execute({ runtime: 'ts' }, dummyApi, execCtx)
+  assert.equal(err3.isError, true)
+  const text3 = (err3.output ?? []).map(o => ('text' in o ? o.text : '')).join('')
+  assert.match(text3, /stop retrying malformed calls/)
+})
+
+test('planner prompt and worker assignment brief explicitly mark floor-confirmed routes as DO NOT RE-PROVE without 10-item truncation', () => {
+  const confirmed = Array.from({ length: 14 }, (_, i) => ({
+    origin: 'http://127.0.0.1:4101',
+    method: 'GET',
+    path: `/api/v1/resource-${i + 1}/:id`,
+    cwe: 'CWE-639',
+    probeClass: 'broken-access-control',
+  }))
+
+  const plannerJson = JSON.parse(coordinatorPlannerPrompt({
+    goal: 'Test unconfirmed routes',
+    roundNo: 1,
+    capabilityTier: 2,
+    approvedOrigins: ['http://127.0.0.1:4101'],
+    budgetRemaining: { usd: 2, requests: 'unlimited' },
+    dynamicStepBudget: 12,
+    pendingOob: 0,
+    chainSteps: [],
+    alreadyConfirmed: confirmed,
+  })) as { alreadyConfirmedByFloor?: { directive: string; items: Array<{ path: string }> } }
+
+  assert.ok(plannerJson.alreadyConfirmedByFloor)
+  assert.match(plannerJson.alreadyConfirmedByFloor.directive, /ALREADY CONFIRMED BY FLOOR — DO NOT RE-PROVE/)
+  assert.equal(plannerJson.alreadyConfirmedByFloor.items.length, 14, 'must not truncate 14 floor hits at 10')
+
+  const brief = JSON.parse(buildAssignmentBrief({
+    missionKind: 'class_scan',
+    origin: 'http://127.0.0.1:4101',
+    routes: [{ method: 'POST', path: '/api/v1/unconfirmed-action', riskScore: 85 }],
+    alreadyConfirmedOnOrigin: confirmed.slice(0, 4),
+  })) as { alreadyConfirmedDirective?: string; alreadyConfirmedOnOrigin?: unknown[] }
+  assert.match(brief.alreadyConfirmedDirective ?? '', /ALREADY CONFIRMED BY FLOOR — DO NOT RE-PROVE/)
+  assert.equal(brief.alreadyConfirmedOnOrigin?.length, 4)
 })

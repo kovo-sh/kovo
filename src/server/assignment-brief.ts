@@ -352,7 +352,12 @@ function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<
           },
         }
       : {}),
-    ...(state.confirmed.length ? { alreadyConfirmedOnOrigin: state.confirmed } : {}),
+    ...(state.confirmed.length
+      ? {
+          alreadyConfirmedDirective: 'ALREADY CONFIRMED BY FLOOR — DO NOT RE-PROVE; investigate unconfirmed routes/classes instead.',
+          alreadyConfirmedOnOrigin: state.confirmed,
+        }
+      : {}),
     targetCount: Math.max(1, Math.min(3, Math.floor(input.targetCount ?? 1))),
     ...(input.turnBudget ? { turnBudget: Math.max(1, Math.min(30, Math.floor(input.turnBudget))) } : {}),
   }
@@ -426,7 +431,7 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
       const right = `${b.path} ${b.method}`
       return left < right ? -1 : left > right ? 1 : 0
     })
-    .slice(0, 10)
+    .slice(0, 30)
 
   const codeBudget = input.codeExpansion === 'full'
     ? ASSIGNMENT_BRIEF_CODE_EXPANDED_BYTES

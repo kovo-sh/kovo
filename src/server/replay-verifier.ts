@@ -2994,7 +2994,24 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
     title: params.title?.trim() || verdict.claimTitle || 'Agent script proof',
   })
   if (!built) {
-    return { verdict, exchanges, receipt: null, vulnClass: null, transcriptDigests, ...attribution }
+    // Fail closed: every agent script confirmation MUST produce a verified ProofReceipt.
+    // Never fall back to a receiptless script-only confirmation (e.g. mutating POST boundary claims
+    // that lack persisted before/after readbacks).
+    return {
+      verdict: {
+        ...verdict,
+        confirmed: false,
+        reason: 'oracle_failed',
+        rejectedBy: 'receipt',
+        missingEvidence: [...new Set([...(verdict.missingEvidence ?? []), 'verified_proof_receipt'])],
+        detail: 'ProofReceipt could not be built from the script claims: mutating boundary claims require persisted before/after readbacks via ctx.prove_persisted_mutation; read-only boundaries require GET/HEAD.',
+      },
+      exchanges,
+      receipt: null,
+      vulnClass: null,
+      transcriptDigests,
+      ...attribution,
+    }
   }
   const verification = verifyReceipt(built.receipt, built.transcript)
   if (!verification.confirmed) {

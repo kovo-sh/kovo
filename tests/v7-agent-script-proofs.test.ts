@@ -1084,3 +1084,137 @@ test('v7 agent-script-proofs: retestReplaySpec runs persisted agent script (repr
   assert.equal(errored.verdict, 'inconclusive', errored.replay.outcome.reason ?? errored.replay.outcome.observed)
   assert.equal(errored.replay.verdict, 'inconclusive')
 })
+
+// ---------------------------------------------------------------------------
+// 6. Strict ProofReceipt gate: receiptless mutating boundary claims fail closed
+// ---------------------------------------------------------------------------
+
+test('v7 agent-script-proofs: mutating POST boundary claim without readback fails closed and refuses receiptless persistence', async (t) => {
+  const fixture = await startTenantWriteFixture()
+  t.after(() => fixture.close())
+  const { storage } = makeStore(t)
+  // Local endpoint where both owner_acme and member_beta receive 200 on POST (reproduces #150's
+  // mutating boundary claim without before/after readback: assessBoundary passes the actor
+  // differential, buildAgentScriptReceipt returns null for mutating boundary claims, and
+  // runAgentScriptProof MUST fail closed with rejectedBy='receipt' instead of confirming a
+  // receiptless CWE-200 FP).
+  const postServer = createServer((req, res) => {
+    res.setHeader('content-type', 'application/json')
+    if (req.method === 'POST' && req.url === '/api/inbox/alert-1/read') {
+      res.statusCode = 200
+      res.end(JSON.stringify({ id: 'alert-1', read: true }))
+      return
+    }
+    res.statusCode = 404
+    res.end(JSON.stringify({ error: 'not found' }))
+  })
+  postServer.listen(0, '127.0.0.1')
+  await once(postServer, 'listening')
+  t.after(() => {
+    postServer.closeAllConnections()
+    postServer.close()
+  })
+  const postOrigin = `http://127.0.0.1:${(postServer.address() as { port: number }).port}`
+  const { runId } = await setupApprovedRun(storage, { seeds: [postOrigin], environment: 'local-lab', tier: 3 })
+  const run = storage.run(runId)
+  const asset = run.candidates[0]!
+  const assignment = storage.makeWorker(run, 'verification', asset, 'Mutating boundary fail-closed', 'fixture')
+
+  const broker = new RequestBroker({ rejectUnauthorized: false })
+  const grant = makeMultiTenantGrant(postOrigin)
+
+  const mutatingBoundaryBackend = makeFakeVerifyBackend(async ({ rpc }) => {
+    const ctrl = await rpc('http', {
+      origin: postOrigin,
+      method: 'POST',
+      path: '/api/inbox/alert-1/read',
+      persona: 'owner_acme',
+      sessionGroupRole: 'control',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ read: true }),
+    })
+    assert.equal(ctrl.ok, true, ctrl.error ?? 'ctrl RPC failed')
+    const probe = await rpc('http', {
+      origin: postOrigin,
+      method: 'POST',
+      path: '/api/inbox/alert-1/read',
+      persona: 'member_beta',
+      sessionGroupRole: 'probe',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ read: true }),
+    })
+    assert.equal(probe.ok, true, probe.error ?? 'probe RPC failed')
+    return {
+      runtime: 'ts',
+      result: {
+        title: 'Mutating POST boundary without readback',
+        severity: 'high',
+        claims: [{
+          kind: 'boundary',
+          boundaryClass: 'access',
+          controlExchangeId: String(ctrl.result!.exchangeId),
+          probeExchangeId: String(probe.result!.exchangeId),
+          expectControlDenied: false,
+        }],
+      },
+      stdout: '',
+      stderr: '',
+      exitCode: 0,
+      durationMs: 10,
+      timedOut: false,
+    }
+  })
+
+  const proof = await runAgentScriptProof({
+    script: '// mutating POST boundary without readback\n',
+    runtime: 'ts',
+    title: 'Mutating POST boundary without readback',
+    broker,
+    grant,
+    backend: mutatingBoundaryBackend,
+    runId: run.id,
+    assignmentId: assignment.id,
+    targetOrigins: [postOrigin],
+    signal: AbortSignal.timeout(20_000),
+  })
+
+  assert.equal(proof.verdict.confirmed, false, 'mutating boundary claim without ProofReceipt MUST fail closed')
+  assert.equal(proof.verdict.rejectedBy, 'receipt')
+  assert.ok(proof.verdict.missingEvidence?.includes('verified_proof_receipt'))
+  assert.equal(proof.receipt, null)
+
+  // Even if a caller artificially forces verdict.confirmed=true with receipt=null, persistAgentScriptProof
+  // MUST throw InvariantError and leave zero findings persisted.
+  const execution = new Execution(storage, { backend: mutatingBoundaryBackend, broker })
+  t.after(() => execution.stop())
+  const execInternal = execution as unknown as {
+    persistAgentScriptProof: (input: {
+      run: Run
+      assignment: Assignment
+      script: string
+      runtime: 'ts' | 'python'
+      title?: string
+      proof: AgentScriptProofResult
+      secrets: ReadonlyArray<{ label: string; value: string }>
+    }) => { findingId: string; replaySpecId: string; receiptId: string | null }
+  }
+  const forgedReceiptless: AgentScriptProofResult = {
+    ...proof,
+    verdict: { ...proof.verdict, confirmed: true, reason: 'confirmed' },
+    receipt: null,
+  }
+  assert.throws(
+    () => execInternal.persistAgentScriptProof({
+      run,
+      assignment,
+      script: '// receiptless forged proof\n',
+      runtime: 'ts',
+      title: 'Must not persist CWE-200 FP',
+      proof: forgedReceiptless,
+      secrets: [],
+    }),
+    (err: unknown) => err instanceof InvariantError && err.code === 'invariant.confirmation_evidence',
+    'persistAgentScriptProof must reject receiptless confirmations',
+  )
+  assert.equal(storage.db.select().from(findings).all().length, 0, 'no receiptless finding may be persisted')
+})

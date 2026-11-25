@@ -918,10 +918,10 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     secrets: readonly NamedSecret[]
   }): { findingId: string; replaySpecId: string; receiptId: string | null } {
     const { run, assignment, proof } = input
-    if (!proof.verdict.confirmed || (proof.receipt && !proof.receipt.verification.confirmed)) {
+    if (!proof.verdict.confirmed || !proof.receipt || !proof.receipt.verification.confirmed) {
       throw new InvariantError(
         'invariant.confirmation_evidence',
-        `Invariant: refusing to persist a non-confirming agent script proof (verdict=${proof.verdict.reason}).`,
+        `Invariant: refusing to persist an agent script proof without a verified ProofReceipt (verdict=${proof.verdict.reason}, hasReceipt=${Boolean(proof.receipt)}).`,
       )
     }
     const receipt = proof.receipt?.receipt ?? null
@@ -1156,7 +1156,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       signal: params.job.controller.signal,
       canaryBroker: this.canaryBroker,
     })
-    const receiptOk = !envelope.vulnClass || result.receipt?.verification.confirmed === true
+    const receiptOk = result.receipt?.verification.confirmed === true
     const confirmed = result.verdict.confirmed && receiptOk
     const status: Finding['status'] = confirmed
       ? 'confirmed'

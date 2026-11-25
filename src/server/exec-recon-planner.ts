@@ -897,7 +897,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
   // --- Slice 3 / agentic value-add: read-only prompt context builders ---
   /** Confirmed + static-verified (endpoint, method, param, cwe) refs. Prompt context only. */
-  alreadyConfirmedRefs(run: Run, limit = 10): AlreadyConfirmedRef[] {
+  alreadyConfirmedRefs(run: Run, limit = 30): AlreadyConfirmedRef[] {
     try {
       const rows = this.storage.db.select().from(findings).where(and(
         eq(findings.runId, run.id),
@@ -1049,15 +1049,26 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     } catch {
       return { seeded: 0, endpoints: [] }
     }
+    const confirmedRefs = this.alreadyConfirmedRefs(run, 100)
     const confirmedPaths = new Set(
-      this.alreadyConfirmedRefs(run, 100).map(ref => normalizeEndpointTemplate(ref.path)),
+      confirmedRefs.map(ref => normalizeEndpointTemplate(ref.path)),
     )
+    const confirmedMethodPaths = new Set(
+      confirmedRefs
+        .filter(ref => ref.method)
+        .map(ref => `${ref.method!.toUpperCase()} ${normalizeEndpointTemplate(ref.path)}`),
+    )
+    const unconfirmedEndpoints = endpoints.filter(ep => {
+      const norm = normalizeEndpointTemplate(ep.pathTemplate)
+      const methodKey = `${(ep.method || 'GET').toUpperCase()} ${norm}`
+      return !confirmedPaths.has(norm) && !confirmedMethodPaths.has(methodKey)
+    })
     const coveredRoutes = new Set<string>()
     for (const step of existingSteps) {
       for (const route of this.stepMentionedRoutes(step)) coveredRoutes.add(route)
     }
     const candidates = selectUncoveredHighRiskEndpoints({
-      endpoints,
+      endpoints: unconfirmedEndpoints,
       approvedOrigins,
       confirmedPaths,
       coveredRoutes,
@@ -1304,8 +1315,15 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const origin = input.targetOrigins[0]
     if (!origin) return undefined
     try {
-      const routes = this.storage.listEndpoints(input.run.id, { orderBy: 'risk', limit: 40 })
+      const confirmedPathSet = new Set(
+        input.confirmed
+          .filter(ref => !ref.origin || ref.origin === origin)
+          .map(ref => normalizeEndpointTemplate(ref.path)),
+      )
+      const originEndpoints = this.storage.listEndpoints(input.run.id, { orderBy: 'risk', limit: 40 })
         .filter(ep => input.targetOrigins.includes(ep.origin))
+      const unconfirmedOriginEndpoints = originEndpoints.filter(ep => !confirmedPathSet.has(normalizeEndpointTemplate(ep.pathTemplate)))
+      const routes = (unconfirmedOriginEndpoints.length > 0 ? unconfirmedOriginEndpoints : originEndpoints)
         .slice(0, 6)
         .map(ep => ({
           method: ep.method,
@@ -1600,13 +1618,27 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const personas = [...resolveRunPersonas(this.storage, updated.projectId, updated.approvedPersonaIds).values()]
       .map(persona => ({ handle: persona.handle, roleLabel: persona.roleLabel, originAllowlist: persona.originAllowlist }))
 
-    // Priority #3: bounded cross-persona BOLA/IDOR matrix per discovered resource type.
+    // Priority #3: bounded cross-persona BOLA/IDOR matrix per discovered resource type (excluding floor-confirmed BOLA routes).
+    const confirmedForPlanner = this.alreadyConfirmedRefs(updated, 100)
+    const confirmedBolaPaths = new Set(
+      confirmedForPlanner
+        .filter(ref =>
+          ref.cwe === 'CWE-639' ||
+          ref.cwe === 'CWE-862' ||
+          ref.cwe === 'CWE-863' ||
+          confirmedCategoryFamily(ref.probeClass ?? '') === 'authz',
+        )
+        .map(ref => normalizeEndpointTemplate(ref.path)),
+    )
     let bolaAutoSteps = 0
     if (updated.capabilityTier >= 2 && personas.length >= 2 && allSteps.length < dynamicStepBudget) {
       const typeGroups = new Map<string, BolaTestQueueItem[]>()
       for (const item of buildBolaTestQueue(allUntaintedFacts, personas, approvedOrigins, this.storage.listResourceSamples(run.id))) {
+        const remainingVariants = item.variants.filter(v => !confirmedBolaPaths.has(normalizeEndpointTemplate(v.endpoint)))
+        if (confirmedBolaPaths.has(normalizeEndpointTemplate(item.endpoint)) && remainingVariants.length === 0) continue
+        const filteredItem: BolaTestQueueItem = remainingVariants.length ? { ...item, variants: remainingVariants } : item
         const key = `${item.origin}\u0000${item.resourceKey}`
-        typeGroups.set(key, [...(typeGroups.get(key) ?? []), item])
+        typeGroups.set(key, [...(typeGroups.get(key) ?? []), filteredItem])
       }
       const perOriginSteps = new Map<string, number>()
       const candidateGroups = [...typeGroups.values()].sort((a, b) =>
@@ -1710,6 +1742,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       pendingOob,
       chainSteps: this.storage.listChainSteps(fresh.id, updated.goalRevision)
         .map(step => ({ id: step.id, title: step.title, status: step.status })),
+      alreadyConfirmed: confirmedForPlanner.slice(0, 30),
       personas: personas.map(persona => ({ handle: persona.handle, roleLabel: persona.roleLabel })),
       mountedRepos: this.host.projectReposMount(updated.projectId).mountedRepos,
       openProofGaps: this.storage.listOpenProofGaps(fresh.id, updated.goalRevision)
