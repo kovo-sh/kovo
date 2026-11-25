@@ -93,6 +93,7 @@ import type {
   VerifyTranscriptRecord,
   VerifyClaim,
   VerifyCanaryBroker,
+  VerifyOobPromotionView,
 } from './verify-claims.ts'
 import {
   handleProveAccessBoundary,
@@ -292,7 +293,9 @@ export class VerifyRpcServer {
   private readonly asyncPollRecords = new Map<string, HostAsyncPollRecord>()
   private readonly mutatedSessions = new Set<string>()
   private readonly mutatedSessionEntities = new Set<string>()
-  private readonly mintedCanaryIds = new Map<string, string>()
+  private readonly mintedCanaries = new Map<string, { token: string; canaryId: string; runId: string; attemptId: string; mintedAtMs: number }>()
+  private readonly sessionOobSubscriptions = new Map<string, { token: string; canaryId: string }>()
+  private readonly bufferedOobPromotions: VerifyOobPromotionView[] = []
   private readonly sealAttemptsByExchange = new Map<string, number>()
   private readonly sessionSealedHandles = new Set<string>()
   private totalSealAttempts = 0
@@ -1425,6 +1428,44 @@ export class VerifyRpcServer {
     }
   }
 
+  /** Fail-closed lookup ensuring OOB tokens/ids belong to this session, run, and attempt. */
+  private requireSessionCanary(args: Record<string, unknown>, action: string) {
+    const raw = typeof args.token === 'string' ? args.token.trim().toLowerCase() : ''
+    if (!raw) throw new Error(`oob ${action} requires a canary token.`)
+    const entry = this.mintedCanaries.get(raw)
+    if (!entry) throw new Error(`oob ${action} rejected: canary token was not minted in this verification session.`)
+    if (entry.runId !== this.options.runId || entry.attemptId !== this.nonce) {
+      throw new Error(`oob ${action} rejected: canary token does not belong to this run/attempt.`)
+    }
+    for (const [field, expected] of [['runId', entry.runId], ['attemptId', entry.attemptId], ['canaryId', entry.canaryId]] as const) {
+      const provided = typeof args[field] === 'string' ? args[field].trim() : ''
+      if (provided && provided !== expected) throw new Error(`oob ${action} rejected: ${field} mismatch.`)
+    }
+    return entry
+  }
+
+  /** Consume only the requested canary's promotion; buffer sibling session promotions instead of discarding them. */
+  private takeOobPromotion(canary: VerifyCanaryBroker, normalizedToken: string, subscriptionId: string | null, canPromote: boolean): VerifyOobPromotionView | undefined {
+    const matches = (item: VerifyOobPromotionView): boolean => {
+      const itemToken = typeof item.subscription.token === 'string' ? item.subscription.token.trim().toLowerCase() : ''
+      if (itemToken) return itemToken === normalizedToken && (!subscriptionId || !item.subscription.id || item.subscription.id === subscriptionId)
+      return Boolean(subscriptionId && item.subscription.id === subscriptionId)
+    }
+    const bufferedIdx = this.bufferedOobPromotions.findIndex(matches)
+    if (bufferedIdx >= 0) return this.bufferedOobPromotions.splice(bufferedIdx, 1)[0]
+    if (!canPromote || !canary.promoteLate) return undefined
+    let promotions: VerifyOobPromotionView[] = []
+    try { promotions = canary.promoteLate({ runId: this.options.runId }) ?? [] } catch { return undefined }
+    let matched: VerifyOobPromotionView | undefined
+    for (const item of promotions) {
+      if (!matched && matches(item)) { matched = item; continue }
+      const itemToken = typeof item.subscription.token === 'string' ? item.subscription.token.trim().toLowerCase() : ''
+      const owned = itemToken ? this.mintedCanaries.has(itemToken) : Boolean(item.subscription.id && this.sessionOobSubscriptions.has(item.subscription.id))
+      if (owned && !this.bufferedOobPromotions.some(p => p.subscription.id === item.subscription.id)) this.bufferedOobPromotions.push(item)
+    }
+    return matched
+  }
+
   private async handleOob(args: Record<string, unknown>): Promise<unknown> {
     const canary = this.options.canary ?? (this.options.grant as Grant & { canaryBroker?: VerifyCanaryBroker }).canaryBroker
     if (!canary) throw new Error('OOB canaries are not available for this run.')
@@ -1434,7 +1475,10 @@ export class VerifyRpcServer {
       const origin = typeof args.origin === 'string' && args.origin ? args.origin : this.options.targetOrigins?.[0]
       const started = Date.now()
       const minted = canary.mintCanary(this.options.runId, label, origin, { assignmentId: this.options.assignmentId }) as ReturnType<VerifyCanaryBroker['mintCanary']> & { id?: string }
-      if (typeof minted.id === 'string' && minted.id) this.mintedCanaryIds.set(minted.token.toLowerCase(), minted.id)
+      const normalizedToken = minted.token.trim().toLowerCase()
+      if (!normalizedToken) throw new Error('OOB canary broker returned an empty token.')
+      const canaryId = typeof minted.id === 'string' && minted.id ? minted.id : normalizedToken
+      this.mintedCanaries.set(normalizedToken, { token: minted.token, canaryId, runId: this.options.runId, attemptId: this.nonce, mintedAtMs: started })
       const record = this.transcript.record({
         op: 'oob',
         startedAt: started,
@@ -1445,8 +1489,8 @@ export class VerifyRpcServer {
       return this.scrubRecord({ exchangeId: record.exchangeId, token: minted.token, url: minted.httpUrl, dnsHost: minted.dnsHost, ...(minted.id ? { canaryId: minted.id } : {}) })
     }
     if (action === 'subscribe') {
-      const token = typeof args.token === 'string' ? args.token.trim().toLowerCase() : ''
-      if (!token) throw new Error('oob subscribe requires a canary token.')
+      const entry = this.requireSessionCanary(args, 'subscribe')
+      const token = entry.token.trim().toLowerCase()
       if (!canary.subscribe) throw new Error('OOB relay does not expose durable pending_oob subscriptions; a late callback cannot be promoted.')
       const artifact = typeof args.artifact === 'string' ? args.artifact : ''
       const immediateMs = typeof args.immediateMs === 'number' ? Math.max(0, Math.min(args.immediateMs, 30_000)) : undefined
@@ -1455,59 +1499,56 @@ export class VerifyRpcServer {
       const subscription = canary.subscribe({
         runId: this.options.runId,
         assignmentId: this.options.assignmentId,
-        canaryId: typeof args.canaryId === 'string' && args.canaryId ? args.canaryId : (this.mintedCanaryIds.get(token) ?? token),
-        token,
+        canaryId: entry.canaryId,
+        token: entry.token,
         artifact,
         ...(immediateMs !== undefined ? { immediateMs } : {}),
         ...(windowMs !== undefined ? { windowMs } : {}),
       })
+      this.sessionOobSubscriptions.set(subscription.id, { token, canaryId: entry.canaryId })
       this.transcript.record({
         op: 'oob',
         startedAt: started,
         durationMs: Date.now() - started,
         request: { origin: '', method: 'SUBSCRIBE', pathAndQuery: `/oob/pending/${subscription.id}`, headers: {}, bodyBytes: 0, bodySha256: createHash('sha256').update(subscription.id).digest('hex'), nonce: this.nonce },
-        artifact: { kind: 'oob-mint', token, hit: false },
+        artifact: { kind: 'oob-mint', token: entry.token, hit: false },
       })
       return this.scrubRecord({
-        subscriptionId: subscription.id,
-        token,
-        status: subscription.status ?? 'pending',
-        createdAt: subscription.createdAt ?? started,
-        expiresAt: subscription.expiresAt ?? null,
-        immediateMs: subscription.immediateMs ?? immediateMs ?? null,
-        windowMs: subscription.windowMs ?? windowMs ?? null,
+        subscriptionId: subscription.id, token: entry.token, status: subscription.status ?? 'pending',
+        createdAt: subscription.createdAt ?? started, expiresAt: subscription.expiresAt ?? null,
+        immediateMs: subscription.immediateMs ?? immediateMs ?? null, windowMs: subscription.windowMs ?? windowMs ?? null,
       })
     }
     if (action === 'wait') {
-      const token = typeof args.token === 'string' ? args.token.trim().toLowerCase() : ''
-      if (!token) throw new Error('oob wait requires a canary token.')
-      const subscriptionId = typeof args.subscriptionId === 'string' ? args.subscriptionId : null
+      const entry = this.requireSessionCanary(args, 'wait')
+      const token = entry.token.trim().toLowerCase()
+      const subscriptionId = typeof args.subscriptionId === 'string' && args.subscriptionId.trim() ? args.subscriptionId.trim() : null
+      if (subscriptionId && this.sessionOobSubscriptions.get(subscriptionId)?.token !== token) {
+        throw new Error('oob wait rejected: subscriptionId does not belong to this session canary.')
+      }
       const subscriptionCreatedAt = typeof args.subscriptionCreatedAt === 'number' ? args.subscriptionCreatedAt : null
       const immediateMs = typeof args.immediateMs === 'number' ? Math.max(0, Math.min(args.immediateMs, 30_000)) : 3_000
       const timeoutMs = typeof args.timeoutMs === 'number' ? Math.max(0, Math.min(args.timeoutMs, 60_000)) : immediateMs
       const immediateDeadline = (subscriptionCreatedAt ?? Date.now()) + immediateMs
       const t0 = Date.now()
-      let check = canary.checkCanary(token, { runId: this.options.runId })
+      let check = canary.checkCanary(entry.token, { runId: this.options.runId })
       let callbackReceivedAt: number | null = null
       let promoted = false
       let matched = check.hit
       if (!matched && canary.awaitAny) {
         try {
-          const awaited = await canary.awaitAny({ token, runId: this.options.runId }, { timeoutMs, pollMs: 100 })
+          const awaited = await canary.awaitAny({ token: entry.token, runId: this.options.runId }, { timeoutMs, pollMs: 100 })
           matched = awaited.matched
           callbackReceivedAt = awaited.callback?.receivedAt ?? null
         } catch { /* fall through to the recorded in-memory check */ }
       }
-      const promotions = (() => {
-        try { return canary.promoteLate?.({ runId: this.options.runId }) ?? [] } catch { return [] }
-      })()
-      const promotion = promotions.find(item => item.subscription.token === token || item.subscription.id === subscriptionId)
+      const promotion = this.takeOobPromotion(canary, token, subscriptionId, matched || !canary.awaitAny)
       if (promotion) {
         promoted = true
         matched = true
         callbackReceivedAt = callbackReceivedAt ?? promotion.callback.receivedAt ?? null
       }
-      check = canary.checkCanary(token, { runId: this.options.runId })
+      check = canary.checkCanary(entry.token, { runId: this.options.runId })
       const hit = Boolean(matched || check.hit)
       const receivedAt = callbackReceivedAt ?? (typeof check.detail?.timestamp === 'number' ? check.detail.timestamp : null)
       const stage: 'immediate' | 'late' | 'pending' | 'none' = hit
@@ -1518,23 +1559,17 @@ export class VerifyRpcServer {
         startedAt: t0,
         durationMs: Date.now() - t0,
         request: { origin: '', method: 'WAIT', pathAndQuery: subscriptionId ? `/oob/pending/${subscriptionId}` : '/oob/wait', headers: {}, bodyBytes: 0, bodySha256: createHash('sha256').update(token).digest('hex'), nonce: this.nonce },
-        artifact: { kind: 'oob-mint', token, hit },
+        artifact: { kind: 'oob-mint', token: entry.token, hit },
       })
       return this.scrubRecord({
-        exchangeId: record.exchangeId,
-        checkExchangeId: record.exchangeId,
-        subscriptionId: promotion?.subscription.id ?? subscriptionId,
-        token,
-        hit,
-        stage,
-        promoted,
-        receivedAt,
-        hits: check.hits.slice(-5),
+        exchangeId: record.exchangeId, checkExchangeId: record.exchangeId,
+        subscriptionId: promotion?.subscription.id ?? subscriptionId, token: entry.token,
+        hit, stage, promoted, receivedAt, hits: check.hits.slice(-5),
       })
     }
     if (action === 'check') {
-      const token = typeof args.token === 'string' ? args.token : ''
-      if (!token) throw new Error('oob check requires a canary token.')
+      const entry = this.requireSessionCanary(args, 'check')
+      const token = entry.token
       const id = typeof args.exchangeId === 'string' ? args.exchangeId : ''
       const record = id ? this.transcript.get(id) : undefined
       const result = canary.checkCanary(token, { runId: this.options.runId })
