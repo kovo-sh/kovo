@@ -1,5 +1,5 @@
 // Per-seed semantic variation for the multi-hop suite. Dev seeds are reproducible; held-out seeds
-// are HMAC-derived from a host-only salt (GUARDIAN_RB_HELDOUT_SALT) and never committed.
+// are HMAC-derived from a host-only salt (KOVO_RB_HELDOUT_SALT) and never committed.
 import { createHmac } from 'node:crypto'
 import { createPrng } from './prng.ts'
 import type { Prng } from './prng.ts'
@@ -22,11 +22,11 @@ export function seedSetFor(seed: number): SeedSet {
 }
 
 export function requireHeldOutSalt(salt?: string): string {
-  const value = salt ?? process.env.GUARDIAN_RB_HELDOUT_SALT
+  const value = salt ?? process.env.KOVO_RB_HELDOUT_SALT
   if (!value || value.length < MIN_SALT_LEN) {
     throw new Error(
       `held-out seeds require a salt of >= ${MIN_SALT_LEN} chars via the salt argument or ` +
-        'GUARDIAN_RB_HELDOUT_SALT; refusing to derive a held-out variant without it',
+        'KOVO_RB_HELDOUT_SALT; refusing to derive a held-out variant without it',
     )
   }
   return value

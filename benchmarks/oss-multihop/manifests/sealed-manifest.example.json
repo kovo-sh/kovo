@@ -200,7 +200,7 @@
         "kind": "loopback_oob_collector",
         "description": "Template loopback OOB collector oracle for sealed slot 2.",
         "targetService": "slot2_worker",
-        "expectedCorrelationField": "X-Guardian-Run-Id",
+        "expectedCorrelationField": "X-Kovo-Run-Id",
         "pollTimeoutMs": 5000,
         "runScopedCanaryPrefix": "oss_canary_sealed2_",
         "collectorUrl": "http://127.0.0.1:19402/oob/slot2",

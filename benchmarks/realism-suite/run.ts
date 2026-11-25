@@ -49,7 +49,7 @@ export const FIXTURES: Record<string, FixtureModule> = {
 export interface Briefing {
   fixture: string
   title: string
-  safety: { loopbackOnly: true; envGate: 'GUARDIAN_ALLOW_LOCAL_LAB=1'; syntheticSecrets: true }
+  safety: { loopbackOnly: true; envGate: 'KOVO_ALLOW_LOCAL_LAB=1'; syntheticSecrets: true }
   origins: Record<string, string>
   hosts: Record<string, string>
   personas: Array<Omit<Persona, 'password'> & { password: string }>
@@ -78,7 +78,7 @@ export function briefingFor(fixture: StartedFixture): Briefing {
   const briefing: Briefing = {
     fixture: fixture.name,
     title: fixture.title,
-    safety: { loopbackOnly: true, envGate: 'GUARDIAN_ALLOW_LOCAL_LAB=1', syntheticSecrets: true },
+    safety: { loopbackOnly: true, envGate: 'KOVO_ALLOW_LOCAL_LAB=1', syntheticSecrets: true },
     origins: fixture.origins,
     hosts: fixture.hosts,
     personas: fixture.personas,

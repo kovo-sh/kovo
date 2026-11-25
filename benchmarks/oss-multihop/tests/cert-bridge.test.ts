@@ -24,7 +24,7 @@ import {
 } from '../run.ts'
 import type {
   ExternalOracleObservation,
-  GuardianCompositeProofReceipt,
+  KovoCompositeProofReceipt,
   OssAnchorManifest,
   PatchRetestRecord,
   RunTelemetry,
@@ -53,7 +53,7 @@ import {
   type V7RegressionFloorInput,
 } from '../../../scripts/certify-v8.ts'
 
-const tempRoot = mkdtempSync(join(tmpdir(), 'guardian-v8-oss-cert-bridge-'))
+const tempRoot = mkdtempSync(join(tmpdir(), 'kovo-v8-oss-cert-bridge-'))
 process.on('exit', () => rmSync(tempRoot, { recursive: true, force: true }))
 
 const DEV_APPS = ['paygrid', 'shipforge', 'nexusiam'] as const
@@ -271,7 +271,7 @@ function makeValidReceipt(
   runId: string,
   baseTs: number,
   correlationId: string,
-): GuardianCompositeProofReceipt {
+): KovoCompositeProofReceipt {
   const origin = anchor.personas.find((p) => p.allowedAsChainOrigin)!
   return {
     receiptId: `rcpt_${anchor.anchorId}`,
@@ -405,7 +405,7 @@ function evaluateAnchorVulnerableOracle(
 
 function makeClosedPatchRetest(
   anchor: OssAnchorManifest,
-  receipt: GuardianCompositeProofReceipt,
+  receipt: KovoCompositeProofReceipt,
   vulnObs: ExternalOracleObservation,
   overrides: Partial<PatchRetestRecord> = {},
 ): PatchRetestRecord {
@@ -448,7 +448,7 @@ function buildTenTargetScenario(opts: {
   const omitPatchSet = new Set(opts.omitPatchRetestProjects ?? [])
   const invalidHopSet = new Set(opts.invalidPatchHopProjects ?? [])
 
-  const receipts: GuardianCompositeProofReceipt[] = []
+  const receipts: KovoCompositeProofReceipt[] = []
   const oracleObservations: ExternalOracleObservation[] = []
   const patchRetests: PatchRetestRecord[] = []
 

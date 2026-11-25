@@ -1,6 +1,6 @@
 // Held-Out Modern SaaS Lab ("Orbit Workspace") entrypoint.
 //
-//   node server.mjs                      -> listens on HOST:PORT (Docker: 0.0.0.0:3000 under GUARDIAN_LAB=1)
+//   node server.mjs                      -> listens on HOST:PORT (Docker: 0.0.0.0:3000 under KOVO_LAB=1)
 //   import { startHeldOutSaasServer }    -> in-process loopback server for benchmark-recall (127.0.0.1:0)
 //
 // Pure Node.js stdlib (node:http, node:crypto, node:sqlite). No npm install, no network, no disk writes.
@@ -22,8 +22,8 @@ export const heldOutSaasPatchIds = [...PATCH_IDS]
  */
 export async function startHeldOutSaasServer(opts = {}) {
   const host = opts.host ?? '127.0.0.1'
-  if (!LOOPBACK.has(host) && process.env.GUARDIAN_LAB !== '1') {
-    throw new Error(`Held-out SaaS lab refuses to bind ${host}: only loopback is allowed outside a Guardian lab container.`)
+  if (!LOOPBACK.has(host) && process.env.KOVO_LAB !== '1') {
+    throw new Error(`Held-out SaaS lab refuses to bind ${host}: only loopback is allowed outside a Kovo Hunter lab container.`)
   }
   for (const id of opts.patchedIds ?? []) {
     if (!PATCH_IDS.includes(id)) throw new Error(`Unknown held-out SaaS patch id "${id}".`)

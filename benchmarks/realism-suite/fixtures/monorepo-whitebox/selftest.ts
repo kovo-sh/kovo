@@ -74,7 +74,7 @@ export async function runSelfTest(): Promise<string[]> {
     const record = await fetch(`${app}/v3/admin/users/mono-bob`, { headers: adminHeaders })
     assert.equal(record.status, 200)
     assert.equal(((await record.json()) as { role: string }).role, 'admin')
-    const unknown = await fetch(`${app}/v3/admin/users/guardian-none-selftest`, { headers: adminHeaders })
+    const unknown = await fetch(`${app}/v3/admin/users/kovo-none-selftest`, { headers: adminHeaders })
     assert.equal(unknown.status, 404)
     checks.push('admin read surface exposes the persisted role change to admins only')
     checks.push('authz + sqli sinks reachable through nested mounts')

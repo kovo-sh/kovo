@@ -94,7 +94,7 @@
   ],
   "invariants": {
     "environmentMode": "staging_isolated",
-    "runTagPrefix": "guardian-qa-",
+    "runTagPrefix": "kovo-qa-",
     "orphanRecordsAfterCleanup": 0,
     "cleanupRestoresMutations": true,
     "http2": "h2c prior-knowledge",

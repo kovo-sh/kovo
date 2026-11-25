@@ -36,12 +36,12 @@ services:
       OSS_LAB_SEED_CRED: "oss_lab_kc_seed_01"
       OSS_LAB_FED_USER_CRED: "oss_lab_kc_fed_user"
     labels:
-      guardian.oss_lab.target: "oss-sealed-keycloak-01"
-      guardian.oss_lab.split: "sealed"
-      guardian.oss_lab.egress_policy: "deny_all_internal_only"
+      kovo.oss_lab.target: "oss-sealed-keycloak-01"
+      kovo.oss_lab.split: "sealed"
+      kovo.oss_lab.egress_policy: "deny_all_internal_only"
 
   keycloak_idp_broker:
-    image: "${IDP_BROKER_IMAGE:-guardian-lab/oidc-broker-stub:1.0.0}"
+    image: "${IDP_BROKER_IMAGE:-kovo-lab/oidc-broker-stub:1.0.0}"
     networks:
       - lab_internal
     read_only: true
@@ -53,9 +53,9 @@ services:
       OIDC_ISSUER: "http://keycloak_idp_broker:8081"
       OSS_LAB_BROKER_SECRET: "oss_lab_kc_broker_secret_01"
     labels:
-      guardian.oss_lab.target: "oss-sealed-keycloak-01"
-      guardian.oss_lab.split: "sealed"
-      guardian.oss_lab.role: "idp"
+      kovo.oss_lab.target: "oss-sealed-keycloak-01"
+      kovo.oss_lab.split: "sealed"
+      kovo.oss_lab.role: "idp"
 
   keycloak_db:
     image: "postgres:16.4-alpine"
@@ -70,6 +70,6 @@ services:
       POSTGRES_USER: "oss_lab_user"
       POSTGRES_PASSWORD: "oss_lab_kc_pg_password_01"
     labels:
-      guardian.oss_lab.target: "oss-sealed-keycloak-01"
-      guardian.oss_lab.split: "sealed"
-      guardian.oss_lab.role: "db"
+      kovo.oss_lab.target: "oss-sealed-keycloak-01"
+      kovo.oss_lab.split: "sealed"
+      kovo.oss_lab.role: "db"

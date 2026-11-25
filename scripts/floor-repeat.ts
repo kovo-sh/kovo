@@ -6,7 +6,7 @@
 // uses: a >1-target spread is a bug, never sampling noise.
 //
 // Usage:
-//   GUARDIAN_ALLOW_LOCAL_LAB=1 node scripts/floor-repeat.ts \
+//   KOVO_ALLOW_LOCAL_LAB=1 node scripts/floor-repeat.ts \
 //     --apps acme-saas,shopflow,opsportal --seed 1 --repeat 3 --out-dir /tmp/floor-repeat
 //
 // Options mirror `scripts/benchmark-realistic.ts` for the floor: `--seed`, `--apps`, `--repeat`,
@@ -33,7 +33,7 @@ function parse(): Args {
     apps: ['acme-saas', 'shopflow', 'opsportal'],
     seed: 1,
     repeat: 3,
-    outDir: '/tmp/guardian-floor-repeat',
+    outDir: '/tmp/kovo-floor-repeat',
     mode: 'grey-box',
     concurrency: 1,
     wordlist: false,
@@ -90,7 +90,7 @@ function runCell(args: Args, app: string, repeat: number): Promise<CellRun> {
   return new Promise(resolvePromise => {
     const child = spawn(process.execPath, childArgs, {
       cwd: resolve(import.meta.dirname, '..'),
-      env: { ...process.env, GUARDIAN_ALLOW_LOCAL_LAB: '1' },
+      env: { ...process.env, KOVO_ALLOW_LOCAL_LAB: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let log = ''

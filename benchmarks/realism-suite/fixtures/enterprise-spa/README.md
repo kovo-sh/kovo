@@ -32,7 +32,7 @@ and three decoys (tenant-scoped REST profile, disabled introspection, public CDN
 ## Self-test
 
 ```bash
-GUARDIAN_ALLOW_LOCAL_LAB=1 node --test benchmarks/realism-suite/tests/
+KOVO_ALLOW_LOCAL_LAB=1 node --test benchmarks/realism-suite/tests/
 ```
 
 `selftest.ts` starts the fixture, walks the full OIDC redirect login, checks the split-origin

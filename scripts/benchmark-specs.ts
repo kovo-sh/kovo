@@ -20,7 +20,7 @@ function build(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
   // v5 M3 anomaly contracts (awaiting their probe shapes) are anomaly-gated and independent of class.
   const m3 = synthM3Contracts(o, env)
   if (m3.length > 0) return m3
-  if (process.env.GUARDIAN_BENCH_DEBUG === '1') {
+  if (process.env.KOVO_BENCH_DEBUG === '1') {
     const keys = o.hyp.probeClass === 'workflow_invariant'
       ? `qty=${o.hyp.quantityField ?? '-'} create=${o.hyp.createPath ?? '-'} read=${o.hyp.workflowReadPath ?? '-'} repeat=${o.hyp.repeatMutation === true} price=${o.hyp.priceTrust === true}`
       : `param=${o.hyp.param?.name ?? '-'}@${o.hyp.location ?? '-'}`
@@ -54,7 +54,7 @@ export function synthesizeSpecs(o: HypothesisOutcome, env: ProbeEnv): Synthesize
   try {
     built = build(o, env)
   } catch (err) {
-    if (process.env.GUARDIAN_BENCH_DEBUG === '1') process.stderr.write(`[spec-error] ${o.hyp.probeClass} ${o.hyp.endpoint.path}: ${err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)}\n`)
+    if (process.env.KOVO_BENCH_DEBUG === '1') process.stderr.write(`[spec-error] ${o.hyp.probeClass} ${o.hyp.endpoint.path}: ${err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)}\n`)
     return []
   }
   const out: SynthesizedSpec[] = []
@@ -62,9 +62,9 @@ export function synthesizeSpecs(o: HypothesisOutcome, env: ProbeEnv): Synthesize
     try {
       const parsed = declarativeReplaySpecSchema.safeParse(candidate.spec)
       if (parsed.success) out.push({ kind: candidate.kind, spec: parsed.data as unknown as Record<string, unknown> })
-      else if (process.env.GUARDIAN_BENCH_DEBUG === '1') process.stderr.write(`[spec-invalid] ${o.hyp.probeClass} ${o.hyp.endpoint.path}: ${parsed.error.issues[0]?.path.join('.')} ${parsed.error.issues[0]?.message}\n`)
+      else if (process.env.KOVO_BENCH_DEBUG === '1') process.stderr.write(`[spec-invalid] ${o.hyp.probeClass} ${o.hyp.endpoint.path}: ${parsed.error.issues[0]?.path.join('.')} ${parsed.error.issues[0]?.message}\n`)
     } catch (err) {
-      if (process.env.GUARDIAN_BENCH_DEBUG === '1') process.stderr.write(`[spec-invalid] ${o.hyp.probeClass} ${o.hyp.endpoint.path}: ${err instanceof Error ? err.message.slice(0, 160) : 'schema validation failed'}\n`)
+      if (process.env.KOVO_BENCH_DEBUG === '1') process.stderr.write(`[spec-invalid] ${o.hyp.probeClass} ${o.hyp.endpoint.path}: ${err instanceof Error ? err.message.slice(0, 160) : 'schema validation failed'}\n`)
     }
   }
   return out

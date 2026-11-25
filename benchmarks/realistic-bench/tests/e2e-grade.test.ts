@@ -1,5 +1,5 @@
 // End-to-end grading: build a controlled acme-saas run (a known mix of vulnerable sites and a hard
-// decoy), drive real solvers so the impact oracle records genuine events, assemble Guardian-style
+// decoy), drive real solvers so the impact oracle records genuine events, assemble Kovo Hunter-style
 // findings (true positives + one decoy false positive + one unmatched false positive + a duplicate),
 // then grade with gradeRun and assert recall / precision / decoy-FP / funnel all come out right.
 import { test } from 'node:test'

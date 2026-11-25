@@ -11,7 +11,7 @@ node scripts/conversion-autopsy.ts --json /tmp/conversion-autopsy.json
 ```
 
 The script resolves each seed's runtime route map from the app blueprints (`generateVariant`), reads
-`guardian.sqlite`, `agent-sessions/*.sqlite`, and the cell `.json`, and prints only structured
+`kovo.sqlite`, `agent-sessions/*.sqlite`, and the cell `.json`, and prints only structured
 fields. It does not read response bodies, does not print payloads, and never writes to the data
 dirs. The held-out salt is read from the owner-only file and never printed.
 
@@ -50,7 +50,7 @@ One row per planted-but-unfound target (52 rows). Buckets are applied in this pr
 1. **`never_dispatched`** — no agent request was ever made on any entry/trigger route of the target.
    Sub-reasons: `no_planned_step_named_route`, `step_<status>_never_assigned`,
    `assigned_but_route_untouched`.
-2. **`route_hit_no_verify`** — the route was requested, but no `guardian_verify` /
+2. **`route_hit_no_verify`** — the route was requested, but no `kovo_verify` /
    `verify_replay_spec` call was **bound to that route** and no replay spec was recorded for it.
 3. **`verify_called_but_oracle_rejected`** — a verify verdict artifact exists for the target and is
    non-confirming; the normalized reason code is recorded.
@@ -112,7 +112,7 @@ Depth and verification breadth:
 | heldout/shopflow | 319 | 136 | 40 | 6 | 21 |
 | **total** | **1,811** | **552 (30%)** | **306 (17%)** | **29 (21%)** | **111 (79%)** |
 
-Only 29 of 140 investigations ever called `guardian_verify` or `verify_replay_spec` at all (53 calls
+Only 29 of 140 investigations ever called `kovo_verify` or `verify_replay_spec` at all (53 calls
 in total). 47% of all agent turns were spent in investigations that never reached a terminal state.
 
 ---
@@ -252,7 +252,7 @@ and then dropped without a route-bound proof.
   last 15% of turns cannot collect new evidence. 8 dispatched investigations reached that threshold
   without ever verifying.
 - The settlement tool gate (`:811`) explicitly offers the gap as an alternative to
-  `guardian_verify`. Agents take it: for the 24 no-verify rows, the final three calls are dominated
+  `kovo_verify`. Agents take it: for the 24 no-verify rows, the final three calls are dominated
   by `record_coverage` (12), `complete_intent` (8) and `board_post` (3), while only one row ends on a
   verify tool (and that call was not bound to the target route).
 - Proposal funnel: 43 agent proposals → 24 `pending/open_proof_gap`, 16 `inconclusive`, 2

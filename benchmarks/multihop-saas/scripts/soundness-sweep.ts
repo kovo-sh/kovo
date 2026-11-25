@@ -2,7 +2,7 @@
 // (paygrid, shipforge, nexusiam, connecthub).
 //
 // Sweeps dev seeds 1..N (default N=30) and optional salted held-out seeds 1000001..1000000+M
-// (--held-out [M], requiring GUARDIAN_RB_HELDOUT_SALT). Verifies:
+// (--held-out [M], requiring KOVO_RB_HELDOUT_SALT). Verifies:
 //   1. 100% vulnerable solver pass rate (4/4 chains per archetype per seed -> ChainOracle v2 + Mode-A receipt)
 //   2. 100% hardened silence (0 findings, 0 oracle events)
 //   3. 100% partial-hop twin silence (0 findings, 0 terminal events, >=2 early hops exercised)
@@ -678,7 +678,7 @@ export function parseSweepCliArgs(argv: readonly string[]): ParsedCliArgs {
   }
 
   if (flags['held-out-salt'] !== undefined || flags.salt !== undefined) {
-    throw new Error('never pass the held-out salt on the command line; set GUARDIAN_RB_HELDOUT_SALT instead')
+    throw new Error('never pass the held-out salt on the command line; set KOVO_RB_HELDOUT_SALT instead')
   }
 
   let apps: ArchetypeName[] = [...ALL_ARCHETYPES]

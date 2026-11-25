@@ -121,7 +121,7 @@ export function resolveOobCallbackPorts(
 }
 
 export async function createEngineEnv(handle: BenchmarkServerHandle, caps: ProfileCaps, assignmentLabel: string, opts: EngineEnvOptions = {}): Promise<EngineEnv> {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-bench-run-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-bench-run-'))
   const storage = new Store(dir)
   const origin = new URL(handle.origin).origin
   const project = storage.createProject({

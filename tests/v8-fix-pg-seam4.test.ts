@@ -3,7 +3,7 @@
 // 2. PG-C1 already-settled payout re-approval guard (409 on non-draft payouts).
 // 3. Deterministic 6-payout seed capacity supporting 3x sequential PG-C1 replay.
 // 4. Full 4/4 public-origin confirmation, leakage-scan cleanliness, and hardened / PG-D1..D3 silence.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

@@ -1,4 +1,4 @@
-# Guardian v7 — swarm handover (2026-11-24 11:45 PT)
+# Kovo Hunter v7 — swarm handover (2026-11-24 11:45 PT)
 
 > Read this first, then `plans/ROADMAP-v5.md` (the decision log, 1,013 lines), `VERIFICATION-v5.md` §V7 (the certificate and its erratum), and `plans/STREAM-BACKLOG.md` (the queue).
 > This file is written for a **new agent with no context**. It states what is true, what is provable, what is broken, and what to do next — in that order.
@@ -7,7 +7,7 @@
 
 ## 0. Mission
 
-Guardian is a **defensive** web-app security scanner (authorized local benchmarks + fixtures only). It has three layers:
+Kovo Hunter is a **defensive** web-app security scanner (authorized local benchmarks + fixtures only). It has three layers:
 
 1. **Layer 2 — deterministic floor** (`Execution --no-llm`): recon → hypotheses → probes → proofs. No model.
 2. **Layer 3 — agentic** (DeepSeek V4.1 Flash via the OpenRouter profile): investigations on top of the floor.
@@ -78,7 +78,7 @@ Guardian is a **defensive** web-app security scanner (authorized local benchmark
 ## 4. The one blocking architectural fact (read before touching the VM)
 
 `replay-verifier.ts` cannot shrink because the **agent** proof path never persists a script:
-- production does not wire `handlers.guardian_verify` into `AgentSession`;
+- production does not wire `handlers.kovo_verify` into `AgentSession`;
 - there is **no storage table** for a verified agent script/receipt;
 - therefore agent findings are still declarative `replay_spec` rows covering any of 14 kinds (`execution.ts` ~12298), and patch retest historically replayed them.
 
@@ -137,7 +137,7 @@ Done: broker jars keyed `(run, assignment, role, persona, session)`; mismatch de
 **If it validates, the certificate erratum resolves to 28/58 (the viewer legitimately owns `9ca676`), not 26.**
 
 ### 7.2 `agents/agent-script-proofs` @ `16726df` — M0 closer, **code only, unvalidated**
-Done (typecheck clean): `agentScriptProofEnvelopeSchema` + `agentScript` on `replayBase`; schema v8→v9 additive migration with `replay_specs` proof columns (`proof_kind/verdict/runtime/script_sha256/artifact_id/receipt`) + accessors; `buildAgentScriptReceipt()`; `runAgentScriptProof()` (real worker session + `VerifyRpcServer`, fresh nonce, transcript → `verifyReceipt`); production `guardian_verify` handler registered **only** for `LinuxWorkerBackend`; `persistAgentScriptProof()` (owner-only artifact, synthesized attribution-only spec, finding upserted with a `ProofReceipt…` verification string so the confirmation guard holds); receipt-first short-circuit at the top of `executeInlineVerification` for `verify_replay_spec` / `propose_chain_finding` / `update_proposed_finding`; `retestPersistedAgentScript()` wired into `retestReplaySpec`.
+Done (typecheck clean): `agentScriptProofEnvelopeSchema` + `agentScript` on `replayBase`; schema v8→v9 additive migration with `replay_specs` proof columns (`proof_kind/verdict/runtime/script_sha256/artifact_id/receipt`) + accessors; `buildAgentScriptReceipt()`; `runAgentScriptProof()` (real worker session + `VerifyRpcServer`, fresh nonce, transcript → `verifyReceipt`); production `kovo_verify` handler registered **only** for `LinuxWorkerBackend`; `persistAgentScriptProof()` (owner-only artifact, synthesized attribution-only spec, finding upserted with a `ProofReceipt…` verification string so the confirmation guard holds); receipt-first short-circuit at the top of `executeInlineVerification` for `verify_replay_spec` / `propose_chain_finding` / `update_proposed_finding`; `retestPersistedAgentScript()` wired into `retestReplaySpec`.
 
 **Not done:** no `tests/v7-agent-script-proofs.test.ts`, no `worker-gate.sh`, **no benchmark of any kind**, **zero deletions**. The next step is exactly: write the test (receipt persistence + retest through a fake backend/attempt factory), run `npm run check` + `worker-gate.sh`, then parity (xben 25/25, held-out-saas 20/20 + 20/20 patches, dev 36/59, salted held-out exact total), then one agentic cell to prove agent findings cite receipts, then delete only provably-unreachable branches.
 
@@ -160,28 +160,28 @@ Done but unvalidated end-to-end: JWT hypothesis for reporting/integration reads 
 bash scripts/worker-gate.sh
 
 # Dev floor (no model, cheap)
-newgrp docker -c 'cd /home/omarchy/guardian && GUARDIAN_ALLOW_LOCAL_LAB=1 \
+newgrp docker -c 'cd /home/omarchy/kovo-hunter && KOVO_ALLOW_LOCAL_LAB=1 \
   node scripts/benchmark-realistic.ts --app all --seeds 1 --mode grey-box --no-llm \
   --verifier docker --no-conventional-wordlist --isolate-data-dir --concurrency 1 \
   --budget-usd 2 --max-duration-ms 600000 --out-dir /tmp/floor-x'
 
 # Salted held-out floor (never print the salt)
-newgrp docker -c 'cd /home/omarchy/guardian && GUARDIAN_ALLOW_LOCAL_LAB=1 \
-  GUARDIAN_RB_HELDOUT_SALT="$(cat /home/omarchy/.config/guardian-bench/heldout.salt)" \
+newgrp docker -c 'cd /home/omarchy/kovo-hunter && KOVO_ALLOW_LOCAL_LAB=1 \
+  KOVO_RB_HELDOUT_SALT="$(cat /home/omarchy/.config/guardian-bench/heldout.salt)" \
   node scripts/benchmark-realistic.ts --app all --seeds 1000042 --held-out --mode grey-box \
   --no-llm --verifier docker --isolate-data-dir --concurrency 1 --budget-usd 2 \
   --max-duration-ms 600000 --out-dir /tmp/heldout-x'
 
 # Agentic cell (SERIALIZED: --data-dir takes an exclusive lock)
-newgrp docker -c 'cd /home/omarchy/guardian && GUARDIAN_ALLOW_LOCAL_LAB=1 \
-  GUARDIAN_RB_HELDOUT_SALT="$(cat /home/omarchy/.config/guardian-bench/heldout.salt)" \
+newgrp docker -c 'cd /home/omarchy/kovo-hunter && KOVO_ALLOW_LOCAL_LAB=1 \
+  KOVO_RB_HELDOUT_SALT="$(cat /home/omarchy/.config/guardian-bench/heldout.salt)" \
   node scripts/benchmark-realistic.ts --app shopflow --seeds 1000042 --held-out --mode grey-box \
   --verifier docker --isolate-data-dir --keep-data-dirs --concurrency 1 --worker-concurrency 6 \
   --budget-usd 5 --max-duration-ms 600000 --data-dir /home/omarchy/guardian-data \
   --out-dir /tmp/agentic-x'
 
 # Realism suites
-newgrp docker -c 'cd /home/omarchy/guardian && GUARDIAN_ALLOW_LOCAL_LAB=1 \
+newgrp docker -c 'cd /home/omarchy/kovo-hunter && KOVO_ALLOW_LOCAL_LAB=1 \
   node scripts/benchmark-realism.ts --fixture wan-oob --no-llm --verifier docker --out-dir /tmp/r2'
 node scripts/smoke-agentic.ts --tier 1 --out-dir /tmp/smoke   # ~6 min, ~$1.30, includes the precision trap
 
@@ -194,7 +194,7 @@ node scripts/audit-confirmation-consistency.ts --data-dir /tmp/x/data/<cell>
 - `--data-dir` holds an **exclusive SQLite lock** (model profile) ⇒ **agentic runs are globally serialized**. Floor runs don't need it.
 - 29 GB RAM; concurrent benchmark cells cause SIGTERMs and hung cells. One benchmark at a time.
 - Docker needs `newgrp docker -c '…'`.
-- Model profile: `GUARDIAN_DATA_DIR=/home/omarchy/guardian-data` (OpenRouter DeepSeek V4.1 Flash). Credentials live outside the repo; never print or commit them.
+- Model profile: `KOVO_DATA_DIR=/home/omarchy/guardian-data` (OpenRouter DeepSeek V4.1 Flash). Credentials live outside the repo; never print or commit them.
 
 ---
 

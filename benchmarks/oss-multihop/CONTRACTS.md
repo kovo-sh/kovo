@@ -8,7 +8,7 @@ This document defines the binding contracts for `benchmarks/oss-multihop/` per [
 
 - **Scope:** Standalone directory `benchmarks/oss-multihop/**`. Zero edits to `src/` or other benchmark suites.
 - **Runtime:** Node 24+ native TypeScript type-stripping, ESM, explicit `.ts` extensions, `import type` for types, `erasableSyntaxOnly: true`, **zero npm dependencies** (`node:*` built-ins only).
-- **Local-Lab Gate:** Any lab self-test or runtime check calls `assertLocalLabAllowed()`, requiring `GUARDIAN_ALLOW_LOCAL_LAB=1`.
+- **Local-Lab Gate:** Any lab self-test or runtime check calls `assertLocalLabAllowed()`, requiring `KOVO_ALLOW_LOCAL_LAB=1`.
 - **No Shell Execution in Framework Code:** The framework modules (`lib/`, `run.ts`) perform pure validation, external oracle evaluation, and two-side grading without `node:child_process`, `eval`, `new Function`, or `vm`.
 - **Zero Exploit Payloads Committed:** Manifests describe defensive QA anchor topology, synthetic personas (`oss_lab_*`), read-only external impact oracles, and paired patch-retest contracts only.
 
@@ -58,13 +58,13 @@ Every oracle carries a `runScopedCanaryPrefix` (`oss_canary_*`), `expectedCorrel
 An anchor counts as a **True Positive (TP)** if and only if **both** sides confirm:
 
 1. **External Impact Oracle Side:** An `ExternalOracleObservation` for `anchorId` with `buildTarget === 'vulnerable'`, `oracleId === anchor.impactOracle.oracleId`, `runId === receipt.runId`, and `observed === true`.
-2. **Guardian `CompositeProofReceipt` Side:** A host-verified `GuardianCompositeProofReceipt` (`verified === true`) satisfying:
+2. **Kovo Hunter `CompositeProofReceipt` Side:** A host-verified `KovoCompositeProofReceipt` (`verified === true`) satisfying:
    - `replayMode === 'fresh_clean_replay'` (Mode A is mandatory on benchmark anchors; Mode B `one_shot_transcript` is rejected).
    - **Attacker-Origin Provenance:** `attackerOriginVerified === true` and `originPersona` is listed in `anchor.personas` with `allowedAsChainOrigin: true` (victim/admin shortcutting is rejected).
    - **Causal Chain Completeness:** At least `anchor.hopCount` monotonically ordered hops (`t_1 <= t_2 <= ...`), with all `causalEdges` verified (`verified === true`) and connecting valid hops.
    - **Correlation & Temporal Order:** `terminalImpact.observed === true`, matching `correlationId` when present, and earliest hop timestamp `<= oracleObservation.observedAtMs`.
 
-- **Oracle-only (no verified Guardian receipt):** Graded as **False Negative (`unconfirmed_oracle_only`)** — Guardian did not prove the chain.
+- **Oracle-only (no verified Kovo Hunter receipt):** Graded as **False Negative (`unconfirmed_oracle_only`)** — Kovo Hunter did not prove the chain.
 - **Receipt-only (no external oracle confirmation) or rejected shortcut/edge/replay claim:** Graded as a **Spurious FP** — fails the 100% precision gate.
 
 ---

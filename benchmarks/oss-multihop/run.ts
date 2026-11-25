@@ -12,7 +12,7 @@ import type {
   CleanControlGradeDetail,
   CleanNegativeControlSpec,
   ExternalOracleObservation,
-  GuardianCompositeProofReceipt,
+  KovoCompositeProofReceipt,
   ManifestBundle,
   OssAnchorManifest,
   OssGradeInput,
@@ -345,7 +345,7 @@ export function runOfflineSelfTest(): SelfTestReport {
     throw new Error(`Expected 4 observed oracle kinds in selftest, got ${oracleKindsVerified}`)
   }
 
-  const makeReceipt = (anchor: OssAnchorManifest, obs: ExternalOracleObservation): GuardianCompositeProofReceipt => {
+  const makeReceipt = (anchor: OssAnchorManifest, obs: ExternalOracleObservation): KovoCompositeProofReceipt => {
     const origin = anchor.personas.find((p) => p.allowedAsChainOrigin)!
     return {
       receiptId: `rcpt_${anchor.anchorId}`,
@@ -421,7 +421,7 @@ export function runOfflineSelfTest(): SelfTestReport {
   })
 
   // Verify clean-control 0-FP failure tripwire
-  const fpReceipt: GuardianCompositeProofReceipt = {
+  const fpReceipt: KovoCompositeProofReceipt = {
     ...receipts[0],
     receiptId: 'rcpt_clean_fp_tripwire',
     targetId: controls[0].controlId,
@@ -493,12 +493,12 @@ Usage:
   node benchmarks/oss-multihop/run.ts list [--split dev|clean_control|sealed|all] [--allow-sealed-m4] [--json]
   node benchmarks/oss-multihop/run.ts validate [--manifest <path>...] [--all] [--allow-sealed-m4]
   node benchmarks/oss-multihop/run.ts grade [--manifest <path>...] [--split dev|sealed|all] [--allow-sealed-m4] [--controls <path>|none] --input <path> [--json <out>] [--md <out>] [--quiet]
-  GUARDIAN_ALLOW_LOCAL_LAB=1 node benchmarks/oss-multihop/run.ts selftest
+  KOVO_ALLOW_LOCAL_LAB=1 node benchmarks/oss-multihop/run.ts selftest
 `)
 }
 
 interface RawGradePayload {
-  receipts: GuardianCompositeProofReceipt[]
+  receipts: KovoCompositeProofReceipt[]
   oracleObservations: ExternalOracleObservation[]
   patchRetests?: PatchRetestRecord[]
   telemetry: Omit<RunTelemetry, 'split'> & { split?: AnchorSplit }

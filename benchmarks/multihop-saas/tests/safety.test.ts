@@ -133,19 +133,19 @@ test('synthetic-only secret material', () => {
   assert.deepEqual(problems, [], `secret/leak markers:\n${problems.join('\n')}`)
 })
 
-test('local-lab gate refuses to start any server without GUARDIAN_ALLOW_LOCAL_LAB=1', async () => {
-  const previous = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
+test('local-lab gate refuses to start any server without KOVO_ALLOW_LOCAL_LAB=1', async () => {
+  const previous = process.env.KOVO_ALLOW_LOCAL_LAB
+  delete process.env.KOVO_ALLOW_LOCAL_LAB
   try {
     assert.equal(localLabAllowed(), false)
-    assert.throws(() => assertLocalLabAllowed(), /GUARDIAN_ALLOW_LOCAL_LAB=1/)
+    assert.throws(() => assertLocalLabAllowed(), /KOVO_ALLOW_LOCAL_LAB=1/)
     await assert.rejects(
       () => startPaygrid({ seed: 1, mode: 'vulnerable', asyncLatencyMs: 1 }),
-      /GUARDIAN_ALLOW_LOCAL_LAB=1/,
+      /KOVO_ALLOW_LOCAL_LAB=1/,
     )
   } finally {
-    if (previous === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = previous
+    if (previous === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = previous
   }
 })
 
@@ -196,19 +196,19 @@ test('egress refuses unregistered targets, external hosts and non-loopback URLs'
   assert.throws(() => egress.register({ name: 'outside', origin: 'http://10.0.0.1:80', internal: false }), /non-loopback/)
 })
 
-test('seed sets: dev 1..9999, salted held-out >= 1_000_000 via GUARDIAN_RB_HELDOUT_SALT', () => {
+test('seed sets: dev 1..9999, salted held-out >= 1_000_000 via KOVO_RB_HELDOUT_SALT', () => {
   assert.deepEqual(listSeeds('dev', 3), [1, 2, 3])
   assert.equal(seedSetFor(9999), 'dev')
   assert.equal(seedSetFor(1_000_000), 'held-out')
-  const previous = process.env.GUARDIAN_RB_HELDOUT_SALT
-  delete process.env.GUARDIAN_RB_HELDOUT_SALT
+  const previous = process.env.KOVO_RB_HELDOUT_SALT
+  delete process.env.KOVO_RB_HELDOUT_SALT
   try {
-    assert.throws(() => listSeeds('held-out', 1), /GUARDIAN_RB_HELDOUT_SALT/)
+    assert.throws(() => listSeeds('held-out', 1), /KOVO_RB_HELDOUT_SALT/)
   } finally {
-    if (previous === undefined) delete process.env.GUARDIAN_RB_HELDOUT_SALT
-    else process.env.GUARDIAN_RB_HELDOUT_SALT = previous
+    if (previous === undefined) delete process.env.KOVO_RB_HELDOUT_SALT
+    else process.env.KOVO_RB_HELDOUT_SALT = previous
   }
-  process.env.GUARDIAN_RB_HELDOUT_SALT = 'unit-test-held-out-salt'
+  process.env.KOVO_RB_HELDOUT_SALT = 'unit-test-held-out-salt'
   const held = listSeeds('held-out', 3)
   assert.equal(held.length, 3)
   assert.ok(held.every((seed) => seed >= 1_000_000))

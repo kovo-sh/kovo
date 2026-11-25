@@ -161,17 +161,17 @@ test('every entrypoint calls the local-lab gate', () => {
   }
 })
 
-test('local-lab gate refuses to start without GUARDIAN_ALLOW_LOCAL_LAB=1', () => {
-  const prev = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
+test('local-lab gate refuses to start without KOVO_ALLOW_LOCAL_LAB=1', () => {
+  const prev = process.env.KOVO_ALLOW_LOCAL_LAB
+  delete process.env.KOVO_ALLOW_LOCAL_LAB
   try {
     assert.equal(localLabAllowed(), false)
-    assert.throws(() => assertLocalLabAllowed(), /GUARDIAN_ALLOW_LOCAL_LAB=1/)
+    assert.throws(() => assertLocalLabAllowed(), /KOVO_ALLOW_LOCAL_LAB=1/)
   } finally {
-    if (prev === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prev
+    if (prev === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = prev
   }
-  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  process.env.KOVO_ALLOW_LOCAL_LAB = '1'
   assert.doesNotThrow(() => assertLocalLabAllowed())
 })
 
@@ -256,15 +256,15 @@ test('apps are discovered dynamically under apps/ (and may be absent during M0)'
 
 test('seed sets: dev is reproducible; held-out requires a salt', () => {
   assert.deepEqual(listSeeds('dev', 3), [1, 2, 3])
-  const prev = process.env.GUARDIAN_RB_HELDOUT_SALT
-  delete process.env.GUARDIAN_RB_HELDOUT_SALT
+  const prev = process.env.KOVO_RB_HELDOUT_SALT
+  delete process.env.KOVO_RB_HELDOUT_SALT
   try {
-    assert.throws(() => listSeeds('held-out', 1), /GUARDIAN_RB_HELDOUT_SALT/)
+    assert.throws(() => listSeeds('held-out', 1), /KOVO_RB_HELDOUT_SALT/)
   } finally {
-    if (prev === undefined) delete process.env.GUARDIAN_RB_HELDOUT_SALT
-    else process.env.GUARDIAN_RB_HELDOUT_SALT = prev
+    if (prev === undefined) delete process.env.KOVO_RB_HELDOUT_SALT
+    else process.env.KOVO_RB_HELDOUT_SALT = prev
   }
-  process.env.GUARDIAN_RB_HELDOUT_SALT = 'unit-test-held-out-salt'
+  process.env.KOVO_RB_HELDOUT_SALT = 'unit-test-held-out-salt'
   const held = listSeeds('held-out', 3)
   assert.equal(held.length, 3)
   assert.ok(held.every((n) => n >= 1_000_000))

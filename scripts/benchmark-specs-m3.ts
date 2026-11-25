@@ -163,7 +163,7 @@ export function synthCsrfStateChange(o: HypothesisOutcome, env: ProbeEnv): Synth
   const controlLiteral = literal(hit.controlValue)
   const stateSelector = typeof hit.stateSelector === 'string' ? hit.stateSelector : undefined
   const recordId = deriveRecordId(hit)
-  if (process.env.GUARDIAN_BENCH_DEBUG === '1') {
+  if (process.env.KOVO_BENCH_DEBUG === '1') {
     process.stderr.write(`[spec-csrf] path=${path} method=${methodRaw} bodyField=${bodyField} enc=${String(hit.bodyEncoding ?? '-')} readPath=${readPath} stateField=${stateField} control=${String(hit.controlValue ?? '-')} expected=${String(hit.expectedValue ?? '-')} recordId=${recordId ?? '-'} keys=${Object.keys(hit).join(',')}\n`)
   }
   if (!path.startsWith('/') || !readPath.startsWith('/')) return []
@@ -277,7 +277,7 @@ export function synthWebhookSignature(o: HypothesisOutcome, env: ProbeEnv): Synt
   // A POST to the same path as the delivery/list read is a CRUD create, not a signed inbound
   // receiver; only an explicit processing acknowledgement may confirm that ambiguous shape.
   if (!acceptance && readPath && readPath === path) return []
-  if (process.env.GUARDIAN_BENCH_DEBUG === '1') {
+  if (process.env.KOVO_BENCH_DEBUG === '1') {
     process.stderr.write(`[spec-webhook] path=${path} variant=${String(hit.variant ?? '-')} proof=${String(hit.proof ?? '-')} header=${header || '-'} bodyKeys=${body ? Object.keys(body).join(',') : 'none'} readPath=${readPath || '-'} stateField=${String(hit.stateField ?? '-')} expected=${String(hit.expectedValue ?? '-')}\n`)
   }
   if (!path.startsWith('/') || !body) return []
@@ -290,11 +290,11 @@ export function synthWebhookSignature(o: HypothesisOutcome, env: ProbeEnv): Synt
     // tamper would leave the inline signature valid and turn the control into another acceptance.
     if (inline) {
       return stepOf(env, 'c1', 'control', 'Tampered inline signature is rejected', {
-        method: 'POST', pathAndQuery: path, headers: { 'Content-Type': 'application/json' }, jsonBody: { ...body, [inline[2]]: 'guardian-invalid-signature' },
+        method: 'POST', pathAndQuery: path, headers: { 'Content-Type': 'application/json' }, jsonBody: { ...body, [inline[2]]: 'kovo-invalid-signature' },
       }, null, {}, [400, 401, 403, 422])
     }
     return stepOf(env, 'c1', 'control', 'Tampered signature is rejected', {
-      method: 'POST', pathAndQuery: path, headers: { 'Content-Type': 'application/json', [header]: 'guardian-invalid-signature' }, jsonBody: body,
+      method: 'POST', pathAndQuery: path, headers: { 'Content-Type': 'application/json', [header]: 'kovo-invalid-signature' }, jsonBody: body,
     }, null, {}, [400, 401, 403, 422])
   }
   const probeStep = (id: string, role: 'control' | 'probe', description: string, withSignature: boolean) => {
@@ -398,7 +398,7 @@ export function synthOpenRedirect(o: HypothesisOutcome, env: ProbeEnv): Synthesi
   try { observed = new URL(String(hit.location ?? '')) } catch { return [] }
   if (!observed.hostname || /^(?:127\.|localhost$)/i.test(observed.hostname)) return []
   if (!payload || payload.length > 512 || /[\r\n\0]/.test(payload)) return []
-  const control = requestParts(o, env, 'https://guardian-control.invalid/cb')
+  const control = requestParts(o, env, 'https://kovo-control.invalid/cb')
   const probe = requestParts(o, env, payload)
   if (!control || !probe) return []
   const host = observed.hostname.toLowerCase()

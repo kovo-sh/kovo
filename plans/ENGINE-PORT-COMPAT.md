@@ -34,7 +34,7 @@ Slice 3.
    (no raw logs or HTTP bodies inspected; only test ids, assertion names and counters).
 4. Docker-dependent suites executed through `newgrp docker -c '…'`; without the group the
    baseline itself shows ~80 spurious failures, so **all tier comparisons below are docker-on**.
-5. Isolation lever: `GUARDIAN_DETERMINISTIC_ENGINE=0` (the engine's own disable switch) to
+5. Isolation lever: `KOVO_DETERMINISTIC_ENGINE=0` (the engine's own disable switch) to
    prove which failures are caused by the in-Execution sweep.
 
 ### Baseline drift (not caused by engine-port)
@@ -64,7 +64,7 @@ The sweep is bounded by **1800 requests / 240 s** (`deterministic-engine.ts:33-3
 budget, multi-trial fanout, specialist assignment/grant creation, planner review, K=6 stop —
 now sits behind that gate.
 
-Proof: with `GUARDIAN_DETERMINISTIC_ENGINE=0` the sweep returns immediately and
+Proof: with `KOVO_DETERMINISTIC_ENGINE=0` the sweep returns immediately and
 `T1-22a`, `T1-24a`, `T2-22c` and `M4.8` all pass unchanged. With the engine on they fail on
 their 0.5–8 s deadlines. This is an ordering contract break, not a modelling difference.
 
@@ -97,7 +97,7 @@ enters deterministic mode" is therefore false even with the engine disabled. The
 after the engine branch forked. Port version:
 
 ```
-if (allowLocalLab && GUARDIAN_ALLOW_LOCAL_LAB === '1' && fresh.capabilityTier >= 3)
+if (allowLocalLab && KOVO_ALLOW_LOCAL_LAB === '1' && fresh.capabilityTier >= 3)
 ```
 
 Main version additionally requires `project.environment === 'local-lab'`,
@@ -147,7 +147,7 @@ unless another file is named.
 | 16 | `T2-24b` early-stop cancels sibling in SQLite (`:6633`) | losing sibling reaches `canceled` when trial 0 confirms | winner's confirmation never dispatched ⇒ sibling finishes `complete` (50 s) | **engine-regression** | same ordering fix as #6; early-stop trigger must not depend on the sweep | 3 |
 | 17 | `T2-24e` `trial.early_stopped` SSE event (`:6753`) | event emitted on sibling cancellation | no cancellation ⇒ no event | **engine-regression** | same as #16 | 3 |
 | 18 | `T3-24` crown-jewel lead → 2 trials → cancel sibling (`:8114`) | 2 parallel trials, first confirmation cancels the other | fanout suppressed by the sweep gate | **engine-regression** | same as #6 | 3 |
-| 19 | `T4-08` full `guardian scan --local-lab --sarif` (`:8560`) | deterministic CLI exits 2 on a confirmed high finding; SARIF/MD/summary valid | scan finishes without the confirmed finding (exit 1) | **engine-regression** (product floor) | restore the legacy deterministic pass (flag off) before the engine lane; parity-gate the engine | 2 |
+| 19 | `T4-08` full `kovo-hunter scan --local-lab --sarif` (`:8560`) | deterministic CLI exits 2 on a confirmed high finding; SARIF/MD/summary valid | scan finishes without the confirmed finding (exit 1) | **engine-regression** (product floor) | restore the legacy deterministic pass (flag off) before the engine lane; parity-gate the engine | 2 |
 
 Measured: **19 regressions in the six files** (16 tier leaves + 3 contract-file tests), plus 6
 pre-existing baseline flakes. The recorded "25" is the same failure population counted with the
@@ -205,7 +205,7 @@ early-stop is never dispatched — the cancellation machinery they exercise is i
    `surface-engine`, `replay-verifier`, `dedupe`, `broker`, `store`, `worker-backend` exports.
 3. **Split the fallback instead of replacing it** (Slice 2): keep `main`'s
    `runDeterministicInvestigation` as the flag-off path; add the engine as the flag-on path.
-   Invert the switch: opt-in (`GUARDIAN_DETERMINISTIC_ENGINE=1`), not opt-out.
+   Invert the switch: opt-in (`KOVO_DETERMINISTIC_ENGINE=1`), not opt-out.
 4. **Move budget persistence to the top of `driveInvestigation`**, before the
    `profiles.length` branch. This alone clears #1 and unblocks the K=6/planner paths.
 5. **Move `expandEligibleMultiTrialSteps` + `refreshReadyChainSteps` ahead of the sweep** so fanout
@@ -265,7 +265,7 @@ cd /tmp/port-probe && node --test --test-reporter=tap \
 newgrp docker -c "cd /tmp/port-probe && node --test --test-reporter=tap tests/v4-e2e-tiers.test.ts"
 
 # isolation lever proving RC-1
-GUARDIAN_DETERMINISTIC_ENGINE=0 node --test --test-reporter=tap \
+KOVO_DETERMINISTIC_ENGINE=0 node --test --test-reporter=tap \
   --test-name-pattern='T1-22a|T1-24a|T2-22c' tests/v4-e2e-tiers.test.ts
 ```
 

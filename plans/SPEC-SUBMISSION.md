@@ -1,7 +1,7 @@
 # Spec submission: why 19 held-out route-hit targets never persisted a spec
 
 Source artifacts (no raw logs): the clean held-out autopsy cells for seed **1000042** (grey-box,
-K=6, salted), `guardian.sqlite` + `agent-sessions/*.sqlite` + the floor scorecards:
+K=6, salted), `kovo.sqlite` + `agent-sessions/*.sqlite` + the floor scorecards:
 
 | app | kept dir | floor card |
 | --- | --- | --- |
@@ -58,7 +58,7 @@ anomaly (leak / cross-tenant / bypass / missing scoping) near a distinctive targ
 | primary cause | rows | classes |
 | --- | ---: | --- |
 | (a) turn/wall cap hit while still probing or repairing a spec | **12** | mass_assignment, oauth, xss_stored, jwt, cache_poisoning, xxe, idor ×2, bfla, csrf, webhook_forgery, race_condition |
-| (b) settlement/revoked phase, `guardian_verify` still allowed but skipped | 5 | business_logic ×2, webhook_forgery ×2, race_condition |
+| (b) settlement/revoked phase, `kovo_verify` still allowed but skipped | 5 | business_logic ×2, webhook_forgery ×2, race_condition |
 | (c) leaning `complete_intent` accepted with no target spec | 0 primary (2 overlapping: acme webhook `[partial]`, shopflow xss `[partial]`) | — |
 | (d) offline claim with no execution | 0 (every row had target-route requests) | — |
 | (e) brief never stated a per-target spec obligation | **all 19** (cross-cutting; the N-2 nudge named proof tools but not the route or the mandatory spec) | — |
@@ -81,7 +81,7 @@ Pre-agreed rule applied to §2:
 
 - **Reserved wrap-up verify turn + route-specific obligation** (`src/server/agent-session.ts`):
   settlement pauses offline analysis while the most-probed route has no covering spec; the N-2
-  nudge and 85% banner name `METHOD path param=…` and repeat `GUARDIAN_VERIFY_SPEC_SHAPE`;
+  nudge and 85% banner name `METHOD path param=…` and repeat `KOVO_VERIFY_SPEC_SHAPE`;
   `complete_intent(proved|partial)` is rejected with the exact missing `proofGapReason` or spec.
 - **Coded proof gaps** (`record_coverage` → `open_proof_gap`): `no_spec_shape`,
   `no_authenticated_persona`, `baseline_empty`, `no_control_path`, `runtime_unavailable`,
@@ -103,7 +103,7 @@ Captured before temp dirs are removed; 0-FP artifacts are byte-identical (no key
 ## 5. After the fixes: measured held-out cell
 
 Salted held-out shopflow, seed 1000042, grey-box, K=6, 600 s, docker, traced
-(`GUARDIAN_TRACE_DIR=/tmp/spec-sub-trace-final`), SHA `e3b4ffc` (agent-session + bench changes only;
+(`KOVO_TRACE_DIR=/tmp/spec-sub-trace-final`), SHA `e3b4ffc` (agent-session + bench changes only;
 the `execution.ts` cap patch is not in this branch):
 
 | metric | baseline (kept autopsy cell) | after |

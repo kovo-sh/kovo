@@ -1,6 +1,6 @@
 # staging-concurrency — realism fixture #3
 
-A shared, stateful tenant that models Guardian's `staging_isolated` contract: mutations
+A shared, stateful tenant that models Kovo Hunter's `staging_isolated` contract: mutations
 are pre-authorized, every created entity is run-tagged, and teardown must leave the
 database indistinguishable from before the run.
 
@@ -17,11 +17,11 @@ synthetic bearer tokens.
 
 ## Run-scoped entities
 
-Send `X-Guardian-Run-Id: <runId>` on writes. Created carts and orders get IDs shaped
-`guardian-qa-<runId>-<label>-<n>`. Mutations of existing rows are journaled so cleanup can
+Send `X-Kovo-Run-Id: <runId>` on writes. Created carts and orders get IDs shaped
+`kovo-qa-<runId>-<label>-<n>`. Mutations of existing rows are journaled so cleanup can
 restore them. `POST /__staging__/cleanup?runId=<id>` restores mutations, deletes tagged
 rows, and returns `{removed, restored, remaining}`. `GET /__staging__/orphans?runId=` audits.
-`stop()` runs the same cleanup for every tracked run and throws if any `guardian-qa-`
+`stop()` runs the same cleanup for every tracked run and throws if any `kovo-qa-`
 record survives.
 
 ## Intended surface
@@ -37,7 +37,7 @@ record survives.
 ## Truth (never served)
 
 `truth.json` holds four findings, one two-step cross-tenant chain, three decoys, and the
-cleanup invariants (`guardian-qa-` prefix, zero orphans, mutation restore).
+cleanup invariants (`kovo-qa-` prefix, zero orphans, mutation restore).
 
 ## Self-test
 

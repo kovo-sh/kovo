@@ -133,7 +133,7 @@ Non-sibling labels and every `static_verified`/`proposed`/`open_proof_gap` claim
 ## Third triage round (Phase-B, K=6 in-run workers)
 
 The K=6 cell produced three runtime-confirmed findings that matched no target. All three were
-confirmed by the **guardian_verify** transcript path, and all three shared one root cause: the host
+confirmed by the **kovo_verify** transcript path, and all three shared one root cause: the host
 classified the claimed impact from the **title string only**, and anything outside the four gated
 classes fell to `other`, which skips the impact gate entirely.
 

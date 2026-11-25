@@ -22,16 +22,16 @@ Never copy a number from a scorecard by hand — quote the report artifact path 
 
 ```bash
 # loopback lab only
-export GUARDIAN_ALLOW_LOCAL_LAB=1
+export KOVO_ALLOW_LOCAL_LAB=1
 
 # agentic runs need the Docker worker backend (worker sessions)
-newgrp docker -c 'docker image inspect guardian-worker:v4 >/dev/null && echo worker-ok'
+newgrp docker -c 'docker image inspect kovo-worker:v4 >/dev/null && echo worker-ok'
 
-# enabled model profile (OpenRouter DeepSeek V4.1 Flash in the Guardian data dir)
-export GUARDIAN_DATA_DIR=/home/omarchy/guardian-data
+# enabled model profile (OpenRouter DeepSeek V4.1 Flash in the Kovo Hunter data dir)
+export KOVO_DATA_DIR=/home/omarchy/guardian-data
 
 # salted held-out seeds (owner-only file; NEVER print or commit the value)
-export GUARDIAN_RB_HELDOUT_SALT="$(cat /home/omarchy/.config/guardian-bench/heldout.salt)"
+export KOVO_RB_HELDOUT_SALT="$(cat /home/omarchy/.config/guardian-bench/heldout.salt)"
 ```
 
 Typecheck floor before any calibration run:
@@ -44,14 +44,14 @@ Twin matrix (`run.ts selftest`, real site twins) and the acceptance suite:
 
 ```bash
 # every real site twin on dev seeds 1,2 (exit 2 on any twin mismatch)
-GUARDIAN_ALLOW_LOCAL_LAB=1 node benchmarks/reason-bench/run.ts selftest --app ledgerflow --seeds 1,2 \
+KOVO_ALLOW_LOCAL_LAB=1 node benchmarks/reason-bench/run.ts selftest --app ledgerflow --seeds 1,2 \
   --site lf-01,lf-02,lf-03,lf-04,lf-05,lf-06,lf-07,lf-08,lf-09,lf-10,lf-11,lf-12,lf-13,lf-14
-GUARDIAN_ALLOW_LOCAL_LAB=1 node benchmarks/reason-bench/run.ts selftest --app forgecloud --seeds 1,2 \
+KOVO_ALLOW_LOCAL_LAB=1 node benchmarks/reason-bench/run.ts selftest --app forgecloud --seeds 1,2 \
   --site fc-01,fc-02,fc-03,fc-04,fc-05,fc-06,fc-07,fc-08,fc-09,fc-10,fc-11,fc-12,fc-13,fc-14
 
 # matrix + benign-soundness tests (the 30-seed sweep is opt-in)
-GUARDIAN_ALLOW_LOCAL_LAB=1 node --test benchmarks/reason-bench/tests/
-REASON_SOUNDNESS_SEEDS=1 GUARDIAN_ALLOW_LOCAL_LAB=1 node --test benchmarks/reason-bench/tests/soundness.test.ts
+KOVO_ALLOW_LOCAL_LAB=1 node --test benchmarks/reason-bench/tests/
+REASON_SOUNDNESS_SEEDS=1 KOVO_ALLOW_LOCAL_LAB=1 node --test benchmarks/reason-bench/tests/soundness.test.ts
 ```
 
 The `--site` filter lists the 14 real sites. The generic runner assumes a `vulnerable` twin fires,
@@ -64,7 +64,7 @@ role is asserted by `tests/{ledgerflow,forgecloud}.test.ts` and the soundness sw
 | forgecloud | 56/56 | 5/5 at 0/0 | 95 (6 personas; revoked login denied) | 0 | 0 |
 
 The 30-seed sweep (`REASON_SOUNDNESS_SEEDS=1`, seeds 1–30 × both apps) recorded 0 oracle events
-and 0 orphan `guardian-qa-` records; teardown removes the materialized tree and closes the listener.
+and 0 orphan `kovo-qa-` records; teardown removes the materialized tree and closes the listener.
 
 `--no-llm` never needs a model profile or Docker worker sessions; it always uses a fresh,
 isolated deterministic data dir.
@@ -81,16 +81,16 @@ No payload strings are printed.
 # dev
 npm run benchmark:reason -- \
   --app all --seed 1 --mode grey-box --no-llm --concurrency 2 \
-  --out-dir .guardian/reason-gate/dev \
-  --json .guardian/reason-gate/dev/reason-report.json \
-  --md   .guardian/reason-gate/dev/reason-report.md
+  --out-dir .kovo/reason-gate/dev \
+  --json .kovo/reason-gate/dev/reason-report.json \
+  --md   .kovo/reason-gate/dev/reason-report.md
 
 # salted held-out
 npm run benchmark:reason -- \
   --app all --held-out --seeds 1000042 --mode grey-box --no-llm --concurrency 2 \
-  --out-dir .guardian/reason-gate/heldout \
-  --json .guardian/reason-gate/heldout/reason-report.json \
-  --md   .guardian/reason-gate/heldout/reason-report.md
+  --out-dir .kovo/reason-gate/heldout \
+  --json .kovo/reason-gate/heldout/reason-report.json \
+  --md   .kovo/reason-gate/heldout/reason-report.md
 ```
 
 `tests/anti-heuristic.test.ts` runs these two commands through the real CLI process boundary and
@@ -99,8 +99,8 @@ makes the CLI exit **3**.
 
 | split | cells | targets | confirmed | floor recall | ceiling | verdict | artifact |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| dev (seed 1) | 2 | 28 | 0 | 0.0% | 10% | PASS (exit 0) | `.guardian/reason-gate/dev/reason-report.json` |
-| held-out (seed 1000042) | 2 | 28 | 0 | 0.0% | 10% | PASS (exit 0) | `.guardian/reason-gate/heldout/reason-report.json` |
+| dev (seed 1) | 2 | 28 | 0 | 0.0% | 10% | PASS (exit 0) | `.kovo/reason-gate/dev/reason-report.json` |
+| held-out (seed 1000042) | 2 | 28 | 0 | 0.0% | 10% | PASS (exit 0) | `.kovo/reason-gate/heldout/reason-report.json` |
 
 **Per-site floor verdicts** (from the gate reports; `decoy` = mounted hardened for that seed, so it is
 not a floor target; `missed` = scored target, no confirmed finding):
@@ -149,7 +149,7 @@ not a floor target; `missed` = scored target, no confirmed finding):
 The hardened set is drawn per seed (five decoy units out of the 19 discovered site dirs), so a
 canonical site can be a target on one split and a decoy on the other. The 2026-11-23 floor numbers
 were produced by the commands above in a scratch output dir; re-running §1 repopulates
-`.guardian/reason-gate/{dev,heldout}/` with the same report schema. `tests/anti-heuristic.test.ts`
+`.kovo/reason-gate/{dev,heldout}/` with the same report schema. `tests/anti-heuristic.test.ts`
 re-runs both legs and asserts exit 0 + `recall <= 0.10`.
 
 ---
@@ -161,9 +161,9 @@ with worker-socket access and the salted seeds:
 
 ```bash
 newgrp docker          # once per shell (or prefix each command: newgrp docker -c '<command>')
-export GUARDIAN_ALLOW_LOCAL_LAB=1
-export GUARDIAN_DATA_DIR=/home/omarchy/guardian-data
-export GUARDIAN_RB_HELDOUT_SALT="$(cat /home/omarchy/.config/guardian-bench/heldout.salt)"
+export KOVO_ALLOW_LOCAL_LAB=1
+export KOVO_DATA_DIR=/home/omarchy/guardian-data
+export KOVO_RB_HELDOUT_SALT="$(cat /home/omarchy/.config/guardian-bench/heldout.salt)"
 ```
 
 Run each leg into its own artifact directory so the artifacts carry one `(budget, duration)`
@@ -179,10 +179,10 @@ run_leg() {  # $1=split(dev|heldout)  $2=mode  $3=duration  $4=budget
     --app all "${split_args[@]}" --mode "$mode" \
     --max-duration-ms "$duration" --budget-usd "$budget" \
     --verifier docker --concurrency 2 --isolate-data-dir \
-    --floor-from ".guardian/reason-gate/$split" \
-    --out-dir ".guardian/reason-cal/$split-$mode-$duration" \
-    --json ".guardian/reason-cal/$split-$mode-$duration/reason-report.json" \
-    --md ".guardian/reason-cal/$split-$mode-$duration/reason-report.md"
+    --floor-from ".kovo/reason-gate/$split" \
+    --out-dir ".kovo/reason-cal/$split-$mode-$duration" \
+    --json ".kovo/reason-cal/$split-$mode-$duration/reason-report.json" \
+    --md ".kovo/reason-cal/$split-$mode-$duration/reason-report.md"
 }
 
 run_leg dev     grey-box  10m 5
@@ -251,18 +251,18 @@ for budget in 2 5 20; do
     npm run benchmark:reason -- \
       --app all --seed 1 --mode grey-box \
       --max-duration-ms "$duration" --budget-usd "$budget" --verifier docker \
-      --out-dir ".guardian/reason-curve/$budget-$duration"
+      --out-dir ".kovo/reason-curve/$budget-$duration"
   done
 done
 
 # merge every leg into one curve report (a floor run keeps ΔReasoning honest)
 npm run benchmark:reason -- \
   --app all --seed 1 --mode grey-box --no-llm \
-  --floor-from .guardian/reason-gate/dev \
-  --curve-from .guardian/reason-curve \
-  --out-dir .guardian/reason-curve/merged \
-  --json .guardian/reason-curve/merged/reason-report.json \
-  --md   .guardian/reason-curve/merged/reason-report.md
+  --floor-from .kovo/reason-gate/dev \
+  --curve-from .kovo/reason-curve \
+  --out-dir .kovo/reason-curve/merged \
+  --json .kovo/reason-curve/merged/reason-report.json \
+  --md   .kovo/reason-curve/merged/reason-report.md
 ```
 
 | budget | 10m | 30m | 45m | 60m |
@@ -280,7 +280,7 @@ report's `notes`.
 ## 4. How to fill this file
 
 1. Run the gate legs (§1) and record `floor recall`, verdict, and per-site outcomes from
-   `.guardian/reason-gate/<split>/reason-report.json` → `gate`.
+   `.kovo/reason-gate/<split>/reason-report.json` → `gate`.
 2. Run the eight agentic legs (§2). Each report's `lift` block gives `floorRecall`,
    `deltaReasoning`, `costPerAdditiveConfirmedUsd`; `agentic` gives recall/precision/chains;
    `byMode[].aggregate.families` gives A–F.
@@ -309,4 +309,4 @@ salt or a persona secret.
 | best agentic recall (held-out) | TODO (M4 agentic run) |
 | best ΔReasoning | TODO (M4 agentic run) |
 | 0 decoy FP confirmed? | yes — floor precision 100%, decoyFP 0 on both splits |
-| orphan containers after run | 0 (`docker ps --filter label=guardian.workspace`; floor run uses no workers) |
+| orphan containers after run | 0 (`docker ps --filter label=kovo.workspace`; floor run uses no workers) |

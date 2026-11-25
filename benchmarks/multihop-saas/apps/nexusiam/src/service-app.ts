@@ -82,7 +82,7 @@ export async function handleApp(
           headers: {
             'content-type': 'application/json',
             'x-service-token': header(req, 'x-service-token'),
-            'x-guardian-run-id': body?.runId ?? runId,
+            'x-kovo-run-id': body?.runId ?? runId,
           },
           body: JSON.stringify({ commentId: comment.id, sourceDigest: visitDigest, runId: body?.runId ?? runId }),
         })

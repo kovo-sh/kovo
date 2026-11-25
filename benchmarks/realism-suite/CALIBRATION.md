@@ -7,17 +7,17 @@ This document defines how the four `benchmarks/realism-suite` fixtures become me
 serves `truth.json` to `Execution`.
 
 > Defensive QA context: the fixtures are loopback-only authorized lab targets. They
-> measure whether Guardian's discovery, auth, replay and evidence pipeline works under
+> measure whether Kovo Hunter's discovery, auth, replay and evidence pipeline works under
 > realistic enterprise, WAN, staging and monorepo conditions — not an attack tool.
 
 ## Safety and evidence rules
 
-- `GUARDIAN_ALLOW_LOCAL_LAB=1` is mandatory; fixtures bind only `127.0.0.1:0`.
+- `KOVO_ALLOW_LOCAL_LAB=1` is mandatory; fixtures bind only `127.0.0.1:0`.
 - Fixture credentials are synthetic and per-run. Artifacts are written `0600` in a `0700`
-  directory and scanned for known fixture secrets, `GUARDIAN_RB_HELDOUT_SALT` when set,
+  directory and scanned for known fixture secrets, `KOVO_RB_HELDOUT_SALT` when set,
   private keys, provider keys, JWTs and AWS-shaped keys. A dirty scan exits `4`.
 - `--no-llm` is the deterministic floor. It never inherits a model-enabled data dir.
-- Agentic runs need an enabled model profile (`--data-dir` / `GUARDIAN_DATA_DIR`) **and**
+- Agentic runs need an enabled model profile (`--data-dir` / `KOVO_DATA_DIR`) **and**
   a worker-session-capable verifier (`--verifier docker`). `local-jq` plus a model profile
   exits `2` instead of producing an inert run.
 - A fixture that `Execution` cannot reach is recorded with its exact failure stage
@@ -31,21 +31,21 @@ serves `truth.json` to `Execution`.
 
 ```bash
 # Deterministic floor per fixture (no model profile, no Docker required)
-GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- \
-  --fixture enterprise-spa --no-llm --out-dir .guardian/realism-gate
+KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- \
+  --fixture enterprise-spa --no-llm --out-dir .kovo/realism-gate
 
 # Agentic lane per fixture (needs a model profile + Docker worker sessions)
-GUARDIAN_ALLOW_LOCAL_LAB=1 GUARDIAN_DATA_DIR=/path/to/guardian-data \
+KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR=/path/to/kovo-data \
   newgrp docker -c 'npm run benchmark:realism -- --fixture enterprise-spa --verifier docker \
-    --mode grey-box --out-dir .guardian/realism-gate-agentic'
+    --mode grey-box --out-dir .kovo/realism-gate-agentic'
 
 # CI form: fail the build when a required gate criterion is not met
-GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- \
-  --fixture all --no-llm --fail-on-gate --out-dir .guardian/realism-gate
+KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- \
+  --fixture all --no-llm --fail-on-gate --out-dir .kovo/realism-gate
 
 # Cross-check the persisted findings with the suite's own grader
-GUARDIAN_ALLOW_LOCAL_LAB=1 node benchmarks/realism-suite/run.ts grade \
-  --fixture enterprise-spa --findings .guardian/realism-gate/enterprise-spa-grey-box-no-llm.findings.json
+KOVO_ALLOW_LOCAL_LAB=1 node benchmarks/realism-suite/run.ts grade \
+  --fixture enterprise-spa --findings .kovo/realism-gate/enterprise-spa-grey-box-no-llm.findings.json
 ```
 
 Artifacts per fixture (`<slug> = <fixture>-<mode>[-no-llm]`):
@@ -105,7 +105,7 @@ any check fails, else `unmeasured` if any check is unmeasured, else `pass`.
 | `storedEndpoints` | `endpoints` rows for the run | `null` if the count query failed |
 | `declaredEndpoints` | fixture `routes.length` | fixture-declared surface |
 | `storeWriteP99Ms` | harness timing of real `Store.upsertEndpoint` calls during the run | nearest-rank p99; `null` with fewer than 20 writes |
-| `siblingDerivationSuppressed` | `phase0.siblings_suppressed` event with `GUARDIAN_RECON_SIBLINGS=1` | `false` when Phase-0 ran without suppressing; `null` when no Phase-0 evidence exists |
+| `siblingDerivationSuppressed` | `phase0.siblings_suppressed` event with `KOVO_RECON_SIBLINGS=1` | `false` when Phase-0 ran without suppressing; `null` when no Phase-0 evidence exists |
 | `tierA4HopSinks` | truth 4-hop IDs matched to Program-Graph code→runtime lead facts (`source=program_graph`) | Tier A is the hypothesis-linked priority set; `null` without ranking evidence |
 | `leakedEntities` | staging `orphans()` after `cleanup(runId)` | unchanged from the staging safety gate |
 
@@ -143,7 +143,7 @@ stored XSS confirmed**, and chain `spa-admin-compromise` complete.
 | Grade | TP / FP / precision / recall | — | — |
 
 ```bash
-GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- --fixture enterprise-spa --no-llm
+KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- --fixture enterprise-spa --no-llm
 ```
 
 ## Gate #2 — WAN + async OOB (`wan-oob`)
@@ -176,7 +176,7 @@ window (see “Wiring health vs capability”).
 | Grade | TP / FP / precision / recall | — | — |
 
 ```bash
-GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- --fixture wan-oob --no-llm
+KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- --fixture wan-oob --no-llm
 ```
 
 Flag: `--callback-delay-ms` exists for smoke runs only; the default `15000,30000` is the gate configuration.
@@ -184,7 +184,7 @@ Flag: `--callback-delay-ms` exists for smoke runs only; the default `15000,30000
 ## Gate #3 — staging safety (`staging-concurrency`)
 
 Gate: **write-BOLA confirmed**, **HTTP/2 race confirmed**, **checkout price tampering
-confirmed**, and **zero leaked `guardian-qa-` entities after cleanup**. Chain
+confirmed**, and **zero leaked `kovo-qa-` entities after cleanup**. Chain
 `stg-tenant-takeover` is reported informationally (the explicit staging gate above is
 authoritative). Wiring is judged separately: zero blocking approvals, zero broker-denied
 mutating requests, and zero leaked entities. The race capability criterion additionally
@@ -200,12 +200,12 @@ mutations reports `0 leaked` but still fails the write/race/checkout gate.
 | Write-BOLA | TP for `stg-write-bola` | — | — |
 | HTTP/2 race | TP for `stg-race-double-spend` | — | — |
 | Checkout tampering | TP for `stg-price-tampering` | — | — |
-| Leaked entities | `fixture.orphans()` length after `cleanup(runId)` (prefix `guardian-qa-`) | — | — |
+| Leaked entities | `fixture.orphans()` length after `cleanup(runId)` (prefix `kovo-qa-`) | — | — |
 | Cleanup effect | records removed / tenant mutations restored | — | — |
 | Grade | TP / FP / precision / recall | — | — |
 
 ```bash
-GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- --fixture staging-concurrency --no-llm
+KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- --fixture staging-concurrency --no-llm
 ```
 
 ## Gate #4 — monorepo white-box (`monorepo-whitebox`)
@@ -229,7 +229,7 @@ ranked Tier A.
 | Grade | TP / FP / precision / recall | — | — |
 
 ```bash
-GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- \
+KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- \
   --fixture monorepo-whitebox --mode white-box --no-llm
 ```
 
@@ -246,12 +246,12 @@ do not transcribe expected or simulated numbers.
 | 2026-11-23 | `91a4be1` | `monorepo-whitebox` | white-box / `--no-llm`, **smoke** (120 s cap) | FAIL | `investigation` | SAST suspects 0 (link n/a); persisted 62 / retrieved 62 / declared 2,565 (under 2,500); 4-hop 0/3; chain 0/2; TP 0 / FP 0; 611 engine requests, 2 rejected / 1 lead; 88.3 s | `realism-gate-4-smoke` (local out-dir) |
 | 2026-11-23 | `b62401c` | `wan-oob` | grey-box / `--no-llm`, 300 s cap, default callback delays (15/30 s) | FAIL | `investigation` | **wiring FAIL**: pending_oob registered 0; drain n/a (no late callbacks); approvals 0 blocking / 176 auto-review rows; denied mutations 0; 33 endpoints; p99 1.24 ms; **capability FAIL**: blind SQLi / async SSRF / async XXE not confirmed, async FN 100%; fixture callbacks `sqli` only; TP 0 / FP 0; 467 engine requests | `realism-gate-2-final` (local out-dir) |
 | 2026-11-23 | `b62401c` | `staging-concurrency` | grey-box / `--no-llm`, 180 s cap, `staging_isolated`, HTTP/2 transport enabled | FAIL | `investigation` | **wiring FAIL**: approvals 0 blocking; **denied mutations 15 (all `staging_contract`)**; parked workers 0; leaked 0; **h2 single-packet bursts 0**, HTTP/1.1 fallback 0; 18 endpoints; p99 1.23 ms; **capability FAIL**: write-BOLA / race / checkout not confirmed; TP 0 / FP 0; 396 engine requests | `realism-gate-3-final` (local out-dir) |
-| 2026-11-23 | `b62401c` | `monorepo-whitebox` | white-box / `--no-llm`, 300 s cap, `GUARDIAN_RECON_SIBLINGS=1` | FAIL | `investigation` | **wiring FAIL**: stored 62 / declared 2,565 (< 2,500); p99 1.06 ms (pass); sibling derivation suppressed true (pass); Tier A 4-hop sinks 3/3 (pass); **capability FAIL**: SAST suspects 0, 4-hop 0/3, chain 0/2; TP 0 / FP 0; 62 endpoints; 571 engine requests, 2 rejected / 1 lead | `realism-gate-4-final` (local out-dir) |
+| 2026-11-23 | `b62401c` | `monorepo-whitebox` | white-box / `--no-llm`, 300 s cap, `KOVO_RECON_SIBLINGS=1` | FAIL | `investigation` | **wiring FAIL**: stored 62 / declared 2,565 (< 2,500); p99 1.06 ms (pass); sibling derivation suppressed true (pass); Tier A 4-hop sinks 3/3 (pass); **capability FAIL**: SAST suspects 0, 4-hop 0/3, chain 0/2; TP 0 / FP 0; 62 endpoints; 571 engine requests, 2 rejected / 1 lead | `realism-gate-4-final` (local out-dir) |
 | 2026-11-23 | `5f0aea8` | `wan-oob` | grey-box / `--no-llm`, 300 s cap, default callback delays, merged main | FAIL | `investigation` | **wiring FAIL**: pending_oob registered 0; drain n/a; approvals 0 blocking / 176 auto-review rows; denied mutations 0; 33 endpoints; p99 1.37 ms; **capability FAIL**: blind SQLi / async SSRF / async XXE not confirmed, async FN 100%; fixture callbacks `sqli` only; TP 0 / FP 0; 467 engine requests | `realism-merged-2` (local out-dir) |
 | 2026-11-23 | `5f0aea8` | `staging-concurrency` | grey-box / `--no-llm`, 180 s cap, `staging_isolated`, HTTP/2 enabled, merged main | FAIL | `investigation` | **wiring FAIL**: approvals 0 blocking; **denied mutations 15 (all `staging_contract`)**; parked 0; leaked 0; h2 single-packet bursts 0 / fallback 0; 18 endpoints; p99 0.97 ms; **capability FAIL**: write-BOLA / race / checkout not confirmed; TP 0 / FP 0; 396 engine requests | `realism-merged-3` (local out-dir) |
-| 2026-11-23 | `5f0aea8` | `monorepo-whitebox` | white-box / `--no-llm`, 300 s cap, `GUARDIAN_RECON_SIBLINGS=1`, merged main | FAIL | `investigation` | **wiring PASS**: declared 2,565 / spec ops 2,565 / matched 2,565; persisted 5,130 rows (2,568 distinct); retrieved 5,130; truncated no; p99 0.39 ms; sibling suppression true; Tier A 4-hop 3/3; code leads 4 (3 four-hop); probe plan Tier A 3, subset 1,444/2,563. **capability FAIL**: SAST suspects 0, 4-hop 0/3, chain 0/2; TP 0 / FP 0; 5,130 endpoints; 373 engine requests | `realism-merged-4` (local out-dir) |
+| 2026-11-23 | `5f0aea8` | `monorepo-whitebox` | white-box / `--no-llm`, 300 s cap, `KOVO_RECON_SIBLINGS=1`, merged main | FAIL | `investigation` | **wiring PASS**: declared 2,565 / spec ops 2,565 / matched 2,565; persisted 5,130 rows (2,568 distinct); retrieved 5,130; truncated no; p99 0.39 ms; sibling suppression true; Tier A 4-hop 3/3; code leads 4 (3 four-hop); probe plan Tier A 3, subset 1,444/2,563. **capability FAIL**: SAST suspects 0, 4-hop 0/3, chain 0/2; TP 0 / FP 0; 5,130 endpoints; 373 engine requests | `realism-merged-4` (local out-dir) |
 | 2026-11-24 | `42ff918` | `wan-oob` | grey-box / `--no-llm` | FAIL | `gate_incomplete` | **split gates**: `oob_wiring_fnr` **0.0% PASS** (0/2 fired async canary targets unconfirmed; basis `fired_canaries`; SSRF 14 minted/1 fired, XXE 15 minted/3 fired); `fixture_capability_recall` **50.0% FAIL** (2/4 — missing blind SQLi and the exfil chain); legacy blended async FNR 33.3% informational only. **wiring PASS**: 29 pending_oob registered, 45 s drain, 4 late promotions. TP 2 / FP 0 / precision 100%; 34 endpoints; 393 broker exchanges; 166 s | `/tmp/realism-gates-wan-final` |
-| 2026-11-24 | `42ff918` | `staging-concurrency` | grey-box / `--no-llm`, `staging_isolated` | **PASS** | `passed` | **wiring PASS**; **capability PASS**: write-BOLA / HTTP/2 double-spend (2 single-packet bursts, 0 HTTP/1.1 fallback) / checkout tampering confirmed; 0 leaked `guardian-qa-` entities; chain 1/2 informational. TP 3 / FP 0 / precision 100%; 51 endpoints; 276 broker exchanges; 108 s | `/tmp/realism-gates-staging` |
+| 2026-11-24 | `42ff918` | `staging-concurrency` | grey-box / `--no-llm`, `staging_isolated` | **PASS** | `passed` | **wiring PASS**; **capability PASS**: write-BOLA / HTTP/2 double-spend (2 single-packet bursts, 0 HTTP/1.1 fallback) / checkout tampering confirmed; 0 leaked `kovo-qa-` entities; chain 1/2 informational. TP 3 / FP 0 / precision 100%; 51 endpoints; 276 broker exchanges; 108 s | `/tmp/realism-gates-staging` |
 | 2026-11-24 | `42ff918` | `monorepo-whitebox` | white-box / `--no-llm` | FAIL | `investigation` | **wiring PASS** (declared 2,565 / matched 2,565; persisted 5,130 rows / 2,568 distinct; Tier A 4-hop 3/3; code leads 4 with 3 four-hop). **capability FAIL**: TP 0 / FP 0; 0 vulnerability findings; 5,130 endpoints; 373 engine requests. **#4 funnel**: billing 0 dispatched / 0 route hit / 0 verify; reports 0/0/0; admin 1/1/0 — confirmations lost before verification, not at brief truncation | `/tmp/realism-gates-mono-final` |
 
 Smoke rows (`91a4be1`) are harness-validation runs, not gate evidence: the WAN smoke row uses a

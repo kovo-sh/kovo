@@ -20,11 +20,11 @@ export function seedSetFor(seed: number): SeedSet {
 }
 
 function requireHeldOutSalt(salt?: string): string {
-  const s = salt ?? process.env.GUARDIAN_RB_HELDOUT_SALT
+  const s = salt ?? process.env.KOVO_RB_HELDOUT_SALT
   if (!s || s.length < MIN_SALT_LEN) {
     throw new Error(
       `held-out seeds require a salt of >= ${MIN_SALT_LEN} chars via the salt argument or ` +
-        'GUARDIAN_RB_HELDOUT_SALT; refusing to derive a held-out variant without it',
+        'KOVO_RB_HELDOUT_SALT; refusing to derive a held-out variant without it',
     )
   }
   return s

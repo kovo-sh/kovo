@@ -3,7 +3,7 @@
 import { createServer } from 'node:http'
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { loginPersonas, pickLoginPath } from '../guardian-login.ts'
+import { loginPersonas, pickLoginPath } from '../kovo-login.ts'
 import { closeServer, listenLoopback } from '../lib/safety.ts'
 
 const personas = [

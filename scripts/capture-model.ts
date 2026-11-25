@@ -98,7 +98,7 @@ for (const protocol of ['responses', 'messages'] as const) {
   if (values.protocol && protocol !== workflowProtocol) continue
   const calls: ProviderCall[] = []
   await testProvider({ ...DEFAULT_PROVIDER, protocol, key }, call => calls.push(call))
-  if (calls.length !== 1 || calls[0].status !== 200 || !calls[0].body.includes('guardian_connection')) {
+  if (calls.length !== 1 || calls[0].status !== 200 || !calls[0].body.includes('kovo_connection')) {
     throw new Error(`Expected one complete streamed ${protocol} capture.`)
   }
   saveRecording('connection', protocol, calls, key)
@@ -107,7 +107,7 @@ for (const protocol of ['responses', 'messages'] as const) {
 const selectedScenarios = scenarios.filter(item => selected === item.name ||
   (!selected || selected === 'workflow') && !item.historical)
 if (selectedScenarios.length) {
-  const directory = mkdtempSync(join(tmpdir(), 'guardian-record-'))
+  const directory = mkdtempSync(join(tmpdir(), 'kovo-record-'))
   const backend = new LinuxWorkerBackend()
   try {
     for (const { name, prompt, scenario, evidence, expectedChecks, availableChecks } of selectedScenarios) {

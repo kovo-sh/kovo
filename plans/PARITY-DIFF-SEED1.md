@@ -14,7 +14,7 @@
 
 Product per-cell funnel (grader): acme `22→17→16→14→13→13`, shopflow `19→11→8→8→7→7`,
 opsportal `18→13→10→8→6→6` (targets→surface→hypothesis→signal→spec→confirmed).
-Structural evidence read read-only from each cell's `guardian.sqlite` (`endpoints`, `endpoint_params`,
+Structural evidence read read-only from each cell's `kovo.sqlite` (`endpoints`, `endpoint_params`,
 `broker_exchanges`, `facts`, `replay_specs`, `findings`, `events` of kind `deterministic_engine.*`) and from
 `generateVariant(blueprint, 1)` for the runtime route map. No logs, bodies or payload strings were loaded.
 
@@ -136,7 +136,7 @@ signal→spec, the product loses at surface→signal.
 Apply fix #1 only, then:
 
 ```sh
-GUARDIAN_ALLOW_LOCAL_LAB=1 newgrp docker -c 'cd <worktree> && \
+KOVO_ALLOW_LOCAL_LAB=1 newgrp docker -c 'cd <worktree> && \
   node scripts/benchmark-realistic.ts --app all --seeds 1 --mode grey-box --no-llm \
   --verifier docker --isolate-data-dir --concurrency 3 --max-duration-ms 600000 \
   --out-dir /tmp/parity/fix1'

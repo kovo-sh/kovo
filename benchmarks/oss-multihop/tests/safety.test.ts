@@ -27,7 +27,7 @@ import {
 import type {
   CleanNegativeControlSpec,
   ExternalOracleObservation,
-  GuardianCompositeProofReceipt,
+  KovoCompositeProofReceipt,
   OssAnchorManifest,
   PatchRetestRecord,
   RunTelemetry,
@@ -59,7 +59,7 @@ function makeValidReceipt(
   runId: string,
   baseTs: number,
   correlationId: string,
-): GuardianCompositeProofReceipt {
+): KovoCompositeProofReceipt {
   const origin = anchor.personas.find((p) => p.allowedAsChainOrigin)!
   return {
     receiptId: `rcpt_${anchor.anchorId}`,
@@ -144,18 +144,18 @@ test('static safety: zero npm deps and no child_process/eval/vm in benchmarks/os
   }
 })
 
-test('local-lab gate enforces GUARDIAN_ALLOW_LOCAL_LAB=1', () => {
-  const prev = process.env.GUARDIAN_ALLOW_LOCAL_LAB
+test('local-lab gate enforces KOVO_ALLOW_LOCAL_LAB=1', () => {
+  const prev = process.env.KOVO_ALLOW_LOCAL_LAB
   try {
-    delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    assert.throws(() => assertLocalLabAllowed(), /GUARDIAN_ALLOW_LOCAL_LAB=1/)
-    process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+    delete process.env.KOVO_ALLOW_LOCAL_LAB
+    assert.throws(() => assertLocalLabAllowed(), /KOVO_ALLOW_LOCAL_LAB=1/)
+    process.env.KOVO_ALLOW_LOCAL_LAB = '1'
     assert.doesNotThrow(() => assertLocalLabAllowed())
   } finally {
     if (prev === undefined) {
-      delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
+      delete process.env.KOVO_ALLOW_LOCAL_LAB
     } else {
-      process.env.GUARDIAN_ALLOW_LOCAL_LAB = prev
+      process.env.KOVO_ALLOW_LOCAL_LAB = prev
     }
   }
 })
@@ -433,7 +433,7 @@ test('two-side grading, patchBrokeHopId verification, and clean-control 0-FP fai
   assert.ok(renderOssScorecardMarkdown(passRes).includes('patchBrokeHopId'))
 
   // Case 2: Any single FP on a clean negative control MUST fail the gate immediately
-  const cleanFpReceipt: GuardianCompositeProofReceipt = {
+  const cleanFpReceipt: KovoCompositeProofReceipt = {
     ...receipts[0],
     receiptId: 'rcpt_clean_control_fp',
     targetId: controls[1].controlId,

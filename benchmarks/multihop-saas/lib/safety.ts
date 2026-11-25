@@ -6,13 +6,13 @@ import type { AddressInfo } from 'node:net'
 export const LOOPBACK = '127.0.0.1'
 
 export function localLabAllowed(): boolean {
-  return process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1'
+  return process.env.KOVO_ALLOW_LOCAL_LAB === '1'
 }
 
 export function assertLocalLabAllowed(): void {
   if (!localLabAllowed()) {
     throw new Error(
-      'multihop-saas refuses to start: set GUARDIAN_ALLOW_LOCAL_LAB=1 to run the offline loopback lab.',
+      'multihop-saas refuses to start: set KOVO_ALLOW_LOCAL_LAB=1 to run the offline loopback lab.',
     )
   }
 }

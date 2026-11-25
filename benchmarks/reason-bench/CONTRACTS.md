@@ -15,7 +15,7 @@ the app streams (`apps/ledgerflow`, `apps/forgecloud`) build against.
   explicit `.ts` extensions, `import type` for types. Erasable syntax only (no `enum`, no
   `namespace`, no constructor parameter properties). **Zero npm dependencies** — only `node:*`
   built-ins (`node:sqlite`, `node:http`, `node:crypto`, `node:async_hooks`, `node:test`, ...).
-- **Local-Lab Gate:** every entrypoint calls `assertLocalLabAllowed()` (`GUARDIAN_ALLOW_LOCAL_LAB=1`
+- **Local-Lab Gate:** every entrypoint calls `assertLocalLabAllowed()` (`KOVO_ALLOW_LOCAL_LAB=1`
   required) before starting a server or a lab. `run.ts` calls it first; `HttpApp.listen()` and
   `startInternalService()` call it again.
 - **Loopback only:** servers bind strictly to `127.0.0.1` port `0` via `listenLoopback()`. Only
@@ -268,7 +268,7 @@ is present (otherwise from site `chains`).
 
 - **Dev seeds:** integers `1..9999` (reproducible; hill-climbing).
 - **Held-out seeds:** integers `>= 1_000_000`, derived by HMAC-SHA256 over
-  `GUARDIAN_RB_HELDOUT_SALT` (env only; `run.ts seeds --set held-out` refuses a `--salt` flag). The
+  `KOVO_RB_HELDOUT_SALT` (env only; `run.ts seeds --set held-out` refuses a `--salt` flag). The
   salt is never written to `variant.json`, briefings, ground truth or logs.
 - **Randomized per seed:** API prefix, route nouns, param names, id format, persona emails/passwords,
   canary salt, decoy assignment (count within `decoyCount`, chain units together), plus the
@@ -358,6 +358,6 @@ Default out dir: `benchmarks/reason-bench/out/` (gitignored).
 ## 9. M0 acceptance
 
 - `node_modules/.bin/tsc -p benchmarks/reason-bench/tsconfig.json` → **0 errors** with apps absent.
-- `GUARDIAN_ALLOW_LOCAL_LAB=1 node --test benchmarks/reason-bench/tests/` → safety +
+- `KOVO_ALLOW_LOCAL_LAB=1 node --test benchmarks/reason-bench/tests/` → safety +
   causal-chain tests pass; app-dependent cases skip cleanly when `apps/` is empty.
 - `run.ts` typechecks and its CLI `seeds` command works without any app shell.

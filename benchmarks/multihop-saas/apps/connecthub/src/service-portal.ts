@@ -50,7 +50,7 @@ export async function handlePortal(
     const raw = await readBody(req)
     const response = await deps.egress.fetch('oauth', '/login', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-guardian-run-id': runId },
+      headers: { 'content-type': 'application/json', 'x-kovo-run-id': runId },
       body: raw,
     })
     await proxy(res, response)
@@ -125,7 +125,7 @@ export async function handlePortal(
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-guardian-run-id': runId,
+        'x-kovo-run-id': runId,
         ...(forwardActor ? { 'x-internal-actor': suppliedActor } : {}),
       },
       body: JSON.stringify({ tenantId: supportCase.tenantId, runId }),

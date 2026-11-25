@@ -446,7 +446,7 @@ export function synthAuthz(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
       'expected: "non-owner denied" }'
     const steps: Array<Record<string, unknown>> = []
     if (!functionLevel) {
-      const negativeId = rows === null ? `guardian-none-${randomBytes(5).toString('hex')}` : bogusIdFor(id)
+      const negativeId = rows === null ? `kovo-none-${randomBytes(5).toString('hex')}` : bogusIdFor(id)
       const negativePath = hasPathPlaceholder(o.hyp.endpoint.path)
         ? fillPlaceholders(o.hyp.endpoint.path, encodeURIComponent(negativeId))
         : `${o.hyp.endpoint.path}?${o.hyp.endpoint.params.find(p => p.location === 'query')?.name ?? 'id'}=${encodeURIComponent(negativeId)}`
@@ -465,7 +465,7 @@ export function synthAuthz(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
       },
     })
   }
-  if (out.length === 0 && process.env.GUARDIAN_BENCH_DEBUG === '1') {
+  if (out.length === 0 && process.env.KOVO_BENCH_DEBUG === '1') {
     process.stderr.write(`[spec-skip] authz_matrix ${o.hyp.endpoint.path}: owner=${rejects.owner} probe=${rejects.probe} public=${rejects.public} trivial=${rejects.trivial}\n`)
   }
   return out
@@ -477,12 +477,12 @@ function massAssignmentValue(field: string, privileged: boolean): string | boole
     if (/role|admin|permission|privilege|scope/i.test(field)) return 'admin'
     if (/plan|tier/i.test(field)) return 'enterprise'
     if (/org|tenant|team|group/i.test(field)) return '1'
-    return 'guardian-privileged'
+    return 'kovo-privileged'
   }
   if (/role|permission|privilege|scope/i.test(field)) return 'user'
   if (/plan|tier/i.test(field)) return 'free'
   if (/org|tenant|team|group/i.test(field)) return '0'
-  return 'guardian-low'
+  return 'kovo-low'
 }
 
 /**
@@ -530,7 +530,7 @@ export function synthMassAssignment(o: HypothesisOutcome, env: ProbeEnv): Synthe
   const out = synthMassAssignmentTransition(o, env)
   if (out.length > 0) return out
   const isBool = /^(?:is|has|verified|admin|emailVerified)/i.test(field)
-  const value: string | boolean = isBool ? true : `guardian_ma_${randomBytes(3).toString('hex')}`
+  const value: string | boolean = isBool ? true : `kovo_ma_${randomBytes(3).toString('hex')}`
   const read: RequestParts = { method: 'GET', pathAndQuery: o.hyp.endpoint.path }
   const write: RequestParts = {
     method: o.hyp.endpoint.method === 'PUT' || o.hyp.endpoint.method === 'PATCH' ? o.hyp.endpoint.method as 'PUT' | 'PATCH' : (o.hyp.method === 'GET' ? 'PATCH' : o.hyp.method),
@@ -584,7 +584,7 @@ export function synthSecondOrderSsrf(o: HypothesisOutcome, env: ProbeEnv): Synth
       case 'json': default: return { method: o.hyp.method, pathAndQuery: path, jsonBody: { ...siblings, [param]: value } }
     }
   }
-  const control = register('http://guardian-control.invalid/')
+  const control = register('http://kovo-control.invalid/')
   const probe = register('{{canary_url}}')
   if (!control || !probe) return []
   const registerStep = stepOf(env, 'p1', 'probe', 'Register the canary URL through the write route', probe)
@@ -608,7 +608,7 @@ export function synthSsrf(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[
   if (secondOrder.length > 0) return secondOrder
   const hit = o.anomalies.find(a => a.type === 'canary_callback' && a.variant === 'http')
   if (!hit) return []
-  const control = requestParts(o, env, 'http://guardian-control.invalid/')
+  const control = requestParts(o, env, 'http://kovo-control.invalid/')
   const probe = requestParts(o, env, '{{canary_url}}')
   if (!control || !probe) return []
   const spec = {
@@ -616,13 +616,13 @@ export function synthSsrf(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[
     kind: 'http_chain',
     steps: [
       stepOf(env, 'c1', 'control', 'Benign URL value (no callback expected)', control),
-      stepOf(env, 'p1', 'probe', 'Guardian canary URL value', probe),
+      stepOf(env, 'p1', 'probe', 'Kovo Hunter canary URL value', probe),
     ],
   }
   return [{ kind: 'http_chain', spec }]
 }
 
-const xmlBenign = '<?xml version="1.0" encoding="UTF-8"?><guardian><ping>ok</ping></guardian>'
+const xmlBenign = '<?xml version="1.0" encoding="UTF-8"?><kovo><ping>ok</ping></kovo>'
 const xxeBodies: Record<string, string> = {
   general_entity: '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE root [<!ENTITY gxxe SYSTEM "{{canary_url}}">]><root>&gxxe;</root>',
   param_entity: '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE root [<!ENTITY % gxxep SYSTEM "{{canary_url}}"> %gxxep;]><root>ok</root>',
@@ -641,7 +641,7 @@ export function synthXxe(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[]
     kind: 'http_chain',
     steps: [
       stepOf(env, 'c1', 'control', 'Benign XML document', { method, pathAndQuery: path, headers, textBody: xmlBenign }),
-      stepOf(env, 'p1', 'probe', 'XML document with external entity to Guardian canary', { method, pathAndQuery: path, headers, textBody: body }),
+      stepOf(env, 'p1', 'probe', 'XML document with external entity to Kovo Hunter canary', { method, pathAndQuery: path, headers, textBody: body }),
     ],
   }
   return [{ kind: 'http_chain', spec }]
@@ -729,7 +729,7 @@ export function synthTraversal(o: HypothesisOutcome, env: ProbeEnv): Synthesized
   const location = o.hyp.location ?? 'query'
   const raw = String(hit.payload ?? '')
   if (!raw || raw.length > 200 || /[\r\n\0\\]/.test(raw)) return []
-  const controlValue = `../guardian-none-${randomBytes(4).toString('hex')}.txt`
+  const controlValue = `../kovo-none-${randomBytes(4).toString('hex')}.txt`
   const build = (value: string): RequestParts => {
     // Reuse the probe's injection encoding (query/form values are URL-encoded exactly once by the
     // broker), so the replay reproduces the payload the oracle actually accepted.
@@ -763,7 +763,7 @@ export function synthSsti(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[
   const hit = o.anomalies.find(a => a.type === 'expression_evaluated')
   if (!hit) return []
   const tpl = sstiTemplates[String(hit.engine)]
-  const control = requestParts(o, env, 'guardian')
+  const control = requestParts(o, env, 'kovo')
   const probe = tpl ? requestParts(o, env, tpl) : null
   if (!control || !probe) return []
   const spec = {

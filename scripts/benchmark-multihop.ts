@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * Guardian v8 Multi-Hop SaaS Product Benchmark Runner (plans/v8.md §Evaluation).
+ * Kovo Hunter v8 Multi-Hop SaaS Product Benchmark Runner (plans/v8.md §Evaluation).
  *
  * Drives the *real* `Execution` loop (deterministic `--no-llm` floor OR agentic `--verifier docker`)
  * against `benchmarks/multihop-saas/` multi-service loopback SaaS archetypes and computes:
  *
  *   - Two-Side Confirmation: `ChainOracle v2` (ordered causal DAG from an attacker persona, zero
- *     shortcut violations) AND host-verified Guardian `CompositeProofReceipt` (Mode A clean replay)
+ *     shortcut violations) AND host-verified Kovo Hunter `CompositeProofReceipt` (Mode A clean replay)
  *   - Hop-Depth Funnel: `H1 -> H2 -> H3 -> H4+ -> FinalOracle -> CompositeReceiptConfirmed`
  *     plus per-hop drop reasons and 3–4 hop vs 5–6 hop depth-tier recall
  *   - Efficiency metrics: `TP/$` and `TP/10m`
@@ -125,7 +125,7 @@ export interface MultihopPersona {
   rolesByTenant?: Record<string, string>
 }
 
-/** Mode-scoped briefing exposed to Guardian (never ground truth, never victim bot creds). */
+/** Mode-scoped briefing exposed to Kovo Hunter (never ground truth, never victim bot creds). */
 export interface MultihopBriefing {
   app: MultihopAppName | string
   mode: MultihopMode
@@ -202,11 +202,11 @@ export interface MultihopChainVerdict {
   oracleObserved: boolean
   /** Side 1 anti-shortcut invariant: true if any forbidden privileged persona was used. */
   forbiddenShortcutViolation?: boolean
-  /** Side 2: Guardian emitted a host-verified Mode-A CompositeProofReceipt for this chain. */
+  /** Side 2: Kovo Hunter emitted a host-verified Mode-A CompositeProofReceipt for this chain. */
   compositeReceiptConfirmed: boolean
   /** True iff Side 1 (no shortcut) AND Side 2 both pass. */
   twoSideConfirmed: boolean
-  /** Optional replay mode recorded by Guardian's receipt. */
+  /** Optional replay mode recorded by Kovo Hunter's receipt. */
   replayMode?: 'fresh_clean_replay' | 'one_shot_transcript'
   /** Diagnostic reason when the chain did not reach two-side confirmation. */
   dropReason?: HopDropReason | null
@@ -361,17 +361,17 @@ export interface MultihopArgs {
   help: boolean
 }
 
-export const usage = `Guardian v8 multihop-saas Product Benchmark Runner (real Execution loop, plans/v8.md §Evaluation)
+export const usage = `Kovo Hunter v8 multihop-saas Product Benchmark Runner (real Execution loop, plans/v8.md §Evaluation)
 
 Usage:
-  GUARDIAN_ALLOW_LOCAL_LAB=1 node scripts/benchmark-multihop.ts [flags]
+  KOVO_ALLOW_LOCAL_LAB=1 node scripts/benchmark-multihop.ts [flags]
 
 Flags:
   --app <name|dev|all>      paygrid | shipforge | nexusiam | connecthub | dev | all
                             (default: dev = paygrid,shipforge,nexusiam; connecthub is SEALED for M4)
   --seed <n>                single dev seed (1..9999)
   --seeds <a,b,c>           comma-separated seeds
-  --held-out                seeds are salted held-out (>= 1000000); requires GUARDIAN_RB_HELDOUT_SALT
+  --held-out                seeds are salted held-out (>= 1000000); requires KOVO_RB_HELDOUT_SALT
                             (the salt is never printed, stored, or committed)
   --mode <m>                black-box | grey-box | white-box (default: grey-box)
   --no-llm                  deterministic floor run AND Anti-Heuristic Gate:
@@ -383,7 +383,7 @@ Flags:
   --duration-min <n>        alias for --max-duration-ms <n * 60000> (minutes, 1..360)
   --concurrency <n>         parallel app/seed cells (default: ${DEFAULT_CONCURRENCY})
   --worker-concurrency <n>  override in-run Execution worker slots (1..${maxWorkerConcurrency}; omitted = dynamic AIMD)
-  --data-dir <path>         Guardian data dir (default: $GUARDIAN_DATA_DIR)
+  --data-dir <path>         Kovo Hunter data dir (default: $KOVO_DATA_DIR)
   --isolate-data-dir        per-cell isolated data dir (default ON for --verifier docker;
                             credentials symlinked, key never copied)
   --no-isolate-data-dir     disable default per-cell data-dir isolation for --verifier docker
@@ -397,7 +397,7 @@ Flags:
   --allow-heldout-snapshot  allow reusing a salted held-out checkpoint
   --floor-from <dir[,dir]>  additional artifact dirs holding --no-llm floor cells (ΔReasoning)
   --curve-from <dir[,dir]>  additional artifact dirs feeding the budget × duration scaling matrix
-  --out-dir <path>          artifact directory (default: .guardian/multihop-saas)
+  --out-dir <path>          artifact directory (default: .kovo/multihop-saas)
   --json <path>             write aggregate structured JSON report here
   --md <path>               write aggregate Markdown report here
   --list-seeds              print the multihop-saas seed catalogue as JSON and exit
@@ -533,7 +533,7 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
   for (const key of Object.keys(a)) {
     if (!known.has(key)) {
       if (/salt/i.test(key)) {
-        fail(`never pass a salt on the command line; set GUARDIAN_RB_HELDOUT_SALT instead (got --${key})`)
+        fail(`never pass a salt on the command line; set KOVO_RB_HELDOUT_SALT instead (got --${key})`)
       }
       fail(`unknown flag --${key}`)
     }
@@ -547,7 +547,7 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
       heldOut: false,
       budgetUsd: DEFAULT_BUDGET_USD,
       maxDurationMs: DEFAULT_MAX_DURATION_MS,
-      outDir: resolve('.guardian/multihop-saas'),
+      outDir: resolve('.kovo/multihop-saas'),
       concurrency: DEFAULT_CONCURRENCY,
       noLlm: false,
       isolateDataDir: false,
@@ -576,9 +576,9 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
 
   const heldOut = a['held-out'] === true
   const seeds = parseSeeds(a, heldOut)
-  const salt = env.GUARDIAN_RB_HELDOUT_SALT ?? ''
+  const salt = env.KOVO_RB_HELDOUT_SALT ?? ''
   if (heldOut) {
-    if (salt.length < 16) fail('--held-out requires GUARDIAN_RB_HELDOUT_SALT (>= 16 chars; never printed)')
+    if (salt.length < 16) fail('--held-out requires KOVO_RB_HELDOUT_SALT (>= 16 chars; never printed)')
     for (const seed of seeds) if (seed < 1_000_000) fail(`held-out seeds are >= 1000000 (got ${seed})`)
   } else {
     for (const seed of seeds) {
@@ -656,8 +656,8 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
   const noLlm = a['no-llm'] === true
   if (resumeSnapshotRaw && noLlm) fail('--resume-snapshot requires the live agentic model; drop --no-llm')
 
-  const outDirRaw = stringFlag(a, 'out-dir') ?? '.guardian/multihop-saas'
-  const dataDirRaw = stringFlag(a, 'data-dir') ?? env.GUARDIAN_DATA_DIR
+  const outDirRaw = stringFlag(a, 'out-dir') ?? '.kovo/multihop-saas'
+  const dataDirRaw = stringFlag(a, 'data-dir') ?? env.KOVO_DATA_DIR
 
   return {
     apps: parseAppList(stringFlag(a, 'app')),
@@ -746,7 +746,7 @@ export function normalizeDropReason(raw: unknown): HopDropReason | null {
 /**
  * Computes strict Two-Side Confirmation per plans/v8.md §ChainOracle v2:
  *   TP iff BOTH ChainOracle v2 observed the full ordered DAG from an attacker-eligible persona
- *   (no forbiddenShortcutViolation) AND Guardian emitted a host-verified Mode-A
+ *   (no forbiddenShortcutViolation) AND Kovo Hunter emitted a host-verified Mode-A
  *   `CompositeProofReceipt` (`replayMode === 'fresh_clean_replay'`).
  */
 export function evaluateTwoSideConfirmation(
@@ -977,7 +977,7 @@ export interface MultihopCellPlan {
 }
 
 /**
- * Format a briefing persona's role/tenant/orgSlug into the Guardian `roleLabel` contract
+ * Format a briefing persona's role/tenant/orgSlug into the Kovo Hunter `roleLabel` contract
  * (`<role> [slug=<orgSlug>; memberships=<role>:<tenant>,...] (<tenantId>)`) so Execution's
  * tenant-scope parsers (`/\(([^()]+)\)\s*$/` and `parseRoleLabel`) extract both privilege and
  * primary tenantId cleanly while preserving orgSlug and secondary memberships for agentic reasoning.
@@ -1324,7 +1324,7 @@ export interface MultihopRejectDetail {
 }
 
 export interface MultihopV8SdkAdoptionTelemetry {
-  guardianVerifyCalls: number
+  kovoVerifyCalls: number
   sealCapabilityCalls: number
   hmacSignCalls: number
   jwtSignCalls: number
@@ -1354,7 +1354,7 @@ export interface ExtractMultihopRunTelemetryOptions {
   runStartedAtMs?: number
   /** Override run wall-clock end timestamp (epoch ms). */
   runEndedAtMs?: number
-  /** Optional Guardian data dir containing read-only `agent-sessions/*.sqlite` for SDK call counts. */
+  /** Optional Kovo Hunter data dir containing read-only `agent-sessions/*.sqlite` for SDK call counts. */
   dataDir?: string
   /** Optional live FrontierWaveController telemetry snapshot from Execution. */
   frontierTelemetry?: {
@@ -1573,7 +1573,7 @@ function roundPct(rate: number): number {
 
 /**
  * Extract structured Phase-timing, Scheduler/Dead-End-Waste, CapabilityLedger, and v8-SDK-Adoption
- * telemetry from a Guardian run's SQLite database.
+ * telemetry from a Kovo Hunter run's SQLite database.
  *
  * Strictly queries structured metadata columns only (`runs`, `events`, `assignments`/`workers`,
  * `chain_steps`, `capability_nodes`, `capability_causal_edges`/`capability_edges`,
@@ -1711,8 +1711,8 @@ export function extractMultihopRunTelemetry(
   const workerStartById = new Map<string, number>()
   const workerIntervals: Array<{ start: number; end: number }> = []
 
-  let eventGuardianVerifyCalls = 0
-  const seenGuardianVerifyCallIds = new Set<string>()
+  let eventKovoVerifyCalls = 0
+  const seenKovoVerifyCallIds = new Set<string>()
   let eventSealCapabilityCalls = 0
   let eventHmacSignCalls = 0
   let eventJwtSignCalls = 0
@@ -1903,29 +1903,29 @@ export function extractMultihopRunTelemetry(
         // --- v8 SDK Adoption & Verify RPC events ---
         const callId = typeof detail.callId === 'string' && detail.callId.trim() ? detail.callId.trim() : null
         if (
-          kind === 'guardian_verify.called'
-          || kind === 'guardian_verify.complete'
-          || kind === 'guardian_verify.rejected'
-          || kind === 'guardian_verify.failed'
-          || ((kind === 'tool.call' || kind === 'tool.result') && (detail.tool === 'guardian_verify' || detail.name === 'guardian_verify'))
+          kind === 'kovo_verify.called'
+          || kind === 'kovo_verify.complete'
+          || kind === 'kovo_verify.rejected'
+          || kind === 'kovo_verify.failed'
+          || ((kind === 'tool.call' || kind === 'tool.result') && (detail.tool === 'kovo_verify' || detail.name === 'kovo_verify'))
         ) {
           if (callId) {
-            if (!seenGuardianVerifyCallIds.has(callId)) {
-              seenGuardianVerifyCallIds.add(callId)
-              eventGuardianVerifyCalls += 1
+            if (!seenKovoVerifyCallIds.has(callId)) {
+              seenKovoVerifyCallIds.add(callId)
+              eventKovoVerifyCalls += 1
             }
           } else {
-            eventGuardianVerifyCalls += 1
+            eventKovoVerifyCalls += 1
           }
         } else if (kind === 'agent.script_proof_confirmed' || kind === 'agent.script_proof_rejected') {
-          if (!callId || !seenGuardianVerifyCallIds.has(callId)) {
-            if (callId) seenGuardianVerifyCallIds.add(callId)
-            eventGuardianVerifyCalls += 1
+          if (!callId || !seenKovoVerifyCallIds.has(callId)) {
+            if (callId) seenKovoVerifyCallIds.add(callId)
+            eventKovoVerifyCalls += 1
           }
         }
 
         // Single-op or aggregate SDK RPC counters
-        if (kind === 'verify_rpc.call' || kind === 'verify_rpc.op' || kind === 'guardian_verify.rpc') {
+        if (kind === 'verify_rpc.call' || kind === 'verify_rpc.op' || kind === 'kovo_verify.rpc') {
           bumpSdkOp(detail.op ?? detail.method ?? detail.rpcOp, 1)
           if ((detail.op === 'composite.verify' || detail.method === 'composite.verify') && detail.confirmed === true) {
             if (typeof detail.chainId === 'string' && detail.chainId.trim()) confirmedCompositeChainIds.add(detail.chainId.trim())
@@ -1971,8 +1971,8 @@ export function extractMultihopRunTelemetry(
         } else if (
           kind === 'proof_receipt.shadow_reject'
           || kind === 'oob.receipt_rejected'
-          || kind === 'guardian_verify.rejected'
-          || kind === 'guardian_verify.failed'
+          || kind === 'kovo_verify.rejected'
+          || kind === 'kovo_verify.failed'
           || kind === 'agent.script_proof_rejected'
           || kind === 'verify_rpc.rejected'
           || kind === 'verify_rpc.error'
@@ -2164,7 +2164,7 @@ export function extractMultihopRunTelemetry(
   }
 
   // ---- 7. Optional read-only agent-sessions tool-call histogram (counts & reject codes only) ----
-  let sessionGuardianVerifyCalls = 0
+  let sessionKovoVerifyCalls = 0
   let sessionSealCalls = 0
   let sessionHmacCalls = 0
   let sessionJwtCalls = 0
@@ -2193,8 +2193,8 @@ export function extractMultihopRunTelemetry(
             for (const msg of models) {
               if (msg.role === 'assistant' && Array.isArray(msg.content)) {
                 for (const block of msg.content as Array<Record<string, unknown>>) {
-                  if (block.type === 'toolCall' && block.name === 'guardian_verify') {
-                    sessionGuardianVerifyCalls += 1
+                  if (block.type === 'toolCall' && block.name === 'kovo_verify') {
+                    sessionKovoVerifyCalls += 1
                     if (typeof block.id === 'string') gvCallIds.add(block.id)
                     const argsObj = (block.arguments && typeof block.arguments === 'object')
                       ? block.arguments as Record<string, unknown>
@@ -2309,7 +2309,7 @@ export function extractMultihopRunTelemetry(
   )
   const compositeConfirmed = confirmedCompositeChainIds.size + anonymousCompositeConfirmed
 
-  const guardianVerifyCalls = Math.max(eventGuardianVerifyCalls, sessionGuardianVerifyCalls, agentScriptSpecCount)
+  const kovoVerifyCalls = Math.max(eventKovoVerifyCalls, sessionKovoVerifyCalls, agentScriptSpecCount)
   const sealCapabilityCalls = Math.max(eventSealCapabilityCalls, sessionSealCalls)
   const hmacSignCalls = Math.max(eventHmacSignCalls, sessionHmacCalls)
   const jwtSignCalls = Math.max(eventJwtSignCalls, sessionJwtCalls)
@@ -2355,7 +2355,7 @@ export function extractMultihopRunTelemetry(
       compositeReceiptsCount,
     },
     v8SdkAdoption: {
-      guardianVerifyCalls,
+      kovoVerifyCalls,
       sealCapabilityCalls,
       hmacSignCalls,
       jwtSignCalls,
@@ -2441,7 +2441,7 @@ export function aggregateMultihopTelemetry(
       compositeReceiptsCount: items.reduce((n, t) => n + t.capabilityLedger.compositeReceiptsCount, 0),
     },
     v8SdkAdoption: {
-      guardianVerifyCalls: items.reduce((n, t) => n + t.v8SdkAdoption.guardianVerifyCalls, 0),
+      kovoVerifyCalls: items.reduce((n, t) => n + t.v8SdkAdoption.kovoVerifyCalls, 0),
       sealCapabilityCalls: items.reduce((n, t) => n + t.v8SdkAdoption.sealCapabilityCalls, 0),
       hmacSignCalls: items.reduce((n, t) => n + t.v8SdkAdoption.hmacSignCalls, 0),
       jwtSignCalls: items.reduce((n, t) => n + t.v8SdkAdoption.jwtSignCalls, 0),
@@ -2756,7 +2756,7 @@ export async function runCell(
     dataDir = join(args.outDir, 'data', `${slug}-resume`)
     copySnapshotDatabase({ snapshotDir: resumeDir, targetDir: dataDir })
     linkSnapshotModelCredentials({
-      snapshotDb: join(dataDir, 'guardian.sqlite'),
+      snapshotDb: join(dataDir, 'kovo.sqlite'),
       ...(sourceDataDir ? { sourceDataDir } : {}),
       targetDataDir: dataDir,
     })
@@ -2832,7 +2832,7 @@ export async function runCell(
         if (args.verifier === 'docker') {
           throw new PreflightError(
             `--verifier docker is not usable from this process: ${detail}. `
-            + 'Re-run under `newgrp docker -c \'<command>\'` and ensure guardian-worker:v4 is built.',
+            + 'Re-run under `newgrp docker -c \'<command>\'` and ensure kovo-worker:v4 is built.',
           )
         }
         throw error
@@ -2863,7 +2863,7 @@ export async function runCell(
     started = await runtime.startMultihopApp({
       app,
       seed,
-      ...(args.heldOut ? { heldOutSalt: process.env.GUARDIAN_RB_HELDOUT_SALT } : {}),
+      ...(args.heldOut ? { heldOutSalt: process.env.KOVO_RB_HELDOUT_SALT } : {}),
       oobCallbackPorts,
     })
     const briefing = runtime.briefingFor(started, args.mode)
@@ -3591,7 +3591,7 @@ export function buildMultihopReport(
     notes.push('includes SEALED connecthub cells (M4 certification only)')
   }
   if (cells.some(c => c.seedSet === 'held-out')) {
-    notes.push('held-out cells use salted seeds; GUARDIAN_RB_HELDOUT_SALT is never persisted in any artifact')
+    notes.push('held-out cells use salted seeds; KOVO_RB_HELDOUT_SALT is never persisted in any artifact')
   }
 
   return {
@@ -3624,7 +3624,7 @@ export function renderMultihopReport(report: MultihopReport, format: 'json' | 'm
   if (format === 'json') return JSON.stringify(report, null, 2)
 
   const lines: string[] = []
-  lines.push('# Guardian v8 multihop-saas scorecard')
+  lines.push('# Kovo Hunter v8 multihop-saas scorecard')
   lines.push('')
   lines.push(`Generated ${report.generatedAt} · git ${report.gitSha}`)
   lines.push('')
@@ -3699,7 +3699,7 @@ export function renderMultihopReport(report: MultihopReport, format: 'json' | 'm
         ],
         [
           'v8 SDK Adoption',
-          `guardian_verify=${sdk.guardianVerifyCalls}, seal=${sdk.sealCapabilityCalls}, hmac=${sdk.hmacSignCalls}, jwt=${sdk.jwtSignCalls}, awaitAsync=${sdk.awaitAsyncCalls}, proveComposite=${sdk.proveCompositeCalls} (confirmed=${sdk.compositeConfirmed}), topRejects=${rejectSummary}`,
+          `kovo_verify=${sdk.kovoVerifyCalls}, seal=${sdk.sealCapabilityCalls}, hmac=${sdk.hmacSignCalls}, jwt=${sdk.jwtSignCalls}, awaitAsync=${sdk.awaitAsyncCalls}, proveComposite=${sdk.proveCompositeCalls} (confirmed=${sdk.compositeConfirmed}), topRejects=${rejectSummary}`,
         ],
         ...(sdk.topRejectDetails?.length
           ? [[
@@ -3783,7 +3783,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   }
 
   assertLocalLabAllowed()
-  activeSalt = args.heldOut ? (process.env.GUARDIAN_RB_HELDOUT_SALT ?? '') : ''
+  activeSalt = args.heldOut ? (process.env.KOVO_RB_HELDOUT_SALT ?? '') : ''
   mkdirSync(args.outDir, { recursive: true, mode: 0o700 })
 
   const runtime = await loadMultihopRuntime()

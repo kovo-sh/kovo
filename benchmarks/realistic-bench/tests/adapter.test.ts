@@ -5,11 +5,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { runGuardianAgainstMaterialized, readMaterializedSurface, vulnClassForFinding } from '../guardian-adapter.ts'
+import { runKovoAgainstMaterialized, readMaterializedSurface, vulnClassForFinding } from '../kovo-adapter.ts'
 import type {
   EngineEnvLike, EngineHandleLike, EngineModuleLike, HypothesisLike, MaterializedAppLike,
   ProfileCapsLike, SynthesizedSpecLike,
-} from '../guardian-adapter.ts'
+} from '../kovo-adapter.ts'
 import { validateFindings } from '../grader/schema.ts'
 
 function fixtureTree(app = 'acme-saas', routes: Record<string, { method: string; path: string }> = {}): string {
@@ -104,14 +104,14 @@ function fakeEngine(overrides: Partial<EngineModuleLike> = {}): {
 }
 
 test('adapter emits grader-schema findings from materialized routes without touching truth', async () => {
-  const prev = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  const prev = process.env.KOVO_ALLOW_LOCAL_LAB
+  process.env.KOVO_ALLOW_LOCAL_LAB = '1'
   const src = fixtureTree()
   const { app: started, reads } = fixtureStarted(src)
   const { engine, seen } = fakeEngine()
   let ticks = 5000
   try {
-    const result = await runGuardianAgainstMaterialized({
+    const result = await runKovoAgainstMaterialized({
       treeDir: src, seed: 42, app: 'acme-saas', profileMode: 'v4-full', verifierBackend: 'local-jq',
     }, {
       startApp: async () => started,
@@ -151,14 +151,14 @@ test('adapter emits grader-schema findings from materialized routes without touc
   } finally {
     await new Promise<void>(r => setImmediate(r))
     rmSync(join(src, '..', '..', '..'), { recursive: true, force: true })
-    if (prev === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prev
+    if (prev === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = prev
   }
 })
 
 test('adapter dedupes repeated confirmed signals on the same endpoint/param/class', async () => {
-  const prev = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  const prev = process.env.KOVO_ALLOW_LOCAL_LAB
+  process.env.KOVO_ALLOW_LOCAL_LAB = '1'
   const src = fixtureTree()
   const { app: started } = fixtureStarted(src)
   const endpoint = {
@@ -174,7 +174,7 @@ test('adapter dedupes repeated confirmed signals on the same endpoint/param/clas
     }),
   })
   try {
-    const result = await runGuardianAgainstMaterialized({
+    const result = await runKovoAgainstMaterialized({
       treeDir: src, seed: 42, app: 'acme-saas', profileMode: 'v4-full', verifierBackend: 'local-jq',
     }, { startApp: async () => started, loadEngine: async () => dup.engine, fetchImpl: loginFetch })
     assert.equal(result.findings.length, 1)
@@ -182,39 +182,39 @@ test('adapter dedupes repeated confirmed signals on the same endpoint/param/clas
     assert.equal(result.signalsObserved, 2)
   } finally {
     rmSync(join(src, '..', '..', '..'), { recursive: true, force: true })
-    if (prev === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prev
+    if (prev === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = prev
   }
 })
 
 test('adapter refuses to run unless the local lab is explicitly allowed', async () => {
-  const prev = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
+  const prev = process.env.KOVO_ALLOW_LOCAL_LAB
+  delete process.env.KOVO_ALLOW_LOCAL_LAB
   const src = fixtureTree()
   let startedCalled = false
   try {
     await assert.rejects(
-      runGuardianAgainstMaterialized({
+      runKovoAgainstMaterialized({
         treeDir: src, seed: 1, app: 'acme-saas', profileMode: 'v4-full', verifierBackend: 'local-jq',
       }, { startApp: async () => { startedCalled = true; return fixtureStarted(src).app } }),
-      /GUARDIAN_ALLOW_LOCAL_LAB/,
+      /KOVO_ALLOW_LOCAL_LAB/,
     )
     assert.equal(startedCalled, false)
   } finally {
     rmSync(join(src, '..', '..', '..'), { recursive: true, force: true })
-    if (prev !== undefined) process.env.GUARDIAN_ALLOW_LOCAL_LAB = prev
+    if (prev !== undefined) process.env.KOVO_ALLOW_LOCAL_LAB = prev
   }
 })
 
 test('adapter rejects a treeDir that is not the started app sourceDir', async () => {
-  const prev = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  const prev = process.env.KOVO_ALLOW_LOCAL_LAB
+  process.env.KOVO_ALLOW_LOCAL_LAB = '1'
   const src = fixtureTree()
   const other = fixtureTree()
   const { app: started } = fixtureStarted(other)
   try {
     await assert.rejects(
-      runGuardianAgainstMaterialized({
+      runKovoAgainstMaterialized({
         treeDir: src, seed: 1, app: 'acme-saas', profileMode: 'v4-full', verifierBackend: 'local-jq',
       }, { startApp: async () => started, loadEngine: async () => fakeEngine().engine, fetchImpl: loginFetch }),
       /refusing to probe a different tree/,
@@ -222,8 +222,8 @@ test('adapter rejects a treeDir that is not the started app sourceDir', async ()
   } finally {
     rmSync(join(src, '..', '..', '..'), { recursive: true, force: true })
     rmSync(join(other, '..', '..', '..'), { recursive: true, force: true })
-    if (prev === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prev
+    if (prev === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = prev
   }
 })
 

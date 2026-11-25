@@ -61,10 +61,10 @@ const SEVERITY_ORDER: Record<string, number> = {
 
 export function formatCliHelp(): string {
   return [
-    'Guardian v3 Headless Security Scanner CLI',
+    'Kovo Hunter Headless Security Scanner CLI',
     '',
     'Usage:',
-    '  guardian scan [options]',
+    '  kovo-hunter scan [options]',
     '',
     'Options:',
     '  --repo <path>              Local repository path to mount read-only into /repos (repeatable)',
@@ -77,7 +77,7 @@ export function formatCliHelp(): string {
     '  --budget-requests <n>      Max brokered requests (default: 4000 public / 10000 local-lab)',
     '  --sarif <path>             Write OASIS SARIF 2.1.0 report JSON to path',
     '  --fail-on <severity>       Exit code 2 threshold: critical|high|medium|low (default: high)',
-    '  --local-lab                Enable local-lab HTTP/port target mode (requires GUARDIAN_ALLOW_LOCAL_LAB=1)',
+    '  --local-lab                Enable local-lab HTTP/port target mode (requires KOVO_ALLOW_LOCAL_LAB=1)',
     '  --compose <file>           Docker Compose file relative to --repo for --local-lab stack',
     '  --lab-port <n>             Internal port for --local-lab container (default: 8080)',
     '  --lab-health <path>        Health check path for --local-lab container (default: /health)',
@@ -118,12 +118,12 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
       failOn: 'high',
       localLab: false,
       iast: false,
-      outputDir: resolve('.guardian', 'cli-run'),
+      outputDir: resolve('.kovo', 'cli-run'),
       timeoutSec: 900,
       help: true,
     }
   } else if (args[0] && !args[0].startsWith('-')) {
-    throw new Error(`Unknown Guardian CLI command: "${args[0]}". Expected "guardian scan".`)
+    throw new Error(`Unknown Kovo Hunter CLI command: "${args[0]}". Expected "kovo-hunter scan".`)
   }
 
   const opts: CliOptions = {
@@ -136,7 +136,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
     failOn: 'high',
     localLab: false,
     iast: false,
-    outputDir: resolve('.guardian', `cli-run-${Date.now()}`),
+    outputDir: resolve('.kovo', `cli-run-${Date.now()}`),
     timeoutSec: 900,
     help: false,
   }
@@ -267,7 +267,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
         break
       }
       default:
-        throw new Error(`Unknown CLI flag: "${arg}". Run "guardian scan --help" for usage.`)
+        throw new Error(`Unknown CLI flag: "${arg}". Run "kovo-hunter scan --help" for usage.`)
     }
   }
 
@@ -445,7 +445,7 @@ export async function runCli(argv: readonly string[]): Promise<0 | 1 | 2> {
   try {
     opts = parseCliArgs(argv)
   } catch (err) {
-    console.error(`[guardian] ${err instanceof Error ? err.message : String(err)}`)
+    console.error(`[kovo] ${err instanceof Error ? err.message : String(err)}`)
     return 1
   }
 
@@ -458,13 +458,13 @@ export async function runCli(argv: readonly string[]): Promise<0 | 1 | 2> {
     try {
       assertLocalLabAllowed('local-lab')
     } catch (err) {
-      console.error(`[guardian] ${err instanceof Error ? err.message : String(err)}`)
+      console.error(`[kovo] ${err instanceof Error ? err.message : String(err)}`)
       return 1
     }
   }
 
   if (opts.origins.length === 0 && opts.repos.length === 0) {
-    console.error('[guardian] Provide at least one --origin <url> or --repo <path>. Run "guardian scan --help".')
+    console.error('[kovo] Provide at least one --origin <url> or --repo <path>. Run "kovo-hunter scan --help".')
     return 1
   }
 
@@ -472,7 +472,7 @@ export async function runCli(argv: readonly string[]): Promise<0 | 1 | 2> {
   try {
     validatedOrigins = opts.origins.map(o => validateOriginForCli(o, opts.localLab))
   } catch (err) {
-    console.error(`[guardian] ${err instanceof Error ? err.message : String(err)}`)
+    console.error(`[kovo] ${err instanceof Error ? err.message : String(err)}`)
     return 1
   }
 
@@ -480,7 +480,7 @@ export async function runCli(argv: readonly string[]): Promise<0 | 1 | 2> {
   const diffScopes: Array<{ repo: string; diffBase: string; changedFiles: string[] }> = []
   if (opts.diffBase) {
     if (opts.repos.length === 0) {
-      console.error('[guardian] --diff-base requires at least one --repo <path>.')
+      console.error('[kovo] --diff-base requires at least one --repo <path>.')
       return 1
     }
     try {
@@ -489,7 +489,7 @@ export async function runCli(argv: readonly string[]): Promise<0 | 1 | 2> {
         diffScopes.push({ repo: basename(repoPath), ...diff })
       }
     } catch (err) {
-      console.error(`[guardian] Offline git diff scoping failed: ${err instanceof Error ? err.message : String(err)}`)
+      console.error(`[kovo] Offline git diff scoping failed: ${err instanceof Error ? err.message : String(err)}`)
       return 1
     }
   }
@@ -499,7 +499,7 @@ export async function runCli(argv: readonly string[]): Promise<0 | 1 | 2> {
   try {
     parsedPersonas = opts.personas.map(p => loadPersonaFile(p, validatedOrigins, opts.localLab))
   } catch (err) {
-    console.error(`[guardian] ${err instanceof Error ? err.message : String(err)}`)
+    console.error(`[kovo] ${err instanceof Error ? err.message : String(err)}`)
     return 1
   }
 
@@ -684,7 +684,7 @@ export async function runCli(argv: readonly string[]): Promise<0 | 1 | 2> {
     console.log(JSON.stringify(summary))
     return exitCode
   } catch (err) {
-    console.error(`[guardian] Scan failed: ${err instanceof Error ? err.message : String(err)}`)
+    console.error(`[kovo] Scan failed: ${err instanceof Error ? err.message : String(err)}`)
     return 1
   } finally {
     await engine.stop().catch(() => undefined)
@@ -705,7 +705,7 @@ if (isMain) {
       process.exitCode = code
     })
     .catch(err => {
-      console.error(`[guardian] Fatal CLI error: ${err instanceof Error ? err.message : String(err)}`)
+      console.error(`[kovo] Fatal CLI error: ${err instanceof Error ? err.message : String(err)}`)
       process.exitCode = 1
     })
 }

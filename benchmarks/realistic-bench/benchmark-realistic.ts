@@ -1,13 +1,13 @@
 #!/usr/bin/env node
-// realistic-bench x Guardian CLI: materialize one variant, run the real Guardian engines
+// realistic-bench x Kovo Hunter CLI: materialize one variant, run the real Kovo Hunter engines
 // against it, grade with grader/score.ts, and print recall/precision by vuln class.
 //
 // Usage:
-//   GUARDIAN_ALLOW_LOCAL_LAB=1 node benchmarks/realistic-bench/benchmark-realistic.ts \
+//   KOVO_ALLOW_LOCAL_LAB=1 node benchmarks/realistic-bench/benchmark-realistic.ts \
 //     --app acme-saas --seed 42 --split dev [--profile-mode v4-full] [--mode grey-box] \
 //     [--verifier auto|docker|local-jq] [--out-json path] [--out-md path] [--out-findings path]
 //
-// Held-out: add --split heldout and export GUARDIAN_RB_HELDOUT_SALT (>=16 chars).
+// Held-out: add --split heldout and export KOVO_RB_HELDOUT_SALT (>=16 chars).
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { appNames } from './lib/types.ts'
@@ -15,8 +15,8 @@ import type { AppName, BenchMode, GradeInput } from './lib/types.ts'
 import { assertLocalLabAllowed } from './lib/safety.ts'
 import { gradeRun, renderScorecard, startRealisticApp } from './run.ts'
 import { validateGradeInput } from './grader/schema.ts'
-import { runGuardianAgainstMaterialized, startOobCanaryBroker } from './guardian-adapter.ts'
-import type { ProfileMode, VerifierChoice } from './guardian-adapter.ts'
+import { runKovoAgainstMaterialized, startOobCanaryBroker } from './kovo-adapter.ts'
+import type { ProfileMode, VerifierChoice } from './kovo-adapter.ts'
 
 interface CliArgs {
   app: AppName
@@ -78,11 +78,11 @@ function readArgs(argv: string[]): CliArgs {
   const splitRaw = str(a, 'split') ?? 'dev'
   if (splitRaw !== 'dev' && splitRaw !== 'heldout') throw new Error(`--split must be dev or heldout (got '${splitRaw}')`)
   const split: 'dev' | 'heldout' = splitRaw
-  const salt = split === 'heldout' ? (process.env.GUARDIAN_RB_HELDOUT_SALT ?? '') : ''
+  const salt = split === 'heldout' ? (process.env.KOVO_RB_HELDOUT_SALT ?? '') : ''
   if (split === 'dev' && seed >= 1_000_000) throw new Error(`dev seeds are 1..9999 (got ${seed}); use --split heldout`)
   if (split === 'heldout') {
     if (seed < 1_000_000) throw new Error(`held-out seeds are >= 1000000 (got ${seed}); use --split dev`)
-    if (salt.length < 16) throw new Error('held-out runs require GUARDIAN_RB_HELDOUT_SALT (>=16 chars, never committed)')
+    if (salt.length < 16) throw new Error('held-out runs require KOVO_RB_HELDOUT_SALT (>=16 chars, never committed)')
   }
   return {
     app: appRaw as AppName,
@@ -128,7 +128,7 @@ async function main(): Promise<void> {
   }
   try {
     process.stdout.write(`[realistic-bench] ${args.app} seed=${args.seed} (${started.plan.seedSet}) ${args.profileMode} ${args.mode} ${started.origin} oob=127.0.0.1:${oob.port}\n`)
-    const run = await runGuardianAgainstMaterialized({
+    const run = await runKovoAgainstMaterialized({
       treeDir: started.sourceDir,
       seed: args.seed,
       app: args.app,

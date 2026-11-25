@@ -29,9 +29,9 @@ services:
       OSS_LAB_VIEWER_CRED: "oss_lab_outline_viewer_a"
       OSS_LAB_ADMIN_CRED: "oss_lab_outline_admin_b"
     labels:
-      guardian.oss_lab.target: "oss-clean-outline-02"
-      guardian.oss_lab.split: "clean_control"
-      guardian.oss_lab.egress_policy: "deny_all_internal_only"
+      kovo.oss_lab.target: "oss-clean-outline-02"
+      kovo.oss_lab.split: "clean_control"
+      kovo.oss_lab.egress_policy: "deny_all_internal_only"
 
   outline_db:
     image: "postgres:16.4-alpine"
@@ -46,5 +46,5 @@ services:
       POSTGRES_USER: "oss_lab_user"
       POSTGRES_PASSWORD: "oss_lab_pg_clean_02"
     labels:
-      guardian.oss_lab.target: "oss-clean-outline-02"
-      guardian.oss_lab.role: "db"
+      kovo.oss_lab.target: "oss-clean-outline-02"
+      kovo.oss_lab.role: "db"

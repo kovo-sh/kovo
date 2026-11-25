@@ -32,9 +32,9 @@ services:
       OSS_LAB_MEMBER_CRED: "oss_lab_vikunja_member_a"
       OSS_LAB_OWNER_CRED: "oss_lab_vikunja_owner_b"
     labels:
-      guardian.oss_lab.target: "oss-clean-vikunja-01"
-      guardian.oss_lab.split: "clean_control"
-      guardian.oss_lab.egress_policy: "deny_all_internal_only"
+      kovo.oss_lab.target: "oss-clean-vikunja-01"
+      kovo.oss_lab.split: "clean_control"
+      kovo.oss_lab.egress_policy: "deny_all_internal_only"
 
   vikunja_db:
     image: "postgres:16.4-alpine"
@@ -49,5 +49,5 @@ services:
       POSTGRES_USER: "oss_lab_user"
       POSTGRES_PASSWORD: "oss_lab_pg_clean_01"
     labels:
-      guardian.oss_lab.target: "oss-clean-vikunja-01"
-      guardian.oss_lab.role: "db"
+      kovo.oss_lab.target: "oss-clean-vikunja-01"
+      kovo.oss_lab.role: "db"

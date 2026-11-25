@@ -36,9 +36,9 @@ services:
       OSS_LAB_COLLAB_CRED: "oss_lab_gitea_collab_low"
       OSS_LAB_ADMIN_CRED: "oss_lab_gitea_org_admin"
     labels:
-      guardian.oss_lab.target: "oss-dev-gitea-01"
-      guardian.oss_lab.split: "dev"
-      guardian.oss_lab.egress_policy: "deny_all_internal_only"
+      kovo.oss_lab.target: "oss-dev-gitea-01"
+      kovo.oss_lab.split: "dev"
+      kovo.oss_lab.egress_policy: "deny_all_internal_only"
 
   gitea_db:
     image: "postgres:16.4-alpine"
@@ -53,11 +53,11 @@ services:
       POSTGRES_USER: "oss_lab_user"
       POSTGRES_PASSWORD: "oss_lab_pg_password_01"
     labels:
-      guardian.oss_lab.target: "oss-dev-gitea-01"
-      guardian.oss_lab.role: "db"
+      kovo.oss_lab.target: "oss-dev-gitea-01"
+      kovo.oss_lab.role: "db"
 
   internal_runner_meta:
-    image: "${INTERNAL_STUB_IMAGE:-guardian-lab/internal-stub:1.0.0}"
+    image: "${INTERNAL_STUB_IMAGE:-kovo-lab/internal-stub:1.0.0}"
     networks:
       - lab_internal
     read_only: true
@@ -69,5 +69,5 @@ services:
       OSS_LAB_RUNNER_TOKEN: "oss_lab_gitea_runner_stub_01"
       OSS_LAB_CANARY_PREFIX: "oss_canary_gitea_"
     labels:
-      guardian.oss_lab.target: "oss-dev-gitea-01"
-      guardian.oss_lab.role: "internal_target"
+      kovo.oss_lab.target: "oss-dev-gitea-01"
+      kovo.oss_lab.role: "internal_target"

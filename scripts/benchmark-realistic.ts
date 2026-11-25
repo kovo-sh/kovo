@@ -1,28 +1,28 @@
 #!/usr/bin/env node
-// Guardian v5 M0 — true end-to-end `realistic-bench` harness.
+// Kovo Hunter v5 M0 — true end-to-end `realistic-bench` harness.
 //
-// Drives Guardian's REAL `Execution` orchestrator (Phase-0 recon → threat model →
+// Drives Kovo Hunter's REAL `Execution` orchestrator (Phase-0 recon → threat model →
 // investigation → Zero-LLM replay verification) against a materialized
 // `benchmarks/realistic-bench` app, then grades the persisted findings with the
 // benchmark's immutable grader.
 //
 // It deliberately does NOT touch `scripts/benchmark-probes.ts`,
-// `scripts/benchmark-specs*.ts` or `benchmarks/realistic-bench/guardian-adapter.ts`
+// `scripts/benchmark-specs*.ts` or `benchmarks/realistic-bench/kovo-adapter.ts`
 // (the procedural pipeline). The only benchmark inputs are `startRealisticApp`,
 // `briefingFor`, `gradeRun` and `renderScorecard`.
 //
 // Usage:
-//   GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realistic -- \
+//   KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:realistic -- \
 //     --app acme-saas --seed 1 --mode grey-box --budget-usd 5 \
 //     --out-dir /tmp/rb-v4-base
 //
-// Held-out seeds (>= 1_000_000) additionally require GUARDIAN_RB_HELDOUT_SALT
+// Held-out seeds (>= 1_000_000) additionally require KOVO_RB_HELDOUT_SALT
 // (>= 16 chars). The salt is read from the environment only and is never written
 // to an artifact.
 //
 // Model usage: a fresh per-cell data directory has no provider profile, so the
 // run is deterministic/Zero-LLM (`Execution` stops after threat model because it
-// has no investigator). Point `--data-dir` at a Guardian data directory that has
+// has no investigator). Point `--data-dir` at a Kovo Hunter data directory that has
 // an enabled model profile to run the full agentic loop. `--no-llm` refuses to
 // run when such a profile is present. The selected model mode is always recorded
 // in the artifact metadata; results are never simulated.
@@ -186,16 +186,16 @@ export interface RealisticArgs {
   help: boolean
 }
 
-const usage = `Guardian realistic-bench (real Execution loop)
+const usage = `Kovo Hunter realistic-bench (real Execution loop)
 
 Usage:
-  GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realistic -- [flags]
+  KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:realistic -- [flags]
 
 Flags:
   --app <name|all>        acme-saas | shopflow | opsportal | all (default: all)
   --seed <n>              single dev seed (1..9999)
   --seeds <a,b,c>         comma-separated seeds
-  --held-out              seeds are held-out (>= 1000000) and need GUARDIAN_RB_HELDOUT_SALT
+  --held-out              seeds are held-out (>= 1000000) and need KOVO_RB_HELDOUT_SALT
   --mode <m>              black-box | grey-box | white-box (default: grey-box)
   --budget-usd <n>        per-run USD budget (default: $${DEFAULT_BUDGET_USD} at 600 s,
                           $10 at 45 min; linear between)
@@ -211,19 +211,19 @@ Flags:
                           with --max-duration-ms: 25,000 at 600 s, 100,000 at 45 min).
                           Phase A never borrows it.
   --max-rps <n>           hard per-origin rate cap (default ${DEFAULT_MAX_RPS}; WAF/429
-                          backoff still applies). GUARDIAN_MAX_RPS is the env equivalent.
+                          backoff still applies). KOVO_MAX_RPS is the env equivalent.
   These are caps, not targets: wall/USD/completion still end the run.
-  --out-dir <path>        artifact directory (default: .guardian/realistic-bench)
+  --out-dir <path>        artifact directory (default: .kovo/realistic-bench)
   --concurrency <n>       parallel app/seed cells (default: ${DEFAULT_CONCURRENCY})
   --worker-concurrency <n>
                           in-run investigation worker slots handed to Execution
                           (default: 6 agentic, 1 with --no-llm). Independent of
                           --concurrency: it changes how many assignments one cell
                           runs at once, never how many cells run at once.
-  --data-dir <path>       Guardian data dir (single cell: used verbatim, so an
+  --data-dir <path>       Kovo Hunter data dir (single cell: used verbatim, so an
                           existing model profile is picked up; multi-cell: base
                           directory, one isolated child dir per cell)
-                          (default: $GUARDIAN_DATA_DIR or <out-dir>/data/<cell>)
+                          (default: $KOVO_DATA_DIR or <out-dir>/data/<cell>)
   --no-llm                force the deterministic/Zero-LLM path; the run uses an
                           isolated data dir and never loads a model profile
   --no-conventional-wordlist
@@ -263,12 +263,12 @@ Flags:
   --help                  show this help
 
 Environment:
-  GUARDIAN_ALLOW_LOCAL_LAB=1   required to boot loopback lab origins
-  GUARDIAN_RB_HELDOUT_SALT     required for --held-out (never logged/committed)
-  GUARDIAN_DATA_DIR            default Guardian data dir (model profile source)
-  GUARDIAN_FLOOR_REQUEST_BUDGET / GUARDIAN_AGENT_REQUEST_BUDGET / GUARDIAN_TOTAL_REQUEST_BUDGET
+  KOVO_ALLOW_LOCAL_LAB=1   required to boot loopback lab origins
+  KOVO_RB_HELDOUT_SALT     required for --held-out (never logged/committed)
+  KOVO_DATA_DIR            default Kovo Hunter data dir (model profile source)
+  KOVO_FLOOR_REQUEST_BUDGET / KOVO_AGENT_REQUEST_BUDGET / KOVO_TOTAL_REQUEST_BUDGET
                                defaults for the split request budgets
-  GUARDIAN_MAX_RPS             hard per-origin rate cap (default 50)
+  KOVO_MAX_RPS             hard per-origin rate cap (default 50)
 
 Parallel agentic matrix:
   --concurrency 3 --isolate-data-dir  gives each cell its own Store under
@@ -294,7 +294,7 @@ Recon cache (v5.1 inner loop):
   --refresh-recon ignores an existing snapshot and recaptures it after a fresh Phase-0.
 
 Snapshot resume (v5.1 primary inner loop):
-  --snapshot-after-floor <dir> captures <dir>/guardian.sqlite (VACUUM INTO),
+  --snapshot-after-floor <dir> captures <dir>/kovo.sqlite (VACUUM INTO),
   snapshot.json (coordinator state + version stamps) and target.json (app/seed/mode +
   mutating replay log) at the post-floor boundary and at each planner round (round
   snapshots go to <dir>/planner-round-<n>/). --resume-snapshot <dir> copies that DB
@@ -408,7 +408,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
       agentRequestBudget: defaults.agent,
       totalRequestBudget: defaults.total,
       maxRps: DEFAULT_MAX_RPS,
-      outDir: resolve('.guardian/realistic-bench'), concurrency: DEFAULT_CONCURRENCY,
+      outDir: resolve('.kovo/realistic-bench'), concurrency: DEFAULT_CONCURRENCY,
       workerConcurrency: defaultWorkerConcurrency(Boolean(a['no-llm'])),
       noLlm: Boolean(a['no-llm']), isolateDataDir: Boolean(a['isolate-data-dir']),
       conventionalWordlist: a['no-conventional-wordlist'] !== true,
@@ -453,9 +453,9 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
 
   const heldOut = a['held-out'] === true
   const seeds = parseSeeds(a)
-  const salt = env.GUARDIAN_RB_HELDOUT_SALT ?? ''
+  const salt = env.KOVO_RB_HELDOUT_SALT ?? ''
   if (heldOut) {
-    if (salt.length < 16) fail('--held-out requires GUARDIAN_RB_HELDOUT_SALT (>= 16 chars)')
+    if (salt.length < 16) fail('--held-out requires KOVO_RB_HELDOUT_SALT (>= 16 chars)')
     for (const seed of seeds) if (seed < 1_000_000) fail(`held-out seeds are >= 1000000 (got ${seed})`)
   } else {
     for (const seed of seeds) {
@@ -478,11 +478,11 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
   }
   // Split request budgets: flag > env > duration-scaled default. Phase A/B never borrow each other.
   const floorRequestBudget = requestBudgetValue(
-    stringFlag(a, 'floor-request-budget'), env.GUARDIAN_FLOOR_REQUEST_BUDGET,
+    stringFlag(a, 'floor-request-budget'), env.KOVO_FLOOR_REQUEST_BUDGET,
     scaledBudgets.floor, '--floor-request-budget',
   )
   const agentRequestBudget = requestBudgetValue(
-    stringFlag(a, 'agent-request-budget'), env.GUARDIAN_AGENT_REQUEST_BUDGET,
+    stringFlag(a, 'agent-request-budget'), env.KOVO_AGENT_REQUEST_BUDGET,
     scaledBudgets.agent, '--agent-request-budget',
   )
   if (stringFlag(a, 'budget-requests') !== undefined && stringFlag(a, 'total-request-budget') !== undefined) {
@@ -490,12 +490,12 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
   }
   const totalRequestBudget = requestBudgetValue(
     stringFlag(a, 'budget-requests') ?? stringFlag(a, 'total-request-budget'),
-    env.GUARDIAN_TOTAL_REQUEST_BUDGET,
+    env.KOVO_TOTAL_REQUEST_BUDGET,
     floorRequestBudget + agentRequestBudget,
     '--budget-requests',
   )
   const maxRps = requestBudgetValue(
-    stringFlag(a, 'max-rps'), env.GUARDIAN_MAX_RPS,
+    stringFlag(a, 'max-rps'), env.KOVO_MAX_RPS,
     DEFAULT_MAX_RPS,
     '--max-rps',
   )
@@ -511,8 +511,8 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
   const workerConcurrency = a['worker-concurrency'] === undefined
     ? defaultWorkerConcurrency(noLlm)
     : parseWorkerConcurrency(stringFlag(a, 'worker-concurrency') ?? '')
-  const outDirRaw = stringFlag(a, 'out-dir') ?? '.guardian/realistic-bench'
-  const dataDirRaw = stringFlag(a, 'data-dir') ?? env.GUARDIAN_DATA_DIR
+  const outDirRaw = stringFlag(a, 'out-dir') ?? '.kovo/realistic-bench'
+  const dataDirRaw = stringFlag(a, 'data-dir') ?? env.KOVO_DATA_DIR
   if (resumeSnapshotRaw && noLlm) {
     fail('--resume-snapshot requires the live agentic model; drop --no-llm')
   }
@@ -941,7 +941,7 @@ function specParams(spec: unknown): string[] {
 }
 
 /**
- * Translate persisted Guardian findings into the benchmark grader schema.
+ * Translate persisted Kovo Hunter findings into the benchmark grader schema.
  * Confirmed -> runtime_confirmed, static_verified -> static_verified; pending /
  * inconclusive claims are preserved as proposed/open_proof_gap so the precision
  * denominator reflects what was actually submitted. Dismissed and superseded
@@ -1035,7 +1035,7 @@ export function buildTelemetry(input: {
   budgetUsd: number
   budgetExhausted: boolean
 }): RunTelemetry {
-  // Guardian does not persist a chain-step -> concrete path mapping, so the harness
+  // Kovo Hunter does not persist a chain-step -> concrete path mapping, so the harness
   // deliberately reports no synthesized hypotheses rather than guessing paths. The
   // grader still derives hypothesis formation from the recorded request log.
   return {
@@ -1125,7 +1125,7 @@ export function assertAgenticPreflight(input: AgenticPreflightInput): void {
     throw new PreflightError(
       `agentic Execution requires a worker-session-capable verifier backend; --verifier docker could not open a worker session${detail}. `
       + 'Docker worker sessions need socket access: re-run under `newgrp docker -c \'<command>\'` and verify '
-      + '`docker images` contains guardian-worker:v4.',
+      + '`docker images` contains kovo-worker:v4.',
     )
   }
   throw new PreflightError(
@@ -1411,7 +1411,7 @@ export function openCellStore(directory: string): Store {
     return new Store(directory)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    if (/Another Guardian server is using this data directory/.test(message)) {
+    if (/Another Kovo Hunter server is using this data directory/.test(message)) {
       throw new PreflightError(
         `${message} Parallel cells need isolated stores: add --isolate-data-dir `
         + '(it is on by default when --concurrency > 1) or use a distinct --data-dir per cell.',
@@ -1451,16 +1451,16 @@ export function shouldIsolateDataDir(args: Pick<RealisticArgs, 'isolateDataDir' 
 }
 
 /**
- * Create a per-cell Guardian Store from a source data dir without copying the key:
+ * Create a per-cell Kovo Hunter Store from a source data dir without copying the key:
  * only enabled model_profiles rows + the workspace identity are copied; credentials/
  * becomes a symlink to the source credentials dir.
  */
 export function prepareIsolatedDataDir(input: { sourceDataDir: string; targetDir: string }): IsolatedDataDirResult {
   const source = resolve(input.sourceDataDir)
   const target = resolve(input.targetDir)
-  const sourceDb = join(source, 'guardian.sqlite')
+  const sourceDb = join(source, 'kovo.sqlite')
   const sourceCredentials = join(source, 'credentials')
-  if (!existsSync(sourceDb)) throw new PreflightError(`--isolate-data-dir source has no guardian.sqlite: ${source}`)
+  if (!existsSync(sourceDb)) throw new PreflightError(`--isolate-data-dir source has no kovo.sqlite: ${source}`)
   if (!existsSync(sourceCredentials)) throw new PreflightError(`--isolate-data-dir source has no credentials dir: ${source}`)
 
   unlockAndRemove(target)
@@ -1501,7 +1501,7 @@ export function prepareIsolatedDataDir(input: { sourceDataDir: string; targetDir
 
     // Replace the auto-created workspace with the source workspace row, then bind the
     // copied profile rows to it. Only workspace identity + profile metadata move; keys do not.
-    const targetClient = new DatabaseSync(join(target, 'guardian.sqlite'))
+    const targetClient = new DatabaseSync(join(target, 'kovo.sqlite'))
     try {
       targetClient.exec('PRAGMA foreign_keys = OFF')
       targetClient.prepare('delete from workspaces').run()
@@ -1894,7 +1894,7 @@ export function surfaceReplayPath(pathAndQuery: string): string | null {
   const path = pathAndQuery.split('?')[0] ?? ''
   if (!path.startsWith('/') || path.startsWith('//')) return null
   if (path.length > 512) return null
-  if (path.includes('.guardian-cal-')) return null // soft-404 calibration tokens
+  if (path.includes('.kovo-cal-')) return null // soft-404 calibration tokens
   if (path.includes('[[') || path.includes('{{')) return null // redacted secret placeholders
   if (!/^[A-Za-z0-9._~!$&'()*+,;=:@%/-]+$/.test(path)) return null
   return path
@@ -2350,7 +2350,7 @@ export function linkSnapshotModelCredentials(input: {
   if (!rows.length) return { profiles: 0, linked: 0 }
   if (!input.sourceDataDir) {
     throw new PreflightError(
-      '--resume-snapshot needs --data-dir (or GUARDIAN_DATA_DIR) pointing at the enabled model '
+      '--resume-snapshot needs --data-dir (or KOVO_DATA_DIR) pointing at the enabled model '
       + 'profile whose key the resumed run must use',
     )
   }
@@ -2361,7 +2361,7 @@ export function linkSnapshotModelCredentials(input: {
   // Fall back to matching the profile by name/model when the source credential id differs
   // (e.g. the checkpoint came from a different isolated copy of the same profile).
   let sourceRows: Array<{ credential_id?: string; name?: string; model?: string }> = []
-  const sourceDb = join(resolve(input.sourceDataDir), 'guardian.sqlite')
+  const sourceDb = join(resolve(input.sourceDataDir), 'kovo.sqlite')
   if (existsSync(sourceDb)) {
     const source = new DatabaseSync(sourceDb, { readOnly: true })
     try {
@@ -2586,12 +2586,12 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
   const startedAt = nowMs()
   const slug = cellSlug(app, seed, args.mode)
   // The deterministic engine reads the switch from the environment (same mechanism as
-  // GUARDIAN_DETERMINISTIC_ENGINE). Record the effective value in cell meta as well.
-  if (args.conventionalWordlist) delete process.env.GUARDIAN_CONVENTIONAL_WORDLIST
-  else process.env.GUARDIAN_CONVENTIONAL_WORDLIST = '0'
+  // KOVO_DETERMINISTIC_ENGINE). Record the effective value in cell meta as well.
+  if (args.conventionalWordlist) delete process.env.KOVO_CONVENTIONAL_WORDLIST
+  else process.env.KOVO_CONVENTIONAL_WORDLIST = '0'
   // The product surface benefits from response-driven object siblings; the procedural capability
   // harness keeps its historical corpus (the flag is opt-in in phase0-recon).
-  process.env.GUARDIAN_RECON_SIBLINGS = '1'
+  process.env.KOVO_RECON_SIBLINGS = '1'
   const cellCount = cellKeys(args).length
   // --no-llm must never inherit a model-enabled data dir: use an isolated deterministic store.
   const sourceDataDir = args.noLlm ? undefined : args.dataDir
@@ -2641,7 +2641,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     dataDir = join(args.outDir, 'data', `${slug}-resume`)
     copySnapshotDatabase({ snapshotDir: resumeDir, targetDir: dataDir })
     const linked = linkSnapshotModelCredentials({
-      snapshotDb: join(dataDir, 'guardian.sqlite'),
+      snapshotDb: join(dataDir, 'kovo.sqlite'),
       ...(sourceDataDir ? { sourceDataDir } : {}),
       targetDataDir: dataDir,
     })
@@ -2675,7 +2675,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
   let canaryStopped = false
   let whiteBoxRoot: string | undefined
   if (args.isolateDataDir && !sourceDataDir && !args.noLlm) {
-    notes.push('--isolate-data-dir had no --data-dir/GUARDIAN_DATA_DIR source; using a fresh cell data dir')
+    notes.push('--isolate-data-dir had no --data-dir/KOVO_DATA_DIR source; using a fresh cell data dir')
   }
   if (isolated) {
     notes.push(
@@ -2710,7 +2710,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
         if (args.verifier === 'docker') {
           throw new PreflightError(
             `--verifier docker is not usable from this process: ${detail}. Docker worker sessions need socket access; `
-            + 're-run under `newgrp docker -c \'<command>\'` and make sure guardian-worker:v4 is built.',
+            + 're-run under `newgrp docker -c \'<command>\'` and make sure kovo-worker:v4 is built.',
           )
         }
         throw error
@@ -2744,7 +2744,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     started = await startRealisticApp({
       app,
       seed,
-      ...(args.heldOut ? { heldOutSalt: process.env.GUARDIAN_RB_HELDOUT_SALT } : {}),
+      ...(args.heldOut ? { heldOutSalt: process.env.KOVO_RB_HELDOUT_SALT } : {}),
       oobCallbackPorts,
     })
     const briefing = briefingFor(started, args.mode)

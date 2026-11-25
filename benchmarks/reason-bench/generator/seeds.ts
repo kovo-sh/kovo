@@ -1,6 +1,6 @@
 // Dev vs held-out seed resolution for reason-bench. Dev seeds are freely reproducible; held-out
 // seeds require an unguessable salt (never committed) so a scanner/prompt cannot derive them from
-// the repository. Held-out derivation is HMAC-SHA256 over GUARDIAN_RB_HELDOUT_SALT.
+// the repository. Held-out derivation is HMAC-SHA256 over KOVO_RB_HELDOUT_SALT.
 import { createHmac } from 'node:crypto'
 import { createPrng } from '../lib/prng.ts'
 import type { Prng } from '../lib/prng.ts'
@@ -21,11 +21,11 @@ export function seedSetFor(seed: number): SeedSet {
 }
 
 export function requireHeldOutSalt(salt?: string): string {
-  const s = salt ?? process.env.GUARDIAN_RB_HELDOUT_SALT
+  const s = salt ?? process.env.KOVO_RB_HELDOUT_SALT
   if (!s || s.length < MIN_SALT_LEN) {
     throw new Error(
       `held-out seeds require a salt of >= ${MIN_SALT_LEN} chars via the salt argument or ` +
-        'GUARDIAN_RB_HELDOUT_SALT; refusing to derive a held-out variant without it',
+        'KOVO_RB_HELDOUT_SALT; refusing to derive a held-out variant without it',
     )
   }
   return s

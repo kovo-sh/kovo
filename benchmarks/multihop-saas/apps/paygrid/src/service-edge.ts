@@ -104,7 +104,7 @@ export async function handleEdge(
       return
     }
     const response = await deps.egress.fetch('vault.internal', `/treasury/${encodeURIComponent(pathTenant)}`, {
-      headers: { 'x-service-jwt': serviceToken(state), 'x-guardian-run-id': runId },
+      headers: { 'x-service-jwt': serviceToken(state), 'x-kovo-run-id': runId },
     })
     if (!response.ok) {
       sendJson(res, 404, { error: 'treasury not found' })
@@ -128,7 +128,7 @@ export async function handleEdge(
   if (url.pathname.startsWith(`${p}/`) || url.pathname === p) {
     const raw = method === 'GET' || method === 'HEAD' ? '' : await readBody(req)
     const headers: Record<string, string> = {
-      'x-guardian-run-id': runId,
+      'x-kovo-run-id': runId,
       'x-edge-region': 'mh-lab-1',
       // Internal bridge credential: lets api trust edge-computed headers on forwarded requests.
       'x-edge-bridge': state.edgeBridgeToken,

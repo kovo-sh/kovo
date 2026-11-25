@@ -377,7 +377,7 @@ export async function handleScm(
       try {
         const response = await deps.egress.fetch('registry.internal', path, {
           method: 'POST',
-          headers: { 'content-type': 'application/json', 'x-guardian-run-id': runId },
+          headers: { 'content-type': 'application/json', 'x-kovo-run-id': runId },
           body: JSON.stringify({ projectId: project.id, tenantId: project.tenantId, event: 'push' }),
         })
         const raw = (await response.text()).slice(0, DELIVERY_BODY_LIMIT)

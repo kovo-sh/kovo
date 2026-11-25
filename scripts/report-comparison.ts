@@ -56,8 +56,8 @@ const answer = z.strictObject({
   reportSha256: digest,
   tasks: z.partialRecord(tasks, grade).refine(value => Object.keys(value).length > 0),
 })
-const review = z.strictObject({ reader: label, guardian: answer, artex: answer, notes: label.optional() }).refine(
-  ({ guardian, artex }) => tasks.options.every(task => (guardian.tasks[task] === undefined) === (artex.tasks[task] === undefined)),
+const review = z.strictObject({ reader: label, kovo: answer, artex: answer, notes: label.optional() }).refine(
+  ({ kovo, artex }) => tasks.options.every(task => (kovo.tasks[task] === undefined) === (artex.tasks[task] === undefined)),
   { message: 'Provide a grade for the same tasks in both reports.' },
 )
 const scenario = z.strictObject({
@@ -65,7 +65,7 @@ const scenario = z.strictObject({
   input: artifact,
   heldOut: z.boolean().default(false),
   cases: z.array(expectedCase).min(1),
-  guardian: productReport.optional(),
+  kovo: productReport.optional(),
   artex: productReport.optional(),
   reviews: z.array(review).default([]),
 })
@@ -86,7 +86,7 @@ const inputSchema = z.object({
 type Artifact = z.infer<typeof artifact>
 type Verdict = z.infer<typeof verdict>
 type Scenario = z.infer<typeof scenario>
-type Product = 'guardian' | 'artex'
+type Product = 'kovo' | 'artex'
 type Status = 'passed' | 'failed' | 'pending'
 type RecordingAudit = z.infer<typeof recordingAuditSchema>
 type StoppingPoint = z.infer<typeof inputSchema>['stoppingPoint']
@@ -190,11 +190,11 @@ async function readProduct(directory: string, entry: Scenario, product: Product,
     recordingAudit = 'unreviewed'
     if (audit) {
       validateRecording(audit, scope, stoppingPoint, context)
-      if (product === 'guardian') {
+      if (product === 'kovo') {
         const lines = report.toString('utf8').split(/\r?\n/)
         if (!audit.reportVersion || !lines.includes('- **Run** ' + audit.runId) ||
             !lines.includes('- **Report version** ' + audit.reportVersion)) {
-          throw new Error(context + ' has a recording for a different Guardian report version.')
+          throw new Error(context + ' has a recording for a different Kovo Hunter report version.')
         }
       }
       recordingAudit = 'verified'
@@ -244,27 +244,27 @@ async function readScenario(directory: string, entry: Scenario) {
       entry.cases.some(row => !scope.has(row.asset))) {
     throw new Error('Invalid scope or duplicate case labels for ' + JSON.stringify(entry.id) + '.')
   }
-  const guardian = await readProduct(directory, entry, 'guardian', scope, input.stoppingPoint)
+  const kovo = await readProduct(directory, entry, 'kovo', scope, input.stoppingPoint)
   const artex = await readProduct(directory, entry, 'artex', scope, input.stoppingPoint)
   const readers = new Set<string>()
   for (const review of entry.reviews) {
     if (readers.has(review.reader)) throw new Error('Duplicate reader for ' + JSON.stringify(entry.id) + '.')
     readers.add(review.reader)
-    if (review.guardian.reportSha256 !== guardian?.report.sha256 || review.artex.reportSha256 !== artex?.report.sha256) {
+    if (review.kovo.reportSha256 !== kovo?.report.sha256 || review.artex.reportSha256 !== artex?.report.sha256) {
       throw new Error('Reader answers for ' + JSON.stringify(entry.id) + ' reference different reports.')
     }
   }
   const { capturedEvidence, ...context } = input
   return { id: entry.id, input: entry.input, heldOut: entry.heldOut, ...context,
-    cases: entry.cases, guardian, artex, reviews: entry.reviews }
+    cases: entry.cases, kovo, artex, reviews: entry.reviews }
 }
 
 type CheckedScenario = Awaited<ReturnType<typeof readScenario>>
 
 function findSeriousFindingIssues(scenarios: CheckedScenario[]) {
-  return scenarios.flatMap(({ id, guardian }) => {
-    if (guardian?.recordingAudit !== 'verified') return []
-    return guardian.cases.flatMap(row => {
+  return scenarios.flatMap(({ id, kovo }) => {
+    if (kovo?.recordingAudit !== 'verified') return []
+    return kovo.cases.flatMap(row => {
       if (row.expected !== 'confirmed' || (row.severity !== 'high' && row.severity !== 'critical')) return []
       if (row.reported === 'confirmed' && row.reportedSeverity === row.severity) return []
       return [{
@@ -280,9 +280,9 @@ function findSeriousFindingIssues(scenarios: CheckedScenario[]) {
 }
 
 function findCoverageOverclaims(scenarios: CheckedScenario[]) {
-  return scenarios.flatMap(({ id, guardian }) => {
-    if (guardian?.recordingAudit !== 'verified') return []
-    return guardian.cases.filter(({ expected, reported }) => {
+  return scenarios.flatMap(({ id, kovo }) => {
+    if (kovo?.recordingAudit !== 'verified') return []
+    return kovo.cases.filter(({ expected, reported }) => {
       if (expected === 'untested') return reported !== 'untested'
       return expected === 'inconclusive' && (reported === 'confirmed' || reported === 'met')
     }).map(({ asset, issue, expected, reported }) => ({ scenario: id, asset, issue, expected, reported }))
@@ -314,25 +314,25 @@ function scoreProduct(scenarios: CheckedScenario[], product: Product) {
   }
 }
 
-function compareAccuracy(guardian: ReturnType<typeof scoreProduct>, artex: ReturnType<typeof scoreProduct>): Status {
-  if (!guardian || !artex) return 'pending'
-  if (guardian.recall !== null && artex.recall !== null && guardian.recall < artex.recall) return 'failed'
-  if (guardian.precision === null || artex.precision === null || artex.recall === null) return 'pending'
-  return guardian.precision >= artex.precision ? 'passed' : 'failed'
+function compareAccuracy(kovo: ReturnType<typeof scoreProduct>, artex: ReturnType<typeof scoreProduct>): Status {
+  if (!kovo || !artex) return 'pending'
+  if (kovo.recall !== null && artex.recall !== null && kovo.recall < artex.recall) return 'failed'
+  if (kovo.precision === null || artex.precision === null || artex.recall === null) return 'pending'
+  return kovo.precision >= artex.precision ? 'passed' : 'failed'
 }
 
 function compareReaders(scenarios: CheckedScenario[]) {
   const byScenario = scenarios.map(item => {
     const relevant = item.cases.some(row => row.expected === 'confirmed') ? tasks.options : ['coverage'] as const
-    const reviews = item.reviews.filter(review => relevant.some(task => review.guardian.tasks[task] !== undefined))
+    const reviews = item.reviews.filter(review => relevant.some(task => review.kovo.tasks[task] !== undefined))
     return {
       id: item.id,
       pairs: reviews.length,
       tasks: relevant.map(task => {
-        const graded = reviews.filter(review => review.guardian.tasks[task] !== undefined)
+        const graded = reviews.filter(review => review.kovo.tasks[task] !== undefined)
         return {
           task, pairs: graded.length,
-          guardian: graded.filter(review => review.guardian.tasks[task] === 'correct').length,
+          kovo: graded.filter(review => review.kovo.tasks[task] === 'correct').length,
           artex: graded.filter(review => review.artex.tasks[task] === 'correct').length,
         }
       }),
@@ -342,17 +342,17 @@ function compareReaders(scenarios: CheckedScenario[]) {
   const results = Object.fromEntries(tasks.options.map(task => {
     const rows = scores.filter(row => row.task === task)
     return [task, {
-      guardian: rows.reduce((total, row) => total + row.guardian, 0),
+      kovo: rows.reduce((total, row) => total + row.kovo, 0),
       artex: rows.reduce((total, row) => total + row.artex, 0),
     }]
   }))
   const missedEssentialTask = scores.some(row =>
-    row.pairs && (row.task === 'priority' || row.task === 'coverage') && !row.guardian)
+    row.pairs && (row.task === 'priority' || row.task === 'coverage') && !row.kovo)
   const remaining = byScenario.filter(item => item.tasks.some(task => !task.pairs)).map(item => item.id)
   let status: Status = 'pending'
   if (missedEssentialTask) status = 'failed'
   else if (!remaining.length) {
-    status = Object.values(results).some(row => row.guardian < row.artex) ? 'failed' : 'passed'
+    status = Object.values(results).some(row => row.kovo < row.artex) ? 'failed' : 'passed'
   }
   return { status, pairs: byScenario.reduce((total, row) => total + row.pairs, 0), results, byScenario, awaitingReview: remaining }
 }
@@ -367,15 +367,15 @@ export async function compareReports(manifestPath: string) {
   }
   const scenarios = []
   for (const entry of manifest.scenarios) scenarios.push(await readScenario(directory, entry))
-  const guardian = manifest.mode === 'assessment' ? scoreProduct(scenarios, 'guardian') : null
+  const kovo = manifest.mode === 'assessment' ? scoreProduct(scenarios, 'kovo') : null
   const artex = manifest.mode === 'assessment' ? scoreProduct(scenarios, 'artex') : null
   const seriousFindingIssues = manifest.mode === 'assessment' ? findSeriousFindingIssues(scenarios) : []
   const coverageOverclaims = manifest.mode === 'assessment' ? findCoverageOverclaims(scenarios) : []
-  const accuracyStatus: Status = seriousFindingIssues.length || coverageOverclaims.length ? 'failed' : compareAccuracy(guardian, artex)
-  const accuracy = { status: accuracyStatus, guardian, artex, seriousFindingIssues, coverageOverclaims }
-  const evidenceIssues = scenarios.flatMap(item => item.guardian?.evidenceIssues.map(issue => ({ scenario: item.id, ...issue })) ?? [])
+  const accuracyStatus: Status = seriousFindingIssues.length || coverageOverclaims.length ? 'failed' : compareAccuracy(kovo, artex)
+  const accuracy = { status: accuracyStatus, kovo, artex, seriousFindingIssues, coverageOverclaims }
+  const evidenceIssues = scenarios.flatMap(item => item.kovo?.evidenceIssues.map(issue => ({ scenario: item.id, ...issue })) ?? [])
   const evidenceStatus: Status = evidenceIssues.some(issue => issue.reason !== 'unreviewed') ? 'failed'
-    : scenarios.some(item => !item.guardian) || evidenceIssues.length ? 'pending' : 'passed'
+    : scenarios.some(item => !item.kovo) || evidenceIssues.length ? 'pending' : 'passed'
   const evidence = { status: evidenceStatus, issues: evidenceIssues }
   const readers = compareReaders(scenarios)
   const coverage = {

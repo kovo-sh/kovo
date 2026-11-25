@@ -2,7 +2,7 @@
 // 10% overall confirmed recall on dev and salted held-out seeds, and the CLI must exit 0.
 //
 // The gate is exercised through its real process boundary (the CLI's exit code is the assertion),
-// never mocked or called in-process. Held-out is skipped cleanly when GUARDIAN_RB_HELDOUT_SALT is
+// never mocked or called in-process. Held-out is skipped cleanly when KOVO_RB_HELDOUT_SALT is
 // absent; the value is forwarded to the child and never printed or written.
 //
 // Note: reason-bench app/runtime source may not statically import child_process (safety.test.ts
@@ -53,9 +53,9 @@ async function runGate(label: string, args: string[], withSalt: boolean): Promis
     '--json', jsonPath,
     '--md', mdPath,
   ]
-  const env: NodeJS.ProcessEnv = { ...process.env, GUARDIAN_ALLOW_LOCAL_LAB: '1' }
-  if (withSalt) env.GUARDIAN_RB_HELDOUT_SALT = process.env.GUARDIAN_RB_HELDOUT_SALT
-  else delete env.GUARDIAN_RB_HELDOUT_SALT
+  const env: NodeJS.ProcessEnv = { ...process.env, KOVO_ALLOW_LOCAL_LAB: '1' }
+  if (withSalt) env.KOVO_RB_HELDOUT_SALT = process.env.KOVO_RB_HELDOUT_SALT
+  else delete env.KOVO_RB_HELDOUT_SALT
 
   // Lazy builtin load: the benchmark tree forbids a static child_process import.
   const { spawn } = await import('node:child_process')
@@ -118,10 +118,10 @@ test('anti-heuristic gate: dev seed 1 floor <= 10% and exit 0', { timeout: TIMEO
   assertFloor('dev seed 1', result, 28)
 })
 
-const salt = process.env.GUARDIAN_RB_HELDOUT_SALT ?? ''
+const salt = process.env.KOVO_RB_HELDOUT_SALT ?? ''
 test('anti-heuristic gate: held-out seed 1000042 floor <= 10% and exit 0', {
   timeout: TIMEOUT_MS,
-  skip: salt.length < 16 ? 'GUARDIAN_RB_HELDOUT_SALT is not set' : false,
+  skip: salt.length < 16 ? 'KOVO_RB_HELDOUT_SALT is not set' : false,
 }, async () => {
   const result = await runGate('heldout', ['--app', 'all', '--held-out', '--seeds', '1000042'], true)
   assertFloor('held-out seed 1000042', result, 28)

@@ -183,7 +183,7 @@ export function synthWorkflowStepSkip(o: HypothesisOutcome, env: ProbeEnv): Synt
     ? hit.recordId
     : targetId
   const canReadState = Boolean(readPath && stateField)
-  if (process.env.GUARDIAN_BENCH_DEBUG === '1') {
+  if (process.env.KOVO_BENCH_DEBUG === '1') {
     process.stderr.write(`[spec-workflow] from=${fromState || '-'} to=${toState || '-'} create=${createPath ?? '-'} seeded=${seeded} repeat=${repeatTransition} read=${readPath ?? '-'} field=${stateField || '-'} coll=${collection ?? '-'} idField=${idField ?? '-'} recordId=${recordId ?? '-'} target=${target}\n`)
   }
   if (!canReadState && !repeatTransition && (!fromState || !toState)) return []
@@ -536,7 +536,7 @@ export function synthUrlDomXss(o: HypothesisOutcome, env: ProbeEnv): Synthesized
   if (!basePath.startsWith('/') || !/^[A-Za-z_][A-Za-z0-9_.-]{0,40}$/.test(param)) return []
   const payload = `<img src=x onerror="document.title='{{canary_token}}'">`
   const encodedPayload = payload.split('{{canary_token}}').map(encodeURIComponent).join('{{canary_token}}')
-  const controlPath = appendQuery(basePath, param, 'guardian')
+  const controlPath = appendQuery(basePath, param, 'kovo')
   const probePath = appendQuery(basePath, param, encodedPayload, false)
   const params = { origin: env.origin, ...(env.owner ? { persona: env.owner } : {}), ...sessionFields(env, o.hyp) }
   const jq = '{ controlPassed: (.steps.c1.status >= 200 and .steps.c1.status < 400 and (.steps.c1.title != .canaryToken) and (([(.steps.c1.domSinkTraces // [])[] | select(.containsCanary)] | length) == 0)), ' +
@@ -661,7 +661,7 @@ export function synthReflectedXss(o: HypothesisOutcome, env: ProbeEnv): Synthesi
   if (context !== 'html_body' || !chars.includes('<') || !chars.includes('"')) return []
   const basePath = o.hyp.endpoint.path
   if (!basePath.startsWith('/')) return []
-  const controlPath = appendQuery(basePath, o.hyp.param.name, 'guardian')
+  const controlPath = appendQuery(basePath, o.hyp.param.name, 'kovo')
   const payload = `<img src=x onerror="document.title='{{canary_token}}'">`
   // Keep the verifier placeholder intact while percent-encoding the rest of the payload.
   const encodedPayload = payload.split('{{canary_token}}').map(encodeURIComponent).join('{{canary_token}}')

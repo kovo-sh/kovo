@@ -1,4 +1,4 @@
-// multihop-saas entrypoint: programmatic API + CLI + Guardian v8 product-runner bridge.
+// multihop-saas entrypoint: programmatic API + CLI + Kovo Hunter v8 product-runner bridge.
 //   startPaygrid({ seed, mode, twin?, asyncLatencyMs? }) -> StartedPaygrid
 //   startMultihopApp({ app, seed, mode?, variant?, fastLab?, heldOutSalt? }) -> StartedMultihopApp
 //   briefingFor(started, mode?) -> MultihopProductBriefing
@@ -318,7 +318,7 @@ export function gradeLab(lab: StartedPaygrid | StartedLabBase, findings: Finding
 }
 
 // ---------------------------------------------------------------------------------------------
-// Guardian v8 product-runner bridge (`scripts/benchmark-multihop.ts`)
+// Kovo Hunter v8 product-runner bridge (`scripts/benchmark-multihop.ts`)
 // ---------------------------------------------------------------------------------------------
 
 export interface StartMultihopAppOptions {
@@ -1052,7 +1052,7 @@ export function listSeeds(): SeedCatalogue
 export function listSeeds(set: SeedSet, n?: number, salt?: string): number[]
 export function listSeeds(set?: SeedSet, n = 5, salt?: string): number[] | SeedCatalogue {
   if (set !== undefined) return libListSeeds(set, n, salt)
-  const resolvedSalt = salt ?? process.env.GUARDIAN_RB_HELDOUT_SALT
+  const resolvedSalt = salt ?? process.env.KOVO_RB_HELDOUT_SALT
   const heldOutAvailable = Boolean(resolvedSalt && resolvedSalt.length >= 16)
   return {
     apps: discoverApps(),
@@ -1147,7 +1147,7 @@ function resolveReceiptChainId(
     return receipt.chainId
   }
 
-  // Step B: endpoint + causal-topology matching for real Guardian runs (anti-contamination generic chainIds).
+  // Step B: endpoint + causal-topology matching for real Kovo Hunter runs (anti-contamination generic chainIds).
   if (!chainSpecs.length || candidateChainIds.size === 0) return null
   const hops = receipt.receipt?.hops
   if (receipt.hopCount < 2 || (hops !== undefined && hops.length < 2)) {
@@ -1587,7 +1587,7 @@ function cmdSeeds(a: Record<string, string | boolean>): void {
   const set = (a.set ? String(a.set) : 'dev') as SeedSet
   if (set !== 'dev' && set !== 'held-out') throw new Error('--set must be dev or held-out')
   if (a.salt !== undefined) {
-    throw new Error('never pass the held-out salt on the command line; set GUARDIAN_RB_HELDOUT_SALT instead')
+    throw new Error('never pass the held-out salt on the command line; set KOVO_RB_HELDOUT_SALT instead')
   }
   const n = Number(a.n ?? 5)
   process.stdout.write(`${JSON.stringify(listSeeds(set, n))}\n`)
@@ -1596,7 +1596,7 @@ function cmdSeeds(a: Record<string, string | boolean>): void {
 async function cmdServe(a: Record<string, string | boolean>): Promise<void> {
   assertLocalLabAllowed()
   if (a['held-out-salt'] !== undefined) {
-    throw new Error('never pass the held-out salt on the command line; set GUARDIAN_RB_HELDOUT_SALT instead')
+    throw new Error('never pass the held-out salt on the command line; set KOVO_RB_HELDOUT_SALT instead')
   }
   const app = a.app ? String(a.app) : 'paygrid'
   const mode = asMode(a.mode)
@@ -1658,7 +1658,7 @@ function cmdGrade(a: Record<string, string | boolean>): void {
 async function cmdSelftest(a: Record<string, string | boolean>): Promise<void> {
   assertLocalLabAllowed()
   if (a['held-out-salt'] !== undefined) {
-    throw new Error('never pass the held-out salt on the command line; set GUARDIAN_RB_HELDOUT_SALT instead')
+    throw new Error('never pass the held-out salt on the command line; set KOVO_RB_HELDOUT_SALT instead')
   }
   const seeds = String(a.seeds ?? '1,2,3').split(',').map((value) => Number(value.trim()))
     .filter((value) => Number.isFinite(value))

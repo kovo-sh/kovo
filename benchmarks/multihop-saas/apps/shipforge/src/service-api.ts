@@ -62,7 +62,7 @@ export async function handleApi(
     const raw = await readBody(req)
     const response = await deps.egress.fetch('scm', '/login', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-guardian-run-id': runId },
+      headers: { 'content-type': 'application/json', 'x-kovo-run-id': runId },
       body: raw,
     })
     await proxy(res, response)
@@ -220,7 +220,7 @@ export async function handleApi(
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-guardian-run-id': runId,
+        'x-kovo-run-id': runId,
         authorization: `Bearer ${session.token}`,
       },
       body: raw,
@@ -236,7 +236,7 @@ export async function handleApi(
     const path = `/repos/${encodeURIComponent(projectDeliveries[0]!)}` +
       `/webhooks/${encodeURIComponent(projectDeliveries[1]!)}/deliveries`
     const response = await deps.egress.fetch('scm', path, {
-      headers: { 'x-guardian-run-id': runId, authorization: `Bearer ${session.token}` },
+      headers: { 'x-kovo-run-id': runId, authorization: `Bearer ${session.token}` },
     })
     await proxy(res, response)
     return
@@ -251,7 +251,7 @@ export async function handleApi(
       return
     }
     const response = await deps.egress.fetch('runner', '/streams/shared', {
-      headers: { 'x-guardian-run-id': runId, authorization: `Bearer ${credential}` },
+      headers: { 'x-kovo-run-id': runId, authorization: `Bearer ${credential}` },
     })
     await proxy(res, response)
     return
@@ -269,7 +269,7 @@ export async function handleApi(
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-guardian-run-id': runId,
+        'x-kovo-run-id': runId,
         ...(registryToken ? { 'x-registry-token': registryToken } : {}),
       },
       body: JSON.stringify({ tenant: body?.tenant, projectId: body?.projectId }),

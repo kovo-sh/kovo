@@ -16,8 +16,8 @@ const maxOpsBody = 64 * 1024
 const bootstrapParam = 'bootstrap'
 const defaultPairingTtlMs = 5 * 60 * 1000
 const maxActivePairingTokens = 10
-const pairingLinkPath = '/_guardian/auth/pairing-link'
-const rotateSessionPath = '/_guardian/auth/rotate-session'
+const pairingLinkPath = '/_kovo/auth/pairing-link'
+const rotateSessionPath = '/_kovo/auth/rotate-session'
 const killSwitchPath = '/api/ops/kill-switch'
 const receiptExportPathRegex = /^\/api\/runs\/([A-Za-z0-9_-]{1,128})\/receipts\/export$/
 
@@ -42,7 +42,7 @@ export interface LocalSessionOptions {
   store?: Store
 }
 
-export interface GuardianLocalServer {
+export interface KovoLocalServer {
   server: Server
   token: string
   bootstrapSecret: string
@@ -114,7 +114,7 @@ export function consumeBootstrapSecret(directory: string): void {
 
 export function isSessionAuthorized(cookieHeader: string | undefined, token: string): boolean {
   const cookies = cookieHeader?.split(';').map(cookie => cookie.trim()) ?? []
-  const value = cookies.find(cookie => cookie.startsWith('guardian_local='))?.slice('guardian_local='.length)
+  const value = cookies.find(cookie => cookie.startsWith('kovo_local='))?.slice('kovo_local='.length)
   return Boolean(value && value.length === token.length && /^[0-9a-f]+$/.test(value)
     && constantTimeEquals(value, token))
 }
@@ -124,7 +124,7 @@ export function isBootstrapAuthorized(candidate: string | null | undefined, secr
 }
 
 export function sessionCookie(token: string, origin: string): string {
-  return `guardian_local=${token}; Path=/; HttpOnly; SameSite=Strict${origin.startsWith('https:') ? '; Secure' : ''}`
+  return `kovo_local=${token}; Path=/; HttpOnly; SameSite=Strict${origin.startsWith('https:') ? '; Secure' : ''}`
 }
 
 function bootstrapNotice(): string {
@@ -188,7 +188,7 @@ function allowedOrigins(port: number, publicOrigin?: string): Map<string, string
   if (publicOrigin) {
     const proxy = new URL(publicOrigin)
     if (proxy.protocol !== 'https:' || proxy.origin !== publicOrigin) {
-      throw new Error('GUARDIAN_PUBLIC_ORIGIN must be a single HTTPS origin.')
+      throw new Error('KOVO_PUBLIC_ORIGIN must be a single HTTPS origin.')
     }
     origins.set(proxy.host, proxy.origin)
   }
@@ -200,7 +200,7 @@ function allowedOrigins(port: number, publicOrigin?: string): Map<string, string
  * cookie or a single-use bootstrap secret that is only available to the owner (terminal URL or a
  * mode-0600 file). The application handler is never invoked for an unauthenticated document.
  */
-export function createGuardianLocalServer(options: LocalSessionOptions): GuardianLocalServer {
+export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalServer {
   const { app, directory, port } = options
   const origins = allowedOrigins(port, options.publicOrigin)
   const pairingTtlMs = options.pairingTtlMs ?? defaultPairingTtlMs
@@ -327,9 +327,9 @@ export function createGuardianLocalServer(options: LocalSessionOptions): Guardia
 
     const session = isSessionAuthorized(req.headers.cookie, token)
     if (!session) {
-      if (req.headers['sec-fetch-site'] === 'cross-site') return reject(res, 403, 'Open Guardian directly.')
+      if (req.headers['sec-fetch-site'] === 'cross-site') return reject(res, 403, 'Open Kovo Hunter directly.')
       if (
-        path.pathname.startsWith('/_guardian/auth/') ||
+        path.pathname.startsWith('/_kovo/auth/') ||
         path.pathname.startsWith('/api/ops/') ||
         receiptExportPathRegex.test(path.pathname)
       ) {
@@ -337,7 +337,7 @@ export function createGuardianLocalServer(options: LocalSessionOptions): Guardia
       }
       return rejectSession(res)
     }
-    if (req.headers['sec-fetch-site'] === 'cross-site') return reject(res, 403, 'Open Guardian directly.')
+    if (req.headers['sec-fetch-site'] === 'cross-site') return reject(res, 403, 'Open Kovo Hunter directly.')
     if (Number(req.headers['content-length'] ?? 0) > maxBody) return reject(res, 413, 'Request body is too large.')
 
     // v7 M4 Production Ops: global < 2s kill-switch control endpoint.
@@ -411,7 +411,7 @@ export function createGuardianLocalServer(options: LocalSessionOptions): Guardia
           now: now(),
         })
         return sendJson(res, 200, bundle, {
-          'content-disposition': `attachment; filename="guardian-receipts-${runId.slice(0, 12)}.json"`,
+          'content-disposition': `attachment; filename="kovo-receipts-${runId.slice(0, 12)}.json"`,
         })
       } catch (err) {
         if (err instanceof TenantIsolationError) {
@@ -426,7 +426,7 @@ export function createGuardianLocalServer(options: LocalSessionOptions): Guardia
     }
 
     // Authenticated local-server session management endpoints (never exposed without an active
-    // guardian_local session cookie + exact matching Origin header).
+    // kovo_local session cookie + exact matching Origin header).
     if (path.pathname === pairingLinkPath) {
       if (method !== 'POST') return reject(res, 405, 'Method not allowed.')
       if (req.headers.origin !== origin) return reject(res, 403, 'Unexpected origin.')
@@ -449,7 +449,7 @@ export function createGuardianLocalServer(options: LocalSessionOptions): Guardia
       return sendJson(res, 200, { rotated: true })
     }
 
-    if (path.pathname.startsWith('/_guardian/auth/')) {
+    if (path.pathname.startsWith('/_kovo/auth/')) {
       return reject(res, 404, 'Not found.')
     }
 
@@ -489,7 +489,7 @@ export function createGuardianLocalServer(options: LocalSessionOptions): Guardia
   const server = createServer((req, res) => {
     void serve(req, res).catch(() => {
       if (res.destroyed) return
-      if (!res.headersSent) reject(res, 500, 'Guardian could not complete the request.')
+      if (!res.headersSent) reject(res, 500, 'Kovo Hunter could not complete the request.')
       else res.end()
     })
   })
@@ -505,7 +505,7 @@ export function createGuardianLocalServer(options: LocalSessionOptions): Guardia
 }
 
 async function main() {
-  const directory = resolve(process.env.GUARDIAN_DATA_DIR ?? '.guardian')
+  const directory = resolve(process.env.KOVO_DATA_DIR ?? '.kovo')
   const port = Number(process.env.PORT ?? 8000)
   const serverEntry = new URL('../build/server/server.js', import.meta.url).href
   const { default: app, initialize } = await import(serverEntry) as {
@@ -515,20 +515,20 @@ async function main() {
 
   initialize()
 
-  const local = createGuardianLocalServer({
+  const local = createKovoLocalServer({
     app,
     directory,
     port,
-    publicOrigin: process.env.GUARDIAN_PUBLIC_ORIGIN || undefined,
+    publicOrigin: process.env.KOVO_PUBLIC_ORIGIN || undefined,
   })
 
-  const origin = process.env.GUARDIAN_PUBLIC_ORIGIN || `http://127.0.0.1:${port}`
+  const origin = process.env.KOVO_PUBLIC_ORIGIN || `http://127.0.0.1:${port}`
   local.server.listen(port, '127.0.0.1', () => {
     const bootstrapFile = join(directory, 'bootstrap-url')
     writeFileSync(bootstrapFile, `${local.bootstrapUrl(`http://127.0.0.1:${port}`)}\n`, { mode: 0o600 })
     chmodSync(bootstrapFile, 0o600)
-    console.log(`Guardian listening on http://127.0.0.1:${port}`)
-    console.log(`Open Guardian with the one-time bootstrap URL: ${local.bootstrapUrl(origin)}`)
+    console.log(`Kovo Hunter listening on http://127.0.0.1:${port}`)
+    console.log(`Open Kovo Hunter with the one-time bootstrap URL: ${local.bootstrapUrl(origin)}`)
   })
 }
 

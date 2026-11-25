@@ -1,6 +1,6 @@
 // Benign-traffic soundness sweep (M2 acceptance): an all-hardened deployment must emit **zero**
 // oracle events for every persona's normal read traffic, the decoy solvers must stay 0/0, and a
-// run-scoped `guardian-qa-` probe record must be gone after cleanup and teardown.
+// run-scoped `kovo-qa-` probe record must be gone after cleanup and teardown.
 //
 // Seeds 1–2 always run. The full 1..30 sweep is opt-in (REASON_SOUNDNESS_SEEDS=1) because it
 // materializes 30 variants per app; it is the M2 soundness gate, not the inner loop.
@@ -193,7 +193,7 @@ interface SoundnessResult {
 
 async function soundnessPass(ctx: AppCase, seed: number): Promise<SoundnessResult> {
   const app = await startHardened(ctx, seed)
-  const tag = `guardian-qa-${seed}-${randomBytes(4).toString('hex')}`
+  const tag = `kovo-qa-${seed}-${randomBytes(4).toString('hex')}`
   const result: SoundnessResult = { events: [], personas: 0, reads: 0, deniedLogins: [] }
   try {
     // 1. every persona attempts a login and reads the common area.

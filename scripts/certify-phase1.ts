@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Guardian v6 Phase-1 certification runner.
+ * Kovo Hunter v6 Phase-1 certification runner.
  *
  * Turns the reviewer's Phase-1 matrix (ROADMAP check-in #4) into one reproducible
  * certificate. It does not grade anything itself: every number comes from the real
@@ -36,13 +36,13 @@
  * Verdicts: PASS only when every criterion passes its stated threshold. Artifacts:
  * `certificate.json` (machine readable) + `certificate.md` (summary). Exit 1 on FAIL.
  *
- * Safety: the salted held-out salt is read only from GUARDIAN_RB_HELDOUT_SALT, is never
+ * Safety: the salted held-out salt is read only from KOVO_RB_HELDOUT_SALT, is never
  * written to any artifact, and every rendered artifact is scanned/redacted before disk.
  * Each cell gets its own out-dir/data-dir; SIGINT/SIGTERM kills the whole child process
  * group and removes per-cell data dirs (0 orphans).
  *
  * Usage:
- *   GUARDIAN_ALLOW_LOCAL_LAB=1 npm run certify:phase1 -- --run \
+ *   KOVO_ALLOW_LOCAL_LAB=1 npm run certify:phase1 -- --run \
  *     --data-dir /home/omarchy/guardian-data --verifier docker --use-newgrp
  *   npm run certify:phase1 -- --from-dir /tmp/v6-floor-post --from-dir /tmp/preserve
  */
@@ -682,7 +682,7 @@ function metaFloorMetrics(meta: Record<string, unknown> | null, card: ScorecardL
 }
 
 function findRunDatabase(dir: string, slug: string): string | null {
-  const direct = join(dir, 'data', slug, 'guardian.sqlite')
+  const direct = join(dir, 'data', slug, 'kovo.sqlite')
   if (existsSync(direct)) return direct
   const dataRoot = join(dir, 'data')
   const matches: string[] = []
@@ -690,15 +690,15 @@ function findRunDatabase(dir: string, slug: string): string | null {
     try {
       for (const entry of readdirSync(dataRoot)) {
         if (entry === slug || entry.startsWith(`${slug}-`)) {
-          const candidate = join(dataRoot, entry, 'guardian.sqlite')
+          const candidate = join(dataRoot, entry, 'kovo.sqlite')
           if (existsSync(candidate)) matches.push(candidate)
         }
       }
     } catch { /* unreadable data dir */ }
   }
   if (matches.length === 1) return matches[0]!
-  // Last resort: exactly one guardian.sqlite under the cell's own directory tree.
-  const found = collectFiles(dir, (path) => basename(path) === 'guardian.sqlite', 3)
+  // Last resort: exactly one kovo.sqlite under the cell's own directory tree.
+  const found = collectFiles(dir, (path) => basename(path) === 'kovo.sqlite', 3)
   return found.length === 1 ? found[0]! : (matches.sort()[0] ?? null)
 }
 
@@ -1121,9 +1121,9 @@ export function ingestFromDirs(dirs: string[], env: NodeJS.ProcessEnv = process.
     }
   }
 
-  const salt = env.GUARDIAN_RB_HELDOUT_SALT ?? ''
+  const salt = env.KOVO_RB_HELDOUT_SALT ?? ''
   if (runs.some(run => run.seedSet === 'held-out') && !salt) {
-    notes.push('held-out cells ingested without GUARDIAN_RB_HELDOUT_SALT (salt not needed to read finished reports)')
+    notes.push('held-out cells ingested without KOVO_RB_HELDOUT_SALT (salt not needed to read finished reports)')
   }
   return { runs, reason, notes, filesScanned: scanned.size }
 }
@@ -1884,13 +1884,13 @@ export function assertSecretFree(text: string, secrets: string[]): void {
 }
 
 function artifactSecrets(env: NodeJS.ProcessEnv): string[] {
-  const salt = env.GUARDIAN_RB_HELDOUT_SALT ?? ''
+  const salt = env.KOVO_RB_HELDOUT_SALT ?? ''
   return salt.length >= 8 ? [salt] : []
 }
 
 export function renderCertificateMarkdown(cert: Certificate): string {
   const lines: string[] = []
-  lines.push('# Guardian v6 Phase-1 certification')
+  lines.push('# Kovo Hunter v6 Phase-1 certification')
   lines.push('')
   lines.push(`**Verdict: ${cert.verdict}**`)
   lines.push('')
@@ -2178,7 +2178,7 @@ async function runCell(cell: RunPlanCell, options: ExecuteOptions): Promise<{ ce
         cwd: resolve(import.meta.dirname, '..'),
         detached: true,
         stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
-        env: { ...process.env, GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_CELL_ID: cell.id },
+        env: { ...process.env, KOVO_ALLOW_LOCAL_LAB: '1', KOVO_CELL_ID: cell.id },
       })
     } catch (error) {
       if (logFd !== null) { try { closeSync(logFd) } catch { /* already closed */ } }
@@ -2221,7 +2221,7 @@ function cleanupContainers(): void {
   const ids: string[] = []
   for (const cell of cleanupCellIds) {
     try {
-      const listed = runDocker(['docker', 'ps', '-aq', '--filter', `label=dev.guardian.cell=${cell}`])
+      const listed = runDocker(['docker', 'ps', '-aq', '--filter', `label=dev.kovo.cell=${cell}`])
       ids.push(...listed.split('\n').map(line => line.trim()).filter(Boolean))
     } catch { /* docker not reachable in this process (newgrp off / no group) */ }
   }
@@ -2310,7 +2310,7 @@ interface CliOptions {
   help: boolean
 }
 
-const usage = `Guardian v6 Phase-1 certification
+const usage = `Kovo Hunter v6 Phase-1 certification
 
 Usage:
   npm run certify:phase1 -- --run [flags]        execute the matrix
@@ -2320,7 +2320,7 @@ Flags:
   --run                     spawn floor + unified + reason harnesses with per-cell dirs
   --dry-run                 print the --run plan as JSON and exit (implies --run)
   --from-dir <dir>          artifact directory to ingest (repeatable)
-  --out-dir <dir>           certificate directory (default .guardian/certify-phase1)
+  --out-dir <dir>           certificate directory (default .kovo/certify-phase1)
   --json <path>             certificate JSON path (default <out-dir>/certificate.json)
   --md <path>               certificate Markdown path (default <out-dir>/certificate.md)
   --apps <all|a,b>          apps for the realism matrix (default all three)
@@ -2332,8 +2332,8 @@ Flags:
   --concurrency <n>         concurrent harness processes (default 3) — cell scheduling only
   --worker-concurrency <n>  in-run worker slots per agentic cell (default: harness default:
                             6 agentic / 1 deterministic). Independent of --concurrency.
-  --data-dir <path>         Guardian data dir with an enabled model profile
-                            (default $GUARDIAN_DATA_DIR); required for --run agentic
+  --data-dir <path>         Kovo Hunter data dir with an enabled model profile
+                            (default $KOVO_DATA_DIR); required for --run agentic
   --verifier <kind>         auto | docker | local-jq (default docker for --run)
   --use-newgrp              wrap harnesses in 'newgrp docker -c' (Docker socket group)
   --budget-usd <n>          per-cell agentic budget (default 5)
@@ -2345,9 +2345,9 @@ Flags:
   --help                    show this help
 
 Environment:
-  GUARDIAN_ALLOW_LOCAL_LAB=1   required by the harnesses (set automatically for children)
-  GUARDIAN_RB_HELDOUT_SALT     required for --run held-out cells; never written to artifacts
-  GUARDIAN_DATA_DIR            default Guardian data dir
+  KOVO_ALLOW_LOCAL_LAB=1   required by the harnesses (set automatically for children)
+  KOVO_RB_HELDOUT_SALT     required for --run held-out cells; never written to artifacts
+  KOVO_DATA_DIR            default Kovo Hunter data dir
 
 Verdict thresholds:
   floor spread <= ${DEFAULT_THRESHOLDS.floorSpreadMax} target; preservation >= ${DEFAULT_THRESHOLDS.preservationMin};
@@ -2415,7 +2415,7 @@ function parseCli(argv: string[], env: NodeJS.ProcessEnv = process.env): CliOpti
   for (const key of Object.keys(a)) if (!known.has(key)) fail(`unknown flag --${key}`)
   if (a.help === true) {
     return {
-      fromDirs: [], run: false, dryRun: false, outDir: resolve('.guardian/certify-phase1'),
+      fromDirs: [], run: false, dryRun: false, outDir: resolve('.kovo/certify-phase1'),
       jsonPath: null, mdPath: null, apps: [...CERTIFY_APPS], devSeed: DEV_SEED, heldoutSeed: HELDOUT_SEED,
       devRuns: 3, floorHeldoutRuns: 1, heldoutRuns: 2, concurrency: 3, workerConcurrency: null, dataDir: null,
       verifier: 'docker', useNewgrp: false, budgetUsd: 5, maxDurationMs: 600_000, reasonRuns: 1,
@@ -2433,12 +2433,12 @@ function parseCli(argv: string[], env: NodeJS.ProcessEnv = process.env): CliOpti
   for (const app of apps) if (!CERTIFY_APPS.includes(app as typeof CERTIFY_APPS[number])) fail(`--apps must be ${CERTIFY_APPS.join(', ')} or all (got '${app}')`)
   const verifier = typeof a.verifier === 'string' ? a.verifier : 'docker'
   if (verifier !== 'auto' && verifier !== 'docker' && verifier !== 'local-jq') fail(`--verifier must be auto, docker or local-jq (got '${verifier}')`)
-  const dataDir = typeof a['data-dir'] === 'string' ? resolve(a['data-dir']) : (env.GUARDIAN_DATA_DIR ? resolve(env.GUARDIAN_DATA_DIR) : null)
+  const dataDir = typeof a['data-dir'] === 'string' ? resolve(a['data-dir']) : (env.KOVO_DATA_DIR ? resolve(env.KOVO_DATA_DIR) : null)
   return {
     fromDirs: fromDirs.map(dir => resolve(dir)),
     run,
     dryRun,
-    outDir: resolve(typeof a['out-dir'] === 'string' ? a['out-dir'] : '.guardian/certify-phase1'),
+    outDir: resolve(typeof a['out-dir'] === 'string' ? a['out-dir'] : '.kovo/certify-phase1'),
     jsonPath: typeof a.json === 'string' ? resolve(a.json) : null,
     mdPath: typeof a.md === 'string' ? resolve(a.md) : null,
     apps,
@@ -2516,9 +2516,9 @@ async function main(): Promise<void> {
         process.stdout.write(`${JSON.stringify({ cells: plan, concurrency: cli.concurrency, workerConcurrency: cli.workerConcurrency }, null, 2)}\n`)
         return
       }
-      const salt = process.env.GUARDIAN_RB_HELDOUT_SALT ?? ''
-      if (salt.length < 16) fail('--run requires GUARDIAN_RB_HELDOUT_SALT (>= 16 chars); the value is never written')
-      if (!cli.dataDir) fail('--run agentic cells need --data-dir (or GUARDIAN_DATA_DIR) with an enabled model profile')
+      const salt = process.env.KOVO_RB_HELDOUT_SALT ?? ''
+      if (salt.length < 16) fail('--run requires KOVO_RB_HELDOUT_SALT (>= 16 chars); the value is never written')
+      if (!cli.dataDir) fail('--run agentic cells need --data-dir (or KOVO_DATA_DIR) with an enabled model profile')
       for (const sub of ['floor', 'unified', 'reason']) {
         if (existsSync(join(cli.outDir, sub))) {
           fail(`--run refuses to mix with existing matrix artifacts at ${join(cli.outDir, sub)}; use a fresh --out-dir`)

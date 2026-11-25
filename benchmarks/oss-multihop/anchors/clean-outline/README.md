@@ -37,4 +37,4 @@ APP_IMAGE=outlinewiki/outline APP_TAG=0.80.1 \
 - **Expected Silence Pattern:** `audit_event=unauthorized_export.*oss_canary_clean_outline_[a-z0-9_-]+` (must NOT trigger)
 - **Hard 0-FP Requirement (`maxAllowedFindings: 0`):**
   - Clean patched build (`v0.80.1`, commit `8888888888888888888888888888888888888801`) has no paired vulnerable target (`patchBrokeHopId` is not applicable).
-  - `assertOutlineZeroFalsePositives()` delegates to `evaluateOracleEvidence()` and `gradeCleanControl()`. Any Guardian receipt targeting `oss-clean-outline-02` OR any unexpected log oracle trigger (`observed: true`) fails both `cleanControlGatePassed` and `precisionGatePassed`.
+  - `assertOutlineZeroFalsePositives()` delegates to `evaluateOracleEvidence()` and `gradeCleanControl()`. Any Kovo Hunter receipt targeting `oss-clean-outline-02` OR any unexpected log oracle trigger (`observed: true`) fails both `cleanControlGatePassed` and `precisionGatePassed`.

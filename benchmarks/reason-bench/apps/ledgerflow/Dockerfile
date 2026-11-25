@@ -5,7 +5,7 @@ FROM node:24-slim
 WORKDIR /app
 COPY benchmarks/reason-bench /app/benchmarks/reason-bench
 
-ENV GUARDIAN_ALLOW_LOCAL_LAB=1 \
+ENV KOVO_ALLOW_LOCAL_LAB=1 \
     NODE_ENV=production \
     NODE_OPTIONS=--no-warnings
 

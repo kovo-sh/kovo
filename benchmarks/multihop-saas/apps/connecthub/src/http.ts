@@ -59,7 +59,7 @@ export function bearer(req: IncomingMessage): string {
 }
 
 export function runIdOf(req: IncomingMessage, fallback: string): string {
-  return header(req, 'x-guardian-run-id') || fallback
+  return header(req, 'x-kovo-run-id') || fallback
 }
 
 /** Case-insensitive header presence check, independent of the node lowercasing rules. */

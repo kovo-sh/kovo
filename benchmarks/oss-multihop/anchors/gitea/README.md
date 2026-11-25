@@ -41,7 +41,7 @@ APP_IMAGE=gitea/gitea APP_TAG=1.22.6 \
 - **Oracle ID:** `ora-gitea-oob-01` (`loopback_oob_collector`)
 - **Target Service:** `internal_runner_meta`
 - **Collector Endpoint:** `http://127.0.0.1:19401/oob/gitea` (strictly loopback)
-- **Signal Criteria:** `POST` request with path prefix `/oob/gitea/`, run-scoped canary token prefixed with `oss_canary_gitea_`, correlated via `X-Guardian-Run-Id`.
+- **Signal Criteria:** `POST` request with path prefix `/oob/gitea/`, run-scoped canary token prefixed with `oss_canary_gitea_`, correlated via `X-Kovo-Run-Id`.
 - **Evaluator:** `evaluateGiteaOracle()` and `evaluatePairedBuilds()` delegate to `evaluateOracleEvidence()` in `../../lib/oracle-runner.ts`.
 
 ---

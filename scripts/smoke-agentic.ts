@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Guardian v7 — three-tier smoke battery.
+// Kovo Hunter v7 — three-tier smoke battery.
 //
 // Tier 0 (<90 s, $0): worker gate + deterministic replay of past false-positive
 // archetypes through the shared Oracle invariants.
@@ -29,8 +29,8 @@ import { start as startZeroVulnTrap } from '../benchmarks/realism-suite/traps/ze
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, '..')
 const CORPUS_PATH = join(ROOT, 'benchmarks/realism-suite/traps/fp-archetypes.json')
-const DEFAULT_DATA_DIR = process.env.GUARDIAN_DATA_DIR ?? '/home/omarchy/guardian-data'
-const DEFAULT_OUT = join(ROOT, '.guardian/smoke-battery')
+const DEFAULT_DATA_DIR = process.env.KOVO_DATA_DIR ?? '/home/omarchy/guardian-data'
+const DEFAULT_OUT = join(ROOT, '.kovo/smoke-battery')
 
 export const SMOKE_VERSION = 1
 export const LIFT_APPS = ['acme-saas'] as const
@@ -193,7 +193,7 @@ export interface SmokeArgs {
   help: boolean
 }
 
-const usage = `Guardian smoke battery (three tiers, defensive QA)
+const usage = `Kovo Hunter smoke battery (three tiers, defensive QA)
 
 Usage:
   npm run smoke:agentic -- [flags]
@@ -234,8 +234,8 @@ Flags:
   --micro-recon-timeout-sec <n>
                             bounded cold fallback for monorepo-whitebox when no
                             resumable post-recon snapshot exists (default 420)
-  --out-dir <path>          artifacts (default .guardian/smoke-battery)
-  --data-dir <path>         Guardian data dir (default $GUARDIAN_DATA_DIR or
+  --out-dir <path>          artifacts (default .kovo/smoke-battery)
+  --data-dir <path>         Kovo Hunter data dir (default $KOVO_DATA_DIR or
                             /home/omarchy/guardian-data)
   --snapshot-root <path>    post-floor checkpoints (default <out-dir>/snapshots)
   --floor-scorecard <path>  baseline floor scorecard used for net-new/preservation
@@ -261,9 +261,9 @@ Gates (Tier 1):
   >= 12 completed assignments in the 300 s lift cell; <= $0.80/cell.
 
 Environment:
-  GUARDIAN_ALLOW_LOCAL_LAB=1   required for the loopback trap/fixtures
-  GUARDIAN_DATA_DIR            model profile source (isolated per cell)
-  GUARDIAN_RB_HELDOUT_SALT     required only for the Tier 2 held-out command
+  KOVO_ALLOW_LOCAL_LAB=1   required for the loopback trap/fixtures
+  KOVO_DATA_DIR            model profile source (isolated per cell)
+  KOVO_RB_HELDOUT_SALT     required only for the Tier 2 held-out command
   Docker socket                agentic cells run under newgrp docker when needed
 
 Examples:
@@ -742,7 +742,7 @@ export function preservedSiteIds(card: ScorecardLike | null, baselineIds: string
 }
 
 /**
- * Read active `runtime_confirmed` finding IDs from a `guardian.sqlite` DB (snapshot or resumed).
+ * Read active `runtime_confirmed` finding IDs from a `kovo.sqlite` DB (snapshot or resumed).
  * Used to attribute `claimed_without_impact` rows on `--resume-snapshot` scorecards strictly to
  * findings that were already `runtime_confirmed` at snapshot capture — never to unverified
  * post-resume claims.
@@ -769,9 +769,9 @@ export interface CellAccountingInput {
   card: ScorecardLike | null
   baseline: ScorecardLike | null
   liftBaseline: number
-  /** Finding IDs already `runtime_confirmed` inside the resumed snapshot's `guardian.sqlite`. */
+  /** Finding IDs already `runtime_confirmed` inside the resumed snapshot's `kovo.sqlite`. */
   snapshotFindingIds?: ReadonlySet<string>
-  /** Finding IDs currently `runtime_confirmed` inside the resumed run's `guardian.sqlite`. */
+  /** Finding IDs currently `runtime_confirmed` inside the resumed run's `kovo.sqlite`. */
   resumedFindingIds?: ReadonlySet<string>
 }
 
@@ -788,11 +788,11 @@ export interface CellAccounting {
  * Pure accounting for lift/rotation cells (both cold and `--resume-snapshot`).
  *
  * On `--resume-snapshot`, the target app's oracle starts empty so preserved floor findings in
- * `guardian.sqlite` match their planted `card.vulns` sites with `outcome: 'claimed_without_impact'`
+ * `kovo.sqlite` match their planted `card.vulns` sites with `outcome: 'claimed_without_impact'`
  * and `matchedFindingIds` populated, while only post-resume findings earn `outcome: 'confirmed'`.
  * Preserved floor sites are identified strictly by:
  *   1. explicit baseline scorecard `vulns` (`baselineIds`), OR
- *   2. exact finding IDs that were already `runtime_confirmed` in `<snapshot>/guardian.sqlite`
+ *   2. exact finding IDs that were already `runtime_confirmed` in `<snapshot>/kovo.sqlite`
  *      and still match a planted vuln site in `card.vulns` (or still exist in `resumedFindingIds`
  *      when `card.vulns` is omitted).
  *
@@ -1209,9 +1209,9 @@ function realisticArgs(plan: CellPlan, opts: SmokeArgs): string[] {
 function baseEnv(opts: SmokeArgs): NodeJS.ProcessEnv {
   return {
     ...process.env,
-    GUARDIAN_ALLOW_LOCAL_LAB: '1',
-    GUARDIAN_DATA_DIR: opts.dataDir,
-    GUARDIAN_RECON_SIBLINGS: '1',
+    KOVO_ALLOW_LOCAL_LAB: '1',
+    KOVO_DATA_DIR: opts.dataDir,
+    KOVO_RECON_SIBLINGS: '1',
   }
 }
 
@@ -1269,7 +1269,7 @@ async function runRealisticCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMe
       mkdirSync(dirname(baselineDest), { recursive: true, mode: 0o700 })
       const capturedSnapDir = plan.snapshot ? (bestSnapshotDir(plan.snapshot) ?? plan.snapshot) : null
       const capturedSnapIds = capturedSnapDir
-        ? runtimeConfirmedFindingIds(join(capturedSnapDir, 'guardian.sqlite'))
+        ? runtimeConfirmedFindingIds(join(capturedSnapDir, 'kovo.sqlite'))
         : new Set<string>()
       const floorVulns = capturedSnapIds.size > 0
         ? (card?.vulns ?? [])
@@ -1284,13 +1284,13 @@ async function runRealisticCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMe
     }
   }
   const dbPath = plan.source === 'snapshot'
-    ? join(plan.outDir, 'data', `${plan.app}-seed${opts.seed}-grey-box-resume`, 'guardian.sqlite')
-    : join(dataDir, 'guardian.sqlite')
+    ? join(plan.outDir, 'data', `${plan.app}-seed${opts.seed}-grey-box-resume`, 'kovo.sqlite')
+    : join(dataDir, 'kovo.sqlite')
   const snapshotDbDir = plan.source === 'snapshot' && plan.snapshot
     ? (bestSnapshotDir(plan.snapshot) ?? plan.snapshot)
     : null
   const snapshotFindingIds = snapshotDbDir
-    ? runtimeConfirmedFindingIds(join(snapshotDbDir, 'guardian.sqlite'))
+    ? runtimeConfirmedFindingIds(join(snapshotDbDir, 'kovo.sqlite'))
     : undefined
   const resumedFindingIds = plan.source === 'snapshot' && existsSync(dbPath)
     ? runtimeConfirmedFindingIds(dbPath)
@@ -1401,7 +1401,7 @@ async function runTrapCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetrics
       docker: true,
       killAfterMs: opts.trapDurationSec * 1000 + 60_000,
     })
-    const dbPath = join(dataDir, 'guardian.sqlite')
+    const dbPath = join(dataDir, 'kovo.sqlite')
     const counts = confirmedVulnerabilityCounts(dbPath)
     const state = latestRunState(dbPath)
     const log = readLog(logPath)
@@ -1573,7 +1573,7 @@ async function runMicroCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetric
       artifact,
       wallMs: result.wallMs,
       timedOut: result.timedOut,
-      db: join(dataDir, `${fixture}-${slice.mode}`, 'guardian.sqlite'),
+      db: join(dataDir, `${fixture}-${slice.mode}`, 'kovo.sqlite'),
       log: readLog(logPath),
     }
   }))
@@ -1796,26 +1796,26 @@ async function runTierOne(opts: SmokeArgs, report: SmokeReport): Promise<void> {
 export function tierTwoCommand(): string[] {
   return [
     '# Full matrix (all 3 apps, dev seed 1, 15 min/cell, 3 cells in parallel):',
-    'GUARDIAN_ALLOW_LOCAL_LAB=1 GUARDIAN_DATA_DIR=/home/omarchy/guardian-data \\',
+    'KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR=/home/omarchy/guardian-data \\',
     '  newgrp docker -c \'npm run benchmark:realistic -- --app all --seed 1 --mode grey-box \\',
     '    --max-duration-ms 900000 --budget-usd 5 --concurrency 3 --worker-concurrency 6 \\',
-    '    --isolate-data-dir --out-dir .guardian/smoke-battery/tier2-dev\'',
+    '    --isolate-data-dir --out-dir .kovo/smoke-battery/tier2-dev\'',
     '',
     '# Salted held-out (never commit the salt; seeds >= 1,000,000):',
-    'GUARDIAN_ALLOW_LOCAL_LAB=1 GUARDIAN_RB_HELDOUT_SALT=... \\',
+    'KOVO_ALLOW_LOCAL_LAB=1 KOVO_RB_HELDOUT_SALT=... \\',
     '  newgrp docker -c \'npm run benchmark:realistic -- --app all --seeds 1000001,1000002 \\',
     '    --held-out --mode grey-box --max-duration-ms 900000 --concurrency 3 \\',
-    '    --isolate-data-dir --out-dir .guardian/smoke-battery/tier2-heldout\'',
+    '    --isolate-data-dir --out-dir .kovo/smoke-battery/tier2-heldout\'',
     '',
     '# Endurance (45 min, one app, floor+agent split budgets):',
-    'GUARDIAN_ALLOW_LOCAL_LAB=1 GUARDIAN_DATA_DIR=/home/omarchy/guardian-data \\',
+    'KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR=/home/omarchy/guardian-data \\',
     '  newgrp docker -c \'npm run benchmark:realistic -- --app acme-saas --seed 1 \\',
-    '    --max-duration-ms 2700000 --budget-usd 10 --out-dir .guardian/smoke-battery/tier2-endurance\'',
+    '    --max-duration-ms 2700000 --budget-usd 10 --out-dir .kovo/smoke-battery/tier2-endurance\'',
     '',
     '# Realism exit gate (all fixtures, wiring + capability):',
-    'GUARDIAN_ALLOW_LOCAL_LAB=1 GUARDIAN_DATA_DIR=/home/omarchy/guardian-data \\',
+    'KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR=/home/omarchy/guardian-data \\',
     '  newgrp docker -c \'npm run benchmark:realism -- --fixture all --verifier docker \\',
-    '    --max-duration-ms 600000 --out-dir .guardian/smoke-battery/tier2-realism\'',
+    '    --max-duration-ms 600000 --out-dir .kovo/smoke-battery/tier2-realism\'',
   ]
 }
 
@@ -1908,7 +1908,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     process.stdout.write(usage)
     return 0
   }
-  if (!opts.dryRun) process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  if (!opts.dryRun) process.env.KOVO_ALLOW_LOCAL_LAB = '1'
   mkdirSync(opts.outDir, { recursive: true, mode: 0o700 })
   const mode = opts.dryRun ? 'dry-run' : 'run'
   const report = emptyReport(opts, mode)

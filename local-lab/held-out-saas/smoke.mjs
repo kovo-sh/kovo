@@ -8,15 +8,15 @@ import { startHeldOutSaasServer, loadHeldOutSaasManifest, heldOutSaasPatchIds } 
 const manifest = loadHeldOutSaasManifest()
 const mk = id => manifest.challenges.find(c => c.id === id)?.flagMarker
 
-// ---- loopback canary listener (stand-in for Guardian's CanaryBroker) --------------------------------------------
+// ---- loopback canary listener (stand-in for Kovo Hunter's CanaryBroker) --------------------------------------------
 const hits = []
 const canary = createServer((req, res) => {
   hits.push(req.url)
-  res.writeHead(200, { 'content-type': 'text/plain' }).end('guardian-canary-ok')
+  res.writeHead(200, { 'content-type': 'text/plain' }).end('kovo-canary-ok')
 })
 await new Promise(r => canary.listen(0, '127.0.0.1', r))
 const canaryBase = `http://127.0.0.1:${canary.address().port}`
-const canaryUrl = tag => `${canaryBase}/c/guardian-canary-${tag}${Math.random().toString(16).slice(2, 14).padEnd(12, '0')}`
+const canaryUrl = tag => `${canaryBase}/c/kovo-canary-${tag}${Math.random().toString(16).slice(2, 14).padEnd(12, '0')}`
 const hitCount = () => hits.length
 
 const b64 = o => Buffer.from(JSON.stringify(o)).toString('base64url')

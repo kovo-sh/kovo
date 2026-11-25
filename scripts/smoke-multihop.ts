@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Guardian v8 — Multi-Hop Smoke Battery (Tier 0 + Tier 1).
+// Kovo Hunter v8 — Multi-Hop Smoke Battery (Tier 0 + Tier 1).
 //
 // Tier 0 (< 90 s, $0):
 //   Runs `scripts/worker-gate.sh` + v8 unit/chaos test suites
@@ -24,8 +24,8 @@ import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, '..')
-const DEFAULT_DATA_DIR = process.env.GUARDIAN_DATA_DIR ?? '/home/omarchy/guardian-data'
-const DEFAULT_OUT_DIR = join(ROOT, '.guardian/smoke-multihop')
+const DEFAULT_DATA_DIR = process.env.KOVO_DATA_DIR ?? '/home/omarchy/guardian-data'
+const DEFAULT_OUT_DIR = join(ROOT, '.kovo/smoke-multihop')
 
 export const SMOKE_MULTIHOP_VERSION = 1
 export const DEV_ARCHETYPES = ['paygrid', 'shipforge', 'nexusiam'] as const
@@ -193,7 +193,7 @@ export interface V8SmokeGateReportInput {
 // CLI
 // ---------------------------------------------------------------------------
 
-const USAGE = `Guardian v8 — Multi-Hop Smoke Battery (defensive QA)
+const USAGE = `Kovo Hunter v8 — Multi-Hop Smoke Battery (defensive QA)
 
 Usage:
   node scripts/smoke-multihop.ts [flags]
@@ -222,8 +222,8 @@ Flags:
   --budget-usd-per-cell <n>        USD cap per Tier-1 cell (default 2.0)
   --max-duration-ms <n>            Wall-clock cap per Tier-1 cell in ms (default 600000)
   --dry-run                        Plan cells & print report; starts ZERO external processes
-  --out-dir <path>                 Artifact directory (default .guardian/smoke-multihop)
-  --data-dir <path>                Guardian model profile source dir (default $GUARDIAN_DATA_DIR)
+  --out-dir <path>                 Artifact directory (default .kovo/smoke-multihop)
+  --data-dir <path>                Kovo Hunter model profile source dir (default $KOVO_DATA_DIR)
   --baseline <path>                Optional baseline JSON report for hop-funnel non-regression
   --seed <n>                       Deterministic dev seed (default 1)
   --cell-index <n>                 Explicit rotation index (default UTC day-of-year)
@@ -1082,8 +1082,8 @@ async function runTierOneCell(plan: V8CellPlan, opts: V8SmokeArgs): Promise<V8Ce
   const logPath = join(plan.outDir, 'run.log')
   const env: NodeJS.ProcessEnv = {
     ...process.env,
-    GUARDIAN_ALLOW_LOCAL_LAB: '1',
-    GUARDIAN_DATA_DIR: opts.dataDir,
+    KOVO_ALLOW_LOCAL_LAB: '1',
+    KOVO_DATA_DIR: opts.dataDir,
   }
   const outcome = await spawnLogged({
     command: plan.command,
@@ -1096,7 +1096,7 @@ async function runTierOneCell(plan: V8CellPlan, opts: V8SmokeArgs): Promise<V8Ce
   })
 
   const scorecard = findCellScorecard(plan, opts.seed)
-  const dbPath = join(plan.outDir, 'data', 'guardian.sqlite')
+  const dbPath = join(plan.outDir, 'data', 'kovo.sqlite')
   const dbSummary = readDbSummary(dbPath)
   const logText = existsSync(logPath) ? readFileSync(logPath, 'utf8') : ''
 
@@ -1232,7 +1232,7 @@ export function renderV8CompactTable(cells: readonly V8CellMetrics[]): string {
 
 export function renderV8MarkdownSummary(report: V8SmokeReport): string {
   const lines: string[] = [
-    `# Guardian v8 Multi-Hop Smoke Battery (${report.executionMode})`,
+    `# Kovo Hunter v8 Multi-Hop Smoke Battery (${report.executionMode})`,
     '',
     `- **Git SHA:** \`${report.gitSha}\``,
     `- **Tier:** \`${report.args.tier}\` | **Archetype:** \`${report.args.resolvedArchetype}\` (selector: \`${report.args.archetype}\`) | **Mode:** \`${report.args.mode}\``,
@@ -1383,7 +1383,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return 0
   }
 
-  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  process.env.KOVO_ALLOW_LOCAL_LAB = '1'
   mkdirSync(opts.outDir, { recursive: true, mode: 0o700 })
 
   await runTierZero(opts, report)

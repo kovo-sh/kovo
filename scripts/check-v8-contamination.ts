@@ -214,7 +214,7 @@ export function formatContaminationReport(result: ContaminationScanResult): stri
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
 
-const usage = `Guardian v8 Anti-Contamination CI Lint (plans/v8.md §Anti-Goodhart)
+const usage = `Kovo Hunter v8 Anti-Contamination CI Lint (plans/v8.md §Anti-Goodhart)
 
 Usage:
   node scripts/check-v8-contamination.ts [--root <dir>] [--json] [--help]

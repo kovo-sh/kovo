@@ -1,6 +1,6 @@
 // Live paygrid loopback suites: vulnerable 4/4, hardened silence, partial-twin silence, leak scan,
 // lifecycle hooks, run tagging and configurable async latency.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -152,7 +152,7 @@ test('materialized white-box tree is leakage-scan clean; briefings expose mode-s
   }
 })
 
-test('renewable lifecycle hooks, X-Guardian-Run-Id tagging and fast-lab async latency', async () => {
+test('renewable lifecycle hooks, X-Kovo-Run-Id tagging and fast-lab async latency', async () => {
   const lab = await startPaygrid({ seed: 9, mode: 'vulnerable', asyncLatencyMs: 40 })
   try {
     const ctx = createSolverContext(lab)
@@ -197,8 +197,8 @@ test('renewable lifecycle hooks, X-Guardian-Run-Id tagging and fast-lab async la
 })
 
 test('salted held-out seeds run through the same lab', async () => {
-  const previous = process.env.GUARDIAN_RB_HELDOUT_SALT
-  process.env.GUARDIAN_RB_HELDOUT_SALT = 'unit-test-held-out-salt'
+  const previous = process.env.KOVO_RB_HELDOUT_SALT
+  process.env.KOVO_RB_HELDOUT_SALT = 'unit-test-held-out-salt'
   const lab = await startPaygrid({ seed: 1_000_042, mode: 'vulnerable', asyncLatencyMs: 5 })
   try {
     assert.equal(lab.seedSet, 'held-out')
@@ -207,8 +207,8 @@ test('salted held-out seeds run through the same lab', async () => {
     assert.equal(gradeLab(lab, findings).gate.pass, true)
   } finally {
     await lab.stop()
-    if (previous === undefined) delete process.env.GUARDIAN_RB_HELDOUT_SALT
-    else process.env.GUARDIAN_RB_HELDOUT_SALT = previous
+    if (previous === undefined) delete process.env.KOVO_RB_HELDOUT_SALT
+    else process.env.KOVO_RB_HELDOUT_SALT = previous
   }
 })
 

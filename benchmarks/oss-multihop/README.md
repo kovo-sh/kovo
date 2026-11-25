@@ -1,6 +1,6 @@
 # `oss-multihop` — Real-World OSS / CVE Multi-Hop Anchor Corpus
 
-`benchmarks/oss-multihop/` defines the declarative anchor specifications, safety validators, external impact oracle evaluators, and two-side grading engine for Guardian v8's Real-World OSS Multi-Hop Anchor Corpus (see [`plans/v8.md`](../../plans/v8.md) §"Real-World OSS / CVE Multi-Hop Anchor Corpus", §M2, and §M4).
+`benchmarks/oss-multihop/` defines the declarative anchor specifications, safety validators, external impact oracle evaluators, and two-side grading engine for Kovo Hunter v8's Real-World OSS Multi-Hop Anchor Corpus (see [`plans/v8.md`](../../plans/v8.md) §"Real-World OSS / CVE Multi-Hop Anchor Corpus", §M2, and §M4).
 
 Binding specification: [`CONTRACTS.md`](./CONTRACTS.md).
 
@@ -19,7 +19,7 @@ Binding specification: [`CONTRACTS.md`](./CONTRACTS.md).
 ## Safety & Isolation Guarantees
 
 1. **Zero npm dependencies:** Pure Node 24+ native TypeScript (`node:*` built-ins only), `erasableSyntaxOnly: true`.
-2. **Local-Lab Gate:** Lab selftests require `GUARDIAN_ALLOW_LOCAL_LAB=1`.
+2. **Local-Lab Gate:** Lab selftests require `KOVO_ALLOW_LOCAL_LAB=1`.
 3. **Strict `--internal` Docker lab networks:** Every Compose network MUST set `internal: true` (`egressPolicy: "deny_all_internal_only"`). Host networking (`network_mode: host`), `privileged: true`, and dangerous Linux capabilities (`NET_ADMIN`, `SYS_ADMIN`, etc.) are rejected by the manifest validator.
 4. **Loopback-only port publication:** Host port bindings are allowed only on entry `app` or `lab_proxy` services and MUST bind `127.0.0.1:<port>:<containerPort>` (default `127.0.0.1:0:<containerPort>`). Internal targets, databases, caches, and async workers may never publish host ports.
 5. **Pinned vulnerable & patched commits:** Every anchor pins both `vulnerableBuild` and `patchedBuild` with non-floating version tags, 40-hex commit SHAs, and `sha256:<64-hex>` OCI image digests.
@@ -48,11 +48,11 @@ node benchmarks/oss-multihop/run.ts grade \
   --md /path/to/scorecard.md
 
 # Run the offline self-test suite (no Docker required)
-GUARDIAN_ALLOW_LOCAL_LAB=1 node benchmarks/oss-multihop/run.ts selftest
+KOVO_ALLOW_LOCAL_LAB=1 node benchmarks/oss-multihop/run.ts selftest
 
 # Typecheck & run unit/safety tests
 node_modules/.bin/tsc -p benchmarks/oss-multihop/tsconfig.json
-GUARDIAN_ALLOW_LOCAL_LAB=1 node --test benchmarks/oss-multihop/tests/
+KOVO_ALLOW_LOCAL_LAB=1 node --test benchmarks/oss-multihop/tests/
 ```
 
 ---

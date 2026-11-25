@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Guardian v4 held-out modern SaaS lab (20 planted vulns + 6 hard decoys). Pure Node.js stdlib, synthetic data only.",
+  "description": "Kovo Hunter v4 held-out modern SaaS lab (20 planted vulns + 6 hard decoys). Pure Node.js stdlib, synthetic data only.",
   "engines": { "node": ">=24" },
   "scripts": {
     "start": "node server.mjs",

@@ -2,6 +2,6 @@
 FROM node:24-slim
 WORKDIR /lab
 COPY benchmarks/reason-bench /lab/benchmarks/reason-bench
-ENV GUARDIAN_ALLOW_LOCAL_LAB=1
+ENV KOVO_ALLOW_LOCAL_LAB=1
 WORKDIR /lab/benchmarks/reason-bench
 CMD ["node", "run.ts", "serve", "--app", "forgecloud", "--seed", "1", "--out-dir", "/tmp/forgecloud-out"]
