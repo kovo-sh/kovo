@@ -189,9 +189,50 @@ export interface AsyncAwaitResult {
   pollRecordId: string; converged: boolean; status: 'converged' | 'timeout' | 'aborted' | 'max_attempts' | 'monotonic_violation'
   exchangeId: string | null; exchange: HttpExchange | null; evidence: Record<string, unknown>
 }
+export type HopSurface = 'http' | 'graphql' | 'ws' | 'sse' | 'browser' | 'webhook' | 'async_job' | 'idp' | 'cdn' | 'storage'
+export type ReplayMode = 'fresh_clean_replay' | 'one_shot_transcript'
+export type OracleFamily = 'dual_tenant_abac' | 'temporal_revocation' | 'economic_conservation' | 'cryptographic_scope_replay' | 'parser_cache_differential' | 'cross_surface_pivot'
+
+export interface ProofReceiptInput {
+  vulnClass: string
+  target: { origin: string; method?: string; pathAndQuery?: string; param?: string }
+  exchangeIds?: string[]; oobEventIds?: string[]; browserTraceIds?: string[]; claimedDelta: string
+  oracleEvents?: string[]; requiredRole?: 'viewer' | 'member' | 'admin' | 'owner'; resourceTenant?: string
+  expectControlDenied?: boolean; proofPatterns?: string[]; injectedAtMs?: number
+  conservedBalance?: { balanceField?: string; capField?: string; unitDebit?: number }
+}
+
+export interface HopTargetObject { origin: string; method?: string; pathAndQuery?: string; param?: string }
+export type HopTargetInput = string | HopTargetObject
+
+export interface HopReceiptInput {
+  hopId: string; surface?: HopSurface; target: HopTargetInput; method?: string
+  exchangeIds?: string[]; oobEventIds?: string[]; browserTraceIds?: string[]; claimedDelta: string
+  producedCapabilities?: string[]; consumedCapabilities?: string[]
+  entityId?: string; canaryToken?: string; proofReceipt?: ProofReceiptInput
+}
+
+export type CausalEdgeInput =
+  | ({ kind: 'value_binding'; fromHopId: string; toHopId: string; sourceExchangeId?: string; targetExchangeId?: string }
+    & ({ capabilityHandle: string; valueDigest?: string } | { capabilityHandle?: string; valueDigest: string }))
+  | { kind: 'derived_crypto_binding'; fromHopId: string; toHopId: string; sourceCapabilityId: string; derivedCapabilityId?: string; alg?: string }
+  | { kind: 'state_transition_binding'; fromHopId: string; toHopId: string; entityId: string; ablationExchangeIds: string[]; mutationKind?: string }
+  | { kind: 'async_pivot_binding'; fromHopId: string; toHopId: string; correlationId: string; channel: 'poll_convergence' | 'oob_relay' | 'browser_trace' | 'async_job'; oobEventId?: string; browserTraceId?: string; pollRecordId?: string }
+
+export interface TerminalImpactInput {
+  terminalHopId: string; claimedImpact?: string; summary?: string; terminalExchangeId?: string
+  proofReceipt?: ProofReceiptInput; oracleFamily?: OracleFamily; oracleInput?: Record<string, unknown>
+  preChainControlExchangeIds?: string[]; postChainReadbackExchangeIds?: string[]; modeAFailureExchangeId?: string
+}
+
+export interface CompositeProofReceiptInput {
+  chainId: string; terminalVulnClass: string; hops: HopReceiptInput[]; causalEdges?: CausalEdgeInput[]
+  terminalImpact: TerminalImpactInput; replayMode?: ReplayMode; benchmarkMode?: boolean
+}
+
 export interface CompositeVerificationResult {
   confirmed: boolean; ok?: boolean; verified?: boolean; verificationId?: string; chainId: string; terminalVulnClass: string
-  replayMode: 'fresh_clean_replay' | 'one_shot_transcript'; modeBVerified: boolean; hopCount: number
+  replayMode: ReplayMode; modeBVerified: boolean; hopCount: number
   verifiedEdges: Array<Record<string, unknown>>; reason: string; failedStage?: string; rejectedBy?: string | null
   missingEvidence?: string[]; claim?: CompositeReceiptClaim; terminalVerification?: Record<string, unknown>; evidence?: Record<string, unknown>
 }
@@ -200,7 +241,13 @@ export interface OobHandle { exchangeId: string; token: string; url: string; dns
 export interface OobCheck extends OobHandle { hit: boolean; checkExchangeId?: string; hits: Array<{ protocol: string; token: string; remoteIp?: string; timestamp?: number }> }
 
 export interface HttpOptions {
-  as?: string; persona?: string; session?: string; role?: 'setup' | 'control' | 'probe' | 'cleanup'; arm?: 'setup' | 'control' | 'probe' | 'cleanup'
+  as?: string; persona?: string; session?: string
+  /**
+   * HTTP session group role (`'setup' | 'control' | 'probe' | 'cleanup'`).
+   * Distinct from `ProofRole` values (such as `'control_denied'` or `'mutation'`) and persona handles.
+   */
+  role?: 'setup' | 'control' | 'probe' | 'cleanup'
+  arm?: 'setup' | 'control' | 'probe' | 'cleanup'
   method?: string; headers?: Record<string, string>; body?: string | Record<string, unknown> | unknown[]
   followRedirects?: boolean; timeoutMs?: number; capability?: string | CapabilityInjectionSpec
   capabilityTarget?: 'bearer' | 'header' | 'cookie' | 'url'; capabilityHeaderName?: string; capabilityCookieName?: string
@@ -361,6 +408,43 @@ function normalizeAsyncPredicate(raw: AsyncMatchPredicate | undefined, expectSta
   const pred: AsyncMatchPredicate = raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...raw } : {}
   if (expectStatus !== undefined && pred.status === undefined) pred.status = expectStatus
   return Object.keys(pred).length > 0 ? pred : undefined
+}
+
+function normalizeHopTarget(rawTarget: unknown, hopMethod: unknown, defaultOrigin: string | undefined): unknown {
+  const fallbackMethod = typeof hopMethod === 'string' && hopMethod.trim() ? hopMethod.trim().toUpperCase() : undefined
+  if (typeof rawTarget === 'string') {
+    const trimmed = rawTarget.trim()
+    if (!trimmed) return rawTarget
+    const prefixed = /^([A-Za-z]{1,10})\s+(.+)$/.exec(trimmed)
+    const method = prefixed ? prefixed[1]!.toUpperCase() : fallbackMethod
+    const split = splitTarget(prefixed ? prefixed[2]!.trim() : trimmed, defaultOrigin)
+    const origin = split.origin ?? defaultOrigin
+    return { ...(origin ? { origin } : {}), ...(method ? { method } : {}), pathAndQuery: split.path }
+  }
+  if (!rawTarget || typeof rawTarget !== 'object' || Array.isArray(rawTarget)) return rawTarget
+  const t = rawTarget as Record<string, unknown>
+  const rawOrigin = typeof t.origin === 'string' && t.origin.trim() ? t.origin.trim() : undefined
+  const rawMethod = typeof t.method === 'string' && t.method.trim() ? t.method.trim().toUpperCase() : fallbackMethod
+  const rawPath = typeof t.pathAndQuery === 'string' && t.pathAndQuery.trim() ? t.pathAndQuery : undefined
+  const split = rawPath !== undefined ? splitTarget(rawPath, rawOrigin ?? defaultOrigin) : undefined
+  const origin = rawOrigin ?? split?.origin ?? defaultOrigin
+  const param = typeof t.param === 'string' && t.param.trim() ? t.param.trim() : undefined
+  return { ...(origin ? { origin } : {}), ...(rawMethod ? { method: rawMethod } : {}), ...(split ? { pathAndQuery: split.path } : {}), ...(param ? { param } : {}) }
+}
+
+function normalizeCompositeReceipt(receipt: unknown, defaultOrigin: string | undefined): Record<string, unknown> {
+  const raw = receipt && typeof receipt === 'object' && !Array.isArray(receipt) && 'receipt' in receipt
+    ? (receipt as Record<string, unknown>).receipt
+    : receipt
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { receipt: raw }
+  const rec = raw as Record<string, unknown>
+  if (!Array.isArray(rec.hops)) return { receipt: rec }
+  const hops = rec.hops.map(h => {
+    if (!h || typeof h !== 'object' || Array.isArray(h)) return h
+    const { method, target, ...rest } = h as Record<string, unknown>
+    return { ...rest, target: normalizeHopTarget(target, method, defaultOrigin) }
+  })
+  return { receipt: { ...rec, hops } }
 }
 
 export class VerifyContext {
@@ -566,9 +650,9 @@ export class VerifyContext {
 
   awaitAsync(input: AsyncAwaitInput | Record<string, unknown>): Promise<AsyncAwaitResult> { return this.await_async(input) }
 
-  async prove_composite(receipt: Record<string, unknown>): Promise<CompositeVerificationResult> {
-    const payload = receipt && typeof receipt === 'object' && 'receipt' in receipt ? receipt : { receipt }
-    const res = await rpc('composite.verify', payload as Record<string, unknown>, 30_000) as CompositeVerificationResult
+  async prove_composite(receipt: CompositeProofReceiptInput): Promise<CompositeVerificationResult> {
+    const payload = normalizeCompositeReceipt(receipt, this.defaultOrigin)
+    const res = await rpc('composite.verify', payload, 30_000) as CompositeVerificationResult
     const confirmed = res.confirmed === true || res.ok === true || res.verified === true
     if (res.claim) {
       if (confirmed) { this._lastFailedCompositeClaim = null; this.claims.push(res.claim) }
@@ -577,7 +661,7 @@ export class VerifyContext {
     return { ...res, confirmed, ok: confirmed, verified: confirmed }
   }
 
-  proveComposite(receipt: Record<string, unknown>): Promise<CompositeVerificationResult> { return this.prove_composite(receipt) }
+  proveComposite(receipt: CompositeProofReceiptInput): Promise<CompositeVerificationResult> { return this.prove_composite(receipt) }
 
   effectiveClaims(): VerifyClaim[] {
     if (this.claims.length > 0) return [...this.claims]
