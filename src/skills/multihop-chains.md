@@ -200,8 +200,8 @@ await ctx.prove_composite({
     postChainReadbackExchangeIds: [after.exchangeId],
     oracleInput: {
       equation: 'balance_minting',
-      balancesBefore: { acct: base.json?.balance ?? 0 },
-      balancesAfter: { acct: after.json?.balance ?? 0 },
+      balancesBefore: { acct: (base.json as { balance?: number } | null | undefined)?.balance ?? 0 },
+      balancesAfter: { acct: (after.json as { balance?: number } | null | undefined)?.balance ?? 0 },
       authorizedDeposits: 0,
       baselineReadbackExchangeId: base.exchangeId,
       finalReadbackExchangeId: after.exchangeId,

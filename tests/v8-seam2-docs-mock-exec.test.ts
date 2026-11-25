@@ -365,20 +365,11 @@ test('Part A.3: Every TS code fence in multihop-chains.md and agent-prompts.ts c
     const syntactic = diags.filter(d => d.category === 'syntactic')
     assert.equal(syntactic.length, 0, `${snippet.id} has TS syntax errors: ${JSON.stringify(syntactic)}`)
 
-    // Note: HttpExchange.json is typed `unknown` in worker/kovo_verify/kovo_verify.ts:140,
-    // which triggers TS2339 on `base.json?.balance` / `after.json?.balance` in multihop-chains.md:201-202.
-    // Every other semantic diagnostic (invalid ctx.* call, wrong argument type, bad enum literal,
-    // unknown identifier, etc.) MUST fail immediately.
-    const unexpectedSemantic = diags.filter(d => !(
-      d.category === 'semantic'
-      && d.code === 2339
-      && /Property 'balance' does not exist on type '\{\}'/.test(d.message)
-      && snippet.id.startsWith('multihop-chains.md#')
-    ))
+    const semantic = diags.filter(d => d.category === 'semantic')
     assert.equal(
-      unexpectedSemantic.length,
+      semantic.length,
       0,
-      `${snippet.id} has unexpected TS semantic diagnostics: ${JSON.stringify(unexpectedSemantic)}`,
+      `${snippet.id} has TS semantic diagnostics: ${JSON.stringify(semantic)}`,
     )
   }
 
@@ -950,13 +941,15 @@ test('Part B.2: Live Mock-LLM Execution wall-clock rotation creates <= 2 KB v8.h
     broker: new RequestBroker({ rejectUnauthorized: false }),
     backend: new LocalRpcTestBackend(),
     deterministicSweep: false,
-    assignmentWallClockOverrideMs: 220,
+    // Give Turn 1 (`record_fact`) sufficient headroom under parallel test-suite CPU load
+    // before Turn 2 hangs and triggers bounded wall-clock rotation.
+    assignmentWallClockOverrideMs: 800,
   })
 
   await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     engine.start()
     engine.wake()
-    const deadline = Date.now() + 5_000
+    const deadline = Date.now() + 10_000
     while (Date.now() < deadline) {
       const steps = storage.listChainSteps(runId, run.goalRevision)
       const cont = steps.find(s => s.dependsOnStepIds.includes(progressStep.id) && extractContinuationDepth(s) === 1)
