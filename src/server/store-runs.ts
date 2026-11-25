@@ -120,6 +120,16 @@ import {
   type ThreatModel,
 } from './store-session.ts'
 
+function deriveDefaultEnvironmentMode(
+  projectEnvironment: 'public' | 'local-lab' | string,
+  capabilityTier: CapabilityTier,
+  approvalPolicy?: ApprovalPolicy,
+): EnvironmentMode {
+  if (projectEnvironment === 'local-lab') return 'ephemeral_lab'
+  if (capabilityTier >= 3 || approvalPolicy === 'yolo') return 'staging_isolated'
+  return defaultEnvironmentMode(projectEnvironment)
+}
+
 export class RunsRepository {
   private readonly session: DbSession
   private readonly projects: ProjectsRepository
@@ -285,6 +295,16 @@ export class RunsRepository {
     return new Set(run.candidates.filter(candidate => approved.has(candidate.id)).map(candidate => candidate.origin))
   }
 
+  /** True when the operator explicitly locked `environmentMode` via `setEnvironmentMode()`. */
+  private hasExplicitEnvironmentMode(runId: string): boolean {
+    const row = this.session.db.select({ id: tables.events.id }).from(tables.events).where(and(
+      eq(tables.events.workspaceId, this.session.workspace.id),
+      eq(tables.events.runId, runId),
+      eq(tables.events.kind, 'scope.environment_mode'),
+    )).limit(1).get()
+    return Boolean(row)
+  }
+
   /**
    * v6 three-tier scope for a run. `targetOrigins` remains the legacy approved-candidate allowlist
    * (so every pre-v6 database upgrades without data loss); `authOrigins`/`assetOrigins` are
@@ -293,7 +313,11 @@ export class RunsRepository {
   scopePolicy(runOrId: Run | string): ScopePolicy {
     const run = typeof runOrId === 'string' ? this.run(runOrId) : runOrId
     return {
-      mode: run.environmentMode ?? defaultEnvironmentMode(this.projects.project(run.projectId).environment),
+      mode: run.environmentMode ?? deriveDefaultEnvironmentMode(
+        this.projects.project(run.projectId).environment,
+        run.capabilityTier,
+        run.approvalPolicy,
+      ),
       targetOrigins: [...this.approvedOriginsFor(run)],
       authOrigins: [...(run.authOrigins ?? [])],
       assetOrigins: [...(run.assetOrigins ?? [])],
@@ -1303,7 +1327,7 @@ export class RunsRepository {
     if (!origin) throw new Error('Approval lease origin is malformed.')
     const method = input.method.trim().toUpperCase()
     if (!method) throw new Error('Approval lease method is required.')
-    const routePattern = routePatternForPath(input.pathAndQuery)
+    const routePattern = normalizeApprovalPathPattern(input.pathAndQuery)
     const now = Date.now()
     const row = this.session.db.insert(tables.approvalLeases).values({
       id: randomUUID(),
@@ -1389,12 +1413,16 @@ export class RunsRepository {
     } catch {
       return false
     }
-    const routePattern = routePatternForPath(pathAndQuery)
+    const normalizedPattern = normalizeApprovalPathPattern(pathAndQuery)
+    const legacyRoutePattern = routePatternForPath(pathAndQuery)
+    const routePatterns = normalizedPattern === legacyRoutePattern
+      ? [normalizedPattern]
+      : [normalizedPattern, legacyRoutePattern]
     const row = this.session.db.select().from(tables.approvalLeases).where(and(
       eq(tables.approvalLeases.runId, runId),
       eq(tables.approvalLeases.origin, normalized),
       eq(tables.approvalLeases.method, method.trim().toUpperCase()),
-      eq(tables.approvalLeases.routePattern, routePattern),
+      inArray(tables.approvalLeases.routePattern, routePatterns),
       eq(tables.approvalLeases.status, 'active'),
       eq(tables.approvalLeases.scopeRevision, run.scopeRevision),
     )).get()
@@ -1500,7 +1528,16 @@ export class RunsRepository {
       throw new Error('Cannot change approval policy after a run has ended.')
     }
     const previous = run.approvalPolicy ?? 'auto_review'
-    this.updateRun(run.id, { approvalPolicy })
+    const project = this.projects.project(run.projectId)
+    const derivedEnvironmentMode = !this.hasExplicitEnvironmentMode(run.id)
+      ? deriveDefaultEnvironmentMode(project.environment, run.capabilityTier, approvalPolicy)
+      : undefined
+    this.updateRun(run.id, {
+      approvalPolicy,
+      ...(derivedEnvironmentMode !== undefined && derivedEnvironmentMode !== run.environmentMode
+        ? { environmentMode: derivedEnvironmentMode }
+        : {}),
+    })
     let autoApprovedCount = 0
     if (approvalPolicy === 'yolo') {
       const now = Date.now()
@@ -1693,6 +1730,7 @@ export class RunsRepository {
       const approvedPersonaIds = capabilityTier >= 2
         ? [...new Set((input.approvedPersonaIds ?? []).filter(pid => validPersonaIds.has(pid)))]
         : []
+      const approvalPolicy: ApprovalPolicy = input.approvalPolicy ?? 'auto_review'
       const defaultReqs = project.environment === 'local-lab' ? defaultLabBudgetRequests : defaultPublicBudgetRequests
       const run = this.session.db.insert(tables.runs).values({
         id: randomUUID(),
@@ -1707,7 +1745,7 @@ export class RunsRepository {
         status: 'waiting',
         sourceMode: input.sourceMode,
         capabilityTier,
-        approvalPolicy: input.approvalPolicy ?? 'auto_review',
+        approvalPolicy,
         approvedEndpointPatterns: [],
         approvedPersonaIds,
         roundNo: 0,
@@ -1727,7 +1765,7 @@ export class RunsRepository {
         approved: [],
         authOrigins: [],
         assetOrigins: [],
-        environmentMode: defaultEnvironmentMode(project.environment),
+        environmentMode: deriveDefaultEnvironmentMode(project.environment, capabilityTier, approvalPolicy),
         routeDenylist: [],
         createdAt: Date.now(),
       }).returning().get()
@@ -2129,6 +2167,12 @@ export class RunsRepository {
       }
     }
 
+    const nextApprovalPolicy = cmd.approvalPolicy ?? run.approvalPolicy ?? 'auto_review'
+    const derivedEnvironmentMode = !this.hasExplicitEnvironmentMode(run.id) &&
+      (cmd.capabilityTier !== undefined || cmd.approvalPolicy !== undefined)
+      ? deriveDefaultEnvironmentMode(project.environment, capabilityTier, nextApprovalPolicy)
+      : undefined
+
     const updated = this.updateRun(run.id, {
       approved,
       scopeRevision,
@@ -2138,6 +2182,7 @@ export class RunsRepository {
       capabilityTier,
       approvedPersonaIds,
       ...(cmd.approvalPolicy !== undefined ? { approvalPolicy: cmd.approvalPolicy } : {}),
+      ...(derivedEnvironmentMode !== undefined ? { environmentMode: derivedEnvironmentMode } : {}),
       ...(cmd.budgetUsd !== undefined ? { budgetUsd: cmd.budgetUsd } : {}),
       ...(cmd.budgetRequests !== undefined ? { budgetRequests: cmd.budgetRequests } : {}),
       ...(cmd.maxRpsPerOrigin !== undefined ? { maxRpsPerOrigin: cmd.maxRpsPerOrigin } : {}),

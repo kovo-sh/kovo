@@ -11,7 +11,7 @@ import { useRun } from '../data.tsx'
 import type { Command } from '../data.tsx'
 import { useDecisions } from '../decisions.tsx'
 import { Kbd } from '../display.tsx'
-import { cap, fmtN, fmtUsd, host, plural, words } from '../format.ts'
+import { fmtN, fmtUsd, host, plural, words } from '../format.ts'
 import { StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
@@ -106,7 +106,9 @@ function ScopeCard({ editing, draft, setDraft, footer, inDialog = false }: {
       ? <select className={selectClass} value={draft.approvalPolicy} onChange={e => setDraft(d => ({ ...d, approvalPolicy: e.target.value as ApprovalPolicy }))} aria-label="Approval policy">
         {approvalPolicies.map(p => <option key={p} value={p}>{approvalPolicyMeta[p].label}</option>)}
       </select>
-      : <>{draft.capabilityTier === 3 ? approvalPolicyMeta[draft.approvalPolicy].label : cap(draft.approvalPolicy)}</>],
+      : draft.capabilityTier === 3
+        ? <span title={approvalPolicyMeta[draft.approvalPolicy].summary}>{approvalPolicyMeta[draft.approvalPolicy].label}</span>
+        : <span className="font-normal text-fg-subtle" title="Approval policy only applies to Active Testing (Tier 3)">Not needed (read-only)</span>],
     ['Rate limit', canEditConfig
       ? <input className={cn(RW.fieldInput, 'num mt-[3px] h-[26px] w-[74px]')} type="number" min={1} max={maxRpsPerOriginCeiling} step={1} value={draft.maxRpsPerOrigin} aria-label="Requests per second per origin" onChange={e => setDraft(d => ({ ...d, maxRpsPerOrigin: Number(e.target.value) }))} />
       : <>{draft.maxRpsPerOrigin} req/s per origin</>],
@@ -120,7 +122,11 @@ function ScopeCard({ editing, draft, setDraft, footer, inDialog = false }: {
       {inDialog
         ? <DialogTitle className="text-[13px] font-medium text-fg">Proposed scope</DialogTitle>
         : <span>Proposed scope</span>}
-      <span className="num font-normal text-fg-subtle">{discovery ? plural(hosts.length, 'host') + ' from project seeds' : `${selected.size} of ${plural(hosts.length, 'discovered host')}`}</span>
+      <span className="num font-normal text-fg-subtle">
+        {discovery
+          ? plural(hosts.length, 'host') + ' from project seeds'
+          : `${selected.size} of ${plural(hosts.length, 'discovered host')} selected`}
+      </span>
       {editing && !discovery && <span className="ml-auto flex gap-1">
         <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={() => setDraft(d => ({ ...d, assetIds: hosts.filter(h => !h.thirdParty).slice(0, maxScopeHosts).map(h => h.id) }))}>First-party</button>
         <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={() => setDraft(d => ({ ...d, assetIds: [] }))}>Clear</button>
@@ -176,6 +182,11 @@ function ScopeCard({ editing, draft, setDraft, footer, inDialog = false }: {
       : <div className="grid max-h-[224px] grid-cols-3 overflow-auto p-2 font-mono text-[12px]">
         {shownHosts.map(h => <span key={h.id} className="truncate px-2 py-[3px] text-fg-muted" title={`${h.origin} · ${h.source}`}>{host(h.origin)}</span>)}
         {!shownHosts.length && <span className="px-2 py-[3px] text-fg-subtle">No hosts selected.</span>}
+        {!discovery && hosts.length > shownHosts.length && (
+          <span className="col-span-3 px-2 pt-1 font-sans text-[11.5px] text-fg-subtle">
+            {plural(hosts.length - shownHosts.length, 'discovered host')} unchecked by default (e.g. third-party or subdomains). Click Edit scope to review all {hosts.length}.
+          </span>
+        )}
       </div>}
     {editing && discovery && <div className="flex flex-col gap-2 border-t border-line px-4 pb-3 pt-2.5">
       <span className="text-[12px] text-fg-subtle">
@@ -202,15 +213,32 @@ export function ConsentView() {
   const r = detail.run
   const { discovery, hosts, defaults } = useScopeModel()
   const [editing, setEditing] = useState(false)
+  const syncKey = `${r.id}:${r.phase}:${r.scopeRevision}:${defaults.join(',')}`
+  const [syncedKey, setSyncedKey] = useState(syncKey)
   const [draft, setDraftState] = useState<Draft>(() => initialDraft(r, defaults))
   const setDraft = (fn: (d: Draft) => Draft) => setDraftState(fn)
   const ck = consentKey(r)
   const decision = q.get(ck)
   const scoped = Boolean(decision)
+  if (syncedKey !== syncKey && !editing && !scoped) {
+    setSyncedKey(syncKey)
+    setDraftState(initialDraft(r, defaults))
+  }
   const nw = (r.goal || '').split(/\s+/).filter(Boolean).length
   const count = discovery ? hosts.length : draft.assetIds.length
   const overLimit = draft.assetIds.length > maxScopeHosts
   const canApprove = q.canAct(ck, 'scope') && (discovery || (count > 0 && !overLimit))
+  const footerNote = overLimit
+    ? `Choose up to ${maxScopeHosts} hosts.`
+    : !discovery && count === 0
+      ? 'Select at least one host to start the assessment.'
+      : draft.capabilityTier === 3
+        ? draft.approvalPolicy === 'yolo'
+          ? 'Active checks run autonomously in scope; hard safety guardrails stay enforced.'
+          : draft.approvalPolicy === 'strict'
+            ? 'Every state-changing request will pause for your explicit approval.'
+            : 'Safe checks auto-approve; deletes, uploads, and execution proofs ask first.'
+        : `Approving authorizes a scoped defensive assessment (${capabilityTierMeta[draft.capabilityTier].short}).`
 
   const approve = () => {
     if (!canApprove) return
@@ -235,7 +263,9 @@ export function ConsentView() {
         Nothing has been sent <em className="not-italic text-fg-subtle">yet.</em>
       </div>
       <p className="m-0 mb-[22px] max-w-[560px] text-[13.5px] leading-[21px] text-fg-muted">
-        The coordinator received the goal “{r.goal}” and is holding until you approve the {discovery ? 'discovery' : 'scope'} below. No request leaves Kovo Hunter before that.
+        {discovery
+          ? `The coordinator received the goal “${r.goal}” and is holding until you approve discovery below. No request leaves Kovo Hunter before that.`
+          : `Subdomain discovery found ${plural(hosts.length, 'candidate host')} for “${r.goal}”. Confirm the target hosts, mode, and approval policy below before testing begins.`}
       </p>
       {nw < 6 && <div className="mb-[18px] flex items-start gap-2.5 rounded-lg bg-warn-soft px-3 py-2.5 text-[12.5px] leading-[19px] text-fg-muted shadow-[inset_0_0_0_1px_var(--warn-line)]">
         <Icon name="alert" className="mt-[3px] flex-none text-warn" />
@@ -248,7 +278,7 @@ export function ConsentView() {
         footer={
           <div className={RW.sheetF}>
             <span className="mr-auto text-[12px] text-fg-subtle">
-              {overLimit ? `Choose up to ${maxScopeHosts} hosts.` : draft.capabilityTier === 3 ? 'State-changing requests will still ask before sending.' : `Approving authorizes a scoped defensive assessment (${capabilityTierMeta[draft.capabilityTier].short}).`}
+              {footerNote}
             </span>
             {scoped
               ? decision!.state !== 'sent' && <button type="button" className={runBtn()} onClick={() => q.reopen(ck)}><Icon name="undo" />Undo</button>
