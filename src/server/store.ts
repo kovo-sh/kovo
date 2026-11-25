@@ -7,7 +7,6 @@ import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { and, asc, desc, eq, gt, inArray, or, sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/node-sqlite'
-import { migrate } from 'drizzle-orm/node-sqlite/migrator'
 import type { z } from 'zod'
 import type { importAccessPolicy } from '../access-policy.ts'
 import {
@@ -947,8 +946,7 @@ export class Store {
       },
     }) as DatabaseSync
     this.db = drizzle({ client: this.client })
-    const result = migrate(this.db, { migrationsFolder: resolve('drizzle') })
-    if (result && 'exitCode' in result) throw new Error('Guardian database migration failed.')
+    this.initCoreSchema()
     this.initV3Schema()
     this.initV4Schema()
     this.initV5Schema()
@@ -979,55 +977,503 @@ export class Store {
     this.recover()
   }
 
-  private initV3Schema() {
-    const existingColumns = (table: string): Set<string> => {
-      const rows = this.client.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
-      return new Set(rows.map(r => r.name))
-    }
-    const ensureColumn = (table: string, column: string, definition: string) => {
-      if (!existingColumns(table).has(column)) {
-        this.client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`)
-      }
-    }
+  private existingColumns(table: string): Set<string> {
+    const rows = this.client.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+    return new Set(rows.map(r => r.name))
+  }
 
+  private ensureColumn(table: string, column: string, definition: string): boolean {
+    if (!this.existingColumns(table).has(column)) {
+      this.client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`)
+      return true
+    }
+    return false
+  }
+
+  /**
+   * Canonical SQLite DDL for all 25 core tables, matching `src/server/schema.ts` 1:1 with
+   * `ON DELETE CASCADE` on every child foreign key referencing `projects(id)`, `runs(id)`,
+   * `assignments(id)`, and `replay_specs(id)`. Uses `CREATE TABLE IF NOT EXISTS` so existing
+   * pre-cascade databases open losslessly and are upgraded additively by `initV3..V8Schema`.
+   */
+  private initCoreSchema() {
+    this.client.exec(`
+      CREATE TABLE IF NOT EXISTS workspaces (
+        id TEXT PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS model_profiles (
+        id TEXT PRIMARY KEY NOT NULL,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+        name TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        model TEXT NOT NULL,
+        protocol TEXT NOT NULL,
+        credential_id TEXT NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 100,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        context_window INTEGER NOT NULL DEFAULT 1048576,
+        max_tokens INTEGER NOT NULL DEFAULT 16384,
+        thinking_level TEXT NOT NULL DEFAULT 'medium',
+        role_affinity TEXT NOT NULL DEFAULT 'any',
+        input_cost_per_mtok REAL NOT NULL DEFAULT 0.15,
+        cached_input_cost_per_mtok REAL NOT NULL DEFAULT 0.003,
+        output_cost_per_mtok REAL NOT NULL DEFAULT 0.6,
+        health_state TEXT NOT NULL DEFAULT 'closed',
+        cooldown_until INTEGER,
+        last_error TEXT,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS model_profiles_workspace ON model_profiles (workspace_id, priority);
+
+      CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY NOT NULL,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+        tenant_id TEXT NOT NULL DEFAULT 'default',
+        name TEXT NOT NULL,
+        environment TEXT NOT NULL DEFAULT 'public',
+        seeds TEXT NOT NULL,
+        default_scope TEXT NOT NULL,
+        lab_config TEXT,
+        sandbox_write_allowlist TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS project_assets (
+        id TEXT PRIMARY KEY NOT NULL,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        origin TEXT NOT NULL,
+        source TEXT NOT NULL,
+        third_party INTEGER NOT NULL,
+        include_subdomains INTEGER NOT NULL DEFAULT 0,
+        prepared TEXT,
+        dns_source TEXT,
+        access_policy TEXT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS project_assets_origin ON project_assets (project_id, origin);
+
+      CREATE TABLE IF NOT EXISTS project_specs (
+        id TEXT PRIMARY KEY NOT NULL,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        origin TEXT,
+        content TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS project_specs_project ON project_specs (project_id);
+
+      CREATE TABLE IF NOT EXISTS personas (
+        id TEXT PRIMARY KEY NOT NULL,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+        handle TEXT NOT NULL,
+        role_label TEXT NOT NULL,
+        origin_allowlist TEXT NOT NULL,
+        auth_kind TEXT NOT NULL,
+        header_name TEXT,
+        login_config TEXT,
+        credential_id TEXT NOT NULL,
+        canary_markers TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS personas_project_handle ON personas (project_id, handle);
+
+      CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY NOT NULL,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+        tenant_id TEXT NOT NULL DEFAULT 'default',
+        original_goal TEXT NOT NULL,
+        goal TEXT NOT NULL,
+        goal_revision INTEGER NOT NULL,
+        scope_revision INTEGER NOT NULL,
+        coordinator_id TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        status TEXT NOT NULL,
+        source_mode TEXT NOT NULL DEFAULT 'public',
+        capability_tier INTEGER NOT NULL DEFAULT 1,
+        approval_policy TEXT NOT NULL DEFAULT 'auto_review',
+        approved_endpoint_patterns TEXT NOT NULL DEFAULT '[]',
+        approved_persona_ids TEXT NOT NULL,
+        round_no INTEGER NOT NULL DEFAULT 0,
+        budget_usd REAL NOT NULL DEFAULT 25,
+        budget_requests INTEGER NOT NULL DEFAULT 0,
+        spent_usd REAL NOT NULL DEFAULT 0,
+        spent_tokens INTEGER NOT NULL DEFAULT 0,
+        spent_requests INTEGER NOT NULL DEFAULT 0,
+        turns_used INTEGER NOT NULL DEFAULT 0,
+        max_rps_per_origin INTEGER NOT NULL DEFAULT 5,
+        worker_concurrency INTEGER NOT NULL DEFAULT 6,
+        worker_max_turns INTEGER NOT NULL DEFAULT 150,
+        dynamic_step_budget INTEGER,
+        multi_trial_enabled INTEGER NOT NULL DEFAULT 1,
+        phase0_completed_at INTEGER,
+        review_plan TEXT,
+        candidates TEXT NOT NULL,
+        approved TEXT NOT NULL,
+        auth_origins TEXT NOT NULL DEFAULT '[]',
+        asset_origins TEXT NOT NULL DEFAULT '[]',
+        environment_mode TEXT NOT NULL DEFAULT 'prod_readonly',
+        route_denylist TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS runs_project ON runs (project_id);
+
+      CREATE TABLE IF NOT EXISTS threat_models (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        scope_revision INTEGER NOT NULL,
+        goal_revision INTEGER NOT NULL,
+        entries TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS threat_models_run ON threat_models (run_id);
+
+      CREATE TABLE IF NOT EXISTS chain_steps (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        goal_revision INTEGER NOT NULL,
+        scope_revision INTEGER NOT NULL,
+        seq INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        hypothesis TEXT NOT NULL,
+        category TEXT NOT NULL DEFAULT 'misconfig-exposure',
+        priority INTEGER NOT NULL DEFAULT 50,
+        target_asset_ids TEXT NOT NULL,
+        skills TEXT NOT NULL,
+        depends_on_fact_ids TEXT NOT NULL,
+        depends_on_step_ids TEXT NOT NULL,
+        status TEXT NOT NULL,
+        assigned_worker_id TEXT,
+        specialist_profile TEXT,
+        trial_group_id TEXT,
+        trial_index INTEGER NOT NULL DEFAULT 0,
+        source_origins TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS chain_steps_run ON chain_steps (run_id, status);
+
+      CREATE TABLE IF NOT EXISTS assignments (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        asset_id TEXT,
+        step_id TEXT,
+        input_assignment_id TEXT,
+        phase TEXT NOT NULL,
+        status TEXT NOT NULL,
+        scope_revision INTEGER NOT NULL,
+        goal_revision INTEGER NOT NULL,
+        session_id TEXT NOT NULL,
+        lease TEXT,
+        lease_expires_at INTEGER,
+        approval_parked_at INTEGER,
+        attempt INTEGER NOT NULL DEFAULT 0,
+        max_turns INTEGER NOT NULL DEFAULT 150,
+        turns_used INTEGER NOT NULL DEFAULT 0,
+        requests_used INTEGER NOT NULL DEFAULT 0,
+        parent_fact_ids TEXT NOT NULL,
+        source_origins TEXT NOT NULL,
+        title TEXT NOT NULL,
+        objective TEXT NOT NULL,
+        outcome TEXT,
+        checks TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS assignments_run ON assignments (run_id);
+
+      CREATE TABLE IF NOT EXISTS facts (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+        scope_revision INTEGER NOT NULL,
+        goal_revision INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        data TEXT NOT NULL,
+        source_origins TEXT NOT NULL,
+        evidence_ids TEXT NOT NULL,
+        exchange_ids TEXT NOT NULL,
+        tainted INTEGER NOT NULL DEFAULT 0,
+        cold_since_round INTEGER,
+        digest_id TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS facts_run ON facts (run_id, tainted);
+
+      CREATE TABLE IF NOT EXISTS graph_edges (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        from_kind TEXT NOT NULL,
+        from_id TEXT NOT NULL,
+        to_kind TEXT NOT NULL,
+        to_id TEXT NOT NULL,
+        edge_kind TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS graph_edges_run ON graph_edges (run_id, from_id);
+      CREATE INDEX IF NOT EXISTS graph_edges_to ON graph_edges (run_id, to_id);
+
+      CREATE TABLE IF NOT EXISTS graph_digests (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        round_no INTEGER NOT NULL,
+        level TEXT NOT NULL,
+        signature_hash TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        covered_fact_ids TEXT NOT NULL,
+        covered_assignment_ids TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS graph_digests_run ON graph_digests (run_id, active);
+
+      CREATE TABLE IF NOT EXISTS broker_exchanges (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+        scope_revision INTEGER NOT NULL,
+        origin TEXT NOT NULL,
+        final_origin TEXT NOT NULL,
+        redirect_origins TEXT NOT NULL,
+        method TEXT NOT NULL,
+        path_and_query TEXT NOT NULL,
+        persona_handle TEXT,
+        status INTEGER NOT NULL,
+        media_type TEXT NOT NULL,
+        req_headers TEXT NOT NULL,
+        resp_headers TEXT NOT NULL,
+        body_preview TEXT NOT NULL,
+        body_artifact_id TEXT,
+        body_sha256 TEXT NOT NULL,
+        secret_matches TEXT NOT NULL DEFAULT '[]',
+        duration_ms INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS broker_exchanges_run ON broker_exchanges (run_id, origin);
+
+      CREATE TABLE IF NOT EXISTS approval_requests (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+        scope_revision INTEGER NOT NULL,
+        origin TEXT NOT NULL,
+        method TEXT NOT NULL,
+        path_and_query TEXT NOT NULL,
+        persona_handle TEXT,
+        rationale TEXT NOT NULL,
+        request_preview TEXT NOT NULL,
+        status TEXT NOT NULL,
+        decided_by TEXT,
+        decided_at INTEGER,
+        policy_note TEXT,
+        risk_level TEXT,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS approval_requests_run ON approval_requests (run_id, status);
+
+      CREATE TABLE IF NOT EXISTS replay_specs (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        finding_id TEXT NOT NULL,
+        assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+        scope_revision INTEGER NOT NULL,
+        goal_revision INTEGER NOT NULL,
+        spec TEXT NOT NULL,
+        spec_sha256 TEXT NOT NULL,
+        source_origins TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 1,
+        verified_inline INTEGER NOT NULL DEFAULT 0,
+        last_verification_diff TEXT,
+        proof_kind TEXT,
+        proof_verdict TEXT,
+        proof_runtime TEXT,
+        proof_script_sha256 TEXT,
+        proof_artifact_id TEXT,
+        proof_receipt TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS replay_specs_run ON replay_specs (run_id);
+
+      CREATE TABLE IF NOT EXISTS retest_runs (
+        id TEXT PRIMARY KEY NOT NULL,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        finding_id TEXT NOT NULL,
+        replay_spec_id TEXT NOT NULL REFERENCES replay_specs(id) ON DELETE CASCADE,
+        scope_revision INTEGER NOT NULL,
+        verdict TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        evidence_ids TEXT NOT NULL,
+        exchange_ids TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS retest_runs_finding ON retest_runs (finding_id);
+
+      CREATE TABLE IF NOT EXISTS coverage_entries (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        scope_revision INTEGER NOT NULL,
+        goal_revision INTEGER NOT NULL,
+        origin TEXT NOT NULL,
+        category TEXT NOT NULL,
+        status TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        enforcing_control TEXT,
+        proof_gap_reason TEXT,
+        linked_finding_id TEXT,
+        assignment_id TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS coverage_origin_cat ON coverage_entries (run_id, goal_revision, origin, category);
+
+      CREATE TABLE IF NOT EXISTS canaries (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        assignment_id TEXT NOT NULL,
+        token TEXT NOT NULL UNIQUE,
+        purpose TEXT NOT NULL,
+        protocol TEXT NOT NULL DEFAULT 'http',
+        dns_host TEXT,
+        hit_count INTEGER NOT NULL DEFAULT 0,
+        triggered INTEGER NOT NULL DEFAULT 0,
+        trigger_detail TEXT,
+        created_at INTEGER NOT NULL,
+        triggered_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS canaries_run ON canaries (run_id);
+
+      CREATE TABLE IF NOT EXISTS evidence (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+        scope_revision INTEGER NOT NULL,
+        goal_revision INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        operation_id TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS evidence_run ON evidence (run_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS evidence_operation ON evidence (assignment_id, operation_id);
+
+      CREATE TABLE IF NOT EXISTS findings (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        asset_id TEXT NOT NULL,
+        goal_revision INTEGER NOT NULL,
+        check_id TEXT NOT NULL DEFAULT 'hsts',
+        case_id TEXT NOT NULL DEFAULT '',
+        finding_kind TEXT NOT NULL DEFAULT 'baseline_check',
+        replay_spec_id TEXT,
+        provenance TEXT NOT NULL DEFAULT 'agent_only' CHECK (provenance IN ('floor', 'agent_only', 'chain_from_floor')),
+        parent_finding_ids TEXT,
+        verification_class TEXT NOT NULL DEFAULT 'runtime_confirmed'
+          CHECK (verification_class IN ('runtime_confirmed', 'pending_oob', 'static_advisory', 'open_proof_gap', 'dismissed'))
+          CHECK (json_extract(finding, '$.status') <> 'confirmed' OR verification_class = 'runtime_confirmed')
+          CHECK (json_extract(finding, '$.status') <> 'confirmed' OR verification_tier IS NULL OR verification_tier <> 'static_verified'),
+        source_origins TEXT NOT NULL,
+        verification_tier TEXT,
+        fingerprint_hash TEXT,
+        superseded_by_finding_id TEXT,
+        counterevidence TEXT,
+        confidence_rationale TEXT,
+        severity_change_conditions TEXT,
+        code_locations TEXT,
+        finding TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS findings_run ON findings (run_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS findings_check_case ON findings (run_id, asset_id, goal_revision, check_id, case_id);
+
+      CREATE TABLE IF NOT EXISTS reports (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        version INTEGER NOT NULL,
+        partial INTEGER NOT NULL,
+        body TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS report_version ON reports (run_id, version);
+
+      CREATE TABLE IF NOT EXISTS messages (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        thread_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        reply_to TEXT,
+        evidence_ids TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS thread_messages ON messages (run_id, thread_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS run_replies ON messages (run_id, reply_to);
+
+      CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+        run_id TEXT REFERENCES runs(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        message TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS events_run ON events (run_id, id);
+
+      CREATE TABLE IF NOT EXISTS operations (
+        id TEXT PRIMARY KEY NOT NULL,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+        fingerprint TEXT NOT NULL,
+        result TEXT NOT NULL
+      );
+    `)
+  }
+
+  private initV3Schema() {
     // model_profiles v3 columns
-    ensureColumn('model_profiles', 'cached_input_cost_per_mtok', 'REAL NOT NULL DEFAULT 0.003')
+    this.ensureColumn('model_profiles', 'cached_input_cost_per_mtok', 'REAL NOT NULL DEFAULT 0.003')
 
     // projects v3 columns
-    ensureColumn('projects', 'lab_config', 'TEXT')
+    this.ensureColumn('projects', 'lab_config', 'TEXT')
 
     // personas v3 columns
-    ensureColumn('personas', 'login_config', 'TEXT')
+    this.ensureColumn('personas', 'login_config', 'TEXT')
 
     // runs v3 Tier 3 approval policy columns
-    ensureColumn('runs', 'approval_policy', "TEXT NOT NULL DEFAULT 'auto_review'")
-    ensureColumn('runs', 'approved_endpoint_patterns', "TEXT NOT NULL DEFAULT '[]'")
+    this.ensureColumn('runs', 'approval_policy', "TEXT NOT NULL DEFAULT 'auto_review'")
+    this.ensureColumn('runs', 'approved_endpoint_patterns', "TEXT NOT NULL DEFAULT '[]'")
 
     // approval_requests v3 audit trail columns
-    ensureColumn('approval_requests', 'policy_note', 'TEXT')
-    ensureColumn('approval_requests', 'risk_level', 'TEXT')
+    this.ensureColumn('approval_requests', 'policy_note', 'TEXT')
+    this.ensureColumn('approval_requests', 'risk_level', 'TEXT')
 
     // findings v3 columns
-    ensureColumn('findings', 'verification_tier', 'TEXT')
-    ensureColumn('findings', 'fingerprint_hash', 'TEXT')
-    ensureColumn('findings', 'superseded_by_finding_id', 'TEXT')
-    ensureColumn('findings', 'counterevidence', 'TEXT')
-    ensureColumn('findings', 'confidence_rationale', 'TEXT')
-    ensureColumn('findings', 'severity_change_conditions', 'TEXT')
-    ensureColumn('findings', 'code_locations', 'TEXT')
+    this.ensureColumn('findings', 'verification_tier', 'TEXT')
+    this.ensureColumn('findings', 'fingerprint_hash', 'TEXT')
+    this.ensureColumn('findings', 'superseded_by_finding_id', 'TEXT')
+    this.ensureColumn('findings', 'counterevidence', 'TEXT')
+    this.ensureColumn('findings', 'confidence_rationale', 'TEXT')
+    this.ensureColumn('findings', 'severity_change_conditions', 'TEXT')
+    this.ensureColumn('findings', 'code_locations', 'TEXT')
 
     // coverage_entries v3 columns
-    ensureColumn('coverage_entries', 'enforcing_control', 'TEXT')
-    ensureColumn('coverage_entries', 'proof_gap_reason', 'TEXT')
-    ensureColumn('coverage_entries', 'linked_finding_id', 'TEXT')
+    this.ensureColumn('coverage_entries', 'enforcing_control', 'TEXT')
+    this.ensureColumn('coverage_entries', 'proof_gap_reason', 'TEXT')
+    this.ensureColumn('coverage_entries', 'linked_finding_id', 'TEXT')
 
     // canaries v3 columns
-    ensureColumn('canaries', 'protocol', `TEXT NOT NULL DEFAULT 'http'`)
-    ensureColumn('canaries', 'dns_host', 'TEXT')
-    ensureColumn('canaries', 'hit_count', 'INTEGER NOT NULL DEFAULT 0')
+    this.ensureColumn('canaries', 'protocol', `TEXT NOT NULL DEFAULT 'http'`)
+    this.ensureColumn('canaries', 'dns_host', 'TEXT')
+    this.ensureColumn('canaries', 'hit_count', 'INTEGER NOT NULL DEFAULT 0')
 
     // broker_exchanges v5 secret-disclosure metadata (redacted fingerprints; no raw values)
-    ensureColumn('broker_exchanges', 'secret_matches', `TEXT NOT NULL DEFAULT '[]'`)
+    this.ensureColumn('broker_exchanges', 'secret_matches', `TEXT NOT NULL DEFAULT '[]'`)
 
     // v3 tables & indexes
     this.client.exec(`
@@ -1035,8 +1481,8 @@ export class Store {
 
       CREATE TABLE IF NOT EXISTS sast_runs (
         id TEXT PRIMARY KEY NOT NULL,
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        assignment_id TEXT NOT NULL REFERENCES assignments(id),
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
         repo TEXT NOT NULL,
         engine TEXT NOT NULL,
         raw_artifact_id TEXT,
@@ -1048,8 +1494,8 @@ export class Store {
 
       CREATE TABLE IF NOT EXISTS surface_probes (
         id TEXT PRIMARY KEY NOT NULL,
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        assignment_id TEXT NOT NULL REFERENCES assignments(id),
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
         scope_revision INTEGER NOT NULL,
         origin TEXT NOT NULL,
         probe_kind TEXT NOT NULL,
@@ -1062,7 +1508,7 @@ export class Store {
 
       CREATE TABLE IF NOT EXISTS patch_proposals (
         id TEXT PRIMARY KEY NOT NULL,
-        run_id TEXT NOT NULL REFERENCES runs(id),
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
         finding_id TEXT NOT NULL,
         repo TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'draft',
@@ -1079,42 +1525,32 @@ export class Store {
   }
 
   private initV4Schema() {
-    const existingColumns = (table: string): Set<string> => {
-      const rows = this.client.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
-      return new Set(rows.map(r => r.name))
-    }
-    const ensureColumn = (table: string, column: string, definition: string) => {
-      if (!existingColumns(table).has(column)) {
-        this.client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`)
-      }
-    }
-
     // model_profiles v4 columns
-    ensureColumn('model_profiles', 'role_affinity', "TEXT NOT NULL DEFAULT 'any'")
+    this.ensureColumn('model_profiles', 'role_affinity', "TEXT NOT NULL DEFAULT 'any'")
 
     // projects v4 columns
-    ensureColumn('projects', 'sandbox_write_allowlist', "TEXT NOT NULL DEFAULT '[]'")
+    this.ensureColumn('projects', 'sandbox_write_allowlist', "TEXT NOT NULL DEFAULT '[]'")
 
     // runs v4 columns
-    ensureColumn('runs', 'dynamic_step_budget', 'INTEGER')
-    ensureColumn('runs', 'multi_trial_enabled', 'INTEGER NOT NULL DEFAULT 1')
-    ensureColumn('runs', 'phase0_completed_at', 'INTEGER')
+    this.ensureColumn('runs', 'dynamic_step_budget', 'INTEGER')
+    this.ensureColumn('runs', 'multi_trial_enabled', 'INTEGER NOT NULL DEFAULT 1')
+    this.ensureColumn('runs', 'phase0_completed_at', 'INTEGER')
 
     // chain_steps v4 columns
-    ensureColumn('chain_steps', 'specialist_profile', 'TEXT')
-    ensureColumn('chain_steps', 'trial_group_id', 'TEXT')
-    ensureColumn('chain_steps', 'trial_index', 'INTEGER NOT NULL DEFAULT 0')
+    this.ensureColumn('chain_steps', 'specialist_profile', 'TEXT')
+    this.ensureColumn('chain_steps', 'trial_group_id', 'TEXT')
+    this.ensureColumn('chain_steps', 'trial_index', 'INTEGER NOT NULL DEFAULT 0')
 
     // replay_specs v4 columns
-    ensureColumn('replay_specs', 'attempt_count', 'INTEGER NOT NULL DEFAULT 1')
-    ensureColumn('replay_specs', 'verified_inline', 'INTEGER NOT NULL DEFAULT 0')
-    ensureColumn('replay_specs', 'last_verification_diff', 'TEXT')
+    this.ensureColumn('replay_specs', 'attempt_count', 'INTEGER NOT NULL DEFAULT 1')
+    this.ensureColumn('replay_specs', 'verified_inline', 'INTEGER NOT NULL DEFAULT 0')
+    this.ensureColumn('replay_specs', 'last_verification_diff', 'TEXT')
 
     // v4 tables & indexes
     this.client.exec(`
       CREATE TABLE IF NOT EXISTS endpoints (
         id TEXT PRIMARY KEY NOT NULL,
-        run_id TEXT NOT NULL REFERENCES runs(id),
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
         scope_revision INTEGER NOT NULL,
         origin TEXT NOT NULL,
         method TEXT NOT NULL,
@@ -1136,8 +1572,8 @@ export class Store {
 
       CREATE TABLE IF NOT EXISTS endpoint_params (
         id TEXT PRIMARY KEY NOT NULL,
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        endpoint_id TEXT NOT NULL REFERENCES endpoints(id),
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        endpoint_id TEXT NOT NULL REFERENCES endpoints(id) ON DELETE CASCADE,
         name TEXT NOT NULL,
         location TEXT NOT NULL,
         inferred_type TEXT,
@@ -1151,9 +1587,9 @@ export class Store {
 
       CREATE TABLE IF NOT EXISTS api_dependencies (
         id TEXT PRIMARY KEY NOT NULL,
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        producer_endpoint_id TEXT NOT NULL REFERENCES endpoints(id),
-        consumer_endpoint_id TEXT NOT NULL REFERENCES endpoints(id),
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        producer_endpoint_id TEXT NOT NULL REFERENCES endpoints(id) ON DELETE CASCADE,
+        consumer_endpoint_id TEXT NOT NULL REFERENCES endpoints(id) ON DELETE CASCADE,
         resource_key TEXT NOT NULL,
         sample_resource_id_hash TEXT,
         persona_handle TEXT,
@@ -1166,7 +1602,7 @@ export class Store {
 
       CREATE TABLE IF NOT EXISTS second_order_canaries (
         id TEXT PRIMARY KEY NOT NULL,
-        run_id TEXT NOT NULL REFERENCES runs(id),
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
         assignment_id TEXT NOT NULL,
         marker TEXT NOT NULL UNIQUE,
         injected_origin TEXT NOT NULL,
@@ -1185,7 +1621,7 @@ export class Store {
 
       CREATE TABLE IF NOT EXISTS lab_telemetry (
         id TEXT PRIMARY KEY NOT NULL,
-        run_id TEXT NOT NULL REFERENCES runs(id),
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
         exchange_id TEXT NOT NULL,
         trace_id TEXT NOT NULL,
         routes_hit TEXT NOT NULL DEFAULT '[]',
@@ -1224,7 +1660,7 @@ export class Store {
     this.client.exec(`
       CREATE TABLE IF NOT EXISTS board_members (
         id TEXT PRIMARY KEY NOT NULL,
-        run_id TEXT NOT NULL REFERENCES runs(id),
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
         handle TEXT NOT NULL,
         role TEXT NOT NULL,
         specialist_profile TEXT,
@@ -1247,7 +1683,7 @@ export class Store {
 
       CREATE TABLE IF NOT EXISTS board_messages (
         id TEXT PRIMARY KEY NOT NULL,
-        run_id TEXT NOT NULL REFERENCES runs(id),
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
         seq INTEGER NOT NULL,
         author_handle TEXT NOT NULL,
         author_role TEXT NOT NULL,
@@ -1272,7 +1708,7 @@ export class Store {
       -- v5 M2.1: redacted non-secret sample identifiers harvested per (run, owner persona, collection, resource key).
       CREATE TABLE IF NOT EXISTS resource_samples (
         id TEXT PRIMARY KEY NOT NULL,
-        run_id TEXT NOT NULL REFERENCES runs(id),
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
         owner_persona TEXT NOT NULL,
         resource_key TEXT NOT NULL,
         collection_path TEXT NOT NULL DEFAULT '',
@@ -1289,16 +1725,6 @@ export class Store {
       CREATE INDEX IF NOT EXISTS resource_samples_run ON resource_samples (run_id, resource_key);
     `)
 
-    const existingColumns = (table: string): Set<string> => {
-      const rows = this.client.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
-      return new Set(rows.map(r => r.name))
-    }
-    const ensureColumn = (table: string, column: string, definition: string) => {
-      if (!existingColumns(table).has(column)) {
-        this.client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`)
-      }
-    }
-
     for (const [column, definition] of [
       ['role_affinity', 'TEXT'],
       ['last_read_seq', 'INTEGER NOT NULL DEFAULT 0'],
@@ -1308,7 +1734,7 @@ export class Store {
       ['active_assignment_id', 'TEXT'],
       ['updated_at', 'INTEGER NOT NULL DEFAULT 0'],
     ] as const) {
-      ensureColumn('board_members', column, definition)
+      this.ensureColumn('board_members', column, definition)
     }
     for (const [column, definition] of [
       ['ref_fact_ids', "TEXT NOT NULL DEFAULT '[]'"],
@@ -1319,7 +1745,7 @@ export class Store {
       ['reply_to_seq', 'INTEGER'],
       ['tainted', 'INTEGER NOT NULL DEFAULT 0'],
     ] as const) {
-      ensureColumn('board_messages', column, definition)
+      this.ensureColumn('board_messages', column, definition)
     }
 
     // Backfill the deterministic system roster for runs created before v5 so an upgraded
@@ -1348,40 +1774,28 @@ export class Store {
    * `PRAGMA user_version = STORE_SCHEMA_VERSION` stamps the upgrade.
    */
   private initV6Schema() {
-    const existingColumns = (table: string): Set<string> => {
-      const rows = this.client.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
-      return new Set(rows.map(r => r.name))
-    }
-    const ensureColumn = (table: string, column: string, definition: string) => {
-      if (!existingColumns(table).has(column)) {
-        this.client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`)
-        return true
-      }
-      return false
-    }
-
-    ensureColumn('resource_samples', 'collection_path', "TEXT NOT NULL DEFAULT ''")
+    this.ensureColumn('resource_samples', 'collection_path', "TEXT NOT NULL DEFAULT ''")
     this.client.exec("UPDATE resource_samples SET collection_path = '' WHERE collection_path IS NULL")
 
     // v6 Phase 2 Layer-1 scope + environment contract (additive).
     // The legacy approved-candidate allowlist stays the target tier; auth/asset tiers are additive.
-    const hadEnvironmentMode = existingColumns('runs').has('environment_mode')
-    ensureColumn('runs', 'auth_origins', "TEXT NOT NULL DEFAULT '[]'")
-    ensureColumn('runs', 'asset_origins', "TEXT NOT NULL DEFAULT '[]'")
-    ensureColumn('runs', 'environment_mode', "TEXT NOT NULL DEFAULT 'prod_readonly'")
-    ensureColumn('runs', 'route_denylist', "TEXT NOT NULL DEFAULT '[]'")
-    ensureColumn('assignments', 'approval_parked_at', 'INTEGER')
+    const hadEnvironmentMode = this.existingColumns('runs').has('environment_mode')
+    this.ensureColumn('runs', 'auth_origins', "TEXT NOT NULL DEFAULT '[]'")
+    this.ensureColumn('runs', 'asset_origins', "TEXT NOT NULL DEFAULT '[]'")
+    this.ensureColumn('runs', 'environment_mode', "TEXT NOT NULL DEFAULT 'prod_readonly'")
+    this.ensureColumn('runs', 'route_denylist', "TEXT NOT NULL DEFAULT '[]'")
+    this.ensureColumn('assignments', 'approval_parked_at', 'INTEGER')
 
     // v6 provenance / advisory contract (additive; safe on legacy databases).
     const previousVersion = Number(
       (this.client.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined)?.user_version ?? 0,
     )
-    const addedProvenance = ensureColumn(
+    const addedProvenance = this.ensureColumn(
       'findings', 'provenance',
       "TEXT NOT NULL DEFAULT 'agent_only' CHECK (provenance IN ('floor', 'agent_only', 'chain_from_floor'))",
     )
-    const addedParents = ensureColumn('findings', 'parent_finding_ids', 'TEXT')
-    const addedVerificationClass = ensureColumn(
+    const addedParents = this.ensureColumn('findings', 'parent_finding_ids', 'TEXT')
+    const addedVerificationClass = this.ensureColumn(
       'findings', 'verification_class',
       "TEXT NOT NULL DEFAULT 'runtime_confirmed' CHECK (verification_class IN ('runtime_confirmed', 'pending_oob', 'static_advisory', 'open_proof_gap', 'dismissed')) "
       + "CHECK (json_extract(finding, '$.status') <> 'confirmed' OR verification_class = 'runtime_confirmed') "
@@ -1415,7 +1829,7 @@ export class Store {
     this.client.exec(`
       CREATE TABLE IF NOT EXISTS lab_containers (
         id TEXT PRIMARY KEY NOT NULL,
-        run_id TEXT NOT NULL REFERENCES runs(id),
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
         assignment_id TEXT,
         container_name TEXT NOT NULL,
         image_name TEXT,
@@ -1428,7 +1842,7 @@ export class Store {
 
       CREATE TABLE IF NOT EXISTS approval_leases (
         id TEXT PRIMARY KEY NOT NULL,
-        run_id TEXT NOT NULL REFERENCES runs(id),
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
         scope_revision INTEGER NOT NULL,
         origin TEXT NOT NULL,
         method TEXT NOT NULL,
@@ -1471,29 +1885,22 @@ export class Store {
    * are simply not script proofs.
    */
   private initV7Schema() {
-    const existingColumns = (table: string): Set<string> => {
-      const rows = this.client.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
-      return new Set(rows.map(r => r.name))
-    }
-    const ensureColumn = (table: string, column: string, definition: string) => {
-      if (!existingColumns(table).has(column)) {
-        this.client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`)
-      }
-    }
-    ensureColumn('replay_specs', 'proof_kind', 'TEXT')
-    ensureColumn('replay_specs', 'proof_verdict', 'TEXT')
-    ensureColumn('replay_specs', 'proof_runtime', 'TEXT')
-    ensureColumn('replay_specs', 'proof_script_sha256', 'TEXT')
-    ensureColumn('replay_specs', 'proof_artifact_id', 'TEXT')
-    ensureColumn('replay_specs', 'proof_receipt', 'TEXT')
-    ensureColumn('project_assets', 'include_subdomains', 'INTEGER NOT NULL DEFAULT 0')
+    this.ensureColumn('replay_specs', 'proof_kind', 'TEXT')
+    this.ensureColumn('replay_specs', 'proof_verdict', 'TEXT')
+    this.ensureColumn('replay_specs', 'proof_runtime', 'TEXT')
+    this.ensureColumn('replay_specs', 'proof_script_sha256', 'TEXT')
+    this.ensureColumn('replay_specs', 'proof_artifact_id', 'TEXT')
+    this.ensureColumn('replay_specs', 'proof_receipt', 'TEXT')
+    this.ensureColumn('project_assets', 'include_subdomains', 'INTEGER NOT NULL DEFAULT 0')
     // v7 M4: per-tenant isolation & append-only tenant audit log (additive, safe on legacy DBs).
-    ensureColumn('projects', 'tenant_id', "TEXT NOT NULL DEFAULT 'default'")
-    ensureColumn('runs', 'tenant_id', "TEXT NOT NULL DEFAULT 'default'")
+    this.ensureColumn('projects', 'tenant_id', "TEXT NOT NULL DEFAULT 'default'")
+    this.ensureColumn('runs', 'tenant_id', "TEXT NOT NULL DEFAULT 'default'")
     this.client.exec(`
       CREATE INDEX IF NOT EXISTS replay_specs_proof ON replay_specs (run_id, proof_kind);
       CREATE INDEX IF NOT EXISTS projects_tenant ON projects (tenant_id);
       CREATE INDEX IF NOT EXISTS runs_tenant ON runs (tenant_id);
+      -- CRITICAL SAFETY INVARIANT: append-only audit log intentionally has NO foreign key and
+      -- NO ON DELETE CASCADE so audit entries survive run and project deletion.
       CREATE TABLE IF NOT EXISTS tenant_audit_log (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         id TEXT NOT NULL UNIQUE,
@@ -1524,9 +1931,21 @@ export class Store {
     this.client.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`)
   }
 
-  /** v8 M0: idempotent CapabilityLedger tables & indexes on the shared WAL SQLite handle. */
+  /** v8 M0: idempotent CapabilityLedger tables, indexes, and run-delete cascade trigger. */
   private initV8Schema() {
     initCapabilityLedgerSchema(this.client)
+    // CapabilityLedger can also be opened standalone without a `runs` table, so its tables do not
+    // declare a FK to `runs(id)`. On a Store DB, keep them in sync on raw `DELETE FROM runs` /
+    // cascaded `DELETE FROM projects` in child-before-parent order for the composite FK.
+    this.client.exec(`
+      CREATE TRIGGER IF NOT EXISTS runs_after_delete_capability_ledger
+        AFTER DELETE ON runs
+        BEGIN
+          DELETE FROM capability_causal_edges WHERE run_id = OLD.id;
+          DELETE FROM capability_negative_edges WHERE run_id = OLD.id;
+          DELETE FROM capability_nodes WHERE run_id = OLD.id;
+        END;
+    `)
   }
 
   /**
@@ -1663,6 +2082,7 @@ export class Store {
       ).get() as { c?: number } | undefined
       this.ftsTableExists = Number(existing?.c ?? 0) > 0
       this.ftsAvailable = false
+      if (this.ftsTableExists) this.ensureFtsCascadeTrigger()
       return
     }
     try {
@@ -1700,6 +2120,17 @@ export class Store {
       }
     }
     this.ftsTableExists = this.ftsAvailable
+    if (this.ftsTableExists) this.ensureFtsCascadeTrigger()
+  }
+
+  private ensureFtsCascadeTrigger() {
+    this.client.exec(`
+      CREATE TRIGGER IF NOT EXISTS runs_after_delete_fts
+        AFTER DELETE ON runs
+        BEGIN
+          DELETE FROM broker_exchanges_fts WHERE run_id = OLD.id;
+        END;
+    `)
   }
 
   close() {
@@ -2716,7 +3147,44 @@ export class Store {
     return rows.map(r => r.id).filter(runId => this.isRunActive(runId))
   }
 
-  private deleteRunRowsInTx(runId: string): { sessionIds: string[]; flatArtifactIds: string[] } {
+  /**
+   * Returns true when every child FK referencing `projects`, `runs`, `assignments`,
+   * `replay_specs`, or `endpoints` in the opened SQLite DB declares `ON DELETE CASCADE`
+   * (and the non-FK cascade triggers are installed). Legacy pre-cascade DBs return false and
+   * automatically use the explicit topological child-before-parent delete fallback.
+   */
+  private hasCascadeSchema(): boolean {
+    const fkParents = new Set(['projects', 'runs', 'assignments', 'replay_specs', 'endpoints'])
+    const childTables = [
+      'project_assets', 'project_specs', 'personas', 'runs', 'threat_models', 'chain_steps',
+      'assignments', 'facts', 'graph_edges', 'graph_digests', 'broker_exchanges',
+      'approval_requests', 'approval_leases', 'replay_specs', 'retest_runs', 'coverage_entries',
+      'canaries', 'evidence', 'findings', 'sast_runs', 'surface_probes', 'patch_proposals',
+      'reports', 'messages', 'events', 'endpoints', 'endpoint_params', 'api_dependencies',
+      'second_order_canaries', 'lab_telemetry', 'board_members', 'board_messages',
+      'resource_samples', 'lab_containers',
+    ] as const
+    for (const table of childTables) {
+      if (!this.tableExists(table)) continue
+      const fks = this.client.prepare(`PRAGMA foreign_key_list(${table})`).all() as Array<{
+        table: string
+        on_delete: string
+      }>
+      const relevant = fks.filter(fk => fkParents.has(fk.table))
+      if (!relevant.length || relevant.some(fk => fk.on_delete.toUpperCase() !== 'CASCADE')) {
+        return false
+      }
+    }
+    const triggerNames = new Set(
+      (this.client.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'").all() as Array<{ name: string }>)
+        .map(row => row.name),
+    )
+    if (!triggerNames.has('runs_after_delete_capability_ledger')) return false
+    if (this.ftsTableExists && !triggerNames.has('runs_after_delete_fts')) return false
+    return true
+  }
+
+  private collectRunCleanupFiles(runId: string): { sessionIds: string[]; artifactIds: Set<string> } {
     const assignmentSessions = this.client.prepare(
       `SELECT DISTINCT session_id AS sid FROM assignments WHERE run_id = ?`,
     ).all(runId) as { sid: string | null }[]
@@ -2745,64 +3213,73 @@ export class Store {
     for (const row of this.client.prepare(`SELECT artifact_id AS aid FROM lab_telemetry WHERE run_id = ?`).all(runId) as { aid: string | null }[]) {
       if (row.aid) artifactIds.add(row.aid)
     }
+    return { sessionIds, artifactIds }
+  }
 
-    // Delete in strict child-before-parent order to satisfy PRAGMA foreign_keys = ON.
-    // Note: tenant_audit_log is an append-only immutable audit table with a BEFORE DELETE trigger
-    // and no FK to runs, so it is intentionally preserved.
-    if (this.ftsTableExists) {
-      this.client.prepare(`DELETE FROM broker_exchanges_fts WHERE run_id = ?`).run(runId)
-    }
-    const orderedTables = [
-      'retest_runs',
-      'replay_specs',
-      'facts',
-      'broker_exchanges',
-      'approval_requests',
-      'evidence',
-      'sast_runs',
-      'surface_probes',
-      'endpoint_params',
-      'api_dependencies',
-      'capability_causal_edges',
-      'capability_negative_edges',
-      'capability_nodes',
-      'lab_containers',
-      'lab_telemetry',
-      'board_messages',
-      'board_members',
-      'resource_samples',
-      'second_order_canaries',
-      'approval_leases',
-      'patch_proposals',
-      'findings',
-      'coverage_entries',
-      'canaries',
-      'graph_edges',
-      'graph_digests',
-      'threat_models',
-      'chain_steps',
-      'reports',
-      'messages',
-      'events',
-      'endpoints',
-      'assignments',
-    ] as const
-    for (const table of orderedTables) {
-      this.client.prepare(`DELETE FROM ${table} WHERE run_id = ?`).run(runId)
-    }
-    this.client.prepare(`DELETE FROM runs WHERE id = ? AND workspace_id = ?`).run(runId, this.workspace.id)
-
-    // Keep any legacy flat content-addressed blob still referenced by another run.
+  /** Keep any legacy flat content-addressed blob still referenced by another surviving run. */
+  private filterUnreferencedFlatArtifacts(artifactIds: ReadonlySet<string>): string[] {
+    if (artifactIds.size === 0) return []
+    const checkShared = this.client.prepare(
+      `SELECT 1 FROM broker_exchanges WHERE body_artifact_id = ? LIMIT 1`,
+    )
     const flatArtifactIds: string[] = []
-    if (artifactIds.size > 0) {
-      const checkShared = this.client.prepare(
-        `SELECT 1 FROM broker_exchanges WHERE body_artifact_id = ? LIMIT 1`,
-      )
-      for (const aid of artifactIds) {
-        if (!checkShared.get(aid)) flatArtifactIds.push(aid)
+    for (const aid of artifactIds) {
+      if (!checkShared.get(aid)) flatArtifactIds.push(aid)
+    }
+    return flatArtifactIds
+  }
+
+  private deleteRunRowsInTx(runId: string, cascade = this.hasCascadeSchema()): { sessionIds: string[]; flatArtifactIds: string[] } {
+    const { sessionIds, artifactIds } = this.collectRunCleanupFiles(runId)
+
+    // Note: tenant_audit_log is an append-only immutable audit table with a BEFORE DELETE trigger
+    // and no FK to runs, so it is intentionally preserved on both cascade and legacy paths.
+    if (!cascade) {
+      // Legacy pre-cascade DB fallback: delete in strict child-before-parent order for PRAGMA foreign_keys = ON.
+      if (this.ftsTableExists) {
+        this.client.prepare(`DELETE FROM broker_exchanges_fts WHERE run_id = ?`).run(runId)
+      }
+      const orderedTables = [
+        'retest_runs',
+        'replay_specs',
+        'facts',
+        'broker_exchanges',
+        'approval_requests',
+        'evidence',
+        'sast_runs',
+        'surface_probes',
+        'endpoint_params',
+        'api_dependencies',
+        'capability_causal_edges',
+        'capability_negative_edges',
+        'capability_nodes',
+        'lab_containers',
+        'lab_telemetry',
+        'board_messages',
+        'board_members',
+        'resource_samples',
+        'second_order_canaries',
+        'approval_leases',
+        'patch_proposals',
+        'findings',
+        'coverage_entries',
+        'canaries',
+        'graph_edges',
+        'graph_digests',
+        'threat_models',
+        'chain_steps',
+        'reports',
+        'messages',
+        'events',
+        'endpoints',
+        'assignments',
+      ] as const
+      for (const table of orderedTables) {
+        this.client.prepare(`DELETE FROM ${table} WHERE run_id = ?`).run(runId)
       }
     }
-    return { sessionIds, flatArtifactIds }
+    this.client.prepare(`DELETE FROM runs WHERE id = ? AND workspace_id = ?`).run(runId, this.workspace.id)
+    return { sessionIds, flatArtifactIds: this.filterUnreferencedFlatArtifacts(artifactIds) }
   }
 
   private cleanupRunFilesOnDisk(
@@ -2878,16 +3355,27 @@ export class Store {
         .where(and(eq(tables.personas.projectId, projectId), eq(tables.personas.workspaceId, this.workspace.id)))
         .all()
 
-      const runCleanups: Array<{ runId: string; sessionIds: string[]; flatArtifactIds: string[] }> = []
-      for (const row of runRows) {
-        const files = this.deleteRunRowsInTx(row.id)
-        runCleanups.push({ runId: row.id, ...files })
+      let runCleanups: Array<{ runId: string; sessionIds: string[]; flatArtifactIds: string[] }>
+      if (this.hasCascadeSchema()) {
+        const pending = runRows.map(row => ({ runId: row.id, ...this.collectRunCleanupFiles(row.id) }))
+        this.client.prepare(`DELETE FROM projects WHERE id = ? AND workspace_id = ?`).run(projectId, this.workspace.id)
+        runCleanups = pending.map(item => ({
+          runId: item.runId,
+          sessionIds: item.sessionIds,
+          flatArtifactIds: this.filterUnreferencedFlatArtifacts(item.artifactIds),
+        }))
+      } else {
+        runCleanups = []
+        for (const row of runRows) {
+          const files = this.deleteRunRowsInTx(row.id, false)
+          runCleanups.push({ runId: row.id, ...files })
+        }
+        this.client.prepare(`DELETE FROM retest_runs WHERE project_id = ?`).run(projectId)
+        this.client.prepare(`DELETE FROM personas WHERE project_id = ? AND workspace_id = ?`).run(projectId, this.workspace.id)
+        this.client.prepare(`DELETE FROM project_specs WHERE project_id = ?`).run(projectId)
+        this.client.prepare(`DELETE FROM project_assets WHERE project_id = ?`).run(projectId)
+        this.client.prepare(`DELETE FROM projects WHERE id = ? AND workspace_id = ?`).run(projectId, this.workspace.id)
       }
-      this.client.prepare(`DELETE FROM retest_runs WHERE project_id = ?`).run(projectId)
-      this.client.prepare(`DELETE FROM personas WHERE project_id = ? AND workspace_id = ?`).run(projectId, this.workspace.id)
-      this.client.prepare(`DELETE FROM project_specs WHERE project_id = ?`).run(projectId)
-      this.client.prepare(`DELETE FROM project_assets WHERE project_id = ?`).run(projectId)
-      this.client.prepare(`DELETE FROM projects WHERE id = ? AND workspace_id = ?`).run(projectId, this.workspace.id)
       this.event(null, 'project.deleted', `Deleted project ${existing.name}.`, {
         projectId,
         projectName: existing.name,

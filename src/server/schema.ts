@@ -45,6 +45,7 @@ export const modelProfiles = sqliteTable('model_profiles', {
 export const projects = sqliteTable('projects', {
   id: text('id').primaryKey().notNull(),
   workspaceId: text('workspace_id').notNull().references(() => workspaces.id),
+  tenantId: text('tenant_id').default('default').notNull(),
   name: text('name').notNull(),
   environment: text('environment').$type<'public' | 'local-lab'>().default('public').notNull(),
   seeds: text('seeds', { mode: 'json' }).$type<string[]>().notNull(),
@@ -52,11 +53,11 @@ export const projects = sqliteTable('projects', {
   labConfig: text('lab_config', { mode: 'json' }).$type<LabConfig | null>(),
   sandboxWriteAllowlist: text('sandbox_write_allowlist', { mode: 'json' }).$type<ApprovedEndpointPattern[]>().default([]).notNull(),
   createdAt: integer('created_at').notNull(),
-})
+}, table => [index('projects_tenant').on(table.tenantId)])
 
 export const projectAssets = sqliteTable('project_assets', {
   id: text('id').primaryKey().notNull(),
-  projectId: text('project_id').notNull().references(() => projects.id),
+  projectId: text('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
   origin: text('origin').notNull(),
   source: text('source').notNull(),
   thirdParty: integer('third_party', { mode: 'boolean' }).notNull(),
@@ -68,7 +69,7 @@ export const projectAssets = sqliteTable('project_assets', {
 
 export const projectSpecs = sqliteTable('project_specs', {
   id: text('id').primaryKey().notNull(),
-  projectId: text('project_id').notNull().references(() => projects.id),
+  projectId: text('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
   name: text('name').notNull(),
   kind: text('kind').$type<'openapi' | 'graphql' | 'routes' | 'notes'>().notNull(),
   origin: text('origin'),
@@ -78,7 +79,7 @@ export const projectSpecs = sqliteTable('project_specs', {
 
 export const personas = sqliteTable('personas', {
   id: text('id').primaryKey().notNull(),
-  projectId: text('project_id').notNull().references(() => projects.id),
+  projectId: text('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
   workspaceId: text('workspace_id').notNull().references(() => workspaces.id),
   handle: text('handle').notNull(),
   roleLabel: text('role_label').notNull(),
@@ -93,8 +94,9 @@ export const personas = sqliteTable('personas', {
 
 export const runs = sqliteTable('runs', {
   id: text('id').primaryKey().notNull(),
-  projectId: text('project_id').notNull().references(() => projects.id),
+  projectId: text('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
   workspaceId: text('workspace_id').notNull().references(() => workspaces.id),
+  tenantId: text('tenant_id').default('default').notNull(),
   originalGoal: text('original_goal').notNull(),
   goal: text('goal').notNull(),
   goalRevision: integer('goal_revision').notNull(),
@@ -105,7 +107,7 @@ export const runs = sqliteTable('runs', {
   sourceMode: text('source_mode').$type<'prepared' | 'public'>().default('public').notNull(),
   capabilityTier: integer('capability_tier').$type<CapabilityTier>().default(1).notNull(),
   approvalPolicy: text('approval_policy').$type<ApprovalPolicy>().default('auto_review').notNull(),
-  approvedEndpointPatterns: text('approved_endpoint_patterns', { mode: 'json' }).$type<ApprovedEndpointPattern[]>().notNull(),
+  approvedEndpointPatterns: text('approved_endpoint_patterns', { mode: 'json' }).$type<ApprovedEndpointPattern[]>().default([]).notNull(),
   approvedPersonaIds: text('approved_persona_ids', { mode: 'json' }).$type<string[]>().notNull(),
   roundNo: integer('round_no').default(0).notNull(),
   budgetUsd: real('budget_usd').default(25).notNull(),
@@ -130,11 +132,14 @@ export const runs = sqliteTable('runs', {
   environmentMode: text('environment_mode').$type<EnvironmentMode>().default('prod_readonly').notNull(),
   routeDenylist: text('route_denylist', { mode: 'json' }).$type<string[]>().default([]).notNull(),
   createdAt: integer('created_at').notNull(),
-}, table => [index('runs_project').on(table.projectId)])
+}, table => [
+  index('runs_project').on(table.projectId),
+  index('runs_tenant').on(table.tenantId),
+])
 
 export const threatModels = sqliteTable('threat_models', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   scopeRevision: integer('scope_revision').notNull(),
   goalRevision: integer('goal_revision').notNull(),
   entries: text('entries', { mode: 'json' }).$type<ThreatModelSummary[]>().notNull(),
@@ -144,7 +149,7 @@ export const threatModels = sqliteTable('threat_models', {
 
 export const chainSteps = sqliteTable('chain_steps', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   goalRevision: integer('goal_revision').notNull(),
   scopeRevision: integer('scope_revision').notNull(),
   seq: integer('seq').notNull(),
@@ -168,7 +173,7 @@ export const chainSteps = sqliteTable('chain_steps', {
 
 export const assignments = sqliteTable('assignments', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   assetId: text('asset_id'),
   stepId: text('step_id'),
   inputAssignmentId: text('input_assignment_id'),
@@ -196,8 +201,8 @@ export const assignments = sqliteTable('assignments', {
 
 export const facts = sqliteTable('facts', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
-  assignmentId: text('assignment_id').notNull().references(() => assignments.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
+  assignmentId: text('assignment_id').notNull().references(() => assignments.id, { onDelete: 'cascade' }),
   scopeRevision: integer('scope_revision').notNull(),
   goalRevision: integer('goal_revision').notNull(),
   kind: text('kind').$type<'endpoint' | 'auth' | 'header' | 'cors' | 'cookie' | 'object_ref' | 'redirect' | 'policy_gap' | 'config' | 'dns' | 'tls' | 'secret' | 'dom' | 'note'>().notNull(),
@@ -211,11 +216,14 @@ export const facts = sqliteTable('facts', {
   coldSinceRound: integer('cold_since_round'),
   digestId: text('digest_id'),
   createdAt: integer('created_at').notNull(),
-}, table => [index('facts_run').on(table.runId, table.tainted)])
+}, table => [
+  index('facts_run').on(table.runId, table.tainted),
+  index('facts_run_created').on(table.runId, table.createdAt),
+])
 
 export const graphEdges = sqliteTable('graph_edges', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   fromKind: text('from_kind').$type<'assignment' | 'step' | 'fact' | 'finding' | 'digest'>().notNull(),
   fromId: text('from_id').notNull(),
   toKind: text('to_kind').$type<'assignment' | 'step' | 'fact' | 'finding' | 'digest'>().notNull(),
@@ -226,7 +234,7 @@ export const graphEdges = sqliteTable('graph_edges', {
 
 export const graphDigests = sqliteTable('graph_digests', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   roundNo: integer('round_no').notNull(),
   level: text('level').$type<'minor' | 'major'>().notNull(),
   signatureHash: text('signature_hash').notNull(),
@@ -239,8 +247,8 @@ export const graphDigests = sqliteTable('graph_digests', {
 
 export const brokerExchanges = sqliteTable('broker_exchanges', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
-  assignmentId: text('assignment_id').notNull().references(() => assignments.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
+  assignmentId: text('assignment_id').notNull().references(() => assignments.id, { onDelete: 'cascade' }),
   scopeRevision: integer('scope_revision').notNull(),
   origin: text('origin').notNull(),
   finalOrigin: text('final_origin').notNull(),
@@ -256,18 +264,19 @@ export const brokerExchanges = sqliteTable('broker_exchanges', {
   bodyArtifactId: text('body_artifact_id'),
   bodySha256: text('body_sha256').notNull(),
   /** Redacted structural evidence from the pre-scrub response (fingerprints only). */
-  secretMatches: text('secret_matches', { mode: 'json' }).$type<SecretMatch[]>().notNull(),
+  secretMatches: text('secret_matches', { mode: 'json' }).$type<SecretMatch[]>().default([]).notNull(),
   durationMs: integer('duration_ms').notNull(),
   createdAt: integer('created_at').notNull(),
 }, table => [
   index('broker_exchanges_run').on(table.runId, table.origin),
+  index('broker_exchanges_run_created').on(table.runId, table.createdAt),
   index('broker_exchanges_body_artifact').on(table.bodyArtifactId),
 ])
 
 export const approvalRequests = sqliteTable('approval_requests', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
-  assignmentId: text('assignment_id').notNull().references(() => assignments.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
+  assignmentId: text('assignment_id').notNull().references(() => assignments.id, { onDelete: 'cascade' }),
   scopeRevision: integer('scope_revision').notNull(),
   origin: text('origin').notNull(),
   method: text('method').notNull(),
@@ -292,7 +301,7 @@ export const approvalRequests = sqliteTable('approval_requests', {
  */
 export const approvalLeases = sqliteTable('approval_leases', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   scopeRevision: integer('scope_revision').notNull(),
   origin: text('origin').notNull(),
   method: text('method').notNull(),
@@ -341,9 +350,9 @@ export interface ReplayProofReceiptRow {
 
 export const replaySpecs = sqliteTable('replay_specs', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   findingId: text('finding_id').notNull(),
-  assignmentId: text('assignment_id').notNull().references(() => assignments.id),
+  assignmentId: text('assignment_id').notNull().references(() => assignments.id, { onDelete: 'cascade' }),
   scopeRevision: integer('scope_revision').notNull(),
   goalRevision: integer('goal_revision').notNull(),
   spec: text('spec', { mode: 'json' }).$type<DeclarativeReplaySpec>().notNull(),
@@ -372,10 +381,10 @@ export const replaySpecs = sqliteTable('replay_specs', {
 
 export const retestRuns = sqliteTable('retest_runs', {
   id: text('id').primaryKey().notNull(),
-  projectId: text('project_id').notNull().references(() => projects.id),
-  runId: text('run_id').notNull().references(() => runs.id),
+  projectId: text('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   findingId: text('finding_id').notNull(),
-  replaySpecId: text('replay_spec_id').notNull().references(() => replaySpecs.id),
+  replaySpecId: text('replay_spec_id').notNull().references(() => replaySpecs.id, { onDelete: 'cascade' }),
   scopeRevision: integer('scope_revision').notNull(),
   verdict: text('verdict').$type<'reproduced' | 'fixed' | 'inconclusive'>().notNull(),
   summary: text('summary').notNull(),
@@ -386,7 +395,7 @@ export const retestRuns = sqliteTable('retest_runs', {
 
 export const coverageEntries = sqliteTable('coverage_entries', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   scopeRevision: integer('scope_revision').notNull(),
   goalRevision: integer('goal_revision').notNull(),
   origin: text('origin').notNull(),
@@ -402,7 +411,7 @@ export const coverageEntries = sqliteTable('coverage_entries', {
 
 export const canaries = sqliteTable('canaries', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   assignmentId: text('assignment_id').notNull(),
   token: text('token').notNull().unique(),
   purpose: text('purpose').notNull(),
@@ -417,15 +426,19 @@ export const canaries = sqliteTable('canaries', {
 
 export const evidence = sqliteTable('evidence', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
-  assignmentId: text('assignment_id').notNull().references(() => assignments.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
+  assignmentId: text('assignment_id').notNull().references(() => assignments.id, { onDelete: 'cascade' }),
   scopeRevision: integer('scope_revision').notNull(),
   goalRevision: integer('goal_revision').notNull(),
   title: text('title').notNull(),
   kind: text('kind').$type<EvidenceSummary['kind']>().notNull(),
   operationId: text('operation_id'),
   createdAt: integer('created_at').notNull(),
-}, table => [index('evidence_run').on(table.runId), uniqueIndex('evidence_operation').on(table.assignmentId, table.operationId)])
+}, table => [
+  index('evidence_run').on(table.runId),
+  index('evidence_run_created').on(table.runId, table.createdAt),
+  uniqueIndex('evidence_operation').on(table.assignmentId, table.operationId),
+])
 
 /** v6 provenance contract: where a persisted finding came from. */
 export const findingProvenances = ['floor', 'agent_only', 'chain_from_floor'] as const
@@ -442,7 +455,7 @@ export type FindingVerificationClass = typeof findingVerificationClasses[number]
 
 export const findings = sqliteTable('findings', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   assetId: text('asset_id').notNull(),
   goalRevision: integer('goal_revision').notNull(),
   checkId: text('check_id').$type<AssessmentCheckId | 'chain'>().notNull().default('hsts'),
@@ -470,8 +483,8 @@ export const findings = sqliteTable('findings', {
 
 export const sastRuns = sqliteTable('sast_runs', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
-  assignmentId: text('assignment_id').notNull().references(() => assignments.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
+  assignmentId: text('assignment_id').notNull().references(() => assignments.id, { onDelete: 'cascade' }),
   repo: text('repo').notNull(),
   engine: text('engine').notNull(),
   rawArtifactId: text('raw_artifact_id'),
@@ -482,8 +495,8 @@ export const sastRuns = sqliteTable('sast_runs', {
 
 export const surfaceProbes = sqliteTable('surface_probes', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
-  assignmentId: text('assignment_id').notNull().references(() => assignments.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
+  assignmentId: text('assignment_id').notNull().references(() => assignments.id, { onDelete: 'cascade' }),
   scopeRevision: integer('scope_revision').notNull(),
   origin: text('origin').notNull(),
   probeKind: text('probe_kind').notNull(),
@@ -495,7 +508,7 @@ export const surfaceProbes = sqliteTable('surface_probes', {
 
 export const patchProposals = sqliteTable('patch_proposals', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   findingId: text('finding_id').notNull(),
   repo: text('repo').notNull(),
   status: text('status').$type<PatchProposalStatus>().default('draft').notNull(),
@@ -510,7 +523,7 @@ export const patchProposals = sqliteTable('patch_proposals', {
 
 export const reports = sqliteTable('reports', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   version: integer('version').notNull(),
   partial: integer('partial', { mode: 'boolean' }).notNull(),
   body: text('body', { mode: 'json' }).$type<ReportBody>().notNull(),
@@ -519,7 +532,7 @@ export const reports = sqliteTable('reports', {
 
 export const messages = sqliteTable('messages', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   threadId: text('thread_id').notNull(),
   role: text('role').$type<'operator' | 'coordinator' | 'worker' | 'guardian'>().notNull(),
   content: text('content').notNull(),
@@ -531,7 +544,7 @@ export const messages = sqliteTable('messages', {
 export const events = sqliteTable('events', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   workspaceId: text('workspace_id').notNull().references(() => workspaces.id),
-  runId: text('run_id').references(() => runs.id),
+  runId: text('run_id').references(() => runs.id, { onDelete: 'cascade' }),
   kind: text('kind').notNull(),
   message: text('message').notNull(),
   detail: text('detail', { mode: 'json' }).$type<Record<string, unknown>>().notNull(),
@@ -547,7 +560,7 @@ export const operations = sqliteTable('operations', {
 
 export const endpoints = sqliteTable('endpoints', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   scopeRevision: integer('scope_revision').notNull(),
   origin: text('origin').notNull(),
   method: text('method').notNull(),
@@ -566,12 +579,13 @@ export const endpoints = sqliteTable('endpoints', {
 }, table => [
   uniqueIndex('endpoints_run_route').on(table.runId, table.origin, table.method, table.pathTemplate),
   index('endpoints_run_risk').on(table.runId, table.riskScore),
+  index('endpoints_run_updated').on(table.runId, table.updatedAt),
 ])
 
 export const endpointParams = sqliteTable('endpoint_params', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
-  endpointId: text('endpoint_id').notNull().references(() => endpoints.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
+  endpointId: text('endpoint_id').notNull().references(() => endpoints.id, { onDelete: 'cascade' }),
   name: text('name').notNull(),
   location: text('location').$type<ParamLocation>().notNull(),
   inferredType: text('inferred_type'),
@@ -586,9 +600,9 @@ export const endpointParams = sqliteTable('endpoint_params', {
 
 export const apiDependencies = sqliteTable('api_dependencies', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
-  producerEndpointId: text('producer_endpoint_id').notNull().references(() => endpoints.id),
-  consumerEndpointId: text('consumer_endpoint_id').notNull().references(() => endpoints.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
+  producerEndpointId: text('producer_endpoint_id').notNull().references(() => endpoints.id, { onDelete: 'cascade' }),
+  consumerEndpointId: text('consumer_endpoint_id').notNull().references(() => endpoints.id, { onDelete: 'cascade' }),
   resourceKey: text('resource_key').notNull(),
   sampleResourceIdHash: text('sample_resource_id_hash'),
   personaHandle: text('persona_handle'),
@@ -602,7 +616,7 @@ export const apiDependencies = sqliteTable('api_dependencies', {
 
 export const secondOrderCanaries = sqliteTable('second_order_canaries', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   assignmentId: text('assignment_id').notNull(),
   marker: text('marker').notNull().unique(),
   injectedOrigin: text('injected_origin').notNull(),
@@ -622,7 +636,7 @@ export const secondOrderCanaries = sqliteTable('second_order_canaries', {
 
 export const labTelemetry = sqliteTable('lab_telemetry', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   exchangeId: text('exchange_id').notNull(),
   traceId: text('trace_id').notNull(),
   routesHit: text('routes_hit', { mode: 'json' }).$type<string[]>().default([]).notNull(),
@@ -638,7 +652,7 @@ export const labTelemetry = sqliteTable('lab_telemetry', {
 
 export const boardMembers = sqliteTable('board_members', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   handle: text('handle').notNull(), // e.g. 'coordinator', 'bola', 'auth', 'bola-2'
   role: text('role').$type<BoardMemberRole>().notNull(),
   specialistProfile: text('specialist_profile').$type<SpecialistProfile | null>(),
@@ -662,7 +676,7 @@ export const boardMembers = sqliteTable('board_members', {
 
 export const boardMessages = sqliteTable('board_messages', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   seq: integer('seq').notNull(), // strictly monotonic per run (1, 2, 3, ...)
   authorHandle: text('author_handle').notNull(),
   authorRole: text('author_role').$type<BoardAuthorRole>().notNull(),
@@ -692,7 +706,7 @@ export const boardMessages = sqliteTable('board_messages', {
  */
 export const resourceSamples = sqliteTable('resource_samples', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   ownerPersona: text('owner_persona').notNull(),
   resourceKey: text('resource_key').notNull(),
   collectionPath: text('collection_path').default('').notNull(),
@@ -725,7 +739,7 @@ export const storeSettings = sqliteTable('store_settings', {
 /** v6 crash recovery: persisted LabRunner container IDs so a restart can reclaim orphans. */
 export const labContainers = sqliteTable('lab_containers', {
   id: text('id').primaryKey().notNull(),
-  runId: text('run_id').notNull().references(() => runs.id),
+  runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   assignmentId: text('assignment_id'),
   containerName: text('container_name').notNull(),
   imageName: text('image_name'),
@@ -752,4 +766,28 @@ export const benchmarkRuns = sqliteTable('benchmark_runs', {
   createdAt: integer('created_at').notNull(),
 }, table => [
   index('benchmark_runs_suite').on(table.suite, table.createdAt),
+])
+
+/**
+ * v7 M4: append-only hash-chained tenant audit log.
+ * CRITICAL SAFETY INVARIANT: Intentionally has NO foreign key and NO `ON DELETE CASCADE` to
+ * `runs` or `projects` (enforced further by SQLite `BEFORE UPDATE`/`BEFORE DELETE` abort triggers)
+ * so audit records survive run and project deletion intact.
+ */
+export const tenantAuditLog = sqliteTable('tenant_audit_log', {
+  seq: integer('seq').primaryKey({ autoIncrement: true }),
+  id: text('id').notNull().unique(),
+  tenantId: text('tenant_id').notNull(),
+  runId: text('run_id'),
+  actor: text('actor').notNull(),
+  action: text('action').notNull(),
+  resourceKind: text('resource_kind').notNull(),
+  resourceId: text('resource_id'),
+  outcome: text('outcome').notNull(),
+  detail: text('detail', { mode: 'json' }).$type<Record<string, unknown>>().notNull(),
+  prevHash: text('prev_hash').notNull(),
+  entryHash: text('entry_hash').notNull(),
+  createdAt: integer('created_at').notNull(),
+}, table => [
+  index('tenant_audit_log_tenant').on(table.tenantId, table.seq),
 ])
