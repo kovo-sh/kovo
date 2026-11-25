@@ -19,6 +19,7 @@ import { redact, redactPii } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import { brokerExchanges, findings as findingsTable, replaySpecs, reports, retestRuns } from './schema.ts'
 import type { Store } from './store.ts'
+import { parseUnifiedDiff } from './unified-diff.ts'
 
 export interface SarifCodeLocation {
   repo?: string
@@ -137,7 +138,7 @@ export interface SarifCodeFlow {
 export interface SarifArtifactChange {
   artifactLocation: SarifArtifactLocation
   replacements: Array<{
-    deletedRegion: { startLine: number; endLine?: number }
+    deletedRegion: { startLine: number; startColumn?: number; endLine?: number; endColumn?: number }
     insertedContent: { text: string }
   }>
 }
@@ -276,82 +277,43 @@ function canonicalRuleId(finding: SarifFindingInput): { id: string; name: string
 function parseArtifactChangesFromPatch(patch: SarifPatchInput, secrets: readonly NamedSecret[]): SarifArtifactChange[] {
   const changes: SarifArtifactChange[] = []
 
-  // Parse unified diff hunks into standard OASIS SARIF 2.1.0 artifactChanges.
-  const lines = patch.diff.replace(/\r\n/g, '\n').split('\n')
-  let currentUri: string | null = null
-  let currentReplacements: SarifArtifactChange['replacements'] = []
-
-  const flush = () => {
-    if (currentUri && currentReplacements.length > 0) {
-      changes.push({
-        artifactLocation: { uri: currentUri },
-        replacements: currentReplacements,
-      })
-    }
-    currentUri = null
-    currentReplacements = []
-  }
-
-  let i = 0
-  while (i < lines.length) {
-    const line = lines[i]
-    if (line.startsWith('+++ ')) {
-      flush()
-      const rawPath = line.slice(4).split('\t')[0].trim().replace(/^[ab]\//, '')
-      currentUri = rawPath === '/dev/null' ? null : rawPath
-      i++
-      continue
-    }
-    const hunkMatch = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/)
-    if (hunkMatch && currentUri) {
-      const oldStart = Number(hunkMatch[1])
-      const oldCount = hunkMatch[2] !== undefined ? Number(hunkMatch[2]) : 1
-      i++
-      const inserted: string[] = []
-      let seenOld = 0
-      const newCount = hunkMatch[4] !== undefined ? Number(hunkMatch[4]) : 1
-      let seenNew = 0
-      while (i < lines.length) {
-        const l = lines[i]
-        if (l.startsWith('@@ ') || l.startsWith('--- ') || l.startsWith('+++ ') || l.startsWith('diff --git ')) break
-        if (l.startsWith('\\ No newline')) {
-          i++
-          continue
-        }
-        if (seenOld >= oldCount && seenNew >= newCount && l === '') {
-          i++
-          break
-        }
-        if (l.startsWith(' ')) {
-          inserted.push(l.slice(1))
-          seenOld++
-          seenNew++
-          i++
-        } else if (l.startsWith('-')) {
-          seenOld++
-          i++
-        } else if (l.startsWith('+')) {
-          inserted.push(l.slice(1))
-          seenNew++
-          i++
-        } else {
-          break
-        }
+  // M-24: Parse unified diff hunks strictly by declared line counts via shared parser,
+  // emitting zero-width deletedRegion for insertion-only hunks (`oldCount === 0`).
+  try {
+    const filePatches = parseUnifiedDiff(patch.diff, { allowEmpty: true })
+    for (const filePatch of filePatches) {
+      if (filePatch.isDelete) continue
+      const replacements: SarifArtifactChange['replacements'] = []
+      for (const hunk of filePatch.hunks) {
+        const inserted = hunk.entries
+          .filter(entry => entry.kind === 'context' || entry.kind === 'add')
+          .map(entry => entry.text)
+        const deletedRegion = hunk.oldCount === 0
+          ? (() => {
+              const insertLine = Math.max(1, hunk.oldStart === 0 ? 1 : hunk.oldStart + 1)
+              return { startLine: insertLine, startColumn: 1, endLine: insertLine, endColumn: 1 }
+            })()
+          : {
+              startLine: Math.max(1, hunk.oldStart),
+              endLine: Math.max(1, hunk.oldStart + hunk.oldCount - 1),
+            }
+        replacements.push({
+          deletedRegion,
+          insertedContent: {
+            text: redact(inserted.join('\n') + (inserted.length ? '\n' : ''), secrets),
+          },
+        })
       }
-      currentReplacements.push({
-        deletedRegion: {
-          startLine: Math.max(1, oldStart),
-          endLine: Math.max(1, oldStart + Math.max(oldCount, 1) - 1),
-        },
-        insertedContent: {
-          text: redact(inserted.join('\n') + (inserted.length ? '\n' : ''), secrets),
-        },
-      })
-      continue
+      if (replacements.length > 0) {
+        changes.push({
+          artifactLocation: { uri: filePatch.normalizedPath },
+          replacements,
+        })
+      }
     }
-    i++
+  } catch {
+    // Fall through to explicit codeLocations + fixAfter fallback when diff is unparseable.
   }
-  flush()
 
   // Fallback to explicit codeLocations + fixAfter if diff had no parseable hunks.
   if (changes.length === 0 && patch.codeLocations?.length && patch.fixAfter !== undefined) {

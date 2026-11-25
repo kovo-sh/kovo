@@ -22,6 +22,7 @@ import type { Stats } from 'node:fs'
 import type { Server as TcpServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { parseUnifiedDiff } from './unified-diff.ts'
 import {
   ContainerSupervisor,
   LAB_OWNER_PID_LABEL,
@@ -434,103 +435,6 @@ function writeFileNoFollow(fullPath: string, content: string, createOnly: boolea
     try { unlinkSync(tmpPath) } catch { /* ignore */ }
     throw err
   }
-}
-
-interface ParsedHunk {
-  oldStart: number
-  oldCount: number
-  newStart: number
-  newCount: number
-  lines: string[]
-}
-
-interface ParsedFilePatch {
-  oldPath: string
-  newPath: string
-  hunks: ParsedHunk[]
-}
-
-function parseUnifiedDiff(diffText: string): ParsedFilePatch[] {
-  const rawLines = diffText.replace(/\r\n/g, '\n').split('\n')
-  const patches: ParsedFilePatch[] = []
-  let i = 0
-
-  while (i < rawLines.length) {
-    const line = rawLines[i]
-    if (line.startsWith('--- ')) {
-      const oldPath = line.slice(4).split('\t')[0].trim()
-      const nextLine = rawLines[i + 1] ?? ''
-      if (!nextLine.startsWith('+++ ')) {
-        i++
-        continue
-      }
-      const newPath = nextLine.slice(4).split('\t')[0].trim()
-      i += 2
-      const hunks: ParsedHunk[] = []
-
-      while (i < rawLines.length) {
-        const hLine = rawLines[i]
-        if (hLine.startsWith('--- ') || hLine.startsWith('diff --git ')) break
-        const match = hLine.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/)
-        if (!match) {
-          i++
-          continue
-        }
-        const oldStart = Number(match[1])
-        const oldCount = match[2] !== undefined ? Number(match[2]) : 1
-        const newStart = Number(match[3])
-        const newCount = match[4] !== undefined ? Number(match[4]) : 1
-        i++
-        const hunkLines: string[] = []
-        let seenOld = 0
-        let seenNew = 0
-        while (i < rawLines.length) {
-          const contentLine = rawLines[i]
-          if (contentLine.startsWith('@@ ') || contentLine.startsWith('diff --git ') || contentLine.startsWith('--- ')) {
-            break
-          }
-          if (contentLine.startsWith('\\ No newline at end of file')) {
-            i++
-            continue
-          }
-          if (seenOld >= oldCount && seenNew >= newCount && contentLine === '') {
-            i++
-            break
-          }
-          if (contentLine.startsWith(' ')) {
-            hunkLines.push(contentLine)
-            seenOld++
-            seenNew++
-            i++
-          } else if (contentLine.startsWith('-')) {
-            hunkLines.push(contentLine)
-            seenOld++
-            i++
-          } else if (contentLine.startsWith('+')) {
-            hunkLines.push(contentLine)
-            seenNew++
-            i++
-          } else if (contentLine === '' && (seenOld < oldCount || seenNew < newCount)) {
-            hunkLines.push(' ')
-            seenOld++
-            seenNew++
-            i++
-          } else {
-            break
-          }
-        }
-        hunks.push({ oldStart, oldCount, newStart, newCount, lines: hunkLines })
-      }
-
-      if (hunks.length > 0) {
-        patches.push({ oldPath, newPath, hunks })
-      }
-      continue
-    }
-    i++
-  }
-
-  return patches
 }
 
 export function applyUnifiedDiffToDirectory(rootDir: string, diffText: string): { filesModified: string[] } {

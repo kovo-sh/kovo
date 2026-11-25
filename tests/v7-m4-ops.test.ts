@@ -11,7 +11,7 @@ import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant, Transport } from '../src/server/broker.ts'
 import { buildCoverageGapReport, formatCoverageGapMarkdown } from '../src/server/coverage-gaps.ts'
 import { GlobalKillSwitch, KillSwitchTrippedError } from '../src/server/kill-switch.ts'
-import { exportRunReceiptBundle, verifyProofReceiptBundle } from '../src/server/receipt-export.ts'
+import { exportRunReceiptBundle, getReceiptSigningPublicKey, verifyProofReceiptBundle } from '../src/server/receipt-export.ts'
 import { redactPii, redactZdr, redactZdrJsonValue } from '../src/server/redact.ts'
 import { exportReportMarkdown } from '../src/server/report-export.ts'
 import {
@@ -928,13 +928,17 @@ test('M4: portable ProofReceipt export signs/verifies, enforces ZDR & tenant iso
     assert.ok(!httpJson.includes('123-45-6789'))
     assert.ok(!httpJson.includes('sk_live_shouldNeverLeak123456'))
 
-    // Verify default workspace HMAC signature matches
-    const defaultSecret = createHash('sha256')
+    // Verify default workspace random 0600 Ed25519 signature (M-23: never derived from workspace.id)
+    assert.deepEqual(
+      verifyProofReceiptBundle(httpBundle, { algorithm: 'ed25519', publicKey: getReceiptSigningPublicKey(storage) }),
+      { valid: true, verifiedRecords: 1 },
+    )
+    const legacyWorkspaceSecret = createHash('sha256')
       .update(`kovo.receipt-export.v1\0${storage.workspace.id}`)
       .digest('hex')
-    assert.deepEqual(
-      verifyProofReceiptBundle(httpBundle, { algorithm: 'hmac-sha256', secret: defaultSecret }),
-      { valid: true, verifiedRecords: 1 },
+    assert.equal(
+      verifyProofReceiptBundle(httpBundle, { algorithm: 'hmac-sha256', secret: legacyWorkspaceSecret }).valid,
+      false,
     )
 
     // Cross-tenant HTTP export -> 403 TENANT_ISOLATION_DENIED

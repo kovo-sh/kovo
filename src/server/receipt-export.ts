@@ -9,8 +9,10 @@
  *  - Patch-retest proof verdicts (`retest_runs`),
  *  - Honest operational coverage-gap summary (`CoverageGapReport`).
  */
-import { createHash, createHmac, sign as cryptoSign, timingSafeEqual, verify as cryptoVerify } from 'node:crypto'
-import type { KeyLike } from 'node:crypto'
+import { createHash, createHmac, createPrivateKey, createPublicKey, generateKeyPairSync, sign as cryptoSign, timingSafeEqual, verify as cryptoVerify } from 'node:crypto'
+import type { KeyLike, KeyObject } from 'node:crypto'
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { desc, eq } from 'drizzle-orm'
 import { CAUSAL_EDGE_KINDS, REPLAY_MODES, compositeProofReceiptSchema } from './composite-receipt.ts'
 import type {
@@ -252,10 +254,106 @@ function scrubHeaders(headers: Record<string, string>, secrets: readonly NamedSe
   return out
 }
 
-function defaultSigningSecret(storage: Store): string {
+const RECEIPT_SIGNING_KEY_FILE = 'receipt-signing.ed25519.pem'
+const RECEIPT_SIGNING_PUB_FILE = 'receipt-signing.ed25519.pub.pem'
+
+export interface ReceiptSigningKeyPair {
+  privateKey: KeyObject
+  publicKey: KeyObject
+  keyId: string
+  privateKeyPath: string
+  publicKeyPath: string
+}
+
+function ed25519KeyId(publicKey: KeyObject): string {
+  const der = publicKey.export({ type: 'spki', format: 'der' })
+  return `ed25519:${createHash('sha256').update(der).digest('hex').slice(0, 16)}`
+}
+
+function readValidatedReceiptSigningKey(privateKeyPath: string, publicKeyPath: string): ReceiptSigningKeyPair {
+  const st = lstatSync(privateKeyPath)
+  if (st.isSymbolicLink() || !st.isFile()) {
+    throw new Error('Receipt signing private key must be a regular file.')
+  }
+  if ((st.mode & 0o077) !== 0) {
+    throw new Error('Receipt signing private key must have owner-only (0600) permissions.')
+  }
+  const pem = readFileSync(privateKeyPath, 'utf8')
+  const privateKey = createPrivateKey(pem)
+  if (privateKey.asymmetricKeyType !== 'ed25519') {
+    throw new Error('Receipt signing private key must be an Ed25519 key.')
+  }
+  const publicKey = createPublicKey(privateKey)
+  if (!existsSync(publicKeyPath)) {
+    try {
+      const publicPem = publicKey.export({ type: 'spki', format: 'pem' }).toString()
+      writeFileSync(publicKeyPath, publicPem, { mode: 0o644 })
+    } catch { /* best-effort convenience export */ }
+  }
+  return {
+    privateKey,
+    publicKey,
+    keyId: ed25519KeyId(publicKey),
+    privateKeyPath,
+    publicKeyPath,
+  }
+}
+
+/**
+ * Load or generate a random workspace Ed25519 signing keypair persisted with strict `0600`
+ * permissions under `<KOVO_DATA_DIR>/credentials/` (M-23). Never derives signing keys from
+ * workspace UUIDs or other public identifiers.
+ */
+export function loadOrCreateReceiptSigningKeyPair(storage: Store): ReceiptSigningKeyPair {
+  const credDir = join(storage.directory, 'credentials')
+  mkdirSync(credDir, { recursive: true, mode: 0o700 })
+  chmodSync(credDir, 0o700)
+  const privateKeyPath = join(credDir, RECEIPT_SIGNING_KEY_FILE)
+  const publicKeyPath = join(credDir, RECEIPT_SIGNING_PUB_FILE)
+
+  if (existsSync(privateKeyPath)) {
+    return readValidatedReceiptSigningKey(privateKeyPath, publicKeyPath)
+  }
+
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519')
+  const privatePem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString()
+  const publicPem = publicKey.export({ type: 'spki', format: 'pem' }).toString()
+  try {
+    writeFileSync(privateKeyPath, privatePem, { mode: 0o600, flag: 'wx' })
+    chmodSync(privateKeyPath, 0o600)
+  } catch (err) {
+    if ((err as { code?: string }).code === 'EEXIST') {
+      return readValidatedReceiptSigningKey(privateKeyPath, publicKeyPath)
+    }
+    throw err
+  }
+  writeFileSync(publicKeyPath, publicPem, { mode: 0o644 })
+  return {
+    privateKey,
+    publicKey,
+    keyId: ed25519KeyId(publicKey),
+    privateKeyPath,
+    publicKeyPath,
+  }
+}
+
+/** Return the workspace's Ed25519 public key for verifying default-signed receipt bundles. */
+export function getReceiptSigningPublicKey(storage: Store): KeyObject {
+  return loadOrCreateReceiptSigningKeyPair(storage).publicKey
+}
+
+function resolveDefaultSigningOptions(storage: Store): ReceiptBundleSignOptions {
   const fromEnv = (process.env.KOVO_RECEIPT_SIGNING_KEY ?? '').trim()
-  if (fromEnv.length >= 16) return fromEnv
-  return createHash('sha256').update(`kovo.receipt-export.v1\0${storage.workspace.id}`).digest('hex')
+  if (fromEnv.length >= 16) {
+    if (fromEnv.startsWith('-----BEGIN ')) {
+      const privateKey = createPrivateKey(fromEnv)
+      const publicKey = createPublicKey(privateKey)
+      return { algorithm: 'ed25519', privateKey, keyId: ed25519KeyId(publicKey) }
+    }
+    return { algorithm: 'hmac-sha256', secret: fromEnv, keyId: 'env:kovo-receipt-signing-key' }
+  }
+  const pair = loadOrCreateReceiptSigningKeyPair(storage)
+  return { algorithm: 'ed25519', privateKey: pair.privateKey, keyId: pair.keyId }
 }
 
 function buildCommandHint(steps: readonly PortableReproducerStep[]): string {
@@ -786,11 +884,7 @@ export function exportRunReceiptBundle(
     coverageGaps,
   }
   const payloadSha256 = sha256Hex(canonicalJson(payload))
-  const signing: ReceiptBundleSignOptions = options.signing ?? {
-    algorithm: 'hmac-sha256',
-    secret: defaultSigningSecret(storage),
-    keyId: `workspace:${storage.workspace.id.slice(0, 8)}`,
-  }
+  const signing: ReceiptBundleSignOptions = options.signing ?? resolveDefaultSigningOptions(storage)
   const bytes = payloadSigningBytes(payload, payloadSha256)
   const signature = signing.algorithm === 'hmac-sha256'
     ? createHmac('sha256', signing.secret).update(bytes).digest('base64url')
