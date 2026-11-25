@@ -13,6 +13,8 @@ import {
   assessMarkupImpact,
   assessMfaBypass,
   assessStatusOnlyDivergence,
+  flattenJson,
+  isMutatingMethod,
   isReadMethod,
   matchInjectionFingerprint,
   normalizeRole,
@@ -20,6 +22,7 @@ import {
   assessReadDisclosure,
 } from './oracle-invariants.ts'
 import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, ActorIdentity } from './oracle-invariants.ts'
+import { isJobOrHandleStub } from './v8-oracle-families.ts'
 
 // ---------------------------------------------------------------------------
 // Constants shared with the container mount (worker-backend) and both SDKs.
@@ -275,9 +278,7 @@ export class TranscriptStore {
         method,
         pathAndQuery: record.request?.pathAndQuery ?? null,
         origin: record.request?.origin ?? null,
-        status: record.response?.status != null && Number.isFinite(Number(record.response.status))
-      ? Number(record.response.status)
-      : null,
+        status: recordStatus(record),
         durationMs: record.durationMs,
         error: record.error ?? null,
         signature: record.signature,
@@ -485,6 +486,8 @@ export interface VerifyOracleResult {
   missingEvidence?: string[]
   /** Compact role-labelled transcript so a repair can be made in one turn. */
   transcriptSummary?: TranscriptSummary[]
+  /** Primary probe endpoint pathAndQuery derived from the cited exchanges, when available. */
+  endpoint?: string | null
 }
 
 export interface VerifyClaimContext {
@@ -917,10 +920,7 @@ function transcriptImpactStep(
   const record = store.get(id)
   if (!record) return null
   const body = store.body(id)
-  let json: unknown
-  if (body !== undefined) {
-    try { json = JSON.parse(body) } catch { json = undefined }
-  }
+  const json = parseJsonBody(body)
   const handle = record.request?.personaHandle ?? null
   // Host-signed persona label wins; a script cannot manufacture a role or tenant differential.
   const signedLabel = record.request?.actorRoleLabel ?? null
@@ -943,9 +943,7 @@ function transcriptImpactStep(
     method: (record.request?.method ?? 'GET').toUpperCase(),
     route: (record.request?.pathAndQuery ?? '/').split('?')[0].replace(/\/+$/, '').toLowerCase() || '/',
     pathAndQuery: record.request?.pathAndQuery ?? '/',
-    status: record.response?.status != null && Number.isFinite(Number(record.response.status))
-      ? Number(record.response.status)
-      : null,
+    status: recordStatus(record),
     actor,
     json,
     body: body ?? '',
@@ -965,10 +963,7 @@ function transcriptBoundaryStep(
   const record = store.get(id)
   if (!record) return null
   const body = store.body(id)
-  let json: unknown
-  if (body !== undefined) {
-    try { json = JSON.parse(body) } catch { json = undefined }
-  }
+  const json = parseJsonBody(body)
   const handle = record.request?.personaHandle ?? null
   const roles = 'actorRoles' in claim ? claim.actorRoles : undefined
   const tenants = 'actorTenants' in claim ? claim.actorTenants : undefined
@@ -986,16 +981,8 @@ function transcriptBoundaryStep(
     method: (record.request?.method ?? 'GET').toUpperCase(),
     route: (record.request?.pathAndQuery ?? '/').split('?')[0].replace(/\/+$/, '').toLowerCase() || '/',
     pathAndQuery: record.request?.pathAndQuery ?? '/',
-    status: record.response?.status != null && Number.isFinite(Number(record.response.status))
-      ? Number(record.response.status)
-      : null,
-    actor: {
-      handle,
-      role,
-      tenant,
-      auth: 'unknown',
-      sameSite: null,
-    },
+    status: recordStatus(record),
+    actor: { handle, role, tenant, auth: 'unknown', sameSite: null },
     json,
     body: body ?? '',
     requestHeaders: record.request?.headers ?? null,
@@ -1003,38 +990,82 @@ function transcriptBoundaryStep(
   }
 }
 
-function evaluateBoundaryClaim(
-  store: TranscriptStore,
-  claim: Extract<VerifyClaim, { kind: 'boundary' }>,
-  context: VerifyClaimContext,
-): VerifyClaimCheck {
-  const requireRecord = (id: string): VerifyTranscriptRecord | null => {
-    if (context.allowedExchangeIds && !context.allowedExchangeIds.has(id)) return null
-    return store.get(id) ?? null
+const LIFECYCLE_STATE_KEY_RE = /^(?:status|state|workflow[_-]?status|workflow[_-]?state|approval[_-]?status|approval[_-]?state|lifecycle[_-]?state|lifecycle[_-]?status|stage|phase)$/i
+const INTERMEDIATE_STATE_VAL_RE = /^(?:draft|queued|pending(?:[_-](?:approval|review|verification|settlement|execution|processing))?|awaiting[_-](?:approval|review|verification|settlement|confirmation)|unapproved|unverified|scheduled|enqueued|staged|initiated|requested|submitted|processing|in[_-]progress|accepted|primed)$/i
+const FINALIZED_STATE_VAL_RE = /^(?:approved|settled|paid|disbursed|released|completed|fulfilled|captured|executed|published|active|confirmed|verified|granted|promoted|revoked|deleted|voided|refunded)$/i
+const UNAPPROVED_BOOL_KEY_RE = /^(?:requires[_-]?approval|needs[_-]?approval|pending[_-]?approval|is[_-]?draft)$/i
+const TERMINAL_BOOL_KEY_RE = /^(?:approved|settled|disbursed|verified|finalized|published|executed)$/i
+const COLLECTION_COUNT_KEY_RE = /^(?:count|total_?count|length|size|updated_?at|version)$/i
+export const STANDALONE_TERMINAL_IMPACT_HINT =
+  'terminal_impact_unproven: creating or fetching an intermediate draft/queued/pending object or handle stub is NOT terminal security impact — prove unauthorized cross-tenant data exposure, privileged state settlement/approval, economic conservation violation, or chain the intermediate capability via ctx.seal_capability + ctx.prove_composite.'
+
+const parseJsonBody = (body: string | undefined): unknown => { if (!body?.trim()) return undefined; try { return JSON.parse(body) } catch { return undefined } }
+const recordStatus = (r: VerifyTranscriptRecord | undefined): number | null => (r?.response?.status != null && Number.isFinite(Number(r.response.status)) ? Number(r.response.status) : null)
+const stubRejection = (claim: VerifyClaim, state: string | null, base: Record<string, unknown> = {}): VerifyClaimCheck =>
+  ({ claim, passed: false, detail: STANDALONE_TERMINAL_IMPACT_HINT, observed: { ...base, intermediateStub: true, stubState: state, rejectedBy: 'terminal_impact_unproven' } })
+
+function intermediateLifecycleState(json: unknown, status?: number | null, beforeFlat?: Map<string, string>): { state: string | null; existingMutated: boolean } {
+  if (!json || typeof json !== 'object') return { state: null, existingMutated: false }
+  let state: string | null = null, existingMutated = false
+  for (const [path, rawVal] of flattenJson(json)) {
+    const existed = Boolean(beforeFlat?.has(path))
+    if (existed && beforeFlat!.get(path) === rawVal) continue
+    const leaf = (path.replace(/\[\d+\]/g, '').split('.').pop() ?? '').toLowerCase(), val = rawVal.trim()
+    if (LIFECYCLE_STATE_KEY_RE.test(leaf)) {
+      if (FINALIZED_STATE_VAL_RE.test(val)) return { state: null, existingMutated }
+      if (!state && INTERMEDIATE_STATE_VAL_RE.test(val)) state = val.toLowerCase()
+    } else if (!state && UNAPPROVED_BOOL_KEY_RE.test(leaf) && val.toLowerCase() === 'true') state = 'unapproved'
+    else if (!state && (status === 201 || status === 202) && TERMINAL_BOOL_KEY_RE.test(leaf) && val.toLowerCase() === 'false') state = 'unapproved'
+    else if (existed && !COLLECTION_COUNT_KEY_RE.test(leaf)) existingMutated = true
   }
-  if (!requireRecord(claim.controlExchangeId)) {
-    return { claim, passed: false, detail: `Unknown control exchange ${claim.controlExchangeId} for a boundary claim.` }
+  return { state, existingMutated }
+}
+
+export function detectIntermediateStub(record: VerifyTranscriptRecord | undefined, body: string | undefined): { isStub: boolean; pureJobStub: boolean; state: string | null } {
+  const status = recordStatus(record)
+  if (!record || status === null || status < 200 || status >= 300) return { isStub: false, pureJobStub: false, state: null }
+  const json = parseJsonBody(body), method = (record.request?.method ?? 'GET').toUpperCase()
+  if (isJobOrHandleStub(json, body, status, method, record.request?.pathAndQuery ?? '')) {
+    return { isStub: true, pureJobStub: true, state: intermediateLifecycleState(json, status).state ?? 'handle_stub' }
   }
-  if (!requireRecord(claim.probeExchangeId)) {
-    return { claim, passed: false, detail: `Unknown probe exchange ${claim.probeExchangeId} for a boundary claim.` }
+  if (method === 'POST' || method === 'PUT') {
+    const { state } = intermediateLifecycleState(json, status)
+    if (state) return { isStub: true, pureJobStub: false, state }
   }
+  return { isStub: false, pureJobStub: false, state: null }
+}
+
+function afterReadbackIsIntermediateOnly(beforeBody: string | undefined, afterRec: VerifyTranscriptRecord | undefined, afterBody: string | undefined): { isStub: boolean; pureJobStub: boolean; state: string | null } {
+  const status = recordStatus(afterRec)
+  if (!afterRec || status === null || status < 200 || status >= 300) return { isStub: false, pureJobStub: false, state: null }
+  const afterJson = parseJsonBody(afterBody)
+  if (isJobOrHandleStub(afterJson, afterBody, status, afterRec.request?.method, afterRec.request?.pathAndQuery)) {
+    return { isStub: true, pureJobStub: true, state: intermediateLifecycleState(afterJson, status).state ?? 'handle_stub' }
+  }
+  const beforeJson = parseJsonBody(beforeBody)
+  const beforeFlat = beforeJson && typeof beforeJson === 'object' ? flattenJson(beforeJson) : new Map<string, string>()
+  const { state, existingMutated } = intermediateLifecycleState(afterJson, status, beforeFlat)
+  return state && !existingMutated ? { isStub: true, pureJobStub: false, state } : { isStub: false, pureJobStub: false, state: null }
+}
+
+function evaluateBoundaryClaim(store: TranscriptStore, claim: Extract<VerifyClaim, { kind: 'boundary' }>, context: VerifyClaimContext): VerifyClaimCheck {
+  const okId = (id: string) => (!context.allowedExchangeIds || context.allowedExchangeIds.has(id)) && Boolean(store.get(id))
+  if (!okId(claim.controlExchangeId)) return { claim, passed: false, detail: `Unknown control exchange ${claim.controlExchangeId} for a boundary claim.` }
+  if (!okId(claim.probeExchangeId)) return { claim, passed: false, detail: `Unknown probe exchange ${claim.probeExchangeId} for a boundary claim.` }
   const control = transcriptBoundaryStep(store, claim, claim.controlExchangeId, 'control')
   const probe = transcriptBoundaryStep(store, claim, claim.probeExchangeId, 'probe')
-  if (!control || !probe) {
-    return { claim, passed: false, detail: 'Boundary claim references an unreadable exchange.' }
-  }
+  if (!control || !probe) return { claim, passed: false, detail: 'Boundary claim references an unreadable exchange.' }
   const assessment = assessBoundary({
     boundaryClass: claim.boundaryClass,
     impactClass: claim.boundaryClass === 'access' ? 'authorization' : 'other',
     steps: [control, probe],
     expectControlDenied: claim.expectControlDenied,
   })
-  return {
-    claim,
-    passed: assessment.required && assessment.satisfied,
-    detail: assessment.reason,
-    observed: assessment.evidence,
+  if (assessment.required && assessment.satisfied) {
+    const stub = detectIntermediateStub(store.get(claim.probeExchangeId), store.body(claim.probeExchangeId))
+    if (stub.isStub) return stubRejection(claim, stub.state, assessment.evidence)
   }
+  return { claim, passed: assessment.required && assessment.satisfied, detail: assessment.reason, observed: assessment.evidence }
 }
 
 function evaluateMfaClaim(
@@ -1112,12 +1143,20 @@ function evaluateImpactClaim(
     oracleEvents: claim.oracleEvents,
     targetOrigin: probeRecord?.request?.origin ?? null,
   })
-  return {
-    claim,
-    passed: assessment.required && assessment.satisfied,
-    detail: assessment.reason,
-    ...(assessment.evidence ? { observed: assessment.evidence } : {}),
+  if (assessment.required && assessment.satisfied && claim.impactClass !== 'injection' && claim.impactClass !== 'markup' && claim.impactClass !== 'csrf') {
+    const probeStub = detectIntermediateStub(probeRecord, store.body(claim.probeExchangeId))
+    if (probeStub.isStub) {
+      const obs = asRecord(assessment.evidence)
+      const hasBoundaryCrossing = obs?.crossTenant === true || obs?.roleDifferential === true
+      const afterStub = claim.afterExchangeId
+        ? afterReadbackIsIntermediateOnly(claim.beforeExchangeId ? store.body(claim.beforeExchangeId) : undefined, store.get(claim.afterExchangeId), store.body(claim.afterExchangeId))
+        : null
+      if (afterStub ? afterStub.isStub && ((probeStub.pureJobStub && afterStub.pureJobStub) || !hasBoundaryCrossing) : (probeStub.pureJobStub || !hasBoundaryCrossing)) {
+        return stubRejection(claim, afterStub?.state ?? probeStub.state, assessment.evidence ?? {})
+      }
+    }
   }
+  return { claim, passed: assessment.required && assessment.satisfied, detail: assessment.reason, ...(assessment.evidence ? { observed: assessment.evidence } : {}) }
 }
 
 /** Active-markup evidence over the exchanges a proof already asserts (never a bare tag). */
@@ -1137,9 +1176,7 @@ function implicitMarkupEvidence(
       arm: (record.request?.sessionRole as ImpactStep['arm'] | null) ?? 'setup',
       method: (record.request?.method ?? 'GET').toUpperCase(),
       route: (record.request?.pathAndQuery ?? '/').split('?')[0],
-      status: record.response?.status != null && Number.isFinite(Number(record.response.status))
-      ? Number(record.response.status)
-      : null,
+      status: recordStatus(record),
       actor: { handle: record.request?.personaHandle ?? null, role: normalizeRole(record.request?.personaHandle ?? null), tenant: null, auth: 'unknown', sameSite: null },
       body,
     })
@@ -1152,31 +1189,13 @@ function implicitMarkupEvidence(
 function claimedExchangeIds(claims: readonly VerifyClaim[]): string[] {
   const ids = new Set<string>()
   for (const claim of claims) {
-    if (claim.kind === 'timing') continue
-    if (claim.kind === 'structural_diff') {
-      for (const id of claim.controlIds) ids.add(id)
-      for (const id of claim.variantIds) ids.add(id)
-      continue
-    }
-    if (claim.kind === 'race') {
-      for (const id of claim.exchangeIds) ids.add(id)
-      continue
-    }
-    if (claim.kind === 'impact') continue
-    if (claim.kind === 'boundary') {
-      ids.add(claim.controlExchangeId)
-      ids.add(claim.probeExchangeId)
-      continue
-    }
+    if (claim.kind === 'timing' || claim.kind === 'impact') continue
+    if (claim.kind === 'structural_diff') { for (const id of [...claim.controlIds, ...claim.variantIds]) ids.add(id); continue }
+    if (claim.kind === 'race' || claim.kind === 'composite_receipt') { for (const id of claim.exchangeIds) ids.add(id); continue }
+    if (claim.kind === 'boundary') { ids.add(claim.controlExchangeId); ids.add(claim.probeExchangeId); continue }
     if (claim.kind === 'mfa') {
-      ids.add(claim.enrolledExchangeId)
-      ids.add(claim.preChallengeExchangeId)
-      ids.add(claim.postChallengeExchangeId)
+      ids.add(claim.enrolledExchangeId); ids.add(claim.preChallengeExchangeId); ids.add(claim.postChallengeExchangeId)
       if (claim.challengeExchangeId) ids.add(claim.challengeExchangeId)
-      continue
-    }
-    if (claim.kind === 'composite_receipt') {
-      for (const id of claim.exchangeIds) ids.add(id)
       continue
     }
     ids.add(claim.exchangeId)
@@ -1188,37 +1207,20 @@ function claimedExchangeIds(claims: readonly VerifyClaim[]): string[] {
  * An authorization-titled proof without an `impact` claim still has to expose an owner-scoped
  * non-public attribute in its probe exchange. Status and self-echoed fields are not disclosure.
  */
-function implicitReadDisclosure(
-  store: TranscriptStore,
-  claims: readonly VerifyClaim[],
-  context: VerifyClaimContext,
-): { satisfied: boolean; reason: string } {
+function implicitReadDisclosure(store: TranscriptStore, claims: readonly VerifyClaim[], context: VerifyClaimContext): { satisfied: boolean; reason: string } {
   const steps: ImpactStep[] = []
   for (const id of claimedExchangeIds(claims)) {
     if (context.allowedExchangeIds && !context.allowedExchangeIds.has(id)) continue
     const record = store.get(id)
     if (!record) continue
-    const body = store.body(id)
-    let json: unknown
-    if (body !== undefined) {
-      try { json = JSON.parse(body) } catch { json = undefined }
-    }
-    const handle = record.request?.personaHandle ?? null
+    const body = store.body(id), handle = record.request?.personaHandle ?? null
     steps.push({
       id,
       arm: (record.request?.sessionRole as ImpactStep['arm'] | null) ?? 'setup',
       method: (record.request?.method ?? 'GET').toUpperCase(),
-      status: record.response?.status != null && Number.isFinite(Number(record.response.status))
-      ? Number(record.response.status)
-      : null,
-      actor: {
-        handle,
-        role: normalizeRole(handle),
-        tenant: parseRoleLabel(handle).tenant,
-        auth: 'unknown',
-        sameSite: null,
-      },
-      json,
+      status: recordStatus(record),
+      actor: { handle, role: normalizeRole(handle), tenant: parseRoleLabel(handle).tenant, auth: 'unknown', sameSite: null },
+      json: parseJsonBody(body),
       body: body ?? '',
       ...(record.seq !== undefined ? { seq: record.seq } : {}),
     } as ImpactStep & { seq: number })
@@ -1461,6 +1463,14 @@ export function evaluateClaim(
       const minDelta = Math.max(1, Math.min(claim.minDeltaTokens ?? 1, 32))
       const maxSimilarity = claim.maxSimilarity ?? 1
       const distinct = !cross.normalizedEqual && stableDelta.length >= minDelta && cross.similarity < maxSimilarity
+      const diffObs = { stableDelta: stableDelta.slice(0, 16), similarity: Number(cross.similarity.toFixed(4)), rounds: controls.length, stableControl: !unstableControl, stableVariant: !unstableVariant }
+      if (distinct) {
+        const vStubs = claim.variantIds.map((id, i) => detectIntermediateStub(store.get(id), variants[i]))
+        if (vStubs.every(s => s.isStub) && variants.every(b => matchInjectionFingerprint(b) === null) &&
+            (vStubs.every(s => s.pureJobStub) || claim.controlIds.every(id => (recordStatus(store.get(id)) ?? 0) >= 400))) {
+          return stubRejection(claim, vStubs[0]?.state ?? 'draft', diffObs)
+        }
+      }
       // A changed token must be present in the same direction in every round: intersect alone can
       // keep tokens that rotate between two unrelated arms, so require the first arm's delta.
       return {
@@ -1469,13 +1479,7 @@ export function evaluateClaim(
         detail: distinct
           ? `Structural differential: ${stableDelta.length} stable token(s) changed between arms (similarity ${cross.similarity.toFixed(3)}).`
           : `No stable structural differential: ${stableDelta.length} stable changed token(s), similarity ${cross.similarity.toFixed(3)}; ${cross.normalizedEqual ? 'the arms are identical after token stripping' : 'the delta is not stable across rounds'}.`,
-        observed: {
-          stableDelta: stableDelta.slice(0, 16),
-          similarity: Number(cross.similarity.toFixed(4)),
-          rounds: controls.length,
-          stableControl: !unstableControl,
-          stableVariant: !unstableVariant,
-        },
+        observed: diffObs,
       }
     }
     case 'race': {
@@ -1593,6 +1597,7 @@ export function describeMissingEvidence(check: VerifyClaimCheck): string[] {
   if (check.passed) return []
   const missing = new Set<string>()
   const observed = check.observed ?? {}
+  if (observed.rejectedBy === 'terminal_impact_unproven') return ['terminal_impact_unproven']
   const detail = check.detail ?? ''
   const claim = check.claim
   const bool = (key: string): boolean | null => typeof observed[key] === 'boolean' ? observed[key] as boolean : null
@@ -1708,10 +1713,7 @@ function transcriptStatusSteps(store: TranscriptStore): ImpactStep[] {
     if (!record.request) continue
     if (record.op !== 'http' && record.op !== 'http2') continue
     const body = store.body(record.exchangeId) ?? ''
-    let json: unknown
-    if (body) {
-      try { json = JSON.parse(body) } catch { json = undefined }
-    }
+    const json = parseJsonBody(body)
     const role = record.request.sessionRole
     const arm: ImpactStep['arm'] = role === 'probe' || role === 'control' ? role : 'setup'
     const handle = record.request.personaHandle ?? null
@@ -1722,14 +1724,8 @@ function transcriptStatusSteps(store: TranscriptStore): ImpactStep[] {
       method: record.request.method.toUpperCase(),
       route: (record.request.pathAndQuery || '/').split('?')[0],
       pathAndQuery: record.request.pathAndQuery,
-      status: record.response ? Number(record.response.status) : null,
-      actor: {
-        handle,
-        role: normalizeRole(label ?? handle),
-        tenant: parseRoleLabel(label ?? handle ?? '').tenant ?? null,
-        auth: 'unknown',
-        sameSite: null,
-      },
+      status: recordStatus(record),
+      actor: { handle, role: normalizeRole(label ?? handle), tenant: parseRoleLabel(label ?? handle ?? '').tenant ?? null, auth: 'unknown', sameSite: null },
       ...(json !== undefined ? { json } : {}),
       body,
       requestHeaders: record.request.headers,
@@ -1859,30 +1855,66 @@ export function evaluateClaims(
       failures.push('boundary: access-control claim requires a denied/challenged control plus a crossing variant, or an actor/precondition differential backed by data/state evidence.')
     }
   }
+  // Standalone intermediate-stub gate: reject non-composite proofs whose succeeding probes only
+  // create or poll a draft/queued/pending object or handle stub with no terminal security impact.
+  const hasTerminalOracle = checks.some(c => c.passed && ['composite_receipt', 'oob', 'dom_sentinel', 'timing', 'mfa', 'race', 'impact', 'boundary'].includes(c.claim.kind))
+  const hasEvaluatedOrFp = checks.some(p => {
+    if (!p.passed) return false
+    if (matchInjectionFingerprint(claimEvidenceText(store, p)) !== null) return true
+    const pc = p.claim
+    if (pc.kind !== 'body_contains' || pc.absent === true || pc.text.length < 4) return false
+    return checks.some(a => a.passed && a.claim.kind === 'body_contains' && a.claim.absent === true && a.claim.text === pc.text &&
+      a.claim.exchangeId !== pc.exchangeId && ((s: number | null) => s !== null && s >= 200 && s < 300)(recordStatus(store.get(a.claim.exchangeId))))
+  })
+  const citedRecords = claimedExchangeIds(claims)
+    .filter(id => !context.allowedExchangeIds || context.allowedExchangeIds.has(id))
+    .map(id => store.get(id))
+    .filter((rec): rec is VerifyTranscriptRecord => Boolean(rec?.request && rec.response && (rec.op === 'http' || rec.op === 'http2')))
+  if (!hasTerminalOracle && !hasEvaluatedOrFp) {
+    const ok2xx = citedRecords.filter(r => { const s = recordStatus(r); return s !== null && s >= 200 && s < 300 })
+    const probe2xx = ok2xx.filter(r => r.request?.sessionRole === 'probe')
+    const mut2xx = ok2xx.filter(r => isMutatingMethod(r.request?.method))
+    const primary2xx = probe2xx.length > 0 ? probe2xx : (mut2xx.length > 0 ? mut2xx : ok2xx)
+    if (primary2xx.length > 0 && primary2xx.every(r => detectIntermediateStub(r, store.body(r.exchangeId)).isStub)) {
+      const minProbeSeq = Math.min(...primary2xx.map(r => r.seq))
+      const beforeBody = [...ok2xx].reverse().find(r => r.seq < minProbeSeq && !isMutatingMethod(r.request?.method))
+      const probeActors = new Set(primary2xx.map(r => r.request?.personaHandle ?? null))
+      const hasNonStubAfter = ok2xx.some(r =>
+        r.seq > minProbeSeq && !primary2xx.includes(r) && !detectIntermediateStub(r, store.body(r.exchangeId)).isStub &&
+        !(probeActors.has(r.request?.personaHandle ?? null) && afterReadbackIsIntermediateOnly(beforeBody ? store.body(beforeBody.exchangeId) : undefined, r, store.body(r.exchangeId)).isStub))
+      if (!hasNonStubAfter) failures.push(STANDALONE_TERMINAL_IMPACT_HINT)
+    }
+  }
   const failedCheck = checks.find(check => !check.passed) ?? null
   const missingEvidence = new Set<string>()
   for (const check of checks) for (const item of describeMissingEvidence(check)) missingEvidence.add(item)
-  if (failures.some(failure => /impact: (?:authorization|disclosure) claim dismissed/.test(failure))) missingEvidence.add('owner_scoped_disclosure')
-  if (failures.some(failure => /markup claim dismissed/.test(failure))) missingEvidence.add('executable_markup')
-  if (failures.some(failure => /impact: .* requires a passing impact-evidence claim/.test(failure))) missingEvidence.add('impact_claim')
-  if (failures.some(failure => /^boundary: authentication/.test(failure))) missingEvidence.add('boundary_claim')
-  if (failures.some(failure => /^boundary: MFA/.test(failure))) missingEvidence.add('mfa_claim')
-  if (failures.some(failure => /^boundary: access-control/.test(failure))) missingEvidence.add('boundary_or_disclosure')
+  if (failures.some(f => f.startsWith('terminal_impact_unproven:'))) missingEvidence.add('terminal_impact_unproven')
+  if (failures.some(f => /impact: (?:authorization|disclosure) claim dismissed/.test(f))) missingEvidence.add('owner_scoped_disclosure')
+  if (failures.some(f => /markup claim dismissed/.test(f))) missingEvidence.add('executable_markup')
+  if (failures.some(f => /impact: .* requires a passing impact-evidence claim/.test(f))) missingEvidence.add('impact_claim')
+  if (failures.some(f => /^boundary: authentication/.test(f))) missingEvidence.add('boundary_claim')
+  if (failures.some(f => /^boundary: MFA/.test(f))) missingEvidence.add('mfa_claim')
+  if (failures.some(f => /^boundary: access-control/.test(f))) missingEvidence.add('boundary_or_disclosure')
   const rejectedBy = failedCheck
-    ? (failedCheck.claim.kind === 'composite_receipt' && typeof failedCheck.observed?.rejectedBy === 'string'
-        ? failedCheck.observed.rejectedBy
-        : failedCheck.claim.kind)
+    ? (typeof failedCheck.observed?.rejectedBy === 'string' ? failedCheck.observed.rejectedBy : failedCheck.claim.kind)
     : failures.length > 0
-      ? (failures.some(failure => failure.startsWith('boundary:')) ? 'boundary_gate' : failures.some(failure => failure.startsWith('impact:')) ? 'impact_gate' : 'oracle')
+      ? (failures.some(f => f.startsWith('terminal_impact_unproven:')) ? 'terminal_impact_unproven'
+          : failures.some(f => f.startsWith('boundary:')) ? 'boundary_gate'
+            : failures.some(f => f.startsWith('impact:')) ? 'impact_gate' : 'oracle')
       : null
+  const impactProbeId = claims.find((c): c is Extract<VerifyClaim, { kind: 'impact' }> => c.kind === 'impact')?.probeExchangeId
+  const endpoint = citedRecords.find(r => r.request?.sessionRole === 'probe')?.request?.pathAndQuery
+    ?? (impactProbeId ? store.get(impactProbeId)?.request?.pathAndQuery : undefined)
+    ?? citedRecords[citedRecords.length - 1]?.request?.pathAndQuery ?? null
   return {
     passed: checks.length > 0 && failures.length === 0,
     checks,
     failures,
     transcriptDigest: store.digest(),
     rejectedBy,
-    ...(failures.length > 0 ? { missingEvidence: [...missingEvidence] } : { missingEvidence: [] }),
+    missingEvidence: failures.length > 0 ? [...missingEvidence] : [],
     transcriptSummary: store.summaries(),
+    endpoint,
   }
 }
 
