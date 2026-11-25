@@ -32,6 +32,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -1189,6 +1190,1034 @@ export function extractCompositeReceipts(input: {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Structured Run Telemetry Extraction (Phase timing, Scheduler/Waste, CapabilityLedger, v8 SDK)
+// ---------------------------------------------------------------------------------------------
+
+export interface MultihopPhaseTimingTelemetry {
+  codeAuditMs: number | null
+  floorMs: number | null
+  phaseBStartMs: number | null
+  firstChainDispatchMs: number | null
+  totalWallMs: number
+}
+
+export interface MultihopSchedulerTelemetry {
+  maxEffectiveConcurrency: number
+  workersStarted: number
+  workersCompleted: number
+  wallClockRotations: number
+  maxWorkerWallMs: number | null
+  totalPhaseBAssignments: number
+  deadEndReprobes: number
+  deadEndWastePct: number
+}
+
+export interface MultihopCapabilityLedgerTelemetry {
+  nodesTotal: number
+  capabilityOnlyCount: number
+  sealedHandlesCount: number
+  causalEdgesCount: number
+  negativeEdgesPrunedCount: number
+  compositeReceiptsCount: number
+}
+
+export interface MultihopV8SdkAdoptionTelemetry {
+  guardianVerifyCalls: number
+  sealCapabilityCalls: number
+  hmacSignCalls: number
+  jwtSignCalls: number
+  awaitAsyncCalls: number
+  proveCompositeCalls: number
+  compositeConfirmed: number
+  topRejectReasons: Array<{ reason: string; count: number }>
+}
+
+export interface MultihopRunTelemetry {
+  phaseTiming: MultihopPhaseTimingTelemetry
+  scheduler: MultihopSchedulerTelemetry
+  capabilityLedger: MultihopCapabilityLedgerTelemetry
+  v8SdkAdoption: MultihopV8SdkAdoptionTelemetry
+}
+
+export interface MultihopFrontierWasteSnapshot {
+  deadEndReprobeCount: number
+  totalAssignmentsDispatched: number
+  phaseBAssignments: number
+  deadEndReprobeWasteRate: number
+}
+
+export interface ExtractMultihopRunTelemetryOptions {
+  /** Override run wall-clock start timestamp (epoch ms). */
+  runStartedAtMs?: number
+  /** Override run wall-clock end timestamp (epoch ms). */
+  runEndedAtMs?: number
+  /** Optional Guardian data dir containing read-only `agent-sessions/*.sqlite` for SDK call counts. */
+  dataDir?: string
+  /** Optional live FrontierWaveController telemetry snapshot from Execution. */
+  frontierTelemetry?: {
+    totalAssignmentsDispatched?: number
+    deadEndReprobeCount?: number
+    deadEndReprobeWasteRate?: number
+    prunedEdgeCount?: number
+  } | null
+  /** Optional pre-extracted composite receipt count from run grading. */
+  compositeReceiptsExtracted?: number
+}
+
+type SqliteRow = Record<string, unknown>
+
+function resolveSqliteHandle(
+  db: DatabaseSync | Pick<Store, 'client' | 'directory'>,
+): { client: DatabaseSync; directory?: string } {
+  if ('client' in db && db.client && typeof db.client.prepare === 'function') {
+    return { client: db.client, directory: db.directory }
+  }
+  return { client: db as DatabaseSync }
+}
+
+function listExistingTables(db: DatabaseSync): Set<string> {
+  const rows = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as SqliteRow[]
+  const out = new Set<string>()
+  for (const row of rows) {
+    if (typeof row.name === 'string') out.add(row.name)
+  }
+  return out
+}
+
+function listTableColumns(db: DatabaseSync, table: string): Set<string> {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as SqliteRow[]
+  const out = new Set<string>()
+  for (const row of rows) {
+    if (typeof row.name === 'string') out.add(row.name)
+  }
+  return out
+}
+
+function safeJsonParse(raw: unknown): unknown {
+  if (raw === null || raw === undefined) return null
+  if (typeof raw === 'object') return raw
+  if (typeof raw !== 'string' || !raw.trim()) return null
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
+
+function finiteNonNeg(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+}
+
+function finitePos(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null
+}
+
+function normalizeRejectReason(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  const cleaned = redact(raw).replace(/\s+/g, ' ').trim()
+  if (!cleaned) return null
+  return cleaned.slice(0, 80)
+}
+
+function bumpRejectReason(map: Map<string, number>, raw: unknown, delta = 1): void {
+  const normalized = normalizeRejectReason(raw)
+  if (!normalized || delta <= 0) return
+  map.set(normalized, (map.get(normalized) ?? 0) + delta)
+}
+
+function isChainStepRow(row: {
+  category?: unknown
+  skills?: unknown
+  depends_on_step_ids?: unknown
+  depends_on_fact_ids?: unknown
+  title?: unknown
+}): boolean {
+  const cat = typeof row.category === 'string' ? row.category.toLowerCase() : ''
+  if (cat === 'chain' || cat === 'chain_step' || cat === 'multihop_chain') return true
+  const skills = safeJsonParse(row.skills)
+  if (Array.isArray(skills)) {
+    for (const s of skills) {
+      if (typeof s === 'string' && (s.startsWith('chain:') || s === 'chain-primitives' || s === 'multihop-chains')) {
+        return true
+      }
+    }
+  }
+  const depSteps = safeJsonParse(row.depends_on_step_ids)
+  if (Array.isArray(depSteps) && depSteps.length > 0) return true
+  const title = typeof row.title === 'string' ? row.title.toLowerCase() : ''
+  if (/\b(?:chain|multi-?hop|pivot)\b/.test(title)) return true
+  return false
+}
+
+function countPatternMatches(text: string, re: RegExp): number {
+  let count = 0
+  re.lastIndex = 0
+  while (re.exec(text) !== null) count += 1
+  return count
+}
+
+function roundPct(rate: number): number {
+  return Math.round(Math.max(0, rate) * 10_000) / 100
+}
+
+/**
+ * Extract structured Phase-timing, Scheduler/Dead-End-Waste, CapabilityLedger, and v8-SDK-Adoption
+ * telemetry from a Guardian run's SQLite database.
+ *
+ * Strictly queries structured metadata columns only (`runs`, `events`, `assignments`/`workers`,
+ * `chain_steps`, `capability_nodes`, `capability_causal_edges`/`capability_edges`,
+ * `capability_negative_edges`, `replay_specs`, `findings`) — never raw HTTP bodies or secrets.
+ */
+export function extractMultihopRunTelemetry(
+  db: DatabaseSync | Pick<Store, 'client' | 'directory'>,
+  runId: string,
+  options: ExtractMultihopRunTelemetryOptions = {},
+): MultihopRunTelemetry {
+  const { client, directory } = resolveSqliteHandle(db)
+  const tables = listExistingTables(client)
+  const dataDir = options.dataDir ?? directory
+
+  // ---- 1. Run anchor timestamp ----
+  let runCreatedAt: number | null = null
+  if (tables.has('runs')) {
+    const cols = listTableColumns(client, 'runs')
+    if (cols.has('id') && cols.has('created_at')) {
+      const row = client.prepare('SELECT created_at FROM runs WHERE id = ?').get(runId) as SqliteRow | undefined
+      runCreatedAt = finitePos(row?.created_at)
+    }
+  }
+
+  // ---- 2. Chain steps lookup (to identify chain dispatches cleanly) ----
+  const chainStepIds = new Set<string>()
+  if (tables.has('chain_steps')) {
+    const cols = listTableColumns(client, 'chain_steps')
+    if (cols.has('id') && cols.has('run_id')) {
+      const selectCols = ['id']
+      for (const c of ['category', 'skills', 'depends_on_step_ids', 'depends_on_fact_ids', 'title']) {
+        if (cols.has(c)) selectCols.push(c)
+      }
+      const rows = client.prepare(`SELECT ${selectCols.join(', ')} FROM chain_steps WHERE run_id = ?`).all(runId) as SqliteRow[]
+      for (const row of rows) {
+        if (typeof row.id === 'string' && isChainStepRow(row)) chainStepIds.add(row.id)
+      }
+    }
+  }
+
+  // ---- 3. Assignments / Workers table ----
+  const assignmentTable = tables.has('assignments') ? 'assignments' : tables.has('workers') ? 'workers' : null
+  const investigationAssignmentIds = new Set<string>()
+  const allKnownAssignmentPhases = new Map<string, string>()
+  const sessionIds = new Set<string>()
+  let dbPhaseBAssignments = 0
+  let dbPhaseBCompleted = 0
+  let earliestPhaseBAssignmentAt: number | null = null
+  let assignmentFlagDeadEndReprobes = 0
+  let maxAssignmentTableWallMs: number | null = null
+  let earliestAssignmentCreatedAt: number | null = null
+  let latestAssignmentTs: number | null = null
+
+  if (assignmentTable) {
+    const cols = listTableColumns(client, assignmentTable)
+    if (cols.has('run_id')) {
+      const want = [
+        'id', 'phase', 'status', 'session_id', 'created_at',
+        'started_at', 'completed_at', 'ended_at', 'wall_ms', 'dead_end_reprobe',
+      ].filter(c => cols.has(c))
+      if (want.length > 0) {
+        const rows = client.prepare(`SELECT ${want.join(', ')} FROM ${assignmentTable} WHERE run_id = ?`).all(runId) as SqliteRow[]
+        for (const row of rows) {
+          const id = typeof row.id === 'string' ? row.id : null
+          const phase = typeof row.phase === 'string' ? row.phase : null
+          const status = typeof row.status === 'string' ? row.status : null
+          const createdAt = finitePos(row.created_at)
+          const startedAt = finitePos(row.started_at)
+          const endedAt = finitePos(row.completed_at) ?? finitePos(row.ended_at)
+          const wallMs = finiteNonNeg(row.wall_ms)
+
+          if (typeof row.session_id === 'string' && row.session_id.trim()) sessionIds.add(row.session_id.trim())
+          if (createdAt !== null) {
+            earliestAssignmentCreatedAt = earliestAssignmentCreatedAt === null ? createdAt : Math.min(earliestAssignmentCreatedAt, createdAt)
+            latestAssignmentTs = latestAssignmentTs === null ? createdAt : Math.max(latestAssignmentTs, createdAt)
+          }
+          if (endedAt !== null) {
+            latestAssignmentTs = latestAssignmentTs === null ? endedAt : Math.max(latestAssignmentTs, endedAt)
+          }
+          if (id && phase) allKnownAssignmentPhases.set(id, phase)
+
+          const isPhaseB = phase === null || phase === 'investigation'
+          if (isPhaseB) {
+            dbPhaseBAssignments += 1
+            if (id) investigationAssignmentIds.add(id)
+            if (status === 'complete' || status === 'completed') dbPhaseBCompleted += 1
+            const ts = startedAt ?? createdAt
+            if (ts !== null) {
+              earliestPhaseBAssignmentAt = earliestPhaseBAssignmentAt === null ? ts : Math.min(earliestPhaseBAssignmentAt, ts)
+            }
+            const measuredWall = wallMs ?? (startedAt !== null && endedAt !== null && endedAt >= startedAt
+              ? endedAt - startedAt
+              : createdAt !== null && endedAt !== null && endedAt >= createdAt
+                ? endedAt - createdAt
+                : null)
+            if (measuredWall !== null) {
+              maxAssignmentTableWallMs = maxAssignmentTableWallMs === null
+                ? measuredWall
+                : Math.max(maxAssignmentTableWallMs, measuredWall)
+            }
+          }
+          if (row.dead_end_reprobe === 1 || row.dead_end_reprobe === true) {
+            assignmentFlagDeadEndReprobes += 1
+          }
+        }
+      }
+    }
+  }
+
+  // ---- 4. Events scan (structured fields only) ----
+  let earliestEventAt: number | null = null
+  let latestEventAt: number | null = null
+  let codeAuditStartAt: number | null = null
+  let codeAuditEndAt: number | null = null
+  let codeAuditElapsedOverride: number | null = null
+  let floorStartAt: number | null = null
+  let floorEndAt: number | null = null
+  let floorMsReported: number | null = null
+  let phaseBStartEventAt: number | null = null
+  let firstChainDispatchEventAt: number | null = null
+  let firstChainRoundDispatchAt: number | null = null
+
+  let maxEffectiveConcurrency = 0
+  let eventWorkersStarted = 0
+  let eventWorkersCompleted = 0
+  let eventWorkersCompletedAll = 0
+  let eventWallClockRotations = 0
+  let metricsWallClockRotations = 0
+  let metricsPhaseBAssignments = 0
+  let frontierSummaryDispatched = 0
+  let frontierSummaryDeadEndReprobes = 0
+  let explicitDeadEndReprobeEvents = 0
+  let negativeEdgePrunedEvents = 0
+  let maxEventWorkerWallMs: number | null = null
+  const workerStartById = new Map<string, number>()
+  const workerIntervals: Array<{ start: number; end: number }> = []
+
+  let eventGuardianVerifyCalls = 0
+  const seenGuardianVerifyCallIds = new Set<string>()
+  let eventSealCapabilityCalls = 0
+  let eventHmacSignCalls = 0
+  let eventJwtSignCalls = 0
+  let eventAwaitAsyncCalls = 0
+  let eventProveCompositeCalls = 0
+  let eventCompositeRejected = 0
+  const confirmedCompositeChainIds = new Set<string>()
+  let anonymousCompositeConfirmed = 0
+  const rejectReasons = new Map<string, number>()
+
+  const bumpSdkOp = (op: unknown, count = 1): void => {
+    if (typeof op !== 'string' || count <= 0) return
+    const key = op.trim()
+    if (key === 'capability.seal' || key === 'seal_capability' || key === 'sealCapabilityCalls') eventSealCapabilityCalls += count
+    else if (key === 'crypto.hmacSign' || key === 'hmac_sign' || key === 'hmacSignCalls') eventHmacSignCalls += count
+    else if (key === 'crypto.jwtSign' || key === 'jwt_sign' || key === 'jwtSignCalls') eventJwtSignCalls += count
+    else if (key === 'async.awaitResult' || key === 'await_async' || key === 'awaitAsyncCalls') eventAwaitAsyncCalls += count
+    else if (key === 'composite.verify' || key === 'prove_composite' || key === 'proveCompositeCalls') eventProveCompositeCalls += count
+  }
+
+  const recordPhaseBStart = (ts: number | null): void => {
+    if (ts === null) return
+    phaseBStartEventAt = phaseBStartEventAt === null ? ts : Math.min(phaseBStartEventAt, ts)
+  }
+
+  const recordFirstChainDispatch = (ts: number | null): void => {
+    if (ts === null) return
+    firstChainDispatchEventAt = firstChainDispatchEventAt === null ? ts : Math.min(firstChainDispatchEventAt, ts)
+  }
+
+  if (tables.has('events')) {
+    const cols = listTableColumns(client, 'events')
+    if (cols.has('run_id') && cols.has('kind')) {
+      const selectCols = ['kind']
+      if (cols.has('detail')) selectCols.push('detail')
+      if (cols.has('created_at')) selectCols.push('created_at')
+      const orderBy = cols.has('created_at')
+        ? (cols.has('id') ? 'ORDER BY created_at ASC, id ASC' : 'ORDER BY created_at ASC')
+        : (cols.has('id') ? 'ORDER BY id ASC' : '')
+      const rows = client.prepare(`SELECT ${selectCols.join(', ')} FROM events WHERE run_id = ? ${orderBy}`).all(runId) as SqliteRow[]
+
+      for (const row of rows) {
+        const kind = typeof row.kind === 'string' ? row.kind : ''
+        const createdAt = finitePos(row.created_at)
+        const parsedDetail = safeJsonParse(row.detail)
+        const detail = (parsedDetail && typeof parsedDetail === 'object' && !Array.isArray(parsedDetail))
+          ? parsedDetail as Record<string, unknown>
+          : {}
+
+        if (createdAt !== null) {
+          earliestEventAt = earliestEventAt === null ? createdAt : Math.min(earliestEventAt, createdAt)
+          latestEventAt = latestEventAt === null ? createdAt : Math.max(latestEventAt, createdAt)
+        }
+
+        // --- Phase Timing events ---
+        if (kind === 'code_audit.started') {
+          if (createdAt !== null) codeAuditStartAt = codeAuditStartAt === null ? createdAt : Math.min(codeAuditStartAt, createdAt)
+        } else if (kind === 'code_audit.complete' || kind === 'code_audit.wall_clock_rotated') {
+          if (createdAt !== null) codeAuditEndAt = codeAuditEndAt === null ? createdAt : Math.max(codeAuditEndAt, createdAt)
+          const elapsed = finiteNonNeg(detail.elapsedMs) ?? finiteNonNeg(detail.durationMs)
+          if (elapsed !== null) {
+            codeAuditElapsedOverride = codeAuditElapsedOverride === null ? elapsed : Math.max(codeAuditElapsedOverride, elapsed)
+          }
+        } else if (kind === 'deterministic_lane.started' || kind === 'floor.started') {
+          if (createdAt !== null) floorStartAt = floorStartAt === null ? createdAt : Math.min(floorStartAt, createdAt)
+        } else if (kind === 'deterministic_floor.summary' || kind === 'deterministic_lane.metrics' || kind === 'deterministic_engine.summary') {
+          if (createdAt !== null) floorEndAt = floorEndAt === null ? createdAt : Math.max(floorEndAt, createdAt)
+          const pt = (detail.phaseTimings && typeof detail.phaseTimings === 'object')
+            ? detail.phaseTimings as Record<string, unknown>
+            : null
+          const fm = finiteNonNeg(pt?.floorMs) ?? finiteNonNeg(detail.laneWallMs) ?? finiteNonNeg(detail.durationMs)
+          if (fm !== null) floorMsReported = fm
+          recordPhaseBStart(finitePos(pt?.agentDispatchAt))
+        } else if (kind === 'investigation.started') {
+          recordPhaseBStart(createdAt)
+        } else if (kind === 'scheduler.dispatch') {
+          recordPhaseBStart(createdAt)
+          const effConc = finiteNonNeg(detail.effectiveConcurrency) ?? finiteNonNeg(detail.slots)
+          if (effConc !== null) maxEffectiveConcurrency = Math.max(maxEffectiveConcurrency, Math.floor(effConc))
+          const byLane = (detail.selectedByLane && typeof detail.selectedByLane === 'object')
+            ? detail.selectedByLane as Record<string, unknown>
+            : null
+          const chainSelected = finiteNonNeg(byLane?.chain) ?? 0
+          const activeChains = finiteNonNeg(detail.activeChainCount) ?? 0
+          const readyChains = finiteNonNeg(detail.readyChainSteps) ?? 0
+          const dispatched = finiteNonNeg(detail.dispatched) ?? 0
+          if (chainSelected > 0 || activeChains > 0 || (readyChains > 0 && dispatched > 0 && byLane === null)) {
+            recordFirstChainDispatch(createdAt)
+          }
+        } else if (kind === 'chain.round') {
+          const dispatched = finiteNonNeg(detail.dispatched) ?? 0
+          if (dispatched > 0 && createdAt !== null) {
+            firstChainRoundDispatchAt = firstChainRoundDispatchAt === null ? createdAt : Math.min(firstChainRoundDispatchAt, createdAt)
+          }
+        }
+
+        // --- Worker lifecycle & scheduler metrics ---
+        if (kind === 'worker.started') {
+          eventWorkersStarted += 1
+          recordPhaseBStart(createdAt)
+          const aid = typeof detail.assignmentId === 'string' ? detail.assignmentId : null
+          if (aid && createdAt !== null) workerStartById.set(aid, createdAt)
+          const stepId = typeof detail.stepId === 'string' ? detail.stepId : null
+          if (
+            detail.lane === 'chain'
+            || detail.isChain === true
+            || (stepId && chainStepIds.has(stepId))
+          ) {
+            recordFirstChainDispatch(createdAt)
+          }
+        } else if (kind === 'worker.complete') {
+          eventWorkersCompletedAll += 1
+          const aid = typeof detail.assignmentId === 'string' ? detail.assignmentId : null
+          const knownPhase = aid ? allKnownAssignmentPhases.get(aid) : undefined
+          if (!knownPhase || knownPhase === 'investigation') {
+            eventWorkersCompleted += 1
+          }
+          const explicitWall = finiteNonNeg(detail.elapsedMs) ?? finiteNonNeg(detail.wallMs)
+          if (explicitWall !== null) {
+            maxEventWorkerWallMs = maxEventWorkerWallMs === null ? explicitWall : Math.max(maxEventWorkerWallMs, explicitWall)
+          }
+          if (aid && createdAt !== null) {
+            const st = workerStartById.get(aid)
+            if (st !== undefined && createdAt >= st) {
+              const dur = createdAt - st
+              maxEventWorkerWallMs = maxEventWorkerWallMs === null ? dur : Math.max(maxEventWorkerWallMs, dur)
+              workerIntervals.push({ start: st, end: createdAt })
+            }
+          }
+        } else if (kind === 'worker.wall_clock_rotated') {
+          eventWallClockRotations += 1
+          const aid = typeof detail.assignmentId === 'string' ? detail.assignmentId : null
+          const explicitWall = finiteNonNeg(detail.elapsedMs) ?? finiteNonNeg(detail.wallClockMs)
+          if (explicitWall !== null) {
+            maxEventWorkerWallMs = maxEventWorkerWallMs === null ? explicitWall : Math.max(maxEventWorkerWallMs, explicitWall)
+          }
+          if (aid && createdAt !== null) {
+            const st = workerStartById.get(aid)
+            if (st !== undefined && createdAt >= st) {
+              const dur = createdAt - st
+              maxEventWorkerWallMs = maxEventWorkerWallMs === null ? dur : Math.max(maxEventWorkerWallMs, dur)
+              workerIntervals.push({ start: st, end: createdAt })
+            }
+          }
+        } else if (kind === 'worker.failed' || kind === 'worker.canceled' || kind === 'worker.stall_failed') {
+          const aid = typeof detail.assignmentId === 'string' ? detail.assignmentId : null
+          if (aid && createdAt !== null) {
+            const st = workerStartById.get(aid)
+            if (st !== undefined && createdAt >= st) {
+              const dur = createdAt - st
+              maxEventWorkerWallMs = maxEventWorkerWallMs === null ? dur : Math.max(maxEventWorkerWallMs, dur)
+              workerIntervals.push({ start: st, end: createdAt })
+            }
+          }
+        } else if (kind === 'agentic.assignment_metrics') {
+          const rot = finiteNonNeg(detail.wallClockRotations)
+          if (rot !== null) metricsWallClockRotations = Math.max(metricsWallClockRotations, Math.floor(rot))
+          const obs = finiteNonNeg(detail.assignmentsObserved)
+          if (obs !== null) metricsPhaseBAssignments = Math.max(metricsPhaseBAssignments, Math.floor(obs))
+          const mw = finiteNonNeg(detail.maxWorkerWallMs)
+          if (mw !== null) {
+            maxEventWorkerWallMs = maxEventWorkerWallMs === null ? mw : Math.max(maxEventWorkerWallMs, mw)
+          }
+        }
+
+        // --- Frontier / Dead-end reprobe events ---
+        if (kind === 'frontier.negative_edge') {
+          if (detail.pruned === true) negativeEdgePrunedEvents += 1
+          const attemptCount = finiteNonNeg(detail.attemptCount) ?? 0
+          if (detail.wasDeadEndReprobe === true || detail.reprobe === true || (detail.pruned === true && attemptCount > 2)) {
+            explicitDeadEndReprobeEvents += 1
+          }
+        } else if (kind === 'frontier.dead_end_reprobe' || kind === 'scheduler.dead_end_reprobe') {
+          explicitDeadEndReprobeEvents += 1
+        } else if (
+          kind === 'frontier.summary'
+          || kind === 'frontier.wave_summary'
+          || kind === 'frontier.metrics'
+          || kind === 'scheduler.frontier_summary'
+        ) {
+          const dispatched = finiteNonNeg(detail.totalAssignmentsDispatched) ?? finiteNonNeg(detail.phaseBAssignments)
+          if (dispatched !== null) frontierSummaryDispatched = Math.max(frontierSummaryDispatched, Math.floor(dispatched))
+          const reprobes = finiteNonNeg(detail.deadEndReprobeCount) ?? finiteNonNeg(detail.deadEndReprobes)
+          if (reprobes !== null) frontierSummaryDeadEndReprobes = Math.max(frontierSummaryDeadEndReprobes, Math.floor(reprobes))
+        }
+
+        // --- v8 SDK Adoption & Verify RPC events ---
+        const callId = typeof detail.callId === 'string' && detail.callId.trim() ? detail.callId.trim() : null
+        if (
+          kind === 'guardian_verify.called'
+          || kind === 'guardian_verify.complete'
+          || kind === 'guardian_verify.rejected'
+          || kind === 'guardian_verify.failed'
+          || ((kind === 'tool.call' || kind === 'tool.result') && (detail.tool === 'guardian_verify' || detail.name === 'guardian_verify'))
+        ) {
+          if (callId) {
+            if (!seenGuardianVerifyCallIds.has(callId)) {
+              seenGuardianVerifyCallIds.add(callId)
+              eventGuardianVerifyCalls += 1
+            }
+          } else {
+            eventGuardianVerifyCalls += 1
+          }
+        } else if (kind === 'agent.script_proof_confirmed' || kind === 'agent.script_proof_rejected') {
+          if (!callId || !seenGuardianVerifyCallIds.has(callId)) {
+            if (callId) seenGuardianVerifyCallIds.add(callId)
+            eventGuardianVerifyCalls += 1
+          }
+        }
+
+        // Single-op or aggregate SDK RPC counters
+        if (kind === 'verify_rpc.call' || kind === 'verify_rpc.op' || kind === 'guardian_verify.rpc') {
+          bumpSdkOp(detail.op ?? detail.method ?? detail.rpcOp, 1)
+          if ((detail.op === 'composite.verify' || detail.method === 'composite.verify') && detail.confirmed === true) {
+            if (typeof detail.chainId === 'string' && detail.chainId.trim()) confirmedCompositeChainIds.add(detail.chainId.trim())
+            else anonymousCompositeConfirmed += 1
+          } else if (detail.ok === false || detail.confirmed === false) {
+            if (detail.op === 'composite.verify' || detail.method === 'composite.verify') eventCompositeRejected += 1
+            bumpRejectReason(rejectReasons, detail.rejectReason ?? detail.failedStage ?? detail.rejectedBy ?? detail.reason ?? detail.errorCode)
+          }
+        } else if (kind === 'capability.seal' || kind === 'capability.sealed' || kind === 'verify_rpc.capability_seal') {
+          eventSealCapabilityCalls += 1
+        } else if (kind === 'crypto.hmacSign' || kind === 'crypto.hmac_sign' || kind === 'verify_rpc.hmac_sign') {
+          eventHmacSignCalls += 1
+        } else if (kind === 'crypto.jwtSign' || kind === 'crypto.jwt_sign' || kind === 'verify_rpc.jwt_sign') {
+          eventJwtSignCalls += 1
+        } else if (kind === 'async.awaitResult' || kind === 'async.await_result' || kind === 'verify_rpc.await_async') {
+          eventAwaitAsyncCalls += 1
+        } else if (kind === 'composite.verify' || kind === 'composite.verified' || kind === 'verify_rpc.composite_verify') {
+          eventProveCompositeCalls += 1
+          if (kind === 'composite.verified' || detail.confirmed === true) {
+            if (typeof detail.chainId === 'string' && detail.chainId.trim()) confirmedCompositeChainIds.add(detail.chainId.trim())
+            else anonymousCompositeConfirmed += 1
+          } else if (detail.confirmed === false) {
+            eventCompositeRejected += 1
+            bumpRejectReason(rejectReasons, detail.failedStage ?? detail.rejectReason ?? detail.rejectedBy ?? detail.reason)
+          }
+        } else if (kind === 'composite.rejected') {
+          eventProveCompositeCalls += 1
+          eventCompositeRejected += 1
+          bumpRejectReason(rejectReasons, detail.failedStage ?? detail.rejectReason ?? detail.rejectedBy ?? detail.reason)
+        } else if (kind === 'agent.script_proof_confirmed') {
+          const rule = typeof detail.receiptRule === 'string' ? detail.receiptRule : ''
+          const chainId = typeof detail.chainId === 'string' && detail.chainId.trim() ? detail.chainId.trim() : null
+          if (rule.startsWith('composite:') || chainId) {
+            if (chainId) confirmedCompositeChainIds.add(chainId)
+            else anonymousCompositeConfirmed += 1
+          }
+        } else if (
+          kind === 'proof_receipt.shadow_reject'
+          || kind === 'oob.receipt_rejected'
+          || kind === 'guardian_verify.rejected'
+          || kind === 'guardian_verify.failed'
+          || kind === 'agent.script_proof_rejected'
+          || kind === 'verify_rpc.rejected'
+          || kind === 'verify_rpc.error'
+        ) {
+          bumpRejectReason(rejectReasons, detail.failedStage ?? detail.rejectReason ?? detail.rejectedBy ?? detail.reason ?? detail.errorCode ?? detail.rule)
+        }
+
+        const rpcBag = (detail.rpcCounts && typeof detail.rpcCounts === 'object')
+          ? detail.rpcCounts as Record<string, unknown>
+          : (detail.sdkCalls && typeof detail.sdkCalls === 'object')
+            ? detail.sdkCalls as Record<string, unknown>
+            : null
+        if (rpcBag) {
+          for (const [opKey, rawCount] of Object.entries(rpcBag)) {
+            const c = finiteNonNeg(rawCount)
+            if (c !== null) bumpSdkOp(opKey, Math.floor(c))
+          }
+        }
+      }
+    }
+  }
+
+  // Fallback concurrency from overlapping worker intervals if no scheduler.dispatch events
+  if (maxEffectiveConcurrency === 0 && workerIntervals.length > 0) {
+    const pts: Array<{ ts: number; delta: number }> = []
+    for (const iv of workerIntervals) {
+      pts.push({ ts: iv.start, delta: 1 }, { ts: iv.end, delta: -1 })
+    }
+    pts.sort((a, b) => a.ts - b.ts || a.delta - b.delta)
+    let cur = 0
+    for (const p of pts) {
+      cur += p.delta
+      if (cur > maxEffectiveConcurrency) maxEffectiveConcurrency = cur
+    }
+  } else if (maxEffectiveConcurrency === 0 && (eventWorkersStarted > 0 || dbPhaseBAssignments > 0)) {
+    maxEffectiveConcurrency = 1
+  }
+
+  // ---- 5. CapabilityLedger tables ----
+  let nodesTotal = 0
+  let capabilityOnlyCount = 0
+  let sealedHandlesCount = 0
+  let causalEdgesCount = 0
+  let negativeEdgesPrunedCount = 0
+  let negEdgeTableExtraReprobes = 0
+
+  if (tables.has('capability_nodes')) {
+    const cols = listTableColumns(client, 'capability_nodes')
+    if (cols.has('run_id')) {
+      const sel = ['cap_id', 'promotion_status'].filter(c => cols.has(c))
+      const rows = client.prepare(
+        sel.length ? `SELECT ${sel.join(', ')} FROM capability_nodes WHERE run_id = ?` : 'SELECT 1 FROM capability_nodes WHERE run_id = ?',
+      ).all(runId) as SqliteRow[]
+      nodesTotal = rows.length
+      for (const row of rows) {
+        if (row.promotion_status === 'capability_only') capabilityOnlyCount += 1
+        if (typeof row.cap_id === 'string' && row.cap_id.startsWith('cap:')) sealedHandlesCount += 1
+      }
+    }
+  }
+
+  if (tables.has('capability_causal_edges')) {
+    const cols = listTableColumns(client, 'capability_causal_edges')
+    if (cols.has('run_id')) {
+      const row = client.prepare('SELECT COUNT(*) AS c FROM capability_causal_edges WHERE run_id = ?').get(runId) as SqliteRow | undefined
+      causalEdgesCount = finiteNonNeg(Number(row?.c)) ?? 0
+    }
+  } else if (tables.has('capability_edges')) {
+    const cols = listTableColumns(client, 'capability_edges')
+    if (cols.has('run_id')) {
+      const sel = ['kind', 'edge_kind', 'pruned', 'is_negative', 'attempt_count'].filter(c => cols.has(c))
+      const rows = client.prepare(
+        sel.length ? `SELECT ${sel.join(', ')} FROM capability_edges WHERE run_id = ?` : 'SELECT 1 FROM capability_edges WHERE run_id = ?',
+      ).all(runId) as SqliteRow[]
+      for (const row of rows) {
+        const edgeKind = String(row.kind ?? row.edge_kind ?? '').toLowerCase()
+        const isNeg = row.is_negative === 1 || row.is_negative === true || edgeKind === 'negative' || edgeKind === 'negative_edge'
+        if (isNeg) {
+          if (row.pruned === 1 || row.pruned === true) {
+            negativeEdgesPrunedCount += 1
+            const attempts = finiteNonNeg(Number(row.attempt_count)) ?? 0
+            if (attempts > 2) negEdgeTableExtraReprobes += Math.floor(attempts - 2)
+          }
+        } else {
+          causalEdgesCount += 1
+        }
+      }
+    }
+  }
+
+  if (tables.has('capability_negative_edges')) {
+    const cols = listTableColumns(client, 'capability_negative_edges')
+    if (cols.has('run_id')) {
+      const sel = ['pruned', 'attempt_count'].filter(c => cols.has(c))
+      const rows = client.prepare(
+        sel.length ? `SELECT ${sel.join(', ')} FROM capability_negative_edges WHERE run_id = ?` : 'SELECT 1 FROM capability_negative_edges WHERE run_id = ?',
+      ).all(runId) as SqliteRow[]
+      for (const row of rows) {
+        if (row.pruned === 1 || row.pruned === true) {
+          negativeEdgesPrunedCount += 1
+          const attempts = finiteNonNeg(Number(row.attempt_count)) ?? 0
+          if (attempts > 2) negEdgeTableExtraReprobes += Math.floor(attempts - 2)
+        }
+      }
+    }
+  } else if (negativeEdgesPrunedCount === 0 && negativeEdgePrunedEvents > 0) {
+    negativeEdgesPrunedCount = negativeEdgePrunedEvents
+  }
+  if (options.frontierTelemetry?.prunedEdgeCount !== undefined) {
+    negativeEdgesPrunedCount = Math.max(negativeEdgesPrunedCount, Math.floor(options.frontierTelemetry.prunedEdgeCount))
+  }
+
+  // ---- 6. Replay specs & Findings (structured receipt / rejection metadata only) ----
+  const compositeReceiptKeys = new Set<string>()
+  let agentScriptSpecCount = 0
+
+  const inspectCompositeCandidate = (raw: unknown, fallbackKey: string): void => {
+    if (!raw || typeof raw !== 'object') return
+    const obj = raw as Record<string, unknown>
+    const receipt = (obj.compositeReceipt ?? obj.compositeProofReceipt ?? null) as Record<string, unknown> | null
+    const verification = (obj.compositeVerification ?? obj.verification ?? null) as Record<string, unknown> | null
+    if (receipt && typeof receipt.chainId === 'string' && Array.isArray(receipt.hops) && receipt.hops.length > 0) {
+      compositeReceiptKeys.add(receipt.chainId)
+      if (verification) {
+        if (verification.confirmed === true) {
+          confirmedCompositeChainIds.add(receipt.chainId)
+        } else if (verification.confirmed === false) {
+          bumpRejectReason(rejectReasons, verification.failedStage ?? verification.reason)
+        }
+      }
+    } else if (typeof obj.chainId === 'string' && Array.isArray(obj.hops) && obj.hops.length > 0) {
+      compositeReceiptKeys.add(obj.chainId || fallbackKey)
+      if (verification?.confirmed === true) confirmedCompositeChainIds.add(obj.chainId)
+    }
+  }
+
+  if (tables.has('replay_specs')) {
+    const cols = listTableColumns(client, 'replay_specs')
+    if (cols.has('run_id')) {
+      const sel = ['id', 'proof_kind', 'proof_verdict', 'spec', 'proof_receipt', 'last_verification_diff'].filter(c => cols.has(c))
+      if (sel.length > 0) {
+        const rows = client.prepare(`SELECT ${sel.join(', ')} FROM replay_specs WHERE run_id = ?`).all(runId) as SqliteRow[]
+        for (const row of rows) {
+          const rowId = typeof row.id === 'string' ? row.id : 'spec'
+          if (row.proof_kind === 'agent_script') agentScriptSpecCount += 1
+          const specObj = safeJsonParse(row.spec)
+          const proofReceiptObj = safeJsonParse(row.proof_receipt)
+          const diffObj = safeJsonParse(row.last_verification_diff)
+          inspectCompositeCandidate(specObj, rowId)
+          inspectCompositeCandidate(proofReceiptObj, rowId)
+          if (diffObj && typeof diffObj === 'object') {
+            const d = diffObj as Record<string, unknown>
+            if (d.verdict && d.verdict !== 'confirmed') {
+              const summary = (d.assertionSummary && typeof d.assertionSummary === 'object')
+                ? d.assertionSummary as Record<string, unknown>
+                : null
+              bumpRejectReason(rejectReasons, summary?.reason ?? d.reason)
+            }
+          }
+          if (row.proof_verdict === 'dismissed' || row.proof_verdict === 'inconclusive') {
+            if (proofReceiptObj && typeof proofReceiptObj === 'object') {
+              const pr = proofReceiptObj as Record<string, unknown>
+              const ver = (pr.verification && typeof pr.verification === 'object') ? pr.verification as Record<string, unknown> : null
+              bumpRejectReason(rejectReasons, ver?.reason ?? row.proof_verdict)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (tables.has('findings')) {
+    const cols = listTableColumns(client, 'findings')
+    if (cols.has('run_id') && cols.has('finding')) {
+      const sel = ['id', 'finding'].filter(c => cols.has(c))
+      const rows = client.prepare(`SELECT ${sel.join(', ')} FROM findings WHERE run_id = ?`).all(runId) as SqliteRow[]
+      for (const row of rows) {
+        const parsed = safeJsonParse(row.finding)
+        if (parsed && typeof parsed === 'object') {
+          const f = parsed as Record<string, unknown>
+          inspectCompositeCandidate(f.evidence, typeof row.id === 'string' ? row.id : 'finding')
+        }
+      }
+    }
+  }
+
+  // ---- 7. Optional read-only agent-sessions tool-call histogram (counts & reject codes only) ----
+  let sessionGuardianVerifyCalls = 0
+  let sessionSealCalls = 0
+  let sessionHmacCalls = 0
+  let sessionJwtCalls = 0
+  let sessionAwaitCalls = 0
+  let sessionCompositeCalls = 0
+  if (dataDir && sessionIds.size > 0) {
+    const sessionsDir = join(dataDir, 'agent-sessions')
+    if (existsSync(sessionsDir)) {
+      const reSeal = /\b(?:seal_capability|sealCapability)\s*\(|['"]capability\.seal['"]/g
+      const reHmac = /\b(?:hmac_sign|hmacSign)\s*\(|['"]crypto\.hmacSign['"]/g
+      const reJwt = /\b(?:jwt_sign|jwtSign)\s*\(|['"]crypto\.jwtSign['"]/g
+      const reAwait = /\b(?:await_async|awaitAsync)\s*\(|['"]async\.awaitResult['"]/g
+      const reComposite = /\b(?:prove_composite|proveComposite)\s*\(|['"]composite\.verify['"]/g
+
+      for (const sessionId of sessionIds) {
+        const sessionPath = join(sessionsDir, `${sessionId}.sqlite`)
+        if (!existsSync(sessionPath)) continue
+        let sessionDb: DatabaseSync | undefined
+        try {
+          sessionDb = new DatabaseSync(sessionPath, { readOnly: true })
+          const rows = sessionDb.prepare('SELECT record FROM entries ORDER BY commit_seq ASC').all() as Array<{ record?: unknown }>
+          const gvCallIds = new Set<string>()
+          for (const row of rows) {
+            const parsed = safeJsonParse(row.record) as { model?: Array<Record<string, unknown>> } | null
+            const models = Array.isArray(parsed?.model) ? parsed.model : []
+            for (const msg of models) {
+              if (msg.role === 'assistant' && Array.isArray(msg.content)) {
+                for (const block of msg.content as Array<Record<string, unknown>>) {
+                  if (block.type === 'toolCall' && block.name === 'guardian_verify') {
+                    sessionGuardianVerifyCalls += 1
+                    if (typeof block.id === 'string') gvCallIds.add(block.id)
+                    const argsObj = (block.arguments && typeof block.arguments === 'object')
+                      ? block.arguments as Record<string, unknown>
+                      : null
+                    const scriptText = typeof argsObj?.script === 'string' ? argsObj.script : ''
+                    if (scriptText) {
+                      sessionSealCalls += countPatternMatches(scriptText, reSeal)
+                      sessionHmacCalls += countPatternMatches(scriptText, reHmac)
+                      sessionJwtCalls += countPatternMatches(scriptText, reJwt)
+                      sessionAwaitCalls += countPatternMatches(scriptText, reAwait)
+                      sessionCompositeCalls += countPatternMatches(scriptText, reComposite)
+                    }
+                  }
+                }
+              } else if (msg.role === 'toolResult' && typeof msg.toolCallId === 'string' && gvCallIds.has(msg.toolCallId)) {
+                const rawText = typeof msg.content === 'string'
+                  ? msg.content
+                  : Array.isArray(msg.content)
+                    ? (msg.content as Array<{ text?: unknown }>).map(p => (typeof p?.text === 'string' ? p.text : '')).join('\n')
+                    : ''
+                const resultObj = safeJsonParse(rawText)
+                if (resultObj && typeof resultObj === 'object' && !Array.isArray(resultObj)) {
+                  const rec = resultObj as Record<string, unknown>
+                  const cr = (rec.compositeReceipt && typeof rec.compositeReceipt === 'object')
+                    ? rec.compositeReceipt as Record<string, unknown>
+                    : null
+                  if (cr?.confirmed === true) {
+                    if (typeof cr.chainId === 'string' && cr.chainId.trim()) confirmedCompositeChainIds.add(cr.chainId.trim())
+                    else anonymousCompositeConfirmed += 1
+                  }
+                  if (rec.confirmed === false || rec.ok === false || cr?.confirmed === false) {
+                    bumpRejectReason(rejectReasons, cr?.failedStage ?? rec.rejectedBy ?? rec.reason ?? rec.errorCode)
+                  }
+                }
+              }
+            }
+          }
+        } catch {
+          // Best-effort: ignore locked/unreadable session SQLite files.
+        } finally {
+          try { sessionDb?.close() } catch { /* ignore */ }
+        }
+      }
+    }
+  }
+
+  // ---- 8. Assemble all 4 telemetry sections ----
+  const runAnchorMs = finitePos(options.runStartedAtMs)
+    ?? runCreatedAt
+    ?? earliestEventAt
+    ?? earliestAssignmentCreatedAt
+    ?? 0
+  const runEndMs = finitePos(options.runEndedAtMs)
+    ?? latestEventAt
+    ?? latestAssignmentTs
+    ?? runAnchorMs
+  const totalWallMs = Math.max(0, runEndMs - runAnchorMs)
+
+  const codeAuditMs = codeAuditStartAt !== null && codeAuditEndAt !== null && codeAuditEndAt >= codeAuditStartAt
+    ? codeAuditEndAt - codeAuditStartAt
+    : codeAuditElapsedOverride
+  const floorMs = floorMsReported !== null
+    ? floorMsReported
+    : floorStartAt !== null && floorEndAt !== null && floorEndAt >= floorStartAt
+      ? floorEndAt - floorStartAt
+      : null
+
+  const effectivePhaseBStartAt = phaseBStartEventAt ?? earliestPhaseBAssignmentAt
+  const phaseBStartMs = effectivePhaseBStartAt !== null
+    ? Math.max(0, effectivePhaseBStartAt - runAnchorMs)
+    : null
+  const effectiveFirstChainAt = firstChainDispatchEventAt ?? firstChainRoundDispatchAt
+  const firstChainDispatchMs = effectiveFirstChainAt !== null
+    ? Math.max(0, effectiveFirstChainAt - runAnchorMs)
+    : null
+
+  const workersStarted = eventWorkersStarted > 0 ? eventWorkersStarted : dbPhaseBAssignments
+  const workersCompleted = eventWorkersCompleted > 0
+    ? eventWorkersCompleted
+    : dbPhaseBCompleted > 0
+      ? dbPhaseBCompleted
+      : eventWorkersCompletedAll
+  const wallClockRotations = Math.max(eventWallClockRotations, metricsWallClockRotations)
+  const maxWorkerWallMs = maxEventWorkerWallMs !== null && maxAssignmentTableWallMs !== null
+    ? Math.max(maxEventWorkerWallMs, maxAssignmentTableWallMs)
+    : (maxEventWorkerWallMs ?? maxAssignmentTableWallMs)
+  const totalPhaseBAssignments = Math.max(
+    dbPhaseBAssignments,
+    workersStarted,
+    metricsPhaseBAssignments,
+    frontierSummaryDispatched,
+    Math.floor(finiteNonNeg(options.frontierTelemetry?.totalAssignmentsDispatched) ?? 0),
+  )
+  const deadEndReprobes = Math.max(
+    explicitDeadEndReprobeEvents,
+    frontierSummaryDeadEndReprobes,
+    negEdgeTableExtraReprobes,
+    assignmentFlagDeadEndReprobes,
+    Math.floor(finiteNonNeg(options.frontierTelemetry?.deadEndReprobeCount) ?? 0),
+  )
+  const wasteRate = totalPhaseBAssignments > 0
+    ? deadEndReprobes / totalPhaseBAssignments
+    : (finiteNonNeg(options.frontierTelemetry?.deadEndReprobeWasteRate) ?? 0)
+  const deadEndWastePct = roundPct(wasteRate)
+
+  const compositeReceiptsCount = Math.max(
+    compositeReceiptKeys.size,
+    confirmedCompositeChainIds.size + anonymousCompositeConfirmed,
+    Math.floor(finiteNonNeg(options.compositeReceiptsExtracted) ?? 0),
+  )
+  const compositeConfirmed = confirmedCompositeChainIds.size + anonymousCompositeConfirmed
+
+  const guardianVerifyCalls = Math.max(eventGuardianVerifyCalls, sessionGuardianVerifyCalls, agentScriptSpecCount)
+  const sealCapabilityCalls = Math.max(eventSealCapabilityCalls, sessionSealCalls)
+  const hmacSignCalls = Math.max(eventHmacSignCalls, sessionHmacCalls)
+  const jwtSignCalls = Math.max(eventJwtSignCalls, sessionJwtCalls)
+  const awaitAsyncCalls = Math.max(eventAwaitAsyncCalls, sessionAwaitCalls)
+  const proveCompositeCalls = Math.max(
+    eventProveCompositeCalls,
+    sessionCompositeCalls,
+    compositeConfirmed + eventCompositeRejected,
+  )
+
+  const topRejectReasons = [...rejectReasons.entries()]
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .slice(0, 10)
+    .map(([reason, count]) => ({ reason, count }))
+
+  return {
+    phaseTiming: {
+      codeAuditMs,
+      floorMs,
+      phaseBStartMs,
+      firstChainDispatchMs,
+      totalWallMs,
+    },
+    scheduler: {
+      maxEffectiveConcurrency,
+      workersStarted,
+      workersCompleted,
+      wallClockRotations,
+      maxWorkerWallMs,
+      totalPhaseBAssignments,
+      deadEndReprobes,
+      deadEndWastePct,
+    },
+    capabilityLedger: {
+      nodesTotal,
+      capabilityOnlyCount,
+      sealedHandlesCount,
+      causalEdgesCount,
+      negativeEdgesPrunedCount,
+      compositeReceiptsCount,
+    },
+    v8SdkAdoption: {
+      guardianVerifyCalls,
+      sealCapabilityCalls,
+      hmacSignCalls,
+      jwtSignCalls,
+      awaitAsyncCalls,
+      proveCompositeCalls,
+      compositeConfirmed,
+      topRejectReasons,
+    },
+  }
+}
+
+function avgNullable(values: ReadonlyArray<number | null>): number | null {
+  const valid = values.filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
+  if (!valid.length) return null
+  return Math.round(valid.reduce((acc, v) => acc + v, 0) / valid.length)
+}
+
+function maxNullable(values: ReadonlyArray<number | null>): number | null {
+  const valid = values.filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
+  if (!valid.length) return null
+  return Math.max(...valid)
+}
+
+/** Aggregate structured telemetry across multiple cells cleanly (returns null if none carry telemetry). */
+export function aggregateMultihopTelemetry(
+  cells: readonly Pick<MultihopCellMeta, 'telemetry'>[],
+): MultihopRunTelemetry | null {
+  const items = cells
+    .map(c => c.telemetry)
+    .filter((t): t is MultihopRunTelemetry => Boolean(t))
+  if (!items.length) return null
+
+  const totalPhaseBAssignments = items.reduce((n, t) => n + t.scheduler.totalPhaseBAssignments, 0)
+  const deadEndReprobes = items.reduce((n, t) => n + t.scheduler.deadEndReprobes, 0)
+  const deadEndWastePct = totalPhaseBAssignments > 0
+    ? roundPct(deadEndReprobes / totalPhaseBAssignments)
+    : roundPct(items.reduce((n, t) => n + t.scheduler.deadEndWastePct, 0) / (items.length * 100))
+
+  const rejectMap = new Map<string, number>()
+  for (const t of items) {
+    for (const entry of t.v8SdkAdoption.topRejectReasons) {
+      bumpRejectReason(rejectMap, entry.reason, entry.count)
+    }
+  }
+  const topRejectReasons = [...rejectMap.entries()]
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .slice(0, 10)
+    .map(([reason, count]) => ({ reason, count }))
+
+  return {
+    phaseTiming: {
+      codeAuditMs: avgNullable(items.map(t => t.phaseTiming.codeAuditMs)),
+      floorMs: avgNullable(items.map(t => t.phaseTiming.floorMs)),
+      phaseBStartMs: avgNullable(items.map(t => t.phaseTiming.phaseBStartMs)),
+      firstChainDispatchMs: avgNullable(items.map(t => t.phaseTiming.firstChainDispatchMs)),
+      totalWallMs: items.reduce((n, t) => n + t.phaseTiming.totalWallMs, 0),
+    },
+    scheduler: {
+      maxEffectiveConcurrency: Math.max(...items.map(t => t.scheduler.maxEffectiveConcurrency)),
+      workersStarted: items.reduce((n, t) => n + t.scheduler.workersStarted, 0),
+      workersCompleted: items.reduce((n, t) => n + t.scheduler.workersCompleted, 0),
+      wallClockRotations: items.reduce((n, t) => n + t.scheduler.wallClockRotations, 0),
+      maxWorkerWallMs: maxNullable(items.map(t => t.scheduler.maxWorkerWallMs)),
+      totalPhaseBAssignments,
+      deadEndReprobes,
+      deadEndWastePct,
+    },
+    capabilityLedger: {
+      nodesTotal: items.reduce((n, t) => n + t.capabilityLedger.nodesTotal, 0),
+      capabilityOnlyCount: items.reduce((n, t) => n + t.capabilityLedger.capabilityOnlyCount, 0),
+      sealedHandlesCount: items.reduce((n, t) => n + t.capabilityLedger.sealedHandlesCount, 0),
+      causalEdgesCount: items.reduce((n, t) => n + t.capabilityLedger.causalEdgesCount, 0),
+      negativeEdgesPrunedCount: items.reduce((n, t) => n + t.capabilityLedger.negativeEdgesPrunedCount, 0),
+      compositeReceiptsCount: items.reduce((n, t) => n + t.capabilityLedger.compositeReceiptsCount, 0),
+    },
+    v8SdkAdoption: {
+      guardianVerifyCalls: items.reduce((n, t) => n + t.v8SdkAdoption.guardianVerifyCalls, 0),
+      sealCapabilityCalls: items.reduce((n, t) => n + t.v8SdkAdoption.sealCapabilityCalls, 0),
+      hmacSignCalls: items.reduce((n, t) => n + t.v8SdkAdoption.hmacSignCalls, 0),
+      jwtSignCalls: items.reduce((n, t) => n + t.v8SdkAdoption.jwtSignCalls, 0),
+      awaitAsyncCalls: items.reduce((n, t) => n + t.v8SdkAdoption.awaitAsyncCalls, 0),
+      proveCompositeCalls: items.reduce((n, t) => n + t.v8SdkAdoption.proveCompositeCalls, 0),
+      compositeConfirmed: items.reduce((n, t) => n + t.v8SdkAdoption.compositeConfirmed, 0),
+      topRejectReasons,
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Cell metadata, artifacts & execution
 // ---------------------------------------------------------------------------------------------
 
@@ -1246,6 +2275,12 @@ export interface MultihopCellMeta {
   assignmentsCompleted: number
   assignmentsTotal: number
   investigationCompleted: number
+  phaseBAssignments?: number
+  deadEndReprobeCount?: number
+  deadEndReprobeWasteRate?: number
+  deadEndWastePct?: number
+  frontier?: MultihopFrontierWasteSnapshot
+  telemetry?: MultihopRunTelemetry
   facts: number
   findingsPersisted: number
   findingsSubmitted: number
@@ -1260,6 +2295,8 @@ export interface MultihopCellMeta {
   notes: string[]
   shutdown: { engineBusy: number; appStopped: boolean; canaryStopped: boolean }
 }
+
+export type MultihopCellReport = MultihopCellMeta
 
 export interface MultihopCellResult {
   meta: MultihopCellMeta
@@ -1882,6 +2919,21 @@ export async function runCell(
       investigationCompleted: assignmentDiagnostics.investigationCompleted,
     })
 
+    let frontierTelemetry: ExtractMultihopRunTelemetryOptions['frontierTelemetry'] = null
+    try {
+      frontierTelemetry = engine.frontierControllerFor(runId).getTelemetry()
+    } catch { /* best-effort */ }
+    const runTelemetry = extractMultihopRunTelemetry(storage, runId, {
+      runStartedAtMs: startedAt,
+      runEndedAtMs: endedAt,
+      dataDir,
+      frontierTelemetry,
+      compositeReceiptsExtracted: compositeReceipts.length,
+    })
+    const deadEndReprobeWasteRate = runTelemetry.scheduler.totalPhaseBAssignments > 0
+      ? runTelemetry.scheduler.deadEndReprobes / runTelemetry.scheduler.totalPhaseBAssignments
+      : 0
+
     const meta: MultihopCellMeta = {
       schemaVersion: 1,
       app,
@@ -1936,6 +2988,17 @@ export async function runCell(
       assignmentsCompleted: assignmentDiagnostics.completed,
       assignmentsTotal: assignmentDiagnostics.total,
       investigationCompleted: assignmentDiagnostics.investigationCompleted,
+      phaseBAssignments: runTelemetry.scheduler.totalPhaseBAssignments,
+      deadEndReprobeCount: runTelemetry.scheduler.deadEndReprobes,
+      deadEndReprobeWasteRate,
+      deadEndWastePct: runTelemetry.scheduler.deadEndWastePct,
+      frontier: {
+        deadEndReprobeCount: runTelemetry.scheduler.deadEndReprobes,
+        totalAssignmentsDispatched: runTelemetry.scheduler.totalPhaseBAssignments,
+        phaseBAssignments: runTelemetry.scheduler.totalPhaseBAssignments,
+        deadEndReprobeWasteRate,
+      },
+      telemetry: runTelemetry,
       facts: factsCount,
       findingsPersisted: detail.findings.length,
       findingsSubmitted: submitted.length,
@@ -2248,6 +3311,7 @@ export interface MultihopReport {
   curve: MultihopCurveRow[]
   antiHeuristicGate: MultihopAntiHeuristicGate | null
   hardenedTwinGatePassed: boolean
+  telemetry?: MultihopRunTelemetry | null
   notes: string[]
 }
 
@@ -2263,6 +3327,7 @@ export function buildMultihopReport(
   const agentic = aggregateMultihopCells(agenticCells)
   const floorRun = floorRunCells.length ? aggregateMultihopCells(floorRunCells) : null
   const allAgg = aggregateMultihopCells(cells)
+  const telemetry = aggregateMultihopTelemetry(agenticCells.length ? agenticCells : cells)
 
   const notes: string[] = []
   if (agenticCells.length && !floor) {
@@ -2287,11 +3352,13 @@ export function buildMultihopReport(
     curve: budgetDurationCurve(allFloor.concat(agenticCells)),
     antiHeuristicGate: floorRunCells.length ? evaluateAntiHeuristicGate(floorRunCells) : null,
     hardenedTwinGatePassed: allAgg.hardenedTwinGatePassed,
+    telemetry,
     notes,
   }
 }
 
 const pct = (n: number): string => `${(n * 100).toFixed(1)}%`
+const fmtMs = (ms: number | null): string => (ms === null ? 'n/a' : `${(ms / 1000).toFixed(1)}s (${ms}ms)`)
 
 function mdTable(headers: string[], rows: string[][]): string {
   const lines = [`| ${headers.join(' | ')} |`, `| ${headers.map(() => '---').join(' | ')} |`]
@@ -2348,6 +3415,40 @@ export function renderMultihopReport(report: MultihopReport, format: 'json' | 'm
     lines.push('## Anti-Heuristic Gate (`--no-llm <= 5%`)')
     lines.push('')
     lines.push(`Floor chain recall **${pct(g.recall)}** (${g.confirmed}/${g.targets}) vs ceiling **${pct(g.ceiling)}** -> **${g.passed ? 'PASS' : 'FAIL'}**`)
+    lines.push('')
+  }
+  const tel = report.telemetry ?? aggregateMultihopTelemetry(report.cells)
+  if (tel) {
+    const pt = tel.phaseTiming
+    const sc = tel.scheduler
+    const cl = tel.capabilityLedger
+    const sdk = tel.v8SdkAdoption
+    const rejectSummary = sdk.topRejectReasons.length
+      ? sdk.topRejectReasons.slice(0, 5).map(r => `\`${r.reason}\` (${r.count})`).join(', ')
+      : 'none'
+    lines.push('## Telemetry Summary')
+    lines.push('')
+    lines.push(mdTable(
+      ['section', 'metrics'],
+      [
+        [
+          'Phase Timing',
+          `codeAudit=${fmtMs(pt.codeAuditMs)}, floor=${fmtMs(pt.floorMs)}, phaseBStart=${fmtMs(pt.phaseBStartMs)}, firstChainDispatch=${fmtMs(pt.firstChainDispatchMs)}, totalWall=${fmtMs(pt.totalWallMs)}`,
+        ],
+        [
+          'Scheduler & Waste',
+          `maxConc=${sc.maxEffectiveConcurrency}, workers=${sc.workersCompleted}/${sc.workersStarted}, rotations=${sc.wallClockRotations}, maxWorkerWall=${fmtMs(sc.maxWorkerWallMs)}, phaseBAssignments=${sc.totalPhaseBAssignments}, deadEndReprobes=${sc.deadEndReprobes} (${sc.deadEndWastePct.toFixed(2)}%)`,
+        ],
+        [
+          'CapabilityLedger',
+          `nodes=${cl.nodesTotal} (capOnly=${cl.capabilityOnlyCount}, sealed=${cl.sealedHandlesCount}), causalEdges=${cl.causalEdgesCount}, negEdgesPruned=${cl.negativeEdgesPrunedCount}, compositeReceipts=${cl.compositeReceiptsCount}`,
+        ],
+        [
+          'v8 SDK Adoption',
+          `guardian_verify=${sdk.guardianVerifyCalls}, seal=${sdk.sealCapabilityCalls}, hmac=${sdk.hmacSignCalls}, jwt=${sdk.jwtSignCalls}, awaitAsync=${sdk.awaitAsyncCalls}, proveComposite=${sdk.proveCompositeCalls} (confirmed=${sdk.compositeConfirmed}), topRejects=${rejectSummary}`,
+        ],
+      ],
+    ))
     lines.push('')
   }
   lines.push('## Per Cell')
