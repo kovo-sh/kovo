@@ -2,8 +2,8 @@ node_modules/
 dist/app.js
 
 /build/
-# Local run state, incl. opt-in agentic traces (.guardian/traces/<traceId>/)
-/.guardian/
+# Local run state, incl. opt-in agentic traces (.kovo/traces/<traceId>/)
+/.kovo/
 /playwright-report/
 /test-results/
 /node_modules/

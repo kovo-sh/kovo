@@ -1,11 +1,11 @@
 // Theme integration. The app decides the theme with html[data-appearance]
 // = light | dark | system and html[data-theme] = light | dark (localStorage
-// `guardian-appearance`, applied before first paint by __root.tsx).
+// `kovo-appearance`, applied before first paint by __root.tsx).
 // Tailwind v4 dark: variants and tokens.css both key off these attributes.
 import { useCallback, useEffect, useState } from 'react'
 
 export type Theme = 'light' | 'dark'
-const KEY = 'guardian-appearance'
+const KEY = 'kovo-appearance'
 
 function resolve(): Theme {
   if (typeof document === 'undefined') return 'light'

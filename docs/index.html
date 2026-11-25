@@ -3,19 +3,19 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Kovo Guardian — Open-Source AI Security Pentester</title>
+  <title>Kovo Hunter — Open-Source AI Security Pentester</title>
   <meta name="description" content="Open-source AI security pentester that helps you catch vulnerabilities before attackers do. Self-hosted UI, air-gapped workers, host request broker, opaque persona vault, and zero-LLM replay verification." />
   <meta name="theme-color" content="#0F1D2D" />
 
   <!-- Open Graph -->
   <meta property="og:type" content="website" />
-  <meta property="og:site_name" content="Kovo Guardian" />
-  <meta property="og:title" content="Kovo Guardian — Open-Source AI Security Pentester" />
+  <meta property="og:site_name" content="Kovo Hunter" />
+  <meta property="og:title" content="Kovo Hunter — Open-Source AI Security Pentester" />
   <meta property="og:description" content="Catch vulnerabilities before attackers do. Self-hosted AI pentesting locked safely to your own apps with air-gapped workers, an opaque persona vault, and 1-click zero-LLM replay verification." />
 
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary" />
-  <meta name="twitter:title" content="Kovo Guardian — Open-Source AI Security Pentester" />
+  <meta name="twitter:title" content="Kovo Hunter — Open-Source AI Security Pentester" />
   <meta name="twitter:description" content="Open-source Apache 2.0 AI security pentester with a self-hosted UI, air-gapped workers, host request broker, and 1-click zero-LLM Verify Fix." />
 
   <!-- Blueprint Crosshair SVG Favicon (Prussian Navy #0F1D2D + Copper #B45309) -->
@@ -656,7 +656,7 @@
             <rect x="6.7" y="6.7" width="2.6" height="2.6" fill="#B45309"/>
           </svg>
         </span>
-        <span>Kovo Guardian</span>
+        <span>Kovo Hunter</span>
         <span class="brand-tag">APACHE 2.0</span>
       </a>
       <nav class="nav" aria-label="Primary">
@@ -664,7 +664,7 @@
         <a href="#install">Get Started</a>
         <a href="#compare" class="hide-sm">Compare</a>
         <a href="#faq" class="hide-sm">FAQ</a>
-        <a href="https://github.com/kovo-sh/guardian" target="_blank" rel="noopener noreferrer" class="nav-gh">GitHub ↗</a>
+        <a href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer" class="nav-gh">GitHub ↗</a>
       </nav>
     </div>
   </header>
@@ -678,17 +678,17 @@
             <div class="spec-kicker">OPEN-SOURCE AI SECURITY PENTESTER · KOVO-GRD</div>
             <h1>Catch vulnerabilities before attackers do.</h1>
             <p class="hero-copy">
-              <strong>Kovo Guardian</strong> is an open-source AI security pentester that helps you catch vulnerabilities before attackers do — with a self-hosted UI, air-gapped worker isolation, host-brokered scope locks, and deterministic zero-LLM verification.
+              <strong>Kovo Hunter</strong> is an open-source AI security pentester that helps you catch vulnerabilities before attackers do — with a self-hosted UI, air-gapped worker isolation, host-brokered scope locks, and deterministic zero-LLM verification.
             </p>
             <div class="cta-row">
               <a href="#install" class="btn btn-dark">Get Started</a>
-              <a href="https://github.com/kovo-sh/guardian" target="_blank" rel="noopener noreferrer" class="btn btn-plain">GitHub (kovo-sh/guardian)</a>
+              <a href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer" class="btn btn-plain">GitHub (kovo-sh/kovo-hunter)</a>
               <button type="button" class="btn btn-plain" id="openReportBtn" aria-haspopup="dialog">Sample Report</button>
             </div>
           </div>
 
           <aside class="title-block" aria-label="Project overview">
-            <div class="tb-bar"><span>SPECIFICATION</span><span>KOVO-SH/GUARDIAN</span></div>
+            <div class="tb-bar"><span>SPECIFICATION</span><span>KOVO-SH/KOVO-HUNTER</span></div>
             <div class="tb-grid">
               <div class="tb-cell"><span class="tb-k">License</span><span class="tb-v copper">Apache 2.0</span></div>
               <div class="tb-cell"><span class="tb-k">Control</span><span class="tb-v">Self-Hosted UI</span></div>
@@ -750,10 +750,10 @@
           <div>
             <h2>Self-hosted pentesting locked to your own software.</h2>
             <p class="prose">
-              Like <strong>ARTEX</strong>, Kovo Guardian provides a self-hosted management UI so you can complete pentesting end-to-end in one simple UI.
+              Like <strong>ARTEX</strong>, Kovo Hunter provides a self-hosted management UI so you can complete pentesting end-to-end in one simple UI.
             </p>
             <p class="prose">
-              ARTEX is extremely powerful, yet easy to misuse for developers and security engineers trying to protect their own applications. Kovo Guardian makes it simple to lock pentesting to your own apps and approved domains so you don't accidentally probe third-party hosts, mutate production data, or leak test credentials.
+              ARTEX is extremely powerful, yet easy to misuse for developers and security engineers trying to protect their own applications. Kovo Hunter makes it simple to lock pentesting to your own apps and approved domains so you don't accidentally probe third-party hosts, mutate production data, or leak test credentials.
             </p>
 
             <div class="feat-cols">
@@ -850,17 +850,17 @@
 
                   <div class="install-pane active" id="pane-docker" role="tabpanel" aria-labelledby="tab-docker">
                     <div class="cmd-box">
-                      <pre>docker run -p 8000:8000 -v guardian-data:/data ghcr.io/kovo-sh/guardian</pre>
-                      <button type="button" class="copy-btn" aria-label="Copy Docker install command" data-copy="docker run -p 8000:8000 -v guardian-data:/data ghcr.io/kovo-sh/guardian">COPY</button>
+                      <pre>docker run -p 8000:8000 -v kovo-data:/data ghcr.io/kovo-sh/kovo-hunter</pre>
+                      <button type="button" class="copy-btn" aria-label="Copy Docker install command" data-copy="docker run -p 8000:8000 -v kovo-data:/data ghcr.io/kovo-sh/kovo-hunter">COPY</button>
                     </div>
-                    <p class="install-note">Persists local run state in the <code>guardian-data</code> volume and opens the self-hosted UI on <code>http://localhost:8000</code>.</p>
+                    <p class="install-note">Persists local run state in the <code>kovo-data</code> volume and opens the self-hosted UI on <code>http://localhost:8000</code>.</p>
                   </div>
 
                   <div class="install-pane" id="pane-source" role="tabpanel" aria-labelledby="tab-source">
                     <div class="cmd-box">
-                      <pre>git clone https://github.com/kovo-sh/guardian.git
-cd guardian && npm ci && npm run worker:build && npm run build && npm start</pre>
-                      <button type="button" class="copy-btn" aria-label="Copy build from source commands" data-copy="git clone https://github.com/kovo-sh/guardian.git&#10;cd guardian && npm ci && npm run worker:build && npm run build && npm start">COPY</button>
+                      <pre>git clone https://github.com/kovo-sh/kovo-hunter.git
+cd kovo-hunter && npm ci && npm run worker:build && npm run build && npm start</pre>
+                      <button type="button" class="copy-btn" aria-label="Copy build from source commands" data-copy="git clone https://github.com/kovo-sh/kovo-hunter.git&#10;cd kovo-hunter && npm ci && npm run worker:build && npm run build && npm start">COPY</button>
                     </div>
                     <p class="install-note">Requires Node.js 24+ and a local Docker daemon for isolated <code>--network=none</code> workers.</p>
                   </div>
@@ -897,13 +897,13 @@ cd guardian && npm ci && npm run worker:build && npm run build && npm start</pre
             <span>Honest matrix</span>
           </div>
           <div>
-            <h2>How Kovo Guardian compares.</h2>
+            <h2>How Kovo Hunter compares.</h2>
             <div class="table-wrap">
               <table class="cmp">
                 <thead>
                   <tr>
                     <th>Dimension</th>
-                    <th class="g-col">Kovo Guardian</th>
+                    <th class="g-col">Kovo Hunter</th>
                     <th>ARTEX</th>
                     <th>Strix</th>
                     <th>Classic DAST (ZAP / Nuclei)</th>
@@ -963,13 +963,13 @@ cd guardian && npm ci && npm run worker:build && npm run build && npm start</pre
           </div>
           <div>
             <div class="faq-item">
-              <h3>Is Kovo Guardian free? What are the restrictions?</h3>
+              <h3>Is Kovo Hunter free? What are the restrictions?</h3>
               <p>Free &amp; open-source under <strong>Apache 2.0</strong> — unlimited pentest runs across all your applications, pay us nothing.</p>
-              <p><strong>Enterprise Edition</strong> (in development) for larger teams &amp; organizations adds SSO, configurable roles &amp; RBAC, and scheduled routine pentest runs (e.g. weekly) with automated email and Slack reports. <a class="link-copper" href="mailto:will@kovo.sh?subject=Kovo%20Guardian%20Enterprise">Contact us</a>.</p>
+              <p><strong>Enterprise Edition</strong> (in development) for larger teams &amp; organizations adds SSO, configurable roles &amp; RBAC, and scheduled routine pentest runs (e.g. weekly) with automated email and Slack reports. <a class="link-copper" href="mailto:will@kovo.sh?subject=Kovo%20Hunter%20Enterprise">Contact us</a>.</p>
             </div>
             <div class="faq-item">
-              <h3>How does Kovo Guardian compare to ARTEX, Strix, and traditional scanners?</h3>
-              <p>See <a class="link-copper" href="#compare">TBL 03 / COMPARE</a> above. Kovo Guardian pairs ARTEX's single self-hosted UI with defensive-first boundaries — air-gapped workers, broker-enforced scope tiers, an opaque persona vault, and deterministic zero-LLM replay verification.</p>
+              <h3>How does Kovo Hunter compare to ARTEX, Strix, and traditional scanners?</h3>
+              <p>See <a class="link-copper" href="#compare">TBL 03 / COMPARE</a> above. Kovo Hunter pairs ARTEX's single self-hosted UI with defensive-first boundaries — air-gapped workers, broker-enforced scope tiers, an opaque persona vault, and deterministic zero-LLM replay verification.</p>
             </div>
           </div>
         </div>
@@ -984,18 +984,18 @@ cd guardian && npm ci && npm run worker:build && npm run build && npm start</pre
             <h3>Enterprise Edition (in development)</h3>
             <p>SSO, configurable roles &amp; RBAC, and scheduled routine pentest runs (e.g. weekly) with automated email and Slack reports.</p>
           </div>
-          <a href="mailto:will@kovo.sh?subject=Kovo%20Guardian%20Enterprise" class="btn btn-white">Contact us</a>
+          <a href="mailto:will@kovo.sh?subject=Kovo%20Hunter%20Enterprise" class="btn btn-white">Contact us</a>
         </div>
       </div>
     </div>
   </main>
 
   <footer class="foot">
-    <div>KOVO GUARDIAN · APACHE 2.0 · CREATED BY WILL CHEN</div>
+    <div>KOVO HUNTER · APACHE 2.0 · CREATED BY WILL CHEN</div>
     <nav aria-label="Footer">
-      <a href="https://github.com/kovo-sh/guardian" target="_blank" rel="noopener noreferrer">GITHUB</a>
-      <a href="https://github.com/kovo-sh/guardian/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">APACHE 2.0 LICENSE</a>
-      <a href="mailto:will@kovo.sh?subject=Kovo%20Guardian%20Enterprise">ENTERPRISE CONTACT</a>
+      <a href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer">GITHUB</a>
+      <a href="https://github.com/kovo-sh/kovo-hunter/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">APACHE 2.0 LICENSE</a>
+      <a href="mailto:will@kovo.sh?subject=Kovo%20Hunter%20Enterprise">ENTERPRISE CONTACT</a>
     </nav>
   </footer>
 
@@ -1007,7 +1007,7 @@ cd guardian && npm ci && npm run worker:build && npm run build && npm start</pre
         <button type="button" class="modal-close" id="closeReportBtn" aria-label="Close sample report modal">&times;</button>
       </div>
       <div class="modal-body">
-        <pre># Kovo Guardian Security Assessment Export
+        <pre># Kovo Hunter Security Assessment Export
 Approved Scope: staging.yourapp.dev, api.yourapp.dev (Tier 1)
 Worker Runtime: --network=none | Grey-Box Mount: /repos/app:ro
 Persona Vault:  user_a, user_b (0 credentials exposed to LLM)

@@ -74,7 +74,7 @@ The lift cell compares the resumed run against
 `--floor-scorecard`). Produce that baseline once with the deterministic floor:
 
 ```bash
-GUARDIAN_ALLOW_LOCAL_LAB=1 node scripts/benchmark-realistic.ts \
+KOVO_ALLOW_LOCAL_LAB=1 node scripts/benchmark-realistic.ts \
   --app acme-saas --seed 1 --no-llm --max-duration-ms 300000 \
   --out-dir <snapshot-root>/baseline
 ```
@@ -99,7 +99,7 @@ to `<out-dir>/smoke-report.json` (add `--json` to print it).
 ## Tier 2 — documented, not run by default
 
 `--tier 2` prints the full 3-app agentic matrix, salted held-out command, endurance
-run, and realism exit gate. Held-out requires `GUARDIAN_RB_HELDOUT_SALT` and seeds
+run, and realism exit gate. Held-out requires `KOVO_RB_HELDOUT_SALT` and seeds
 >= 1,000,000; never commit the salt.
 
 ```bash
@@ -121,7 +121,7 @@ worktrees/commits and writes `<out-dir>/calibration.csv` for the Spearman study:
 
 ## Safety
 
-- Loopback only: `GUARDIAN_ALLOW_LOCAL_LAB=1` is required by fixtures/trap.
+- Loopback only: `KOVO_ALLOW_LOCAL_LAB=1` is required by fixtures/trap.
 - Model credentials stay outside the repo; per-cell data dirs copy profile metadata
   and symlink credential files, never the key itself.
 - Agentic cells run under `newgrp docker` when the Docker socket is not in the

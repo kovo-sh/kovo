@@ -80,7 +80,7 @@ function VerdictStrip() {
     onClick={() => setOpen(!open)}
     onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setOpen(!open) } }}
   >
-    <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-guardian', !open && '-rotate-90')} />
+    <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-kovo', !open && '-rotate-90')} />
     {open ? <>
       <span className="min-w-0 flex-1 truncate font-medium text-fg">{v.hed}</span>
       <span className="inline-flex flex-none items-center gap-1.5 text-fg-subtle">{v.conf.word === 'Not yet assessed' ? v.conf.word : v.conf.word + ' confidence'}</span>
@@ -169,7 +169,7 @@ function GroupHead({ g, group, collapsed, onToggle, style, className }: {
     onClick={onToggle}
     onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle() } }}
   >
-    <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-guardian', collapsed && '-rotate-90')} />
+    <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-kovo', collapsed && '-rotate-90')} />
     <span className="inline-flex size-3.5 flex-none items-center justify-center">{g.glyph}</span>
     <span>{g.label}</span>
     <span className="font-normal tabular-nums text-fg-subtle">{g.items.length}</span>
@@ -341,11 +341,11 @@ export function FindingsView() {
   </>
 }
 
-/** Rows above which the list is windowed. `localStorage['guardian-rw-virtual-at']` overrides it (testing). */
+/** Rows above which the list is windowed. `localStorage['kovo-rw-virtual-at']` overrides it (testing). */
 function useVirtualThreshold() {
   const [n, setN] = useState(VIRTUAL_AT)
   useEffect(() => {
-    const v = Number(localStorage.getItem('guardian-rw-virtual-at'))
+    const v = Number(localStorage.getItem('kovo-rw-virtual-at'))
     if (v > 0) setN(v)
   }, [])
   return n

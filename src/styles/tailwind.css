@@ -1,5 +1,5 @@
 /* =====================================================================
-   Guardian design system — Tailwind CSS v4 entry point.
+   Kovo Hunter design system — Tailwind CSS v4 entry point.
 
    This file is the *additive* foundation for the class-variance-authority
    primitives in src/components/ui/*. It intentionally does NOT ship
@@ -127,7 +127,7 @@
   --shadow-popover: var(--shadow-pop);
 
   /* Motion ----------------------------------------------------------- */
-  --ease-guardian: var(--ease);
+  --ease-kovo: var(--ease);
   --ease-spring: var(--spring);
   --default-transition-duration: var(--d1);
 }

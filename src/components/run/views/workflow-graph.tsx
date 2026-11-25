@@ -118,7 +118,7 @@ function tickBgClass(status: string): string {
   }
 }
 
-const NODE_BASE = 'group/node absolute flex h-[var(--nh)] w-[var(--nw)] cursor-pointer select-none flex-col gap-[3px] rounded-[9px] px-[11px] pb-2 pt-[9px] transition-[opacity,box-shadow,transform] duration-[var(--d2)] ease-guardian group-data-[lod]/wf:justify-center group-data-[lod]/wf:px-3.5 group-data-[lod]/wf:py-2.5 data-[rp=hidden]:pointer-events-none data-[rp=hidden]:scale-[.94] data-[rp=hidden]:opacity-0!'
+const NODE_BASE = 'group/node absolute flex h-[var(--nh)] w-[var(--nw)] cursor-pointer select-none flex-col gap-[3px] rounded-[9px] px-[11px] pb-2 pt-[9px] transition-[opacity,box-shadow,transform] duration-[var(--d2)] ease-kovo group-data-[lod]/wf:justify-center group-data-[lod]/wf:px-3.5 group-data-[lod]/wf:py-2.5 data-[rp=hidden]:pointer-events-none data-[rp=hidden]:scale-[.94] data-[rp=hidden]:opacity-0!'
 const NODE_STACK_LAYERS = "before:content-[''] before:absolute before:inset-x-1.5 before:-bottom-[5px] before:-z-[1] before:h-2 before:rounded-b-[9px] before:bg-panel before:shadow-surface after:content-[''] after:absolute after:inset-x-3 after:-bottom-2.5 after:-z-[2] after:h-2 after:rounded-b-[9px] after:bg-panel after:opacity-70 after:shadow-surface"
 const NODE_TOP = 'flex h-4 min-w-0 items-center gap-1.5 whitespace-nowrap text-[11.5px] group-data-[lod]/wf:hidden'
 const NODE_TITLE = 'line-clamp-2 min-h-[34px] text-[12.5px] font-medium leading-[17px] group-data-[lod]/wf:min-h-0 group-data-[lod]/wf:text-[21px] group-data-[lod]/wf:leading-[27px]'
@@ -264,7 +264,7 @@ const NodeCard = memo(function NodeCard({ n, info, flags, reportSub }: { n: WfNo
 const Edge = memo(function Edge({ d, e, hot }: { d: string; e: WfEdge; hot: boolean }) {
   return <path
     className={cn(
-      'fill-none transition-[opacity,stroke,stroke-width] duration-[var(--d2)] ease-guardian data-[rp=hidden]:hidden',
+      'fill-none transition-[opacity,stroke,stroke-width] duration-[var(--d2)] ease-kovo data-[rp=hidden]:hidden',
       e.kind === 'causal' && '[stroke-dasharray:4_3]',
       hot
         ? cn('opacity-100 stroke-accent', e.kind === 'causal' ? '[stroke-width:1.6]' : '[stroke-width:1.8]')
@@ -917,7 +917,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
             </span>
             <span className="h-[3px] overflow-hidden rounded-[2px] bg-line-2">
               <i
-                className={cn('block h-full origin-left transition-transform duration-500 ease-guardian', isCur ? 'bg-accent' : 'bg-fg-subtle')}
+                className={cn('block h-full origin-left transition-transform duration-500 ease-kovo', isCur ? 'bg-accent' : 'bg-fg-subtle')}
                 style={{ transform: `scaleX(${h.n ? h.done / h.n : 0})` }}
               />
             </span>

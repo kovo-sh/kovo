@@ -25,7 +25,7 @@ export function DropdownMenuContent({ align = 'end', className, ...props }: Menu
           data-slot="dropdown-menu-content"
           className={cn(
             'max-h-[var(--available-height)] min-w-[170px] overflow-auto rounded-card bg-raise p-1 text-fg shadow-popover outline-none',
-            'transition-[opacity,transform] duration-150 ease-guardian',
+            'transition-[opacity,transform] duration-150 ease-kovo',
             'data-[ending-style]:scale-[.98] data-[ending-style]:opacity-0',
             'data-[starting-style]:scale-[.98] data-[starting-style]:opacity-0',
             className,

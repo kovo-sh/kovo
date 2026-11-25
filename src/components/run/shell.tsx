@@ -100,7 +100,7 @@ function NavWithRun({ runId, view, sel, go, switchRun, children }: {
   return <NavProvider runId={runId} view={view} sel={sel} go={go} switchRun={switchRun} hasPendingApprovals={hasPendingApprovals}>{children}</NavProvider>
 }
 
-const PANE_KEY = 'guardian-rw-pane'
+const PANE_KEY = 'kovo-rw-pane'
 const PANE_MIN = 320
 const PANE_MAX = 640
 
@@ -125,7 +125,7 @@ function Workspace() {
     className={cn(
       'grid h-screen',
       cols,
-      !resizing && !rm && 'transition-[grid-template-columns] duration-[var(--d2)] ease-guardian',
+      !resizing && !rm && 'transition-[grid-template-columns] duration-[var(--d2)] ease-kovo',
     )}
     style={paneW && !nav.paneCollapsed ? { ['--pane-w' as string]: paneW + 'px' } : undefined}
   >
@@ -138,7 +138,7 @@ function Workspace() {
     <aside
       ref={paneRef}
       className={cn(
-        'relative flex min-h-0 min-w-0 flex-col border-l border-line bg-panel transition-opacity duration-[var(--d2)] ease-guardian motion-reduce:transition-none',
+        'relative flex min-h-0 min-w-0 flex-col border-l border-line bg-panel transition-opacity duration-[var(--d2)] ease-kovo motion-reduce:transition-none',
         nav.paneCollapsed && 'pointer-events-none overflow-hidden border-l-transparent opacity-0 duration-[var(--d1)]',
       )}
       aria-label="Inspector"

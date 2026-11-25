@@ -98,7 +98,7 @@ export function ExchangeRow({ id, summary, hl = [] }: { id: string; summary?: Ex
       <span className={cn('w-7 flex-none font-mono text-[12px]', httpCodeClass(x.status))}>{x.status}</span>
       <span className="min-w-0 flex-1 truncate font-mono text-[12px]">{host(x.origin)}{x.pathAndQuery}</span>
       {hv}
-      <span className={cn('inline-flex flex-none text-fg-subtle transition-transform duration-[var(--d2)] ease-guardian', open ? 'rotate-0' : '-rotate-90')}>
+      <span className={cn('inline-flex flex-none text-fg-subtle transition-transform duration-[var(--d2)] ease-kovo', open ? 'rotate-0' : '-rotate-90')}>
         <Icon name="chev" />
       </span>
     </div>

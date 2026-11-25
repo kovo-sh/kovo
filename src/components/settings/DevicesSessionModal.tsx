@@ -135,7 +135,7 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
     setStatusMessage('')
     setConfirmRotate(false)
     try {
-      const response = await fetch('/_guardian/auth/pairing-link', {
+      const response = await fetch('/_kovo/auth/pairing-link', {
         method: 'POST',
         credentials: 'same-origin',
       })
@@ -189,7 +189,7 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
     setErrorMessage('')
     setStatusMessage('')
     try {
-      const response = await fetch('/_guardian/auth/rotate-session', {
+      const response = await fetch('/_kovo/auth/rotate-session', {
         method: 'POST',
         credentials: 'same-origin',
       })

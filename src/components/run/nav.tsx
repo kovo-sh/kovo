@@ -17,7 +17,7 @@ import type { ReactNode } from 'react'
 import { useShortcuts } from './keyboard.tsx'
 import type { ViewId } from './meta.ts'
 
-const PANE_COLLAPSED_KEY = 'guardian-run-pane-collapsed'
+const PANE_COLLAPSED_KEY = 'kovo-run-pane-collapsed'
 
 export interface Sel { kind: string; id: string }
 export const selKey = (s: Sel) => s.kind + ':' + s.id

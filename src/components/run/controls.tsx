@@ -135,7 +135,7 @@ export const FilterBox = forwardRef<HTMLInputElement, { value: string; onChange:
     useImperativeHandle(ref, () => inner.current!, [])
     useShortcuts([{ key: '/', run: () => { inner.current?.focus(); inner.current?.select() } }])
     return <label className={cn(
-      'flex h-[26px] w-[120px] flex-none items-center gap-1.5 rounded-control px-2 text-fg-subtle transition-[width,background-color,box-shadow] duration-[var(--d2)] ease-guardian hover:bg-hover focus-within:w-[200px] focus-within:bg-sunk focus-within:text-fg-muted focus-within:shadow-hairline',
+      'flex h-[26px] w-[120px] flex-none items-center gap-1.5 rounded-control px-2 text-fg-subtle transition-[width,background-color,box-shadow] duration-[var(--d2)] ease-kovo hover:bg-hover focus-within:w-[200px] focus-within:bg-sunk focus-within:text-fg-muted focus-within:shadow-hairline',
       className,
     )}>
       <Icon name="search" />

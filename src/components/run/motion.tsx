@@ -128,7 +128,7 @@ export function Meter({ id, value, warn, wide, className, style, title, barColor
     <i
       ref={ref}
       className={cn(
-        'absolute inset-0 origin-left rounded-[4px] transition-transform duration-500 ease-guardian motion-reduce:transition-none',
+        'absolute inset-0 origin-left rounded-[4px] transition-transform duration-500 ease-kovo motion-reduce:transition-none',
         w ? 'bg-warn' : 'bg-fg-muted',
       )}
       style={{ transform: 'scaleX(var(--v, 0))', ...(barColor ? { background: barColor } : undefined) }}

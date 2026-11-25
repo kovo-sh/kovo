@@ -150,7 +150,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       {items.map(t => <div
         key={t.id}
         className={cn(
-          'pointer-events-auto relative flex min-w-[280px] max-w-[520px] items-center gap-2.5 overflow-hidden rounded-[9px] py-2 pl-3 pr-2 text-[12.5px] shadow-[0_10px_30px_-10px_rgba(0,0,0,.4)] transition-[opacity,transform] duration-[var(--d2)] ease-guardian',
+          'pointer-events-auto relative flex min-w-[280px] max-w-[520px] items-center gap-2.5 overflow-hidden rounded-[9px] py-2 pl-3 pr-2 text-[12.5px] shadow-[0_10px_30px_-10px_rgba(0,0,0,.4)] transition-[opacity,transform] duration-[var(--d2)] ease-kovo',
           t.tone === 'error' ? 'bg-danger text-white' : 'bg-fg text-panel',
           t.out ? 'translate-y-2 opacity-0' : 'translate-y-0 opacity-100',
         )}

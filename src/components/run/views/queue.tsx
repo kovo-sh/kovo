@@ -273,7 +273,7 @@ export function QueueView() {
             onClick={() => setCollapsed(c => ({ ...c, [k]: !col }))}
             onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setCollapsed(c => ({ ...c, [k]: !col })) } }}
           >
-            <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-guardian', col && '-rotate-90')} />
+            <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-kovo', col && '-rotate-90')} />
             <span>{label}</span>
             <span className="font-normal tabular-nums text-fg-subtle"><AnimatedNumber id={'q.sec.' + k} value={items.length} /></span>
             <span className="text-[12px] font-normal text-fg-subtle">{sub}</span>
@@ -360,7 +360,7 @@ function QRow({ it, sec, cur, motion: m, onSelect, onAct, onAsk }: {
       {meta.map((x, i) => <span key={i} className="inline-flex items-center gap-2">{i > 0 && <span className="text-fg-faint">·</span>}{x}</span>)}
     </span>
     {sec !== 'done' && <span className={cn(
-      'pointer-events-none absolute right-3 top-1/2 flex -translate-y-1/2 translate-x-1 gap-1 pl-6 opacity-0 transition-[opacity,transform] duration-[var(--d1)] ease-guardian',
+      'pointer-events-none absolute right-3 top-1/2 flex -translate-y-1/2 translate-x-1 gap-1 pl-6 opacity-0 transition-[opacity,transform] duration-[var(--d1)] ease-kovo',
       cur
         ? 'bg-gradient-to-r from-transparent via-[var(--row-s)] to-[var(--row-s)]'
         : 'bg-gradient-to-r from-transparent via-[var(--row-h)] to-[var(--row-h)]',

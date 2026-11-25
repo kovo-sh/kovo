@@ -217,7 +217,7 @@ export function ExchangesView() {
             const ck = it.key.slice(2)
             const col = !!collapsed[ck]
             return <div key={it.key} style={style} className={cn(RW.ghead, 'absolute')} role="button" tabIndex={-1} onClick={() => setCollapsed(c => ({ ...c, [ck]: !col }))}>
-              <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-guardian', col && '-rotate-90')} />
+              <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-kovo', col && '-rotate-90')} />
               <span className="inline-flex size-3.5 flex-none items-center justify-center text-fg-subtle"><Icon name={it.icon} /></span>
               <span className={it.icon === 'globe' ? 'font-mono text-[12px]' : undefined}>{it.label}</span>
               <span className="font-normal tabular-nums text-fg-subtle">{fmtN(it.count)}</span>

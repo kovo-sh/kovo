@@ -200,4 +200,4 @@ Palette: Views, Runs, Findings, Workers, Hosts and core Actions are built in. Ad
 `npm run check` must pass; zero console errors/warnings. Screenshot light and dark at 1440×900 against F's shots.
 Playwright **must** intercept every non-GET request (`page.route('**/*', …)` → fulfill a mock) and assert payloads
 instead of letting them through (see `README.md` for the QA harness and the e2e specs that cover this page)
-(cookie: visit `/` first; data: `GUARDIAN_DATA_DIR=/tmp/guardian-ui-data`).
+(cookie: visit `/` first; data: `KOVO_DATA_DIR=/tmp/kovo-ui-data`).

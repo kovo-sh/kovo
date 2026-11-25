@@ -91,7 +91,7 @@ export function ActivityView() {
             className={cn(
               RW.row,
               selId === id && RW.rowCur,
-              !rm && e.id > fresh && 'transition-[background-color,opacity] duration-700 ease-guardian starting:bg-accent-soft starting:opacity-0',
+              !rm && e.id > fresh && 'transition-[background-color,opacity] duration-700 ease-kovo starting:bg-accent-soft starting:opacity-0',
             )}
             onClick={() => nav.select({ kind: 'event', id })}
           >
