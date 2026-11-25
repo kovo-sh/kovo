@@ -17,6 +17,27 @@ interface PairingLinkResponse {
   ttlSeconds: number
 }
 
+interface AuthStatusResponse {
+  authenticated: boolean
+  origin: string
+  loopbackOnly: boolean
+  publicOriginConfigured: boolean
+  activePairingLinks: number
+  pairingTtlSeconds: number
+}
+
+type SessionState = 'loading' | 'active' | 'expired' | 'unavailable'
+
+function isLoopbackUrl(rawUrl: string | undefined): boolean {
+  if (!rawUrl) return false
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase()
+    return host === '127.0.0.1' || host === 'localhost' || host === '[::1]' || host === '::1'
+  } catch {
+    return false
+  }
+}
+
 const SVG_ICON_CLASS =
   'block shrink-0 fill-none stroke-current [stroke-width:1.5] [stroke-linecap:round] [stroke-linejoin:round]'
 
@@ -84,6 +105,8 @@ export function DevicesIcon({ className }: { className?: string }) {
 }
 
 export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModalProps) {
+  const [sessionState, setSessionState] = useState<SessionState>('loading')
+  const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null)
   const [pairingPending, setPairingPending] = useState(false)
   const [pairingLink, setPairingLink] = useState<PairingLinkResponse | null>(null)
   const [expiresAtMs, setExpiresAtMs] = useState<number | null>(null)
@@ -97,6 +120,44 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
   const copyTimerRef = useRef<number | null>(null)
 
   const busy = pairingPending || rotatePending
+
+  // Reflect live server session state whenever the modal opens.
+  useEffect(() => {
+    if (!open) return
+    const controller = new AbortController()
+    setSessionState('loading')
+    setErrorMessage('')
+    void fetch('/_kovo/auth/status', {
+      method: 'GET',
+      credentials: 'same-origin',
+      signal: controller.signal,
+    })
+      .then(async response => {
+        if (controller.signal.aborted) return
+        if (response.ok) {
+          const data = await response.json() as AuthStatusResponse
+          setAuthStatus(data)
+          setSessionState(data.authenticated ? 'active' : 'expired')
+          return
+        }
+        setAuthStatus(null)
+        if (response.status === 401) {
+          setSessionState('expired')
+          setErrorMessage(await readAuthError(response, 'Local session expired. Open Kovo Hunter using the startup login URL.'))
+          return
+        }
+        setSessionState('unavailable')
+        if (response.status === 404) {
+          setErrorMessage('Local session controls are only available when running the local server.')
+        }
+      })
+      .catch(() => {
+        if (controller.signal.aborted) return
+        setAuthStatus(null)
+        setSessionState('unavailable')
+      })
+    return () => controller.abort()
+  }, [open])
 
   // Live 1-second countdown ticker while a pairing link is active.
   useEffect(() => {
@@ -140,13 +201,17 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
         credentials: 'same-origin',
       })
       if (!response.ok) {
+        if (response.status === 401) setSessionState('expired')
+        else if (response.status === 404) setSessionState('unavailable')
         throw new Error(await readAuthError(response, 'Could not generate a pairing link.'))
       }
       const data = await response.json() as PairingLinkResponse
       const mintedAt = Date.now()
+      setSessionState('active')
       setPairingLink(data)
       setExpiresAtMs(resolveExpiryMs(data, mintedAt))
       setNowMs(mintedAt)
+      setAuthStatus(prev => (prev ? { ...prev, activePairingLinks: prev.activePairingLinks + 1 } : prev))
       const copied = await copyTextToClipboard(data.url)
       if (copied) {
         markCopied()
@@ -194,12 +259,16 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
         credentials: 'same-origin',
       })
       if (!response.ok) {
+        if (response.status === 401) setSessionState('expired')
+        else if (response.status === 404) setSessionState('unavailable')
         throw new Error(await readAuthError(response, 'Could not sign out other devices.'))
       }
+      setSessionState('active')
       setConfirmRotate(false)
       setPairingLink(null)
       setExpiresAtMs(null)
       setCopyState('idle')
+      setAuthStatus(prev => (prev ? { ...prev, activePairingLinks: 0 } : prev))
       setStatusMessage('All other devices have been signed out and pending pairing links cleared. This browser stays signed in.')
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : 'Could not sign out other devices.')
@@ -211,6 +280,20 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
   const remainingSeconds = expiresAtMs === null ? 0 : Math.max(0, Math.ceil((expiresAtMs - nowMs) / 1000))
   const isExpired = Boolean(pairingLink) && remainingSeconds <= 0
   const isExpiringSoon = Boolean(pairingLink) && remainingSeconds > 0 && remainingSeconds <= 60
+  const controlsDisabled = busy || sessionState === 'expired' || sessionState === 'unavailable'
+  const pairingLoopbackOnly = Boolean(
+    (pairingLink && isLoopbackUrl(pairingLink.url)) ||
+    (!pairingLink && authStatus?.loopbackOnly),
+  )
+
+  const badgeProps: { variant: 'ok' | 'danger' | 'warn' | 'neutral'; dotClass: string; label: string } =
+    sessionState === 'active'
+      ? { variant: 'ok', dotClass: 'bg-ok', label: 'Active' }
+      : sessionState === 'expired'
+        ? { variant: 'danger', dotClass: 'bg-danger', label: 'Expired' }
+        : sessionState === 'unavailable'
+          ? { variant: 'warn', dotClass: 'bg-warn', label: 'Unavailable' }
+          : { variant: 'neutral', dotClass: 'bg-fg-faint', label: 'Checking…' }
 
   return (
     <Dialog
@@ -235,9 +318,9 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
             </DialogTitle>
           </div>
           <div className="flex flex-none items-center gap-2">
-            <Badge variant="ok" className="font-medium">
-              <i className="inline-block size-1.5 flex-none rounded-full bg-ok" aria-hidden="true" />
-              Active
+            <Badge variant={badgeProps.variant} className="font-medium">
+              <i className={cn('inline-block size-1.5 flex-none rounded-full', badgeProps.dotClass)} aria-hidden="true" />
+              {badgeProps.label}
             </Badge>
             <Button
               type="button"
@@ -272,7 +355,7 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
                   type="button"
                   variant="outline"
                   className="h-7 bg-fg px-2.5 text-panel shadow-none hover:bg-fg hover:brightness-110 active:scale-[0.98]"
-                  disabled={busy}
+                  disabled={controlsDisabled}
                   onClick={() => void handleMintPairingLink()}
                 >
                   {pairingPending ? 'Generating link…' : 'Generate pairing link'}
@@ -342,12 +425,26 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
                     type="button"
                     variant="ghost"
                     className="h-6 rounded-[5px] px-[7px] text-[12px]"
-                    disabled={busy}
+                    disabled={controlsDisabled}
                     onClick={() => void handleMintPairingLink()}
                   >
                     {pairingPending ? 'Regenerating…' : 'Regenerate'}
                   </Button>
                 </div>
+              </div>
+            )}
+
+            {pairingLoopbackOnly && sessionState === 'active' && (
+              <div
+                role="note"
+                className="flex flex-col gap-1 rounded-[7px] border border-warn/30 bg-warn-soft px-[11px] py-[9px] text-[12px] leading-[17px] text-fg-muted"
+              >
+                <strong className="font-medium text-warn">Loopback-only pairing URL</strong>
+                <span>
+                  This server is only reachable on <code className="font-mono text-[11.5px]">127.0.0.1</code> /{' '}
+                  <code className="font-mono text-[11.5px]">localhost</code>, so pairing links only work in another browser on this same machine. To pair a phone or remote device, run behind an HTTPS reverse proxy and set{' '}
+                  <code className="font-mono text-[11.5px]">KOVO_PUBLIC_ORIGIN</code>.
+                </span>
               </div>
             )}
 
@@ -384,7 +481,7 @@ export function DevicesSessionModal({ open = true, onClose }: DevicesSessionModa
                   type="button"
                   variant="outline"
                   className="h-7 border border-danger/35 bg-panel px-2.5 text-danger shadow-none hover:bg-danger-soft"
-                  disabled={busy}
+                  disabled={controlsDisabled}
                   onClick={() => {
                     setErrorMessage('')
                     setStatusMessage('')

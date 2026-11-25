@@ -217,15 +217,36 @@ export function recordProfileFailure(
 
 function findExistingProfile(
   storage: Store,
-  settings: Pick<ProviderSettings, 'id' | 'name'>,
+  settings: Pick<ProviderSettings, 'id'>,
 ) {
-  return settings.id
-    ? storage.db.select().from(modelProfiles).where(and(
-        eq(modelProfiles.id, settings.id), eq(modelProfiles.workspaceId, storage.workspace.id),
-      )).get()
-    : storage.db.select().from(modelProfiles).where(and(
-        eq(modelProfiles.workspaceId, storage.workspace.id), eq(modelProfiles.name, settings.name),
-      )).get()
+  if (!settings.id) return undefined
+  return storage.db.select().from(modelProfiles).where(and(
+    eq(modelProfiles.id, settings.id), eq(modelProfiles.workspaceId, storage.workspace.id),
+  )).get()
+}
+
+function resolveUniqueProfileName(
+  storage: Store,
+  requestedName: string,
+  excludeId?: string,
+): string {
+  const base = requestedName.trim()
+  const existingNames = new Set(
+    storage.db.select({ id: modelProfiles.id, name: modelProfiles.name })
+      .from(modelProfiles)
+      .where(eq(modelProfiles.workspaceId, storage.workspace.id))
+      .all()
+      .filter(row => row.id !== excludeId)
+      .map(row => row.name.trim().toLowerCase()),
+  )
+  if (!existingNames.has(base.toLowerCase())) return base
+  for (let n = 2; n < 10_000; n += 1) {
+    const suffix = ` (${n})`
+    const candidate = `${base.slice(0, 160 - suffix.length)}${suffix}`
+    if (!existingNames.has(candidate.toLowerCase())) return candidate
+  }
+  const fallbackSuffix = ` (${randomUUID().slice(0, 6)})`
+  return `${base.slice(0, 160 - fallbackSuffix.length)}${fallbackSuffix}`
 }
 
 function resolveEffectiveKey(
@@ -251,6 +272,24 @@ export async function checkModelConnection(
   if (lastTest?.digest === digest) lastTest = undefined
   await testProvider(effective)
   if (attempt === latestTestAttempt) lastTest = { digest, expires: Date.now() + 5 * 60_000 }
+  if (existing) {
+    let matchesStoredKey = !parsed.key
+    if (!matchesStoredKey) {
+      try {
+        matchesStoredKey = resolvedKey === readFileSync(credentialPath(storage.directory, existing.credentialId), 'utf8').trim()
+      } catch {
+        matchesStoredKey = false
+      }
+    }
+    const matchesExistingConnection =
+      existing.endpoint === parsed.endpoint &&
+      existing.model === parsed.model &&
+      existing.protocol === parsed.protocol &&
+      matchesStoredKey
+    if (matchesExistingConnection) {
+      recordProfileSuccess(existing.id, storage)
+    }
+  }
   return { ok: true as const }
 }
 
@@ -291,10 +330,11 @@ export async function saveModelProfile(
     writeFileSync(newCredentialPath, resolvedKey, { mode: 0o600, flag: 'wx' })
   }
   const profileId = existing?.id ?? settings.id ?? randomUUID()
+  const finalName = existing ? settings.name : resolveUniqueProfileName(storage, settings.name)
 
   try {
     const values = {
-      name: settings.name,
+      name: finalName,
       endpoint: settings.endpoint,
       model: settings.model,
       protocol: settings.protocol,

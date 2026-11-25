@@ -17,6 +17,8 @@ function safeHostname(origin: string): string {
   }
 }
 
+const maxDnsExportMiB = Math.round(maxDnsExportBytes / (1024 * 1024))
+
 export function DnsInventoryImport({ projectId, defaultZone, cancel, imported }: {
   projectId: string
   defaultZone: string
@@ -34,7 +36,7 @@ export function DnsInventoryImport({ projectId, defaultZone, cancel, imported }:
     const file = fields.get('export')
     const zone = String(fields.get('zone') ?? '').trim()
     if (!(file instanceof File) || !file.size || file.size > maxDnsExportBytes) {
-      setError('Choose a DNS export file up to 128 KiB.')
+      setError(`Choose a DNS export file up to ${maxDnsExportMiB} MiB.`)
       return
     }
     setReading(true)
@@ -66,7 +68,8 @@ export function DnsInventoryImport({ projectId, defaultZone, cancel, imported }:
         <CardBody className="grid gap-3 py-3.5">
           <p className="m-0 text-[12px] text-fg-subtle">
             Found {preview.candidates.length} {preview.candidates.length === 1 ? 'host' : 'hosts'} in{' '}
-            <code className="font-mono text-[12px]">{preview.zone}</code>. You can choose which hosts to include before starting a scan.
+            <code className="font-mono text-[12px]">{preview.zone}</code>. Importing adds all listed hosts into{' '}
+            <strong className="font-medium text-fg">Needs approval</strong> — review and approve which hosts to include before starting a scan.
           </p>
           <div className="max-h-[240px] overflow-y-auto border-t border-line">
             {preview.candidates.map(host => (
@@ -106,7 +109,9 @@ export function DnsInventoryImport({ projectId, defaultZone, cancel, imported }:
               } }), imported)
             }}
           >
-            {action.pending ? 'Importing…' : 'Import hosts'}
+            {action.pending
+              ? 'Importing…'
+              : `Import all ${preview.candidates.length} ${preview.candidates.length === 1 ? 'host' : 'hosts'}`}
           </Button>
         </CardFooter>
       </Card>

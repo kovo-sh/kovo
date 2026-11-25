@@ -4,6 +4,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { asc, eq } from 'drizzle-orm'
 import { isLocalLabEnvEnabled } from '../domain.ts'
 import type { RequestBroker } from './broker.ts'
+import { listMountedRepos, projectReposDir } from './github-connector.ts'
 import { PersonaAuthManager } from './persona-auth.ts'
 import { personaSecrets, refreshPersonaSession, resolveRunPersonas } from './persona-vault.ts'
 import { redact } from './redact.ts'
@@ -247,6 +248,55 @@ export function readWorkerSession(storage: Store, runId: string, workerId: strin
   }
 }
 
+/**
+ * Resolve the primary synced repository directory (`<dataDir>/repos/<projectId>/<owner>/<repo>`)
+ * for local-lab execution, honoring an optional `labConfig.repo` selector and falling back to
+ * `<dataDir>/repos/<projectId>` when no synced `<owner>/<repo>` directory exists.
+ */
+export function resolvePrimaryLabRepoDir(dataDir: string, projectId: string, preferredRepo?: string): string {
+  const baseDir = projectReposDir(dataDir, projectId)
+  const mountedRepos = listMountedRepos(baseDir)
+  if (!mountedRepos.length) return baseDir
+
+  const normalizedWanted = preferredRepo?.trim().replace(/^\/?repos\//, '').replace(/^\/+|\/+$/g, '')
+  if (normalizedWanted) {
+    const wantedLower = normalizedWanted.toLowerCase()
+    const exact = mountedRepos.find(m => m.replace(/^\/repos\//, '').toLowerCase() === wantedLower)
+    if (exact) return join(baseDir, exact.replace(/^\/repos\//, ''))
+    const byRepoName = mountedRepos.find(m => m.replace(/^\/repos\//, '').toLowerCase().endsWith(`/${wantedLower}`))
+    if (byRepoName) return join(baseDir, byRepoName.replace(/^\/repos\//, ''))
+  }
+
+  const primaryRel = mountedRepos[0]!.replace(/^\/repos\//, '')
+  return primaryRel ? join(baseDir, primaryRel) : baseDir
+}
+
+function lowercaseHeaders(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(headers)) {
+    out[k.toLowerCase()] = v
+  }
+  return out
+}
+
+function normalizeBodyForAuthDiff(body: string): string {
+  return body
+    .replace(/\bnonce=["'][^"']{4,128}["']/gi, 'nonce="[norm]"')
+    .replace(/\bcsrf[-_]?token["']?\s*[:=]\s*["'][^"']{4,128}["']/gi, 'csrf="[norm]"')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function resolveSameOriginRedirectPath(origin: string, location: string): string | null {
+  try {
+    const resolved = new URL(location, origin)
+    if (resolved.origin !== origin) return null
+    return `${resolved.pathname}${resolved.search}`
+  } catch {
+    return null
+  }
+}
+
 export async function testPersonaAuth(
   storage: Store,
   broker: RequestBroker,
@@ -254,6 +304,7 @@ export async function testPersonaAuth(
   personaAuth?: PersonaAuthManager,
 ): Promise<{
   ok: boolean
+  inconclusive?: boolean
   origin: string
   path: string
   status: number
@@ -270,12 +321,14 @@ export async function testPersonaAuth(
     : persona.originAllowlist[0]
   if (!origin) throw new Error('Persona has no allowlisted origin configured.')
 
-  const path = input.path && input.path.startsWith('/') && !input.path.startsWith('//')
+  const initialPath = input.path && input.path.startsWith('/') && !input.path.startsWith('//')
     ? input.path.slice(0, 256)
     : '/'
 
+  // Playwright / browser-form logins need more than 20 s for launch, hydration, and redirect.
+  const timeoutMs = persona.authKind === 'login' ? 60_000 : 20_000
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 20_000)
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
     let loginAdapterHint: string | null = null
     if (persona.authKind === 'login') {
@@ -300,33 +353,62 @@ export async function testPersonaAuth(
     }
 
     const secrets = personaSecrets(resolved)
-    const res = await broker.executeHttp(
+    const grant = {
+      origin,
+      tier: 2 as const,
+      maxRpsPerOrigin: 6,
+      allowLocalLab: project.environment === 'local-lab' && isLocalLabEnvEnabled(),
+      personas: resolved,
+      secrets,
+      canRead: (target: string) => persona.originAllowlist.includes(target),
+      audit: () => { /* health check only */ },
+    }
+
+    const firstAuthRes = await broker.executeHttp(
       {
         origin,
         method: 'GET',
-        pathAndQuery: path,
+        pathAndQuery: initialPath,
         persona: persona.handle,
         followRedirects: false,
       },
-      {
-        origin,
-        tier: 2,
-        maxRpsPerOrigin: 2,
-        allowLocalLab: project.environment === 'local-lab' && isLocalLabEnvEnabled(),
-        personas: resolved,
-        secrets,
-        canRead: target => persona.originAllowlist.includes(target),
-        audit: () => { /* health check only */ },
-      },
+      grant,
       controller.signal,
     )
 
-    const headersLower: Record<string, string> = {}
-    for (const [k, v] of Object.entries(res.respHeaders)) {
-      headersLower[k.toLowerCase()] = v
+    let res = firstAuthRes
+    let effectivePath = initialPath
+    let authRedirectPath: string | null = null
+    let totalDurationMs = firstAuthRes.durationMs
+    let headersLower = lowercaseHeaders(res.respHeaders)
+
+    // Follow at most 1 same-origin redirect (e.g. GET / -> 302 /dashboard).
+    if (res.status >= 300 && res.status < 400 && headersLower['location']) {
+      const sameOriginNext = resolveSameOriginRedirectPath(origin, headersLower['location'])
+      if (sameOriginNext && sameOriginNext !== initialPath) {
+        authRedirectPath = sameOriginNext
+        effectivePath = sameOriginNext
+        const hopped = await broker.executeHttp(
+          {
+            origin,
+            method: 'GET',
+            pathAndQuery: sameOriginNext,
+            persona: persona.handle,
+            followRedirects: false,
+          },
+          grant,
+          controller.signal,
+        )
+        res = hopped
+        totalDurationMs += hopped.durationMs
+        headersLower = lowercaseHeaders(res.respHeaders)
+      }
     }
 
     const hints: string[] = []
+    if (authRedirectPath) {
+      hints.push(`redirect -> ${redact(authRedirectPath, secrets).slice(0, 80)}`)
+    }
     if (headersLower['x-clerk-auth-status']) {
       hints.push(redact(headersLower['x-clerk-auth-status'], secrets))
     }
@@ -339,6 +421,80 @@ export async function testPersonaAuth(
     if (res.status >= 300 && res.status < 400 && headersLower['location']) {
       hints.push(`redirect -> ${redact(headersLower['location'], secrets).slice(0, 80)}`)
     }
+
+    const explicitClerkSignedIn = headersLower['x-clerk-auth-status'] === 'signed-in'
+    const explicitClerkSignedOut = headersLower['x-clerk-auth-status'] === 'signed-out'
+    let ok = res.status >= 200 && res.status < 300 && !explicitClerkSignedOut
+    let inconclusive = false
+
+    // Diff authenticated vs anonymous GET so identical public 200 SPA shells are flagged
+    // inconclusive instead of returning a false-green sign-in verification.
+    if (ok && !explicitClerkSignedIn) {
+      try {
+        const firstAnonRes = await broker.executeHttp(
+          {
+            origin,
+            method: 'GET',
+            pathAndQuery: initialPath,
+            followRedirects: false,
+          },
+          grant,
+          controller.signal,
+        )
+        let anonRes = firstAnonRes
+        let anonHeadersLower = lowercaseHeaders(anonRes.respHeaders)
+        let anonRedirectPath: string | null = null
+
+        if (anonRes.status >= 300 && anonRes.status < 400 && anonHeadersLower['location']) {
+          const anonSameOriginNext = resolveSameOriginRedirectPath(origin, anonHeadersLower['location'])
+          if (anonSameOriginNext) {
+            anonRedirectPath = anonSameOriginNext
+            if (anonSameOriginNext === authRedirectPath) {
+              anonRes = await broker.executeHttp(
+                {
+                  origin,
+                  method: 'GET',
+                  pathAndQuery: anonSameOriginNext,
+                  followRedirects: false,
+                },
+                grant,
+                controller.signal,
+              )
+              anonHeadersLower = lowercaseHeaders(anonRes.respHeaders)
+            }
+          }
+        }
+
+        const redirectDiverged = authRedirectPath !== anonRedirectPath
+        const statusDiverged = res.status !== anonRes.status
+        const bodyIdentical =
+          !redirectDiverged &&
+          !statusDiverged &&
+          (res.bodySha256 === anonRes.bodySha256 ||
+            normalizeBodyForAuthDiff(res.body) === normalizeBodyForAuthDiff(anonRes.body))
+
+        if (bodyIdentical) {
+          ok = false
+          inconclusive = true
+          hints.push(
+            `Inconclusive: authenticated and anonymous GET ${effectivePath} returned identical HTTP ${res.status} (${res.mediaType || 'response'}) — test against a protected path such as /api/me or /dashboard`,
+          )
+        } else if (statusDiverged) {
+          hints.push(`diff vs anonymous (HTTP ${anonRes.status})`)
+        } else if (redirectDiverged) {
+          hints.push(
+            anonRedirectPath
+              ? `diff vs anonymous (redirect -> ${redact(anonRedirectPath, secrets).slice(0, 60)})`
+              : `diff vs anonymous (HTTP ${anonRes.status} on ${initialPath})`,
+          )
+        } else {
+          hints.push(loginAdapterHint ? 'signed-in (differs from anonymous)' : `Authenticated GET differs from anonymous (${res.mediaType || 'ok'})`)
+        }
+      } catch {
+        // Anonymous comparison failed (e.g. transient error); fall back to authenticated response alone.
+      }
+    }
+
     if (!hints.length) {
       if (res.status >= 200 && res.status < 300) {
         hints.push(loginAdapterHint ? 'signed-in' : `Authenticated GET accepted (${res.mediaType || 'ok'})`)
@@ -352,15 +508,13 @@ export async function testPersonaAuth(
       hints.push(loginAdapterHint)
     }
 
-    const ok = res.status >= 200 && res.status < 300 &&
-      headersLower['x-clerk-auth-status'] !== 'signed-out'
-
     return {
       ok,
+      ...(inconclusive ? { inconclusive: true } : {}),
       origin,
-      path,
+      path: effectivePath,
       status: res.status,
-      durationMs: res.durationMs,
+      durationMs: totalDurationMs,
       authHint: redact(hints.join(' · '), secrets),
     }
   } finally {

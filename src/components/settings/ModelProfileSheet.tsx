@@ -63,6 +63,18 @@ function CustomProviderIllustration() {
   )
 }
 
+function suggestUniqueProfileName(baseName: string, profiles: readonly PublicModelProfile[]): string {
+  const base = baseName.trim()
+  const existing = new Set(profiles.map(profile => profile.name.trim().toLowerCase()))
+  if (!existing.has(base.toLowerCase())) return base
+  for (let n = 2; n < 10_000; n += 1) {
+    const suffix = ` (${n})`
+    const candidate = `${base.slice(0, 160 - suffix.length)}${suffix}`
+    if (!existing.has(candidate.toLowerCase())) return candidate
+  }
+  return `${base.slice(0, 150)} (new)`
+}
+
 export function ModelProfileSheet({
   open,
   editing,
@@ -88,8 +100,11 @@ export function ModelProfileSheet({
   const isDefaultMode = !isEditing && mode === 'default'
 
   const nextPriority = profiles.length === 0 ? 100 : Math.max(10, Math.min(...profiles.map(p => p.priority)) - 10)
+  const suggestedName = isDefaultMode || profiles.length === 0
+    ? suggestUniqueProfileName(DEFAULT_PROVIDER.name, profiles)
+    : suggestUniqueProfileName(`Custom profile ${profiles.length + 1}`, profiles)
   const defaults = editing ?? {
-    name: isDefaultMode || profiles.length === 0 ? DEFAULT_PROVIDER.name : `Custom profile ${profiles.length + 1}`,
+    name: suggestedName,
     endpoint: DEFAULT_PROVIDER.endpoint,
     model: DEFAULT_PROVIDER.model,
     protocol: DEFAULT_PROVIDER.protocol,
@@ -161,7 +176,7 @@ export function ModelProfileSheet({
               ? roleRaw as RoleAffinity : DEFAULT_PROVIDER.roleAffinity
             const data = {
               ...(editing ? { id: editing.id } : {}),
-              name: String(form.get('name') ?? '').trim() || DEFAULT_PROVIDER.name,
+              name: String(form.get('name') ?? '').trim() || defaults.name,
               endpoint: String(form.get('endpoint') ?? DEFAULT_PROVIDER.endpoint),
               model: String(form.get('model') ?? DEFAULT_PROVIDER.model),
               protocol: form.get('protocol') === 'messages' ? 'messages' as const : 'responses' as const,
@@ -304,7 +319,7 @@ export function ModelProfileSheet({
                       <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
                         <label className={FIELD_CLASS}>
                           Profile name
-                          <Input className="w-full" name="name" required maxLength={160} defaultValue={DEFAULT_PROVIDER.name} />
+                          <Input className="w-full" name="name" required maxLength={160} defaultValue={defaults.name} />
                         </label>
                         <label className={FIELD_CLASS}>
                           Priority (higher tried first)

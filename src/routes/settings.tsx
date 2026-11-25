@@ -643,7 +643,11 @@ function SettingsWorkbenchPage() {
       }),
       () => {
         setTestingId(null)
-        setPageStatus(`${profile.name}: connection verified. The model streamed a valid tool call.`)
+        setPageStatus(
+          profile.healthState === 'closed'
+            ? `${profile.name}: connection verified. The model streamed a valid tool call.`
+            : `${profile.name}: connection verified. Cooldown cleared and profile marked healthy.`,
+        )
       },
     ).finally(() => setTestingId(null))
   }
