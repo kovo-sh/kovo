@@ -534,7 +534,7 @@ export class VerifyRpcServer {
       const result = await this.dispatch(payload, nonce)
       return reply(200, { ok: true, result })
     } catch (error) {
-      return reply(200, { ok: false, error: error instanceof Error ? error.message.slice(0, 600) : 'Verification RPC failed.' })
+      return reply(200, { ok: false, error: this.scrub(error instanceof Error ? error.message : 'Verification RPC failed.').slice(0, 600) })
     }
   }
 
@@ -684,7 +684,7 @@ export class VerifyRpcServer {
     }
     // Normalize broker personaSecrets() placeholders emitted for ephemeral derived-capability personas.
     out = out.replace(/\[persona:(cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+):secret\]/g, '[redacted:$1]')
-    return scrubDerivedSecrets(out, this.capabilityVault)
+    return redact(scrubDerivedSecrets(out, this.capabilityVault))
   }
 
   private scrubRecord<T>(value: T): T {
@@ -1169,6 +1169,8 @@ export class VerifyRpcServer {
     const derivedFromCapabilityIds = [...new Set(cryptoAttestations.map(a => a.derivedFromCapabilityId))]
     const requestMeta: VerifyTranscriptRequest = {
       ...applied.requestMeta,
+      pathAndQuery: this.scrub(applied.requestMeta.pathAndQuery),
+      headers: this.scrubRecord(applied.requestMeta.headers),
       ...(cryptoAttestations.length > 0 ? { derivedFromCapabilityId: cryptoAttestations[0]!.derivedFromCapabilityId } : {}),
       nonce,
     }
@@ -1369,7 +1371,7 @@ export class VerifyRpcServer {
         request: {
           origin,
           method: 'GET',
-          pathAndQuery: rawPath,
+          pathAndQuery: this.scrub(rawPath),
           headers: recordedHeaders,
           bodyBytes: 0,
           bodySha256: createHash('sha256').update('').digest('hex'),
@@ -1403,14 +1405,15 @@ export class VerifyRpcServer {
         durationMs: record.durationMs,
       })
     } catch (error) {
+      const msg = this.scrub(error instanceof Error ? error.message : 'Browser verification failed.')
       const record = this.transcript.record({
         op: 'browser',
         startedAt: started,
         durationMs: Date.now() - started,
-        request: { origin, method: 'GET', pathAndQuery: rawPath, headers: Object.fromEntries(Object.keys(headers).map(key => [key, '[injected]'])), bodyBytes: 0, bodySha256: createHash('sha256').update('').digest('hex'), personaHandle, nonce },
-        error: error instanceof Error ? error.message : 'Browser verification failed.',
+        request: { origin, method: 'GET', pathAndQuery: this.scrub(rawPath), headers: Object.fromEntries(Object.keys(headers).map(key => [key, '[injected]'])), bodyBytes: 0, bodySha256: createHash('sha256').update('').digest('hex'), personaHandle, nonce },
+        error: msg,
       })
-      throw new Error(`${record.exchangeId}: ${error instanceof Error ? error.message : 'Browser verification failed.'}`)
+      throw new Error(`${record.exchangeId}: ${msg}`)
     }
   }
 

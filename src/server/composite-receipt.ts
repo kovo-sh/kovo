@@ -9,7 +9,7 @@ import { parseRoleLabel, routeFamily, stepReadsState } from './oracle-invariants
 import { proofReceiptSchema, receiptIdSchema, verifyReceipt } from './proof-receipt.ts'
 import { evaluateV8OracleFamily, extractTenantMarkers, isJobOrHandleStub } from './v8-oracle-families.ts'
 import type { CrossSurfaceHop, CrossSurfacePivotInput, HostSignedRecord as V8OracleRecord, V8OracleFamily, V8OracleInputMap } from './v8-oracle-families.ts'
-import { hydrateV8OracleInput, selectStateTransitionPair, toOracleRecord } from './v8-oracle-hydrate.ts'
+import { hydrateV8OracleInput, matchesHydratedRecord, selectStateTransitionPair, toOracleRecord } from './v8-oracle-hydrate.ts'
 import type { ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 
 export const HOP_SURFACES = ['http', 'graphql', 'ws', 'sse', 'browser', 'webhook', 'async_job', 'idp', 'cdn', 'storage'] as const
@@ -74,7 +74,6 @@ export const compositeProofReceiptSchema = z.object({
 export type CompositeProofReceipt = z.output<typeof compositeProofReceiptSchema>
 
 // --- Host-Signed Transcript Types (Superset of ReceiptTranscript) -----------
-
 export interface HostCryptoAttestation { derivedFromCapabilityId: string; derivedCapabilityId?: string; alg: string; artifactDigest: string; timestampMs: number }
 export interface HostTranscriptEntry extends ReceiptTranscriptEntry {
   timestampMs?: number; actorPersona?: string | null; actorRoleLabel?: string | null; emittedCapabilities?: readonly string[]
@@ -102,7 +101,6 @@ export interface CompositeReceiptVerification {
 }
 
 // --- Cryptographic, Hashing & Transcript Helpers ----------------------------
-
 const CONSUMED_STATE_RE =
   /\b(?:already[_\s-]?(?:consumed|redeemed|used|claimed|applied|settled)|token[_\s-]?(?:consumed|used|redeemed|spent)|one[_\s-]?time|nonce[_\s-]?(?:used|replayed|consumed)|invite[_\s-]?(?:redeemed|consumed|used)|state[_\s-]?(?:consumed|exhausted|finalized))\b/i
 const ABLATION_DENIED_STATUSES = new Set([401, 403, 404, 409, 412, 422])
@@ -183,7 +181,6 @@ function serializeBodyText(entry: HostTranscriptEntry): string {
 }
 
 // --- DAG Topology & Transcript Integrity ------------------------------------
-
 interface DagTopology { hopsById: Map<string, HopReceipt>; topoOrder: string[]; roots: string[]; incomingByHop: Map<string, Array<{ edgeIndex: number; edge: CausalEdgeBinding }>> }
 interface IndexedTranscript { entriesById: Map<string, HostTranscriptEntry>; oobById: Map<string, HostOobEvent>; tracesById: Map<string, HostBrowserTrace>; pollsById: Map<string, HostAsyncPollRecord>; allPolls: readonly HostAsyncPollRecord[] }
 
@@ -235,8 +232,10 @@ function indexAndVerifyCitations(receipt: CompositeProofReceipt, transcript: Hos
     }
     return null
   }
+  const checkProof = (pr: ProofReceipt | undefined, label: string): string | null => !pr ? null
+    : checkAll(pr.exchangeIds, entriesById, `${label} exchange`) ?? checkAll(pr.oobEventIds, oobById, `${label} OOB event`) ?? checkAll(pr.browserTraceIds, tracesById, `${label} browser trace`)
   for (const h of receipt.hops) {
-    const err = checkAll(h.exchangeIds, entriesById, `hop "${h.hopId}" exchange`) ?? checkAll(h.oobEventIds, oobById, `hop "${h.hopId}" OOB event`) ?? checkAll(h.browserTraceIds, tracesById, `hop "${h.hopId}" browser trace`)
+    const err = checkAll(h.exchangeIds, entriesById, `hop "${h.hopId}" exchange`) ?? checkAll(h.oobEventIds, oobById, `hop "${h.hopId}" OOB event`) ?? checkAll(h.browserTraceIds, tracesById, `hop "${h.hopId}" browser trace`) ?? checkProof(h.proofReceipt, `hop "${h.hopId}" proofReceipt`)
     if (err) return { ok: false, reason: err }
   }
   for (const e of receipt.causalEdges) {
@@ -248,6 +247,7 @@ function indexAndVerifyCitations(receipt: CompositeProofReceipt, transcript: Hos
   const tErr = checkAll(ti.preChainControlExchangeIds, entriesById, 'pre-chain control') ?? checkAll(ti.postChainReadbackExchangeIds, entriesById, 'post-chain readback')
     ?? (ti.terminalExchangeId ? checkAll([ti.terminalExchangeId], entriesById, 'terminal exchange') : null)
     ?? (ti.modeAFailureExchangeId ? checkAll([ti.modeAFailureExchangeId], entriesById, 'Mode-A failure') : null)
+    ?? checkProof(ti.proofReceipt, 'terminal proofReceipt')
   return tErr ? { ok: false, reason: tErr } : { ok: true, idx: { entriesById, oobById, tracesById, pollsById, allPolls } }
 }
 
@@ -262,7 +262,6 @@ function recordHopCapabilities(hop: HopReceipt, idx: IndexedTranscript, target: 
 }
 
 // --- Four Causal Edge Verifiers ---------------------------------------------
-
 interface HopOutputEvent { sourceId: string; timestampMs: number; capabilities: Set<string>; digests: Set<string> }
 type EdgeBase = { edgeIndex: number; kind: CausalEdgeKind; fromHopId: string; toHopId: string; fromEx?: readonly string[]; toEx?: readonly string[] }
 const EDGE_FIX_HINTS: Record<CausalEdgeKind, string> = {
@@ -464,7 +463,6 @@ function verifyAsyncPivotBinding(
 }
 
 // --- Attacker-Origin Provenance & Replay Mode Policy ------------------------
-
 function verifyAttackerProvenance(
   receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, options: CompositeVerifyOptions,
 ): { ok: true; derivedCapabilities: string[]; attackerTenants: ReadonlySet<string> } | { ok: false; reason: string } {
@@ -551,7 +549,6 @@ function verifyReplayMode(
 }
 
 // --- Public Verifier & Single-Hop Bridge ------------------------------------
-
 type DefaultV8Ctx = { termEndpoint: string; termFam: string; hasOob: boolean; hasBrowser: boolean; hasBody: boolean; isStub: boolean; ownTenantOnly: boolean }
 
 function dispatchDefaultV8Oracle(
@@ -561,25 +558,26 @@ function dispatchDefaultV8Oracle(
   const ti = receipt.terminalImpact, normCls = receipt.terminalVulnClass.trim().toLowerCase()
   const family = ti.oracleFamily ?? (V8_ORACLE_FAMILY_SET.has(normCls) ? normCls as V8OracleFamily : null)
   if (!family) return null
-  const verifySignature = options.signingKey ? (rec: V8OracleRecord): boolean => {
+  const sig = options.signingKey ? '' : 'host-verified-sig'
+  const verifySignature = (rec: V8OracleRecord): boolean => {
     const e = idx.entriesById.get(rec.id) ?? idx.oobById.get(rec.id) ?? idx.tracesById.get(rec.id) ?? idx.pollsById.get(rec.id)
-    return Boolean(e && e.hostSignature === rec.hostSignature && verifyHostRecordSignature(e, options.signingKey!))
-  } : undefined
+    if (!e || (options.signingKey && (e.hostSignature !== rec.hostSignature || !verifyHostRecordSignature(e, options.signingKey)))) return false
+    return idx.pollsById.has(rec.id) || matchesHydratedRecord(rec, idx, sig)
+  }
   const rejectFam = (reason: string, missingEvidence: string[], rejectedBy = `v8_oracle_${family}`) => ({ ok: false as const, reason, rejectedBy, missingEvidence })
   const mapFail = (reason: string) => (reason === 'terminal_impact_unproven_intermediate_stub' || reason === 'bled_access_own_tenant_only')
     ? rejectFam(TERMINAL_IMPACT_UNPROVEN_HINT, [TERMINAL_IMPACT_UNPROVEN_HINT], 'terminal_impact_unproven')
     : rejectFam(`v8_oracle_failed (${family}): ${reason}`, [reason])
-  const sig = options.signingKey ? '' : 'host-verified-sig'
   const econCtx = { preChainControlExchangeIds: ti.preChainControlExchangeIds, termHopExchangeIds: dag.hopsById.get(ti.terminalHopId)!.exchangeIds, postChainReadbackExchangeIds: ti.postChainReadbackExchangeIds }
   const explicitInput = ti.oracleInput ?? options.v8OracleInput
   if (explicitInput) {
     const hydrated = hydrateV8OracleInput(family, explicitInput, idx, sig, econCtx)
-    const dec = evaluateV8OracleFamily(family, { ...hydrated, ...(verifySignature ? { verifySignature } : {}) } as V8OracleInputMap[typeof family])
+    const dec = evaluateV8OracleFamily(family, { ...hydrated, verifySignature } as V8OracleInputMap[typeof family])
     return dec.satisfied ? { ok: true, family, explicit: true } : mapFail(dec.reason)
   }
   if (family === 'economic_conservation') {
     const hydrated = hydrateV8OracleInput(family, {}, idx, sig, econCtx)
-    const dec = evaluateV8OracleFamily(family, { ...hydrated, ...(verifySignature ? { verifySignature } : {}) } as V8OracleInputMap['economic_conservation'])
+    const dec = evaluateV8OracleFamily(family, { ...hydrated, verifySignature } as V8OracleInputMap['economic_conservation'])
     const reason = dec.reason === 'unknown_economic_equation' ? 'missing_economic_oracle_input' : dec.reason
     return rejectFam(`v8_oracle_failed (economic_conservation): ${reason} — provide terminalImpact.oracleInput.`, [reason, 'terminalImpact.oracleInput'])
   }
@@ -605,7 +603,7 @@ function dispatchDefaultV8Oracle(
     })
     const dec = evaluateV8OracleFamily('cross_surface_pivot', {
       attackerOriginPersona: { actorId: actorOf(rootEx) ?? 'attacker', role: roleOf(rootEx) ?? 'member', tenantId: rootEx.step.actor.tenant ?? null, isPrivilegedPreSeeded: false },
-      preChainControlDenied: toOracleRecord(terminalCtrl, sig), hops, ...(verifySignature ? { verifySignature } : {}),
+      preChainControlDenied: toOracleRecord(terminalCtrl, sig), hops, verifySignature,
       terminalImpact: { kind: postMutRb ? 'privileged_mutation' : 'privileged_read', verified: true, impactDigest: sha256Hex(termEx.step.body ?? JSON.stringify(termEx.step.json ?? termEx.exchangeId)), ...(postMutRb ? { postImpactReadback: toOracleRecord(postMutRb, sig) } : {}) },
     } satisfies CrossSurfacePivotInput)
     return dec.satisfied ? { ok: true, family, explicit: false } : mapFail(dec.reason)

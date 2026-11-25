@@ -407,18 +407,18 @@ async function runAttempt(
       parsed = parseVerifyScriptResult(execution.result)
     } catch (error) {
       const rawTitle = execution.result && typeof execution.result === 'object' && !Array.isArray(execution.result) && typeof (execution.result as { title?: unknown }).title === 'string'
-        ? (execution.result as { title: string }).title
+        ? redact((execution.result as { title: string }).title)
         : null
       const latestComp = session.transcript.latestCompositeVerification()
       if (latestComp && !latestComp.confirmed) {
         const compRejectedBy = latestComp.rejectedBy ?? (latestComp.failedStage ? `composite_${latestComp.failedStage}` : 'composite_receipt')
-        const compMissing = latestComp.missingEvidence.length > 0 ? latestComp.missingEvidence : [compRejectedBy]
+        const compMissing = latestComp.missingEvidence.length > 0 ? latestComp.missingEvidence.map(m => redact(m)) : [compRejectedBy]
         return {
           report: {
             ...base,
             title: rawTitle,
             claimCount: 1,
-            failures: [`composite_receipt: CompositeProofReceipt rejected at stage '${latestComp.failedStage ?? 'unknown'}': ${latestComp.reason}`],
+            failures: [redact(`composite_receipt: CompositeProofReceipt rejected at stage '${latestComp.failedStage ?? 'unknown'}': ${latestComp.reason}`)],
             rejectedBy: compRejectedBy,
             missingEvidence: compMissing,
           },
@@ -456,28 +456,29 @@ async function runAttempt(
           checkpointOps,
         }
       }
-      return { report: { ...base, title: rawTitle, failures: [error instanceof Error ? error.message : 'Invalid result.'], rejectedBy: 'claims', missingEvidence: ['valid_proof_document'] }, fingerprints: [] }
+      return { report: { ...base, title: rawTitle, failures: [redact(error instanceof Error ? error.message : 'Invalid result.')], rejectedBy: 'claims', missingEvidence: ['valid_proof_document'] }, fingerprints: [] }
     }
+    const safeTitle = typeof parsed.title === 'string' ? redact(parsed.title) : null
     if (typeof parsed.nonce === 'string' && parsed.nonce !== nonce) {
       return {
-        report: { ...base, title: parsed.title ?? null, claimCount: parsed.claims.length, nonceMismatch: true, failures: ['Proof document nonce does not match this attempt; a stale result was replayed.'], rejectedBy: 'nonce', missingEvidence: ['fresh_nonce'] },
+        report: { ...base, title: safeTitle, claimCount: parsed.claims.length, nonceMismatch: true, failures: ['Proof document nonce does not match this attempt; a stale result was replayed.'], rejectedBy: 'nonce', missingEvidence: ['fresh_nonce'] },
         fingerprints: [],
       }
     }
-    const descriptorText = `${parsed.title ?? ''} ${parsed.description ?? ''}`
+    const descriptorText = `${safeTitle ?? ''} ${parsed.description ?? ''}`
     const declaredCwe = /\bCWE-\d{1,4}\b/i.exec(descriptorText)?.[0] ?? null
     const oracle = evaluateClaims(session.transcript, parsed.claims, {
       ...(options.canary ? { canary: options.canary } : {}),
       allowedExchangeIds: new Set(session.transcript.list().map(record => record.exchangeId)),
       claimedImpact: classifyImpactDescriptor({
         cwe: declaredCwe,
-        title: parsed.title,
+        title: safeTitle ?? undefined,
         description: parsed.description,
       }),
-      claimedBoundary: classifyBoundaryClaim({ title: parsed.title }),
+      claimedBoundary: classifyBoundaryClaim({ title: safeTitle ?? undefined }),
     })
     const causal = causalFingerprints(session.transcript, oracle.checks, nonce)
-    const missingEvidence = oracle.missingEvidence ?? []
+    const missingEvidence = (oracle.missingEvidence ?? []).map(item => redact(item))
     const repairFeedback = oracle.passed ? [] : [
       `rejected-by: ${oracle.rejectedBy ?? 'unknown'}`,
       ...missingEvidence.map(item => `missing-evidence: ${item}`),
@@ -487,9 +488,9 @@ async function runAttempt(
     return {
       report: {
         ...base,
-        title: parsed.title ?? null,
+        title: safeTitle,
         oraclePassed: oracle.passed,
-        failures: [...oracle.failures, ...repairFeedback],
+        failures: [...oracle.failures, ...repairFeedback].map(item => redact(item)),
         claimCount: parsed.claims.length,
         causal,
         rejectedBy: oracle.rejectedBy ?? null,
@@ -510,6 +511,7 @@ async function runAttemptSafe(
   try {
     return await runAttempt(options, attempt, nonce)
   } catch (error) {
+    const errMsg = redact(error instanceof Error ? error.message : 'Verification attempt failed to start.')
     return {
       report: {
         attempt,
@@ -517,7 +519,7 @@ async function runAttemptSafe(
         exitCode: 1,
         durationMs: 0,
         oraclePassed: false,
-        failures: [error instanceof Error ? error.message : 'Verification attempt failed to start.'],
+        failures: [errMsg],
         claimCount: 0,
         exchangeCount: 0,
         transcriptDigest: '',
@@ -526,7 +528,7 @@ async function runAttemptSafe(
         title: null,
         nonceMismatch: false,
         rejectedBy: 'execution',
-        missingEvidence: [error instanceof Error ? error.message.slice(0, 120) : 'attempt_start'],
+        missingEvidence: [error instanceof Error ? errMsg.slice(0, 120) : 'attempt_start'],
         transcriptSummary: [],
       },
       fingerprints: [],
@@ -563,7 +565,7 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
       ?? null
     return {
       rejectedBy: primaryRejectedBy,
-      missingEvidence: [...new Set(source.flatMap(report => report.missingEvidence))],
+      missingEvidence: [...new Set(source.flatMap(report => report.missingEvidence.map(item => redact(item))))],
       transcriptSummary: source[0]?.transcriptSummary ?? [],
       ...(showDiagnostics && typeof failingExit === 'number' ? { exitCode: failingExit } : {}),
       ...(showDiagnostics ? { stderrPreview } : {}),
@@ -573,7 +575,13 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
   const withFeedback = <T extends Omit<VerifyVerdict, 'rejectedBy' | 'missingEvidence' | 'transcriptSummary'>>(
     value: T,
     includeScriptDiagnostics = false,
-  ): VerifyVerdict => ({ ...value, ...feedback(includeScriptDiagnostics) })
+  ): VerifyVerdict => ({
+    ...value,
+    claimTitle: typeof value.claimTitle === 'string' ? redact(value.claimTitle) : value.claimTitle,
+    disagreements: value.disagreements.map(item => redact(item)),
+    detail: redact(value.detail),
+    ...feedback(includeScriptDiagnostics),
+  })
 
   if (first.report.nonce === second.report.nonce) {
     return withFeedback({ confirmed: false, reason: 'nonce_reuse', detail: 'Both attempts used the same nonce; sessions were not fresh.', attempts, disagreements: [], claimTitle: first.report.title })
