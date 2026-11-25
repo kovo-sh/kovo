@@ -3,7 +3,7 @@ import type { ReactNode } from 'react'
 import { workspaceData } from '../actions.ts'
 import appStyles from '../app.css?url'
 import { AppShell } from '../components/shell/AppShell.tsx'
-import shellStyles from '../components/shell/shell.css?url'
+import { buttonVariants } from '../components/ui/button.tsx'
 import designSystemStyles from '../styles/tailwind.css?url'
 
 export const Route = createRootRoute({
@@ -16,22 +16,25 @@ export const Route = createRootRoute({
     ],
     links: [
       { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' },
-      // Design-system utilities load before the legacy sheets so same-specificity
+      // Design-system utilities load before the legacy sheet so same-specificity
       // legacy rules keep winning on routes that have not been migrated yet.
       { rel: 'stylesheet', href: designSystemStyles },
       { rel: 'stylesheet', href: appStyles },
-      { rel: 'stylesheet', href: shellStyles },
     ],
   }),
   component: Shell,
   shellComponent: Document,
-  errorComponent: ({ error }) => <main className="workspace-page">
-    <h1>Kovo Hunter couldn’t open this view</h1>
-    <p className="muted" style={{ margin: '8px 0 14px' }}>
-      {error instanceof Error ? error.message : 'This view is unavailable.'}
-    </p>
-    <Link to="/" className="btn">Return to workspace</Link>
-  </main>,
+  errorComponent: ({ error }) => (
+    <main className="mx-auto w-full max-w-[960px] px-6 pb-[72px] pt-6">
+      <h1>Kovo Hunter couldn’t open this view</h1>
+      <p className="mb-3.5 mt-2 text-fg-subtle">
+        {error instanceof Error ? error.message : 'This view is unavailable.'}
+      </p>
+      <Link to="/" className={buttonVariants({ variant: 'outline' })}>
+        Return to workspace
+      </Link>
+    </main>
+  ),
 })
 
 function Shell() {

@@ -2,8 +2,10 @@
 // Mirrors /runs/$runId's Rail (232px warm-stone/neutral-charcoal rail, monochrome
 // Mark, ⌘K trigger, recent runs grouped by project, theme toggle & shortcut sheet).
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
+import { cva } from 'class-variance-authority'
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
+import { cn } from '../../lib/cn.ts'
 import { KovoHunterMark } from '../brand/KovoHunterMark.tsx'
 import { KbdGroup } from '../run/display.tsx'
 import { runLabel } from '../run/format.ts'
@@ -24,6 +26,36 @@ export { formatFullDateTime, formatRelativeTime, useNow } from './GlobalPalette.
 export type { PoolHealth, ShellProjectItem, ShellRecentRun, ShellWorkspaceData } from './GlobalPalette.tsx'
 
 const APPEARANCE_KEY = 'guardian-appearance'
+
+const railItemVariants = cva(
+  'relative flex w-full cursor-pointer select-none items-center gap-[9px] rounded-control border-0 bg-transparent px-2 text-left text-[13px] text-fg-muted transition-colors duration-[var(--d1)] hover:bg-hover hover:text-fg',
+  {
+    variants: {
+      kind: {
+        nav: 'h-7',
+        run: 'h-auto items-start py-1.5 font-normal',
+      },
+      active: {
+        true: 'bg-press font-medium text-fg',
+        false: '',
+      },
+    },
+    defaultVariants: {
+      kind: 'nav',
+      active: false,
+    },
+  },
+)
+
+const healthDotVariants = cva('size-[7px] flex-none rounded-full', {
+  variants: {
+    health: {
+      healthy: 'bg-ok',
+      degraded: 'bg-warn',
+      unconfigured: 'bg-transparent ring-[1.5px] ring-inset ring-fg-faint',
+    },
+  },
+})
 
 function resolveEffectiveTheme(): 'light' | 'dark' {
   if (typeof document === 'undefined') return 'light'
@@ -97,9 +129,14 @@ function isEditableTarget(target: EventTarget | null): boolean {
   return Boolean(target.closest('[contenteditable="true"]'))
 }
 
+function hasOpenDialog(): boolean {
+  if (typeof document === 'undefined') return false
+  return Boolean(document.querySelector('[role="dialog"], [role="alertdialog"], [data-slot="dialog-content"]'))
+}
+
 function poolHealthTitle(health: PoolHealth): string {
   if (health === 'healthy') return 'Model pool healthy'
-  if (health === 'degraded') return 'Model pool degraded (circuit breaker active)'
+  if (health === 'degraded') return 'Model pool degraded (some profiles temporarily cooling down)'
   return 'No enabled model profile configured'
 }
 
@@ -161,18 +198,16 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
         setPalette(s => ({ open: !s.open, prefill: '' }))
         return
       }
-      if (e.key === 'Escape') {
-        if (palette.open) { e.preventDefault(); setPalette(s => ({ ...s, open: false })); return }
-        if (helpOpen) { e.preventDefault(); setHelpOpen(false); return }
-        return
-      }
-      if (palette.open || helpOpen || devicesOpen) return
+      // Escape is handled natively by each open @base-ui/react Dialog so only
+      // the topmost modal dismisses without affecting anything underneath.
+      if (e.key === 'Escape') return
+      if (palette.open || helpOpen || devicesOpen || hasOpenDialog()) return
       if (e.metaKey || e.ctrlKey || e.altKey) return
       if (isEditableTarget(e.target)) return
 
-      const now = Date.now()
+      const ts = Date.now()
       const chord = chordRef.current
-      if (chord && now - chord.at < 800 && chord.key === 'g') {
+      if (chord && ts - chord.at < 800 && chord.key === 'g') {
         chordRef.current = null
         const k = e.key.toLowerCase()
         if (k === 'p') {
@@ -188,7 +223,7 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
       }
 
       if (e.key === 'g') {
-        chordRef.current = { key: 'g', at: now }
+        chordRef.current = { key: 'g', at: ts }
         return
       }
       if (e.key === '?') {
@@ -227,53 +262,63 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
   const isDark = theme === 'dark'
 
   return <ShellContext.Provider value={ctx}>
-    <div className="app-shell">
-      <aside className="sh-rail" aria-label="Workspace navigation">
-        <div className="sh-brand">
-          <KovoHunterMark />
-          <Link to="/" className="sh-brand-name" title="All projects" style={{ whiteSpace: 'nowrap' }}>Kovo Hunter</Link>
-          <span className="sh-ws">Local</span>
+    <div className="grid h-screen grid-cols-[232px_minmax(0,1fr)] overflow-hidden bg-bg text-fg max-[720px]:grid-cols-[196px_minmax(0,1fr)] [&_svg]:block [&_svg]:flex-none">
+      <aside className="flex min-h-0 flex-col border-r border-line bg-rail" aria-label="Workspace navigation">
+        <div className="flex h-12 flex-none items-center gap-[9px] pl-4 pr-3.5">
+          <KovoHunterMark size={18} className="size-[18px] flex-none text-fg" />
+          <Link to="/" className="whitespace-nowrap text-[13px] font-semibold tracking-[-0.01em] text-fg" title="All projects">
+            Kovo Hunter
+          </Link>
+          <span className="ml-auto text-[12px] text-fg-subtle">Local</span>
         </div>
 
-        <button type="button" className="sh-search" onClick={() => openPalette()}>
+        <button
+          type="button"
+          className="mx-2.5 mb-2.5 mt-0.5 flex h-[30px] cursor-pointer items-center gap-2 rounded-[7px] border-0 bg-panel pl-[9px] pr-2 text-left text-[13px] font-normal text-fg-subtle shadow-hairline transition-colors duration-[var(--d1)] hover:bg-panel hover:text-fg-muted"
+          onClick={() => openPalette()}
+        >
           <Icon name="search" />
-          <span style={{ whiteSpace: 'nowrap' }}>Search…</span>
-          <KbdGroup keys={['mod', 'K']} />
+          <span className="whitespace-nowrap">Search…</span>
+          <span className="ml-auto">
+            <KbdGroup keys={['mod', 'K']} />
+          </span>
         </button>
 
-        <div className="sh-rail-scroll">
-          <div className="sh-rail-h"><span>Workspace</span></div>
+        <div className="flex-1 overflow-auto px-2 pb-2">
+          <div className="flex items-center justify-between px-2 pb-1 pt-1.5 text-[11.5px] font-medium tracking-[0.01em] text-fg-subtle">
+            <span>Workspace</span>
+          </div>
           <nav aria-label="Workspace">
             <Link
               to="/"
-              className={'sh-ritem' + (isProjectsActive ? ' on' : '')}
+              className={railItemVariants({ active: isProjectsActive })}
               aria-current={pathname === '/' ? 'page' : undefined}
             >
               <Icon name="grid" />
-              <span className="lbl">Projects</span>
+              <span className="min-w-0 flex-1 truncate">Projects</span>
             </Link>
             <Link
               to="/settings"
               search={{}}
-              className={'sh-ritem' + (isSettingsActive ? ' on' : '')}
+              className={railItemVariants({ active: isSettingsActive })}
               aria-current={isSettingsActive ? 'page' : undefined}
               title={poolHealthTitle(data.poolHealth)}
             >
               <Icon name="sliders" />
-              <span className="lbl">Model settings</span>
+              <span className="min-w-0 flex-1 truncate">Model settings</span>
               {data.poolHealth !== 'healthy' && (
-                <span className={'sh-health-dot ' + data.poolHealth} aria-hidden="true" />
+                <span className={healthDotVariants({ health: data.poolHealth })} aria-hidden="true" />
               )}
             </Link>
           </nav>
 
-          <div className="sh-rail-h">
+          <div className="flex items-center justify-between px-2 pb-1 pt-3.5 text-[11.5px] font-medium tracking-[0.01em] text-fg-subtle">
             <span>Recent runs</span>
-            <span className="num" style={{ fontWeight: 400 }}>{data.recentRuns.length || ''}</span>
+            <span className="font-normal tabular-nums">{data.recentRuns.length || ''}</span>
           </div>
 
           {data.recentRuns.length === 0
-            ? <div className="sh-rail-empty">No runs yet</div>
+            ? <div className="px-2 py-1.5 text-[12px] text-fg-subtle">No runs yet</div>
             : data.recentRuns.map(r => {
               const relTime = formatRelativeTime(r.startedAt, { compact: true, now })
               const fullTime = formatFullDateTime(r.startedAt)
@@ -282,15 +327,17 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
                 to="/runs/$runId"
                 params={{ runId: r.id }}
                 search={{}}
-                className="sh-ritem run"
+                className={railItemVariants({ kind: 'run' })}
                 title={`${r.projectName} — ${runLabel(r.goal)} (${fullTime})`}
               >
-                <span className="g"><StatusGlyph status={r.status} /></span>
-                <span className="lbl">
-                  <span className="t">{r.projectName}</span>
-                  <span className="s">
+                <span className="inline-flex size-3.5 flex-none items-center justify-center pt-[3px]">
+                  <StatusGlyph status={r.status} />
+                </span>
+                <span className="flex min-w-0 flex-1 flex-col gap-0">
+                  <span className="truncate text-inherit">{r.projectName}</span>
+                  <span className="flex gap-1.5 overflow-hidden whitespace-nowrap text-[11.5px] leading-4 text-fg-subtle">
                     <time
-                      className="num"
+                      className="tabular-nums"
                       dateTime={new Date(r.startedAt).toISOString()}
                       title={fullTime}
                       suppressHydrationWarning
@@ -299,43 +346,52 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
                     </time>
                     <span aria-hidden="true">·</span>
                     <span>{runStatusLabel(r.status)}</span>
-                    {r.confirmedCount > 0 && <span className="num" style={{ marginLeft: 'auto' }}>{r.confirmedCount}</span>}
+                    {r.confirmedCount > 0 && <span className="ml-auto tabular-nums">{r.confirmedCount}</span>}
                   </span>
                 </span>
               </Link>
             })}
         </div>
 
-        <div className="sh-rail-session">
+        <div className="flex-none border-t border-line px-2 py-1.5">
           <button
             type="button"
-            className="sh-session-chip"
+            className={cn(
+              'group/sess flex h-8 min-h-8 w-full cursor-pointer items-center gap-2 whitespace-nowrap rounded-control border-0 bg-transparent px-2 text-left text-[12.5px] font-medium leading-none text-fg-muted shadow-none transition-colors duration-[var(--d1)]',
+              'hover:bg-hover hover:text-fg active:bg-press active:text-fg aria-expanded:bg-press aria-expanded:text-fg',
+              '[&_.ico]:text-fg-subtle [&_.ico]:transition-colors hover:[&_.ico]:text-fg-muted aria-expanded:[&_.ico]:text-fg-muted',
+            )}
             onClick={openDevices}
             aria-haspopup="dialog"
             aria-expanded={devicesOpen}
             title="Devices & local session — pair another browser or phone"
           >
             <DevicesIcon />
-            <span className="sh-session-label">Local session</span>
-            <span className="sh-session-hint">Pair device</span>
-            <Icon name="chevR" className="sh-session-chev" />
+            <span className="min-w-0 flex-1 truncate">Local session</span>
+            <span className="flex-none text-[11px] font-normal text-fg-subtle transition-colors duration-[var(--d1)] group-hover/sess:text-fg-muted max-[720px]:hidden">
+              Pair device
+            </span>
+            <Icon
+              name="chevR"
+              className="flex-none text-fg-faint transition-[color,transform] duration-[var(--d1)] ease-guardian group-hover/sess:translate-x-[1px] group-hover/sess:text-fg-subtle"
+            />
           </button>
         </div>
 
-        <div className="sh-rail-foot">
+        <div className="flex flex-none items-center gap-1 border-t border-line p-2">
           <button
             type="button"
-            className="sh-icon-btn"
+            className="inline-flex h-7 min-w-7 cursor-pointer items-center justify-center gap-1.5 rounded-control border-0 bg-transparent px-[7px] text-fg-subtle shadow-none transition-colors duration-[var(--d1)] hover:bg-hover hover:text-fg"
             onClick={toggleTheme}
             title="Toggle theme (⇧T)"
           >
             <Icon name={isDark ? 'sun' : 'moon'} />
-            <span style={{ fontSize: 12 }}>{isDark ? 'Light' : 'Dark'}</span>
+            <span className="text-[12px] font-medium">{isDark ? 'Light' : 'Dark'}</span>
           </button>
-          <span className="grow" />
+          <span className="flex-1" />
           <button
             type="button"
-            className="sh-icon-btn"
+            className="inline-flex h-7 min-w-7 cursor-pointer items-center justify-center gap-1.5 rounded-control border-0 bg-transparent px-[7px] text-fg-subtle shadow-none transition-colors duration-[var(--d1)] hover:bg-hover hover:text-fg"
             onClick={openHelp}
             title="Keyboard shortcuts (?)"
             aria-label="Keyboard shortcuts"
@@ -345,7 +401,7 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
         </div>
       </aside>
 
-      <div className="sh-main">{children}</div>
+      <div className="relative flex min-h-0 min-w-0 flex-col overflow-auto bg-panel">{children}</div>
     </div>
 
     <GlobalPalette

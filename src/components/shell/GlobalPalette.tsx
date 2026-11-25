@@ -1,14 +1,17 @@
 // Global ⌘K command palette and keyboard shortcut sheet for non-run workspace routes.
-// Matches /runs/$runId's Palette design & interaction model.
+// Matches /runs/$runId's Palette design & interaction model using @base-ui/react Dialog.
 import { useNavigate } from '@tanstack/react-router'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
+import { cn } from '../../lib/cn.ts'
 import { Kbd, KbdGroup } from '../run/display.tsx'
 import { host, modKey, runLabel } from '../run/format.ts'
 import { StatusGlyph } from '../run/glyphs.tsx'
 import { Icon } from '../run/icons.tsx'
 import type { IconName } from '../run/icons.tsx'
 import { runStatusLabel } from '../run/meta.ts'
+import { Button } from '../ui/button.tsx'
+import { Dialog, DialogContent, DialogTitle } from '../ui/dialog.tsx'
 
 const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const
 const MINUTE_MS = 60_000
@@ -128,7 +131,7 @@ function Highlight({ text, q }: { text: string; q: string }) {
   const toks = q.split(/\s+/).filter(Boolean).map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
   if (!toks.length) return <>{text}</>
   const parts = text.split(new RegExp('(' + toks.join('|') + ')', 'gi'))
-  return <>{parts.map((p, i) => (i % 2 ? <mark key={i}>{p}</mark> : p))}</>
+  return <>{parts.map((p, i) => (i % 2 ? <mark key={i} className="bg-transparent font-medium text-accent">{p}</mark> : p))}</>
 }
 
 function poolHealthText(health: PoolHealth): string {
@@ -300,10 +303,8 @@ export function GlobalPalette({
 
   useEffect(() => {
     if (!open) return
-    listRef.current?.querySelector('.gpal-item.on')?.scrollIntoView({ block: 'nearest' })
+    listRef.current?.querySelector('[data-active="true"]')?.scrollIntoView({ block: 'nearest' })
   }, [open, cur, items])
-
-  if (!open) return null
 
   const runItem = (i: number) => {
     const it = items[i]
@@ -313,9 +314,13 @@ export function GlobalPalette({
   }
 
   let lastSection = ''
-  return <div className="sh-overlay" onMouseDown={e => { if (e.target === e.currentTarget) onClose() }}>
-    <div className="gpal" role="dialog" aria-modal="true" aria-label="Command palette">
-      <div className="gpal-in">
+  return <Dialog open={open} onOpenChange={next => { if (!next) onClose() }}>
+    <DialogContent
+      aria-label="Command palette"
+      className="mb-auto mt-[10vh] max-w-[620px] overflow-hidden rounded-2xl border-0 bg-raise p-0 shadow-popover [&_svg]:block [&_svg]:flex-none"
+    >
+      <DialogTitle className="sr-only">Command palette</DialogTitle>
+      <div className="flex h-[50px] items-center gap-2.5 border-b border-line px-4 text-fg-subtle">
         <Icon name="search" />
         <input
           autoFocus
@@ -324,10 +329,10 @@ export function GlobalPalette({
           autoComplete="off"
           spellCheck={false}
           aria-label="Search workspace"
+          className="h-auto min-w-0 flex-1 rounded-none border-0 bg-transparent p-0 text-[14.5px] text-fg shadow-none outline-none placeholder:text-fg-subtle focus:shadow-none focus:outline-none"
           onChange={e => { setQ(e.target.value); setIdx(0) }}
           onKeyDown={e => {
-            if (e.key === 'Escape') { e.preventDefault(); onClose() }
-            else if (e.key === 'ArrowDown' || (e.ctrlKey && e.key === 'n')) {
+            if (e.key === 'ArrowDown' || (e.ctrlKey && e.key === 'n')) {
               e.preventDefault()
               setIdx(Math.min(items.length - 1, cur + 1))
             } else if (e.key === 'ArrowUp' || (e.ctrlKey && e.key === 'p')) {
@@ -339,43 +344,65 @@ export function GlobalPalette({
             }
           }}
         />
-        <span className="gpal-scope">{data.workspace.name}</span>
+        <span className="whitespace-nowrap rounded-[5px] border border-line-2 px-[7px] py-0.5 text-[11.5px] text-fg-subtle">
+          {data.workspace.name}
+        </span>
       </div>
-      <div className="gpal-list" ref={listRef} role="listbox">
-        {items.length === 0 && <div className="gpal-empty">No matches for “{q}”</div>}
+      <div className="max-h-[400px] overflow-auto p-1.5" ref={listRef} role="listbox">
+        {items.length === 0 && (
+          <div className="p-7 text-center text-[12.5px] text-fg-subtle">No matches for “{q}”</div>
+        )}
         {items.map((it, i) => {
-          const head = it.section !== lastSection ? <div className="gpal-sec">{it.section}</div> : null
+          const head = it.section !== lastSection
+            ? <div className="px-2.5 pb-1 pt-2 text-[11.5px] font-medium text-fg-subtle">{it.section}</div>
+            : null
           lastSection = it.section
+          const isCurrent = i === cur
           return <div key={it.id}>
             {head}
             <div
-              className={'gpal-item' + (i === cur ? ' on' : '')}
+              className={cn(
+                'flex h-9 cursor-pointer items-center gap-2.5 rounded-[7px] px-2.5 text-fg-muted',
+                isCurrent && 'bg-press',
+              )}
+              data-active={isCurrent ? 'true' : undefined}
               role="option"
-              aria-selected={i === cur}
+              aria-selected={isCurrent}
               title={it.title}
-              onMouseMove={() => { if (i !== cur) setIdx(i) }}
+              onMouseMove={() => { if (!isCurrent) setIdx(i) }}
               onClick={() => runItem(i)}
             >
-              <span className="g">
+              <span className="inline-flex size-3.5 flex-none items-center justify-center">
                 {typeof it.icon === 'string' ? <Icon name={it.icon as IconName} /> : it.icon}
               </span>
-              <span className="l"><Highlight text={it.label} q={q.trim()} /></span>
+              <span className="min-w-0 flex-1 truncate text-fg">
+                <Highlight text={it.label} q={q.trim()} />
+              </span>
               {it.keys
-                ? <span className="r"><KbdGroup keys={it.keys} /></span>
+                ? <span className="flex-none text-[12px] text-fg-subtle"><KbdGroup keys={it.keys} /></span>
                 : it.right
-                  ? <span className={it.rightMono === false ? 'r num' : 'r mono'} title={it.rightTitle} suppressHydrationWarning>{it.right}</span>
+                  ? <span
+                      className={cn(
+                        'max-w-[220px] truncate whitespace-nowrap text-[12px] text-fg-subtle',
+                        it.rightMono === false ? 'tabular-nums' : 'font-mono',
+                      )}
+                      title={it.rightTitle}
+                      suppressHydrationWarning
+                    >
+                      {it.right}
+                    </span>
                   : null}
             </div>
           </div>
         })}
       </div>
-      <div className="gpal-f">
-        <span><Kbd>↑</Kbd><Kbd>↓</Kbd> navigate</span>
-        <span><Kbd>↵</Kbd> open</span>
-        <span><Kbd>esc</Kbd> close</span>
+      <div className="flex items-center gap-4 border-t border-line bg-sunk px-3.5 py-2 text-[11.5px] text-fg-subtle">
+        <span className="inline-flex items-center gap-1.5"><Kbd>↑</Kbd><Kbd>↓</Kbd> navigate</span>
+        <span className="inline-flex items-center gap-1.5"><Kbd>↵</Kbd> open</span>
+        <span className="inline-flex items-center gap-1.5"><Kbd>esc</Kbd> close</span>
       </div>
-    </div>
-  </div>
+    </DialogContent>
+  </Dialog>
 }
 
 const GLOBAL_SHORTCUTS: [string, [string, string][]][] = [
@@ -395,19 +422,32 @@ const GLOBAL_SHORTCUTS: [string, [string, string][]][] = [
 export function GlobalHelpSheet({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [mod, setMod] = useState('Ctrl')
   useEffect(() => setMod(modKey()), [])
-  if (!open) return null
-  return <div className="sh-overlay" onMouseDown={e => { if (e.target === e.currentTarget) onClose() }}>
-    <div className="ghelp" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
-      <div className="ghelp-top">
-        <h3>Keyboard shortcuts</h3>
-        <button type="button" className="sh-icon-btn" onClick={onClose} aria-label="Close shortcuts">
+
+  return <Dialog open={open} onOpenChange={next => { if (!next) onClose() }}>
+    <DialogContent
+      aria-label="Keyboard shortcuts"
+      className="max-h-[76vh] max-w-[540px] overflow-auto rounded-2xl border-0 bg-raise px-5 pb-4 pt-[18px] shadow-popover [&_svg]:block [&_svg]:flex-none"
+    >
+      <div className="mb-1 flex items-center justify-between">
+        <DialogTitle className="text-[13.5px] font-semibold text-fg">Keyboard shortcuts</DialogTitle>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="text-fg-subtle hover:text-fg"
+          onClick={onClose}
+          aria-label="Close shortcuts"
+        >
           <Icon name="close" />
-        </button>
+        </Button>
       </div>
       {GLOBAL_SHORTCUTS.map(([section, rows]) => <div key={section}>
-        <h5>{section}</h5>
-        <div className="ghelp-grid">
-          {rows.map(([keys, label]) => <div key={label}>
+        <h5 className="mb-1 mt-3.5 text-[11.5px] font-medium text-fg-subtle">{section}</h5>
+        <div className="grid grid-cols-2 gap-x-6 max-[720px]:grid-cols-1">
+          {rows.map(([keys, label]) => <div
+            key={label}
+            className="flex items-center justify-between gap-2 border-b border-line py-[5px] text-[12.5px] text-fg-muted"
+          >
             <span>{label}</span>
             <span className="kbd-group">
               {keys.split(' ').map((k, i) => <span key={i} className="kbd">{k === 'mod' ? mod : k}</span>)}
@@ -415,6 +455,6 @@ export function GlobalHelpSheet({ open, onClose }: { open: boolean; onClose: () 
           </div>)}
         </div>
       </div>)}
-    </div>
-  </div>
+    </DialogContent>
+  </Dialog>
 }

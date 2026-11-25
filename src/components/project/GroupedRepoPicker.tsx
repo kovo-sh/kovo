@@ -1,4 +1,6 @@
+import { cva } from 'class-variance-authority'
 import { useMemo, useState } from 'react'
+import { cn } from '../../lib/cn.ts'
 import { formatHumanTime } from '../common.tsx'
 import { Icon } from '../run/icons.tsx'
 import { Checkbox } from '../ui/checkbox.tsx'
@@ -28,6 +30,47 @@ export interface GroupedRepoPickerProps {
   searchPlaceholder?: string
   emptyMessage?: string
 }
+
+const repoRowVariants = cva(
+  'm-0 flex min-h-[34px] flex-row justify-start gap-2.5 border-t border-line text-[12.5px] font-normal leading-[18px] transition-colors duration-[var(--d1)] first:border-t-0',
+  {
+    variants: {
+      variant: {
+        compact: 'items-center py-1.5 pl-[26px] pr-3',
+        detailed: 'items-start py-[9px] pl-[30px] pr-4',
+      },
+      selected: {
+        true: 'bg-sel',
+        false: '',
+      },
+      disabled: {
+        true: 'cursor-default opacity-52',
+        false: 'cursor-pointer',
+      },
+    },
+    compoundVariants: [
+      { selected: false, disabled: false, className: 'hover:bg-hover' },
+      { selected: true, disabled: false, className: 'hover:bg-accent-soft' },
+    ],
+    defaultVariants: {
+      variant: 'compact',
+      selected: false,
+      disabled: false,
+    },
+  },
+)
+
+const visibilityBadgeVariants = cva(
+  'inline-flex h-[18px] flex-none items-center whitespace-nowrap text-[10.5px]',
+  {
+    variants: {
+      visibility: {
+        private: 'rounded-full border border-line-2 bg-sunk px-1.5 font-medium text-fg-muted',
+        public: 'bg-transparent px-0.5 font-normal text-fg-subtle',
+      },
+    },
+  },
+)
 
 export function splitRepoFullName(fullName: string): { owner: string; name: string } {
   const slashIdx = fullName.indexOf('/')
@@ -112,6 +155,7 @@ export function GroupedRepoPicker({
 
   const showToolbar = variant === 'detailed' ? repos.length > 0 : repos.length > 1
   const remainingCap = Math.max(0, maxSelectable - selectedRepos.length)
+  const isDetailed = variant === 'detailed'
 
   function isGroupExpanded(group: RepoOwnerGroup, index: number, selectedInGroup: number): boolean {
     if (isSearching) {
@@ -180,23 +224,32 @@ export function GroupedRepoPicker({
   }
 
   if (repos.length === 0) {
-    return <div className={`grp-empty grp-${variant}`}>{emptyMessage}</div>
+    return (
+      <div className={cn('text-[12px] text-fg-subtle', isDetailed ? 'p-4' : 'px-3 py-3.5')}>
+        {emptyMessage}
+      </div>
+    )
   }
 
   return (
-    <div className={`grp-root grp-${variant}`}>
+    <div className="flex flex-col bg-panel">
       {showToolbar && (
-        <div className="grp-toolbar">
-          <div className="grp-search-wrap">
-            <Icon name="search" size={13} className="grp-search-ico" />
+        <div
+          className={cn(
+            'flex items-center gap-1.5 border-b border-line bg-panel transition-colors duration-[var(--d1)] focus-within:border-b-accent-line',
+            isDetailed ? 'min-h-10 py-[5px] pl-4 pr-3' : 'min-h-9 py-1 pl-3 pr-2',
+          )}
+        >
+          <div className="flex min-w-[120px] flex-1 items-center gap-[7px]">
+            <Icon name="search" size={13} className="flex-none text-fg-subtle" />
             <input
               type="search"
-              className="grp-search-input"
+              className="h-[26px] w-full min-w-0 flex-1 rounded-none border-0 bg-transparent p-0 text-[12.5px] leading-5 text-fg shadow-none outline-none placeholder:text-fg-subtle focus:shadow-none focus:outline-none"
               value={search}
               onChange={e => onSearchChange(e.target.value)}
               placeholder={
                 searchPlaceholder ??
-                (variant === 'detailed'
+                (isDetailed
                   ? 'Filter repositories by name, branch, or description…'
                   : 'Filter repositories…')
               }
@@ -204,21 +257,21 @@ export function GroupedRepoPicker({
               disabled={disabled}
             />
           </div>
-          <div className="grp-toolbar-actions">
+          <div className="flex flex-none items-center gap-0.5">
             <button
               type="button"
-              className="grp-tb-btn"
+              className="h-6 cursor-pointer rounded-[5px] border-0 bg-transparent px-[7px] text-[11.5px] font-medium text-fg-muted shadow-none transition-colors duration-[var(--d1)] hover:bg-hover hover:text-fg disabled:cursor-default disabled:opacity-45 disabled:hover:bg-transparent"
               disabled={disabled || filteredRepos.length === 0}
               onClick={handleSelectAllVisible}
             >
-              {variant === 'detailed'
+              {isDetailed
                 ? `Select all${filteredRepos.length > maxSelectable ? ` (first ${maxSelectable})` : filteredRepos.length > 0 ? ` (${filteredRepos.length})` : ''}`
                 : 'Select all'}
             </button>
             {selectedRepos.length > 0 && (
               <button
                 type="button"
-                className="grp-tb-btn"
+                className="h-6 cursor-pointer rounded-[5px] border-0 bg-transparent px-[7px] text-[11.5px] font-medium text-fg-muted shadow-none transition-colors duration-[var(--d1)] hover:bg-hover hover:text-fg disabled:cursor-default disabled:opacity-45 disabled:hover:bg-transparent"
                 disabled={disabled}
                 onClick={() => onChangeSelectedRepos([])}
               >
@@ -229,9 +282,15 @@ export function GroupedRepoPicker({
         </div>
       )}
 
-      <div className="grp-list" role="group" aria-label="Accessible GitHub repositories">
+      <div
+        className={cn('overflow-y-auto bg-panel', isDetailed ? 'max-h-96' : 'max-h-[216px]')}
+        role="group"
+        aria-label="Accessible GitHub repositories"
+      >
         {visibleGroups.length === 0 ? (
-          <div className="grp-empty">No repositories match “{search.trim()}”.</div>
+          <div className={cn('text-[12px] text-fg-subtle', isDetailed ? 'p-4' : 'px-3 py-3.5')}>
+            No repositories match “{search.trim()}”.
+          </div>
         ) : (
           visibleGroups.map((group, groupIdx) => {
             const selectedInGroup = group.items.reduce(
@@ -243,37 +302,50 @@ export function GroupedRepoPicker({
             const canSelectOrg = hasUnselected && remainingCap > 0
 
             return (
-              <div
-                key={group.owner}
-                className={`grp-org${expanded ? ' expanded' : ''}${selectedInGroup > 0 ? ' has-sel' : ''}`}
-              >
-                <div className="grp-org-head">
+              <div key={group.owner} className="border-t border-line first:border-t-0">
+                <div
+                  className={cn(
+                    'group/org flex items-center justify-between gap-1.5 bg-sunk transition-colors duration-[var(--d1)] hover:bg-[color-mix(in_srgb,var(--hover)_70%,var(--sunk))]',
+                    isDetailed ? 'min-h-[34px] pl-2.5 pr-3' : 'min-h-8 pl-1.5 pr-2',
+                  )}
+                >
                   <button
                     type="button"
-                    className="grp-org-toggle"
+                    className={cn(
+                      'flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded-none border-0 bg-transparent px-1.5 text-left text-fg shadow-none hover:bg-transparent',
+                      isDetailed ? 'h-[34px]' : 'h-8',
+                    )}
                     aria-expanded={expanded}
                     onClick={() => toggleGroup(group.owner, expanded)}
                   >
-                    <span className={`grp-org-chev${expanded ? ' open' : ''}`} aria-hidden="true">
+                    <span
+                      className={cn(
+                        'inline-flex size-3.5 flex-none items-center justify-center text-fg-subtle transition-[transform,color] duration-[var(--d1)] ease-guardian',
+                        expanded && 'rotate-90 text-fg-muted',
+                      )}
+                      aria-hidden="true"
+                    >
                       <Icon name="chevR" size={12} />
                     </span>
-                    <span className="grp-org-name" title={group.owner}>
-                      <span className="grp-org-at">@</span>
+                    <span className="min-w-0 truncate text-[12px] font-semibold text-fg" title={group.owner}>
+                      <span className="mr-px font-normal text-fg-subtle">@</span>
                       {group.owner}
                     </span>
-                    <span className="grp-org-count num">
+                    <span className="inline-flex h-[17px] min-w-[18px] flex-none items-center justify-center rounded-full border border-line-2 bg-panel px-[5px] text-[11px] font-medium tabular-nums text-fg-subtle">
                       {isSearching ? `${group.items.length} / ${group.totalCount}` : group.items.length}
                     </span>
                     {selectedInGroup > 0 && (
-                      <span className="grp-org-sel num">{selectedInGroup} selected</span>
+                      <span className="inline-flex h-[17px] flex-none items-center whitespace-nowrap rounded-full border border-accent/28 bg-accent-soft px-1.5 text-[10.5px] font-medium tabular-nums text-accent">
+                        {selectedInGroup} selected
+                      </span>
                     )}
                   </button>
 
-                  <div className="grp-org-actions">
+                  <div className="flex flex-none items-center gap-0.5">
                     {canSelectOrg && (
                       <button
                         type="button"
-                        className="grp-org-act grp-org-act-select"
+                        className="h-[22px] cursor-pointer rounded-sm border-0 bg-transparent px-1.5 text-[11px] font-medium text-fg-subtle opacity-0 shadow-none transition-[opacity,background-color,color] duration-[var(--d1)] hover:bg-hover hover:text-fg group-hover/org:opacity-100 group-focus-within/org:opacity-100 disabled:cursor-default disabled:opacity-45 [@media(hover:none)]:opacity-100"
                         disabled={disabled}
                         onClick={() => selectOrg(group)}
                       >
@@ -283,7 +355,7 @@ export function GroupedRepoPicker({
                     {selectedInGroup > 0 && (
                       <button
                         type="button"
-                        className="grp-org-act grp-org-act-clear"
+                        className="h-[22px] cursor-pointer rounded-sm border-0 bg-transparent px-1.5 text-[11px] font-medium text-fg-muted shadow-none transition-[opacity,background-color,color] duration-[var(--d1)] hover:bg-hover hover:text-fg disabled:cursor-default disabled:opacity-45"
                         disabled={disabled}
                         onClick={() => clearOrg(group)}
                       >
@@ -294,45 +366,76 @@ export function GroupedRepoPicker({
                 </div>
 
                 {expanded && (
-                  <div className="grp-org-repos">
+                  <div className="border-t border-line bg-panel">
                     {group.items.map(({ repo, name }) => {
                       const checked = selectedSet.has(repo.fullName)
                       const atCap = !checked && selectedRepos.length >= maxSelectable
-                      const updated = variant === 'detailed' ? formatHumanTime(repo.updatedAt) : null
+                      const isRowDisabled = atCap || disabled
+                      const updated = isDetailed ? formatHumanTime(repo.updatedAt) : null
 
                       return (
                         <label
                           key={repo.fullName}
-                          className={`grp-repo-row${checked ? ' on' : ''}${atCap || disabled ? ' disabled' : ''}`}
+                          className={repoRowVariants({
+                            variant,
+                            selected: checked,
+                            disabled: isRowDisabled,
+                          })}
                         >
                           <Checkbox
                             checked={checked}
-                            disabled={disabled || atCap}
+                            disabled={isRowDisabled}
+                            className={isDetailed ? 'mt-0.5 flex-none' : 'flex-none'}
                             aria-label={`Select repository ${repo.fullName}`}
                             onCheckedChange={next => toggleRepo(repo.fullName, Boolean(next))}
                           />
-                          {variant === 'detailed' ? (
-                            <span className="grp-repo-detail">
-                              <span className="grp-repo-line">
-                                <span className="mono grp-repo-name" title={repo.fullName}>{name}</span>
-                                <span className={`grp-vis ${repo.private ? 'private' : 'public'}`}>
+                          {isDetailed ? (
+                            <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                              <span className="flex min-w-0 flex-wrap items-center gap-1.5">
+                                <span
+                                  className="flex-[0_1_auto] truncate font-mono text-[12px] font-semibold text-fg"
+                                  title={repo.fullName}
+                                >
+                                  {name}
+                                </span>
+                                <span
+                                  className={visibilityBadgeVariants({
+                                    visibility: repo.private ? 'private' : 'public',
+                                  })}
+                                >
                                   {repo.private ? 'private' : 'public'}
                                 </span>
-                                <span className="grp-branch mono">{repo.defaultBranch}</span>
+                                <span className="inline-flex h-[18px] flex-none items-center whitespace-nowrap rounded-full border border-line bg-sunk px-1.5 font-mono text-[10.5px] text-fg-muted">
+                                  {repo.defaultBranch}
+                                </span>
                                 {updated?.label && (
-                                  <span className="grp-updated num" title={updated.full}>
+                                  <span
+                                    className="whitespace-nowrap text-[11.5px] tabular-nums text-fg-subtle"
+                                    title={updated.full}
+                                  >
                                     Updated {updated.label}
                                   </span>
                                 )}
                               </span>
                               {repo.description && (
-                                <span className="grp-repo-desc">{repo.description}</span>
+                                <span className="truncate text-[11.5px] leading-4 text-fg-subtle">
+                                  {repo.description}
+                                </span>
                               )}
                             </span>
                           ) : (
                             <>
-                              <span className="mono grp-repo-name" title={repo.fullName}>{name}</span>
-                              <span className={`grp-vis ${repo.private ? 'private' : 'public'}`}>
+                              <span
+                                className="min-w-0 flex-1 truncate font-mono text-[12px] font-medium text-fg"
+                                title={repo.fullName}
+                              >
+                                {name}
+                              </span>
+                              <span
+                                className={visibilityBadgeVariants({
+                                  visibility: repo.private ? 'private' : 'public',
+                                })}
+                              >
                                 {repo.private ? 'private' : 'public'}
                               </span>
                             </>
