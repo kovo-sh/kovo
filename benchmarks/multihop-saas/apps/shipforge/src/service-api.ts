@@ -7,7 +7,8 @@ import {
 } from './http.ts'
 import type { LabState, TenantKey } from './shared.ts'
 import {
-  authenticate, authorizeHeader, digest, hmacHex, patByToken, resolveCaller, roleOf, safeEqualHex, sessionTenantOk,
+  authenticate, authorizeHeader, digest, hasTenantMembership, hmacHex, patByToken, resolveCaller, roleOf,
+  safeEqualHex, sessionTenantOk,
 } from './policy.ts'
 import {
   buildById, convergeBuild, deploymentById, projectById, tenantById, tenantBySlug,
@@ -86,9 +87,11 @@ export async function handleApi(
     const session = sessionAuth(state, req, res)
     if (!session) return
     sendJson(res, 200, {
-      orgs: state.distro.map((tenant) => ({
-        id: tenant.id, slug: tenant.slug, name: tenant.name, role: roleOf(state, session, tenant.id),
-      })),
+      orgs: state.distro
+        .filter((tenant) => hasTenantMembership(state, session, tenant.id))
+        .map((tenant) => ({
+          id: tenant.id, slug: tenant.slug, name: tenant.name, role: roleOf(state, session, tenant.id),
+        })),
     })
     return
   }
@@ -98,7 +101,7 @@ export async function handleApi(
     const session = sessionAuth(state, req, res)
     if (!session) return
     const tenantId = tenantById(state, org[0]!)
-    if (!tenantId) {
+    if (!tenantId || !hasTenantMembership(state, session, tenantId)) {
       sendJson(res, 404, { error: 'unknown org' })
       return
     }
@@ -111,7 +114,7 @@ export async function handleApi(
     if (!session) return
     sendJson(res, 200, {
       projects: state.projects
-        .filter((project) => project.tenantId === session.tenantId || project.visibility === 'shared')
+        .filter((project) => hasTenantMembership(state, session, project.tenantId))
         .map((project) => ({
           id: project.id, slug: project.slug, name: project.name,
           tenant: project.tenantId, visibility: project.visibility, state: project.state,
@@ -125,7 +128,7 @@ export async function handleApi(
     const session = sessionAuth(state, req, res)
     if (!session) return
     const project = projectById(state, projectGet[0]!)
-    if (!project || (project.tenantId !== session.tenantId && project.visibility !== 'shared')) {
+    if (!project || !hasTenantMembership(state, session, project.tenantId)) {
       sendJson(res, 404, { error: 'unknown project' })
       return
     }

@@ -271,3 +271,55 @@ test('anti-heuristic floor: an empty deterministic run scores <= 5% recall', asy
     await lab.stop()
   }
 })
+
+test('benign detail GET routes enforce tenant membership while preserving dual_member access', async () => {
+  const lab = await startShipforge({ seed: 1, mode: 'vulnerable', asyncLatencyMs: 5 })
+  try {
+    const ctx = createSolverContext(lab)
+    const memberA = await ctx.login('member_a')
+    const memberB = await ctx.login('member_b')
+    const dual = await ctx.login('dual_member')
+    const prefix = lab.plan.routePrefix
+    const { projectIdA, projectIdB } = lab.plan.ids
+
+    // Own-tenant detail GETs succeed.
+    assert.equal((await ctx.http('api', `${prefix}/projects/${projectIdA}`, { token: memberA })).status, 200)
+    assert.equal((await ctx.http('api', `${prefix}/projects/${projectIdB}`, { token: memberB })).status, 200)
+    assert.equal((await ctx.http('scm', `/repos/${projectIdA}`, { token: memberA })).status, 200)
+    assert.equal((await ctx.http('scm', `/repos/${projectIdB}`, { token: memberB })).status, 200)
+    assert.equal((await ctx.http('api', `${prefix}/orgs/org_a`, { token: memberA })).status, 200)
+    assert.equal((await ctx.http('api', `${prefix}/orgs/org_b`, { token: memberB })).status, 200)
+
+    // Cross-tenant detail GETs are rejected (404), and unauthenticated /repos/:id is 401.
+    assert.equal((await ctx.http('api', `${prefix}/projects/${projectIdB}`, { token: memberA })).status, 404)
+    assert.equal((await ctx.http('api', `${prefix}/projects/${projectIdA}`, { token: memberB })).status, 404)
+    assert.equal((await ctx.http('scm', `/repos/${projectIdB}`, { token: memberA })).status, 404)
+    assert.equal((await ctx.http('scm', `/repos/${projectIdA}`, { token: memberB })).status, 404)
+    assert.equal((await ctx.http('scm', `/repos/${projectIdB}`)).status, 401)
+    assert.equal((await ctx.http('api', `${prefix}/orgs/org_b`, { token: memberA })).status, 404)
+    assert.equal((await ctx.http('api', `${prefix}/orgs/org_a`, { token: memberB })).status, 404)
+
+    // dual_member retains access to both org_a and org_b (member of both), denied org_c.
+    assert.equal((await ctx.http('api', `${prefix}/projects/${projectIdA}`, { token: dual })).status, 200)
+    assert.equal((await ctx.http('api', `${prefix}/projects/${projectIdB}`, { token: dual })).status, 200)
+    assert.equal((await ctx.http('scm', `/repos/${projectIdA}`, { token: dual })).status, 200)
+    assert.equal((await ctx.http('scm', `/repos/${projectIdB}`, { token: dual })).status, 200)
+    assert.equal((await ctx.http('api', `${prefix}/orgs/org_a`, { token: dual })).status, 200)
+    assert.equal((await ctx.http('api', `${prefix}/orgs/org_b`, { token: dual })).status, 200)
+    assert.equal((await ctx.http('api', `${prefix}/orgs/org_c`, { token: dual })).status, 404)
+
+    // Webhook delivery log enforces tenant membership.
+    const wh = await ctx.http('api', `${prefix}/projects/${projectIdA}/webhooks`, {
+      method: 'POST',
+      token: memberA,
+      body: { targetHost: 'runner', targetPath: '/hooks/deploy', events: ['push'] },
+    })
+    assert.equal(wh.status, 201)
+    const wid = wh.json<{ webhookId: string }>().webhookId
+    assert.equal((await ctx.http('api', `${prefix}/projects/${projectIdA}/webhooks/${wid}/deliveries`, { token: memberA })).status, 200)
+    assert.equal((await ctx.http('api', `${prefix}/projects/${projectIdA}/webhooks/${wid}/deliveries`, { token: memberB })).status, 404)
+    assert.equal((await ctx.http('scm', `/repos/${projectIdA}/webhooks/${wid}/deliveries`, { token: memberB })).status, 404)
+  } finally {
+    await lab.stop()
+  }
+})
