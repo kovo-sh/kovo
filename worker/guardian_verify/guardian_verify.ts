@@ -136,7 +136,8 @@ interface RpcEnvelope { ok: boolean; result?: unknown; error?: string }
 
 export interface HttpExchange {
   exchangeId: string; status: number; method: string; pathAndQuery: string; finalPathAndQuery?: string
-  redirectOrigins?: string[]; mediaType: string; headers: Record<string, string>; body: string; bodyPreview: string
+  redirectOrigins?: string[]; mediaType: string; headers: Record<string, string>; body: string; text: string
+  json: unknown; data: unknown; bodyPreview: string
   bodyBytes: number; bodySha256: string; durationMs: number; personaHandle: string | null
   consumedCapabilityId?: string | null; derivedFromCapabilityIds?: string[]; protocol?: 'h2'
 }
@@ -197,7 +198,7 @@ export interface OobHandle { exchangeId: string; token: string; url: string; dns
 export interface OobCheck extends OobHandle { hit: boolean; checkExchangeId?: string; hits: Array<{ protocol: string; token: string; remoteIp?: string; timestamp?: number }> }
 
 export interface HttpOptions {
-  as?: string; persona?: string; session?: string; role?: 'setup' | 'control' | 'probe' | 'cleanup'
+  as?: string; persona?: string; session?: string; role?: 'setup' | 'control' | 'probe' | 'cleanup'; arm?: 'setup' | 'control' | 'probe' | 'cleanup'
   method?: string; headers?: Record<string, string>; body?: string | Record<string, unknown> | unknown[]
   followRedirects?: boolean; timeoutMs?: number; capability?: string | CapabilityInjectionSpec
   capabilityTarget?: 'bearer' | 'header' | 'cookie' | 'url'; capabilityHeaderName?: string; capabilityCookieName?: string
@@ -313,10 +314,22 @@ function extractInlineHttpOptions(input: unknown): HttpOptions {
   if (r.body !== undefined) out.body = r.body as HttpOptions['body']
   const persona = typeof r.as === 'string' ? r.as : typeof r.persona === 'string' ? r.persona : undefined
   if (persona) out.as = persona
-  for (const k of ['session', 'role', 'followRedirects', 'timeoutMs', 'capability', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'entityId', 'correlationIds', 'evidenceRole', 'replayAttempt'] as const) {
+  for (const k of ['session', 'role', 'arm', 'followRedirects', 'timeoutMs', 'capability', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'entityId', 'correlationIds', 'evidenceRole', 'replayAttempt'] as const) {
     if (r[k] !== undefined) (out as Record<string, unknown>)[k] = r[k]
   }
   return out
+}
+
+function parseJsonSafe(body: unknown): unknown {
+  if (typeof body !== 'string' || !body.trim()) return null
+  try { return JSON.parse(body) } catch { return null }
+}
+
+function hydrateExchange(raw: HttpExchange): HttpExchange {
+  if (!raw || typeof raw !== 'object') return raw
+  const body = typeof raw.body === 'string' ? raw.body : ''
+  const parsed = raw.json !== undefined ? raw.json : parseJsonSafe(body)
+  return { ...raw, body, text: body, json: parsed, data: parsed, headers: raw.headers && typeof raw.headers === 'object' ? raw.headers : {} }
 }
 
 function resolveCapHandle(value: unknown): string {
@@ -398,7 +411,7 @@ export class VerifyContext {
         ...(body !== undefined ? { body } : {}),
         ...(persona ? { persona } : {}),
         ...(merged.session ? { session: merged.session } : {}),
-        ...(merged.role ? { sessionGroupRole: merged.role } : {}),
+        ...((merged.role ?? merged.arm) ? { sessionGroupRole: merged.role ?? merged.arm } : {}),
         ...(merged.followRedirects !== undefined ? { followRedirects: merged.followRedirects } : {}),
         ...(merged.capability !== undefined ? { capability: merged.capability } : {}),
         ...(merged.capabilityTarget ? { capabilityTarget: merged.capabilityTarget } : {}),
@@ -416,12 +429,12 @@ export class VerifyContext {
 
   async http(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {
     const { args, timeoutMs } = this.buildHttpRpcArgs(input, options)
-    return await rpc('http', args, timeoutMs) as HttpExchange
+    return hydrateExchange(await rpc('http', args, timeoutMs) as HttpExchange)
   }
 
   async httpSend(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {
     const { args, timeoutMs } = this.buildHttpRpcArgs(input, options)
-    return await rpc('http.send', args, timeoutMs) as HttpExchange
+    return hydrateExchange(await rpc('http.send', args, timeoutMs) as HttpExchange)
   }
 
   http_send(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> { return this.httpSend(input, options) }
@@ -572,7 +585,7 @@ export class VerifyContext {
     const correlationId = r.correlationId ?? r.correlation_id
     const correlationIds = (r.correlationIds ?? r.correlation_ids) as string[] | undefined
     const entityId = r.entityId ?? r.entity_id
-    return await rpc('async.awaitResult', {
+    const res = await rpc('async.awaitResult', {
       pollRequest,
       ...(matchPredicate ? { matchPredicate } : {}),
       ...(r.profile ? { profile: r.profile } : {}),
@@ -585,6 +598,7 @@ export class VerifyContext {
       ...(correlationIds?.length ? { correlationIds } : {}),
       ...(entityId ? { entityId: String(entityId) } : {}),
     }, Math.max((timeoutMs ?? 30_000) + 10_000, 15_000)) as AsyncAwaitResult
+    return res && res.exchange ? { ...res, exchange: hydrateExchange(res.exchange) } : res
   }
 
   await_async(
@@ -613,7 +627,7 @@ export class VerifyContext {
 
   async http2(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {
     const { args, timeoutMs } = this.buildHttpRpcArgs(input, options)
-    return await rpc('http2', args, timeoutMs) as HttpExchange
+    return hydrateExchange(await rpc('http2', args, timeoutMs) as HttpExchange)
   }
 
   async browser(input: HttpTarget, options: { as?: string; waitForSelector?: string; timeoutMs?: number } = {}): Promise<BrowserExchange> {
