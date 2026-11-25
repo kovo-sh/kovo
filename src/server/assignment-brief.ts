@@ -627,6 +627,66 @@ export function fitHopCheckpointForBrief(
   return { checkpoint: minimal, bytes: measure(minimal), truncated: true }
 }
 
+export interface AssignmentBriefMultiHopContract {
+  attackerOriginRule: string
+  optionalHelpers?: string
+  modeATsRecipe: string
+  hardenedTwinRule: string
+}
+
+export const MULTIHOP_ATTACKER_ORIGIN_RULE =
+  'Start Hop 1 strictly from a low-privilege or cross-tenant persona (member/viewer/cross-org); NEVER use a pre-seeded owner/admin persona on the attack arm (reserve owner/admin strictly for control comparison).'
+
+export const MULTIHOP_HARDENED_TWIN_RULE =
+  'If a terminal guard holds cleanly, do NOT file a standalone finding on benign Hop 1-2; call record_coverage(status="ruled_out", proofGapReason="invariant_enforced_hardened") and complete_intent.'
+
+export const MULTIHOP_OPTIONAL_HELPERS_NOTE =
+  'Crypto/async hops: ctx.hmac_sign({ secretHandle, payload, alg }) | ctx.jwt_sign({ secretHandle, claims, alg, hopReceiptId, slot }) -> derived_crypto_binding; ctx.await_async({ pollRequest, matchPredicate, triggerExchangeId, correlationId, profile: "fast_lab" }) -> async_pivot_binding; state mutation -> state_transition_binding (ablationExchangeIds).'
+
+/** Exact Mode-A TypeScript guardian_verify recipe (<= 18 lines, live SDK parameter names). */
+export const MULTIHOP_MODE_A_TS_RECIPE = [
+  'const ctrl = await ctx.http_send("/api/target", { as: "member_b", role: "control" })',
+  'const h1 = await ctx.http_send("/api/hop1", { as: "member_b", role: "probe" })',
+  'const cap = await ctx.seal_capability({ exchange: h1, hopReceiptId: "1", slot: "tok", jsonPath: "$.token" })',
+  'const h2 = await ctx.http_send("/api/target", { capability: cap.handle, role: "probe" })',
+  'await ctx.prove_composite({',
+  '  chainId: "chain-1", terminalVulnClass: "dual_tenant_abac", replayMode: "fresh_clean_replay",',
+  '  hops: [',
+  '    { hopId: "hop_1", surface: "http", target: { origin: ctx.targetOrigin, method: "GET", pathAndQuery: "/api/hop1" }, exchangeIds: [h1.exchangeId], producedCapabilities: [cap.handle], claimedDelta: "Hop 1 capability obtained." },',
+  '    { hopId: "hop_2", surface: "http", target: { origin: ctx.targetOrigin, method: "GET", pathAndQuery: "/api/target" }, exchangeIds: [h2.exchangeId], consumedCapabilities: [cap.handle], claimedDelta: "Hop 2 boundary crossed." },',
+  '  ],',
+  '  causalEdges: [{ kind: "value_binding", fromHopId: "hop_1", toHopId: "hop_2", capabilityHandle: cap.handle }],',
+  '  terminalImpact: { terminalHopId: "hop_2", claimedImpact: "Unauthorized terminal access.", preChainControlExchangeIds: [ctrl.exchangeId], postChainReadbackExchangeIds: [h2.exchangeId] },',
+  '})',
+  'return ctx.result({ title: "Multi-hop chain confirmed" })',
+].join('\n')
+
+const COMPACT_MULTIHOP_MODE_A_RECIPE =
+  'ctrl=http_send(target,{as:"member_b",role:"control"}); h1=http_send(hop1,{as:"member_b",role:"probe"}); cap=seal_capability({exchange:h1,hopReceiptId:"1",slot:"tok",jsonPath:"$.token"}); h2=http_send(target,{capability:cap.handle,role:"probe"}); prove_composite({chainId,terminalVulnClass,hops,causalEdges,terminalImpact,replayMode:"fresh_clean_replay"}); (+hmac_sign/jwt_sign/await_async if needed)'
+
+export function isMultiHopBriefInput(input: Pick<AssignmentBriefInput, 'missionKind' | 'hopCheckpoint'>): boolean {
+  return Boolean(input.hopCheckpoint)
+    || input.missionKind === 'chain_step_2'
+    || input.missionKind === 'multihop_chain'
+    || input.missionKind === 'second_order'
+}
+
+export function buildMultiHopProofContract(compact = false): AssignmentBriefMultiHopContract {
+  if (compact) {
+    return {
+      attackerOriginRule: 'Start Hop 1 from low-priv/cross-tenant persona (never owner/admin on attack arm).',
+      modeATsRecipe: COMPACT_MULTIHOP_MODE_A_RECIPE,
+      hardenedTwinRule: 'If terminal guard holds, no Hop 1-2 standalone finding; record_coverage(status="ruled_out", proofGapReason="invariant_enforced_hardened") + complete_intent.',
+    }
+  }
+  return {
+    attackerOriginRule: MULTIHOP_ATTACKER_ORIGIN_RULE,
+    optionalHelpers: MULTIHOP_OPTIONAL_HELPERS_NOTE,
+    modeATsRecipe: MULTIHOP_MODE_A_TS_RECIPE,
+    hardenedTwinRule: MULTIHOP_HARDENED_TWIN_RULE,
+  }
+}
+
 interface WorkingState {
   routes: AssignmentBriefRoute[]
   linked: AssignmentBriefRoute[]
@@ -638,6 +698,8 @@ interface WorkingState {
   codeBudget: number
   hopCheckpoint?: RenderedHopCheckpoint
   hopCheckpointBudget: number
+  multiHopProofContract?: AssignmentBriefMultiHopContract
+  multiHopContractCompacted: boolean
   proofObligation?: Record<string, unknown>
 }
 
@@ -647,6 +709,7 @@ function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<
     origin: cleanText(input.origin.split(/[?#]/, 1)[0], 180),
     ...(state.detLead ? { detLead: state.detLead } : {}),
     ...(state.hopCheckpoint ? { hopCheckpoint: state.hopCheckpoint } : {}),
+    ...(state.multiHopProofContract ? { multiHopProofContract: state.multiHopProofContract } : {}),
     ...(state.proofObligation ? { proofObligation: state.proofObligation } : {}),
     routes: state.routes,
     ...(state.code ? { code: state.code } : {}),
@@ -763,6 +826,7 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
     ? fitHopCheckpointForBrief(input.hopCheckpoint, hopCheckpointBudget)
     : undefined
   const proofObligation = input.proofObligation ? normalizeProofObligation(input.proofObligation) : undefined
+  const multiHopProofContract = isMultiHopBriefInput(input) ? buildMultiHopProofContract(false) : undefined
 
   return {
     routes,
@@ -773,6 +837,8 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
     ...(input.detLead ? { detLead: normalizeDetLead(input.detLead) } : {}),
     ...(code ? { code } : {}),
     ...(fittedCheckpoint ? { hopCheckpoint: fittedCheckpoint.checkpoint } : {}),
+    ...(multiHopProofContract ? { multiHopProofContract } : {}),
+    multiHopContractCompacted: false,
     ...(proofObligation ? { proofObligation } : {}),
     codeBudget,
     hopCheckpointBudget,
@@ -783,13 +849,14 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
  * Render the brief plus deterministic reduction metadata.
  *
  * The reduction ladder keeps the highest-signal material longest: det_lead, hopCheckpoint,
- * then the top route(s), then personas/confirmed refs, then baseline keys/samples, then linked routes.
+ * multiHopProofContract, then the top route(s), then personas/confirmed refs, then baseline
+ * keys/samples, then linked routes.
  */
 export function buildAssignmentBriefPacket(
   input: AssignmentBriefInput,
   maxBytes?: number,
 ): AssignmentBriefResult {
-  const defaultCap = input.codeExpansion === 'full' || Boolean(input.hopCheckpoint)
+  const defaultCap = input.codeExpansion === 'full' || isMultiHopBriefInput(input)
     ? ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE
     : ASSIGNMENT_BRIEF_MAX_BYTES
   const cap = Math.max(128, Math.min(Math.floor(maxBytes ?? defaultCap), ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE))
@@ -847,6 +914,13 @@ export function buildAssignmentBriefPacket(
       state.proofObligation = undefined
       continue
     }
+    // Compact the Mode-A multi-hop proof contract before shrinking code slices or hopCheckpoints
+    // so both the recipe/provenance rules and chain lineage coexist inside the 4 KB budget.
+    if (state.multiHopProofContract && !state.multiHopContractCompacted) {
+      state.multiHopProofContract = buildMultiHopProofContract(true)
+      state.multiHopContractCompacted = true
+      continue
+    }
     if (state.code && state.codeBudget > 240) {
       const nextBudget = Math.max(240, Math.floor(state.codeBudget * 0.6))
       state.code = renderCodeDataflowSlice(state.code, nextBudget).slice
@@ -866,6 +940,10 @@ export function buildAssignmentBriefPacket(
     if (state.hopCheckpoint && input.hopCheckpoint && state.hopCheckpointBudget > 256) {
       state.hopCheckpoint = fitHopCheckpointForBrief(input.hopCheckpoint, 256).checkpoint
       state.hopCheckpointBudget = 256
+      continue
+    }
+    if (state.multiHopProofContract) {
+      state.multiHopProofContract = undefined
       continue
     }
     if (state.detLead && typeof state.detLead.signalSummary === 'string' && state.detLead.signalSummary.length > 60) {
