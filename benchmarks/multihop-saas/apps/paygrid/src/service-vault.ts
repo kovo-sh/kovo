@@ -2,7 +2,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { readBody, parseJson, sendJson, header, runIdOf, match, parseUrl } from './http.ts'
 import type { LabState, TenantKey } from './shared.ts'
-import { hmacHex, safeEqualHex } from './policy.ts'
+import { digest, hmacHex, safeEqualHex } from './policy.ts'
 
 function serviceAuthorized(state: LabState, req: IncomingMessage): boolean {
   const expected = hmacHex(state.plan.secrets.serviceToken, 'service')
@@ -92,7 +92,7 @@ export async function handleVault(
       amountCents: body.amountCents,
       accepted: true,
       scope,
-      derivedFromDigest: header(req, 'x-lab-derived-from'),
+      derivedFromDigest: digest(state.plan.secrets.webhookSigningSalt),
       runId,
     })
     sendJson(res, 200, { accepted: true, tenantId: body.tenantId, amountCents: body.amountCents })

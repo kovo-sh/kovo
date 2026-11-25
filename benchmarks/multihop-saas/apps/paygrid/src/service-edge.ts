@@ -4,7 +4,7 @@ import type { Egress } from '../../../lib/egress.ts'
 import { readBody, sendJson, sendText, header, runIdOf, match, parseUrl } from './http.ts'
 import type { LabState } from './shared.ts'
 import { authenticate, digest, hmacHex, lastJsonNumber, verifyExport } from './policy.ts'
-import { tenantBySlug } from './state.ts'
+import { exportPathPrefix, tenantBySlug } from './state.ts'
 
 export interface EdgeDeps {
   egress: Egress
@@ -90,10 +90,14 @@ export async function handleEdge(
       sendJson(res, 403, { error: 'export job does not match signed tenant' })
       return
     }
-    const prefix = `/files/export/${signedTenant}`
-    const allowed = state.profile.strictExportPath
-      ? url.pathname.startsWith(`${prefix}/`) && pathTenant === signedTenant
-      : url.pathname.startsWith(prefix)
+    const signedTenantId = tenantBySlug(state, signedTenant)
+    const pathTenantId = tenantBySlug(state, pathTenant)
+    const expectedPrefix = signedTenantId && pathTenantId
+      ? exportPathPrefix(state, signedTenantId, pathTenantId)
+      : null
+    const allowed = expectedPrefix !== null
+      && url.pathname.startsWith(expectedPrefix)
+      && (!state.profile.strictExportPath || signedTenantId === pathTenantId)
     if (!allowed) {
       state.emit('file.download_denied', { reason: 'path_scope', path: url.pathname, runId })
       sendJson(res, 403, { error: 'path outside signed prefix' })

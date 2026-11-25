@@ -56,7 +56,6 @@ export async function solveC2(ctx: SolverContext): Promise<CompositeProofReceipt
     rawBody: payload,
     headers: {
       'x-signature': ctx.hmac(secret, payload),
-      'x-lab-derived-from': ctx.digest(secret),
       'x-scope': 'settlement:write',
     },
   })
