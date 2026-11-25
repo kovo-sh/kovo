@@ -1,5 +1,5 @@
 /**
- * Guardian v4 recall benchmark core: pure, dependency-light helpers shared by the
+ * Kovo Hunter v4 recall benchmark core: pure, dependency-light helpers shared by the
  * live pipeline (`benchmark-live.ts`) and the CLI/orchestrator (`benchmark-recall.ts`).
  *
  * Nothing in this file talks to the network. It owns the funnel arithmetic, the
@@ -274,22 +274,22 @@ export function resolveBenchOrchestrationConfig(
   overrides: BenchmarkOrchestrationOverrides = {},
 ): BenchmarkOrchestrationConfig {
   const maxRequests = overrides.maxRequests
-    ?? readInt(env.GUARDIAN_BENCH_MAX_REQUESTS)
+    ?? readInt(env.KOVO_BENCH_MAX_REQUESTS)
     ?? BENCH_MAX_REQUESTS_DEFAULT
   const deadlineMs = overrides.deadlineMs
-    ?? readInt(env.GUARDIAN_BENCH_DEADLINE_MS)
+    ?? readInt(env.KOVO_BENCH_DEADLINE_MS)
     ?? BENCH_DEADLINE_MS_DEFAULT
   const probeConcurrency = clampInt(
-    overrides.probeConcurrency ?? readInt(env.GUARDIAN_BENCH_PROBE_CONCURRENCY) ?? BENCH_PROBE_CONCURRENCY_DEFAULT,
+    overrides.probeConcurrency ?? readInt(env.KOVO_BENCH_PROBE_CONCURRENCY) ?? BENCH_PROBE_CONCURRENCY_DEFAULT,
     1,
     BENCH_PROBE_CONCURRENCY_MAX,
   )
   const verifyConcurrency = clampInt(
-    overrides.verifyConcurrency ?? readInt(env.GUARDIAN_BENCH_VERIFY_CONCURRENCY) ?? BENCH_VERIFY_CONCURRENCY_DEFAULT,
+    overrides.verifyConcurrency ?? readInt(env.KOVO_BENCH_VERIFY_CONCURRENCY) ?? BENCH_VERIFY_CONCURRENCY_DEFAULT,
     1,
     BENCH_VERIFY_CONCURRENCY_MAX,
   )
-  const rawSlow = overrides.slowProbes ?? readInt(env.GUARDIAN_BENCH_SLOW_PROBES)
+  const rawSlow = overrides.slowProbes ?? readInt(env.KOVO_BENCH_SLOW_PROBES)
   return {
     maxRequests: Math.max(1, maxRequests),
     deadlineMs: Math.max(1_000, deadlineMs),
@@ -297,8 +297,8 @@ export function resolveBenchOrchestrationConfig(
     verifyConcurrency,
     slowProbes: rawSlow === null ? null : clampInt(rawSlow, 0, 64),
     classCaps: {
-      perEndpoint: { ...DEFAULT_PER_ENDPOINT_CLASS_CAPS, ...(overrides.classCaps?.perEndpoint ?? parseClassCapSpec(env.GUARDIAN_BENCH_CLASS_ENDPOINT_CAP)) },
-      perClass: { ...DEFAULT_PER_CLASS_CAPS, ...(overrides.classCaps?.perClass ?? parseClassCapSpec(env.GUARDIAN_BENCH_CLASS_CAP)) },
+      perEndpoint: { ...DEFAULT_PER_ENDPOINT_CLASS_CAPS, ...(overrides.classCaps?.perEndpoint ?? parseClassCapSpec(env.KOVO_BENCH_CLASS_ENDPOINT_CAP)) },
+      perClass: { ...DEFAULT_PER_CLASS_CAPS, ...(overrides.classCaps?.perClass ?? parseClassCapSpec(env.KOVO_BENCH_CLASS_CAP)) },
     },
   }
 }
@@ -832,7 +832,7 @@ const usd = (v: number | null): string => (v === null ? 'n/a' : `$${v.toFixed(4)
 export function formatBenchmarkMarkdown(result: BenchmarkSuiteResult): string {
   if (result.children?.length && result.suite === 'all') {
     return [
-      `# Guardian v4 Recall Benchmark: all suites`,
+      `# Kovo Hunter v4 Recall Benchmark: all suites`,
       '',
       `- Git SHA: \`${result.gitSha}\``,
       `- Baseline SHA: \`${result.baselineSha ?? 'none'}\``,
@@ -842,7 +842,7 @@ export function formatBenchmarkMarkdown(result: BenchmarkSuiteResult): string {
   }
   const diff = result.diff
   const lines: string[] = []
-  lines.push(`# Guardian v4 Recall Benchmark: ${result.suite}`)
+  lines.push(`# Kovo Hunter v4 Recall Benchmark: ${result.suite}`)
   lines.push('')
   lines.push(`- Git SHA: \`${result.gitSha}\``)
   lines.push(`- Baseline SHA: \`${result.baselineSha ?? 'none'}\`${diff && !diff.hasBaseline ? ' (no matching baseline run found)' : ''}`)

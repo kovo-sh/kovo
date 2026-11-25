@@ -287,7 +287,7 @@ export interface CompositeReceiptEdgeSummary {
   verified: boolean
 }
 
-export interface GuardianCompositeProofReceipt {
+export interface KovoCompositeProofReceipt {
   receiptId: string
   chainId: string
   targetId: string
@@ -330,7 +330,7 @@ export interface RunTelemetry {
 export interface OssGradeInput {
   anchors: OssAnchorManifest[]
   cleanControls: CleanNegativeControlSpec[]
-  receipts: GuardianCompositeProofReceipt[]
+  receipts: KovoCompositeProofReceipt[]
   oracleObservations: ExternalOracleObservation[]
   patchRetests: PatchRetestRecord[]
   telemetry: RunTelemetry

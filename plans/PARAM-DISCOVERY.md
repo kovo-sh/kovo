@@ -89,7 +89,7 @@ Product floor (`Execution --no-llm`), dev seed 1, three runs:
 
 Spread 0; decoy FPs 0; unmatched FPs 0.
 
-Salted held-out floor seed `1000042` (`GUARDIAN_RB_HELDOUT_SALT` from the owner-only file, never
+Salted held-out floor seed `1000042` (`KOVO_RB_HELDOUT_SALT` from the owner-only file, never
 printed), measured **after** merging the store-level `runtime_confirmed` receipt invariant:
 **25/58**, precision 100% (previous 24/58). The search finding satisfies the invariant
 (`provenance=floor`, `verification_class=runtime_confirmed`, `finding.verified`).

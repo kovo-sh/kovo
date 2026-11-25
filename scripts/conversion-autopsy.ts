@@ -16,7 +16,7 @@
 //   node scripts/conversion-autopsy.ts [--json <path>]
 //
 // Env:
-//   GUARDIAN_RB_HELDOUT_SALT  required for salted held-out seeds (or read from the owner-only
+//   KOVO_RB_HELDOUT_SALT  required for salted held-out seeds (or read from the owner-only
 //                             file listed below). The value is never printed.
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
@@ -53,7 +53,7 @@ const CELLS: Cell[] = [
 ]
 
 const HELDOUT_SALT_FILE = '/home/omarchy/.config/guardian-bench/heldout.salt'
-const VERIFY_TOOLS = new Set(['guardian_verify', 'verify_replay_spec'])
+const VERIFY_TOOLS = new Set(['kovo_verify', 'verify_replay_spec'])
 
 type Bucket = 'never_dispatched' | 'route_hit_no_verify' | 'verify_called_but_oracle_rejected' | 'probed_missed_bug'
 
@@ -62,7 +62,7 @@ type Route = { method: string, path: string }
 type ToolCall = { name: string, args: string }
 
 function readSalt(): string | undefined {
-  if (process.env.GUARDIAN_RB_HELDOUT_SALT) return process.env.GUARDIAN_RB_HELDOUT_SALT.trim()
+  if (process.env.KOVO_RB_HELDOUT_SALT) return process.env.KOVO_RB_HELDOUT_SALT.trim()
   if (existsSync(HELDOUT_SALT_FILE)) return readFileSync(HELDOUT_SALT_FILE, 'utf8').trim()
   return undefined
 }
@@ -211,13 +211,13 @@ function analyzeCell(cell: Cell, salt: string | undefined) {
   const dir = join(cell.root, 'data', cell.slug)
   const cellJson = JSON.parse(readFileSync(join(cell.root, `${cell.slug}.json`), 'utf8'))
   const meta = JSON.parse(readFileSync(join(cell.root, `${cell.slug}.meta.json`), 'utf8'))
-  if (!existsSync(join(dir, 'guardian.sqlite'))) throw new Error(`missing db for ${cell.slug}`)
+  if (!existsSync(join(dir, 'kovo.sqlite'))) throw new Error(`missing db for ${cell.slug}`)
 
   const plan = planFor(cell.app, cell.seed, salt)
   const bp = BLUEPRINTS[cell.app]!
   const specById = new Map(bp.sites.map((s) => [s.id, s] as const))
 
-  const db = new DatabaseSync(join(dir, 'guardian.sqlite'), { readOnly: true })
+  const db = new DatabaseSync(join(dir, 'kovo.sqlite'), { readOnly: true })
   const q = <T>(sql: string, ...params: any[]): T[] => db.prepare(sql).all(...params) as T[]
 
   const assignments = q<any>(`select id, step_id, status, turns_used, max_turns, requests_used, session_id, title, outcome

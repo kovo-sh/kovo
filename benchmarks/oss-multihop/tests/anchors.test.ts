@@ -21,7 +21,7 @@ import {
 import type {
   CleanNegativeControlSpec,
   ComposeServiceRole,
-  GuardianCompositeProofReceipt,
+  KovoCompositeProofReceipt,
   OssAnchorManifest,
 } from '../lib/types.ts'
 import * as giteaOracle from '../anchors/gitea/oracle.ts'
@@ -324,7 +324,7 @@ function validateLabComposeStaticSafety(
   return issues
 }
 
-function makeSyntheticCleanControlReceipt(controlId: string, runId: string): GuardianCompositeProofReceipt {
+function makeSyntheticCleanControlReceipt(controlId: string, runId: string): KovoCompositeProofReceipt {
   return {
     receiptId: `rcpt_fp_${controlId}`,
     chainId: `chain_fp_${controlId}`,

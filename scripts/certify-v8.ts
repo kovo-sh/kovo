@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Guardian v8 — M2 / M3 / M4 Scaling & Certification Scorecard CLI (`scripts/certify-v8.ts`).
+ * Kovo Hunter v8 — M2 / M3 / M4 Scaling & Certification Scorecard CLI (`scripts/certify-v8.ts`).
  *
- * Pure, deterministic grading and aggregation for Guardian v8 multi-hop certification per
+ * Pure, deterministic grading and aggregation for Kovo Hunter v8 multi-hop certification per
  * `plans/v8.md` §Milestones (M2, M3, M4):
  *  - Universal Precision Gate: 100.0% worst-run precision (0 hardened-twin decoy FPs,
  *    0 unmatched FPs, 0 OSS clean-control FPs across every single cell/repeat).
@@ -2434,7 +2434,7 @@ export function renderCalibrationMarkdown(report: V8CertificationReport): string
   const lines: string[] = []
   const gateUpper = report.gate.toUpperCase()
 
-  lines.push(`# Guardian v8 Calibration & Certification Scorecard (${gateUpper})`)
+  lines.push(`# Kovo Hunter v8 Calibration & Certification Scorecard (${gateUpper})`)
   lines.push('')
   lines.push(
     `**Verdict:** **${report.verdict}** · **Gate:** \`${gateUpper}\` · **Generated:** ${report.generatedAt} · **Git:** \`${report.gitSha}\``,
@@ -2860,7 +2860,7 @@ export function loadV7FloorInput(filePath: string): unknown {
 // CLI Parsing & Entrypoint
 // ---------------------------------------------------------------------------
 
-const USAGE = `Guardian v8 Scaling & Certification Scorecard CLI
+const USAGE = `Kovo Hunter v8 Scaling & Certification Scorecard CLI
 
 Usage:
   node scripts/certify-v8.ts --gate m2|m3|m4 --inputs <paths...> \\

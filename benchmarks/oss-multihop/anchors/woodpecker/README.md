@@ -46,7 +46,7 @@ docker compose -p oss-sealed-woodpecker-patched -f benchmarks/oss-multihop/ancho
 - **Oracle ID:** `ora-woodpecker-oob-01` (`loopback_oob_collector`)
 - **Target Service:** `woodpecker_secret_meta` (`internal_target`)
 - **Collector Endpoint:** `http://127.0.0.1:19402/oob/woodpecker` (strictly loopback)
-- **Signal Criteria:** `POST` request with path prefix `/oob/woodpecker/`, run-scoped canary token prefixed with `oss_canary_woodpecker_`, correlated via `X-Guardian-Run-Id`.
+- **Signal Criteria:** `POST` request with path prefix `/oob/woodpecker/`, run-scoped canary token prefixed with `oss_canary_woodpecker_`, correlated via `X-Kovo-Run-Id`.
 - **Evaluator:** `evaluateWoodpeckerOracle()` and `evaluatePairedBuilds()` delegate to `evaluateOracleEvidence()` in `../../lib/oracle-runner.ts`.
 
 ---

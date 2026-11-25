@@ -66,12 +66,12 @@ Six seeded personas: `owner_a`, `member_a`, `viewer_a`, `dual_member` (admin org
 ## Usage
 
 ```bash
-# dev seeds are 1..9999; held-out seeds need GUARDIAN_RB_HELDOUT_SALT (never committed)
+# dev seeds are 1..9999; held-out seeds need KOVO_RB_HELDOUT_SALT (never committed)
 node benchmarks/reason-bench/run.ts seeds --set dev --n 5
-GUARDIAN_RB_HELDOUT_SALT=... node benchmarks/reason-bench/run.ts seeds --set held-out --n 5
+KOVO_RB_HELDOUT_SALT=... node benchmarks/reason-bench/run.ts seeds --set held-out --n 5
 
 # boot a lab (prints the mode briefing JSON; artifacts written on Ctrl-C)
-GUARDIAN_ALLOW_LOCAL_LAB=1 node benchmarks/reason-bench/run.ts serve --app ledgerflow --seed 1 --mode grey-box
+KOVO_ALLOW_LOCAL_LAB=1 node benchmarks/reason-bench/run.ts serve --app ledgerflow --seed 1 --mode grey-box
 
 # grade a run
 node benchmarks/reason-bench/run.ts grade --truth t.json --findings f.json --events e.json \
@@ -81,7 +81,7 @@ node benchmarks/reason-bench/run.ts grade --truth t.json --findings f.json --eve
 node benchmarks/reason-bench/run.ts anti-heuristic-check --scorecard card.json --max-recall 0.15
 
 # app self-tests once the shells exist
-GUARDIAN_ALLOW_LOCAL_LAB=1 node benchmarks/reason-bench/run.ts selftest --app all --seeds 1,2,3
+KOVO_ALLOW_LOCAL_LAB=1 node benchmarks/reason-bench/run.ts selftest --app all --seeds 1,2,3
 ```
 
 Programmatic API (`run.ts`): `startReasonApp`, `gradeRun`, `renderScorecard`, `briefingFor`,
@@ -127,10 +127,10 @@ Programmatic API (`run.ts`): `startReasonApp`, `gradeRun`, `renderScorecard`, `b
 
 ## Safety
 
-Everything runs offline on `127.0.0.1:0`, requires `GUARDIAN_ALLOW_LOCAL_LAB=1`, uses only `node:*`
+Everything runs offline on `127.0.0.1:0`, requires `KOVO_ALLOW_LOCAL_LAB=1`, uses only `node:*`
 built-ins, confines outbound traffic to `lib/egress.ts`, confines file features to `lib/vfs.ts`,
 simulates shell execution, emits only synthetic `rb_fake_*`/`rbc_*`/`rbs_*` secrets, and scans
 materialized app trees for truth/solver/mode leakage. See `tests/safety.test.ts`.
 
 Typecheck: `node_modules/.bin/tsc -p benchmarks/reason-bench/tsconfig.json`
-Tests: `GUARDIAN_ALLOW_LOCAL_LAB=1 node --test benchmarks/reason-bench/tests/`
+Tests: `KOVO_ALLOW_LOCAL_LAB=1 node --test benchmarks/reason-bench/tests/`

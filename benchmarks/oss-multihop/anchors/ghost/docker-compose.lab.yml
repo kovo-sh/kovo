@@ -35,9 +35,9 @@ services:
       OSS_LAB_CONTRIBUTOR_CRED: "oss_lab_ghost_contributor"
       OSS_LAB_OWNER_CRED: "oss_lab_ghost_owner"
     labels:
-      guardian.oss_lab.target: "oss-dev-ghost-01"
-      guardian.oss_lab.split: "dev"
-      guardian.oss_lab.egress_policy: "deny_all_internal_only"
+      kovo.oss_lab.target: "oss-dev-ghost-01"
+      kovo.oss_lab.split: "dev"
+      kovo.oss_lab.egress_policy: "deny_all_internal_only"
 
   ghost_db:
     image: "mysql:8.0.39"
@@ -53,11 +53,11 @@ services:
       MYSQL_PASSWORD: "oss_lab_mysql_password_03"
       MYSQL_ROOT_PASSWORD: "oss_lab_mysql_root_03"
     labels:
-      guardian.oss_lab.target: "oss-dev-ghost-01"
-      guardian.oss_lab.role: "db"
+      kovo.oss_lab.target: "oss-dev-ghost-01"
+      kovo.oss_lab.role: "db"
 
   ghost_export_worker:
-    image: "${WORKER_IMAGE:-guardian-lab/ghost-preview-bot:1.0.0}"
+    image: "${WORKER_IMAGE:-kovo-lab/ghost-preview-bot:1.0.0}"
     networks:
       - lab_internal
     cap_drop:
@@ -72,5 +72,5 @@ services:
       OSS_LAB_OWNER_CRED: "oss_lab_ghost_owner"
       OSS_LAB_CANARY_PREFIX: "oss_canary_ghost_"
     labels:
-      guardian.oss_lab.target: "oss-dev-ghost-01"
-      guardian.oss_lab.role: "worker"
+      kovo.oss_lab.target: "oss-dev-ghost-01"
+      kovo.oss_lab.role: "worker"

@@ -121,7 +121,7 @@ function parseCommitBody(body: Buffer): { tree: string; parents: string[]; ts: n
 }
 
 /** Write a fresh repository (HEAD + refs + loose objects + working tree) from snapshots. */
-export function createGitRepo(dir: string, commits: CommitSpec[], author = 'Guardian QA'): GitCommit[] {
+export function createGitRepo(dir: string, commits: CommitSpec[], author = 'Kovo Hunter QA'): GitCommit[] {
   if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
   const gitDir = join(dir, '.git')
   mkdirSync(gitDir, { recursive: true })

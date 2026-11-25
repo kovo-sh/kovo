@@ -111,7 +111,7 @@ export async function handleApi(
     const raw = await readBody(req)
     const response = await deps.egress.fetch('idp', '/login', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-guardian-run-id': runId },
+      headers: { 'content-type': 'application/json', 'x-kovo-run-id': runId },
       body: raw,
     })
     sendJson(res, response.status, await response.json())
@@ -191,7 +191,7 @@ export async function handleApi(
           headers: {
             'content-type': 'application/json',
             'x-service-token': serviceToken(state),
-            'x-guardian-run-id': runId,
+            'x-kovo-run-id': runId,
           },
           body: JSON.stringify({ commentId: comment.id, runId }),
         })
@@ -523,7 +523,7 @@ export async function handleApi(
     // The worker scopes job reads to the caller tenant and tracks status polls per requester.
     const response = await deps.egress.fetch('docs-worker', exportResult ? `/jobs/${jobId}/result` : `/jobs/${jobId}`, {
       headers: {
-        'x-guardian-run-id': runId,
+        'x-kovo-run-id': runId,
         'x-lab-tenant': session.tenantId,
         'x-lab-requester': digest(`requester:${session.token}`),
       },

@@ -34,9 +34,9 @@ services:
       OSS_LAB_CONTRIB_CRED: "oss_lab_wp_contrib_a"
       OSS_LAB_MAINTAINER_CRED: "oss_lab_wp_maintainer_a"
     labels:
-      guardian.oss_lab.target: "oss-sealed-woodpecker-01"
-      guardian.oss_lab.split: "sealed"
-      guardian.oss_lab.egress_policy: "deny_all_internal_only"
+      kovo.oss_lab.target: "oss-sealed-woodpecker-01"
+      kovo.oss_lab.split: "sealed"
+      kovo.oss_lab.egress_policy: "deny_all_internal_only"
 
   woodpecker_agent:
     image: "${AGENT_IMAGE:-woodpeckerci/woodpecker-agent}:${APP_TAG:-v2.6.0}"
@@ -55,9 +55,9 @@ services:
       WOODPECKER_BACKEND: "local"
       OSS_LAB_CANARY_PREFIX: "oss_canary_woodpecker_"
     labels:
-      guardian.oss_lab.target: "oss-sealed-woodpecker-01"
-      guardian.oss_lab.split: "sealed"
-      guardian.oss_lab.role: "worker"
+      kovo.oss_lab.target: "oss-sealed-woodpecker-01"
+      kovo.oss_lab.split: "sealed"
+      kovo.oss_lab.role: "worker"
 
   woodpecker_db:
     image: "postgres:16.4-alpine"
@@ -72,12 +72,12 @@ services:
       POSTGRES_USER: "oss_lab_user"
       POSTGRES_PASSWORD: "oss_lab_wp_pg_password_02"
     labels:
-      guardian.oss_lab.target: "oss-sealed-woodpecker-01"
-      guardian.oss_lab.split: "sealed"
-      guardian.oss_lab.role: "db"
+      kovo.oss_lab.target: "oss-sealed-woodpecker-01"
+      kovo.oss_lab.split: "sealed"
+      kovo.oss_lab.role: "db"
 
   woodpecker_secret_meta:
-    image: "${INTERNAL_STUB_IMAGE:-guardian-lab/internal-stub:1.0.0}"
+    image: "${INTERNAL_STUB_IMAGE:-kovo-lab/internal-stub:1.0.0}"
     networks:
       - lab_internal
     read_only: true
@@ -89,6 +89,6 @@ services:
       OSS_LAB_RUNNER_TOKEN: "oss_lab_wp_runner_stub_01"
       OSS_LAB_CANARY_PREFIX: "oss_canary_woodpecker_"
     labels:
-      guardian.oss_lab.target: "oss-sealed-woodpecker-01"
-      guardian.oss_lab.split: "sealed"
-      guardian.oss_lab.role: "internal_target"
+      kovo.oss_lab.target: "oss-sealed-woodpecker-01"
+      kovo.oss_lab.split: "sealed"
+      kovo.oss_lab.role: "internal_target"

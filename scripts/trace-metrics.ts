@@ -1,12 +1,12 @@
 /**
- * Guardian v5.1 — trace metrics CLI.
+ * Kovo Hunter v5.1 — trace metrics CLI.
  *
- * Reads `.guardian/traces/<id>/` (manifest + events) and computes the nine fast-loop metrics
+ * Reads `.kovo/traces/<id>/` (manifest + events) and computes the nine fast-loop metrics
  * accepted in plans/ROADMAP-v5.md. Prints a compact table (or `--json`) and never dumps raw
  * prompts or HTTP bodies.
  *
  * Usage:
- *   node scripts/trace-metrics.ts --trace .guardian/traces/<id>
+ *   node scripts/trace-metrics.ts --trace .kovo/traces/<id>
  *   node scripts/trace-metrics.ts --trace <dir> --control <summary.json> --json
  *   node scripts/trace-metrics.ts --trace <dir> --gate
  */

@@ -38,7 +38,7 @@ function jwtBodySpecs(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
     if (!path.startsWith('/') || !/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(field)) continue
     const subject = typeof a.subject === 'string' && /^[A-Za-z0-9@._:-]{1,128}$/.test(a.subject) ? a.subject : null
     if (!subject) continue
-    const bogus = `guardian-no-such-subject-${randomBytes(4).toString('hex')}`
+    const bogus = `kovo-no-such-subject-${randomBytes(4).toString('hex')}`
     const method = String(a.method ?? 'POST').toUpperCase() === 'POST' ? 'POST' : 'POST'
     const encoding = a.encoding === 'form' || a.bodyEncoding === 'form' ? 'form' : 'json'
     const extra = a.body && typeof a.body === 'object' && !Array.isArray(a.body) ? a.body as Record<string, unknown> : {}
@@ -127,11 +127,11 @@ function oauthSpecs(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[] {
   const path = o.hyp.endpoint.path.split('?')[0]
   const challenge = 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM'
   const withParams = (set: Record<string, string>) => {
-    const u = new URL(seed ? `${path}?${seed}` : path, 'http://guardian.invalid')
+    const u = new URL(seed ? `${path}?${seed}` : path, 'http://kovo.invalid')
     for (const [k, v] of Object.entries(set)) u.searchParams.set(k, v)
     return u.pathname + u.search
   }
-  const orig = (() => { try { return new URL(new URL(`${path}?${seed ?? ''}`, 'http://guardian.invalid').searchParams.get('redirect_uri') ?? 'https://app.example.invalid/cb') } catch { return new URL('https://app.example.invalid/cb') } })()
+  const orig = (() => { try { return new URL(new URL(`${path}?${seed ?? ''}`, 'http://kovo.invalid').searchParams.get('redirect_uri') ?? 'https://app.example.invalid/cb') } catch { return new URL('https://app.example.invalid/cb') } })()
   const seedVariants: Record<string, string> = {
     userinfo_at: `https://${orig.host}@evil.invalid/cb`,
     backslash_at: `https://${orig.host}\\@evil.invalid/cb`,
@@ -216,7 +216,7 @@ export function synthCache(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
   if (!poison && !deception) return []
   const basePath = probePathFor(o.hyp)
   const path = basePath.replace(/\/+$/, '') || '/'
-  const marker = 'guardian-cache-probe'
+  const marker = 'kovo-cache-probe'
   const out: SynthesizedSpec[] = []
 
   // Header-free cache: the lab cache emits no Age/X-Cache, so persistence is proven from the body
@@ -239,12 +239,12 @@ export function synthCache(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
     const explicitControl = typeof poison.controlPath === 'string' && poison.controlPath.startsWith('/') ? poison.controlPath : null
     let controlWarmPath = explicitControl ?? warmPath
     if (!explicitControl && keyParam && controlKey) {
-      const url = new URL(warmPath, 'http://guardian.invalid')
+      const url = new URL(warmPath, 'http://kovo.invalid')
       url.searchParams.set(keyParam, controlKey)
       controlWarmPath = url.pathname + url.search
     }
     const stripGcb = (p: string): string => {
-      const url = new URL(p, 'http://guardian.invalid')
+      const url = new URL(p, 'http://kovo.invalid')
       url.searchParams.delete('_gcb')
       return url.pathname + (url.search || '')
     }
@@ -303,9 +303,9 @@ export function synthCache(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
 
   if (deception) {
     const observedUrl = typeof deception.deceptionUrl === 'string' ? deception.deceptionUrl : ''
-    let deceptionPath = `${path}/guardian-static.css`
+    let deceptionPath = `${path}/kovo-static.css`
     try {
-      const parsed = new URL(observedUrl, 'http://guardian.invalid')
+      const parsed = new URL(observedUrl, 'http://kovo.invalid')
       if (parsed.pathname && parsed.pathname !== '/') deceptionPath = parsed.pathname
     } catch { /* keep generic static suffix */ }
     const jq = '{ controlPassed: (.cacheProof.cacheHitObserved == true), ' +

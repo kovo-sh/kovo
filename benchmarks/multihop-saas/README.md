@@ -14,7 +14,7 @@ benchmarks, and does not feed any result back into the engine.
 
 ```bash
 # Every command that starts a service requires the explicit lab gate.
-export GUARDIAN_ALLOW_LOCAL_LAB=1
+export KOVO_ALLOW_LOCAL_LAB=1
 
 node benchmarks/multihop-saas/run.ts list
 node benchmarks/multihop-saas/run.ts seeds --set dev --n 5
@@ -29,7 +29,7 @@ Validation:
 
 ```bash
 node_modules/.bin/tsc -p benchmarks/multihop-saas/tsconfig.json
-GUARDIAN_ALLOW_LOCAL_LAB=1 node --test benchmarks/multihop-saas/tests/
+KOVO_ALLOW_LOCAL_LAB=1 node --test benchmarks/multihop-saas/tests/
 ```
 
 ---
@@ -38,7 +38,7 @@ GUARDIAN_ALLOW_LOCAL_LAB=1 node --test benchmarks/multihop-saas/tests/
 
 | Invariant | Enforcement |
 |---|---|
-| Local lab gate | `assertLocalLabAllowed()` must pass (`GUARDIAN_ALLOW_LOCAL_LAB=1`) before any server starts; checked in `run.ts`, `startPaygrid`, `startServices`, `listenLoopback`, `egress.fetch`. |
+| Local lab gate | `assertLocalLabAllowed()` must pass (`KOVO_ALLOW_LOCAL_LAB=1`) before any server starts; checked in `run.ts`, `startPaygrid`, `startServices`, `listenLoopback`, `egress.fetch`. |
 | Loopback only | Only `lib/safety.ts` may call `.listen(...)`; it binds `127.0.0.1` port `0` and rejects any other address. `tests/safety.test.ts` scans the whole tree. |
 | Zero dependencies | Imports are only `node:*` or relative `.ts` files. No nested `package.json`. |
 | No dynamic execution | No `child_process`, `eval`, `new Function`, `vm`, or `worker_threads` anywhere. |
@@ -97,7 +97,7 @@ B2B fintech — billing, ledger and payouts.
   Tenant slugs always prefix-overlap (`acme`, `acme-systems`, `acme-systems-treasury`) so the
   signed-prefix defect is reachable.
 - **Lifecycle hooks:** invite create/revoke, PAT create/revoke, session revoke, export job
-  create/cancel, key rotation, and `X-Guardian-Run-Id` propagation onto every created entity.
+  create/cancel, key rotation, and `X-Kovo-Run-Id` propagation onto every created entity.
 - **Async latency:** `asyncLatencyMs` is configurable (`fast-lab` profiles are typically 5–50 ms;
   WAN/endurance profiles can set 15–30 s). Jobs converge through bounded polling.
 
@@ -150,7 +150,7 @@ fresh temporary tree that `scanTreeForLeakage` has already cleared.
 
 - **Dev:** integers `1..9999`. Reproducible from the repository.
 - **Held-out:** integers `>= 1_000_000`, derived/reproduced with
-  `GUARDIAN_RB_HELDOUT_SALT` (>= 16 chars, owner-only, never committed). Never pass a salt on the
+  `KOVO_RB_HELDOUT_SALT` (>= 16 chars, owner-only, never committed). Never pass a salt on the
   command line; held-out variants are keyed by HMAC-SHA256.
 
 Semantic variation changes tenant slugs, user ids, emails, invite material, resource ids, secrets,

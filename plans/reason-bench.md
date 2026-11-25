@@ -23,7 +23,7 @@ Real-world critical vulnerabilities that escape every deterministic DAST/SAST to
 ### Binding Anti-Heuristic CI Contract
 Every planted vulnerability in `reason-bench` **MUST** pass two automated gates before merging:
 1. **Twin Soundness Gate:** Its `solver.ts` emits `>= 1` attributed impact-oracle event on `vulnerable.ts` and **`0` events** on `hardened.ts`; normal benign traffic emits **`0` events** across all hardened apps.
-2. **Anti-Heuristic Gate (`--no-llm` Ceiling):** Running Guardian's `Execution --no-llm` (and the procedural deterministic harness) against the site must score **`0` confirmed** (overall benchmark `--no-llm` floor strictly **`<= 10%`**). If a general deterministic heuristic solves a site, the site is either redesigned or moved to `realistic-bench`.
+2. **Anti-Heuristic Gate (`--no-llm` Ceiling):** Running Kovo Hunter's `Execution --no-llm` (and the procedural deterministic harness) against the site must score **`0` confirmed** (overall benchmark `--no-llm` floor strictly **`<= 10%`**). If a general deterministic heuristic solves a site, the site is either redesigned or moved to `realistic-bench`.
 
 ---
 
@@ -31,11 +31,11 @@ Every planted vulnerability in `reason-bench` **MUST** pass two automated gates 
 
 `benchmarks/reason-bench/` inherits every hard safety rule enforced by `realistic-bench/tests/safety.test.ts`:
 - **Runtime:** Node 24+ native TypeScript (`.ts` imports, erasable syntax, **zero npm dependencies** — `node:*` built-ins only).
-- **Local-Lab Gate:** Every entrypoint calls `assertLocalLabAllowed()` (`GUARDIAN_ALLOW_LOCAL_LAB=1` required).
+- **Local-Lab Gate:** Every entrypoint calls `assertLocalLabAllowed()` (`KOVO_ALLOW_LOCAL_LAB=1` required).
 - **Loopback Only:** Servers bind strictly to `127.0.0.1` port `0`; outbound fetches flow exclusively through `lib/egress.ts` (loopback + registered internal mock ports + caller-supplied `oobCallbackPorts`, 2s timeout, 64 KiB cap, no off-allowlist redirects).
 - **No Real Host Side Effects:** Virtual in-memory filesystem (`lib/vfs.ts`), simulated PDF/template renderer (pure-JS bounded interpreter, zero `eval`/`new Function`/`vm`/`child_process`), synthetic secrets (`rb_fake_*`, `rbs_*`).
 - **Leakage-Scanned Materialization:** White-box materialization writes neutral app source (`src/` + `ui/` + `variant.json`) into a temp dir with zero `truth/`, `solver.ts`, or marker strings matching `/vulnerab|hardened|decoy|oracle|solver|CWE-|ground.?truth/i`.
-- **Salted Held-Out Seeds:** Dev seeds `1..9999` for iteration; held-out seeds `>= 1_000_000` keyed by HMAC-SHA256 over `GUARDIAN_RB_HELDOUT_SALT` (refused without salt; never serialized into `variant.json`).
+- **Salted Held-Out Seeds:** Dev seeds `1..9999` for iteration; held-out seeds `>= 1_000_000` keyed by HMAC-SHA256 over `KOVO_RB_HELDOUT_SALT` (refused without salt; never serialized into `variant.json`).
 
 ---
 
@@ -180,7 +180,7 @@ Zero `FLAG{}` strings; all impact is proven externally from DB state diffs, ledg
 
 | Metric | Definition | Target Calibration |
 | --- | --- | --- |
-| **Heuristic Floor (`--no-llm`)** | Confirmed recall of Guardian `Execution --no-llm` (and procedural harness) | **MUST be `<= 10–15%`** (sanity check proving benchmark resists heuristics) |
+| **Heuristic Floor (`--no-llm`)** | Confirmed recall of Kovo Hunter `Execution --no-llm` (and procedural harness) | **MUST be `<= 10–15%`** (sanity check proving benchmark resists heuristics) |
 | **Pure Reasoning Lift (`ΔReasoning`)** | `Agentic Confirmed Recall - Heuristic Floor` (on both dev & salted held-out) | Primary north-star KPI for agentic improvements (target `>= +35–55pp` for frontier/tuned agentic) |
 | **Precision & Decoy FP Rate** | `TP / (TP + decoyFP + unmatchedFP)` and `decoyFP / totalDecoys` | **`>= 95%` precision**, **`0` decoy FPs** |
 | **Strict Causal Chain Completion** | Chains where `ChainOracle` observed all prerequisite hops + final impact in order | Reported separately from single-site recall |
@@ -189,11 +189,11 @@ Zero `FLAG{}` strings; all impact is proven externally from DB state diffs, ledg
 
 ---
 
-## 6. Guardian Integration (`scripts/benchmark-reason.ts`)
+## 6. Kovo Hunter Integration (`scripts/benchmark-reason.ts`)
 
 Add a thin CLI runner (`"benchmark:reason"` in `package.json`) reusing M0's `Execution` harness and Day-1 fast-loop infrastructure:
 - `--app ledgerflow|forgecloud|all`
-- `--seed <n>` / `--seeds 1,2,3` / `--held-out` (`GUARDIAN_RB_HELDOUT_SALT`)
+- `--seed <n>` / `--seeds 1,2,3` / `--held-out` (`KOVO_RB_HELDOUT_SALT`)
 - `--mode black-box|grey-box|white-box`
 - `--no-llm` (runs the Anti-Heuristic Gate directly)
 - `--budget-usd <n>` / `--max-duration-ms <n>` (supports `10m`, `30m`, `45m`, `60m` scaling tests)
@@ -209,13 +209,13 @@ Add a thin CLI runner (`"benchmark:reason"` in `package.json`) reusing M0's `Exe
 | **M1 — `ledgerflow` Pilot MVP (10 sites + 4 decoys)** | 2 sites each from Families A–E (`lf-01,04,05,07,08,09,11,12,13,14`) + 4 hard decoys (`lf-d1..d4`) + minimal SPA UI | `benchmarks/reason-bench/apps/ledgerflow/**`, `tests/ledgerflow.test.ts` | All 10 vulnerable twins fire, all 10 hardened twins & 4 decoys stay silent; **`Execution --no-llm <= 1/10`** |
 | **M2 — Complete `ledgerflow` (14 sites + 5 decoys)** | Add remaining 4 sites (`lf-02,03,06,10`) + `lf-d5` + 30-seed soundness sweep (dev + salted held-out) | `benchmarks/reason-bench/apps/ledgerflow/**`, `tests/soundness.test.ts` | 14/14 vulnerable fire, 0 benign events across seeds 1–30, leakage scan 100% clean |
 | **M3 — `forgecloud` (14 sites + 5 decoys)** | Build all 14 `forgecloud` sites (`fc-01..fc-14`) + 5 hard decoys (`fc-d1..d5`) + SSE/PDF/OIDC/batch/cache/chain monitors + SPA UI | `benchmarks/reason-bench/apps/forgecloud/**`, `tests/forgecloud.test.ts` | 14/14 vulnerable fire, 0 benign/decoy events, **`Execution --no-llm <= 1/14`** |
-| **M4 — Guardian Harness & Calibration Baseline** | Wire `scripts/benchmark-reason.ts`, run anti-heuristic gate across all 28 sites, capture baseline `--no-llm` vs. Agentic (`deepseek-v4.1-flash`, grey-box & white-box, 10m vs. 45m, dev & salted held-out), publish `CALIBRATION.md` | `scripts/benchmark-reason.ts`, `package.json`, `benchmarks/reason-bench/CALIBRATION.md` | `--no-llm <= 10%` overall, `0` orphans, calibrated `ΔReasoning` baseline published |
+| **M4 — Kovo Hunter Harness & Calibration Baseline** | Wire `scripts/benchmark-reason.ts`, run anti-heuristic gate across all 28 sites, capture baseline `--no-llm` vs. Agentic (`deepseek-v4.1-flash`, grey-box & white-box, 10m vs. 45m, dev & salted held-out), publish `CALIBRATION.md` | `scripts/benchmark-reason.ts`, `package.json`, `benchmarks/reason-bench/CALIBRATION.md` | `--no-llm <= 10%` overall, `0` orphans, calibrated `ΔReasoning` baseline published |
 
 ---
 
-## 8. Expected Diagnostic Value for Guardian's Agentic Layer
+## 8. Expected Diagnostic Value for Kovo Hunter's Agentic Layer
 
-Once M1 (`ledgerflow` 10-site pilot) is live, `reason-bench` immediately answers the hardest engineering questions for Guardian's agentic layer:
+Once M1 (`ledgerflow` 10-site pilot) is live, `reason-bench` immediately answers the hardest engineering questions for Kovo Hunter's agentic layer:
 - **Do typed proof compilers (`prove_business_invariant`, `prove_state_mutation_diff`) unlock Family A/B?**
 - **Does the typed `artifactRegistry` + explicit chain archetypes unlock Family E (`lf-13`, `lf-14`, `fc-10`, `fc-11`)?**
 - **Does a 45-minute multi-wave production run genuinely beat a 10-minute run on multi-step workflows and chains?**

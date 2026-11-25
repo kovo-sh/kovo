@@ -10,7 +10,7 @@
 #
 # Env:
 #   HILLCLIMB_OUT              output directory (default /tmp/hillclimb-loop-<timestamp>)
-#   GUARDIAN_DATA_DIR          model data dir (default /home/omarchy/guardian-data)
+#   KOVO_DATA_DIR          model data dir (default /home/omarchy/guardian-data)
 #   HILLCLIMB_SKIP_AGENTIC=1   skip the agentic leg
 #   HILLCLIMB_SKIP_REALISTIC=1 skip the realistic leg
 #
@@ -25,7 +25,7 @@ if [[ "$MODE" != "--smoke" && "$MODE" != "--full" ]]; then
   exit 2
 fi
 OUT="${HILLCLIMB_OUT:-/tmp/hillclimb-loop-$(date +%Y%m%d-%H%M%S)}"
-DATA_DIR="${GUARDIAN_DATA_DIR:-/home/omarchy/guardian-data}"
+DATA_DIR="${KOVO_DATA_DIR:-/home/omarchy/guardian-data}"
 mkdir -p "$OUT"
 
 run() {
@@ -35,10 +35,10 @@ run() {
 
 if [[ "${HILLCLIMB_SKIP_REALISTIC:-0}" != "1" ]]; then
   if [[ "$MODE" == "--full" ]]; then
-    run realistic env GUARDIAN_ALLOW_LOCAL_LAB=1 node "$ROOT/scripts/benchmark-realistic-matrix.ts" \
+    run realistic env KOVO_ALLOW_LOCAL_LAB=1 node "$ROOT/scripts/benchmark-realistic-matrix.ts" \
       --apps acme-saas,shopflow,opsportal --seeds 42,1,2 --concurrency 9 --out-dir "$OUT/rb"
   else
-    run realistic env GUARDIAN_ALLOW_LOCAL_LAB=1 node "$ROOT/scripts/benchmark-realistic-matrix.ts" \
+    run realistic env KOVO_ALLOW_LOCAL_LAB=1 node "$ROOT/scripts/benchmark-realistic-matrix.ts" \
       --apps acme-saas,shopflow,opsportal --seeds 42 --concurrency 9 --out-dir "$OUT/rb"
   fi
 fi
@@ -48,11 +48,11 @@ if [[ "${HILLCLIMB_SKIP_AGENTIC:-0}" != "1" ]]; then
     echo "agentic: skipped (docker socket unavailable; run under: newgrp docker -c 'bash scripts/hillclimb-loop.sh')" >"$OUT/agentic.log"
     echo 0 >"$OUT/agentic.rc"
   elif [[ "$MODE" == "--full" ]]; then
-    run agentic env GUARDIAN_ALLOW_LOCAL_LAB=1 node "$ROOT/scripts/benchmark-agentic-matrix.ts" \
+    run agentic env KOVO_ALLOW_LOCAL_LAB=1 node "$ROOT/scripts/benchmark-agentic-matrix.ts" \
       --apps acme-saas,shopflow,opsportal --seeds 1 --modes grey-box --budget-usd 2 \
       --max-duration-ms 600000 --concurrency 3 --data-dir "$DATA_DIR" --verifier docker --out-dir "$OUT/ag"
   else
-    run agentic env GUARDIAN_ALLOW_LOCAL_LAB=1 node "$ROOT/scripts/benchmark-agentic-matrix.ts" \
+    run agentic env KOVO_ALLOW_LOCAL_LAB=1 node "$ROOT/scripts/benchmark-agentic-matrix.ts" \
       --apps acme-saas,shopflow,opsportal --seeds 1 --modes grey-box --smoke \
       --concurrency 3 --data-dir "$DATA_DIR" --verifier docker --out-dir "$OUT/ag"
   fi

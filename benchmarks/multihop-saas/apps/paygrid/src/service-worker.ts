@@ -40,7 +40,7 @@ async function processJob(state: LabState, job: JobRecord, egress: Egress): Prom
   }
   const response = await egress.fetch('vault.internal', '/internal/render-hook', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-guardian-run-id': job.runId },
+    headers: { 'content-type': 'application/json', 'x-kovo-run-id': job.runId },
     body: JSON.stringify({ invoiceId: job.invoiceId, templateId: job.templateId, runId: job.runId }),
   })
   const text = await response.text()

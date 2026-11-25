@@ -1,6 +1,6 @@
 # Held-Out Modern SaaS Lab ("Orbit Workspace")
 
-Guardian v4 Suite C: 20 planted High/Critical vulnerabilities + 6 hard decoys in a multi-tenant SaaS.
+Kovo Hunter v4 Suite C: 20 planted High/Critical vulnerabilities + 6 hard decoys in a multi-tenant SaaS.
 Pure Node.js stdlib (`node:http`, `node:crypto`, `node:sqlite`), synthetic data only, no npm install, no disk writes.
 
 | File | Purpose |
@@ -15,7 +15,7 @@ Pure Node.js stdlib (`node:http`, `node:crypto`, `node:sqlite`), synthetic data 
 
 ## Safety
 
-- Loopback only: the in-process launcher refuses non-loopback hosts unless `GUARDIAN_LAB=1` (set by LabRunner).
+- Loopback only: the in-process launcher refuses non-loopback hosts unless `KOVO_LAB=1` (set by LabRunner).
 - The only outbound primitive (`fetchLoopback`) refuses everything except `127.0.0.1` / `localhost` / `::1`
   (SSRF, XXE-OOB and JWT `jku` sinks).
 - XXE `file://` and path traversal resolve against an in-memory virtual file system, never the host.

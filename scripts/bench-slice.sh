@@ -3,10 +3,10 @@
 # statuses for the selected class. Uses the existing procedural driver; no ad-hoc scripts.
 #
 # Usage:
-#   GUARDIAN_ALLOW_LOCAL_LAB=1 scripts/bench-slice.sh --app shopflow [--class jwt]
+#   KOVO_ALLOW_LOCAL_LAB=1 scripts/bench-slice.sh --app shopflow [--class jwt]
 #       [--seed 42] [--split dev|heldout] [--mode grey-box] [--out-dir /tmp/...]
 #
-# Held-out requires GUARDIAN_RB_HELDOUT_SALT in the environment.
+# Held-out requires KOVO_RB_HELDOUT_SALT in the environment.
 set -uo pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -24,13 +24,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$APP" ]] || { echo "--app is required" >&2; exit 2; }
-[[ "$SPLIT" == "heldout" && "${GUARDIAN_RB_HELDOUT_SALT:-}" == "" ]] && { echo "heldout requires GUARDIAN_RB_HELDOUT_SALT" >&2; exit 2; }
+[[ "$SPLIT" == "heldout" && "${KOVO_RB_HELDOUT_SALT:-}" == "" ]] && { echo "heldout requires KOVO_RB_HELDOUT_SALT" >&2; exit 2; }
 mkdir -p "$OUT"
 JSON="$OUT/score.json"
 LOG="$OUT/run.log"
 
 SLICE_ARGS=(--app "$APP" --seed "$SEED" --split "$SPLIT" --mode "$MODE" --out-json "$JSON" --out-findings "$OUT/findings.json")
-if ! GUARDIAN_ALLOW_LOCAL_LAB=1 node "$ROOT/benchmarks/realistic-bench/benchmark-realistic.ts" "${SLICE_ARGS[@]}" >"$LOG" 2>&1; then
+if ! KOVO_ALLOW_LOCAL_LAB=1 node "$ROOT/benchmarks/realistic-bench/benchmark-realistic.ts" "${SLICE_ARGS[@]}" >"$LOG" 2>&1; then
   echo "slice failed; tail:" >&2; tail -12 "$LOG" >&2; exit 1
 fi
 

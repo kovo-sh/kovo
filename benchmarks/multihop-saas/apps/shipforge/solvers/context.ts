@@ -43,7 +43,7 @@ function response(status: number, text: string): SolverResponse {
 export function createSolverContext(lab: StartedShipforge): SolverContext {
   const call = async (url: string, request: SolverRequest = {}): Promise<SolverResponse> => {
     const headers: Record<string, string> = {
-      'x-guardian-run-id': lab.runId,
+      'x-kovo-run-id': lab.runId,
       ...(request.headers ?? {}),
     }
     if (request.token) headers.authorization = `Bearer ${request.token}`

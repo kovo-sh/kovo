@@ -6,11 +6,11 @@
  * JSON and prints aggregate metrics (no raw logs).
  *
  * Usage:
- *   GUARDIAN_ALLOW_LOCAL_LAB=1 node scripts/benchmark-realistic-matrix.ts \
+ *   KOVO_ALLOW_LOCAL_LAB=1 node scripts/benchmark-realistic-matrix.ts \
  *     --apps acme-saas,shopflow,opsportal --seeds 42,1,2 --split dev \
  *     --concurrency 9 --out-dir /tmp/rb-matrix
  *
- * Held-out runs additionally need GUARDIAN_RB_HELDOUT_SALT (>=16 chars, never committed).
+ * Held-out runs additionally need KOVO_RB_HELDOUT_SALT (>=16 chars, never committed).
  */
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
@@ -61,11 +61,11 @@ function parseArgs(argv: readonly string[]): {
     probeConcurrency: undefined as number | undefined,
     verifyConcurrency: undefined as number | undefined,
     slowProbes: undefined as number | undefined,
-    minFreeMemGb: Number(process.env.GUARDIAN_MATRIX_MIN_FREE_GB) > 0
-      ? Number(process.env.GUARDIAN_MATRIX_MIN_FREE_GB) : DEFAULT_MIN_FREE_MEM_GB,
-    maxActiveWorkers: Number(process.env.GUARDIAN_MATRIX_MAX_WORKERS) >= 1
-      ? Math.floor(Number(process.env.GUARDIAN_MATRIX_MAX_WORKERS)) : DEFAULT_MAX_ACTIVE_WORKERS,
-    warmWorkers: !envFlagDisabled(process.env, 'GUARDIAN_WARM_WORKERS'),
+    minFreeMemGb: Number(process.env.KOVO_MATRIX_MIN_FREE_GB) > 0
+      ? Number(process.env.KOVO_MATRIX_MIN_FREE_GB) : DEFAULT_MIN_FREE_MEM_GB,
+    maxActiveWorkers: Number(process.env.KOVO_MATRIX_MAX_WORKERS) >= 1
+      ? Math.floor(Number(process.env.KOVO_MATRIX_MAX_WORKERS)) : DEFAULT_MAX_ACTIVE_WORKERS,
+    warmWorkers: !envFlagDisabled(process.env, 'KOVO_WARM_WORKERS'),
   }
   const int = (arg: string, value: string, min: number, max: number): number => {
     const n = Number(value)
@@ -114,8 +114,8 @@ function parseArgs(argv: readonly string[]): {
     if (out.apps.length === 0) throw new Error('No apps selected')
     if (out.seeds.length === 0) throw new Error('No seeds selected')
   }
-  if (out.suite === 'realistic' && out.split === 'heldout' && (process.env.GUARDIAN_RB_HELDOUT_SALT ?? '').length < 16) {
-    throw new Error('heldout requires GUARDIAN_RB_HELDOUT_SALT (>=16 chars)')
+  if (out.suite === 'realistic' && out.split === 'heldout' && (process.env.KOVO_RB_HELDOUT_SALT ?? '').length < 16) {
+    throw new Error('heldout requires KOVO_RB_HELDOUT_SALT (>=16 chars)')
   }
   return out
 }
@@ -139,17 +139,17 @@ function readScorecard(file: string): Partial<CellResult> | null {
 export function orchestrationEnv(opts: ReturnType<typeof parseArgs>, cell: Cell): Record<string, string> {
   const id = cellLabel(opts.suite === 'realistic' ? `realistic-${cell.app}-seed${cell.seed}` : `${opts.suite}-seed${cell.seed}`)
   const env: Record<string, string> = {
-    GUARDIAN_ALLOW_LOCAL_LAB: '1',
+    KOVO_ALLOW_LOCAL_LAB: '1',
     // Cell isolation: stable label + unique data dir + unique run label per cell.
-    GUARDIAN_CELL_ID: id,
-    GUARDIAN_RUN_LABEL: id,
-    GUARDIAN_DATA_DIR: resolve(opts.outDir, 'cells', id, 'data'),
-    GUARDIAN_WARM_WORKERS: opts.warmWorkers ? '1' : '0',
+    KOVO_CELL_ID: id,
+    KOVO_RUN_LABEL: id,
+    KOVO_DATA_DIR: resolve(opts.outDir, 'cells', id, 'data'),
+    KOVO_WARM_WORKERS: opts.warmWorkers ? '1' : '0',
   }
-  if (opts.maxRequests !== undefined) env.GUARDIAN_BENCH_MAX_REQUESTS = String(opts.maxRequests)
-  if (opts.probeConcurrency !== undefined) env.GUARDIAN_BENCH_PROBE_CONCURRENCY = String(opts.probeConcurrency)
-  if (opts.verifyConcurrency !== undefined) env.GUARDIAN_BENCH_VERIFY_CONCURRENCY = String(opts.verifyConcurrency)
-  if (opts.slowProbes !== undefined) env.GUARDIAN_BENCH_SLOW_PROBES = String(opts.slowProbes)
+  if (opts.maxRequests !== undefined) env.KOVO_BENCH_MAX_REQUESTS = String(opts.maxRequests)
+  if (opts.probeConcurrency !== undefined) env.KOVO_BENCH_PROBE_CONCURRENCY = String(opts.probeConcurrency)
+  if (opts.verifyConcurrency !== undefined) env.KOVO_BENCH_VERIFY_CONCURRENCY = String(opts.verifyConcurrency)
+  if (opts.slowProbes !== undefined) env.KOVO_BENCH_SLOW_PROBES = String(opts.slowProbes)
   return env
 }
 
@@ -205,8 +205,8 @@ function runCell(cell: Cell, opts: ReturnType<typeof parseArgs>): Promise<CellRe
 
 async function main(): Promise<number> {
   const opts = parseArgs(process.argv.slice(2))
-  if (opts.suite === 'realistic' && opts.split === 'heldout' && !process.env.GUARDIAN_RB_HELDOUT_SALT) {
-    console.error('heldout split requires GUARDIAN_RB_HELDOUT_SALT')
+  if (opts.suite === 'realistic' && opts.split === 'heldout' && !process.env.KOVO_RB_HELDOUT_SALT) {
+    console.error('heldout split requires KOVO_RB_HELDOUT_SALT')
     return 2
   }
   mkdirSync(opts.outDir, { recursive: true })

@@ -1,6 +1,6 @@
 // Realism Fixture #3 — staging safety contract + concurrency.
 // A shared stateful store under `staging_isolated` semantics: run-scoped entity tagging
-// (`guardian-qa-<runId>-`), write-BOLA, a multi-step checkout that trusts client pricing,
+// (`kovo-qa-<runId>-`), write-BOLA, a multi-step checkout that trusts client pricing,
 // and an HTTP/2 (h2c) transfer endpoint that loses the single-packet race.
 import { createServer as createH2Server, type Http2ServerRequest, type Http2ServerResponse } from 'node:http2'
 import { Router, bearer, headerValue, jsonBody, sendJson, serve, type Ctx } from '../../lib/http.ts'
@@ -9,7 +9,7 @@ import { MemStore, type Row } from '../../lib/store.ts'
 import { hexToken } from '../../lib/rand.ts'
 import type { ApiRefEntry, FixtureStartOptions, Persona, StartedFixture } from '../../lib/types.ts'
 
-export const RUN_TAG_PREFIX = 'guardian-qa-'
+export const RUN_TAG_PREFIX = 'kovo-qa-'
 
 interface UserRow {
   id: string
@@ -93,7 +93,7 @@ export async function start(options: FixtureStartOptions = {}): Promise<StagingF
   }
 
   function runIdOf(ctx: Ctx): string | null {
-    const raw = headerValue(ctx, 'x-guardian-run-id')
+    const raw = headerValue(ctx, 'x-kovo-run-id')
     if (!raw) return null
     return /^[\w.-]{1,64}$/.test(raw) ? raw : null
   }
@@ -359,7 +359,7 @@ export async function start(options: FixtureStartOptions = {}): Promise<StagingF
 
   const apiRef: ApiRefEntry[] = [
     { origin: 'app', method: 'GET', path: '/v1/invoices/:id', auth: 'tenant', notes: 'ownership enforced' },
-    { origin: 'app', method: 'PATCH', path: '/v1/invoices/:id', auth: 'tenant', notes: 'JSON {total}; run-scoped tagging via X-Guardian-Run-Id' },
+    { origin: 'app', method: 'PATCH', path: '/v1/invoices/:id', auth: 'tenant', notes: 'JSON {total}; run-scoped tagging via X-Kovo-Run-Id' },
     { origin: 'app', method: 'GET', path: '/v1/reports/:id', auth: 'user' },
     { origin: 'app', method: 'POST', path: '/v1/checkout/start', auth: 'tenant' },
     { origin: 'app', method: 'POST', path: '/v1/checkout/quote', auth: 'tenant', notes: 'JSON {cartId}' },

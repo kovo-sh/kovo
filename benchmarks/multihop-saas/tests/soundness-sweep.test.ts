@@ -1,7 +1,7 @@
 // Multi-seed soundness & leakage verification across all 4 multihop-saas archetypes.
 // Default: seeds 1..5 across paygrid, shipforge, nexusiam, connecthub.
-// Set GUARDIAN_MULTIHOP_FULL_SWEEP=1 to run the full 1..30 dev sweep.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+// Set KOVO_MULTIHOP_FULL_SWEEP=1 to run the full 1..30 dev sweep.
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -13,7 +13,7 @@ import {
 } from '../scripts/soundness-sweep.ts'
 
 test('multi-seed dev soundness & leakage sweep across all 4 archetypes', async () => {
-  const fullSweep = process.env.GUARDIAN_MULTIHOP_FULL_SWEEP === '1'
+  const fullSweep = process.env.KOVO_MULTIHOP_FULL_SWEEP === '1'
   const seedCount = fullSweep ? 30 : 5
   const devSeeds = Array.from({ length: seedCount }, (_, idx) => idx + 1)
 
@@ -55,8 +55,8 @@ test('multi-seed dev soundness & leakage sweep across all 4 archetypes', async (
 })
 
 test('salted held-out soundness & leakage sweep across all 4 archetypes', async () => {
-  const previous = process.env.GUARDIAN_RB_HELDOUT_SALT
-  process.env.GUARDIAN_RB_HELDOUT_SALT = 'unit-test-multihop-soundness-heldout-salt'
+  const previous = process.env.KOVO_RB_HELDOUT_SALT
+  process.env.KOVO_RB_HELDOUT_SALT = 'unit-test-multihop-soundness-heldout-salt'
   try {
     const report = await runSoundnessSweep({
       devSeeds: [],
@@ -73,8 +73,8 @@ test('salted held-out soundness & leakage sweep across all 4 archetypes', async 
     assert.equal(report.totals.twinTerminalEvents, 0)
     assert.equal(report.totals.leakageHits, 0)
   } finally {
-    if (previous === undefined) delete process.env.GUARDIAN_RB_HELDOUT_SALT
-    else process.env.GUARDIAN_RB_HELDOUT_SALT = previous
+    if (previous === undefined) delete process.env.KOVO_RB_HELDOUT_SALT
+    else process.env.KOVO_RB_HELDOUT_SALT = previous
   }
 })
 
@@ -90,14 +90,14 @@ test('CLI arg parsing rejects CLI salt and wires dev + held-out seed ranges clea
   assert.equal(parsed.devSeeds[29], 30)
   assert.deepEqual(parsed.heldOutSeeds, [1_000_001, 1_000_002, 1_000_003])
 
-  const previous = process.env.GUARDIAN_RB_HELDOUT_SALT
-  delete process.env.GUARDIAN_RB_HELDOUT_SALT
+  const previous = process.env.KOVO_RB_HELDOUT_SALT
+  delete process.env.KOVO_RB_HELDOUT_SALT
   try {
     await assert.rejects(
       () => runSoundnessSweep({ devSeeds: [], heldOutSeeds: [1_000_001] }),
-      /GUARDIAN_RB_HELDOUT_SALT/,
+      /KOVO_RB_HELDOUT_SALT/,
     )
   } finally {
-    if (previous !== undefined) process.env.GUARDIAN_RB_HELDOUT_SALT = previous
+    if (previous !== undefined) process.env.KOVO_RB_HELDOUT_SALT = previous
   }
 })

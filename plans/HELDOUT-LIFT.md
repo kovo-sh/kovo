@@ -59,8 +59,8 @@ nonexistent-id path). The floor had rejected the same target at the spec stage
 Commands (salt from the owner-only file, never printed):
 
 ```sh
-GUARDIAN_ALLOW_LOCAL_LAB=1 GUARDIAN_DATA_DIR=/home/omarchy/guardian-data \
-GUARDIAN_RB_HELDOUT_SALT="$(cat /home/omarchy/.config/guardian-bench/heldout.salt)" \
+KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR=/home/omarchy/guardian-data \
+KOVO_RB_HELDOUT_SALT="$(cat /home/omarchy/.config/guardian-bench/heldout.salt)" \
   newgrp docker -c 'cd <worktree> && node scripts/benchmark-realistic.ts \
     --app acme-saas --seed 1000042 --held-out --mode grey-box --concurrency 1 \
     --worker-concurrency 4 --verifier docker --budget-usd 5 --max-duration-ms 600000 \
@@ -140,7 +140,7 @@ merchant routes (fixed in §5); a verifier change would only hide it.
 
 ## 3. Held-out autopsy: exact funnel from the events
 
-All numbers below are derived from the kept per-cell `guardian.sqlite` of the clean unified reruns
+All numbers below are derived from the kept per-cell `kovo.sqlite` of the clean unified reruns
 (`/tmp/heldout-lift-{acme,shop2,ops}`), joined against `generateVariant(app, 1000042, salt)` and the
 floor scorecard (`/tmp/hfr-final-held-on`, 9/8/7). No log or raw body was read.
 
@@ -254,7 +254,7 @@ two SQLi validation gaps (`dismissed/true` 2) and one race threshold (`inconclus
 Coverage is the smaller residual: 11/34 never hit, of which 8 were nominally dispatched but bound to
 the wrong route/param (e.g. acme SQLi brief on `/api/queries/run`, not `/api/search/workspaces`) and
 3 were not dispatched at all. A thin-dispatch fix alone can recover at most those 11; the other 19
-route-hit targets are a **guardian_verify / agent-proof-conversion** problem.
+route-hit targets are a **kovo_verify / agent-proof-conversion** problem.
 
 ## 4. Why dev was +1–2 and held-out was 0
 
@@ -275,7 +275,7 @@ measured reasons**:
    mounted route+method, but 19/23 never produced a persisted replay spec. The assignment outcomes
    show the causes: `complete_intent` shape errors (`steps` must be an array; `request.origin`,
    `request.pathAndQuery`, role, lowercase id), `maxTurns` reached during schema repair, and agents
-   stopping at facts/closure without submitting. This is a guardian_verify/SDK conversion gap, not a
+   stopping at facts/closure without submitting. This is a kovo_verify/SDK conversion gap, not a
    model ceiling and not dispatch.
 4. **Coverage is a smaller residual (11/34), and 8 of those were nominally dispatched.** The failure
    is route grounding inside the brief: e.g. acme SQLi was briefed on `/api/queries/run` +

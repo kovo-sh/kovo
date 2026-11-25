@@ -1,6 +1,6 @@
-// Integration layer between realistic-bench (pane 3) and Guardian's live engines.
+// Integration layer between realistic-bench (pane 3) and Kovo Hunter's live engines.
 //
-// realistic-bench owns materialization, the impact oracle and grading. Guardian owns discovery,
+// realistic-bench owns materialization, the impact oracle and grading. Kovo Hunter owns discovery,
 // hypothesis probing and Zero-LLM replay verification. This adapter joins them without either
 // side reading the other's answer key:
 //   * input:  a materialized app tree + its live origin (per-seed variant.json routes only)
@@ -10,7 +10,7 @@
 // type below deliberately omits them, so truth is not even reachable from this module. Routes,
 // params, personas and the login flow all come from variant.json / the briefing.
 //
-// Guardian's engine is loaded from ../../scripts/*.ts through non-literal dynamic imports: the
+// Kovo Hunter's engine is loaded from ../../scripts/*.ts through non-literal dynamic imports: the
 // benchmark tsconfig stays self-contained (no tsc coupling to scripts/ + src/), while runtime
 // still executes the real engine modules.
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
@@ -22,7 +22,7 @@ import type {
 import { appNames } from './lib/types.ts'
 import { assertLocalLabAllowed } from './lib/safety.ts'
 import { briefingFor, startRealisticApp } from './run.ts'
-import { loginPersonas, pickLoginPath, type LoginPersona, type PersonaAuth } from './guardian-login.ts'
+import { loginPersonas, pickLoginPath, type LoginPersona, type PersonaAuth } from './kovo-login.ts'
 
 export type ProfileMode = 'v3-baseline' | 'v4-full'
 export type VerifierChoice = 'auto' | 'docker' | 'local-jq'
@@ -103,7 +103,7 @@ export interface BriefingLike {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Guardian engine surface (loaded dynamically; structural so tsc never follows scripts/)
+// Kovo Hunter engine surface (loaded dynamically; structural so tsc never follows scripts/)
 // ---------------------------------------------------------------------------------------------
 export interface DiscoveredParamLike { name: string; location: string; isObjectId: boolean; isCsrf: boolean }
 export interface DiscoveredEndpointLike { method: string; path: string; params: DiscoveredParamLike[]; source: string }
@@ -161,7 +161,7 @@ export interface EngineEnvCreateOptionsLike {
 }
 
 /**
- * A Guardian-operated loopback canary listener, started *before* the materialized app so its exact
+ * A Kovo Hunter-operated loopback canary listener, started *before* the materialized app so its exact
  * port can be handed to the app's contained egress allowlist. The broker is passed unchanged into
  * createEngineEnv, so SSRF/XXE probes, replay verification and the app all share one callback port.
  */
@@ -188,7 +188,7 @@ export async function startOobCanaryBroker(opts: { repoRootDir?: string } = {}):
   const repoRootDir = opts.repoRootDir ?? DEFAULT_REPO_ROOT
   const mod = await importRepoModule(repoRootDir, 'src/server/canary-broker.ts')
   const Broker = mod.CanaryBroker as (new (options?: { storage?: unknown; dnsDomain?: string }) => CanaryBrokerLike) | undefined
-  if (!Broker) throw new Error('src/server/canary-broker.ts does not export CanaryBroker (Guardian engine API drift)')
+  if (!Broker) throw new Error('src/server/canary-broker.ts does not export CanaryBroker (Kovo Hunter engine API drift)')
   const broker = new Broker()
   const info = await broker.startListener({ host: '127.0.0.1', port: 0 })
   if (!info.running || !info.port || info.host !== '127.0.0.1') {
@@ -200,7 +200,7 @@ export async function startOobCanaryBroker(opts: { repoRootDir?: string } = {}):
     try { baseHost = new URL(info.effectiveBaseUrl).hostname } catch { /* handled below */ }
     if (baseHost !== '127.0.0.1') {
       await broker.stopListener().catch(() => undefined)
-      throw new Error('OOB canary listener must use a loopback base URL; unset GUARDIAN_CANARY_PUBLIC_URL for local-lab runs')
+      throw new Error('OOB canary listener must use a loopback base URL; unset KOVO_CANARY_PUBLIC_URL for local-lab runs')
     }
   }
   return { port: info.port, broker, stop: () => broker.stopListener() }
@@ -208,12 +208,12 @@ export async function startOobCanaryBroker(opts: { repoRootDir?: string } = {}):
 
 async function importRepoModule(repoRootDir: string, rel: string): Promise<Record<string, unknown>> {
   const file = resolve(repoRootDir, rel)
-  if (!existsSync(file)) throw new Error(`Guardian engine module missing: ${file}`)
+  if (!existsSync(file)) throw new Error(`Kovo Hunter engine module missing: ${file}`)
   // Non-literal specifier: deliberately opaque to tsc so this tsconfig stays standalone.
   return await import(pathToFileURL(file).href) as Record<string, unknown>
 }
 
-export async function loadGuardianEngine(repoRootDir = DEFAULT_REPO_ROOT): Promise<EngineModuleLike> {
+export async function loadKovoEngine(repoRootDir = DEFAULT_REPO_ROOT): Promise<EngineModuleLike> {
   const [envMod, probeMod, specMod, backendMod, verifierMod, liveMod] = await Promise.all([
     importRepoModule(repoRootDir, 'scripts/benchmark-env.ts'),
     importRepoModule(repoRootDir, 'scripts/benchmark-probes.ts'),
@@ -224,7 +224,7 @@ export async function loadGuardianEngine(repoRootDir = DEFAULT_REPO_ROOT): Promi
   ])
   const need = (mod: Record<string, unknown>, name: string, where: string): unknown => {
     const fn = mod[name]
-    if (!fn) throw new Error(`${where} does not export ${name} (Guardian engine API drift)`)
+    if (!fn) throw new Error(`${where} does not export ${name} (Kovo Hunter engine API drift)`)
     return fn
   }
   return {
@@ -245,7 +245,7 @@ export async function loadGuardianEngine(repoRootDir = DEFAULT_REPO_ROOT): Promi
 // ---------------------------------------------------------------------------------------------
 // Adapter options / result
 // ---------------------------------------------------------------------------------------------
-export interface GuardianAdapterDeps {
+export interface KovoAdapterDeps {
   startApp?: (opts: { app: AppName; seed: number; heldOutSalt?: string; oobCallbackPorts?: number[] }) => Promise<MaterializedAppLike>
   briefing?: (app: MaterializedAppLike, mode: BenchMode) => BriefingLike
   loadEngine?: (repoRootDir: string) => Promise<EngineModuleLike>
@@ -253,7 +253,7 @@ export interface GuardianAdapterDeps {
   now?: () => number
 }
 
-export interface RunGuardianOptions {
+export interface RunKovoOptions {
   treeDir: string
   seed: number
   app: AppName | string
@@ -276,7 +276,7 @@ export interface RunGuardianOptions {
   repoRootDir?: string
 }
 
-export interface GuardianRunResult {
+export interface KovoRunResult {
   app: string
   seed: number
   findings: SubmittedFinding[]
@@ -294,7 +294,7 @@ export interface GuardianRunResult {
 const SEVERITIES: Severity[] = ['critical', 'high', 'medium', 'low']
 const AUTHZ_CWES = new Set([284, 285, 566, 639, 862, 863])
 
-function normalizeProfileMode(mode: RunGuardianOptions['profileMode']): ProfileMode {
+function normalizeProfileMode(mode: RunKovoOptions['profileMode']): ProfileMode {
   if (mode === 'full' || mode === 'v4-full') return 'v4-full'
   if (mode === 'baseline' || mode === 'v3-baseline') return 'v3-baseline'
   throw new Error(`unknown profile mode '${String(mode)}' (use v4-full | v3-baseline)`)
@@ -415,9 +415,9 @@ async function verifyWithRetries(
 // ---------------------------------------------------------------------------------------------
 // Main entrypoint
 // ---------------------------------------------------------------------------------------------
-export async function runGuardianAgainstMaterialized(
-  opts: RunGuardianOptions, deps: GuardianAdapterDeps = {},
-): Promise<GuardianRunResult> {
+export async function runKovoAgainstMaterialized(
+  opts: RunKovoOptions, deps: KovoAdapterDeps = {},
+): Promise<KovoRunResult> {
   assertLocalLabAllowed()
   if (!(appNames as readonly string[]).includes(String(opts.app))) {
     throw new Error(`unknown app '${String(opts.app)}' (known: ${appNames.join(', ')})`)
@@ -466,7 +466,7 @@ export async function runGuardianAgainstMaterialized(
     throw new Error(`treeDir (${opts.treeDir}) is not the app's materialized sourceDir (${started.sourceDir}); refusing to probe a different tree`)
   }
 
-  const engine = deps.loadEngine ? await deps.loadEngine(repoRootDir) : await loadGuardianEngine(repoRootDir)
+  const engine = deps.loadEngine ? await deps.loadEngine(repoRootDir) : await loadKovoEngine(repoRootDir)
   const caps = engine.profileCaps(profileMode)
   const briefing = (deps.briefing ?? ((a, m) => briefingFor(a as unknown as Parameters<typeof briefingFor>[0], m)))(started, mode)
 
@@ -507,7 +507,7 @@ export async function runGuardianAgainstMaterialized(
 
     const verifier = await engine.selectVerifierBackend(opts.verifierBackend)
     verifierKind = verifier.kind
-    const deadlineMs = opts.deadlineMs ?? Number(process.env.GUARDIAN_BENCH_DEADLINE_MS ?? 8 * 60_000)
+    const deadlineMs = opts.deadlineMs ?? Number(process.env.KOVO_BENCH_DEADLINE_MS ?? 8 * 60_000)
     const maxRequests = opts.maxRequests ?? 3800
     const deadline = now() + deadlineMs
     const probeEnv = env.probeEnv
@@ -604,7 +604,7 @@ export async function runGuardianAgainstMaterialized(
  * runs `runLivePipeline` against this materialized app through the shared launcher contract.
  * Never used by the truth-free adapter path above.
  */
-export async function runGuardianLivePipelineAgainstMaterialized(
+export async function runKovoLivePipelineAgainstMaterialized(
   opts: {
     started: MaterializedAppLike
     treeDir: string
@@ -614,12 +614,12 @@ export async function runGuardianLivePipelineAgainstMaterialized(
     repoRootDir?: string
     fetchImpl?: typeof fetch
   },
-  deps: GuardianAdapterDeps = {},
+  deps: KovoAdapterDeps = {},
 ): Promise<{ traces: unknown[]; totalCostUsd: number; verifierBackend: string | null; notes: string[] }> {
   assertLocalLabAllowed()
   if (!statSync(opts.treeDir).isDirectory()) throw new Error(`treeDir is not a directory: ${opts.treeDir}`)
   const repoRootDir = opts.repoRootDir ?? DEFAULT_REPO_ROOT
-  const engine = deps.loadEngine ? await deps.loadEngine(repoRootDir) : await loadGuardianEngine(repoRootDir)
+  const engine = deps.loadEngine ? await deps.loadEngine(repoRootDir) : await loadKovoEngine(repoRootDir)
   if (!engine.runLivePipeline) throw new Error('scripts/benchmark-live.ts does not export runLivePipeline')
   const surface = readMaterializedSurface(opts.treeDir)
   const briefing = (deps.briefing ?? ((a, m) => briefingFor(a as unknown as Parameters<typeof briefingFor>[0], m)))(opts.started, 'grey-box')

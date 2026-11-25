@@ -53,7 +53,7 @@ export async function runSelfTest(): Promise<string[]> {
   const aliceHeaders = {
     authorization: `Bearer ${alice.token}`,
     'content-type': 'application/json',
-    'x-guardian-run-id': runId,
+    'x-kovo-run-id': runId,
   }
   const bobHeaders = { authorization: `Bearer ${bob.token}`, 'content-type': 'application/json' }
 
@@ -163,13 +163,13 @@ export async function runSelfTest(): Promise<string[]> {
     const stopRun = 'stg-run-stop'
     await fetch(`${app}/v1/checkout/start`, {
       method: 'POST',
-      headers: { ...aliceHeaders, 'x-guardian-run-id': stopRun },
+      headers: { ...aliceHeaders, 'x-kovo-run-id': stopRun },
       body: '{}',
     })
     assert.ok(fixture.orphans(stopRun).length >= 1)
   } finally {
     await fixture.stop()
-    assert.deepEqual(fixture.orphans(), [], 'stop leaves zero guardian-qa- records')
+    assert.deepEqual(fixture.orphans(), [], 'stop leaves zero kovo-qa- records')
     await fixture.stop()
   }
   checks.push('stop leaves zero orphan run-tagged records')

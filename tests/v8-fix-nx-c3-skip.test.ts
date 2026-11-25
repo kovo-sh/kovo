@@ -6,7 +6,7 @@
 //  - Public documents remain readable without prior listing or metadata open, and full NX-C3
 //    confirmation continues to pass in single, concurrent, and 3x sequential runs while hardened
 //    mode and NX-D1..NX-D3 twins remain silent.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

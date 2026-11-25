@@ -47,7 +47,7 @@ export async function runSelfTest(): Promise<string[]> {
 
     // 3. IdP redirect_uri is not allowlisted (open redirect)
     const evil = await fetch(
-      `${idp}/authorize?client_id=guardian-spa&response_type=code&redirect_uri=${encodeURIComponent('https://evil.example/steal')}&login_hint=alice@alpha.example.invalid`,
+      `${idp}/authorize?client_id=kovo-spa&response_type=code&redirect_uri=${encodeURIComponent('https://evil.example/steal')}&login_hint=alice@alpha.example.invalid`,
       { redirect: 'manual' },
     )
     assert.equal(evil.status, 302)

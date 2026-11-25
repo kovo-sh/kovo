@@ -1,5 +1,5 @@
 /**
- * Live recall benchmark pipeline. Boots the lab server on loopback, then drives Guardian's
+ * Live recall benchmark pipeline. Boots the lab server on loopback, then drives Kovo Hunter's
  * real engines generically: recon -> hypothesis formation -> probes -> replay-spec synthesis ->
  * Zero-LLM verification. Manifest answer keys are used only afterwards, for scoring.
  */
@@ -281,7 +281,7 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
   const capped = applyBenchmarkClassCaps(plan.hypotheses, config.classCaps)
   const hypotheses = capped.kept
   notes.push(`Discovered ${endpoints.length} endpoints; formed ${discoveredCount} hypotheses; class caps kept ${hypotheses.length}.`)
-  if (process.env.GUARDIAN_BENCH_DEBUG === '1') notes.push(`[paths] ${endpoints.map(e => `${e.method} ${e.path}`).join(' | ')}`)
+  if (process.env.KOVO_BENCH_DEBUG === '1') notes.push(`[paths] ${endpoints.map(e => `${e.method} ${e.path}`).join(' | ')}`)
 
   // Blind time-based SQLi is the only probe that deliberately sleeps on the target. Scale its
   // allowance with the candidate count, ranked by param/path plausibility, but execute the chosen
@@ -338,7 +338,7 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
       csrfRejected: outcome.csrfRejected, contextReset: outcome.contextReset, tierBlocked: outcome.tierBlocked,
       jqError: false, spaCatchall: false, skippedForBudget: false,
     }
-    if (process.env.GUARDIAN_BENCH_DEBUG === '1') {
+    if (process.env.KOVO_BENCH_DEBUG === '1') {
       notes.push(`[debug] ${hyp.probeClass} ${hyp.endpoint.method} ${hyp.endpoint.path} param=${hyp.param?.name ?? '-'}@${hyp.location ?? '-'} -> ${outcome.verdict}: ${(outcome.summary ?? outcome.error ?? '').slice(0, 140)} anomalies=${outcome.anomalies.map(a => String(a.type)).join(',')}`)
       if (outcome.verdict === 'signal') notes.push(`[debugjson] ${hyp.probeClass} ${hyp.endpoint.path} ${JSON.stringify(outcome.anomalies).slice(0, 900)} details=${JSON.stringify(outcome.details).slice(0, 500)}`)
     }
@@ -376,7 +376,7 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
         scored.jqError = scored.jqError || Boolean(res.feedback?.jqError)
         scored.spaCatchall = scored.spaCatchall || Boolean(res.feedback?.spaCatchallMatched)
         if (/blocked below Tier 3|requires explicit Tier 3/i.test(res.replay?.outcome.reason ?? '')) scored.tierBlocked = true
-        if (process.env.GUARDIAN_BENCH_DEBUG === '1') notes.push(`[debugverify] ${item.synth.kind} ${hyp.endpoint.path} param=${hyp.param?.name ?? '-'} -> ${res.verdict}: ${(res.replay?.outcome.reason ?? res.replay?.outcome.observed ?? '').slice(0, 160)}`)
+        if (process.env.KOVO_BENCH_DEBUG === '1') notes.push(`[debugverify] ${item.synth.kind} ${hyp.endpoint.path} param=${hyp.param?.name ?? '-'} -> ${res.verdict}: ${(res.replay?.outcome.reason ?? res.replay?.outcome.observed ?? '').slice(0, 160)}`)
         if (res.verdict === 'confirmed') { scored.confirmed = true; break outer }
       }
     }
@@ -389,7 +389,7 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
       notes.push(`Confirmed: ${hyp.probeClass} ${hyp.method} ${hyp.endpoint.path} param=${hyp.param?.name ?? '-'} requests=${local.requests}`)
     }
     stat.hypotheses += 1
-    if (process.env.GUARDIAN_BENCH_DEBUG === '1') notes.push(`[timing] ${hyp.probeClass} ${hyp.endpoint.method} ${hyp.endpoint.path} ${Date.now() - started}ms requests=${local.requests}`)
+    if (process.env.KOVO_BENCH_DEBUG === '1') notes.push(`[timing] ${hyp.probeClass} ${hyp.endpoint.method} ${hyp.endpoint.path} ${Date.now() - started}ms requests=${local.requests}`)
     return { scored }
   }
 
@@ -516,8 +516,8 @@ function collectConfirmedFindings(manifest: BenchmarkManifest, executed: readonl
 }
 
 async function runPipelineWithPatches(args: LivePipelineArgs, patchedIds: string[]): Promise<LivePipelineOutcome> {
-  if (process.env.GUARDIAN_ALLOW_LOCAL_LAB !== '1') {
-    throw new Error('Live benchmark runs require GUARDIAN_ALLOW_LOCAL_LAB=1.')
+  if (process.env.KOVO_ALLOW_LOCAL_LAB !== '1') {
+    throw new Error('Live benchmark runs require KOVO_ALLOW_LOCAL_LAB=1.')
   }
   const caps = profileCaps(args.profileMode)
   const launcher = args.launcher ?? await resolveLauncher(args.suite, args.repoRootDir)
@@ -679,14 +679,14 @@ export async function verifyPatchesLive(args: PatchVerificationArgs): Promise<Pa
   const suite: BenchmarkSuiteName = args.suite ?? 'held-out-saas'
   const verifierBackend: VerifierBackendChoice = args.verifierBackend ?? 'auto'
   const repoRootDir = args.repoRootDir ?? resolve(import.meta.dirname, '..')
-  const patchTimeoutMs = args.patchTimeoutMs ?? Number(process.env.GUARDIAN_BENCH_PATCH_TIMEOUT_MS ?? 90_000)
-  const allPatchesTimeoutMs = args.allPatchesTimeoutMs ?? Number(process.env.GUARDIAN_BENCH_ALLPATCH_TIMEOUT_MS ?? 10 * 60_000)
-  const isolationSample = args.isolationSample ?? Number(process.env.GUARDIAN_BENCH_PATCH_ISOLATION ?? 4)
+  const patchTimeoutMs = args.patchTimeoutMs ?? Number(process.env.KOVO_BENCH_PATCH_TIMEOUT_MS ?? 90_000)
+  const allPatchesTimeoutMs = args.allPatchesTimeoutMs ?? Number(process.env.KOVO_BENCH_ALLPATCH_TIMEOUT_MS ?? 10 * 60_000)
+  const isolationSample = args.isolationSample ?? Number(process.env.KOVO_BENCH_PATCH_ISOLATION ?? 4)
 
-  if (process.env.GUARDIAN_ALLOW_LOCAL_LAB !== '1') {
+  if (process.env.KOVO_ALLOW_LOCAL_LAB !== '1') {
     return {
       attempted: 0, fixed: 0, reproducedBefore: 0, perPatch: [], durationMs: Date.now() - started,
-      skippedReason: 'Patch verification requires GUARDIAN_ALLOW_LOCAL_LAB=1.',
+      skippedReason: 'Patch verification requires KOVO_ALLOW_LOCAL_LAB=1.',
     }
   }
 
@@ -922,7 +922,7 @@ export async function verifyPatchesLive(args: PatchVerificationArgs): Promise<Pa
   // Optional regression discovery: a fresh all-patched pipeline may surface new probe classes. Its
   // findings are NEVER used to mark a baseline vuln as still-confirming; only ids with no baseline
   // attribution are reported as newly confirming, and same-id findings are informational.
-  if (allPatches.attempted && process.env.GUARDIAN_BENCH_ALLPATCH_FRESH === '1') {
+  if (allPatches.attempted && process.env.KOVO_BENCH_ALLPATCH_FRESH === '1') {
     try {
       const fresh = await withTimeout(runtime.runFull(allPatchIds), allPatchesTimeoutMs, 'all-patches discovery pass')
       const baselineIds = new Set(baselineFindings.map(f => f.id))

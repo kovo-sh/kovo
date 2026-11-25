@@ -7,7 +7,7 @@ import type {
   CleanControlGradeDetail,
   CleanNegativeControlSpec,
   ExternalOracleObservation,
-  GuardianCompositeProofReceipt,
+  KovoCompositeProofReceipt,
   HopDepthFunnel,
   OssAnchorManifest,
   OssGradeInput,
@@ -34,7 +34,7 @@ export interface PatchRetestVerdict {
   reasons: string[]
 }
 
-function isMonotonicHops(receipt: GuardianCompositeProofReceipt): boolean {
+function isMonotonicHops(receipt: KovoCompositeProofReceipt): boolean {
   if (!Array.isArray(receipt.hops) || receipt.hops.length === 0) return false
   const sorted = [...receipt.hops].sort((a, b) => a.order - b.order)
   for (let i = 0; i < sorted.length; i += 1) {
@@ -44,7 +44,7 @@ function isMonotonicHops(receipt: GuardianCompositeProofReceipt): boolean {
   return true
 }
 
-function areCausalEdgesValid(receipt: GuardianCompositeProofReceipt): boolean {
+function areCausalEdgesValid(receipt: KovoCompositeProofReceipt): boolean {
   if (receipt.hops.length <= 1) return true
   if (!Array.isArray(receipt.causalEdges) || receipt.causalEdges.length < receipt.hops.length - 1) {
     return false
@@ -61,12 +61,12 @@ function areCausalEdgesValid(receipt: GuardianCompositeProofReceipt): boolean {
 /**
  * Verifies two-side confirmation:
  * 1) External impact oracle observed the terminal impact on the vulnerable build, AND
- * 2) Guardian produced a host-verified Mode-A `CompositeProofReceipt` originating from an
+ * 2) Kovo Hunter produced a host-verified Mode-A `CompositeProofReceipt` originating from an
  *    allowed attacker persona with verified causal edges and matching run/correlation.
  */
 export function verifyTwoSideConfirmation(
   anchor: OssAnchorManifest,
-  receipt: GuardianCompositeProofReceipt | undefined,
+  receipt: KovoCompositeProofReceipt | undefined,
   observations: readonly ExternalOracleObservation[],
 ): TwoSideVerdict {
   const reasons: string[] = []
@@ -81,7 +81,7 @@ export function verifyTwoSideConfirmation(
 
   if (!receipt) {
     if (oracleConfirmed) {
-      reasons.push('External oracle observed impact, but Guardian emitted no CompositeProofReceipt.')
+      reasons.push('External oracle observed impact, but Kovo Hunter emitted no CompositeProofReceipt.')
       return {
         confirmed: false,
         status: 'unconfirmed_oracle_only',
@@ -91,7 +91,7 @@ export function verifyTwoSideConfirmation(
         reasons,
       }
     }
-    reasons.push('Neither external oracle nor Guardian receipt confirmed this anchor.')
+    reasons.push('Neither external oracle nor Kovo Hunter receipt confirmed this anchor.')
     return {
       confirmed: false,
       status: 'fn',
@@ -102,7 +102,7 @@ export function verifyTwoSideConfirmation(
   }
 
   if (!receipt.verified || !receipt.terminalImpact.observed) {
-    reasons.push('Guardian CompositeProofReceipt is not host-verified or terminalImpact.observed is false.')
+    reasons.push('Kovo Hunter CompositeProofReceipt is not host-verified or terminalImpact.observed is false.')
     return {
       confirmed: false,
       status: oracleConfirmed ? 'unconfirmed_oracle_only' : 'fn',
@@ -157,7 +157,7 @@ export function verifyTwoSideConfirmation(
   }
 
   if (!oracleConfirmed || !matchingObs) {
-    reasons.push('Guardian emitted a verified receipt, but the external impact oracle did not observe impact.')
+    reasons.push('Kovo Hunter emitted a verified receipt, but the external impact oracle did not observe impact.')
     return {
       confirmed: false,
       status: 'unconfirmed_receipt_only',
@@ -228,7 +228,7 @@ export function verifyTwoSideConfirmation(
  */
 export function gradePatchRetest(
   anchor: OssAnchorManifest,
-  receipt: GuardianCompositeProofReceipt,
+  receipt: KovoCompositeProofReceipt,
   patchRetests: readonly PatchRetestRecord[],
 ): PatchRetestVerdict {
   const record = patchRetests.find(
@@ -313,7 +313,7 @@ export function gradePatchRetest(
 
 export function gradeCleanControl(
   control: CleanNegativeControlSpec,
-  receipts: readonly GuardianCompositeProofReceipt[],
+  receipts: readonly KovoCompositeProofReceipt[],
   observations: readonly ExternalOracleObservation[],
 ): CleanControlGradeDetail {
   const controlReceipts = receipts.filter((r) => r.targetId === control.controlId)
@@ -380,7 +380,7 @@ export function gradeOssRun(input: OssGradeInput): OssGradeResult {
     if (maxObservedHopDepth >= 4) funnel.h4Plus += 1
 
     // Pick best matching receipt (prefer verified TP, else first verified claim, else first receipt).
-    let chosenReceipt: GuardianCompositeProofReceipt | undefined
+    let chosenReceipt: KovoCompositeProofReceipt | undefined
     let chosenVerdict: TwoSideVerdict | undefined
 
     if (candidateReceipts.length === 0) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Guardian v6 — realism exit-gate harness.
+// Kovo Hunter v6 — realism exit-gate harness.
 //
 // Boots one `benchmarks/realism-suite` fixture, hands its briefing to the REAL
 // `Execution` product pipeline (black/grey/white-box, `--no-llm` and agentic), then
@@ -8,17 +8,17 @@
 // `Execution` cannot reach is recorded with its exact failure stage, never as a pass.
 //
 // Usage:
-//   GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- \
+//   KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- \
 //     --fixture enterprise-spa --no-llm --out-dir /tmp/realism-gate
-//   GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- \
+//   KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- \
 //     --fixture all --mode grey-box --no-llm --json --md
 //
-// Agentic runs additionally need a Guardian data dir with an enabled model profile
-// (`--data-dir` or GUARDIAN_DATA_DIR) and a worker-session-capable verifier (docker):
-//   GUARDIAN_ALLOW_LOCAL_LAB=1 GUARDIAN_DATA_DIR=/path/to/data \
+// Agentic runs additionally need a Kovo Hunter data dir with an enabled model profile
+// (`--data-dir` or KOVO_DATA_DIR) and a worker-session-capable verifier (docker):
+//   KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR=/path/to/data \
 //     newgrp docker -c 'node scripts/benchmark-realism.ts --fixture all --verifier docker'
 //
-// Safety: only the loopback realism fixtures are used; `GUARDIAN_ALLOW_LOCAL_LAB=1`
+// Safety: only the loopback realism fixtures are used; `KOVO_ALLOW_LOCAL_LAB=1`
 // is mandatory. Fixture credentials are synthetic. Artifacts are written 0600 in a
 // 0700 directory and are scanned for known secrets, the held-out salt and generic
 // credential shapes before the process reports success.
@@ -110,10 +110,10 @@ export interface RealismArgs {
   help: boolean
 }
 
-const usage = `Guardian realism exit gates (real Execution loop)
+const usage = `Kovo Hunter realism exit gates (real Execution loop)
 
 Usage:
-  GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- [flags]
+  KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:realism -- [flags]
 
 Flags:
   --fixture <name|all>      enterprise-spa | wan-oob | staging-concurrency |
@@ -124,9 +124,9 @@ Flags:
   --verifier <kind>         auto | docker | local-jq (default: auto)
   --budget-usd <n>          per-run USD budget (default: ${DEFAULT_BUDGET_USD})
   --max-duration-ms <n>     wall-clock cap per fixture (default: ${DEFAULT_MAX_DURATION_MS})
-  --out-dir <path>          artifact directory (default: .guardian/realism-bench)
-  --data-dir <path>         Guardian data dir with an enabled model profile
-                            (default: $GUARDIAN_DATA_DIR). Agentic cells always run
+  --out-dir <path>          artifact directory (default: .kovo/realism-bench)
+  --data-dir <path>         Kovo Hunter data dir with an enabled model profile
+                            (default: $KOVO_DATA_DIR). Agentic cells always run
                             from an isolated copy under <out-dir>/data/<cell>.
   --isolate-data-dir        accepted for parity; agentic cells are always isolated
                             from the source data dir (profiles copied, credentials
@@ -144,9 +144,9 @@ Flags:
   --help                    show this help
 
 Environment:
-  GUARDIAN_ALLOW_LOCAL_LAB=1   required to boot loopback fixtures
-  GUARDIAN_DATA_DIR            default Guardian data dir (model profile source)
-  GUARDIAN_RB_HELDOUT_SALT     scanned in artifacts when set (never printed)
+  KOVO_ALLOW_LOCAL_LAB=1   required to boot loopback fixtures
+  KOVO_DATA_DIR            default Kovo Hunter data dir (model profile source)
+  KOVO_RB_HELDOUT_SALT     scanned in artifacts when set (never printed)
 
 Artifacts per fixture:
   <out-dir>/<fixture>-<mode>[-no-llm].json         grade + gate metrics + meta
@@ -220,8 +220,8 @@ export function parseRealismArgs(argv: string[], env: NodeJS.ProcessEnv = proces
   if (!Number.isFinite(budgetUsd) || budgetUsd < 0.1 || budgetUsd > 500) {
     fail(`--budget-usd must be a number between 0.1 and 500 (got '${String(raw['budget-usd'])}')`)
   }
-  const outDirRaw = stringFlag(raw, 'out-dir') ?? '.guardian/realism-bench'
-  const dataDirRaw = stringFlag(raw, 'data-dir') ?? env.GUARDIAN_DATA_DIR
+  const outDirRaw = stringFlag(raw, 'out-dir') ?? '.kovo/realism-bench'
+  const dataDirRaw = stringFlag(raw, 'data-dir') ?? env.KOVO_DATA_DIR
   const seed = positiveInt(stringFlag(raw, 'realism-seed'), '--realism-seed', DEFAULT_REALISM_SEED)
   const targetOrigin = stringFlag(raw, 'target-origin')
   return {
@@ -581,7 +581,7 @@ export function declaredEndpointsFromReplaySpec(spec: unknown): DeclaredEndpoint
   }
 }
 
-/** Translate persisted Guardian findings into the realism-suite grading schema. */
+/** Translate persisted Kovo Hunter findings into the realism-suite grading schema. */
 export function translateFindings(input: {
   findings: Finding[]
   replaySpecs: ReplaySpecLike[]
@@ -746,7 +746,7 @@ export interface WiringMetricValues {
   siblingDerivationSuppressed: boolean | null
   /** Truth 4-hop sinks that Phase-0 ranked as Tier A (Program-Graph hypothesis-linked). */
   tierA4HopSinks: number | null
-  /** `guardian-qa-` records remaining after staging cleanup (staging only). */
+  /** `kovo-qa-` records remaining after staging cleanup (staging only). */
   leakedEntities: number | null
   /**
    * Async-OOB wiring reliability (wan-oob only). Kept in the wiring report so a capability miss
@@ -1849,7 +1849,7 @@ export function evaluateWiring(fixture: string, values: WiringMetricValues): Wir
     }))
     criteria.push(numericWiringCriterion({
       id: 'leaked-entities-zero',
-      label: 'Zero leaked guardian-qa- entities after cleanup',
+      label: 'Zero leaked kovo-qa- entities after cleanup',
       value: values.leakedEntities,
       ok: value => value === 0,
       observed: values.leakedEntities === null ? 'cleanup not measured' : `${values.leakedEntities} leaked`,
@@ -2150,7 +2150,7 @@ export function evaluateGate(fixture: string, metrics: RealismMetrics): GateCrit
       { id: 'checkout-tampering', label: 'Checkout price tampering confirmed', required: true, met: Boolean(staging?.checkoutConfirmed), observed: String(Boolean(staging?.checkoutConfirmed)) },
       {
         id: 'zero-leaked-entities',
-        label: 'Zero leaked guardian-qa- entities after cleanup',
+        label: 'Zero leaked kovo-qa- entities after cleanup',
         required: true,
         met: staging?.leakedEntities === 0,
         observed: staging?.leakedEntities === -1 ? 'cleanup not measured' : `${staging?.leakedEntities ?? '?'} leaked`,
@@ -2351,7 +2351,7 @@ export interface RealismCellResult {
 }
 
 export interface RealismSummary {
-  suite: 'guardian-realism-gates'
+  suite: 'kovo-realism-gates'
   generatedAt: number
   gitSha: string
   mode: BenchMode
@@ -2364,7 +2364,7 @@ export interface RealismSummary {
 
 function resolveGitSha(): string {
   try {
-    return process.env.GUARDIAN_GIT_SHA
+    return process.env.KOVO_GIT_SHA
       ?? execFileSyncText('git', ['rev-parse', 'HEAD']).trim().slice(0, 40)
   } catch {
     return 'unknown'
@@ -2637,9 +2637,9 @@ function unlockAndRemove(dir: string): void {
 }
 
 async function workspaceContainers(cell: string | undefined): Promise<number | null> {
-  if (!cell || process.env.GUARDIAN_REALISM_SKIP_DOCKER_ORPHAN_CHECK === '1') return null
+  if (!cell || process.env.KOVO_REALISM_SKIP_DOCKER_ORPHAN_CHECK === '1') return null
   return new Promise(resolvePromise => {
-    execFile('docker', ['ps', '-q', '--filter', `label=dev.guardian.cell=${cell}`], { timeout: 8_000 }, (error, stdout) => {
+    execFile('docker', ['ps', '-q', '--filter', `label=dev.kovo.cell=${cell}`], { timeout: 8_000 }, (error, stdout) => {
       if (error) { resolvePromise(null); return }
       resolvePromise(String(stdout).split('\n').filter(Boolean).length)
     })
@@ -3591,14 +3591,14 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
     // White-box scale gate: exercise the opt-in sibling-derivation request so Phase-0's
     // suppression decision is observed rather than assumed.
     if (fixtureName === 'monorepo-whitebox') {
-      previousSiblingEnv = process.env.GUARDIAN_RECON_SIBLINGS
-      process.env.GUARDIAN_RECON_SIBLINGS = '1'
-      notes.push('GUARDIAN_RECON_SIBLINGS=1 (opt-in sibling derivation requested for suppression check)')
+      previousSiblingEnv = process.env.KOVO_RECON_SIBLINGS
+      process.env.KOVO_RECON_SIBLINGS = '1'
+      notes.push('KOVO_RECON_SIBLINGS=1 (opt-in sibling derivation requested for suppression check)')
     }
     // Harness-side observation only: the broker is the real product broker, instrumented so the
     // gate can report denied mutations and HTTP/2 single-packet race bursts. Staging enables the
     // HTTP/2 transport because the fixture's h2c endpoint is the object under test.
-    const observedBroker = process.env.GUARDIAN_NETWORK_FIXTURE
+    const observedBroker = process.env.KOVO_NETWORK_FIXTURE
       ? undefined
       : new WiringObservedBroker({
           storage,
@@ -3784,8 +3784,8 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
     restoreStoreWrites?.()
     restoreStoreWrites = null
     if (fixtureName === 'monorepo-whitebox') {
-      if (previousSiblingEnv === undefined) delete process.env.GUARDIAN_RECON_SIBLINGS
-      else process.env.GUARDIAN_RECON_SIBLINGS = previousSiblingEnv
+      if (previousSiblingEnv === undefined) delete process.env.KOVO_RECON_SIBLINGS
+      else process.env.KOVO_RECON_SIBLINGS = previousSiblingEnv
     }
     const shutdown = await tearDown(ctx, signal)
     ctx.storage = undefined
@@ -3810,7 +3810,7 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
         ctx.notes.push(`staging cleanup: ${shutdown.stagingCleanup.removed} removed, ${shutdown.stagingCleanup.restored} restored`)
       }
       if (shutdown.stagingOrphansAfterCleanup.length > 0) {
-        ctx.notes.push(`staging orphan check: ${shutdown.stagingOrphansAfterCleanup.length} guardian-qa- record(s) remain`)
+        ctx.notes.push(`staging orphan check: ${shutdown.stagingOrphansAfterCleanup.length} kovo-qa- record(s) remain`)
       }
     }
     metrics.wiring = buildWiringReport(ctx.fixture, metrics.wiring.metrics)
@@ -3995,7 +3995,7 @@ export function renderCellMarkdown(result: RealismCellResult): string {
   lines.push(`- approvals: blocking=${metricValue(wiringMetrics.approvalBlocks)} (created ${metricValue(wiringMetrics.approvalRequestsCreated)}); parked workers=${metricValue(wiringMetrics.parkedWorkers)}; broker-denied mutations=${metricValue(wiringMetrics.brokerDeniedMutations)} (total denied ${metricValue(wiringMetrics.brokerDeniedTotal)}${wiringMetrics.brokerDeniedReasons ? `; reasons ${Object.entries(wiringMetrics.brokerDeniedReasons).map(([reason, count]) => `${reason}=${count}`).join(', ')}` : ''})`)
   lines.push(`- race transport: HTTP/2 single-packet=${metricValue(wiringMetrics.h2SinglePacketBursts)}; HTTP/1.1 fallback=${metricValue(wiringMetrics.http1FallbackBursts)}; bursts=${metricValue(wiringMetrics.raceBursts)}`)
   lines.push(`- store: persisted=${metricValue(wiringMetrics.storedEndpoints)}/${metricValue(wiringMetrics.declaredEndpoints)}; write p99=${metricValue(wiringMetrics.storeWriteP99Ms, ' ms')}; sibling derivation suppressed=${wiringMetrics.siblingDerivationSuppressed === null ? 'n/a' : String(wiringMetrics.siblingDerivationSuppressed)}; Tier A 4-hop sinks=${metricValue(wiringMetrics.tierA4HopSinks)}`)
-  lines.push(`- leaked guardian-qa- entities after cleanup=${metricValue(wiringMetrics.leakedEntities)}`)
+  lines.push(`- leaked kovo-qa- entities after cleanup=${metricValue(wiringMetrics.leakedEntities)}`)
   if (result.metrics.routeDiscovery) {
     const discovery = result.metrics.routeDiscovery
     lines.push('')
@@ -4049,7 +4049,7 @@ export function renderCellMarkdown(result: RealismCellResult): string {
     lines.push(`- write-BOLA: ${staging.writeBolaConfirmed ? 'confirmed' : 'not confirmed'}`)
     lines.push(`- HTTP/2 race: ${staging.raceConfirmed ? 'confirmed' : 'not confirmed'} (${result.metrics.wiring.metrics.h2SinglePacketBursts ?? 'n/a'} HTTP/2 single-packet burst(s), ${result.metrics.wiring.metrics.http1FallbackBursts ?? 'n/a'} HTTP/1.1 fallback)`)
     lines.push(`- checkout tampering: ${staging.checkoutConfirmed ? 'confirmed' : 'not confirmed'}`)
-    lines.push(`- leaked \`guardian-qa-\` entities after cleanup: ${staging.leakedEntities}`)
+    lines.push(`- leaked \`kovo-qa-\` entities after cleanup: ${staging.leakedEntities}`)
     lines.push(`- cleanup: ${staging.cleanup ? `${staging.cleanup.removed} removed, ${staging.cleanup.restored} restored` : 'not run'}`)
   }
   if (result.metrics.monorepo) {
@@ -4250,9 +4250,9 @@ async function main(): Promise<void> {
       if (existsSync(file)) baseFiles.push(file)
     }
   }
-  const salt = process.env.GUARDIAN_RB_HELDOUT_SALT
+  const salt = process.env.KOVO_RB_HELDOUT_SALT
   const summary: RealismSummary = {
-    suite: 'guardian-realism-gates',
+    suite: 'kovo-realism-gates',
     generatedAt: Date.now(),
     gitSha: resolveGitSha(),
     mode: args.mode,

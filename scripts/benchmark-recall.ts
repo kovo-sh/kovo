@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
- * Guardian v4 recall benchmark harness (`npm run benchmark:recall`).
+ * Kovo Hunter v4 recall benchmark harness (`npm run benchmark:recall`).
  *
- * Runs the stratified XBEN-25 dev suite and/or the Held-Out Modern SaaS Lab against Guardian's
+ * Runs the stratified XBEN-25 dev suite and/or the Held-Out Modern SaaS Lab against Kovo Hunter's
  * own engines, records the 6-stage funnel plus the 11-bucket failure taxonomy in SQLite
  * (`benchmark_runs`), and emits JSON + Markdown diff reports against a baseline run.
  *
  * `--dry-run` never touches the network: it uses a deterministic capability model so the
  * reporting and persistence plumbing can be exercised anywhere. Live runs (the default) are
- * gated behind GUARDIAN_ALLOW_LOCAL_LAB=1 and drive the real engines in `benchmark-live.ts`.
+ * gated behind KOVO_ALLOW_LOCAL_LAB=1 and drive the real engines in `benchmark-live.ts`.
  */
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
@@ -127,8 +127,8 @@ export function resolveGitSha(rootDir = benchmarkRepoRoot): string {
 }
 
 function assertLocalLabGate(dryRun: boolean | undefined) {
-  if (!dryRun && process.env.GUARDIAN_ALLOW_LOCAL_LAB !== '1') {
-    throw new Error('Refusing to execute local-lab benchmarks: set GUARDIAN_ALLOW_LOCAL_LAB=1 (or use --dry-run).')
+  if (!dryRun && process.env.KOVO_ALLOW_LOCAL_LAB !== '1') {
+    throw new Error('Refusing to execute local-lab benchmarks: set KOVO_ALLOW_LOCAL_LAB=1 (or use --dry-run).')
   }
 }
 
@@ -367,7 +367,7 @@ export interface BenchmarkCliOptions extends Omit<RunBenchmarkOptions, 'storage'
 
 export function benchmarkCliHelp(): string {
   return [
-    'Guardian v4 recall benchmark',
+    'Kovo Hunter v4 recall benchmark',
     '',
     'Usage: node scripts/benchmark-recall.ts [options]',
     '',
@@ -377,27 +377,27 @@ export function benchmarkCliHelp(): string {
     '  --git-sha <sha>                               SHA label for this run (default: git HEAD)',
     '  --out-json <file>  --out-md <file>            Write the JSON / Markdown report',
     '  --out-dir <dir>                               Write per-suite reports into a directory',
-    '  --db <dir>                                    Data directory holding guardian.sqlite for benchmark_runs',
+    '  --db <dir>                                    Data directory holding kovo.sqlite for benchmark_runs',
     '  --diff                                        Print the Markdown diff to stdout',
     '  --verify-patches                              held-out-saas: verify reproduced -> fixed patch retests',
     '                                                (20 isolated patches + one all-patches pass)',
     '  --verifier-backend <auto|docker|local-jq>     Zero-LLM verifier backend (default: auto)',
-    '  --max-requests <n>                            Broker audit-unit budget (default: 6000, env GUARDIAN_BENCH_MAX_REQUESTS)',
+    '  --max-requests <n>                            Broker audit-unit budget (default: 6000, env KOVO_BENCH_MAX_REQUESTS)',
     '  --deadline-ms <n>                             Wall-clock budget for the live pipeline (default: 480000)',
-    '  --probe-concurrency <n>                       Parallel read-only hypotheses, 1-8 (default: 4, env GUARDIAN_BENCH_PROBE_CONCURRENCY)',
+    '  --probe-concurrency <n>                       Parallel read-only hypotheses, 1-8 (default: 4, env KOVO_BENCH_PROBE_CONCURRENCY)',
     '  --verify-concurrency <n>                      Candidate specs verified in parallel, 1-4 (default: 2)',
     '  --slow-probes <n>                             Blind time-based SQLi allowance (default: adaptive 12-24)',
     '  --dry-run                                     Capability-model run, no network',
     '  -h, --help',
     '',
-    'Live runs require GUARDIAN_ALLOW_LOCAL_LAB=1.',
-    'Orchestration env: GUARDIAN_BENCH_MAX_REQUESTS, GUARDIAN_BENCH_DEADLINE_MS,',
-    'GUARDIAN_BENCH_PROBE_CONCURRENCY, GUARDIAN_BENCH_VERIFY_CONCURRENCY, GUARDIAN_BENCH_SLOW_PROBES,',
-    'GUARDIAN_BENCH_CLASS_CAP / GUARDIAN_BENCH_CLASS_ENDPOINT_CAP (class=limit,...).',
-    'Patch-verification bounds: GUARDIAN_BENCH_PATCH_TIMEOUT_MS (per patch, default 90000),',
-    'GUARDIAN_BENCH_ALLPATCH_TIMEOUT_MS (all-patches baseline-spec replay, default 600000),',
-    'GUARDIAN_BENCH_PATCH_ISOLATION (unrelated findings replayed per patch, default 4).',
-    'GUARDIAN_BENCH_ALLPATCH_FRESH=1 adds an optional fresh all-patches discovery pass;',
+    'Live runs require KOVO_ALLOW_LOCAL_LAB=1.',
+    'Orchestration env: KOVO_BENCH_MAX_REQUESTS, KOVO_BENCH_DEADLINE_MS,',
+    'KOVO_BENCH_PROBE_CONCURRENCY, KOVO_BENCH_VERIFY_CONCURRENCY, KOVO_BENCH_SLOW_PROBES,',
+    'KOVO_BENCH_CLASS_CAP / KOVO_BENCH_CLASS_ENDPOINT_CAP (class=limit,...).',
+    'Patch-verification bounds: KOVO_BENCH_PATCH_TIMEOUT_MS (per patch, default 90000),',
+    'KOVO_BENCH_ALLPATCH_TIMEOUT_MS (all-patches baseline-spec replay, default 600000),',
+    'KOVO_BENCH_PATCH_ISOLATION (unrelated findings replayed per patch, default 4).',
+    'KOVO_BENCH_ALLPATCH_FRESH=1 adds an optional fresh all-patches discovery pass;',
     'its findings are reported as newly-confirming, never as patch evidence.',
   ].join('\n')
 }

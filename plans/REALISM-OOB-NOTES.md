@@ -126,7 +126,7 @@ index adf1c79..ab41236 100644
          pathAndQuery,
          headers: { 'Content-Type': 'application/json', ...stagingHeaders },
          body: JSON.stringify(body),
-+        // In a local lab the broker records this as `X-Guardian-Trace-Id`, so the exchange that
++        // In a local lab the broker records this as `X-Kovo-Trace-Id`, so the exchange that
 +        // carried the injected canary is identifiable when the callback arrives after the probe
 +        // window (request bodies are not indexed, headers are).
 +        ...(traceId ? { traceId } : {}),
@@ -135,7 +135,7 @@ index adf1c79..ab41236 100644
          assignmentId: input.assignmentId,
 @@ -3314,7 +3329,7 @@ async function probeSecondOrderSsrf(
  
-   const control = await send(hyp.pathAndQuery, 'http://guardian-control.invalid/')
+   const control = await send(hyp.pathAndQuery, 'http://kovo-control.invalid/')
    const controlId = control ? extractCreatedId(control.body) : null
 -  if (controlId) await triggerFetch(controlId)
 +  if (controlId && !triggerIsSelf) await triggerFetch(controlId)
@@ -211,7 +211,7 @@ index adf1c79..ab41236 100644
 
 The companion probe diff is already committed on this branch (`src/server/probes/{ssrf,xxe}.ts`):
 each canary-carrying probe request sets `traceId` to the injected token, so the broker records
-`X-Guardian-Trace-Id` in the local lab and the drain can find the carrier for a body-only injection.
+`X-Kovo-Trace-Id` in the local lab and the drain can find the carrier for a body-only injection.
 
 ## 3. Measured result with the patch applied
 
@@ -277,7 +277,7 @@ Committed on this branch (`tests/v7-realism-oob.test.ts`, probe lane only):
   `pending_oob` subscription tokens;
 - the XXE probe does the same for general/parameter/SVG entity payloads and keeps
   `Content-Type: application/xml`;
-- a recorded `x-guardian-trace-id` header makes the carrier exchange findable through
+- a recorded `x-kovo-trace-id` header makes the carrier exchange findable through
   `Store.searchExchanges`, which is the exact lookup the drain uses.
 
 To restore with the engine patch (these were green in the patched tree, removed from the probe-only
@@ -297,9 +297,9 @@ commit because they depend on engine selection):
 
 ```bash
 # engine patch applied
-GUARDIAN_ALLOW_LOCAL_LAB=1 newgrp docker -c \
+KOVO_ALLOW_LOCAL_LAB=1 newgrp docker -c \
   'node scripts/benchmark-realism.ts --fixture wan-oob --no-llm --verifier docker --out-dir /tmp/realism-oob --json'
-GUARDIAN_ALLOW_LOCAL_LAB=1 newgrp docker -c \
+KOVO_ALLOW_LOCAL_LAB=1 newgrp docker -c \
   'node scripts/benchmark-realistic.ts --app all --seeds 1 --mode grey-box --no-llm \
      --verifier docker --isolate-data-dir --concurrency 3 --budget-usd 2 \
      --max-duration-ms 600000 --out-dir /tmp/floor-oob'

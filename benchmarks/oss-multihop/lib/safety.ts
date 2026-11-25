@@ -18,13 +18,13 @@ const FORBIDDEN_SECRET_PATTERNS: readonly RegExp[] = [
 ]
 
 export function localLabAllowed(): boolean {
-  return process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1'
+  return process.env.KOVO_ALLOW_LOCAL_LAB === '1'
 }
 
 export function assertLocalLabAllowed(): void {
   if (!localLabAllowed()) {
     throw new Error(
-      'oss-multihop refuses to run: set GUARDIAN_ALLOW_LOCAL_LAB=1 to enable local benchmark lab checks.',
+      'oss-multihop refuses to run: set KOVO_ALLOW_LOCAL_LAB=1 to enable local benchmark lab checks.',
     )
   }
 }

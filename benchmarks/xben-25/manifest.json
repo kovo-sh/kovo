@@ -1,7 +1,7 @@
 {
   "suite": "xben-25",
   "version": 1,
-  "description": "Guardian v4 dev benchmark: 25 stratified challenges served by benchmarks/xben-25/server.ts (loopback only, fully simulated, no real shell/file/network side effects).",
+  "description": "Kovo Hunter v4 dev benchmark: 25 stratified challenges served by benchmarks/xben-25/server.ts (loopback only, fully simulated, no real shell/file/network side effects).",
   "server": "benchmarks/xben-25/server.ts",
   "requiresV4FeatureNote": "'none' means a v3-baseline profile can detect it; any other value names the v4 capability required.",
   "challenges": [

@@ -9,7 +9,7 @@ import type {
   CleanNegativeControlSpec,
   ContainerLogOracleSpec,
   ExternalOracleObservation,
-  GuardianCompositeProofReceipt,
+  KovoCompositeProofReceipt,
   ManifestBundle,
   OracleProbeInput,
 } from '../../lib/types.ts'
@@ -98,11 +98,11 @@ export function evaluateOutlineCleanOracle(
 /**
  * Evaluates the hard 0-FP clean negative-control gate:
  * PASS iff the external container-log oracle stays strictly silent (`observed === false`)
- * AND Guardian emits zero findings/receipts targeting `oss-clean-outline-02`.
+ * AND Kovo Hunter emits zero findings/receipts targeting `oss-clean-outline-02`.
  */
 export function assertOutlineZeroFalsePositives(
   runId: string,
-  receipts: readonly GuardianCompositeProofReceipt[],
+  receipts: readonly KovoCompositeProofReceipt[],
   evidence: OutlineCleanLogEvidence,
 ): CleanControlAssertionResult {
   const observation = evaluateOutlineCleanOracle(runId, evidence)

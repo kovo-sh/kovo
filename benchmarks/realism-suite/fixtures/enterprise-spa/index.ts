@@ -31,7 +31,7 @@ interface UserRow {
   tenant: string
 }
 
-const CLIENT_ID = 'guardian-spa'
+const CLIENT_ID = 'kovo-spa'
 const CLIENT_SECRET = 'rbs_fake_oidc_client_secret_2026'
 const USERS: UserRow[] = [
   { id: 'u-alpha-1', email: 'alice@alpha.example.invalid', password: 'rb_fake_alice_pw', role: 'member', tenant: 'tenant-alpha' },

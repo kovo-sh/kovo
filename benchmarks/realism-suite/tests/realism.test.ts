@@ -130,13 +130,13 @@ test('findings files can be arrays or { findings: [...] }', () => {
   }
 })
 
-test('fixtures refuse to start without GUARDIAN_ALLOW_LOCAL_LAB=1', async () => {
-  const previous = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
+test('fixtures refuse to start without KOVO_ALLOW_LOCAL_LAB=1', async () => {
+  const previous = process.env.KOVO_ALLOW_LOCAL_LAB
+  delete process.env.KOVO_ALLOW_LOCAL_LAB
   try {
-    await assert.rejects(() => startEnterpriseSpa(), /GUARDIAN_ALLOW_LOCAL_LAB/)
+    await assert.rejects(() => startEnterpriseSpa(), /KOVO_ALLOW_LOCAL_LAB/)
   } finally {
-    if (previous === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = previous
+    if (previous === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = previous
   }
 })

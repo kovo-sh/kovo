@@ -11,7 +11,7 @@ import { runSiteMatrix } from '../apps/shopflow/truth/selftest.ts'
 import { buildPath } from '../apps/shopflow/truth/matrix-helpers.ts'
 import { personaIds } from '../lib/types.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 test('blueprint validates with the expected shape', () => {
   assert.doesNotThrow(() => validateBlueprint(blueprint))

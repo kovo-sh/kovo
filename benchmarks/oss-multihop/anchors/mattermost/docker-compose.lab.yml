@@ -12,7 +12,7 @@ networks:
 
 services:
   mm_lab_proxy:
-    image: "${PROXY_IMAGE:-guardian-lab/loopback-proxy:1.0.0}"
+    image: "${PROXY_IMAGE:-kovo-lab/loopback-proxy:1.0.0}"
     ports:
       - "127.0.0.1:0:8065"
     networks:
@@ -27,9 +27,9 @@ services:
     environment:
       UPSTREAM_URL: "http://mattermost_app:8065"
     labels:
-      guardian.oss_lab.target: "oss-dev-mattermost-01"
-      guardian.oss_lab.role: "lab_proxy"
-      guardian.oss_lab.egress_policy: "deny_all_internal_only"
+      kovo.oss_lab.target: "oss-dev-mattermost-01"
+      kovo.oss_lab.role: "lab_proxy"
+      kovo.oss_lab.egress_policy: "deny_all_internal_only"
 
   mattermost_app:
     image: "${APP_IMAGE:-mattermost/mattermost-team-edition}:${APP_TAG:-9.5.8}"
@@ -50,12 +50,12 @@ services:
       OSS_LAB_MEMBER_CRED: "oss_lab_mm_member_a"
       OSS_LAB_SYSADMIN_CRED: "oss_lab_mm_sysadmin"
     labels:
-      guardian.oss_lab.target: "oss-dev-mattermost-01"
-      guardian.oss_lab.split: "dev"
-      guardian.oss_lab.role: "app"
+      kovo.oss_lab.target: "oss-dev-mattermost-01"
+      kovo.oss_lab.split: "dev"
+      kovo.oss_lab.role: "app"
 
   mattermost_idp:
-    image: "${IDP_IMAGE:-guardian-lab/oidc-stub:1.0.0}"
+    image: "${IDP_IMAGE:-kovo-lab/oidc-stub:1.0.0}"
     networks:
       - lab_internal
     read_only: true
@@ -67,8 +67,8 @@ services:
       OIDC_ISSUER: "http://mattermost_idp:8080"
       OSS_LAB_OIDC_SECRET: "oss_lab_mm_oidc_secret_01"
     labels:
-      guardian.oss_lab.target: "oss-dev-mattermost-01"
-      guardian.oss_lab.role: "idp"
+      kovo.oss_lab.target: "oss-dev-mattermost-01"
+      kovo.oss_lab.role: "idp"
 
   mattermost_db:
     image: "postgres:16.4-alpine"
@@ -83,5 +83,5 @@ services:
       POSTGRES_USER: "oss_lab_user"
       POSTGRES_PASSWORD: "oss_lab_pg_password_04"
     labels:
-      guardian.oss_lab.target: "oss-dev-mattermost-01"
-      guardian.oss_lab.role: "db"
+      kovo.oss_lab.target: "oss-dev-mattermost-01"
+      kovo.oss_lab.role: "db"

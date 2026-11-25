@@ -40,9 +40,9 @@ services:
       ADMIN_PASSWORD: "oss_lab_directus_admin_a"
       OSS_LAB_MEMBER_CRED: "oss_lab_directus_member_b"
     labels:
-      guardian.oss_lab.target: "oss-dev-directus-01"
-      guardian.oss_lab.split: "dev"
-      guardian.oss_lab.egress_policy: "deny_all_internal_only"
+      kovo.oss_lab.target: "oss-dev-directus-01"
+      kovo.oss_lab.split: "dev"
+      kovo.oss_lab.egress_policy: "deny_all_internal_only"
 
   directus_db:
     image: "postgres:16.4-alpine"
@@ -57,8 +57,8 @@ services:
       POSTGRES_USER: "oss_lab_user"
       POSTGRES_PASSWORD: "oss_lab_pg_password_02"
     labels:
-      guardian.oss_lab.target: "oss-dev-directus-01"
-      guardian.oss_lab.role: "db"
+      kovo.oss_lab.target: "oss-dev-directus-01"
+      kovo.oss_lab.role: "db"
 
   directus_cache:
     image: "redis:7.2.5-alpine"
@@ -70,5 +70,5 @@ services:
     security_opt:
       - "no-new-privileges:true"
     labels:
-      guardian.oss_lab.target: "oss-dev-directus-01"
-      guardian.oss_lab.role: "cache"
+      kovo.oss_lab.target: "oss-dev-directus-01"
+      kovo.oss_lab.role: "cache"

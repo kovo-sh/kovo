@@ -1,5 +1,5 @@
 /**
- * Guardian reason-bench product harness (M4).
+ * Kovo Hunter reason-bench product harness (M4).
  *
  * Drives the *real* `Execution` loop (the same engine the product runs) against the
  * `benchmarks/reason-bench/` loopback labs and reports the reasoning metrics defined in
@@ -287,16 +287,16 @@ export interface ReasonArgs {
   help: boolean
 }
 
-const usage = `Guardian reason-bench (real Execution loop, plans/reason-bench.md §5–§6)
+const usage = `Kovo Hunter reason-bench (real Execution loop, plans/reason-bench.md §5–§6)
 
 Usage:
-  GUARDIAN_ALLOW_LOCAL_LAB=1 npm run benchmark:reason -- [flags]
+  KOVO_ALLOW_LOCAL_LAB=1 npm run benchmark:reason -- [flags]
 
 Flags:
   --app <name|all>          ledgerflow | forgecloud | all (default: all)
   --seed <n>                single dev seed (1..9999)
   --seeds <a,b,c>           comma-separated seeds
-  --held-out                seeds are held-out (>= 1000000); needs GUARDIAN_RB_HELDOUT_SALT
+  --held-out                seeds are held-out (>= 1000000); needs KOVO_RB_HELDOUT_SALT
                             (the salt is never printed, stored or committed)
   --mode <m>                black-box | grey-box | white-box (default: grey-box)
   --no-llm                  deterministic floor run AND the Anti-Heuristic Gate:
@@ -308,9 +308,9 @@ Flags:
   --budget-usd <n>          per-cell USD budget (default: ${DEFAULT_BUDGET_USD})
   --max-duration-ms <n|10m|30m|45m|60m>
                             wall-clock cap per cell (default: ${Math.round(DEFAULT_MAX_DURATION_MS / 60_000)}m)
-  --data-dir <path>         Guardian data dir; single cell uses it verbatim, matrices use it
+  --data-dir <path>         Kovo Hunter data dir; single cell uses it verbatim, matrices use it
                             as the per-cell isolation source
-                            (default: $GUARDIAN_DATA_DIR)
+                            (default: $KOVO_DATA_DIR)
   --keep-data-dirs          keep isolated per-cell data dirs after grading
   --allow-inert-workers     allow an agentic run when the verifier backend cannot open worker
                             sessions (records an inert run; still exits 2 by default)
@@ -324,7 +324,7 @@ Flags:
   --allow-heldout-snapshot  explicitly allow reusing a salted held-out checkpoint
   --floor-from <dir[,dir]>  additional artifact dirs holding --no-llm cells (ΔReasoning)
   --curve-from <dir[,dir]>  additional artifact dirs feeding the budget × duration curve
-  --out-dir <path>          artifact directory (default: .guardian/reason-bench)
+  --out-dir <path>          artifact directory (default: .kovo/reason-bench)
   --json <path>             write the structured reasoning report here
   --md <path>               write the markdown reasoning report here
   --list-seeds              print the reason-bench seed catalogue as JSON and exit
@@ -432,7 +432,7 @@ export function parseReasonArgs(argv: string[], env: NodeJS.ProcessEnv = process
   ])
   for (const key of Object.keys(a)) {
     if (!known.has(key)) {
-      if (/salt/i.test(key)) fail(`never pass a salt on the command line; set GUARDIAN_RB_HELDOUT_SALT instead (got --${key})`)
+      if (/salt/i.test(key)) fail(`never pass a salt on the command line; set KOVO_RB_HELDOUT_SALT instead (got --${key})`)
       fail(`unknown flag --${key}`)
     }
   }
@@ -441,7 +441,7 @@ export function parseReasonArgs(argv: string[], env: NodeJS.ProcessEnv = process
     return {
       apps: [...reasonAppNames], seeds: [1], mode: 'grey-box', heldOut: false,
       budgetUsd: DEFAULT_BUDGET_USD, maxDurationMs: DEFAULT_MAX_DURATION_MS,
-      outDir: resolve('.guardian/reason-bench'), concurrency: DEFAULT_CONCURRENCY,
+      outDir: resolve('.kovo/reason-bench'), concurrency: DEFAULT_CONCURRENCY,
       noLlm: false, isolateDataDir: false, keepDataDirs: false, allowInertWorkers: false,
       verifier: 'auto', snapshotMaxAgeMs: DEFAULT_SNAPSHOT_MAX_AGE_MS, snapshotRefresh: false,
       allowHeldoutSnapshot: false, floorFrom: [], curveFrom: [],
@@ -461,9 +461,9 @@ export function parseReasonArgs(argv: string[], env: NodeJS.ProcessEnv = process
 
   const heldOut = a['held-out'] === true
   const seeds = parseSeeds(a, heldOut)
-  const salt = env.GUARDIAN_RB_HELDOUT_SALT ?? ''
+  const salt = env.KOVO_RB_HELDOUT_SALT ?? ''
   if (heldOut) {
-    if (salt.length < 16) fail('--held-out requires GUARDIAN_RB_HELDOUT_SALT (>= 16 chars; never printed)')
+    if (salt.length < 16) fail('--held-out requires KOVO_RB_HELDOUT_SALT (>= 16 chars; never printed)')
     for (const seed of seeds) if (seed < 1_000_000) fail(`held-out seeds are >= 1000000 (got ${seed})`)
   } else {
     for (const seed of seeds) {
@@ -499,8 +499,8 @@ export function parseReasonArgs(argv: string[], env: NodeJS.ProcessEnv = process
   const noLlm = a['no-llm'] === true
   if (resumeSnapshotRaw && noLlm) fail('--resume-snapshot requires the live agentic model; drop --no-llm')
 
-  const outDirRaw = stringFlag(a, 'out-dir') ?? '.guardian/reason-bench'
-  const dataDirRaw = stringFlag(a, 'data-dir') ?? env.GUARDIAN_DATA_DIR
+  const outDirRaw = stringFlag(a, 'out-dir') ?? '.kovo/reason-bench'
+  const dataDirRaw = stringFlag(a, 'data-dir') ?? env.KOVO_DATA_DIR
 
   return {
     apps: parseAppList(stringFlag(a, 'app')),
@@ -1023,7 +1023,7 @@ export async function runCell(
     dataDir = join(args.outDir, 'data', `${slug}-resume`)
     copySnapshotDatabase({ snapshotDir: resumeDir, targetDir: dataDir })
     const linked = linkSnapshotModelCredentials({
-      snapshotDb: join(dataDir, 'guardian.sqlite'),
+      snapshotDb: join(dataDir, 'kovo.sqlite'),
       ...(sourceDataDir ? { sourceDataDir } : {}),
       targetDataDir: dataDir,
     })
@@ -1059,7 +1059,7 @@ export async function runCell(
   let engineBusy = -1
 
   if (args.isolateDataDir && !sourceDataDir && !args.noLlm) {
-    notes.push('--isolate-data-dir had no --data-dir/GUARDIAN_DATA_DIR source; using a fresh cell data dir')
+    notes.push('--isolate-data-dir had no --data-dir/KOVO_DATA_DIR source; using a fresh cell data dir')
   }
   if (isolated) {
     notes.push(
@@ -1105,7 +1105,7 @@ export async function runCell(
         if (args.verifier === 'docker') {
           throw new PreflightError(
             `--verifier docker is not usable from this process: ${detail}. Docker worker sessions need `
-            + 'socket access; re-run under `newgrp docker -c \'<command>\'` and make sure guardian-worker:v4 is built.',
+            + 'socket access; re-run under `newgrp docker -c \'<command>\'` and make sure kovo-worker:v4 is built.',
           )
         }
         throw error
@@ -1139,7 +1139,7 @@ export async function runCell(
     started = await runtime.startReasonApp({
       app,
       seed,
-      ...(args.heldOut ? { heldOutSalt: process.env.GUARDIAN_RB_HELDOUT_SALT } : {}),
+      ...(args.heldOut ? { heldOutSalt: process.env.KOVO_RB_HELDOUT_SALT } : {}),
       oobCallbackPorts,
     })
     const briefing = runtime.briefingFor(started, args.mode)
@@ -2091,7 +2091,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 
   // Safety: loopback local-lab only, before any runtime or app boot.
   assertLocalLabAllowed()
-  activeSalt = args.heldOut ? (process.env.GUARDIAN_RB_HELDOUT_SALT ?? '') : ''
+  activeSalt = args.heldOut ? (process.env.KOVO_RB_HELDOUT_SALT ?? '') : ''
   mkdirSync(args.outDir, { recursive: true, mode: 0o700 })
 
   const runtime = await loadReasonRuntime()

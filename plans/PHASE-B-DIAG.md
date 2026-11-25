@@ -2,7 +2,7 @@
 
 **Run:** `52a05555-cfd8-4603-b115-ade36be491ca`, acme-saas seed 1, grey-box, agentic, Docker workers,
 git `275592a`, wall cap 600 s, `budget_usd 2.00`.
-**Artifacts:** kept run `/tmp/unified-acme2/` (scorecard + `guardian.sqlite` + worker session SQLite);
+**Artifacts:** kept run `/tmp/unified-acme2/` (scorecard + `kovo.sqlite` + worker session SQLite);
 comparison run `/tmp/unified-acme/` (previous) and `/tmp/unified-acme2/summary.json`.
 **Method:** structured SQL/JSON only — `assignments`, `chain_steps`, `facts`, `findings`, `replay_specs`,
 `broker_exchanges`, `coverage_entries`, `events`, worker-session `tasks`/`entries`. No raw bodies, no
@@ -92,7 +92,7 @@ Tool mix (calls): C = 42 (`request_http` 15, `request_http_batch` 6, `derive_evi
 `get_exchange` 2, `load_skill` 1, `search_exchanges` 1).
 
 **Typed proof tools were available in every prompt and used zero times** (`prove_authz_read_diff`,
-`prove_state_mutation_diff`); `guardian_verify` likewise **0**. The previous run's single agentic
+`prove_state_mutation_diff`); `kovo_verify` likewise **0**. The previous run's single agentic
 confirmation came from `prove_authz_read_diff` — i.e. the one thing that produced lift last run is the
 one thing this run never called.
 

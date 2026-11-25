@@ -6,7 +6,7 @@ Binding design for every module. Types live in `lib/types.ts` (do not fork them)
 - **Scope:** only write under `benchmarks/realistic-bench/`. Never touch `src/`, `package.json`, `package-lock.json`, `scripts/`, root `tests/`, `benchmarks/xben-25/`, `local-lab/`. Never `git commit`.
 - **Runtime:** Node 24+ native TypeScript type-stripping, ESM, `import ... from './x.ts'` with explicit `.ts` extensions, `import type` for types. Erasable syntax only (no `enum`, no `namespace`, no constructor parameter properties). **Zero npm dependencies** — only `node:*` built-ins (`node:sqlite`, `node:http`, `node:crypto`, `node:async_hooks`, `node:test`, ...). No zod.
 - **Safety (enforced by `tests/safety.test.ts`):**
-  - Everything calls `assertLocalLabAllowed()` (throws unless `GUARDIAN_ALLOW_LOCAL_LAB=1`) before starting.
+  - Everything calls `assertLocalLabAllowed()` (throws unless `KOVO_ALLOW_LOCAL_LAB=1`) before starting.
   - Servers listen only on `127.0.0.1` port `0`.
   - Outbound requests only via `lib/egress.ts` — loopback `127.0.0.1` only, and only to ports registered as the app's internal mock services or the caller-supplied `oobCallbackPorts`. Everything else is blocked and logged (`egressBlocked`). No redirects followed off the allowlist, 2 s timeout, 64 KiB cap.
   - File access for app features (downloads, XXE `file://`, templates, exports) only via `lib/vfs.ts` — an in-memory virtual filesystem with synthetic files. The real filesystem is never read from user input.
@@ -69,7 +69,7 @@ same attempts produce **zero** matching events. Solvers live outside the materia
 
 ## Seeds
 - Dev seeds: integers `1..9999` (hill-climbing; freely reproducible).
-- Held-out seeds: integers `>= 1_000_000`; plan derivation mixes HMAC-SHA256 over `GUARDIAN_RB_HELDOUT_SALT` (env, ≥16 chars, never committed). Without the salt, held-out seeds are refused. The salt is never written into `variant.json`, briefings, ground truth or any other artifact; only routes/params/idFormat/apiPrefix are scanner-visible.
+- Held-out seeds: integers `>= 1_000_000`; plan derivation mixes HMAC-SHA256 over `KOVO_RB_HELDOUT_SALT` (env, ≥16 chars, never committed). Without the salt, held-out seeds are refused. The salt is never written into `variant.json`, briefings, ground truth or any other artifact; only routes/params/idFormat/apiPrefix are scanner-visible.
 - Randomized per seed: api prefix, route nouns (vocab synonyms), param names, id format, persona emails/passwords, canary salt, which sites are hardened (count within `decoyCount`, chain members together, `canBeDecoy:false` respected).
 
 ## Grading
@@ -109,4 +109,4 @@ CLI: `node benchmarks/realistic-bench/run.ts serve --app <a> --seed <n> [--mode 
 ground truth + oracle/request/egress logs to out-dir on SIGINT/SIGTERM), `grade --truth f --findings f --events f --requests f [--egress f] --telemetry f [--mode m] [--md out.md] [--json out.json]`,
 `selftest --app <a|all> --seeds 1,2,3` (runs every site solver in both modes), `seeds --set dev|held-out [--n 5]`.
 Default out dir: `benchmarks/realistic-bench/out/` (gitignored).
-Self-tests: `GUARDIAN_ALLOW_LOCAL_LAB=1 node --test benchmarks/realistic-bench/tests/` ; typecheck: `node_modules/.bin/tsc -p benchmarks/realistic-bench/tsconfig.json`.
+Self-tests: `KOVO_ALLOW_LOCAL_LAB=1 node --test benchmarks/realistic-bench/tests/` ; typecheck: `node_modules/.bin/tsc -p benchmarks/realistic-bench/tsconfig.json`.

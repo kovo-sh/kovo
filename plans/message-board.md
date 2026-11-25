@@ -1,4 +1,4 @@
-# Guardian Swarm Message Board — Implementation Plan
+# Kovo Hunter Swarm Message Board — Implementation Plan
 
 **Status:** Proposed  
 **Scope:** All capability tiers (`Tier 0` through `Tier 3`, `public` and `local-lab`)  
@@ -8,7 +8,7 @@
 
 ## 1. Motivation & Design Philosophy
 
-Guardian v4 already has a strong typed blackboard (`facts`, `endpoints`, `chain_steps`, `graph_edges`, `replay_specs`, `findings`), 7 domain specialists (`SPECIALIST_PROFILES`), SSE live updates, scope/taint isolation, and deterministic Zero-LLM verification (`ReplayVerifier`).
+Kovo Hunter v4 already has a strong typed blackboard (`facts`, `endpoints`, `chain_steps`, `graph_edges`, `replay_specs`, `findings`), 7 domain specialists (`SPECIALIST_PROFILES`), SSE live updates, scope/taint isolation, and deterministic Zero-LLM verification (`ReplayVerifier`).
 
 Today, however, orchestration is strictly hub-and-spoke with ephemeral workers:
 - Each `ChainStep` spawns a one-shot `assignment` that exits when done. Cross-domain discoveries have to round-trip through `facts` → debounced `runChainPlanner` → a brand-new cold specialist.
@@ -16,7 +16,7 @@ Today, however, orchestration is strictly hub-and-spoke with ephemeral workers:
 - The right-hand `Coordinator` pane (`startCoordinator` in `src/server/execution.ts`) is a 1-on-1 Q&A sidecar with aggregate summary counts; the operator cannot see specialist handoffs in one stream or directly address a specialist.
 
 ### Core Principle: Hybrid Blackboard + Swarm Board
-The Message Board **does not replace** Guardian's typed blackboard or Zero-LLM verification invariants:
+The Message Board **does not replace** Kovo Hunter's typed blackboard or Zero-LLM verification invariants:
 
 | Layer | Tables / Modules | Source of Truth For |
 | :--- | :--- | :--- |
@@ -43,7 +43,7 @@ Every board message is an audit-logged, redacted, scope-attributed coordination 
 ## 3. Roster & Warm Specialist Lifecycle
 
 ### 3.1 Canonical Roster Handles
-Map Guardian's existing 7 `SpecialistProfile`s (`src/server/agent-session.ts`) plus deterministic system actors to short, ergonomic handles:
+Map Kovo Hunter's existing 7 `SpecialistProfile`s (`src/server/agent-session.ts`) plus deterministic system actors to short, ergonomic handles:
 
 | Handle | Role | Maps To | Spawn Policy |
 | :--- | :--- | :--- | :--- |
@@ -75,8 +75,8 @@ Map Guardian's existing 7 `SpecialistProfile`s (`src/server/agent-session.ts`) p
 ```
 
 - **`waiting` preserves session state:** The member keeps its `@earendil-works/pi-durable` `sessionId` and `lastReadSeq` cursor on disk at zero runtime cost until woken by a targeted `@mention` or a new `ChainStep` brief.
-- **Concurrency & budget compliance:** Waking a `waiting` member enqueues a wakeup job against Guardian's existing `workerConcurrency` semaphore, `budgetUsd`, `budgetRequests`, and `K=6` diminishing-returns gate.
-- **Context ceiling & clean retirement:** When a warm specialist reaches its configured turn ceiling (e.g., `maxTurnsCeiling`) or prompt-token budget (~60% of model context window), Guardian forces a concise closure summary post to the board and marks the member `retired`. Any subsequent work for that profile spawns a fresh member (`@bola-r2` or recycled session) seeded from `facts` and the closure post.
+- **Concurrency & budget compliance:** Waking a `waiting` member enqueues a wakeup job against Kovo Hunter's existing `workerConcurrency` semaphore, `budgetUsd`, `budgetRequests`, and `K=6` diminishing-returns gate.
+- **Context ceiling & clean retirement:** When a warm specialist reaches its configured turn ceiling (e.g., `maxTurnsCeiling`) or prompt-token budget (~60% of model context window), Kovo Hunter forces a concise closure summary post to the board and marks the member `retired`. Any subsequent work for that profile spawns a fresh member (`@bola-r2` or recycled session) seeded from `facts` and the closure post.
 
 ---
 
@@ -276,7 +276,7 @@ Replace the `Coordinator` tab in the resizable right split-pane (`.chat-pane`):
 - **Verification:**
   - `npm run check && npm run build`
   - Unit & boundary tests for redaction, scope-revocation tainting, and `@mention` routing.
-  - Playwright E2E verifying right-pane `Board` tab renders live briefs/verdicts/approvals and plain messages still receive `@coordinator` replies (all existing `guardian-v2.spec.ts` and `guardian-v4.spec.ts` passing).
+  - Playwright E2E verifying right-pane `Board` tab renders live briefs/verdicts/approvals and plain messages still receive `@coordinator` replies (all existing `kovo-v2.spec.ts` and `kovo-v4.spec.ts` passing).
 
 ### Phase 2 — Specialist `board_post` / `board_read` & Passive Peer Awareness
 **Goal:** Give existing specialists visibility into peer claims/blockers/leads and allow structured handoff posts without changing worker lifecycle yet.
@@ -306,4 +306,4 @@ Replace the `Coordinator` tab in the resizable right split-pane (`.chat-pane`):
 | Orchestration & Tools | `src/server/agent-session.ts`, `src/server/execution.ts`, `src/server/replay-verifier.ts` |
 | Live Transport | `src/routes/api.runs.$runId.events.ts` *(reuses existing SSE event bus)* |
 | Frontend UI | `src/components/run-board.tsx` *(new)*, `src/components/run-workspace.tsx`, `src/components/run-state.ts`, `src/app.css` |
-| Tests | `tests/v4-board-boundaries.test.ts` *(new)*, `tests/guardian-v4.spec.ts` |
+| Tests | `tests/v4-board-boundaries.test.ts` *(new)*, `tests/kovo-v4.spec.ts` |

@@ -46,7 +46,7 @@ export async function handleEdge(
 
   if (url.pathname.startsWith(`${p}/`)) {
     const raw = method === 'GET' || method === 'HEAD' ? '' : await readBody(req)
-    const headers: Record<string, string> = { 'x-guardian-run-id': runId, 'x-edge-region': 'mh-lab-1' }
+    const headers: Record<string, string> = { 'x-kovo-run-id': runId, 'x-edge-region': 'mh-lab-1' }
     const authorization = header(req, 'authorization')
     if (authorization) headers.authorization = authorization
     const contentType = header(req, 'content-type')

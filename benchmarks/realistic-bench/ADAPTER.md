@@ -1,7 +1,7 @@
-# Guardian integration adapter (`realistic-bench`)
+# Kovo Hunter integration adapter (`realistic-bench`)
 
 Pane 3's contract (`run.ts`) owns materialization, the impact oracle and grading, but it stops
-at "what the scanner may see" (`briefingFor`). Guardian's engines need more: authenticated
+at "what the scanner may see" (`briefingFor`). Kovo Hunter's engines need more: authenticated
 personas, a benchmark-server handle for `EngineEnv`, and finding objects in the grader schema.
 This adapter is that missing layer.
 
@@ -11,9 +11,9 @@ All code here is benchmark scope: nothing under `src/` or `scripts/` was modifie
 
 | File | Purpose |
 | --- | --- |
-| `guardian-adapter.ts` | `runGuardianAgainstMaterialized()` — discovery → hypotheses → probes → replay-spec synthesis → Zero-LLM verification, emitted as `SubmittedFinding[]` + `RunTelemetry`. Also `startOobCanaryBroker()`, `readMaterializedSurface()`, `loadGuardianEngine()`, and a manifest-mode `runGuardianLivePipelineAgainstMaterialized()`. |
-| `guardian-login.ts` | Derives the login route from `variant.json` routes and exchanges briefing email/password for cookie/bearer credentials per persona. |
-| `benchmark-realistic.ts` | Thin CLI: materialize → run Guardian → `gradeRun()` → recall/precision by class + decoy FP count. |
+| `kovo-adapter.ts` | `runKovoAgainstMaterialized()` — discovery → hypotheses → probes → replay-spec synthesis → Zero-LLM verification, emitted as `SubmittedFinding[]` + `RunTelemetry`. Also `startOobCanaryBroker()`, `readMaterializedSurface()`, `loadKovoEngine()`, and a manifest-mode `runKovoLivePipelineAgainstMaterialized()`. |
+| `kovo-login.ts` | Derives the login route from `variant.json` routes and exchanges briefing email/password for cookie/bearer credentials per persona. |
+| `benchmark-realistic.ts` | Thin CLI: materialize → run Kovo Hunter → `gradeRun()` → recall/precision by class + decoy FP count. |
 
 The engine itself is imported from the repo (never copied): `scripts/benchmark-env.ts`
 (`createEngineEnv`, `discoverEndpoints`), `scripts/benchmark-probes.ts`
@@ -26,9 +26,9 @@ this `tsconfig.json` does not have to typecheck `scripts/` + `src/`.
 ## API
 
 ```ts
-import { runGuardianAgainstMaterialized } from './guardian-adapter.ts'
+import { runKovoAgainstMaterialized } from './kovo-adapter.ts'
 
-const run = await runGuardianAgainstMaterialized({
+const run = await runKovoAgainstMaterialized({
   treeDir: started.sourceDir,        // materialized src/ (contains variant.json)
   seed: 42,
   app: 'acme-saas',
@@ -76,7 +76,7 @@ Behavior:
 
 ### Manifest mode (diagnostic only)
 
-`runGuardianLivePipelineAgainstMaterialized({ started, treeDir, manifest, ... })` wraps
+`runKovoLivePipelineAgainstMaterialized({ started, treeDir, manifest, ... })` wraps
 `runLivePipeline` with the shared launcher contract
 (`{ origin, port, personas: {cookie|token}, close }`). It exists for parity/diagnostic runs where
 a caller already owns a manifest; the truth-free path above never uses it.
@@ -84,8 +84,8 @@ a caller already owns a manifest; the truth-free path above never uses it.
 ## CLI
 
 ```bash
-cd /home/omarchy/guardian            # repo root
-export GUARDIAN_ALLOW_LOCAL_LAB=1
+cd /home/omarchy/kovo-hunter            # repo root
+export KOVO_ALLOW_LOCAL_LAB=1
 
 node benchmarks/realistic-bench/benchmark-realistic.ts \
   --app acme-saas --seed 42 --split dev \
@@ -116,8 +116,8 @@ by vuln class:
 Dev seed (reproducible, no salt):
 
 ```bash
-cd /home/omarchy/guardian
-GUARDIAN_ALLOW_LOCAL_LAB=1 node benchmarks/realistic-bench/benchmark-realistic.ts \
+cd /home/omarchy/kovo-hunter
+KOVO_ALLOW_LOCAL_LAB=1 node benchmarks/realistic-bench/benchmark-realistic.ts \
   --app acme-saas --seed 42 --split dev --profile-mode v4-full --mode grey-box \
   --out-json benchmarks/realistic-bench/out/dev-acme-42.score.json \
   --out-md benchmarks/realistic-bench/out/dev-acme-42.score.md
@@ -126,8 +126,8 @@ GUARDIAN_ALLOW_LOCAL_LAB=1 node benchmarks/realistic-bench/benchmark-realistic.t
 Held-out seed (salt never committed; `>= 16` chars):
 
 ```bash
-cd /home/omarchy/guardian
-GUARDIAN_ALLOW_LOCAL_LAB=1 GUARDIAN_RB_HELDOUT_SALT="$GUARDIAN_RB_HELDOUT_SALT" \
+cd /home/omarchy/kovo-hunter
+KOVO_ALLOW_LOCAL_LAB=1 KOVO_RB_HELDOUT_SALT="$KOVO_RB_HELDOUT_SALT" \
   node benchmarks/realistic-bench/benchmark-realistic.ts \
   --app acme-saas --seed 1000042 --split heldout --profile-mode v4-full --mode grey-box \
   --out-json benchmarks/realistic-bench/out/heldout-acme-1000042.score.json \
@@ -139,7 +139,7 @@ All three apps, dev seed sweep:
 ```bash
 for app in acme-saas shopflow opsportal; do
   for seed in 1 2 3; do
-    GUARDIAN_ALLOW_LOCAL_LAB=1 node benchmarks/realistic-bench/benchmark-realistic.ts \
+    KOVO_ALLOW_LOCAL_LAB=1 node benchmarks/realistic-bench/benchmark-realistic.ts \
       --app "$app" --seed "$seed" --split dev \
       --out-json "benchmarks/realistic-bench/out/dev-$app-$seed.score.json" || exit 1
   done
@@ -149,19 +149,19 @@ done
 ## Validation
 
 ```bash
-GUARDIAN_ALLOW_LOCAL_LAB=1 node --test benchmarks/realistic-bench/tests/
+KOVO_ALLOW_LOCAL_LAB=1 node --test benchmarks/realistic-bench/tests/
 node_modules/.bin/tsc -p benchmarks/realistic-bench/tsconfig.json
 ```
 
 Adapter tests cover: grader-schema validity, CWE→vulnClass mapping, dedupe, telemetry,
-`GUARDIAN_ALLOW_LOCAL_LAB` refusal, treeDir/sourceDir mismatch refusal, cookie+form+bearer login,
+`KOVO_ALLOW_LOCAL_LAB` refusal, treeDir/sourceDir mismatch refusal, cookie+form+bearer login,
 loopback-only login, and — via throwing getters — that `groundTruth`/`plan.sites` are never read.
 
 ## Baseline after merging engine `ca992f6` (native, no shims)
 
-Apps snapshot synced read-only at 2026-11-21 23:28 PT; Guardian engine at `ca992f6`
+Apps snapshot synced read-only at 2026-11-21 23:28 PT; Kovo Hunter engine at `ca992f6`
 (23/25 xben-25, 0 FP). Adapter now consumes `synthesizeSpecs` (multiple specs per signal).
-Nine runs, `GUARDIAN_ALLOW_LOCAL_LAB=1`, `v4-full`, grey-box:
+Nine runs, `KOVO_ALLOW_LOCAL_LAB=1`, `v4-full`, grey-box:
 
 | app | seed | recall | precision | decoy FP | unmatched FP | findings | runtime |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -228,7 +228,7 @@ the materialized route template, not a concrete id.
   `Unknown named parameter '0'` (`lib/db.ts` does not spread array bindings) and a missing
   shopflow `hardened.ts`; the current wiring routes around the former. A future site module
   calling `db.run(sql, [..])` directly would still hit it.
-- `tests/safety.test.ts` passes; its `FS_ALLOWED` list includes `guardian-adapter.ts` and
+- `tests/safety.test.ts` passes; its `FS_ALLOWED` list includes `kovo-adapter.ts` and
   `benchmark-realistic.ts` (benchmark tooling). Re-apply that one-line-list change if pane 3's
   safety test is re-synced over this tree.
 - The merged engine exports `synthesizeSpecs` (array). The adapter prefers it and falls back to
@@ -237,6 +237,6 @@ the materialized route template, not a concrete id.
   not count toward `static_only` / `staticRecall` and cannot inflate precision.
 - `runLivePipelineAgainstMaterialized` uses `suite: 'xben-25'` purely as the pipeline's suite
   label; the caller supplies the manifest and no suite scoring is performed.
-- `tests/safety.test.ts`'s `FS_ALLOWED` list gained `guardian-adapter.ts` and
+- `tests/safety.test.ts`'s `FS_ALLOWED` list gained `kovo-adapter.ts` and
   `benchmark-realistic.ts` (benchmark tooling: variant.json read + artifact writes). Re-apply that
   one-line-list change if pane 3's safety test is re-synced over this tree.

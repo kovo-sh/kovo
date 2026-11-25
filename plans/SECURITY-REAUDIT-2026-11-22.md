@@ -1,7 +1,7 @@
-# Guardian security re-audit (adversarial, read-only)
+# Kovo Hunter security re-audit (adversarial, read-only)
 
 - Date: 2026-11-22
-- Repo: `/home/omarchy/guardian`
+- Repo: `/home/omarchy/kovo-hunter`
 - HEAD: `3c0a547` (merge of `probe-split` + compat audit)
 - Fix commits in scope (all confirmed ancestors of HEAD): `6350a4f` (Tier-3 approvals), `ad853ab`/`fec9df8` (session/IdP/browser), `dbcc773` (repo/worker/lab).
 - Method: trace real call paths, then try to refute each claim with targeted `node --test` runs and small throw-away probes under `/tmp` (no repo/source edits, no benchmarks, no commits).
@@ -21,7 +21,7 @@ Framing: defensive authorization/scope re-audit of a local, authorized security-
 | 4 | MED Clerk/provider host scope | **PARTIAL** | “PSL-aware” is a hardcoded partial list; private/multi-tenant suffixes (`github.io`, `vercel.app`, `com.co`, `s3.amazonaws.com`, …) collapse to the suffix and authorize attacker-controlled sibling tenants. Form login never validates its login URL. |
 | 5 | MED credential redirects + SSRF | **PARTIAL** | Redirects are manual and fail closed; address classification is sound, but checked addresses are **not pinned**, zero-address resolutions and `unknown` browser results are accepted, and the browser re-resolves at connect. |
 | 6 | MED browser egress (`scoped-browser.ts`) | **FIXED** | All listed controls are present and fail closed; residual egress via WebTransport/IP literal and a fail-open `routeWebSocket` fallback remain (see residuals). The bigger gap is that the same guards were not applied to the persona form-login browser. |
-| 7 | MED lab container | **PARTIAL** | Non-root/read-only/cap-drop/no-socket are present, but `GUARDIAN_LAB_USER=00:00` passes the root check, and the IAST telemetry bind mount is RW and shared across runs. |
+| 7 | MED lab container | **PARTIAL** | Non-root/read-only/cap-drop/no-socket are present, but `KOVO_LAB_USER=00:00` passes the root check, and the IAST telemetry bind mount is RW and shared across runs. |
 | 8 | MED approval fast paths | **PARTIAL** | GraphQL envelope/multipart/rationale fixes hold, but the older idempotent-POST gate bypasses the whole approval pipeline, duplicate JSON keys are parity-unsafe, and >64 KiB or gzip bodies evade the keyword scan. |
 | 9 | MED worker output bounds | **FIXED** | 64 KiB/line + 4 MiB/session enforced with terminate-on-overrun; stderr bounded separately; no buffered/before-check allocation found. |
 
@@ -41,7 +41,7 @@ Framing: defensive authorization/scope re-audit of a local, authorized security-
 - Different persona/body/flags/path: covered by the test at `:414-418`.
 - Forged by a missing context: callers without context cannot consume a one-shot grant at all (`approval-judge.ts:408`), so this fails **closed**.
 - Run/scope change survival: runId and scope revision are in the key; fail closed.
-- Local-lab path: `localLabAutoApproval` is evaluated before patterns/ledger and returns `approved` for every request at that origin (`approval-judge.ts:394-396`), but it requires `environment=local-lab`, `GUARDIAN_ALLOW_LOCAL_LAB=1`, tier ≥ 3, non-strict policy, and `isLocalLabAutoApprovalOrigin` (`execution.ts:1171-1176`). Metadata/link-local hosts are rejected there (`approval-judge.ts:192-197`) and independently by the broker’s unconditional link-local resolver check (`broker.ts:2140-2153`). I could not bypass the origin binding. This is intentional per-run lab behavior, not a grant reuse.
+- Local-lab path: `localLabAutoApproval` is evaluated before patterns/ledger and returns `approved` for every request at that origin (`approval-judge.ts:394-396`), but it requires `environment=local-lab`, `KOVO_ALLOW_LOCAL_LAB=1`, tier ≥ 3, non-strict policy, and `isLocalLabAutoApprovalOrigin` (`execution.ts:1171-1176`). Metadata/link-local hosts are rejected there (`approval-judge.ts:192-197`) and independently by the broker’s unconditional link-local resolver check (`broker.ts:2140-2153`). I could not bypass the origin binding. This is intentional per-run lab behavior, not a grant reuse.
 
 **Remaining bypasses (why PARTIAL):**
 
@@ -76,7 +76,7 @@ Preconditions: a writable tree containing a dangling link at the moment the patc
 ## 3. MED — bootstrap session issuance
 
 **Verified:**
-- A session cookie is set in exactly one place: the bootstrap branch (`scripts/serve.ts:173-186`). No other route sets `guardian_local`; the app response’s `set-cookie` is only forwarded after an authorized request (`serve.ts:188-224`).
+- A session cookie is set in exactly one place: the bootstrap branch (`scripts/serve.ts:173-186`). No other route sets `kovo_local`; the app response’s `set-cookie` is only forwarded after an authorized request (`serve.ts:188-224`).
 - Only `GET` with a `bootstrap` search param is accepted; `HEAD` falls through to 401. `isBootstrapAuthorized` requires exactly 64 lowercase hex chars and uses `timingSafeEqual` after a length check (`serve.ts:74-83`).
 - Single use is safe against a race: `bootstrapConsumed` is checked and set synchronously with no `await` in between, then the 0600 file is removed (`serve.ts:176-181`). A second attempt gets 401 (`tests/v5-security-authbrowser.test.ts:107-108`).
 - The 303 strips the secret from `Location` (`serve.ts:182-184`), and `Referrer-Policy: no-referrer` is set.
@@ -84,7 +84,7 @@ Preconditions: a writable tree containing a dangling link at the moment the patc
 - Cookie is `HttpOnly; SameSite=Strict`, with `Secure` on HTTPS (`serve.ts:85-87`).
 - Duplicate/encoded params: `searchParams.get` returns the first value and the candidate is re-validated as strict hex; neither form opens a bypass without knowing the 256-bit secret.
 
-**Caveats (not bypasses):** the secret is accepted on any GET path, not only `/`; the bootstrap branch has no `Sec-Fetch-Site` check (possession of the secret is the credential); the URL is printed to stdout and written to `bootstrap-url` (0600; that file is not deleted on consumption); a reverse proxy in front of `GUARDIAN_PUBLIC_ORIGIN` may log the request line containing `?bootstrap=`. The long-lived session token is port-agnostic under browser cookie rules, so another service on `localhost` can receive it on a same-site top-level navigation (it cannot read the HttpOnly value, but its server sees the header).
+**Caveats (not bypasses):** the secret is accepted on any GET path, not only `/`; the bootstrap branch has no `Sec-Fetch-Site` check (possession of the secret is the credential); the URL is printed to stdout and written to `bootstrap-url` (0600; that file is not deleted on consumption); a reverse proxy in front of `KOVO_PUBLIC_ORIGIN` may log the request line containing `?bootstrap=`. The long-lived session token is port-agnostic under browser cookie rules, so another service on `localhost` can receive it on a same-site top-level navigation (it cannot read the HttpOnly value, but its server sees the header).
 
 ---
 
@@ -129,7 +129,7 @@ Consequences: for a persona whose target is a tenant on a shared platform (GitHu
 ## 6. MED — scoped browser egress
 
 **Verified as fixed in `src/server/scoped-browser.ts`:**
-- Sandbox on by default; `--no-sandbox` only with `GUARDIAN_INSECURE_NO_SANDBOX=1` plus a warning (`:295-305`, `:358-363`).
+- Sandbox on by default; `--no-sandbox` only with `KOVO_INSECURE_NO_SANDBOX=1` plus a warning (`:295-305`, `:358-363`).
 - `--host-resolver-rules=MAP * ~NOTFOUND` + `--disable-background-networking` (`:296-302`), and every request is fulfilled through the broker — no `route.continue` in this file.
 - Non-proxied UDP/WebRTC flags plus constructor neutralisation (`:300-313`, `:739-740`).
 - `serviceWorkers: 'block'` (`:736`, and `:1579`).
@@ -151,13 +151,13 @@ Consequences: for a persona whose target is a tenant on a shared platform (GitHu
 - `docker run` includes `--user <non-root>`, `--cap-drop ALL`, `--security-opt no-new-privileges`, `--read-only`, `/tmp` tmpfs, memory/CPU/pids limits, and per-run labels (`src/server/lab-runner.ts:779-802`).
 - `/app` is a read-only bind mount; IAST hooks are read-only; the only RW mount is the telemetry dir (`:1293,1298,1303,1306`). No Docker socket, no `--privileged`.
 - The lab network is `--internal` with `inhibit_ipv4=true` (`:1443-1455`).
-- Telemetry dir is created/chmod 0700, and chowned to the container user only when Guardian is root (`:751-759`).
+- Telemetry dir is created/chmod 0700, and chowned to the container user only when Kovo Hunter is root (`:751-759`).
 - Compose parsing does not carry `volumes` through to `docker run`; explicit service objects are whitelisted (`:324-460`).
 
 **Refutation:**
-- **`GUARDIAN_LAB_USER` root check is textual.** `resolveLabContainerUser` rejects only `candidate.split(':')[0] === '0'` (`:738-743`). Verified: `00:00` and `000:1000` are accepted. Docker’s numeric user parsing accepts leading zeros, so `00:00` resolves to uid 0 — the exact condition the function claims to forbid. Impact is mitigated by cap-drop/no-new-privileges/read-only rootfs, but container root can still chown/write the RW telemetry bind mount and any future RW mount.
+- **`KOVO_LAB_USER` root check is textual.** `resolveLabContainerUser` rejects only `candidate.split(':')[0] === '0'` (`:738-743`). Verified: `00:00` and `000:1000` are accepted. Docker’s numeric user parsing accepts leading zeros, so `00:00` resolves to uid 0 — the exact condition the function claims to forbid. Impact is mitigated by cap-drop/no-new-privileges/read-only rootfs, but container root can still chown/write the RW telemetry bind mount and any future RW mount.
 - The telemetry mount is RW (`:1303`) and, when the data-dir path is used (`execution.ts:2452`), is **shared across runs** (`<data>/evidence/lab-telemetry`). One lab app can read/overwrite another run’s telemetry, and there is no quota on the bind mount (disk-fill DoS). I found no host reader that follows links placed there today, so this is cross-run integrity/DoS rather than a direct host escape.
-- When Guardian is non-root and the operator sets a non-root `GUARDIAN_LAB_USER` different from Guardian’s uid, the 0700 telemetry dir is not writable by the container and IAST silently produces nothing (fail-closed functional regression).
+- When Kovo Hunter is non-root and the operator sets a non-root `KOVO_LAB_USER` different from Kovo Hunter’s uid, the 0700 telemetry dir is not writable by the container and IAST silently produces nothing (fail-closed functional regression).
 
 ---
 
@@ -171,7 +171,7 @@ Consequences: for a persona whose target is a tenant on a shared platform (GitHu
 
 **Remaining bypasses (why PARTIAL):**
 - **The older idempotent-POST gate short-circuits all of this** (see finding 1, item 2): path-name + “no literal mutation” is the only test, and it runs before `evaluateTier3Approval`.
-- **Duplicate top-level JSON keys.** `parseJsonObjectBody` uses `JSON.parse` (last-wins, `:480-490`). Verified: a body with the same `query` key twice — first a mutation, then a read-only document — is auto-approved as `benign_fast_path`. Guardian forwards the body unchanged, so a target parser that takes the first occurrence executes the mutation. Parity-unsafe even if most popular parsers are last-wins.
+- **Duplicate top-level JSON keys.** `parseJsonObjectBody` uses `JSON.parse` (last-wins, `:480-490`). Verified: a body with the same `query` key twice — first a mutation, then a read-only document — is auto-approved as `benign_fast_path`. Kovo Hunter forwards the body unchanged, so a target parser that takes the first occurrence executes the mutation. Parity-unsafe even if most popular parsers are last-wins.
 - **No outbound body-size cap.** `textBody` is capped, but `jsonBody` is `z.unknown()` (`src/replay-spec.ts:393-394`); a body larger than 64 KiB can place a destructive keyword past `MAX_KEYWORD_SCAN_CHARS`, and the judge preview is only 1,200 chars (`:825`). The 64 KiB scan therefore has a truncation gap.
 - **Compressed bodies.** A request with `Content-Encoding: gzip` is scanned as compressed bytes, so the keyword hard-escalation never sees the plaintext and the judge receives a gibberish preview. The broker does not decompress request bodies for classification.
 - `isReadOnlySearchPost` trusts the path name (`search|query|filter|lookup|introspect|validate|check|health|ping`) plus the absence of a small mutation keyword set (`:87-91`, `519-524`); a state-changing POST on any such path that avoids those words is auto-approved at `benign_fast_path`.
@@ -198,9 +198,9 @@ Consequences: for a persona whose target is a tenant on a shared platform (GitHu
 3. **Tier-3 state-change batches now hard-fail.** `request_http_batch` calls `executeBatch` with no `BrokerApprovalRequired` catch (`execution.ts:5400-5420`), so once the first grant is consumed any further batch item fails the whole tool.
 4. **Local-lab `localhost` persona login is always rejected.** `classifyAddress('localhost')` is `blocked` (`persona-auth.ts:251-259`), so an explicitly allowlisted `http://localhost:<port>` credential target fails at `:574-580`; only `127.0.0.1`/`[::1]` work.
 5. **Bootstrap operational/leak surface.** The one-time URL is printed to stdout and stored in `bootstrap-url` (0600) and can appear in a reverse proxy’s request log. The `bootstrap-url` file is not removed when the secret is consumed. Headless/UI automation must now read the 0600 file (the Playwright fixture does).
-6. **Sandbox-by-default can break browser probes inside containers where user namespaces are unavailable**, forcing the explicit `GUARDIAN_INSECURE_NO_SANDBOX=1` opt-in (with reduced isolation).
+6. **Sandbox-by-default can break browser probes inside containers where user namespaces are unavailable**, forcing the explicit `KOVO_INSECURE_NO_SANDBOX=1` opt-in (with reduced isolation).
 7. **Read-only rootfs + non-root user + cap-drop can break images that expect to write outside `/tmp`** (e.g. package managers/entrypoints), turning some lab targets into start failures. This is the intended trade-off, but it should be surfaced in the lab error path.
-8. **`GUARDIAN_LAB_USER=00:00` is accepted as root** (finding 7), which is a validation regression relative to the stated invariant.
+8. **`KOVO_LAB_USER=00:00` is accepted as root** (finding 7), which is a validation regression relative to the stated invariant.
 
 ---
 
@@ -223,7 +223,7 @@ The hardcoded suffix list treats `github.io`, `vercel.app`, `com.co`, `s3.amazon
 5. **Fix the dangling-symlink containment bug**: `lstat` every existing component (including broken links) and reject links unconditionally before returning from `safeResolveUnderRoot`; write patch files with `O_NOFOLLOW | O_CREAT | O_EXCL` and verify the parent realpath at write time.
 6. **Restore legitimate Tier-3 flows**: pass the full `StateChangeApprovalContext` from `replay-verifier`/`probes` (including `isRceProof`, body hash, persona), or add a spec-scoped grant that the verifier consumes; register one grant per **request instance** (or dedupe burst requests before preparation) so identical race bursts work; add a catch/approval path for `request_http_batch`.
 7. **Tighten patterns**: wildcard only ID-like target segments, not arbitrary literals; consider removing the trailing-`*` arbitrary-depth prefix match or requiring an explicit operator confirmation for it; never allow patterns to cover `rce_proof` regardless of context availability.
-8. **Lab hardening**: compare the numeric uid parsed from `GUARDIAN_LAB_USER` (`Number(...) !== 0`), make the telemetry mount per-run (or `readonly` unless IAST is enabled), and add quota/cleanup; consider `--userns-remap`/rootless docs.
+8. **Lab hardening**: compare the numeric uid parsed from `KOVO_LAB_USER` (`Number(...) !== 0`), make the telemetry mount per-run (or `readonly` unless IAST is enabled), and add quota/cleanup; consider `--userns-remap`/rootless docs.
 9. **Fast-path parity**: reject duplicate top-level JSON keys (parse with a strict/duplicate-aware parser or scan the raw body for repeated `"query"` keys), cap outbound body size, and classify compressed bodies by rejecting `Content-Encoding` on Tier-3 state changes.
 10. **Bootstrap hygiene**: strip/avoid logging the bootstrap URL at the proxy, remove `bootstrap-url` on consumption, and consider a session token bound to the issuing origin/port where possible.
 
@@ -238,5 +238,5 @@ The hardcoded suffix list treats `github.io`, `vercel.app`, `com.co`, `s3.amazon
 - Registrable domain: real `registrableDomain`/`isHostInScope`; `app.example.github.io` → `github.io`, and a sibling host is in scope.
 - Dangling symlink: under `/tmp`, a create-file unified diff through a dangling link wrote the target outside the root; `safeResolveUnderRoot` accepted the path.
 - Race burst: real `StateChangeApprovalLedger` + `RequestBroker.executeRaceBurst`; one grant, three identical requests → `BrokerApprovalRequired` on the second.
-- Lab user: `resolveLabContainerUser({GUARDIAN_LAB_USER:'00:00'})` returns `00:00` (accepted).
+- Lab user: `resolveLabContainerUser({KOVO_LAB_USER:'00:00'})` returns `00:00` (accepted).
 - Localhost: `classifyAddress('localhost') === 'blocked'`; `127.0.0.1` and `::1` are `loopback`.

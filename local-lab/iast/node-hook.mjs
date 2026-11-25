@@ -2,7 +2,7 @@ import http from 'node:http'
 import { writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 
-const OUT_DIR = process.env.GUARDIAN_IAST_OUT_DIR || '/var/run/guardian-iast'
+const OUT_DIR = process.env.KOVO_IAST_OUT_DIR || '/var/run/kovo-iast'
 const MAX_BYTES = 65_536
 
 const SECRET_PATTERNS = [
@@ -71,11 +71,11 @@ function writeTelemetryRecord(traceId, record) {
 const seenRoutes = new Set()
 const origEmit = http.Server.prototype.emit
 
-http.Server.prototype.emit = function guardianIastEmit(event, ...args) {
+http.Server.prototype.emit = function kovoIastEmit(event, ...args) {
   if (event === 'request' && args.length >= 2) {
     const req = args[0]
     const res = args[1]
-    const rawTrace = req && req.headers ? req.headers['x-guardian-trace-id'] : undefined
+    const rawTrace = req && req.headers ? req.headers['x-kovo-trace-id'] : undefined
     const traceId = Array.isArray(rawTrace) ? rawTrace[0] : rawTrace
     if (typeof traceId === 'string' && traceId.trim()) {
       let pathname = '/'
@@ -103,12 +103,12 @@ http.Server.prototype.emit = function guardianIastEmit(event, ...args) {
         bodyBytes += buf.length
       }
 
-      res.write = function guardianIastWrite(chunk, ...rest) {
+      res.write = function kovoIastWrite(chunk, ...rest) {
         captureChunk(chunk)
         return origWrite.call(this, chunk, ...rest)
       }
 
-      res.end = function guardianIastEnd(chunk, ...rest) {
+      res.end = function kovoIastEnd(chunk, ...rest) {
         if (chunk && typeof chunk !== 'function') captureChunk(chunk)
         if (!flushed) {
           flushed = true

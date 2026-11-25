@@ -1,7 +1,7 @@
 {
   "schemaVersion": "1.0",
   "bundleKind": "dev_anchors",
-  "description": "Guardian v8 M2 Dev OSS Multi-Hop Anchor Specs (4 targets: Gitea, Directus, Ghost, Mattermost). Defensive QA manifests, external impact oracles, and paired patch-retest contracts only — zero exploit payloads.",
+  "description": "Kovo Hunter v8 M2 Dev OSS Multi-Hop Anchor Specs (4 targets: Gitea, Directus, Ghost, Mattermost). Defensive QA manifests, external impact oracles, and paired patch-retest contracts only — zero exploit payloads.",
   "anchors": [
     {
       "schemaVersion": "1.0",
@@ -78,7 +78,7 @@
         "kind": "loopback_oob_collector",
         "description": "Verifies isolated internal pivot callback bearing run-scoped canary token on the loopback collector.",
         "targetService": "internal_runner_meta",
-        "expectedCorrelationField": "X-Guardian-Run-Id",
+        "expectedCorrelationField": "X-Kovo-Run-Id",
         "pollTimeoutMs": 5000,
         "runScopedCanaryPrefix": "oss_canary_gitea_",
         "collectorUrl": "http://127.0.0.1:19401/oob/gitea",
@@ -141,7 +141,7 @@
           },
           "internal_runner_meta": {
             "role": "internal_target",
-            "imageRef": "guardian-lab/internal-stub:1.0.0",
+            "imageRef": "kovo-lab/internal-stub:1.0.0",
             "imageDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "networks": ["gitea_internal"],
             "readOnlyRootFs": true,
@@ -441,7 +441,7 @@
           },
           "ghost_export_worker": {
             "role": "worker",
-            "imageRef": "guardian-lab/ghost-preview-bot:1.0.0",
+            "imageRef": "kovo-lab/ghost-preview-bot:1.0.0",
             "imageDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             "networks": ["ghost_internal"],
             "capDrop": ["ALL"]
@@ -563,7 +563,7 @@
         "services": {
           "mm_lab_proxy": {
             "role": "lab_proxy",
-            "imageRef": "guardian-lab/loopback-proxy:1.0.0",
+            "imageRef": "kovo-lab/loopback-proxy:1.0.0",
             "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
             "networks": ["mm_internal"],
             "ports": ["127.0.0.1:0:8065"],
@@ -583,7 +583,7 @@
           },
           "mattermost_idp": {
             "role": "idp",
-            "imageRef": "guardian-lab/oidc-stub:1.0.0",
+            "imageRef": "kovo-lab/oidc-stub:1.0.0",
             "imageDigest": "sha256:abababababababababababababababababababababababababababababababab",
             "networks": ["mm_internal"],
             "readOnlyRootFs": true,

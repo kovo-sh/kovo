@@ -27,7 +27,7 @@ import {
 import type {
   ComposeServiceRole,
   ExternalOracleObservation,
-  GuardianCompositeProofReceipt,
+  KovoCompositeProofReceipt,
   OssAnchorManifest,
   PatchRetestRecord,
   RunTelemetry,
@@ -340,7 +340,7 @@ function makeValidReceipt(
   runId: string,
   baseTs: number,
   correlationId: string,
-): GuardianCompositeProofReceipt {
+): KovoCompositeProofReceipt {
   const origin = anchor.personas.find((p) => p.allowedAsChainOrigin)!
   return {
     receiptId: `rcpt_${anchor.anchorId}`,

@@ -1,7 +1,7 @@
 /**
  * Confirmation-consistency audit (precision integrity).
  *
- * Reads persisted Guardian store(s) read-only and asserts the product invariant:
+ * Reads persisted Kovo Hunter store(s) read-only and asserts the product invariant:
  *   every finding persisted `runtime_confirmed` / `confirmed` must have persisted evidence that
  *   satisfies its oracle — its linked replay spec's `last_verification_diff.verdict === 'confirmed'`,
  *   an OOB ProofReceipt (`finding.verification` starts with `ProofReceipt` / an
@@ -44,11 +44,11 @@ function dbsUnder(root: string): string[] {
       let isDir = false
       try { isDir = statSync(path).isDirectory() } catch { continue }
       if (isDir) { if (name !== 'node_modules') visit(path, depth + 1) }
-      else if (name === 'guardian.sqlite') out.push(path)
+      else if (name === 'kovo.sqlite') out.push(path)
     }
   }
   if (!existsSync(root)) return out
-  try { if (statSync(root).isFile()) return root.endsWith('guardian.sqlite') ? [root] : [] } catch { return out }
+  try { if (statSync(root).isFile()) return root.endsWith('kovo.sqlite') ? [root] : [] } catch { return out }
   visit(root, 0)
   return out
 }

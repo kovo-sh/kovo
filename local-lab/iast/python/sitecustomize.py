@@ -1,4 +1,4 @@
-"""Guardian v4 zero-egress Python IAST hook for local-lab containers."""
+"""Kovo Hunter v4 zero-egress Python IAST hook for local-lab containers."""
 import json
 import os
 import re
@@ -6,7 +6,7 @@ import sys
 import time
 import traceback
 
-OUT_DIR = os.environ.get("GUARDIAN_IAST_OUT_DIR", "/var/run/guardian-iast")
+OUT_DIR = os.environ.get("KOVO_IAST_OUT_DIR", "/var/run/kovo-iast")
 MAX_BYTES = 65536
 
 _SECRET_PATTERNS = [
@@ -65,8 +65,8 @@ def emit_telemetry(trace_id: str, routes_hit=None, sink_events=None, exceptions=
 _orig_excepthook = sys.excepthook
 
 
-def _guardian_excepthook(exc_type, exc_value, exc_tb):
-    trace_id = os.environ.get("GUARDIAN_CURRENT_TRACE_ID", f"py-exc-{int(time.time() * 1000)}")
+def _kovo_excepthook(exc_type, exc_value, exc_tb):
+    trace_id = os.environ.get("KOVO_CURRENT_TRACE_ID", f"py-exc-{int(time.time() * 1000)}")
     stack = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
     emit_telemetry(
         trace_id,
@@ -76,4 +76,4 @@ def _guardian_excepthook(exc_type, exc_value, exc_tb):
     _orig_excepthook(exc_type, exc_value, exc_tb)
 
 
-sys.excepthook = _guardian_excepthook
+sys.excepthook = _kovo_excepthook

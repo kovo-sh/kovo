@@ -2,7 +2,7 @@
  * Agentic benchmark matrix (v5 M6 measurement).
  *
  * Runs app x seed x mode cells in parallel child processes. Every cell gets its own
- * artifact directory and an isolated Guardian data dir initialized from --data-dir, so
+ * artifact directory and an isolated Kovo Hunter data dir initialized from --data-dir, so
  * cells never contend for the source Store lock. Agentic cells require a
  * worker-session-capable verifier (`--verifier docker`); the matrix fails closed when a
  * cell is inert, when worker sessions cannot be opened, or when a preflight/lock error
@@ -12,13 +12,13 @@
  * or persisted; failures are summarized to a single short reason.
  *
  * Usage:
- *   newgrp docker -c 'GUARDIAN_ALLOW_LOCAL_LAB=1 node scripts/benchmark-agentic-matrix.ts \
+ *   newgrp docker -c 'KOVO_ALLOW_LOCAL_LAB=1 node scripts/benchmark-agentic-matrix.ts \
  *     --apps acme-saas,shopflow,opsportal --seeds 1,1000042 --modes grey-box \
  *     --data-dir /home/omarchy/guardian-data --verifier docker \
  *     --budget-usd 5 --max-duration-ms 1200000 --concurrency 3 \
  *     --out-dir /tmp/agentic-matrix'
  *
- * Held-out seeds (>= 1000000) require GUARDIAN_RB_HELDOUT_SALT (>= 16 chars, never
+ * Held-out seeds (>= 1000000) require KOVO_RB_HELDOUT_SALT (>= 16 chars, never
  * logged or committed). `--smoke` is the CI preset: 90 s wall cap, $0.25 budget.
  */
 import { spawn } from 'node:child_process'
@@ -70,7 +70,7 @@ export interface MatrixArgs {
   minFreeMemGb?: number
   /** Pause launching cells at/above this many running cell workers (default 16). */
   maxActiveWorkers?: number
-  /** Best-effort warm session container per cell (`GUARDIAN_WARM_WORKERS=0` disables). */
+  /** Best-effort warm session container per cell (`KOVO_WARM_WORKERS=0` disables). */
   warmWorkers?: boolean
   /** Route model traffic through the loopback gate (global stream cap + 429 AIMD). */
   modelGate?: boolean
@@ -292,26 +292,26 @@ export function parseMatrixArgs(
     fail(`--verifier must be one of ${MATRIX_KNOWN_VERIFIERS.join(', ')} (got '${verifierRaw}')`)
   }
 
-  const outDirRaw = stringFlag('out-dir') ?? '.guardian/agentic-matrix'
-  const dataDirRaw = stringFlag('data-dir') ?? env.GUARDIAN_DATA_DIR
+  const outDirRaw = stringFlag('out-dir') ?? '.kovo/agentic-matrix'
+  const dataDirRaw = stringFlag('data-dir') ?? env.KOVO_DATA_DIR
   const childTimeoutMs = stringFlag('timeout-ms') === undefined
     ? maxDurationMs + 5 * 60_000
     : parsePositiveInt(stringFlag('timeout-ms')!, '--timeout-ms')
   const minFreeMemGb = stringFlag('min-free-gb') === undefined
-    ? (Number(env.GUARDIAN_MATRIX_MIN_FREE_GB) > 0 ? Number(env.GUARDIAN_MATRIX_MIN_FREE_GB) : DEFAULT_MIN_FREE_MEM_GB)
+    ? (Number(env.KOVO_MATRIX_MIN_FREE_GB) > 0 ? Number(env.KOVO_MATRIX_MIN_FREE_GB) : DEFAULT_MIN_FREE_MEM_GB)
     : parseNumber(stringFlag('min-free-gb')!, '--min-free-gb', 0, 1024)
   const maxActiveWorkers = stringFlag('max-workers') === undefined
-    ? (Number(env.GUARDIAN_MATRIX_MAX_WORKERS) >= 1 ? Math.floor(Number(env.GUARDIAN_MATRIX_MAX_WORKERS)) : DEFAULT_MAX_ACTIVE_WORKERS)
+    ? (Number(env.KOVO_MATRIX_MAX_WORKERS) >= 1 ? Math.floor(Number(env.KOVO_MATRIX_MAX_WORKERS)) : DEFAULT_MAX_ACTIVE_WORKERS)
     : parsePositiveInt(stringFlag('max-workers')!, '--max-workers', 256)
-  const warmWorkers = boolFlag('warm-workers') || (!boolFlag('no-warm-workers') && !envFlagDisabled(env, 'GUARDIAN_WARM_WORKERS'))
-  const modelGate = boolFlag('model-gate') || (!boolFlag('no-model-gate') && !envFlagDisabled(env, 'GUARDIAN_MODEL_GATE'))
+  const warmWorkers = boolFlag('warm-workers') || (!boolFlag('no-warm-workers') && !envFlagDisabled(env, 'KOVO_WARM_WORKERS'))
+  const modelGate = boolFlag('model-gate') || (!boolFlag('no-model-gate') && !envFlagDisabled(env, 'KOVO_MODEL_GATE'))
   const maxInFlightStreams = stringFlag('max-inflight-streams') === undefined
     ? defaultMaxInFlightStreams(env)
     : parsePositiveInt(stringFlag('max-inflight-streams')!, '--max-inflight-streams', 256)
 
   const heldOutSeeds = seeds.filter(seed => seed >= HELDOUT_SEED_FLOOR)
-  if (heldOutSeeds.length && (env.GUARDIAN_RB_HELDOUT_SALT ?? '').length < 16) {
-    fail('held-out seeds (>= 1000000) require GUARDIAN_RB_HELDOUT_SALT (>= 16 chars)')
+  if (heldOutSeeds.length && (env.KOVO_RB_HELDOUT_SALT ?? '').length < 16) {
+    fail('held-out seeds (>= 1000000) require KOVO_RB_HELDOUT_SALT (>= 16 chars)')
   }
 
   return {
@@ -443,7 +443,7 @@ export interface CellRunOutcome {
 export type CellExecutor = (cell: MatrixCell, args: MatrixArgs) => Promise<CellRunOutcome>
 
 function childEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  return { ...base, GUARDIAN_ALLOW_LOCAL_LAB: '1' }
+  return { ...base, KOVO_ALLOW_LOCAL_LAB: '1' }
 }
 
 /**
@@ -457,12 +457,12 @@ export function cellEnv(
 ): NodeJS.ProcessEnv {
   const id = cellLabel(cell.label)
   const env = childEnv(base)
-  env.GUARDIAN_CELL_ID = id
-  env.GUARDIAN_RUN_LABEL = id
-  env.GUARDIAN_WARM_WORKERS = args.warmWorkers === false ? '0' : '1'
-  if (!args.modelGate) env.GUARDIAN_MODEL_GATE = '0'
+  env.KOVO_CELL_ID = id
+  env.KOVO_RUN_LABEL = id
+  env.KOVO_WARM_WORKERS = args.warmWorkers === false ? '0' : '1'
+  if (!args.modelGate) env.KOVO_MODEL_GATE = '0'
   if (args.dataDir) {
-    env.GUARDIAN_DATA_DIR = args.dataDirOverrides?.[cell.label] ?? resolve(args.outDir, 'data', cell.label)
+    env.KOVO_DATA_DIR = args.dataDirOverrides?.[cell.label] ?? resolve(args.outDir, 'data', cell.label)
   }
   return env
 }
@@ -750,10 +750,10 @@ export function renderMatrixSummary(totals: MatrixTotals): string {
   ].join('\n')
 }
 
-export const MATRIX_USAGE = `Guardian agentic benchmark matrix (v5 M6)
+export const MATRIX_USAGE = `Kovo Hunter agentic benchmark matrix (v5 M6)
 
 Usage:
-  GUARDIAN_ALLOW_LOCAL_LAB=1 node scripts/benchmark-agentic-matrix.ts [flags]
+  KOVO_ALLOW_LOCAL_LAB=1 node scripts/benchmark-agentic-matrix.ts [flags]
 
 Flags:
   --apps a,b              ${MATRIX_KNOWN_APPS.join(' | ')} (default: all)
@@ -762,9 +762,9 @@ Flags:
   --budget-usd <n>        per-cell USD budget (default: ${DEFAULT_MATRIX_BUDGET_USD})
   --max-duration-ms <n>   per-cell wall cap (default: ${DEFAULT_MATRIX_MAX_DURATION_MS})
   --concurrency <n>       parallel cells (default: ${DEFAULT_MATRIX_CONCURRENCY})
-  --out-dir <dir>         matrix artifacts (default: .guardian/agentic-matrix)
-  --data-dir <path>       Guardian data dir with an enabled model profile
-                          (default: $GUARDIAN_DATA_DIR); each cell gets an isolated copy
+  --out-dir <dir>         matrix artifacts (default: .kovo/agentic-matrix)
+  --data-dir <path>       Kovo Hunter data dir with an enabled model profile
+                          (default: $KOVO_DATA_DIR); each cell gets an isolated copy
   --verifier <kind>       auto | docker | local-jq (default: docker; auto with --no-llm)
   --no-llm                deterministic cells (no model profile)
   --keep-data-dirs        keep per-cell isolated data dirs
@@ -774,10 +774,10 @@ Flags:
   --max-workers <n>       pause new cells at this many running cell workers (default: ${DEFAULT_MAX_ACTIVE_WORKERS})
   --no-warm-workers       disable the per-cell warm session container pool
   --no-model-gate         bypass the loopback gate (no global stream cap / 429 AIMD)
-  --max-inflight-streams  global concurrent model streams (default: 28, env GUARDIAN_MODEL_MAX_STREAMS)
+  --max-inflight-streams  global concurrent model streams (default: 28, env KOVO_MODEL_MAX_STREAMS)
   --help                  show this help
 
-Held-out seeds need GUARDIAN_RB_HELDOUT_SALT (env only; never logged).
+Held-out seeds need KOVO_RB_HELDOUT_SALT (env only; never logged).
 Agentic cells need Docker worker access: run under \`newgrp docker -c '<command>'\`.
 Each cell gets its own data dir, ephemeral app/canary ports, cell label and run label.
 Exit codes: 0 clean, 2 fail-closed configuration/inert/lock, 1 cell failure.
@@ -832,7 +832,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     return 0
   }
   if (!args.noLlm && !args.dataDir) {
-    process.stderr.write('error: agentic matrix needs --data-dir (or GUARDIAN_DATA_DIR) with an enabled model profile; use --no-llm for deterministic cells\n')
+    process.stderr.write('error: agentic matrix needs --data-dir (or KOVO_DATA_DIR) with an enabled model profile; use --no-llm for deterministic cells\n')
     return 2
   }
   // Worker sessions need the Docker backend; a model profile + local-jq is inert, so fail fast.

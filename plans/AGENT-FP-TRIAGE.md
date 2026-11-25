@@ -2,7 +2,7 @@
 
 **Stream:** `agent-fp-triage` · **Branch:** `agents/agent-fp-triage` · **Base:** `66be563`
 **Cell under audit:** definitive held-out unified, seed `1000042`, 600 s, K=6, salt via
-`GUARDIAN_RB_HELDOUT_SALT` (never printed). Kept dirs: `/tmp/heldout-unified-definitive`.
+`KOVO_RB_HELDOUT_SALT` (never printed). Kept dirs: `/tmp/heldout-unified-definitive`.
 
 Baseline on that cell: 29/58 targets confirmed (50% recall), shopflow precision **83.3%**
 (2 unmatched FPs), opsportal precision **87.5%** (1 unmatched + 1 misclassified).

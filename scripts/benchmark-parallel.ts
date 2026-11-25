@@ -13,7 +13,7 @@
  *     rate-limited request can be retried; responses stream through untouched.
  *   - `ResourceGuard` — pauses launching new cells when MemAvailable < 6 GiB or the number of
  *     active worker containers exceeds 16. Pause/resume episodes are recorded for the summary.
- *   - `CellReaper` — removes containers by `dev.guardian.cell=<id>` label on exit/SIGINT/SIGTERM,
+ *   - `CellReaper` — removes containers by `dev.kovo.cell=<id>` label on exit/SIGINT/SIGTERM,
  *     and verifies no orphans remain. Only ever touches the labels it owns.
  *   - `rewriteProfileEndpoints` — rewrites enabled model-profile endpoints inside an isolated
  *     data dir (used to route through the gate); never touches credentials.
@@ -575,7 +575,7 @@ export function readMemAvailableBytes(): number {
 export async function countActiveWorkers(): Promise<number> {
   return new Promise(resolvePromise => {
     const child = spawn('docker', [
-      'ps', '--quiet', '--filter', 'label=dev.guardian.cell', '--filter', 'status=running',
+      'ps', '--quiet', '--filter', 'label=dev.kovo.cell', '--filter', 'status=running',
     ], { stdio: ['ignore', 'pipe', 'ignore'] })
     let out = ''
     child.stdout?.on('data', (chunk: Buffer) => { if (out.length < 64 * 1024) out += chunk.toString() })
@@ -711,7 +711,7 @@ export class CellReaper {
     for (const id of cell ? [cellLabel(cell)] : [...this.cells]) {
       if (!this.cells.has(id)) continue
       try {
-        const out = await this.docker(['ps', '--all', '--quiet', '--filter', `label=dev.guardian.cell=${id}`])
+        const out = await this.docker(['ps', '--all', '--quiet', '--filter', `label=dev.kovo.cell=${id}`])
         for (const line of out.split('\n')) {
           const trimmed = line.trim()
           if (trimmed) ids.push(trimmed)
@@ -763,8 +763,8 @@ export function rewriteProfileEndpoints(
   dataDir: string,
   map: (endpoint: string) => string,
 ): { updated: number; endpoints: string[] } {
-  const dbPath = resolve(dataDir, 'guardian.sqlite')
-  if (!existsSync(dbPath)) throw new Error(`model-profile rewrite needs guardian.sqlite in ${dataDir}`)
+  const dbPath = resolve(dataDir, 'kovo.sqlite')
+  if (!existsSync(dbPath)) throw new Error(`model-profile rewrite needs kovo.sqlite in ${dataDir}`)
   const db = new DatabaseSync(dbPath)
   try {
     const rows = db.prepare('select id, endpoint from model_profiles where enabled = 1').all() as Array<{ id: string; endpoint: string }>
@@ -798,7 +798,7 @@ export function formatGiB(bytes: number): string {
 
 /** Environment default for the global stream cap. */
 export function defaultMaxInFlightStreams(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = Number(env.GUARDIAN_MODEL_MAX_STREAMS)
+  const raw = Number(env.KOVO_MODEL_MAX_STREAMS)
   return Number.isFinite(raw) && raw >= 1 ? Math.min(256, Math.floor(raw)) : 28
 }
 

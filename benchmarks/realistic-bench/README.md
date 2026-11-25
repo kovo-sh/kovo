@@ -2,9 +2,9 @@
 
 An offline, loopback-only benchmark for measuring a defensive scanner's **High/Critical recall and
 precision** against realistic, multi-tenant web applications — a more faithful alternative to
-single-bug CTF suites like XBOW/XBEN. Built to score Guardian, but scanner-agnostic.
+single-bug CTF suites like XBOW/XBEN. Built to score Kovo Hunter, but scanner-agnostic.
 
-Everything runs on `127.0.0.1` behind `GUARDIAN_ALLOW_LOCAL_LAB=1`; all data is synthetic and every
+Everything runs on `127.0.0.1` behind `KOVO_ALLOW_LOCAL_LAB=1`; all data is synthetic and every
 dangerous sink (SSRF, XXE, path traversal, command execution, SSTI) is a safe, instrumented
 stand-in. No real network, filesystem, or shell is ever touched.
 
@@ -42,7 +42,7 @@ traversal, simulated command injection).
 ## Quick start
 
 ```sh
-export GUARDIAN_ALLOW_LOCAL_LAB=1
+export KOVO_ALLOW_LOCAL_LAB=1
 
 # Boot a lab instance (prints a per-mode briefing; writes ground truth + oracle/request logs to --out-dir on Ctrl-C)
 node benchmarks/realistic-bench/run.ts serve --app acme-saas --seed 3 --mode grey-box
@@ -54,20 +54,20 @@ node benchmarks/realistic-bench/run.ts selftest --app all --seeds 1,2,3
 node benchmarks/realistic-bench/run.ts grade --truth gt.json --findings f.json \
   --events ev.json --requests req.json --telemetry tel.json --md scorecard.md
 
-# List reproducible seeds (held-out needs GUARDIAN_RB_HELDOUT_SALT, >=16 chars)
+# List reproducible seeds (held-out needs KOVO_RB_HELDOUT_SALT, >=16 chars)
 node benchmarks/realistic-bench/run.ts seeds --set dev --n 5
 ```
 
 Typecheck: `node_modules/.bin/tsc -p benchmarks/realistic-bench/tsconfig.json`
-Tests: `GUARDIAN_ALLOW_LOCAL_LAB=1 node --test benchmarks/realistic-bench/tests/` (142 tests)
+Tests: `KOVO_ALLOW_LOCAL_LAB=1 node --test benchmarks/realistic-bench/tests/` (142 tests)
 
 ## Scoring commands (dev and held-out)
 
 Run from the repo root. Everything is loopback-only and refuses to start unless
-`GUARDIAN_ALLOW_LOCAL_LAB=1` is set.
+`KOVO_ALLOW_LOCAL_LAB=1` is set.
 
 ```sh
-export GUARDIAN_ALLOW_LOCAL_LAB=1
+export KOVO_ALLOW_LOCAL_LAB=1
 
 # Dev seed: reproducible, no salt. --split dev rejects seeds >= 1_000_000.
 node benchmarks/realistic-bench/benchmark-realistic.ts \
@@ -79,7 +79,7 @@ node benchmarks/realistic-bench/benchmark-realistic.ts \
 
 # Held-out seed: the salt comes from the environment only (>=16 chars, never committed).
 # --split heldout rejects seeds < 1_000_000 and refuses to run without the salt.
-GUARDIAN_ALLOW_LOCAL_LAB=1 GUARDIAN_RB_HELDOUT_SALT="$GUARDIAN_RB_HELDOUT_SALT" \
+KOVO_ALLOW_LOCAL_LAB=1 KOVO_RB_HELDOUT_SALT="$KOVO_RB_HELDOUT_SALT" \
   node benchmarks/realistic-bench/benchmark-realistic.ts \
   --app acme-saas --seed 1000001 --split heldout \
   --profile-mode v4-full --mode grey-box --verifier auto \
@@ -102,29 +102,29 @@ The same scorecard can be produced from externally captured artifacts with
 
 ## Parallel agentic matrix (real `Execution` harness)
 
-`scripts/benchmark-realistic.ts` drives Guardian's real `Execution` loop. A parallel
-agentic matrix must not share one Guardian data dir (the second Store would fail with
-`Another Guardian server is using this data directory`). With `--concurrency > 1`,
+`scripts/benchmark-realistic.ts` drives Kovo Hunter's real `Execution` loop. A parallel
+agentic matrix must not share one Kovo Hunter data dir (the second Store would fail with
+`Another Kovo Hunter server is using this data directory`). With `--concurrency > 1`,
 per-cell isolation is on by default:
 
 ```sh
 # Run from the repo root. The key stays in the source data dir; only profile metadata
 # is copied and credentials/ is symlinked into each cell.
-GUARDIAN_ALLOW_LOCAL_LAB=1 GUARDIAN_DATA_DIR=<guardian-data-dir> \
+KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR=<kovo-data-dir> \
 newgrp docker -c 'cd <repo> && node scripts/benchmark-realistic.ts \
   --app all --seeds 1 --mode grey-box --verifier docker \
   --concurrency 3 --isolate-data-dir --budget-usd 3 \
   --out-dir /tmp/rb-agentic-matrix'
 ```
 
-Each cell creates `<out-dir>/data/<app>-seed<seed>-<mode>/`, initializes a fresh Guardian
+Each cell creates `<out-dir>/data/<app>-seed<seed>-<mode>/`, initializes a fresh Kovo Hunter
 Store, copies only the enabled `model_profiles` rows (+ workspace identity), and symlinks
 `credentials/` to the source data dir. The key is never copied into the out-dir. Isolated
 dirs are removed after grading unless `--keep-data-dirs` is passed; `--isolate-data-dir`
 can also be forced for a single cell.
 
 **Current engine gap (do not misread as a benchmark bug):** as of repo `c345f46` / engine
-`ca992f6`, the full Guardian pipeline confirmed **0 vulnerabilities on every dev seed tried**
+`ca992f6`, the full Kovo Hunter pipeline confirmed **0 vulnerabilities on every dev seed tried**
 (acme 0/22, 0/22, 0/20; shopflow 0/18, 0/19, 0/20; opsportal 0/16, 0/18, 0/17 for seeds
 42/1/2). Precision was 100% on shopflow, 0% on acme/opsportal (a few unmatched findings).
 The gap is engine-side (recon stops at the SPA shell; query/body-driven classes are never
@@ -135,7 +135,7 @@ when vulnerable and silent when hardened.
 
 ## Held-out salt rule
 
-- Held-out seeds (`>= 1_000_000`) are derived with `HMAC-SHA256(GUARDIAN_RB_HELDOUT_SALT, ...)`;
+- Held-out seeds (`>= 1_000_000`) are derived with `HMAC-SHA256(KOVO_RB_HELDOUT_SALT, ...)`;
   the same seed with a different salt produces a different plan. The salt lives only in the
   environment (or an explicit `{ salt }` argument in tests) and must be **>= 16 characters**.
 - Never commit the salt, echo it into logs, pass it on a command line, or write it next to results.
@@ -157,7 +157,7 @@ when vulnerable and silent when hardened.
 ## Seeds (dev vs held-out)
 
 - **dev** seeds (`1..9999`): freely reproducible; use for development and recall hill-climbing.
-- **held-out** seeds (`>= 1_000_000`): the plan is keyed by HMAC over `GUARDIAN_RB_HELDOUT_SALT`
+- **held-out** seeds (`>= 1_000_000`): the plan is keyed by HMAC over `KOVO_RB_HELDOUT_SALT`
   (never committed). Without the salt they are refused and their numbers aren't derivable from the
   repo — use them for the anti-overfitting generalization check. See "Held-out salt rule" above for
   artifact and rotation requirements.
@@ -228,9 +228,9 @@ sockets bind `127.0.0.1` only; outbound requests go through `lib/egress.ts` (loo
 ports only); file access for app features goes through the in-memory `lib/vfs.ts`; command execution
 is a pure simulator (`lib/simshell.ts`); `node:fs` is confined to the jailed static server and
 build-time tooling; secrets are synthetic (`rb_fake_*`, `rbs_*`). Nothing starts without
-`GUARDIAN_ALLOW_LOCAL_LAB=1`.
+`KOVO_ALLOW_LOCAL_LAB=1`.
 
-## Integrating a scanner (e.g. Guardian)
+## Integrating a scanner (e.g. Kovo Hunter)
 
 ```ts
 import { startRealisticApp, briefingFor, gradeRun, renderScorecard } from './run.ts'

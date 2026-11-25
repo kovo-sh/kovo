@@ -7,7 +7,7 @@
 //
 // Apps are imported lazily by name from apps/<app>/index.ts so this file typechecks and runs before
 // the app shells exist. `listSeeds` is intentionally stricter than realistic-bench: the held-out
-// salt is only read from GUARDIAN_RB_HELDOUT_SALT, never from a CLI flag.
+// salt is only read from KOVO_RB_HELDOUT_SALT, never from a CLI flag.
 import { writeFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { join, dirname, isAbsolute, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -134,7 +134,7 @@ async function cmdServe(a: Record<string, string | boolean>): Promise<void> {
   const outDir = String(a['out-dir'] ?? join(HERE, 'out'))
   if (!isApp(app)) throw new Error(`--app must be one of ${appNames.join(', ')}`)
   if (a['held-out-salt'] !== undefined) {
-    throw new Error('never pass the held-out salt on the command line; set GUARDIAN_RB_HELDOUT_SALT instead')
+    throw new Error('never pass the held-out salt on the command line; set KOVO_RB_HELDOUT_SALT instead')
   }
   const started = await startReasonApp({ app, seed })
   const briefing = briefingFor(started, mode)
@@ -312,7 +312,7 @@ function cmdSeeds(a: Record<string, string | boolean>): void {
   const set = (a.set ? String(a.set) : 'dev') as SeedSet
   const n = Number(a.n ?? 5)
   if (a.salt !== undefined) {
-    throw new Error('never pass the held-out salt on the command line; set GUARDIAN_RB_HELDOUT_SALT instead')
+    throw new Error('never pass the held-out salt on the command line; set KOVO_RB_HELDOUT_SALT instead')
   }
   process.stdout.write(`${JSON.stringify(genListSeeds(set, n))}\n`)
 }

@@ -12,7 +12,7 @@ networks:
 
 services:
   saleor_lab_proxy:
-    image: "${PROXY_IMAGE:-guardian-lab/loopback-proxy:1.0.0}"
+    image: "${PROXY_IMAGE:-kovo-lab/loopback-proxy:1.0.0}"
     ports:
       - "127.0.0.1:0:8000"
     networks:
@@ -27,10 +27,10 @@ services:
     environment:
       UPSTREAM_URL: "http://saleor_app:8000"
     labels:
-      guardian.oss_lab.target: "oss-sealed-saleor-01"
-      guardian.oss_lab.split: "sealed"
-      guardian.oss_lab.role: "lab_proxy"
-      guardian.oss_lab.egress_policy: "deny_all_internal_only"
+      kovo.oss_lab.target: "oss-sealed-saleor-01"
+      kovo.oss_lab.split: "sealed"
+      kovo.oss_lab.role: "lab_proxy"
+      kovo.oss_lab.egress_policy: "deny_all_internal_only"
 
   saleor_app:
     image: "${APP_IMAGE:-ghcr.io/saleor/saleor}:${APP_TAG:-3.19.24}"
@@ -52,9 +52,9 @@ services:
       OSS_LAB_BUYER_CRED: "oss_lab_saleor_buyer_a"
       OSS_LAB_ADMIN_CRED: "oss_lab_saleor_admin_a"
     labels:
-      guardian.oss_lab.target: "oss-sealed-saleor-01"
-      guardian.oss_lab.split: "sealed"
-      guardian.oss_lab.role: "app"
+      kovo.oss_lab.target: "oss-sealed-saleor-01"
+      kovo.oss_lab.split: "sealed"
+      kovo.oss_lab.role: "app"
 
   saleor_worker:
     image: "${APP_IMAGE:-ghcr.io/saleor/saleor}:${APP_TAG:-3.19.24}"
@@ -75,9 +75,9 @@ services:
       OSS_LAB_APP_TOKEN: "oss_lab_saleor_app_token_01"
       OSS_LAB_CANARY_PREFIX: "oss_canary_saleor_"
     labels:
-      guardian.oss_lab.target: "oss-sealed-saleor-01"
-      guardian.oss_lab.split: "sealed"
-      guardian.oss_lab.role: "worker"
+      kovo.oss_lab.target: "oss-sealed-saleor-01"
+      kovo.oss_lab.split: "sealed"
+      kovo.oss_lab.role: "worker"
 
   saleor_db:
     image: "postgres:16.4-alpine"
@@ -92,9 +92,9 @@ services:
       POSTGRES_USER: "oss_lab_user"
       POSTGRES_PASSWORD: "oss_lab_saleor_pg_password_04"
     labels:
-      guardian.oss_lab.target: "oss-sealed-saleor-01"
-      guardian.oss_lab.split: "sealed"
-      guardian.oss_lab.role: "db"
+      kovo.oss_lab.target: "oss-sealed-saleor-01"
+      kovo.oss_lab.split: "sealed"
+      kovo.oss_lab.role: "db"
 
   saleor_cache:
     image: "redis:7.2.5-alpine"
@@ -106,6 +106,6 @@ services:
     security_opt:
       - "no-new-privileges:true"
     labels:
-      guardian.oss_lab.target: "oss-sealed-saleor-01"
-      guardian.oss_lab.split: "sealed"
-      guardian.oss_lab.role: "cache"
+      kovo.oss_lab.target: "oss-sealed-saleor-01"
+      kovo.oss_lab.split: "sealed"
+      kovo.oss_lab.role: "cache"

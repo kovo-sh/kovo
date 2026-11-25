@@ -42,15 +42,15 @@ test('held-out derivation refuses missing/short salts and ignores salts on dev s
   assert.deepStrictEqual(generateVariant(bp, 7, { salt: SALT_A }), generateVariant(bp, 7), 'dev plans must ignore the salt')
 })
 
-test('GUARDIAN_RB_HELDOUT_SALT is honoured as the fallback (and only for held-out seeds)', () => {
-  const prev = process.env.GUARDIAN_RB_HELDOUT_SALT
-  process.env.GUARDIAN_RB_HELDOUT_SALT = SALT_A
+test('KOVO_RB_HELDOUT_SALT is honoured as the fallback (and only for held-out seeds)', () => {
+  const prev = process.env.KOVO_RB_HELDOUT_SALT
+  process.env.KOVO_RB_HELDOUT_SALT = SALT_A
   try {
     assert.deepStrictEqual(generateVariant(acme.blueprint, HELD_OUT_SEED), generateVariant(acme.blueprint, HELD_OUT_SEED, { salt: SALT_A }))
     assert.notDeepStrictEqual(generateVariant(acme.blueprint, HELD_OUT_SEED), generateVariant(acme.blueprint, HELD_OUT_SEED, { salt: SALT_B }))
   } finally {
-    if (prev === undefined) delete process.env.GUARDIAN_RB_HELDOUT_SALT
-    else process.env.GUARDIAN_RB_HELDOUT_SALT = prev
+    if (prev === undefined) delete process.env.KOVO_RB_HELDOUT_SALT
+    else process.env.KOVO_RB_HELDOUT_SALT = prev
   }
 })
 

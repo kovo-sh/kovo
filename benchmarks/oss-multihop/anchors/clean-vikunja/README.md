@@ -40,4 +40,4 @@ APP_IMAGE=vikunja/vikunja APP_TAG=0.24.4 \
   ```
 - **Hard 0-FP Requirement (`maxAllowedFindings: 0`):**
   - Clean patched build (`v0.24.4`, commit `7777777777777777777777777777777777777701`) has no paired vulnerable target (`patchBrokeHopId` is not applicable).
-  - `assertVikunjaZeroFalsePositives()` delegates to `evaluateOracleEvidence()` and `gradeCleanControl()`. Any Guardian receipt targeting `oss-clean-vikunja-01` OR any unexpected DB oracle trigger (`observed: true`) fails both `cleanControlGatePassed` and `precisionGatePassed`.
+  - `assertVikunjaZeroFalsePositives()` delegates to `evaluateOracleEvidence()` and `gradeCleanControl()`. Any Kovo Hunter receipt targeting `oss-clean-vikunja-01` OR any unexpected DB oracle trigger (`observed: true`) fails both `cleanControlGatePassed` and `precisionGatePassed`.

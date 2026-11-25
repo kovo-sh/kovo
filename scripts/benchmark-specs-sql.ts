@@ -22,7 +22,7 @@ function injectionFields(o: HypothesisOutcome, env: ProbeEnv) {
   const param = o.hyp.param!
   const body: Record<string, unknown> = {}
   for (const p of o.hyp.endpoint.params) {
-    if (p.name !== param.name && p.location === o.hyp.location && !p.isCsrf) body[p.name] = 'guardian'
+    if (p.name !== param.name && p.location === o.hyp.location && !p.isCsrf) body[p.name] = 'kovo'
   }
   const loc = o.hyp.location!
   return {
@@ -130,7 +130,7 @@ function cut3RecipeEnvelope(
   } => {
     if (location === 'query') {
       try {
-        const url = new URL(fields.pathAndQuery, 'http://guardian.invalid')
+        const url = new URL(fields.pathAndQuery, 'http://kovo.invalid')
         url.searchParams.set(fields.paramName, value)
         return { pathAndQuery: `${url.pathname}${url.search}` }
       } catch {

@@ -57,7 +57,7 @@ export async function handleApi(
     const raw = await readBody(req)
     const response = await deps.egress.fetch('oauth', '/login', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-guardian-run-id': runId },
+      headers: { 'content-type': 'application/json', 'x-kovo-run-id': runId },
       body: raw,
     })
     await proxy(res, response)
@@ -346,7 +346,7 @@ export async function handleApi(
     state.webhooks.push(webhook)
     const created = await deps.egress.fetch('webhook-relay', '/subscriptions', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-guardian-run-id': runId },
+      headers: { 'content-type': 'application/json', 'x-kovo-run-id': runId },
       body: JSON.stringify({
         webhookId: webhook.id,
         tenantId: webhook.tenantId,

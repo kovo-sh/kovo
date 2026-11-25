@@ -2,7 +2,7 @@
  * Generic hypothesis formation and probe execution for the recall benchmark.
  *
  * Nothing here knows about any benchmark challenge: hypotheses are derived only from the
- * endpoints/params Guardian's recon discovered (names, locations, path shapes, methods), then
+ * endpoints/params Kovo Hunter's recon discovered (names, locations, path shapes, methods), then
  * handed to the real `probeDifferential` engine. Profile capabilities decide which discovery
  * strategies, parameter encodings and probe classes are available.
  */
@@ -575,7 +575,7 @@ export function formHypotheses(endpoints: readonly DiscoveredEndpoint[], caps: P
     const creatorBody = (creator: DiscoveredEndpoint): Record<string, unknown> => {
       const body: Record<string, unknown> = {}
       for (const p of creator.params.filter(x => x.location === 'json' || x.location === 'form')) {
-        body[p.name] = p.isObjectId || idName.test(p.name) ? '1' : /(qty|quantity|count|amount|price|total)/i.test(p.name) ? 1 : 'guardian'
+        body[p.name] = p.isObjectId || idName.test(p.name) ? '1' : /(qty|quantity|count|amount|price|total)/i.test(p.name) ? 1 : 'kovo'
       }
       return body
     }
@@ -933,16 +933,16 @@ const sessionBody = /(session (expired|required|invalid|not found)|login require
 
 /**
  * Value for a sibling request field. Real APIs validate writes, so values are format-aware and prefer
- * values observed on the target's own surface; `guardian` is only the last resort for free text.
+ * values observed on the target's own surface; `kovo` is only the last resort for free text.
  */
 export function siblingValue(name: string, env?: ProbeEnv): string | number | boolean {
   const lower = name.toLowerCase()
   if (/(?:^|_)(?:is|has)_|enabled|active|verified|admin|paid|approved|marketing|optin|boolean|flag$/.test(lower)) return true
   if (/(uuid|guid)/.test(lower)) return '00000000-0000-4000-8000-000000000001'
-  if (/email/.test(lower)) return 'guardian@example.test'
+  if (/email/.test(lower)) return 'kovo@example.test'
   if (/(date|time|timestamp|_at)$/.test(lower)) return '2026-01-01T00:00:00Z'
   if (/(qty|quantity|count|limit|amount|price|total|number|num|page|size|offset|age)/.test(lower)) return 1
-  if (/(url|uri|link|callback|webhook|redirect|target)$/.test(lower)) return 'http://guardian-control.invalid/'
+  if (/(url|uri|link|callback|webhook|redirect|target)$/.test(lower)) return 'http://kovo-control.invalid/'
   if (env?.corpus) {
     const mined = mineJsonFieldValues(env.corpus, name, 2)
     if (mined.length > 0) return mined[0]
@@ -954,7 +954,7 @@ export function siblingValue(name: string, env?: ProbeEnv): string | number | bo
     }
     return '1'
   }
-  return 'guardian'
+  return 'kovo'
 }
 
 function siblingBody(h: Hypothesis, env?: ProbeEnv): Record<string, unknown> | undefined {
@@ -1136,8 +1136,8 @@ function semanticValue(name: string, env: ProbeEnv, observed?: string[]): string
   const lower = name.toLowerCase()
   if (/(?:^|_)(?:is|has)_|enabled|active|verified|admin|paid|approved|marketing|optin|boolean/.test(lower)) return true
   if (/(qty|quantity|count|limit|amount|price|total|number|num|page|size|offset|age)/.test(lower)) return 1
-  if (/email/.test(lower)) return 'guardian@example.test'
-  if (/(url|uri|link|callback|webhook|redirect)/.test(lower)) return 'http://guardian-control.invalid/'
+  if (/email/.test(lower)) return 'kovo@example.test'
+  if (/(url|uri|link|callback|webhook|redirect)/.test(lower)) return 'http://kovo-control.invalid/'
   if (/(date|time|timestamp|at)$/.test(lower)) return '2026-01-01T00:00:00Z'
   if (/(id|ref|key|code|token)$/.test(lower)) {
     if (env.corpus) {
@@ -1152,7 +1152,7 @@ function semanticValue(name: string, env: ProbeEnv, observed?: string[]): string
     const mined = mineJsonFieldValues(env.corpus, name, 2)
     if (mined.length > 0) return mined[0]
   }
-  return 'guardian'
+  return 'kovo'
 }
 
 /**
@@ -1377,10 +1377,10 @@ async function fallbackWebhookBody(h: Hypothesis, env: ProbeEnv): Promise<Record
     else if (/backup|job|run|event|order|id|ref|endpoint|hook/i.test(name)) body[name] = `gwh${shortToken(8)}`
     else if (/amount|total|value|price/i.test(name)) body[name] = 1
     else if (/store|tenant|org|account|team/i.test(name)) body[name] = tenant || `gwh${shortToken(4)}`
-    else body[name] = 'guardian.probe'
+    else body[name] = 'kovo.probe'
   }
   if (tenant && !Object.keys(body).some(k => /store|tenant|org|account|team/i.test(k))) body.store = tenant
-  if (!Object.keys(body).some(k => /event|type/i.test(k))) body.event = { type: 'guardian.probe', id: `gwh${shortToken(8)}` }
+  if (!Object.keys(body).some(k => /event|type/i.test(k))) body.event = { type: 'kovo.probe', id: `gwh${shortToken(8)}` }
   body.ts = body.ts ?? Math.floor(Date.now() / 1000)
   return Object.keys(body).length > 0 ? body : null
 }
@@ -1392,11 +1392,11 @@ async function serverActionBodies(h: Hypothesis, env: ProbeEnv): Promise<unknown
   const positional: unknown[] = []
   const objectBody: Record<string, unknown> = {}
   for (const token of fields.slice(0, 4)) {
-    let value: string | number | boolean = 'guardian'
+    let value: string | number | boolean = 'kovo'
     if (/(org|tenant|team|group|account|company|workspace)/i.test(token)) {
       value = (await surfaceValueFor(token, env)) ?? (await idPool(env))[0] ?? '1'
     } else if (/(plan|tier)/i.test(token)) {
-      value = (await surfaceValueFor(token, env)) ?? 'guardian'
+      value = (await surfaceValueFor(token, env)) ?? 'kovo'
     } else if (/(id|ref|key)$/i.test(token)) {
       value = (await idPool(env))[0] ?? '1'
     }
@@ -1484,7 +1484,7 @@ export function alternateStateValue(value: unknown, tag: string): unknown {
   if (typeof value === 'string') {
     if (/^\d{1,10}$/.test(value)) return String(Number(value) + 9_000_001).slice(0, 12)
     if (value.length > 0 && value.length <= 24 && /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(value)) return `${value}_${suffix}`
-    return `guardian_${suffix}`
+    return `kovo_${suffix}`
   }
   return value
 }
@@ -1542,7 +1542,7 @@ export interface FunctionStateReadback {
   path: string
   controlBody: unknown
   probeBody: unknown
-  /** Scalar path inside the read body that changed (e.g. ["flags","guardian"]). */
+  /** Scalar path inside the read body that changed (e.g. ["flags","kovo"]). */
   fieldPath: string[]
   controlValue?: unknown
   probeValue: unknown
@@ -1644,7 +1644,7 @@ async function observeFunctionStateReadback(
     if (!readPath) continue
     let initial: BrokerExchangeResult
     try { initial = await send('GET', readPath, owner) } catch { continue }
-    if (process.env.GUARDIAN_BENCH_DEBUG === '1') process.stderr.write(`[state-readback] ${h.endpoint.path} candidate=${candidate} initial=${initial.status}\n`)
+    if (process.env.KOVO_BENCH_DEBUG === '1') process.stderr.write(`[state-readback] ${h.endpoint.path} candidate=${candidate} initial=${initial.status}\n`)
     if (initial.status < 200 || initial.status >= 300) continue
     let initialJson: unknown
     try { initialJson = JSON.parse(initial.body) } catch { continue }
@@ -1670,7 +1670,7 @@ async function observeFunctionStateReadback(
     let afterJson: unknown
     try { afterJson = JSON.parse(after.body) } catch { continue }
     const delta = scalarDeltas(beforeJson, afterJson)[0]
-    if (process.env.GUARDIAN_BENCH_DEBUG === '1') process.stderr.write(`[state-readback] ${h.endpoint.path} ${readPath} before=${before.status} probe=${write.status} after=${after.status} delta=${delta ? delta.path.join('.') : 'none'}\n`)
+    if (process.env.KOVO_BENCH_DEBUG === '1') process.stderr.write(`[state-readback] ${h.endpoint.path} ${readPath} before=${before.status} probe=${write.status} after=${after.status} delta=${delta ? delta.path.join('.') : 'none'}\n`)
     if (!delta) continue
     return {
       path: readPath, controlBody: variants.controlBody, probeBody: variants.probeBody,
@@ -1858,7 +1858,7 @@ async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedCon
             (real.status !== fake.status || responseSimilarity(real.body, fake.body) < 0.9)) { ctx.paramActive = true; break }
       }
     } else if (fake) {
-      const values = inferredPurpose === 'url' ? ['http://guardian-control.invalid/'] : ['a', 'test', 'gxprobe']
+      const values = inferredPurpose === 'url' ? ['http://kovo-control.invalid/'] : ['a', 'test', 'gxprobe']
       ctx.paramActive = false
       for (const value of values) {
         const ex = await sendFor(h.param.name, value)
@@ -1906,7 +1906,7 @@ async function resolveContext(h: Hypothesis, env: ProbeEnv): Promise<ResolvedCon
           return await env.broker.executeHttp({ origin: env.origin, persona: env.owner, followRedirects: false, ...inj }, env.grant, env.signal)
         } catch { return null }
       }
-      const bogus = await send('zzguardianzz')
+      const bogus = await send('zzkovozz')
       for (const value of candidates) {
         const ex = await send(value)
         if (!ex || ex.status >= 500) continue
@@ -2729,7 +2729,7 @@ async function webhookDeliveryFor(h: Hypothesis, env: ProbeEnv): Promise<Webhook
         return {
           body: {
             endpoint: id, id, hookId: id, webhookId: id,
-            event: { type: 'guardian.probe', id: `gwh${shortToken(8)}` }, type: 'guardian.probe',
+            event: { type: 'kovo.probe', id: `gwh${shortToken(8)}` }, type: 'kovo.probe',
           },
           readPath: path, stateField: key, stateValue: value.length + 1,
           header: 'x-webhook-signature',
@@ -2742,7 +2742,7 @@ async function webhookDeliveryFor(h: Hypothesis, env: ProbeEnv): Promise<Webhook
         return {
           body: {
             endpoint: id, id, hookId: id, webhookId: id,
-            event: { type: 'guardian.probe', id: `gwh${shortToken(8)}` }, type: 'guardian.probe',
+            event: { type: 'kovo.probe', id: `gwh${shortToken(8)}` }, type: 'kovo.probe',
           },
           readPath: path, stateField: key, stateValue: value + 1,
           header: 'x-webhook-signature',

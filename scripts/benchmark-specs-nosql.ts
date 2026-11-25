@@ -25,7 +25,7 @@ export function synthNosql(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec
   // Neutral object control must have matched the primitive baseline; otherwise the divergence is
   // just request-shape rejection rather than query-operator interpretation.
   if (o.details.neutralMatchesBase !== true) return []
-  const marker = 'guardian'
+  const marker = 'kovo'
   const baseline = requestPartsForValue(o, env, marker)
   const neutral = requestPartsForValue(o, env, { gx: marker })
   const probe = requestPartsForValue(o, env, build(marker))

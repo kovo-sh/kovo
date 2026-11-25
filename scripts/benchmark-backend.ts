@@ -39,7 +39,7 @@ export class LocalJqBackend implements WorkerBackend {
     const filter = match[1].replaceAll(`'\\''`, `'`)
     const file = job.files.find(f => f.name === 'replay-results.json')
     if (!file) return { exitCode: 2, stdout: '', stderr: 'missing replay-results.json evidence file', outputs: {} }
-    const dir = mkdtempSync(join(tmpdir(), 'guardian-bench-jq-'))
+    const dir = mkdtempSync(join(tmpdir(), 'kovo-bench-jq-'))
     try {
       const evidencePath = join(dir, 'replay-results.json')
       writeFileSync(evidencePath, file.content, { mode: 0o600 })
@@ -63,7 +63,7 @@ export class LocalJqBackend implements WorkerBackend {
 async function dockerWorkerUsable(): Promise<boolean> {
   const info = await execFileText('docker', ['info', '--format', '{{.ServerVersion}}'], 8_000)
   if (info.code !== 0) return false
-  const image = await execFileText('docker', ['image', 'inspect', 'guardian-worker:v4'], 8_000)
+  const image = await execFileText('docker', ['image', 'inspect', 'kovo-worker:v4'], 8_000)
   return image.code === 0
 }
 
@@ -75,7 +75,7 @@ export async function selectVerifierBackend(choice: 'auto' | 'docker' | 'local-j
   }
   const dockerOk = await dockerWorkerUsable()
   if (choice === 'docker') {
-    if (!dockerOk) throw new Error('Docker worker backend requested but Docker or the guardian-worker:v4 image is unavailable.')
+    if (!dockerOk) throw new Error('Docker worker backend requested but Docker or the kovo-worker:v4 image is unavailable.')
     return { kind: 'docker', backend: new LinuxWorkerBackend() }
   }
   if (dockerOk) return { kind: 'docker', backend: new LinuxWorkerBackend() }

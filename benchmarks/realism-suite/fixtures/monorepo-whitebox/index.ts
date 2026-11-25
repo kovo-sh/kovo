@@ -164,7 +164,7 @@ function sourceFiles(repoVersion: 'v1' | 'v2' | 'v3'): Record<string, string> {
 
   const files: Record<string, string> = {
     'README.md': [
-      '# guardian-samples/monorepo',
+      '# kovo-samples/monorepo',
       '',
       'Multi-service workspace: gateway, billing, reports, admin, identity, catalog, orders, notifications, search.',
       '',
@@ -179,7 +179,7 @@ function sourceFiles(repoVersion: 'v1' | 'v2' | 'v3'): Record<string, string> {
       '',
     ].join('\n'),
     'package.json': JSON.stringify(
-      { name: 'guardian-samples-monorepo', private: true, workspaces: ['services/*', 'platform'] },
+      { name: 'kovo-samples-monorepo', private: true, workspaces: ['services/*', 'platform'] },
       null,
       2,
     ),

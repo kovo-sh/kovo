@@ -1,7 +1,7 @@
 {
   "schemaVersion": "1.0",
   "bundleKind": "sealed_anchors",
-  "description": "Guardian v8 M4 Sealed OSS Multi-Hop Anchor Specs (4 targets: Keycloak, Woodpecker, Metabase, Saleor). Evaluated ONLY at M4 certification via --manifest; kept strictly outside dev hill-climbing. Defensive QA manifests, external impact oracles, and paired patch-retest contracts only — zero exploit payloads.",
+  "description": "Kovo Hunter v8 M4 Sealed OSS Multi-Hop Anchor Specs (4 targets: Keycloak, Woodpecker, Metabase, Saleor). Evaluated ONLY at M4 certification via --manifest; kept strictly outside dev hill-climbing. Defensive QA manifests, external impact oracles, and paired patch-retest contracts only — zero exploit payloads.",
   "anchors": [
     {
       "schemaVersion": "1.0",
@@ -132,7 +132,7 @@
           },
           "keycloak_idp_broker": {
             "role": "idp",
-            "imageRef": "guardian-lab/oidc-broker-stub:1.0.0",
+            "imageRef": "kovo-lab/oidc-broker-stub:1.0.0",
             "imageDigest": "sha256:a100000000000000000000000000000000000000000000000000000000000003",
             "networks": ["keycloak_internal"],
             "readOnlyRootFs": true,
@@ -229,7 +229,7 @@
         "kind": "loopback_oob_collector",
         "description": "Verifies isolated runner callback bearing run-scoped canary token on the loopback OOB collector.",
         "targetService": "woodpecker_secret_meta",
-        "expectedCorrelationField": "X-Guardian-Run-Id",
+        "expectedCorrelationField": "X-Kovo-Run-Id",
         "pollTimeoutMs": 5000,
         "runScopedCanaryPrefix": "oss_canary_woodpecker_",
         "collectorUrl": "http://127.0.0.1:19402/oob/woodpecker",
@@ -303,7 +303,7 @@
           },
           "woodpecker_secret_meta": {
             "role": "internal_target",
-            "imageRef": "guardian-lab/internal-stub:1.0.0",
+            "imageRef": "kovo-lab/internal-stub:1.0.0",
             "imageDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "networks": ["woodpecker_internal"],
             "readOnlyRootFs": true,
@@ -451,7 +451,7 @@
           },
           "metabase_export_worker": {
             "role": "worker",
-            "imageRef": "guardian-lab/metabase-export-worker:1.0.0",
+            "imageRef": "kovo-lab/metabase-export-worker:1.0.0",
             "imageDigest": "sha256:a300000000000000000000000000000000000000000000000000000000000003",
             "networks": ["metabase_internal"],
             "capDrop": ["ALL"]
@@ -573,7 +573,7 @@
         "services": {
           "saleor_lab_proxy": {
             "role": "lab_proxy",
-            "imageRef": "guardian-lab/loopback-proxy:1.0.0",
+            "imageRef": "kovo-lab/loopback-proxy:1.0.0",
             "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
             "networks": ["saleor_internal"],
             "ports": ["127.0.0.1:0:8000"],

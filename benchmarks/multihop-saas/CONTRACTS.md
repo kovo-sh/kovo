@@ -13,7 +13,7 @@ weaken an inherited `realistic-bench` / `reason-bench` safety invariant.
 - **Runtime:** Node 24+ native TypeScript type stripping, ESM, explicit `.ts` relative imports,
   `import type` for types, erasable syntax only (no `enum`, no `namespace`, no parameter
   properties). **Zero npm dependencies** — only `node:*` built-ins.
-- **Local-Lab Gate:** `GUARDIAN_ALLOW_LOCAL_LAB=1` is required before any server or service call.
+- **Local-Lab Gate:** `KOVO_ALLOW_LOCAL_LAB=1` is required before any server or service call.
   `assertLocalLabAllowed()` is invoked by `run.ts` (server commands), `startPaygrid`,
   `startServices`, `listenLoopback`, and `egress.fetch`.
 - **Loopback only:** servers bind `127.0.0.1:0` exclusively through `lib/safety.ts`.
@@ -202,7 +202,7 @@ Every archetype must provide:
 - **Five isolated loopback services** with distinct route surfaces and realistic benign workflows.
 - **Renewable lifecycle hooks:** create/revoke invites and PATs, revoke sessions, create/cancel async
   jobs, rotate keys, and reset/clean-room semantics suitable for Mode-A replay.
-- **`X-Guardian-Run-Id` tagging:** every created entity and async correlation carries the caller's
+- **`X-Kovo-Run-Id` tagging:** every created entity and async correlation carries the caller's
   run id; the worker only converges jobs for the same run scope.
 - **Configurable async latency:** `asyncLatencyMs` is a first-class option; jobs expose `queued` /
   `ready` / `failed` / `cancelled` and are processed by bounded polling.
@@ -245,7 +245,7 @@ mode/twin/chain/ground-truth data. `scanTreeForLeakage(root)` rejects:
 ## 12. Seed contract
 
 - Dev: integers `1..9999`; deterministic from the repository.
-- Held-out: integers `>= 1_000_000`; reproduction requires `GUARDIAN_RB_HELDOUT_SALT` (>= 16 chars).
+- Held-out: integers `>= 1_000_000`; reproduction requires `KOVO_RB_HELDOUT_SALT` (>= 16 chars).
   The PRNG key is HMAC-SHA256(salt, seed/label); salts are never accepted on the command line and
   never written to artifacts.
 - `listSeeds('dev', n)` returns `1..n`; `listSeeds('held-out', n)` returns unique HMAC-derived seeds.

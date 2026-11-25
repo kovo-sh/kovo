@@ -31,7 +31,7 @@ const FS_ALLOWED = [
   'generator/materialize.ts', // build-time temp-tree materialization
   'grader/schema.ts', // writes ground-truth.schema.json (tooling)
   'run.ts',
-  'guardian-adapter.ts', // tooling: reads the materialized variant.json (routes only) + realpath guard
+  'kovo-adapter.ts', // tooling: reads the materialized variant.json (routes only) + realpath guard
   'benchmark-realistic.ts', // tooling: writes scorecard/findings artifacts under --out-*
 ]
 

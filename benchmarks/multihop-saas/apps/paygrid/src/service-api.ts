@@ -69,7 +69,7 @@ export async function handleApi(
     const raw = await readBody(req)
     const response = await deps.egress.fetch('idp', '/login', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-guardian-run-id': runId },
+      headers: { 'content-type': 'application/json', 'x-kovo-run-id': runId },
       body: raw,
     })
     await proxy(res, response)
@@ -156,7 +156,7 @@ export async function handleApi(
     const raw = await readBody(req)
     const response = await deps.egress.fetch('idp', '/invites', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-guardian-run-id': runId, authorization: `Bearer ${session.token}` },
+      headers: { 'content-type': 'application/json', 'x-kovo-run-id': runId, authorization: `Bearer ${session.token}` },
       body: JSON.stringify({ ...(parseJson<Record<string, unknown>>(raw) ?? {}), tenant: state.orgs[tenantId].slug }),
     })
     await proxy(res, response)
@@ -169,7 +169,7 @@ export async function handleApi(
     if (!session) return
     const response = await deps.egress.fetch('idp', `/invites/${encodeURIComponent(revokeInvite[1]!)}/revoke`, {
       method: 'POST',
-      headers: { 'x-guardian-run-id': runId, authorization: `Bearer ${session.token}` },
+      headers: { 'x-kovo-run-id': runId, authorization: `Bearer ${session.token}` },
     })
     await proxy(res, response)
     return
@@ -246,7 +246,7 @@ export async function handleApi(
     const fileName = state.orgs[tenantId].treasuryFile
     const response = await deps.egress.fetch('worker', '/jobs/export', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-guardian-run-id': runId },
+      headers: { 'content-type': 'application/json', 'x-kovo-run-id': runId },
       body: JSON.stringify({ tenantId, userId: session.userId, fileName, runId }),
     })
     const payload = JSON.parse(await response.text()) as { jobId: string }
@@ -273,7 +273,7 @@ export async function handleApi(
       return
     }
     const response = await deps.egress.fetch('worker', `/jobs/${encodeURIComponent(job.id)}`, {
-      headers: { 'x-guardian-run-id': runId },
+      headers: { 'x-kovo-run-id': runId },
     })
     const payload = parseJson<Record<string, unknown>>(await response.text()) ?? { job }
     sendJson(res, response.status, payload)
@@ -290,7 +290,7 @@ export async function handleApi(
       return
     }
     const response = await deps.egress.fetch('worker', `/jobs/${encodeURIComponent(job.id)}/trace`, {
-      headers: { 'x-guardian-run-id': runId },
+      headers: { 'x-kovo-run-id': runId },
     })
     const payload = parseJson<Record<string, unknown>>(await response.text()) ?? {}
     sendJson(res, response.status, payload)
@@ -307,7 +307,7 @@ export async function handleApi(
       return
     }
     const response = await deps.egress.fetch('worker', `/jobs/${encodeURIComponent(job.id)}`, {
-      headers: { 'x-guardian-run-id': runId },
+      headers: { 'x-kovo-run-id': runId },
     })
     const payload = parseJson<Record<string, unknown>>(await response.text()) ?? { job }
     sendJson(res, response.status, payload)
@@ -318,7 +318,7 @@ export async function handleApi(
     const raw = await readBody(req)
     const forwardHeaders: Record<string, string> = {
       'content-type': header(req, 'content-type') || 'application/json',
-      'x-guardian-run-id': runId,
+      'x-kovo-run-id': runId,
     }
     for (const name of ['x-signature', 'x-scope']) {
       const value = header(req, name)
@@ -459,7 +459,7 @@ export async function handleApi(
     const template = state.templates.find((item) => item.id === invoice.templateId)
     const response = await deps.egress.fetch('worker', '/jobs/render', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-guardian-run-id': runId },
+      headers: { 'content-type': 'application/json', 'x-kovo-run-id': runId },
       body: JSON.stringify({
         invoiceId: invoice.id,
         templateId: invoice.templateId,
