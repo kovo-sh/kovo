@@ -23,6 +23,8 @@ import { redact, redactHeaders, scanSecretHeaders, scanSecrets } from './redact.
 import type { NamedSecret, SecretMatch } from './redact.ts'
 import { evaluateScopeRequest, isVerifiedReadOnlyGraphqlQuery, originRoleFor } from './scope-policy.ts'
 import type { ScopeHook, ScopePolicy } from './scope-policy.ts'
+import { globalKillSwitch, KillSwitchTrippedError } from './kill-switch.ts'
+import type { GlobalKillSwitch } from './kill-switch.ts'
 import {
   createHttpTransport,
   extractTlsMetadata,
@@ -293,6 +295,8 @@ export type Grant = {
    * mutations without per-request approval. Omitted grants keep legacy v5 behavior exactly.
    */
   scopePolicy?: ScopePolicy
+  /** v7 M4: optional tenant namespace used for tenant-scoped kill-switch checks. */
+  tenantId?: string
   /**
    * Durable, route-scoped operator lease (Run approval_leases). A match authorizes the normalized
    * route across probe iterations and replays; it never widens origin scope.
@@ -381,6 +385,8 @@ export type BrokerOptions = {
    * Returning true retries the request once with freshly resolved persona headers.
    */
   reauth?: (personaHandle: string, origin: string) => Promise<boolean | void>
+  /** v7 M4: optional kill-switch instance (defaults to process-wide `globalKillSwitch`). */
+  killSwitch?: GlobalKillSwitch
 }
 
 const maxPathLength = 8192
@@ -1680,6 +1686,33 @@ export class RequestBroker {
     this.httpTransport = options.transport ?? createHttpTransport(this.transportConfig, defaultTransport)
   }
 
+  private getKillSwitch(): GlobalKillSwitch {
+    return this.options.killSwitch ?? globalKillSwitch
+  }
+
+  private async withKillSwitch<T>(
+    signal: AbortSignal,
+    grant: Grant,
+    fn: (boundSignal: AbortSignal, ks: GlobalKillSwitch) => Promise<T>,
+  ): Promise<T> {
+    const ks = this.getKillSwitch()
+    const tenantId = grant.tenantId ?? null
+    const bound = ks.bindSignal(signal, tenantId)
+    try {
+      return await fn(bound.signal, ks)
+    } catch (err) {
+      if (bound.signal.aborted && bound.signal.reason instanceof KillSwitchTrippedError) {
+        throw bound.signal.reason
+      }
+      if (ks.isActive(tenantId)) {
+        ks.assertAllowed(tenantId)
+      }
+      throw err
+    } finally {
+      bound.release()
+    }
+  }
+
   /** Non-secret transport summary for diagnostics and tests. */
   getTransportSummary(): {
     http2: boolean
@@ -2453,6 +2486,8 @@ export class RequestBroker {
       const release = await this.acquireSlot(url.origin, grant.maxRpsPerOrigin ?? 5, deadline, false, routeTemplateForPath(url.pathname))
       let response: RawHttpResponse
       try {
+        this.getKillSwitch().assertAllowed(grant.tenantId ?? null)
+        deadline.throwIfAborted()
         grant.audit('allowed', url.origin)
         response = await transport(url, addresses.find(a => a.family === 4) ?? addresses[0], deadline, {
           readBody: false,
@@ -3024,6 +3059,26 @@ export class RequestBroker {
       raceBarrier?: RaceBarrier
     },
   ): Promise<BrokerExchangeResult> {
+    return this.withKillSwitch(signal, grant, (boundSignal, ks) =>
+      this.executePreparedHttpWithKillSwitch(prepared, req, grant, boundSignal, ks, options),
+    )
+  }
+
+  private async executePreparedHttpWithKillSwitch(
+    prepared: ReturnType<RequestBroker['prepareHttpRequest']>,
+    req: BrokerHttpRequest,
+    grant: Grant,
+    signal: AbortSignal,
+    ks: GlobalKillSwitch,
+    options: {
+      bypassConcurrency: boolean
+      preResolvedAddresses?: PublicAddress[]
+      reauthAttempted?: boolean
+      refreshedPersonaHeaders?: Record<string, string>
+      raceBurst?: boolean
+      raceBarrier?: RaceBarrier
+    },
+  ): Promise<BrokerExchangeResult> {
     await this.applyAuthMutationIfNeeded(prepared, req, grant, signal)
     const {
       initialOrigin,
@@ -3055,6 +3110,7 @@ export class RequestBroker {
       throw new BrokerDenied(message)
     }
     const check = () => {
+      ks.assertAllowed(grant.tenantId ?? null)
       deadline.throwIfAborted()
       if (!safeUrl(url, true, localLab, grant.allowedPorts) || !this.originInGrantScope(grant, url.origin)) {
         this.purgeSessionJars(undefined, url.origin)
@@ -3299,6 +3355,8 @@ export class RequestBroker {
       const release = await this.acquireSlot(url.origin, maxRps, deadline, options.bypassConcurrency, hopRouteTemplate)
       let response: RawHttpResponse
       try {
+        ks.assertAllowed(grant.tenantId ?? null)
+        deadline.throwIfAborted()
         grant.audit('allowed', url.origin)
         response = await transport(url, addresses.find(a => a.family === 4) ?? addresses[0], deadline, {
           method: activeMethod,
@@ -3445,6 +3503,7 @@ export class RequestBroker {
     signal: AbortSignal,
     bypassConcurrency: boolean,
   ): Promise<BrokerExchangeResult> {
+    this.getKillSwitch().assertAllowed(grant.tenantId ?? null)
     const prepared = this.prepareHttpRequest(req, grant)
     return this.executePreparedHttp(prepared, req, grant, signal, { bypassConcurrency })
   }
@@ -3454,6 +3513,7 @@ export class RequestBroker {
   }
 
   async executeBatch(reqs: readonly BrokerHttpRequest[], grant: Grant, signal: AbortSignal): Promise<BrokerExchangeResult[]> {
+    this.getKillSwitch().assertAllowed(grant.tenantId ?? null)
     const tier = grant.tier ?? 1
     if (tier < 2) {
       throw new BrokerDenied('Synchronized parallel batches (executeBatch) require Tier 2 or Tier 3.')
@@ -3500,6 +3560,7 @@ export class RequestBroker {
     grant: Grant,
     signal: AbortSignal,
   ): Promise<BrokerRaceBurstResult> {
+    this.getKillSwitch().assertAllowed(grant.tenantId ?? null)
     const tier = grant.tier ?? 1
     if (tier < 2) {
       throw new BrokerDenied('Safe race-condition burst execution (executeRaceBurst) requires Tier 2 or Tier 3.')
@@ -3615,12 +3676,16 @@ export class RequestBroker {
     }
 
     const started = Date.now()
-    const deadline = AbortSignal.any([signal, AbortSignal.timeout(15_000)])
-    grant.audit('allowed', parsed.origin)
-
-    const dnsResolver = this.options.dnsResolver ?? defaultDnsRecordResolver
-    const records = await dnsResolver(parsed.hostname, deadline)
-    deadline.throwIfAborted()
+    const records = await this.withKillSwitch(signal, grant, async (ksSignal, ks) => {
+      const deadline = AbortSignal.any([ksSignal, AbortSignal.timeout(15_000)])
+      ks.assertAllowed(grant.tenantId ?? null)
+      grant.audit('allowed', parsed.origin)
+      const dnsResolver = this.options.dnsResolver ?? defaultDnsRecordResolver
+      const resolved = await dnsResolver(parsed.hostname, deadline)
+      ks.assertAllowed(grant.tenantId ?? null)
+      deadline.throwIfAborted()
+      return resolved
+    })
 
     const danglingHints: DnsDanglingHint[] = []
     for (const cname of records.cname) {
@@ -3659,13 +3724,18 @@ export class RequestBroker {
     }
 
     const started = Date.now()
-    const deadline = AbortSignal.any([signal, AbortSignal.timeout(15_000)])
-    const addresses = await this.resolveAndCheckAddresses(parsed.hostname, grant, deadline, parsed.origin)
-    const chosen = addresses.find(a => a.family === 4) ?? addresses[0]
-    const inspector = this.options.tlsInspector ?? defaultTlsInspector
+    const { chosen, tls } = await this.withKillSwitch(signal, grant, async (ksSignal, ks) => {
+      const deadline = AbortSignal.any([ksSignal, AbortSignal.timeout(15_000)])
+      const addresses = await this.resolveAndCheckAddresses(parsed.hostname, grant, deadline, parsed.origin)
+      const picked = addresses.find(a => a.family === 4) ?? addresses[0]
+      const inspector = this.options.tlsInspector ?? defaultTlsInspector
 
-    grant.audit('allowed', parsed.origin)
-    const tls = await inspector(parsed, chosen, deadline)
+      ks.assertAllowed(grant.tenantId ?? null)
+      grant.audit('allowed', parsed.origin)
+      const inspected = await inspector(parsed, picked, deadline)
+      ks.assertAllowed(grant.tenantId ?? null)
+      return { chosen: picked, tls: inspected }
+    })
     grant.audit('observed', parsed.origin)
 
     return {
@@ -3780,23 +3850,28 @@ export class RequestBroker {
     const maxBytes = Math.max(1024, Math.min(req.maxBytes ?? defaultWsMaxBytes, defaultWsMaxBytes))
     const timeoutMs = Math.max(500, Math.min(req.timeoutMs ?? defaultWsTimeoutMs, hardWsTimeoutMs))
     const started = Date.now()
-    const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs + 2_000)])
+    const ks = this.getKillSwitch()
+    const ksBound = ks.bindSignal(signal, grant.tenantId ?? null)
+    const deadline = AbortSignal.any([ksBound.signal, AbortSignal.timeout(timeoutMs + 2_000)])
     const secrets: NamedSecret[] = [
       ...(grant.personas ? personaSecrets(grant.personas) : []),
       ...(grant.secrets ?? []),
       ...(req.secrets ?? []),
     ]
 
-    const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, initialOrigin)
-    const chosen = addresses.find(a => a.family === 4) ?? addresses[0]
-    const maxRps = grant.maxRpsPerOrigin ?? (tier === 3 ? 3 : 5)
-    const release = await this.acquireSlot(initialOrigin, maxRps, deadline)
-
-    const wsTransport = this.options.wsTransport ?? defaultWsTransport
-    const sessionMode = Boolean(req.turns?.length) && this.options.wsSessionEnabled === true
     let raw
     try {
-      grant.audit('allowed', initialOrigin)
+      const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, initialOrigin)
+      const chosen = addresses.find(a => a.family === 4) ?? addresses[0]
+      const maxRps = grant.maxRpsPerOrigin ?? (tier === 3 ? 3 : 5)
+      const release = await this.acquireSlot(initialOrigin, maxRps, deadline)
+
+      const wsTransport = this.options.wsTransport ?? defaultWsTransport
+      const sessionMode = Boolean(req.turns?.length) && this.options.wsSessionEnabled === true
+      try {
+        ks.assertAllowed(grant.tenantId ?? null)
+        deadline.throwIfAborted()
+        grant.audit('allowed', initialOrigin)
       if (sessionMode) {
         const frames: BrokerWebsocketFrame[] = []
         let connected = false
@@ -3864,8 +3939,16 @@ export class RequestBroker {
           rejectUnauthorized: this.options.rejectUnauthorized ?? true,
         })
       }
+      } finally {
+        release()
+      }
+    } catch (err) {
+      if (ksBound.signal.aborted && ksBound.signal.reason instanceof KillSwitchTrippedError) {
+        throw ksBound.signal.reason
+      }
+      throw err
     } finally {
-      release()
+      ksBound.release()
     }
 
     grant.audit('observed', initialOrigin, raw.upgradeStatus ?? undefined)

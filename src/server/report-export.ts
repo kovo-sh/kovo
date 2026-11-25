@@ -21,8 +21,10 @@ import {
   suppliedResponseLabel,
   verificationTierLabels,
 } from '../report-summary.ts'
+import { buildCoverageGapReport, formatCoverageGapMarkdown } from './coverage-gaps.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
-import { redact, redactHeaders } from './redact.ts'
+import { exportRunReceiptBundle, verifyProofReceiptBundle } from './receipt-export.ts'
+import { redact, redactHeaders, redactZdr } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import { isReportSource, projectReportEvidence } from './report-evidence.ts'
 import { brokerExchanges, facts, replaySpecs, reports, retestRuns } from './schema.ts'
@@ -65,8 +67,23 @@ function linkTo({ number }: Attachment) {
   return `[Evidence ${number}](#evidence-${number})`
 }
 
-export function exportReportMarkdown(storage: Store, runId: string, reportId: string) {
+export { exportRunReceiptBundle, verifyProofReceiptBundle }
+
+export interface ExportReportMarkdownOptions {
+  zdr?: boolean
+  tenantId?: string
+}
+
+export function exportReportMarkdown(
+  storage: Store,
+  runId: string,
+  reportId: string,
+  options: ExportReportMarkdownOptions = {},
+) {
   const run = storage.run(runId)
+  if (options.tenantId !== undefined) {
+    storage.assertRunTenantAccess(run.id, options.tenantId)
+  }
   const report = storage.db.select().from(reports).where(and(eq(reports.runId, run.id), eq(reports.id, reportId))).get()
   if (!report) throw new Error('Report version not found.')
 
@@ -469,6 +486,15 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
 
   if (body.gaps.length) lines.push('## Coverage gaps', '', ...body.gaps.map(gap => '- ' + inline(gap, secrets)), '')
 
+  const operationalGaps = buildCoverageGapReport(storage, run.id, {
+    approvedOrigins: approved,
+    secrets,
+    zdr: options.zdr === true,
+  })
+  if (operationalGaps.totalGaps > 0) {
+    lines.push(formatCoverageGapMarkdown(operationalGaps))
+  }
+
   lines.push('## Methodology and limitations', '',
     '- Guardian evaluated only the approved hosts, capability tier, personas, and recorded evidence identified in this report.',
     '- A confirmed finding strictly requires a deterministic Zero-LLM Replay Verification or air-gapped baseline comparison linked to its source evidence. Model commentary and CVE version matches alone cannot confirm a finding.',
@@ -494,5 +520,7 @@ export function exportReportMarkdown(storage: Store, runId: string, reportId: st
     )
   }
 
-  return { filename: `guardian-report-${run.id.slice(0, 8)}-v${report.version}.md`, content: redact(lines.join('\n'), secrets) }
+  const rawContent = lines.join('\n')
+  const content = options.zdr ? redactZdr(rawContent, secrets) : redact(rawContent, secrets)
+  return { filename: `guardian-report-${run.id.slice(0, 8)}-v${report.version}.md`, content }
 }
