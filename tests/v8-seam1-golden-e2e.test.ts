@@ -646,6 +646,11 @@ const h5 = await send('api', releasePath, {
   method: 'POST',
   body: { manifest, signature: signed.signature, version: '2026.11.0' },
 })
+if (h5.status !== 200) return ctx.result({ title })
+const readback = await send('api', \`\${cfg.routePrefix}/deployments/\${cfg.ids.deploymentProdId}\`, {
+  ...bearer(member, 'member_a'),
+  evidenceRole: 'post_chain_readback',
+})
 return await finish({
   chainId: cfg.chainId,
   terminalVulnClass: cfg.terminalVulnClass,
@@ -667,6 +672,7 @@ return await finish({
     summary: 'A cross-tenant signing key signed an unauthorized production release manifest.',
     terminalExchangeId: h5.exchangeId,
     preChainControlExchangeIds: [],
+    postChainReadbackExchangeIds: [readback.exchangeId],
   },
   replayMode: 'fresh_clean_replay',
 })
@@ -1260,58 +1266,6 @@ function gradeChain(lab: StartedLab, chain: ChainSpec, findings: Finding[]): Sco
   return gradeRun({ groundTruth, findings, oracle: lab.export() })
 }
 
-function exactKnownGap(
-  chainId: string,
-  run: HarnessRun,
-  oracle: OracleExport,
-): { id: string; reason: string } | null {
-  const releases = run.attempts.flatMap((attempt) => attempt.session.transcript.list().filter((record) =>
-    record.request?.method === 'POST' && /\/deployments\/[^/]+\/release$/.test(record.request?.pathAndQuery ?? '')))
-  if (chainId === 'SF-C1' && !run.verdict.confirmed && releases.length >= 2) {
-    const statuses = releases.slice(0, 2).map((record) => record.response?.status ?? null)
-    const exact = statuses[0] === 200 && statuses[1] === 403
-      && run.verdict.attempts.every((attempt) => attempt.claimCount >= 1)
-      && run.verdict.rejectedBy === 'terminal_impact_unproven'
-    if (exact) {
-      return { id: 'sf_c1_run2_secret_rotation', reason: 'run_1_release_200_run_2_release_403_terminal_impact_unproven' }
-    }
-  }
-  if (chainId === 'NX-C4') {
-    const evaluation = oracle.evaluations.find((item) => item.chainId === chainId)
-    const terminal = run.attempts.at(-1)?.session.transcript.list().find((record) =>
-      record.request?.method === 'GET' && /\/exports\/[^/]+\/result$/.test(record.request?.pathAndQuery ?? ''))
-    const exact = Boolean(terminal?.response?.status === 200)
-      && Boolean(evaluation && !evaluation.completed && evaluation.missingHopIds.includes('nx-c4-h4'))
-      && /terminal.*not observed/i.test(evaluation?.failureReason ?? '')
-    if (exact) return { id: 'nx_c4_export_result_lineage', reason: 'export_result_200_but_nx_c4_h4_terminal_not_observed' }
-  }
-  for (const receipt of run.workerReceipts) {
-    if (receipt.chainId === 'invalid' && run.verdict.rejectedBy === 'schema') {
-      return { id: 'verify_rpc_chain_id_scrubbing', reason: 'worker_receipt_chain_id_scrubbed_to_invalid_schema_rejection' }
-    }
-  }
-  if (/cross_surface_pivot.*correlationToken|correlationToken.*cross_surface_pivot/i.test(
-    `${run.verdict.detail} ${run.verdict.missingEvidence.join(' ')}`,
-  )) {
-    return { id: 'composite_cross_surface_pivot_source_hop_correlation_token', reason: 'cross_surface_pivot_source_hop_correlationToken_rejected' }
-  }
-  return null
-}
-
-// Exact, narrow exceptions for the four documented unmerged fixes. Nothing else is swallowed.
-const KNOWN_UNMERGED_GAPS = {
-  'SF-C1': ['sf_c1_run2_secret_rotation'],
-  'NX-C4': ['nx_c4_export_result_lineage'],
-  '*': ['verify_rpc_chain_id_scrubbing', 'composite_cross_surface_pivot_source_hop_correlation_token'],
-} as const
-
-function assertKnownGapAllowed(chainId: string, id: string): void {
-  const allowed = chainId === '*'
-    ? KNOWN_UNMERGED_GAPS['*']
-    : [...KNOWN_UNMERGED_GAPS['*'], ...(KNOWN_UNMERGED_GAPS[chainId as keyof typeof KNOWN_UNMERGED_GAPS] ?? [])]
-  assert.ok((allowed as readonly string[]).includes(id), `unexpected failure is not a known unmerged gap: ${chainId}/${id}`)
-}
-
 function structuredFailure(run: HarnessRun, oracle: OracleExport): Record<string, unknown> {
   const bodyFacts = run.attempts.map((captured) => captured.session.transcript.list().flatMap((record) => {
     const raw = captured.session.transcript.body(record.exchangeId)
@@ -1376,7 +1330,6 @@ for (const app of ['paygrid', 'shipforge', 'nexusiam'] as const) {
         let terminals = oracle.events.terminals.filter((terminal) => terminal.chainId === chain.id).length
         let confirmations = oracle.confirmed.filter((confirmed) => confirmed.chainId === chain.id).length
         const findings: Finding[] = []
-        let gap: string | null = null
 
         if (run.verdict.confirmed) {
           assert.equal(run.workerReceipts.length, 2, `${chain.id}: both attempts must expose the host-backed composite receipt`)
@@ -1386,46 +1339,25 @@ for (const app of ['paygrid', 'shipforge', 'nexusiam'] as const) {
           if (options.mode !== 'vulnerable' || options.twin) {
             assert.fail(`${chain.id}: hardened/twin worker false positive: ${JSON.stringify(structuredFailure(run, oracle))}`)
           }
-          if (!evaluation.completed) {
-            const known = exactKnownGap(chain.id, run, oracle)
-            if (known) {
-              assertKnownGapAllowed(chain.id, known.id)
-              gap = `${known.id}:${known.reason}`
-            } else {
-              assert.equal(evaluation.completed, true, `${chain.id}: worker confirmed but app ChainOracle did not complete: ${JSON.stringify(structuredFailure(run, oracle))}`)
-            }
-          }
-          if (!gap) {
-            const benchmarkReceipt = lab.oracle.mintReceipt(chain.id)
-            oracle = lab.export()
-            terminals = oracle.events.terminals.filter((terminal) => terminal.chainId === chain.id).length
-            confirmations = oracle.confirmed.filter((confirmed) => confirmed.chainId === chain.id).length
-            for (const worker of run.workerReceipts) compareTwoSides(chain, worker, benchmarkReceipt)
-            findings.push({ chainId: chain.id, terminalVulnClass: chain.vulnClass, receipt: benchmarkReceipt, reportedBy: 'seam1-golden-e2e' })
-          }
+          assert.equal(evaluation.completed, true, `${chain.id}: worker confirmed but app ChainOracle did not complete: ${JSON.stringify(structuredFailure(run, oracle))}`)
+          const benchmarkReceipt = lab.oracle.mintReceipt(chain.id)
+          oracle = lab.export()
+          terminals = oracle.events.terminals.filter((terminal) => terminal.chainId === chain.id).length
+          confirmations = oracle.confirmed.filter((confirmed) => confirmed.chainId === chain.id).length
+          for (const worker of run.workerReceipts) compareTwoSides(chain, worker, benchmarkReceipt)
+          findings.push({ chainId: chain.id, terminalVulnClass: chain.vulnClass, receipt: benchmarkReceipt, reportedBy: 'seam1-golden-e2e' })
         } else if (options.mode === 'vulnerable' && !options.twin) {
-          const known = exactKnownGap(chain.id, run, oracle)
-          if (known) {
-            assertKnownGapAllowed(chain.id, known.id)
-            gap = `${known.id}:${known.reason}`
-          } else {
-            assert.fail(`${chain.id}: vulnerable golden chain failed unexpectedly: ${JSON.stringify(structuredFailure(run, oracle))}`)
-          }
+          assert.fail(`${chain.id}: vulnerable golden chain failed unexpectedly: ${JSON.stringify(structuredFailure(run, oracle))}`)
         }
 
         const card = gradeChain(lab, chain, findings)
         if (options.mode === 'vulnerable' && !options.twin) {
-          if (gap) {
-            assert.equal(confirmations, 0, `${chain.id}: known gap must not manufacture a ChainOracle confirmation`)
-            assert.equal(card.fp, 0, `${chain.id}: known gap must not create a decoy false positive`)
-          } else {
-            assert.equal(card.tp, 1, `${chain.id}: Two-Side Grader must count one true positive`)
-            assert.equal(card.fp, 0)
-            assert.equal(card.fn, 0)
-            assert.equal(card.gate.pass, true)
-            assert.equal(confirmations, 1)
-            assert.ok(terminals >= 1, `${chain.id}: vulnerable replay must observe terminal impact`)
-          }
+          assert.equal(card.tp, 1, `${chain.id}: Two-Side Grader must count one true positive`)
+          assert.equal(card.fp, 0)
+          assert.equal(card.fn, 0)
+          assert.equal(card.gate.pass, true)
+          assert.equal(confirmations, 1)
+          assert.ok(terminals >= 1, `${chain.id}: vulnerable replay must observe terminal impact`)
         } else {
           assert.equal(run.verdict.confirmed, false, `${chain.id}: ${options.twin ?? options.mode} must stay worker-silent`)
           assert.equal(terminals, 0, `${chain.id}: ${options.twin ?? options.mode} must stay terminal-silent`)
@@ -1450,7 +1382,7 @@ for (const app of ['paygrid', 'shipforge', 'nexusiam'] as const) {
           decoyFps: card.strictDecoyFps,
           gradePass: card.gate.pass,
           runtimeMs: Math.round(run.runtimeMs),
-          gap,
+          gap: null,
         })
       }
       t.diagnostic(JSON.stringify({ chainId: chain.id, outcomes }))
