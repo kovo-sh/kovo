@@ -1017,3 +1017,116 @@ test('Seam 4: floor-confirmed GET /api/tickets/tkt_123 matches template /api/tic
   // Unrelated resource routes remain unconfirmed
   assert.equal(isRouteConfirmed({ method: 'GET', path: '/api/invoices/inv_123' }, confirmedSets), false)
 })
+
+// ============================================================================
+// SEAM 5: Bare Collection GET Precision Guard (CWE-639 / read-only BFLA)
+// ============================================================================
+
+test('Seam 5: bare collection GET with inverted role denial (owner=403, viewer=200 on own collection) fails closed for BOLA and non-admin BFLA, while object-scoped BOLA and foreign-tenant collection leaks confirm', () => {
+  // 5a. Fail-closed NEGATIVE: bare collection GET /api/v1/credentials (same-tenant owner=403, viewer=200)
+  const credSameTenant = buildAgentScriptReceipt({
+    origin: ORIGIN,
+    title: 'Access-control inversion on GET /api/v1/credentials: viewer allowed, owner denied',
+    exchanges: [
+      {
+        exchangeId: 'ctl', method: 'GET', pathAndQuery: '/api/v1/credentials', origin: ORIGIN,
+        status: 403, personaHandle: 'owner_a', actorRoleLabel: 'owner (tenant-a)', body: '{"error":"forbidden"}',
+      },
+      {
+        exchangeId: 'prb', method: 'GET', pathAndQuery: '/api/v1/credentials', origin: ORIGIN,
+        status: 200, personaHandle: 'viewer_a', actorRoleLabel: 'viewer (tenant-a)',
+        body: '{"credentials":[{"id":"cred_1","token":"tok_own_12345","email":"viewer@tenant-a.example"}]}',
+      },
+    ],
+    claims: [{ kind: 'boundary', boundaryClass: 'access', controlExchangeId: 'ctl', probeExchangeId: 'prb', expectControlDenied: true }],
+  })
+  assert.ok(credSameTenant)
+  const credSameVerdict = verifyReceipt(credSameTenant.receipt, credSameTenant.transcript)
+  assert.equal(credSameVerdict.confirmed, false, 'same-tenant bare collection GET role inversion MUST fail closed')
+  assert.match(credSameVerdict.reason, /Bare collection GET|object identifier/i)
+
+  // 5b. Fail-closed NEGATIVE: bare collection GET /api/v1/charges (cross-tenant owner=403, viewer=200 on own charges)
+  const chargesCrossActor = buildAgentScriptReceipt({
+    origin: ORIGIN,
+    title: 'Access-control inversion on GET /api/v1/charges: viewer allowed, owner denied',
+    exchanges: [
+      {
+        exchangeId: 'ctl', method: 'GET', pathAndQuery: '/api/v1/charges', origin: ORIGIN,
+        status: 403, personaHandle: 'owner_b', actorRoleLabel: 'owner (tenant-b)', body: '{"error":"forbidden"}',
+      },
+      {
+        exchangeId: 'prb', method: 'GET', pathAndQuery: '/api/v1/charges', origin: ORIGIN,
+        status: 200, personaHandle: 'viewer_a', actorRoleLabel: 'viewer (tenant-a)',
+        body: '{"charges":[{"id":"chg_1","amount_cents":1999,"user_id":"u_42","email":"viewer@tenant-a.example"}]}',
+      },
+    ],
+    claims: [{ kind: 'boundary', boundaryClass: 'access', controlExchangeId: 'ctl', probeExchangeId: 'prb', expectControlDenied: true }],
+  })
+  assert.ok(chargesCrossActor)
+  const chargesCrossVerdict = verifyReceipt(chargesCrossActor.receipt, chargesCrossActor.transcript)
+  assert.equal(chargesCrossVerdict.confirmed, false, 'bare collection GET returning own tenant charges MUST fail closed')
+
+  // 5c. Fail-closed NEGATIVE: read-only BFLA on bare non-admin collection GET /api/v1/charges (owner=403, viewer=200)
+  const chargesBfla = buildAgentScriptReceipt({
+    origin: ORIGIN,
+    title: 'BFLA inversion on GET /api/v1/charges',
+    exchanges: [
+      {
+        exchangeId: 'ctl', method: 'GET', pathAndQuery: '/api/v1/charges', origin: ORIGIN,
+        status: 403, personaHandle: 'owner_a', actorRoleLabel: 'owner (tenant-a)', body: '{"error":"forbidden"}',
+      },
+      {
+        exchangeId: 'prb', method: 'GET', pathAndQuery: '/api/v1/charges', origin: ORIGIN,
+        status: 200, personaHandle: 'viewer_a', actorRoleLabel: 'viewer (tenant-a)',
+        body: '{"charges":[{"id":"chg_1","amount_cents":1999}]}',
+      },
+    ],
+    claims: [{ kind: 'boundary', boundaryClass: 'auth', controlExchangeId: 'ctl', probeExchangeId: 'prb', expectControlDenied: true }],
+  })
+  assert.ok(chargesBfla)
+  assert.equal(chargesBfla.receipt.vulnClass, 'bfla')
+  const chargesBflaVerdict = verifyReceipt(chargesBfla.receipt, chargesBfla.transcript)
+  assert.equal(chargesBflaVerdict.confirmed, false, 'read-only BFLA on bare non-admin collection GET MUST fail closed')
+
+  // 5d. Positive: object-level BOLA GET /api/v1/orders/ord_other STILL confirms cleanly!
+  const objectBola = buildAgentScriptReceipt({
+    origin: ORIGIN,
+    title: 'Cross-tenant order BOLA read',
+    exchanges: [
+      {
+        exchangeId: 'ctl', method: 'GET', pathAndQuery: '/api/v1/orders/ord_other', origin: ORIGIN,
+        status: 403, personaHandle: 'anonymous', actorRoleLabel: 'anonymous', body: '{"error":"forbidden"}',
+      },
+      {
+        exchangeId: 'prb', method: 'GET', pathAndQuery: '/api/v1/orders/ord_other', origin: ORIGIN,
+        status: 200, personaHandle: 'member_b', actorRoleLabel: 'member (tenant-b)',
+        body: '{"id":"ord_other","owner_id":"owner-a","tenant_id":"tenant-a","email":"alice@tenant-a.example","total":4900}',
+      },
+    ],
+    claims: [{ kind: 'boundary', boundaryClass: 'access', controlExchangeId: 'ctl', probeExchangeId: 'prb', expectControlDenied: true }],
+  })
+  assert.ok(objectBola)
+  const objectBolaVerdict = verifyReceipt(objectBola.receipt, objectBola.transcript)
+  assert.equal(objectBolaVerdict.confirmed, true, objectBolaVerdict.reason)
+
+  // 5e. Positive: bare collection GET that genuinely leaks multi-tenant records (>=2 distinct tenant_ids) STILL confirms!
+  const multiTenantLeak = buildAgentScriptReceipt({
+    origin: ORIGIN,
+    title: 'Unscoped multi-tenant collection leak on GET /api/v1/charges',
+    exchanges: [
+      {
+        exchangeId: 'ctl', method: 'GET', pathAndQuery: '/api/v1/charges', origin: ORIGIN,
+        status: 401, personaHandle: null, actorRoleLabel: null, body: '{"error":"unauthorized"}',
+      },
+      {
+        exchangeId: 'prb', method: 'GET', pathAndQuery: '/api/v1/charges', origin: ORIGIN,
+        status: 200, personaHandle: 'viewer_a', actorRoleLabel: 'viewer (tenant-a)',
+        body: '{"charges":[{"id":"chg_1","tenant_id":"tenant-a","amount_cents":1999},{"id":"chg_2","tenant_id":"tenant-b","email":"victim@tenant-b.example","amount_cents":9900}]}',
+      },
+    ],
+    claims: [{ kind: 'boundary', boundaryClass: 'access', controlExchangeId: 'ctl', probeExchangeId: 'prb', expectControlDenied: true }],
+  })
+  assert.ok(multiTenantLeak)
+  const multiTenantVerdict = verifyReceipt(multiTenantLeak.receipt, multiTenantLeak.transcript)
+  assert.equal(multiTenantVerdict.confirmed, true, multiTenantVerdict.reason)
+})

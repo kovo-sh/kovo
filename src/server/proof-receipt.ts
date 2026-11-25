@@ -19,6 +19,8 @@ import {
   assessImpactEvidence,
   assessInjectionImpact,
   assessStatusOnlyDivergence,
+  hasForeignTenantOrOwnerDisclosure,
+  isObjectScopedRequest,
   knownOracleEvent,
   parseRoleLabel,
   routeFamily,
@@ -530,6 +532,24 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
       observed: receipt.claimedDelta,
       expected: 'persisted/observable impact that the recorded exchanges substantiate',
       evidence: assessment.evidence,
+    }
+  }
+  // Defense-in-depth precision guard for read-only object-level BOLA/IDOR (CWE-639): a bare
+  // collection GET without an object identifier must carry explicit cross-tenant or foreign-owner
+  // disclosure evidence (never an inverted higher-role 401/403 vs lower-role own-collection 200).
+  if (!mutatingProbe && /^(?:bola|idor|cross_tenant|cross_tenant_read)$/i.test(receipt.vulnClass)) {
+    const readProbe = steps.find(step => step.arm === 'probe' && is2xxStatus(step.status))
+    if (readProbe && !isObjectScopedRequest(readProbe)) {
+      const evidence = assessment.evidence as { crossTenant?: boolean } | undefined
+      const hasForeign = evidence?.crossTenant === true ||
+        hasForeignTenantOrOwnerDisclosure(steps, readProbe, receipt.resourceTenant ?? null)
+      if (!hasForeign) {
+        return reject(
+          receipt,
+          rule,
+          `Bare collection GET (${readProbe.route ?? readProbe.pathAndQuery ?? '/'}) without an object identifier cannot confirm ${receipt.vulnClass} without explicit cross-tenant or foreign-owner data disclosure.`,
+        )
+      }
     }
   }
   return {

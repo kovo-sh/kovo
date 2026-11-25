@@ -732,6 +732,96 @@ export interface AuthorizationAssessment extends ImpactAssessment {
   }
 }
 
+const STRONG_OBJECT_ID_SEGMENT_RE = /^(?:\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{8,}|:[a-z0-9_]+|\{[a-z0-9_]+\}|[a-z]{1,12}[_-][a-z0-9_-]*\d[a-z0-9_-]*|[a-z]{1,6}\d+)$/i
+const PREFIXED_SLUG_OBJECT_ID_RE = /^[a-z]{2,6}[_-][a-z0-9]{3,}$/i
+const ROUTE_PREFIX_OR_VERSION_RE = /^(?:api|v\d+|api[-_]?v\d+|v\d+[-_](?:alpha|beta|rc)\d*)$/i
+const NON_OBJECT_SEGMENT_RE = /^(?:api|v\d+|api[-_]?v\d+|v\d+[-_](?:alpha|beta|rc)\d*|oauth2?|http2|2fa|utf[-_]?8|sha[-_]?256|base[-_]?64|health[-_]?check|sign[-_]?(?:in|up|out)|log[-_]?(?:in|out)|reset[-_]?password|forgot[-_]?password|api[-_]?keys?|webhook[-_]?test|feature[-_]?flags?|user[-_]?profile|audit[-_]?logs?|credit[-_]?cards?|payment[-_]?methods?|rate[-_]?limits?)$/i
+const OBJECT_QUERY_PARAM_RE = /(?:^|[?&])(?:[a-z0-9_]*_?id|tenant|org|organization|account|user|owner|customer|email|slug|key|number|token|code|handle)=[^&]+/i
+const TENANT_SCOPE_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:tenant|org|organization|workspace)(?:_?id)?$/i
+
+/**
+ * True when a request targets a specific object (concrete ID segment in the path or an explicit
+ * identifier query parameter) rather than a bare collection listing like `GET /api/v1/charges`.
+ */
+export function isObjectScopedRequest(step: Pick<ImpactStep, 'route' | 'pathAndQuery'>): boolean {
+  const pathAndQuery = (step.pathAndQuery ?? step.route ?? '').trim()
+  if (!pathAndQuery) return false
+  const [pathname, query = ''] = pathAndQuery.split('?', 2)
+  if (query && OBJECT_QUERY_PARAM_RE.test(`?${query}`)) return true
+  const segments = pathname.split('/').filter(Boolean)
+  for (let i = 0; i < segments.length; i += 1) {
+    const seg = segments[i]!
+    if (NON_OBJECT_SEGMENT_RE.test(seg)) continue
+    if (STRONG_OBJECT_ID_SEGMENT_RE.test(seg)) return true
+    if (i >= 1 && PREFIXED_SLUG_OBJECT_ID_RE.test(seg) && !ROUTE_PREFIX_OR_VERSION_RE.test(segments[i - 1]!)) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * True when a probe response on a bare collection GET carries explicit cross-tenant or
+ * foreign-owner disclosure evidence (not merely the caller's own tenant records):
+ *  - a known foreign tenant/actor identity (from a foreign-tenant control or declared resourceTenant)
+ *    appears in an owner/tenant field of the probe response, OR
+ *  - the collection response spans >=2 distinct tenant/org/workspace IDs (unscoped multi-tenant dump).
+ */
+export function hasForeignTenantOrOwnerDisclosure(
+  steps: readonly ImpactStep[],
+  probe: ImpactStep,
+  declaredResourceTenant?: string | null,
+): boolean {
+  if (probe.json === undefined || probe.json === null || typeof probe.json !== 'object') return false
+  const flat = flattenJson(probe.json)
+  if (flat.size === 0) return false
+  const probeTenant = probe.actor.tenant?.toLowerCase() ?? null
+  const probeHandle = probe.actor.handle?.toLowerCase() ?? null
+  const foreignTenants = new Set<string>()
+  const foreignHandles = new Set<string>()
+  if (declaredResourceTenant) {
+    const t = declaredResourceTenant.trim().toLowerCase()
+    if (t && t !== probeTenant) foreignTenants.add(t)
+  }
+  for (const step of steps) {
+    if (step === probe) continue
+    const t = step.actor.tenant?.toLowerCase() ?? null
+    const h = step.actor.handle?.toLowerCase() ?? null
+    if (t && probeTenant && t !== probeTenant) {
+      foreignTenants.add(t)
+      if (h && h !== probeHandle) foreignHandles.add(h)
+    }
+  }
+  const observedTenants = new Set<string>()
+  for (const [path, rawValue] of flat) {
+    const leaf = deRedactIdentity(path.replace(/\[\d+\]/g, '').split('.').pop() ?? '')
+    const val = deRedactIdentity(rawValue.trim())
+    if (!val || val === 'null' || val === 'undefined' || val === '0' || val === 'false' || val === 'true') continue
+    if (TENANT_SCOPE_FIELD_RE.test(leaf)) {
+      observedTenants.add(val)
+      if (foreignTenants.has(val)) return true
+    }
+    if (OWNER_SCOPED_RE.test(leaf)) {
+      if (foreignHandles.has(val) || foreignTenants.has(val)) return true
+      for (const ft of foreignTenants) {
+        if (ft.length >= 3 && val.includes(ft) && (!probeTenant || !val.includes(probeTenant))) return true
+      }
+      if (probeTenant && val.includes('@')) {
+        const domain = val.split('@')[1] ?? ''
+        for (const ft of foreignTenants) {
+          if (ft.length >= 3 && domain.includes(ft) && !domain.includes(probeTenant)) return true
+        }
+      }
+    }
+    const canaryMatch = /\brbc_([a-z0-9-]+)_[0-9a-f]{8,}\b/i.exec(val)
+    if (canaryMatch && probeTenant && canaryMatch[1]!.toLowerCase() !== probeTenant.replace(/[^a-z0-9-]/g, '')) {
+      return true
+    }
+  }
+  if (observedTenants.size >= 2) return true
+  return false
+}
+
 function sameTenant(a: ActorIdentity, b: ActorIdentity): boolean {
   return Boolean(a.tenant && b.tenant && a.tenant === b.tenant)
 }
@@ -908,11 +998,17 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
       evidence: base,
     }
   }
-  if (roleDifferential && boundaryControlDenied) {
+  const probeIsFunctionSurface = FUNCTION_SURFACE_RE.test(probe.route ?? '')
+  const probeIsObjectScoped = isObjectScopedRequest(probe)
+  // A read-only vertical differential with a denied control only confirms on a role-exclusive
+  // privileged/function surface (`/admin`, `/audit`, `/manage`, ...) under BFLA. On a non-admin
+  // bare collection GET (e.g. `GET /api/v1/charges`), a higher role receiving 401/403 while a
+  // lower role reads its own collection is an inverted/role-partitioned control, NOT BOLA or BFLA.
+  if (roleDifferential && boundaryControlDenied && vertical && probeIsFunctionSurface) {
     return {
       required: true,
       satisfied: true,
-      reason: `Vertical read differential: ${escalationReason}; the sibling control on the same route was denied while the probe was served data.`,
+      reason: `Vertical read differential: ${escalationReason}; the sibling control on the same privileged route was denied while the probe was served data.`,
       evidence: base,
     }
   }
@@ -1006,6 +1102,17 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
       satisfied: true,
       reason: `Credential-shaped value disclosed: the probe response matches ${patternEvidence.length} declared credential shape(s) absent from every control, under a ${boundaryControlDenied ? 'denied sibling control' : 'role differential'}.`,
       evidence: base,
+    }
+  }
+  if (!probeIsObjectScoped && !(vertical && probeIsFunctionSurface)) {
+    const foreignCollectionData = hasForeignTenantOrOwnerDisclosure(steps, probe, resourceTenant)
+    if (!foreignCollectionData) {
+      return {
+        required: true,
+        satisfied: false,
+        reason: `Bare collection GET (${probe.route ?? probe.pathAndQuery ?? '/'}) lacks impact evidence: without an object identifier, ${vertical ? 'read-only BFLA' : 'object-level authorization (CWE-639)'} requires explicit cross-tenant or foreign-owner data disclosure; an inverted role denial while a caller reads its own collection is not an access-control crossing.`,
+        evidence: base,
+      }
     }
   }
   const disclosure = assessReadDisclosure({ steps, probe })
