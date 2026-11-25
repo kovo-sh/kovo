@@ -44,7 +44,7 @@ import type {
   PersistedMutationArgs,
   RaceBurstArgs,
 } from './floor-recipes.ts'
-import { actorFromPersona, assessBoundary, assessImpactEvidence, assessMassAssignmentImpact, assessMfaBypass, assessStatusOnlyDivergence, classifyBoundaryClaim, classifyImpactDescriptor, normalizeRole } from './oracle-invariants.ts'
+import { actorFromPersona, assessBoundary, assessImpactEvidence, assessMassAssignmentImpact, assessMfaBypass, assessStatusOnlyDivergence, classifyBoundaryClaim, classifyImpactDescriptor, normalizeRole, parseRoleLabel } from './oracle-invariants.ts'
 import type { ActorIdentity, AmbientAuth, ImpactStep, PersonaCredentialSource, RoleName } from './oracle-invariants.ts'
 import { verifyReceipt } from './proof-receipt.ts'
 import type { ProofReceipt, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
@@ -135,10 +135,11 @@ function personaOf(handle: string | null | undefined, personas: readonly EngineP
 export function floorActorFor(handle: string | null | undefined, personas: readonly EnginePersona[]): FloorActor {
   if (!handle) return { handle: ANONYMOUS_HANDLE, role: null, tenant: null, auth: 'unknown' }
   const persona = personaOf(handle, personas)
+  const parsed = parseRoleLabel(persona?.roleLabel ?? null)
   return {
     handle,
-    role: roleOf(persona),
-    tenant: persona?.tenant ?? null,
+    role: parsed.role ?? roleOf(persona),
+    tenant: persona?.tenant?.toLowerCase() ?? parsed.tenant ?? null,
     auth: 'cookie',
   }
 }

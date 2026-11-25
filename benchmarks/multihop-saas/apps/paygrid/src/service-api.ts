@@ -245,7 +245,7 @@ export async function handleApi(
     const session = auth(state, req, res)
     if (!session) return
     const job = state.jobs.find((item) => item.id === exportById[0] && item.kind === 'export')
-    if (!job) {
+    if (!job || job.tenantId !== session.tenantId) {
       sendJson(res, 404, { error: 'unknown export' })
       return
     }
@@ -309,7 +309,7 @@ export async function handleApi(
     const session = auth(state, req, res)
     if (!session) return
     const template = state.templates.find((item) => item.id === templateById[0])
-    if (!template) {
+    if (!template || template.tenantId !== session.tenantId) {
       sendJson(res, 404, { error: 'unknown template' })
       return
     }
@@ -345,7 +345,7 @@ export async function handleApi(
     const session = auth(state, req, res)
     if (!session) return
     const invoice = state.invoices.find((item) => item.id === invoiceById[0])
-    if (!invoice) {
+    if (!invoice || invoice.tenantId !== session.tenantId) {
       sendJson(res, 404, { error: 'unknown invoice' })
       return
     }

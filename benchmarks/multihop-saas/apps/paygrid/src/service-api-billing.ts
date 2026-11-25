@@ -45,7 +45,7 @@ export async function handleBilling(
     const session = auth(state, req, res)
     if (!session) return true
     const payout = state.payouts.find((item) => item.id === payoutById[0])
-    if (!payout) {
+    if (!payout || payout.tenantId !== session.tenantId) {
       sendJson(res, 404, { error: 'unknown payout' })
       return true
     }
@@ -202,7 +202,7 @@ export async function handleBilling(
     const session = auth(state, req, res)
     if (!session) return true
     const order = state.orders.find((item) => item.id === orderById[0])
-    if (!order) {
+    if (!order || order.tenantId !== session.tenantId) {
       sendJson(res, 404, { error: 'unknown order' })
       return true
     }

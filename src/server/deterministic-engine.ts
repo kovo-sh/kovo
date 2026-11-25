@@ -28,6 +28,7 @@ import type { WorkerBackend } from './worker-backend.ts'
 import { synthesizeEngineSpecs, vulnClassOfSpec } from './deterministic-specs.ts'
 import type { EngineEndpoint, EngineHypothesis, EngineParam, SynthesizedEngineSpec } from './deterministic-specs.ts'
 import { planFloorRecipe, recipeSpecRecord, recipeVerificationResult, runPlannedRecipe } from './floor-recipe-engine.ts'
+import { parseRoleLabel, parseRoleTenants } from './oracle-invariants.ts'
 
 export type { EngineEndpoint, EngineHypothesis, EngineParam } from './deterministic-specs.ts'
 
@@ -1381,7 +1382,34 @@ export function buildIdentityProfiles(
   return profiles
 }
 
-function personaPicks(personas: readonly EnginePersona[]): {
+function personaTenantsOf(persona: EnginePersona): string[] {
+  const seen = new Set<string>()
+  if (persona.tenant?.trim()) seen.add(persona.tenant.trim().toLowerCase())
+  for (const tenant of parseRoleTenants(persona.roleLabel)) seen.add(tenant)
+  return [...seen]
+}
+
+function primaryTenantOf(persona: EnginePersona | undefined): string | undefined {
+  if (!persona) return undefined
+  return persona.tenant?.trim() || parseRoleLabel(persona.roleLabel).tenant || undefined
+}
+
+function personasShareTenant(a: EnginePersona, b: EnginePersona): boolean {
+  const left = personaTenantsOf(a)
+  if (left.length === 0) return false
+  const right = new Set(personaTenantsOf(b))
+  return left.some(tenant => right.has(tenant))
+}
+
+function personasAreDisjointTenants(a: EnginePersona, b: EnginePersona): boolean {
+  const left = personaTenantsOf(a)
+  const right = personaTenantsOf(b)
+  if (left.length === 0 || right.length === 0) return false
+  const rightSet = new Set(right)
+  return !left.some(tenant => rightSet.has(tenant))
+}
+
+export function personaPicks(personas: readonly EnginePersona[]): {
   owner?: EnginePersona
   crossTenant?: EnginePersona
   lower?: EnginePersona
@@ -1389,14 +1417,27 @@ function personaPicks(personas: readonly EnginePersona[]): {
 } {
   const members = personas.filter(p => p.privilege !== 'admin')
   const owner = members.find(p => p.privilege === 'member') ?? members[0] ?? personas[0]
-  const crossTenant = owner
-    ? personas.find(p => p.handle !== owner.handle && p.privilege !== 'admin' && p.tenant && owner.tenant && p.tenant !== owner.tenant)
+  const ownerTenants = owner ? personaTenantsOf(owner) : []
+  const disjointCrossTenant = owner
+    ? personas.find(p => p.handle !== owner.handle && p.privilege !== 'admin' && personasAreDisjointTenants(owner, p))
+      ?? personas.find(p => p.handle !== owner.handle && personasAreDisjointTenants(owner, p))
     : undefined
+  // Only fall back to an arbitrary second persona when the app carries no tenant metadata at all
+  // (single-tenant user-vs-user apps). When personas carry tenant memberships, never pair two
+  // personas that share a tenant as a cross-tenant BOLA pair.
+  const crossTenant = disjointCrossTenant ?? (
+    owner && ownerTenants.length === 0
+      ? personas.find(p => p.handle !== owner.handle && !personasShareTenant(owner, p))
+      : undefined
+  )
   const lower = owner
-    ? personas.find(p => p.privilege === 'viewer' && p.tenant === owner.tenant)
+    ? personas.find(p =>
+        p.handle !== owner.handle &&
+        p.privilege === 'viewer' &&
+        (ownerTenants.length > 0 ? personasShareTenant(owner, p) : personaTenantsOf(p).length === 0))
     : undefined
   const admin = personas.find(p => p.privilege === 'admin')
-  return { owner, crossTenant: crossTenant ?? (owner ? personas.find(p => p.handle !== owner.handle) : undefined), lower, admin }
+  return { owner, crossTenant, lower, admin }
 }
 
 function semanticValue(name: string, observed?: string): string | number | boolean {
@@ -1591,7 +1632,7 @@ export function enumerateHypotheses(
       : bare
 
     // --- Authorization / BOLA / IDOR / BFLA ------------------------------------------------
-    if (options.tier >= 2 && picks.owner && picks.crossTenant &&
+    if (options.tier >= 2 && picks.owner && (picks.crossTenant || (privileged && picks.lower)) &&
         (options.tier >= 3 || method === 'GET' || method === 'POST' || method === 'DELETE')) {
       const authzOwner = privileged ? (picks.admin ?? picks.owner) : picks.owner
       const authzOther = privileged
@@ -2369,7 +2410,7 @@ export function enumerateHypotheses(
       // claims are the caller's existing authorization, never an escalation.
       const claims: Record<string, string> = { ...identityClaims }
       if (Object.keys(claims).length === 0 && picks.owner) {
-        const tenant = picks.owner.tenant
+        const tenant = primaryTenantOf(picks.owner)
         if (tenant) {
           claims.tenant = tenant
           claims.store = tenant
@@ -2473,7 +2514,8 @@ export function enumerateHypotheses(
         }
         // The cross-tenant persona's tenant label is itself a legitimate overpost value even when
         // the collection response does not expose the owning tenant id field.
-        if (picks.crossTenant?.tenant && values.tenant_id === undefined) values.tenant_id = picks.crossTenant.tenant
+        const crossTenantName = primaryTenantOf(picks.crossTenant)
+        if (crossTenantName && values.tenant_id === undefined) values.tenant_id = crossTenantName
         // A role/privilege write must be performed by a genuinely lower-privileged actor on that
         // actor's own record: an owner editing its own row cannot demonstrate escalation.
         const roleField = candidates.find(f => /^(?:role|roles|permission|permissions|privilege|grant|level|is_admin|isAdmin|admin)$/i.test(f))
