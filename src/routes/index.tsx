@@ -6,11 +6,11 @@ import {
   CreateProjectGithubBlock,
   type GithubPatStatusSummary,
 } from '../components/project/CreateProjectGithubBlock.tsx'
-import { fmtDate, host, plural } from '../components/run/format.ts'
+import { host, plural } from '../components/run/format.ts'
 import { StatusGlyph } from '../components/run/glyphs.tsx'
 import { Icon } from '../components/run/icons.tsx'
 import { PHASE_LABEL, runStatusLabel } from '../components/run/meta.ts'
-import { useShell } from '../components/shell/AppShell.tsx'
+import { formatFullDateTime, formatRelativeTime, useNow, useShell } from '../components/shell/AppShell.tsx'
 import { Button } from '../components/ui/button.tsx'
 import { Checkbox } from '../components/ui/checkbox.tsx'
 import { Input, NativeSelect, Textarea } from '../components/ui/input.tsx'
@@ -202,6 +202,7 @@ function Workspace() {
   const search = Route.useSearch()
   const navigate = useNavigate()
   const shell = useShell()
+  const now = useNow()
   const [modalOpen, setModalOpen] = useState(Boolean(search.new))
   const [filter, setFilter] = useState('')
 
@@ -332,17 +333,28 @@ function Workspace() {
           </div>
 
           <div className="proj-run-col">
-            {latest ? <Link
-              to="/runs/$runId"
-              params={{ runId: latest.id }}
-              search={{}}
-              className="proj-run-link"
-              title={latest.goal}
-            >
-              <span className="g"><StatusGlyph status={latest.status} /></span>
-              <span className="proj-run-meta">{formatRunPhase(latest.status, latest.phase)}</span>
-              <span className="proj-run-time num">{fmtDate(latest.startedAt)}</span>
-            </Link> : <span className="muted">No runs yet</span>}
+            {latest ? (() => {
+              const relTime = formatRelativeTime(latest.startedAt, { compact: false, now })
+              const fullTime = formatFullDateTime(latest.startedAt)
+              return <Link
+                to="/runs/$runId"
+                params={{ runId: latest.id }}
+                search={{}}
+                className="proj-run-link"
+                title={`${latest.goal} (${fullTime})`}
+              >
+                <span className="g"><StatusGlyph status={latest.status} /></span>
+                <span className="proj-run-meta">{formatRunPhase(latest.status, latest.phase)}</span>
+                <time
+                  className="proj-run-time num"
+                  dateTime={new Date(latest.startedAt).toISOString()}
+                  title={fullTime}
+                  suppressHydrationWarning
+                >
+                  {relTime}
+                </time>
+              </Link>
+            })() : <span className="muted">No runs yet</span>}
           </div>
 
           <div className="proj-counts-col num">

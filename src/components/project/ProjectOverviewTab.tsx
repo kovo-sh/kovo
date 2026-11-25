@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { timeText } from '../common.tsx'
+import { formatFullDateTime, formatRelativeTime, useNow } from '../shell/AppShell.tsx'
 import { capabilityTierMeta, formatUsd, phaseNames } from '../run-state.ts'
 import type { ProjectLoaderData, ProjectTabId } from './types.ts'
 import { formatGithubPatBadge } from './types.ts'
@@ -61,6 +61,7 @@ function AllowlistSetupSvg({ ready }: { ready: boolean }) {
 
 export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
   const { project, assets, personas, specs, runs, githubPatStatus } = data
+  const now = useNow()
   const latestRun = runs[0]
   const completedRuns = runs.filter(r => r.status === 'complete').length
   const activeRuns = runs.filter(r => r.status === 'running' || r.status === 'waiting' || r.status === 'paused' || r.status === 'budget_paused').length
@@ -127,9 +128,7 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
           <PersonasSetupSvg ready={personas.length > 0} />
           <span className="n">{personas.length > 0 ? `${plural(personas.length, 'test account')} ready` : 'Add Test Accounts'}</span>
           <span className="l">
-            {personas.length > 0
-              ? 'Test accounts configured for Tier 2/3 BOLA checks.'
-              : 'Configure User A & User B for cross-tenant authorization testing.'}
+            Scan behind sign-in and catch cross-account access leaks.
           </span>
         </button>
         <button
@@ -140,9 +139,7 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
           <GithubSetupSvg ready={specs.length > 0} />
           <span className="n">{specs.length > 0 ? `${plural(specs.length, 'repo snapshot')} synced` : 'Connect GitHub Repos'}</span>
           <span className="l">
-            {githubPatStatus.configured
-              ? 'PAT connected — discover & sync repos read-only for grey-box context.'
-              : 'Optional Fine-Grained PAT for read-only code, schema & CVE context.'}
+            Add source code to enrich vulnerability analysis.
           </span>
         </button>
         <button
@@ -153,9 +150,7 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
           <AllowlistSetupSvg ready={allowlistCount > 0} />
           <span className="n">{allowlistCount > 0 ? `${plural(allowlistCount, 'allowlist rule')}` : 'Configure Write Allowlist'}</span>
           <span className="l">
-            {allowlistCount > 0
-              ? 'Explicit Tier-2 sandbox write allowlist active.'
-              : 'Fail-closed empty list; optionally allow non-destructive staging POSTs.'}
+            Allow safe test mutations on staging without risking real data.
           </span>
         </button>
       </div>
@@ -183,7 +178,15 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
               </span>
               <span className="pw-row-right">
                 <span className="pw-tag solid" style={{ textTransform: 'capitalize' }}>{run.status.replaceAll('_', ' ')}</span>
-                <span className="muted num" style={{ fontSize: 12 }}>{timeText(run.createdAt)}</span>
+                <time
+                  className="muted num"
+                  style={{ fontSize: 12 }}
+                  dateTime={new Date(run.createdAt).toISOString()}
+                  title={formatFullDateTime(run.createdAt)}
+                  suppressHydrationWarning
+                >
+                  {formatRelativeTime(run.createdAt, { compact: false, now })}
+                </time>
               </span>
             </Link>
           ))}

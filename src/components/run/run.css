@@ -112,28 +112,37 @@
 .rw .search{margin:2px 10px 10px;height:30px;display:flex;align-items:center;gap:8px;padding:0 8px 0 9px;border-radius:7px;color:var(--fg-3);background:var(--panel);box-shadow:var(--shadow-sm);transition:color var(--d1)}
 .rw .search:hover{color:var(--fg-2)}
 .rw .search .kbd-group{margin-left:auto}
-.rw .rail-scroll{overflow:auto;flex:1;padding:0 8px 8px}
-.rw .rail-h{display:flex;align-items:center;justify-content:space-between;color:var(--fg-3);font-size:11.5px;font-weight:500;padding:14px 8px 4px;letter-spacing:.01em}
-.rw .proj{padding:8px 8px 2px;font-size:12px;color:var(--fg-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.rw .ritem{display:flex;align-items:center;gap:9px;height:28px;padding:0 8px;border-radius:6px;color:var(--fg-2);cursor:pointer;user-select:none;width:100%;text-align:left;position:relative;transition:background var(--d1),color var(--d1)}
-.rw .ritem:hover{background:var(--hover);color:var(--fg)}
-.rw .ritem.on{background:var(--press);color:var(--fg)}
+.rw .rail-scroll{overflow:auto;flex:1;padding:2px 10px 10px}
+.rw .rail-h{display:flex;align-items:center;justify-content:space-between;color:var(--fg-3);font-size:11.5px;font-weight:500;padding:14px 10px 6px;letter-spacing:.01em}
+.rw .rail-h:first-child{padding-top:6px}
+.rw .rail nav{display:flex;flex-direction:column;gap:2px}
+.rw .proj{padding:10px 10px 4px;font-size:11.5px;font-weight:500;color:var(--fg-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rw .ritem{display:flex;align-items:center;gap:10px;height:auto;min-height:34px;padding:8px 10px;border:0;border-radius:7px;background:transparent;box-shadow:none;color:var(--fg-2);font-size:13px;font-weight:400;line-height:18px;cursor:pointer;user-select:none;width:100%;text-align:left;position:relative;transition:background var(--d1),color var(--d1)}
+.rw .ritem .ico{color:var(--fg-3);transition:color var(--d1)}
+.rw .ritem:hover{background:var(--hover);color:var(--fg);box-shadow:none}
+.rw .ritem:hover .ico{color:var(--fg-2)}
+.rw .ritem.on{background:var(--accent-soft);color:var(--fg);font-weight:500;box-shadow:none}
+.rw .ritem.on:hover{background:var(--accent-soft);color:var(--fg)}
+.rw .ritem.on .ico{color:var(--accent)}
+.rw .ritem.on::before{content:"";position:absolute;left:0;top:7px;bottom:7px;width:2.5px;border-radius:0 2px 2px 0;background:var(--accent)}
 .rw .ritem .lbl{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .rw .ritem .ct{color:var(--fg-3);font-size:12px}
 .rw .ritem .badge{min-width:18px;height:17px;padding:0 5px;border-radius:9px;font-size:11px;font-weight:600;line-height:17px;text-align:center;color:var(--fg-2);background:var(--press)}
 .rw .ritem .badge.hot{color:var(--warn);background:var(--warn-soft);box-shadow:inset 0 0 0 1px var(--warn-line)}
 .rw .ritem .badge.pulse{animation:rw-pulse .6s var(--ease)}
 @keyframes rw-pulse{0%{transform:scale(1)}35%{transform:scale(1.22)}100%{transform:scale(1)}}
-.rw .ritem.run{height:auto;padding:6px 8px;align-items:flex-start}
+.rw .ritem.run{height:auto;min-height:0;padding:8px 10px;align-items:flex-start;gap:9px;font-weight:400}
+.rw .ritem.run + .ritem.run{margin-top:2px}
+.rw .ritem.run.on::before{top:9px;bottom:9px}
 .rw .ritem.run .g{padding-top:3px}
-.rw .ritem.run .lbl{display:flex;flex-direction:column;gap:0}
+.rw .ritem.run .lbl{display:flex;flex-direction:column;gap:1px}
 .rw .ritem.run .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:inherit}
 .rw .ritem.run .s{font-size:11.5px;line-height:16px;color:var(--fg-3);display:flex;gap:6px;white-space:nowrap;overflow:hidden}
 .rw .ritem .kh{opacity:0;transition:opacity var(--d1)}
 .rw .ritem:hover .kh{opacity:1}
-.rw .rail-foot{border-top:1px solid var(--line);padding:8px;display:flex;align-items:center;gap:4px}
-.rw .icon-btn{height:28px;min-width:28px;display:inline-flex;align-items:center;justify-content:center;gap:6px;border-radius:6px;color:var(--fg-3);padding:0 7px;transition:background var(--d1),color var(--d1)}
-.rw .icon-btn:hover{background:var(--hover);color:var(--fg)}
+.rw .rail-foot{border-top:1px solid var(--line);padding:8px 10px;display:flex;align-items:center;gap:4px}
+.rw .icon-btn{height:28px;min-width:28px;display:inline-flex;align-items:center;justify-content:center;gap:6px;border:0;border-radius:6px;background:transparent;box-shadow:none;color:var(--fg-3);padding:0 7px;transition:background var(--d1),color var(--d1)}
+.rw .icon-btn:hover{background:var(--hover);color:var(--fg);box-shadow:none}
 .rw .icon-btn[disabled]{opacity:.4;cursor:default}
 .rw .rail-foot .grow{flex:1}
 .rw .main{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--panel);position:relative}
@@ -835,9 +844,12 @@
 .rw .btn.primary{font-weight:500;border:0}
 .rw .toolbar{gap:6px}
 
-/* rail: run rows render as links */
-.rw a.ritem{color:var(--fg-2)}
-.rw a.ritem.on,.rw a.ritem:hover{color:var(--fg)}
+/* rail: clean borderless ghost rows (neutralise app.css button box-shadow/radius) */
+.rw button.ritem,.rw a.ritem{border:0;border-radius:7px;background:transparent;box-shadow:none;color:var(--fg-2)}
+.rw button.ritem:hover,.rw a.ritem:hover{background:var(--hover);color:var(--fg);box-shadow:none}
+.rw button.ritem.on,.rw a.ritem.on,.rw button.ritem.on:hover,.rw a.ritem.on:hover{background:var(--accent-soft);color:var(--fg);box-shadow:none}
+.rw button.icon-btn{border:0;border-radius:6px;background:transparent;box-shadow:none}
+.rw button.icon-btn:hover{background:var(--hover);color:var(--fg);box-shadow:none}
 
 /* header "…" menu, popovers (budget / policy / scope / goal) */
 .rw .menu{position:absolute;right:0;top:32px;z-index:30;min-width:232px;background:var(--raise);border-radius:10px;box-shadow:var(--shadow-pop);padding:6px;transform-origin:top right;animation:rw-pop var(--d2) var(--ease)}

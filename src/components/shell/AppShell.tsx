@@ -6,14 +6,21 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import type { ReactNode } from 'react'
 import { KovoHunterMark } from '../brand/KovoHunterMark.tsx'
 import { KbdGroup } from '../run/display.tsx'
-import { runLabel, short } from '../run/format.ts'
+import { runLabel } from '../run/format.ts'
 import { StatusGlyph } from '../run/glyphs.tsx'
 import { Icon } from '../run/icons.tsx'
 import { runStatusLabel } from '../run/meta.ts'
 import { DevicesIcon, DevicesSessionModal } from '../settings/DevicesSessionModal.tsx'
-import { GlobalHelpSheet, GlobalPalette } from './GlobalPalette.tsx'
+import {
+  formatFullDateTime,
+  formatRelativeTime,
+  GlobalHelpSheet,
+  GlobalPalette,
+  useNow,
+} from './GlobalPalette.tsx'
 import type { PoolHealth, ShellWorkspaceData } from './GlobalPalette.tsx'
 
+export { formatFullDateTime, formatRelativeTime, useNow } from './GlobalPalette.tsx'
 export type { PoolHealth, ShellProjectItem, ShellRecentRun, ShellWorkspaceData } from './GlobalPalette.tsx'
 
 const APPEARANCE_KEY = 'guardian-appearance'
@@ -100,6 +107,7 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
   const navigate = useNavigate()
   const pathname = useRouterState({ select: state => state.location.pathname })
   const { theme, toggle: toggleTheme } = useShellTheme()
+  const now = useNow()
   const [palette, setPalette] = useState<{ open: boolean; prefill: string }>({ open: false, prefill: '' })
   const [helpOpen, setHelpOpen] = useState(false)
   const [devicesOpen, setDevicesOpen] = useState(false)
@@ -202,21 +210,6 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [palette.open, helpOpen, devicesOpen, navigate, toggleTheme, openNewProject])
 
-  const groupedRecent = useMemo(() => {
-    const groups: { projectId: string; projectName: string; runs: ShellWorkspaceData['recentRuns'] }[] = []
-    const byProject = new Map<string, (typeof groups)[number]>()
-    for (const run of data.recentRuns) {
-      let group = byProject.get(run.projectId)
-      if (!group) {
-        group = { projectId: run.projectId, projectName: run.projectName, runs: [] }
-        byProject.set(run.projectId, group)
-        groups.push(group)
-      }
-      group.runs.push(run)
-    }
-    return groups
-  }, [data.recentRuns])
-
   const ctx = useMemo<ShellContextApi>(() => ({
     openPalette,
     closePalette,
@@ -279,36 +272,38 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
             <span className="num" style={{ fontWeight: 400 }}>{data.recentRuns.length || ''}</span>
           </div>
 
-          {groupedRecent.length === 0
+          {data.recentRuns.length === 0
             ? <div className="sh-rail-empty">No runs yet</div>
-            : groupedRecent.map(group => <div key={group.projectId}>
-              <Link
-                to="/projects/$projectId"
-                params={{ projectId: group.projectId }}
-                className="sh-proj"
-                title={group.projectName}
-              >
-                {group.projectName}
-              </Link>
-              {group.runs.map(r => <Link
+            : data.recentRuns.map(r => {
+              const relTime = formatRelativeTime(r.startedAt, { compact: true, now })
+              const fullTime = formatFullDateTime(r.startedAt)
+              return <Link
                 key={r.id}
                 to="/runs/$runId"
                 params={{ runId: r.id }}
                 search={{}}
                 className="sh-ritem run"
-                title={r.goal}
+                title={`${r.projectName} — ${runLabel(r.goal)} (${fullTime})`}
               >
                 <span className="g"><StatusGlyph status={r.status} /></span>
                 <span className="lbl">
-                  <span className="t">{runLabel(r.goal)}</span>
+                  <span className="t">{r.projectName}</span>
                   <span className="s">
-                    <span className="mono" style={{ fontSize: 11 }}>{short(r.id)}</span>
+                    <time
+                      className="num"
+                      dateTime={new Date(r.startedAt).toISOString()}
+                      title={fullTime}
+                      suppressHydrationWarning
+                    >
+                      {relTime}
+                    </time>
+                    <span aria-hidden="true">·</span>
                     <span>{runStatusLabel(r.status)}</span>
                     {r.confirmedCount > 0 && <span className="num" style={{ marginLeft: 'auto' }}>{r.confirmedCount}</span>}
                   </span>
                 </span>
-              </Link>)}
-            </div>)}
+              </Link>
+            })}
         </div>
 
         <div className="sh-rail-session">
