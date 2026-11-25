@@ -1,9 +1,4 @@
-/**
- * Layer-1 Derived Capability Custody & Bounded Async Poll-Convergence (v8 M0).
- *
- * Seals dynamically discovered runtime secrets behind opaque handles `cap:hop_<hopReceiptId>:<slot>`
- * held strictly host-side in module-private storage (with optional 0600 file persistence).
- */
+/** Layer-1 Derived Capability Custody (`cap:hop_<hopReceiptId>:<slot>`) & Bounded Async Poll-Convergence (v8 M0). */
 import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { accessSync, chmodSync, constants, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
@@ -21,9 +16,7 @@ export type DerivedCustodyErrorCode =
 export class DerivedCustodyError extends Error {
   readonly code: DerivedCustodyErrorCode
   constructor(code: DerivedCustodyErrorCode, message: string) {
-    super(message)
-    this.name = 'DerivedCustodyError'
-    this.code = code
+    super(message); this.name = 'DerivedCustodyError'; this.code = code
   }
 }
 
@@ -41,16 +34,8 @@ export interface SealDerivedCapabilityInput {
   derivedFromCapabilityId?: DerivedCapabilityHandle; defaultHeaderName?: string; defaultCookieName?: string
   allowedOrigins?: readonly string[]
 }
-export interface MatchedSealedHandle {
-  handleId: DerivedCapabilityHandle
-  rawDigest: string
-}
-export interface MatchSealedHandlesInput {
-  runId?: string
-  targetOrigin?: string
-  parts: readonly string[]
-  minLength?: number
-}
+export interface MatchedSealedHandle { handleId: DerivedCapabilityHandle; rawDigest: string }
+export interface MatchSealedHandlesInput { runId?: string; targetOrigin?: string; parts: readonly string[]; minLength?: number }
 
 const SAFE_ID_RE = /^[A-Za-z0-9._-]{1,128}$/
 const SAFE_SLOT_RE = /^[A-Za-z0-9._-]{1,64}$/
@@ -63,11 +48,9 @@ const DEFAULT_MAX_ENTRIES = 512
 const MIN_SCRUB_LENGTH = 4
 const DEFAULT_AUTOBIND_MIN_LENGTH = 8
 const TRIVIAL_AUTOBIND_VALUES = new Set([
-  'undefined', 'approved', 'accepted', 'rejected', 'completed', 'complete',
-  'processing', 'succeeded', 'disabled', 'password', 'username', 'anonymous',
-  'localhost', 'application/json', 'text/plain', 'text/html', 'authorization',
-  'content-type', 'connection', 'keep-alive', 'transfer-encoding', 'not_found',
-  'internal_error', 'forbidden', 'unauthorized', 'bad_request', 'placeholder',
+  'undefined', 'approved', 'accepted', 'rejected', 'completed', 'complete', 'processing', 'succeeded', 'disabled', 'password',
+  'username', 'anonymous', 'localhost', 'application/json', 'text/plain', 'text/html', 'authorization', 'content-type', 'connection',
+  'keep-alive', 'transfer-encoding', 'not_found', 'internal_error', 'forbidden', 'unauthorized', 'bad_request', 'placeholder',
   'default_value', 'readonly', 'readwrite',
 ])
 const UNSAFE_HEADERS = new Set(['host', 'content-length', 'connection', 'transfer-encoding', 'upgrade', 'keep-alive', 'te', 'trailer', 'proxy-connection'])
@@ -96,10 +79,7 @@ function cloneMeta(meta: DerivedCapabilityMeta): DerivedCapabilityMeta {
   return { ...meta, ...(meta.allowedOrigins ? { allowedOrigins: [...meta.allowedOrigins] } : {}) }
 }
 
-// ---------------------------------------------------------------------------
-// Module-Private Custody Store & 0600 Persistence
-// ---------------------------------------------------------------------------
-
+// --- Module-Private Custody Store & 0600 Persistence ---
 interface SealedEntry { meta: DerivedCapabilityMeta; rawValue: string }
 interface ScrubRecord { handle: DerivedCapabilityHandle; rawValue: string }
 interface PersistedVaultPayload { v: 1; runId: string; entries: SealedEntry[]; scrubHistory: ScrubRecord[] }
@@ -115,11 +95,7 @@ function getInternals(vault: DerivedCapabilityVault): VaultInternals {
   return state
 }
 
-function resolveActiveEntry(
-  vault: DerivedCapabilityVault,
-  handle: string,
-  opts?: { runId?: string; targetOrigin?: string },
-): SealedEntry {
+function resolveActiveEntry(vault: DerivedCapabilityVault, handle: string, opts?: { runId?: string; targetOrigin?: string }): SealedEntry {
   const state = getInternals(vault)
   assertCustody(opts?.runId === undefined || opts.runId === state.runId, 'RUN_MISMATCH', `Vault runId "${state.runId}" != "${opts?.runId}".`)
   assertCustody(isDerivedCapabilityHandle(handle), 'INVALID_HANDLE', `Malformed derived capability handle "${handle}".`)
@@ -177,11 +153,7 @@ export class DerivedCapabilityVault {
     assertCustody(SAFE_ID_RE.test(options.runId), 'INVALID_INPUT', `Invalid runId "${options.runId}".`)
     const maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES
     assertCustody(Number.isInteger(maxEntries) && maxEntries >= 1 && maxEntries <= 10_000, 'INVALID_INPUT', 'maxEntries must be 1..10000.')
-    assertCustody(
-      options.defaultTtlMs === undefined || options.defaultTtlMs === null || (Number.isFinite(options.defaultTtlMs) && options.defaultTtlMs >= 0),
-      'INVALID_INPUT',
-      'defaultTtlMs must be a non-negative finite number or null.',
-    )
+    assertCustody(options.defaultTtlMs === undefined || options.defaultTtlMs === null || (Number.isFinite(options.defaultTtlMs) && options.defaultTtlMs >= 0), 'INVALID_INPUT', 'defaultTtlMs must be a non-negative finite number or null.')
     this.runId = options.runId
     const state: VaultInternals = {
       runId: options.runId, persistPath: options.persistPath, defaultTtlMs: options.defaultTtlMs ?? null,
@@ -191,8 +163,7 @@ export class DerivedCapabilityVault {
     if (loaded) {
       for (const e of loaded.entries) {
         if (e?.meta && isDerivedCapabilityHandle(e.meta.handle) && typeof e.rawValue === 'string') {
-          state.entries.set(e.meta.handle, e)
-          state.scrubHistory.set(e.rawValue, { handle: e.meta.handle, rawValue: e.rawValue })
+          state.entries.set(e.meta.handle, e); state.scrubHistory.set(e.rawValue, { handle: e.meta.handle, rawValue: e.rawValue })
         }
       }
       for (const rec of loaded.scrubHistory) {
@@ -211,7 +182,6 @@ export class DerivedCapabilityVault {
     const ttl = input.ttlMs === undefined ? state.defaultTtlMs : input.ttlMs
     assertCustody(ttl === null || (Number.isFinite(ttl) && ttl >= 0), 'INVALID_INPUT', 'ttlMs must be a non-negative finite number or null.')
     assertCustody(input.derivedFromCapabilityId === undefined || isDerivedCapabilityHandle(input.derivedFromCapabilityId), 'INVALID_HANDLE', 'Invalid derivedFromCapabilityId.')
-
     const allowedOrigins = input.allowedOrigins?.map(normalizeOrigin)
     const createdAtMs = state.now()
     const digest = sha256Hex(input.rawValue)
@@ -267,37 +237,27 @@ export class DerivedCapabilityVault {
     const state = getInternals(this)
     if (input.runId !== undefined && input.runId !== state.runId) return []
     const parts = input.parts.filter((p): p is string => typeof p === 'string' && p.length > 0)
-    if (parts.length === 0) return []
-    const minLen = typeof input.minLength === 'number' && Number.isFinite(input.minLength)
-      ? Math.max(1, Math.floor(input.minLength))
-      : DEFAULT_AUTOBIND_MIN_LENGTH
-    let normalizedTargetOrigin: string | null = null
-    if (input.targetOrigin) {
-      try { normalizedTargetOrigin = normalizeOrigin(input.targetOrigin) } catch { normalizedTargetOrigin = null }
-    }
+    if (!parts.length) return []
+    const minLen = typeof input.minLength === 'number' && Number.isFinite(input.minLength) ? Math.max(1, Math.floor(input.minLength)) : DEFAULT_AUTOBIND_MIN_LENGTH
+    let targetOrigin: string | null = null
+    if (input.targetOrigin) { try { targetOrigin = normalizeOrigin(input.targetOrigin) } catch { /* invalid origin */ } }
     const nowMs = state.now()
     const matches: MatchedSealedHandle[] = []
     for (const entry of state.entries.values()) {
-      if (entry.meta.runId !== state.runId) continue
-      if (entry.meta.expiresAtMs !== null && nowMs >= entry.meta.expiresAtMs) continue
-      if (entry.meta.allowedOrigins?.length) {
-        if (!normalizedTargetOrigin || !entry.meta.allowedOrigins.includes(normalizedTargetOrigin)) continue
-      }
-      const raw = entry.rawValue
-      const trimmed = raw.trim()
+      if (entry.meta.runId !== state.runId || (entry.meta.expiresAtMs !== null && nowMs >= entry.meta.expiresAtMs)) continue
+      if (entry.meta.allowedOrigins?.length && (!targetOrigin || !entry.meta.allowedOrigins.includes(targetOrigin))) continue
+      const raw = entry.rawValue, trimmed = raw.trim()
       if (trimmed.length < minLen || /^(.)\1+$/.test(trimmed) || TRIVIAL_AUTOBIND_VALUES.has(trimmed.toLowerCase())) continue
-      const needles: string[] = [raw]
+      const needles = [raw]
       const encoded = encodeURIComponent(raw)
       if (encoded !== raw) {
         needles.push(encoded)
-        const lowerEncoded = encoded.replace(/%[0-9A-F]{2}/g, m => m.toLowerCase())
-        if (lowerEncoded !== encoded) needles.push(lowerEncoded)
+        const lower = encoded.replace(/%[0-9A-F]{2}/g, m => m.toLowerCase())
+        if (lower !== encoded) needles.push(lower)
         if (encoded.includes('%20')) needles.push(encoded.replaceAll('%20', '+'))
       }
       if (/["\\\r\n\t\x00-\x1f]/.test(raw)) needles.push(JSON.stringify(raw).slice(1, -1))
-      if (needles.some(n => parts.some(p => p.includes(n)))) {
-        matches.push({ handleId: entry.meta.handle, rawDigest: entry.meta.sha256 })
-      }
+      if (needles.some(n => parts.some(p => p.includes(n)))) matches.push({ handleId: entry.meta.handle, rawDigest: entry.meta.sha256 })
     }
     return matches
   }
@@ -311,25 +271,17 @@ export class DerivedCapabilityVault {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Secret Scrubbing (Raw + URL/Form + Base64 / Unpadded / Base64URL)
-// ---------------------------------------------------------------------------
-
+// --- Secret Scrubbing (Raw + URL/Form + Base64 / Unpadded / Base64URL) ---
 function buildSecretVariants(rawValue: string): string[] {
   const variants = new Set<string>([rawValue])
   const add = (v: string) => { if (v !== rawValue && v.length >= MIN_SCRUB_LENGTH) variants.add(v) }
   const urlEnc = encodeURIComponent(rawValue)
   if (urlEnc !== rawValue) {
-    add(urlEnc)
-    add(urlEnc.replace(/%[0-9A-F]{2}/g, m => m.toLowerCase()))
-    add(urlEnc.replaceAll('%20', '+'))
+    add(urlEnc); add(urlEnc.replace(/%[0-9A-F]{2}/g, m => m.toLowerCase())); add(urlEnc.replaceAll('%20', '+'))
   }
   const buf = Buffer.from(rawValue, 'utf8')
   const b64 = buf.toString('base64')
-  add(b64)
-  add(b64.replace(/=+$/, ''))
-  add(encodeURIComponent(b64))
-  add(buf.toString('base64url'))
+  add(b64); add(b64.replace(/=+$/, '')); add(encodeURIComponent(b64)); add(buf.toString('base64url'))
   return Array.from(variants)
 }
 
@@ -359,10 +311,7 @@ export function vaultScrubDescriptors(vault: DerivedCapabilityVault): NamedSecre
   return list
 }
 
-// ---------------------------------------------------------------------------
-// Host-Side Injection & Cryptographic Derivation Helpers
-// ---------------------------------------------------------------------------
-
+// --- Host-Side Injection & Cryptographic Derivation Helpers ---
 export type InjectCapabilityTarget = 'bearer' | 'header' | 'cookie' | 'url'
 export interface HostInjectableRequest { url: string; method?: string; headers?: Record<string, string>; body?: string | Uint8Array | null }
 export interface InjectCapabilityOptions {
@@ -377,15 +326,13 @@ export interface InjectCapabilityResult { request: HostInjectableRequest; attest
 
 function setHeaderCI(headers: Record<string, string>, name: string, value: string): void {
   const lower = name.toLowerCase()
-  for (const key of Object.keys(headers)) { if (key.toLowerCase() === lower) delete headers[key] }
+  for (const key of Object.keys(headers)) if (key.toLowerCase() === lower) delete headers[key]
   headers[name] = value
 }
-
 function getHeaderCI(headers: Record<string, string>, name: string): string | undefined {
   const lower = name.toLowerCase()
   return Object.entries(headers).find(([k]) => k.toLowerCase() === lower)?.[1]
 }
-
 function mergeCookieHeader(existing: string | undefined, cookieName: string, rawValue: string): string {
   const pairs: string[] = []
   let replaced = false
@@ -400,7 +347,6 @@ function mergeCookieHeader(existing: string | undefined, cookieName: string, raw
   if (!replaced) pairs.push(`${cookieName}=${rawValue}`)
   return pairs.join('; ')
 }
-
 function resolveVault(optVault: DerivedCapabilityVault | undefined, argVault: DerivedCapabilityVault | undefined): DerivedCapabilityVault {
   const vault = optVault ?? argVault
   assertCustody(vault, 'INVALID_INPUT', 'A DerivedCapabilityVault instance is required.')
@@ -416,7 +362,6 @@ export function injectCapabilityIntoRequest(options: InjectCapabilityOptions, va
   const headers: Record<string, string> = { ...(options.request.headers ?? {}) }
   let url = options.request.url
   const raw = entry.rawValue
-
   if (options.target === 'bearer') {
     assertCustody(!CRLF_RE.test(raw), 'INVALID_INPUT', 'Bearer capability contains control characters.')
     setHeaderCI(headers, 'Authorization', `Bearer ${/^bearer\s+/i.test(raw) ? raw.replace(/^bearer\s+/i, '') : raw}`)
@@ -451,7 +396,6 @@ export function injectCapabilityIntoRequest(options: InjectCapabilityOptions, va
   } else {
     throw new DerivedCustodyError('INVALID_INPUT', `Unsupported injection target "${String(options.target)}".`)
   }
-
   return {
     request: { ...options.request, url, headers },
     attestation: {
@@ -490,9 +434,8 @@ export function hostHmacSign(options: HostHmacSignOptions, vaultArg?: DerivedCap
   return {
     signature,
     attestation: {
-      derivedFromCapabilityId: entry.meta.handle, alg: options.alg, encoding,
-      payloadDigest: sha256Hex(options.payload), signatureDigest: sha256Hex(signature),
-      sourceSecretDigest: entry.meta.sha256, runId: state.runId, timestampMs: state.now(),
+      derivedFromCapabilityId: entry.meta.handle, alg: options.alg, encoding, payloadDigest: sha256Hex(options.payload),
+      signatureDigest: sha256Hex(signature), sourceSecretDigest: entry.meta.sha256, runId: state.runId, timestampMs: state.now(),
     },
   }
 }
@@ -522,9 +465,7 @@ export function hostJwtSign(options: HostJwtSignOptions, vaultArg?: DerivedCapab
   assertCustody(options.header === undefined || (options.header && typeof options.header === 'object' && !Array.isArray(options.header)), 'INVALID_INPUT', 'JWT header must be a plain object.')
   assertCustody(options.header?.alg === undefined || options.header.alg === options.alg, 'INVALID_INPUT', 'JWT header.alg must match options.alg.')
   const entry = resolveActiveEntry(vault, options.secretHandle, { runId: options.runId })
-
-  let headerJson: string
-  let claimsJson: string
+  let headerJson: string, claimsJson: string
   try {
     headerJson = JSON.stringify({ typ: 'JWT', ...(options.header ?? {}), alg: options.alg })
     claimsJson = JSON.stringify(options.claims)
@@ -535,31 +476,22 @@ export function hostJwtSign(options: HostJwtSignOptions, vaultArg?: DerivedCapab
   const token = `${signingInput}.${createHmac(nodeAlg, entry.rawValue).update(signingInput, 'utf8').digest('base64url')}`
   const timestampMs = state.now()
   const sealedMeta = vault.seal({
-    hopReceiptId: options.hopReceiptId ?? entry.meta.hopReceiptId,
-    slot: options.slot ?? `jwt_${sha256Hex(token).slice(0, 12)}`,
-    rawValue: token, kind: 'jwt', ttlMs: options.ttlMs,
-    derivedFromCapabilityId: entry.meta.handle,
+    hopReceiptId: options.hopReceiptId ?? entry.meta.hopReceiptId, slot: options.slot ?? `jwt_${sha256Hex(token).slice(0, 12)}`,
+    rawValue: token, kind: 'jwt', ttlMs: options.ttlMs, derivedFromCapabilityId: entry.meta.handle,
     allowedOrigins: options.allowedOrigins ?? entry.meta.allowedOrigins,
   })
   return {
     token, derivedHandle: sealedMeta.handle,
     attestation: {
       derivedFromCapabilityId: entry.meta.handle, derivedHandle: sealedMeta.handle, alg: options.alg,
-      claimsDigest: sha256Hex(claimsJson), tokenDigest: sealedMeta.sha256,
-      sourceSecretDigest: entry.meta.sha256, runId: state.runId, timestampMs,
+      claimsDigest: sha256Hex(claimsJson), tokenDigest: sealedMeta.sha256, sourceSecretDigest: entry.meta.sha256, runId: state.runId, timestampMs,
     },
   }
 }
 
-// ---------------------------------------------------------------------------
-// Bounded Async Poll-Convergence
-// ---------------------------------------------------------------------------
-
+// --- Bounded Async Poll-Convergence ---
 export type AsyncPollProfile = 'fast_lab' | 'wan'
-export const ASYNC_CONVERGENCE_PROFILES: Record<
-  AsyncPollProfile,
-  { defaultTimeoutMs: number; maxTimeoutMs: number; defaultIntervalMs: number; defaultMaxAttempts: number }
-> = {
+export const ASYNC_CONVERGENCE_PROFILES: Record<AsyncPollProfile, { defaultTimeoutMs: number; maxTimeoutMs: number; defaultIntervalMs: number; defaultMaxAttempts: number }> = {
   fast_lab: { defaultTimeoutMs: 5_000, maxTimeoutMs: 5_000, defaultIntervalMs: 150, defaultMaxAttempts: 40 },
   wan: { defaultTimeoutMs: 30_000, maxTimeoutMs: 30_000, defaultIntervalMs: 500, defaultMaxAttempts: 120 },
 }
@@ -593,11 +525,7 @@ function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
   })
 }
 
-async function raceWithAbortAndDeadline<T>(
-  work: () => Promise<T> | T,
-  signal: AbortSignal,
-  remainingMs: number,
-): Promise<{ kind: 'ok'; value: T } | { kind: 'aborted' } | { kind: 'timeout' }> {
+async function raceWithAbortAndDeadline<T>(work: () => Promise<T> | T, signal: AbortSignal, remainingMs: number): Promise<{ kind: 'ok'; value: T } | { kind: 'aborted' } | { kind: 'timeout' }> {
   if (signal.aborted) return { kind: 'aborted' }
   if (remainingMs <= 0) return { kind: 'timeout' }
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -623,13 +551,10 @@ export async function awaitAsyncConvergence<T>(options: AwaitAsyncConvergenceOpt
   const timeoutMs = options.timeoutMs ?? bounds.defaultTimeoutMs
   const intervalMs = options.intervalMs ?? bounds.defaultIntervalMs
   const maxAttempts = options.maxAttempts ?? bounds.defaultMaxAttempts
-
   assertCustody(Number.isFinite(timeoutMs) && timeoutMs > 0 && timeoutMs <= bounds.maxTimeoutMs, 'INVALID_INPUT', `timeoutMs (${timeoutMs}) must be in (0, ${bounds.maxTimeoutMs}] for "${profile}".`)
   assertCustody(Number.isFinite(intervalMs) && intervalMs >= 0 && intervalMs <= bounds.maxTimeoutMs, 'INVALID_INPUT', `intervalMs (${intervalMs}) is out of bounds.`)
   assertCustody(Number.isInteger(maxAttempts) && maxAttempts >= 1, 'INVALID_INPUT', 'maxAttempts must be a positive integer.')
-
-  const startMs = now()
-  const tTriggerMs = options.tTriggerMs ?? startMs
+  const startMs = now(), tTriggerMs = options.tTriggerMs ?? startMs
   assertCustody(Number.isFinite(tTriggerMs), 'INVALID_INPUT', 'tTriggerMs must be a finite timestamp.')
   const deadlineMs = startMs + timeoutMs
   const attemptLog: AsyncConvergenceAttemptRecord[] = []
@@ -639,7 +564,6 @@ export async function awaitAsyncConvergence<T>(options: AwaitAsyncConvergenceOpt
     if (options.signal.aborted) controller.abort(options.signal.reason)
     else options.signal.addEventListener('abort', onExternalAbort, { once: true })
   }
-
   const finish = (status: AsyncConvergenceStatus, tObservedMs: number | null, value?: T): AsyncConvergenceResult<T> => ({
     converged: status === 'converged', status, ...(value !== undefined ? { value } : {}),
     evidence: {
@@ -648,22 +572,16 @@ export async function awaitAsyncConvergence<T>(options: AwaitAsyncConvergenceOpt
       aborted: status === 'aborted', timedOut: status === 'timeout', attemptLog,
     },
   })
-
   try {
     if (controller.signal.aborted) return finish('aborted', null)
     let sawMonotonicRejection = false
-
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       if (controller.signal.aborted) return finish('aborted', null)
       const remainingMs = deadlineMs - now()
       if (remainingMs <= 0) return finish(sawMonotonicRejection ? 'monotonic_violation' : 'timeout', null)
-
       const startedAtMs = now()
       try {
-        const raced = await raceWithAbortAndDeadline(
-          () => options.pollFn({ attempt, elapsedMs: Math.max(0, startedAtMs - tTriggerMs), signal: controller.signal }),
-          controller.signal, remainingMs,
-        )
+        const raced = await raceWithAbortAndDeadline(() => options.pollFn({ attempt, elapsedMs: Math.max(0, startedAtMs - tTriggerMs), signal: controller.signal }), controller.signal, remainingMs)
         if (raced.kind === 'aborted') return finish('aborted', null)
         if (raced.kind === 'timeout') { controller.abort(new Error('convergence_timeout')); return finish(sawMonotonicRejection ? 'monotonic_violation' : 'timeout', null) }
         const completedAtMs = now()
@@ -680,9 +598,7 @@ export async function awaitAsyncConvergence<T>(options: AwaitAsyncConvergenceOpt
         } else if (matched) {
           attemptLog.push({ attempt, startedAtMs, completedAtMs, observedAtMs, matched: true })
           return finish('converged', observedAtMs, raced.value)
-        } else {
-          attemptLog.push({ attempt, startedAtMs, completedAtMs, observedAtMs, matched: false })
-        }
+        } else attemptLog.push({ attempt, startedAtMs, completedAtMs, observedAtMs, matched: false })
       } catch (err) {
         if (controller.signal.aborted) return finish('aborted', null)
         const completedAtMs = now()
