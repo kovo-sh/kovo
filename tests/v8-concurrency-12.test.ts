@@ -29,6 +29,7 @@ import {
   type Grant,
   type Transport,
 } from '../src/server/broker.ts'
+import { defaultWorkerConcurrency } from '../src/domain.ts'
 import {
   DET_LEAD_CONCURRENT_CAP,
   Execution,
@@ -312,6 +313,285 @@ test('PhaseBConcurrencyController winds down smoothly on low remaining budget an
   })
   assert.equal(cliPinned.getEffectiveConcurrency({ remainingBudgetUsd: 5.0 }), 4)
   assert.equal(cliPinned.recordPressure('target_503'), 4)
+  // Clean completions must never ramp an explicitly pinned controller above 4
+  for (let i = 0; i < 6; i += 1) {
+    assert.equal(cliPinned.recordCleanCompletion({ spawnLatencyMs: 300, remainingBudgetUsd: 5.0 }), 4)
+  }
+  assert.equal(cliPinned.snapshot(5.0).increases, 0)
+
+  // Explicit ceiling (e.g. run.workerConcurrency = 4 without Execution override) strictly bounds AIMD
+  let ceilNow = 200_000
+  const ceilingBounded = new PhaseBConcurrencyController({
+    cpuCount: 16,
+    availMemBytes: 11 * GiB,
+    ceiling: 4,
+    now: () => ceilNow,
+  })
+  assert.equal(ceilingBounded.hardwareCap, 4)
+  assert.equal(ceilingBounded.getEffectiveConcurrency({ remainingBudgetUsd: 5.0 }), 4)
+  for (let i = 0; i < 6; i += 1) {
+    ceilNow += 20_000
+    assert.equal(ceilingBounded.recordCleanCompletion({ spawnLatencyMs: 300, remainingBudgetUsd: 5.0 }), 4)
+  }
+  assert.equal(ceilingBounded.snapshot(5.0).current, 4)
+  assert.equal(ceilingBounded.snapshot(5.0).increases, 0)
+
+  // Ceiling 1 is honored without being clamped up to PHASE_B_AIMD_MIN_FLOOR (2)
+  assert.equal(computeHostPhaseBConcurrencyCap({ cpuCount: 16, availMemBytes: 11 * GiB, ceiling: 1 }), 1)
+  const ceilingOne = new PhaseBConcurrencyController({
+    cpuCount: 16,
+    availMemBytes: 11 * GiB,
+    ceiling: 1,
+  })
+  assert.equal(ceilingOne.getEffectiveConcurrency({ remainingBudgetUsd: 5.0 }), 1)
+  assert.equal(ceilingOne.recordPressure('llm_429'), 1)
+})
+
+test('Live Execution strictly caps at 4 when explicit workerConcurrencyOverride or run.workerConcurrency=4 is set, while omitted override ramps via AIMD', async (t) => {
+  // (a) Explicit workerConcurrencyOverride=4 (CLI --worker-concurrency 4) never ramps above 4
+  {
+    const llm = await startFastMockLlm(t, 45)
+    const { storage } = makeStore(t)
+    await saveModelProfile({
+      name: 'Cap4-Override-Mock',
+      endpoint: llm.endpoint,
+      model: 'mock-cap4-override',
+      protocol: 'responses',
+      key: 'sk-mock-cap4-override-1234',
+      priority: 100,
+      enabled: true,
+      contextWindow: 128_000,
+      maxTokens: 4096,
+      thinkingLevel: 'medium',
+      roleAffinity: 'tactical',
+      inputCostPerMtok: 0,
+      cachedInputCostPerMtok: 0,
+      outputCostPerMtok: 0,
+    }, storage, { skipConnectionCheck: true })
+
+    const { runId, run } = await setupApprovedRun(storage, {
+      seeds: [ORIGIN],
+      budgetUsd: 5,
+      budgetRequests: 5000,
+      maxRpsPerOrigin: 30,
+    })
+    for (let i = 1; i <= 12; i += 1) {
+      storage.addChainStep(run, {
+        title: `Override cap check ${i}`,
+        hypothesis: `Verify access controls on GET /api/v1/override/${i}.`,
+        category: 'broken-access-control',
+        priority: 85 - i,
+        targetAssetIds: run.approved,
+        sourceOrigins: [ORIGIN],
+        skills: ['bola-bfla'],
+      })
+    }
+    storage.updateRun(runId, {
+      phase: 'investigation',
+      status: 'running',
+      workerConcurrency: 4,
+      multiTrialEnabled: false,
+    })
+
+    const engine = new Execution(storage, {
+      backend: stubBackend(),
+      deterministicSweep: false,
+      workerConcurrencyOverride: 4,
+    })
+    let snapDuringRun: ReturnType<Execution['getPhaseBConcurrencySnapshot']>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_PHASE_B_CONCURRENCY: undefined, KOVO_WORKER_CONCURRENCY: undefined }, async () => {
+      engine.start()
+      engine.wake()
+      const deadline = Date.now() + 5_000
+      while (Date.now() < deadline) {
+        const done = storage.listChainSteps(runId, run.goalRevision).filter(s => s.status === 'complete').length
+        if (done >= 12) break
+        await new Promise(r => setTimeout(r, 20))
+      }
+      snapDuringRun = engine.getPhaseBConcurrencySnapshot(runId)
+      await stopExecution(engine as never)
+    })
+
+    const dispatchEvents = storage.eventsAfter(runId, 0, 200).filter(e => e.kind === 'scheduler.dispatch')
+    assert.ok(dispatchEvents.length >= 2, 'expected multiple dispatch waves across 12 steps at cap 4')
+    const maxEff = Math.max(...dispatchEvents.map(e => Number((e.detail as { effectiveConcurrency?: number }).effectiveConcurrency ?? 0)))
+    assert.equal(maxEff, 4, `explicit workerConcurrencyOverride=4 must cap effectiveConcurrency at 4, got ${maxEff}`)
+    assert.equal(snapDuringRun?.override, 4)
+    assert.equal(snapDuringRun?.current, 4)
+    assert.equal(snapDuringRun?.increases, 0)
+    assert.ok(llm.getPeakConcurrent() <= 4, `live mock LLM peak concurrent must stay <= 4, got ${llm.getPeakConcurrent()}`)
+  }
+
+  // (b) Direct run.workerConcurrency=4 (even without Execution workerConcurrencyOverride) bounds AIMD ceiling at 4
+  {
+    const llm = await startFastMockLlm(t, 45)
+    const { storage } = makeStore(t)
+    await saveModelProfile({
+      name: 'Cap4-Run-Mock',
+      endpoint: llm.endpoint,
+      model: 'mock-cap4-run',
+      protocol: 'responses',
+      key: 'sk-mock-cap4-run-1234',
+      priority: 100,
+      enabled: true,
+      contextWindow: 128_000,
+      maxTokens: 4096,
+      thinkingLevel: 'medium',
+      roleAffinity: 'tactical',
+      inputCostPerMtok: 0,
+      cachedInputCostPerMtok: 0,
+      outputCostPerMtok: 0,
+    }, storage, { skipConnectionCheck: true })
+
+    const { runId, run } = await setupApprovedRun(storage, {
+      seeds: [ORIGIN],
+      budgetUsd: 5,
+      budgetRequests: 5000,
+      maxRpsPerOrigin: 30,
+    })
+    for (let i = 1; i <= 12; i += 1) {
+      storage.addChainStep(run, {
+        title: `Run-level cap check ${i}`,
+        hypothesis: `Verify access controls on GET /api/v1/runcap/${i}.`,
+        category: 'broken-access-control',
+        priority: 85 - i,
+        targetAssetIds: run.approved,
+        sourceOrigins: [ORIGIN],
+        skills: ['bola-bfla'],
+      })
+    }
+    storage.updateRun(runId, {
+      phase: 'investigation',
+      status: 'running',
+      workerConcurrency: 4,
+      multiTrialEnabled: false,
+    })
+
+    const engine = new Execution(storage, {
+      backend: stubBackend(),
+      deterministicSweep: false,
+    })
+    let snapDuringRun: ReturnType<Execution['getPhaseBConcurrencySnapshot']>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_PHASE_B_CONCURRENCY: undefined, KOVO_WORKER_CONCURRENCY: undefined }, async () => {
+      engine.start()
+      engine.wake()
+      const deadline = Date.now() + 5_000
+      while (Date.now() < deadline) {
+        const done = storage.listChainSteps(runId, run.goalRevision).filter(s => s.status === 'complete').length
+        if (done >= 12) break
+        await new Promise(r => setTimeout(r, 20))
+      }
+      snapDuringRun = engine.getPhaseBConcurrencySnapshot(runId)
+      await stopExecution(engine as never)
+    })
+
+    const dispatchEvents = storage.eventsAfter(runId, 0, 200).filter(e => e.kind === 'scheduler.dispatch')
+    assert.ok(dispatchEvents.length >= 2)
+    const maxEff = Math.max(...dispatchEvents.map(e => Number((e.detail as { effectiveConcurrency?: number }).effectiveConcurrency ?? 0)))
+    assert.ok(maxEff <= 4, `run.workerConcurrency=4 must cap AIMD effectiveConcurrency <= 4, got ${maxEff}`)
+    assert.ok((snapDuringRun?.hardwareCap ?? 99) <= 4, `controller hardwareCap must be <= 4, got ${snapDuringRun?.hardwareCap}`)
+    assert.ok(llm.getPeakConcurrent() <= 4, `live mock LLM peak concurrent must stay <= 4, got ${llm.getPeakConcurrent()}`)
+  }
+
+  // (c) Omitted override + default run.workerConcurrency (6) enables dynamic AIMD up to host hardware ceiling
+  {
+    const expectedHostCap = computeHostPhaseBConcurrencyCap()
+    const llm = await startFastMockLlm(t, 45)
+    const { storage } = makeStore(t)
+    await saveModelProfile({
+      name: 'Aimd-Default-Mock',
+      endpoint: llm.endpoint,
+      model: 'mock-aimd-default',
+      protocol: 'responses',
+      key: 'sk-mock-aimd-default-1234',
+      priority: 100,
+      enabled: true,
+      contextWindow: 128_000,
+      maxTokens: 4096,
+      thinkingLevel: 'medium',
+      roleAffinity: 'tactical',
+      inputCostPerMtok: 0,
+      cachedInputCostPerMtok: 0,
+      outputCostPerMtok: 0,
+    }, storage, { skipConnectionCheck: true })
+
+    const { runId, run } = await setupApprovedRun(storage, {
+      seeds: [ORIGIN],
+      budgetUsd: 5,
+      budgetRequests: 5000,
+      maxRpsPerOrigin: 30,
+    })
+    for (let i = 1; i <= 20; i += 1) {
+      storage.addChainStep(run, {
+        title: `AIMD default ramp check ${i}`,
+        hypothesis: `Verify access controls on GET /api/v1/aimd/${i}.`,
+        category: 'broken-access-control',
+        priority: 90 - i,
+        targetAssetIds: run.approved,
+        sourceOrigins: [ORIGIN],
+        skills: ['bola-bfla'],
+      })
+    }
+    // Simulate omitted --worker-concurrency (Store.createRun defaults to defaultWorkerConcurrency = 6),
+    // verifying dynamic AIMD still ramps up to the host hardware ceiling (12 on 16c/11GiB hosts).
+    const omittedCreated = storage.createRun({
+      requestId: 'req-omitted-wc',
+      projectId: run.projectId,
+      goal: 'Verify default omitted workerConcurrency uses defaultWorkerConcurrency',
+      sourceMode: 'public',
+      capabilityTier: 2,
+      approvalPolicy: 'auto_review',
+      approvedPersonaIds: [],
+      budgetUsd: 5,
+      budgetRequests: 5000,
+      maxRpsPerOrigin: 30,
+      workerMaxTurns: 40,
+      multiTrialEnabled: false,
+    } as unknown as Parameters<typeof storage.createRun>[0])
+    const omittedRun = storage.run(omittedCreated.id)
+    assert.equal(omittedRun.workerConcurrency, defaultWorkerConcurrency)
+    storage.updateRun(runId, {
+      phase: 'investigation',
+      status: 'running',
+      workerConcurrency: omittedRun.workerConcurrency,
+      multiTrialEnabled: false,
+    })
+
+    const engine = new Execution(storage, {
+      backend: stubBackend(),
+      deterministicSweep: false,
+    })
+    let snapDuringRun: ReturnType<Execution['getPhaseBConcurrencySnapshot']>
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_PHASE_B_CONCURRENCY: undefined, KOVO_WORKER_CONCURRENCY: undefined }, async () => {
+      engine.start()
+      engine.wake()
+      const deadline = Date.now() + 6_000
+      while (Date.now() < deadline) {
+        const done = storage.listChainSteps(runId, run.goalRevision).filter(s => s.status === 'complete').length
+        if (done >= 20) break
+        await new Promise(r => setTimeout(r, 20))
+      }
+      snapDuringRun = engine.getPhaseBConcurrencySnapshot(runId)
+      await stopExecution(engine as never)
+    })
+
+    const dispatchEvents = storage.eventsAfter(runId, 0, 200).filter(e => e.kind === 'scheduler.dispatch')
+    assert.ok(dispatchEvents.length >= 2)
+    const maxEff = Math.max(...dispatchEvents.map(e => Number((e.detail as { effectiveConcurrency?: number }).effectiveConcurrency ?? 0)))
+    assert.equal(snapDuringRun?.override, null, 'omitted override must leave controller unpinned for dynamic AIMD')
+    assert.equal(snapDuringRun?.hardwareCap, expectedHostCap)
+    if (expectedHostCap > PHASE_B_AIMD_WARM_START) {
+      assert.ok(
+        maxEff > PHASE_B_AIMD_WARM_START,
+        `dynamic AIMD must ramp above warmStart=${PHASE_B_AIMD_WARM_START} toward hostCap=${expectedHostCap}, got maxEff=${maxEff}`,
+      )
+      assert.equal(
+        snapDuringRun?.current,
+        expectedHostCap,
+        `expected AIMD to reach hardwareCap=${expectedHostCap} after 20 clean completions`,
+      )
+    }
+  }
 })
 
 // ============================================================================

@@ -80,6 +80,11 @@ describe('Stream D: benchmark-multihop CLI dynamic AIMD & Docker isolation safet
       /\.\.\.\(workerConcurrency !== undefined \? \{ workerConcurrency \} : \{\}\)/,
       'runCell must omit workerConcurrency when undefined so dynamic AIMD auto-scales',
     )
+    assert.match(
+      src,
+      /\.\.\.\(workerConcurrency !== undefined \? \{ workerConcurrencyOverride: workerConcurrency \} : \{\}\)/,
+      'runCell must forward explicit --worker-concurrency as Execution.workerConcurrencyOverride so AIMD never overrides it',
+    )
     assert.match(usage, /--worker-concurrency <n>/)
   })
 

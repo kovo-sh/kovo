@@ -2884,6 +2884,7 @@ export async function runCell(
     gitSha = resolveGitSha()
     const seedSet: 'dev' | 'held-out' = started.plan?.seedSet ?? (args.heldOut ? 'held-out' : 'dev')
 
+    const workerConcurrency = resolveMultihopWorkerConcurrency(args)
     let personaIds: string[] = []
     if (resumeRequested && loadedSnapshot) {
       projectId = loadedSnapshot.target.projectId
@@ -2902,6 +2903,9 @@ export async function runCell(
         ...(canaryBaseUrl ? { newCanaryBaseUrls: [canaryBaseUrl] } : {}),
         personaCredentials: plan.personas.map(p => ({ handle: p.handle, email: p.email, password: p.password })),
       })
+      if (workerConcurrency !== undefined) {
+        storage.updateRun(runId, { workerConcurrency })
+      }
       snapshotMeta.resume.originsRebound = applied.origins.rowsUpdated
       snapshotMeta.resume.personaSessionsRebound = applied.personaSessionsRebound
       snapshotMeta.resume.phase0Skipped = applied.phase0Skipped
@@ -2970,7 +2974,6 @@ export async function runCell(
         }
       }
 
-      const workerConcurrency = resolveMultihopWorkerConcurrency(args)
       const createRunInput: Omit<Parameters<Store['createRun']>[0], 'workerConcurrency'> & {
         workerConcurrency?: number
       } = {
@@ -3066,6 +3069,7 @@ export async function runCell(
       ...(backend ? { backend } : {}),
       deterministicOnly: args.noLlm,
       maxDurationMs: args.maxDurationMs,
+      ...(workerConcurrency !== undefined ? { workerConcurrencyOverride: workerConcurrency } : {}),
       onCheckpoint: event => captureCheckpoint(event.checkpoint),
     })
     engine.start()

@@ -493,6 +493,8 @@ export class Execution {
   private readonly agenticLaneCompleted = new Set<string>()
   private readonly agenticLaneStopping = new Set<string>()
   private readonly agenticLaneAssignmentIds = new Set<string>()
+  /** Floor assignment IDs explicitly launched to overlap Phase A (`threat_model` -> `investigation`). */
+  private readonly overlappedFloorAssignmentIds = new Set<string>()
   /** runIds whose report is waiting on the bounded pre-report OOB drain (single-flight). */
   private readonly verificationDraining = new Set<string>()
   /** Last drain outcome per run: recorded in run-event meta and exposed for tests/benchmarks. */
@@ -625,7 +627,15 @@ export class Execution {
       ...core, probePlans: this.probePlans,
       stagingTaggedMutations: this.stagingTaggedMutations, stagingUntaggedSkipped: this.stagingUntaggedSkipped,
       stagingCleaned: this.stagingCleaned, stagingCreatedEntities: this.stagingCreatedEntities,
-      approvedOriginsSet, permitted, buildGrant,
+      approvedOriginsSet, permitted,
+      buildGrant: (job, run, allowed) => {
+        // ExecFloorLane only reaches buildGrant during `threat_model` when `allowThreatModelPhase`
+        // was explicitly enabled; authorize its `investigation` worker across the Phase-A overlap.
+        if (run.phase === 'threat_model' && job.assignment.phase === 'investigation') {
+          this.overlappedFloorAssignmentIds.add(job.assignment.id)
+        }
+        return this.buildGrant(job, run, allowed)
+      },
       beginFloorRequestPhase: run => this.beginFloorRequestPhase(run),
       phaseRequestRemaining: run => this.phaseRequestRemaining(run),
       markEndpointCoverage: (run, o, m, p, c) => this.markEndpointCoverage(run, o, m, p, c),
@@ -869,6 +879,7 @@ export class Execution {
     this.phaseBControllers.clear()
     this.agenticLaneJobs.clear()
     this.agenticLaneStopping.clear()
+    this.overlappedFloorAssignmentIds.clear()
     this.personaAuth.stopAll()
     await this.labRunner.stopAll().catch(() => undefined)
     this.startedLabRuns.clear()
@@ -987,6 +998,12 @@ export class Execution {
     }
   }
 
+  private isOverlappedFloorAssignment(runId: string, assignmentId: string): boolean {
+    if (this.overlappedFloorAssignmentIds.has(assignmentId)) return true
+    const lane = this.agenticLaneJobs.get(runId)
+    return Boolean(lane?.allowThreatModelPhase && lane.assignmentId === assignmentId)
+  }
+
   private authorize(job: Active): boolean {
     let current: Assignment
     let run: Run
@@ -1001,8 +1018,14 @@ export class Execution {
     if (current.phase === 'retest') {
       return [...job.origins].every(origin => this.permitted(run, origin))
     }
+    const phaseAllowed = run.phase === current.phase
+      || (
+        current.phase === 'investigation'
+        && run.phase === 'threat_model'
+        && this.isOverlappedFloorAssignment(run.id, current.id)
+      )
     return run.status === 'running' &&
-      run.phase === current.phase &&
+      phaseAllowed &&
       current.goalRevision === run.goalRevision &&
       [...job.origins].every(origin => this.permitted(run, origin))
   }
@@ -2504,6 +2527,7 @@ export class Execution {
       onAssignment: id => {
         holder.assignmentId = id
         this.agenticLaneAssignmentIds.add(id)
+        if (allowThreatModelPhase) this.overlappedFloorAssignmentIds.add(id)
       },
     })
       .catch(error => {
@@ -2516,6 +2540,7 @@ export class Execution {
       .finally(() => {
         this.agenticLaneJobs.delete(run.id)
         this.agenticLaneStopping.delete(run.id)
+        if (holder.assignmentId) this.overlappedFloorAssignmentIds.delete(holder.assignmentId)
         this.agenticLaneCompleted.add(key)
         this.agenticFloorFinishedAt.set(run.id, Date.now())
         this.traceLifecycle(run.id, 'lane_end', { aborted: controller.signal.aborted, deadlineMs })
@@ -3663,7 +3688,12 @@ export class Execution {
   private phaseBControllerFor(run: Run): PhaseBConcurrencyController {
     let controller = this.phaseBControllers.get(run.id)
     if (!controller) {
-      const explicitCeiling = run.workerConcurrency > defaultWorkerConcurrency ? run.workerConcurrency : undefined
+      // Respect any non-default run.workerConcurrency as a hard AIMD ceiling (preserving the
+      // legacy Queue #17 single-slot `1` starvation guard unless an explicit override is set).
+      const explicitCeiling =
+        run.workerConcurrency >= 2 && run.workerConcurrency !== defaultWorkerConcurrency
+          ? Math.min(maxWorkerConcurrency, Math.floor(run.workerConcurrency))
+          : undefined
       controller = new PhaseBConcurrencyController({
         ...(this.workerConcurrencyOverride !== undefined ? { explicitOverride: this.workerConcurrencyOverride } : {}),
         ...(explicitCeiling !== undefined ? { ceiling: explicitCeiling } : {}),
