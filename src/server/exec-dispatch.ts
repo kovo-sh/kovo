@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { cpus as osCpus, freemem as osFreemem } from 'node:os'
 import { and, eq } from 'drizzle-orm'
 import { z } from 'zod'
 import {
@@ -1374,6 +1376,257 @@ export function resolveEffectivePhaseBConcurrency(input: EffectivePhaseBConcurre
   return base
 }
 
+/** Dynamic AIMD Phase-B worker concurrency defaults & bounds. */
+export const PHASE_B_AIMD_MAX_CEILING = 12
+export const PHASE_B_AIMD_WARM_START = 6
+export const PHASE_B_AIMD_MIN_FLOOR = 2
+export const PHASE_B_AIMD_INCREASE_STEP = 2
+export const PHASE_B_AIMD_CLEAN_WINDOW_MS = 18_000
+export const PHASE_B_AIMD_CLEAN_COMPLETIONS_THRESHOLD = 3
+export const PHASE_B_AIMD_USD_PER_SLOT = 0.15
+export const PHASE_B_AIMD_RAM_GB_PER_SLOT = 0.75
+export const PHASE_B_AIMD_CPU_FRACTION = 0.75
+export const PHASE_B_AIMD_SPAWN_LATENCY_WARN_MS = 8_000
+
+export type PhaseBPressureKind =
+  | 'llm_429'
+  | 'target_429'
+  | 'target_503'
+  | 'target_timeout'
+  | 'container_spawn_error'
+  | 'container_pressure'
+
+/** Read Linux `/proc/meminfo` `MemAvailable` when present (more accurate than `os.freemem()`). */
+export function detectHostAvailableMemoryBytes(): number {
+  try {
+    const meminfo = readFileSync('/proc/meminfo', 'utf8')
+    const match = /^MemAvailable:\s+(\d+)\s+kB$/m.exec(meminfo)
+    if (match) {
+      const kb = Number(match[1])
+      if (Number.isFinite(kb) && kb > 0) return kb * 1024
+    }
+  } catch { /* non-Linux or restricted procfs: fall back to os.freemem() */ }
+  return osFreemem()
+}
+
+/** Parse explicit operator env override (`GUARDIAN_PHASE_B_CONCURRENCY` or `GUARDIAN_WORKER_CONCURRENCY`). */
+export function parseEnvPhaseBConcurrencyOverride(env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const raw = env.GUARDIAN_PHASE_B_CONCURRENCY ?? env.GUARDIAN_WORKER_CONCURRENCY
+  if (raw === undefined || raw.trim() === '') return undefined
+  const parsed = Number(raw.trim())
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined
+  return Math.max(1, Math.min(maxWorkerConcurrency, Math.floor(parsed)))
+}
+
+/** Auto-compute host Phase-B concurrency ceiling from CPU cores and available RAM (~0.75 GiB/slot). */
+export function computeHostPhaseBConcurrencyCap(input: {
+  cpuCount?: number
+  availMemBytes?: number
+  ceiling?: number
+} = {}): number {
+  const hardCeiling = Math.max(
+    PHASE_B_AIMD_MIN_FLOOR,
+    Math.min(maxWorkerConcurrency, Math.floor(input.ceiling ?? PHASE_B_AIMD_MAX_CEILING)),
+  )
+  const cpuCount = Math.max(1, Math.floor(input.cpuCount ?? osCpus().length))
+  const availBytes = Math.max(0, input.availMemBytes ?? detectHostAvailableMemoryBytes())
+  const availGb = availBytes / (1024 ** 3)
+  const cpuCap = Math.max(PHASE_B_AIMD_MIN_FLOOR, Math.floor(cpuCount * PHASE_B_AIMD_CPU_FRACTION))
+  const ramCap = Math.max(PHASE_B_AIMD_MIN_FLOOR, Math.floor(availGb / PHASE_B_AIMD_RAM_GB_PER_SLOT))
+  return Math.max(PHASE_B_AIMD_MIN_FLOOR, Math.min(hardCeiling, cpuCap, ramCap))
+}
+
+/** Cap concurrency by remaining USD budget (`>= 1` slot; winds down cleanly as budget depletes). */
+export function computeBudgetPhaseBConcurrencyCap(remainingBudgetUsd?: number): number {
+  if (remainingBudgetUsd === undefined || !Number.isFinite(remainingBudgetUsd)) return Number.POSITIVE_INFINITY
+  return Math.max(1, Math.floor(Math.max(0, remainingBudgetUsd) / PHASE_B_AIMD_USD_PER_SLOT))
+}
+
+export interface PhaseBConcurrencyControllerOptions {
+  cpuCount?: number
+  availMemBytes?: number
+  ceiling?: number
+  warmStart?: number
+  cleanWindowMs?: number
+  cleanCompletionsThreshold?: number
+  /** Explicit CLI/API/test concurrency override (always takes precedence over AIMD). */
+  explicitOverride?: number
+  env?: NodeJS.ProcessEnv
+  now?: () => number
+}
+
+export interface PhaseBConcurrencySnapshot {
+  current: number
+  hardwareCap: number
+  effectiveMaxCap: number
+  override: number | null
+  cleanCompletionsInWindow: number
+  pressureCount: number
+  increases: number
+  decreases: number
+  lastPressureKind: PhaseBPressureKind | null
+}
+
+/**
+ * Dynamic AIMD Phase-B specialist concurrency controller.
+ * - Auto-computes `hardwareCap` from host CPUs/available RAM (ceiling 12 on 16c/11GiB hosts).
+ * - Starts warm at `min(6, hardwareCap)` so Wave 1 fills immediately.
+ * - Additive Increase (`+2` up to `effectiveMaxCap`) after a clean window (~18s or clean completions
+ *   with zero LLM 429s, low target 5xx/timeout rate, and healthy container spawn latency).
+ * - Multiplicative Decrease (`max(2, floor(current / 2))`) immediately on pressure.
+ * - Dynamically winds down when remaining USD budget shrinks (`floor(remainingUsd / 0.15)`).
+ * - Explicit env/CLI override always wins.
+ */
+export class PhaseBConcurrencyController {
+  readonly hardwareCap: number
+  readonly override: number | null
+  private readonly cleanWindowMs: number
+  private readonly cleanCompletionsThreshold: number
+  private readonly now: () => number
+  private current: number
+  private windowStartedAt: number
+  private cleanCompletionsInWindow = 0
+  private targetOutcomesInWindow = 0
+  private targetErrorsInWindow = 0
+  private pressureEventsInWindow = 0
+  private maxSpawnLatencyInWindowMs = 0
+  private pressureCount = 0
+  private increases = 0
+  private decreases = 0
+  private lastPressureKind: PhaseBPressureKind | null = null
+
+  constructor(options: PhaseBConcurrencyControllerOptions = {}) {
+    this.now = options.now ?? (() => Date.now())
+    this.hardwareCap = computeHostPhaseBConcurrencyCap({
+      ...(options.cpuCount !== undefined ? { cpuCount: options.cpuCount } : {}),
+      ...(options.availMemBytes !== undefined ? { availMemBytes: options.availMemBytes } : {}),
+      ...(options.ceiling !== undefined ? { ceiling: options.ceiling } : {}),
+    })
+    const explicit = options.explicitOverride !== undefined && Number.isFinite(options.explicitOverride) && options.explicitOverride > 0
+      ? Math.max(1, Math.min(maxWorkerConcurrency, Math.floor(options.explicitOverride)))
+      : parseEnvPhaseBConcurrencyOverride(options.env)
+    this.override = explicit ?? null
+    this.cleanWindowMs = Math.max(1_000, Math.floor(options.cleanWindowMs ?? PHASE_B_AIMD_CLEAN_WINDOW_MS))
+    this.cleanCompletionsThreshold = Math.max(1, Math.floor(options.cleanCompletionsThreshold ?? PHASE_B_AIMD_CLEAN_COMPLETIONS_THRESHOLD))
+    const warm = Math.max(PHASE_B_AIMD_MIN_FLOOR, Math.floor(options.warmStart ?? PHASE_B_AIMD_WARM_START))
+    this.current = this.override ?? Math.min(warm, this.hardwareCap)
+    this.windowStartedAt = this.now()
+  }
+
+  private resetWindow(nowMs: number): void {
+    this.windowStartedAt = nowMs
+    this.cleanCompletionsInWindow = 0
+    this.targetOutcomesInWindow = 0
+    this.targetErrorsInWindow = 0
+    this.pressureEventsInWindow = 0
+    this.maxSpawnLatencyInWindowMs = 0
+  }
+
+  private effectiveCap(remainingBudgetUsd?: number): number {
+    if (this.override !== null) return this.override
+    return Math.min(this.hardwareCap, computeBudgetPhaseBConcurrencyCap(remainingBudgetUsd))
+  }
+
+  private maybeIncrease(nowMs: number, remainingBudgetUsd?: number): void {
+    if (this.override !== null) return
+    const cap = this.effectiveCap(remainingBudgetUsd)
+    if (this.current >= cap) return
+    const errorRate = this.targetOutcomesInWindow > 0 ? this.targetErrorsInWindow / this.targetOutcomesInWindow : 0
+    const healthy = this.pressureEventsInWindow === 0
+      && errorRate <= 0.15
+      && this.maxSpawnLatencyInWindowMs <= PHASE_B_AIMD_SPAWN_LATENCY_WARN_MS
+    if (!healthy) return
+    const windowElapsed = nowMs - this.windowStartedAt >= this.cleanWindowMs
+    const readyByTime = windowElapsed && (this.cleanCompletionsInWindow > 0 || this.targetOutcomesInWindow > 0)
+    const readyByCompletions = this.cleanCompletionsInWindow >= this.cleanCompletionsThreshold
+    if (readyByTime || readyByCompletions) {
+      const next = Math.min(cap, this.current + PHASE_B_AIMD_INCREASE_STEP)
+      if (next > this.current) {
+        this.current = next
+        this.increases += 1
+      }
+      this.resetWindow(nowMs)
+    }
+  }
+
+  /** Current effective concurrency cap, applying clean-window ramp-up and remaining-budget wind-down. */
+  getEffectiveConcurrency(input: { remainingBudgetUsd?: number; nowMs?: number } = {}): number {
+    if (this.override !== null) return this.override
+    const nowMs = input.nowMs ?? this.now()
+    this.maybeIncrease(nowMs, input.remainingBudgetUsd)
+    const cap = this.effectiveCap(input.remainingBudgetUsd)
+    return Math.max(1, Math.min(cap, this.current))
+  }
+
+  /** Immediate Multiplicative Decrease (`max(2, floor(current / 2))`) on rate-limit, target, or container pressure. */
+  recordPressure(kind: PhaseBPressureKind, nowMs = this.now()): number {
+    this.pressureCount += 1
+    this.lastPressureKind = kind
+    this.pressureEventsInWindow += 1
+    if (this.override !== null) return this.override
+    const next = Math.max(PHASE_B_AIMD_MIN_FLOOR, Math.floor(this.current / 2))
+    if (next < this.current) {
+      this.current = next
+      this.decreases += 1
+    }
+    this.resetWindow(nowMs)
+    return this.current
+  }
+
+  /** Record a target HTTP status or timeout; backs off immediately on 429/503/timeout spikes. */
+  recordTargetOutcome(statusOrError: number | 'timeout', nowMs = this.now()): void {
+    this.targetOutcomesInWindow += 1
+    const isSpikeError = statusOrError === 'timeout' || statusOrError === 429 || statusOrError === 503
+    if (!isSpikeError) return
+    this.targetErrorsInWindow += 1
+    const errorRate = this.targetErrorsInWindow / this.targetOutcomesInWindow
+    if (this.targetErrorsInWindow >= 3 || (this.targetOutcomesInWindow >= 4 && errorRate > 0.25)) {
+      const kind: PhaseBPressureKind = statusOrError === 'timeout'
+        ? 'target_timeout'
+        : statusOrError === 429
+          ? 'target_429'
+          : 'target_503'
+      this.recordPressure(kind, nowMs)
+    }
+  }
+
+  /** Record a clean specialist completion; high spawn latency triggers backoff instead of ramp-up. */
+  recordCleanCompletion(input: {
+    spawnLatencyMs?: number
+    nowMs?: number
+    remainingBudgetUsd?: number
+  } = {}): number {
+    const nowMs = input.nowMs ?? this.now()
+    if (typeof input.spawnLatencyMs === 'number' && Number.isFinite(input.spawnLatencyMs)) {
+      this.maxSpawnLatencyInWindowMs = Math.max(this.maxSpawnLatencyInWindowMs, input.spawnLatencyMs)
+      if (input.spawnLatencyMs > PHASE_B_AIMD_SPAWN_LATENCY_WARN_MS) {
+        return this.recordPressure('container_pressure', nowMs)
+      }
+    }
+    this.cleanCompletionsInWindow += 1
+    this.maybeIncrease(nowMs, input.remainingBudgetUsd)
+    return this.getEffectiveConcurrency({
+      ...(input.remainingBudgetUsd !== undefined ? { remainingBudgetUsd: input.remainingBudgetUsd } : {}),
+      nowMs,
+    })
+  }
+
+  snapshot(remainingBudgetUsd?: number): PhaseBConcurrencySnapshot {
+    const cap = this.effectiveCap(remainingBudgetUsd)
+    return {
+      current: this.override ?? Math.max(1, Math.min(cap, this.current)),
+      hardwareCap: this.hardwareCap,
+      effectiveMaxCap: cap,
+      override: this.override,
+      cleanCompletionsInWindow: this.cleanCompletionsInWindow,
+      pressureCount: this.pressureCount,
+      increases: this.increases,
+      decreases: this.decreases,
+      lastPressureKind: this.lastPressureKind,
+    }
+  }
+}
+
 export interface DispatchLaneStep {
   id: string
   seq: number
@@ -1662,7 +1915,10 @@ export function planRoundRobinDispatch<T extends DispatchLaneStep>(
   const lanes = new Map<DispatchLane, T[]>()
   for (const lane of ['lead', ...DISPATCH_LANE_ORDER] as DispatchLane[]) lanes.set(lane, [])
   const duplicateTrials: Array<{ lane: DispatchLane; step: T }> = []
+  const seenStepIds = new Set<string>()
   for (const step of steps) {
+    if (seenStepIds.has(step.id)) continue
+    seenStepIds.add(step.id)
     const lane = classifyDispatchLane(step, options.hostTiers)
     if (isTrialDuplicateStep(step)) duplicateTrials.push({ lane, step })
     else lanes.get(lane)!.push(step)

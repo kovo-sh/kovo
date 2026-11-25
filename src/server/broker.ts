@@ -1639,6 +1639,51 @@ function collectSecrets(req: BrokerHttpRequest, grant: Grant): NamedSecret[] {
   return all
 }
 
+/** Per-origin concurrent in-flight HTTP cap for external/public hosts (polite bound). */
+export const EXTERNAL_ORIGIN_MAX_IN_FLIGHT = 2
+/** Per-origin concurrent in-flight HTTP cap for loopback / authorized local-lab origins (12-worker headroom). */
+export const LOOPBACK_ORIGIN_MAX_IN_FLIGHT = 12
+export const EXTERNAL_ORIGIN_MAX_RPS_CAP = 20
+export const LOOPBACK_ORIGIN_MAX_RPS_CAP = 100
+
+/** True strictly for loopback origins (`localhost`, `127.0.0.0/8`, `::1`). */
+export function isLoopbackOrigin(origin: string): boolean {
+  try {
+    const host = new URL(origin).hostname.replace(/^\[|\]$/g, '').toLowerCase()
+    if (host === 'localhost' || host === '::1') return true
+    if (ipaddr.isValid(host)) return ipaddr.process(host).range() === 'loopback'
+  } catch { /* invalid origin */ }
+  return false
+}
+
+/**
+ * Per-origin concurrent in-flight request ceiling. External origins stay bounded at 2 so remote
+ * targets are never hammered; loopback / authorized local-lab origins scale smoothly to 12 workers.
+ */
+export function brokerPerOriginConcurrencyCap(
+  origin: string,
+  allowLocalLabOrigin = false,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const isLocal = isLoopbackOrigin(origin) || (allowLocalLabOrigin && isLocalLabAutoApprovalOrigin(origin))
+  if (!isLocal) return EXTERNAL_ORIGIN_MAX_IN_FLIGHT
+  const raw = Number(env.GUARDIAN_BROKER_LOOPBACK_IN_FLIGHT)
+  if (Number.isFinite(raw) && raw >= 2) return Math.min(24, Math.floor(raw))
+  return LOOPBACK_ORIGIN_MAX_IN_FLIGHT
+}
+
+/** Per-origin RPS ceiling: polite cap (20) on external hosts, higher ceiling (100) on loopback/local-lab. */
+export function brokerPerOriginRpsCap(
+  origin: string,
+  requestedRps: number,
+  allowLocalLabOrigin = false,
+): number {
+  const isLocal = isLoopbackOrigin(origin) || (allowLocalLabOrigin && isLocalLabAutoApprovalOrigin(origin))
+  const ceiling = isLocal ? LOOPBACK_ORIGIN_MAX_RPS_CAP : EXTERNAL_ORIGIN_MAX_RPS_CAP
+  const safeRequested = Number.isFinite(requestedRps) ? requestedRps : 5
+  return Math.max(1, Math.min(ceiling, safeRequested))
+}
+
 type OriginHealth = {
   errors5xx: number[]
   errors429: number[]
@@ -2272,8 +2317,10 @@ export class RequestBroker {
     signal: AbortSignal,
     bypassConcurrency = false,
     routeTemplate?: string,
+    localLab = false,
   ): Promise<() => void> {
-    const configuredRps = Math.max(1, Math.min(20, maxRps))
+    const inFlightCap = brokerPerOriginConcurrencyCap(origin, localLab)
+    const configuredRps = brokerPerOriginRpsCap(origin, maxRps, localLab)
     const state = this.health(origin, configuredRps)
     if (state.openReason && (!state.openUntil || this.now() < state.openUntil)) {
       throw new BrokerCircuitOpen(origin, state.openReason)
@@ -2294,7 +2341,7 @@ export class RequestBroker {
       state.lastRefill = now
 
       const retryAfterWait = state.retryAfterUntil !== undefined ? state.retryAfterUntil - now : 0
-      const concurrencyOk = bypassConcurrency || state.inFlight < 2
+      const concurrencyOk = bypassConcurrency || state.inFlight < inFlightCap
       if (retryAfterWait <= 0 && concurrencyOk && state.tokens >= 1) {
         state.tokens -= 1
         state.inFlight += 1
@@ -2485,7 +2532,7 @@ export class RequestBroker {
       check()
       const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, url.origin)
       check()
-      const release = await this.acquireSlot(url.origin, grant.maxRpsPerOrigin ?? 5, deadline, false, routeTemplateForPath(url.pathname))
+      const release = await this.acquireSlot(url.origin, grant.maxRpsPerOrigin ?? 5, deadline, false, routeTemplateForPath(url.pathname), localLab)
       let response: RawHttpResponse
       try {
         this.getKillSwitch().assertAllowed(grant.tenantId ?? null)
@@ -3354,7 +3401,7 @@ export class RequestBroker {
       }
 
       const hopRouteTemplate = routeTemplateForPath(url.pathname)
-      const release = await this.acquireSlot(url.origin, maxRps, deadline, options.bypassConcurrency, hopRouteTemplate)
+      const release = await this.acquireSlot(url.origin, maxRps, deadline, options.bypassConcurrency, hopRouteTemplate, localLab)
       let response: RawHttpResponse
       try {
         ks.assertAllowed(grant.tenantId ?? null)
@@ -3869,7 +3916,7 @@ export class RequestBroker {
       const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, initialOrigin)
       const chosen = addresses.find(a => a.family === 4) ?? addresses[0]
       const maxRps = grant.maxRpsPerOrigin ?? (tier === 3 ? 3 : 5)
-      const release = await this.acquireSlot(initialOrigin, maxRps, deadline)
+      const release = await this.acquireSlot(initialOrigin, maxRps, deadline, false, undefined, localLab)
 
       const wsTransport = this.options.wsTransport ?? defaultWsTransport
       const sessionMode = Boolean(req.turns?.length) && this.options.wsSessionEnabled === true

@@ -208,6 +208,53 @@ const EXCLUDED_FILE_PATTERNS = [
 
 const MAX_RECOVERED_RUNS = 32
 
+/** Default and bounded resource limits for local-lab target containers so 12 concurrent worker containers fit comfortably in host RAM. */
+export const DEFAULT_LAB_MEMORY_LIMIT = '512m'
+export const MAX_LAB_MEMORY_LIMIT_MB = 2048
+export const DEFAULT_LAB_CPUS = '1.0'
+export const MAX_LAB_CPUS = 4.0
+export const DEFAULT_LAB_PIDS_LIMIT = 128
+export const MAX_LAB_PIDS_LIMIT = 512
+
+function parseDockerMemoryLimitMb(raw: string | undefined): number | null {
+  if (!raw) return null
+  const match = /^(\d+(?:\.\d+)?)\s*([kmg])?b?$/i.exec(raw.trim())
+  if (!match) return null
+  const amount = Number(match[1])
+  if (!Number.isFinite(amount) || amount <= 0) return null
+  const unit = (match[2] ?? 'm').toLowerCase()
+  if (unit === 'g') return Math.round(amount * 1024)
+  if (unit === 'k') return Math.max(1, Math.round(amount / 1024))
+  return Math.round(amount)
+}
+
+/** Resolve bounded memory, CPU, and PIDs limits for a local-lab service container. */
+export function resolveLabServiceResourceLimits(
+  service: Pick<LabServiceSpec, 'memoryLimit' | 'cpus' | 'pidsLimit'>,
+  labConfig: Pick<LabConfig, 'memoryLimit' | 'cpus' | 'pidsLimit'>,
+  env: NodeJS.ProcessEnv = process.env,
+): { memoryLimit: string; cpus: string; pidsLimit: number } {
+  const maxMemMbRaw = parseDockerMemoryLimitMb(env.GUARDIAN_LAB_MAX_MEMORY_LIMIT)
+  const maxMemMb = maxMemMbRaw ? Math.max(128, Math.min(8192, maxMemMbRaw)) : MAX_LAB_MEMORY_LIMIT_MB
+  const rawMemory = (service.memoryLimit ?? labConfig.memoryLimit ?? '').trim()
+  const parsedMemMb = parseDockerMemoryLimitMb(rawMemory)
+  const memoryLimit = parsedMemMb !== null
+    ? `${Math.max(64, Math.min(maxMemMb, parsedMemMb))}m`
+    : DEFAULT_LAB_MEMORY_LIMIT
+
+  const rawCpus = Number((service.cpus ?? labConfig.cpus ?? '').trim())
+  const cpus = Number.isFinite(rawCpus) && rawCpus > 0
+    ? Math.max(0.25, Math.min(MAX_LAB_CPUS, rawCpus)).toFixed(2).replace(/\.00$/, '.0')
+    : DEFAULT_LAB_CPUS
+
+  const rawPids = service.pidsLimit ?? labConfig.pidsLimit
+  const pidsLimit = typeof rawPids === 'number' && Number.isFinite(rawPids) && rawPids > 0
+    ? Math.max(32, Math.min(MAX_LAB_PIDS_LIMIT, Math.floor(rawPids)))
+    : DEFAULT_LAB_PIDS_LIMIT
+
+  return { memoryLimit, cpus, pidsLimit }
+}
+
 export function assertLocalLabAllowed(environment: string): void {
   if (environment !== 'local-lab') {
     throw new Error(
@@ -1040,9 +1087,7 @@ export class LabRunner {
     const shortId = createHash('sha256').update(`${runId}:${service.name}:${randomUUID()}`).digest('hex').slice(0, 10)
     const safeSvc = service.name.replace(/[^a-z0-9_-]/g, '').slice(0, 20) || 'svc'
     const containerName = `guardian-lab-${safeSvc}-${shortId}`
-    const memoryLimit = service.memoryLimit ?? labConfig.memoryLimit ?? '512m'
-    const cpus = service.cpus ?? labConfig.cpus ?? '1.0'
-    const pidsLimit = service.pidsLimit ?? labConfig.pidsLimit ?? 128
+    const { memoryLimit, cpus, pidsLimit } = resolveLabServiceResourceLimits(service, labConfig, this.env)
 
     let imageName: string
     let builtImage = false
@@ -1189,7 +1234,7 @@ export class LabRunner {
       return { containerName, containerId, containerIp: rawIp, imageName, builtImage, volumes }
     } catch (err) {
       this.markContainerOrphaned(storage, runId, containerName)
-      await this.docker(['container', 'rm', '--force', containerName], AbortSignal.timeout(5_000)).catch(() => undefined)
+      await this.removeContainerAndRow(storage, runId, containerName)
       await this.cleanupDockerArtifacts({ volumes, images: builtImage ? [imageName] : [] })
       throw err
     }
@@ -1395,12 +1440,12 @@ export class LabRunner {
       }
       if (proxyStarted) {
         this.markContainerOrphaned(params.storage, params.runId, proxyContainerName)
-        await this.docker(['container', 'rm', '--force', proxyContainerName], AbortSignal.timeout(5_000)).catch(() => undefined)
+        await this.removeContainerAndRow(params.storage, params.runId, proxyContainerName)
       }
-      for (const cname of containerNames) {
+      await Promise.all(containerNames.map(async cname => {
         this.markContainerOrphaned(params.storage, params.runId, cname)
-        await this.docker(['container', 'rm', '--force', cname], AbortSignal.timeout(5_000)).catch(() => undefined)
-      }
+        await this.removeContainerAndRow(params.storage, params.runId, cname)
+      }))
       await this.sweepOrphanContainersForRun(params.runId)
       await this.cleanupDockerArtifacts({
         volumes,
@@ -1504,7 +1549,7 @@ export class LabRunner {
     } catch (err) {
       writeLabProxyTarget(state.proxyDir, prevContainer, state.handle.internalPort)
       this.markContainerOrphaned(state.storage, runId, launched.containerName)
-      await this.docker(['container', 'rm', '--force', launched.containerName], AbortSignal.timeout(5_000)).catch(() => undefined)
+      await this.removeContainerAndRow(state.storage, runId, launched.containerName)
       await this.cleanupDockerArtifacts({
         volumes: launched.volumes,
         images: launched.builtImage ? [launched.imageName] : [],
@@ -1543,8 +1588,10 @@ export class LabRunner {
 
   private async sweepOrphanContainersForRun(runId: string): Promise<void> {
     const ids = await this.listByLabel('container', runId)
-    if (ids.length > 0) {
-      await this.docker(['container', 'rm', '--force', ...ids], AbortSignal.timeout(10_000)).catch(() => undefined)
+    if (ids.length === 0) return
+    const batchRemoved = await this.tryDocker(['container', 'rm', '--force', ...ids], AbortSignal.timeout(10_000))
+    if (!batchRemoved && ids.length > 1) {
+      await Promise.all(ids.map(id => this.tryDocker(['container', 'rm', '--force', id], AbortSignal.timeout(5_000))))
     }
   }
 
@@ -1701,10 +1748,10 @@ export class LabRunner {
     this.active.delete(runId)
 
     await new Promise<void>(res => state.forwarder.close(() => res())).catch(() => undefined)
-    await this.removeContainerAndRow(state.storage, runId, state.proxyContainerName)
-    for (const cname of state.containerNames) {
-      await this.removeContainerAndRow(state.storage, runId, cname)
-    }
+    await Promise.all([
+      this.removeContainerAndRow(state.storage, runId, state.proxyContainerName),
+      ...state.containerNames.map(cname => this.removeContainerAndRow(state.storage, runId, cname)),
+    ])
     await this.sweepOrphanContainersForRun(runId)
     await this.cleanupDockerArtifacts({
       volumes: state.volumes,
