@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { extname } from 'node:path'
 import { z } from 'zod'
 import {
   type CodeLocation,
@@ -23,6 +24,12 @@ import type {
   RouteSinkPath,
   StaticCodeLead,
 } from './program-graph.ts'
+import {
+  SNAPSHOT_GRAPH_SOURCE_EXTS,
+  SNAPSHOT_SEMANTIC_SOURCE_EXTS,
+  snapshotSourceFiles,
+  type StaticWorkspaceSnapshot,
+} from './static-workspace-snapshot.ts'
 import type { Assignment, Run, Store } from './store.ts'
 import type {
   CallGraphResult,
@@ -332,6 +339,8 @@ export interface SemanticAuditContext {
   liveEndpoints?: ReadonlyArray<{ method: string; path: string }>
   /** Mounted Program Graph for interprocedural AST/RBAC policy diffing & static leads (v7 M2). */
   programGraph?: ProgramGraph
+  /** Optional Phase A StaticWorkspaceSnapshot (reuses file list, source cache, and ProgramGraph). */
+  staticSnapshot?: StaticWorkspaceSnapshot
   signal: AbortSignal
 }
 
@@ -342,6 +351,8 @@ export interface SemanticAuditPipelineOptions {
   gitMaxCommits?: number
   gitDiffBase?: string
   persistToStore?: boolean
+  /** Optional Phase A StaticWorkspaceSnapshot (overrides ctx.staticSnapshot when supplied). */
+  staticSnapshot?: StaticWorkspaceSnapshot
 }
 
 export interface SemanticAuditPipelineResult {
@@ -619,12 +630,98 @@ export function createReasoningLlmCall(
   }
 }
 
+function detectRepoStackFromSnippets(snippets: ReadonlyArray<{ file: string; excerpt: string }>): {
+  frameworks: string[]
+  ormLibraries: string[]
+  authLibraries: string[]
+} {
+  const combined = snippets.map(s => `${s.file}\n${s.excerpt}`).join('\n')
+  const frameworks: string[] = []
+  const ormLibraries: string[] = []
+  const authLibraries: string[] = []
+  if (/next\/server|NextResponse|__NEXT_DATA__|next\.config/i.test(combined)) frameworks.push('nextjs')
+  if (/\bexpress\b|app\.(?:get|post|put|delete)\(/i.test(combined)) frameworks.push('express')
+  if (/\bfastify\b/i.test(combined)) frameworks.push('fastify')
+  if (/@Controller|@Injectable|NestFactory/i.test(combined)) frameworks.push('nestjs')
+  if (/\bFastAPI\b|APIRouter/i.test(combined)) frameworks.push('fastapi')
+  if (/\bFlask\b|render_template_string/i.test(combined)) frameworks.push('flask')
+  if (/\bdjango\b/i.test(combined)) frameworks.push('django')
+  if (/prisma|\$queryRawUnsafe/i.test(combined)) ormLibraries.push('prisma')
+  if (/drizzle-orm/i.test(combined)) ormLibraries.push('drizzle')
+  if (/\bsequelize\b/i.test(combined)) ormLibraries.push('sequelize')
+  if (/\btypeorm\b/i.test(combined)) ormLibraries.push('typeorm')
+  if (/sqlalchemy/i.test(combined)) ormLibraries.push('sqlalchemy')
+  if (/next-auth|NextAuth/i.test(combined)) authLibraries.push('nextauth')
+  if (/@clerk/i.test(combined)) authLibraries.push('clerk')
+  if (/jsonwebtoken|PyJWT|jwt\.verify/i.test(combined)) authLibraries.push('jwt')
+  if (/passport/i.test(combined)) authLibraries.push('passport')
+  return { frameworks, ormLibraries, authLibraries }
+}
+
+function collectRepoContextFromSnapshot(
+  snapshot: StaticWorkspaceSnapshot,
+  cleanRepo: string,
+): RepoContextSummary {
+  const files = snapshotSourceFiles(snapshot, {
+    extensions: SNAPSHOT_SEMANTIC_SOURCE_EXTS,
+    repoPrefix: cleanRepo,
+  }).slice(0, 400)
+
+  const relevance = (relPath: string): number => {
+    const rel = relPath.toLowerCase()
+    let score = 0
+    if (/(route|router|controller|handler|endpoint|api)/.test(rel)) score += 8
+    if (/(middleware|auth|session|login|jwt|oauth|permission|rbac|acl)/.test(rel)) score += 7
+    if (/(db|database|orm|query|repository|model|schema|migration)/.test(rel)) score += 5
+    if (/(graphql|resolver|trpc)/.test(rel)) score += 6
+    if (/(server|app|main|index)\./.test(rel)) score += 3
+    if (/(test|spec|mock|fixture)/.test(rel)) score -= 7
+    if (/(readme|license|changelog|docs?\/)/.test(rel)) score -= 8
+    return score
+  }
+
+  files.sort((a, b) => relevance(b.path) - relevance(a.path) || a.path.localeCompare(b.path))
+
+  const langs = new Set<string>()
+  const snippets: Array<{ file: string; excerpt: string }> = []
+  let total = 0
+  for (const f of files) {
+    const ext = extname(f.path).toLowerCase()
+    if (ext === '.ts' || ext === '.tsx') langs.add('typescript')
+    else if (ext === '.js' || ext === '.jsx' || ext === '.mjs' || ext === '.cjs') langs.add('javascript')
+    else if (ext === '.py') langs.add('python')
+    else if (ext === '.go') langs.add('go')
+    else if (ext === '.java') langs.add('java')
+    else if (ext === '.php') langs.add('php')
+    else if (ext === '.rb') langs.add('ruby')
+
+    if (snippets.length < 40 && total < 44_000 && Buffer.byteLength(f.content, 'utf8') <= 128 * 1024) {
+      const txt = f.content.slice(0, 1800)
+      snippets.push({ file: f.path, excerpt: txt })
+      total += txt.length
+    }
+  }
+
+  const stack = detectRepoStackFromSnippets(snippets)
+  return {
+    repo: cleanRepo,
+    filesScanned: files.length,
+    languages: langs.size ? [...langs] : ['typescript'],
+    ...stack,
+    snippets,
+  }
+}
+
 export async function collectRepoContextForSpec(
   session: WorkerSession,
   repo: string,
   signal: AbortSignal,
+  staticSnapshot?: StaticWorkspaceSnapshot,
 ): Promise<RepoContextSummary> {
   const cleanRepo = normalizeRepoIdentifier(repo)
+  if (staticSnapshot) {
+    return collectRepoContextFromSnapshot(staticSnapshot, cleanRepo)
+  }
   const code = `
 import fs from 'node:fs';
 import path from 'node:path';
@@ -694,34 +791,13 @@ process.stdout.write(JSON.stringify({ filesScanned: files.length, languages: [..
       snippets?: Array<{ file: string; excerpt: string }>
     }
     const snippets = Array.isArray(parsed.snippets) ? parsed.snippets : []
-    const combined = snippets.map(s => `${s.file}\n${s.excerpt}`).join('\n')
-    const frameworks: string[] = []
-    const ormLibraries: string[] = []
-    const authLibraries: string[] = []
-    if (/next\/server|NextResponse|__NEXT_DATA__|next\.config/i.test(combined)) frameworks.push('nextjs')
-    if (/\bexpress\b|app\.(?:get|post|put|delete)\(/i.test(combined)) frameworks.push('express')
-    if (/\bfastify\b/i.test(combined)) frameworks.push('fastify')
-    if (/@Controller|@Injectable|NestFactory/i.test(combined)) frameworks.push('nestjs')
-    if (/\bFastAPI\b|APIRouter/i.test(combined)) frameworks.push('fastapi')
-    if (/\bFlask\b|render_template_string/i.test(combined)) frameworks.push('flask')
-    if (/\bdjango\b/i.test(combined)) frameworks.push('django')
-    if (/prisma|\$queryRawUnsafe/i.test(combined)) ormLibraries.push('prisma')
-    if (/drizzle-orm/i.test(combined)) ormLibraries.push('drizzle')
-    if (/\bsequelize\b/i.test(combined)) ormLibraries.push('sequelize')
-    if (/\btypeorm\b/i.test(combined)) ormLibraries.push('typeorm')
-    if (/sqlalchemy/i.test(combined)) ormLibraries.push('sqlalchemy')
-    if (/next-auth|NextAuth/i.test(combined)) authLibraries.push('nextauth')
-    if (/@clerk/i.test(combined)) authLibraries.push('clerk')
-    if (/jsonwebtoken|PyJWT|jwt\.verify/i.test(combined)) authLibraries.push('jwt')
-    if (/passport/i.test(combined)) authLibraries.push('passport')
+    const stack = detectRepoStackFromSnippets(snippets)
 
     return {
       repo: cleanRepo,
       filesScanned: Number(parsed.filesScanned ?? snippets.length),
       languages: Array.isArray(parsed.languages) && parsed.languages.length ? parsed.languages : ['typescript'],
-      frameworks,
-      ormLibraries,
-      authLibraries,
+      ...stack,
       snippets,
     }
   } catch {
@@ -854,13 +930,13 @@ export async function extractProjectSecuritySpecAndRules(
   ctx: SemanticAuditContext,
   repo: string,
   session: WorkerSession,
-  options: { enableLlm?: boolean } = {},
+  options: { enableLlm?: boolean; staticSnapshot?: StaticWorkspaceSnapshot } = {},
 ): Promise<{
   spec: ProjectSecuritySpec
   rules: ValidatedDynamicRule[]
   rejectedRules: Array<{ ruleId: string; reason: string }>
 }> {
-  const context = await collectRepoContextForSpec(session, repo, ctx.signal)
+  const context = await collectRepoContextForSpec(session, repo, ctx.signal, options.staticSnapshot ?? ctx.staticSnapshot)
   const deterministic = inferProjectSecuritySpecDeterministic(context.repo, context)
   let spec = deterministic.spec
   const rawRuleCandidates: unknown[] = [...deterministic.candidateRules]
@@ -1061,11 +1137,85 @@ process.stdout.write(JSON.stringify(findings));
 // Stage 2: Atlantis/RepoAudit-Style Backward Traversal & Path Dominance
 // ============================================================================
 
+const SNAPSHOT_CALL_GRAPH_EXTS: ReadonlySet<string> = new Set([
+  ...SNAPSHOT_GRAPH_SOURCE_EXTS,
+  '.php',
+])
+
+function buildRepoCallGraphFromSnapshot(
+  snapshot: StaticWorkspaceSnapshot,
+  cleanRepo: string,
+  customGuardPatterns: readonly string[],
+  customSanitizerPatterns: readonly string[],
+  customSinkPatterns: ReadonlyArray<{ pattern: string; sinkKind: AuditSinkKind }>,
+): CallGraphIndex {
+  const files = snapshotSourceFiles(snapshot, {
+    extensions: SNAPSHOT_CALL_GRAPH_EXTS,
+    repoPrefix: cleanRepo,
+  }).slice(0, 400)
+
+  const nodes: CallGraphNode[] = []
+  const edges: CallGraphEdge[] = []
+  const bySym = new Map<string, CallGraphNode[]>()
+
+  for (const f of files) {
+    const rel = f.path
+    const lines = f.content.split('\n')
+    for (let i = 0; i < lines.length; i += 1) {
+      const l = lines[i]!
+      const fnM = l.match(/(?:export\s+)?(?:async\s+)?function\s+([A-Za-z0-9_]+)\s*\(|def\s+([A-Za-z0-9_]+)\s*\(/)
+      const rtM = l.match(/\.(get|post|put|patch|delete)\s*\(\s*["']([^"']+)["']/)
+      const sym = fnM ? (fnM[1] || fnM[2]) : rtM ? `${rtM[1].toUpperCase()} ${rtM[2]}` : null
+      if (!sym) continue
+      const block = lines.slice(i, Math.min(lines.length, i + 25)).join('\n')
+      const guards = customGuardPatterns.filter(p => block.includes(p))
+      const sanitizers = customSanitizerPatterns.filter(p => block.includes(p))
+      const sinkHit = customSinkPatterns.find(sp => block.includes(sp.pattern))
+      const calls = [...block.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)].map(m => m[1]!).filter(c => c !== sym)
+      const node: CallGraphNode = {
+        id: `${rel}:${i + 1}:${sym}`,
+        file: rel,
+        line: i + 1,
+        symbol: sym,
+        kind: rtM ? 'entrypoint' : sinkHit ? 'sink' : 'function',
+        ...(rtM ? { httpMethod: rtM[1].toUpperCase(), routePath: rtM[2] } : {}),
+        ...(sinkHit ? { sinkKind: sinkHit.sinkKind } : {}),
+        guards,
+        sanitizers,
+        calls: [...new Set(calls)].slice(0, 30),
+      }
+      nodes.push(node)
+      const existing = bySym.get(sym)
+      if (existing) existing.push(node)
+      else bySym.set(sym, [node])
+    }
+  }
+
+  for (const caller of nodes) {
+    for (const c of caller.calls) {
+      for (const callee of (bySym.get(c) ?? []).slice(0, 3)) {
+        if (callee.id !== caller.id) {
+          edges.push({ fromId: caller.id, toId: callee.id, file: caller.file, line: caller.line })
+        }
+      }
+    }
+  }
+
+  return {
+    repo: cleanRepo,
+    filesScanned: files.length,
+    nodes,
+    edges,
+    analyzerSource: 'offline_script_fallback',
+  }
+}
+
 export async function buildRepoCallGraph(
   session: WorkerSession,
   repo: string,
   spec: ProjectSecuritySpec,
   signal: AbortSignal,
+  staticSnapshot?: StaticWorkspaceSnapshot,
 ): Promise<CallGraphIndex> {
   const cleanRepo = normalizeRepoIdentifier(repo)
   const customGuardPatterns = spec.authTenantGuards.flatMap(g => g.patterns).slice(0, 40)
@@ -1073,6 +1223,16 @@ export async function buildRepoCallGraph(
   const customSinkPatterns = spec.sinks.flatMap(sk =>
     sk.patterns.map(p => ({ pattern: p, sinkKind: sk.sinkKind })),
   ).slice(0, 40)
+
+  if (staticSnapshot) {
+    return buildRepoCallGraphFromSnapshot(
+      staticSnapshot,
+      cleanRepo,
+      customGuardPatterns,
+      customSanitizerPatterns,
+      customSinkPatterns,
+    )
+  }
 
   // Prefer dedicated worker op: 'call_graph' or analyze('call-graph')
   if (typeof session.callGraph === 'function') {
@@ -2341,8 +2501,18 @@ export async function runVariantSweepForFinding(
   const session = ctx.session ?? await ctx.backend.openSession(ctx.assignment?.id ?? randomUUID(), ctx.signal, { reposDir: ctx.reposDir })
 
   try {
-    // Read bounded snippet inside --network none container
+    // Read bounded snippet from StaticWorkspaceSnapshot when available, else inside --network none container
     let snippet = primaryLoc.snippet ?? ''
+    if (!snippet && ctx.staticSnapshot) {
+      const cached = ctx.staticSnapshot.sourceByPath.get(`${cleanRepo}/${primaryLoc.file}`)
+        ?? ctx.staticSnapshot.sourceByPath.get(primaryLoc.file)
+      if (cached !== undefined) {
+        const lines = cached.split('\n')
+        const s = Math.max(0, primaryLoc.startLine - 4)
+        const e = Math.min(lines.length, primaryLoc.endLine + 4)
+        snippet = lines.slice(s, e).join('\n').slice(0, 2000)
+      }
+    }
     if (!snippet) {
       const readCode = `
 import fs from 'node:fs';
@@ -2600,8 +2770,19 @@ export async function runThreeStageSemanticAudit(
   options: SemanticAuditPipelineOptions = {},
 ): Promise<SemanticAuditPipelineResult> {
   const startedAt = Date.now()
+  const staticSnapshot = options.staticSnapshot ?? ctx.staticSnapshot
+  const effectiveProgramGraph = ctx.programGraph ?? staticSnapshot?.programGraph
   const ownedSession = !ctx.session
-  const session = ctx.session ?? await ctx.backend.openSession(ctx.assignment?.id ?? randomUUID(), ctx.signal, { reposDir: ctx.reposDir })
+  let session: WorkerSession | undefined = ctx.session
+  const ensureSession = async (): Promise<WorkerSession> => {
+    if (!session) {
+      session = await ctx.backend.openSession(ctx.assignment?.id ?? randomUUID(), ctx.signal, { reposDir: ctx.reposDir })
+    }
+    return session
+  }
+  if (!staticSnapshot) {
+    await ensureSession()
+  }
 
   const specsByRepo: Record<string, ProjectSecuritySpec> = {}
   const rejectedDynamicRules: Array<{ ruleId: string; reason: string }> = []
@@ -2621,24 +2802,34 @@ export async function runThreeStageSemanticAudit(
       }
 
       // Stage 1: IRIS-style Spec + Dynamic Rule Scan
-      const stage1 = await extractProjectSecuritySpecAndRules(ctx, cleanRepo, session, {
+      const stage1Session = staticSnapshot ? (session as WorkerSession) : await ensureSession()
+      const stage1 = await extractProjectSecuritySpecAndRules(ctx, cleanRepo, stage1Session, {
         enableLlm: options.enableStage1Llm
           ?? (ctx.modelProfiles?.length ? process.env.GUARDIAN_STAGE1_LLM !== '0' : false),
+        ...(staticSnapshot ? { staticSnapshot } : {}),
       })
       specsByRepo[cleanRepo] = stage1.spec
       dynamicRulesCount += stage1.rules.length
       rejectedDynamicRules.push(...stage1.rejectedRules)
 
-      const dynamicFindings = await runValidatedDynamicRulesInWorker(
-        session,
-        cleanRepo,
-        stage1.rules,
-        ctx.signal,
-        ctx.secrets,
-      )
+      const dynamicFindings = stage1.rules.length > 0
+        ? await runValidatedDynamicRulesInWorker(
+            await ensureSession(),
+            cleanRepo,
+            stage1.rules,
+            ctx.signal,
+            ctx.secrets,
+          )
+        : []
 
       // Stage 2: Atlantis/RepoAudit-style Call-Graph Backward Traversal & Path Dominance
-      const graph = await buildRepoCallGraph(session, cleanRepo, stage1.spec, ctx.signal)
+      const graph = await buildRepoCallGraph(
+        staticSnapshot ? (session as WorkerSession) : await ensureSession(),
+        cleanRepo,
+        stage1.spec,
+        ctx.signal,
+        staticSnapshot,
+      )
       callGraphsByRepo[cleanRepo] = {
         filesScanned: graph.filesScanned,
         nodes: graph.nodes.length,
@@ -2656,13 +2847,13 @@ export async function runThreeStageSemanticAudit(
         backwardPaths,
         hostTiers: ctx.hostTiers,
         callGraph: graph,
-        ...(ctx.programGraph ? { programGraph: ctx.programGraph } : {}),
+        ...(effectiveProgramGraph ? { programGraph: effectiveProgramGraph } : {}),
         ...(ctx.liveEndpoints ? { liveEndpoints: ctx.liveEndpoints } : {}),
       }))
 
       // Stage 3: Big Sleep/Aardvark-style Git Security Miner
       if (options.enableStage3GitMiner !== false) {
-        const gitRes = await mineGitSecurityHistory(ctx, cleanRepo, session, stage1.spec, {
+        const gitRes = await mineGitSecurityHistory(ctx, cleanRepo, await ensureSession(), stage1.spec, {
           maxCommits: options.gitMaxCommits,
           diffBase: options.gitDiffBase,
         })
@@ -2704,7 +2895,7 @@ export async function runThreeStageSemanticAudit(
       durationMs: Date.now() - startedAt,
     }
   } finally {
-    if (ownedSession) {
+    if (ownedSession && session) {
       await session.close().catch(() => undefined)
     }
   }

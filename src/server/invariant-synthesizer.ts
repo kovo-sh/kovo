@@ -18,6 +18,7 @@ import type {
   ProgramSinkKind,
   ServiceOriginMapping,
 } from './program-graph.ts'
+import { snapshotSourceFiles, type StaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
 
 // ============================================================================
 // Constants & Shared v8 Capability / Hypothesis Schema
@@ -174,7 +175,7 @@ export interface RuntimeInvariantParityResult {
 }
 
 export interface SynthesizeInvariantsInput {
-  mode: SynthesizerMode; graph?: ProgramGraph; sourceFiles?: readonly SourceFileInput[]
+  mode: SynthesizerMode; graph?: ProgramGraph; sourceFiles?: readonly SourceFileInput[]; staticSnapshot?: StaticWorkspaceSnapshot
   services?: readonly MonorepoService[]; serviceOrigins?: readonly ServiceOriginMapping[]
   compose?: string; ingress?: string; runtime?: Omit<RuntimeDiscoveryInput, 'mode'>
   totalRunBudgetUsd?: number; maxBudgetFraction?: number; maxSliceBytes?: number; maxHypotheses?: number
@@ -1072,10 +1073,14 @@ export function synthesizeInvariants(input: SynthesizeInvariantsInput): Synthesi
   const all: InvariantHypothesis[] = []
   let guardMatrix: GuardAsymmetryMatrixResult | undefined, trustBoundaries: TrustBoundaryGraphResult | undefined
   let lifecycleSlices: EntityLifecycleSlicesResult | undefined, runtimeParity: RuntimeInvariantParityResult | undefined
-  if (input.mode === 'white-box' && input.graph) {
-    guardMatrix = buildGuardAsymmetryMatrix(input.graph, { sourceFiles: input.sourceFiles, serviceOrigins: input.serviceOrigins })
-    trustBoundaries = buildTrustBoundaryGraph(input.graph, { sourceFiles: input.sourceFiles, services: input.services, serviceOrigins: input.serviceOrigins, compose: input.compose, ingress: input.ingress })
-    lifecycleSlices = buildEntityLifecycleSlices(input.graph, { sourceFiles: input.sourceFiles, serviceOrigins: input.serviceOrigins, maxSliceBytes: input.maxSliceBytes, totalRunBudgetUsd: input.totalRunBudgetUsd, maxBudgetFraction: input.maxBudgetFraction })
+  const snap = input.staticSnapshot
+  const graph = input.graph ?? snap?.programGraph
+  const sourceFiles = input.sourceFiles ?? (snap ? snapshotSourceFiles(snap) : undefined)
+  const compose = input.compose ?? snap?.compose, ingress = input.ingress ?? snap?.ingress
+  if (input.mode === 'white-box' && graph) {
+    guardMatrix = buildGuardAsymmetryMatrix(graph, { sourceFiles, serviceOrigins: input.serviceOrigins })
+    trustBoundaries = buildTrustBoundaryGraph(graph, { sourceFiles, services: input.services, serviceOrigins: input.serviceOrigins, compose, ingress })
+    lifecycleSlices = buildEntityLifecycleSlices(graph, { sourceFiles, serviceOrigins: input.serviceOrigins, maxSliceBytes: input.maxSliceBytes, totalRunBudgetUsd: input.totalRunBudgetUsd, maxBudgetFraction: input.maxBudgetFraction })
     all.push(...guardMatrix.hypotheses, ...trustBoundaries.hypotheses, ...lifecycleSlices.hypotheses)
   }
   if (input.runtime) {
