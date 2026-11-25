@@ -2,7 +2,7 @@
 import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { accessSync, chmodSync, constants, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
-import type { NamedSecret } from './redact.ts'
+import { buildSecretEncodingVariants, type NamedSecret } from './redact.ts'
 
 export type DerivedCapabilityHandle = `cap:hop_${string}:${string}`
 export type DerivedSecretKind =
@@ -11,7 +11,7 @@ export type DerivedSecretKind =
 export type DerivedCustodyErrorCode =
   | 'INVALID_HANDLE' | 'UNKNOWN_HANDLE' | 'EXPIRED_HANDLE' | 'RUN_MISMATCH'
   | 'ORIGIN_NOT_ALLOWED' | 'INVALID_INPUT' | 'UNSAFE_HEADER' | 'PERSISTENCE_ERROR'
-  | 'CAPACITY_EXCEEDED' | 'MONOTONIC_VIOLATION'
+  | 'CAPACITY_EXCEEDED' | 'MONOTONIC_VIOLATION' | 'HANDLE_IMMUTABLE'
 
 export class DerivedCustodyError extends Error {
   readonly code: DerivedCustodyErrorCode
@@ -45,7 +45,7 @@ const COOKIE_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,256}$/
 const CRLF_RE = /[\r\n\0]/
 const MAX_SECRET_BYTES = 32_768
 const DEFAULT_MAX_ENTRIES = 512
-const MIN_SCRUB_LENGTH = 4
+const MIN_SCRUB_LENGTH = 8
 const DEFAULT_AUTOBIND_MIN_LENGTH = 8
 const TRIVIAL_AUTOBIND_VALUES = new Set([
   'undefined', 'approved', 'accepted', 'rejected', 'completed', 'complete', 'processing', 'succeeded', 'disabled', 'password',
@@ -87,6 +87,7 @@ interface VaultInternals {
   readonly runId: string; readonly persistPath?: string; readonly defaultTtlMs: number | null
   readonly maxEntries: number; readonly now: () => number
   readonly entries: Map<DerivedCapabilityHandle, SealedEntry>; readonly scrubHistory: Map<string, ScrubRecord>
+  readonly sealedDigests: Map<DerivedCapabilityHandle, string>
 }
 const vaultInternals = new WeakMap<DerivedCapabilityVault, VaultInternals>()
 function getInternals(vault: DerivedCapabilityVault): VaultInternals {
@@ -157,17 +158,21 @@ export class DerivedCapabilityVault {
     this.runId = options.runId
     const state: VaultInternals = {
       runId: options.runId, persistPath: options.persistPath, defaultTtlMs: options.defaultTtlMs ?? null,
-      maxEntries, now: options.now ?? Date.now, entries: new Map(), scrubHistory: new Map(),
+      maxEntries, now: options.now ?? Date.now, entries: new Map(), scrubHistory: new Map(), sealedDigests: new Map(),
     }
     const loaded = options.persistPath ? readPersistedVault(options.persistPath, options.runId) : null
     if (loaded) {
       for (const e of loaded.entries) {
         if (e?.meta && isDerivedCapabilityHandle(e.meta.handle) && typeof e.rawValue === 'string') {
           state.entries.set(e.meta.handle, e); state.scrubHistory.set(e.rawValue, { handle: e.meta.handle, rawValue: e.rawValue })
+          state.sealedDigests.set(e.meta.handle, e.meta.sha256)
         }
       }
       for (const rec of loaded.scrubHistory) {
-        if (rec && isDerivedCapabilityHandle(rec.handle) && typeof rec.rawValue === 'string') state.scrubHistory.set(rec.rawValue, rec)
+        if (rec && isDerivedCapabilityHandle(rec.handle) && typeof rec.rawValue === 'string') {
+          state.scrubHistory.set(rec.rawValue, rec)
+          if (!state.sealedDigests.has(rec.handle)) state.sealedDigests.set(rec.handle, sha256Hex(rec.rawValue))
+        }
       }
     }
     vaultInternals.set(this, state)
@@ -178,7 +183,8 @@ export class DerivedCapabilityVault {
     assertCustody(typeof input.rawValue === 'string' && input.rawValue.length > 0, 'INVALID_INPUT', 'rawValue must be a non-empty string.')
     assertCustody(Buffer.byteLength(input.rawValue, 'utf8') <= MAX_SECRET_BYTES, 'INVALID_INPUT', `rawValue exceeds ${MAX_SECRET_BYTES} bytes.`)
     const handle = formatDerivedHandle(input.hopReceiptId, input.slot)
-    assertCustody(state.entries.has(handle) || state.entries.size < state.maxEntries, 'CAPACITY_EXCEEDED', `Vault capacity (${state.maxEntries}) reached.`)
+    assertCustody(!state.entries.has(handle) && !state.sealedDigests.has(handle), 'HANDLE_IMMUTABLE', `Capability handle "${handle}" is immutable and cannot be overwritten or re-sealed.`)
+    assertCustody(state.entries.size < state.maxEntries, 'CAPACITY_EXCEEDED', `Vault capacity (${state.maxEntries}) reached.`)
     const ttl = input.ttlMs === undefined ? state.defaultTtlMs : input.ttlMs
     assertCustody(ttl === null || (Number.isFinite(ttl) && ttl >= 0), 'INVALID_INPUT', 'ttlMs must be a non-negative finite number or null.')
     assertCustody(input.derivedFromCapabilityId === undefined || isDerivedCapabilityHandle(input.derivedFromCapabilityId), 'INVALID_HANDLE', 'Invalid derivedFromCapabilityId.')
@@ -194,9 +200,15 @@ export class DerivedCapabilityVault {
       ...(allowedOrigins?.length ? { allowedOrigins } : {}),
     }
     state.entries.set(handle, { meta, rawValue: input.rawValue })
+    state.sealedDigests.set(handle, digest)
     state.scrubHistory.set(input.rawValue, { handle, rawValue: input.rawValue })
     writePersistedVault(state)
     return cloneMeta(meta)
+  }
+
+  hasEverSealed(handle: string): boolean {
+    const state = getInternals(this)
+    return isDerivedCapabilityHandle(handle) && (state.entries.has(handle) || state.sealedDigests.has(handle))
   }
 
   getMeta(handle: string): DerivedCapabilityMeta | null {
@@ -271,29 +283,16 @@ export class DerivedCapabilityVault {
   }
 }
 
-// --- Secret Scrubbing (Raw + URL/Form + Base64 / Unpadded / Base64URL) ---
-function buildSecretVariants(rawValue: string): string[] {
-  const variants = new Set<string>([rawValue])
-  const add = (v: string) => { if (v !== rawValue && v.length >= MIN_SCRUB_LENGTH) variants.add(v) }
-  const urlEnc = encodeURIComponent(rawValue)
-  if (urlEnc !== rawValue) {
-    add(urlEnc); add(urlEnc.replace(/%[0-9A-F]{2}/g, m => m.toLowerCase())); add(urlEnc.replaceAll('%20', '+'))
-  }
-  const buf = Buffer.from(rawValue, 'utf8')
-  const b64 = buf.toString('base64')
-  add(b64); add(b64.replace(/=+$/, '')); add(encodeURIComponent(b64)); add(buf.toString('base64url'))
-  return Array.from(variants)
-}
-
+// --- Secret Scrubbing (Raw + URL/Form + Base64 / Unpadded / Base64URL + JSON/HTML Escapes) ---
 export function scrubDerivedSecrets(text: string, vault: DerivedCapabilityVault | readonly DerivedCapabilityVault[]): string {
   if (!text) return text
   const vaults = Array.isArray(vault) ? vault : [vault]
   const replacements: Array<{ needle: string; placeholder: string }> = []
   for (const v of vaults) {
     for (const rec of getInternals(v).scrubHistory.values()) {
-      if (rec.rawValue.length < MIN_SCRUB_LENGTH) continue
+      if (rec.rawValue.length < MIN_SCRUB_LENGTH || TRIVIAL_AUTOBIND_VALUES.has(rec.rawValue.trim().toLowerCase())) continue
       const placeholder = `[redacted:${rec.handle}]`
-      for (const needle of buildSecretVariants(rec.rawValue)) replacements.push({ needle, placeholder })
+      for (const needle of buildSecretEncodingVariants(rec.rawValue, MIN_SCRUB_LENGTH)) replacements.push({ needle, placeholder })
     }
   }
   if (!replacements.length) return text
@@ -306,7 +305,9 @@ export function scrubDerivedSecrets(text: string, vault: DerivedCapabilityVault 
 export function vaultScrubDescriptors(vault: DerivedCapabilityVault): NamedSecret[] {
   const list: NamedSecret[] = []
   for (const rec of getInternals(vault).scrubHistory.values()) {
-    if (rec.rawValue.length >= MIN_SCRUB_LENGTH) list.push({ value: rec.rawValue, placeholder: `[redacted:${rec.handle}]` })
+    if (rec.rawValue.length >= MIN_SCRUB_LENGTH && !TRIVIAL_AUTOBIND_VALUES.has(rec.rawValue.trim().toLowerCase())) {
+      list.push({ value: rec.rawValue, placeholder: `[redacted:${rec.handle}]` })
+    }
   }
   return list
 }

@@ -7,6 +7,7 @@ import { scanSecondOrderMarkers } from './canary-broker.ts'
 import type { SecondOrderStore } from './canary-broker.ts'
 import { cookieRecordsFromHeader } from './persona-auth.ts'
 import { buildPersonaBrowserAttachment, personaSecrets } from './persona-vault.ts'
+import { createEgressSanitizer } from './egress-sanitizer.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import { evaluateBrowserScopeRequest } from './scope-policy.ts'
@@ -917,13 +918,21 @@ export function buildSoft404ProbePaths(count = 3): string[] {
 async function mirrorJarCookies(
   context: PlaywrightContext | undefined,
   broker: RequestBroker,
-  scope: { session?: string; runId?: string; assignmentId?: string; sessionGroupRole?: string },
+  scope: { session?: string; persona?: string; runId?: string; assignmentId?: string; sessionGroupRole?: string },
   origin: string,
+  mirroredSecrets?: NamedSecret[],
 ): Promise<void> {
   if (!context?.addCookies) return
   try {
     const cookies = broker.sessionCookiesForBrowser(scope, origin)
     if (cookies.length === 0) return
+    if (mirroredSecrets) {
+      for (const cookie of cookies) {
+        if (cookie.value && cookie.value.length >= 6) {
+          mirroredSecrets.push({ value: cookie.value, placeholder: `[redacted:cookie:${cookie.name}]` })
+        }
+      }
+    }
     await context.addCookies(cookies.map(cookie => ({
       name: cookie.name,
       value: cookie.value,
@@ -937,6 +946,26 @@ async function mirrorJarCookies(
   } catch {
     // Best-effort mirroring: a cookie that Playwright rejects must never fail a visit.
   }
+}
+
+/** Collects secret material seeded into a browser context so EgressSanitizer scrubs every field (H-8). */
+function collectBundleSecrets(bundle: BrowserSessionBundle | null | undefined): NamedSecret[] {
+  if (!bundle) return []
+  const out: NamedSecret[] = []
+  for (const c of bundle.cookies ?? []) {
+    if (c.value && c.value.length >= 6) out.push({ value: c.value, placeholder: `[redacted:cookie:${c.name}]` })
+  }
+  for (const [k, v] of Object.entries(bundle.localStorage ?? {})) {
+    if (v && v.length >= 8) out.push({ value: v, placeholder: `[redacted:storage:${k}]` })
+  }
+  for (const [k, v] of Object.entries(bundle.sessionStorage ?? {})) {
+    if (v && v.length >= 8) out.push({ value: v, placeholder: `[redacted:storage:${k}]` })
+  }
+  for (const [k, v] of Object.entries(bundle.headers ?? {})) {
+    const trimmed = v.replace(/^Bearer\s+/i, '').trim()
+    if (trimmed.length >= 6) out.push({ value: trimmed, placeholder: `[redacted:header:${k.toLowerCase()}]` })
+  }
+  return out
 }
 
 function hasDestructiveInput(text: string): boolean {
@@ -1629,7 +1658,7 @@ export class ScopedBrowser {
             ...(state.runId ? { runId: state.runId } : {}),
             ...(state.assignmentId ? { assignmentId: state.assignmentId } : {}),
             ...(state.sessionGroupRole ? { sessionGroupRole: state.sessionGroupRole } : {}),
-          }, parsedUrl.origin)
+          }, parsedUrl.origin, state.secrets)
           const reqRecord: BrowserXhrRecord = {
             method,
             url: redact(parsedUrl.href, state.secrets),
@@ -1753,6 +1782,7 @@ export class ScopedBrowser {
       const timeoutMs = Math.max(2_000, Math.min(req.timeoutMs ?? maxBrowserTimeoutMs, maxBrowserTimeoutMs))
       const secrets = [...collectSecrets(req, grant), ...this.broker.getRegisteredSecrets()]
       const bundle = await this.resolveBundle(req, grant, initialOrigin)
+      secrets.push(...collectBundleSecrets(bundle))
       const runtime = await this.ensurePooledContext(browser, req, initialOrigin, bundle)
       const state: PooledVisitState = {
         origin: initialOrigin,
@@ -1846,16 +1876,17 @@ export class ScopedBrowser {
 
         const finalUrlRaw = runtime.page.url()
         const runtimeSecrets = [...secrets, ...this.broker.getRegisteredSecrets()]
-        const finalUrl = redact(finalUrlRaw, runtimeSecrets)
-        const title = redact(await runtime.page.title().catch(() => ''), runtimeSecrets).slice(0, 300)
+        const egress = createEgressSanitizer({ secrets: runtimeSecrets })
+        const finalUrl = egress.redactText(finalUrlRaw, 'browser_result')
+        const title = egress.redactText(await runtime.page.title().catch(() => ''), 'browser_result').slice(0, 300)
         let finalOrigin = initialOrigin
         try { finalOrigin = new URL(finalUrlRaw).origin } catch { /* keep initial */ }
         const primaryExchange = state.exchanges[0]
         const redirectOrigins = primaryExchange?.redirectOrigins ?? [initialOrigin]
-        const initialRedactedUrl = redact(targetUrl.href, runtimeSecrets)
+        const initialRedactedUrl = egress.redactText(targetUrl.href, 'browser_result')
         const webSockets = [...runtime.sockets.values()].map(socket => ({
           ...socket,
-          frames: socket.frames.map(frame => ({ ...frame, preview: redact(frame.preview, runtimeSecrets) })),
+          frames: socket.frames.map(frame => ({ ...frame, preview: egress.redactText(frame.preview, 'browser_result') })),
         }))
         if (webSockets.length > 0) {
           for (const socket of webSockets) {
@@ -1869,13 +1900,13 @@ export class ScopedBrowser {
             })
           }
         }
-        results.push({
+        results.push(egress.sanitizeBrowserResult({
           origin: initialOrigin,
           finalUrl,
           title,
           status: navResponse ? navResponse.status() : (primaryExchange?.status ?? null),
-          domSnippet: redact(snapshot.domHtml, runtimeSecrets).slice(0, maxDomSnippetChars),
-          links: [...new Set(snapshot.links.map(link => redact(link, runtimeSecrets)))].slice(0, 160),
+          domSnippet: egress.redactText(snapshot.domHtml, 'browser_result').slice(0, maxDomSnippetChars),
+          links: [...new Set(snapshot.links.map(link => egress.redactText(link, 'browser_result')))].slice(0, 160),
           forms: snapshot.forms,
           xhrRequests: state.xhrRequests.slice(0, 100),
           allRequests: state.allRequests.slice(0, 200),
@@ -1884,7 +1915,7 @@ export class ScopedBrowser {
           postMessageListeners: {
             ...snapshot.postMessageListeners,
             handlers: snapshot.postMessageListeners.handlers.map(handler => ({
-              preview: redact(handler.preview, runtimeSecrets),
+              preview: egress.redactText(handler.preview, 'browser_result'),
               checksOrigin: handler.checksOrigin,
             })),
           },
@@ -1908,7 +1939,7 @@ export class ScopedBrowser {
           exchangeIds: state.exchangeIds,
           exchanges: state.exchanges,
           durationMs: Date.now() - started,
-        })
+        }))
       } finally {
         runtime.active = null
         runtime.activeGrant = null
@@ -2150,7 +2181,7 @@ export class ScopedBrowser {
               runId: req.runId,
               assignmentId: req.assignmentId,
               sessionGroupRole: req.sessionGroupRole,
-            }, parsedUrl.origin)
+            }, parsedUrl.origin, secrets)
           }
 
           const reqRecord: BrowserXhrRecord = {
@@ -2565,13 +2596,14 @@ export class ScopedBrowser {
 
       const finalUrlRaw = page.url()
       const runtimeSecrets = [...secrets, ...this.broker.getRegisteredSecrets()]
-      const finalUrl = redact(finalUrlRaw, runtimeSecrets)
-      const title = redact(await page.title().catch(() => ''), runtimeSecrets).slice(0, 300)
+      const egress = createEgressSanitizer({ secrets: runtimeSecrets })
+      const finalUrl = egress.redactText(finalUrlRaw, 'browser_result')
+      const title = egress.redactText(await page.title().catch(() => ''), 'browser_result').slice(0, 300)
       const primaryExchange = exchanges[0]
       let finalOrigin = initialOrigin
       try { finalOrigin = new URL(finalUrlRaw).origin } catch { /* keep initialOrigin */ }
       const redirectOrigins = primaryExchange?.redirectOrigins ?? [initialOrigin]
-      const initialRedactedUrl = redact(targetUrl.href, runtimeSecrets)
+      const initialRedactedUrl = egress.redactText(targetUrl.href, 'browser_result')
       const redirectSummary: BrowserRedirectSummary = {
         initialUrl: initialRedactedUrl,
         finalUrl,
@@ -2597,31 +2629,31 @@ export class ScopedBrowser {
       const safeSelectorResult: BrowserSelectorResult | null = snapshot.selectorResult
         ? {
             ...snapshot.selectorResult,
-            textPreview: redact(snapshot.selectorResult.textPreview, runtimeSecrets),
+            textPreview: egress.redactText(snapshot.selectorResult.textPreview, 'browser_result'),
           }
         : null
 
       const safeFetchResult: BrowserFetchResult | null = snapshot.fetchResult
         ? {
             ...snapshot.fetchResult,
-            url: redact(snapshot.fetchResult.url, runtimeSecrets),
-            bodyPreview: redact(snapshot.fetchResult.bodyPreview, runtimeSecrets),
-            error: snapshot.fetchResult.error ? redact(snapshot.fetchResult.error, runtimeSecrets) : null,
+            url: egress.redactText(snapshot.fetchResult.url, 'browser_result'),
+            bodyPreview: egress.redactText(snapshot.fetchResult.bodyPreview, 'browser_result'),
+            error: snapshot.fetchResult.error ? egress.redactText(snapshot.fetchResult.error, 'browser_result') : null,
           }
         : null
 
       const safeSinkTraces: BrowserDomSinkTrace[] = (snapshot.sinkTraces ?? []).map(t => ({
         ...t,
-        preview: redact(t.preview, runtimeSecrets).slice(0, 400),
+        preview: egress.redactText(t.preview, 'browser_result').slice(0, 400),
       }))
 
-      return {
+      return egress.sanitizeBrowserResult({
         origin: initialOrigin,
         finalUrl,
         title,
         status: navResponse ? navResponse.status() : (exchanges[0]?.status ?? null),
-        domSnippet: redact(snapshot.domHtml, runtimeSecrets).slice(0, maxDomSnippetChars),
-        links: [...new Set(snapshot.links.map(l => redact(l, runtimeSecrets)))].slice(0, 120),
+        domSnippet: egress.redactText(snapshot.domHtml, 'browser_result').slice(0, maxDomSnippetChars),
+        links: [...new Set(snapshot.links.map(l => egress.redactText(l, 'browser_result')))].slice(0, 120),
         forms: snapshot.forms,
         xhrRequests: xhrRequests.slice(0, 100),
         allRequests: allRequests.slice(0, 150),
@@ -2630,7 +2662,7 @@ export class ScopedBrowser {
         postMessageListeners: {
           ...snapshot.postMessageListeners,
           handlers: snapshot.postMessageListeners.handlers.map(h => ({
-            preview: redact(h.preview, runtimeSecrets),
+            preview: egress.redactText(h.preview, 'browser_result'),
             checksOrigin: h.checksOrigin,
           })),
         },
@@ -2651,7 +2683,7 @@ export class ScopedBrowser {
         exchangeIds,
         exchanges,
         durationMs: Date.now() - started,
-      }
+      })
     } finally {
       deadline.removeEventListener('abort', onAbort)
       await forceClose()
@@ -2996,7 +3028,7 @@ export class ScopedBrowser {
                 runId: cur.step.runId,
                 assignmentId: cur.step.assignmentId,
                 sessionGroupRole: cur.step.role,
-              }, parsedUrl.origin)
+              }, parsedUrl.origin, stepSecrets)
 
               const reqRecord: BrowserXhrRecord = {
                 method,
@@ -3447,13 +3479,14 @@ export class ScopedBrowser {
 
         const finalUrlRaw = page.url()
         const runtimeSecrets = [...stepSecrets, ...this.broker.getRegisteredSecrets()]
-        const finalUrl = redact(finalUrlRaw, runtimeSecrets)
-        const title = redact(await page.title().catch(() => ''), runtimeSecrets).slice(0, 300)
+        const egress = createEgressSanitizer({ secrets: runtimeSecrets })
+        const finalUrl = egress.redactText(finalUrlRaw, 'browser_result')
+        const title = egress.redactText(await page.title().catch(() => ''), 'browser_result').slice(0, 300)
         const primaryExchange = stepExchanges[0]
         let finalOrigin = stepOrigin
         try { finalOrigin = new URL(finalUrlRaw).origin } catch { /* keep stepOrigin */ }
         const redirectOrigins = primaryExchange?.redirectOrigins ?? [stepOrigin]
-        const initialRedactedUrl = redact(new URL(currentPathAndQuery, stepOrigin).href, runtimeSecrets)
+        const initialRedactedUrl = egress.redactText(new URL(currentPathAndQuery, stepOrigin).href, 'browser_result')
         const redirectSummary: BrowserRedirectSummary = {
           initialUrl: initialRedactedUrl,
           finalUrl,
@@ -3477,28 +3510,28 @@ export class ScopedBrowser {
         }
 
         const safeSelectorResult: BrowserSelectorResult | null = snapshot.selectorResult
-          ? { ...snapshot.selectorResult, textPreview: redact(snapshot.selectorResult.textPreview, runtimeSecrets) }
+          ? { ...snapshot.selectorResult, textPreview: egress.redactText(snapshot.selectorResult.textPreview, 'browser_result') }
           : null
         const safeFetchResult: BrowserFetchResult | null = snapshot.fetchResult
           ? {
               ...snapshot.fetchResult,
-              url: redact(snapshot.fetchResult.url, runtimeSecrets),
-              bodyPreview: redact(snapshot.fetchResult.bodyPreview, runtimeSecrets),
-              error: snapshot.fetchResult.error ? redact(snapshot.fetchResult.error, runtimeSecrets) : null,
+              url: egress.redactText(snapshot.fetchResult.url, 'browser_result'),
+              bodyPreview: egress.redactText(snapshot.fetchResult.bodyPreview, 'browser_result'),
+              error: snapshot.fetchResult.error ? egress.redactText(snapshot.fetchResult.error, 'browser_result') : null,
             }
           : null
         const safeSinkTraces: BrowserDomSinkTrace[] = (snapshot.sinkTraces ?? []).map(t => ({
           ...t,
-          preview: redact(t.preview, runtimeSecrets).slice(0, 400),
+          preview: egress.redactText(t.preview, 'browser_result').slice(0, 400),
         }))
 
-        results.push({
+        results.push(egress.sanitizeBrowserResult({
           origin: stepOrigin,
           finalUrl,
           title,
           status: stepExchanges[0]?.status ?? lastNavStatus,
-          domSnippet: redact(snapshot.domHtml, runtimeSecrets).slice(0, maxDomSnippetChars),
-          links: [...new Set(snapshot.links.map(l => redact(l, runtimeSecrets)))].slice(0, 120),
+          domSnippet: egress.redactText(snapshot.domHtml, 'browser_result').slice(0, maxDomSnippetChars),
+          links: [...new Set(snapshot.links.map(l => egress.redactText(l, 'browser_result')))].slice(0, 120),
           forms: snapshot.forms,
           xhrRequests: stepXhrRequests.slice(0, 100),
           allRequests: stepAllRequests.slice(0, 150),
@@ -3507,7 +3540,7 @@ export class ScopedBrowser {
           postMessageListeners: {
             ...snapshot.postMessageListeners,
             handlers: snapshot.postMessageListeners.handlers.map(h => ({
-              preview: redact(h.preview, runtimeSecrets),
+              preview: egress.redactText(h.preview, 'browser_result'),
               checksOrigin: h.checksOrigin,
             })),
           },
@@ -3528,7 +3561,7 @@ export class ScopedBrowser {
           exchangeIds: stepExchangeIds,
           exchanges: stepExchanges,
           durationMs: Date.now() - stepStarted,
-        })
+        }))
 
         if (step.role === 'control' || step.role === 'probe') {
           activeControlProbeRole = step.role
