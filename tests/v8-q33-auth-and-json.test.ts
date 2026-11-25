@@ -2,22 +2,19 @@
  * v8 Queue #33 Regression Suite — Derived Bearer/Cookie Injection, `json: null` Hydration,
  * and Non-JSON `capability.seal` `jsonPath` Fallback / Scrubbed Diagnostics.
  *
- * Defensive QA: exercises real loopback HTTP server + `VerifyRpcServer` + TS & Python SDKs
+ * Defensive QA: exercises real loopback HTTP server + `VerifyRpcServer` + TS SDK
  * to assert wire-level `Authorization: Bearer <rawToken>` and `Cookie:` headers across all
- * four call patterns, `hydrateExchange` / `Exchange` handling of `json: null` and BOM bodies,
+ * four call patterns, `hydrateExchange` handling of `json: null` and BOM bodies,
  * and non-JSON `capability.seal` diagnostics + regex fallback without ever leaking raw secrets.
  */
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { promisify } from 'node:util'
 
 import { scanSourceTreeForContamination } from '../scripts/check-v8-contamination.ts'
 import { RequestBroker } from '../src/server/broker.ts'
@@ -34,11 +31,9 @@ import {
 import { VerifyContext, hydrateExchange } from '../worker/guardian_verify/guardian_verify.ts'
 import type { HttpExchange } from '../worker/guardian_verify/guardian_verify.ts'
 
-const execFileAsync = promisify(execFile)
 process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const SDK_DIR = join(REPO_ROOT, 'worker', 'guardian_verify')
 
 const MINTED_SESSION_TOKEN = 'minted_sess_tok_q33_9a8b7c6d5e4f'
 const MINTED_HMAC_SECRET = 'hmac_key_q33_real_secret_123456'
@@ -299,11 +294,11 @@ test('derived session token injects Authorization: Bearer <rawToken> on wire acr
 })
 
 // ============================================================================
-// 2. `hydrateExchange` & Python `Exchange` `json: null` Bug
+// 2. `hydrateExchange` `json: null` Bug
 // ============================================================================
 
-test('TS hydrateExchange and Python Exchange parse valid JSON body even when raw.json is null (+ BOM & prove_* sub-exchanges)', async (t) => {
-  const { server, ctx } = await startRpc(t)
+test('TS hydrateExchange parses valid JSON body even when raw.json is null (+ BOM & prove_* sub-exchanges)', async (t) => {
+  const { ctx } = await startRpc(t)
 
   // Direct TS unit check: raw.json === null must fall through to parseJsonSafe(body)
   const withNullJson = hydrateExchange({
@@ -348,44 +343,6 @@ test('TS hydrateExchange and Python Exchange parse valid JSON body even when raw
   assert.equal(parsedRedacted.token_count, 5)
   assert.deepEqual(parsedRedacted.nested, { token: { type: 'string' } })
   assert.equal(redact('api_key = "super-secret-value"'), '[redacted]')
-
-  // Python SDK: Exchange with json=None + BOM + live all-4-patterns wire check
-  const workDir = mkdtempSync(join(tmpdir(), 'guardian-q33-py-'))
-  t.after(() => rmSync(workDir, { recursive: true, force: true }))
-  const pyScript = join(workDir, 'test_q33.py')
-  writeFileSync(pyScript, `
-import sys
-sys.path.insert(0, ${JSON.stringify(SDK_DIR)})
-from guardian_verify import Exchange, VerifyContext
-
-# 1. Exchange(json=None) with valid JSON body must parse .json and .data
-ex_null = Exchange({"exchangeId": "gx-py-1", "status": 200, "body": '{"ok":true,"n":7}', "json": None})
-assert ex_null.json == {"ok": True, "n": 7} and ex_null.data == {"ok": True, "n": 7}
-assert ex_null["json"] == {"ok": True, "n": 7}
-
-# 2. Live BOM + derived bearer injection across patterns
-ctx = VerifyContext()
-bom = ctx.http_send("/v1/bom-json")
-assert bom.json == {"status": "ok", "count": 3} and bom.data == {"status": "ok", "count": 3}
-
-mint = ctx.http_send("/v1/mint-session", method="POST", as_persona="member_b")
-cap = ctx.seal_capability(mint, "tok", json_path="$.token")
-r1 = ctx.http_send("/v1/me", capability=cap.handle)
-r2 = ctx.http_send("/v1/me", capability={"handle": cap.handle, "target": "bearer"}, as_persona="member_b")
-r3 = ctx.http_send("/v1/me", headers={"authorization": "Bearer " + cap.handle})
-for r in (r1, r2, r3):
-    assert r.status == 200 and r.json["actor"] == "minted", (r.status, r.body)
-print("PY_Q33_OK")
-`)
-  const env = {
-    ...process.env,
-    [VERIFY_RPC_SOCKET_ENV]: server.socketPath,
-    [VERIFY_RPC_TOKEN_ENV]: join(server.hostDir, 'token'),
-    [VERIFY_RPC_CONTEXT_ENV]: join(server.hostDir, 'context.json'),
-    [VERIFY_NONCE_ENV]: server.nonce,
-  }
-  const pyRun = await execFileAsync('python3', [pyScript], { env, timeout: 15_000 })
-  assert.match(pyRun.stdout, /PY_Q33_OK/)
 })
 
 // ============================================================================
@@ -447,7 +404,6 @@ test('LOC ceilings and zero v8 benchmark contamination hold', () => {
   const loc = (rel: string) => readFileSync(join(REPO_ROOT, rel), 'utf8').trimEnd().split('\n').length
   assert.ok(loc('src/server/verify-rpc.ts') <= 2300, `verify-rpc.ts LOC=${loc('src/server/verify-rpc.ts')} > 2300`)
   assert.ok(loc('worker/guardian_verify/guardian_verify.ts') <= 900, `guardian_verify.ts LOC=${loc('worker/guardian_verify/guardian_verify.ts')} > 900`)
-  assert.ok(loc('worker/guardian_verify/guardian_verify.py') <= 800, `guardian_verify.py LOC=${loc('worker/guardian_verify/guardian_verify.py')} > 800`)
 
   const scan = scanSourceTreeForContamination(REPO_ROOT)
   assert.equal(scan.ok, true, `Unexpected contamination: ${JSON.stringify(scan.hits)}`)

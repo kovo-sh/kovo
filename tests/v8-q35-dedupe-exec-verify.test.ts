@@ -50,7 +50,7 @@ type PersistFn = (input: {
   run: ReturnType<Store['run']>
   assignment: ReturnType<Store['makeWorker']>
   script: string
-  runtime: 'ts' | 'python'
+  runtime: 'ts'
   title?: string
   proof: AgentScriptProofResult
   secrets: readonly []

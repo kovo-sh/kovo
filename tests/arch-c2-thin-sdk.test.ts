@@ -1,12 +1,12 @@
 /**
- * Architecture Wave 3 Proposal C2 — thin-client worker SDKs.
+ * Architecture Wave 3 Proposal C2 — thin-client worker SDK.
  *
  * Defensive QA: differential probes against an intentional local loopback fixture. Verifies that
- *   1. both SDKs stay within tight LOC budgets and carry zero duplicated statistics / structural
+ *   1. the TS SDK stays within tight LOC budgets and carries zero duplicated statistics / structural
  *      normalization / oracle scoring (the host `verify-rpc.ts` is the single engine),
  *   2. every `ctx.prove_*` helper returns the authoritative host verdict (`prove.*` RPC), so the
  *      helper's `ok` can never diverge from the host transcript oracle, and
- *   3. TS + Python helper calls flow end-to-end through `verifyScript()` fresh double runs.
+ *   3. TS helper calls flow end-to-end through `verifyScript()` fresh double runs.
  */
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
@@ -136,32 +136,23 @@ const describeVerdict = (v: Awaited<ReturnType<typeof verifyScript>>) =>
 // 1. Static budgets: thin SDKs, single host engine
 // ---------------------------------------------------------------------------
 
-test('thin SDKs stay within LOC budgets and carry zero duplicated stats/normalization/oracle scoring', () => {
+test('thin SDK stays within LOC budget and carries zero duplicated stats/normalization/oracle scoring', () => {
   const ts = readFileSync(join(SDK_DIR, 'guardian_verify.ts'), 'utf8')
-  const py = readFileSync(join(SDK_DIR, 'guardian_verify.py'), 'utf8')
   const rpcSrc = readFileSync(join(REPO_ROOT, 'src/server/verify-rpc.ts'), 'utf8')
   const loc = (text: string) => text.trimEnd().split('\n').length
   assert.ok(loc(ts) <= 900, `guardian_verify.ts is ${loc(ts)} LOC (must be <= 900)`)
-  assert.ok(loc(py) <= 800, `guardian_verify.py is ${loc(py)} LOC (must be <= 800)`)
 
   for (const forbidden of [/\bmannWhitneyU\b/, /\bfunction erf\b/, /\bnormalCdf\b/, /\bfunction median\b/, /\bfunction mad\b/, /STRUCTURAL_[A-Z_]+_RE/, /normalizeStructuralTokens/, /\bchangedTokens\b/, /\btokenSet\b/]) {
     assert.equal(forbidden.test(ts), false, `guardian_verify.ts must not duplicate ${forbidden}`)
   }
-  for (const forbidden of [/def _mann_whitney/, /def _erf/, /def _normal_cdf/, /def _median/, /def _mad/, /_STRUCTURAL_RULES/, /normalize_structural_tokens/, /def _changed_tokens/, /def _token_set/]) {
-    assert.equal(forbidden.test(py), false, `guardian_verify.py must not duplicate ${forbidden}`)
-  }
-  // Both SDKs delegate every prove_* helper to the host `prove.*` RPCs.
+  // TS SDK delegates every prove_* helper to the host `prove.*` RPCs.
   for (const op of ['prove.accessBoundary', 'prove.persistedMutation', 'prove.differential', 'prove.oob', 'prove.race', 'prove.injection']) {
     assert.ok(ts.includes(`'${op}'`), `guardian_verify.ts must call ${op}`)
-    assert.ok(py.includes(`"${op}"`), `guardian_verify.py must call ${op}`)
     assert.ok(rpcSrc.includes(`op === '${op}'`), `verify-rpc.ts must dispatch ${op}`)
   }
   // Backward-compatible method names and aliases survive.
   for (const method of ['prove_access_boundary(', 'proveAccessBoundary(', 'prove_persisted_mutation(', 'prove_boolean_or_timing_diff(', 'prove_oob_callback(', 'prove_race_burst(', 'prove_injection_differential(', 'prove_composite(', 'proveComposite(', 'seal_capability(', 'hmac_sign(', 'jwt_sign(', 'await_async(']) {
     assert.ok(ts.includes(method), `guardian_verify.ts missing ${method}`)
-  }
-  for (const method of ['def prove_access_boundary', 'def proveAccessBoundary', 'def prove_persisted_mutation', 'def prove_boolean_or_timing_diff', 'def prove_oob_callback', 'def prove_race_burst', 'def prove_injection_differential', 'def prove_composite', 'def proveComposite', 'def seal_capability', 'def hmac_sign', 'def jwt_sign', 'def await_async']) {
-    assert.ok(py.includes(method), `guardian_verify.py missing ${method}`)
   }
 })
 
@@ -253,7 +244,7 @@ test('every prove_* helper verdict matches the host transcript oracle on vulnera
 })
 
 // ---------------------------------------------------------------------------
-// 3. End-to-end verifyScript() fresh double runs: TS + Python
+// 3. End-to-end verifyScript() fresh double runs: TS
 // ---------------------------------------------------------------------------
 
 test('TS SDK prove_access_boundary / prove_persisted_mutation / prove_boolean_or_timing_diff / prove_race_burst confirm through verifyScript()', async () => {
@@ -307,39 +298,7 @@ return ctx.result({ title: 'Concurrent duplicate redemption burst' })
   }
 })
 
-test('Python SDK prove_access_boundary / prove_persisted_mutation / prove_boolean_or_timing_diff / prove_race_burst confirm through verifyScript()', async () => {
-  reset()
-  const verdict = await verifyScript({
-    candidate: {
-      name: 'thin.py',
-      runtime: 'python',
-      code: `
-import time
-from guardian_verify import define, run
-
-def verify(ctx):
-    boundary = ctx.prove_access_boundary('bob', 'alice', '/items/1')
-    assert boundary['ok'] and boundary['confirmed'], boundary['missingEvidence']
-    assert boundary['control'].status == 403 and boundary['probe'].status == 200
-    value = int(time.time() * 1000) % 1000000
-    mutation = ctx.prove_persisted_mutation('/state/item', {'target': '/state/mutate', 'method': 'POST', 'body': {'balance': value}, 'as': 'alice'}, 'balance', value, read_persona='alice')
-    assert mutation['ok'], mutation['missingEvidence']
-    diff = ctx.prove_boolean_or_timing_diff('/diff?view=user', ('/diff?view=admin', {}), 'boolean', rounds=3)
-    assert diff['ok'], diff['missingEvidence']
-    race = ctx.proveRaceBurst([{'path': '/race/redeem', 'as': 'alice'}, {'path': '/race/redeem', 'as': 'alice'}])
-    assert race['ok'], race['missingEvidence']
-    return ctx.result('Mass assignment balance overwrite')
-
-run(define(verify=verify))
-`,
-    },
-    openAttempt: factory(),
-  })
-  assert.equal(verdict.confirmed, true, describeVerdict(verdict))
-  assert.equal(verdict.attempts[0]?.claimCount, 4)
-})
-
-test('TS and Python prove_composite return the authoritative host verdict and auto-record the host-signed claim (never claims_missing)', async () => {
+test('TS prove_composite returns the authoritative host verdict and auto-records the host-signed claim (never claims_missing)', async () => {
   const receipt = (exchangeVar: string, originVar: string) => `{
     chainId: 'chain-thin-sdk-single-hop',
     terminalVulnClass: 'dual_tenant_abac',
@@ -368,31 +327,4 @@ return ctx.result({ title: 'Single-hop composite (expected rejection)' })
   assert.equal(tsVerdict.reason, 'oracle_failed', describeVerdict(tsVerdict))
   assert.ok(tsVerdict.rejectedBy && tsVerdict.rejectedBy !== 'claims')
   assert.ok(tsVerdict.attempts.every(a => a.claimCount === 1))
-
-  const pyVerdict = await verifyScript({
-    candidate: {
-      name: 'composite.py',
-      runtime: 'python',
-      code: `
-h1 = ctx.http_send("/items/1", as_persona="alice", role="probe")
-verdict = ctx.proveComposite({
-    "chainId": "chain-thin-sdk-single-hop",
-    "terminalVulnClass": "dual_tenant_abac",
-    "hops": [{"hopId": "hop_1", "surface": "http", "target": {"origin": ctx.target_origin, "method": "GET", "pathAndQuery": "/items/1"}, "exchangeIds": [h1.exchange_id], "claimedDelta": "Read item as owner."}],
-    "causalEdges": [],
-    "terminalImpact": {"terminalHopId": "hop_1", "summary": "Single-hop read without any denied control or pivot.", "terminalExchangeId": h1.exchange_id},
-    "replayMode": "fresh_clean_replay",
-})
-assert verdict["ok"] is False and verdict["confirmed"] is False, verdict
-assert str(verdict["claim"]["verificationId"]).startswith("gc-"), verdict
-assert verdict["rejectedBy"] and verdict["missingEvidence"], verdict
-assert ctx.claims == []
-return ctx.result("Single-hop composite (expected rejection)")
-`,
-    },
-    openAttempt: factory(),
-  })
-  assert.equal(pyVerdict.confirmed, false)
-  assert.equal(pyVerdict.reason, 'oracle_failed', describeVerdict(pyVerdict))
-  assert.equal(pyVerdict.rejectedBy, tsVerdict.rejectedBy, 'TS and Python must surface the identical host rejection')
 })

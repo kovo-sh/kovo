@@ -3,15 +3,15 @@
  *
  *  1. Auth Bypass / Forged-Token ProofReceipt (`CWE-287` / `CWE-347`):
  *     - Positive: `auth_bypass`, `jwt_forgery`, `broken_auth`, `auth_protocol` via `verifyReceipt`,
- *       `buildAgentScriptReceipt`, and live `ctx.prove_access_boundary` (TS & Python) with 401/403
+ *       `buildAgentScriptReceipt`, and live `ctx.prove_access_boundary` (TS) with 401/403
  *       control and distinct bypass header / forged JWT / bypass query param returning structured
  *       private/account JSON data.
  *     - Fail-closed negative: normal vault-persona login crossing anon-401, public endpoint (200
  *       control), status-only/empty/boilerplate `{ok:true}`/error-only/HTML-shell probe responses,
  *       no request differential, AND cross-tenant BOLA write with anon-401 still strictly rejected.
  *  2. Conserved-Balance / Race `ctx.prove_race_burst` Wiring (`CWE-362`):
- *     - Positive: `ctx.prove_race_burst({ requests, readRoute, balanceField, unitDebit })` in TS &
- *       Python automatically executes baseline GET -> burst -> post GET -> serial control (+ serial
+ *     - Positive: `ctx.prove_race_burst({ requests, readRoute, balanceField, unitDebit })` in TS
+ *       automatically executes baseline GET -> burst -> post GET -> serial control (+ serial
  *       post GET) and emits a `race` claim that passes BOTH Layer-3 `verifyScript` AND
  *       `buildAgentScriptReceipt` + `verifyReceipt` (`conserved_balance` rule) for under-debit,
  *       negative-stock partial-win (2xx + 409), and single-use over-credit races.
@@ -34,11 +34,7 @@
  *       write methods (`PATCH /api/tickets/:id`) distinct when method-scoped.
  */
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { promisify } from 'node:util'
-
-const execFileAsync = promisify(execFile)
 import { once } from 'node:events'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { createServer } from 'node:http'
@@ -379,7 +375,7 @@ test('Seam 1: auth_bypass & jwt_forgery ProofReceipts confirm valid bypasses and
   assert.equal(pureAnonWriteVerdict.confirmed, false, 'cross-tenant BOLA write with anon-401 control MUST still fail closed')
 })
 
-test('Seam 1 end-to-end: ctx.prove_access_boundary (TS & Python) confirms forged-JWT auth bypass through verifyScript + ProofReceipt', async t => {
+test('Seam 1 end-to-end: ctx.prove_access_boundary (TS) confirms forged-JWT auth bypass through verifyScript + ProofReceipt', async t => {
   const server = createServer((req, res) => {
     const auth = req.headers.authorization ?? ''
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -471,31 +467,13 @@ return ctx.result({ title: 'Unsigned JWT authentication bypass (CWE-347)', sever
     restore()
     await rpcServer.close()
   }
-
-  // Python inline script via verifyScript
-  const pyVerdict = await verifyScript({
-    candidate: {
-      name: 'jwt-bypass.py',
-      runtime: 'python',
-      code: `
-ctx.prove_access_boundary(
-    route="/api/v1/admin/profile",
-    vuln_class="jwt_forgery",
-    probe_options={"headers": {"authorization": "Bearer eyJhbGciOiJub25lIn0.eyJyb2xlIjoiYWRtaW4ifQ."}},
-)
-result = ctx.result("Unsigned JWT auth bypass (CWE-347)", severity="critical")
-`,
-    },
-    openAttempt: makeFactory(),
-  })
-  assert.equal(pyVerdict.confirmed, true, `${pyVerdict.reason}: ${pyVerdict.detail}`)
 })
 
 // ============================================================================
 // SEAM 2: Conserved-Balance / Race ctx.prove_race_burst Wiring (CWE-362)
 // ============================================================================
 
-test('Seam 2 end-to-end: ctx.prove_race_burst with readRoute emits conserved_balance ProofReceipt in TS & Python (and fails closed when conserved)', async t => {
+test('Seam 2 end-to-end: ctx.prove_race_burst with readRoute emits conserved_balance ProofReceipt in TS (and fails closed when conserved)', async t => {
   const state = { balance: 100, vulnerable: true, seq: 0, inFlight: 0, burstWindowActive: false }
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -629,62 +607,6 @@ test('Seam 2 end-to-end: ctx.prove_race_burst with readRoute emits conserved_bal
   } finally {
     restoreSafe()
     await rpcSafe.close()
-  }
-
-  // 2c. Positive Python SDK parity -> buildAgentScriptReceipt + verifyReceipt
-  state.balance = 100
-  state.vulnerable = true
-  const rpcPy = new VerifyRpcServer({
-    broker: new RequestBroker({ rejectUnauthorized: false }),
-    grant,
-    runId: 'run-race-py',
-    assignmentId: 'assign-race-py',
-    nonce: randomUUID(),
-    targetOrigins: [origin],
-  })
-  await rpcPy.start()
-  const restorePy = bindRpcEnv(rpcPy)
-  try {
-    const { stdout: pyOut } = await execFileAsync(
-      'python3',
-      [
-        '-c',
-        `
-import json, sys
-sys.path.insert(0, ${JSON.stringify(SDK_DIR)})
-from guardian_verify import VerifyContext
-ctx = VerifyContext()
-proof = ctx.prove_race_burst(
-    requests=[
-        {"path": "/api/v1/wallet/redeem", "method": "POST", "body": {"amount": 10}, "as": "alice"},
-        {"path": "/api/v1/wallet/redeem", "method": "POST", "body": {"amount": 10}, "as": "alice"},
-        {"path": "/api/v1/wallet/redeem", "method": "POST", "body": {"amount": 10}, "as": "alice"},
-    ],
-    read_route="/api/v1/wallet",
-    balance_field="balance",
-    unit_debit=10,
-)
-print(json.dumps({"ok": proof["ok"], "claims": ctx.claims}))
-`,
-      ],
-      { encoding: 'utf8', env: process.env },
-    )
-    const parsed = JSON.parse(pyOut) as { ok: boolean; claims: Record<string, unknown>[] }
-    assert.equal(parsed.ok, true)
-    const built = buildAgentScriptReceipt({
-      origin,
-      title: 'Python wallet double-spend (CWE-362)',
-      exchanges: transcriptToScriptExchanges(rpcPy),
-      claims: parsed.claims,
-    })
-    assert.ok(built)
-    const verification = verifyReceipt(built.receipt, built.transcript)
-    assert.equal(verification.confirmed, true, verification.reason)
-    assert.equal(verification.rule, 'conserved_balance')
-    assert.equal(verification.evidence?.violationKind, 'under_debit')
-  } finally {
-    restorePy()
-    await rpcPy.close()
   }
 })
 
@@ -950,27 +872,6 @@ return ctx.result({ title: 'Server-side template injection in render (CWE-1336)'
     restoreBare500()
     await rpcBare500.close()
   }
-
-  // 3f. Python parity: POST SSTI via verifyScript
-  const pySsti = await verifyScript({
-    candidate: {
-      name: 'post-ssti.py',
-      runtime: 'python',
-      code: `
-ctx.prove_injection_differential(
-    path="/api/v1/templates/render",
-    method="POST",
-    control_body={"template": "hello-world"},
-    probe_body={"template": "{{739*740}}"},
-    expected_output="546860",
-    vuln_class="ssti",
-)
-result = ctx.result("Python POST SSTI (CWE-1336)", severity="critical")
-`,
-    },
-    openAttempt: makeFactory(),
-  })
-  assert.equal(pySsti.confirmed, true, `${pySsti.reason}: ${pySsti.detail}`)
 })
 
 // ============================================================================

@@ -15,7 +15,7 @@
  *     Zero-FP Hardened-Twin rule) for chain/multi-hop briefs within budget, and omits it on
  *     single-hop briefs.
  *  4. Every SDK snippet field name in `src/skills/multihop-chains.md` and `MULTIHOP_MODE_A_TS_RECIPE`
- *     matches live `worker/guardian_verify/guardian_verify.ts`, `guardian_verify.py`,
+ *     matches live `worker/guardian_verify/guardian_verify.ts`,
  *     `src/server/verify-rpc.ts`, and `compositeProofReceiptSchema` (zero stale field names).
  */
 import assert from 'node:assert/strict'
@@ -262,13 +262,12 @@ test('assignment-brief renders Mode-A prove_composite contract and Attacker-Orig
 // 4. Schema & live SDK signature alignment + zero contamination
 // ============================================================================
 
-test('multihop-chains.md and Mode-A recipe match live guardian_verify.ts, guardian_verify.py, verify-rpc.ts, and compositeProofReceiptSchema', () => {
+test('multihop-chains.md and Mode-A recipe match live guardian_verify.ts, verify-rpc.ts, and compositeProofReceiptSchema', () => {
   clearSkillsCache()
   const playbook = loadSkill(MULTIHOP_CHAINS_SKILL)?.content ?? ''
   assert.ok(playbook.length > 0)
 
   const tsSdk = readFileSync(resolve(REPO_ROOT, 'worker/guardian_verify/guardian_verify.ts'), 'utf8')
-  const pySdk = readFileSync(resolve(REPO_ROOT, 'worker/guardian_verify/guardian_verify.py'), 'utf8')
   const verifyRpc = readFileSync(resolve(REPO_ROOT, 'src/server/verify-rpc.ts'), 'utf8')
   const compositeSrc = readFileSync(resolve(REPO_ROOT, 'src/server/composite-receipt.ts'), 'utf8')
 
@@ -336,24 +335,6 @@ test('multihop-chains.md and Mode-A recipe match live guardian_verify.ts, guardi
     assert.ok(playbook.includes(field), `multihop-chains.md missing live field ${field}`)
     assert.ok(tsSdk.includes(field), `guardian_verify.ts missing field ${field}`)
     assert.ok(verifyRpc.includes(field), `verify-rpc.ts missing field ${field}`)
-  }
-
-  // Python SDK snake_case parameter names documented in multihop-chains.md must exist in guardian_verify.py.
-  for (const pyField of [
-    'def seal_capability',
-    'hop_receipt_id',
-    'json_path',
-    'def hmac_sign',
-    'secret_handle',
-    'def jwt_sign',
-    'def await_async',
-    'poll_request',
-    'match_predicate',
-    'trigger_exchange_id',
-    'correlation_id',
-    'def prove_composite',
-  ]) {
-    assert.ok(pySdk.includes(pyField), `guardian_verify.py missing ${pyField}`)
   }
 
   // Every CompositeProofReceipt field taught in multihop-chains.md must exist in composite-receipt.ts.

@@ -1,23 +1,20 @@
 /**
  * v8 Queue #27 — SDK Ergonomics & Documented Recipe Tests (Defect #3 from #391).
  *
- * Defensive QA: loopback fixture + real `VerifyRpcServer` exercising both TypeScript and Python
- * `guardian_verify` SDKs across positional, single-dict, snake_case, camelCase, and flat-arg
- * calling conventions, `_AttrDict` attribute/key dual access, result aliases (`.handle`/`.token`/
+ * Defensive QA: loopback fixture + real `VerifyRpcServer` exercising the TypeScript
+ * `guardian_verify` SDK across positional, single-object, snake_case, camelCase, and flat-arg
+ * calling conventions, result aliases (`.handle`/`.token`/
  * `.derivedHandle`/`.cap_id`), and documented recipe accuracy in `multihop-chains.md` and
  * `agent-prompts.ts`.
  */
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
 import { createHmac, randomUUID } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { promisify } from 'node:util'
 
 import {
   GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
@@ -38,7 +35,6 @@ import {
 import { scanSourceTreeForContamination } from '../scripts/check-v8-contamination.ts'
 import { VerifyContext } from '../worker/guardian_verify/guardian_verify.ts'
 
-const execFileAsync = promisify(execFile)
 process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -262,149 +258,13 @@ test('TS SDK hmac_sign, jwt_sign, and await_async support options objects, posit
   assert.equal(polFlatStrUntil.converged, true)
 })
 
-test('Python SDK _AttrDict dual access + snake_case/camelCase kwargs, single-dict, positional, flat await_async, and aliases', async (t) => {
-  pollCounts.clear()
-  const server = new VerifyRpcServer({
-    broker: new RequestBroker({ transportConfig: { http2: false } }),
-    grant: makeGrant(),
-    runId: `run-q27-py-${randomUUID().slice(0, 8)}`,
-    assignmentId: 'assign-q27-py',
-    targetOrigins: [origin],
-  })
-  await server.start()
-  t.after(() => server.close())
-
-  const workDir = mkdtempSync(join(tmpdir(), 'guardian-q27-py-'))
-  t.after(() => rmSync(workDir, { recursive: true, force: true }))
-
-  const pyScript = join(workDir, 'test_ergo.py')
-  writeFileSync(pyScript, `
-import hashlib, hmac, json, sys
-sys.path.insert(0, ${JSON.stringify(SDK_DIR)})
-from guardian_verify import VerifyContext
-
-ctx = VerifyContext()
-h1 = ctx.http_send("/api/v1/service-meta", as_persona="member_b", role="probe")
-
-# 1. seal_capability: positional, single-dict, camelCase kwargs, snake_case kwargs + _AttrDict dual access
-c1 = ctx.seal_capability(h1, "k1", hop_receipt_id="p1", json_path="$.signingKey", kind="hmac_key")
-c2 = ctx.seal_capability({"exchange": h1, "slot": "k2", "hopReceiptId": "p2", "jsonPath": "$.signingKey", "kind": "hmac_key"})
-c3 = ctx.seal_capability(exchange=h1, slot="k3", hopReceiptId="p3", jsonPath="$.signingKey", kind="hmac_key")
-c4 = ctx.seal_capability(exchange_id=h1.exchange_id, slot="k4", hop_receipt_id="p4", json_path="$.signingKey", kind="hmac_key")
-for cap, expected_h in ((c1, "cap:hop_p1:k1"), (c2, "cap:hop_p2:k2"), (c3, "cap:hop_p3:k3"), (c4, "cap:hop_p4:k4")):
-    assert cap["handle"] == expected_h
-    assert cap.handle == expected_h
-    assert cap.cap_id == expected_h
-    assert cap["cap_id"] == expected_h
-    assert cap.exchangeId == h1.exchange_id
-    assert cap.exchange_id == h1.exchange_id
-
-# 2. hmac_sign: positional, single-dict, camelCase kwargs, snake_case kwargs + _AttrDict dual access
-payload = json.dumps({"action": "export", "tenant": "org_a"}, separators=(",", ":"))
-expected_sig = hmac.new(${JSON.stringify(SIGNING_KEY)}.encode(), payload.encode(), hashlib.sha256).hexdigest()
-
-s1 = ctx.hmac_sign(c1.handle, payload, "sha256", "hex")
-s2 = ctx.hmac_sign({"secretHandle": c1.handle, "payload": payload, "alg": "sha256"})
-s3 = ctx.hmac_sign({"keyHandle": c1.handle, "message": payload, "algorithm": "sha256"})
-s4 = ctx.hmac_sign(secretHandle=c1.handle, payload=payload, algorithm="sha256")
-s5 = ctx.hmac_sign(secret_handle=c1.handle, body={"action": "export", "tenant": "org_a"}, alg="sha256")
-for s in (s1, s2, s3, s4):
-    assert s["signature"] == expected_sig
-    assert s.signature == expected_sig
-    assert s.handle == expected_sig
-    assert s.derivedHandle == expected_sig
-    assert s.exchangeId == s["exchangeId"]
-    assert s.exchange_id == s["exchangeId"]
-assert len(s5.signature) == 64
-
-# 3. jwt_sign: positional, single-dict, camelCase kwargs, snake_case kwargs + .handle/.token aliases
-j1 = ctx.jwt_sign(c1.handle, {"sub": "svc", "scope": "export"}, "HS256", hop_receipt_id="j1", slot="jwt1")
-j2 = ctx.jwt_sign({"secretHandle": c1.handle, "claims": {"sub": "svc", "scope": "export"}, "alg": "HS256", "hopReceiptId": "j2", "slot": "jwt2"})
-j3 = ctx.jwt_sign(secretHandle=c1.handle, claims={"sub": "svc", "scope": "export"}, algorithm="HS256", hopReceiptId="j3", slot="jwt3")
-j4 = ctx.jwt_sign(keyHandle=c1.handle, payload={"sub": "svc", "scope": "export"}, alg="HS256", hop_receipt_id="j4", slot="jwt4")
-for j in (j1, j2, j3, j4):
-    assert j["derivedHandle"].startswith("cap:hop_")
-    assert j.derivedHandle == j["derivedHandle"]
-    assert j.handle == j.derivedHandle
-    assert j.token == j.derivedHandle
-    assert j["handle"] == j.derivedHandle
-    assert j["token"] == j.derivedHandle
-
-# Inject via .token alias against fixture
-pre = ctx.http_send("/api/v1/exports/foreign-item", as_persona="member_b", role="control")
-assert pre.status == 403
-readback = ctx.http_send("/api/v1/exports/foreign-item", capability=j3.token, role="probe")
-assert readback.status == 200
-assert readback.consumed_capability_id == j3.derivedHandle
-
-# 4. await_async: positional nested, single-dict nested, single-dict flat, flat kwargs + _AttrDict dual access
-trig = ctx.http_send("/api/v1/webhooks/trigger", method="POST", as_persona="member_b", role="probe", headers={"x-signature": s1.signature, "content-type": "application/json"}, body=payload)
-assert trig.status == 200
-
-p1 = ctx.await_async({"path": "/api/v1/jobs/py-pos", "as_persona": "member_b", "role": "probe"}, {"status": 200, "jsonPath": "$.state", "equals": "ready"}, timeout_ms=3000, interval_ms=20, trigger_exchange_id=trig.exchange_id, correlation_id="py-pos")
-p2 = ctx.await_async({"pollRequest": {"path": "/api/v1/jobs/py-dict-nested", "persona": "member_b"}, "matchPredicate": {"status": 200}, "timeoutMs": 3000, "intervalMs": 20, "triggerExchangeId": trig.exchange_id, "correlationId": "py-dict-nested"})
-p3 = ctx.await_async({"path": "/api/v1/jobs/py-dict-flat", "method": "GET", "persona": "member_b", "headers": {"x-probe": "flat-py"}, "expectStatus": 200, "timeoutMs": 3000, "intervalMs": 20})
-p4 = ctx.await_async(url=${JSON.stringify(origin)} + "/api/v1/jobs/py-kw-flat", method="GET", persona="member_b", until={"json_path": "$.state", "equals": "ready"}, timeout_ms=3000, interval_ms=20)
-for p in (p1, p2, p3, p4):
-    assert p["converged"] is True
-    assert p.converged is True
-    assert p.pollRecordId == p["pollRecordId"]
-    assert p.poll_record_id == p["pollRecordId"]
-    assert p.exchange.exchangeId == p["exchange"]["exchangeId"]
-    assert p.exchange.status == 200
-assert '"probeHeader":"flat-py"' in p3.exchange.body
-
-# Sealing directly from p3.exchange works too
-dl_cap = ctx.seal_capability(p3.exchange, "dl_tok", hop_receipt_id="p5", json_path="$.downloadToken", kind="bearer_token")
-assert dl_cap.handle == "cap:hop_p5:dl_tok"
-
-# 5. prove_composite returns _AttrDict supporting both dict & attribute access
-verdict = ctx.prove_composite({
-    "chainId": "py-q27-ergo-chain",
-    "terminalVulnClass": "cross_surface_pivot",
-    "hops": [
-        {"hopId": "hop_1", "surface": "http", "target": {"origin": ctx.target_origin, "method": "GET", "pathAndQuery": "/api/v1/service-meta"}, "exchangeIds": [h1.exchange_id], "claimedDelta": "Obtain key."},
-        {"hopId": "hop_2", "surface": "webhook", "target": {"origin": ctx.target_origin, "method": "POST", "pathAndQuery": "/api/v1/webhooks/trigger"}, "exchangeIds": [j3.exchangeId], "claimedDelta": "Mint JWT."},
-        {"hopId": "hop_3", "surface": "http", "target": {"origin": ctx.target_origin, "method": "GET", "pathAndQuery": "/api/v1/exports/foreign-item"}, "exchangeIds": [readback.exchange_id], "claimedDelta": "Read foreign record."},
-    ],
-    "causalEdges": [
-        {"kind": "derived_crypto_binding", "fromHopId": "hop_1", "toHopId": "hop_2", "sourceCapabilityId": c1.handle, "derivedCapabilityId": j3.handle, "alg": "HS256"},
-        {"kind": "value_binding", "fromHopId": "hop_2", "toHopId": "hop_3", "capabilityHandle": j3.token},
-    ],
-    "terminalImpact": {
-        "terminalHopId": "hop_3",
-        "claimedImpact": "Cross-tenant export readback.",
-        "preChainControlExchangeIds": [pre.exchange_id],
-        "postChainReadbackExchangeIds": [readback.exchange_id],
-    },
-})
-assert verdict["confirmed"] is True, verdict
-assert verdict.confirmed is True
-assert verdict.ok is True
-assert verdict.verified is True
-print("PY_ERGO_OK")
-`)
-
-  const env = {
-    ...process.env,
-    [VERIFY_RPC_SOCKET_ENV]: server.socketPath,
-    [VERIFY_RPC_TOKEN_ENV]: join(server.hostDir, 'token'),
-    [VERIFY_RPC_CONTEXT_ENV]: join(server.hostDir, 'context.json'),
-    [VERIFY_NONCE_ENV]: server.nonce,
-  }
-  const pyRun = await execFileAsync('python3', [pyScript], { env, timeout: 15_000 })
-  assert.match(pyRun.stdout, /PY_ERGO_OK/)
-})
-
 test('Documented recipes use valid DERIVED_SECRET_KINDS, stay within LOC/byte budgets, and have zero contamination', () => {
   const playbook = readFileSync(join(REPO_ROOT, 'src/skills/multihop-chains.md'), 'utf8')
   const prompts = readFileSync(join(REPO_ROOT, 'src/server/agent-prompts.ts'), 'utf8')
   const tsSdk = readFileSync(join(SDK_DIR, 'guardian_verify.ts'), 'utf8')
-  const pySdk = readFileSync(join(SDK_DIR, 'guardian_verify.py'), 'utf8')
 
   const loc = (text: string) => text.trimEnd().split('\n').length
   assert.ok(loc(tsSdk) <= 900, `guardian_verify.ts is ${loc(tsSdk)} LOC (> 900)`)
-  assert.ok(loc(pySdk) <= 800, `guardian_verify.py is ${loc(pySdk)} LOC (> 800)`)
 
   const guidance = guardianVerifyHelperGuidance()
   assert.ok(
