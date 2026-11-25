@@ -2869,8 +2869,13 @@ export class RequestBroker {
       })
       const contractApplies = effectiveScopePolicy.mode !== 'ephemeral_lab'
       const verifiedGraphqlRead = req.method === 'POST' &&
+        !hasMultipart && !hasMultipartContentType && !hasCompressedBody &&
         isVerifiedReadOnlyGraphqlQuery(req.pathAndQuery, req.body ?? null, req.headers)
       const isStructuralMutation = req.method === 'DELETE' || hasMultipart || hasMultipartContentType || hasCompressedBody
+      // Durable route leases can never pre-authorize race bursts or compressed bodies: race bursts
+      // must consume their exact single-use burst quota and compressed bodies always escalate.
+      const leaseAuthorizesRoute = !options.raceBurst && !hasCompressedBody &&
+        grant.approvalLeases?.(initialOrigin, req.method, req.pathAndQuery) === true
       const sandboxPostAllowed = !hasMultipart && !hasMultipartContentType &&
         req.method === 'POST' && tier === 2 &&
         grant.sandboxWriteAllowlist !== undefined &&
@@ -2881,20 +2886,19 @@ export class RequestBroker {
           contractApproved = contractApplies
         } else if (approvalMeta.explicitEnvironmentMode) {
           // Explicit v6 environment contract (or ephemeral lab): preserve contract semantics verbatim.
-          contractApproved = contractApplies ||
-            grant.approvalLeases?.(initialOrigin, req.method, req.pathAndQuery) === true
+          contractApproved = contractApplies || leaseAuthorizesRoute
         } else if (!contractApplies) {
-          contractApproved = grant.approvalLeases?.(initialOrigin, req.method, req.pathAndQuery) === true
+          contractApproved = leaseAuthorizesRoute
         } else if (approvalMeta.effectivePolicy === 'yolo') {
           contractApproved = true
         } else if (approvalMeta.effectivePolicy === 'strict') {
-          contractApproved = grant.approvalLeases?.(initialOrigin, req.method, req.pathAndQuery) === true
+          contractApproved = leaseAuthorizesRoute
         } else {
           // auto_review: durable leases and safe tagged writes auto-approve; DELETE / multipart /
-          // compressed requests still flow through approvalPatterns / Safety Judge / HITL.
+          // compressed / race-burst requests still flow through approvalPatterns / Safety Judge / HITL.
           contractApproved =
-            grant.approvalLeases?.(initialOrigin, req.method, req.pathAndQuery) === true ||
-            !isStructuralMutation
+            leaseAuthorizesRoute ||
+            (!isStructuralMutation && !options.raceBurst)
         }
       } else {
         // A durable operator lease may authorize a route the environment contract would otherwise
@@ -2903,8 +2907,7 @@ export class RequestBroker {
           decision.code !== 'out_of_scope' &&
           decision.code !== 'auth_origin_active_probe' &&
           decision.code !== 'asset_origin_active_probe'
-        const leased = leaseEligible &&
-          grant.approvalLeases?.(initialOrigin, req.method, req.pathAndQuery) === true
+        const leased = leaseEligible && leaseAuthorizesRoute
         if (leased) {
           contractApproved = true
         } else if (decision.code === 'readonly_environment' && sandboxPostAllowed) {
@@ -3868,6 +3871,10 @@ export class RequestBroker {
       uniqueOrigins.add(origin)
     }
 
+    // Prepare and authorize EVERY request up-front before releasing any bytes onto the wire,
+    // so an unapproved or denied sibling never lets an earlier batch item transmit.
+    const preparedList = reqs.map(req => ({ req, prepared: this.prepareHttpRequest(req, grant) }))
+
     for (const origin of uniqueOrigins) {
       const state = this.health(origin, resolveGrantMaxRps(grant, 5))
       state.batchActive = true
@@ -3875,7 +3882,9 @@ export class RequestBroker {
       state.tokens = Math.max(state.tokens, reqs.length)
     }
     try {
-      return await Promise.all(reqs.map(req => this.executeHttpInternal(req, grant, signal, true)))
+      return await Promise.all(
+        preparedList.map(({ req, prepared }) => this.executePreparedHttp(prepared, req, grant, signal, { bypassConcurrency: true })),
+      )
     } finally {
       for (const origin of uniqueOrigins) {
         const state = this.origins.get(origin)

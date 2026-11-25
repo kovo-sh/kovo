@@ -33,6 +33,18 @@ export interface Tier3ApprovalRequest {
   headers?: Record<string, string>
 }
 
+export interface Tier3ApprovalPlanTarget {
+  origin: string
+  method: string
+  pathAndQuery: string
+  personaHandle: string | null
+  bodyPreview: string | null
+  bodyHash: string | null
+  headers?: Record<string, string>
+  hasMultipart: boolean
+  instances: number
+}
+
 export interface Tier3ApprovalPlan {
   primary: {
     origin: string
@@ -45,32 +57,36 @@ export interface Tier3ApprovalPlan {
     hasMultipart: boolean
     approvalInstances: number
   }
-  additional: Array<{
-    origin: string
-    method: string
-    pathAndQuery: string
-    personaHandle: string | null
-    bodyHash: string | null
-    hasMultipart: boolean
-    instances: number
-  }>
+  /** Every distinct state-changing target in the group, in first-seen order; each must be evaluated individually. */
+  targets: Tier3ApprovalPlanTarget[]
+  additional: Tier3ApprovalPlanTarget[]
 }
 
 /**
  * Group the exact requests of a synchronized operation (race burst / batch) by ledger
  * fingerprint. Identical request instances share a fingerprint and therefore a single approval
- * target carrying `instances = N`; each instance still consumes its own single-use grant.
+ * target carrying `instances = N`; each distinct target is returned in `targets` with its full
+ * request metadata so EVERY distinct target is evaluated individually (never smuggled under a
+ * benign primary target).
  */
 export function planTier3ApprovalTargets(
   run: Run,
   requests: ReadonlyArray<Tier3ApprovalRequest>,
   options: { isRaceBurst?: boolean } = {},
 ): Tier3ApprovalPlan {
-  const isReadOnly = (method: string, multipart: boolean) =>
-    !multipart && (method.toUpperCase() === 'GET' || method.toUpperCase() === 'HEAD' || method.toUpperCase() === 'OPTIONS')
+  const isReadOnly = (method: string, multipart: boolean, body: string | null) => {
+    if (multipart) return false
+    const upper = method.toUpperCase()
+    if (upper === 'GET' || upper === 'HEAD') return true
+    if (upper === 'OPTIONS') return body === null || body === ''
+    return false
+  }
   const describe = (request: Tier3ApprovalRequest) => {
     const hasMultipart = Boolean(request.multipartParts?.length) ||
       hasDeclaredMultipartContentType(request.headers)
+    const contentEncoding = Object.entries(request.headers ?? {})
+      .find(([k]) => k.toLowerCase() === 'content-encoding')?.[1]?.trim() ?? ''
+    const hasCompressedBody = contentEncoding !== '' && !/^identity$/i.test(contentEncoding)
     return {
       origin: request.origin,
       method: request.method,
@@ -78,12 +94,13 @@ export function planTier3ApprovalTargets(
       personaHandle: request.persona ?? null,
       bodyHash: computeStateChangeBodyHash(request.body ?? null, request.multipartParts),
       hasMultipart,
+      hasCompressedBody,
       bodyPreview: request.body ?? null,
       headers: request.headers,
     }
   }
   const described = requests.map(describe)
-  const fingerprintOf = (target: ReturnType<typeof describe>) => buildStateChangeFingerprint({
+  const groupKeyOf = (target: ReturnType<typeof describe>) => `${buildStateChangeFingerprint({
     runId: run.id,
     origin: target.origin,
     method: target.method,
@@ -94,32 +111,41 @@ export function planTier3ApprovalTargets(
     hasMultipart: target.hasMultipart,
     isRaceBurst: Boolean(options.isRaceBurst),
     isRceProof: false,
-  })
-  // Prefer a state-changing request as the judge/operator-facing primary; fall back to the first.
-  const primaryIndex = Math.max(0, described.findIndex(target => !isReadOnly(target.method, target.hasMultipart)))
+  })}\0${target.hasCompressedBody ? 'compressed' : 'plain'}`
+  // Prefer a state-changing request as the first target; fall back to the first request.
+  const primaryIndex = Math.max(0, described.findIndex(target => !isReadOnly(target.method, target.hasMultipart, target.bodyPreview)))
   const groups = new Map<string, { target: ReturnType<typeof describe>; instances: number }>()
   for (const target of described) {
-    if (isReadOnly(target.method, target.hasMultipart)) continue
-    const key = fingerprintOf(target)
+    if (isReadOnly(target.method, target.hasMultipart, target.bodyPreview)) continue
+    const key = groupKeyOf(target)
     const existing = groups.get(key)
     if (existing) existing.instances += 1
     else groups.set(key, { target, instances: 1 })
   }
   const primaryTarget = described[primaryIndex]!
-  const primaryKey = fingerprintOf(primaryTarget)
+  const primaryKey = groupKeyOf(primaryTarget)
   const primaryGroup = groups.get(primaryKey)
-  const additional: Tier3ApprovalPlan['additional'] = []
-  for (const [key, group] of groups) {
-    if (key === primaryKey) continue
-    additional.push({
-      origin: group.target.origin,
-      method: group.target.method,
-      pathAndQuery: group.target.pathAndQuery,
-      personaHandle: group.target.personaHandle,
-      bodyHash: group.target.bodyHash,
-      hasMultipart: group.target.hasMultipart,
-      instances: group.instances,
-    })
+  const toPlanTarget = (target: ReturnType<typeof describe>, instances: number): Tier3ApprovalPlanTarget => ({
+    origin: target.origin,
+    method: target.method,
+    pathAndQuery: target.pathAndQuery,
+    personaHandle: target.personaHandle,
+    bodyPreview: target.bodyPreview,
+    bodyHash: target.bodyHash,
+    headers: target.headers,
+    hasMultipart: target.hasMultipart,
+    instances,
+  })
+  const targets: Tier3ApprovalPlanTarget[] = []
+  const additional: Tier3ApprovalPlanTarget[] = []
+  if (groups.size === 0) {
+    targets.push(toPlanTarget(primaryTarget, 1))
+  } else {
+    for (const [key, group] of groups) {
+      const entry = toPlanTarget(group.target, group.instances)
+      targets.push(entry)
+      if (key !== primaryKey) additional.push(entry)
+    }
   }
   return {
     primary: {
@@ -133,6 +159,7 @@ export function planTier3ApprovalTargets(
       hasMultipart: primaryTarget.hasMultipart,
       approvalInstances: primaryGroup?.instances ?? 1,
     },
+    targets,
     additional,
   }
 }
@@ -208,44 +235,34 @@ export type StateChangeApprovalTarget = {
 /**
  * Register the exact, single-use grant a decision just authorized. The immediate broker retry
  * consumes it only when origin/method/path/persona/body/flag fingerprint and scope revision match.
+ *
+ * Distinct sibling targets are NEVER granted from a single decision: callers must evaluate and
+ * approve each distinct target individually before calling `registerStateChangeGrant`.
  */
 export function registerStateChangeGrant(
   ledger: StateChangeApprovalLedger,
   burstInstances: BurstApprovalInstances,
   run: Run,
   input: StateChangeApprovalInput,
-  additional: StateChangeApprovalTarget[] = [],
 ): void {
   const primaryBodyHash = input.bodyHash ?? computeStateChangeBodyHash(input.bodyPreview ?? null)
-  const targets = [
-    { ...input, bodyHash: primaryBodyHash },
-    ...additional.map(target => ({
-      ...target,
-      hasMultipart: target.hasMultipart ?? input.hasMultipart,
-      isRaceBurst: input.isRaceBurst,
-      isRceProof: input.isRceProof,
-      approvalId: input.approvalId,
-    })),
-  ]
   const expiresAt = Date.now() + STATE_CHANGE_APPROVAL_TTL_MS
-  for (const target of targets) {
-    const fingerprint: StateChangeFingerprintInput = {
-      runId: run.id,
-      origin: target.origin,
-      method: target.method,
-      pathAndQuery: target.pathAndQuery,
-      scopeRevision: run.scopeRevision,
-      personaHandle: target.personaHandle ?? null,
-      bodyHash: target.bodyHash ?? null,
-      hasMultipart: Boolean(target.hasMultipart),
-      isRaceBurst: Boolean(target.isRaceBurst),
-      isRceProof: Boolean(target.isRceProof),
-    }
-    const instances = Math.max(1, target.instances ?? 1)
-    if (instances > 1) {
-      grantBurstInstances(burstInstances, fingerprint, instances, expiresAt)
-    } else {
-      ledger.grant(fingerprint, { expiresAt, approvalId: target.approvalId })
-    }
+  const fingerprint: StateChangeFingerprintInput = {
+    runId: run.id,
+    origin: input.origin,
+    method: input.method,
+    pathAndQuery: input.pathAndQuery,
+    scopeRevision: run.scopeRevision,
+    personaHandle: input.personaHandle ?? null,
+    bodyHash: primaryBodyHash ?? null,
+    hasMultipart: Boolean(input.hasMultipart),
+    isRaceBurst: Boolean(input.isRaceBurst),
+    isRceProof: Boolean(input.isRceProof),
+  }
+  const instances = Math.max(1, input.instances ?? 1)
+  if (instances > 1) {
+    grantBurstInstances(burstInstances, fingerprint, instances, expiresAt)
+  } else {
+    ledger.grant(fingerprint, { expiresAt, approvalId: input.approvalId })
   }
 }

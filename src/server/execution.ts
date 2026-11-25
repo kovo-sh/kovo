@@ -1541,28 +1541,58 @@ export class Execution {
       return await options.execute()
     } catch (err) {
       if (!(err instanceof BrokerApprovalRequired)) throw err
-      const approval = await this.waitForTier3Approval(job, {
-        origin: approvalPlan.primary.origin,
-        method: approvalPlan.primary.method,
-        pathAndQuery: approvalPlan.primary.pathAndQuery,
-        personaHandle: approvalPlan.primary.personaHandle,
-        rationale: options.rationale,
-        requestPreview: options.requestPreview,
-        bodyPreview: approvalPlan.primary.bodyPreview,
-        bodyHash: approvalPlan.primary.bodyHash,
-        headers: approvalPlan.primary.headers,
-        hasMultipart: approvalPlan.primary.hasMultipart,
-        ...(options.isRaceBurst ? { isRaceBurst: true } : {}),
-        approvalInstances: approvalPlan.primary.approvalInstances,
-        additionalApprovalTargets: approvalPlan.additional,
-        secrets: options.secrets,
-      }, signal)
-      if (!approval.approved) {
-        throw new BrokerDenied(
-          approval.deniedReason
-            ? `Tier 3 Safety Judge denied ${options.denyLabel} probe: ${approval.deniedReason}`
-            : `Tier 3 ${options.denyLabel} request was denied or expired.`,
-        )
+      const distinctTargets = approvalPlan.targets
+      const multiTarget = distinctTargets.length > 1
+      const approvedGrants: Array<Parameters<typeof registerStateChangeGrant>[3]> = []
+      for (let idx = 0; idx < distinctTargets.length; idx += 1) {
+        const target = distinctTargets[idx]!
+        const targetPreview = multiTarget
+          ? JSON.stringify({
+              batchItem: `${idx + 1}/${distinctTargets.length}`,
+              totalRequests: requests.length,
+              instances: target.instances,
+              method: target.method,
+              origin: target.origin,
+              pathAndQuery: target.pathAndQuery,
+              persona: target.personaHandle,
+              bodyPreview: target.bodyPreview?.slice(0, 300) ?? null,
+              hasMultipart: target.hasMultipart,
+            }, null, 2)
+          : options.requestPreview
+        const approval = await this.waitForTier3Approval(job, {
+          origin: target.origin,
+          method: target.method,
+          pathAndQuery: target.pathAndQuery,
+          personaHandle: target.personaHandle,
+          rationale: multiTarget
+            ? `${options.rationale} (target ${idx + 1}/${distinctTargets.length}: ${target.method.toUpperCase()} ${target.pathAndQuery})`
+            : options.rationale,
+          requestPreview: targetPreview,
+          bodyPreview: target.bodyPreview,
+          bodyHash: target.bodyHash,
+          headers: target.headers,
+          hasMultipart: target.hasMultipart,
+          ...(options.isRaceBurst ? { isRaceBurst: true } : {}),
+          approvalInstances: target.instances,
+          deferGrant: multiTarget,
+          secrets: options.secrets,
+        }, signal)
+        if (!approval.approved) {
+          throw new BrokerDenied(
+            approval.deniedReason
+              ? `Tier 3 Safety Judge denied ${options.denyLabel} probe: ${approval.deniedReason}`
+              : `Tier 3 ${options.denyLabel} request was denied or expired.`,
+          )
+        }
+        if (multiTarget && approval.grantTarget) {
+          approvedGrants.push(approval.grantTarget)
+        }
+      }
+      if (multiTarget) {
+        const freshRun = this.check(job)
+        for (const grantTarget of approvedGrants) {
+          registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, freshRun, grantTarget)
+        }
       }
       return await options.execute()
     }
@@ -1643,7 +1673,10 @@ export class Execution {
       isRaceBurst?: boolean
       /** Single-use instances of the primary fingerprint this decision covers (default 1). */
       approvalInstances?: number
-      /** Additional exact requests covered by one synchronized decision (e.g. a race burst). */
+      /**
+       * Deprecated: distinct sibling targets can never piggyback on one approval decision.
+       * Passing a non-empty array fails closed so unjudged targets are never granted.
+       */
       additionalApprovalTargets?: Array<{
         origin: string
         method: string
@@ -1653,14 +1686,22 @@ export class Execution {
         hasMultipart?: boolean
         instances?: number
       }>
+      /** When true, return the approved grant descriptor without registering it yet (used by multi-target groups). */
+      deferGrant?: boolean
       secrets: readonly NamedSecret[]
     },
     signal: AbortSignal,
-  ): Promise<{ approved: boolean; deniedReason?: string }> {
+  ): Promise<{ approved: boolean; deniedReason?: string; grantTarget?: Parameters<typeof registerStateChangeGrant>[3] }> {
     const run = this.check(job)
     const project = this.storage.project(run.projectId)
     if (run.capabilityTier < 3) {
       throw new BrokerDenied('This operation requires Capability Tier 3.')
+    }
+    if (input.additionalApprovalTargets && input.additionalApprovalTargets.length > 0) {
+      return {
+        approved: false,
+        deniedReason: 'Distinct batch targets must each be evaluated individually; piggybacking additionalApprovalTargets is forbidden.',
+      }
     }
 
     // NOTE: local-lab auto-approval is decided exclusively below by evaluateTier3Approval so
@@ -1723,8 +1764,11 @@ export class Execution {
         decidedBy: approved ? (evaluation.decidedBy === 'operator' ? 'auto-review:rule' : evaluation.decidedBy) : 'auto-review:judge',
       })
       if (!approved) return { approved: false, deniedReason: evaluation.reason }
-      registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, grantTarget(), input.additionalApprovalTargets ?? [])
-      return { approved: true }
+      const targetGrant = grantTarget()
+      if (!input.deferGrant) {
+        registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, targetGrant)
+      }
+      return { approved: true, grantTarget: targetGrant }
     }
 
     const approvalKey = [
@@ -1831,13 +1875,17 @@ export class Execution {
       }
       // A human/operator approval authorizes exactly this fingerprint once; broader reuse requires
       // an explicit operator pattern (approve_similar_endpoint), never a prefix match on the card.
-      registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, grantTarget(postedApprovalId), input.additionalApprovalTargets ?? [])
+      const targetGrant = grantTarget(postedApprovalId)
+      if (!input.deferGrant) {
+        registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, targetGrant)
+      }
+      return { approved: true, grantTarget: targetGrant }
     } else {
       // A denied/expired/canceled decision ends this assignment and settles its chain step so
       // neither investigation nor verification wedges waiting on a permanently blocked worker.
       this.terminateApprovalBlockedAssignment(run.id, job.assignment.id, decision)
     }
-    return { approved: decision === 'approved' }
+    return { approved: false }
   }
 
   private terminateApprovalBlockedAssignment(
