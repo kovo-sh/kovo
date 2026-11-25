@@ -1020,6 +1020,169 @@ export function isClerkCredentialHost(originOrHost: string, allowlist: readonly 
   return exact.some(allowed => registrableDomain(allowed) === apex)
 }
 
+const HOSTED_SUPABASE_HOST_PATTERN = /^[a-z0-9][a-z0-9-]{1,62}\.supabase\.(?:co|in|net)$/i
+
+export function isHostedSupabaseHost(originOrHost: string): boolean {
+  try {
+    const parsed = originOrHost.includes('://') ? new URL(originOrHost) : new URL(`https://${originOrHost}`)
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.port) return false
+    return HOSTED_SUPABASE_HOST_PATTERN.test(normalizeHostname(parsed.hostname))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * A Supabase Auth credential destination must either lie inside the persona allowlist, or be a
+ * strict hosted Supabase project origin (`https://<ref>.supabase.co|in|net`) explicitly named by
+ * the operator or discovered directly from the allowlisted target origin's HTML/JS.
+ */
+export function isSupabaseCredentialHost(
+  originOrHost: string,
+  allowlist: readonly string[],
+  operatorNamed?: string,
+  discoveredOrigin?: string | null,
+): boolean {
+  let parsed: URL
+  try {
+    parsed = originOrHost.includes('://') ? new URL(originOrHost) : new URL(`https://${originOrHost}`)
+  } catch {
+    return false
+  }
+  if (parsed.username || parsed.password) return false
+  if (isOriginInScope(parsed.origin, allowlist)) return true
+  if (allowlist.some(entry => {
+    try { return new URL(entry).origin === parsed.origin } catch { return false }
+  })) return true
+  if (!isHostedSupabaseHost(parsed.origin)) return false
+  if (operatorNamed) {
+    try {
+      if (new URL(operatorNamed).origin === parsed.origin) return true
+    } catch {
+      // Ignore malformed operator URL.
+    }
+  }
+  if (discoveredOrigin) {
+    try {
+      if (new URL(discoveredOrigin).origin === parsed.origin) return true
+    } catch {
+      // Ignore malformed discovered URL.
+    }
+  }
+  return false
+}
+
+function decodeJwtPayloadObject(jwt: string): Record<string, unknown> | null {
+  try {
+    const parts = jwt.split('.')
+    if (parts.length < 2) return null
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    const pad = b64.length % 4 === 0 ? '' : '='.repeat(4 - (b64.length % 4))
+    const parsed = JSON.parse(Buffer.from(b64 + pad, 'base64').toString('utf8')) as unknown
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null
+  } catch {
+    return null
+  }
+}
+
+export function extractSupabaseConfigFromText(
+  text: string,
+  allowlist: readonly string[],
+): { supabaseOrigin: string | null; supabaseAnonKey: string | null } {
+  let supabaseOrigin: string | null = null
+  let supabaseAnonKey: string | null = null
+
+  const acceptOrigin = (candidate: string): string | null => {
+    try {
+      const parsed = new URL(candidate.trim())
+      if ((parsed.protocol !== 'https:' && parsed.protocol !== 'http:') || parsed.username || parsed.password) return null
+      if (isHostedSupabaseHost(parsed.origin)) return parsed.origin
+      if (isOriginInScope(parsed.origin, allowlist)) return parsed.origin
+      return null
+    } catch {
+      return null
+    }
+  }
+
+  // 1. Hosted Supabase URLs directly embedded in HTML or JS bundles
+  const hostedMatch = /https:\/\/([a-z0-9][a-z0-9-]{1,62}\.supabase\.(?:co|in|net))\b/i.exec(text)
+  if (hostedMatch?.[1]) {
+    supabaseOrigin = acceptOrigin(`https://${hostedMatch[1].toLowerCase()}`)
+  }
+
+  // 2. Named Supabase URL config keys or data attributes (supports self-hosted / allowlisted origins too)
+  if (!supabaseOrigin) {
+    const namedUrlPatterns = [
+      /(?:NEXT_PUBLIC_SUPABASE_URL|VITE_SUPABASE_URL|PUBLIC_SUPABASE_URL|REACT_APP_SUPABASE_URL|NUXT_PUBLIC_SUPABASE_URL|SUPABASE_URL|supabaseUrl|supabase_url)\s*[:=]\s*["'`](https?:\/\/[^"'`\s]+)["'`]/i,
+      /data-supabase-url=["'](https?:\/\/[^"'\s]+)["']/i,
+      /["'`](https?:\/\/[^"'`\s]+?)\/auth\/v1\b/i,
+    ]
+    for (const pattern of namedUrlPatterns) {
+      const match = pattern.exec(text)
+      if (match?.[1]) {
+        const accepted = acceptOrigin(match[1])
+        if (accepted) {
+          supabaseOrigin = accepted
+          break
+        }
+      }
+    }
+  }
+
+  // 3. Modern Supabase publishable key (`sb_publishable_...`)
+  const publishableMatch = /\b(sb_publishable_[A-Za-z0-9_-]{16,})\b/.exec(text)
+  if (publishableMatch?.[1]) {
+    supabaseAnonKey = publishableMatch[1]
+  }
+
+  // 4. Named Supabase anon/publishable key config entries or data attributes
+  if (!supabaseAnonKey) {
+    const namedKeyPatterns = [
+      /(?:NEXT_PUBLIC_SUPABASE_ANON_KEY|NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY|VITE_SUPABASE_ANON_KEY|VITE_SUPABASE_PUBLISHABLE_KEY|PUBLIC_SUPABASE_ANON_KEY|REACT_APP_SUPABASE_ANON_KEY|NUXT_PUBLIC_SUPABASE_ANON_KEY|SUPABASE_ANON_KEY|SUPABASE_PUBLISHABLE_KEY|supabaseAnonKey|supabaseKey|supabase_anon_key|anonKey)\s*[:=]\s*["'`]([A-Za-z0-9._-]{16,2048})["'`]/i,
+      /data-supabase-(?:anon-key|publishable-key|key)=["']([A-Za-z0-9._-]{16,2048})["']/i,
+    ]
+    for (const pattern of namedKeyPatterns) {
+      const match = pattern.exec(text)
+      if (match?.[1]) {
+        const candidate = match[1].trim()
+        // Never accidentally adopt a service_role JWT even if embedded in a broken app.
+        if (candidate.startsWith('eyJ')) {
+          const payload = decodeJwtPayloadObject(candidate)
+          if (payload && payload.role === 'service_role') continue
+        }
+        supabaseAnonKey = candidate
+        break
+      }
+    }
+  }
+
+  // 5. Classic Supabase anon JWTs (`role === 'anon'`), also deriving `https://<ref>.supabase.co` if needed
+  if (!supabaseAnonKey || !supabaseOrigin) {
+    const jwtRegex = /\b(eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g
+    let checked = 0
+    for (const match of text.matchAll(jwtRegex)) {
+      if (++checked > 24) break
+      const token = match[1]!
+      const payload = decodeJwtPayloadObject(token)
+      if (!payload) continue
+      if (payload.role !== 'anon') continue
+      const iss = typeof payload.iss === 'string' ? payload.iss.toLowerCase() : ''
+      const ref = typeof payload.ref === 'string' ? payload.ref.trim().toLowerCase() : ''
+      if (iss === 'supabase' || iss.includes('supabase') || /^[a-z0-9-]{8,63}$/.test(ref)) {
+        if (!supabaseAnonKey) supabaseAnonKey = token
+        if (!supabaseOrigin && /^[a-z0-9][a-z0-9-]{3,62}$/.test(ref)) {
+          supabaseOrigin = acceptOrigin(`https://${ref}.supabase.co`)
+        }
+        break
+      }
+    }
+  }
+
+  return { supabaseOrigin, supabaseAnonKey }
+}
+
 /**
  * Per-worker session clone pool with coordinated single-flight refresh.
  *
@@ -1379,7 +1542,24 @@ export class PersonaAuthManager {
     targetOrigin: string,
     allowlist: readonly string[],
     signal?: AbortSignal,
-  ): Promise<{ html: string; headers: Headers; clerkFapiOrigin: string | null; hasClerk: boolean }> {
+  ): Promise<{
+    html: string
+    headers: Headers
+    clerkFapiOrigin: string | null
+    hasClerk: boolean
+    supabaseOrigin: string | null
+    supabaseAnonKey: string | null
+    hasSupabase: boolean
+  }> {
+    const empty = {
+      html: '',
+      headers: new Headers(),
+      clerkFapiOrigin: null,
+      hasClerk: false,
+      supabaseOrigin: null,
+      supabaseAnonKey: null,
+      hasSupabase: false,
+    }
     try {
       const target = await this.assertCredentialTarget(targetOrigin, allowlist, 'Target origin')
       // No redirects while discovering provider configuration: a redirect target must never decide
@@ -1391,8 +1571,8 @@ export class PersonaAuthManager {
         signal,
         Math.min(this.timeoutMs, 8_000),
       )
-      if (res.status >= 300 && res.status < 400) {
-        return { html: '', headers: res.headers, clerkFapiOrigin: null, hasClerk: false }
+      if (res.status < 200 || res.status >= 300) {
+        return { ...empty, headers: res.headers }
       }
       const html = (await res.text()).slice(0, 250_000)
       let clerkFapiOrigin: string | null = null
@@ -1420,9 +1600,59 @@ export class PersonaAuthManager {
         hasClerkHeader ||
         /data-clerk-publishable-key|@clerk\/|clerk-js|__clerk_db_jwt/i.test(html),
       )
-      return { html, headers: res.headers, clerkFapiOrigin, hasClerk }
+
+      let { supabaseOrigin, supabaseAnonKey } = extractSupabaseConfigFromText(html, allowlist)
+
+      // Scan up to 4 same-origin JS bundles when Supabase URL or public anon key is not inline in HTML.
+      if (!supabaseOrigin || !supabaseAnonKey) {
+        const targetOriginUrl = new URL(targetOrigin)
+        const scriptUrls: string[] = []
+        const seenScripts = new Set<string>()
+        for (const match of html.matchAll(/<script\b[^>]*\bsrc=["']([^"']+)["']/gi)) {
+          const rawSrc = match[1]?.trim()
+          if (!rawSrc || rawSrc.startsWith('data:') || rawSrc.startsWith('javascript:')) continue
+          try {
+            const resolved = new URL(rawSrc, targetOriginUrl)
+            if (resolved.origin !== targetOriginUrl.origin) continue
+            if (!/\.(?:m?js|cjs)(?:$|\?)/i.test(resolved.pathname)) continue
+            const href = resolved.toString()
+            if (seenScripts.has(href)) continue
+            seenScripts.add(href)
+            scriptUrls.push(href)
+            if (scriptUrls.length >= 4) break
+          } catch {
+            // Ignore malformed script URL.
+          }
+        }
+        for (const scriptUrl of scriptUrls) {
+          if (supabaseOrigin && supabaseAnonKey) break
+          try {
+            const sRes = await this.credentialFetch(
+              scriptUrl,
+              { method: 'GET', headers: { Accept: 'application/javascript,text/javascript,*/*' }, redirect: 'manual' },
+              target.addresses,
+              signal,
+              Math.min(this.timeoutMs, 4_000),
+            )
+            if (sRes.status < 200 || sRes.status >= 300) continue
+            const jsText = (await sRes.text()).slice(0, 512_000)
+            const found = extractSupabaseConfigFromText(jsText, allowlist)
+            if (!supabaseOrigin && found.supabaseOrigin) supabaseOrigin = found.supabaseOrigin
+            if (!supabaseAnonKey && found.supabaseAnonKey) supabaseAnonKey = found.supabaseAnonKey
+          } catch {
+            // Best-effort JS bundle discovery.
+          }
+        }
+      }
+
+      const hasSupabase = Boolean(
+        supabaseOrigin ||
+        supabaseAnonKey ||
+        /@supabase\/supabase-js|supabase\.co\/auth\/v1/i.test(html),
+      )
+      return { html, headers: res.headers, clerkFapiOrigin, hasClerk, supabaseOrigin, supabaseAnonKey, hasSupabase }
     } catch {
-      return { html: '', headers: new Headers(), clerkFapiOrigin: null, hasClerk: false }
+      return empty
     }
   }
 
@@ -1666,6 +1896,7 @@ export class PersonaAuthManager {
 
     let adapter: Exclude<PersonaLoginAdapter, 'auto'> | 'oidc'
     let detectedClerkFapiOrigin: string | null = null
+    let detectedSupabase: { origin: string | null; apiKey: string | null } | undefined
 
     const crossOriginAuthUrl = (() => {
       if (!config.loginUrl) return false
@@ -1681,14 +1912,18 @@ export class PersonaAuthManager {
       adapter = 'oidc'
     } else if (config.adapter === 'auto') {
       const inspected = await this.inspectTargetOrigin(targetOrigin, persona.originAllowlist, signal)
-      if (crossOriginAuthUrl) {
+      if (config.loginUrl && (/\/auth\/v1\/token\b/i.test(config.loginUrl) || isHostedSupabaseHost(config.loginUrl))) {
+        adapter = 'supabase'
+        detectedSupabase = { origin: inspected.supabaseOrigin, apiKey: inspected.supabaseAnonKey }
+      } else if (crossOriginAuthUrl) {
         // An allowlisted external login URL is an SSO/IdP hop, not the app's own form.
         adapter = 'oidc'
       } else if (inspected.hasClerk) {
         adapter = 'clerk'
         detectedClerkFapiOrigin = inspected.clerkFapiOrigin
-      } else if (config.loginUrl && /\/auth\/v1\/token\b/i.test(config.loginUrl)) {
+      } else if (inspected.hasSupabase) {
         adapter = 'supabase'
+        detectedSupabase = { origin: inspected.supabaseOrigin, apiKey: inspected.supabaseAnonKey }
       } else if (config.loginUrl && /\/api\//i.test(config.loginUrl)) {
         adapter = 'json'
       } else if (/data-kovo-sso|authorize\?client_id|\/oauth2\/|\/oidc\/|single sign-on/i.test(inspected.html)) {
@@ -1708,7 +1943,7 @@ export class PersonaAuthManager {
       case 'clerk_client':
         return await this.authenticateClerkClientCookie(persona, config, password, targetOrigin, signal)
       case 'supabase':
-        return await this.authenticateSupabase(persona, config, email, password, targetOrigin, signal)
+        return await this.authenticateSupabase(persona, config, email, password, targetOrigin, detectedSupabase, signal)
       case 'json':
         return await this.authenticateJson(persona, config, email, password, targetOrigin, signal)
       case 'form':
@@ -2148,24 +2383,103 @@ export class PersonaAuthManager {
     }
   }
 
+  private supabaseAuthAllowlist(
+    persona: ResolvedPersona,
+    config: PersonaLoginConfig,
+    loginUrl: string,
+    discoveredOrigin: string | null,
+  ): readonly string[] {
+    try {
+      const parsed = new URL(loginUrl)
+      if (
+        isHostedSupabaseHost(parsed.origin) &&
+        isSupabaseCredentialHost(parsed.origin, persona.originAllowlist, config.loginUrl, discoveredOrigin)
+      ) {
+        return [...persona.originAllowlist, parsed.origin]
+      }
+    } catch {
+      // Malformed loginUrl will be rejected by assertCredentialTarget.
+    }
+    return persona.originAllowlist
+  }
+
   private async authenticateSupabase(
     persona: ResolvedPersona,
     config: PersonaLoginConfig,
     email: string,
     password: string,
     targetOrigin: string,
+    detectedSupabase?: { origin: string | null; apiKey: string | null },
     signal?: AbortSignal,
   ): Promise<AuthenticateResult> {
-    const loginUrl = config.loginUrl || `${targetOrigin}/auth/v1/token?grant_type=password`
-    const loginTarget = await this.assertCredentialTarget(loginUrl, persona.originAllowlist, 'Supabase login URL')
+    const ext = config as PersonaLoginConfig & {
+      apikey?: string
+      apiKey?: string
+      headers?: Record<string, string>
+    }
+    const safeCustomHeaders: Record<string, string> = {}
+    let explicitApiKey = ext.apiKey?.trim() || ext.apikey?.trim() || ''
+    if (ext.headers && typeof ext.headers === 'object') {
+      for (const [k, v] of Object.entries(ext.headers)) {
+        const name = k.trim()
+        const value = typeof v === 'string' ? v.trim() : ''
+        if (!name || !value || !/^[A-Za-z0-9-]{1,64}$/.test(name)) continue
+        const lower = name.toLowerCase()
+        if (lower === 'host' || lower === 'content-length' || lower === 'cookie' || lower === 'connection' || lower === 'transfer-encoding' || lower === 'upgrade') {
+          continue
+        }
+        if (lower === 'apikey') {
+          if (!explicitApiKey) explicitApiKey = value
+          continue
+        }
+        safeCustomHeaders[name] = value
+      }
+    }
+
+    let discoveredOrigin = detectedSupabase?.origin ?? null
+    let discoveredApiKey = detectedSupabase?.apiKey ?? null
+    if (!detectedSupabase && (!explicitApiKey || !config.loginUrl)) {
+      const inspected = await this.inspectTargetOrigin(targetOrigin, persona.originAllowlist, signal)
+      discoveredOrigin = inspected.supabaseOrigin
+      discoveredApiKey = inspected.supabaseAnonKey
+    }
+
+    const apiKey = explicitApiKey || discoveredApiKey || ''
+
+    let loginUrl: string
+    if (config.loginUrl) {
+      const parsed = new URL(config.loginUrl)
+      if (!parsed.pathname.includes('/auth/v1/token')) {
+        const basePath = parsed.pathname.replace(/\/+$/, '')
+        parsed.pathname = basePath.endsWith('/auth/v1') ? `${basePath}/token` : `${basePath}/auth/v1/token`
+      }
+      if (!parsed.searchParams.has('grant_type')) {
+        parsed.searchParams.set('grant_type', 'password')
+      }
+      loginUrl = parsed.toString()
+    } else if (
+      discoveredOrigin &&
+      isSupabaseCredentialHost(discoveredOrigin, persona.originAllowlist, config.loginUrl, discoveredOrigin)
+    ) {
+      loginUrl = `${discoveredOrigin}/auth/v1/token?grant_type=password`
+    } else {
+      loginUrl = `${targetOrigin}/auth/v1/token?grant_type=password`
+    }
+
+    const supabaseAllowlist = this.supabaseAuthAllowlist(persona, config, loginUrl, discoveredOrigin)
+    const loginTarget = await this.assertCredentialTarget(loginUrl, supabaseAllowlist, 'Supabase login URL')
+    const baseHeaders: Record<string, string> = {
+      ...safeCustomHeaders,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      ...(apiKey ? { apikey: apiKey } : {}),
+    }
+
     const res = await this.credentialFetch(
       loginUrl,
       {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
+        headers: baseHeaders,
         body: JSON.stringify({ email, password }),
       },
       loginTarget.addresses,
@@ -2185,9 +2499,12 @@ export class PersonaAuthManager {
 
     if (!res.ok) {
       const msg = String(body.error_description || body.msg || body.error || `HTTP ${res.status}`)
+      const missingKeyHint = !apiKey && /api\s*key|apikey|no api key/i.test(msg)
+        ? ' (configure loginConfig.apikey or ensure the Supabase public anon key is discoverable on the target origin)'
+        : ''
       throw new PersonaAuthError(
         res.status === 400 || res.status === 401 ? 'INVALID_CREDENTIALS' : 'AUTH_FAILED',
-        `Supabase login failed (${res.status}): ${sanitizeErrorText(msg, [password])}`,
+        `Supabase login failed (${res.status}): ${sanitizeErrorText(msg, [password])}${missingKeyHint}`,
       )
     }
 
@@ -2216,15 +2533,12 @@ export class PersonaAuthManager {
     const refreshIntervalSec = config.refreshIntervalSec ?? Math.max(15, Math.min(1800, Math.floor(expiresInSec * 0.75)))
     const doRefresh = async () => {
       if (!refreshToken) return
-      const refreshTarget = await this.assertCredentialTarget(refreshUrl, persona.originAllowlist, 'Supabase refresh URL')
+      const refreshTarget = await this.assertCredentialTarget(refreshUrl, supabaseAllowlist, 'Supabase refresh URL')
       const rRes = await this.credentialFetch(
         refreshUrl,
         {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-          },
+          headers: baseHeaders,
           body: JSON.stringify({ refresh_token: refreshToken }),
         },
         refreshTarget.addresses,

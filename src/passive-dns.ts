@@ -73,8 +73,10 @@ function hostAt(name: string, origin: string) {
 const dnsClass = /^(?:IN|CH|HS|CS)$/i
 const ttl = /^(?:\d+|(?:\d+[wdhms])+\d*)$/i
 
+const maxDnsExportMiB = Math.round(maxDnsExportBytes / (1024 * 1024))
+
 export function parseDnsInventory(zoneInput: string, document: string) {
-  if (new TextEncoder().encode(document).length > maxDnsExportBytes) throw new Error('Choose a DNS export of at most 128 KiB.')
+  if (new TextEncoder().encode(document).length > maxDnsExportBytes) throw new Error(`Choose a DNS export of at most ${maxDnsExportMiB} MiB.`)
   const zoneValue = assetOrigin.safeParse(zoneInput.trim().replace(/\.$/, ''))
   if (!zoneValue.success) throw new Error('Enter the DNS zone domain.')
   const zone = new URL(zoneValue.data).hostname

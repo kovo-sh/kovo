@@ -464,7 +464,7 @@ export const preparedObservation = z.object({
 })
 
 export const addCandidate = z.object({
-  origin: assetOrigin,
+  origin: scopedAssetOrigin,
   source: shortText,
   thirdParty: z.boolean(),
   includeSubdomains: z.boolean().optional(),
@@ -488,7 +488,7 @@ export const importProjectSpec = z.object({
   projectId: id,
   name: shortText,
   kind: z.enum(['openapi', 'graphql', 'routes', 'notes']),
-  origin: assetOrigin.optional(),
+  origin: scopedAssetOrigin.optional(),
   content: z.string().min(1).max(maxSpecBytes),
 })
 
@@ -522,6 +522,10 @@ export const personaLoginConfigSchema = z.object({
   passwordField: z.string().trim().min(1).max(64).optional(),
   tokenJsonPath: z.string().trim().min(1).max(160).optional(),
   refreshIntervalSec: z.number().int().min(10).max(3600).optional(),
+  // Optional public client key (e.g. Supabase anon/publishable key) or custom auth headers.
+  apikey: z.string().trim().min(1).max(2048).optional(),
+  apiKey: z.string().trim().min(1).max(2048).optional(),
+  headers: z.record(z.string().trim().regex(/^[A-Za-z0-9-]{1,64}$/), z.string().trim().max(2048)).optional(),
   // Optional M2 session-hardening knobs (URLs/paths only — never tokens).
   refreshUrl: personaLoginUrl.optional(),
   refreshTokenJsonPath: z.string().trim().min(1).max(160).optional(),

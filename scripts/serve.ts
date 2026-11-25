@@ -18,6 +18,7 @@ const defaultPairingTtlMs = 5 * 60 * 1000
 const maxActivePairingTokens = 10
 const pairingLinkPath = '/_kovo/auth/pairing-link'
 const rotateSessionPath = '/_kovo/auth/rotate-session'
+const authStatusPath = '/_kovo/auth/status'
 const killSwitchPath = '/api/ops/kill-switch'
 const receiptExportPathRegex = /^\/api\/runs\/([A-Za-z0-9_-]{1,128})\/receipts\/export$/
 
@@ -110,6 +111,16 @@ export function readOrCreateBootstrapSecret(directory: string): string {
 
 export function consumeBootstrapSecret(directory: string): void {
   rmSync(join(directory, 'bootstrap'), { force: true })
+  rmSync(join(directory, 'bootstrap-url'), { force: true })
+}
+
+function isLoopbackOrigin(originUrl: string): boolean {
+  try {
+    const host = new URL(originUrl).hostname.toLowerCase()
+    return host === '127.0.0.1' || host === 'localhost' || host === '[::1]' || host === '::1'
+  } catch {
+    return false
+  }
 }
 
 export function isSessionAuthorized(cookieHeader: string | undefined, token: string): boolean {
@@ -426,7 +437,28 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
     }
 
     // Authenticated local-server session management endpoints (never exposed without an active
-    // kovo_local session cookie + exact matching Origin header).
+    // kovo_local session cookie; mutating endpoints also require exact matching Origin header).
+    if (path.pathname === authStatusPath) {
+      if (method !== 'GET' && method !== 'HEAD') return reject(res, 405, 'Method not allowed.')
+      prunePairingTokens(now())
+      const payload = {
+        authenticated: true,
+        origin,
+        loopbackOnly: isLoopbackOrigin(origin),
+        publicOriginConfigured: Boolean(options.publicOrigin),
+        activePairingLinks: pairingTokens.size,
+        pairingTtlSeconds: Math.round(pairingTtlMs / 1000),
+      }
+      if (method === 'HEAD') {
+        res.writeHead(200, {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+        }).end()
+        return
+      }
+      return sendJson(res, 200, payload)
+    }
+
     if (path.pathname === pairingLinkPath) {
       if (method !== 'POST') return reject(res, 405, 'Method not allowed.')
       if (req.headers.origin !== origin) return reject(res, 403, 'Unexpected origin.')
@@ -445,6 +477,8 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
       req.resume()
       token = rotateSessionToken(directory)
       pairingTokens.clear()
+      bootstrapConsumed = true
+      consumeBootstrapSecret(directory)
       res.setHeader('set-cookie', sessionCookie(token, origin))
       return sendJson(res, 200, { rotated: true })
     }

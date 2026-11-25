@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto'
+import { join } from 'node:path'
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
 import { importAccessPolicy } from './access-policy.ts'
 import {
   approvedEndpointPatternSchema,
+  assetOriginForEnvironment,
   createPersona,
   deletePersona,
   id,
@@ -54,7 +56,7 @@ import {
   store,
 } from './server/store.ts'
 import { runDiscoverySubdomainsForRun } from './server/subdomain-discovery.ts'
-import { readWorkerSession, testPersonaAuth } from './server/worker-session-reader.ts'
+import { readWorkerSession, resolvePrimaryLabRepoDir, testPersonaAuth } from './server/worker-session-reader.ts'
 
 export const workspaceData = createServerFn({ method: 'GET' }).handler(() => {
   const db = store()
@@ -86,7 +88,11 @@ export const modelData = createServerFn({ method: 'GET' }).handler(() => publicM
 export const listModels = createServerFn({ method: 'GET' }).handler(() => listModelProfiles())
 
 export const testModel = createServerFn({ method: 'POST' }).validator(providerSettings)
-  .handler(({ data }) => checkModelConnection(data))
+  .handler(async ({ data }) => {
+    const result = await checkModelConnection(data)
+    if (data.id) execution().wake()
+    return result
+  })
 
 export const saveModel = createServerFn({ method: 'POST' }).validator(providerSettings)
   .handler(async ({ data }) => {
@@ -173,7 +179,15 @@ export const importProjectAccessPolicy = createServerFn({ method: 'POST' }).vali
   .handler(({ data }) => store().importProjectAccessPolicy(data))
 
 export const importSpec = createServerFn({ method: 'POST' }).validator(importProjectSpec)
-  .handler(({ data }) => store().importProjectSpec(data))
+  .handler(({ data }) => {
+    const db = store()
+    if (data.origin) {
+      const project = db.project(data.projectId)
+      const origin = assetOriginForEnvironment(project.environment).parse(data.origin)
+      return db.importProjectSpec({ ...data, origin })
+    }
+    return db.importProjectSpec(data)
+  })
 
 export const readProjectSpec = createServerFn({ method: 'GET' })
   .validator(z.object({ projectId: id, specId: id }))
@@ -476,7 +490,7 @@ export const startRunLabAction = createServerFn({ method: 'POST' })
     if (!project.labConfig?.enabled) {
       throw new Error('Enable local lab in Project settings before starting LabRunner.')
     }
-    const repoDir = projectReposDir(db.directory, project.id)
+    const repoDir = resolvePrimaryLabRepoDir(db.directory, project.id, project.labConfig.repo)
     const handle = await execution().labRunner.startLabTarget({
       runId: run.id,
       environment: project.environment,
@@ -484,6 +498,9 @@ export const startRunLabAction = createServerFn({ method: 'POST' })
       labConfig: project.labConfig,
       storage: db,
       projectId: project.id,
+      ...(project.labConfig.iastEnabled
+        ? { telemetryDir: join(db.directory, 'evidence', 'lab-telemetry') }
+        : {}),
       signal: AbortSignal.timeout(120_000),
     })
     return { target: serializeLabTarget(handle) }
