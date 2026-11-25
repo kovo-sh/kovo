@@ -2798,8 +2798,9 @@ const scenarioInstructions: Record<AgentScenario, string> = {
     '4. Every DB query / ORM / SQL / NoSQL / Supabase RLS / Firebase Rules sink — checking tenant/user ownership scoping, raw query interpolation, mass assignment, and non-atomic credit/quota check-then-act race windows.',
     '5. Every outbound `fetch`/HTTP client (SSRF sink), redirect handler, file-upload/path-traversal handler, WebSocket Origin/authz handler, CORS/cookie policy config, `postMessage`/DOM sink, and IaC/CI workflow (Dockerfile/K8s/Terraform/GitHub Actions).',
     'For EACH concrete suspect (skip clean, properly authorized handlers and static brochure files), call `record_fact` targeting the best-matching approved origin with kind="code_audit_suspect" and full structured data (subkind, repo, file, line, routeOrAction, authCheck, ownershipCheck, sinkKind, hypothesis, recommendedTier).',
+    'Record incrementally: call `record_fact` with kind="code_audit_suspect" the moment you identify each high-signal defect in a service/handler file — do NOT wait until every file in the repository is read before recording facts. Prioritize, in order: (a) cross-service trust boundaries and forwarded identity/role headers, (b) multi-tenant authz or cache-key asymmetries, (c) entity creator/approver and state-machine transitions, (d) signing/webhook verification boundaries, (e) async-worker outbound fetch/webhook/log sinks (SSRF pivots and secret-in-log exposure).',
     'For source-only Tier 0 engagements where runtime reproduction is unavailable, submit verified source-to-sink findings via `propose_chain_finding` using `kind: "static_ast_proof"` (strictly `static_verified` tier) with non-empty `counterevidence`, `confidenceRationale`, `codeLocations`, and `runtimeProofGap`. Record 3-state closure (`reported` / `ruled_out` with exact `enforcingControl` file:line / `needs_follow_up` with `proofGapReason`) via `record_coverage`.',
-    'Prioritize suspects on crown-jewel surfaces (auth, billing, webhooks, APIs, uploads, LLM gateways, sandboxes). When done (or upon entering settlement), commit all suspects/coverage and call `complete_intent`.',
+    'Prioritize suspects on crown-jewel surfaces (auth, billing, webhooks, APIs, uploads, LLM gateways, sandboxes). When the wall-clock settlement prompt arrives, STOP reading more files and immediately record your top 3-6 suspects as `code_audit_suspect` facts, then call `complete_intent`; also commit all coverage when done.',
   ].join('\n'),
 
   'cross-host-synthesizer': [
@@ -3212,6 +3213,18 @@ export function codeAuditPrompt(input: CodeAuditPromptInput): string {
     reposRoot: '/repos',
     maxTurns,
     settlementStartsAtTurn: Math.max(1, Math.floor(maxTurns * 0.85)),
+    recordingPolicy: {
+      mode: 'incremental',
+      rule: 'Call record_fact(kind="code_audit_suspect") IMMEDIATELY as soon as you spot each high-signal defect in a service or handler file. Do NOT wait until you have read every file in the repository before recording facts.',
+      settlement: 'When the wall-clock settlement prompt arrives, STOP reading more files and immediately record your top 3-6 suspects, then call complete_intent. Partial suspects are strictly better than an empty audit.',
+      priorityOrder: [
+        'cross-service trust boundaries and forwarded identity/role headers between services',
+        'multi-tenant authorization or cache-key asymmetries (tenantless keys, missing tenant/org scope)',
+        'entity creator/approver and state-machine transitions (who may mutate, approve, transfer, reopen)',
+        'signing/webhook verification boundaries (signature and scope checks, fail-open verification)',
+        'async-worker outbound fetch/webhook/log sinks (SSRF pivots and secret-in-log exposure)',
+      ],
+    },
     personas: input.personas ?? [],
     specs: input.specsSummary ?? [],
     threatModel: input.threatModel ?? [],
