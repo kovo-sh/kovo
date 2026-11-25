@@ -16,8 +16,32 @@ import {
   type PersonaResourceQueueItem,
   type WorkerToolHandlers,
 } from './agent-session.ts'
+import {
+  CapabilityLedger,
+  type NegativeEdge as LedgerNegativeEdge,
+  type NegativeEdgeReason as LedgerNegativeEdgeReason,
+} from './capability-ledger.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
 import { hasDynamicIdSegment, identifierFormsForRoute, intentFamily } from './deterministic-engine.ts'
+import {
+  FrontierScheduler,
+  MAX_CHECKPOINT_BRIEF_BYTES,
+  buildHopCheckpointBrief,
+  computeNegativeEdgeKey,
+  type AttemptUpdateResult,
+  type DiscoverySurfaceCandidate,
+  type FrontierBranch,
+  type FrontierSchedulerOptions,
+  type FrontierWasteTelemetry,
+  type HopCheckpointBrief,
+  type NegativeEdgeRecord,
+  type PivotAttemptOutcome,
+  type RouteSweepCandidate,
+  type VerifiedHopReceiptEvent,
+  type WaveProgressDecision,
+  type WaveQuotaConfig,
+  type WaveSelectionResult,
+} from './frontier-scheduler.ts'
 import {
   decideNext,
   extractChainHops,
@@ -323,15 +347,16 @@ export interface CoordinatorSchedulerState {
   highPriorityQueueEmpty?: boolean
   /** Consecutive rounds with no new runtime_confirmed finding and no new chain primitive. */
   consecutiveDryRounds?: number
+  /** v8 M3: count of host-verified HopReceipts that expanded tenant/role/service/surface reach. */
+  verifiedHopReachExpansions?: number
+  /** v8 M3: optional FrontierScheduler wave-progression evaluation for frontier-aware termination. */
+  frontierDecision?: WaveProgressDecision | null
 }
 
 /**
- * Deterministic v6/v7 scheduler guard: budget, requests, wall clock, K=2 empty rounds,
- * improving-round precision stop, and done+OOB drain.
- *
- * The precision stop (v7) ends the planner when the high-priority queue is drained *and* two
- * consecutive rounds produced no new runtime_confirmed finding and no new chain primitive. Budget,
- * request, wall-clock and OOB-drain rules still take precedence, so late callbacks are never lost.
+ * Deterministic v6/v7/v8 scheduler guard: budget, requests, wall clock, K=2 empty rounds,
+ * v8 frontier-progress continuation (verified HopReceipt reach expansion continues waves even
+ * before terminal confirmation), improving-round precision stop, and done+OOB drain.
  */
 export function coordinatorSchedulerDecision(state: CoordinatorSchedulerState): SchedulerDecision {
   const decision = decideNext({
@@ -347,6 +372,26 @@ export function coordinatorSchedulerDecision(state: CoordinatorSchedulerState): 
   // A done coordinator with OOB subscriptions still draining keeps running (decideNext returned
   // `continue` here), so the precision stop must not pre-empt the callback drain.
   if (state.coordinatorDone === true && pending > 0) return decision
+  // v8 M3 frontier-progress termination: verified HopReceipt reach expansion keeps waves running
+  // even before terminal CompositeProofReceipt confirmation.
+  if (
+    (state.verifiedHopReachExpansions ?? 0) > 0
+    || (state.frontierDecision?.decision === 'continue' && state.frontierDecision.reason === 'frontier_progress')
+  ) {
+    return {
+      decision: 'continue',
+      reason: 'continue',
+      detail: state.frontierDecision?.detail
+        ?? `Continuing: ${state.verifiedHopReachExpansions ?? 1} host-verified HopReceipt reach expansion(s) advanced the causal frontier.`,
+    }
+  }
+  if (state.frontierDecision?.decision === 'stop' && state.highPriorityQueueEmpty === true) {
+    return {
+      decision: 'stop',
+      reason: 'diminishing_returns',
+      detail: state.frontierDecision.detail,
+    }
+  }
   const dryRounds = state.consecutiveDryRounds ?? 0
   if (state.highPriorityQueueEmpty === true && dryRounds >= DRY_ROUND_LIMIT) {
     return {
@@ -363,7 +408,8 @@ export function coordinatorSchedulerDecision(state: CoordinatorSchedulerState): 
  *  - Round 1 seeds initial agentic work before any specialist wave has run (`-> 0`).
  *  - A mid-wave round with zero newly completed investigation assignments has no new worker
  *    evidence to judge yet, so preserve the existing streak rather than incrementing it.
- *  - Any new runtime confirmation or chain primitive resets the streak to 0.
+ *  - Any new runtime confirmation, chain primitive, or v8 verified HopReceipt reach expansion
+ *    resets the streak to 0.
  *  - Keeps `DRY_ROUND_LIMIT = 2` intact once real completed waves stop advancing the frontier.
  */
 export function nextPlannerDryRounds(input: {
@@ -373,8 +419,9 @@ export function nextPlannerDryRounds(input: {
   newChainPrimitives: number
   completedInvestigations: number
   previousCompletedInvestigations: number
+  verifiedHopReachExpansions?: number
 }): number {
-  if (input.newRuntimeConfirmed + input.newChainPrimitives > 0) return 0
+  if (input.newRuntimeConfirmed + input.newChainPrimitives + (input.verifiedHopReachExpansions ?? 0) > 0) return 0
   if (input.roundNo <= 1) return 0
   if (input.completedInvestigations <= input.previousCompletedInvestigations) return input.previousDryRounds
   return input.previousDryRounds + 1
@@ -447,7 +494,44 @@ export function readChainHopsFromFacts(
   return extractChainHops({ facts: hopFacts })
 }
 
-/** Map chained hypotheses onto validated dispatch inputs with typed `ChainHop` metadata (no prompt soup). */
+/** Format a pre-hydrated Hop-Checkpoint brief strictly <= `maxBytes` (default 2 KB UTF-8). */
+export function formatHopCheckpointForAssignment(
+  briefOrBranch: HopCheckpointBrief | { branch: FrontierBranch; evi: number },
+  maxBytes = MAX_CHECKPOINT_BRIEF_BYTES,
+): { brief: HopCheckpointBrief; json: string; bytes: number } {
+  const cap = Math.max(256, Math.min(MAX_CHECKPOINT_BRIEF_BYTES, Math.floor(maxBytes)))
+  if ('branch' in briefOrBranch) {
+    const built = buildHopCheckpointBrief(briefOrBranch.branch, briefOrBranch.evi, cap)
+    return { brief: built.brief, json: built.checkpointJson, bytes: built.checkpointBytes }
+  }
+  const clone: HopCheckpointBrief = {
+    ...briefOrBranch,
+    verifiedHops: [...briefOrBranch.verifiedHops],
+    capabilityHandles: [...briefOrBranch.capabilityHandles],
+    nextGoal: { ...briefOrBranch.nextGoal },
+  }
+  let json = JSON.stringify(clone)
+  let bytes = Buffer.byteLength(json, 'utf8')
+  while (bytes > cap && clone.verifiedHops.length > 0) {
+    clone.verifiedHops.shift()
+    clone.omittedEarlierHops = (clone.omittedEarlierHops ?? 0) + 1
+    json = JSON.stringify(clone)
+    bytes = Buffer.byteLength(json, 'utf8')
+  }
+  while (bytes > cap && clone.capabilityHandles.length > 1) {
+    clone.capabilityHandles.shift()
+    json = JSON.stringify(clone)
+    bytes = Buffer.byteLength(json, 'utf8')
+  }
+  if (bytes > cap) {
+    clone.nextGoal.goal = clone.nextGoal.goal.slice(0, 48)
+    json = JSON.stringify(clone)
+    bytes = Buffer.byteLength(json, 'utf8')
+  }
+  return { brief: clone, json, bytes }
+}
+
+/** Map chained hypotheses onto validated dispatch inputs with typed `ChainHop` + v8 checkpoint briefs. */
 export function chainHypothesisDispatchSteps(hypotheses: readonly ChainHypothesis[]): DispatchStepInput[] {
   return hypotheses.map(hypothesis => {
     const hopBlock = hypothesis.chainHops?.length
@@ -455,6 +539,9 @@ export function chainHypothesisDispatchSteps(hypotheses: readonly ChainHypothesi
       : ''
     const baseText = `${hypothesis.title} — ${hypothesis.rationale}`
     const maxBase = Math.max(200, 1200 - hopBlock.length)
+    const checkpoint = hypothesis.hops >= 2 && hypothesis.checkpointBrief
+      ? formatHopCheckpointForAssignment(hypothesis.checkpointBrief, MAX_CHECKPOINT_BRIEF_BYTES)
+      : null
     return {
       hypothesis: `${baseText.slice(0, maxBase)}${hopBlock}`,
       origins: hypothesis.chainOrigins,
@@ -464,8 +551,133 @@ export function chainHypothesisDispatchSteps(hypotheses: readonly ChainHypothesi
       skills: [...new Set([...hypothesis.primitiveKinds.map(kind => `chain:${kind}`), 'chain-primitives', ...hypothesis.probeClasses])],
       priority: Math.round(hypothesis.confidence * 100),
       ...(hypothesis.chainHops?.length ? { chainHops: hypothesis.chainHops } : {}),
+      ...(checkpoint ? { checkpointBrief: checkpoint.brief, checkpointJson: checkpoint.json } : {}),
     }
   })
+}
+
+export interface FrontierWaveControllerOptions extends FrontierSchedulerOptions {
+  ledger?: CapabilityLedger | null
+}
+
+function toLedgerNegativeReason(reason: PivotAttemptOutcome['failureReason']): LedgerNegativeEdgeReason {
+  if (reason === 'control_blocked_cleanly' || reason === 'decoy_guard_verified' || reason === 'invariant_enforced_hardened') {
+    return reason
+  }
+  return 'invariant_enforced_hardened'
+}
+
+/**
+ * v8 M3 wave-progression controller binding `FrontierScheduler` to `CapabilityLedger`:
+ *  - Syncs pruned negative edges from SQLite WAL `CapabilityLedger` before wave selection so
+ *    dead-end `(preconditionCapIds, targetSurfaceKey, hypothesisClass)` tuples are never re-probed.
+ *  - Records 2-strike dead-end pruning directly as negative edges in `CapabilityLedger`.
+ *  - Emits strictly `<= 2 KB` pre-hydrated hop-checkpoint briefs on depth `>= 2` assignments.
+ *  - Evaluates frontier-progress termination so waves continue whenever a host-verified
+ *    `HopReceipt` expands tenant/role/service/surface reach even before terminal confirmation.
+ */
+export class FrontierWaveController {
+  readonly scheduler: FrontierScheduler
+  readonly ledger: CapabilityLedger | null
+
+  constructor(options: FrontierWaveControllerOptions = {}) {
+    this.scheduler = new FrontierScheduler(options)
+    this.ledger = options.ledger ?? null
+    this.syncNegativeEdgesFromLedger()
+  }
+
+  /** Pull every pruned negative edge from `CapabilityLedger` into `FrontierScheduler`. */
+  syncNegativeEdgesFromLedger(): number {
+    if (!this.ledger) return 0
+    const pruned = this.ledger.listNegativeEdges({ prunedOnly: true })
+    if (!pruned.length) return 0
+    const records: NegativeEdgeRecord[] = pruned.map(neg => ({
+      negativeEdgeKey: computeNegativeEdgeKey(neg.preconditionCapIds, neg.targetSurfaceKey, neg.hypothesisClass),
+      branchKey: `ledger:${neg.preconditionKey}`,
+      preconditionCapIds: [...neg.preconditionCapIds],
+      targetSurfaceKey: neg.targetSurfaceKey,
+      hypothesisClass: neg.hypothesisClass,
+      reason: neg.reason,
+      failedAttempts: neg.attemptCount,
+      falsifiedByExchangeIds: [...neg.falsifiedByExchangeIds],
+      recordedAtWave: 0,
+    }))
+    this.scheduler.seedNegativeEdges(records)
+    return records.length
+  }
+
+  admitBranch(branch: FrontierBranch): boolean {
+    this.syncNegativeEdgesFromLedger()
+    return this.scheduler.admitBranch(branch)
+  }
+
+  admitBranches(branches: readonly FrontierBranch[]): number {
+    this.syncNegativeEdgesFromLedger()
+    return this.scheduler.admitBranches(branches)
+  }
+
+  addDiscoverySurface(candidate: DiscoverySurfaceCandidate): void {
+    this.scheduler.addDiscoverySurface(candidate)
+  }
+
+  addRouteSweepCandidate(candidate: RouteSweepCandidate): void {
+    this.scheduler.addRouteSweepCandidate(candidate)
+  }
+
+  selectNextWave(waveCapacity: number, quotaOverride?: WaveQuotaConfig): WaveSelectionResult {
+    this.syncNegativeEdgesFromLedger()
+    return this.scheduler.selectNextWaveAssignments(waveCapacity, quotaOverride)
+  }
+
+  /**
+   * Record a pivot attempt outcome in `FrontierScheduler` and persist failure strikes / 2-strike
+   * pruning into `CapabilityLedger` as negative edges so sibling workers skip the dead end.
+   */
+  recordPivotOutcome(outcome: PivotAttemptOutcome): AttemptUpdateResult & { ledgerNegativeEdge?: LedgerNegativeEdge } {
+    const branchBefore = this.scheduler.getBranch(outcome.branchKey)
+    const result = this.scheduler.recordAttemptOutcome(outcome)
+    let ledgerNegativeEdge: LedgerNegativeEdge | undefined
+    if (this.ledger && outcome.status === 'failed') {
+      const capIds = branchBefore?.verifiedHops.map(h => h.capabilityId).filter(Boolean) ?? []
+      const preconditionCapIds = capIds.length > 0 ? capIds : [`branch:${outcome.branchKey}`]
+      const hypothesisClass = outcome.hypothesisClass ?? branchBefore?.nextTarget.hypothesisClass ?? 'unknown'
+      const exchanges = outcome.falsifiedByExchangeIds?.length
+        ? outcome.falsifiedByExchangeIds
+        : [`ex_strike_${outcome.waveNo ?? 0}_${outcome.branchKey}`]
+      ledgerNegativeEdge = this.ledger.recordNegativeEdge({
+        preconditionCapIds,
+        targetSurfaceKey: outcome.targetSurfaceKey,
+        hypothesisClass,
+        falsifiedByExchangeIds: exchanges,
+        reason: toLedgerNegativeReason(outcome.failureReason),
+        forcePrune: result.pruned,
+        notes: result.pruned
+          ? `Pruned after ${this.scheduler.strikeLimit}-strike dead-end stagnation on ${outcome.branchKey}.`
+          : `Failed pivot attempt (${result.reason}) on ${outcome.branchKey}.`,
+      })
+    }
+    return { ...result, ...(ledgerNegativeEdge ? { ledgerNegativeEdge } : {}) }
+  }
+
+  evaluateWaveProgress(input: {
+    completedAssignments: number
+    confirmedCompositeReceipts?: readonly string[]
+    verifiedHopReceipts?: readonly VerifiedHopReceiptEvent[]
+    pendingAsyncOrOob?: number
+    budgetUsdSpent?: number
+    budgetUsdLimit?: number
+    elapsedMs?: number
+    maxDurationMs?: number
+    requestsSpent?: number
+    agentRequestBudget?: number
+    coverageSettledCount?: number
+  }): WaveProgressDecision {
+    return this.scheduler.evaluateWaveProgress(input)
+  }
+
+  getTelemetry(): FrontierWasteTelemetry {
+    return this.scheduler.getTelemetry()
+  }
 }
 
 export interface CoordinatorPlannerSessionDeps {
@@ -661,14 +873,18 @@ export function normalizeDispatchStopReason(reason: string | null | undefined): 
   switch ((reason ?? '').trim()) {
     case 'diminishing_returns':
     case 'dry_rounds':
+    case 'frontier_stagnated':
+    case 'frontier_exhausted':
       return 'dry_rounds'
     case 'coordinator_done':
       return 'coordinator_done'
     case 'budget_exhausted':
       return 'budget_exhausted'
     case 'requests_exhausted':
+    case 'request_budget_exhausted':
       return 'requests_exhausted'
     case 'wallclock_exhausted':
+    case 'duration_exhausted':
       return 'wallclock_exhausted'
     case 'circuit_open':
       return 'circuit_open'

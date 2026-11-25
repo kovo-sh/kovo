@@ -90,6 +90,11 @@ import type {
 } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import { matchesApprovedEndpointPattern, normalizeApprovalPathPattern } from './approval-judge.ts'
+import {
+  CapabilityLedger,
+  initCapabilityLedgerSchema,
+  type CapabilityLedgerOptions,
+} from './capability-ledger.ts'
 import { computeFindingFingerprint, isOriginWideCwe, normalizeEndpointTemplate } from './dedupe.ts'
 import type { ApprovalDecidedBy, ApprovalRiskLevel } from './approval-judge.ts'
 import { listProjectPersonas } from './persona-vault.ts'
@@ -896,6 +901,7 @@ export class Store {
     this.initV5Schema()
     this.initV6Schema()
     this.initV7Schema()
+    this.initV8Schema()
     // v6.2 full-body FTS size guard: refuse to switch on an expensive index over a database that is
     // already large unless the operator explicitly forced it. Release the process lock so a
     // subsequent correctly-configured reopen can proceed.
@@ -1463,6 +1469,19 @@ export class Store {
         END;
     `)
     this.client.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`)
+  }
+
+  /** v8 M0: idempotent CapabilityLedger tables & indexes on the shared WAL SQLite handle. */
+  private initV8Schema() {
+    initCapabilityLedgerSchema(this.client)
+  }
+
+  /**
+   * Return a run-scoped v8 `CapabilityLedger` bound directly to this Store's shared WAL
+   * `DatabaseSync` handle (zero extra SQLite connections; closing the returned view is a no-op).
+   */
+  capabilityLedger(runId: string, options: Omit<CapabilityLedgerOptions, 'runId'> = {}): CapabilityLedger {
+    return new CapabilityLedger(this.client, { ...options, runId })
   }
 
   /**
