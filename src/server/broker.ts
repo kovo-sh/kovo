@@ -402,7 +402,7 @@ export type BrokerOptions = {
    * Rate-limited persona re-authentication invoked by the broker on a persona-bound 401.
    * Returning true retries the request once with freshly resolved persona headers.
    */
-  reauth?: (personaHandle: string, origin: string) => Promise<boolean | void>
+  reauth?: (personaHandle: string, runId?: string, origin?: string) => Promise<boolean | void>
   /** v7 M4: optional kill-switch instance (defaults to process-wide `globalKillSwitch`). */
   killSwitch?: GlobalKillSwitch
 }
@@ -3714,7 +3714,8 @@ export class RequestBroker {
         this.reauthHandler &&
         !deadline.aborted
       ) {
-        const refreshed = await this.reauthHandler(personaHandle, url.origin).catch(() => false)
+        const reauthRunId = req.runId ?? grant.scopePolicy?.runId ?? undefined
+        const refreshed = await this.reauthHandler(personaHandle, reauthRunId, url.origin).catch(() => false)
         if (refreshed !== false) {
           const refreshedPersona = grant.personas?.get(personaHandle)
           const rebuilt = refreshedPersona ? buildPersonaHeader(refreshedPersona, initialOrigin) : null

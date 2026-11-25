@@ -650,7 +650,27 @@ export class Execution {
     this.personaAuth = options.personaAuth ?? new PersonaAuthManager()
     this.broker = options.broker ?? createBroker({ storage, canaryBroker: this.canaryBroker })
     if (!options.broker) {
-      this.broker.setReauth(personaHandle => this.personaAuth.requestReauth(personaHandle))
+      this.broker.setReauth(async (personaHandle, runId) => {
+        if (runId) {
+          if (this.personaAuth.sessions.has(personaHandle, runId)) {
+            return this.personaAuth.requestReauth(personaHandle, undefined, runId)
+          }
+          const runScoped = await this.personaAuth.requestReauth(personaHandle, undefined, runId)
+          if (runScoped) return true
+          // Backwards-compatible fallback ONLY for legacy unscoped pool registrations (`entry.runId === undefined`);
+          // never fall back across runs when the handle belongs to a different run.
+          const probe = this.personaAuth.cloneSession(personaHandle)
+          if (probe) {
+            const isUnscoped = !probe.runId
+            probe.dispose()
+            if (isUnscoped) {
+              return this.personaAuth.requestReauth(personaHandle)
+            }
+          }
+          return false
+        }
+        return this.personaAuth.requestReauth(personaHandle)
+      })
     }
     // `storage` activates second-order canary scanning inside the browser context too.
     this.browser = options.browser ?? new ScopedBrowser(this.broker, { storage })
@@ -927,6 +947,7 @@ export class Execution {
       try { trace.closeTrace() } catch { /* tracing must never break shutdown */ }
     }
     this.runTraces.clear()
+    this.capabilityVaults.clear()
     this.phaseBControllers.clear()
     this.agenticLaneJobs.clear()
     this.agenticLaneStopping.clear()
@@ -1110,11 +1131,25 @@ export class Execution {
     // session clone. A logout/rotation in one clone can never 401 a sibling worker.
     const personas = new Map(
       [...resolvedPersonas.entries()].map(([handle, persona]) => {
+        let usedUnscopedClone = false
         const cloned = cloneWorkerPersona(
           persona,
           job.assignment.id,
-          (h, wid) => this.personaAuth.cloneSession(h, wid),
-          h => this.personaAuth.sessions.session(h),
+          (h, wid) => {
+            const scoped = this.personaAuth.cloneSession(h, wid, run.id)
+            if (scoped) return scoped
+            // Backwards-compatible fallback ONLY for legacy unscoped pool entries (`entry.runId === undefined`);
+            // never attach a clone belonging to a different run.
+            const fallback = this.personaAuth.cloneSession(h, wid)
+            if (fallback && !fallback.runId) {
+              usedUnscopedClone = true
+              return fallback
+            }
+            fallback?.dispose()
+            return null
+          },
+          h => this.personaAuth.sessions.session(h, run.id)
+            ?? (usedUnscopedClone ? this.personaAuth.sessions.session(h) : null),
         )
         if (!cloned) return [handle, persona] as const
         const tracked = this.workerSessionClones.get(job.assignment.id) ?? []
@@ -2061,6 +2096,18 @@ export class Execution {
       }
     }
 
+    // M-28: evict cached in-memory capability vaults for finalized, failed, stopped, or deleted runs
+    for (const runId of [...this.capabilityVaults.keys()]) {
+      try {
+        const current = this.storage.run(runId)
+        if (current.status === 'complete' || current.status === 'failed' || current.status === 'stopped' || current.phase === 'complete') {
+          this.capabilityVaults.delete(runId)
+        }
+      } catch {
+        this.capabilityVaults.delete(runId)
+      }
+    }
+
     // 2. Dispatch pending one-click Verify Fix retests (works even on completed runs, Zero-LLM!)
     for (const run of this.storage.runsWithPendingRetests()) {
       const retests = this.storage.workerList(run.id).filter(w => w.phase === 'retest' && w.status === 'queued')
@@ -2771,7 +2818,10 @@ export class Execution {
         this.agenticLaneJobs.delete(run.id)
         this.agenticLaneStopping.delete(run.id)
         if (holder.assignmentId) this.overlappedFloorAssignmentIds.delete(holder.assignmentId)
-        this.agenticLaneCompleted.add(key)
+        // M-10: do not mark Phase A completed when aborted (e.g. pause mid-floor), so resume re-runs it.
+        if (!controller.signal.aborted) {
+          this.agenticLaneCompleted.add(key)
+        }
         this.agenticFloorFinishedAt.set(run.id, Date.now())
         this.traceLifecycle(run.id, 'lane_end', { aborted: controller.signal.aborted, deadlineMs })
         try { this.settleFloorRequestPhase(run.id, controller.signal.aborted ? 'floor_aborted' : 'floor_complete') } catch { /* metrics only */ }
@@ -4478,6 +4528,16 @@ export class Execution {
       lastDrain: this.lastOobDrain,
       drain: runId => this.drainPendingOob(runId),
     }, run)
+    if (!this.verificationDraining.has(run.id)) {
+      try {
+        const current = this.storage.run(run.id)
+        if (current.status === 'complete' || current.phase === 'complete') {
+          this.capabilityVaults.delete(run.id)
+        }
+      } catch {
+        this.capabilityVaults.delete(run.id)
+      }
+    }
   }
 
   private advanceToVerification(run: Run) {
