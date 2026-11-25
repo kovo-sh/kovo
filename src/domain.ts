@@ -402,6 +402,7 @@ export const newProject = z.object({
   name: shortText,
   seeds: z.array(z.string().trim().min(1).max(253)).min(1).max(maxProjectSeeds),
   environment: z.enum(['public', 'local-lab']).default('public'),
+  includeSubdomains: z.boolean().optional(),
   labConfig: labConfigSchema.optional(),
   sandboxWriteAllowlist: z.array(approvedEndpointPatternSchema).max(100).optional(),
 }).transform((data, ctx) => {
@@ -466,6 +467,7 @@ export const addCandidate = z.object({
   origin: assetOrigin,
   source: shortText,
   thirdParty: z.boolean(),
+  includeSubdomains: z.boolean().optional(),
 })
 
 export const projectAsset = addCandidate.extend({
@@ -645,6 +647,7 @@ export interface Candidate {
   origin: string
   source: string
   thirdParty: boolean
+  includeSubdomains?: boolean
   sourceEvidenceId?: string
   prepared?: PreparedObservation | null
   dnsSource?: DnsSource | null

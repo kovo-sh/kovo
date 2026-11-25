@@ -60,6 +60,7 @@ export const projectAssets = sqliteTable('project_assets', {
   origin: text('origin').notNull(),
   source: text('source').notNull(),
   thirdParty: integer('third_party', { mode: 'boolean' }).notNull(),
+  includeSubdomains: integer('include_subdomains', { mode: 'boolean' }).default(false).notNull(),
   prepared: text('prepared', { mode: 'json' }).$type<PreparedObservation>(),
   dnsSource: text('dns_source', { mode: 'json' }).$type<DnsSource>(),
   accessPolicy: text('access_policy', { mode: 'json' }).$type<AccessPolicySnapshot>(),

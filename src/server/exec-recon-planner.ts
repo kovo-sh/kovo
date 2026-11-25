@@ -113,6 +113,7 @@ import {
 } from './model-settings.ts'
 import { resolveRunPersonas } from './persona-vault.ts'
 import { runPhase0Recon } from './phase0-recon.ts'
+import { applyDiscoveredSubdomainsToRun, discoverSubdomainsForOrigins } from './subdomain-discovery.ts'
 import type { Phase0GraphwireExtras, ProbePlanRegistry } from './probe-plan.ts'
 import type { CodeDataflowSlice, CodeToRuntimeHypothesis } from './program-graph.ts'
 import type { NamedSecret } from './redact.ts'
@@ -372,6 +373,34 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       // 0c. Zero-LLM Phase-0 deterministic surface mapper (runs before LLM Turn 1)
       const phase0RootExchanges = new Map<string, BrokerExchangeResult>()
       if (!freshRun.phase0CompletedAt && approvedOrigins.size > 0 && this.host.authorize(job)) {
+        // Passive CT-log + live DNS subdomain discovery for public HTTPS origins only (skipped for local-lab/localhost).
+        if (
+          freshRun.sourceMode !== 'prepared' &&
+          freshRun.capabilityTier > 0 &&
+          this.storage.project(freshRun.projectId).environment === 'public'
+        ) {
+          try {
+            const subResult = await discoverSubdomainsForOrigins([...approvedOrigins], {
+              signal: task.controller.signal,
+            })
+            if (subResult.queriedApexes.length > 0) {
+              const applied = applyDiscoveredSubdomainsToRun(this.storage, freshRun.id, subResult, approvedOrigins)
+              if (applied.admitted.length > 0) {
+                for (const cand of applied.admitted) {
+                  job.origins.add(cand.origin)
+                  if (!approvedAssets.some(a => a.origin === cand.origin)) {
+                    approvedAssets.push(cand)
+                  }
+                }
+                const refreshed = this.host.buildGrant(job, this.storage.run(freshRun.id), approvedOrigins)
+                grant = refreshed.grant
+                secrets = refreshed.secrets
+              }
+            }
+          } catch {
+            // Passive CT discovery must never fail or block Phase-0
+          }
+        }
         try {
           const reconResult = await runPhase0Recon({
             storage: this.storage,

@@ -45,8 +45,14 @@ function useScopeModel() {
   return useMemo(() => {
     const discovery = r.phase === 'consent'
     const hosts = discovery
-      ? p.seeds.map(s => ({ id: s, origin: s, thirdParty: false, source: 'Project seed' }))
-      : r.candidates.map(c => ({ id: c.id, origin: c.origin, thirdParty: c.thirdParty, source: c.source }))
+      ? p.seeds.map(s => ({ id: s, origin: s, thirdParty: false, source: 'Project seed', externalCname: null as string | null }))
+      : r.candidates.map(c => ({
+        id: c.id,
+        origin: c.origin,
+        thirdParty: c.thirdParty,
+        source: c.source,
+        externalCname: c.dnsSource?.externalAliases?.[0] ?? null,
+      }))
     const defaults = r.scopeRevision > 0 ? [...r.approved]
       : r.candidates.filter(a => !a.thirdParty && (p.defaultScope.length ? p.defaultScope.includes(a.origin) : !a.dnsSource)).map(a => a.id)
     return { discovery, hosts, defaults }
@@ -130,7 +136,10 @@ function ScopeCard({ editing, draft, setDraft, footer }: {
       ? <div className="hosts mono edit">
         {hosts.map(h => <label key={h.id} className={selected.has(h.id) ? '' : 'off'} title={`${h.origin} · ${h.source}`}>
           <input type="checkbox" aria-label={'Include ' + host(h.origin)} checked={selected.has(h.id)} onChange={e => setDraft(d => ({ ...d, assetIds: e.target.checked ? [...d.assetIds, h.id] : d.assetIds.filter(x => x !== h.id) }))} />
-          <span>{host(h.origin)}</span>{h.thirdParty && <span className="third">3P</span>}
+          <span>{host(h.origin)}</span>
+          {h.thirdParty && <span className="third" title={h.externalCname ? `Third-party CNAME (${h.externalCname}) — unchecked by default` : 'Third-party host — unchecked by default'}>
+            {h.externalCname ? `Third-party CNAME (${h.externalCname})` : '3P'}
+          </span>}
         </label>)}
       </div>
       : <div className="hosts mono">

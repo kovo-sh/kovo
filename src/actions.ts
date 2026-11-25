@@ -131,6 +131,16 @@ export const createProject = createServerFn({ method: 'POST' }).validator(newPro
 export const addProjectAsset = createServerFn({ method: 'POST' }).validator(projectAsset)
   .handler(({ data }) => store().addProjectAsset(data))
 
+export const updateProjectAssetScope = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    requestId: id,
+    projectId: id,
+    assetId: id,
+    includeSubdomains: z.boolean().optional(),
+    approveInDefaultScope: z.boolean().optional(),
+  }))
+  .handler(({ data }) => store().updateProjectAssetScope(data))
+
 export const importProjectDns = createServerFn({ method: 'POST' }).validator(importDnsInventory)
   .handler(({ data }) => store().importProjectDns(data))
 

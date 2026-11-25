@@ -44,6 +44,7 @@ import type {
   CapabilityTier,
   CheckCoverage,
   CodeLocation,
+  DnsSource,
   DynamicRetestVerdict,
   EndpointSource,
   EvidenceSummary,
@@ -1424,6 +1425,7 @@ export class Store {
     ensureColumn('replay_specs', 'proof_script_sha256', 'TEXT')
     ensureColumn('replay_specs', 'proof_artifact_id', 'TEXT')
     ensureColumn('replay_specs', 'proof_receipt', 'TEXT')
+    ensureColumn('project_assets', 'include_subdomains', 'INTEGER NOT NULL DEFAULT 0')
     this.client.exec(`
       CREATE INDEX IF NOT EXISTS replay_specs_proof ON replay_specs (run_id, proof_kind);
     `)
@@ -5032,8 +5034,9 @@ export class Store {
         sandboxWriteAllowlist: input.sandboxWriteAllowlist ?? [],
         createdAt: Date.now(),
       }).returning().get()
+      const includeSubdomains = environment === 'public' && Boolean(input.includeSubdomains)
       this.db.insert(tables.projectAssets).values(project.seeds.map(origin => ({
-        id: randomUUID(), projectId: project.id, origin, source: 'Project seed', thirdParty: false,
+        id: randomUUID(), projectId: project.id, origin, source: 'Project seed', thirdParty: false, includeSubdomains,
       }))).run()
       this.event(null, 'project.created', 'Project created.', { projectId: project.id, environment: project.environment })
       return { id: project.id }
@@ -5176,8 +5179,61 @@ export class Store {
     return this.operate(input, () => {
       const project = this.project(input.projectId)
       const origin = assetOriginForEnvironment(project.environment).parse(input.origin)
-      const candidate = this.saveCandidate(project.id, { ...input, origin })
+      const includeSubdomains = project.environment === 'public' && !input.thirdParty && Boolean(input.includeSubdomains)
+      const candidate = this.saveCandidate(project.id, { ...input, origin, includeSubdomains })
       return { id: candidate.id }
+    })
+  }
+
+  updateProjectAssetScope(input: {
+    requestId: string
+    projectId: string
+    assetId: string
+    includeSubdomains?: boolean
+    approveInDefaultScope?: boolean
+  }) {
+    return this.operate(input, () => {
+      const project = this.project(input.projectId)
+      const asset = this.db.select().from(tables.projectAssets)
+        .where(and(eq(tables.projectAssets.projectId, project.id), eq(tables.projectAssets.id, input.assetId)))
+        .get()
+      if (!asset) throw new Error('Project asset not found.')
+
+      let nextIncludeSubdomains = Boolean(asset.includeSubdomains)
+      if (input.includeSubdomains !== undefined) {
+        nextIncludeSubdomains = project.environment === 'public' && !asset.thirdParty && Boolean(input.includeSubdomains)
+        this.db.update(tables.projectAssets)
+          .set({ includeSubdomains: nextIncludeSubdomains })
+          .where(eq(tables.projectAssets.id, asset.id))
+          .run()
+      }
+
+      let nextDefaultScope = [...project.defaultScope]
+      if (input.approveInDefaultScope !== undefined) {
+        if (input.approveInDefaultScope) {
+          if (!nextDefaultScope.includes(asset.origin)) nextDefaultScope.push(asset.origin)
+        } else {
+          nextDefaultScope = nextDefaultScope.filter(origin => origin !== asset.origin)
+        }
+        this.db.update(tables.projects)
+          .set({ defaultScope: nextDefaultScope })
+          .where(eq(tables.projects.id, project.id))
+          .run()
+      }
+
+      this.event(null, 'inventory.asset_scope_updated', `Updated scope settings for ${asset.origin}.`, {
+        projectId: project.id,
+        assetId: asset.id,
+        origin: asset.origin,
+        thirdParty: asset.thirdParty,
+        includeSubdomains: nextIncludeSubdomains,
+        approvedInDefaultScope: nextDefaultScope.includes(asset.origin),
+      })
+      return {
+        id: asset.id,
+        includeSubdomains: nextIncludeSubdomains,
+        approvedInDefaultScope: nextDefaultScope.includes(asset.origin),
+      }
     })
   }
 
@@ -5222,12 +5278,21 @@ export class Store {
   private saveCandidate(projectId: string, input: Omit<Candidate, 'id'>, replace = true) {
     const candidate = {
       id: randomUUID(), projectId, origin: input.origin, source: redact(input.source),
-      thirdParty: input.thirdParty, prepared: input.prepared ?? null,
+      thirdParty: input.thirdParty,
+      includeSubdomains: !input.thirdParty && Boolean(input.includeSubdomains),
+      prepared: input.prepared ?? null,
+      dnsSource: input.dnsSource ?? null,
     }
     const insert = this.db.insert(tables.projectAssets).values(candidate)
     if (replace) return insert.onConflictDoUpdate({
       target: [tables.projectAssets.projectId, tables.projectAssets.origin],
-      set: { source: candidate.source, thirdParty: candidate.thirdParty, ...(input.prepared === undefined ? {} : { prepared: input.prepared }) },
+      set: {
+        source: candidate.source,
+        thirdParty: candidate.thirdParty,
+        ...(input.includeSubdomains === undefined ? {} : { includeSubdomains: candidate.includeSubdomains }),
+        ...(input.prepared === undefined ? {} : { prepared: input.prepared }),
+        ...(input.dnsSource === undefined ? {} : { dnsSource: input.dnsSource }),
+      },
     }).returning().get()
     insert.onConflictDoNothing().run()
     return this.db.select().from(tables.projectAssets).where(and(
@@ -5235,17 +5300,21 @@ export class Store {
     )).get()!
   }
 
-  suggestCandidateHost(run: Run, origin: string, source: string, thirdParty = false) {
+  suggestCandidateHost(run: Run, origin: string, source: string, thirdParty = false, dnsSource?: DnsSource | null) {
     if (run.candidates.some(candidate => candidate.origin === origin)) {
       return { added: false, origin }
     }
-    const asset = this.saveCandidate(run.projectId, { origin, source: redact(source), thirdParty }, false)
+    const asset = this.saveCandidate(
+      run.projectId,
+      { origin, source: redact(source), thirdParty, ...(dnsSource !== undefined ? { dnsSource } : {}) },
+      false,
+    )
     const discovery = this.workerList(run.id).find(worker => worker.phase === 'discovery' && worker.assetId === null)
     const sourceEv = discovery && this.recordInventory(run, discovery, 'Candidate source', [asset])
     const candidate = sourceEv ? { ...asset, sourceEvidenceId: sourceEv.id } : asset
     this.updateRun(run.id, { candidates: [...run.candidates, candidate] })
     this.event(run.id, 'asset.candidate', `Worker suggested candidate host ${origin} (unapproved until scope approval).`, {
-      id: asset.id, origin: asset.origin, source: redact(source), sourceEvidenceId: sourceEv?.id,
+      id: asset.id, origin: asset.origin, source: redact(source), thirdParty, sourceEvidenceId: sourceEv?.id,
     })
     return { added: true, id: asset.id, origin: asset.origin }
   }

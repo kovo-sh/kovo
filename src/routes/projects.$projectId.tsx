@@ -13,6 +13,7 @@ import {
   saveGithubToken,
   syncGithubRepositories,
   testPersonaAuthAction,
+  updateProjectAssetScope,
   updateProjectLabConfigAction,
   updateProjectSandboxAllowlistAction,
 } from '../actions.ts'
@@ -183,6 +184,8 @@ function ProjectPage() {
   const navigate = useNavigate()
   const labAllowed = project.environment === 'local-lab' && localLabEnvEnabled
   const [panel, setPanel] = useState<'candidate' | 'dns' | 'access'>()
+  const [candidateThirdParty, setCandidateThirdParty] = useState(false)
+  const [candidateIncludeSubdomains, setCandidateIncludeSubdomains] = useState(false)
   const [addingPersona, setAddingPersona] = useState(false)
   const [inlinePersonaOpen, setInlinePersonaOpen] = useState(false)
   const [starting, setStarting] = useState(runs.length === 0)
@@ -796,13 +799,45 @@ function ProjectPage() {
         }
         void inventoryAction.submit(() => addProjectAsset({ data: {
           requestId: crypto.randomUUID(), projectId: project.id,
-          origin: String(form.get('origin')), source: String(form.get('source')), thirdParty: form.has('thirdParty'),
+          origin: String(form.get('origin')), source: String(form.get('source')),
+          thirdParty: candidateThirdParty,
+          includeSubdomains: project.environment === 'public' && !candidateThirdParty && candidateIncludeSubdomains,
           prepared: prepared as Parameters<typeof addProjectAsset>[0]['data']['prepared'],
-        } }), () => setPanel(undefined))
+        } }), () => {
+          setCandidateThirdParty(false)
+          setCandidateIncludeSubdomains(false)
+          setPanel(undefined)
+        })
       }}>
         <label>Host<Input name="origin" placeholder="docs.example.com" required /></label>
         <label>Source<Input name="source" placeholder="Service ownership inventory" required maxLength={160} /></label>
-        <label className="checkbox"><Checkbox name="thirdParty" aria-label="Third-party service" /> Third-party service</label>
+        <label className="checkbox">
+          <Checkbox
+            name="thirdParty"
+            checked={candidateThirdParty}
+            aria-label="Third-party service"
+            onCheckedChange={checked => {
+              const next = Boolean(checked)
+              setCandidateThirdParty(next)
+              if (next) setCandidateIncludeSubdomains(false)
+            }}
+          />
+          <span>Third-party service</span>
+        </label>
+        {project.environment === 'public' && !candidateThirdParty && <div className="field-grid">
+          <label className="checkbox">
+            <Checkbox
+              name="includeSubdomains"
+              checked={candidateIncludeSubdomains}
+              aria-label="Include subdomains (*.domain)"
+              onCheckedChange={checked => setCandidateIncludeSubdomains(Boolean(checked))}
+            />
+            <span>Include subdomains (<code>*.domain</code>)</span>
+          </label>
+          <span className="muted small-note">
+            Enables passive CT-log + live DNS discovery in Phase 0 for first-party subdomains. Managed third-party SaaS CNAMEs stay unchecked and require explicit approval.
+          </span>
+        </div>}
         <Collapsible className="provider-advanced">
           <CollapsibleTrigger render={<Button variant="ghost" className="collapsible-trigger" />}>Supply prepared evidence</CollapsibleTrigger>
           <CollapsibleContent keepMounted>
@@ -814,12 +849,73 @@ function ProjectPage() {
         <FormError error={inventoryAction.error} />
         <div className="form-actions"><Button type="submit" variant="default" disabled={inventoryAction.pending}>Add to project</Button></div>
       </form>}
-      <ul className="project-list">{assets.map(asset => <li key={asset.id}>
-        <div className="list-row"><span><strong>{safeHost(asset.origin)}</strong>
-          <small>{asset.source}{asset.dnsSource ? ` · ${asset.dnsSource.zone}` : ''}{asset.accessPolicy ? ' · Access policy records' : ''}</small></span>
-          <span className="muted btn-nowrap">{asset.thirdParty ? 'Third party' : project.defaultScope.includes(asset.origin) ? 'Project default' : 'Candidate'}</span>
-        </div>
-      </li>)}</ul>
+      <ul className="project-list">{assets.map(asset => {
+        const externalCname = asset.dnsSource?.externalAliases?.[0]
+        const isDefaultApproved = project.defaultScope.includes(asset.origin)
+        const hostLabel = safeHost(asset.origin)
+        return <li key={asset.id}>
+          <div className="list-row">
+            <span>
+              <span className="inline-badges">
+                <strong>{hostLabel}</strong>
+                {asset.includeSubdomains && !asset.thirdParty && <span className="badge badge-trace">*.{asset.dnsSource?.zone ?? hostLabel}</span>}
+                {asset.thirdParty && externalCname
+                  ? <span className="badge badge-attention">Third-party CNAME ({externalCname})</span>
+                  : asset.thirdParty
+                    ? <span className="badge badge-attention">Third party</span>
+                    : null}
+              </span>
+              <small>
+                {asset.source}
+                {asset.dnsSource ? ` · ${asset.dnsSource.zone}` : ''}
+                {asset.accessPolicy ? ' · Access policy records' : ''}
+              </small>
+            </span>
+            <div className="toolbar">
+              {project.environment === 'public' && !asset.thirdParty && (
+                <label className="checkbox small-note" title="Auto-admit live first-party subdomains discovered via passive CT logs (excludes third-party SaaS CNAMEs)">
+                  <Checkbox
+                    checked={Boolean(asset.includeSubdomains)}
+                    disabled={inventoryAction.pending}
+                    aria-label={`Include subdomains for ${hostLabel}`}
+                    onCheckedChange={checked => {
+                      const next = Boolean(checked)
+                      void inventoryAction.submit(() => updateProjectAssetScope({ data: {
+                        requestId: crypto.randomUUID(),
+                        projectId: project.id,
+                        assetId: asset.id,
+                        includeSubdomains: next,
+                      } }), () => setNotice(`${next ? 'Enabled' : 'Disabled'} *.domain passive discovery for ${hostLabel}.`))
+                    }}
+                  />
+                  <span><code>*.domain</code></span>
+                </label>
+              )}
+              {asset.thirdParty ? (
+                <label className="checkbox small-note" title="Third-party CNAMEs stay unchecked by default; check only if you have authorization to test this custom domain">
+                  <Checkbox
+                    checked={isDefaultApproved}
+                    disabled={inventoryAction.pending}
+                    aria-label={`Approve third-party host ${hostLabel} in project scope`}
+                    onCheckedChange={checked => {
+                      const next = Boolean(checked)
+                      void inventoryAction.submit(() => updateProjectAssetScope({ data: {
+                        requestId: crypto.randomUUID(),
+                        projectId: project.id,
+                        assetId: asset.id,
+                        approveInDefaultScope: next,
+                      } }), () => setNotice(`${next ? 'Explicitly approved' : 'Removed'} third-party host ${hostLabel} ${next ? 'in' : 'from'} project scope.`))
+                    }}
+                  />
+                  <span>{isDefaultApproved ? 'Approved in scope' : 'Approve in scope'}</span>
+                </label>
+              ) : (
+                <span className="muted btn-nowrap">{isDefaultApproved ? 'Project default' : 'Candidate'}</span>
+              )}
+            </div>
+          </div>
+        </li>
+      })}</ul>
     </section>
 
     <section className="stacked-section" aria-label="Persona vault">
