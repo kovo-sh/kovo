@@ -256,6 +256,40 @@ const DERIVED_SECRET_KINDS = new Set<DerivedSecretKind>([
 ])
 const INJECT_CAPABILITY_TARGETS = new Set<InjectCapabilityTarget>(['bearer', 'header', 'cookie', 'url'])
 const BROKER_FORBIDDEN_CALLER_HEADER_RE = /^(?:authorization|proxy-authorization|cookie)$/i
+const INLINE_CAP_RE = /(?<!\[redacted:)(?<![A-Za-z0-9_])cap(?::|%3[aA])hop_[A-Za-z0-9._-]+(?::|%3[aA])[A-Za-z0-9._-]+/g
+const EXACT_BEARER_CAP_RE = /^(?:Bearer\s+)?(cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+)\s*$/i
+const EXACT_INLINE_CAP_RE = /^cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$/
+
+function normalizeDerivedSecretKind(raw: unknown): DerivedSecretKind | undefined {
+  if (raw === undefined || raw === null) return undefined
+  if (typeof raw !== 'string') throw new Error(`Unsupported capability kind "${String(raw)}".`)
+  const norm = raw.trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (!norm) return undefined
+  if (DERIVED_SECRET_KINDS.has(norm as DerivedSecretKind)) return norm as DerivedSecretKind
+  if (/(?:^|_)jwt(?:$|_)/.test(norm)) return 'jwt'
+  if (/oidc|assertion/.test(norm)) return 'oidc_assertion'
+  if (/salt/.test(norm)) return 'signing_salt'
+  if (/cookie/.test(norm)) return 'cookie'
+  if (/signed.*url|presigned|url/.test(norm)) return 'signed_url'
+  if (/header/.test(norm)) return 'header_secret'
+  if (/bearer|access_token|identity_session/.test(norm)) return 'bearer_token'
+  if (/signing|hmac|secret_key|private_key|mac_key|key_material/.test(norm)) return 'hmac_key'
+  if (/api_key|token|pat/.test(norm)) return 'api_token'
+  if (/secret|key/.test(norm)) return 'hmac_key'
+  return 'generic_secret'
+}
+
+function setHeaderCI(map: Record<string, string>, name: string, value: string): void {
+  const lower = name.toLowerCase()
+  for (const key of Object.keys(map)) {
+    if (key.toLowerCase() === lower) delete map[key]
+  }
+  map[name] = value
+}
+
+function hasInlineCapCandidate(text: string): boolean {
+  return text.includes('cap:') || /cap%3a/i.test(text)
+}
 
 export class VerifyRpcServer {
   readonly nonce: string
@@ -519,7 +553,8 @@ export class VerifyRpcServer {
     const { origin } = this.scopeOrigin(originArg)
     if (originArg !== undefined && typeof originArg !== 'string') throw new Error('origin must be a string.')
     const rawPath = rawPathInput ?? '/'
-    if (typeof rawPath !== 'string' || !rawPath.startsWith('/') || rawPath.startsWith('//') || rawPath.length > MAX_PATH_LENGTH || /[\r\n\0]/.test(rawPath)) {
+    const isExactCapPath = typeof rawPath === 'string' && isDerivedCapabilityHandle(rawPath.trim())
+    if (typeof rawPath !== 'string' || (!isExactCapPath && (!rawPath.startsWith('/') || rawPath.startsWith('//'))) || rawPath.length > MAX_PATH_LENGTH || /[\r\n\0]/.test(rawPath)) {
       throw new Error('Request path is invalid or exceeds the 8 KiB limit.')
     }
     const method = String(args.method ?? 'GET').toUpperCase()
@@ -650,72 +685,230 @@ export class VerifyRpcServer {
     return 'bearer'
   }
 
+  private resolveInlineHandle(
+    handle: string, targetUrl: string, method: string, mode: 'url' | 'header' | 'bearer', headerName?: string,
+  ): { rawValue: string; attestation: CapabilityConsumptionAttestation } {
+    if (mode === 'bearer') {
+      const injected = this.capabilityVault.injectCapabilityIntoRequest({ handle, target: 'bearer', runId: this.capabilityVault.runId, request: { url: targetUrl, method, headers: {} } })
+      return { rawValue: (injected.request.headers?.Authorization ?? '').replace(/^Bearer\s+/i, ''), attestation: injected.attestation }
+    }
+    if (mode === 'header') {
+      const hName = headerName ?? 'X-Guardian-Inline-Resolve'
+      const injected = this.capabilityVault.injectCapabilityIntoRequest({ handle, target: 'header', headerName: hName, runId: this.capabilityVault.runId, request: { url: targetUrl, method, headers: {} } })
+      return { rawValue: injected.request.headers?.[hName] ?? '', attestation: injected.attestation }
+    }
+    const injected = this.capabilityVault.injectCapabilityIntoRequest({ handle, target: 'url', queryParam: '__guardian_resolve__', runId: this.capabilityVault.runId, request: { url: targetUrl, method, headers: {} } })
+    return { rawValue: new URL(injected.request.url).searchParams.get('__guardian_resolve__') ?? '', attestation: injected.attestation }
+  }
+
   private applyCapabilityInjection(
-    brokerRequest: BrokerHttpRequest,
-    requestMeta: VerifyTranscriptRequest,
-    cap: ParsedCapabilityArg | null,
+    brokerRequest: BrokerHttpRequest, requestMeta: VerifyTranscriptRequest, cap: ParsedCapabilityArg | null,
   ): {
-    brokerRequest: BrokerHttpRequest
-    grant: Grant
-    requestMeta: VerifyTranscriptRequest
-    attestation: CapabilityConsumptionAttestation | null
-    injectedHeaders: Record<string, string>
+    brokerRequest: BrokerHttpRequest; grant: Grant; requestMeta: VerifyTranscriptRequest
+    attestation: CapabilityConsumptionAttestation | null; attestations: CapabilityConsumptionAttestation[]; injectedHeaders: Record<string, string>
   } {
     const vaultSecrets = vaultScrubDescriptors(this.capabilityVault)
-    const baseReq: BrokerHttpRequest = {
-      ...brokerRequest,
-      ...(vaultSecrets.length > 0 ? { secrets: [...(brokerRequest.secrets ?? []), ...vaultSecrets] } : {}),
+    const baseReq: BrokerHttpRequest = { ...brokerRequest, ...(vaultSecrets.length > 0 ? { secrets: [...(brokerRequest.secrets ?? []), ...vaultSecrets] } : {}) }
+    const attestationsById = new Map<string, CapabilityConsumptionAttestation>()
+    const recordAtt = (att: CapabilityConsumptionAttestation) => { if (!attestationsById.has(att.consumedCapabilityId)) attestationsById.set(att.consumedCapabilityId, att) }
+    const decodeCap = (m: string) => (/%3[aA]/.test(m) ? m.replace(/%3[aA]/g, ':') : m)
+    const knownHandles = this.capabilityVault.list().map(m => m.handle).sort((a, b) => b.length - a.length)
+    const splitCap = (raw: string): { handle: string; suffix: string } => {
+      if (this.capabilityVault.getMeta(raw)) return { handle: raw, suffix: '' }
+      const hit = knownHandles.find(h => raw.startsWith(h) && /^[._-]/.test(raw.slice(h.length)))
+      return hit ? { handle: hit, suffix: raw.slice(hit.length) } : { handle: raw, suffix: '' }
     }
-    if (!cap) {
-      return {
-        brokerRequest: baseReq,
-        grant: this.options.grant,
-        requestMeta,
-        attestation: null,
-        injectedHeaders: {},
-      }
-    }
-    const target = this.inferCapabilityTarget(cap)
-    const baseUrl = new URL(baseReq.pathAndQuery, baseReq.origin).href
-    const origHeaders = { ...(baseReq.headers ?? {}) }
-    const injected = this.capabilityVault.injectCapabilityIntoRequest({
-      handle: cap.handle,
-      target,
-      ...(cap.headerName ? { headerName: cap.headerName } : {}),
-      ...(cap.cookieName ? { cookieName: cap.cookieName } : {}),
-      ...(cap.queryParam ? { queryParam: cap.queryParam } : {}),
-      runId: this.capabilityVault.runId,
-      request: {
-        url: baseUrl,
-        method: baseReq.method,
-        headers: origHeaders,
-      },
+    const redactCaps = (s: string) => s.replace(new RegExp(INLINE_CAP_RE.source, 'g'), (m) => {
+      const { handle, suffix } = splitCap(decodeCap(m))
+      return `[redacted:${handle}]${suffix}`
     })
+    const replaceInline = (
+      text: string, targetUrl: string, mode: 'url' | 'header' | 'bearer',
+      opts?: { headerName?: string; rejectCrlf?: boolean; jsonEscape?: boolean; onHandle?: (h: string) => void },
+    ): string => text.replace(new RegExp(INLINE_CAP_RE.source, 'g'), (match) => {
+      const isEncoded = /%3[aA]/.test(match)
+      const { handle, suffix } = splitCap(decodeCap(match))
+      const { rawValue, attestation } = this.resolveInlineHandle(handle, targetUrl, baseReq.method, mode, opts?.headerName)
+      if (opts?.rejectCrlf && /[\r\n\0]/.test(rawValue)) throw new Error('Inline capability value contains control characters.')
+      recordAtt(attestation)
+      opts?.onHandle?.(handle)
+      const val = isEncoded ? encodeURIComponent(rawValue) : (opts?.jsonEscape && /["\\\r\n\t\x00-\x1f]/.test(rawValue) ? JSON.stringify(rawValue).slice(1, -1) : rawValue)
+      return `${val}${suffix}`
+    })
+
     let nextOrigin = baseReq.origin
     let nextPathAndQuery = baseReq.pathAndQuery
-    if (injected.request.url !== baseUrl) {
-      const parsedUrl = new URL(injected.request.url)
-      if (!this.options.grant.canRead(parsedUrl.origin)) {
-        throw new Error('Derived capability destination is outside the current assignment scope.')
-      }
-      nextOrigin = parsedUrl.origin
-      nextPathAndQuery = parsedUrl.pathname + parsedUrl.search
-    }
-    const nextHeaders: Record<string, string> = {}
+    let nextBody = baseReq.body
+    const workingHeaders: Record<string, string> = { ...(baseReq.headers ?? {}) }
+    const injectedByCapKeys = new Set<string>()
     const authHeaders: Record<string, string> = {}
     const metaHeaders: Record<string, string> = { ...requestMeta.headers }
     const injectedHeaders: Record<string, string> = {}
-    for (const [k, v] of Object.entries(injected.request.headers ?? {})) {
-      const changed = origHeaders[k] !== v
-      if (changed) injectedHeaders[k] = v
-      if (BROKER_FORBIDDEN_CALLER_HEADER_RE.test(k)) {
-        authHeaders[k] = v
-        metaHeaders[k] = `[redacted:${cap.handle}]`
-      } else {
-        nextHeaders[k] = v
-        metaHeaders[k] = changed ? `[redacted:${cap.handle}]` : v
+    let primaryAuthHandle: string | null = null
+
+    // 1) Explicit capability argument injection
+    if (cap) {
+      const target = this.inferCapabilityTarget(cap)
+      const baseUrl = new URL(nextPathAndQuery.startsWith('/') ? nextPathAndQuery : '/', nextOrigin).href
+      const capInputHeaders: Record<string, string> = {}
+      for (const [k, v] of Object.entries(workingHeaders)) {
+        if (!BROKER_FORBIDDEN_CALLER_HEADER_RE.test(k) || (target === 'cookie' && /^cookie$/i.test(k) && !hasInlineCapCandidate(v))) {
+          capInputHeaders[k] = v
+        }
+      }
+      const injected = this.capabilityVault.injectCapabilityIntoRequest({
+        handle: cap.handle, target, runId: this.capabilityVault.runId,
+        ...(cap.headerName ? { headerName: cap.headerName } : {}),
+        ...(cap.cookieName ? { cookieName: cap.cookieName } : {}),
+        ...(cap.queryParam ? { queryParam: cap.queryParam } : {}),
+        request: { url: baseUrl, method: baseReq.method, headers: capInputHeaders },
+      })
+      recordAtt(injected.attestation)
+      if (injected.request.url !== baseUrl) {
+        const parsedUrl = new URL(injected.request.url)
+        if (!this.options.grant.canRead(parsedUrl.origin)) throw new Error('Derived capability destination is outside the current assignment scope.')
+        nextOrigin = parsedUrl.origin
+        nextPathAndQuery = parsedUrl.pathname + parsedUrl.search
+      }
+      for (const [k, v] of Object.entries(injected.request.headers ?? {})) {
+        if (capInputHeaders[k] === v) continue
+        injectedHeaders[k] = v
+        injectedByCapKeys.add(k.toLowerCase())
+        if (BROKER_FORBIDDEN_CALLER_HEADER_RE.test(k)) {
+          setHeaderCI(authHeaders, k, v)
+          setHeaderCI(metaHeaders, k, `[redacted:${cap.handle}]`)
+          primaryAuthHandle = primaryAuthHandle ?? cap.handle
+          for (const wk of Object.keys(workingHeaders)) if (wk.toLowerCase() === k.toLowerCase()) delete workingHeaders[wk]
+        } else {
+          setHeaderCI(workingHeaders, k, v)
+          setHeaderCI(metaHeaders, k, `[redacted:${cap.handle}]`)
+        }
       }
     }
+
+    // 2) Inline `cap:hop_...` placeholders in URL path/query
+    const trimmedPath = nextPathAndQuery.trim()
+    if (EXACT_INLINE_CAP_RE.test(trimmedPath)) {
+      const urlBase = new URL('/', nextOrigin).href
+      const resolved = this.resolveInlineHandle(trimmedPath, urlBase, baseReq.method, 'url')
+      if (/^https?:\/\//i.test(resolved.rawValue)) {
+        const injected = this.capabilityVault.injectCapabilityIntoRequest({
+          handle: trimmedPath, target: 'url', runId: this.capabilityVault.runId, request: { url: urlBase, method: baseReq.method, headers: {} },
+        })
+        const parsedUrl = new URL(injected.request.url)
+        if (!this.options.grant.canRead(parsedUrl.origin)) throw new Error('Derived capability destination is outside the current assignment scope.')
+        nextOrigin = parsedUrl.origin
+        nextPathAndQuery = parsedUrl.pathname + parsedUrl.search
+        recordAtt(injected.attestation)
+      } else if (resolved.rawValue.startsWith('/') && !resolved.rawValue.startsWith('//') && !/[\r\n\0]/.test(resolved.rawValue) && resolved.rawValue.length <= MAX_PATH_LENGTH) {
+        nextPathAndQuery = resolved.rawValue
+        recordAtt(resolved.attestation)
+      } else {
+        throw new Error('Request path is invalid or exceeds the 8 KiB limit.')
+      }
+    } else if (hasInlineCapCandidate(nextPathAndQuery)) {
+      const urlBase = new URL(nextPathAndQuery, nextOrigin).href
+      nextPathAndQuery = replaceInline(nextPathAndQuery, urlBase, 'url', { rejectCrlf: true })
+      if (!nextPathAndQuery.startsWith('/') || nextPathAndQuery.startsWith('//') || nextPathAndQuery.length > MAX_PATH_LENGTH) {
+        throw new Error('Request path is invalid or exceeds the 8 KiB limit.')
+      }
+    }
+
+    // 3) Inline `cap:hop_...` placeholders in headers (routing Authorization/Cookie through auth targets)
+    const targetUrl = new URL(nextPathAndQuery, nextOrigin).href
+    const nextHeaders: Record<string, string> = {}
+    for (const [k, v] of Object.entries(workingHeaders)) {
+      if (injectedByCapKeys.has(k.toLowerCase()) || !hasInlineCapCandidate(v) || !new RegExp(INLINE_CAP_RE.source, 'g').test(v)) {
+        nextHeaders[k] = v
+        continue
+      }
+      if (/^authorization$/i.test(k)) {
+        const exactBearer = EXACT_BEARER_CAP_RE.exec(v)
+        if (exactBearer) {
+          const handle = exactBearer[1]!
+          const injected = this.capabilityVault.injectCapabilityIntoRequest({
+            handle, target: 'bearer', runId: this.capabilityVault.runId, request: { url: targetUrl, method: baseReq.method, headers: {} },
+          })
+          const resolvedAuth = injected.request.headers!.Authorization!
+          setHeaderCI(authHeaders, 'Authorization', resolvedAuth)
+          injectedHeaders['Authorization'] = resolvedAuth
+          setHeaderCI(metaHeaders, k, `[redacted:${handle}]`)
+          recordAtt(injected.attestation)
+          primaryAuthHandle = primaryAuthHandle ?? handle
+        } else {
+          const resolvedAuth = replaceInline(v, targetUrl, 'bearer', { onHandle: h => { primaryAuthHandle = primaryAuthHandle ?? h } })
+          setHeaderCI(authHeaders, 'Authorization', resolvedAuth)
+          injectedHeaders['Authorization'] = resolvedAuth
+          setHeaderCI(metaHeaders, k, redactCaps(v))
+        }
+      } else if (/^cookie$/i.test(k)) {
+        const existingAuthCookie = Object.entries(authHeaders).find(([ak]) => /^cookie$/i.test(ak))?.[1]
+        const cookieHeaders: Record<string, string> = existingAuthCookie ? { Cookie: existingAuthCookie } : {}
+        let firstHandle: string | null = null
+        const metaSegs: string[] = []
+        for (const rawSeg of v.split(';')) {
+          const seg = rawSeg.trim()
+          if (!seg) continue
+          if (!new RegExp(INLINE_CAP_RE.source, 'g').test(seg)) {
+            cookieHeaders.Cookie = cookieHeaders.Cookie ? `${cookieHeaders.Cookie}; ${seg}` : seg
+            metaSegs.push(seg)
+            continue
+          }
+          const eq = seg.indexOf('=')
+          const rhs = eq > 0 ? seg.slice(eq + 1).trim() : seg
+          if ((eq > 0 && EXACT_INLINE_CAP_RE.test(rhs)) || (eq === -1 && EXACT_INLINE_CAP_RE.test(seg))) {
+            const cookieName = eq > 0 ? seg.slice(0, eq).trim() : undefined
+            const injected = this.capabilityVault.injectCapabilityIntoRequest({
+              handle: rhs, target: 'cookie', ...(cookieName ? { cookieName } : {}),
+              runId: this.capabilityVault.runId, request: { url: targetUrl, method: baseReq.method, headers: cookieHeaders },
+            })
+            cookieHeaders.Cookie = injected.request.headers!.Cookie!
+            recordAtt(injected.attestation)
+            firstHandle = firstHandle ?? rhs
+            metaSegs.push(cookieName ? `${cookieName}=[redacted:${rhs}]` : `[redacted:${rhs}]`)
+          } else {
+            const resolvedSeg = replaceInline(seg, targetUrl, 'header', { headerName: 'X-Guardian-Inline-Resolve', onHandle: h => { firstHandle = firstHandle ?? h } })
+            cookieHeaders.Cookie = cookieHeaders.Cookie ? `${cookieHeaders.Cookie}; ${resolvedSeg}` : resolvedSeg
+            metaSegs.push(redactCaps(seg))
+          }
+        }
+        if (firstHandle && cookieHeaders.Cookie) {
+          setHeaderCI(authHeaders, 'Cookie', cookieHeaders.Cookie)
+          injectedHeaders['Cookie'] = cookieHeaders.Cookie
+          setHeaderCI(metaHeaders, k, metaSegs.join('; '))
+          primaryAuthHandle = primaryAuthHandle ?? firstHandle
+        } else {
+          nextHeaders[k] = v
+        }
+      } else if (/^proxy-authorization$/i.test(k)) {
+        const resolvedVal = replaceInline(v, targetUrl, 'bearer', { onHandle: h => { primaryAuthHandle = primaryAuthHandle ?? h } })
+        setHeaderCI(authHeaders, k, resolvedVal)
+        injectedHeaders[k] = resolvedVal
+        setHeaderCI(metaHeaders, k, redactCaps(v))
+      } else {
+        const resolvedVal = replaceInline(v, targetUrl, 'header', { headerName: k })
+        nextHeaders[k] = resolvedVal
+        injectedHeaders[k] = resolvedVal
+        setHeaderCI(metaHeaders, k, redactCaps(v))
+      }
+    }
+
+    // 4) Inline `cap:hop_...` placeholders in request body
+    if (typeof nextBody === 'string' && hasInlineCapCandidate(nextBody)) {
+      let isJsonBody = false
+      const trimmedBody = nextBody.trimStart()
+      if (trimmedBody.startsWith('{') || trimmedBody.startsWith('[')) {
+        try { JSON.parse(nextBody); isJsonBody = true } catch { isJsonBody = false }
+      }
+      nextBody = replaceInline(nextBody, targetUrl, 'url', { jsonEscape: isJsonBody })
+    }
+
+    const attestations = [...attestationsById.values()]
+    if (attestations.length === 0) {
+      return { brokerRequest: baseReq, grant: this.options.grant, requestMeta, attestation: null, attestations: [], injectedHeaders: {} }
+    }
+
+    // 5) Package capability-injected Authorization/Cookie headers into an ephemeral persona
     let effectiveGrant: Grant = this.options.grant
     let effectivePersona = baseReq.persona
     if (Object.keys(authHeaders).length > 0) {
@@ -730,38 +923,24 @@ export class VerifyRpcServer {
         Object.assign(mergedBundleHeaders, baseInjected)
         baseRoleLabel = basePersona.roleLabel
       }
-      Object.assign(mergedBundleHeaders, authHeaders)
-      // Use the capability handle itself as the ephemeral persona handle so RequestBroker's
-      // personaSecrets() redacts echoed derived secrets as `[redacted:<cap:hop_...>]`.
-      const ephemeralHandle = cap.handle
+      for (const [k, v] of Object.entries(authHeaders)) setHeaderCI(mergedBundleHeaders, k, v)
+      const ephemeralHandle = primaryAuthHandle ?? attestations[0]!.consumedCapabilityId
       const ephemeralPersona: ResolvedPersona = {
-        id: ephemeralHandle,
-        handle: ephemeralHandle,
-        roleLabel: baseRoleLabel,
-        originAllowlist: [nextOrigin],
-        authKind: 'login',
-        headerName: null,
-        secret: '',
-        canaryMarkers: [],
-        session: {
-          headerType: 'header',
-          value: 'derived',
-          adapterUsed: 'derived-capability',
-          bundle: {
-            v: 2,
-            headers: mergedBundleHeaders,
-          },
-        },
+        id: ephemeralHandle, handle: ephemeralHandle, roleLabel: baseRoleLabel, originAllowlist: [nextOrigin],
+        authKind: 'login', headerName: null, secret: '', canaryMarkers: [],
+        session: { headerType: 'header', value: 'derived', adapterUsed: 'derived-capability', bundle: { v: 2, headers: mergedBundleHeaders } },
       }
       const nextPersonas = new Map(this.options.grant.personas ?? [])
       nextPersonas.set(ephemeralHandle, ephemeralPersona)
       effectiveGrant = { ...this.options.grant, personas: nextPersonas }
       effectivePersona = ephemeralHandle
     }
+
     const nextBrokerReq: BrokerHttpRequest = {
       ...baseReq,
       origin: nextOrigin,
       pathAndQuery: nextPathAndQuery,
+      ...(nextBody !== undefined ? { body: nextBody } : {}),
       ...(Object.keys(nextHeaders).length > 0 ? { headers: nextHeaders } : { headers: undefined }),
       ...(effectivePersona ? { persona: effectivePersona } : {}),
       secrets: [...(baseReq.secrets ?? []), ...vaultScrubDescriptors(this.capabilityVault)],
@@ -771,20 +950,18 @@ export class VerifyRpcServer {
       origin: nextOrigin,
       pathAndQuery: this.scrub(nextPathAndQuery),
       headers: metaHeaders,
-      consumedCapabilityId: injected.attestation.consumedCapabilityId,
+      ...(nextBody !== baseReq.body ? {
+        bodyBytes: nextBody ? Buffer.byteLength(nextBody) : 0,
+        bodySha256: createHash('sha256').update(this.scrub(nextBody ?? '')).digest('hex'),
+      } : {}),
+      consumedCapabilityId: attestations[0]!.consumedCapabilityId,
     }
-    return {
-      brokerRequest: nextBrokerReq,
-      grant: effectiveGrant,
-      requestMeta: nextMeta,
-      attestation: injected.attestation,
-      injectedHeaders,
-    }
+    return { brokerRequest: nextBrokerReq, grant: effectiveGrant, requestMeta: nextMeta, attestation: attestations[0] ?? null, attestations, injectedHeaders }
   }
 
   private detectCryptoAttestationsForRequest(
     brokerRequest: BrokerHttpRequest,
-    consumedCapabilityId: string | null,
+    consumedCapabilityIds: readonly string[],
     injectedHeaders: Record<string, string>,
   ): HostCryptoAttestation[] {
     const matched: HostCryptoAttestation[] = []
@@ -795,8 +972,8 @@ export class VerifyRpcServer {
       seen.add(key)
       matched.push({ ...att })
     }
-    if (consumedCapabilityId) {
-      const jwtAtt = this.jwtDerivations.get(consumedCapabilityId)
+    for (const capId of consumedCapabilityIds) {
+      const jwtAtt = this.jwtDerivations.get(capId)
       if (jwtAtt) add(jwtAtt)
     }
     if (this.hmacDerivations.size > 0) {
@@ -823,7 +1000,7 @@ export class VerifyRpcServer {
     brokerRequest: BrokerHttpRequest,
     requestMeta: VerifyTranscriptRequest,
     result: { body: string; respHeaders: Record<string, string> },
-    attestation: CapabilityConsumptionAttestation | null,
+    attestations: readonly CapabilityConsumptionAttestation[],
     cryptoAttestations: HostCryptoAttestation[],
     cleanSession: boolean,
   ): void {
@@ -838,7 +1015,7 @@ export class VerifyRpcServer {
       ...Object.entries(requestMeta.headers).map(([k, v]) => `${k}: ${v}`),
       brokerRequest.body ?? '',
     ].join('\n'))
-    if (attestation) {
+    for (const attestation of attestations) {
       prov.consumedCapabilities.add(attestation.consumedCapabilityId)
       prov.injectedRequestDigests.add(attestation.digest)
     }
@@ -874,6 +1051,7 @@ export class VerifyRpcServer {
 
   private exchangeView(record: VerifyTranscriptRecord, result: BrokerExchangeResult, extra?: {
     consumedCapabilityId?: string | null
+    consumedCapabilities?: string[]
     derivedFromCapabilityIds?: string[]
   }) {
     return this.scrubRecord({
@@ -892,6 +1070,7 @@ export class VerifyRpcServer {
       durationMs: result.durationMs,
       personaHandle: record.request?.personaHandle ?? null,
       ...(extra?.consumedCapabilityId ? { consumedCapabilityId: extra.consumedCapabilityId } : {}),
+      ...(extra?.consumedCapabilities?.length ? { consumedCapabilities: extra.consumedCapabilities } : {}),
       ...(extra?.derivedFromCapabilityIds?.length ? { derivedFromCapabilityIds: extra.derivedFromCapabilityIds } : {}),
     })
   }
@@ -900,9 +1079,10 @@ export class VerifyRpcServer {
     const parsed = this.parseHttpArgs(args)
     const capArg = this.parseCapabilityArg(args)
     const applied = this.applyCapabilityInjection(parsed.brokerRequest, parsed.requestMeta, capArg)
+    const consumedIds = applied.attestations.map(a => a.consumedCapabilityId)
     const cryptoAttestations = this.detectCryptoAttestationsForRequest(
       applied.brokerRequest,
-      applied.attestation?.consumedCapabilityId ?? null,
+      consumedIds,
       applied.injectedHeaders,
     )
     const requestMeta: VerifyTranscriptRequest = {
@@ -949,12 +1129,13 @@ export class VerifyRpcServer {
         applied.brokerRequest,
         requestMeta,
         { body: result.body, respHeaders: result.respHeaders },
-        applied.attestation,
+        applied.attestations,
         cryptoAttestations,
         cleanSession,
       )
       return this.exchangeView(record, { ...result, body }, {
         consumedCapabilityId: applied.attestation?.consumedCapabilityId ?? null,
+        consumedCapabilities: consumedIds,
         derivedFromCapabilityIds: [...new Set(cryptoAttestations.map(a => a.derivedFromCapabilityId))],
       })
     } catch (error) {
@@ -1454,13 +1635,7 @@ export class VerifyRpcServer {
         ? args.hopId.trim()
         : exchangeId
 
-    let kind: DerivedSecretKind | undefined
-    if (args.kind !== undefined) {
-      if (typeof args.kind !== 'string' || !DERIVED_SECRET_KINDS.has(args.kind as DerivedSecretKind)) {
-        throw new Error(`Unsupported capability kind "${String(args.kind)}".`)
-      }
-      kind = args.kind as DerivedSecretKind
-    }
+    const kind = normalizeDerivedSecretKind(args.kind)
     const ttlMs = args.ttlMs === null ? null : typeof args.ttlMs === 'number' ? args.ttlMs : undefined
     const allowedOrigins = Array.isArray(args.allowedOrigins)
       ? args.allowedOrigins.filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
@@ -1739,7 +1914,7 @@ export class VerifyRpcServer {
         const applied = this.applyCapabilityInjection(parsedPoll.brokerRequest, parsedPoll.requestMeta, capArg)
         const cryptoAtts = this.detectCryptoAttestationsForRequest(
           applied.brokerRequest,
-          applied.attestation?.consumedCapabilityId ?? null,
+          applied.attestations.map(a => a.consumedCapabilityId),
           applied.injectedHeaders,
         )
         const sessionKey = applied.brokerRequest.session ?? '__default__'
@@ -1793,12 +1968,13 @@ export class VerifyRpcServer {
         last.applied.brokerRequest,
         reqMeta,
         { body: last.result.body, respHeaders: last.result.respHeaders },
-        last.applied.attestation,
+        last.applied.attestations,
         last.cryptoAtts,
         last.cleanSession,
       )
       finalExchangeView = this.exchangeView(finalRecord, { ...last.result, body: scrubbedBody }, {
         consumedCapabilityId: last.applied.attestation?.consumedCapabilityId ?? null,
+        consumedCapabilities: last.applied.attestations.map(a => a.consumedCapabilityId),
         derivedFromCapabilityIds: [...new Set(last.cryptoAtts.map(a => a.derivedFromCapabilityId))],
       })
     }
