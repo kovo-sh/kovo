@@ -2,8 +2,8 @@
 // builds against these shapes; the app shells mirror the domain subset they need so a materialized
 // white-box source tree stays self-contained.
 
-export type AppName = 'paygrid'
-export const appNames: readonly AppName[] = ['paygrid']
+export type AppName = 'paygrid' | 'connecthub'
+export const appNames: readonly AppName[] = ['paygrid', 'connecthub']
 
 export type BenchMode = 'black-box' | 'grey-box' | 'white-box'
 export type LabMode = 'vulnerable' | 'hardened'
@@ -24,8 +24,20 @@ export const personaIds: readonly PersonaId[] = [
 
 export type TenantId = 'org_a' | 'org_b' | 'org_c'
 
-export type ServiceId = 'edge' | 'api' | 'worker' | 'idp' | 'vault.internal'
-export const serviceIds: readonly ServiceId[] = ['edge', 'api', 'worker', 'idp', 'vault.internal']
+export type ServiceId =
+  | 'edge'
+  | 'api'
+  | 'worker'
+  | 'idp'
+  | 'vault.internal'
+  | 'portal'
+  | 'oauth'
+  | 'webhook-relay'
+  | 'billing.internal'
+export const serviceIds: readonly ServiceId[] = [
+  'edge', 'api', 'worker', 'idp', 'vault.internal',
+  'portal', 'oauth', 'webhook-relay', 'billing.internal',
+]
 
 export type Role = 'owner' | 'admin' | 'member' | 'viewer' | 'finance' | 'bot'
 
@@ -44,6 +56,10 @@ export type TerminalImpactKind =
   | 'forged_settlement'
   | 'cross_tenant_export'
   | 'ledger_overcredit'
+  | 'delegated_billing_rebate'
+  | 'cross_tenant_secret_read'
+  | 'split_refund_ledger_break'
+  | 'cross_tenant_partner_export'
 
 export type HopDropReason =
   | 'capability_not_extracted'

@@ -15,8 +15,13 @@ export const APPS_ROOT = join(BENCH_ROOT, 'apps')
 const COPIED_RUNTIME = ['safety.ts', 'egress.ts', 'vfs.ts'] as const
 const SCANNED = new Set(['.ts', '.js', '.mjs', '.json', '.md', '.html'])
 const BANNED_CONTENT =
-  /vulnerab\w*|\bhardened\b|\bdecoy\w*\b|\boracle\w*\b|\bsolver\w*\b|CWE-\d+|ground.?truth|PG-[CD]\d/i
+  /vulnerab\w*|\bhardened\b|\bdecoy\w*\b|\boracle\w*\b|\bsolver\w*\b|CWE-\d+|ground.?truth|(?:PG|CH)-[CD]\d/i
 const BANNED_PATH_SEGMENTS = new Set(['truth', 'solvers', 'solver', 'decoy', 'oracle', 'chains'])
+
+const SERVICES_BY_APP: Record<AppName, string[]> = {
+  paygrid: ['edge', 'api', 'worker', 'idp', 'vault.internal'],
+  connecthub: ['portal', 'api', 'oauth', 'webhook-relay', 'billing.internal'],
+}
 
 export interface MaterializeInput {
   app: AppName
@@ -84,10 +89,10 @@ export function materialize(input: MaterializeInput): MaterializeResult {
     seedSet: input.plan.seedSet,
     routePrefix: input.plan.routePrefix,
     tenants: input.plan.tenants,
-    services: ['edge', 'api', 'worker', 'idp', 'vault.internal'],
+    services: SERVICES_BY_APP[input.app],
   }
   writeFileSync(join(root, 'variant.json'), `${JSON.stringify(descriptor, null, 2)}\n`)
-  writeFileSync(join(root, 'README.md'), '# paygrid lab source snapshot\n')
+  writeFileSync(join(root, 'README.md'), `# ${input.app} lab source snapshot\n`)
 
   assertNoLeakage(root)
   return {
