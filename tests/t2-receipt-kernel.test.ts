@@ -252,7 +252,7 @@ test('H-5: replay-verifier rejects untrusted recipe/agentScript envelopes and en
       origin,
       method: 'GET',
       pathAndQuery: '/search?q=ok',
-      controlPathAndQuery: '/search?q=ok',
+      controlPathAndQuery: `/search?q=${encodeURIComponent("ok' AND 1=1-- -")}`,
       probePathAndQuery: `/search?q=${encodeURIComponent("ok' AND 1=2-- -")}`,
       param: 'q',
       vulnClass: 'sqli',
