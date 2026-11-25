@@ -9,6 +9,8 @@ import {
 import { Icon } from '../run/icons.tsx'
 import { Checkbox } from '../ui/checkbox.tsx'
 import { Input } from '../ui/input.tsx'
+import type { GithubAppInstallationSummary } from '../../server/github-connector.ts'
+import { GithubInstallBanner } from './GithubInstallBanner.tsx'
 import type { DiscoveredGithubRepo } from './types.ts'
 
 export interface GithubPatStatusSummary {
@@ -20,6 +22,11 @@ export interface GithubPatStatusSummary {
   expiresAt?: string | null
   githubDeviceFlowConfigured?: boolean
   clientIdSource?: 'env' | 'vault' | null
+  appSlug?: string | null
+  installUrl?: string | null
+  installations?: GithubAppInstallationSummary[]
+  privateRepoCount?: number
+  needsAppInstall?: boolean
 }
 
 interface ActiveDeviceFlow {
@@ -507,6 +514,18 @@ export function CreateProjectGithubBlock({
       </div>
 
       <div className="cp-gh-panel">
+        <GithubInstallBanner
+          authKind={patStatus.authKind}
+          tokenKind={patStatus.tokenKind}
+          login={patStatus.login}
+          installUrl={patStatus.installUrl}
+          installations={patStatus.installations}
+          privateRepoCount={patStatus.privateRepoCount}
+          needsAppInstall={patStatus.needsAppInstall}
+          loading={loadingRepos}
+          onRefresh={() => void handleRefresh()}
+          compact
+        />
         {loadingRepos && !reposLoaded ? (
           <span className="muted">Loading repositories…</span>
         ) : error ? (
