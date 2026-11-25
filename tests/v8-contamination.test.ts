@@ -14,11 +14,16 @@ import {
   ANTI_HEURISTIC_CEILING,
   aggregateMultihopCells,
   assertMultihopPreflight,
+  briefingToOpenApiByOrigin,
   buildHopDepthFunnel,
   computeEfficiencyMetrics,
   evaluateAntiHeuristicGate,
   evaluateTwoSideConfirmation,
+  loadMultihopRuntime,
   parseMultihopArgs,
+  pickLoginPath,
+  pickLoginUrl,
+  planCell,
 } from '../scripts/benchmark-multihop.ts'
 import type { MultihopCellMeta, MultihopChainVerdict, SubmittedCompositeProof } from '../scripts/benchmark-multihop.ts'
 import { PreflightError, emptySnapshotMeta } from '../scripts/benchmark-realistic.ts'
@@ -371,5 +376,69 @@ describe('v8 multihop-saas product runner (scripts/benchmark-multihop.ts)', () =
       aggregateMultihopCells([{ ...baseCell, hardenedTwinDecoyFps: 1, precision: 0 }]).hardenedTwinGatePassed,
       false,
     )
+  })
+
+  it('bridges benchmarks/multihop-saas/run.ts cleanly across paygrid, shipforge, and nexusiam', async () => {
+    const prevAllow = process.env.GUARDIAN_ALLOW_LOCAL_LAB
+    process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+    try {
+      const runtime = await loadMultihopRuntime()
+      const seeds = (await runtime.listSeeds()) as { apps: string[]; dev: number[] }
+      assert.ok(Array.isArray(seeds.dev) && seeds.dev.length >= 3)
+      for (const appName of ['paygrid', 'shipforge', 'nexusiam'] as const) {
+        assert.ok(seeds.apps.includes(appName), `expected ${appName} in discovered apps`)
+        const started = await runtime.startMultihopApp({ app: appName, seed: 1 })
+        try {
+          assert.equal(started.app, appName)
+          assert.ok(started.origin.startsWith('http://127.0.0.1:'))
+          assert.ok(Array.isArray(started.oracle.events()))
+          assert.ok(Array.isArray(started.oracle.requests()))
+
+          const black = runtime.briefingFor(started, 'black-box')
+          assert.equal(black.apiReference, undefined)
+          assert.equal(black.sourceDir, undefined)
+          assert.ok(black.personas.length <= 3)
+          assert.ok(black.personas.every(p => typeof p.role === 'string' && p.role.length > 0))
+          assert.doesNotThrow(() => planCell(black, null))
+
+          const white = runtime.briefingFor(started, 'white-box')
+          assert.ok((white.apiReference?.length ?? 0) > 20)
+          assert.ok(typeof white.sourceDir === 'string' && white.sourceDir.length > 0)
+          const loginPath = pickLoginPath(white)
+          assert.ok(loginPath, `${appName} should expose a login path`)
+          const loginUrl = pickLoginUrl(white, loginPath)
+          assert.ok(loginUrl && loginUrl.startsWith('http://127.0.0.1:'), `${appName} loginUrl should resolve`)
+          const byOrigin = briefingToOpenApiByOrigin(white)
+          assert.ok(byOrigin.length >= 2, `${appName} should split OpenAPI across public service origins`)
+          assert.doesNotThrow(() => planCell(white, loginPath))
+
+          const card = runtime.gradeRun({
+            groundTruth: started.groundTruth,
+            findings: [],
+            compositeReceipts: [],
+            oracleEvents: started.oracle.events(),
+            requestLog: started.oracle.requests(),
+            egressLog: started.oracle.egress?.() ?? [],
+            ...(started.oracle.export ? { oracleExport: started.oracle.export() } : {}),
+            telemetry: { startedAtMs: 0, endedAtMs: 100, totalCostUsd: 0, budgetUsd: 5, budgetExhausted: false },
+            mode: 'white-box',
+          })
+          assert.equal(card.chainsTotal, 4)
+          assert.equal(card.chainsConfirmed, 0)
+          assert.equal(card.precision, 1)
+          assert.equal(card.unmatchedFalsePositives, 0)
+          assert.equal(card.chains?.length, 4)
+          assert.match(runtime.renderScorecard(card, 'md'), /Hop-Depth Funnel/)
+          assert.doesNotThrow(() => JSON.parse(runtime.renderScorecard(card, 'json')))
+        } finally {
+          await started.stop()
+          // Idempotent stop check
+          await started.stop()
+        }
+      }
+    } finally {
+      if (prevAllow === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
+      else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prevAllow
+    }
   })
 })
