@@ -143,9 +143,6 @@ import {
   diminishingReturnsDryThreshold,
   plannerDebounceMs,
   intentLeaseMs,
-  deterministicFloorWallClockShare,
-  deterministicLaneMaxWallClockMs,
-  deterministicLaneWallClockShare,
   resolvePhaseRequestBudgets,
   resolveFloorLaneMode,
   chainHypothesisDispatchSteps,
@@ -284,6 +281,57 @@ export interface ExecutionOptions {
 }
 
 export type ExecutionCheckpoint = 'phase0' | 'deterministic-lane' | 'post-floor' | 'planner-round'
+
+export const SOURCE_AUDIT_DEFAULT_WALL_CLOCK_MS = 120_000
+export const SOURCE_AUDIT_MIN_WALL_CLOCK_MS = 45_000
+export const SOURCE_AUDIT_MAX_WALL_CLOCK_MS = 90_000
+export const SOURCE_AUDIT_WALL_CLOCK_SHARE = 0.15
+export const SOURCE_AUDIT_SHORT_RUN_THRESHOLD_MS = 15 * 60_000
+export const SOURCE_AUDIT_SHORT_RUN_MAX_TURNS = 8
+export const PHASE_A_FLOOR_MIN_WALL_CLOCK_MS = 15_000
+export const PHASE_A_FLOOR_MAX_WALL_CLOCK_MS = 75_000
+export const PHASE_A_FLOOR_WALL_CLOCK_SHARE = 0.12
+
+/**
+ * Proportional wall-clock cap for Phase 1B Source-First Code Audit so Phase A never consumes half
+ * of a timed run before Phase B dispatches Wave 1 workers.
+ */
+export function resolveSourceAuditWallClockMs(maxDurationMs?: number): number {
+  if (typeof maxDurationMs === 'number' && Number.isFinite(maxDurationMs) && maxDurationMs > 0) {
+    return Math.max(
+      SOURCE_AUDIT_MIN_WALL_CLOCK_MS,
+      Math.min(SOURCE_AUDIT_MAX_WALL_CLOCK_MS, Math.floor(maxDurationMs * SOURCE_AUDIT_WALL_CLOCK_SHARE)),
+    )
+  }
+  return SOURCE_AUDIT_DEFAULT_WALL_CLOCK_MS
+}
+
+/** Cap interactive code-audit turns to <= 8 on short timed runs (<= 15m). */
+export function resolveSourceAuditMaxTurns(workerMaxTurns?: number, maxDurationMs?: number): number {
+  const base = Math.max(6, Math.min(workerMaxTurns || defaultCodeAuditMaxTurns, defaultCodeAuditMaxTurns))
+  if (typeof maxDurationMs === 'number' && Number.isFinite(maxDurationMs) && maxDurationMs > 0 && maxDurationMs <= SOURCE_AUDIT_SHORT_RUN_THRESHOLD_MS) {
+    return Math.min(base, SOURCE_AUDIT_SHORT_RUN_MAX_TURNS)
+  }
+  return base
+}
+
+/**
+ * Proportional Phase A deterministic floor wall-clock cap for agentic runs (`hasProfiles: true`).
+ * `--no-llm` runs (`hasProfiles: false`) return `undefined` so they retain full floor budget.
+ */
+export function resolvePhaseAFloorWallClockMs(
+  maxDurationMs: number | undefined,
+  options: { hasProfiles: boolean },
+): number | undefined {
+  if (!options.hasProfiles) return undefined
+  if (typeof maxDurationMs === 'number' && Number.isFinite(maxDurationMs) && maxDurationMs > 0) {
+    return Math.max(
+      PHASE_A_FLOOR_MIN_WALL_CLOCK_MS,
+      Math.min(PHASE_A_FLOOR_MAX_WALL_CLOCK_MS, Math.floor(maxDurationMs * PHASE_A_FLOOR_WALL_CLOCK_SHARE)),
+    )
+  }
+  return PHASE_A_FLOOR_MAX_WALL_CLOCK_MS
+}
 
 /** Per-run accounting for the split request budgets (never persisted; telemetry only). */
 interface PhaseRequestState {
@@ -2148,7 +2196,14 @@ export class Execution {
     const approvedOrigins = new Set(approvedAssets.map(a => a.origin))
     if (!approvedOrigins.size) return { suspects: [], stepsCreated: [] }
 
-    const auditMaxTurns = Math.max(6, Math.min(run.workerMaxTurns || defaultCodeAuditMaxTurns, defaultCodeAuditMaxTurns))
+    const runMaxDuration = Number((run as { maxDurationMs?: number }).maxDurationMs)
+    const effectiveMaxDurationMs = Number.isFinite(runMaxDuration) && runMaxDuration > 0
+      ? runMaxDuration
+      : this.maxDurationMs
+    const auditWallMs = resolveSourceAuditWallClockMs(effectiveMaxDurationMs)
+    const auditSettlementMs = Math.min(Math.floor(auditWallMs * 0.8), wallClockSettlementMs(auditWallMs))
+    const semanticTimeoutMs = Math.min(35_000, Math.floor(auditWallMs * 0.45))
+    const auditMaxTurns = resolveSourceAuditMaxTurns(run.workerMaxTurns, effectiveMaxDurationMs)
     const auditPhase = run.phase === 'investigation' ? 'investigation' : 'threat_model'
     const auditWorker = this.storage.makeWorker(
       run,
@@ -2170,8 +2225,8 @@ export class Execution {
 
     const job: Active = { assignment: claimed, origins: new Set(approvedOrigins), controller }
     this.active.set(claimed.id, job)
-    this.storage.event(run.id, 'code_audit.started', `Source-First Code Audit started across ${mountedRepos.length} mounted ${mountedRepos.length === 1 ? 'repo' : 'repos'}.`, {
-      assignmentId: claimed.id, mountedRepos,
+    this.storage.event(run.id, 'code_audit.started', `Source-First Code Audit started across ${mountedRepos.length} mounted ${mountedRepos.length === 1 ? 'repo' : 'repos'} (wall cap ${Math.round(auditWallMs / 1000)}s, max ${auditMaxTurns} turns).`, {
+      assignmentId: claimed.id, mountedRepos, auditWallMs, auditSettlementMs, semanticTimeoutMs, auditMaxTurns,
     })
 
     const { grant, secrets, currentSecrets } = this.buildGrant(job, run, approvedOrigins)
@@ -2188,9 +2243,15 @@ export class Execution {
       const personasPub = publicPersonasFromGrant(grant)
 
       // Stage 1-3 deterministic + semantic code audit pipeline (IRIS + call-graph + git history)
+      // Bounded by `semanticTimeoutMs` so Stage 1-3 leaves budget for interactive audit + Phase B.
+      const semanticController = new AbortController()
+      const onAuditAbortForSemantic = () => semanticController.abort(controller.signal.reason)
+      controller.signal.addEventListener('abort', onAuditAbortForSemantic, { once: true })
+      if (controller.signal.aborted) semanticController.abort(controller.signal.reason)
+      let semanticTimer: NodeJS.Timeout | undefined
       try {
         const hostTiersForAudit = computeHostTiers([...approvedOrigins], threatModel)
-        const semanticRes = await runThreeStageSemanticAudit({
+        const semanticPromise = runThreeStageSemanticAudit({
           storage: this.storage,
           run,
           assignment: claimed,
@@ -2201,7 +2262,7 @@ export class Execution {
           approvedOrigins: [...approvedOrigins],
           hostTiers: hostTiersForAudit,
           modelProfiles: resolveProfilePoolForRole('reasoning', profiles),
-          signal: controller.signal,
+          signal: semanticController.signal,
           secrets: currentSecrets(),
           liveEndpoints: this.storage.listEndpoints(run.id)
             .filter(ep => approvedOrigins.has(ep.origin))
@@ -2217,6 +2278,16 @@ export class Execution {
           enableStage1Llm: process.env.GUARDIAN_STAGE1_LLM !== '0',
           persistToStore: true,
         })
+        semanticPromise.catch(() => undefined)
+        const semanticTimeout = new Promise<never>((_, reject) => {
+          semanticTimer = setTimeout(() => {
+            const err = new Error(`Semantic audit sub-timeout reached (${semanticTimeoutMs}ms).`)
+            semanticController.abort(err)
+            reject(err)
+          }, semanticTimeoutMs)
+          semanticTimer.unref?.()
+        })
+        const semanticRes = await Promise.race([semanticPromise, semanticTimeout])
         const semanticSteps = toChainStepInputs(run, semanticRes.rankedSuspects, hostTiersForAudit, semanticRes.persistedFactIds)
         const existingTitles = new Set(this.storage.listChainSteps(run.id, run.goalRevision).map(s => s.title.trim().toLowerCase()))
         for (const stInput of semanticSteps) {
@@ -2226,46 +2297,58 @@ export class Execution {
           existingTitles.add(key)
         }
       } catch {
-        // Semantic audit is additive; continue with interactive code auditor session
+        // Semantic audit is additive and sub-timeout bounded; continue with interactive code auditor session
+      } finally {
+        if (semanticTimer) clearTimeout(semanticTimer)
+        controller.signal.removeEventListener('abort', onAuditAbortForSemantic)
       }
 
-      const sessionResult = await runAgentSession({
-        directory: this.storage.directory,
-        sessionId: claimed.sessionId,
-        requestId: `code-audit:${run.id}:${run.goalRevision}:${run.scopeRevision}`,
-        profiles: resolveProfilePoolForRole('reasoning', profiles),
-        scenario: 'code-auditor',
-        roleAffinity: 'reasoning',
-        prompt: codeAuditPrompt({
-          goal: run.goal,
-          capabilityTier: run.capabilityTier,
-          approvedOrigins: [...approvedOrigins],
-          mountedRepos,
-          personas: personasPub,
-          specsSummary: stagedSpecs,
-          threatModel,
-          maxTurns: auditMaxTurns,
-        }),
-        signal: controller.signal,
-        maxTurns: auditMaxTurns,
-        compaction: true,
-        enableSettlement: true,
-        requireCompleteIntent: true,
-        shouldSettle: () => (Date.now() - startedAt) >= 8 * 60_000,
-        handlers,
-        secrets,
-        beforeCall: () => {
-          this.check(job)
-          if (this.storage.checkBudgetExceeded(run.id)) {
-            throw new BudgetExceededError('Run spend or request budget exceeded.')
-          }
-        },
-        ...llmRunHooks(this.storage, run.id),
-        onTurn: turn => {
-          this.storage.updateWorker(claimed.id, { turnsUsed: turn })
-          this.storage.recordLlmSpend(run.id, { turns: 1 })
-        },
-      })
+      const remainingAuditWallMs = Math.max(0, auditWallMs - Math.max(0, Date.now() - startedAt))
+      const sessionResult = remainingAuditWallMs > 2_000 && !controller.signal.aborted
+        ? await runAgentSession({
+            directory: this.storage.directory,
+            sessionId: claimed.sessionId,
+            requestId: `code-audit:${run.id}:${run.goalRevision}:${run.scopeRevision}`,
+            profiles: resolveProfilePoolForRole('reasoning', profiles),
+            scenario: 'code-auditor',
+            roleAffinity: 'reasoning',
+            prompt: codeAuditPrompt({
+              goal: run.goal,
+              capabilityTier: run.capabilityTier,
+              approvedOrigins: [...approvedOrigins],
+              mountedRepos,
+              personas: personasPub,
+              specsSummary: stagedSpecs,
+              threatModel,
+              maxTurns: auditMaxTurns,
+            }),
+            signal: controller.signal,
+            maxTurns: auditMaxTurns,
+            wallClockMs: remainingAuditWallMs,
+            compaction: true,
+            enableSettlement: true,
+            requireCompleteIntent: true,
+            shouldSettle: () => (Date.now() - startedAt) >= auditSettlementMs,
+            onWallClockRotate: info => {
+              this.safeEvent(run.id, 'code_audit.wall_clock_rotated',
+                `Source-First Code Audit rotated cleanly at wall-clock budget (${Math.round(info.elapsedMs / 1000)}s / ${Math.round(auditWallMs / 1000)}s, ${info.turnsUsed} turn(s)).`,
+                { assignmentId: claimed.id, auditWallMs, auditSettlementMs, ...info })
+            },
+            handlers,
+            secrets,
+            beforeCall: () => {
+              this.check(job)
+              if (this.storage.checkBudgetExceeded(run.id)) {
+                throw new BudgetExceededError('Run spend or request budget exceeded.')
+              }
+            },
+            ...llmRunHooks(this.storage, run.id),
+            onTurn: turn => {
+              this.storage.updateWorker(claimed.id, { turnsUsed: turn })
+              this.storage.recordLlmSpend(run.id, { turns: 1 })
+            },
+          })
+        : { completion: undefined }
 
       const latestRun = this.storage.run(run.id)
       const suspects = this.storage.listFacts(run.id, { includeTainted: false, kind: 'code_audit_suspect', limit: 100 })
@@ -2440,12 +2523,25 @@ export class Execution {
     return `${run.id}:${run.goalRevision}:${run.scopeRevision}`
   }
 
-  /** `min(240 s, 40% × maxDurationMs)`; deterministicOnly stays unrestricted (no lane there). */
-  private deterministicLaneDeadlineMs(): number {
-    return Math.max(
-      15_000,
-      Math.min(deterministicLaneMaxWallClockMs, Math.floor(this.maxDurationMs * deterministicLaneWallClockShare)),
-    )
+  /** `min(75 s, 12% × maxDurationMs)` on agentic runs; `--no-llm` / deterministicOnly stays unrestricted. */
+  private deterministicLaneDeadlineMs(run?: Pick<Run, 'id'>): number {
+    const runMaxDuration = Number((run as { maxDurationMs?: number } | undefined)?.maxDurationMs)
+    const effectiveMaxDurationMs = Number.isFinite(runMaxDuration) && runMaxDuration > 0
+      ? runMaxDuration
+      : this.maxDurationMs
+    return resolvePhaseAFloorWallClockMs(effectiveMaxDurationMs, { hasProfiles: true }) ?? PHASE_A_FLOOR_MAX_WALL_CLOCK_MS
+  }
+
+  /** Detect whether a restored floor snapshot already populated deterministic floor results for this run. */
+  private hasPreHydratedFloorSnapshot(runId: string): boolean {
+    try {
+      const row = this.storage.client.prepare(
+        `SELECT 1 FROM events WHERE run_id = ? AND kind IN ('deterministic_engine.summary', 'deterministic_floor.summary', 'deterministic_lane.metrics') LIMIT 1`,
+      ).get(runId)
+      return Boolean(row)
+    } catch {
+      return false
+    }
   }
 
   private shouldStartDeterministicLane(run: Run, profiles: readonly ResolvedModelProfile[]): boolean {
@@ -2464,6 +2560,16 @@ export class Execution {
     const seeded = this.prePhase0SeededSteps.get(key)
     if (seeded !== false && this.deterministicSweep !== 'always') return false
     if (this.deterministicInFlight.has(`${key}:engine`) || this.deterministicCompleted.has(`${key}:engine`)) return false
+    if (this.deterministicSweep !== 'always' && this.hasPreHydratedFloorSnapshot(run.id)) {
+      this.agenticLaneCompleted.add(key)
+      this.safeEvent(
+        run.id,
+        'deterministic_lane.skipped',
+        'Skipped redundant Phase A deterministic floor sweep: pre-hydrated floor snapshot is already loaded.',
+        { reason: 'pre_hydrated_floor_snapshot', mode: this.deterministicSweep },
+      )
+      return false
+    }
     return true
   }
 
@@ -2487,12 +2593,12 @@ export class Execution {
     this.agenticFloorStartedAt.set(run.id, Date.now())
     // Phase-A allowance starts here: Phase-0 discovery/scope requests stay outside both phases.
     this.beginFloorRequestPhase(this.storage.run(run.id))
-    const deadlineMs = this.deterministicLaneDeadlineMs()
+    const deadlineMs = this.deterministicLaneDeadlineMs(run)
     try {
       this.storage.event(
         run.id,
         'deterministic_lane.started',
-        `Deterministic floor (Phase A) started before agents (deadline ${Math.round(deadlineMs / 1000)}s, ${Math.round(deterministicFloorWallClockShare * 100)}% of run wall clock).`,
+        `Deterministic floor (Phase A) started before agents (deadline ${Math.round(deadlineMs / 1000)}s, ${Math.round(PHASE_A_FLOOR_WALL_CLOCK_SHARE * 100)}% of run wall clock).`,
         { deadlineMs, maxDurationMs: this.maxDurationMs, mode: this.deterministicSweep, sequential: true },
       )
     } catch { /* run may be gone */ }
@@ -3173,6 +3279,15 @@ export class Execution {
         )
       }
     } catch { /* lead queueing is additive */ }
+
+    // Wave-1 invariant chains: promote high-signal cross-surface / cross-service / entity-lifecycle
+    // hypotheses into ready `chain` lane steps BEFORE Phase B's first dispatch tick.
+    try {
+      this.reconPlanner.ensureWave1InvariantChainSteps(
+        this.storage.run(run.id),
+        this.approvedOriginsSet(run),
+      )
+    } catch { /* invariant chain promotion is additive */ }
 
     const steps = this.storage.listChainSteps(run.id, run.goalRevision)
     const readySteps = steps
