@@ -101,8 +101,11 @@ export async function handleApi(
 
   const org = match(url, method, at('/orgs/:org'))
   if (org) {
+    const session = auth(state, req, res)
+    if (!session) return
     const tenantId = tenantById(state, org[0]!)
-    if (!tenantId) {
+    // Org records are tenant-private: non-members get the same answer as an unknown org.
+    if (!tenantId || !roleOf(state, session, tenantId)) {
       sendJson(res, 404, { error: 'unknown org' })
       return
     }
@@ -117,6 +120,11 @@ export async function handleApi(
     const tenantId = tenantById(state, members[0]!)
     if (!tenantId) {
       sendJson(res, 404, { error: 'unknown org' })
+      return
+    }
+    // Member rosters expose user emails and roles: only tenant members may list them.
+    if (!roleOf(state, session, tenantId)) {
+      sendJson(res, 403, { error: 'not a member of this tenant' })
       return
     }
     sendJson(res, 200, {
