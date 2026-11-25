@@ -7,28 +7,36 @@ Leases are exclusive: a task may start only if its files are not held by an acti
 Format:
 `- [ ] <task> | status: ready|active|blocked | lease: <files> | deps: <task ids or -> | stream: <branch or ->`
 
-## Active (2026-11-24, `main` @ `eec6419`)
+## Active (2026-11-24, `main` @ `fb93a8a`)
 
-- [ ] `queue-13b-cert` — Final Unified Agentic Certification Matrices on `main` @ `eec6419` (Dev `>= 40/59`, Salted Held-Out `>= 32/58`, Tier-1 Smoke 8/8 warm agentic post-floor snapshots) | status: active | lease: Docker benchmark slot | deps: - | stream: `@bench-verifier`
-- [ ] `v7-docs-update` — Record verified milestones through `eec6419` + Queue #13b pending section in `VERIFICATION-v5.md`, `plans/ROADMAP-v5.md`, `plans/STREAM-BACKLOG.md` | status: active | lease: `VERIFICATION-v5.md`, `plans/ROADMAP-v5.md`, `plans/STREAM-BACKLOG.md` | deps: - | stream: `swarm/v7-docs-update`
+- [ ] `v7-smoke-fix` — Fix Tier-1 Smoke `--resume-snapshot` `conversion`/`floorPreserved` accounting bug (caught in Queue #14 Step 3) + update `VERIFICATION-v5.md` §V7.7 & `plans/STREAM-BACKLOG.md` | status: active | lease: `scripts/smoke-agentic.ts`, `tests/v7-tier1-throughput.test.ts`, `VERIFICATION-v5.md`, `plans/STREAM-BACKLOG.md` | deps: - | stream: `swarm/v7-smoke-fix`
+- [ ] `v7-m1-spa` — SPA/client-side surface & agentic lift work on `swarm/v7-m1-spa` | status: active | lease: SPA recon / M1 lift slice | deps: - | stream: `swarm/v7-m1-spa`
+- [ ] `queue-15-cert` — Next Unified Agentic Certification Matrices + Tier-1 Warm Smoke on `main` post-`fb93a8a` (+ `v7-smoke-fix`, `v7-m1-spa`) measuring recovered XSS floor (`f9dc5d4`) + M2/M1 lift | status: ready | lease: Docker benchmark slot | deps: `v7-smoke-fix` | stream: `@bench-verifier`
 
 ## Ready (dispatch when a lease frees)
 
-- [ ] `hos-07-probe-miss` — Investigate & restore `held-out-saas` `hos-07` probe-stage signal miss (`19/20 -> 20/20 + 20/20 patches`) | status: ready | lease: `scripts/benchmark-probes.ts` / engine probe slice | deps: - | stream: -
-- [ ] `tier1-calibration` — Tier-1 smoke calibration study (8 varied builds vs reference) | status: ready | lease: `scripts/smoke-agentic.ts`, traps | deps: `queue-13b-cert` | stream: -
-- [ ] `legacy-tests-cleanup` — Pre-existing suite: `tests/v5-engine-coverage.test.ts` 2 failures (content vs template param pick; OR-branch baseline) & `tests/v4-m4-surface-orchestration.test.ts` teardown hang | status: ready | lease: `tests/` | deps: - | stream: -
+- [ ] `v7-m0-cut3f` — Final Cut 3f `replay-verifier.ts` retirement (`2,657 LOC -> <1K LOC`) behind parity gates (hand off to OpenCode pane 3 after `swarm/v7-m1-spa` commits) | status: ready | lease: `src/server/replay-verifier.ts`, verifier tests | deps: - | stream: `swarm/v7-m0-cut3f`
+- [ ] `tier1-precision-and-p50` — Triage Queue #14 Tier-1 warm `lift` `1 unmatchedFP` and `rotation/opsportal` `p50=268.2s` (>110s gate) | status: ready | lease: `src/server/oracle-invariants.ts`, `src/server/agent-session.ts` | deps: `v7-smoke-fix` | stream: -
+- [ ] `tier1-calibration` — Tier-1 smoke calibration study (8 varied builds vs reference) | status: ready | lease: `scripts/smoke-agentic.ts`, traps | deps: `v7-smoke-fix`, `queue-15-cert` | stream: -
 
-## Blocked (needs a test-migration stream first)
+## Sequence after Queue #14 (`main` @ `fb93a8a`)
 
-- [ ] `browser-vm-delete` — delete the remaining `browser_chain` interaction half of the legacy VM. Blocked: five e2e suites drive navigate/fill/click/dom-sink proofs through `verifyReplaySpec` directly (v3-protocol-browser, v4-e2e T2-05e/T3-05/T3-20, v4-m2 M2.6); each must move onto a `browser_sink` envelope + real `runBrowserSession` before the branch can go. | status: blocked | lease: replay-verifier, tests | stream: agents/cut3d-browser-retire
+1. Merge `swarm/v7-smoke-fix` (resumed snapshot `conversion` fix + §V7.7 provenance) and `swarm/v7-m1-spa`.
+2. Run Queue #15 on `main` post-`fb93a8a` to verify recovered XSS floor (`f9dc5d4`), M1 aggregate recall (`>= 40/59` dev / `>= 32/58` held-out @ 100%), and Tier-1 warm 8/8 gates.
+3. Land `v7-m0-cut3f` (`replay-verifier.ts < 1K LOC`), triage remaining Tier-1 `lift` `unmatchedFP` / `opsportal` p50, then run Tier-1 calibration and begin v8 (`plans/v8.md`).
 
-## Sequence after Queue #13b
+## Completed (through `main` @ `fb93a8a`)
 
-1. Populate `VERIFICATION-v5.md` §V7.7 with Queue #13b exact Dev / Salted Held-Out / Tier-1 Smoke numbers and issue M1 certificate if `>= 40/59` dev, `>= 32/58` held-out, and `100%` precision pass.
-2. Restore `held-out-saas` `hos-07` (`19/20 -> 20/20`).
-3. Run Tier-1 smoke calibration study & continue remaining Cut 3 legacy VM retirements behind parity gates.
-
-## Completed (through `main` @ `eec6419`)
+- [x] `v7-hos07-fix` (`fb93a8a` / `5b77b1c`) — Bumped `BENCH_MAX_REQUESTS_DEFAULT 3800 -> 6000` (`4,228/6,000`, `0` budgetSkipped), added GraphQL object-scoped arg/variable recognition in `isObjectScopedRequest()` keeping bare collection GET fail-closed (`hos-02`), restored `held-out-saas --verify-patches` to **20/20 + 20/20 patches @ 100.0% precision**, and fixed stale assertions/teardown in `tests/v5-engine-coverage.test.ts` & `tests/v4-m4-surface-orchestration.test.ts` (36/36 PASS) | stream: `swarm/v7-hos07-fix`
+- [x] `v7-m0-cut3e` (`f9dc5d4` / `e939298`) — Retired `browser_chain` & 4 legacy VMs from `src/server/replay-verifier.ts` (−806 LOC; now **2,657 LOC**, −1,611 LOC from 4,268) + fixed `4375eb8` auth reflected-XSS `browser_sink` regression (`acme.reflected-search-xss`, `og.account-search-xss`) | stream: `swarm/v7-m0-cut3e`
+- [x] `v7-m2-chains` (`4f09411` / `78f6240`) — M2 white-box-first AST/RBAC diff analysis, typed multi-round 4-hop `ChainHops`, and `reason-bench` readiness | stream: `swarm/v7-m2-chains`
+- [x] `v7-m4-ops` (`53ca9f2` / `d53e237`) — M4 production operations: signed scope, `<2s` kill switch, ZDR/TTL/audit, tenant isolation, coverage gaps, `ProofReceipt` export | stream: `swarm/v7-m4-ops`
+- [x] `v8-plan` (`1a3cebc` / `4d4971d`) — Authored `plans/v8.md` multi-hop realistic SaaS architecture & benchmark plan | stream: `swarm/v8-plan`
+- [x] `queue-14-cert` (`4010d05`) — Full 3-leg Unified Agentic Certification + Tier-1 Warm Smoke (`@bench-verifier`): **100.0% worst-run precision** across both Dev (**36/59**, `$1.716`) and Salted Held-Out (**29/58**, `shopflow` 100.0%, `$1.536`), **21/21** live `agent_script` `ProofReceipt` confirmations (`0` stalls, `0` crashes, `0` conflicts), net-new `acme.invoice-bola` (`CWE-639`) on both matrices, Tier-1 warm **5/8 PASS** (`throughput=12`, `trap-zero=0`, `paired-net-new` `+1`/`+1`, `crashes=0`, `cost` `$1.199`) | stream: `@bench-verifier`
+- [x] `collection-bola-precision` (`4010d05`) — Fail closed on bare collection GET role-inversion BOLA/BFLA receipts without cross-tenant evidence (restored `shopflow` to 100.0% precision) | stream: `swarm/collection-bola-precision`
+- [x] `v7-docs-update` (`643b142`) — Recorded verified v7 milestones and LOC reductions in `VERIFICATION-v5.md`, `plans/ROADMAP-v5.md`, `plans/STREAM-BACKLOG.md` | stream: `swarm/v7-docs-update`
+- [x] `cut3d-browser-retire` (`13111e4`) — Routed `browser_chain` DOM proofs onto `browser_sink` floor recipe (unblocking Cut 3e VM deletion) | stream: `agents/cut3d-browser-retire`
+- [x] `agentic-lift-oracles` (`56afe19`) — Wired `auth_bypass`, `conserved_balance` `race_burst`, POST SSTI, and concrete-ID floor dedupe | stream: `swarm/agentic-lift-oracles`
 
 - [x] `receipt-strict-and-lift` (`eec6419`) — Strict fail-closed `ProofReceipt` gate (closes `#150` receiptless `CWE-200` FP), `guardian_verify` `code`/`source` aliases + 3-error loop breaker, `alreadyConfirmed` cap `10 -> 30` + floor-confirmed BOLA/high-risk dispatch exclusion | stream: `swarm/receipt-strict-and-lift`
 - [x] `hos-parity` (`c3da71f`) — Dotted JSON param nested object carrier fix restoring `held-out-saas` `hos-08` (`18 -> 19/20 + 19/20 patches @ 100%`) | stream: `agents/hos-parity`

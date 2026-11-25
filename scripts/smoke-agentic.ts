@@ -741,6 +741,128 @@ export function preservedSiteIds(card: ScorecardLike | null, baselineIds: string
   return baselineIds.filter(id => matched.has(id)).length
 }
 
+/**
+ * Read active `runtime_confirmed` finding IDs from a `guardian.sqlite` DB (snapshot or resumed).
+ * Used to attribute `claimed_without_impact` rows on `--resume-snapshot` scorecards strictly to
+ * findings that were already `runtime_confirmed` at snapshot capture — never to unverified
+ * post-resume claims.
+ */
+export function runtimeConfirmedFindingIds(dbPath: string): Set<string> {
+  if (!existsSync(dbPath)) return new Set()
+  let db: DatabaseSync | undefined
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true })
+    const rows = db.prepare(
+      "select id from findings where verification_class = 'runtime_confirmed' and superseded_by_finding_id is null",
+    ).all() as Array<{ id?: string }>
+    return new Set(rows.map(row => String(row.id ?? '')).filter(Boolean))
+  } catch {
+    return new Set()
+  } finally {
+    try { db?.close() } catch { /* best-effort */ }
+  }
+}
+
+export interface CellAccountingInput {
+  kind: CellMetrics['kind']
+  source: CellMetrics['source']
+  card: ScorecardLike | null
+  baseline: ScorecardLike | null
+  liftBaseline: number
+  /** Finding IDs already `runtime_confirmed` inside the resumed snapshot's `guardian.sqlite`. */
+  snapshotFindingIds?: ReadonlySet<string>
+  /** Finding IDs currently `runtime_confirmed` inside the resumed run's `guardian.sqlite`. */
+  resumedFindingIds?: ReadonlySet<string>
+}
+
+export interface CellAccounting {
+  confirmed: number
+  floorConfirmed: number | null
+  floorPreserved: number | null
+  netNew: number | null
+  effectiveConfirmed: number
+  conversion: number | null
+}
+
+/**
+ * Pure accounting for lift/rotation cells (both cold and `--resume-snapshot`).
+ *
+ * On `--resume-snapshot`, the target app's oracle starts empty so preserved floor findings in
+ * `guardian.sqlite` match their planted `card.vulns` sites with `outcome: 'claimed_without_impact'`
+ * and `matchedFindingIds` populated, while only post-resume findings earn `outcome: 'confirmed'`.
+ * Preserved floor sites are identified strictly by:
+ *   1. explicit baseline scorecard `vulns` (`baselineIds`), OR
+ *   2. exact finding IDs that were already `runtime_confirmed` in `<snapshot>/guardian.sqlite`
+ *      and still match a planted vuln site in `card.vulns` (or still exist in `resumedFindingIds`
+ *      when `card.vulns` is omitted).
+ *
+ * Effective confirmed sites take the union `preservedSites ∪ confirmedSites` (zero double-counting;
+ * lost floor findings genuinely drop conversion and fail the `conversion drop <= 10pp` gate).
+ */
+export function computeCellAccounting(input: CellAccountingInput): CellAccounting {
+  const { kind, source, card, baseline, liftBaseline } = input
+  const confirmed = card?.confirmed ?? 0
+  const baselineIds = confirmedSiteIds(baseline)
+  const snapIds = input.snapshotFindingIds ?? new Set<string>()
+  const resumedIds = input.resumedFindingIds
+  const floorConfirmed = baseline?.confirmed ?? (kind === 'lift' ? liftBaseline : (source === 'snapshot' && snapIds.size > 0 ? snapIds.size : null))
+
+  if (source !== 'snapshot') {
+    const floorPreserved = kind === 'lift' && baselineIds.length > 0
+      ? preservedSiteIds(card, baselineIds)
+      : null
+    const netNew = kind === 'lift'
+      ? Math.max(0, confirmed - (floorConfirmed ?? 0))
+      : (card ? confirmed : null)
+    const conversion = (card?.targets ?? 0) > 0 ? confirmed / card!.targets! : conversionOf(card)
+    return { confirmed, floorConfirmed, floorPreserved, netNew, effectiveConfirmed: confirmed, conversion }
+  }
+
+  const vulns = card?.vulns ?? []
+  const confirmedSites = new Set(confirmedSiteIds(card))
+  let preservedSites: Set<string> | null = null
+
+  if (baselineIds.length > 0) {
+    const matched = new Set(
+      vulns
+        .filter(vuln => vuln.outcome === 'confirmed' || (vuln.matchedFindingIds?.length ?? 0) > 0)
+        .map(vuln => vuln.siteId),
+    )
+    preservedSites = new Set(baselineIds.filter(id => matched.has(id)))
+  } else if (snapIds.size > 0 && vulns.length > 0) {
+    preservedSites = new Set(
+      vulns
+        .filter(vuln => (vuln.matchedFindingIds ?? []).some(id => snapIds.has(id) && (!resumedIds || resumedIds.has(id))))
+        .map(vuln => vuln.siteId),
+    )
+  }
+
+  let floorPreserved: number | null = null
+  let effectiveConfirmed: number
+  let netNew: number | null
+
+  if (preservedSites !== null) {
+    floorPreserved = preservedSites.size
+    const effectiveSites = new Set<string>([...preservedSites, ...confirmedSites])
+    effectiveConfirmed = effectiveSites.size
+    const freshConfirmed = [...confirmedSites].filter(siteId => !preservedSites.has(siteId)).length
+    netNew = kind === 'lift' || card ? freshConfirmed : null
+  } else if (snapIds.size > 0 && resumedIds) {
+    const surviving = [...snapIds].filter(id => resumedIds.has(id)).length
+    floorPreserved = surviving
+    const cap = (card?.targets ?? 0) > 0 ? card!.targets! : Number.POSITIVE_INFINITY
+    effectiveConfirmed = Math.min(cap, confirmed + surviving)
+    netNew = card ? confirmed : null
+  } else {
+    floorPreserved = null
+    effectiveConfirmed = confirmed
+    netNew = kind === 'lift' || card ? confirmed : null
+  }
+
+  const conversion = (card?.targets ?? 0) > 0 ? effectiveConfirmed / card!.targets! : conversionOf(card)
+  return { confirmed, floorConfirmed, floorPreserved, netNew, effectiveConfirmed, conversion }
+}
+
 export interface ResolvedLiftBaseline {
   card: ScorecardLike
   conversion: number | null
@@ -1145,43 +1267,59 @@ async function runRealisticCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMe
     const baselineDest = join(opts.snapshotRoot, 'baseline', `${plan.app}-seed${opts.seed}-grey-box.json`)
     if (!existsSync(baselineDest)) {
       mkdirSync(dirname(baselineDest), { recursive: true, mode: 0o700 })
-      writeFileSync(baselineDest, `${JSON.stringify({ ...resolvedBaseline.card, source: 'snapshot-after-floor' }, null, 2)}\n`, { mode: 0o600 })
+      const capturedSnapDir = plan.snapshot ? (bestSnapshotDir(plan.snapshot) ?? plan.snapshot) : null
+      const capturedSnapIds = capturedSnapDir
+        ? runtimeConfirmedFindingIds(join(capturedSnapDir, 'guardian.sqlite'))
+        : new Set<string>()
+      const floorVulns = capturedSnapIds.size > 0
+        ? (card?.vulns ?? [])
+            .filter(vuln => (vuln.matchedFindingIds ?? []).some(id => capturedSnapIds.has(id)))
+            .map(vuln => ({ siteId: vuln.siteId, outcome: 'confirmed', matchedFindingIds: vuln.matchedFindingIds }))
+        : []
+      const baselineCard: ScorecardLike = {
+        ...resolvedBaseline.card,
+        ...(floorVulns.length > 0 ? { confirmed: floorVulns.length, vulns: floorVulns } : {}),
+      }
+      writeFileSync(baselineDest, `${JSON.stringify({ ...baselineCard, source: 'snapshot-after-floor' }, null, 2)}\n`, { mode: 0o600 })
     }
   }
-  const baseline = resolvedBaseline?.card ?? null
-  const baselineIds = confirmedSiteIds(baseline)
-  const confirmed = card?.confirmed ?? 0
-  const floorConfirmed = baseline?.confirmed ?? (plan.kind === 'lift' ? opts.liftBaseline : null)
-  const netNew = plan.kind === 'lift'
-    ? (plan.source === 'snapshot' ? confirmed : Math.max(0, confirmed - (floorConfirmed ?? 0)))
-    : (card ? confirmed : null)
-  const floorPreserved = plan.kind === 'lift' && baselineIds.length > 0
-    ? preservedSiteIds(card, baselineIds)
-    : null
-  // A resumed scorecard counts only oracle evidence from this process, so effective lift
-  // conversion = net-new + preserved floor findings over the cell's targets.
-  const effectiveConfirmed = plan.kind === 'lift' && plan.source === 'snapshot'
-    ? confirmed + (floorPreserved ?? 0)
-    : confirmed
-  const conversion = (card?.targets ?? 0) > 0 ? effectiveConfirmed / card!.targets! : conversionOf(card)
-  const log = readLog(logPath)
   const dbPath = plan.source === 'snapshot'
     ? join(plan.outDir, 'data', `${plan.app}-seed${opts.seed}-grey-box-resume`, 'guardian.sqlite')
     : join(dataDir, 'guardian.sqlite')
+  const snapshotDbDir = plan.source === 'snapshot' && plan.snapshot
+    ? (bestSnapshotDir(plan.snapshot) ?? plan.snapshot)
+    : null
+  const snapshotFindingIds = snapshotDbDir
+    ? runtimeConfirmedFindingIds(join(snapshotDbDir, 'guardian.sqlite'))
+    : undefined
+  const resumedFindingIds = plan.source === 'snapshot' && existsSync(dbPath)
+    ? runtimeConfirmedFindingIds(dbPath)
+    : undefined
+  const baseline = resolvedBaseline?.card ?? null
+  const accounting = computeCellAccounting({
+    kind: plan.kind,
+    source: plan.source,
+    card,
+    baseline,
+    liftBaseline: opts.liftBaseline,
+    snapshotFindingIds,
+    resumedFindingIds,
+  })
+  const log = readLog(logPath)
   return {
     id: plan.id,
     kind: plan.kind,
     app: plan.app,
     source: plan.source,
     targets: card?.targets ?? 0,
-    confirmed,
+    confirmed: accounting.confirmed,
     precision: card?.precision ?? 0,
     decoyFalsePositives: card?.decoyFalsePositives ?? 0,
     unmatchedFalsePositives: card?.unmatchedFalsePositives ?? 0,
-    netNew,
-    floorConfirmed,
-    floorPreserved,
-    conversion,
+    netNew: accounting.netNew,
+    floorConfirmed: accounting.floorConfirmed,
+    floorPreserved: accounting.floorPreserved,
+    conversion: accounting.conversion,
     costUsd: card?.totalCostUsd ?? spentUsd(dbPath),
     p50AssignmentMs: assignmentP50Ms(dbPath),
     completedAssignments: meta?.assignments?.completed ?? 0,
@@ -1497,9 +1635,16 @@ async function runMicroCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetric
 async function runLiftCellTwice(plan: CellPlan, opts: SmokeArgs): Promise<{ cell: CellMetrics; rerun: boolean }> {
   const first = await runRealisticCell(plan, opts)
   if (!opts.rerunOnMinusOne || first.netNew === null) return { cell: first, rerun: false }
-  const baselinePath = opts.floorScorecard ?? join(opts.snapshotRoot, 'baseline', `${plan.app}-seed${opts.seed}-grey-box.json`)
-  const baseline = readJson<ScorecardLike>(baselinePath)
-  const baselineConversion = conversionOf(baseline)
+  const resolved = resolveLiftBaseline({
+    floorScorecard: opts.floorScorecard,
+    snapshotRoot: opts.snapshotRoot,
+    defaultSnapshotRoot: join(DEFAULT_OUT, 'snapshots'),
+    snapshotDir: plan.snapshot,
+    app: plan.app,
+    seed: opts.seed,
+    liftTargets: first.targets,
+  })
+  const baselineConversion = resolved?.conversion ?? null
   const improved = baselineConversion !== null && (first.conversion ?? -1) > baselineConversion
   if (first.netNew === opts.liftBaseline - 1 && improved) {
     // Re-run only the lift cell, into a sibling directory so the first artifact is preserved.
