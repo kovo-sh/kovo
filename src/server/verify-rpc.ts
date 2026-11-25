@@ -232,6 +232,8 @@ interface HostExchangeProvenance {
   cleanSession?: boolean
   replayAttempt?: 'mode_a' | 'ablation_control' | 'primary'
   rawRequestBody?: string
+  rawRequestOrigin?: string
+  rawRequestParts?: string[]
   carrierText?: string
 }
 
@@ -1080,11 +1082,9 @@ export class VerifyRpcServer {
     prov.timestampMs = startedAt
     prov.cleanSession = cleanSession
     prov.rawRequestBody = brokerRequest.body
-    prov.carrierText = this.scrub([
-      brokerRequest.pathAndQuery,
-      ...Object.entries(requestMeta.headers).map(([k, v]) => `${k}: ${v}`),
-      brokerRequest.body ?? '',
-    ].join('\n'))
+    prov.rawRequestOrigin = brokerRequest.origin
+    prov.rawRequestParts = [brokerRequest.pathAndQuery, ...Object.values(brokerRequest.headers ?? {}), ...(brokerRequest.body ? [brokerRequest.body] : [])]
+    prov.carrierText = this.scrub([brokerRequest.pathAndQuery, ...Object.entries(requestMeta.headers).map(([k, v]) => `${k}: ${v}`), brokerRequest.body ?? ''].join('\n'))
     for (const attestation of attestations) {
       prov.consumedCapabilities.add(attestation.consumedCapabilityId)
       prov.injectedRequestDigests.add(attestation.digest)
@@ -1689,10 +1689,14 @@ export class VerifyRpcServer {
       ...(allowedOrigins?.length ? { allowedOrigins } : {}),
     })
 
-    // Attach host-side provenance to the originating exchange and retroactively scrub transcript bodies.
+    // Attach host-side provenance to the originating exchange, backfill later requests carrying the sealed value, and rescrub.
     const sourceProv = this.getOrCreateProvenance(exchangeId, sourceRecord.startedAt)
-    sourceProv.emittedCapabilities.add(meta.handle)
-    sourceProv.observedResponseDigests.add(meta.sha256)
+    sourceProv.emittedCapabilities.add(meta.handle); sourceProv.observedResponseDigests.add(meta.sha256)
+    for (const [exId, exProv] of this.exchangeProvenance.entries()) {
+      if (exId === exchangeId || exProv.timestampMs < sourceRecord.startedAt || !exProv.rawRequestParts?.length) continue
+      const hits = this.capabilityVault.matchSealedHandlesInRequest({ runId: this.capabilityVault.runId, targetOrigin: exProv.rawRequestOrigin, parts: exProv.rawRequestParts })
+      if (hits.some(h => h.handleId === meta.handle)) { exProv.consumedCapabilities.add(meta.handle); exProv.injectedRequestDigests.add(meta.sha256) }
+    }
     this.transcript.rescrubBodies(text => this.scrub(text))
 
     const started = this.nextHostTimestampMs()

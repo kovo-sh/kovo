@@ -565,10 +565,12 @@ export interface VerifyCanaryBroker {
 // ---------------------------------------------------------------------------
 
 const GX_ID_RE = /\bgx-[0-9a-f-]{8,}\b/gi
+const REDACTED_TOKEN_RE = /\[redacted(?::[^\]]+)?\]/gi
 const CAP_HANDLE_RE = /\bcap:[A-Za-z0-9_.:-]+\b/g
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
 const LONG_HEX_RE = /\b[0-9a-f]{16,}\b/gi
 const ISO_TS_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?/g
+const COMPOUND_ID_RE = /(?<![a-z0-9])(?!(?:cwe|cve|rfc|iso|sha|aes|rsa|hmac|http|https|utf|tls|jwt)[-_])[a-z]{2,12}[_-](?:\d+[a-z0-9]*[_-][a-z0-9]{2,}|[a-z0-9]*\d[a-z0-9]*[_-](?=[a-z0-9]*\d)[a-z0-9]{2,})(?![a-z0-9])/gi
 const PREFIXED_ID_RE = /(?<![a-z0-9])(?!(?:cwe|cve|rfc|iso|sha|aes|rsa|hmac|http|https|utf|tls|jwt)[-_])[a-z]{2,12}[_-](?=[a-z0-9]*\d)[a-z0-9]{3,}(?![a-z0-9])/gi
 
 /** Remove run-scoped nonces and standard dynamic tokens (for cross-attempt comparison). */
@@ -577,10 +579,12 @@ export function normalizeDynamic(input: string, nonce?: string): string {
   if (nonce) out = out.split(nonce).join('<nonce>')
   return out
     .replace(GX_ID_RE, '<gx>')
+    .replace(REDACTED_TOKEN_RE, '<redacted>')
     .replace(CAP_HANDLE_RE, '<cap>')
     .replace(UUID_RE, '<uuid>')
     .replace(ISO_TS_RE, '<ts>')
     .replace(LONG_HEX_RE, '<hex>')
+    .replace(COMPOUND_ID_RE, '<id>')
     .replace(PREFIXED_ID_RE, '<id>')
 }
 
@@ -1897,6 +1901,31 @@ function normalizedValue(value: unknown, nonce: string): unknown {
   return value
 }
 
+const STANDARD_PATH_PREFIX_RE = /^(?:cwe|cve|rfc|iso|sha|aes|rsa|hmac|http|https|utf|tls|jwt|oauth|v\d+)$/i
+const STANDARD_ALGO_TOKEN_RE = /^(?:sha\d+|aes\d+|hs\d+|rs\d+|es\d+|utf\d+|base\d+|http\d+)$/i
+
+function isDynamicPathSegment(decoded: string): boolean {
+  if (
+    /^\d+$/.test(decoded) ||
+    /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(decoded) ||
+    /^[0-9a-f]{16,}$/i.test(decoded) ||
+    /^gx-[0-9a-f-]{4,}$/i.test(decoded) ||
+    /^cap:[A-Za-z0-9_.:-]+$/.test(decoded) ||
+    /\[redacted(?::[^\]]+)?\]/i.test(decoded) ||
+    /^[a-z]{2,10}_[A-Za-z0-9]{8,}$/.test(decoded) ||
+    (/^[a-z]{2,12}[-_][A-Za-z0-9]{3,}$/i.test(decoded) && /\d/.test(decoded) && !/^(?:cwe|cve|rfc|iso|sha|aes|rsa|hmac|http|https|utf|tls|jwt)[-_]/i.test(decoded))
+  ) return true
+  const parts = decoded.split(/[-_]/)
+  if (parts.length >= 2 && /^[a-z][a-z0-9]*$/i.test(parts[0]!) && !STANDARD_PATH_PREFIX_RE.test(parts[0]!)) {
+    const tail = parts.slice(1)
+    const hasDigitAlnumChunk = tail.some(p => /^(?=[a-z0-9]*\d)[a-z0-9]{4,}$/i.test(p) && !STANDARD_ALGO_TOKEN_RE.test(p))
+    const numericCount = tail.filter(p => /^\d+$/.test(p)).length
+    const digitPartCount = tail.filter(p => /\d/.test(p)).length
+    if (hasDigitAlnumChunk || (parts.length >= 3 && numericCount >= 1 && digitPartCount >= 2)) return true
+  }
+  return false
+}
+
 /** Path template so fresh-session ids do not break agreement. */
 function pathFingerprint(path: string | undefined): string {
   if (!path) return ''
@@ -1907,16 +1936,9 @@ function pathFingerprint(path: string | undefined): string {
     if (segment.includes('%')) {
       try { decoded = decodeURIComponent(segment) } catch { decoded = segment }
     }
-    if (
-      /^\d+$/.test(decoded) ||
-      /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(decoded) ||
-      /^[0-9a-f]{16,}$/i.test(decoded) ||
-      /^gx-[0-9a-f-]{4,}$/i.test(decoded) ||
-      /^cap:[A-Za-z0-9_.:-]+$/.test(decoded) ||
-      /^\[redacted:[^\]]+\]$/i.test(decoded) ||
-      /^[a-z]{2,10}_[A-Za-z0-9]{8,}$/.test(decoded) ||
-      (/^[a-z]{2,12}[-_][A-Za-z0-9]{3,}$/i.test(decoded) && /\d/.test(decoded) && !/^(?:cwe|cve|rfc|iso|sha|aes|rsa|hmac|http|https|utf|tls|jwt)[-_]/i.test(decoded))
-    ) return '*'
+    const extMatch = /^([^./]+)(\.[a-z0-9]{1,8})$/i.exec(decoded)
+    if (extMatch && isDynamicPathSegment(extMatch[1]!)) return `*${extMatch[2]!.toLowerCase()}`
+    if (isDynamicPathSegment(decoded)) return '*'
     return segment.toLowerCase()
   }).join('/')
   // Query parameter names are causal; values are usually nonces/ids.
@@ -2124,12 +2146,27 @@ export function causalFingerprints(
       }
     }
     if (claim.kind === 'composite_receipt') {
-      const termId = claim.terminalExchangeId ?? claim.exchangeIds[claim.exchangeIds.length - 1]
-      const term = termId ? store.get(termId) : undefined
       const obs = asRecord(check.observed)
       const hostRec = claim.verificationId ? store.getCompositeVerification(claim.verificationId) : undefined
       const receipt = asRecord(claim.compositeReceipt)
       const terminalImpact = asRecord(receipt?.terminalImpact)
+      const terminalHopId = typeof terminalImpact?.terminalHopId === 'string' ? terminalImpact.terminalHopId : null
+      const hopsArr = Array.isArray(receipt?.hops) ? receipt.hops.map(asRecord).filter((h): h is Record<string, unknown> => h !== null) : []
+      const termHopObj = (terminalHopId ? hopsArr.find(h => h.hopId === terminalHopId) : null) ?? hopsArr[hopsArr.length - 1] ?? null
+      const termHopExIds = Array.isArray(termHopObj?.exchangeIds)
+        ? termHopObj.exchangeIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
+        : []
+      const termId = claim.terminalExchangeId ?? termHopExIds[termHopExIds.length - 1] ?? claim.exchangeIds[claim.exchangeIds.length - 1]
+      const rawTerm = termId ? store.get(termId) : undefined
+      const is2xxRec = (rec: VerifyTranscriptRecord | undefined): boolean => {
+        const s = rec?.response?.status != null ? Number(rec.response.status) : null
+        return s !== null && s >= 200 && s < 300
+      }
+      // For multi-exchange terminal hops (e.g., concurrent race bursts), the last exchange can be a
+      // non-deterministic non-2xx loser on one run and a 2xx winner on the other; prefer the winning 2xx record.
+      const term = (rawTerm && is2xxRec(rawTerm))
+        ? rawTerm
+        : (termHopExIds.map(id => store.get(id)).find(is2xxRec) ?? rawTerm)
       const terminalOracleFamily = typeof obs?.terminalOracleFamily === 'string'
         ? obs.terminalOracleFamily
         : (typeof terminalImpact?.oracleFamily === 'string' ? terminalImpact.oracleFamily : null)
