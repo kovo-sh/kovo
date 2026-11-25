@@ -2437,7 +2437,7 @@ export function deriveResponseFieldParams(
 }
 
 /** Query keys carried by a same-origin redirect Location are wire-observed for the target route. */
-export function paramCandidatesFromRedirect(targetPath: string, searchParams: Iterable<string>): DiscoveredParamCandidate[] {
+export function paramCandidatesFromRedirect(searchParams: Iterable<string>): DiscoveredParamCandidate[] {
   const out: DiscoveredParamCandidate[] = []
   for (const name of searchParams) {
     if (!PARAM_NAME_RE.test(name)) continue
@@ -3174,7 +3174,13 @@ export function ingestDeclaredApiSurface(input: {
   let specs: Array<{ kind: string; content: string }> = []
   try {
     const run = storage.run(runId)
-    specs = storage.listProjectSpecsFull(run.projectId)
+    const wanted = (() => { try { return new URL(origin).origin } catch { return origin } })()
+    // A project reference can describe several origins (SPA shell, API, IdP, CDN). Parse only the
+    // documents declared for this origin; otherwise every origin would claim every route.
+    specs = storage.listProjectSpecsFull(run.projectId).filter(spec => {
+      if (!spec.origin) return true
+      try { return new URL(spec.origin).origin === wanted } catch { return false }
+    })
   } catch {
     return result
   }
@@ -3498,22 +3504,40 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   // renames resources still gets the full declared surface without any noun wordlist.
   let declaredSurface: Phase0ReconResult['declaredSurface']
   if (normalizedOrigins.length > 0) {
-    declaredSurface = ingestDeclaredApiSurface({
-      storage,
-      runId,
-      scopeRevision,
-      origin: normalizedOrigins[0],
-      dynamicPaths,
-      dynamicParams,
-    })
-    endpointsDiscovered += declaredSurface.endpoints
-    paramsDiscovered += declaredSurface.params
-    if (declaredSurface.declaredOpsSeen > 0) {
+    // The project reference may describe several origins (SPA shell, API, IdP). Ingesting only
+    // the primary origin silently dropped every declared operation of the others, so the engine
+    // never saw body-only API routes or the IdP token/JWKS endpoints.
+    const total: DeclaredSurfaceSummary = {
+      specs: 0, endpoints: 0, params: 0, methods: {}, declaredOpsSeen: 0, declaredOpsMatched: 0, declaredTolerantCapped: 0,
+    }
+    // Declared references may cover origins the run never scopes as targets (external IdP, CDN).
+    // Ingest them so the surface is complete, while the live crawl below stays target-only.
+    const declaredOrigins = new Set(normalizedOrigins)
+    try {
+      for (const spec of storage.listProjectSpecsFull(storage.run(runId).projectId)) {
+        if (!spec.origin) continue
+        try { declaredOrigins.add(new URL(spec.origin).origin) } catch { /* malformed spec origin */ }
+      }
+    } catch { /* no project specs */ }
+    for (const origin of declaredOrigins) {
+      const part = ingestDeclaredApiSurface({ storage, runId, scopeRevision, origin, dynamicPaths, dynamicParams })
+      total.specs += part.specs
+      total.endpoints += part.endpoints
+      total.params += part.params
+      total.declaredOpsSeen += part.declaredOpsSeen
+      total.declaredOpsMatched += part.declaredOpsMatched
+      total.declaredTolerantCapped += part.declaredTolerantCapped
+      for (const [method, count] of Object.entries(part.methods)) total.methods[method] = (total.methods[method] ?? 0) + count
+    }
+    declaredSurface = total
+    endpointsDiscovered += total.endpoints
+    paramsDiscovered += total.params
+    if (total.declaredOpsSeen > 0) {
       storage.event(
         runId,
         'phase0.declared_surface',
-        `Ingested ${declaredSurface.endpoints} new declared operation(s); ${declaredSurface.declaredOpsMatched}/${declaredSurface.declaredOpsSeen} declared operation(s) are visible in the store.`,
-        declaredSurface,
+        `Ingested ${total.endpoints} new declared operation(s); ${total.declaredOpsMatched}/${total.declaredOpsSeen} declared operation(s) are visible in the store.`,
+        total,
       )
     }
   }
@@ -4242,6 +4266,40 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       routeMapEndpoints += expanded.endpoints
       const doc = parseJsonOrYaml(ex.body)
       if (doc && typeof doc === 'object') {
+        // Declared-surface hydration: an OIDC discovery document and a CDN asset manifest both
+        // name routes the origin actually serves. Absolute discovery URLs are accepted only when
+        // they stay on the document's own origin; manifest entries resolve against the document.
+        const docOrigin = (() => { try { return new URL(origin).origin } catch { return origin } })()
+        const recordDeclared = (method: string, pathname: string): void => {
+          if (!pathname.startsWith('/') || pathname.startsWith('//') || /[:{}\s]/.test(pathname)) return
+          recordEndpoint(method, pathname, 'spa_crawl', { authRequirement: 'none' })
+          queueDiscoveredRoute(method, pathname)
+        }
+        for (const key of ['authorization_endpoint', 'token_endpoint', 'jwks_uri', 'userinfo_endpoint', 'end_session_endpoint', 'introspection_endpoint', 'revocation_endpoint', 'registration_endpoint']) {
+          const value = (doc as Record<string, unknown>)[key]
+          if (typeof value !== 'string') continue
+          try {
+            const parsed = new URL(value, docOrigin)
+            if (parsed.origin !== docOrigin) continue
+            recordDeclared(/token|introspection|revocation|registration/.test(key) ? 'POST' : 'GET', parsed.pathname)
+          } catch { /* malformed declaration */ }
+        }
+        for (const key of ['chunks', 'files', 'assets', 'scripts', 'entrypoints']) {
+          const list = (doc as Record<string, unknown>)[key]
+          if (!Array.isArray(list)) continue
+          for (const item of list.slice(0, 64)) {
+            const raw = typeof item === 'string'
+              ? item
+              : item && typeof item === 'object'
+                ? ((item as Record<string, unknown>).file ?? (item as Record<string, unknown>).src ?? (item as Record<string, unknown>).path)
+                : null
+            if (typeof raw !== 'string' || !raw.trim()) continue
+            const clean = (raw.startsWith('/') ? raw : `/${raw.replace(/^\.?\//, '')}`).split('?')[0] ?? ''
+            if (!clean || clean.startsWith('//') || !/^\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{1,512}$/.test(clean)) continue
+            recordEndpoint('GET', clean, 'spa_crawl')
+            if (/\.(?:js|mjs)$/i.test(clean)) queueJsChunk(clean, docPath)
+          }
+        }
         for (const link of extractJsonLinkTargets(ex.body, origin)) navSeeds.push({ path: link, depth: 0 })
         const entries = harvestRouteMapDocument(doc).slice(0, 120)
         const docGetPaths = new Set(entries.filter(entry => entry.method === 'GET').map(entry => normalizeDiscoveryTemplate(entry.path)))
@@ -4898,7 +4956,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       const existing = new Set(existingParams.map(param => `${param.name}|${param.location}`))
       const candidates = orderDiscoveredParams([
         ...(evidence ? deriveResponseFieldParams(bare, evidence.fields, 'GET') : []),
-        ...(evidence ? paramCandidatesFromRedirect(bare, evidence.redirectQuery) : []),
+        ...(evidence ? paramCandidatesFromRedirect(evidence.redirectQuery) : []),
       ]).filter(candidate => !existing.has(`${candidate.name}|${candidate.location}`))
       const inferredExisting = existingParams.filter(param =>
         paramProvenanceOfSource(param.source) !== 'observed' && param.location === 'query')
