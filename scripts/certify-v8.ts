@@ -137,8 +137,10 @@ export interface HopDepthFunnelLike {
   h2?: number
   h3?: number
   h4Plus?: number
+  h4plus?: number
   finalOracle?: number
   compositeReceiptConfirmed?: number
+  receiptConfirmed?: number
   oracleObserved?: number
   twoSideConfirmed?: number
   dropReasons?: Partial<Record<string, number>>
@@ -163,7 +165,17 @@ export interface MultihopChainVerdictInput {
   forbiddenShortcutViolation?: boolean
   compositeReceiptConfirmed?: boolean
   twoSideConfirmed: boolean
+  replayMode?: 'fresh_clean_replay' | 'one_shot_transcript' | string
   dropReason?: string | null
+}
+
+export interface MultihopTwinVerdictInput {
+  twinId: string
+  baseChainId?: string
+  vulnClass?: string
+  falsePositive: boolean
+  matchedFindingIds?: string[]
+  reason?: string
 }
 
 export interface FrontierWasteTelemetry {
@@ -171,6 +183,14 @@ export interface FrontierWasteTelemetry {
   totalAssignmentsDispatched?: number
   phaseBAssignments?: number
   deadEndReprobeWasteRate?: number
+}
+
+export interface MultihopRunTelemetryLike {
+  scheduler?: {
+    totalPhaseBAssignments?: number
+    deadEndReprobes?: number
+    deadEndWastePct?: number
+  } | null
 }
 
 export interface MultihopCellInput {
@@ -200,12 +220,14 @@ export interface MultihopCellInput {
   recall?: number
   precision?: number
   hardenedTwinsTotal?: number
+  decoys?: number
   hardenedTwinDecoyFps?: number
   decoyFalsePositives?: number
   hardenedTwinFalsePositives?: number
   unmatchedFalsePositives?: number
   shortcutViolations?: number
   modeBViolations?: number
+  inert?: boolean
   tpPerDollar?: number | null
   tpPer10m?: number | null
   hopFunnel?: HopDepthFunnelLike | null
@@ -214,13 +236,16 @@ export interface MultihopCellInput {
     hops5to6?: { targets: number; confirmed: number; recall?: number }
   } | null
   chains?: MultihopChainVerdictInput[]
+  hardenedTwins?: MultihopTwinVerdictInput[]
   assignmentsCompleted?: number
   assignmentsTotal?: number
   phaseBAssignments?: number
   totalAssignmentsDispatched?: number
   deadEndReprobeCount?: number
   deadEndReprobeWasteRate?: number
+  deadEndWastePct?: number
   frontier?: FrontierWasteTelemetry | null
+  telemetry?: MultihopRunTelemetryLike | null
   gitSha?: string
 }
 
@@ -252,6 +277,7 @@ export interface NormalizedMultihopCell {
   unmatchedFalsePositives: number
   shortcutViolations: number
   modeBViolations: number
+  inert: boolean
   hopFunnel: HopDepthFunnel
   depthBreakdown: DepthTierBreakdown
   chains: MultihopChainVerdictInput[]
@@ -292,8 +318,10 @@ export interface OssCorpusInput {
   cleanControlCount: number
   cleanControlFpCount: number
   totalFpCount?: number
+  falsePositives?: number
   recall?: number
   precision?: number
+  worstRunPrecision?: number
   patchRetestAttempted?: number
   patchRetestClosed?: number
   patchRetestClosureRate?: number
@@ -518,6 +546,9 @@ export interface V8CertificationReport {
     totalHardenedTwinDecoyFps: number
     totalUnmatchedFalsePositives: number
     totalOssFalsePositives: number
+    totalShortcutViolations: number
+    totalModeBViolations: number
+    inertAgenticCells: number
     passed: boolean
   }
   antiHeuristic: {
@@ -587,6 +618,11 @@ export interface CertifyV8CliArgs {
 
 function finiteNum(value: unknown, fallback = 0): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
+
+function nonNegNum(value: unknown, fallback = 0): number {
+  const n = finiteNum(value, fallback)
+  return n < 0 ? 0 : n
 }
 
 function optionalNum(value: unknown): number | null {
@@ -712,17 +748,20 @@ export function normalizeHopFunnel(
     }
   }
   return {
-    totalChains: finiteNum(raw?.totalChains, fallback?.totalChains ?? 0),
-    H1: finiteNum(raw?.H1 ?? raw?.h1, 0),
-    H2: finiteNum(raw?.H2 ?? raw?.h2, 0),
-    H3: finiteNum(raw?.H3 ?? raw?.h3, 0),
-    H4Plus: finiteNum(raw?.H4Plus ?? raw?.h4Plus, 0),
-    FinalOracle: finiteNum(
+    totalChains: nonNegNum(raw?.totalChains, fallback?.totalChains ?? 0),
+    H1: nonNegNum(raw?.H1 ?? raw?.h1, 0),
+    H2: nonNegNum(raw?.H2 ?? raw?.h2, 0),
+    H3: nonNegNum(raw?.H3 ?? raw?.h3, 0),
+    H4Plus: nonNegNum(raw?.H4Plus ?? raw?.h4Plus ?? raw?.h4plus, 0),
+    FinalOracle: nonNegNum(
       raw?.FinalOracle ?? raw?.finalOracle ?? raw?.oracleObserved,
       fallback?.oracleObserved ?? 0,
     ),
-    CompositeReceiptConfirmed: finiteNum(
-      raw?.CompositeReceiptConfirmed ?? raw?.compositeReceiptConfirmed ?? raw?.twoSideConfirmed,
+    CompositeReceiptConfirmed: nonNegNum(
+      raw?.CompositeReceiptConfirmed ??
+        raw?.compositeReceiptConfirmed ??
+        raw?.receiptConfirmed ??
+        raw?.twoSideConfirmed,
       fallback?.confirmed ?? 0,
     ),
     dropReasons,
@@ -823,18 +862,26 @@ export function normalizeCell(raw: MultihopCellInput): NormalizedMultihopCell {
   const mode = normalizeMode(String(raw.mode ?? 'grey-box'))
   const llm = normalizeLlm(raw.llm)
 
-  const chainsTotal = finiteNum(raw.chainsTotal, 0)
-  const chainsConfirmed = finiteNum(raw.chainsConfirmed, 0)
-  const chainsOracleObserved = finiteNum(raw.chainsOracleObserved, chainsConfirmed)
-  const chainsCompositeConfirmed = finiteNum(raw.chainsCompositeConfirmed, chainsConfirmed)
+  const chainsTotal = nonNegNum(raw.chainsTotal, 0)
+  const chainsConfirmed = nonNegNum(raw.chainsConfirmed, 0)
+  const chainsOracleObserved = nonNegNum(raw.chainsOracleObserved, chainsConfirmed)
+  const chainsCompositeConfirmed = nonNegNum(raw.chainsCompositeConfirmed, chainsConfirmed)
   const recall = optionalNum(raw.recall) ?? safeRatio(chainsConfirmed, chainsTotal)
 
-  const hardenedTwinsTotal = finiteNum(raw.hardenedTwinsTotal, 0)
-  const hardenedTwinDecoyFps = finiteNum(
-    raw.hardenedTwinDecoyFps ?? raw.decoyFalsePositives ?? raw.hardenedTwinFalsePositives,
-    0,
+  const hardenedTwinsArr = Array.isArray(raw.hardenedTwins) ? raw.hardenedTwins : []
+  const hardenedTwinsTotal = Math.max(
+    nonNegNum(raw.hardenedTwinsTotal ?? raw.decoys, 0),
+    hardenedTwinsArr.length,
   )
-  const unmatchedFalsePositives = finiteNum(raw.unmatchedFalsePositives, 0)
+  const twinFpsFromArray = hardenedTwinsArr.filter((t) => t && t.falsePositive === true).length
+  const hardenedTwinDecoyFps = Math.max(
+    nonNegNum(
+      raw.hardenedTwinDecoyFps ?? raw.decoyFalsePositives ?? raw.hardenedTwinFalsePositives,
+      0,
+    ),
+    twinFpsFromArray,
+  )
+  const unmatchedFalsePositives = nonNegNum(raw.unmatchedFalsePositives, 0)
   const totalFps = hardenedTwinDecoyFps + unmatchedFalsePositives
   const computedPrecision =
     chainsConfirmed + totalFps > 0 ? safeRatio(chainsConfirmed, chainsConfirmed + totalFps) : 1
@@ -843,12 +890,24 @@ export function normalizeCell(raw: MultihopCellInput): NormalizedMultihopCell {
   const precision =
     reportedPrecision === null ? computedPrecision : Math.min(reportedPrecision, computedPrecision)
 
-  const budgetUsd = finiteNum(raw.budgetUsd, 0)
-  const maxDurationMs = finiteNum(raw.maxDurationMs, 0)
-  const durationMs = finiteNum(raw.durationMs ?? raw.wallMs, 0)
-  const costUsd = finiteNum(raw.costUsd ?? raw.totalCostUsd, 0)
+  const budgetUsd = nonNegNum(raw.budgetUsd, 0)
+  const maxDurationMs = nonNegNum(raw.maxDurationMs, 0)
+  const durationMs = nonNegNum(raw.durationMs ?? raw.wallMs, 0)
+  const costUsd = nonNegNum(raw.costUsd ?? raw.totalCostUsd, 0)
 
   const chains = Array.isArray(raw.chains) ? raw.chains : []
+  const derivedShortcutViolations = chains.filter(
+    (ch) => ch && ch.forbiddenShortcutViolation === true,
+  ).length
+  const derivedModeBViolations = chains.filter(
+    (ch) => ch && ch.replayMode === 'one_shot_transcript',
+  ).length
+  const shortcutViolations = Math.max(
+    nonNegNum(raw.shortcutViolations, 0),
+    derivedShortcutViolations,
+  )
+  const modeBViolations = Math.max(nonNegNum(raw.modeBViolations, 0), derivedModeBViolations)
+  const inert = raw.inert === true
   const hopFunnel = raw.hopFunnel
     ? normalizeHopFunnel(raw.hopFunnel, {
         totalChains: chainsTotal,
@@ -869,10 +928,10 @@ export function normalizeCell(raw: MultihopCellInput): NormalizedMultihopCell {
     ((raw.depthBreakdown.hops3to4?.targets ?? 0) > 0 ||
       (raw.depthBreakdown.hops5to6?.targets ?? 0) > 0)
   ) {
-    const t34 = finiteNum(raw.depthBreakdown.hops3to4?.targets, 0)
-    const c34 = finiteNum(raw.depthBreakdown.hops3to4?.confirmed, 0)
-    const t56 = finiteNum(raw.depthBreakdown.hops5to6?.targets, 0)
-    const c56 = finiteNum(raw.depthBreakdown.hops5to6?.confirmed, 0)
+    const t34 = nonNegNum(raw.depthBreakdown.hops3to4?.targets, 0)
+    const c34 = nonNegNum(raw.depthBreakdown.hops3to4?.confirmed, 0)
+    const t56 = nonNegNum(raw.depthBreakdown.hops5to6?.targets, 0)
+    const c56 = nonNegNum(raw.depthBreakdown.hops5to6?.confirmed, 0)
     depthBreakdown = {
       hops3to4: {
         targets: t34,
@@ -894,19 +953,26 @@ export function normalizeCell(raw: MultihopCellInput): NormalizedMultihopCell {
     }
   }
 
+  const schedulerTel = raw.telemetry?.scheduler
   const phaseBAssignments = optionalNum(
     raw.phaseBAssignments ??
       raw.frontier?.phaseBAssignments ??
+      schedulerTel?.totalPhaseBAssignments ??
       raw.totalAssignmentsDispatched ??
       raw.frontier?.totalAssignmentsDispatched ??
       raw.assignmentsTotal ??
       raw.assignmentsCompleted,
   )
   const deadEndReprobeCount = optionalNum(
-    raw.deadEndReprobeCount ?? raw.frontier?.deadEndReprobeCount,
+    raw.deadEndReprobeCount ??
+      raw.frontier?.deadEndReprobeCount ??
+      schedulerTel?.deadEndReprobes,
   )
+  const rawWastePct = optionalNum(raw.deadEndWastePct ?? schedulerTel?.deadEndWastePct)
   const explicitWasteRate = optionalNum(
-    raw.deadEndReprobeWasteRate ?? raw.frontier?.deadEndReprobeWasteRate,
+    raw.deadEndReprobeWasteRate ??
+      raw.frontier?.deadEndReprobeWasteRate ??
+      (rawWastePct !== null ? rawWastePct / 100 : undefined),
   )
   const deadEndReprobeWasteRate =
     explicitWasteRate !== null
@@ -950,8 +1016,9 @@ export function normalizeCell(raw: MultihopCellInput): NormalizedMultihopCell {
     hardenedTwinsTotal,
     hardenedTwinDecoyFps,
     unmatchedFalsePositives,
-    shortcutViolations: finiteNum(raw.shortcutViolations, 0),
-    modeBViolations: finiteNum(raw.modeBViolations, 0),
+    shortcutViolations,
+    modeBViolations,
+    inert,
     hopFunnel,
     depthBreakdown,
     chains,
@@ -1156,7 +1223,12 @@ export function computeWasteSummary(cells: readonly NormalizedMultihopCell[]): W
       maxCellWasteRate = maxCellWasteRate === null ? rate : Math.max(maxCellWasteRate, rate)
     } else if (c.deadEndReprobeWasteRate !== null) {
       measuredCells += 1
-      const weight = c.phaseBAssignments !== null && c.phaseBAssignments > 0 ? c.phaseBAssignments : 1
+      const weight =
+        c.phaseBAssignments !== null && c.phaseBAssignments > 0
+          ? c.phaseBAssignments
+          : c.phaseBAssignments === 0 && c.deadEndReprobeWasteRate === 0
+            ? 0
+            : 1
       weightedRateSum += c.deadEndReprobeWasteRate * weight
       weightSum += weight
       if (c.phaseBAssignments !== null && c.phaseBAssignments > 0) {
@@ -1276,21 +1348,26 @@ export function normalizeOssInputs(
   const cleanControlResults: OssCleanControlResultInput[] = []
 
   for (const item of list) {
-    totalAnchors += finiteNum(item.totalAnchors, 0)
-    tpCount += finiteNum(item.tpCount, 0)
+    const itemAnchors = nonNegNum(item.totalAnchors, 0)
+    const itemTp = nonNegNum(item.tpCount, 0)
+    totalAnchors += itemAnchors
+    tpCount += itemTp
 
-    const unmatched = finiteNum(item.unmatchedFpCount, 0)
-    const spurious = finiteNum(item.spuriousAnchorFpCount, 0)
-    const ccCount = finiteNum(item.cleanControlCount, item.cleanControlResults?.length ?? 0)
+    const unmatched = nonNegNum(item.unmatchedFpCount, 0)
+    const spurious = nonNegNum(item.spuriousAnchorFpCount, 0)
+    const ccCount = nonNegNum(item.cleanControlCount, item.cleanControlResults?.length ?? 0)
     const ccFpsFromDetail = Array.isArray(item.cleanControlResults)
-      ? item.cleanControlResults.reduce((acc, r) => acc + finiteNum(r.fpCount, 0), 0)
+      ? item.cleanControlResults.reduce((acc, r) => acc + nonNegNum(r.fpCount, 0), 0)
       : 0
     const ccUnexpectedFromDetail = Array.isArray(item.cleanControlResults)
-      ? item.cleanControlResults.reduce((acc, r) => acc + finiteNum(r.unexpectedOracleTriggers, 0), 0)
+      ? item.cleanControlResults.reduce((acc, r) => acc + nonNegNum(r.unexpectedOracleTriggers, 0), 0)
       : 0
-    const ccFps = Math.max(finiteNum(item.cleanControlFpCount, 0), ccFpsFromDetail)
+    const ccFps = Math.max(nonNegNum(item.cleanControlFpCount, 0), ccFpsFromDetail)
     const derivedTotalFp = unmatched + spurious + ccFps
-    const itemTotalFp = Math.max(finiteNum(item.totalFpCount, 0), derivedTotalFp)
+    const itemTotalFp = Math.max(
+      nonNegNum(item.totalFpCount ?? item.falsePositives, 0),
+      derivedTotalFp,
+    )
 
     unmatchedFpCount += unmatched
     spuriousAnchorFpCount += spurious
@@ -1300,9 +1377,12 @@ export function normalizeOssInputs(
     totalFpCount += itemTotalFp
 
     const computedPrec =
-      item.tpCount + itemTotalFp > 0 ? safeRatio(item.tpCount, item.tpCount + itemTotalFp) : 1
+      itemTp + itemTotalFp > 0 ? safeRatio(itemTp, itemTp + itemTotalFp) : 1
     const reportedPrec = optionalNum(item.precision)
-    const itemPrec = reportedPrec === null ? computedPrec : Math.min(reportedPrec, computedPrec)
+    const reportedWorstPrec = optionalNum(item.worstRunPrecision)
+    let itemPrec = computedPrec
+    if (reportedPrec !== null) itemPrec = Math.min(itemPrec, reportedPrec)
+    if (reportedWorstPrec !== null) itemPrec = Math.min(itemPrec, reportedWorstPrec)
     worstRunPrecision = Math.min(worstRunPrecision, itemPrec)
 
     if (Array.isArray(item.anchorResults) && item.anchorResults.length > 0) {
@@ -1314,16 +1394,16 @@ export function normalizeOssInputs(
         }
       }
     } else if (item.split === 'sealed') {
-      sealedAnchors += finiteNum(item.totalAnchors, 0)
-      sealedTpCount += finiteNum(item.tpCount, 0)
+      sealedAnchors += itemAnchors
+      sealedTpCount += itemTp
     }
 
     if (Array.isArray(item.cleanControlResults)) {
       for (const cc of item.cleanControlResults) cleanControlResults.push(cc)
     }
 
-    patchRetestAttempted += finiteNum(item.patchRetestAttempted, 0)
-    patchRetestClosed += finiteNum(item.patchRetestClosed, 0)
+    patchRetestAttempted += nonNegNum(item.patchRetestAttempted, 0)
+    patchRetestClosed += nonNegNum(item.patchRetestClosed, 0)
 
     const tpu = optionalNum(item.tpPerUsd)
     if (tpu !== null) {
@@ -1336,6 +1416,8 @@ export function normalizeOssInputs(
       tpPer10mCount += 1
     }
   }
+
+  const effectivePatchAttempted = Math.max(patchRetestAttempted, tpCount)
 
   return {
     runs: list.length,
@@ -1352,10 +1434,10 @@ export function normalizeOssInputs(
     cleanControlCount,
     cleanControlFpCount,
     cleanControlUnexpectedOracles,
-    patchRetestAttempted,
+    patchRetestAttempted: effectivePatchAttempted,
     patchRetestClosed,
     patchRetestClosureRate:
-      patchRetestAttempted > 0 ? safeRatio(patchRetestClosed, patchRetestAttempted) : null,
+      effectivePatchAttempted > 0 ? safeRatio(patchRetestClosed, effectivePatchAttempted) : null,
     tpPerUsd: tpPerUsdCount > 0 ? tpPerUsdSum / tpPerUsdCount : null,
     tpPer10m: tpPer10mCount > 0 ? tpPer10mSum / tpPer10mCount : null,
     anchorResults,
@@ -1474,10 +1556,23 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
   let worstRunCell: string | null = null
   let totalHardenedTwinDecoyFps = 0
   let totalUnmatchedFalsePositives = 0
+  let totalShortcutViolations = 0
+  let totalModeBViolations = 0
+  let inertAgenticCells = 0
+  const integrityOffenders: string[] = []
 
   for (const c of cells) {
     totalHardenedTwinDecoyFps += c.hardenedTwinDecoyFps
     totalUnmatchedFalsePositives += c.unmatchedFalsePositives
+    totalShortcutViolations += c.shortcutViolations
+    totalModeBViolations += c.modeBViolations
+    const isInertAgentic = c.llm === 'agentic' && c.inert
+    if (isInertAgentic) inertAgenticCells += 1
+    if (c.shortcutViolations > 0 || c.modeBViolations > 0 || isInertAgentic) {
+      integrityOffenders.push(
+        `${c.cell} (shortcut=${c.shortcutViolations}, modeB=${c.modeBViolations}${isInertAgentic ? ', inert=true' : ''})`,
+      )
+    }
     if (c.precision < worstRunPrecision || (c.precision < 1 - EPS && worstRunCell === null)) {
       worstRunPrecision = Math.min(worstRunPrecision, c.precision)
       worstRunCell = `${c.cell} (${c.llm}, ${c.tierLabel}${c.repeatId ? `, r=${c.repeatId}` : ''})`
@@ -1513,6 +1608,25 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
         : `${pct(worstRunPrecision)} (twinFPs=${totalHardenedTwinDecoyFps}, unmatchedFPs=${totalUnmatchedFalsePositives}, ossFPs=${totalOssFps})`,
     status: precisionPassed ? 'PASS' : 'FAIL',
     detail: worstRunCell ? `worst cell: ${worstRunCell}` : undefined,
+  })
+
+  const integrityPassed =
+    cells.length > 0 &&
+    totalShortcutViolations === 0 &&
+    totalModeBViolations === 0 &&
+    inertAgenticCells === 0
+
+  addCheck({
+    id: 'two_side_replay_integrity',
+    category: 'precision',
+    description: 'Two-side provenance & Mode-A replay integrity (0 shortcut violations, 0 Mode-B violations, 0 inert agentic cells)',
+    threshold: '0 shortcut violations, 0 Mode-B violations, 0 inert cells',
+    observed:
+      cells.length === 0
+        ? 'no cells'
+        : `shortcutViolations=${totalShortcutViolations}, modeBViolations=${totalModeBViolations}, inertAgenticCells=${inertAgenticCells}`,
+    status: integrityPassed ? 'PASS' : 'FAIL',
+    detail: integrityOffenders.length > 0 ? integrityOffenders.slice(0, 5).join('; ') : undefined,
   })
 
   // ---- 2. Universal Anti-Heuristic Gate (`multihop-saas --no-llm <= 5%`) ----
@@ -1623,16 +1737,36 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
     'white-box',
     sealedWb15Cells.length > 0 ? SCALING_TIERS.t15_60m.label : null,
   )
-  // Blind first run: sort repeats by earliest startedAt (preserving input order when null).
+  // Blind first run: sort repeats by earliest startedAt (non-null timestamps first, preserving order on ties).
   const orderedSealedRepeats = [...sealedWbSummary.repeatSummaries].sort((a, b) => {
     if (a.startedAt !== null && b.startedAt !== null) return a.startedAt - b.startedAt
+    if (a.startedAt !== null) return -1
+    if (b.startedAt !== null) return 1
     return 0
   })
   const sealedBlindFirstRun = orderedSealedRepeats[0] ?? null
 
+  const isCompleteDevRepeat = (r: RepeatSummary): boolean =>
+    MULTIHOP_DEV_APPS.every((app) => r.apps.includes(app)) &&
+    r.chainsTotal >= V8_THRESHOLDS.m2.expectedDevChains &&
+    r.hardenedTwinsTotal >= V8_THRESHOLDS.m2.expectedDevTwins
+
+  const completeDevRepeats = (summary: ModeSplitSummary): { complete: number; incomplete: number } => {
+    let complete = 0
+    let incomplete = 0
+    for (const r of summary.repeatSummaries) {
+      if (isCompleteDevRepeat(r)) complete += 1
+      else incomplete += 1
+    }
+    return { complete, incomplete }
+  }
+
   // Scaling summary
-  const tiersPresent = devWb2.repeats > 0 && devWb5.repeats > 0 && devWb15.repeats > 0
-  const minRepeatsObserved = Math.min(devWb2.repeats, devWb5.repeats, devWb15.repeats)
+  const devWb2Cov = completeDevRepeats(devWb2)
+  const devWb5Cov = completeDevRepeats(devWb5)
+  const devWb15Cov = completeDevRepeats(devWb15)
+  const tiersPresent = devWb2Cov.complete > 0 && devWb5Cov.complete > 0 && devWb15Cov.complete > 0
+  const minRepeatsObserved = Math.min(devWb2Cov.complete, devWb5Cov.complete, devWb15Cov.complete)
   const r2 = devWb2.medianRecall
   const r5 = devWb5.medianRecall
   const r15 = devWb15.medianRecall
@@ -1684,7 +1818,23 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
   // ---- 3. Gate-Specific Checks ----
 
   if (gate === 'm2') {
-    // M2 Gate: $5/30m, Dev 12 chains + 9 twins
+    // M2 Gate: $5/30m, Dev 3-archetype (paygrid, shipforge, nexusiam; 12 chains + 9 twins)
+    const devGb5Cov = completeDevRepeats(devGb5)
+    const m2CoveragePassed =
+      devGb5Cov.complete >= 1 &&
+      devGb5Cov.incomplete === 0 &&
+      devWb5Cov.complete >= 1 &&
+      devWb5Cov.incomplete === 0
+
+    addCheck({
+      id: 'm2_dev_archetype_coverage',
+      category: 'recall',
+      description: 'M2 Dev 3-archetype coverage (paygrid, shipforge, nexusiam; 12 chains + 9 twins per repeat)',
+      threshold: `all 3 dev apps (>= ${V8_THRESHOLDS.m2.expectedDevChains} chains, >= ${V8_THRESHOLDS.m2.expectedDevTwins} twins) in GB & WB`,
+      observed: `GB complete=${devGb5Cov.complete}/${devGb5.repeats}, WB complete=${devWb5Cov.complete}/${devWb5.repeats}`,
+      status: m2CoveragePassed ? 'PASS' : 'FAIL',
+    })
+
     const gbRecall = devGb5.medianRecall
     const wbRecall = devWb5.medianRecall
     const wbLift = gbRecall !== null && wbRecall !== null ? wbRecall - gbRecall : null
@@ -1736,19 +1886,25 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
       threshold: '0 twin FPs',
       observed: `${m2TwinFps}/${m2TwinsTotal}`,
       status:
-        devGb5.cells > 0 && devWb5.cells > 0 && m2TwinFps === 0 ? 'PASS' : 'FAIL',
+        devGb5.cells > 0 && devWb5.cells > 0 && m2TwinsTotal > 0 && m2TwinFps === 0 ? 'PASS' : 'FAIL',
     })
   }
 
   if (gate === 'm3') {
-    // M3 Gate: Dev scaling matrix ($2/10m, $5/30m, $15/60m, n >= 3)
+    // M3 Gate: Dev scaling matrix ($2/10m, $5/30m, $15/60m, n >= 3 complete 3-archetype repeats)
+    const m3IncompleteRepeats = devWb2Cov.incomplete + devWb5Cov.incomplete + devWb15Cov.incomplete
     addCheck({
       id: 'm3_repeats_floor',
       category: 'scaling',
-      description: 'M3 Scaling matrix coverage ($2/10m, $5/30m, $15/60m with n >= 3 repeats each)',
-      threshold: `n >= ${V8_THRESHOLDS.minRepeats} repeats per tier`,
-      observed: `$2/10m: n=${devWb2.repeats}, $5/30m: n=${devWb5.repeats}, $15/60m: n=${devWb15.repeats}`,
-      status: tiersPresent && minRepeatsObserved >= V8_THRESHOLDS.minRepeats ? 'PASS' : 'FAIL',
+      description: 'M3 Scaling matrix coverage ($2/10m, $5/30m, $15/60m with n >= 3 complete 3-archetype repeats each)',
+      threshold: `n >= ${V8_THRESHOLDS.minRepeats} complete Dev repeats per tier`,
+      observed: `$2/10m: n=${devWb2Cov.complete}/${devWb2.repeats}, $5/30m: n=${devWb5Cov.complete}/${devWb5.repeats}, $15/60m: n=${devWb15Cov.complete}/${devWb15.repeats}`,
+      status:
+        tiersPresent &&
+        minRepeatsObserved >= V8_THRESHOLDS.minRepeats &&
+        m3IncompleteRepeats === 0
+          ? 'PASS'
+          : 'FAIL',
     })
 
     addCheck({
@@ -1827,16 +1983,19 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
   }
 
   if (gate === 'm4') {
-    // 1. Dev ($15/60m, n >= 3)
+    // 1. Dev ($15/60m, n >= 3 complete 3-archetype repeats)
+    const devGb15Cov = completeDevRepeats(devGb15)
     addCheck({
       id: 'm4_dev_repeats',
       category: 'recall',
-      description: 'M4 Dev $15/60m repeat count (WB and GB, n >= 3)',
-      threshold: `n >= ${V8_THRESHOLDS.minRepeats} repeats (WB & GB)`,
-      observed: `WB n=${devWb15.repeats}, GB n=${devGb15.repeats}`,
+      description: 'M4 Dev $15/60m repeat count (WB and GB, n >= 3 complete 3-archetype repeats)',
+      threshold: `n >= ${V8_THRESHOLDS.minRepeats} complete repeats (WB & GB)`,
+      observed: `WB n=${devWb15Cov.complete}/${devWb15.repeats}, GB n=${devGb15Cov.complete}/${devGb15.repeats}`,
       status:
-        devWb15.repeats >= V8_THRESHOLDS.minRepeats &&
-        devGb15.repeats >= V8_THRESHOLDS.minRepeats
+        devWb15Cov.complete >= V8_THRESHOLDS.minRepeats &&
+        devWb15Cov.incomplete === 0 &&
+        devGb15Cov.complete >= V8_THRESHOLDS.minRepeats &&
+        devGb15Cov.incomplete === 0
           ? 'PASS'
           : 'FAIL',
     })
@@ -1875,7 +2034,9 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
           : 'FAIL',
     })
 
-    // 2. Salted Held-Out (seed >= 1_000_000, $15/60m, n >= 3)
+    // 2. Salted Held-Out (seed >= 1_000_000, $15/60m, n >= 3 complete 3-archetype repeats)
+    const heldOutWb15Cov = completeDevRepeats(heldOutWb15)
+    const heldOutGb15Cov = completeDevRepeats(heldOutGb15)
     const invalidHeldOutSeeds = [...heldOutWb15Cells, ...heldOutGb15Cells].filter(
       (c) => c.seed < V8_THRESHOLDS.heldOutSeedMin,
     )
@@ -1883,12 +2044,14 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
     addCheck({
       id: 'm4_heldout_repeats',
       category: 'generalization',
-      description: 'M4 Salted Held-Out $15/60m coverage (seed >= 1_000_000, n >= 3 WB & GB)',
-      threshold: `n >= ${V8_THRESHOLDS.minRepeats} repeats, all seeds >= ${V8_THRESHOLDS.heldOutSeedMin}`,
-      observed: `WB n=${heldOutWb15.repeats}, GB n=${heldOutGb15.repeats}, invalidSeeds=${invalidHeldOutSeeds.length}`,
+      description: 'M4 Salted Held-Out $15/60m coverage (seed >= 1_000_000, n >= 3 complete 3-archetype WB & GB)',
+      threshold: `n >= ${V8_THRESHOLDS.minRepeats} complete repeats, all seeds >= ${V8_THRESHOLDS.heldOutSeedMin}`,
+      observed: `WB n=${heldOutWb15Cov.complete}/${heldOutWb15.repeats}, GB n=${heldOutGb15Cov.complete}/${heldOutGb15.repeats}, invalidSeeds=${invalidHeldOutSeeds.length}`,
       status:
-        heldOutWb15.repeats >= V8_THRESHOLDS.minRepeats &&
-        heldOutGb15.repeats >= V8_THRESHOLDS.minRepeats &&
+        heldOutWb15Cov.complete >= V8_THRESHOLDS.minRepeats &&
+        heldOutWb15Cov.incomplete === 0 &&
+        heldOutGb15Cov.complete >= V8_THRESHOLDS.minRepeats &&
+        heldOutGb15Cov.incomplete === 0 &&
         invalidHeldOutSeeds.length === 0
           ? 'PASS'
           : 'FAIL',
@@ -1953,13 +2116,15 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
       id: 'm4_sealed_wb_recall',
       category: 'generalization',
       description: 'M4 Sealed connecthub blind first run white-box (>= 50%, 0/3 twin FPs)',
-      threshold: `>= ${pct(V8_THRESHOLDS.m4.sealedWhiteBoxRecallMin)} (>= 2/4), 0 twin FPs`,
+      threshold: `>= ${pct(V8_THRESHOLDS.m4.sealedWhiteBoxRecallMin)} (>= 2/4), 0/3 twin FPs`,
       observed:
         sealedBlindFirstRun === null
           ? 'missing (sealed connecthub WB run)'
           : `${pct(sealedBlindFirstRun.recall)} (${sealedBlindFirstRun.chainsConfirmed}/${sealedBlindFirstRun.chainsTotal}, twinFPs=${sealedWbSummary.hardenedTwinDecoyFps}/${sealedWbSummary.hardenedTwinsTotal})`,
       status:
         sealedBlindFirstRun !== null &&
+        sealedBlindFirstRun.chainsTotal >= 4 &&
+        sealedBlindFirstRun.hardenedTwinsTotal >= 3 &&
         sealedBlindFirstRun.recall >= V8_THRESHOLDS.m4.sealedWhiteBoxRecallMin - EPS &&
         sealedWbSummary.hardenedTwinDecoyFps === 0
           ? 'PASS'
@@ -2162,17 +2327,20 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
             : 'FAIL',
       })
 
-      if (v7Floor?.realisticBench && v7Floor.realisticBench.maxFloorSpread !== null) {
-        const spread = v7Floor.realisticBench.maxFloorSpread
-        addCheck({
-          id: 'm4_v7_realistic_spread',
-          category: 'v7-floor',
-          description: 'M4 v7 regression floor: realistic-bench floor spread == 0',
-          threshold: '0 spread',
-          observed: String(spread),
-          status: spread <= V8_THRESHOLDS.m4.v7RealisticMaxSpread ? 'PASS' : 'FAIL',
-        })
-      }
+      const spread = v7Floor?.realisticBench?.maxFloorSpread ?? null
+      addCheck({
+        id: 'm4_v7_realistic_spread',
+        category: 'v7-floor',
+        description: 'M4 v7 regression floor: realistic-bench floor spread == 0',
+        threshold: '0 spread',
+        observed: spread === null ? 'missing (--v7-floor realisticBench.maxFloorSpread)' : String(spread),
+        status:
+          spread !== null &&
+          spread >= 0 &&
+          spread <= V8_THRESHOLDS.m4.v7RealisticMaxSpread
+            ? 'PASS'
+            : 'FAIL',
+      })
     } else {
       notes.push('v7 regression floor check waived (--allow-missing-v7-floor)')
     }
@@ -2198,7 +2366,10 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
       totalHardenedTwinDecoyFps,
       totalUnmatchedFalsePositives,
       totalOssFalsePositives: totalOssFps,
-      passed: precisionPassed,
+      totalShortcutViolations,
+      totalModeBViolations,
+      inertAgenticCells,
+      passed: precisionPassed && integrityPassed,
     },
     antiHeuristic: {
       cells: noLlmCells.length,
@@ -2575,6 +2746,15 @@ function extractCellsFromParsed(parsed: unknown): MultihopCellInput[] {
   return []
 }
 
+function parseJsonFile(filePath: string): unknown {
+  const raw = readFileSync(filePath, 'utf8')
+  try {
+    return JSON.parse(raw) as unknown
+  } catch (err) {
+    throw new Error(`Failed to parse JSON file ${filePath}: ${(err as Error).message}`)
+  }
+}
+
 function collectJsonFilesFromDir(dirPath: string): string[] {
   const entries = readdirSync(dirPath).sort()
   const reportFile = entries.find((e) => e === 'multihop-report.json')
@@ -2587,8 +2767,14 @@ function collectJsonFilesFromDir(dirPath: string): string[] {
   }
   const files: string[] = []
   for (const entry of entries) {
+    if (entry === 'node_modules' || entry === '.git') continue
     const full = join(dirPath, entry)
-    const st = statSync(full)
+    let st
+    try {
+      st = statSync(full)
+    } catch {
+      continue
+    }
     if (st.isDirectory()) {
       files.push(...collectJsonFilesFromDir(full))
     } else if (entry.endsWith('.json')) {
@@ -2608,11 +2794,32 @@ export function loadMultihopInputs(paths: readonly string[]): MultihopCellInput[
     const st = statSync(abs)
     const files = st.isDirectory() ? collectJsonFilesFromDir(abs) : [abs]
     for (const file of files) {
-      const parsed = JSON.parse(readFileSync(file, 'utf8')) as unknown
+      const parsed = parseJsonFile(file)
       cells.push(...extractCellsFromParsed(parsed))
     }
   }
   return cells
+}
+
+function collectOssJsonFilesFromDir(dirPath: string): string[] {
+  const entries = readdirSync(dirPath).sort()
+  const files: string[] = []
+  for (const entry of entries) {
+    if (entry === 'node_modules' || entry === '.git') continue
+    const full = join(dirPath, entry)
+    let st
+    try {
+      st = statSync(full)
+    } catch {
+      continue
+    }
+    if (st.isDirectory()) {
+      files.push(...collectOssJsonFilesFromDir(full))
+    } else if (entry.endsWith('.json')) {
+      files.push(full)
+    }
+  }
+  return files
 }
 
 export function loadOssInputs(paths: readonly string[]): OssCorpusInput[] {
@@ -2622,13 +2829,17 @@ export function loadOssInputs(paths: readonly string[]): OssCorpusInput[] {
     if (!existsSync(abs)) {
       throw new Error(`OSS input path does not exist: ${rawPath}`)
     }
-    const parsed = JSON.parse(readFileSync(abs, 'utf8')) as unknown
-    if (Array.isArray(parsed)) {
-      for (const item of parsed) out.push(item as OssCorpusInput)
-    } else if (parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).results)) {
-      for (const item of (parsed as { results: OssCorpusInput[] }).results) out.push(item)
-    } else if (parsed && typeof parsed === 'object') {
-      out.push(parsed as OssCorpusInput)
+    const st = statSync(abs)
+    const files = st.isDirectory() ? collectOssJsonFilesFromDir(abs) : [abs]
+    for (const file of files) {
+      const parsed = parseJsonFile(file)
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) out.push(item as OssCorpusInput)
+      } else if (parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).results)) {
+        for (const item of (parsed as { results: OssCorpusInput[] }).results) out.push(item)
+      } else if (parsed && typeof parsed === 'object') {
+        out.push(parsed as OssCorpusInput)
+      }
     }
   }
   return out
@@ -2639,7 +2850,10 @@ export function loadV7FloorInput(filePath: string): unknown {
   if (!existsSync(abs)) {
     throw new Error(`v7 floor path does not exist: ${filePath}`)
   }
-  return JSON.parse(readFileSync(abs, 'utf8')) as unknown
+  if (statSync(abs).isDirectory()) {
+    throw new Error(`v7 floor path is a directory, expected a JSON file: ${filePath}`)
+  }
+  return parseJsonFile(abs)
 }
 
 // ---------------------------------------------------------------------------
@@ -2656,7 +2870,7 @@ Usage:
 Options:
   --gate <m2|m3|m4>          Milestone certification gate to evaluate (required)
   --inputs <paths...>        One or more multihop report JSONs, *.meta.json files, or directories
-  --oss <paths...>           OSS multi-hop grade JSON file(s) from benchmarks/oss-multihop/run.ts
+  --oss <paths...>           OSS multi-hop grade JSON file(s) or directories from benchmarks/oss-multihop/run.ts
   --v7-floor <path>          v7 regression floor JSON (xben, held-out-saas, reason-bench, realistic-bench)
   --out-md <path>            Write Markdown scorecard (e.g. CALIBRATION-v8.md)
   --out-json <path>          Write structured JSON report
@@ -2681,8 +2895,14 @@ export function parseCertifyV8Args(argv: readonly string[]): CertifyV8CliArgs {
   let allowMissingV7Floor = false
   let help = false
 
+  const isFlagToken = (tok: string): boolean => tok.startsWith('--') || tok === '-h'
+
   for (let i = 0; i < argv.length; i += 1) {
-    const token = argv[i]!
+    const rawToken = argv[i]!
+    const eqIdx = rawToken.startsWith('--') ? rawToken.indexOf('=') : -1
+    const token = eqIdx > 0 ? rawToken.slice(0, eqIdx) : rawToken
+    const inlineVal = eqIdx > 0 ? rawToken.slice(eqIdx + 1) : undefined
+
     if (token === '-h' || token === '--help') {
       help = true
       continue
@@ -2692,16 +2912,21 @@ export function parseCertifyV8Args(argv: readonly string[]): CertifyV8CliArgs {
       continue
     }
     if (token === '--gate') {
-      const next = argv[++i]
-      if (next !== 'm2' && next !== 'm3' && next !== 'm4') {
+      const next = inlineVal ?? argv[++i]
+      const normalized = next?.toLowerCase()
+      if (normalized !== 'm2' && normalized !== 'm3' && normalized !== 'm4') {
         throw new Error(`Invalid --gate value '${next ?? ''}'; expected m2, m3, or m4`)
       }
-      gate = next
+      gate = normalized
       continue
     }
     if (token === '--inputs' || token === '--input') {
       let consumed = 0
-      while (i + 1 < argv.length && !argv[i + 1]!.startsWith('--')) {
+      if (inlineVal !== undefined) {
+        inputs.push(...splitCsvOrTokens(inlineVal))
+        consumed += 1
+      }
+      while (i + 1 < argv.length && !isFlagToken(argv[i + 1]!)) {
         inputs.push(...splitCsvOrTokens(argv[++i]!))
         consumed += 1
       }
@@ -2710,7 +2935,11 @@ export function parseCertifyV8Args(argv: readonly string[]): CertifyV8CliArgs {
     }
     if (token === '--oss') {
       let consumed = 0
-      while (i + 1 < argv.length && !argv[i + 1]!.startsWith('--')) {
+      if (inlineVal !== undefined) {
+        ossPaths.push(...splitCsvOrTokens(inlineVal))
+        consumed += 1
+      }
+      while (i + 1 < argv.length && !isFlagToken(argv[i + 1]!)) {
         ossPaths.push(...splitCsvOrTokens(argv[++i]!))
         consumed += 1
       }
@@ -2718,24 +2947,24 @@ export function parseCertifyV8Args(argv: readonly string[]): CertifyV8CliArgs {
       continue
     }
     if (token === '--v7-floor') {
-      const next = argv[++i]
-      if (!next || next.startsWith('--')) throw new Error('--v7-floor requires a path')
+      const next = inlineVal ?? argv[++i]
+      if (!next || isFlagToken(next)) throw new Error('--v7-floor requires a path')
       v7FloorPath = next
       continue
     }
     if (token === '--out-md') {
-      const next = argv[++i]
-      if (!next || next.startsWith('--')) throw new Error('--out-md requires a path')
+      const next = inlineVal ?? argv[++i]
+      if (!next || isFlagToken(next)) throw new Error('--out-md requires a path')
       outMd = next
       continue
     }
     if (token === '--out-json') {
-      const next = argv[++i]
-      if (!next || next.startsWith('--')) throw new Error('--out-json requires a path')
+      const next = inlineVal ?? argv[++i]
+      if (!next || isFlagToken(next)) throw new Error('--out-json requires a path')
       outJson = next
       continue
     }
-    throw new Error(`Unknown CLI argument: ${token}`)
+    throw new Error(`Unknown CLI argument: ${rawToken}`)
   }
 
   if (!help) {
