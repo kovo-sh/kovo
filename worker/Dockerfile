@@ -83,7 +83,8 @@ RUN mkdir -p /opt/trivy-cache /tmp/trivy-tmp \
 
 WORKDIR /opt/kovo-worker
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+RUN chmod 0644 /opt/kovo-worker/package.json /opt/kovo-worker/package-lock.json \
+  && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
   && mkdir -p /tmp/swc-out && chmod 0700 /tmp/swc-out \
   && SWC_NATIVE_BINDING_CACHE=/tmp/swc-out node -e 'require("@swc/core")' \
   && SWC_NODE_BIN="$(find /tmp/swc-out -name '*.node' | head -n1)" \
@@ -92,7 +93,7 @@ RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
   && cp "${SWC_NODE_BIN}" "${SWC_TARGET}" \
   && chmod 0755 "${SWC_TARGET}" \
   && rm -rf /tmp/swc-out \
-  && chmod -R a+rX /opt/kovo-worker/node_modules \
+  && chmod -R a+rX /opt/kovo-worker \
   && AST_GREP_BIN="$(find /opt/kovo-worker/node_modules/@ast-grep -maxdepth 2 -type f -name ast-grep | head -n1)" \
   && test -n "${AST_GREP_BIN}" \
   && chmod 0755 "${AST_GREP_BIN}" \
@@ -123,7 +124,8 @@ RUN chmod -R a+rX /opt/kovo-rules \
   && rm -rf /tmp/rule-check /tmp/.config /tmp/.cache
 
 COPY analyzers.ts bridge.ts ./
-RUN chmod 0644 /opt/kovo-worker/analyzers.ts /opt/kovo-worker/bridge.ts
+RUN chmod 0644 /opt/kovo-worker/analyzers.ts /opt/kovo-worker/bridge.ts /opt/kovo-worker/package.json /opt/kovo-worker/package-lock.json \
+  && chmod -R a+rX /opt/kovo-worker /opt/kovo-rules
 
 ENV PATH="/opt/kovo-venv/bin:/opt/kovo-worker/node_modules/.bin:/usr/local/bin:/usr/bin:/bin" \
     HOME="/tmp" \
@@ -136,4 +138,9 @@ ENV PATH="/opt/kovo-venv/bin:/opt/kovo-worker/node_modules/.bin:/usr/local/bin:/
     PYTHONDONTWRITEBYTECODE="1"
 
 USER 10001:10001
+# Build-time non-root invariant: fail build immediately if any worker/rule file is unreadable by
+# uid 10001 (e.g. host umask 0077 COPY 0600 on package.json) or bridge.ts fails to boot.
+RUN test -z "$(find /opt/kovo-worker /opt/kovo-rules ! -readable 2>/dev/null | head -n1)" \
+  && printf '{"id":"build-check","op":"shutdown"}\n' | node --max-old-space-size=512 /opt/kovo-worker/bridge.ts --session >/dev/null \
+  && rm -rf /tmp/kovo-* /tmp/.cache /tmp/.config
 ENTRYPOINT ["node", "--max-old-space-size=512", "/opt/kovo-worker/bridge.ts"]
