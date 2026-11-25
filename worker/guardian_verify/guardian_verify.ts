@@ -20,7 +20,7 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 import { dirname, join } from 'node:path'
 
-export type ClaimKind = 'status' | 'header' | 'body_contains' | 'jsonpath' | 'css' | 'dom_sentinel' | 'oob' | 'timing'
+export type ClaimKind = 'status' | 'header' | 'body_contains' | 'jsonpath' | 'css' | 'dom_sentinel' | 'oob' | 'timing' | 'composite_receipt'
 
 export interface StatusClaim { kind: 'status'; exchangeId: string; expected: number | number[]; message?: string }
 export interface HeaderClaim { kind: 'header'; exchangeId: string; name: string; equals?: string; matches?: string; absent?: boolean; message?: string }
@@ -91,7 +91,24 @@ export interface BoundaryClaim {
   actorTenants?: Record<string, string>
   message?: string
 }
-export type VerifyClaim = StatusClaim | HeaderClaim | BodyClaim | JsonPathClaim | CssClaim | SentinelsClaim | OobClaim | TimingClaim | StructuralDiffClaim | RaceClaim | ImpactClaim | BoundaryClaim
+export interface CompositeReceiptClaim {
+  kind: 'composite_receipt'
+  verificationId?: string
+  chainId: string
+  terminalVulnClass: string
+  cwe?: string
+  route?: string
+  exchangeIds: string[]
+  terminalExchangeId?: string
+  replayMode?: 'fresh_clean_replay' | 'one_shot_transcript'
+  hopCount?: number
+  compositeReceipt?: Record<string, unknown>
+  rejectedBy?: string | null
+  missingEvidence?: string[]
+  reason?: string
+  message?: string
+}
+export type VerifyClaim = StatusClaim | HeaderClaim | BodyClaim | JsonPathClaim | CssClaim | SentinelsClaim | OobClaim | TimingClaim | StructuralDiffClaim | RaceClaim | ImpactClaim | BoundaryClaim | CompositeReceiptClaim
 
 export type ProofRole =
   | 'setup' | 'control' | 'probe' | 'cleanup'
@@ -526,6 +543,9 @@ export interface AsyncAwaitResult {
 
 export interface CompositeVerificationResult {
   confirmed: boolean
+  ok?: boolean
+  verified?: boolean
+  verificationId?: string
   chainId: string
   terminalVulnClass: string
   replayMode: 'fresh_clean_replay' | 'one_shot_transcript'
@@ -534,6 +554,9 @@ export interface CompositeVerificationResult {
   verifiedEdges: Array<Record<string, unknown>>
   reason: string
   failedStage?: string
+  rejectedBy?: string | null
+  missingEvidence?: string[]
+  claim?: CompositeReceiptClaim
   terminalVerification?: Record<string, unknown>
   evidence?: Record<string, unknown>
 }
@@ -946,6 +969,8 @@ export class VerifyContext {
   /** Alias for `expect`. */
   readonly assert: Expectations
   private readonly defaultOrigin: string | undefined
+  /** Last rejected composite claim, emitted if no confirmed claim is recorded so feedback surfaces instead of `claims_missing`. */
+  private _lastFailedCompositeClaim: CompositeReceiptClaim | null = null
 
   constructor() {
     const context = readContext()
@@ -1166,9 +1191,76 @@ export class VerifyContext {
   }
 
   async proveComposite(receipt: Record<string, unknown>): Promise<CompositeVerificationResult> {
+    const rawReceipt = (receipt && typeof receipt === 'object' && 'receipt' in receipt && receipt.receipt && typeof receipt.receipt === 'object'
+      ? receipt.receipt
+      : receipt) as Record<string, unknown>
     const payload = receipt && typeof receipt === 'object' && 'receipt' in receipt ? receipt : { receipt }
-    const result = await rpc('composite.verify', payload as Record<string, unknown>, 30_000)
-    return result as CompositeVerificationResult
+    const rawResult = await rpc('composite.verify', payload as Record<string, unknown>, 30_000) as CompositeVerificationResult
+    const confirmed = rawResult.confirmed === true || rawResult.ok === true || rawResult.verified === true
+    const hops = Array.isArray(rawReceipt?.hops) ? rawReceipt.hops as Array<Record<string, unknown>> : []
+    const ti = rawReceipt?.terminalImpact && typeof rawReceipt.terminalImpact === 'object'
+      ? rawReceipt.terminalImpact as Record<string, unknown>
+      : {}
+    const terminalHopId = typeof ti.terminalHopId === 'string' ? ti.terminalHopId : ''
+    const termHop = hops.find(h => h && h.hopId === terminalHopId) ?? hops[hops.length - 1]
+    const termTarget = termHop?.target && typeof termHop.target === 'object' ? termHop.target as Record<string, unknown> : null
+    const route = typeof termTarget?.pathAndQuery === 'string' ? termTarget.pathAndQuery : undefined
+    const strIds = (v: unknown): string[] => Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.length > 0) : []
+    const exchangeIds = [...new Set([
+      ...hops.flatMap(h => strIds(h?.exchangeIds)),
+      ...strIds(ti.preChainControlExchangeIds),
+      ...strIds(ti.postChainReadbackExchangeIds),
+      ...(typeof ti.terminalExchangeId === 'string' && ti.terminalExchangeId.trim() ? [ti.terminalExchangeId.trim()] : []),
+    ])].slice(0, 64)
+    const termExIds = strIds(termHop?.exchangeIds)
+    const terminalExchangeId = typeof ti.terminalExchangeId === 'string' && ti.terminalExchangeId.trim()
+      ? ti.terminalExchangeId.trim()
+      : termExIds[termExIds.length - 1]
+    const cweText = `${String(rawReceipt?.cwe ?? '')} ${String(ti.cwe ?? '')} ${String(rawReceipt?.terminalVulnClass ?? '')} ${String(ti.summary ?? ti.claimedImpact ?? '')}`
+    const cwe = /\bCWE-\d{1,4}\b/i.exec(cweText)?.[0]?.toUpperCase()
+    const rejectedBy = confirmed
+      ? null
+      : (rawResult.rejectedBy ?? (rawResult.failedStage ? `composite_${rawResult.failedStage}` : 'composite_receipt'))
+    const missingEvidence = confirmed
+      ? []
+      : (Array.isArray(rawResult.missingEvidence) && rawResult.missingEvidence.length > 0
+          ? rawResult.missingEvidence
+          : [rejectedBy ?? 'composite_receipt'])
+    const claim: CompositeReceiptClaim = {
+      kind: 'composite_receipt',
+      ...(rawResult.verificationId ? { verificationId: rawResult.verificationId } : {}),
+      chainId: rawResult.chainId || (typeof rawReceipt?.chainId === 'string' ? rawReceipt.chainId : 'invalid'),
+      terminalVulnClass: rawResult.terminalVulnClass || (typeof rawReceipt?.terminalVulnClass === 'string' ? rawReceipt.terminalVulnClass : 'unknown'),
+      ...(cwe ? { cwe } : {}),
+      ...(route ? { route } : {}),
+      exchangeIds,
+      ...(terminalExchangeId ? { terminalExchangeId } : {}),
+      ...(rawResult.replayMode ? { replayMode: rawResult.replayMode } : {}),
+      hopCount: typeof rawResult.hopCount === 'number' ? rawResult.hopCount : hops.length,
+      compositeReceipt: rawReceipt,
+      ...(!confirmed ? { rejectedBy, missingEvidence, reason: rawResult.reason } : {}),
+    }
+    if (confirmed) {
+      this._lastFailedCompositeClaim = null
+      this.claims.push(claim)
+    } else {
+      this._lastFailedCompositeClaim = claim
+    }
+    return {
+      ...rawResult,
+      confirmed,
+      ok: confirmed,
+      verified: confirmed,
+      rejectedBy,
+      missingEvidence,
+      claim,
+    }
+  }
+
+  /** Effective claims for proof serialization (falls back to last rejected composite claim to avoid `claims_missing`). */
+  effectiveClaims(): VerifyClaim[] {
+    if (this.claims.length > 0) return [...this.claims]
+    return this._lastFailedCompositeClaim ? [this._lastFailedCompositeClaim] : []
   }
 
   prove_composite(receipt: Record<string, unknown>): Promise<CompositeVerificationResult> {
@@ -2065,7 +2157,7 @@ export class VerifyContext {
       title: input.title.slice(0, 300),
       severity: (input.severity ?? 'high').slice(0, 32),
       ...(input.description ? { description: input.description.slice(0, 4000) } : {}),
-      claims: [...this.claims],
+      claims: this.effectiveClaims(),
     }
   }
 }
@@ -2095,12 +2187,13 @@ function writeResult(value: unknown): void {
 
 function normalizeProofResult(ctx: VerifyContext, returned: unknown, defaultTitle?: string): ProofResult {
   const fallbackTitle = (defaultTitle && defaultTitle.trim() ? defaultTitle.trim() : 'Verification script proof').slice(0, 300)
+  const fallbackClaims = ctx.effectiveClaims()
   if (returned && typeof returned === 'object' && !Array.isArray(returned)) {
     const rec = returned as Record<string, unknown>
     if (Array.isArray(rec.claims)) {
       const title = typeof rec.title === 'string' && rec.title.trim() ? rec.title.trim().slice(0, 300) : fallbackTitle
       const severity = typeof rec.severity === 'string' && rec.severity.trim() ? rec.severity.trim().slice(0, 32) : 'high'
-      const claims = rec.claims.length > 0 ? (rec.claims as VerifyClaim[]) : [...ctx.claims]
+      const claims = rec.claims.length > 0 ? (rec.claims as VerifyClaim[]) : fallbackClaims
       return {
         sdk: 'guardian_verify.ts',
         nonce: typeof rec.nonce === 'string' && rec.nonce ? rec.nonce : ctx.nonce,
@@ -2116,7 +2209,7 @@ function normalizeProofResult(ctx: VerifyContext, returned: unknown, defaultTitl
     nonce: ctx.nonce,
     title: fallbackTitle,
     severity: 'high',
-    claims: [...ctx.claims],
+    claims: fallbackClaims,
   }
 }
 

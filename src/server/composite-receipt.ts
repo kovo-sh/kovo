@@ -1,26 +1,16 @@
 /**
- * CompositeProofReceipt — unified multi-hop DAG confirmation verifier (v8 M0).
- *
+ * CompositeProofReceipt — unified multi-hop DAG confirmation verifier (v8).
  * Verifies 1..8 hop causal chains strictly over host-signed transcript records:
- *  1. `value_binding`: DerivedCapabilityHandle ID or sha256(extractedValue) output -> request (t_i <= t_j).
- *  2. `derived_crypto_binding`: Layer-1 `derivedFromCapabilityId` attestation linking Hop i -> Hop j.
- *  3. `state_transition_binding`: shared entityId + clean-session ablation control (Hop j alone fails).
- *  4. `async_pivot_binding`: trigger -> async/OOB/browser effect with monotonic timestamps & correlationId.
- *
- * Also enforces attacker-origin provenance, strict Mode-A vs Mode-B replay, optional HMAC-SHA256
- * transcript integrity, and 1-hop ProofReceipt bridge parity (`singleReceiptToComposite`).
+ * value_binding, derived_crypto_binding, state_transition_binding, async_pivot_binding,
+ * attacker-origin provenance, Mode-A/Mode-B replay, and hardened terminal-impact oracles.
  */
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
 import { parseRoleLabel, routeFamily, stepReadsState } from './oracle-invariants.ts'
 import { proofReceiptSchema, receiptIdSchema, verifyReceipt } from './proof-receipt.ts'
-import type {
-  ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent,
-  ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification,
-} from './proof-receipt.ts'
-
-// --- Schemas & Types --------------------------------------------------------
+import { isJobOrHandleStub } from './v8-oracle-families.ts'
+import type { ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 
 export const HOP_SURFACES = ['http', 'graphql', 'ws', 'sse', 'browser', 'webhook', 'async_job', 'idp', 'cdn', 'storage'] as const
 export type HopSurface = (typeof HOP_SURFACES)[number]
@@ -28,7 +18,6 @@ export const CAUSAL_EDGE_KINDS = ['value_binding', 'derived_crypto_binding', 'st
 export type CausalEdgeKind = (typeof CAUSAL_EDGE_KINDS)[number]
 export const REPLAY_MODES = ['fresh_clean_replay', 'one_shot_transcript'] as const
 export type ReplayMode = (typeof REPLAY_MODES)[number]
-
 export const capabilityHandleSchema = z.string().trim().regex(/^cap:[A-Za-z0-9._:-]{1,180}$/)
 export const sha256HexSchema = z.string().trim().regex(/^[0-9a-fA-F]{64}$/)
 
@@ -37,43 +26,29 @@ const edgeEnds = { fromHopId: receiptIdSchema, toHopId: receiptIdSchema }
 const nonEmpty = (max: number) => z.string().trim().min(1).max(max)
 
 export const hopReceiptSchema = z.object({
-  hopId: receiptIdSchema,
-  surface: z.enum(HOP_SURFACES).default('http'),
-  target: z.object({
-    origin: scopedAssetOrigin,
-    method: z.string().trim().regex(/^[A-Z]{1,10}$/).optional(),
-    pathAndQuery: nonEmpty(4096).optional(),
-    param: nonEmpty(128).optional(),
-  }),
-  exchangeIds: idList(32), oobEventIds: idList(16), browserTraceIds: idList(16),
-  claimedDelta: nonEmpty(1200),
-  producedCapabilities: z.array(capabilityHandleSchema).max(16).default([]),
-  consumedCapabilities: z.array(capabilityHandleSchema).max(16).default([]),
-  entityId: nonEmpty(256).optional(), canaryToken: nonEmpty(256).optional(),
-  proofReceipt: proofReceiptSchema.optional(),
+  hopId: receiptIdSchema, surface: z.enum(HOP_SURFACES).default('http'),
+  target: z.object({ origin: scopedAssetOrigin, method: z.string().trim().regex(/^[A-Z]{1,10}$/).optional(), pathAndQuery: nonEmpty(4096).optional(), param: nonEmpty(128).optional() }),
+  exchangeIds: idList(32), oobEventIds: idList(16), browserTraceIds: idList(16), claimedDelta: nonEmpty(1200),
+  producedCapabilities: z.array(capabilityHandleSchema).max(16).default([]), consumedCapabilities: z.array(capabilityHandleSchema).max(16).default([]),
+  entityId: nonEmpty(256).optional(), canaryToken: nonEmpty(256).optional(), proofReceipt: proofReceiptSchema.optional(),
 })
 export type HopReceipt = z.output<typeof hopReceiptSchema>
 
 export const valueBindingEdgeSchema = z.object({
-  kind: z.literal('value_binding'), ...edgeEnds,
-  capabilityHandle: capabilityHandleSchema.optional(), valueDigest: sha256HexSchema.optional(),
+  kind: z.literal('value_binding'), ...edgeEnds, capabilityHandle: capabilityHandleSchema.optional(), valueDigest: sha256HexSchema.optional(),
   sourceExchangeId: receiptIdSchema.optional(), targetExchangeId: receiptIdSchema.optional(),
-}).refine(e => e.capabilityHandle !== undefined || e.valueDigest !== undefined, {
-  message: 'value_binding requires capabilityHandle and/or valueDigest',
-})
+}).refine(e => e.capabilityHandle !== undefined || e.valueDigest !== undefined, { message: 'value_binding requires capabilityHandle and/or valueDigest' })
 export const derivedCryptoBindingEdgeSchema = z.object({
-  kind: z.literal('derived_crypto_binding'), ...edgeEnds,
-  sourceCapabilityId: capabilityHandleSchema, derivedCapabilityId: capabilityHandleSchema.optional(),
-  alg: nonEmpty(32).optional(),
+  kind: z.literal('derived_crypto_binding'), ...edgeEnds, sourceCapabilityId: capabilityHandleSchema,
+  derivedCapabilityId: capabilityHandleSchema.optional(), alg: nonEmpty(32).optional(),
 })
 export const stateTransitionBindingEdgeSchema = z.object({
-  kind: z.literal('state_transition_binding'), ...edgeEnds,
-  entityId: nonEmpty(256), ablationExchangeIds: z.array(receiptIdSchema).min(1).max(16),
-  mutationKind: nonEmpty(64).optional(),
+  kind: z.literal('state_transition_binding'), ...edgeEnds, entityId: nonEmpty(256),
+  ablationExchangeIds: z.array(receiptIdSchema).min(1).max(16), mutationKind: nonEmpty(64).optional(),
 })
 export const asyncPivotBindingEdgeSchema = z.object({
-  kind: z.literal('async_pivot_binding'), ...edgeEnds,
-  correlationId: nonEmpty(256), channel: z.enum(['poll_convergence', 'oob_relay', 'browser_trace', 'async_job']),
+  kind: z.literal('async_pivot_binding'), ...edgeEnds, correlationId: nonEmpty(256),
+  channel: z.enum(['poll_convergence', 'oob_relay', 'browser_trace', 'async_job']),
   oobEventId: receiptIdSchema.optional(), browserTraceId: receiptIdSchema.optional(), pollRecordId: receiptIdSchema.optional(),
 })
 export const causalEdgeBindingSchema = z.discriminatedUnion('kind', [
@@ -82,71 +57,43 @@ export const causalEdgeBindingSchema = z.discriminatedUnion('kind', [
 export type CausalEdgeBinding = z.output<typeof causalEdgeBindingSchema>
 
 export const terminalImpactSchema = z.object({
-  terminalHopId: receiptIdSchema, claimedImpact: nonEmpty(1200), proofReceipt: proofReceiptSchema.optional(),
-  preChainControlExchangeIds: idList(16), postChainReadbackExchangeIds: idList(16),
-  modeAFailureExchangeId: receiptIdSchema.optional(),
-})
+  terminalHopId: receiptIdSchema, claimedImpact: z.string().trim().max(1200).optional(), summary: z.string().trim().max(1200).optional(),
+  terminalExchangeId: receiptIdSchema.optional(), proofReceipt: proofReceiptSchema.optional(),
+  preChainControlExchangeIds: idList(16), postChainReadbackExchangeIds: idList(16), modeAFailureExchangeId: receiptIdSchema.optional(),
+}).transform(ti => ({ ...ti, claimedImpact: ti.claimedImpact && ti.claimedImpact.length > 0 ? ti.claimedImpact : (ti.summary ?? '') }))
 export type TerminalImpact = z.output<typeof terminalImpactSchema>
 
 export const compositeProofReceiptSchema = z.object({
-  chainId: receiptIdSchema, terminalVulnClass: nonEmpty(64),
-  hops: z.array(hopReceiptSchema).min(1).max(8),
-  causalEdges: z.array(causalEdgeBindingSchema).max(28).default([]),
-  terminalImpact: terminalImpactSchema,
-  replayMode: z.enum(REPLAY_MODES).default('fresh_clean_replay'),
-  benchmarkMode: z.boolean().optional(),
+  chainId: receiptIdSchema, terminalVulnClass: nonEmpty(64), hops: z.array(hopReceiptSchema).min(1).max(8),
+  causalEdges: z.array(causalEdgeBindingSchema).max(28).default([]), terminalImpact: terminalImpactSchema,
+  replayMode: z.enum(REPLAY_MODES).default('fresh_clean_replay'), benchmarkMode: z.boolean().optional(),
 })
 export type CompositeProofReceipt = z.output<typeof compositeProofReceiptSchema>
 
 // --- Host-Signed Transcript Types (Superset of ReceiptTranscript) -----------
 
-export interface HostCryptoAttestation {
-  derivedFromCapabilityId: string; derivedCapabilityId?: string; alg: string; artifactDigest: string; timestampMs: number
-}
+export interface HostCryptoAttestation { derivedFromCapabilityId: string; derivedCapabilityId?: string; alg: string; artifactDigest: string; timestampMs: number }
 export interface HostTranscriptEntry extends ReceiptTranscriptEntry {
-  timestampMs?: number; actorPersona?: string | null; actorRoleLabel?: string | null
-  emittedCapabilities?: readonly string[]; observedResponseDigests?: readonly string[]
-  consumedCapabilities?: readonly string[]; injectedRequestDigests?: readonly string[]
+  timestampMs?: number; actorPersona?: string | null; actorRoleLabel?: string | null; emittedCapabilities?: readonly string[]
+  observedResponseDigests?: readonly string[]; consumedCapabilities?: readonly string[]; injectedRequestDigests?: readonly string[]
   cryptoAttestations?: readonly HostCryptoAttestation[]; entityId?: string; correlationIds?: readonly string[]
   cleanSession?: boolean; replayAttempt?: 'mode_a' | 'ablation_control' | 'primary'; hostSignature?: string
 }
-export interface HostOobEvent extends ReceiptOobEvent {
-  emittedCapabilities?: readonly string[]; observedValueDigests?: readonly string[]
-  correlationIds?: readonly string[]; hostSignature?: string
-}
-export interface HostBrowserTrace extends ReceiptBrowserTrace {
-  timestampMs?: number; actorPersona?: string | null; emittedCapabilities?: readonly string[]
-  observedValueDigests?: readonly string[]; correlationIds?: readonly string[]; hostSignature?: string
-}
-export interface HostAsyncPollRecord {
-  id: string; triggerExchangeId?: string; tTriggerMs: number; tObservedMs: number; converged: boolean
-  correlationIds?: readonly string[]; emittedCapabilities?: readonly string[]
-  observedValueDigests?: readonly string[]; entityId?: string; hostSignature?: string
-}
-export interface HostSignedTranscript extends ReceiptTranscript {
-  entries?: readonly HostTranscriptEntry[]; oobEvents?: readonly HostOobEvent[]
-  browserTraces?: readonly HostBrowserTrace[]; asyncPollRecords?: readonly HostAsyncPollRecord[]
-}
+export interface HostOobEvent extends ReceiptOobEvent { emittedCapabilities?: readonly string[]; observedValueDigests?: readonly string[]; correlationIds?: readonly string[]; hostSignature?: string }
+export interface HostBrowserTrace extends ReceiptBrowserTrace { timestampMs?: number; actorPersona?: string | null; emittedCapabilities?: readonly string[]; observedValueDigests?: readonly string[]; correlationIds?: readonly string[]; hostSignature?: string }
+export interface HostAsyncPollRecord { id: string; triggerExchangeId?: string; tTriggerMs: number; tObservedMs: number; converged: boolean; correlationIds?: readonly string[]; emittedCapabilities?: readonly string[]; observedValueDigests?: readonly string[]; entityId?: string; hostSignature?: string }
+export interface HostSignedTranscript extends ReceiptTranscript { entries?: readonly HostTranscriptEntry[]; oobEvents?: readonly HostOobEvent[]; browserTraces?: readonly HostBrowserTrace[]; asyncPollRecords?: readonly HostAsyncPollRecord[] }
 export type HostSignableRecord = HostTranscriptEntry | HostOobEvent | HostBrowserTrace | HostAsyncPollRecord
-
 export interface CompositeVerifyOptions {
-  attackerPersonas?: readonly string[]; forbiddenShortcutPersonas?: readonly string[]
-  benchmarkMode?: boolean; requireCleanSessionFlag?: boolean; signingKey?: string
-  verifyTerminalImpact?: (
-    receipt: CompositeProofReceipt, transcript: HostSignedTranscript,
-  ) => { confirmed: boolean; reason: string; family?: string; evidence?: Record<string, unknown> }
+  attackerPersonas?: readonly string[]; forbiddenShortcutPersonas?: readonly string[]; benchmarkMode?: boolean; requireCleanSessionFlag?: boolean; signingKey?: string
+  verifyTerminalImpact?: (receipt: CompositeProofReceipt, transcript: HostSignedTranscript) => { confirmed: boolean; reason: string; family?: string; evidence?: Record<string, unknown> }
 }
-export interface VerifiedEdgeResult {
-  edgeIndex: number; kind: CausalEdgeKind; fromHopId: string; toHopId: string
-  verified: boolean; reason: string; evidence?: Record<string, unknown>
-}
-export type CompositeFailureStage =
-  | 'schema' | 'dag_topology' | 'transcript_integrity' | 'edge_binding'
-  | 'attacker_provenance' | 'replay_mode' | 'terminal_impact'
+export interface VerifiedEdgeResult { edgeIndex: number; kind: CausalEdgeKind; fromHopId: string; toHopId: string; verified: boolean; reason: string; evidence?: Record<string, unknown> }
+export type CompositeFailureStage = 'schema' | 'dag_topology' | 'transcript_integrity' | 'edge_binding' | 'attacker_provenance' | 'replay_mode' | 'terminal_impact'
 export interface CompositeReceiptVerification {
-  confirmed: boolean; chainId: string; terminalVulnClass: string; replayMode: ReplayMode
-  modeBVerified: boolean; hopCount: number; verifiedEdges: VerifiedEdgeResult[]; reason: string
-  failedStage?: CompositeFailureStage; terminalVerification?: ReceiptVerification; evidence?: Record<string, unknown>
+  confirmed: boolean; chainId: string; terminalVulnClass: string; replayMode: ReplayMode; modeBVerified: boolean; hopCount: number
+  verifiedEdges: VerifiedEdgeResult[]; reason: string; failedStage?: CompositeFailureStage; rejectedBy?: string | null; missingEvidence?: string[]
+  terminalVerification?: ReceiptVerification; evidence?: Record<string, unknown>
 }
 
 // --- Cryptographic, Hashing & Transcript Helpers ----------------------------
@@ -154,7 +101,32 @@ export interface CompositeReceiptVerification {
 const CONSUMED_STATE_RE =
   /\b(?:already[_\s-]?(?:consumed|redeemed|used|claimed|applied|settled)|token[_\s-]?(?:consumed|used|redeemed|spent)|one[_\s-]?time|nonce[_\s-]?(?:used|replayed|consumed)|invite[_\s-]?(?:redeemed|consumed|used)|state[_\s-]?(?:consumed|exhausted|finalized))\b/i
 const ABLATION_DENIED_STATUSES = new Set([401, 403, 404, 409, 412, 422])
+const DENIED_CONTROL_STATUSES = new Set([401, 403, 404])
 const SHA256_RE = /^[0-9a-f]{64}$/
+const TENANT_KEYS = new Set(['tenant', 'tenantid', 'tenant_id', 'org', 'orgid', 'org_id', 'workspaceid', 'workspace_id', 'ownertenant', 'ownertenantid', 'owner_tenant_id'])
+const STRICT_TERMINAL_CLASS_RE = /^(?:dual_tenant_abac|parser_cache_differential|temporal_revocation|economic_conservation|cryptographic_scope_replay|cross_surface_pivot)$|dual[_-]?tenant|abac|cache[_-]?(?:bleed|poison|deception|diff)|parser[_-]?diff|smuggl|cwe[-_]?444|cwe[-_]?639|\bidor\b|\bbola\b/i
+const TERMINAL_IMPACT_UNPROVEN_HINT =
+  "terminal_impact_unproven: creating a job/handle or priming cache is an intermediate capability, not terminal impact — follow the derived handle/URL to prove unauthorized foreign-tenant data read or privileged mutation, or call record_coverage(status='ruled_out', proofGapReason='invariant_enforced_hardened') if the terminal guard blocks access"
+
+function collectTenantMarkers(value: unknown, out: Set<string>, depth = 0): void {
+  if (depth > 3 || out.size > 32 || value == null) return
+  if (Array.isArray(value)) { for (const x of value) collectTenantMarkers(x, out, depth + 1); return }
+  if (typeof value !== 'object') return
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof v === 'string' && v.trim() && TENANT_KEYS.has(k.toLowerCase())) out.add(v.trim().toLowerCase())
+    else if (v && typeof v === 'object') collectTenantMarkers(v, out, depth + 1)
+  }
+}
+
+function entryTenants(entry: HostTranscriptEntry): Set<string> {
+  const out = new Set<string>()
+  let json = entry.step.json
+  if (json === undefined && typeof entry.step.body === 'string' && entry.step.body.trim().startsWith('{')) {
+    try { json = JSON.parse(entry.step.body) } catch { json = undefined }
+  }
+  collectTenantMarkers(json, out)
+  return out
+}
 
 export const sha256Hex = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex')
 
@@ -251,16 +223,8 @@ function serializeBodyText(entry: HostTranscriptEntry): string {
 
 // --- DAG Topology & Transcript Integrity ------------------------------------
 
-interface DagTopology {
-  hopsById: Map<string, HopReceipt>; topoOrder: string[]; roots: string[]
-  incomingByHop: Map<string, Array<{ edgeIndex: number; edge: CausalEdgeBinding }>>
-}
-
-interface IndexedTranscript {
-  entriesById: Map<string, HostTranscriptEntry>; oobById: Map<string, HostOobEvent>
-  tracesById: Map<string, HostBrowserTrace>; pollsById: Map<string, HostAsyncPollRecord>
-  allPolls: readonly HostAsyncPollRecord[]
-}
+interface DagTopology { hopsById: Map<string, HopReceipt>; topoOrder: string[]; roots: string[]; incomingByHop: Map<string, Array<{ edgeIndex: number; edge: CausalEdgeBinding }>> }
+interface IndexedTranscript { entriesById: Map<string, HostTranscriptEntry>; oobById: Map<string, HostOobEvent>; tracesById: Map<string, HostBrowserTrace>; pollsById: Map<string, HostAsyncPollRecord>; allPolls: readonly HostAsyncPollRecord[] }
 
 function validateDagTopology(receipt: CompositeProofReceipt): { ok: true; dag: DagTopology } | { ok: false; reason: string } {
   const hopsById = new Map<string, HopReceipt>()
@@ -270,54 +234,38 @@ function validateDagTopology(receipt: CompositeProofReceipt): { ok: true; dag: D
   }
   if (!hopsById.has(receipt.terminalImpact.terminalHopId)) return { ok: false, reason: `terminalHopId "${receipt.terminalImpact.terminalHopId}" not in hops.` }
   if (receipt.hops.length === 1 && receipt.causalEdges.length > 0) return { ok: false, reason: 'A 1-hop receipt cannot declare causalEdges.' }
-
   const inDeg = new Map<string, number>(receipt.hops.map(h => [h.hopId, 0]))
   const outAdj = new Map<string, string[]>(receipt.hops.map(h => [h.hopId, []]))
   const revAdj = new Map<string, string[]>(receipt.hops.map(h => [h.hopId, []]))
   const incomingByHop = new Map<string, Array<{ edgeIndex: number; edge: CausalEdgeBinding }>>(receipt.hops.map(h => [h.hopId, []]))
   const seen = new Set<string>()
-
   for (let i = 0; i < receipt.causalEdges.length; i++) {
     const e = receipt.causalEdges[i]!
     if (!hopsById.has(e.fromHopId) || !hopsById.has(e.toHopId)) return { ok: false, reason: `Edge #${i} references unknown hop.` }
     if (e.fromHopId === e.toHopId) return { ok: false, reason: `Edge #${i} forms a self-loop on "${e.fromHopId}".` }
     const key = `${e.fromHopId}->${e.toHopId}:${e.kind}`
     if (seen.has(key)) return { ok: false, reason: `Duplicate causal edge "${key}".` }
-    seen.add(key)
-    outAdj.get(e.fromHopId)!.push(e.toHopId)
-    revAdj.get(e.toHopId)!.push(e.fromHopId)
-    inDeg.set(e.toHopId, (inDeg.get(e.toHopId) ?? 0) + 1)
-    incomingByHop.get(e.toHopId)!.push({ edgeIndex: i, edge: e })
+    seen.add(key); outAdj.get(e.fromHopId)!.push(e.toHopId); revAdj.get(e.toHopId)!.push(e.fromHopId)
+    inDeg.set(e.toHopId, (inDeg.get(e.toHopId) ?? 0) + 1); incomingByHop.get(e.toHopId)!.push({ edgeIndex: i, edge: e })
   }
-
   const roots = receipt.hops.filter(h => inDeg.get(h.hopId) === 0).map(h => h.hopId)
   const queue = [...roots], rem = new Map(inDeg), topoOrder: string[] = []
   while (queue.length > 0) {
-    const id = queue.shift()!
-    topoOrder.push(id)
+    const id = queue.shift()!; topoOrder.push(id)
     for (const next of outAdj.get(id) ?? []) { const d = (rem.get(next) ?? 0) - 1; rem.set(next, d); if (d === 0) queue.push(next) }
   }
   if (topoOrder.length !== receipt.hops.length) return { ok: false, reason: 'Causal DAG contains a cycle.' }
-
-  const reachesTerminal = new Set<string>([receipt.terminalImpact.terminalHopId])
-  const rq = [receipt.terminalImpact.terminalHopId]
+  const reachesTerminal = new Set<string>([receipt.terminalImpact.terminalHopId]), rq = [receipt.terminalImpact.terminalHopId]
   while (rq.length > 0) for (const prev of revAdj.get(rq.shift()!) ?? []) if (!reachesTerminal.has(prev)) { reachesTerminal.add(prev); rq.push(prev) }
   const orphan = receipt.hops.find(h => !reachesTerminal.has(h.hopId))
-  if (orphan) return { ok: false, reason: `Hop "${orphan.hopId}" does not reach terminalHopId.` }
-  return { ok: true, dag: { hopsById, topoOrder, roots, incomingByHop } }
+  return orphan ? { ok: false, reason: `Hop "${orphan.hopId}" does not reach terminalHopId.` } : { ok: true, dag: { hopsById, topoOrder, roots, incomingByHop } }
 }
 
-function indexAndVerifyCitations(
-  receipt: CompositeProofReceipt,
-  transcript: HostSignedTranscript,
-  signingKey?: string,
-): { ok: true; idx: IndexedTranscript } | { ok: false; reason: string } {
+function indexAndVerifyCitations(receipt: CompositeProofReceipt, transcript: HostSignedTranscript, signingKey?: string): { ok: true; idx: IndexedTranscript } | { ok: false; reason: string } {
   const entriesById = new Map((transcript.entries ?? []).map(e => [e.exchangeId, e]))
   const oobById = new Map((transcript.oobEvents ?? []).map(o => [o.id, o]))
   const tracesById = new Map((transcript.browserTraces ?? []).map(t => [t.id, t]))
-  const allPolls = transcript.asyncPollRecords ?? []
-  const pollsById = new Map(allPolls.map(p => [p.id, p]))
-
+  const allPolls = transcript.asyncPollRecords ?? [], pollsById = new Map(allPolls.map(p => [p.id, p]))
   const checkAll = <T extends HostSignableRecord>(ids: readonly string[], map: Map<string, T>, label: string): string | null => {
     for (const id of ids) {
       const rec = map.get(id)
@@ -326,11 +274,8 @@ function indexAndVerifyCitations(
     }
     return null
   }
-
   for (const h of receipt.hops) {
-    const err = checkAll(h.exchangeIds, entriesById, `hop "${h.hopId}" exchange`)
-      ?? checkAll(h.oobEventIds, oobById, `hop "${h.hopId}" OOB event`)
-      ?? checkAll(h.browserTraceIds, tracesById, `hop "${h.hopId}" browser trace`)
+    const err = checkAll(h.exchangeIds, entriesById, `hop "${h.hopId}" exchange`) ?? checkAll(h.oobEventIds, oobById, `hop "${h.hopId}" OOB event`) ?? checkAll(h.browserTraceIds, tracesById, `hop "${h.hopId}" browser trace`)
     if (err) return { ok: false, reason: err }
   }
   for (const e of receipt.causalEdges) {
@@ -339,11 +284,10 @@ function indexAndVerifyCitations(
     if (err) return { ok: false, reason: err }
   }
   const ti = receipt.terminalImpact
-  const tErr = checkAll(ti.preChainControlExchangeIds, entriesById, 'pre-chain control')
-    ?? checkAll(ti.postChainReadbackExchangeIds, entriesById, 'post-chain readback')
+  const tErr = checkAll(ti.preChainControlExchangeIds, entriesById, 'pre-chain control') ?? checkAll(ti.postChainReadbackExchangeIds, entriesById, 'post-chain readback')
+    ?? (ti.terminalExchangeId ? checkAll([ti.terminalExchangeId], entriesById, 'terminal exchange') : null)
     ?? (ti.modeAFailureExchangeId ? checkAll([ti.modeAFailureExchangeId], entriesById, 'Mode-A failure') : null)
-  if (tErr) return { ok: false, reason: tErr }
-  return { ok: true, idx: { entriesById, oobById, tracesById, pollsById, allPolls } }
+  return tErr ? { ok: false, reason: tErr } : { ok: true, idx: { entriesById, oobById, tracesById, pollsById, allPolls } }
 }
 
 function recordHopCapabilities(hop: HopReceipt, idx: IndexedTranscript, target: Set<string>): void {
@@ -638,36 +582,96 @@ function verifyReplayMode(
 
 // --- Public Verifier & Single-Hop Bridge ------------------------------------
 
-export function verifyCompositeReceipt(
-  rawReceipt: unknown,
-  hostTranscript: HostSignedTranscript,
-  options: CompositeVerifyOptions = {},
-): CompositeReceiptVerification {
+function verifyTerminalImpactGate(
+  receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, verifiedEdges: VerifiedEdgeResult[],
+  hostTranscript: HostSignedTranscript, options: CompositeVerifyOptions,
+): { ok: true; terminalVerification?: ReceiptVerification } | { ok: false; reason: string; rejectedBy?: string; missingEvidence?: string[]; terminalVerification?: ReceiptVerification } {
+  const ti = receipt.terminalImpact
+  const effSummary = ti.summary !== undefined ? ti.summary : ti.claimedImpact
+  if (effSummary.replace(/\s+/g, '').length < 12) {
+    return { ok: false, reason: 'terminal_impact_summary_missing: terminalImpact.summary must be a meaningful non-empty description (>= 12 non-whitespace chars).', rejectedBy: 'terminal_impact_summary_missing', missingEvidence: ['terminal_impact_summary_missing'] }
+  }
+  const termHop = dag.hopsById.get(ti.terminalHopId)!
+  if (ti.terminalExchangeId && !termHop.exchangeIds.includes(ti.terminalExchangeId)) {
+    return { ok: false, reason: `terminalExchangeId "${ti.terminalExchangeId}" does not belong to terminal hop "${termHop.hopId}".`, rejectedBy: 'terminal_exchange_invalid', missingEvidence: ['terminal_exchange_in_final_hop'] }
+  }
+  let terminalVerification: ReceiptVerification | undefined
+  if (ti.proofReceipt) {
+    terminalVerification = verifyReceipt(ti.proofReceipt, hostTranscript)
+    if (!terminalVerification.confirmed) return { ok: false, reason: terminalVerification.reason, terminalVerification }
+  }
+  if (options.verifyTerminalImpact) {
+    const verdict = options.verifyTerminalImpact(receipt, hostTranscript)
+    if (!verdict.confirmed) return { ok: false, reason: verdict.reason, terminalVerification }
+  }
+  if (ti.proofReceipt || options.verifyTerminalImpact) return { ok: true, terminalVerification }
+
+  const termEx = ti.terminalExchangeId
+    ? idx.entriesById.get(ti.terminalExchangeId)!
+    : [...termHop.exchangeIds].reverse().map(id => idx.entriesById.get(id)!).find(e => e.step.arm === 'probe' && is2xx(e.step.status))
+  if (ti.terminalExchangeId && (!termEx || termEx.step.arm === 'control' || !is2xx(termEx.step.status))) {
+    return { ok: false, reason: `terminalExchangeId "${ti.terminalExchangeId}" is not a succeeding probe exchange.`, rejectedBy: 'terminal_impact_unproven', missingEvidence: [TERMINAL_IMPACT_UNPROVEN_HINT] }
+  }
+  const hasOob = termHop.oobEventIds.some(id => idx.oobById.get(id)?.delivered === true)
+  const hasBrowser = termHop.browserTraceIds.some(id => (idx.tracesById.get(id)?.sinks?.length ?? 0) > 0)
+  const hasAsyncEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'async_pivot_binding' && e.verified)
+  if (!termEx && !hasOob && !hasBrowser && !hasAsyncEdge) {
+    return { ok: false, reason: `Terminal hop "${termHop.hopId}" has no succeeding terminal evidence.`, rejectedBy: 'terminal_impact_unproven', missingEvidence: [TERMINAL_IMPACT_UNPROVEN_HINT] }
+  }
+  const hasPostMutation = ti.postChainReadbackExchangeIds.some(id => {
+    if (termEx && id === termEx.exchangeId) return false
+    const e = idx.entriesById.get(id)!
+    const mono = !termEx || !isFiniteTs(termEx.timestampMs) || (isFiniteTs(e.timestampMs) && e.timestampMs >= termEx.timestampMs)
+    const isRead = stepReadsState(e.step) || e.step.arm === 'control' || e.step.evidenceRole === 'post_chain_readback'
+    const hasData = e.step.json !== undefined || (typeof e.step.body === 'string' && e.step.body.trim().length > 0)
+    return is2xx(e.step.status) && mono && isRead && hasData && !isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method)
+  })
+  const termFam = routeFamily(termEx?.step.route ?? termEx?.step.pathAndQuery ?? termHop.target.pathAndQuery ?? '')
+  const ctrlCandidates = [...ti.preChainControlExchangeIds, ...termHop.exchangeIds, ...receipt.causalEdges.flatMap(ed => ed.kind === 'state_transition_binding' && ed.toHopId === termHop.hopId ? ed.ablationExchangeIds : [])]
+  const hasCleanDeniedCtrl = ctrlCandidates.some(id => {
+    if (termEx && id === termEx.exchangeId) return false
+    const c = idx.entriesById.get(id)
+    if (!c || (c.step.arm !== 'control' && c.replayAttempt !== 'ablation_control') || typeof c.step.status !== 'number' || !DENIED_CONTROL_STATUSES.has(c.step.status)) return false
+    const cf = routeFamily(c.step.route ?? c.step.pathAndQuery ?? '')
+    return !termFam || !cf || cf === termFam || Boolean(termHop.entityId && entryMatchesEntity(c, termHop.entityId))
+  })
+  const attackerTenants = new Set<string>()
+  for (const rId of dag.roots) for (const exId of dag.hopsById.get(rId)!.exchangeIds) {
+    const e = idx.entriesById.get(exId)!
+    if (e.step.arm !== 'probe') continue
+    const t = (e.step.actor.tenant ?? parseRoleLabel(e.actorRoleLabel ?? e.actorPersona ?? '').tenant ?? '').trim().toLowerCase()
+    if (t) attackerTenants.add(t)
+  }
+  const respTenants = termEx ? entryTenants(termEx) : new Set<string>()
+  const hasBody = Boolean(termEx && (termEx.step.json !== undefined || (typeof termEx.step.body === 'string' && termEx.step.body.trim().length > 0)))
+  const isStub = Boolean(termEx && hasBody && isJobOrHandleStub(termEx.step.json, termEx.step.body, termEx.step.status, termEx.step.method))
+  if (isStub && !hasPostMutation) return { ok: false, reason: TERMINAL_IMPACT_UNPROVEN_HINT, rejectedBy: 'terminal_impact_unproven', missingEvidence: [TERMINAL_IMPACT_UNPROVEN_HINT] }
+  const ownTenantOnly = respTenants.size > 0 && attackerTenants.size > 0 && [...respTenants].every(t => attackerTenants.has(t))
+  if (termEx && ownTenantOnly && !hasPostMutation && !hasCleanDeniedCtrl) return { ok: false, reason: TERMINAL_IMPACT_UNPROVEN_HINT, rejectedBy: 'terminal_impact_unproven', missingEvidence: [TERMINAL_IMPACT_UNPROVEN_HINT] }
+  if (STRICT_TERMINAL_CLASS_RE.test(receipt.terminalVulnClass)) {
+    if (!hasCleanDeniedCtrl && !hasOob && !hasBrowser) return { ok: false, reason: `Missing clean denied control (401/403/404) on terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, rejectedBy: 'terminal_impact_unproven', missingEvidence: ['clean_denied_control_401_403_404', TERMINAL_IMPACT_UNPROVEN_HINT] }
+    if (termEx && !hasPostMutation && (!hasBody || isStub || ownTenantOnly)) return { ok: false, reason: TERMINAL_IMPACT_UNPROVEN_HINT, rejectedBy: 'terminal_impact_unproven', missingEvidence: [TERMINAL_IMPACT_UNPROVEN_HINT] }
+  }
+  return { ok: true }
+}
+
+export function verifyCompositeReceipt(rawReceipt: unknown, hostTranscript: HostSignedTranscript, options: CompositeVerifyOptions = {}): CompositeReceiptVerification {
   const parsed = compositeProofReceiptSchema.safeParse(rawReceipt)
   if (!parsed.success) {
     const issue = parsed.error.issues[0]
-    return {
-      confirmed: false, chainId: 'invalid', terminalVulnClass: 'invalid', replayMode: 'fresh_clean_replay',
-      modeBVerified: false, hopCount: 0, verifiedEdges: [], failedStage: 'schema',
-      reason: `Schema validation failed: ${issue?.path.join('.') || 'receipt'} ${issue?.message ?? ''}`.slice(0, 400),
-    }
+    return { confirmed: false, chainId: 'invalid', terminalVulnClass: 'invalid', replayMode: 'fresh_clean_replay', modeBVerified: false, hopCount: 0, verifiedEdges: [], failedStage: 'schema', reason: `Schema validation failed: ${issue?.path.join('.') || 'receipt'} ${issue?.message ?? ''}`.slice(0, 400) }
   }
   const receipt = parsed.data
-  const fail = (
-    failedStage: CompositeFailureStage, reason: string,
-    verifiedEdges: VerifiedEdgeResult[] = [], terminalVerification?: ReceiptVerification,
-  ): CompositeReceiptVerification => ({
-    confirmed: false, chainId: receipt.chainId, terminalVulnClass: receipt.terminalVulnClass,
-    replayMode: receipt.replayMode, modeBVerified: false, hopCount: receipt.hops.length,
-    verifiedEdges, failedStage, reason, ...(terminalVerification ? { terminalVerification } : {}),
+  const fail = (failedStage: CompositeFailureStage, reason: string, verifiedEdges: VerifiedEdgeResult[] = [], terminalVerification?: ReceiptVerification, rejectedBy?: string, missingEvidence?: string[]): CompositeReceiptVerification => ({
+    confirmed: false, chainId: receipt.chainId, terminalVulnClass: receipt.terminalVulnClass, replayMode: receipt.replayMode,
+    modeBVerified: false, hopCount: receipt.hops.length, verifiedEdges, failedStage, reason,
+    ...(rejectedBy ? { rejectedBy } : {}), ...(missingEvidence?.length ? { missingEvidence } : {}), ...(terminalVerification ? { terminalVerification } : {}),
   })
-
   const dagRes = validateDagTopology(receipt)
   if (!dagRes.ok) return fail('dag_topology', dagRes.reason)
   const idxRes = indexAndVerifyCitations(receipt, hostTranscript, options.signingKey)
   if (!idxRes.ok) return fail('transcript_integrity', idxRes.reason)
   const { dag } = dagRes, { idx } = idxRes
-
   const verifiedEdges: VerifiedEdgeResult[] = [], knownCaps = new Set<string>()
   for (const hopId of dag.topoOrder) {
     for (const { edgeIndex, edge } of dag.incomingByHop.get(hopId) ?? []) {
@@ -682,37 +686,17 @@ export function verifyCompositeReceipt(
     }
     recordHopCapabilities(dag.hopsById.get(hopId)!, idx, knownCaps)
   }
-
   const provRes = verifyAttackerProvenance(receipt, dag, idx, options)
   if (!provRes.ok) return fail('attacker_provenance', provRes.reason, verifiedEdges)
   const replayRes = verifyReplayMode(receipt, dag, idx, options)
   if (!replayRes.ok) return fail('replay_mode', replayRes.reason, verifiedEdges)
-
-  let terminalVerification: ReceiptVerification | undefined
-  if (receipt.terminalImpact.proofReceipt) {
-    terminalVerification = verifyReceipt(receipt.terminalImpact.proofReceipt, hostTranscript)
-    if (!terminalVerification.confirmed) return fail('terminal_impact', terminalVerification.reason, verifiedEdges, terminalVerification)
-  }
-  if (options.verifyTerminalImpact) {
-    const verdict = options.verifyTerminalImpact(receipt, hostTranscript)
-    if (!verdict.confirmed) return fail('terminal_impact', verdict.reason, verifiedEdges, terminalVerification)
-  }
-  if (!receipt.terminalImpact.proofReceipt && !options.verifyTerminalImpact) {
-    const termHop = dag.hopsById.get(receipt.terminalImpact.terminalHopId)!
-    const okTerminal =
-      termHop.exchangeIds.some(id => { const e = idx.entriesById.get(id)!; return e.step.arm === 'probe' && is2xx(e.step.status) }) ||
-      termHop.oobEventIds.some(id => idx.oobById.get(id)?.delivered === true) ||
-      termHop.browserTraceIds.some(id => (idx.tracesById.get(id)?.sinks?.length ?? 0) > 0) ||
-      verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'async_pivot_binding' && e.verified)
-    if (!okTerminal) return fail('terminal_impact', `Terminal hop "${termHop.hopId}" has no succeeding terminal evidence.`, verifiedEdges)
-  }
-
+  const termRes = verifyTerminalImpactGate(receipt, dag, idx, verifiedEdges, hostTranscript, options)
+  if (!termRes.ok) return fail('terminal_impact', termRes.reason, verifiedEdges, termRes.terminalVerification, termRes.rejectedBy, termRes.missingEvidence)
   return {
-    confirmed: true, chainId: receipt.chainId, terminalVulnClass: receipt.terminalVulnClass,
-    replayMode: receipt.replayMode, modeBVerified: receipt.replayMode === 'one_shot_transcript',
-    hopCount: receipt.hops.length, verifiedEdges,
+    confirmed: true, chainId: receipt.chainId, terminalVulnClass: receipt.terminalVulnClass, replayMode: receipt.replayMode,
+    modeBVerified: receipt.replayMode === 'one_shot_transcript', hopCount: receipt.hops.length, verifiedEdges,
     reason: `CompositeProofReceipt confirmed (${receipt.hops.length} hop(s), ${verifiedEdges.length} verified causal edge(s), mode=${receipt.replayMode}).`,
-    ...(terminalVerification ? { terminalVerification } : {}),
+    ...(termRes.terminalVerification ? { terminalVerification: termRes.terminalVerification } : {}),
     evidence: { topoOrder: dag.topoOrder, roots: dag.roots, derivedCapabilities: provRes.derivedCapabilities },
   }
 }

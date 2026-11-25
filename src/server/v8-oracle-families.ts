@@ -19,29 +19,12 @@ export type CausalBindingKind = 'value_binding' | 'derived_crypto_binding' | 'st
 export type SignatureVerifier = (record: HostSignedRecord) => boolean
 
 export interface HostSignedRecord {
-  id: string
-  hostSignature: string
-  timestampMs: number
-  status?: number | null
-  method?: string
-  route?: string
-  surface?: V8SurfaceKind
-  actorId?: string | null
-  tenantId?: string | null
-  body?: string
-  json?: unknown
-  requestHeaders?: Readonly<Record<string, string>> | null
-  responseHeaders?: Readonly<Record<string, string>> | null
-  capabilityHandle?: string | null
-  artifactDigest?: string | null
-  derivedFromCapabilityId?: string | null
+  id: string; hostSignature: string; timestampMs: number; status?: number | null; method?: string; route?: string; surface?: V8SurfaceKind
+  actorId?: string | null; tenantId?: string | null; body?: string; json?: unknown
+  requestHeaders?: Readonly<Record<string, string>> | null; responseHeaders?: Readonly<Record<string, string>> | null
+  capabilityHandle?: string | null; artifactDigest?: string | null; derivedFromCapabilityId?: string | null
 }
-
-export interface V8OracleDecision extends ImpactAssessment {
-  family: V8OracleFamily
-  subRule?: string
-}
-
+export interface V8OracleDecision extends ImpactAssessment { family: V8OracleFamily; subRule?: string }
 interface WithVerifier { verifySignature?: SignatureVerifier }
 
 /* ─────────────────────────── Shared pure helpers ─────────────────────────── */
@@ -51,6 +34,46 @@ const DEFAULT_TOL = 1e-6
 const MAX_PIVOT_HOPS = 8
 const FINALIZED_STATES = new Set(['fulfilled', 'completed', 'captured', 'released', 'settled', 'paid', 'shipped', 'delivered', 'disbursed'])
 const ERROR_ONLY_KEYS = new Set(['error', 'errors', 'message', 'detail', 'code', 'status', 'statusCode', 'ok', 'success'])
+const STUB_META_KEYS = new Set([
+  'ok', 'success', 'error', 'errors', 'message', 'detail', 'code', 'status', 'statuscode', 'state',
+  'accepted', 'queued', 'pending', 'created', 'updated', 'cached', 'hit', 'primed', 'id',
+  'jobid', 'job_id', 'exportid', 'export_id', 'taskid', 'task_id', 'requestid', 'request_id',
+  'handle', 'token', 'signedurl', 'signed_url', 'downloadurl', 'download_url', 'exporturl', 'export_url',
+  'pollurl', 'poll_url', 'statusurl', 'status_url', 'artifacturl', 'artifact_url', 'url', 'href', 'link',
+  'location', 'path', 'filekey', 'file_key', 'createdat', 'created_at', 'updatedat', 'updated_at',
+  'expiresat', 'expires_at', 'ttl', 'format', 'type', 'kind', 'scope', 'tenantid', 'tenant_id',
+  'orgid', 'org_id', 'workspaceid', 'workspace_id', 'ownerid', 'owner_id', 'userid', 'user_id',
+  'actorid', 'actor_id', 'role', 'roles', 'permissions', 'count', 'total', 'size', 'progress', 'poll',
+])
+const JOB_CACHE_SIGNAL_KEYS = new Set([
+  'jobid', 'job_id', 'exportid', 'export_id', 'taskid', 'task_id', 'downloadurl', 'download_url',
+  'signedurl', 'signed_url', 'exporturl', 'export_url', 'pollurl', 'poll_url', 'statusurl', 'status_url',
+  'artifacturl', 'artifact_url', 'url', 'href', 'queued', 'pending', 'accepted', 'cached', 'primed',
+  'permissions', 'roles',
+])
+const PENDING_STATE_RE = /^(?:queued|pending|processing|accepted|created|scheduled|running|in_progress|started|primed|cached|ok)$/i
+const WRAPPER_KEYS = new Set(['job', 'export', 'task', 'result', 'data'])
+
+export function isJobOrHandleStub(json: unknown, body?: string, status?: number | null, method?: string): boolean {
+  let val = json
+  if (val === undefined && typeof body === 'string' && body.trim().startsWith('{')) {
+    try { val = JSON.parse(body) } catch { val = undefined }
+  }
+  if (!val || typeof val !== 'object' || Array.isArray(val)) return false
+  let obj = val as Record<string, unknown>
+  const topKeys = Object.keys(obj)
+  if (topKeys.length === 1 && WRAPPER_KEYS.has(topKeys[0]!.toLowerCase())) {
+    const inner = obj[topKeys[0]!]
+    if (inner && typeof inner === 'object' && !Array.isArray(inner)) obj = inner as Record<string, unknown>
+  }
+  const entries = Object.entries(obj).filter(([, v]) => v !== null && v !== undefined && v !== '' && !(Array.isArray(v) && v.length === 0))
+  if (entries.length === 0) return true
+  if (!entries.every(([k]) => STUB_META_KEYS.has(k.toLowerCase()))) return false
+  const hasSignalKey = entries.some(([k]) => JOB_CACHE_SIGNAL_KEYS.has(k.toLowerCase()))
+  const stateVal = typeof obj.status === 'string' ? obj.status : (typeof obj.state === 'string' ? obj.state : '')
+  const isCreation = (status === 201 || status === 202) || (Boolean(method) && /^(?:POST|PUT)$/i.test(method!) && entries.some(([k]) => /^(?:id|status|state|url|location|handle)$/i.test(k)))
+  return hasSignalKey || isCreation || (Boolean(stateVal) && PENDING_STATE_RE.test(stateVal.trim()))
+}
 
 const ok = (family: V8OracleFamily, subRule: string, reason: string, evidence: Record<string, unknown>): V8OracleDecision =>
   ({ family, subRule, required: true, satisfied: true, reason, evidence })
@@ -82,6 +105,7 @@ function checkRecords(pairs: readonly [HostSignedRecord | null | undefined, stri
 }
 
 function hasSubstantivePayload(record: HostSignedRecord): boolean {
+  if (isJobOrHandleStub(record.json, record.body, record.status, record.method)) return false
   if (normStr(record.artifactDigest) || normStr(record.capabilityHandle)) return true
   if (record.json !== undefined && record.json !== null) {
     if (Array.isArray(record.json)) return record.json.length > 0
@@ -108,56 +132,22 @@ function hasCacheHitHeader(headers: Readonly<Record<string, string>> | null | un
 
 /* ───────────────────── 1. Dual-Tenant ABAC Evaluator ─────────────────────── */
 
-export interface DualTenantActor {
-  actorId: string
-  rolesByTenant: Readonly<Record<string, RoleName | string | null | undefined>>
-}
-
+export interface DualTenantActor { actorId: string; rolesByTenant: Readonly<Record<string, RoleName | string | null | undefined>> }
 export interface DualTenantCrossOrgTransferInput extends WithVerifier {
-  mode: 'cross_org_transfer'
-  actor: DualTenantActor
-  sourceTenantId: string
-  destTenantId: string
-  entityId: string
-  requiredSourceRole?: RoleName
-  requiredDestRole?: RoleName
-  transferRecord: HostSignedRecord
-  postTransferReadback: HostSignedRecord
-  observedOwnerTenantId: string
-  sourceControlDenied?: HostSignedRecord
+  mode: 'cross_org_transfer'; actor: DualTenantActor; sourceTenantId: string; destTenantId: string; entityId: string
+  requiredSourceRole?: RoleName; requiredDestRole?: RoleName; transferRecord: HostSignedRecord; postTransferReadback: HostSignedRecord
+  observedOwnerTenantId: string; sourceControlDenied?: HostSignedRecord
 }
-
 export interface DualTenantCacheBleedInput extends WithVerifier {
-  mode: 'dual_org_cache_bleed'
-  actor: DualTenantActor
-  primeTenantId: string
-  targetTenantId: string
-  requiredRole?: RoleName
-  baselineDeniedControl: HostSignedRecord
-  primeAction: HostSignedRecord
-  bledAccess: HostSignedRecord
-  isolatedControl?: boolean
-  targetRecordId?: string
-  observedTenantId?: string
+  mode: 'dual_org_cache_bleed'; actor: DualTenantActor; primeTenantId: string; targetTenantId: string; requiredRole?: RoleName
+  baselineDeniedControl: HostSignedRecord; primeAction: HostSignedRecord; bledAccess: HostSignedRecord
+  isolatedControl?: boolean; targetRecordId?: string; observedTenantId?: string
 }
-
 export interface DualTenantBatchPartialAuthzInput extends WithVerifier {
-  mode: 'batch_partial_authz'
-  actor: DualTenantActor
-  ownTenantId: string
-  foreignTenantId: string
-  ownRecordId: string
-  foreignRecordId: string
-  requestedIds: readonly string[]
-  requiredRole?: RoleName
-  singleForeignControlDenied: HostSignedRecord
-  batchRequest: HostSignedRecord
-  returnedForeignIds?: readonly string[]
-  foreignDataObserved?: boolean
-  postMutationReadback?: HostSignedRecord
-  foreignMutationPersisted?: boolean
+  mode: 'batch_partial_authz'; actor: DualTenantActor; ownTenantId: string; foreignTenantId: string; ownRecordId: string; foreignRecordId: string
+  requestedIds: readonly string[]; requiredRole?: RoleName; singleForeignControlDenied: HostSignedRecord; batchRequest: HostSignedRecord
+  returnedForeignIds?: readonly string[]; foreignDataObserved?: boolean; postMutationReadback?: HostSignedRecord; foreignMutationPersisted?: boolean
 }
-
 export type DualTenantAbacInput = DualTenantCrossOrgTransferInput | DualTenantCacheBleedInput | DualTenantBatchPartialAuthzInput
 
 export function resolveTenantRole(actor: DualTenantActor | null | undefined, tenantId: string): RoleName | null {
@@ -218,6 +208,7 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
     if (!input.isolatedControl && input.primeAction.timestampMs < input.baselineDeniedControl.timestampMs) return deny(f, 'non_monotonic_prime_timestamp', sub)
     if (input.bledAccess.timestampMs < input.primeAction.timestampMs) return deny(f, 'non_monotonic_bled_timestamp', sub)
     if (input.observedTenantId && normKey(input.observedTenantId) !== target) return deny(f, 'observed_tenant_mismatch', sub)
+    if (isJobOrHandleStub(input.bledAccess.json, input.bledAccess.body, input.bledAccess.status, input.bledAccess.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
     if (!normStr(input.targetRecordId) && !hasSubstantivePayload(input.bledAccess)) return deny(f, 'bled_access_missing_substantive_data', sub)
 
     return ok(f, sub, 'dual_org_permission_cache_bleed_confirmed', {
@@ -491,32 +482,16 @@ export function evaluateCryptographicScopeReplay(input: CryptographicScopeReplay
 /* ───────────────── 5. Parser / Cache Differential Evaluator ──────────────── */
 
 export interface ParserDifferentialInput extends WithVerifier {
-  mode: 'parser_differential'
-  differentialKind: 'duplicate_json_key' | 'path_normalization' | 'header_normalization' | 'hop_by_hop_smuggling' | 'content_type_confusion'
-  differentialFeature: string
-  canonicalValue?: string
-  variantValue?: string
-  impactKind: 'read' | 'mutation'
-  cleanControl: HostSignedRecord
-  differentialProbe: HostSignedRecord
-  isolatedControl?: boolean
-  postMutationReadback?: HostSignedRecord
-  mutationPersisted?: boolean
-  unauthorizedDigest?: string
+  mode: 'parser_differential'; differentialKind: 'duplicate_json_key' | 'path_normalization' | 'header_normalization' | 'hop_by_hop_smuggling' | 'content_type_confusion'
+  differentialFeature: string; canonicalValue?: string; variantValue?: string; impactKind: 'read' | 'mutation'
+  cleanControl: HostSignedRecord; differentialProbe: HostSignedRecord; isolatedControl?: boolean
+  postMutationReadback?: HostSignedRecord; mutationPersisted?: boolean; unauthorizedDigest?: string
 }
-
 export interface CachePrimedDifferentialInput extends WithVerifier {
-  mode: 'cache_primed'
-  cacheKey: string
-  victimArtifactDigest: string
-  cleanControl: HostSignedRecord
-  cleanControlContainsVictimData?: boolean
-  victimOrPrimeRequest: HostSignedRecord
-  attackerProbe: HostSignedRecord
-  isolatedControl?: boolean
-  cacheHitObserved?: boolean
+  mode: 'cache_primed'; cacheKey: string; victimArtifactDigest: string; cleanControl: HostSignedRecord
+  cleanControlContainsVictimData?: boolean; victimOrPrimeRequest: HostSignedRecord; attackerProbe: HostSignedRecord
+  isolatedControl?: boolean; cacheHitObserved?: boolean
 }
-
 export type ParserCacheDifferentialInput = ParserDifferentialInput | CachePrimedDifferentialInput
 
 export function evaluateParserCacheDifferential(input: ParserCacheDifferentialInput): V8OracleDecision {
@@ -543,6 +518,7 @@ export function evaluateParserCacheDifferential(input: ParserCacheDifferentialIn
       if (input.postMutationReadback!.timestampMs < input.differentialProbe.timestampMs) return deny(f, 'mutation_readback_precedes_probe', sub)
       if (input.mutationPersisted !== true) return deny(f, 'mutation_not_persisted', sub)
     } else {
+      if (isJobOrHandleStub(input.differentialProbe.json, input.differentialProbe.body, input.differentialProbe.status, input.differentialProbe.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
       const probeDigest = normStr(input.unauthorizedDigest ?? input.differentialProbe.artifactDigest)
       const ctrlDigest = normStr(input.cleanControl.artifactDigest)
       if (probeDigest && ctrlDigest && probeDigest === ctrlDigest) return deny(f, 'probe_artifact_already_in_control', sub)
@@ -577,6 +553,7 @@ export function evaluateParserCacheDifferential(input: ParserCacheDifferentialIn
     const sameActor = Boolean(vActor && aActor && vActor === aActor), sameTenant = Boolean(vTenant && aTenant && vTenant === aTenant)
     if ((!vActor && !vTenant) || (sameActor && (sameTenant || (!vTenant && !aTenant)))) return deny(f, 'victim_and_attacker_not_distinct', sub)
 
+    if (isJobOrHandleStub(input.attackerProbe.json, input.attackerProbe.body, input.attackerProbe.status, input.attackerProbe.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
     if (input.cacheHitObserved !== true && !hasCacheHitHeader(input.attackerProbe.responseHeaders)) return deny(f, 'no_cache_hit_evidence', sub)
     if (normStr(input.attackerProbe.artifactDigest) !== victimDigest) return deny(f, 'attacker_did_not_receive_victim_artifact', sub)
 
