@@ -248,6 +248,139 @@ export function normalizeConfirmedRouteTemplate(path?: string | null): string {
   return segments.join('/') || '/'
 }
 
+export interface PlannerConfirmedRef extends AlreadyConfirmedRef {
+  hasCompositeReceipt?: boolean
+}
+
+export type DuplicatePlannedStepReason = 'already_confirmed' | 'in_flight' | null
+
+export interface PlannedStepDedupeCandidate {
+  title: string
+  hypothesis: string
+  category?: string | null
+  origins?: readonly string[]
+  sourceOrigins?: readonly string[]
+  skills?: readonly string[]
+  dependsOnFactIds?: readonly string[]
+  dependsOnStepIds?: readonly string[]
+  checkpointCapId?: string | null
+  trialIndex?: number
+}
+
+const IN_FLIGHT_STEP_STATUSES = new Set<ChainStep['status']>(['pending', 'ready', 'running'])
+
+/** Canonical `(origin, normalizedRoute, classFamily)` dedupe key for planner/dispatch suppression. */
+export function plannerDedupeTupleKey(origin: string, route: string, categoryOrClass: string): string | null {
+  const cleanOrigin = origin.trim()
+  const normRoute = normalizeConfirmedRouteTemplate(route)
+  if (!cleanOrigin || !normRoute || normRoute === '/') return null
+  const rawClass = (categoryOrClass ?? '').trim()
+  if (!rawClass) return null
+  const family = confirmedCategoryFamily(rawClass)
+  if (!family) return null
+  return `${cleanOrigin}\u0000${normRoute}\u0000${family}`
+}
+
+/** Build confirmed `(origin, normalizedRoute, classFamily)` and composite-confirmed lookup sets. */
+export function buildConfirmedTupleKeySets(confirmed: readonly PlannerConfirmedRef[]): {
+  all: Set<string>
+  composite: Set<string>
+  compositeRoutes: Set<string>
+} {
+  const all = new Set<string>()
+  const composite = new Set<string>()
+  const compositeRoutes = new Set<string>()
+  for (const ref of confirmed) {
+    const origin = ref.origin?.trim()
+    const normRoute = normalizeConfirmedRouteTemplate(ref.path)
+    if (!origin || !normRoute || normRoute === '/') continue
+    if (ref.hasCompositeReceipt) {
+      compositeRoutes.add(`${origin}\u0000${normRoute}`)
+    }
+    const probeClass = ref.probeClass?.trim()
+    if (!probeClass) continue
+    const tupleKey = plannerDedupeTupleKey(origin, normRoute, probeClass)
+    if (!tupleKey) continue
+    all.add(tupleKey)
+    if (ref.hasCompositeReceipt) {
+      composite.add(tupleKey)
+    }
+  }
+  return { all, composite, compositeRoutes }
+}
+
+/** Build active in-flight `(origin, normalizedRoute, classFamily)` tuple set (excludes `trialIndex > 0`). */
+export function buildInFlightTupleKeys(
+  steps: readonly Pick<ChainStep, 'status' | 'trialIndex' | 'title' | 'hypothesis' | 'category' | 'sourceOrigins'>[],
+): Set<string> {
+  const keys = new Set<string>()
+  for (const step of steps) {
+    if (!IN_FLIGHT_STEP_STATUSES.has(step.status)) continue
+    if ((step.trialIndex ?? 0) > 0) continue
+    const routes = [...new Set(templatesMentionedInText(`${step.title} ${step.hypothesis}`).map(normalizeConfirmedRouteTemplate))]
+      .filter(route => route && route !== '/')
+    if (!routes.length) continue
+    for (const origin of step.sourceOrigins ?? []) {
+      for (const route of routes) {
+        const key = plannerDedupeTupleKey(origin, route, step.category)
+        if (key) keys.add(key)
+      }
+    }
+  }
+  return keys
+}
+
+function addStepTuplesToInFlightSet(
+  inFlight: Set<string>,
+  step: { title: string; hypothesis: string; category: string; origins: readonly string[]; trialIndex?: number },
+): void {
+  if ((step.trialIndex ?? 0) > 0) return
+  const routes = [...new Set(templatesMentionedInText(`${step.title} ${step.hypothesis}`).map(normalizeConfirmedRouteTemplate))]
+    .filter(route => route && route !== '/')
+  if (!routes.length) return
+  for (const origin of step.origins) {
+    for (const route of routes) {
+      const key = plannerDedupeTupleKey(origin, route, step.category)
+      if (key) inFlight.add(key)
+    }
+  }
+}
+
+function isCompositeVerificationConfirmed(
+  proofReceiptObj: Record<string, unknown> | undefined,
+  findingEvidence?: Record<string, unknown>,
+  compReceiptObj?: Record<string, unknown>,
+): boolean {
+  const compVer = (
+    proofReceiptObj?.compositeVerification
+    ?? findingEvidence?.compositeVerification
+    ?? compReceiptObj?.verification
+  ) as Record<string, unknown> | undefined
+  if (compVer && typeof compVer === 'object') {
+    if (compVer.confirmed === true || compVer.ok === true) return true
+    if (compVer.confirmed === false || compVer.ok === false) return false
+  }
+  const ver = proofReceiptObj?.verification as Record<string, unknown> | undefined
+  if (ver && typeof ver === 'object') {
+    return ver.confirmed === true || ver.ok === true
+  }
+  return false
+}
+
+function parseTerminalEndpointCandidate(raw: unknown): { method: string | null; path: string } | null {
+  if (typeof raw !== 'string') return null
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+  const withMethod = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\/\S*)$/i.exec(trimmed)
+  if (withMethod) {
+    return { method: withMethod[1]!.toUpperCase(), path: withMethod[2]! }
+  }
+  if (trimmed.startsWith('/')) {
+    return { method: null, path: trimmed }
+  }
+  return null
+}
+
 /** Build normalized confirmed path + `(METHOD, path)` lookup sets for floor-dedupe filtering. */
 export function buildConfirmedRouteSets(confirmed: readonly AlreadyConfirmedRef[]): {
   paths: Set<string>
@@ -1916,40 +2049,112 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
   // --- Slice 3 / agentic value-add: read-only prompt context builders ---
   /** Confirmed + static-verified (endpoint, method, param, cwe) refs. Prompt context only. */
-  alreadyConfirmedRefs(run: Run, limit = 30): AlreadyConfirmedRef[] {
+  alreadyConfirmedRefs(run: Run, limit = 30): PlannerConfirmedRef[] {
     try {
       const rows = this.storage.db.select().from(findings).where(and(
         eq(findings.runId, run.id),
         eq(findings.goalRevision, run.goalRevision),
       )).all()
       const specById = new Map(this.storage.listReplaySpecs(run.id).map(spec => [spec.id, spec]))
-      const refs: AlreadyConfirmedRef[] = []
-      const seen = new Set<string>()
+      const refs: PlannerConfirmedRef[] = []
+      const refIndexByKey = new Map<string, number>()
+      const pushRef = (ref: PlannerConfirmedRef): void => {
+        const normPath = normalizeConfirmedRouteTemplate(ref.path)
+        if (!normPath) return
+        const key = `${ref.origin ?? ''} ${ref.method ?? ''} ${normPath} ${ref.param ?? ''} ${ref.cwe ?? ''} ${ref.probeClass ?? ''}`
+        const existingIdx = refIndexByKey.get(key)
+        if (existingIdx !== undefined) {
+          if (ref.hasCompositeReceipt && !refs[existingIdx]!.hasCompositeReceipt) {
+            refs[existingIdx] = { ...refs[existingIdx]!, hasCompositeReceipt: true }
+          }
+          return
+        }
+        if (refs.length >= limit) return
+        refIndexByKey.set(key, refs.length)
+        refs.push(ref)
+      }
       for (const row of rows) {
         if (row.finding.status !== 'confirmed' && row.finding.status !== 'static_verified') continue
         const spec = row.replaySpecId ? specById.get(row.replaySpecId) : undefined
         const fields = spec ? extractSpecDedupeFields(spec.spec) : null
+        const proofReceiptObj = spec?.proofReceipt && typeof spec.proofReceipt === 'object'
+          ? spec.proofReceipt as unknown as Record<string, unknown>
+          : undefined
+        const findingEvidence = (row.finding as Finding & { evidence?: Record<string, unknown> }).evidence
+        const compReceiptObj = (proofReceiptObj?.compositeReceipt ?? findingEvidence?.compositeReceipt) as Record<string, unknown> | undefined
+        const compVerified = Boolean(compReceiptObj && typeof compReceiptObj === 'object')
+          && isCompositeVerificationConfirmed(proofReceiptObj, findingEvidence, compReceiptObj)
         const receiptTarget = spec?.proofReceipt?.receipt?.target
         const rawPath = (fields?.endpoint?.trim() && fields.endpoint.trim() !== '/')
           ? fields.endpoint.trim()
           : (receiptTarget?.pathAndQuery?.trim() ?? fields?.endpoint?.trim() ?? '')
         const path = rawPath.trim()
-        if (!path) continue
-        const rawMethod = (fields?.method && fields.method !== 'ANY')
-          ? fields.method
-          : (receiptTarget?.method?.trim() ?? null)
-        const method = rawMethod && rawMethod !== 'ANY' ? rawMethod.toUpperCase() : null
-        const key = `${method ?? ''} ${normalizeConfirmedRouteTemplate(path)} ${fields?.param ?? ''} ${row.finding.cwe ?? ''}`
-        if (seen.has(key)) continue
-        seen.add(key)
-        refs.push({
-          origin: row.finding.origin,
-          ...(method ? { method } : {}),
-          path,
-          ...(fields?.param ? { param: fields.param } : {}),
-          ...(row.finding.cwe ? { cwe: row.finding.cwe } : {}),
-          ...(row.finding.category ? { probeClass: row.finding.category } : {}),
-        })
+        if (path) {
+          const rawMethod = (fields?.method && fields.method !== 'ANY')
+            ? fields.method
+            : (receiptTarget?.method?.trim() ?? null)
+          const method = rawMethod && rawMethod !== 'ANY' ? rawMethod.toUpperCase() : null
+          pushRef({
+            origin: row.finding.origin,
+            ...(method ? { method } : {}),
+            path,
+            ...(fields?.param ? { param: fields.param } : {}),
+            ...(row.finding.cwe ? { cwe: row.finding.cwe } : {}),
+            ...(row.finding.category ? { probeClass: row.finding.category } : {}),
+            ...(compVerified ? { hasCompositeReceipt: true } : {}),
+          })
+        }
+        if (compVerified && compReceiptObj) {
+          const terminalVulnClass = typeof compReceiptObj.terminalVulnClass === 'string' && compReceiptObj.terminalVulnClass.trim()
+            ? compReceiptObj.terminalVulnClass.trim()
+            : undefined
+          const compProbeClass = row.finding.category || terminalVulnClass
+          const hops = Array.isArray(compReceiptObj.hops) ? compReceiptObj.hops as Array<Record<string, unknown>> : []
+          let terminalOrigin = row.finding.origin
+          const terminalHopId = typeof (compReceiptObj.terminalImpact as Record<string, unknown> | undefined)?.terminalHopId === 'string'
+            ? String((compReceiptObj.terminalImpact as Record<string, unknown>).terminalHopId)
+            : null
+          for (const hop of hops) {
+            if (!hop || typeof hop !== 'object') continue
+            const target = hop.target && typeof hop.target === 'object' ? hop.target as Record<string, unknown> : undefined
+            const hopOrigin = typeof target?.origin === 'string' && target.origin.trim()
+              ? target.origin.trim()
+              : row.finding.origin
+            if (terminalHopId && hop.hopId === terminalHopId) {
+              terminalOrigin = hopOrigin
+            }
+            const hopPath = typeof target?.pathAndQuery === 'string' ? target.pathAndQuery.trim() : ''
+            if (!hopPath) continue
+            const hopRawMethod = typeof target?.method === 'string' ? target.method.trim().toUpperCase() : ''
+            const hopMethod = hopRawMethod && hopRawMethod !== 'ANY' ? hopRawMethod : null
+            const hopParam = typeof target?.param === 'string' && target.param.trim() ? target.param.trim() : null
+            pushRef({
+              origin: hopOrigin,
+              ...(hopMethod ? { method: hopMethod } : {}),
+              path: hopPath,
+              ...(hopParam ? { param: hopParam } : {}),
+              ...(row.finding.cwe ? { cwe: row.finding.cwe } : {}),
+              ...(compProbeClass ? { probeClass: compProbeClass } : {}),
+              hasCompositeReceipt: true,
+            })
+          }
+          const compVer = (
+            proofReceiptObj?.compositeVerification
+            ?? findingEvidence?.compositeVerification
+            ?? compReceiptObj.verification
+          ) as Record<string, unknown> | undefined
+          const parsedTerminal = parseTerminalEndpointCandidate(compVer?.terminalEndpoint ?? findingEvidence?.terminalEndpoint)
+          if (parsedTerminal) {
+            pushRef({
+              origin: terminalOrigin,
+              ...(parsedTerminal.method ? { method: parsedTerminal.method } : {}),
+              path: parsedTerminal.path,
+              ...(row.finding.cwe ? { cwe: row.finding.cwe } : {}),
+              ...(compProbeClass ? { probeClass: compProbeClass } : {}),
+              hasCompositeReceipt: true,
+            })
+          }
+        }
         if (refs.length >= limit) break
       }
       return refs
@@ -2113,15 +2318,108 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
 
   /**
-   * A planner step that only names routes the deterministic floor already confirmed is a duplicate
-   * dispatch, unless it declares a parent fact/step (that is an explicit chain/escalation).
+   * Classify whether a planned step duplicates already-confirmed or currently in-flight work on
+   * `(origin, normalizedRoute, classFamily)`, strictly preserving zero-recall-loss invariants:
+   * - never suppresses multi-trial siblings (`trialIndex > 0`) or Hop-Continuations
+   *   (`checkpointCapId` / `dependsOnStepIds` / continuation skill);
+   * - never suppresses a different vuln class on an already-confirmed or in-flight route;
+   * - never suppresses a multi-hop chain step (`routes.length >= 2` or multi-hop chain signal)
+   *   unless ALL mentioned `(origin, route, classFamily)` tuples are already confirmed with a
+   *   composite receipt or currently in-flight.
    */
-  stepRepeatsConfirmedWork(step: Pick<ChainStep, 'title' | 'hypothesis' | 'dependsOnFactIds' | 'dependsOnStepIds'>, confirmed: readonly AlreadyConfirmedRef[]): boolean {
-    if ((step.dependsOnFactIds?.length ?? 0) > 0 || (step.dependsOnStepIds?.length ?? 0) > 0) return false
-    const routes = this.stepMentionedRoutes(step)
-    if (!routes.length) return false
+  classifyDuplicatePlannedStep(
+    candidate: PlannedStepDedupeCandidate,
+    confirmed: readonly PlannerConfirmedRef[],
+    inFlightTuples: ReadonlySet<string> = new Set(),
+  ): DuplicatePlannedStepReason {
+    // Zero-recall-loss invariant: never suppress multi-trial siblings or Hop-Continuations.
+    if ((candidate.trialIndex ?? 0) > 0) return null
+    const hasCheckpointCap = Boolean(candidate.checkpointCapId?.trim())
+      || Boolean(extractCheckpointCapIdFromStep({ skills: candidate.skills }))
+    const hasDepSteps = (candidate.dependsOnStepIds?.length ?? 0) > 0
+    const hasContinuationSkill = (candidate.skills ?? []).some(skill =>
+      skill.startsWith(CHAIN_CONTINUATION_SKILL_PREFIX))
+    if (hasDepSteps || hasCheckpointCap || hasContinuationSkill) return null
+
+    const routes = this.stepMentionedRoutes(candidate).filter(route => route && route !== '/')
+    if (!routes.length) return null
+
+    const origins = [...new Set(
+      (candidate.origins ?? candidate.sourceOrigins ?? [])
+        .map(origin => origin.trim())
+        .filter(Boolean),
+    )]
+    const category = candidate.category?.trim() ?? ''
+    const hasDepFacts = (candidate.dependsOnFactIds?.length ?? 0) > 0
+    const confirmedTuples = buildConfirmedTupleKeySets(confirmed)
+
+    const multiHop = routes.length >= 2
+
+    if (multiHop) {
+      // Multi-hop chain step: only suppress if ALL `(origin, route, classFamily)` tuples are
+      // already composite-confirmed or currently in-flight (never suppress on single-hop-only).
+      if (!origins.length || !category) return null
+      const tuples: string[] = []
+      for (const origin of origins) {
+        for (const route of routes) {
+          const key = plannerDedupeTupleKey(origin, route, category)
+          if (!key) return null
+          tuples.push(key)
+        }
+      }
+      if (!tuples.length) return null
+      if (tuples.every(key => confirmedTuples.composite.has(key))) return 'already_confirmed'
+      if (tuples.every(key => confirmedTuples.composite.has(key) || inFlightTuples.has(key))) return 'in_flight'
+      return null
+    }
+
+    // Single-route step: tuple-scoped `(origin, normalizedRoute, classFamily)` matching.
+    if (origins.length > 0 && category) {
+      const tuples: string[] = []
+      for (const origin of origins) {
+        const key = plannerDedupeTupleKey(origin, routes[0]!, category)
+        if (!key) return null
+        tuples.push(key)
+      }
+      if (!tuples.length) return null
+      if (!hasDepFacts && tuples.every(key => confirmedTuples.all.has(key))) return 'already_confirmed'
+      if (tuples.every(key => confirmedTuples.composite.has(key))) return 'already_confirmed'
+      if (tuples.every(key =>
+        inFlightTuples.has(key)
+        || (!hasDepFacts && confirmedTuples.all.has(key))
+        || confirmedTuples.composite.has(key))) {
+        return 'in_flight'
+      }
+      return null
+    }
+
+    // Legacy direct callers (e.g. stepRepeatsConfirmedWork without origins/category).
+    if (hasDepFacts) return null
+    if (category) {
+      const targetFamily = confirmedCategoryFamily(category)
+      const matched = confirmed.some(ref =>
+        normalizeConfirmedRouteTemplate(ref.path) === routes[0]
+        && Boolean(ref.probeClass?.trim())
+        && confirmedCategoryFamily(ref.probeClass!.trim()) === targetFamily,
+      )
+      return matched ? 'already_confirmed' : null
+    }
     const confirmedPaths = buildConfirmedRouteSets(confirmed).paths
     return routes.every(route => confirmedPaths.has(normalizeConfirmedRouteTemplate(route)))
+      ? 'already_confirmed'
+      : null
+  }
+
+  /**
+   * A planner step that only names routes the deterministic floor already confirmed is a duplicate
+   * dispatch, unless it declares a parent fact/step (that is an explicit chain/escalation) or
+   * targets a different vulnerability class / origin.
+   */
+  stepRepeatsConfirmedWork(
+    step: PlannedStepDedupeCandidate,
+    confirmed: readonly PlannerConfirmedRef[],
+  ): boolean {
+    return this.classifyDuplicatePlannedStep(step, confirmed) === 'already_confirmed'
   }
 
 
@@ -2206,6 +2504,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     if (!facts.length) return 0
     const existing = this.storage.listChainSteps(run.id, run.goalRevision)
     const boundFactIds = new Set(existing.flatMap(step => step.dependsOnFactIds))
+    const confirmedTuples = buildConfirmedTupleKeySets(this.alreadyConfirmedRefs(run, 100)).all
+    const inFlightTuples = buildInFlightTupleKeys(existing)
     const sourceMounted = options.sourceMounted ?? (this.host.projectReposMount(run.projectId).mountedRepos.length > 0)
     const maxSeeded = sourceMounted ? WHITEBOX_TIER_A_MAX_SEEDED_STEPS : TIER_A_MAX_SEEDED_STEPS
     let slots = Math.max(0, Math.min(maxSeeded, budget - existing.length))
@@ -2223,6 +2523,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const category = detLeadCategory(probeClass)
       const dedupeKey = `${method} ${normalizeEndpointTemplate(endpoint)}|${confirmedCategoryFamily(category)}`
       if (this.tierAStepKeys.has(dedupeKey) || this.detLeadStepKeys.has(dedupeKey)) continue
+      const tupleKey = plannerDedupeTupleKey(fact.origin, endpoint, category)
+      if (tupleKey && (confirmedTuples.has(tupleKey) || inFlightTuples.has(tupleKey))) continue
       const reason = typeof fact.data.reason === 'string' ? fact.data.reason.slice(0, 200) : 'white-box dataflow slice'
       this.enqueueLeadStep(run, asset, fact, {
         probeClass, method, endpoint, category, dedupeKey, isTierA: true, reason,
@@ -2635,7 +2937,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   ): Pick<DispatchFunnelCounts, 'planned' | 'enqueued' | 'filteredDedupe' | 'filteredAlreadyConfirmed' | 'filteredNoAsset'> {
     const existing = this.storage.listChainSteps(run.id, run.goalRevision)
     const titles = new Set(existing.map(step => step.title.trim().toLowerCase()))
-    const confirmed = this.alreadyConfirmedRefs(run, 40)
+    const confirmed = this.alreadyConfirmedRefs(run, 100)
+    const inFlightTuples = buildInFlightTupleKeys(existing)
     const counts = { planned: plan.plan.length, enqueued: 0, filteredDedupe: 0, filteredAlreadyConfirmed: 0, filteredNoAsset: 0 }
     const depStepIds = [...new Set(options.dependsOnStepIds ?? [])]
     for (const step of plan.plan) {
@@ -2643,21 +2946,9 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const key = title.toLowerCase()
       if (titles.has(key)) { counts.filteredDedupe += 1; continue }
       const boundFactIds = step.parentEvidenceIds.filter(id => factIds.has(id))
-      // Tool-dispatched hypotheses obey the same no-re-dispatch rule as planner JSON steps.
-      if (this.stepRepeatsConfirmedWork({
-        title, hypothesis: step.hypothesis, dependsOnFactIds: boundFactIds, dependsOnStepIds: depStepIds,
-      }, confirmed)) { counts.filteredAlreadyConfirmed += 1; continue }
-      const assetIds = run.candidates
-        .filter(candidate => step.origins.includes(candidate.origin) && run.approved.includes(candidate.id))
-        .map(candidate => candidate.id)
-      if (!assetIds.length) { counts.filteredNoAsset += 1; continue }
       const category = step.probeClass === 'stored_xss' ? 'cors-client-side'
         : step.probeClass === 'authz_replay' || step.probeClass === 'auth_bypass' ? 'broken-access-control'
           : step.probeClass === 'ssrf' ? 'injection-input' : 'broken-access-control'
-      // F2: lead-bound coordinator dispatches obey the same low-priority rule as planner steps.
-      const leadBound = boundFactIds.some(id => detLeadFactIds.has(id)) ||
-        isDetLeadDispatchStep({ title, hypothesis: step.hypothesis })
-      const tierABound = boundFactIds.some(id => this.host.tierAFactIds.has(id))
       const parsedBrief = step.checkpointBrief
         ? finalizeHopCheckpointBrief(step.checkpointBrief, MAX_CHECKPOINT_BRIEF_BYTES)
         : (() => {
@@ -2668,6 +2959,27 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         || parsedBrief?.brief.capabilityHandles[parsedBrief.brief.capabilityHandles.length - 1]
         || parsedBrief?.brief.verifiedHops[parsedBrief.brief.verifiedHops.length - 1]?.capId
         || undefined
+      // Tool-dispatched hypotheses obey the same confirmed & in-flight tuple dedupe rule as planner JSON steps.
+      const dupReason = this.classifyDuplicatePlannedStep({
+        title,
+        hypothesis: step.hypothesis,
+        category,
+        origins: step.origins,
+        skills: step.skills,
+        dependsOnFactIds: boundFactIds,
+        dependsOnStepIds: depStepIds,
+        checkpointCapId,
+      }, confirmed, inFlightTuples)
+      if (dupReason === 'already_confirmed') { counts.filteredAlreadyConfirmed += 1; continue }
+      if (dupReason === 'in_flight') { counts.filteredDedupe += 1; continue }
+      const assetIds = run.candidates
+        .filter(candidate => step.origins.includes(candidate.origin) && run.approved.includes(candidate.id))
+        .map(candidate => candidate.id)
+      if (!assetIds.length) { counts.filteredNoAsset += 1; continue }
+      // F2: lead-bound coordinator dispatches obey the same low-priority rule as planner steps.
+      const leadBound = boundFactIds.some(id => detLeadFactIds.has(id)) ||
+        isDetLeadDispatchStep({ title, hypothesis: step.hypothesis })
+      const tierABound = boundFactIds.some(id => this.host.tierAFactIds.has(id))
       const checkpointJson = parsedBrief?.checkpointJson
         ?? (typeof step.checkpointJson === 'string' && step.checkpointJson.trim() ? step.checkpointJson.trim().slice(0, MAX_CHECKPOINT_BRIEF_BYTES) : undefined)
       const stepSkills = [...step.skills]
@@ -2718,6 +3030,12 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         })
       }
       titles.add(key)
+      addStepTuplesToInFlightSet(inFlightTuples, {
+        title,
+        hypothesis: step.hypothesis,
+        category,
+        origins: step.origins,
+      })
       counts.enqueued += 1
     }
     return counts
@@ -2991,6 +3309,165 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
 
   /**
+   * Auto-enqueue verification steps for cross-persona or active-HTML `second_order_surface` facts,
+   * skipping routes that already have a host-verified `CompositeProofReceipt` (never skipping when
+   * only a single-hop non-composite finding exists on that route).
+   */
+  queueSecondOrderSurfaceSteps(
+    run: Run,
+    approvedOrigins: ReadonlySet<string>,
+    allUntaintedFacts: readonly Fact[],
+    existingSteps: readonly ChainStep[],
+    confirmedForPlanner: readonly PlannerConfirmedRef[],
+    remainingSlots: number,
+    funnel: DispatchFunnelCounts,
+  ): number {
+    const confirmedCompositeRoutes = buildConfirmedTupleKeySets(confirmedForPlanner).compositeRoutes
+    let secondOrderAutoSteps = 0
+    for (const fact of allUntaintedFacts.filter(candidate =>
+      candidate.data?.subkind === 'second_order_surface' && run.capabilityTier >= 1).slice(0, 20)) {
+      if (secondOrderAutoSteps >= remainingSlots) break
+      const marker = typeof fact.data?.marker === 'string' ? fact.data.marker : ''
+      const surfacedOrigin = typeof fact.data?.surfacedOrigin === 'string' ? fact.data.surfacedOrigin : fact.origin
+      const surfacedEndpoint = typeof fact.data?.surfacedEndpoint === 'string' ? fact.data.surfacedEndpoint : '/'
+      const surfacedMediaType = typeof fact.data?.surfacedMediaType === 'string' ? fact.data.surfacedMediaType : ''
+      const crossPersona = fact.data?.crossPersona === true
+      const activeHtml = /html/i.test(surfacedMediaType)
+      if (!marker || !approvedOrigins.has(surfacedOrigin) || (!crossPersona && !activeHtml)) continue
+      if (existingSteps.some(step => (step.dependsOnFactIds ?? []).includes(fact.id) ||
+        (step.title.includes(marker) && step.sourceOrigins.includes(surfacedOrigin)))) continue
+      const asset = run.candidates.find(candidate => candidate.origin === surfacedOrigin && run.approved.includes(candidate.id))
+      if (!asset) continue
+      const normalizedSurfacedRoute = normalizeConfirmedRouteTemplate(surfacedEndpoint)
+      if (normalizedSurfacedRoute && normalizedSurfacedRoute !== '/'
+        && confirmedCompositeRoutes.has(`${surfacedOrigin}\u0000${normalizedSurfacedRoute}`)) {
+        funnel.planned += 1
+        funnel.filteredAlreadyConfirmed += 1
+        continue
+      }
+      this.storage.addChainStep(run, {
+        title: `Second-order canary verification · ${marker} → ${new URL(surfacedOrigin).hostname}${surfacedEndpoint.slice(0, 40)}`,
+        hypothesis: `Second-order canary ${marker} planted via ${String(fact.data?.injectedEndpoint ?? '/')} (param ${String(fact.data?.injectedParam ?? 'input')}, persona ${String(fact.data?.injectedPersona ?? 'anonymous')}) resurfaced on ${surfacedOrigin}${surfacedEndpoint} as persona ${String(fact.data?.surfacedPersona ?? 'anonymous')} with media type ${surfacedMediaType || 'unknown'}${crossPersona ? ' (cross-persona)' : ''}${activeHtml ? ' (active HTML render)' : ''}. Re-read the surfaced endpoint with a control persona, prove the injected marker is persisted and rendered to a different principal, then submit a ${activeHtml ? 'browser_chain' : 'http_chain'} DeclarativeReplaySpec whose probe step renders the marker verbatim and whose control step does not.`,
+        category: crossPersona ? 'broken-access-control' : 'cors-client-side',
+        priority: 95,
+        targetAssetIds: [asset.id],
+        skills: crossPersona
+          ? ['oob-ssrf-browser-chain', 'bola-idor-race', 'false-positive-elimination']
+          : ['client-side-xss-postmessage', 'oob-ssrf-browser-chain'],
+        dependsOnFactIds: [fact.id],
+        sourceOrigins: [...new Set([surfacedOrigin, fact.origin])].filter(origin => approvedOrigins.has(origin)),
+        specialistProfile: crossPersona ? 'bola-bfla-specialist' : 'client-browser-dom-specialist',
+      })
+      funnel.planned += 1
+      funnel.enqueued += 1
+      secondOrderAutoSteps += 1
+    }
+    return secondOrderAutoSteps
+  }
+
+  /**
+   * Budget, dedupe (`(origin, normalizedRoute, classFamily)` against confirmed & in-flight steps),
+   * sanitize dependencies, and enqueue `parsedPlanner.data.newSteps` while keeping exact dispatch
+   * funnel accounting.
+   */
+  applyPlannerNewSteps(input: {
+    run: Run
+    newSteps: ReturnType<typeof plannerResponseSchema.parse>['newSteps']
+    approvedOrigins: ReadonlySet<string>
+    existingSteps: readonly ChainStep[]
+    dynamicStepBudget: number
+    factIds: ReadonlySet<string>
+    detLeadFactIds: ReadonlySet<string>
+    funnel: DispatchFunnelCounts
+  }): number {
+    const {
+      run: currentRun,
+      newSteps,
+      approvedOrigins: currentApproved,
+      existingSteps,
+      dynamicStepBudget,
+      factIds,
+      detLeadFactIds,
+      funnel,
+    } = input
+    const confirmedForDispatch = this.alreadyConfirmedRefs(currentRun, 100)
+    const inFlightTuples = buildInFlightTupleKeys(existingSteps)
+    const remainingSlots = Math.max(0, dynamicStepBudget - existingSteps.length)
+    const candidateSteps = newSteps
+      .map(step => ({ ...step, origins: step.origins.filter(origin => currentApproved.has(origin)) }))
+    const budgetedNewSteps = applyCrownJewelStepBudget(
+      candidateSteps,
+      computeHostTiers([...currentApproved], this.storage.latestThreatModel(currentRun.id, currentRun.goalRevision)?.entries),
+      existingSteps,
+      remainingSlots,
+    )
+    // Attribute the budget gate precisely: duplicate titles and unusable origins are their own
+    // funnel buckets; only the remaining drops are capacity (step-budget/crown-jewel share).
+    const existingTitles = new Set(existingSteps.map(step => step.title.trim().toLowerCase()))
+    const preBudgetDedupe = candidateSteps.filter(step => existingTitles.has(step.title.trim().toLowerCase())).length
+    const preBudgetNoAsset = candidateSteps.filter(step => step.origins.length === 0).length
+    const droppedAtBudget = Math.max(0, candidateSteps.length - budgetedNewSteps.length)
+    funnel.planned += candidateSteps.length
+    funnel.filteredDedupe += Math.min(preBudgetDedupe, droppedAtBudget)
+    funnel.filteredNoAsset += Math.min(preBudgetNoAsset, Math.max(0, droppedAtBudget - preBudgetDedupe))
+    funnel.filteredBudget += Math.max(0, droppedAtBudget - preBudgetDedupe - preBudgetNoAsset)
+    // Dependency sanitisation: a planner-emitted id that does not exist can never resolve, and
+    // `refreshReadyChainSteps` requires every parent fact/step to exist. Drop unknown ids at
+    // enqueue so planned work cannot be stranded as a permanently `pending` step.
+    const liveFactIds = new Set(factIds)
+    const liveStepIds = new Set(existingSteps.map(step => step.id))
+    let enqueued = 0
+    for (const step of budgetedNewSteps) {
+      const dupReason = this.classifyDuplicatePlannedStep(step, confirmedForDispatch, inFlightTuples)
+      if (dupReason === 'already_confirmed') { funnel.filteredAlreadyConfirmed += 1; continue }
+      if (dupReason === 'in_flight') { funnel.filteredDedupe += 1; continue }
+      const validOrigins = step.origins.filter(origin => currentApproved.has(origin))
+      const assetIds = currentRun.candidates
+        .filter(candidate => validOrigins.includes(candidate.origin) && currentRun.approved.includes(candidate.id))
+        .map(candidate => candidate.id)
+      if (!assetIds.length) { funnel.filteredNoAsset += 1; continue }
+      // v7 precision guard: a plain re-emission of the same (route, class) is capped at 2
+      // investigations unless the step cites a chain primitive or parent evidence.
+      const guardRoutes = this.stepMentionedRoutes(step)
+      const guardKey = guardRoutes.length ? reinvestigationKey(guardRoutes[0], step.category) : ''
+      if (guardKey) {
+        const unlocked = step.dependsOnFactIds.length > 0 || step.dependsOnStepIds.length > 0
+        const verdict = this.host.reinvestigationGuardFor(currentRun.id).record(guardKey, unlocked)
+        if (!verdict.allowed) {
+          this.host.noteCappedReinvestigation(currentRun, guardKey, verdict.count)
+          funnel.filteredCap += 1
+          continue
+        }
+      }
+      const parentFactIds = step.dependsOnFactIds.filter(id => liveFactIds.has(id))
+      const parentStepIds = step.dependsOnStepIds.filter(id => liveStepIds.has(id))
+      // F2: a planner re-emission of a det_lead upgrade must not jump back above class steps.
+      const leadBound = parentFactIds.some(id => detLeadFactIds.has(id)) ||
+        isDetLeadDispatchStep({ title: step.title, hypothesis: step.hypothesis })
+      const specialistProfile = routeStepToSpecialist({
+        title: step.title, hypothesis: step.hypothesis, category: step.category, skills: step.skills,
+      })
+      const tierABound = parentFactIds.some(id => this.host.tierAFactIds.has(id))
+      const created = this.storage.addChainStep(currentRun, {
+        title: step.title, hypothesis: step.hypothesis, category: step.category,
+        priority: tierABound ? TIER_A_STEP_PRIORITY : leadBound ? Math.min(step.priority, DET_LEAD_STEP_PRIORITY) : step.priority,
+        targetAssetIds: assetIds, skills: step.skills, dependsOnFactIds: parentFactIds,
+        dependsOnStepIds: parentStepIds, sourceOrigins: validOrigins, specialistProfile,
+      })
+      liveStepIds.add(created.id)
+      addStepTuplesToInFlightSet(inFlightTuples, {
+        title: step.title,
+        hypothesis: step.hypothesis,
+        category: step.category,
+        origins: validOrigins,
+      })
+      funnel.enqueued += 1
+      enqueued += 1
+    }
+    return enqueued
+  }
+
+  /**
    * Persist newly discovered typed `ChainHop` artifacts as structured `chain_hop` facts so follow-on
    * coordinator rounds and assignment briefs consume typed hop handles instead of prompt soup.
    * Idempotent by `hopId`.
@@ -3209,39 +3686,17 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       }
     }
 
-    // Auto-enqueue verification for each new cross-persona or active-HTML second-order surface.
-    let secondOrderAutoSteps = 0
-    for (const fact of allUntaintedFacts.filter(candidate =>
-      candidate.data?.subkind === 'second_order_surface' && updated.capabilityTier >= 1).slice(0, 20)) {
-      if (allSteps.length + bolaAutoSteps + secondOrderAutoSteps >= dynamicStepBudget) break
-      const marker = typeof fact.data?.marker === 'string' ? fact.data.marker : ''
-      const surfacedOrigin = typeof fact.data?.surfacedOrigin === 'string' ? fact.data.surfacedOrigin : fact.origin
-      const surfacedEndpoint = typeof fact.data?.surfacedEndpoint === 'string' ? fact.data.surfacedEndpoint : '/'
-      const surfacedMediaType = typeof fact.data?.surfacedMediaType === 'string' ? fact.data.surfacedMediaType : ''
-      const crossPersona = fact.data?.crossPersona === true
-      const activeHtml = /html/i.test(surfacedMediaType)
-      if (!marker || !approvedOrigins.has(surfacedOrigin) || (!crossPersona && !activeHtml)) continue
-      if (allSteps.some(step => (step.dependsOnFactIds ?? []).includes(fact.id) ||
-        (step.title.includes(marker) && step.sourceOrigins.includes(surfacedOrigin)))) continue
-      const asset = updated.candidates.find(candidate => candidate.origin === surfacedOrigin && updated.approved.includes(candidate.id))
-      if (!asset) continue
-      this.storage.addChainStep(updated, {
-        title: `Second-order canary verification · ${marker} → ${new URL(surfacedOrigin).hostname}${surfacedEndpoint.slice(0, 40)}`,
-        hypothesis: `Second-order canary ${marker} planted via ${String(fact.data?.injectedEndpoint ?? '/')} (param ${String(fact.data?.injectedParam ?? 'input')}, persona ${String(fact.data?.injectedPersona ?? 'anonymous')}) resurfaced on ${surfacedOrigin}${surfacedEndpoint} as persona ${String(fact.data?.surfacedPersona ?? 'anonymous')} with media type ${surfacedMediaType || 'unknown'}${crossPersona ? ' (cross-persona)' : ''}${activeHtml ? ' (active HTML render)' : ''}. Re-read the surfaced endpoint with a control persona, prove the injected marker is persisted and rendered to a different principal, then submit a ${activeHtml ? 'browser_chain' : 'http_chain'} DeclarativeReplaySpec whose probe step renders the marker verbatim and whose control step does not.`,
-        category: crossPersona ? 'broken-access-control' : 'cors-client-side',
-        priority: 95,
-        targetAssetIds: [asset.id],
-        skills: crossPersona
-          ? ['oob-ssrf-browser-chain', 'bola-idor-race', 'false-positive-elimination']
-          : ['client-side-xss-postmessage', 'oob-ssrf-browser-chain'],
-        dependsOnFactIds: [fact.id],
-        sourceOrigins: [...new Set([surfacedOrigin, fact.origin])].filter(origin => approvedOrigins.has(origin)),
-        specialistProfile: crossPersona ? 'bola-bfla-specialist' : 'client-browser-dom-specialist',
-      })
-      funnel.planned += 1
-      funnel.enqueued += 1
-      secondOrderAutoSteps += 1
-    }
+    // Auto-enqueue verification for each new cross-persona or active-HTML second-order surface,
+    // skipping routes already confirmed by a host-verified CompositeProofReceipt.
+    const secondOrderAutoSteps = this.queueSecondOrderSurfaceSteps(
+      updated,
+      approvedOrigins,
+      allUntaintedFacts,
+      allSteps,
+      confirmedForPlanner,
+      Math.max(0, dynamicStepBudget - allSteps.length - bolaAutoSteps),
+      funnel,
+    )
 
     // Tool-equipped coordinator session: paginated read tools, explicit dispatch, no snapshot.
     let toolDispatched = 0
@@ -3309,71 +3764,16 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         const target = existingSteps.find(step => step.id === cancelId)
         if (target && ['pending', 'ready'].includes(target.status)) this.storage.updateChainStep(target.id, { status: 'canceled' })
       }
-      const confirmedForDispatch = this.alreadyConfirmedRefs(currentRun, 40)
-      const remainingSlots = Math.max(0, dynamicStepBudget - existingSteps.length)
-      const candidateSteps = parsedPlanner.data.newSteps
-        .map(step => ({ ...step, origins: step.origins.filter(origin => currentApproved.has(origin)) }))
-      const budgetedNewSteps = applyCrownJewelStepBudget(
-        candidateSteps,
-        computeHostTiers([...currentApproved], this.storage.latestThreatModel(run.id, currentRun.goalRevision)?.entries),
+      addedCount += this.applyPlannerNewSteps({
+        run: currentRun,
+        newSteps: parsedPlanner.data.newSteps,
+        approvedOrigins: currentApproved,
         existingSteps,
-        remainingSlots,
-      )
-      const dispatchableNewSteps = budgetedNewSteps.filter(step => !this.stepRepeatsConfirmedWork(step, confirmedForDispatch))
-      // Attribute the budget gate precisely: duplicate titles and unusable origins are their own
-      // funnel buckets; only the remaining drops are capacity (step-budget/crown-jewel share).
-      const existingTitles = new Set(existingSteps.map(step => step.title.trim().toLowerCase()))
-      const preBudgetDedupe = candidateSteps.filter(step => existingTitles.has(step.title.trim().toLowerCase())).length
-      const preBudgetNoAsset = candidateSteps.filter(step => step.origins.length === 0).length
-      const droppedAtBudget = Math.max(0, candidateSteps.length - budgetedNewSteps.length)
-      funnel.planned += candidateSteps.length
-      funnel.filteredDedupe += Math.min(preBudgetDedupe, droppedAtBudget)
-      funnel.filteredNoAsset += Math.min(preBudgetNoAsset, Math.max(0, droppedAtBudget - preBudgetDedupe))
-      funnel.filteredBudget += Math.max(0, droppedAtBudget - preBudgetDedupe - preBudgetNoAsset)
-      funnel.filteredAlreadyConfirmed += Math.max(0, budgetedNewSteps.length - dispatchableNewSteps.length)
-      // Dependency sanitisation: a planner-emitted id that does not exist can never resolve, and
-      // `refreshReadyChainSteps` requires every parent fact/step to exist. Drop unknown ids at
-      // enqueue so planned work cannot be stranded as a permanently `pending` step.
-      const liveFactIds = new Set(factIds)
-      const liveStepIds = new Set(existingSteps.map(step => step.id))
-      for (const step of dispatchableNewSteps) {
-        const validOrigins = step.origins.filter(origin => currentApproved.has(origin))
-        const assetIds = currentRun.candidates
-          .filter(candidate => validOrigins.includes(candidate.origin) && currentRun.approved.includes(candidate.id))
-          .map(candidate => candidate.id)
-        if (!assetIds.length) { funnel.filteredNoAsset += 1; continue }
-        // v7 precision guard: a plain re-emission of the same (route, class) is capped at 2
-        // investigations unless the step cites a chain primitive or parent evidence.
-        const guardRoutes = this.stepMentionedRoutes(step)
-        const guardKey = guardRoutes.length ? reinvestigationKey(guardRoutes[0], step.category) : ''
-        if (guardKey) {
-          const unlocked = step.dependsOnFactIds.length > 0 || step.dependsOnStepIds.length > 0
-          const verdict = this.host.reinvestigationGuardFor(run.id).record(guardKey, unlocked)
-          if (!verdict.allowed) {
-            this.host.noteCappedReinvestigation(run, guardKey, verdict.count)
-            funnel.filteredCap += 1
-            continue
-          }
-        }
-        const parentFactIds = step.dependsOnFactIds.filter(id => liveFactIds.has(id))
-        const parentStepIds = step.dependsOnStepIds.filter(id => liveStepIds.has(id))
-        // F2: a planner re-emission of a det_lead upgrade must not jump back above class steps.
-        const leadBound = parentFactIds.some(id => detLeadFactIds.has(id)) ||
-          isDetLeadDispatchStep({ title: step.title, hypothesis: step.hypothesis })
-        const specialistProfile = routeStepToSpecialist({
-          title: step.title, hypothesis: step.hypothesis, category: step.category, skills: step.skills,
-        })
-        const tierABound = parentFactIds.some(id => this.host.tierAFactIds.has(id))
-        const created = this.storage.addChainStep(currentRun, {
-          title: step.title, hypothesis: step.hypothesis, category: step.category,
-          priority: tierABound ? TIER_A_STEP_PRIORITY : leadBound ? Math.min(step.priority, DET_LEAD_STEP_PRIORITY) : step.priority,
-          targetAssetIds: assetIds, skills: step.skills, dependsOnFactIds: parentFactIds,
-          dependsOnStepIds: parentStepIds, sourceOrigins: validOrigins, specialistProfile,
-        })
-        liveStepIds.add(created.id)
-        funnel.enqueued += 1
-        addedCount += 1
-      }
+        dynamicStepBudget,
+        factIds,
+        detLeadFactIds,
+        funnel,
+      })
     }
 
     // Round-1 2-wave pipeline top-up: ensure Wave 1 + Wave 2 stay buffered when uncovered
