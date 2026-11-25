@@ -76,6 +76,38 @@ interface LoadedAppModule {
 }
 
 const loadedApps = new Map<string, Promise<LoadedAppModule>>()
+const loadedAppsSync = new Map<string, LoadedAppModule>()
+
+/** Blueprint hop routeKeys that alias a differently named entry in apiCatalog(). */
+const HOP_ROUTE_KEY_ALIASES: Record<string, string> = {
+  // paygrid
+  'api.permissionsPrime': 'api.orgPermissions',
+  'api.exportCreate': 'api.orgExports',
+  'api.exportSignedUrl': 'api.exportUrl',
+  'file.treasuryDownload': 'edge.fileExport',
+  // shipforge
+  'api.productionRelease': 'api.deploymentRelease',
+  'runner.sseStream': 'runner.streamShared',
+  'runner.sseArtifactEvent': 'runner.artifact',
+  // nexusiam
+  'app.moderationRender': 'app.moderationQueue',
+  'api.scimTokenMint': 'api.scimTokenCreate',
+  'api.auditVaultRead': 'api.auditVault',
+  'app.shareLinkCapture': 'app.sharePreview',
+  'cdn.profileCacheRead': 'cdn.profileCss',
+  'api.docsWorkspaceFallback': 'api.docsList',
+  'api.docPrivateOpen': 'api.docGet',
+  'api.docContentRead': 'api.docContent',
+}
+
+loadedAppsSync.set('paygrid', {
+  name: 'paygrid',
+  services: describeApp().services,
+  chains: PAYGRID_CHAINS,
+  twins: PAYGRID_TWINS,
+  start: (options) => startPaygrid(options) as unknown as Promise<StartedLabBase>,
+  runSolvers: (lab, chainIds) => runReferenceSolvers(lab as unknown as StartedPaygrid, chainIds),
+})
 
 function pascalCase(name: string): string {
   return name.replace(/(^|[-_])([a-z])/g, (_, __, ch: string) => ch.toUpperCase())
@@ -162,7 +194,7 @@ async function loadAppModule(app: string): Promise<LoadedAppModule> {
       )
     }
 
-    return {
+    const loaded: LoadedAppModule = {
       name: app,
       services: info.services,
       chains,
@@ -170,6 +202,8 @@ async function loadAppModule(app: string): Promise<LoadedAppModule> {
       start,
       runSolvers,
     }
+    loadedAppsSync.set(app, loaded)
+    return loaded
   })()
 
   loadedApps.set(app, loader)
@@ -291,8 +325,30 @@ export interface MultihopProductPersona {
   email: string
   password: string
   tenant: string
+  tenantId: string
+  orgSlug?: string
   role: string
   rolesByTenant: Record<string, string>
+}
+
+export interface HardenedTwinEndpoint {
+  method: string
+  path: string
+  routeKey: string
+  hopId: string
+  service: string
+  role: 'decoy_hop' | 'enforced_hop'
+}
+
+export interface ProductTwinDecoy {
+  twinId: string
+  chainId: string
+  baseChainId: string
+  vulnClass: string
+  benignHopIds: string[]
+  enforcedAtHopId: string
+  note: string
+  endpoints: HardenedTwinEndpoint[]
 }
 
 export interface MultihopProductBriefing {
@@ -349,15 +405,22 @@ export interface StartedMultihopApp {
 }
 
 export interface ProductSubmittedFinding {
+  id?: string
   findingId?: string
+  title?: string
   chainId?: string
+  twinId?: string
   terminalVulnClass?: string
   vulnClass?: string
+  cwe?: string
   hopIds?: string[]
   method?: string
   path?: string
+  endpoints?: Array<{ method?: string; path: string }>
   param?: string
+  params?: string[]
   severity?: string
+  status?: string
   evidenceSummary?: string
 }
 
@@ -417,6 +480,8 @@ export interface ProductChainVerdict {
 
 export interface ProductTwinVerdict {
   twinId: string
+  baseChainId?: string
+  vulnClass?: string
   falsePositive: boolean
   matchedFindingIds: string[]
   reason?: string
@@ -456,7 +521,200 @@ export interface ProductScorecard {
 }
 
 const groundTruthOracleMap = new WeakMap<object, () => OracleExport>()
+const groundTruthTwinsMap = new WeakMap<object, ProductTwinDecoy[]>()
 const startedDefaultBriefingMode = new WeakMap<object, BenchMode>()
+
+function resolveTwinEndpoints(
+  twin: TwinSpec,
+  chain: ChainSpec | undefined,
+  apiReference: readonly ApiRef[] | undefined,
+): HardenedTwinEndpoint[] {
+  if (!chain || !apiReference?.length) return []
+  const byRouteKey = new Map<string, ApiRef>()
+  for (const ref of apiReference) byRouteKey.set(ref.routeKey, ref)
+  const out: HardenedTwinEndpoint[] = []
+  const seen = new Set<string>()
+  const addHop = (hopId: string, role: HardenedTwinEndpoint['role']): void => {
+    const hop = chain.hops.find((h) => h.hopId === hopId)
+    if (!hop) return
+    const lookupKey = HOP_ROUTE_KEY_ALIASES[hop.routeKey] ?? hop.routeKey
+    const ref = byRouteKey.get(hop.routeKey) ?? byRouteKey.get(lookupKey)
+    if (!ref) return
+    const dedupeKey = `${ref.method.toUpperCase()} ${ref.path} ${hopId}`
+    if (seen.has(dedupeKey)) return
+    seen.add(dedupeKey)
+    out.push({
+      method: ref.method.toUpperCase(),
+      path: ref.path,
+      routeKey: hop.routeKey,
+      hopId,
+      service: String(hop.service),
+      role,
+    })
+  }
+  for (const hopId of twin.decoyHopIds) addHop(hopId, 'decoy_hop')
+  if (twin.enforcedAtHopId) addHop(twin.enforcedAtHopId, 'enforced_hop')
+  return out
+}
+
+function buildProductTwinDecoys(
+  twins: readonly TwinSpec[],
+  chains: readonly ChainSpec[],
+  apiReference?: readonly ApiRef[],
+  selectedTwinId?: string,
+): ProductTwinDecoy[] {
+  const chosen = selectedTwinId ? twins.filter((t) => t.id === selectedTwinId) : twins
+  return chosen.map((twin) => {
+    const baseChain = chains.find((c) => c.id === twin.baseChainId)
+    return {
+      twinId: twin.id,
+      chainId: twin.baseChainId,
+      baseChainId: twin.baseChainId,
+      vulnClass: baseChain?.vulnClass ?? '',
+      benignHopIds: [...twin.decoyHopIds],
+      enforcedAtHopId: twin.enforcedAtHopId,
+      note: twin.note,
+      endpoints: resolveTwinEndpoints(twin, baseChain, apiReference),
+    }
+  })
+}
+
+function normalizeEndpointPath(raw: string): string {
+  let path = raw.trim()
+  if (/^https?:\/\//i.test(path)) {
+    try {
+      path = new URL(path).pathname
+    } catch { /* fall through to string normalization */ }
+  }
+  const hashIdx = path.indexOf('#')
+  if (hashIdx >= 0) path = path.slice(0, hashIdx)
+  const queryIdx = path.indexOf('?')
+  if (queryIdx >= 0) path = path.slice(0, queryIdx)
+  path = path.replace(/\/{2,}/g, '/')
+  if (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1)
+  return path.startsWith('/') ? path : `/${path}`
+}
+
+function escapeRegexLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function templateSegmentToRegex(segment: string): string {
+  if (/^:[A-Za-z0-9_-]+$/.test(segment) || /^\{[A-Za-z0-9_-]+\}$/.test(segment)) {
+    return '[^/]+'
+  }
+  const tokenRe = /:[A-Za-z0-9_-]+|\{[A-Za-z0-9_-]+\}/g
+  let out = ''
+  let lastIndex = 0
+  for (const match of segment.matchAll(tokenRe)) {
+    const idx = match.index ?? 0
+    out += escapeRegexLiteral(segment.slice(lastIndex, idx))
+    out += '[^/]+'
+    lastIndex = idx + match[0].length
+  }
+  out += escapeRegexLiteral(segment.slice(lastIndex))
+  return out
+}
+
+function pathMatchesTemplate(actualRaw: string, templateRaw: string): boolean {
+  const actual = normalizeEndpointPath(actualRaw)
+  const template = normalizeEndpointPath(templateRaw)
+  if (actual === template) return true
+  const actualSegs = actual.split('/')
+  const templateSegs = template.split('/')
+  if (actualSegs.length !== templateSegs.length) return false
+  for (let i = 0; i < templateSegs.length; i++) {
+    const tSeg = templateSegs[i]!
+    const aSeg = actualSegs[i]!
+    if (tSeg === aSeg) continue
+    const re = new RegExp(`^${templateSegmentToRegex(tSeg)}$`)
+    if (!re.test(aSeg)) return false
+  }
+  return true
+}
+
+function findingEndpoints(finding: ProductSubmittedFinding): Array<{ method?: string; path: string }> {
+  const out: Array<{ method?: string; path: string }> = []
+  if (Array.isArray(finding.endpoints)) {
+    for (const ep of finding.endpoints) {
+      if (ep && typeof ep.path === 'string' && ep.path.trim()) {
+        out.push({ ...(ep.method ? { method: ep.method } : {}), path: ep.path })
+      }
+    }
+  }
+  if (typeof finding.path === 'string' && finding.path.trim()) {
+    out.push({ ...(finding.method ? { method: finding.method } : {}), path: finding.path })
+  }
+  return out
+}
+
+function endpointMatchesTwin(
+  ep: { method?: string; path: string },
+  twin: ProductTwinDecoy,
+): boolean {
+  const epMethod = ep.method?.trim().toUpperCase()
+  for (const twinEp of twin.endpoints) {
+    if (epMethod && twinEp.method && epMethod !== twinEp.method.toUpperCase()) continue
+    if (pathMatchesTemplate(ep.path, twinEp.path)) return true
+  }
+  return false
+}
+
+function findingMatchesTwin(
+  finding: ProductSubmittedFinding,
+  twin: ProductTwinDecoy,
+  options: { isTwinMode: boolean; baseChainConfirmed: boolean },
+): boolean {
+  if (finding.twinId === twin.twinId || finding.chainId === twin.twinId) return true
+  if ((finding.hopIds ?? []).some((hopId) => twin.benignHopIds.includes(hopId) || hopId === twin.enforcedAtHopId)) {
+    return true
+  }
+  const eps = findingEndpoints(finding)
+  if (eps.some((ep) => endpointMatchesTwin(ep, twin))) return true
+
+  const claimedVuln = (finding.terminalVulnClass ?? finding.vulnClass ?? '').trim().toLowerCase()
+  const twinVuln = twin.vulnClass.trim().toLowerCase()
+  const vulnMatches = Boolean(twinVuln && claimedVuln && claimedVuln === twinVuln)
+  const baseChainMatches = finding.chainId === twin.baseChainId
+
+  if (options.isTwinMode && (baseChainMatches || vulnMatches)) return true
+  if (!options.baseChainConfirmed && (baseChainMatches || vulnMatches)) return true
+  return false
+}
+
+function resolveProductTwins(gt: GroundTruth): ProductTwinDecoy[] {
+  const mapped = groundTruthTwinsMap.get(gt)
+  if (mapped && mapped.length > 0) return mapped
+
+  const mod = loadedAppsSync.get(String(gt.app))
+  if (gt.twinDecoys.length > 0) {
+    return gt.twinDecoys.map((raw) => {
+      const ext = raw as Partial<ProductTwinDecoy>
+      const catalogTwin = mod?.twins.find((t) =>
+        (ext.twinId && t.id === ext.twinId)
+        || (gt.twinId && t.id === gt.twinId)
+        || (t.baseChainId === raw.chainId && t.enforcedAtHopId === raw.enforcedAtHopId),
+      )
+      const baseChainId = ext.baseChainId ?? catalogTwin?.baseChainId ?? raw.chainId
+      const baseChain = mod?.chains.find((c) => c.id === baseChainId)
+      return {
+        twinId: ext.twinId ?? catalogTwin?.id ?? gt.twinId ?? raw.chainId,
+        chainId: raw.chainId,
+        baseChainId,
+        vulnClass: ext.vulnClass ?? baseChain?.vulnClass ?? '',
+        benignHopIds: [...raw.benignHopIds],
+        enforcedAtHopId: raw.enforcedAtHopId,
+        note: raw.note,
+        endpoints: Array.isArray(ext.endpoints) ? ext.endpoints : [],
+      }
+    })
+  }
+
+  if (mod && mod.twins.length > 0) {
+    return buildProductTwinDecoys(mod.twins, mod.chains, undefined, gt.twinId)
+  }
+  return []
+}
 
 function flattenOracleEvents(exported: OracleExport): Array<Record<string, unknown>> {
   const out: Array<Record<string, unknown>> = []
@@ -503,7 +761,16 @@ export async function startMultihopApp(opts: StartMultihopAppOptions = {}): Prom
     asyncLatencyMs,
   })
 
+  const greyApiRef = lab.briefing('grey-box').apiReference
+  const resolvedTwins = buildProductTwinDecoys(mod.twins, mod.chains, greyApiRef, lab.twinId)
+  const productGroundTruth: GroundTruth = {
+    ...lab.groundTruth,
+    twinDecoys: resolvedTwins,
+  }
   groundTruthOracleMap.set(lab.groundTruth, () => lab.export())
+  groundTruthOracleMap.set(productGroundTruth, () => lab.export())
+  groundTruthTwinsMap.set(lab.groundTruth, resolvedTwins)
+  groundTruthTwinsMap.set(productGroundTruth, resolvedTwins)
 
   let stopPromise: Promise<void> | undefined
   const stop = (): Promise<void> => {
@@ -523,7 +790,7 @@ export async function startMultihopApp(opts: StartMultihopAppOptions = {}): Prom
     entryOrigin: lab.entryOrigin,
     origins: { ...lab.origins },
     plan: lab.plan,
-    groundTruth: lab.groundTruth,
+    groundTruth: productGroundTruth,
     sourceDir: lab.sourceDir,
     briefing(mode?: BenchMode): Briefing {
       return lab.briefing(mode ?? defaultBriefingMode)
@@ -534,7 +801,7 @@ export async function startMultihopApp(opts: StartMultihopAppOptions = {}): Prom
     collectArtifacts() {
       const exported = lab.export()
       return {
-        groundTruth: lab.groundTruth,
+        groundTruth: productGroundTruth,
         oracle: exported,
         events: flattenOracleEvents(exported),
         requests: [],
@@ -598,17 +865,34 @@ export function briefingFor(
   pushOrigin(primaryOrigin)
   for (const origin of Object.values(entryOrigins)) pushOrigin(origin)
 
-  const personas: MultihopProductPersona[] = raw.personas.map((persona) => {
+  // Never leak admin_bot or its org_c tenant slug into the briefing.
+  const nonBotPersonas = raw.personas.filter((persona) => String(persona.id) !== 'admin_bot')
+  const exposedTenantIds = new Set(nonBotPersonas.map((persona) => String(persona.tenant)))
+  const slugByTenantId = new Map<string, string>()
+  const planTenants = (started.plan as { tenants?: Record<string, { id?: string; slug?: string }> } | undefined)?.tenants
+  if (planTenants && typeof planTenants === 'object') {
+    for (const entry of Object.values(planTenants)) {
+      if (entry && typeof entry.id === 'string' && typeof entry.slug === 'string' && exposedTenantIds.has(entry.id)) {
+        slugByTenantId.set(entry.id, entry.slug)
+      }
+    }
+  }
+
+  const personas: MultihopProductPersona[] = nonBotPersonas.map((persona) => {
     const rolesByTenant: Record<string, string> = {}
     for (const [tenant, role] of Object.entries(persona.rolesByTenant)) {
       if (role) rolesByTenant[tenant] = role
     }
     const primaryRole = rolesByTenant[persona.tenant] ?? Object.values(rolesByTenant)[0] ?? 'member'
+    const tenantId = String(persona.tenant)
+    const orgSlug = slugByTenantId.get(tenantId)
     return {
       id: persona.id,
       email: persona.email,
       password: persona.password,
-      tenant: persona.tenant,
+      tenant: tenantId,
+      tenantId,
+      ...(orgSlug ? { orgSlug } : {}),
       role: primaryRole,
       rolesByTenant,
     }
@@ -781,42 +1065,57 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
     }
   })
 
+  const confirmedChainIds = new Set(chains.filter((c) => c.twoSideConfirmed).map((c) => c.chainId))
+  const resolvedTwins = resolveProductTwins(gt)
   const twinClaimFindingIds = new Set<string>()
-  const hardenedTwins: ProductTwinVerdict[] = gt.twinDecoys.map((decoy) => {
+  const hardenedTwins: ProductTwinVerdict[] = resolvedTwins.map((decoy) => {
     const matchedIds: string[] = []
+    const isTwinMode = gt.labMode === 'hardened' || gt.twinId === decoy.twinId
+    const baseChainConfirmed = confirmedChainIds.has(decoy.baseChainId)
+
     for (const receipt of receipts) {
-      if (receipt.chainId === decoy.chainId) {
-        const id = receipt.findingId ?? `receipt:${receipt.chainId}`
-        matchedIds.push(id)
+      const receiptId = receipt.findingId ?? `receipt:${receipt.chainId}`
+      if (receipt.findingId && confirmedFindingIds.has(receipt.findingId) && !isTwinMode) continue
+      const receiptMatchesTwin = receipt.chainId === decoy.twinId
+        || (receipt.chainId === decoy.baseChainId && (isTwinMode || !baseChainConfirmed))
+      if (receiptMatchesTwin) {
+        if (!matchedIds.includes(receiptId)) matchedIds.push(receiptId)
+        twinClaimFindingIds.add(receiptId)
         if (receipt.findingId) twinClaimFindingIds.add(receipt.findingId)
       }
     }
+
     for (let i = 0; i < findings.length; i++) {
       const f = findings[i]!
-      const id = f.findingId ?? `finding:${i}`
+      const id = f.findingId ?? f.id ?? `finding:${i}`
+      if (!isTwinMode && confirmedFindingIds.has(id)) continue
       if (matchedIds.includes(id)) continue
-      const touchesDecoy = f.chainId === decoy.chainId
-        || (f.hopIds ?? []).some((hopId) => decoy.benignHopIds.includes(hopId))
-      if (touchesDecoy) {
+      if (findingMatchesTwin(f, decoy, { isTwinMode, baseChainConfirmed })) {
         matchedIds.push(id)
         twinClaimFindingIds.add(id)
       }
     }
+
     return {
-      twinId: gt.twinId ?? decoy.chainId,
+      twinId: decoy.twinId,
+      baseChainId: decoy.baseChainId,
+      ...(decoy.vulnClass ? { vulnClass: decoy.vulnClass } : {}),
       falsePositive: matchedIds.length > 0,
       matchedFindingIds: matchedIds,
       ...(matchedIds.length > 0 ? { reason: decoy.note } : {}),
     }
   })
 
-  let hardenedTwinDecoyFps = hardenedTwins.filter((t) => t.falsePositive).length
+  let hardenedTwinDecoyFps = Math.max(
+    twinClaimFindingIds.size,
+    hardenedTwins.filter((t) => t.falsePositive).length,
+  )
   let unmatchedFalsePositives = 0
   for (let i = 0; i < findings.length; i++) {
     const f = findings[i]!
-    const id = f.findingId ?? `finding:${i}`
+    const id = f.findingId ?? f.id ?? `finding:${i}`
     if (gt.labMode === 'hardened') {
-      hardenedTwinDecoyFps += 1
+      if (!twinClaimFindingIds.has(id)) hardenedTwinDecoyFps += 1
       continue
     }
     if (confirmedFindingIds.has(id) || twinClaimFindingIds.has(id)) continue
@@ -920,6 +1219,17 @@ function renderProductScorecardMd(card: ProductScorecard): string {
     ...card.chains.map((c) =>
       `| ${c.chainId} | ${c.expectedHops} | ${c.maxHopReached} | ${c.oracleObserved ? 'yes' : 'no'} | ${c.compositeReceiptConfirmed ? 'yes' : 'no'} | ${c.twoSideConfirmed ? 'yes' : 'no'} | ${c.dropReason ?? 'none'} |`),
     '',
+    ...(card.hardenedTwins.length > 0
+      ? [
+          '## Hardened Twins',
+          '',
+          '| twin | baseChain | vulnClass | decoyFP | matchedFindings |',
+          '|---|---|---|---|---|',
+          ...card.hardenedTwins.map((t) =>
+            `| ${t.twinId} | ${t.baseChainId ?? '-'} | ${t.vulnClass ?? '-'} | ${t.falsePositive ? 'YES (FP)' : 'no'} | ${t.matchedFindingIds.join(', ') || 'none'} |`),
+          '',
+        ]
+      : []),
   ]
   return lines.join('\n')
 }

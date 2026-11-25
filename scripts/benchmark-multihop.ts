@@ -117,6 +117,8 @@ export interface MultihopPersona {
   email: string
   password: string
   tenant: string
+  tenantId?: string
+  orgSlug?: string
   role: string
   rolesByTenant?: Record<string, string>
 }
@@ -213,6 +215,8 @@ export interface MultihopChainVerdict {
 
 export interface MultihopTwinVerdict {
   twinId: string
+  baseChainId?: string
+  vulnClass?: string
   falsePositive: boolean
   matchedFindingIds?: string[]
   reason?: string
@@ -887,9 +891,48 @@ export interface MultihopCellPlan {
   publicOrigins: string[]
   loginPath: string | null
   openApi: { openapi: string; info: { title: string; version: string }; paths: Record<string, unknown> } | null
-  personas: Array<{ handle: string; roleLabel: string; email: string; password: string; canaryMarkers: string[] }>
+  personas: Array<{
+    handle: string
+    roleLabel: string
+    role: string
+    tenantId: string
+    orgSlug?: string
+    rolesByTenant?: Record<string, string>
+    email: string
+    password: string
+    canaryMarkers: string[]
+  }>
   capabilityTier: 3
   mission: string
+}
+
+/**
+ * Format a briefing persona's role/tenant/orgSlug into the Guardian `roleLabel` contract
+ * (`<role> [slug=<orgSlug>; memberships=<role>:<tenant>,...] (<tenantId>)`) so Execution's
+ * tenant-scope parsers (`/\(([^()]+)\)\s*$/` and `parseRoleLabel`) extract both privilege and
+ * primary tenantId cleanly while preserving orgSlug and secondary memberships for agentic reasoning.
+ */
+export function formatMultihopPersonaRoleLabel(persona: MultihopPersona): string {
+  const tenantId = (persona.tenantId ?? persona.tenant ?? '').trim()
+  const primaryRole = (
+    persona.role?.trim()
+    || (tenantId && persona.rolesByTenant?.[tenantId]?.trim())
+    || Object.values(persona.rolesByTenant ?? {}).find(v => typeof v === 'string' && v.trim())?.trim()
+    || 'member'
+  )
+  const membershipEntries = Object.entries(persona.rolesByTenant ?? {})
+    .filter(([, r]) => Boolean(r?.trim()))
+    .map(([t, r]) => `${r.trim()}:${t}`)
+  const hasSecondaryScope = Object.keys(persona.rolesByTenant ?? {}).some(t => t !== tenantId)
+  const metaParts: string[] = []
+  const orgSlug = persona.orgSlug?.trim()
+  if (orgSlug && orgSlug !== tenantId) metaParts.push(`slug=${orgSlug}`)
+  if (hasSecondaryScope && membershipEntries.length) metaParts.push(`memberships=${membershipEntries.join(',')}`)
+
+  const suffix = tenantId ? ` (${tenantId})` : ''
+  const base = metaParts.length ? `${primaryRole} [${metaParts.join('; ')}]` : primaryRole
+  const maxBaseLen = Math.max(1, 160 - suffix.length)
+  return `${base.slice(0, maxBaseLen)}${suffix}`
 }
 
 function safeHandle(id: string): string {
@@ -1039,15 +1082,28 @@ export function planCell(briefing: MultihopBriefing, loginPath: string | null): 
 
   const handles = new Set<string>()
   const personas = briefing.personas.map(p => {
+    const normalizedId = p.id.trim().toLowerCase()
+    const normalizedRole = (p.role ?? '').trim().toLowerCase()
+    if (normalizedId === 'admin_bot' || normalizedRole === 'bot') {
+      fail(`refusing to register forbidden victim bot persona '${p.id}'`)
+    }
     let handle = safeHandle(p.id)
     for (let n = 2; handles.has(handle); n += 1) handle = `${safeHandle(p.id)}-${n}`
     handles.add(handle)
-    const roleLabel = p.rolesByTenant
-      ? Object.entries(p.rolesByTenant).map(([t, r]) => `${r}@${t}`).join(', ')
-      : `${p.role} (${p.tenant})`
+    const tenantId = (p.tenantId ?? p.tenant ?? '').trim()
+    const role = (
+      p.role?.trim()
+      || (tenantId && p.rolesByTenant?.[tenantId]?.trim())
+      || 'member'
+    )
+    const roleLabel = formatMultihopPersonaRoleLabel({ ...p, role, tenant: tenantId, tenantId })
     return {
       handle,
       roleLabel,
+      role,
+      tenantId,
+      ...(p.orgSlug?.trim() ? { orgSlug: p.orgSlug.trim() } : {}),
+      ...(p.rolesByTenant ? { rolesByTenant: { ...p.rolesByTenant } } : {}),
       email: p.email,
       password: p.password,
       canaryMarkers: [] as string[],
@@ -1800,7 +1856,8 @@ export async function runCell(
     const depthBreakdown = computeDepthTierBreakdown(twoSide.verdicts)
 
     const hardenedTwins = card.hardenedTwins ?? []
-    const hardenedTwinsTotal = num(card.hardenedTwinsTotal, num(card.decoys, hardenedTwins.length))
+    const rawTwinsTotal = num(card.hardenedTwinsTotal, num(card.decoys, hardenedTwins.length))
+    const hardenedTwinsTotal = rawTwinsTotal > 0 ? rawTwinsTotal : hardenedTwins.length
     const hardenedTwinDecoyFps = num(
       card.hardenedTwinDecoyFps,
       num(card.decoyFalsePositives, hardenedTwins.filter(t => t.falsePositive).length),
@@ -2303,7 +2360,7 @@ export function renderMultihopReport(report: MultihopReport, format: 'json' | 'm
       `${c.chainsConfirmed}/${c.chainsTotal}`,
       pct(c.recall),
       pct(c.precision),
-      String(c.hardenedTwinDecoyFps),
+      `${c.hardenedTwinDecoyFps}/${c.hardenedTwinsTotal}`,
       c.tpPerDollar === null ? 'n/a' : c.tpPerDollar.toFixed(2),
       c.tpPer10m === null ? 'n/a' : c.tpPer10m.toFixed(2),
       `$${c.costUsd.toFixed(4)}`,
