@@ -6,11 +6,16 @@ import type { DeclarativeReplaySpec, ReplayStep } from '../replay-spec.ts'
 /**
  * Typed proof compilers.
  *
- * The agentic layer used to ask the model to hand-write a raw `DeclarativeReplaySpec` plus a jq
- * `assertionsJq` program. That is where most spec friction lived: Flash-class models emit plausible
- * JSON with status-only assertions, unbound bodies, or a declared endpoint that never ran. These
- * compilers take a small, typed, *verified* description of the proof and emit a deterministic
- * `http_chain` spec whose assertion is identifier-bound and proof-strength compliant.
+ * Live callers (audited via `grep -rn "proof-tools" src/ tests/ scripts/`):
+ *  - `src/server/agent-session.ts`: `describeProofTools`, `validateProofInput`,
+ *    `proveAuthzReadDiff`, `proveStateMutationDiff`, `proveBusinessInvariant`,
+ *    `proveCanaryOrRedirect`, `CompiledProof`, `ProofToolName` (deterministic compiler fallback
+ *    when `guardian_verify` is not registered).
+ *  - `tests/v5-proof-tools.test.ts`, `tests/v5-agentic-tools.test.ts`,
+ *    `tests/v5-agentic-lane.test.ts`: additionally import `proofToolNames` and `ProofCompileError`.
+ *
+ * Unreferenced intermediate input/schema/issue types remain module-private to keep the exported
+ * surface minimal.
  *
  * Design constraints:
  *  - Pure: no I/O, no clock, no randomness. Same input -> byte-identical spec (stable key order).
@@ -31,24 +36,24 @@ export const proofToolNames = [
 
 export type ProofToolName = typeof proofToolNames[number]
 
-export type ProofSurfaceKind = 'ssrf' | 'xxe' | 'stored_xss' | 'open_redirect'
-export type BusinessInvariantOp = 'lt' | 'lte' | 'gt' | 'gte' | 'eq' | 'neq'
-export type StateMutationOp = 'changed' | 'neq' | 'increment' | 'decrement' | 'set' | 'delete' | 'create' | 'skip'
+type ProofSurfaceKind = 'ssrf' | 'xxe' | 'stored_xss' | 'open_redirect'
+type BusinessInvariantOp = 'lt' | 'lte' | 'gt' | 'gte' | 'eq' | 'neq'
+type StateMutationOp = 'changed' | 'neq' | 'increment' | 'decrement' | 'set' | 'delete' | 'create' | 'skip'
 
-export interface ProofExtract {
+interface ProofExtract {
   varName: string
   from: 'header' | 'json' | 'status' | 'regex'
   selector: string
 }
 
-export interface ProofCsrfBind {
+interface ProofCsrfBind {
   headerName?: string
   fieldName?: string
   cookieName?: string
 }
 
 /** A typed replay step description. `id` is optional; compilers assign deterministic ids. */
-export interface ProofStepInput {
+interface ProofStepInput {
   id?: string
   description?: string
   method?: HttpMethod
@@ -66,7 +71,7 @@ export interface ProofStepInput {
 
 type Severity = typeof findingSeverities[number]
 
-export interface ProofCommonInput {
+interface ProofCommonInput {
   origin: string
   title?: string
   category?: string
@@ -78,7 +83,7 @@ export interface ProofCommonInput {
   recheckInstructions?: string
 }
 
-export interface AuthzReadDiffInput extends ProofCommonInput {
+interface AuthzReadDiffInput extends ProofCommonInput {
   ownerPersona: string
   attackerPersona: string
   endpoint: string
@@ -87,7 +92,7 @@ export interface AuthzReadDiffInput extends ProofCommonInput {
   identifierPath: string
 }
 
-export interface StateMutationDiffInput extends ProofCommonInput {
+interface StateMutationDiffInput extends ProofCommonInput {
   setupSteps?: ProofStepInput[]
   beforeRead: ProofStepInput
   probeMutation: ProofStepInput
@@ -99,7 +104,7 @@ export interface StateMutationDiffInput extends ProofCommonInput {
   controlAfterRead?: ProofStepInput
 }
 
-export interface BusinessInvariantInput extends ProofCommonInput {
+interface BusinessInvariantInput extends ProofCommonInput {
   setupSteps?: ProofStepInput[]
   controlFlow: ProofStepInput | ProofStepInput[]
   probeFlow: ProofStepInput | ProofStepInput[]
@@ -112,14 +117,14 @@ export interface BusinessInvariantInput extends ProofCommonInput {
   controlReadback?: ProofStepInput
 }
 
-export interface CanaryOrRedirectInput extends ProofCommonInput {
+interface CanaryOrRedirectInput extends ProofCommonInput {
   plantStep: ProofStepInput
   triggerStep: ProofStepInput
   canaryIdOrMarker: string
   surfaceKind: ProofSurfaceKind
 }
 
-export type CompiledReplaySpec = Extract<DeclarativeReplaySpec, { kind: 'http_chain' }>
+type CompiledReplaySpec = Extract<DeclarativeReplaySpec, { kind: 'http_chain' }>
 
 export interface CompiledProof {
   spec: CompiledReplaySpec
@@ -129,7 +134,7 @@ export interface CompiledProof {
   warnings: string[]
 }
 
-export type ProofIssueCode =
+type ProofIssueCode =
   | 'missing'
   | 'invalid'
   | 'nonspecific_identifier'
@@ -138,14 +143,14 @@ export type ProofIssueCode =
   | 'unsafe_payload'
   | 'unsupported'
 
-export interface ProofIssue {
+interface ProofIssue {
   field: string
   code: ProofIssueCode
   message: string
   fix: string
 }
 
-export type ProofValidationResult =
+type ProofValidationResult =
   | { ok: true; tool: ProofToolName; warnings: string[] }
   | { ok: false; tool: ProofToolName | null; errors: ProofIssue[] }
 
@@ -1197,14 +1202,14 @@ export function proveCanaryOrRedirect(input: CanaryOrRedirectInput): CompiledPro
 // LLM tool descriptions
 // ---------------------------------------------------------------------------
 
-export interface ProofToolPropertySchema {
+interface ProofToolPropertySchema {
   type: 'string' | 'number' | 'boolean' | 'array' | 'object'
   description: string
   enum?: readonly string[]
   items?: ProofToolPropertySchema
 }
 
-export interface ProofToolDescription {
+interface ProofToolDescription {
   name: ProofToolName
   usage: string
   inputSchema: {
