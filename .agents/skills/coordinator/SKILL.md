@@ -56,6 +56,13 @@ When spawning native swarm workers (`swarm(action="add", model=...)`), route by 
 - **`gemini-4-neon-high`** (or default/inherited model): complex multi-file engine/concurrency fixes, broker/auth security boundaries, and proof-kernel soundness work.
 - Switch a `waiting` worker on quota exhaustion or capacity limits via `swarm(action="model", name="<worker>", model="<model>")`, and use the OpenCode fallback below on content-safety blocks.
 
+## Benchmark Snapshot Isolation
+
+- **NEVER freeze `main`** (`workspace: "inherit"`) for long M2/M3/M4 Docker benchmark runs.
+- Always run long benchmark verifiers in an isolated `workspace: "share"` (or detached `git worktree add --detach`) snapshot pinned to `<sha>`.
+- Pin an immutable per-SHA Docker image (`docker tag kovo-worker:v4 kovo-worker:<sha>` + `KOVO_WORKER_IMAGE=kovo-worker:<sha>`) so `main` can keep merging PRs, rebuilding `kovo-worker:v4`, and refreshing `:8000` with zero interference.
+- Avoid launching heavy full-repo Docker builds or 264-file test sweeps simultaneously during peak 12-container benchmark load; normal merges, `tsc --noEmit`, targeted unit tests, and `vite build` are fine.
+
 ## Content-Block Fallback: Delegate to OpenCode
 
 When a native swarm worker hits a content-safety filter block — e.g.:
