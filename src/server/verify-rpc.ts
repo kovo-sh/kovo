@@ -2231,40 +2231,27 @@ export class VerifyRpcServer {
     const missingEvidence = verdict.confirmed
       ? []
       : (verdict.missingEvidence?.length ? [...verdict.missingEvidence] : [rejectedBy ?? 'composite_receipt'])
+    const chainId = this.scrub(verdict.chainId || (typeof rawObj?.chainId === 'string' ? rawObj.chainId : 'invalid'))
+    const terminalVulnClass = this.scrub(verdict.terminalVulnClass || (typeof rawObj?.terminalVulnClass === 'string' ? rawObj.terminalVulnClass : 'unknown'))
+    const scrubbedRoute = route ? this.scrub(route) : null
     const recorded = this.transcript.recordCompositeVerification({
-      chainId: verdict.chainId,
-      terminalVulnClass: verdict.terminalVulnClass,
-      replayMode: verdict.replayMode,
-      hopCount: verdict.hopCount,
-      confirmed: verdict.confirmed,
-      verifiedEdgeCount: verdict.verifiedEdges.filter(e => e.verified).length,
-      reason: verdict.reason,
+      chainId, terminalVulnClass, replayMode: verdict.replayMode, hopCount: verdict.hopCount, confirmed: verdict.confirmed,
+      verifiedEdgeCount: verdict.verifiedEdges.filter(e => e.verified).length, reason: this.scrub(verdict.reason),
       ...(verdict.failedStage ? { failedStage: verdict.failedStage } : {}),
-      rejectedBy,
-      missingEvidence,
-      exchangeIds,
-      terminalExchangeId,
-      route,
+      rejectedBy, missingEvidence: this.scrubRecord(missingEvidence), exchangeIds, terminalExchangeId, route: scrubbedRoute,
     })
     const cweText = `${String(rawObj?.cwe ?? '')} ${String(ti?.cwe ?? '')} ${String(rawObj?.terminalVulnClass ?? '')} ${String(ti?.summary ?? ti?.claimedImpact ?? '')}`
     const cwe = /\bCWE-\d{1,4}\b/i.exec(cweText)?.[0]?.toUpperCase()
     const claim: Extract<VerifyClaim, { kind: 'composite_receipt' }> = {
-      kind: 'composite_receipt',
-      verificationId: recorded.verificationId,
-      chainId: verdict.chainId || (typeof rawObj?.chainId === 'string' ? rawObj.chainId : 'invalid'),
-      terminalVulnClass: verdict.terminalVulnClass || (typeof rawObj?.terminalVulnClass === 'string' ? rawObj.terminalVulnClass : 'unknown'),
-      ...(cwe ? { cwe } : {}),
-      ...(route ? { route } : {}),
-      exchangeIds,
-      ...(terminalExchangeId ? { terminalExchangeId } : {}),
-      ...(verdict.replayMode ? { replayMode: verdict.replayMode } : {}),
+      kind: 'composite_receipt', verificationId: recorded.verificationId, chainId, terminalVulnClass,
+      ...(cwe ? { cwe } : {}), ...(scrubbedRoute ? { route: scrubbedRoute } : {}), exchangeIds,
+      ...(terminalExchangeId ? { terminalExchangeId } : {}), ...(verdict.replayMode ? { replayMode: verdict.replayMode } : {}),
       hopCount: typeof verdict.hopCount === 'number' ? verdict.hopCount : hops.length,
-      ...(rawObj ? { compositeReceipt: rawObj } : {}),
-      ...(!verdict.confirmed ? { rejectedBy, missingEvidence, reason: verdict.reason } : {}),
+      ...(rawObj ? { compositeReceipt: rawObj } : {}), ...(!verdict.confirmed ? { rejectedBy, missingEvidence, reason: verdict.reason } : {}),
     }
     return this.scrubRecord({
       ...verdict,
-      ...(route && !verdict.terminalEndpoint ? { terminalEndpoint: route } : {}),
+      ...(scrubbedRoute && !verdict.terminalEndpoint ? { terminalEndpoint: scrubbedRoute } : {}),
       ok: verdict.confirmed,
       verified: verdict.confirmed,
       verificationId: recorded.verificationId,
