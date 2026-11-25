@@ -5,7 +5,9 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { join, resolve } from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { configureGlobalKillSwitch, globalKillSwitch } from '../src/server/kill-switch.ts'
+import { getAppRuntime } from '../src/server/app-runtime.ts'
+import type { AppRuntime } from '../src/server/app-runtime.ts'
+import { configureGlobalKillSwitch } from '../src/server/kill-switch.ts'
 import type { GlobalKillSwitch } from '../src/server/kill-switch.ts'
 import { exportRunReceiptBundle } from '../src/server/receipt-export.ts'
 import { store, TenantIsolationError } from '../src/server/store.ts'
@@ -37,7 +39,9 @@ export interface LocalSessionOptions {
   pairingTtlMs?: number
   /** Optional clock override for deterministic expiration tests. */
   now?: () => number
-  /** v7 M4: kill-switch instance exposed at `/api/ops/kill-switch` (defaults to `globalKillSwitch`). */
+  /** Option 2 M2: optional shared AppRuntime composition root. */
+  runtime?: AppRuntime
+  /** v7 M4: kill-switch instance exposed at `/api/ops/kill-switch` (defaults to `AppRuntime.killSwitch`). */
   killSwitch?: GlobalKillSwitch
   /** v7 M4: optional Store handle for `/api/runs/:runId/receipts/export` and ops audit logging. */
   store?: Store
@@ -48,6 +52,7 @@ export interface KovoLocalServer {
   token: string
   bootstrapSecret: string
   bootstrapUrl(origin: string): string
+  runtime?: AppRuntime
 }
 
 function constantTimeEquals(a: string, b: string): boolean {
@@ -216,8 +221,9 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
   const origins = allowedOrigins(port, options.publicOrigin)
   const pairingTtlMs = options.pairingTtlMs ?? defaultPairingTtlMs
   const now = options.now ?? Date.now
-  const killSwitch = options.killSwitch ?? globalKillSwitch
-  const storeHandle = options.store
+  const runtime = options.runtime
+  const killSwitch = options.killSwitch ?? runtime?.killSwitch ?? getAppRuntime({ dataDir: directory }).killSwitch
+  const storeHandle = options.store ?? runtime?.store
   let token = readOrCreateSessionToken(directory)
   const secret = readOrCreateBootstrapSecret(directory)
   let bootstrapConsumed = false
@@ -496,7 +502,15 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
     }
 
     const abort = new AbortController()
-    res.once('close', () => abort.abort())
+    const unsubscribeSseRevocation = path.pathname.endsWith('/events')
+      ? killSwitch.onSseRevocation(() => {
+          if (!abort.signal.aborted) abort.abort()
+        })
+      : null
+    res.once('close', () => {
+      unsubscribeSseRevocation?.()
+      abort.abort()
+    })
     let received = 0
     const limiter = new Transform({
       transform(chunk, _encoding, done) {
@@ -536,23 +550,29 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
     },
     bootstrapSecret: secret,
     bootstrapUrl: (origin: string) => `${origin}/?${bootstrapParam}=${secret}`,
+    ...(runtime ? { runtime } : {}),
   }
 }
 
 async function main() {
   const directory = resolve(process.env.KOVO_DATA_DIR ?? '.kovo')
   const port = Number(process.env.PORT ?? 8000)
+  const killSwitchFilePath = join(directory, 'kill-switch.json')
+  const runtime = getAppRuntime({
+    dataDir: directory,
+    killSwitchFilePath,
+  })
   const serverEntry = new URL('../build/server/server.js', import.meta.url).href
   const { default: app, initialize } = await import(serverEntry) as {
     default: LocalApp
-    initialize: () => void
+    initialize: (options?: { dataDir?: string; killSwitchFilePath?: string }) => AppRuntime | void
   }
 
-  initialize()
+  initialize({ dataDir: directory, killSwitchFilePath })
 
   const sharedStore = store()
   const sharedKillSwitch = configureGlobalKillSwitch({
-    filePath: join(directory, 'kill-switch.json'),
+    filePath: killSwitchFilePath,
   })
 
   const local = createKovoLocalServer({
@@ -560,9 +580,22 @@ async function main() {
     directory,
     port,
     publicOrigin: process.env.KOVO_PUBLIC_ORIGIN || undefined,
+    runtime,
     killSwitch: sharedKillSwitch,
     store: sharedStore,
   })
+
+  let shuttingDown = false
+  const shutdown = () => {
+    if (shuttingDown) return
+    shuttingDown = true
+    local.server.closeAllConnections?.()
+    local.server.close(() => {
+      void runtime.dispose().finally(() => process.exit(0))
+    })
+  }
+  process.once('SIGTERM', shutdown)
+  process.once('SIGINT', shutdown)
 
   const origin = process.env.KOVO_PUBLIC_ORIGIN || `http://127.0.0.1:${port}`
   local.server.listen(port, '127.0.0.1', () => {

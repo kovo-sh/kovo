@@ -32,9 +32,12 @@ import type {
   OobRelayStatus,
   OobSubscription,
   OobSubscriptionInput,
+  OobUnsubscribeRunResult,
 } from './oob-relay.ts'
+import { cancelOobDrainForRun } from './oob-drain.ts'
 import { redact, redactHeaders } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
+import { assertValidRunId } from './run-context.ts'
 import { canaries } from './schema.ts'
 import type { Store } from './store.ts'
 
@@ -1333,6 +1336,32 @@ export class CanaryBroker {
     this.oobRelayInstance.close()
   }
 
+  /**
+   * Unsubscribe and evict all OOB subscriptions, bindings, in-flight drains, and in-memory
+   * canary state owned by `runId` without affecting any other concurrent run.
+   */
+  unsubscribeRun(runId: string): OobUnsubscribeRunResult & { evictedCanaries: number } {
+    const validRunId = assertValidRunId(runId, 'CanaryBroker.unsubscribeRun')
+    cancelOobDrainForRun(validRunId)
+    const relayResult = this.oobRelayInstance.unsubscribeRun(validRunId)
+    let evictedCanaries = 0
+    for (const [token, meta] of [...this.minted.entries()]) {
+      if (meta.runId === validRunId) {
+        this.minted.delete(token)
+        this.hitsByToken.delete(token)
+        evictedCanaries += 1
+      }
+    }
+    for (const [marker, meta] of [...this.mintedSecondOrder.entries()]) {
+      if (meta.runId === validRunId) {
+        this.mintedSecondOrder.delete(marker)
+        this.hitsByToken.delete(marker)
+        evictedCanaries += 1
+      }
+    }
+    return { ...relayResult, evictedCanaries }
+  }
+
   private appendHit(hit: CanaryHit) {
     let list = this.hitsByToken.get(hit.token)
     if (!list) {
@@ -1417,9 +1446,10 @@ export class CanaryBroker {
     origin?: string,
     options?: { storage?: Store | SecondOrderStore; assignmentId?: string },
   ): MintedCanary {
+    const validRunId = assertValidRunId(runId, 'CanaryBroker.mintCanary')
     const id = randomUUID()
     const digest = createHmac('sha256', this.secret)
-      .update(runId)
+      .update(validRunId)
       .update(id)
       .update(randomBytes(8))
       .digest('hex')
@@ -1434,7 +1464,7 @@ export class CanaryBroker {
     }
     this.minted.set(token, {
       id,
-      runId,
+      runId: validRunId,
       label,
       origin: origin ?? null,
       storage,
@@ -1443,7 +1473,7 @@ export class CanaryBroker {
     this.oobRelayInstance.registerCanary({
       token,
       canaryId: id,
-      runId,
+      runId: validRunId,
       assignmentId: options?.assignmentId ?? 'canary-broker',
     })
 
@@ -1451,7 +1481,7 @@ export class CanaryBroker {
       const purpose = (origin ? `${label} (${origin})` : label).slice(0, 200)
       storage.db.insert(canaries).values({
         id,
-        runId,
+        runId: validRunId,
         assignmentId: options?.assignmentId ?? 'canary-broker',
         token,
         purpose,
@@ -1467,7 +1497,7 @@ export class CanaryBroker {
     return {
       id,
       token,
-      runId,
+      runId: validRunId,
       label,
       origin: origin ?? null,
       httpUrl,
@@ -1490,10 +1520,11 @@ export class CanaryBroker {
     sourcePersona?: string | null
     storage?: Store | SecondOrderStore
   }): MintedSecondOrderCanary {
+    const validRunId = assertValidRunId(input.runId, 'CanaryBroker.mintSecondOrderCanary')
     let marker = ''
     for (let attempt = 0; attempt < 8; attempt += 1) {
       const digest = createHmac('sha256', this.secret)
-        .update(input.runId)
+        .update(validRunId)
         .update(randomBytes(8))
         .digest('hex')
         .slice(0, 8)
@@ -1517,7 +1548,7 @@ export class CanaryBroker {
     let id: string | undefined
     if (storage) {
       const row = storage.insertSecondOrderCanary({
-        runId: input.runId,
+        runId: validRunId,
         assignmentId,
         marker,
         injectedOrigin,
@@ -1534,7 +1565,7 @@ export class CanaryBroker {
     }
     this.mintedSecondOrder.set(marker, {
       id,
-      runId: input.runId,
+      runId: validRunId,
       assignmentId,
       injectedOrigin,
       injectedEndpoint,
@@ -1545,7 +1576,7 @@ export class CanaryBroker {
     this.oobRelayInstance.registerCanary({
       token: marker,
       canaryId: id ?? marker,
-      runId: input.runId,
+      runId: validRunId,
       assignmentId,
     })
 
@@ -1556,7 +1587,7 @@ export class CanaryBroker {
     return {
       ...(id ? { id } : {}),
       marker,
-      runId: input.runId,
+      runId: validRunId,
       assignmentId,
       injectedOrigin,
       injectedEndpoint,
@@ -1570,10 +1601,18 @@ export class CanaryBroker {
   checkCanary(token: string, options?: { storage?: Store | SecondOrderStore; runId?: string }): CanaryCheckResult {
     const normalized = token.trim().toLowerCase()
     const meta = this.minted.get(normalized)
+    const secondOrderMeta = this.mintedSecondOrder.get(normalized)
+    if (options?.runId) {
+      if (meta && meta.runId !== options.runId) {
+        return { found: false, hit: false, triggered: false, hits: [], detail: null }
+      }
+      if (!meta && secondOrderMeta && secondOrderMeta.runId !== options.runId) {
+        return { found: false, hit: false, triggered: false, hits: [], detail: null }
+      }
+    }
     const storage = options?.storage ?? meta?.storage ?? this.defaultStorage
     const runId = options?.runId ?? meta?.runId
 
-    const memHits = [...(this.hitsByToken.get(normalized) ?? [])]
     let row: typeof canaries.$inferSelect | undefined
     if (isFullStore(storage)) {
       try {
@@ -1584,6 +1623,12 @@ export class CanaryBroker {
         row = undefined
       }
     }
+
+    const ownedByRequestedRun = !options?.runId
+      || meta?.runId === options.runId
+      || secondOrderMeta?.runId === options.runId
+      || Boolean(row)
+    const memHits = ownedByRequestedRun ? [...(this.hitsByToken.get(normalized) ?? [])] : []
 
     if (row && memHits.length > 0 && !row.triggered && isFullStore(storage)) {
       const latest = memHits[memHits.length - 1]
