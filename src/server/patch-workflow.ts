@@ -130,6 +130,8 @@ export type PatchLlmCall = (prompt: { systemPrompt: string; userPrompt: string }
 export interface PatchLabRetestContext {
   labRunner: LabRunner
   runId: string
+  /** Optional explicit sanitized lab workspace path (auto-resolved from `labRunner.supervisor` when omitted). */
+  sanitizedRepoDir?: string
   replaySpec: DeclarativeReplaySpec
   broker: RequestBroker
   browser?: ScopedBrowser
@@ -1067,6 +1069,36 @@ export async function runPatchReviewer(params: {
   }
 }
 
+/** Per-run Gate-6 serialization mutex (M-7): prevents concurrent candidate patches from racing on one lab workspace. */
+const gate6RunLocks = new Map<string, Promise<void>>()
+
+async function withGate6RunLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = gate6RunLocks.get(runId) ?? Promise.resolve()
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const tail = prev.then(() => gate, () => gate)
+  gate6RunLocks.set(runId, tail)
+  await prev.catch(() => undefined)
+  try {
+    return await fn()
+  } finally {
+    release()
+    if (gate6RunLocks.get(runId) === tail) {
+      gate6RunLocks.delete(runId)
+    }
+  }
+}
+
+function restoreWorkspaceSnapshot(targetDir: string, backupDir: string): void {
+  if (!existsSync(targetDir) || !existsSync(backupDir)) return
+  for (const entry of readdirSync(targetDir)) {
+    rmSync(join(targetDir, entry), { recursive: true, force: true })
+  }
+  for (const entry of readdirSync(backupDir)) {
+    cpSync(join(backupDir, entry), join(targetDir, entry), { recursive: true })
+  }
+}
+
 export async function generateAndReviewPatch(params: PatchWorkflowParams): Promise<PatchProposalResult> {
   const now = Date.now()
   const proposalId = randomUUID()
@@ -1094,67 +1126,99 @@ export async function generateAndReviewPatch(params: PatchWorkflowParams): Promi
   const gates = [...review.gates]
 
   // Stage 3: Optional local-lab dynamic fix retest (reproduced -> fixed) with authorized baseline caller.
+  // M-7: Serialize concurrent Gate-6 retests per run, validate diff applicability in an isolated temp
+  // copy first, and snapshot/restore `sanitizedRepoDir` so candidate patches never leave the live
+  // run workspace mutated.
   if (params.labRetest && finalStatus === 'approved') {
     const lr = params.labRetest
-    try {
-      await lr.labRunner.rebuildWithPatch(lr.runId, authorOutput.diff, params.signal)
-      const retest = await retestReplaySpec({
-        spec: lr.replaySpec,
-        broker: lr.broker,
-        browser: lr.browser,
-        canaryBroker: lr.canaryBroker,
-        backend: lr.backend,
-        grant: lr.grant,
-        signal: params.signal ?? AbortSignal.timeout(60_000),
-        storage: lr.storage,
-        runId: lr.runId,
-        assignmentId: lr.assignmentId,
-      })
+    await withGate6RunLock(lr.runId, async () => {
+      const activeRunState = lr.labRunner?.supervisor?.getActiveRun?.(lr.runId)
+      const sanitizedRepoDir = lr.sanitizedRepoDir ?? activeRunState?.handle?.sanitizedRepoDir
+      let scratchDir: string | null = null
+      let backupDir: string | null = null
+      try {
+        if (sanitizedRepoDir && existsSync(sanitizedRepoDir)) {
+          // 1. Validate the candidate diff in an isolated temporary copy before touching the live lab dir.
+          scratchDir = mkdtempSync(join(tmpdir(), 'kovo-patch-gate6-work-'))
+          cpSync(sanitizedRepoDir, scratchDir, { recursive: true })
+          applyUnifiedDiffToDirectory(scratchDir, authorOutput.diff)
 
-      let baselineStatus: number | null = null
-      let baselineOk = false
-      if (lr.baselineCaller) {
-        try {
-          const baseline = await lr.broker.executeHttp(lr.baselineCaller, lr.grant, params.signal ?? AbortSignal.timeout(30_000))
-          baselineStatus = baseline.status
-          const expected = lr.baselineExpectStatus ?? [200, 201, 202, 204]
-          baselineOk = expected.includes(baseline.status)
-        } catch {
-          baselineOk = false
+          // 2. Capture a clean pre-retest snapshot for guaranteed rollback in `finally`.
+          backupDir = mkdtempSync(join(tmpdir(), 'kovo-patch-gate6-backup-'))
+          cpSync(sanitizedRepoDir, backupDir, { recursive: true })
+        }
+
+        await lr.labRunner.rebuildWithPatch(lr.runId, authorOutput.diff, params.signal)
+        const retest = await retestReplaySpec({
+          spec: lr.replaySpec,
+          broker: lr.broker,
+          browser: lr.browser,
+          canaryBroker: lr.canaryBroker,
+          backend: lr.backend,
+          grant: lr.grant,
+          signal: params.signal ?? AbortSignal.timeout(60_000),
+          storage: lr.storage,
+          runId: lr.runId,
+          assignmentId: lr.assignmentId,
+        })
+
+        let baselineStatus: number | null = null
+        let baselineOk = false
+        if (lr.baselineCaller) {
+          try {
+            const baseline = await lr.broker.executeHttp(lr.baselineCaller, lr.grant, params.signal ?? AbortSignal.timeout(30_000))
+            baselineStatus = baseline.status
+            const expected = lr.baselineExpectStatus ?? [200, 201, 202, 204]
+            baselineOk = expected.includes(baseline.status)
+          } catch {
+            baselineOk = false
+          }
+        }
+
+        if (retest.verdict === 'fixed' && lr.baselineCaller && baselineOk) {
+          dynamicRetestVerdict = 'fixed'
+          dynamicRetestSummary = `Zero-LLM dynamic fix retest confirmed reproduced → fixed: ${retest.replay.outcome.observed}; authorized baseline caller still HTTP ${baselineStatus}`
+          gates[5] = { gate: 6, name: 'dynamic_retest', passed: true, detail: dynamicRetestSummary }
+        } else if (retest.verdict === 'fixed' && !lr.baselineCaller) {
+          dynamicRetestVerdict = 'skipped'
+          dynamicRetestSummary = `Exploit replay reports fixed, but Gate 6 is unverified: no authorized baseline caller was supplied to prove legitimate traffic still succeeds.`
+          gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
+          finalStatus = 'withheld'
+        } else if (retest.verdict === 'fixed' && lr.baselineCaller && !baselineOk) {
+          dynamicRetestVerdict = 'skipped'
+          dynamicRetestSummary = `Exploit replay reports fixed, but the authorized baseline caller regressed (HTTP ${baselineStatus ?? 'error'}); patch breaks legitimate traffic.`
+          gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
+          finalStatus = 'rejected'
+        } else if (retest.verdict === 'reproduced') {
+          dynamicRetestVerdict = 'reproduced'
+          dynamicRetestSummary = `Vulnerability still reproduced after patch rebuild: ${retest.replay.outcome.observed}`
+          gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
+          finalStatus = 'rejected'
+        } else {
+          dynamicRetestVerdict = 'skipped'
+          dynamicRetestSummary = `Dynamic fix retest inconclusive: ${retest.replay.outcome.observed}`
+          gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
+          finalStatus = 'withheld'
+        }
+      } catch (err) {
+        dynamicRetestVerdict = 'skipped'
+        dynamicRetestSummary = `Dynamic fix retest failed: ${err instanceof Error ? err.message : String(err)}`
+        gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
+        finalStatus = 'withheld'
+      } finally {
+        if (sanitizedRepoDir && backupDir) {
+          try {
+            restoreWorkspaceSnapshot(sanitizedRepoDir, backupDir)
+          } catch { /* rollback is best-effort */ }
+        }
+        if (scratchDir) {
+          try { rmSync(scratchDir, { recursive: true, force: true }) } catch { /* ignore */ }
+        }
+        if (backupDir) {
+          try { rmSync(backupDir, { recursive: true, force: true }) } catch { /* ignore */ }
         }
       }
-
-      if (retest.verdict === 'fixed' && lr.baselineCaller && baselineOk) {
-        dynamicRetestVerdict = 'fixed'
-        dynamicRetestSummary = `Zero-LLM dynamic fix retest confirmed reproduced → fixed: ${retest.replay.outcome.observed}; authorized baseline caller still HTTP ${baselineStatus}`
-        gates[5] = { gate: 6, name: 'dynamic_retest', passed: true, detail: dynamicRetestSummary }
-      } else if (retest.verdict === 'fixed' && !lr.baselineCaller) {
-        dynamicRetestVerdict = 'skipped'
-        dynamicRetestSummary = `Exploit replay reports fixed, but Gate 6 is unverified: no authorized baseline caller was supplied to prove legitimate traffic still succeeds.`
-        gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
-        finalStatus = 'withheld'
-      } else if (retest.verdict === 'fixed' && lr.baselineCaller && !baselineOk) {
-        dynamicRetestVerdict = 'skipped'
-        dynamicRetestSummary = `Exploit replay reports fixed, but the authorized baseline caller regressed (HTTP ${baselineStatus ?? 'error'}); patch breaks legitimate traffic.`
-        gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
-        finalStatus = 'rejected'
-      } else if (retest.verdict === 'reproduced') {
-        dynamicRetestVerdict = 'reproduced'
-        dynamicRetestSummary = `Vulnerability still reproduced after patch rebuild: ${retest.replay.outcome.observed}`
-        gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
-        finalStatus = 'rejected'
-      } else {
-        dynamicRetestVerdict = 'skipped'
-        dynamicRetestSummary = `Dynamic fix retest inconclusive: ${retest.replay.outcome.observed}`
-        gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
-        finalStatus = 'withheld'
-      }
-    } catch (err) {
-      dynamicRetestVerdict = 'skipped'
-      dynamicRetestSummary = `Dynamic fix retest failed: ${err instanceof Error ? err.message : String(err)}`
-      gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
-      finalStatus = 'withheld'
-    }
+    })
   } else if (params.labRetest && finalStatus !== 'approved') {
     gates[5] = {
       gate: 6,

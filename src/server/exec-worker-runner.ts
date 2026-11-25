@@ -79,6 +79,7 @@ import { crawlStateGraph } from './phase0-recon.ts'
 import { resolveProfileNoTokenWatchdogMs } from './provider-stream.ts'
 import { BudgetExceededError } from './provider.ts'
 import { redact, type NamedSecret } from './redact.ts'
+import { sanitizeWorkerFactData } from './run-actor.ts'
 import { brokerExchanges } from './schema.ts'
 import type {
   Assignment,
@@ -401,11 +402,13 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         const currentApproved = this.host.approvedOriginsSet(curRun)
         const cleanOrigin = this.host.parseOriginForRun(curRun, args.origin)
         if (!currentApproved.has(cleanOrigin)) throw new BrokerDenied(`Origin ${cleanOrigin} is not approved.`)
+        // M-47: Untrusted worker writes can never spoof host planner control signals (det_lead, hop_checkpoint).
+        const sanitizedData = sanitizeWorkerFactData(args.data as Record<string, unknown> | undefined)
         const fact = this.storage.addFact(curRun, job.assignment, {
           kind: args.kind,
           origin: cleanOrigin,
           summary: args.summary,
-          data: args.data,
+          data: sanitizedData,
           exchangeIds: args.exchangeIds,
           evidenceIds: args.evidenceIds,
           sourceOrigins: args.sourceOrigins,
