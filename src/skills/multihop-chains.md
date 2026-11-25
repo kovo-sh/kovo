@@ -21,8 +21,10 @@ Your `AssignmentBrief` may include a bounded (`<= 2 KB`) `hopCheckpoint` object:
 Whenever a host-signed HTTP exchange, GraphQL response, SSE event, browser trace, or async readback yields a reusable credential or authorization artifact (bearer token, API key, session cookie, signed URL, OIDC assertion, signing salt, or HMAC key):
 1. Call `ctx.seal_capability` inside your `kovo_verify` script to seal the artifact in host-side `DerivedCapabilityVault` custody (strict `camelCase` option keys):
    - Inputs: `{ exchange | exchangeId, slot, hopReceiptId?, jsonPath | header | cookie | regex | value, kind?, ttlMs?, allowedOrigins?, defaultHeaderName?, defaultCookieName? }` (at least one extraction selector — `jsonPath`, `header`, `cookie`, `regex`, or `value` — is required).
+   - **2xx Status Guard:** ALWAYS assert `res.status >= 200 && res.status < 300` before calling `ctx.seal_capability(...)` so 4xx `{ error }` JSON does not fail `jsonPath`/`regex` extraction.
+   - **SSE / Non-JSON Extraction:** For `text/event-stream` (SSE) or non-JSON responses, extract capabilities with `regex` (not `jsonPath`).
    - Output: `{ handle, meta, exchangeId, sealExchangeId, scrubbedPreview }` where `handle` is opaque `cap:hop_<id>:<slot>` and `meta.sha256Prefix` holds the truncated digest (raw bytes remain host-side and are scrubbed from prompts/transcripts).
-2. Inject the sealed capability into Hop `k+1` via Layer-1 request options: `ctx.http_send(target, { capability: "cap:hop_<id>:<slot>", capabilityTarget?: "bearer" | "header" | "cookie" | "url", capabilityHeaderName?, capabilityCookieName?, capabilityQueryParam?, role: "probe" })` (or `{ capability: { handle, target?, headerName?, cookieName?, queryParam? } }`).
+2. Inject the sealed capability into Hop `k+1` via Layer-1 request options: `ctx.http_send(target, { capability: "cap:hop_<id>:<slot>", capabilityTarget?: "bearer" | "header" | "cookie" | "url", capabilityHeaderName?, capabilityCookieName?, capabilityQueryParam?, role: "probe" })` (or `{ capability: { handle, target?, headerName?, cookieName?, queryParam? } }`). `HttpOptions.role` accepts **ONLY** `'setup' | 'control' | 'probe' | 'cleanup'` — never pass persona names or proof roles like `'control_denied'`.
 3. **Derived Session Token Injection Rule:** Whenever Hop `k` mints or exchanges a session token or bearer credential, seal it with `kind: "bearer_token"` and send Hop `k+1` with `{ capability: { handle, target: "bearer" }, role: "probe" }` (or `{ headers: { Authorization: "Bearer " + handle }, role: "probe" }`) and **OMIT `as` / `persona`** so the derived session authenticates cleanly without being confused with or overwritten by a pre-seeded persona.
 4. Layer 1 performs the injection host-side and records `consumedCapabilityId` in the host-signed transcript, enabling deterministic `value_binding` verification.
 
@@ -53,11 +55,20 @@ A multi-hop finding confirms ONLY when `ctx.prove_composite` verifies a complete
 
 - **Mandatory `ctx.prove_composite` Rule (No Standalone Terminal Helpers After Setup Hops):** ALWAYS finalize with `ctx.prove_composite` — **NEVER** call standalone `ctx.prove_race_burst`, `ctx.prove_access_boundary`, or `ctx.prove_persisted_mutation` as your final proof — whenever your verification script executes prerequisite setup hops (e.g., disclosure/extraction, token/session acquisition, parser differential, cache prime, state rebind, or async job polling) before the terminal impact. Even when the terminal hop is a concurrent race burst, execute the race burst inside the chain and wrap ALL prerequisite setup hops plus the terminal race hop inside `ctx.prove_composite` (calling standalone `prove_race_burst` records `hopCount = 0` and fails multi-hop chain confirmation).
 - **Complete Causal Hop Declaration Rule (Hop 1 Through Terminal):** Declare **EVERY** causal hop your verification script executed — from Hop 1 (entry disclosure/extraction) through every intermediate pivot, token/invite resolve, parser differential, cache prime, state rebind, signing, or async-poll hop to the terminal hop — in `prove_composite.hops[]` and connect them end-to-end with `causalEdges[]`. Omitting Hop 1 or any intermediate setup hop yields an incomplete receipt even when all hops executed in the transcript.
+- **Strict-CamelCase Inline Schema (`prove_composite`):**
+  - `hops[]`: `{ hopId, surface?, target: { origin, method, pathAndQuery }, exchangeIds, claimedDelta, producedCapabilities?, consumedCapabilities? }` — **`target` MUST be `{ origin, method, pathAndQuery }`, NOT a bare string, and `claimedDelta` is required!**
+  - `causalEdges[]`:
+    - `kind: 'value_binding'` requires `capabilityHandle` (or `valueDigest`);
+    - `kind: 'state_transition_binding'` requires `entityId` AND `ablationExchangeIds` (baseline exchange proving target fails before the state-mutating hop!);
+    - `kind: 'derived_crypto_binding'` requires `sourceCapabilityId`;
+    - `kind: 'async_pivot_binding'` requires `correlationId` + `channel`.
+  - `terminalImpact`: `{ terminalHopId, claimedImpact, preChainControlExchangeIds, postChainReadbackExchangeIds, oracleInput? }`.
 
 ```ts
 // Mode-A defensive verification shape (all IDs reference host-signed transcript records)
 const preDenied = await ctx.http_send('/api/v1/terminal', { as: 'member_b', role: 'control' })
 const ex1 = await ctx.http_send('/api/v1/resource-meta', { as: 'member_b', role: 'probe' })
+if (!(ex1.status >= 200 && ex1.status < 300)) throw new Error(`Hop 1 failed: ${ex1.status}`)
 const cap1 = await ctx.seal_capability({ exchange: ex1, hopReceiptId: '1', slot: 'scoped_tok', jsonPath: '$.token', kind: 'bearer_token' })
 const postReadback = await ctx.http_send('/api/v1/terminal', { capability: cap1.handle, role: 'probe' })
 await ctx.prove_composite({
@@ -105,6 +116,7 @@ Use this exact pattern whenever a chain crosses signing, token-forgery, or backg
 const preDenied = await ctx.http_send('/api/v1/exports/foreign-item', { as: 'member_b', role: 'control' })
 // Hop 1: low-priv persona retrieves intermediate signing material (seal it; do NOT file as standalone CWE-200)
 const h1 = await ctx.http_send('/api/v1/service-meta', { as: 'member_b', role: 'probe' })
+if (!(h1.status >= 200 && h1.status < 300)) throw new Error(`Hop 1 failed: ${h1.status}`)
 const keyCap = await ctx.seal_capability({ exchange: h1, hopReceiptId: '1', slot: 'signing_key', jsonPath: '$.signingKey', kind: 'hmac_key' })
 // Hop 2: derive host-attested HMAC signature (or forged JWT via ctx.jwt_sign) and trigger async job
 const payload = JSON.stringify({ action: 'export', tenant: 'target_org', correlationId: 'corr-1' })
@@ -116,6 +128,7 @@ const h2 = await ctx.http_send('/api/v1/webhooks/trigger', {
   headers: { 'x-signature': sig.signature, 'content-type': 'application/json' },
   body: payload, correlationIds: ['corr-1'],
 })
+if (!(h2.status >= 200 && h2.status < 300)) throw new Error(`Hop 2 failed: ${h2.status}`)
 const jobCap = await ctx.seal_capability({ exchange: h2, hopReceiptId: '2', slot: 'job_id', jsonPath: '$.jobId' })
 // Hop 3: bounded host-tracked async convergence (never unbounded sleeps; never stop at the job handle)
 const pol = await ctx.await_async({
@@ -123,6 +136,7 @@ const pol = await ctx.await_async({
   matchPredicate: { status: 200, jsonPath: '$.state', equals: 'ready' },
   triggerExchangeId: h2.exchangeId, correlationId: 'corr-1', profile: 'fast_lab',
 })
+if (!pol.exchange || !(pol.exchange.status >= 200 && pol.exchange.status < 300)) throw new Error('Hop 3 async poll did not yield 2xx')
 const exportCap = await ctx.seal_capability({ exchange: pol.exchange, hopReceiptId: '3', slot: 'export_tok', jsonPath: '$.downloadToken', kind: 'bearer_token' })
 // Hop 4: terminal cross-tenant readback via derived capability
 const postReadback = await ctx.http_send('/api/v1/exports/foreign-item', { capability: exportCap.handle, role: 'probe' })
@@ -154,9 +168,9 @@ return ctx.result({ title: '4-hop cross-service signing and async export pivot' 
 ### The 4 Typed Causal Edge Bindings & Connected-DAG Rule (`dag_topology`)
 - **Connected-DAG Rule (`dag_topology`):** Every hop listed in `hops[]` MUST be connected by `causalEdges[]` on a directed path reaching `terminalImpact.terminalHopId`. NEVER include unused or orphan exploratory hops in `hops[]` — keep baseline reads, pre-chain controls, and ablation probes in `preChainControlExchangeIds`, `postChainReadbackExchangeIds`, `ablationExchangeIds`, or `terminalImpact.oracleInput` rather than listing disconnected hops in `hops[]`.
 - Every non-root hop must connect causally via host-signed transcript evidence:
-1. **`value_binding`:** `{ kind: "value_binding", fromHopId, toHopId, capabilityHandle?, valueDigest?, sourceExchangeId?, targetExchangeId? }` — verbatim `cap:hop_<id>:<slot>` handle or `sha256(extractedValue)` observed in Hop `i` output and injected into Hop `j` request (`t_i <= t_j`).
+1. **`value_binding`:** `{ kind: "value_binding", fromHopId, toHopId, capabilityHandle?, valueDigest?, sourceExchangeId?, targetExchangeId? }` — **requires `capabilityHandle` (or `valueDigest`)**: verbatim `cap:hop_<id>:<slot>` handle or `sha256(extractedValue)` observed in Hop `i` output and injected into Hop `j` request (`t_i <= t_j`).
 2. **`derived_crypto_binding`:** `{ kind: "derived_crypto_binding", fromHopId, toHopId, sourceCapabilityId, derivedCapabilityId?, alg? }` — backed by a host-signed `derivedFromCapabilityId` attestation from `ctx.hmac_sign`, `ctx.jwt_sign`, or host-tracked token exchange.
-3. **`state_transition_binding`:** `{ kind: "state_transition_binding", fromHopId, toHopId, entityId, ablationExchangeIds: [cleanAblation.exchangeId], mutationKind? }` — Hop `i` mutates shared entity/cache state without issuing a new token; **`ablationExchangeIds` is MANDATORY** and must prove in a clean session (`cleanSession=true`) that running Hop `j` *without* Hop `i` fails cleanly (`401`/`403`/`404`/`409`/`412`/`422`), whereas `Hop i -> Hop j` succeeds. **Clean-Control Order Rule:** ALWAYS execute `const cleanAblation = await ctx.http_send('/api/v1/target', { as: 'member_b', role: 'control', entityId })` **BEFORE** Stage 1 mutates shared/cache state (or against a fresh untouched sibling entity with matching `entityId`) — running the control *after* Stage 1 marks the session dirty (`cleanSession=false`) and fails `state_transition_binding`.
+3. **`state_transition_binding`:** `{ kind: "state_transition_binding", fromHopId, toHopId, entityId, ablationExchangeIds: [cleanAblation.exchangeId], mutationKind? }` — Hop `i` mutates shared entity/cache state without issuing a new token; **requires `entityId` AND `ablationExchangeIds` (baseline exchange proving target fails before the state-mutating hop!)** in a clean session (`cleanSession=true`) (`401`/`403`/`404`/`409`/`412`/`422`), whereas `Hop i -> Hop j` succeeds. **Clean-Control Order Rule:** ALWAYS execute `const cleanAblation = await ctx.http_send('/api/v1/target', { as: 'member_b', role: 'control', entityId })` **BEFORE** Stage 1 mutates shared/cache state (or against a fresh untouched sibling entity with matching `entityId`) — running the control *after* Stage 1 marks the session dirty (`cleanSession=false`) and fails `state_transition_binding`.
 4. **`async_pivot_binding`:** `{ kind: "async_pivot_binding", fromHopId, toHopId, correlationId, channel: "poll_convergence" | "oob_relay" | "browser_trace" | "async_job", pollRecordId? | oobEventId? | browserTraceId? }` — connects trigger Hop `i` to downstream effect Hop `j` with monotonic timestamps (`t_i <= t_j`) and run-scoped correlation.
 
 ### White-Box Single-Script Consolidation (3–5 Stage Workflows)
