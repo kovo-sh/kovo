@@ -63,6 +63,7 @@ import { dedupeCodeAuditSuspects } from './semantic-audit.ts'
 import {
   isOpaqueResourceId,
   type ChainStep,
+  type EndpointRow,
   type Fact,
   type ResourceSampleRow,
   type Run,
@@ -1743,10 +1744,51 @@ export const CODE_AUDIT_WAVE1_MAX_STEPS = 6
 export const MAX_CODE_AUDIT_SIBLING_LEADS = 4
 /** Maximum composite multi-service chain steps synthesized from complementary code-audit sinks. */
 export const MAX_SYNTHESIZED_CODE_AUDIT_COMPOSITE_STEPS = 2
+/** Maximum generic cross-origin composite Wave-1 chain steps synthesized from runtime facts/specs when `!sourceMounted`. */
+export const MAX_SYNTHESIZED_RUNTIME_COMPOSITE_STEPS = 2
 
 const SEALED_HOP_CAP_HANDLE_RE = /\bcap:hop_(?!synth:)[A-Za-z0-9._-]+:[A-Za-z0-9._-]+/
 const SOURCE_AUDIT_ORIGIN_TEXT_RE = /\b(?:source[- ]first code audit|source audit verify|semantic audit|code_audit_suspect|code_audit|source_audit|semantic_audit)\b/i
 const CAUSAL_ARROW_HYPOTHESIS_RE = /->|→|=>/
+const RUNTIME_BACKED_CHAIN_SKILLS: ReadonlySet<string> = new Set([
+  'api-dependency',
+  'runtime-dependency',
+  'runtime-composite-chain',
+  'cross-origin-chain',
+  'runtime-cross-origin',
+  'persona-differential',
+  'runtime-persona-diff',
+])
+const RUNTIME_API_DEP_HYPOTHESIS_RE = /\b(?:api_dependency:|api_dep_producer=|producer\s*(?:->|→)\s*consumer|resource_key=)/i
+const RUNTIME_PERSONA_DIFF_HYPOTHESIS_RE = /\b(?:denied_control:|persona_diff:|runtime_surface_asymmetry|catalog_weaker=|client_roles=)\b|\bis\s+denied\s*\((?:401|403)\)[\s\S]{0,160}\bbut\s+succeeds\s*\(2\d\d\)/i
+const RUNTIME_CROSS_ORIGIN_HYPOTHESIS_RE = /\b(?:cross_origin_edge:|cross_origin=|cross-origin\s+(?:transition|api\s+dependency|composite\s+chain))\b/i
+const HTTP_ORIGIN_IN_TEXT_RE = /https?:\/\/[A-Za-z0-9.-]+(?::\d+)?/gi
+
+/**
+ * True when a grey-box/runtime Wave-1 chain step is backed by concrete runtime evidence:
+ * producer->consumer API dependencies, real cross-origin transitions (>= 2 distinct origins),
+ * or multi-persona differential observations (exempting it from generic Wave-1 stub demotion).
+ */
+export function hasRuntimeBackedChainEvidence(
+  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'skills'> & Partial<Pick<DispatchLaneStep, 'sourceOrigins'>>,
+): boolean {
+  if ((step.skills ?? []).some(skill => RUNTIME_BACKED_CHAIN_SKILLS.has(skill) || skill.startsWith('api_dep:'))) {
+    return true
+  }
+  const distinctSourceOrigins = new Set((step.sourceOrigins ?? []).filter(Boolean))
+  if (distinctSourceOrigins.size >= 2) return true
+  const hyp = step.hypothesis ?? ''
+  const text = `${step.title} ${hyp}`
+  if (RUNTIME_API_DEP_HYPOTHESIS_RE.test(text)) return true
+  if (RUNTIME_PERSONA_DIFF_HYPOTHESIS_RE.test(text)) return true
+  if (RUNTIME_CROSS_ORIGIN_HYPOTHESIS_RE.test(text)) return true
+  const mentionedOrigins = new Set<string>()
+  for (const m of hyp.matchAll(HTTP_ORIGIN_IN_TEXT_RE)) {
+    mentionedOrigins.add(m[0]!.toLowerCase())
+    if (mentionedOrigins.size >= 2) return true
+  }
+  return false
+}
 
 /** Extract the continuation depth (`0` for original steps, `1..N` for continuation steps). */
 export function extractContinuationDepth(step: { skills?: readonly string[] }): number {
@@ -1781,13 +1823,16 @@ export function hasSourceAuditOrigin(
 
 /**
  * True when a step is a generic Wave-1 heuristic boundary stub (`Wave-1 chain · ...` without
- * `dependsOnFactIds` at depth 0 or concrete source-audit suspect linkage), including any
- * continuation spawned from such a stub.
+ * `dependsOnFactIds` at depth 0, concrete source-audit suspect linkage, or runtime dependency /
+ * cross-origin / multi-persona differential backing), including any continuation spawned from
+ * such a stub.
  */
 export function isGenericWave1BoundaryChainStep(
-  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'skills' | 'dependsOnFactIds'>,
+  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'skills' | 'dependsOnFactIds'>
+    & Partial<Pick<DispatchLaneStep, 'sourceOrigins'>>,
 ): boolean {
   if (hasSourceAuditOrigin(step)) return false
+  if (hasRuntimeBackedChainEvidence(step)) return false
   const isWave1StubMarker = /^wave-1\s+chain\b/i.test(step.title)
     || /\[inv_hyp=[^\]]+\]/i.test(step.hypothesis ?? '')
     || (step.skills ?? []).includes('wave1-boundary-stub')
@@ -1798,14 +1843,16 @@ export function isGenericWave1BoundaryChainStep(
 
 /**
  * True when a chain step is backed by concrete source-audit findings, upstream facts
- * (`dependsOnFactIds`), or a planner-synthesized causal arrow hypothesis (as opposed to a generic
- * Wave-1 heuristic boundary stub).
+ * (`dependsOnFactIds`), runtime dependency/cross-origin/multi-persona evidence, or a
+ * planner-synthesized causal arrow hypothesis (as opposed to a generic Wave-1 heuristic stub).
  */
 export function isHighSignalSourceOrPlannerChainStep(
-  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'skills' | 'dependsOnFactIds'>,
+  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'skills' | 'dependsOnFactIds'>
+    & Partial<Pick<DispatchLaneStep, 'sourceOrigins'>>,
 ): boolean {
   if (isGenericWave1BoundaryChainStep(step)) return false
   if (hasSourceAuditOrigin(step)) return true
+  if (hasRuntimeBackedChainEvidence(step)) return true
   if ((step.dependsOnFactIds?.length ?? 0) > 0) return true
   if ((step.skills ?? []).some(skill => skill.startsWith('chain:'))) return true
   return CAUSAL_ARROW_HYPOTHESIS_RE.test(`${step.title} ${step.hypothesis ?? ''}`)
@@ -1829,14 +1876,15 @@ export function hasSealedHopCapability(
 
 /**
  * Fair multi-hop frontier interleaving rank within the `chain` lane (lower = higher priority):
- *  0. Unstarted (`depth === 0`) source-audit / planner-synthesized multi-hop chains,
+ *  0. Unstarted (`depth === 0`) source-audit / planner-synthesized / runtime-evidence-backed chains,
  *  1. `depth === 1` continuations that sealed a `cap:hop_*` capability handle,
- *  2. Remaining unstarted (`depth === 0`) Wave-1 boundary chains,
+ *  2. Remaining unstarted (`depth === 0`) Wave-1 boundary stubs,
  *  3. `depth === 1` continuations without a sealed `cap:hop_*` handle,
  *  4. `depth >= 2` continuations (only after distinct chains have had their first shot).
  */
 export function chainLaneDispatchRank(
-  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'skills' | 'dependsOnFactIds'>,
+  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'skills' | 'dependsOnFactIds'>
+    & Partial<Pick<DispatchLaneStep, 'sourceOrigins'>>,
 ): number {
   const depth = extractContinuationDepth(step)
   if (depth === 0) {
@@ -3653,6 +3701,486 @@ export function convertCodeAuditSuspectsToChainSteps(
     })
     existingTitles.add(title.toLowerCase())
     coveredFactIds.add(item.fact.id)
+    created.push(step)
+    totalSteps += 1
+  }
+
+  return created
+}
+
+const COMPOSITE_RUNTIME_TITLE_PREFIX = 'Runtime composite chain ·'
+
+export interface RuntimeCompositeApiDependencyInput {
+  producer: string
+  consumer: string
+  resourceKey: string
+  producerOrigin?: string
+  consumerOrigin?: string
+  personaHandle?: string | null
+}
+
+export interface SynthesizeRuntimeCompositeWave1Options {
+  /** Only synthesize runtime grey-box composites when repository source is NOT mounted. */
+  sourceMounted: boolean
+  facts?: readonly Fact[]
+  endpoints?: readonly Pick<EndpointRow, 'id' | 'origin' | 'method' | 'pathTemplate' | 'authRequirement' | 'riskScore' | 'source' | 'sinkKinds'>[]
+  apiDependencies?: readonly RuntimeCompositeApiDependencyInput[]
+  specs?: ReadonlyArray<{ kind: string; origin?: string | null; content: string }>
+  hostTiers?: Record<string, HostTier>
+  maxSteps?: number
+}
+
+interface NormalizedRuntimeHopCandidate {
+  key: string
+  origin: string
+  host: string
+  asset: Run['candidates'][number]
+  serviceScope: string
+  endpoint: string
+  sinkKind: string
+  cue: string
+  mappedSkills: string[]
+  roles: ReadonlySet<CodeAuditChainRole>
+  factId?: string
+  resourceKey?: string
+  isApiDep?: boolean
+  isCrown: boolean
+  priorityScore: number
+}
+
+/**
+ * Grey-box counterpart to WB's `convertCodeAuditSuspectsToChainSteps` composite synthesis:
+ * when `!sourceMounted`, synthesize up to `MAX_SYNTHESIZED_RUNTIME_COMPOSITE_STEPS` (default 2)
+ * generic cross-origin / producer->consumer composite Wave-1 `ChainStep`s from persisted runtime
+ * facts, endpoints, API dependencies, and OpenAPI/GraphQL specs (matching WB's `Composite workflow
+ * (3-5 stages)` dispatch shape without any source-code dependence or benchmark literals).
+ */
+export function synthesizeRuntimeCompositeWave1Steps(
+  storage: Store,
+  run: Run,
+  options: SynthesizeRuntimeCompositeWave1Options,
+): ChainStep[] {
+  if (options.sourceMounted) return []
+  const maxSteps = Math.max(0, Math.min(
+    options.maxSteps !== undefined ? Math.floor(options.maxSteps) : MAX_SYNTHESIZED_RUNTIME_COMPOSITE_STEPS,
+    MAX_SYNTHESIZED_RUNTIME_COMPOSITE_STEPS,
+  ))
+  if (maxSteps <= 0) return []
+
+  const assetByOrigin = new Map<string, Run['candidates'][number]>()
+  for (const cand of run.candidates) {
+    if (run.approved.includes(cand.id) && !assetByOrigin.has(cand.origin)) {
+      assetByOrigin.set(cand.origin, cand)
+    }
+  }
+  if (assetByOrigin.size === 0) return []
+
+  const existingSteps = storage.listChainSteps(run.id, run.goalRevision)
+  const existingTitles = new Set(existingSteps.map(s => s.title.trim().toLowerCase()))
+  const existingRuntimeComposites = existingSteps.filter(s =>
+    s.title.startsWith(COMPOSITE_RUNTIME_TITLE_PREFIX),
+  ).length
+  const remainingCompositeBudget = Math.max(0, maxSteps - existingRuntimeComposites)
+  let totalSteps = existingSteps.length
+  if (remainingCompositeBudget <= 0 || totalSteps >= hardChainStepsCeiling) return []
+
+  const candidates: NormalizedRuntimeHopCandidate[] = []
+  const seenKeys = new Set<string>()
+  const hostOfOrigin = (origin: string): string => {
+    try { return new URL(origin).hostname.toLowerCase() } catch { return origin.toLowerCase() }
+  }
+
+  const pushCandidate = (input: {
+    origin: string
+    endpoint: string
+    cue: string
+    sinkKind?: string
+    factId?: string
+    resourceKey?: string
+    isApiDep?: boolean
+    extraText?: string
+    baseScore?: number
+  }): void => {
+    const asset = assetByOrigin.get(input.origin)
+    if (!asset) return
+    const endpoint = input.endpoint.trim()
+    if (!endpoint) return
+    const host = hostOfOrigin(input.origin)
+    const combinedText = `${endpoint} ${input.cue} ${input.extraText ?? ''}`
+    const sinkKind = input.sinkKind?.trim() || inferSinkKindFromFactText(combinedText)
+    const roles = classifyCodeAuditChainRoles({ sinkKind, text: combinedText })
+    const key = `${input.origin}|${endpoint.toLowerCase()}|${sinkKind}`
+    if (seenKeys.has(key)) return
+    seenKeys.add(key)
+    const mapped = sinkCategoryAndSkills(sinkKind)
+    const isCrown = (options.hostTiers?.[input.origin] ?? classifyHostTier(input.origin)) === 'crown_jewel'
+    candidates.push({
+      key,
+      origin: input.origin,
+      host,
+      asset,
+      serviceScope: inferServiceScopeFromSuspect('', endpoint, input.origin),
+      endpoint,
+      sinkKind,
+      cue: compactSuspectCue(input.cue, 76),
+      mappedSkills: mapped.skills,
+      roles,
+      ...(input.factId ? { factId: input.factId } : {}),
+      ...(input.resourceKey ? { resourceKey: input.resourceKey } : {}),
+      ...(input.isApiDep ? { isApiDep: true } : {}),
+      isCrown,
+      priorityScore: (input.baseScore ?? 50) + (isCrown ? 12 : 0) + roles.size * 6 + (input.isApiDep ? 14 : 0),
+    })
+  }
+
+  // 1. Collect from runtime API dependencies (highest-signal producer -> consumer links).
+  const depPairs: Array<{ prod: NormalizedRuntimeHopCandidate; cons: NormalizedRuntimeHopCandidate; resourceKey: string }> = []
+  const defaultOrigin = [...assetByOrigin.keys()][0]!
+  for (const dep of (options.apiDependencies ?? []).slice(0, 40)) {
+    const prodOrigin = dep.producerOrigin && assetByOrigin.has(dep.producerOrigin) ? dep.producerOrigin : defaultOrigin
+    const consOrigin = dep.consumerOrigin && assetByOrigin.has(dep.consumerOrigin) ? dep.consumerOrigin : prodOrigin
+    const prodBefore = candidates.length
+    pushCandidate({
+      origin: prodOrigin,
+      endpoint: dep.producer,
+      cue: `Producer ${dep.producer} yields resource "${dep.resourceKey}"`,
+      resourceKey: dep.resourceKey,
+      isApiDep: true,
+      extraText: `producer resource ${dep.resourceKey}`,
+      baseScore: 76,
+    })
+    const prodCand = candidates.find(c => c.origin === prodOrigin && c.endpoint === dep.producer.trim())
+      ?? (candidates.length > prodBefore ? candidates[candidates.length - 1] : undefined)
+    const consBefore = candidates.length
+    pushCandidate({
+      origin: consOrigin,
+      endpoint: dep.consumer,
+      cue: `Consumer ${dep.consumer} acts on resource "${dep.resourceKey}"`,
+      resourceKey: dep.resourceKey,
+      isApiDep: true,
+      extraText: `consumer resource ${dep.resourceKey} cross-tenant mutation`,
+      baseScore: 78,
+    })
+    const consCand = candidates.find(c => c.origin === consOrigin && c.endpoint === dep.consumer.trim())
+      ?? (candidates.length > consBefore ? candidates[candidates.length - 1] : undefined)
+    if (prodCand && consCand && prodCand.key !== consCand.key) {
+      depPairs.push({ prod: prodCand, cons: consCand, resourceKey: dep.resourceKey })
+    }
+  }
+
+  // 2. Collect from non-tainted runtime facts (Phase-0 catalogs, persona resources, det leads, notes).
+  for (const fact of options.facts ?? []) {
+    if (fact.tainted || !assetByOrigin.has(fact.origin)) continue
+    const data = (fact.data ?? {}) as Record<string, unknown>
+    const subkind = typeof data.subkind === 'string' ? data.subkind : ''
+    if (subkind === 'runtime_spa_routes' && Array.isArray(data.spaRoutes)) {
+      for (const raw of data.spaRoutes.slice(0, 12)) {
+        if (!raw || typeof raw !== 'object') continue
+        const route = raw as { path?: string; serviceOrigin?: string; apiCalls?: Array<{ method?: string; path?: string; serviceOrigin?: string }>; requiredRoles?: string[]; stateActions?: string[] }
+        const target = route.apiCalls?.[0]
+        const targetOrigin = target?.serviceOrigin && assetByOrigin.has(target.serviceOrigin)
+          ? target.serviceOrigin
+          : route.serviceOrigin && assetByOrigin.has(route.serviceOrigin)
+            ? route.serviceOrigin
+            : fact.origin
+        const epLabel = target?.path ? `${(target.method ?? 'GET').toUpperCase()} ${target.path}` : (route.path ?? '')
+        if (!epLabel) continue
+        pushCandidate({
+          origin: targetOrigin,
+          endpoint: epLabel,
+          cue: `SPA route ${route.path ?? epLabel} invokes ${epLabel}${route.requiredRoles?.length ? ` (client roles: ${route.requiredRoles.join(',')})` : ''}`,
+          factId: fact.id,
+          extraText: `${(route.stateActions ?? []).join(' ')} ${(route.requiredRoles ?? []).join(' ')}`,
+          baseScore: 72,
+        })
+      }
+      continue
+    }
+    if (subkind === 'runtime_graphql_catalog') {
+      const cat = data.graphqlCatalog as { endpoint?: string; serviceOrigin?: string; fields?: Array<{ name?: string; kind?: string; requiredRole?: string }> } | undefined
+      const gqlOrigin = cat?.serviceOrigin && assetByOrigin.has(cat.serviceOrigin) ? cat.serviceOrigin : fact.origin
+      const mut = cat?.fields?.find(f => f.kind === 'mutation') ?? cat?.fields?.[0]
+      if (mut?.name) {
+        pushCandidate({
+          origin: gqlOrigin,
+          endpoint: `${(mut.kind ?? 'mutation').toUpperCase()} ${cat?.endpoint ?? '/graphql'}#${mut.name}`,
+          cue: `GraphQL ${mut.kind ?? 'operation'} ${mut.name} at ${cat?.endpoint ?? '/graphql'}`,
+          factId: fact.id,
+          extraText: `${mut.name} ${mut.requiredRole ?? ''} mutation batch graphql`,
+          baseScore: 72,
+        })
+      }
+      continue
+    }
+    const routeFromData = typeof data.endpoint === 'string' && data.endpoint.trim()
+      ? `${typeof data.method === 'string' ? `${data.method.toUpperCase()} ` : ''}${data.endpoint.trim()}`
+      : typeof data.path === 'string' && data.path.trim()
+        ? `${typeof data.method === 'string' ? `${data.method.toUpperCase()} ` : ''}${data.path.trim()}`
+        : templatesMentionedInText(fact.summary)[0] ?? ''
+    if (!routeFromData) continue
+    pushCandidate({
+      origin: fact.origin,
+      endpoint: routeFromData,
+      cue: fact.summary,
+      factId: fact.id,
+      extraText: `${fact.kind} ${subkind} ${typeof data.field === 'string' ? data.field : ''}`,
+      baseScore: fact.kind === 'auth' || fact.kind === 'policy_gap' || fact.kind === 'object_ref' || subkind === 'det_lead' ? 74 : 62,
+    })
+  }
+
+  // 3. Collect from persisted endpoints (prioritizing cross-origin diversity and high-risk routes).
+  const endpoints = options.endpoints ?? storage.listEndpoints(run.id, { limit: 200 })
+  for (const ep of endpoints) {
+    if (!assetByOrigin.has(ep.origin)) continue
+    if (ep.pathTemplate === '/' || /^\/(?:health|healthz|ready|metrics|favicon)/i.test(ep.pathTemplate)) continue
+    const label = `${ep.method.toUpperCase()} ${ep.pathTemplate}`
+    const authHint = ep.authRequirement ? `auth=${ep.authRequirement}` : 'auth=unspecified'
+    pushCandidate({
+      origin: ep.origin,
+      endpoint: label,
+      cue: `Discovered ${label} (${authHint}) on ${hostOfOrigin(ep.origin)}`,
+      sinkKind: ep.sinkKinds?.[0],
+      extraText: `${authHint} ${(ep.sinkKinds ?? []).join(' ')}`,
+      baseScore: ep.riskScore ?? 55,
+    })
+  }
+
+  // 4. Collect from JSON OpenAPI specs when endpoints/facts are sparse.
+  for (const spec of (options.specs ?? []).slice(0, 6)) {
+    if (spec.kind !== 'openapi') continue
+    const specOrigin = spec.origin && assetByOrigin.has(spec.origin) ? spec.origin : defaultOrigin
+    try {
+      const parsed = JSON.parse(spec.content) as {
+        security?: Array<Record<string, string[]>>
+        paths?: Record<string, Record<string, { operationId?: string; summary?: string; security?: Array<Record<string, string[]>> }>>
+      }
+      for (const [pathKey, methods] of Object.entries(parsed.paths ?? {})) {
+        if (!methods || typeof methods !== 'object') continue
+        for (const [method, op] of Object.entries(methods)) {
+          if (!/^(?:get|post|put|patch|delete)$/i.test(method)) continue
+          const label = `${method.toUpperCase()} ${pathKey}`
+          const sec = Array.isArray(op?.security) ? op.security : parsed.security
+          const authText = Array.isArray(sec) && sec.length === 0 ? 'unauthenticated public' : ''
+          pushCandidate({
+            origin: specOrigin,
+            endpoint: label,
+            cue: op?.summary || `OpenAPI ${op?.operationId ?? label} on ${hostOfOrigin(specOrigin)}`,
+            extraText: `${op?.operationId ?? ''} ${authText}`,
+            baseScore: 60,
+          })
+        }
+      }
+    } catch { /* ignore non-JSON spec */ }
+  }
+
+  if (candidates.length < 2) return []
+
+  const composites: Array<{ label: string; category: string; hops: NormalizedRuntimeHopCandidate[]; resourceKey?: string; priority: number }> = []
+  const usedInPrior = new Set<string>()
+  const emittedKeySets: ReadonlySet<string>[] = []
+
+  const pick = (
+    predicate: (c: NormalizedRuntimeHopCandidate) => boolean,
+    exclude: ReadonlySet<string>,
+    anchor?: NormalizedRuntimeHopCandidate,
+  ): NormalizedRuntimeHopCandidate | undefined => {
+    const scored = candidates
+      .filter(c => !exclude.has(c.key) && predicate(c))
+      .map((c, idx) => {
+        let score = c.priorityScore
+        if (!usedInPrior.has(c.key)) score += 20
+        if (anchor && c.origin !== anchor.origin) score += 28
+        if (anchor && c.serviceScope !== anchor.serviceScope) score += 10
+        if (anchor && c.sinkKind !== anchor.sinkKind) score += 8
+        return { c, score, idx }
+      })
+      .sort((a, b) => (b.score - a.score) || (a.idx - b.idx))
+    return scored[0]?.c
+  }
+
+  const recordRuntimeComposite = (
+    label: string,
+    category: string,
+    hops: NormalizedRuntimeHopCandidate[],
+    resourceKey?: string,
+  ): void => {
+    if (composites.length >= maxSteps || hops.length < 2) return
+    const keySet = new Set(hops.map(h => h.key))
+    if (emittedKeySets.some(prev => [...keySet].every(k => prev.has(k)))) return
+    emittedKeySets.push(keySet)
+    for (const h of hops) usedInPrior.add(h.key)
+    composites.push({
+      label,
+      category,
+      hops,
+      ...(resourceKey ? { resourceKey } : {}),
+      priority: Math.max(96, 98 - composites.length),
+    })
+  }
+
+  // Pattern A: Outbound/SSRF/Proxy -> Signing/Webhook -> Privileged Mutation / Auth Session
+  {
+    const used = new Set<string>()
+    const entry = pick(c => c.roles.has('outbound_fetch'), used)
+    if (entry) {
+      used.add(entry.key)
+      const pivot = pick(c => c.roles.has('signing_webhook'), used, entry)
+      if (pivot) {
+        used.add(pivot.key)
+        const terminal = pick(c => c.roles.has('privileged_mutation') || c.roles.has('auth_session'), used, pivot)
+        const hops = terminal ? [entry, pivot, terminal] : [entry, pivot]
+        recordRuntimeComposite(
+          terminal ? 'Outbound/SSRF -> Signing/Webhook -> Terminal Impact' : 'Outbound/SSRF -> Signing/Webhook Pivot',
+          terminal ? 'broken-access-control' : 'auth-identity',
+          hops,
+        )
+      }
+    }
+  }
+
+  // Pattern B: Disclosure / Producer -> Auth/Session/IdP -> Privileged Mutation
+  if (composites.length < maxSteps) {
+    const used = new Set<string>()
+    const entry = pick(c => c.roles.has('info_disclosure') && c.sinkKind !== 'auth_config', used)
+      ?? pick(c => c.roles.has('info_disclosure') || Boolean(c.isApiDep), used)
+    if (entry) {
+      used.add(entry.key)
+      const authPivot = pick(c => c.roles.has('auth_session'), used, entry)
+      if (authPivot) {
+        used.add(authPivot.key)
+        const terminal = pick(c => c.roles.has('privileged_mutation') || c.roles.has('async_worker'), used, authPivot)
+        const hops = terminal ? [entry, authPivot, terminal] : [entry, authPivot]
+        recordRuntimeComposite(
+          terminal ? 'Disclosure -> Auth/Session -> Privileged Mutation' : 'Disclosure -> Auth/Session Pivot',
+          'broken-access-control',
+          hops,
+        )
+      }
+    }
+  }
+
+  // Pattern C: Cache/Permission or API Dependency Producer -> Async Export / Privileged Mutation
+  if (composites.length < maxSteps && depPairs.length > 0) {
+    const rankedDep = [...depPairs].sort((a, b) =>
+      Number(b.prod.origin !== b.cons.origin) - Number(a.prod.origin !== a.cons.origin)
+      || (b.prod.priorityScore + b.cons.priorityScore) - (a.prod.priorityScore + a.cons.priorityScore),
+    )[0]!
+    const used = new Set<string>([rankedDep.prod.key, rankedDep.cons.key])
+    const terminal = pick(
+      c => (c.origin !== rankedDep.cons.origin || c.roles.has('privileged_mutation') || c.roles.has('async_worker')),
+      used,
+      rankedDep.cons,
+    )
+    const hops = terminal ? [rankedDep.prod, rankedDep.cons, terminal] : [rankedDep.prod, rankedDep.cons]
+    recordRuntimeComposite(
+      `Producer -> Consumer (${rankedDep.resourceKey})${terminal ? ' -> Cross-Boundary Pivot' : ''}`,
+      'broken-access-control',
+      hops,
+      rankedDep.resourceKey,
+    )
+  }
+
+  // Pattern D (Cross-origin runtime fallback): >= 2 distinct approved origins with complementary roles/surfaces
+  if (composites.length < maxSteps) {
+    const distinctOrigins = [...new Set(candidates.map(c => c.origin))]
+    if (distinctOrigins.length >= 2) {
+      const used = new Set<string>()
+      const first = pick(
+        c => c.roles.has('auth_session') || c.roles.has('info_disclosure') || c.roles.has('outbound_fetch') || c.roles.size > 0,
+        used,
+      ) ?? pick(() => true, used)
+      if (first) {
+        used.add(first.key)
+        const second = pick(c => c.origin !== first.origin && (c.roles.size > 0 || c.sinkKind !== first.sinkKind), used, first)
+          ?? pick(c => c.origin !== first.origin, used, first)
+        if (second) {
+          used.add(second.key)
+          const third = pick(c => c.origin !== first.origin && c.origin !== second.origin, used, second)
+            ?? pick(c => c.roles.has('privileged_mutation') || c.roles.has('async_worker'), used, second)
+          const hops = third ? [first, second, third] : [first, second]
+          recordRuntimeComposite(
+            `Cross-Origin ${first.sinkKind} -> ${second.sinkKind}${third ? ` -> ${third.sinkKind}` : ''} Workflow`,
+            'broken-access-control',
+            hops,
+          )
+        }
+      }
+    }
+  }
+
+  const created: ChainStep[] = []
+  for (const comp of composites) {
+    if (created.length >= remainingCompositeBudget || totalSteps >= hardChainStepsCeiling) break
+    const sourceOrigins = [...new Set(comp.hops.map(h => h.origin))]
+    const distinctHosts = [...new Set(comp.hops.map(h => h.host))]
+    const hostSuffix = distinctHosts.length >= 2
+      ? `${distinctHosts[0]} -> ${distinctHosts[1]}`
+      : distinctHosts[0]!
+    const title = `${COMPOSITE_RUNTIME_TITLE_PREFIX} ${comp.label} (${hostSuffix})`.slice(0, 180)
+    if (existingTitles.has(title.toLowerCase())) continue
+
+    const hopEntries = comp.hops.map((h, idx) =>
+      `Hop ${idx + 1} / Stage ${idx + 1} (${h.endpoint}, ${h.origin}): ${compactSuspectCue(h.cue, 54)}`,
+    )
+    const compRoles = new Set(comp.hops.flatMap(h => [...h.roles]))
+    const helperHint = compRoles.has('concurrent_settlement')
+      ? 'ctx.prove_race_burst + ctx.seal_capability'
+      : compRoles.has('signing_webhook')
+        ? 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign'
+        : compRoles.has('async_worker') || compRoles.has('cache_permission')
+          ? 'ctx.seal_capability + ctx.await_async'
+          : 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign/ctx.await_async'
+    const intermediatePivotStage = comp.hops.length === 2
+      ? [`Stage 3 (pivot via ${helperHint})`]
+      : []
+    const terminalStage = 'Terminal Verification (denied control BEFORE Stage 1 -> final readback/state change -> ctx.prove_composite)'
+    const hopSequence = [...hopEntries, ...intermediatePivotStage, terminalStage].join(' -> ')
+    const stageCount = Math.min(5, Math.max(3, comp.hops.length + (comp.hops.length === 2 ? 2 : 1)))
+    const isCrossOrigin = sourceOrigins.length >= 2
+    const hasDep = Boolean(comp.resourceKey || comp.hops.some(h => h.isApiDep))
+    const tags: string[] = [`[chain_hops=${stageCount}]`, '[lane=chain]']
+    if (comp.resourceKey) tags.push(`api_dependency:${comp.resourceKey}`)
+    if (isCrossOrigin) tags.push(`cross_origin_edge:${sourceOrigins[0]}->${sourceOrigins[1]}`)
+    const hypothesis = [
+      `${tags.join(' ')} Composite workflow (${stageCount} stages): ${hopSequence}.`,
+      'Verify ALL stages in ONE kovo_verify script from ONE low-priv persona (never use a target-tenant persona on the probe arm): run clean denied control BEFORE Stage 1, seal via ctx.seal_capability, use ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst, and confirm via ctx.prove_composite (fresh_clean_replay) — never stop at an intermediate info-disclosure, job creation, cache prime, or token/link stub.',
+    ].join(' ')
+
+    const skills = [
+      ...new Set([
+        'multihop-chains',
+        'chain-primitives',
+        'runtime-composite-chain',
+        ...(isCrossOrigin ? ['cross-origin-chain'] : []),
+        ...(hasDep ? ['api-dependency'] : []),
+        ...comp.hops.flatMap(h => h.mappedSkills),
+      ]),
+    ]
+    const targetAssetIds = [...new Set(comp.hops.map(h => h.asset.id))]
+    const dependsOnFactIds = [
+      ...new Set(comp.hops.map(h => h.factId).filter((id): id is string => Boolean(id))),
+    ].slice(0, MAX_CODE_AUDIT_SIBLING_LEADS + 1)
+    const specialistProfile = routeStepToSpecialist({
+      title,
+      hypothesis: hopSequence,
+      category: comp.category,
+      skills,
+      endpoint: comp.hops[0]!.endpoint,
+      sinkKind: comp.hops[0]!.sinkKind,
+    })
+
+    const step = storage.addChainStep(run, {
+      title,
+      hypothesis,
+      category: comp.category,
+      priority: comp.priority,
+      targetAssetIds,
+      skills,
+      dependsOnFactIds,
+      sourceOrigins,
+      specialistProfile,
+    })
+    existingTitles.add(title.toLowerCase())
     created.push(step)
     totalSteps += 1
   }
