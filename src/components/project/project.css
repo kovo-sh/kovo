@@ -200,6 +200,10 @@
 .pw-btn.ghost:hover { background: var(--pw-hover); color: var(--pw-fg); }
 .pw-btn.danger { color: var(--pw-bad); }
 .pw-btn.danger:hover { background: var(--pw-bad-soft); color: var(--pw-bad); }
+.pw-btn.ghost.danger-hover { color: var(--pw-fg-3); }
+.pw-btn.ghost.danger-hover:hover { background: var(--pw-bad-soft); color: var(--pw-bad); }
+.pw-btn.danger-solid { background: var(--pw-bad); color: #ffffff; box-shadow: none; }
+.pw-btn.danger-solid:hover { filter: brightness(1.08); background: var(--pw-bad); }
 .pw-btn:disabled { opacity: 0.45; cursor: default; pointer-events: none; }
 
 .pw-tag {
@@ -277,6 +281,45 @@
   color: inherit; text-decoration: none; transition: background 120ms;
 }
 .pw-row-link:hover { background: var(--pw-hover); }
+.pw-run-row {
+  display: flex; align-items: center; gap: 4px;
+  border-bottom: 1px solid var(--pw-line);
+  transition: background 120ms;
+}
+.pw-run-row:hover { background: var(--pw-hover); }
+.pw-run-row .pw-row-link {
+  flex: 1; min-width: 0; border-bottom: 0;
+}
+.pw-run-row .pw-row-link:hover { background: transparent; }
+.pw-row-del {
+  flex: none;
+  width: 28px; height: 28px; padding: 0; margin-right: 4px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 6px; background: transparent; box-shadow: none;
+  color: var(--pw-fg-3); opacity: 0.55; cursor: pointer;
+  transition: background 120ms, color 120ms, opacity 120ms;
+}
+.pw-run-row:hover .pw-row-del,
+.pw-run-row:focus-within .pw-row-del,
+.pw-row-del:focus-visible { opacity: 1; }
+.pw-row-del:hover { background: var(--pw-bad-soft); color: var(--pw-bad); opacity: 1; }
+.pw-confirm-summary {
+  border: 1px solid var(--pw-line); border-radius: 8px;
+  background: var(--pw-sunk); padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.pw-confirm-goal {
+  font-weight: 500; font-size: 13px; color: var(--pw-fg);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.pw-confirm-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.pw-confirm-warn {
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 9px 11px; border-radius: 8px;
+  background: var(--pw-warn-soft); box-shadow: inset 0 0 0 1px var(--pw-warn-line);
+  color: var(--pw-fg); font-size: 12px; line-height: 17px;
+}
+.pw-confirm-warn .ico { color: var(--pw-warn); flex: none; margin-top: 2px; }
 .pw-row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .pw-row-title {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0;

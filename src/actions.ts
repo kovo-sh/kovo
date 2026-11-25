@@ -47,7 +47,11 @@ import {
 } from './server/persona-vault.ts'
 import { exportReportMarkdown } from './server/report-export.ts'
 import { exportReportSarif } from './server/sarif-export.ts'
-import { store } from './server/store.ts'
+import {
+  deleteProjectWithActiveGuard,
+  deleteRunWithActiveGuard,
+  store,
+} from './server/store.ts'
 import { readWorkerSession, testPersonaAuth } from './server/worker-session-reader.ts'
 
 export const workspaceData = createServerFn({ method: 'GET' }).handler(() => {
@@ -216,6 +220,13 @@ export const projectData = createServerFn({ method: 'GET' })
 
 export const createProject = createServerFn({ method: 'POST' }).validator(newProject)
   .handler(({ data }) => store().createProject(data))
+
+export const removeProject = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    projectId: id,
+    stopActive: z.boolean().optional(),
+  }))
+  .handler(({ data }) => deleteProjectWithActiveGuard(store(), execution(), getLabRunner(), data))
 
 export const addProjectAsset = createServerFn({ method: 'POST' }).validator(projectAsset)
   .handler(({ data }) => store().addProjectAsset(data))
@@ -432,6 +443,13 @@ export const runShellData = createServerFn({ method: 'GET' })
 
 export const createRun = createServerFn({ method: 'POST' }).validator(newRun)
   .handler(({ data }) => store().createRun(data))
+
+export const removeRun = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    runId: id,
+    stopActive: z.boolean().optional(),
+  }))
+  .handler(({ data }) => deleteRunWithActiveGuard(store(), execution(), getLabRunner(), data))
 
 export const commandRun = createServerFn({ method: 'POST' }).validator(runCommand)
   .handler(({ data }) => {

@@ -59,6 +59,7 @@ const P = {
   budget: '<circle cx="8" cy="8" r="5.75"/><path d="M9.75 6.1c-.35-.6-1-.95-1.75-.95-1 0-1.75.6-1.75 1.4 0 1.9 3.5 1 3.5 2.9 0 .8-.75 1.4-1.75 1.4-.8 0-1.45-.35-1.8-1M8 4v1.15M8 10.85V12"/>',
   sparkle: '<path d="M8 2.5v3M8 10.5v3M2.5 8h3M10.5 8h3"/>',
   panelR: '<rect x="2.25" y="2.75" width="11.5" height="10.5" rx="1.5"/><path d="M9.75 2.75v10.5"/>',
+  trash: '<path d="M2.75 4.25h10.5M6 4.25V3a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.25M4.25 4.25l.5 8.5a1 1 0 0 0 1 .95h4.5a1 1 0 0 0 1-.95l.5-8.5M6.75 7v4M9.25 7v4"/>',
 } as const
 
 export type IconName = keyof typeof P

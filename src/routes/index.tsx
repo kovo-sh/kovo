@@ -38,7 +38,7 @@ function CreateProjectSheet({
 }) {
   const navigate = useNavigate()
   const [environment, setEnvironment] = useState<'public' | 'local-lab'>('public')
-  const [includeSubdomains, setIncludeSubdomains] = useState(false)
+  const [includeSubdomains, setIncludeSubdomains] = useState(true)
   const [selectedRepos, setSelectedRepos] = useState<string[]>([])
   const [submitStatus, setSubmitStatus] = useState('')
   const action = useAction()
@@ -56,9 +56,9 @@ function CreateProjectSheet({
   }, [isModal, onClose, action.pending])
 
   const sheetContent = <form
-    className={isModal ? 'sh-modal-sheet' : 'sheet'}
+    className={isModal ? 'sh-modal-sheet cp-modal' : 'sheet cp-modal'}
     style={isModal ? {
-      width: 600,
+      width: 540,
       maxHeight: 'calc(100vh - 56px)',
       display: 'flex',
       flexDirection: 'column',
@@ -66,11 +66,11 @@ function CreateProjectSheet({
     } : undefined}
     role={isModal ? 'dialog' : undefined}
     aria-modal={isModal ? 'true' : undefined}
-    aria-label={isModal ? 'Create a project' : undefined}
+    aria-label={isModal ? 'New project' : undefined}
     onSubmit={event => {
       event.preventDefault()
       const form = new FormData(event.currentTarget)
-      const nextEnv = form.get('environment') === 'local-lab' ? 'local-lab' as const : 'public' as const
+      const nextEnv = environment
       const reposToSync = selectedRepos.slice(0, 20)
       setSubmitStatus('Creating project…')
       void action.submit(async () => {
@@ -92,7 +92,8 @@ function CreateProjectSheet({
         return project
       }, async project => {
         setSubmitStatus('')
-        setIncludeSubdomains(false)
+        setEnvironment('public')
+        setIncludeSubdomains(true)
         setSelectedRepos([])
         onClose()
         await navigate({ to: '/projects/$projectId', params: { projectId: project.id } })
@@ -101,8 +102,7 @@ function CreateProjectSheet({
   >
     <div className="sheet-h" style={isModal ? { flex: 'none' } : undefined}>
       <Icon name="plus" />
-      <span>Create a project</span>
-      <span className="muted">Define authorized seed hosts</span>
+      <span>New project</span>
       {isModal && <button
         type="button"
         className="sh-icon-btn sh-sheet-close"
@@ -115,52 +115,37 @@ function CreateProjectSheet({
     </div>
 
     <div
-      className="sh-sheet-body"
+      className="sh-sheet-body cp-body"
       style={isModal ? { flex: '1 1 auto', minHeight: 0, overflowY: 'auto' } : undefined}
     >
-      <label>
-        Project name
-        <Input name="name" placeholder="Product website" required maxLength={160} autoFocus={isModal} />
+      <label className="cp-field">
+        <span>Project name</span>
+        <Input name="name" placeholder="Acme Web" required maxLength={160} autoFocus={isModal} />
       </label>
 
-      <label>
-        Primary target URL / seed hosts
-        <Textarea name="seeds" rows={2} placeholder={'example.com\ndocs.example.com'} required />
-        <span className="muted">Enter up to 100 related hosts you own or have written authorization to assess.</span>
-      </label>
+      <div className="cp-sites-group">
+        <label className="cp-field">
+          <span>Sites</span>
+          <Textarea
+            name="seeds"
+            rows={2}
+            placeholder={'https://app.example.com'}
+            required
+          />
+        </label>
 
-      <label>
-        Target environment
-        <NativeSelect name="environment" value={environment} onChange={e => {
-          const next = e.target.value === 'local-lab' ? 'local-lab' : 'public'
-          setEnvironment(next)
-          if (next !== 'public') setIncludeSubdomains(false)
-        }}>
-          <option value="public">Public website (HTTPS only)</option>
-          <option value="local-lab">Local Lab (localhost or private staging, when enabled)</option>
-        </NativeSelect>
-        <span
-          className="muted"
-          title="Requires server-side GUARDIAN_ALLOW_LOCAL_LAB=1 to allow localhost or private-network targets."
-        >
-          Local lab targets (localhost or private network addresses) are blocked by default unless enabled on the server.
-        </span>
-      </label>
-
-      {environment === 'public' && <div className="field-grid">
-        <label className="checkbox">
+        <label className={`checkbox cp-subdomains-row${environment !== 'public' ? ' disabled' : ''}`}>
           <Checkbox
             name="includeSubdomains"
-            checked={includeSubdomains}
-            aria-label="Include subdomains (*.domain)"
+            checked={environment === 'public' ? includeSubdomains : false}
+            disabled={environment !== 'public' || action.pending}
+            aria-label="Include subdomains"
             onCheckedChange={checked => setIncludeSubdomains(Boolean(checked))}
           />
-          <span>Include subdomains (<code>*.domain</code>)</span>
+          <span>Include subdomains</span>
+          <code className="cp-subdomains-code">*.domain</code>
         </label>
-        <span className="sh-hint">
-          Discovers your live subdomains automatically before testing begins. Third-party hosted services (such as GitBook, Webflow, Shopify, or Zendesk) stay excluded unless you explicitly approve them.
-        </span>
-      </div>}
+      </div>
 
       <CreateProjectGithubBlock
         initialPatStatus={githubPatStatus}
@@ -169,13 +154,36 @@ function CreateProjectSheet({
         disabled={action.pending}
       />
 
+      <details className="cp-advanced">
+        <summary className="cp-advanced-summary">
+          <span>Advanced configuration</span>
+          {environment === 'local-lab' && <span className="tag warn">Local lab</span>}
+        </summary>
+        <div className="cp-advanced-body">
+          <label className="cp-field">
+            <span>Target environment</span>
+            <NativeSelect
+              name="environment"
+              value={environment}
+              onChange={e => {
+                const next = e.target.value === 'local-lab' ? 'local-lab' : 'public'
+                setEnvironment(next)
+                if (next !== 'public') setIncludeSubdomains(false)
+                else setIncludeSubdomains(true)
+              }}
+            >
+              <option value="public">Public website</option>
+              <option value="local-lab">Local lab (localhost / private staging)</option>
+            </NativeSelect>
+          </label>
+        </div>
+      </details>
+
       <FormError error={action.error} />
     </div>
 
     <div className="sheet-f" style={isModal ? { flex: 'none' } : undefined}>
-      <span className="muted">
-        {submitStatus || 'All hosts stay blocked by default until you approve scope.'}
-      </span>
+      {submitStatus && <span className="muted">{submitStatus}</span>}
       {canCancel && <Button type="button" disabled={action.pending} onClick={onClose}>Cancel</Button>}
       <Button type="submit" variant="default" disabled={action.pending}>
         {submitStatus || (selectedRepos.length > 0 ? `Create & sync (${selectedRepos.length})` : 'Create project')}

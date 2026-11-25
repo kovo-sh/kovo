@@ -1,4 +1,7 @@
-import { Link } from '@tanstack/react-router'
+import { Link, useRouter } from '@tanstack/react-router'
+import { useEffect, useState } from 'react'
+import { removeRun } from '../../actions.ts'
+import { Icon } from '../run/icons.tsx'
 import { formatFullDateTime, formatRelativeTime, useNow } from '../shell/AppShell.tsx'
 import { formatUsd, phaseNames } from '../run-state.ts'
 import type { ProjectLoaderData, ProjectTabId } from './types.ts'
@@ -167,13 +170,46 @@ function AllowlistSetupSvg({ ready }: { ready: boolean }) {
 
 export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
   const { project, assets, personas, specs, runs, githubPatStatus } = data
+  const router = useRouter()
   const now = useNow()
+  const [runToDelete, setRunToDelete] = useState<ProjectLoaderData['runs'][number] | null>(null)
+  const [deletingRun, setDeletingRun] = useState(false)
+  const [deleteError, setDeleteError] = useState('')
   const latestRun = runs[0]
   const completedRuns = runs.filter(r => r.status === 'complete').length
   const activeRuns = runs.filter(r => r.status === 'running' || r.status === 'waiting' || r.status === 'paused' || r.status === 'budget_paused').length
   const wildcardCount = assets.filter(a => a.includeSubdomains && !a.thirdParty).length
   const thirdPartyCount = assets.filter(a => a.thirdParty).length
   const allowlistCount = (project.sandboxWriteAllowlist ?? []).length
+
+  useEffect(() => {
+    if (!runToDelete) return
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !deletingRun) {
+        e.preventDefault()
+        setRunToDelete(null)
+        setDeleteError('')
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [runToDelete, deletingRun])
+
+  async function confirmDeleteRun() {
+    if (!runToDelete || deletingRun) return
+    const isActive = runToDelete.status === 'running'
+    setDeletingRun(true)
+    setDeleteError('')
+    try {
+      await removeRun({ data: { runId: runToDelete.id, stopActive: isActive } })
+      setRunToDelete(null)
+      await router.invalidate()
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : 'Could not delete the run.')
+    } finally {
+      setDeletingRun(false)
+    }
+  }
 
   const postureHeadline = runs.length === 0
     ? `Ready for your first assessment across ${plural(assets.length, 'host')}`
@@ -274,29 +310,46 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
       {runs.length > 0 ? (
         <div className="pw-table-wrap">
           {runs.map(run => (
-            <Link key={run.id} to="/runs/$runId" params={{ runId: run.id }} className="pw-row-link">
-              <span className="pw-dot" data-status={run.status} aria-hidden="true" />
-              <span className="pw-row-main">
-                <span className="pw-row-title">
-                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{run.goal}</span>
+            <div key={run.id} className="pw-run-row">
+              <Link to="/runs/$runId" params={{ runId: run.id }} className="pw-row-link">
+                <span className="pw-dot" data-status={run.status} aria-hidden="true" />
+                <span className="pw-row-main">
+                  <span className="pw-row-title">
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{run.goal}</span>
+                  </span>
+                  <span className="pw-row-sub num">
+                    {RUN_MODE_LABEL[run.capabilityTier] ?? 'Standard'} · {phaseNames[run.phase]}
+                    {run.findingCount > 0 ? ` · ${plural(run.findingCount, 'finding')}` : ''}
+                    {run.confirmedCount > 0 ? ` (${run.confirmedCount} confirmed)` : ''}
+                    {' '}· {run.turnsUsed} turns · {run.spentRequests} reqs · {formatUsd(run.spentUsd)}
+                  </span>
                 </span>
-                <span className="pw-row-sub num">
-                  {RUN_MODE_LABEL[run.capabilityTier] ?? 'Standard'} · {phaseNames[run.phase]} · {run.turnsUsed} turns · {run.spentRequests} reqs · {formatUsd(run.spentUsd)}
+                <span className="pw-row-right">
+                  <span className="pw-tag solid" style={{ textTransform: 'capitalize' }}>{run.status.replaceAll('_', ' ')}</span>
+                  <time
+                    className="muted num"
+                    style={{ fontSize: 12 }}
+                    dateTime={new Date(run.createdAt).toISOString()}
+                    title={formatFullDateTime(run.createdAt)}
+                    suppressHydrationWarning
+                  >
+                    {formatRelativeTime(run.createdAt, { compact: false, now })}
+                  </time>
                 </span>
-              </span>
-              <span className="pw-row-right">
-                <span className="pw-tag solid" style={{ textTransform: 'capitalize' }}>{run.status.replaceAll('_', ' ')}</span>
-                <time
-                  className="muted num"
-                  style={{ fontSize: 12 }}
-                  dateTime={new Date(run.createdAt).toISOString()}
-                  title={formatFullDateTime(run.createdAt)}
-                  suppressHydrationWarning
-                >
-                  {formatRelativeTime(run.createdAt, { compact: false, now })}
-                </time>
-              </span>
-            </Link>
+              </Link>
+              <button
+                type="button"
+                className="pw-row-del"
+                title="Delete run"
+                aria-label={`Delete run: ${run.goal}`}
+                onClick={() => {
+                  setDeleteError('')
+                  setRunToDelete(run)
+                }}
+              >
+                <Icon name="trash" size={14} />
+              </button>
+            </div>
           ))}
         </div>
       ) : (
@@ -308,5 +361,90 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
         </div>
       )}
     </section>
+
+    {runToDelete && (() => {
+      const isActive = runToDelete.status === 'running'
+      return (
+        <div
+          className="pw-overlay"
+          onMouseDown={e => {
+            if (e.target === e.currentTarget && !deletingRun) {
+              setRunToDelete(null)
+              setDeleteError('')
+            }
+          }}
+        >
+          <div
+            className="pw-modal"
+            style={{ width: 460 }}
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="pw-del-run-title"
+          >
+            <div className="pw-modal-hdr">
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                <Icon name="trash" size={15} style={{ color: 'var(--pw-bad)' }} />
+                <span id="pw-del-run-title">{isActive ? 'Stop & delete run' : 'Delete run'}</span>
+              </span>
+              <button
+                type="button"
+                className="pw-btn ghost"
+                style={{ padding: '0 6px' }}
+                disabled={deletingRun}
+                onClick={() => { setRunToDelete(null); setDeleteError('') }}
+                aria-label="Close"
+              >
+                <Icon name="close" size={14} />
+              </button>
+            </div>
+            <div className="pw-modal-body">
+              <p className="dim" style={{ margin: 0, fontSize: 12.5 }}>
+                Permanently remove this run and all of its findings, HTTP traffic, reports, and artifacts. This cannot be undone.
+              </p>
+              <div className="pw-confirm-summary">
+                <div className="pw-confirm-goal" title={runToDelete.goal}>{runToDelete.goal}</div>
+                <div className="pw-confirm-meta num">
+                  <span className="pw-tag solid" style={{ textTransform: 'capitalize' }}>
+                    <span className="pw-dot" data-status={runToDelete.status} />
+                    {runToDelete.status.replaceAll('_', ' ')}
+                  </span>
+                  <span className="pw-tag solid">
+                    {plural(runToDelete.findingCount, 'finding')}
+                    {runToDelete.confirmedCount > 0 ? ` (${runToDelete.confirmedCount} confirmed)` : ''}
+                  </span>
+                  <span className="pw-tag solid">{runToDelete.spentRequests} req · {formatUsd(runToDelete.spentUsd)}</span>
+                </div>
+              </div>
+              {isActive && (
+                <div className="pw-confirm-warn" role="status">
+                  <Icon name="alert" size={14} />
+                  <span>This run is currently running. Confirming will stop active workers and clean up containers before deleting.</span>
+                </div>
+              )}
+              {deleteError && <p className="err" role="alert" style={{ margin: 0 }}>{deleteError}</p>}
+            </div>
+            <div className="pw-modal-ftr">
+              <button
+                type="button"
+                className="pw-btn ghost"
+                disabled={deletingRun}
+                onClick={() => { setRunToDelete(null); setDeleteError('') }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="pw-btn danger-solid"
+                disabled={deletingRun}
+                onClick={() => void confirmDeleteRun()}
+              >
+                <Icon name="trash" size={13} />
+                {deletingRun ? (isActive ? 'Stopping & deleting…' : 'Deleting…') : (isActive ? 'Stop & delete run' : 'Delete run')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )
+    })()}
   </>
 }

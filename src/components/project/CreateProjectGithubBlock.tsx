@@ -6,6 +6,7 @@ import {
   saveGithubToken,
   startGithubDeviceFlowAction,
 } from '../../actions.ts'
+import { Icon } from '../run/icons.tsx'
 import { Checkbox } from '../ui/checkbox.tsx'
 import { Input } from '../ui/input.tsx'
 import type { DiscoveredGithubRepo } from './types.ts'
@@ -38,14 +39,9 @@ interface Props {
 
 const MAX_SYNC_REPOS = 20
 
-function patKindTag(status: GithubPatStatusSummary): string {
-  if (status.authKind === 'github_app_device') {
-    return status.login ? `GitHub App · @${status.login}` : 'GitHub App'
-  }
-  if (status.tokenKind === 'fine_grained') return 'Read-only token'
-  if (status.tokenKind === 'classic') return 'Classic token'
-  if (status.tokenKind === 'github_app') return 'GitHub App'
-  return 'GitHub token'
+function connectionBadge(status: GithubPatStatusSummary): string {
+  if (status.login) return `@${status.login}`
+  return 'Connected'
 }
 
 async function copyText(text: string): Promise<boolean> {
@@ -56,6 +52,79 @@ async function copyText(text: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+/** Theme-aware repo + code-branch + security lens illustration (light & dark). */
+function GithubBannerSvg({ connected }: { connected: boolean }) {
+  const accent = connected ? 'var(--ok)' : 'var(--accent)'
+  const accentSoft = connected ? 'var(--ok-soft)' : 'var(--accent-soft)'
+  const accentLine = connected
+    ? 'color-mix(in srgb, var(--ok) 45%, transparent)'
+    : 'var(--accent-line)'
+  return (
+    <svg
+      className="cp-gh-art"
+      width="58"
+      height="44"
+      viewBox="0 0 58 44"
+      fill="none"
+      aria-hidden="true"
+    >
+      {/* Repository code card */}
+      <rect
+        x="1"
+        y="3"
+        width="40"
+        height="34"
+        rx="7"
+        fill="var(--panel)"
+        stroke="var(--line-2)"
+        strokeWidth="1.25"
+      />
+      {/* Window header bar */}
+      <path d="M1.6 11.5H40.4" stroke="var(--line)" strokeWidth="1.1" />
+      <circle cx="7" cy="7.5" r="1.4" fill="var(--fg-4)" />
+      <circle cx="11.5" cy="7.5" r="1.4" fill="var(--fg-4)" />
+      <circle cx="16" cy="7.5" r="1.4" fill="var(--fg-4)" />
+
+      {/* Git branch graph inside repo card */}
+      <circle cx="11.5" cy="18.5" r="2.2" fill="var(--panel)" stroke="currentColor" strokeWidth="1.4" />
+      <circle cx="11.5" cy="30" r="2.2" fill="var(--panel)" stroke="currentColor" strokeWidth="1.4" />
+      <circle cx="21.5" cy="21" r="2.2" fill={accent} />
+      <path d="M11.5 20.7V27.8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      <path d="M11.5 27.8C11.5 24.4 21.5 25.2 21.5 23.2" stroke={accent} strokeWidth="1.4" strokeLinecap="round" />
+
+      {/* Subtle code lines */}
+      <rect x="27" y="17.5" width="9" height="2.4" rx="1.2" fill="var(--line-strong)" />
+      <rect x="27" y="23" width="7" height="2.4" rx="1.2" fill="var(--line-2)" />
+      <rect x="27" y="28.5" width="8.5" height="2.4" rx="1.2" fill="var(--line-2)" />
+
+      {/* Overlapping shield / security magnifier badge */}
+      <circle
+        cx="43"
+        cy="28"
+        r="12.5"
+        fill="var(--panel)"
+        stroke={accentLine}
+        strokeWidth="1.35"
+      />
+      <circle cx="43" cy="28" r="10" fill={accentSoft} />
+      {connected ? (
+        <path
+          d="M38.8 28.2L41.6 31L47.4 25.1"
+          stroke={accent}
+          strokeWidth="1.9"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      ) : (
+        <>
+          <circle cx="41.8" cy="26.8" r="4.1" stroke={accent} strokeWidth="1.65" />
+          <path d="M44.9 29.9L47.8 32.8" stroke={accent} strokeWidth="1.75" strokeLinecap="round" />
+        </>
+      )}
+    </svg>
+  )
 }
 
 export function CreateProjectGithubBlock({
@@ -243,7 +312,7 @@ export function CreateProjectGithubBlock({
       setSearch('')
       onChangeSelectedRepos(result.repos.length === 1 ? [result.repos[0]!.fullName] : [])
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not save GitHub token.')
+      setError(err instanceof Error ? err.message : 'Could not connect GitHub.')
     } finally {
       setSavingToken(false)
     }
@@ -260,317 +329,258 @@ export function CreateProjectGithubBlock({
   }
 
   if (!patStatus.configured) {
-    return <div
-      style={{
-        borderTop: '1px solid var(--line)',
-        paddingTop: 11,
-        display: 'grid',
-        gap: 8,
-      }}
-    >
-      <button
-        type="button"
-        onClick={() => { setExpandedConnect(v => !v); setError('') }}
-        aria-expanded={expandedConnect}
-        disabled={disabled}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 6,
-          width: '100%',
-          padding: '2px 0',
-          border: 0,
-          background: 'transparent',
-          color: 'var(--fg-2)',
-          fontSize: 12.5,
-          fontWeight: 500,
-          textAlign: 'left',
-          cursor: 'pointer',
-          boxShadow: 'none',
-        }}
-      >
-        <span style={{ color: 'var(--fg-3)', display: 'inline-block', transform: expandedConnect ? 'rotate(90deg)' : 'none', transition: 'transform 140ms' }}>▸</span>
-        <span>Connect GitHub for source code &amp; dependency context</span>
-        <span className="tag solid" style={{ marginLeft: 'auto' }}>Optional</span>
-      </button>
+    return (
+      <div className={`cp-gh-card${expandedConnect ? ' open' : ''}`}>
+        <button
+          type="button"
+          className="cp-gh-banner"
+          onClick={() => {
+            setExpandedConnect(v => !v)
+            setError('')
+          }}
+          aria-expanded={expandedConnect}
+          disabled={disabled}
+        >
+          <GithubBannerSvg connected={false} />
+          <span className="cp-gh-copy">
+            <span className="cp-gh-title-row">
+              <strong>Connect GitHub</strong>
+              <span className="cp-gh-rec-badge">Recommended</span>
+            </span>
+            <span className="cp-gh-sub">
+              Add source code to find deeper vulnerabilities
+            </span>
+          </span>
+          <span className="cp-gh-chev" aria-hidden="true">
+            <Icon name={expandedConnect ? 'chevU' : 'chevR'} size={14} />
+          </span>
+        </button>
 
-      {expandedConnect && <div
-        style={{
-          border: '1px solid var(--line)',
-          borderRadius: 8,
-          background: 'var(--sunk)',
-          padding: '10px 12px',
-          display: 'grid',
-          gap: 10,
-        }}
-      >
-        {!deviceFlow ? (
-          <div style={{ display: 'grid', gap: 8 }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
-              <span
-                style={{ fontSize: 12, color: 'var(--fg-2)' }}
-                title="Uses GitHub App Device Flow with automatic token refresh in an owner-only (0600) local credential file"
-              >
-                Sign in with a read-only GitHub App (tokens refresh automatically and stay stored privately on your machine).
-              </span>
-              {patStatus.githubDeviceFlowConfigured && (
-                <button
-                  type="button"
-                  className="btn primary"
-                  disabled={startingDeviceFlow || savingToken || disabled}
-                  onClick={() => void handleStartDeviceFlow()}
+        {expandedConnect && (
+          <div className="cp-gh-panel">
+            {!deviceFlow ? (
+              <div className="cp-gh-flow-row">
+                {patStatus.githubDeviceFlowConfigured ? (
+                  <button
+                    type="button"
+                    className="btn primary"
+                    disabled={startingDeviceFlow || savingToken || disabled}
+                    onClick={() => void handleStartDeviceFlow()}
+                  >
+                    {startingDeviceFlow ? 'Starting…' : 'Sign in with GitHub'}
+                  </button>
+                ) : (
+                  <div className="cp-gh-input-row">
+                    <Input
+                      type="text"
+                      value={clientIdInput}
+                      onChange={e => { setClientIdInput(e.target.value); setError('') }}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault()
+                          void handleStartDeviceFlow()
+                        }
+                      }}
+                      placeholder="GitHub App Client ID"
+                      autoComplete="off"
+                      disabled={startingDeviceFlow || savingToken || disabled}
+                      aria-label="GitHub App Client ID"
+                      style={{ flex: 1 }}
+                    />
+                    <button
+                      type="button"
+                      className="btn primary"
+                      disabled={startingDeviceFlow || savingToken || disabled || clientIdInput.trim().length < 6}
+                      onClick={() => void handleStartDeviceFlow()}
+                    >
+                      {startingDeviceFlow ? 'Starting…' : 'Sign in'}
+                    </button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="cp-gh-device">
+                <div className="cp-gh-code-row">
+                  <span className="cp-gh-code mono">{deviceFlow.userCode}</span>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => void copyText(deviceFlow.userCode).then(ok => setCodeCopied(ok))}
+                  >
+                    {codeCopied ? 'Copied' : 'Copy code'}
+                  </button>
+                  <a
+                    className="btn primary"
+                    href={deviceFlow.verificationUri}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Open GitHub ↗
+                  </a>
+                </div>
+                <div className="cp-gh-poll-row">
+                  <span role="status" className="muted num">
+                    Waiting for approval…
+                  </span>
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    onClick={() => void handleCancelDeviceFlow()}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {error && <p role="alert" className="cp-gh-err">{error}</p>}
+
+            <details className="cp-gh-alt">
+              <summary>Or connect with an access token</summary>
+              <div className="cp-gh-alt-body">
+                <div className="cp-gh-input-row">
+                  <Input
+                    type="password"
+                    value={tokenInput}
+                    onChange={e => setTokenInput(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault()
+                        void handleSaveToken()
+                      }
+                    }}
+                    placeholder="Paste read-only GitHub token"
+                    autoComplete="off"
+                    disabled={savingToken || disabled}
+                    aria-label="Read-only GitHub access token"
+                    style={{ flex: 1 }}
+                  />
+                  <button
+                    type="button"
+                    className="btn primary"
+                    disabled={savingToken || disabled || tokenInput.trim().length < 10}
+                    onClick={() => void handleSaveToken()}
+                  >
+                    {savingToken ? 'Connecting…' : 'Connect'}
+                  </button>
+                </div>
+                <a
+                  className="cp-gh-token-link"
+                  href="https://github.com/settings/personal-access-tokens/new"
+                  target="_blank"
+                  rel="noopener noreferrer"
                 >
-                  {startingDeviceFlow ? 'Starting…' : 'Sign in with GitHub'}
-                </button>
-              )}
-            </div>
-            {!patStatus.githubDeviceFlowConfigured && (
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  Create a read-only token on GitHub ↗
+                </a>
+              </div>
+            </details>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div className="cp-gh-card connected">
+      <div className="cp-gh-connected-head">
+        <GithubBannerSvg connected={true} />
+        <div className="cp-gh-copy">
+          <div className="cp-gh-title-row">
+            <strong>GitHub repositories</strong>
+            <span className="tag ok">{connectionBadge(patStatus)}</span>
+            {selectedRepos.length > 0 && (
+              <span className="tag accent num">{selectedRepos.length} selected</span>
+            )}
+          </div>
+          <span className="cp-gh-sub">
+            Select repos to include in security analysis
+          </span>
+        </div>
+        <button
+          type="button"
+          className="btn ghost"
+          disabled={loadingRepos || disabled}
+          onClick={() => void handleRefresh()}
+        >
+          {loadingRepos ? 'Loading…' : 'Refresh'}
+        </button>
+      </div>
+
+      <div className="cp-gh-panel">
+        {loadingRepos && !reposLoaded ? (
+          <span className="muted">Loading repositories…</span>
+        ) : error ? (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+            <span role="alert" className="cp-gh-err">{error}</span>
+            <button type="button" className="btn ghost" onClick={() => void handleRefresh()}>Retry</button>
+          </div>
+        ) : repos.length === 0 ? (
+          <span className="muted">No repositories found. You can sync repos later in the project.</span>
+        ) : (
+          <>
+            {repos.length > 1 && (
+              <div className="cp-gh-input-row">
                 <Input
-                  type="text"
-                  value={clientIdInput}
-                  onChange={e => { setClientIdInput(e.target.value); setError('') }}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault()
-                      void handleStartDeviceFlow()
-                    }
-                  }}
-                  placeholder="GitHub App Client ID (e.g. Iv23li…)"
-                  autoComplete="off"
-                  disabled={startingDeviceFlow || savingToken || disabled}
-                  aria-label="GitHub App Client ID"
-                  style={{ flex: 1 }}
+                  type="search"
+                  value={search}
+                  onChange={e => setSearch(e.target.value)}
+                  placeholder="Filter repositories…"
+                  aria-label="Filter GitHub repositories"
+                  disabled={disabled}
+                  style={{ flex: 1, minWidth: 150 }}
                 />
                 <button
                   type="button"
-                  className="btn primary"
-                  disabled={startingDeviceFlow || savingToken || disabled || clientIdInput.trim().length < 6}
-                  onClick={() => void handleStartDeviceFlow()}
+                  className="btn ghost"
+                  disabled={disabled || filteredRepos.length === 0}
+                  onClick={() => onChangeSelectedRepos(filteredRepos.slice(0, MAX_SYNC_REPOS).map(r => r.fullName))}
                 >
-                  {startingDeviceFlow ? 'Starting…' : 'Sign in with GitHub'}
+                  Select all
                 </button>
+                {selectedRepos.length > 0 && (
+                  <button
+                    type="button"
+                    className="btn ghost"
+                    disabled={disabled}
+                    onClick={() => onChangeSelectedRepos([])}
+                  >
+                    Clear
+                  </button>
+                )}
               </div>
             )}
-          </div>
-        ) : (
-          <div style={{ display: 'grid', gap: 8 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-              <span
-                className="mono"
-                style={{
-                  fontSize: 16,
-                  fontWeight: 600,
-                  letterSpacing: '0.12em',
-                  padding: '4px 10px',
-                  borderRadius: 6,
-                  background: 'var(--panel)',
-                  border: '1px solid var(--line-2)',
-                  userSelect: 'all',
-                }}
-              >
-                {deviceFlow.userCode}
-              </span>
-              <button
-                type="button"
-                className="btn"
-                onClick={() => void copyText(deviceFlow.userCode).then(ok => setCodeCopied(ok))}
-              >
-                {codeCopied ? 'Copied code' : 'Copy code'}
-              </button>
-              <a
-                className="btn primary"
-                href={deviceFlow.verificationUri}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                Open GitHub verification ↗
-              </a>
+
+            <div className="cp-gh-repo-list" role="group" aria-label="Accessible GitHub repositories">
+              {filteredRepos.length === 0 ? (
+                <div className="cp-gh-repo-empty">No repositories match “{search.trim()}”.</div>
+              ) : filteredRepos.map((repo, idx) => {
+                const checked = selectedRepos.includes(repo.fullName)
+                const atCap = !checked && selectedRepos.length >= MAX_SYNC_REPOS
+                return (
+                  <label
+                    key={repo.fullName}
+                    className={`checkbox cp-gh-repo-item${checked ? ' on' : ''}`}
+                    style={{
+                      borderTop: idx === 0 ? 'none' : '1px solid var(--line)',
+                      cursor: atCap || disabled ? 'default' : 'pointer',
+                      opacity: atCap ? 0.55 : 1,
+                    }}
+                  >
+                    <Checkbox
+                      checked={checked}
+                      disabled={disabled || atCap}
+                      aria-label={`Select repository ${repo.fullName}`}
+                      onCheckedChange={next => toggleRepo(repo.fullName, Boolean(next))}
+                    />
+                    <span className="mono cp-gh-repo-name">{repo.fullName}</span>
+                    <span className="tag solid">{repo.private ? 'private' : 'public'}</span>
+                  </label>
+                )
+              })}
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, fontSize: 12, color: 'var(--fg-2)' }}>
-              <span role="status" className="num">
-                Waiting for GitHub approval… polling every {deviceFlow.intervalSec}s
-              </span>
-              <button
-                type="button"
-                className="btn ghost"
-                onClick={() => void handleCancelDeviceFlow()}
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
+          </>
         )}
-
-        {error && <p role="alert" style={{ margin: 0, color: 'var(--bad)', fontSize: 12 }}>{error}</p>}
-
-        <details style={{ borderTop: '1px solid var(--line)', paddingTop: 8 }}>
-          <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--fg-2)', fontWeight: 500 }}>
-            Or connect with a read-only GitHub token
-          </summary>
-          <div style={{ display: 'grid', gap: 8, marginTop: 8 }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
-              <span style={{ fontSize: 12, color: 'var(--fg-2)' }}>
-                Choose <b>Only select repositories</b> → <b>Contents: Read-only</b> → Generate &amp; paste.
-              </span>
-              <a
-                className="btn"
-                href="https://github.com/settings/personal-access-tokens/new"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                Create read-only token ↗
-              </a>
-            </div>
-            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-              <Input
-                type="password"
-                value={tokenInput}
-                onChange={e => setTokenInput(e.target.value)}
-                onKeyDown={e => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault()
-                    void handleSaveToken()
-                  }
-                }}
-                placeholder="github_pat_…"
-                autoComplete="off"
-                disabled={savingToken || disabled}
-                aria-label="Read-only GitHub access token"
-                style={{ flex: 1 }}
-              />
-              <button
-                type="button"
-                className="btn primary"
-                disabled={savingToken || disabled || tokenInput.trim().length < 10}
-                onClick={() => void handleSaveToken()}
-              >
-                {savingToken ? 'Connecting…' : 'Save & discover'}
-              </button>
-            </div>
-          </div>
-        </details>
-
-        <span className="sh-hint" title="Saved locally in an owner-only (0600) credential file">
-          Stored privately on your machine and never shown again.
-        </span>
-      </div>}
-    </div>
-  }
-
-  return <div
-    style={{
-      borderTop: '1px solid var(--line)',
-      paddingTop: 11,
-      display: 'grid',
-      gap: 8,
-    }}
-  >
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-      <span style={{ fontSize: 12.5, fontWeight: 500, color: 'var(--fg)' }}>
-        Source repositories (GitHub, read-only)
-      </span>
-      <span className="tag ok">{patKindTag(patStatus)}</span>
-      <span className="tag solid">Optional</span>
-      <button
-        type="button"
-        className="btn ghost"
-        style={{ marginLeft: 'auto' }}
-        disabled={loadingRepos || disabled}
-        onClick={() => void handleRefresh()}
-      >
-        {loadingRepos ? 'Loading…' : 'Refresh'}
-      </button>
-    </div>
-
-    {loadingRepos && !reposLoaded ? (
-      <span className="sh-hint">Discovering accessible GitHub repositories…</span>
-    ) : error ? (
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-        <span role="alert" style={{ color: 'var(--bad)', fontSize: 12 }}>{error}</span>
-        <button type="button" className="btn ghost" onClick={() => void handleRefresh()}>Retry</button>
       </div>
-    ) : repos.length === 0 ? (
-      <span className="sh-hint">No repositories returned for this connection. You can still create the project and sync repos later.</span>
-    ) : <>
-      {repos.length > 1 && <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-        <Input
-          type="search"
-          value={search}
-          onChange={e => setSearch(e.target.value)}
-          placeholder="Filter repositories…"
-          aria-label="Filter GitHub repositories"
-          disabled={disabled}
-          style={{ flex: 1, minWidth: 160 }}
-        />
-        <button
-          type="button"
-          className="btn ghost"
-          disabled={disabled || filteredRepos.length === 0}
-          onClick={() => onChangeSelectedRepos(filteredRepos.slice(0, MAX_SYNC_REPOS).map(r => r.fullName))}
-        >
-          Select all
-        </button>
-        <button
-          type="button"
-          className="btn ghost"
-          disabled={disabled || selectedRepos.length === 0}
-          onClick={() => onChangeSelectedRepos([])}
-        >
-          Clear
-        </button>
-      </div>}
-
-      <div
-        role="group"
-        aria-label="Accessible GitHub repositories"
-        style={{
-          maxHeight: 168,
-          overflowY: 'auto',
-          border: '1px solid var(--line)',
-          borderRadius: 8,
-          background: 'var(--sunk)',
-        }}
-      >
-        {filteredRepos.length === 0 ? (
-          <div style={{ padding: '10px 12px', color: 'var(--fg-3)', fontSize: 12 }}>
-            No repositories match “{search.trim()}”.
-          </div>
-        ) : filteredRepos.map((repo, idx) => {
-          const checked = selectedRepos.includes(repo.fullName)
-          const atCap = !checked && selectedRepos.length >= MAX_SYNC_REPOS
-          return <label
-            key={repo.fullName}
-            className="checkbox"
-            style={{
-              padding: '7px 10px',
-              margin: 0,
-              borderTop: idx === 0 ? 'none' : '1px solid var(--line)',
-              cursor: atCap || disabled ? 'default' : 'pointer',
-              opacity: atCap ? 0.55 : 1,
-              background: checked ? 'var(--accent-soft)' : 'transparent',
-            }}
-          >
-            <Checkbox
-              checked={checked}
-              disabled={disabled || atCap}
-              aria-label={`Select repository ${repo.fullName}`}
-              onCheckedChange={next => toggleRepo(repo.fullName, Boolean(next))}
-            />
-            <span className="mono" style={{ fontSize: 12, color: 'var(--fg)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-              {repo.fullName}
-            </span>
-            <span className="tag solid">{repo.private ? 'private' : 'public'}</span>
-            <span className="tag accent">{repo.defaultBranch}</span>
-          </label>
-        })}
-      </div>
-
-      <span className="sh-hint num">
-        {selectedRepos.length > 0
-          ? `${selectedRepos.length} ${selectedRepos.length === 1 ? 'repository' : 'repositories'} selected — will sync read-only right after project creation.`
-          : `Pick the ${repos.length === 1 ? 'repo' : '1–2 repos'} belonging to this project (optional, max ${MAX_SYNC_REPOS}).`}
-      </span>
-    </>}
-  </div>
+    </div>
+  )
 }

@@ -3,10 +3,10 @@
 // priority when the line overflows. Primary action + "…" menu carry every
 // run-level command: resume/pause, budget, approval policy, scope, goal
 // revision, approve-all, exports, lab runner, stop.
-import { Link } from '@tanstack/react-router'
+import { Link, useNavigate, useRouter } from '@tanstack/react-router'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { FormEvent, ReactNode, RefObject } from 'react'
-import { checkRunLabHealthAction, downloadReportMarkdown, exportSarifAction, startRunLabAction, stopRunLabAction } from '../../actions.ts'
+import { checkRunLabHealthAction, downloadReportMarkdown, exportSarifAction, removeRun, startRunLabAction, stopRunLabAction } from '../../actions.ts'
 import { approvalPolicies, maxBudgetRequests, maxRpsPerOriginCeiling } from '../../domain.ts'
 import type { ApprovalPolicy } from '../../domain.ts'
 import { approvalPolicyMeta, capabilityTierMeta } from '../run-state.ts'
@@ -59,8 +59,11 @@ export function RunHeader() {
   const nav = useNav()
   const toast = useToast()
   const openScope = useOverlays().editScope
+  const navigate = useNavigate()
+  const router = useRouter()
   const r = detail.run
   const [pop, setPop] = useState<Popover>(null)
+  const [deleteOpen, setDeleteOpen] = useState(false)
   const wrap = useRef<HTMLDivElement>(null)
   const rl = useRef<HTMLDivElement>(null)
   const dur = model.end - r.createdAt
@@ -68,6 +71,9 @@ export function RunHeader() {
   const rPct = r.budgetRequests ? r.spentRequests / r.budgetRequests : 0
   const scopeN = model.scopeOrigins.length
   const editable = !['complete', 'stopped', 'failed'].includes(r.status)
+  const isActiveRun = r.status === 'running'
+    || detail.assignments.some(a => a.status === 'running' || a.status === 'waiting_approval')
+    || Boolean(detail.labTarget)
   const pendingApprovals = detail.approvals.filter(a => a.status === 'pending')
   useFitRunline(rl, [r.status, r.phase, r.spentUsd, r.spentRequests, scopeN])
 
@@ -168,13 +174,15 @@ export function RunHeader() {
               : item('play', 'Start local lab', () => void labAct(() => startRunLabAction({ data: { runId: r.id } }), 'Lab started'), { disabled: !detail.localLabEnvEnabled || !detail.project.labConfig?.enabled })}
             {item('activity', 'Lab health check', () => void labAct(() => checkRunLabHealthAction({ data: { runId: r.id } }), 'Health checked'))}
           </>}
-          {editable && r.status !== 'waiting' && <>
-            <div className="menu-sep" />
-            {item('stop', 'Stop run', () => {
-              setPop(null)
-              toast.undoable({ message: 'Stopping the run', sub: 'Sends when this closes; a partial report is saved', icon: 'stop', commit: () => send({ action: 'stop' }) })
-            }, { danger: true })}
-          </>}
+          <div className="menu-sep" />
+          {editable && r.status !== 'waiting' && item('stop', 'Stop run', () => {
+            setPop(null)
+            toast.undoable({ message: 'Stopping the run', sub: 'Sends when this closes; a partial report is saved', icon: 'stop', commit: () => send({ action: 'stop' }) })
+          }, { danger: true })}
+          {item('trash', 'Delete run…', () => {
+            setPop(null)
+            setDeleteOpen(true)
+          }, { danger: true })}
         </div>}
         {pop === 'budget' && <BudgetPopover onClose={() => setPop(null)} />}
         {pop === 'policy' && <PolicyPopover onClose={() => setPop(null)} />}
@@ -182,6 +190,16 @@ export function RunHeader() {
         {pop === 'goal' && <GoalPopover onClose={() => setPop(null)} />}
       </span>
     </div>
+    {deleteOpen && <DeleteRunDialog
+      isActive={isActiveRun}
+      onClose={() => setDeleteOpen(false)}
+      onDeleted={async () => {
+        setDeleteOpen(false)
+        toast.show('Run deleted', { icon: 'check' })
+        await router.invalidate()
+        await navigate({ to: '/projects/$projectId', params: { projectId: detail.project.id }, replace: true })
+      }}
+    />}
     <div className="runline num" ref={rl}>
       <span className="rl"><StatusGlyph status={r.status} /><b>{runStatusLabel(r.status)}</b></span>
       <span className="rl"><PhaseTrack phase={r.phase} />
@@ -292,4 +310,85 @@ function GoalPopover({ onClose }: { onClose: () => void }) {
       <textarea className="field-in" rows={6} maxLength={8000} value={goal} onChange={e => setGoal(e.target.value)} autoFocus aria-label="Goal" />
     </PopShell>
   </form>
+}
+
+function DeleteRunDialog({ isActive, onClose, onDeleted }: {
+  isActive: boolean
+  onClose: () => void
+  onDeleted: () => Promise<void>
+}) {
+  const { detail } = useRun()
+  const model = useRunModel()
+  const r = detail.run
+  const [deleting, setDeleting] = useState(false)
+  const [err, setErr] = useState('')
+  const totalFindings = model.findings.length
+  const confirmedFindings = model.findings.filter(f => ['confirmed', 'verified', 'static_verified'].includes(f.status)).length
+
+  useShortcuts([{ key: 'Escape', allowInInput: true, run: () => { if (!deleting) onClose() } }], { priority: 100, exclusive: true })
+
+  async function handleConfirm() {
+    if (deleting) return
+    setDeleting(true)
+    setErr('')
+    try {
+      await removeRun({ data: { runId: r.id, stopActive: isActive } })
+      await onDeleted()
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Could not delete the run.')
+      setDeleting(false)
+    }
+  }
+
+  return <div
+    className="overlay open"
+    onMouseDown={e => { if (e.target === e.currentTarget && !deleting) onClose() }}
+  >
+    <div className="pal del-dialog" role="alertdialog" aria-modal="true" aria-labelledby="rw-del-run-title">
+      <div className="sheet">
+        <div className="sheet-h">
+          <Icon name="trash" style={{ color: 'var(--bad)' }} />
+          <span id="rw-del-run-title">{isActive ? 'Stop & delete run' : 'Delete run'}</span>
+          <button
+            type="button"
+            className="btn ghost"
+            style={{ marginLeft: 'auto', padding: '0 6px' }}
+            disabled={deleting}
+            onClick={onClose}
+            aria-label="Close"
+          >
+            <Icon name="close" />
+          </button>
+        </div>
+        <div className="del-dialog-b">
+          <p className="del-dialog-lede">
+            Permanently delete this run and all of its findings, HTTP traffic, reports, and artifacts. This cannot be undone.
+          </p>
+          <div className="del-dialog-summary">
+            <div className="del-dialog-goal" title={r.goal}>{r.goal}</div>
+            <div className="del-dialog-meta num">
+              <span className="tag solid"><StatusGlyph status={r.status} />{runStatusLabel(r.status)}</span>
+              <span className="tag solid">
+                {plural(totalFindings, 'finding')}
+                {confirmedFindings > 0 ? ` (${confirmedFindings} confirmed)` : ''}
+              </span>
+              <span className="tag solid">{fmtN(r.spentRequests)} req · {fmtUsd(r.spentUsd)}</span>
+            </div>
+          </div>
+          {isActive && <div className="del-dialog-warn" role="status">
+            <Icon name="alert" />
+            <span>This run is currently active. Confirming will stop active workers and clean up containers before deleting.</span>
+          </div>}
+          {err && <p className="err-line" role="alert" style={{ margin: 0 }}>{err}</p>}
+        </div>
+        <div className="sheet-f">
+          <button type="button" className="btn ghost" disabled={deleting} onClick={onClose}>Cancel</button>
+          <button type="button" className="btn danger-solid" disabled={deleting} onClick={() => void handleConfirm()}>
+            <Icon name="trash" />
+            {deleting ? (isActive ? 'Stopping & deleting…' : 'Deleting…') : (isActive ? 'Stop & delete run' : 'Delete run')}
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
 }

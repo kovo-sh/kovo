@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import {
-  existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmdirSync, unlinkSync, writeFileSync,
+  existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, rmdirSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -97,7 +97,7 @@ import {
 } from './capability-ledger.ts'
 import { computeFindingFingerprint, isOriginWideCwe, normalizeEndpointTemplate } from './dedupe.ts'
 import type { ApprovalDecidedBy, ApprovalRiskLevel } from './approval-judge.ts'
-import { listProjectPersonas } from './persona-vault.ts'
+import { deletePersonaCredentialFiles, listProjectPersonas } from './persona-vault.ts'
 import { isSafeMetadataPath, redact, redactHeaders, redactJsonValue, redactZdrJsonValue, secretMatchKinds } from './redact.ts'
 import type { NamedSecret, SecretMatch } from './redact.ts'
 import { purgeExpiredArtifacts } from './artifact-ttl.ts'
@@ -2493,24 +2493,270 @@ export class Store {
 
   projectDetail(projectId: string) {
     const project = this.project(projectId)
+    const runRows = this.db.select({
+      id: tables.runs.id,
+      goal: tables.runs.goal,
+      status: tables.runs.status,
+      phase: tables.runs.phase,
+      capabilityTier: tables.runs.capabilityTier,
+      approvalPolicy: tables.runs.approvalPolicy,
+      spentUsd: tables.runs.spentUsd,
+      spentRequests: tables.runs.spentRequests,
+      turnsUsed: tables.runs.turnsUsed,
+      createdAt: tables.runs.createdAt,
+    }).from(tables.runs).where(eq(tables.runs.projectId, projectId)).orderBy(desc(tables.runs.createdAt)).all()
+    const findingCountRows = this.client.prepare(`
+      SELECT r.id AS runId,
+        (SELECT count(*) FROM findings f WHERE f.run_id = r.id AND f.superseded_by_finding_id IS NULL) AS findingCount,
+        (SELECT count(*) FROM findings f WHERE f.run_id = r.id AND f.superseded_by_finding_id IS NULL
+          AND json_extract(f.finding, '$.status') IN ('confirmed', 'verified', 'static_verified')) AS confirmedCount
+      FROM runs r
+      WHERE r.project_id = ? AND r.workspace_id = ?
+    `).all(projectId, this.workspace.id) as { runId: string; findingCount: number; confirmedCount: number }[]
+    const findingCounts = new Map(findingCountRows.map(r => [r.runId, {
+      findingCount: Number(r.findingCount),
+      confirmedCount: Number(r.confirmedCount),
+    }]))
     return {
       project,
       assets: this.db.select().from(tables.projectAssets).where(eq(tables.projectAssets.projectId, projectId)).all(),
       personas: listProjectPersonas(this, projectId),
       specs: this.listProjectSpecs(projectId),
-      runs: this.db.select({
-        id: tables.runs.id,
-        goal: tables.runs.goal,
-        status: tables.runs.status,
-        phase: tables.runs.phase,
-        capabilityTier: tables.runs.capabilityTier,
-        approvalPolicy: tables.runs.approvalPolicy,
-        spentUsd: tables.runs.spentUsd,
-        spentRequests: tables.runs.spentRequests,
-        turnsUsed: tables.runs.turnsUsed,
-        createdAt: tables.runs.createdAt,
-      }).from(tables.runs).where(eq(tables.runs.projectId, projectId)).orderBy(desc(tables.runs.createdAt)).all(),
+      runs: runRows.map(r => {
+        const counts = findingCounts.get(r.id)
+        return {
+          ...r,
+          findingCount: counts?.findingCount ?? 0,
+          confirmedCount: counts?.confirmedCount ?? 0,
+        }
+      }),
     }
+  }
+
+  /** True when the run itself is in `running` status or still owns running workers/lab containers. */
+  isRunActive(runId: string): boolean {
+    const run = this.db.select({ id: tables.runs.id, status: tables.runs.status })
+      .from(tables.runs)
+      .where(and(eq(tables.runs.id, runId), eq(tables.runs.workspaceId, this.workspace.id)))
+      .get()
+    if (!run) return false
+    if (run.status === 'running') return true
+    const activeAssignments = this.client.prepare(
+      `SELECT count(*) AS c FROM assignments WHERE run_id = ? AND status IN ('running', 'waiting_approval')`,
+    ).get(runId) as { c?: number } | undefined
+    if (Number(activeAssignments?.c ?? 0) > 0) return true
+    const activeContainers = this.client.prepare(
+      `SELECT count(*) AS c FROM lab_containers WHERE run_id = ? AND status = 'running'`,
+    ).get(runId) as { c?: number } | undefined
+    return Number(activeContainers?.c ?? 0) > 0
+  }
+
+  /** Return all run IDs belonging to a project that are currently active. */
+  listActiveRunIdsForProject(projectId: string): string[] {
+    const rows = this.db.select({ id: tables.runs.id })
+      .from(tables.runs)
+      .where(and(eq(tables.runs.projectId, projectId), eq(tables.runs.workspaceId, this.workspace.id)))
+      .all()
+    return rows.map(r => r.id).filter(runId => this.isRunActive(runId))
+  }
+
+  private deleteRunRowsInTx(runId: string): { sessionIds: string[]; flatArtifactIds: string[] } {
+    const assignmentSessions = this.client.prepare(
+      `SELECT DISTINCT session_id AS sid FROM assignments WHERE run_id = ?`,
+    ).all(runId) as { sid: string | null }[]
+    const boardSessions = this.client.prepare(
+      `SELECT DISTINCT session_id AS sid FROM board_members WHERE run_id = ?`,
+    ).all(runId) as { sid: string | null }[]
+    const sessionIds = [...new Set(
+      [...assignmentSessions, ...boardSessions]
+        .map(row => row.sid)
+        .filter((sid): sid is string => typeof sid === 'string' && sid.length > 0),
+    )]
+
+    const artifactIds = new Set<string>()
+    for (const row of this.client.prepare(`SELECT id FROM evidence WHERE run_id = ?`).all(runId) as { id: string }[]) {
+      if (row.id) artifactIds.add(row.id)
+    }
+    for (const row of this.client.prepare(`SELECT body_artifact_id AS aid FROM broker_exchanges WHERE run_id = ? AND body_artifact_id IS NOT NULL`).all(runId) as { aid: string | null }[]) {
+      if (row.aid) artifactIds.add(row.aid)
+    }
+    for (const row of this.client.prepare(`SELECT proof_artifact_id AS aid FROM replay_specs WHERE run_id = ? AND proof_artifact_id IS NOT NULL`).all(runId) as { aid: string | null }[]) {
+      if (row.aid) artifactIds.add(row.aid)
+    }
+    for (const row of this.client.prepare(`SELECT raw_artifact_id AS aid FROM sast_runs WHERE run_id = ? AND raw_artifact_id IS NOT NULL`).all(runId) as { aid: string | null }[]) {
+      if (row.aid) artifactIds.add(row.aid)
+    }
+    for (const row of this.client.prepare(`SELECT artifact_id AS aid FROM lab_telemetry WHERE run_id = ?`).all(runId) as { aid: string | null }[]) {
+      if (row.aid) artifactIds.add(row.aid)
+    }
+
+    // Delete in strict child-before-parent order to satisfy PRAGMA foreign_keys = ON.
+    // Note: tenant_audit_log is an append-only immutable audit table with a BEFORE DELETE trigger
+    // and no FK to runs, so it is intentionally preserved.
+    if (this.ftsTableExists) {
+      this.client.prepare(`DELETE FROM broker_exchanges_fts WHERE run_id = ?`).run(runId)
+    }
+    const orderedTables = [
+      'retest_runs',
+      'replay_specs',
+      'facts',
+      'broker_exchanges',
+      'approval_requests',
+      'evidence',
+      'sast_runs',
+      'surface_probes',
+      'endpoint_params',
+      'api_dependencies',
+      'capability_causal_edges',
+      'capability_negative_edges',
+      'capability_nodes',
+      'lab_containers',
+      'lab_telemetry',
+      'board_messages',
+      'board_members',
+      'resource_samples',
+      'second_order_canaries',
+      'approval_leases',
+      'patch_proposals',
+      'findings',
+      'coverage_entries',
+      'canaries',
+      'graph_edges',
+      'graph_digests',
+      'threat_models',
+      'chain_steps',
+      'reports',
+      'messages',
+      'events',
+      'endpoints',
+      'assignments',
+    ] as const
+    for (const table of orderedTables) {
+      this.client.prepare(`DELETE FROM ${table} WHERE run_id = ?`).run(runId)
+    }
+    this.client.prepare(`DELETE FROM runs WHERE id = ? AND workspace_id = ?`).run(runId, this.workspace.id)
+
+    // Keep any legacy flat content-addressed blob still referenced by another run.
+    const flatArtifactIds: string[] = []
+    if (artifactIds.size > 0) {
+      const checkShared = this.client.prepare(
+        `SELECT 1 FROM broker_exchanges WHERE body_artifact_id = ? LIMIT 1`,
+      )
+      for (const aid of artifactIds) {
+        if (!checkShared.get(aid)) flatArtifactIds.push(aid)
+      }
+    }
+    return { sessionIds, flatArtifactIds }
+  }
+
+  private cleanupRunFilesOnDisk(
+    runId: string,
+    sessionIds: readonly string[],
+    flatArtifactIds: readonly string[],
+  ): void {
+    const isSafeSegment = (seg: string) => Boolean(seg) && !seg.includes('..') && !/[\\/\0]/.test(seg)
+    if (isSafeSegment(runId)) {
+      for (const dir of [
+        join(this.directory, 'artifacts', runId),
+        join(this.directory, 'runs', runId),
+        join(this.directory, 'agent-sessions', runId),
+      ]) {
+        try { rmSync(dir, { recursive: true, force: true }) } catch { /* ignore */ }
+      }
+    }
+    for (const sessionId of sessionIds) {
+      if (!isSafeSegment(sessionId)) continue
+      const base = join(this.directory, 'agent-sessions', `${sessionId}.sqlite`)
+      for (const file of [base, `${base}-wal`, `${base}-shm`]) {
+        try { unlinkSync(file) } catch { /* ignore */ }
+      }
+    }
+    for (const artifactId of flatArtifactIds) {
+      if (!isSafeSegment(artifactId)) continue
+      try { unlinkSync(join(this.directory, 'artifacts', `${artifactId}.txt`)) } catch { /* ignore */ }
+    }
+  }
+
+  /**
+   * Delete a single run and all of its child rows atomically in one SQLite transaction,
+   * then remove on-disk run artifacts and worker session files.
+   */
+  deleteRun(runId: string): { deleted: boolean; projectId: string; runId: string } {
+    this.flushNow()
+    const committed = this.transaction(() => {
+      const existing = this.db.select({ id: tables.runs.id, projectId: tables.runs.projectId })
+        .from(tables.runs)
+        .where(and(eq(tables.runs.id, runId), eq(tables.runs.workspaceId, this.workspace.id)))
+        .get()
+      if (!existing) return null
+      const files = this.deleteRunRowsInTx(runId)
+      this.event(null, 'run.deleted', `Deleted run ${runId}.`, {
+        projectId: existing.projectId,
+        runId,
+      })
+      return { projectId: existing.projectId, ...files }
+    }, { behavior: 'immediate' })
+    if (!committed) return { deleted: false, projectId: '', runId }
+    this.cleanupRunFilesOnDisk(runId, committed.sessionIds, committed.flatArtifactIds)
+    return { deleted: true, projectId: committed.projectId, runId }
+  }
+
+  /**
+   * Delete a project, cascading all runs (and their child rows), specs, personas, assets,
+   * on-disk run artifacts/sessions, local 0600 persona credentials, and synced repo cache dir.
+   */
+  deleteProject(projectId: string): { deleted: boolean; projectId: string; deletedRuns: number } {
+    this.flushNow()
+    const committed = this.transaction(() => {
+      const existing = this.db.select({ id: tables.projects.id, name: tables.projects.name })
+        .from(tables.projects)
+        .where(and(eq(tables.projects.id, projectId), eq(tables.projects.workspaceId, this.workspace.id)))
+        .get()
+      if (!existing) return null
+      const runRows = this.db.select({ id: tables.runs.id })
+        .from(tables.runs)
+        .where(and(eq(tables.runs.projectId, projectId), eq(tables.runs.workspaceId, this.workspace.id)))
+        .all()
+      const personaRows = this.db.select({ credentialId: tables.personas.credentialId })
+        .from(tables.personas)
+        .where(and(eq(tables.personas.projectId, projectId), eq(tables.personas.workspaceId, this.workspace.id)))
+        .all()
+
+      const runCleanups: Array<{ runId: string; sessionIds: string[]; flatArtifactIds: string[] }> = []
+      for (const row of runRows) {
+        const files = this.deleteRunRowsInTx(row.id)
+        runCleanups.push({ runId: row.id, ...files })
+      }
+      this.client.prepare(`DELETE FROM retest_runs WHERE project_id = ?`).run(projectId)
+      this.client.prepare(`DELETE FROM personas WHERE project_id = ? AND workspace_id = ?`).run(projectId, this.workspace.id)
+      this.client.prepare(`DELETE FROM project_specs WHERE project_id = ?`).run(projectId)
+      this.client.prepare(`DELETE FROM project_assets WHERE project_id = ?`).run(projectId)
+      this.client.prepare(`DELETE FROM projects WHERE id = ? AND workspace_id = ?`).run(projectId, this.workspace.id)
+      this.event(null, 'project.deleted', `Deleted project ${existing.name}.`, {
+        projectId,
+        projectName: existing.name,
+        deletedRuns: runRows.length,
+      })
+      return {
+        runCleanups,
+        credentialIds: personaRows.map(p => p.credentialId),
+        deletedRuns: runRows.length,
+      }
+    }, { behavior: 'immediate' })
+    if (!committed) return { deleted: false, projectId, deletedRuns: 0 }
+
+    for (const cleanup of committed.runCleanups) {
+      this.cleanupRunFilesOnDisk(cleanup.runId, cleanup.sessionIds, cleanup.flatArtifactIds)
+    }
+    deletePersonaCredentialFiles(this.directory, committed.credentialIds)
+    if (projectId && !projectId.includes('..') && !/[\\/\0]/.test(projectId)) {
+      try {
+        rmSync(join(this.directory, 'repos', projectId), { recursive: true, force: true })
+      } catch {
+        // Best-effort repo cache cleanup.
+      }
+    }
+    return { deleted: true, projectId, deletedRuns: committed.deletedRuns }
   }
 
   runDetail(runId: string, options?: RunDetailOptions) {
@@ -7288,6 +7534,102 @@ function boundedArtifactSize(root: string): { total: number; blobs: number } {
     }
   }
   return { total, blobs }
+}
+
+export interface DeleteExecutionControl {
+  wake: () => void
+  getLabTargetHandle: (runId: string) => unknown
+}
+
+export interface DeleteLabControl {
+  getTarget: (runId: string) => unknown
+  stopLabTarget: (runId: string) => Promise<unknown>
+}
+
+async function stopRunsBeforeDelete(
+  db: Store,
+  exec: DeleteExecutionControl,
+  labRunner: DeleteLabControl,
+  runIds: readonly string[],
+  waitTimeoutMs = 2_500,
+): Promise<void> {
+  for (const runId of runIds) {
+    try {
+      const current = db.run(runId)
+      if (!['complete', 'stopped'].includes(current.status)) {
+        db.command({ requestId: randomUUID(), runId, action: 'stop' })
+      }
+    } catch {
+      // Run may already be stopped or absent.
+    }
+    await labRunner.stopLabTarget(runId).catch(() => undefined)
+  }
+  exec.wake()
+
+  const deadline = Date.now() + Math.max(0, waitTimeoutMs)
+  while (Date.now() < deadline) {
+    const stillActive = runIds.some(runId =>
+      db.isRunActive(runId) || Boolean(exec.getLabTargetHandle(runId)) || Boolean(labRunner.getTarget(runId)),
+    )
+    if (!stillActive) break
+    await new Promise(resolve => setTimeout(resolve, 100))
+    exec.wake()
+  }
+}
+
+export async function deleteRunWithActiveGuard(
+  db: Store,
+  exec: DeleteExecutionControl,
+  labRunner: DeleteLabControl,
+  input: { runId: string; stopActive?: boolean; waitTimeoutMs?: number },
+): Promise<{ deleted: boolean; projectId: string; runId: string }> {
+  const isActive = db.isRunActive(input.runId)
+    || Boolean(exec.getLabTargetHandle(input.runId))
+    || Boolean(labRunner.getTarget(input.runId))
+  if (isActive && !input.stopActive) {
+    throw new Error('This run is currently active. Stop the run first (or choose Stop & Delete) before deleting it.')
+  }
+  if (isActive && input.stopActive) {
+    await stopRunsBeforeDelete(db, exec, labRunner, [input.runId], input.waitTimeoutMs)
+  } else {
+    await labRunner.stopLabTarget(input.runId).catch(() => undefined)
+  }
+  const result = db.deleteRun(input.runId)
+  if (result.deleted) exec.wake()
+  return result
+}
+
+export async function deleteProjectWithActiveGuard(
+  db: Store,
+  exec: DeleteExecutionControl,
+  labRunner: DeleteLabControl,
+  input: { projectId: string; stopActive?: boolean; waitTimeoutMs?: number },
+): Promise<{ deleted: boolean; projectId: string; deletedRuns: number }> {
+  let detail: ReturnType<Store['projectDetail']> | null = null
+  try {
+    detail = db.projectDetail(input.projectId)
+  } catch {
+    return { deleted: false, projectId: input.projectId, deletedRuns: 0 }
+  }
+  const allRunIds = detail.runs.map(r => r.id)
+  const activeRunIds = allRunIds.filter(runId =>
+    db.isRunActive(runId) || Boolean(exec.getLabTargetHandle(runId)) || Boolean(labRunner.getTarget(runId)),
+  )
+  if (activeRunIds.length > 0 && !input.stopActive) {
+    throw new Error(
+      `This project has ${activeRunIds.length} active ${activeRunIds.length === 1 ? 'run' : 'runs'}. Stop active runs first (or choose Stop & Delete) before deleting the project.`,
+    )
+  }
+  if (activeRunIds.length > 0 && input.stopActive) {
+    await stopRunsBeforeDelete(db, exec, labRunner, activeRunIds, input.waitTimeoutMs)
+  } else {
+    for (const runId of allRunIds) {
+      await labRunner.stopLabTarget(runId).catch(() => undefined)
+    }
+  }
+  const result = db.deleteProject(input.projectId)
+  if (result.deleted) exec.wake()
+  return result
 }
 
 let instance: Store | undefined
