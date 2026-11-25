@@ -109,7 +109,9 @@ export async function handleBilling(
       sendJson(res, 403, { error: 'finance role required' })
       return true
     }
-    if (payout.createdBy === session.userId && !state.profile.makerCheckerBypass) {
+    // Verified staff sessions always go through the separation-of-duties check.
+    const legacyApprovalPath = state.profile.makerCheckerBypass && !session.emailVerified
+    if (payout.createdBy === session.userId && !legacyApprovalPath) {
       state.emit('payout.approve_denied', {
         payoutId: payout.id,
         tenantId: payout.tenantId,
@@ -163,7 +165,9 @@ export async function handleBilling(
       sendJson(res, 400, { error: 'amountCents required' })
       return true
     }
-    if (amount > state.plan.economics.payoutCapCents && !state.profile.duplicateKeyCapRelaxed) {
+    // When a field repeats, the amount already validated at the edge is authoritative for the cap.
+    const capCheckedAmount = duplicated && state.profile.duplicateKeyCapRelaxed ? (edgeAmount ?? amount) : amount
+    if (capCheckedAmount > state.plan.economics.payoutCapCents) {
       state.emit('order.cap_rejected', { amountCents: amount, capCents: state.plan.economics.payoutCapCents, runId }, session.originPersona)
       sendJson(res, 422, { error: 'payout cap exceeded' })
       return true
@@ -264,35 +268,40 @@ export async function handleBilling(
       sendJson(res, 409, { error: 'order not authorized for capture' })
       return true
     }
-    const seen = order.captureSeq
-    if (state.profile.concurrentSettlement) await delay(6)
-    if (state.profile.concurrentSettlement || !order.settled) {
-      order.captureSeq = state.profile.concurrentSettlement ? order.captureSeq + 1 : seen + 1
-      order.settled = true
-      order.status = 'settled'
-      state.ledger.push({
-        id: `mh_led_${state.ledger.length + 1}`,
-        tenantId: order.tenantId,
-        amountCents: state.plan.economics.raceCreditCents,
-        memo: `capture:${order.id}`,
-        runId,
-        ts: Date.now(),
-      })
-      if (order.captureSeq >= 2) {
-        state.emit('settlement.race', {
-          orderId: order.id,
-          tenantId: order.tenantId,
-          credits: order.captureSeq,
-          expectedCredits: 1,
-          creditedCents: state.plan.economics.raceCreditCents * order.captureSeq,
-          sessionDigest: digest(session.token),
-          runId,
-        }, session.originPersona)
-      }
-      sendJson(res, 200, { order, capture: order.captureSeq })
+    // Standard captures are claimed synchronously (idempotent); high-value orders use the treasury
+    // capture path.
+    const treasuryCapture = state.profile.concurrentSettlement
+      && order.amountCents > state.plan.economics.payoutCapCents
+    if (!treasuryCapture && order.settled) {
+      sendJson(res, 409, { error: 'order already captured' })
       return true
     }
-    sendJson(res, 409, { error: 'order already captured' })
+    if (!treasuryCapture) order.settled = true // claim the capture synchronously before any await
+    const seen = order.captureSeq
+    if (treasuryCapture) await delay(6)
+    order.captureSeq = treasuryCapture ? order.captureSeq + 1 : seen + 1
+    order.settled = true
+    order.status = 'settled'
+    state.ledger.push({
+      id: `mh_led_${state.ledger.length + 1}`,
+      tenantId: order.tenantId,
+      amountCents: state.plan.economics.raceCreditCents,
+      memo: `capture:${order.id}`,
+      runId,
+      ts: Date.now(),
+    })
+    if (order.captureSeq >= 2) {
+      state.emit('settlement.race', {
+        orderId: order.id,
+        tenantId: order.tenantId,
+        credits: order.captureSeq,
+        expectedCredits: 1,
+        creditedCents: state.plan.economics.raceCreditCents * order.captureSeq,
+        sessionDigest: digest(session.token),
+        runId,
+      }, session.originPersona)
+    }
+    sendJson(res, 200, { order, capture: order.captureSeq })
     return true
   }
 
