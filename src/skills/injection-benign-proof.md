@@ -10,13 +10,13 @@ Before proposing any active execution check, gather strong structural evidence u
 
 ## 2. Guardian v2 Non-Destructive Proof Standard (Tier 3 Only)
 Guardian strictly prohibits destructive operations, persistent changes, file writes, host-file reads, reverse shells, or denial-of-service probes. All active execution verification MUST obey three invariants:
-1. **Hard Tier 3 HITL Gate:** Active `rce_proof` specs are blocked at Tiers 0–2 on public targets and require explicit operator approval via an inline Approval Card showing the exact target, rationale, and benign template.
-2. **Destructive Denylist Compliance:** Both `declarativeReplaySpecSchema` and `RequestBroker` reject destructive commands, file-write redirects, network shell patterns, and sensitive host/metadata paths.
+1. **Hard Tier 3 HITL Gate:** Active execution probes are blocked at Tiers 0–2 on public targets and require explicit operator approval via an inline Approval Card showing the exact target, rationale, and benign verification approach.
+2. **Destructive Denylist Compliance:** Both the TypeScript `guardian_verify` verifier and `RequestBroker` reject destructive commands, file-write redirects, network shell patterns, and sensitive host/metadata paths.
 3. **Unforgeable Verifier-Minted Nonces (Zero Reflection False Positives):**
-   When constructing `kind: "rce_proof"`, never hardcode static expected outputs—always use placeholders populated fresh by Guardian’s Zero-LLM Replay Verifier at replay time:
-   - **`proofMode: "dynamic_math"`:** Use `{{nonce_a}}` and `{{nonce_b}}` (verifier selects two fresh 5-digit primes). Confirmation succeeds only when the computed product appears in the probe response, is absent from `controlStep`, and is not merely literal input reflection.
-   - **`proofMode: "split_echo"`:** Use `{{nonce_part1}}` and `{{nonce_part2}}` in a split concatenation template so the assembled token never appears in the HTTP request, eliminating reflection false positives.
-   - **`proofMode: "oob_canary"`:** Use `{{canary_url}}` or `{{canary_token}}` for asynchronous/blind execution paths; the verifier mints separate control and probe Guardian canaries and confirms only when the probe canary triggers while the control canary stays silent.
+   When writing a TypeScript `guardian_verify` proof for injection or execution, never rely on hardcoded static echoes—use Guardian's host-backed proof helpers with fresh per-run nonces (`ctx.nonce` / `ctx.oob.mint`):
+   - **Evaluated Differential (`ctx.proveInjectionDifferential`):** Compare a clean control request against a benign computed expression (e.g., arithmetic evaluation or split concatenation) so the expected output appears in the probe response, is absent from the control response, and is not merely literal input reflection.
+   - **Boolean / Timing Differential (`ctx.proveBooleanOrTimingDiff`):** Verify blind predicate or timing differences across paired control-vs-variant rounds via the host oracle rather than single-shot heuristics.
+   - **Out-of-Band Callback (`ctx.proveOobCallback` / `ctx.oob`):** For asynchronous/blind execution paths, mint fresh host-verified Guardian canaries and confirm only when the probe canary triggers while the control path stays silent.
 
 ## 3. Honest Fallback & Calibration
 - If a target blocks outbound egress or only exhibits benign error-message disclosure without provable execution, report the verified error-exposure or input-validation weakness honestly (`medium`/`low`) rather than speculating about execution.
