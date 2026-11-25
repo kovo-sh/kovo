@@ -78,19 +78,30 @@ interface LoadedAppModule {
 const loadedApps = new Map<string, Promise<LoadedAppModule>>()
 const loadedAppsSync = new Map<string, LoadedAppModule>()
 
-/** Blueprint hop routeKeys that alias a differently named entry in apiCatalog(). */
-const HOP_ROUTE_KEY_ALIASES: Record<string, string> = {
+/**
+ * Blueprint hop/terminal routeKeys mapped to one or more canonical + public-relay entries in
+ * apiCatalog(). `resolveRouteKeyRefs()` always checks the raw routeKey first and then all listed
+ * aliases, so both internal and public-relay endpoints are resolved with seed-varied prefixes.
+ */
+const HOP_ROUTE_KEY_ALIASES: Record<string, string | readonly string[]> = {
   // paygrid
   'api.permissionsPrime': 'api.orgPermissions',
   'api.exportCreate': 'api.orgExports',
   'api.exportSignedUrl': 'api.exportUrl',
   'file.treasuryDownload': 'edge.fileExport',
+  'worker.jobRender': 'api.invoiceRender',
+  'worker.jobTrace': 'api.jobTrace',
+  'worker.jobPoll': ['api.exportGet', 'api.jobPoll'],
+  'vault.settlementWebhook': 'api.settlementWebhook',
   // shipforge
   'api.productionRelease': 'api.deploymentRelease',
-  'runner.sseStream': 'runner.streamShared',
-  'runner.sseArtifactEvent': 'runner.artifact',
+  'runner.sseStream': ['runner.streamShared', 'api.runnerSharedEvents'],
+  'runner.sseArtifactEvent': ['runner.artifact', 'api.runnerSharedEvents'],
+  'scm.webhookCreate': 'api.projectWebhooks',
+  'scm.deliveryLog': 'api.deliveryLog',
+  'registry.internalSync': 'api.registrySync',
   // nexusiam
-  'app.moderationRender': 'app.moderationQueue',
+  'app.moderationRender': ['app.moderationQueue', 'app.inbox'],
   'api.scimTokenMint': 'api.scimTokenCreate',
   'api.auditVaultRead': 'api.auditVault',
   'app.shareLinkCapture': 'app.sharePreview',
@@ -98,6 +109,8 @@ const HOP_ROUTE_KEY_ALIASES: Record<string, string> = {
   'api.docsWorkspaceFallback': 'api.docsList',
   'api.docPrivateOpen': 'api.docGet',
   'api.docContentRead': 'api.docContent',
+  'docsWorker.jobPoll': 'api.exportStatus',
+  'docsWorker.jobResult': 'api.exportResult',
 }
 
 loadedAppsSync.set('paygrid', {
@@ -433,6 +446,18 @@ export interface ProductSubmittedCompositeProof {
   confirmed: boolean
   attackerProvenanceValid: boolean
   modeBVerified?: boolean
+  receipt?: {
+    hops?: Array<{
+      hopId: string
+      target?: { method?: string; pathAndQuery?: string }
+    }>
+    causalEdges?: Array<{ kind?: string }>
+    terminalImpact?: { terminalHopId?: string }
+  }
+  verification?: {
+    terminalEndpoint?: string | null
+    terminalOracleFamily?: string | null
+  }
 }
 
 export interface ProductGradeInput {
@@ -520,9 +545,97 @@ export interface ProductScorecard {
   hardenedTwins: ProductTwinVerdict[]
 }
 
+interface ChainEndpointTemplate {
+  method: string
+  path: string
+  routeKey: string
+  hopId?: string
+}
+
+interface ResolvedChainMatchSpec {
+  chainId: string
+  vulnClass: string
+  terminalEndpoints: ChainEndpointTemplate[]
+  upstreamHopEndpoints: ChainEndpointTemplate[]
+  edgeKinds: string[]
+}
+
 const groundTruthOracleMap = new WeakMap<object, () => OracleExport>()
 const groundTruthTwinsMap = new WeakMap<object, ProductTwinDecoy[]>()
+const groundTruthChainsMap = new WeakMap<object, ResolvedChainMatchSpec[]>()
 const startedDefaultBriefingMode = new WeakMap<object, BenchMode>()
+
+function resolveRouteKeyRefs(routeKey: string, byRouteKey: ReadonlyMap<string, ApiRef>): ApiRef[] {
+  const out: ApiRef[] = []
+  const seen = new Set<string>()
+  const addKey = (key: string): void => {
+    const ref = byRouteKey.get(key)
+    if (!ref) return
+    const dedupeKey = `${ref.method.toUpperCase()} ${ref.path}`
+    if (seen.has(dedupeKey)) return
+    seen.add(dedupeKey)
+    out.push(ref)
+  }
+  addKey(routeKey)
+  const alias = HOP_ROUTE_KEY_ALIASES[routeKey]
+  if (typeof alias === 'string') {
+    addKey(alias)
+  } else if (Array.isArray(alias)) {
+    for (const key of alias) addKey(key)
+  }
+  return out
+}
+
+function buildResolvedChainMatchSpecs(
+  chains: readonly ChainSpec[],
+  apiReference?: readonly ApiRef[],
+): ResolvedChainMatchSpec[] {
+  if (!chains.length || !apiReference?.length) return []
+  const byRouteKey = new Map<string, ApiRef>()
+  for (const ref of apiReference) byRouteKey.set(ref.routeKey, ref)
+
+  return chains.map((chain) => {
+    const terminalEndpoints: ChainEndpointTemplate[] = []
+    const terminalSeen = new Set<string>()
+    const addTerminal = (routeKey: string, hopId?: string): void => {
+      for (const ref of resolveRouteKeyRefs(routeKey, byRouteKey)) {
+        const method = ref.method.toUpperCase()
+        const dedupeKey = `${method} ${ref.path}`
+        if (terminalSeen.has(dedupeKey)) continue
+        terminalSeen.add(dedupeKey)
+        terminalEndpoints.push({ method, path: ref.path, routeKey, ...(hopId ? { hopId } : {}) })
+      }
+    }
+
+    const lastHop = chain.hops[chain.hops.length - 1]
+    addTerminal(chain.terminal.routeKey, lastHop?.hopId)
+    if (lastHop && lastHop.routeKey !== chain.terminal.routeKey) {
+      addTerminal(lastHop.routeKey, lastHop.hopId)
+    }
+
+    const upstreamHopEndpoints: ChainEndpointTemplate[] = []
+    const upstreamSeen = new Set<string>()
+    const upstreamHops = chain.hops.length > 1 ? chain.hops.slice(0, -1) : []
+    for (const hop of upstreamHops) {
+      for (const ref of resolveRouteKeyRefs(hop.routeKey, byRouteKey)) {
+        const method = ref.method.toUpperCase()
+        const dedupeKey = `${method} ${ref.path}`
+        if (upstreamSeen.has(dedupeKey)) continue
+        upstreamSeen.add(dedupeKey)
+        upstreamHopEndpoints.push({ method, path: ref.path, routeKey: hop.routeKey, hopId: hop.hopId })
+      }
+    }
+
+    const edgeKinds = chain.hops.flatMap((hop) => (hop.edgeFromPrevious ? [hop.edgeFromPrevious] : []))
+    return {
+      chainId: chain.id,
+      vulnClass: chain.vulnClass,
+      terminalEndpoints,
+      upstreamHopEndpoints,
+      edgeKinds,
+    }
+  })
+}
 
 function resolveTwinEndpoints(
   twin: TwinSpec,
@@ -537,20 +650,19 @@ function resolveTwinEndpoints(
   const addHop = (hopId: string, role: HardenedTwinEndpoint['role']): void => {
     const hop = chain.hops.find((h) => h.hopId === hopId)
     if (!hop) return
-    const lookupKey = HOP_ROUTE_KEY_ALIASES[hop.routeKey] ?? hop.routeKey
-    const ref = byRouteKey.get(hop.routeKey) ?? byRouteKey.get(lookupKey)
-    if (!ref) return
-    const dedupeKey = `${ref.method.toUpperCase()} ${ref.path} ${hopId}`
-    if (seen.has(dedupeKey)) return
-    seen.add(dedupeKey)
-    out.push({
-      method: ref.method.toUpperCase(),
-      path: ref.path,
-      routeKey: hop.routeKey,
-      hopId,
-      service: String(hop.service),
-      role,
-    })
+    for (const ref of resolveRouteKeyRefs(hop.routeKey, byRouteKey)) {
+      const dedupeKey = `${ref.method.toUpperCase()} ${ref.path} ${hopId}`
+      if (seen.has(dedupeKey)) continue
+      seen.add(dedupeKey)
+      out.push({
+        method: ref.method.toUpperCase(),
+        path: ref.path,
+        routeKey: hop.routeKey,
+        hopId,
+        service: String(hop.service),
+        role,
+      })
+    }
   }
   for (const hopId of twin.decoyHopIds) addHop(hopId, 'decoy_hop')
   if (twin.enforcedAtHopId) addHop(twin.enforcedAtHopId, 'enforced_hop')
@@ -763,6 +875,7 @@ export async function startMultihopApp(opts: StartMultihopAppOptions = {}): Prom
 
   const greyApiRef = lab.briefing('grey-box').apiReference
   const resolvedTwins = buildProductTwinDecoys(mod.twins, mod.chains, greyApiRef, lab.twinId)
+  const resolvedChains = buildResolvedChainMatchSpecs(mod.chains, greyApiRef)
   const productGroundTruth: GroundTruth = {
     ...lab.groundTruth,
     twinDecoys: resolvedTwins,
@@ -771,6 +884,8 @@ export async function startMultihopApp(opts: StartMultihopAppOptions = {}): Prom
   groundTruthOracleMap.set(productGroundTruth, () => lab.export())
   groundTruthTwinsMap.set(lab.groundTruth, resolvedTwins)
   groundTruthTwinsMap.set(productGroundTruth, resolvedTwins)
+  groundTruthChainsMap.set(lab.groundTruth, resolvedChains)
+  groundTruthChainsMap.set(productGroundTruth, resolvedChains)
 
   let stopPromise: Promise<void> | undefined
   const stop = (): Promise<void> => {
@@ -981,12 +1096,140 @@ function isStandaloneGradeInput(input: GradeInput | ProductGradeInput): input is
   return 'oracle' in input && input.oracle !== undefined
 }
 
+interface ParsedEndpointCandidate {
+  method?: string
+  path: string
+}
+
+function parseEndpointCandidate(
+  rawPath: string | null | undefined,
+  explicitMethod?: string | null,
+): ParsedEndpointCandidate | null {
+  if (typeof rawPath !== 'string') return null
+  const trimmed = rawPath.trim()
+  if (!trimmed) return null
+  const methodMatch = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(.+)$/i.exec(trimmed)
+  const method = (methodMatch?.[1] ?? explicitMethod ?? '').trim().toUpperCase() || undefined
+  const pathPart = methodMatch?.[2] ?? trimmed
+  const path = normalizeEndpointPath(pathPart)
+  if (!path) return null
+  return { ...(method ? { method } : {}), path }
+}
+
+function endpointMatchesTemplate(
+  candidate: ParsedEndpointCandidate,
+  template: ChainEndpointTemplate,
+): boolean {
+  if (candidate.method && template.method && candidate.method !== template.method.toUpperCase()) {
+    return false
+  }
+  return pathMatchesTemplate(candidate.path, template.path)
+}
+
+function receiptPriority(receipt: ProductSubmittedCompositeProof): number {
+  const modeAConfirmed = receipt.confirmed
+    && receipt.attackerProvenanceValid
+    && receipt.replayMode === 'fresh_clean_replay'
+  if (modeAConfirmed) return 3
+  if (receipt.confirmed) return 2
+  if (receipt.replayMode === 'fresh_clean_replay') return 1
+  return 0
+}
+
+function resolveReceiptChainId(
+  receipt: ProductSubmittedCompositeProof,
+  candidateChainIds: ReadonlySet<string>,
+  chainSpecs: readonly ResolvedChainMatchSpec[],
+  oracleObservedByChain: ReadonlyMap<string, boolean>,
+): string | null {
+  // Step A: exact benchmark chainId match (preserves all existing unit/synthetic tests).
+  if (receipt.chainId && candidateChainIds.has(receipt.chainId)) {
+    return receipt.chainId
+  }
+
+  // Step B: endpoint + causal-topology matching for real Guardian runs (anti-contamination generic chainIds).
+  if (!chainSpecs.length || candidateChainIds.size === 0) return null
+  const hops = receipt.receipt?.hops
+  if (receipt.hopCount < 2 || (hops !== undefined && hops.length < 2)) {
+    return null
+  }
+
+  const terminalHopId = receipt.receipt?.terminalImpact?.terminalHopId
+  const terminalHop = hops?.length
+    ? ((terminalHopId ? hops.find((h) => h.hopId === terminalHopId) : undefined) ?? hops[hops.length - 1])
+    : undefined
+
+  const terminalCandidates: ParsedEndpointCandidate[] = []
+  const seenTerm = new Set<string>()
+  const addTerminalCandidate = (rawPath: string | null | undefined, explicitMethod?: string | null): void => {
+    const parsed = parseEndpointCandidate(rawPath, explicitMethod)
+    if (!parsed) return
+    const key = `${parsed.method ?? '*'} ${parsed.path}`
+    if (seenTerm.has(key)) return
+    seenTerm.add(key)
+    terminalCandidates.push(parsed)
+  }
+  addTerminalCandidate(receipt.verification?.terminalEndpoint, terminalHop?.target?.method)
+  addTerminalCandidate(terminalHop?.target?.pathAndQuery, terminalHop?.target?.method)
+  if (!terminalCandidates.length) return null
+
+  const matchingSpecs = chainSpecs.filter((spec) =>
+    candidateChainIds.has(spec.chainId)
+    && terminalCandidates.some((cand) =>
+      spec.terminalEndpoints.some((tmpl) => endpointMatchesTemplate(cand, tmpl)),
+    ),
+  )
+  if (!matchingSpecs.length) return null
+  if (matchingSpecs.length === 1) return matchingSpecs[0]!.chainId
+
+  const upstreamCandidates: ParsedEndpointCandidate[] = []
+  const seenUp = new Set<string>()
+  for (const hop of hops ?? []) {
+    if (hop === terminalHop) continue
+    const parsed = parseEndpointCandidate(hop.target?.pathAndQuery, hop.target?.method)
+    if (!parsed) continue
+    const key = `${parsed.method ?? '*'} ${parsed.path}`
+    if (seenUp.has(key)) continue
+    seenUp.add(key)
+    upstreamCandidates.push(parsed)
+  }
+  const receiptEdgeKinds = new Set(
+    (receipt.receipt?.causalEdges ?? [])
+      .map((edge) => edge?.kind?.trim())
+      .filter((kind): kind is string => Boolean(kind)),
+  )
+
+  let bestChainId = matchingSpecs[0]!.chainId
+  let bestScore = -1
+  for (const spec of matchingSpecs) {
+    let upstreamOverlap = 0
+    for (const up of upstreamCandidates) {
+      if (spec.upstreamHopEndpoints.some((tmpl) => endpointMatchesTemplate(up, tmpl))) {
+        upstreamOverlap += 1
+      }
+    }
+    const specEdgeSet = new Set(spec.edgeKinds)
+    let edgeOverlap = 0
+    for (const kind of receiptEdgeKinds) {
+      if (specEdgeSet.has(kind)) edgeOverlap += 1
+    }
+    const oracleBonus = oracleObservedByChain.get(spec.chainId) ? 1 : 0
+    const score = (upstreamOverlap * 10) + (edgeOverlap * 2) + oracleBonus
+    if (score > bestScore) {
+      bestScore = score
+      bestChainId = spec.chainId
+    }
+  }
+  return bestChainId
+}
+
 function gradeProductRun(input: ProductGradeInput): ProductScorecard {
   const gt = input.groundTruth
   const oracleExport = input.oracleExport ?? groundTruthOracleMap.get(gt)?.()
   const evalByChain = new Map((oracleExport?.evaluations ?? []).map((ev) => [ev.chainId, ev]))
   const receipts = input.compositeReceipts ?? []
   const findings = input.findings ?? []
+  const chainSpecs = groundTruthChainsMap.get(gt) ?? []
 
   const oracleEventsByChain = new Map<string, Array<{ seq: number; eventKind?: string; hopId?: string }>>()
   for (const raw of input.oracleEvents ?? []) {
@@ -1002,10 +1245,32 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
     oracleEventsByChain.set(ev.chainId, list)
   }
 
+  const expectedChainIds = new Set<string>()
+  const oracleObservedByChain = new Map<string, boolean>()
+  for (const expected of gt.expectedChains) {
+    expectedChainIds.add(expected.chainId)
+    const evaluation = evalByChain.get(expected.chainId)
+    const chainEvents = oracleEventsByChain.get(expected.chainId) ?? []
+    const observedHopIds = new Set(
+      chainEvents.filter((e) => e.eventKind === 'hop' && e.hopId).map((e) => e.hopId!),
+    )
+    const maxHopReached = evaluation ? evaluation.hopsObserved : observedHopIds.size
+    const forbiddenShortcutViolation = evaluation?.dropReason === 'persona_shortcut_rejected'
+    const oracleObserved = evaluation
+      ? evaluation.completed && evaluation.terminalObserved && !forbiddenShortcutViolation
+      : chainEvents.some((e) => e.eventKind === 'terminal') && maxHopReached >= expected.hopIds.length
+    oracleObservedByChain.set(expected.chainId, oracleObserved)
+  }
+
   const receiptByChain = new Map<string, ProductSubmittedCompositeProof>()
+  const resolvedChainByReceipt = new Map<ProductSubmittedCompositeProof, string>()
   for (const receipt of receipts) {
-    if (receipt.chainId && !receiptByChain.has(receipt.chainId)) {
-      receiptByChain.set(receipt.chainId, receipt)
+    const resolvedChainId = resolveReceiptChainId(receipt, expectedChainIds, chainSpecs, oracleObservedByChain)
+    if (!resolvedChainId) continue
+    resolvedChainByReceipt.set(receipt, resolvedChainId)
+    const existing = receiptByChain.get(resolvedChainId)
+    if (!existing || receiptPriority(receipt) > receiptPriority(existing)) {
+      receiptByChain.set(resolvedChainId, receipt)
     }
   }
 
@@ -1018,9 +1283,7 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
     )
     const maxHopReached = evaluation ? evaluation.hopsObserved : observedHopIds.size
     const forbiddenShortcutViolation = evaluation?.dropReason === 'persona_shortcut_rejected'
-    const oracleObserved = evaluation
-      ? evaluation.completed && evaluation.terminalObserved && !forbiddenShortcutViolation
-      : chainEvents.some((e) => e.eventKind === 'terminal') && maxHopReached >= expected.hopIds.length
+    const oracleObserved = oracleObservedByChain.get(expected.chainId) ?? false
 
     const matchedReceipt = receiptByChain.get(expected.chainId)
     const replayMode = matchedReceipt?.replayMode ?? 'fresh_clean_replay'
@@ -1066,6 +1329,7 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
   })
 
   const confirmedChainIds = new Set(chains.filter((c) => c.twoSideConfirmed).map((c) => c.chainId))
+  const allSpecChainIds = new Set(chainSpecs.map((spec) => spec.chainId))
   const resolvedTwins = resolveProductTwins(gt)
   const twinClaimFindingIds = new Set<string>()
   const hardenedTwins: ProductTwinVerdict[] = resolvedTwins.map((decoy) => {
@@ -1076,8 +1340,11 @@ function gradeProductRun(input: ProductGradeInput): ProductScorecard {
     for (const receipt of receipts) {
       const receiptId = receipt.findingId ?? `receipt:${receipt.chainId}`
       if (receipt.findingId && confirmedFindingIds.has(receipt.findingId) && !isTwinMode) continue
+      const resolvedChainForReceipt = resolvedChainByReceipt.get(receipt)
+        ?? resolveReceiptChainId(receipt, allSpecChainIds, chainSpecs, oracleObservedByChain)
+      const matchedBaseChain = resolvedChainForReceipt === decoy.baseChainId
       const receiptMatchesTwin = receipt.chainId === decoy.twinId
-        || (receipt.chainId === decoy.baseChainId && (isTwinMode || !baseChainConfirmed))
+        || ((receipt.chainId === decoy.baseChainId || matchedBaseChain) && (isTwinMode || !baseChainConfirmed))
       if (receiptMatchesTwin) {
         if (!matchedIds.includes(receiptId)) matchedIds.push(receiptId)
         twinClaimFindingIds.add(receiptId)

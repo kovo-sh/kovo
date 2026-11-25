@@ -753,11 +753,23 @@ export function evaluateTwoSideConfirmation(
   rawVerdicts: readonly MultihopChainVerdict[],
   compositeReceipts: readonly SubmittedCompositeProof[] = [],
 ): TwoSideConfirmationSummary {
+  const receiptRank = (r: SubmittedCompositeProof): number => {
+    if (r.confirmed && r.attackerProvenanceValid && r.replayMode === 'fresh_clean_replay') return 3
+    if (r.confirmed) return 2
+    if (r.replayMode === 'fresh_clean_replay') return 1
+    return 0
+  }
   const receiptByChainId = new Map<string, SubmittedCompositeProof>()
   const receiptByFindingId = new Map<string, SubmittedCompositeProof>()
   for (const r of compositeReceipts) {
-    if (r.chainId) receiptByChainId.set(r.chainId, r)
-    if (r.findingId) receiptByFindingId.set(r.findingId, r)
+    if (r.chainId) {
+      const prev = receiptByChainId.get(r.chainId)
+      if (!prev || receiptRank(r) > receiptRank(prev)) receiptByChainId.set(r.chainId, r)
+    }
+    if (r.findingId) {
+      const prev = receiptByFindingId.get(r.findingId)
+      if (!prev || receiptRank(r) > receiptRank(prev)) receiptByFindingId.set(r.findingId, r)
+    }
   }
 
   let oracleObserved = 0
@@ -1198,12 +1210,26 @@ export function planCell(briefing: MultihopBriefing, loginPath: string | null): 
  */
 export function extractCompositeReceipts(input: {
   findings: readonly Finding[]
-  replaySpecs: ReadonlyArray<{ id: string; findingId: string | null; spec: unknown }>
+  replaySpecs: ReadonlyArray<{ id: string; findingId: string | null; spec: unknown; proofReceipt?: unknown }>
 }): SubmittedCompositeProof[] {
   const out: SubmittedCompositeProof[] = []
-  const seen = new Set<string>()
+  const indexByKey = new Map<string, number>()
+  const skippedFindingIds = new Set<string>()
+  for (const finding of input.findings) {
+    if (finding.status === 'dismissed' || finding.supersededByFindingId) {
+      if (finding.id) skippedFindingIds.add(finding.id)
+    }
+  }
+
+  const candidateScore = (item: SubmittedCompositeProof): number => {
+    const modeAConfirmed = item.confirmed && item.attackerProvenanceValid && item.replayMode === 'fresh_clean_replay'
+    return (modeAConfirmed ? 8 : item.confirmed ? 4 : 0)
+      + (item.verification ? 2 : 0)
+      + (item.verification?.terminalEndpoint ? 1 : 0)
+  }
 
   const inspectRecord = (findingId: string | undefined, raw: unknown): void => {
+    if (findingId && skippedFindingIds.has(findingId)) return
     if (!raw || typeof raw !== 'object') return
     const obj = raw as Record<string, unknown>
     const candidate = (obj.compositeReceipt ?? obj.compositeProofReceipt ?? obj) as Record<string, unknown>
@@ -1214,15 +1240,12 @@ export function extractCompositeReceipts(input: {
       && Array.isArray(candidate.hops)
       && candidate.hops.length >= 1
     ) {
-      const key = `${candidate.chainId}:${findingId ?? ''}`
-      if (seen.has(key)) return
-      seen.add(key)
       const replayMode = candidate.replayMode === 'one_shot_transcript' ? 'one_shot_transcript' : 'fresh_clean_replay'
       const confirmed = verification ? Boolean(verification.confirmed) : false
       const attackerProvenanceValid = verification
         ? verification.failedStage !== 'attacker_provenance'
         : false
-      out.push({
+      const entry: SubmittedCompositeProof = {
         ...(findingId ? { findingId } : {}),
         chainId: candidate.chainId,
         terminalVulnClass: candidate.terminalVulnClass,
@@ -1233,14 +1256,30 @@ export function extractCompositeReceipts(input: {
         ...(verification?.modeBVerified !== undefined ? { modeBVerified: verification.modeBVerified } : {}),
         receipt: candidate as unknown as CompositeProofReceipt,
         ...(verification ? { verification: verification as CompositeReceiptVerification } : {}),
-      })
+      }
+      const key = `${candidate.chainId}:${findingId ?? ''}`
+      const existingIdx = indexByKey.get(key)
+      if (existingIdx !== undefined) {
+        if (candidateScore(entry) > candidateScore(out[existingIdx]!)) {
+          out[existingIdx] = entry
+        }
+        return
+      }
+      indexByKey.set(key, out.length)
+      out.push(entry)
     }
   }
 
   for (const row of input.replaySpecs) {
-    inspectRecord(row.findingId ?? undefined, row.spec)
+    const findingId = row.findingId ?? undefined
+    if (findingId && skippedFindingIds.has(findingId)) continue
+    inspectRecord(findingId, row.spec)
+    if (row.proofReceipt !== undefined && row.proofReceipt !== null) {
+      inspectRecord(findingId, row.proofReceipt)
+    }
   }
   for (const finding of input.findings) {
+    if (finding.status === 'dismissed' || finding.supersededByFindingId) continue
     inspectRecord(finding.id, (finding as unknown as { evidence?: unknown }).evidence)
   }
   return out
@@ -3059,7 +3098,7 @@ export async function runCell(
     const compositeReceipts = extractCompositeReceipts({
       findings: detail.findings as Finding[],
       replaySpecs: detail.replaySpecs.map(row => ({
-        id: row.id, findingId: row.findingId, spec: row.spec,
+        id: row.id, findingId: row.findingId, spec: row.spec, proofReceipt: row.proofReceipt,
       })),
     })
 
