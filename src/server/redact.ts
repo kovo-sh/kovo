@@ -5,28 +5,102 @@ export interface NamedSecret {
   placeholder: string
 }
 
+export const SENSITIVE_HTTP_HEADER_RE = /^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|x-auth-token|x-access-token|x-refresh-token|x-session-token|x-session-id|x-csrf-token|x-xsrf-token|csrf-token|xsrf-token|x-amz-security-token|x-forwarded-authorization)$/i
+
+const SECRET_KEY_CORE = '(?:[A-Za-z0-9_-]*(?:password|passwd|api[_-]?key|signing[_-]?key|private[_-]?key|encryption[_-]?key|master[_-]?key|hmac[_-]?key|jwt[_-]?key|secret[_-]?key(?:[_-]?base)?|secret[_-]?access[_-]?key|token|secret|session[_-]?(?:id|key|cookie)|service[_-]?role[_-]?key)|authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-csrf-token|x-xsrf-token)'
+
 const credentialPatterns = [
-  /\b(?:sk-or-v1-[a-z0-9_-]+|sk-ant-[a-z0-9_-]+|sk-proj-[a-z0-9_-]+|github_pat_[a-z0-9_]+|gh[pousr]_[a-z0-9_]+)\b/gi,
+  /\b(?:sk-or-v1-[A-Za-z0-9_-]+|sk-ant-[A-Za-z0-9_-]+|sk-proj-[A-Za-z0-9_-]+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|(?:AKIA|ASIA)[0-9A-Z]{16}|(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,}|whsec_[0-9A-Za-z]{16,}|xox[baprs]-[0-9A-Za-z-]{10,}|glpat-[0-9A-Za-z_-]{16,}|SG\.[0-9A-Za-z_-]{16,}\.[0-9A-Za-z_-]{16,}|AIza[0-9A-Za-z_-]{35}|npm_[0-9A-Za-z]{20,}|pypi-[0-9A-Za-z_-]{20,}|hf_[0-9A-Za-z]{20,})\b/g,
   /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?/g,
   /-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\n]*PRIVATE KEY-----/g,
-  /\b(?:authorization|proxy-authorization|cookie|set-cookie)\s*:\s*[^\n\r"]+/gi,
+  /(?<!")\b(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-csrf-token|x-xsrf-token)\s*:\s*[^\n\r"]+/gi,
   /\bBearer\s+[a-z0-9._~+/=-]{8,}/gi,
-  /("[A-Za-z0-9_-]*(?:password|passwd|api[_-]?key|signing[_-]?key|private[_-]?key|token|secret|session[_-]?(?:id|key)|service[_-]?role[_-]?key)"\s*:\s*)(?:(null|\{|\[)|"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false)|(?<![A-Za-z0-9_-])[A-Za-z0-9_-]*(?:password|passwd|api[_-]?key|signing[_-]?key|private[_-]?key|token|secret|session[_-]?(?:id|key)|service[_-]?role[_-]?key)["']?\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'[^']*'|[^\s&,;}"']+)/gi,
+  new RegExp(
+    `("${SECRET_KEY_CORE}"\\s*:\\s*)(?:(null|\\{|\\[)|"(?:\\\\.|[^"\\\\])*"|-?\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?|true|false)|(?<![A-Za-z0-9_-])${SECRET_KEY_CORE}["']?\\s*[:=]\\s*(?:"(?:\\\\.|[^"\\\\])*"|'[^']*'|[^\\s&,;}"']+)`,
+    'gi',
+  ),
 ]
 
-export function redact(text: string, secrets: readonly NamedSecret[] = []): string {
-  let out = text
-  for (const secret of secrets) {
-    if (!secret.value || secret.value.length < 4) continue
-    out = out.replaceAll(secret.value, secret.placeholder)
-    // Also scrub URL-encoded and base64/base64url forms of registered persona/API secrets.
-    const encoded = encodeURIComponent(secret.value)
-    if (encoded !== secret.value && encoded.length >= 6) out = out.replaceAll(encoded, secret.placeholder)
-    const b64 = Buffer.from(secret.value, 'utf8').toString('base64')
-    if (b64 !== secret.value && b64.length >= 4) out = out.replaceAll(b64, secret.placeholder)
-    const b64url = Buffer.from(secret.value, 'utf8').toString('base64url')
-    if (b64url !== secret.value && b64url !== b64 && b64url.length >= 4) out = out.replaceAll(b64url, secret.placeholder)
+function htmlEscapeBasic(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;')
+}
+
+/**
+ * Generates exact encoded variants of a registered secret for zero-heuristic scrubbing (M-14):
+ * raw, URL-encoded (uppercase/lowercase/form), base64 (padded/unpadded/URL-encoded), base64url,
+ * JSON-escaped, PHP slash-escaped (`\/`), and HTML-entity-encoded.
+ */
+export function buildSecretEncodingVariants(value: string, minEncodedLength = 4): string[] {
+  const forms = new Set<string>([value])
+  const add = (candidate: string, floor = minEncodedLength) => {
+    if (candidate && candidate !== value && candidate.length >= floor) forms.add(candidate)
   }
+  const encoded = encodeURIComponent(value)
+  if (encoded !== value) {
+    add(encoded, Math.max(6, minEncodedLength))
+    const lowerEncoded = encoded.replace(/%[0-9A-F]{2}/g, m => m.toLowerCase())
+    add(lowerEncoded, Math.max(6, minEncodedLength))
+    if (encoded.includes('%20')) {
+      add(encoded.replaceAll('%20', '+'), Math.max(6, minEncodedLength))
+      add(lowerEncoded.replaceAll('%20', '+'), Math.max(6, minEncodedLength))
+    }
+  }
+  const buf = Buffer.from(value, 'utf8')
+  const b64 = buf.toString('base64')
+  add(b64)
+  add(b64.replace(/=+$/, ''))
+  const b64UrlEnc = encodeURIComponent(b64)
+  if (b64UrlEnc !== b64) add(b64UrlEnc)
+  const b64url = buf.toString('base64url')
+  add(b64url)
+  const jsonEscaped = JSON.stringify(value).slice(1, -1)
+  add(jsonEscaped)
+  if (value.includes('/')) {
+    add(value.replaceAll('/', '\\/'))
+    add(jsonEscaped.replaceAll('/', '\\/'))
+  }
+  if (/[&<>"']/.test(value)) {
+    const htmlEsc = htmlEscapeBasic(value)
+    add(htmlEsc)
+    if (value.includes("'")) add(htmlEsc.replaceAll('&#39;', '&#x27;'))
+  }
+  return [...forms]
+}
+
+/**
+ * Exact-value secret redaction ONLY (zero heuristic keyword regexes).
+ * Safe for model tool arguments, scripts, code, and structured JSON payloads.
+ */
+export function redactExactValues(
+  text: string,
+  secrets: readonly NamedSecret[] = [],
+  options: { minLength?: number } = {},
+): string {
+  if (!text || secrets.length === 0) return text
+  const minLen = Math.max(1, options.minLength ?? 4)
+  const needles: Array<{ needle: string; placeholder: string }> = []
+  for (const secret of secrets) {
+    if (!secret.value || secret.value.length < minLen) continue
+    for (const variant of buildSecretEncodingVariants(secret.value, Math.min(4, minLen))) {
+      needles.push({ needle: variant, placeholder: secret.placeholder })
+    }
+  }
+  if (needles.length === 0) return text
+  needles.sort((a, b) => b.needle.length - a.needle.length)
+  let out = text
+  for (const { needle, placeholder } of needles) {
+    if (out.includes(needle)) out = out.replaceAll(needle, () => placeholder)
+  }
+  return out
+}
+
+export function redact(text: string, secrets: readonly NamedSecret[] = []): string {
+  let out = redactExactValues(text, secrets, { minLength: 4 })
   out = credentialPatterns.slice(0, 5).reduce((value, pattern) => value.replace(pattern, '[redacted]'), out)
   return out.replace(credentialPatterns[5]!, (_m, jsonPrefix?: string, preserved?: string) => (
     jsonPrefix ? `${jsonPrefix}${preserved ?? '"[redacted]"'}` : '[redacted]'
@@ -256,14 +330,7 @@ function looksHighEntropy(segment: string): boolean {
 }
 
 function secretVariants(value: string): string[] {
-  const forms = new Set<string>([value])
-  const encoded = encodeURIComponent(value)
-  if (encoded !== value && encoded.length >= 6) forms.add(encoded)
-  const b64 = Buffer.from(value, 'utf8').toString('base64')
-  if (b64 !== value && b64.length >= 4) forms.add(b64)
-  const b64url = Buffer.from(value, 'utf8').toString('base64url')
-  if (b64url !== value && b64url !== b64 && b64url.length >= 4) forms.add(b64url)
-  return [...forms]
+  return buildSecretEncodingVariants(value, 4)
 }
 
 function countOccurrences(haystack: string, needle: string, cap: number): number {
@@ -354,11 +421,15 @@ function cleanPathSegment(key: string): string {
   return cleaned.slice(0, 48)
 }
 
-export function redactHeaders(headers: Record<string, string>, secrets: readonly NamedSecret[] = []): Record<string, string> {
-  const sensitiveHeader = /^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-csrf-token|x-xsrf-token)$/i
+export function redactHeaders(
+  headers: Record<string, string | string[] | undefined>,
+  secrets: readonly NamedSecret[] = [],
+): Record<string, string> {
   const out: Record<string, string> = {}
-  for (const [key, value] of Object.entries(headers)) {
-    out[key] = sensitiveHeader.test(key) ? '[redacted]' : redact(value, secrets)
+  for (const [key, rawValue] of Object.entries(headers)) {
+    if (rawValue === undefined) continue
+    const value = Array.isArray(rawValue) ? rawValue.join(', ') : String(rawValue)
+    out[key] = SENSITIVE_HTTP_HEADER_RE.test(key) ? '[redacted]' : redact(value, secrets)
   }
   return out
 }

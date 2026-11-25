@@ -441,8 +441,8 @@ export function bundleSecrets(bundle: PersonaCredentialBundle | undefined): stri
       for (const pair of value.split(';')) {
         const eq = pair.indexOf('=')
         if (eq <= 0) continue
-        const cookieValue = pair.slice(eq + 1).trim()
-        if (cookieValue.length >= 16) out.add(cookieValue)
+        const cookieValue = pair.slice(eq + 1).trim().replace(/^["']|["']$/g, '')
+        if (cookieValue.length >= 8) out.add(cookieValue)
       }
     }
   }
@@ -947,13 +947,13 @@ export function personaSecrets(resolved: ReadonlyMap<string, ResolvedPersona>): 
     for (const raw of values) {
       if (!raw) continue
       push(placeholder, raw)
-      // Also scrub individual cookie values >= 16 chars (e.g., rotated JWT inside "__session=<jwt>; __client_uat=...")
+      // Also scrub individual cookie values >= 8 chars (e.g., session tokens / rotated JWTs inside "sid=...; __session=<jwt>")
       if (persona.authKind === 'cookie' || persona.authKind === 'login') {
         for (const pair of raw.split(';')) {
           const eq = pair.indexOf('=')
           if (eq <= 0) continue
-          const cookieVal = pair.slice(eq + 1).trim()
-          if (cookieVal.length >= 16) push(placeholder, cookieVal)
+          const cookieVal = pair.slice(eq + 1).trim().replace(/^["']|["']$/g, '')
+          if (cookieVal.length >= 8) push(placeholder, cookieVal)
         }
       }
     }

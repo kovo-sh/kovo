@@ -854,6 +854,25 @@ export function boundedArtifactSize(root: string): { total: number; blobs: numbe
   return { total, blobs }
 }
 
+/**
+ * Identify SQLite foreign-key / deleted-run errors raised when a run (or its assignment) is
+ * deleted concurrently while queued exchange writes are flushing. Genuine I/O or corruption
+ * errors return false so they are never silently dropped.
+ */
+export function isDeadRunFkError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const err = error as { message?: unknown; code?: unknown; errstr?: unknown; errcode?: unknown; cause?: unknown }
+  const message = typeof err.message === 'string' ? err.message : ''
+  const errstr = typeof err.errstr === 'string' ? err.errstr : ''
+  const code = typeof err.code === 'string' ? err.code : ''
+  const errcode = typeof err.errcode === 'number' ? err.errcode : undefined
+  if (code === 'SQLITE_CONSTRAINT_FOREIGNKEY' || errcode === 787) return true
+  if (/FOREIGN KEY constraint failed/i.test(message) || /FOREIGN KEY constraint failed/i.test(errstr)) return true
+  if (/\brun not found\b/i.test(message)) return true
+  if (err.cause && err.cause !== error) return isDeadRunFkError(err.cause)
+  return false
+}
+
 export function cleanupRunFilesOnDisk(
   directory: string,
   runId: string,
@@ -867,6 +886,13 @@ export function cleanupRunFilesOnDisk(
       join(directory, 'agent-sessions', runId),
     ]) {
       try { rmSync(dir, { recursive: true, force: true }) } catch { /* ignore */ }
+    }
+    const safeVaultRunId = /^[A-Za-z0-9._-]{1,128}$/.test(runId)
+      ? runId
+      : runId.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 128) || 'run'
+    for (const vaultFile of new Set([`${runId}.json`, `${safeVaultRunId}.json`])) {
+      if (!isSafePathSegment(vaultFile)) continue
+      try { unlinkSync(join(directory, 'capability-vaults', vaultFile)) } catch { /* ignore */ }
     }
   }
   for (const sessionId of sessionIds) {
@@ -1110,14 +1136,57 @@ export class StoreSession implements DbSession {
     const batch = this.pendingExchanges.splice(0, this.pendingExchanges.length)
     this._flushing = true
     try {
-      withBusyRetry(() => this.client.exec('BEGIN IMMEDIATE'))
+      let begun = false
       try {
-        this.applyExchangeBatch(batch)
+        withBusyRetry(() => this.client.exec('BEGIN IMMEDIATE'))
+        begun = true
+        const inserted = this.applyExchangeBatch(batch)
         withBusyRetry(() => this.client.exec('COMMIT'))
+        this.emitExchangeEvents(inserted)
       } catch (error) {
-        try { this.client.exec('ROLLBACK') } catch { /* ignore */ }
-        this.pendingExchanges.unshift(...batch)
-        throw error
+        if (begun) {
+          try { this.client.exec('ROLLBACK') } catch { /* ignore */ }
+        } else {
+          this.pendingExchanges.unshift(...batch)
+          throw error
+        }
+        // M-16: never poison the shared SQLite write queue when one run in a multi-run batch
+        // was deleted concurrently. Isolate per item: commit live-run rows, drop dead-run FK
+        // rows, and rethrow only genuine non-deleted-run storage errors.
+        if (isDeadRunFkError(error)) {
+          if (batch.length > 1) {
+            const failedItems: PendingExchangeWrite[] = []
+            let nonFkError: unknown = null
+            for (const item of batch) {
+              let itemBegun = false
+              try {
+                withBusyRetry(() => this.client.exec('BEGIN IMMEDIATE'))
+                itemBegun = true
+                const inserted = this.applyExchangeBatch([item])
+                withBusyRetry(() => this.client.exec('COMMIT'))
+                this.emitExchangeEvents(inserted)
+              } catch (itemError) {
+                if (itemBegun) {
+                  try { this.client.exec('ROLLBACK') } catch { /* ignore */ }
+                }
+                if (isDeadRunFkError(itemError)) {
+                  // Dead run / deleted assignment: drop this stale write cleanly.
+                  continue
+                }
+                failedItems.push(item)
+                nonFkError ??= itemError
+              }
+            }
+            if (failedItems.length > 0) {
+              this.pendingExchanges.unshift(...failedItems)
+              throw nonFkError
+            }
+          }
+          // Single-item dead-run FK write is dropped cleanly without poisoning future flushes.
+        } else {
+          this.pendingExchanges.unshift(...batch)
+          throw error
+        }
       }
     } finally {
       this._flushing = false
@@ -1128,7 +1197,8 @@ export class StoreSession implements DbSession {
   /** Queue one fully-redacted exchange row, flushing synchronously at the bounded size boundary. */
   enqueueExchange(item: PendingExchangeWrite): void {
     if (this._txDepth > 0) {
-      this.applyExchangeBatch([item])
+      const inserted = this.applyExchangeBatch([item])
+      this.emitExchangeEvents(inserted)
       return
     }
     this.pendingExchanges.push(item)
@@ -1153,12 +1223,28 @@ export class StoreSession implements DbSession {
     })
   }
 
+  private emitExchangeEvents(inserted: readonly (typeof tables.events.$inferSelect)[]): void {
+    if (!inserted.length) return
+    queueMicrotask(() => {
+      for (const event of inserted) {
+        this.emitter.emit('run:' + event.runId, {
+          id: event.id,
+          kind: event.kind,
+          message: event.message,
+          detail: event.detail,
+          createdAt: event.createdAt,
+        } satisfies RunEventPayload)
+      }
+      this.emitter.emit('wake')
+    })
+  }
+
   /**
    * Insert a batch of exchanges, their FTS rows, run/assignment request counters and audit events
    * inside one IMMEDIATE transaction. Bulk values keep a 128-exchange flush well under 50 ms.
    */
-  private applyExchangeBatch(batch: readonly PendingExchangeWrite[]): void {
-    if (!batch.length) return
+  private applyExchangeBatch(batch: readonly PendingExchangeWrite[]): (typeof tables.events.$inferSelect)[] {
+    if (!batch.length) return []
     const rows = batch.map(item => item.row)
     this.db.insert(tables.brokerExchanges).values(rows as typeof tables.brokerExchanges.$inferInsert[]).run()
     if (this.ftsAvailable) {
@@ -1193,19 +1279,7 @@ export class StoreSession implements DbSession {
       detail: item.eventDetail,
       createdAt: item.row.createdAt ?? Date.now(),
     }))
-    const inserted = this.db.insert(tables.events).values(eventRows).returning().all()
-    queueMicrotask(() => {
-      for (const event of inserted) {
-        this.emitter.emit('run:' + event.runId, {
-          id: event.id,
-          kind: event.kind,
-          message: event.message,
-          detail: event.detail,
-          createdAt: event.createdAt,
-        } satisfies RunEventPayload)
-      }
-      this.emitter.emit('wake')
-    })
+    return this.db.insert(tables.events).values(eventRows).returning().all()
   }
 
   transaction<T>(fn: () => T, _options?: { behavior?: 'deferred' | 'immediate' | 'exclusive' }): T {

@@ -650,7 +650,27 @@ export class Execution {
     this.personaAuth = options.personaAuth ?? new PersonaAuthManager()
     this.broker = options.broker ?? createBroker({ storage, canaryBroker: this.canaryBroker })
     if (!options.broker) {
-      this.broker.setReauth(personaHandle => this.personaAuth.requestReauth(personaHandle))
+      this.broker.setReauth(async (personaHandle, runId) => {
+        if (runId) {
+          if (this.personaAuth.sessions.has(personaHandle, runId)) {
+            return this.personaAuth.requestReauth(personaHandle, undefined, runId)
+          }
+          const runScoped = await this.personaAuth.requestReauth(personaHandle, undefined, runId)
+          if (runScoped) return true
+          // Backwards-compatible fallback ONLY for legacy unscoped pool registrations (`entry.runId === undefined`);
+          // never fall back across runs when the handle belongs to a different run.
+          const probe = this.personaAuth.cloneSession(personaHandle)
+          if (probe) {
+            const isUnscoped = !probe.runId
+            probe.dispose()
+            if (isUnscoped) {
+              return this.personaAuth.requestReauth(personaHandle)
+            }
+          }
+          return false
+        }
+        return this.personaAuth.requestReauth(personaHandle)
+      })
     }
     // `storage` activates second-order canary scanning inside the browser context too.
     this.browser = options.browser ?? new ScopedBrowser(this.broker, { storage })
@@ -927,6 +947,7 @@ export class Execution {
       try { trace.closeTrace() } catch { /* tracing must never break shutdown */ }
     }
     this.runTraces.clear()
+    this.capabilityVaults.clear()
     this.phaseBControllers.clear()
     this.agenticLaneJobs.clear()
     this.agenticLaneStopping.clear()
@@ -1110,11 +1131,25 @@ export class Execution {
     // session clone. A logout/rotation in one clone can never 401 a sibling worker.
     const personas = new Map(
       [...resolvedPersonas.entries()].map(([handle, persona]) => {
+        let usedUnscopedClone = false
         const cloned = cloneWorkerPersona(
           persona,
           job.assignment.id,
-          (h, wid) => this.personaAuth.cloneSession(h, wid),
-          h => this.personaAuth.sessions.session(h),
+          (h, wid) => {
+            const scoped = this.personaAuth.cloneSession(h, wid, run.id)
+            if (scoped) return scoped
+            // Backwards-compatible fallback ONLY for legacy unscoped pool entries (`entry.runId === undefined`);
+            // never attach a clone belonging to a different run.
+            const fallback = this.personaAuth.cloneSession(h, wid)
+            if (fallback && !fallback.runId) {
+              usedUnscopedClone = true
+              return fallback
+            }
+            fallback?.dispose()
+            return null
+          },
+          h => this.personaAuth.sessions.session(h, run.id)
+            ?? (usedUnscopedClone ? this.personaAuth.sessions.session(h) : null),
         )
         if (!cloned) return [handle, persona] as const
         const tracked = this.workerSessionClones.get(job.assignment.id) ?? []
@@ -1541,28 +1576,58 @@ export class Execution {
       return await options.execute()
     } catch (err) {
       if (!(err instanceof BrokerApprovalRequired)) throw err
-      const approval = await this.waitForTier3Approval(job, {
-        origin: approvalPlan.primary.origin,
-        method: approvalPlan.primary.method,
-        pathAndQuery: approvalPlan.primary.pathAndQuery,
-        personaHandle: approvalPlan.primary.personaHandle,
-        rationale: options.rationale,
-        requestPreview: options.requestPreview,
-        bodyPreview: approvalPlan.primary.bodyPreview,
-        bodyHash: approvalPlan.primary.bodyHash,
-        headers: approvalPlan.primary.headers,
-        hasMultipart: approvalPlan.primary.hasMultipart,
-        ...(options.isRaceBurst ? { isRaceBurst: true } : {}),
-        approvalInstances: approvalPlan.primary.approvalInstances,
-        additionalApprovalTargets: approvalPlan.additional,
-        secrets: options.secrets,
-      }, signal)
-      if (!approval.approved) {
-        throw new BrokerDenied(
-          approval.deniedReason
-            ? `Tier 3 Safety Judge denied ${options.denyLabel} probe: ${approval.deniedReason}`
-            : `Tier 3 ${options.denyLabel} request was denied or expired.`,
-        )
+      const distinctTargets = approvalPlan.targets
+      const multiTarget = distinctTargets.length > 1
+      const approvedGrants: Array<Parameters<typeof registerStateChangeGrant>[3]> = []
+      for (let idx = 0; idx < distinctTargets.length; idx += 1) {
+        const target = distinctTargets[idx]!
+        const targetPreview = multiTarget
+          ? JSON.stringify({
+              batchItem: `${idx + 1}/${distinctTargets.length}`,
+              totalRequests: requests.length,
+              instances: target.instances,
+              method: target.method,
+              origin: target.origin,
+              pathAndQuery: target.pathAndQuery,
+              persona: target.personaHandle,
+              bodyPreview: target.bodyPreview?.slice(0, 300) ?? null,
+              hasMultipart: target.hasMultipart,
+            }, null, 2)
+          : options.requestPreview
+        const approval = await this.waitForTier3Approval(job, {
+          origin: target.origin,
+          method: target.method,
+          pathAndQuery: target.pathAndQuery,
+          personaHandle: target.personaHandle,
+          rationale: multiTarget
+            ? `${options.rationale} (target ${idx + 1}/${distinctTargets.length}: ${target.method.toUpperCase()} ${target.pathAndQuery})`
+            : options.rationale,
+          requestPreview: targetPreview,
+          bodyPreview: target.bodyPreview,
+          bodyHash: target.bodyHash,
+          headers: target.headers,
+          hasMultipart: target.hasMultipart,
+          ...(options.isRaceBurst ? { isRaceBurst: true } : {}),
+          approvalInstances: target.instances,
+          deferGrant: multiTarget,
+          secrets: options.secrets,
+        }, signal)
+        if (!approval.approved) {
+          throw new BrokerDenied(
+            approval.deniedReason
+              ? `Tier 3 Safety Judge denied ${options.denyLabel} probe: ${approval.deniedReason}`
+              : `Tier 3 ${options.denyLabel} request was denied or expired.`,
+          )
+        }
+        if (multiTarget && approval.grantTarget) {
+          approvedGrants.push(approval.grantTarget)
+        }
+      }
+      if (multiTarget) {
+        const freshRun = this.check(job)
+        for (const grantTarget of approvedGrants) {
+          registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, freshRun, grantTarget)
+        }
       }
       return await options.execute()
     }
@@ -1643,7 +1708,10 @@ export class Execution {
       isRaceBurst?: boolean
       /** Single-use instances of the primary fingerprint this decision covers (default 1). */
       approvalInstances?: number
-      /** Additional exact requests covered by one synchronized decision (e.g. a race burst). */
+      /**
+       * Deprecated: distinct sibling targets can never piggyback on one approval decision.
+       * Passing a non-empty array fails closed so unjudged targets are never granted.
+       */
       additionalApprovalTargets?: Array<{
         origin: string
         method: string
@@ -1653,14 +1721,22 @@ export class Execution {
         hasMultipart?: boolean
         instances?: number
       }>
+      /** When true, return the approved grant descriptor without registering it yet (used by multi-target groups). */
+      deferGrant?: boolean
       secrets: readonly NamedSecret[]
     },
     signal: AbortSignal,
-  ): Promise<{ approved: boolean; deniedReason?: string }> {
+  ): Promise<{ approved: boolean; deniedReason?: string; grantTarget?: Parameters<typeof registerStateChangeGrant>[3] }> {
     const run = this.check(job)
     const project = this.storage.project(run.projectId)
     if (run.capabilityTier < 3) {
       throw new BrokerDenied('This operation requires Capability Tier 3.')
+    }
+    if (input.additionalApprovalTargets && input.additionalApprovalTargets.length > 0) {
+      return {
+        approved: false,
+        deniedReason: 'Distinct batch targets must each be evaluated individually; piggybacking additionalApprovalTargets is forbidden.',
+      }
     }
 
     // NOTE: local-lab auto-approval is decided exclusively below by evaluateTier3Approval so
@@ -1723,8 +1799,11 @@ export class Execution {
         decidedBy: approved ? (evaluation.decidedBy === 'operator' ? 'auto-review:rule' : evaluation.decidedBy) : 'auto-review:judge',
       })
       if (!approved) return { approved: false, deniedReason: evaluation.reason }
-      registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, grantTarget(), input.additionalApprovalTargets ?? [])
-      return { approved: true }
+      const targetGrant = grantTarget()
+      if (!input.deferGrant) {
+        registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, targetGrant)
+      }
+      return { approved: true, grantTarget: targetGrant }
     }
 
     const approvalKey = [
@@ -1831,13 +1910,17 @@ export class Execution {
       }
       // A human/operator approval authorizes exactly this fingerprint once; broader reuse requires
       // an explicit operator pattern (approve_similar_endpoint), never a prefix match on the card.
-      registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, grantTarget(postedApprovalId), input.additionalApprovalTargets ?? [])
+      const targetGrant = grantTarget(postedApprovalId)
+      if (!input.deferGrant) {
+        registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, targetGrant)
+      }
+      return { approved: true, grantTarget: targetGrant }
     } else {
       // A denied/expired/canceled decision ends this assignment and settles its chain step so
       // neither investigation nor verification wedges waiting on a permanently blocked worker.
       this.terminateApprovalBlockedAssignment(run.id, job.assignment.id, decision)
     }
-    return { approved: decision === 'approved' }
+    return { approved: false }
   }
 
   private terminateApprovalBlockedAssignment(
@@ -2010,6 +2093,18 @@ export class Execution {
         this.startedLabRuns.delete(runId)
         this.startedLabHandles.delete(runId)
         void this.labRunner.stopLabTarget(runId).catch(() => undefined)
+      }
+    }
+
+    // M-28: evict cached in-memory capability vaults for finalized, failed, stopped, or deleted runs
+    for (const runId of [...this.capabilityVaults.keys()]) {
+      try {
+        const current = this.storage.run(runId)
+        if (current.status === 'complete' || current.status === 'failed' || current.status === 'stopped' || current.phase === 'complete') {
+          this.capabilityVaults.delete(runId)
+        }
+      } catch {
+        this.capabilityVaults.delete(runId)
       }
     }
 
@@ -2723,7 +2818,10 @@ export class Execution {
         this.agenticLaneJobs.delete(run.id)
         this.agenticLaneStopping.delete(run.id)
         if (holder.assignmentId) this.overlappedFloorAssignmentIds.delete(holder.assignmentId)
-        this.agenticLaneCompleted.add(key)
+        // M-10: do not mark Phase A completed when aborted (e.g. pause mid-floor), so resume re-runs it.
+        if (!controller.signal.aborted) {
+          this.agenticLaneCompleted.add(key)
+        }
         this.agenticFloorFinishedAt.set(run.id, Date.now())
         this.traceLifecycle(run.id, 'lane_end', { aborted: controller.signal.aborted, deadlineMs })
         try { this.settleFloorRequestPhase(run.id, controller.signal.aborted ? 'floor_aborted' : 'floor_complete') } catch { /* metrics only */ }
@@ -4430,6 +4528,16 @@ export class Execution {
       lastDrain: this.lastOobDrain,
       drain: runId => this.drainPendingOob(runId),
     }, run)
+    if (!this.verificationDraining.has(run.id)) {
+      try {
+        const current = this.storage.run(run.id)
+        if (current.status === 'complete' || current.phase === 'complete') {
+          this.capabilityVaults.delete(run.id)
+        }
+      } catch {
+        this.capabilityVaults.delete(run.id)
+      }
+    }
   }
 
   private advanceToVerification(run: Run) {

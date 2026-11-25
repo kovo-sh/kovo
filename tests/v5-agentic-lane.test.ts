@@ -22,7 +22,6 @@ import { setTimeout as delay } from 'node:timers/promises'
 
 import type { Finding, InlineVerifyFeedback } from '../src/domain.ts'
 import { readTrace } from '../src/server/agent-trace.ts'
-import { proveAuthzReadDiff, validateProofInput } from '../src/server/proof-tools.ts'
 import { verifierRepairFeedback, withVerifierRepairFeedback } from '../src/server/agent-session.ts'
 import {
   computeDynamicStepBudget,
@@ -33,7 +32,6 @@ import {
 } from '../src/server/execution.ts'
 import { Store } from '../src/server/store.ts'
 import type { ChainStep, Run } from '../src/server/store.ts'
-import type { CompiledProof } from '../src/server/proof-tools.ts'
 import { setupApprovedRun, withEnv } from './v4-tier-helpers.ts'
 
 process.env.KOVO_ALLOW_LOCAL_LAB = '1'
@@ -324,27 +322,9 @@ test('proof handler compiles a typed spec and verification failures carry repair
   const origin = run.candidates.find(c => run.approved.includes(c.id))!.origin
   const execution = track(new Execution(storage))
 
-  // Invalid input is rejected before the handler is called (compiler validation).
-  const invalid = validateProofInput('prove_authz_read_diff', { origin })
-  assert.equal(invalid.ok, false)
-  if (!invalid.ok) {
-    assert.ok(invalid.errors.length > 0)
-    assert.ok(invalid.errors.every(error => typeof error.fix === 'string' && error.fix.length > 0))
-  }
-
-  const proof: CompiledProof = proveAuthzReadDiff({
-    origin,
-    ownerPersona: 'owner',
-    attackerPersona: 'attacker',
-    endpoint: '/api/invoices/{resourceId}',
-    resourceId: 'inv_9f3c2b71',
-    identifierPath: 'data.id',
-  })
-  assert.equal(proof.spec.kind, 'http_chain')
-
-  // The retired `submitProofSpec` compiler path is gone (M0 Cut 1); verification feedback is now
-  // surfaced by `withVerifierRepairFeedback`, which must attach a structured repair block to a
-  // failing outcome and must leave a confirmed outcome byte-identical.
+  // The retired `submitProofSpec` and `proof-tools.ts` compiler paths are gone; verification
+  // feedback is surfaced by `withVerifierRepairFeedback`, which attaches a structured repair
+  // block to a failing outcome and leaves a confirmed outcome byte-identical.
   const feedback: InlineVerifyFeedback = {
     verdict: 'inconclusive',
     controlPassed: false,

@@ -67,6 +67,22 @@ export interface ReceiptTranscriptEntry {
   step: ImpactStep
   /** Wall-clock duration of the exchange (timing-differential receipts). */
   durationMs?: number
+  /** Host-recorded operation type (`http`, `http2`, `race`, `oob`, `browser`). */
+  op?: string
+  /** Host-recorded monotonic transcript sequence index (never worker-ordered). */
+  seq?: number
+  /** Host-recorded request start timestamp (epoch ms). */
+  startedAt?: number
+  /** Host-recorded request end timestamp (epoch ms). */
+  endedAt?: number
+  /** Host-recorded target origin of this exchange. */
+  origin?: string
+  /** Host-recorded primary sealed capability consumed by this exchange (if any). */
+  consumedCapabilityId?: string | null
+  /** Host-recorded sealed capabilities consumed by this exchange (if any). */
+  consumedCapabilities?: readonly string[]
+  /** Host-recorded session jar identifier (if any). */
+  sessionId?: string | null
   /**
    * Text the target actually received (path, request headers, body). Used only to prove the
    * injected canary token reached the target — never to re-run a request.
@@ -402,15 +418,66 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
 
   if (rule === 'timing') {
     if (receipt.exchangeIds.length < 2) return reject(receipt, rule, 'A timing receipt needs a control and a probe exchange.')
+    const uniqueIds = new Set(receipt.exchangeIds)
+    if (uniqueIds.size !== receipt.exchangeIds.length) {
+      return reject(receipt, rule, 'A timing receipt must not cite duplicate exchange IDs across control and probe arms.')
+    }
     const timed = receipt.exchangeIds.map(id => entriesById.get(id)!)
     const controls = timed.filter(entry => entry.step.arm === 'control')
     const probes = timed.filter(entry => entry.step.arm === 'probe')
     if (controls.length === 0 || probes.length === 0) {
       return reject(receipt, rule, 'A timing receipt needs at least one control arm and one probe arm.')
     }
-    const controlMs = Math.max(...controls.map(entry => entry.durationMs ?? entry.step.durationMs ?? 0))
-    const probeMs = Math.max(...probes.map(entry => entry.durationMs ?? entry.step.durationMs ?? 0))
-    if (controlMs <= 0 || probeMs <= 0) return reject(receipt, rule, 'Timing receipt exchanges must record their wall-clock duration.')
+    // H-15: Every control and probe exchange MUST target the exact same normalized origin,
+    // HTTP method, route path, and persona so a fast route or different persona cannot be paired
+    // against a legitimately slow route/persona to forge a blind_sqli timing confirmation.
+    const normalizedActorOf = (entry: ReceiptTranscriptEntry): string => (entry.step.actor.handle ?? '').trim().toLowerCase()
+    const baseMethod = controls[0]!.step.method.toUpperCase()
+    const baseRoute = routeOf(controls[0]!.step)
+    const basePersona = normalizedActorOf(controls[0]!)
+    const baseOrigin = controls[0]!.origin ? normalizeOrigin(controls[0]!.origin) : null
+    const targetOrigin = normalizeOrigin(receipt.target.origin)
+    const targetRoute = receipt.target.pathAndQuery ? normalizePath(receipt.target.pathAndQuery) : null
+    for (const entry of [...controls, ...probes]) {
+      const method = entry.step.method.toUpperCase()
+      if (method !== baseMethod) {
+        return reject(receipt, rule, `Timing arms must use the exact same HTTP method (${baseMethod} vs ${method}).`)
+      }
+      if (receipt.target.method && method !== receipt.target.method) {
+        return reject(receipt, rule, `Timing exchange method (${method}) does not match receipt target (${receipt.target.method}).`)
+      }
+      const route = routeOf(entry.step)
+      if (route !== baseRoute) {
+        return reject(receipt, rule, `Timing arms must target the exact same route (${baseRoute || '/'} vs ${route || '/'}).`)
+      }
+      if (targetRoute && route && route !== targetRoute) {
+        return reject(receipt, rule, `Timing exchange route (${route}) does not match receipt target (${targetRoute}).`)
+      }
+      const persona = normalizedActorOf(entry)
+      if (persona !== basePersona) {
+        return reject(receipt, rule, `Timing arms must execute under the exact same persona (${basePersona || 'anonymous'} vs ${persona || 'anonymous'}).`)
+      }
+      if (entry.origin) {
+        const entryOrigin = normalizeOrigin(entry.origin)
+        if (baseOrigin && entryOrigin !== baseOrigin) {
+          return reject(receipt, rule, `Timing arms must target the exact same origin (${baseOrigin} vs ${entryOrigin}).`)
+        }
+        if (entryOrigin !== targetOrigin) {
+          return reject(receipt, rule, `Timing exchange origin (${entryOrigin}) does not match receipt target (${targetOrigin}).`)
+        }
+      }
+    }
+    const controlDurations = controls.map(entry => entry.durationMs ?? entry.step.durationMs ?? 0)
+    const probeDurations = probes.map(entry => entry.durationMs ?? entry.step.durationMs ?? 0)
+    if (controlDurations.some(d => d <= 0) || probeDurations.some(d => d <= 0)) {
+      return reject(receipt, rule, 'Timing receipt exchanges must record their wall-clock duration.')
+    }
+    const sortedProbes = [...probeDurations].sort((a, b) => a - b)
+    const mid = Math.floor(sortedProbes.length / 2)
+    const probeMs = sortedProbes.length % 2 === 1
+      ? sortedProbes[mid]!
+      : (sortedProbes[mid - 1]! + sortedProbes[mid]!) / 2
+    const controlMs = Math.max(...controlDurations)
     if (controlMs >= 1_000) return reject(receipt, rule, `The control took ${controlMs} ms, so a delay is not distinguishable from normal latency.`)
     if (probeMs < Math.max(1_000, controlMs * 3)) {
       return reject(receipt, rule, `Probe ${probeMs} ms is not a stable separation from the ${controlMs} ms control.`)
@@ -419,10 +486,10 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
       confirmed: true,
       vulnClass: receipt.vulnClass,
       rule,
-      reason: `The probe arm took ${probeMs} ms against a ${controlMs} ms control (>3x separation).`,
+      reason: `The probe arm took ${probeMs} ms (median) against a ${controlMs} ms control (>3x separation) on ${baseMethod} ${baseRoute || targetRoute || '/'}.`,
       observed: receipt.claimedDelta,
       expected: 'comparable latency between control and probe',
-      evidence: { controlMs, probeMs },
+      evidence: { controlMs, probeMs, method: baseMethod, route: baseRoute || targetRoute || '/', persona: basePersona || null },
     }
   }
 
@@ -461,9 +528,7 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     if (controlLocations.includes(location)) {
       return reject(receipt, rule, 'The control arm redirects to the same off-origin destination, so the destination is not attacker-controlled.')
     }
-    const canaryPattern = (receipt.proofPatterns ?? []).find(pattern => {
-      try { return new RegExp(pattern).test(location) } catch { return false }
-    })
+    const canaryPattern = (receipt.proofPatterns ?? []).find(pattern => safeRegexTest(pattern, location))
     return {
       confirmed: true,
       vulnClass: receipt.vulnClass,
@@ -476,11 +541,12 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
   }
 
   if (rule === 'conserved_balance') {
-    return verifyConservedBalanceReceipt(receipt, entriesById)
+    const transcriptOrder = new Map(entries.map((entry, idx) => [entry.exchangeId, idx]))
+    return verifyConservedBalanceReceipt(receipt, entriesById, transcriptOrder)
   }
 
   if (rule === 'auth_bypass') {
-    return verifyAuthBypassReceipt(receipt, entriesById)
+    return verifyAuthBypassReceipt(receipt, entriesById, entries)
   }
 
   // Impact rules: re-run the shared oracle model over the recorded steps.
@@ -655,7 +721,7 @@ function findCapValue(baseline: ImpactStep, post: ImpactStep, balanceField: stri
   return null
 }
 
-function requestDebitOf(step: ImpactStep, fallbackUnitDebit: number): number {
+function hostRequestDebitOf(step: ImpactStep): number | null {
   if (step.requestJson && typeof step.requestJson === 'object' && !Array.isArray(step.requestJson)) {
     const fields = extractNumericFields(step.requestJson)
     for (const [field, value] of fields.entries()) {
@@ -663,23 +729,39 @@ function requestDebitOf(step: ImpactStep, fallbackUnitDebit: number): number {
       if (REQUEST_DEBIT_FIELD_RE.test(leaf) && value > 0) return value
     }
   }
-  return fallbackUnitDebit
+  return null
+}
+
+function entryHostOrder(entry: ReceiptTranscriptEntry, transcriptOrder: ReadonlyMap<string, number>): number {
+  if (typeof entry.seq === 'number' && Number.isFinite(entry.seq)) return entry.seq
+  return transcriptOrder.get(entry.exchangeId) ?? 0
+}
+
+function entryWindow(entry: ReceiptTranscriptEntry): { start: number; end: number } | null {
+  if (typeof entry.startedAt !== 'number' || !Number.isFinite(entry.startedAt)) return null
+  const start = entry.startedAt
+  const end = typeof entry.endedAt === 'number' && Number.isFinite(entry.endedAt)
+    ? Math.max(start, entry.endedAt)
+    : start + Math.max(0, entry.durationMs ?? entry.step.durationMs ?? 0)
+  return { start, end }
 }
 
 /**
  * Fail-closed `conserved_balance` receipt rule for race / double-spend / inventory-oversell proofs.
  * Requires host-recorded transcript evidence of:
- *   1. A 2xx baseline numeric readback before the burst,
- *   2. >=2 acknowledged (2xx) concurrent burst mutations (rejecting 5xx/4xx-only bursts),
- *   3. A 2xx post-burst numeric readback on the same conserved field proving a conservation
- *      violation (under-debit, negative balance/stock, or cap/quota overshoot — never status-only),
- *   4. A passing serial control exchange proving the conservation boundary holds serially (either
- *      serial debit matches expected debit without going negative, or serial mutation is rejected
- *      with 4xx once depleted/used).
+ *   1. A 2xx baseline numeric readback strictly before the burst in host transcript order,
+ *   2. >=2 acknowledged (2xx) concurrent burst mutations with genuine temporal overlap when
+ *      host timestamps are recorded (rejecting 5xx/4xx-only or strictly sequential bursts),
+ *   3. A 2xx post-burst numeric readback strictly after the burst in host transcript order on the
+ *      same conserved field proving a conservation violation (under-debit, negative balance/stock,
+ *      or cap/quota overshoot — never status-only),
+ *   4. A passing serial control exchange proving the conservation boundary holds serially, with
+ *      per-mutation debit derived/bounded strictly from host-recorded exchanges.
  */
 function verifyConservedBalanceReceipt(
   receipt: ProofReceipt,
   entriesById: ReadonlyMap<string, ReceiptTranscriptEntry>,
+  transcriptOrder: ReadonlyMap<string, number>,
 ): ReceiptVerification {
   const rule = 'conserved_balance' as const
   if (receipt.exchangeIds.length < 4) {
@@ -689,7 +771,21 @@ function verifyConservedBalanceReceipt(
       'A conserved_balance receipt requires baseline readback, >=2 burst mutations, post-burst readback, and a serial control.',
     )
   }
-  const cited = receipt.exchangeIds.map(id => entriesById.get(id)!)
+  // C-5: Never trust worker-supplied `receipt.exchangeIds` array order. Deduplicate and sort
+  // deterministically by host transcript sequence/order (with host `startedAt` as tie-breaker).
+  const uniqueIds = [...new Set(receipt.exchangeIds)]
+  if (uniqueIds.length !== receipt.exchangeIds.length) {
+    return reject(receipt, rule, 'A conserved_balance receipt must not reuse the same exchange ID across roles.')
+  }
+  const cited = uniqueIds
+    .map(id => entriesById.get(id)!)
+    .sort((a, b) => {
+      const orderDiff = entryHostOrder(a, transcriptOrder) - entryHostOrder(b, transcriptOrder)
+      if (orderDiff !== 0) return orderDiff
+      const startA = typeof a.startedAt === 'number' ? a.startedAt : 0
+      const startB = typeof b.startedAt === 'number' ? b.startedAt : 0
+      return startA - startB
+    })
   const roleOf = (entry: ReceiptTranscriptEntry): string => (entry.evidenceRole ?? '').trim().toLowerCase()
 
   const burstIndices: number[] = []
@@ -724,22 +820,63 @@ function verifyConservedBalanceReceipt(
     return reject(receipt, rule, `Only ${ackedBurst.length} concurrent mutation was acknowledged; a conserved_balance proof requires >=2 acknowledged concurrent mutations.`)
   }
 
-  // Locate baseline readback (before the burst).
+  // C-5: Verify genuine temporal concurrency overlap across acknowledged burst exchanges whenever
+  // host timestamps are present. Strictly sequential HTTP requests cannot prove a race condition.
+  const ackedWindows = ackedBurst.map(entryWindow).filter((w): w is { start: number; end: number } => w !== null)
+  if (ackedWindows.length >= 2) {
+    let hasOverlap = false
+    for (let i = 0; i < ackedWindows.length && !hasOverlap; i += 1) {
+      for (let j = i + 1; j < ackedWindows.length; j += 1) {
+        const a = ackedWindows[i]!
+        const b = ackedWindows[j]!
+        if (a.start <= b.end && b.start <= a.end) {
+          hasOverlap = true
+          break
+        }
+      }
+    }
+    if (!hasOverlap) {
+      return reject(
+        receipt,
+        rule,
+        'Burst exchanges did not overlap in time in the host transcript; strictly sequential requests cannot prove a race condition.',
+      )
+    }
+  }
+
+  // C-5: Enforce strict host chronological ordering for baseline and post-burst readbacks.
+  const misplacedBaseline = cited.findIndex((entry, index) => index >= firstBurstIdx && BASELINE_READ_ROLES.has(roleOf(entry)))
+  if (misplacedBaseline >= 0) {
+    return reject(receipt, rule, 'Baseline readback must occur chronologically before the concurrent burst in the host transcript.')
+  }
+  const misplacedPost = cited.findIndex((entry, index) => index <= lastBurstIdx && POST_READ_ROLES.has(roleOf(entry)))
+  if (misplacedPost >= 0) {
+    return reject(receipt, rule, 'Post-burst readback must occur chronologically after the concurrent burst in the host transcript.')
+  }
+
+  // Locate baseline readback (strictly before the burst in host order).
   let baselineIdx = cited.findIndex((entry, index) => index < firstBurstIdx && BASELINE_READ_ROLES.has(roleOf(entry)))
   if (baselineIdx < 0) {
-    baselineIdx = cited.findIndex((entry, index) =>
-      index < firstBurstIdx && (entry.step.arm === 'setup' || entry.step.arm === 'control') && is2xxStatus(entry.step.status))
+    baselineIdx = cited.findIndex((entry, index) => {
+      if (index >= firstBurstIdx) return false
+      const r = roleOf(entry)
+      if (POST_READ_ROLES.has(r) || SERIAL_PRE_ROLES.has(r) || SERIAL_POST_ROLES.has(r) || SERIAL_MUTATION_ROLE_RE.test(r) || BURST_ROLE_RE.test(r)) {
+        return false
+      }
+      return (entry.step.arm === 'setup' || entry.step.arm === 'control') && is2xxStatus(entry.step.status)
+    })
   }
   if (baselineIdx < 0 || !is2xxStatus(cited[baselineIdx]!.step.status)) {
     return reject(receipt, rule, 'A conserved_balance receipt requires a 2xx baseline numeric readback before the burst.')
   }
   const baselineEntry = cited[baselineIdx]!
 
-  // Locate post-burst readback (after the burst, before any serial post-read).
+  // Locate post-burst readback (strictly after the burst in host order, before any serial post-read).
   let postIdx = cited.findIndex((entry, index) => index > lastBurstIdx && POST_READ_ROLES.has(roleOf(entry)))
   if (postIdx < 0) {
     postIdx = cited.findIndex((entry, index) =>
       index > lastBurstIdx &&
+      !BASELINE_READ_ROLES.has(roleOf(entry)) &&
       !SERIAL_MUTATION_ROLE_RE.test(roleOf(entry)) &&
       !SERIAL_POST_ROLES.has(roleOf(entry)) &&
       !SERIAL_PRE_ROLES.has(roleOf(entry)) &&
@@ -751,6 +888,21 @@ function verifyConservedBalanceReceipt(
   }
   const postEntry = cited[postIdx]!
 
+  // Timestamp sanity check when host timestamps are recorded: baseline cannot start after burst,
+  // and post-burst readback cannot start before burst.
+  if (ackedWindows.length > 0) {
+    const minBurstStart = Math.min(...ackedWindows.map(w => w.start))
+    const maxBurstEnd = Math.max(...ackedWindows.map(w => w.end))
+    const baseWin = entryWindow(baselineEntry)
+    const postWin = entryWindow(postEntry)
+    if (baseWin && baseWin.start > maxBurstEnd) {
+      return reject(receipt, rule, 'Baseline readback timestamp is after the concurrent burst in the host transcript.')
+    }
+    if (postWin && postWin.start < minBurstStart) {
+      return reject(receipt, rule, 'Post-burst readback timestamp precedes the concurrent burst in the host transcript.')
+    }
+  }
+
   const conserved = sharedConservedField(baselineEntry.step, postEntry.step, receipt.conservedBalance?.balanceField)
   if (!conserved) {
     return reject(
@@ -760,24 +912,35 @@ function verifyConservedBalanceReceipt(
     )
   }
 
-  const unitDebit = receipt.conservedBalance?.unitDebit ?? 1
-  const expectedBurstDebit = ackedBurst.reduce((sum, entry) => sum + requestDebitOf(entry.step, unitDebit), 0)
   const actualBurstDebit = conserved.pre - conserved.post
   const cap = findCapValue(baselineEntry.step, postEntry.step, conserved.field, receipt.conservedBalance?.capField)
 
-  // Locate serial control exchanges (must prove conservation holds serially).
-  const serialMutations = cited.filter((entry, index) => {
-    if (index === baselineIdx || index === postIdx || burstIndices.includes(index)) return false
+  // Locate serial control exchanges (must not be interleaved inside the burst).
+  const serialIndices: number[] = []
+  cited.forEach((entry, index) => {
+    if (index === baselineIdx || index === postIdx || burstIndices.includes(index)) return
     const role = roleOf(entry)
-    if (SERIAL_PRE_ROLES.has(role) || SERIAL_POST_ROLES.has(role)) return false
-    return SERIAL_MUTATION_ROLE_RE.test(role) || (entry.step.arm === 'control' && stepMutatesState(entry.step))
+    if (SERIAL_PRE_ROLES.has(role) || SERIAL_POST_ROLES.has(role)) return
+    if (SERIAL_MUTATION_ROLE_RE.test(role) || (entry.step.arm === 'control' && stepMutatesState(entry.step))) {
+      serialIndices.push(index)
+    }
   })
-  const serialPreEntry = cited.find(entry => SERIAL_PRE_ROLES.has(roleOf(entry)))
-  const serialPostEntry = cited.find((entry, index) =>
+  if (serialIndices.some(idx => idx > firstBurstIdx && idx < lastBurstIdx)) {
+    return reject(receipt, rule, 'Serial control exchanges must not be interleaved inside the concurrent burst.')
+  }
+  const serialMutations = serialIndices.map(i => cited[i]!)
+  const serialPreIdx = cited.findIndex(entry => SERIAL_PRE_ROLES.has(roleOf(entry)))
+  const serialPreEntry = serialPreIdx >= 0 ? cited[serialPreIdx] : undefined
+  const serialPostIdx = cited.findIndex((entry, index) =>
     index !== baselineIdx && index !== postIdx && !burstIndices.includes(index) && SERIAL_POST_ROLES.has(roleOf(entry)))
+  const serialPostEntry = serialPostIdx >= 0 ? cited[serialPostIdx] : undefined
 
   if (serialMutations.length === 0) {
     return reject(receipt, rule, 'A conserved_balance receipt requires a serial control exchange proving the conservation boundary holds serially.')
+  }
+  const lastSerialIdx = serialIndices[serialIndices.length - 1]!
+  if (serialPostIdx >= 0 && serialPostIdx < lastSerialIdx) {
+    return reject(receipt, rule, 'Serial post-readback must occur chronologically after the serial control mutation in the host transcript.')
   }
   const serial5xx = serialMutations.filter(entry => entry.step.status !== null && entry.step.status >= 500)
   const serial2xx = serialMutations.filter(entry => is2xxStatus(entry.step.status))
@@ -795,6 +958,7 @@ function verifyConservedBalanceReceipt(
 
   let serialControlKind: 'serial_debit_exact' | 'serial_rejection' | null = null
   let serialDebitObserved: number | null = null
+  const declaredUnitDebit = receipt.conservedBalance?.unitDebit
   if (serial2xx.length > 0) {
     if (!serialPostEntry || !is2xxStatus(serialPostEntry.step.status)) {
       return reject(receipt, rule, 'Serial control mutations succeeded without a 2xx post-serial numeric readback proving exact serial debit.')
@@ -806,7 +970,11 @@ function verifyConservedBalanceReceipt(
     if (serialPreVal === null || serialPostVal === null) {
       return reject(receipt, rule, `Serial control readback is missing numeric field "${conserved.field}".`)
     }
-    const expectedSerialDebit = serial2xx.reduce((sum, entry) => sum + requestDebitOf(entry.step, unitDebit), 0)
+    const serialHostDebits = serial2xx.map(entry => hostRequestDebitOf(entry.step))
+    const allSerialHostDebits = serialHostDebits.every((d): d is number => d !== null)
+    const expectedSerialDebit = allSerialHostDebits
+      ? serialHostDebits.reduce((sum, d) => sum + d, 0)
+      : serial2xx.length * (declaredUnitDebit ?? 1)
     const decreasing = conserved.post <= conserved.pre && !cap
     const serialDelta = decreasing ? serialPreVal - serialPostVal : serialPostVal - serialPreVal
     if (decreasing && serialPostVal < 0) {
@@ -835,6 +1003,29 @@ function verifyConservedBalanceReceipt(
     serialControlKind = 'serial_rejection'
   }
 
+  // C-5: Derive/bound expectedBurstDebit strictly from host-recorded exchanges — NEVER trust an
+  // uncorroborated worker-supplied `unitDebit` to fabricate an `under_debit` violation!
+  const burstHostDebits = ackedBurst.map(entry => hostRequestDebitOf(entry.step))
+  const allBurstHostDebits = burstHostDebits.every((d): d is number => d !== null)
+  let expectedBurstDebit: number
+  let hasHostDerivedDebit = false
+  if (allBurstHostDebits) {
+    expectedBurstDebit = burstHostDebits.reduce((sum, d) => sum + d, 0)
+    hasHostDerivedDebit = true
+  } else if (serialControlKind === 'serial_debit_exact' && serialDebitObserved !== null && serialDebitObserved > 1e-6) {
+    const derivedHostUnitDebit = serialDebitObserved / serial2xx.length
+    // Bound any declared unitDebit to never exceed the host-observed serial per-mutation debit.
+    const effectiveUnitDebit = declaredUnitDebit !== undefined
+      ? Math.min(declaredUnitDebit, derivedHostUnitDebit)
+      : derivedHostUnitDebit
+    expectedBurstDebit = ackedBurst.length * effectiveUnitDebit
+    hasHostDerivedDebit = true
+  } else {
+    // No host request body debit and no 2xx serial debit: worker-supplied unitDebit is untrusted.
+    expectedBurstDebit = ackedBurst.length
+    hasHostDerivedDebit = false
+  }
+
   // Evaluate conservation violation on the concurrent burst.
   let violationKind: 'under_debit' | 'negative_balance' | 'cap_overshoot' | 'over_credit' | null = null
   if (conserved.pre >= 0 && conserved.post < 0) {
@@ -842,16 +1033,17 @@ function verifyConservedBalanceReceipt(
   } else if (cap && conserved.pre <= cap.value && conserved.post > cap.value) {
     violationKind = 'cap_overshoot'
   } else if (conserved.pre >= 0 && conserved.post >= 0 && actualBurstDebit < expectedBurstDebit - 1e-6) {
-    // Require concrete movement (either burst debited >0 but <expected, OR serial control proved a
-    // single serial mutation debits >0 while the concurrent burst debited less than expected).
+    // Require host-derived debit AND concrete movement (under_debit cannot rely on worker unitDebit).
     const provedMutating = actualBurstDebit > 1e-6 || (serialDebitObserved !== null && serialDebitObserved > 1e-6)
-    if (provedMutating) {
+    if (hasHostDerivedDebit && provedMutating) {
       violationKind = 'under_debit'
     } else if (serialControlKind === 'serial_rejection' && conserved.post > conserved.pre + 1e-6) {
       // Single-use credit/coupon race: >=2 concurrent redemptions credited the balance while a
       // subsequent serial redemption was rejected with 4xx.
       violationKind = 'over_credit'
     }
+  } else if (serialControlKind === 'serial_rejection' && conserved.pre >= 0 && conserved.post > conserved.pre + 1e-6) {
+    violationKind = 'over_credit'
   }
 
   if (!violationKind) {
@@ -887,6 +1079,27 @@ function verifyConservedBalanceReceipt(
 
 const AUTH_BYPASS_BOILERPLATE_KEY_RE = /^(?:ok|status|success|message|msg|error|errors|detail|details|code|timestamp|time|date|version|health|healthy|alive|ping|pong|request_?id|trace_?id|correlation_?id|nonce)$/i
 const AUTH_BYPASS_VOLATILE_HEADER_RE = /^(?:host|content-length|connection|user-agent|accept|accept-encoding|x-request-id|x-correlation-id|x-trace-id|traceparent|tracestate|date)$/i
+const AUTH_BYPASS_SECURITY_HEADER_RE = /^(?:authorization|proxy-authorization|x-forwarded-(?:for|host|proto|user|email|groups|roles|uri|url)|x-original-(?:url|uri|forwarded-for)|x-rewrite-url|x-real-ip|x-client-ip|x-remote-(?:user|addr|ip)|x-custom-ip-authorization|x-user(?:name|-id|-role)?|x-auth(?:[-_].+)?|x-admin(?:[-_].+)?|x-role(?:s)?|x-api-key|x-token(?:[-_].+)?|x-bypass(?:[-_].+)?|x-internal(?:[-_].+)?|forwarded|client-ip|true-client-ip|cf-connecting-ip|x-impersonate(?:[-_].+)?|x-tenant(?:[-_].+)?)$/i
+const SEALED_OR_VAULT_MARKER_RE = /(?:\[redacted:(?:cap:)?|cap:hop_[A-Za-z0-9._-]+:|\[persona:)/i
+const ANON_HANDLE_RE = /^(?:anon|anonymous|guest|unauthenticated)$/i
+const AUTH_ROLE_RANK: Readonly<Record<string, number>> = { viewer: 1, member: 2, admin: 3, owner: 4 }
+
+function normalizedAuthHandle(handle: string | null | undefined): string | null {
+  if (!handle) return null
+  const trimmed = handle.trim().toLowerCase()
+  if (!trimmed || ANON_HANDLE_RE.test(trimmed)) return null
+  return trimmed
+}
+
+function authRoleRank(role: RoleName | null | undefined): number {
+  return role ? (AUTH_ROLE_RANK[role] ?? 0) : 0
+}
+
+function queryPartOf(pathAndQuery: string | undefined): string {
+  if (!pathAndQuery) return ''
+  const idx = pathAndQuery.indexOf('?')
+  return idx >= 0 ? pathAndQuery.slice(idx + 1).trim() : ''
+}
 
 function canonicalRequestHeaderMap(headers: Record<string, string> | null | undefined): Record<string, string> {
   const out: Record<string, string> = {}
@@ -907,10 +1120,79 @@ function authBypassRequestDifferential(
   const probeHeaders = canonicalRequestHeaderMap(probe.requestHeaders)
   const headerKeys = new Set([...Object.keys(controlHeaders), ...Object.keys(probeHeaders)])
   for (const key of headerKeys) {
+    if (key === 'cookie') continue
+    if (!AUTH_BYPASS_SECURITY_HEADER_RE.test(key)) continue
     if (controlHeaders[key] !== probeHeaders[key]) return 'header'
   }
-  if ((control.pathAndQuery ?? '') !== (probe.pathAndQuery ?? '')) return 'query'
+  if (queryPartOf(control.pathAndQuery) !== queryPartOf(probe.pathAndQuery)) return 'query'
   if (JSON.stringify(control.requestJson ?? null) !== JSON.stringify(probe.requestJson ?? null)) return 'body'
+  return null
+}
+
+function probeCarriedHostCredentialControlLacked(
+  control: ReceiptTranscriptEntry,
+  probe: ReceiptTranscriptEntry,
+  allEntries: readonly ReceiptTranscriptEntry[],
+): string | null {
+  const ctlHandle = normalizedAuthHandle(control.step.actor.handle)
+  const prbHandle = normalizedAuthHandle(probe.step.actor.handle)
+  if (prbHandle !== null && prbHandle !== ctlHandle) {
+    if (ctlHandle === null) {
+      return `Normal authenticated persona "${probe.step.actor.handle}" crossing an unauthenticated 401 is standard login, not an authentication bypass.`
+    }
+    return `Auth bypass rejected: probe used a different authenticated persona ("${probe.step.actor.handle}" vs control "${control.step.actor.handle}"); switching personas is not an authentication bypass.`
+  }
+  if (authRoleRank(probe.step.actor.role) > authRoleRank(control.step.actor.role)) {
+    return `Auth bypass rejected: probe carried higher role privileges ("${probe.step.actor.role}" vs control "${control.step.actor.role ?? 'none'}"); normal RBAC is not an authentication bypass.`
+  }
+
+  // Sealed capability check: reject if probe consumed any host-sealed capability that control lacked.
+  const ctlCaps = new Set<string>([
+    ...(control.consumedCapabilityId ? [control.consumedCapabilityId] : []),
+    ...(control.consumedCapabilities ?? []),
+  ])
+  const prbCaps = [
+    ...(probe.consumedCapabilityId ? [probe.consumedCapabilityId] : []),
+    ...(probe.consumedCapabilities ?? []),
+  ]
+  if (prbCaps.some(cap => !ctlCaps.has(cap))) {
+    return 'Auth bypass rejected: probe carried a host-sealed capability that the control lacked (authenticated session reuse is not an authentication bypass).'
+  }
+  const ctlHeaders = canonicalRequestHeaderMap(control.step.requestHeaders)
+  const prbHeaders = canonicalRequestHeaderMap(probe.step.requestHeaders)
+  for (const [k, v] of Object.entries(prbHeaders)) {
+    if (SEALED_OR_VAULT_MARKER_RE.test(v) && ctlHeaders[k] !== v) {
+      return 'Auth bypass rejected: probe carried a sealed capability or vault credential header that the control lacked.'
+    }
+  }
+
+  // Session jar / cookie check: reject if probe carried a cookie or distinct session jar that control lacked.
+  if (prbHeaders.cookie && prbHeaders.cookie !== ctlHeaders.cookie) {
+    return 'Auth bypass rejected: probe carried a session cookie that the control lacked (session-jar authentication is not an authentication bypass).'
+  }
+  if (probe.sessionId && probe.sessionId !== control.sessionId) {
+    return 'Auth bypass rejected: probe used an authenticated session jar that the control lacked.'
+  }
+
+  // Login-issued token check: if probe sent an Authorization token that matches a token returned by
+  // an earlier 2xx response in the host transcript, it is a real login credential, not a forgery.
+  const prbAuth = prbHeaders.authorization
+  if (prbAuth && prbAuth !== ctlHeaders.authorization) {
+    const rawToken = prbAuth.replace(/^(?:Bearer|Token|Basic)\s+/i, '').trim()
+    if (rawToken.length >= 12) {
+      for (const prior of allEntries) {
+        if (prior.exchangeId === probe.exchangeId || prior.exchangeId === control.exchangeId) continue
+        if (!is2xxStatus(prior.step.status)) continue
+        const priorBody = typeof prior.step.body === 'string'
+          ? prior.step.body
+          : prior.step.json !== undefined ? JSON.stringify(prior.step.json) : ''
+        const priorSetCookie = headerValue(prior.step.responseHeaders, 'set-cookie') ?? ''
+        if (priorBody.includes(rawToken) || priorSetCookie.includes(rawToken)) {
+          return 'Auth bypass rejected: probe used a credential issued by a prior 2xx login/token exchange in the host transcript (normal authentication, not a bypass).'
+        }
+      }
+    }
+  }
   return null
 }
 
@@ -962,6 +1244,7 @@ function collectSubstantiveAuthDataFields(value: unknown, prefix = '', depth = 0
 function verifyAuthBypassReceipt(
   receipt: ProofReceipt,
   entriesById: ReadonlyMap<string, ReceiptTranscriptEntry>,
+  allEntries: readonly ReceiptTranscriptEntry[] = [...entriesById.values()],
 ): ReceiptVerification {
   const rule = 'auth_bypass' as const
   if (receipt.exchangeIds.length < 2) {
@@ -1015,10 +1298,11 @@ function verifyAuthBypassReceipt(
       continue
     }
     for (const control of sameRouteControls) {
-      // Precision guard: unauthenticated 401 vs a legitimate host-injected vault persona 200 is
-      // normal authentication working, NOT an auth bypass.
-      if (control.step.actor.handle === null && probe.step.actor.handle !== null) {
-        lastRejection = `Normal authenticated persona "${probe.step.actor.handle}" crossing an unauthenticated 401 is standard login, not an authentication bypass.`
+      // H-14: Reject if probe carried ANY host credential (vault persona, higher role/admin,
+      // sealed capability, session cookie/jar, or login-issued token) that the control lacked.
+      const credRejection = probeCarriedHostCredentialControlLacked(control, probe, allEntries)
+      if (credRejection) {
+        lastRejection = credRejection
         continue
       }
       const differential = authBypassRequestDifferential(control.step, probe.step)
@@ -1240,6 +1524,12 @@ export function buildProofReceipt(input: z.input<typeof proofReceiptSchema>): Pr
 export interface ScriptProofExchange {
   exchangeId: string
   op?: string
+  /** Host-recorded monotonic transcript sequence index (never worker-ordered). */
+  seq?: number
+  /** Host-recorded request start timestamp (epoch ms). */
+  startedAt?: number
+  /** Host-recorded request end timestamp (epoch ms). */
+  endedAt?: number
   method: string
   pathAndQuery: string
   origin: string
@@ -1250,10 +1540,66 @@ export interface ScriptProofExchange {
   sessionRole?: string | null
   /** Host-resolved persona role label (e.g. "owner (acme)"); never script-supplied. */
   actorRoleLabel?: string | null
+  /** Host-resolved ambient credential placement (`cookie`, `bearer`, `header`, `unknown`). */
+  ambientAuth?: ImpactStep['actor']['auth']
+  /** Host-observed SameSite attribute on the session cookie (`Strict`, `Lax`, `None`, or null). */
+  sessionSameSite?: string | null
+  /** Host-recorded primary sealed capability consumed by this exchange (if any). */
+  consumedCapabilityId?: string | null
+  /** Host-recorded sealed capabilities consumed by this exchange (if any). */
+  consumedCapabilities?: readonly string[]
+  /** Host-recorded session jar identifier (if any). */
+  sessionId?: string | null
+  /** Host-recorded OOB or structured artifact (for `op: 'oob'` mint/wait/check records). */
+  artifact?: {
+    kind?: string
+    token?: string
+    url?: string
+    dnsHost?: string
+    hit?: boolean
+    subscriptionId?: string
+    canaryId?: string
+    receivedAtMs?: number
+  } | null
   body?: string
   requestBody?: string | null
   requestHeaders?: Record<string, string> | null
   responseHeaders?: Record<string, string> | null
+}
+
+function deriveHostAmbientAuth(exchange: ScriptProofExchange): ImpactStep['actor']['auth'] {
+  if (exchange.ambientAuth && exchange.ambientAuth !== 'unknown') return exchange.ambientAuth
+  const headers = exchange.requestHeaders
+  if (headers) {
+    const auth = headerValue(headers, 'authorization')
+    const cookie = headerValue(headers, 'cookie')
+    if (cookie && !auth) return 'cookie'
+    if (auth) return /^bearer\s+/i.test(auth) ? 'bearer' : 'header'
+    if (headerValue(headers, 'x-api-key') || headerValue(headers, 'x-auth-token')) return 'header'
+  }
+  return 'unknown'
+}
+
+function extractSameSiteFromSetCookie(setCookie: string | null): string | null {
+  if (!setCookie) return null
+  const m = /;\s*samesite\s*=\s*(strict|lax|none)\b/i.exec(setCookie)
+  if (!m?.[1]) return null
+  const lower = m[1].toLowerCase()
+  return lower === 'strict' ? 'Strict' : lower === 'lax' ? 'Lax' : 'None'
+}
+
+function deriveHostSameSite(exchange: ScriptProofExchange, allExchanges: readonly ScriptProofExchange[]): string | null {
+  if (exchange.sessionSameSite !== undefined) return exchange.sessionSameSite
+  const own = extractSameSiteFromSetCookie(headerValue(exchange.responseHeaders, 'set-cookie'))
+  if (own) return own
+  const exchangeOrigin = normalizeOrigin(exchange.origin)
+  for (const item of allExchanges) {
+    if (exchangeOrigin && item.origin && normalizeOrigin(item.origin) !== exchangeOrigin) continue
+    if (exchange.personaHandle && item.personaHandle && item.personaHandle !== exchange.personaHandle) continue
+    const found = extractSameSiteFromSetCookie(headerValue(item.responseHeaders, 'set-cookie'))
+    if (found) return found
+  }
+  return null
 }
 
 const IMPACT_CLASS_TO_VULN_CLASS: Readonly<Record<string, string>> = {
@@ -1325,39 +1671,70 @@ function impactStepOf(
 export function buildAgentScriptReceipt(input: {
   claims: readonly Record<string, unknown>[]
   exchanges: readonly ScriptProofExchange[]
+  /** Host-recorded OOB callback events (for `kind === 'oob'` claims). */
+  oobEvents?: readonly ReceiptOobEvent[]
   origin: string
   title: string
 }): { receipt: ProofReceipt; transcript: ReceiptTranscript } | null {
   const byId = new Map(input.exchanges.map(exchange => [exchange.exchangeId, exchange]))
   const orderById = new Map(input.exchanges.map((exchange, index) => [exchange.exchangeId, index]))
+  const hostOrderOf = (id: string): number => {
+    const ex = byId.get(id)
+    if (ex && typeof ex.seq === 'number' && Number.isFinite(ex.seq)) return ex.seq
+    return orderById.get(id) ?? 0
+  }
+  const sortByHostOrder = (ids: readonly string[]): string[] =>
+    [...new Set(ids)].sort((a, b) => {
+      const diff = hostOrderOf(a) - hostOrderOf(b)
+      if (diff !== 0) return diff
+      const startA = byId.get(a)?.startedAt ?? 0
+      const startB = byId.get(b)?.startedAt ?? 0
+      return startA - startB
+    })
   const buildTranscript = (
     armOverrides: ReadonlyMap<string, ImpactStep['arm']>,
     extra?: {
-      requestJson?: unknown
       requestJsonById?: ReadonlyMap<string, unknown>
-      ambientAuth?: ImpactStep['actor']['auth']
-      sameSite?: string | null
       evidenceRoleOverrides?: ReadonlyMap<string, string>
     },
   ): ReceiptTranscript => ({
     entries: input.exchanges.map(exchange => {
-      const perExchangeReq = extra?.requestJsonById?.has(exchange.exchangeId)
-        ? extra.requestJsonById.get(exchange.exchangeId)
-        : exchange.requestBody !== undefined && exchange.requestBody !== null
-          ? (() => { try { return JSON.parse(exchange.requestBody) } catch { return exchange.requestBody } })()
-          : extra?.requestJson
+      // C-5 / H-13: Host-recorded `exchange.requestBody` ALWAYS takes precedence and can never
+      // be overridden by `requestJsonById` or script-declared `claim.requestBody`.
+      const hostReq = exchange.requestBody !== undefined && exchange.requestBody !== null
+        ? (() => { try { return JSON.parse(exchange.requestBody) } catch { return exchange.requestBody } })()
+        : undefined
+      const perExchangeReq = hostReq !== undefined
+        ? hostReq
+        : extra?.requestJsonById?.has(exchange.exchangeId)
+          ? extra.requestJsonById.get(exchange.exchangeId)
+          : undefined
+      const hostAmbientAuth = deriveHostAmbientAuth(exchange)
+      const hostSameSite = deriveHostSameSite(exchange, input.exchanges)
+      const carrierParts = [
+        exchange.pathAndQuery ?? '',
+        exchange.requestHeaders ? JSON.stringify(exchange.requestHeaders) : '',
+        exchange.requestBody ?? '',
+        exchange.body ?? '',
+      ].filter(Boolean)
       return {
         exchangeId: exchange.exchangeId,
         step: impactStepOf(exchange, {
           ...(armOverrides.has(exchange.exchangeId) ? { arm: armOverrides.get(exchange.exchangeId)! } : {}),
           ...(perExchangeReq !== undefined ? { requestJson: perExchangeReq } : {}),
-          ...(extra?.ambientAuth ? { ambientAuth: extra.ambientAuth } : {}),
-          ...(extra?.sameSite !== undefined ? { sameSite: extra.sameSite } : {}),
+          ambientAuth: hostAmbientAuth,
+          sameSite: hostSameSite,
         }),
         ...(exchange.durationMs !== undefined ? { durationMs: exchange.durationMs } : {}),
-        ...(exchange.body !== undefined
-          ? { carrierText: `${exchange.pathAndQuery}\n${JSON.stringify(exchange.requestHeaders ?? {})}\n${exchange.body}` }
-          : {}),
+        ...(exchange.op ? { op: exchange.op } : {}),
+        seq: hostOrderOf(exchange.exchangeId),
+        ...(exchange.startedAt !== undefined ? { startedAt: exchange.startedAt } : {}),
+        ...(exchange.endedAt !== undefined ? { endedAt: exchange.endedAt } : {}),
+        ...(exchange.origin ? { origin: exchange.origin } : {}),
+        ...(exchange.consumedCapabilityId !== undefined ? { consumedCapabilityId: exchange.consumedCapabilityId } : {}),
+        ...(exchange.consumedCapabilities !== undefined ? { consumedCapabilities: exchange.consumedCapabilities } : {}),
+        ...(exchange.sessionId !== undefined ? { sessionId: exchange.sessionId } : {}),
+        ...(carrierParts.length > 0 ? { carrierText: carrierParts.join('\n') } : {}),
         ...(extra?.evidenceRoleOverrides?.has(exchange.exchangeId)
           ? { evidenceRole: extra.evidenceRoleOverrides.get(exchange.exchangeId)! }
           : exchange.sessionRole ? { evidenceRole: exchange.sessionRole } : {}),
@@ -1393,34 +1770,38 @@ export function buildAgentScriptReceipt(input: {
       : null
     // Deduplicate and preserve host-transcript chronological order so pre/post mutation readbacks
     // stay strictly before/after the mutating probe in `findPersistence()`.
-    const exchangeIds = [...new Set([
+    const exchangeIds = sortByHostOrder([
       ...(beforeId ? [beforeId] : []),
       ...controlIds,
       probeId,
       ...(afterId ? [afterId] : []),
-    ])].sort((a, b) => (orderById.get(a) ?? 0) - (orderById.get(b) ?? 0))
+    ])
     if (exchangeIds.length === 0) continue
     const armOverrides = new Map<string, ImpactStep['arm']>()
     for (const id of controlIds) armOverrides.set(id, 'control')
     if (beforeId) armOverrides.set(beforeId, 'control')
     if (afterId) armOverrides.set(afterId, 'control')
     armOverrides.set(probeId, 'probe')
-    const rawAmbient = recordField(claim, 'ambient')
-    const ambient = rawAmbient && typeof rawAmbient === 'object' && !Array.isArray(rawAmbient)
-      ? rawAmbient as { kind?: unknown; sameSite?: unknown }
-      : null
-    const ambientAuth = ambient?.kind === 'cookie' || ambient?.kind === 'bearer' || ambient?.kind === 'header' || ambient?.kind === 'unknown'
-      ? ambient.kind
-      : undefined
-    const sameSite = typeof ambient?.sameSite === 'string' ? ambient.sameSite : null
-    const transcript = buildTranscript(armOverrides, {
-      ...(recordField(claim, 'requestBody') !== undefined ? { requestJson: recordField(claim, 'requestBody') } : {}),
-      ...(ambientAuth ? { ambientAuth } : {}),
-      ...(sameSite !== null ? { sameSite } : {}),
-    })
+    // H-13: Never trust script-declared `requestBody`, `ambient`, `sameSite`, or `oracleEvents`.
+    // Request bodies, ambient auth kind, SameSite, and host-observed oracle events are derived
+    // strictly from host-recorded TranscriptStore exchanges and headers.
+    const transcript = buildTranscript(armOverrides)
+    const hostOracleEvents: string[] = []
+    if (impactClass === 'csrf' && beforeId && afterId) {
+      const probeEntry = transcript.entries?.find(e => e.exchangeId === probeId)
+      const probeStep = probeEntry?.step
+      if (probeStep && is2xxStatus(probeStep.status) && stepMutatesState(probeStep) && probeStep.actor.auth === 'cookie') {
+        const ss = (probeStep.actor.sameSite ?? '').toLowerCase()
+        const originHdr = headerValue(probeStep.requestHeaders, 'origin') ?? headerValue(probeStep.requestHeaders, 'referer')
+        const targetHost = hostOf(probe.origin || input.origin)
+        const reqHost = hostOf(originHdr)
+        if (ss !== 'strict' && ss !== 'lax' && targetHost && reqHost && reqHost !== targetHost) {
+          hostOracleEvents.push('csrf_state_change')
+        }
+      }
+    }
     const requiredRole = recordField(claim, 'requiredRole')
     const resourceTenant = recordField(claim, 'resourceTenant')
-    const oracleEvents = stringArray(recordField(claim, 'oracleEvents'))
     const proofPatterns = stringArray(recordField(claim, 'proofPatterns')).filter(p => p.length >= 4 && p.length <= 200).slice(0, 4)
     return {
       receipt: buildProofReceipt({
@@ -1439,7 +1820,7 @@ export function buildAgentScriptReceipt(input: {
           : {}),
         ...(typeof resourceTenant === 'string' && resourceTenant ? { resourceTenant } : {}),
         ...(recordField(claim, 'expectControlDenied') === true ? { expectControlDenied: true } : {}),
-        ...(oracleEvents.length ? { oracleEvents: [...new Set(oracleEvents)].slice(0, 8) } : {}),
+        ...(hostOracleEvents.length ? { oracleEvents: hostOracleEvents } : {}),
         ...(proofPatterns.length ? { proofPatterns } : {}),
       }),
       transcript,
@@ -1461,8 +1842,17 @@ export function buildAgentScriptReceipt(input: {
     const rawVuln = typeof recordField(claim, 'vulnClass') === 'string'
       ? (recordField(claim, 'vulnClass') as string).trim().toLowerCase()
       : ''
+    // H-14: A probe carrying a persona, sealed capability, session jar, or cookie that the control
+    // lacked cannot auto-classify as an unauthenticated auth_bypass.
+    const probeHasHostCredential = Boolean(
+      normalizedAuthHandle(probe.personaHandle) ||
+      probe.consumedCapabilityId ||
+      (probe.consumedCapabilities && probe.consumedCapabilities.length > 0) ||
+      (probe.sessionId && probe.sessionId !== control.sessionId) ||
+      (headerValue(probe.requestHeaders, 'cookie') && headerValue(probe.requestHeaders, 'cookie') !== headerValue(control.requestHeaders, 'cookie')),
+    )
     const isAuthBypass = AUTH_BYPASS_CLASS_RE.test(rawVuln) ||
-      (boundaryClass === 'auth' && !rawVuln && !control.personaHandle && !probe.personaHandle)
+      (boundaryClass === 'auth' && !rawVuln && !normalizedAuthHandle(control.personaHandle) && !probeHasHostCredential)
     const probeMethod = probe.method.toUpperCase()
     // Mutating BOLA/BFLA boundary claims require persisted before/after readbacks (`impact` claim);
     // only non-mutating read boundaries map directly onto `bola`/`bfla`. Auth bypass / forged-token
@@ -1480,20 +1870,12 @@ export function buildAgentScriptReceipt(input: {
         : boundaryClass === 'auth'
           ? 'bfla'
           : 'bola'
-    const exchangeIds = [...new Set([controlId, probeId])]
-      .sort((a, b) => (orderById.get(a) ?? 0) - (orderById.get(b) ?? 0))
+    const exchangeIds = sortByHostOrder([controlId, probeId])
     const armOverrides = new Map<string, ImpactStep['arm']>([
       [controlId, 'control'],
       [probeId, 'probe'],
     ])
-    const requestJsonById = new Map<string, unknown>()
-    if (recordField(claim, 'controlRequestBody') !== undefined) {
-      requestJsonById.set(controlId, recordField(claim, 'controlRequestBody'))
-    }
-    if (recordField(claim, 'probeRequestBody') !== undefined) {
-      requestJsonById.set(probeId, recordField(claim, 'probeRequestBody'))
-    }
-    const transcript = buildTranscript(armOverrides, requestJsonById.size ? { requestJsonById } : undefined)
+    const transcript = buildTranscript(armOverrides)
     const expectControlDenied = recordField(claim, 'expectControlDenied') !== false
     return {
       receipt: buildProofReceipt({
@@ -1612,15 +1994,35 @@ export function buildAgentScriptReceipt(input: {
       }
     }
     if (kind === 'timing') {
-      const controls = cited(stringArray(recordField(claim, 'controlIds')))
-      const variants = cited(stringArray(recordField(claim, 'variantIds')))
+      const controls = [...new Set(cited(stringArray(recordField(claim, 'controlIds'))))]
+      const variants = [...new Set(cited(stringArray(recordField(claim, 'variantIds'))))]
       if (controls.length < 5 || variants.length < 5) continue
+      const controlSet = new Set(controls)
+      if (variants.some(id => controlSet.has(id))) continue
       const probe = byId.get(variants[0]!)
-      if (!probe) continue
+      const baseline = byId.get(controls[0]!)
+      if (!probe || !baseline) continue
+      // H-15: Every control and variant exchange MUST target the exact same normalized origin,
+      // HTTP method, route path, and persona.
+      const baseOrigin = normalizeOrigin(baseline.origin || input.origin)
+      const baseMethod = baseline.method.toUpperCase()
+      const baseRoute = normalizePath(baseline.pathAndQuery)
+      const basePersona = (baseline.personaHandle ?? '').trim().toLowerCase()
+      const allConsistent = [...controls, ...variants].every(id => {
+        const ex = byId.get(id)!
+        return normalizeOrigin(ex.origin || input.origin) === baseOrigin
+          && ex.method.toUpperCase() === baseMethod
+          && normalizePath(ex.pathAndQuery) === baseRoute
+          && (ex.personaHandle ?? '').trim().toLowerCase() === basePersona
+      })
+      if (!allConsistent) continue
       const armOverrides = new Map<string, ImpactStep['arm']>()
       for (const id of controls) armOverrides.set(id, 'control')
       for (const id of variants) armOverrides.set(id, 'probe')
       const transcript = buildTranscript(armOverrides)
+      const controlEntry = transcript.entries!.find(entry => entry.exchangeId === controls[0])
+      const probeEntry = transcript.entries!.find(entry => entry.exchangeId === variants[0])
+      const param = controlEntry && probeEntry ? deriveDifferingParam(controlEntry, probeEntry) : null
       return {
         receipt: buildProofReceipt({
           vulnClass: 'blind_sqli',
@@ -1628,8 +2030,9 @@ export function buildAgentScriptReceipt(input: {
             origin: probe.origin || input.origin,
             method: probe.method.toUpperCase(),
             pathAndQuery: probe.pathAndQuery,
+            ...(param ? { param } : {}),
           },
-          exchangeIds: [...controls, ...variants],
+          exchangeIds: sortByHostOrder([...controls, ...variants]),
           oobEventIds: [],
           browserTraceIds: [],
           claimedDelta: `${input.title} — timing separation over ${controls.length}/${variants.length} recorded arms.`.slice(0, 1200),
@@ -1642,20 +2045,32 @@ export function buildAgentScriptReceipt(input: {
       const baselineId = typeof rawBaseline === 'string' && byId.has(rawBaseline) ? rawBaseline : null
       const rawPost = recordField(claim, 'postExchangeId') ?? recordField(claim, 'afterExchangeId')
       const postId = typeof rawPost === 'string' && byId.has(rawPost) ? rawPost : null
-      const burstIds = cited(stringArray(recordField(claim, 'burstExchangeIds') ?? recordField(claim, 'exchangeIds')))
-      const serialIds = cited(stringArray(recordField(claim, 'serialExchangeIds') ?? recordField(claim, 'controlExchangeIds')))
+      const burstIds = [...new Set(cited(stringArray(recordField(claim, 'burstExchangeIds') ?? recordField(claim, 'exchangeIds'))))]
+      const serialIds = [...new Set(cited(stringArray(recordField(claim, 'serialExchangeIds') ?? recordField(claim, 'controlExchangeIds'))))]
       const rawSerialPre = recordField(claim, 'serialPreExchangeId')
       const serialPreId = typeof rawSerialPre === 'string' && byId.has(rawSerialPre) ? rawSerialPre : null
       const rawSerialPost = recordField(claim, 'serialPostExchangeId')
       const serialPostId = typeof rawSerialPost === 'string' && byId.has(rawSerialPost) ? rawSerialPost : null
       if (!baselineId || !postId || burstIds.length < 2 || serialIds.length === 0) continue
-      const firstBurst = byId.get(burstIds[0]!)
+      // C-5: Every role must refer to a disjoint host exchange ID (no role aliasing).
+      const roleIdList = [
+        baselineId,
+        ...burstIds,
+        postId,
+        ...(serialPreId ? [serialPreId] : []),
+        ...serialIds,
+        ...(serialPostId ? [serialPostId] : []),
+      ]
+      if (new Set(roleIdList).size !== roleIdList.length) continue
+      const sortedBurstIds = sortByHostOrder(burstIds)
+      const sortedSerialIds = sortByHostOrder(serialIds)
+      const firstBurst = byId.get(sortedBurstIds[0]!)
       if (!firstBurst) continue
       const armOverrides = new Map<string, ImpactStep['arm']>()
       const evidenceRoleOverrides = new Map<string, string>()
       armOverrides.set(baselineId, 'setup')
       evidenceRoleOverrides.set(baselineId, 'baseline_read')
-      burstIds.forEach((id, index) => {
+      sortedBurstIds.forEach((id, index) => {
         armOverrides.set(id, 'probe')
         evidenceRoleOverrides.set(id, `burst_${index + 1}`)
       })
@@ -1665,7 +2080,7 @@ export function buildAgentScriptReceipt(input: {
         armOverrides.set(serialPreId, 'control')
         evidenceRoleOverrides.set(serialPreId, 'serial_pre_read')
       }
-      serialIds.forEach((id, index) => {
+      sortedSerialIds.forEach((id, index) => {
         armOverrides.set(id, 'control')
         evidenceRoleOverrides.set(id, `serial_control_${index + 1}`)
       })
@@ -1673,21 +2088,10 @@ export function buildAgentScriptReceipt(input: {
         armOverrides.set(serialPostId, 'control')
         evidenceRoleOverrides.set(serialPostId, 'serial_post_read')
       }
-      const exchangeIds = [...new Set([
-        baselineId,
-        ...burstIds,
-        postId,
-        ...(serialPreId ? [serialPreId] : []),
-        ...serialIds,
-        ...(serialPostId ? [serialPostId] : []),
-      ])]
-      const raceRequestBody = recordField(claim, 'requestBody')
-      const requestJsonById = new Map<string, unknown>()
-      if (raceRequestBody !== undefined) {
-        for (const id of [...burstIds, ...serialIds]) requestJsonById.set(id, raceRequestBody)
-      }
+      // C-5: Always sort exchangeIds deterministically by host transcript order — NEVER trust
+      // worker-supplied array order, claim `requestBody`, or uncorroborated `unitDebit`.
+      const exchangeIds = sortByHostOrder(roleIdList)
       const transcript = buildTranscript(armOverrides, {
-        ...(requestJsonById.size ? { requestJsonById } : {}),
         evidenceRoleOverrides,
       })
       const rawClass = recordField(claim, 'vulnClass')
@@ -1696,8 +2100,6 @@ export function buildAgentScriptReceipt(input: {
         : 'race_double_spend'
       const balanceField = typeof recordField(claim, 'balanceField') === 'string' ? (recordField(claim, 'balanceField') as string).trim() : ''
       const capField = typeof recordField(claim, 'capField') === 'string' ? (recordField(claim, 'capField') as string).trim() : ''
-      const unitDebitRaw = recordField(claim, 'unitDebit')
-      const unitDebit = typeof unitDebitRaw === 'number' && Number.isFinite(unitDebitRaw) && unitDebitRaw > 0 ? unitDebitRaw : undefined
       return {
         receipt: buildProofReceipt({
           vulnClass,
@@ -1709,19 +2111,137 @@ export function buildAgentScriptReceipt(input: {
           exchangeIds,
           oobEventIds: [],
           browserTraceIds: [],
-          claimedDelta: `${input.title} — conserved-balance race over ${burstIds.length} burst + ${serialIds.length} serial control exchange(s).`.slice(0, 1200),
-          ...(balanceField || capField || unitDebit !== undefined
+          claimedDelta: `${input.title} — conserved-balance race over ${sortedBurstIds.length} burst + ${sortedSerialIds.length} serial control exchange(s).`.slice(0, 1200),
+          ...(balanceField || capField
             ? {
                 conservedBalance: {
                   ...(balanceField ? { balanceField } : {}),
                   ...(capField ? { capField } : {}),
-                  ...(unitDebit !== undefined ? { unitDebit } : {}),
                 },
               }
             : {}),
         }),
         transcript,
       }
+    }
+  }
+
+  // H-20: Out-of-band (`prove.oob`) receipt branch — converts a host-verified OOB callback into a
+  // standard `ProofReceipt` via `buildOobReceipt` using host OOB events + mint/injection/wait IDs.
+  for (const claim of input.claims) {
+    if (recordField(claim, 'kind') !== 'oob') continue
+    if (recordField(claim, 'expectHit') === false) continue
+    const rawMintId = recordField(claim, 'exchangeId') ?? recordField(claim, 'mintExchangeId')
+    const mintId = typeof rawMintId === 'string' && byId.has(rawMintId) ? rawMintId : null
+    const mintExchange = mintId ? byId.get(mintId) : undefined
+    const rawWaitId = recordField(claim, 'waitExchangeId')
+    const explicitWaitId = typeof rawWaitId === 'string' && byId.has(rawWaitId) ? rawWaitId : null
+    const rawInjectId = recordField(claim, 'injectionExchangeId') ?? recordField(claim, 'carrierExchangeId')
+    const explicitInjectId = typeof rawInjectId === 'string' && byId.has(rawInjectId) ? rawInjectId : null
+    const rawOobEventId = recordField(claim, 'oobEventId') ?? recordField(claim, 'subscriptionId')
+    const explicitOobEventId = typeof rawOobEventId === 'string' && rawOobEventId.trim() ? rawOobEventId.trim() : null
+
+    const mintToken = mintExchange?.artifact?.token?.trim() || null
+    const hostOobEvents = input.oobEvents ?? []
+    let oobEvent: ReceiptOobEvent | null = null
+    if (hostOobEvents.length > 0) {
+      oobEvent = hostOobEvents.find(ev =>
+        ev.delivered && Boolean(ev.token) &&
+        ((explicitOobEventId && ev.id === explicitOobEventId) ||
+          (mintToken && ev.token?.toLowerCase() === mintToken.toLowerCase()) ||
+          (!explicitOobEventId && !mintToken)),
+      ) ?? null
+    }
+    let derivedWaitId: string | null = explicitWaitId
+    if (!oobEvent) {
+      const waitRecord = (explicitWaitId ? byId.get(explicitWaitId) : undefined)
+        ?? input.exchanges.find(ex =>
+          ex.op === 'oob' &&
+          ex.artifact?.hit === true &&
+          Boolean(ex.artifact?.token) &&
+          (!mintToken || ex.artifact!.token!.toLowerCase() === mintToken.toLowerCase()),
+        )
+      if (waitRecord?.artifact?.hit === true && waitRecord.artifact.token) {
+        derivedWaitId = waitRecord.exchangeId
+        const subMatch = /^\/oob\/pending\/([^/?#]+)/.exec(waitRecord.pathAndQuery ?? '')
+        const derivedId = explicitOobEventId
+          ?? waitRecord.artifact.subscriptionId
+          ?? subMatch?.[1]
+          ?? waitRecord.exchangeId
+        oobEvent = {
+          id: derivedId,
+          ...(waitRecord.artifact.canaryId ? { canaryId: waitRecord.artifact.canaryId } : {}),
+          token: waitRecord.artifact.token,
+          targetOrigin: input.origin,
+          delivered: true,
+          stage: 'immediate',
+          receivedAtMs: waitRecord.artifact.receivedAtMs ?? waitRecord.endedAt ?? waitRecord.startedAt ?? Date.now(),
+        }
+      }
+    }
+    if (!oobEvent || !oobEvent.delivered || !oobEvent.token) continue
+
+    const token = oobEvent.token
+    const carriesToken = (ex: ScriptProofExchange): boolean => {
+      if (ex.op === 'oob') return false
+      if ((ex.pathAndQuery ?? '').includes(token)) return true
+      if ((ex.requestBody ?? '').includes(token)) return true
+      if ((ex.body ?? '').includes(token)) return true
+      if (ex.requestHeaders && Object.values(ex.requestHeaders).some(v => String(v).includes(token))) return true
+      return false
+    }
+    const explicitCarrier = explicitInjectId ? byId.get(explicitInjectId) : undefined
+    const carryingExchanges = explicitCarrier && carriesToken(explicitCarrier)
+      ? [explicitCarrier]
+      : input.exchanges.filter(carriesToken)
+    const primaryCarrier = carryingExchanges[0] ?? explicitCarrier ?? null
+    const exchangeIds = sortByHostOrder([
+      ...(mintId ? [mintId] : []),
+      ...carryingExchanges.map(ex => ex.exchangeId),
+      ...(explicitCarrier ? [explicitCarrier.exchangeId] : []),
+      ...(derivedWaitId ? [derivedWaitId] : []),
+    ])
+    if (exchangeIds.length === 0) continue
+
+    const armOverrides = new Map<string, ImpactStep['arm']>()
+    for (const ex of carryingExchanges) armOverrides.set(ex.exchangeId, 'probe')
+    if (mintId && !armOverrides.has(mintId)) armOverrides.set(mintId, 'setup')
+    if (derivedWaitId && !armOverrides.has(derivedWaitId)) armOverrides.set(derivedWaitId, 'control')
+    const baseTranscript = buildTranscript(armOverrides)
+    const rawVuln = typeof recordField(claim, 'vulnClass') === 'string'
+      ? (recordField(claim, 'vulnClass') as string).trim().toLowerCase()
+      : ''
+    const msg = `${input.title} ${String(recordField(claim, 'message') ?? '')}`.toLowerCase()
+    const vulnClass = rawVuln && OOB_CLASS_RE.test(rawVuln)
+      ? rawVuln
+      : /\bxxe\b|xml external/.test(msg)
+        ? 'xxe'
+        : /\bssrf\b|server-side request/.test(msg)
+          ? 'ssrf'
+          : /webhook/.test(msg)
+            ? 'webhook_forgery'
+            : 'oob'
+    const injectedAtMs = primaryCarrier?.startedAt ?? oobEvent.injectedAtMs
+    const normalizedOobEvent: ReceiptOobEvent = {
+      ...oobEvent,
+      ...(oobEvent.targetOrigin ? {} : { targetOrigin: primaryCarrier?.origin || input.origin }),
+      ...(injectedAtMs !== undefined && oobEvent.injectedAtMs === undefined ? { injectedAtMs } : {}),
+    }
+    return {
+      receipt: buildOobReceipt({
+        vulnClass,
+        origin: primaryCarrier?.origin || input.origin,
+        ...(primaryCarrier?.method ? { method: primaryCarrier.method.toUpperCase() } : {}),
+        ...(primaryCarrier?.pathAndQuery ? { pathAndQuery: primaryCarrier.pathAndQuery } : {}),
+        exchangeIds,
+        oobEventId: normalizedOobEvent.id,
+        claimedDelta: `${input.title} — host-verified out-of-band callback (${normalizedOobEvent.id}) delivered after canary injection.`.slice(0, 1200),
+        ...(injectedAtMs !== undefined ? { injectedAtMs } : {}),
+      }),
+      transcript: {
+        ...baseTranscript,
+        oobEvents: [normalizedOobEvent],
+      },
     }
   }
 
@@ -1754,6 +2274,231 @@ export function buildOobReceipt(input: {
     claimedDelta: input.claimedDelta,
     ...(input.injectedAtMs !== undefined ? { injectedAtMs: input.injectedAtMs } : {}),
   })
+}
+
+export type ProofReceiptMode = 'off' | 'shadow' | 'strict'
+
+/**
+ * Confirmation gate mode for legacy declarative replay specs:
+ *  - `strict` (default): `verifyReceipt()` is the final confirmation gate and vetoes any
+ *    unsubstantiated DSL confirmation (never widens a non-confirming verdict).
+ *  - `shadow` / `advisory`: records the receipt without changing the DSL verdict (explicit env
+ *    override for parity/regression tests).
+ *  - `off` / `0` / `false` / `no`: disables receipt evaluation on legacy DSL replays.
+ */
+export function proofReceiptMode(env: NodeJS.ProcessEnv = process.env): ProofReceiptMode {
+  const raw = (env.KOVO_PROOF_RECEIPT ?? '').trim().toLowerCase()
+  if (raw === '0' || raw === 'off' || raw === 'false' || raw === 'no') return 'off'
+  if (raw === 'shadow' || raw === 'advisory') return 'shadow'
+  return 'strict'
+}
+
+export const MAX_REPLAY_REGEX_PATTERN_LENGTH = 256
+export const MAX_REPLAY_REGEX_HAYSTACK_LENGTH = 16 * 1024
+
+/**
+ * H-32: Structural ReDoS guard for worker- and model-supplied regexes running on the host event
+ * loop. Rejects overly long patterns (> 256 chars), control chars, backreferences, lookbehinds,
+ * nested quantifiers (including `{m,n}` and nested groups), quantified alternations, stacked
+ * quantifiers, unbounded chained wildcards, and huge explicit repetition bounds.
+ */
+export function isSafeRegexPattern(pattern: string, maxLength = MAX_REPLAY_REGEX_PATTERN_LENGTH): boolean {
+  if (typeof pattern !== 'string' || pattern.length === 0 || pattern.length > maxLength) return false
+  if (/[\0\r\n]/.test(pattern)) return false
+  if (/\\[1-9]|\\k</.test(pattern)) return false
+  if (/\(\?<[=!]/.test(pattern)) return false
+  if (/(?:\.\*|\.\+){2,}/.test(pattern)) return false
+  if (/(\\[wsdWSD])[*+]\s*\1[*+]/.test(pattern)) return false
+
+  type Frame = { hasQuantifier: boolean; hasAlternation: boolean; isLookahead: boolean }
+  const stack: Frame[] = [{ hasQuantifier: false, hasAlternation: false, isLookahead: false }]
+  let inClass = false
+  let prevWasQuantifier = false
+  let prevTokenKind: 'none' | 'atom' | 'group' | 'lookahead' = 'none'
+  let lastClosedGroup: Frame | null = null
+
+  for (let i = 0; i < pattern.length; i += 1) {
+    const ch = pattern[i]!
+    if (ch === '\\') {
+      i += 1
+      if (i >= pattern.length) return false
+      if (!inClass) { prevWasQuantifier = false; prevTokenKind = 'atom'; lastClosedGroup = null }
+      continue
+    }
+    if (inClass) {
+      if (ch === ']') { inClass = false; prevWasQuantifier = false; prevTokenKind = 'atom'; lastClosedGroup = null }
+      continue
+    }
+    if (ch === '[') { inClass = true; continue }
+    if (ch === '(') {
+      const isLookahead = pattern[i + 1] === '?' && (pattern[i + 2] === '=' || pattern[i + 2] === '!')
+      stack.push({ hasQuantifier: false, hasAlternation: false, isLookahead })
+      prevWasQuantifier = false; prevTokenKind = 'none'; lastClosedGroup = null
+      continue
+    }
+    if (ch === ')') {
+      if (stack.length <= 1) return false
+      const closed = stack.pop()!
+      if (closed.hasQuantifier) stack[stack.length - 1]!.hasQuantifier = true
+      lastClosedGroup = closed
+      prevWasQuantifier = false
+      prevTokenKind = closed.isLookahead ? 'lookahead' : 'group'
+      continue
+    }
+    if (ch === '|') {
+      stack[stack.length - 1]!.hasAlternation = true
+      prevWasQuantifier = false; prevTokenKind = 'none'; lastClosedGroup = null
+      continue
+    }
+    const isStarPlus = ch === '*' || ch === '+'
+    const isBrace = ch === '{'
+    if (isStarPlus || isBrace) {
+      let repeatsAtLeastTwo = isStarPlus
+      if (isBrace) {
+        const endBrace = pattern.indexOf('}', i + 1)
+        if (endBrace === -1) return false
+        const m = /^(\d+)(?:,(\d*))?$/.exec(pattern.slice(i + 1, endBrace))
+        if (!m) { prevWasQuantifier = false; prevTokenKind = 'atom'; lastClosedGroup = null; continue }
+        const min = Number(m[1])
+        const max = m[2] === undefined ? min : (m[2] === '' ? Infinity : Number(m[2]))
+        if (min > 64 || (Number.isFinite(max) && max > 64) || max < min) return false
+        repeatsAtLeastTwo = max >= 2
+        i = endBrace
+      }
+      if (pattern[i + 1] === '?') i += 1
+      if (prevWasQuantifier || prevTokenKind === 'lookahead') return false
+      if (repeatsAtLeastTwo && prevTokenKind === 'group' && lastClosedGroup && (lastClosedGroup.hasQuantifier || lastClosedGroup.hasAlternation)) return false
+      if (repeatsAtLeastTwo) stack[stack.length - 1]!.hasQuantifier = true
+      prevWasQuantifier = true; lastClosedGroup = null
+      continue
+    }
+    if (ch === '?') {
+      if (prevWasQuantifier) return false
+      prevWasQuantifier = true
+      continue
+    }
+    prevWasQuantifier = false; prevTokenKind = 'atom'; lastClosedGroup = null
+  }
+  if (inClass || stack.length !== 1) return false
+  try { new RegExp(pattern); return true } catch { return false }
+}
+
+export function safeRegexTest(
+  pattern: string,
+  haystack: string,
+  opts?: { maxPatternLength?: number; maxHaystackLength?: number },
+): boolean {
+  if (!isSafeRegexPattern(pattern, opts?.maxPatternLength ?? MAX_REPLAY_REGEX_PATTERN_LENGTH)) return false
+  const capped = typeof haystack === 'string'
+    ? haystack.slice(0, opts?.maxHaystackLength ?? MAX_REPLAY_REGEX_HAYSTACK_LENGTH)
+    : ''
+  try { return new RegExp(pattern).test(capped) } catch { return false }
+}
+
+const ALLOWED_RECIPES_BY_SPEC_KIND: Readonly<Record<string, ReadonlySet<string>>> = {
+  browser_chain: new Set(['browser_sink']),
+  sql_boolean_diff: new Set(['boolean_or_timing']),
+  sql_time_diff: new Set(['boolean_or_timing']),
+  race_burst: new Set(['conserved_balance', 'race_burst']),
+  http_chain: new Set([
+    'access_boundary', 'persisted_mutation', 'boolean_or_timing', 'oob_callback',
+    'race_burst', 'disclosure', 'redirect', 'injection_fingerprint', 'conserved_balance',
+  ]),
+}
+
+/**
+ * H-5: Strict provenance, scope, Tier-0, denylist, and allowlist gate for `recipe` envelopes.
+ */
+export function validateReplayRecipeEnvelope(input: {
+  specKind: string
+  specOrigin: string
+  recipeId: string
+  recipeArgs: Record<string, unknown>
+  recipeOrigin: string
+  envelopeTrust?: 'host_persisted' | 'untrusted'
+  tier: number
+  canRead: (origin: string) => boolean
+  hasDestructive: (serialized: string) => boolean
+  hasStoredMatch?: () => boolean
+}): { ok: true } | { ok: false; reason: string } {
+  if (input.envelopeTrust === 'untrusted') {
+    return { ok: false, reason: 'Untrusted model-supplied recipe envelope rejected by verification kernel.' }
+  }
+  if (input.specKind === 'static_ast_proof') {
+    return { ok: false, reason: 'static_ast_proof cannot carry or execute a live floor recipe envelope.' }
+  }
+  if (input.tier === 0) {
+    return { ok: false, reason: 'Live recipe execution is disabled in Tier 0.' }
+  }
+  const allowed = ALLOWED_RECIPES_BY_SPEC_KIND[input.specKind]
+  if (!allowed || !allowed.has(input.recipeId)) {
+    return { ok: false, reason: `Recipe "${input.recipeId}" is not allowlisted for spec kind "${input.specKind}".` }
+  }
+  if (input.hasDestructive(JSON.stringify({ recipeId: input.recipeId, args: input.recipeArgs }))) {
+    return { ok: false, reason: 'Recipe envelope rejected by destructive-payload denylist.' }
+  }
+  const specOriginNorm = normalizeOrigin(input.specOrigin)
+  const origins = new Set<string>()
+  if (input.recipeOrigin) origins.add(input.recipeOrigin)
+  for (const key of ['origin', 'targetOrigin'] as const) {
+    const val = input.recipeArgs[key]
+    if (typeof val === 'string' && val.trim()) origins.add(val.trim())
+  }
+  if (Array.isArray(input.recipeArgs.steps)) {
+    for (const s of input.recipeArgs.steps) {
+      if (s && typeof s === 'object' && typeof (s as { origin?: unknown }).origin === 'string') {
+        const o = (s as { origin: string }).origin.trim()
+        if (o) origins.add(o)
+      }
+    }
+  }
+  for (const origin of origins) {
+    if (!input.canRead(origin)) return { ok: false, reason: `Recipe envelope origin ${origin} is not in approved scope.` }
+    if (specOriginNorm && normalizeOrigin(origin) !== specOriginNorm) {
+      return { ok: false, reason: `Recipe envelope origin (${origin}) does not match spec origin (${input.specOrigin}).` }
+    }
+  }
+  if (input.recipeId === 'boolean_or_timing') {
+    const ctlPath = typeof input.recipeArgs.controlPathAndQuery === 'string' ? input.recipeArgs.controlPathAndQuery : null
+    const prbPath = typeof input.recipeArgs.probePathAndQuery === 'string' ? input.recipeArgs.probePathAndQuery : null
+    if (ctlPath && prbPath && normalizePath(ctlPath) !== normalizePath(prbPath)) {
+      return { ok: false, reason: `boolean_or_timing recipe control route (${normalizePath(ctlPath)}) does not match probe route (${normalizePath(prbPath)}).` }
+    }
+  }
+  if (input.hasStoredMatch && input.envelopeTrust !== 'host_persisted' && !input.hasStoredMatch()) {
+    return { ok: false, reason: 'Recipe envelope has no matching host-persisted floor record in run storage.' }
+  }
+  return { ok: true }
+}
+
+export function validateReplayAgentScriptEnvelope(input: {
+  specKind?: unknown
+  origin: string
+  verdict: string
+  envelopeTrust?: 'host_persisted' | 'untrusted'
+  tier: number
+  canRead: (origin: string) => boolean
+  hasStoredMatch?: () => boolean
+}): { ok: true } | { ok: false; reason: string } {
+  if (input.envelopeTrust === 'untrusted') {
+    return { ok: false, reason: 'Untrusted model-supplied agentScript envelope rejected by verification kernel.' }
+  }
+  if (input.specKind === 'static_ast_proof') {
+    return { ok: false, reason: 'static_ast_proof cannot carry or execute a live agentScript envelope.' }
+  }
+  if (input.tier === 0) {
+    return { ok: false, reason: 'Live agentScript retest is disabled in Tier 0.' }
+  }
+  if (!input.origin || !input.canRead(input.origin)) {
+    return { ok: false, reason: `agentScript envelope origin ${input.origin || '(missing)'} is not in approved scope.` }
+  }
+  if (input.verdict !== 'confirmed') {
+    return { ok: false, reason: `agentScript envelope verdict must be "confirmed" to retest (got "${input.verdict}").` }
+  }
+  if (input.hasStoredMatch && input.envelopeTrust !== 'host_persisted' && !input.hasStoredMatch()) {
+    return { ok: false, reason: 'agentScript envelope has no matching host-confirmed proof record in run storage.' }
+  }
+  return { ok: true }
 }
 
 export type { ImpactClass, ImpactStep, RoleName }

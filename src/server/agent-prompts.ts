@@ -1073,7 +1073,7 @@ export const KOVO_VERIFY_USAGE_HINT =
   'Inline TS scripts receive `ctx` directly (no imports required): `await ctx.prove_access_boundary({ controlPersona, probePersona, route }); return ctx.result({ title: "..." })` (or `export default async (ctx) => { ... }`).'
 
 const KOVO_VERIFY_SIGNATURES = [
-  'Exact TS helper signatures (targets accept string path/URL or { url|path|pathAndQuery, method?, headers?, body?, as? }):',
+  'Exact TS helper signatures (strict camelCase options; targets accept string path/URL or { url|path|pathAndQuery, method?, headers?, body?, as? }):',
   '- ctx.prove_access_boundary({ controlPersona?, probePersona?, route, probeRoute?, method?, boundaryClass?: "access"|"auth", vulnClass?, controlOptions?, probeOptions?, expectControlDenied? }) — for auth bypass / forged JWT, pass boundaryClass: "auth", vulnClass: "auth_bypass"|"jwt_forgery" with unauthenticated/bad-token control (401/403) and bypass header/token/param in probeOptions/probeRoute.',
   '- ctx.prove_persisted_mutation({ readRoute, mutation: { path|url, method, body, as? }, fieldPath, expectDelta, readPersona?, mutatePersona? })',
   '- ctx.prove_injection_differential({ control: path|{ path, method?, body?, as? }, probe: path|{ path, method?, body?, as? }, expectedOutput?, vulnClass? }) — pass expectedOutput (>=4 chars, non-reflected) for SSTI/eval/cmdi or omit for engine error fingerprint.',

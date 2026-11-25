@@ -9,7 +9,7 @@ import { parseRoleLabel, routeFamily, stepReadsState } from './oracle-invariants
 import { proofReceiptSchema, receiptIdSchema, verifyReceipt } from './proof-receipt.ts'
 import { evaluateV8OracleFamily, extractTenantMarkers, isJobOrHandleStub } from './v8-oracle-families.ts'
 import type { CrossSurfaceHop, CrossSurfacePivotInput, HostSignedRecord as V8OracleRecord, V8OracleFamily, V8OracleInputMap } from './v8-oracle-families.ts'
-import { hydrateV8OracleInput, matchesHydratedRecord, selectStateTransitionPair, toOracleRecord } from './v8-oracle-hydrate.ts'
+import { hydrateV8OracleInput, isHydratedStub, isPrivilegedActorOrRole, matchesHydratedRecord, selectStateTransitionPair, toOracleRecord } from './v8-oracle-hydrate.ts'
 import type { ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 
 export const HOP_SURFACES = ['http', 'graphql', 'ws', 'sse', 'browser', 'webhook', 'async_job', 'idp', 'cdn', 'storage'] as const
@@ -254,6 +254,7 @@ function indexAndVerifyCitations(receipt: CompositeProofReceipt, transcript: Hos
 function recordHopCapabilities(hop: HopReceipt, idx: IndexedTranscript, target: Set<string>): void {
   for (const id of hop.exchangeIds) {
     const e = idx.entriesById.get(id)!
+    if (e.step.arm === 'control') continue
     for (const c of e.emittedCapabilities ?? []) target.add(c)
     for (const a of e.cryptoAttestations ?? []) if (a.derivedCapabilityId) target.add(a.derivedCapabilityId)
   }
@@ -470,9 +471,9 @@ function verifyAttackerProvenance(
   const forbiddenSet = new Set(options.forbiddenShortcutPersonas ?? [])
   const rootSet = new Set(dag.roots), dagCaps = new Set<string>(), probeTenants = new Set<string>()
   const isForbidden = (a: string | null, r: string | null) =>
-    (a !== null && forbiddenSet.has(a)) || (allowedSet ? a !== null && !allowedSet.has(a) : r === 'owner')
+    (a !== null && forbiddenSet.has(a)) || (allowedSet ? a !== null && !allowedSet.has(a) : isPrivilegedActorOrRole(a, r))
   const isAllowed = (a: string | null, r: string | null) =>
-    !(a !== null && forbiddenSet.has(a)) && (allowedSet ? a !== null && allowedSet.has(a) : r !== 'owner')
+    !(a !== null && forbiddenSet.has(a)) && (allowedSet ? a !== null && allowedSet.has(a) : !isPrivilegedActorOrRole(a, r))
 
   for (const hopId of dag.topoOrder) {
     const hop = dag.hopsById.get(hopId)!
@@ -572,6 +573,7 @@ function dispatchDefaultV8Oracle(
   const explicitInput = ti.oracleInput ?? options.v8OracleInput
   if (explicitInput) {
     const hydrated = hydrateV8OracleInput(family, explicitInput, idx, sig, econCtx)
+    if (family === 'economic_conservation' && isHydratedStub(hydrated.finalReadback)) return mapFail('terminal_impact_unproven_intermediate_stub')
     const dec = evaluateV8OracleFamily(family, { ...hydrated, verifySignature } as V8OracleInputMap[typeof family])
     return dec.satisfied ? { ok: true, family, explicit: true } : mapFail(dec.reason)
   }
@@ -601,8 +603,9 @@ function dispatchDefaultV8Oracle(
         ...(edge?.kind === 'derived_crypto_binding' ? { derivedFromCapabilityId: edge.sourceCapabilityId } : {}), ...(edge?.kind === 'state_transition_binding' && abl ? { ablationControlDenied: toOracleRecord(abl, sig) } : {}),
       }
     })
+    const rAct = actorOf(rootEx), rRole = roleOf(rootEx), isPrivilegedPreSeeded = Boolean((rAct && options.forbiddenShortcutPersonas?.includes(rAct)) || (options.attackerPersonas?.length ? (rAct !== null && !options.attackerPersonas.includes(rAct)) : isPrivilegedActorOrRole(rAct, rRole)))
     const dec = evaluateV8OracleFamily('cross_surface_pivot', {
-      attackerOriginPersona: { actorId: actorOf(rootEx) ?? 'attacker', role: roleOf(rootEx) ?? 'member', tenantId: rootEx.step.actor.tenant ?? null, isPrivilegedPreSeeded: false },
+      attackerOriginPersona: { actorId: rAct ?? 'attacker', role: rRole ?? 'member', tenantId: rootEx.step.actor.tenant ?? null, isPrivilegedPreSeeded },
       preChainControlDenied: toOracleRecord(terminalCtrl, sig), hops, verifySignature,
       terminalImpact: { kind: postMutRb ? 'privileged_mutation' : 'privileged_read', verified: true, impactDigest: sha256Hex(termEx.step.body ?? JSON.stringify(termEx.step.json ?? termEx.exchangeId)), ...(postMutRb ? { postImpactReadback: toOracleRecord(postMutRb, sig) } : {}) },
     } satisfies CrossSurfacePivotInput)
@@ -664,22 +667,19 @@ function verifyTerminalImpactGate(
     if (!c || (termEx && c.exchangeId === termEx.exchangeId) || nonTermExSet.has(c.exchangeId)) return false
     if ((c.step.arm !== 'control' && c.replayAttempt !== 'ablation_control') || typeof c.step.status !== 'number' || !DENIED_CONTROL_STATUSES.has(c.step.status)) return false
     const ca = actorOf(c); if (c.step.status === 401 && termAuthd && (!ca || ANON_ACTOR_RE.test(ca))) return false
-    const cf = normRouteFam(c.step.route ?? c.step.pathAndQuery, c.entityId ?? termEx?.entityId ?? termHop.entityId)
-    return Boolean(termFam) && Boolean(cf) && cf === termFam
+    const cf = normRouteFam(c.step.route ?? c.step.pathAndQuery, c.entityId ?? termEx?.entityId ?? termHop.entityId), eid = termEx?.entityId ?? termHop.entityId
+    return Boolean(termFam) && Boolean(cf) && cf === termFam && (c.step.status !== 404 || (eid ? entryMatchesEntity(c, eid) : (c.step.pathAndQuery ?? c.step.route ?? '').split('?', 1)[0] === termEndpoint.split('?', 1)[0]))
   })
   const hasCleanDeniedCtrl = Boolean(terminalCtrl), hasAsyncEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'async_pivot_binding' && e.verified), hasAnyDerivedCrypto = verifiedEdges.some(e => e.kind === 'derived_crypto_binding' && e.verified)
-  const ownTenantOnly = Boolean(termEx && isOwnTenantOnly(termEx))
-  const v8Default = dispatchDefaultV8Oracle(receipt, dag, idx, termEx, options, terminalCtrl, postMutRb, { termEndpoint, termFam, hasOob, hasBrowser, hasBody, isStub, ownTenantOnly })
+  const ownTenantOnly = Boolean(termEx && isOwnTenantOnly(termEx)), v8Default = dispatchDefaultV8Oracle(receipt, dag, idx, termEx, options, terminalCtrl, postMutRb, { termEndpoint, termFam, hasOob, hasBrowser, hasBody, isStub, ownTenantOnly })
   if (v8Default && !v8Default.ok) return v8Default
-  if (v8Default?.explicit && v8Default.family === 'economic_conservation') return { ok: true, terminalOracleFamily: v8Default.family, ...(termEndpoint ? { terminalEndpoint: termEndpoint } : {}) }
   if (!termEx && !hasOob && !hasBrowser && !hasAsyncEdge) return failUnproven(`Terminal hop "${termHop.hopId}" has no succeeding terminal evidence.`)
   if (isStub && !hasPostMutation) return failUnproven()
   const crossOrReplay = isCrossTenantCls || receipt.terminalVulnClass === 'cross_surface_pivot' || receipt.terminalVulnClass === 'cryptographic_scope_replay'
   if (termEx && ownTenantOnly && !hasPostMutation && (crossOrReplay || !hasCleanDeniedCtrl)) return failUnproven()
-  const needsStrict = STRICT_TERMINAL_CLASS_RE.test(receipt.terminalVulnClass)
-    || (hasBody && !hasOob && !hasBrowser && !hasAsyncEdge && !hasAnyDerivedCrypto && !['business_logic', 'ssrf'].includes(receipt.terminalVulnClass.toLowerCase()))
+  const hasEconBaselineCtrl = Boolean(v8Default?.explicit && v8Default.family === 'economic_conservation'), needsStrict = STRICT_TERMINAL_CLASS_RE.test(receipt.terminalVulnClass) || (!hasOob && !hasBrowser && !hasAsyncEdge && !(receipt.hops.length >= 2 && hasAnyDerivedCrypto))
   if (needsStrict) {
-    if (!hasCleanDeniedCtrl && !hasOob && !hasBrowser) return failUnproven(`Missing clean denied control (401/403/404) on exact terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['clean_denied_control_401_403_404'])
+    if (!hasCleanDeniedCtrl && !hasEconBaselineCtrl && !hasOob && !hasBrowser) return failUnproven(`Missing clean denied control (401/403/404) on exact terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['clean_denied_control_401_403_404'])
     if (!hasOob && !hasBrowser && ((!termEx && !hasPostMutation) || !termEndpoint || !termFam)) return failUnproven(`Missing concrete terminal exchange or endpoint for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['terminal_exchange_with_endpoint'])
     if (termEx && !hasPostMutation && (!hasBody || isStub || (ownTenantOnly && crossOrReplay))) return failUnproven()
   }

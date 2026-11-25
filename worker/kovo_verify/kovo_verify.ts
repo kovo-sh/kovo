@@ -143,26 +143,31 @@ export interface HttpExchange {
 }
 export interface CapabilityInjectionSpec { handle: string; target?: 'bearer' | 'header' | 'cookie' | 'url'; headerName?: string; cookieName?: string; queryParam?: string }
 export interface SealCapabilityInput {
-  exchangeId?: string; exchange?: { exchangeId: string } | null; hopReceiptId?: string; hopId?: string; slot: string
+  exchangeId?: string; exchange?: { exchangeId: string } | null; hopReceiptId?: string; slot: string
   jsonPath?: string; header?: string; cookie?: string; regex?: string; value?: string
   kind?: 'bearer_token' | 'api_token' | 'cookie' | 'signed_url' | 'oidc_assertion' | 'signing_salt' | 'hmac_key' | 'jwt' | 'header_secret' | 'generic_secret'
   ttlMs?: number | null; defaultHeaderName?: string; defaultCookieName?: string; allowedOrigins?: string[]
 }
 export interface SealedCapabilityResult { handle: string; meta: Record<string, unknown>; exchangeId: string; sealExchangeId: string; scrubbedPreview: string }
 export interface HmacSignInput {
-  secretHandle?: string; secret_handle?: string; keyHandle?: string; key_handle?: string
-  payload?: string | Record<string, unknown> | unknown[]; message?: string | Record<string, unknown> | unknown[]; body?: string | Record<string, unknown> | unknown[]
-  alg?: 'sha256' | 'sha384' | 'sha512'; algorithm?: 'sha256' | 'sha384' | 'sha512'; encoding?: 'hex' | 'base64' | 'base64url'
+  secretHandle: string
+  payload: string | Record<string, unknown> | unknown[]
+  alg?: 'sha256' | 'sha384' | 'sha512'
+  encoding?: 'hex' | 'base64' | 'base64url'
 }
 export interface HmacSignResult {
   exchangeId: string; signature: string; handle: string; derivedHandle: string
   attestation: { derivedFromCapabilityId: string; alg: string; encoding: string; payloadDigest: string; signatureDigest: string; sourceSecretDigest: string; runId: string; timestampMs: number }
 }
 export interface JwtSignInput {
-  secretHandle?: string; secret_handle?: string; keyHandle?: string; key_handle?: string
-  claims?: Record<string, unknown>; payload?: Record<string, unknown>
-  alg?: 'HS256' | 'HS384' | 'HS512'; algorithm?: 'HS256' | 'HS384' | 'HS512'; header?: Record<string, unknown>
-  hopReceiptId?: string; hop_receipt_id?: string; slot?: string; ttlMs?: number | null; ttl_ms?: number | null; allowedOrigins?: string[]; allowed_origins?: string[]
+  secretHandle: string
+  claims: Record<string, unknown>
+  alg?: 'HS256' | 'HS384' | 'HS512'
+  header?: Record<string, unknown>
+  hopReceiptId?: string
+  slot?: string
+  ttlMs?: number | null
+  allowedOrigins?: string[]
 }
 export interface JwtSignResult {
   exchangeId: string; derivedHandle: string; handle: string; token: string
@@ -174,14 +179,11 @@ export interface AsyncMatchPredicate {
 }
 export interface AsyncAwaitInput extends HttpOptions {
   pollRequest?: HttpTarget | (HttpOptions & { path?: string; url?: string; origin?: string })
-  poll_request?: HttpTarget; request?: HttpTarget
   path?: string; url?: string; pathAndQuery?: string; endpoint?: string; route?: string; target?: HttpTarget; origin?: string
-  matchPredicate?: AsyncMatchPredicate; match_predicate?: AsyncMatchPredicate; match?: AsyncMatchPredicate; predicate?: AsyncMatchPredicate
-  until?: AsyncMatchPredicate | string | number | number[]; expectStatus?: number | number[]; expect_status?: number | number[]
-  profile?: 'fast_lab' | 'wan'; timeoutMs?: number; timeout_ms?: number; intervalMs?: number; interval_ms?: number
-  maxAttempts?: number; max_attempts?: number; triggerExchangeId?: string | { exchangeId: string }; trigger_exchange_id?: string | { exchangeId: string }
-  tTriggerMs?: number; t_trigger_ms?: number; correlationId?: string; correlation_id?: string; correlationIds?: string[]; correlation_ids?: string[]
-  entityId?: string; entity_id?: string
+  matchPredicate?: AsyncMatchPredicate; expectStatus?: number | number[]
+  profile?: 'fast_lab' | 'wan'; timeoutMs?: number; intervalMs?: number; maxAttempts?: number
+  triggerExchangeId?: string | { exchangeId: string }; tTriggerMs?: number
+  correlationId?: string; correlationIds?: string[]; entityId?: string
 }
 export interface AsyncAwaitResult {
   pollRecordId: string; converged: boolean; status: 'converged' | 'timeout' | 'aborted' | 'max_attempts' | 'monotonic_violation'
@@ -206,7 +208,6 @@ export interface HttpOptions {
   replayAttempt?: 'mode_a' | 'ablation_control' | 'primary'
 }
 export type HttpTarget = string | (HttpOptions & { url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; target?: HttpTarget; origin?: string })
-export interface TimingResult { controlIds: string[]; variantIds: string[]; claim: TimingClaim }
 
 export interface Expectations {
   status(exchange: { exchangeId: string }, expected: number | number[], message?: string): StatusClaim
@@ -218,7 +219,6 @@ export interface Expectations {
   css(exchange: { exchangeId: string }, selector: string, expected?: { exists?: boolean; count?: number; textEquals?: string; textContains?: string }, message?: string): CssClaim
   domSentinel(exchange: { exchangeId: string }, sentinel: string, mode?: 'source' | 'executed', message?: string): SentinelsClaim
   oob(exchange: { exchangeId: string }, expectHit?: boolean, message?: string): OobClaim
-  timing(result: TimingResult, message?: string): TimingClaim
 }
 
 function readContext(): RpcContext {
@@ -317,9 +317,6 @@ function extractInlineHttpOptions(input: unknown): HttpOptions {
   for (const k of ['session', 'role', 'arm', 'followRedirects', 'timeoutMs', 'capability', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'entityId', 'correlationIds', 'evidenceRole', 'replayAttempt'] as const) {
     if (r[k] !== undefined) (out as Record<string, unknown>)[k] = r[k]
   }
-  for (const [src, dst] of [['capability_target', 'capabilityTarget'], ['capability_header_name', 'capabilityHeaderName'], ['capability_cookie_name', 'capabilityCookieName'], ['capability_query_param', 'capabilityQueryParam']] as const) {
-    if (r[src] !== undefined && (out as Record<string, unknown>)[dst] === undefined) (out as Record<string, unknown>)[dst] = r[src]
-  }
   return out
 }
 
@@ -350,7 +347,7 @@ function resolveCapHandle(value: unknown): string {
   if (typeof value === 'string') return value
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     const r = value as Record<string, unknown>
-    return String(r.handle ?? r.derivedHandle ?? r.cap_id ?? '')
+    return String(r.handle ?? r.derivedHandle ?? '')
   }
   return ''
 }
@@ -360,18 +357,10 @@ function normalizePayloadStr(value: unknown): string {
   return value === undefined || value === null ? '' : JSON.stringify(value)
 }
 
-function normalizeAsyncPredicate(raw: unknown, expectStatus?: unknown): AsyncMatchPredicate | undefined {
-  const pred: Record<string, unknown> = {}
-  if (typeof raw === 'string') pred.bodyContains = raw
-  else if (typeof raw === 'number' || Array.isArray(raw)) pred.status = raw
-  else if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-    Object.assign(pred, raw as Record<string, unknown>)
-    for (const [src, dst] of [['body_contains', 'bodyContains'], ['body_matches', 'bodyMatches'], ['json_path', 'jsonPath'], ['expect_status', 'status'], ['expectStatus', 'status']] as const) {
-      if (src in pred && !(dst in pred)) { pred[dst] = pred[src]; delete pred[src] }
-    }
-  }
+function normalizeAsyncPredicate(raw: AsyncMatchPredicate | undefined, expectStatus?: number | number[]): AsyncMatchPredicate | undefined {
+  const pred: AsyncMatchPredicate = raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...raw } : {}
   if (expectStatus !== undefined && pred.status === undefined) pred.status = expectStatus
-  return Object.keys(pred).length > 0 ? (pred as AsyncMatchPredicate) : undefined
+  return Object.keys(pred).length > 0 ? pred : undefined
 }
 
 export class VerifyContext {
@@ -405,7 +394,6 @@ export class VerifyContext {
       css: (ex, selector, expected, message) => push({ kind: 'css', exchangeId: ex.exchangeId, selector, ...(expected ?? {}), ...(message ? { message } : {}) }),
       domSentinel: (ex, sentinel, mode, message) => push({ kind: 'dom_sentinel', exchangeId: ex.exchangeId, sentinel, mode: mode ?? 'executed', ...(message ? { message } : {}) }),
       oob: (ex, expectHit, message) => push({ kind: 'oob', exchangeId: ex.exchangeId, expectHit: expectHit ?? true, ...(message ? { message } : {}) }),
-      timing: (result, message) => push({ ...result.claim, ...(message ? { message } : {}) }),
     }
     this.expect = expectations
     this.assert = expectations
@@ -414,13 +402,8 @@ export class VerifyContext {
   private buildHttpRpcArgs(input: HttpTarget, options: HttpOptions = {}): { args: Record<string, unknown>; timeoutMs: number } {
     const target = splitTarget(input, this.defaultOrigin)
     const merged: HttpOptions = { ...extractInlineHttpOptions(input), ...options }
-    const mr = merged as Record<string, unknown>
     const { body, headers } = normalizeBodyAndHeaders(merged.body, merged.headers)
     const persona = merged.as ?? merged.persona
-    const capTarget = merged.capabilityTarget ?? mr.capability_target
-    const capHeader = merged.capabilityHeaderName ?? mr.capability_header_name
-    const capCookie = merged.capabilityCookieName ?? mr.capability_cookie_name
-    const capQuery = merged.capabilityQueryParam ?? mr.capability_query_param
     return {
       args: {
         ...(target.origin ? { origin: target.origin } : {}),
@@ -433,10 +416,10 @@ export class VerifyContext {
         ...((merged.role ?? merged.arm) ? { sessionGroupRole: merged.role ?? merged.arm } : {}),
         ...(merged.followRedirects !== undefined ? { followRedirects: merged.followRedirects } : {}),
         ...(merged.capability !== undefined ? { capability: merged.capability } : {}),
-        ...(capTarget ? { capabilityTarget: capTarget } : {}),
-        ...(capHeader ? { capabilityHeaderName: capHeader } : {}),
-        ...(capCookie ? { capabilityCookieName: capCookie } : {}),
-        ...(capQuery ? { capabilityQueryParam: capQuery } : {}),
+        ...(merged.capabilityTarget ? { capabilityTarget: merged.capabilityTarget } : {}),
+        ...(merged.capabilityHeaderName ? { capabilityHeaderName: merged.capabilityHeaderName } : {}),
+        ...(merged.capabilityCookieName ? { capabilityCookieName: merged.capabilityCookieName } : {}),
+        ...(merged.capabilityQueryParam ? { capabilityQueryParam: merged.capabilityQueryParam } : {}),
         ...(merged.entityId ? { entityId: merged.entityId } : {}),
         ...(merged.correlationIds?.length ? { correlationIds: merged.correlationIds } : {}),
         ...(merged.evidenceRole ? { evidenceRole: merged.evidenceRole } : {}),
@@ -451,22 +434,20 @@ export class VerifyContext {
     return hydrateExchange(await rpc('http', args, timeoutMs) as HttpExchange)
   }
 
-  async httpSend(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {
+  async http_send(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {
     const { args, timeoutMs } = this.buildHttpRpcArgs(input, options)
     return hydrateExchange(await rpc('http.send', args, timeoutMs) as HttpExchange)
   }
 
-  http_send(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> { return this.httpSend(input, options) }
-  request(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> { return this.httpSend(input, options) }
+  request(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> { return this.http_send(input, options) }
 
-  async sealCapability(input: SealCapabilityInput): Promise<SealedCapabilityResult> {
+  async seal_capability(input: SealCapabilityInput): Promise<SealedCapabilityResult> {
     const exchangeId = input.exchangeId ?? input.exchange?.exchangeId
-    if (!exchangeId) throw new Error('sealCapability requires exchangeId or exchange.')
+    if (!exchangeId) throw new Error('seal_capability requires exchangeId or exchange.')
     return await rpc('capability.seal', {
       exchangeId,
       slot: input.slot,
       ...(input.hopReceiptId ? { hopReceiptId: input.hopReceiptId } : {}),
-      ...(input.hopId ? { hopId: input.hopId } : {}),
       ...(input.jsonPath ? { jsonPath: input.jsonPath } : {}),
       ...(input.header ? { header: input.header } : {}),
       ...(input.cookie ? { cookie: input.cookie } : {}),
@@ -480,47 +461,33 @@ export class VerifyContext {
     }, 30_000) as SealedCapabilityResult
   }
 
-  seal_capability(input: SealCapabilityInput | Record<string, unknown>): Promise<SealedCapabilityResult> {
-    const r = input as Record<string, unknown>
-    return this.sealCapability({
-      ...(r as unknown as SealCapabilityInput),
-      ...((r.exchangeId ?? r.exchange_id) ? { exchangeId: String(r.exchangeId ?? r.exchange_id) } : {}),
-      ...((r.hopReceiptId ?? r.hop_receipt_id) ? { hopReceiptId: String(r.hopReceiptId ?? r.hop_receipt_id) } : {}),
-      ...((r.hopId ?? r.hop_id) ? { hopId: String(r.hopId ?? r.hop_id) } : {}),
-      ...((r.jsonPath ?? r.json_path) ? { jsonPath: String(r.jsonPath ?? r.json_path) } : {}),
-      ...((r.ttlMs ?? r.ttl_ms) !== undefined ? { ttlMs: (r.ttlMs ?? r.ttl_ms) as number | null } : {}),
-      ...((r.defaultHeaderName ?? r.default_header_name) ? { defaultHeaderName: String(r.defaultHeaderName ?? r.default_header_name) } : {}),
-      ...((r.defaultCookieName ?? r.default_cookie_name) ? { defaultCookieName: String(r.defaultCookieName ?? r.default_cookie_name) } : {}),
-      ...((r.allowedOrigins ?? r.allowed_origins) ? { allowedOrigins: (r.allowedOrigins ?? r.allowed_origins) as string[] } : {}),
-    })
-  }
+  sealCapability(input: SealCapabilityInput): Promise<SealedCapabilityResult> { return this.seal_capability(input) }
 
-  async hmacSign(
+  async hmac_sign(
     inputOrSecret: HmacSignInput | Record<string, unknown> | string,
     payloadArg?: string | Record<string, unknown> | unknown[],
-    opts?: { alg?: string; algorithm?: string; encoding?: string } | string,
+    opts?: { alg?: string; encoding?: string } | string,
     encodingArg?: string,
   ): Promise<HmacSignResult> {
+    const isPos = typeof inputOrSecret === 'string' || (
+      payloadArg !== undefined && inputOrSecret && typeof inputOrSecret === 'object' && !('secretHandle' in inputOrSecret)
+    )
     let secretHandle = ''
     let rawPayload: unknown
     let alg: string | undefined
     let encoding: string | undefined
-    const isPos = typeof inputOrSecret === 'string' || (
-      payloadArg !== undefined && inputOrSecret && typeof inputOrSecret === 'object'
-      && !('secretHandle' in inputOrSecret) && !('secret_handle' in inputOrSecret) && !('keyHandle' in inputOrSecret) && !('key_handle' in inputOrSecret)
-    )
     if (isPos) {
       secretHandle = resolveCapHandle(inputOrSecret)
       rawPayload = payloadArg
       const o = typeof opts === 'string' ? { alg: opts } : (opts ?? {})
-      alg = o.alg ?? o.algorithm
+      alg = o.alg
       encoding = encodingArg ?? o.encoding
     } else if (inputOrSecret && typeof inputOrSecret === 'object') {
-      const r = inputOrSecret as Record<string, unknown>
-      secretHandle = resolveCapHandle(r.secretHandle ?? r.secret_handle ?? r.keyHandle ?? r.key_handle ?? '')
-      rawPayload = r.payload ?? r.message ?? r.body
-      alg = (r.alg ?? r.algorithm) as string | undefined
-      encoding = r.encoding as string | undefined
+      const r = inputOrSecret as Partial<HmacSignInput>
+      secretHandle = resolveCapHandle(r.secretHandle ?? '')
+      rawPayload = r.payload
+      alg = r.alg
+      encoding = r.encoding
     }
     const res = await rpc('crypto.hmacSign', {
       secretHandle,
@@ -532,101 +499,74 @@ export class VerifyContext {
     return { ...res, signature: res.signature, handle, derivedHandle: res.derivedHandle ?? handle }
   }
 
-  hmac_sign(
+  hmacSign(
     inputOrSecret: HmacSignInput | Record<string, unknown> | string,
     payloadArg?: string | Record<string, unknown> | unknown[],
-    opts?: { alg?: string; algorithm?: string; encoding?: string } | string,
+    opts?: { alg?: string; encoding?: string } | string,
     encodingArg?: string,
-  ): Promise<HmacSignResult> { return this.hmacSign(inputOrSecret, payloadArg, opts, encodingArg) }
+  ): Promise<HmacSignResult> { return this.hmac_sign(inputOrSecret, payloadArg, opts, encodingArg) }
 
-  async jwtSign(
+  async jwt_sign(
     inputOrSecret: JwtSignInput | Record<string, unknown> | string,
     claimsArg?: Record<string, unknown>,
-    opts?: Omit<JwtSignInput, 'secretHandle' | 'claims'> | Record<string, unknown> | string,
+    opts?: Omit<JwtSignInput, 'secretHandle' | 'claims'> | string,
   ): Promise<JwtSignResult> {
     const isPos = typeof inputOrSecret === 'string' || (
-      claimsArg !== undefined && inputOrSecret && typeof inputOrSecret === 'object'
-      && !('secretHandle' in inputOrSecret) && !('secret_handle' in inputOrSecret) && !('keyHandle' in inputOrSecret) && !('key_handle' in inputOrSecret)
+      claimsArg !== undefined && inputOrSecret && typeof inputOrSecret === 'object' && !('secretHandle' in inputOrSecret)
     )
-    const r: Record<string, unknown> = isPos
-      ? (typeof opts === 'string' ? { alg: opts } : { ...(opts ?? {}) })
-      : ((inputOrSecret && typeof inputOrSecret === 'object' ? inputOrSecret : {}) as Record<string, unknown>)
-    const secretHandle = isPos
-      ? resolveCapHandle(inputOrSecret)
-      : resolveCapHandle(r.secretHandle ?? r.secret_handle ?? r.keyHandle ?? r.key_handle ?? '')
-    const claims = (isPos ? claimsArg : (r.claims ?? r.payload ?? {})) as Record<string, unknown>
-    const alg = (r.alg ?? r.algorithm) as string | undefined
-    const hopReceiptId = r.hopReceiptId ?? r.hop_receipt_id
-    const ttlMs = r.ttlMs ?? r.ttl_ms
-    const allowedOrigins = (r.allowedOrigins ?? r.allowed_origins) as string[] | undefined
+    const r: Partial<JwtSignInput> = isPos
+      ? (typeof opts === 'string' ? { alg: opts as JwtSignInput['alg'] } : { ...(opts ?? {}) })
+      : ((inputOrSecret && typeof inputOrSecret === 'object' ? inputOrSecret : {}) as Partial<JwtSignInput>)
+    const secretHandle = resolveCapHandle(isPos ? inputOrSecret : (r.secretHandle ?? ''))
+    const claims = (isPos ? claimsArg : r.claims) ?? {}
     const res = await rpc('crypto.jwtSign', {
       secretHandle,
-      claims: claims ?? {},
-      ...(alg ? { alg } : {}),
+      claims,
+      ...(r.alg ? { alg: r.alg } : {}),
       ...(r.header ? { header: r.header } : {}),
-      ...(hopReceiptId ? { hopReceiptId: String(hopReceiptId) } : {}),
+      ...(r.hopReceiptId ? { hopReceiptId: String(r.hopReceiptId) } : {}),
       ...(r.slot ? { slot: String(r.slot) } : {}),
-      ...(ttlMs !== undefined ? { ttlMs } : {}),
-      ...(allowedOrigins?.length ? { allowedOrigins } : {}),
+      ...(r.ttlMs !== undefined ? { ttlMs: r.ttlMs } : {}),
+      ...(r.allowedOrigins?.length ? { allowedOrigins: r.allowedOrigins } : {}),
     }, 30_000) as JwtSignResult
     return { ...res, handle: res.handle ?? res.derivedHandle, token: res.token ?? res.derivedHandle }
   }
 
-  jwt_sign(
+  jwtSign(
     inputOrSecret: JwtSignInput | Record<string, unknown> | string,
     claimsArg?: Record<string, unknown>,
-    opts?: Omit<JwtSignInput, 'secretHandle' | 'claims'> | Record<string, unknown> | string,
-  ): Promise<JwtSignResult> { return this.jwtSign(inputOrSecret, claimsArg, opts) }
+    opts?: Omit<JwtSignInput, 'secretHandle' | 'claims'> | string,
+  ): Promise<JwtSignResult> { return this.jwt_sign(inputOrSecret, claimsArg, opts) }
 
-  async awaitAsync(
-    input: AsyncAwaitInput | Record<string, unknown> | string,
-    matchPredicateArg?: AsyncMatchPredicate | Record<string, unknown> | string | number | number[],
-    opts?: Record<string, unknown>,
-  ): Promise<AsyncAwaitResult> {
-    const r: Record<string, unknown> = typeof input === 'string'
-      ? { ...(opts ?? {}), pollRequest: input }
-      : { ...(input as Record<string, unknown>), ...(opts ?? {}) }
-    const pollRaw = r.pollRequest ?? r.poll_request ?? r.request
-    const { args: pollRequest } = pollRaw !== undefined
-      ? this.buildHttpRpcArgs(pollRaw as HttpTarget, typeof pollRaw === 'string' ? extractInlineHttpOptions(r) : {})
+  async await_async(input: AsyncAwaitInput | Record<string, unknown>): Promise<AsyncAwaitResult> {
+    const r = (input && typeof input === 'object' ? input : {}) as AsyncAwaitInput
+    const { args: pollRequest } = r.pollRequest !== undefined
+      ? this.buildHttpRpcArgs(r.pollRequest, typeof r.pollRequest === 'string' ? extractInlineHttpOptions(r) : {})
       : this.buildHttpRpcArgs(r as HttpTarget)
-    const matchPredicate = normalizeAsyncPredicate(
-      matchPredicateArg ?? r.matchPredicate ?? r.match_predicate ?? r.match ?? r.predicate ?? r.until,
-      r.expectStatus ?? r.expect_status,
-    )
-    const timeoutMs = (r.timeoutMs ?? r.timeout_ms) !== undefined ? Number(r.timeoutMs ?? r.timeout_ms) : undefined
-    const intervalMs = (r.intervalMs ?? r.interval_ms) !== undefined ? Number(r.intervalMs ?? r.interval_ms) : undefined
-    const maxAttempts = (r.maxAttempts ?? r.max_attempts) !== undefined ? Number(r.maxAttempts ?? r.max_attempts) : undefined
-    const trigRaw = r.triggerExchangeId ?? r.trigger_exchange_id
-    const triggerExchangeId = typeof trigRaw === 'string' ? trigRaw
-      : (trigRaw && typeof trigRaw === 'object' ? String((trigRaw as Record<string, unknown>).exchangeId ?? '') : undefined)
-    const tTriggerMs = (r.tTriggerMs ?? r.t_trigger_ms) !== undefined ? Number(r.tTriggerMs ?? r.t_trigger_ms) : undefined
-    const correlationId = r.correlationId ?? r.correlation_id
-    const correlationIds = (r.correlationIds ?? r.correlation_ids) as string[] | undefined
-    const entityId = r.entityId ?? r.entity_id
+    const matchPredicate = normalizeAsyncPredicate(r.matchPredicate, r.expectStatus)
+    const triggerExchangeId = typeof r.triggerExchangeId === 'string'
+      ? r.triggerExchangeId
+      : (r.triggerExchangeId && typeof r.triggerExchangeId === 'object' ? r.triggerExchangeId.exchangeId : undefined)
+    const timeoutMs = r.timeoutMs !== undefined ? Number(r.timeoutMs) : undefined
     const res = await rpc('async.awaitResult', {
       pollRequest,
       ...(matchPredicate ? { matchPredicate } : {}),
       ...(r.profile ? { profile: r.profile } : {}),
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-      ...(intervalMs !== undefined ? { intervalMs } : {}),
-      ...(maxAttempts !== undefined ? { maxAttempts } : {}),
+      ...(r.intervalMs !== undefined ? { intervalMs: Number(r.intervalMs) } : {}),
+      ...(r.maxAttempts !== undefined ? { maxAttempts: Number(r.maxAttempts) } : {}),
       ...(triggerExchangeId ? { triggerExchangeId } : {}),
-      ...(tTriggerMs !== undefined ? { tTriggerMs } : {}),
-      ...(correlationId ? { correlationId: String(correlationId) } : {}),
-      ...(correlationIds?.length ? { correlationIds } : {}),
-      ...(entityId ? { entityId: String(entityId) } : {}),
+      ...(r.tTriggerMs !== undefined ? { tTriggerMs: Number(r.tTriggerMs) } : {}),
+      ...(r.correlationId ? { correlationId: String(r.correlationId) } : {}),
+      ...(r.correlationIds?.length ? { correlationIds: r.correlationIds } : {}),
+      ...(r.entityId ? { entityId: String(r.entityId) } : {}),
     }, Math.max((timeoutMs ?? 30_000) + 10_000, 15_000)) as AsyncAwaitResult
     return res && res.exchange ? { ...res, exchange: hydrateExchange(res.exchange) } : res
   }
 
-  await_async(
-    input: AsyncAwaitInput | Record<string, unknown> | string,
-    matchPredicateArg?: AsyncMatchPredicate | Record<string, unknown> | string | number | number[],
-    opts?: Record<string, unknown>,
-  ): Promise<AsyncAwaitResult> { return this.awaitAsync(input, matchPredicateArg, opts) }
+  awaitAsync(input: AsyncAwaitInput | Record<string, unknown>): Promise<AsyncAwaitResult> { return this.await_async(input) }
 
-  async proveComposite(receipt: Record<string, unknown>): Promise<CompositeVerificationResult> {
+  async prove_composite(receipt: Record<string, unknown>): Promise<CompositeVerificationResult> {
     const payload = receipt && typeof receipt === 'object' && 'receipt' in receipt ? receipt : { receipt }
     const res = await rpc('composite.verify', payload as Record<string, unknown>, 30_000) as CompositeVerificationResult
     const confirmed = res.confirmed === true || res.ok === true || res.verified === true
@@ -637,16 +577,11 @@ export class VerifyContext {
     return { ...res, confirmed, ok: confirmed, verified: confirmed }
   }
 
-  prove_composite(receipt: Record<string, unknown>): Promise<CompositeVerificationResult> { return this.proveComposite(receipt) }
+  proveComposite(receipt: Record<string, unknown>): Promise<CompositeVerificationResult> { return this.prove_composite(receipt) }
 
   effectiveClaims(): VerifyClaim[] {
     if (this.claims.length > 0) return [...this.claims]
     return this._lastFailedCompositeClaim ? [this._lastFailedCompositeClaim] : []
-  }
-
-  async http2(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {
-    const { args, timeoutMs } = this.buildHttpRpcArgs(input, options)
-    return hydrateExchange(await rpc('http2', args, timeoutMs) as HttpExchange)
   }
 
   async browser(input: HttpTarget, options: { as?: string; waitForSelector?: string; timeoutMs?: number } = {}): Promise<BrowserExchange> {
@@ -666,31 +601,9 @@ export class VerifyContext {
       ({ ...handle, ...(await rpc('oob', { action: 'check', token: handle.token, exchangeId: handle.exchangeId }, 30_000) as OobCheck) }),
   }
 
-  readonly timing = {
-    compare: async (
-      control: { target: HttpTarget; options?: HttpOptions },
-      variant: { target: HttpTarget; options?: HttpOptions },
-      options: { pairs?: number } = {},
-    ): Promise<TimingResult> => {
-      const pairs = Math.max(5, Math.min(Math.round(options.pairs ?? 6), 7))
-      const controlIds: string[] = []
-      const variantIds: string[] = []
-      for (let i = 0; i < pairs; i += 1) {
-        const order: Array<'control' | 'variant'> = i % 2 === 0 ? ['control', 'variant'] : ['variant', 'control']
-        for (const which of order) {
-          const call = which === 'control' ? control : variant
-          const exchange = await this.http(call.target, call.options)
-          if (which === 'control') controlIds.push(exchange.exchangeId)
-          else variantIds.push(exchange.exchangeId)
-        }
-      }
-      return { controlIds, variantIds, claim: { kind: 'timing', controlIds, variantIds, minPairs: pairs, maxPValue: 0.05 } }
-    },
-  }
-
   // -- authoritative host-backed proof helpers (`prove.*`) ----------------
 
-  async proveAccessBoundary(input: AccessBoundaryInput | Record<string, unknown>): Promise<AccessBoundaryProof> {
+  async prove_access_boundary(input: AccessBoundaryInput | Record<string, unknown>): Promise<AccessBoundaryProof> {
     if (!input || typeof input !== 'object') {
       throw new Error('prove_access_boundary requires { controlPersona?, probePersona?, route, method?, boundaryClass?, vulnClass?, expectControlDenied? }.')
     }
@@ -699,16 +612,15 @@ export class VerifyContext {
     return res
   }
 
-  async provePersistedMutation(input: PersistedMutationInput | Record<string, unknown>): Promise<PersistedMutationProof> {
+  async prove_persisted_mutation(input: PersistedMutationInput | Record<string, unknown>): Promise<PersistedMutationProof> {
     if (!input || typeof input !== 'object') {
       throw new Error('prove_persisted_mutation requires { readRoute, mutation, fieldPath, expectDelta }.')
     }
     const raw = input as Record<string, unknown>
-    const expectFn = typeof raw.expectDelta === 'function' ? raw.expectDelta : (typeof raw.expect_delta === 'function' ? raw.expect_delta : null)
+    const expectFn = typeof raw.expectDelta === 'function' ? raw.expectDelta : null
     const payload: Record<string, unknown> = { ...raw }
     if (expectFn) {
       delete payload.expectDelta
-      delete payload.expect_delta
       payload.hasCustomExpectFn = true
     }
     const res = hydrateFields(await rpc('prove.persistedMutation', payload, 70_000) as Record<string, unknown>, ['before', 'mutation', 'after']) as unknown as PersistedMutationProof
@@ -720,7 +632,7 @@ export class VerifyContext {
     return res
   }
 
-  async proveBooleanOrTimingDiff(input: BooleanOrTimingDiffInput | Record<string, unknown>): Promise<DifferentialProof> {
+  async prove_boolean_or_timing_diff(input: BooleanOrTimingDiffInput | Record<string, unknown>): Promise<DifferentialProof> {
     if (!input || typeof input !== 'object') {
       throw new Error('prove_boolean_or_timing_diff requires { control, variant, mode: "boolean"|"timing", rounds? }.')
     }
@@ -732,17 +644,17 @@ export class VerifyContext {
     return res
   }
 
-  async proveOobCallback(input: OobCallbackInput | Record<string, unknown>): Promise<OobCallbackProof> {
+  async prove_oob_callback(input: OobCallbackInput | Record<string, unknown>): Promise<OobCallbackProof> {
     const raw = input as Record<string, unknown>
-    const timeoutMs = Number(raw.timeoutMs ?? raw.timeout_ms ?? 6_000)
+    const timeoutMs = Number(raw.timeoutMs ?? 6_000)
     let res: OobCallbackProof
     if (typeof raw.inject === 'function') {
       const injectFn = raw.inject as (canary: OobHandle) => Promise<HttpExchange | void> | HttpExchange | void
       const started = await rpc('prove.oob', {
         phase: 'start',
         ...(raw.token ? { token: raw.token } : {}),
-        ...(raw.immediateMs !== undefined || raw.immediate_ms !== undefined ? { immediateMs: Number(raw.immediateMs ?? raw.immediate_ms) } : {}),
-        ...(raw.windowMs !== undefined || raw.window_ms !== undefined ? { windowMs: Number(raw.windowMs ?? raw.window_ms) } : {}),
+        ...(raw.immediateMs !== undefined ? { immediateMs: Number(raw.immediateMs) } : {}),
+        ...(raw.windowMs !== undefined ? { windowMs: Number(raw.windowMs) } : {}),
       }, 30_000) as { handle: OobHandle; subscription: Record<string, unknown> }
       let injection: HttpExchange | null = null
       let injectionError: string | null = null
@@ -758,7 +670,7 @@ export class VerifyContext {
         subscription: started.subscription,
         ...(injection ? { injection } : {}),
         ...(injectionError ? { injectionError } : {}),
-        ...(raw.immediateMs !== undefined || raw.immediate_ms !== undefined ? { immediateMs: Number(raw.immediateMs ?? raw.immediate_ms) } : {}),
+        ...(raw.immediateMs !== undefined ? { immediateMs: Number(raw.immediateMs) } : {}),
         timeoutMs,
         ...(raw.message ? { message: raw.message } : {}),
       }, timeoutMs + 15_000) as OobCallbackProof
@@ -769,7 +681,7 @@ export class VerifyContext {
     return res
   }
 
-  async proveRaceBurst(input: RaceBurstInput | Record<string, unknown>): Promise<RaceBurstProof> {
+  async prove_race_burst(input: RaceBurstInput | Record<string, unknown>): Promise<RaceBurstProof> {
     const raw = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>
     const reqCount = Array.isArray(raw.requests) ? raw.requests.length : 0
     const rpcTimeout = Math.max(40_000, Math.min(80_000, 25_000 + reqCount * 2_000))
@@ -778,7 +690,7 @@ export class VerifyContext {
     return res
   }
 
-  async proveInjectionDifferential(input: InjectionDifferentialInput | Record<string, unknown>): Promise<InjectionDifferentialProof> {
+  async prove_injection_differential(input: InjectionDifferentialInput | Record<string, unknown>): Promise<InjectionDifferentialProof> {
     if (!input || typeof input !== 'object') {
       throw new Error('prove_injection_differential requires { control, probe, expectedOutput?, vulnClass? }.')
     }
@@ -788,23 +700,13 @@ export class VerifyContext {
     return res
   }
 
-  /** snake_case aliases matching the documented helper contract (host normalizes snake_case keys directly). */
-  prove_access_boundary(
-    inputOrControl: AccessBoundaryInput | Record<string, unknown> | string,
-    probePersona?: string,
-    route?: HttpTarget,
-    options?: Partial<AccessBoundaryInput>,
-  ): Promise<AccessBoundaryProof> {
-    if (typeof inputOrControl === 'string') {
-      return this.proveAccessBoundary({ ...(options ?? {}), controlPersona: inputOrControl, probePersona: probePersona ?? '', route: route ?? '/' })
-    }
-    return this.proveAccessBoundary(inputOrControl)
-  }
-  prove_persisted_mutation(input: PersistedMutationInput | Record<string, unknown>): Promise<PersistedMutationProof> { return this.provePersistedMutation(input) }
-  prove_boolean_or_timing_diff(input: BooleanOrTimingDiffInput | Record<string, unknown>): Promise<DifferentialProof> { return this.proveBooleanOrTimingDiff(input) }
-  prove_injection_differential(input: InjectionDifferentialInput | Record<string, unknown>): Promise<InjectionDifferentialProof> { return this.proveInjectionDifferential(input) }
-  prove_oob_callback(input: OobCallbackInput | Record<string, unknown>): Promise<OobCallbackProof> { return this.proveOobCallback(input) }
-  prove_race_burst(input: RaceBurstInput | Record<string, unknown>): Promise<RaceBurstProof> { return this.proveRaceBurst(input) }
+  /** Thin 1-line camelCase compatibility delegates for existing v6/v8 callers. */
+  proveAccessBoundary(input: AccessBoundaryInput | Record<string, unknown>): Promise<AccessBoundaryProof> { return this.prove_access_boundary(input) }
+  provePersistedMutation(input: PersistedMutationInput | Record<string, unknown>): Promise<PersistedMutationProof> { return this.prove_persisted_mutation(input) }
+  proveBooleanOrTimingDiff(input: BooleanOrTimingDiffInput | Record<string, unknown>): Promise<DifferentialProof> { return this.prove_boolean_or_timing_diff(input) }
+  proveInjectionDifferential(input: InjectionDifferentialInput | Record<string, unknown>): Promise<InjectionDifferentialProof> { return this.prove_injection_differential(input) }
+  proveOobCallback(input: OobCallbackInput | Record<string, unknown>): Promise<OobCallbackProof> { return this.prove_oob_callback(input) }
+  proveRaceBurst(input: RaceBurstInput | Record<string, unknown>): Promise<RaceBurstProof> { return this.prove_race_burst(input) }
 
   result(input: { title: string; severity?: string; description?: string }): ProofResult {
     if (!input.title || !input.title.trim()) throw new Error('Proof result requires a title.')
