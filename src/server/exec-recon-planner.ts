@@ -133,6 +133,7 @@ import {
   synthesizeInvariants,
   toCapabilityLedgerSeeds,
   type CapabilitySeedRecord,
+  type InvariantHypothesis,
   type PersonaSurfaceObservation,
   type RuntimeDiscoveryInput,
   type RuntimeOpenApiOperation,
@@ -374,6 +375,10 @@ export interface SeedCapabilityLedgerInvariantsOptions {
   runtime?: Omit<RuntimeDiscoveryInput, 'mode'>
   approvedOrigins?: ReadonlySet<string>
   maxHypotheses?: number
+  /** Promote high-signal cross-surface / cross-service / lifecycle hypotheses into Wave 1 `chain` steps (default true when tier > 0). */
+  promoteWave1Chains?: boolean
+  /** Cap on Wave 1 `chain` steps seeded from invariant synthesis (default 6). */
+  maxWave1ChainSteps?: number
 }
 
 export interface SeedCapabilityLedgerInvariantsResult {
@@ -382,6 +387,65 @@ export interface SeedCapabilityLedgerInvariantsResult {
   seededCount: number
   quarantinedCount: number
   capIds: string[]
+  wave1ChainStepsCreated: number
+  wave1ChainStepIds: string[]
+}
+
+const WAVE1_INVARIANT_KIND_RANK: Record<InvariantHypothesis['kind'], number> = {
+  trust_boundary_mismatch: 0,
+  policy_asymmetry: 1,
+  runtime_surface_asymmetry: 2,
+  lifecycle_invariant: 3,
+}
+
+const WAVE1_INVARIANT_PRIORITY: Record<InvariantHypothesis['severity'], number> = {
+  critical: 96,
+  high: 93,
+  medium: 90,
+  low: 88,
+}
+
+function invariantHypothesisSkills(hyp: InvariantHypothesis): string[] {
+  const skills = new Set<string>(['multihop-chains', 'chain-primitives', 'false-positive-elimination'])
+  if (hyp.kind === 'trust_boundary_mismatch') {
+    skills.add('cross-host-chaining')
+    skills.add('auth-oauth-oidc')
+    if (hyp.capabilityKind === 'parser_or_cache_primitive') skills.add('cache-smuggling-desync')
+  } else if (hyp.kind === 'policy_asymmetry' || hyp.kind === 'runtime_surface_asymmetry') {
+    skills.add('access-control-bola-bfla')
+    if (hyp.surface === 'graphql') skills.add('api-rest-graphql')
+    if (hyp.surface === 'ws') skills.add('websocket-cswsh')
+    if (hyp.surface === 'storage') skills.add('upload-storage-security')
+  } else if (hyp.kind === 'lifecycle_invariant') {
+    skills.add('business-logic-workflows')
+    skills.add('access-control-bola-bfla')
+  }
+  return [...skills]
+}
+
+function invariantHypothesisCategory(hyp: InvariantHypothesis): string {
+  if (hyp.kind === 'lifecycle_invariant') return 'business-logic'
+  if (hyp.kind === 'trust_boundary_mismatch' && hyp.capabilityKind === 'identity_session') return 'auth-identity'
+  return 'broken-access-control'
+}
+
+function extractRouteRefsFromText(texts: readonly string[]): string[] {
+  const found: string[] = []
+  const seen = new Set<string>()
+  const re = /\b(?:(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+)?(\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{2,120})/g
+  for (const text of texts) {
+    for (const match of text.matchAll(re)) {
+      const method = match[1]?.toUpperCase()
+      const rawPath = match[2]!.replace(/[),.;:'"`]+$/, '')
+      if (rawPath.length < 2 || rawPath.startsWith('//') || /\.(?:ts|tsx|js|jsx|py|go|java|rb|yml|yaml|json|md)$/i.test(rawPath)) continue
+      const ref = method ? `${method} ${rawPath}` : rawPath
+      if (seen.has(ref)) continue
+      seen.add(ref)
+      found.push(ref)
+      if (found.length >= 4) return found
+    }
+  }
+  return found
 }
 
 const INVARIANT_SCAN_EXT = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.java', '.rb'])
@@ -447,6 +511,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   private readonly plannerEvidenceFrontier = new Map<string, { confirmed: number; primitives: number }>()
   private readonly frontierControllers = new Map<string, FrontierWaveController>()
   private readonly invariantsSeededRuns = new Set<string>()
+  private readonly wave1InvariantChainsPromoted = new Set<string>()
   private readonly plannerSeenCausalEdges = new Map<string, Set<string>>()
   private readonly detLeadStepKeys = new Set<string>()
   private readonly detLeadGateRejected = new Set<string>()
@@ -539,9 +604,11 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       : toCapabilityLedgerSeeds(synthesis.hypotheses)
     const ledger = this.storage.capabilityLedger(run.id)
     const capIds: string[] = []
+    const capIdByHypothesisId = new Map<string, string>()
     let seededCount = 0
     for (const seed of seeds) {
       const input = seedRecordToLedgerInput(seed, defaultOrigin)
+      capIdByHypothesisId.set(seed.metadata.hypothesisId, input.capId)
       if (ledger.getCapability(input.capId)) {
         capIds.push(input.capId)
         continue
@@ -555,16 +622,28 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       }
     }
     this.invariantsSeededRuns.add(run.id)
+
+    const shouldPromote = options.promoteWave1Chains !== false && run.capabilityTier > 0
+    const wave1ChainStepIds = shouldPromote
+      ? this.promoteInvariantHypothesesToWave1ChainSteps(run, synthesis, {
+          approvedOrigins,
+          capIdByHypothesisId,
+          maxSteps: options.maxWave1ChainSteps ?? 6,
+        })
+      : []
+
     try {
       this.storage.event(
         run.id,
         'invariants.synthesized',
-        `InvariantSynthesizer (${mode}) seeded ${seededCount} quarantined capability hypothesis node(s) (${synthesis.hypotheses.length} total).`,
+        `InvariantSynthesizer (${mode}) seeded ${seededCount} quarantined capability hypothesis node(s) (${synthesis.hypotheses.length} total, ${wave1ChainStepIds.length} Wave-1 chain step(s)).`,
         {
           mode,
           hypotheses: synthesis.hypotheses.length,
           seeded: seededCount,
           quarantined: capIds.length,
+          wave1ChainStepsCreated: wave1ChainStepIds.length,
+          wave1ChainStepIds,
           guardAsymmetries: synthesis.guardMatrix?.hypotheses.length ?? 0,
           trustBoundaries: synthesis.trustBoundaries?.hypotheses.length ?? 0,
           lifecycleSlices: synthesis.lifecycleSlices?.slices.length ?? 0,
@@ -579,7 +658,196 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       seededCount,
       quarantinedCount: capIds.length,
       capIds,
+      wave1ChainStepsCreated: wave1ChainStepIds.length,
+      wave1ChainStepIds,
     }
+  }
+
+  /**
+   * Promote high-signal cross-surface / cross-service / entity-lifecycle hypotheses from
+   * `synthesizeInvariants()` directly into ready Wave-1 `chain` lane `ChainStep`s BEFORE Phase B's
+   * first dispatch tick so multi-hop chain proving starts in Wave 1 instead of Wave 2.
+   */
+  promoteInvariantHypothesesToWave1ChainSteps(
+    run: Run,
+    synthesis: SynthesizeInvariantsResult,
+    options: {
+      approvedOrigins?: ReadonlySet<string>
+      capIdByHypothesisId?: ReadonlyMap<string, string>
+      maxSteps?: number
+    } = {},
+  ): string[] {
+    if (run.capabilityTier <= 0) return []
+    const approvedOrigins = options.approvedOrigins ?? this.host.approvedOriginsSet(run)
+    if (!approvedOrigins.size) return []
+
+    const eligible = synthesis.hypotheses
+      .filter(h => h.score >= 0.55 || h.severity === 'critical' || h.severity === 'high')
+      .sort((a, b) =>
+        WAVE1_INVARIANT_KIND_RANK[a.kind] - WAVE1_INVARIANT_KIND_RANK[b.kind]
+        || b.score - a.score
+        || a.id.localeCompare(b.id),
+      )
+    if (!eligible.length) {
+      this.wave1InvariantChainsPromoted.add(run.id)
+      return []
+    }
+
+    const existingSteps = this.storage.listChainSteps(run.id, run.goalRevision)
+    const existingHypIds = new Set<string>()
+    const existingTitles = new Set<string>()
+    for (const step of existingSteps) {
+      existingTitles.add(step.title.trim().toLowerCase())
+      const m = /\[inv_hyp=([^\]]+)\]/.exec(step.hypothesis)
+      if (m?.[1]) existingHypIds.add(m[1])
+    }
+
+    const budget = computeDynamicStepBudget(this.storage, run.id)
+    const maxToAdd = Math.max(0, Math.min(options.maxSteps ?? 6, budget - existingSteps.length))
+    if (maxToAdd <= 0) {
+      this.wave1InvariantChainsPromoted.add(run.id)
+      return []
+    }
+
+    const personas = [...resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds).values()]
+      .sort((a, b) => a.handle.localeCompare(b.handle))
+      .slice(0, 6)
+    const personasSummary = personas.length
+      ? personas.map(p => `${p.handle} (${p.roleLabel})`).join(', ')
+      : 'unauthenticated / active run personas'
+    const storedEndpoints = this.storage.listEndpoints(run.id, { limit: 120 })
+      .filter(ep => approvedOrigins.has(ep.origin))
+    const approvedList = [...approvedOrigins]
+    const seenCluster = new Set<string>()
+    const createdIds: string[] = []
+
+    for (const hyp of eligible) {
+      if (createdIds.length >= maxToAdd) break
+      if (existingHypIds.has(hyp.id)) continue
+      const clusterKey = `${hyp.kind}|${hyp.entity.toLowerCase()}|${(hyp.targetRoute ?? hyp.surface).toLowerCase()}`
+      if (seenCluster.has(clusterKey)) continue
+
+      const targetOrigins: string[] = []
+      if (hyp.serviceOrigin && approvedOrigins.has(hyp.serviceOrigin)) {
+        targetOrigins.push(hyp.serviceOrigin)
+      }
+      if (hyp.kind === 'trust_boundary_mismatch') {
+        const evidenceText = `${hyp.summary} ${hyp.evidence.join(' ')}`
+        for (const origin of approvedList) {
+          if (targetOrigins.includes(origin)) continue
+          try {
+            const host = new URL(origin).host
+            if (evidenceText.includes(origin) || evidenceText.includes(host)) targetOrigins.push(origin)
+          } catch { /* ignore */ }
+          if (targetOrigins.length >= 2) break
+        }
+        if (targetOrigins.length < 2 && approvedList.length >= 2) {
+          for (const origin of approvedList) {
+            if (!targetOrigins.includes(origin)) targetOrigins.push(origin)
+            if (targetOrigins.length >= 2) break
+          }
+        }
+      }
+      if (!targetOrigins.length) targetOrigins.push(approvedList[0]!)
+
+      const targetAssetIds = run.candidates
+        .filter(c => targetOrigins.includes(c.origin) && run.approved.includes(c.id))
+        .map(c => c.id)
+      if (!targetAssetIds.length) continue
+
+      const capId = options.capIdByHypothesisId?.get(hyp.id)
+        ?? formatDerivedCapabilityHandle(
+          'synth',
+          hyp.id.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[^A-Za-z0-9]+/, '').slice(0, 60) || 'seed',
+        )
+      const routeRefs = [
+        ...(hyp.targetRoute ? [hyp.targetRoute] : []),
+        ...extractRouteRefsFromText([...hyp.evidence, ...hyp.preconditions, hyp.summary]),
+      ]
+      if (routeRefs.length < 2 && hyp.entity && hyp.entity !== 'service' && hyp.entity !== 'boundary') {
+        const entityToken = hyp.entity.toLowerCase().replace(/[^a-z0-9]/g, '')
+        for (const ep of storedEndpoints) {
+          if (!targetOrigins.includes(ep.origin)) continue
+          if (entityToken.length >= 3 && ep.pathTemplate.toLowerCase().includes(entityToken)) {
+            const ref = `${ep.method} ${ep.pathTemplate}`
+            if (!routeRefs.includes(ref)) routeRefs.push(ref)
+            if (routeRefs.length >= 3) break
+          }
+        }
+      }
+      const uniqueRoutes = [...new Set(routeRefs)].slice(0, 4)
+      const hopDepth = hyp.kind === 'trust_boundary_mismatch' || targetOrigins.length >= 2 ? 3 : 2
+      const kindLabel = hyp.kind === 'trust_boundary_mismatch'
+        ? 'Cross-service boundary chain'
+        : hyp.kind === 'policy_asymmetry' || hyp.kind === 'runtime_surface_asymmetry'
+          ? 'Cross-surface policy chain'
+          : 'Entity lifecycle chain'
+      const routeSuffix = uniqueRoutes[0] ? ` · ${uniqueRoutes[0]}` : ''
+      const title = `Wave-1 chain · ${kindLabel} (${hyp.entity}/${hyp.surface})${routeSuffix}`.slice(0, 180)
+      if (existingTitles.has(title.toLowerCase())) continue
+
+      const locationTag = hyp.location ? ` Source: ${hyp.location.file}:${hyp.location.line}.` : ''
+      const preconditionsTag = hyp.preconditions.length
+        ? ` Preconditions: ${hyp.preconditions.slice(0, 3).join('; ')}.`
+        : ''
+      const endpointsTag = uniqueRoutes.length ? ` Endpoints: ${uniqueRoutes.join(', ')}.` : ''
+      const hypothesis = (
+        `[chain_hops=${hopDepth}] [lane=chain] [inv_hyp=${hyp.id}] [cap=${capId}] `
+        + `Multi-hop invariant chain (${hyp.mode} ${hyp.kind}): ${hyp.summary}`
+        + `${endpointsTag} Personas: ${personasSummary}.${preconditionsTag}${locationTag} `
+        + `Verification: ${hyp.verificationHint}`
+      ).slice(0, 1200)
+
+      const category = invariantHypothesisCategory(hyp)
+      const skills = invariantHypothesisSkills(hyp)
+      const created = this.storage.addChainStep(run, {
+        title,
+        hypothesis,
+        category,
+        priority: WAVE1_INVARIANT_PRIORITY[hyp.severity],
+        targetAssetIds,
+        skills,
+        dependsOnFactIds: [],
+        dependsOnStepIds: [],
+        sourceOrigins: targetOrigins,
+        specialistProfile: routeStepToSpecialist({ title, hypothesis, category, skills }),
+      })
+      createdIds.push(created.id)
+      existingHypIds.add(hyp.id)
+      existingTitles.add(title.toLowerCase())
+      seenCluster.add(clusterKey)
+    }
+
+    this.wave1InvariantChainsPromoted.add(run.id)
+    if (createdIds.length > 0) {
+      try {
+        this.storage.event(
+          run.id,
+          'invariants.wave1_chains_seeded',
+          `Promoted ${createdIds.length} synthesized invariant hypothesis(es) directly into ready Wave-1 chain steps.`,
+          {
+            mode: synthesis.mode,
+            count: createdIds.length,
+            stepIds: createdIds,
+            hypothesisKinds: [...new Set(eligible.slice(0, createdIds.length).map(h => h.kind))],
+          },
+        )
+      } catch { /* telemetry is best-effort */ }
+    }
+    return createdIds
+  }
+
+  /**
+   * Ensure Wave-1 invariant chain steps are promoted before Phase B's first dispatch tick
+   * (idempotent no-op when threat modeling already promoted them).
+   */
+  ensureWave1InvariantChainSteps(run: Run, approvedOrigins: ReadonlySet<string>): number {
+    if (run.capabilityTier <= 0 || this.wave1InvariantChainsPromoted.has(run.id)) return 0
+    const res = this.seedCapabilityLedgerInvariants(run, {
+      approvedOrigins,
+      promoteWave1Chains: true,
+    })
+    return res.wave1ChainStepsCreated
   }
 
   private collectRuntimeDiscoveryInput(
@@ -907,13 +1175,15 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       await this.host.correlateSpecDependencies(freshRun, claimed, specs, approvedOrigins, approvedAssets[0]?.origin, task.controller.signal, secrets)
 
       // 1b. v8 M2 General Invariant Synthesis (white-box mounted source OR grey-box/black-box runtime parity)
-      //     Seeds SQLite WAL CapabilityLedger with strictly quarantined `capability_only` hypotheses.
+      //     Seeds SQLite WAL CapabilityLedger with strictly quarantined `capability_only` hypotheses
+      //     and promotes high-signal cross-surface / cross-service / lifecycle hypotheses into ready Wave-1 chain steps.
       try {
         this.seedCapabilityLedgerInvariants(this.storage.run(freshRun.id), {
           reposDir,
           mountedRepos,
           specs,
           approvedOrigins,
+          promoteWave1Chains: freshRun.capabilityTier > 0 && profiles.length > 0,
         })
       } catch {
         // Additive Layer-2 synthesis must never block threat model progression
