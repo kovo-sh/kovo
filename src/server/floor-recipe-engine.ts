@@ -44,13 +44,13 @@ import type {
   PersistedMutationArgs,
   RaceBurstArgs,
 } from './floor-recipes.ts'
-import { assessBoundary, assessMfaBypass, classifyBoundaryClaim, normalizeRole } from './oracle-invariants.ts'
-import type { ActorIdentity, AmbientAuth, ImpactStep, RoleName } from './oracle-invariants.ts'
+import { actorFromPersona, assessBoundary, assessImpactEvidence, assessMassAssignmentImpact, assessMfaBypass, assessStatusOnlyDivergence, classifyBoundaryClaim, classifyImpactDescriptor, normalizeRole } from './oracle-invariants.ts'
+import type { ActorIdentity, AmbientAuth, ImpactStep, PersonaCredentialSource, RoleName } from './oracle-invariants.ts'
 import { verifyReceipt } from './proof-receipt.ts'
-import type { ProofReceipt, ReceiptTranscript } from './proof-receipt.ts'
-import type { ReplayVerificationResult, RetestVerdict } from './replay-verifier.ts'
+import type { ProofReceipt, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
+import type { ProofReceiptMode, ReplayReceiptCheck, ReplayVerdict, ReplayVerificationResult, RetestVerdict } from './replay-verifier.ts'
 import { cacheBusterValueRegex, containsDestructivePayload, extractCacheBusterParam, replayAssertionOutcomeSchema } from '../replay-spec.ts'
-import type { AuthMutation, DeclarativeReplaySpec, FloorRecipeEnvelope, ReplayStep } from '../replay-spec.ts'
+import type { AuthMutation, DeclarativeReplaySpec, FloorRecipeEnvelope, ReplayAssertionOutcome, ReplayStep } from '../replay-spec.ts'
 import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied } from './broker.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
@@ -2507,4 +2507,1070 @@ export async function runAuthProtocolProofRecipe(
   } finally {
     await canarySession?.close()
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Verification assessment + receipt helpers (moved from replay-verifier.ts, Cut 3f)
+//
+// These helpers implement the legacy declarative VM's impact/proof-strength gates and the receipt
+// gate. They live with the recipe engine so `replay-verifier.ts` stays a thin validation/dispatch
+// module; every public symbol is re-exported from the verifier.
+// ---------------------------------------------------------------------------------------------
+
+function interpolateString(template: string, vars: Record<string, string>): string {
+  return template.replace(/\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}/g, (full, name: string) =>
+    Object.prototype.hasOwnProperty.call(vars, name) ? vars[name] : full)
+}
+
+function interpolateValue(value: unknown, vars: Record<string, string>): unknown {
+  if (typeof value === 'string') return interpolateString(value, vars)
+  if (Array.isArray(value)) return value.map(v => interpolateValue(v, vars))
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = interpolateValue(v, vars)
+    }
+    return out
+  }
+  return value
+}
+
+function readJsonPath(obj: unknown, path: string): string | null {
+  const clean = path.replace(/^\$\.?/, '')
+  const segments = clean.split('.').filter(Boolean)
+  let cur: unknown = obj
+  for (const seg of segments) {
+    if (cur === null || cur === undefined) return null
+    const arrayMatch = seg.match(/^([a-zA-Z0-9_-]*)\[(\d+)\]$/)
+    if (arrayMatch) {
+      const [, key, idxStr] = arrayMatch
+      if (key) cur = (cur as Record<string, unknown>)[key]
+      if (!Array.isArray(cur)) return null
+      cur = cur[Number(idxStr)]
+    } else if (typeof cur === 'object') {
+      cur = (cur as Record<string, unknown>)[seg]
+    } else {
+      return null
+    }
+  }
+  if (cur === null || cur === undefined) return null
+  return typeof cur === 'string' ? cur : JSON.stringify(cur)
+}
+
+export function extractVariables(step: ReplayStep, exchange: BrokerExchangeResult, vars: Record<string, string>) {
+  for (const rule of step.extract ?? []) {
+    let extracted: string | null = null
+    if (rule.from === 'status') {
+      extracted = String(exchange.status)
+    } else if (rule.from === 'header') {
+      extracted = exchange.respHeaders[rule.selector.toLowerCase()] ?? null
+    } else if (rule.from === 'json') {
+      try {
+        const parsed = JSON.parse(exchange.body) as unknown
+        extracted = readJsonPath(parsed, rule.selector)
+      } catch {
+        extracted = null
+      }
+    } else if (rule.from === 'regex') {
+      try {
+        const re = new RegExp(rule.selector)
+        const m = exchange.body.match(re)
+        extracted = m ? (m[1] ?? m[0] ?? null) : null
+      } catch {
+        extracted = null
+      }
+    }
+    if (extracted !== null) vars[rule.varName] = extracted.slice(0, 512)
+  }
+}
+
+const BFLA_CWE_RE = /^CWE-(?:285|269|862|863)$/i
+const BFLA_TEXT_RE = /\b(?:bfla|broken function[- ]level|function[- ]level|privilege escalation|vertical access)\b/i
+const READ_ONLY_REPLAY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+const MUTATING_REPLAY_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+
+export interface BflaImpactAssessment {
+  required: boolean
+  satisfied: boolean
+  reason: string
+  evidence?: Record<string, unknown>
+}
+
+function normalizedReplayPath(value: string | undefined): string {
+  if (!value) return ''
+  return value.split('?')[0].split('#')[0].replace(/\/{2,}/g, '/').replace(/\/+$/, '').toLowerCase() || '/'
+}
+
+/**
+ * Map recorded replay steps onto the shared evidence model. Role/tenant/auth metadata is enriched
+ * into each step summary at record time (see `personaActorFields`), so the same validators can run
+ * on a spec whose persona handles are opaque.
+ */
+export function impactStepsFromStepsOut(
+  spec: DeclarativeReplaySpec,
+  stepsOut: Record<string, unknown>,
+): ImpactStep[] {
+  if (spec.kind !== 'http_chain' && spec.kind !== 'auth_protocol_proof') return []
+  return spec.steps.map(step => {
+    const entry = stepsOut[step.id] as Record<string, unknown> | undefined
+    const handle = (typeof entry?.personaHandle === 'string' ? entry.personaHandle : null) ?? step.request.persona ?? null
+    const declaredRole = typeof entry?.actorRole === 'string' ? normalizeRole(entry.actorRole) : null
+    let entryJson = entry?.json ?? null
+    if (entryJson === null && typeof entry?.body === 'string') {
+      // Unit-level callers may provide only the recorded body; parse it so the shared validators
+      // see the same shape the wire recorder produces.
+      try { entryJson = JSON.parse(entry.body) } catch { entryJson = null }
+    }
+    return {
+      id: step.id,
+      arm: step.role,
+      method: step.request.method.toUpperCase(),
+      route: normalizedReplayPath(step.request.pathAndQuery),
+      pathAndQuery: step.request.pathAndQuery,
+      status: typeof entry?.status === 'number' ? entry.status : null,
+      actor: {
+        handle,
+        role: declaredRole ?? normalizeRole(step.request.persona),
+        tenant: typeof entry?.actorTenant === 'string' ? entry.actorTenant : null,
+        auth: (typeof entry?.ambientAuth === 'string' ? entry.ambientAuth : 'unknown') as AmbientAuth,
+        sameSite: typeof entry?.sessionSameSite === 'string' ? entry.sessionSameSite : null,
+      } satisfies ActorIdentity,
+      json: entryJson,
+      body: typeof entry?.body === 'string' ? entry.body : '',
+      ...(Array.isArray(entry?.secretMatches)
+        ? { secretMatches: (entry.secretMatches as Array<Record<string, unknown>>).map(match => String(match.sha256Prefix ?? '')).filter(Boolean) }
+        : {}),
+      requestJson: step.request.jsonBody,
+      requestHeaders: step.request.headers ?? null,
+      responseHeaders: (entry?.headers as Record<string, string> | undefined) ?? null,
+    }
+  })
+}
+
+/**
+ * Vertical (function-level) BFLA needs *impact*, not just a 2xx from a lower-privileged actor.
+ * A read-only route that every authenticated role may legitimately read must never confirm as
+ * privilege escalation: the replay must show a role/tenant differential *and* a real side effect
+ * (or an owner-scoped disclosure for reads). Object-level BOLA (CWE-639) is handled by the shared
+ * impact gate, not here.
+ */
+export function assessBflaImpact(
+  spec: DeclarativeReplaySpec,
+  stepsOut: Record<string, unknown>,
+): BflaImpactAssessment {
+  if (spec.kind !== 'http_chain') {
+    return { required: false, satisfied: true, reason: 'Not an HTTP chain replay spec.' }
+  }
+  const descriptor = `${spec.cwe} ${spec.category} ${spec.title} ${spec.impact} ${spec.severityRationale}`
+  const vertical = BFLA_CWE_RE.test(spec.cwe) || BFLA_TEXT_RE.test(descriptor)
+  if (!vertical || spec.steps.length < 2) {
+    return { required: false, satisfied: true, reason: 'Not a function-level BFLA proof.' }
+  }
+  const assessment = assessImpactEvidence({
+    impactClass: 'bfla',
+    steps: impactStepsFromStepsOut(spec, stepsOut),
+    requiredRole: spec.requiredRole ?? null,
+    resourceTenant: spec.resourceTenant ?? null,
+    expectControlDenied: spec.expectControlDenied,
+    oracleEvents: spec.expectedImpactEvents,
+    targetOrigin: spec.origin,
+  })
+  return {
+    required: true,
+    satisfied: assessment.satisfied,
+    reason: assessment.reason,
+    ...(assessment.evidence ? { evidence: assessment.evidence } : {}),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// v5.1 Slice 4 — proof-strength + endpoint-binding guards for LLM-authored
+// http_chain specs. These guards are strictly additive: they can only turn a
+// would-be confirmation into `inconclusive`, never the other way around.
+// ---------------------------------------------------------------------------
+
+type HttpChainSpec = Extract<DeclarativeReplaySpec, { kind: 'http_chain' }>
+
+/** Vertical/horizontal authorization claims, identified by CWE or category only (never free text). */
+const AUTHZ_CWE_RE = /^CWE-(?:269|284|285|566|639|862|863|1220)$/i
+const AUTHZ_CATEGORY_RE = /(?:^|[-_\s])(?:broken[-_\s]?access[-_\s]?control|access[-_\s]?control|idor|bola|bfla|authori[sz]ation|privilege[-_\s]?escalation|tenant[-_\s]?isolation)(?:$|[-_\s])/i
+
+function isAuthorizationClaim(spec: HttpChainSpec): boolean {
+  return AUTHZ_CWE_RE.test(spec.cwe) || AUTHZ_CATEGORY_RE.test(spec.category)
+}
+
+export type HttpChainAssertionEvidence = 'status_only' | 'unbound_content' | 'content_bound'
+
+/**
+ * Classify what the jq assertion actually proves. `status_only` inspects nothing but status codes;
+ * `unbound_content` reads a body/header without binding it to an identifier, extracted variable or
+ * field comparison (a dynamic page differs on every request); `content_bound` compares structured
+ * fields, extracted identifiers, canary/canary-fingerprint evidence or secret fingerprints.
+ */
+export function classifyHttpChainAssertion(program: string): HttpChainAssertionEvidence {
+  const fields = new Set<string>()
+  for (const match of program.matchAll(/\.steps\.[A-Za-z0-9_-]+\.([A-Za-z0-9_]+)/g)) {
+    fields.add(match[1].toLowerCase())
+  }
+  const contentFields = [...fields].filter(field =>
+    field !== 'status' && field !== 'statuses' && field !== 'id' && field !== 'role' && field !== 'batchcount')
+  const topLevelProof = /\.(?:proofMatches|extractedVars|secretMatches|canary|cacheProof|uploadProof|cryptographicProofPassed)\b/.test(program)
+  if (contentFields.length === 0) return topLevelProof ? 'content_bound' : 'status_only'
+  if (fields.has('json') || fields.has('secretmatches')) return 'content_bound'
+  const identifierBound = topLevelProof ||
+    /\$[A-Za-z_][A-Za-z0-9_]*/.test(program) ||
+    /\.(?:body|bodyPreview)\s*\|\s*(?:index|contains|startswith|endswith|test|match|capture|split|ltrimstr|rtrimstr)\s*\(/.test(program) ||
+    /\b(?:index|contains|startswith|endswith)\s*\(\s*(?:"[^"]*"|\$[A-Za-z_])/.test(program)
+  if (identifierBound) return 'content_bound'
+  // A body/header byte-length differential is structural (a masked value cannot be longer than the
+  // value it masks); any other unbound body/header read is only a "different body" observation.
+  if (fields.has('bodybytes')) return 'content_bound'
+  return 'unbound_content'
+}
+
+interface JsonFieldRef {
+  stepId: string
+  path: string[]
+}
+
+/** Extract `.steps.<id>.json.<field>` / `.json["field"]` references (bounded, no array indexes). */
+function referencedJsonPaths(program: string): JsonFieldRef[] {
+  const out: JsonFieldRef[] = []
+  const seen = new Set<string>()
+  const refPattern = /\.steps\.([A-Za-z0-9_-]+)\.json((?:\.[A-Za-z_][A-Za-z0-9_]*|\[(?:"[^"]{1,64}"|\d{1,3})\])+)/g
+  for (const match of program.matchAll(refPattern)) {
+    const segments = [...match[2].matchAll(/\[(?:"([^"]{1,64})"|\d{1,3})\]|\.([A-Za-z_][A-Za-z0-9_]*)/g)]
+    if (segments.some(seg => seg[1] === undefined && seg[2] === undefined)) continue
+    if (/\[\d{1,3}\]/.test(match[2])) continue
+    const path = segments.map(seg => seg[1] ?? seg[2]).filter((seg): seg is string => Boolean(seg))
+    if (path.length === 0) continue
+    const key = `${match[1]}|${path.join('.')}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ stepId: match[1], path })
+    if (out.length >= 24) break
+  }
+  return out
+}
+
+function readJsonField(json: unknown, path: readonly string[]): string | null {
+  let cur: unknown = json
+  for (const segment of path) {
+    if (!cur || typeof cur !== 'object' || Array.isArray(cur)) return null
+    cur = (cur as Record<string, unknown>)[segment]
+  }
+  if (cur === undefined || cur === null) return null
+  return typeof cur === 'string' ? cur : JSON.stringify(cur)
+}
+
+/** Non-secret quoted literals used by the assertion, for identifier-bound marker disclosure checks. */
+function jqStringLiterals(program: string): string[] {
+  const out = new Set<string>()
+  for (const match of program.matchAll(/"((?:[^"\\]|\\.){8,120})"/g)) {
+    const value = match[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+    if (!value || /[\r\n\0]/.test(value)) continue
+    if (/^(?:application\/json|content-type|content-security-policy)$/i.test(value)) continue
+    out.add(value)
+    if (out.size >= 8) break
+  }
+  return [...out]
+}
+
+function normalizeOriginValue(value: string | undefined): string {
+  if (!value) return ''
+  try {
+    const url = new URL(value)
+    return `${url.protocol}//${url.host.toLowerCase()}`
+  } catch {
+    return value.trim().toLowerCase().replace(/\/+$/, '')
+  }
+}
+
+function originHost(value: string | undefined): string {
+  try {
+    return value ? new URL(value).host.toLowerCase() : ''
+  } catch {
+    return ''
+  }
+}
+
+/** Route family: path only, lower-cased, trailing slash trimmed (query is compared separately). */
+export function routeKey(pathAndQuery: string | undefined): string {
+  if (!pathAndQuery) return ''
+  const pathOnly = pathAndQuery.split('?')[0].split('#')[0]
+  const collapsed = pathOnly.replace(/\/{2,}/g, '/').replace(/\/+$/, '')
+  return (collapsed || '/').toLowerCase()
+}
+
+interface HttpChainStepSnapshot {
+  index: number
+  id: string
+  role: string
+  method: string
+  route: string
+  pathAndQuery: string
+  actor: string
+  status: number | null
+  body: string
+  bodyBytes: number
+  mediaType: string
+  json: unknown
+  secretMatches: number
+}
+
+export function isSuccessStatus(status: number | null): boolean {
+  return status !== null && status >= 200 && status < 300
+}
+
+export function snapshotHttpChainSteps(
+  spec: HttpChainSpec,
+  stepsOut: Record<string, unknown>,
+  stepExchanges: ReadonlyMap<string, BrokerExchangeResult[]>,
+): HttpChainStepSnapshot[] {
+  return spec.steps.map((step, index) => {
+    const entry = (stepsOut[step.id] ?? {}) as Record<string, unknown>
+    const exchange = stepExchanges.get(step.id)?.[0]
+    const body = typeof entry.body === 'string' ? entry.body : ''
+    const persona = step.request.persona ?? null
+    const session = step.request.session ?? null
+    return {
+      index,
+      id: step.id,
+      role: step.role,
+      method: step.request.method.toUpperCase(),
+      route: routeKey(exchange?.pathAndQuery ?? step.request.pathAndQuery),
+      pathAndQuery: exchange?.pathAndQuery ?? step.request.pathAndQuery,
+      actor: persona ? `persona:${persona}` : session ? `session:${session}` : 'anonymous',
+      status: typeof entry.status === 'number' ? entry.status : null,
+      body,
+      bodyBytes: typeof entry.bodyBytes === 'number' ? entry.bodyBytes : Buffer.byteLength(body, 'utf8'),
+      mediaType: typeof entry.mediaType === 'string' ? entry.mediaType : '',
+      json: entry.json ?? null,
+      secretMatches: exchange?.secretMatches?.length ?? 0,
+    }
+  })
+}
+
+export type HttpChainDifferential =
+  | 'denied_then_allowed'
+  | 'cross_actor_access'
+  | 'field_bound'
+  | 'state_delta'
+  | 'identifier_proof'
+  | null
+
+export interface HttpChainProofStrength {
+  claim: 'authorization' | 'other'
+  assertionEvidence: HttpChainAssertionEvidence
+  differential: HttpChainDifferential
+  satisfied: boolean
+  reason: string
+}
+
+function detectHttpChainDifferential(
+  spec: HttpChainSpec,
+  snapshots: readonly HttpChainStepSnapshot[],
+): HttpChainDifferential {
+  const controls = snapshots.filter(step => step.role === 'control')
+  const probes = snapshots.filter(step => step.role === 'probe')
+  const dataBearing = (step: HttpChainStepSnapshot) => isSuccessStatus(step.status) && step.bodyBytes >= 8
+  const sameRoute = (a: HttpChainStepSnapshot, b: HttpChainStepSnapshot) =>
+    a.method === b.method && a.route === b.route && a.route !== ''
+  const denied = (step: HttpChainStepSnapshot) => step.status === 401 || step.status === 403
+  // A control that is bounced (login/SSO redirect) did not receive the resource either.
+  const bounced = (step: HttpChainStepSnapshot) =>
+    step.status !== null && step.status >= 300 && step.status < 400
+
+  // 1. The same endpoint is denied to the control caller and served to the probe caller.
+  if (probes.some(probe => dataBearing(probe) && controls.some(control => sameRoute(control, probe) && (denied(control) || bounced(control))))) {
+    return 'denied_then_allowed'
+  }
+
+  // 2. A different actor reaches the exact endpoint the control actor reached.
+  if (probes.some(probe => dataBearing(probe) && controls.some(control =>
+    sameRoute(control, probe) && control.actor !== probe.actor && (isSuccessStatus(control.status) || denied(control))))) {
+    return 'cross_actor_access'
+  }
+
+  // 3. A declared response field carries a different value for the probe than for the control.
+  for (const ref of referencedJsonPaths(spec.assertionsJq)) {
+    const probe = probes.find(step => step.id === ref.stepId && isSuccessStatus(step.status))
+    if (!probe) continue
+    const probeValue = readJsonField(probe.json, ref.path)
+    if (probeValue === null) continue
+    if (controls.some(control => control.status !== null && readJsonField(control.json, ref.path) !== probeValue)) {
+      return 'field_bound'
+    }
+  }
+
+  // 4. A privileged mutation succeeds and a later read observes the mutated state (or its removal).
+  const mutatingProbe = probes.find(step => MUTATING_REPLAY_METHODS.has(step.method) && isSuccessStatus(step.status))
+  if (mutatingProbe) {
+    const reads = snapshots.filter(step => READ_ONLY_REPLAY_METHODS.has(step.method) && step.index !== mutatingProbe.index)
+    const before = [...reads].reverse().find(step => step.index < mutatingProbe.index && isSuccessStatus(step.status) && step.bodyBytes > 0)
+    const after = reads.find(step => step.index > mutatingProbe.index)
+    if (before && after) {
+      if ((after.status !== null && after.status >= 400) || (after.bodyBytes > 0 && after.body !== before.body)) {
+        return 'state_delta'
+      }
+    }
+  }
+
+  // 5. Identifier-bound proof: pre-redaction secret fingerprints or an asserted marker observed only
+  //    in the probe response.
+  if (probes.some(step => isSuccessStatus(step.status) && step.secretMatches > 0)) return 'identifier_proof'
+  const controlBodies = controls.map(step => step.body)
+  for (const literal of jqStringLiterals(spec.assertionsJq)) {
+    if (probes.some(step => step.body !== '' && step.body.includes(literal)) &&
+        !controlBodies.some(body => body.includes(literal))) {
+      return 'identifier_proof'
+    }
+  }
+
+  return null
+}
+
+/**
+ * Proof-strength gate for authorization `http_chain` specs. A status-only claim (or a bare
+ * "the body differs" claim) is never a control-vs-probe differential, and a content assertion must
+ * be backed by an observable differential in the recorded exchanges (denied-then-allowed,
+ * cross-actor access, field-bound value change, state delta, or identifier-bound proof).
+ */
+export function assessHttpChainProofStrength(
+  spec: HttpChainSpec,
+  snapshots: readonly HttpChainStepSnapshot[],
+): HttpChainProofStrength {
+  const assertionEvidence = classifyHttpChainAssertion(spec.assertionsJq)
+  // Universal status-only ban: a bare 2xx -> 4xx/5xx divergence can never confirm ANY class. The
+  // injection/authz/redirect oracles still run afterwards; this is a floor, not a substitute.
+  if (assertionEvidence === 'status_only') {
+    const statusOnly = assessStatusOnlyDivergence(
+      snapshots.map(snapshot => ({
+        id: snapshot.id,
+        arm: snapshot.role === 'probe'
+          ? 'probe' as const
+          : snapshot.role === 'control'
+            ? 'control' as const
+            : snapshot.role === 'cleanup'
+              ? 'cleanup' as const
+              : 'setup' as const,
+        method: snapshot.method,
+        route: snapshot.route,
+        pathAndQuery: snapshot.pathAndQuery,
+        status: snapshot.status,
+        actor: actorFromPersona(snapshot.actor, []),
+        json: snapshot.json,
+        body: snapshot.body,
+      })),
+    )
+    if (statusOnly.statusOnly) {
+      return {
+        claim: isAuthorizationClaim(spec) ? 'authorization' : 'other',
+        assertionEvidence,
+        differential: null,
+        satisfied: false,
+        reason: statusOnly.reason,
+      }
+    }
+  }
+  if (!isAuthorizationClaim(spec)) {
+    return { claim: 'other', assertionEvidence, differential: null, satisfied: true, reason: 'Not an authorization claim.' }
+  }
+  if (assertionEvidence === 'status_only') {
+    return {
+      claim: 'authorization',
+      assertionEvidence,
+      differential: null,
+      satisfied: false,
+      reason: 'Authorization claim is status-only: a 2xx status (or status equality) is not an access-control differential. Assert a cross-actor resource read, a field/identifier bound to the victim object, or a state delta.',
+    }
+  }
+  // Canary / cryptographic proof is produced by the verifier itself (distinct control vs probe
+  // tokens, non-destructive math), so it is already an identifier-bound execution differential.
+  if (/\.(?:canary|proof)\b/.test(spec.assertionsJq)) {
+    return {
+      claim: 'authorization',
+      assertionEvidence,
+      differential: 'identifier_proof',
+      satisfied: true,
+      reason: 'Authorization claim is bound to verifier-minted canary/cryptographic proof.',
+    }
+  }
+  const differential = detectHttpChainDifferential(spec, snapshots)
+  if (assertionEvidence === 'unbound_content' && differential !== 'state_delta' && differential !== 'field_bound') {
+    return {
+      claim: 'authorization',
+      assertionEvidence,
+      differential,
+      satisfied: false,
+      reason: 'Authorization claim rests on a different-body observation without identifier binding; assert a field-bound value, extracted victim identifier, secret fingerprint, or state delta.',
+    }
+  }
+  if (differential === null) {
+    return {
+      claim: 'authorization',
+      assertionEvidence,
+      differential,
+      satisfied: false,
+      reason: 'Authorization claim has no genuine control-vs-probe differential in the recorded exchanges (no denied-then-allowed route, cross-actor access, field-bound change, or state delta).',
+    }
+  }
+  return {
+    claim: 'authorization',
+    assertionEvidence,
+    differential,
+    satisfied: true,
+    reason: `Authorization differential proven: ${differential}.`,
+  }
+}
+
+export interface HttpChainEndpointBinding {
+  bound: boolean
+  verifiedEndpoint: { stepId: string; role: string; origin: string; method: string; pathAndQuery: string } | null
+  declaredEndpoint: { stepId: string; origin: string; method: string; pathAndQuery: string } | null
+  mismatches: Array<{ stepId: string; field: 'origin' | 'method' | 'redirectHost' | 'specOrigin'; declared: string; actual: string }>
+  reason: string
+}
+
+/**
+ * Mechanical endpoint/method binding: the verified endpoint is the *actual* probe exchange, not the
+ * spec's claim. Any disagreement between the declared step request and the wire exchange, a redirect
+ * that leaves the declared host, or a primary probe step targeting a different origin than the
+ * finding origin, invalidates the confirmation.
+ */
+export function assessHttpChainEndpointBinding(
+  spec: HttpChainSpec,
+  stepRequests: ReadonlyMap<string, readonly BrokerHttpRequest[]>,
+  stepExchanges: ReadonlyMap<string, readonly BrokerExchangeResult[]>,
+): HttpChainEndpointBinding {
+  const mismatches: HttpChainEndpointBinding['mismatches'] = []
+  for (const step of spec.steps) {
+    const requests = stepRequests.get(step.id) ?? []
+    const exchanges = stepExchanges.get(step.id) ?? []
+    for (const [idx, exchange] of exchanges.entries()) {
+      const request = requests[Math.min(idx, Math.max(0, requests.length - 1))]
+      if (!request) continue
+      if (exchange.method.toUpperCase() !== request.method.toUpperCase()) {
+        mismatches.push({ stepId: step.id, field: 'method', declared: request.method.toUpperCase(), actual: exchange.method.toUpperCase() })
+      }
+      if (normalizeOriginValue(exchange.origin) !== normalizeOriginValue(request.origin)) {
+        mismatches.push({ stepId: step.id, field: 'origin', declared: normalizeOriginValue(request.origin), actual: normalizeOriginValue(exchange.origin) })
+      }
+    }
+  }
+
+  const primaryProbe = spec.steps.find(step => step.role === 'probe' && (stepExchanges.get(step.id)?.length ?? 0) > 0)
+  const primaryExchange = primaryProbe ? stepExchanges.get(primaryProbe.id)?.[0] : undefined
+  if (!primaryProbe || !primaryExchange) {
+    return {
+      bound: false,
+      verifiedEndpoint: null,
+      declaredEndpoint: null,
+      mismatches,
+      reason: 'No executed probe exchange is available to bind the finding endpoint.',
+    }
+  }
+
+  const declaredEndpoint = {
+    stepId: primaryProbe.id,
+    origin: normalizeOriginValue(primaryProbe.request.origin),
+    method: primaryProbe.request.method.toUpperCase(),
+    pathAndQuery: primaryProbe.request.pathAndQuery,
+  }
+  const verifiedEndpoint = {
+    stepId: primaryProbe.id,
+    role: primaryProbe.role,
+    origin: normalizeOriginValue(primaryExchange.origin),
+    method: primaryExchange.method.toUpperCase(),
+    pathAndQuery: primaryExchange.pathAndQuery,
+  }
+
+  if (normalizeOriginValue(spec.origin) !== declaredEndpoint.origin) {
+    mismatches.push({ stepId: primaryProbe.id, field: 'specOrigin', declared: declaredEndpoint.origin, actual: normalizeOriginValue(spec.origin) })
+  }
+  const declaredHost = originHost(primaryProbe.request.origin)
+  const finalHost = originHost(primaryExchange.finalOrigin)
+  if (declaredHost && finalHost && declaredHost !== finalHost) {
+    mismatches.push({ stepId: primaryProbe.id, field: 'redirectHost', declared: declaredHost, actual: finalHost })
+  }
+
+  if (mismatches.length > 0) {
+    const first = mismatches[0]
+    return {
+      bound: false,
+      verifiedEndpoint,
+      declaredEndpoint,
+      mismatches: mismatches.slice(0, 8),
+      reason: first.field === 'specOrigin'
+        ? `Finding origin ${normalizeOriginValue(spec.origin)} does not match the probe endpoint origin ${declaredEndpoint.origin} (step "${first.stepId}"); the verified exchange came from a different asset than the finding claims.`
+        : first.field === 'redirectHost'
+          ? `Probe step "${first.stepId}" redirected from ${first.declared} to ${first.actual}; the verified endpoint is not the declared asset.`
+          : `Probe step "${first.stepId}" ${first.field} mismatch: declared ${first.declared}, exchanged ${first.actual}.`,
+    }
+  }
+
+  return {
+    bound: true,
+    verifiedEndpoint,
+    declaredEndpoint,
+    mismatches: [],
+    reason: `Verified ${verifiedEndpoint.method} ${verifiedEndpoint.origin}${verifiedEndpoint.pathAndQuery} from step "${verifiedEndpoint.stepId}".`,
+  }
+}
+
+export function summarizeExchange(ex: BrokerExchangeResult) {  let json: unknown = null
+  if (ex.mediaType.includes('json')) {
+    try { json = JSON.parse(ex.body) } catch { json = null }
+  }
+  return {
+    origin: ex.origin,
+    finalOrigin: ex.finalOrigin,
+    redirectOrigins: ex.redirectOrigins,
+    method: ex.method,
+    pathAndQuery: ex.pathAndQuery,
+    personaHandle: ex.personaHandle,
+    status: ex.status,
+    mediaType: ex.mediaType,
+    headers: ex.respHeaders,
+    setCookies: ex.setCookies,
+    body: ex.body.slice(0, 64 * 1024),
+    bodyPreview: ex.bodyPreview,
+    bodyBytes: ex.bodyBytes,
+    bodySha256: ex.bodySha256,
+    durationMs: ex.durationMs,
+    // Pre-redaction structural proof: fingerprints only (never the raw value), so an assertion can
+    // prove a disclosed secret matched the entitled view even after the body was scrubbed.
+    ...(ex.secretMatches?.length
+      ? {
+          secretMatches: ex.secretMatches.slice(0, 16).map(m => ({
+            kind: m.kind,
+            sha256Prefix: m.sha256Prefix,
+            ...(m.fieldPath ? { fieldPath: m.fieldPath } : {}),
+            count: m.count,
+          })),
+        }
+      : {}),
+    ...(json !== null ? { json } : {}),
+  }
+}
+
+export function hasDestructiveContent(text: string): boolean {
+  if (containsDestructivePayload(text)) return true
+  try {
+    const decoded = decodeURIComponent(text.replaceAll('+', ' '))
+    if (decoded !== text && containsDestructivePayload(decoded)) return true
+  } catch {
+    const plusDecoded = text.replaceAll('+', ' ')
+    if (plusDecoded !== text && containsDestructivePayload(plusDecoded)) return true
+  }
+  return false
+}
+
+export function singleQuoteEscape(value: string): string {
+  return value.replaceAll("'", "'\\''")
+}
+
+export const RETIRED_LEGACY_SPEC_KINDS: ReadonlySet<string> = new Set([
+  'dns_takeover', 'tls_audit', 'browser_dom', 'ws_chain', 'upload_probe',
+  'sql_boolean_diff', 'sql_time_diff', 'race_burst', 'browser_chain',
+])
+export const RETIRED_LEGACY_SPEC_REASON = 'retired_legacy_spec_kind: use guardian_verify'
+
+export function retiredLegacyResult(
+  kind: string,
+  exchanges: BrokerExchangeResult[],
+  exchangeIds: string[],
+): ReplayVerificationResult {
+  const evidencePayload = { kind, retired: true, reason: RETIRED_LEGACY_SPEC_REASON }
+  const evidenceSha256 = createHash('sha256').update(JSON.stringify(evidencePayload)).digest('hex')
+  return {
+    verdict: 'dismissed',
+    outcome: {
+      confirmed: false,
+      controlPassed: false,
+      observed: RETIRED_LEGACY_SPEC_REASON,
+      expected: 'Proof submitted via guardian_verify or a wired floor recipe.',
+      reason: RETIRED_LEGACY_SPEC_REASON,
+    },
+    exchangeIds,
+    exchanges,
+    evidencePayload,
+    evidenceSha256,
+  }
+}
+
+export function inconclusiveResult(
+  reason: string,
+  exchanges: BrokerExchangeResult[],
+  exchangeIds: string[],
+  evidencePayload: Record<string, unknown>,
+): ReplayVerificationResult {
+  const payload = { ...evidencePayload, error: reason }
+  const evidenceSha256 = createHash('sha256').update(JSON.stringify(payload)).digest('hex')
+  return {
+    verdict: 'inconclusive',
+    outcome: {
+      confirmed: false,
+      controlPassed: false,
+      observed: reason.slice(0, 1200),
+      expected: 'Clean replay execution passing control and deterministic assertions.',
+      reason: reason.slice(0, 1200),
+    },
+    exchangeIds,
+    exchanges,
+    evidencePayload: payload,
+    evidenceSha256,
+  }
+}
+
+/**
+ * Mint a throw-away signing key and a fresh timestamp, then compute the HMAC over the documented
+ * canonical form. Used only for self-signed webhook proof (no real secret ever enters the spec).
+ */
+
+function applyBodySignature(interpolated: unknown, signable: NonNullable<ReplayStep['request']['bodySignature']>): unknown {
+  const input = interpolated && typeof interpolated === 'object' && !Array.isArray(interpolated)
+    ? { ...(interpolated as Record<string, unknown>) }
+    : {}
+  const key = `guardian_whk_${randomBytes(8).toString('hex')}`
+  const ts = String(Math.floor(Date.now() / 1000))
+  if (signable.timestampField) input[signable.timestampField] = ts
+  input[signable.keyField] = key
+  const withoutSig = { ...input }
+  delete withoutSig[signable.signatureField]
+  const event = signable.eventField
+    ? withoutSig[signable.eventField]
+    : (withoutSig.event ?? withoutSig.payload ?? withoutSig.data ?? withoutSig)
+  const asText = (value: unknown): string => (typeof value === 'string' ? value : JSON.stringify(value))
+  const canonical = signable.canonical === 'ts_event'
+    ? `${ts}.${asText(event)}`
+    : signable.canonical === 'ts_body'
+      ? `${ts}.${JSON.stringify(withoutSig)}`
+      : signable.canonical === 'event'
+        ? asText(event)
+        : JSON.stringify(withoutSig)
+  input[signable.signatureField] = createHmac('sha256', key).update(canonical).digest(signable.encoding)
+  return input
+}
+
+function requestShapeToBrokerRequest(
+  req: ReplayStep['request'],
+  vars: Record<string, string>,
+  opts?: {
+    sessionId?: string
+    sessionGroupRole?: 'setup' | 'control' | 'probe' | 'cleanup'
+    runId?: string
+    assignmentId?: string
+  },
+): BrokerHttpRequest {
+  const pathAndQuery = interpolateString(req.pathAndQuery, vars)
+  const headers: Record<string, string> = {}
+  for (const [k, v] of Object.entries(req.headers ?? {})) {
+    headers[k] = interpolateString(v, vars)
+  }
+  let body: string | undefined
+  if (req.textBody !== undefined) {
+    body = interpolateString(req.textBody, vars)
+  } else if (req.jsonBody !== undefined) {
+    const interpolated = interpolateValue(req.jsonBody, vars)
+    const signable = (req as ReplayStep['request']).bodySignature
+    const signed = signable ? applyBodySignature(interpolated, signable) : interpolated
+    body = JSON.stringify(signed)
+    if (!headers['Content-Type'] && !headers['content-type']) {
+      headers['Content-Type'] = 'application/json'
+    }
+  }
+  const maybeReq = req as ReplayStep['request']
+  let authMutation: AuthMutation | undefined = maybeReq.authMutation
+  if (authMutation && authMutation.kind === 'jku_x5u_canary') {
+    const rawUrl = authMutation.url ?? authMutation.value
+    const interpUrl = rawUrl !== undefined ? interpolateString(rawUrl, vars) : undefined
+    authMutation = {
+      ...authMutation,
+      ...(authMutation.url !== undefined && interpUrl !== undefined ? { url: interpUrl } : {}),
+      ...(authMutation.value !== undefined && interpUrl !== undefined ? { value: interpUrl } : {}),
+    }
+  }
+  return {
+    origin: req.origin,
+    method: req.method,
+    pathAndQuery,
+    headers,
+    body,
+    persona: req.persona,
+    ...(opts?.sessionId ?? req.session ? { session: opts?.sessionId ?? req.session } : {}),
+    ...(opts?.sessionGroupRole ? { sessionGroupRole: opts.sessionGroupRole } : {}),
+    ...(req.csrfBind !== undefined ? { csrfBind: req.csrfBind } : {}),
+    ...(authMutation ? { authMutation } : {}),
+    ...(maybeReq.traceId ? { traceId: maybeReq.traceId } : {}),
+    ...(opts?.runId ? { runId: opts.runId } : {}),
+    ...(opts?.assignmentId ? { assignmentId: opts.assignmentId } : {}),
+    followRedirects: req.followRedirects,
+  }
+}
+
+export function stepToBrokerRequest(
+  step: ReplayStep,
+  vars: Record<string, string>,
+  opts?: { replayJarPrefix?: string; runId?: string; assignmentId?: string },
+): BrokerHttpRequest {
+  let sessionId: string | undefined
+  if (step.request.session) {
+    if (opts?.replayJarPrefix) {
+      const candidate = `rv-${opts.replayJarPrefix}-${step.request.session}`
+      sessionId = candidate.length <= 32
+        ? candidate
+        : `rv-${opts.replayJarPrefix}-${createHash('sha256').update(step.request.session).digest('hex').slice(0, 12)}`.slice(0, 32)
+    } else {
+      sessionId = step.request.session
+    }
+  }
+  return requestShapeToBrokerRequest(step.request, vars, {
+    sessionId,
+    sessionGroupRole: step.role,
+    runId: opts?.runId,
+    assignmentId: opts?.assignmentId,
+  })
+}
+
+const postureCwes = new Set([
+  'CWE-16', 'CWE-200', 'CWE-209', 'CWE-284', 'CWE-285', 'CWE-287', 'CWE-288', 'CWE-306', 'CWE-319', 'CWE-326',
+  'CWE-346', 'CWE-523', 'CWE-538', 'CWE-540', 'CWE-614', 'CWE-639', 'CWE-693', 'CWE-862', 'CWE-863', 'CWE-942',
+  'CWE-1004', 'CWE-1021',
+])
+const postureCategoryPattern = /access|auth|bypass|cors|header|posture|misconfig|exposure|session|cookie|transport|tls|csp|policy|idor|bola|bfla/i
+
+/** requireControlNonError defaults to true for posture / auth-bypass style specs. */
+export function defaultRequireControlNonError(spec: DeclarativeReplaySpec): boolean {
+  if (spec.kind === 'static_ast_proof') return false
+  return postureCwes.has(spec.cwe) || postureCategoryPattern.test(spec.category)
+}
+
+function statusMatchesExpected(expected: number | number[] | undefined, status: number): boolean {
+  if (expected === undefined) return false
+  return Array.isArray(expected) ? expected.includes(status) : expected === status
+}
+
+export function isUnexpectedErrorStatus(status: number, ...expected: Array<number | number[] | undefined>): boolean {
+  if (status !== 404 && status < 500) return false
+  return !expected.some(e => statusMatchesExpected(e, status))
+}
+
+/**
+ * Map a replay spec onto a receipt class. Only classes whose evidence the receipt model can
+ * re-derive in-process are returned; everything else stays on the legacy verdict (no invented
+ * receipt rule keeps a confirmation alive).
+ */
+
+export function receiptVulnClassFor(spec: DeclarativeReplaySpec): string | null {
+  const text = `${spec.cwe} ${spec.category} ${spec.title} ${spec.impact}`
+  if (/CWE-918|\bssrf\b|server[- ]side request/i.test(text)) return 'ssrf'
+  if (/CWE-611|\bxxe\b|external entit/i.test(text)) return 'xxe'
+  if (spec.kind !== 'http_chain' && spec.kind !== 'auth_protocol_proof') return null
+  return vulnClassForImpactClass(classifyImpactDescriptor({
+    cwe: spec.cwe,
+    category: spec.category,
+    title: spec.title,
+    impact: spec.impact,
+  }))
+}
+
+function vulnClassForImpactClass(impactClass: string | null | undefined): string | null {
+  switch (impactClass) {
+    case 'authorization':
+    case 'bola':
+      return 'bola'
+    case 'bfla': return 'bfla'
+    case 'mass_assignment': return 'mass_assignment'
+    case 'csrf': return 'csrf'
+    case 'business_logic': return 'business_logic'
+    case 'markup': return 'xss_stored'
+    case 'disclosure': return 'info_disclosure'
+    default: return null
+  }
+}
+
+const replayCanaryTokenRe = /guardian-canary-[a-f0-9]{24}/i
+
+/**
+ * Build a ProofReceipt + transcript from a completed replay. The transcript is the host-recorded
+ * evidence the verifier already produced (`stepsOut` + exchange ids); nothing is re-executed.
+ * Returns null when the spec has no receipt representation.
+ */
+export function buildReplayReceipt(input: {
+  spec: DeclarativeReplaySpec
+  evidencePayload: Record<string, unknown>
+  exchangeIds: readonly string[]
+  exchanges: readonly BrokerExchangeResult[]
+}): { receipt: ProofReceipt; transcript: ReceiptTranscript } | null {
+  const impactGate = input.evidencePayload.impactGate as { required?: boolean } | undefined
+  const evidenceClass = typeof input.evidencePayload.evidenceClass === 'string'
+    ? input.evidencePayload.evidenceClass
+    : null
+  const vulnClass = vulnClassForImpactClass(evidenceClass) ?? receiptVulnClassFor(input.spec)
+  if (!vulnClass) return null
+  const isOob = vulnClass === 'ssrf' || vulnClass === 'xxe'
+  // The DSL only confirms an impact claim when its shared oracle gate applies. Do not manufacture a
+  // receipt for a class the replay never gated (auth-boundary, redirect, injection differentials):
+  // those keep their existing evidence model instead of being downgraded by a rule they never had.
+  if (!isOob && impactGate?.required !== true) return null
+  const stepsOut = (input.evidencePayload.steps ?? {}) as Record<string, unknown>
+  const steps = impactStepsFromStepsOut(input.spec, stepsOut)
+  if (steps.length === 0 && vulnClass !== 'ssrf' && vulnClass !== 'xxe') return null
+  const exchangeById = new Map<string, BrokerExchangeResult>()
+  input.exchangeIds.forEach((id, index) => {
+    const exchange = input.exchanges[index]
+    if (exchange) exchangeById.set(id, exchange)
+  })
+  const entries: ReceiptTranscriptEntry[] = []
+  const orderedIds: string[] = []
+  for (const [index, step] of steps.entries()) {
+    const recorded = stepsOut[step.id] as { exchangeId?: unknown } | undefined
+    const id = typeof recorded?.exchangeId === 'string'
+      ? recorded.exchangeId
+      : input.exchangeIds[index] ?? `exchange-${index}`
+    if (!id) continue
+    const exchange = exchangeById.get(id)
+    entries.push({
+      exchangeId: id,
+      step,
+      ...(typeof (recorded as { durationMs?: unknown } | undefined)?.durationMs === 'number'
+        ? { durationMs: (recorded as { durationMs: number }).durationMs }
+        : {}),
+      ...(exchange
+        ? { carrierText: `${exchange.pathAndQuery}\n${JSON.stringify(exchange.reqHeaders ?? {})}\n${String(exchange.body ?? '').slice(0, 32 * 1024)}` }
+        : {}),
+    })
+    orderedIds.push(id)
+  }
+
+  if (isOob) {
+    const carrying = entries.find(entry => replayCanaryTokenRe.test(entry.carrierText ?? ''))
+    if (!carrying) return null
+    const token = replayCanaryTokenRe.exec(carrying.carrierText ?? '')![0]
+    const receipt = {
+      vulnClass,
+      target: {
+        origin: input.spec.origin,
+        method: carrying.step.method.toUpperCase(),
+        ...(carrying.step.pathAndQuery ? { pathAndQuery: carrying.step.pathAndQuery } : {}),
+      },
+      exchangeIds: [carrying.exchangeId],
+      oobEventIds: ['replay-canary'],
+      browserTraceIds: [],
+      claimedDelta: `The target fetched the injected out-of-band canary after the ${vulnClass.toUpperCase()} probe.`,
+    }
+    const transcript: ReceiptTranscript = {
+      entries: [carrying],
+      oobEvents: [{
+        id: 'replay-canary',
+        callbackId: `replay:${carrying.exchangeId}`,
+        token,
+        targetOrigin: input.spec.origin,
+        delivered: true,
+        stage: 'immediate',
+        receivedAtMs: Date.now(),
+      }],
+      browserTraces: [],
+    }
+    return { receipt: receipt as ProofReceipt, transcript }
+  }
+
+  if (orderedIds.length === 0) return null
+  const targetExchangeStep = steps.find(step => step.arm === 'probe') ?? steps[0]
+  const targetEntry = entries.find(entry => entry.step === targetExchangeStep) ?? entries[0]
+  const receipt = {
+    vulnClass,
+    target: {
+      origin: input.spec.origin,
+      method: targetEntry.step.method.toUpperCase(),
+      ...(targetEntry.step.pathAndQuery ? { pathAndQuery: targetEntry.step.pathAndQuery } : {}),
+    },
+    exchangeIds: orderedIds,
+    oobEventIds: [],
+    browserTraceIds: [],
+    claimedDelta: (input.spec.expectedImpactEvents ?? []).length
+      ? `Replay observed the declared impact: ${(input.spec.expectedImpactEvents ?? []).join(', ')}.`
+      : `Replay moved state across the ${vulnClass} boundary described by "${input.spec.title.slice(0, 120)}".`,
+    ...(() => {
+      const declared = ((input.spec as { expectedImpactEvents?: string[] }).expectedImpactEvents ?? []).slice()
+      const csrfModelled = 'steps' in input.spec && Array.isArray(input.spec.steps) &&
+        input.spec.steps.some(s => Boolean((s as { request?: { csrfBind?: unknown } }).request?.csrfBind))
+      if (csrfModelled && !declared.includes('csrf_state_change')) declared.push('csrf_state_change')
+      return declared.length ? { oracleEvents: declared } : {}
+    })(),
+    ...('proofPatterns' in input.spec && Array.isArray(input.spec.proofPatterns) && input.spec.proofPatterns.length
+      ? { proofPatterns: input.spec.proofPatterns as string[] }
+      : {}),
+    ...('requiredRole' in input.spec && input.spec.requiredRole ? { requiredRole: input.spec.requiredRole } : {}),
+    ...('resourceTenant' in input.spec && input.spec.resourceTenant ? { resourceTenant: input.spec.resourceTenant } : {}),
+    ...('expectControlDenied' in input.spec && input.spec.expectControlDenied ? { expectControlDenied: true } : {}),
+  }
+  return { receipt: receipt as ProofReceipt, transcript: { entries } }
+}
+
+/**
+ * Apply the receipt to a verdict. Shadow mode only annotates; strict mode can only downgrade a
+ * confirmation (never promote one), so precision is monotonic.
+ */
+export function applyReceiptGate(input: {
+  mode: ProofReceiptMode
+  verdict: ReplayVerdict
+  outcome: ReplayAssertionOutcome
+  receipt: ProofReceipt
+  verification: ReceiptVerification
+}): { verdict: ReplayVerdict; outcome: ReplayAssertionOutcome; check?: ReplayReceiptCheck } {
+  if (input.mode === 'off') return { verdict: input.verdict, outcome: input.outcome }
+  const check: ReplayReceiptCheck = { receipt: input.receipt, verification: input.verification, mode: input.mode }
+  if (input.mode === 'strict' && input.verdict === 'confirmed' && !input.verification.confirmed) {
+    return {
+      verdict: 'inconclusive',
+      outcome: {
+        ...input.outcome,
+        confirmed: false,
+        reason: `ProofReceipt rejected the confirmation: ${input.verification.reason}`.slice(0, 1200),
+      },
+      check,
+    }
+  }
+  return { verdict: input.verdict, outcome: input.outcome, check }
+}
+
+export function receiptCheckForResult(input: {
+  mode: ProofReceiptMode
+  verdict: ReplayVerdict
+  outcome: ReplayAssertionOutcome
+  spec: DeclarativeReplaySpec
+  evidencePayload: Record<string, unknown>
+  exchangeIds: readonly string[]
+  exchanges: readonly BrokerExchangeResult[]
+}): { verdict: ReplayVerdict; outcome: ReplayAssertionOutcome; check?: ReplayReceiptCheck } {
+  if (input.mode === 'off' || input.verdict !== 'confirmed') return { verdict: input.verdict, outcome: input.outcome }
+  const built = buildReplayReceipt({
+    spec: input.spec,
+    evidencePayload: input.evidencePayload,
+    exchangeIds: input.exchangeIds,
+    exchanges: input.exchanges,
+  })
+  if (!built) return { verdict: input.verdict, outcome: input.outcome }
+  const verification = verifyReceipt(built.receipt, built.transcript)
+  return applyReceiptGate({
+    mode: input.mode,
+    verdict: input.verdict,
+    outcome: input.outcome,
+    receipt: built.receipt,
+    verification,
+  })
+}
+
+/**
+ * `GUARDIAN_PROOF_RECEIPT=off` restores the pure legacy DSL verdict, `shadow` (default) records the
+ * receipt without changing a verdict, and `strict` makes `verifyReceipt` the final confirmation
+ * gate. Strict is opt-in until parity across every suite is certified.
+ */
+export function proofReceiptMode(env: NodeJS.ProcessEnv = process.env): ProofReceiptMode {
+  const raw = (env.GUARDIAN_PROOF_RECEIPT ?? '').trim().toLowerCase()
+  if (raw === '0' || raw === 'off' || raw === 'false' || raw === 'no') return 'off'
+  if (raw === 'strict' || raw === 'enforce' || raw === '1') return 'strict'
+  return 'shadow'
 }

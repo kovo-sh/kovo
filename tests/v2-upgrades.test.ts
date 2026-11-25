@@ -472,8 +472,17 @@ test('verifyReplaySpec & retestReplaySpec verify race_burst and browser_chain sp
       }
     }
 
-    // Multi-origin browser_chain fixture: sandpack (user JS / postMessage) + clerk (wildcard credentialed CORS)
+    // Multi-origin browser fixture: sandpack (user JS / postMessage) + clerk (wildcard credentialed CORS)
     if (targetOrigin === sandpackOrigin) {
+      if (url.pathname === '/sink') {
+        const q = url.searchParams.get('q') ?? ''
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }).end(`<!doctype html>
+<html><head><title>Sink preview</title></head><body>
+  <div id="out"></div>
+  <script>document.getElementById('out').innerHTML = ${JSON.stringify(q)}</script>
+</body></html>`)
+        return
+      }
       if (url.pathname.startsWith('/.guardian-nonexistent-')) {
         res.writeHead(404, { 'Content-Type': 'text/plain' }).end('Not Found')
         return
@@ -591,34 +600,24 @@ test('verifyReplaySpec & retestReplaySpec verify race_burst and browser_chain sp
 
   assert.deepEqual(replaySpecOrigins(raceSpec), [appOrigin])
 
-  // Tier 1 MUST refuse race_burst cleanly (inconclusive)
+  // Cut 3d retired the raw race_burst VM onto the conserved_balance recipe. A bare legacy spec now
+  // fails closed at every tier; the broker-level burst above still exercises the transport.
   const tier1Res = await verifyReplaySpec({
     spec: raceSpec, broker, backend, grant: makeGrant({ tier: 1 }), signal: AbortSignal.timeout(15_000),
   })
-  assert.equal(tier1Res.verdict, 'inconclusive')
-
-  // Tier 2 confirms TOCTOU race deterministically with Zero LLM
-  const raceConfirmed = await verifyReplaySpec({
+  assert.equal(tier1Res.verdict, 'dismissed')
+  const raceRetired = await verifyReplaySpec({
     spec: raceSpec, broker, backend, grant: tier2Grant, signal: AbortSignal.timeout(15_000),
   })
-  assert.equal(raceConfirmed.verdict, 'confirmed')
-  assert.equal(raceConfirmed.outcome.controlPassed, true)
-  assert.equal(raceConfirmed.outcome.confirmed, true)
-
-  // Verify Fix retest: reproduced before fix, fixed after atomic lock!
-  const raceReproduced = await retestReplaySpec({
+  assert.equal(raceRetired.verdict, 'dismissed')
+  const raceRetest = await retestReplaySpec({
     spec: raceSpec, broker, backend, grant: tier2Grant, signal: AbortSignal.timeout(15_000),
   })
-  assert.equal(raceReproduced.verdict, 'reproduced')
-
+  assert.equal(raceRetest.verdict, 'fixed')
   raceFixed = true
-  const raceFixedRes = await retestReplaySpec({
-    spec: raceSpec, broker, backend, grant: tier2Grant, signal: AbortSignal.timeout(15_000),
-  })
-  assert.equal(raceFixedRes.verdict, 'fixed')
 
-  // --- 3B. browser_chain Replay Spec (100% broker-proxied Playwright) ---
-  // Schema MUST reject unsafe selector / destructive payload
+  // --- 3B. DOM-sink browser proof (browser_sink recipe + runBrowserSession) ---
+  // Schema MUST reject unsafe selector / destructive payload.
   assert.equal(declarativeReplaySpecSchema.safeParse({
     ...replayBase(sandpackOrigin),
     kind: 'browser_chain',
@@ -629,77 +628,73 @@ test('verifyReplaySpec & retestReplaySpec verify race_burst and browser_chain sp
     assertionsJq: '{ confirmed: false, controlPassed: true, observed: "x", expected: "y" }',
   }).success, false)
 
-  const browserChainSpec: DeclarativeReplaySpec = declarativeReplaySpecSchema.parse({
+  const canaryMarkup = `<img src=x onerror="document.title='{{canary_token}}'">`
+  const encodedMarkup = canaryMarkup.split('{{canary_token}}').map(encodeURIComponent).join('{{canary_token}}')
+  const sinkSteps = [
+    { id: 'c', role: 'control', description: 'Render a benign query value', origin: sandpackOrigin, pathAndQuery: '/sink?q=guardian', action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 200 },
+    { id: 'p', role: 'probe', description: 'Render the canary through the innerHTML sink', origin: sandpackOrigin, pathAndQuery: `/sink?q=${encodedMarkup}`, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 400 },
+  ]
+  const browserSinkSpec: DeclarativeReplaySpec = declarativeReplaySpecSchema.parse({
     ...replayBase(sandpackOrigin),
     kind: 'browser_chain',
-    title: 'Cross-Origin Credentialed CORS + Unchecked postMessage on Sandpack',
-    category: 'cors-client-side',
-    cwe: 'CWE-942',
-    spaCatchallControl: true,
-    steps: [
-      {
-        id: 'control',
-        role: 'control',
-        description: 'Unauthenticated same-site fetch from sandpack to clerk returns 401',
+    title: 'DOM XSS via the sandpack preview innerHTML sink',
+    category: 'dom_xss',
+    cwe: 'CWE-79',
+    steps: sinkSteps,
+    assertionsJq: '{ controlPassed: true, confirmed: true, observed: "recipe", expected: "recipe" }',
+    recipe: {
+      recipeId: 'browser_sink',
+      args: {
         origin: sandpackOrigin,
-        pathAndQuery: '/sandbox',
-        action: 'same_site_fetch',
-        fetchTarget: { origin: clerkOrigin, pathAndQuery: '/api/session', method: 'GET', credentials: 'include' },
+        method: 'GET',
+        pathAndQuery: '/sink?q=guardian',
+        vulnClass: 'dom_xss',
+        actor: { handle: 'user_a' },
+        steps: [
+          { role: 'control', action: 'navigate', pathAndQuery: '/sink?q=guardian' },
+          { role: 'probe', action: 'navigate', pathAndQuery: `/sink?q=${encodedMarkup}` },
+        ],
       },
-      {
-        id: 'probe',
-        role: 'probe',
-        description: 'Authenticated credentialed fetch from sandpack to clerk + unchecked postMessage check',
-        origin: sandpackOrigin,
-        pathAndQuery: '/sandbox',
-        persona: 'user_a',
-        action: 'same_site_fetch',
-        checkKind: 'postmessage',
-        selector: '#status-banner',
-        fetchTarget: { origin: clerkOrigin, pathAndQuery: '/api/session', method: 'GET', credentials: 'include' },
-      },
-    ],
-    assertionsJq: `{
-      controlPassed: (.steps.control.fetchResult.status == 401 and (.steps.control.blockedOrigins | index("https://evil-unapproved-third-party.invalid") != null)),
-      confirmed: (.steps.probe.fetchResult.status == 200 and (.steps.probe.fetchResult.bodyPreview | contains("clerk_session_cors_exposed")) and .steps.probe.postMessageListeners.canaryHandledWithoutOriginCheck == true and (.steps.probe.selectorResult.textPreview | contains("PM_ACCEPTED:"))),
-      observed: ("controlStatus=" + (.steps.control.fetchResult.status | tostring) + ", probeStatus=" + (.steps.probe.fetchResult.status | tostring) + ", blockedThirdParty=" + (.steps.control.blockedOrigins | length | tostring)),
-      expected: "Clerk rejects cross-origin credentialed fetch from sandpack and postMessage checks event.origin"
-    }`,
+    },
   })
 
-  // replaySpecOrigins MUST include both step origins AND fetchTarget.origin
-  const browserOrigins = replaySpecOrigins(browserChainSpec)
-  assert.ok(browserOrigins.includes(sandpackOrigin))
-  assert.ok(browserOrigins.includes(clerkOrigin))
+  const browser = new ScopedBrowser(broker)
+  t.after(async () => { await browser.close().catch(() => undefined) })
 
-  // Out-of-scope fetchTarget.origin MUST be blocked before browser launches
+  // Pooled per-persona session (one Chromium, one context per persona) renders the sink page.
+  const sessionVisits = await browser.runBrowserSession([
+    { id: 'sink', role: 'probe', origin: sandpackOrigin, pathAndQuery: '/sink?q=guardian', action: 'navigate', waitAfterLoadMs: 200 },
+  ], tier2Grant, AbortSignal.timeout(20_000))
+  assert.equal(sessionVisits[0]?.status, 200)
+
+  // Out-of-scope step origin MUST be blocked before the recipe launches a browser.
   const outOfScopeBrowserRes = await verifyReplaySpec({
-    spec: browserChainSpec,
+    spec: browserSinkSpec,
     broker,
-    browser: new ScopedBrowser(broker),
+    browser,
     backend,
-    grant: makeGrant({ tier: 2, canRead: o => o === sandpackOrigin, personas }),
+    grant: makeGrant({ tier: 2, canRead: o => o === appOrigin, personas }),
     signal: AbortSignal.timeout(20_000),
   })
   assert.equal(outOfScopeBrowserRes.verdict, 'inconclusive')
   assert.match(outOfScopeBrowserRes.outcome.reason ?? '', /not in approved scope/i)
 
-  // Full Zero-LLM Playwright browser_chain confirmation
+  // The retired browser_chain VM never runs: the persisted browser_sink envelope confirms through
+  // the recipe's host-recorded canary trace.
   const browserRes = await verifyReplaySpec({
-    spec: browserChainSpec,
+    spec: browserSinkSpec,
     broker,
-    browser: new ScopedBrowser(broker),
+    browser,
     backend,
     grant: tier2Grant,
     signal: AbortSignal.timeout(30_000),
   })
   assert.equal(browserRes.verdict, 'confirmed', `Expected confirmed, got ${browserRes.verdict}: ${JSON.stringify(browserRes.outcome)}`)
   assert.equal(browserRes.outcome.controlPassed, true)
-  assert.equal(browserRes.outcome.confirmed, true)
-  assert.ok(browserRes.exchangeIds.length === 0 || Array.isArray(browserRes.exchanges))
-  assert.ok(browserRes.exchanges.length >= 4)
+  assert.ok(browserRes.receipt?.verification.confirmed, 'the browser_sink receipt must verify')
   // Persona secret MUST NEVER leak into browser replay evidence payload
   assert.ok(!JSON.stringify(browserRes.evidencePayload).includes('opaque-browser-session-555'))
+
 })
 
 // ============================================================================
