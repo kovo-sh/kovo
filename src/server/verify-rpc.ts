@@ -1099,7 +1099,7 @@ export class VerifyRpcServer {
     const combinedText = `${brokerRequest.pathAndQuery}\n${brokerRequest.body ?? ''}\n${result.body}`
     if (typeof args.entityId === 'string' && args.entityId.trim()) {
       const entity = args.entityId.trim().slice(0, 256)
-      if (combinedText.includes(entity)) prov.entityId = entity
+      if (combinedText.toLowerCase().includes(entity.toLowerCase())) prov.entityId = entity // case-variant host binding (still requires host-observed presence)
     }
     const rawCorr = Array.isArray(args.correlationIds)
       ? args.correlationIds

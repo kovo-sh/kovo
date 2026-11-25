@@ -172,18 +172,14 @@ function entryLeaves(entry: HostTranscriptEntry, withHeaders: boolean): Set<stri
   return out
 }
 function entryMatchesEntity(entry: HostTranscriptEntry, entityId: string): boolean {
-  if (entry.entityId === entityId) return true
-  const path = entry.step.pathAndQuery ?? entry.step.route ?? ''
-  return (Boolean(path) && new RegExp(`(?:^|[/=?&])${entityId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[/&?#])`).test(path)) || entryLeaves(entry, false).has(entityId)
+  const eid = entityId.trim(), lid = eid.toLowerCase(), esc = eid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), path = entry.step.pathAndQuery ?? entry.step.route ?? ''
+  if (!eid) return false; if (entry.entityId?.trim().toLowerCase() === lid || entry.correlationIds?.some(c => c.trim().toLowerCase() === lid) || (path && new RegExp(`(?:^|[/=?&])${esc}(?:$|[/&?#])`, 'i').test(path))) return true
+  for (const leaf of entryLeaves(entry, false)) if (leaf.toLowerCase() === lid) return true
+  return eid.length >= 4 && new RegExp(`(?:^|[^A-Za-z0-9_-])${esc}(?:$|[^A-Za-z0-9_-])`, 'i').test(entry.carrierText ?? '')
 }
-function entryMatchesCorrelation(entry: HostTranscriptEntry, correlationId: string): boolean {
-  if (entry.correlationIds?.includes(correlationId) || entry.entityId === correlationId || entry.carrierText?.includes(correlationId)) return true
-  for (const leaf of entryLeaves(entry, true)) if (leaf === correlationId || leaf.includes(correlationId)) return true
-  return false
-}
+const entryMatchesCorrelation = (entry: HostTranscriptEntry, correlationId: string): boolean => Boolean(entry.correlationIds?.includes(correlationId) || entry.entityId === correlationId || entry.carrierText?.includes(correlationId)) || [...entryLeaves(entry, true)].some(leaf => leaf.includes(correlationId))
 function serializeBodyText(entry: HostTranscriptEntry): string {
-  if (typeof entry.step.body === 'string' && entry.step.body.length > 0) return entry.step.body
-  try { return entry.step.json !== undefined ? JSON.stringify(entry.step.json) : '' } catch { return '' }
+  try { return typeof entry.step.body === 'string' && entry.step.body.length > 0 ? entry.step.body : entry.step.json !== undefined ? JSON.stringify(entry.step.json) : '' } catch { return '' }
 }
 
 // --- DAG Topology & Transcript Integrity ------------------------------------
@@ -371,37 +367,40 @@ function verifyStateTransitionBinding(
   base: EdgeBase, edge: Extract<CausalEdgeBinding, { kind: 'state_transition_binding' }>,
   fromHop: HopReceipt, toHop: HopReceipt, idx: IndexedTranscript, dagDerivedCaps: ReadonlySet<string>,
 ): VerifiedEdgeResult {
-  const okOnEntity = (hop: HopReceipt) => hop.exchangeIds.map(id => idx.entriesById.get(id)!)
-    .filter(e => is2xx(e.step.status) && isFiniteTs(e.timestampMs) && entryMatchesEntity(e, edge.entityId))
+  const hopEntries = (hop: HopReceipt) => hop.exchangeIds.map(id => idx.entriesById.get(id)!)
+  const okOnEntity = (hop: HopReceipt) => hopEntries(hop).filter(e => is2xx(e.step.status) && isFiniteTs(e.timestampMs) && entryMatchesEntity(e, edge.entityId))
+  const hopDiag = (hop: HopReceipt, side: string) => { const es = hopEntries(hop); return `[${side}Ok=0: exchanges=${es.length}, 2xx=${es.filter(e => is2xx(e.step.status)).length}, timestamped=${es.filter(e => isFiniteTs(e.timestampMs)).length}, entityMatch=${es.filter(e => entryMatchesEntity(e, edge.entityId)).length}]` }
   const fromOk = okOnEntity(fromHop), toOk = okOnEntity(toHop)
-  if (fromOk.length === 0) return edgeFail(base, `fromHop "${fromHop.hopId}" has no succeeding exchange on "${edge.entityId}".`)
-  if (toOk.length === 0) return edgeFail(base, `toHop "${toHop.hopId}" has no succeeding exchange on "${edge.entityId}".`)
+  if (fromOk.length === 0) return edgeFail(base, `fromHop "${fromHop.hopId}" has no succeeding exchange on "${edge.entityId}" ${hopDiag(fromHop, 'from')}.`)
+  if (toOk.length === 0) return edgeFail(base, `toHop "${toHop.hopId}" has no succeeding exchange on "${edge.entityId}" ${hopDiag(toHop, 'to')}.`)
   const pair = fromOk.flatMap(f => toOk.filter(t => f.timestampMs! <= t.timestampMs!).map(t => ({ from: f, to: t })))[0]
   if (!pair) return edgeFail(base, `state_transition_binding on "${edge.entityId}" violated monotonic ordering (t_i > t_j).`)
-
   const hopExSet = new Set([...fromHop.exchangeIds, ...toHop.exchangeIds])
   const toUsesNewCap = (pair.to.consumedCapabilities ?? []).some(c => dagDerivedCaps.has(c))
   const toActor = actorOf(pair.to), toFam = normRouteFam(pair.to.step.route ?? pair.to.step.pathAndQuery, edge.entityId)
-  let validAblation: HostTranscriptEntry | null = null
-
+  // Sibling is untouched when no succeeding state-changing exchange on it precedes the ablation (missing timestamps count as touched).
+  const touchedBefore = (eid: string, ab: HostTranscriptEntry) => [...idx.entriesById.values()].some(e => e.exchangeId !== ab.exchangeId && is2xx(e.step.status) && !stepReadsState(e.step) && (!isFiniteTs(e.timestampMs) || !isFiniteTs(ab.timestampMs) || e.timestampMs <= ab.timestampMs) && entryMatchesEntity(e, eid))
+  let validAblation: HostTranscriptEntry | null = null; const diags: string[] = []
   for (const abId of edge.ablationExchangeIds) {
-    if (hopExSet.has(abId)) return edgeFail(base, `Ablation exchange "${abId}" cannot reuse a hop exchange.`)
-    const ab = idx.entriesById.get(abId)!
+    if (hopExSet.has(abId)) return edgeFail(base, `Ablation exchange "${abId}" cannot reuse a hop exchange [hop_exchange_reuse].`)
+    const ab = idx.entriesById.get(abId)!, st = ab.step.status, denied = typeof st === 'number' && ABLATION_DENIED_STATUSES.has(st)
     if (ab.cleanSession === false) return edgeFail(base, `Ablation exchange "${abId}" had cleanSession=false (session/entity already mutated); run the ablation control BEFORE Hop "${fromHop.hopId}" or on a fresh untouched sibling entity (pass entityId).`)
-    if (!(ab.cleanSession === true && (ab.step.arm === 'control' || ab.replayAttempt === 'ablation_control'))) return edgeFail(base, `Ablation exchange "${abId}" must be a clean-session control arm (role: "control" or replayAttempt: "ablation_control").`)
-    const st = ab.step.status
-    if (typeof st === 'number' && st >= 500) return edgeFail(base, `Ablation exchange "${abId}" returned server error ${st}.`)
-    if (is2xx(st) && ab.step.evidenceRole !== 'invariant_preserved') return edgeFail(base, `Ablation control "${abId}" succeeded (${st}); Hop j is not dependent on Hop i.`)
-    if (!entryMatchesEntity(ab, edge.entityId) && !(toFam && normRouteFam(ab.step.route ?? ab.step.pathAndQuery, ab.entityId) === toFam)) continue
+    if (typeof st === 'number' && st >= 500) return edgeFail(base, `Ablation exchange "${abId}" returned server error ${st} [status=5xx].`)
+    if (is2xx(st) && ab.step.evidenceRole !== 'invariant_preserved') return edgeFail(base, `Ablation control "${abId}" succeeded (${st}) [status=2xx]; Hop j is not dependent on Hop i.`)
+    const labeled = ab.cleanSession === true && (ab.step.arm === 'control' || ab.replayAttempt === 'ablation_control')
+    if (!entryMatchesEntity(ab, edge.entityId) && !(toFam && normRouteFam(ab.step.route ?? ab.step.pathAndQuery, ab.entityId) === toFam)) { diags.push(`${abId}: route_family_mismatch (entity and toHop route family "${toFam || 'none'}" unmatched)`); continue }
+    if (!labeled) { // unlabeled clean-session denial: sound only before Hop i ran or on a host-bound untouched sibling; never 2xx/dirty/mutated
+      const before = isFiniteTs(ab.timestampMs) && ab.timestampMs < pair.from.timestampMs!
+      const sibling = Boolean(ab.entityId && ab.entityId.trim().toLowerCase() !== edge.entityId.trim().toLowerCase() && !touchedBefore(ab.entityId, ab))
+      if (ab.cleanSession !== true || !denied || !(before || sibling)) { diags.push(`${abId}: unlabeled_control (cleanSession=${ab.cleanSession ?? 'unset'}, status=${st ?? 'null'}, beforeFromHop=${before}, untouchedSibling=${sibling}; pass role: "control")`); continue }
+    }
     const abActor = actorOf(ab)
-    if (!toUsesNewCap && toActor && abActor && abActor !== toActor) return edgeFail(base, `Ablation "${abId}" actor "${abActor}" mismatches toHop actor "${toActor}".`)
-    if ((typeof st === 'number' && ABLATION_DENIED_STATUSES.has(st)) || ab.step.evidenceRole === 'invariant_preserved') validAblation = ab
+    if (!toUsesNewCap && toActor && abActor && abActor !== toActor) return edgeFail(base, `Ablation "${abId}" actor "${abActor}" mismatches toHop actor "${toActor}" [actor_mismatch].`)
+    if (denied || (labeled && ab.step.evidenceRole === 'invariant_preserved')) validAblation = ab
+    else diags.push(`${abId}: status=${st ?? 'null'} not a denial (401/403/404/409/412/422)`)
   }
-  if (!validAblation) return edgeFail(base, `state_transition_binding on "${edge.entityId}" lacks a passing clean-session ablation control.`)
-  return edgeOk(base, 'state_transition_binding verified with clean-session ablation control.', {
-    entityId: edge.entityId, fromExchangeId: pair.from.exchangeId, toExchangeId: pair.to.exchangeId,
-    ablationExchangeId: validAblation.exchangeId, ablationStatus: validAblation.step.status,
-  })
+  if (!validAblation) return edgeFail(base, `state_transition_binding on "${edge.entityId}" lacks a passing clean-session ablation control [${diags.join('; ') || 'no ablationExchangeIds cited'}].`)
+  return edgeOk(base, 'state_transition_binding verified with clean-session ablation control.', { entityId: edge.entityId, fromExchangeId: pair.from.exchangeId, toExchangeId: pair.to.exchangeId, ablationExchangeId: validAblation.exchangeId, ablationStatus: validAblation.step.status })
 }
 
 function verifyAsyncPivotBinding(
@@ -545,7 +544,7 @@ function verifyReplayMode(
     const e = idx.entriesById.get(id)!
     if (!is2xx(e.step.status) || !isFiniteTs(e.timestampMs) || (refTs !== null && e.timestampMs < refTs)) return false
     const isRead = stepReadsState(e.step) || e.step.arm === 'control' || e.step.evidenceRole === 'post_chain_readback'
-    return isRead && (e.step.json !== undefined || (typeof e.step.body === 'string' && e.step.body.trim().length > 0))
+    return isRead && (e.step.json !== undefined || (typeof e.step.body === 'string' && e.step.body.trim().length > 0)) && !isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method, e.step.route ?? e.step.pathAndQuery)
   })
   return hasRead ? { ok: true } : { ok: false, reason: 'Mode B requires a post-chain 2xx readback proving persisted impact.' }
 }
@@ -649,7 +648,7 @@ function verifyTerminalImpactGate(
     const mono = !termEx || !isFiniteTs(termEx.timestampMs) || (isFiniteTs(e.timestampMs) && e.timestampMs >= termEx.timestampMs)
     const isRead = stepReadsState(e.step) || e.step.arm === 'control' || e.step.evidenceRole === 'post_chain_readback'
     const hasData = e.step.json !== undefined || (typeof e.step.body === 'string' && e.step.body.trim().length > 0)
-    return is2xx(e.step.status) && mono && isRead && hasData && !isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method) && (!isCrossTenantCls || !isOwnTenantOnly(e))
+    return is2xx(e.step.status) && mono && isRead && hasData && !isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method, e.step.route ?? e.step.pathAndQuery) && (!isCrossTenantCls || !isOwnTenantOnly(e))
   }) : undefined
   const hasPostMutation = Boolean(postMutRb), termHopSet = new Set(termHop.exchangeIds)
   const nonTermExSet = new Set(receipt.hops.filter(h => h.hopId !== termHop.hopId).flatMap(h => h.exchangeIds).filter(id => !termHopSet.has(id)))
@@ -668,7 +667,7 @@ function verifyTerminalImpactGate(
   const hasAsyncEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'async_pivot_binding' && e.verified)
   const hasAnyDerivedCrypto = verifiedEdges.some(e => e.kind === 'derived_crypto_binding' && e.verified)
   const hasBody = Boolean(termEx && (termEx.step.json !== undefined || (typeof termEx.step.body === 'string' && termEx.step.body.trim().length > 0)))
-  const isStub = Boolean(termEx && hasBody && isJobOrHandleStub(termEx.step.json, termEx.step.body, termEx.step.status, termEx.step.method))
+  const isStub = Boolean(termEx && hasBody && isJobOrHandleStub(termEx.step.json, termEx.step.body, termEx.step.status, termEx.step.method, termEx.step.route ?? termEx.step.pathAndQuery))
   const ownTenantOnly = Boolean(termEx && isOwnTenantOnly(termEx))
   const v8Default = dispatchDefaultV8Oracle(receipt, dag, idx, termEx, options, terminalCtrl, postMutRb, { termEndpoint, termFam, hasOob, hasBrowser, hasBody, isStub, ownTenantOnly })
   if (v8Default && !v8Default.ok) return v8Default
