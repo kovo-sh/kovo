@@ -48,6 +48,14 @@ moving — **not** doing hands-on codebase digging or editing yourself.
   them once the verifier finishes.
 - **Never push to a remote** unless the user explicitly asks.
 
+## Worker Dispatch & Model Routing
+
+When spawning native swarm workers (`swarm(action="add", model=...)`), route by task complexity:
+
+- **`gemini-4-hydrogen-high`** (or **`gemini-4-hydrogen-medium`** for trivial 1-file copy/test edits): straightforward UI polish, layout/copy fixes, mechanical refactors, unit-test/doc cleanups, and read-only audits (faster turnaround, lower quota burn).
+- **`gemini-4-neon-high`** (or default/inherited model): complex multi-file engine/concurrency fixes, broker/auth security boundaries, and proof-kernel soundness work.
+- Switch a `waiting` worker on quota exhaustion or capacity limits via `swarm(action="model", name="<worker>", model="<model>")`, and use the OpenCode fallback below on content-safety blocks.
+
 ## Content-Block Fallback: Delegate to OpenCode
 
 When a native swarm worker hits a content-safety filter block — e.g.:
