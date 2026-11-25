@@ -397,6 +397,8 @@ export interface FloorBrowserStep {
   selector?: string
   value?: string
   waitAfterLoadMs?: number
+  reusePage?: boolean
+  persona?: string
 }
 
 export interface FloorBrowserSessionResult {
@@ -1367,16 +1369,24 @@ const redirect = defineRecipe<RedirectArgs>('redirect', async (args, ctx) => {
 
 /** `browser_chain` / DOM sink → receipt `browser` rule over a host-recorded trace. */
 const browserSink = defineRecipe<BrowserSinkArgs>('browser_sink', async (args, ctx) => {
-  const browserClass = /^(?:browser_|dom_|postmessage)/i.test(args.vulnClass)
+  const browserClass = /^(?:browser_|dom_|postmessage|xss(?:_(?:reflected|stored))?$)/i.test(args.vulnClass)
   ctx.require(
     browserClass,
     'receipt_class',
-    `browser_sink needs a browser-class label (dom_*/browser_*/postmessage*); ${args.vulnClass} maps to a different receipt rule.`,
+    `browser_sink needs a browser-class label (dom_*/browser_*/postmessage*/xss*); ${args.vulnClass} maps to a different receipt rule.`,
   )
   // Verifier-minted canary: deterministic for the same proof inputs, and never a stored literal.
   const canaryToken = args.canaryToken
     ?? `guardian-dom-${createHash('sha256').update(`${args.origin}|${args.pathAndQuery}|${args.vulnClass}`).digest('hex').slice(0, 10)}`
   const interpolate = (value: string | undefined): string | undefined => value?.replaceAll('{{canary_token}}', canaryToken)
+
+  // `verifyReceipt` selects the `browser` rule only for browser-class vulnClasses (`dom_xss`, etc.),
+  // whereas `xss`/`xss_reflected`/`xss_stored` route to the HTTP `impact` rule (which requires HTTP
+  // exchangeIds). Normalize XSS aliases to `dom_xss` inside browser-trace receipts so authenticated
+  // reflected/stored XSS proofs verified via browser traces route to the `browser` receipt rule.
+  const receiptVulnClass = /^(?:xss|xss_reflected|xss_stored|dom_xss)$/i.test(args.vulnClass)
+    ? 'dom_xss'
+    : args.vulnClass
 
   if (!args.steps || args.steps.length === 0) {
     // Single-visit proof (no interaction): the host records one page trace.
@@ -1393,7 +1403,7 @@ const browserSink = defineRecipe<BrowserSinkArgs>('browser_sink', async (args, c
       )
     }
     return buildProofReceipt({
-      vulnClass: args.vulnClass,
+      vulnClass: receiptVulnClass,
       target: targetOf(args),
       exchangeIds: [],
       browserTraceIds: trace ? [trace.id] : [],
@@ -1425,7 +1435,7 @@ const browserSink = defineRecipe<BrowserSinkArgs>('browser_sink', async (args, c
     )
   }
   return buildProofReceipt({
-    vulnClass: args.vulnClass,
+    vulnClass: receiptVulnClass,
     target: targetOf(args),
     exchangeIds: [],
     browserTraceIds: (result?.traces ?? []).map(trace => trace.id),
@@ -1457,6 +1467,7 @@ export function browserSinkEnvelopeFromSteps(input: {
   origin: string
   vulnClass: string
   steps: ReadonlyArray<Record<string, unknown>>
+  canaryToken?: string
 }): { recipeId: 'browser_sink'; args: BrowserSinkArgs } | null {
   // A protocol proof must never be flattened into a DOM-sink recipe: its assertion (origin check,
   // credentialed fetch, built-in result) is not expressible here, so the caller stays on the
@@ -1466,14 +1477,29 @@ export function browserSinkEnvelopeFromSteps(input: {
   for (const step of input.steps) {
     const action = typeof step.action === 'string' ? step.action : 'navigate'
     if (!SIMPLE_BROWSER_ACTIONS.has(action)) return null
-    // `dom_xss_sink_hook` is a snapshot, not an interaction: the recipe arms the sink hook on every
-    // visited page and requires the canary in the probe trace, so the step maps to nothing.
-    if (action === 'dom_xss_sink_hook') continue
     const role = step.role === 'control' ? 'control' : 'probe'
     const pathAndQuery = typeof step.pathAndQuery === 'string' && step.pathAndQuery.startsWith('/') ? step.pathAndQuery : undefined
     const selector = typeof step.selector === 'string' && step.selector.length > 0 ? step.selector : undefined
     const value = typeof step.value === 'string' ? step.value : undefined
     const waitAfterLoadMs = typeof step.waitAfterLoadMs === 'number' ? step.waitAfterLoadMs : undefined
+    const reusePage = step.reusePage === true ? true : undefined
+    const persona = typeof step.persona === 'string' && step.persona.length > 0 ? step.persona : undefined
+    // `dom_xss_sink_hook` is a snapshot when a prior step for the same role already visited that
+    // path; when it targets a new path (or is the first step for that role), keep it as a
+    // `navigate` step so the armed sink hook still loads the target page.
+    if (action === 'dom_xss_sink_hook') {
+      const priorForRole = [...mapped].reverse().find(prev => prev.role === role)
+      if (!pathAndQuery || (priorForRole && priorForRole.pathAndQuery === pathAndQuery)) continue
+      mapped.push({
+        role,
+        action: 'navigate',
+        pathAndQuery,
+        ...(waitAfterLoadMs !== undefined ? { waitAfterLoadMs } : {}),
+        ...(reusePage ? { reusePage } : {}),
+        ...(persona ? { persona } : {}),
+      })
+      continue
+    }
     if (action !== 'navigate' && !selector) return null
     mapped.push({
       role,
@@ -1482,6 +1508,8 @@ export function browserSinkEnvelopeFromSteps(input: {
       ...(selector ? { selector } : {}),
       ...(value !== undefined ? { value } : {}),
       ...(waitAfterLoadMs !== undefined ? { waitAfterLoadMs } : {}),
+      ...(reusePage ? { reusePage } : {}),
+      ...(persona ? { persona } : {}),
     })
   }
   const firstProbe = mapped.find(step => step.role === 'probe')
@@ -1496,6 +1524,7 @@ export function browserSinkEnvelopeFromSteps(input: {
       vulnClass: input.vulnClass,
       actor: { handle: actorHandle },
       steps: mapped,
+      ...(input.canaryToken ? { canaryToken: input.canaryToken } : {}),
     },
   }
 }

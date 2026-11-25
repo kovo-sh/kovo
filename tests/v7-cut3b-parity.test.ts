@@ -662,7 +662,7 @@ test('the no-fallback assertion refuses the legacy DSL for every wired authz pai
     ['http_chain', 'csrf'],
     ['http_chain', 'path_traversal'],
     ['http_chain', 'graphql_bola'],
-    ['race_burst', 'race_double_spend'],
+    ['rce_proof', 'ssti'],
   ] as const) {
     assert.equal(wiredRecipeForSpecKind(kind, category), null)
     assert.doesNotThrow(() => assertNotRecipeWiredLegacyCall({ kind, category }))

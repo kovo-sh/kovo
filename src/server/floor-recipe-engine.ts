@@ -15,7 +15,9 @@
  * declarative-spec assertion. A wired pair must not fall back to `verifyReplaySpec`; the verifier
  * throws if it is called for one (`assertRecipeWiredKind`).
  */
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, createHmac, randomBytes, randomInt, randomUUID } from 'node:crypto'
+import { diffResponse } from '../../worker/analyzers.ts'
+import type { StateChangeApprovalContext } from './approval-judge.ts'
 import { baseFields, bogusIdFor } from './deterministic-specs.ts'
 import type { EngineHypothesis, Severity, SynthesizedEngineSpec } from './deterministic-specs.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
@@ -27,6 +29,7 @@ import { CUT3_FLOOR_RECIPE_IDS, browserSinkEnvelopeFromSteps, cut3FloorRecipe, f
 import type {
   AccessBoundaryArgs,
   BooleanOrTimingArgs,
+  BrowserSinkArgs,
   ConservedBalanceArgs,
   Cut3FloorRecipeArgs,
   Cut3FloorRecipeArgsMap,
@@ -41,10 +44,23 @@ import type {
   PersistedMutationArgs,
   RaceBurstArgs,
 } from './floor-recipes.ts'
-import type { ImpactStep, RoleName } from './oracle-invariants.ts'
+import { assessBoundary, assessMfaBypass, classifyBoundaryClaim, normalizeRole } from './oracle-invariants.ts'
+import type { ActorIdentity, AmbientAuth, ImpactStep, RoleName } from './oracle-invariants.ts'
+import { verifyReceipt } from './proof-receipt.ts'
+import type { ProofReceipt, ReceiptTranscript } from './proof-receipt.ts'
 import type { ReplayVerificationResult, RetestVerdict } from './replay-verifier.ts'
-import type { FloorRecipeEnvelope } from '../replay-spec.ts'
-import type { BrokerExchangeResult, Grant, RequestBroker } from './broker.ts'
+import { cacheBusterValueRegex, containsDestructivePayload, extractCacheBusterParam, replayAssertionOutcomeSchema } from '../replay-spec.ts'
+import type { AuthMutation, DeclarativeReplaySpec, FloorRecipeEnvelope, ReplayStep } from '../replay-spec.ts'
+import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied } from './broker.ts'
+import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
+import type { CanaryBroker } from './canary-broker.ts'
+import { personaSecrets } from './persona-vault.ts'
+import { redact, redactJsonValue } from './redact.ts'
+import type { NamedSecret } from './redact.ts'
+import type { Store } from './store.ts'
+import { openCanarySession, structuralSimilarity } from './verify-support.ts'
+import type { EphemeralCanarySession } from './verify-support.ts'
+import type { WorkerBackend } from './worker-backend.ts'
 import { brokerFloorRecipeDeps } from './floor-recipes.ts'
 
 export type PersistedFloorRecipeId = FloorRecipeId | Cut3FloorRecipeId
@@ -582,7 +598,7 @@ function planBrowserRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   const origin = typeof steps[0]?.origin === 'string' ? String(steps[0].origin) : hyp.endpoint.origin
   const envelope = browserSinkEnvelopeFromSteps({ origin, vulnClass: 'dom_xss', steps })
   if (!envelope) return { ...sketch, skipReason: 'browser spec steps could not be expressed as a browser_sink recipe' }
-  return { ...sketch, vulnClass: envelope.args.vulnClass, args: envelope.args }
+  return { ...sketch, vulnClass: input.vulnClass || envelope.args.vulnClass, args: envelope.args }
 }
 
 export function planFloorRecipe(input: FloorRecipePlanInput): FloorRecipePlan | null {
@@ -621,23 +637,37 @@ export function browserSessionSeam(input: {
   signal: AbortSignal
   origin: string
   runId?: string
+  assignmentId?: string
+  recordExchange?: (exchange: BrokerExchangeResult) => string | void
 }): NonNullable<FloorRecipeDeps['browserSession']> {
   return async session => {
     if (typeof input.browser.runBrowserSession !== 'function') return null
-    const sessionSteps: BrowserSessionStep[] = session.steps.map((step, index) => ({
-      id: `b${index + 1}`,
-      role: step.role,
-      origin: input.origin,
-      ...(step.pathAndQuery !== undefined ? { pathAndQuery: step.pathAndQuery } : {}),
-      action: step.action,
-      ...(step.selector !== undefined ? { selector: step.selector } : {}),
-      ...(step.value !== undefined ? { value: step.value } : {}),
-      ...(step.waitAfterLoadMs !== undefined ? { waitAfterLoadMs: step.waitAfterLoadMs } : {}),
-      canaryToken: session.canaryToken,
-      checkKind: 'dom_xss' as const,
-      enableSinkHook: true,
-      ...(input.runId ? { runId: input.runId } : {}),
-    }))
+    const defaultPersona = session.actor?.handle &&
+      session.actor.handle !== 'anonymous' &&
+      session.actor.handle !== ANONYMOUS_HANDLE
+      ? session.actor.handle
+      : undefined
+    const sessionSteps: BrowserSessionStep[] = session.steps.map((step, index) => {
+      const persona = step.persona ?? defaultPersona
+      return {
+        id: `b${index + 1}`,
+        role: step.role,
+        origin: input.origin,
+        ...(step.pathAndQuery !== undefined ? { pathAndQuery: step.pathAndQuery } : {}),
+        ...(step.reusePage ? { reusePage: true } : {}),
+        ...(persona ? { persona } : {}),
+        action: step.action,
+        ...(step.selector !== undefined ? { selector: step.selector } : {}),
+        ...(step.value !== undefined ? { value: step.value } : {}),
+        ...(step.waitAfterLoadMs !== undefined ? { waitAfterLoadMs: step.waitAfterLoadMs } : {}),
+        canaryToken: session.canaryToken,
+        checkKind: 'dom_xss' as const,
+        enableSinkHook: true,
+        ...(input.runId ? { runId: input.runId } : {}),
+        ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
+        ...(input.recordExchange ? { onExchange: input.recordExchange } : {}),
+      }
+    })
     const visits = await input.browser.runBrowserSession(sessionSteps, input.grant, input.signal)
     const traces: Array<{ id: string; origin: string; sinks: string[] }> = []
     let sinkHit = false
@@ -692,7 +722,18 @@ export async function runPlannedRecipe(input: RunPlannedRecipeInput): Promise<Fl
   })
   const browser = input.browser ?? new ScopedBrowser(input.broker)
   const withBrowser: FloorRecipeDeps = input.plan.recipeId === 'browser_sink'
-    ? { ...deps, browserSession: browserSessionSeam({ browser, grant: input.grant, signal: input.signal, origin: input.plan.args.origin || input.hypothesis.endpoint.origin, ...(input.runId ? { runId: input.runId } : {}) }) }
+    ? {
+        ...deps,
+        browserSession: browserSessionSeam({
+          browser,
+          grant: input.grant,
+          signal: input.signal,
+          origin: input.plan.args.origin || input.hypothesis.endpoint.origin,
+          ...(input.runId ? { runId: input.runId } : {}),
+          ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
+          ...(input.recordExchange ? { recordExchange: input.recordExchange } : {}),
+        }),
+      }
     : deps
   return executeFloorRecipeById(input.plan.recipeId, input.plan.args, withBrowser)
 }
@@ -722,6 +763,9 @@ const SEVERITY_BY_CLASS: Readonly<Record<string, Severity>> = {
   open_redirect: 'medium',
   url_redirect: 'medium',
   dom_xss: 'high',
+  xss: 'high',
+  xss_reflected: 'high',
+  xss_stored: 'high',
   injection: 'high',
 }
 
@@ -747,6 +791,9 @@ const CWE_BY_CLASS: Readonly<Record<string, string>> = {
   open_redirect: 'CWE-601',
   url_redirect: 'CWE-601',
   dom_xss: 'CWE-79',
+  xss: 'CWE-79',
+  xss_reflected: 'CWE-79',
+  xss_stored: 'CWE-79',
   injection: 'CWE-89',
 }
 
@@ -953,6 +1000,41 @@ function recordSpecFor(
       ],
     }
   }
+  if (plan.recipeId === 'browser_sink' || plan.specKind === 'browser_chain') {
+    const args = plan.args as BrowserSinkArgs
+    const defaultPersona = args.actor?.handle && args.actor.handle !== 'anonymous' && args.actor.handle !== ANONYMOUS_HANDLE
+      ? args.actor.handle
+      : undefined
+    const browserSteps = (args.steps && args.steps.length > 0)
+      ? args.steps.map((step, index) => ({
+          id: `${step.role === 'control' ? 'c' : 'p'}${index + 1}`,
+          role: step.role,
+          description: `${step.role} ${step.action}`,
+          origin,
+          ...(step.pathAndQuery !== undefined ? { pathAndQuery: step.pathAndQuery } : index === 0 ? { pathAndQuery: args.pathAndQuery || '/' } : {}),
+          ...(step.reusePage ? { reusePage: true } : {}),
+          ...(step.persona ?? defaultPersona ? { persona: step.persona ?? defaultPersona } : {}),
+          action: step.action,
+          ...(step.selector ? { selector: step.selector } : {}),
+          ...(step.value !== undefined ? { value: step.value } : {}),
+          ...(step.waitAfterLoadMs !== undefined ? { waitAfterLoadMs: step.waitAfterLoadMs } : {}),
+          checkKind: 'dom_xss' as const,
+          enableSinkHook: true,
+        }))
+      : [
+          { id: 'c1', role: 'control' as const, description: 'Control view', origin, pathAndQuery: args.pathAndQuery || '/', ...(defaultPersona ? { persona: defaultPersona } : {}), action: 'navigate' as const, checkKind: 'dom_xss' as const, enableSinkHook: true },
+          { id: 'p1', role: 'probe' as const, description: 'Probe view', origin, pathAndQuery: args.pathAndQuery || '/', ...(defaultPersona ? { persona: defaultPersona } : {}), action: 'navigate' as const, checkKind: 'dom_xss' as const, enableSinkHook: true },
+        ]
+    // Ensure schema invariants: at least one control and one probe step, and step 1 has pathAndQuery.
+    const hasControl = browserSteps.some(s => s.role === 'control')
+    const hasProbe = browserSteps.some(s => s.role === 'probe')
+    const validSteps = [
+      ...(hasControl ? [] : [{ id: 'c0', role: 'control' as const, description: 'Control view', origin, pathAndQuery: args.pathAndQuery || '/', ...(defaultPersona ? { persona: defaultPersona } : {}), action: 'navigate' as const }]),
+      ...browserSteps,
+      ...(hasProbe ? [] : [{ id: 'p0', role: 'probe' as const, description: 'Probe view', origin, pathAndQuery: args.pathAndQuery || '/', ...(defaultPersona ? { persona: defaultPersona } : {}), action: 'navigate' as const }]),
+    ]
+    return { ...base, kind: 'browser_chain', steps: validSteps }
+  }
   return { ...base, kind: 'http_chain', steps }
 }
 
@@ -1123,5 +1205,1306 @@ function recipeResult(
     evidencePayload,
     evidenceSha256,
     receipt: { receipt: execution.receipt, verification, mode: 'strict' },
+  }
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Cut 3e: Typed runners retiring legacy VM branches from replay-verifier.ts
+// ---------------------------------------------------------------------------------------------
+
+export interface LegacySpecRunnerContext {
+  broker: RequestBroker
+  canaryBroker?: CanaryBroker
+  backend: WorkerBackend
+  reposDir?: string
+  grant: Grant
+  signal: AbortSignal
+  storage?: Store
+  runId?: string
+  assignmentId: string
+  onExchange?: (exchange: BrokerExchangeResult) => string | void
+}
+
+function runnerSecrets(grant: Grant, broker: RequestBroker): NamedSecret[] {
+  return [
+    ...(grant.secrets ?? []),
+    ...(grant.personas ? personaSecrets(grant.personas) : []),
+    ...(broker.getRegisteredSecrets?.() ?? []),
+  ]
+}
+
+function runnerInconclusive(
+  reason: string,
+  exchanges: BrokerExchangeResult[],
+  exchangeIds: string[],
+  evidencePayload: Record<string, unknown>,
+): ReplayVerificationResult {
+  const payload = { ...evidencePayload, error: reason }
+  const evidenceSha256 = createHash('sha256').update(JSON.stringify(payload)).digest('hex')
+  return {
+    verdict: 'inconclusive',
+    outcome: {
+      confirmed: false,
+      controlPassed: false,
+      observed: reason.slice(0, 1200),
+      expected: 'Clean replay execution passing control and deterministic assertions.',
+      reason: reason.slice(0, 1200),
+    },
+    exchangeIds,
+    exchanges,
+    evidencePayload: payload,
+    evidenceSha256,
+  }
+}
+
+function runnerSummarizeExchange(ex: BrokerExchangeResult) {
+  let json: unknown = null
+  if (ex.mediaType.includes('json')) {
+    try { json = JSON.parse(ex.body) } catch { json = null }
+  }
+  return {
+    origin: ex.origin,
+    finalOrigin: ex.finalOrigin,
+    redirectOrigins: ex.redirectOrigins,
+    method: ex.method,
+    pathAndQuery: ex.pathAndQuery,
+    personaHandle: ex.personaHandle,
+    status: ex.status,
+    mediaType: ex.mediaType,
+    headers: ex.respHeaders,
+    setCookies: ex.setCookies,
+    body: ex.body.slice(0, 64 * 1024),
+    bodyPreview: ex.bodyPreview,
+    bodyBytes: ex.bodyBytes,
+    bodySha256: ex.bodySha256,
+    durationMs: ex.durationMs,
+    ...(ex.secretMatches?.length
+      ? {
+          secretMatches: ex.secretMatches.slice(0, 16).map(m => ({
+            kind: m.kind,
+            sha256Prefix: m.sha256Prefix,
+            ...(m.fieldPath ? { fieldPath: m.fieldPath } : {}),
+            count: m.count,
+          })),
+        }
+      : {}),
+    ...(json !== null ? { json } : {}),
+  }
+}
+
+function runnerInterpolateString(template: string, vars: Record<string, string>): string {
+  return template.replace(/\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}/g, (full, name: string) =>
+    Object.prototype.hasOwnProperty.call(vars, name) ? vars[name] : full)
+}
+
+function runnerInterpolateValue(value: unknown, vars: Record<string, string>): unknown {
+  if (typeof value === 'string') return runnerInterpolateString(value, vars)
+  if (Array.isArray(value)) return value.map(v => runnerInterpolateValue(v, vars))
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = runnerInterpolateValue(v, vars)
+    }
+    return out
+  }
+  return value
+}
+
+function runnerApplyBodySignature(interpolated: unknown, signable: NonNullable<ReplayStep['request']['bodySignature']>): unknown {
+  const input = interpolated && typeof interpolated === 'object' && !Array.isArray(interpolated)
+    ? { ...(interpolated as Record<string, unknown>) }
+    : {}
+  const key = `guardian_whk_${randomBytes(8).toString('hex')}`
+  const ts = String(Math.floor(Date.now() / 1000))
+  if (signable.timestampField) input[signable.timestampField] = ts
+  input[signable.keyField] = key
+  const withoutSig = { ...input }
+  delete withoutSig[signable.signatureField]
+  const event = signable.eventField
+    ? withoutSig[signable.eventField]
+    : (withoutSig.event ?? withoutSig.payload ?? withoutSig.data ?? withoutSig)
+  const asText = (value: unknown): string => (typeof value === 'string' ? value : JSON.stringify(value))
+  const canonical = signable.canonical === 'ts_event'
+    ? `${ts}.${asText(event)}`
+    : signable.canonical === 'ts_body'
+      ? `${ts}.${JSON.stringify(withoutSig)}`
+      : signable.canonical === 'event'
+        ? asText(event)
+        : JSON.stringify(withoutSig)
+  input[signable.signatureField] = createHmac('sha256', key).update(canonical).digest(signable.encoding)
+  return input
+}
+
+function runnerStepToBrokerRequest(
+  step: ReplayStep,
+  vars: Record<string, string>,
+  opts?: { replayJarPrefix?: string; runId?: string; assignmentId?: string },
+): BrokerHttpRequest {
+  const req = step.request
+  let sessionId: string | undefined
+  if (req.session) {
+    if (opts?.replayJarPrefix) {
+      const candidate = `rv-${opts.replayJarPrefix}-${req.session}`
+      sessionId = candidate.length <= 32
+        ? candidate
+        : `rv-${opts.replayJarPrefix}-${createHash('sha256').update(req.session).digest('hex').slice(0, 12)}`.slice(0, 32)
+    } else {
+      sessionId = req.session
+    }
+  }
+  const pathAndQuery = runnerInterpolateString(req.pathAndQuery, vars)
+  const headers: Record<string, string> = {}
+  for (const [k, v] of Object.entries(req.headers ?? {})) {
+    headers[k] = runnerInterpolateString(v, vars)
+  }
+  let body: string | undefined
+  if (req.textBody !== undefined) {
+    body = runnerInterpolateString(req.textBody, vars)
+  } else if (req.jsonBody !== undefined) {
+    const interpolated = runnerInterpolateValue(req.jsonBody, vars)
+    const signed = req.bodySignature ? runnerApplyBodySignature(interpolated, req.bodySignature) : interpolated
+    body = JSON.stringify(signed)
+    if (!headers['Content-Type'] && !headers['content-type']) {
+      headers['Content-Type'] = 'application/json'
+    }
+  }
+  let authMutation: AuthMutation | undefined = req.authMutation
+  if (authMutation && authMutation.kind === 'jku_x5u_canary') {
+    const rawUrl = authMutation.url ?? authMutation.value
+    const interpUrl = rawUrl !== undefined ? runnerInterpolateString(rawUrl, vars) : undefined
+    authMutation = {
+      ...authMutation,
+      ...(authMutation.url !== undefined && interpUrl !== undefined ? { url: interpUrl } : {}),
+      ...(authMutation.value !== undefined && interpUrl !== undefined ? { value: interpUrl } : {}),
+    }
+  }
+  return {
+    origin: req.origin,
+    method: req.method,
+    pathAndQuery,
+    headers,
+    body,
+    persona: req.persona,
+    ...(sessionId ? { session: sessionId } : {}),
+    sessionGroupRole: step.role,
+    ...(req.csrfBind !== undefined ? { csrfBind: req.csrfBind } : {}),
+    ...(authMutation ? { authMutation } : {}),
+    ...(req.traceId ? { traceId: req.traceId } : {}),
+    ...(opts?.runId ? { runId: opts.runId } : {}),
+    ...(opts?.assignmentId ? { assignmentId: opts.assignmentId } : {}),
+    followRedirects: req.followRedirects,
+  }
+}
+
+function runnerHasDestructiveContent(text: string): boolean {
+  if (containsDestructivePayload(text)) return true
+  try {
+    const decoded = decodeURIComponent(text.replaceAll('+', ' '))
+    if (decoded !== text && containsDestructivePayload(decoded)) return true
+  } catch {
+    const plusDecoded = text.replaceAll('+', ' ')
+    if (plusDecoded !== text && containsDestructivePayload(plusDecoded)) return true
+  }
+  return false
+}
+
+function runnerIsPrime(n: number): boolean {
+  if (n < 2) return false
+  if (n % 2 === 0) return n === 2
+  const limit = Math.floor(Math.sqrt(n))
+  for (let i = 3; i <= limit; i += 2) {
+    if (n % i === 0) return false
+  }
+  return true
+}
+
+function runnerFiveDigitPrime(exclude?: number): number {
+  for (;;) {
+    const candidate = randomInt(10_007, 99_991) | 1
+    if (candidate !== exclude && runnerIsPrime(candidate)) return candidate
+  }
+}
+
+function runnerAlphaToken(len = 7): string {
+  const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789'
+  const bytes = randomBytes(len)
+  let out = ''
+  for (let i = 0; i < len; i += 1) out += alphabet[bytes[i] % alphabet.length]
+  return out
+}
+
+function runnerBase64urlJson(value: unknown): string {
+  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url')
+}
+
+async function runnerSleepAbortable(ms: number, signal: AbortSignal) {
+  if (signal.aborted) throw signal.reason
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(signal.reason)
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+function runnerStatusMatchesExpected(expected: number | number[] | undefined, status: number): boolean {
+  if (expected === undefined) return false
+  return Array.isArray(expected) ? expected.includes(status) : expected === status
+}
+
+function runnerIsUnexpectedErrorStatus(status: number, ...expected: Array<number | number[] | undefined>): boolean {
+  if (status !== 404 && status < 500) return false
+  return !expected.some(e => runnerStatusMatchesExpected(e, status))
+}
+
+const RUNNER_POSTURE_CWES = new Set([
+  'CWE-16', 'CWE-200', 'CWE-209', 'CWE-284', 'CWE-285', 'CWE-287', 'CWE-288', 'CWE-306', 'CWE-319', 'CWE-326',
+  'CWE-346', 'CWE-523', 'CWE-538', 'CWE-540', 'CWE-614', 'CWE-639', 'CWE-693', 'CWE-862', 'CWE-863', 'CWE-942',
+  'CWE-1004', 'CWE-1021',
+])
+const RUNNER_POSTURE_CATEGORY_RE = /access|auth|bypass|cors|header|posture|misconfig|exposure|session|cookie|transport|tls|csp|policy|idor|bola|bfla/i
+
+function runnerDefaultRequireControlNonError(spec: DeclarativeReplaySpec): boolean {
+  if (spec.kind === 'static_ast_proof') return false
+  return RUNNER_POSTURE_CWES.has(spec.cwe) || RUNNER_POSTURE_CATEGORY_RE.test(spec.category)
+}
+
+function runnerReadJsonPath(obj: unknown, path: string): string | null {
+  const clean = path.replace(/^\$\.?/, '')
+  const segments = clean.split('.').filter(Boolean)
+  let cur: unknown = obj
+  for (const seg of segments) {
+    if (cur === null || cur === undefined) return null
+    const arrayMatch = seg.match(/^([a-zA-Z0-9_-]*)\[(\d+)\]$/)
+    if (arrayMatch) {
+      const [, key, idxStr] = arrayMatch
+      if (key) cur = (cur as Record<string, unknown>)[key]
+      if (!Array.isArray(cur)) return null
+      cur = cur[Number(idxStr)]
+    } else if (typeof cur === 'object') {
+      cur = (cur as Record<string, unknown>)[seg]
+    } else {
+      return null
+    }
+  }
+  if (cur === null || cur === undefined) return null
+  return typeof cur === 'string' ? cur : JSON.stringify(cur)
+}
+
+function runnerExtractVariables(step: ReplayStep, exchange: BrokerExchangeResult, vars: Record<string, string>) {
+  for (const rule of step.extract ?? []) {
+    let extracted: string | null = null
+    if (rule.from === 'status') {
+      extracted = String(exchange.status)
+    } else if (rule.from === 'header') {
+      extracted = exchange.respHeaders[rule.selector.toLowerCase()] ?? null
+    } else if (rule.from === 'json') {
+      try { extracted = runnerReadJsonPath(JSON.parse(exchange.body), rule.selector) } catch { extracted = null }
+    } else if (rule.from === 'regex') {
+      try {
+        const m = exchange.body.match(new RegExp(rule.selector))
+        extracted = m ? (m[1] ?? m[0] ?? null) : null
+      } catch {
+        extracted = null
+      }
+    }
+    if (extracted !== null) vars[rule.varName] = extracted.slice(0, 512)
+  }
+}
+
+function runnerHandleError(
+  err: unknown,
+  ctx: LegacySpecRunnerContext,
+  exchanges: BrokerExchangeResult[],
+  exchangeIds: string[],
+  evidencePayload: Record<string, unknown>,
+): ReplayVerificationResult {
+  const secrets = runnerSecrets(ctx.grant, ctx.broker)
+  const safePayload = redactJsonValue(evidencePayload, secrets)
+  if (err instanceof BrokerDenied || err instanceof BrokerCircuitOpen || err instanceof BrokerApprovalRequired) {
+    return runnerInconclusive(redact(err.message, secrets), exchanges, exchangeIds, safePayload)
+  }
+  const message = redact(err instanceof Error ? err.message : String(err), secrets)
+  return runnerInconclusive(`Replay execution failed: ${message}`, exchanges, exchangeIds, safePayload)
+}
+
+/**
+ * Cut 3e typed runner for `static_ast_proof` (zero-jq).
+ * Enforces strict tier separation: can only ever emit `static_verified`, `dismissed`, or `inconclusive`.
+ */
+export async function runStaticAstProofRecipe(
+  spec: Extract<DeclarativeReplaySpec, { kind: 'static_ast_proof' }>,
+  ctx: LegacySpecRunnerContext,
+): Promise<ReplayVerificationResult> {
+  if (!ctx.reposDir) {
+    return runnerInconclusive('static_ast_proof requires the read-only /repos mount (reposDir).', [], [], { kind: spec.kind })
+  }
+  const basePayload: Record<string, unknown> = {
+    kind: spec.kind,
+    origin: spec.origin,
+    replayedAt: new Date().toISOString(),
+  }
+  try {
+    const astResult = await ctx.backend.verifyStaticAst(ctx.assignmentId, {
+      repo: spec.repo,
+      file: spec.file,
+      startLine: spec.startLine,
+      endLine: spec.endLine,
+      engine: spec.engine,
+      ruleOrPattern: spec.ruleOrPattern,
+    }, ctx.signal, { reposDir: ctx.reposDir })
+    const evidencePayload = redactJsonValue({
+      ...basePayload,
+      repo: spec.repo,
+      file: spec.file,
+      startLine: spec.startLine,
+      endLine: spec.endLine,
+      engine: spec.engine,
+      ruleOrPattern: spec.ruleOrPattern,
+      sourceToSinkTrace: spec.sourceToSinkTrace ?? null,
+      runtimeProofGap: spec.runtimeProofGap,
+      verificationTier: 'static_verified',
+      astVerify: astResult,
+      static: {
+        verified: astResult.verified,
+        matchCount: astResult.matchCount,
+        matchedLines: astResult.matchedLines,
+        controlPassed: astResult.verified,
+      },
+    }, runnerSecrets(ctx.grant, ctx.broker))
+    const evidenceSha256 = createHash('sha256').update(JSON.stringify(evidencePayload)).digest('hex')
+    if (astResult.verified) {
+      return {
+        verdict: 'static_verified',
+        verificationTier: 'static_verified',
+        outcome: {
+          confirmed: true,
+          controlPassed: true,
+          observed: `Static AST matched ${astResult.matchCount} line(s) in ${spec.repo}/${spec.file}:${spec.startLine}-${spec.endLine}.`,
+          expected: `Pattern ${spec.ruleOrPattern} verified in cited source range.`,
+        },
+        exchangeIds: [],
+        exchanges: [],
+        evidencePayload,
+        evidenceSha256,
+      }
+    }
+    const reason = `Static AST re-verification failed: ${astResult.reason ?? 'pattern not found in the cited range.'}`
+    return {
+      verdict: 'dismissed',
+      outcome: {
+        confirmed: false,
+        controlPassed: true,
+        observed: reason.slice(0, 1200),
+        expected: `Pattern ${spec.ruleOrPattern} verified in cited source range.`,
+        reason: reason.slice(0, 1200),
+      },
+      exchangeIds: [],
+      exchanges: [],
+      evidencePayload,
+      evidenceSha256,
+    }
+  } catch (err) {
+    return runnerHandleError(err, ctx, [], [], basePayload)
+  }
+}
+
+/**
+ * Cut 3e typed runner for `rce_proof` (zero-jq; Tier-3 + HITL gate, non-reflectable math/split_echo,
+ * and ProofReceipt-verified OOB callbacks).
+ */
+export async function runRceProofRecipe(
+  spec: Extract<DeclarativeReplaySpec, { kind: 'rce_proof' }>,
+  ctx: LegacySpecRunnerContext,
+): Promise<ReplayVerificationResult> {
+  const exchanges: BrokerExchangeResult[] = []
+  const exchangeIds: string[] = []
+  const recordExchange = (ex: BrokerExchangeResult): string => {
+    exchanges.push(ex)
+    const id = ctx.onExchange?.(ex)
+    if (typeof id === 'string' && id) {
+      exchangeIds.push(id)
+      return id
+    }
+    return `rce-${exchanges.length}`
+  }
+
+  // Hard Tier 3 + HITL approval gate
+  const tier = ctx.grant.tier ?? 1
+  const gateRequest = spec.probeStep.request
+  if (tier < 3) {
+    ctx.grant.audit('denied', gateRequest.origin)
+    return runnerInconclusive(`${spec.kind} replay specs are blocked below Tier 3.`, exchanges, exchangeIds, { kind: spec.kind })
+  }
+  const localLab = Boolean(ctx.grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+  const approvalContext: StateChangeApprovalContext = {
+    personaHandle: gateRequest.persona ?? null,
+    body: gateRequest.textBody ?? (gateRequest.jsonBody !== undefined ? JSON.stringify(gateRequest.jsonBody) : null),
+    hasMultipart: false,
+    isRaceBurst: false,
+    isRceProof: true,
+  }
+  const approved = ctx.grant.isStateChangeApproved
+    ? ctx.grant.isStateChangeApproved(gateRequest.origin, gateRequest.method, gateRequest.pathAndQuery, approvalContext)
+    : localLab
+  if (!approved) {
+    ctx.grant.audit('denied', gateRequest.origin)
+    return runnerInconclusive(`${spec.kind} requires explicit Tier 3 HITL operator approval.`, exchanges, exchangeIds, { kind: spec.kind })
+  }
+
+  const basePayload: Record<string, unknown> = {
+    kind: spec.kind,
+    origin: spec.origin,
+    replayedAt: new Date().toISOString(),
+  }
+  const controlVars: Record<string, string> = {}
+  const probeVars: Record<string, string> = {}
+  const proofMeta: Record<string, unknown> = { mode: spec.proofMode }
+
+  let canarySession: EphemeralCanarySession | undefined
+  let controlCanaryToken: string | undefined
+  let probeCanaryToken: string | undefined
+  let expectedNonceProduct: string | undefined
+  let expectedSplitAssembled: string | undefined
+
+  try {
+    if (spec.proofMode === 'dynamic_math') {
+      const a = runnerFiveDigitPrime()
+      const b = runnerFiveDigitPrime(a)
+      expectedNonceProduct = String(a * b)
+      probeVars.nonce_a = String(a)
+      probeVars.nonce_b = String(b)
+      proofMeta.nonceA = a
+      proofMeta.nonceB = b
+      proofMeta.expectedProduct = expectedNonceProduct
+    } else if (spec.proofMode === 'split_echo') {
+      const part1 = runnerAlphaToken(7)
+      const part2 = runnerAlphaToken(7)
+      expectedSplitAssembled = part1 + part2
+      probeVars.nonce_part1 = part1
+      probeVars.nonce_part2 = part2
+      proofMeta.expectedAssembled = expectedSplitAssembled
+    } else {
+      canarySession = await openCanarySession(ctx.canaryBroker, ctx.storage, ctx.runId, ctx.assignmentId, spec.origin)
+      const controlCanary = canarySession.mint(`rce_proof:control:${spec.title}`)
+      const probeCanary = canarySession.mint(`rce_proof:probe:${spec.title}`)
+      controlCanaryToken = controlCanary.token
+      probeCanaryToken = probeCanary.token
+      controlVars.canary_token = controlCanary.token
+      controlVars.canary_url = controlCanary.url
+      controlVars.canary_dns_host = controlCanary.dnsHost
+      probeVars.canary_token = probeCanary.token
+      probeVars.canary_url = probeCanary.url
+      probeVars.canary_dns_host = probeCanary.dnsHost
+      proofMeta.controlCanaryToken = controlCanary.token
+      proofMeta.probeCanaryToken = probeCanary.token
+    }
+
+    const controlReq = runnerStepToBrokerRequest(spec.controlStep, controlVars, { runId: ctx.runId, assignmentId: ctx.assignmentId })
+    const probeReq = runnerStepToBrokerRequest(spec.probeStep, probeVars, { runId: ctx.runId, assignmentId: ctx.assignmentId })
+    const serializedProbeReq = JSON.stringify(probeReq)
+
+    if (runnerHasDestructiveContent(JSON.stringify(controlReq)) || runnerHasDestructiveContent(serializedProbeReq)) {
+      return runnerInconclusive('Interpolated rce_proof request matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
+    }
+    if (spec.proofMode === 'split_echo' && expectedSplitAssembled && serializedProbeReq.includes(expectedSplitAssembled)) {
+      return runnerInconclusive('Invalid split_echo template: nonce_part1 and nonce_part2 must be separated by execution concatenation syntax.', exchanges, exchangeIds, { kind: spec.kind })
+    }
+
+    const controlEx = await ctx.broker.executeHttp(controlReq, ctx.grant, ctx.signal)
+    recordExchange(controlEx)
+    const injectedAtMs = Date.now()
+    const probeEx = await ctx.broker.executeHttp(probeReq, ctx.grant, ctx.signal)
+    const probeExchangeId = recordExchange(probeEx)
+
+    let deterministicProofPassed = false
+    let receiptCheck: ReplayVerificationResult['receipt']
+    let observed = probeEx.bodyPreview.slice(0, 400) || `status=${probeEx.status}`
+
+    if (spec.proofMode === 'dynamic_math' && expectedNonceProduct) {
+      const inProbe = probeEx.body.includes(expectedNonceProduct)
+      const inControl = controlEx.body.includes(expectedNonceProduct)
+      const inOutbound = serializedProbeReq.includes(expectedNonceProduct)
+      deterministicProofPassed = inProbe && !inControl && !inOutbound
+      proofMeta.mathVerified = deterministicProofPassed
+      proofMeta.productInProbe = inProbe
+      proofMeta.productInControl = inControl
+      observed = deterministicProofPassed
+        ? `Evaluated dynamic_math product ${expectedNonceProduct} observed exclusively in probe.`
+        : `dynamic_math product not evaluated (inProbe=${inProbe}, inControl=${inControl}).`
+    } else if (spec.proofMode === 'split_echo' && expectedSplitAssembled) {
+      const inProbe = probeEx.body.includes(expectedSplitAssembled)
+      const inControl = controlEx.body.includes(expectedSplitAssembled)
+      const inOutbound = serializedProbeReq.includes(expectedSplitAssembled)
+      deterministicProofPassed = inProbe && !inControl && !inOutbound
+      proofMeta.splitEchoVerified = deterministicProofPassed
+      proofMeta.assembledInProbe = inProbe
+      proofMeta.assembledInControl = inControl
+      observed = deterministicProofPassed
+        ? `Concatenated split_echo token observed exclusively in probe.`
+        : `split_echo concatenation not observed (inProbe=${inProbe}, inControl=${inControl}).`
+    } else if (spec.proofMode === 'oob_canary' && canarySession && controlCanaryToken && probeCanaryToken) {
+      const probeWait = await canarySession.waitForCallback(probeCanaryToken, ctx.signal)
+      const controlCheck = canarySession.check(controlCanaryToken)
+      proofMeta.canaryProbeTriggered = probeWait.triggered
+      proofMeta.canaryProbeStage = probeWait.stage
+      proofMeta.canaryProbePromoted = probeWait.promoted
+      proofMeta.canaryProbeDetail = probeWait.detail
+      proofMeta.canaryControlTriggered = controlCheck.triggered
+      proofMeta.canaryControlDetail = controlCheck.detail
+      const receipt: ProofReceipt = {
+        vulnClass: 'oob',
+        target: { origin: spec.origin, method: probeEx.method.toUpperCase(), pathAndQuery: probeEx.pathAndQuery },
+        exchangeIds: [probeExchangeId],
+        oobEventIds: ['rce-oob-canary'],
+        browserTraceIds: [],
+        claimedDelta: 'Probe triggered an out-of-band execution callback that control did not.',
+        injectedAtMs,
+      }
+      const transcript: ReceiptTranscript = {
+        entries: [{
+          exchangeId: probeExchangeId,
+          step: {
+            id: spec.probeStep.id,
+            arm: 'probe',
+            method: probeEx.method.toUpperCase(),
+            route: probeEx.pathAndQuery.split('?')[0] || '/',
+            pathAndQuery: probeEx.pathAndQuery,
+            status: probeEx.status,
+            actor: { handle: probeEx.personaHandle, role: null, tenant: null, auth: 'unknown', sameSite: null },
+            json: null,
+            body: probeEx.body,
+          },
+          carrierText: `${probeReq.pathAndQuery}\n${JSON.stringify(probeReq.headers ?? {})}\n${probeReq.body ?? ''}`,
+        }],
+        oobEvents: [{
+          id: 'rce-oob-canary',
+          callbackId: probeWait.subscriptionId ?? `rce:${probeExchangeId}`,
+          token: probeCanaryToken,
+          targetOrigin: spec.origin,
+          delivered: probeWait.triggered && !controlCheck.triggered,
+          stage: probeWait.stage === 'late' ? 'late' : 'immediate',
+          receivedAtMs: Date.now(),
+          injectedAtMs,
+        }],
+      }
+      const verification = verifyReceipt(receipt, transcript)
+      receiptCheck = { receipt, verification, mode: 'strict' }
+      deterministicProofPassed = probeWait.triggered && !controlCheck.triggered && verification.confirmed
+      observed = `probeCanary=${probeWait.triggered}, controlCanary=${controlCheck.triggered}`
+    }
+
+    proofMeta.cryptographicProofPassed = deterministicProofPassed
+    const evidencePayload = redactJsonValue({
+      ...basePayload,
+      proofMode: spec.proofMode,
+      control: runnerSummarizeExchange(controlEx),
+      probe: runnerSummarizeExchange(probeEx),
+      proof: proofMeta,
+    }, runnerSecrets(ctx.grant, ctx.broker))
+    const evidenceSha256 = createHash('sha256').update(JSON.stringify(evidencePayload)).digest('hex')
+
+    const controlPassed = !runnerIsUnexpectedErrorStatus(controlEx.status, spec.controlStep.expectedStatus, spec.expectedStatus) &&
+      controlEx.status >= 200 && controlEx.status < 500
+    if (deterministicProofPassed && controlPassed) {
+      return {
+        verdict: 'confirmed',
+        verificationTier: 'runtime_confirmed',
+        outcome: {
+          confirmed: true,
+          controlPassed: true,
+          observed: observed.slice(0, 1200),
+          expected: 'Untrusted input is never evaluated as template or command code.',
+        },
+        exchangeIds,
+        exchanges,
+        evidencePayload,
+        evidenceSha256,
+        ...(receiptCheck ? { receipt: receiptCheck } : {}),
+      }
+    }
+    return {
+      verdict: controlPassed ? 'dismissed' : 'inconclusive',
+      outcome: {
+        confirmed: false,
+        controlPassed,
+        observed: observed.slice(0, 1200),
+        expected: 'Untrusted input is never evaluated as template or command code.',
+        reason: deterministicProofPassed
+          ? `Control step returned unexpected HTTP ${controlEx.status}.`
+          : 'Cryptographic non-destructive proof-of-execution check did not pass (possible reflection or unexecuted payload).',
+      },
+      exchangeIds,
+      exchanges,
+      evidencePayload,
+      evidenceSha256,
+      ...(receiptCheck ? { receipt: receiptCheck } : {}),
+    }
+  } catch (err) {
+    return runnerHandleError(err, ctx, exchanges, exchangeIds, basePayload)
+  } finally {
+    await canarySession?.close()
+  }
+}
+
+/**
+ * Cut 3e typed runner for `cache_differential` (zero-jq).
+ * Enforces unique ?_gcb= isolation, header-hit / body_repeat persistence, requireControlNonError,
+ * and optional SPA catch-all control.
+ */
+export async function runCacheDifferentialRecipe(
+  spec: Extract<DeclarativeReplaySpec, { kind: 'cache_differential' }>,
+  ctx: LegacySpecRunnerContext,
+): Promise<ReplayVerificationResult> {
+  const exchanges: BrokerExchangeResult[] = []
+  const exchangeIds: string[] = []
+  const recordExchange = (ex: BrokerExchangeResult) => {
+    exchanges.push(ex)
+    const id = ctx.onExchange?.(ex)
+    if (typeof id === 'string' && id) exchangeIds.push(id)
+  }
+  const basePayload: Record<string, unknown> = {
+    kind: spec.kind,
+    origin: spec.origin,
+    replayedAt: new Date().toISOString(),
+  }
+
+  try {
+    const controlGcb = randomUUID()
+    const probeGcb = randomUUID()
+    const repeatGcb = randomUUID()
+    const resolveCachePath = (raw: string, token: string): string =>
+      raw.replaceAll('{{control_gcb}}', controlGcb)
+        .replaceAll('{{probe_gcb}}', probeGcb)
+        .replaceAll('{{repeat_gcb}}', repeatGcb)
+        .replaceAll('{{cache_buster}}', token)
+
+    const controlPath = resolveCachePath(spec.controlPath, controlGcb)
+    const probePath = resolveCachePath(spec.probePath, probeGcb)
+    const verifyPath = spec.verifyPath ? resolveCachePath(spec.verifyPath, probeGcb) : probePath
+    const repeatPath = spec.repeatPath ? resolveCachePath(spec.repeatPath, repeatGcb) : null
+
+    const actualCtrlGcb = extractCacheBusterParam(controlPath)
+    const actualProbeGcb = extractCacheBusterParam(probePath)
+    if (!actualCtrlGcb || !cacheBusterValueRegex.test(actualCtrlGcb) ||
+        !actualProbeGcb || !cacheBusterValueRegex.test(actualProbeGcb)) {
+      return runnerInconclusive('cache_differential requires valid ?_gcb=<16-36 hex/uuid> tokens.', exchanges, exchangeIds, { kind: spec.kind })
+    }
+    if (actualCtrlGcb.toLowerCase() === actualProbeGcb.toLowerCase()) {
+      return runnerInconclusive('cache_differential cannot reuse _gcb between control and probe.', exchanges, exchangeIds, { kind: spec.kind })
+    }
+    if (spec.proofMode === 'body_repeat' && !repeatPath) {
+      return runnerInconclusive('cache_differential body_repeat proof requires a repeatPath.', exchanges, exchangeIds, { kind: spec.kind })
+    }
+
+    const controlEx = await ctx.broker.executeHttp({
+      origin: spec.targetOrigin,
+      method: spec.method,
+      pathAndQuery: controlPath,
+      ...(spec.controlPersona ? { persona: spec.controlPersona } : {}),
+      probeClass: 'cache_differential',
+      followRedirects: false,
+      runId: ctx.runId,
+      assignmentId: ctx.assignmentId,
+    }, ctx.grant, ctx.signal)
+    recordExchange(controlEx)
+
+    const probeEx = await ctx.broker.executeHttp({
+      origin: spec.targetOrigin,
+      method: spec.method,
+      pathAndQuery: probePath,
+      headers: spec.poisonHeaders,
+      persona: spec.poisonPersona,
+      probeClass: 'cache_poison_deception',
+      followRedirects: false,
+      runId: ctx.runId,
+      assignmentId: ctx.assignmentId,
+    }, ctx.grant, ctx.signal)
+    recordExchange(probeEx)
+
+    const verifyEx = await ctx.broker.executeHttp({
+      origin: spec.targetOrigin,
+      method: spec.method,
+      pathAndQuery: verifyPath,
+      ...(spec.verifyPersona ? { persona: spec.verifyPersona } : {}),
+      probeClass: 'cache_differential',
+      cacheVerify: true,
+      followRedirects: false,
+      runId: ctx.runId,
+      assignmentId: ctx.assignmentId,
+    }, ctx.grant, ctx.signal)
+    recordExchange(verifyEx)
+
+    let repeatEx: BrokerExchangeResult | null = null
+    if (spec.proofMode === 'body_repeat' && repeatPath) {
+      await runnerSleepAbortable(150, ctx.signal)
+      repeatEx = await ctx.broker.executeHttp({
+        origin: spec.targetOrigin,
+        method: spec.method,
+        pathAndQuery: repeatPath,
+        ...(spec.verifyPersona ? { persona: spec.verifyPersona } : {}),
+        probeClass: 'cache_differential',
+        cacheVerify: true,
+        followRedirects: false,
+        runId: ctx.runId,
+        assignmentId: ctx.assignmentId,
+      }, ctx.grant, ctx.signal)
+      recordExchange(repeatEx)
+    }
+
+    const guardControlErrors = spec.requireControlNonError ?? runnerDefaultRequireControlNonError(spec)
+    let forcedInconclusiveReason: string | null = null
+    if (guardControlErrors) {
+      if (runnerIsUnexpectedErrorStatus(controlEx.status, spec.expectedStatus)) {
+        forcedInconclusiveReason = `Unexpected HTTP ${controlEx.status} on cache_differential control step (requireControlNonError).`
+      } else if (runnerIsUnexpectedErrorStatus(verifyEx.status, spec.expectedStatus)) {
+        forcedInconclusiveReason = `Unexpected HTTP ${verifyEx.status} on cache_differential verify step (requireControlNonError).`
+      }
+    }
+
+    const ageRaw = verifyEx.respHeaders.age
+    const age = ageRaw !== undefined ? Number(ageRaw) : NaN
+    const cacheHeaderSignal = [
+      verifyEx.respHeaders['x-cache'],
+      verifyEx.respHeaders['cf-cache-status'],
+      verifyEx.respHeaders['x-cache-status'],
+      verifyEx.respHeaders['x-proxy-cache'],
+      verifyEx.respHeaders['cache-status'],
+    ].some(v => typeof v === 'string' && /\bhit\b/i.test(v))
+    const simControlVsVerify = structuralSimilarity(controlEx.body, verifyEx.body)
+    const simProbeVsVerify = structuralSimilarity(probeEx.body, verifyEx.body)
+
+    let cacheHitObserved: boolean
+    let poisonPersistedToVictim: boolean
+    let markerInControl = false
+    let markerInProbe = false
+    let markerInVerify = false
+    let markerInRepeat = false
+    let repeatBodyMatches = false
+    let timingSignal = false
+    if (spec.proofMode === 'body_repeat') {
+      const marker = spec.marker
+      markerInControl = Boolean(marker && controlEx.body.includes(marker))
+      markerInProbe = Boolean(marker && probeEx.body.includes(marker))
+      markerInVerify = Boolean(marker && verifyEx.body.includes(marker))
+      markerInRepeat = Boolean(marker && repeatEx?.body.includes(marker))
+      const actorDifferential = Boolean(spec.poisonPersona) && (spec.verifyPersona ?? null) !== spec.poisonPersona
+      const bodyPersisted = verifyEx.body === probeEx.body && verifyEx.body !== controlEx.body
+      repeatBodyMatches = Boolean(repeatEx && repeatEx.body === verifyEx.body && repeatEx.body !== controlEx.body)
+      const markerPersisted = Boolean(marker) && markerInProbe && markerInVerify && !markerInControl
+      cacheHitObserved = Boolean(marker) ? markerPersisted : bodyPersisted
+      poisonPersistedToVictim = actorDifferential && cacheHitObserved && repeatBodyMatches && (!marker || markerInRepeat)
+      timingSignal = Boolean(repeatEx) && repeatBodyMatches
+    } else {
+      cacheHitObserved = (Number.isFinite(age) && age > 0) || cacheHeaderSignal
+      poisonPersistedToVictim =
+        (simControlVsVerify < 0.95 || verifyEx.status !== controlEx.status) &&
+        (simProbeVsVerify >= 0.85 || verifyEx.status === probeEx.status)
+    }
+
+    const deterministicProofPassed = cacheHitObserved && poisonPersistedToVictim
+    const proofFailureReason = deterministicProofPassed
+      ? ''
+      : spec.proofMode === 'body_repeat'
+        ? (!cacheHitObserved
+          ? 'Header-free cache proof: the clean verify did not receive the warm marker/body.'
+          : 'Header-free cache proof: repeat fetch did not reproduce the poisoned body, or the control did not differ.')
+        : !cacheHitObserved
+          ? 'Verify request did not observe a cache hit (missing HIT header or Age > 0).'
+          : 'Clean unauthenticated verify response matched clean control rather than poisoned probe.'
+
+    let spaCatchall: Record<string, unknown> | undefined
+    if (spec.spaCatchallControl) {
+      const catchallPath = `/.guardian-nonexistent-${randomUUID()}`
+      const catchallEx = await ctx.broker.executeHttp({
+        origin: spec.targetOrigin,
+        method: 'GET',
+        pathAndQuery: catchallPath,
+        followRedirects: true,
+      }, ctx.grant, ctx.signal)
+      recordExchange(catchallEx)
+      const diff = diffResponse(
+        { status: catchallEx.status, body: catchallEx.body, mediaType: catchallEx.mediaType },
+        { status: verifyEx.status, body: verifyEx.body, mediaType: verifyEx.mediaType },
+      )
+      spaCatchall = {
+        path: catchallPath,
+        ...runnerSummarizeExchange(catchallEx),
+        comparisons: { verify: diff },
+        allProbesMatchedCatchall: diff.likelySpaCatchall,
+      }
+      if (diff.likelySpaCatchall) {
+        forcedInconclusiveReason = 'cache_differential verify response is structurally indistinguishable from an HTTP 200 SPA catch-all route.'
+      }
+    }
+
+    const controlSummary = { id: 'control', role: 'control', ...runnerSummarizeExchange(controlEx) }
+    const probeSummary = { id: 'probe', role: 'probe', ...runnerSummarizeExchange(probeEx) }
+    const verifySummary = { id: 'verify', role: 'probe', ...runnerSummarizeExchange(verifyEx) }
+    const repeatSummary = repeatEx ? { id: 'repeat', role: 'probe', ...runnerSummarizeExchange(repeatEx) } : undefined
+
+    const evidencePayload = redactJsonValue({
+      ...basePayload,
+      targetOrigin: spec.targetOrigin,
+      mode: spec.mode,
+      control: controlSummary,
+      probe: probeSummary,
+      verify: verifySummary,
+      ...(repeatSummary ? { repeat: repeatSummary } : {}),
+      steps: { control: controlSummary, probe: probeSummary, verify: verifySummary, ...(repeatSummary ? { repeat: repeatSummary } : {}) },
+      ...(spaCatchall ? { spaCatchall } : {}),
+      cacheProof: {
+        mode: spec.mode,
+        proofMode: spec.proofMode,
+        controlGcb: actualCtrlGcb,
+        probeGcb: actualProbeGcb,
+        cacheHitObserved,
+        poisonPersistedToVictim,
+        simControlVsVerify,
+        simProbeVsVerify,
+        age: Number.isFinite(age) ? age : null,
+        markerPresent: Boolean(spec.marker),
+        markerInControl,
+        markerInProbe,
+        markerInVerify,
+        markerInRepeat,
+        repeatBodyMatches,
+        timingSignal,
+      },
+    }, runnerSecrets(ctx.grant, ctx.broker))
+    const evidenceSha256 = createHash('sha256').update(JSON.stringify(evidencePayload)).digest('hex')
+
+    if (forcedInconclusiveReason) {
+      return {
+        verdict: 'inconclusive',
+        outcome: {
+          confirmed: false,
+          controlPassed: false,
+          observed: verifyEx.bodyPreview.slice(0, 400),
+          expected: 'Clean uncached or isolated response.',
+          reason: forcedInconclusiveReason,
+        },
+        exchangeIds,
+        exchanges,
+        evidencePayload,
+        evidenceSha256,
+      }
+    }
+    const controlPassed = controlEx.status >= 200 && controlEx.status < 500
+    if (deterministicProofPassed && controlPassed) {
+      return {
+        verdict: 'confirmed',
+        verificationTier: 'runtime_confirmed',
+        outcome: {
+          confirmed: true,
+          controlPassed: true,
+          observed: `Cache ${spec.mode} persisted poisoned response to clean verify (simControl=${simControlVsVerify.toFixed(2)}, simProbe=${simProbeVsVerify.toFixed(2)}).`,
+          expected: 'Unkeyed input or victim response is not cached and served across clients.',
+        },
+        exchangeIds,
+        exchanges,
+        evidencePayload,
+        evidenceSha256,
+      }
+    }
+    return {
+      verdict: controlPassed ? 'dismissed' : 'inconclusive',
+      outcome: {
+        confirmed: false,
+        controlPassed,
+        observed: verifyEx.bodyPreview.slice(0, 400) || `verifyStatus=${verifyEx.status}`,
+        expected: 'Unkeyed input or victim response is not cached and served across clients.',
+        reason: proofFailureReason || `Control step returned HTTP ${controlEx.status}.`,
+      },
+      exchangeIds,
+      exchanges,
+      evidencePayload,
+      evidenceSha256,
+    }
+  } catch (err) {
+    return runnerHandleError(err, ctx, exchanges, exchangeIds, basePayload)
+  }
+}
+
+/**
+ * Cut 3e typed runner for `auth_protocol_proof`:
+ * - OOB `jku_x5u_canary` verifies directly through `ProofReceipt` (`oob` rule, zero-jq).
+ * - Token-minting & JWT/OAuth differentials enforce boundary gates, redaction of mutated tokens,
+ *   and evaluate assertions cleanly without living inside `replay-verifier.ts`.
+ */
+export async function runAuthProtocolProofRecipe(
+  spec: Extract<DeclarativeReplaySpec, { kind: 'auth_protocol_proof' }>,
+  ctx: LegacySpecRunnerContext,
+): Promise<ReplayVerificationResult> {
+  const exchanges: BrokerExchangeResult[] = []
+  const exchangeIds: string[] = []
+  const recordExchange = (ex: BrokerExchangeResult): string => {
+    exchanges.push(ex)
+    const id = ctx.onExchange?.(ex)
+    if (typeof id === 'string' && id) {
+      exchangeIds.push(id)
+      return id
+    }
+    return `auth-${exchanges.length}`
+  }
+
+  const basePayload: Record<string, unknown> = {
+    kind: spec.kind,
+    origin: spec.origin,
+    replayedAt: new Date().toISOString(),
+  }
+  const vars: Record<string, string> = {}
+  const stepsOut: Record<string, unknown> = {}
+  const probeStepExchanges: Array<{ id: string; exchange: BrokerExchangeResult; exchangeId: string; request: BrokerHttpRequest }> = []
+  const replayJarPrefix = randomUUID().slice(0, 8)
+  let firstControlStep: Record<string, unknown> | undefined
+  let firstProbeStep: Record<string, unknown> | undefined
+
+  const mintedTokens: Array<{ name: string; alg: string }> = []
+  if (spec.tokenMints?.length) {
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    vars.now = String(nowSeconds)
+    vars.now_plus_1h = String(nowSeconds + 3600)
+    for (const mint of spec.tokenMints) {
+      const header = { alg: mint.signature === 'none' ? 'none' : 'HS256', typ: 'JWT', ...(mint.header ?? {}) }
+      const resolveClaims = (value: unknown): unknown => {
+        if (value === '{{now}}') return nowSeconds
+        if (value === '{{now_plus_1h}}') return nowSeconds + 3600
+        if (Array.isArray(value)) return value.map(resolveClaims)
+        if (value && typeof value === 'object') {
+          return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, resolveClaims(v)]))
+        }
+        return value
+      }
+      const headerJson = runnerInterpolateValue(resolveClaims(header), vars) as Record<string, unknown>
+      const payloadJson = runnerInterpolateValue(resolveClaims(mint.payload), vars) as Record<string, unknown>
+      vars[mint.name] = `${runnerBase64urlJson(headerJson)}.${runnerBase64urlJson(payloadJson)}.`
+      mintedTokens.push({ name: mint.name, alg: String(headerJson.alg ?? 'none') })
+    }
+  }
+
+  const serializedSteps = JSON.stringify(spec.steps)
+  const needsCanary = spec.steps.some(s => s.request.authMutation?.kind === 'jku_x5u_canary') ||
+    /\{\{canary_(?:url|token|dns_host)\}\}/.test(serializedSteps)
+  let canarySession: EphemeralCanarySession | undefined
+  let ctrlCanary: { url: string; token: string; dnsHost: string } | undefined
+  let prbCanary: { url: string; token: string; dnsHost: string } | undefined
+
+  let forcedInconclusiveReason: string | null = null
+  let deterministicProofPassed = true
+  let proofFailureReason = ''
+
+  try {
+    if (needsCanary) {
+      canarySession = await openCanarySession(ctx.canaryBroker, ctx.storage, ctx.runId, ctx.assignmentId, spec.origin)
+      ctrlCanary = canarySession.mint(`auth_protocol_proof:control:${spec.title}`)
+      prbCanary = canarySession.mint(`auth_protocol_proof:probe:${spec.title}`)
+    }
+
+    const injectedAtMs = Date.now()
+    for (const step of spec.steps) {
+      ctx.signal.throwIfAborted()
+      const stepVars: Record<string, string> = { ...vars }
+      if (ctrlCanary && prbCanary) {
+        const activeCanary = step.role === 'control' ? ctrlCanary : prbCanary
+        stepVars.canary_url = activeCanary.url
+        stepVars.canary_token = activeCanary.token
+        stepVars.canary_dns_host = activeCanary.dnsHost
+      }
+      const brokerReq = runnerStepToBrokerRequest(step, stepVars, {
+        replayJarPrefix,
+        runId: ctx.runId,
+        assignmentId: ctx.assignmentId,
+      })
+      if (brokerReq.authMutation?.kind === 'jku_x5u_canary' && !brokerReq.authMutation.url && !brokerReq.authMutation.value && ctrlCanary && prbCanary) {
+        brokerReq.authMutation = { ...brokerReq.authMutation, url: step.role === 'control' ? ctrlCanary.url : prbCanary.url }
+      }
+      const ex = await ctx.broker.executeHttp(brokerReq, ctx.grant, ctx.signal)
+      const exId = recordExchange(ex)
+      runnerExtractVariables(step, ex, vars)
+      const stepEntry: Record<string, unknown> = { id: step.id, role: step.role, ...runnerSummarizeExchange(ex) }
+      stepsOut[step.id] = stepEntry
+      if (step.role === 'control' && !firstControlStep) firstControlStep = stepEntry
+      if (step.role === 'probe') {
+        if (!firstProbeStep) firstProbeStep = stepEntry
+        probeStepExchanges.push({ id: step.id, exchange: ex, exchangeId: exId, request: brokerReq })
+      }
+    }
+
+    const guardControlErrors = spec.requireControlNonError ?? runnerDefaultRequireControlNonError(spec)
+    if (guardControlErrors) {
+      for (const step of spec.steps) {
+        if (step.role !== 'control' && step.role !== 'probe') continue
+        const status = (stepsOut[step.id] as { status?: number } | undefined)?.status
+        if (typeof status === 'number' && runnerIsUnexpectedErrorStatus(status, step.expectedStatus, spec.expectedStatus)) {
+          if (step.role === 'probe') {
+            const statusAssertedInJq =
+              new RegExp(`status\\s*==\\s*${status}\\b|\\b${status}\\s*==\\s*[^;]*status`).test(spec.assertionsJq) ||
+              (status >= 500 && /status\s*>=\s*500\b/.test(spec.assertionsJq))
+            if (statusAssertedInJq) continue
+          }
+          forcedInconclusiveReason = `Unexpected HTTP ${status} on ${step.role} step "${step.id}" (requireControlNonError); declare expectedStatus ${status} to test error behavior.`
+          break
+        }
+      }
+    }
+
+    let canaryProof: Record<string, unknown> | undefined
+    let oobReceiptCheck: ReplayVerificationResult['receipt']
+    if (canarySession && prbCanary && ctrlCanary) {
+      const probeWait = await canarySession.waitForCallback(prbCanary.token, ctx.signal)
+      const controlCheck = canarySession.check(ctrlCanary.token)
+      deterministicProofPassed = probeWait.triggered && !controlCheck.triggered
+      if (!deterministicProofPassed) {
+        proofFailureReason = 'auth_protocol_proof OOB canary callback did not trigger exclusively on probe step.'
+      }
+      canaryProof = {
+        probeTriggered: probeWait.triggered,
+        probeStage: probeWait.stage,
+        probePromoted: probeWait.promoted,
+        controlTriggered: controlCheck.triggered,
+        probeDetail: probeWait.detail,
+        controlDetail: controlCheck.detail,
+      }
+      const primaryProbe = probeStepExchanges[0]
+      if (primaryProbe) {
+        const receipt: ProofReceipt = {
+          vulnClass: 'oob',
+          target: { origin: spec.origin, method: primaryProbe.exchange.method.toUpperCase(), pathAndQuery: primaryProbe.exchange.pathAndQuery },
+          exchangeIds: [primaryProbe.exchangeId],
+          oobEventIds: ['auth-oob-canary'],
+          browserTraceIds: [],
+          claimedDelta: 'Auth protocol token header triggered an out-of-band canary fetch on probe only.',
+          injectedAtMs,
+        }
+        const carrierExtra = primaryProbe.request.authMutation?.kind === 'jku_x5u_canary'
+          ? (primaryProbe.request.authMutation.url ?? primaryProbe.request.authMutation.value ?? '')
+          : ''
+        const transcript: ReceiptTranscript = {
+          entries: [{
+            exchangeId: primaryProbe.exchangeId,
+            step: {
+              id: primaryProbe.id,
+              arm: 'probe',
+              method: primaryProbe.exchange.method.toUpperCase(),
+              route: primaryProbe.exchange.pathAndQuery.split('?')[0] || '/',
+              pathAndQuery: primaryProbe.exchange.pathAndQuery,
+              status: primaryProbe.exchange.status,
+              actor: { handle: primaryProbe.exchange.personaHandle, role: null, tenant: null, auth: 'unknown', sameSite: null },
+              json: null,
+              body: primaryProbe.exchange.body,
+            },
+            carrierText: `${primaryProbe.request.pathAndQuery}\n${JSON.stringify(primaryProbe.request.headers ?? {})}\n${primaryProbe.request.body ?? ''}\n${carrierExtra}`,
+          }],
+          oobEvents: [{
+            id: 'auth-oob-canary',
+            callbackId: probeWait.subscriptionId ?? `auth:${primaryProbe.exchangeId}`,
+            token: prbCanary.token,
+            targetOrigin: spec.origin,
+            delivered: probeWait.triggered && !controlCheck.triggered,
+            stage: probeWait.stage === 'late' ? 'late' : 'immediate',
+            receivedAtMs: Date.now(),
+            injectedAtMs,
+          }],
+        }
+        const verification = verifyReceipt(receipt, transcript)
+        oobReceiptCheck = { receipt, verification, mode: 'strict' }
+        if (!verification.confirmed) {
+          deterministicProofPassed = false
+          proofFailureReason = verification.reason
+        }
+      }
+    }
+
+    let spaCatchall: Record<string, unknown> | undefined
+    if (spec.spaCatchallControl) {
+      const catchallPath = `/.guardian-nonexistent-${randomUUID()}`
+      const catchallEx = await ctx.broker.executeHttp({
+        origin: spec.origin,
+        method: 'GET',
+        pathAndQuery: catchallPath,
+        followRedirects: true,
+      }, ctx.grant, ctx.signal)
+      recordExchange(catchallEx)
+      const comparisons: Record<string, Record<string, unknown>> = {}
+      let allProbesMatchedCatchall = probeStepExchanges.length > 0
+      for (const probe of probeStepExchanges) {
+        const diff = diffResponse(
+          { status: catchallEx.status, body: catchallEx.body, mediaType: catchallEx.mediaType },
+          { status: probe.exchange.status, body: probe.exchange.body, mediaType: probe.exchange.mediaType },
+        )
+        comparisons[probe.id] = diff
+        if (!diff.likelySpaCatchall) allProbesMatchedCatchall = false
+      }
+      spaCatchall = { path: catchallPath, ...runnerSummarizeExchange(catchallEx), comparisons, allProbesMatchedCatchall }
+      if (allProbesMatchedCatchall) {
+        forcedInconclusiveReason = 'Probe response is structurally indistinguishable from an HTTP 200 SPA catch-all route.'
+      }
+    }
+
+    const authSteps: ImpactStep[] = spec.steps.map(step => {
+      const entry = stepsOut[step.id] as Record<string, unknown> | undefined
+      let entryJson = entry?.json ?? null
+      if (entryJson === null && typeof entry?.body === 'string') {
+        try { entryJson = JSON.parse(entry.body) } catch { entryJson = null }
+      }
+      const handle = (typeof entry?.personaHandle === 'string' ? entry.personaHandle : null) ?? step.request.persona ?? null
+      return {
+        id: step.id,
+        arm: step.role,
+        method: step.request.method.toUpperCase(),
+        route: step.request.pathAndQuery.split('?')[0].split('#')[0].replace(/\/{2,}/g, '/').replace(/\/+$/, '').toLowerCase() || '/',
+        pathAndQuery: step.request.pathAndQuery,
+        status: typeof entry?.status === 'number' ? entry.status : null,
+        actor: {
+          handle,
+          role: normalizeRole(step.request.persona),
+          tenant: null,
+          auth: 'unknown' as AmbientAuth,
+          sameSite: null,
+        } satisfies ActorIdentity,
+        json: entryJson,
+        body: typeof entry?.body === 'string' ? entry.body : '',
+        requestJson: step.request.jsonBody,
+        requestHeaders: step.request.headers ?? null,
+        responseHeaders: (entry?.headers as Record<string, string> | undefined) ?? null,
+      }
+    })
+    // Boundary gate applies to HTTP auth/access bypass claims, never to OOB jku_x5u_canary fetches
+    // (whose proof is the host-observed out-of-band callback verified by ProofReceipt).
+    const authBoundaryClass = canaryProof
+      ? 'other' as const
+      : classifyBoundaryClaim({ cwe: spec.cwe, category: spec.category, title: spec.title, impact: spec.impact })
+    const authBoundaryGate = authBoundaryClass === 'mfa'
+      ? assessMfaBypass({ impactClass: 'other', steps: authSteps, targetOrigin: spec.origin })
+      : authBoundaryClass === 'auth' || authBoundaryClass === 'access'
+        ? assessBoundary({
+            impactClass: 'other',
+            steps: authSteps,
+            boundaryClass: authBoundaryClass,
+            expectControlDenied: spec.expectControlDenied,
+            targetOrigin: spec.origin,
+          })
+        : null
+    if (authBoundaryGate?.required && !authBoundaryGate.satisfied) {
+      deterministicProofPassed = false
+      proofFailureReason = authBoundaryGate.reason
+    }
+
+    const dynamicSecrets = runnerSecrets(ctx.grant, ctx.broker)
+    const evidencePayload = redactJsonValue({
+      ...basePayload,
+      protocol: spec.protocol,
+      steps: stepsOut,
+      ...(firstControlStep ? { control: firstControlStep } : {}),
+      ...(firstProbeStep ? { probe: firstProbeStep } : {}),
+      extractedVars: vars,
+      ...(mintedTokens.length > 0 ? { mintedTokens } : {}),
+      ...(canaryProof ? { canaryProof } : {}),
+      ...(spaCatchall ? { spaCatchall } : {}),
+      ...(authBoundaryGate ? { boundaryGate: authBoundaryGate } : {}),
+    }, dynamicSecrets)
+    const serializedPayload = JSON.stringify(evidencePayload, null, 2)
+    const evidenceSha256 = createHash('sha256').update(serializedPayload).digest('hex')
+
+    // OOB canary path (e.g. jku_x5u_canary): zero-jq confirmation backed by ProofReceipt.
+    if (canaryProof) {
+      const controlStatus = (firstControlStep as { status?: number } | undefined)?.status ?? null
+      const controlPassed = forcedInconclusiveReason === null && controlStatus !== null && controlStatus >= 200 && controlStatus < 500
+      if (forcedInconclusiveReason) {
+        return {
+          verdict: 'inconclusive',
+          outcome: { confirmed: false, controlPassed: false, observed: 'oob_canary', expected: 'No untrusted header fetch.', reason: forcedInconclusiveReason },
+          exchangeIds, exchanges, evidencePayload, evidenceSha256,
+          ...(oobReceiptCheck ? { receipt: oobReceiptCheck } : {}),
+        }
+      }
+      if (deterministicProofPassed && controlPassed) {
+        return {
+          verdict: 'confirmed',
+          verificationTier: 'runtime_confirmed',
+          outcome: { confirmed: true, controlPassed: true, observed: 'jku_x5u_oob_confirmed', expected: 'Token header URL is never fetched.' },
+          exchangeIds, exchanges, evidencePayload, evidenceSha256,
+          ...(oobReceiptCheck ? { receipt: oobReceiptCheck } : {}),
+        }
+      }
+      return {
+        verdict: controlPassed ? 'dismissed' : 'inconclusive',
+        outcome: { confirmed: false, controlPassed, observed: 'jku_x5u_oob_not_triggered', expected: 'Token header URL is never fetched.', reason: proofFailureReason || 'OOB canary did not fire.' },
+        exchangeIds, exchanges, evidencePayload, evidenceSha256,
+        ...(oobReceiptCheck ? { receipt: oobReceiptCheck } : {}),
+      }
+    }
+
+    // Non-OOB auth_protocol_proof (JWT mutations, tokenMints, OAuth redirect differentials):
+    // evaluate spec assertions via worker jq so every caller differential shape stays exact.
+    const jqCommand = `jq '${spec.assertionsJq.replaceAll("'", "'\\''")}' /evidence/replay-results.json > /work/outcome.json`
+    const workerResult = await ctx.backend.run({
+      assignmentId: ctx.assignmentId,
+      files: [{ name: 'replay-results.json', content: serializedPayload }],
+      command: jqCommand,
+      outputs: ['outcome.json'],
+      timeoutMs: 30_000,
+    }, ctx.signal)
+    const rawOutcome = (workerResult.outputs['outcome.json'] || workerResult.stdout || '').trim()
+    if (workerResult.exitCode !== 0 || !rawOutcome) {
+      return runnerInconclusive(`Replay jq assertion failed (exit ${workerResult.exitCode}): ${workerResult.stderr.slice(0, 400)}`, exchanges, exchangeIds, evidencePayload)
+    }
+    let parsedJson: unknown
+    try { parsedJson = JSON.parse(rawOutcome) } catch {
+      return runnerInconclusive('Replay jq assertion did not emit valid JSON.', exchanges, exchangeIds, evidencePayload)
+    }
+    const coerceText = (v: unknown) => (typeof v === 'string' ? v : (JSON.stringify(v) ?? String(v))).slice(0, 1200)
+    if (parsedJson && typeof parsedJson === 'object' && !Array.isArray(parsedJson)) {
+      const obj = { ...(parsedJson as Record<string, unknown>) }
+      if ('observed' in obj && obj.observed !== undefined) obj.observed = coerceText(obj.observed)
+      if ('expected' in obj && obj.expected !== undefined) obj.expected = coerceText(obj.expected)
+      if ('reason' in obj) {
+        if (obj.reason === undefined || obj.reason === null) delete obj.reason
+        else obj.reason = coerceText(obj.reason)
+      }
+      parsedJson = obj
+    }
+    const validated = replayAssertionOutcomeSchema.safeParse(parsedJson)
+    if (!validated.success) {
+      return runnerInconclusive(`Replay assertion output violated schema: ${validated.error.issues[0]?.message ?? 'invalid shape'}`, exchanges, exchangeIds, evidencePayload)
+    }
+    const outcome = validated.data
+    if (forcedInconclusiveReason) {
+      return {
+        verdict: 'inconclusive',
+        outcome: { ...outcome, confirmed: false, controlPassed: false, reason: forcedInconclusiveReason },
+        exchangeIds, exchanges, evidencePayload, evidenceSha256,
+      }
+    }
+    if (!deterministicProofPassed) {
+      return {
+        verdict: outcome.controlPassed ? 'dismissed' : 'inconclusive',
+        outcome: { ...outcome, confirmed: false, reason: proofFailureReason || 'Auth protocol boundary proof did not pass.' },
+        exchangeIds, exchanges, evidencePayload, evidenceSha256,
+      }
+    }
+    const verdict = outcome.controlPassed && outcome.confirmed
+      ? 'confirmed'
+      : outcome.controlPassed ? 'dismissed' : 'inconclusive'
+    return {
+      verdict,
+      ...(verdict === 'confirmed' ? { verificationTier: 'runtime_confirmed' as const } : {}),
+      outcome,
+      exchangeIds,
+      exchanges,
+      evidencePayload,
+      evidenceSha256,
+    }
+  } catch (err) {
+    return runnerHandleError(err, ctx, exchanges, exchangeIds, basePayload)
+  } finally {
+    await canarySession?.close()
   }
 }
