@@ -70,12 +70,13 @@ function ProjectPage() {
     }
   }
 
+  const allowlistCount = (project.sandboxWriteAllowlist ?? []).length
   const tabCounts: Partial<Record<ProjectTabId, number>> = {
     overview: runs.length,
     inventory: assets.length,
     personas: personas.length,
     sources: specs.length,
-    guardrails: (project.sandboxWriteAllowlist ?? []).length,
+    ...(allowlistCount > 0 ? { guardrails: allowlistCount } : {}),
   }
 
   return <main className="pw">
@@ -96,12 +97,6 @@ function ProjectPage() {
           </button>
         </div>
       </div>
-      <div className="pw-runline num" aria-label="Project summary metrics">
-        <span className="pw-rl"><b>{runs.length}</b> {runs.length === 1 ? 'run' : 'runs'}</span>
-        <span className="pw-rl"><b>{assets.length}</b> {assets.length === 1 ? 'host' : 'hosts'}</span>
-        <span className="pw-rl"><b>{personas.length}</b> {personas.length === 1 ? 'persona' : 'personas'}</span>
-        <span className="pw-rl"><b>{specs.length}</b> {specs.length === 1 ? 'repo/spec' : 'repos/specs'}</span>
-      </div>
     </header>
 
     <div className="pw-toolbar">
@@ -118,7 +113,7 @@ function ProjectPage() {
             onClick={() => selectTab(tab.id)}
           >
             <span>{tab.label}</span>
-            {typeof count === 'number' && count > 0 && <span className="ct num">{count}</span>}
+            {typeof count === 'number' && <span className="ct num">{count}</span>}
           </button>
         })}
       </nav>
