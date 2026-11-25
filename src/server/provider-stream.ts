@@ -1,5 +1,5 @@
 import type { ProviderSettings, RoleAffinity, ThinkingLevel } from '../domain.ts'
-import { redact } from './redact.ts'
+import { createEgressSanitizer, redactSecrets } from './egress-sanitizer.ts'
 import type { NamedSecret } from './redact.ts'
 
 type Fields = Record<string, unknown>
@@ -63,7 +63,6 @@ export interface StreamSanitizeOptions {
 
 const replacement = '[redacted]'
 const credentialField = /^(?:authorization|proxy-authorization|cookie|set-cookie|password|api[_-]?key|token|session[_-]?(?:id|key)|client[_-]?secret|service[_-]?role[_-]?key)$/i
-const rawCookieField = /^(?:cookie|set-cookie)$/i
 type FragmentMode = 'text' | 'json_args' | 'raw_args'
 const terminalEvents = new Set(['response.completed', 'response.incomplete', 'response.failed', 'message_stop', 'error'])
 const messageEvents = new Set([
@@ -89,8 +88,7 @@ function fields(value: unknown): Fields | undefined {
 }
 
 export function redactProviderText(value: string, key: string, secrets: readonly NamedSecret[] = []): string {
-  const withKey = key ? value.replaceAll(key, replacement) : value
-  return redact(withKey, secrets)
+  return createEgressSanitizer({ providerKey: key, secrets }).redactText(value, 'llm_context')
 }
 
 function fragment(owner: Fields | undefined, field: string): Fragment | undefined {
@@ -100,23 +98,11 @@ function fragment(owner: Fields | undefined, field: string): Fragment | undefine
 
 /**
  * Redacts only the exact provider API key and registered vault/persona secrets (including
- * URL-encoded and base64/base64url variants) without applying heuristic credential regexes.
- * Used for model tool-call arguments so legitimate scripts, canary tokens, and auth probes
- * containing parameter or variable names like `token`, `password`, or `secret` are not corrupted.
+ * URL-encoded, base64/base64url, JSON-escaped, and HTML-entity variants) via EgressSanitizer
+ * without applying heuristic credential regexes (H-25).
  */
 export function redactExactSecrets(value: string, key: string, secrets: readonly NamedSecret[] = []): string {
-  let out = key ? value.replaceAll(key, replacement) : value
-  for (const secret of secrets) {
-    if (!secret.value || secret.value.length < 4) continue
-    out = out.replaceAll(secret.value, secret.placeholder)
-    const encoded = encodeURIComponent(secret.value)
-    if (encoded !== secret.value && encoded.length >= 6) out = out.replaceAll(encoded, secret.placeholder)
-    const b64 = Buffer.from(secret.value, 'utf8').toString('base64')
-    if (b64 !== secret.value && b64.length >= 4) out = out.replaceAll(b64, secret.placeholder)
-    const b64url = Buffer.from(secret.value, 'utf8').toString('base64url')
-    if (b64url !== secret.value && b64url !== b64 && b64url.length >= 4) out = out.replaceAll(b64url, secret.placeholder)
-  }
-  return out
+  return redactSecrets(value, secrets, { providerKey: key })
 }
 
 function sanitizeToolArgumentValue(
@@ -124,15 +110,7 @@ function sanitizeToolArgumentValue(
   key: string,
   secrets: readonly NamedSecret[] = [],
 ): unknown {
-  if (typeof value === 'string') return redactExactSecrets(value, key, secrets)
-  if (Array.isArray(value)) return value.map(item => sanitizeToolArgumentValue(item, key, secrets))
-  const record = fields(value)
-  if (!record) return value
-  return Object.fromEntries(Object.entries(record).map(([name, item]) => {
-    const safeName = redactExactSecrets(name, key, secrets)
-    if (rawCookieField.test(name) && typeof item === 'string') return [safeName, replacement]
-    return [safeName, sanitizeToolArgumentValue(item, key, secrets)]
-  }))
+  return createEgressSanitizer({ providerKey: key, secrets }).sanitizeValue(value, 'llm_tool_args')
 }
 
 function redactArguments(value: string, key: string, secrets: readonly NamedSecret[]): string {

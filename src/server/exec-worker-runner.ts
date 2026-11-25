@@ -36,6 +36,7 @@ import {
 import { DERIVED_CAPABILITY_HANDLE_RE, type NegativeEdge } from './capability-ledger.ts'
 import { queryCves } from './cve-broker.ts'
 import { vaultScrubDescriptors, type DerivedCapabilityVault } from './derived-custody.ts'
+import { createEgressSanitizer } from './egress-sanitizer.ts'
 import {
   createProviderLlmCall,
   evaluateSubmissionDedupe,
@@ -762,6 +763,15 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         const cappedMax = requestedMax !== undefined ? Math.min(requestedMax, remainingReqs) : Math.min(defaultMax, remainingReqs)
         return { curRun, cleanOrigin, remainingReqs, cappedMax }
       }
+      const egressSecrets = (extra: readonly NamedSecret[] = []): NamedSecret[] => [
+        ...currentSecrets(),
+        ...(typeof this.broker.getRegisteredSecrets === 'function' ? this.broker.getRegisteredSecrets() : []),
+        ...extra,
+      ]
+      const workerEgress = createEgressSanitizer({
+        secrets: () => egressSecrets(),
+        capabilityVaults: () => [this.host.capabilityVaultFor(run.id)],
+      })
       const stageJsonArtifact = async (
         curRun: Run,
         kind: 'dns' | 'tls' | 'browser' | 'surface' | 'ws',
@@ -771,8 +781,15 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         signal: AbortSignal,
         secretsList: readonly NamedSecret[] = currentSecrets(),
       ) => {
-        const serialized = JSON.stringify(payload, null, 2)
-        const ev = this.storage.addArtifact(curRun, job.assignment, kind, title, serialized, undefined, secretsList)
+        const artifactEgress = createEgressSanitizer({
+          secrets: () => egressSecrets(secretsList),
+          capabilityVaults: () => [this.host.capabilityVaultFor(curRun.id)],
+        })
+        const sanitizedPayload = kind === 'browser'
+          ? artifactEgress.sanitizeBrowserResult(payload)
+          : artifactEgress.sanitizeValue(payload, 'worker_rpc')
+        const serialized = JSON.stringify(sanitizedPayload, null, 2)
+        const ev = this.storage.addArtifact(curRun, job.assignment, kind, title, serialized, undefined, egressSecrets(secretsList))
         const stagedPath = await session.stage(filename.replace('{id}', ev.id.slice(0, 8)), serialized, signal).catch(() => null)
         return { evidenceId: ev.id, stagedPath }
       }
@@ -844,7 +861,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               ...s,
               runId: curRun.id,
               assignmentId: job.assignment.id,
-              secrets: currentSecrets(),
+              secrets: egressSecrets(),
               onExchange: createExchangeRecorder(this.storage, () => curRun, job.assignment.id, currentSecrets, {
                 onSaved: (r, e, id) => {
                   trackPersonaResources(r, e, id)
@@ -855,13 +872,15 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             grant,
             signal,
           )
-          const summarized = visits.map(({ exchanges: _ex, ...rest }) => ({
-            ...rest,
-            domSnippet: rest.domSnippet.slice(0, 2000),
-          }))
+          const summarized = workerEgress.sanitizeBrowserResult(
+            visits.map(({ exchanges: _ex, ...rest }) => ({
+              ...rest,
+              domSnippet: rest.domSnippet.slice(0, 2000),
+            })),
+          )
           const ev = this.storage.addArtifact(curRun, job.assignment, 'browser',
             `Browser session (${steps.length} steps)`,
-            JSON.stringify(summarized, null, 2), undefined, currentSecrets())
+            JSON.stringify(summarized, null, 2), undefined, egressSecrets())
           return { evidenceId: ev.id, stepsCount: visits.length, visits: summarized }
         },
 
