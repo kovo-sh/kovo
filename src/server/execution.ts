@@ -1096,10 +1096,20 @@ export class Execution {
       return secrets
     }
     const allowLocalLab = project.environment === 'local-lab'
+    const readLiveMaxRpsPerOrigin = (): number => {
+      try {
+        return this.storage.run(run.id)?.maxRpsPerOrigin ?? run.maxRpsPerOrigin
+      } catch {
+        return run.maxRpsPerOrigin
+      }
+    }
 
     const grant: Grant = {
       tier: run.capabilityTier,
-      maxRpsPerOrigin: run.maxRpsPerOrigin,
+      get maxRpsPerOrigin() {
+        return readLiveMaxRpsPerOrigin()
+      },
+      getMaxRpsPerOrigin: readLiveMaxRpsPerOrigin,
       allowLocalLab,
       personas,
       secrets,
@@ -1191,14 +1201,46 @@ export class Execution {
         })) return true
         return false
       },
-      audit: (outcome, origin, status) => {
+      audit: (outcome, origin, status, meta) => {
         if (outcome === 'allowed') job.origins.add(origin)
         const ctrl = this.phaseBControllers.get(run.id)
         if (ctrl && outcome === 'observed' && typeof status === 'number') ctrl.recordTargetOutcome(status)
         if (ctrl && outcome === 'circuit_open') ctrl.recordPressure('target_503')
-        this.storage.event(run.id, 'broker.' + outcome,
-          `Broker ${outcome} for ${new URL(origin).hostname}${status ? ` (${status})` : ''}.`,
-          { assignmentId: job.assignment.id, origin, status })
+        let host = origin
+        try { host = new URL(origin).hostname } catch { /* keep raw origin */ }
+        const auditSecrets = currentSecrets()
+        const scrubMeta = (value: string | undefined, maxLen: number): string | undefined => {
+          if (typeof value !== 'string') return undefined
+          const cleaned = redact(value, auditSecrets).replace(/[\r\n\0]+/g, ' ').trim()
+          if (!cleaned) return undefined
+          return cleaned.length > maxLen ? `${cleaned.slice(0, maxLen)}…` : cleaned
+        }
+        const reason = scrubMeta(meta?.reason, 512)
+        const method = scrubMeta(meta?.method, 32)
+        const path = scrubMeta(meta?.path, 512)
+        const persona = scrubMeta(meta?.persona, 128)
+        let message = `Broker ${outcome} for ${host}${status ? ` (${status})` : ''}.`
+        if (outcome === 'denied' && (reason || method || path)) {
+          const targetPart = method && path
+            ? `${method} ${path} on ${host}`
+            : method
+              ? `${method} on ${host}`
+              : path
+                ? `${path} on ${host}`
+                : `for ${host}`
+          message = reason
+            ? `Broker denied ${targetPart} (${reason})`
+            : `Broker denied ${targetPart}.`
+        }
+        this.storage.event(run.id, 'broker.' + outcome, message, {
+          assignmentId: job.assignment.id,
+          origin,
+          status,
+          ...(reason !== undefined ? { reason } : {}),
+          ...(method !== undefined ? { method } : {}),
+          ...(path !== undefined ? { path } : {}),
+          ...(persona !== undefined ? { persona } : {}),
+        })
         if (outcome === 'circuit_open') {
           const fresh = this.storage.run(run.id)
           // A `circuit_open` audit also fires for *route-scoped* 5xx cooldowns (a single endpoint
