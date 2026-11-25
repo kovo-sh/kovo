@@ -61,7 +61,7 @@ import type {
   FindingProvenanceFields,
   ReportProvenanceSurface,
 } from '../report-summary.ts'
-import { matchesApprovedEndpointPattern, normalizeApprovalPathPattern } from './approval-judge.ts'
+import { matchesApprovedEndpointPattern, normalizeApprovalPathPattern } from './approval-pattern.ts'
 import type { ApprovalDecidedBy, ApprovalRiskLevel } from './approval-judge.ts'
 import { redact, redactZdrJsonValue } from './redact.ts'
 import type { NamedSecret } from './redact.ts'

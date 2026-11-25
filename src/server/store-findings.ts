@@ -35,7 +35,7 @@ import type {
   FindingProvenance,
   FindingVerificationClass,
 } from '../report-summary.ts'
-import { computeFindingFingerprint, isOriginWideCwe, normalizeEndpointTemplate } from './dedupe.ts'
+import { computeFindingFingerprint, isOriginWideCwe, normalizeEndpointTemplate } from './finding-fingerprint.ts'
 import { redact, redactHeaders, redactJsonValue } from './redact.ts'
 import type { NamedSecret, SecretMatch } from './redact.ts'
 import {
