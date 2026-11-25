@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { drizzle } from 'drizzle-orm/node-sqlite'
 import { purgeExpiredArtifacts } from './artifact-ttl.ts'
@@ -1423,6 +1423,11 @@ export class Store {
     try { this.client.close() } catch { /* ignore */ }
     try { this.processLock.exec('ROLLBACK') } catch { /* ignore */ }
     try { this.processLock.close() } catch { /* ignore */ }
+    const registry = (globalThis as Record<symbol, Map<string, Store> | undefined>)[STORE_SINGLETON_SYMBOL]
+    const resolvedDir = resolve(this.directory)
+    if (registry?.get(resolvedDir) === this) {
+      registry.delete(resolvedDir)
+    }
   }
 
   // --- Shared DbSession Facade ---
@@ -1732,7 +1737,25 @@ export async function deleteProjectWithActiveGuard(
   return result
 }
 
-let instance: Store | undefined
+const STORE_SINGLETON_SYMBOL = Symbol.for('kovo.storeSingleton')
+
+function getStoreRegistry(): Map<string, Store> {
+  const g = globalThis as Record<symbol, Map<string, Store> | undefined>
+  let registry = g[STORE_SINGLETON_SYMBOL]
+  if (!registry) {
+    registry = new Map<string, Store>()
+    g[STORE_SINGLETON_SYMBOL] = registry
+  }
+  return registry
+}
+
 export function store() {
-  return instance ??= new Store(dataDirectory())
+  const dir = resolve(dataDirectory())
+  const registry = getStoreRegistry()
+  let existing = registry.get(dir)
+  if (!existing) {
+    existing = new Store(dir)
+    registry.set(dir, existing)
+  }
+  return existing
 }
