@@ -182,6 +182,12 @@ async function readStreamWithIdleTimeout(
       registerActivityReset?.(armTimer)
       const onAbort = () => {
         if (timer) clearTimeout(timer)
+        const reason = signal.reason
+        rejectIdle?.(
+          reason instanceof Error
+            ? reason
+            : new Error(typeof reason === 'string' && reason ? reason : 'The model stream was aborted.'),
+        )
       }
       signal.addEventListener('abort', onAbort, { once: true })
       let next: ReadableStreamReadResult<Uint8Array>
@@ -251,76 +257,118 @@ function makeFetch(
       AbortSignal.timeout(totalTimeoutMs),
       ...(options.signal ? [options.signal] : []),
     ])
-    const connectSignal = AbortSignal.any([totalSignal, AbortSignal.timeout(firstEventTimeoutMs)])
-    const response = await fetch(beta ? endpoint + '?beta=true' : endpoint, {
-      method: 'POST',
-      headers,
-      body: raw,
-      redirect: 'error',
-      signal: connectSignal,
-    })
-
-    const contentType = response.headers.get('content-type') ?? 'application/json'
-    const recordResponse = options.record && ((body: string) => options.record!({
-      scenario,
-      endpoint: redactProviderText(new URL(endpoint).pathname, settings.key, secrets),
-      request: sanitizeProviderValue(payload, settings.key, undefined, secrets) as Record<string, unknown>,
-      status: response.status,
-      contentType: redactProviderText(contentType, settings.key, secrets),
-      body,
-    }))
-
-    if (!response.ok) {
-      const errText = await response.text().catch(() => '')
-      const effectiveStatus = response.status === 429 && isQuotaBody(errText) ? 402 : response.status
-      const message = effectiveStatus === 401 || effectiveStatus === 403
-        ? 'The provider rejected the API key.'
-        : effectiveStatus === 402
-          ? 'The provider quota or credit balance was exhausted.'
-          : effectiveStatus === 404
-            ? 'The provider endpoint or model was not found.'
-            : effectiveStatus === 429
-              ? 'The provider rate limit was reached.'
-              : `The model provider returned HTTP ${effectiveStatus}.`
-      const error = JSON.stringify({ error: { message } })
-      recordResponse?.(error)
-      return new Response(error, { status: effectiveStatus, headers: { 'content-type': 'application/json' } })
-    }
-
-    if (!response.body || !contentType.toLowerCase().includes('text/event-stream')) {
-      await response.body?.cancel()
-      throw new Error('The provider did not return a streaming response.')
-    }
-
-    let resetIdleTimer: () => void = () => undefined
-    const sanitized = sanitizeProviderStream(response.body, settings.key, settings.protocol, {
-      secrets,
-      responseLimit,
-      onActivity: () => {
-        resetIdleTimer()
-        options.onStreamActivity?.()
-      },
-    })
-    const text = await readStreamWithIdleTimeout(sanitized, idleTimeoutMs, totalSignal, reset => {
-      resetIdleTimer = reset
-    })
-    recordResponse?.(text)
-
-    if (options.onUsage) {
-      const usage = extractUsageFromSse(text, settings.protocol)
-      if (usage.inputTokens > 0 || usage.outputTokens > 0) {
-        options.onUsage({
-          ...usage,
-          costUsd: estimateCostUsd(settings, usage.inputTokens, usage.outputTokens, usage.cachedInputTokens),
-          profileId,
-        })
+    const firstEventController = new AbortController()
+    const firstEventTimeoutError = () => new Error('The model provider timed out before returning the first event.')
+    let firstEventCleared = false
+    let firstEventTimer: ReturnType<typeof setTimeout> | undefined
+    const clearFirstEventTimer = () => {
+      if (firstEventCleared) return
+      firstEventCleared = true
+      if (firstEventTimer) {
+        clearTimeout(firstEventTimer)
+        firstEventTimer = undefined
       }
     }
+    if (Number.isFinite(firstEventTimeoutMs) && firstEventTimeoutMs > 0) {
+      firstEventTimer = setTimeout(() => {
+        if (!firstEventCleared) {
+          firstEventController.abort(firstEventTimeoutError())
+        }
+      }, firstEventTimeoutMs)
+      firstEventTimer.unref?.()
+    }
+    const onTotalAbort = () => clearFirstEventTimer()
+    totalSignal.addEventListener('abort', onTotalAbort, { once: true })
+    // Enforce firstEventTimeoutMs ONLY until the first chunk/event arrives (disarmed via
+    // clearFirstEventTimer), so healthy multi-chunk streams are never aborted mid-body.
+    const fetchSignal = AbortSignal.any([totalSignal, firstEventController.signal])
 
-    return new Response(text, {
-      status: response.status,
-      headers: { 'content-type': 'text/event-stream' },
-    })
+    try {
+      const response = await fetch(beta ? endpoint + '?beta=true' : endpoint, {
+        method: 'POST',
+        headers,
+        body: raw,
+        redirect: 'error',
+        signal: fetchSignal,
+      })
+
+      const contentType = response.headers.get('content-type') ?? 'application/json'
+      const recordResponse = options.record && ((body: string) => options.record!({
+        scenario,
+        endpoint: redactProviderText(new URL(endpoint).pathname, settings.key, secrets),
+        request: sanitizeProviderValue(payload, settings.key, undefined, secrets) as Record<string, unknown>,
+        status: response.status,
+        contentType: redactProviderText(contentType, settings.key, secrets),
+        body,
+      }))
+
+      if (!response.ok) {
+        clearFirstEventTimer()
+        const errText = await response.text().catch(() => '')
+        const effectiveStatus = response.status === 429 && isQuotaBody(errText) ? 402 : response.status
+        const message = effectiveStatus === 401 || effectiveStatus === 403
+          ? 'The provider rejected the API key.'
+          : effectiveStatus === 402
+            ? 'The provider quota or credit balance was exhausted.'
+            : effectiveStatus === 404
+              ? 'The provider endpoint or model was not found.'
+              : effectiveStatus === 429
+                ? 'The provider rate limit was reached.'
+                : `The model provider returned HTTP ${effectiveStatus}.`
+        const error = JSON.stringify({ error: { message } })
+        recordResponse?.(error)
+        return new Response(error, { status: effectiveStatus, headers: { 'content-type': 'application/json' } })
+      }
+
+      if (!response.body || !contentType.toLowerCase().includes('text/event-stream')) {
+        clearFirstEventTimer()
+        await response.body?.cancel()
+        throw new Error('The provider did not return a streaming response.')
+      }
+
+      let resetIdleTimer: () => void = () => undefined
+      const sanitized = sanitizeProviderStream(response.body, settings.key, settings.protocol, {
+        secrets,
+        responseLimit,
+        onFirstChunk: clearFirstEventTimer,
+        onActivity: () => {
+          clearFirstEventTimer()
+          resetIdleTimer()
+          options.onStreamActivity?.()
+        },
+      })
+      const text = await readStreamWithIdleTimeout(sanitized, idleTimeoutMs, fetchSignal, reset => {
+        resetIdleTimer = reset
+      })
+      clearFirstEventTimer()
+      recordResponse?.(text)
+
+      if (options.onUsage) {
+        const usage = extractUsageFromSse(text, settings.protocol)
+        if (usage.inputTokens > 0 || usage.outputTokens > 0) {
+          options.onUsage({
+            ...usage,
+            costUsd: estimateCostUsd(settings, usage.inputTokens, usage.outputTokens, usage.cachedInputTokens),
+            profileId,
+          })
+        }
+      }
+
+      return new Response(text, {
+        status: response.status,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    } catch (error) {
+      if (firstEventController.signal.aborted && !totalSignal.aborted) {
+        throw firstEventController.signal.reason instanceof Error
+          ? firstEventController.signal.reason
+          : firstEventTimeoutError()
+      }
+      throw error
+    } finally {
+      clearFirstEventTimer()
+      totalSignal.removeEventListener('abort', onTotalAbort)
+    }
   }
   return send
 }
@@ -436,6 +484,9 @@ export function provider(
 let rrCounter = 0
 
 export function classifyFailoverError(message: string): { failover: boolean; hard: boolean } {
+  if (/aborted due to timeout/i.test(message)) {
+    return { failover: true, hard: false }
+  }
   if (/aborted|cancelled|canceled|budget|exceeded Kovo Hunter’s size limit|Unexpected model endpoint/i.test(message)) {
     return { failover: false, hard: false }
   }
