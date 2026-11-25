@@ -20,8 +20,32 @@ import {
 } from '../domain.ts'
 import { declarativeReplaySpecSchema, replaySpecOrigins, type AgentScriptProofEnvelope, type DeclarativeReplaySpec } from '../replay-spec.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
-import { BrokerDenied, type BrokerExchangeResult, type Grant } from './broker.ts'
+import { BrokerDenied, type BrokerExchangeResult, type Grant, type RequestBroker } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
+import {
+  ALWAYS_QUARANTINED_KINDS,
+  DERIVED_CAPABILITY_HANDLE_RE,
+  computeArtifactDigest,
+  formatDerivedCapabilityHandle,
+  type CapabilityKind,
+  type CapabilityLedger,
+  type CapabilitySurface,
+  type CausalEdgeBindingKind,
+} from './capability-ledger.ts'
+import {
+  compositeProofReceiptSchema,
+  type CompositeProofReceipt,
+  type CompositeReceiptVerification,
+  type CompositeVerifyOptions,
+  type HostSignedTranscript,
+} from './composite-receipt.ts'
+import {
+  DerivedCapabilityVault,
+  scrubDerivedSecrets,
+  vaultScrubDescriptors,
+  type DerivedCapabilityMeta,
+  type DerivedSecretKind,
+} from './derived-custody.ts'
 import { checkCoverage, readComparisons, verificationCommand, type EvidenceReview } from './evidence-checks.ts'
 import type { ExecBoardManager } from './exec-board.ts'
 import {
@@ -35,15 +59,22 @@ import {
   type ExecReviewInput,
   type ExecTier3ApprovalInput,
 } from './exec-exchange.ts'
-import { alignClaimClass } from './oracle-invariants.ts'
-import { buildOobReceipt, verifyReceipt, type ReceiptOobEvent } from './proof-receipt.ts'
+import { alignClaimClass, parseRoleLabel } from './oracle-invariants.ts'
+import {
+  buildAgentScriptReceipt,
+  buildOobReceipt,
+  verifyReceipt,
+  type ProofReceipt,
+  type ReceiptOobEvent,
+  type ReceiptVerification,
+  type ScriptProofExchange,
+} from './proof-receipt.ts'
 import { BudgetExceededError } from './provider.ts'
 import { redact, redactJsonValue, type NamedSecret } from './redact.ts'
 import {
   buildInlineVerifyFeedback,
   persistedAgentScriptOf,
   retestReplaySpec,
-  runAgentScriptProof,
   verifyReplaySpec,
   verifyReplaySpecInline,
   type AgentScriptProofResult,
@@ -60,7 +91,15 @@ import {
   type Run,
   type Store,
 } from './store.ts'
-import { LinuxWorkerBackend } from './worker-backend.ts'
+import {
+  TranscriptStore,
+  VerifyRpcServer,
+  verifyScript,
+  type VerifyAttemptSession,
+  type VerifyTranscriptRecord,
+  type VerifyVerdict,
+} from './verify-rpc.ts'
+import { LinuxWorkerBackend, type WorkerBackend } from './worker-backend.ts'
 
 type Active = ExecActiveJob
 type Capture = ExecCapture
@@ -83,6 +122,8 @@ export interface ExecVerifyHost extends ExecCoreServices {
   completeWorker: (worker: Assignment, run: Run, outcome: string, evidenceIds: string[], checks?: CheckCoverage[], secrets?: readonly NamedSecret[]) => void
   recordSpecVerification: (runId: string, specId: string, feedback: InlineVerifyFeedback, summary: string) => void
   resolveInlineVerdictRow: (runId: string, findingRow: typeof findings.$inferSelect | undefined) => typeof findings.$inferSelect | undefined
+  /** Shared run-scoped Layer-1 DerivedCapabilityVault across all VerifyRpcServer worker sessions. */
+  capabilityVaultFor?: (runId: string) => DerivedCapabilityVault
 }
 
 
@@ -343,13 +384,58 @@ export function agentProofAttribution(vulnClass: string): {
       remediation: 'Serialize the state transition (unique constraint, lock, or idempotency key).',
     }
   }
-  if (/^(?:business_logic|invariant_violation|workflow_skip)$/.test(key)) {
+  if (/^(?:business_logic|invariant_violation|workflow_skip|economic_conservation)$/.test(key)) {
     return {
       label: 'business-logic invariant violation',
       cwe: 'CWE-840',
       category: 'business-logic-race',
-      impact: 'A workflow invariant was violated by replaying or skipping a legitimate step.',
-      remediation: 'Enforce the invariant server-side and re-validate workflow state on every transition.',
+      impact: 'A workflow or conservation invariant was violated by a multi-step sequence.',
+      remediation: 'Enforce the invariant server-side atomically and re-validate workflow state on every transition.',
+    }
+  }
+  if (/^dual_tenant_abac$/.test(key)) {
+    return {
+      label: 'cross-tenant ABAC authorization bypass',
+      cwe: 'CWE-639',
+      category: 'broken-access-control',
+      impact: 'An actor crossed a multi-tenant or role-matrix authorization boundary via a chained sequence.',
+      remediation: 'Enforce tenant and object-level authorization invariants uniformly on every read, batch, and mutation path.',
+    }
+  }
+  if (/^temporal_revocation$/.test(key)) {
+    return {
+      label: 'stale or revoked credential acceptance',
+      cwe: 'CWE-613',
+      category: 'auth-identity',
+      impact: 'A revoked or demoted credential remained honored on a secondary surface after primary revocation.',
+      remediation: 'Propagate session/token revocation synchronously across every primary, streaming, and async surface.',
+    }
+  }
+  if (/^cryptographic_scope_replay$/.test(key)) {
+    return {
+      label: 'cryptographic scope replay / signature forgery',
+      cwe: 'CWE-347',
+      category: 'auth-identity',
+      impact: 'A signed token or webhook signature was forged or replayed across tenant or scope boundaries.',
+      remediation: 'Keep signing material strictly private and bind signatures to tenant, audience, and action scope.',
+    }
+  }
+  if (/^parser_cache_differential$/.test(key)) {
+    return {
+      label: 'parser / cache differential boundary bypass',
+      cwe: 'CWE-444',
+      category: 'misconfig-exposure',
+      impact: 'A parser or cache key differential between surfaces bypassed access or tenant isolation.',
+      remediation: 'Normalize parsing across layers and key shared caches by tenant and authenticated identity.',
+    }
+  }
+  if (/^cross_surface_pivot$/.test(key)) {
+    return {
+      label: 'cross-surface multi-hop privilege pivot',
+      cwe: 'CWE-918',
+      category: 'ssrf-redirects',
+      impact: 'An attacker-origin chain pivoted across application surfaces to reach a protected internal or privileged action.',
+      remediation: 'Enforce strict authentication, allowlists, and provenance checks at every cross-service and async boundary.',
     }
   }
   return {
@@ -414,7 +500,7 @@ function receiptFindingTemplate(vulnClass: 'ssrf' | 'xxe', origin: string, param
 }
 
 function serializeProofReceiptRow(
-  pair: { receipt: import('./proof-receipt.ts').ProofReceipt; verification: import('./proof-receipt.ts').ReceiptVerification },
+  pair: { receipt: ProofReceipt; verification: ReceiptVerification },
 ): ReplayProofReceiptRow {
   const { receipt, verification } = pair
   return {
@@ -442,7 +528,917 @@ function serializeProofReceiptRow(
   }
 }
 
+// --- v8 Layer-1 Vault, CompositeProofReceipt & CapabilityLedger Wiring ------
+
+export interface V8CompositeProofBundle {
+  receipt: CompositeProofReceipt
+  verification: CompositeReceiptVerification
+  hopActors: Record<string, string | null>
+}
+
+export interface V8AgentScriptProofParams {
+  script: string
+  runtime: 'ts' | 'python'
+  title?: string
+  broker: RequestBroker
+  grant: Grant
+  backend: WorkerBackend
+  runId: string
+  assignmentId: string
+  targetOrigins: readonly string[]
+  signal: AbortSignal
+  timeoutMs?: number
+  canaryBroker?: CanaryBroker
+  /** Shared per-run Layer-1 DerivedCapabilityVault across worker sessions. */
+  capabilityVault?: DerivedCapabilityVault
+  /** Host-enforced composite receipt verification options. */
+  compositeVerifyOptions?: Omit<CompositeVerifyOptions, 'signingKey'>
+}
+
+export interface V8AgentScriptProofResult extends AgentScriptProofResult {
+  compositeReceipt: V8CompositeProofBundle | null
+  sealedCapabilities: DerivedCapabilityMeta[]
+  transcriptRecords: VerifyTranscriptRecord[]
+  hostTranscript: HostSignedTranscript | null
+}
+
+export interface SyncVerifyArtifactsResult {
+  sealedCapabilities: Array<{
+    handle: string
+    kind: string
+    sha256Prefix: string
+    derivedFromCapabilityId?: string
+  }>
+  verifiedHops: Array<{
+    hopReceiptId: string
+    edgeId: string
+    binding: CausalEdgeBindingKind
+    postconditionCapId: string | null
+    terminalImpact: string | null
+  }>
+  newCapabilityCount: number
+  newEdgeCount: number
+}
+
+function safeVaultRunId(runId: string): string {
+  return /^[A-Za-z0-9._-]{1,128}$/.test(runId)
+    ? runId
+    : runId.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 128) || 'run'
+}
+
+const REDACTED_CAP_PLACEHOLDER_RE = /^\[redacted:(cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+)\]$/
+const guardedVaults = new WeakSet<DerivedCapabilityVault>()
+
+/**
+ * Prevent double-run / cross-worker re-sealing from overwriting a real derived secret with its own
+ * Layer-1 redaction placeholder (`[redacted:cap:hop_<id>:<slot>]`). When a second attempt extracts
+ * an already-scrubbed secret from a broker response, return the active vault metadata directly so
+ * host-side crypto/injection keeps using the real secret without ever leaking it.
+ */
+function guardVaultAgainstPlaceholderReseal(vault: DerivedCapabilityVault): DerivedCapabilityVault {
+  if (guardedVaults.has(vault)) return vault
+  guardedVaults.add(vault)
+  const origSeal = vault.seal.bind(vault)
+  vault.seal = (input) => {
+    const match = typeof input.rawValue === 'string'
+      ? REDACTED_CAP_PLACEHOLDER_RE.exec(input.rawValue.trim())
+      : null
+    if (match?.[1]) {
+      const existing = vault.getMeta(match[1])
+      if (existing && vault.hasActive(existing.handle)) {
+        return existing
+      }
+    }
+    return origSeal(input)
+  }
+  return vault
+}
+
+function mapDerivedSecretKindToCapabilityKind(kind: DerivedSecretKind): CapabilityKind {
+  switch (kind) {
+    case 'cookie':
+    case 'oidc_assertion':
+      return 'identity_session'
+    case 'signing_salt':
+    case 'hmac_key':
+      return 'signing_material'
+    case 'signed_url':
+      return 'signed_artifact_or_url'
+    case 'bearer_token':
+    case 'api_token':
+    case 'jwt':
+    case 'header_secret':
+      return 'scoped_token'
+    default:
+      return 'state_handle'
+  }
+}
+
+function mapTranscriptOpToSurface(op: VerifyTranscriptRecord['op']): CapabilitySurface {
+  if (op === 'browser') return 'browser'
+  if (op === 'async_poll') return 'async_job'
+  return 'http'
+}
+
+function normalizeLedgerCapHandle(meta: Pick<DerivedCapabilityMeta, 'handle' | 'hopReceiptId' | 'slot'>): string {
+  if (DERIVED_CAPABILITY_HANDLE_RE.test(meta.handle)) return meta.handle
+  const safeHop = meta.hopReceiptId.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[^A-Za-z0-9]+/, 'h').slice(0, 40)
+    || createHash('sha256').update(meta.hopReceiptId).digest('hex').slice(0, 16)
+  const safeSlot = meta.slot.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[^A-Za-z0-9]+/, 's').slice(0, 40) || 'slot'
+  return formatDerivedCapabilityHandle(safeHop, safeSlot)
+}
+
+function extractHopActors(
+  receipt: CompositeProofReceipt,
+  transcript: HostSignedTranscript,
+): Record<string, string | null> {
+  const byId = new Map((transcript.entries ?? []).map(entry => [entry.exchangeId, entry]))
+  const actors: Record<string, string | null> = {}
+  for (const hop of receipt.hops) {
+    let persona: string | null = null
+    for (const exId of hop.exchangeIds) {
+      const entry = byId.get(exId)
+      if (entry?.actorPersona) { persona = entry.actorPersona; break }
+      if (entry?.step.actor.handle) { persona = entry.step.actor.handle; break }
+    }
+    actors[hop.hopId] = persona
+  }
+  return actors
+}
+
+function transcriptToScriptExchanges(
+  transcript: TranscriptStore,
+  vault: DerivedCapabilityVault,
+): ScriptProofExchange[] {
+  return transcript.list().flatMap(record => {
+    if (record.op === 'oob' || record.op === 'browser') return []
+    const request = record.request
+    if (!request) return []
+    const rawBody = transcript.body(record.exchangeId)
+    const body = rawBody !== undefined ? scrubDerivedSecrets(rawBody, vault) : undefined
+    return [{
+      exchangeId: record.exchangeId,
+      op: record.op,
+      method: request.method,
+      pathAndQuery: request.pathAndQuery,
+      origin: request.origin,
+      status: record.response?.status ?? null,
+      durationMs: record.durationMs,
+      personaHandle: request.personaHandle ?? null,
+      sessionRole: request.sessionRole ?? null,
+      actorRoleLabel: request.actorRoleLabel ?? null,
+      ...(body !== undefined ? { body } : {}),
+      requestHeaders: request.headers ?? null,
+      responseHeaders: record.response?.headers ?? null,
+    }]
+  })
+}
+
+function serializeCompositeProofReceiptRow(
+  bundle: V8CompositeProofBundle,
+  singlePair?: { receipt: ProofReceipt; verification: ReceiptVerification } | null,
+): ReplayProofReceiptRow & {
+  compositeReceipt: CompositeProofReceipt
+  compositeVerification: CompositeReceiptVerification
+  hopActors: Record<string, string | null>
+} {
+  const { receipt: comp, verification: compVer, hopActors } = bundle
+  const terminalHop = comp.hops.find(h => h.hopId === comp.terminalImpact.terminalHopId) ?? comp.hops[comp.hops.length - 1]!
+  const allExchangeIds = [...new Set([
+    ...comp.hops.flatMap(h => h.exchangeIds),
+    ...comp.terminalImpact.preChainControlExchangeIds,
+    ...comp.terminalImpact.postChainReadbackExchangeIds,
+  ])].slice(0, 64)
+  const base: ReplayProofReceiptRow = singlePair
+    ? serializeProofReceiptRow(singlePair)
+    : {
+        receipt: {
+          vulnClass: comp.terminalVulnClass,
+          target: {
+            origin: terminalHop.target.origin,
+            ...(terminalHop.target.method ? { method: terminalHop.target.method } : {}),
+            ...(terminalHop.target.pathAndQuery ? { pathAndQuery: terminalHop.target.pathAndQuery } : {}),
+            ...(terminalHop.target.param ? { param: terminalHop.target.param } : {}),
+          },
+          exchangeIds: allExchangeIds,
+          oobEventIds: [...new Set(comp.hops.flatMap(h => h.oobEventIds))].slice(0, 16),
+          browserTraceIds: [...new Set(comp.hops.flatMap(h => h.browserTraceIds))].slice(0, 16),
+          claimedDelta: comp.terminalImpact.claimedImpact,
+        },
+        verification: {
+          confirmed: compVer.confirmed,
+          vulnClass: compVer.terminalVulnClass,
+          rule: `composite:${compVer.replayMode}`,
+          reason: compVer.reason,
+          observed: `${compVer.hopCount}-hop CompositeProofReceipt (${compVer.verifiedEdges.length} verified causal edges)`,
+          expected: 'every hop and causal edge verifies over host-signed transcripts with attacker-origin provenance',
+        },
+      }
+  return {
+    ...base,
+    compositeReceipt: comp,
+    compositeVerification: compVer,
+    hopActors,
+  }
+}
+
+/**
+ * Run a Layer-3 `guardian_verify` script with a shared run-scoped `DerivedCapabilityVault`,
+ * capturing both single-hop `ProofReceipt`s and multi-hop `CompositeProofReceipt`s as well as
+ * any newly sealed Layer-1 capabilities for `CapabilityLedger` persistence.
+ */
+export async function runV8AgentScriptProof(params: V8AgentScriptProofParams): Promise<V8AgentScriptProofResult> {
+  const code = params.script.trim()
+  if (!code) throw new Error('An agent proof script is required.')
+  if (Buffer.byteLength(code) > 64 * 1024) throw new Error('The agent proof script exceeds the 64 KiB limit.')
+
+  const vault = guardVaultAgainstPlaceholderReseal(
+    params.capabilityVault ?? new DerivedCapabilityVault({ runId: safeVaultRunId(params.runId) }),
+  )
+  const handlesBefore = new Set(vault.list().map(meta => meta.handle))
+
+  type AttemptCapture = {
+    claims: Record<string, unknown>[]
+    transcript: TranscriptStore
+    hostTranscript: HostSignedTranscript | null
+    composites: V8CompositeProofBundle[]
+    title: string | null
+    severity: string | null
+    description: string | null
+  }
+  const attempts = new Map<1 | 2, AttemptCapture>()
+
+  const openAttempt = async (input: { attempt: 1 | 2; nonce: string }): Promise<VerifyAttemptSession> => {
+    const server = new VerifyRpcServer({
+      broker: params.broker,
+      grant: params.grant,
+      runId: params.runId,
+      assignmentId: params.assignmentId,
+      nonce: input.nonce,
+      targetOrigins: [...params.targetOrigins],
+      capabilityVault: vault,
+      ...(params.canaryBroker ? { canary: params.canaryBroker } : {}),
+      ...(params.compositeVerifyOptions ? { compositeVerifyOptions: params.compositeVerifyOptions } : {}),
+    })
+    const attemptComposites: V8CompositeProofBundle[] = []
+    const origVerifyComposite = server.verifyComposite.bind(server)
+    server.verifyComposite = (rawReceipt: unknown, options?: Omit<CompositeVerifyOptions, 'signingKey'>) => {
+      const verification = origVerifyComposite(rawReceipt, options)
+      const parsed = compositeProofReceiptSchema.safeParse(rawReceipt)
+      if (parsed.success) {
+        const hostTranscript = server.buildHostSignedTranscript()
+        attemptComposites.push({
+          receipt: parsed.data,
+          verification,
+          hopActors: extractHopActors(parsed.data, hostTranscript),
+        })
+      }
+      return verification
+    }
+
+    await server.start()
+    let session: Awaited<ReturnType<WorkerBackend['openSession']>>
+    try {
+      session = await params.backend.openSession(
+        `${params.assignmentId}-verify-${input.attempt}`,
+        params.signal,
+        { rpcMountDir: server.hostDir },
+      )
+    } catch (error) {
+      await server.close().catch(() => undefined)
+      throw error
+    }
+    const verify = session.verifyScript
+    if (!verify) {
+      await session.close().catch(() => undefined)
+      await server.close().catch(() => undefined)
+      throw new Error('This worker backend cannot execute Layer-3 verification scripts.')
+    }
+    return {
+      nonce: input.nonce,
+      transcript: server.transcript,
+      async execute(candidate, signal) {
+        const execution = await verify({
+          runtime: candidate.runtime,
+          code: candidate.code,
+          nonce: input.nonce,
+          ...(params.timeoutMs ? { timeoutMs: params.timeoutMs } : {}),
+        }, signal)
+        const resObj = execution.result && typeof execution.result === 'object' && !Array.isArray(execution.result)
+          ? execution.result as Record<string, unknown>
+          : {}
+        // If the script returned a composite receipt in its result without invoking the RPC directly,
+        // still verify it strictly host-side via server.verifyComposite (never trust script output).
+        if (attemptComposites.length === 0) {
+          const directComposite = resObj.compositeReceipt ?? resObj.compositeProofReceipt
+          if (directComposite && typeof directComposite === 'object') {
+            server.verifyComposite(directComposite)
+          }
+        }
+        const claims = Array.isArray(resObj.claims)
+          ? resObj.claims.filter((c): c is Record<string, unknown> => Boolean(c) && typeof c === 'object' && !Array.isArray(c))
+          : []
+        attempts.set(input.attempt, {
+          claims,
+          transcript: server.transcript,
+          hostTranscript: server.buildHostSignedTranscript(),
+          composites: [...attemptComposites],
+          title: typeof resObj.title === 'string' && resObj.title.trim() ? resObj.title.trim() : null,
+          severity: typeof resObj.severity === 'string' && resObj.severity.trim() ? resObj.severity.trim() : null,
+          description: typeof resObj.description === 'string' && resObj.description.trim() ? resObj.description.trim() : null,
+        })
+        return {
+          result: execution.result,
+          stdout: execution.stdout,
+          stderr: execution.stderr,
+          exitCode: execution.exitCode,
+          durationMs: execution.durationMs,
+          timedOut: execution.timedOut,
+        }
+      },
+      async close() {
+        await session.close().catch(() => undefined)
+        await server.close().catch(() => undefined)
+      },
+    }
+  }
+
+  const verdict = await verifyScript({
+    candidate: { name: `agent-proof-${params.runId}.${params.runtime === 'python' ? 'py' : 'ts'}`, runtime: params.runtime, code },
+    openAttempt,
+    signal: params.signal,
+  })
+  const transcriptDigests = verdict.attempts.map(attempt => attempt.transcriptDigest).filter(Boolean)
+
+  // Collect newly sealed capabilities from the shared vault plus any handles touched in transcripts.
+  const latestCapture = attempts.get(2) ?? attempts.get(1) ?? null
+  const transcriptRecords = latestCapture?.transcript.list() ?? []
+  const hostTranscript = latestCapture?.hostTranscript ?? null
+  const touchedHandles = new Set<string>()
+  for (const cap of attempts.values()) {
+    for (const rec of cap.transcript.list()) {
+      if (rec.artifact?.capabilityHandle) touchedHandles.add(rec.artifact.capabilityHandle)
+      if (rec.artifact?.derivedCapabilityId) touchedHandles.add(rec.artifact.derivedCapabilityId)
+    }
+  }
+  const sealedCapabilities = vault.list().filter(
+    meta => !handlesBefore.has(meta.handle) || touchedHandles.has(meta.handle),
+  )
+
+  // Check if both fresh sessions produced a host-verified CompositeProofReceipt.
+  const a1 = attempts.get(1)
+  const a2 = attempts.get(2)
+  const r1 = verdict.attempts[0]
+  const r2 = verdict.attempts[1]
+  const confirmedComp1 = a1?.composites.find(c => c.verification.confirmed) ?? null
+  const confirmedComp2 = a2?.composites.find(c => c.verification.confirmed) ?? null
+  const sessionsClean = Boolean(
+    r1 && r2
+    && r1.nonce !== r2.nonce
+    && !r1.nonceMismatch && !r2.nonceMismatch
+    && r1.exitCode === 0 && r2.exitCode === 0
+    && r1.signaturesValid && r2.signaturesValid,
+  )
+
+  if (sessionsClean && confirmedComp1 && confirmedComp2) {
+    const agrees = confirmedComp1.receipt.chainId === confirmedComp2.receipt.chainId
+      && confirmedComp1.receipt.terminalVulnClass === confirmedComp2.receipt.terminalVulnClass
+      && confirmedComp1.receipt.hops.length === confirmedComp2.receipt.hops.length
+    const chosenCapture = a2 ?? a1!
+    const chosenComposite = confirmedComp2
+    const exchanges = transcriptToScriptExchanges(chosenCapture.transcript, vault)
+    const attribution = {
+      claimTitle: chosenCapture.title ?? verdict.claimTitle ?? params.title?.trim() ?? `${chosenComposite.receipt.terminalVulnClass} multi-hop chain`,
+      severity: chosenCapture.severity,
+      description: chosenCapture.description,
+    }
+    if (!agrees) {
+      return {
+        verdict: {
+          ...verdict,
+          confirmed: false,
+          reason: 'transcript_mismatch',
+          rejectedBy: 'composite_receipt',
+          detail: `Both fresh runs verified CompositeProofReceipt, but they disagreed on chain identity (${confirmedComp1.receipt.chainId}/${confirmedComp1.receipt.terminalVulnClass} vs ${confirmedComp2.receipt.chainId}/${confirmedComp2.receipt.terminalVulnClass}).`,
+        },
+        exchanges,
+        receipt: null,
+        compositeReceipt: chosenComposite,
+        vulnClass: null,
+        transcriptDigests,
+        sealedCapabilities,
+        transcriptRecords,
+        hostTranscript,
+        ...attribution,
+      }
+    }
+    const compositeVerdict: VerifyVerdict = {
+      ...verdict,
+      confirmed: true,
+      reason: 'confirmed',
+      rejectedBy: null,
+      missingEvidence: [],
+      disagreements: [],
+      claimTitle: attribution.claimTitle,
+      detail: `Both fresh runs confirmed ${chosenComposite.receipt.hops.length}-hop CompositeProofReceipt (${chosenComposite.receipt.chainId}, ${chosenComposite.receipt.terminalVulnClass}, ${chosenComposite.verification.verifiedEdges.length} verified edge(s)).`,
+      attempts: verdict.attempts.map(att => ({
+        ...att,
+        oraclePassed: true,
+        failures: [],
+        rejectedBy: null,
+        missingEvidence: [],
+      })),
+    }
+    return {
+      verdict: compositeVerdict,
+      exchanges,
+      receipt: null,
+      compositeReceipt: chosenComposite,
+      vulnClass: chosenComposite.receipt.terminalVulnClass,
+      transcriptDigests,
+      sealedCapabilities,
+      transcriptRecords,
+      hostTranscript,
+      ...attribution,
+    }
+  }
+
+  // If a CompositeProofReceipt was submitted and rejected by host verification, fail closed cleanly.
+  const rejectedComposite = a2?.composites.find(c => !c.verification.confirmed)
+    ?? a1?.composites.find(c => !c.verification.confirmed)
+    ?? null
+  if (!verdict.confirmed && rejectedComposite) {
+    const capture = a2 ?? a1
+    const exchanges = capture ? transcriptToScriptExchanges(capture.transcript, vault) : []
+    return {
+      verdict: {
+        ...verdict,
+        confirmed: false,
+        reason: 'oracle_failed',
+        rejectedBy: 'composite_receipt',
+        detail: `CompositeProofReceipt rejected at stage '${rejectedComposite.verification.failedStage ?? 'unknown'}': ${rejectedComposite.verification.reason}`,
+      },
+      exchanges,
+      receipt: null,
+      compositeReceipt: rejectedComposite,
+      vulnClass: null,
+      transcriptDigests,
+      sealedCapabilities,
+      transcriptRecords,
+      hostTranscript,
+      claimTitle: capture?.title ?? verdict.claimTitle ?? null,
+      severity: capture?.severity ?? null,
+      description: capture?.description ?? null,
+    }
+  }
+
+  // Standard single-hop ProofReceipt path (100% parity with v7 runAgentScriptProof).
+  const passing = verdict.confirmed
+    ? [...attempts.entries()]
+        .sort((a, b) => b[0] - a[0])
+        .find(([, captured]) => captured.transcript.size > 0)
+    : undefined
+  if (!passing) {
+    return {
+      verdict,
+      exchanges: latestCapture ? transcriptToScriptExchanges(latestCapture.transcript, vault) : [],
+      receipt: null,
+      compositeReceipt: null,
+      vulnClass: null,
+      transcriptDigests,
+      sealedCapabilities,
+      transcriptRecords,
+      hostTranscript,
+      claimTitle: latestCapture?.title ?? verdict.claimTitle ?? null,
+      severity: latestCapture?.severity ?? null,
+      description: latestCapture?.description ?? null,
+    }
+  }
+  const captured = passing[1]
+  const attribution = {
+    claimTitle: captured.title ?? verdict.claimTitle ?? null,
+    severity: captured.severity,
+    description: captured.description,
+  }
+  const exchanges = transcriptToScriptExchanges(captured.transcript, vault)
+  const origin = exchanges.find(exchange => exchange.sessionRole === 'probe')?.origin
+    ?? exchanges[0]?.origin
+    ?? params.targetOrigins[0]
+    ?? ''
+  const built = buildAgentScriptReceipt({
+    claims: captured.claims,
+    exchanges,
+    origin,
+    title: params.title?.trim() || verdict.claimTitle || 'Agent script proof',
+  })
+  if (!built) {
+    return {
+      verdict: {
+        ...verdict,
+        confirmed: false,
+        reason: 'oracle_failed',
+        rejectedBy: 'receipt',
+        missingEvidence: [...new Set([...(verdict.missingEvidence ?? []), 'verified_proof_receipt'])],
+        detail: 'ProofReceipt could not be built from the script claims: mutating boundary claims require persisted before/after readbacks via ctx.prove_persisted_mutation; read-only boundaries require GET/HEAD.',
+      },
+      exchanges,
+      receipt: null,
+      compositeReceipt: null,
+      vulnClass: null,
+      transcriptDigests,
+      sealedCapabilities,
+      transcriptRecords,
+      hostTranscript,
+      ...attribution,
+    }
+  }
+  const verification = verifyReceipt(built.receipt, built.transcript)
+  if (!verification.confirmed) {
+    return {
+      verdict: {
+        ...verdict,
+        confirmed: false,
+        reason: 'oracle_failed',
+        detail: `ProofReceipt verification rejected the script claim (${verification.rule}): ${verification.reason}`,
+        rejectedBy: 'receipt',
+      },
+      exchanges,
+      receipt: null,
+      compositeReceipt: null,
+      vulnClass: null,
+      transcriptDigests,
+      sealedCapabilities,
+      transcriptRecords,
+      hostTranscript,
+      ...attribution,
+    }
+  }
+  return {
+    verdict,
+    exchanges,
+    receipt: { receipt: built.receipt, verification },
+    compositeReceipt: null,
+    vulnClass: built.receipt.vulnClass,
+    transcriptDigests,
+    sealedCapabilities,
+    transcriptRecords,
+    hostTranscript,
+    ...attribution,
+  }
+}
+
+function nextMonotonicEdgeTimestamps(
+  ledger: CapabilityLedger,
+  preconditionCapIds: readonly string[],
+  rawSourceMs: number,
+  rawTargetMs: number,
+): { sourceTimestampMs: number; targetTimestampMs: number } {
+  let minUpstreamMs = 0
+  for (const preId of preconditionCapIds) {
+    for (const edge of ledger.getIncomingEdges(preId)) {
+      if (edge.targetTimestampMs > minUpstreamMs) minUpstreamMs = edge.targetTimestampMs
+    }
+  }
+  const sourceTimestampMs = Math.max(0, Math.floor(Math.max(rawSourceMs, minUpstreamMs)))
+  const targetTimestampMs = Math.max(sourceTimestampMs, Math.floor(rawTargetMs))
+  return { sourceTimestampMs, targetTimestampMs }
+}
+
+/**
+ * Persist newly sealed Layer-1 capabilities and host-verified hop edges into `CapabilityLedger`.
+ *
+ * Security invariants:
+ *  - Intermediate capabilities are strictly quarantined (`promotionStatus: 'capability_only'`,
+ *    `terminalImpactOracleVerified: false`).
+ *  - Zero raw secrets ever touch the ledger (only opaque `cap:hop_<id>:<slot>` handles + SHA-256 digests).
+ *  - Only a host-verified `CompositeProofReceipt` may mark a non-quarantined terminal capability
+ *    `terminal_eligible` or record a `terminalImpact` edge.
+ */
+export function syncVerifyArtifactsToLedger(input: {
+  ledger: CapabilityLedger
+  proof: V8AgentScriptProofResult
+  defaultOrigin: string
+  defaultPersona?: string
+}): SyncVerifyArtifactsResult {
+  const { ledger, proof } = input
+  const defaultOrigin = input.defaultOrigin.trim() || 'unknown'
+  const defaultPersona = input.defaultPersona?.trim() || 'attacker'
+  const sealedSummaries: SyncVerifyArtifactsResult['sealedCapabilities'] = []
+  const verifiedHops: SyncVerifyArtifactsResult['verifiedHops'] = []
+  let newCapabilityCount = 0
+  let newEdgeCount = 0
+
+  const recordByCapHandle = new Map<string, VerifyTranscriptRecord>()
+  const consumedByExchangeId = new Map<string, string>()
+  for (const rec of proof.transcriptRecords) {
+    if (rec.artifact?.capabilityHandle) recordByCapHandle.set(rec.artifact.capabilityHandle, rec)
+    if (rec.artifact?.derivedCapabilityId) recordByCapHandle.set(rec.artifact.derivedCapabilityId, rec)
+    if (rec.request?.consumedCapabilityId) consumedByExchangeId.set(rec.exchangeId, rec.request.consumedCapabilityId)
+  }
+
+  const ensureAttackerSeed = (persona: string, tenantScope: string, serviceOrigin: string, createdAtMs: number): string => {
+    const safePersona = persona.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[^A-Za-z0-9]+/, 'a').slice(0, 32) || 'attacker'
+    const seedCapId = formatDerivedCapabilityHandle(`seed_${safePersona}`, 'session')
+    if (!ledger.getCapability(seedCapId)) {
+      ledger.addCapability({
+        capId: seedCapId,
+        kind: 'identity_session',
+        promotionStatus: 'capability_only',
+        terminalImpactOracleVerified: false,
+        provenance: 'attacker_seed',
+        tenantScope,
+        actorPersona: persona,
+        serviceOrigin,
+        surface: 'http',
+        artifactDigest: computeArtifactDigest(`seed:${ledger.runId}:${persona}:${serviceOrigin}`),
+        artifactSummary: `Attacker seed session for ${persona}`,
+        createdAtMs: Math.max(0, Math.floor(createdAtMs)),
+      })
+      newCapabilityCount += 1
+    }
+    return seedCapId
+  }
+
+  // 1. Persist every newly sealed Layer-1 capability strictly as `capability_only`.
+  for (const meta of proof.sealedCapabilities) {
+    const capId = normalizeLedgerCapHandle(meta)
+    const rec = recordByCapHandle.get(meta.handle)
+    const actorPersona = rec?.request?.personaHandle?.trim() || defaultPersona
+    const roleLabel = rec?.request?.actorRoleLabel ?? undefined
+    const tenantScope = parseRoleLabel(roleLabel).tenant || parseRoleLabel(actorPersona).tenant || 'default_tenant'
+    const serviceOrigin = rec?.request?.origin?.trim() || meta.allowedOrigins?.[0] || defaultOrigin
+    const surface = rec ? mapTranscriptOpToSurface(rec.op) : 'http'
+    const capKind = mapDerivedSecretKindToCapabilityKind(meta.kind)
+    const nowMs = Math.max(0, Math.floor(meta.createdAtMs || Date.now()))
+
+    if (!ledger.getCapability(capId)) {
+      ledger.addCapability({
+        capId,
+        kind: capKind,
+        promotionStatus: 'capability_only',
+        terminalImpactOracleVerified: false,
+        provenance: meta.derivedFromCapabilityId ? 'derived_hop' : 'runtime_discovery',
+        tenantScope,
+        actorPersona,
+        serviceOrigin,
+        surface,
+        validityTtlMs: meta.expiresAtMs !== null ? Math.max(0, meta.expiresAtMs - meta.createdAtMs) : null,
+        parentHopReceiptIds: [meta.hopReceiptId],
+        artifactDigest: meta.sha256,
+        artifactSummary: `Sealed ${meta.kind} slot ${meta.slot} (sha256:${meta.sha256Prefix})`,
+        metadata: {
+          slot: meta.slot,
+          secretKind: meta.kind,
+          ...(meta.derivedFromCapabilityId ? { parentHandle: meta.derivedFromCapabilityId } : {}),
+        },
+        createdAtMs: nowMs,
+      })
+      newCapabilityCount += 1
+    }
+
+    sealedSummaries.push({
+      handle: meta.handle,
+      kind: meta.kind,
+      sha256Prefix: meta.sha256Prefix,
+      ...(meta.derivedFromCapabilityId ? { derivedFromCapabilityId: meta.derivedFromCapabilityId } : {}),
+    })
+
+    // Record a verified causal hop edge for this newly sealed capability.
+    const parentHandle = meta.derivedFromCapabilityId
+      ? normalizeLedgerCapHandle({ handle: meta.derivedFromCapabilityId, hopReceiptId: meta.hopReceiptId, slot: 'parent' })
+      : null
+    const hasParentInLedger = Boolean(parentHandle && ledger.getCapability(parentHandle))
+    const consumedFromTranscript = proof.transcriptRecords.find(r => r.request?.consumedCapabilityId)?.request?.consumedCapabilityId
+    const hasConsumedInLedger = Boolean(consumedFromTranscript && ledger.getCapability(consumedFromTranscript))
+
+    let preconditionCapIds: string[]
+    let bindingKind: CausalEdgeBindingKind
+    if (hasParentInLedger && parentHandle && parentHandle !== capId) {
+      preconditionCapIds = [parentHandle]
+      bindingKind = 'derived_crypto_binding'
+    } else if (hasConsumedInLedger && consumedFromTranscript && consumedFromTranscript !== capId) {
+      preconditionCapIds = [consumedFromTranscript]
+      bindingKind = 'value_binding'
+    } else {
+      const seedId = ensureAttackerSeed(actorPersona, tenantScope, serviceOrigin, Math.max(0, nowMs - 1))
+      preconditionCapIds = [seedId]
+      bindingKind = 'value_binding'
+    }
+
+    const edgeId = `edge_cap_${createHash('sha256').update(`${ledger.runId}:${preconditionCapIds.join(',')}:${capId}:${bindingKind}`).digest('hex').slice(0, 20)}`
+    if (!ledger.getCausalEdge(edgeId)) {
+      const { sourceTimestampMs, targetTimestampMs } = nextMonotonicEdgeTimestamps(
+        ledger,
+        preconditionCapIds,
+        rec?.startedAt ?? Math.max(0, nowMs - 1),
+        nowMs,
+      )
+      try {
+        const edge = ledger.addCausalEdge({
+          edgeId,
+          preconditionCapIds,
+          actorContext: {
+            persona: actorPersona,
+            tenantScope,
+            ...(roleLabel ? { roleLabel } : {}),
+            serviceOrigin,
+          },
+          hopReceiptId: meta.hopReceiptId,
+          edgeBindingKind: bindingKind,
+          postconditionCapId: capId,
+          sourceTimestampMs,
+          targetTimestampMs,
+          bindingDigest: meta.sha256,
+          metadata: { source: 'guardian_verify', slot: meta.slot },
+        })
+        newEdgeCount += 1
+        verifiedHops.push({
+          hopReceiptId: edge.hopReceiptId,
+          edgeId: edge.edgeId,
+          binding: edge.edgeBindingKind,
+          postconditionCapId: edge.postconditionCapId,
+          terminalImpact: edge.terminalImpact,
+        })
+      } catch {
+        // Ignore cycle/duplicate edge races cleanly; capability node stays persisted.
+      }
+    }
+  }
+
+  // 2. If a CompositeProofReceipt was host-verified, persist its verified DAG causal edges.
+  if (proof.compositeReceipt?.verification.confirmed) {
+    const { receipt, hopActors } = proof.compositeReceipt
+    const hopById = new Map(receipt.hops.map(hop => [hop.hopId, hop]))
+    const hopRepCap = new Map<string, string>()
+
+    for (let idx = 0; idx < receipt.hops.length; idx += 1) {
+      const hop = receipt.hops[idx]!
+      const persona = hopActors[hop.hopId] || defaultPersona
+      const origin = hop.target.origin || defaultOrigin
+      const tenantScope = parseRoleLabel(persona).tenant || 'default_tenant'
+      const baseTs = Date.now() + idx
+
+      for (const rawCap of [...hop.producedCapabilities, ...hop.consumedCapabilities]) {
+        if (!DERIVED_CAPABILITY_HANDLE_RE.test(rawCap)) continue
+        if (!ledger.getCapability(rawCap)) {
+          ledger.addCapability({
+            capId: rawCap,
+            kind: 'scoped_token',
+            promotionStatus: 'capability_only',
+            terminalImpactOracleVerified: false,
+            provenance: 'derived_hop',
+            tenantScope,
+            actorPersona: persona,
+            serviceOrigin: origin,
+            surface: hop.surface,
+            parentHopReceiptIds: [hop.hopId],
+            artifactDigest: computeArtifactDigest(`${receipt.chainId}:${hop.hopId}:${rawCap}`),
+            artifactSummary: `Composite hop ${hop.hopId} capability`,
+            createdAtMs: baseTs,
+          })
+          newCapabilityCount += 1
+        }
+      }
+      const produced = hop.producedCapabilities.find(c => DERIVED_CAPABILITY_HANDLE_RE.test(c))
+      if (produced) {
+        hopRepCap.set(hop.hopId, produced)
+      } else {
+        const synthetic = formatDerivedCapabilityHandle(
+          `${receipt.chainId.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 24)}_${hop.hopId.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 24)}`,
+          'hop',
+        )
+        if (!ledger.getCapability(synthetic)) {
+          ledger.addCapability({
+            capId: synthetic,
+            kind: 'state_handle',
+            promotionStatus: 'capability_only',
+            terminalImpactOracleVerified: false,
+            provenance: idx === 0 ? 'attacker_seed' : 'derived_hop',
+            tenantScope,
+            actorPersona: persona,
+            serviceOrigin: origin,
+            surface: hop.surface,
+            parentHopReceiptIds: [hop.hopId],
+            artifactDigest: computeArtifactDigest(`${receipt.chainId}:${hop.hopId}:${hop.claimedDelta}`),
+            artifactSummary: hop.claimedDelta.slice(0, 160),
+            createdAtMs: baseTs,
+          })
+          newCapabilityCount += 1
+        }
+        hopRepCap.set(hop.hopId, synthetic)
+      }
+    }
+
+    for (let i = 0; i < receipt.causalEdges.length; i += 1) {
+      const edge = receipt.causalEdges[i]!
+      const fromCap = (edge.kind === 'value_binding' && edge.capabilityHandle && ledger.getCapability(edge.capabilityHandle)
+        ? edge.capabilityHandle
+        : edge.kind === 'derived_crypto_binding' && ledger.getCapability(edge.sourceCapabilityId)
+          ? edge.sourceCapabilityId
+          : hopRepCap.get(edge.fromHopId))
+      const toHop = hopById.get(edge.toHopId)
+      const isTerminal = edge.toHopId === receipt.terminalImpact.terminalHopId
+      const toCap = (edge.kind === 'derived_crypto_binding' && edge.derivedCapabilityId && ledger.getCapability(edge.derivedCapabilityId)
+        ? edge.derivedCapabilityId
+        : hopRepCap.get(edge.toHopId)) ?? null
+      if (!fromCap || (!toCap && !isTerminal)) continue
+
+      const edgeId = `edge_comp_${createHash('sha256').update(`${ledger.runId}:${receipt.chainId}:${i}:${edge.fromHopId}:${edge.toHopId}:${edge.kind}`).digest('hex').slice(0, 20)}`
+      if (ledger.getCausalEdge(edgeId)) continue
+
+      const persona = hopActors[edge.toHopId] || hopActors[edge.fromHopId] || defaultPersona
+      const nowMs = Date.now() + i
+      const { sourceTimestampMs, targetTimestampMs } = nextMonotonicEdgeTimestamps(ledger, [fromCap], nowMs, nowMs + 1)
+      try {
+        const saved = ledger.addCausalEdge({
+          edgeId,
+          preconditionCapIds: [fromCap],
+          actorContext: {
+            persona,
+            serviceOrigin: toHop?.target.origin || defaultOrigin,
+          },
+          hopReceiptId: edge.toHopId,
+          edgeBindingKind: edge.kind,
+          ...(toCap && toCap !== fromCap ? { postconditionCapId: toCap } : {}),
+          ...(isTerminal ? { terminalImpact: receipt.terminalImpact.claimedImpact } : {}),
+          sourceTimestampMs,
+          targetTimestampMs,
+          metadata: { chainId: receipt.chainId, terminalVulnClass: receipt.terminalVulnClass },
+        })
+        newEdgeCount += 1
+        verifiedHops.push({
+          hopReceiptId: saved.hopReceiptId,
+          edgeId: saved.edgeId,
+          binding: saved.edgeBindingKind,
+          postconditionCapId: saved.postconditionCapId,
+          terminalImpact: saved.terminalImpact,
+        })
+      } catch {
+        // Ignore cycle/duplicate races; verified composite receipt remains authoritative.
+      }
+    }
+
+    // Mark ONLY the terminal hop's non-quarantined capability (if any) terminal_eligible.
+    const terminalCap = hopRepCap.get(receipt.terminalImpact.terminalHopId)
+    if (terminalCap) {
+      const terminalNode = ledger.getCapability(terminalCap)
+      if (terminalNode && !ALWAYS_QUARANTINED_KINDS.has(terminalNode.kind)) {
+        try { ledger.markTerminalEligible(terminalCap, receipt.chainId) } catch { /* stay quarantined if constrained */ }
+      }
+    }
+  }
+
+  return {
+    sealedCapabilities: sealedSummaries,
+    verifiedHops,
+    newCapabilityCount,
+    newEdgeCount,
+  }
+}
+
 export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
+  private readonly fallbackVaults = new Map<string, DerivedCapabilityVault>()
+
+  /** Return the shared run-scoped Layer-1 DerivedCapabilityVault across worker sessions. */
+  capabilityVaultFor(runId: string): DerivedCapabilityVault {
+    if (this.host.capabilityVaultFor) return this.host.capabilityVaultFor(runId)
+    let vault = this.fallbackVaults.get(runId)
+    if (!vault) {
+      vault = new DerivedCapabilityVault({ runId: safeVaultRunId(runId) })
+      this.fallbackVaults.set(runId, vault)
+    }
+    return vault
+  }
+
+  /** Execute a `guardian_verify` script bound to this run's shared `DerivedCapabilityVault`. */
+  runAgentScriptProof(
+    params: Omit<V8AgentScriptProofParams, 'broker' | 'backend' | 'canaryBroker' | 'capabilityVault'> & {
+      capabilityVault?: DerivedCapabilityVault
+    },
+  ): Promise<V8AgentScriptProofResult> {
+    return runV8AgentScriptProof({
+      ...params,
+      broker: this.broker,
+      backend: this.backend,
+      canaryBroker: this.canaryBroker,
+      capabilityVault: params.capabilityVault ?? this.capabilityVaultFor(params.runId),
+    })
+  }
+
+  /** Persist sealed capabilities and verified hops from a `guardian_verify` run into `CapabilityLedger`. */
+  syncVerifyArtifactsToLedger(input: {
+    runId: string
+    proof: V8AgentScriptProofResult
+    defaultOrigin: string
+    defaultPersona?: string
+  }): SyncVerifyArtifactsResult {
+    return syncVerifyArtifactsToLedger({
+      ledger: this.storage.capabilityLedger(input.runId),
+      proof: input.proof,
+      defaultOrigin: input.defaultOrigin,
+      ...(input.defaultPersona ? { defaultPersona: input.defaultPersona } : {}),
+    })
+  }
 
   private addReplayReceiptArtifact(
     run: Run,
@@ -932,21 +1928,38 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     script: string
     runtime: 'ts' | 'python'
     title?: string
-    proof: AgentScriptProofResult
+    proof: AgentScriptProofResult | V8AgentScriptProofResult
     secrets: readonly NamedSecret[]
   }): { findingId: string; replaySpecId: string; receiptId: string | null } {
     const { run, assignment, proof } = input
-    if (!proof.verdict.confirmed || !proof.receipt || !proof.receipt.verification.confirmed) {
+    const compositeBundle = 'compositeReceipt' in proof ? proof.compositeReceipt : null
+    const singleConfirmed = Boolean(proof.receipt && proof.receipt.verification.confirmed)
+    const compositeConfirmed = Boolean(compositeBundle && compositeBundle.verification.confirmed)
+    if (!proof.verdict.confirmed || (!singleConfirmed && !compositeConfirmed)) {
       throw new InvariantError(
         'invariant.confirmation_evidence',
-        `Invariant: refusing to persist an agent script proof without a verified ProofReceipt (verdict=${proof.verdict.reason}, hasReceipt=${Boolean(proof.receipt)}).`,
+        `Invariant: refusing to persist an agent script proof without a verified ProofReceipt or CompositeProofReceipt (verdict=${proof.verdict.reason}, hasReceipt=${Boolean(proof.receipt)}, hasComposite=${Boolean(compositeBundle)}).`,
       )
     }
+    const vault = this.capabilityVaultFor(run.id)
+    const allSecrets: NamedSecret[] = [...input.secrets, ...vaultScrubDescriptors(vault)]
     const receipt = proof.receipt?.receipt ?? null
     const verification = proof.receipt?.verification ?? null
-    const claim = receipt?.vulnClass ?? 'disclosure'
+    const cleanCompositeBundle: V8CompositeProofBundle | null = compositeConfirmed && compositeBundle
+      ? {
+          receipt: redactJsonValue(compositeBundle.receipt, allSecrets),
+          verification: redactJsonValue(compositeBundle.verification, allSecrets),
+          hopActors: compositeBundle.hopActors,
+        }
+      : null
+    const claim = cleanCompositeBundle?.receipt.terminalVulnClass ?? receipt?.vulnClass ?? 'disclosure'
     const attribution = agentProofAttribution(claim)
-    const origin = receipt?.target.origin
+    const compositeTerminalOrigin = cleanCompositeBundle
+      ? (cleanCompositeBundle.receipt.hops.find(h => h.hopId === cleanCompositeBundle.receipt.terminalImpact.terminalHopId)?.target.origin
+          ?? cleanCompositeBundle.receipt.hops[cleanCompositeBundle.receipt.hops.length - 1]?.target.origin)
+      : undefined
+    const origin = compositeTerminalOrigin
+      ?? receipt?.target.origin
       ?? proof.exchanges.find(exchange => exchange.sessionRole === 'probe')?.origin
       ?? proof.exchanges[0]?.origin
     if (!origin || !this.host.approvedOriginsSet(run).has(origin)) {
@@ -959,8 +1972,8 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       ? proof.severity as Finding['severity']
       : 'high'
     const scriptSha256 = createHash('sha256').update(input.script).digest('hex')
-    const scriptRedacted = redact(input.script, input.secrets)
-    const cleanTitle = redact(title, input.secrets)
+    const scriptRedacted = scrubDerivedSecrets(redact(input.script, allSecrets), vault)
+    const cleanTitle = scrubDerivedSecrets(redact(title, allSecrets), vault)
 
     const artifact = this.storage.addArtifact(
       run,
@@ -968,26 +1981,38 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       'replay',
       `Agent proof script · ${cleanTitle}`,
       JSON.stringify({
-        mode: 'agent_script',
+        mode: cleanCompositeBundle ? 'agent_script_composite' : 'agent_script',
         runtime: input.runtime,
         scriptSha256,
         script: scriptRedacted,
         receipt,
         verification,
+        ...(cleanCompositeBundle ? {
+          compositeReceipt: cleanCompositeBundle.receipt,
+          compositeVerification: cleanCompositeBundle.verification,
+          hopActors: cleanCompositeBundle.hopActors,
+        } : {}),
         transcriptDigests: proof.transcriptDigests,
       }, null, 2),
       `agent-proof:${scriptSha256}`,
-      input.secrets,
+      allSecrets,
     )
 
+    const compositeExchangeIds = cleanCompositeBundle
+      ? [...new Set([
+          ...cleanCompositeBundle.receipt.hops.flatMap(h => h.exchangeIds),
+          ...cleanCompositeBundle.receipt.terminalImpact.preChainControlExchangeIds,
+          ...cleanCompositeBundle.receipt.terminalImpact.postChainReadbackExchangeIds,
+        ])]
+      : []
     const envelope: AgentScriptProofEnvelope = {
       kind: 'agent_script',
       runtime: input.runtime,
       script: scriptRedacted,
       scriptSha256,
       verdict: 'confirmed',
-      ...(receipt?.vulnClass ? { vulnClass: receipt.vulnClass } : {}),
-      exchangeIds: [...new Set(proof.exchanges.map(exchange => exchange.exchangeId))].slice(0, 64),
+      ...(claim ? { vulnClass: claim } : {}),
+      exchangeIds: [...new Set([...compositeExchangeIds, ...proof.exchanges.map(exchange => exchange.exchangeId)])].slice(0, 64),
       transcriptDigests: proof.transcriptDigests.slice(0, 4),
       receiptArtifactId: artifact.id,
       confirmedAt: Date.now(),
@@ -997,9 +2022,17 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       verificationTier: 'runtime_confirmed',
       controlPassed: proof.verdict.attempts.every(attempt => attempt.oraclePassed),
       assertionSummary: {
-        observed: verification?.observed ?? `${proof.verdict.attempts.length} signed script runs confirmed the claim.`,
-        expected: verification?.expected ?? 'the claimed impact is re-derivable from the recorded transcript',
-        ...(verification?.reason ? { reason: verification.reason } : {}),
+        observed: cleanCompositeBundle
+          ? `${cleanCompositeBundle.verification.hopCount}-hop CompositeProofReceipt (${cleanCompositeBundle.receipt.chainId}) confirmed across ${proof.verdict.attempts.length} fresh runs.`
+          : verification?.observed ?? `${proof.verdict.attempts.length} signed script runs confirmed the claim.`,
+        expected: cleanCompositeBundle
+          ? 'every hop, causal edge binding, and attacker-origin provenance verifies over host-signed transcripts'
+          : verification?.expected ?? 'the claimed impact is re-derivable from the recorded transcript',
+        ...(cleanCompositeBundle?.verification.reason
+          ? { reason: cleanCompositeBundle.verification.reason }
+          : verification?.reason
+            ? { reason: verification.reason }
+            : {}),
       },
       stepStatuses: [],
       retriesRemaining: maxInlineVerifyRetries,
@@ -1010,7 +2043,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       category: attribution.category,
       title: cleanTitle,
     })?.id ?? randomUUID()
-    const spec = this.agentProofAttributionSpec({
+    const baseSpec = this.agentProofAttributionSpec({
       origin,
       title: cleanTitle,
       attribution,
@@ -1019,6 +2052,18 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       proof,
       receipt,
     })
+    const spec: DeclarativeReplaySpec = cleanCompositeBundle
+      ? ({
+          ...baseSpec,
+          compositeReceipt: cleanCompositeBundle.receipt,
+          compositeVerification: cleanCompositeBundle.verification,
+        } as unknown as DeclarativeReplaySpec)
+      : baseSpec
+    const proofReceiptRow: ReplayProofReceiptRow | null = cleanCompositeBundle
+      ? serializeCompositeProofReceiptRow(cleanCompositeBundle, receipt && verification ? { receipt, verification } : null)
+      : receipt && verification
+        ? serializeProofReceiptRow({ receipt, verification })
+        : null
     const proofRecord: AgentScriptProofRecord = {
       replaySpecId: '',
       findingId,
@@ -1026,7 +2071,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       runtime: input.runtime,
       scriptSha256,
       artifactId: artifact.id,
-      receipt: receipt && verification ? serializeProofReceiptRow({ receipt, verification }) : null,
+      receipt: proofReceiptRow,
       createdAt: Date.now(),
     }
     const specRow = this.storage.createReplaySpec(
@@ -1038,27 +2083,40 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       { initialAttemptCount: 1, verifiedInline: true, lastVerificationDiff: feedback, proof: proofRecord },
     )
 
-    const finding: Finding = {
+    const finding: Finding & { evidence?: Record<string, unknown> } = {
       id: findingId,
       origin,
       title: cleanTitle,
       status: 'confirmed',
       severity,
-      reason: verification?.reason ?? proof.verdict.detail ?? 'Confirmed by a Layer-3 verification script.',
+      reason: cleanCompositeBundle?.verification.reason ?? verification?.reason ?? proof.verdict.detail ?? 'Confirmed by a Layer-3 verification script.',
       remediation: attribution.remediation,
-      impact: receipt?.claimedDelta ?? attribution.impact,
+      impact: cleanCompositeBundle?.receipt.terminalImpact.claimedImpact ?? receipt?.claimedDelta ?? attribution.impact,
       recheck: `Re-run the persisted ${input.runtime} proof script and re-validate its receipt.`,
       category: attribution.category,
       cwe: attribution.cwe,
       confidence: 'high',
-      verification: receipt
-        ? `ProofReceipt ${receipt.exchangeIds[0] ?? scriptSha256.slice(0, 12)} · ${verification?.rule ?? 'receipt'} rule · ${verification?.reason ?? 'verified'}`
-        : `Layer-3 script proof (${input.runtime}) · ${proof.verdict.attempts.length} signed runs · digest ${proof.transcriptDigests[0]?.slice(0, 12) ?? 'n/a'}`,
+      verification: cleanCompositeBundle
+        ? `ProofReceipt (Composite) ${cleanCompositeBundle.receipt.chainId} · ${cleanCompositeBundle.verification.hopCount} hops · ${cleanCompositeBundle.receipt.replayMode} · ${cleanCompositeBundle.verification.reason}`
+        : receipt
+          ? `ProofReceipt ${receipt.exchangeIds[0] ?? scriptSha256.slice(0, 12)} · ${verification?.rule ?? 'receipt'} rule · ${verification?.reason ?? 'verified'}`
+          : `Layer-3 script proof (${input.runtime}) · ${proof.verdict.attempts.length} signed runs · digest ${proof.transcriptDigests[0]?.slice(0, 12) ?? 'n/a'}`,
       verificationTier: 'runtime_confirmed',
       findingKind: 'multi_step_chain',
       replaySpecId: specRow.id,
-      exchangeIds: receipt?.exchangeIds?.length ? [...receipt.exchangeIds] : envelope.exchangeIds,
+      exchangeIds: compositeExchangeIds.length
+        ? compositeExchangeIds
+        : receipt?.exchangeIds?.length
+          ? [...receipt.exchangeIds]
+          : envelope.exchangeIds,
       evidenceIds: [artifact.id],
+      ...(cleanCompositeBundle ? {
+        evidence: {
+          compositeReceipt: cleanCompositeBundle.receipt,
+          compositeVerification: cleanCompositeBundle.verification,
+          hopActors: cleanCompositeBundle.hopActors,
+        },
+      } : {}),
       scopeRevision: run.scopeRevision,
     }
     this.storage.upsertChainFinding(run, asset.id, finding, specRow.id, [origin])
@@ -1068,10 +2126,15 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       replaySpecId: specRow.id,
       artifactId: artifact.id,
       scriptSha256,
-      receiptRule: verification?.rule ?? null,
+      receiptRule: cleanCompositeBundle ? `composite:${cleanCompositeBundle.receipt.replayMode}` : (verification?.rule ?? null),
+      ...(cleanCompositeBundle ? { chainId: cleanCompositeBundle.receipt.chainId, hopCount: cleanCompositeBundle.receipt.hops.length } : {}),
       transcriptDigests: proof.transcriptDigests,
     })
-    return { findingId, replaySpecId: specRow.id, receiptId: receipt?.exchangeIds[0] ?? null }
+    return {
+      findingId,
+      replaySpecId: specRow.id,
+      receiptId: cleanCompositeBundle?.receipt.chainId ?? receipt?.exchangeIds[0] ?? null,
+    }
   }
 
 
@@ -1161,20 +2224,18 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     const approved = this.host.approvedOriginsSet(run)
     if (!origin || !approved.has(origin)) return null
 
-    const result = await runAgentScriptProof({
+    const result = await this.runAgentScriptProof({
       script: envelope.script,
       runtime: envelope.runtime,
       ...(envelope.vulnClass ? { title: `${envelope.vulnClass} agent proof re-verification` } : {}),
-      broker: this.broker,
       grant: params.grant,
-      backend: this.backend,
       runId: run.id,
       assignmentId: params.job.assignment.id,
       targetOrigins: [origin],
       signal: params.job.controller.signal,
-      canaryBroker: this.canaryBroker,
     })
     const receiptOk = result.receipt?.verification.confirmed === true
+      || result.compositeReceipt?.verification.confirmed === true
     const confirmed = result.verdict.confirmed && receiptOk
     const status: Finding['status'] = confirmed
       ? 'confirmed'
@@ -1201,11 +2262,13 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       sourceOrigins: specRow.sourceOrigins,
       secrets: params.currentSecrets(),
     })
-    const receiptRow = confirmed && result.receipt
-      ? serializeProofReceiptRow(result.receipt)
-      : confirmed
-        ? proof.receipt ?? null
-        : null
+    const receiptRow = confirmed && result.compositeReceipt?.verification.confirmed
+      ? serializeCompositeProofReceiptRow(result.compositeReceipt, result.receipt)
+      : confirmed && result.receipt
+        ? serializeProofReceiptRow(result.receipt)
+        : confirmed
+          ? proof.receipt ?? null
+          : null
     this.storage.setReplaySpecProof(run.id, updatedSpec.id, {
       ...proof,
       replaySpecId: updatedSpec.id,

@@ -232,6 +232,19 @@ export const SPEC_PROOF_GAP_CODES = [
 ] as const
 
 /**
+ * v8 negative-edge proof-gap reasons indicating a hardened boundary, clean control block, or
+ * verified decoy guard. Recording one feeds `CapabilityLedger` negative-edge 2-strike pruning
+ * and `FrontierWaveController` so sibling workers skip dead-end branches.
+ */
+export const NEGATIVE_EDGE_PROOF_GAP_CODES = [
+  'invariant_enforced_hardened',
+  'control_blocked_cleanly',
+  'decoy_guard_verified',
+] as const
+
+export type NegativeEdgeProofGapCode = typeof NEGATIVE_EDGE_PROOF_GAP_CODES[number]
+
+/**
  * Accepted aliases for the same evidence contracts. Kept out of the canonical list because the
  * settlement directive is byte-capped to eight codes; `parseProofGapCode` still recognizes them.
  */
@@ -241,6 +254,7 @@ export const SPEC_PROOF_GAP_ALIASES = [
   'method_not_allowed',
   'no_readback_surface',
   'hardened_or_no_anomaly',
+  ...NEGATIVE_EDGE_PROOF_GAP_CODES,
 ] as const
 
 export type SpecProofGapCode = typeof SPEC_PROOF_GAP_CODES[number] | typeof SPEC_PROOF_GAP_ALIASES[number]
@@ -252,6 +266,15 @@ export function parseProofGapCode(reason: string | undefined | null): SpecProofG
   const head = value.split(/[^a-z0-9_]+/, 1)[0] ?? ''
   const known: readonly string[] = [...SPEC_PROOF_GAP_CODES, ...SPEC_PROOF_GAP_ALIASES]
   return known.includes(head) ? head as SpecProofGapCode : null
+}
+
+/** Extract a v8 negative-edge proof-gap reason if present (leading code or token). */
+export function parseNegativeEdgeGapReason(reason: string | undefined | null): NegativeEdgeProofGapCode | null {
+  const code = parseProofGapCode(reason)
+  if (code && (NEGATIVE_EDGE_PROOF_GAP_CODES as readonly string[]).includes(code)) {
+    return code as NegativeEdgeProofGapCode
+  }
+  return null
 }
 
 /** Route evidence captured from the first successful probe: method + path template + param names. */
@@ -903,6 +926,20 @@ export class SpecSubmissionTracker {
         if (!mutatingProbe) return { ok: false, missing: 'at least one non-denied mutating probe (POST/PUT/PATCH/DELETE) on the resource family' }
         if (readableGet) return { ok: false, missing: 'zero readable GET endpoints in the resource family (a 2xx GET was observed)' }
         return { ok: true, evidence: 'a mutating probe with no readable GET readback' }
+      case 'invariant_enforced_hardened':
+      case 'control_blocked_cleanly':
+      case 'decoy_guard_verified':
+        if (
+          denial
+          || statuses.some(status => status === 404 || status === 409 || status === 412 || status === 422)
+          || (controlExchange && differentialExchange)
+        ) {
+          return { ok: true, evidence: 'enforced denial or control + differential probe exchanges on the route' }
+        }
+        return {
+          ok: false,
+          missing: 'a 401/403/404/409/412/422 enforcement denial or control + differential probe exchanges on this route',
+        }
       case 'hardened_or_no_anomaly':
       case 'no_reproducible_signal':
         if (!controlExchange) return { ok: false, missing: 'a control exchange on this route' }
@@ -1632,6 +1669,14 @@ export interface RecordCoverageArgs {
   route?: string
   /** Linked finding ID when status === 'reported'. */
   linkedFindingId?: string
+  /** Optional v8 opaque precondition capability handles (`cap:hop_<id>:<slot>`) for negative-edge pruning. */
+  preconditionCapIds?: string[]
+  /** Optional v8 frontier branch key for negative-edge 2-strike pruning. */
+  branchKey?: string
+  /** Optional hypothesis/chain class for negative-edge attribution. */
+  hypothesisClass?: string
+  /** Optional exchange IDs that falsified the branch. */
+  exchangeIds?: string[]
 }
 
 export interface ProposeChainFindingArgs {
@@ -1899,6 +1944,31 @@ export interface GuardianVerifyAttemptSummary {
   failures: string[]
 }
 
+export interface GuardianVerifySealedCapabilitySummary {
+  handle: string
+  kind: string
+  sha256Prefix: string
+  derivedFromCapabilityId?: string
+}
+
+export interface GuardianVerifyHopSummary {
+  hopReceiptId: string
+  edgeId: string
+  binding: string
+  postconditionCapId?: string | null
+  terminalImpact?: string | null
+}
+
+export interface GuardianVerifyCompositeSummary {
+  chainId: string
+  terminalVulnClass: string
+  hopCount: number
+  replayMode: string
+  confirmed: boolean
+  failedStage?: string
+  verifiedEdgeCount: number
+}
+
 export interface GuardianVerifyToolResult {
   /** True only when the independent transcript oracle confirmed two fresh, signed runs. */
   confirmed: boolean
@@ -1922,6 +1992,12 @@ export interface GuardianVerifyToolResult {
   stderrPreview?: string
   /** Actionable 1-line usage hint surfaced on `claims_missing` / execution failure. */
   usageHint?: string
+  /** v8 opaque capability handles newly sealed host-side during this script run (never raw secrets). */
+  sealedCapabilities?: GuardianVerifySealedCapabilitySummary[]
+  /** v8 verified causal hop edges persisted into CapabilityLedger during this script run. */
+  verifiedHops?: GuardianVerifyHopSummary[]
+  /** v8 CompositeProofReceipt verification summary when `ctx.prove_composite` ran. */
+  compositeReceipt?: GuardianVerifyCompositeSummary
 }
 
 export type GuardianVerifyHandler = (
@@ -2018,6 +2094,45 @@ export function summarizeGuardianVerifyOutcome(value: unknown): GuardianVerifyTo
   const usageHint = isScriptFailure
     ? (typeof rec.usageHint === 'string' && rec.usageHint.trim() ? rec.usageHint.trim() : GUARDIAN_VERIFY_USAGE_HINT)
     : undefined
+  const sealedCapabilities: GuardianVerifySealedCapabilitySummary[] = Array.isArray(rec.sealedCapabilities)
+    ? rec.sealedCapabilities
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
+        .filter(item => typeof item.handle === 'string' && /^cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$/.test(item.handle))
+        .map(item => ({
+          handle: String(item.handle),
+          kind: typeof item.kind === 'string' ? item.kind : 'generic_secret',
+          sha256Prefix: typeof item.sha256Prefix === 'string' ? item.sha256Prefix.slice(0, 16) : '',
+          ...(typeof item.derivedFromCapabilityId === 'string' && /^cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$/.test(item.derivedFromCapabilityId)
+            ? { derivedFromCapabilityId: item.derivedFromCapabilityId }
+            : {}),
+        }))
+    : []
+  const verifiedHops: GuardianVerifyHopSummary[] = Array.isArray(rec.verifiedHops)
+    ? rec.verifiedHops
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
+        .filter(item => typeof item.hopReceiptId === 'string' && typeof item.edgeId === 'string')
+        .map(item => ({
+          hopReceiptId: String(item.hopReceiptId),
+          edgeId: String(item.edgeId),
+          binding: typeof item.binding === 'string' ? item.binding : 'value_binding',
+          ...(typeof item.postconditionCapId === 'string' || item.postconditionCapId === null ? { postconditionCapId: item.postconditionCapId as string | null } : {}),
+          ...(typeof item.terminalImpact === 'string' || item.terminalImpact === null ? { terminalImpact: item.terminalImpact as string | null } : {}),
+        }))
+    : []
+  const rawComp = rec.compositeReceipt && typeof rec.compositeReceipt === 'object' && !Array.isArray(rec.compositeReceipt)
+    ? rec.compositeReceipt as Record<string, unknown>
+    : null
+  const compositeReceipt: GuardianVerifyCompositeSummary | undefined = rawComp && typeof rawComp.chainId === 'string'
+    ? {
+        chainId: rawComp.chainId,
+        terminalVulnClass: typeof rawComp.terminalVulnClass === 'string' ? rawComp.terminalVulnClass : 'unknown',
+        hopCount: typeof rawComp.hopCount === 'number' ? rawComp.hopCount : 0,
+        replayMode: typeof rawComp.replayMode === 'string' ? rawComp.replayMode : 'fresh_clean_replay',
+        confirmed: rawComp.confirmed === true && confirmed,
+        ...(typeof rawComp.failedStage === 'string' ? { failedStage: rawComp.failedStage } : {}),
+        verifiedEdgeCount: typeof rawComp.verifiedEdgeCount === 'number' ? rawComp.verifiedEdgeCount : 0,
+      }
+    : undefined
   return {
     confirmed,
     reason,
@@ -2034,6 +2149,9 @@ export function summarizeGuardianVerifyOutcome(value: unknown): GuardianVerifyTo
     ...(isScriptFailure && typeof exitCode === 'number' ? { exitCode } : {}),
     ...(isScriptFailure ? { stderrPreview } : {}),
     ...(usageHint ? { usageHint } : {}),
+    ...(sealedCapabilities.length ? { sealedCapabilities } : {}),
+    ...(verifiedHops.length ? { verifiedHops } : {}),
+    ...(compositeReceipt ? { compositeReceipt } : {}),
   }
 }
 
@@ -4667,6 +4785,10 @@ export function buildWorkerTools(
         proofGapReason: opt(str({ description: `REQUIRED when status="needs_follow_up": machine-readable code plus detail (${[...SPEC_PROOF_GAP_CODES, ...SPEC_PROOF_GAP_ALIASES].join('|')}) explaining the exact blocker.`, maxLength: 600 })),
         route: opt(str({ description: 'Route this closure applies to, as "METHOD /path" (path parameters may be concrete: "GET /api/orders/1001"). REQUIRED for a coded needs_follow_up gap when more than one route was probed, because the gap discharges only that route.', maxLength: 200 })),
         linkedFindingId: opt(str({ description: 'Finding ID when status="reported".', maxLength: 64 })),
+        preconditionCapIds: opt(arr(str({ maxLength: 160 }), { maxItems: 16 })),
+        branchKey: opt(str({ maxLength: 200 })),
+        hypothesisClass: opt(str({ maxLength: 100 })),
+        exchangeIds: opt(arr(str({ maxLength: 120 }), { maxItems: 16 })),
       }),
       replay: 'safe',
       outputLimits,
@@ -4711,6 +4833,10 @@ export function buildWorkerTools(
           proofGapReason: persistedGapReason,
           route: routeText,
           linkedFindingId: args.linkedFindingId?.trim() || undefined,
+          ...(args.preconditionCapIds?.length ? { preconditionCapIds: args.preconditionCapIds } : {}),
+          ...(args.branchKey?.trim() ? { branchKey: args.branchKey.trim() } : {}),
+          ...(args.hypothesisClass?.trim() ? { hypothesisClass: args.hypothesisClass.trim() } : {}),
+          ...(args.exchangeIds?.length ? { exchangeIds: args.exchangeIds } : {}),
         }, signal).then(result => {
           if (args.status === 'needs_follow_up' && args.proofGapReason?.trim()) {
             specSubmission?.tracker?.noteProofGap({
