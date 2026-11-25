@@ -39,6 +39,9 @@ run() { step "$1"; shift; if "$@"; then :; else echo "FAILED: $1" >&2; fail=1; f
 
 run "typecheck" npm run check
 
+# v8 anti-contamination invariant (<1s): zero v8 benchmark literals in src/server/ or src/skills/.
+run "v8 anti-contamination lint" node scripts/check-v8-contamination.ts
+
 # v7 dispatch-funnel invariant (<=15 lines): the pure helpers must be wired into the engine and the
 # synthetic fixture must prove (a) a dry/coordinator stop never strands dispatchable ready steps and
 # (b) multi-trial fanout only spends surplus worker slots. Catches this coverage class in minutes.
