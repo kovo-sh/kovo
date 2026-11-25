@@ -1,7 +1,7 @@
 // Tenant API: sessions, organizations, invoice templates, invoices, exports and benign CRUD.
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Egress } from '../../../lib/egress.ts'
-import { readBody, parseJson, sendJson, runIdOf, match, parseUrl } from './http.ts'
+import { readBody, parseJson, sendJson, runIdOf, match, parseUrl, header } from './http.ts'
 import type { LabState } from './shared.ts'
 import {
   authenticate, digest, effectivePermissions, permissionKey, permissionsFor, roleOf, sessionTenantOk,
@@ -272,7 +272,65 @@ export async function handleApi(
       sendJson(res, 404, { error: 'unknown export' })
       return
     }
-    sendJson(res, 200, { job })
+    const response = await deps.egress.fetch('worker', `/jobs/${encodeURIComponent(job.id)}`, {
+      headers: { 'x-guardian-run-id': runId },
+    })
+    const payload = parseJson<Record<string, unknown>>(await response.text()) ?? { job }
+    sendJson(res, response.status, payload)
+    return
+  }
+
+  const jobTrace = match(url, method, at('/jobs/:id/trace'))
+  if (jobTrace) {
+    const session = auth(state, req, res)
+    if (!session) return
+    const job = state.jobs.find((item) => item.id === jobTrace[0])
+    if (!job || job.tenantId !== session.tenantId) {
+      sendJson(res, 404, { error: 'unknown job' })
+      return
+    }
+    const response = await deps.egress.fetch('worker', `/jobs/${encodeURIComponent(job.id)}/trace`, {
+      headers: { 'x-guardian-run-id': runId },
+    })
+    const payload = parseJson<Record<string, unknown>>(await response.text()) ?? {}
+    sendJson(res, response.status, payload)
+    return
+  }
+
+  const jobById = match(url, method, at('/jobs/:id'))
+  if (jobById) {
+    const session = auth(state, req, res)
+    if (!session) return
+    const job = state.jobs.find((item) => item.id === jobById[0])
+    if (!job || job.tenantId !== session.tenantId) {
+      sendJson(res, 404, { error: 'unknown job' })
+      return
+    }
+    const response = await deps.egress.fetch('worker', `/jobs/${encodeURIComponent(job.id)}`, {
+      headers: { 'x-guardian-run-id': runId },
+    })
+    const payload = parseJson<Record<string, unknown>>(await response.text()) ?? { job }
+    sendJson(res, response.status, payload)
+    return
+  }
+
+  if (method === 'POST' && match(url, method, at('/webhooks/settlement'))) {
+    const raw = await readBody(req)
+    const forwardHeaders: Record<string, string> = {
+      'content-type': header(req, 'content-type') || 'application/json',
+      'x-guardian-run-id': runId,
+    }
+    for (const name of ['x-signature', 'x-lab-derived-from', 'x-scope']) {
+      const value = header(req, name)
+      if (value) forwardHeaders[name] = value
+    }
+    const response = await deps.egress.fetch('vault.internal', '/webhooks/settlement', {
+      method: 'POST',
+      headers: forwardHeaders,
+      body: raw,
+    })
+    const payload = parseJson<Record<string, unknown>>(await response.text()) ?? {}
+    sendJson(res, response.status, payload)
     return
   }
 

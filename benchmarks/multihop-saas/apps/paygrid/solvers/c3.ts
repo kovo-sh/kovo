@@ -24,7 +24,7 @@ export async function solveC3(ctx: SolverContext): Promise<CompositeProofReceipt
 
   let ready = false
   for (let attempt = 0; attempt < 80; attempt++) {
-    const polled = await ctx.http('worker', `/jobs/${jobId}`)
+    const polled = await ctx.http('api', `${prefix}/exports/${jobId}`, { token: viewerB })
     if (polled.status !== 200) return null
     const job = polled.json<{ job: { status: string } }>().job
     if (job.status === 'ready') {

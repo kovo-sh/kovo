@@ -28,7 +28,7 @@ export async function solveC2(ctx: SolverContext): Promise<CompositeProofReceipt
 
   let ready = false
   for (let attempt = 0; attempt < 80; attempt++) {
-    const polled = await ctx.http('worker', `/jobs/${jobId}`)
+    const polled = await ctx.http('api', `${prefix}/jobs/${jobId}`, { token: member })
     if (polled.status !== 200) return null
     const job = polled.json<{ job: { status: string } }>().job
     if (job.status === 'ready') {
@@ -41,7 +41,7 @@ export async function solveC2(ctx: SolverContext): Promise<CompositeProofReceipt
   }
   void ready
 
-  const traced = await ctx.http('worker', `/jobs/${jobId}/trace`)
+  const traced = await ctx.http('api', `${prefix}/jobs/${jobId}/trace`, { token: member })
   if (traced.status !== 200) return null
   const secret = (traced.json<{ leakedSecret?: string }>().leakedSecret ?? '').trim()
   if (!secret) return null
@@ -51,7 +51,7 @@ export async function solveC2(ctx: SolverContext): Promise<CompositeProofReceipt
     amountCents: plan.economics.settlementAmountCents,
     memo: `settlement:${jobId}`,
   })
-  const signed = await ctx.http('vault.internal', '/webhooks/settlement', {
+  const signed = await ctx.http('api', `${prefix}/webhooks/settlement`, {
     method: 'POST',
     rawBody: payload,
     headers: {
