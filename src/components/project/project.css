@@ -1,5 +1,5 @@
 /* =====================================================================
-   Guardian Project Detail Workbench (.pw)
+   Kovo Hunter Project Detail Workbench (.pw)
    Matches /runs/$runId (.rw) warm-stone light & neutral-charcoal dark
    tokens, typography, hairline bands, compact controls, and sheets.
    ===================================================================== */
@@ -200,8 +200,6 @@
 .pw-btn.ghost:hover { background: var(--pw-hover); color: var(--pw-fg); }
 .pw-btn.danger { color: var(--pw-bad); }
 .pw-btn.danger:hover { background: var(--pw-bad-soft); color: var(--pw-bad); }
-.pw-btn.ghost.danger-hover { color: var(--pw-fg-3); }
-.pw-btn.ghost.danger-hover:hover { background: var(--pw-bad-soft); color: var(--pw-bad); }
 .pw-btn.danger-solid { background: var(--pw-bad); color: #ffffff; box-shadow: none; }
 .pw-btn.danger-solid:hover { filter: brightness(1.08); background: var(--pw-bad); }
 .pw-btn:disabled { opacity: 0.45; cursor: default; pointer-events: none; }
@@ -220,24 +218,44 @@
 /* Workbench content column */
 .pw-body { flex: 1; padding: 22px 24px 64px; max-width: 1020px; width: 100%; }
 
-/* Editorial overview posture, hairline trio & clickable setup strip */
-.pw-eyebrow {
-  display: flex; align-items: center; gap: 8px;
-  color: var(--pw-fg-3); font-size: 12px; margin-bottom: 6px;
+/* Compact posture bar replacing the old eyebrow + headline + trio */
+.pw-posture {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px 24px;
+  flex-wrap: wrap;
+  padding: 12px 0 13px;
+  border-top: 1px solid var(--pw-line);
+  border-bottom: 1px solid var(--pw-line);
 }
-.pw-hed {
-  font-size: 18px; line-height: 26px; font-weight: 600;
-  letter-spacing: -0.017em; margin: 0; color: var(--pw-fg); max-width: 780px;
+.pw-posture-main { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1 1 320px; }
+.pw-posture-main > .pw-dot { width: 8px; height: 8px; }
+.pw-posture-copy { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pw-posture-title {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 15px; line-height: 22px; font-weight: 600;
+  letter-spacing: -0.012em; color: var(--pw-fg);
 }
-.pw-trio {
-  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
-  margin-top: 16px; border-top: 1px solid var(--pw-line); border-bottom: 1px solid var(--pw-line);
+.pw-posture-sub { color: var(--pw-fg-3); font-size: 12px; line-height: 18px; }
+.pw-posture-facts {
+  display: flex; align-items: center; gap: 6px 14px; flex-wrap: wrap;
+  color: var(--pw-fg-3); font-size: 12px;
 }
-.pw-trio > div { padding: 12px 18px 14px 0; min-width: 0; }
-.pw-trio > div + div { padding-left: 18px; border-left: 1px solid var(--pw-line); }
-.pw-trio h3 { margin: 0 0 6px; font-size: 11.5px; font-weight: 500; color: var(--pw-fg-3); }
-.pw-trio .big { font-size: 15px; line-height: 22px; font-weight: 600; color: var(--pw-fg); margin-bottom: 3px; }
-.pw-trio p { margin: 0; color: var(--pw-fg-2); font-size: 12px; line-height: 18px; }
+.pw-posture-facts b { font-weight: 600; color: var(--pw-fg-2); }
+.pw-posture-facts .pw-posture-linked { color: var(--pw-fg-2); }
+
+/* Completed setup collapses to one calm line */
+.pw-setup-done {
+  display: flex; align-items: center; gap: 10px 14px; flex-wrap: wrap;
+  margin-top: 18px; padding: 8px 12px;
+  border: 1px solid var(--pw-line); border-radius: 8px;
+  background: var(--pw-sunk); color: var(--pw-fg-2); font-size: 12px;
+}
+.pw-setup-done-label {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-weight: 500; color: var(--pw-fg);
+}
+.pw-setup-done-label .ico { color: var(--pw-fg-3); }
+.pw-setup-done-meta { color: var(--pw-fg-3); }
+.pw-setup-done .pw-btn { margin-left: auto; }
 
 .pw-sec { margin-top: 22px; }
 .pw-sec-head {
@@ -264,11 +282,22 @@
 .pw-needs button:hover { background: var(--pw-hover); }
 .pw-needs .n { font-size: 13.5px; font-weight: 600; color: var(--pw-fg); display: flex; align-items: center; gap: 6px; }
 .pw-needs .l { color: var(--pw-fg-3); font-size: 11.5px; line-height: 16px; }
-.pw-needs button.ready .n { color: var(--pw-ok); }
-.pw-needs button.hot .n { color: var(--pw-warn); }
 
 /* Hairline tables & rows */
 .pw-table-wrap { border-top: 1px solid var(--pw-line); }
+.pw-table-wrap-spaced { margin-top: 18px; }
+.pw-group-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  padding: 10px 4px 7px;
+}
+.pw-group-head h3 { margin: 0; font-size: 12px; font-weight: 600; color: var(--pw-fg); }
+.pw-group-head .muted { font-size: 11.5px; }
+.pw-host-search { width: 180px; height: 26px; }
+.pw-footnote {
+  margin: 14px 0 0; padding: 10px 12px;
+  border-top: 1px solid var(--pw-line);
+  color: var(--pw-fg-3); font-size: 12px; line-height: 18px;
+}
 .pw-row {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
   min-height: 44px; padding: 8px 4px; border-bottom: 1px solid var(--pw-line);
@@ -422,10 +451,11 @@
   font-size: 11.5px; line-height: 16px; color: var(--pw-fg-2);
 }
 
-/* Compact persona multi-select pills & section boxes */
-.pw-section-box {
-  border: 1px solid var(--pw-line); border-radius: 9px; background: var(--pw-panel);
-  padding: 12px 14px; display: flex; flex-direction: column; gap: 10px;
+/* Compact persona multi-select pills & section groups */
+.pw-section-group {
+  border-top: 1px solid var(--pw-line);
+  padding-top: 12px;
+  display: flex; flex-direction: column; gap: 10px;
 }
 .pw-section-box-h {
   display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
@@ -468,6 +498,25 @@
 .pw-budget-ctrl {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
 }
+.pw-budget-row.is-flat {
+  padding: 10px 0 0; border: 0; border-radius: 0; border-top: 1px solid var(--pw-line);
+  background: transparent;
+}
+.pw-persona-quickfill {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-size: 12px;
+}
+.pw-persona-quickfill > .muted { margin-right: 2px; }
+.pw-curl-helper { display: grid; gap: 6px; }
+.pw-persona-advanced { margin-top: 0; }
+.pw-hdr-more { width: 26px; padding: 0; }
+.pw-menu { min-width: 168px; }
+.pw-menu-item {
+  display: flex; align-items: center; justify-content: flex-start; gap: 8px;
+  padding: 7px 9px; border-radius: 6px;
+  font-size: 12.5px; color: var(--fg, #1b1b1a); cursor: pointer;
+}
+.pw-menu-item[data-variant=destructive] { color: var(--bad, #cf3a3a); }
 .pw-budget-in {
   width: 84px; height: 26px; padding: 0 8px; border: 0; border-radius: 6px;
   background: var(--pw-panel); box-shadow: var(--pw-shadow-sm);
@@ -545,7 +594,7 @@
 .pw-disclosure > summary:hover { color: var(--pw-fg); }
 .pw-disclosure-body { margin-top: 10px; display: grid; gap: 10px; }
 
-/* GitHub Device Flow & PAT steps & repo checklist */
+/* GitHub Device Flow & access-token steps & repo checklist */
 .pw-gh-device {
   display: grid; gap: 10px;
 }
@@ -652,8 +701,7 @@
 }
 
 @media (max-width: 780px) {
-  .pw-trio, .pw-needs, .pw-grid-2, .pw-grid-3 { grid-template-columns: minmax(0, 1fr); }
-  .pw-trio > div + div { padding-left: 0; border-left: 0; border-top: 1px solid var(--pw-line); }
+  .pw-needs, .pw-grid-2, .pw-grid-3 { grid-template-columns: minmax(0, 1fr) !important; }
   .pw-needs button + button { border-left: 0; border-top: 1px solid var(--pw-line); }
   .pw-hdr, .pw-toolbar { padding: 0 14px; }
   .pw-body { padding: 16px 14px 48px; }

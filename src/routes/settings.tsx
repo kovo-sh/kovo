@@ -1,22 +1,21 @@
 import { createFileRoute, Link, useNavigate, useRouter } from '@tanstack/react-router'
 import { useEffect, useRef, useState } from 'react'
 import {
-  cancelGithubDeviceFlowAction,
   clearGithubToken,
   getGithubStatus,
   listGithubRepositories,
   listModels,
-  pollGithubDeviceFlowAction,
   removeModelProfile,
   saveGithubToken,
-  startGithubDeviceFlowAction,
   testModel,
   toggleModelProfile,
 } from '../actions.ts'
 import { formatHumanTime, useAction } from '../components/common.tsx'
+import { useGithubDeviceFlow } from '../components/github/useGithubDeviceFlow.ts'
 import { GithubInstallBanner } from '../components/project/GithubInstallBanner.tsx'
 import { ModelProfileSheet } from '../components/settings/ModelProfileSheet.tsx'
 import '../components/settings/settings.css'
+import { Icon } from '../components/run/icons.tsx'
 import { id } from '../domain.ts'
 import type { PublicModelProfile } from '../domain.ts'
 
@@ -57,39 +56,10 @@ export const Route = createFileRoute('/settings')({
 
 type GithubStatusData = Awaited<ReturnType<typeof getGithubStatus>>
 
-interface ActiveDeviceFlow {
-  flowId: string
-  userCode: string
-  verificationUri: string
-  expiresIn: number
-  intervalSec: number
-}
-
-async function copyText(text: string): Promise<boolean> {
-  if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return false
-  try {
-    await navigator.clipboard.writeText(text)
-    return true
-  } catch {
-    return false
-  }
-}
-
 function githubConnectionSummary(status: GithubStatusData): { label: string; tone: 'ok' | 'solid' } {
   if (!status.configured) return { label: 'Not connected', tone: 'solid' }
-  if (status.authKind === 'github_app_device') {
-    return {
-      label: status.login ? `Connected via GitHub App · @${status.login}` : 'Connected via GitHub App',
-      tone: 'ok',
-    }
-  }
-  const kind = status.tokenKind === 'fine_grained'
-    ? 'Read-only token'
-    : status.tokenKind === 'classic'
-      ? 'Classic token'
-      : 'GitHub token'
   return {
-    label: status.source === 'fixture' ? `${kind} · local preset` : `${kind} saved`,
+    label: status.login ? `GitHub connected · @${status.login}` : 'GitHub connected',
     tone: 'ok',
   }
 }
@@ -98,24 +68,55 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
   const router = useRouter()
   const [status, setStatus] = useState<GithubStatusData>(initialStatus)
   const [reconnecting, setReconnecting] = useState(false)
-  const [clientIdInput, setClientIdInput] = useState('')
-  const [deviceFlow, setDeviceFlow] = useState<ActiveDeviceFlow | null>(null)
-  const [startingFlow, setStartingFlow] = useState(false)
-  const [codeCopied, setCodeCopied] = useState(false)
   const [patInput, setPatInput] = useState('')
   const [savingPat, setSavingPat] = useState(false)
   const [disconnecting, setDisconnecting] = useState(false)
+  const [confirmDisconnect, setConfirmDisconnect] = useState(false)
   const [loadingInstallations, setLoadingInstallations] = useState(false)
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
-  const activeFlowIdRef = useRef<string | null>(null)
   const autoFetchedInstallationsRef = useRef(false)
+
+  const device = useGithubDeviceFlow({
+    configured: Boolean(status.githubDeviceFlowConfigured),
+    disabled: savingPat || disconnecting,
+    onStart: () => {
+      setError('')
+      setNotice('')
+    },
+    onAuthorized: async result => {
+      setReconnecting(false)
+      setError('')
+      setStatus(result.accountStatus)
+      const who = result.login ? ` · @${result.login}` : ''
+      setNotice(`Connected to GitHub${who}. Found ${result.repoCount} accessible ${result.repoCount === 1 ? 'repository' : 'repositories'}.`)
+      await router.invalidate()
+    },
+  })
+  const {
+    flow: deviceFlow,
+    starting: startingFlow,
+    error: deviceFlowError,
+    clientId: clientIdInput,
+    setClientId: setClientIdInput,
+    codeCopied,
+  } = device
+  const displayError = error || deviceFlowError
 
   const isGithubAppSession = status.configured && (status.authKind === 'github_app_device' || status.tokenKind === 'github_app')
 
   useEffect(() => {
     setStatus(initialStatus)
   }, [initialStatus])
+
+  useEffect(() => {
+    if (!confirmDisconnect) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !disconnecting) setConfirmDisconnect(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [confirmDisconnect, disconnecting])
 
   useEffect(() => {
     if (!isGithubAppSession) {
@@ -150,102 +151,6 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
       setError(err instanceof Error ? err.message : 'Could not refresh GitHub installations.')
     } finally {
       setLoadingInstallations(false)
-    }
-  }
-
-  useEffect(() => {
-    activeFlowIdRef.current = deviceFlow?.flowId ?? null
-  }, [deviceFlow?.flowId])
-
-  useEffect(() => {
-    if (!deviceFlow) return
-    let cancelled = false
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const flowId = deviceFlow.flowId
-
-    const scheduleNext = (delaySec: number) => {
-      if (cancelled) return
-      timer = setTimeout(() => {
-        void pollOnce()
-      }, Math.max(1, delaySec) * 1000)
-    }
-
-    const pollOnce = async () => {
-      if (cancelled || activeFlowIdRef.current !== flowId) return
-      try {
-        const res = await pollGithubDeviceFlowAction({ data: { flowId } })
-        if (cancelled || activeFlowIdRef.current !== flowId) return
-        if (res.status === 'pending') {
-          scheduleNext(res.intervalSec)
-          return
-        }
-        if (res.status === 'slow_down') {
-          setDeviceFlow(prev => (prev && prev.flowId === flowId ? { ...prev, intervalSec: res.intervalSec } : prev))
-          scheduleNext(res.intervalSec)
-          return
-        }
-        if (res.status === 'authorized') {
-          setDeviceFlow(null)
-          setReconnecting(false)
-          setCodeCopied(false)
-          setClientIdInput('')
-          setError('')
-          setStatus(res.accountStatus)
-          const who = res.login ? ` · @${res.login}` : ''
-          setNotice(`Connected via GitHub App${who}. Found ${res.repoCount} accessible ${res.repoCount === 1 ? 'repository' : 'repositories'}.`)
-          await router.invalidate()
-          return
-        }
-        setDeviceFlow(null)
-        setError(res.error || 'GitHub sign-in did not complete.')
-      } catch (err) {
-        if (cancelled || activeFlowIdRef.current !== flowId) return
-        setDeviceFlow(null)
-        setError(err instanceof Error ? err.message : 'GitHub sign-in polling failed.')
-      }
-    }
-
-    scheduleNext(deviceFlow.intervalSec)
-    return () => {
-      cancelled = true
-      if (timer) clearTimeout(timer)
-    }
-  }, [deviceFlow?.flowId, router])
-
-  async function handleStartDeviceFlow() {
-    if (startingFlow || savingPat || disconnecting) return
-    const trimmedClientId = clientIdInput.trim()
-    if (!status.githubDeviceFlowConfigured && trimmedClientId.length < 6) {
-      setError('Enter your GitHub App Client ID to start sign-in.')
-      return
-    }
-    setStartingFlow(true)
-    setError('')
-    setNotice('')
-    setCodeCopied(false)
-    try {
-      const started = await startGithubDeviceFlowAction({
-        data: trimmedClientId ? { clientId: trimmedClientId } : undefined,
-      })
-      setDeviceFlow(started)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not start GitHub Device Flow.')
-    } finally {
-      setStartingFlow(false)
-    }
-  }
-
-  async function handleCancelDeviceFlow() {
-    const flowId = deviceFlow?.flowId
-    setDeviceFlow(null)
-    setCodeCopied(false)
-    setError('')
-    if (flowId) {
-      try {
-        await cancelGithubDeviceFlowAction({ data: { flowId } })
-      } catch {
-        // Best-effort
-      }
     }
   }
 
@@ -313,7 +218,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
             </span>
             <p
               className="sw-sheet-row-desc"
-              title="Credentials are stored locally in an owner-only (0600) credential file"
+              title="Credentials are stored privately on this machine"
             >
               {status.configured && status.authKind === 'github_app_device'
                 ? 'Authorized with read-only GitHub App access (code and metadata only). Tokens refresh automatically and stay stored privately on your machine.'
@@ -342,7 +247,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
                     type="button"
                     className="sw-btn danger"
                     disabled={disconnecting || startingFlow || savingPat}
-                    onClick={() => void handleDisconnect()}
+                    onClick={() => setConfirmDisconnect(true)}
                   >
                     {disconnecting ? 'Disconnecting…' : 'Disconnect'}
                   </button>
@@ -353,7 +258,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
                 type="button"
                 className="sw-btn primary"
                 disabled={startingFlow || savingPat}
-                onClick={() => void handleStartDeviceFlow()}
+                onClick={() => void device.start()}
               >
                 {startingFlow ? 'Starting…' : 'Sign in with GitHub'}
               </button>
@@ -385,7 +290,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
                   <strong>GitHub App Client ID</strong>
                   <span
                     className="sw-muted"
-                    title="Server administrators can set GUARDIAN_GITHUB_CLIENT_ID in the environment for one-click sign-in"
+                    title="Stored privately on this machine for one-click sign-in"
                   >
                     Needed once for one-click GitHub sign-in
                   </span>
@@ -395,7 +300,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
                     className="sw-input"
                     type="text"
                     value={clientIdInput}
-                    onChange={e => { setClientIdInput(e.target.value); setError('') }}
+                    onChange={e => setClientIdInput(e.target.value)}
                     placeholder="Iv23li…"
                     autoComplete="off"
                     disabled={startingFlow || savingPat}
@@ -405,7 +310,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
                     type="button"
                     className="sw-btn primary"
                     disabled={startingFlow || savingPat || clientIdInput.trim().length < 6}
-                    onClick={() => void handleStartDeviceFlow()}
+                    onClick={() => void device.start()}
                   >
                     {startingFlow ? 'Starting…' : 'Sign in with GitHub'}
                   </button>
@@ -418,7 +323,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
                   type="button"
                   className="sw-btn primary"
                   disabled={startingFlow || savingPat}
-                  onClick={() => void handleStartDeviceFlow()}
+                  onClick={() => void device.start()}
                 >
                   {startingFlow ? 'Starting…' : 'Sign in with GitHub'}
                 </button>
@@ -452,7 +357,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
               <button
                 type="button"
                 className="sw-btn"
-                onClick={() => void copyText(deviceFlow.userCode).then(ok => setCodeCopied(ok))}
+                onClick={() => void device.copyCode()}
               >
                 {codeCopied ? 'Copied code' : 'Copy code'}
               </button>
@@ -467,7 +372,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
               <button
                 type="button"
                 className="sw-btn ghost"
-                onClick={() => void handleCancelDeviceFlow()}
+                onClick={() => void device.cancel()}
               >
                 Cancel
               </button>
@@ -488,7 +393,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
                   <span
                     className="sw-sheet-row-desc"
-                    title="Saved locally in an owner-only (0600) credential file"
+                    title="Stored privately on this machine"
                   >
                     Scope a read-only token to <strong>Contents: Read-only</strong> and paste it below (stored privately on your machine).
                   </span>
@@ -526,13 +431,72 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
           </div>
         )}
 
-        {error && (
-          <div role="alert" className="sw-band-foot err">{error}</div>
+        {displayError && (
+          <div role="alert" className="sw-band-foot err">{displayError}</div>
         )}
         {notice && !error && (
           <div role="status" className="sw-band-foot ok">{notice}</div>
         )}
       </div>
+
+      {confirmDisconnect && (
+        <div
+          className="sw-overlay"
+          role="presentation"
+          onMouseDown={event => {
+            if (event.target === event.currentTarget && !disconnecting) setConfirmDisconnect(false)
+          }}
+        >
+          <div
+            className="sw-modal"
+            style={{ width: 440 }}
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="sw-disconnect-title"
+          >
+            <div className="sw-modal-h">
+              <h2 id="sw-disconnect-title">Disconnect GitHub?</h2>
+              <button
+                type="button"
+                className="sw-btn ghost sm"
+                disabled={disconnecting}
+                onClick={() => setConfirmDisconnect(false)}
+                aria-label="Close"
+              >
+                <Icon name="close" size={14} />
+              </button>
+            </div>
+            <div className="sw-modal-b">
+              <p style={{ margin: 0, fontSize: '12.5px', color: 'var(--sw-fg-2)' }}>
+                This removes the saved GitHub credential from this machine. Source sync and repository discovery stop until you connect again.
+              </p>
+            </div>
+            <div className="sw-modal-f">
+              <div className="sw-modal-f-acts">
+                <button
+                  type="button"
+                  className="sw-btn ghost"
+                  disabled={disconnecting}
+                  onClick={() => setConfirmDisconnect(false)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="sw-btn danger"
+                  disabled={disconnecting}
+                  onClick={() => {
+                    setConfirmDisconnect(false)
+                    void handleDisconnect()
+                  }}
+                >
+                  {disconnecting ? 'Disconnecting…' : 'Disconnect'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   )
 }
@@ -542,22 +506,22 @@ function healthLabel(profile: PublicModelProfile): { text: string; tone: 'ok' | 
   if (profile.healthState === 'open') {
     if (profile.cooldownUntil && profile.cooldownUntil > Date.now()) {
       const secs = Math.max(1, Math.ceil((profile.cooldownUntil - Date.now()) / 1000))
-      return { text: `Circuit open (${secs}s)`, tone: 'bad' }
+      return { text: `Temporarily unavailable (${secs}s)`, tone: 'bad' }
     }
-    return { text: 'Circuit open', tone: 'bad' }
+    return { text: 'Temporarily unavailable', tone: 'bad' }
   }
-  if (profile.healthState === 'half_open') return { text: 'Half-open', tone: 'warn' }
+  if (profile.healthState === 'half_open') return { text: 'Recovering', tone: 'warn' }
   return { text: 'Healthy', tone: 'ok' }
 }
 
 function poolSummary(profiles: PublicModelProfile[]): { label: string; tone: 'ok' | 'warn' | 'bad' | 'solid' } {
   const enabled = profiles.filter(p => p.enabled)
-  if (enabled.length === 0) return { label: 'No active model', tone: 'warn' }
+  if (enabled.length === 0) return { label: 'No model enabled', tone: 'warn' }
   const openCount = enabled.filter(p => p.healthState === 'open').length
   const halfCount = enabled.filter(p => p.healthState === 'half_open').length
-  if (openCount === enabled.length) return { label: `Pool open · ${enabled.length} of ${profiles.length}`, tone: 'bad' }
-  if (openCount > 0 || halfCount > 0) return { label: `Degraded · ${enabled.length} of ${profiles.length} enabled`, tone: 'warn' }
-  return { label: `Healthy · ${enabled.length} of ${profiles.length} enabled`, tone: 'ok' }
+  if (openCount === enabled.length) return { label: `All models unavailable · ${enabled.length} of ${profiles.length}`, tone: 'bad' }
+  if (openCount > 0 || halfCount > 0) return { label: `Some models unavailable · ${enabled.length} of ${profiles.length} enabled`, tone: 'warn' }
+  return { label: `Ready · ${enabled.length} of ${profiles.length} enabled`, tone: 'ok' }
 }
 
 function formatK(value: number) {
@@ -594,6 +558,7 @@ function SettingsWorkbenchPage() {
   const [editing, setEditing] = useState<PublicModelProfile>()
   const [testingId, setTestingId] = useState<string | null>(null)
   const [pageStatus, setPageStatus] = useState('')
+  const [confirmDelete, setConfirmDelete] = useState<PublicModelProfile | null>(null)
 
   const pool = poolSummary(profiles)
   const enabledCount = profiles.filter(p => p.enabled).length
@@ -693,7 +658,7 @@ function SettingsWorkbenchPage() {
             </div>
             <span
               className="sw-sec-meta sw-num"
-              title="Keys are stored locally in owner-only (0600) credential files"
+              title="Keys are stored privately on this machine"
             >
               {profiles.length > 0
                 ? `${enabledCount} of ${profiles.length} enabled · highest priority tried first`
@@ -747,15 +712,11 @@ function SettingsWorkbenchPage() {
                           <div className="sw-prof-main">
                             <div className="sw-prof-top">
                               <span className="sw-prof-name">{profile.name}</span>
-                              <span className="sw-tag solid sw-mono">{profile.model}</span>
-                              <span className="sw-tag">
-                                {profile.protocol === 'messages' ? 'Anthropic' : 'Responses'}
-                              </span>
-                              {profile.roleAffinity && profile.roleAffinity !== 'any' && (
-                                <span className="sw-tag accent">{profile.roleAffinity}</span>
-                              )}
+                              <span className="sw-prof-model sw-mono" title={profile.model}>{profile.model}</span>
                             </div>
                             <div className="sw-prof-sub">
+                              <span>{profile.protocol === 'messages' ? 'Anthropic Messages' : 'OpenAI Responses'}</span>
+                              <span aria-hidden="true">·</span>
                               <span className="sw-mono" title={profile.endpoint}>{shortEndpointHost(profile.endpoint)}</span>
                               <span aria-hidden="true">·</span>
                               <span>Role: {profile.roleAffinity ?? 'any'}</span>
@@ -776,7 +737,7 @@ function SettingsWorkbenchPage() {
                         <td>
                           <span
                             className={`sw-status-cell ${status.tone}`}
-                            title={profile.healthState === 'closed' ? 'Circuit breaker closed' : status.text}
+                            title={profile.healthState === 'closed' ? 'Healthy' : status.text}
                           >
                             <i className={`sw-dot ${status.tone}`} aria-hidden="true" />
                             {status.text}
@@ -836,16 +797,7 @@ function SettingsWorkbenchPage() {
                               disabled={poolAction.pending}
                               onClick={() => {
                                 setPageStatus('')
-                                void poolAction.submit(
-                                  () => removeModelProfile({ data: { profileId: profile.id } }),
-                                  () => {
-                                    if (editing?.id === profile.id) {
-                                      setEditing(undefined)
-                                      setSheetOpen(false)
-                                    }
-                                    setPageStatus(`${profile.name} deleted.`)
-                                  },
-                                )
+                                setConfirmDelete(profile)
                               }}
                             >
                               Delete
@@ -879,6 +831,75 @@ function SettingsWorkbenchPage() {
           if (runId) await navigate({ to: '/runs/$runId', params: { runId } })
         }}
       />
+
+      {confirmDelete && (
+        <div
+          className="sw-overlay"
+          role="presentation"
+          onMouseDown={event => {
+            if (event.target === event.currentTarget && !poolAction.pending) setConfirmDelete(null)
+          }}
+        >
+          <div
+            className="sw-modal"
+            style={{ width: 440 }}
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="sw-delete-profile-title"
+          >
+            <div className="sw-modal-h">
+              <h2 id="sw-delete-profile-title">Delete model profile?</h2>
+              <button
+                type="button"
+                className="sw-btn ghost sm"
+                disabled={poolAction.pending}
+                onClick={() => setConfirmDelete(null)}
+                aria-label="Close"
+              >
+                <Icon name="close" size={14} />
+              </button>
+            </div>
+            <div className="sw-modal-b">
+              <p style={{ margin: 0, fontSize: '12.5px', color: 'var(--sw-fg-2)' }}>
+                Remove <strong style={{ color: 'var(--sw-fg)' }}>{confirmDelete.name}</strong> from the failover pool. Its saved API key is deleted from this machine and cannot be recovered.
+              </p>
+            </div>
+            <div className="sw-modal-f">
+              <div className="sw-modal-f-acts">
+                <button
+                  type="button"
+                  className="sw-btn ghost"
+                  disabled={poolAction.pending}
+                  onClick={() => setConfirmDelete(null)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="sw-btn danger"
+                  disabled={poolAction.pending}
+                  onClick={() => {
+                    const profile = confirmDelete
+                    void poolAction.submit(
+                      () => removeModelProfile({ data: { profileId: profile.id } }),
+                      () => {
+                        if (editing?.id === profile.id) {
+                          setEditing(undefined)
+                          setSheetOpen(false)
+                        }
+                        setConfirmDelete(null)
+                        setPageStatus(`${profile.name} deleted.`)
+                      },
+                    )
+                  }}
+                >
+                  {poolAction.pending ? 'Deleting…' : 'Delete profile'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   )
 }

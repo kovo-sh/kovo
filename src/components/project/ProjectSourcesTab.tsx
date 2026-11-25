@@ -1,18 +1,16 @@
 import { useRouter } from '@tanstack/react-router'
 import { useEffect, useRef, useState } from 'react'
 import {
-  cancelGithubDeviceFlowAction,
   clearGithubToken,
   importSpec,
   listGithubRepositories,
-  pollGithubDeviceFlowAction,
   removeProjectSpec,
   saveGithubToken,
-  startGithubDeviceFlowAction,
   syncGithubRepositories,
 } from '../../actions.ts'
 import { maxSpecBytes } from '../../domain.ts'
 import { formatHumanTime, FormError, useAction } from '../common.tsx'
+import { useGithubDeviceFlow } from '../github/useGithubDeviceFlow.ts'
 import { GithubInstallBanner } from './GithubInstallBanner.tsx'
 import { GroupedRepoPicker } from './GroupedRepoPicker.tsx'
 import type { DiscoveredGithubRepo, ProjectLoaderData } from './types.ts'
@@ -20,14 +18,6 @@ import { safeHost } from './types.ts'
 
 interface Props {
   data: ProjectLoaderData
-}
-
-interface ActiveDeviceFlow {
-  flowId: string
-  userCode: string
-  verificationUri: string
-  expiresIn: number
-  intervalSec: number
 }
 
 function SourcesEmptyIllustration() {
@@ -66,16 +56,8 @@ async function copyCodeToClipboard(text: string): Promise<boolean> {
 }
 
 function formatGithubConnectionBadge(status: ProjectLoaderData['githubPatStatus']): string {
-  if (!status.configured) return 'Optional · Not connected'
-  if (status.authKind === 'github_app_device') {
-    return status.login ? `Connected via GitHub App · @${status.login}` : 'Connected via GitHub App'
-  }
-  const kindLabel = status.tokenKind === 'fine_grained'
-    ? 'Read-only token'
-    : status.tokenKind === 'classic'
-      ? 'Classic token'
-      : 'GitHub token'
-  return status.source === 'fixture' ? `${kindLabel} · local preset` : `${kindLabel} saved`
+  if (!status.configured) return 'Not connected'
+  return status.login ? `GitHub connected · @${status.login}` : 'GitHub connected'
 }
 
 export function ProjectSourcesTab({ data }: Props) {
@@ -94,123 +76,43 @@ export function ProjectSourcesTab({ data }: Props) {
   const [specNotice, setSpecNotice] = useState('')
   const [specName, setSpecName] = useState('')
   const [specContent, setSpecContent] = useState('')
-
-  // GitHub App Device Flow state
-  const [clientIdInput, setClientIdInput] = useState('')
-  const [deviceFlow, setDeviceFlow] = useState<ActiveDeviceFlow | null>(null)
-  const [deviceFlowStarting, setDeviceFlowStarting] = useState(false)
-  const [deviceFlowError, setDeviceFlowError] = useState('')
-  const [codeCopied, setCodeCopied] = useState(false)
-  const activeFlowIdRef = useRef<string | null>(null)
+  const manualUploadRef = useRef<HTMLDetailsElement | null>(null)
 
   const githubAction = useAction()
   const specAction = useAction()
+
+  const device = useGithubDeviceFlow({
+    configured: Boolean(githubPatStatus.githubDeviceFlowConfigured),
+    disabled: githubAction.pending,
+    onStart: () => setGithubNotice(''),
+    onAuthorized: async result => {
+      setEditingGithubToken(false)
+      setLiveGithubStatus(result.accountStatus)
+      const who = result.login ? ` · @${result.login}` : ''
+      setGithubNotice(`Connected to GitHub${who}. Found ${result.repoCount} accessible ${result.repoCount === 1 ? 'repository' : 'repositories'}.`)
+      await router.invalidate()
+      loadGithubRepos()
+    },
+  })
+  const {
+    flow: deviceFlow,
+    starting: deviceFlowStarting,
+    error: deviceFlowError,
+    clientId: clientIdInput,
+    setClientId: setClientIdInput,
+    codeCopied,
+    clearError: clearDeviceFlowError,
+  } = device
 
   useEffect(() => {
     setLiveGithubStatus(githubPatStatus)
   }, [githubPatStatus])
 
-  useEffect(() => {
-    activeFlowIdRef.current = deviceFlow?.flowId ?? null
-  }, [deviceFlow?.flowId])
-
-  useEffect(() => {
-    if (!deviceFlow) return
-    let cancelled = false
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const flowId = deviceFlow.flowId
-
-    const scheduleNext = (delaySec: number) => {
-      if (cancelled) return
-      timer = setTimeout(() => {
-        void pollOnce()
-      }, Math.max(1, delaySec) * 1000)
+  function openManualUpload() {
+    if (manualUploadRef.current) {
+      manualUploadRef.current.open = true
+      manualUploadRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' })
     }
-
-    const pollOnce = async () => {
-      if (cancelled || activeFlowIdRef.current !== flowId) return
-      try {
-        const res = await pollGithubDeviceFlowAction({ data: { flowId } })
-        if (cancelled || activeFlowIdRef.current !== flowId) return
-        if (res.status === 'pending') {
-          scheduleNext(res.intervalSec)
-          return
-        }
-        if (res.status === 'slow_down') {
-          setDeviceFlow(prev => (prev && prev.flowId === flowId ? { ...prev, intervalSec: res.intervalSec } : prev))
-          scheduleNext(res.intervalSec)
-          return
-        }
-        if (res.status === 'authorized') {
-          setDeviceFlow(null)
-          setDeviceFlowError('')
-          setEditingGithubToken(false)
-          setCodeCopied(false)
-          setClientIdInput('')
-          setLiveGithubStatus(res.accountStatus)
-          const who = res.login ? ` · @${res.login}` : ''
-          setGithubNotice(`Connected via GitHub App${who}. Found ${res.repoCount} accessible ${res.repoCount === 1 ? 'repository' : 'repositories'}.`)
-          await router.invalidate()
-          loadGithubRepos()
-          return
-        }
-        setDeviceFlow(null)
-        setDeviceFlowError(res.error || 'GitHub sign-in did not complete. Please try again.')
-      } catch (err) {
-        if (cancelled || activeFlowIdRef.current !== flowId) return
-        setDeviceFlow(null)
-        setDeviceFlowError(err instanceof Error ? err.message : 'GitHub sign-in polling failed.')
-      }
-    }
-
-    scheduleNext(deviceFlow.intervalSec)
-    return () => {
-      cancelled = true
-      if (timer) clearTimeout(timer)
-    }
-  }, [deviceFlow?.flowId])
-
-  async function handleStartDeviceFlow() {
-    if (deviceFlowStarting || githubAction.pending) return
-    const trimmedClientId = clientIdInput.trim()
-    if (!githubPatStatus.githubDeviceFlowConfigured && trimmedClientId.length < 6) {
-      setDeviceFlowError('Enter your GitHub App Client ID to start sign-in.')
-      return
-    }
-    setDeviceFlowStarting(true)
-    setDeviceFlowError('')
-    setGithubNotice('')
-    setCodeCopied(false)
-    try {
-      const started = await startGithubDeviceFlowAction({
-        data: trimmedClientId ? { clientId: trimmedClientId } : undefined,
-      })
-      setDeviceFlow(started)
-    } catch (err) {
-      setDeviceFlowError(err instanceof Error ? err.message : 'Could not start GitHub Device Flow.')
-    } finally {
-      setDeviceFlowStarting(false)
-    }
-  }
-
-  async function handleCancelDeviceFlow() {
-    const flowId = deviceFlow?.flowId
-    setDeviceFlow(null)
-    setDeviceFlowError('')
-    setCodeCopied(false)
-    if (flowId) {
-      try {
-        await cancelGithubDeviceFlowAction({ data: { flowId } })
-      } catch {
-        // Best-effort cleanup
-      }
-    }
-  }
-
-  async function handleCopyUserCode() {
-    if (!deviceFlow) return
-    const copied = await copyCodeToClipboard(deviceFlow.userCode)
-    setCodeCopied(copied)
   }
 
   function loadGithubRepos() {
@@ -260,7 +162,7 @@ export function ProjectSourcesTab({ data }: Props) {
             {formatGithubConnectionBadge(githubPatStatus)}
           </span>
         </div>
-        <p title="Credentials are stored locally in an owner-only (0600) credential file and never echoed back">
+        <p title="Credentials are stored privately on this machine and never shown again">
           Optional read-only GitHub sync for source code, API schemas, and dependency checks. Credentials stay stored privately on your machine and are never shown again.
         </p>
       </div>
@@ -281,7 +183,7 @@ export function ProjectSourcesTab({ data }: Props) {
           onClick={() => {
             setEditingGithubToken(v => !v)
             setGithubNotice('')
-            setDeviceFlowError('')
+            clearDeviceFlowError()
           }}
           aria-expanded={editingGithubToken}
         >
@@ -293,7 +195,7 @@ export function ProjectSourcesTab({ data }: Props) {
     {githubNotice && <p role="status" className="notice">{githubNotice}</p>}
     {specNotice && <p role="status" className="notice">{specNotice}</p>}
 
-    {(!githubPatStatus.configured || editingGithubToken) && <div className="pw-sheet" style={{ marginBottom: 16 }}>
+    {(!githubPatStatus.configured || editingGithubToken) && <div className="pw-sheet" id="pw-github-connect" style={{ marginBottom: 16 }}>
       <div className="pw-sheet-h">
         <span>{githubPatStatus.configured ? 'Reconnect GitHub account' : 'Sign in with GitHub'}</span>
         <span className="pw-tag solid">Read-only · Auto-refresh</span>
@@ -304,7 +206,7 @@ export function ProjectSourcesTab({ data }: Props) {
             <p
               className="muted"
               style={{ margin: 0, fontSize: 12 }}
-              title="Uses GitHub App Device Flow (Contents: Read-only, Metadata: Read-only) with automatic refresh in a local 0600 file"
+              title="Read-only GitHub App access with automatic token refresh, stored privately on this machine"
             >
               Sign in to Kovo Hunter with read-only GitHub App access (code and metadata only). Expiring tokens refresh automatically and stay stored privately on your machine.
             </p>
@@ -316,7 +218,7 @@ export function ProjectSourcesTab({ data }: Props) {
                     className="pw-in mono"
                     type="text"
                     value={clientIdInput}
-                    onChange={e => { setClientIdInput(e.target.value); setDeviceFlowError('') }}
+                    onChange={e => setClientIdInput(e.target.value)}
                     placeholder="Iv23li…"
                     autoComplete="off"
                     disabled={deviceFlowStarting || githubAction.pending}
@@ -324,7 +226,7 @@ export function ProjectSourcesTab({ data }: Props) {
                 </div>
                 <span
                   className="hint"
-                  title="Server administrators can set GUARDIAN_GITHUB_CLIENT_ID in the environment for one-click sign-in. Saved locally with 0600 permissions."
+                  title="Stored privately on your machine for one-click GitHub sign-in"
                 >
                   Entered once for one-click GitHub sign-in and stored privately on your machine.
                 </span>
@@ -335,7 +237,7 @@ export function ProjectSourcesTab({ data }: Props) {
                 type="button"
                 className="pw-btn primary"
                 disabled={deviceFlowStarting || githubAction.pending || (!githubPatStatus.githubDeviceFlowConfigured && clientIdInput.trim().length < 6)}
-                onClick={() => void handleStartDeviceFlow()}
+                onClick={() => void device.start()}
               >
                 {deviceFlowStarting ? 'Starting GitHub sign-in…' : 'Sign in with GitHub'}
               </button>
@@ -343,7 +245,7 @@ export function ProjectSourcesTab({ data }: Props) {
                 <button
                   type="button"
                   className="pw-btn ghost"
-                  onClick={() => { setEditingGithubToken(false); setGithubTokenInput(''); setDeviceFlowError('') }}
+                  onClick={() => { setEditingGithubToken(false); setGithubTokenInput(''); clearDeviceFlowError() }}
                 >
                   Cancel
                 </button>
@@ -360,7 +262,7 @@ export function ProjectSourcesTab({ data }: Props) {
               <button
                 type="button"
                 className="pw-btn"
-                onClick={() => void handleCopyUserCode()}
+                onClick={() => void device.copyCode()}
               >
                 {codeCopied ? 'Copied code' : 'Copy code'}
               </button>
@@ -381,7 +283,7 @@ export function ProjectSourcesTab({ data }: Props) {
               <button
                 type="button"
                 className="pw-btn ghost"
-                onClick={() => void handleCancelDeviceFlow()}
+                onClick={() => void device.cancel()}
               >
                 Cancel
               </button>
@@ -398,7 +300,7 @@ export function ProjectSourcesTab({ data }: Props) {
               <ol className="pw-steps" style={{ flex: 1 }}>
                 <li>Under <strong>Repository access</strong>, choose <strong>Only select repositories</strong> and pick the repos you want Kovo Hunter to inspect.</li>
                 <li>Under <strong>Repository permissions</strong>, set <strong>Contents: Read-only</strong>.</li>
-                <li>Click <strong>Generate token</strong> and paste it below — <span title="Saved locally in an owner-only (0600) credential file">stored privately on your machine</span>.</li>
+                <li>Click <strong>Generate token</strong> and paste it below — <span title="Stored privately on this machine">stored privately on your machine</span>.</li>
               </ol>
               <a
                 className="pw-btn"
@@ -416,7 +318,7 @@ export function ProjectSourcesTab({ data }: Props) {
                 const token = githubTokenInput.trim()
                 if (!token) return
                 setGithubNotice('')
-                setDeviceFlowError('')
+                clearDeviceFlowError()
                 void githubAction.submit(() => saveGithubToken({ data: { token } }), result => {
                   setLiveGithubStatus(result.status)
                   setGithubTokenInput('')
@@ -514,7 +416,6 @@ export function ProjectSourcesTab({ data }: Props) {
           <p
             className="muted"
             style={{ margin: 0, fontSize: 11.5 }}
-            title="Loaded from local fallback token file (~/.config/guardian-fixtures/github.pat)"
           >
             Using a local fallback GitHub token. Click <strong>Change connection</strong> to sign in with GitHub or save your own read-only token instead.
           </p>
@@ -628,19 +529,36 @@ export function ProjectSourcesTab({ data }: Props) {
         })}
       </div>
     ) : (
-      <div className="pw-empty" style={{ padding: '32px 20px', gap: 12 }}>
+      <div className="pw-empty-card">
         <SourcesEmptyIllustration />
-        <div style={{ display: 'grid', gap: 4 }}>
-          <strong style={{ color: 'var(--pw-fg)', fontSize: 13.5 }}>No repositories or specs synced yet</strong>
-          <p style={{ margin: 0, maxWidth: 440 }}>
-            Connect GitHub above to pull read-only code and dependency context, or upload an OpenAPI or GraphQL schema manually below.
-          </p>
+        <h3>No repositories or specs synced yet</h3>
+        <p>
+          Connect GitHub to pull read-only code and dependency context, or upload an OpenAPI or GraphQL schema manually.
+        </p>
+        <div className="pw-sec-actions" style={{ justifyContent: 'center' }}>
+          <button
+            type="button"
+            className="pw-btn primary"
+            onClick={() => {
+              if (githubPatStatus.configured) {
+                setEditingGithubToken(false)
+                openRepoPicker()
+              } else {
+                document.getElementById('pw-github-connect')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+              }
+            }}
+          >
+            {githubPatStatus.configured ? 'Discover repositories' : 'Connect GitHub'}
+          </button>
+          <button type="button" className="pw-btn ghost" onClick={openManualUpload}>
+            Upload schema manually
+          </button>
         </div>
       </div>
     )}
 
-    <details className="pw-disclosure">
-      <summary>Advanced: upload schemas or lockfiles manually</summary>
+    <details className="pw-disclosure" ref={manualUploadRef}>
+      <summary>Advanced configuration</summary>
       <div className="pw-disclosure-body">
         <p className="muted" style={{ margin: 0, fontSize: 12 }}>
           Kovo Hunter automatically discovers runtime schemas and extracts OpenAPI, GraphQL, and lockfile specs from synced repositories. Use manual upload only when you need to supply an extra schema or lockfile directly.

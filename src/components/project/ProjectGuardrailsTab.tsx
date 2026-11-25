@@ -114,18 +114,16 @@ export function ProjectGuardrailsTab({ data }: Props) {
       <span>Local lab runner</span>
       <span
         className={`pw-tag ${labAllowed ? (labEnabled ? 'ok' : 'accent') : 'solid'}`}
-        title={labAllowed ? undefined : 'Fail-closed: requires a Local Lab project and server-side GUARDIAN_ALLOW_LOCAL_LAB=1'}
+        title={labAllowed ? undefined : 'Requires a Local Lab project with the local lab runner enabled on this server'}
       >
-        {labAllowed ? (labEnabled ? 'Lab enabled' : 'Lab ready') : 'Blocked by default'}
+        {labAllowed ? (labEnabled ? 'Lab enabled' : 'Lab ready') : 'Unavailable on this server'}
       </span>
     </div>
     <div className="pw-sheet-b">
       <p className="muted" style={{ margin: 0, fontSize: 12 }}>
         Isolated local Docker target stack with optional test-account seeding and runtime code telemetry.
         {!labAllowed && (
-          <span title="Requires a Local Lab project and GUARDIAN_ALLOW_LOCAL_LAB=1 on the server">
-            {' '}Available only on Local Lab projects when enabled on this server.
-          </span>
+          <span>Available only on Local Lab projects when enabled on this server.</span>
         )}
       </p>
       {labNotice && <p role="status" className="notice" style={{ margin: 0 }}>{labNotice}</p>}
@@ -192,11 +190,11 @@ export function ProjectGuardrailsTab({ data }: Props) {
   </form>
 
   return <div>
-    <section aria-label="Sandbox write allowlist">
+    <section aria-label="Approved write rules">
       <div className="pw-sec-head">
         <div>
-          <h2>Approved write endpoints <span className="muted num">({rules.length})</span></h2>
-          <p title="Tier-2 sandbox write allowlist; defaults to fail-closed empty list on public projects">
+          <h2>Approved write rules <span className="muted num">({rules.length})</span></h2>
+          <p title="Write requests stay blocked until you approve a specific endpoint">
             Allow non-destructive POST checks on specific staging or test-account endpoints. Write requests are blocked by default on public projects.
           </p>
         </div>
@@ -211,7 +209,7 @@ export function ProjectGuardrailsTab({ data }: Props) {
                 setAllowNotice('')
               }}
             >
-              {addRuleOpen ? 'Close' : 'Add write rule'}
+              {addRuleOpen ? 'Close' : 'Add rule'}
             </button>
           </div>
         )}
@@ -245,7 +243,7 @@ export function ProjectGuardrailsTab({ data }: Props) {
         }}
       >
         <div className="pw-sheet-h">
-          <span>Add write rule</span>
+          <span>Add rule</span>
           <button type="button" className="pw-btn ghost" onClick={() => setAddRuleOpen(false)}>Close</button>
         </div>
         <div className="pw-sheet-b">
@@ -272,7 +270,7 @@ export function ProjectGuardrailsTab({ data }: Props) {
         <div className="pw-sheet-f">
           <button type="button" className="pw-btn ghost" onClick={() => setAddRuleOpen(false)}>Cancel</button>
           <button type="submit" className="pw-btn primary" disabled={allowlistAction.pending || !allowOrigin.trim() || !allowPath.trim()}>
-            {allowlistAction.pending ? 'Saving…' : 'Save allowlist rule'}
+            {allowlistAction.pending ? 'Saving…' : 'Save rule'}
           </button>
         </div>
       </form>}
@@ -307,14 +305,12 @@ export function ProjectGuardrailsTab({ data }: Props) {
           ))}
         </div>
       ) : (
-        <div className="pw-empty" style={{ padding: '32px 20px', gap: 12 }}>
+        <div className="pw-empty-card">
           <GuardrailsEmptyIllustration />
-          <div style={{ display: 'grid', gap: 4 }}>
-            <strong style={{ color: 'var(--pw-fg)', fontSize: 13.5 }}>Write requests are blocked by default</strong>
-            <p style={{ margin: 0, maxWidth: 440 }}>
-              Kovo Hunter will not send state-changing requests unless you explicitly approve a staging or test-account endpoint here.
-            </p>
-          </div>
+          <h3>Write requests are blocked by default</h3>
+          <p>
+            Kovo Hunter will not send state-changing requests unless you explicitly approve a staging or test-account endpoint here.
+          </p>
           {!addRuleOpen && (
             <button
               type="button"
@@ -324,7 +320,7 @@ export function ProjectGuardrailsTab({ data }: Props) {
                 setAllowNotice('')
               }}
             >
-              Add write rule
+              Add rule
             </button>
           )}
         </div>
@@ -335,10 +331,9 @@ export function ProjectGuardrailsTab({ data }: Props) {
       {project.environment === 'local-lab' ? (
         labRunnerForm
       ) : (
-        <details className="pw-disclosure">
-          <summary>Local lab runner (unavailable on public HTTPS projects)</summary>
-          <div className="pw-disclosure-body">{labRunnerForm}</div>
-        </details>
+        <p className="pw-footnote">
+          Local Docker lab settings are only available on Local Lab projects.
+        </p>
       )}
     </section>
   </div>
