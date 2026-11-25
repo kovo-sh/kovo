@@ -1422,7 +1422,7 @@ export function computeHostPhaseBConcurrencyCap(input: {
   ceiling?: number
 } = {}): number {
   const hardCeiling = Math.max(
-    PHASE_B_AIMD_MIN_FLOOR,
+    1,
     Math.min(maxWorkerConcurrency, Math.floor(input.ceiling ?? PHASE_B_AIMD_MAX_CEILING)),
   )
   const cpuCount = Math.max(1, Math.floor(input.cpuCount ?? osCpus().length))
@@ -1430,7 +1430,7 @@ export function computeHostPhaseBConcurrencyCap(input: {
   const availGb = availBytes / (1024 ** 3)
   const cpuCap = Math.max(PHASE_B_AIMD_MIN_FLOOR, Math.floor(cpuCount * PHASE_B_AIMD_CPU_FRACTION))
   const ramCap = Math.max(PHASE_B_AIMD_MIN_FLOOR, Math.floor(availGb / PHASE_B_AIMD_RAM_GB_PER_SLOT))
-  return Math.max(PHASE_B_AIMD_MIN_FLOOR, Math.min(hardCeiling, cpuCap, ramCap))
+  return Math.min(hardCeiling, Math.max(PHASE_B_AIMD_MIN_FLOOR, Math.min(cpuCap, ramCap)))
 }
 
 /** Cap concurrency by remaining USD budget (`>= 1` slot; winds down cleanly as budget depletes). */
@@ -1505,7 +1505,7 @@ export class PhaseBConcurrencyController {
     this.override = explicit ?? null
     this.cleanWindowMs = Math.max(1_000, Math.floor(options.cleanWindowMs ?? PHASE_B_AIMD_CLEAN_WINDOW_MS))
     this.cleanCompletionsThreshold = Math.max(1, Math.floor(options.cleanCompletionsThreshold ?? PHASE_B_AIMD_CLEAN_COMPLETIONS_THRESHOLD))
-    const warm = Math.max(PHASE_B_AIMD_MIN_FLOOR, Math.floor(options.warmStart ?? PHASE_B_AIMD_WARM_START))
+    const warm = Math.max(1, Math.floor(options.warmStart ?? PHASE_B_AIMD_WARM_START))
     this.current = this.override ?? Math.min(warm, this.hardwareCap)
     this.windowStartedAt = this.now()
   }
@@ -1561,7 +1561,8 @@ export class PhaseBConcurrencyController {
     this.lastPressureKind = kind
     this.pressureEventsInWindow += 1
     if (this.override !== null) return this.override
-    const next = Math.max(PHASE_B_AIMD_MIN_FLOOR, Math.floor(this.current / 2))
+    const floor = Math.min(PHASE_B_AIMD_MIN_FLOOR, this.hardwareCap)
+    const next = Math.max(floor, Math.floor(this.current / 2))
     if (next < this.current) {
       this.current = next
       this.decreases += 1

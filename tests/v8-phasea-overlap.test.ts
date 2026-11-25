@@ -24,6 +24,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 
+import { RequestBroker } from '../src/server/broker.ts'
 import { Execution, type ExecutionCheckpoint } from '../src/server/execution.ts'
 import type { ExecFloorLane } from '../src/server/exec-floor-lane.ts'
 import { privateModelProfiles, saveModelProfile } from '../src/server/model-settings.ts'
@@ -417,7 +418,11 @@ test('ExecFloorLane.runEngineInvestigation requires allowThreatModelPhase during
   const { runId } = await setupApprovedRun(storage, { seeds: [ORIGIN_API], tier: 2 })
   storage.updateRun(runId, { phase: 'threat_model', status: 'running' })
 
-  const execution = new Execution(storage, { backend: stubBackend() })
+  const fastBroker = new RequestBroker({
+    resolve: async () => [{ address: '127.0.0.1', family: 4 }],
+    transport: async () => ({ status: 200, headers: { 'content-type': 'application/json' }, body: '{"ok":true}' }),
+  })
+  const execution = new Execution(storage, { backend: stubBackend(), broker: fastBroker, floorRequestBudget: 20, agentRequestBudget: 100 })
   t.after(() => execution.stop())
   const eng = internals(execution)
 
@@ -436,12 +441,18 @@ test('ExecFloorLane.runEngineInvestigation requires allowThreatModelPhase during
   let assignedWithFlag: string | null = null
   await eng.floorLane.runEngineInvestigation(storage.run(runId), {
     allowThreatModelPhase: true,
+    maxDurationMs: 2_000,
     onAssignment: id => { assignedWithFlag = id },
   })
   assert.ok(assignedWithFlag, 'allowThreatModelPhase: true must allow floor engine to claim its worker during threat_model')
   assert.ok(
     storage.eventsAfter(runId, 0).some(e => e.kind === 'deterministic_engine.probe_selection'),
     'allowThreatModelPhase: true must enter probe selection during threat_model',
+  )
+  assert.equal(
+    storage.eventsAfter(runId, 0).filter(e => e.kind === 'broker.denied').length,
+    0,
+    'allowThreatModelPhase: true must authorize floor HTTP requests during threat_model',
   )
 })
 
@@ -502,5 +513,156 @@ test('--no-llm / deterministicOnly and non-overlapped guards remain untouched', 
     ag.shouldStartDeterministicLane(storage.run(freshRunId), [{ id: 'p1', model: 'mock' }], { allowThreatModelPhase: true }),
     true,
     'threat_model is allowed when allowThreatModelPhase is set',
+  )
+})
+
+// ============================================================================
+// 6. Live HTTP regression guard: overlapped floor executes real probes during
+//    threat_model (zero BrokerDenied short-circuit) and records accurate floorMs
+// ============================================================================
+
+test('Phase A overlap executes real HTTP floor probes during threat_model without BrokerDenied and records accurate floorMs', async (t) => {
+  disableStage1Llm(t)
+  // Real loopback target server with a small per-request latency so floorMs reflects live HTTP work.
+  let targetHits = 0
+  const targetServer: Server = createServer((req, res) => {
+    targetHits += 1
+    const timer = setTimeout(() => {
+      if (res.destroyed || res.writableEnded) return
+      res.statusCode = 200
+      res.setHeader('Content-Type', 'application/json')
+      if ((req.url ?? '').startsWith('/api/items')) {
+        res.end(JSON.stringify({ items: [{ id: 'item-101', owner: 'alice', status: 'active' }] }))
+      } else {
+        res.end(JSON.stringify({ ok: true }))
+      }
+    }, 5)
+    timer.unref?.()
+  })
+  await new Promise<void>(resolve => targetServer.listen(0, '127.0.0.1', () => resolve()))
+  const targetPort = (targetServer.address() as AddressInfo).port
+  const targetOrigin = `http://127.0.0.1:${targetPort}`
+  t.after(async () => {
+    targetServer.closeAllConnections?.()
+    await new Promise<void>(resolve => targetServer.close(() => resolve()))
+  })
+
+  const { storage } = makeStore(t)
+  const { runId, run } = await setupApprovedRun(storage, {
+    environment: 'local-lab',
+    seeds: [targetOrigin],
+    tier: 2,
+    budgetRequests: 5_000,
+    maxRpsPerOrigin: 60,
+  })
+  storage.upsertEndpoint({
+    runId,
+    origin: targetOrigin,
+    method: 'GET',
+    pathTemplate: '/api/items',
+    source: 'openapi',
+    riskScore: 80,
+  })
+  storage.upsertEndpoint({
+    runId,
+    origin: targetOrigin,
+    method: 'GET',
+    pathTemplate: '/api/items/:id',
+    source: 'openapi',
+    riskScore: 85,
+  })
+  storage.updateRun(runId, { phase: 'threat_model', status: 'running' })
+  const reposDir = makeMountedRepo(t)
+
+  let auditRequestReceived!: () => void
+  const auditInFlight = new Promise<void>(resolve => { auditRequestReceived = resolve })
+  let releaseAudit!: () => void
+  const auditGate = new Promise<void>(resolve => { releaseAudit = resolve })
+  t.after(() => releaseAudit())
+
+  const mockLlmPort = await startMockAuditServer(t, async () => {
+    auditRequestReceived()
+    await auditGate
+  })
+  const profiles = await createMockProfile(storage, mockLlmPort)
+
+  const execution = new Execution(storage, {
+    deterministicSweep: true,
+    maxDurationMs: 120_000,
+    floorRequestBudget: 35,
+    agentRequestBudget: 2_000,
+    backend: stubBackend(),
+  })
+  t.after(async () => {
+    releaseAudit()
+    await execution.stop()
+  })
+
+  const eng = internals(execution) as ExecInternals & {
+    authorize: (job: { assignment: ReturnType<typeof storage.makeWorker>; origins: Set<string>; controller: AbortController }) => boolean
+  }
+  eng.projectReposMount = () => ({ reposDir, mountedRepos: ['demo-service'] })
+  eng.prePhase0SeededSteps.set(laneKey(storage.run(runId)), false)
+
+  // Non-overlapped investigation worker must STILL be rejected by authorize() during threat_model.
+  const approvedAsset = run.candidates.find(c => run.approved.includes(c.id))!
+  const strayWorker = storage.makeWorker(storage.run(runId), 'investigation', approvedAsset, 'Stray specialist', 'Must not run during threat_model')
+  const strayClaimed = storage.updateWorker(strayWorker.id, { status: 'running', lease: 'stray-lease', leaseExpiresAt: Date.now() + 60_000 })!
+  assert.equal(
+    eng.authorize({ assignment: strayClaimed, origins: new Set([targetOrigin]), controller: new AbortController() }),
+    false,
+    'unrelated investigation worker must still be denied during threat_model',
+  )
+  storage.updateWorker(strayWorker.id, { status: 'canceled', lease: null, leaseExpiresAt: null })
+
+  // Run source-first code audit during threat_model; DO NOT mock runEngineInvestigation so the
+  // real ExecFloorLane + RequestBroker + runDeterministicEngine executes live HTTP probes!
+  const wallStart = Date.now()
+  const auditPromise = execution.runSourceFirstCodeAudit(storage.run(runId), [], profiles, new AbortController().signal)
+  await auditInFlight
+
+  // Wait for the real overlapped deterministic floor to finish while code_audit is still in threat_model.
+  const floorDeadline = Date.now() + 15_000
+  while (Date.now() < floorDeadline) {
+    if (eng.agenticLaneCompleted.has(laneKey(storage.run(runId)))) break
+    await delay(25)
+  }
+  assert.equal(
+    eng.agenticLaneCompleted.has(laneKey(storage.run(runId))),
+    true,
+    'real overlapped floor must complete during threat_model',
+  )
+  const elapsedAtFloorDone = Date.now() - wallStart
+
+  releaseAudit()
+  await auditPromise
+
+  const events = storage.eventsAfter(runId, 0, 500)
+  const deniedEvents = events.filter(e => e.kind === 'broker.denied')
+  assert.equal(
+    deniedEvents.length,
+    0,
+    `overlapped floor must not hit broker.denied during threat_model (got ${deniedEvents.length})`,
+  )
+  assert.ok(targetHits > 0, `expected real HTTP probes to reach loopback target during threat_model, got targetHits=${targetHits}`)
+
+  const engineSummary = events.find(e => e.kind === 'deterministic_engine.summary')
+  assert.ok(engineSummary, 'expected deterministic_engine.summary event from real floor run')
+  const requestsUsed = Number((engineSummary.detail as { requestsUsed?: number }).requestsUsed ?? 0)
+  assert.ok(requestsUsed > 0, `real floor must send >0 target requests, got requestsUsed=${requestsUsed}`)
+
+  const floorSummary = events.find(e => e.kind === 'deterministic_floor.summary')
+  assert.ok(floorSummary, 'expected deterministic_floor.summary event')
+  const pt = (floorSummary.detail as {
+    phaseTimings?: { floorStartedAt?: number; floorFinishedAt?: number; floorMs?: number }
+    floorRequests?: number
+  }).phaseTimings
+  assert.ok(pt && typeof pt.floorStartedAt === 'number' && typeof pt.floorFinishedAt === 'number', 'phaseTimings timestamps must be recorded')
+  assert.equal(pt.floorMs, Math.max(0, pt.floorFinishedAt - pt.floorStartedAt), 'floorMs must equal floorFinishedAt - floorStartedAt')
+  assert.ok((pt.floorMs ?? 0) >= 15, `floorMs must capture real HTTP floor duration (>=15ms), got ${pt.floorMs}ms`)
+  assert.ok((pt.floorMs ?? 0) <= elapsedAtFloorDone + 50, `floorMs (${pt.floorMs}ms) must not exceed wall window (${elapsedAtFloorDone}ms)`)
+  assert.ok(
+    Number((floorSummary.detail as { floorRequests?: number }).floorRequests ?? 0) > 0,
+    'deterministic_floor.summary must record non-zero split floorRequests',
   )
 })
