@@ -34,6 +34,7 @@ import {
   replayStepSchema,
   sqlBooleanDiffReplaySpecSchema,
 } from '../src/replay-spec.ts'
+import { browserSinkEnvelopeFromSteps } from '../src/server/floor-recipes.ts'
 import { AGENTIC_MIN_MAX_TURNS, roleAffinityForScenario } from '../src/server/agent-session.ts'
 import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied, RequestBroker } from '../src/server/broker.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
@@ -3722,17 +3723,21 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const browser = new ScopedBrowser(broker)
+    const steps = [
+      { id: 'c1', role: 'control', description: 'Control safe text', origin: fx.origin, pathAndQuery: '/', action: 'navigate' },
+      { id: 'p1', role: 'probe', description: 'Fill XSS', origin: fx.origin, pathAndQuery: '/', action: 'fill', selector: '#payload', value: '{{canary_token}}<img src=x onerror=1>', enableSinkHook: true },
+      { id: 'p2', role: 'probe', description: 'Click render with sink hook', origin: fx.origin, reusePage: true, action: 'click', selector: '#render', enableSinkHook: true },
+    ]
+    const recipe = browserSinkEnvelopeFromSteps({ origin: fx.origin, vulnClass: 'dom_xss', steps })
+    assert.ok(recipe, 'expected browser_sink recipe envelope for T2-05e')
     const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
           kind: 'browser_chain',
+          recipe,
           assertionsJq: '{ controlPassed: (.steps.c1.status == 200 and (.steps.c1.domSinkTraces | length == 0)), confirmed: ((.steps.p2.domSinkTraces | length >= 1) or (.domSinkTraces | length >= 1)), observed: ("sinks=" + ((.domSinkTraces | length) | tostring)), expected: "0 DOM sink hits" }',
-          steps: [
-            { id: 'c1', role: 'control', description: 'Control safe text', origin: fx.origin, pathAndQuery: '/', action: 'navigate' },
-            { id: 'p1', role: 'probe', description: 'Fill XSS', origin: fx.origin, pathAndQuery: '/', action: 'fill', selector: '#payload', value: '<img src=x onerror=1>', enableSinkHook: true },
-            { id: 'p2', role: 'probe', description: 'Click render with sink hook', origin: fx.origin, reusePage: true, action: 'click', selector: '#render', enableSinkHook: true } as never,
-          ],
+          steps: steps as never,
         } as unknown,
         broker,
         browser,
@@ -5588,22 +5593,31 @@ describe('Tier 2 — Pairwise Component Integration (140 cases)', () => {
   })
 
   test('T2-20e: Coordinator dispatches browser_chain verification step for surfaced Stored XSS canary', async (t) => {
-    const fx = await startHttpFixture(t, (_req, _b, res) => {
+    const marker = 'gn2o_t220e_surfaced'
+    const fx = await startHttpFixture(t, (req, _b, res) => {
       res.setHeader('Content-Type', 'text/html')
-      res.end('<html><body><div id="out"><img src=x onerror="window.__xss=1"></div></body></html>')
+      if (req.url === '/admin/export') {
+        res.end(`<html><body><div id="out"></div><script>document.getElementById('out').innerHTML = ${JSON.stringify(`<img src=x onerror=1>${marker}`)};</script></body></html>`)
+        return
+      }
+      res.end('<html><body><div id="out">clean</div></body></html>')
     })
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const browser = new ScopedBrowser(broker)
+    const steps = [
+      { id: 'c1', role: 'control', description: 'Control view', origin: fx.origin, pathAndQuery: '/clean', action: 'navigate' },
+      { id: 'p1', role: 'probe', description: 'Admin views surfaced canary', origin: fx.origin, pathAndQuery: '/admin/export', action: 'dom_xss_sink_hook', enableSinkHook: true },
+    ]
+    const recipe = browserSinkEnvelopeFromSteps({ origin: fx.origin, vulnClass: 'xss_stored', canaryToken: marker, steps })
+    assert.ok(recipe, 'expected browser_sink recipe envelope for T2-20e')
     const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
           kind: 'browser_chain',
+          recipe,
           assertionsJq: '{ controlPassed: (.steps.c1.status == 200), confirmed: (.steps.p1.status == 200 and (.steps.p1.domSnippet | contains("onerror"))), observed: .steps.p1.domSnippet, expected: "sanitized output without onerror" }',
-          steps: [
-            { id: 'c1', role: 'control', description: 'Control view', origin: fx.origin, pathAndQuery: '/clean', action: 'navigate' },
-            { id: 'p1', role: 'probe', description: 'Admin views surfaced canary', origin: fx.origin, pathAndQuery: '/admin/export', action: 'dom_xss_sink_hook', enableSinkHook: true },
-          ],
+          steps,
         },
         broker,
         browser,
@@ -6655,18 +6669,22 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     })
     const broker = new RequestBroker({ rejectUnauthorized: false })
     const browser = new ScopedBrowser(broker)
+    const steps = [
+      { id: 'c1', role: 'control', description: 'Control view', origin: fx.origin, pathAndQuery: '/', action: 'navigate' },
+      { id: 'p1', role: 'probe', description: 'Fill payload', origin: fx.origin, pathAndQuery: '/', action: 'fill', selector: '#bio', value: '{{canary_token}}<img src=x onerror=1>', enableSinkHook: true },
+      { id: 'p2', role: 'probe', description: 'Save to localStorage', origin: fx.origin, reusePage: true, action: 'click', selector: '#save' },
+      { id: 'p3', role: 'probe', description: 'Preview innerHTML sink', origin: fx.origin, reusePage: true, action: 'click', selector: '#preview', enableSinkHook: true },
+    ]
+    const recipe = browserSinkEnvelopeFromSteps({ origin: fx.origin, vulnClass: 'dom_xss', steps })
+    assert.ok(recipe, 'expected browser_sink recipe envelope for T3-05')
     const res = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
       verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin),
           kind: 'browser_chain',
+          recipe,
           assertionsJq: '{ controlPassed: (.steps.c1.status == 200 and (.steps.c1.domSinkTraces | length == 0)), confirmed: ((.steps.p3.domSinkTraces | length >= 1) or (.domSinkTraces | length >= 1)), observed: ("sinks=" + ((.domSinkTraces | length) | tostring)), expected: "0 DOM sink hits" }',
-          steps: [
-            { id: 'c1', role: 'control', description: 'Control view', origin: fx.origin, pathAndQuery: '/', action: 'navigate' },
-            { id: 'p1', role: 'probe', description: 'Fill payload', origin: fx.origin, pathAndQuery: '/', action: 'fill', selector: '#bio', value: '<img src=x onerror=1>', enableSinkHook: true },
-            { id: 'p2', role: 'probe', description: 'Save to localStorage', origin: fx.origin, reusePage: true, action: 'click', selector: '#save' } as never,
-            { id: 'p3', role: 'probe', description: 'Preview innerHTML sink', origin: fx.origin, reusePage: true, action: 'click', selector: '#preview', enableSinkHook: true } as never,
-          ],
+          steps: steps as never,
         } as unknown,
         broker,
         browser,
@@ -7289,14 +7307,18 @@ describe('Tier 3 — Cross-Feature Full E2E Workflows (28 cases)', () => {
     const browser = new ScopedBrowser(broker)
     await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
       await broker.executeHttp(asBrokerRequest({ origin: fx.origin, method: 'POST', pathAndQuery: '/profile', persona: 'persona_a', body: JSON.stringify({ bio: `<img src=x onerror=1>${marker}` }), runId, assignmentId: aid }), makeLabGrant(fx.origin, { personas: personaMap, isIdempotentPostAllowed: () => true }), AbortSignal.timeout(5000))
+      const steps = [
+        { id: 'c1', role: 'control', description: 'Clean view', origin: fx.origin, pathAndQuery: '/', persona: 'persona_b', action: 'navigate' },
+        { id: 'p1', role: 'probe', description: 'Admin export view', origin: fx.origin, pathAndQuery: '/admin/export', persona: 'persona_b', action: 'dom_xss_sink_hook', enableSinkHook: true },
+      ]
+      const recipe = browserSinkEnvelopeFromSteps({ origin: fx.origin, vulnClass: 'xss_stored', canaryToken: marker, steps })
+      assert.ok(recipe, 'expected browser_sink recipe envelope for T3-20')
       const res = await verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin), kind: 'browser_chain',
+          recipe,
           assertionsJq: '{ controlPassed: (.steps.c1.status == 200 and (.steps.c1.domSinkTraces | length == 0)), confirmed: ((.steps.p1.domSinkTraces | length >= 1) or (.domSinkTraces | length >= 1)), observed: ("sinks=" + ((.domSinkTraces | length) | tostring)), expected: "0 DOM sink hits" }',
-          steps: [
-            { id: 'c1', role: 'control', description: 'Clean view', origin: fx.origin, pathAndQuery: '/', persona: 'persona_b', action: 'navigate' },
-            { id: 'p1', role: 'probe', description: 'Admin export view', origin: fx.origin, pathAndQuery: '/admin/export', persona: 'persona_b', action: 'dom_xss_sink_hook', enableSinkHook: true },
-          ],
+          steps,
         },
         broker, browser, backend: new LinuxWorkerBackend(), storage, runId,
         grant: makeLabGrant(fx.origin, { personas: personaMap }), signal: AbortSignal.timeout(30_000),
@@ -8120,14 +8142,18 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
       const surfacedRows = v4.listSecondOrderCanaries(runId, 'surfaced')
       assert.equal(surfacedRows.length, 1, 'Expected cross-persona GET /admin/reports to surface canary')
       assert.equal(surfacedRows[0].surfacedPersona ?? surfacedRows[0].surfaced_persona, 'persona_b')
+      const steps = [
+        { id: 'c1', role: 'control', description: 'Neutral page', origin: fx.origin, pathAndQuery: '/neutral/0', persona: 'persona_b', action: 'navigate' },
+        { id: 'p1', role: 'probe', description: 'Admin export triggers Stored XSS', origin: fx.origin, pathAndQuery: '/admin/reports', persona: 'persona_b', action: 'dom_xss_sink_hook', enableSinkHook: true },
+      ]
+      const recipe = browserSinkEnvelopeFromSteps({ origin: fx.origin, vulnClass: 'xss_stored', canaryToken: marker, steps })
+      assert.ok(recipe, 'expected browser_sink recipe envelope for T4-11')
       const verified = await verifyReplaySpec({
         spec: {
           ...baseReplaySpecFields(fx.origin), kind: 'browser_chain',
+          recipe,
           assertionsJq: '{ controlPassed: (.steps.c1.status == 200 and (.steps.c1.domSinkTraces | length == 0)), confirmed: ((.steps.p1.domSinkTraces | length >= 1) or (.domSinkTraces | length >= 1)), observed: ("sinks=" + ((.domSinkTraces | length) | tostring)), expected: "0 DOM sink hits" }',
-          steps: [
-            { id: 'c1', role: 'control', description: 'Neutral page', origin: fx.origin, pathAndQuery: '/neutral/0', persona: 'persona_b', action: 'navigate' },
-            { id: 'p1', role: 'probe', description: 'Admin export triggers Stored XSS', origin: fx.origin, pathAndQuery: '/admin/reports', persona: 'persona_b', action: 'dom_xss_sink_hook', enableSinkHook: true },
-          ],
+          steps,
         },
         broker, browser, backend: new LinuxWorkerBackend(), storage, runId, grant, signal: AbortSignal.timeout(30_000),
       })

@@ -167,10 +167,10 @@ test('Cut 3c recipe wiring: redirect, browser_sink, and injection_fingerprint pe
   assert.equal(browserFixed.verdict, 'fixed')
 })
 
-test('Cut 3c/3d retirement: all 8 retired legacy spec kinds fail closed without executing legacy VM code', async () => {
+test('Cut 3c/3d/3e retirement: all 9 retired legacy spec kinds fail closed without executing legacy VM code', async () => {
   const retiredKinds = [
     'dns_takeover', 'tls_audit', 'browser_dom', 'ws_chain', 'upload_probe',
-    'sql_boolean_diff', 'sql_time_diff', 'race_burst',
+    'sql_boolean_diff', 'sql_time_diff', 'race_burst', 'browser_chain',
   ] as const
   for (const kind of retiredKinds) {
     assert.ok(RETIRED_LEGACY_SPEC_KINDS.has(kind), `missing retired kind ${kind}`)
@@ -270,6 +270,16 @@ test('Cut 3c/3d retirement: all 8 retired legacy spec kinds fail closed without 
       burst: [
         { origin, method: 'POST' as const, pathAndQuery: '/giftcards/1/redeem', jsonBody: { amount: 4 } },
         { origin, method: 'POST' as const, pathAndQuery: '/giftcards/1/redeem', jsonBody: { amount: 4 } },
+      ],
+    },
+    {
+      // Cut 3e retired the raw browser_chain VM branch: bare browser_chain specs fail closed
+      // (navigate/fill/click proofs run via the browser_sink floor recipe envelope).
+      ...base,
+      kind: 'browser_chain' as const,
+      steps: [
+        { id: 'c1', role: 'control' as const, description: 'control', origin, pathAndQuery: '/safe', action: 'navigate' as const },
+        { id: 'p1', role: 'probe' as const, description: 'probe', origin, pathAndQuery: '/vuln', action: 'navigate' as const },
       ],
     },
   ]

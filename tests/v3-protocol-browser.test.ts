@@ -16,6 +16,7 @@ import { test } from 'node:test'
 import { BrokerApprovalRequired, BrokerDenied, RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'
 import type { ResolvedPersona } from '../src/server/persona-vault.ts'
+import { browserSinkEnvelopeFromSteps } from '../src/server/floor-recipes.ts'
 import { verifyReplaySpec } from '../src/server/replay-verifier.ts'
 import { ScopedBrowser } from '../src/server/scoped-browser.ts'
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
@@ -688,7 +689,31 @@ test('v3 ScopedBrowser & browser_chain: 100% broker-proxied, out-of-scope abort,
     assert.equal(safeVisit.domSinkTraces.some(tr => tr.containsCanary), false, 'textContent must not trigger innerHTML sink hook')
     assert.equal(thirdPartyHits, 0)
 
-    // verifyReplaySpec (browser_chain) deterministic confirmation via fill + dom_xss_sink_hook
+    // verifyReplaySpec (browser_sink recipe envelope) deterministic confirmation via fill + dom_xss_sink_hook
+    const browserSteps = [
+      {
+        id: 'control',
+        role: 'control' as const,
+        description: 'Safe textContent rendering does not hit innerHTML sink',
+        origin: appOrigin,
+        pathAndQuery: '/safe?live=1',
+        action: 'fill' as const,
+        selector: '#note-input',
+        value: '{{canary_token}}',
+        enableSinkHook: true,
+      },
+      {
+        id: 'probe',
+        role: 'probe' as const,
+        description: 'Vulnerable innerHTML rendering captures verifier canary in sink hook',
+        origin: appOrigin,
+        pathAndQuery: '/vuln?q={{canary_token}}',
+        action: 'dom_xss_sink_hook' as const,
+        enableSinkHook: true,
+      },
+    ]
+    const browserRecipe = browserSinkEnvelopeFromSteps({ origin: appOrigin, vulnClass: 'dom_xss', steps: browserSteps })
+    assert.ok(browserRecipe, 'expected browser_sink recipe envelope')
     const chainConfirmed = await verifyReplaySpec({
       spec: {
         version: 1,
@@ -702,28 +727,8 @@ test('v3 ScopedBrowser & browser_chain: 100% broker-proxied, out-of-scope abort,
         impact: 'Arbitrary JavaScript execution in the victim browser origin.',
         remediation: 'Use textContent instead of innerHTML for untrusted text.',
         recheckInstructions: 'Verify canary input does not reach innerHTML sink.',
-        steps: [
-          {
-            id: 'control',
-            role: 'control',
-            description: 'Safe textContent rendering does not hit innerHTML sink',
-            origin: appOrigin,
-            pathAndQuery: '/safe?live=1',
-            action: 'fill',
-            selector: '#note-input',
-            value: '{{canary_token}}',
-            enableSinkHook: true,
-          },
-          {
-            id: 'probe',
-            role: 'probe',
-            description: 'Vulnerable innerHTML rendering captures verifier canary in sink hook',
-            origin: appOrigin,
-            pathAndQuery: '/vuln?q={{canary_token}}',
-            action: 'dom_xss_sink_hook',
-            enableSinkHook: true,
-          },
-        ],
+        steps: browserSteps,
+        recipe: browserRecipe,
         assertionsJq: '{ controlPassed: ((.steps.control.status == 200) and (([.steps.control.domSinkTraces[] | select(.containsCanary)] | length) == 0)), confirmed: (([.steps.probe.domSinkTraces[] | select(.sink == "innerHTML" and .containsCanary)] | length) >= 1), observed: ("probe_sink_hits=" + (([.steps.probe.domSinkTraces[] | select(.containsCanary)] | length) | tostring)), expected: "0 canary innerHTML sink hits" }',
       },
       broker,

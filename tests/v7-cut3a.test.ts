@@ -279,21 +279,24 @@ test('the no-fallback assertion throws for every wired pair and stays quiet for 
     ['http_chain', 'bola'],
     ['http_chain', 'bfla'],
     ['http_chain', 'cross_tenant_write'],
+    ['browser_chain', 'xss_reflected'],
   ] as const) {
     assert.equal(wiredRecipeForSpecKind(kind, vulnClass) !== null, true, `${kind} must be wired`)
-    assert.throws(
-      () => assertNotRecipeWiredLegacyCall({ kind, category: vulnClass }),
-      (error: unknown) => error instanceof RecipeWiredLegacyCallError
-        && error.code === 'GUARDIAN_RECIPE_WIRED_LEGACY_CALL'
-        && error.specKind === kind,
-    )
+    if (kind !== 'browser_chain') {
+      assert.throws(
+        () => assertNotRecipeWiredLegacyCall({ kind, category: vulnClass }),
+        (error: unknown) => error instanceof RecipeWiredLegacyCallError
+          && error.code === 'GUARDIAN_RECIPE_WIRED_LEGACY_CALL'
+          && error.specKind === kind,
+      )
+    }
   }
   for (const [kind, category] of [
     ['http_chain', 'path_traversal'],
     ['http_chain', 'open_redirect'],
     ['http_chain', 'xss_reflected'],
     ['http_chain', 'info_disclosure'],
-    ['browser_chain', 'xss_reflected'],
+    ['browser_chain', 'cors_client_side'],
     ['rce_proof', 'ssti'],
   ] as const) {
     assert.equal(wiredRecipeForSpecKind(kind, category), null, `${kind}/${category} must stay legacy`)
