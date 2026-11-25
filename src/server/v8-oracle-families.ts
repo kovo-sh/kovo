@@ -43,36 +43,36 @@ const PENDING_STATE_RE = /^(?:queued|pending|processing|accepted|created|schedul
 const STUB_URL_VAL_RE = /^(?:https?:\/\/|\/[a-z0-9._~/-]*\/(?:download|export|presign|signed|file|artifact|job|status|poll|token)\b)/i
 const BARE_ACK_BODY_RE = /^(?:ok|queued|accepted|pending|primed|cached|created|done|true|https?:\/\/\S+|\/\S+)$/i
 
-function scanStubNode(node: unknown, depth: number): { allStub: boolean; hasSignal: boolean; hasState: boolean; hasCreateKey: boolean; count: number } {
-  const fail = { allStub: false, hasSignal: false, hasState: false, hasCreateKey: false, count: 1 }
-  if (depth > 4 || node == null) return { allStub: true, hasSignal: false, hasState: false, hasCreateKey: false, count: 0 }
-  let hasSignal = false, hasState = false, hasCreateKey = false, count = 0
+// Loose job-envelope scan (async export/job/render/report/task creation or job-status metadata, or a job-collection/status route): tolerates boolean flags and id/timestamp/key-suffixed scalars, never sensitive or record-bearing fields.
+const JOB_ENVELOPE_KEYS = wordSet('job jobs export exports task tasks render renders report reports'), JOB_ID_KEY_RE = /^(?:job|export|task|render|report)_?id$/
+const LOOSE_META_KEY_RE = /^(?:trace|via|mode|source|reason|processed)$|[a-z0-9](?:Id|Ids|At|By|Slug|Key|Url|Uri|Path|Status|State|Kind|Type|Ms)$|_(?:id|ids|at|by|slug|key|url|uri|path|status|state|kind|type|ms)$/
+const SENSITIVE_KEY_RE = /secret|passw|private|credential|api_?key|ssn|card|iban|balance|amount|salary|email|phone|cents|price|total/i, JOB_ROUTE_RE = /\/(?:exports|jobs|renders|tasks|reports)(?:\/[^/]+)?\/?$/i
+type StubScan = { allStub: boolean; hasSignal: boolean; hasState: boolean; hasCreateKey: boolean; hasJob: boolean; count: number }
+function scanStubNode(node: unknown, depth: number, loose = false): StubScan {
+  const acc: StubScan = { allStub: true, hasSignal: false, hasState: false, hasCreateKey: false, hasJob: false, count: 0 }
+  const fail: StubScan = { ...acc, allStub: false, count: 1 }
+  const merge = (sub: StubScan): boolean => sub.allStub && Boolean(Object.assign(acc, { hasSignal: acc.hasSignal || sub.hasSignal, hasState: acc.hasState || sub.hasState, hasCreateKey: acc.hasCreateKey || sub.hasCreateKey, hasJob: acc.hasJob || sub.hasJob, count: acc.count + sub.count }))
+  if (depth > 4 || node == null) return acc
   if (Array.isArray(node)) {
-    if (node.every(x => x === null || typeof x !== 'object')) return { allStub: true, hasSignal, hasState, hasCreateKey, count: node.length }
-    for (const item of node) {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) return fail
-      const sub = scanStubNode(item, depth + 1); if (!sub.allStub) return sub
-      hasSignal ||= sub.hasSignal; hasState ||= sub.hasState; hasCreateKey ||= sub.hasCreateKey; count += sub.count
-    }
-    return { allStub: true, hasSignal, hasState, hasCreateKey, count }
+    if (node.every(x => x === null || typeof x !== 'object')) return { ...acc, count: node.length }
+    for (const item of node) if (!item || typeof item !== 'object' || Array.isArray(item) || !merge(scanStubNode(item, depth + 1, loose))) return fail
+    return acc
   }
   if (typeof node !== 'object') return fail
   for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
     if (v === null || v === undefined || v === '' || (Array.isArray(v) && v.length === 0)) continue
-    const lk = k.toLowerCase()
-    if (!STUB_META_KEYS.has(lk) && !WRAPPER_KEYS.has(lk)) return fail
-    if (JOB_CACHE_SIGNAL_KEYS.has(lk)) hasSignal = true
-    if (typeof v === 'object') {
-      const sub = scanStubNode(v, depth + 1); if (!sub.allStub) return sub
-      hasSignal ||= sub.hasSignal; hasState ||= sub.hasState; hasCreateKey ||= sub.hasCreateKey; count += sub.count
-    } else {
-      count += 1
-      if ((lk === 'status' || lk === 'state' || lk === 'cachestatus' || lk === 'cache_status') && typeof v === 'string' && PENDING_STATE_RE.test(v.trim())) hasState = true
-      if (typeof v === 'string' && STUB_URL_VAL_RE.test(v.trim())) hasSignal = true
-      if (/^(?:id|status|state|url|location|handle|path|key)$/i.test(lk)) hasCreateKey = true
-    }
+    const lk = k.toLowerCase(), env = loose && JOB_ENVELOPE_KEYS.has(lk) && typeof v === 'object'
+    const looseOk = loose && !SENSITIVE_KEY_RE.test(k) && (typeof v === 'boolean' || ((typeof v === 'string' || typeof v === 'number') && LOOSE_META_KEY_RE.test(k)))
+    if (!STUB_META_KEYS.has(lk) && !WRAPPER_KEYS.has(lk) && !env && !looseOk) return fail
+    if (JOB_CACHE_SIGNAL_KEYS.has(lk)) acc.hasSignal = true
+    if (env || (loose && JOB_ID_KEY_RE.test(lk))) acc.hasJob = true
+    if (typeof v === 'object') { if (!merge(scanStubNode(v, depth + 1, loose))) return fail; continue }
+    acc.count += 1
+    if ((lk === 'status' || lk === 'state' || lk === 'cachestatus' || lk === 'cache_status') && typeof v === 'string' && PENDING_STATE_RE.test(v.trim())) acc.hasState = true
+    if (typeof v === 'string' && STUB_URL_VAL_RE.test(v.trim())) acc.hasSignal = true
+    if (/^(?:id|status|state|url|location|handle|path|key)$/i.test(lk)) acc.hasCreateKey = true
   }
-  return { allStub: true, hasSignal, hasState, hasCreateKey, count }
+  return acc
 }
 
 export function extractTenantMarkers(json: unknown, body?: string): Set<string> {
@@ -90,18 +90,18 @@ export function extractTenantMarkers(json: unknown, body?: string): Set<string> 
   walk(val, 0); return out
 }
 
-export function isJobOrHandleStub(json: unknown, body?: string, status?: number | null, method?: string): boolean {
+export function isJobOrHandleStub(json: unknown, body?: string, status?: number | null, method?: string, route?: string | null): boolean {
   let val = json
   const trimmed = typeof body === 'string' ? body.trim() : ''
   if (val === undefined && trimmed && /^[\[{]/.test(trimmed)) try { val = JSON.parse(trimmed) } catch { val = undefined }
   if (val === undefined || val === null) return Boolean(trimmed && BARE_ACK_BODY_RE.test(trimmed))
   if (typeof val !== 'object') return typeof val === 'string' && BARE_ACK_BODY_RE.test(val.trim())
   const scan = scanStubNode(val, 0)
-  if (!scan.allStub) return false
-  if (scan.count === 0) return true
-  const isCreation = (status === 201 || status === 202) || (Boolean(method) && /^(?:POST|PUT)$/i.test(method!) && scan.hasCreateKey)
-  return scan.hasSignal || isCreation || scan.hasState
+  if (scan.allStub && (scan.count === 0 || scan.hasSignal || scan.hasState || status === 201 || status === 202 || (Boolean(method) && /^(?:POST|PUT)$/i.test(method!) && scan.hasCreateKey))) return true
+  const loose = scanStubNode(val, 0, true)
+  return loose.allStub && loose.count > 0 && (loose.hasJob || JOB_ROUTE_RE.test(normStr(route).split(/[?#]/)[0] ?? ''))
 }
+const stubRec = (r: Pick<HostSignedRecord, 'json' | 'body' | 'status' | 'method' | 'route'>): boolean => isJobOrHandleStub(r.json, r.body, r.status, r.method, r.route)
 
 const ok = (family: V8OracleFamily, subRule: string, reason: string, evidence: Record<string, unknown>): V8OracleDecision => ({ family, subRule, required: true, satisfied: true, reason, evidence })
 const deny = (family: V8OracleFamily, reason: string, subRule?: string, evidence?: Record<string, unknown>): V8OracleDecision => ({ family, subRule, required: true, satisfied: false, reason, evidence })
@@ -120,13 +120,10 @@ function checkRecord(record: HostSignedRecord | null | undefined, label: string,
   if (!Number.isFinite(record.timestampMs) || record.timestampMs <= 0) return `invalid_${label}_timestamp`
   return verify && !verify(record) ? `invalid_${label}_signature` : null
 }
-function checkRecords(pairs: readonly [HostSignedRecord | null | undefined, string][], verify?: SignatureVerifier): string | null {
-  for (const [rec, label] of pairs) { const err = checkRecord(rec, label, verify); if (err) return err }
-  return null
-}
+const checkRecords = (pairs: readonly [HostSignedRecord | null | undefined, string][], verify?: SignatureVerifier): string | null => pairs.reduce<string | null>((err, [rec, label]) => err ?? checkRecord(rec, label, verify), null)
 
 function hasSubstantivePayload(record: HostSignedRecord): boolean {
-  if (isJobOrHandleStub(record.json, record.body, record.status, record.method)) return false
+  if (stubRec(record)) return false
   if (normStr(record.artifactDigest) || normStr(record.capabilityHandle)) return true
   if (record.json !== undefined && record.json !== null) {
     if (Array.isArray(record.json)) return record.json.length > 0
@@ -204,7 +201,7 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
     if (input.sourceControlDenied && !isDenied(input.sourceControlDenied.status)) return deny(f, 'source_control_not_denied', sub)
     if (!isOk(input.transferRecord.status)) return deny(f, 'transfer_not_accepted', sub)
     if (!isOk(input.postTransferReadback.status)) return deny(f, 'readback_not_accepted', sub)
-    if (isJobOrHandleStub(input.postTransferReadback.json, input.postTransferReadback.body, input.postTransferReadback.status, input.postTransferReadback.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
+    if (stubRec(input.postTransferReadback)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
     if (input.postTransferReadback.timestampMs < input.transferRecord.timestampMs) return deny(f, 'non_monotonic_readback_timestamp', sub)
     if (normKey(input.observedOwnerTenantId) !== dst) return deny(f, 'transfer_not_persisted_to_dest_tenant', sub)
 
@@ -230,7 +227,7 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
     if (!input.isolatedControl && input.primeAction.timestampMs < input.baselineDeniedControl.timestampMs) return deny(f, 'non_monotonic_prime_timestamp', sub)
     if (input.bledAccess.timestampMs < input.primeAction.timestampMs) return deny(f, 'non_monotonic_bled_timestamp', sub)
     if (input.observedTenantId && normKey(input.observedTenantId) !== target) return deny(f, 'observed_tenant_mismatch', sub)
-    if (isJobOrHandleStub(input.bledAccess.json, input.bledAccess.body, input.bledAccess.status, input.bledAccess.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
+    if (stubRec(input.bledAccess)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
     const bledTenants = extractTenantMarkers(input.bledAccess.json, input.bledAccess.body)
     if (bledTenants.size > 0 && bledTenants.has(prime) && !bledTenants.has(target)) return deny(f, 'bled_access_own_tenant_only', sub)
     if (!normStr(input.targetRecordId) && !hasSubstantivePayload(input.bledAccess)) return deny(f, 'bled_access_missing_substantive_data', sub)
@@ -258,19 +255,19 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
     if (!isDenied(input.singleForeignControlDenied.status)) return deny(f, 'single_foreign_control_not_denied', sub)
     if (!isOk(input.batchRequest.status)) return deny(f, 'batch_request_denied_or_failed', sub)
 
-    const foreignRead = !isJobOrHandleStub(input.batchRequest.json, input.batchRequest.body, input.batchRequest.status, input.batchRequest.method) &&
+    const foreignRead = !stubRec(input.batchRequest) &&
       new Set((input.returnedForeignIds ?? []).map(normStr)).has(foreignId) &&
       (input.foreignDataObserved === true || hasSubstantivePayload(input.batchRequest))
     let foreignMut = false
     if (input.postMutationReadback) {
       const mutErr = checkRecord(input.postMutationReadback, 'post_mutation_readback', input.verifySignature)
       if (mutErr) return deny(f, mutErr, sub)
-      if (isJobOrHandleStub(input.postMutationReadback.json, input.postMutationReadback.body, input.postMutationReadback.status, input.postMutationReadback.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
+      if (stubRec(input.postMutationReadback)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
       foreignMut = isOk(input.postMutationReadback.status) &&
         input.postMutationReadback.timestampMs >= input.batchRequest.timestampMs && input.foreignMutationPersisted === true
     }
     if (!foreignRead && !foreignMut) {
-      if (isJobOrHandleStub(input.batchRequest.json, input.batchRequest.body, input.batchRequest.status, input.batchRequest.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
+      if (stubRec(input.batchRequest)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
       return deny(f, 'foreign_record_not_returned_or_mutated', sub)
     }
 
@@ -500,7 +497,7 @@ export function evaluateCryptographicScopeReplay(input: CryptographicScopeReplay
   if (!tamperedDigest || !validDigest || !replayedDigest) return deny(f, 'missing_signature_digest_binding')
   if (tamperedDigest === validDigest) return deny(f, 'tampered_digest_matches_valid_signature')
   if (replayedDigest !== validDigest) return deny(f, 'replayed_signature_digest_mismatch')
-  if (input.persistedImpact !== true && isJobOrHandleStub(input.replayedAcceptance.json, input.replayedAcceptance.body, input.replayedAcceptance.status, input.replayedAcceptance.method)) {
+  if (input.persistedImpact !== true && stubRec(input.replayedAcceptance)) {
     return deny(f, 'terminal_impact_unproven_intermediate_stub')
   }
   if (input.persistedImpact !== true && !hasSubstantivePayload(input.replayedAcceptance)) return deny(f, 'replay_acceptance_lacks_substantive_impact')
@@ -548,10 +545,10 @@ export function evaluateParserCacheDifferential(input: ParserCacheDifferentialIn
       if (mutErr) return deny(f, mutErr, sub)
       if (!isOk(input.postMutationReadback!.status)) return deny(f, 'mutation_readback_failed', sub)
       if (input.postMutationReadback!.timestampMs < input.differentialProbe.timestampMs) return deny(f, 'mutation_readback_precedes_probe', sub)
-      if (isJobOrHandleStub(input.postMutationReadback!.json, input.postMutationReadback!.body, input.postMutationReadback!.status, input.postMutationReadback!.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
+      if (stubRec(input.postMutationReadback!)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
       if (input.mutationPersisted !== true) return deny(f, 'mutation_not_persisted', sub)
     } else {
-      if (isJobOrHandleStub(input.differentialProbe.json, input.differentialProbe.body, input.differentialProbe.status, input.differentialProbe.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
+      if (stubRec(input.differentialProbe)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
       const probeDigest = normStr(input.unauthorizedDigest ?? input.differentialProbe.artifactDigest)
       const ctrlDigest = normStr(input.cleanControl.artifactDigest)
       if (probeDigest && ctrlDigest && probeDigest === ctrlDigest) return deny(f, 'probe_artifact_already_in_control', sub)
@@ -586,7 +583,7 @@ export function evaluateParserCacheDifferential(input: ParserCacheDifferentialIn
     const sameActor = Boolean(vActor && aActor && vActor === aActor), sameTenant = Boolean(vTenant && aTenant && vTenant === aTenant)
     if ((!vActor && !vTenant) || (sameActor && (sameTenant || (!vTenant && !aTenant)))) return deny(f, 'victim_and_attacker_not_distinct', sub)
 
-    if (isJobOrHandleStub(input.attackerProbe.json, input.attackerProbe.body, input.attackerProbe.status, input.attackerProbe.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
+    if (stubRec(input.attackerProbe)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
     if (input.cacheHitObserved !== true && !hasCacheHitHeader(input.attackerProbe.responseHeaders)) return deny(f, 'no_cache_hit_evidence', sub)
     if (normStr(input.attackerProbe.artifactDigest) !== victimDigest) return deny(f, 'attacker_did_not_receive_victim_artifact', sub)
 
@@ -720,8 +717,8 @@ export function evaluateCrossSurfacePivot(input: CrossSurfacePivotInput): V8Orac
     if (rbErr) return deny(f, rbErr, sub)
     if (!isOk(rb!.status)) return deny(f, 'post_impact_readback_failed', sub)
     if (rb!.timestampMs < lastHop.record.timestampMs) return deny(f, 'post_impact_readback_precedes_terminal_hop', sub)
-    if (isJobOrHandleStub(rb!.json, rb!.body, rb!.status, rb!.method)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
-  } else if (isJobOrHandleStub(lastHop.record.json, lastHop.record.body, lastHop.record.status, lastHop.record.method)) {
+    if (stubRec(rb!)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
+  } else if (stubRec(lastHop.record)) {
     return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
   }
   return ok(f, sub, 'cross_surface_causal_pivot_confirmed', {
