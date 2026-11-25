@@ -16,7 +16,7 @@ request:
   path: "/joomla/greenery_hub/index.php/en/hotels/reservations?location=d2tff&task=hub.search&ordering=score&direction=desc&type_id=0&show=db8ck%22onfocus=%22confirm(document.domain)%22autofocus=%22xwu0k"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "and"
 matchers:
   - type: "word"

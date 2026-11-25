@@ -17,7 +17,7 @@ request:
   path: "/www/admin/install.php?action=welcome"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "and"
 matchers:
   - type: "word"

@@ -10,7 +10,7 @@ request:
   method: GET
   path: /phpinfo.php
 control:
-  path: "/guardian-none-{{rand}}.php"
+  path: "/kovo-none-{{rand}}.php"
 matchers-condition: and
 matchers:
   - type: status

@@ -1,4 +1,4 @@
-// Minimal, dependency-free parser for the restricted YAML subset used by Guardian's vetted safe templates.
+// Minimal, dependency-free parser for the restricted YAML subset used by Kovo Hunter's vetted safe templates.
 // Supported: block mappings, block sequences (including `- key: value` maps), flow sequences/maps (flat),
 // quoted/plain scalars, and `#` comments. Not supported (rejected or ignored by design): anchors, tags,
 // multi-document streams, block scalars (`|`, `>`), and merge keys.

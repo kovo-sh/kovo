@@ -9,7 +9,7 @@ request:
   method: GET
   path: /@vite/client
 control:
-  path: "/@vite/guardian-none-{{rand}}"
+  path: "/@vite/kovo-none-{{rand}}"
 matchers-condition: and
 matchers:
   - type: status

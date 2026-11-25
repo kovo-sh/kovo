@@ -440,13 +440,13 @@ function rewritePlaceholders(
   // Strip {{BaseURL}} / {{RootURL}} prefixes
   out = out.replace(/\{\{(?:BaseURL|RootURL)\}\}/gi, '')
   // Rewrite scheme-prefixed interactsh URLs first so loader's :// check passes and runtime doesn't double-prefix http://
-  out = out.replace(/https?:\/\/\{\{interactsh-?url\}\}/gi, '{{guardian_canary_http}}')
+  out = out.replace(/https?:\/\/\{\{interactsh-?url\}\}/gi, '{{kovo_canary_http}}')
   // Rewrite bare interactsh URLs
-  out = out.replace(/\{\{interactsh-?url\}\}/gi, preferDnsCanary ? '{{guardian_canary_dns}}' : '{{guardian_canary_http}}')
+  out = out.replace(/\{\{interactsh-?url\}\}/gi, preferDnsCanary ? '{{kovo_canary_dns}}' : '{{kovo_canary_http}}')
   // Rewrite benign random generators
   out = out.replace(/\{\{(?:randstr|rand_int\([^)]*\)|rand_text_alpha\([^)]*\)|rand_text_alphanumeric\([^)]*\)|rand_base\([^)]*\)|rand_char\([^)]*\))\}\}/gi, '{{rand}}')
-  // Reject any unresolved {{...}} other than Guardian's 3 safe placeholders
-  const stripped = out.replace(/\{\{(?:rand|guardian_canary_http|guardian_canary_dns)\}\}/g, 'X')
+  // Reject any unresolved {{...}} other than Kovo Hunter's 3 safe placeholders
+  const stripped = out.replace(/\{\{(?:rand|kovo_canary_http|kovo_canary_dns)\}\}/g, 'X')
   if (/\{\{[^}]*\}\}/.test(stripped)) {
     return { ok: false, reason: 'unresolved_placeholder' }
   }
@@ -754,7 +754,7 @@ export function transpileNucleiTemplate(
   const severity = severityMap[rawSev] ?? 'info'
 
   const rawDescription = typeof info.description === 'string'
-    ? info.description.trim().replace(/\s+/g, ' ').replace(/interactsh-?url/gi, 'guardian_canary_http').replace(/interactsh/gi, 'guardian_canary')
+    ? info.description.trim().replace(/\s+/g, ' ').replace(/interactsh-?url/gi, 'kovo_canary_http').replace(/interactsh/gi, 'kovo_canary')
     : ''
   const description = (rawDescription.length >= 5 ? rawDescription : `Safe check derived from ${id}: ${name}`).slice(0, 600)
 
@@ -994,7 +994,7 @@ export function transpileNucleiTemplate(
     return { ok: false, id, reason: 'status_only_matcher' }
   }
 
-  const requestHasCanary = JSON.stringify({ cleanPath, cleanHeaders, cleanBody }).includes('guardian_canary_')
+  const requestHasCanary = JSON.stringify({ cleanPath, cleanHeaders, cleanBody }).includes('kovo_canary_')
   if (requestHasCanary && !hasCanaryMatcher) {
     outMatchers.push({ type: 'canary', protocol: preferDnsCanary ? 'dns' : 'any' })
     hasCanaryMatcher = true
@@ -1009,7 +1009,7 @@ export function transpileNucleiTemplate(
   if (requestHasCanary) {
     control = {
       method: 'GET',
-      path: cleanPath.replace(/\{\{guardian_canary_(?:http|dns)\}\}/g, 'guardian-none-{{rand}}'),
+      path: cleanPath.replace(/\{\{kovo_canary_(?:http|dns)\}\}/g, 'kovo-none-{{rand}}'),
     }
     spaExclusion = true
   } else if (Object.keys(cleanHeaders).length > 0 && cleanPath === '/') {
@@ -1018,7 +1018,7 @@ export function transpileNucleiTemplate(
   } else {
     control = {
       method: 'GET',
-      path: '/.guardian-none-{{rand}}',
+      path: '/.kovo-none-{{rand}}',
     }
     spaExclusion = true
   }
@@ -1268,7 +1268,7 @@ async function runCli() {
 
   try {
     if (!effectiveSourceDir) {
-      cloneDir = mkdtempSync(join(tmpdir(), 'guardian-nuclei-src-'))
+      cloneDir = mkdtempSync(join(tmpdir(), 'kovo-nuclei-src-'))
       const cloneArgs = ['clone', '--depth', '1', '--filter=blob:none', '--sparse']
       if (ref) cloneArgs.push('--branch', ref)
       cloneArgs.push(repoUrl, cloneDir)

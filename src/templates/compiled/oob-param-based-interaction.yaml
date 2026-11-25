@@ -14,10 +14,10 @@ reference: "https://github.com/PortSwigger/collaborator-everywhere"
 spaExclusion: true
 request:
   method: "GET"
-  path: "/?u={{guardian_canary_http}}/&href={{guardian_canary_http}}/&action={{guardian_canary_http}}/&host={{guardian_canary_http}}&http_host={{guardian_canary_http}}&email=root@{{guardian_canary_http}}&url={{guardian_canary_http}}/&load={{guardian_canary_http}}/&preview={{guardian_canary_http}}/&target={{guardian_canary_http}}/&proxy={{guardian_canary_http}}/&from={{guardian_canary_http}}/&src={{guardian_canary_http}}/&ref={{guardian_canary_http}}/&referrer={{guardian_canary_http}}/"
+  path: "/?u={{kovo_canary_http}}/&href={{kovo_canary_http}}/&action={{kovo_canary_http}}/&host={{kovo_canary_http}}&http_host={{kovo_canary_http}}&email=root@{{kovo_canary_http}}&url={{kovo_canary_http}}/&load={{kovo_canary_http}}/&preview={{kovo_canary_http}}/&target={{kovo_canary_http}}/&proxy={{kovo_canary_http}}/&from={{kovo_canary_http}}/&src={{kovo_canary_http}}/&ref={{kovo_canary_http}}/&referrer={{kovo_canary_http}}/"
 control:
   method: "GET"
-  path: "/?u=guardian-none-{{rand}}/&href=guardian-none-{{rand}}/&action=guardian-none-{{rand}}/&host=guardian-none-{{rand}}&http_host=guardian-none-{{rand}}&email=root@guardian-none-{{rand}}&url=guardian-none-{{rand}}/&load=guardian-none-{{rand}}/&preview=guardian-none-{{rand}}/&target=guardian-none-{{rand}}/&proxy=guardian-none-{{rand}}/&from=guardian-none-{{rand}}/&src=guardian-none-{{rand}}/&ref=guardian-none-{{rand}}/&referrer=guardian-none-{{rand}}/"
+  path: "/?u=kovo-none-{{rand}}/&href=kovo-none-{{rand}}/&action=kovo-none-{{rand}}/&host=kovo-none-{{rand}}&http_host=kovo-none-{{rand}}&email=root@kovo-none-{{rand}}&url=kovo-none-{{rand}}/&load=kovo-none-{{rand}}/&preview=kovo-none-{{rand}}/&target=kovo-none-{{rand}}/&proxy=kovo-none-{{rand}}/&from=kovo-none-{{rand}}/&src=kovo-none-{{rand}}/&ref=kovo-none-{{rand}}/&referrer=kovo-none-{{rand}}/"
 matchers-condition: "or"
 matchers:
   - type: "canary"

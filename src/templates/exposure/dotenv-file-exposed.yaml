@@ -10,7 +10,7 @@ request:
   method: GET
   path: /.env
 control:
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: and
 matchers:
   - type: status

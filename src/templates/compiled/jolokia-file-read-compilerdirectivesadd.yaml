@@ -19,7 +19,7 @@ request:
   path: "/jolokia/exec/com.sun.management:type=DiagnosticCommand/compilerDirectivesAdd/!/etc!/passwd"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "and"
 matchers:
   - type: "regex"

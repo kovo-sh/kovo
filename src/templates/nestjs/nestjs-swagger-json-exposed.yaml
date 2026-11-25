@@ -10,7 +10,7 @@ request:
   method: GET
   path: /api-json
 control:
-  path: "/api-json-guardian-none-{{rand}}"
+  path: "/api-json-kovo-none-{{rand}}"
 matchers-condition: and
 matchers:
   - type: status

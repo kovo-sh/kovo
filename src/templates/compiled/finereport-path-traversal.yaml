@@ -15,7 +15,7 @@ request:
   path: "/WebReport/ReportServer?op=chart&cmd=get_geo_json&resourcepath=privilege.xml"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "and"
 matchers:
   - type: "word"

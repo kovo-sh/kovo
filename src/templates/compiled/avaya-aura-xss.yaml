@@ -19,7 +19,7 @@ request:
   path: "/admin/public/login.jsp?error=%3Cscript%3Ealert(document.domain)%3C/script%3e"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "and"
 matchers:
   - type: "word"

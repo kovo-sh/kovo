@@ -9,7 +9,7 @@ request:
   method: GET
   path: /bundle.js.map
 control:
-  path: "/guardian-none-{{rand}}.js.map"
+  path: "/kovo-none-{{rand}}.js.map"
 matchers-condition: and
 matchers:
   - type: status

@@ -13,10 +13,10 @@ reference: "https://support.cloudflare.com/hc/en-us/articles/360028146432-Unders
 spaExclusion: true
 request:
   method: "GET"
-  path: "/cdn-cgi/image/width/{{guardian_canary_http}}"
+  path: "/cdn-cgi/image/width/{{kovo_canary_http}}"
 control:
   method: "GET"
-  path: "/cdn-cgi/image/width/guardian-none-{{rand}}"
+  path: "/cdn-cgi/image/width/kovo-none-{{rand}}"
 matchers-condition: "or"
 matchers:
   - type: "canary"

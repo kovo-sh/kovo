@@ -17,7 +17,7 @@ request:
   path: "/web/set_profiling?profile=0&collectors=<script>alert(document.domain)</script>"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "and"
 matchers:
   - type: "word"
