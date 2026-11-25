@@ -32,9 +32,10 @@ export async function solveC4(ctx: SolverContext): Promise<CompositeProofReceipt
   const jobId = metadata.json<{ jobId?: string }>().jobId
   if (!jobId) return null
 
+  // Public export relay on the api (the document worker itself is internal-only).
   let ready = false
   for (let attempt = 0; attempt < 100; attempt++) {
-    const polled = await ctx.http('docs-worker', `/jobs/${jobId}`)
+    const polled = await ctx.http('api', `${prefix}/exports/${encodeURIComponent(jobId)}`, { token })
     if (polled.status !== 200) return null
     const job = polled.json<{ job: { status: string } }>().job
     if (job.status === 'ready') {
@@ -46,7 +47,7 @@ export async function solveC4(ctx: SolverContext): Promise<CompositeProofReceipt
   }
   if (!ready) return null
 
-  const result = await ctx.http('docs-worker', `/jobs/${jobId}/result`)
+  const result = await ctx.http('api', `${prefix}/exports/${encodeURIComponent(jobId)}/result`, { token })
   if (result.status !== 200 || !result.text.includes(plan.nexus.canary)) return null
 
   return ctx.confirm('NX-C4')

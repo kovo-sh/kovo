@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Egress } from '../../../lib/egress.ts'
 import {
-  readBody, parseJson, sendJson, sendText, bearer, runIdOf, match, parseUrl,
+  readBody, parseJson, sendJson, sendText, bearer, header, runIdOf, match, parseUrl,
 } from './http.ts'
 import type { LabState, TenantKey } from './shared.ts'
 import {
@@ -237,6 +237,42 @@ export async function handleApi(
       `/webhooks/${encodeURIComponent(projectDeliveries[1]!)}/deliveries`
     const response = await deps.egress.fetch('scm', path, {
       headers: { 'x-guardian-run-id': runId, authorization: `Bearer ${session.token}` },
+    })
+    await proxy(res, response)
+    return
+  }
+
+  // Pool event feed relayed from the build runner. The runner applies its own credential policy;
+  // this route only forwards the caller's credential.
+  if (match(url, method, at('/runners/shared/events'))) {
+    const credential = authorizeHeader(req)
+    if (!credential) {
+      sendJson(res, 401, { error: 'credential required' })
+      return
+    }
+    const response = await deps.egress.fetch('runner', '/streams/shared', {
+      headers: { 'x-guardian-run-id': runId, authorization: `Bearer ${credential}` },
+    })
+    await proxy(res, response)
+    return
+  }
+
+  // Registry integration check: relays a tenant sync to the package registry with the registry
+  // credential the caller supplies. The registry applies its own credential and scope policy.
+  if (method === 'POST' && match(url, method, at('/integrations/registry/sync'))) {
+    const session = sessionAuth(state, req, res)
+    if (!session) return
+    const raw = await readBody(req)
+    const body = parseJson<{ tenant?: string; projectId?: string; registryToken?: string }>(raw)
+    const registryToken = header(req, 'x-registry-token') || (typeof body?.registryToken === 'string' ? body.registryToken : '')
+    const response = await deps.egress.fetch('registry.internal', '/sync', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-guardian-run-id': runId,
+        ...(registryToken ? { 'x-registry-token': registryToken } : {}),
+      },
+      body: JSON.stringify({ tenant: body?.tenant, projectId: body?.projectId }),
     })
     await proxy(res, response)
     return
@@ -580,7 +616,7 @@ export async function handleApi(
         reason: 'approval_required',
         autoReleaseScheduled: deployment.autoReleaseScheduled,
         runId,
-      })
+      }, caller.persona)
       sendJson(res, 409, { error: 'deployment is not approved for release' })
     }
     if (deployment.id === state.plan.ids.deploymentProdId) {

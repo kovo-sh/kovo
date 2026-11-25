@@ -27,16 +27,64 @@ function actor(event: AuditEvent, fallback: PersonaId): PersonaId {
   return event.actorPersona ?? fallback
 }
 
+interface Denial {
+  entityId: string
+  tenantId: string
+  actor: string
+}
+
 export function createShipforgeMonitor(
   oracle: ChainOracle, plan: ShipforgePlan, runId: string, profile: LabProfile,
 ) {
+  // Per-entity tracking: concurrent workers and dual-replay verification interleave several builds,
+  // streams, deliveries and deployments inside one run, so no chain keeps a single "current" slot.
   const c1 = {
-    buildId: '', buildDigest: '', tokenDigest: '', saTokenDigest: '', victimKeyDigest: '',
-    h2: false, h3: false, h4: false,
+    builds: new Map<string, string>(), // buildId -> buildDigest
+    tokens: new Map<string, string>(), // runner token digest -> buildId
+    saTokens: new Set<string>(), // service-account token digests minted by an env-scope-free promotion
+    victimKeys: new Set<string>(), // victim signing-key digests disclosed by a partial-authz batch
   }
-  const c2 = { streamId: '', streamDigest: '', projectId: '', artifactDigest: '', controlProject: '', h2: false, h3: false }
-  const c3 = { templateDigest: '', deliveryId: '', deliveryDigest: '', tokenDigest: '', h2: false, h3: false }
-  const c4 = { automationId: '', automationDigest: '', deploymentId: '', controlDeployment: '', h2: false }
+  const c2 = {
+    streams: new Map<string, string>(), // streamId -> streamDigest
+    artifacts: new Map<string, Set<string>>(), // projectId -> artifact digests observed on a revoked stream
+    transferred: new Map<string, { fromTenant: string; actor: string }>(), // projectId -> transfer context
+    denials: [] as Denial[], // export attempts refused for lack of a transfer
+  }
+  const c3 = {
+    templates: new Set<string>(), // leaked template digests
+    deliveries: new Map<string, string>(), // deliveryDigest -> deliveryId
+    tokens: new Map<string, string>(), // leaked internal token digest -> deliveryId
+  }
+  const c4 = {
+    automations: new Map<string, string>(), // automationId -> automationDigest
+    disputed: new Map<string, { tenantId: string; actor: string }>(), // deploymentId -> dispute context
+    denials: [] as Denial[], // releases refused because the deployment was neither approved nor scheduled
+  }
+  const recordedControls = new Set<string>()
+
+  // A clean ablation control is a genuine denial observed on the same entity, or on a sibling entity
+  // of the same tenant made by the same actor (a verifier may ablate on a fresh entity while the
+  // full workflow completes on another). It always requires a real denial event.
+  const controlFor = (
+    denials: readonly Denial[], entityId: string, tenantId: string, actorId: string,
+  ): Denial | null =>
+    denials.find((denial) => denial.entityId === entityId) ??
+    denials.find((denial) =>
+      denial.entityId !== entityId && denial.tenantId !== '' && denial.tenantId === tenantId &&
+      denial.actor !== '' && denial.actor === actorId) ??
+    null
+
+  const recordControlOnce = (
+    chainId: string, fromHopId: string, toHopId: string, entityId: string, denial: Denial, ts: number,
+  ): void => {
+    const key = `${chainId}\0${fromHopId}\0${toHopId}\0${entityId}`
+    if (recordedControls.has(key)) return
+    recordedControls.add(key)
+    oracle.recordControl({
+      chainId, fromHopId, toHopId, entityId, result: 'failed_without_predecessor', ts,
+      detail: denial.entityId === entityId ? {} : { controlEntityId: denial.entityId, sibling: true },
+    })
+  }
 
   const consume = (event: AuditEvent): void => {
     if (event.runId !== runId) return
@@ -47,14 +95,11 @@ export function createShipforgeMonitor(
       if (text(event, 'tenantId') !== 'org_a' || !flag(event, 'envPreviewExposed')) return
       const buildId = text(event, 'buildId')
       if (!buildId) return
-      c1.buildId = buildId
-      c1.buildDigest = text(event, 'buildDigest') || digest(buildId)
-      c1.h2 = false
-      c1.h3 = false
-      c1.h4 = false
+      const buildDigest = text(event, 'buildDigest') || digest(buildId)
+      c1.builds.set(buildId, buildDigest)
       oracle.recordHop({
         chainId: 'SF-C1', hopId: 'sf-c1-h1', service: service('scm'), routeKey: 'scm.previewBuild',
-        actor: actor(event, 'member_a'), artifactDigest: c1.buildDigest, entityId: buildId,
+        actor: actor(event, 'member_a'), artifactDigest: buildDigest, entityId: buildId,
         ts: event.ts, detail: { projectId: text(event, 'projectId') },
       })
       return
@@ -62,19 +107,20 @@ export function createShipforgeMonitor(
 
     if (event.kind === 'ci.env_preview') {
       if (!flag(event, 'exposed')) return
-      if (!c1.buildId || text(event, 'buildId') !== c1.buildId) return
+      const buildId = text(event, 'buildId')
+      const buildDigest = buildId ? c1.builds.get(buildId) : undefined
+      if (!buildDigest) return
       const tokenDigest = text(event, 'runnerTokenDigest')
       if (!tokenDigest) return
-      c1.tokenDigest = tokenDigest
-      c1.h2 = true
+      c1.tokens.set(tokenDigest, buildId)
       oracle.recordHop({
         chainId: 'SF-C1', hopId: 'sf-c1-h2', service: service('api'), routeKey: 'api.ciRunEnvPreview',
-        actor: actor(event, 'member_a'), artifactDigest: tokenDigest, entityId: c1.buildId,
+        actor: actor(event, 'member_a'), artifactDigest: tokenDigest, entityId: buildId,
         ts: event.ts, detail: { env: text(event, 'env'), status: text(event, 'status') },
       })
       oracle.recordEdge({
         chainId: 'SF-C1', fromHopId: 'sf-c1-h1', toHopId: 'sf-c1-h2', kind: 'async_pivot_binding',
-        fromArtifactDigest: c1.buildDigest, toConsumedDigest: tokenDigest,
+        fromArtifactDigest: buildDigest, toConsumedDigest: tokenDigest,
         runId, pollObserved: true, ts: event.ts,
         detail: { attestation: 'runner-build-poll' },
       })
@@ -82,12 +128,12 @@ export function createShipforgeMonitor(
     }
 
     if (event.kind === 'deployment.promoted') {
-      if (!c1.h2 || flag(event, 'envScopeChecked')) return
-      if (text(event, 'tokenDigest') !== c1.tokenDigest) return
+      if (flag(event, 'envScopeChecked')) return
+      const tokenDigest = text(event, 'tokenDigest')
+      if (!tokenDigest || !c1.tokens.has(tokenDigest)) return
       const saTokenDigest = text(event, 'saTokenDigest')
       if (!saTokenDigest) return
-      c1.saTokenDigest = saTokenDigest
-      c1.h3 = true
+      c1.saTokens.add(saTokenDigest)
       oracle.recordHop({
         chainId: 'SF-C1', hopId: 'sf-c1-h3', service: service('api'), routeKey: 'api.deploymentPromote',
         actor: actor(event, 'member_a'), artifactDigest: saTokenDigest, entityId: text(event, 'deploymentId'),
@@ -95,19 +141,19 @@ export function createShipforgeMonitor(
       })
       oracle.recordEdge({
         chainId: 'SF-C1', fromHopId: 'sf-c1-h2', toHopId: 'sf-c1-h3', kind: 'value_binding',
-        fromArtifactDigest: c1.tokenDigest, toConsumedDigest: c1.tokenDigest, ts: event.ts,
+        fromArtifactDigest: tokenDigest, toConsumedDigest: tokenDigest, ts: event.ts,
       })
       return
     }
 
     if (event.kind === 'secrets.batch_processed') {
-      if (!c1.h3 || !flag(event, 'partialAuthz')) return
-      if (text(event, 'credentialDigest') !== c1.saTokenDigest) return
+      if (!flag(event, 'partialAuthz')) return
+      const credentialDigest = text(event, 'credentialDigest')
+      if (!credentialDigest || !c1.saTokens.has(credentialDigest)) return
       if (text(event, 'victimTenant') !== 'org_b') return
       const keyDigest = text(event, 'victimKeyDigest')
       if (!keyDigest) return
-      c1.victimKeyDigest = keyDigest
-      c1.h4 = true
+      c1.victimKeys.add(keyDigest)
       oracle.recordHop({
         chainId: 'SF-C1', hopId: 'sf-c1-h4', service: service('api'), routeKey: 'api.secretsBatch',
         actor: actor(event, 'member_a'), artifactDigest: keyDigest, entityId: text(event, 'victimId'),
@@ -115,14 +161,15 @@ export function createShipforgeMonitor(
       })
       oracle.recordEdge({
         chainId: 'SF-C1', fromHopId: 'sf-c1-h3', toHopId: 'sf-c1-h4', kind: 'value_binding',
-        fromArtifactDigest: c1.saTokenDigest, toConsumedDigest: c1.saTokenDigest, ts: event.ts,
+        fromArtifactDigest: credentialDigest, toConsumedDigest: credentialDigest, ts: event.ts,
       })
       return
     }
 
     if (event.kind === 'deployment.released' && text(event, 'deploymentId') === plan.ids.deploymentProdId) {
-      if (!c1.h4 || text(event, 'signedWith') !== 'prod-signing-key') return
-      if (text(event, 'keyDigest') !== c1.victimKeyDigest) return
+      if (text(event, 'signedWith') !== 'prod-signing-key') return
+      const keyDigest = text(event, 'keyDigest')
+      if (!keyDigest || !c1.victimKeys.has(keyDigest)) return
       const releaseDigest = text(event, 'releaseDigest')
       if (!releaseDigest) return
       oracle.recordHop({
@@ -132,8 +179,8 @@ export function createShipforgeMonitor(
       })
       oracle.recordEdge({
         chainId: 'SF-C1', fromHopId: 'sf-c1-h4', toHopId: 'sf-c1-h5', kind: 'derived_crypto_binding',
-        fromArtifactDigest: c1.victimKeyDigest, toConsumedDigest: '',
-        derivedFromDigest: c1.victimKeyDigest, ts: event.ts,
+        fromArtifactDigest: keyDigest, toConsumedDigest: '',
+        derivedFromDigest: keyDigest, ts: event.ts,
         detail: { attestation: 'release-manifest-signature' },
       })
       oracle.recordTerminal({
@@ -149,29 +196,26 @@ export function createShipforgeMonitor(
       if (!flag(event, 'revokedPat') || profile.sseChecksRevocation) return
       const streamId = text(event, 'streamId')
       if (!streamId) return
-      c2.streamId = streamId
-      c2.streamDigest = digest(streamId)
-      c2.projectId = ''
-      c2.artifactDigest = ''
-      c2.controlProject = ''
-      c2.h2 = false
-      c2.h3 = false
+      const streamDigest = digest(streamId)
+      c2.streams.set(streamId, streamDigest)
       oracle.recordHop({
         chainId: 'SF-C2', hopId: 'sf-c2-h1', service: service('runner'), routeKey: 'runner.sseStream',
-        actor: actor(event, 'revoked_or_demoted'), artifactDigest: c2.streamDigest, entityId: streamId,
+        actor: actor(event, 'revoked_or_demoted'), artifactDigest: streamDigest, entityId: streamId,
         ts: event.ts, detail: { pool: text(event, 'pool') },
       })
       return
     }
 
     if (event.kind === 'runner.stream_event') {
-      if (!c2.streamId || text(event, 'streamId') !== c2.streamId) return
+      const streamId = text(event, 'streamId')
+      const streamDigest = streamId ? c2.streams.get(streamId) : undefined
+      if (!streamDigest) return
       const projectId = text(event, 'projectId')
       const artifactDigest = text(event, 'artifactDigest')
       if (!projectId || !artifactDigest) return
-      c2.projectId = projectId
-      c2.artifactDigest = artifactDigest
-      c2.h2 = true
+      const seen = c2.artifacts.get(projectId) ?? new Set<string>()
+      seen.add(artifactDigest)
+      c2.artifacts.set(projectId, seen)
       oracle.recordHop({
         chainId: 'SF-C2', hopId: 'sf-c2-h2', service: service('runner'), routeKey: 'runner.sseArtifactEvent',
         actor: actor(event, 'revoked_or_demoted'), artifactDigest, entityId: projectId,
@@ -179,7 +223,7 @@ export function createShipforgeMonitor(
       })
       oracle.recordEdge({
         chainId: 'SF-C2', fromHopId: 'sf-c2-h1', toHopId: 'sf-c2-h2', kind: 'async_pivot_binding',
-        fromArtifactDigest: c2.streamDigest, toConsumedDigest: artifactDigest,
+        fromArtifactDigest: streamDigest, toConsumedDigest: artifactDigest,
         runId, pollObserved: true, ts: event.ts,
         detail: { attestation: 'shared-stream-scope' },
       })
@@ -188,15 +232,25 @@ export function createShipforgeMonitor(
 
     if (event.kind === 'scm.repo_export_denied' && text(event, 'reason') === 'transfer_required') {
       if (profile.transferDualAdmin || profile.transferRequiresLivePat) return
-      c2.controlProject = text(event, 'projectId')
+      const projectId = text(event, 'projectId')
+      if (!projectId) return
+      const denial: Denial = { entityId: projectId, tenantId: text(event, 'tenantId'), actor: event.actorPersona ?? '' }
+      c2.denials.push(denial)
+      // A control observed after the transfer still ablates every matching transferred project.
+      for (const [transferredId, context] of c2.transferred) {
+        if (controlFor([denial], transferredId, context.fromTenant, context.actor)) {
+          recordControlOnce('SF-C2', 'sf-c2-h3', 'sf-c2-h4', transferredId, denial, event.ts)
+        }
+      }
       return
     }
 
     if (event.kind === 'project.transferred') {
-      if (!c2.h2 || text(event, 'projectId') !== c2.projectId) return
-      if (text(event, 'artifactDigest') !== c2.artifactDigest) return
-      c2.h3 = true
-      const projectId = c2.projectId
+      const projectId = text(event, 'projectId')
+      const artifactDigest = text(event, 'artifactDigest')
+      if (!projectId || !artifactDigest || !c2.artifacts.get(projectId)?.has(artifactDigest)) return
+      const context = { fromTenant: text(event, 'fromTenant'), actor: event.actorPersona ?? '' }
+      c2.transferred.set(projectId, context)
       oracle.recordHop({
         chainId: 'SF-C2', hopId: 'sf-c2-h3', service: service('api'), routeKey: 'api.projectTransfer',
         actor: actor(event, 'dual_member'), artifactDigest: digest(projectId), entityId: projectId,
@@ -204,23 +258,19 @@ export function createShipforgeMonitor(
       })
       oracle.recordEdge({
         chainId: 'SF-C2', fromHopId: 'sf-c2-h2', toHopId: 'sf-c2-h3', kind: 'value_binding',
-        fromArtifactDigest: c2.artifactDigest, toConsumedDigest: c2.artifactDigest, ts: event.ts,
+        fromArtifactDigest: artifactDigest, toConsumedDigest: artifactDigest, ts: event.ts,
       })
-      if (c2.controlProject === projectId) {
-        oracle.recordControl({
-          chainId: 'SF-C2', fromHopId: 'sf-c2-h3', toHopId: 'sf-c2-h4', entityId: projectId,
-          result: 'failed_without_predecessor', ts: event.ts,
-        })
-      }
+      const denial = controlFor(c2.denials, projectId, context.fromTenant, context.actor)
+      if (denial) recordControlOnce('SF-C2', 'sf-c2-h3', 'sf-c2-h4', projectId, denial, event.ts)
       return
     }
 
     if (event.kind === 'scm.repo_exported') {
-      if (!c2.h3 || text(event, 'projectId') !== c2.projectId) return
+      const projectId = text(event, 'projectId')
+      if (!projectId || !c2.transferred.has(projectId)) return
       if (!flag(event, 'transferred')) return
       const archiveDigest = text(event, 'archiveDigest')
       if (!archiveDigest) return
-      const projectId = c2.projectId
       oracle.recordHop({
         chainId: 'SF-C2', hopId: 'sf-c2-h4', service: service('scm'), routeKey: 'scm.repoExport',
         actor: actor(event, 'dual_member'), artifactDigest: archiveDigest, entityId: projectId,
@@ -245,12 +295,7 @@ export function createShipforgeMonitor(
       const leakedTemplateId = text(event, 'leakedTemplateId')
       const templateDigest = text(event, 'templateDigest')
       if (!leakedTemplateId || !templateDigest) return
-      c3.templateDigest = templateDigest
-      c3.deliveryId = ''
-      c3.deliveryDigest = ''
-      c3.tokenDigest = ''
-      c3.h2 = false
-      c3.h3 = false
+      c3.templates.add(templateDigest)
       oracle.recordHop({
         chainId: 'SF-C3', hopId: 'sf-c3-h1', service: service('api'), routeKey: 'api.projectSearch',
         actor: actor(event, 'member_a'), artifactDigest: templateDigest, entityId: leakedTemplateId,
@@ -260,46 +305,48 @@ export function createShipforgeMonitor(
     }
 
     if (event.kind === 'scm.webhook_created') {
-      if (!c3.templateDigest || text(event, 'templateDigest') !== c3.templateDigest) return
+      const templateDigest = text(event, 'templateDigest')
+      if (!templateDigest || !c3.templates.has(templateDigest)) return
       const deliveryId = text(event, 'deliveryId')
       if (!deliveryId) return
-      c3.deliveryId = deliveryId
-      c3.deliveryDigest = digest(deliveryId)
-      c3.h2 = true
+      const deliveryDigest = digest(deliveryId)
+      c3.deliveries.set(deliveryDigest, deliveryId)
       oracle.recordHop({
         chainId: 'SF-C3', hopId: 'sf-c3-h2', service: service('scm'), routeKey: 'scm.webhookCreate',
-        actor: actor(event, 'member_a'), artifactDigest: c3.deliveryDigest, entityId: deliveryId,
+        actor: actor(event, 'member_a'), artifactDigest: deliveryDigest, entityId: deliveryId,
         ts: event.ts, detail: { deliveredTo: text(event, 'deliveredTo'), status: String(event.detail.deliveryStatus ?? '') },
       })
       oracle.recordEdge({
         chainId: 'SF-C3', fromHopId: 'sf-c3-h1', toHopId: 'sf-c3-h2', kind: 'derived_crypto_binding',
-        fromArtifactDigest: c3.templateDigest, toConsumedDigest: '',
-        derivedFromDigest: c3.templateDigest, ts: event.ts,
+        fromArtifactDigest: templateDigest, toConsumedDigest: '',
+        derivedFromDigest: templateDigest, ts: event.ts,
         detail: { attestation: 'webhook-template-projection' },
       })
       return
     }
 
     if (event.kind === 'scm.delivery_log') {
-      if (!c3.h2 || text(event, 'deliveryDigest') !== c3.deliveryDigest) return
+      const deliveryDigest = text(event, 'deliveryDigest')
+      const deliveryId = deliveryDigest ? c3.deliveries.get(deliveryDigest) : undefined
+      if (!deliveryId) return
       const tokenDigest = text(event, 'tokenDigest')
       if (!tokenDigest) return
-      c3.tokenDigest = tokenDigest
-      c3.h3 = true
+      c3.tokens.set(tokenDigest, deliveryId)
       oracle.recordHop({
         chainId: 'SF-C3', hopId: 'sf-c3-h3', service: service('scm'), routeKey: 'scm.deliveryLog',
-        actor: actor(event, 'member_a'), artifactDigest: tokenDigest, entityId: c3.deliveryId,
+        actor: actor(event, 'member_a'), artifactDigest: tokenDigest, entityId: deliveryId,
         ts: event.ts, detail: { logRedacted: flag(event, 'logRedacted') },
       })
       oracle.recordEdge({
         chainId: 'SF-C3', fromHopId: 'sf-c3-h2', toHopId: 'sf-c3-h3', kind: 'value_binding',
-        fromArtifactDigest: c3.deliveryDigest, toConsumedDigest: c3.deliveryDigest, ts: event.ts,
+        fromArtifactDigest: deliveryDigest, toConsumedDigest: deliveryDigest, ts: event.ts,
       })
       return
     }
 
     if (event.kind === 'registry.sync') {
-      if (!c3.h3 || text(event, 'tokenDigest') !== c3.tokenDigest) return
+      const tokenDigest = text(event, 'tokenDigest')
+      if (!tokenDigest || !c3.tokens.has(tokenDigest)) return
       if (!flag(event, 'tokenValid') || flag(event, 'scoped')) return
       if (text(event, 'tenantId') !== 'org_b') return
       const secretDigest = text(event, 'secretDigest')
@@ -312,8 +359,8 @@ export function createShipforgeMonitor(
       })
       oracle.recordEdge({
         chainId: 'SF-C3', fromHopId: 'sf-c3-h3', toHopId: 'sf-c3-h4', kind: 'derived_crypto_binding',
-        fromArtifactDigest: c3.tokenDigest, toConsumedDigest: '',
-        derivedFromDigest: c3.tokenDigest, ts: event.ts,
+        fromArtifactDigest: tokenDigest, toConsumedDigest: '',
+        derivedFromDigest: tokenDigest, ts: event.ts,
         detail: { attestation: 'registry-service-token' },
       })
       oracle.recordTerminal({
@@ -330,14 +377,11 @@ export function createShipforgeMonitor(
       if (text(event, 'inheritedRole') !== 'org:admin' || !flag(event, 'autoRelease')) return
       const automationId = text(event, 'automationId')
       if (!automationId) return
-      c4.automationId = automationId
-      c4.automationDigest = digest(automationId)
-      c4.deploymentId = ''
-      c4.controlDeployment = ''
-      c4.h2 = false
+      const automationDigest = digest(automationId)
+      c4.automations.set(automationId, automationDigest)
       oracle.recordHop({
         chainId: 'SF-C4', hopId: 'sf-c4-h1', service: service('api'), routeKey: 'api.automationCreate',
-        actor: actor(event, 'member_a'), artifactDigest: c4.automationDigest, entityId: automationId,
+        actor: actor(event, 'member_a'), artifactDigest: automationDigest, entityId: automationId,
         ts: event.ts, detail: { inheritedRole: text(event, 'inheritedRole') },
       })
       return
@@ -345,18 +389,34 @@ export function createShipforgeMonitor(
 
     if (event.kind === 'release.denied' && text(event, 'reason') === 'approval_required') {
       if (!profile.disputeKeepsSchedule) return
-      c4.controlDeployment = text(event, 'deploymentId')
+      const deploymentId = text(event, 'deploymentId')
+      if (!deploymentId) return
+      // Production releases are refused by a separate signing policy, and a deployment that already
+      // carries a schedule is not refused for lack of one; neither ablates a sibling dispute.
+      const siblingEligible = deploymentId !== plan.ids.deploymentProdId && event.detail.autoReleaseScheduled !== true
+      const denial: Denial = {
+        entityId: deploymentId,
+        tenantId: siblingEligible ? text(event, 'tenantId') : '',
+        actor: siblingEligible ? event.actorPersona ?? '' : '',
+      }
+      c4.denials.push(denial)
+      for (const [disputedId, context] of c4.disputed) {
+        if (controlFor([denial], disputedId, context.tenantId, context.actor)) {
+          recordControlOnce('SF-C4', 'sf-c4-h2', 'sf-c4-h3', disputedId, denial, event.ts)
+        }
+      }
       return
     }
 
     if (event.kind === 'deployment.disputed') {
-      if (!c4.automationId || text(event, 'automationId') !== c4.automationId) return
-      if (text(event, 'automationDigest') !== c4.automationDigest) return
+      const automationId = text(event, 'automationId')
+      const automationDigest = automationId ? c4.automations.get(automationId) : undefined
+      if (!automationDigest || text(event, 'automationDigest') !== automationDigest) return
       if (!flag(event, 'autoReleaseScheduled')) return
       const deploymentId = text(event, 'deploymentId')
       if (!deploymentId) return
-      c4.deploymentId = deploymentId
-      c4.h2 = true
+      const context = { tenantId: text(event, 'tenantId'), actor: event.actorPersona ?? '' }
+      c4.disputed.set(deploymentId, context)
       oracle.recordHop({
         chainId: 'SF-C4', hopId: 'sf-c4-h2', service: service('api'), routeKey: 'api.deploymentDispute',
         actor: actor(event, 'member_a'), artifactDigest: digest(deploymentId), entityId: deploymentId,
@@ -364,22 +424,18 @@ export function createShipforgeMonitor(
       })
       oracle.recordEdge({
         chainId: 'SF-C4', fromHopId: 'sf-c4-h1', toHopId: 'sf-c4-h2', kind: 'value_binding',
-        fromArtifactDigest: c4.automationDigest, toConsumedDigest: c4.automationDigest, ts: event.ts,
+        fromArtifactDigest: automationDigest, toConsumedDigest: automationDigest, ts: event.ts,
       })
-      if (c4.controlDeployment === deploymentId) {
-        oracle.recordControl({
-          chainId: 'SF-C4', fromHopId: 'sf-c4-h2', toHopId: 'sf-c4-h3', entityId: deploymentId,
-          result: 'failed_without_predecessor', ts: event.ts,
-        })
-      }
+      const denial = controlFor(c4.denials, deploymentId, context.tenantId, context.actor)
+      if (denial) recordControlOnce('SF-C4', 'sf-c4-h2', 'sf-c4-h3', deploymentId, denial, event.ts)
       return
     }
 
-    if (event.kind === 'deployment.released' && text(event, 'deploymentId') === c4.deploymentId) {
-      if (!c4.h2 || text(event, 'approval') !== 'automation') return
+    if (event.kind === 'deployment.released' && c4.disputed.has(text(event, 'deploymentId'))) {
+      if (text(event, 'approval') !== 'automation') return
       const releaseDigest = text(event, 'releaseDigest')
       if (!releaseDigest) return
-      const deploymentId = c4.deploymentId
+      const deploymentId = text(event, 'deploymentId')
       oracle.recordHop({
         chainId: 'SF-C4', hopId: 'sf-c4-h3', service: service('api'), routeKey: 'api.productionRelease',
         actor: actor(event, 'member_a'), artifactDigest: releaseDigest, entityId: deploymentId,

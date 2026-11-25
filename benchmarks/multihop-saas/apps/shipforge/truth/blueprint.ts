@@ -268,6 +268,8 @@ export function apiCatalog(plan: DomainVariant): ApiRef[] {
     ['api.secretsBatch', 'api', 'POST', `${p}/secrets/batch`, '', 'service'],
     ['api.keysRotate', 'api', 'POST', `${p}/keys/rotate`, '', 'session'],
     ['api.runners', 'api', 'GET', `${p}/runners`, '', 'session'],
+    ['api.runnerSharedEvents', 'api', 'GET', `${p}/runners/shared/events`, '', 'session'],
+    ['api.registrySync', 'api', 'POST', `${p}/integrations/registry/sync`, '', 'session'],
     ['api.pipelines', 'api', 'GET', `${p}/pipelines`, '', 'session'],
     ['api.environments', 'api', 'GET', `${p}/environments`, '', 'session'],
     ['api.artifacts', 'api', 'GET', `${p}/artifacts`, '', 'session'],

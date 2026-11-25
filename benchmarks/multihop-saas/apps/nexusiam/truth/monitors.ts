@@ -26,14 +26,73 @@ function actor(event: AuditEvent, fallback: PersonaId): PersonaId {
   return event.actorPersona ?? fallback
 }
 
+interface Denial {
+  entityId: string
+  tenantId: string
+  actor: string
+  reason?: string
+}
+
 export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runId: string) {
+  // Per-entity tracking: concurrent workers and dual-replay verification interleave several
+  // comments, codes, documents and export jobs inside one run, so no chain keeps a single
+  // "current" slot that a second entity could overwrite.
   const c1 = {
-    commentId: '', commentDigest: '', visitDigest: '', tokenDigest: '', targetUserId: '', targetRole: '',
-    deniedUserId: '', h2: false, h3: false, h4: false,
+    comments: new Map<string, string>(), // commentId -> commentDigest
+    visits: new Set<string>(), // moderation visit digests
+    tokens: new Set<string>(), // bot-minted SCIM token digests
+    promoted: new Map<string, string>(), // userId -> role granted through a bot-minted token
+    deniedUsers: new Set<string>(), // readers refused by the audit vault
   }
-  const c2 = { codeDigest: '', inviteTokenDigest: '', h2: false, h3: false }
-  const c3 = { delegationDigest: '', docId: '', h2: false, h3: false }
-  const c4 = { folderDigest: '', handleDigest: '', jobId: '', h2: false, h3: false }
+  const c2 = {
+    codes: new Set<string>(), // redirected authorization code digests
+    captured: new Set<string>(), // code digests captured through the share preview
+    inviteTokens: new Set<string>(), // leaked pending-invite token digests
+  }
+  const c3 = {
+    delegations: new Set<string>(), // cross-tenant cached delegation key digests
+    listed: new Map<string, Set<string>>(), // docId -> delegation digests that listed it
+    opened: new Map<string, { tenantId: string; actor: string; delegations: Set<string> }>(), // docId -> open context
+    denials: [] as Denial[], // private-document reads refused without a delegation / scope
+  }
+  const c4 = {
+    folders: new Set<string>(), // private folder name digests disclosed by facets
+    handles: new Map<string, string>(), // export handle digest -> jobId
+    polled: new Set<string>(), // jobIds observed ready through a disclosed handle
+  }
+  const recordedControls = new Set<string>()
+
+  // A clean ablation control is a genuine denial observed on the same entity, or on a sibling entity
+  // of the same tenant made by the same actor. It always requires a real denial event.
+  const controlFor = (
+    denials: readonly Denial[], entityId: string, tenantId: string, actorId: string,
+  ): Denial | null =>
+    denials.find((denial) => denial.entityId === entityId) ??
+    denials.find((denial) =>
+      denial.entityId !== entityId && denial.tenantId !== '' && denial.tenantId === tenantId &&
+      denial.actor !== '' && denial.actor === actorId) ??
+    null
+
+  const recordControlOnce = (
+    chainId: string, fromHopId: string, toHopId: string, entityId: string, ts: number,
+    detail: Record<string, string | number | boolean>,
+  ): void => {
+    const key = `${chainId}\0${fromHopId}\0${toHopId}\0${entityId}`
+    if (recordedControls.has(key)) return
+    recordedControls.add(key)
+    oracle.recordControl({
+      chainId, fromHopId, toHopId, entityId, result: 'failed_without_predecessor', ts, detail,
+    })
+  }
+
+  const recordC3Control = (docId: string, denial: Denial, ts: number): void => {
+    const detail: Record<string, string | number | boolean> = { reason: denial.reason ?? '' }
+    if (denial.entityId !== docId) {
+      detail.controlEntityId = denial.entityId
+      detail.sibling = true
+    }
+    recordControlOnce('NX-C3', 'nx-c3-h3', 'nx-c3-h4', docId, ts, detail)
+  }
 
   const consume = (event: AuditEvent): void => {
     if (event.runId !== runId) return
@@ -43,8 +102,7 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
       const commentId = text(event, 'commentId')
       const commentDigest = text(event, 'commentDigest')
       if (!commentId || !commentDigest) return
-      c1.commentId = commentId
-      c1.commentDigest = commentDigest
+      c1.comments.set(commentId, commentDigest)
       oracle.recordHop({
         chainId: 'NX-C1', hopId: 'nx-c1-h1', service: sid('api'), routeKey: 'api.commentCreate',
         actor: actor(event, 'member_a'), artifactDigest: commentDigest, entityId: commentId, ts: event.ts,
@@ -54,29 +112,30 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
     }
 
     if (event.kind === 'moderation.bot_visit') {
-      if (!c1.commentId || text(event, 'commentId') !== c1.commentId) return
+      const commentId = text(event, 'commentId')
+      const commentDigest = commentId ? c1.comments.get(commentId) : undefined
+      if (!commentDigest) return
       const visitDigest = text(event, 'visitDigest')
       if (!visitDigest) return
-      c1.visitDigest = visitDigest
-      c1.h2 = true
+      c1.visits.add(visitDigest)
       oracle.recordHop({
         chainId: 'NX-C1', hopId: 'nx-c1-h2', service: sid('app'), routeKey: 'app.moderationRender',
-        actor: 'member_a', artifactDigest: visitDigest, entityId: c1.commentId, ts: event.ts,
+        actor: 'member_a', artifactDigest: visitDigest, entityId: commentId, ts: event.ts,
         detail: { renderedRaw: flag(event, 'renderedRaw') },
       })
       oracle.recordEdge({
         chainId: 'NX-C1', fromHopId: 'nx-c1-h1', toHopId: 'nx-c1-h2', kind: 'value_binding',
-        fromArtifactDigest: c1.commentDigest, toConsumedDigest: text(event, 'commentDigest'), ts: event.ts,
+        fromArtifactDigest: commentDigest, toConsumedDigest: text(event, 'commentDigest'), ts: event.ts,
       })
       return
     }
 
     if (event.kind === 'scim.token_minted') {
-      if (!c1.visitDigest || text(event, 'sourceDigest') !== c1.visitDigest) return
+      const sourceDigest = text(event, 'sourceDigest')
+      if (!sourceDigest || !c1.visits.has(sourceDigest)) return
       const tokenDigest = text(event, 'tokenDigest')
       if (!tokenDigest) return
-      c1.tokenDigest = tokenDigest
-      c1.h3 = true
+      c1.tokens.add(tokenDigest)
       oracle.recordHop({
         chainId: 'NX-C1', hopId: 'nx-c1-h3', service: sid('api'), routeKey: 'api.scimTokenMint',
         actor: 'member_a', artifactDigest: tokenDigest, ts: event.ts,
@@ -84,20 +143,19 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
       })
       oracle.recordEdge({
         chainId: 'NX-C1', fromHopId: 'nx-c1-h2', toHopId: 'nx-c1-h3', kind: 'value_binding',
-        fromArtifactDigest: c1.visitDigest, toConsumedDigest: text(event, 'sourceDigest'), ts: event.ts,
+        fromArtifactDigest: sourceDigest, toConsumedDigest: sourceDigest, ts: event.ts,
       })
       return
     }
 
     if (event.kind === 'scim.user_patched') {
-      if (!c1.tokenDigest || text(event, 'tokenDigest') !== c1.tokenDigest) return
+      const tokenDigest = text(event, 'tokenDigest')
+      if (!tokenDigest || !c1.tokens.has(tokenDigest)) return
       const targetUserId = text(event, 'targetUserId')
       // The audit vault admits owners and admins, so either promotion completes the escalation.
       const role = text(event, 'role')
       if (targetUserId !== plan.personas.member_a.userId || (role !== 'owner' && role !== 'admin')) return
-      c1.targetUserId = targetUserId
-      c1.targetRole = role
-      c1.h4 = true
+      c1.promoted.set(targetUserId, role)
       const artifact = digest(`role:${targetUserId}:${role}`)
       oracle.recordHop({
         chainId: 'NX-C1', hopId: 'nx-c1-h4', service: sid('api'), routeKey: 'api.scimUserPatch',
@@ -106,17 +164,20 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
       })
       oracle.recordEdge({
         chainId: 'NX-C1', fromHopId: 'nx-c1-h3', toHopId: 'nx-c1-h4', kind: 'value_binding',
-        fromArtifactDigest: c1.tokenDigest, toConsumedDigest: text(event, 'tokenDigest'), ts: event.ts,
+        fromArtifactDigest: tokenDigest, toConsumedDigest: tokenDigest, ts: event.ts,
       })
       return
     }
 
+    // The NX-C1 shared entity is the reader itself, so a denial for that reader is the
+    // same-entity control; it is recorded whenever it happens relative to the promotion.
     if (event.kind === 'audit.vault_denied') {
-      if (text(event, 'readerUserId') !== plan.personas.member_a.userId) return
-      c1.deniedUserId = text(event, 'readerUserId')
+      const readerUserId = text(event, 'readerUserId')
+      if (readerUserId !== plan.personas.member_a.userId) return
+      c1.deniedUsers.add(readerUserId)
       oracle.recordControl({
         chainId: 'NX-C1', fromHopId: 'nx-c1-h4', toHopId: 'nx-c1-h5',
-        entityId: c1.deniedUserId, result: 'failed_without_predecessor', ts: event.ts,
+        entityId: readerUserId, result: 'failed_without_predecessor', ts: event.ts,
         detail: { reason: text(event, 'reason') },
       })
       return
@@ -124,19 +185,21 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
 
     if (event.kind === 'audit.vault_read') {
       const readerUserId = text(event, 'readerUserId')
-      if (!c1.h4 || readerUserId !== plan.personas.member_a.userId) return
+      if (readerUserId !== plan.personas.member_a.userId) return
+      const role = c1.promoted.get(readerUserId)
+      if (!role) return
       const artifact = digest(`audit:${readerUserId}`)
       oracle.recordHop({
         chainId: 'NX-C1', hopId: 'nx-c1-h5', service: sid('api'), routeKey: 'api.auditVaultRead',
         actor: 'member_a', artifactDigest: artifact, entityId: readerUserId, ts: event.ts,
-        effectiveRole: c1.targetRole === 'admin' ? 'admin' : 'owner',
+        effectiveRole: role === 'admin' ? 'admin' : 'owner',
       })
       oracle.recordEdge({
         chainId: 'NX-C1', fromHopId: 'nx-c1-h4', toHopId: 'nx-c1-h5', kind: 'state_transition_binding',
-        fromArtifactDigest: c1.targetUserId ? digest(`role:${c1.targetUserId}:${c1.targetRole}`) : '',
+        fromArtifactDigest: digest(`role:${readerUserId}:${role}`),
         toConsumedDigest: artifact, entityId: readerUserId, ts: event.ts,
       })
-      if (c1.deniedUserId === readerUserId) {
+      if (c1.deniedUsers.has(readerUserId)) {
         oracle.recordControl({
           chainId: 'NX-C1', fromHopId: 'nx-c1-h4', toHopId: 'nx-c1-h5',
           entityId: readerUserId, result: 'failed_without_predecessor', ts: event.ts,
@@ -153,7 +216,7 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
       if (!flag(event, 'openRedirect')) return
       const codeDigest = text(event, 'codeDigest')
       if (!codeDigest) return
-      c2.codeDigest = codeDigest
+      c2.codes.add(codeDigest)
       oracle.recordHop({
         chainId: 'NX-C2', hopId: 'nx-c2-h1', service: sid('idp'), routeKey: 'idp.authorizeRedirect',
         actor: 'member_b', artifactDigest: codeDigest, ts: event.ts,
@@ -163,26 +226,27 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
     }
 
     if (event.kind === 'share.delegated_code_captured') {
-      if (!c2.codeDigest || text(event, 'codeDigest') !== c2.codeDigest) return
-      c2.h2 = true
+      const codeDigest = text(event, 'codeDigest')
+      if (!codeDigest || !c2.codes.has(codeDigest)) return
+      c2.captured.add(codeDigest)
       oracle.recordHop({
         chainId: 'NX-C2', hopId: 'nx-c2-h2', service: sid('app'), routeKey: 'app.shareLinkCapture',
-        actor: 'member_b', artifactDigest: c2.codeDigest, ts: event.ts,
+        actor: 'member_b', artifactDigest: codeDigest, ts: event.ts,
         detail: { victimBot: flag(event, 'victimBot') },
       })
       oracle.recordEdge({
         chainId: 'NX-C2', fromHopId: 'nx-c2-h1', toHopId: 'nx-c2-h2', kind: 'value_binding',
-        fromArtifactDigest: c2.codeDigest, toConsumedDigest: text(event, 'codeDigest'), ts: event.ts,
+        fromArtifactDigest: codeDigest, toConsumedDigest: codeDigest, ts: event.ts,
       })
       return
     }
 
     if (event.kind === 'invite.pending_listed') {
-      if (!c2.h2 || text(event, 'derivedFromDigest') !== c2.codeDigest) return
+      const codeDigest = text(event, 'derivedFromDigest')
+      if (!codeDigest || !c2.captured.has(codeDigest)) return
       const leaked = text(event, 'leakedTokenDigest')
       if (!leaked) return
-      c2.inviteTokenDigest = leaked
-      c2.h3 = true
+      c2.inviteTokens.add(leaked)
       oracle.recordHop({
         chainId: 'NX-C2', hopId: 'nx-c2-h3', service: sid('idp'), routeKey: 'idp.pendingInvites',
         actor: 'member_b', artifactDigest: leaked, ts: event.ts,
@@ -190,14 +254,15 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
       })
       oracle.recordEdge({
         chainId: 'NX-C2', fromHopId: 'nx-c2-h2', toHopId: 'nx-c2-h3', kind: 'derived_crypto_binding',
-        fromArtifactDigest: c2.codeDigest, toConsumedDigest: '', derivedFromDigest: c2.codeDigest, ts: event.ts,
+        fromArtifactDigest: codeDigest, toConsumedDigest: '', derivedFromDigest: codeDigest, ts: event.ts,
         detail: { attestation: 'delegated-code-exchange' },
       })
       return
     }
 
     if (event.kind === 'invite.redeemed_stale') {
-      if (!c2.h3 || text(event, 'tokenDigest') !== c2.inviteTokenDigest) return
+      const inviteTokenDigest = text(event, 'tokenDigest')
+      if (!inviteTokenDigest || !c2.inviteTokens.has(inviteTokenDigest)) return
       const sessionDigest = text(event, 'sessionDigest')
       if (!sessionDigest) return
       oracle.recordHop({
@@ -207,8 +272,8 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
       })
       oracle.recordEdge({
         chainId: 'NX-C2', fromHopId: 'nx-c2-h3', toHopId: 'nx-c2-h4', kind: 'derived_crypto_binding',
-        fromArtifactDigest: c2.inviteTokenDigest, toConsumedDigest: '',
-        derivedFromDigest: c2.inviteTokenDigest, ts: event.ts,
+        fromArtifactDigest: inviteTokenDigest, toConsumedDigest: '',
+        derivedFromDigest: inviteTokenDigest, ts: event.ts,
         detail: { attestation: 'stale-invite-session' },
       })
       oracle.recordTerminal({
@@ -222,7 +287,7 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
       if (!flag(event, 'crossTenant')) return
       const delegationDigest = text(event, 'delegationKeyDigest')
       if (!delegationDigest) return
-      c3.delegationDigest = delegationDigest
+      c3.delegations.add(delegationDigest)
       oracle.recordHop({
         chainId: 'NX-C3', hopId: 'nx-c3-h1', service: sid('cdn'), routeKey: 'cdn.profileCacheRead',
         actor: 'member_b', artifactDigest: delegationDigest, ts: event.ts,
@@ -232,12 +297,14 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
     }
 
     if (event.kind === 'docs.listing_served') {
-      if (!c3.delegationDigest || !flag(event, 'fallback')) return
-      if (text(event, 'delegationKeyDigest') !== c3.delegationDigest) return
+      if (!flag(event, 'fallback')) return
+      const delegationDigest = text(event, 'delegationKeyDigest')
+      if (!delegationDigest || !c3.delegations.has(delegationDigest)) return
       const docId = text(event, 'docId')
       if (!docId) return
-      c3.docId = docId
-      c3.h2 = true
+      const listedWith = c3.listed.get(docId) ?? new Set<string>()
+      listedWith.add(delegationDigest)
+      c3.listed.set(docId, listedWith)
       const artifact = digest(docId)
       oracle.recordHop({
         chainId: 'NX-C3', hopId: 'nx-c3-h2', service: sid('api'), routeKey: 'api.docsWorkspaceFallback',
@@ -246,55 +313,67 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
       })
       oracle.recordEdge({
         chainId: 'NX-C3', fromHopId: 'nx-c3-h1', toHopId: 'nx-c3-h2', kind: 'value_binding',
-        fromArtifactDigest: c3.delegationDigest, toConsumedDigest: text(event, 'delegationKeyDigest'), ts: event.ts,
+        fromArtifactDigest: delegationDigest, toConsumedDigest: delegationDigest, ts: event.ts,
       })
       return
     }
 
     if (event.kind === 'docs.doc_opened') {
-      if (!c3.h2 || text(event, 'docId') !== c3.docId) return
-      if (text(event, 'delegationKeyDigest') !== c3.delegationDigest) return
-      c3.h3 = true
-      const artifact = digest(`doc:${c3.docId}`)
+      const docId = text(event, 'docId')
+      const delegationDigest = text(event, 'delegationKeyDigest')
+      if (!docId || !delegationDigest || !c3.listed.get(docId)?.has(delegationDigest)) return
+      const opened = c3.opened.get(docId) ?? {
+        tenantId: text(event, 'tenantId'), actor: event.actorPersona ?? '', delegations: new Set<string>(),
+      }
+      opened.delegations.add(delegationDigest)
+      c3.opened.set(docId, opened)
+      const artifact = digest(`doc:${docId}`)
       oracle.recordHop({
         chainId: 'NX-C3', hopId: 'nx-c3-h3', service: sid('api'), routeKey: 'api.docPrivateOpen',
-        actor: 'member_b', artifactDigest: artifact, entityId: c3.docId, ts: event.ts,
+        actor: 'member_b', artifactDigest: artifact, entityId: docId, ts: event.ts,
       })
       oracle.recordEdge({
         chainId: 'NX-C3', fromHopId: 'nx-c3-h2', toHopId: 'nx-c3-h3', kind: 'value_binding',
-        fromArtifactDigest: digest(c3.docId), toConsumedDigest: digest(c3.docId), ts: event.ts,
+        fromArtifactDigest: digest(docId), toConsumedDigest: digest(docId), ts: event.ts,
       })
+      const denial = controlFor(c3.denials, docId, opened.tenantId, opened.actor)
+      if (denial) recordC3Control(docId, denial, event.ts)
       return
     }
 
     if (event.kind === 'docs.access_denied') {
-      if (!c3.docId || text(event, 'docId') !== c3.docId) return
+      const docId = text(event, 'docId')
+      if (!docId) return
       const reason = text(event, 'reason')
       if (reason !== 'missing_delegation' && reason !== 'scope_check') return
-      oracle.recordControl({
-        chainId: 'NX-C3', fromHopId: 'nx-c3-h3', toHopId: 'nx-c3-h4',
-        entityId: c3.docId, result: 'failed_without_predecessor', ts: event.ts,
-        detail: { reason },
-      })
+      const denial: Denial = { entityId: docId, tenantId: text(event, 'tenantId'), actor: event.actorPersona ?? '', reason }
+      c3.denials.push(denial)
+      // Credit every opened document this denial ablates (same document, or same-tenant sibling
+      // refused for the same actor), whichever order the control and the open arrive in.
+      for (const [openedId, opened] of c3.opened) {
+        if (controlFor([denial], openedId, opened.tenantId, opened.actor)) recordC3Control(openedId, denial, event.ts)
+      }
       return
     }
 
     if (event.kind === 'docs.content_read') {
-      if (!c3.h3 || text(event, 'docId') !== c3.docId) return
+      const docId = text(event, 'docId')
+      const opened = docId ? c3.opened.get(docId) : undefined
+      if (!opened) return
       if (!text(event, 'canaryDigest')) return
-      const artifact = digest(`content:${c3.docId}`)
+      const artifact = digest(`content:${docId}`)
       oracle.recordHop({
         chainId: 'NX-C3', hopId: 'nx-c3-h4', service: sid('api'), routeKey: 'api.docContentRead',
-        actor: 'member_b', artifactDigest: artifact, entityId: c3.docId, ts: event.ts,
+        actor: 'member_b', artifactDigest: artifact, entityId: docId, ts: event.ts,
       })
       oracle.recordEdge({
         chainId: 'NX-C3', fromHopId: 'nx-c3-h3', toHopId: 'nx-c3-h4', kind: 'state_transition_binding',
-        fromArtifactDigest: digest(`doc:${c3.docId}`), toConsumedDigest: artifact,
-        entityId: c3.docId, ts: event.ts,
+        fromArtifactDigest: digest(`doc:${docId}`), toConsumedDigest: artifact,
+        entityId: docId, ts: event.ts,
       })
       oracle.recordTerminal({
         chainId: 'NX-C3', service: sid('api'), routeKey: 'api.docContentRead',
-        kind: impact('cross_tenant_document_read'), actor: 'member_b', entityId: c3.docId, ts: event.ts,
+        kind: impact('cross_tenant_document_read'), actor: 'member_b', entityId: docId, ts: event.ts,
       })
       return
     }
@@ -303,7 +382,7 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
       if (!flag(event, 'privateMatch')) return
       const folderDigest = text(event, 'folderNameDigest')
       if (!folderDigest) return
-      c4.folderDigest = folderDigest
+      c4.folders.add(folderDigest)
       oracle.recordHop({
         chainId: 'NX-C4', hopId: 'nx-c4-h1', service: sid('api'), routeKey: 'api.searchFacets',
         actor: 'revoked_or_demoted', artifactDigest: folderDigest, ts: event.ts,
@@ -313,55 +392,58 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
     }
 
     if (event.kind === 'doc.share_metadata') {
-      if (!c4.folderDigest || text(event, 'folderDigest') !== c4.folderDigest) return
+      const folderDigest = text(event, 'folderDigest')
+      if (!folderDigest || !c4.folders.has(folderDigest)) return
       const handleDigest = text(event, 'handleDigest')
       if (!handleDigest) return
-      c4.handleDigest = handleDigest
-      c4.jobId = text(event, 'jobId')
-      c4.h2 = true
+      const jobId = text(event, 'jobId')
+      c4.handles.set(handleDigest, jobId)
       oracle.recordHop({
         chainId: 'NX-C4', hopId: 'nx-c4-h2', service: sid('api'), routeKey: 'api.shareMetadata',
-        actor: 'revoked_or_demoted', artifactDigest: handleDigest, entityId: c4.jobId, ts: event.ts,
+        actor: 'revoked_or_demoted', artifactDigest: handleDigest, entityId: jobId, ts: event.ts,
       })
       oracle.recordEdge({
         chainId: 'NX-C4', fromHopId: 'nx-c4-h1', toHopId: 'nx-c4-h2', kind: 'value_binding',
-        fromArtifactDigest: c4.folderDigest, toConsumedDigest: text(event, 'folderDigest'), ts: event.ts,
+        fromArtifactDigest: folderDigest, toConsumedDigest: folderDigest, ts: event.ts,
       })
       return
     }
 
     if (event.kind === 'worker.job_polled') {
-      if (!c4.h2 || text(event, 'handleDigest') !== c4.handleDigest) return
+      const handleDigest = text(event, 'handleDigest')
+      const jobId = handleDigest ? c4.handles.get(handleDigest) : undefined
+      if (jobId === undefined) return
       if (text(event, 'status') !== 'ready') return
-      c4.h3 = true
-      const artifact = digest(`job:${c4.jobId}`)
+      c4.polled.add(jobId)
+      const artifact = digest(`job:${jobId}`)
       oracle.recordHop({
         chainId: 'NX-C4', hopId: 'nx-c4-h3', service: sid('docs-worker'), routeKey: 'docsWorker.jobPoll',
-        actor: 'revoked_or_demoted', artifactDigest: artifact, entityId: c4.jobId, ts: event.ts,
+        actor: 'revoked_or_demoted', artifactDigest: artifact, entityId: jobId, ts: event.ts,
       })
       oracle.recordEdge({
         chainId: 'NX-C4', fromHopId: 'nx-c4-h2', toHopId: 'nx-c4-h3', kind: 'value_binding',
-        fromArtifactDigest: c4.handleDigest, toConsumedDigest: text(event, 'handleDigest'), ts: event.ts,
+        fromArtifactDigest: handleDigest, toConsumedDigest: handleDigest, ts: event.ts,
       })
       return
     }
 
     if (event.kind === 'worker.job_result') {
-      if (!c4.h3 || text(event, 'jobId') !== c4.jobId) return
+      const jobId = text(event, 'jobId')
+      if (!c4.polled.has(jobId)) return
       if (!flag(event, 'exfiltrated') || !text(event, 'canaryDigest')) return
-      const artifact = digest(`result:${c4.jobId}`)
+      const artifact = digest(`result:${jobId}`)
       oracle.recordHop({
         chainId: 'NX-C4', hopId: 'nx-c4-h4', service: sid('docs-worker'), routeKey: 'docsWorker.jobResult',
-        actor: 'revoked_or_demoted', artifactDigest: artifact, entityId: c4.jobId, ts: event.ts,
+        actor: 'revoked_or_demoted', artifactDigest: artifact, entityId: jobId, ts: event.ts,
       })
       oracle.recordEdge({
         chainId: 'NX-C4', fromHopId: 'nx-c4-h3', toHopId: 'nx-c4-h4', kind: 'async_pivot_binding',
-        fromArtifactDigest: digest(`job:${c4.jobId}`), toConsumedDigest: artifact,
+        fromArtifactDigest: digest(`job:${jobId}`), toConsumedDigest: artifact,
         runId, pollObserved: true, ts: event.ts,
       })
       oracle.recordTerminal({
         chainId: 'NX-C4', service: sid('docs-worker'), routeKey: 'docsWorker.jobResult',
-        kind: impact('cross_tenant_exfiltration'), actor: 'revoked_or_demoted', entityId: c4.jobId, ts: event.ts,
+        kind: impact('cross_tenant_exfiltration'), actor: 'revoked_or_demoted', entityId: jobId, ts: event.ts,
       })
     }
   }
