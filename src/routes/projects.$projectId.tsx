@@ -32,11 +32,12 @@ function ProjectPage() {
   const [personaTests, setPersonaTests] = useState<Record<string, PersonaTestState>>({})
 
   function selectTab(next: ProjectTabId) {
+    if (next === activeTab) return
     void navigate({
       to: '/projects/$projectId',
       params: { projectId: project.id },
       search: next === 'overview' ? {} : { tab: next },
-      replace: true,
+      replace: false,
     })
   }
 

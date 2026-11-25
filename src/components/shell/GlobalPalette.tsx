@@ -4,11 +4,63 @@ import { useNavigate } from '@tanstack/react-router'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Kbd, KbdGroup } from '../run/display.tsx'
-import { host, modKey, runLabel, short } from '../run/format.ts'
+import { host, modKey, runLabel } from '../run/format.ts'
 import { StatusGlyph } from '../run/glyphs.tsx'
 import { Icon } from '../run/icons.tsx'
 import type { IconName } from '../run/icons.tsx'
 import { runStatusLabel } from '../run/meta.ts'
+
+const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const
+const MINUTE_MS = 60_000
+const HOUR_MS = 3_600_000
+const DAY_MS = 24 * HOUR_MS
+
+/**
+ * Human-friendly timestamp:
+ * - < 24h old: relative ("just now", "8m ago" / "8 minutes ago", "2h ago" / "2 hours ago")
+ * - >= 24h old: concise calendar date ("Nov 22", or "Nov 22, 2025" if a different year)
+ */
+export function formatRelativeTime(ms: number, opts?: { compact?: boolean; now?: number }): string {
+  if (!Number.isFinite(ms)) return ''
+  const now = opts?.now ?? Date.now()
+  const diff = now - ms
+  if (diff >= -MINUTE_MS && diff < DAY_MS) {
+    if (diff < MINUTE_MS) return 'just now'
+    if (diff < HOUR_MS) {
+      const mins = Math.floor(diff / MINUTE_MS)
+      return opts?.compact ? `${mins}m ago` : `${mins} ${mins === 1 ? 'minute' : 'minutes'} ago`
+    }
+    const hrs = Math.floor(diff / HOUR_MS)
+    return opts?.compact ? `${hrs}h ago` : `${hrs} ${hrs === 1 ? 'hour' : 'hours'} ago`
+  }
+  const d = new Date(ms)
+  const ref = new Date(now)
+  const day = `${SHORT_MONTHS[d.getMonth()]} ${d.getDate()}`
+  return d.getFullYear() === ref.getFullYear() ? day : `${day}, ${d.getFullYear()}`
+}
+
+/** Full local date + time for hover tooltips (e.g. "Nov 24, 2026, 9:00 PM"). */
+export function formatFullDateTime(ms: number): string {
+  if (!Number.isFinite(ms)) return ''
+  return new Date(ms).toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+}
+
+/** Lightweight client clock tick so relative timestamps stay fresh while open. */
+export function useNow(intervalMs = 60_000): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    setNow(Date.now())
+    const id = window.setInterval(() => setNow(Date.now()), intervalMs)
+    return () => window.clearInterval(id)
+  }, [intervalMs])
+  return now
+}
 
 export interface ShellProjectItem {
   id: string
@@ -55,8 +107,11 @@ interface GlobalCommand {
   section: 'Navigation' | 'Projects' | 'Recent runs' | 'Actions'
   label: string
   sub?: string
+  title?: string
   icon: IconName | ReactNode
   right?: string
+  rightTitle?: string
+  rightMono?: boolean
   keys?: string[]
   run: () => void
 }
@@ -104,6 +159,7 @@ export function GlobalPalette({
   data: ShellWorkspaceData
 }) {
   const navigate = useNavigate()
+  const now = useNow()
   const [q, setQ] = useState(prefill)
   const [idx, setIdx] = useState(0)
   const listRef = useRef<HTMLDivElement>(null)
@@ -155,13 +211,18 @@ export function GlobalPalette({
     }
 
     for (const r of data.recentRuns) {
+      const rel = formatRelativeTime(r.startedAt, { compact: true, now })
+      const full = formatFullDateTime(r.startedAt)
       out.push({
         id: 'run.' + r.id,
         section: 'Recent runs',
-        label: runLabel(r.goal),
+        label: r.projectName,
         sub: `${r.goal} ${r.projectName} ${r.id} ${r.status}`,
+        title: `${r.projectName} — ${runLabel(r.goal)} (${full})`,
         icon: <StatusGlyph status={r.status} />,
-        right: `${short(r.id)} · ${runStatusLabel(r.status)}`,
+        right: `${rel} · ${runStatusLabel(r.status)}`,
+        rightTitle: full,
+        rightMono: false,
         run: () => { void navigate({ to: '/runs/$runId', params: { runId: r.id }, search: {} }) },
       })
     }
@@ -208,7 +269,7 @@ export function GlobalPalette({
     )
 
     return out
-  }, [data, navigate, onOpenNewProject, onOpenHelp, onOpenDevices, theme, toggleTheme])
+  }, [data, now, navigate, onOpenNewProject, onOpenHelp, onOpenDevices, theme, toggleTheme])
 
   const items = useMemo(() => {
     const query = q.trim().toLowerCase()
@@ -291,6 +352,7 @@ export function GlobalPalette({
               className={'gpal-item' + (i === cur ? ' on' : '')}
               role="option"
               aria-selected={i === cur}
+              title={it.title}
               onMouseMove={() => { if (i !== cur) setIdx(i) }}
               onClick={() => runItem(i)}
             >
@@ -301,7 +363,7 @@ export function GlobalPalette({
               {it.keys
                 ? <span className="r"><KbdGroup keys={it.keys} /></span>
                 : it.right
-                  ? <span className="r mono">{it.right}</span>
+                  ? <span className={it.rightMono === false ? 'r num' : 'r mono'} title={it.rightTitle} suppressHydrationWarning>{it.right}</span>
                   : null}
             </div>
           </div>

@@ -13,6 +13,147 @@ interface Props {
   onPersonaCreated: (created: { id: string; handle: string }) => void
 }
 
+function CrossAccountEmptySvg() {
+  return (
+    <svg
+      className="pw-empty-art"
+      width="180"
+      height="88"
+      viewBox="0 0 180 88"
+      fill="none"
+      aria-hidden="true"
+    >
+      {/* Left card: User A */}
+      <rect
+        x="4"
+        y="14"
+        width="68"
+        height="60"
+        rx="8"
+        fill="var(--pw-panel)"
+        stroke="var(--pw-line-2)"
+        strokeWidth="1.2"
+      />
+      <circle
+        cx="19"
+        cy="31"
+        r="7.5"
+        fill="var(--pw-accent-soft)"
+        stroke="var(--pw-accent-line)"
+        strokeWidth="1.1"
+      />
+      <circle cx="19" cy="29.3" r="2.1" stroke="var(--pw-accent)" strokeWidth="1.2" />
+      <path
+        d="M15.4 35.1c.65-1.75 1.9-2.55 3.6-2.55s2.95.8 3.6 2.55"
+        stroke="var(--pw-accent)"
+        strokeWidth="1.2"
+        strokeLinecap="round"
+      />
+      <text
+        x="31"
+        y="34"
+        fill="var(--pw-fg)"
+        fontSize="9.5"
+        fontWeight="600"
+        fontFamily="inherit"
+      >
+        User A
+      </text>
+      <rect x="13" y="47" width="46" height="4.5" rx="2.25" fill="var(--pw-line-2)" />
+      <rect x="13" y="56" width="31" height="4.5" rx="2.25" fill="var(--pw-line)" />
+
+      {/* Right card: User B */}
+      <rect
+        x="108"
+        y="14"
+        width="68"
+        height="60"
+        rx="8"
+        fill="var(--pw-panel)"
+        stroke="var(--pw-line-2)"
+        strokeWidth="1.2"
+      />
+      <circle
+        cx="123"
+        cy="31"
+        r="7.5"
+        fill="var(--pw-sunk)"
+        stroke="var(--pw-line-strong)"
+        strokeWidth="1.1"
+      />
+      <circle cx="123" cy="29.3" r="2.1" stroke="var(--pw-fg-2)" strokeWidth="1.2" />
+      <path
+        d="M119.4 35.1c.65-1.75 1.9-2.55 3.6-2.55s2.95.8 3.6 2.55"
+        stroke="var(--pw-fg-2)"
+        strokeWidth="1.2"
+        strokeLinecap="round"
+      />
+      <text
+        x="135"
+        y="34"
+        fill="var(--pw-fg)"
+        fontSize="9.5"
+        fontWeight="600"
+        fontFamily="inherit"
+      >
+        User B
+      </text>
+      <rect x="117" y="47" width="46" height="4.5" rx="2.25" fill="var(--pw-line-2)" />
+      <rect x="117" y="56" width="34" height="4.5" rx="2.25" fill="var(--pw-line)" />
+
+      {/* Center vertical isolation boundary */}
+      <line
+        x1="90"
+        y1="6"
+        x2="90"
+        y2="24"
+        stroke="var(--pw-line-strong)"
+        strokeWidth="1.25"
+        strokeDasharray="3 3"
+        strokeLinecap="round"
+      />
+      <line
+        x1="90"
+        y1="64"
+        x2="90"
+        y2="82"
+        stroke="var(--pw-line-strong)"
+        strokeWidth="1.25"
+        strokeDasharray="3 3"
+        strokeLinecap="round"
+      />
+
+      {/* Shield + lock emblem on the boundary */}
+      <path
+        d="M90 26L102 30.8V42.4C102 50.6 96.9 56.8 90 60.5C83.1 56.8 78 50.6 78 42.4V30.8L90 26Z"
+        fill="var(--pw-panel)"
+        stroke="var(--pw-accent)"
+        strokeWidth="1.4"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M90 28.6L99.5 32.4V42.2C99.5 48.9 95.4 54.1 90 57.3C84.6 54.1 80.5 48.9 80.5 42.2V32.4L90 28.6Z"
+        fill="var(--pw-accent-soft)"
+      />
+      <rect
+        x="85.8"
+        y="41.8"
+        width="8.4"
+        height="6.8"
+        rx="1.6"
+        fill="var(--pw-accent)"
+      />
+      <path
+        d="M87.4 41.8V39.6A2.6 2.6 0 0 1 92.6 39.6V41.8"
+        stroke="var(--pw-accent)"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+      />
+      <circle cx="90" cy="45.1" r="1" fill="var(--pw-panel)" />
+    </svg>
+  )
+}
+
 export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPersonaCreated }: Props) {
   const { project, personas } = data
   const [modalOpen, setModalOpen] = useState(false)
@@ -82,13 +223,15 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
     <div className="pw-sec-head">
       <div>
         <h2>Test accounts <span className="muted num">({personas.length})</span></h2>
-        <p>Opaque test accounts for Tier 2/3 validation. Secrets are stored locally at 0600 and injected only on allowlisted origins.</p>
+        <p>Add test logins so Kovo Hunter can scan behind sign-in and check whether one user can reach another user&apos;s data. Credentials stay encrypted on your machine.</p>
       </div>
-      <div className="pw-sec-actions">
-        <button type="button" className="pw-btn primary" onClick={() => { setModalOpen(true); setNotice('') }}>
-          Add test account
-        </button>
-      </div>
+      {personas.length > 0 && (
+        <div className="pw-sec-actions">
+          <button type="button" className="pw-btn primary" onClick={() => { setModalOpen(true); setNotice('') }}>
+            Add test account
+          </button>
+        </div>
+      )}
     </div>
 
     {notice && <p role="status" className="notice">{notice}</p>}
@@ -142,9 +285,13 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
         })}
       </div>
     ) : (
-      <div className="pw-empty">
-        <p>No test accounts configured yet. Add User A &amp; User B for authenticated BOLA/IDOR checks.</p>
-        <button type="button" className="pw-btn primary" onClick={() => setModalOpen(true)}>Add first test account</button>
+      <div className="pw-empty-card">
+        <CrossAccountEmptySvg />
+        <h3>No test accounts yet</h3>
+        <p>Add one login to scan signed-in views, or two logins (User A &amp; User B) to test cross-account isolation.</p>
+        <button type="button" className="pw-btn primary" onClick={() => { setModalOpen(true); setNotice('') }}>
+          Add test account
+        </button>
       </div>
     )}
 
@@ -183,7 +330,7 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
           } }), created => {
             resetForm()
             setModalOpen(false)
-            setNotice(`Saved test account "${created.handle}". Secret stored in local 0600 vault.`)
+            setNotice(`Saved test account "${created.handle}". Credentials stay encrypted on your machine.`)
             onPersonaCreated(created)
           })
         }}
@@ -220,7 +367,7 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
           </div>}
 
           <div className="pw-grid-2">
-            <label className="pw-fld">Handle (lowercase, opaque to workers)
+            <label className="pw-fld">Handle (lowercase identifier)
               <input className="pw-in mono" name="handle" required pattern="[a-z0-9][a-z0-9_-]{0,47}" placeholder="tenant_a"
                 value={handle} onChange={e => setHandle(e.target.value)} />
             </label>
@@ -258,7 +405,7 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
               </label>
               <label className="pw-fld">Password
                 <input className="pw-in" name="secret" type="password" required maxLength={4096} autoComplete="off"
-                  value={secret} onChange={e => setSecret(e.target.value)} placeholder="Stored in local 0600 vault" />
+                  value={secret} onChange={e => setSecret(e.target.value)} placeholder="Encrypted on your machine" />
               </label>
             </div>
             <div className="pw-grid-2">
@@ -291,7 +438,7 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
           <FormError error={personaAction.error} />
         </div>
         <div className="pw-sheet-f">
-          <span className="hint">Stored in local 0600 vault; never enters LLM prompts.</span>
+          <span className="hint">Credentials stay encrypted on your machine and are never sent to AI models.</span>
           <button type="button" className="pw-btn ghost" onClick={() => setModalOpen(false)}>Cancel</button>
           <button type="submit" className="pw-btn primary" disabled={personaAction.pending}>Save test account</button>
         </div>
