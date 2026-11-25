@@ -1816,11 +1816,12 @@ export function evaluateClaims(
     check.passed && check.claim.kind === 'boundary' &&
     (check.observed as { arm?: unknown } | undefined)?.arm === 'control_denied')
   const compositePassed = checks.some(check => check.passed && check.claim.kind === 'composite_receipt')
+  const compositeFailed = checks.some(check => !check.passed && check.claim.kind === 'composite_receipt')
   const impactBacked = compositePassed || checks.some(check =>
     check.passed && check.claim.kind === 'impact' &&
     (check.claim.impactClass === claimed ||
       ((claimed === 'bfla' || claimed === 'disclosure') && check.claim.impactClass === 'authorization')))
-  if (claimed && claimed !== 'other' && !impactBacked) {
+  if (claimed && claimed !== 'other' && !impactBacked && !compositeFailed) {
     if (claimed === 'authorization' || claimed === 'disclosure') {
       const disclosure = implicitReadDisclosure(store, claims, context)
       if (!disclosure.satisfied && !boundaryClaimPassed) {
@@ -1843,13 +1844,13 @@ export function evaluateClaims(
   // control that the variant crosses. No label can pass on a 2xx from an ungated request.
   const claimedBoundary = context.claimedBoundary
   const mfaClaimPassed = checks.some(check => check.passed && check.claim.kind === 'mfa')
-  if (!compositePassed && claimedBoundary === 'mfa' && !mfaClaimPassed) {
+  if (!compositePassed && !compositeFailed && claimedBoundary === 'mfa' && !mfaClaimPassed) {
     failures.push('boundary: MFA/2FA claim requires an `mfa` claim showing an enrolled account, a protected read denied/challenged before the code check, and the same actor granted the same resource after it; an OTP endpoint that returns {ok:true} without gating anything is advisory only.')
   }
-  if (!compositePassed && claimedBoundary === 'auth' && !boundaryClaimPassed) {
+  if (!compositePassed && !compositeFailed && claimedBoundary === 'auth' && !boundaryClaimPassed) {
     failures.push('boundary: authentication/bypass claim requires a `boundary` claim over a denied/challenged control (401/403, login redirect or MFA challenge) and a variant that crosses it; a 2xx from an ungated request is not a bypass.')
   }
-  if (!compositePassed && claimedBoundary === 'access' && !boundaryClaimPassed && !impactBacked) {
+  if (!compositePassed && !compositeFailed && claimedBoundary === 'access' && !boundaryClaimPassed && !impactBacked) {
     const disclosure = implicitReadDisclosure(store, claims, context)
     if (!disclosure.satisfied) {
       failures.push('boundary: access-control claim requires a denied/challenged control plus a crossing variant, or an actor/precondition differential backed by data/state evidence.')
