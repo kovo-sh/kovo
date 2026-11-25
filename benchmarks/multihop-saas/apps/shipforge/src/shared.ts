@@ -134,6 +134,7 @@ export interface InviteRecord {
   role: LabRole
   revoked: boolean
   token: string
+  invitedBy: string
   runId: string
 }
 

@@ -73,6 +73,17 @@ export function canManage(role: LabRole | null): boolean {
   return role === 'owner' || role === 'admin'
 }
 
+/** Roles that may change tenant resources (builds, hooks, automations, deployments). */
+export function canContribute(role: LabRole | null): boolean {
+  return role === 'owner' || role === 'admin' || role === 'member'
+}
+
+const ROLE_RANK: Record<LabRole, number> = { viewer: 1, member: 2, bot: 2, admin: 3, owner: 4 }
+
+export function roleRank(role: LabRole | null): number {
+  return role ? ROLE_RANK[role] : 0
+}
+
 export function patByToken(state: LabState, token: string): PatRecord | null {
   return state.pats.find((pat) => pat.token === token) ?? null
 }
@@ -106,6 +117,7 @@ export function resolveCaller(state: LabState, req: IncomingMessage): Caller | n
     return { kind: 'session', tenantId: session.tenantId, role: session.role, persona: session.originPersona }
   }
   const pat = patByToken(state, token)
+  if (pat?.revoked) return null
   if (pat) {
     const user = state.users.find((item) => item.id === pat.userId) ?? null
     return {

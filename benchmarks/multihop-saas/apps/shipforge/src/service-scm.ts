@@ -8,7 +8,10 @@ import type {
   BuildRecord, DeliveryRecord, InviteRecord, LabRole, LabState, PatRecord, SessionRecord, TenantKey,
   WebhookRecord,
 } from './shared.ts'
-import { authenticate, authorizeHeader, digest, hasTenantMembership, patByToken } from './policy.ts'
+import {
+  authenticate, authorizeHeader, canContribute, canManage, digest, hasTenantMembership, patByToken, roleOf,
+  roleRank,
+} from './policy.ts'
 import { projectById, tenantBySlug } from './state.ts'
 
 export interface ScmDeps {
@@ -99,9 +102,15 @@ export async function handleScm(
   }
 
   if (match(url, method, '/sessions/revoke')) {
+    const actor = authenticate(state, req)
+    if (!actor) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
     const body = parseJson<{ token?: string }>(await readBody(req))
-    const target = body?.token ? state.sessions.get(body.token) : authenticate(state, req)
-    if (target) {
+    const target = body?.token ? state.sessions.get(body.token) : actor
+    // A caller may only end sessions that belong to the same user.
+    if (target && target.userId === actor.userId) {
       target.revoked = true
       state.emit('session.revoked', { sessionDigest: digest(target.token), runId }, target.originPersona)
     }
@@ -117,11 +126,17 @@ export async function handleScm(
       return
     }
     const body = parseJson<{ scopes?: string[]; tenant?: string }>(await readBody(req))
+    // A token can only be bound to a tenant the holder actually belongs to.
+    const requestedTenant = body?.tenant ? tenantBySlug(state, body.tenant) : null
+    if (body?.tenant && (!requestedTenant || !roleOf(state, session, requestedTenant))) {
+      sendJson(res, 403, { error: 'not a member of this tenant' })
+      return
+    }
     const pat: PatRecord = {
       id: mint('mh_pat_'),
       token: mint('mh_fake_pat_'),
       userId: session.userId,
-      tenantId: (body?.tenant ? tenantBySlug(state, body.tenant) : null) ?? session.tenantId,
+      tenantId: requestedTenant ?? session.tenantId,
       scopes: body?.scopes ?? ['repo:read'],
       revoked: false,
       runId,
@@ -136,13 +151,20 @@ export async function handleScm(
 
   const patRevoke = match(url, method, '/pats/:id/revoke')
   if (patRevoke) {
+    // Revocation needs the token holder's session (or an owner/admin of its tenant); unknown and
+    // foreign ids share one answer.
+    const actor = authenticate(state, req)
+    if (!actor) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
     const pat = state.pats.find((item) => item.id === patRevoke[0])
-    if (!pat) {
+    if (!pat || (pat.userId !== actor.userId && !canManage(roleOf(state, actor, pat.tenantId)))) {
       sendJson(res, 404, { error: 'unknown token' })
       return
     }
     pat.revoked = true
-    state.emit('pat.revoked', { patId: pat.id, tenantId: pat.tenantId, runId })
+    state.emit('pat.revoked', { patId: pat.id, tenantId: pat.tenantId, runId }, actor.originPersona)
     sendJson(res, 200, { ok: true })
     return
   }
@@ -158,14 +180,32 @@ export async function handleScm(
       sendJson(res, 400, { error: 'email required' })
       return
     }
-    const tenantId = (body.tenant ? tenantBySlug(state, body.tenant) : null) ?? session.tenantId
+    const requestedTenant = body.tenant ? tenantBySlug(state, body.tenant) : null
+    if (body.tenant && !requestedTenant) {
+      sendJson(res, 400, { error: 'unknown tenant' })
+      return
+    }
+    const tenantId = requestedTenant ?? session.tenantId
+    const role = (body.role as LabRole | undefined) ?? 'member'
+    const inviterRole = roleOf(state, session, tenantId)
+    // Inviting requires contributor rights in the target tenant and can never grant a role above
+    // the inviter's own.
+    if (!canContribute(inviterRole)) {
+      sendJson(res, 403, { error: 'not allowed to invite into this tenant' })
+      return
+    }
+    if (!['owner', 'admin', 'member', 'viewer'].includes(role) || roleRank(role) > roleRank(inviterRole)) {
+      sendJson(res, 403, { error: 'invite role exceeds inviter role' })
+      return
+    }
     const invite: InviteRecord = {
       id: mint('mh_inv_'),
       tenantId,
       email: body.email,
-      role: (body.role as LabRole | undefined) ?? 'member',
+      role,
       revoked: false,
       token: mint('mh_fake_invite_'),
+      invitedBy: session.userId,
       runId,
     }
     state.invites.push(invite)
@@ -176,13 +216,18 @@ export async function handleScm(
 
   const inviteRevoke = match(url, method, '/invites/:id/revoke')
   if (inviteRevoke) {
+    const actor = authenticate(state, req)
+    if (!actor) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
     const invite = state.invites.find((item) => item.id === inviteRevoke[0])
-    if (!invite) {
+    if (!invite || (invite.invitedBy !== actor.userId && !canManage(roleOf(state, actor, invite.tenantId)))) {
       sendJson(res, 404, { error: 'unknown invite' })
       return
     }
     invite.revoked = true
-    state.emit('invite.revoked', { inviteId: invite.id, tenantId: invite.tenantId, runId })
+    state.emit('invite.revoked', { inviteId: invite.id, tenantId: invite.tenantId, runId }, actor.originPersona)
     sendJson(res, 200, { ok: true })
     return
   }
@@ -228,8 +273,12 @@ export async function handleScm(
       return
     }
     const project = projectById(state, preview[0]!)
-    if (!project) {
+    if (!project || !hasTenantMembership(state, session, project.tenantId)) {
       sendJson(res, 404, { error: 'unknown repository' })
+      return
+    }
+    if (!canContribute(roleOf(state, session, project.tenantId))) {
+      sendJson(res, 403, { error: 'preview builds require contributor access' })
       return
     }
     const body = parseJson<{ commit?: string }>(await readBody(req))
@@ -273,8 +322,12 @@ export async function handleScm(
       return
     }
     const project = projectById(state, webhookCreate[0]!)
-    if (!project) {
+    if (!project || !hasTenantMembership(state, session, project.tenantId)) {
       sendJson(res, 404, { error: 'unknown repository' })
+      return
+    }
+    if (!canContribute(roleOf(state, session, project.tenantId))) {
+      sendJson(res, 403, { error: 'webhooks require contributor access' })
       return
     }
     const body = parseJson<{
@@ -283,13 +336,22 @@ export async function handleScm(
     const template = body?.templateId
       ? state.webhookTemplates.find((item) => item.id === body.templateId) ?? null
       : null
+    const targetHost = body?.targetHost ?? template?.targetHost ?? 'runner'
+    // Deliveries to internal services are only allowed through a registered delivery template,
+    // and always use that template's path.
+    if (targetHost === 'registry.internal' && template?.targetHost !== 'registry.internal') {
+      sendJson(res, 400, { error: 'internal delivery targets require a registered template' })
+      return
+    }
     const webhook: WebhookRecord = {
       id: `mh_wh_${state.webhooks.length + 1}_${digest(`${runId}:${project.id}`).slice(0, 8)}`,
       projectId: project.id,
       tenantId: project.tenantId,
       templateId: body?.templateId ?? '',
-      targetHost: body?.targetHost ?? template?.targetHost ?? 'runner',
-      targetPath: body?.targetPath ?? template?.targetPath ?? '/hooks/deploy',
+      targetHost,
+      targetPath: targetHost === 'registry.internal' && template
+        ? template.targetPath
+        : body?.targetPath ?? template?.targetPath ?? '/hooks/deploy',
       deliveries: [],
       runId,
     }
@@ -385,11 +447,16 @@ export async function handleScm(
       sendJson(res, 403, { error: 'repository requires an accepted transfer' })
       return
     }
-    const canary = state.plan.secrets.internalBearerToken
+    if (!canContribute(roleOf(state, session, session.tenantId))) {
+      sendJson(res, 403, { error: 'repository archives require contributor access' })
+      return
+    }
+    // Archives carry a per-repository deploy key; it unlocks nothing outside this repository.
+    const deployKey = `mh_fake_deploykey_${digest(`${state.plan.seed}:${state.plan.seedSet}:${project.id}`).slice(0, 20)}`
     const body = [
       `repo,${project.slug}`,
       `tenant,${project.tenantId}`,
-      `secret,${canary}`,
+      `secret,${deployKey}`,
       `bundle,${digest(`${project.id}:${runId}`)}`,
       '',
     ].join('\n')
@@ -430,12 +497,20 @@ export async function handleScm(
 
   if (method === 'POST' && match(url, method, '/oauth/token')) {
     await readBody(req)
+    if (!authenticate(state, req)) {
+      sendJson(res, 401, { error: 'invalid_client' })
+      return
+    }
     sendJson(res, 200, {
       access_token: mint('mh_fake_oauth_'), token_type: 'Bearer', expires_in: 3600, scope: 'repo read:user',
     })
     return
   }
   if (match(url, method, '/oauth/authorize')) {
+    if (!authenticate(state, req)) {
+      sendJson(res, 401, { error: 'login_required' })
+      return
+    }
     sendJson(res, 200, { code: mint('mh_fake_code_'), state: url.search.get('state') ?? '' })
     return
   }
@@ -458,7 +533,17 @@ export async function handleScm(
     return
   }
   if (match(url, method, '/audit')) {
-    sendJson(res, 200, { events: state.audit.slice(-50).map((event) => ({ kind: event.kind, ts: event.ts })) })
+    const session = authenticate(state, req)
+    if (!session) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
+    sendJson(res, 200, {
+      events: state.audit
+        .filter((event) => event.detail.tenantId === session.tenantId)
+        .slice(-50)
+        .map((event) => ({ kind: event.kind, ts: event.ts })),
+    })
     return
   }
   if (match(url, method, '/health/history')) {

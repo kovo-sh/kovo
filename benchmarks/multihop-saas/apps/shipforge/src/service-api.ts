@@ -7,8 +7,8 @@ import {
 } from './http.ts'
 import type { LabState, TenantKey } from './shared.ts'
 import {
-  authenticate, authorizeHeader, digest, hasTenantMembership, hmacHex, patByToken, resolveCaller, roleOf,
-  safeEqualHex, sessionTenantOk,
+  authenticate, authorizeHeader, canContribute, canManage, digest, hasTenantMembership, hmacHex, patByToken,
+  resolveCaller, roleOf, safeEqualHex, sessionTenantOk,
 } from './policy.ts'
 import {
   buildById, convergeBuild, deploymentById, projectById, tenantById, tenantBySlug,
@@ -152,6 +152,11 @@ export async function handleApi(
       session.tenantId
     const sourceRole = roleOf(state, session, project.tenantId)
     const destRole = roleOf(state, session, destination)
+    // Transfers always need some standing in both tenants; the policy below decides how much.
+    if (!sourceRole || !destRole) {
+      sendJson(res, 404, { error: 'unknown project' })
+      return
+    }
     if (state.profile.transferDualAdmin && (
       (sourceRole !== 'admin' && sourceRole !== 'owner') || (destRole !== 'admin' && destRole !== 'owner')
     )) {
@@ -335,6 +340,17 @@ export async function handleApi(
       sendJson(res, 404, { error: 'unknown deployment' })
       return
     }
+    // Promotion is a runner-to-control-plane call; user sessions and tokens cannot promote.
+    if (caller.kind !== 'runner' || caller.tenantId !== deployment.tenantId) {
+      state.emit('deployment.promote_denied', {
+        deploymentId: deployment.id,
+        reason: 'credential_kind',
+        credentialEnv: caller.env ?? caller.kind,
+        runId,
+      })
+      sendJson(res, 403, { error: 'promotion requires a runner credential' })
+      return
+    }
     if (state.profile.promoteEnvScope) {
       const envOk = caller.kind === 'runner' && caller.env === 'prod'
       if (!envOk) {
@@ -389,6 +405,11 @@ export async function handleApi(
     const caller = resolveCaller(state, req)
     if (!caller) {
       sendJson(res, 401, { error: 'credential required' })
+      return
+    }
+    // Unmasked batch reads are reserved for deployment service accounts.
+    if (caller.kind !== 'service-account') {
+      sendJson(res, 403, { error: 'service account credential required' })
       return
     }
     const body = parseJson<{ ids?: string[]; mutate?: boolean }>(await readBody(req))
@@ -449,6 +470,15 @@ export async function handleApi(
       sendJson(res, 400, { error: 'projectId required' })
       return
     }
+    const target = projectById(state, body.projectId)
+    if (!target || target.tenantId !== session.tenantId) {
+      sendJson(res, 404, { error: 'unknown project' })
+      return
+    }
+    if (!canContribute(roleOf(state, session, session.tenantId))) {
+      sendJson(res, 403, { error: 'automations require contributor access' })
+      return
+    }
     const inherited = state.profile.automationInheritAdmin
     const automation = {
       id: `mh_auto_${state.automations.length + 1}_${digest(`${runId}:${body.projectId}`).slice(0, 8)}`,
@@ -481,11 +511,19 @@ export async function handleApi(
       sendJson(res, 404, { error: 'unknown deployment' })
       return
     }
+    if (!canContribute(roleOf(state, session, deployment.tenantId))) {
+      sendJson(res, 403, { error: 'disputes require contributor access' })
+      return
+    }
     const body = parseJson<{ automationId?: string }>(await readBody(req))
     const automationId = body?.automationId ?? ''
+    // Only an auto-releasing automation registered for this deployment's project keeps a schedule.
+    const automation = state.automations.find((item) =>
+      item.id === automationId && item.tenantId === deployment.tenantId &&
+      item.projectId === deployment.projectId) ?? null
     deployment.disputed = true
     deployment.status = 'disputed'
-    if (state.profile.disputeKeepsSchedule) deployment.autoReleaseScheduled = true
+    if (state.profile.disputeKeepsSchedule && automation?.autoRelease) deployment.autoReleaseScheduled = true
     state.emit('deployment.disputed', {
       deploymentId: deployment.id,
       projectId: deployment.projectId,
@@ -507,8 +545,12 @@ export async function handleApi(
       return
     }
     const deployment = deploymentById(state, release[0]!)
-    if (!deployment) {
+    if (!deployment || caller.tenantId !== deployment.tenantId) {
       sendJson(res, 404, { error: 'unknown deployment' })
+      return
+    }
+    if ((caller.kind === 'session' || caller.kind === 'pat') && !canContribute(caller.role)) {
+      sendJson(res, 403, { error: 'releases require contributor access' })
       return
     }
     const body = parseJson<{ manifest?: string; signature?: string; version?: string }>(await readBody(req))
@@ -583,6 +625,10 @@ export async function handleApi(
   if (method === 'POST' && match(url, method, at('/keys/rotate'))) {
     const session = sessionAuth(state, req, res)
     if (!session) return
+    if (!canManage(roleOf(state, session, session.tenantId))) {
+      sendJson(res, 403, { error: 'key rotation requires owner or admin' })
+      return
+    }
     state.emit('keys.rotated', { tenantId: session.tenantId, keyId: 'mh_fake_signing_1', runId }, session.originPersona)
     sendJson(res, 200, { ok: true, keyId: 'mh_fake_signing_1' })
     return
@@ -605,6 +651,12 @@ export async function handleApi(
     if (match(url, method, at(path))) {
       const session = sessionAuth(state, req, res)
       if (!session) return
+      if (path === '/members') {
+        sendJson(res, 200, {
+          members: state.users.filter((user) => !user.bot && user.rolesByTenant[session.tenantId]).length,
+        })
+        return
+      }
       sendJson(res, 200, payload)
       return
     }
@@ -614,9 +666,12 @@ export async function handleApi(
     const session = sessionAuth(state, req, res)
     if (!session) return
     sendJson(res, 200, {
-      events: state.audit.slice(-100).map((event) => ({
-        kind: event.kind, ts: event.ts, actor: event.actorPersona,
-      })),
+      events: state.audit
+        .filter((event) => event.detail.tenantId === session.tenantId)
+        .slice(-100)
+        .map((event) => ({
+          kind: event.kind, ts: event.ts, actor: event.actorPersona,
+        })),
     })
     return
   }
