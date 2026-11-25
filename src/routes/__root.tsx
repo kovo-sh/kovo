@@ -4,6 +4,7 @@ import { workspaceData } from '../actions.ts'
 import appStyles from '../app.css?url'
 import { AppShell } from '../components/shell/AppShell.tsx'
 import shellStyles from '../components/shell/shell.css?url'
+import designSystemStyles from '../styles/tailwind.css?url'
 
 export const Route = createRootRoute({
   loader: () => workspaceData(),
@@ -15,6 +16,9 @@ export const Route = createRootRoute({
     ],
     links: [
       { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' },
+      // Design-system utilities load before the legacy sheets so same-specificity
+      // legacy rules keep winning on routes that have not been migrated yet.
+      { rel: 'stylesheet', href: designSystemStyles },
       { rel: 'stylesheet', href: appStyles },
       { rel: 'stylesheet', href: shellStyles },
     ],
