@@ -30,6 +30,7 @@ import {
   buildIdentityProfiles,
   enumerateHypotheses,
 } from '../src/server/deterministic-engine.ts'
+import { planFloorRecipe, runPlannedRecipe } from '../src/server/floor-recipe-engine.ts'
 import type { EndpointHarvest, EngineEndpoint, EnginePersona } from '../src/server/deterministic-engine.ts'
 import type { DifferentialResult } from '../src/server/surface-engine.ts'
 
@@ -211,12 +212,12 @@ test('floor: a state-field mutation carries a fresh baseline write', async () =>
     assert.equal(specs.length, 1)
     const spec = specs[0]!.spec as Json
     const steps = spec.steps as Array<{ id: string; role: string; request: { method: string; pathAndQuery: string; jsonBody?: Json } }>
-    assert.deepEqual(steps.map(step => step.id), ['c2', 'w1', 'c1', 'p1', 'p2'])
-    const baseline = steps[1]!
+    assert.deepEqual(steps.map(step => step.id), ['w1', 'c2', 'c3', 'c1', 'p1', 'p2'])
+    const baseline = steps[0]!
     assert.equal(baseline.request.method, 'PATCH')
     assert.equal(typeof baseline.request.jsonBody?.status, 'string')
     assert.notEqual(baseline.request.jsonBody?.status, 'pending')
-    assert.equal(steps[3]!.request.jsonBody?.status, 'pending')
+    assert.equal(steps[4]!.request.jsonBody?.status, 'pending')
 
     const res = await verify(spec, fx.origin)
     assert.equal(res.verdict, 'confirmed', String(res.outcome.reason))
@@ -394,25 +395,57 @@ test('floor: a broad LIKE baseline is ordered so a non-matching term is tried fi
   assert.match(baselines[1] ?? '', /^kovo-[a-f0-9]{8}$/)
 })
 
-test('floor: the discriminating baseline confirms on the concatenating twin', async () => {
+test('floor: the discriminating baseline confirms on the concatenating twin via wired floor recipe', async () => {
   const fx = await startSearchFixture()
   try {
-    const specs = synthesizeEngineSpecs(sqliHypothesis(fx.origin, ''), sqliSignal())
+    const hyp = sqliHypothesis(fx.origin, '')
+    const probe = sqliSignal()
+    const specs = synthesizeEngineSpecs(hyp, probe)
     const nonce = specs.find(spec => /^kovo-/.test(String((spec.spec as Json).baselineValue ?? '')))
     assert.ok(nonce, 'a fresh baseline candidate exists')
-    const res = await verify(nonce!.spec as Json, fx.origin)
-    assert.equal(res.verdict, 'confirmed', String(res.outcome.reason))
+    const plan = planFloorRecipe({
+      hypothesis: { ...hyp, baselineValue: String((nonce!.spec as Json).baselineValue) },
+      probe,
+      specKind: nonce!.kind,
+      vulnClass: nonce!.vulnClass,
+      personas: [{ ...personaOf('owner_a', fx.origin), privilege: 'admin' }],
+    })
+    assert.ok(plan && !plan.skipReason)
+    const exec = await runPlannedRecipe({
+      plan,
+      hypothesis: { ...hyp, baselineValue: String((nonce!.spec as Json).baselineValue) },
+      broker: new RequestBroker({ rejectUnauthorized: false }),
+      grant: grantFor(fx.origin),
+      signal: AbortSignal.timeout(30_000),
+    })
+    assert.equal(exec.result.confirmed, true, exec.result.verification.reason)
   } finally { await fx.close() }
 })
 
 test('floor: the same boolean recipe stays unconfirmed on the parameterized twin', async () => {
   const fx = await startSearchFixture({ hardened: true })
   try {
-    const specs = synthesizeEngineSpecs(sqliHypothesis(fx.origin, ''), sqliSignal())
+    const hyp = sqliHypothesis(fx.origin, '')
+    const probe = sqliSignal()
+    const specs = synthesizeEngineSpecs(hyp, probe)
     const nonce = specs.find(spec => /^kovo-/.test(String((spec.spec as Json).baselineValue ?? '')))
     assert.ok(nonce)
-    const res = await verify(nonce!.spec as Json, fx.origin)
-    assert.notEqual(res.verdict, 'confirmed', 'the hardened twin must not confirm')
+    const plan = planFloorRecipe({
+      hypothesis: { ...hyp, baselineValue: String((nonce!.spec as Json).baselineValue) },
+      probe,
+      specKind: nonce!.kind,
+      vulnClass: nonce!.vulnClass,
+      personas: [{ ...personaOf('owner_a', fx.origin), privilege: 'admin' }],
+    })
+    assert.ok(plan && !plan.skipReason)
+    const exec = await runPlannedRecipe({
+      plan,
+      hypothesis: { ...hyp, baselineValue: String((nonce!.spec as Json).baselineValue) },
+      broker: new RequestBroker({ rejectUnauthorized: false }),
+      grant: grantFor(fx.origin),
+      signal: AbortSignal.timeout(30_000),
+    })
+    assert.equal(exec.result.confirmed, false, 'the hardened twin must not confirm')
   } finally { await fx.close() }
 })
 

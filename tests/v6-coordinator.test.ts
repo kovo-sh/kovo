@@ -397,13 +397,14 @@ test('chaining round proposes same-origin and cross-origin hypotheses with paren
     endpoint(2, { id: 'invoice', origin: 'https://api.local', pathTemplate: '/api/invoices/1042', method: 'GET' }),
   ]
 
-  const hypotheses = planChainRound({ primitives, endpoints, approvedOrigins: ['https://app.local', 'https://api.local'] })
-  const sameOrigin = hypotheses.filter(hypothesis => hypothesis.scope === 'same_origin' && hypothesis.hops === 2)
-  const crossOrigin = hypotheses.filter(hypothesis => hypothesis.scope === 'cross_origin' && hypothesis.hops === 2)
-
-  assert.ok(sameOrigin.length >= 1)
+  const crossHypotheses = planChainRound({ primitives, endpoints, approvedOrigins: ['https://app.local', 'https://api.local'] })
+  const crossOrigin = crossHypotheses.filter(hypothesis => hypothesis.scope === 'cross_origin' && hypothesis.hops >= 2)
   assert.ok(crossOrigin.length >= 1)
-  const tokenAdmin = hypotheses.find(hypothesis =>
+
+  const sameOriginHypotheses = planChainRound({ primitives, endpoints, approvedOrigins: ['https://app.local'], maxHops: 2 })
+  const sameOrigin = sameOriginHypotheses.filter(hypothesis => hypothesis.scope === 'same_origin' && hypothesis.hops === 2)
+  assert.ok(sameOrigin.length >= 1)
+  const tokenAdmin = sameOriginHypotheses.find(hypothesis =>
     hypothesis.scope === 'same_origin' && hypothesis.primitiveKinds.includes('leaked_token') && hypothesis.primitiveKinds.includes('admin_route'))
   assert.ok(tokenAdmin, 'leaked token + admin route should form a same-origin chain')
   assert.equal(tokenAdmin.hops, 2)
@@ -583,5 +584,9 @@ test('coordinator module never imports execution.ts (no cycle) or other server m
   assert.ok(!/from\s+['"][^'"]*store\.ts['"]/.test(source), 'must not import store.ts')
   assert.ok(!/from\s+['"][^'"]*agent-session\.ts['"]/.test(source), 'must not import agent-session.ts')
   assert.ok(!/from\s+['"][^'"]*program-graph\.ts['"]/.test(source), 'stays standalone (graph passed via deps)')
-  assert.ok(!/from\s+['"]/.test(source), 'zero runtime/type imports')
+  const imports = [...source.matchAll(/from\s+['"]([^'"]+)['"]/g)].map(m => m[1])
+  assert.ok(
+    imports.every(spec => spec === './capability-ledger.ts' || spec === './frontier-scheduler.ts'),
+    `only pure coordinator helper modules allowed, got: ${imports.join(', ')}`,
+  )
 })

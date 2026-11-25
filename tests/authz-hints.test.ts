@@ -95,7 +95,7 @@ describe('object-route readback hints', () => {
     assert.equal(hyp.readbackPath, '/api/people/{{id}}')
   })
 
-  test('a self-service account mutation falls back to the mutating actor identity route', () => {
+  test('an object-detail mutation defaults to its own detail readback before identity fallback', () => {
     const surface = [
       endpoint({ method: 'PATCH', pathTemplate: '/api/account/:accountId' }),
       endpoint({ method: 'GET', pathTemplate: '/api/me' }),
@@ -104,19 +104,19 @@ describe('object-route readback hints', () => {
       ['PATCH:/api/account/:accountId', harvest({ ownerIds: ['a-1'], otherIds: ['a-2'] })],
     ])
     const hyp = authzHypothesis(surface, harvests, 'PATCH', '/api/account/:accountId')
-    assert.equal(hyp.readbackPath, '/api/me')
-    assert.equal(hyp.readbackPersona, hyp.otherPersona)
+    assert.equal(hyp.readbackPath, '/api/account/{{id}}')
+    assert.equal(hyp.readbackPersona, undefined)
   })
 
-  test('no observable read route means no invented readback', () => {
+  test('an action-verb mutation without a detail read or identity route has no invented readback', () => {
     const surface = [
-      endpoint({ method: 'PATCH', pathTemplate: '/api/notes/:noteId' }),
+      endpoint({ method: 'PATCH', pathTemplate: '/api/admin/notes/:noteId/archive' }),
       endpoint({ method: 'GET', pathTemplate: '/api/health' }),
     ]
     const harvests = new Map<string, EndpointHarvest>([
-      ['PATCH:/api/notes/:noteId', harvest({ ownerIds: ['n-1'], otherIds: ['n-2'] })],
+      ['PATCH:/api/admin/notes/:noteId/archive', harvest({ ownerIds: ['n-1'], otherIds: ['n-2'] })],
     ])
-    const hyp = authzHypothesis(surface, harvests, 'PATCH', '/api/notes/:noteId')
+    const hyp = authzHypothesis(surface, harvests, 'PATCH', '/api/admin/notes/:noteId/archive')
     assert.equal(hyp.readbackPath, undefined)
   })
 })
@@ -177,12 +177,14 @@ describe('readback hints feed the mutating authz spec', () => {
     const [spec] = synthesizeEngineSpecs(hyp, result)
     assert.ok(spec, 'a mutating authz spec is synthesized from the hint')
     const steps = spec.spec.steps as Array<{ id: string; role: string; request: { method: string; pathAndQuery: string } }>
-    const reads = steps.filter(step => step.request.method === 'GET')
-    assert.equal(reads.length, 2, 'pre- and post-mutation readbacks')
-    assert.deepEqual(reads.map(step => step.request.pathAndQuery), [
-      '/api/admin/members/m-1',
-      '/api/admin/members/m-1',
-    ])
+    const preRead = steps.find(step => step.id === 'c1')
+    const postRead = steps.find(step => step.id === 'p2')
+    const bogusRead = steps.find(step => step.id === 'c3')
+    assert.equal(preRead?.request.method, 'GET')
+    assert.equal(preRead?.request.pathAndQuery, '/api/admin/members/m-1')
+    assert.equal(postRead?.request.method, 'GET')
+    assert.equal(postRead?.request.pathAndQuery, '/api/admin/members/m-1')
+    assert.equal(bogusRead?.request.method, 'GET')
     const mutation = steps.find(step => step.id === 'p1')
     assert.equal(mutation?.request.pathAndQuery, '/api/admin/members/m-1/role')
     assert.equal(spec.spec.requiredRole, 'admin')

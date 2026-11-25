@@ -389,7 +389,43 @@ test('v6 scope: a target finding survives IdP redirect + CDN asset hops', async 
     scopeRevision: run.scopeRevision,
   } as unknown as Finding
 
-  storage.upsertChainFinding(storage.run(runId), assetId, finding, randomUUID(), [appOrigin, idpOrigin, cdnOrigin])
+  const confirmedSpec = storage.createReplaySpec(
+    storage.run(runId),
+    worker,
+    finding.id,
+    {
+      version: 1,
+      kind: 'http_chain',
+      origin: appOrigin,
+      title: finding.title,
+      category: 'broken-access-control',
+      cwe: 'CWE-639',
+      severity: 'high',
+      severityRationale: 'Cross-tenant read.',
+      impact: 'Unauthorized object read.',
+      remediation: 'Check ownership.',
+      recheckInstructions: 'Replay.',
+      steps: [
+        { id: 'c1', role: 'control', description: 'owner', request: { origin: appOrigin, method: 'GET', pathAndQuery: '/api/items/1', followRedirects: false } },
+        { id: 'p1', role: 'probe', description: 'other', request: { origin: appOrigin, method: 'GET', pathAndQuery: '/api/items/1', followRedirects: false } },
+      ],
+      spaCatchallControl: false,
+      assertionsJq: '{ controlPassed: true, confirmed: true, observed: "ok", expected: "denied" }',
+    },
+    [appOrigin, idpOrigin, cdnOrigin],
+    {
+      verifiedInline: true,
+      lastVerificationDiff: {
+        verdict: 'confirmed',
+        controlPassed: true,
+        stepStatuses: [],
+        assertionSummary: { observed: 'ok', expected: 'denied' },
+        retriesRemaining: 0,
+      },
+    },
+  )
+
+  storage.upsertChainFinding(storage.run(runId), assetId, finding, confirmedSpec.id, [appOrigin, idpOrigin, cdnOrigin])
   const reportId = storage.writeReport(storage.run(runId), true)
   const report = storage.runDetail(runId).reports.find(row => row.id === reportId)
   assert.ok(report, 'report exists')
@@ -400,7 +436,42 @@ test('v6 scope: a target finding survives IdP redirect + CDN asset hops', async 
 
   // Control: a truly unapproved origin still invalidates provenance.
   const rogue = { ...finding, id: randomUUID(), title: 'Rogue hop' } as unknown as Finding
-  storage.upsertChainFinding(storage.run(runId), assetId, rogue, randomUUID(), [appOrigin, 'https://rogue.example'])
+  const rogueSpec = storage.createReplaySpec(
+    storage.run(runId),
+    worker,
+    rogue.id,
+    {
+      version: 1,
+      kind: 'http_chain',
+      origin: appOrigin,
+      title: rogue.title,
+      category: 'broken-access-control',
+      cwe: 'CWE-639',
+      severity: 'high',
+      severityRationale: 'Cross-tenant read.',
+      impact: 'Unauthorized object read.',
+      remediation: 'Check ownership.',
+      recheckInstructions: 'Replay.',
+      steps: [
+        { id: 'c1', role: 'control', description: 'owner', request: { origin: appOrigin, method: 'GET', pathAndQuery: '/api/items/1', followRedirects: false } },
+        { id: 'p1', role: 'probe', description: 'other', request: { origin: appOrigin, method: 'GET', pathAndQuery: '/api/items/1', followRedirects: false } },
+      ],
+      spaCatchallControl: false,
+      assertionsJq: '{ controlPassed: true, confirmed: true, observed: "ok", expected: "denied" }',
+    },
+    [appOrigin, 'https://rogue.example'],
+    {
+      verifiedInline: true,
+      lastVerificationDiff: {
+        verdict: 'confirmed',
+        controlPassed: true,
+        stepStatuses: [],
+        assertionSummary: { observed: 'ok', expected: 'denied' },
+        retriesRemaining: 0,
+      },
+    },
+  )
+  storage.upsertChainFinding(storage.run(runId), assetId, rogue, rogueSpec.id, [appOrigin, 'https://rogue.example'])
   const report2 = storage.writeReport(storage.run(runId), true)
   const body2 = storage.runDetail(runId).reports.find(row => row.id === report2)!.body
   assert.equal(body2.findings.some(item => item.id === rogue.id), false)
@@ -528,7 +599,7 @@ test('v6 scope: legacy approved allowlist migrates into targetOrigins on reopen'
   assert.deepEqual(scope.targetOrigins, [appOrigin], 'legacy allowlist remains the target tier')
   assert.deepEqual(scope.authOrigins, [])
   assert.deepEqual(scope.assetOrigins, [])
-  assert.equal(scope.mode, 'prod_readonly')
+  assert.equal(scope.mode, 'staging_isolated')
 })
 
 test('v6 scope: exact single-use ledger semantics are unchanged for opted-in patterns', () => {

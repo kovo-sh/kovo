@@ -306,11 +306,12 @@ test('settlement revokes network probes but keeps queries and kovo_verify', () =
   }
 })
 
-test('final turn also revokes read/query/verify wrap-up tools', () => {
+test('final turn also revokes read/query/verify_replay_spec wrap-up tools while keeping kovo_verify', () => {
   const finalTurn = { settling: true, turnsUsed: 30, maxTurns: 30 }
-  for (const name of ['search_facts', 'expand_digest', 'kovo_verify']) {
+  for (const name of ['search_facts', 'expand_digest', 'verify_replay_spec']) {
     assert.match(settlementToolBlock({ name, ...finalTurn }) ?? '', /final turn/i)
   }
+  assert.equal(settlementToolBlock({ name: 'kovo_verify', ...finalTurn }), undefined)
   assert.equal(settlementToolBlock({ name: 'record_fact', ...finalTurn }), undefined)
   assert.equal(settlementToolBlock({ name: 'request_http', settling: false, turnsUsed: 30, maxTurns: 30 }), undefined)
 })

@@ -13,10 +13,11 @@
  */
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import type { TestContext } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 
 import type { Finding, InlineVerifyFeedback } from '../src/domain.ts'
@@ -29,8 +30,9 @@ import {
   Execution,
   resolveDeterministicSweepMode,
 } from '../src/server/execution.ts'
+import { Store } from '../src/server/store.ts'
 import type { ChainStep, Run } from '../src/server/store.ts'
-import { makeStore, setupApprovedRun, withEnv } from './v4-tier-helpers.ts'
+import { setupApprovedRun, withEnv } from './v4-tier-helpers.ts'
 
 process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
@@ -72,17 +74,30 @@ function laneKey(run: Run): string {
   return `${run.id}:${run.goalRevision}:${run.scopeRevision}`
 }
 
-async function startRun(t: Parameters<typeof makeStore>[0], opts: { concurrency?: number } = {}) {
-  const { dir, storage } = makeStore(t)
+async function startRun(t: TestContext, opts: { concurrency?: number } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v5-lane-'))
+  const storage = new Store(dir)
+  const executions: Execution[] = []
+  t.after(async () => {
+    for (const execution of executions) {
+      try { await execution.stop() } catch { /* already stopped */ }
+    }
+    try { storage.close() } catch { /* already closed */ }
+    rmSync(dir, { recursive: true, force: true })
+  })
+  const track = (execution: Execution): Execution => {
+    executions.push(execution)
+    return execution
+  }
   const { runId } = await setupApprovedRun(storage, { budgetRequests: 500 })
   if (opts.concurrency !== undefined) {
     storage.client.prepare('UPDATE runs SET worker_concurrency = ? WHERE id = ?').run(opts.concurrency, runId)
   }
   storage.updateRun(runId, { phase: 'investigation', status: 'running' })
-  return { dir, storage, runId }
+  return { dir, storage, runId, track }
 }
 
-function addStep(storage: ReturnType<typeof makeStore>['storage'], run: Run, overrides: Partial<Parameters<typeof storage.addChainStep>[1]> = {}): ChainStep {
+function addStep(storage: Store, run: Run, overrides: Partial<Parameters<typeof storage.addChainStep>[1]> = {}): ChainStep {
   const assetIds = run.candidates.filter(c => run.approved.includes(c.id)).map(c => c.id)
   const origin = run.candidates.find(c => run.approved.includes(c.id))?.origin ?? 'http://127.0.0.1:9'
   const step = storage.addChainStep(run, {
@@ -134,10 +149,9 @@ test('deterministicSweep resolves from option/env and defaults OFF', () => {
 })
 
 test('flag OFF: zero lane traffic and no lane events', async (t) => {
-  const { storage, runId } = await startRun(t, { concurrency: 2 })
+  const { storage, runId, track } = await startRun(t, { concurrency: 2 })
   const run = storage.run(runId)
-  const execution = new Execution(storage, { deterministicSweep: false })
-  t.after(() => execution.stop())
+  const execution = track(new Execution(storage, { deterministicSweep: false }))
   internals(execution).prePhase0SeededSteps.set(laneKey(run), false)
   const dispatched: string[] = []
   internals(execution).startInvestigationStep = (_r, step) => { dispatched.push(step.id) }
@@ -153,35 +167,32 @@ test('flag OFF: zero lane traffic and no lane events', async (t) => {
 })
 
 test('seeded pre-Phase-0 steps skip the lane; "always" bypasses the guard', async (t) => {
-  const { storage, runId } = await startRun(t, { concurrency: 2 })
+  const { storage, runId, track } = await startRun(t, { concurrency: 2 })
   const run = storage.run(runId)
   addStep(storage, run)
 
-  const guarded = new Execution(storage, { deterministicSweep: true })
-  t.after(() => guarded.stop())
+  const guarded = track(new Execution(storage, { deterministicSweep: true }))
   internals(guarded).prePhase0SeededSteps.set(laneKey(run), true)
   internals(guarded).startInvestigationStep = () => undefined
   const guardedLane = stubLane(guarded)
   internals(guarded).driveInvestigation(storage.run(runId), [{ id: 'profile', model: 'mock' }])
   assert.equal(guardedLane.calls.length, 0, 'pre-seeded steps must suppress the lane')
 
-  const forced = new Execution(storage, { deterministicSweep: 'always' })
-  t.after(() => forced.stop())
+  const forced = track(new Execution(storage, { deterministicSweep: 'always' }))
   internals(forced).prePhase0SeededSteps.set(laneKey(run), true)
   internals(forced).startInvestigationStep = () => undefined
   const forcedLane = stubLane(forced)
   internals(forced).driveInvestigation(storage.run(runId), [{ id: 'profile', model: 'mock' }])
   assert.equal(forcedLane.calls.length, 1, '"always" is the explicit operator override')
-  internals(forced).advanceToVerification(storage.run(runId))
+  await internals(forced).advanceToVerification(storage.run(runId))
   await delay(20)
 })
 
 test('missing pre-Phase-0 record is conservative: lane skipped on resumed runs', async (t) => {
-  const { storage, runId } = await startRun(t, { concurrency: 2 })
+  const { storage, runId, track } = await startRun(t, { concurrency: 2 })
   const run = storage.run(runId)
   addStep(storage, run)
-  const execution = new Execution(storage, { deterministicSweep: true })
-  t.after(() => execution.stop())
+  const execution = track(new Execution(storage, { deterministicSweep: true }))
   internals(execution).startInvestigationStep = () => undefined
   const lane = stubLane(execution)
   internals(execution).driveInvestigation(storage.run(runId), [{ id: 'profile', model: 'mock' }])
@@ -189,11 +200,10 @@ test('missing pre-Phase-0 record is conservative: lane skipped on resumed runs',
 })
 
 test('flag ON: Phase A runs first (sequential) and gates specialist dispatch', async (t) => {
-  const { storage, runId } = await startRun(t, { concurrency: 2 })
+  const { storage, runId, track } = await startRun(t, { concurrency: 2 })
   const run = storage.run(runId)
   addStep(storage, run)
-  const execution = new Execution(storage, { deterministicSweep: true, maxDurationMs: 600_000 })
-  t.after(() => execution.stop())
+  const execution = track(new Execution(storage, { deterministicSweep: true, maxDurationMs: 600_000 }))
   internals(execution).prePhase0SeededSteps.set(laneKey(run), false)
   const dispatched: string[] = []
   internals(execution).startInvestigationStep = (_r, step) => { dispatched.push(step.id) }
@@ -204,8 +214,8 @@ test('flag ON: Phase A runs first (sequential) and gates specialist dispatch', a
 
   assert.equal(lane.calls.length, 1)
   assert.equal(dispatched.length, 0, 'agents wait for the phase-A floor to settle')
-  assert.equal(lane.calls[0].maxDurationMs, deadline, 'Phase A deadline = min(180 s, 28% × maxDurationMs)')
-  assert.equal(deadline, 168_000)
+  assert.equal(lane.calls[0].maxDurationMs, deadline, 'Phase A deadline = min(75 s, 12% × maxDurationMs)')
+  assert.equal(deadline, 72_000)
   // Zero chain-step cancellation and no confirmed-route hiding.
   const steps = storage.listChainSteps(runId, storage.run(runId).goalRevision)
   assert.ok(steps.every(step => step.status !== 'canceled'), 'the floor must not cancel specialist steps')
@@ -216,13 +226,12 @@ test('flag ON: Phase A runs first (sequential) and gates specialist dispatch', a
 })
 
 test('lane never writes dynamicStepBudget and aborting it settles before Phase 3', async (t) => {
-  const { storage, runId } = await startRun(t, { concurrency: 2 })
+  const { storage, runId, track } = await startRun(t, { concurrency: 2 })
   const run = storage.run(runId)
   addStep(storage, run)
   storage.updateRunDynamicStepBudget(runId, 77)
   const computedBefore = computeDynamicStepBudget(storage, runId)
-  const execution = new Execution(storage, { deterministicSweep: true })
-  t.after(() => execution.stop())
+  const execution = track(new Execution(storage, { deterministicSweep: true }))
   internals(execution).prePhase0SeededSteps.set(laneKey(run), false)
   internals(execution).startInvestigationStep = () => undefined
   const lane = stubLane(execution, 60)
@@ -234,10 +243,11 @@ test('lane never writes dynamicStepBudget and aborting it settles before Phase 3
 
   const pending = internals(execution).advanceToVerification
   assert.equal(typeof pending, 'function')
-  internals(execution).advanceToVerification(storage.run(runId))
+  const adv = internals(execution).advanceToVerification(storage.run(runId))
   await delay(20)
   assert.equal(storage.run(runId).phase, 'investigation', 'Phase 3 must wait for the lane to settle')
   await delay(120)
+  await adv
   assert.ok(['verification', 'complete'].includes(storage.run(runId).phase), 'finalize commits after the lane settles')
   assert.ok(lane.calls[0].settledAt, 'abort settled before the verification phase committed')
   const kinds = storage.eventsAfter(runId, 0).map(e => e.kind)
@@ -246,7 +256,7 @@ test('lane never writes dynamicStepBudget and aborting it settles before Phase 3
 })
 
 test('K=6 dry-streak still halts and engine facts never reset it', async (t) => {
-  const { storage, runId } = await startRun(t)
+  const { storage, runId, track } = await startRun(t)
   const run = storage.run(runId)
   const assignment = storage.makeWorker(run, 'investigation', run.candidates[0], 'lane worker', 'lane worker')
   const claimed = storage.updateWorker(assignment.id, { status: 'running', lease: randomUUID() })!
@@ -269,8 +279,7 @@ test('K=6 dry-streak still halts and engine facts never reset it', async (t) => 
   )
   assert.equal(countConsecutiveDrySteps(storage, current, new Set([claimed.id])), diminishingReturnsDryThreshold)
 
-  const execution = new Execution(storage)
-  t.after(() => execution.stop())
+  const execution = track(new Execution(storage))
   internals(execution).prePhase0SeededSteps.set(laneKey(current), true)
   internals(execution).startInvestigationStep = () => undefined
   ;(internals(execution) as unknown as Record<string, unknown>).schedulePlanner = () => undefined
@@ -285,11 +294,10 @@ test('K=6 dry-streak still halts and engine facts never reset it', async (t) => 
 })
 
 test('multi-trial fanout/early-stop machinery is untouched by the lane', async (t) => {
-  const { storage, runId } = await startRun(t, { concurrency: 3 })
+  const { storage, runId, track } = await startRun(t, { concurrency: 3 })
   const run = storage.run(runId)
   addStep(storage, run, { title: 'Crown-jewel authz probe', priority: 95 })
-  const execution = new Execution(storage, { deterministicSweep: true })
-  t.after(() => execution.stop())
+  const execution = track(new Execution(storage, { deterministicSweep: true }))
   internals(execution).prePhase0SeededSteps.set(laneKey(run), false)
   internals(execution).startInvestigationStep = () => undefined
   stubLane(execution)
@@ -309,11 +317,10 @@ test('multi-trial fanout/early-stop machinery is untouched by the lane', async (
 })
 
 test('proof handler compiles a typed spec and verification failures carry repair blocks', async (t) => {
-  const { storage, runId } = await startRun(t)
+  const { storage, runId, track } = await startRun(t)
   const run = storage.run(runId)
   const origin = run.candidates.find(c => run.approved.includes(c.id))!.origin
-  const execution = new Execution(storage)
-  t.after(() => execution.stop())
+  const execution = track(new Execution(storage))
 
   // The retired `submitProofSpec` and `proof-tools.ts` compiler paths are gone; verification
   // feedback is surfaced by `withVerifierRepairFeedback`, which attaches a structured repair
@@ -341,7 +348,7 @@ test('proof handler compiles a typed spec and verification failures carry repair
 })
 
 test('occurred context builders: confirmed refs, leads and <=1.5 KB assignment brief', async (t) => {
-  const { storage, runId } = await startRun(t)
+  const { storage, runId, track } = await startRun(t)
   const run = storage.run(runId)
   const origin = run.candidates.find(c => run.approved.includes(c.id))!.origin
   const assignment = storage.makeWorker(run, 'investigation', run.candidates[0], 'ctx', 'ctx')
@@ -352,8 +359,7 @@ test('occurred context builders: confirmed refs, leads and <=1.5 KB assignment b
     summary: 'lead',
     data: { kind: 'det_lead', source: 'deterministic_engine', probeClass: 'authz_matrix', endpoint: '/api/invoices/:id', method: 'GET' },
   })
-  const execution = new Execution(storage)
-  t.after(() => execution.stop())
+  const execution = track(new Execution(storage))
   const leads = internals(execution).detLeadSummaries(storage.run(runId))
   assert.equal(leads[0]?.probeClass, 'authz_matrix')
 
@@ -377,19 +383,17 @@ test('occurred context builders: confirmed refs, leads and <=1.5 KB assignment b
 })
 
 test('tracing is OFF by default and emits lifecycle/planner/checkpoint records when enabled', async (t) => {
-  const { storage, runId } = await startRun(t)
+  const { storage, runId, track } = await startRun(t)
   const cleanEnv = { KOVO_TRACE: undefined, KOVO_TRACE_DIR: undefined, KOVO_TRACE_ROOT: undefined }
 
   await withEnv(cleanEnv, () => {
-    const execution = new Execution(storage)
-    t.after(() => execution.stop())
+    const execution = track(new Execution(storage))
     assert.equal(internals(execution).ensureRunTrace(storage.run(runId)), null, 'trace is off by default')
   })
 
   const traceRoot = mkdtempSync(join(tmpdir(), 'kovo-trace-'))
   await withEnv({ KOVO_TRACE: '1', KOVO_TRACE_ROOT: traceRoot }, () => {
-    const execution = new Execution(storage)
-    t.after(() => execution.stop())
+    const execution = track(new Execution(storage))
     const trace = internals(execution).ensureRunTrace(storage.run(runId), [{ model: 'mock-model' }])
     assert.ok(trace)
     internals(execution).traceLifecycle(runId, 'lane_start', { deadlineMs: 240_000 })

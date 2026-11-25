@@ -319,14 +319,17 @@ test('settlement pauses offline analysis while a probed route still owes a spec'
   assert.equal(settlementToolBlock({ name: 'derive_evidence', ...base, specPending: false }), undefined)
 })
 
-test('the final turn does not re-enable kovo_verify or probe tools', () => {
+test('the final turn keeps kovo_verify available while blocking probe and wrap-up tools', () => {
   const directive = settlementSpecDirective(ROUTE)
-  for (const name of ['request_http', 'kovo_verify', 'verify_replay_spec']) {
+  for (const name of ['request_http', 'verify_replay_spec', 'search_facts']) {
     const block = settlementToolBlock({
       name, settling: true, turnsUsed: 12, maxTurns: 12, specPending: true, specDirective: directive,
     })
     assert.ok(block, `${name} stays blocked on the final turn`)
   }
+  assert.equal(settlementToolBlock({
+    name: 'kovo_verify', settling: true, turnsUsed: 12, maxTurns: 12, specPending: true, specDirective: directive,
+  }), undefined)
 })
 
 // ============================================================================

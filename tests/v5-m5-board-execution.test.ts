@@ -270,21 +270,29 @@ test('warm retirement mirrors stop, turn ceilings and scope revocation', async t
 })
 
 test('deterministic posters are wired into dispatch, verification, circuit, approval, canary and turn-start hooks', () => {
-  const source = readFileSync(resolve(new URL('..', import.meta.url).pathname, 'src/server/execution.ts'), 'utf8')
+  const root = new URL('..', import.meta.url).pathname
+  const source = readFileSync(resolve(root, 'src/server/execution.ts'), 'utf8')
+  const workerRunnerSource = readFileSync(resolve(root, 'src/server/exec-worker-runner.ts'), 'utf8')
+  const verifySource = readFileSync(resolve(root, 'src/server/exec-verify.ts'), 'utf8')
   for (const fragment of [
     'this.postCoordinatorBrief(run, effectiveStep, boardHandle, targetOrigins)',
-    'this.postVerificationVerdict(this.storage.run(params.job.assignment.runId)',
+    'postVerificationVerdict: (run, opts) => this.postVerificationVerdict(run, opts)',
     'this.postBrokerBlocker(fresh, origin, status)',
     'this.postApprovalCard(run, job.assignment.id',
     'this.postApprovalResolution(run, job.assignment.id',
     'this.postCanaryLead(curRun',
-    'onTurnStart: turn =>',
-    "injectBoardTurnInstructions('', delta.text)",
     'boardTools.noteEvidence()',
-    'this.boardTurnDelta(this.storage.run(run.id), boardHandle',
   ]) {
     assert.ok(source.includes(fragment), `execution wiring is missing: ${fragment}`)
   }
+  for (const fragment of [
+    'onTurnStart: turn =>',
+    "injectBoardTurnInstructions('', delta.text)",
+    'this.host.boardTurnDelta(this.storage.run(run.id), boardHandle',
+  ]) {
+    assert.ok(workerRunnerSource.includes(fragment), `exec-worker-runner wiring is missing: ${fragment}`)
+  }
+  assert.ok(verifySource.includes('this.host.postVerificationVerdict('), 'exec-verify wiring is missing postVerificationVerdict')
 })
 
 test('parallel steps for one profile use sharded handles instead of serializing behind a singleton', async t => {

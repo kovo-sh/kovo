@@ -297,15 +297,22 @@ test('C: hard-escalated requests still escalate even with a matching pattern', a
   assert.equal(destructiveBody.decision, 'approve')
   assert.equal(destructiveBody.stage, 'approved_pattern')
 
-  const multipart = await decide({ hasMultipart: true })
-  assert.equal(multipart.decision, 'escalate_human')
-  assert.equal(multipart.stage, 'hard_escalation')
+  // Operator pattern ("Approve similar") honors well-formed multipart & DELETE on that exact route,
+  // while non-overridable structural risks (malformed multipart, compressed body, rce_proof) and
+  // race bursts never match a pattern.
+  const multipartWithPattern = await decide({ hasMultipart: true })
+  assert.equal(multipartWithPattern.decision, 'approve')
+  assert.equal(multipartWithPattern.stage, 'approved_pattern')
+
+  const malformedMultipart = await decide({ headers: { 'content-type': 'multipart/form-data' } })
+  assert.equal(malformedMultipart.decision, 'escalate_human')
+  assert.equal(malformedMultipart.stage, 'hard_escalation')
 
   const race = await decide({ isRaceBurst: true })
   assert.equal(race.decision, 'escalate_human')
   assert.notEqual(race.stage, 'approved_pattern', 'patterns never pre-approve race bursts')
 
-  const remove = await evaluateTier3Approval({
+  const approvedDelete = await evaluateTier3Approval({
     policy: 'auto_review',
     origin: PUBLIC_ORIGIN,
     method: 'DELETE',
@@ -313,15 +320,26 @@ test('C: hard-escalated requests still escalate even with a matching pattern', a
     approvedPatterns: [{ origin: PUBLIC_ORIGIN, method: 'DELETE', pathPattern: '/api/items/*' }],
     offline: true,
   })
-  assert.equal(remove.decision, 'escalate_human')
-  assert.equal(remove.stage, 'hard_escalation')
+  assert.equal(approvedDelete.decision, 'approve')
+  assert.equal(approvedDelete.stage, 'approved_pattern')
+
+  const unapprovedDelete = await evaluateTier3Approval({
+    policy: 'auto_review',
+    origin: PUBLIC_ORIGIN,
+    method: 'DELETE',
+    pathAndQuery: '/api/other/123',
+    approvedPatterns: [{ origin: PUBLIC_ORIGIN, method: 'DELETE', pathPattern: '/api/items/*' }],
+    offline: true,
+  })
+  assert.equal(unapprovedDelete.decision, 'escalate_human')
+  assert.equal(unapprovedDelete.stage, 'hard_escalation')
 
   // A non-escalated ID target still matches the pattern after the ordering change.
   const benign = await decide({})
   assert.equal(benign.stage, 'approved_pattern')
 })
 
-test('C: patterns never authorize an RCE proof, including when the caller omits context', () => {
+test('C: patterns never authorize an RCE proof or malformed multipart, including when context is omitted', () => {
   const patterns = [{ origin: PUBLIC_ORIGIN, method: 'POST', pathPattern: '/api/items/*' }]
 
   const withoutContext = authorizeStateChange({
@@ -343,7 +361,7 @@ test('C: patterns never authorize an RCE proof, including when the caller omits 
   })
   assert.equal(withRce.approved, false, 'rce_proof is never covered by an operator pattern')
 
-  const withMultipart = authorizeStateChange({
+  const withWellFormedMultipart = authorizeStateChange({
     runId: 'run-rce',
     origin: PUBLIC_ORIGIN,
     method: 'POST',
@@ -351,7 +369,18 @@ test('C: patterns never authorize an RCE proof, including when the caller omits 
     context: { personaHandle: null, hasMultipart: true },
     approvedPatterns: patterns,
   })
-  assert.equal(withMultipart.approved, false, 'upload/multipart is never covered by an operator pattern')
+  assert.equal(withWellFormedMultipart.approved, true, 'explicit operator pattern authorizes well-formed multipart on that route')
+  assert.equal(withWellFormedMultipart.via, 'operator_pattern')
+
+  const withCompressed = authorizeStateChange({
+    runId: 'run-rce',
+    origin: PUBLIC_ORIGIN,
+    method: 'POST',
+    pathAndQuery: '/api/items/123',
+    context: { personaHandle: null, hasCompressedBody: true },
+    approvedPatterns: patterns,
+  })
+  assert.equal(withCompressed.approved, false, 'compressed bodies are never covered by an operator pattern')
 })
 
 test('C: rce_proof without context is refused by the judge', async () => {

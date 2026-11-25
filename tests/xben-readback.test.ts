@@ -135,9 +135,16 @@ async function handle(req: IncomingMessage, res: ServerResponse, users: Map<stri
     if (options.denyLowPrivPromote && callerRole !== 'admin') return json(res, 403, { error: 'forbidden' })
     const row = users.get(promote[1]!)
     if (!row) return json(res, 404, { error: 'user not found' })
-    users.set(promote[1]!, { ...row, role: 'admin' })
+    let nextRole = 'admin'
+    if (chunks.length > 0) {
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { role?: unknown }
+        if (typeof parsed.role === 'string' && parsed.role) nextRole = parsed.role
+      } catch { /* keep default */ }
+    }
+    users.set(promote[1]!, { ...row, role: nextRole })
     // The buggy function echoes the new role; the echo alone is never accepted as persistence.
-    return json(res, 200, { ok: true, user: promote[1], role: 'admin' })
+    return json(res, 200, { ok: true, user: promote[1], role: nextRole })
   }
   const invoice = /^\/api\/invoices\/([a-z0-9]{1,8})$/.exec(url.pathname)
   if (invoice && req.method === 'GET') {
@@ -261,14 +268,14 @@ test('product: a privileged promote proof carries a pre/post readback and confir
     assert.equal(declarativeReplaySpecSchema.safeParse(spec).success, true)
     assert.equal(spec.requiredRole, 'admin')
     const steps = spec.steps as Array<{ id: string; role: string; request: { method: string; pathAndQuery: string; persona?: string } }>
-    assert.deepEqual(steps.map(step => step.id), ['c2', 'c1', 'p1', 'p2'])
+    assert.deepEqual(steps.map(step => step.id), ['w1', 'c2', 'c3', 'c1', 'p1', 'p2'])
     // A separate read of the mutated account brackets the lower-privileged mutation.
-    assert.equal(steps[1]!.request.method, 'GET')
-    assert.equal(steps[1]!.request.pathAndQuery, '/api/admin/users/u-1001')
-    assert.equal(steps[2]!.request.method, 'POST')
-    assert.equal(steps[2]!.request.persona, 'viewer')
     assert.equal(steps[3]!.request.method, 'GET')
     assert.equal(steps[3]!.request.pathAndQuery, '/api/admin/users/u-1001')
+    assert.equal(steps[4]!.request.method, 'POST')
+    assert.equal(steps[4]!.request.persona, 'viewer')
+    assert.equal(steps[5]!.request.method, 'GET')
+    assert.equal(steps[5]!.request.pathAndQuery, '/api/admin/users/u-1001')
     // Deterministic: the same observation always produces byte-identical steps.
     assert.deepEqual(synthesizeEngineSpecs(hyp, signal(promoteAnomaly(), promoteMatrix()))[0]!.spec, spec)
 

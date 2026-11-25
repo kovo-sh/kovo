@@ -620,7 +620,14 @@ test('V5-M2.6 local-lab Tier-3 approvals auto-approve keyword routes but never r
     bodyPreview: '{"amount":1}', environment: 'public', offline: true,
   })
   assert.equal(publicRefund.decision, 'escalate_human')
-  assert.equal(publicRefund.stage, 'hard_escalation')
+  assert.equal(publicRefund.stage, 'fail_safe')
+
+  const publicDelete = await evaluateTier3Approval({
+    ...base, method: 'DELETE', pathAndQuery: '/api/invoices/42', personaHandle: 'tenant_a',
+    environment: 'public', offline: true,
+  })
+  assert.equal(publicDelete.decision, 'escalate_human')
+  assert.equal(publicDelete.stage, 'hard_escalation')
 
   const localDelete = await evaluateTier3Approval({
     ...base, method: 'DELETE', pathAndQuery: '/api/invoices/42', environment: 'local-lab', offline: true,

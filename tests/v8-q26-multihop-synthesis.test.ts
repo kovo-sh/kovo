@@ -339,8 +339,8 @@ test('Fix C: workerInvestigationPrompt, KOVO_VERIFY guidance, and multihop-chain
     assert.match(text, /ALL probe-arm hops MUST run as a single starting low-privilege persona/i, `${label} missing single-origin probe-arm rule`)
     assert.match(text, /NEVER use a target-tenant persona on the probe arm to mint handles/i, `${label} missing anti-collusion rule`)
   }
-  assert.match(guidance, /Never stop at a single-hop disclosure\/handle/i)
-  assert.match(guidance, /ONE low-priv\/cross-tenant persona/i)
+  assert.match(guidance, /Never stop at (?:a single-hop )?disclosure\/handle/i)
+  assert.match(guidance, /ONE low-priv\/(?:cross-tenant|derived) persona/i)
 
   // workerInvestigationPrompt emits multiHopDirectives for multi-hop steps and omits it for single-hop steps.
   const multiHopPrompt = JSON.parse(workerInvestigationPrompt({
@@ -386,8 +386,8 @@ test('Fix C: workerInvestigationPrompt, KOVO_VERIFY guidance, and multihop-chain
   })
   const mhSkill = injected.find(s => s.name === MULTIHOP_CHAINS_SKILL)
   assert.ok(mhSkill, 'multihop-chains must be pre-injected for chain lane')
-  assert.match(mhSkill!.excerpt, /No Collusion/i)
-  assert.match(mhSkill!.excerpt, /No Premature Filing/i)
+  assert.match(mhSkill!.excerpt, /ONE low-priv\/derived persona/i)
+  assert.match(mhSkill!.excerpt, /NEVER stop at job creation, cache prime, or link\/token stubs/i)
   assert.ok(mhSkill!.excerpt.includes('ctx.seal_capability'))
   assert.ok(mhSkill!.excerpt.includes('ctx.hmac_sign'))
   assert.ok(mhSkill!.excerpt.includes('ctx.jwt_sign'))

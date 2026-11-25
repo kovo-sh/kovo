@@ -44,7 +44,7 @@ process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const FIXTURE = 'monorepo-whitebox'
 const ORIGIN = 'http://127.0.0.1:9'
-const DECLARED_OPERATIONS = 2_565
+const DECLARED_OPERATIONS = 2_567
 const GENERATED_OPERATIONS = 2_560
 
 interface HarnessPathResult {
@@ -184,8 +184,8 @@ describe('realism #4 monorepo: briefing -> declared surface -> AST reachability'
     // AST aliases use `:id` while the OpenAPI document uses `{id}`; both are stored losslessly.
     assert.ok(harness.endpoints.length >= DECLARED_OPERATIONS)
     assert.ok(harness.endpoints.some((endpoint) => endpoint.source === 'repo_ast' && endpoint.pathTemplate.startsWith('/v4/')))
-    // Ranking wiring: the sink routes are Tier-A priorities, not sampled into the long tail.
-    assert.equal(harness.priority, 3, 'the three sink routes are Tier-A priorities')
+    // Ranking wiring: the sink and privileged admin-guard routes are Tier-A priorities, not sampled into the long tail.
+    assert.equal(harness.priority, 5, 'the Tier-A priority routes are not sampled into the long tail')
     assert.ok(harness.probeSubset >= 3)
   })
 

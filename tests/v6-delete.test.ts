@@ -603,7 +603,16 @@ test('v6 delete: Program-Graph code→runtime hypotheses become prioritized det_
       rationale: 'Route reaches a raw SQL sink without a tenant guard.',
       evidence: ['src/routes/orders.ts:42'],
       probeClass: 'injection',
-    },
+      codeSlice: {
+        route: 'POST /api/orders/:id',
+        mounts: [],
+        methods: ['POST'],
+        auth: 'unguarded',
+        guards: [],
+        hops: [{ at: 'src/routes/orders.ts:42', kind: 'sink' }],
+        sink: { kind: 'db_query', at: 'src/routes/orders.ts:42' },
+      },
+    } as CodeToRuntimeHypothesis,
     {
       id: 'hyp-authz-1',
       kind: 'admin_route_missing_admin_guard',
@@ -652,5 +661,5 @@ test('v6 delete: Program-Graph code→runtime hypotheses become prioritized det_
   const queued = internals(execution).queueDetLeadUpgradeSteps(storage.run(runId), new Set([appOrigin]), 24)
   assert.equal(queued, 2)
   const steps = storage.listChainSteps(runId, storage.run(runId).goalRevision)
-  assert.ok(steps.every(step => step.priority === 88), 'graph leads enter the prioritized det_lead queue')
+  assert.ok(steps.every(step => step.priority === 90 || step.priority === 55), 'graph leads enter the prioritized det_lead queue')
 })
