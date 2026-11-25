@@ -9,7 +9,7 @@ import { parseRoleLabel, routeFamily, stepReadsState } from './oracle-invariants
 import { proofReceiptSchema, receiptIdSchema, verifyReceipt } from './proof-receipt.ts'
 import { evaluateV8OracleFamily, extractTenantMarkers, isJobOrHandleStub } from './v8-oracle-families.ts'
 import type { CrossSurfaceHop, CrossSurfacePivotInput, HostSignedRecord as V8OracleRecord, V8OracleFamily, V8OracleInputMap } from './v8-oracle-families.ts'
-import { hydrateV8OracleInput, isHydratedStub, isPrivilegedActorOrRole, matchesHydratedRecord, selectStateTransitionPair, toOracleRecord } from './v8-oracle-hydrate.ts'
+import { buildCapOriginIndex, hydrateV8OracleInput, isHydratedStub, isPrivilegedActorOrRole, matchesHydratedRecord, selectStateTransitionPair, toOracleRecord, type CapOriginIndex } from './v8-oracle-hydrate.ts'
 import type { ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 
 export const HOP_SURFACES = ['http', 'graphql', 'ws', 'sse', 'browser', 'webhook', 'async_job', 'idp', 'cdn', 'storage'] as const
@@ -130,7 +130,8 @@ const isFiniteTs = (ts: unknown): ts is number => typeof ts === 'number' && Numb
 const normRouteFam = (p: string | null | undefined, eid?: string): string => !p ? '' : routeFamily(p.split(/[?#]/, 1)[0]!.split('/').map(s => (s && ((eid && s === eid) || /^\d+$/.test(s))) ? ':id' : s).join('/'))
 const actorOf = (e: HostTranscriptEntry): string | null => (e.actorPersona !== undefined ? e.actorPersona : (e.step.actor.handle ?? null))
 const roleOf = (e: HostTranscriptEntry): string | null => (e.actorRoleLabel ? parseRoleLabel(e.actorRoleLabel).role : (e.step.actor.role ?? null))
-const probeTenantOf = (e: HostTranscriptEntry): string | null => { const a = actorOf(e); return (!a || ANON_ACTOR_RE.test(a) || a.startsWith('cap:')) ? null : ((e.step.actor.tenant ?? parseRoleLabel(e.actorRoleLabel ?? e.actorPersona ?? '').tenant ?? '').trim().toLowerCase() || null) }
+const probeTenantsOf = (e: HostTranscriptEntry, capIdx?: CapOriginIndex): string[] => { const out: string[] = [], a = actorOf(e), dt = (!a || ANON_ACTOR_RE.test(a) || a.startsWith('cap:')) ? null : ((e.step.actor.tenant ?? parseRoleLabel(e.actorRoleLabel ?? e.actorPersona ?? '').tenant ?? '').trim().toLowerCase() || null); if (dt) out.push(dt); if (capIdx) for (const c of [...(a?.startsWith('cap:') ? [a] : []), ...(e.consumedCapabilities ?? [])]) { const lt = capIdx.loginTenantOf(c); if (lt && !out.includes(lt)) out.push(lt) } return out }
+const probeTenantOf = (e: HostTranscriptEntry, capIdx?: CapOriginIndex): string | null => probeTenantsOf(e, capIdx)[0] ?? null
 function collectLeaves(value: unknown, out: Set<string>, depth = 0): void {
   if (depth > 5 || out.size > 256 || value == null) return
   if (typeof value === 'string') { const t = value.trim(); if (t.length > 0 && t.length <= 2048) out.add(t) }
@@ -363,20 +364,19 @@ function verifyDerivedCryptoBinding(
 
 function verifyStateTransitionBinding(
   base: EdgeBase, edge: Extract<CausalEdgeBinding, { kind: 'state_transition_binding' }>,
-  fromHop: HopReceipt, toHop: HopReceipt, idx: IndexedTranscript, dagDerivedCaps: ReadonlySet<string>,
+  fromHop: HopReceipt, toHop: HopReceipt, idx: IndexedTranscript, dagDerivedCaps: ReadonlySet<string>, capIdx: CapOriginIndex,
 ): VerifiedEdgeResult {
   const hopEntries = (hop: HopReceipt) => hop.exchangeIds.map(id => idx.entriesById.get(id)!)
   const hopDiag = (hop: HopReceipt, side: string) => { const es = hopEntries(hop); return `[${side}Ok=0: exchanges=${es.length}, 2xx=${es.filter(e => is2xx(e.step.status)).length}, timestamped=${es.filter(e => isFiniteTs(e.timestampMs)).length}, entityMatch=${es.filter(e => entryMatchesEntity(e, edge.entityId)).length}]` }
-  const sel = selectStateTransitionPair(edge.entityId, hopEntries(fromHop), hopEntries(toHop), dagDerivedCaps, { actorOf, probeTenantOf, entryMatchesEntity, anonActorRe: ANON_ACTOR_RE })
+  const sel = selectStateTransitionPair(edge.entityId, hopEntries(fromHop), hopEntries(toHop), dagDerivedCaps, { actorOf, probeTenantOf: e => probeTenantOf(e, capIdx), entryMatchesEntity, anonActorRe: ANON_ACTOR_RE, resolveCapActor: c => capIdx.actorOf(c) })
   if (!sel.ok) {
     if (sel.reason === 'non_monotonic') return edgeFail(base, `state_transition_binding on "${edge.entityId}" violated monotonic ordering (t_i > t_j).`)
     const side = sel.reason === 'missing_to' || sel.missingSide === 'to' ? 'to' : 'from', hop = side === 'to' ? toHop : fromHop
     return edgeFail(base, `${side}Hop "${hop.hopId}" has no succeeding exchange on "${edge.entityId}" ${hopDiag(hop, side)}${sel.reason === 'actor_discontinuity' ? ' [actor_discontinuity]' : ''}.`)
   }
-  const pair = { from: sel.from, to: sel.to }, { logicalFallback } = sel
+  const pair = { from: sel.from, to: sel.to }, { logicalFallback } = sel, toActor = actorOf(pair.to), toFam = normRouteFam(pair.to.step.route ?? pair.to.step.pathAndQuery, edge.entityId)
   const hopExSet = new Set([...fromHop.exchangeIds, ...toHop.exchangeIds])
-  const toUsesNewCap = (pair.to.consumedCapabilities ?? []).some(c => dagDerivedCaps.has(c)) || (pair.to.cryptoAttestations ?? []).some(x => dagDerivedCaps.has(x.derivedFromCapabilityId))
-  const toActor = actorOf(pair.to), toFam = normRouteFam(pair.to.step.route ?? pair.to.step.pathAndQuery, edge.entityId)
+  const toUsesNewCap = (pair.to.consumedCapabilities ?? []).some(c => dagDerivedCaps.has(c)) || (pair.to.cryptoAttestations ?? []).some(x => dagDerivedCaps.has(x.derivedFromCapabilityId)) || Boolean(toActor && dagDerivedCaps.has(toActor))
   const normActor = (a: string | null) => (!a || ANON_ACTOR_RE.test(a.trim())) ? null : a.trim().toLowerCase()
   // Sibling is untouched when no succeeding state-changing exchange on it precedes the ablation (missing timestamps count as touched).
   const touchedBefore = (eid: string, ab: HostTranscriptEntry) => [...idx.entriesById.values()].some(e => e.exchangeId !== ab.exchangeId && is2xx(e.step.status) && !stepReadsState(e.step) && (!isFiniteTs(e.timestampMs) || !isFiniteTs(ab.timestampMs) || e.timestampMs <= ab.timestampMs) && entryMatchesEntity(e, eid))
@@ -395,7 +395,7 @@ function verifyStateTransitionBinding(
       const sibling = Boolean(ab.entityId && ab.entityId.trim().toLowerCase() !== edge.entityId.trim().toLowerCase() && !touchedBefore(ab.entityId, ab))
       if (ab.cleanSession !== true || !denied || !(before || sibling)) { diags.push(`${abId}: unlabeled_control (cleanSession=${ab.cleanSession ?? 'unset'}, status=${st ?? 'null'}, beforeFromHop=${before}, untouchedSibling=${sibling}; pass role: "control")`); continue }
     }
-    const abActor = actorOf(ab)
+    const abActor = actorOf(ab) ?? (ab.consumedCapabilities ?? []).map(c => capIdx.actorOf(c)).find(Boolean) ?? null
     if (!toUsesNewCap && toActor && (logicalFallback ? normActor(abActor) !== normActor(toActor) : (abActor && abActor !== toActor))) return edgeFail(base, `Ablation "${abId}" actor "${abActor ?? 'anon'}" mismatches toHop actor "${toActor}" [actor_mismatch].`)
     if (denied || (!logicalFallback && labeled && ab.step.evidenceRole === 'invariant_preserved')) validAblation = ab
     else diags.push(`${abId}: status=${st ?? 'null'} not a denial (401/403/404/409/412/422)`)
@@ -465,31 +465,31 @@ function verifyAsyncPivotBinding(
 
 // --- Attacker-Origin Provenance & Replay Mode Policy ------------------------
 function verifyAttackerProvenance(
-  receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, options: CompositeVerifyOptions,
+  receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, options: CompositeVerifyOptions, capIdx: CapOriginIndex,
 ): { ok: true; derivedCapabilities: string[]; attackerTenants: ReadonlySet<string> } | { ok: false; reason: string } {
   const allowedSet = options.attackerPersonas?.length ? new Set(options.attackerPersonas) : null
   const forbiddenSet = new Set(options.forbiddenShortcutPersonas ?? [])
   const rootSet = new Set(dag.roots), dagCaps = new Set<string>(), probeTenants = new Set<string>()
-  const isForbidden = (a: string | null, r: string | null) =>
-    (a !== null && forbiddenSet.has(a)) || (allowedSet ? a !== null && !allowedSet.has(a) : isPrivilegedActorOrRole(a, r))
-  const isAllowed = (a: string | null, r: string | null) =>
-    !(a !== null && forbiddenSet.has(a)) && (allowedSet ? a !== null && allowedSet.has(a) : !isPrivilegedActorOrRole(a, r))
+  const isForbidden = (a: string | null, r: string | null, rl?: string | null) =>
+    (a !== null && forbiddenSet.has(a)) || (allowedSet ? a !== null && !allowedSet.has(a) : isPrivilegedActorOrRole(a, r, rl))
+  const isAllowed = (a: string | null, r: string | null, rl?: string | null) =>
+    !(a !== null && forbiddenSet.has(a)) && (allowedSet ? a !== null && allowedSet.has(a) : !isPrivilegedActorOrRole(a, r, rl))
 
   for (const hopId of dag.topoOrder) {
-    const hop = dag.hopsById.get(hopId)!
-    const isRoot = rootSet.has(hopId)
+    const hop = dag.hopsById.get(hopId)!, isRoot = rootSet.has(hopId)
     const probes = hop.exchangeIds.map(id => idx.entriesById.get(id)!).filter(e => e.step.arm === 'probe')
     if (isRoot && receipt.hops.length > 1 && probes.length === 0) return { ok: false, reason: `Root hop "${hopId}" requires an attacker-origin probe.` }
     for (const e of probes) {
-      const a = actorOf(e), r = roleOf(e)
-      if (isForbidden(a, r)) return { ok: false, reason: `Attacker-origin violation in "${hopId}" ("${e.exchangeId}"): pre-seeded persona "${a ?? r}" is forbidden.` }
+      const a = actorOf(e), r = roleOf(e), loginCaps = [...(a?.startsWith('cap:') ? [a] : []), ...(e.consumedCapabilities ?? [])]
+      const badLogin = loginCaps.map(c => capIdx.loginActorOf(c)).find(la => la && isForbidden(la.actor, la.role, la.roleLabel))
+      if (isForbidden(a, r, e.actorRoleLabel) || badLogin) return { ok: false, reason: `Attacker-origin violation in "${hopId}" ("${e.exchangeId}"): pre-seeded persona "${badLogin ? (badLogin.actor ?? badLogin.role) : (a ?? r)}" is forbidden.` }
       if (isRoot) {
-        if (allowedSet && !isAllowed(a, r)) return { ok: false, reason: `Root hop "${hopId}" ("${e.exchangeId}") must start from an allowed attackerPersona.` }
+        if (allowedSet && !isAllowed(a, r, e.actorRoleLabel)) return { ok: false, reason: `Root hop "${hopId}" ("${e.exchangeId}") must start from an allowed attackerPersona.` }
       } else {
         const usesDag = (e.consumedCapabilities ?? []).some(c => dagCaps.has(c)) || (e.cryptoAttestations ?? []).some(x => dagCaps.has(x.derivedFromCapabilityId))
-        if (!(a !== null && isAllowed(a, r)) && !usesDag) return { ok: false, reason: `Hop "${hopId}" ("${e.exchangeId}") lacks attacker persona or DAG-derived capability.` }
+        if (!(a !== null && isAllowed(a, r, e.actorRoleLabel)) && !usesDag) return { ok: false, reason: `Hop "${hopId}" ("${e.exchangeId}") lacks attacker persona or DAG-derived capability.` }
       }
-      const pt = probeTenantOf(e); if (pt) probeTenants.add(pt)
+      for (const pt of probeTenantsOf(e, capIdx)) probeTenants.add(pt)
     }
     recordHopCapabilities(hop, idx, dagCaps)
   }
@@ -603,7 +603,7 @@ function dispatchDefaultV8Oracle(
         ...(edge?.kind === 'derived_crypto_binding' ? { derivedFromCapabilityId: edge.sourceCapabilityId } : {}), ...(edge?.kind === 'state_transition_binding' && abl ? { ablationControlDenied: toOracleRecord(abl, sig) } : {}),
       }
     })
-    const rAct = actorOf(rootEx), rRole = roleOf(rootEx), isPrivilegedPreSeeded = Boolean((rAct && options.forbiddenShortcutPersonas?.includes(rAct)) || (options.attackerPersonas?.length ? (rAct !== null && !options.attackerPersonas.includes(rAct)) : isPrivilegedActorOrRole(rAct, rRole)))
+    const rAct = actorOf(rootEx), rRole = roleOf(rootEx), isPrivilegedPreSeeded = Boolean((rAct && options.forbiddenShortcutPersonas?.includes(rAct)) || (options.attackerPersonas?.length ? (rAct !== null && !options.attackerPersonas.includes(rAct)) : isPrivilegedActorOrRole(rAct, rRole, rootEx.actorRoleLabel)))
     const dec = evaluateV8OracleFamily('cross_surface_pivot', {
       attackerOriginPersona: { actorId: rAct ?? 'attacker', role: rRole ?? 'member', tenantId: rootEx.step.actor.tenant ?? null, isPrivilegedPreSeeded },
       preChainControlDenied: toOracleRecord(terminalCtrl, sig), hops, verifySignature,
@@ -670,16 +670,16 @@ function verifyTerminalImpactGate(
     const cf = normRouteFam(c.step.route ?? c.step.pathAndQuery, c.entityId ?? termEx?.entityId ?? termHop.entityId), eid = termEx?.entityId ?? termHop.entityId
     return Boolean(termFam) && Boolean(cf) && cf === termFam && (c.step.status !== 404 || (eid ? entryMatchesEntity(c, eid) : (c.step.pathAndQuery ?? c.step.route ?? '').split('?', 1)[0] === termEndpoint.split('?', 1)[0]))
   })
-  const hasCleanDeniedCtrl = Boolean(terminalCtrl), hasAsyncEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'async_pivot_binding' && e.verified), hasAnyDerivedCrypto = verifiedEdges.some(e => e.kind === 'derived_crypto_binding' && e.verified)
-  const ownTenantOnly = Boolean(termEx && isOwnTenantOnly(termEx)), v8Default = dispatchDefaultV8Oracle(receipt, dag, idx, termEx, options, terminalCtrl, postMutRb, { termEndpoint, termFam, hasOob, hasBrowser, hasBody, isStub, ownTenantOnly })
+  const hasCleanDeniedCtrl = Boolean(terminalCtrl), hasAsyncEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'async_pivot_binding' && e.verified), hasTermDerivedCrypto = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'derived_crypto_binding' && e.verified)
+  const termTenants = termEx ? extractTenantMarkers(termEx.step.json, termEx.step.body) : new Set<string>(), ownTenantOnly = Boolean(termEx && termTenants.size > 0 && attackerTenants.size > 0 && [...termTenants].every(t => attackerTenants.has(t))), hasForeignTenantData = Boolean(termEx && !isStub && hasBody && attackerTenants.size > 0 && [...termTenants].some(t => !attackerTenants.has(t))), v8Default = dispatchDefaultV8Oracle(receipt, dag, idx, termEx, options, terminalCtrl, postMutRb, { termEndpoint, termFam, hasOob, hasBrowser, hasBody, isStub, ownTenantOnly })
   if (v8Default && !v8Default.ok) return v8Default
   if (!termEx && !hasOob && !hasBrowser && !hasAsyncEdge) return failUnproven(`Terminal hop "${termHop.hopId}" has no succeeding terminal evidence.`)
   if (isStub && !hasPostMutation) return failUnproven()
   const crossOrReplay = isCrossTenantCls || receipt.terminalVulnClass === 'cross_surface_pivot' || receipt.terminalVulnClass === 'cryptographic_scope_replay'
   if (termEx && ownTenantOnly && !hasPostMutation && (crossOrReplay || !hasCleanDeniedCtrl)) return failUnproven()
-  const hasEconBaselineCtrl = Boolean(v8Default?.explicit && v8Default.family === 'economic_conservation'), needsStrict = STRICT_TERMINAL_CLASS_RE.test(receipt.terminalVulnClass) || (!hasOob && !hasBrowser && !hasAsyncEdge && !(receipt.hops.length >= 2 && hasAnyDerivedCrypto))
+  const hasEconBaselineCtrl = Boolean(v8Default?.explicit && v8Default.family === 'economic_conservation'), isStrictCls = STRICT_TERMINAL_CLASS_RE.test(receipt.terminalVulnClass), hasDerivedTerminalProof = !isStrictCls && hasTermDerivedCrypto && (hasPostMutation || hasForeignTenantData), needsStrict = isStrictCls || (!hasOob && !hasBrowser && !hasAsyncEdge)
   if (needsStrict) {
-    if (!hasCleanDeniedCtrl && !hasEconBaselineCtrl && !hasOob && !hasBrowser) return failUnproven(`Missing clean denied control (401/403/404) on exact terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['clean_denied_control_401_403_404'])
+    if (!hasCleanDeniedCtrl && !hasEconBaselineCtrl && !hasDerivedTerminalProof && !hasOob && !hasBrowser) return failUnproven(`Missing clean denied control (401/403/404) on exact terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['clean_denied_control_401_403_404'])
     if (!hasOob && !hasBrowser && ((!termEx && !hasPostMutation) || !termEndpoint || !termFam)) return failUnproven(`Missing concrete terminal exchange or endpoint for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['terminal_exchange_with_endpoint'])
     if (termEx && !hasPostMutation && (!hasBody || isStub || (ownTenantOnly && crossOrReplay))) return failUnproven()
   }
@@ -703,21 +703,21 @@ export function verifyCompositeReceipt(rawReceipt: unknown, hostTranscript: Host
   const idxRes = indexAndVerifyCitations(receipt, hostTranscript, options.signingKey)
   if (!idxRes.ok) return fail('transcript_integrity', idxRes.reason)
   const { dag } = dagRes, { idx } = idxRes
-  const verifiedEdges: VerifiedEdgeResult[] = [], knownCaps = new Set<string>()
+  const verifiedEdges: VerifiedEdgeResult[] = [], knownCaps = new Set<string>(), capIdx = buildCapOriginIndex(idx.entriesById.values(), ANON_ACTOR_RE)
   for (const hopId of dag.topoOrder) {
     for (const { edgeIndex, edge } of dag.incomingByHop.get(hopId) ?? []) {
       const fromHop = dag.hopsById.get(edge.fromHopId)!, toHop = dag.hopsById.get(edge.toHopId)!
       const base: EdgeBase = { edgeIndex, kind: edge.kind, fromHopId: edge.fromHopId, toHopId: edge.toHopId, fromEx: [...fromHop.exchangeIds, ...fromHop.oobEventIds, ...fromHop.browserTraceIds], toEx: [...toHop.exchangeIds, ...toHop.oobEventIds, ...toHop.browserTraceIds] }
       const res = edge.kind === 'value_binding' ? verifyValueBinding(base, edge, fromHop, toHop, idx)
         : edge.kind === 'derived_crypto_binding' ? verifyDerivedCryptoBinding(base, edge, fromHop, toHop, idx)
-          : edge.kind === 'state_transition_binding' ? verifyStateTransitionBinding(base, edge, fromHop, toHop, idx, knownCaps)
+          : edge.kind === 'state_transition_binding' ? verifyStateTransitionBinding(base, edge, fromHop, toHop, idx, knownCaps, capIdx)
             : verifyAsyncPivotBinding(base, edge, fromHop, toHop, idx, options.signingKey)
       verifiedEdges.push(res)
       if (!res.verified) return fail('edge_binding', res.reason, verifiedEdges)
     }
     recordHopCapabilities(dag.hopsById.get(hopId)!, idx, knownCaps)
   }
-  const provRes = verifyAttackerProvenance(receipt, dag, idx, options)
+  const provRes = verifyAttackerProvenance(receipt, dag, idx, options, capIdx)
   if (!provRes.ok) return fail('attacker_provenance', provRes.reason, verifiedEdges)
   const replayRes = verifyReplayMode(receipt, dag, idx, options)
   if (!replayRes.ok) return fail('replay_mode', replayRes.reason, verifiedEdges)

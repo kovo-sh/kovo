@@ -122,12 +122,16 @@ test('value_binding: passes on verbatim DerivedCapabilityHandle and rejects spoo
   const cap = 'cap:hop_1:delegated_session'
   const transcript: HostSignedTranscript = {
     entries: [
-      makeEntry('ex-1', makeStep({ id: 'ex-1', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/preview' }), {
+      makeEntry('ex-ctrl', makeStep({ id: 'ex-ctrl', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/admin/export', json: { error: 'forbidden' } }), {
+        timestampMs: 900,
+        actorPersona: 'member_a',
+      }),
+      makeEntry('ex-1', makeStep({ id: 'ex-1', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/preview', json: { preview: 'ok' } }), {
         timestampMs: 1000,
         actorPersona: 'member_a',
         emittedCapabilities: [cap],
       }),
-      makeEntry('ex-2', makeStep({ id: 'ex-2', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/admin/export' }), {
+      makeEntry('ex-2', makeStep({ id: 'ex-2', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/admin/export', json: { tenantId: 'org-b', records: [{ id: 'rec-1', amount: 4200 }] } }), {
         timestampMs: 1500,
         actorPersona: null,
         consumedCapabilities: [cap],
@@ -143,7 +147,7 @@ test('value_binding: passes on verbatim DerivedCapabilityHandle and rejects spoo
       { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN_API, pathAndQuery: '/api/admin/export' }, exchangeIds: ['ex-2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Used delegated handle for export', producedCapabilities: [], consumedCapabilities: [cap] },
     ],
     causalEdges: [{ kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: cap }],
-    terminalImpact: { terminalHopId: 'hop_2', claimedImpact: 'Exported restricted tenant records', preChainControlExchangeIds: [], postChainReadbackExchangeIds: [] },
+    terminalImpact: { terminalHopId: 'hop_2', claimedImpact: 'Exported restricted tenant records', preChainControlExchangeIds: ['ex-ctrl'], postChainReadbackExchangeIds: [] },
     replayMode: 'fresh_clean_replay',
   }
 
@@ -158,8 +162,9 @@ test('value_binding: passes on verbatim DerivedCapabilityHandle and rejects spoo
   // Out-of-order timestamps (t_1 > t_2) MUST reject.
   const outOfOrder: HostSignedTranscript = {
     entries: [
-      { ...transcript.entries![0]!, timestampMs: 2000 },
-      { ...transcript.entries![1]!, timestampMs: 1500 },
+      transcript.entries![0]!,
+      { ...transcript.entries![1]!, timestampMs: 2000 },
+      { ...transcript.entries![2]!, timestampMs: 1500 },
     ],
   }
   const badOrder = verifyCompositeReceipt(receipt, outOfOrder, { attackerPersonas: ['member_a'] })
@@ -170,8 +175,9 @@ test('value_binding: passes on verbatim DerivedCapabilityHandle and rejects spoo
   // Spoofed capability handle not emitted in Hop 1 MUST reject.
   const spoofed: HostSignedTranscript = {
     entries: [
-      { ...transcript.entries![0]!, emittedCapabilities: [] },
-      transcript.entries![1]!,
+      transcript.entries![0]!,
+      { ...transcript.entries![1]!, emittedCapabilities: [] },
+      transcript.entries![2]!,
     ],
   }
   const badSpoof = verifyCompositeReceipt(receipt, spoofed, { attackerPersonas: ['member_a'] })
@@ -184,11 +190,15 @@ test('value_binding: passes on sha256(extractedValue) from response JSON -> Auth
   const digest = sha256Hex(syntheticToken)
   const transcript: HostSignedTranscript = {
     entries: [
-      makeEntry('ex-1', makeStep({ id: 'ex-1', arm: 'probe', method: 'GET', status: 200, json: { issuedToken: syntheticToken } }), {
+      makeEntry('ex-ctrl', makeStep({ id: 'ex-ctrl', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/admin/records', json: { error: 'forbidden' } }), {
+        timestampMs: 1800,
+        actorPersona: 'viewer_a',
+      }),
+      makeEntry('ex-1', makeStep({ id: 'ex-1', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/token/preview', json: { issuedToken: syntheticToken } }), {
         timestampMs: 2000,
         actorPersona: 'viewer_a',
       }),
-      makeEntry('ex-2', makeStep({ id: 'ex-2', arm: 'probe', method: 'GET', status: 200, requestHeaders: { Authorization: `Bearer ${syntheticToken}` } }), {
+      makeEntry('ex-2', makeStep({ id: 'ex-2', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/admin/records', requestHeaders: { Authorization: `Bearer ${syntheticToken}` }, json: { records: [{ id: 'r1', balance: 9900 }] } }), {
         timestampMs: 2500,
         actorPersona: 'viewer_a',
       }),
@@ -198,11 +208,11 @@ test('value_binding: passes on sha256(extractedValue) from response JSON -> Auth
     chainId: 'chain-vb-digest',
     terminalVulnClass: 'bfla',
     hops: [
-      { hopId: 'h1', surface: 'http', target: { origin: ORIGIN_API }, exchangeIds: ['ex-1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Extracted token', producedCapabilities: [], consumedCapabilities: [] },
-      { hopId: 'h2', surface: 'http', target: { origin: ORIGIN_API }, exchangeIds: ['ex-2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Replayed token', producedCapabilities: [], consumedCapabilities: [] },
+      { hopId: 'h1', surface: 'http', target: { origin: ORIGIN_API, pathAndQuery: '/api/token/preview' }, exchangeIds: ['ex-1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Extracted token', producedCapabilities: [], consumedCapabilities: [] },
+      { hopId: 'h2', surface: 'http', target: { origin: ORIGIN_API, pathAndQuery: '/api/admin/records' }, exchangeIds: ['ex-2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Replayed token', producedCapabilities: [], consumedCapabilities: [] },
     ],
     causalEdges: [{ kind: 'value_binding', fromHopId: 'h1', toHopId: 'h2', valueDigest: digest }],
-    terminalImpact: { terminalHopId: 'h2', claimedImpact: 'Escalated access', preChainControlExchangeIds: [], postChainReadbackExchangeIds: [] },
+    terminalImpact: { terminalHopId: 'h2', claimedImpact: 'Escalated access to restricted records', preChainControlExchangeIds: ['ex-ctrl'], postChainReadbackExchangeIds: [] },
     replayMode: 'fresh_clean_replay',
   }
 
@@ -229,12 +239,16 @@ test('derived_crypto_binding: verifies Layer-1 attestation and rejects missing/t
 
   const transcript: HostSignedTranscript = {
     entries: [
-      makeEntry('ex-1', makeStep({ id: 'ex-1', arm: 'probe', method: 'GET', status: 200 }), {
+      makeEntry('ex-ctrl', makeStep({ id: 'ex-ctrl', arm: 'control', method: 'POST', status: 403, pathAndQuery: '/api/settlement/execute', json: { error: 'forbidden' } }), {
+        timestampMs: 900,
+        actorPersona: 'member_a',
+      }),
+      makeEntry('ex-1', makeStep({ id: 'ex-1', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/config/salt', json: { saltRef: 's1' } }), {
         timestampMs: 1000,
         actorPersona: 'member_a',
         emittedCapabilities: [saltCap],
       }),
-      makeEntry('ex-2', makeStep({ id: 'ex-2', arm: 'probe', method: 'POST', status: 200 }), {
+      makeEntry('ex-2', makeStep({ id: 'ex-2', arm: 'probe', method: 'POST', status: 200, pathAndQuery: '/idp/token', json: { token: 'minted' } }), {
         timestampMs: 1400,
         actorPersona: null,
         cryptoAttestations: [
@@ -247,7 +261,7 @@ test('derived_crypto_binding: verifies Layer-1 attestation and rejects missing/t
           },
         ],
       }),
-      makeEntry('ex-3', makeStep({ id: 'ex-3', arm: 'probe', method: 'POST', status: 200 }), {
+      makeEntry('ex-3', makeStep({ id: 'ex-3', arm: 'probe', method: 'POST', status: 200, pathAndQuery: '/api/settlement/execute', json: { settlementId: 'stl-1', amountCents: 25000, status: 'settled' } }), {
         timestampMs: 1800,
         actorPersona: null,
         consumedCapabilities: [mintedJwtCap],
@@ -259,15 +273,15 @@ test('derived_crypto_binding: verifies Layer-1 attestation and rejects missing/t
     chainId: 'chain-crypto-1',
     terminalVulnClass: 'auth_bypass',
     hops: [
-      { hopId: 'h1', surface: 'http', target: { origin: ORIGIN_API }, exchangeIds: ['ex-1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Leaked salt', producedCapabilities: [saltCap], consumedCapabilities: [] },
-      { hopId: 'h2', surface: 'idp', target: { origin: ORIGIN_IDP }, exchangeIds: ['ex-2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Signed JWT via Layer-1', producedCapabilities: [mintedJwtCap], consumedCapabilities: [] },
-      { hopId: 'h3', surface: 'http', target: { origin: ORIGIN_API }, exchangeIds: ['ex-3'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Executed privileged action with derived JWT', producedCapabilities: [], consumedCapabilities: [mintedJwtCap] },
+      { hopId: 'h1', surface: 'http', target: { origin: ORIGIN_API, pathAndQuery: '/api/config/salt' }, exchangeIds: ['ex-1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Leaked salt', producedCapabilities: [saltCap], consumedCapabilities: [] },
+      { hopId: 'h2', surface: 'idp', target: { origin: ORIGIN_IDP, pathAndQuery: '/idp/token' }, exchangeIds: ['ex-2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Signed JWT via Layer-1', producedCapabilities: [mintedJwtCap], consumedCapabilities: [] },
+      { hopId: 'h3', surface: 'http', target: { origin: ORIGIN_API, pathAndQuery: '/api/settlement/execute' }, exchangeIds: ['ex-3'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Executed privileged action with derived JWT', producedCapabilities: [], consumedCapabilities: [mintedJwtCap] },
     ],
     causalEdges: [
       { kind: 'derived_crypto_binding', fromHopId: 'h1', toHopId: 'h2', sourceCapabilityId: saltCap, derivedCapabilityId: mintedJwtCap, alg: 'HS256' },
       { kind: 'value_binding', fromHopId: 'h2', toHopId: 'h3', capabilityHandle: mintedJwtCap },
     ],
-    terminalImpact: { terminalHopId: 'h3', claimedImpact: 'Forged service token accepted', preChainControlExchangeIds: [], postChainReadbackExchangeIds: [] },
+    terminalImpact: { terminalHopId: 'h3', claimedImpact: 'Forged service token accepted', preChainControlExchangeIds: ['ex-ctrl'], postChainReadbackExchangeIds: [] },
     replayMode: 'fresh_clean_replay',
   }
 
@@ -277,7 +291,7 @@ test('derived_crypto_binding: verifies Layer-1 attestation and rejects missing/t
 
   // Missing attestation MUST reject.
   const noAtt: HostSignedTranscript = {
-    entries: [transcript.entries![0]!, { ...transcript.entries![1]!, cryptoAttestations: [] }, transcript.entries![2]!],
+    entries: [transcript.entries![0]!, transcript.entries![1]!, { ...transcript.entries![2]!, cryptoAttestations: [] }, transcript.entries![3]!],
   }
   assert.equal(verifyCompositeReceipt(receipt, noAtt, { attackerPersonas: ['member_a'] }).confirmed, false)
 
@@ -285,11 +299,12 @@ test('derived_crypto_binding: verifies Layer-1 attestation and rejects missing/t
   const badDeriveTs: HostSignedTranscript = {
     entries: [
       transcript.entries![0]!,
+      transcript.entries![1]!,
       {
-        ...transcript.entries![1]!,
-        cryptoAttestations: [{ ...transcript.entries![1]!.cryptoAttestations![0]!, timestampMs: 900 }],
+        ...transcript.entries![2]!,
+        cryptoAttestations: [{ ...transcript.entries![2]!.cryptoAttestations![0]!, timestampMs: 900 }],
       },
-      transcript.entries![2]!,
+      transcript.entries![3]!,
     ],
   }
   const tsRes = verifyCompositeReceipt(receipt, badDeriveTs, { attackerPersonas: ['member_a'] })
@@ -320,7 +335,7 @@ test('state_transition_binding: passes on clean-session 403 ablation and rejects
         actorPersona: 'member_a',
         entityId,
       }),
-      makeEntry('ex-approve', makeStep({ id: 'ex-approve', arm: 'probe', method: 'POST', status: 200, pathAndQuery: `/api/orders/${entityId}/approve` }), {
+      makeEntry('ex-approve', makeStep({ id: 'ex-approve', arm: 'probe', method: 'POST', status: 200, pathAndQuery: `/api/orders/${entityId}/approve`, json: { id: entityId, status: 'approved', amountCents: 5000 } }), {
         timestampMs: 1500,
         actorPersona: 'member_a',
         entityId,
@@ -496,20 +511,21 @@ test('attacker-origin provenance: rejects pre-seeded privileged persona shortcut
     chainId: 'chain-prov-1',
     terminalVulnClass: 'privilege_escalation',
     hops: [
-      { hopId: 'h1', surface: 'http', target: { origin: ORIGIN_API }, exchangeIds: ['ex-1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Obtained token', producedCapabilities: [cap], consumedCapabilities: [] },
-      { hopId: 'h2', surface: 'http', target: { origin: ORIGIN_API }, exchangeIds: ['ex-ctrl', 'ex-2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Read owner vault', producedCapabilities: [], consumedCapabilities: [cap] },
+      { hopId: 'h1', surface: 'http', target: { origin: ORIGIN_API, pathAndQuery: '/api/token/mint' }, exchangeIds: ['ex-1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Obtained token', producedCapabilities: [cap], consumedCapabilities: [] },
+      { hopId: 'h2', surface: 'http', target: { origin: ORIGIN_API, pathAndQuery: '/api/owner/vault' }, exchangeIds: ['ex-ctrl', 'ex-2'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Read owner vault', producedCapabilities: [], consumedCapabilities: [cap] },
     ],
     causalEdges: [{ kind: 'value_binding', fromHopId: 'h1', toHopId: 'h2', capabilityHandle: cap }],
-    terminalImpact: { terminalHopId: 'h2', claimedImpact: 'Escalated to owner vault', preChainControlExchangeIds: [], postChainReadbackExchangeIds: [] },
+    terminalImpact: { terminalHopId: 'h2', claimedImpact: 'Escalated to owner vault', preChainControlExchangeIds: ['ex-pre-ctrl'], postChainReadbackExchangeIds: [] },
     replayMode: 'fresh_clean_replay',
   }
 
   // Case A: Root is member_a, Hop 2 probe uses derived cap (actorPersona: null), owner_a ONLY in control arm -> PASS.
   const legitTranscript: HostSignedTranscript = {
     entries: [
-      makeEntry('ex-1', makeStep({ id: 'ex-1', arm: 'probe', method: 'GET', status: 200 }), { timestampMs: 1000, actorPersona: 'member_a', emittedCapabilities: [cap] }),
-      makeEntry('ex-ctrl', makeStep({ id: 'ex-ctrl', arm: 'control', method: 'GET', status: 200, actor: { handle: 'owner_a', role: 'owner', tenant: 'org-a', auth: 'bearer', sameSite: null } }), { timestampMs: 1100, actorPersona: 'owner_a' }),
-      makeEntry('ex-2', makeStep({ id: 'ex-2', arm: 'probe', method: 'GET', status: 200 }), { timestampMs: 1500, actorPersona: null, consumedCapabilities: [cap] }),
+      makeEntry('ex-pre-ctrl', makeStep({ id: 'ex-pre-ctrl', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/owner/vault', json: { error: 'forbidden' } }), { timestampMs: 900, actorPersona: 'member_a' }),
+      makeEntry('ex-1', makeStep({ id: 'ex-1', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/token/mint', json: { issued: true } }), { timestampMs: 1000, actorPersona: 'member_a', emittedCapabilities: [cap] }),
+      makeEntry('ex-ctrl', makeStep({ id: 'ex-ctrl', arm: 'control', method: 'GET', status: 200, pathAndQuery: '/api/owner/vault', actor: { handle: 'owner_a', role: 'owner', tenant: 'org-a', auth: 'bearer', sameSite: null }, json: { vault: 'owner-secret' } }), { timestampMs: 1100, actorPersona: 'owner_a' }),
+      makeEntry('ex-2', makeStep({ id: 'ex-2', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/api/owner/vault', json: { vault: 'owner-secret', balanceCents: 99000 } }), { timestampMs: 1500, actorPersona: null, consumedCapabilities: [cap] }),
     ],
   }
   const legit = verifyCompositeReceipt(baseReceipt, legitTranscript, {
@@ -521,9 +537,10 @@ test('attacker-origin provenance: rejects pre-seeded privileged persona shortcut
   // Case B: Root starts as pre-seeded owner_a -> HARD REJECT.
   const rootShortcut: HostSignedTranscript = {
     entries: [
-      { ...legitTranscript.entries![0]!, actorPersona: 'owner_a' },
-      legitTranscript.entries![1]!,
+      legitTranscript.entries![0]!,
+      { ...legitTranscript.entries![1]!, actorPersona: 'owner_a' },
       legitTranscript.entries![2]!,
+      legitTranscript.entries![3]!,
     ],
   }
   const rRoot = verifyCompositeReceipt(baseReceipt, rootShortcut, {
@@ -538,7 +555,8 @@ test('attacker-origin provenance: rejects pre-seeded privileged persona shortcut
     entries: [
       legitTranscript.entries![0]!,
       legitTranscript.entries![1]!,
-      { ...legitTranscript.entries![2]!, actorPersona: 'owner_a' },
+      legitTranscript.entries![2]!,
+      { ...legitTranscript.entries![3]!, actorPersona: 'owner_a' },
     ],
   }
   const rTerm = verifyCompositeReceipt(baseReceipt, termShortcut, {
@@ -723,13 +741,22 @@ test('DAG topology & host-signature tamper detection fail closed', () => {
 test('deep 8-hop DAG confirms while 9-hop receipt is rejected by schema', () => {
   const hops: CompositeProofReceipt['hops'] = []
   const edges: CompositeProofReceipt['causalEdges'] = []
-  const entries: HostTranscriptEntry[] = []
+  const entries: HostTranscriptEntry[] = [
+    makeEntry('ex-ctrl', makeStep({ id: 'ex-ctrl', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/api/vault/final', json: { error: 'forbidden' } }), {
+      timestampMs: 900,
+      actorPersona: 'member_a',
+    }),
+  ]
 
   for (let i = 1; i <= 8; i++) {
     const prevCap = i > 1 ? `cap:h${i - 1}:tok` : undefined
     const nextCap = i < 8 ? `cap:h${i}:tok` : undefined
+    const pq = i === 8 ? '/api/vault/final' : `/api/step/${i}`
     entries.push(
-      makeEntry(`ex-${i}`, makeStep({ id: `ex-${i}`, arm: 'probe', method: 'GET', status: 200 }), {
+      makeEntry(`ex-${i}`, makeStep({
+        id: `ex-${i}`, arm: 'probe', method: 'GET', status: 200, pathAndQuery: pq,
+        ...(i === 8 ? { json: { tenantId: 'org-b', records: [{ id: 'rec-8', balanceCents: 12000 }] } } : {}),
+      }), {
         timestampMs: 1000 + i * 100,
         actorPersona: i === 1 ? 'member_a' : null,
         ...(prevCap ? { consumedCapabilities: [prevCap] } : {}),
@@ -739,7 +766,7 @@ test('deep 8-hop DAG confirms while 9-hop receipt is rejected by schema', () => 
     hops.push({
       hopId: `h${i}`,
       surface: 'http',
-      target: { origin: ORIGIN_API },
+      target: { origin: ORIGIN_API, pathAndQuery: pq },
       exchangeIds: [`ex-${i}`],
       oobEventIds: [],
       browserTraceIds: [],
@@ -757,7 +784,7 @@ test('deep 8-hop DAG confirms while 9-hop receipt is rejected by schema', () => 
     terminalVulnClass: 'cross_tenant_read',
     hops,
     causalEdges: edges,
-    terminalImpact: { terminalHopId: 'h8', claimedImpact: '8-hop chain confirmed', preChainControlExchangeIds: [], postChainReadbackExchangeIds: [] },
+    terminalImpact: { terminalHopId: 'h8', claimedImpact: '8-hop chain confirmed', preChainControlExchangeIds: ['ex-ctrl'], postChainReadbackExchangeIds: [] },
     replayMode: 'fresh_clean_replay',
   }
   const ok8 = verifyCompositeReceipt(receipt8, { entries }, { attackerPersonas: ['member_a'] })

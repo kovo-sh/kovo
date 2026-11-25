@@ -9,7 +9,7 @@
  * and boolean impact predicates exclusively from host-recorded transcript records.
  */
 import { createHash } from 'node:crypto'
-import { normalizeRole, parseRoleLabel, stepReadsState } from './oracle-invariants.ts'
+import { normalizeRole, parseRoleLabel, parseRoleMemberships, stepReadsState } from './oracle-invariants.ts'
 import { extractTenantMarkers, isJobOrHandleStub, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
 
 export interface HydratableEntry {
@@ -20,7 +20,7 @@ export interface HydratableEntry {
   emittedCapabilities?: readonly string[]
   observedResponseDigests?: readonly string[]
   consumedCapabilities?: readonly string[]
-  cryptoAttestations?: readonly { derivedFromCapabilityId: string; artifactDigest?: string }[]
+  cryptoAttestations?: readonly { derivedFromCapabilityId: string; derivedCapabilityId?: string; artifactDigest?: string }[]
   entityId?: string
   correlationIds?: readonly string[]
   hostSignature?: string
@@ -97,11 +97,147 @@ const PIVOT_ROLE_SET = new Set(['trigger_write', 'browser_dom_trace', 'admin_bot
 const PIVOT_IMPACT_SET = new Set(['privileged_read', 'privileged_mutation', 'credential_capture', 'internal_secret_exfil', 'privilege_escalation'])
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 
-/** True when an actor persona handle or role represents a privileged pre-seeded identity (`admin`/`owner`). */
-export function isPrivilegedActorOrRole(actor: string | null, role: string | null): boolean {
+/**
+ * True when an actor persona handle or role represents a privileged pre-seeded identity.
+ * Strictly forbids `PRIV_HANDLE_RE` handles (`owner_*`, `admin_*`, ...), `owner` in any tenant,
+ * and single-tenant `admin`. Allows multi-tenant personas whose `actorRoleLabel` memberships hold
+ * a low-privilege role (`member`/`viewer`/`user`/etc.) in at least one distinct non-admin tenant.
+ */
+export function isPrivilegedActorOrRole(
+  actor: string | null,
+  role: string | null,
+  actorRoleLabel?: string | null,
+): boolean {
+  if (actor && PRIV_HANDLE_RE.test(actor.trim())) return true
   const nr = normalizeRole(role ?? undefined)
-  if (nr === 'admin' || nr === 'owner') return true
-  return Boolean(actor && PRIV_HANDLE_RE.test(actor.trim()))
+  if (nr === 'owner') return true
+  const memberships = actorRoleLabel ? parseRoleMemberships(actorRoleLabel) : []
+  if (memberships.some(m => m.role === 'owner')) return true
+  const hasAdmin = nr === 'admin' || memberships.some(m => m.role === 'admin')
+  if (!hasAdmin) return false
+  const adminTenants = new Set(memberships.filter(m => m.role === 'admin' && m.tenant).map(m => m.tenant!))
+  const lowPrivTenants = new Set(
+    memberships
+      .filter(m => (m.role === 'member' || m.role === 'viewer') && m.tenant && !adminTenants.has(m.tenant))
+      .map(m => m.tenant!),
+  )
+  const distinctTenants = new Set(memberships.filter(m => m.tenant).map(m => m.tenant!))
+  return !(distinctTenants.size >= 2 && lowPrivTenants.size >= 1)
+}
+
+const LOGIN_ROUTE_RE = /(?:^|\/)(?:login|signin|sign-in|authenticate)(?:\/|$)/i
+const LOGIN_TENANT_KEYS = new Set([
+  'tenant', 'tenantid', 'tenant_id', 'org', 'orgid', 'org_id',
+  'orgslug', 'org_slug', 'organization', 'organizationid', 'organization_id',
+  'workspace', 'workspaceid', 'workspace_id',
+])
+const LOGIN_EMAIL_KEYS = new Set(['email', 'useremail', 'user_email', 'username'])
+
+function findFirstStringByKeys(val: unknown, keys: ReadonlySet<string>, depth = 0): string | null {
+  if (depth > 3 || val == null || typeof val !== 'object') return null
+  if (Array.isArray(val)) {
+    for (const item of val) {
+      const hit = findFirstStringByKeys(item, keys, depth + 1)
+      if (hit) return hit
+    }
+    return null
+  }
+  for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+    if (typeof v === 'string' && v.trim() && keys.has(k.toLowerCase())) return v.trim().toLowerCase()
+  }
+  for (const v of Object.values(val as Record<string, unknown>)) {
+    if (v && typeof v === 'object') {
+      const hit = findFirstStringByKeys(v, keys, depth + 1)
+      if (hit) return hit
+    }
+  }
+  return null
+}
+
+export interface CapOriginIndex {
+  loginTenantOf(cap: string): string | null
+  loginActorOf(cap: string): { actor: string | null; role: string | null; roleLabel: string | null } | null
+  actorOf(cap: string): string | null
+}
+
+/**
+ * Index host-signed transcript entries by emitted capability handle (`cap:*`) so verifiers can:
+ *  - propagate originating `POST /login` tenant/actor provenance onto `cap:*` sessions;
+ *  - trace derived-capability actor lineage cleanly across hops in `state_transition_binding`.
+ */
+export function buildCapOriginIndex(entries: Iterable<HydratableEntry>, anonActorRe: RegExp): CapOriginIndex {
+  const isHostOp = (e: HydratableEntry): boolean =>
+    e.evidenceRole === 'host_capability_op' || e.evidenceRole === 'host_crypto_op'
+  const isLoginEx = (e: HydratableEntry): boolean => {
+    if (isHostOp(e) || e.step.method.toUpperCase() !== 'POST' || !is2xx(e.step.status)) return false
+    const route = (e.step.route ?? e.step.pathAndQuery ?? '').split('?', 1)[0] ?? ''
+    return LOGIN_ROUTE_RE.test(route)
+  }
+  const emitterByCap = new Map<string, HydratableEntry>()
+  for (const e of entries) {
+    const caps = [
+      ...(e.emittedCapabilities ?? []),
+      ...(e.cryptoAttestations ?? []).map(a => a.derivedCapabilityId).filter((c): c is string => Boolean(c)),
+    ]
+    for (const cap of caps) {
+      const prev = emitterByCap.get(cap)
+      if (!prev || (isHostOp(prev) && !isHostOp(e)) || (!isLoginEx(prev) && isLoginEx(e))) {
+        emitterByCap.set(cap, e)
+      }
+    }
+  }
+
+  const directTenant = (e: HydratableEntry): string | null => {
+    const a = actorOfEntry(e)
+    if (!a || anonActorRe.test(a) || a.startsWith('cap:')) return null
+    return (e.step.actor.tenant ?? parseRoleLabel(e.actorRoleLabel ?? e.actorPersona ?? '').tenant ?? '').trim().toLowerCase() || null
+  }
+
+  const loginTenantOf = (cap: string): string | null => {
+    const e = emitterByCap.get(cap)
+    if (!e || !isLoginEx(e)) return null
+    return directTenant(e)
+      ?? findFirstStringByKeys(e.step.json, LOGIN_TENANT_KEYS)
+      ?? findFirstStringByKeys(e.step.requestJson, LOGIN_TENANT_KEYS)
+      ?? findFirstStringByKeys(e.step.json, LOGIN_EMAIL_KEYS)
+      ?? findFirstStringByKeys(e.step.requestJson, LOGIN_EMAIL_KEYS)
+  }
+
+  const loginActorOf = (cap: string): { actor: string | null; role: string | null; roleLabel: string | null } | null => {
+    const e = emitterByCap.get(cap)
+    if (!e || !isLoginEx(e)) return null
+    const a = actorOfEntry(e)
+    const cleanActor = (!a || anonActorRe.test(a) || a.startsWith('cap:')) ? null : a
+    const r = roleOfEntry(e)
+    return (cleanActor || r || e.actorRoleLabel)
+      ? { actor: cleanActor, role: r, roleLabel: e.actorRoleLabel ?? null }
+      : null
+  }
+
+  const actorOf = (cap: string, visited = new Set<string>()): string | null => {
+    if (visited.has(cap) || visited.size > 8) return null
+    visited.add(cap)
+    const e = emitterByCap.get(cap)
+    if (!e) return null
+    const a = actorOfEntry(e)?.trim().toLowerCase() ?? ''
+    if (a && !anonActorRe.test(a) && !a.startsWith('cap:')) return a
+    const nextCaps = [
+      ...(a.startsWith('cap:') ? [a] : []),
+      ...(e.consumedCapabilities ?? []),
+      ...(e.cryptoAttestations ?? []).map(x => x.derivedFromCapabilityId),
+    ]
+    for (const nc of nextCaps) {
+      const hit = actorOf(nc, visited)
+      if (hit) return hit
+    }
+    if (isLoginEx(e)) {
+      return findFirstStringByKeys(e.step.requestJson, LOGIN_EMAIL_KEYS)
+        ?? findFirstStringByKeys(e.step.json, LOGIN_EMAIL_KEYS)
+    }
+    return null
+  }
+
+  return { loginTenantOf, loginActorOf, actorOf: (cap: string) => actorOf(cap) }
 }
 
 /** True when a hydrated `HostSignedRecord` is an intermediate job/export/handle stub rather than terminal impact. */
@@ -726,7 +862,7 @@ export function hydrateV8OracleInput(
         actorId: aId ?? '',
         role: aRole,
         tenantId: firstEntry.step.actor.tenant ?? null,
-        isPrivilegedPreSeeded: isPrivilegedActorOrRole(aId, aRole),
+        isPrivilegedPreSeeded: isPrivilegedActorOrRole(aId, aRole, firstEntry.actorRoleLabel),
       }
     }
     if (rawInput.terminalImpact && typeof rawInput.terminalImpact === 'object' && !Array.isArray(rawInput.terminalImpact)) {
@@ -922,6 +1058,7 @@ export function selectStateTransitionPair<T extends HydratableEntry>(
     probeTenantOf: (e: T) => string | null
     entryMatchesEntity: (e: T, eid: string) => boolean
     anonActorRe: RegExp
+    resolveCapActor?: (cap: string) => string | null
   },
 ):
   | { ok: true; from: T; to: T; logicalFallback: boolean }
@@ -950,14 +1087,41 @@ export function selectStateTransitionPair<T extends HydratableEntry>(
   if (monoPairs.length === 0) return { ok: false, reason: 'non_monotonic' }
   const normAct = (e: T): string | null => {
     const a = helpers.actorOf(e)?.trim().toLowerCase() ?? ''
-    return (!a || helpers.anonActorRe.test(a)) ? null : a
+    return (!a || helpers.anonActorRe.test(a) || a.startsWith('cap:')) ? null : a
+  }
+  const capsOf = (e: T): string[] => {
+    const a = helpers.actorOf(e)?.trim() ?? ''
+    return [
+      ...(a.startsWith('cap:') ? [a] : []),
+      ...(e.consumedCapabilities ?? []),
+      ...(e.cryptoAttestations ?? []).flatMap(x => [
+        x.derivedFromCapabilityId,
+        ...(x.derivedCapabilityId ? [x.derivedCapabilityId] : []),
+      ]),
+    ]
+  }
+  const lineageActors = (e: T): Set<string> => {
+    const out = new Set<string>()
+    const direct = normAct(e)
+    if (direct) out.add(direct)
+    if (helpers.resolveCapActor) {
+      for (const c of capsOf(e)) {
+        const oa = helpers.resolveCapActor(c)?.trim().toLowerCase()
+        if (oa && !helpers.anonActorRe.test(oa) && !oa.startsWith('cap:')) out.add(oa)
+      }
+    }
+    return out
   }
   const matched = monoPairs.find(({ from: f, to: t }) => {
     const fa = normAct(f), ta = normAct(t)
-    const sameActor = (fa !== null && fa === ta) || (fa === null && ta === null && f.step.actor.auth === t.step.actor.auth)
-    const usesCap = (t.consumedCapabilities ?? []).some(c => dagDerivedCaps.has(c))
-      || (t.cryptoAttestations ?? []).some(x => dagDerivedCaps.has(x.derivedFromCapabilityId))
-    return sameActor || usesCap
+    const fActors = lineageActors(f), tActors = lineageActors(t)
+    const fCaps = capsOf(f), tCaps = capsOf(t), fCapSet = new Set(fCaps)
+    const sameActor = (fActors.size > 0 && tActors.size > 0)
+      ? [...fActors].some(a => tActors.has(a))
+      : (fa === null && ta === null && fActors.size === 0 && tActors.size === 0 && f.step.actor.auth === t.step.actor.auth)
+    const usesCap = tCaps.some(c => dagDerivedCaps.has(c))
+    const sharedCap = tCaps.some(c => fCapSet.has(c)) && (fActors.size === 0 || tActors.size === 0 || sameActor)
+    return sameActor || usesCap || sharedCap
   })
   return matched
     ? { ok: true, from: matched.from, to: matched.to, logicalFallback: true }
