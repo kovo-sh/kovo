@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
 import { importAccessPolicy } from './access-policy.ts'
@@ -52,6 +53,7 @@ import {
   deleteRunWithActiveGuard,
   store,
 } from './server/store.ts'
+import { runDiscoverySubdomainsForRun } from './server/subdomain-discovery.ts'
 import { readWorkerSession, testPersonaAuth } from './server/worker-session-reader.ts'
 
 export const workspaceData = createServerFn({ method: 'GET' }).handler(() => {
@@ -347,7 +349,25 @@ export const runShellData = createServerFn({ method: 'GET' })
   .handler(({ data }) => store().runShellSummary(data.runId))
 
 export const createRun = createServerFn({ method: 'POST' }).validator(newRun)
-  .handler(({ data }) => store().createRun(data))
+  .handler(async ({ data }) => {
+    const db = store()
+    const created = db.createRun(data)
+    try {
+      const run = db.run(created.id)
+      if (run.phase === 'consent' && run.status === 'waiting') {
+        db.command({
+          requestId: randomUUID(),
+          runId: created.id,
+          action: 'discover',
+          consent: true,
+        })
+        await runDiscoverySubdomainsForRun(db, created.id, { timeoutMs: 15_000 })
+      }
+    } catch {
+      // Auto-discovery must never fail run creation; the run still exists and can be reviewed/discovered.
+    }
+    return created
+  })
 
 export const removeRun = createServerFn({ method: 'POST' })
   .validator(z.object({
@@ -360,8 +380,23 @@ export const removeRun = createServerFn({ method: 'POST' })
   })
 
 export const commandRun = createServerFn({ method: 'POST' }).validator(runCommand)
-  .handler(({ data }) => {
-    const result = store().command(data, data.action !== 'message' || modelReady())
+  .handler(async ({ data }) => {
+    const db = store()
+    const shouldDiscoverSubdomains = data.action === 'discover' && data.consent && (() => {
+      try {
+        return db.run(data.runId).phase === 'consent'
+      } catch {
+        return false
+      }
+    })()
+    const result = db.command(data, data.action !== 'message' || modelReady())
+    if (shouldDiscoverSubdomains) {
+      try {
+        await runDiscoverySubdomainsForRun(db, data.runId, { timeoutMs: 15_000 })
+      } catch {
+        // Passive subdomain discovery must never fail the discover command.
+      }
+    }
     execution().wake()
     return result
   })
