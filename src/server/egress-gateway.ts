@@ -27,8 +27,9 @@ import { connect as http2Connect, constants as http2Constants } from 'node:http2
 import type { ClientHttp2Session } from 'node:http2'
 import { connect as netConnect } from 'node:net'
 import type { AddressInfo, Socket as NetSocket } from 'node:net'
-import { connect as tlsConnect } from 'node:tls'
+import { connect as tlsConnect, TLSSocket } from 'node:tls'
 import type { Duplex } from 'node:stream'
+import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib'
 import ipaddr from 'ipaddr.js'
 import { isIpLiteralHost, normalizeHostname } from './public-suffix.ts'
 
@@ -117,6 +118,27 @@ export interface EgressPolicy {
   onDenied?: (event: { url: string; origin: string; code: EgressDenyCode; reason: string }) => void
   /** Optional audit callback invoked before dialing a validated pinned address. */
   onAllow?: (event: { url: string; origin: string; pinnedAddress: string }) => void
+}
+
+export interface EgressRawHttp1Options<TTls = unknown> {
+  method?: string
+  headers?: Record<string, string>
+  body?: string | Buffer
+  maxBodyBytes?: number
+  readBody?: boolean
+  rejectUnauthorized?: boolean
+  signal?: AbortSignal
+  /** Optional hook to extract TLS metadata from the underlying `TLSSocket` before the stream ends. */
+  extractTls?: (socket: TLSSocket, hostname: string) => TTls
+}
+
+export interface EgressRawHttp1Response<TTls = unknown> {
+  status: number
+  headers: IncomingHttpHeaders
+  body: string
+  bodyBytes: number
+  bodyTruncated: boolean
+  tls?: TTls
 }
 
 export interface EgressHttp2Init {
@@ -767,6 +789,148 @@ export async function egressFetch(
   }
 }
 
+/**
+ * Canonical pinned-IP HTTP/1.1 raw transport hook for `RequestBroker` (`defaultTransport`).
+ *
+ * Preserves exact caller header ordering, optional body skipping (`readBody: false` / `HEAD`),
+ * transparent gzip/deflate/br decompression, bounded truncation at `maxBodyBytes`, TLS socket
+ * metadata inspection, and defense-in-depth cloud-metadata/link-local refusal.
+ */
+export async function egressRawHttp1<TTls = unknown>(
+  url: URL,
+  address: { address: string; family?: number },
+  options: EgressRawHttp1Options<TTls> = {},
+): Promise<EgressRawHttp1Response<TTls>> {
+  warnIfEnvProxyEnabled()
+
+  const pinnedIp = stripBracketsAndZone(address.address)
+  if (!pinnedIp || isMetadataOrLinkLocalAddress(pinnedIp)) {
+    throw new EgressDeniedError(
+      'metadata_blocked',
+      `Egress address "${address.address}" is a link-local/cloud-metadata endpoint; never permitted.`,
+    )
+  }
+
+  return await new Promise<EgressRawHttp1Response<TTls>>((resolve, reject) => {
+    const isHttps = url.protocol === 'https:'
+    const port = url.port ? Number(url.port) : (isHttps ? 443 : 80)
+    const method = options.method ?? 'GET'
+    const readBody = options.readBody ?? false
+    const cap = Math.max(1, options.maxBodyBytes ?? DEFAULT_MAX_RESPONSE_BYTES)
+    const headers: Record<string, string> = { ...(options.headers ?? {}) }
+    if (!Object.keys(headers).some(k => k.toLowerCase() === 'host')) {
+      headers.Host = url.host
+    }
+    const hostname = stripBracketsAndZone(url.hostname)
+
+    const onResponse = (res: IncomingMessage) => {
+      const tls = options.extractTls && res.socket instanceof TLSSocket
+        ? options.extractTls(res.socket, hostname)
+        : undefined
+      if (!readBody || method === 'HEAD') {
+        resolve({ status: res.statusCode ?? 0, headers: res.headers, body: '', bodyBytes: 0, bodyTruncated: false, tls })
+        res.destroy()
+        return
+      }
+
+      const rawEncoding = res.headers['content-encoding']
+      const encoding = (Array.isArray(rawEncoding) ? rawEncoding.join(', ') : (rawEncoding ?? '')).toLowerCase().trim()
+      let stream: NodeJS.ReadableStream = res
+      let decompressed = false
+      if (encoding === 'gzip' || encoding === 'x-gzip') {
+        const gunzip = createGunzip()
+        res.pipe(gunzip)
+        stream = gunzip
+        decompressed = true
+      } else if (encoding === 'deflate') {
+        const inflate = createInflate()
+        res.pipe(inflate)
+        stream = inflate
+        decompressed = true
+      } else if (encoding === 'br') {
+        const brotli = createBrotliDecompress()
+        res.pipe(brotli)
+        stream = brotli
+        decompressed = true
+      }
+
+      const chunks: Buffer[] = []
+      let total = 0
+      let truncated = false
+      let finished = false
+      const done = () => {
+        if (finished) return
+        finished = true
+        const responseHeaders: IncomingHttpHeaders = { ...res.headers }
+        if (decompressed) {
+          delete responseHeaders['content-encoding']
+          delete responseHeaders['content-length']
+        }
+        resolve({
+          status: res.statusCode ?? 0,
+          headers: responseHeaders,
+          body: Buffer.concat(chunks).toString('utf8'),
+          bodyBytes: total,
+          bodyTruncated: truncated,
+          tls,
+        })
+      }
+
+      stream.on('data', (chunk: Buffer) => {
+        if (finished) return
+        if (total + chunk.length > cap) {
+          const remaining = cap - total
+          if (remaining > 0) chunks.push(chunk.subarray(0, remaining))
+          total = cap
+          truncated = true
+          res.destroy()
+          done()
+          return
+        }
+        chunks.push(chunk)
+        total += chunk.length
+      })
+      stream.once('end', done)
+      stream.once('close', done)
+      stream.once('error', err => {
+        if (!finished) {
+          if (truncated) done()
+          else reject(err)
+        }
+      })
+    }
+
+    const family = address.family === 4 || address.family === 6 ? address.family : undefined
+    const req = isHttps
+      ? httpsRequest({
+          hostname: pinnedIp,
+          ...(family ? { family } : {}),
+          servername: !isIpLiteralHost(hostname) ? hostname : undefined,
+          port,
+          path: url.pathname + url.search,
+          method,
+          agent: false,
+          rejectUnauthorized: options.rejectUnauthorized ?? true,
+          signal: options.signal,
+          headers,
+        }, onResponse)
+      : httpRequest({
+          hostname: pinnedIp,
+          ...(family ? { family } : {}),
+          port,
+          path: url.pathname + url.search,
+          method,
+          agent: false,
+          signal: options.signal,
+          headers,
+        }, onResponse)
+
+    req.once('error', reject)
+    if (options.body !== undefined) req.write(options.body)
+    req.end()
+  })
+}
+
 // ---------------------------------------------------------------------------
 // 2. Canonical HTTP/2 Outbound Dialer (`egressHttp2`)
 // ---------------------------------------------------------------------------
@@ -785,7 +949,7 @@ export async function egressHttp2(
 
   const method = (init.method ?? 'GET').toUpperCase()
   const validated = await resolveAndValidateHost(urlInput, policy, method)
-  const pinned = validated.addresses[0]!
+  const pinned = validated.addresses.find(a => a.family === 4) ?? validated.addresses[0]!
   policy.onAllow?.({
     url: validated.url.href,
     origin: validated.url.origin,
@@ -815,6 +979,7 @@ export async function egressHttp2(
   }
 
   const started = Date.now()
+  let activeSocket: Duplex | undefined
   const client: ClientHttp2Session = http2Connect(validated.url.origin, {
     createConnection: () => {
       const tcpSocket = netConnect({
@@ -823,13 +988,16 @@ export async function egressHttp2(
         family: pinned.family,
       })
       if (isHttps) {
-        return tlsConnect({
+        const tlsSock = tlsConnect({
           socket: tcpSocket,
           servername: !isIpLiteralHost(validated.hostname) ? validated.hostname : undefined,
           ALPNProtocols: ['h2'],
           rejectUnauthorized,
         })
+        activeSocket = tlsSock
+        return tlsSock
       }
+      activeSocket = tcpSocket
       return tcpSocket
     },
   })
@@ -841,6 +1009,7 @@ export async function egressHttp2(
       const timer = setTimeout(() => {
         const err = new Error(`HTTP/2 egress request timed out after ${timeoutMs}ms.`)
         client.destroy(err)
+        activeSocket?.destroy()
         finish(err)
       }, timeoutMs)
       timer.unref?.()
@@ -857,6 +1026,7 @@ export async function egressHttp2(
       const onAbort = () => {
         const reason = init.signal?.reason instanceof Error ? init.signal.reason : new Error('HTTP/2 egress request aborted.')
         client.destroy(reason)
+        activeSocket?.destroy()
         finish(reason)
       }
       init.signal?.addEventListener('abort', onAbort, { once: true })
@@ -1227,6 +1397,7 @@ export async function createLoopbackProxy(initialPolicy: LoopbackProxyPolicy = {
 
 export const EgressGateway = {
   egressFetch,
+  egressRawHttp1,
   egressHttp2,
   createLoopbackProxy,
   resolveAndValidateHost,
