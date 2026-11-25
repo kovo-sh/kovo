@@ -84,6 +84,12 @@ export function roleRank(role: LabRole | null): number {
   return role ? ROLE_RANK[role] : 0
 }
 
+/** Tenant that owns the dev runner pool; runner credentials act on this tenant only. */
+export const RUNNER_POOL_TENANT: TenantKey = 'org_a'
+
+/** Scope held by pool operator tokens; only they receive artifact frames on the shared stream. */
+export const POOL_STREAM_SCOPE = 'runner:stream'
+
 export function patByToken(state: LabState, token: string): PatRecord | null {
   return state.pats.find((pat) => pat.token === token) ?? null
 }
@@ -128,7 +134,7 @@ export function resolveCaller(state: LabState, req: IncomingMessage): Caller | n
     }
   }
   const env = runnerEnvFor(state, token)
-  if (env) return { kind: 'runner', tenantId: 'org_a', role: null, env }
+  if (env) return { kind: 'runner', tenantId: RUNNER_POOL_TENANT, role: null, env }
   const account = serviceAccountFor(state, token)
   if (account) return { kind: 'service-account', tenantId: account.tenantId, role: 'admin' }
   return null
