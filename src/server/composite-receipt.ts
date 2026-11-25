@@ -267,11 +267,15 @@ function recordHopCapabilities(hop: HopReceipt, idx: IndexedTranscript, target: 
 // --- Four Causal Edge Verifiers ---------------------------------------------
 
 interface HopOutputEvent { sourceId: string; timestampMs: number; capabilities: Set<string>; digests: Set<string> }
-type EdgeBase = { edgeIndex: number; kind: CausalEdgeKind; fromHopId: string; toHopId: string }
-
-const edgeFail = (base: EdgeBase, reason: string): VerifiedEdgeResult => ({ ...base, verified: false, reason })
-const edgeOk = (base: EdgeBase, reason: string, evidence?: Record<string, unknown>): VerifiedEdgeResult =>
-  ({ ...base, verified: true, reason, ...(evidence ? { evidence } : {}) })
+type EdgeBase = { edgeIndex: number; kind: CausalEdgeKind; fromHopId: string; toHopId: string; fromEx?: readonly string[]; toEx?: readonly string[] }
+const EDGE_FIX_HINTS: Record<CausalEdgeKind, string> = {
+  value_binding: 'Interpolate the sealed cap:... handle into the downstream request or pass capability: { handle } so the host attests consumedCapabilities / cryptoAttestations.',
+  derived_crypto_binding: 'Derive via crypto.hmacSign/crypto.jwtSign and interpolate the signature or derived cap:... handle (or pass capability: { handle }) so the host attests consumedCapabilities / cryptoAttestations.',
+  state_transition_binding: 'Pass entityId on both hops and cite a clean-session denied control (replayAttempt: "ablation_control") in ablationExchangeIds.',
+  async_pivot_binding: 'Pass matching correlationId on the trigger and downstream OOB/browser/async.awaitResult exchange in monotonic timestamp order.',
+}
+const edgeFail = ({ fromEx = [], toEx = [], ...pub }: EdgeBase, reason: string): VerifiedEdgeResult => ({ ...pub, verified: false, reason: `Edge #${pub.edgeIndex} (${pub.kind} ${pub.fromHopId}->${pub.toHopId}, from=[${fromEx.join(',') || 'none'}] to=[${toEx.join(',') || 'none'}]): ${reason} Fix: ${EDGE_FIX_HINTS[pub.kind]}` })
+const edgeOk = ({ fromEx: _f, toEx: _t, ...pub }: EdgeBase, reason: string, evidence?: Record<string, unknown>): VerifiedEdgeResult => ({ ...pub, verified: true, reason, ...(evidence ? { evidence } : {}) })
 
 function collectHopOutputs(hop: HopReceipt, idx: IndexedTranscript): HopOutputEvent[] {
   const out: HopOutputEvent[] = []
@@ -703,8 +707,8 @@ export function verifyCompositeReceipt(rawReceipt: unknown, hostTranscript: Host
   const verifiedEdges: VerifiedEdgeResult[] = [], knownCaps = new Set<string>()
   for (const hopId of dag.topoOrder) {
     for (const { edgeIndex, edge } of dag.incomingByHop.get(hopId) ?? []) {
-      const base: EdgeBase = { edgeIndex, kind: edge.kind, fromHopId: edge.fromHopId, toHopId: edge.toHopId }
       const fromHop = dag.hopsById.get(edge.fromHopId)!, toHop = dag.hopsById.get(edge.toHopId)!
+      const base: EdgeBase = { edgeIndex, kind: edge.kind, fromHopId: edge.fromHopId, toHopId: edge.toHopId, fromEx: [...fromHop.exchangeIds, ...fromHop.oobEventIds, ...fromHop.browserTraceIds], toEx: [...toHop.exchangeIds, ...toHop.oobEventIds, ...toHop.browserTraceIds] }
       const res = edge.kind === 'value_binding' ? verifyValueBinding(base, edge, fromHop, toHop, idx)
         : edge.kind === 'derived_crypto_binding' ? verifyDerivedCryptoBinding(base, edge, fromHop, toHop, idx)
           : edge.kind === 'state_transition_binding' ? verifyStateTransitionBinding(base, edge, fromHop, toHop, idx, knownCaps)
