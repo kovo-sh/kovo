@@ -489,7 +489,7 @@ export class Execution {
   private readonly deterministicSweep: DeterministicSweepMode
   private readonly maxDurationMs: number
   private readonly prePhase0SeededSteps = new Map<string, boolean>()
-  private readonly agenticLaneJobs = new Map<string, { controller: AbortController; promise: Promise<void>; key: string; assignmentId: string }>()
+  private readonly agenticLaneJobs = new Map<string, { controller: AbortController; promise: Promise<void>; key: string; assignmentId: string; allowThreatModelPhase?: boolean }>()
   private readonly agenticLaneCompleted = new Set<string>()
   private readonly agenticLaneStopping = new Set<string>()
   private readonly agenticLaneAssignmentIds = new Set<string>()
@@ -885,6 +885,9 @@ export class Execution {
    * an open SQLite transaction (VACUUM INTO), so callers invoke this after their transaction.
    */
   private notifyCheckpoint(runId: string, checkpoint: ExecutionCheckpoint) {
+    // When Phase A deterministic floor is still in flight (e.g. overlapped with code_audit), defer
+    // `post-floor` until `startDeterministicLane` settles so snapshots capture completed floor.
+    if (checkpoint === 'post-floor' && this.agenticLaneJobs.has(runId)) return
     this.traceLifecycle(runId, 'checkpoint', { checkpoint })
     if (!this.onCheckpoint) return
     try {
@@ -1756,7 +1759,8 @@ export class Execution {
     for (const [runId, lane] of this.agenticLaneJobs) {
       try {
         const current = this.storage.run(runId)
-        const active = current.status === 'running' && current.phase === 'investigation'
+        const active = current.status === 'running'
+          && (current.phase === 'investigation' || (Boolean(lane.allowThreatModelPhase) && current.phase === 'threat_model'))
         if (!active) void this.abortAgenticLane(current, 'run left investigation').catch(() => undefined)
       } catch {
         try { lane.controller.abort(new Error('run unavailable')) } catch { /* already aborted */ }
@@ -2052,6 +2056,13 @@ export class Execution {
       codeAuditSettlementMs: auditSettlementMs,
       semanticTimeoutMs, auditMaxTurns,
     })
+
+    // Overlap Phase A: start deterministic floor concurrently with `--network none` code_audit
+    // (0 target HTTP requests, preserving split `floor_settled` accounting). Phase B still waits.
+    if (!controller.signal.aborted) {
+      try { this.ensureRunTrace(run, profiles) } catch { /* tracing is best-effort */ }
+      this.startDeterministicLane(run, profiles, { allowThreatModelPhase: true })
+    }
 
     const { grant, secrets, currentSecrets } = this.buildGrant(job, run, approvedOrigins)
     const session = await this.backend.openSession(claimed.id, controller.signal, { reposDir })
@@ -2415,11 +2426,17 @@ export class Execution {
     }
   }
 
-  private shouldStartDeterministicLane(run: Run, profiles: readonly ResolvedModelProfile[]): boolean {
+  private shouldStartDeterministicLane(
+    run: Run,
+    profiles: readonly ResolvedModelProfile[],
+    options: { allowThreatModelPhase?: boolean } = {},
+  ): boolean {
     if (this.deterministicSweep === 'off') return false
     if (this.deterministicOnly) return false
     if (!profiles.length) return false
-    if (run.status !== 'running' || run.phase !== 'investigation') return false
+    const phaseAllowed = run.phase === 'investigation'
+      || (Boolean(options.allowThreatModelPhase) && run.phase === 'threat_model')
+    if (run.status !== 'running' || !phaseAllowed) return false
     if (run.capabilityTier < 1) return false
     if (this.approvedOriginsSet(run).size === 0) return false
     const key = this.deterministicLaneKey(run)
@@ -2449,15 +2466,21 @@ export class Execution {
    * exact `--no-llm` implementation and deep policy; agents are not dispatched until it settles.
    * Returns true when the floor is (or remains) in flight, so `driveInvestigation` yields to it.
    */
-  private startDeterministicLane(run: Run, profiles: readonly ResolvedModelProfile[]): boolean {
-    if (!this.shouldStartDeterministicLane(run, profiles)) return this.agenticLaneJobs.has(run.id)
+  private startDeterministicLane(
+    run: Run,
+    profiles: readonly ResolvedModelProfile[],
+    options: { allowThreatModelPhase?: boolean } = {},
+  ): boolean {
+    if (!this.shouldStartDeterministicLane(run, profiles, options)) return this.agenticLaneJobs.has(run.id)
     const key = this.deterministicLaneKey(run)
     const controller = new AbortController()
+    const allowThreatModelPhase = Boolean(options.allowThreatModelPhase)
     const holder = {
       controller,
       key,
       assignmentId: '',
       promise: Promise.resolve(),
+      allowThreatModelPhase,
     }
     this.agenticLaneJobs.set(run.id, holder)
     this.laneStartedAt.set(run.id, Date.now())
@@ -2477,6 +2500,7 @@ export class Execution {
     holder.promise = this.runEngineInvestigation(run, {
       signal: controller.signal,
       maxDurationMs: deadlineMs,
+      allowThreatModelPhase,
       onAssignment: id => {
         holder.assignmentId = id
         this.agenticLaneAssignmentIds.add(id)
@@ -2498,6 +2522,12 @@ export class Execution {
         try { this.settleFloorRequestPhase(run.id, controller.signal.aborted ? 'floor_aborted' : 'floor_complete') } catch { /* metrics only */ }
         try { this.recordFloorMetrics(run.id, controller.signal.aborted ? 'floor_aborted' : 'floor_complete') } catch { /* metrics only */ }
         this.laneStartedAt.delete(run.id)
+        try {
+          const latest = this.storage.run(run.id)
+          if (!controller.signal.aborted && latest.status === 'running' && latest.phase === 'investigation') {
+            this.notifyCheckpoint(run.id, 'post-floor')
+          }
+        } catch { /* run may be gone */ }
         try { this.scheduleWake() } catch { /* scheduler stopped */ }
       })
     return true

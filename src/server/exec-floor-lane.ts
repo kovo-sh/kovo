@@ -823,9 +823,13 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
     signal?: AbortSignal
     maxDurationMs?: number
     onAssignment?: (assignmentId: string) => void
+    allowThreatModelPhase?: boolean
   } = {}): Promise<void> {
     const current = this.storage.run(run.id)
-    if (current.status !== 'running' || current.phase !== 'investigation') return
+    if (
+      current.status !== 'running'
+      || (current.phase !== 'investigation' && !(laneOptions.allowThreatModelPhase && current.phase === 'threat_model'))
+    ) return
     const approvedOrigins = this.host.approvedOriginsSet(current)
     if (current.capabilityTier < 1 || approvedOrigins.size === 0) return
     if (laneOptions.signal?.aborted) return
