@@ -400,14 +400,17 @@ test('seedCodeToRuntimeLeads remains usable as a pure helper', async t => {
 // 6. Spec-shape first-try guidance + exact repair feedback
 // ============================================================================
 
-test('kovo_verify guidance carries the required DeclarativeReplaySpec shape', () => {
-  const hint = kovoVerifyPromptHint()
-  assert.ok(hint.includes(KOVO_VERIFY_SPEC_SHAPE))
+test('kovo_verify guidance stays compact and KOVO_VERIFY_SPEC_SHAPE carries the required DeclarativeReplaySpec fields', () => {
   for (const required of ['severityRationale', 'steps[]', 'description', 'request{origin', 'request.persona']) {
-    assert.ok(hint.includes(required), `prompt hint names ${required}`)
+    assert.ok(KOVO_VERIFY_SPEC_SHAPE.includes(required), `KOVO_VERIFY_SPEC_SHAPE names ${required}`)
   }
+  const hint = kovoVerifyPromptHint()
+  assert.ok(hint.includes('kovo_verify:'))
+  assert.ok(hint.includes('prove_composite'))
+  assert.ok(!hint.includes(KOVO_VERIFY_SPEC_SHAPE), 'prompt hint omits DeclarativeReplaySpec shape (pruned to repair turns)')
   const guidance = kovoVerifyHelperGuidance()
-  assert.ok(guidance.includes('severityRationale'))
+  assert.ok(guidance.includes('ctx.prove_composite'))
+  assert.ok(!guidance.includes(KOVO_VERIFY_SPEC_SHAPE), 'helper guidance omits DeclarativeReplaySpec shape (pruned to repair turns)')
   assert.ok(
     Buffer.byteLength(guidance, 'utf8') <= KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
     'helper guidance stays inside its prompt budget',
