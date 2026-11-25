@@ -33,6 +33,8 @@ export interface LocalSessionOptions {
   /** Owner-only data directory that holds `local-session` and the per-start `bootstrap` secret. */
   directory: string
   port: number
+  /** Optional host-mapped external loopback port (e.g. `KOVO_PORT` in Docker Compose). */
+  hostPort?: number
   /** Additional HTTPS origin presented by a deliberately configured local reverse proxy. */
   publicOrigin?: string
   /** TTL for ephemeral device-pairing links in milliseconds (default: 5 minutes). */
@@ -195,11 +197,15 @@ const mime: Record<string, string> = {
   png: 'image/png',
 }
 
-function allowedOrigins(port: number, publicOrigin?: string): Map<string, string> {
+function allowedOrigins(port: number, publicOrigin?: string, hostPort?: number): Map<string, string> {
   const origins = new Map([
     [`127.0.0.1:${port}`, `http://127.0.0.1:${port}`],
     [`localhost:${port}`, `http://localhost:${port}`],
   ])
+  if (hostPort !== undefined && Number.isInteger(hostPort) && hostPort >= 1 && hostPort <= 65535 && hostPort !== port) {
+    origins.set(`127.0.0.1:${hostPort}`, `http://127.0.0.1:${hostPort}`)
+    origins.set(`localhost:${hostPort}`, `http://localhost:${hostPort}`)
+  }
   // A deliberately configured local reverse proxy can present one additional origin.
   if (publicOrigin) {
     const proxy = new URL(publicOrigin)
@@ -211,6 +217,29 @@ function allowedOrigins(port: number, publicOrigin?: string): Map<string, string
   return origins
 }
 
+const allowedListenHosts = new Set(['127.0.0.1', '0.0.0.0', '::1', '::'])
+
+function resolveListenHost(rawHost: string | undefined): string {
+  const host = rawHost?.trim() || '127.0.0.1'
+  if (!allowedListenHosts.has(host)) {
+    throw new Error('KOVO_LISTEN_HOST must be 127.0.0.1, 0.0.0.0, ::1, or ::.')
+  }
+  return host
+}
+
+function parseOptionalPort(rawPort: string | undefined): number | undefined {
+  const trimmed = rawPort?.trim()
+  if (!trimmed) return undefined
+  if (!/^\d{1,5}$/.test(trimmed)) {
+    throw new Error('KOVO_PORT must be a TCP port between 1 and 65535.')
+  }
+  const parsed = Number(trimmed)
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    throw new Error('KOVO_PORT must be a TCP port between 1 and 65535.')
+  }
+  return parsed
+}
+
 /**
  * Build the production local server. Session issuance requires either an existing owner session
  * cookie or a single-use bootstrap secret that is only available to the owner (terminal URL or a
@@ -218,7 +247,7 @@ function allowedOrigins(port: number, publicOrigin?: string): Map<string, string
  */
 export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalServer {
   const { app, directory, port } = options
-  const origins = allowedOrigins(port, options.publicOrigin)
+  const origins = allowedOrigins(port, options.publicOrigin, options.hostPort)
   const pairingTtlMs = options.pairingTtlMs ?? defaultPairingTtlMs
   const now = options.now ?? Date.now
   const runtime = options.runtime
@@ -557,6 +586,8 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
 async function main() {
   const directory = resolve(process.env.KOVO_DATA_DIR ?? '.kovo')
   const port = Number(process.env.PORT ?? 8000)
+  const hostPort = parseOptionalPort(process.env.KOVO_PORT)
+  const listenHost = resolveListenHost(process.env.KOVO_LISTEN_HOST)
   const killSwitchFilePath = join(directory, 'kill-switch.json')
   const runtime = getAppRuntime({
     dataDir: directory,
@@ -579,6 +610,7 @@ async function main() {
     app,
     directory,
     port,
+    ...(hostPort !== undefined ? { hostPort } : {}),
     publicOrigin: process.env.KOVO_PUBLIC_ORIGIN || undefined,
     runtime,
     killSwitch: sharedKillSwitch,
@@ -597,12 +629,13 @@ async function main() {
   process.once('SIGTERM', shutdown)
   process.once('SIGINT', shutdown)
 
-  const origin = process.env.KOVO_PUBLIC_ORIGIN || `http://127.0.0.1:${port}`
-  local.server.listen(port, '127.0.0.1', () => {
+  const externalPort = hostPort ?? port
+  const origin = process.env.KOVO_PUBLIC_ORIGIN || `http://127.0.0.1:${externalPort}`
+  local.server.listen(port, listenHost, () => {
     const bootstrapFile = join(directory, 'bootstrap-url')
-    writeFileSync(bootstrapFile, `${local.bootstrapUrl(`http://127.0.0.1:${port}`)}\n`, { mode: 0o600 })
+    writeFileSync(bootstrapFile, `${local.bootstrapUrl(`http://127.0.0.1:${externalPort}`)}\n`, { mode: 0o600 })
     chmodSync(bootstrapFile, 0o600)
-    console.log(`Kovo Hunter listening on http://127.0.0.1:${port}`)
+    console.log(`Kovo Hunter listening on http://${listenHost}:${port}`)
     console.log(`Open Kovo Hunter with the one-time bootstrap URL: ${local.bootstrapUrl(origin)}`)
   })
 }

@@ -56,6 +56,8 @@ services:
       - "${KOVO_PORT:-8000}:8000"
     environment:
       PORT: "8000"
+      KOVO_PORT: "${KOVO_PORT:-8000}"
+      KOVO_LISTEN_HOST: "0.0.0.0"
       DOCKER_HOST: tcp://docker-proxy:2375
       KOVO_DATA_DIR: /data
       KOVO_WORKER_AUTO_PULL: "1"

@@ -22,6 +22,7 @@ LABEL org.opencontainers.image.source="https://github.com/wwwillchen/guardian" \
 
 ENV NODE_ENV=production \
     PORT=8000 \
+    KOVO_LISTEN_HOST=0.0.0.0 \
     KOVO_DATA_DIR=/data \
     KOVO_WORKER_IMAGE=${KOVO_WORKER_IMAGE} \
     PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
