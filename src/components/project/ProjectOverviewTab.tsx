@@ -14,6 +14,51 @@ function plural(count: number, singular: string, pluralWord = `${singular}s`): s
   return `${count} ${count === 1 ? singular : pluralWord}`
 }
 
+function PersonasSetupSvg({ ready }: { ready: boolean }) {
+  const accent = ready ? 'var(--pw-ok)' : 'var(--pw-accent)'
+  const border = ready ? 'color-mix(in srgb, var(--pw-ok) 35%, var(--pw-line-2))' : 'var(--pw-line-2)'
+  return (
+    <svg width="36" height="26" viewBox="0 0 36 26" fill="none" aria-hidden="true" style={{ display: 'block', marginBottom: 4, color: 'var(--pw-fg)' }}>
+      <rect x="0.75" y="0.75" width="34.5" height="24.5" rx="5.5" fill="var(--pw-sunk)" stroke={border} strokeWidth="1.1" />
+      <circle cx="11.5" cy="9.75" r="2.25" stroke="currentColor" strokeWidth="1.25" />
+      <path d="M7.5 17.75c.5-2.1 2-3.25 4-3.25s3.5 1.15 4 3.25" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
+      <path d="M18 6v14" stroke={accent} strokeWidth="1.2" strokeLinecap="round" strokeDasharray="2 2.2" />
+      <circle cx="24.5" cy="9.75" r="2.25" fill={ready ? accent : 'var(--pw-panel)'} stroke={accent} strokeWidth="1.25" />
+      <path d="M20.5 17.75c.5-2.1 2-3.25 4-3.25s3.5 1.15 4 3.25" stroke={accent} strokeWidth="1.25" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function GithubSetupSvg({ ready }: { ready: boolean }) {
+  const accent = ready ? 'var(--pw-ok)' : 'var(--pw-accent)'
+  const border = ready ? 'color-mix(in srgb, var(--pw-ok) 35%, var(--pw-line-2))' : 'var(--pw-line-2)'
+  return (
+    <svg width="36" height="26" viewBox="0 0 36 26" fill="none" aria-hidden="true" style={{ display: 'block', marginBottom: 4, color: 'var(--pw-fg)' }}>
+      <rect x="0.75" y="0.75" width="34.5" height="24.5" rx="5.5" fill="var(--pw-sunk)" stroke={border} strokeWidth="1.1" />
+      <circle cx="10.5" cy="8.5" r="1.75" fill="var(--pw-panel)" stroke="currentColor" strokeWidth="1.25" />
+      <circle cx="10.5" cy="17.5" r="1.75" fill="var(--pw-panel)" stroke="currentColor" strokeWidth="1.25" />
+      <circle cx="17.5" cy="11" r="1.75" fill={accent} />
+      <path d="M10.5 10.25v5.5" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
+      <path d="M10.5 15.75c0-2.5 7-1.75 7-4.75" stroke={accent} strokeWidth="1.25" strokeLinecap="round" />
+      <rect x="22.5" y="12.25" width="7" height="5.5" rx="1.25" fill="var(--pw-panel)" stroke={accent} strokeWidth="1.25" />
+      <path d="M24.25 12.25V10.5a1.75 1.75 0 0 1 3.5 0v1.75" stroke={accent} strokeWidth="1.25" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function AllowlistSetupSvg({ ready }: { ready: boolean }) {
+  const accent = ready ? 'var(--pw-ok)' : 'var(--pw-accent)'
+  const border = ready ? 'color-mix(in srgb, var(--pw-ok) 35%, var(--pw-line-2))' : 'var(--pw-line-2)'
+  return (
+    <svg width="36" height="26" viewBox="0 0 36 26" fill="none" aria-hidden="true" style={{ display: 'block', marginBottom: 4, color: 'var(--pw-fg)' }}>
+      <rect x="0.75" y="0.75" width="34.5" height="24.5" rx="5.5" fill="var(--pw-sunk)" stroke={border} strokeWidth="1.1" />
+      <path d="M7.5 9.25h9.5M7.5 13h7.5M7.5 16.75h9.5" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
+      <circle cx="24.5" cy="13" r="5" fill="var(--pw-panel)" stroke={accent} strokeWidth="1.3" />
+      <path d="M22.3 13.1 23.8 14.6 26.8 11.4" stroke={accent} strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
 export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
   const { project, assets, personas, specs, runs, githubPatStatus } = data
   const latestRun = runs[0]
@@ -79,6 +124,7 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
           className={personas.length > 0 ? 'ready' : ''}
           onClick={() => onSelectTab('personas')}
         >
+          <PersonasSetupSvg ready={personas.length > 0} />
           <span className="n">{personas.length > 0 ? `${plural(personas.length, 'persona')} ready` : 'Add Personas'}</span>
           <span className="l">
             {personas.length > 0
@@ -88,9 +134,10 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
         </button>
         <button
           type="button"
-          className={specs.length > 0 ? 'ready' : githubPatStatus.configured ? '' : ''}
+          className={specs.length > 0 ? 'ready' : ''}
           onClick={() => onSelectTab('sources')}
         >
+          <GithubSetupSvg ready={specs.length > 0} />
           <span className="n">{specs.length > 0 ? `${plural(specs.length, 'repo snapshot')} synced` : 'Connect GitHub Repos'}</span>
           <span className="l">
             {githubPatStatus.configured
@@ -103,6 +150,7 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
           className={allowlistCount > 0 ? 'ready' : ''}
           onClick={() => onSelectTab('guardrails')}
         >
+          <AllowlistSetupSvg ready={allowlistCount > 0} />
           <span className="n">{allowlistCount > 0 ? `${plural(allowlistCount, 'allowlist rule')}` : 'Configure Write Allowlist'}</span>
           <span className="l">
             {allowlistCount > 0
