@@ -236,6 +236,88 @@
   font-size: 12px;
 }
 
+/* --- Left-rail bottom Local session chip (Linear/Tailscale-style) --- */
+.sh-rail-session {
+  border-top: 1px solid var(--line);
+  padding: 6px 8px;
+  flex: none;
+}
+
+button.sh-session-chip {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 32px;
+  min-height: 32px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--fg-2);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--d1), color var(--d1);
+}
+
+button.sh-session-chip:hover {
+  background: var(--hover);
+  color: var(--fg);
+  box-shadow: none;
+}
+
+button.sh-session-chip[aria-expanded="true"],
+button.sh-session-chip:active {
+  background: var(--press);
+  color: var(--fg);
+}
+
+button.sh-session-chip .ico {
+  color: var(--fg-3);
+  transition: color var(--d1);
+}
+
+button.sh-session-chip:hover .ico,
+button.sh-session-chip[aria-expanded="true"] .ico {
+  color: var(--fg-2);
+}
+
+.sh-session-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sh-session-hint {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--fg-3);
+  flex: none;
+  transition: color var(--d1);
+}
+
+button.sh-session-chip:hover .sh-session-hint {
+  color: var(--fg-2);
+}
+
+.sh-session-chev {
+  color: var(--fg-4);
+  flex: none;
+  transition: color var(--d1), transform var(--d1) var(--ease);
+}
+
+button.sh-session-chip:hover .sh-session-chev {
+  color: var(--fg-3);
+  transform: translateX(1px);
+}
+
 .sh-rail-foot {
   border-top: 1px solid var(--line);
   padding: 8px;
@@ -851,7 +933,482 @@
   .app-shell {
     grid-template-columns: 196px minmax(0, 1fr);
   }
+  .sh-session-hint {
+    display: none;
+  }
   .ghelp-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+/* =====================================================================
+   Devices & Local Session Modal (portaled to document.body, globally
+   styled via shell.css so it works identically from any route).
+   ===================================================================== */
+.dsm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  background: var(--scrim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px 16px;
+  animation: sh-ofade var(--d1) ease-out;
+}
+
+.dsm-overlay svg {
+  display: block;
+  flex: none;
+}
+
+.dsm-overlay .ico {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.dsm-dialog {
+  width: 484px;
+  max-width: 100%;
+  max-height: calc(100vh - 56px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--raise);
+  color: var(--fg);
+  box-shadow: var(--shadow-pop);
+  animation: sh-pop var(--d2) var(--ease);
+  transform-origin: 50% 45%;
+}
+
+.dsm-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 14px 13px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.dsm-header-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--fg-2);
+}
+
+.dsm-header-title h2 {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 20px;
+  letter-spacing: -0.012em;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dsm-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+button.dsm-close {
+  appearance: none;
+  width: 26px;
+  height: 26px;
+  min-width: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--fg-3);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background var(--d1), color var(--d1);
+}
+
+button.dsm-close:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--fg);
+  box-shadow: none;
+}
+
+.dsm-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.dsm-section {
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.dsm-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dsm-section-title {
+  margin: 0 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 18px;
+  color: var(--fg);
+}
+
+.dsm-section-desc {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--fg-2);
+}
+
+.dsm-actions-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dsm-link-card {
+  border: 1px solid var(--line-2);
+  border-radius: 9px;
+  background: var(--sunk);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.dsm-link-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.dsm-link-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg-2);
+}
+
+.dsm-link-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+input.dsm-link-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 30px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--panel);
+  box-shadow: var(--shadow-sm);
+  color: var(--fg);
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1;
+}
+
+input.dsm-link-input.expired {
+  color: var(--fg-3);
+  text-decoration: line-through;
+}
+
+.dsm-link-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.dsm-link-note {
+  font-size: 11.5px;
+  line-height: 16px;
+  color: var(--fg-3);
+  min-width: 0;
+}
+
+/* Status pills */
+.dsm-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 10px;
+  font-size: 11.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  flex: none;
+}
+
+.dsm-pill.num {
+  font-variant-numeric: tabular-nums;
+}
+
+.dsm-pill.ok {
+  color: var(--ok);
+  background: var(--ok-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ok) 32%, transparent);
+}
+
+.dsm-pill.muted {
+  color: var(--fg-2);
+  background: var(--panel);
+  box-shadow: inset 0 0 0 1px var(--line-2);
+}
+
+.dsm-pill.warn {
+  color: var(--warn);
+  background: var(--warn-soft);
+  box-shadow: inset 0 0 0 1px var(--warn-line);
+}
+
+.dsm-pill.bad {
+  color: var(--bad);
+  background: var(--bad-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bad) 32%, transparent);
+}
+
+.dsm-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  display: inline-block;
+}
+
+.dsm-dot.ok {
+  background: var(--ok);
+}
+
+/* Modal buttons (explicit reset over global app.css button rules) */
+button.dsm-btn {
+  appearance: none;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1;
+  color: var(--fg);
+  background: var(--panel);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  flex: none;
+  transition: background var(--d1), color var(--d1), box-shadow var(--d1), filter var(--d1), transform var(--d1) var(--ease);
+}
+
+button.dsm-btn:hover:not(:disabled) {
+  background: var(--sunk);
+}
+
+button.dsm-btn:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+button.dsm-btn:disabled {
+  opacity: 0.48;
+  cursor: default;
+}
+
+button.dsm-btn.sm {
+  height: 24px;
+  padding: 0 7px;
+  font-size: 12px;
+  border-radius: 5px;
+}
+
+button.dsm-btn.ink {
+  background: var(--fg);
+  color: var(--panel);
+  box-shadow: none;
+}
+
+button.dsm-btn.ink:hover:not(:disabled) {
+  background: var(--fg);
+  filter: brightness(1.12);
+}
+
+button.dsm-btn.primary {
+  background: var(--accent);
+  color: var(--accent-fg);
+  box-shadow: none;
+}
+
+button.dsm-btn.primary:hover:not(:disabled) {
+  background: var(--accent);
+  filter: brightness(1.06);
+}
+
+button.dsm-btn.ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ok) 35%, transparent);
+}
+
+button.dsm-btn.ok:hover:not(:disabled) {
+  background: var(--ok-soft);
+}
+
+button.dsm-btn.ghost {
+  background: transparent;
+  box-shadow: none;
+  color: var(--fg-2);
+}
+
+button.dsm-btn.ghost:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--fg);
+  box-shadow: none;
+}
+
+button.dsm-btn.danger {
+  color: var(--bad);
+  background: var(--panel);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bad) 34%, transparent);
+}
+
+button.dsm-btn.danger:hover:not(:disabled) {
+  background: var(--bad-soft);
+}
+
+button.dsm-btn.danger-solid {
+  color: #ffffff;
+  background: var(--bad);
+  box-shadow: none;
+}
+
+button.dsm-btn.danger-solid:hover:not(:disabled) {
+  background: var(--bad);
+  filter: brightness(1.06);
+}
+
+/* Status / error toast inside modal */
+.dsm-toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 9px 11px;
+  border-radius: 7px;
+  font-size: 12px;
+  line-height: 17px;
+}
+
+.dsm-toast .ico {
+  margin-top: 1px;
+}
+
+.dsm-toast.ok {
+  color: var(--ok);
+  background: var(--ok-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ok) 28%, transparent);
+}
+
+.dsm-toast.err {
+  color: var(--bad);
+  background: var(--bad-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bad) 28%, transparent);
+}
+
+/* Session security footer */
+.dsm-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--line);
+  background: var(--sunk);
+  padding: 14px 18px;
+}
+
+.dsm-footer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.dsm-footer-copy {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.dsm-footer-title {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--fg);
+}
+
+.dsm-footer-desc {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 16px;
+  color: var(--fg-3);
+}
+
+.dsm-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bad-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--bad) 26%, transparent);
+}
+
+.dsm-confirm-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--fg);
+}
+
+.dsm-confirm-acts {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+@media (max-width: 520px) {
+  .dsm-footer-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
   }
 }

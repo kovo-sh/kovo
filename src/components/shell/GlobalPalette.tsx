@@ -88,6 +88,7 @@ export function GlobalPalette({
   onClose,
   onOpenNewProject,
   onOpenHelp,
+  onOpenDevices,
   theme,
   toggleTheme,
   data,
@@ -97,6 +98,7 @@ export function GlobalPalette({
   onClose: () => void
   onOpenNewProject: () => void
   onOpenHelp: () => void
+  onOpenDevices?: () => void
   theme: 'light' | 'dark'
   toggleTheme: () => void
   data: ShellWorkspaceData
@@ -174,6 +176,17 @@ export function GlobalPalette({
         keys: ['N'],
         run: onOpenNewProject,
       },
+      ...(onOpenDevices
+        ? [{
+            id: 'act.devices',
+            section: 'Actions' as const,
+            label: 'Devices & local session',
+            sub: 'pair another device phone browser pairing link sign out rotate session',
+            icon: 'lock' as const,
+            right: 'Pair device',
+            run: onOpenDevices,
+          }]
+        : []),
       {
         id: 'act.theme',
         section: 'Actions',
@@ -195,7 +208,7 @@ export function GlobalPalette({
     )
 
     return out
-  }, [data, navigate, onOpenNewProject, onOpenHelp, theme, toggleTheme])
+  }, [data, navigate, onOpenNewProject, onOpenHelp, onOpenDevices, theme, toggleTheme])
 
   const items = useMemo(() => {
     const query = q.trim().toLowerCase()
