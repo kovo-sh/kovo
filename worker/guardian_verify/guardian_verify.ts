@@ -403,7 +403,139 @@ export interface HttpExchange {
   bodySha256: string
   durationMs: number
   personaHandle: string | null
+  consumedCapabilityId?: string | null
+  derivedFromCapabilityIds?: string[]
   protocol?: 'h2'
+}
+
+export interface CapabilityInjectionSpec {
+  handle: string
+  target?: 'bearer' | 'header' | 'cookie' | 'url'
+  headerName?: string
+  cookieName?: string
+  queryParam?: string
+}
+
+export interface SealCapabilityInput {
+  exchangeId?: string
+  exchange?: { exchangeId: string }
+  hopReceiptId?: string
+  hopId?: string
+  slot: string
+  jsonPath?: string
+  header?: string
+  cookie?: string
+  regex?: string
+  value?: string
+  kind?: 'bearer_token' | 'api_token' | 'cookie' | 'signed_url' | 'oidc_assertion' | 'signing_salt' | 'hmac_key' | 'jwt' | 'header_secret' | 'generic_secret'
+  ttlMs?: number | null
+  defaultHeaderName?: string
+  defaultCookieName?: string
+  allowedOrigins?: string[]
+}
+
+export interface SealedCapabilityResult {
+  handle: string
+  meta: Record<string, unknown>
+  exchangeId: string
+  sealExchangeId: string
+  scrubbedPreview: string
+}
+
+export interface HmacSignInput {
+  secretHandle: string
+  payload: string
+  alg?: 'sha256' | 'sha384' | 'sha512'
+  encoding?: 'hex' | 'base64' | 'base64url'
+}
+
+export interface HmacSignResult {
+  exchangeId: string
+  signature: string
+  attestation: {
+    derivedFromCapabilityId: string
+    alg: string
+    encoding: string
+    payloadDigest: string
+    signatureDigest: string
+    sourceSecretDigest: string
+    runId: string
+    timestampMs: number
+  }
+}
+
+export interface JwtSignInput {
+  secretHandle: string
+  claims: Record<string, unknown>
+  alg?: 'HS256' | 'HS384' | 'HS512'
+  header?: Record<string, unknown>
+  hopReceiptId?: string
+  slot?: string
+  ttlMs?: number | null
+  allowedOrigins?: string[]
+}
+
+export interface JwtSignResult {
+  exchangeId: string
+  derivedHandle: string
+  attestation: {
+    derivedFromCapabilityId: string
+    derivedHandle: string
+    alg: string
+    claimsDigest: string
+    tokenDigest: string
+    sourceSecretDigest: string
+    runId: string
+    timestampMs: number
+  }
+}
+
+export interface AsyncMatchPredicate {
+  status?: number | number[]
+  bodyContains?: string
+  bodyMatches?: string
+  jsonPath?: string
+  equals?: unknown
+  in?: unknown[]
+  matches?: string
+  header?: { name: string; equals?: string; matches?: string }
+}
+
+export interface AsyncAwaitInput {
+  pollRequest: HttpTarget | (HttpOptions & { path?: string; url?: string; origin?: string })
+  matchPredicate?: AsyncMatchPredicate
+  profile?: 'fast_lab' | 'wan'
+  timeoutMs?: number
+  intervalMs?: number
+  maxAttempts?: number
+  triggerExchangeId?: string
+  tTriggerMs?: number
+  correlationId?: string
+  correlationIds?: string[]
+  entityId?: string
+}
+
+export interface AsyncAwaitResult {
+  pollRecordId: string
+  converged: boolean
+  status: 'converged' | 'timeout' | 'aborted' | 'max_attempts' | 'monotonic_violation'
+  exchangeId: string | null
+  exchange: HttpExchange | null
+  evidence: Record<string, unknown>
+}
+
+export interface CompositeVerificationResult {
+  confirmed: boolean
+  chainId: string
+  terminalVulnClass: string
+  replayMode: 'fresh_clean_replay' | 'one_shot_transcript'
+  modeBVerified: boolean
+  hopCount: number
+  verifiedEdges: Array<Record<string, unknown>>
+  reason: string
+  failedStage?: string
+  terminalVerification?: Record<string, unknown>
+  evidence?: Record<string, unknown>
 }
 
 export interface BrowserExchange {
@@ -448,6 +580,15 @@ export type HttpTarget =
       role?: 'setup' | 'control' | 'probe' | 'cleanup'
       followRedirects?: boolean
       timeoutMs?: number
+      capability?: string | CapabilityInjectionSpec
+      capabilityTarget?: 'bearer' | 'header' | 'cookie' | 'url'
+      capabilityHeaderName?: string
+      capabilityCookieName?: string
+      capabilityQueryParam?: string
+      entityId?: string
+      correlationIds?: string[]
+      evidenceRole?: string
+      replayAttempt?: 'mode_a' | 'ablation_control' | 'primary'
     }
 
 export interface HttpOptions {
@@ -461,6 +602,16 @@ export interface HttpOptions {
   body?: string | Record<string, unknown> | unknown[]
   followRedirects?: boolean
   timeoutMs?: number
+  /** Layer-1 derived capability handle (or injection spec) injected strictly host-side. */
+  capability?: string | CapabilityInjectionSpec
+  capabilityTarget?: 'bearer' | 'header' | 'cookie' | 'url'
+  capabilityHeaderName?: string
+  capabilityCookieName?: string
+  capabilityQueryParam?: string
+  entityId?: string
+  correlationIds?: string[]
+  evidenceRole?: string
+  replayAttempt?: 'mode_a' | 'ablation_control' | 'primary'
 }
 
 function normalizeBodyAndHeaders(
@@ -491,6 +642,15 @@ function extractInlineHttpOptions(input: unknown): HttpOptions {
   if (typeof rec.role === 'string' && rec.role) out.role = rec.role as HttpOptions['role']
   if (typeof rec.followRedirects === 'boolean') out.followRedirects = rec.followRedirects
   if (typeof rec.timeoutMs === 'number') out.timeoutMs = rec.timeoutMs
+  if (rec.capability !== undefined) out.capability = rec.capability as HttpOptions['capability']
+  if (typeof rec.capabilityTarget === 'string') out.capabilityTarget = rec.capabilityTarget as HttpOptions['capabilityTarget']
+  if (typeof rec.capabilityHeaderName === 'string') out.capabilityHeaderName = rec.capabilityHeaderName
+  if (typeof rec.capabilityCookieName === 'string') out.capabilityCookieName = rec.capabilityCookieName
+  if (typeof rec.capabilityQueryParam === 'string') out.capabilityQueryParam = rec.capabilityQueryParam
+  if (typeof rec.entityId === 'string') out.entityId = rec.entityId
+  if (Array.isArray(rec.correlationIds)) out.correlationIds = rec.correlationIds as string[]
+  if (typeof rec.evidenceRole === 'string') out.evidenceRole = rec.evidenceRole
+  if (typeof rec.replayAttempt === 'string') out.replayAttempt = rec.replayAttempt as HttpOptions['replayAttempt']
   return out
 }
 
@@ -834,23 +994,185 @@ export class VerifyContext {
     this.assert = expectations
   }
 
-  async http(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {
+  private buildHttpRpcArgs(input: HttpTarget, options: HttpOptions = {}): { args: Record<string, unknown>; timeoutMs: number } {
     const target = splitTarget(input, this.defaultOrigin)
     const merged: HttpOptions = { ...extractInlineHttpOptions(input), ...options }
     const { body, headers } = normalizeBodyAndHeaders(merged.body, merged.headers)
     const persona = merged.as ?? merged.persona
-    const result = await rpc('http', {
-      ...(target.origin ? { origin: target.origin } : {}),
-      path: target.path,
-      method: (merged.method ?? 'GET').toUpperCase(),
-      ...(headers ? { headers } : {}),
-      ...(body !== undefined ? { body } : {}),
-      ...(persona ? { persona } : {}),
-      ...(merged.session ? { session: merged.session } : {}),
-      ...(merged.role ? { sessionGroupRole: merged.role } : {}),
-      ...(merged.followRedirects !== undefined ? { followRedirects: merged.followRedirects } : {}),
-    }, (merged.timeoutMs ?? 60_000) + 10_000)
+    return {
+      args: {
+        ...(target.origin ? { origin: target.origin } : {}),
+        path: target.path,
+        method: (merged.method ?? 'GET').toUpperCase(),
+        ...(headers ? { headers } : {}),
+        ...(body !== undefined ? { body } : {}),
+        ...(persona ? { persona } : {}),
+        ...(merged.session ? { session: merged.session } : {}),
+        ...(merged.role ? { sessionGroupRole: merged.role } : {}),
+        ...(merged.followRedirects !== undefined ? { followRedirects: merged.followRedirects } : {}),
+        ...(merged.capability !== undefined ? { capability: merged.capability } : {}),
+        ...(merged.capabilityTarget ? { capabilityTarget: merged.capabilityTarget } : {}),
+        ...(merged.capabilityHeaderName ? { capabilityHeaderName: merged.capabilityHeaderName } : {}),
+        ...(merged.capabilityCookieName ? { capabilityCookieName: merged.capabilityCookieName } : {}),
+        ...(merged.capabilityQueryParam ? { capabilityQueryParam: merged.capabilityQueryParam } : {}),
+        ...(merged.entityId ? { entityId: merged.entityId } : {}),
+        ...(merged.correlationIds?.length ? { correlationIds: merged.correlationIds } : {}),
+        ...(merged.evidenceRole ? { evidenceRole: merged.evidenceRole } : {}),
+        ...(merged.replayAttempt ? { replayAttempt: merged.replayAttempt } : {}),
+      },
+      timeoutMs: (merged.timeoutMs ?? 60_000) + 10_000,
+    }
+  }
+
+  async http(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {
+    const { args, timeoutMs } = this.buildHttpRpcArgs(input, options)
+    const result = await rpc('http', args, timeoutMs)
     return result as HttpExchange
+  }
+
+  async httpSend(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {
+    const { args, timeoutMs } = this.buildHttpRpcArgs(input, options)
+    const result = await rpc('http.send', args, timeoutMs)
+    return result as HttpExchange
+  }
+
+  http_send(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {
+    return this.httpSend(input, options)
+  }
+
+  request(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {
+    return this.httpSend(input, options)
+  }
+
+  async sealCapability(input: SealCapabilityInput): Promise<SealedCapabilityResult> {
+    const exchangeId = input.exchangeId ?? input.exchange?.exchangeId
+    if (!exchangeId) throw new Error('sealCapability requires exchangeId or exchange.')
+    const result = await rpc('capability.seal', {
+      exchangeId,
+      slot: input.slot,
+      ...(input.hopReceiptId ? { hopReceiptId: input.hopReceiptId } : {}),
+      ...(input.hopId ? { hopId: input.hopId } : {}),
+      ...(input.jsonPath ? { jsonPath: input.jsonPath } : {}),
+      ...(input.header ? { header: input.header } : {}),
+      ...(input.cookie ? { cookie: input.cookie } : {}),
+      ...(input.regex ? { regex: input.regex } : {}),
+      ...(input.value !== undefined ? { value: input.value } : {}),
+      ...(input.kind ? { kind: input.kind } : {}),
+      ...(input.ttlMs !== undefined ? { ttlMs: input.ttlMs } : {}),
+      ...(input.defaultHeaderName ? { defaultHeaderName: input.defaultHeaderName } : {}),
+      ...(input.defaultCookieName ? { defaultCookieName: input.defaultCookieName } : {}),
+      ...(input.allowedOrigins?.length ? { allowedOrigins: input.allowedOrigins } : {}),
+    }, 30_000)
+    return result as SealedCapabilityResult
+  }
+
+  seal_capability(input: SealCapabilityInput | Record<string, unknown>): Promise<SealedCapabilityResult> {
+    const raw = input as Record<string, unknown>
+    return this.sealCapability({
+      ...(raw as unknown as SealCapabilityInput),
+      ...((raw.exchangeId ?? raw.exchange_id) ? { exchangeId: String(raw.exchangeId ?? raw.exchange_id) } : {}),
+      ...((raw.hopReceiptId ?? raw.hop_receipt_id) ? { hopReceiptId: String(raw.hopReceiptId ?? raw.hop_receipt_id) } : {}),
+      ...((raw.hopId ?? raw.hop_id) ? { hopId: String(raw.hopId ?? raw.hop_id) } : {}),
+      ...((raw.jsonPath ?? raw.json_path) ? { jsonPath: String(raw.jsonPath ?? raw.json_path) } : {}),
+      ...((raw.ttlMs ?? raw.ttl_ms) !== undefined ? { ttlMs: (raw.ttlMs ?? raw.ttl_ms) as number | null } : {}),
+      ...((raw.defaultHeaderName ?? raw.default_header_name) ? { defaultHeaderName: String(raw.defaultHeaderName ?? raw.default_header_name) } : {}),
+      ...((raw.defaultCookieName ?? raw.default_cookie_name) ? { defaultCookieName: String(raw.defaultCookieName ?? raw.default_cookie_name) } : {}),
+      ...((raw.allowedOrigins ?? raw.allowed_origins) ? { allowedOrigins: (raw.allowedOrigins ?? raw.allowed_origins) as string[] } : {}),
+    })
+  }
+
+  async hmacSign(input: HmacSignInput): Promise<HmacSignResult> {
+    const result = await rpc('crypto.hmacSign', {
+      secretHandle: input.secretHandle,
+      payload: input.payload,
+      ...(input.alg ? { alg: input.alg } : {}),
+      ...(input.encoding ? { encoding: input.encoding } : {}),
+    }, 30_000)
+    return result as HmacSignResult
+  }
+
+  hmac_sign(input: HmacSignInput | Record<string, unknown>): Promise<HmacSignResult> {
+    const raw = input as Record<string, unknown>
+    return this.hmacSign({
+      secretHandle: String(raw.secretHandle ?? raw.secret_handle ?? ''),
+      payload: String(raw.payload ?? ''),
+      ...(raw.alg ? { alg: raw.alg as HmacSignInput['alg'] } : {}),
+      ...(raw.encoding ? { encoding: raw.encoding as HmacSignInput['encoding'] } : {}),
+    })
+  }
+
+  async jwtSign(input: JwtSignInput): Promise<JwtSignResult> {
+    const result = await rpc('crypto.jwtSign', {
+      secretHandle: input.secretHandle,
+      claims: input.claims,
+      ...(input.alg ? { alg: input.alg } : {}),
+      ...(input.header ? { header: input.header } : {}),
+      ...(input.hopReceiptId ? { hopReceiptId: input.hopReceiptId } : {}),
+      ...(input.slot ? { slot: input.slot } : {}),
+      ...(input.ttlMs !== undefined ? { ttlMs: input.ttlMs } : {}),
+      ...(input.allowedOrigins?.length ? { allowedOrigins: input.allowedOrigins } : {}),
+    }, 30_000)
+    return result as JwtSignResult
+  }
+
+  jwt_sign(input: JwtSignInput | Record<string, unknown>): Promise<JwtSignResult> {
+    const raw = input as Record<string, unknown>
+    return this.jwtSign({
+      secretHandle: String(raw.secretHandle ?? raw.secret_handle ?? ''),
+      claims: (raw.claims ?? {}) as Record<string, unknown>,
+      ...(raw.alg ? { alg: raw.alg as JwtSignInput['alg'] } : {}),
+      ...(raw.header ? { header: raw.header as Record<string, unknown> } : {}),
+      ...((raw.hopReceiptId ?? raw.hop_receipt_id) ? { hopReceiptId: String(raw.hopReceiptId ?? raw.hop_receipt_id) } : {}),
+      ...(raw.slot ? { slot: String(raw.slot) } : {}),
+      ...((raw.ttlMs ?? raw.ttl_ms) !== undefined ? { ttlMs: (raw.ttlMs ?? raw.ttl_ms) as number | null } : {}),
+      ...((raw.allowedOrigins ?? raw.allowed_origins) ? { allowedOrigins: (raw.allowedOrigins ?? raw.allowed_origins) as string[] } : {}),
+    })
+  }
+
+  async awaitAsync(input: AsyncAwaitInput): Promise<AsyncAwaitResult> {
+    const { args: pollRequest } = this.buildHttpRpcArgs(input.pollRequest as HttpTarget)
+    const rpcTimeoutMs = Math.max((input.timeoutMs ?? 30_000) + 10_000, 15_000)
+    const result = await rpc('async.awaitResult', {
+      pollRequest,
+      ...(input.matchPredicate ? { matchPredicate: input.matchPredicate } : {}),
+      ...(input.profile ? { profile: input.profile } : {}),
+      ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+      ...(input.intervalMs !== undefined ? { intervalMs: input.intervalMs } : {}),
+      ...(input.maxAttempts !== undefined ? { maxAttempts: input.maxAttempts } : {}),
+      ...(input.triggerExchangeId ? { triggerExchangeId: input.triggerExchangeId } : {}),
+      ...(input.tTriggerMs !== undefined ? { tTriggerMs: input.tTriggerMs } : {}),
+      ...(input.correlationId ? { correlationId: input.correlationId } : {}),
+      ...(input.correlationIds?.length ? { correlationIds: input.correlationIds } : {}),
+      ...(input.entityId ? { entityId: input.entityId } : {}),
+    }, rpcTimeoutMs)
+    return result as AsyncAwaitResult
+  }
+
+  await_async(input: AsyncAwaitInput | Record<string, unknown>): Promise<AsyncAwaitResult> {
+    const raw = input as Record<string, unknown>
+    return this.awaitAsync({
+      pollRequest: (raw.pollRequest ?? raw.poll_request ?? raw.request) as AsyncAwaitInput['pollRequest'],
+      ...((raw.matchPredicate ?? raw.match_predicate ?? raw.match) ? { matchPredicate: (raw.matchPredicate ?? raw.match_predicate ?? raw.match) as AsyncMatchPredicate } : {}),
+      ...(raw.profile ? { profile: raw.profile as AsyncAwaitInput['profile'] } : {}),
+      ...((raw.timeoutMs ?? raw.timeout_ms) !== undefined ? { timeoutMs: Number(raw.timeoutMs ?? raw.timeout_ms) } : {}),
+      ...((raw.intervalMs ?? raw.interval_ms) !== undefined ? { intervalMs: Number(raw.intervalMs ?? raw.interval_ms) } : {}),
+      ...((raw.maxAttempts ?? raw.max_attempts) !== undefined ? { maxAttempts: Number(raw.maxAttempts ?? raw.max_attempts) } : {}),
+      ...((raw.triggerExchangeId ?? raw.trigger_exchange_id) ? { triggerExchangeId: String(raw.triggerExchangeId ?? raw.trigger_exchange_id) } : {}),
+      ...((raw.tTriggerMs ?? raw.t_trigger_ms) !== undefined ? { tTriggerMs: Number(raw.tTriggerMs ?? raw.t_trigger_ms) } : {}),
+      ...((raw.correlationId ?? raw.correlation_id) ? { correlationId: String(raw.correlationId ?? raw.correlation_id) } : {}),
+      ...((raw.correlationIds ?? raw.correlation_ids) ? { correlationIds: (raw.correlationIds ?? raw.correlation_ids) as string[] } : {}),
+      ...((raw.entityId ?? raw.entity_id) ? { entityId: String(raw.entityId ?? raw.entity_id) } : {}),
+    })
+  }
+
+  async proveComposite(receipt: Record<string, unknown>): Promise<CompositeVerificationResult> {
+    const payload = receipt && typeof receipt === 'object' && 'receipt' in receipt ? receipt : { receipt }
+    const result = await rpc('composite.verify', payload as Record<string, unknown>, 30_000)
+    return result as CompositeVerificationResult
+  }
+
+  prove_composite(receipt: Record<string, unknown>): Promise<CompositeVerificationResult> {
+    return this.proveComposite(receipt)
   }
 
   async http2(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {

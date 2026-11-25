@@ -2761,3 +2761,46 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
   }
 }
 
+// ---------------------------------------------------------------------------
+// v8 Extended Oracle Invariant Families (unified re-exports)
+// ---------------------------------------------------------------------------
+
+export {
+  evaluateV8OracleFamily,
+  evaluateDualTenantAbac,
+  evaluateTemporalRevocation,
+  evaluateEconomicConservation,
+  evaluateCryptographicScopeReplay,
+  evaluateParserCacheDifferential,
+  evaluateCrossSurfacePivot,
+  resolveTenantRole,
+  hasTenantRoleAtLeast,
+} from './v8-oracle-families.ts'
+export type {
+  V8OracleFamily,
+  V8SurfaceKind,
+  CausalBindingKind,
+  SignatureVerifier,
+  HostSignedRecord,
+  V8OracleDecision,
+  DualTenantActor,
+  DualTenantCrossOrgTransferInput,
+  DualTenantCacheBleedInput,
+  DualTenantBatchPartialAuthzInput,
+  DualTenantAbacInput,
+  TemporalRevocationInput,
+  OverRefundInput,
+  BalanceMintingInput,
+  UnderpaidFulfillmentInput,
+  IneligibleDiscountInput,
+  EconomicConservationInput,
+  CryptographicScopeReplayInput,
+  ParserDifferentialInput,
+  CachePrimedDifferentialInput,
+  ParserCacheDifferentialInput,
+  CrossSurfaceHopRole,
+  CrossSurfaceHop,
+  CrossSurfacePivotInput,
+  V8OracleInputMap,
+} from './v8-oracle-families.ts'
+
