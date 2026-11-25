@@ -395,7 +395,7 @@ test('1. Two composite confirmations on parameterized redacted vs concrete ID ro
   assert.equal(canonicalRow.fingerprintHash, expectedFp.hash, 'findings.fingerprint_hash column must be populated')
   assert.equal(canonicalRow.finding.fingerprintHash, expectedFp.hash, 'finding.fingerprintHash JSON field must be populated')
   assert.equal(canonicalRow.finding.status, 'confirmed')
-  assert.equal(canonicalRow.finding.severity, 'critical', 'higher severity from corroborating proof must be preserved')
+  assert.equal(canonicalRow.finding.severity, 'high', 'H-18: confirmed finding severity must stay frozen to canonical confirming receipt')
   assert.equal(canonicalRow.finding.evidenceIds.length, 2, 'both workers artifacts must be preserved in evidenceIds')
   assert.ok(canonicalRow.finding.exchangeIds?.includes('ex-a-probe'), 'original exchangeIds must be preserved')
   assert.ok(canonicalRow.finding.exchangeIds?.includes('ex-b-probe'), 'corroborating exchangeIds must be merged')

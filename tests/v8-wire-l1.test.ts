@@ -306,8 +306,8 @@ test('End-to-end loopback VerifyRpcServer: Hop 1 seal -> Hop 2 hmacSign + jwtSig
   assert.equal(sealed.handle, 'cap:hop_1:salt')
   assert.equal(sealed.scrubbedPreview.includes(RAW_SIGNING_SALT), false, 'raw salt must be scrubbed from preview')
   assert.equal(JSON.stringify(sealed).includes(RAW_SIGNING_SALT), false, 'raw salt must never appear in seal response')
-  assert.equal((rpcServer.transcript.body(hop1Ex.exchangeId) ?? '').includes(RAW_SIGNING_SALT), false, 'transcript body must be retroactively scrubbed')
-  assert.equal(rpcServer.transcript.verifySignatures(), true, 'transcript signatures must remain valid after rescrubbing')
+  assert.equal((rpcServer.transcript.body(hop1Ex.exchangeId) ?? '').includes(RAW_SIGNING_SALT), true, 'H-9: kernel TranscriptStore retains unmodified host truth')
+  assert.equal(rpcServer.transcript.verifySignatures(), true, 'transcript signatures must remain valid after capability seal')
 
   // Transcript RPC readback must also have the raw salt scrubbed
   const txGet = await call('transcript', { action: 'get', exchangeId: hop1Ex.exchangeId })
@@ -781,6 +781,8 @@ import assert from 'node:assert/strict'
 import { VerifyContext } from ${JSON.stringify(join(SDK_DIR, 'kovo_verify.ts'))}
 
 const ctx = new VerifyContext()
+const c0 = await ctx.http_send('/api/vault/export', { as: 'member_b', role: 'control' })
+assert.equal(c0.status, 403)
 const h1 = await ctx.http_send('/api/debug/runtime-meta', { as: 'member_b', role: 'probe' })
 const sealed = await ctx.seal_capability({ exchange: h1, hopReceiptId: 'ts1', slot: 'salt', jsonPath: '$.signing_salt', kind: 'signing_salt' })
 assert.equal(sealed.handle, 'cap:hop_ts1:salt')
@@ -815,7 +817,7 @@ const verdict = await ctx.prove_composite({
     { kind: 'derived_crypto_binding', fromHopId: 'hop_1', toHopId: 'hop_2', sourceCapabilityId: sealed.handle, alg: 'sha256' },
     { kind: 'value_binding', fromHopId: 'hop_2', toHopId: 'hop_3', capabilityHandle: jwt.derivedHandle },
   ],
-  terminalImpact: { terminalHopId: 'hop_3', claimedImpact: 'TS SDK composite confirmed.' },
+  terminalImpact: { terminalHopId: 'hop_3', preChainControlExchangeIds: [c0.exchangeId], claimedImpact: 'TS SDK composite confirmed.' },
 })
 assert.equal(verdict.confirmed, true, verdict.reason)
 console.log('TS_SDK_OK')

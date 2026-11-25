@@ -15,7 +15,7 @@
 import { createHmac } from 'node:crypto'
 import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
-import { HostFactLog } from './host-fact-log.ts'
+import { HostFactLog, type HostExchangeFact } from './host-fact-log.ts'
 import {
   assessBooleanDifferential,
   assessImpactEvidence,
@@ -24,7 +24,6 @@ import {
   hasForeignTenantOrOwnerDisclosure,
   isObjectScopedRequest,
   knownOracleEvent,
-  routeFamily,
   stepMutatesState,
 } from './oracle-invariants.ts'
 import type { BooleanDifferentialArm, BooleanDifferentialRound, ImpactClass, ImpactInput, ImpactStep, RoleName } from './oracle-invariants.ts'
@@ -1758,8 +1757,7 @@ export function buildAgentScriptReceipt(input: {
   evidenceRoleOverrides?: Map<string, string>
 } | null {
   const factLog = input.factLog ?? HostFactLog.fromScriptExchanges(input.exchanges, input.oobEvents)
-  const byId = new Map(input.exchanges.map(exchange => [exchange.exchangeId, exchange]))
-  const hasExchange = (id: string): boolean => Boolean(factLog.getExchange(id) || byId.has(id))
+  const hasExchange = (id: string): boolean => Boolean(factLog.getExchange(id))
   const sortByHostOrder = (ids: readonly string[]): string[] =>
     factLog.orderedExchanges(ids).map(fact => fact.exchangeId)
   const buildTranscript = (
@@ -1789,15 +1787,13 @@ export function buildAgentScriptReceipt(input: {
     if (!vulnClass) continue
     const probeId = recordField(claim, 'probeExchangeId')
     if (typeof probeId !== 'string') continue
-    const probe = byId.get(probeId)
+    const probe = factLog.getExchange(probeId)
     if (!probe) continue
     const controlIds = cited(stringArray(recordField(claim, 'controlExchangeIds')))
-    const beforeId = typeof recordField(claim, 'beforeExchangeId') === 'string' && byId.has(recordField(claim, 'beforeExchangeId') as string)
-      ? recordField(claim, 'beforeExchangeId') as string
-      : null
-    const afterId = typeof recordField(claim, 'afterExchangeId') === 'string' && byId.has(recordField(claim, 'afterExchangeId') as string)
-      ? recordField(claim, 'afterExchangeId') as string
-      : null
+    const rawBeforeId = recordField(claim, 'beforeExchangeId')
+    const beforeId = typeof rawBeforeId === 'string' && hasExchange(rawBeforeId) ? rawBeforeId : null
+    const rawAfterId = recordField(claim, 'afterExchangeId')
+    const afterId = typeof rawAfterId === 'string' && hasExchange(rawAfterId) ? rawAfterId : null
     // Deduplicate and preserve host-transcript chronological order so pre/post mutation readbacks
     // stay strictly before/after the mutating probe in `findPersistence()`.
     const exchangeIds = sortByHostOrder([
@@ -1814,7 +1810,7 @@ export function buildAgentScriptReceipt(input: {
     armOverrides.set(probeId, 'probe')
     // H-13: Never trust script-declared `requestBody`, `ambient`, `sameSite`, or `oracleEvents`.
     // Request bodies, ambient auth kind, SameSite, and host-observed oracle events are derived
-    // strictly from host-recorded TranscriptStore exchanges and headers.
+    // strictly from HostFactLog exchanges and headers.
     const transcript = buildTranscript(armOverrides)
     const hostOracleEvents: string[] = []
     if (impactClass === 'csrf' && beforeId && afterId) {
@@ -1862,8 +1858,8 @@ export function buildAgentScriptReceipt(input: {
     const controlId = recordField(claim, 'controlExchangeId')
     const probeId = recordField(claim, 'probeExchangeId')
     if (typeof controlId !== 'string' || typeof probeId !== 'string') continue
-    const control = byId.get(controlId)
-    const probe = byId.get(probeId)
+    const control = factLog.getExchange(controlId)
+    const probe = factLog.getExchange(probeId)
     if (!control || !probe) continue
     const rawVuln = typeof recordField(claim, 'vulnClass') === 'string'
       ? (recordField(claim, 'vulnClass') as string).trim().toLowerCase()
@@ -1871,14 +1867,14 @@ export function buildAgentScriptReceipt(input: {
     // H-14: A probe carrying a persona, sealed capability, session jar, or cookie that the control
     // lacked cannot auto-classify as an unauthenticated auth_bypass.
     const probeHasHostCredential = Boolean(
-      normalizedAuthHandle(probe.personaHandle) ||
+      normalizedAuthHandle(probe.actor) ||
       probe.consumedCapabilityId ||
       (probe.consumedCapabilities && probe.consumedCapabilities.length > 0) ||
       (probe.sessionId && probe.sessionId !== control.sessionId) ||
       (headerValue(probe.requestHeaders, 'cookie') && headerValue(probe.requestHeaders, 'cookie') !== headerValue(control.requestHeaders, 'cookie')),
     )
     const isAuthBypass = AUTH_BYPASS_CLASS_RE.test(rawVuln) ||
-      (boundaryClass === 'auth' && !rawVuln && !normalizedAuthHandle(control.personaHandle) && !probeHasHostCredential)
+      (boundaryClass === 'auth' && !rawVuln && !normalizedAuthHandle(control.actor) && !probeHasHostCredential)
     const probeMethod = probe.method.toUpperCase()
     // Mutating BOLA/BFLA boundary claims require persisted before/after readbacks (`impact` claim);
     // only non-mutating read boundaries map directly onto `bola`/`bfla`. Auth bypass / forged-token
@@ -1936,7 +1932,7 @@ export function buildAgentScriptReceipt(input: {
     if (recordField(present, 'absent') === true) continue
     const marker = recordField(present, 'text') as string
     const probeId = recordField(present, 'exchangeId') as string
-    const probe = byId.get(probeId)
+    const probe = factLog.getExchange(probeId)
     if (!probe) continue
     const absent = bodyClaims.find(c =>
       recordField(c, 'absent') === true &&
@@ -2001,7 +1997,7 @@ export function buildAgentScriptReceipt(input: {
       if (!controlEntry || !probeEntry) continue
       const param = deriveDifferingParam(controlEntry, probeEntry)
       if (!param) continue
-      const variantExchange = byId.get(variants[0]!)
+      const variantExchange = factLog.getExchange(variants[0]!)
       return {
         receipt: buildProofReceipt({
           vulnClass: 'sqli',
@@ -2027,21 +2023,21 @@ export function buildAgentScriptReceipt(input: {
       if (controls.length < 5 || variants.length < 5) continue
       const controlSet = new Set(controls)
       if (variants.some(id => controlSet.has(id))) continue
-      const probe = byId.get(variants[0]!)
-      const baseline = byId.get(controls[0]!)
+      const probe = factLog.getExchange(variants[0]!)
+      const baseline = factLog.getExchange(controls[0]!)
       if (!probe || !baseline) continue
       // H-15: Every control and variant exchange MUST target the exact same normalized origin,
       // HTTP method, route path, and persona.
       const baseOrigin = normalizeOrigin(baseline.origin || input.origin)
       const baseMethod = baseline.method.toUpperCase()
       const baseRoute = normalizePath(baseline.pathAndQuery)
-      const basePersona = (baseline.personaHandle ?? '').trim().toLowerCase()
+      const basePersona = (baseline.actor ?? '').trim().toLowerCase()
       const allConsistent = [...controls, ...variants].every(id => {
-        const ex = byId.get(id)!
+        const ex = factLog.getExchange(id)!
         return normalizeOrigin(ex.origin || input.origin) === baseOrigin
           && ex.method.toUpperCase() === baseMethod
           && normalizePath(ex.pathAndQuery) === baseRoute
-          && (ex.personaHandle ?? '').trim().toLowerCase() === basePersona
+          && (ex.actor ?? '').trim().toLowerCase() === basePersona
       })
       if (!allConsistent) continue
       const armOverrides = new Map<string, ImpactStep['arm']>()
@@ -2072,15 +2068,15 @@ export function buildAgentScriptReceipt(input: {
     }
     if (kind === 'conserved_balance' || kind === 'race') {
       const rawBaseline = recordField(claim, 'baselineExchangeId') ?? recordField(claim, 'beforeExchangeId')
-      const baselineId = typeof rawBaseline === 'string' && byId.has(rawBaseline) ? rawBaseline : null
+      const baselineId = typeof rawBaseline === 'string' && hasExchange(rawBaseline) ? rawBaseline : null
       const rawPost = recordField(claim, 'postExchangeId') ?? recordField(claim, 'afterExchangeId')
-      const postId = typeof rawPost === 'string' && byId.has(rawPost) ? rawPost : null
+      const postId = typeof rawPost === 'string' && hasExchange(rawPost) ? rawPost : null
       const burstIds = [...new Set(cited(stringArray(recordField(claim, 'burstExchangeIds') ?? recordField(claim, 'exchangeIds'))))]
       const serialIds = [...new Set(cited(stringArray(recordField(claim, 'serialExchangeIds') ?? recordField(claim, 'controlExchangeIds'))))]
       const rawSerialPre = recordField(claim, 'serialPreExchangeId')
-      const serialPreId = typeof rawSerialPre === 'string' && byId.has(rawSerialPre) ? rawSerialPre : null
+      const serialPreId = typeof rawSerialPre === 'string' && hasExchange(rawSerialPre) ? rawSerialPre : null
       const rawSerialPost = recordField(claim, 'serialPostExchangeId')
-      const serialPostId = typeof rawSerialPost === 'string' && byId.has(rawSerialPost) ? rawSerialPost : null
+      const serialPostId = typeof rawSerialPost === 'string' && hasExchange(rawSerialPost) ? rawSerialPost : null
       if (!baselineId || !postId || burstIds.length < 2 || serialIds.length === 0) continue
       // C-5: Every role must refer to a disjoint host exchange ID (no role aliasing).
       const roleIdList = [
@@ -2094,7 +2090,7 @@ export function buildAgentScriptReceipt(input: {
       if (new Set(roleIdList).size !== roleIdList.length) continue
       const sortedBurstIds = sortByHostOrder(burstIds)
       const sortedSerialIds = sortByHostOrder(serialIds)
-      const firstBurst = byId.get(sortedBurstIds[0]!)
+      const firstBurst = factLog.getExchange(sortedBurstIds[0]!)
       if (!firstBurst) continue
       const armOverrides = new Map<string, ImpactStep['arm']>()
       const evidenceRoleOverrides = new Map<string, string>()
@@ -2161,21 +2157,22 @@ export function buildAgentScriptReceipt(input: {
 
   // H-20: Out-of-band (`prove.oob`) receipt branch — converts a host-verified OOB callback into a
   // standard `ProofReceipt` via `buildOobReceipt` using host OOB events + mint/injection/wait IDs.
+  const allFacts = factLog.orderedExchanges()
   for (const claim of input.claims) {
     if (recordField(claim, 'kind') !== 'oob') continue
     if (recordField(claim, 'expectHit') === false) continue
     const rawMintId = recordField(claim, 'exchangeId') ?? recordField(claim, 'mintExchangeId')
-    const mintId = typeof rawMintId === 'string' && byId.has(rawMintId) ? rawMintId : null
-    const mintExchange = mintId ? byId.get(mintId) : undefined
+    const mintId = typeof rawMintId === 'string' && hasExchange(rawMintId) ? rawMintId : null
+    const mintExchange = mintId ? factLog.getExchange(mintId) : undefined
     const rawWaitId = recordField(claim, 'waitExchangeId')
-    const explicitWaitId = typeof rawWaitId === 'string' && byId.has(rawWaitId) ? rawWaitId : null
+    const explicitWaitId = typeof rawWaitId === 'string' && hasExchange(rawWaitId) ? rawWaitId : null
     const rawInjectId = recordField(claim, 'injectionExchangeId') ?? recordField(claim, 'carrierExchangeId')
-    const explicitInjectId = typeof rawInjectId === 'string' && byId.has(rawInjectId) ? rawInjectId : null
+    const explicitInjectId = typeof rawInjectId === 'string' && hasExchange(rawInjectId) ? rawInjectId : null
     const rawOobEventId = recordField(claim, 'oobEventId') ?? recordField(claim, 'subscriptionId')
     const explicitOobEventId = typeof rawOobEventId === 'string' && rawOobEventId.trim() ? rawOobEventId.trim() : null
 
     const mintToken = mintExchange?.artifact?.token?.trim() || null
-    const hostOobEvents = input.oobEvents ?? []
+    const hostOobEvents = input.oobEvents?.length ? input.oobEvents : factLog.listOobEvents()
     let oobEvent: ReceiptOobEvent | null = null
     if (hostOobEvents.length > 0) {
       oobEvent = hostOobEvents.find(ev =>
@@ -2187,8 +2184,8 @@ export function buildAgentScriptReceipt(input: {
     }
     let derivedWaitId: string | null = explicitWaitId
     if (!oobEvent) {
-      const waitRecord = (explicitWaitId ? byId.get(explicitWaitId) : undefined)
-        ?? input.exchanges.find(ex =>
+      const waitRecord = (explicitWaitId ? factLog.getExchange(explicitWaitId) : undefined)
+        ?? allFacts.find(ex =>
           ex.op === 'oob' &&
           ex.artifact?.hit === true &&
           Boolean(ex.artifact?.token) &&
@@ -2215,18 +2212,18 @@ export function buildAgentScriptReceipt(input: {
     if (!oobEvent || !oobEvent.delivered || !oobEvent.token) continue
 
     const token = oobEvent.token
-    const carriesToken = (ex: ScriptProofExchange): boolean => {
+    const carriesToken = (ex: HostExchangeFact): boolean => {
       if (ex.op === 'oob') return false
       if ((ex.pathAndQuery ?? '').includes(token)) return true
-      if ((ex.requestBody ?? '').includes(token)) return true
-      if ((ex.body ?? '').includes(token)) return true
-      if (ex.requestHeaders && Object.values(ex.requestHeaders).some(v => String(v).includes(token))) return true
+      if ((ex.rawRequestBody ?? '').includes(token)) return true
+      if ((ex.rawResponseBody ?? '').includes(token)) return true
+      if (Object.values(ex.requestHeaders).some(v => String(v).includes(token))) return true
       return false
     }
-    const explicitCarrier = explicitInjectId ? byId.get(explicitInjectId) : undefined
+    const explicitCarrier = explicitInjectId ? factLog.getExchange(explicitInjectId) : undefined
     const carryingExchanges = explicitCarrier && carriesToken(explicitCarrier)
       ? [explicitCarrier]
-      : input.exchanges.filter(carriesToken)
+      : allFacts.filter(carriesToken)
     const primaryCarrier = carryingExchanges[0] ?? explicitCarrier ?? null
     const exchangeIds = sortByHostOrder([
       ...(mintId ? [mintId] : []),

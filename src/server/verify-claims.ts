@@ -915,18 +915,24 @@ export function sameSiteFromRecord(record: VerifyTranscriptRecord | undefined): 
   return match ? match[1] ?? null : null
 }
 
-/** Normalize a recorded exchange into the shared impact-evidence shape. */
-function transcriptImpactStep(
+/** Normalize a recorded exchange into the shared impact-evidence shape (HostFactLog-first). */
+function toTranscriptStep(
   store: TranscriptStore,
-  claim: Extract<VerifyClaim, { kind: 'impact' }>,
   id: string,
   arm: ImpactStep['arm'],
-  defaultSameSite: string | null,
-  factLog?: HostFactLog,
+  opts?: {
+    factLog?: HostFactLog
+    defaultSameSite?: string | null
+    actorRoles?: Record<string, string>
+    actorTenants?: Record<string, string>
+    requestBody?: unknown
+    ambient?: { kind: AmbientAuth; sameSite?: string }
+    tenantSignedFirst?: boolean
+  },
 ): ImpactStep | null {
-  const hostFact = factLog?.getExchange(id)
+  const hostFact = opts?.factLog?.getExchange(id)
   if (hostFact) {
-    const step = factLog!.toImpactStep(id, { arm })
+    const step = opts?.factLog?.toImpactStep(id, { arm })
     return step ? ({ ...step, seq: hostFact.seq } as ImpactStep & { seq: number }) : null
   }
   const record = store.get(id)
@@ -938,20 +944,20 @@ function transcriptImpactStep(
   const signedLabel = record.request?.actorRoleLabel ?? null
   const role = signedLabel !== null
     ? normalizeRole(signedLabel) ?? normalizeRole(handle) ?? null
-    : normalizeRole(handle) ?? normalizeRole(claim.actorRoles?.[handle ?? '']) ?? null
+    : normalizeRole(handle) ?? normalizeRole(opts?.actorRoles?.[handle ?? '']) ?? null
   const tenant = signedLabel !== null
-    ? parseRoleLabel(signedLabel).tenant ?? parseRoleLabel(handle).tenant ?? null
-    : parseRoleLabel(handle).tenant ?? claim.actorTenants?.[handle ?? ''] ?? null
+    ? parseRoleLabel(signedLabel).tenant ?? (opts?.tenantSignedFirst ? (opts.actorTenants?.[handle ?? ''] ?? parseRoleLabel(handle).tenant) : parseRoleLabel(handle).tenant) ?? null
+    : (opts?.tenantSignedFirst ? (opts.actorTenants?.[handle ?? ''] ?? parseRoleLabel(handle).tenant) : (parseRoleLabel(handle).tenant ?? opts?.actorTenants?.[handle ?? ''])) ?? null
   const hostAuth = deriveAmbientAuthFromHeaders(record.request?.headers)
-  const hostSameSite = sameSiteFromRecord(record) ?? defaultSameSite
+  const hostSameSite = sameSiteFromRecord(record) ?? opts?.defaultSameSite ?? null
   const hostRawReq = store.requestBody(id)
-  const requestJson = hostRawReq !== undefined ? (parseJsonBody(hostRawReq) ?? hostRawReq) : claim.requestBody
+  const requestJson = hostRawReq !== undefined ? (parseJsonBody(hostRawReq) ?? hostRawReq) : opts?.requestBody
   const actor: ActorIdentity = {
     handle,
     role,
     tenant,
-    auth: hostAuth !== 'unknown' ? hostAuth : ((claim.ambient?.kind ?? 'unknown') as AmbientAuth),
-    sameSite: hostSameSite ?? claim.ambient?.sameSite ?? null,
+    auth: hostAuth !== 'unknown' ? hostAuth : (opts?.ambient?.kind ?? 'unknown'),
+    sameSite: hostSameSite ?? opts?.ambient?.sameSite ?? null,
   }
   return {
     id,
@@ -961,55 +967,14 @@ function transcriptImpactStep(
     pathAndQuery: record.request?.pathAndQuery ?? '/',
     status: recordStatus(record),
     actor,
-    json,
+    ...(json !== undefined ? { json } : {}),
     body: body ?? '',
-    requestJson,
+    ...(requestJson !== undefined ? { requestJson } : {}),
     requestHeaders: record.request?.headers ?? null,
     responseHeaders: record.response?.headers ?? null,
+    durationMs: record.durationMs,
     ...(record.seq !== undefined ? { seq: record.seq } : {}),
   } as ImpactStep & { seq: number }
-}
-
-function transcriptBoundaryStep(
-  store: TranscriptStore,
-  claim: Extract<VerifyClaim, { kind: 'boundary' | 'impact' | 'mfa' }>,
-  id: string,
-  arm: ImpactStep['arm'],
-  factLog?: HostFactLog,
-): ImpactStep | null {
-  const hostFact = factLog?.getExchange(id)
-  if (hostFact) {
-    const step = factLog!.toImpactStep(id, { arm })
-    return step ? ({ ...step, seq: hostFact.seq } as ImpactStep & { seq: number }) : null
-  }
-  const record = store.get(id)
-  if (!record) return null
-  const body = store.body(id)
-  const json = parseJsonBody(body)
-  const handle = record.request?.personaHandle ?? null
-  const roles = 'actorRoles' in claim ? claim.actorRoles : undefined
-  const tenants = 'actorTenants' in claim ? claim.actorTenants : undefined
-  // Host-signed persona label wins; a handle alone is not a tenant ("alice" is not a tenant).
-  const signedLabel = record.request?.actorRoleLabel ?? null
-  const role = signedLabel !== null
-    ? normalizeRole(signedLabel) ?? normalizeRole(handle) ?? null
-    : normalizeRole(handle) ?? normalizeRole(roles?.[handle ?? '']) ?? null
-  const tenant = signedLabel !== null
-    ? parseRoleLabel(signedLabel).tenant ?? tenants?.[handle ?? ''] ?? null
-    : tenants?.[handle ?? ''] ?? parseRoleLabel(handle).tenant ?? null
-  return {
-    id,
-    arm,
-    method: (record.request?.method ?? 'GET').toUpperCase(),
-    route: (record.request?.pathAndQuery ?? '/').split('?')[0].replace(/\/+$/, '').toLowerCase() || '/',
-    pathAndQuery: record.request?.pathAndQuery ?? '/',
-    status: recordStatus(record),
-    actor: { handle, role, tenant, auth: deriveAmbientAuthFromHeaders(record.request?.headers), sameSite: sameSiteFromRecord(record) },
-    json,
-    body: body ?? '',
-    requestHeaders: record.request?.headers ?? null,
-    responseHeaders: record.response?.headers ?? null,
-  }
 }
 
 const LIFECYCLE_STATE_KEY_RE = /^(?:status|state|workflow[_-]?status|workflow[_-]?state|approval[_-]?status|approval[_-]?state|lifecycle[_-]?state|lifecycle[_-]?status|stage|phase)$/i
@@ -1074,8 +1039,9 @@ function evaluateBoundaryClaim(store: TranscriptStore, claim: Extract<VerifyClai
   const okId = (id: string) => (!context.allowedExchangeIds || context.allowedExchangeIds.has(id)) && Boolean(store.get(id))
   if (!okId(claim.controlExchangeId)) return { claim, passed: false, detail: `Unknown control exchange ${claim.controlExchangeId} for a boundary claim.` }
   if (!okId(claim.probeExchangeId)) return { claim, passed: false, detail: `Unknown probe exchange ${claim.probeExchangeId} for a boundary claim.` }
-  const control = transcriptBoundaryStep(store, claim, claim.controlExchangeId, 'control', context.factLog)
-  const probe = transcriptBoundaryStep(store, claim, claim.probeExchangeId, 'probe', context.factLog)
+  const stepOpts = { factLog: context.factLog, actorRoles: claim.actorRoles, actorTenants: claim.actorTenants, tenantSignedFirst: true }
+  const control = toTranscriptStep(store, claim.controlExchangeId, 'control', stepOpts)
+  const probe = toTranscriptStep(store, claim.probeExchangeId, 'probe', stepOpts)
   if (!control || !probe) return { claim, passed: false, detail: 'Boundary claim references an unreadable exchange.' }
   const assessment = assessBoundary({
     boundaryClass: claim.boundaryClass,
@@ -1103,9 +1069,10 @@ function evaluateMfaClaim(
     if (!store.get(id)) return { claim, passed: false, detail: `Unknown MFA exchange ${id}.` }
   }
   const steps: ImpactStep[] = []
+  const stepOpts = { factLog: context.factLog, actorRoles: claim.actorRoles, actorTenants: claim.actorTenants, tenantSignedFirst: true }
   const add = (id: string | undefined, arm: ImpactStep['arm']) => {
     if (!id) return
-    const step = transcriptBoundaryStep(store, claim, id, arm)
+    const step = toTranscriptStep(store, id, arm, stepOpts)
     if (step) steps.push(step)
   }
   add(claim.enrolledExchangeId, 'control')
@@ -1145,9 +1112,17 @@ function evaluateImpactClaim(
   }
   const defaultSameSite = ids.map(id => sameSiteFromRecord(store.get(id))).find(Boolean) ?? null
   const steps: ImpactStep[] = []
+  const stepOpts = {
+    factLog: context.factLog,
+    defaultSameSite,
+    actorRoles: claim.actorRoles,
+    actorTenants: claim.actorTenants,
+    requestBody: claim.requestBody,
+    ambient: claim.ambient,
+  }
   const add = (id: string | undefined, arm: ImpactStep['arm']) => {
     if (!id) return
-    const step = transcriptImpactStep(store, claim, id, arm, defaultSameSite, context.factLog)
+    const step = toTranscriptStep(store, id, arm, stepOpts)
     if (step) steps.push(step)
   }
   add(claim.beforeExchangeId, 'control')
@@ -1181,29 +1156,29 @@ function evaluateImpactClaim(
   return { claim, passed: assessment.required && assessment.satisfied, detail: assessment.reason, ...(assessment.evidence ? { observed: assessment.evidence } : {}) }
 }
 
+function claimedSteps(
+  store: TranscriptStore,
+  claims: readonly VerifyClaim[],
+  context: VerifyClaimContext,
+): ImpactStep[] {
+  const steps: ImpactStep[] = []
+  for (const id of claimedExchangeIds(claims)) {
+    if (context.allowedExchangeIds && !context.allowedExchangeIds.has(id)) continue
+    const role = store.get(id)?.request?.sessionRole
+    const arm: ImpactStep['arm'] = role === 'probe' || role === 'control' || role === 'setup' || role === 'cleanup' ? role : 'setup'
+    const step = toTranscriptStep(store, id, arm, { factLog: context.factLog })
+    if (step) steps.push(step)
+  }
+  return steps
+}
+
 /** Active-markup evidence over the exchanges a proof already asserts (never a bare tag). */
 function implicitMarkupEvidence(
   store: TranscriptStore,
   claims: readonly VerifyClaim[],
   context: VerifyClaimContext,
 ): { satisfied: boolean; reason: string } {
-  const steps: ImpactStep[] = []
-  for (const id of claimedExchangeIds(claims)) {
-    if (context.allowedExchangeIds && !context.allowedExchangeIds.has(id)) continue
-    const record = store.get(id)
-    if (!record) continue
-    const body = store.body(id) ?? ''
-    steps.push({
-      id,
-      arm: (record.request?.sessionRole as ImpactStep['arm'] | null) ?? 'setup',
-      method: (record.request?.method ?? 'GET').toUpperCase(),
-      route: (record.request?.pathAndQuery ?? '/').split('?')[0],
-      status: recordStatus(record),
-      actor: { handle: record.request?.personaHandle ?? null, role: normalizeRole(record.request?.personaHandle ?? null), tenant: null, auth: 'unknown', sameSite: null },
-      body,
-    })
-  }
-  const assessment = assessMarkupImpact({ impactClass: 'markup', steps, oracleEvents: [] })
+  const assessment = assessMarkupImpact({ impactClass: 'markup', steps: claimedSteps(store, claims, context), oracleEvents: [] })
   return { satisfied: assessment.satisfied, reason: assessment.reason }
 }
 
@@ -1230,23 +1205,7 @@ function claimedExchangeIds(claims: readonly VerifyClaim[]): string[] {
  * non-public attribute in its probe exchange. Status and self-echoed fields are not disclosure.
  */
 function implicitReadDisclosure(store: TranscriptStore, claims: readonly VerifyClaim[], context: VerifyClaimContext): { satisfied: boolean; reason: string } {
-  const steps: ImpactStep[] = []
-  for (const id of claimedExchangeIds(claims)) {
-    if (context.allowedExchangeIds && !context.allowedExchangeIds.has(id)) continue
-    const record = store.get(id)
-    if (!record) continue
-    const body = store.body(id), handle = record.request?.personaHandle ?? null
-    steps.push({
-      id,
-      arm: (record.request?.sessionRole as ImpactStep['arm'] | null) ?? 'setup',
-      method: (record.request?.method ?? 'GET').toUpperCase(),
-      status: recordStatus(record),
-      actor: { handle, role: normalizeRole(handle), tenant: parseRoleLabel(handle).tenant, auth: 'unknown', sameSite: null },
-      json: parseJsonBody(body),
-      body: body ?? '',
-      ...(record.seq !== undefined ? { seq: record.seq } : {}),
-    } as ImpactStep & { seq: number })
-  }
+  const steps = claimedSteps(store, claims, context)
   const probe = steps.find(step => step.arm === 'probe') ??
     [...steps].reverse().find(step => step.json !== undefined && step.json !== null)
   if (!probe) return { satisfied: false, reason: 'no probe exchange carries a JSON body to inspect for an owner-scoped disclosure' }
@@ -1729,31 +1688,14 @@ export function describeMissingEvidence(check: VerifyClaimCheck): string[] {
 }
 
 /** Materialize the signed transcript as the shared impact model (bodies included, bounded). */
-function transcriptStatusSteps(store: TranscriptStore): ImpactStep[] {
+function transcriptStatusSteps(store: TranscriptStore, factLog?: HostFactLog): ImpactStep[] {
   const out: ImpactStep[] = []
   for (const record of store.list()) {
-    if (!record.request) continue
-    if (record.op !== 'http' && record.op !== 'http2') continue
-    const body = store.body(record.exchangeId) ?? ''
-    const json = parseJsonBody(body)
+    if (!record.request || (record.op !== 'http' && record.op !== 'http2')) continue
     const role = record.request.sessionRole
     const arm: ImpactStep['arm'] = role === 'probe' || role === 'control' ? role : 'setup'
-    const handle = record.request.personaHandle ?? null
-    const label = record.request.actorRoleLabel ?? null
-    out.push({
-      id: record.exchangeId,
-      arm,
-      method: record.request.method.toUpperCase(),
-      route: (record.request.pathAndQuery || '/').split('?')[0],
-      pathAndQuery: record.request.pathAndQuery,
-      status: recordStatus(record),
-      actor: { handle, role: normalizeRole(label ?? handle), tenant: parseRoleLabel(label ?? handle ?? '').tenant ?? null, auth: 'unknown', sameSite: null },
-      ...(json !== undefined ? { json } : {}),
-      body,
-      requestHeaders: record.request.headers,
-      responseHeaders: record.response?.headers ?? null,
-      durationMs: record.durationMs,
-    })
+    const step = toTranscriptStep(store, record.exchangeId, arm, { factLog })
+    if (step) out.push(step)
   }
   return out
 }
@@ -1815,7 +1757,7 @@ export function evaluateClaims(
   // Universal status-only guard: a failing probe is never confirmation by itself. A 2xx -> 4xx/5xx
   // transition must be backed by an engine/parser fingerprint, a structural differential, a timing
   // arm, a state delta or an OOB callback; otherwise the claim is a bare availability/error signal.
-  const statusSteps = transcriptStatusSteps(store)
+  const statusSteps = transcriptStatusSteps(store, context.factLog)
   const statusOnly = assessStatusOnlyDivergence(statusSteps)
   if (statusOnly.statusOnly) {
     const probeText = statusOnly.probeId ? store.body(statusOnly.probeId) ?? '' : ''

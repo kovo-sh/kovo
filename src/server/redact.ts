@@ -16,7 +16,7 @@ const credentialPatterns = [
   /(?<!")\b(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-csrf-token|x-xsrf-token)\s*:\s*[^\n\r"]+/gi,
   /\bBearer\s+[a-z0-9._~+/=-]{8,}/gi,
   new RegExp(
-    `("${SECRET_KEY_CORE}"\\s*:\\s*)(?:(null|\\{|\\[)|"(?:\\\\.|[^"\\\\])*"|-?\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?|true|false)|(?<![A-Za-z0-9_-])${SECRET_KEY_CORE}["']?\\s*[:=]\\s*(?:"(?:\\\\.|[^"\\\\])*"|'[^']*'|[^\\s&,;}"']+)`,
+    `("${SECRET_KEY_CORE}"\\s*:\\s*)(?:(null|\\{|\\[|"")|"(?:\\\\.|[^"\\\\])*"|-?\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?|true|false)|(?<![A-Za-z0-9_-])${SECRET_KEY_CORE}["']?\\s*[:=]\\s*(?:"(?:\\\\.|[^"\\\\])*"|'[^']*'|[^\\s&,;}"']+)`,
     'gi',
   ),
 ]
@@ -103,7 +103,7 @@ export function redact(text: string, secrets: readonly NamedSecret[] = []): stri
   let out = redactExactValues(text, secrets, { minLength: 4 })
   out = credentialPatterns.slice(0, 5).reduce((value, pattern) => value.replace(pattern, '[redacted]'), out)
   return out.replace(credentialPatterns[5]!, (_m, jsonPrefix?: string, preserved?: string) => (
-    jsonPrefix ? `${jsonPrefix}${preserved ?? '"[redacted]"'}` : '[redacted]'
+    jsonPrefix ? `${jsonPrefix}${preserved !== undefined ? preserved : '"[redacted]"'}` : '[redacted]'
   ))
 }
 
