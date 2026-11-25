@@ -773,7 +773,7 @@ function fakeLabStore(): LabContainerStore & {
  * Docker CLI emulator for the lifecycle tests: creates a real Unix-socket stand-in for the proxy
  * container so the host relay + health check path runs end to end without a Docker daemon.
  */
-function fakeLabDocker(options: { proxyFails?: boolean } = {}): {
+function fakeLabDocker(options: { proxyFails?: boolean; rmFails?: boolean } = {}): {
   runner: DockerRunner
   calls: string[][]
   live: Map<string, string>
@@ -819,6 +819,7 @@ function fakeLabDocker(options: { proxyFails?: boolean } = {}): {
       return ''
     }
     if (args[0] === 'container' && args[1] === 'rm') {
+      if (options.rmFails) throw new Error('simulated docker rm failure')
       live.delete(args[args.length - 1])
       return ''
     }
@@ -886,22 +887,22 @@ test('v6 store wiring: a launched container and the proxy are recorded, then del
   }
 })
 
-test('v6 store wiring: an unexpected start failure marks the launched container orphaned', async t => {
+test('v6 store wiring: an unexpected start failure keeps row orphaned if rm fails and deletes row once removed', async t => {
   const workspace = makeTempDir(t, 'kovo-v6-store-orphan-')
   const repoDir = join(workspace, 'repo')
   mkdirSync(repoDir, { recursive: true })
   writeFileSync(join(repoDir, 'server.js'), "require('http').createServer((_q, r) => r.end('ok')).listen(8080)\n")
   const store = fakeLabStore()
-  const fake = fakeLabDocker({ proxyFails: true })
-  t.after(() => fake.close())
-  const runner = new LabRunner({ docker: fake.runner, stateDir: join(workspace, 'state') })
+  const fakeFailingRm = fakeLabDocker({ proxyFails: true, rmFails: true })
+  t.after(() => fakeFailingRm.close())
+  const runnerFailingRm = new LabRunner({ docker: fakeFailingRm.runner, stateDir: join(workspace, 'state-fail') })
   const runId = 'run-lifecycle-orphan'
 
   const previous = process.env.KOVO_ALLOW_LOCAL_LAB
   process.env.KOVO_ALLOW_LOCAL_LAB = '1'
   try {
     await assert.rejects(
-      runner.startLabTarget({
+      runnerFailingRm.startLabTarget({
         runId,
         environment: 'local-lab',
         repoDir,
@@ -919,9 +920,35 @@ test('v6 store wiring: an unexpected start failure marks the launched container 
       /proxy image unavailable/,
     )
     const rows = store.listLabContainers(runId)
-    assert.equal(rows.length, 1, 'only the service container was launched before the proxy failed')
-    assert.equal(rows[0].status, 'orphaned', 'unexpected-exit containers are marked orphaned, not silently dropped')
-    assert.equal(fake.live.size, 0, 'failure cleanup still removes the container process')
+    assert.equal(rows.length, 1, 'row stays tracked as orphaned when Docker removal fails')
+    assert.equal(rows[0].status, 'orphaned', 'unexpected-exit containers whose removal failed stay marked orphaned')
+    assert.equal(fakeFailingRm.live.size, 1, 'container remained live when rm failed')
+
+    // Once Docker removal succeeds (clean start failure), both container and row are cleaned up.
+    const fakeClean = fakeLabDocker({ proxyFails: true })
+    t.after(() => fakeClean.close())
+    const cleanStore = fakeLabStore()
+    const runnerClean = new LabRunner({ docker: fakeClean.runner, stateDir: join(workspace, 'state-clean') })
+    await assert.rejects(
+      runnerClean.startLabTarget({
+        runId: 'run-lifecycle-orphan-clean',
+        environment: 'local-lab',
+        repoDir,
+        storage: cleanStore as unknown as Store,
+        labConfig: {
+          enabled: true,
+          image: 'node:24-bookworm-slim',
+          startCommand: 'node /app/server.js',
+          internalPort: 8080,
+          healthPath: '/health',
+          healthTimeoutMs: 5_000,
+        },
+        signal: AbortSignal.timeout(30_000),
+      }),
+      /proxy image unavailable/,
+    )
+    assert.equal(fakeClean.live.size, 0, 'failure cleanup removes the container process')
+    assert.equal(cleanStore.listLabContainers('run-lifecycle-orphan-clean').length, 0, 'row is deleted once container removal succeeds')
   } finally {
     if (previous === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
     else process.env.KOVO_ALLOW_LOCAL_LAB = previous

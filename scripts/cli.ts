@@ -9,7 +9,7 @@ import { assetOriginForEnvironment, personaHandle } from '../src/domain.ts'
 import type { CapabilityTier, Finding } from '../src/domain.ts'
 import { Execution } from '../src/server/execution.ts'
 import { projectReposDir } from '../src/server/github-connector.ts'
-import { assertLocalLabAllowed, LabRunner } from '../src/server/lab-runner.ts'
+import { assertLocalLabAllowed, getSharedLabRunner, LabRunner } from '../src/server/lab-runner.ts'
 import { createProjectPersona } from '../src/server/persona-vault.ts'
 import { exportReportMarkdown } from '../src/server/report-export.ts'
 import { exportReportSarif } from '../src/server/sarif-export.ts'
@@ -507,9 +507,12 @@ export async function runCli(argv: readonly string[]): Promise<0 | 1 | 2> {
   const dataDir = join(opts.outputDir, 'data')
   mkdirSync(dataDir, { recursive: true, mode: 0o700 })
 
-  const labRunner = new LabRunner()
+  const labRunner = getSharedLabRunner()
   const storage = new Store(dataDir)
-  const engine = new Execution(storage)
+  if (opts.localLab) {
+    await labRunner.recoverAll(storage).catch(() => [])
+  }
+  const engine = new Execution(storage, { labRunner })
 
   try {
     const environment: 'public' | 'local-lab' = opts.localLab ? 'local-lab' : 'public'
@@ -528,6 +531,7 @@ export async function runCli(argv: readonly string[]): Promise<0 | 1 | 2> {
         runId: labBootId,
         environment: 'local-lab',
         repoDir: opts.repos[0],
+        storage,
         telemetryDir,
         labConfig: {
           enabled: true,
@@ -555,7 +559,8 @@ export async function runCli(argv: readonly string[]): Promise<0 | 1 | 2> {
       environment,
       ...(labHandle ? {
         labConfig: {
-          enabled: true,
+          // CLI already booted this stack via shared labRunner; keep enabled: false so Execution does not boot a duplicate stack (M-20).
+          enabled: false,
           dockerComposeFile: opts.composeFile,
           internalPort: opts.labPort ?? 8080,
           healthPath: opts.labHealthPath ?? '/health',

@@ -797,6 +797,9 @@ export function interpolateComposeString(
       const close = text.indexOf('}', i + 2)
       if (close < 0) throw new ComposeParseError('unterminated "${...}" interpolation', lineNumber)
       const expression = text.slice(i + 2, close)
+      if (expression.length > MAX_SCALAR_LENGTH) {
+        throw new ComposeParseError(`interpolation expression exceeds ${MAX_SCALAR_LENGTH} characters`, lineNumber)
+      }
       const match = /^([A-Za-z_][A-Za-z0-9_]*)(?:(:-|-|:\?|\?)([\s\S]*))?$/.exec(expression)
       if (!match) throw new ComposeParseError('invalid interpolation expression', lineNumber)
       const name = match[1]
@@ -1308,6 +1311,9 @@ export function parseComposeDocument(yamlText: string, options: ComposeParseOpti
   }
   return document
 }
+
+/** Synchronous alias for `parseComposeDocument`; untrusted ingestion should prefer `parseComposeInWorker`. */
+export const parseCompose = parseComposeDocument
 
 export const COMPOSE_PARSER_LIMITS = {
   maxBytes: MAX_COMPOSE_BYTES,
