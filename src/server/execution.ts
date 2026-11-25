@@ -116,7 +116,7 @@ import { buildInlineVerifyFeedback } from './replay-verifier.ts'
 import { approvalRequests, findings } from './schema.ts'
 import { tenantTagForRun } from './scope-policy.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
-import { runThreeStageSemanticAudit, toChainStepInputs } from './semantic-audit.ts'
+import { codeAuditSuspectLocationKey, runThreeStageSemanticAudit, toChainStepInputs, type SemanticAuditSuspect } from './semantic-audit.ts'
 import { cloneWorkerPersona } from './session-isolation.ts'
 import {
   assessmentAssignments,
@@ -288,6 +288,8 @@ export const SOURCE_AUDIT_MAX_WALL_CLOCK_MS = 90_000
 export const SOURCE_AUDIT_WALL_CLOCK_SHARE = 0.15
 export const SOURCE_AUDIT_SHORT_RUN_THRESHOLD_MS = 15 * 60_000
 export const SOURCE_AUDIT_SHORT_RUN_MAX_TURNS = 8
+/** Code-audit settle prompt fires at 60% of the audit cap (54s of 90s), leaving ~36s to record. */
+export const SOURCE_AUDIT_SETTLEMENT_SHARE = 0.6
 export const PHASE_A_FLOOR_MIN_WALL_CLOCK_MS = 15_000
 export const PHASE_A_FLOOR_MAX_WALL_CLOCK_MS = 75_000
 export const PHASE_A_FLOOR_WALL_CLOCK_SHARE = 0.12
@@ -313,6 +315,86 @@ export function resolveSourceAuditMaxTurns(workerMaxTurns?: number, maxDurationM
     return Math.min(base, SOURCE_AUDIT_SHORT_RUN_MAX_TURNS)
   }
   return base
+}
+
+/** 60% settlement prompt threshold for the interactive code audit (54s on a 90s cap). */
+export function resolveSourceAuditSettlementMs(auditWallMs: number): number {
+  const wall = Math.max(1, Math.floor(auditWallMs))
+  return Math.max(1, Math.min(Math.floor(wall * SOURCE_AUDIT_SETTLEMENT_SHARE), wallClockSettlementMs(wall)))
+}
+
+/**
+ * Explicit wrap-up directive for the Source-First Code Auditor: stop reading, commit the highest
+ * signal suspects as facts, then complete. Partial suspects beat an empty audit.
+ */
+export function codeAuditSettlementMessage(auditSettlementMs: number): string {
+  const seconds = Math.max(1, Math.round(auditSettlementMs / 1000))
+  return [
+    `[CODE AUDIT SETTLEMENT — ${seconds}s]`,
+    'STOP reading more files now. Do NOT open another repository file, grep sweep, or broad source walk.',
+    'Immediately call record_fact(kind="code_audit_suspect") for your top 3-6 highest-signal defects — cross-service trust boundaries, multi-tenant authz or cache-key asymmetries, entity creator/approver state-machine transitions, signing/webhook verification boundaries, and async-worker outbound-fetch or secret-in-log sinks — one fact per defect with the exact repo/file/line and sinkKind.',
+    'After those facts are recorded, call complete_intent with status partial|blocked and a concise summary. Recording partial suspects is strictly better than an empty audit.',
+  ].join(' ')
+}
+
+/**
+ * Promote semantic-audit suspects into code_audit_suspect facts, deduped by location against every
+ * fact already in the store. Safety net for the case where the interactive auditor rotates at its
+ * wall-clock deadline without recording anything of its own.
+ */
+export function promoteSemanticAuditSuspects(
+  storage: Store,
+  run: Run,
+  assignment: Assignment,
+  suspects: readonly SemanticAuditSuspect[],
+  approvedOrigins: ReadonlySet<string>,
+): Fact[] {
+  if (!suspects.length) return []
+  const existing = storage.listFacts(run.id, { includeTainted: true, kind: 'code_audit_suspect', limit: 500 })
+  const seen = new Set(existing.map(fact => codeAuditSuspectLocationKey({
+    ...(fact.data as Record<string, unknown>), id: fact.id,
+  })))
+  const created: Fact[] = []
+  for (const suspect of suspects) {
+    if (!approvedOrigins.has(suspect.origin)) continue
+    const key = codeAuditSuspectLocationKey(suspect)
+    if (seen.has(key)) continue
+    seen.add(key)
+    created.push(storage.addFact(run, assignment, {
+      kind: 'code_audit_suspect',
+      origin: suspect.origin,
+      summary: `[semantic ${suspect.stage}] ${suspect.file}:${suspect.line} (${suspect.sinkKind}) — ${suspect.hypothesis}`,
+      data: suspect.data as unknown as Record<string, unknown>,
+    }))
+  }
+  return created
+}
+
+/**
+ * Final suspect roll-up for the code audit. When the interactive auditor recorded zero facts of
+ * its own, semantic-audit suspects are preserved instead of returning an empty audit.
+ */
+export function settleCodeAuditSuspects(input: {
+  storage: Store
+  run: Run
+  assignment: Assignment
+  approvedOrigins: ReadonlySet<string>
+  semanticSuspects: readonly SemanticAuditSuspect[]
+  preInteractiveFactIds: ReadonlySet<string>
+}): { suspects: Fact[]; promoted: Fact[]; interactiveRecorded: number } {
+  const read = (): Fact[] => input.storage
+    .listFacts(input.run.id, { includeTainted: false, kind: 'code_audit_suspect', limit: 100 })
+    .filter(fact => input.approvedOrigins.has(fact.origin))
+  let suspects = read()
+  const interactiveRecorded = suspects.filter(fact => !input.preInteractiveFactIds.has(fact.id)).length
+  let promoted: Fact[] = []
+  if (interactiveRecorded === 0 && input.semanticSuspects.length) {
+    promoted = promoteSemanticAuditSuspects(
+      input.storage, input.run, input.assignment, input.semanticSuspects, input.approvedOrigins,
+    )
+    if (promoted.length) suspects = read()
+  }
+  return { suspects, promoted, interactiveRecorded }
 }
 
 /**
@@ -2201,7 +2283,10 @@ export class Execution {
       ? runMaxDuration
       : this.maxDurationMs
     const auditWallMs = resolveSourceAuditWallClockMs(effectiveMaxDurationMs)
-    const auditSettlementMs = Math.min(Math.floor(auditWallMs * 0.8), wallClockSettlementMs(auditWallMs))
+    const auditSettlementMs = resolveSourceAuditSettlementMs(auditWallMs)
+    // The agent-session's own 80% wall-clock nudge remains the hard per-session settlement; the
+    // code-audit prompt above fires earlier (60%) so suspects land before the slot rotates.
+    const sessionSettlementMs = Math.min(Math.floor(auditWallMs * 0.8), wallClockSettlementMs(auditWallMs))
     const semanticTimeoutMs = Math.min(35_000, Math.floor(auditWallMs * 0.45))
     const auditMaxTurns = resolveSourceAuditMaxTurns(run.workerMaxTurns, effectiveMaxDurationMs)
     const auditPhase = run.phase === 'investigation' ? 'investigation' : 'threat_model'
@@ -2226,12 +2311,17 @@ export class Execution {
     const job: Active = { assignment: claimed, origins: new Set(approvedOrigins), controller }
     this.active.set(claimed.id, job)
     this.storage.event(run.id, 'code_audit.started', `Source-First Code Audit started across ${mountedRepos.length} mounted ${mountedRepos.length === 1 ? 'repo' : 'repos'} (wall cap ${Math.round(auditWallMs / 1000)}s, max ${auditMaxTurns} turns).`, {
-      assignmentId: claimed.id, mountedRepos, auditWallMs, auditSettlementMs, semanticTimeoutMs, auditMaxTurns,
+      assignmentId: claimed.id, mountedRepos, auditWallMs,
+      auditSettlementMs: sessionSettlementMs,
+      codeAuditSettlementMs: auditSettlementMs,
+      semanticTimeoutMs, auditMaxTurns,
     })
 
     const { grant, secrets, currentSecrets } = this.buildGrant(job, run, approvedOrigins)
     const session = await this.backend.openSession(claimed.id, controller.signal, { reposDir })
     const startedAt = Date.now()
+    let codeAuditSettlementPrompted = false
+    let semanticSuspects: SemanticAuditSuspect[] = []
 
     try {
       const stagedSpecs = await this.stageProjectSpecs(run.projectId, session, controller.signal)
@@ -2288,6 +2378,7 @@ export class Execution {
           semanticTimer.unref?.()
         })
         const semanticRes = await Promise.race([semanticPromise, semanticTimeout])
+        semanticSuspects = semanticRes.rankedSuspects
         const semanticSteps = toChainStepInputs(run, semanticRes.rankedSuspects, hostTiersForAudit, semanticRes.persistedFactIds)
         const existingTitles = new Set(this.storage.listChainSteps(run.id, run.goalRevision).map(s => s.title.trim().toLowerCase()))
         for (const stInput of semanticSteps) {
@@ -2303,6 +2394,10 @@ export class Execution {
         controller.signal.removeEventListener('abort', onAuditAbortForSemantic)
       }
 
+      const preInteractiveSuspectIds = new Set(
+        this.storage.listFacts(run.id, { includeTainted: false, kind: 'code_audit_suspect', limit: 500 })
+          .map(fact => fact.id),
+      )
       const remainingAuditWallMs = Math.max(0, auditWallMs - Math.max(0, Date.now() - startedAt))
       const sessionResult = remainingAuditWallMs > 2_000 && !controller.signal.aborted
         ? await runAgentSession({
@@ -2347,12 +2442,33 @@ export class Execution {
               this.storage.updateWorker(claimed.id, { turnsUsed: turn })
               this.storage.recordLlmSpend(run.id, { turns: 1 })
             },
+            onTurnStart: () => {
+              if (codeAuditSettlementPrompted) return
+              if (Date.now() - startedAt < auditSettlementMs) return
+              codeAuditSettlementPrompted = true
+              this.safeEvent(run.id, 'code_audit.settlement_prompt',
+                `Source-First Code Audit settlement prompt fired at ${Math.round(auditSettlementMs / 1000)}s; committing suspects instead of reading further.`,
+                { assignmentId: claimed.id, auditSettlementMs })
+              return { messages: [codeAuditSettlementMessage(auditSettlementMs)] }
+            },
           })
         : { completion: undefined }
 
       const latestRun = this.storage.run(run.id)
-      const suspects = this.storage.listFacts(run.id, { includeTainted: false, kind: 'code_audit_suspect', limit: 100 })
-        .filter(f => approvedOrigins.has(f.origin))
+      const settled = settleCodeAuditSuspects({
+        storage: this.storage,
+        run: latestRun,
+        assignment: claimed,
+        approvedOrigins,
+        semanticSuspects,
+        preInteractiveFactIds: preInteractiveSuspectIds,
+      })
+      if (settled.promoted.length) {
+        this.safeEvent(run.id, 'code_audit.semantic_suspects_preserved',
+          `Source-First Code Audit preserved ${settled.promoted.length} semantic-audit suspect(s) after the interactive auditor recorded none of its own.`,
+          { assignmentId: claimed.id, promotedCount: settled.promoted.length, interactiveRecorded: settled.interactiveRecorded })
+      }
+      const suspects = settled.suspects
       const hostTiers = computeHostTiers([...approvedOrigins], threatModel)
       const stepsCreated = convertCodeAuditSuspectsToChainSteps(this.storage, latestRun, suspects, hostTiers)
 
