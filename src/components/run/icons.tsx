@@ -1,6 +1,7 @@
 // One icon family: 16px grid, 1.5 stroke, round caps (from prototype F).
 // Markup is static and trusted, so it is injected as inner SVG.
 import type { CSSProperties } from 'react'
+import { KovoHunterMark } from '../brand/KovoHunterMark.tsx'
 
 const P = {
   search: '<circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/>',
@@ -83,10 +84,7 @@ export function Icon({ name, size, className, style, title }: {
   />
 }
 
-/** Guardian mark (shield with a core), used in the rail brand. */
+/** Kovo Hunter mark (R2-06 crescent bow-and-arrow), used in the rail brand. */
 export function Mark() {
-  return <svg className="mark" viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
-    <path d="M9 1.75 15.25 4.5v4.25c0 3.6-2.6 6.4-6.25 7.5-3.65-1.1-6.25-3.9-6.25-7.5V4.5Z" />
-    <circle cx="9" cy="9" r="2.25" fill="currentColor" stroke="none" />
-  </svg>
+  return <KovoHunterMark />
 }

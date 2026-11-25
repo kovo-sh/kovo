@@ -238,7 +238,7 @@ function Workspace() {
         <div className="sh-onboard-eyebrow">{workspace.name}</div>
         <h2 className="sh-onboard-display">Start your first project</h2>
         <p className="sh-onboard-lede">
-          Register the hosts you own or have written authorization to test. Guardian verifies scope before dispatching any live requests.
+          Register the hosts you own or have written authorization to test. Kovo Hunter verifies scope before dispatching any live requests.
         </p>
         <CreateProjectSheet isModal={false} canCancel={false} onClose={() => setModalOpen(false)} />
       </div>

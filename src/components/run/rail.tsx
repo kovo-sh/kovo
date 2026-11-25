@@ -2,12 +2,13 @@
 // amber when something needs a decision and pulses when the count changes),
 // runs grouped by project, theme toggle and the shortcut sheet.
 import { Link } from '@tanstack/react-router'
+import { KovoHunterMark } from '../brand/KovoHunterMark.tsx'
 import { useRun } from './data.tsx'
 import { useDecisions } from './decisions.tsx'
 import { KbdGroup } from './display.tsx'
 import { fmtN, runLabel, short } from './format.ts'
 import { StatusGlyph } from './glyphs.tsx'
-import { Icon, Mark } from './icons.tsx'
+import { Icon } from './icons.tsx'
 import { runStatusLabel, VIEWS } from './meta.ts'
 import type { ViewId } from './meta.ts'
 import { usePulse } from './motion.tsx'
@@ -33,7 +34,7 @@ export function Rail() {
   const projects = [...new Set(runs.map(r => r.projectName))]
   const isDark = theme === 'dark'
   return <aside className="rail" aria-label="Run navigation">
-    <div className="brand"><Mark /><Link to="/" className="brand-name" title="All projects">Guardian</Link><span className="ws">Local</span></div>
+    <div className="brand"><KovoHunterMark /><Link to="/" className="brand-name" title="All projects" style={{ whiteSpace: 'nowrap' }}>Kovo Hunter</Link><span className="ws">Local</span></div>
     <button type="button" className="search" onClick={() => pal.open()}>
       <Icon name="search" /><span style={{ whiteSpace: 'nowrap' }}>Search…</span><KbdGroup keys={['mod', 'K']} />
     </button>

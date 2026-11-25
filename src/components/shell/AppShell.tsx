@@ -4,10 +4,11 @@
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
+import { KovoHunterMark } from '../brand/KovoHunterMark.tsx'
 import { KbdGroup } from '../run/display.tsx'
 import { runLabel, short } from '../run/format.ts'
 import { StatusGlyph } from '../run/glyphs.tsx'
-import { Icon, Mark } from '../run/icons.tsx'
+import { Icon } from '../run/icons.tsx'
 import { runStatusLabel } from '../run/meta.ts'
 import { GlobalHelpSheet, GlobalPalette } from './GlobalPalette.tsx'
 import type { PoolHealth, ShellWorkspaceData } from './GlobalPalette.tsx'
@@ -219,8 +220,8 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
     <div className="app-shell">
       <aside className="sh-rail" aria-label="Workspace navigation">
         <div className="sh-brand">
-          <Mark />
-          <Link to="/" className="sh-brand-name" title="All projects">Guardian</Link>
+          <KovoHunterMark />
+          <Link to="/" className="sh-brand-name" title="All projects" style={{ whiteSpace: 'nowrap' }}>Kovo Hunter</Link>
           <span className="sh-ws">Local</span>
         </div>
 
