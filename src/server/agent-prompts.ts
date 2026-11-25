@@ -917,10 +917,13 @@ export type ProofToolHandlerName = typeof proofToolHandlerNames[number]
 // evidence contract (stdout is never evidence).
 // ---------------------------------------------------------------------------
 
-export type GuardianVerifyRuntime = 'ts' | 'python'
+export type GuardianVerifyRuntime = 'ts'
+
+export const GUARDIAN_VERIFY_TS_ONLY_ERROR =
+  'guardian_verify supports TypeScript only (runtime="ts"); rewrite using inline TypeScript with ctx.prove_*.'
 
 /**
- * Typed helpers exported by both guardian_verify SDKs (`ctx.prove_*`). Each records the exact
+ * Typed helpers exported by the guardian_verify TypeScript SDK (`ctx.prove_*`). Each records the exact
  * transcript roles the independent oracle checks, so a proof never fails for want of a role.
  * Keep the one-liners short: this block is copied verbatim into the tool description and the
  * (slimmed) agentic prompt context, so every byte is paid on every turn.
@@ -953,7 +956,7 @@ export const GUARDIAN_VERIFY_REPAIR_INSTRUCTION =
 export const GUARDIAN_VERIFY_SPEC_SHAPE =
   'DeclarativeReplaySpec: version,origin,title,category,cwe,severity,severityRationale,impact,remediation,recheckInstructions,assertionsJq,steps[](id,role,description,request{origin,method,pathAndQuery},request.persona cross-actor).'
 
-/** v8 multi-hop chain helpers exported by both guardian_verify SDKs. */
+/** v8 multi-hop chain helpers exported by the guardian_verify TypeScript SDK. */
 export const GUARDIAN_VERIFY_MULTIHOP_HELPERS = [
   { name: 'seal_capability', use: 'seal hop credential/artifact host-side to cap:hop_<id>:<slot> (never echo raw secrets).' },
   { name: 'http_send', use: 'send hop requests with host-side capability injection ({ capability: handle, role: "probe" }).' },
@@ -1033,8 +1036,8 @@ export function specSubmissionRequiredMessage(
   const missingArtifact = scriptOnly ? 'a submitted guardian_verify proof' : 'a submitted replay spec'
   const submissionLabel = scriptOnly ? 'guardian_verify' : 'guardian_verify/verify_replay_spec'
   const repairProof = scriptOnly
-    ? `call guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")${routeText}`
-    : `call guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")${routeText} (or verify_replay_spec with DeclarativeReplaySpec: ${GUARDIAN_VERIFY_SPEC_SHAPE})`
+    ? `call guardian_verify(script="<inline TS using ctx.prove_*>", runtime="ts")${routeText}`
+    : `call guardian_verify(script="<inline TS using ctx.prove_*>", runtime="ts")${routeText} (or verify_replay_spec with DeclarativeReplaySpec: ${GUARDIAN_VERIFY_SPEC_SHAPE})`
   return [
     `complete_intent rejected (agent.spec_submission_required): missing required field \`proofGapReason\` or ${missingArtifact}${routeText}.`,
     `You probed a route but never submitted a ${submissionLabel} result covering it, so a proved/partial conclusion is unsupported. Each probed route owes its own proof; a gap on another route does not discharge this one.`,
@@ -1057,8 +1060,8 @@ export function gapValidationRejectedMessage(
   const routeText = route ? ` for ${route.method} ${route.path}` : ''
   const scriptOnly = options?.hasGuardianVerify === true
   const repairProof = scriptOnly
-    ? `call guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")${routeText}`
-    : `call guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")${routeText} (or verify_replay_spec with DeclarativeReplaySpec: ${GUARDIAN_VERIFY_SPEC_SHAPE})`
+    ? `call guardian_verify(script="<inline TS using ctx.prove_*>", runtime="ts")${routeText}`
+    : `call guardian_verify(script="<inline TS using ctx.prove_*>", runtime="ts")${routeText} (or verify_replay_spec with DeclarativeReplaySpec: ${GUARDIAN_VERIFY_SPEC_SHAPE})`
   return [
     `complete_intent rejected (agent.gap_validation): the coded proof gap is not supported by the recorded Layer-1 exchange transcript (${evidence}).`,
     `Repair now: ${repairProof}, or probe the route to record the missing exchange and re-record the proof gap with the same route.`,
@@ -1068,7 +1071,7 @@ export function gapValidationRejectedMessage(
 
 
 export const GUARDIAN_VERIFY_USAGE_HINT =
-  'Inline TS scripts receive `ctx` directly (no imports required): `await ctx.prove_access_boundary({ controlPersona, probePersona, route }); return ctx.result({ title: "..." })` (or `export default async (ctx) => { ... }`). Python `ctx.*` helpers are synchronous (no `await` needed).'
+  'Inline TypeScript scripts receive `ctx` directly (no imports required): `await ctx.prove_access_boundary({ controlPersona, probePersona, route }); return ctx.result({ title: "..." })` (or `export default async (ctx) => { ... }`).'
 
 const GUARDIAN_VERIFY_SIGNATURES = [
   'Exact TS helper signatures (targets accept string path/URL or { url|path|pathAndQuery, method?, headers?, body?, as? }):',
@@ -1087,7 +1090,7 @@ const GUARDIAN_VERIFY_SIGNATURES = [
 ].join('\n')
 
 const GUARDIAN_VERIFY_TS_EXAMPLE = [
-  'Working inline TS example (`ctx` is pre-injected — no imports needed; `export default async (ctx) => ...` also works; in Python `ctx.*` is synchronous, no `await` needed):',
+  'Working inline TS example (`ctx` is pre-injected — no imports needed; `export default async (ctx) => ...` also works):',
   '```ts',
   'const proof = await ctx.prove_access_boundary({',
   '  controlPersona: "user_b", probePersona: "user_a", route: "/api/v1/items/1",',
@@ -1112,7 +1115,7 @@ export const GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN = [
 ].join('\n')
 
 const GUARDIAN_VERIFY_TOOL_DESCRIPTION_BASE =
-  `Run a short TypeScript or Python verification script through Guardian’s Layer-1 RPC bridge and the independent transcript oracle. Confirmation requires two fresh-session runs whose signed exchanges satisfy every claimed assertion; the script’s stdout is never evidence. Confirmation BOTH proves AND persists the confirmed finding directly (with ProofReceipt / proof_kind="agent_script" or CompositeProofReceipt) — no propose_chain_finding or verify_replay_spec call is needed. Pass \`script\` inline (works with or without a mounted repo; \`scriptPath\` only reads from a mounted workspace): for single-hop use a typed helper (ctx.prove_access_boundary / ctx.prove_persisted_mutation / ctx.prove_boolean_or_timing_diff / ctx.prove_injection_differential / ctx.prove_oob_callback / ctx.prove_race_burst); for multi-hop chains (2-6 hops) ALWAYS seal intermediate artifacts with ctx.seal_capability, pass them via ctx.http_send({ ..., capability }) (+ ctx.hmac_sign / ctx.jwt_sign / ctx.await_async when needed), and confirm the full DAG via ctx.prove_composite in Mode A starting strictly from a low-priv/cross-tenant persona, then return ctx.result({ title }).\n\n${GUARDIAN_VERIFY_SIGNATURES}\n\n${GUARDIAN_VERIFY_TS_EXAMPLE}\n\n${GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN}`
+  `Run a short TypeScript verification script through Guardian’s Layer-1 RPC bridge and the independent transcript oracle. Confirmation requires two fresh-session runs whose signed exchanges satisfy every claimed assertion; the script’s stdout is never evidence. Confirmation BOTH proves AND persists the confirmed finding directly (with ProofReceipt / proof_kind="agent_script" or CompositeProofReceipt) — no propose_chain_finding or verify_replay_spec call is needed. Pass \`script\` inline (works with or without a mounted repo; \`scriptPath\` only reads from a mounted workspace): for single-hop use a typed helper (ctx.prove_access_boundary / ctx.prove_persisted_mutation / ctx.prove_boolean_or_timing_diff / ctx.prove_injection_differential / ctx.prove_oob_callback / ctx.prove_race_burst); for multi-hop chains (2-6 hops) ALWAYS seal intermediate artifacts with ctx.seal_capability, pass them via ctx.http_send({ ..., capability }) (+ ctx.hmac_sign / ctx.jwt_sign / ctx.await_async when needed), and confirm the full DAG via ctx.prove_composite in Mode A starting strictly from a low-priv/cross-tenant persona, then return ctx.result({ title }).\n\n${GUARDIAN_VERIFY_SIGNATURES}\n\n${GUARDIAN_VERIFY_TS_EXAMPLE}\n\n${GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN}`
 
 /** Runtime DeclarativeReplaySpec kinds rejected on legacy tools while `guardian_verify` is active. */
 export const GUARDIAN_VERIFY_ENFORCED_RUNTIME_KINDS: ReadonlySet<string> = new Set([
@@ -1146,9 +1149,9 @@ export const GUARDIAN_VERIFY_TOOL_DESCRIPTION =
 export const GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES = 2048
 
 export interface GuardianVerifyArgs {
-  /** Inline TS/Python verification script. Takes precedence over `scriptPath`. */
+  /** Inline TypeScript verification script. Takes precedence over `scriptPath`. */
   script?: string
-  /** Workspace path to a previously written script (runtime inferred from a `.py` suffix). */
+  /** Workspace path to a previously written TypeScript verification script. */
   scriptPath?: string
   runtime?: GuardianVerifyRuntime
   title?: string
@@ -1402,14 +1405,14 @@ const PROPOSE_CHAIN_FINDING_LEGACY_SCHEMAS = [
 export function proposeChainFindingDescription(hasGuardianVerify: boolean, allowLegacyReplaySpec = false): string {
   if (hasGuardianVerify && !allowLegacyReplaySpec) {
     return [
-      "[LEGACY FALLBACK — `guardian_verify` is active in this session. For runtime vulnerabilities, call `guardian_verify(script=\"<inline TS/Python using ctx.prove_*>\", runtime=\"ts\")` instead of proposing runtime replay specs so findings persist a verified ProofReceipt (`proof_kind=\"agent_script\"`). Use `propose_chain_finding` ONLY for `static_ast_proof` or when `guardian_verify` is unavailable.]",
+      "[LEGACY FALLBACK — `guardian_verify` is active in this session. For runtime vulnerabilities, call `guardian_verify(script=\"<inline TS using ctx.prove_*>\", runtime=\"ts\")` instead of proposing runtime replay specs so findings persist a verified ProofReceipt (`proof_kind=\"agent_script\"`). Use `propose_chain_finding` ONLY for `static_ast_proof` or when `guardian_verify` is unavailable.]",
       "Submit a static-AST source-to-sink finding with mandatory counterevidence, confidenceRationale, and replaySpec.kind=\"static_ast_proof\" (promotes ONLY to status=\"static_verified\", never runtime \"confirmed\").",
       "- static_ast_proof (deterministic offline opengrep/ast-grep re-run over RO /repos -> static_verified tier ONLY): { kind, repo, file, startLine, endLine, engine, ruleOrPattern, sourceToSinkTrace, runtimeProofGap, verificationTier, astVerify, static: { verified, matchCount, matchedLines, controlPassed } }.",
     ].join(" ")
   }
   return [
     ...(hasGuardianVerify ? [
-      "[LEGACY FALLBACK — `guardian_verify` is active in this session. For runtime vulnerabilities, call `guardian_verify(script=\"<inline TS/Python using ctx.prove_*>\", runtime=\"ts\")` instead of proposing runtime replay specs so findings persist a verified ProofReceipt (`proof_kind=\"agent_script\"`). Use `propose_chain_finding` ONLY for `static_ast_proof` or when `guardian_verify` is unavailable.]",
+      "[LEGACY FALLBACK — `guardian_verify` is active in this session. For runtime vulnerabilities, call `guardian_verify(script=\"<inline TS using ctx.prove_*>\", runtime=\"ts\")` instead of proposing runtime replay specs so findings persist a verified ProofReceipt (`proof_kind=\"agent_script\"`). Use `propose_chain_finding` ONLY for `static_ast_proof` or when `guardian_verify` is unavailable.]",
     ] : []),
     ...PROPOSE_CHAIN_FINDING_LEGACY_SCHEMAS,
   ].join(" ")
@@ -1585,7 +1588,7 @@ export interface WorkerToolHandlers {
     signal: AbortSignal,
   ) => Promise<unknown>
   /**
-   * Layer-3 executable verification: run a short TS/Python script through `verifyScript`
+   * Layer-3 executable verification: run a short TypeScript script through `verifyScript`
    * (fresh-session double run + transcript oracle) and return a verdict-shaped result.
    * Registered only when supplied; when present it is the default agentic proof path.
    */
@@ -1982,7 +1985,7 @@ export const scenarioInstructions: Record<AgentScenario, string> = {
     '3. Multi-persona BOLA/IDOR & race verification (Tier 2/3): harvest resource IDs owned by user_a via record_fact (kind="object_ref", subkind="persona_resource") and test across user_b and anonymous via probe_differential(authz_matrix) or 3-way controls. Use request_http_race (2–10 synchronized requests) for TOCTOU checks and DELETE/multipart ONLY at Tier 3 (HITL approval) or local-lab.',
     '4. Correlate CVEs responsibly: call query_cves on fingerprinted frameworks/packages. Version hits and raw SAST/template matches are ONLY cve_hypothesis or candidate leads—never confirmed until proven deterministically.',
     '5. Strict 3-State Closure Discipline (record_coverage): every tested surface MUST close in one of three states: (a) "reported" (with linkedFindingId), (b) "ruled_out" (REQUIRES non-empty enforcingControl quoting exact file:line in /repos or exact negative-control exchangeId—generic claims like "framework probably escapes it" are rejected), or (c) "needs_follow_up" (REQUIRES non-empty proofGapReason explaining the exact blocker such as Tier 2 persona, Tier 3 approval, or local-lab runtime).',
-    '6. Primary Verification Path (`guardian_verify`) & Fallback Spec Rules: when `guardian_verify` is available, confirm EVERY runtime vulnerability by calling `guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")` (`prove_access_boundary`, `prove_persisted_mutation`, `prove_boolean_or_timing_diff`, `prove_oob_callback`, or `prove_race_burst`) so Guardian runs two fresh sessions and persists a verified ProofReceipt (`proof_kind="agent_script"`). For multi-hop chains (2–6 hops), ALWAYS seal intermediate artifacts via `ctx.seal_capability`, pass them host-side via `ctx.http_send({ ..., capability })` (plus `ctx.hmac_sign`/`ctx.jwt_sign`/`ctx.await_async` when needed), and confirm the full DAG via `ctx.prove_composite` in Mode A (`fresh_clean_replay`), starting strictly from a low-privilege/cross-tenant attacker persona (never a pre-seeded `owner`/`admin` persona on the attack arm). On failure read `rejectedBy`, `missingEvidence`, and `transcriptSummary` and repair the script in the next turn. Use `propose_chain_finding` / `verify_replay_spec` ONLY as legacy fallback (for `static_ast_proof` -> `static_verified` tier, or when `guardian_verify` is absent; retired legacy kinds `dns_takeover`, `tls_audit`, `browser_dom`, `ws_chain`, `upload_probe` fail closed). Every `propose_chain_finding` call requires non-empty counterevidence, confidenceRationale, and a valid DeclarativeReplaySpec; if deduplication returns an existing findingId, call `update_proposed_finding` instead of creating duplicates.',
+    '6. Primary Verification Path (`guardian_verify`) & Fallback Spec Rules: when `guardian_verify` is available, confirm EVERY runtime vulnerability by calling `guardian_verify(script="<inline TS using ctx.prove_*>", runtime="ts")` (`prove_access_boundary`, `prove_persisted_mutation`, `prove_boolean_or_timing_diff`, `prove_oob_callback`, or `prove_race_burst`) so Guardian runs two fresh sessions and persists a verified ProofReceipt (`proof_kind="agent_script"`). For multi-hop chains (2–6 hops), ALWAYS seal intermediate artifacts via `ctx.seal_capability`, pass them host-side via `ctx.http_send({ ..., capability })` (plus `ctx.hmac_sign`/`ctx.jwt_sign`/`ctx.await_async` when needed), and confirm the full DAG via `ctx.prove_composite` in Mode A (`fresh_clean_replay`), starting strictly from a low-privilege/cross-tenant attacker persona (never a pre-seeded `owner`/`admin` persona on the attack arm). On failure read `rejectedBy`, `missingEvidence`, and `transcriptSummary` and repair the script in the next turn. Use `propose_chain_finding` / `verify_replay_spec` ONLY as legacy fallback (for `static_ast_proof` -> `static_verified` tier, or when `guardian_verify` is absent; retired legacy kinds `dns_takeover`, `tls_audit`, `browser_dom`, `ws_chain`, `upload_probe` fail closed). Every `propose_chain_finding` call requires non-empty counterevidence, confidenceRationale, and a valid DeclarativeReplaySpec; if deduplication returns an existing findingId, call `update_proposed_finding` instead of creating duplicates.',
     '7. Never craft destructive payloads, webshells, reverse shells, file writes, or credential exfiltration. Never probe internal IPs or cloud metadata endpoints; use benign signed OOB HTTP/DNS canaries (mint_canary/check_canary) for blind outbound validation. Active rce_proof specs require Tier 3 HITL approval (or local-lab) and strictly non-destructive verifier-minted nonces.',
     '8. When finished (or when entering the 85% settlement phase), commit all unrecorded facts, 3-state coverage entries, and `guardian_verify` proof scripts (or coded `proofGapReason`), then call complete_intent with status (proved | ruled_out | blocked | partial) and a concise evidence-backed summary.',
     boardGuardrailInstructions(),
@@ -2913,13 +2916,13 @@ export function workerSessionInstructions(
 ): string {
   const base = scenarioInstructions[scenario]
   if (scenario === 'worker-investigation' && options?.hasGuardianVerify) {
-    return `${base}\nPRIMARY PROOF CONTRACT: \`guardian_verify\` is active in this session. Confirm EVERY runtime vulnerability via \`guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")\` so Guardian persists a verified ProofReceipt (\`proof_kind="agent_script"\`). For multi-hop chains (2–6 hops), ALWAYS seal intermediate artifacts via \`ctx.seal_capability\`, inject them via \`ctx.http_send({ ..., capability })\` (plus \`ctx.hmac_sign\`/\`ctx.jwt_sign\`/\`ctx.await_async\` as needed), and confirm the full DAG via \`ctx.prove_composite\` in Mode A (\`fresh_clean_replay\`), starting strictly from a low-privilege/cross-tenant attacker persona (never a pre-seeded \`owner\` persona on the attack arm). Do NOT call legacy \`verify_replay_spec\` or \`propose_chain_finding\` with \`http_chain\` for runtime proofs.\n${GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN}`
+    return `${base}\nPRIMARY PROOF CONTRACT: \`guardian_verify\` is active in this session. Confirm EVERY runtime vulnerability via \`guardian_verify(script="<inline TS using ctx.prove_*>", runtime="ts")\` so Guardian persists a verified ProofReceipt (\`proof_kind="agent_script"\`). For multi-hop chains (2–6 hops), ALWAYS seal intermediate artifacts via \`ctx.seal_capability\`, inject them via \`ctx.http_send({ ..., capability })\` (plus \`ctx.hmac_sign\`/\`ctx.jwt_sign\`/\`ctx.await_async\` as needed), and confirm the full DAG via \`ctx.prove_composite\` in Mode A (\`fresh_clean_replay\`), starting strictly from a low-privilege/cross-tenant attacker persona (never a pre-seeded \`owner\` persona on the attack arm). Do NOT call legacy \`verify_replay_spec\` or \`propose_chain_finding\` with \`http_chain\` for runtime proofs.\n${GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN}`
   }
   return base
 }
 
 function derivedRepairFix(result: Record<string, unknown>, preferGuardianVerify = false): string {
-  const toolHint = preferGuardianVerify ? 'guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")' : 'verify_replay_spec'
+  const toolHint = preferGuardianVerify ? 'guardian_verify(script="<inline TS using ctx.prove_*>", runtime="ts")' : 'verify_replay_spec'
   const jqError = typeof result.jqError === 'string' ? result.jqError : ''
   const failedStepId = typeof result.failedStepId === 'string' ? result.failedStepId : ''
   const reason = isPlainRecord(result.assertionSummary) && typeof result.assertionSummary.reason === 'string'
