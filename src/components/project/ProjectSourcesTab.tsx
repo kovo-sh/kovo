@@ -14,6 +14,7 @@ import {
 import { maxSpecBytes } from '../../domain.ts'
 import { formatHumanTime, FormError, useAction } from '../common.tsx'
 import { Checkbox } from '../ui/checkbox.tsx'
+import { GithubInstallBanner } from './GithubInstallBanner.tsx'
 import type { DiscoveredGithubRepo, ProjectLoaderData } from './types.ts'
 import { safeHost } from './types.ts'
 
@@ -80,6 +81,7 @@ function formatGithubConnectionBadge(status: ProjectLoaderData['githubPatStatus'
 export function ProjectSourcesTab({ data }: Props) {
   const { project, specs, githubPatStatus } = data
   const router = useRouter()
+  const [liveGithubStatus, setLiveGithubStatus] = useState(githubPatStatus)
   const [githubTokenInput, setGithubTokenInput] = useState('')
   const [editingGithubToken, setEditingGithubToken] = useState(false)
   const [repoPickerOpen, setRepoPickerOpen] = useState(false)
@@ -103,6 +105,10 @@ export function ProjectSourcesTab({ data }: Props) {
 
   const githubAction = useAction()
   const specAction = useAction()
+
+  useEffect(() => {
+    setLiveGithubStatus(githubPatStatus)
+  }, [githubPatStatus])
 
   useEffect(() => {
     activeFlowIdRef.current = deviceFlow?.flowId ?? null
@@ -141,6 +147,7 @@ export function ProjectSourcesTab({ data }: Props) {
           setEditingGithubToken(false)
           setCodeCopied(false)
           setClientIdInput('')
+          setLiveGithubStatus(res.accountStatus)
           const who = res.login ? ` · @${res.login}` : ''
           setGithubNotice(`Connected via GitHub App${who}. Found ${res.repoCount} accessible ${res.repoCount === 1 ? 'repository' : 'repositories'}.`)
           await router.invalidate()
@@ -209,6 +216,7 @@ export function ProjectSourcesTab({ data }: Props) {
   function loadGithubRepos() {
     setGithubNotice('')
     void githubAction.submit(() => listGithubRepositories(), result => {
+      setLiveGithubStatus(result.status)
       setDiscoveredRepos(result.repos)
       setSelectedRepos(result.defaultSelected)
       setReposTruncated(result.truncated)
@@ -426,6 +434,7 @@ export function ProjectSourcesTab({ data }: Props) {
                 setGithubNotice('')
                 setDeviceFlowError('')
                 void githubAction.submit(() => saveGithubToken({ data: { token } }), result => {
+                  setLiveGithubStatus(result.status)
                   setGithubTokenInput('')
                   setEditingGithubToken(false)
                   setDiscoveredRepos(result.repos)
@@ -480,6 +489,7 @@ export function ProjectSourcesTab({ data }: Props) {
               onClick={() => {
                 setGithubNotice('')
                 void githubAction.submit(() => clearGithubToken(), result => {
+                  setLiveGithubStatus(result.status)
                   setDiscoveredRepos([])
                   setSelectedRepos([])
                   setReposLoaded(false)
@@ -501,6 +511,18 @@ export function ProjectSourcesTab({ data }: Props) {
           Read-only shallow clone + automatic OpenAPI, GraphQL, route, and lockfile extraction.
           {reposTruncated && ' Showing the 200 most recently updated repositories.'}
         </p>
+
+        <GithubInstallBanner
+          authKind={liveGithubStatus.authKind}
+          tokenKind={liveGithubStatus.tokenKind}
+          login={liveGithubStatus.login}
+          installUrl={liveGithubStatus.installUrl}
+          installations={liveGithubStatus.installations}
+          privateRepoCount={liveGithubStatus.privateRepoCount}
+          needsAppInstall={liveGithubStatus.needsAppInstall}
+          loading={githubAction.pending}
+          onRefresh={loadGithubRepos}
+        />
 
         {githubPatStatus.source === 'fixture' && (
           <p

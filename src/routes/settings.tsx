@@ -4,6 +4,7 @@ import {
   cancelGithubDeviceFlowAction,
   clearGithubToken,
   getGithubStatus,
+  listGithubRepositories,
   listModels,
   pollGithubDeviceFlowAction,
   removeModelProfile,
@@ -13,6 +14,7 @@ import {
   toggleModelProfile,
 } from '../actions.ts'
 import { formatHumanTime, useAction } from '../components/common.tsx'
+import { GithubInstallBanner } from '../components/project/GithubInstallBanner.tsx'
 import { ModelProfileSheet } from '../components/settings/ModelProfileSheet.tsx'
 import '../components/settings/settings.css'
 import { id } from '../domain.ts'
@@ -103,13 +105,53 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
   const [patInput, setPatInput] = useState('')
   const [savingPat, setSavingPat] = useState(false)
   const [disconnecting, setDisconnecting] = useState(false)
+  const [loadingInstallations, setLoadingInstallations] = useState(false)
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const activeFlowIdRef = useRef<string | null>(null)
+  const autoFetchedInstallationsRef = useRef(false)
+
+  const isGithubAppSession = status.configured && (status.authKind === 'github_app_device' || status.tokenKind === 'github_app')
 
   useEffect(() => {
     setStatus(initialStatus)
   }, [initialStatus])
+
+  useEffect(() => {
+    if (!isGithubAppSession) {
+      autoFetchedInstallationsRef.current = false
+      return
+    }
+    if (status.installations !== undefined || autoFetchedInstallationsRef.current) return
+    autoFetchedInstallationsRef.current = true
+    let cancelled = false
+    setLoadingInstallations(true)
+    void listGithubRepositories()
+      .then(res => {
+        if (!cancelled) setStatus(res.status)
+      })
+      .catch(() => {
+        // Best-effort background refresh; user can still click Refresh
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingInstallations(false)
+      })
+    return () => { cancelled = true }
+  }, [isGithubAppSession, status.installations])
+
+  async function refreshGithubInstallations() {
+    if (loadingInstallations || disconnecting || startingFlow || savingPat) return
+    setLoadingInstallations(true)
+    setError('')
+    try {
+      const res = await listGithubRepositories()
+      setStatus(res.status)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not refresh GitHub installations.')
+    } finally {
+      setLoadingInstallations(false)
+    }
+  }
 
   useEffect(() => {
     activeFlowIdRef.current = deviceFlow?.flowId ?? null
@@ -318,6 +360,22 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
             ) : null}
           </div>
         </div>
+
+        {isGithubAppSession && !reconnecting && !deviceFlow && (
+          <div className="sw-gh-install-row">
+            <GithubInstallBanner
+              authKind={status.authKind}
+              tokenKind={status.tokenKind}
+              login={status.login}
+              installUrl={status.installUrl}
+              installations={status.installations}
+              privateRepoCount={status.privateRepoCount}
+              needsAppInstall={status.needsAppInstall}
+              loading={loadingInstallations}
+              onRefresh={() => void refreshGithubInstallations()}
+            />
+          </div>
+        )}
 
         {showConnectPanel && !deviceFlow && (!status.githubDeviceFlowConfigured || reconnecting) && (
           <div className="sw-pair-drawer">

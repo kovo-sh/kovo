@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   accessSync,
   chmodSync,
@@ -38,12 +38,25 @@ export interface GithubPatStatus {
   tokenKind: GithubPatKind | null
 }
 
+export interface GithubAppInstallationSummary {
+  id: number
+  accountLogin: string
+  accountType: string
+  repositorySelection: 'all' | 'selected' | 'unknown'
+  htmlUrl?: string
+}
+
 export interface GithubAuthStatus extends GithubPatStatus {
   authKind: GithubAuthKind | null
   login: string | null
   expiresAt: string | null
   githubDeviceFlowConfigured: boolean
   clientIdSource: 'env' | 'vault' | null
+  appSlug: string | null
+  installUrl: string | null
+  installations?: GithubAppInstallationSummary[]
+  needsAppInstall?: boolean
+  privateRepoCount?: number
 }
 
 export interface StoredGithubVaultCredential {
@@ -118,6 +131,10 @@ export interface ListAccessibleGithubReposResult {
   repos: AccessibleGithubRepo[]
   tokenKind: GithubPatKind
   truncated: boolean
+  installations: GithubAppInstallationSummary[]
+  installUrl: string | null
+  needsAppInstall: boolean
+  privateRepoCount: number
 }
 
 export interface RepoDependency {
@@ -353,10 +370,69 @@ function readOwnerOnlyFile(filePath: string, label: string): string {
   return readFileSync(filePath, 'utf8').trim()
 }
 
+const githubAppSlugPattern = /^[a-z0-9-]+$/
+
+function normalizeGithubAppSlug(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  const trimmed = raw.trim()
+  if (!trimmed || trimmed.length > 100 || !githubAppSlugPattern.test(trimmed)) {
+    return null
+  }
+  return trimmed
+}
+
+function readVaultGithubAppConfig(dataDir?: string): { clientId?: string; appSlug?: string } {
+  if (!dataDir) return {}
+  const appConfigPath = vaultGithubAppConfigPath(dataDir)
+  if (!existsSync(appConfigPath)) return {}
+  try {
+    const raw = readOwnerOnlyFile(appConfigPath, 'GitHub App config file')
+    const parsed = JSON.parse(raw) as { clientId?: unknown; appSlug?: unknown }
+    const out: { clientId?: string; appSlug?: string } = {}
+    if (typeof parsed.clientId === 'string' && parsed.clientId.trim()) {
+      try {
+        out.clientId = validateGithubClientId(parsed.clientId)
+      } catch {
+        // Ignore malformed clientId
+      }
+    }
+    const slug = normalizeGithubAppSlug(parsed.appSlug)
+    if (slug) {
+      out.appSlug = slug
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
 export function saveGithubClientId(dataDir: string, rawClientId: string): string {
   const clientId = validateGithubClientId(rawClientId)
-  writeAtomic0600(vaultGithubAppConfigPath(dataDir), `${JSON.stringify({ clientId }, null, 2)}\n`)
+  const existing = readVaultGithubAppConfig(dataDir)
+  writeAtomic0600(
+    vaultGithubAppConfigPath(dataDir),
+    `${JSON.stringify({ ...existing, clientId }, null, 2)}\n`,
+  )
   return clientId
+}
+
+export function resolveGithubAppSlug(dataDir?: string): string | null {
+  const envRaw = process.env.GUARDIAN_GITHUB_APP_SLUG
+  if (typeof envRaw === 'string' && envRaw.trim().length > 0) {
+    return normalizeGithubAppSlug(envRaw)
+  }
+  const vaultConfig = readVaultGithubAppConfig(dataDir)
+  return vaultConfig.appSlug ?? null
+}
+
+export function githubAppInstallUrl(
+  slug: string | null | undefined,
+  githubBaseUrl = DEFAULT_GITHUB_BASE_URL,
+): string | null {
+  const validSlug = normalizeGithubAppSlug(slug)
+  if (!validSlug) return null
+  const base = (githubBaseUrl || DEFAULT_GITHUB_BASE_URL).replace(/\/+$/, '')
+  return `${base}/apps/${validSlug}/installations/new`
 }
 
 function readVaultGithubClientId(dataDir?: string): string | null {
@@ -370,19 +446,7 @@ function readVaultGithubClientId(dataDir?: string): string | null {
       // Fall through to github-app.json
     }
   }
-  const appConfigPath = vaultGithubAppConfigPath(dataDir)
-  if (existsSync(appConfigPath)) {
-    try {
-      const raw = readOwnerOnlyFile(appConfigPath, 'GitHub App config file')
-      const parsed = JSON.parse(raw) as { clientId?: unknown }
-      if (typeof parsed.clientId === 'string' && parsed.clientId.trim()) {
-        return validateGithubClientId(parsed.clientId)
-      }
-    } catch {
-      return null
-    }
-  }
-  return null
+  return readVaultGithubAppConfig(dataDir).clientId ?? null
 }
 
 export function resolveGithubClientId(
@@ -471,6 +535,23 @@ function readGithubPat(patPath = DEFAULT_GITHUB_PAT_PATH): string {
   return readGithubVaultCredential(patPath).accessToken
 }
 
+interface ObservedGithubInstallations {
+  tokenFingerprint: string
+  installations: GithubAppInstallationSummary[]
+  needsAppInstall: boolean
+  privateRepoCount: number
+}
+
+const observedGithubInstallations = new Map<string, ObservedGithubInstallations>()
+
+function fingerprintGithubToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex').slice(0, 16)
+}
+
+function clearObservedGithubInstallations(filePath: string): void {
+  observedGithubInstallations.delete(resolve(filePath))
+}
+
 export function saveGithubVaultCredential(
   dataDir: string,
   credential: StoredGithubVaultCredential,
@@ -487,7 +568,9 @@ export function saveGithubVaultCredential(
     ...(credential.login && credential.login.trim() ? { login: credential.login.trim().slice(0, 100) } : {}),
     authKind: credential.authKind === 'github_app_device' ? 'github_app_device' : 'pat',
   }
-  writeAtomic0600(vaultGithubPatPath(dataDir), `${JSON.stringify(normalized, null, 2)}\n`)
+  const patPath = vaultGithubPatPath(dataDir)
+  clearObservedGithubInstallations(patPath)
+  writeAtomic0600(patPath, `${JSON.stringify(normalized, null, 2)}\n`)
   if (normalized.clientId) {
     saveGithubClientId(dataDir, normalized.clientId)
   }
@@ -499,7 +582,9 @@ export function saveGithubPat(dataDir: string, rawToken: string): GithubPatStatu
   if (!token || token.length < 10 || token.length > 512 || /[\s\0]/.test(token)) {
     throw new Error('GitHub PAT must be a single non-empty token without whitespace.')
   }
-  writeAtomic0600(vaultGithubPatPath(dataDir), `${token}\n`)
+  const patPath = vaultGithubPatPath(dataDir)
+  clearObservedGithubInstallations(patPath)
+  writeAtomic0600(patPath, `${token}\n`)
   return {
     configured: true,
     source: 'vault',
@@ -509,6 +594,7 @@ export function saveGithubPat(dataDir: string, rawToken: string): GithubPatStatu
 
 export function clearGithubPat(dataDir: string): { cleared: boolean; status: GithubPatStatus } {
   const patPath = vaultGithubPatPath(dataDir)
+  clearObservedGithubInstallations(patPath)
   let cleared = false
   try {
     lstatSync(patPath)
@@ -549,11 +635,17 @@ export function getGithubPatStatus(dataDir?: string, explicitPatPath?: string): 
   }
 }
 
-export function getGithubAuthStatus(dataDir?: string, explicitPatPath?: string): GithubAuthStatus {
+export function getGithubAuthStatus(
+  dataDir?: string,
+  explicitPatPath?: string,
+  githubBaseUrl?: string,
+): GithubAuthStatus {
   const resolvedClient = resolveGithubClientId(dataDir)
   const clientIdSource = resolvedClient.source === 'env' || resolvedClient.source === 'vault'
     ? resolvedClient.source
     : null
+  const appSlug = resolveGithubAppSlug(dataDir)
+  const installUrl = githubAppInstallUrl(appSlug, githubBaseUrl)
   const baseUnconfigured: GithubAuthStatus = {
     configured: false,
     source: null,
@@ -563,6 +655,8 @@ export function getGithubAuthStatus(dataDir?: string, explicitPatPath?: string):
     expiresAt: null,
     githubDeviceFlowConfigured: Boolean(resolvedClient.clientId),
     clientIdSource,
+    appSlug,
+    installUrl,
   }
 
   const readStatusFromPath = (targetPath: string, source: GithubPatSource): GithubAuthStatus => {
@@ -570,6 +664,10 @@ export function getGithubAuthStatus(dataDir?: string, explicitPatPath?: string):
     const effectiveClient = cred.clientId
       ? { clientId: cred.clientId, source: (clientIdSource ?? 'vault') as 'env' | 'vault' }
       : { clientId: resolvedClient.clientId, source: clientIdSource }
+    const observed = observedGithubInstallations.get(resolve(targetPath))
+    const observedMatch = observed && observed.tokenFingerprint === fingerprintGithubToken(cred.accessToken)
+      ? observed
+      : null
     return {
       configured: true,
       source,
@@ -579,6 +677,15 @@ export function getGithubAuthStatus(dataDir?: string, explicitPatPath?: string):
       expiresAt: cred.expiresAt ?? null,
       githubDeviceFlowConfigured: Boolean(effectiveClient.clientId),
       clientIdSource: effectiveClient.source,
+      appSlug,
+      installUrl,
+      ...(observedMatch
+        ? {
+            installations: observedMatch.installations.map(item => ({ ...item })),
+            needsAppInstall: observedMatch.needsAppInstall,
+            privateRepoCount: observedMatch.privateRepoCount,
+          }
+        : {}),
     }
   }
 
@@ -998,7 +1105,7 @@ export async function pollGithubDeviceFlow(
     throw new Error('Workspace data directory is required to store GitHub credentials.')
   }
 
-  const accountStatus = saveGithubVaultCredential(effectiveDataDir, {
+  let accountStatus = saveGithubVaultCredential(effectiveDataDir, {
     accessToken,
     ...(refreshToken ? { refreshToken } : {}),
     ...(expiresAt ? { expiresAt } : {}),
@@ -1020,6 +1127,7 @@ export async function pollGithubDeviceFlow(
       signal: options.signal,
     })
     repoCount = listed.repos.length
+    accountStatus = getGithubAuthStatus(effectiveDataDir, undefined, githubBase)
   } catch {
     // Non-fatal: token is stored; caller can refresh repo list separately
   }
@@ -1078,6 +1186,7 @@ export async function listAccessibleGithubRepos(
   options: ListAccessibleGithubReposOptions = {},
 ): Promise<ListAccessibleGithubReposResult> {
   options.signal?.throwIfAborted()
+  const effectivePath = options.patPath ?? resolveGithubPatPath(options.dataDir)
   const cred = await resolveFreshGithubCredential({
     dataDir: options.dataDir,
     patPath: options.patPath,
@@ -1087,6 +1196,7 @@ export async function listAccessibleGithubRepos(
   })
   const pat = cred.accessToken
   const tokenKind = classifyGithubPatKind(pat)
+  const isGithubAppToken = cred.authKind === 'github_app_device' || tokenKind === 'github_app'
   const secrets: NamedSecret[] = [
     { value: pat, placeholder: '[redacted]' },
     ...(cred.refreshToken ? [{ value: cred.refreshToken, placeholder: '[redacted]' }] : []),
@@ -1105,76 +1215,65 @@ export async function listAccessibleGithubRepos(
   }
 
   const repos: AccessibleGithubRepo[] = []
-  const seen = new Set<string>()
+  const repoIndexByKey = new Map<string, number>()
+  const installations: GithubAppInstallationSummary[] = []
   let truncated = false
+  let installationsChecked = false
 
-  const appendRepoBatch = (batch: Array<{
+  type RawRepoItem = {
     full_name?: unknown
     private?: unknown
     default_branch?: unknown
     updated_at?: unknown
     description?: unknown
-  }>) => {
+  }
+
+  const appendRepoBatch = (batch: RawRepoItem[]) => {
     for (const item of batch) {
-      if (repos.length >= maxRepos) {
-        truncated = true
-        break
-      }
       const fullName = typeof item.full_name === 'string' ? item.full_name.trim() : ''
-      if (!fullName || !repoFullNamePattern.test(fullName) || seen.has(fullName)) continue
-      seen.add(fullName)
+      if (!fullName || !repoFullNamePattern.test(fullName)) continue
       const description = typeof item.description === 'string' && item.description.trim()
         ? redact(item.description.trim(), secrets).slice(0, 240)
         : null
-      repos.push({
+      const candidate: AccessibleGithubRepo = {
         fullName,
         private: Boolean(item.private),
         defaultBranch: typeof item.default_branch === 'string' && item.default_branch.trim() ? item.default_branch.trim() : 'main',
         updatedAt: typeof item.updated_at === 'string' && item.updated_at.trim() ? item.updated_at.trim() : null,
         description,
-      })
-    }
-  }
-
-  for (let page = 1; page <= maxPages; page += 1) {
-    options.signal?.throwIfAborted()
-    const query = `per_page=${perPage}&sort=updated&affiliation=owner,collaborator,organization_member${page > 1 ? `&page=${page}` : ''}`
-    const reqSignal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(20_000)]) : AbortSignal.timeout(20_000)
-    const res = await fetchFn(`${apiBase}/user/repos?${query}`, { method: 'GET', headers, signal: reqSignal })
-    if (!res.ok) {
-      const body = redact(await res.text().catch(() => ''), secrets).slice(0, 240)
-      if (res.status === 401) {
-        throw new Error(`GitHub rejected the token (HTTP 401): ${body || 'Bad credentials'}`)
       }
-      if (res.status === 403) {
-        throw new Error(`GitHub denied repository access (HTTP 403): ${body || 'Insufficient permissions'}`)
+      const key = fullName.toLowerCase()
+      const existingIdx = repoIndexByKey.get(key)
+      if (existingIdx !== undefined) {
+        const existing = repos[existingIdx]!
+        if (candidate.private && !existing.private) {
+          repos[existingIdx] = {
+            fullName: candidate.fullName,
+            private: true,
+            defaultBranch: candidate.defaultBranch,
+            updatedAt: candidate.updatedAt ?? existing.updatedAt,
+            description: candidate.description ?? existing.description,
+          }
+        } else {
+          repos[existingIdx] = {
+            ...existing,
+            description: existing.description ?? candidate.description,
+            updatedAt: existing.updatedAt ?? candidate.updatedAt,
+          }
+        }
+        continue
       }
-      throw new Error(`GitHub API GET /user/repos failed (${res.status}): ${body}`)
-    }
-    const batch = await res.json() as Array<{
-      full_name?: unknown
-      private?: unknown
-      default_branch?: unknown
-      updated_at?: unknown
-      description?: unknown
-    }>
-    if (!Array.isArray(batch) || batch.length === 0) break
-
-    appendRepoBatch(batch)
-
-    if (batch.length < perPage) break
-    if (repos.length >= maxRepos) {
-      const linkHeader = res.headers?.get?.('link') ?? ''
-      if (linkHeader.includes('rel="next"') || page === maxPages) {
+      if (repos.length >= maxRepos) {
         truncated = true
+        break
       }
-      break
+      repoIndexByKey.set(key, repos.length)
+      repos.push(candidate)
     }
   }
 
-  // GitHub App user-to-server tokens expose installation repositories via /user/installations.
-  // Merge those when /user/repos is empty or when authenticated via GitHub App Device Flow.
-  if ((repos.length === 0 || cred.authKind === 'github_app_device' || tokenKind === 'github_app') && repos.length < maxRepos) {
+  const fetchInstallationRepos = async (throwOnAuthFailure: boolean): Promise<void> => {
+    installationsChecked = true
     try {
       options.signal?.throwIfAborted()
       const instSignal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(20_000)]) : AbortSignal.timeout(20_000)
@@ -1183,55 +1282,151 @@ export async function listAccessibleGithubRepos(
         headers,
         signal: instSignal,
       })
-      if (instRes.ok) {
-        const instPayload = await instRes.json() as { installations?: Array<{ id?: unknown }> }
-        const installations = Array.isArray(instPayload.installations) ? instPayload.installations : []
-        for (const installation of installations.slice(0, 20)) {
+      if (!instRes.ok) {
+        if (throwOnAuthFailure && instRes.status === 401) {
+          const body = redact(await instRes.text().catch(() => ''), secrets).slice(0, 240)
+          throw new Error(`GitHub rejected the token (HTTP 401): ${body || 'Bad credentials'}`)
+        }
+        return
+      }
+      const instPayload = await instRes.json() as {
+        installations?: Array<{
+          id?: unknown
+          account?: { login?: unknown; type?: unknown }
+          repository_selection?: unknown
+          html_url?: unknown
+        }>
+      }
+      const rawInstallations = Array.isArray(instPayload.installations) ? instPayload.installations : []
+      for (const installation of rawInstallations.slice(0, 50)) {
+        const instId = typeof installation.id === 'number' && Number.isSafeInteger(installation.id) && installation.id > 0
+          ? installation.id
+          : null
+        if (!instId) continue
+        const accountLogin = typeof installation.account?.login === 'string' && installation.account.login.trim()
+          ? installation.account.login.trim().slice(0, 100)
+          : `installation-${instId}`
+        const accountType = typeof installation.account?.type === 'string' && installation.account.type.trim()
+          ? installation.account.type.trim().slice(0, 40)
+          : 'Unknown'
+        const repositorySelection: GithubAppInstallationSummary['repositorySelection'] =
+          installation.repository_selection === 'all'
+            ? 'all'
+            : installation.repository_selection === 'selected'
+              ? 'selected'
+              : 'unknown'
+        const htmlUrl = typeof installation.html_url === 'string' && /^https?:\/\//i.test(installation.html_url.trim())
+          ? installation.html_url.trim()
+          : undefined
+        installations.push({
+          id: instId,
+          accountLogin,
+          accountType,
+          repositorySelection,
+          ...(htmlUrl ? { htmlUrl } : {}),
+        })
+      }
+
+      for (const installation of installations.slice(0, 20)) {
+        if (repos.length >= maxRepos) {
+          truncated = true
+          break
+        }
+        for (let page = 1; page <= maxPages && repos.length < maxRepos; page += 1) {
+          options.signal?.throwIfAborted()
+          const repoSignal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(20_000)]) : AbortSignal.timeout(20_000)
+          const repoRes = await fetchFn(
+            `${apiBase}/user/installations/${installation.id}/repositories?per_page=${perPage}${page > 1 ? `&page=${page}` : ''}`,
+            { method: 'GET', headers, signal: repoSignal },
+          )
+          if (!repoRes.ok) break
+          const repoPayload = await repoRes.json() as { repositories?: RawRepoItem[] }
+          const batch = Array.isArray(repoPayload.repositories) ? repoPayload.repositories : []
+          if (batch.length === 0) break
+          appendRepoBatch(batch)
+          if (batch.length < perPage) break
           if (repos.length >= maxRepos) {
-            truncated = true
+            const linkHeader = repoRes.headers?.get?.('link') ?? ''
+            if (linkHeader.includes('rel="next"') || page === maxPages) {
+              truncated = true
+            }
             break
-          }
-          const instId = typeof installation.id === 'number' && Number.isSafeInteger(installation.id) && installation.id > 0
-            ? installation.id
-            : null
-          if (!instId) continue
-          for (let page = 1; page <= maxPages && repos.length < maxRepos; page += 1) {
-            options.signal?.throwIfAborted()
-            const repoSignal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(20_000)]) : AbortSignal.timeout(20_000)
-            const repoRes = await fetchFn(
-              `${apiBase}/user/installations/${instId}/repositories?per_page=${perPage}${page > 1 ? `&page=${page}` : ''}`,
-              { method: 'GET', headers, signal: repoSignal },
-            )
-            if (!repoRes.ok) break
-            const repoPayload = await repoRes.json() as {
-              repositories?: Array<{
-                full_name?: unknown
-                private?: unknown
-                default_branch?: unknown
-                updated_at?: unknown
-                description?: unknown
-              }>
-            }
-            const batch = Array.isArray(repoPayload.repositories) ? repoPayload.repositories : []
-            if (batch.length === 0) break
-            appendRepoBatch(batch)
-            if (batch.length < perPage) break
-            if (repos.length >= maxRepos) {
-              const linkHeader = repoRes.headers?.get?.('link') ?? ''
-              if (linkHeader.includes('rel="next"') || page === maxPages) {
-                truncated = true
-              }
-              break
-            }
           }
         }
       }
-    } catch {
+    } catch (err) {
+      if (throwOnAuthFailure && err instanceof Error && err.message.includes('HTTP 401')) {
+        throw err
+      }
       // Best-effort fallback for GitHub App installations; keep any /user/repos results intact.
     }
   }
 
-  return { repos, tokenKind, truncated }
+  // For GitHub App user-to-server tokens, query /user/installations FIRST so explicitly
+  // installed private & org repos are always surfaced ahead of old public /user/repos entries.
+  if (isGithubAppToken) {
+    await fetchInstallationRepos(true)
+  }
+
+  if (repos.length < maxRepos) {
+    for (let page = 1; page <= maxPages; page += 1) {
+      options.signal?.throwIfAborted()
+      const query = `per_page=${perPage}&sort=updated&affiliation=owner,collaborator,organization_member${page > 1 ? `&page=${page}` : ''}`
+      const reqSignal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(20_000)]) : AbortSignal.timeout(20_000)
+      const res = await fetchFn(`${apiBase}/user/repos?${query}`, { method: 'GET', headers, signal: reqSignal })
+      if (!res.ok) {
+        if (isGithubAppToken && repos.length > 0 && res.status !== 401) {
+          break
+        }
+        const body = redact(await res.text().catch(() => ''), secrets).slice(0, 240)
+        if (res.status === 401) {
+          throw new Error(`GitHub rejected the token (HTTP 401): ${body || 'Bad credentials'}`)
+        }
+        if (res.status === 403) {
+          throw new Error(`GitHub denied repository access (HTTP 403): ${body || 'Insufficient permissions'}`)
+        }
+        throw new Error(`GitHub API GET /user/repos failed (${res.status}): ${body}`)
+      }
+      const batch = await res.json() as RawRepoItem[]
+      if (!Array.isArray(batch) || batch.length === 0) break
+
+      appendRepoBatch(batch)
+
+      if (batch.length < perPage) break
+      if (repos.length >= maxRepos) {
+        const linkHeader = res.headers?.get?.('link') ?? ''
+        if (linkHeader.includes('rel="next"') || page === maxPages) {
+          truncated = true
+        }
+        break
+      }
+    }
+  }
+
+  if (!installationsChecked && repos.length === 0 && repos.length < maxRepos) {
+    await fetchInstallationRepos(false)
+  }
+
+  const installUrl = githubAppInstallUrl(resolveGithubAppSlug(options.dataDir), options.githubBaseUrl)
+  const needsAppInstall = isGithubAppToken && installations.length === 0
+  const privateRepoCount = repos.reduce((count, repo) => count + (repo.private ? 1 : 0), 0)
+
+  observedGithubInstallations.set(resolve(effectivePath), {
+    tokenFingerprint: fingerprintGithubToken(pat),
+    installations: installations.map(item => ({ ...item })),
+    needsAppInstall,
+    privateRepoCount,
+  })
+
+  return {
+    repos,
+    tokenKind,
+    truncated,
+    installations,
+    installUrl,
+    needsAppInstall,
+    privateRepoCount,
+  }
 }
 
 function classifyRepoPath(filePath: string): { category: SyncedRepoFile['category']; priority: number } | null {
