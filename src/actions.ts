@@ -29,7 +29,7 @@ import {
   startGithubDeviceFlow,
   syncGithubRepos,
 } from './server/github-connector.ts'
-import { assertLocalLabAllowed, LabRunner } from './server/lab-runner.ts'
+import { assertLocalLabAllowed } from './server/lab-runner.ts'
 import type { LabTargetHandle } from './server/lab-runner.ts'
 import {
   checkModelConnection,
@@ -57,69 +57,7 @@ import { readWorkerSession, testPersonaAuth } from './server/worker-session-read
 export const workspaceData = createServerFn({ method: 'GET' }).handler(() => {
   const db = store()
   const githubPatStatus = getGithubAuthStatus(db.directory)
-  const workspaceList = db.listWorkspace()
-  const workspaceId = workspaceList.workspace.id
-
-  const runCountRows = db.client.prepare(`
-    select project_id as projectId, count(*) as runCount
-    from runs
-    where workspace_id = ?
-    group by project_id
-  `).all(workspaceId) as { projectId: string; runCount: number }[]
-  const runCounts = new Map(runCountRows.map(r => [r.projectId, Number(r.runCount)]))
-
-  const hostCountRows = db.client.prepare(`
-    select a.project_id as projectId, count(*) as hostCount
-    from project_assets a
-    join projects p on p.id = a.project_id
-    where p.workspace_id = ?
-    group by a.project_id
-  `).all(workspaceId) as { projectId: string; hostCount: number }[]
-  const hostCounts = new Map(hostCountRows.map(r => [r.projectId, Number(r.hostCount)]))
-
-  const latestRunRows = db.client.prepare(`
-    select r.id as id, r.project_id as projectId, r.goal as goal, r.status as status, r.phase as phase,
-      r.created_at as startedAt,
-      (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
-        and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
-      (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findingCount
-    from runs r
-    where r.workspace_id = ?
-      and r.id = (
-        select r2.id from runs r2
-        where r2.project_id = r.project_id and r2.workspace_id = r.workspace_id
-        order by r2.created_at desc, r2.rowid desc
-        limit 1
-      )
-  `).all(workspaceId) as {
-    id: string; projectId: string; goal: string; status: string; phase: string
-    startedAt: number; confirmedCount: number; findingCount: number
-  }[]
-  const latestRuns = new Map(latestRunRows.map(r => [r.projectId, {
-    id: r.id,
-    goal: r.goal,
-    status: r.status,
-    phase: r.phase,
-    startedAt: Number(r.startedAt),
-    confirmedCount: Number(r.confirmedCount),
-    findingCount: Number(r.findingCount),
-  }]))
-
-  const recentRunRows = db.client.prepare(`
-    select r.id as id, r.project_id as projectId, p.name as projectName, r.goal as goal,
-      r.status as status, r.phase as phase, r.created_at as startedAt,
-      (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
-        and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
-      (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findings
-    from runs r
-    join projects p on p.id = r.project_id
-    where r.workspace_id = ?
-    order by r.created_at desc, r.rowid desc
-    limit 15
-  `).all(workspaceId) as {
-    id: string; projectId: string; projectName: string; goal: string; status: string; phase: string
-    startedAt: number; confirmedCount: number; findings: number
-  }[]
+  const summary = db.workspaceSummary()
 
   const profiles = listModelProfiles(db)
   const hasModel = modelReady(db)
@@ -131,19 +69,7 @@ export const workspaceData = createServerFn({ method: 'GET' }).handler(() => {
       : 'degraded'
 
   return {
-    workspace: workspaceList.workspace,
-    projects: workspaceList.projects.map(project => ({
-      ...project,
-      runCount: runCounts.get(project.id) ?? 0,
-      hostCount: hostCounts.get(project.id) ?? project.seeds.length,
-      latestRun: latestRuns.get(project.id) ?? null,
-    })),
-    recentRuns: recentRunRows.map(r => ({
-      ...r,
-      startedAt: Number(r.startedAt),
-      confirmedCount: Number(r.confirmedCount),
-      findings: Number(r.findings),
-    })),
+    ...summary,
     hasModel,
     poolHealth,
     hasGithubPat: githubPatStatus.configured,
@@ -180,12 +106,6 @@ export const removeModelProfile = createServerFn({ method: 'POST' })
   .handler(({ data }) => deleteModelProfile(data.profileId))
 
 // --- Projects, Assets, Specs, GitHub Sync & Personas ---
-
-let sharedLabRunner: LabRunner | undefined
-function getLabRunner(): LabRunner {
-  sharedLabRunner ??= new LabRunner()
-  return sharedLabRunner
-}
 
 function serializeLabTarget(handle: LabTargetHandle | undefined) {
   if (!handle) return null
@@ -226,7 +146,10 @@ export const removeProject = createServerFn({ method: 'POST' })
     projectId: id,
     stopActive: z.boolean().optional(),
   }))
-  .handler(({ data }) => deleteProjectWithActiveGuard(store(), execution(), getLabRunner(), data))
+  .handler(({ data }) => {
+    const exec = execution()
+    return deleteProjectWithActiveGuard(store(), exec, exec.labRunner, data)
+  })
 
 export const addProjectAsset = createServerFn({ method: 'POST' }).validator(projectAsset)
   .handler(({ data }) => store().addProjectAsset(data))
@@ -411,13 +334,9 @@ export const runData = createServerFn({ method: 'GET' })
     const detail = db.runDetail(data.runId)
     return {
       ...detail,
-      endpoints: db.listEndpoints(data.runId),
-      endpointParams: db.listEndpointParams(data.runId),
-      apiDependencies: db.listApiDependencies(data.runId),
-      labTelemetry: db.listLabTelemetry(data.runId),
-      labTarget: serializeLabTarget(getLabRunner().getTarget(data.runId)),
+      labTarget: serializeLabTarget(execution().labRunner.getTarget(data.runId)),
       localLabEnvEnabled: isLocalLabEnvEnabled(),
-      hasModel: modelReady(),
+      hasModel: modelReady(db),
     }
   })
 
@@ -425,21 +344,7 @@ export const runData = createServerFn({ method: 'GET' })
 // project names) and true totals for lists the run detail caps (exchanges, events).
 export const runShellData = createServerFn({ method: 'GET' })
   .validator(z.object({ runId: id }))
-  .handler(({ data }) => {
-    const db = store()
-    const run = db.run(data.runId)
-    const runs = db.client.prepare(`select r.id as id, r.goal as goal, r.status as status, r.phase as phase,
-        r.created_at as createdAt, r.project_id as projectId, p.name as projectName,
-        (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findings
-      from runs r join projects p on p.id = r.project_id
-      where r.workspace_id = ? order by r.created_at desc limit 200`).all(run.workspaceId) as {
-      id: string; goal: string; status: string; phase: string; createdAt: number; projectId: string; projectName: string; findings: number
-    }[]
-    const counts = db.client.prepare(`select
-        (select count(*) from broker_exchanges where run_id = ?) as exchanges,
-        (select count(*) from events where run_id = ?) as events`).get(run.id, run.id) as { exchanges: number; events: number }
-    return { runs: runs.map(r => ({ ...r, findings: Number(r.findings) })), counts: { exchanges: Number(counts.exchanges), events: Number(counts.events) } }
-  })
+  .handler(({ data }) => store().runShellSummary(data.runId))
 
 export const createRun = createServerFn({ method: 'POST' }).validator(newRun)
   .handler(({ data }) => store().createRun(data))
@@ -449,7 +354,10 @@ export const removeRun = createServerFn({ method: 'POST' })
     runId: id,
     stopActive: z.boolean().optional(),
   }))
-  .handler(({ data }) => deleteRunWithActiveGuard(store(), execution(), getLabRunner(), data))
+  .handler(({ data }) => {
+    const exec = execution()
+    return deleteRunWithActiveGuard(store(), exec, exec.labRunner, data)
+  })
 
 export const commandRun = createServerFn({ method: 'POST' }).validator(runCommand)
   .handler(({ data }) => {
@@ -534,7 +442,7 @@ export const startRunLabAction = createServerFn({ method: 'POST' })
       throw new Error('Enable local lab in Project settings before starting LabRunner.')
     }
     const repoDir = projectReposDir(db.directory, project.id)
-    const handle = await getLabRunner().startLabTarget({
+    const handle = await execution().labRunner.startLabTarget({
       runId: run.id,
       environment: project.environment,
       repoDir,
@@ -549,14 +457,14 @@ export const startRunLabAction = createServerFn({ method: 'POST' })
 export const stopRunLabAction = createServerFn({ method: 'POST' })
   .validator(z.object({ runId: id }))
   .handler(async ({ data }) => {
-    await getLabRunner().stopLabTarget(data.runId)
+    await execution().labRunner.stopLabTarget(data.runId)
     return { stopped: true }
   })
 
 export const checkRunLabHealthAction = createServerFn({ method: 'GET' })
   .validator(z.object({ runId: id }))
   .handler(async ({ data }) => {
-    const handle = getLabRunner().getTarget(data.runId)
+    const handle = execution().labRunner.getTarget(data.runId)
     if (!handle) {
       return { running: false, healthy: false, message: 'Lab stack is not running.' }
     }

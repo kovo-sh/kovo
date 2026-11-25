@@ -75,6 +75,66 @@ function removeLiveContainers(budgetMs = 4_000) {
   }
   removeLiveStagedRepoDirs()
 }
+export interface LiveExitHookTarget {
+  once(event: 'exit', listener: () => void): unknown
+  prependOnceListener(event: 'SIGTERM' | 'SIGINT', listener: () => void): unknown
+  listenerCount(event: 'SIGTERM' | 'SIGINT'): number
+  removeListener(event: 'exit' | 'SIGTERM' | 'SIGINT', listener: () => void): unknown
+}
+
+export interface LiveExitHookOptions {
+  /** Container/tempdir cleanup callback (defaults to `removeLiveContainers`). */
+  cleanup?: (budgetMs: number) => void
+  /** Terminal exit callback used ONLY when no sibling signal listener remains (defaults to `process.exit`). */
+  exit?: (code: number) => void
+  /** Signal emitter target (defaults to `process`). */
+  target?: LiveExitHookTarget
+}
+
+export interface InstalledLiveExitHooks {
+  dispose(): void
+}
+
+/** Explicit shutdown-coordinator hook to reap tracked worker containers & staged repo dirs. */
+export function cleanupLiveWorkerResources(budgetMs = 2_000): void {
+  removeLiveContainers(budgetMs)
+}
+
+/**
+ * Install bounded container/tempdir cleanup hooks on `exit`, `SIGTERM`, and `SIGINT`.
+ *
+ * Uses `prependOnceListener` on signals and only terminates the process when no other sibling
+ * listener remains registered for that signal, so graceful HTTP server, SQLite WAL, and LabRunner
+ * shutdown handlers always run without preemption.
+ */
+export function installLiveExitHooks(options: LiveExitHookOptions = {}): InstalledLiveExitHooks {
+  const cleanup = options.cleanup ?? removeLiveContainers
+  const exit = options.exit ?? (code => process.exit(code))
+  const target = options.target ?? process
+
+  const onExit = () => cleanup(1_500)
+  const makeSignalHandler = (signal: 'SIGTERM' | 'SIGINT', exitCode: number) => () => {
+    cleanup(2_000)
+    if (target.listenerCount(signal) === 0) {
+      exit(exitCode)
+    }
+  }
+  const onSigterm = makeSignalHandler('SIGTERM', 143)
+  const onSigint = makeSignalHandler('SIGINT', 130)
+
+  target.once('exit', onExit)
+  target.prependOnceListener('SIGTERM', onSigterm)
+  target.prependOnceListener('SIGINT', onSigint)
+
+  return {
+    dispose() {
+      target.removeListener('exit', onExit)
+      target.removeListener('SIGTERM', onSigterm)
+      target.removeListener('SIGINT', onSigint)
+    },
+  }
+}
+
 function ensureLiveExitHooks() {
   if (liveExitHookInstalled) return
   liveExitHookInstalled = true
@@ -82,9 +142,7 @@ function ensureLiveExitHooks() {
   // (for example an aborted session between `docker create` and `docker start`,
   // or a Playwright-owned server terminated with SIGTERM). Shutdown cleanup is strictly bounded so
   // a slow/unreachable Docker daemon can never block process exit (and E2E teardown).
-  process.once('exit', () => removeLiveContainers(1_500))
-  process.once('SIGTERM', () => { removeLiveContainers(2_000); process.exit(143) })
-  process.once('SIGINT', () => { removeLiveContainers(2_000); process.exit(130) })
+  installLiveExitHooks()
 }
 function trackLiveContainer(name: string) {
   liveContainers.add(name)

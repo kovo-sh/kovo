@@ -2190,24 +2190,60 @@ function spawnDockerSync(args: string[], timeoutMs = 5_000): string {
   }
 }
 
-function installLabSignalHooks(): void {
-  if (labSignalHooksInstalled) return
-  labSignalHooksInstalled = true
-  const reapThenReraise = (signal: NodeJS.Signals) => {
+export interface LabSignalHookTarget {
+  once(event: 'exit', listener: () => void): unknown
+  prependOnceListener(event: 'SIGINT' | 'SIGTERM' | 'SIGHUP', listener: () => void): unknown
+  listenerCount(event: 'SIGINT' | 'SIGTERM' | 'SIGHUP'): number
+  removeListener(event: 'exit' | 'SIGINT' | 'SIGTERM' | 'SIGHUP', listener: () => void): unknown
+}
+
+export interface LabSignalHookOptions {
+  reap?: () => void
+  reraise?: (signal: 'SIGINT' | 'SIGTERM' | 'SIGHUP') => void
+  target?: LabSignalHookTarget
+}
+
+export function bindLabSignalHooks(options: LabSignalHookOptions = {}): { dispose(): void } {
+  const reap = options.reap ?? (() => {
     for (const runner of ACTIVE_LAB_RUNNERS) runner.reapSyncAll()
-    // Re-deliver the signal with our listener removed so the default action/other handlers run.
+  })
+  const reraise = options.reraise ?? ((signal: 'SIGINT' | 'SIGTERM' | 'SIGHUP') => {
     try {
       process.kill(process.pid, signal)
     } catch {
       // Ignore: the process is already exiting.
     }
-  }
-  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
-    process.once(signal, () => reapThenReraise(signal))
-  }
-  process.once('exit', () => {
-    for (const runner of ACTIVE_LAB_RUNNERS) runner.reapSyncAll()
   })
+  const target = options.target ?? process
+  const signalHandlers: Array<['SIGINT' | 'SIGTERM' | 'SIGHUP', () => void]> = []
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    const handler = () => {
+      reap()
+      // Only re-deliver the signal when no sibling graceful-shutdown listener remains registered
+      // (so HTTP server, SQLite WAL, and worker-backend cleanup handlers are never preempted).
+      if (target.listenerCount(signal) === 0) {
+        reraise(signal)
+      }
+    }
+    signalHandlers.push([signal, handler])
+    target.prependOnceListener(signal, handler)
+  }
+  const onExit = () => reap()
+  target.once('exit', onExit)
+  return {
+    dispose() {
+      for (const [signal, handler] of signalHandlers) {
+        target.removeListener(signal, handler)
+      }
+      target.removeListener('exit', onExit)
+    },
+  }
+}
+
+function installLabSignalHooks(): void {
+  if (labSignalHooksInstalled) return
+  labSignalHooksInstalled = true
+  bindLabSignalHooks()
 }
 
 export interface LabRunnerOptions {
