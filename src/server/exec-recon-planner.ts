@@ -63,6 +63,7 @@ import {
   DRY_ROUND_LIMIT,
   FrontierWaveController,
   MAX_CHAIN_CONTINUATIONS,
+  MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS,
   TIER_A_MAX_SEEDED_STEPS,
   TIER_A_STEP_PRIORITY,
   WHITEBOX_BLACKBOX_CAP_PRIORITY,
@@ -88,6 +89,7 @@ import {
   dispatchableReadySteps,
   emptyDispatchFunnel,
   evaluateDispatchStop,
+  isGenericWave1BoundaryChainStep,
   extractContinuationDepth,
   formatHopCheckpointForAssignment,
   hardChainStepsCeiling,
@@ -2735,9 +2737,9 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     if (input.confirmed) {
       return { enqueued: false, reason: 'already_confirmed' }
     }
-    const maxContinuations = Math.max(0, Math.floor(input.maxContinuations ?? MAX_CHAIN_CONTINUATIONS))
+    const requestedMax = Math.max(0, Math.floor(input.maxContinuations ?? MAX_CHAIN_CONTINUATIONS))
     const currentDepth = extractContinuationDepth(step)
-    if (currentDepth >= maxContinuations) {
+    if (currentDepth >= requestedMax) {
       return { enqueued: false, reason: 'max_continuations_reached', continuationDepth: currentDepth }
     }
 
@@ -2756,6 +2758,26 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       .map(h => h.trim())
       .filter(h => DERIVED_CAPABILITY_HANDLE_RE.test(h))
     const uniqueHandles = [...new Set(candidateHandles)]
+
+    // Prefer the most recent derived sealed capability handle present in SQLite CapabilityLedger
+    // for this chain lineage (excluding static_analysis / cap:hop_synth:* invariant seeds).
+    const ledgerHandles = uniqueHandles.filter(id => ledgerNodeById.has(id))
+    const derivedLedgerHandles = ledgerHandles.filter(id => {
+      const node = ledgerNodeById.get(id)
+      return Boolean(node && node.provenance !== 'static_analysis' && !id.startsWith('cap:hop_synth:'))
+    })
+
+    // Cap generic Wave-1 heuristic boundary chains to 1 continuation (never 2); allow 2 continuations
+    // only for source/planner-backed multi-hop chains that actually sealed >= 1 cap:hop_* handle
+    // in CapabilityLedger.
+    const isGenericWave1 = isGenericWave1BoundaryChainStep(step)
+    const hasSealedLedgerCap = derivedLedgerHandles.length > 0
+    const maxContinuations = isGenericWave1 || !hasSealedLedgerCap
+      ? Math.min(requestedMax, MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS)
+      : requestedMax
+    if (currentDepth >= maxContinuations) {
+      return { enqueued: false, reason: 'max_continuations_reached', continuationDepth: currentDepth }
+    }
 
     const hasProgress = input.recordedFacts.length > 0
       || input.recordedExchanges.length > 0
@@ -2778,12 +2800,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       }
     }
 
-    // Prefer the most recent derived sealed capability handle present in SQLite CapabilityLedger.
-    const ledgerHandles = uniqueHandles.filter(id => ledgerNodeById.has(id))
-    const derivedLedgerHandles = ledgerHandles.filter(id => ledgerNodeById.get(id)?.provenance !== 'static_analysis')
-    const primaryCapId = (derivedLedgerHandles.at(-1) ?? ledgerHandles.at(-1))
-      ?? ledgerNodes.filter(n => n.provenance !== 'static_analysis' && DERIVED_CAPABILITY_HANDLE_RE.test(n.capId)).at(-1)?.capId
-      ?? undefined
+    const primaryCapId = derivedLedgerHandles.at(-1) ?? ledgerHandles.at(-1) ?? undefined
     const allSealedHandles = [...new Set([
       ...uniqueHandles,
       ...(primaryCapId ? [primaryCapId] : []),
@@ -2918,7 +2935,11 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         capabilities: ['http'],
         parentEvidenceIds: parentFactIds,
         skills,
-        priority: Math.min(100, Math.max(step.priority, 98)),
+        priority: isGenericWave1
+          ? Math.min(step.priority, 88)
+          : hasSealedLedgerCap
+            ? Math.min(100, Math.max(step.priority, 95))
+            : Math.min(step.priority, 90),
         budgetUsd: stepBudgetUsd,
         ...(primaryCapId ? { checkpointCapId: primaryCapId } : {}),
         checkpointBrief: finalizedBrief.brief,
