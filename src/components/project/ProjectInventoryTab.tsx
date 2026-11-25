@@ -11,18 +11,19 @@ import {
   Dialog,
   DialogBody,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '../ui/dialog.tsx'
-import { Disclosure, DisclosureContent, DisclosureTrigger } from '../ui/disclosure.tsx'
 import { EmptyState } from '../ui/empty-state.tsx'
-import { Input, Textarea } from '../ui/input.tsx'
+import { Input } from '../ui/input.tsx'
 import type { ProjectLoaderData } from './types.ts'
 import { safeHost } from './types.ts'
 
 interface Props {
   data: ProjectLoaderData
+  onDeleteAsset: (assetId: string) => Promise<unknown>
 }
 
 function safeHostname(raw: string | undefined): string {
@@ -34,13 +35,13 @@ function safeHostname(raw: string | undefined): string {
   }
 }
 
-export function ProjectInventoryTab({ data }: Props) {
+export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
   const { project, assets } = data
   const [panel, setPanel] = useState<'dns' | 'access'>()
   const [addHostOpen, setAddHostOpen] = useState(false)
+  const [assetToDelete, setAssetToDelete] = useState<ProjectLoaderData['assets'][number] | null>(null)
   const [candidateOrigin, setCandidateOrigin] = useState('')
   const [candidateSource, setCandidateSource] = useState('')
-  const [candidatePrepared, setCandidatePrepared] = useState('')
   const [candidateThirdParty, setCandidateThirdParty] = useState(false)
   const [candidateIncludeSubdomains, setCandidateIncludeSubdomains] = useState(false)
   const [notice, setNotice] = useState('')
@@ -55,7 +56,6 @@ export function ProjectInventoryTab({ data }: Props) {
   function resetAddHostForm() {
     setCandidateOrigin('')
     setCandidateSource('')
-    setCandidatePrepared('')
     setCandidateThirdParty(false)
     setCandidateIncludeSubdomains(false)
   }
@@ -131,50 +131,38 @@ export function ProjectInventoryTab({ data }: Props) {
               <code className="font-mono text-[12px]">*.domain</code>
             </label>
           )}
-          {asset.thirdParty ? (
-            <label
-              className="inline-flex cursor-pointer select-none items-center gap-[7px] text-[12px] font-normal text-fg-muted"
-              title="Third-party CNAMEs stay unchecked by default; check only if you have authorization to test this custom domain"
-            >
-              <Checkbox
-                checked={isDefaultApproved}
-                disabled={inventoryAction.pending}
-                aria-label={`Approve third-party host ${hostLabel} in project scope`}
-                onCheckedChange={checked => {
-                  const next = Boolean(checked)
-                  void inventoryAction.submit(() => updateProjectAssetScope({ data: {
-                    requestId: crypto.randomUUID(),
-                    projectId: project.id,
-                    assetId: asset.id,
-                    approveInDefaultScope: next,
-                  } }), () => setNotice(`${next ? 'Explicitly approved' : 'Removed'} third-party host ${hostLabel} ${next ? 'in' : 'from'} project scope.`))
-                }}
-              />
-              <span>{isDefaultApproved ? 'Approved in scope' : 'Approve in scope'}</span>
-            </label>
-          ) : isDefaultApproved ? (
-            <Badge variant="neutral" className="bg-sunk">Approved in scope</Badge>
-          ) : (
-            <label
-              className="inline-flex cursor-pointer select-none items-center gap-[7px] text-[12px] font-normal text-fg-muted"
-              title="Add this host to the project's approved scan scope"
-            >
-              <Checkbox
-                checked={false}
-                disabled={inventoryAction.pending}
-                aria-label={`Approve host ${hostLabel} in project scope`}
-                onCheckedChange={() => {
-                  void inventoryAction.submit(() => updateProjectAssetScope({ data: {
-                    requestId: crypto.randomUUID(),
-                    projectId: project.id,
-                    assetId: asset.id,
-                    approveInDefaultScope: true,
-                  } }), () => setNotice(`Approved ${hostLabel} in project scope.`))
-                }}
-              />
-              <span>Approve in scope</span>
-            </label>
-          )}
+          <label
+            className="inline-flex cursor-pointer select-none items-center gap-[7px] text-[12px] font-normal text-fg-muted"
+            title={asset.thirdParty
+              ? 'Third-party CNAMEs stay unchecked by default; check only if you have authorization to test this custom domain'
+              : 'Include or exclude this host from the project’s approved scan scope'}
+          >
+            <Checkbox
+              checked={isDefaultApproved}
+              disabled={inventoryAction.pending}
+              aria-label={`${isDefaultApproved ? 'Remove' : 'Approve'} ${asset.thirdParty ? 'third-party host ' : 'host '}${hostLabel} ${isDefaultApproved ? 'from' : 'in'} project scope`}
+              onCheckedChange={checked => {
+                const next = Boolean(checked)
+                void inventoryAction.submit(() => updateProjectAssetScope({ data: {
+                  requestId: crypto.randomUUID(),
+                  projectId: project.id,
+                  assetId: asset.id,
+                  approveInDefaultScope: next,
+                } }), () => setNotice(`${next ? 'Approved' : 'Removed'} ${hostLabel} ${next ? 'in' : 'from'} project scope.`))
+              }}
+            />
+            <span>{isDefaultApproved ? 'Approved in scope' : 'Approve in scope'}</span>
+          </label>
+          <Button
+            type="button"
+            variant="ghost"
+            className="data-[slot=button]:text-danger data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger"
+            disabled={inventoryAction.pending}
+            aria-label={`Delete host ${hostLabel}`}
+            onClick={() => setAssetToDelete(asset)}
+          >
+            Delete
+          </Button>
         </div>
       </div>
     )
@@ -334,18 +322,6 @@ export function ProjectInventoryTab({ data }: Props) {
             className="flex min-h-0 flex-1 flex-col"
             onSubmit={event => {
               event.preventDefault()
-              let prepared: unknown
-              const supplied = candidatePrepared.trim()
-              if (supplied) {
-                try {
-                  prepared = JSON.parse(supplied)
-                } catch {
-                  void inventoryAction.submit(async () => {
-                    throw new Error('Prepared evidence must be valid JSON.')
-                  })
-                  return
-                }
-              }
               void inventoryAction.submit(() => addProjectAsset({ data: {
                 requestId: crypto.randomUUID(),
                 projectId: project.id,
@@ -353,7 +329,6 @@ export function ProjectInventoryTab({ data }: Props) {
                 source: candidateSource.trim() || 'Manual entry',
                 thirdParty: candidateThirdParty,
                 includeSubdomains: project.environment === 'public' && !candidateThirdParty && candidateIncludeSubdomains,
-                prepared: prepared as Parameters<typeof addProjectAsset>[0]['data']['prepared'],
               } }), () => {
                 resetAddHostForm()
                 setAddHostOpen(false)
@@ -434,24 +409,6 @@ export function ProjectInventoryTab({ data }: Props) {
                   </span>
                 </div>
               )}
-              <Disclosure className="mt-1 border-t border-line pt-2.5">
-                <DisclosureTrigger className="h-auto bg-transparent px-0 py-1 text-fg-muted shadow-none hover:bg-transparent hover:text-fg">
-                  Advanced configuration
-                </DisclosureTrigger>
-                <DisclosureContent className="grid gap-2.5 pt-2.5">
-                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
-                    Prepared response metadata (JSON)
-                    <Textarea
-                      className="w-full font-mono text-[12px]"
-                      name="prepared"
-                      rows={4}
-                      value={candidatePrepared}
-                      onChange={e => setCandidatePrepared(e.target.value)}
-                      placeholder={'{"status":200,"mediaType":"text/html","transportMaxAge":31536000,"includeSubDomains":false,"contentTypeOptions":"nosniff","referrerPolicy":"strict-origin-when-cross-origin"}'}
-                    />
-                  </label>
-                </DisclosureContent>
-              </Disclosure>
               <FormError error={inventoryAction.error} />
             </DialogBody>
             <DialogFooter>
@@ -468,6 +425,73 @@ export function ProjectInventoryTab({ data }: Props) {
               </Button>
             </DialogFooter>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(assetToDelete)}
+        closeOnEscape={!inventoryAction.pending}
+        onOpenChange={nextOpen => {
+          if (!nextOpen && !inventoryAction.pending) setAssetToDelete(null)
+        }}
+      >
+        <DialogContent
+          role="alertdialog"
+          className="flex max-h-[calc(100vh-56px)] max-w-[440px] flex-col overflow-hidden p-0"
+        >
+          {assetToDelete && (
+            <>
+              <DialogHeader className="flex-row items-center justify-between gap-2.5 border-b border-line bg-raise px-4 py-2.5">
+                <DialogTitle className="inline-flex items-center gap-2 text-[13px] font-semibold text-fg">
+                  <Icon name="trash" size={15} className="text-danger" />
+                  <span>Delete host</span>
+                </DialogTitle>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-[26px]"
+                  disabled={inventoryAction.pending}
+                  onClick={() => setAssetToDelete(null)}
+                  aria-label="Close"
+                >
+                  <Icon name="close" size={14} />
+                </Button>
+              </DialogHeader>
+              <DialogBody className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto p-4">
+                <DialogDescription className="text-[12.5px] leading-5 text-fg-muted">
+                  Remove <strong className="font-mono font-semibold text-fg">{safeHost(assetToDelete.origin)}</strong> from this project&apos;s inventory and default scan scope? Existing runs keep their historical records.
+                </DialogDescription>
+                <FormError error={inventoryAction.error} />
+              </DialogBody>
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  disabled={inventoryAction.pending}
+                  onClick={() => setAssetToDelete(null)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  variant="default"
+                  className="data-[slot=button]:bg-danger data-[slot=button]:text-white data-[slot=button]:hover:bg-danger hover:brightness-[1.08]"
+                  disabled={inventoryAction.pending}
+                  onClick={() => {
+                    const target = assetToDelete
+                    void inventoryAction.submit(() => onDeleteAsset(target.id), () => {
+                      setAssetToDelete(null)
+                      setNotice(`Removed ${safeHost(target.origin)} from project inventory.`)
+                    })
+                  }}
+                >
+                  <Icon name="trash" size={13} />
+                  {inventoryAction.pending ? 'Deleting…' : 'Delete host'}
+                </Button>
+              </DialogFooter>
+            </>
+          )}
         </DialogContent>
       </Dialog>
     </section>

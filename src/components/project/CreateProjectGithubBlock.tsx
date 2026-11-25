@@ -1,13 +1,11 @@
+import { Link } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
-import { listGithubRepositories, saveGithubToken } from '../../actions.ts'
+import { listGithubRepositories } from '../../actions.ts'
 import { cn } from '../../lib/cn.ts'
 import type { GithubAppInstallationSummary } from '../../server/github-connector.ts'
-import { useGithubDeviceFlow } from '../github/useGithubDeviceFlow.ts'
 import { Icon } from '../run/icons.tsx'
 import { Badge } from '../ui/badge.tsx'
 import { Button, buttonVariants } from '../ui/button.tsx'
-import { Disclosure, DisclosureContent, DisclosureTrigger } from '../ui/disclosure.tsx'
-import { Input } from '../ui/input.tsx'
 import { GithubInstallBanner } from './GithubInstallBanner.tsx'
 import { GroupedRepoPicker } from './GroupedRepoPicker.tsx'
 import type { DiscoveredGithubRepo } from './types.ts'
@@ -125,26 +123,15 @@ export function CreateProjectGithubBlock({
   disabled = false,
 }: Props) {
   const [patStatus, setPatStatus] = useState<GithubPatStatusSummary>(initialPatStatus)
-  const [expandedConnect, setExpandedConnect] = useState(false)
-  const [tokenInput, setTokenInput] = useState('')
-  const [savingToken, setSavingToken] = useState(false)
   const [loadingRepos, setLoadingRepos] = useState(false)
   const [repos, setRepos] = useState<DiscoveredGithubRepo[]>([])
   const [reposLoaded, setReposLoaded] = useState(false)
   const [search, setSearch] = useState('')
   const [error, setError] = useState('')
 
-  const device = useGithubDeviceFlow({
-    configured: Boolean(patStatus.githubDeviceFlowConfigured),
-    disabled: disabled || savingToken,
-    onAuthorized: result => {
-      setPatStatus(result.accountStatus)
-      setReposLoaded(false)
-      setExpandedConnect(false)
-      setError('')
-    },
-  })
-  const { flow: deviceFlow, starting: startingDeviceFlow, error: deviceFlowError, clientId: clientIdInput, setClientId: setClientIdInput, codeCopied } = device
+  useEffect(() => {
+    setPatStatus(initialPatStatus)
+  }, [initialPatStatus])
 
   useEffect(() => {
     if (!patStatus.configured || reposLoaded) return
@@ -190,188 +177,33 @@ export function CreateProjectGithubBlock({
     }
   }
 
-  async function handleSaveToken() {
-    const trimmed = tokenInput.trim()
-    if (trimmed.length < 10 || savingToken || disabled) return
-    setSavingToken(true)
-    setError('')
-    try {
-      const result = await saveGithubToken({ data: { token: trimmed } })
-      setTokenInput('')
-      setPatStatus(result.status)
-      setRepos(result.repos)
-      setReposLoaded(true)
-      setExpandedConnect(false)
-      setSearch('')
-      onChangeSelectedRepos(result.repos.length === 1 ? [result.repos[0]!.fullName] : [])
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not connect GitHub.')
-    } finally {
-      setSavingToken(false)
-    }
-  }
-
   if (!patStatus.configured) {
     return (
-      <div
-        className={cn(
-          'overflow-hidden rounded-card border bg-sunk transition-[border-color,background-color,box-shadow] duration-[var(--d1)] dark:bg-raise',
-          expandedConnect ? 'border-line-strong' : 'border-line-2 hover:border-line-strong',
-        )}
-      >
-        <button
-          type="button"
-          className="flex h-auto min-h-[70px] w-full cursor-pointer items-center gap-[13px] whitespace-normal rounded-none border-0 bg-transparent px-[15px] py-[13px] text-left text-fg shadow-none transition-colors duration-[var(--d1)] hover:bg-hover disabled:cursor-default disabled:opacity-50"
-          onClick={() => {
-            setExpandedConnect(v => !v)
-            setError('')
-          }}
-          aria-expanded={expandedConnect}
-          disabled={disabled}
+      <div className="flex flex-wrap items-center gap-[13px] overflow-hidden rounded-card border border-line-2 bg-sunk px-[15px] py-[13px] dark:bg-raise">
+        <GithubBannerSvg />
+        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+          <span className="flex flex-wrap items-center gap-2">
+            <strong className="text-[13.5px] font-semibold leading-[19px] text-fg">Connect GitHub</strong>
+            <Badge className="h-[19px] bg-panel text-[11px] font-medium tracking-[0.01em] text-fg-muted">
+              Recommended
+            </Badge>
+          </span>
+          <span className="text-[12px] font-normal leading-[17px] text-fg-muted">
+            Add source code to find deeper vulnerabilities. Connect GitHub in Settings anytime.
+          </span>
+        </div>
+        <Link
+          to="/settings"
+          search={{}}
+          className={cn(
+            buttonVariants({ variant: 'outline' }),
+            'flex-none no-underline',
+            disabled && 'pointer-events-none opacity-50',
+          )}
         >
-          <GithubBannerSvg />
-          <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-            <span className="flex flex-wrap items-center gap-2">
-              <strong className="text-[13.5px] font-semibold leading-[19px] text-fg">Connect GitHub</strong>
-              <Badge className="h-[19px] bg-panel text-[11px] font-medium tracking-[0.01em] text-fg-muted">
-                Recommended
-              </Badge>
-            </span>
-            <span className="text-[12px] font-normal leading-[17px] text-fg-muted">
-              Add source code to find deeper vulnerabilities
-            </span>
-          </span>
-          <span className="inline-flex flex-none items-center justify-center text-fg-subtle" aria-hidden="true">
-            <Icon name={expandedConnect ? 'chevU' : 'chevR'} size={14} />
-          </span>
-        </button>
-
-        {expandedConnect && (
-          <div className="grid gap-2.5 border-t border-line bg-panel px-[15px] py-3">
-            {!deviceFlow ? (
-              <div className="flex items-center gap-2">
-                {patStatus.githubDeviceFlowConfigured ? (
-                  <Button
-                    type="button"
-                    variant="default"
-                    disabled={startingDeviceFlow || savingToken || disabled}
-                    onClick={() => void device.start()}
-                  >
-                    {startingDeviceFlow ? 'Starting…' : 'Sign in with GitHub'}
-                  </Button>
-                ) : (
-                  <div className="flex w-full items-center gap-1.5">
-                    <Input
-                      type="text"
-                      value={clientIdInput}
-                      onChange={e => { setClientIdInput(e.target.value); setError('') }}
-                      onKeyDown={e => {
-                        if (e.key === 'Enter') {
-                          e.preventDefault()
-                          void device.start()
-                        }
-                      }}
-                      placeholder="GitHub App Client ID"
-                      autoComplete="off"
-                      disabled={startingDeviceFlow || savingToken || disabled}
-                      aria-label="GitHub App Client ID"
-                      className="flex-1"
-                    />
-                    <Button
-                      type="button"
-                      variant="default"
-                      disabled={startingDeviceFlow || savingToken || disabled || clientIdInput.trim().length < 6}
-                      onClick={() => void device.start()}
-                    >
-                      {startingDeviceFlow ? 'Starting…' : 'Sign in'}
-                    </Button>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div className="grid gap-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="select-all rounded-control border border-line-2 bg-sunk px-2.5 py-1 font-mono text-[16px] font-semibold tracking-[0.12em] text-fg">
-                    {deviceFlow.userCode}
-                  </span>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => void device.copyCode()}
-                  >
-                    {codeCopied ? 'Copied' : 'Copy code'}
-                  </Button>
-                  <a
-                    className={buttonVariants({ variant: 'default' })}
-                    href={deviceFlow.verificationUri}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    Open GitHub ↗
-                  </a>
-                </div>
-                <div className="flex items-center justify-between gap-2 text-[12px]">
-                  <span role="status" className="tabular-nums text-fg-subtle">
-                    Waiting for approval…
-                  </span>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    onClick={() => void device.cancel()}
-                  >
-                    Cancel
-                  </Button>
-                </div>
-              </div>
-            )}
-
-            {(error || deviceFlowError) && (
-              <p role="alert" className="m-0 text-[12px] text-danger">{error || deviceFlowError}</p>
-            )}
-
-            <Disclosure className="border-t border-line pt-[9px]">
-              <DisclosureTrigger className="h-auto w-auto rounded-sm bg-transparent px-0 py-0.5 text-[12px] font-medium text-fg-subtle shadow-none hover:bg-transparent hover:text-fg-muted">
-                <span>Or connect with an access token</span>
-              </DisclosureTrigger>
-              <DisclosureContent className="mt-2 grid gap-[7px] pt-0">
-                <div className="flex w-full items-center gap-1.5">
-                  <Input
-                    type="password"
-                    value={tokenInput}
-                    onChange={e => setTokenInput(e.target.value)}
-                    onKeyDown={e => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault()
-                        void handleSaveToken()
-                      }
-                    }}
-                    placeholder="Paste read-only GitHub token"
-                    autoComplete="off"
-                    disabled={savingToken || disabled}
-                    aria-label="Read-only GitHub access token"
-                    className="flex-1"
-                  />
-                  <Button
-                    type="button"
-                    variant="default"
-                    disabled={savingToken || disabled || tokenInput.trim().length < 10}
-                    onClick={() => void handleSaveToken()}
-                  >
-                    {savingToken ? 'Connecting…' : 'Connect'}
-                  </Button>
-                </div>
-                <a
-                  className="w-fit text-[11.5px] text-accent hover:underline"
-                  href="https://github.com/settings/personal-access-tokens/new"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  Create a read-only token on GitHub ↗
-                </a>
-              </DisclosureContent>
-            </Disclosure>
-          </div>
-        )}
+          <span>Connect in Settings</span>
+          <Icon name="arrowR" size={13} />
+        </Link>
       </div>
     )
   }
@@ -391,15 +223,24 @@ export function CreateProjectGithubBlock({
             </Badge>
           )}
         </div>
-        <Button
-          type="button"
-          variant="ghost"
-          className="h-6 px-[7px] text-[12px] text-fg-muted"
-          disabled={loadingRepos || disabled}
-          onClick={() => void handleRefresh()}
-        >
-          {loadingRepos ? 'Loading…' : 'Refresh'}
-        </Button>
+        <div className="flex flex-none items-center gap-1">
+          <Link
+            to="/settings"
+            search={{}}
+            className={cn(buttonVariants({ variant: 'ghost' }), 'h-6 px-[7px] text-[12px] text-fg-muted no-underline')}
+          >
+            Settings
+          </Link>
+          <Button
+            type="button"
+            variant="ghost"
+            className="h-6 px-[7px] text-[12px] text-fg-muted"
+            disabled={loadingRepos || disabled}
+            onClick={() => void handleRefresh()}
+          >
+            {loadingRepos ? 'Loading…' : 'Refresh'}
+          </Button>
+        </div>
       </div>
 
       <GithubInstallBanner

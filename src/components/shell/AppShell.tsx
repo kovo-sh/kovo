@@ -305,7 +305,7 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
               title={poolHealthTitle(data.poolHealth)}
             >
               <Icon name="sliders" />
-              <span className="min-w-0 flex-1 truncate">Model settings</span>
+              <span className="min-w-0 flex-1 truncate">Settings</span>
               {data.poolHealth !== 'healthy' && (
                 <span className={healthDotVariants({ health: data.poolHealth })} aria-hidden="true" />
               )}
