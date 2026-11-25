@@ -26,11 +26,128 @@ export function ProjectInventoryTab({ data }: Props) {
   const [candidateThirdParty, setCandidateThirdParty] = useState(false)
   const [candidateIncludeSubdomains, setCandidateIncludeSubdomains] = useState(false)
   const [notice, setNotice] = useState('')
+  const [hostSearch, setHostSearch] = useState('')
   const inventoryAction = useAction()
 
   function togglePanel(next: typeof panel) {
     setPanel(cur => cur === next ? undefined : next)
     setNotice('')
+  }
+
+  const searchTerm = hostSearch.trim().toLowerCase()
+  const visibleAssets = searchTerm
+    ? assets.filter(asset => {
+      const haystack = `${safeHost(asset.origin)} ${asset.source ?? ''} ${asset.dnsSource?.zone ?? ''}`.toLowerCase()
+      return haystack.includes(searchTerm)
+    })
+    : assets
+  const approvedAssets = visibleAssets.filter(asset => project.defaultScope.includes(asset.origin))
+  const needsApprovalAssets = visibleAssets.filter(asset => !project.defaultScope.includes(asset.origin))
+
+  function renderAsset(asset: ProjectLoaderData['assets'][number]) {
+    const externalCname = asset.dnsSource?.externalAliases?.[0]
+    const isDefaultApproved = project.defaultScope.includes(asset.origin)
+    const hostLabel = safeHost(asset.origin)
+    const policyRecorded = asset.accessPolicy?.recordedAt
+      ? formatHumanTime(asset.accessPolicy.recordedAt)
+      : null
+    return <div key={asset.id} className="pw-row">
+      <div className="pw-row-main">
+        <div className="pw-row-title">
+          <strong className="mono">{hostLabel}</strong>
+          {asset.includeSubdomains && !asset.thirdParty && (
+            <span className="pw-tag accent">*.{asset.dnsSource?.zone ?? hostLabel}</span>
+          )}
+          {asset.thirdParty && externalCname ? (
+            <span className="pw-tag warn">Third-party CNAME ({externalCname})</span>
+          ) : asset.thirdParty ? (
+            <span className="pw-tag warn">Third party</span>
+          ) : null}
+          {asset.accessPolicy && <span className="pw-tag solid">Access policy</span>}
+        </div>
+        <div className="pw-row-sub">
+          {asset.source}
+          {asset.dnsSource ? ` · ${asset.dnsSource.zone}` : ''}
+          {policyRecorded?.label && (
+            <>
+              {' · '}
+              <span className="num" title={policyRecorded.full}>Policy recorded {policyRecorded.label}</span>
+            </>
+          )}
+        </div>
+      </div>
+      <div className="pw-row-right">
+        {project.environment === 'public' && !asset.thirdParty && (
+          <label
+            className="pw-chk"
+            style={{ fontSize: 12 }}
+            title="Automatically include live first-party subdomains discovered passively (excludes third-party hosted services)"
+          >
+            <Checkbox
+              checked={Boolean(asset.includeSubdomains)}
+              disabled={inventoryAction.pending}
+              aria-label={`Include subdomains for ${hostLabel}`}
+              onCheckedChange={checked => {
+                const next = Boolean(checked)
+                void inventoryAction.submit(() => updateProjectAssetScope({ data: {
+                  requestId: crypto.randomUUID(),
+                  projectId: project.id,
+                  assetId: asset.id,
+                  includeSubdomains: next,
+                } }), () => setNotice(`${next ? 'Enabled' : 'Disabled'} subdomain discovery for ${hostLabel}.`))
+              }}
+            />
+            <code>*.domain</code>
+          </label>
+        )}
+        {asset.thirdParty ? (
+          <label
+            className="pw-chk"
+            style={{ fontSize: 12 }}
+            title="Third-party CNAMEs stay unchecked by default; check only if you have authorization to test this custom domain"
+          >
+            <Checkbox
+              checked={isDefaultApproved}
+              disabled={inventoryAction.pending}
+              aria-label={`Approve third-party host ${hostLabel} in project scope`}
+              onCheckedChange={checked => {
+                const next = Boolean(checked)
+                void inventoryAction.submit(() => updateProjectAssetScope({ data: {
+                  requestId: crypto.randomUUID(),
+                  projectId: project.id,
+                  assetId: asset.id,
+                  approveInDefaultScope: next,
+                } }), () => setNotice(`${next ? 'Explicitly approved' : 'Removed'} third-party host ${hostLabel} ${next ? 'in' : 'from'} project scope.`))
+              }}
+            />
+            <span>{isDefaultApproved ? 'Approved in scope' : 'Approve in scope'}</span>
+          </label>
+        ) : isDefaultApproved ? (
+          <span className="pw-tag solid">Approved in scope</span>
+        ) : (
+          <label
+            className="pw-chk"
+            style={{ fontSize: 12 }}
+            title="Add this host to the project's approved scan scope"
+          >
+            <Checkbox
+              checked={false}
+              disabled={inventoryAction.pending}
+              aria-label={`Approve host ${hostLabel} in project scope`}
+              onCheckedChange={() => {
+                void inventoryAction.submit(() => updateProjectAssetScope({ data: {
+                  requestId: crypto.randomUUID(),
+                  projectId: project.id,
+                  assetId: asset.id,
+                  approveInDefaultScope: true,
+                } }), () => setNotice(`Approved ${hostLabel} in project scope.`))
+              }}
+            />
+            <span>Approve in scope</span>
+          </label>
+        )}
+      </div>
+    </div>
   }
 
   return <section aria-label="Project inventory">
@@ -40,6 +157,16 @@ export function ProjectInventoryTab({ data }: Props) {
         <p>Starting hosts, DNS exports, and passively discovered subdomains. Third-party hosted services stay unchecked unless explicitly approved.</p>
       </div>
       <div className="pw-sec-actions">
+        {assets.length > 6 && (
+          <input
+            className="pw-in pw-host-search"
+            type="search"
+            value={hostSearch}
+            onChange={e => setHostSearch(e.target.value)}
+            placeholder="Search hosts"
+            aria-label="Search hosts"
+          />
+        )}
         <button type="button" className="pw-btn primary" onClick={() => togglePanel('candidate')} aria-expanded={panel === 'candidate'}>
           {panel === 'candidate' ? 'Close' : 'Add host'}
         </button>
@@ -94,7 +221,7 @@ export function ProjectInventoryTab({ data }: Props) {
           requestId: crypto.randomUUID(),
           projectId: project.id,
           origin: String(form.get('origin')),
-          source: String(form.get('source')),
+          source: String(form.get('source') ?? '').trim() || 'Manual entry',
           thirdParty: candidateThirdParty,
           includeSubdomains: project.environment === 'public' && !candidateThirdParty && candidateIncludeSubdomains,
           prepared: prepared as Parameters<typeof addProjectAsset>[0]['data']['prepared'],
@@ -115,8 +242,8 @@ export function ProjectInventoryTab({ data }: Props) {
           <label className="pw-fld">Host
             <input className="pw-in" name="origin" placeholder="docs.example.com" required />
           </label>
-          <label className="pw-fld">Source
-            <input className="pw-in" name="source" placeholder="Service ownership inventory" required maxLength={160} />
+          <label className="pw-fld">Source (optional)
+            <input className="pw-in" name="source" placeholder="Manual entry" maxLength={160} />
           </label>
         </div>
         <label className="pw-chk">
@@ -151,7 +278,7 @@ export function ProjectInventoryTab({ data }: Props) {
           </span>
         </div>}
         <details className="pw-disclosure" style={{ marginTop: 4 }}>
-          <summary>Supply prepared evidence (optional)</summary>
+          <summary>Advanced configuration</summary>
           <div className="pw-disclosure-body">
             <label className="pw-fld">Prepared response metadata (JSON)
               <textarea
@@ -171,91 +298,35 @@ export function ProjectInventoryTab({ data }: Props) {
       </div>
     </form>}
 
-    <div className="pw-table-wrap">
-      {assets.map(asset => {
-        const externalCname = asset.dnsSource?.externalAliases?.[0]
-        const isDefaultApproved = project.defaultScope.includes(asset.origin)
-        const hostLabel = safeHost(asset.origin)
-        const policyRecorded = asset.accessPolicy?.recordedAt
-          ? formatHumanTime(asset.accessPolicy.recordedAt)
-          : null
-        return <div key={asset.id} className="pw-row">
-          <div className="pw-row-main">
-            <div className="pw-row-title">
-              <strong className="mono">{hostLabel}</strong>
-              {asset.includeSubdomains && !asset.thirdParty && (
-                <span className="pw-tag accent">*.{asset.dnsSource?.zone ?? hostLabel}</span>
-              )}
-              {asset.thirdParty && externalCname ? (
-                <span className="pw-tag warn">Third-party CNAME ({externalCname})</span>
-              ) : asset.thirdParty ? (
-                <span className="pw-tag warn">Third party</span>
-              ) : null}
-              {asset.accessPolicy && <span className="pw-tag solid">Access policy</span>}
-            </div>
-            <div className="pw-row-sub">
-              {asset.source}
-              {asset.dnsSource ? ` · ${asset.dnsSource.zone}` : ''}
-              {policyRecorded?.label && (
-                <>
-                  {' · '}
-                  <span className="num" title={policyRecorded.full}>Policy recorded {policyRecorded.label}</span>
-                </>
-              )}
-            </div>
+    {assets.length === 0 ? (
+      <div className="pw-empty-card">
+        <h3>No hosts in scope yet</h3>
+        <p>Add a starting host or import a DNS export so Kovo Hunter knows what belongs to this project.</p>
+        <button type="button" className="pw-btn primary" onClick={() => togglePanel('candidate')}>
+          Add host
+        </button>
+      </div>
+    ) : visibleAssets.length === 0 ? (
+      <p className="pw-footnote">No hosts match “{hostSearch.trim()}”.</p>
+    ) : <>
+      {approvedAssets.length > 0 && (
+        <div className="pw-table-wrap">
+          <div className="pw-group-head">
+            <h3>Approved in scope <span className="num muted">({approvedAssets.length})</span></h3>
+            <span className="muted">Included in scan scope</span>
           </div>
-          <div className="pw-row-right">
-            {project.environment === 'public' && !asset.thirdParty && (
-              <label
-                className="pw-chk"
-                style={{ fontSize: 12 }}
-                title="Automatically include live first-party subdomains discovered passively (excludes third-party hosted services)"
-              >
-                <Checkbox
-                  checked={Boolean(asset.includeSubdomains)}
-                  disabled={inventoryAction.pending}
-                  aria-label={`Include subdomains for ${hostLabel}`}
-                  onCheckedChange={checked => {
-                    const next = Boolean(checked)
-                    void inventoryAction.submit(() => updateProjectAssetScope({ data: {
-                      requestId: crypto.randomUUID(),
-                      projectId: project.id,
-                      assetId: asset.id,
-                      includeSubdomains: next,
-                    } }), () => setNotice(`${next ? 'Enabled' : 'Disabled'} subdomain discovery for ${hostLabel}.`))
-                  }}
-                />
-                <code>*.domain</code>
-              </label>
-            )}
-            {asset.thirdParty ? (
-              <label
-                className="pw-chk"
-                style={{ fontSize: 12 }}
-                title="Third-party CNAMEs stay unchecked by default; check only if you have authorization to test this custom domain"
-              >
-                <Checkbox
-                  checked={isDefaultApproved}
-                  disabled={inventoryAction.pending}
-                  aria-label={`Approve third-party host ${hostLabel} in project scope`}
-                  onCheckedChange={checked => {
-                    const next = Boolean(checked)
-                    void inventoryAction.submit(() => updateProjectAssetScope({ data: {
-                      requestId: crypto.randomUUID(),
-                      projectId: project.id,
-                      assetId: asset.id,
-                      approveInDefaultScope: next,
-                    } }), () => setNotice(`${next ? 'Explicitly approved' : 'Removed'} third-party host ${hostLabel} ${next ? 'in' : 'from'} project scope.`))
-                  }}
-                />
-                <span>{isDefaultApproved ? 'Approved in scope' : 'Approve in scope'}</span>
-              </label>
-            ) : (
-              <span className="pw-tag solid">{isDefaultApproved ? 'Project default' : 'Candidate'}</span>
-            )}
-          </div>
+          {approvedAssets.map(renderAsset)}
         </div>
-      })}
-    </div>
+      )}
+      {needsApprovalAssets.length > 0 && (
+        <div className="pw-table-wrap pw-table-wrap-spaced">
+          <div className="pw-group-head">
+            <h3>Needs approval <span className="num muted">({needsApprovalAssets.length})</span></h3>
+            <span className="muted">Approve hosts before they enter scan scope</span>
+          </div>
+          {needsApprovalAssets.map(renderAsset)}
+        </div>
+      )}
+    </>}
   </section>
 }

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { saveModel, testModel } from '../../actions.ts'
 import { useAction } from '../common.tsx'
+import { Icon } from '../run/icons.tsx'
 import { DEFAULT_PROVIDER, roleAffinities, thinkingLevels } from '../../domain.ts'
 import type { PublicModelProfile, RoleAffinity, ThinkingLevel } from '../../domain.ts'
 
@@ -131,7 +132,7 @@ export function ModelProfileSheet({
             onClick={onClose}
             aria-label="Close modal"
           >
-            ✕
+            <Icon name="close" size={14} />
           </button>
         </div>
 
@@ -255,7 +256,7 @@ export function ModelProfileSheet({
                     autoFocus
                     placeholder="sk-or-v1-..."
                   />
-                  <small title="Saved locally in owner-only (0600) credential files">
+                  <small title="Stored privately on this machine">
                     Stored privately on your machine; never returned to the browser or target environments.
                   </small>
                 </label>
@@ -448,7 +449,7 @@ export function ModelProfileSheet({
                     autoComplete="off"
                     placeholder={isEditing ? 'Leave blank to keep existing API key' : 'Enter your provider key'}
                   />
-                  <small title="Saved locally in owner-only (0600) credential files">
+                  <small title="Stored privately on this machine">
                     Stored privately on your machine; never returned to the browser or target environments.
                   </small>
                 </label>

@@ -1,6 +1,7 @@
 import { Link, useRouter } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
 import { removeRun } from '../../actions.ts'
+import { runStatusLabel } from '../run/meta.ts'
 import { Icon } from '../run/icons.tsx'
 import { formatFullDateTime, formatRelativeTime, useNow } from '../shell/AppShell.tsx'
 import { formatUsd, phaseNames } from '../run-state.ts'
@@ -10,7 +11,6 @@ import { formatGithubPatBadge } from './types.ts'
 interface Props {
   data: ProjectLoaderData
   onSelectTab: (tab: ProjectTabId) => void
-  onOpenNewRun: () => void
 }
 
 const RUN_MODE_LABEL: Record<number, string> = {
@@ -168,7 +168,7 @@ function AllowlistSetupSvg({ ready }: { ready: boolean }) {
   )
 }
 
-export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
+export function ProjectOverviewTab({ data, onSelectTab }: Props) {
   const { project, assets, personas, specs, runs, githubPatStatus } = data
   const router = useRouter()
   const now = useNow()
@@ -181,6 +181,48 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
   const wildcardCount = assets.filter(a => a.includeSubdomains && !a.thirdParty).length
   const thirdPartyCount = assets.filter(a => a.thirdParty).length
   const allowlistCount = (project.sandboxWriteAllowlist ?? []).length
+
+  const setupItems = [
+    {
+      id: 'personas' as const,
+      done: personas.length > 0,
+      title: `${plural(personas.length, 'test account')} set up`,
+      pending: 'Add test accounts',
+      description: 'Scan behind sign-in and catch cross-account access leaks.',
+      art: <PersonasSetupSvg ready={false} />,
+    },
+    {
+      id: 'sources' as const,
+      done: specs.length > 0,
+      title: `${plural(specs.length, 'repo snapshot')} synced`,
+      pending: 'Connect GitHub repos',
+      description: 'Add source code to enrich vulnerability analysis.',
+      art: <GithubSetupSvg ready={false} />,
+    },
+    {
+      id: 'guardrails' as const,
+      done: allowlistCount > 0,
+      title: plural(allowlistCount, 'approved write rule'),
+      pending: 'Approve write rules',
+      description: 'Allow safe test mutations on staging without risking real data.',
+      art: <AllowlistSetupSvg ready={false} />,
+    },
+  ]
+  const pendingSetup = setupItems.filter(item => !item.done)
+  const completedSetup = setupItems.length - pendingSetup.length
+  const postureTitle = runs.length === 0
+    ? `Ready to assess ${plural(assets.length, 'host')}`
+    : activeRuns > 0
+      ? `${plural(activeRuns, 'run')} in progress`
+      : `Latest run ${runStatusLabel(latestRun!.status)}`
+  const postureSub = latestRun
+    ? [
+      RUN_MODE_LABEL[latestRun.capabilityTier] ?? 'Standard',
+      phaseNames[latestRun.phase],
+      plural(completedRuns, 'completed run'),
+      formatRelativeTime(latestRun.createdAt, { compact: false, now }),
+    ].join(' · ')
+    : 'No scans yet — start with a Safe Audit to map the surface.'
 
   useEffect(() => {
     if (!runToDelete) return
@@ -211,101 +253,74 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
     }
   }
 
-  const postureHeadline = runs.length === 0
-    ? `Ready for your first assessment across ${plural(assets.length, 'host')}`
-    : activeRuns > 0
-      ? `${plural(activeRuns, 'active run')} in progress across ${plural(assets.length, 'host')} — ${plural(completedRuns, 'completed run')} on record`
-      : `${plural(completedRuns, 'completed run')} across ${plural(assets.length, 'host')} — latest ${phaseNames[latestRun!.phase].toLowerCase()} (${latestRun!.status.replaceAll('_', ' ')})`
-
   return <>
-    <div className="pw-eyebrow">
-      {project.environment === 'local-lab' && <><span>Local Lab</span><span>·</span></>}
-      <span className="num">{plural(assets.length, 'host')}</span>
-      {wildcardCount > 0 && <><span>·</span><span>{plural(wildcardCount, '*.domain scope')}</span></>}
-    </div>
-    <h2 className="pw-hed">{postureHeadline}</h2>
-
-    <div className="pw-trio">
-      <div>
-        <h3>Scope &amp; Surface</h3>
-        <div className="big num">{plural(assets.length, 'host')}</div>
-        <p>
-          {plural(project.seeds.length, 'seed')}
-          {wildcardCount > 0 ? ` · ${wildcardCount} *.domain` : ''}
-          {thirdPartyCount > 0 ? ` · ${plural(thirdPartyCount, 'third-party host')}` : ''}
-        </p>
-      </div>
-      <div>
-        <h3>Accounts &amp; Context</h3>
-        <div className="big num">{plural(personas.length, 'test account')} · {plural(specs.length, 'snapshot')}</div>
-        <p>{formatGithubPatBadge(githubPatStatus)} · {plural(allowlistCount, 'write allowlist rule')}</p>
-      </div>
-      <div>
-        <h3>Latest Run</h3>
-        {latestRun ? <>
-          <div className="big" style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-            <span className="pw-dot" data-status={latestRun.status} />
-            <span style={{ textTransform: 'capitalize' }}>{latestRun.status.replaceAll('_', ' ')}</span>
+    <section className="pw-posture" aria-label="Project posture">
+      <div className="pw-posture-main">
+        <span className="pw-dot" data-status={latestRun?.status ?? 'ready'} aria-hidden="true" />
+        <div className="pw-posture-copy">
+          <div className="pw-posture-title">
+            {postureTitle}
+            {project.environment === 'local-lab' && <span className="pw-tag warn">Local Lab</span>}
           </div>
-          <p className="num">
-            {RUN_MODE_LABEL[latestRun.capabilityTier] ?? 'Standard'} · {phaseNames[latestRun.phase]} · {latestRun.spentRequests} reqs · {formatUsd(latestRun.spentUsd)}
-          </p>
-        </> : <>
-          <div className="big">No runs yet</div>
-          <p>Launch a Safe Audit or Core Pentest in one click.</p>
-        </>}
+          <div className="pw-posture-sub">{postureSub}</div>
+        </div>
       </div>
-    </div>
-
-    <section className="pw-sec" aria-label="Setup readiness">
-      <div className="pw-sec-head">
-        <h2>Readiness &amp; setup</h2>
-      </div>
-      <div className="pw-needs">
-        <button
-          type="button"
-          className={personas.length > 0 ? 'ready' : ''}
-          onClick={() => onSelectTab('personas')}
-        >
-          <PersonasSetupSvg ready={personas.length > 0} />
-          <span className="n">{personas.length > 0 ? `${plural(personas.length, 'test account')} ready` : 'Add Test Accounts'}</span>
-          <span className="l">
-            Scan behind sign-in and catch cross-account access leaks.
-          </span>
-        </button>
-        <button
-          type="button"
-          className={specs.length > 0 ? 'ready' : ''}
-          onClick={() => onSelectTab('sources')}
-        >
-          <GithubSetupSvg ready={specs.length > 0} />
-          <span className="n">{specs.length > 0 ? `${plural(specs.length, 'repo snapshot')} synced` : 'Connect GitHub Repos'}</span>
-          <span className="l">
-            Add source code to enrich vulnerability analysis.
-          </span>
-        </button>
-        <button
-          type="button"
-          className={allowlistCount > 0 ? 'ready' : ''}
-          onClick={() => onSelectTab('guardrails')}
-        >
-          <AllowlistSetupSvg ready={allowlistCount > 0} />
-          <span className="n">{allowlistCount > 0 ? `${plural(allowlistCount, 'allowlist rule')}` : 'Configure Write Allowlist'}</span>
-          <span className="l">
-            Allow safe test mutations on staging without risking real data.
-          </span>
-        </button>
+      <div className="pw-posture-facts num">
+        <span><b>{assets.length}</b> hosts{wildcardCount > 0 ? ` · ${wildcardCount} *.domain` : ''}</span>
+        <span><b>{personas.length}</b> accounts</span>
+        <span><b>{specs.length}</b> specs</span>
+        <span><b>{allowlistCount}</b> write rules</span>
+        {thirdPartyCount > 0 && <span><b>{thirdPartyCount}</b> third-party</span>}
+        <span className={githubPatStatus.configured ? 'pw-posture-linked' : 'muted'}>{formatGithubPatBadge(githubPatStatus)}</span>
+        {latestRun && latestRun.spentRequests > 0 && (
+          <span><b>{latestRun.spentRequests}</b> reqs · {formatUsd(latestRun.spentUsd)}</span>
+        )}
       </div>
     </section>
+
+    {pendingSetup.length > 0 ? (
+      <section className="pw-sec" aria-label="Setup readiness">
+        <div className="pw-sec-head">
+          <h2>Finish setup</h2>
+          <span className="muted num">{completedSetup} of {setupItems.length} complete</span>
+        </div>
+        <div
+          className="pw-needs"
+          style={{ gridTemplateColumns: `repeat(${pendingSetup.length}, minmax(0, 1fr))` }}
+        >
+          {pendingSetup.map(item => (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => onSelectTab(item.id)}
+            >
+              {item.art}
+              <span className="n">{item.pending}</span>
+              <span className="l">{item.description}</span>
+            </button>
+          ))}
+        </div>
+      </section>
+    ) : (
+      <div className="pw-setup-done" role="status">
+        <span className="pw-setup-done-label">
+          <Icon name="check" size={13} />
+          Setup complete
+        </span>
+        <span className="pw-setup-done-meta num">
+          {plural(personas.length, 'test account')} · {plural(specs.length, 'repo snapshot')} · {plural(allowlistCount, 'approved write rule')}
+        </span>
+        <button type="button" className="pw-btn ghost" onClick={() => onSelectTab('guardrails')}>
+          Review
+        </button>
+      </div>
+    )}
 
     <section className="pw-sec" aria-label="Run history">
       <div className="pw-sec-head">
         <div>
           <h2>Runs <span className="muted num">({runs.length})</span></h2>
         </div>
-        {runs.length > 0 && (
-          <button type="button" className="pw-btn" onClick={onOpenNewRun}>New run</button>
-        )}
       </div>
       {runs.length > 0 ? (
         <div className="pw-table-wrap">
@@ -325,7 +340,7 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
                   </span>
                 </span>
                 <span className="pw-row-right">
-                  <span className="pw-tag solid" style={{ textTransform: 'capitalize' }}>{run.status.replaceAll('_', ' ')}</span>
+                  <span className="pw-tag solid">{runStatusLabel(run.status)}</span>
                   <time
                     className="muted num"
                     style={{ fontSize: 12 }}
@@ -356,8 +371,7 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
         <div className="pw-empty-card">
           <RunsEmptySvg />
           <h3>No runs yet</h3>
-          <p>Start a Safe Audit to map your surface, or run a Core Pentest with test accounts to verify access controls across {project.name}.</p>
-          <button type="button" className="pw-btn primary" onClick={onOpenNewRun}>Start first run</button>
+          <p>Start a Safe Audit to map your surface, or run a Core Pentest with test accounts to verify access controls across {project.name}. Use New run in the header to begin.</p>
         </div>
       )}
     </section>
@@ -406,7 +420,7 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
                 <div className="pw-confirm-meta num">
                   <span className="pw-tag solid" style={{ textTransform: 'capitalize' }}>
                     <span className="pw-dot" data-status={runToDelete.status} />
-                    {runToDelete.status.replaceAll('_', ' ')}
+                    {runStatusLabel(runToDelete.status)}
                   </span>
                   <span className="pw-tag solid">
                     {plural(runToDelete.findingCount, 'finding')}

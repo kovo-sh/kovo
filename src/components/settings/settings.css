@@ -1,5 +1,5 @@
 /* =====================================================================
-   Guardian Settings Workbench (/settings) — Option 3 .rw craft parity.
+   Kovo Hunter Settings Workbench (/settings) — Option 3 .rw craft parity.
    Scoped under `.sw` and consumes shared .rw / shell custom properties
    with exact warm-stone light & neutral-charcoal dark fallbacks.
    ===================================================================== */
@@ -508,6 +508,14 @@
 .sw-prof-name {
   font-weight: 550;
   color: var(--sw-fg);
+}
+
+.sw-prof-model {
+  color: var(--sw-fg-2);
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
 
 .sw-prof-sub {

@@ -1,11 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
-import {
-  cancelGithubDeviceFlowAction,
-  listGithubRepositories,
-  pollGithubDeviceFlowAction,
-  saveGithubToken,
-  startGithubDeviceFlowAction,
-} from '../../actions.ts'
+import { useEffect, useState } from 'react'
+import { listGithubRepositories, saveGithubToken } from '../../actions.ts'
+import { useGithubDeviceFlow } from '../github/useGithubDeviceFlow.ts'
 import { Icon } from '../run/icons.tsx'
 import { Input } from '../ui/input.tsx'
 import type { GithubAppInstallationSummary } from '../../server/github-connector.ts'
@@ -29,14 +24,6 @@ export interface GithubPatStatusSummary {
   needsAppInstall?: boolean
 }
 
-interface ActiveDeviceFlow {
-  flowId: string
-  userCode: string
-  verificationUri: string
-  expiresIn: number
-  intervalSec: number
-}
-
 interface Props {
   initialPatStatus: GithubPatStatusSummary
   selectedRepos: string[]
@@ -49,16 +36,6 @@ const MAX_SYNC_REPOS = 20
 function connectionBadge(status: GithubPatStatusSummary): string {
   if (status.login) return `@${status.login}`
   return 'Connected'
-}
-
-async function copyText(text: string): Promise<boolean> {
-  if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return false
-  try {
-    await navigator.clipboard.writeText(text)
-    return true
-  } catch {
-    return false
-  }
 }
 
 /** Crisp 16px monochrome GitHub mark for compact connected header bar. */
@@ -153,69 +130,17 @@ export function CreateProjectGithubBlock({
   const [search, setSearch] = useState('')
   const [error, setError] = useState('')
 
-  // GitHub App Device Flow state
-  const [clientIdInput, setClientIdInput] = useState('')
-  const [deviceFlow, setDeviceFlow] = useState<ActiveDeviceFlow | null>(null)
-  const [startingDeviceFlow, setStartingDeviceFlow] = useState(false)
-  const [codeCopied, setCodeCopied] = useState(false)
-  const activeFlowIdRef = useRef<string | null>(null)
-
-  useEffect(() => {
-    activeFlowIdRef.current = deviceFlow?.flowId ?? null
-  }, [deviceFlow?.flowId])
-
-  useEffect(() => {
-    if (!deviceFlow) return
-    let cancelled = false
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const flowId = deviceFlow.flowId
-
-    const scheduleNext = (delaySec: number) => {
-      if (cancelled) return
-      timer = setTimeout(() => {
-        void pollOnce()
-      }, Math.max(1, delaySec) * 1000)
-    }
-
-    const pollOnce = async () => {
-      if (cancelled || activeFlowIdRef.current !== flowId) return
-      try {
-        const res = await pollGithubDeviceFlowAction({ data: { flowId } })
-        if (cancelled || activeFlowIdRef.current !== flowId) return
-        if (res.status === 'pending') {
-          scheduleNext(res.intervalSec)
-          return
-        }
-        if (res.status === 'slow_down') {
-          setDeviceFlow(prev => (prev && prev.flowId === flowId ? { ...prev, intervalSec: res.intervalSec } : prev))
-          scheduleNext(res.intervalSec)
-          return
-        }
-        if (res.status === 'authorized') {
-          setDeviceFlow(null)
-          setCodeCopied(false)
-          setClientIdInput('')
-          setExpandedConnect(false)
-          setError('')
-          setPatStatus(res.accountStatus)
-          setReposLoaded(false)
-          return
-        }
-        setDeviceFlow(null)
-        setError(res.error || 'GitHub sign-in did not complete.')
-      } catch (err) {
-        if (cancelled || activeFlowIdRef.current !== flowId) return
-        setDeviceFlow(null)
-        setError(err instanceof Error ? err.message : 'GitHub sign-in polling failed.')
-      }
-    }
-
-    scheduleNext(deviceFlow.intervalSec)
-    return () => {
-      cancelled = true
-      if (timer) clearTimeout(timer)
-    }
-  }, [deviceFlow?.flowId])
+  const device = useGithubDeviceFlow({
+    configured: Boolean(patStatus.githubDeviceFlowConfigured),
+    disabled: disabled || savingToken,
+    onAuthorized: result => {
+      setPatStatus(result.accountStatus)
+      setReposLoaded(false)
+      setExpandedConnect(false)
+      setError('')
+    },
+  })
+  const { flow: deviceFlow, starting: startingDeviceFlow, error: deviceFlowError, clientId: clientIdInput, setClientId: setClientIdInput, codeCopied } = device
 
   useEffect(() => {
     if (!patStatus.configured || reposLoaded) return
@@ -241,42 +166,6 @@ export function CreateProjectGithubBlock({
       })
     return () => { cancelled = true }
   }, [patStatus.configured, reposLoaded, onChangeSelectedRepos])
-
-  async function handleStartDeviceFlow() {
-    if (startingDeviceFlow || savingToken || disabled) return
-    const trimmedClientId = clientIdInput.trim()
-    if (!patStatus.githubDeviceFlowConfigured && trimmedClientId.length < 6) {
-      setError('Enter your GitHub App Client ID to start sign-in.')
-      return
-    }
-    setStartingDeviceFlow(true)
-    setError('')
-    setCodeCopied(false)
-    try {
-      const started = await startGithubDeviceFlowAction({
-        data: trimmedClientId ? { clientId: trimmedClientId } : undefined,
-      })
-      setDeviceFlow(started)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not start GitHub sign-in.')
-    } finally {
-      setStartingDeviceFlow(false)
-    }
-  }
-
-  async function handleCancelDeviceFlow() {
-    const flowId = deviceFlow?.flowId
-    setDeviceFlow(null)
-    setCodeCopied(false)
-    setError('')
-    if (flowId) {
-      try {
-        await cancelGithubDeviceFlowAction({ data: { flowId } })
-      } catch {
-        // Best-effort
-      }
-    }
-  }
 
   async function handleRefresh() {
     if (loadingRepos || disabled) return
@@ -355,7 +244,7 @@ export function CreateProjectGithubBlock({
                     type="button"
                     className="btn primary"
                     disabled={startingDeviceFlow || savingToken || disabled}
-                    onClick={() => void handleStartDeviceFlow()}
+                    onClick={() => void device.start()}
                   >
                     {startingDeviceFlow ? 'Starting…' : 'Sign in with GitHub'}
                   </button>
@@ -368,7 +257,7 @@ export function CreateProjectGithubBlock({
                       onKeyDown={e => {
                         if (e.key === 'Enter') {
                           e.preventDefault()
-                          void handleStartDeviceFlow()
+                          void device.start()
                         }
                       }}
                       placeholder="GitHub App Client ID"
@@ -381,7 +270,7 @@ export function CreateProjectGithubBlock({
                       type="button"
                       className="btn primary"
                       disabled={startingDeviceFlow || savingToken || disabled || clientIdInput.trim().length < 6}
-                      onClick={() => void handleStartDeviceFlow()}
+                      onClick={() => void device.start()}
                     >
                       {startingDeviceFlow ? 'Starting…' : 'Sign in'}
                     </button>
@@ -395,7 +284,7 @@ export function CreateProjectGithubBlock({
                   <button
                     type="button"
                     className="btn"
-                    onClick={() => void copyText(deviceFlow.userCode).then(ok => setCodeCopied(ok))}
+                    onClick={() => void device.copyCode()}
                   >
                     {codeCopied ? 'Copied' : 'Copy code'}
                   </button>
@@ -415,7 +304,7 @@ export function CreateProjectGithubBlock({
                   <button
                     type="button"
                     className="btn ghost"
-                    onClick={() => void handleCancelDeviceFlow()}
+                    onClick={() => void device.cancel()}
                   >
                     Cancel
                   </button>
@@ -423,7 +312,7 @@ export function CreateProjectGithubBlock({
               </div>
             )}
 
-            {error && <p role="alert" className="cp-gh-err">{error}</p>}
+            {(error || deviceFlowError) && <p role="alert" className="cp-gh-err">{error || deviceFlowError}</p>}
 
             <details className="cp-gh-alt">
               <summary>Or connect with an access token</summary>

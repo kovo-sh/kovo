@@ -18,7 +18,8 @@ import {
 } from '../../domain.ts'
 import { FormError, useAction } from '../common.tsx'
 import { parseCurlOrHeader } from '../curl-parser.ts'
-import { approvalPolicyMeta, capabilityTierMeta } from '../run-state.ts'
+import { Icon } from '../run/icons.tsx'
+import { approvalPolicyMeta } from '../run-state.ts'
 import { Checkbox } from '../ui/checkbox.tsx'
 import type { PersonaTestState, ProjectLoaderData } from './types.ts'
 import { formatPersonaAuthBadge, LOGIN_URL_PLACEHOLDERS } from './types.ts'
@@ -203,10 +204,12 @@ export function ProjectNewRunSheet({
 
   useEffect(() => {
     if (!open) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !runAction.pending && !personaAction.pending) onClose()
+    }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [open, onClose])
+  }, [open, onClose, runAction.pending, personaAction.pending])
 
   if (!open) return null
 
@@ -324,12 +327,23 @@ export function ProjectNewRunSheet({
       role="dialog"
       aria-modal="true"
       aria-label="Start a run"
-      onMouseDown={e => { if (e.target === e.currentTarget) onClose() }}
+      onMouseDown={e => {
+        if (e.target === e.currentTarget && !runAction.pending && !personaAction.pending) onClose()
+      }}
     >
       <form className="pw-modal" onSubmit={handleSubmit}>
         <div className="pw-modal-hdr">
           <span>New run · {project.name}</span>
-          <button type="button" className="pw-btn ghost" onClick={onClose} aria-label="Close">✕</button>
+          <button
+            type="button"
+            className="pw-btn ghost"
+            style={{ padding: '0 6px' }}
+            onClick={onClose}
+            disabled={runAction.pending || personaAction.pending}
+            aria-label="Close"
+          >
+            <Icon name="close" size={14} />
+          </button>
         </div>
 
         <div className="pw-modal-body">
@@ -360,14 +374,14 @@ export function ProjectNewRunSheet({
           </div>
 
           {tier >= 2 && (
-            <div className="pw-section-box">
+            <div className="pw-section-group">
               <div className="pw-section-box-h">
                 <span className="pw-section-label">
                   Test accounts
                   <span className="pw-tag solid num">{selectedPersonaIds.length}/{personas.length}</span>
                 </span>
-                <button type="button" className="pw-btn ghost" onClick={() => setInlinePersonaOpen(v => !v)}>
-                  {inlinePersonaOpen ? 'Hide form' : '+ Quick add'}
+                <button type="button" className="pw-btn" onClick={() => setInlinePersonaOpen(v => !v)}>
+                  {inlinePersonaOpen ? 'Hide form' : '+ Quick add account'}
                 </button>
               </div>
               {personas.length > 0 ? (
@@ -482,7 +496,7 @@ export function ProjectNewRunSheet({
                     <button type="button" className="pw-btn ghost" onClick={() => setInlinePersonaOpen(false)}>Cancel</button>
                     <button
                       type="button"
-                      className="pw-btn primary"
+                      className="pw-btn"
                       disabled={
                         personaAction.pending ||
                         !personaHandle.trim() ||
@@ -501,7 +515,7 @@ export function ProjectNewRunSheet({
           )}
 
           {tier === 3 && (
-            <div className="pw-section-box" role="radiogroup" aria-label="Approval policy">
+            <div className="pw-section-group" role="radiogroup" aria-label="Approval policy">
               <div className="pw-section-box-h">
                 <span className="pw-section-label">Approval policy</span>
                 <span className="muted" style={{ fontSize: 11.5 }}>Switchable mid-run</span>
@@ -535,7 +549,7 @@ export function ProjectNewRunSheet({
             </div>
           )}
 
-          <div className="pw-budget-row">
+          <div className="pw-budget-row is-flat">
             <div>
               <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--pw-fg)' }}>Budget cap</div>
               <div className="muted" style={{ fontSize: 11.5 }}>Hard stop when spend reaches limit</div>
@@ -570,11 +584,11 @@ export function ProjectNewRunSheet({
           </div>
 
           <details className="pw-disclosure" style={{ marginTop: 0 }}>
-            <summary title={capabilityTierMeta[tier].name}>
-              Custom configuration <span className="muted num">({SCAN_DEPTH_LABELS[tier].short} · {maxRps} req/s · {concurrency} workers · {maxTurns} turns)</span>
+            <summary>
+              Advanced configuration <span className="muted num">({SCAN_DEPTH_LABELS[tier].short} · {maxRps} req/s · {concurrency} workers · {maxTurns} turns)</span>
             </summary>
             <div className="pw-disclosure-body">
-              <label className="pw-fld" title="Maps to internal capability tiers 0–3">Scan depth
+              <label className="pw-fld">Scan depth
                 <select
                   className="pw-select"
                   name="capabilityTier"

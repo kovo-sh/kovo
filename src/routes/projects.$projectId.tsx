@@ -2,6 +2,12 @@ import { createFileRoute, Link, useLocation, useNavigate, useRouter } from '@tan
 import { useEffect, useState } from 'react'
 import { projectData, removeProject, testPersonaAuthAction } from '../actions.ts'
 import { Icon } from '../components/run/icons.tsx'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '../components/ui/dropdown-menu.tsx'
 import { ProjectGuardrailsTab } from '../components/project/ProjectGuardrailsTab.tsx'
 import { ProjectInventoryTab } from '../components/project/ProjectInventoryTab.tsx'
 import { ProjectNewRunSheet } from '../components/project/ProjectNewRunSheet.tsx'
@@ -150,7 +156,6 @@ function ProjectPage() {
     sources: specs.length,
     ...(allowlistCount > 0 ? { guardrails: allowlistCount } : {}),
   }
-  const showHeaderNewRun = !(activeTab === 'overview' && runs.length === 0)
 
   return <main className="pw">
     <header className="pw-hdr">
@@ -163,23 +168,27 @@ function ProjectPage() {
           {project.seeds.map(safeHost).join(', ')}
         </span>
         <div className="pw-hdr-actions">
-          <button
-            type="button"
-            className="pw-btn ghost danger-hover"
-            title="Delete project"
-            onClick={() => {
-              setDeleteProjectError('')
-              setDeleteProjectOpen(true)
-            }}
-          >
-            <Icon name="trash" size={13} />
-            Delete project
+          <button type="button" className="pw-btn primary" onClick={() => setNewRunOpen(true)}>
+            New run
           </button>
-          {showHeaderNewRun && (
-            <button type="button" className="pw-btn primary" onClick={() => setNewRunOpen(true)}>
-              New run
-            </button>
-          )}
+          <DropdownMenu>
+            <DropdownMenuTrigger className="pw-btn ghost pw-hdr-more" aria-label="Project actions">
+              <Icon name="dots" size={15} />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="pw-menu">
+              <DropdownMenuItem
+                variant="destructive"
+                className="pw-menu-item"
+                onClick={() => {
+                  setDeleteProjectError('')
+                  setDeleteProjectOpen(true)
+                }}
+              >
+                <Icon name="trash" size={13} />
+                Delete project
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </div>
     </header>
@@ -209,7 +218,6 @@ function ProjectPage() {
         <ProjectOverviewTab
           data={data}
           onSelectTab={selectTab}
-          onOpenNewRun={() => setNewRunOpen(true)}
         />
       )}
       {activeTab === 'inventory' && <ProjectInventoryTab data={data} />}
