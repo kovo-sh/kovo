@@ -2,7 +2,18 @@
 // imports) into a temporary tree, write a neutral variant descriptor, and prove the copied tree
 // carries no host-side chain markers.
 import { randomBytes } from 'node:crypto'
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, extname, join, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -64,19 +75,42 @@ export function assertNoLeakage(root: string): void {
   if (problems.length) throw new Error(`assertNoLeakage failed under ${root}:\n  - ${problems.join('\n  - ')}`)
 }
 
+function ensureReadableTree(dir: string): void {
+  chmodSync(dir, 0o755)
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name)
+    const st = lstatSync(full)
+    if (st.isSymbolicLink()) continue
+    if (st.isDirectory()) ensureReadableTree(full)
+    else if (st.isFile()) chmodSync(full, 0o644)
+  }
+}
+
 export function materialize(input: MaterializeInput): MaterializeResult {
   const appDir = join(APPS_ROOT, input.app)
   const appSrc = join(appDir, 'src')
   if (!existsSync(appSrc) || !statSync(appSrc).isDirectory()) {
     throw new Error(`materialize: no src/ under ${appDir}`)
   }
+  const suiteRoot = join(input.outRoot ?? tmpdir(), 'multihop-saas')
   const root = join(
-    input.outRoot ?? tmpdir(),
-    'multihop-saas',
+    suiteRoot,
     `${input.app}-${input.plan.seed}-${randomBytes(4).toString('hex')}`,
   )
   rmSync(root, { recursive: true, force: true })
   const sourceDir = join(root, 'apps', input.app, 'src')
+
+  // Record every ancestor directory created by materialize so we can explicitly chmod 0o755
+  // afterwards and bypass restrictive host umasks (e.g. 0077) for non-root Docker workers.
+  const createdAncestors: string[] = []
+  let cursor = dirname(sourceDir)
+  while (!existsSync(cursor)) {
+    createdAncestors.push(cursor)
+    const parent = dirname(cursor)
+    if (parent === cursor) break
+    cursor = parent
+  }
+
   mkdirSync(dirname(sourceDir), { recursive: true })
   cpSync(appSrc, sourceDir, { recursive: true })
 
@@ -93,6 +127,16 @@ export function materialize(input: MaterializeInput): MaterializeResult {
   }
   writeFileSync(join(root, 'variant.json'), `${JSON.stringify(descriptor, null, 2)}\n`)
   writeFileSync(join(root, 'README.md'), `# ${input.app} lab source snapshot\n`)
+
+  for (const ancestor of createdAncestors.reverse()) {
+    chmodSync(ancestor, 0o755)
+  }
+  try {
+    chmodSync(suiteRoot, 0o755)
+  } catch {
+    /* best-effort when suiteRoot pre-existed and is not owned by the current UID */
+  }
+  ensureReadableTree(root)
 
   assertNoLeakage(root)
   return {
