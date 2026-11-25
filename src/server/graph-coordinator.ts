@@ -1841,6 +1841,7 @@ export interface DispatchStepInput {
   /** Optional typed multi-round hop artifacts feeding follow-on briefs without prompt soup. */
   chainHops?: readonly ChainHop[]
   /** Optional v8 bounded (<= 2 KB) pre-hydrated hop-checkpoint brief for depth >= 2 assignments. */
+  checkpointCapId?: string
   checkpointBrief?: HopCheckpointBrief
   checkpointJson?: string
 }
@@ -1864,6 +1865,7 @@ export interface NormalizedDispatchStep {
   skills: string[]
   priority: number
   chainHops?: ChainHop[]
+  checkpointCapId?: string
   checkpointBrief?: HopCheckpointBrief
   checkpointJson?: string
 }
@@ -1950,7 +1952,10 @@ export function dispatchInvestigations(steps: readonly DispatchStepInput[], opti
     if (seen.has(duplicateKey)) return reject('duplicate_step', 'Duplicate hypothesis/origin pair.')
     seen.add(duplicateKey)
     totalBudgetUsd += stepBudget
-    plan.push({
+      const derivedCapId = step.checkpointCapId?.trim()
+        || step.checkpointBrief?.capabilityHandles[step.checkpointBrief.capabilityHandles.length - 1]
+        || step.checkpointBrief?.verifiedHops[step.checkpointBrief.verifiedHops.length - 1]?.capId
+      plan.push({
       id: `dispatch-${plan.length + 1}`,
       hypothesis, origins, capabilities: capabilities.values, parentEvidenceIds,
       budgetUsd: stepBudget,
@@ -1968,6 +1973,7 @@ export function dispatchInvestigations(steps: readonly DispatchStepInput[], opti
             })),
           }
         : {}),
+      ...(derivedCapId ? { checkpointCapId: derivedCapId } : {}),
       ...(step.checkpointBrief ? { checkpointBrief: step.checkpointBrief } : {}),
       ...(step.checkpointJson ? { checkpointJson: step.checkpointJson } : {}),
     })

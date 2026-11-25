@@ -153,15 +153,77 @@ export interface AttackerProvenanceResult {
   violations: AttackerProvenanceViolation[]
 }
 
+export interface CompactCheckpointHop {
+  hop: number; receiptId: string; capId: string; kind: CapabilityKind; surface: CapabilitySurface
+  service: string; tenant: string; actor: string; role?: string; at?: string; binding?: CausalEdgeBindingKind
+}
+export interface HopCheckpointNextGoal {
+  targetSurfaceKey: string; surface: CapabilitySurface; service: string; endpoint: string; method?: string
+  hypothesisClass: string; expectedBinding?: CausalEdgeBindingKind; targetTenant?: string; targetRole?: string; goal: string
+}
 export interface HopCheckpointBrief {
-  schemaVersion: 1; capId: string; kind: CapabilityKind; promotionStatus: PromotionStatus
-  surface: CapabilitySurface; temporalState: CapabilityTemporalState
-  tenantScope: string; actorPersona: string; serviceOrigin: string
-  artifactDigestPrefix: string; artifactSummary: string; hopDepth: number
-  derivedHandles: string[]
-  lineageEdges: Array<{ hopReceiptId: string; binding: CausalEdgeBindingKind; from: string[]; to: string; actor: string }>
-  prunedBranches: Array<{ surface: string; hypothesis: string; reason: NegativeEdgeReason }>
-  truncated: boolean
+  schema: 'v8.hop_checkpoint.v1'; branchKey: string; depth: number; targetHop: number
+  mode: 'pivot' | 'fuse' | 'discover' | 'sweep'; evi: number
+  verifiedHops: CompactCheckpointHop[]; omittedEarlierHops?: number
+  capabilityHandles: string[]; fuseWithBranchKey?: string
+  nextGoal: HopCheckpointNextGoal
+  prunedBranches?: Array<{ surface: string; hypothesis: string; reason: NegativeEdgeReason }>
+  truncated?: boolean; doNotRediscover: true
+}
+export interface HopCheckpointBriefOptions {
+  branchKey?: string; evi?: number; mode?: 'pivot' | 'fuse' | 'discover' | 'sweep'
+  fuseWithBranchKey?: string; nextGoal?: Partial<HopCheckpointNextGoal>
+}
+
+const OPAQUE_BRIEF_HANDLE_RE = /^(?:cap|state|ref|hop|handle|secret|artifact|id):[A-Za-z0-9:._/-]{1,96}$/
+const RAW_BRIEF_SECRET_RE = /(?:eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|Bearer\s+\S+|\b(?:sk|pk|pat|ghp|tok|api)[_-][A-Za-z0-9_-]{12,}\b|[A-Fa-f0-9]{32,}|[A-Za-z0-9+/]{36,}={0,2})/g
+
+export function truncateBriefText(text: string, maxLen: number): string {
+  const t = text.trim()
+  return t.length <= maxLen ? t : maxLen <= 1 ? t.slice(0, maxLen) : `${t.slice(0, maxLen - 1)}…`
+}
+function truncateUtf8Bytes(text: string, maxBytes: number): string {
+  let out = text.trim()
+  while (out.length > 0 && Buffer.byteLength(out, 'utf8') > maxBytes) out = [...out].slice(0, -1).join('')
+  return out
+}
+export function sanitizeCheckpointHandleRef(raw: string, fallback: string): string {
+  const t = raw.trim()
+  if (!t) return fallback
+  if (OPAQUE_BRIEF_HANDLE_RE.test(t)) return t
+  if (RAW_BRIEF_SECRET_RE.test(t)) { RAW_BRIEF_SECRET_RE.lastIndex = 0; return fallback }
+  return t.slice(0, 80)
+}
+export const sanitizeCheckpointText = (text: string, maxLen: number): string => truncateBriefText(text.replace(RAW_BRIEF_SECRET_RE, '[redacted-handle]'), maxLen)
+
+/** Strictly bound a canonical `v8.hop_checkpoint.v1` brief to `<= maxBytes` UTF-8 (default 2 KB). */
+export function finalizeHopCheckpointBrief(rawBrief: HopCheckpointBrief, maxBytes = DEFAULT_CHECKPOINT_BRIEF_MAX_BYTES): { brief: HopCheckpointBrief; checkpointJson: string; checkpointBytes: number } {
+  const cap = Math.max(256, Math.min(DEFAULT_CHECKPOINT_BRIEF_MAX_BYTES, Math.floor(maxBytes)))
+  const brief: HopCheckpointBrief = {
+    ...rawBrief, schema: 'v8.hop_checkpoint.v1', verifiedHops: rawBrief.verifiedHops.map(h => ({ ...h })),
+    capabilityHandles: [...rawBrief.capabilityHandles], nextGoal: { ...rawBrief.nextGoal },
+    ...(rawBrief.prunedBranches ? { prunedBranches: rawBrief.prunedBranches.map(p => ({ ...p })) } : {}), doNotRediscover: true,
+  }
+  const measure = () => { const json = JSON.stringify(brief); return { json, bytes: Buffer.byteLength(json, 'utf8') } }
+  let m = measure()
+  if (m.bytes <= cap) return { brief, checkpointJson: m.json, checkpointBytes: m.bytes }
+  brief.truncated = true
+  while (m.bytes > cap && brief.prunedBranches?.length) { brief.prunedBranches.pop(); if (!brief.prunedBranches.length) delete brief.prunedBranches; m = measure() }
+  while (m.bytes > cap && brief.verifiedHops.length > 0) { brief.verifiedHops.shift(); brief.omittedEarlierHops = (brief.omittedEarlierHops ?? 0) + 1; m = measure() }
+  while (m.bytes > cap && brief.capabilityHandles.length > 1) { brief.capabilityHandles.shift(); m = measure() }
+  if (m.bytes > cap) {
+    brief.branchKey = truncateUtf8Bytes(brief.branchKey, 24)
+    brief.capabilityHandles = brief.capabilityHandles.slice(-1).map(h => truncateUtf8Bytes(h, 32))
+    brief.nextGoal = {
+      targetSurfaceKey: truncateUtf8Bytes(brief.nextGoal.targetSurfaceKey, 32), surface: brief.nextGoal.surface,
+      service: truncateUtf8Bytes(brief.nextGoal.service, 24), endpoint: truncateUtf8Bytes(brief.nextGoal.endpoint, 24),
+      hypothesisClass: truncateUtf8Bytes(brief.nextGoal.hypothesisClass, 24), goal: truncateUtf8Bytes(brief.nextGoal.goal, 24),
+    }
+    delete brief.fuseWithBranchKey
+    m = measure()
+  }
+  if (m.bytes > cap) { brief.nextGoal.goal = truncateUtf8Bytes(brief.nextGoal.goal, 12); brief.nextGoal.targetSurfaceKey = truncateUtf8Bytes(brief.nextGoal.targetSurfaceKey, 16); m = measure() }
+  return { brief, checkpointJson: m.json, checkpointBytes: m.bytes }
 }
 
 export interface CapabilityLedgerStats {
@@ -756,101 +818,75 @@ export class CapabilityLedger {
     ], 'updated_at_ms DESC, target_surface_key ASC').map(rowToNegativeEdge)
   }
 
-  /** Exports a bounded (`<= maxBytes`, default 2048 B) checkpoint brief for Layer-3 hop branching. */
-  buildHopCheckpointBrief(capId: string, maxBytes = DEFAULT_CHECKPOINT_BRIEF_MAX_BYTES): HopCheckpointBrief {
+  /** Exports the canonical `v8.hop_checkpoint.v1` brief (`<= maxBytes`, default 2048 B) from SQLite. */
+  buildHopCheckpointBrief(capId: string, maxBytes = DEFAULT_CHECKPOINT_BRIEF_MAX_BYTES, options: HopCheckpointBriefOptions = {}): HopCheckpointBrief {
     if (!Number.isInteger(maxBytes) || maxBytes < MIN_CHECKPOINT_BRIEF_MAX_BYTES) fail('INVALID_ARGUMENT', `maxBytes must be >= ${MIN_CHECKPOINT_BRIEF_MAX_BYTES}.`)
     const targetNode = this.getCapability(capId) ?? fail('CAPABILITY_NOT_FOUND', `Capability '${capId}' not found.`)
-
     const incomingByPost = new Map<string, CausalEdge[]>()
     for (const edge of this.listCausalEdges()) {
       if (!edge.postconditionCapId) continue
       const list = incomingByPost.get(edge.postconditionCapId) ?? []
-      list.push(edge)
-      incomingByPost.set(edge.postconditionCapId, list)
+      list.push(edge); incomingByPost.set(edge.postconditionCapId, list)
     }
-
-    const ancestorCaps = new Set<string>([capId])
-    const lineageEdgeMap = new Map<string, CausalEdge>()
-    const depthByCap = new Map<string, number>([[capId, 0]])
-    const queue = [capId]
+    const ancestorCaps = new Set<string>([capId]), lineageEdgeMap = new Map<string, CausalEdge>(), depthByCap = new Map<string, number>([[capId, 0]]), queue = [capId]
     let maxDepth = 0
     while (queue.length > 0) {
-      const curr = queue.shift()!
-      const currDist = depthByCap.get(curr) ?? 0
+      const curr = queue.shift()!, currDist = depthByCap.get(curr) ?? 0
       for (const edge of incomingByPost.get(curr) ?? []) {
         lineageEdgeMap.set(edge.edgeId, edge)
         for (const preId of edge.preconditionCapIds) {
-          const nextDist = currDist + 1
-          maxDepth = Math.max(maxDepth, nextDist)
-          ancestorCaps.add(preId)
+          const nextDist = currDist + 1; maxDepth = Math.max(maxDepth, nextDist); ancestorCaps.add(preId)
           if (nextDist > (depthByCap.get(preId) ?? -1)) { depthByCap.set(preId, nextDist); queue.push(preId) }
         }
       }
     }
-
     const orderedEdges = [...lineageEdgeMap.values()].sort((a, b) => a.sourceTimestampMs - b.sourceTimestampMs || a.edgeId.localeCompare(b.edgeId))
     const prunedRelevant = this.listNegativeEdges({ prunedOnly: true }).filter(neg => neg.preconditionCapIds.some(id => ancestorCaps.has(id)))
-
-    const brief: HopCheckpointBrief = {
-      schemaVersion: 1, capId: targetNode.capId, kind: targetNode.kind,
-      promotionStatus: targetNode.promotionStatus, surface: targetNode.surface,
-      temporalState: targetNode.temporalState, tenantScope: targetNode.tenantScope,
-      actorPersona: targetNode.actorPersona, serviceOrigin: targetNode.serviceOrigin,
-      artifactDigestPrefix: targetNode.artifactDigest.slice(0, 16),
-      artifactSummary: targetNode.artifactSummary, hopDepth: maxDepth,
-      derivedHandles: [...ancestorCaps],
-      lineageEdges: orderedEdges.map(e => ({
-        hopReceiptId: e.hopReceiptId, binding: e.edgeBindingKind,
-        from: e.preconditionCapIds, to: e.postconditionCapId ?? e.terminalImpact ?? '', actor: e.actorContext.persona,
-      })),
-      prunedBranches: prunedRelevant.map(n => ({ surface: n.targetSurfaceKey, hypothesis: n.hypothesisClass, reason: n.reason })),
-      truncated: false,
-    }
-
-    const byteLen = () => Buffer.byteLength(JSON.stringify(brief), 'utf8')
-    if (byteLen() <= maxBytes) return brief
-
-    brief.truncated = true
-    while (byteLen() > maxBytes && brief.prunedBranches.length > 0) brief.prunedBranches.pop()
-    while (byteLen() > maxBytes && brief.lineageEdges.length > 0) brief.lineageEdges.shift()
-    while (byteLen() > maxBytes && brief.derivedHandles.length > 1) {
-      const idx = brief.derivedHandles.findIndex(h => h !== capId)
-      if (idx === -1) break
-      brief.derivedHandles.splice(idx, 1)
-    }
-    while (byteLen() > maxBytes && brief.artifactSummary.length > 0) {
-      const nextLen = Math.max(0, Math.floor(brief.artifactSummary.length / 2) - 4)
-      brief.artifactSummary = nextLen > 3 ? `${brief.artifactSummary.slice(0, nextLen)}...` : ''
-    }
-    if (byteLen() > maxBytes) {
-      brief.tenantScope = brief.tenantScope.slice(0, 24)
-      brief.actorPersona = brief.actorPersona.slice(0, 24)
-      brief.serviceOrigin = brief.serviceOrigin.slice(0, 24)
-    }
-    return brief
+    const orderedHandles = [...ancestorCaps].sort((a, b) => (depthByCap.get(b) ?? 0) - (depthByCap.get(a) ?? 0) || a.localeCompare(b))
+    const incomingEdgeByCap = new Map<string, CausalEdge>()
+    for (const edge of orderedEdges) if (edge.postconditionCapId) incomingEdgeByCap.set(edge.postconditionCapId, edge)
+    const verifiedHops: CompactCheckpointHop[] = orderedHandles.map((id, idx) => {
+      const node = this.getCapability(id), edge = incomingEdgeByCap.get(id)
+      return {
+        hop: idx + 1, receiptId: sanitizeCheckpointHandleRef(edge?.hopReceiptId ?? node?.parentHopReceiptIds[0] ?? `hop:${idx + 1}`, `hop:${idx + 1}`),
+        capId: sanitizeCheckpointHandleRef(id, `cap:redacted:${idx + 1}`), kind: node?.kind ?? targetNode.kind, surface: node?.surface ?? targetNode.surface,
+        service: truncateBriefText(node?.serviceOrigin ?? targetNode.serviceOrigin, 48), tenant: truncateBriefText(node?.tenantScope ?? targetNode.tenantScope, 36),
+        actor: truncateBriefText(edge?.actorContext.persona ?? node?.actorPersona ?? targetNode.actorPersona, 36),
+        ...(edge?.actorContext.roleLabel ? { role: truncateBriefText(edge.actorContext.roleLabel, 28) } : {}),
+        ...(edge ? { binding: edge.edgeBindingKind } : {}),
+      }
+    })
+    const ng = options.nextGoal, endpoint = sanitizeCheckpointText(ng?.endpoint ?? (typeof targetNode.metadata.endpoint === 'string' ? targetNode.metadata.endpoint : '/'), 96)
+    const service = truncateBriefText(ng?.service ?? targetNode.serviceOrigin, 48), surface = ng?.surface ?? targetNode.surface
+    return finalizeHopCheckpointBrief({
+      schema: 'v8.hop_checkpoint.v1', branchKey: truncateBriefText(options.branchKey ?? capId, 64), depth: maxDepth, targetHop: Math.min(6, maxDepth + 1),
+      mode: options.mode ?? (options.fuseWithBranchKey ? 'fuse' : 'pivot'), evi: Number((options.evi ?? 1).toFixed(6)), verifiedHops,
+      capabilityHandles: orderedHandles.map((h, i) => sanitizeCheckpointHandleRef(h, `cap:redacted:${i + 1}`)),
+      ...(options.fuseWithBranchKey ? { fuseWithBranchKey: truncateBriefText(options.fuseWithBranchKey, 64) } : {}),
+      nextGoal: {
+        targetSurfaceKey: truncateBriefText(ng?.targetSurfaceKey ?? `${service}|${surface}|${endpoint}`, 80), surface, service, endpoint,
+        ...(ng?.method ? { method: ng.method.toUpperCase() } : {}), hypothesisClass: truncateBriefText(ng?.hypothesisClass ?? targetNode.kind, 48),
+        ...(ng?.expectedBinding ? { expectedBinding: ng.expectedBinding } : {}),
+        ...(ng?.targetTenant ? { targetTenant: truncateBriefText(ng.targetTenant, 36) } : {}),
+        ...(ng?.targetRole ? { targetRole: truncateBriefText(ng.targetRole, 32) } : {}),
+        goal: sanitizeCheckpointText(ng?.goal ?? (targetNode.artifactSummary || `Pivot from ${capId}`), 180),
+      },
+      ...(prunedRelevant.length > 0 ? { prunedBranches: prunedRelevant.map(n => ({ surface: truncateBriefText(n.targetSurfaceKey, 64), hypothesis: truncateBriefText(n.hypothesisClass, 48), reason: n.reason })) } : {}),
+      truncated: false, doNotRediscover: true,
+    }, maxBytes).brief
   }
 
   getStats(): CapabilityLedgerStats {
-    const nodes = this.db.prepare(`
-      SELECT COUNT(*) AS total,
-        SUM(CASE WHEN promotion_status = 'capability_only' THEN 1 ELSE 0 END) AS quarantined,
-        SUM(CASE WHEN promotion_status = 'terminal_eligible' THEN 1 ELSE 0 END) AS terminal_eligible
-      FROM capability_nodes WHERE run_id = ?
-    `).get(this.runId) as { total: number; quarantined: number | null; terminal_eligible: number | null }
+    const nodes = this.db.prepare(
+      `SELECT COUNT(*) AS total, SUM(CASE WHEN promotion_status = 'capability_only' THEN 1 ELSE 0 END) AS quarantined, SUM(CASE WHEN promotion_status = 'terminal_eligible' THEN 1 ELSE 0 END) AS terminal_eligible FROM capability_nodes WHERE run_id = ?`,
+    ).get(this.runId) as { total: number; quarantined: number | null; terminal_eligible: number | null }
     const edges = this.db.prepare('SELECT COUNT(*) AS total FROM capability_causal_edges WHERE run_id = ?').get(this.runId) as { total: number }
-    const negs = this.db.prepare(
-      'SELECT COUNT(*) AS total, SUM(CASE WHEN pruned = 1 THEN 1 ELSE 0 END) AS pruned FROM capability_negative_edges WHERE run_id = ?',
-    ).get(this.runId) as { total: number; pruned: number | null }
-    return {
-      totalNodes: nodes.total, quarantinedNodes: nodes.quarantined ?? 0,
-      terminalEligibleNodes: nodes.terminal_eligible ?? 0, positiveEdges: edges.total,
-      negativeEdges: negs.total, prunedBranches: negs.pruned ?? 0,
-    }
+    const negs = this.db.prepare('SELECT COUNT(*) AS total, SUM(CASE WHEN pruned = 1 THEN 1 ELSE 0 END) AS pruned FROM capability_negative_edges WHERE run_id = ?').get(this.runId) as { total: number; pruned: number | null }
+    return { totalNodes: nodes.total, quarantinedNodes: nodes.quarantined ?? 0, terminalEligibleNodes: nodes.terminal_eligible ?? 0, positiveEdges: edges.total, negativeEdges: negs.total, prunedBranches: negs.pruned ?? 0 }
   }
 
   private queryFiltered(table: string, filters: ReadonlyArray<[string, string | number | undefined]>, orderBy: string): DbRow[] {
-    const clauses = ['run_id = ?']
-    const params: Array<string | number> = [this.runId]
+    const clauses = ['run_id = ?'], params: Array<string | number> = [this.runId]
     for (const [col, val] of filters) if (val !== undefined) { clauses.push(`${col} = ?`); params.push(val) }
     return this.db.prepare(`SELECT * FROM ${table} WHERE ${clauses.join(' AND ')} ORDER BY ${orderBy}`).all(...params) as DbRow[]
   }

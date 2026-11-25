@@ -42,7 +42,7 @@ import {
   summarizeGuardianVerifyOutcome,
 } from '../src/server/agent-session.ts'
 import { RequestBroker, type Grant } from '../src/server/broker.ts'
-import { Execution, runV8AgentScriptProof, syncVerifyArtifactsToLedger } from '../src/server/execution.ts'
+import { Execution, FrontierWaveController, nextPlannerDryRounds, runV8AgentScriptProof, syncVerifyArtifactsToLedger } from '../src/server/execution.ts'
 import type { ResolvedPersona } from '../src/server/persona-vault.ts'
 import { extractStoreCompositeReceipts } from '../src/server/receipt-export.ts'
 import { evidence, findings, replaySpecs } from '../src/server/schema.ts'
@@ -925,28 +925,38 @@ test('4. Verified HopReceipt reach expansions reset nextPlannerDryRounds via Fro
     targetTimestampMs: 1010,
   })
 
-  const progress = execution.evaluateFrontierProgressForRound(runId, {
-    roundNo: 3,
-    previousDryRounds: 1,
-    newRuntimeConfirmed: 0,
-    newChainPrimitives: 0,
-    completedInvestigations: 2,
-    previousCompletedInvestigations: 1,
+  const controller = new FrontierWaveController({ ledger })
+  const hopEvents = ledger.listCausalEdges().map(edge => {
+    const postNode = edge.postconditionCapId ? ledger.getCapability(edge.postconditionCapId) : null
+    return {
+      hopReceiptId: edge.hopReceiptId,
+      branchKey: edge.postconditionCapId ?? edge.edgeId,
+      depth: Math.max(1, edge.preconditionCapIds.length + 1),
+      hostVerified: true,
+      tenantScope: postNode?.tenantScope ?? edge.actorContext.tenantScope ?? 'default_tenant',
+      serviceOrigin: postNode?.serviceOrigin ?? edge.actorContext.serviceOrigin ?? 'unknown',
+      surface: postNode?.surface ?? 'http',
+      ...(postNode ? { capabilityId: postNode.capId } : {}),
+    }
   })
-  assert.equal(progress.verifiedHopReachExpansions, 1, 'New verified HopReceipt must expand frontier reach')
-  assert.equal(progress.dryRounds, 0, 'Verified HopReceipt reach expansion must reset planner dry rounds to 0')
+  const wave1 = controller.evaluateWaveProgress({ completedAssignments: 1, verifiedHopReceipts: hopEvents })
+  const expansions1 = wave1.reachDelta.newHopReceiptIds.length
+  const dryRounds1 = nextPlannerDryRounds({
+    roundNo: 3, previousDryRounds: 1, newRuntimeConfirmed: 0, newChainPrimitives: 0,
+    completedInvestigations: 2, previousCompletedInvestigations: 1, verifiedHopReachExpansions: expansions1,
+  })
+  assert.equal(expansions1, 1, 'New verified HopReceipt must expand frontier reach')
+  assert.equal(dryRounds1, 0, 'Verified HopReceipt reach expansion must reset planner dry rounds to 0')
 
   // Next round with zero new verified hops increments dry rounds normally.
-  const dryNext = execution.evaluateFrontierProgressForRound(runId, {
-    roundNo: 4,
-    previousDryRounds: 0,
-    newRuntimeConfirmed: 0,
-    newChainPrimitives: 0,
-    completedInvestigations: 3,
-    previousCompletedInvestigations: 2,
+  const wave2 = controller.evaluateWaveProgress({ completedAssignments: 1, verifiedHopReceipts: hopEvents })
+  const expansions2 = wave2.reachDelta.newHopReceiptIds.length
+  const dryRounds2 = nextPlannerDryRounds({
+    roundNo: 4, previousDryRounds: 0, newRuntimeConfirmed: 0, newChainPrimitives: 0,
+    completedInvestigations: 3, previousCompletedInvestigations: 2, verifiedHopReachExpansions: expansions2,
   })
-  assert.equal(dryNext.verifiedHopReachExpansions, 0)
-  assert.equal(dryNext.dryRounds, 1)
+  assert.equal(expansions2, 0)
+  assert.equal(dryRounds2, 1)
 })
 
 test('5. Multi-hop skill pre-injection & execution.ts LOC budget (< 6,000 LOC)', () => {

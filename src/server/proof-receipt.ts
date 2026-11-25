@@ -12,29 +12,8 @@
  * produce the same artifact, so promotion, patch retest, and reporting share one confirmation
  * path instead of three.
  */
-import { createRequire } from 'node:module'
 import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
-import type {
-  CausalEdgeBinding,
-  CausalEdgeKind,
-  CompositeFailureStage,
-  CompositeProofReceipt,
-  CompositeReceiptVerification,
-  CompositeVerifyOptions,
-  HopReceipt,
-  HopSurface,
-  HostAsyncPollRecord,
-  HostBrowserTrace,
-  HostCryptoAttestation,
-  HostOobEvent,
-  HostSignableRecord,
-  HostSignedTranscript,
-  HostTranscriptEntry,
-  ReplayMode,
-  TerminalImpact,
-  VerifiedEdgeResult,
-} from './composite-receipt.ts'
 import {
   assessBooleanDifferential,
   assessImpactEvidence,
@@ -1778,88 +1757,3 @@ export function buildOobReceipt(input: {
 }
 
 export type { ImpactClass, ImpactStep, RoleName }
-
-// ---------------------------------------------------------------------------
-// v8 Unified CompositeProofReceipt confirmation bridge
-// ---------------------------------------------------------------------------
-// Loaded lazily via createRequire so importing proof-receipt.ts before
-// composite-receipt.ts avoids ESM top-level TDZ on receiptIdSchema/proofReceiptSchema.
-
-const requireCompositeLocal = createRequire(import.meta.url)
-let cachedCompositeModule: typeof import('./composite-receipt.ts') | null = null
-
-function loadCompositeModule(): typeof import('./composite-receipt.ts') {
-  if (!cachedCompositeModule) {
-    cachedCompositeModule = requireCompositeLocal('./composite-receipt.ts') as typeof import('./composite-receipt.ts')
-  }
-  return cachedCompositeModule
-}
-
-/** Unified confirmation path: verify a 1..8 hop CompositeProofReceipt DAG against host-signed transcripts. */
-export function verifyCompositeReceipt(
-  rawReceipt: unknown,
-  hostTranscript: HostSignedTranscript,
-  options?: CompositeVerifyOptions,
-): CompositeReceiptVerification {
-  return loadCompositeModule().verifyCompositeReceipt(rawReceipt, hostTranscript, options)
-}
-
-/** Wrap a single-hop v7 ProofReceipt as a valid 1-node CompositeProofReceipt DAG. */
-export function singleReceiptToComposite(
-  rawReceipt: ProofReceipt,
-  options?: { chainId?: string; surface?: HopSurface; replayMode?: ReplayMode; benchmarkMode?: boolean },
-): CompositeProofReceipt {
-  return loadCompositeModule().singleReceiptToComposite(rawReceipt, options)
-}
-
-/** Host-side HMAC-SHA256 signer for CompositeProofReceipt transcript records. */
-export function signHostRecord(record: HostSignableRecord, signingKey: string): string {
-  return loadCompositeModule().signHostRecord(record, signingKey)
-}
-
-/** Host-side HMAC-SHA256 verifier for CompositeProofReceipt transcript records. */
-export function verifyHostRecordSignature(record: HostSignableRecord, signingKey: string): boolean {
-  return loadCompositeModule().verifyHostRecordSignature(record, signingKey)
-}
-
-/**
- * Unified confirmation entry point accepting either a multi-hop CompositeProofReceipt
- * or a 1-hop ProofReceipt (automatically wrapped into a 1-node DAG via singleReceiptToComposite).
- */
-export function verifyReceiptUnified(
-  rawReceipt: unknown,
-  hostTranscript: HostSignedTranscript,
-  options?: CompositeVerifyOptions,
-): CompositeReceiptVerification {
-  const composite = loadCompositeModule()
-  if (rawReceipt && typeof rawReceipt === 'object' && !Array.isArray(rawReceipt) && 'hops' in rawReceipt) {
-    return composite.verifyCompositeReceipt(rawReceipt, hostTranscript, options)
-  }
-  const singleParsed = proofReceiptSchema.safeParse(rawReceipt)
-  if (!singleParsed.success) {
-    return composite.verifyCompositeReceipt(rawReceipt, hostTranscript, options)
-  }
-  const wrapped = composite.singleReceiptToComposite(singleParsed.data)
-  return composite.verifyCompositeReceipt(wrapped, hostTranscript, options)
-}
-
-export type {
-  CausalEdgeBinding,
-  CausalEdgeKind,
-  CompositeFailureStage,
-  CompositeProofReceipt,
-  CompositeReceiptVerification,
-  CompositeVerifyOptions,
-  HopReceipt,
-  HopSurface,
-  HostAsyncPollRecord,
-  HostBrowserTrace,
-  HostCryptoAttestation,
-  HostOobEvent,
-  HostSignableRecord,
-  HostSignedTranscript,
-  HostTranscriptEntry,
-  ReplayMode,
-  TerminalImpact,
-  VerifiedEdgeResult,
-}

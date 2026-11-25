@@ -15,6 +15,18 @@
  *  5. 2-Strike Dead-End Pruning & Negative-Edge Memoization keeping dead-end re-probe waste <= 5%.
  */
 
+import {
+  finalizeHopCheckpointBrief,
+  sanitizeCheckpointHandleRef,
+  sanitizeCheckpointText,
+  truncateBriefText,
+  type CompactCheckpointHop,
+  type HopCheckpointBrief,
+  type HopCheckpointNextGoal,
+} from './capability-ledger.ts'
+
+export type { CompactCheckpointHop, HopCheckpointBrief, HopCheckpointNextGoal }
+
 export const MIN_BEAM_WIDTH = 8
 export const MAX_BEAM_WIDTH = 16
 export const DEFAULT_BEAM_WIDTH = 12
@@ -83,23 +95,6 @@ export interface NegativeEdgeRecord {
 
 export type EviInput = Pick<FrontierBranch, 'feasibilityProb' | 'terminalImpactWeight' | 'surfaceNovelty' | 'attemptsOnBranch'>
 export interface ScoredFrontierBranch { branch: FrontierBranch; evi: number; pairKey: string; negativeEdgeKey: string; siblingEdgeKey: string | null }
-
-export interface CompactCheckpointHop {
-  hop: number; receiptId: string; capId: string; kind: FrontierCapabilityKind; surface: FrontierSurface
-  service: string; tenant: string; actor: string; role?: string; at?: string; binding?: CausalEdgeBindingKind
-}
-
-export interface HopCheckpointBrief {
-  schema: 'v8.hop_checkpoint.v1'; branchKey: string; depth: number; targetHop: number
-  mode: 'pivot' | 'fuse' | 'discover' | 'sweep'; evi: number
-  verifiedHops: CompactCheckpointHop[]; omittedEarlierHops?: number
-  capabilityHandles: string[]; fuseWithBranchKey?: string
-  nextGoal: {
-    targetSurfaceKey: string; surface: FrontierSurface; service: string; endpoint: string; method?: string
-    hypothesisClass: string; expectedBinding?: CausalEdgeBindingKind; targetTenant?: string; targetRole?: string; goal: string
-  }
-  doNotRediscover: true
-}
 
 export interface WaveAssignment {
   assignmentId: string; waveNo: number; lane: FrontierLane; branchKey: string; depth: number; targetHop: number
@@ -185,8 +180,6 @@ export interface FrontierSchedulerOptions {
 // Pure Scoring, Keying & Sanitization
 // ---------------------------------------------------------------------------
 
-const OPAQUE_HANDLE_RE = /^(?:cap|state|ref|hop|handle|secret|artifact|id):[A-Za-z0-9:._/-]{1,96}$/
-const RAW_SECRET_RE = /(?:eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|Bearer\s+\S+|\b(?:sk|pk|pat|ghp|tok|api)[_-][A-Za-z0-9_-]{12,}\b|[A-Fa-f0-9]{32,}|[A-Za-z0-9+/]{36,}={0,2})/g
 
 export function clampBeamWidth(width: number | undefined): number {
   return typeof width === 'number' && Number.isFinite(width)
@@ -241,22 +234,7 @@ function branchKeys(branch: FrontierBranch) {
   }
 }
 
-export function sanitizeHandleRef(raw: string, fallback: string): string {
-  const trimmed = raw.trim()
-  if (!trimmed) return fallback
-  if (OPAQUE_HANDLE_RE.test(trimmed)) return trimmed
-  if (RAW_SECRET_RE.test(trimmed)) { RAW_SECRET_RE.lastIndex = 0; return fallback }
-  return trimmed.slice(0, 80)
-}
-
-function truncateText(text: string, maxLen: number): string {
-  const trimmed = text.trim()
-  return trimmed.length <= maxLen ? trimmed : maxLen <= 1 ? trimmed.slice(0, maxLen) : `${trimmed.slice(0, maxLen - 1)}…`
-}
-
-function sanitizeBriefText(text: string, maxLen: number): string {
-  return truncateText(text.replace(RAW_SECRET_RE, '[redacted-handle]'), maxLen)
-}
+export const sanitizeHandleRef = sanitizeCheckpointHandleRef
 
 function compareScoredBranches(a: ScoredFrontierBranch, b: ScoredFrontierBranch): number {
   return (b.evi - a.evi)
@@ -296,37 +274,16 @@ function compactHop(hop: VerifiedHopHandle, compact: boolean): CompactCheckpoint
     receiptId: sanitizeHandleRef(hop.hopReceiptId, `hop:${hop.hopIndex}`),
     capId: sanitizeHandleRef(hop.capabilityId, `cap:redacted:${hop.hopIndex}`),
     kind: hop.kind, surface: hop.surface,
-    service: truncateText(hop.serviceOrigin, compact ? 28 : 48),
-    tenant: truncateText(hop.tenantScope, compact ? 24 : 36),
-    actor: truncateText(hop.actorPersona, compact ? 24 : 36),
+    service: truncateBriefText(hop.serviceOrigin, compact ? 28 : 48),
+    tenant: truncateBriefText(hop.tenantScope, compact ? 24 : 36),
+    actor: truncateBriefText(hop.actorPersona, compact ? 24 : 36),
   }
   if (!compact) {
-    if (hop.roleLabel) out.role = truncateText(hop.roleLabel, 28)
-    if (hop.endpoint) out.at = sanitizeBriefText(`${hop.method ? `${hop.method.toUpperCase()} ` : ''}${hop.endpoint}`, 64)
+    if (hop.roleLabel) out.role = truncateBriefText(hop.roleLabel, 28)
+    if (hop.endpoint) out.at = sanitizeCheckpointText(`${hop.method ? `${hop.method.toUpperCase()} ` : ''}${hop.endpoint}`, 64)
     if (hop.edgeBindingKind) out.binding = hop.edgeBindingKind
   }
   return out
-}
-
-function finalizeBoundedBrief(brief: HopCheckpointBrief, cap: number): {
-  brief: HopCheckpointBrief; checkpointJson: string; checkpointBytes: number
-} {
-  let json = JSON.stringify(brief)
-  let bytes = Buffer.byteLength(json, 'utf8')
-  if (bytes > cap) {
-    brief.branchKey = truncateText(brief.branchKey, 24)
-    brief.verifiedHops = []
-    brief.capabilityHandles = brief.capabilityHandles.slice(-1).map(h => truncateText(h, 32))
-    brief.nextGoal = {
-      targetSurfaceKey: truncateText(brief.nextGoal.targetSurfaceKey, 32), surface: brief.nextGoal.surface,
-      service: truncateText(brief.nextGoal.service, 24), endpoint: truncateText(brief.nextGoal.endpoint, 24),
-      hypothesisClass: truncateText(brief.nextGoal.hypothesisClass, 24), goal: truncateText(brief.nextGoal.goal, 24),
-    }
-    delete brief.fuseWithBranchKey
-    json = JSON.stringify(brief)
-    bytes = Buffer.byteLength(json, 'utf8')
-  }
-  return { brief, checkpointJson: json, checkpointBytes: bytes }
 }
 
 /** Build a pre-hydrated Hop-Checkpoint brief strictly <= 2 KB UTF-8 with scrubbed opaque handles. */
@@ -339,20 +296,20 @@ export function buildHopCheckpointBrief(
   const ordered = [...branch.verifiedHops].sort((a, b) => a.hopIndex - b.hopIndex)
   const allHandles = [...new Set(ordered.map(h => sanitizeHandleRef(h.capabilityId, `cap:redacted:${h.hopIndex}`)))]
   const make = (hops: CompactCheckpointHop[], omitted: number, handles: string[], gl: number, el: number, opt: boolean): HopCheckpointBrief => ({
-    schema: 'v8.hop_checkpoint.v1', branchKey: truncateText(branch.branchKey, 64),
+    schema: 'v8.hop_checkpoint.v1', branchKey: truncateBriefText(branch.branchKey, 64),
     depth: branch.depth, targetHop: Math.min(MAX_CHAIN_DEPTH, branch.depth + 1),
     mode: branch.fuseWithBranchKey ? 'fuse' : 'pivot', evi: Number(evi.toFixed(6)),
     verifiedHops: hops, ...(omitted > 0 ? { omittedEarlierHops: omitted } : {}),
-    capabilityHandles: handles, ...(branch.fuseWithBranchKey ? { fuseWithBranchKey: truncateText(branch.fuseWithBranchKey, 64) } : {}),
+    capabilityHandles: handles, ...(branch.fuseWithBranchKey ? { fuseWithBranchKey: truncateBriefText(branch.fuseWithBranchKey, 64) } : {}),
     nextGoal: {
-      targetSurfaceKey: truncateText(branch.nextTarget.targetSurfaceKey, 80), surface: branch.nextTarget.surface,
-      service: truncateText(branch.nextTarget.serviceOrigin, 48), endpoint: sanitizeBriefText(branch.nextTarget.endpoint, el),
+      targetSurfaceKey: truncateBriefText(branch.nextTarget.targetSurfaceKey, 80), surface: branch.nextTarget.surface,
+      service: truncateBriefText(branch.nextTarget.serviceOrigin, 48), endpoint: sanitizeCheckpointText(branch.nextTarget.endpoint, el),
       ...(branch.nextTarget.method ? { method: branch.nextTarget.method.toUpperCase() } : {}),
-      hypothesisClass: truncateText(branch.nextTarget.hypothesisClass, 48),
+      hypothesisClass: truncateBriefText(branch.nextTarget.hypothesisClass, 48),
       ...(opt && branch.nextTarget.expectedBindingKind ? { expectedBinding: branch.nextTarget.expectedBindingKind } : {}),
-      ...(opt && branch.nextTarget.targetTenantScope ? { targetTenant: truncateText(branch.nextTarget.targetTenantScope, 36) } : {}),
-      ...(opt && branch.nextTarget.targetRoleLabel ? { targetRole: truncateText(branch.nextTarget.targetRoleLabel, 32) } : {}),
-      goal: sanitizeBriefText(branch.nextTarget.goalSummary, gl),
+      ...(opt && branch.nextTarget.targetTenantScope ? { targetTenant: truncateBriefText(branch.nextTarget.targetTenantScope, 36) } : {}),
+      ...(opt && branch.nextTarget.targetRoleLabel ? { targetRole: truncateBriefText(branch.nextTarget.targetRoleLabel, 32) } : {}),
+      goal: sanitizeCheckpointText(branch.nextTarget.goalSummary, gl),
     },
     doNotRediscover: true,
   })
@@ -367,22 +324,22 @@ export function buildHopCheckpointBrief(
       if (bytes <= cap) return { brief, checkpointJson: json, checkpointBytes: bytes }
     }
   }
-  return finalizeBoundedBrief(make([], ordered.length, allHandles.slice(-2), 48, 40, false), cap)
+  return finalizeHopCheckpointBrief(make([], ordered.length, allHandles.slice(-2), 48, 40, false), cap)
 }
 
 function buildSeedBrief(mode: 'discover' | 'sweep', candidate: SurfaceSeedCandidate, score: number, maxBytes: number) {
   const cap = Math.max(256, Math.min(MAX_CHECKPOINT_BRIEF_BYTES, Math.floor(maxBytes)))
   const targetSurfaceKey = `${candidate.serviceOrigin}|${candidate.surface}|${candidate.endpoint}`
   const make = (gl: number, el: number): HopCheckpointBrief => ({
-    schema: 'v8.hop_checkpoint.v1', branchKey: truncateText(candidate.candidateKey, 64),
+    schema: 'v8.hop_checkpoint.v1', branchKey: truncateBriefText(candidate.candidateKey, 64),
     depth: 0, targetHop: 1, mode, evi: Number(score.toFixed(6)), verifiedHops: [], capabilityHandles: [],
     nextGoal: {
-      targetSurfaceKey: truncateText(targetSurfaceKey, 80), surface: candidate.surface,
-      service: truncateText(candidate.serviceOrigin, 48), endpoint: sanitizeBriefText(candidate.endpoint, el),
+      targetSurfaceKey: truncateBriefText(targetSurfaceKey, 80), surface: candidate.surface,
+      service: truncateBriefText(candidate.serviceOrigin, 48), endpoint: sanitizeCheckpointText(candidate.endpoint, el),
       ...(candidate.method ? { method: candidate.method.toUpperCase() } : {}),
-      hypothesisClass: truncateText(candidate.hypothesisClass, 48),
-      ...(candidate.tenantScope ? { targetTenant: truncateText(candidate.tenantScope, 36) } : {}),
-      goal: sanitizeBriefText(candidate.goalSummary, gl),
+      hypothesisClass: truncateBriefText(candidate.hypothesisClass, 48),
+      ...(candidate.tenantScope ? { targetTenant: truncateBriefText(candidate.tenantScope, 36) } : {}),
+      goal: sanitizeCheckpointText(candidate.goalSummary, gl),
     },
     doNotRediscover: true,
   })
@@ -392,7 +349,7 @@ function buildSeedBrief(mode: 'discover' | 'sweep', candidate: SurfaceSeedCandid
     const bytes = Buffer.byteLength(json, 'utf8')
     if (bytes <= cap) return { brief, checkpointJson: json, checkpointBytes: bytes }
   }
-  return finalizeBoundedBrief(make(24, 24), cap)
+  return finalizeHopCheckpointBrief(make(24, 24), cap)
 }
 
 // ---------------------------------------------------------------------------
