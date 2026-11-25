@@ -23,14 +23,12 @@
  */
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { connect as h2Connect, constants as h2constants } from 'node:http2'
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { lookup } from 'node:dns/promises'
-import ipaddr from 'ipaddr.js'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
+import { EgressDeniedError, EgressGateway } from './egress-gateway.ts'
 import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
 import { redact, type NamedSecret } from './redact.ts'
@@ -1195,7 +1193,9 @@ export class VerifyRpcServer {
       })
     } catch (error) {
       const msg = this.scrub(error instanceof Error ? error.message : 'HTTP/2 exchange failed.')
-      const record = this.transcript.record({ op: 'http2', startedAt: started, durationMs: Date.now() - started, request: prep.requestMeta, error: msg, errorCode: /scope|denied|approval|forbidden|outside|header|kill.?switch/i.test(msg) ? 'denied' : 'failed' })
+      const isPolicyDeny = (error instanceof EgressDeniedError && error.code !== 'response_too_large')
+        || /scope|denied|approval|forbidden|outside|header|kill.?switch/i.test(msg)
+      const record = this.transcript.record({ op: 'http2', startedAt: started, durationMs: Date.now() - started, request: prep.requestMeta, error: msg, errorCode: isPolicyDeny ? 'denied' : 'failed' })
       throw new Error(`${record.exchangeId}: ${msg}`)
     }
   }
@@ -1208,7 +1208,7 @@ export class VerifyRpcServer {
     return injected
   }
 
-  /** HTTP/2 stays on the same grant & canonical RequestAdmissionEngine: kill switch, scope, tier, denylist, approval, persona injection. */
+  /** HTTP/2 stays on the same grant, canonical RequestAdmissionEngine, and EgressGateway.egressHttp2. */
   private async executeHttp2(req: BrokerHttpRequest, signal: AbortSignal, grant: Grant = this.options.grant): Promise<{ status: number; headers: Record<string, string>; rawHeaders: Record<string, string>; body: string; durationMs: number }> {
     const ks = (this.options.broker as unknown as { options?: { killSwitch?: GlobalKillSwitch } })?.options?.killSwitch ?? globalKillSwitch
     const tenantId = grant.tenantId ?? null
@@ -1217,13 +1217,6 @@ export class VerifyRpcServer {
     if (!decision.allowed || !decision.parsedUrl) throw new Error(decision.reason)
     const url = decision.parsedUrl
     const localLab = Boolean(decision.localLab)
-    const addresses = await lookup(url.hostname, { all: true, order: 'verbatim' })
-    if (addresses.length === 0) throw new Error('Target hostname did not resolve.')
-    for (const address of addresses) {
-      const range = ipaddr.process(address.address).range()
-      if (range === 'linkLocal') throw new Error('Link-local/metadata destinations are never permitted.')
-      if (!localLab && range !== 'unicast') throw new Error('Target hostname did not resolve exclusively to public addresses.')
-    }
     const headers: Record<string, string> = {}
     for (const [key, value] of Object.entries(req.headers ?? {})) {
       if (!key.trimStart().startsWith(':')) headers[key.toLowerCase()] = value
@@ -1233,48 +1226,34 @@ export class VerifyRpcServer {
       for (const [k, v] of Object.entries(this.resolvePersonaHeaders(grant, personaHandle, url.origin))) headers[k.toLowerCase()] = v
     }
     const ksBound = ks.bindSignal(signal, tenantId)
-    const started = Date.now()
-    const client = h2Connect(`${url.protocol}//${url.host}`, { rejectUnauthorized: true })
     try {
       ksBound.signal.throwIfAborted()
-      const aborted = new Promise<never>((_resolve, reject) => {
-        ksBound.signal.addEventListener('abort', () => reject(ksBound.signal.reason instanceof KillSwitchTrippedError ? ksBound.signal.reason : new Error('HTTP/2 request timed out.')), { once: true })
+      const response = await EgressGateway.egressHttp2(url, {
+        method: req.method,
+        headers,
+        body: req.body || undefined,
+        signal: ksBound.signal,
+      }, {
+        allowLocalLab: localLab,
+        allowedOrigins: [url.origin],
+        timeoutMs: this.options.callTimeoutMs ?? 30_000,
+        maxResponseBytes: 2 * 1024 * 1024,
+        rejectUnauthorized: true,
       })
-      const responsePromise = new Promise<{ status: number; headers: Record<string, string>; body: string }>((resolve, reject) => {
-        client.once('error', reject)
-        const stream = client.request({
-          ...headers,
-          ...(req.body ? { 'content-length': String(Buffer.byteLength(req.body)) } : {}),
-          ':method': req.method,
-          ':path': `${url.pathname}${url.search}`,
-          ':authority': url.host,
-          ':scheme': url.protocol.replace(':', ''),
-        })
-        let status = 0
-        let responseHeaders: Record<string, string> = {}
-        const chunks: Buffer[] = []
-        let captured = 0
-        stream.on('response', value => {
-          status = Number(value[':status'] ?? 0)
-          responseHeaders = {}
-          for (const [k, v] of Object.entries(value)) {
-            if (k.startsWith(':') || v === undefined) continue
-            responseHeaders[k.toLowerCase()] = Array.isArray(v) ? v.join(', ') : String(v)
-          }
-        })
-        stream.on('data', (chunk: Buffer) => {
-          captured += chunk.length
-          if (captured > 2 * 1024 * 1024) { stream.close(h2constants.NGHTTP2_CANCEL); reject(new Error('HTTP/2 response exceeded the 2 MiB verification limit.')); return }
-          chunks.push(chunk)
-        })
-        stream.once('error', reject)
-        stream.once('end', () => resolve({ status, headers: responseHeaders, body: Buffer.concat(chunks).toString('utf8') }))
-        stream.end(req.body || undefined)
-      })
-      const response = await Promise.race([responsePromise, aborted])
-      return { status: response.status, headers: this.egress.sanitizeHttpHeaders(response.headers, 'worker_rpc'), rawHeaders: response.headers, body: response.body, durationMs: Date.now() - started }
+      return {
+        status: response.status,
+        headers: this.egress.sanitizeHttpHeaders(response.headers, 'worker_rpc'),
+        rawHeaders: response.rawHeaders,
+        body: response.body,
+        durationMs: response.durationMs,
+      }
+    } catch (err) {
+      if (ksBound.signal.aborted && ksBound.signal.reason instanceof KillSwitchTrippedError) {
+        throw ksBound.signal.reason
+      }
+      throw err
     } finally {
-      client.close(); ksBound.release()
+      ksBound.release()
     }
   }
 

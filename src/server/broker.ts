@@ -1,15 +1,13 @@
 import { createHash, createHmac, createPublicKey, randomBytes } from 'node:crypto'
-import { lookup, resolve4, resolve6, resolveCname, resolveNs, resolveTxt } from 'node:dns/promises'
-import { request as httpRequest } from 'node:http'
+import { resolve4, resolve6, resolveCname, resolveNs, resolveTxt } from 'node:dns/promises'
 import type { IncomingHttpHeaders } from 'node:http'
-import { request as httpsRequest } from 'node:https'
 import { connect as netConnect } from 'node:net'
 import type { Socket as NetSocket } from 'node:net'
-import { connect as tlsConnect, TLSSocket } from 'node:tls'
-import type { DetailedPeerCertificate } from 'node:tls'
-import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib'
-import ipaddr from 'ipaddr.js'
+import { connect as tlsConnect } from 'node:tls'
+import type { DetailedPeerCertificate, TLSSocket } from 'node:tls'
 import { referrerPolicies } from '../domain.ts'
+import { EgressDeniedError, EgressGateway } from './egress-gateway.ts'
+import { isIpLiteralHost } from './public-suffix.ts'
 import type { ApprovalPolicy, ApprovedEndpointPattern, CapabilityTier, HttpMethod, PreparedObservation } from '../domain.ts'
 import { cacheBusterValueRegex, containsWebshellSignature } from '../replay-spec.ts'
 import type { AuthMutation, CsrfBind } from '../replay-spec.ts'
@@ -801,13 +799,7 @@ function isErrorInducingProbe(probeClass: string | undefined): boolean {
 }
 
 export function isPublicAddress({ address }: PublicAddress): boolean {
-  try {
-    const ip = ipaddr.process(address)
-    if (ip.range() !== 'unicast') return false
-    return ip.kind() === 'ipv4' || ip.toByteArray()[0] >> 5 === 1
-  } catch {
-    return false
-  }
+  return EgressGateway.isPublicIpAddress(address)
 }
 
 async function withAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -1297,123 +1289,28 @@ function defaultTransport(
     rejectUnauthorized?: boolean
   },
 ): Promise<RawHttpResponse> {
-  return new Promise((resolve, reject) => {
-    const isHttps = url.protocol === 'https:'
-    const port = url.port ? Number(url.port) : (isHttps ? 443 : 80)
-    const method = options?.method ?? 'GET'
-    const readBody = options?.readBody ?? false
-    const cap = Math.min(options?.maxBodyBytes ?? defaultMaxBodyBytes, hardMaxBodyBytes)
-    const headers: Record<string, string> = {
-      Host: url.host,
-      Accept: 'text/html, application/json;q=0.9, */*;q=0.1',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'User-Agent': 'KovoHunter/2 defensive evidence review',
-      ...(options?.headers ?? {}),
-    }
-    if (options?.body !== undefined && !headers['Content-Type'] && !headers['content-type']) {
-      headers['Content-Type'] = 'application/json'
-    }
-    if (options?.body !== undefined) {
-      headers['Content-Length'] = String(Buffer.byteLength(options.body))
-    }
-
-    const onResponse = (res: import('node:http').IncomingMessage) => {
-      const tls = res.socket instanceof TLSSocket ? extractTlsMetadata(res.socket, url.hostname) : undefined
-      if (!readBody || method === 'HEAD') {
-        resolve({ status: res.statusCode ?? 0, headers: res.headers, body: '', bodyBytes: 0, bodyTruncated: false, tls })
-        res.destroy()
-        return
-      }
-      const encoding = (header(res.headers, 'content-encoding') ?? '').toLowerCase().trim()
-      let stream: NodeJS.ReadableStream = res
-      let decompressed = false
-      if (encoding === 'gzip' || encoding === 'x-gzip') {
-        const gunzip = createGunzip()
-        res.pipe(gunzip)
-        stream = gunzip
-        decompressed = true
-      } else if (encoding === 'deflate') {
-        const inflate = createInflate()
-        res.pipe(inflate)
-        stream = inflate
-        decompressed = true
-      } else if (encoding === 'br') {
-        const brotli = createBrotliDecompress()
-        res.pipe(brotli)
-        stream = brotli
-        decompressed = true
-      }
-
-      const chunks: Buffer[] = []
-      let total = 0
-      let truncated = false
-      let finished = false
-      const done = () => {
-        if (finished) return
-        finished = true
-        const responseHeaders: IncomingHttpHeaders = { ...res.headers }
-        if (decompressed) {
-          delete responseHeaders['content-encoding']
-          delete responseHeaders['content-length']
-        }
-        resolve({
-          status: res.statusCode ?? 0,
-          headers: responseHeaders,
-          body: Buffer.concat(chunks).toString('utf8'),
-          bodyBytes: total,
-          bodyTruncated: truncated,
-          tls,
-        })
-      }
-      stream.on('data', (chunk: Buffer) => {
-        if (finished) return
-        if (total + chunk.length > cap) {
-          const remaining = cap - total
-          if (remaining > 0) chunks.push(chunk.subarray(0, remaining))
-          total = cap
-          truncated = true
-          res.destroy()
-          done()
-          return
-        }
-        chunks.push(chunk)
-        total += chunk.length
-      })
-      stream.once('end', done)
-      stream.once('close', done)
-      stream.once('error', err => {
-        if (!finished) {
-          if (truncated) done()
-          else reject(err)
-        }
-      })
-    }
-
-    const req = isHttps
-      ? httpsRequest({
-          hostname: address.address,
-          servername: url.hostname,
-          port,
-          path: url.pathname + url.search,
-          method,
-          agent: false,
-          rejectUnauthorized: options?.rejectUnauthorized ?? true,
-          signal,
-          headers,
-        }, onResponse)
-      : httpRequest({
-          hostname: address.address,
-          port,
-          path: url.pathname + url.search,
-          method,
-          agent: false,
-          signal,
-          headers,
-        }, onResponse)
-
-    req.once('error', reject)
-    if (options?.body !== undefined) req.write(options.body)
-    req.end()
+  const headers: Record<string, string> = {
+    Host: url.host,
+    Accept: 'text/html, application/json;q=0.9, */*;q=0.1',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'User-Agent': 'KovoHunter/2 defensive evidence review',
+    ...(options?.headers ?? {}),
+  }
+  if (options?.body !== undefined && !headers['Content-Type'] && !headers['content-type']) {
+    headers['Content-Type'] = 'application/json'
+  }
+  if (options?.body !== undefined) {
+    headers['Content-Length'] = String(Buffer.byteLength(options.body))
+  }
+  return EgressGateway.egressRawHttp1(url, address, {
+    method: options?.method ?? 'GET',
+    headers,
+    body: options?.body,
+    maxBodyBytes: Math.min(options?.maxBodyBytes ?? defaultMaxBodyBytes, hardMaxBodyBytes),
+    readBody: options?.readBody ?? false,
+    rejectUnauthorized: options?.rejectUnauthorized ?? true,
+    signal,
+    extractTls: extractTlsMetadata,
   })
 }
 
@@ -1546,9 +1443,7 @@ export const LOOPBACK_ORIGIN_MAX_RPS_CAP = 100
 /** True strictly for loopback origins (`localhost`, `127.0.0.0/8`, `::1`). */
 export function isLoopbackOrigin(origin: string): boolean {
   try {
-    const host = new URL(origin).hostname.replace(/^\[|\]$/g, '').toLowerCase()
-    if (host === 'localhost' || host === '::1') return true
-    if (ipaddr.isValid(host)) return ipaddr.process(host).range() === 'loopback'
+    return EgressGateway.isLoopbackLiteral(new URL(origin).hostname)
   } catch { /* invalid origin */ }
   return false
 }
@@ -2517,38 +2412,42 @@ export class RequestBroker {
     originForAudit: string,
     auditContext?: { method?: string; path?: string; persona?: string; secrets?: readonly NamedSecret[] },
   ): Promise<PublicAddress[]> {
-    const resolve = this.options.resolve ?? ((host: string) => lookup(host, { all: true, order: 'verbatim' }))
-    const addresses = await withAbort(resolve(hostname), deadline)
-    deadline.throwIfAborted()
     const localLab = isLocalLabEnabled(grant)
-    // Link-local ranges (169.254.0.0/16 incl. cloud metadata, fe80::/10) are never legitimate
-    // targets — not even in an authorized local-lab. This guard stays fail-closed regardless of
-    // Tier-3 auto-approval or KOVO_ALLOW_LOCAL_LAB.
-    const linkLocal = addresses.some(address => {
-      try {
-        return ipaddr.process(address.address).range() === 'linkLocal'
-      } catch {
-        return true
-      }
-    })
-    if (addresses.length === 0 || linkLocal || (!localLab && addresses.some(address => !isPublicAddress(address)))) {
-      const reason = linkLocal
-        ? 'The target hostname resolved to a link-local/metadata address; cloud metadata and link-local endpoints are never permitted.'
-        : 'The target hostname did not resolve exclusively to public addresses.'
-      this.auditDenied(
-        grant,
-        originForAudit,
-        {
-          reason,
-          ...(auditContext?.method ? { method: auditContext.method } : {}),
-          ...(auditContext?.path ? { path: auditContext.path } : {}),
-          ...(auditContext?.persona ? { persona: auditContext.persona } : {}),
-        },
-        auditContext?.secrets,
+    const customResolve = this.options.resolve
+    const bare = hostname.replace(/^\[|\]$/g, '')
+    const validationUrl = `https://${bare.includes(':') ? `[${bare}]` : bare}/`
+    try {
+      const validated = await withAbort(
+        EgressGateway.resolveAndValidateHost(validationUrl, {
+          allowLocalLab: localLab,
+          ...(customResolve
+            ? { resolveHost: async host => (await customResolve(host)).map(a => a.address) }
+            : {}),
+        }),
+        deadline,
       )
-      throw new BrokerDenied(reason)
+      deadline.throwIfAborted()
+      return validated.addresses
+    } catch (err) {
+      if (err instanceof EgressDeniedError) {
+        const reason = err.code === 'metadata_blocked'
+          ? 'The target hostname resolved to a link-local/metadata address; cloud metadata and link-local endpoints are never permitted.'
+          : 'The target hostname did not resolve exclusively to public addresses.'
+        this.auditDenied(
+          grant,
+          originForAudit,
+          {
+            reason,
+            ...(auditContext?.method ? { method: auditContext.method } : {}),
+            ...(auditContext?.path ? { path: auditContext.path } : {}),
+            ...(auditContext?.persona ? { persona: auditContext.persona } : {}),
+          },
+          auditContext?.secrets,
+        )
+        throw new BrokerDenied(reason)
+      }
+      throw err
     }
-    return addresses
   }
 
   async readPublicRoot(grant: Grant, signal: AbortSignal): Promise<PublicObservation> {
@@ -2925,21 +2824,16 @@ export class RequestBroker {
           deny('jku_x5u_canary URL must target a Kovo Hunter CanaryBroker endpoint.')
         }
         const canaryHost = parsedCanary.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+        const canaryAddrClass = EgressGateway.classifyDetailedAddress(canaryHost)
         if (
-          canaryHost === '169.254.169.254' ||
+          canaryAddrClass === 'metadata_or_link_local' ||
           canaryHost === 'metadata.google.internal' ||
-          canaryHost === 'metadata.goog' ||
-          canaryHost.startsWith('169.254.') ||
-          canaryHost.startsWith('fe80:')
+          canaryHost === 'metadata.goog'
         ) {
           deny('jku_x5u_canary URL cannot target cloud metadata or link-local endpoints.')
         }
-        if (ipaddr.isValid(canaryHost)) {
-          const range = ipaddr.process(canaryHost).range()
-          if (range === 'linkLocal') {
-            deny('jku_x5u_canary URL cannot target link-local IP addresses.')
-          }
-          if (!prepared.localLab && range !== 'unicast') {
+        if (isIpLiteralHost(canaryHost)) {
+          if (!prepared.localLab && canaryAddrClass !== 'public') {
             deny('jku_x5u_canary URL cannot target private or loopback IPs on public projects.')
           }
         } else if (

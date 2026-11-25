@@ -30,8 +30,9 @@ import type { AddressInfo } from 'node:net'
 import { join, relative, resolve } from 'node:path'
 import { describe, test } from 'node:test'
 import type { TestContext } from 'node:test'
+import { gzipSync } from 'node:zlib'
 import ts from 'typescript'
-import { RequestBroker } from '../src/server/broker.ts'
+import { BrokerDenied, RequestBroker } from '../src/server/broker.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant } from '../src/server/broker.ts'
 import {
   EgressDeniedError,
@@ -42,6 +43,7 @@ import {
   createPinnedLookup,
   egressFetch,
   egressHttp2,
+  egressRawHttp1,
   isMetadataOrLinkLocalAddress,
   isPublicIpAddress,
 } from '../src/server/egress-gateway.ts'
@@ -51,6 +53,7 @@ import {
   originLockInitScript,
 } from '../src/server/scoped-browser.ts'
 import type { PlaywrightBrowserLike } from '../src/server/scoped-browser.ts'
+import { VERIFY_NONCE_HEADER, VERIFY_RPC_HEADER, VerifyRpcServer } from '../src/server/verify-rpc.ts'
 
 const repoRoot = resolve(new URL('..', import.meta.url).pathname)
 
@@ -708,6 +711,192 @@ describe('ScopedBrowser: EgressGateway loopback proxy & origin-locked storage hy
 })
 
 // ---------------------------------------------------------------------------
+// 5b. RequestBroker HTTP/1.1 & VerifyRpcServer HTTP/2 via EgressGateway
+// ---------------------------------------------------------------------------
+
+describe('RequestBroker & VerifyRpcServer: migrated to EgressGateway', () => {
+  test('egressRawHttp1 preserves header order, decompresses gzip, caps body bytes, and blocks metadata IPs', async t => {
+    const seenHeaderOrder: string[] = []
+    const srv = await startLocalHttpServer(t, (req, res) => {
+      for (let i = 0; i < req.rawHeaders.length; i += 2) {
+        seenHeaderOrder.push(req.rawHeaders[i]!)
+      }
+      if (req.url === '/gzip') {
+        const gz = gzipSync(Buffer.from('hello-compressed-payload', 'utf8'))
+        res.writeHead(200, { 'content-type': 'text/plain', 'content-encoding': 'gzip' })
+        res.end(gz)
+        return
+      }
+      if (req.url === '/large') {
+        res.writeHead(200, { 'content-type': 'text/plain' })
+        res.end('A'.repeat(2048))
+        return
+      }
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.end('ok')
+    })
+
+    const gzRes = await egressRawHttp1(new URL(`http://order.local:${srv.port}/gzip`), { address: '127.0.0.1', family: 4 }, {
+      method: 'GET',
+      headers: {
+        Host: `order.local:${srv.port}`,
+        'X-First': '1',
+        'X-Second': '2',
+      },
+      readBody: true,
+    })
+    assert.equal(gzRes.status, 200)
+    assert.equal(gzRes.body, 'hello-compressed-payload')
+    assert.equal(gzRes.headers['content-encoding'], undefined)
+    assert.ok(seenHeaderOrder.indexOf('X-First') >= 0 && seenHeaderOrder.indexOf('X-First') < seenHeaderOrder.indexOf('X-Second'))
+
+    const truncRes = await egressRawHttp1(new URL(`${srv.origin}/large`), { address: '127.0.0.1', family: 4 }, {
+      method: 'GET',
+      readBody: true,
+      maxBodyBytes: 128,
+    })
+    assert.equal(truncRes.status, 200)
+    assert.equal(truncRes.bodyTruncated, true)
+    assert.equal(truncRes.bodyBytes, 128)
+    assert.equal(truncRes.body.length, 128)
+
+    await assert.rejects(
+      egressRawHttp1(new URL('http://169.254.169.254/latest/meta-data/'), { address: '169.254.169.254', family: 4 }, { readBody: true }),
+      (err: unknown) => err instanceof EgressDeniedError && err.code === 'metadata_blocked',
+    )
+  })
+
+  test('RequestBroker routes HTTP/1.1 through EgressGateway and blocks cloud metadata even in localLab', async t => {
+    const prevLab = process.env.KOVO_ALLOW_LOCAL_LAB
+    process.env.KOVO_ALLOW_LOCAL_LAB = '1'
+    t.after(() => {
+      if (prevLab === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+      else process.env.KOVO_ALLOW_LOCAL_LAB = prevLab
+    })
+
+    const srv = await startLocalHttpServer(t, (req, res) => {
+      const gz = gzipSync(Buffer.from(JSON.stringify({ host: req.headers.host, path: req.url }), 'utf8'))
+      res.writeHead(200, { 'content-type': 'application/json', 'content-encoding': 'gzip' })
+      res.end(gz)
+    })
+
+    const broker = new RequestBroker({
+      resolve: async host => host === 'meta.local'
+        ? [{ address: 'fd00:ec2::254', family: 6 }]
+        : [{ address: '127.0.0.1', family: 4 }],
+    })
+    const grant: Grant = {
+      canRead: () => true,
+      audit: () => undefined,
+      allowLocalLab: true,
+      allowedPorts: [srv.port, 80],
+      tier: 1,
+    }
+
+    const ex = await broker.executeHttp({
+      origin: `http://broker-pin.local:${srv.port}`,
+      method: 'GET',
+      pathAndQuery: '/check?via=egress',
+    }, grant, AbortSignal.timeout(5_000))
+    assert.equal(ex.status, 200)
+    const body = JSON.parse(ex.body) as { host: string; path: string }
+    assert.equal(body.host, `broker-pin.local:${srv.port}`)
+    assert.equal(body.path, '/check?via=egress')
+
+    await assert.rejects(
+      broker.executeHttp({
+        origin: 'http://meta.local:80',
+        method: 'GET',
+        pathAndQuery: '/latest/meta-data/',
+      }, grant, AbortSignal.timeout(5_000)),
+      (err: unknown) => err instanceof BrokerDenied && /link-local\/metadata/i.test(err.message),
+    )
+  })
+
+  test('VerifyRpcServer HTTP/2 routes through EgressGateway.egressHttp2 and enforces SSRF/metadata refusal', async t => {
+    const prevLab = process.env.KOVO_ALLOW_LOCAL_LAB
+    process.env.KOVO_ALLOW_LOCAL_LAB = '1'
+    t.after(() => {
+      if (prevLab === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+      else process.env.KOVO_ALLOW_LOCAL_LAB = prevLab
+    })
+
+    const seenAuthorities: string[] = []
+    const sessions = new Set<import('node:http2').ServerHttp2Session>()
+    const h2 = createH2Server()
+    h2.on('session', session => {
+      sessions.add(session)
+      session.once('close', () => sessions.delete(session))
+    })
+    h2.on('stream', (stream: ServerHttp2Stream, headers) => {
+      seenAuthorities.push(String(headers[':authority'] ?? ''))
+      stream.respond({ ':status': 200, 'content-type': 'application/json' })
+      stream.end(JSON.stringify({ ok: true, authority: headers[':authority'] }))
+    })
+    await new Promise<void>(r => h2.listen(0, '127.0.0.1', r))
+    t.after(async () => {
+      for (const s of sessions) s.destroy()
+      await new Promise<void>(r => h2.close(() => r()))
+    })
+    const port = (h2.address() as AddressInfo).port
+    const pinnedOrigin = `http://127.0.0.1:${port}`
+    const metaOrigin = 'http://169.254.169.254'
+
+    const broker = new RequestBroker()
+    const grant: Grant = {
+      canRead: origin => origin === pinnedOrigin || origin === metaOrigin,
+      audit: () => undefined,
+      allowLocalLab: true,
+      allowedPorts: [port, 80],
+      tier: 1,
+    }
+    const rpcServer = new VerifyRpcServer({
+      broker,
+      grant,
+      runId: 'egress-h2-wire',
+      assignmentId: 'assign-h2-wire',
+      targetOrigins: [pinnedOrigin, metaOrigin],
+    })
+    await rpcServer.start()
+    t.after(() => rpcServer.close())
+
+    const callRpc = (args: Record<string, unknown>) =>
+      new Promise<{ ok: boolean; result?: unknown; error?: string }>((resolvePromise, reject) => {
+        const payload = JSON.stringify({ op: 'http2', args })
+        const req = nodeHttpRequest({
+          socketPath: rpcServer.socketPath,
+          path: '/rpc',
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'content-length': Buffer.byteLength(payload),
+            [VERIFY_RPC_HEADER]: rpcServer.token,
+            [VERIFY_NONCE_HEADER]: rpcServer.nonce,
+          },
+        }, res => {
+          const chunks: Buffer[] = []
+          res.on('data', chunk => chunks.push(Buffer.from(chunk)))
+          res.on('end', () => {
+            try { resolvePromise(JSON.parse(Buffer.concat(chunks).toString('utf8')) as { ok: boolean; result?: unknown; error?: string }) } catch (e) { reject(e) }
+          })
+        })
+        req.once('error', reject)
+        req.end(payload)
+      })
+
+    const ok = await callRpc({ origin: pinnedOrigin, method: 'GET', path: '/h2-ok' })
+    assert.equal(ok.ok, true, ok.error ?? 'expected pinned HTTP/2 via EgressGateway to succeed')
+    assert.equal(seenAuthorities[0], `127.0.0.1:${port}`)
+
+    const blocked = await callRpc({ origin: metaOrigin, method: 'GET', path: '/latest/meta-data/' })
+    assert.equal(blocked.ok, false)
+    assert.match(blocked.error ?? '', /link-local|metadata|never permitted/i)
+    const lastRecord = rpcServer.transcript.list().at(-1)
+    assert.equal(lastRecord?.errorCode, 'denied')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // 6. Static TypeScript AST Contract Test: Zero Unapproved Raw Dialers in src/server/
 // ---------------------------------------------------------------------------
 
@@ -716,17 +905,15 @@ describe('ScopedBrowser: EgressGateway loopback proxy & origin-locked storage hy
  *
  * Rules:
  *  - `src/server/egress-gateway.ts` is the canonical outbound dialer (exempt).
- *  - `src/server/persona-auth.ts` and `src/server/scoped-browser.ts` are MIGRATED and strictly
- *    FORBIDDEN from appearing here.
+ *  - `src/server/persona-auth.ts`, `src/server/scoped-browser.ts`, `src/server/broker.ts`,
+ *    and `src/server/verify-rpc.ts` are MIGRATED and strictly FORBIDDEN from appearing here.
  *  - Any NEW file in `src/server/` MUST route outbound target traffic through `EgressGateway`
  *    and will FAIL this contract test if it calls raw `fetch(`, `http.request(`, `https.request(`,
  *    `http2.connect(`, or `undici.request(`.
  *  - Entries are removed as Wave 2B migrates each module; stale allowlist entries also fail the test.
  */
 const WAVE_2B_RAW_DIALER_ALLOWLIST: Readonly<Record<string, string>> = {
-  'src/server/broker.ts': 'Wave 2B: primary RequestBroker HTTP/1.1 dialer (held by opt2-m3-admission)',
   'src/server/transport.ts': 'Wave 2B: RequestBroker Layer-1 HTTP/1.1 + HTTP/2 transport plumbing',
-  'src/server/verify-rpc.ts': 'Wave 2B: VerifyRpcServer HTTP/2 dialer (held by opt2-m3-admission)',
   'src/server/provider.ts': 'Wave 2B: LLM provider API client',
   'src/server/cve-broker.ts': 'Wave 2B: OSV advisory lookup API client',
   'src/server/github-auth.ts': 'Wave 2B: GitHub OAuth / API client',
@@ -870,9 +1057,11 @@ function findRawDialersInSource(relPath: string, source: string): RawDialerHit[]
 }
 
 describe('Contract: single canonical EgressGateway dialer across src/server/*.ts', () => {
-  test('forbids persona-auth.ts, scoped-browser.ts, and any unapproved file from raw outbound dialers', () => {
+  test('forbids persona-auth.ts, scoped-browser.ts, broker.ts, verify-rpc.ts, and any unapproved file from raw outbound dialers', () => {
     assert.equal('src/server/persona-auth.ts' in WAVE_2B_RAW_DIALER_ALLOWLIST, false, 'persona-auth.ts must NOT be in raw-dialer allowlist')
     assert.equal('src/server/scoped-browser.ts' in WAVE_2B_RAW_DIALER_ALLOWLIST, false, 'scoped-browser.ts must NOT be in raw-dialer allowlist')
+    assert.equal('src/server/broker.ts' in WAVE_2B_RAW_DIALER_ALLOWLIST, false, 'broker.ts must NOT be in raw-dialer allowlist')
+    assert.equal('src/server/verify-rpc.ts' in WAVE_2B_RAW_DIALER_ALLOWLIST, false, 'verify-rpc.ts must NOT be in raw-dialer allowlist')
 
     const serverFiles = collectServerTsFiles(join(repoRoot, 'src/server'))
     assert.ok(serverFiles.length > 40, `Expected src/server/*.ts files to scan, got ${serverFiles.length}`)
