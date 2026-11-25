@@ -66,6 +66,12 @@ export default class ReportBenchmarkReporter implements Reporter {
 
   async onEnd(result: FullResult) {
     if (result.status === 'interrupted' || result.status === 'timedout') return
+    if (this.snapshots.size === 0 && !this.duplicates.size) {
+      if (result.status === 'passed') {
+        console.log('ReportBenchmarkReporter: no @report-benchmark attachments collected; skipping scorecard.')
+      }
+      return
+    }
     try {
       await this.writeScorecard(result.status)
     } catch (error) {

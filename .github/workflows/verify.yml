@@ -24,5 +24,6 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - run: npm run check
       - run: npm run worker:build
+      - run: bash scripts/docker-smoke.sh
       - run: npm run test:boundaries
-      - run: npm run test:e2e -- --reporter=list,./tests/report-benchmark-reporter.ts
+      - run: npm run test:e2e
