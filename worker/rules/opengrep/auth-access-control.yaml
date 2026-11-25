@@ -1,5 +1,5 @@
 rules:
-  - id: guardian.js.jwt-none-or-unverified
+  - id: kovo.js.jwt-none-or-unverified
     languages: [javascript, typescript]
     severity: ERROR
     message: "Insecure JWT verification: alg=none allowed or jwt.decode used without signature verification."
@@ -11,7 +11,7 @@ rules:
       - pattern: |
           jwt.verify($TOK, $KEY, { ..., algorithms: [..., 'none', ...], ... })
 
-  - id: guardian.py.jwt-unverified
+  - id: kovo.py.jwt-unverified
     languages: [python]
     severity: ERROR
     message: "JWT signature verification disabled in PyJWT decode()."
@@ -23,7 +23,7 @@ rules:
       - pattern: |
           jwt.decode($TOK, ..., verify=False, ...)
 
-  - id: guardian.js.cors-reflect-credentials
+  - id: kovo.js.cors-reflect-credentials
     languages: [javascript, typescript]
     severity: ERROR
     message: "Insecure CORS configuration reflecting arbitrary Origin with credentials enabled."
@@ -39,7 +39,7 @@ rules:
       - pattern: |
           cors({ ..., origin: true, credentials: true, ... })
 
-  - id: guardian.js.open-redirect
+  - id: kovo.js.open-redirect
     languages: [javascript, typescript]
     severity: WARNING
     message: "Potential open redirect: unvalidated request parameter passed to res.redirect()."
@@ -51,7 +51,7 @@ rules:
       - pattern: |
           $RES.redirect($REQ.body.$PARAM)
 
-  - id: guardian.js.ssrf-fetch-req
+  - id: kovo.js.ssrf-fetch-req
     languages: [javascript, typescript]
     severity: ERROR
     message: "Potential SSRF: user-controlled request parameter passed directly to outbound HTTP client."
@@ -69,7 +69,7 @@ rules:
       - pattern: |
           axios.post($REQ.body.$PARAM, ...)
 
-  - id: guardian.py.ssrf-requests
+  - id: kovo.py.ssrf-requests
     languages: [python]
     severity: ERROR
     message: "Potential SSRF: dynamic request parameter passed to outbound requests call."
@@ -83,7 +83,7 @@ rules:
       - pattern: |
           requests.post(request.json.get(...), ...)
 
-  - id: guardian.js.mass-assignment
+  - id: kovo.js.mass-assignment
     languages: [javascript, typescript]
     severity: WARNING
     message: "Potential mass assignment: raw req.body passed directly into model create/update."
@@ -97,7 +97,7 @@ rules:
       - pattern: |
           $MODEL.findByIdAndUpdate($ID, $REQ.body, ...)
 
-  - id: guardian.js.header-auth-bypass
+  - id: kovo.js.header-auth-bypass
     languages: [javascript, typescript]
     severity: ERROR
     message: "Suspicious client-controlled bypass header checked in authentication/authorization logic."
@@ -117,7 +117,7 @@ rules:
       - pattern: |
           $REQ.headers['x-forwarded-user']
 
-  - id: guardian.js.tls-reject-unauthorized-false
+  - id: kovo.js.tls-reject-unauthorized-false
     languages: [javascript, typescript]
     severity: WARNING
     message: "TLS certificate verification disabled (rejectUnauthorized: false)."

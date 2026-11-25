@@ -1,5 +1,5 @@
 rules:
-  - id: guardian.js.sqli-template-query
+  - id: kovo.js.sqli-template-query
     languages: [javascript, typescript]
     severity: ERROR
     message: "Potential SQL injection: interpolated template literal or string concatenation passed to database query."
@@ -13,7 +13,7 @@ rules:
       - pattern: $DB.execute($SQL + $INPUT, ...)
       - pattern: $DB.prepare(`...${$INPUT}...`)
 
-  - id: guardian.py.sqli-execute-format
+  - id: kovo.py.sqli-execute-format
     languages: [python]
     severity: ERROR
     message: "Potential SQL injection: formatted or concatenated SQL query passed to execute()."
@@ -25,7 +25,7 @@ rules:
       - pattern: $CURSOR.execute($Q % $X)
       - pattern: $CURSOR.execute($Q + $X)
 
-  - id: guardian.go.sqli-sprintf
+  - id: kovo.go.sqli-sprintf
     languages: [go]
     severity: ERROR
     message: "Potential SQL injection: fmt.Sprintf query string passed to database query."
@@ -36,7 +36,7 @@ rules:
       - pattern: $DB.QueryRow(fmt.Sprintf($FMT, ...), ...)
       - pattern: $DB.Exec(fmt.Sprintf($FMT, ...), ...)
 
-  - id: guardian.js.cmd-injection
+  - id: kovo.js.cmd-injection
     languages: [javascript, typescript]
     severity: ERROR
     message: "Potential OS command injection via shell execution with dynamic input."
@@ -50,7 +50,7 @@ rules:
       - pattern: exec($CMD + $X, ...)
       - pattern: execSync($CMD + $X, ...)
 
-  - id: guardian.py.cmd-injection
+  - id: kovo.py.cmd-injection
     languages: [python]
     severity: ERROR
     message: "Potential OS command injection via os.system or subprocess with shell=True."
@@ -64,7 +64,7 @@ rules:
       - pattern: subprocess.call($CMD, ..., shell=True, ...)
       - pattern: subprocess.check_output($CMD, ..., shell=True, ...)
 
-  - id: guardian.js.code-eval
+  - id: kovo.js.code-eval
     languages: [javascript, typescript]
     severity: ERROR
     message: "Dynamic code execution via eval() or new Function()."
@@ -74,7 +74,7 @@ rules:
       - pattern: eval($X)
       - pattern: new Function(..., $X)
 
-  - id: guardian.js.nosqli-where
+  - id: kovo.js.nosqli-where
     languages: [javascript, typescript]
     severity: ERROR
     message: "Potential NoSQL injection via $where operator or unvalidated request body in query filter."
@@ -88,7 +88,7 @@ rules:
       - pattern: $MODEL.find(req.query)
       - pattern: $MODEL.findOne(req.query)
 
-  - id: guardian.py.ssti-render-template-string
+  - id: kovo.py.ssti-render-template-string
     languages: [python]
     severity: ERROR
     message: "Potential Server-Side Template Injection (SSTI) via render_template_string or jinja2.Template."
@@ -100,7 +100,7 @@ rules:
       - pattern: jinja2.Template($TPL).render(...)
       - pattern: Template($TPL).render(...)
 
-  - id: guardian.js.ssti-render-string
+  - id: kovo.js.ssti-render-string
     languages: [javascript, typescript]
     severity: ERROR
     message: "Potential Server-Side Template Injection via dynamic template string rendering."
@@ -112,7 +112,7 @@ rules:
       - pattern: pug.render($TPL, ...)
       - pattern: Handlebars.compile($TPL)
 
-  - id: guardian.js.path-traversal-fs
+  - id: kovo.js.path-traversal-fs
     languages: [javascript, typescript]
     severity: WARNING
     message: "Potential path traversal: user-controlled request value flows into filesystem read or response file send."
@@ -125,7 +125,7 @@ rules:
       - pattern: readFileSync(path.join($BASE, req.$SRC.$PARAM), ...)
       - pattern: res.sendFile(path.join($BASE, req.$SRC.$PARAM), ...)
 
-  - id: guardian.py.unsafe-deserialization
+  - id: kovo.py.unsafe-deserialization
     languages: [python]
     severity: ERROR
     message: "Unsafe deserialization via pickle.loads or yaml.load without SafeLoader."
@@ -137,7 +137,7 @@ rules:
       - pattern: yaml.load($X)
       - pattern: yaml.unsafe_load($X)
 
-  - id: guardian.js.dom-xss-sink
+  - id: kovo.js.dom-xss-sink
     languages: [javascript, typescript]
     severity: WARNING
     message: "Potential DOM XSS via innerHTML, outerHTML, or document.write."
@@ -148,7 +148,7 @@ rules:
       - pattern: $EL.outerHTML = $VAL
       - pattern: document.write($VAL)
 
-  - id: guardian.react.dangerously-set-inner-html
+  - id: kovo.react.dangerously-set-inner-html
     languages: [javascript, typescript]
     severity: WARNING
     message: "Potential DOM XSS via React dangerouslySetInnerHTML sink."

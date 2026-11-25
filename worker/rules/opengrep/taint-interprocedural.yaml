@@ -1,5 +1,5 @@
 rules:
-  - id: guardian.taint.js.express-sqli
+  - id: kovo.taint.js.express-sqli
     languages: [javascript, typescript]
     mode: taint
     severity: ERROR
@@ -39,7 +39,7 @@ rules:
       - pattern: text($SINK)
       - pattern: $SESSION.execute($SINK)
 
-  - id: guardian.taint.js.cmd-exec
+  - id: kovo.taint.js.cmd-exec
     languages: [javascript, typescript]
     mode: taint
     severity: ERROR
@@ -58,7 +58,7 @@ rules:
       - pattern: $CP.exec($SINK, ...)
       - pattern: $CP.execSync($SINK, ...)
 
-  - id: guardian.taint.js.ssrf-fetch
+  - id: kovo.taint.js.ssrf-fetch
     languages: [javascript, typescript]
     mode: taint
     severity: ERROR
@@ -80,7 +80,7 @@ rules:
       - pattern: axios.post($SINK, ...)
       - pattern: got($SINK, ...)
 
-  - id: guardian.taint.js.server-action-sqli
+  - id: kovo.taint.js.server-action-sqli
     languages: [javascript, typescript]
     mode: taint
     severity: ERROR
@@ -99,7 +99,7 @@ rules:
       - pattern: sql.raw($SINK)
       - pattern: $PRISMA.$queryRawUnsafe($SINK, ...)
 
-  - id: guardian.taint.js.path-traversal
+  - id: kovo.taint.js.path-traversal
     languages: [javascript, typescript]
     mode: taint
     severity: ERROR
@@ -120,7 +120,7 @@ rules:
       - pattern: fs.writeFile($SINK, ...)
       - pattern: $RES.sendFile($SINK, ...)
 
-  - id: guardian.taint.js.open-redirect
+  - id: kovo.taint.js.open-redirect
     languages: [javascript, typescript]
     mode: taint
     severity: WARNING
@@ -137,7 +137,7 @@ rules:
       - pattern: $RES.redirect($SINK)
       - pattern: NextResponse.redirect($SINK, ...)
 
-  - id: guardian.taint.js.dom-xss
+  - id: kovo.taint.js.dom-xss
     languages: [javascript, typescript]
     mode: taint
     severity: ERROR
@@ -158,7 +158,7 @@ rules:
       - pattern: $EL.outerHTML = $SINK
       - pattern: document.write($SINK)
 
-  - id: guardian.taint.py.flask-sqli
+  - id: kovo.taint.py.flask-sqli
     languages: [python]
     mode: taint
     severity: ERROR
@@ -179,7 +179,7 @@ rules:
       - pattern: $CUR.execute($SINK, ...)
       - pattern: $DB.session.execute($SINK, ...)
 
-  - id: guardian.taint.py.cmd-exec
+  - id: kovo.taint.py.cmd-exec
     languages: [python]
     mode: taint
     severity: ERROR
@@ -199,7 +199,7 @@ rules:
       - pattern: subprocess.run($SINK, ..., shell=True, ...)
       - pattern: subprocess.Popen($SINK, ..., shell=True, ...)
 
-  - id: guardian.taint.py.ssrf
+  - id: kovo.taint.py.ssrf
     languages: [python]
     mode: taint
     severity: ERROR
@@ -219,7 +219,7 @@ rules:
       - pattern: httpx.get($SINK, ...)
       - pattern: urllib.request.urlopen($SINK, ...)
 
-  - id: guardian.taint.py.ssti
+  - id: kovo.taint.py.ssti
     languages: [python]
     mode: taint
     severity: ERROR
@@ -236,7 +236,7 @@ rules:
       - pattern: render_template_string($SINK, ...)
       - pattern: jinja2.Template($SINK)
 
-  - id: guardian.taint.go.sqli
+  - id: kovo.taint.go.sqli
     languages: [go]
     mode: taint
     severity: ERROR
@@ -255,7 +255,7 @@ rules:
       - pattern: $DB.QueryRow($SINK, ...)
       - pattern: $DB.Exec($SINK, ...)
 
-  - id: guardian.taint.go.ssrf
+  - id: kovo.taint.go.ssrf
     languages: [go]
     mode: taint
     severity: ERROR
@@ -271,7 +271,7 @@ rules:
       - pattern: http.Get($SINK)
       - pattern: http.NewRequest($M, $SINK, ...)
 
-  - id: guardian.taint.java.sqli
+  - id: kovo.taint.java.sqli
     languages: [java]
     mode: taint
     severity: ERROR
@@ -287,7 +287,7 @@ rules:
       - pattern: $STMT.executeUpdate($SINK)
       - pattern: $STMT.execute($SINK)
 
-  - id: guardian.rule.js.orm-unsafe-raw
+  - id: kovo.rule.js.orm-unsafe-raw
     languages: [javascript, typescript]
     mode: search
     severity: ERROR
@@ -303,7 +303,7 @@ rules:
           - pattern: $PRISMA.$queryRawUnsafe($SQL, ...)
           - pattern: $PRISMA.$executeRawUnsafe($SQL, ...)
 
-  - id: guardian.rule.py.sqlalchemy-text
+  - id: kovo.rule.py.sqlalchemy-text
     languages: [python]
     mode: search
     severity: WARNING
@@ -315,7 +315,7 @@ rules:
           - pattern: text($SQL)
           - pattern: from_statement($SQL)
 
-  - id: guardian.rule.py.fastapi-typed-param
+  - id: kovo.rule.py.fastapi-typed-param
     languages: [python]
     mode: search
     severity: INFO

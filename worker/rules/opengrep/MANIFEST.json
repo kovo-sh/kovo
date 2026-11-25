@@ -1,7 +1,7 @@
 {
   "source": "https://github.com/opengrep/opengrep-rules",
   "commitSha": "f1d2b562b414783763fd02a6ed2736eaed622efa",
-  "existingAndGuardianRules": 39,
+  "existingAndKovoRules": 39,
   "curatedCommunityRules": 1474,
   "totalRules": 1513,
   "yamlFiles": 137,

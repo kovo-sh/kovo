@@ -1,4 +1,4 @@
-id: guardian-ast-ts-innerhtml
+id: kovo-ast-ts-innerhtml
 language: TypeScript
 severity: warning
 message: "Direct assignment to innerHTML may introduce DOM XSS."
@@ -7,7 +7,7 @@ metadata:
 rule:
   pattern: $EL.innerHTML = $VAL
 ---
-id: guardian-ast-js-innerhtml
+id: kovo-ast-js-innerhtml
 language: JavaScript
 severity: warning
 message: "Direct assignment to innerHTML may introduce DOM XSS."
@@ -16,7 +16,7 @@ metadata:
 rule:
   pattern: $EL.innerHTML = $VAL
 ---
-id: guardian-ast-tsx-dangerous-html
+id: kovo-ast-tsx-dangerous-html
 language: Tsx
 severity: warning
 message: "React dangerouslySetInnerHTML sink requires strict sanitization."
@@ -26,7 +26,7 @@ rule:
   kind: jsx_attribute
   regex: '^dangerouslySetInnerHTML\s*='
 ---
-id: guardian-ast-ts-eval
+id: kovo-ast-ts-eval
 language: TypeScript
 severity: error
 message: "Dynamic code execution via eval()."
@@ -35,7 +35,7 @@ metadata:
 rule:
   pattern: eval($ARG)
 ---
-id: guardian-ast-js-eval
+id: kovo-ast-js-eval
 language: JavaScript
 severity: error
 message: "Dynamic code execution via eval()."
@@ -44,7 +44,7 @@ metadata:
 rule:
   pattern: eval($ARG)
 ---
-id: guardian-ast-ts-sqli-query
+id: kovo-ast-ts-sqli-query
 language: TypeScript
 severity: error
 message: "Interpolated template literal passed to database query/execute."
@@ -59,7 +59,7 @@ rule:
     kind: template_substitution
     stopBy: end
 ---
-id: guardian-ast-js-sqli-query
+id: kovo-ast-js-sqli-query
 language: JavaScript
 severity: error
 message: "Interpolated template literal passed to database query/execute."
@@ -74,7 +74,7 @@ rule:
     kind: template_substitution
     stopBy: end
 ---
-id: guardian-ast-ts-exec-template
+id: kovo-ast-ts-exec-template
 language: TypeScript
 severity: error
 message: "Interpolated template literal passed to exec/execSync."
@@ -90,7 +90,7 @@ rule:
     kind: template_substitution
     stopBy: end
 ---
-id: guardian-ast-ts-postmessage-wildcard
+id: kovo-ast-ts-postmessage-wildcard
 language: TypeScript
 severity: warning
 message: "window.postMessage called with wildcard '*' targetOrigin."
@@ -99,7 +99,7 @@ metadata:
 rule:
   pattern: $TARGET.postMessage($DATA, '*')
 ---
-id: guardian-ast-js-postmessage-wildcard
+id: kovo-ast-js-postmessage-wildcard
 language: JavaScript
 severity: warning
 message: "window.postMessage called with wildcard '*' targetOrigin."

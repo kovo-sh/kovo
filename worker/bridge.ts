@@ -58,7 +58,7 @@ export interface OfflineScriptResult {
   timedOut: boolean
 }
 
-/** guardian_verify script execution (Layer-3 SDK staged into the sandbox at call time). */
+/** kovo_verify script execution (Layer-3 SDK staged into the sandbox at call time). */
 export interface VerifyScriptRequest {
   runtime: 'ts'
   code: string
@@ -150,15 +150,15 @@ const maxToolCaptureBytes = 8 * 1024 * 1024
 // host receives a file pointer instead. The host's BoundedLineDecoder kills sessions at 64 KiB,
 // so the spill threshold must stay meaningfully below that.
 const IPC_SPILL_THRESHOLD = 48 * 1024
-const IPC_SPILL_DIR = process.env.GUARDIAN_IPC_DIR || '/tmp/guardian-ipc'
-const cleanSdkName = /^guardian_verify\.ts$/
+const IPC_SPILL_DIR = process.env.KOVO_IPC_DIR || '/tmp/kovo-ipc'
+const cleanSdkName = /^kovo_verify\.ts$/
 const cleanPath = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}(?:\/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}){0,3}$/
 const cleanOutputName = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/
 const cleanRepoName = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}(?:\/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}){0,3}$/
 const REPOS_ROOT = '/repos'
-const RULES_ROOT = '/opt/guardian-rules'
-const VENV_BIN = '/opt/guardian-venv/bin'
-const EVIDENCE_SYMLINK_TARGET = '/tmp/guardian-evidence'
+const RULES_ROOT = '/opt/kovo-rules'
+const VENV_BIN = '/opt/kovo-venv/bin'
+const EVIDENCE_SYMLINK_TARGET = '/tmp/kovo-evidence'
 
 const SEVERITY_RANK: Record<SastSeverity, number> = {
   critical: 0,
@@ -315,7 +315,7 @@ interface ToolExecResult {
 
 function toolEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
-    PATH: process.env.PATH || `${VENV_BIN}:/opt/guardian-worker/node_modules/.bin:/usr/local/bin:/usr/bin:/bin`,
+    PATH: process.env.PATH || `${VENV_BIN}:/opt/kovo-worker/node_modules/.bin:/usr/local/bin:/usr/bin:/bin`,
     HOME: '/tmp',
     XDG_CACHE_HOME: '/tmp/.cache',
     XDG_CONFIG_HOME: '/tmp/.config',
@@ -709,14 +709,14 @@ function runOfflineSca(repoRoot: string, targets: string[]): SastFinding[] {
 }
 
 const FALLBACK_SECRET_RULES: Array<{ ruleId: string; severity: SastSeverity; cwe: string; message: string; regex: RegExp }> = [
-  { ruleId: 'guardian.secret.aws-access-key', severity: 'critical', cwe: 'CWE-798', message: 'Hardcoded AWS access key ID detected.', regex: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g },
-  { ruleId: 'guardian.secret.github-token', severity: 'critical', cwe: 'CWE-798', message: 'Hardcoded GitHub personal access token detected.', regex: /\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g },
-  { ruleId: 'guardian.secret.stripe-key', severity: 'critical', cwe: 'CWE-798', message: 'Hardcoded Stripe live secret key detected.', regex: /\b(?:sk|rk)_live_[0-9a-zA-Z]{16,}\b/g },
-  { ruleId: 'guardian.secret.private-key', severity: 'critical', cwe: 'CWE-798', message: 'Private cryptographic key material committed to repository.', regex: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/g },
-  { ruleId: 'guardian.secret.openai-anthropic', severity: 'high', cwe: 'CWE-798', message: 'Hardcoded LLM API key detected.', regex: /\bsk-(?:proj-|ant-)[A-Za-z0-9_-]{20,}\b/g },
-  { ruleId: 'guardian.secret.google-api-key', severity: 'medium', cwe: 'CWE-798', message: 'Hardcoded Google API key detected.', regex: /\bAIza[0-9A-Za-z_-]{35}\b/g },
-  { ruleId: 'guardian.secret.slack-webhook', severity: 'high', cwe: 'CWE-798', message: 'Hardcoded Slack webhook URL detected.', regex: /https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/]+/g },
-  { ruleId: 'guardian.secret.generic-assignment', severity: 'high', cwe: 'CWE-798', message: 'Hardcoded secret or credential literal detected.', regex: /\b(?:SERVICE_ROLE_KEY|SUPABASE_SERVICE_ROLE|JWT_SECRET|NEXTAUTH_SECRET|DATABASE_URL|POSTGRES_URL|STRIPE_SECRET|WEBHOOK_SECRET)\s*[:=]\s*["'`][^"'`\r\n]{8,160}["'`]/gi },
+  { ruleId: 'kovo.secret.aws-access-key', severity: 'critical', cwe: 'CWE-798', message: 'Hardcoded AWS access key ID detected.', regex: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g },
+  { ruleId: 'kovo.secret.github-token', severity: 'critical', cwe: 'CWE-798', message: 'Hardcoded GitHub personal access token detected.', regex: /\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g },
+  { ruleId: 'kovo.secret.stripe-key', severity: 'critical', cwe: 'CWE-798', message: 'Hardcoded Stripe live secret key detected.', regex: /\b(?:sk|rk)_live_[0-9a-zA-Z]{16,}\b/g },
+  { ruleId: 'kovo.secret.private-key', severity: 'critical', cwe: 'CWE-798', message: 'Private cryptographic key material committed to repository.', regex: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/g },
+  { ruleId: 'kovo.secret.openai-anthropic', severity: 'high', cwe: 'CWE-798', message: 'Hardcoded LLM API key detected.', regex: /\bsk-(?:proj-|ant-)[A-Za-z0-9_-]{20,}\b/g },
+  { ruleId: 'kovo.secret.google-api-key', severity: 'medium', cwe: 'CWE-798', message: 'Hardcoded Google API key detected.', regex: /\bAIza[0-9A-Za-z_-]{35}\b/g },
+  { ruleId: 'kovo.secret.slack-webhook', severity: 'high', cwe: 'CWE-798', message: 'Hardcoded Slack webhook URL detected.', regex: /https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/]+/g },
+  { ruleId: 'kovo.secret.generic-assignment', severity: 'high', cwe: 'CWE-798', message: 'Hardcoded secret or credential literal detected.', regex: /\b(?:SERVICE_ROLE_KEY|SUPABASE_SERVICE_ROLE|JWT_SECRET|NEXTAUTH_SECRET|DATABASE_URL|POSTGRES_URL|STRIPE_SECRET|WEBHOOK_SECRET)\s*[:=]\s*["'`][^"'`\r\n]{8,160}["'`]/gi },
 ]
 
 function runBuiltinSecretScan(repoRoot: string, targets: string[], engine: 'gitleaks' | 'trufflehog'): SastFinding[] {
@@ -764,7 +764,7 @@ function runBuiltinSecretScan(repoRoot: string, targets: string[], engine: 'gitl
 
 async function runOpengrepEngine(repoRoot: string, targets: string[], timeoutMs: number): Promise<{ findings: SastFinding[]; ok: boolean; note?: string }> {
   const configDir = join(RULES_ROOT, 'opengrep')
-  if (!existsSync(configDir)) return { findings: [], ok: false, note: 'Missing /opt/guardian-rules/opengrep' }
+  if (!existsSync(configDir)) return { findings: [], ok: false, note: 'Missing /opt/kovo-rules/opengrep' }
   const interfileArgs = [
     'scan', '--config', configDir, '--enable-interfile', '--interfile-depth=3', '--interfile-timeout=30',
     '--max-memory=1024', '--json', '--no-git-ignore', '--quiet', ...targets,
@@ -791,7 +791,7 @@ async function runOpengrepEngine(repoRoot: string, targets: string[], timeoutMs:
       }>
     }
     const findings: SastFinding[] = (parsed.results ?? []).map(r => {
-      const ruleId = String(r.check_id ?? 'opengrep.rule').replace(/^opt\.guardian-rules\.opengrep\./, '')
+      const ruleId = String(r.check_id ?? 'opengrep.rule').replace(/^opt\.kovo-rules\.opengrep\./, '')
       const cwe = extractCwe(r.extra?.metadata)
       return {
         engine: 'opengrep',
@@ -817,7 +817,7 @@ async function runOpengrepEngine(repoRoot: string, targets: string[], timeoutMs:
 
 async function runAstGrepEngine(repoRoot: string, targets: string[], timeoutMs: number): Promise<{ findings: SastFinding[]; ok: boolean; note?: string }> {
   const configFile = join(RULES_ROOT, 'ast-grep', 'sgconfig.yml')
-  if (!existsSync(configFile)) return { findings: [], ok: false, note: 'Missing /opt/guardian-rules/ast-grep/sgconfig.yml' }
+  if (!existsSync(configFile)) return { findings: [], ok: false, note: 'Missing /opt/kovo-rules/ast-grep/sgconfig.yml' }
   const res = await execTool('ast-grep', [
     'scan', '--config', configFile, '--include-metadata', '--json=compact', ...targets,
   ], { cwd: repoRoot, timeoutMs })
@@ -857,7 +857,7 @@ async function runGitleaksEngine(repoRoot: string, targets: string[], timeoutMs:
   let binaryOk = true
   let note: string | undefined
   for (const target of targets) {
-    const reportPath = join(tmpdir(), `guardian-gitleaks-${randomUUID()}.json`)
+    const reportPath = join(tmpdir(), `kovo-gitleaks-${randomUUID()}.json`)
     try {
       const res = await execTool('gitleaks', [
         'dir', '--no-banner', '--redact=100', '--exit-code', '0',
@@ -1199,7 +1199,7 @@ async function runOfflineScript(req: OfflineScriptRequest, inputDirectory: strin
   }
   const timeoutMs = Math.max(1_000, Math.min(req.timeoutMs ?? 30_000, 60_000))
   const ext = req.runtime === 'python' ? '.py' : '.mjs'
-  const scriptPath = join(tmpdir(), `guardian-script-${randomUUID()}${ext}`)
+  const scriptPath = join(tmpdir(), `kovo-script-${randomUUID()}${ext}`)
   await writeFile(scriptPath, req.code, { mode: 0o600 })
   try {
     const cmd = req.runtime === 'python'
@@ -1213,8 +1213,8 @@ async function runOfflineScript(req: OfflineScriptRequest, inputDirectory: strin
       timeoutMs,
       maxBytes: maxOutputBytes,
       env: {
-        GUARDIAN_REPOS: REPOS_ROOT,
-        GUARDIAN_EVIDENCE: inputDirectory,
+        KOVO_REPOS: REPOS_ROOT,
+        KOVO_EVIDENCE: inputDirectory,
       },
     })
     return {
@@ -1231,18 +1231,18 @@ async function runOfflineScript(req: OfflineScriptRequest, inputDirectory: strin
 }
 
 // ============================================================================
-// Layer-3 guardian_verify script runner (3-hook SDK, transcript-backed claims)
+// Layer-3 kovo_verify script runner (3-hook SDK, transcript-backed claims)
 // ============================================================================
 
 async function runVerifyScript(req: VerifyScriptRequest): Promise<VerifyScriptResult> {
   if (req.runtime !== 'ts') {
-    throw new Error(`Unsupported verification runtime: ${String(req.runtime)}. guardian_verify supports TypeScript only (runtime='ts').`)
+    throw new Error(`Unsupported verification runtime: ${String(req.runtime)}. kovo_verify supports TypeScript only (runtime='ts').`)
   }
   if (typeof req.code !== 'string' || !req.code.trim()) throw new Error('Verification script code must be non-empty.')
   if (Buffer.byteLength(req.code) > maxScriptCodeBytes) throw new Error('Verification script exceeds 256 KiB limit.')
   if (typeof req.nonce !== 'string' || !/^[a-f0-9]{16,128}$/i.test(req.nonce)) throw new Error('Verification nonce is invalid.')
   const timeoutMs = Math.max(1_000, Math.min(req.timeoutMs ?? 90_000, 120_000))
-  const dir = await mkdtemp(join(tmpdir(), 'guardian-verify-'))
+  const dir = await mkdtemp(join(tmpdir(), 'kovo-verify-'))
   const resultPath = join(dir, 'result.json')
   const scriptPath = join(dir, 'candidate.ts')
   try {
@@ -1260,11 +1260,11 @@ async function runVerifyScript(req: VerifyScriptRequest): Promise<VerifyScriptRe
       timeoutMs,
       maxBytes: maxOutputBytes,
       env: {
-        GUARDIAN_RPC_SOCKET: process.env.GUARDIAN_RPC_SOCKET ?? '/guardian-rpc/verify.sock',
-        GUARDIAN_RPC_TOKEN_FILE: process.env.GUARDIAN_RPC_TOKEN_FILE ?? '/guardian-rpc/token',
-        GUARDIAN_RPC_CONTEXT_FILE: process.env.GUARDIAN_RPC_CONTEXT_FILE ?? '/guardian-rpc/context.json',
-        GUARDIAN_VERIFY_NONCE: req.nonce,
-        GUARDIAN_PROOF_RESULT_FILE: resultPath,
+        KOVO_RPC_SOCKET: process.env.KOVO_RPC_SOCKET ?? '/kovo-rpc/verify.sock',
+        KOVO_RPC_TOKEN_FILE: process.env.KOVO_RPC_TOKEN_FILE ?? '/kovo-rpc/token',
+        KOVO_RPC_CONTEXT_FILE: process.env.KOVO_RPC_CONTEXT_FILE ?? '/kovo-rpc/context.json',
+        KOVO_VERIFY_NONCE: req.nonce,
+        KOVO_PROOF_RESULT_FILE: resultPath,
       },
     })
     let result: unknown = null
@@ -1362,7 +1362,7 @@ async function runAstVerify(req: AstVerifyRequest): Promise<AstVerifyResult> {
     try {
       let args: string[]
       if (isYamlRule) {
-        tmpRulePath = join(tmpdir(), `guardian-ast-rule-${randomUUID()}.yaml`)
+        tmpRulePath = join(tmpdir(), `kovo-ast-rule-${randomUUID()}.yaml`)
         await writeFile(tmpRulePath, trimmedRule, { mode: 0o600 })
         args = ['scan', '--rule', tmpRulePath, '--json=compact', targetFile]
       } else if (isBuiltinRuleId && existsSync(join(RULES_ROOT, 'ast-grep', 'sgconfig.yml'))) {
@@ -1395,7 +1395,7 @@ async function runAstVerify(req: AstVerifyRequest): Promise<AstVerifyResult> {
     try {
       let args: string[]
       if (isYamlRule) {
-        tmpRulePath = join(tmpdir(), `guardian-og-rule-${randomUUID()}.yaml`)
+        tmpRulePath = join(tmpdir(), `kovo-og-rule-${randomUUID()}.yaml`)
         await writeFile(tmpRulePath, trimmedRule, { mode: 0o600 })
         args = ['scan', '--config', tmpRulePath, '--json', '--no-git-ignore', '--quiet', targetFile]
       } else if (isBuiltinRuleId && existsSync(join(RULES_ROOT, 'opengrep'))) {
@@ -1633,10 +1633,10 @@ async function createSandbox() {
       await mkdir(EVIDENCE_SYMLINK_TARGET, { recursive: true, mode: 0o700 })
       inputDirectory = EVIDENCE_SYMLINK_TARGET
     } else {
-      inputDirectory = await mkdtemp(join(tmpdir(), 'guardian-inputs-'))
+      inputDirectory = await mkdtemp(join(tmpdir(), 'kovo-inputs-'))
     }
   } catch {
-    inputDirectory = await mkdtemp(join(tmpdir(), 'guardian-inputs-'))
+    inputDirectory = await mkdtemp(join(tmpdir(), 'kovo-inputs-'))
   }
 
   const scratch = new InMemoryFs({}, { maxTotalBytes: maxScratchBytes })
