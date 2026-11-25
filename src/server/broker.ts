@@ -276,10 +276,19 @@ export type TlsInspector = (
   signal: AbortSignal,
 ) => Promise<TlsMetadata>
 
+export interface BrokerAuditMeta {
+  reason?: string
+  method?: string
+  path?: string
+  persona?: string
+}
+
 export type Grant = {
   origin?: string
   tier?: CapabilityTier
   maxRpsPerOrigin?: number
+  /** Optional live getter for dynamic mid-run RPS updates (survives `{ ...grant }` spreads). */
+  getMaxRpsPerOrigin?: () => number
   allowLocalLab?: boolean
   personas?: ReadonlyMap<string, ResolvedPersona>
   secrets?: readonly NamedSecret[]
@@ -323,7 +332,12 @@ export type Grant = {
     pathAndQuery: string,
     context?: StateChangeApprovalContext,
   ) => boolean
-  audit: (outcome: 'allowed' | 'denied' | 'observed' | 'circuit_open', origin: string, status?: number) => void
+  audit: (
+    outcome: 'allowed' | 'denied' | 'observed' | 'circuit_open',
+    origin: string,
+    status?: number,
+    meta?: BrokerAuditMeta,
+  ) => void
 }
 
 export type WebsocketTransport = (
@@ -1686,6 +1700,11 @@ export function brokerPerOriginRpsCap(
   return Math.max(1, Math.min(ceiling, safeRequested))
 }
 
+function resolveGrantMaxRps(grant: Grant, fallback: number): number {
+  const live = grant.getMaxRpsPerOrigin ? grant.getMaxRpsPerOrigin() : grant.maxRpsPerOrigin
+  return typeof live === 'number' && Number.isFinite(live) && live > 0 ? live : fallback
+}
+
 type OriginHealth = {
   errors5xx: number[]
   errors429: number[]
@@ -2355,15 +2374,16 @@ export class RequestBroker {
 
   private async acquireSlot(
     origin: string,
-    maxRps: number,
+    maxRps: number | (() => number),
     signal: AbortSignal,
     bypassConcurrency = false,
     routeTemplate?: string,
     localLab = false,
   ): Promise<() => void> {
     const inFlightCap = brokerPerOriginConcurrencyCap(origin, localLab)
-    const configuredRps = brokerPerOriginRpsCap(origin, maxRps, localLab)
-    const state = this.health(origin, configuredRps)
+    const readConfiguredRps = () =>
+      brokerPerOriginRpsCap(origin, typeof maxRps === 'function' ? maxRps() : maxRps, localLab)
+    const state = this.health(origin, readConfiguredRps())
     if (state.openReason && (!state.openUntil || this.now() < state.openUntil)) {
       throw new BrokerCircuitOpen(origin, state.openReason)
     }
@@ -2377,6 +2397,7 @@ export class RequestBroker {
       }
       if (routeTemplate) this.assertRouteCircuit(origin, routeTemplate)
       const now = Date.now()
+      const configuredRps = readConfiguredRps()
       const rps = Math.max(1, Math.min(configuredRps, state.adaptiveRps ?? configuredRps))
       const elapsedSec = Math.max(0, (now - state.lastRefill) / 1000)
       state.tokens = Math.min(rps, state.tokens + elapsedSec * rps)
@@ -2522,7 +2543,40 @@ export class RequestBroker {
     return grant.canRead(origin)
   }
 
-  private async resolveAndCheckAddresses(hostname: string, grant: Grant, deadline: AbortSignal, originForAudit: string): Promise<PublicAddress[]> {
+  private auditDenied(
+    grant: Grant,
+    origin: string,
+    meta: BrokerAuditMeta,
+    extraSecrets?: readonly NamedSecret[],
+  ): void {
+    const effectiveSecrets: NamedSecret[] = [
+      ...(extraSecrets ?? []),
+      ...(grant.personas ? personaSecrets(grant.personas) : []),
+      ...(grant.secrets ?? []),
+      ...this.redactedSecrets.values(),
+    ]
+    const scrub = (value: string | undefined, maxLen: number): string | undefined => {
+      if (typeof value !== 'string') return undefined
+      const cleaned = redact(value, effectiveSecrets).replace(/[\r\n\0]+/g, ' ').trim()
+      if (!cleaned) return undefined
+      return cleaned.length > maxLen ? `${cleaned.slice(0, maxLen)}…` : cleaned
+    }
+    const cleanMeta: BrokerAuditMeta = {
+      ...(meta.reason ? { reason: scrub(meta.reason, 512) } : {}),
+      ...(meta.method ? { method: scrub(meta.method, 32) } : {}),
+      ...(meta.path ? { path: scrub(meta.path, 512) } : {}),
+      ...(meta.persona ? { persona: scrub(meta.persona, 128) } : {}),
+    }
+    grant.audit('denied', origin, undefined, cleanMeta)
+  }
+
+  private async resolveAndCheckAddresses(
+    hostname: string,
+    grant: Grant,
+    deadline: AbortSignal,
+    originForAudit: string,
+    auditContext?: { method?: string; path?: string; persona?: string; secrets?: readonly NamedSecret[] },
+  ): Promise<PublicAddress[]> {
     const resolve = this.options.resolve ?? ((host: string) => lookup(host, { all: true, order: 'verbatim' }))
     const addresses = await withAbort(resolve(hostname), deadline)
     deadline.throwIfAborted()
@@ -2538,12 +2592,21 @@ export class RequestBroker {
       }
     })
     if (addresses.length === 0 || linkLocal || (!localLab && addresses.some(address => !isPublicAddress(address)))) {
-      grant.audit('denied', originForAudit)
-      throw new BrokerDenied(
-        linkLocal
-          ? 'The target hostname resolved to a link-local/metadata address; cloud metadata and link-local endpoints are never permitted.'
-          : 'The target hostname did not resolve exclusively to public addresses.',
+      const reason = linkLocal
+        ? 'The target hostname resolved to a link-local/metadata address; cloud metadata and link-local endpoints are never permitted.'
+        : 'The target hostname did not resolve exclusively to public addresses.'
+      this.auditDenied(
+        grant,
+        originForAudit,
+        {
+          reason,
+          ...(auditContext?.method ? { method: auditContext.method } : {}),
+          ...(auditContext?.path ? { path: auditContext.path } : {}),
+          ...(auditContext?.persona ? { persona: auditContext.persona } : {}),
+        },
+        auditContext?.secrets,
       )
+      throw new BrokerDenied(reason)
     }
     return addresses
   }
@@ -2557,8 +2620,12 @@ export class RequestBroker {
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(15_000)])
     const transport = this.httpTransport
     let url = new URL('/', grant.origin)
-    const deny = (message: string): never => {
-      grant.audit('denied', url.origin)
+    const deny: (message: string) => never = (message: string): never => {
+      this.auditDenied(grant, url.origin, {
+        reason: message,
+        method: 'GET',
+        path: `${url.pathname}${url.search}`,
+      })
       throw new BrokerDenied(message)
     }
     const check = () => {
@@ -2572,9 +2639,19 @@ export class RequestBroker {
     }
     for (let redirect = 0; redirect <= 3; redirect += 1) {
       check()
-      const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, url.origin)
+      const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, url.origin, {
+        method: 'GET',
+        path: `${url.pathname}${url.search}`,
+      })
       check()
-      const release = await this.acquireSlot(url.origin, grant.maxRpsPerOrigin ?? 5, deadline, false, routeTemplateForPath(url.pathname), localLab)
+      const release = await this.acquireSlot(
+        url.origin,
+        () => resolveGrantMaxRps(grant, 5),
+        deadline,
+        false,
+        routeTemplateForPath(url.pathname),
+        localLab,
+      )
       let response: RawHttpResponse
       try {
         this.getKillSwitch().assertAllowed(grant.tenantId ?? null)
@@ -2592,7 +2669,7 @@ export class RequestBroker {
       this.recordStatus(url.origin, response.status, grant.audit, {
         routeTemplate: routeTemplateForPath(url.pathname),
         headers: response.headers,
-        configuredRps: grant.maxRpsPerOrigin ?? 5,
+        configuredRps: resolveGrantMaxRps(grant, 5),
       })
       if (![301, 302, 303, 307, 308].includes(response.status)) {
         return observed(grant.origin, url, response, this.options.source ?? 'public response')
@@ -2650,34 +2727,45 @@ export class RequestBroker {
       throw new BrokerDenied('Request origin or path is malformed.')
     }
 
+    const personaHandle = req.persona ?? req.personaHandle
+    const deny: (reason: string) => never = (reason: string): never => {
+      this.auditDenied(
+        grant,
+        initialOrigin,
+        {
+          reason,
+          method: req.method,
+          path: req.pathAndQuery,
+          ...(personaHandle ? { persona: personaHandle } : {}),
+        },
+        req.secrets,
+      )
+      throw new BrokerDenied(reason)
+    }
+
     if (!req.pathAndQuery.startsWith('/') || req.pathAndQuery.startsWith('//') ||
         req.pathAndQuery.length > maxPathLength || /[\r\n\0]/.test(req.pathAndQuery)) {
-      grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('Request path is invalid or exceeds Kovo Hunter 8 KiB limit.')
+      deny('Request path is invalid or exceeds Kovo Hunter 8 KiB limit.')
     }
     if (url.origin !== initialOrigin) {
-      grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('Request path escaped the requested origin.')
+      deny('Request path escaped the requested origin.')
     }
     if (!safeUrl(url, true, localLab, grant.allowedPorts) || !this.originInGrantScope(grant, initialOrigin)) {
       this.purgeSessionJars(req.runId ?? grant.scopePolicy?.runId ?? undefined, initialOrigin)
-      grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('Destination is outside the current assignment scope.')
+      deny('Destination is outside the current assignment scope.')
     }
 
     if (req.probeClass === 'cache_poison_deception' || req.probeClass === 'cache_differential') {
       const gcb = url.searchParams.get('_gcb')
       if (!gcb || !cacheBusterValueRegex.test(gcb)) {
-        grant.audit('denied', initialOrigin)
-        throw new BrokerDenied('Cache probes require a unique ?_gcb=<16-36 hex/uuid> cache-buster query parameter.')
+        deny('Cache probes require a unique ?_gcb=<16-36 hex/uuid> cache-buster query parameter.')
       }
       const seen = this.seenGcbTokens.get(gcb.toLowerCase())
       if (seen) {
         if (req.probeClass === 'cache_differential' && req.cacheVerify === true && !seen.verifyUsed) {
           seen.verifyUsed = true
         } else {
-          grant.audit('denied', initialOrigin)
-          throw new BrokerDenied('Reusing an already-used _gcb cache-buster token is forbidden.')
+          deny('Reusing an already-used _gcb cache-buster token is forbidden.')
         }
       } else {
         if (this.seenGcbTokens.size >= 10_000) {
@@ -2695,65 +2783,54 @@ export class RequestBroker {
       hasDestructiveContent(serializedHeaders) ||
       (req.body !== undefined && hasDestructiveContent(req.body))
     ) {
-      grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('Request blocked by Kovo Hunter destructive-payload denylist.')
+      deny('Request blocked by Kovo Hunter destructive-payload denylist.')
     }
     if (req.authMutation?.kind === 'kid_inject' && hasDestructiveContent(req.authMutation.value)) {
-      grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('authMutation kid_inject blocked by Kovo Hunter destructive-payload denylist.')
+      deny('authMutation kid_inject blocked by Kovo Hunter destructive-payload denylist.')
     }
     if (req.authMutation?.kind === 'jku_x5u_canary') {
       const candidateUrl = req.authMutation.url ?? req.authMutation.value
       if (candidateUrl && (hasDestructiveContent(candidateUrl) || /[\r\n\0]/.test(candidateUrl))) {
-        grant.audit('denied', initialOrigin)
-        throw new BrokerDenied('authMutation jku_x5u_canary blocked by Kovo Hunter destructive-payload denylist.')
+        deny('authMutation jku_x5u_canary blocked by Kovo Hunter destructive-payload denylist.')
       }
     }
 
     const hasMultipart = Array.isArray(req.multipartParts) && req.multipartParts.length > 0
     if (hasMultipart && req.body !== undefined) {
-      grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('Specify either body or multipartParts, not both.')
+      deny('Specify either body or multipartParts, not both.')
     }
 
-    const personaHandle = req.persona ?? req.personaHandle
     if (req.authMutation) {
       if (tier < 2) {
-        grant.audit('denied', initialOrigin)
-        throw new BrokerDenied('Broker authMutation primitives require Tier 2 or higher.')
+        deny('Broker authMutation primitives require Tier 2 or higher.')
       }
       if (!personaHandle) {
-        grant.audit('denied', initialOrigin)
-        throw new BrokerDenied('authMutation requires an approved persona handle.')
+        deny('authMutation requires an approved persona handle.')
       }
     }
 
     let resolvedPersonaHeaders: Record<string, string> | undefined
     if (personaHandle) {
       if (tier < 2) {
-        grant.audit('denied', initialOrigin)
-        throw new BrokerDenied('Persona-authenticated requests require Tier 2 or higher.')
+        deny('Persona-authenticated requests require Tier 2 or higher.')
       }
       if (grant.personas) {
         const persona = grant.personas.get(personaHandle)
         if (!persona) {
-          grant.audit('denied', initialOrigin)
-          throw new BrokerDenied(`Persona "${personaHandle}" is not approved for this run.`)
+          deny(`Persona "${personaHandle}" is not approved for this run.`)
         }
         const injected = buildPersonaHeader(persona, initialOrigin)
         if (!injected) {
-          grant.audit('denied', initialOrigin)
           if (!persona.originAllowlist.includes(initialOrigin)) {
-            throw new BrokerDenied(`Origin ${initialOrigin} is not in persona "${personaHandle}" originAllowlist.`)
+            deny(`Origin ${initialOrigin} is not in persona "${personaHandle}" originAllowlist.`)
           }
-          throw new BrokerDenied(`Persona "${personaHandle}" does not have an active authenticated session yet.`)
+          deny(`Persona "${personaHandle}" does not have an active authenticated session yet.`)
         }
         resolvedPersonaHeaders = { ...injected }
       } else if (req.personaHeaders && Object.keys(req.personaHeaders).length > 0) {
         resolvedPersonaHeaders = { ...req.personaHeaders }
       } else {
-        grant.audit('denied', initialOrigin)
-        throw new BrokerDenied(`Persona "${personaHandle}" could not be resolved from run grant.`)
+        deny(`Persona "${personaHandle}" could not be resolved from run grant.`)
       }
     }
 
@@ -2841,13 +2918,11 @@ export class RequestBroker {
           // Derived Tier-3 run: let `approvalPolicy` decide instead of hard-failing untagged writes.
           contractApproved = approvalMeta.effectivePolicy === 'yolo'
         } else {
-          grant.audit('denied', initialOrigin)
-          throw new BrokerDenied(decision.reason)
+          deny(decision.reason)
         }
       }
       if (contractApproved && !isReadOnlyMethod && !verifiedGraphqlRead && tier < 3) {
-        grant.audit('denied', initialOrigin)
-        throw new BrokerDenied(`Method ${req.method} requires Tier 3 (approval-gated state validation).`)
+        deny(`Method ${req.method} requires Tier 3 (approval-gated state validation).`)
       }
     }
 
@@ -2863,8 +2938,7 @@ export class RequestBroker {
         )
       if (!sandboxPostAllowed) {
         if (tier < 3) {
-          grant.audit('denied', initialOrigin)
-          throw new BrokerDenied(
+          deny(
             hasMultipart || hasMultipartContentType
               ? 'Multipart uploads require Tier 3 (approval-gated state validation).'
               : `Method ${req.method} requires Tier 3 (approval-gated state validation).`,
@@ -2890,12 +2964,10 @@ export class RequestBroker {
     const cleanHeaders: Record<string, string> = {}
     for (const [k, v] of Object.entries(req.headers ?? {})) {
       if (forbiddenCallerHeaders.test(k) && !isSelfMintedBearer(k, v)) {
-        grant.audit('denied', initialOrigin)
-        throw new BrokerDenied(`Header "${k}" cannot be set directly; reference an approved persona handle instead.`)
+        deny(`Header "${k}" cannot be set directly; reference an approved persona handle instead.`)
       }
       if (/[\r\n\0]/.test(k) || /[\r\n\0]/.test(v)) {
-        grant.audit('denied', initialOrigin)
-        throw new BrokerDenied('Invalid request header.')
+        deny('Invalid request header.')
       }
       cleanHeaders[k] = v
     }
@@ -2910,7 +2982,18 @@ export class RequestBroker {
         }
         cleanHeaders['Content-Type'] = encoded.contentType
       } catch (err) {
-        grant.audit('denied', initialOrigin)
+        const reason = err instanceof Error ? err.message : String(err)
+        this.auditDenied(
+          grant,
+          initialOrigin,
+          {
+            reason,
+            method: req.method,
+            path: req.pathAndQuery,
+            ...(personaHandle ? { persona: personaHandle } : {}),
+          },
+          req.secrets,
+        )
         throw err
       }
     }
@@ -2919,7 +3002,7 @@ export class RequestBroker {
     const secrets = collectSecrets(req, grant)
     const followRedirects = req.followRedirects ?? true
     const defaultRps = tier === 3 ? 3 : 5
-    const maxRps = grant.maxRpsPerOrigin ?? defaultRps
+    const maxRps = resolveGrantMaxRps(grant, defaultRps)
 
     return {
       initialOrigin,
@@ -2979,6 +3062,20 @@ export class RequestBroker {
     if (!req.authMutation || !prepared.resolvedPersonaHeaders) return
     const mutation = req.authMutation
     const hdrs = prepared.resolvedPersonaHeaders
+    const deny: (reason: string) => never = (reason: string): never => {
+      this.auditDenied(
+        grant,
+        prepared.initialOrigin,
+        {
+          reason,
+          method: req.method,
+          path: req.pathAndQuery,
+          ...(prepared.personaHandle ? { persona: prepared.personaHandle } : {}),
+        },
+        req.secrets,
+      )
+      throw new BrokerDenied(reason)
+    }
 
     // Locate JWT in Authorization: Bearer <jwt> or Cookie header value
     let jwtSource: { kind: 'header'; key: string } | { kind: 'cookie'; key: string; cookieName: string } | null = null
@@ -3008,21 +3105,18 @@ export class RequestBroker {
       }
     }
     if (!jwtSource || !originalJwt) {
-      grant.audit('denied', prepared.initialOrigin)
-      throw new BrokerDenied('authMutation requires a persona with a 3-segment JWT credential.')
+      deny('authMutation requires a persona with a 3-segment JWT credential.')
     }
 
     const parts = originalJwt.split('.')
     if (parts.length !== 3) {
-      grant.audit('denied', prepared.initialOrigin)
-      throw new BrokerDenied('Persona credential is not a valid 3-part JWT.')
+      deny('Persona credential is not a valid 3-part JWT.')
     }
     const [headerB64, payloadB64, sigB64] = parts
     const header = decodeJwtSegmentJson(headerB64)
     const payload = decodeJwtSegmentJson(payloadB64)
     if (!header || !payload) {
-      grant.audit('denied', prepared.initialOrigin)
-      throw new BrokerDenied('Persona JWT header or payload could not be decoded.')
+      deny('Persona JWT header or payload could not be decoded.')
     }
 
     this.registerSecret(`jwt:original:${prepared.personaHandle ?? 'persona'}`, originalJwt)
@@ -3043,8 +3137,7 @@ export class RequestBroker {
       mutatedJwt = `${headerB64}.${encodeJwtJson(nextPayload)}.${sigB64}`
     } else if (mutation.kind === 'kid_inject') {
       if (/[\r\n\0]/.test(mutation.value) || hasDestructiveContent(mutation.value)) {
-        grant.audit('denied', prepared.initialOrigin)
-        throw new BrokerDenied('kid_inject value rejected.')
+        deny('kid_inject value rejected.')
       }
       const nextHeader = { ...header, kid: mutation.value }
       mutatedJwt = `${encodeJwtJson(nextHeader)}.${payloadB64}.${sigB64}`
@@ -3054,27 +3147,22 @@ export class RequestBroker {
       const cb = this.options.canaryBroker ?? grant.canaryBroker
       if (canaryUrl) {
         if (/[\r\n\0]/.test(canaryUrl) || hasDestructiveContent(canaryUrl)) {
-          grant.audit('denied', prepared.initialOrigin)
-          throw new BrokerDenied('jku_x5u_canary URL rejected.')
+          deny('jku_x5u_canary URL rejected.')
         }
         let parsedCanary: URL
         try {
           parsedCanary = new URL(canaryUrl)
         } catch {
-          grant.audit('denied', prepared.initialOrigin)
-          throw new BrokerDenied('jku_x5u_canary URL is malformed.')
+          deny('jku_x5u_canary URL is malformed.')
         }
         if (parsedCanary.protocol !== 'http:' && parsedCanary.protocol !== 'https:') {
-          grant.audit('denied', prepared.initialOrigin)
-          throw new BrokerDenied('jku_x5u_canary URL must use http: or https: protocol.')
+          deny('jku_x5u_canary URL must use http: or https: protocol.')
         }
         if (parsedCanary.search || parsedCanary.hash || parsedCanary.username || parsedCanary.password) {
-          grant.audit('denied', prepared.initialOrigin)
-          throw new BrokerDenied('jku_x5u_canary URL must not contain query, fragment, or userinfo.')
+          deny('jku_x5u_canary URL must not contain query, fragment, or userinfo.')
         }
         if (!canaryUrlRegex.test(parsedCanary.pathname)) {
-          grant.audit('denied', prepared.initialOrigin)
-          throw new BrokerDenied('jku_x5u_canary URL must target a Kovo Hunter CanaryBroker endpoint.')
+          deny('jku_x5u_canary URL must target a Kovo Hunter CanaryBroker endpoint.')
         }
         const canaryHost = parsedCanary.hostname.toLowerCase().replace(/^\[|\]$/g, '')
         if (
@@ -3084,25 +3172,21 @@ export class RequestBroker {
           canaryHost.startsWith('169.254.') ||
           canaryHost.startsWith('fe80:')
         ) {
-          grant.audit('denied', prepared.initialOrigin)
-          throw new BrokerDenied('jku_x5u_canary URL cannot target cloud metadata or link-local endpoints.')
+          deny('jku_x5u_canary URL cannot target cloud metadata or link-local endpoints.')
         }
         if (ipaddr.isValid(canaryHost)) {
           const range = ipaddr.process(canaryHost).range()
           if (range === 'linkLocal') {
-            grant.audit('denied', prepared.initialOrigin)
-            throw new BrokerDenied('jku_x5u_canary URL cannot target link-local IP addresses.')
+            deny('jku_x5u_canary URL cannot target link-local IP addresses.')
           }
           if (!prepared.localLab && range !== 'unicast') {
-            grant.audit('denied', prepared.initialOrigin)
-            throw new BrokerDenied('jku_x5u_canary URL cannot target private or loopback IPs on public projects.')
+            deny('jku_x5u_canary URL cannot target private or loopback IPs on public projects.')
           }
         } else if (
           !prepared.localLab &&
           (canaryHost === 'localhost' || canaryHost.endsWith('.localhost') || canaryHost.endsWith('.local') || canaryHost.endsWith('.internal'))
         ) {
-          grant.audit('denied', prepared.initialOrigin)
-          throw new BrokerDenied('jku_x5u_canary URL cannot target local/internal hostnames on public projects.')
+          deny('jku_x5u_canary URL cannot target local/internal hostnames on public projects.')
         }
         if (cb) {
           const info = cb.listenerInfo()
@@ -3113,8 +3197,7 @@ export class RequestBroker {
             }
           }
           if (allowedOrigins.size > 0 && !allowedOrigins.has(parsedCanary.origin)) {
-            grant.audit('denied', prepared.initialOrigin)
-            throw new BrokerDenied('jku_x5u_canary URL origin does not match the active Kovo Hunter CanaryBroker.')
+            deny('jku_x5u_canary URL origin does not match the active Kovo Hunter CanaryBroker.')
           }
         }
       } else {
@@ -3131,8 +3214,7 @@ export class RequestBroker {
           canaryUrl = minted?.httpUrl ?? minted?.url
         }
         if (!canaryUrl) {
-          grant.audit('denied', prepared.initialOrigin)
-          throw new BrokerDenied('jku_x5u_canary requires an explicit CanaryBroker URL or active CanaryBroker.')
+          deny('jku_x5u_canary requires an explicit CanaryBroker URL or active CanaryBroker.')
         }
       }
       const nextHeader = { ...header, [hdrField]: canaryUrl }
@@ -3143,8 +3225,7 @@ export class RequestBroker {
       try {
         parsedJwks = new URL(jwksTarget)
       } catch {
-        grant.audit('denied', prepared.initialOrigin)
-        throw new BrokerDenied('rs256_to_hs256_jwks jwksUrl is malformed.')
+        deny('rs256_to_hs256_jwks jwksUrl is malformed.')
       }
       const jwksEx = await this.executeHttp({
         origin: parsedJwks.origin,
@@ -3157,8 +3238,7 @@ export class RequestBroker {
         traceId: req.traceId,
       }, grant, signal)
       if (jwksEx.status < 200 || jwksEx.status >= 300) {
-        grant.audit('denied', prepared.initialOrigin)
-        throw new BrokerDenied(`Failed to fetch JWKS (${jwksEx.status}) for rs256_to_hs256_jwks.`)
+        deny(`Failed to fetch JWKS (${jwksEx.status}) for rs256_to_hs256_jwks.`)
       }
       let keys: Array<Record<string, unknown>> = []
       try {
@@ -3173,8 +3253,7 @@ export class RequestBroker {
         keys.find(k => k.kty === 'RSA') ??
         keys[0]
       if (!selectedJwk) {
-        grant.audit('denied', prepared.initialOrigin)
-        throw new BrokerDenied('No usable RSA key found in JWKS for rs256_to_hs256_jwks.')
+        deny('No usable RSA key found in JWKS for rs256_to_hs256_jwks.')
       }
       let pem: string
       try {
@@ -3182,8 +3261,7 @@ export class RequestBroker {
           .export({ type: 'spki', format: 'pem' })
           .toString()
       } catch {
-        grant.audit('denied', prepared.initialOrigin)
-        throw new BrokerDenied('JWKS key could not be exported as SPKI PEM.')
+        deny('JWKS key could not be exported as SPKI PEM.')
       }
       const nextHeader = { ...header, alg: 'HS256' }
       const signingInput = `${encodeJwtJson(nextHeader)}.${payloadB64}`
@@ -3192,8 +3270,7 @@ export class RequestBroker {
     } else if (mutation.kind === 'claim_swap') {
       const isUnsigned = String(header.alg ?? '').toLowerCase() === 'none' || sigB64 === ''
       if (!prepared.localLab && !isUnsigned) {
-        grant.audit('denied', prepared.initialOrigin)
-        throw new BrokerDenied('claim_swap on signed tokens is restricted to local-lab or unsigned tokens.')
+        deny('claim_swap on signed tokens is restricted to local-lab or unsigned tokens.')
       }
       const nextPayload = { ...payload, ...mutation.claims }
       mutatedJwt = `${headerB64}.${encodeJwtJson(nextPayload)}.${sigB64}`
@@ -3276,8 +3353,19 @@ export class RequestBroker {
     let activeBody = prepared.preparedBody
     let includePersona = Boolean(personaHeaders && Object.keys(personaHeaders).length > 0)
 
-    const deny = (message: string): never => {
-      grant.audit('denied', url.origin)
+    const defaultRps = (grant.tier ?? 1) === 3 ? 3 : 5
+    const deny: (message: string) => never = (message: string): never => {
+      this.auditDenied(
+        grant,
+        url.origin,
+        {
+          reason: message,
+          method: activeMethod,
+          path: `${url.pathname}${url.search}`,
+          ...(includePersona && personaHandle ? { persona: personaHandle } : {}),
+        },
+        req.secrets,
+      )
       throw new BrokerDenied(message)
     }
     const check = () => {
@@ -3333,7 +3421,17 @@ export class RequestBroker {
           ) {
             if (approvalMeta.effectivePolicy === 'yolo') return
           } else {
-            grant.audit('denied', target.origin)
+            this.auditDenied(
+              grant,
+              target.origin,
+              {
+                reason: decision.reason,
+                method: activeMethod,
+                path: targetPathAndQuery,
+                ...(includePersona && personaHandle ? { persona: personaHandle } : {}),
+              },
+              req.secrets,
+            )
             throw new BrokerDenied(decision.reason)
           }
         } else if (contractApplies) {
@@ -3361,7 +3459,17 @@ export class RequestBroker {
         ? grant.isStateChangeApproved(target.origin, activeMethod, targetPathAndQuery, context)
         : localLab
       if (!approved) {
-        grant.audit('denied', target.origin)
+        this.auditDenied(
+          grant,
+          target.origin,
+          {
+            reason: `Approval required for state-changing redirect ${activeMethod} ${targetPathAndQuery}.`,
+            method: activeMethod,
+            path: targetPathAndQuery,
+            ...(includePersona && personaHandle ? { persona: personaHandle } : {}),
+          },
+          req.secrets,
+        )
         throw new BrokerApprovalRequired(target.origin, activeMethod, targetPathAndQuery)
       }
     }
@@ -3375,7 +3483,12 @@ export class RequestBroker {
 
       const addresses = redirect === 0 && options.preResolvedAddresses
         ? options.preResolvedAddresses
-        : await this.resolveAndCheckAddresses(url.hostname, grant, deadline, url.origin)
+        : await this.resolveAndCheckAddresses(url.hostname, grant, deadline, url.origin, {
+          method: activeMethod,
+          path: `${url.pathname}${url.search}`,
+          ...(includePersona && personaHandle ? { persona: personaHandle } : {}),
+          secrets: req.secrets,
+        })
       check()
 
       const outboundHeaders: Record<string, string> = {
@@ -3545,7 +3658,14 @@ export class RequestBroker {
       }
 
       const hopRouteTemplate = routeTemplateForPath(url.pathname)
-      const release = await this.acquireSlot(url.origin, maxRps, deadline, options.bypassConcurrency, hopRouteTemplate, localLab)
+      const release = await this.acquireSlot(
+        url.origin,
+        () => resolveGrantMaxRps(grant, maxRps || defaultRps),
+        deadline,
+        options.bypassConcurrency,
+        hopRouteTemplate,
+        localLab,
+      )
       let response: RawHttpResponse
       try {
         ks.assertAllowed(grant.tenantId ?? null)
@@ -3571,7 +3691,7 @@ export class RequestBroker {
       this.recordStatus(url.origin, response.status, grant.audit, {
         routeTemplate: hopRouteTemplate,
         headers: response.headers,
-        configuredRps: maxRps,
+        configuredRps: resolveGrantMaxRps(grant, maxRps || defaultRps),
         probeClass: req.probeClass,
       })
 
@@ -3725,10 +3845,22 @@ export class RequestBroker {
     for (const req of reqs) {
       const origin = new URL(req.origin).origin
       if (!this.originInGrantScope(grant, origin)) {
-        grant.audit('denied', origin)
-        throw new BrokerDenied(`Origin ${origin} is outside the current assignment scope.`)
+        const reason = `Origin ${origin} is outside the current assignment scope.`
+        const persona = req.persona ?? req.personaHandle
+        this.auditDenied(
+          grant,
+          origin,
+          {
+            reason,
+            method: req.method,
+            path: req.pathAndQuery,
+            ...(persona ? { persona } : {}),
+          },
+          req.secrets,
+        )
+        throw new BrokerDenied(reason)
       }
-      const state = this.health(origin, grant.maxRpsPerOrigin ?? 5)
+      const state = this.health(origin, resolveGrantMaxRps(grant, 5))
       if (this.isCircuitOpen(origin)) {
         throw new BrokerCircuitOpen(origin, state.openReason ?? 'Origin circuit is open.')
       }
@@ -3737,7 +3869,7 @@ export class RequestBroker {
     }
 
     for (const origin of uniqueOrigins) {
-      const state = this.health(origin, grant.maxRpsPerOrigin ?? 5)
+      const state = this.health(origin, resolveGrantMaxRps(grant, 5))
       state.batchActive = true
       // Ensure the bucket has enough tokens for a synchronized burst of up to reqs.length
       state.tokens = Math.max(state.tokens, reqs.length)
@@ -3772,15 +3904,21 @@ export class RequestBroker {
     const preparedList = requests.map(req => ({ req, prepared: this.prepareHttpRequest(req, grant, { raceBurst: true }) }))
 
     const countsByOrigin = new Map<string, number>()
-    const hostsToResolve = new Map<string, string>() // hostname -> originForAudit
-    for (const { prepared } of preparedList) {
+    const hostsToResolve = new Map<string, { origin: string; method: string; path: string; persona?: string; secrets?: readonly NamedSecret[] }>()
+    for (const { req, prepared } of preparedList) {
       const origin = prepared.initialOrigin
-      const state = this.health(origin, grant.maxRpsPerOrigin ?? (tier === 3 ? 3 : 5))
+      const state = this.health(origin, resolveGrantMaxRps(grant, tier === 3 ? 3 : 5))
       if (state.openReason) throw new BrokerCircuitOpen(origin, state.openReason)
       if (state.batchActive) throw new BrokerDenied(`Another synchronized burst is already running for ${origin}.`)
       countsByOrigin.set(origin, (countsByOrigin.get(origin) ?? 0) + 1)
       if (!hostsToResolve.has(prepared.url.hostname)) {
-        hostsToResolve.set(prepared.url.hostname, origin)
+        hostsToResolve.set(prepared.url.hostname, {
+          origin,
+          method: req.method,
+          path: req.pathAndQuery,
+          persona: prepared.personaHandle,
+          secrets: req.secrets,
+        })
       }
     }
 
@@ -3788,15 +3926,20 @@ export class RequestBroker {
     const dnsDeadline = AbortSignal.any([signal, AbortSignal.timeout(15_000)])
     const resolvedByHost = new Map<string, PublicAddress[]>()
     await Promise.all(
-      [...hostsToResolve.entries()].map(async ([hostname, origin]) => {
-        const addrs = await this.resolveAndCheckAddresses(hostname, grant, dnsDeadline, origin)
+      [...hostsToResolve.entries()].map(async ([hostname, ctx]) => {
+        const addrs = await this.resolveAndCheckAddresses(hostname, grant, dnsDeadline, ctx.origin, {
+          method: ctx.method,
+          path: ctx.path,
+          ...(ctx.persona ? { persona: ctx.persona } : {}),
+          secrets: ctx.secrets,
+        })
         resolvedByHost.set(hostname, addrs)
       }),
     )
     signal.throwIfAborted()
 
     // 3. Re-check all origins atomically before mutating state, then reserve burst tokens and lock.
-    const defaultRps = grant.maxRpsPerOrigin ?? (tier === 3 ? 3 : 5)
+    const defaultRps = resolveGrantMaxRps(grant, tier === 3 ? 3 : 5)
     for (const origin of countsByOrigin.keys()) {
       const state = this.health(origin, defaultRps)
       if (state.openReason) throw new BrokerCircuitOpen(origin, state.openReason)
@@ -3864,12 +4007,14 @@ export class RequestBroker {
     if (tier === 0) throw new BrokerDenied('Live DNS inspection is disabled in Tier 0 (offline prepared mode).')
     const parsed = new URL(origin)
     if (grant.scopePolicy && originRoleFor(grant.scopePolicy, parsed.origin) !== 'target') {
-      grant.audit('denied', parsed.origin)
-      throw new BrokerDenied('Passive DNS/TLS inspection is only permitted for target origins.')
+      const reason = 'Passive DNS/TLS inspection is only permitted for target origins.'
+      this.auditDenied(grant, parsed.origin, { reason, method: 'DNS', path: '/' })
+      throw new BrokerDenied(reason)
     }
     if (!this.originInGrantScope(grant, parsed.origin)) {
-      grant.audit('denied', parsed.origin)
-      throw new BrokerDenied('Destination is outside the current assignment scope.')
+      const reason = 'Destination is outside the current assignment scope.'
+      this.auditDenied(grant, parsed.origin, { reason, method: 'DNS', path: '/' })
+      throw new BrokerDenied(reason)
     }
 
     const started = Date.now()
@@ -3916,14 +4061,18 @@ export class RequestBroker {
     const parsed = new URL(origin)
     if (parsed.protocol !== 'https:' || !this.originInGrantScope(grant, parsed.origin) ||
         (grant.scopePolicy && originRoleFor(grant.scopePolicy, parsed.origin) !== 'target')) {
-      grant.audit('denied', parsed.origin)
-      throw new BrokerDenied('TLS inspection requires an approved HTTPS origin.')
+      const reason = 'TLS inspection requires an approved HTTPS origin.'
+      this.auditDenied(grant, parsed.origin, { reason, method: 'TLS', path: '/' })
+      throw new BrokerDenied(reason)
     }
 
     const started = Date.now()
     const { chosen, tls } = await this.withKillSwitch(signal, grant, async (ksSignal, ks) => {
       const deadline = AbortSignal.any([ksSignal, AbortSignal.timeout(15_000)])
-      const addresses = await this.resolveAndCheckAddresses(parsed.hostname, grant, deadline, parsed.origin)
+      const addresses = await this.resolveAndCheckAddresses(parsed.hostname, grant, deadline, parsed.origin, {
+        method: 'TLS',
+        path: '/',
+      })
       const picked = addresses.find(a => a.family === 4) ?? addresses[0]
       const inspector = this.options.tlsInspector ?? defaultTlsInspector
 
@@ -3964,22 +4113,35 @@ export class RequestBroker {
       throw new BrokerDenied('WebSocket origin or path is malformed.')
     }
 
+    const personaHandle = req.persona ?? req.personaHandle
+    const deny: (reason: string) => never = (reason: string): never => {
+      this.auditDenied(
+        grant,
+        initialOrigin,
+        {
+          reason,
+          method: 'WS',
+          path: req.pathAndQuery,
+          ...(personaHandle ? { persona: personaHandle } : {}),
+        },
+        req.secrets,
+      )
+      throw new BrokerDenied(reason)
+    }
+
     if (
       !req.pathAndQuery.startsWith('/') ||
       req.pathAndQuery.startsWith('//') ||
       req.pathAndQuery.length > maxPathLength ||
       /[\r\n\0]/.test(req.pathAndQuery)
     ) {
-      grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('WebSocket path is invalid or exceeds Kovo Hunter 8 KiB limit.')
+      deny('WebSocket path is invalid or exceeds Kovo Hunter 8 KiB limit.')
     }
     if (url.origin !== initialOrigin || !safeUrl(url, true, localLab, grant.allowedPorts) || !this.originInGrantScope(grant, initialOrigin)) {
-      grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('WebSocket destination is outside the current assignment scope.')
+      deny('WebSocket destination is outside the current assignment scope.')
     }
     if (grant.scopePolicy && originRoleFor(grant.scopePolicy, initialOrigin) !== 'target') {
-      grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('WebSocket sessions are only permitted for target origins.')
+      deny('WebSocket sessions are only permitted for target origins.')
     }
 
     const sendMessages = (req.sendMessages ?? []).slice(0, hardWsMaxFrames)
@@ -3990,56 +4152,47 @@ export class RequestBroker {
       ...sendMessages,
     ].join('\n')
     if (hasDestructiveContent(serializedInputs)) {
-      grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('WebSocket probe blocked by Kovo Hunter destructive-payload denylist.')
+      deny('WebSocket probe blocked by Kovo Hunter destructive-payload denylist.')
     }
 
-    const personaHandle = req.persona ?? req.personaHandle
     let resolvedPersonaHeaders: Record<string, string> | undefined
     if (personaHandle) {
       if (tier < 2) {
-        grant.audit('denied', initialOrigin)
-        throw new BrokerDenied('Persona-authenticated WebSocket probes require Tier 2 or higher.')
+        deny('Persona-authenticated WebSocket probes require Tier 2 or higher.')
       }
       if (grant.personas) {
         const persona = grant.personas.get(personaHandle)
         if (!persona) {
-          grant.audit('denied', initialOrigin)
-          throw new BrokerDenied(`Persona "${personaHandle}" is not approved for this run.`)
+          deny(`Persona "${personaHandle}" is not approved for this run.`)
         }
         const injected = buildPersonaHeader(persona, initialOrigin)
         if (!injected) {
-          grant.audit('denied', initialOrigin)
           if (!persona.originAllowlist.includes(initialOrigin)) {
-            throw new BrokerDenied(`Origin ${initialOrigin} is not in persona "${personaHandle}" originAllowlist.`)
+            deny(`Origin ${initialOrigin} is not in persona "${personaHandle}" originAllowlist.`)
           }
-          throw new BrokerDenied(`Persona "${personaHandle}" does not have an active authenticated session yet.`)
+          deny(`Persona "${personaHandle}" does not have an active authenticated session yet.`)
         }
         resolvedPersonaHeaders = injected
       } else if (req.personaHeaders && Object.keys(req.personaHeaders).length > 0) {
         resolvedPersonaHeaders = req.personaHeaders
       } else {
-        grant.audit('denied', initialOrigin)
-        throw new BrokerDenied(`Persona "${personaHandle}" could not be resolved from run grant.`)
+        deny(`Persona "${personaHandle}" could not be resolved from run grant.`)
       }
     }
 
     const cleanHeaders: Record<string, string> = {}
     for (const [k, v] of Object.entries(req.headers ?? {})) {
       if (forbiddenCallerHeaders.test(k)) {
-        grant.audit('denied', initialOrigin)
-        throw new BrokerDenied(`Header "${k}" cannot be set directly; reference an approved persona handle instead.`)
+        deny(`Header "${k}" cannot be set directly; reference an approved persona handle instead.`)
       }
       if (/[\r\n\0]/.test(k) || /[\r\n\0]/.test(v)) {
-        grant.audit('denied', initialOrigin)
-        throw new BrokerDenied('Invalid WebSocket request header.')
+        deny('Invalid WebSocket request header.')
       }
       cleanHeaders[k] = v
     }
     const effectiveOriginHeader = req.originHeader ?? cleanHeaders.Origin ?? cleanHeaders.origin ?? initialOrigin
     if (/[\r\n\0]/.test(effectiveOriginHeader)) {
-      grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('Invalid WebSocket Origin header.')
+      deny('Invalid WebSocket Origin header.')
     }
     cleanHeaders.Origin = effectiveOriginHeader
 
@@ -4058,10 +4211,21 @@ export class RequestBroker {
 
     let raw
     try {
-      const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, initialOrigin)
+      const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, initialOrigin, {
+        method: 'WS',
+        path: req.pathAndQuery,
+        ...(personaHandle ? { persona: personaHandle } : {}),
+        secrets: req.secrets,
+      })
       const chosen = addresses.find(a => a.family === 4) ?? addresses[0]
-      const maxRps = grant.maxRpsPerOrigin ?? (tier === 3 ? 3 : 5)
-      const release = await this.acquireSlot(initialOrigin, maxRps, deadline, false, undefined, localLab)
+      const release = await this.acquireSlot(
+        initialOrigin,
+        () => resolveGrantMaxRps(grant, tier === 3 ? 3 : 5),
+        deadline,
+        false,
+        undefined,
+        localLab,
+      )
 
       const wsTransport = this.options.wsTransport ?? defaultWsTransport
       const sessionMode = Boolean(req.turns?.length) && this.options.wsSessionEnabled === true
