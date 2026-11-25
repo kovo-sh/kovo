@@ -9,7 +9,6 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, ReactNode, RefObject } from 'react'
 import { Dropdown, FilterBox, Tabs } from '../controls.tsx'
 import { useRunModel, useVerdict } from '../data.tsx'
-import { useDecisions, ACTIONS } from '../decisions.tsx'
 import { EmptyState, KbdGroup, Seg } from '../display.tsx'
 import { host } from '../format.ts'
 import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
@@ -22,8 +21,8 @@ import { useListNav, useNav, useViewState } from '../nav.tsx'
 import type { InspectorMap } from '../pane.tsx'
 import { usePaletteCommands } from '../palette.tsx'
 import { useToast } from '../toast.tsx'
-import { cn, runBtn, runDec, RW } from '../tw.ts'
-import { FindingInspector, useFindingQueueKey } from './findings-inspector.tsx'
+import { cn, runBtn, RW } from '../tw.ts'
+import { FindingInspector } from './findings-inspector.tsx'
 
 type Group = 'severity' | 'origin' | 'status' | 'none'
 type Sort = 'severity' | 'status' | 'title'
@@ -125,13 +124,12 @@ function Toolbar({ tabs, tab, setTab, filter, setFilter, filterRef, onFilterEnte
 
 // ---------------------------------------------------------------- rows
 
-function FindingRowView({ f, group, cur, onClick, style, local }: {
+function FindingRowView({ f, group, cur, onClick, style }: {
   f: FindingRow
   group: Group
   cur: boolean
   onClick: () => void
   style?: CSSProperties
-  local?: string | null
 }) {
   const st = normFStatus(f.status)
   return <div
@@ -144,7 +142,6 @@ function FindingRowView({ f, group, cur, onClick, style, local }: {
     {group !== 'severity' && <span className="inline-flex size-3.5 flex-none items-center justify-center" title={SEV_LABEL[f.severity] ?? f.severity}><SevGlyph sev={f.severity} /></span>}
     <span className="inline-flex size-3.5 flex-none items-center justify-center" title={stLabel(st)}><StatusGlyph status={st} /></span>
     <span className="min-w-0 flex-1 truncate text-fg">{f.title}</span>
-    {local && <span className={cn(runDec(), 'flex-none whitespace-nowrap')} title="Saved locally in this browser">{local}</span>}
     {f.category && <span className="max-w-[155px] flex-none truncate text-[12px] text-fg-subtle">{prettyCat(f.category)}</span>}
     {group !== 'origin' && <span className="w-[150px] flex-none truncate text-right font-mono text-[12px] text-fg-subtle max-[1320px]:w-[120px] max-[1180px]:hidden">{host(f.origin)}</span>}
   </div>
@@ -185,8 +182,6 @@ export function FindingsView() {
   const model = useRunModel()
   const nav = useNav()
   const toast = useToast()
-  const q = useDecisions()
-  const keyOf = useFindingQueueKey()
   const [tab, setTab] = useViewState<Tab>('findings.tab', 'all')
   const [filter, setFilter] = useViewState('findings.filter', '')
   const [group, setGroup] = useViewState<Group>('findings.group', 'severity')
@@ -230,11 +225,6 @@ export function FindingsView() {
 
   const selId = nav.sel?.kind === 'finding' ? nav.sel.id : null
   const select = (id: string) => nav.select({ kind: 'finding', id })
-  const localLabel = (f: FindingRow) => {
-    const k = keyOf(f.id)
-    const d = k ? q.get(k) : undefined
-    return d ? ACTIONS[d.act].label : null
-  }
 
   // Windowed rendering for long lists.
   const flatEntries = useMemo(() => {
@@ -322,7 +312,7 @@ export function FindingsView() {
           const style: CSSProperties = { position: 'absolute', top: offsets[i], left: 0, right: 0, height: e.t === 'h' ? HEAD_H : ROW_H }
           return e.t === 'h'
             ? <GroupHead key={'h:' + e.g.key} g={e.g} group={group} collapsed={!!collapsed[ck(e.g)]} onToggle={() => toggle(e.g)} className="absolute" style={style} />
-            : <FindingRowView key={e.f.id} f={e.f} group={group} cur={e.f.id === selId} onClick={() => select(e.f.id)} style={style} local={localLabel(e.f)} />
+            : <FindingRowView key={e.f.id} f={e.f} group={group} cur={e.f.id === selId} onClick={() => select(e.f.id)} style={style} />
         })}
       </div>
     </>
@@ -330,9 +320,9 @@ export function FindingsView() {
     body = groups
       ? groups.map(g => <div key={g.key} className="relative">
         <GroupHead g={g} group={group} collapsed={!!collapsed[ck(g)]} onToggle={() => toggle(g)} />
-        {!collapsed[ck(g)] && g.items.map(f => <FindingRowView key={f.id} f={f} group={group} cur={f.id === selId} onClick={() => select(f.id)} local={localLabel(f)} />)}
+        {!collapsed[ck(g)] && g.items.map(f => <FindingRowView key={f.id} f={f} group={group} cur={f.id === selId} onClick={() => select(f.id)} />)}
       </div>)
-      : items.map(f => <FindingRowView key={f.id} f={f} group={group} cur={f.id === selId} onClick={() => select(f.id)} local={localLabel(f)} />)
+      : items.map(f => <FindingRowView key={f.id} f={f} group={group} cur={f.id === selId} onClick={() => select(f.id)} />)
   }
   return <>
     <VerdictStrip />

@@ -5,40 +5,39 @@
 //   const q = useDecisions()
 //   q.sections.decide / review / follow / done   // base queue minus decided items
 //   q.decide('ap:<id>', 'approve', { command: approvalCommand(id, 'approve'), message: 'Approved POST …' })
-//   q.decide('b:hsts:pending', 'dismiss')        // local-only triage (no server API), persisted per run
-//   q.reopen(key)                                // move back to the queue (local / not yet sent)
+//   q.reopen(key)                                // move back to the queue (not yet sent)
 //
-// Decisions with a `command` are real: they stamp immediately, show an undo
-// toast, and the command is sent when the 6 s window closes (or when the
-// next decision replaces the toast). Undo inside the window sends nothing.
-// Local-only decisions persist in localStorage (`kovo-queue:<runId>`).
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+// Every queue decision is a real server command: it stamps immediately, shows an
+// undo toast, and sends when the 6 s window closes (or when another toast
+// replaces it). Undo inside the window sends nothing. Local-only browser triage
+// is intentionally absent so Queue never contradicts Report/SARIF/Overview.
+import { createContext, useCallback, useContext, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useRun } from './data.tsx'
 import type { Command } from './data.tsx'
 import type { IconName } from './icons.tsx'
+import { isApprovalExpired } from './model.ts'
 import type { QueueItem, QueueSection } from './model.ts'
 import { useToast } from './toast.tsx'
 
-export type DecisionAct = 'approve' | 'deny' | 'accept' | 'dismiss' | 'fp' | 'queue' | 'close' | 'scope'
+export type DecisionAct = 'approve' | 'deny' | 'queue' | 'scope'
 export const ACTIONS: Record<DecisionAct, { label: string; tone: 'ok' | 'no' | 'fp' | 'acc'; icon: IconName }> = {
   approve: { label: 'Approved', tone: 'ok', icon: 'check' },
   deny: { label: 'Denied', tone: 'no', icon: 'x' },
-  accept: { label: 'Accepted', tone: 'ok', icon: 'check' },
-  dismiss: { label: 'Dismissed', tone: 'no', icon: 'archive' },
-  fp: { label: 'False positive', tone: 'fp', icon: 'slash' },
   queue: { label: 'Follow-up queued', tone: 'acc', icon: 'follow' },
-  close: { label: 'Not needed', tone: 'no', icon: 'archive' },
   scope: { label: 'Scope approved', tone: 'ok', icon: 'check' },
 }
 
-/** Which actions an item offers: [act, button label, key, primary]. */
-export function actionsFor(it: QueueItem | undefined | null): [DecisionAct, string, string, boolean][] {
+/** Which real server actions an item offers: [act, button label, key, primary]. */
+export function actionsFor(it: QueueItem | undefined | null, now = Date.now()): [DecisionAct, string, string, boolean][] {
   if (!it) return []
   if (it.kind === 'consent') return [['scope', 'Approve scope', 'a', true]]
-  if (it.kind === 'approval') return [['approve', 'Approve', 'a', true], ['deny', 'Deny', 'd', false]]
-  if (it.kind === 'follow') return [['queue', 'Queue follow-up', 'a', true], ['close', 'Not needed', 'd', false]]
-  return [['accept', 'Accept', 'a', true], ['dismiss', 'Dismiss', 'd', false], ['fp', 'False positive', 'f', false]]
+  if (it.kind === 'approval') {
+    if (isApprovalExpired(it.ap, now)) return []
+    return [['approve', 'Approve', 'a', true], ['deny', 'Deny', 'd', false]]
+  }
+  if (it.kind === 'follow') return [['queue', 'Queue follow-up', 'a', true]]
+  return []
 }
 
 /** The real command for an approval decision. */
@@ -46,11 +45,20 @@ export function approvalCommand(approvalId: string, act: 'approve' | 'deny'): Co
   return { action: 'decide_approval', approvalId, decision: act === 'approve' ? 'approved' : 'denied' }
 }
 
+/** Queue progress summary ensuring `handledCount <= initialCount` and ratio stays within `[0, 1]`. */
+export function computeQueueProgress(openCount: number, handledCount: number) {
+  const safeOpen = Math.max(0, openCount)
+  const safeHandled = Math.max(0, handledCount)
+  const initialCount = safeOpen + safeHandled
+  const ratio = initialCount > 0 ? Math.min(1, safeHandled / initialCount) : 0
+  return { openCount: safeOpen, handledCount: safeHandled, initialCount, ratio }
+}
+
 export interface Decision {
   act: DecisionAct
   at: number
-  /** local = UI-only triage; pending = inside the undo window; sent = command delivered; failed = command rejected */
-  state: 'local' | 'pending' | 'sent' | 'failed'
+  /** pending = inside the undo window; sent = command delivered; failed = command rejected */
+  state: 'pending' | 'sent' | 'failed'
 }
 
 export interface DecisionsApi {
@@ -60,14 +68,14 @@ export interface DecisionsApi {
   /** Open items (decide + review + follow) and items needing a decision. */
   openCount: number
   decideCount: number
-  /** Items present at load that could be acted on, and how many the operator handled this session. */
+  /** Total actionable items (open + handled this session), always >= handledCount. */
   initialCount: number
   handledCount: number
   sectionOf: (key: string) => QueueSection | null
   canAct: (key: string, act: DecisionAct) => boolean
   decide: (key: string, act: DecisionAct, opts?: { command?: Command; message?: ReactNode; sub?: string; onUndo?: () => void; silent?: boolean }) => boolean
   reopen: (key: string) => void
-  /** Undo the most recent local decision (after its toast closed). */
+  /** Retained for compatibility; local-only triage has been removed so this is always false. */
   undoLastLocal: () => boolean
 }
 
@@ -81,27 +89,7 @@ export function useDecisions(): DecisionsApi {
 export function DecisionsProvider({ children }: { children: ReactNode }) {
   const { model, send } = useRun()
   const toast = useToast()
-  const runId = model.run.id
-  const storageKey = 'kovo-queue:' + runId
   const [all, setAll] = useState<Record<string, Decision>>({})
-  const order = useRef<string[]>([])
-
-  useEffect(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(storageKey) ?? '{}') as Record<string, Decision>
-      setAll(saved)
-      order.current = Object.entries(saved).sort((a, b) => a[1].at - b[1].at).map(([k]) => k)
-    } catch { /* ignore */ }
-  }, [storageKey])
-
-  const persist = useCallback((next: Record<string, Decision>) => {
-    const local = Object.fromEntries(Object.entries(next).filter(([, d]) => d.state === 'local'))
-    try { localStorage.setItem(storageKey, JSON.stringify(local)) } catch { /* ignore */ }
-  }, [storageKey])
-
-  const update = useCallback((fn: (prev: Record<string, Decision>) => Record<string, Decision>) => {
-    setAll(prev => { const next = fn(prev); persist(next); return next })
-  }, [persist])
 
   const sections = useMemo(() => {
     const base = model.queue
@@ -124,59 +112,51 @@ export function DecisionsProvider({ children }: { children: ReactNode }) {
 
   const decide = useCallback<DecisionsApi['decide']>((key, act, opts = {}) => {
     if (!canAct(key, act)) return false
-    const real = Boolean(opts.command)
-    order.current = [...order.current.filter(k => k !== key), key]
-    update(prev => ({ ...prev, [key]: { act, at: Date.now(), state: real ? 'pending' : 'local' } }))
+    if (!opts.command) return false
+    setAll(prev => ({ ...prev, [key]: { act, at: Date.now(), state: 'pending' } }))
     const undo = () => {
-      order.current = order.current.filter(k => k !== key)
-      update(prev => { const n = { ...prev }; delete n[key]; return n })
+      setAll(prev => { const n = { ...prev }; delete n[key]; return n })
       opts.onUndo?.()
     }
     if (opts.silent) return true
     toast.undoable({
       message: opts.message ?? ACTIONS[act].label,
-      sub: opts.sub ?? (real ? 'Sends when this closes' : undefined),
+      sub: opts.sub ?? 'Sends when this closes',
       icon: ACTIONS[act].icon,
       undo,
-      commit: real ? async () => {
+      commit: async () => {
         try {
           await send(opts.command!)
-          update(prev => prev[key] ? { ...prev, [key]: { ...prev[key], state: 'sent' } } : prev)
+          setAll(prev => prev[key] ? { ...prev, [key]: { ...prev[key], state: 'sent' } } : prev)
         } catch (e) {
-          update(prev => { const n = { ...prev }; delete n[key]; return n })
+          setAll(prev => { const n = { ...prev }; delete n[key]; return n })
           throw e
         }
-      } : undefined,
+      },
     })
     return true
-  }, [canAct, update, toast, send])
+  }, [canAct, toast, send])
 
   const reopen = useCallback((key: string) => {
     const d = all[key]
     if (d && d.state === 'sent') { toast.show('Already sent to Kovo Hunter; it can’t be moved back.'); return }
     if (d?.state === 'pending') { toast.undoLast(); return }
-    order.current = order.current.filter(k => k !== key)
-    update(prev => { const n = { ...prev }; delete n[key]; return n })
+    setAll(prev => { const n = { ...prev }; delete n[key]; return n })
     toast.show('Moved back to the queue', { icon: 'undo' })
-  }, [all, update, toast])
+  }, [all, toast])
 
-  const undoLastLocal = useCallback(() => {
-    for (let i = order.current.length - 1; i >= 0; i--) {
-      const k = order.current[i]
-      if (all[k]?.state === 'local') { reopen(k); return true }
-    }
-    return false
-  }, [all, reopen])
+  const undoLastLocal = useCallback(() => false, [])
 
   const value = useMemo<DecisionsApi>(() => {
-    const base = model.queue
-    const initialCount = base.decide.length + base.review.length + base.follow.length
+    const openCount = sections.decide.length + sections.review.length + sections.follow.length
+    const handledCount = Object.keys(all).filter(k => model.queueItem.has(k)).length
+    const progress = computeQueueProgress(openCount, handledCount)
     return {
       all, get: k => all[k], sections,
-      openCount: sections.decide.length + sections.review.length + sections.follow.length,
+      openCount: progress.openCount,
       decideCount: sections.decide.length,
-      initialCount,
-      handledCount: Object.keys(all).filter(k => model.queueItem.has(k)).length,
+      initialCount: progress.initialCount,
+      handledCount: progress.handledCount,
       sectionOf, canAct, decide, reopen, undoLastLocal,
     }
   }, [model, all, sections, sectionOf, canAct, decide, reopen, undoLastLocal])

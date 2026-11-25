@@ -27,6 +27,7 @@ import { usePaletteCommands } from '../palette.tsx'
 import type { InspectorMap } from '../pane.tsx'
 import { useToast } from '../toast.tsx'
 import { cn, runBtn, runDdItem, runIconBtn, RW } from '../tw.ts'
+import { canGeneratePatch, canVerifyFix } from './findings-inspector.tsx'
 
 const H2 = 'm-0 mb-2.5 mt-[30px] text-[12px] font-semibold uppercase tracking-[0.02em] text-fg-subtle'
 const DL = 'm-0 mb-2.5 grid grid-cols-[112px_minmax(0,1fr)] gap-x-3 gap-y-1 text-[12.5px] leading-[19px] [&_dt]:text-fg-subtle [&_dd]:m-0 [&_dd]:break-words [&_dd]:text-fg-muted'
@@ -96,7 +97,7 @@ export function ReportView() {
 type Rep = ReturnType<typeof useRun>['detail']['reports'][number]
 
 function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]; setVersion: (v: number) => void }) {
-  const { detail, send, pending } = useRun()
+  const { detail, send, pending, refresh } = useRun()
   const model = useRunModel()
   const verdict = useVerdict()
   const links = useLinks()
@@ -121,7 +122,13 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
   const owasp = b.owaspCoverage?.length ? b.owaspCoverage : detail.coverageEntries
   const gapsOpen = b.openProofGaps?.length ? b.openProofGaps
     : (detail.openProofGaps ?? []).map(g => ({ origin: g.origin, category: g.category, summary: g.summary, proofGapReason: g.proofGapReason || g.summary }))
-  const patches = b.patchProposals?.length ? b.patchProposals : (detail.patchProposals ?? [])
+  // Merge live patchProposals with snapshot patches (preferring live records) so newly generated patches appear immediately after refresh().
+  const patches = useMemo(() => {
+    const byId = new Map<string, (typeof detail.patchProposals)[number]>()
+    for (const p of b.patchProposals ?? []) byId.set(p.id, p as (typeof detail.patchProposals)[number])
+    for (const p of detail.patchProposals ?? []) byId.set(p.id, p)
+    return [...byId.values()]
+  }, [b.patchProposals, detail.patchProposals])
   const titleById = new Map(b.findings.map(f => [f.id, f.title]))
   const replayById = new Map(detail.replaySpecs.map(x => [x.id, x]))
   const replayByFinding = new Map(detail.replaySpecs.map(x => [x.findingId, x]))
@@ -187,9 +194,15 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
   }
   const patch = async (f: ReportFinding) => {
     setPatching(f.id)
-    try { await generatePatchAction({ data: { runId: detail.run.id, findingId: f.id, repo: f.codeLocations?.[0]?.repo } }); toast.show('Verified patch generated', { icon: 'check', sub: f.title }) }
-    catch (e) { toast.show(e instanceof Error ? e.message : 'Kovo Hunter could not generate a verified patch.', { tone: 'error' }) }
-    finally { setPatching(null) }
+    try {
+      await generatePatchAction({ data: { runId: detail.run.id, findingId: f.id, repo: f.codeLocations?.[0]?.repo } })
+      await refresh()
+      toast.show('Verified patch generated', { icon: 'check', sub: f.title })
+    } catch (e) {
+      toast.show(e instanceof Error ? e.message : 'Kovo Hunter could not generate a verified patch.', { tone: 'error' })
+    } finally {
+      setPatching(null)
+    }
   }
 
   usePaletteCommands([
@@ -263,8 +276,8 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
         const rk = rs?.spec && typeof rs.spec === 'object' ? REPLAY[String((rs.spec as Record<string, unknown>).kind)] : undefined
         const rt = retests.get(f.id)?.[0]
         const queued = activeRetest.some(o => o.includes(f.id))
-        const canRetest = f.status === 'confirmed' && !!(f.replaySpecId || rs)
-        const canPatch = (f.status === 'confirmed' || f.status === 'static_verified') && (f.codeLocations?.length ?? 0) > 0
+        const canRetest = canVerifyFix(f)
+        const canPatch = canGeneratePatch(f)
         const live = model.findingById.has(f.id)
         const rowBorder = isOpen ? 'border-b border-transparent' : 'border-b border-line'
         return <Fragment key={f.id}>

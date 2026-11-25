@@ -5,14 +5,14 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { BoardPane, useBoardSeen } from './coordinator.tsx'
 import { RunDataProvider, useRun } from './data.tsx'
-import { DecisionsProvider, useDecisions } from './decisions.tsx'
+import { DecisionsProvider } from './decisions.tsx'
 import { fmtN, fmtUsd, RUN_SUBMODE_PARAMS } from './format.ts'
 import { RunHeader } from './header.tsx'
 import { Icon } from './icons.tsx'
 import { KeyboardProvider, useShortcuts } from './keyboard.tsx'
 import { VIEWS } from './meta.ts'
 import type { ViewId } from './meta.ts'
-import type { Detail } from './model.ts'
+import type { Detail, RunEvent } from './model.ts'
 import { useReducedMotion } from './motion.tsx'
 import { NavProvider, selKey, useNav } from './nav.tsx'
 import type { Sel } from './nav.tsx'
@@ -22,7 +22,7 @@ import { PaletteProvider, usePalette } from './palette.tsx'
 import { Rail } from './rail.tsx'
 import { useTheme } from './theme.ts'
 import { ToastProvider, useToast } from './toast.tsx'
-import { cn, runBtn, RW } from './tw.ts'
+import { cn, runBtn } from './tw.ts'
 import { ScopeOverlay } from './views/consent.tsx'
 import { CHAT_FIRST_VIEWS, INSPECTORS, VIEW_COMPONENTS } from './views/index.tsx'
 
@@ -104,21 +104,29 @@ const PANE_KEY = 'kovo-rw-pane'
 const PANE_MIN = 320
 const PANE_MAX = 640
 
+/** Hide the right-hand Coordinator / Board pane until after scope approval. */
+export function isBoardHiddenBeforeApproval(phase: string): boolean {
+  return phase === 'consent' || phase === 'review'
+}
+
 function Workspace() {
+  const { detail } = useRun()
   const nav = useNav()
   const overlays = useOverlays()
   const [paneW, setPaneW] = useState<number | null>(null)
   const [resizing, setResizing] = useState(false)
   const paneRef = useRef<HTMLElement>(null)
+  const hideBoardBeforeApproval = isBoardHiddenBeforeApproval(detail.run.phase)
   useEffect(() => {
     const saved = Number(localStorage.getItem(PANE_KEY))
     if (saved >= PANE_MIN && saved <= PANE_MAX) setPaneW(saved)
   }, [])
-  useGlobalShortcuts()
+  useGlobalShortcuts(hideBoardBeforeApproval)
   useBoardSeen()
   const View = VIEW_COMPONENTS[nav.view]
   const rm = useReducedMotion()
-  const cols = nav.paneCollapsed
+  const paneHidden = hideBoardBeforeApproval || nav.paneCollapsed
+  const cols = paneHidden
     ? 'grid-cols-[232px_minmax(0,1fr)_0px]'
     : 'grid-cols-[232px_minmax(0,1fr)_var(--pane-w,404px)] max-[1180px]:[--pane-w:360px]'
   return <div
@@ -127,7 +135,7 @@ function Workspace() {
       cols,
       !resizing && !rm && 'transition-[grid-template-columns] duration-[var(--d2)] ease-kovo',
     )}
-    style={paneW && !nav.paneCollapsed ? { ['--pane-w' as string]: paneW + 'px' } : undefined}
+    style={paneW && !paneHidden ? { ['--pane-w' as string]: paneW + 'px' } : undefined}
   >
     <Rail />
     <main className="relative flex min-h-0 min-w-0 flex-col bg-panel" aria-label="Run">
@@ -135,7 +143,7 @@ function Workspace() {
       <RunBanners />
       <div key={nav.view} className="relative flex min-h-0 flex-1 flex-col" id="vh"><View /></div>
     </main>
-    <aside
+    {!hideBoardBeforeApproval && <aside
       ref={paneRef}
       className={cn(
         'relative flex min-h-0 min-w-0 flex-col border-l border-line bg-panel transition-opacity duration-[var(--d2)] ease-kovo motion-reduce:transition-none',
@@ -146,7 +154,7 @@ function Workspace() {
     >
       {!nav.paneCollapsed && <Resizer paneRef={paneRef} onResize={setPaneW} onDraggingChange={setResizing} />}
       <div id="paneInner" className="flex min-h-0 flex-1 flex-col"><PaneContent /></div>
-    </aside>
+    </aside>}
     {overlays.scopeOpen && <ScopeOverlay />}
   </div>
 }
@@ -202,33 +210,78 @@ function PaneContent() {
   </div>
 }
 
-/** Budget-paused, model-missing, reconnecting: one-line banners under the run line. */
+/** Return the most recent unresolved `persona.auth_failed` or `persona.refresh_failed` event, if any. */
+export function latestAuthIssue(events: readonly RunEvent[]): RunEvent | null {
+  const byKey = new Map<string, RunEvent>()
+  let lastAuthOkId = -1
+  for (const ev of events) {
+    if (ev.kind === 'persona.authenticated') {
+      const key = typeof ev.detail?.handle === 'string' && ev.detail.handle
+        ? ev.detail.handle
+        : typeof ev.detail?.personaId === 'string' && ev.detail.personaId
+          ? ev.detail.personaId
+          : '*'
+      byKey.set(key, ev)
+      if (ev.id > lastAuthOkId) lastAuthOkId = ev.id
+    } else if (ev.kind === 'persona.auth_failed' || ev.kind === 'persona.refresh_failed') {
+      const key = typeof ev.detail?.handle === 'string' && ev.detail.handle
+        ? ev.detail.handle
+        : typeof ev.detail?.personaId === 'string' && ev.detail.personaId
+          ? ev.detail.personaId
+          : '*'
+      byKey.set(key, ev)
+    }
+  }
+  let latest: RunEvent | null = null
+  for (const [key, ev] of byKey.entries()) {
+    if (ev.kind !== 'persona.auth_failed' && ev.kind !== 'persona.refresh_failed') continue
+    if (key === '*' && lastAuthOkId > ev.id) continue
+    if (!latest || ev.id > latest.id) latest = ev
+  }
+  return latest
+}
+
+function openHeaderBudgetPopover() {
+  if (typeof document === 'undefined') return
+  if (document.querySelector('[role="dialog"][aria-label="Budget and rate limit"]')) return
+  const trigger = document.querySelector<HTMLButtonElement>('header [data-rl-btn][title^="Budget "]')
+  trigger?.click()
+}
+
+/** Budget-paused, auth-issue, model-missing, reconnecting: crisp one-line banners under the run line. */
 function RunBanners() {
-  const { detail, model, connection, send, pending } = useRun()
+  const { detail, model, events, connection } = useRun()
   const r = detail.run
-  const [usd, setUsd] = useState(() => Math.min(500, Math.max(r.budgetUsd + 10, Math.ceil(r.spentUsd + 10))))
-  const [reqs, setReqs] = useState(0)
+  const authIssue = latestAuthIssue(events)
   return <>
-    {r.status === 'budget_paused' && <form
+    {r.status === 'budget_paused' && <div
       className="flex min-h-10 flex-none items-center gap-2.5 border-b border-line bg-warn-soft py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted shadow-[inset_0_-1px_0_var(--warn-line)]"
+      role="status"
       aria-label="Budget paused"
-      onSubmit={e => {
-        e.preventDefault()
-        void send({ action: 'raise_budget', budgetUsd: usd, budgetRequests: reqs, resume: true }).catch(() => {})
-      }}
+      data-testid="budget-paused-banner"
     >
       <Icon name="budget" className="text-warn" />
-      <span className="min-w-0 flex-1"><b className="font-medium text-fg">Paused at the budget ceiling.</b> Spent {fmtUsd(r.spentUsd)} of {fmtUsd(r.budgetUsd)} and {fmtN(r.spentRequests)} of {r.budgetRequests ? fmtN(r.budgetRequests) : 'uncapped'} requests. A partial report is saved; raise the limits to resume without repeating work.</span>
-      <label className="flex flex-none items-center gap-1.5 text-[12px] text-fg-subtle">
-        USD
-        <input className={cn(RW.fieldInput, 'num h-[26px] w-[86px]')} type="number" min={0.1} max={500} step="any" required value={usd} onChange={e => setUsd(Number(e.target.value))} aria-label="New USD budget" />
-      </label>
-      <label className="flex flex-none items-center gap-1.5 text-[12px] text-fg-subtle">
-        Requests
-        <input className={cn(RW.fieldInput, 'num h-[26px] w-[86px]')} type="number" min={0} step={1} required value={reqs} onChange={e => setReqs(Number(e.target.value))} aria-label="New request cap (0 = uncapped)" title="0 = uncapped" />
-      </label>
-      <button type="submit" className={runBtn({ variant: 'primary' })} disabled={pending > 0}>Raise and resume</button>
-    </form>}
+      <span className="min-w-0 flex-1 truncate">
+        <b className="font-medium text-fg">Paused at the budget ceiling.</b> Spent {fmtUsd(r.spentUsd)} of {fmtUsd(r.budgetUsd)} and {fmtN(r.spentRequests)} of {r.budgetRequests ? fmtN(r.budgetRequests) : 'uncapped'} requests. A partial report is saved.
+      </span>
+      <button type="button" data-rl-btn="" className={runBtn({ variant: 'primary' })} onClick={openHeaderBudgetPopover}>
+        <Icon name="budget" />Raise budget
+      </button>
+    </div>}
+    {authIssue && <div
+      className="flex min-h-10 flex-none items-center gap-2.5 border-b border-line bg-warn-soft py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted shadow-[inset_0_-1px_0_var(--warn-line)]"
+      role="status"
+      aria-label="Auth issue"
+      data-testid="auth-issue-banner"
+    >
+      <Icon name="lock" className="text-warn" />
+      <span className="min-w-0 flex-1 truncate" title={authIssue.message}>
+        <b className="font-medium text-fg">Auth issue.</b> {authIssue.message}
+      </span>
+      <Link className={runBtn()} to="/projects/$projectId" params={{ projectId: detail.project.id }} search={{ tab: 'personas' }}>
+        Manage test accounts<Icon name="arrowR" />
+      </Link>
+    </div>}
     {model.needsModel && <div className="flex min-h-10 flex-none items-center gap-2.5 border-b border-line bg-warn-soft py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted shadow-[inset_0_-1px_0_var(--warn-line)]" role="status">
       <Icon name="alert" className="text-warn" />
       <span className="min-w-0 flex-1"><b className="font-medium text-fg">Connect a model to continue.</b> No enabled model profile; settings bring you back here.</span>
@@ -242,13 +295,12 @@ function RunBanners() {
 }
 
 /** Global keyboard model: ⌘K, ?, g+letter, 1–8, [ ], ⇧T, C, Esc stack, Z / ⌘Z undo. */
-function useGlobalShortcuts() {
+function useGlobalShortcuts(hideBoardBeforeApproval: boolean) {
   const nav = useNav()
   const pal = usePalette()
   const { runs, detail } = useRun()
   const { toggle } = useTheme()
   const toast = useToast()
-  const q = useDecisions()
   const switchBy = (d: number) => {
     const ids = runs.map(r => r.id)
     if (ids.length < 2) return
@@ -256,15 +308,15 @@ function useGlobalShortcuts() {
     i = (i + ids.length) % ids.length
     nav.switchRun(ids[i])
   }
-  const undo = () => { if (!toast.undoLast() && !q.undoLastLocal()) toast.show('Nothing to undo') }
+  const undo = () => { if (!toast.undoLast()) toast.show('Nothing to undo') }
   useShortcuts([
     { key: 'mod+k', allowInInput: true, run: () => (pal.isOpen ? pal.close() : pal.open()) },
     { key: '?', run: () => pal.openHelp() },
     { key: 'T', run: toggle },
     ...VIEWS.map((v, i) => ({ key: ['g ' + v.key, String(i + 1)], run: () => nav.setView(v.id) })),
     { key: '[', run: () => switchBy(-1) },
-    { key: ']', run: () => nav.togglePane() },
-    { key: 'c', run: () => nav.openChat(null) },
+    { key: ']', run: () => { if (hideBoardBeforeApproval) return false; nav.togglePane() } },
+    { key: 'c', run: () => { if (hideBoardBeforeApproval) return false; nav.openChat(null) } },
     { key: 'mod+z', run: undo },
     { key: 'z', run: undo },
     { key: 'Escape', run: () => {

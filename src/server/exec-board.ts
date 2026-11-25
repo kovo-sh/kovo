@@ -1,3 +1,4 @@
+import { and, eq } from 'drizzle-orm'
 import {
   parseBoardMentions,
   specialistHandleByProfile,
@@ -11,6 +12,7 @@ import {
 import { buildBoardDelta, type WarmSpecialistController } from './agent-session.ts'
 import { computeDynamicStepBudget, hardChainStepsCeiling } from './exec-dispatch.ts'
 import type { NamedSecret } from './redact.ts'
+import { messages as messagesTable } from './schema.ts'
 import type { Assignment, BoardMessageRow, ChainStep, Run, Store } from './store.ts'
 
 export interface ExecBoardHost {
@@ -75,11 +77,11 @@ export class ExecBoardManager {
     return !['all', 'system', 'operator', 'coordinator', 'verifier', 'broker', 'canary'].includes(handle)
   }
 
-  /** Plain text (or @coordinator) goes to the legacy coordinator thread; @specialist routes to that peer. */
+  /** Plain text (or @coordinator / @all) goes to the coordinator thread; @specialist routes to that peer. */
   shouldCoordinatorAnswer(content: string): boolean {
     const mentions = parseBoardMentions(content)
     const peers = mentions.filter(handle => this.isPeerBoardHandle(handle))
-    return peers.length === 0 || mentions.includes('coordinator')
+    return peers.length === 0 || mentions.includes('coordinator') || mentions.includes('all')
   }
 
   private boardBaseHandle(handle: string): string {
@@ -352,7 +354,26 @@ export class ExecBoardManager {
     }
   }
 
-  /** Operator composer: plain text is handled by the legacy coordinator thread; @handle wakes that peer. */
+  /** Mirror operator `@coordinator` / `@all` board posts to the coordinator thread if not already present. */
+  private mirrorOperatorBoardToCoordinatorThread(run: Run, message: BoardMessageRow): void {
+    try {
+      const existing = this.storage.db.select().from(messagesTable).where(and(
+        eq(messagesTable.runId, run.id),
+        eq(messagesTable.threadId, run.coordinatorId),
+        eq(messagesTable.role, 'operator'),
+      )).all()
+      const alreadyMirrored = existing.some(item =>
+        item.content === message.body && Math.abs(item.createdAt - message.createdAt) <= 60_000)
+      if (alreadyMirrored) return
+      this.storage.message(run.id, run.coordinatorId, 'operator', message.body)
+      this.storage.event(run.id, 'coordinator.message', 'Coordinator message received.')
+      this.host.scheduleWake()
+    } catch {
+      // Mirroring is best-effort; never fail the board router.
+    }
+  }
+
+  /** Operator composer: @coordinator/@all mirror to the coordinator thread; @handle wakes that peer. */
   routeOperatorBoardMessages(run: Run): void {
     this.trackedBoardRuns.add(run.id)
     const cursor = this.routedOperatorBoardSeq.get(run.id) ?? 0
@@ -362,8 +383,17 @@ export class ExecBoardManager {
     if (!msgs.length) return
     this.resetBoardHops(run)
     for (const message of msgs) {
-      const targets = message.mentions.filter(handle => handle !== 'all' && this.isPeerBoardHandle(handle))
+      const mentionsAll = message.mentions.includes('all')
+      const mentionsCoordinator = message.mentions.includes('coordinator')
+      const targets = mentionsAll
+        ? this.storage.listBoardMembers(run.id)
+            .filter(member => member.state !== 'retired' && this.isPeerBoardHandle(member.handle))
+            .map(member => member.handle)
+        : message.mentions.filter(handle => handle !== 'all' && this.isPeerBoardHandle(handle))
       for (const target of targets) this.wakeBoardMember(run, target, message)
+      if (mentionsCoordinator || mentionsAll) {
+        this.mirrorOperatorBoardToCoordinatorThread(run, message)
+      }
     }
     this.routedOperatorBoardSeq.set(run.id, msgs[msgs.length - 1].seq)
   }

@@ -1,34 +1,32 @@
 // Finding inspector (owned by Agent Q). Opened from Findings, and by every
 // cross-link to a finding (Surface, Workflow, Exchanges, palette…).
-import { useEffect, useMemo, useState } from 'react'
+import { useState } from 'react'
 import type { ReactNode } from 'react'
 
+import { generatePatchAction } from '../../../actions.ts'
+import { callerCompatibilityLabels, dynamicRetestLabels, patchStatusLabels } from '../../../report-summary.ts'
 import { useRun, useRunModel } from '../data.tsx'
-import { ACTIONS, useDecisions } from '../decisions.tsx'
-import type { DecisionAct } from '../decisions.tsx'
 import { Disclosure, EmptyState, LinkRow, Props, Section, Tag } from '../display.tsx'
-import { cap, fmtDate, fmtTimeS, host, plural } from '../format.ts'
+import { cap, fmtDate, host, plural } from '../format.ts'
 import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
-import type { IconName } from '../icons.tsx'
 import { covCat, normFStatus, prettyCat, SEV_LABEL, stLabel } from '../meta.ts'
 import type { FindingRow } from '../model.ts'
 import { useLinks } from '../nav.tsx'
-import { ExchangeLink, PaneBody, PaneFooter, PaneHeader } from '../pane.tsx'
+import { ExchangeLink, PaneBody, PaneHeader } from '../pane.tsx'
 import type { InspectorProps } from '../pane.tsx'
 import { useToast } from '../toast.tsx'
 import { cn, runBtn, RW } from '../tw.ts'
 import { CodeLocations, CopyCurlButton, FoundBy, OnSurface } from './queue-read.tsx'
 
-/** finding id → the queue item key that carries it (bundles map every member). */
-export function useFindingQueueKey() {
-  const model = useRunModel()
-  const map = useMemo(() => {
-    const m = new Map<string, string>()
-    for (const it of model.queueItem.values()) if (it.kind === 'finding') for (const f of it.list) m.set(f.id, it.key)
-    return m
-  }, [model])
-  return (id: string) => map.get(id) ?? null
+/** Unified Verify Fix gate across FindingInspector and ReportView: server requires `replaySpecId`. */
+export function canVerifyFix(f: Pick<FindingRow, 'status' | 'replaySpecId'>): boolean {
+  return normFStatus(f.status) === 'confirmed' && Boolean(f.replaySpecId)
+}
+
+/** Unified Generate Verified Patch gate across FindingInspector and ReportView. */
+export function canGeneratePatch(f: Pick<FindingRow, 'status' | 'codeLocations'>): boolean {
+  return (f.status === 'confirmed' || f.status === 'static_verified') && (f.codeLocations?.length ?? 0) > 0
 }
 
 const TIER_L: Record<string, string> = { runtime_confirmed: 'Runtime confirmed', static_verified: 'Statically verified', baseline_confirmed: 'Baseline confirmed' }
@@ -37,30 +35,53 @@ const RETEST_ST: Record<string, string> = { reproduced: 'failed', fixed: 'confir
 
 const text = (v: unknown) => v == null ? '' : typeof v === 'string' ? v : JSON.stringify(v)
 
-/** Primary action row inside Beat 3 ("How to fix & verify"): Copy as cURL + Verify fix + retest history. */
+/** Primary action row inside Beat 3 ("How to fix & verify"): Copy as cURL + immediate Verify Fix + Generate verified patch + retest & patch history. */
 function FixVerifyActions({ f, primaryExchangeId }: { f: FindingRow; primaryExchangeId?: string }) {
-  const { detail, send, pending } = useRun()
+  const { detail, send, pending, refresh } = useRun()
   const toast = useToast()
-  const [asked, setAsked] = useState(false)
+  const [verifying, setVerifying] = useState(false)
+  const [patching, setPatching] = useState(false)
   const replay = detail.replaySpecs.find(r => (f.replaySpecId && r.id === f.replaySpecId) || r.findingId === f.id)
   const retests = detail.retestRuns.filter(r => r.findingId === f.id).slice().sort((a, b) => b.createdAt - a.createdAt)
+  const patches = (detail.patchProposals ?? []).filter(p => p.findingId === f.id)
   const active = detail.assignments.some(a => a.phase === 'retest' && (a.status === 'queued' || a.status === 'running') && (a.stepId === f.id || a.objective.includes(f.id) || (replay && a.objective.includes(replay.id))))
-  const can = normFStatus(f.status) === 'confirmed' && Boolean(f.replaySpecId || replay)
-  useEffect(() => { if (active) setAsked(false) }, [active])
-  if (!primaryExchangeId && !can && !retests.length) return null
-  const run = () => {
-    setAsked(true)
-    toast.undoable({
-      message: 'Verify fix queued', sub: 'Replays the check against the live origin when this closes', icon: 'replay',
-      undo: () => setAsked(false),
-      commit: async () => { try { await send({ action: 'retest_finding', findingId: f.id }) } catch (e) { setAsked(false); throw e } },
-    })
+  const canRetest = canVerifyFix(f)
+  const canPatch = canGeneratePatch(f)
+  if (!primaryExchangeId && !canRetest && !canPatch && !retests.length && !patches.length) return null
+
+  const runVerifyFix = async () => {
+    setVerifying(true)
+    try {
+      await send({ action: 'retest_finding', findingId: f.id })
+      toast.show('Verify Fix queued', { icon: 'replay', sub: f.title })
+    } catch {
+      // Error toast is already surfaced by `send`.
+    } finally {
+      setVerifying(false)
+    }
   }
+
+  const runGeneratePatch = async () => {
+    setPatching(true)
+    try {
+      await generatePatchAction({ data: { runId: detail.run.id, findingId: f.id, repo: f.codeLocations?.[0]?.repo } })
+      await refresh()
+      toast.show('Verified patch generated', { icon: 'check', sub: f.title })
+    } catch (e) {
+      toast.show(e instanceof Error ? e.message : 'Kovo Hunter could not generate a verified patch.', { tone: 'error' })
+    } finally {
+      setPatching(false)
+    }
+  }
+
   return <>
-    {(primaryExchangeId || can) && <div className="mb-2.5 mt-2 flex flex-wrap items-center gap-2">
+    {(primaryExchangeId || canRetest || canPatch) && <div className="mb-2.5 mt-2 flex flex-wrap items-center gap-2">
       <CopyCurlButton exchangeId={primaryExchangeId} />
-      {can && <button type="button" className={runBtn()} disabled={active || asked || pending > 0} onClick={run} title="Re-run automated replay after shipping a fix">
-        <Icon name="replay" />{active ? 'Verifying fix…' : asked ? 'Queued' : 'Verify fix'}
+      {canRetest && <button type="button" className={runBtn()} disabled={active || verifying || pending > 0} onClick={() => void runVerifyFix()} title="Re-run automated replay after shipping a fix">
+        <Icon name="replay" />{active || verifying ? 'Verifying fix…' : 'Verify Fix'}
+      </button>}
+      {canPatch && <button type="button" className={runBtn()} disabled={patching} onClick={() => void runGeneratePatch()} title="Generate and verify a code patch for this finding">
+        <Icon name="edit" />{patching ? 'Generating patch…' : 'Generate verified patch'}
       </button>}
     </div>}
     {retests.length > 0 && <div className="divide-y divide-dashed divide-line">
@@ -73,20 +94,23 @@ function FixVerifyActions({ f, primaryExchangeId }: { f: FindingRow; primaryExch
         </div>
       </div>)}
     </div>}
+    {patches.length > 0 && <div className="mt-2 divide-y divide-dashed divide-line">
+      {patches.map(p => <div key={p.id} className="py-2 text-[12px] leading-[18px] text-fg-muted">
+        <div className="mb-1 flex flex-wrap items-center gap-1.5">
+          <Tag tone={p.status === 'withheld' || p.status === 'rejected' ? 'warn' : undefined}>{patchStatusLabels[p.status]}</Tag>
+          <Tag>{callerCompatibilityLabels[p.callerCompatibility]}</Tag>
+          <Tag>{dynamicRetestLabels[p.dynamicRetestVerdict]}</Tag>
+        </div>
+        {p.reviewNotes && <p className="m-0 mb-1 text-[12px] text-fg-muted">{p.reviewNotes}</p>}
+        {p.status === 'approved' && p.diff.trim() && <pre className={cn(RW.pre, 'max-h-[240px]')}>{p.diff}</pre>}
+      </div>)}
+    </div>}
   </>
 }
-
-const TRIAGE_BTNS: [DecisionAct, string, IconName][] = [
-  ['accept', 'Accept', 'check'],
-  ['dismiss', 'Dismiss', 'archive'],
-  ['fp', 'False positive', 'slash'],
-]
 
 export function FindingInspector({ sel }: InspectorProps) {
   const model = useRunModel()
   const links = useLinks()
-  const q = useDecisions()
-  const keyOf = useFindingQueueKey()
   const f = model.findingById.get(sel.id)
   if (!f) {
     return <>
@@ -103,13 +127,11 @@ export function FindingInspector({ sel }: InspectorProps) {
   const primaryExchangeId = exIds[0] ?? (model.exchangesByOrigin.get(f.origin)?.find(e => e.pathAndQuery === '/' && e.method === 'GET') ?? model.exchangesByOrigin.get(f.origin)?.[0])?.id
   const evs = f.evidenceIds.map(id => model.evidenceById.get(id)).filter(Boolean)
   const workers = model.findingWorkers.get(f.id) ?? []
-  const qkey = keyOf(f.id)
-  const dec = qkey ? q.get(qkey) : undefined
   const superseded = f.supersededByFindingId ? model.findingById.get(f.supersededByFindingId) : undefined
   const obs = f.check?.observed
   const codeLocs = f.codeLocations ?? []
   const diff = replay?.lastVerificationDiff as unknown
-  const canTriage = Boolean(qkey && !dec && (st === 'pending' || st === 'inconclusive') && q.sectionOf(qkey) !== 'done')
+  const hasPatches = (model.detail.patchProposals ?? []).some(p => p.findingId === f.id)
 
   const hasTechnicalDetails = Boolean(
     f.verification || replay || diff != null || f.counterevidence
@@ -127,10 +149,6 @@ export function FindingInspector({ sel }: InspectorProps) {
     <PaneHeader title="Finding" sub={<span title={`Finding ${f.id}`}>{SEV_LABEL[f.severity] ?? f.severity} · {host(f.origin)}</span>} />
     <div className="flex min-h-0 flex-1 flex-col">
       <PaneBody><div className={cn(RW.detail, 'pb-6')}>
-        {dec && <div className={bannerCls}><Icon name={ACTIONS[dec.act].icon} />
-          <span>{ACTIONS[dec.act].label} · {fmtTimeS(dec.at)} · Saved locally in this browser</span>
-          <button type="button" className={cn(runBtn({ variant: 'ghost' }), 'ml-auto')} onClick={() => q.reopen(qkey!)}><Icon name="undo" />Move back</button>
-        </div>}
         {superseded && <div className={bannerCls}><Icon name="alert" /><span>Superseded by a newer finding.</span>
           <button type="button" className={cn(runBtn({ variant: 'ghost' }), 'ml-auto')} onClick={() => links.finding(superseded.id)}>Open<Icon name="arrowR" /></button></div>}
         <div className="mb-2.5 flex flex-wrap gap-1.5">
@@ -144,7 +162,6 @@ export function FindingInspector({ sel }: InspectorProps) {
           ...(f.cwe ? [['Weakness', <span className="font-mono text-[12px]">{f.cwe}</span>] as [string, ReactNode]] : []),
           ...(f.verificationTier ? [['Verified', TIER_L[f.verificationTier] ?? cap(f.verificationTier)] as [string, ReactNode]] : []),
           ...(spans.length > 1 ? [['Spans', <span className="rw-wrap break-all whitespace-normal font-mono text-[11.5px]">{spans.map(host).join(', ')}</span>] as [string, ReactNode]] : []),
-          ...(qkey && (dec || q.sectionOf(qkey) !== 'done') ? [['Queue', <span>{dec ? ACTIONS[dec.act].label : 'Open for review'}</span>, () => links.queueItem(qkey)] as [string, ReactNode, () => void]] : []),
         ]} />
 
         {(f.reason || (f.check && (f.check.expected || obs !== undefined))) && <Section title="What happened">
@@ -167,7 +184,7 @@ export function FindingInspector({ sel }: InspectorProps) {
           <p>{f.impact}</p>
         </Section>}
 
-        {(f.remediation || f.recheck || codeLocs.length > 0 || primaryExchangeId || replay) && <Section title="How to fix & verify">
+        {(f.remediation || f.recheck || codeLocs.length > 0 || primaryExchangeId || canVerifyFix(f) || canGeneratePatch(f) || hasPatches) && <Section title="How to fix & verify">
           {f.remediation && <p>{f.remediation}</p>}
           {f.recheck && <p><b className="font-medium text-fg">Recheck.</b> {f.recheck}</p>}
           <CodeLocations codeLocs={codeLocs} />
@@ -201,19 +218,6 @@ export function FindingInspector({ sel }: InspectorProps) {
           </Section>}
         </Disclosure>}
       </div></PaneBody>
-      {canTriage && <PaneFooter>
-        {TRIAGE_BTNS.map(([act, label, ico], idx) => <button
-          key={act}
-          type="button"
-          className={runBtn({ variant: idx === 0 ? 'default' : 'ghost' })}
-          title="Saved locally in this browser"
-          onClick={() => q.decide(qkey!, act, { sub: 'Saved locally in this browser' })}
-        >
-          <Icon name={ico} />{label}
-        </button>)}
-        <span className="flex-1" />
-        <span className="text-[11.5px] text-fg-subtle">Local triage</span>
-      </PaneFooter>}
     </div>
   </>
 }

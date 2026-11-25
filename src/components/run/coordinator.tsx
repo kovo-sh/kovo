@@ -23,6 +23,7 @@ import { StatusGlyph } from './glyphs.tsx'
 import { Icon } from './icons.tsx'
 import { useShortcuts } from './keyboard.tsx'
 import { PHASE_LABEL, runStatusLabel, stLabel } from './meta.ts'
+import { isApprovalExpired } from './model.ts'
 import type { Approval, Detail, Message } from './model.ts'
 import { useLinks, useNav } from './nav.tsx'
 import { useToast } from './toast.tsx'
@@ -107,13 +108,36 @@ function useApprovalDecide() {
   }
 }
 
-/** One approval row: method · host/path, then ✓ / ✕ (or the decision with Undo). */
-function ApprovalRow({ a, inset = false }: { a: Approval; inset?: boolean }) {
+/** Handles that never wake from operator `@mentions` and are hidden from Board autocomplete. */
+export const NON_WAKEABLE_BOARD_HANDLES = new Set(['broker', 'canary', 'verifier'])
+
+/** Build mention autocomplete candidates excluding non-wakeable system handles. */
+export function buildMentionHandles(members: readonly Pick<BoardMember, 'handle' | 'state'>[]): string[] {
+  return [...new Set([
+    ...canonicalBoardHandles,
+    ...members.filter(m => m.state !== 'retired').map(m => m.handle),
+    'all',
+  ])].filter(h => !NON_WAKEABLE_BOARD_HANDLES.has(h))
+}
+
+/** Decide whether an operator board submission should go to the coordinator thread (`message`) or peer board (`board_post`). */
+export function composerCommandForText(content: string, rawText: string) {
+  const mentions = parseBoardMentions(rawText)
+  const targetsCoordinator = mentions.length === 0 || mentions.includes('coordinator') || mentions.includes('all')
+  if (targetsCoordinator) {
+    return { action: 'message' as const, message: content }
+  }
+  return { action: 'board_post' as const, body: content.slice(0, maxBoardBodyLength), mentions }
+}
+
+/** One approval row: method · host/path, then ✓ / ✕ (or the decision with Undo / Expired). */
+function ApprovalRow({ a, inset = false, now }: { a: Approval; inset?: boolean; now: number }) {
   const q = useDecisions()
   const links = useLinks()
   const decide = useApprovalDecide()
   const d = q.get('ap:' + a.id)
-  const done = Boolean(d || a.status !== 'pending')
+  const expired = isApprovalExpired(a, now)
+  const done = Boolean(d || a.status !== 'pending' || expired)
   return <div
     className={cn(
       'flex h-[34px] items-center gap-2 border-t border-line first:border-t-0 text-[12px] transition-[opacity,background-color] duration-[var(--d1)] hover:bg-hover',
@@ -134,22 +158,24 @@ function ApprovalRow({ a, inset = false }: { a: Approval; inset?: boolean }) {
         <Icon name={ACTIONS[d.act].icon} />{ACTIONS[d.act].label}{d.state === 'pending' ? ' · sending' : ''}
       </span>
       {d.state !== 'sent' && <button type="button" className={runIconBtn({ size: 'sm' })} title="Undo" aria-label="Undo" onClick={() => q.reopen('ap:' + a.id)}><Icon name="undo" /></button>}
-    </> : a.status !== 'pending'
-      ? <span className="flex flex-none items-center gap-[5px] text-[11.5px] text-fg-subtle"><StatusGlyph status={a.status} />{cap(a.status)}</span>
-      : <span className="flex flex-none gap-0.5">
-        <button type="button" className={runIconBtn({ size: 'sm', tone: 'danger' })} title={`Deny ${a.method} ${host(a.origin)}${a.pathAndQuery}`} aria-label="Deny" onClick={() => decide(a.id, 'deny')}><Icon name="x" /></button>
-        <button type="button" className={runIconBtn({ size: 'sm', tone: 'ok' })} title={`Approve ${a.method} ${host(a.origin)}${a.pathAndQuery}`} aria-label="Approve" onClick={() => decide(a.id, 'approve')}><Icon name="check" /></button>
-      </span>}
+    </> : expired
+      ? <span className="flex flex-none items-center gap-[5px] text-[11.5px] text-fg-subtle"><StatusGlyph status="expired" />Expired</span>
+      : a.status !== 'pending'
+        ? <span className="flex flex-none items-center gap-[5px] text-[11.5px] text-fg-subtle"><StatusGlyph status={a.status} />{cap(a.status)}</span>
+        : <span className="flex flex-none gap-0.5">
+          <button type="button" className={runIconBtn({ size: 'sm', tone: 'danger' })} title={`Deny ${a.method} ${host(a.origin)}${a.pathAndQuery}`} aria-label="Deny" onClick={() => decide(a.id, 'deny')}><Icon name="x" /></button>
+          <button type="button" className={runIconBtn({ size: 'sm', tone: 'ok' })} title={`Approve ${a.method} ${host(a.origin)}${a.pathAndQuery}`} aria-label="Approve" onClick={() => decide(a.id, 'approve')}><Icon name="check" /></button>
+        </span>}
   </div>
 }
 
-function ApprovalsCard() {
+function ApprovalsCard({ now }: { now: number }) {
   const model = useRunModel()
   const q = useDecisions()
   const nav = useNav()
   const pending = model.detail.approvals.filter(a => a.status === 'pending').sort((a, b) => a.createdAt - b.createdAt)
   if (!pending.length) return null
-  const open = pending.filter(a => !q.get('ap:' + a.id))
+  const open = pending.filter(a => !q.get('ap:' + a.id) && !isApprovalExpired(a, now))
   const settled = (id: string) => q.get('ap:' + id)?.state === 'sent'
   const shown = pending.slice().sort((a, b) => Number(settled(a.id)) - Number(settled(b.id))).slice(0, 3)
   return <div className="relative z-[2] flex-none border-b border-line bg-panel" data-testid="board-approvals" aria-label="Pending state-change approvals">
@@ -171,7 +197,7 @@ function ApprovalsCard() {
         </button>
       </div>
       <div>
-        {shown.map(a => <ApprovalRow key={a.id} a={a} />)}
+        {shown.map(a => <ApprovalRow key={a.id} a={a} now={now} />)}
         {pending.length > 3 && <div className="flex h-[34px] items-center justify-center border-t border-line pl-4 pr-2.5 text-[12px] text-fg-subtle">
           <button type="button" className={runBtn({ variant: 'link', size: 'none' })} onClick={() => nav.setView('queue')}>+{pending.length - 3} more in the queue</button>
         </div>}
@@ -292,15 +318,6 @@ function RefDetail({ kind, id }: { kind: RefKind; id: string }) {
   return <div className="mt-1.5 rounded-[7px] bg-sunk px-2.5 py-2 text-[12px] leading-[18px] shadow-[inset_0_0_0_1px_var(--line)] [overflow-wrap:anywhere]" data-testid="board-ref-detail">{body}</div>
 }
 
-function InlineApproval({ a }: { a: Approval }) {
-  return <div className="mt-1.5 border-y border-line" data-testid="board-approval-inline">
-    <div className="flex items-center gap-1.5 pb-0.5 pt-1.5 text-[11.5px] font-medium text-warn" title="State-changing request requiring operator approval">
-      <Icon name="shield" /><span>Approval request</span><span className="font-normal text-fg-subtle">· {cap(a.status)}</span>
-    </div>
-    <ApprovalRow a={a} inset />
-  </div>
-}
-
 function Avatar({ role, children }: { role: 'op' | 'co' | ''; children: ReactNode }) {
   return <span className={cn(
     'flex size-[22px] items-center justify-center rounded-full text-[10.5px] font-semibold',
@@ -326,7 +343,6 @@ function BoardPost({ m, filter, setFilter }: { m: BoardMessage; filter: Filter; 
   const model = useRunModel()
   const [open, setOpen] = useState<{ kind: RefKind; id: string } | null>(null)
   const op = m.authorRole === 'operator'
-  const approval = m.refApprovalId ? model.approvalById.get(m.refApprovalId) : undefined
   const mentions = m.mentions.filter(h => h !== 'coordinator' || !op)
   const chip = (kind: RefKind, id: string, label: string, tip: string) => {
     const on = open?.kind === kind && open.id === id
@@ -367,40 +383,14 @@ function BoardPost({ m, filter, setFilter }: { m: BoardMessage; filter: Filter; 
       </div>}
       {refs.length > 0 && <div className="mt-[5px] flex flex-wrap gap-1" aria-label="Evidence references">{refs.map(([k, id]) => chip(k, id, refLabel(k, id), `${cap(k)} · ID ${id}`))}</div>}
       {open && <RefDetail kind={open.kind} id={open.id} />}
-      {approval && <InlineApproval a={approval} />}
     </div>
   </div>
 }
 
-const APPROVAL_RE = /^Tier 3 approval required:\s*(\w+)\s+(\S+)/
-
 /** A coordinator-thread message (coordinator / system replies, worker reports, pre-board operator messages). */
 function ThreadMessage({ m }: { m: Message }) {
   const model = useRunModel()
-  const q = useDecisions()
   const links = useLinks()
-  const am = m.role === 'kovo' ? m.content.match(APPROVAL_RE) : null
-  if (am) {
-    const ap = model.detail.approvals.find(a => a.origin + a.pathAndQuery === am[2] || (a.method === am[1] && am[2].startsWith(a.origin)))
-    const d = ap ? q.get('ap:' + ap.id) : undefined
-    const st = d ? (d.act === 'approve' ? 'confirmed' : 'dismissed') : ap && ap.status !== 'pending' ? (ap.status === 'approved' ? 'confirmed' : 'dismissed') : 'paused'
-    return <div className="grid grid-cols-[22px_minmax(0,1fr)] gap-2.5" data-source="thread" data-role={m.role}>
-      <span className="flex size-[22px] items-center justify-center"><StatusGlyph status={st} /></span>
-      <div className="min-w-0">
-        <div className="flex items-baseline gap-2 text-[12.5px] font-normal leading-[18px] text-fg-muted">
-          <span>Approval requested</span>
-          <span className="num text-[11.5px] text-fg-subtle">{fmtTime(m.createdAt)}</span>
-          {(d || (ap && ap.status !== 'pending')) && <span className="text-[11.5px] text-fg-subtle">· {(d ? ACTIONS[d.act].label : ap!.status).toLowerCase()}</span>}
-        </div>
-        <div
-          className={cn('mt-0.5 truncate whitespace-nowrap font-mono text-[11.5px] leading-[19px] text-fg-subtle', ap && 'cursor-pointer hover:text-fg')}
-          onClick={ap ? () => links.queueItem('ap:' + ap.id) : undefined}
-        >
-          {am[1]} {host(am[2])}
-        </div>
-      </div>
-    </div>
-  }
   const who: [string, 'op' | 'co' | '', string] = m.role === 'operator'
     ? ['You', 'op', 'Y']
     : m.role === 'coordinator'
@@ -436,14 +426,25 @@ export function BoardPane() {
   const [filter, setFilter] = useState<Filter>('all')
   const [workerMsgs, setWorkerMsgs] = useState(false)
   const [draft, setDraft] = useState('')
+  const [editingGoal, setEditingGoal] = useState(false)
+  const [goalDraft, setGoalDraft] = useState(r.goal)
   const [outbox, setOutbox] = useState<{ id: string; content: string; at: number; ctx?: string }[]>([])
   const [mention, setMention] = useState<{ query: string; start: number } | null>(null)
   const [hi, setHi] = useState(0)
+  const [now, setNow] = useState(() => Date.now())
   const scroller = useRef<HTMLDivElement>(null)
   const composer = useRef<HTMLTextAreaElement>(null)
   const board = detail.boardMessages
   const latestSeq = board.reduce((n, m) => Math.max(n, m.seq), 0)
   useEffect(() => { markSeen(r.id, latestSeq) }, [r.id, latestSeq])
+  useEffect(() => { setGoalDraft(r.goal) }, [r.goal])
+  const hasPendingApprovals = detail.approvals.some(a => a.status === 'pending')
+  useEffect(() => {
+    if (!hasPendingApprovals) return
+    setNow(Date.now())
+    const id = window.setInterval(() => setNow(Date.now()), 15_000)
+    return () => window.clearInterval(id)
+  }, [hasPendingApprovals])
 
   const members = useMemo(() => {
     const list = detail.boardMembers.slice()
@@ -457,13 +458,14 @@ export function BoardPane() {
     const order = new Map<string, number>(canonicalBoardHandles.map((h, i) => [h, i]))
     return list.sort((a, b) => (order.get(a.handle) ?? 99) - (order.get(b.handle) ?? 99) || a.handle.localeCompare(b.handle))
   }, [detail.boardMembers, r])
-  const handles = useMemo(() => [...new Set([...canonicalBoardHandles, ...members.filter(m => m.state !== 'retired').map(m => m.handle), 'all'])], [members])
+  const handles = useMemo(() => buildMentionHandles(members), [members])
   const options = mention ? handles.filter(h => h.startsWith(mention.query)).slice(0, 10) : []
 
   const boardStart = board.length ? Math.min(...board.map(m => m.createdAt)) : Infinity
   const items = useMemo(() => {
     const thread: Message[] = (workerMsgs ? model.coordinatorMessages.concat(model.workerMessages) : model.coordinatorMessages)
       .filter(m => !(m.role === 'operator' && m.createdAt >= boardStart - 1000))
+      .filter(m => !(m.role === 'kovo' && m.content.startsWith('Tier 3 approval required:')))
     const showThread = (m: Message) => filter === 'all' || (filter === 'coordinator' && m.role === 'coordinator')
     const out: ({ t: number; s: number; board: BoardMessage } | { t: number; s: number; thread: Message })[] = [
       ...board.filter(m => matches(m, filter)).map(m => ({ t: m.createdAt, s: m.seq, board: m })),
@@ -485,7 +487,7 @@ export function BoardPane() {
   useEffect(() => { if (nav.chat) composer.current?.focus() }, [nav.chat, nav.chatContext])
   useEffect(() => { setHi(0) }, [mention?.query])
 
-  const openApprovals = detail.approvals.filter(a => a.status === 'pending' && !q.get('ap:' + a.id))
+  const openApprovals = detail.approvals.filter(a => a.status === 'pending' && !q.get('ap:' + a.id) && !isApprovalExpired(a, now))
   const ctx = nav.chatContext
 
   const updateDraft = (value: string) => {
@@ -513,19 +515,24 @@ export function BoardPane() {
     const text = draft.trim()
     if (!text) return
     const content = ctx ? `[About: ${ctx.label}]\n${text}` : text
-    const mentions = parseBoardMentions(text)
     const id = crypto.randomUUID()
     setOutbox(o => [...o, { id, content, at: Date.now(), ctx: ctx?.label }])
     setDraft('')
     setMention(null)
-    const command = mentions.length
-      ? { action: 'board_post' as const, body: content.slice(0, maxBoardBodyLength), mentions }
-      : { action: 'message' as const, message: content }
+    const command = composerCommandForText(content, text)
     send(command).catch(() => {
       setOutbox(o => o.filter(m => m.id !== id))
       setDraft(text)
       toast.show('Message not sent', { tone: 'error', sub: 'Your draft is back in the composer.' })
     })
+  }
+  const saveGoal = () => {
+    const next = goalDraft.trim()
+    if (!next || next === r.goal) { setEditingGoal(false); return }
+    void send({ action: 'revise', goal: next }).then(() => {
+      setEditingGoal(false)
+      toast.show('Goal updated', { icon: 'check' })
+    }, () => {})
   }
 
   useShortcuts([
@@ -533,8 +540,7 @@ export function BoardPane() {
     { key: 'Escape', allowInInput: true, when: () => document.activeElement === composer.current && !draft.trim() && nav.chat, run: () => { composer.current?.blur(); nav.closeChat() } },
   ], { priority: 20 })
 
-  const placeholder = ctx ? 'Ask about this item…'
-    : r.status === 'waiting' ? 'Refine the goal before consenting…' : 'Message the coordinator · @ directs a specialist'
+  const placeholder = ctx ? 'Ask about this item…' : 'Message the coordinator · @ directs a specialist'
 
   let lastDay = ''
   const daySep = (t: number) => {
@@ -560,7 +566,7 @@ export function BoardPane() {
           aria-pressed="true"
           title="Swarm board and coordinator thread"
         >
-          Board<span className="num text-[12px] font-normal text-fg-subtle">{plural(board.length + model.coordinatorMessages.length, 'message')}</span>
+          Board<span className="num text-[12px] font-normal text-fg-subtle">{plural(items.length, 'message')}</span>
         </button>
         {nav.sel && <button
           type="button"
@@ -577,7 +583,7 @@ export function BoardPane() {
         <span>{runStatusLabel(r.status)}</span>
       </span>
     </div>
-    <ApprovalsCard />
+    <ApprovalsCard now={now} />
     <div className="flex flex-none items-center gap-1 border-b border-line py-1.5 pl-3 pr-2.5" role="group" aria-label="Board filters">
       <div className="inline-flex min-w-0 items-center gap-0.5">
         {FILTERS.map(([k, l]) => {
@@ -649,70 +655,101 @@ export function BoardPane() {
       </div>
     </div>
     <div className="relative flex-none border-t border-line px-3 pb-3 pt-2.5" data-testid="board-composer">
-      {mention && options.length > 0 && <div className="absolute bottom-[calc(100%-4px)] left-3 right-3 z-20 max-h-60 overflow-auto rounded-card bg-raise p-1 shadow-popover" role="listbox" aria-label="Mention roster">
-        {options.map((h, i) => <button
-          key={h}
-          type="button"
-          role="option"
-          aria-selected={i === hi}
-          className={cn(
-            'flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-[7px] border-0 px-2.5 text-left font-sans text-[13px] font-normal shadow-none',
-            i === hi ? 'bg-press text-fg hover:bg-press' : 'bg-transparent text-fg-muted hover:bg-hover hover:text-fg',
-          )}
-          onMouseDown={e => { e.preventDefault(); pick(h) }}
-          onMouseMove={() => setHi(i)}
-        >
-          <span className="min-w-0 flex-1 truncate text-fg">@{h}</span>
-          <span className="max-w-[200px] truncate whitespace-nowrap text-[11.5px] text-fg-subtle">{specialistProfileByHandle[h] ?? (h === 'all' ? 'broadcast' : 'system')}</span>
-        </button>)}
-      </div>}
-      <div className="rounded-lg bg-raise px-2.5 pb-1.5 pt-2 shadow-hairline transition-shadow duration-[var(--d1)] focus-within:shadow-[0_0_0_1px_var(--accent-line),0_0_0_3px_var(--accent-soft)]">
-        {ctx && <span className="mb-1.5 inline-flex h-5 max-w-full items-center gap-1.5 rounded-[5px] bg-sunk pl-[7px] pr-1 text-[11.5px] text-fg-muted shadow-[inset_0_0_0_1px_var(--line-2)]">
-          <span className="min-w-0 truncate">{ctx.label}</span>
-          <button
+      {r.status === 'waiting' ? (
+        editingGoal ? (
+          <div className="rounded-lg bg-raise p-2.5 shadow-hairline" data-testid="board-goal-editor">
+            <div className="mb-1.5 flex items-center justify-between text-[11.5px] font-medium text-fg-muted">
+              <span>Edit run goal</span>
+              <span className="font-normal text-fg-subtle">Revision {r.goalRevision}</span>
+            </div>
+            <textarea
+              className="w-full resize-none rounded-control border border-line bg-panel px-2 py-1.5 text-[12.5px] leading-[18px] text-fg outline-none focus:border-accent-line"
+              rows={3}
+              maxLength={8000}
+              aria-label="Edit goal"
+              value={goalDraft}
+              onChange={e => setGoalDraft(e.target.value)}
+              autoFocus
+            />
+            <div className="mt-2 flex items-center justify-end gap-1.5">
+              <button type="button" className={runBtn({ variant: 'ghost', size: 'sm' })} onClick={() => { setGoalDraft(r.goal); setEditingGoal(false) }}>Cancel</button>
+              <button type="button" className={runBtn({ variant: 'primary', size: 'sm' })} disabled={inFlight > 0 || !goalDraft.trim() || goalDraft.trim() === r.goal} onClick={saveGoal}>Save goal</button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 rounded-lg bg-sunk px-2.5 py-2 text-[12px] text-fg-subtle shadow-[inset_0_0_0_1px_var(--line)]" data-testid="board-waiting-hint">
+            <span className="min-w-0 flex-1 leading-[17px]">Board is read-only until you approve scope and start the run.</span>
+            <button type="button" className={runBtn({ size: 'sm' })} onClick={() => { setGoalDraft(r.goal); setEditingGoal(true) }}>
+              <Icon name="edit" />Edit goal
+            </button>
+          </div>
+        )
+      ) : <>
+        {mention && options.length > 0 && <div className="absolute bottom-[calc(100%-4px)] left-3 right-3 z-20 max-h-60 overflow-auto rounded-card bg-raise p-1 shadow-popover" role="listbox" aria-label="Mention roster">
+          {options.map((h, i) => <button
+            key={h}
             type="button"
-            className="inline-flex h-auto cursor-pointer items-center border-0 bg-transparent p-0 text-fg-subtle shadow-none hover:bg-transparent hover:text-fg"
-            title="Remove context"
-            aria-label="Remove context"
-            onClick={() => nav.openChat(null)}
+            role="option"
+            aria-selected={i === hi}
+            className={cn(
+              'flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-[7px] border-0 px-2.5 text-left font-sans text-[13px] font-normal shadow-none',
+              i === hi ? 'bg-press text-fg hover:bg-press' : 'bg-transparent text-fg-muted hover:bg-hover hover:text-fg',
+            )}
+            onMouseDown={e => { e.preventDefault(); pick(h) }}
+            onMouseMove={() => setHi(i)}
           >
-            <Icon name="close" size={12} />
-          </button>
-        </span>}
-        <textarea
-          ref={composer}
-          className="h-[38px]! w-full resize-none! rounded-none! border-0! bg-transparent! p-0! text-[12.5px] leading-[19px] text-fg shadow-none! outline-none! placeholder:text-fg-subtle focus:shadow-none!"
-          value={draft}
-          rows={2}
-          maxLength={8000}
-          aria-label="Message board"
-          placeholder={placeholder}
-          onChange={e => updateDraft(e.target.value)}
-          onKeyDown={e => {
-            if (mention && options.length) {
-              if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); e.stopPropagation(); setHi(i => (i + (e.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length); return }
-              if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); e.stopPropagation(); pick(options[hi] ?? options[0]); return }
-              if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setMention(null); return }
-            }
-            if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.nativeEvent.isComposing) { e.preventDefault(); e.stopPropagation(); submit() }
-          }}
-        />
-        <div className="flex items-center gap-2 text-[11.5px] text-fg-subtle">
-          <span>{model.needsModel || !detail.hasModel ? 'Replies wait for a connected model' : '@ directs a specialist'}</span>
-          <span className="flex-1" />
-          <Kbd>↵</Kbd>
-          <button
-            type="button"
-            className={cn(runIconBtn({ size: 'xs' }), 'text-fg-muted')}
-            title="Send (↵ · ⇧↵ for a new line)"
-            aria-label="Send message"
-            disabled={!draft.trim()}
-            onClick={submit}
-          >
-            <Icon name="arrowUp" />
-          </button>
+            <span className="min-w-0 flex-1 truncate text-fg">@{h}</span>
+            <span className="max-w-[200px] truncate whitespace-nowrap text-[11.5px] text-fg-subtle">{specialistProfileByHandle[h] ?? (h === 'all' ? 'broadcast' : 'coordinator')}</span>
+          </button>)}
+        </div>}
+        <div className="rounded-lg bg-raise px-2.5 pb-1.5 pt-2 shadow-hairline transition-shadow duration-[var(--d1)] focus-within:shadow-[0_0_0_1px_var(--accent-line),0_0_0_3px_var(--accent-soft)]">
+          {ctx && <span className="mb-1.5 inline-flex h-5 max-w-full items-center gap-1.5 rounded-[5px] bg-sunk pl-[7px] pr-1 text-[11.5px] text-fg-muted shadow-[inset_0_0_0_1px_var(--line-2)]">
+            <span className="min-w-0 truncate">{ctx.label}</span>
+            <button
+              type="button"
+              className="inline-flex h-auto cursor-pointer items-center border-0 bg-transparent p-0 text-fg-subtle shadow-none hover:bg-transparent hover:text-fg"
+              title="Remove context"
+              aria-label="Remove context"
+              onClick={() => nav.openChat(null)}
+            >
+              <Icon name="close" size={12} />
+            </button>
+          </span>}
+          <textarea
+            ref={composer}
+            className="h-[38px]! w-full resize-none! rounded-none! border-0! bg-transparent! p-0! text-[12.5px] leading-[19px] text-fg shadow-none! outline-none! placeholder:text-fg-subtle focus:shadow-none!"
+            value={draft}
+            rows={2}
+            maxLength={8000}
+            aria-label="Message board"
+            placeholder={placeholder}
+            onChange={e => updateDraft(e.target.value)}
+            onKeyDown={e => {
+              if (mention && options.length) {
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); e.stopPropagation(); setHi(i => (i + (e.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length); return }
+                if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); e.stopPropagation(); pick(options[hi] ?? options[0]); return }
+                if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setMention(null); return }
+              }
+              if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.nativeEvent.isComposing) { e.preventDefault(); e.stopPropagation(); submit() }
+            }}
+          />
+          <div className="flex items-center gap-2 text-[11.5px] text-fg-subtle">
+            <span>{model.needsModel || !detail.hasModel ? 'Replies wait for a connected model' : '@ directs a specialist'}</span>
+            <span className="flex-1" />
+            <Kbd>↵</Kbd>
+            <button
+              type="button"
+              className={cn(runIconBtn({ size: 'xs' }), 'text-fg-muted')}
+              title="Send (↵ · ⇧↵ for a new line)"
+              aria-label="Send message"
+              disabled={!draft.trim()}
+              onClick={submit}
+            >
+              <Icon name="arrowUp" />
+            </button>
+          </div>
         </div>
-      </div>
+      </>}
     </div>
   </div>
 }
