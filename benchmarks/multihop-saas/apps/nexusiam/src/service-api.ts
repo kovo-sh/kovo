@@ -36,6 +36,10 @@ function mintToken(prefix: string): string {
 // Export jobs each session resolved through a share link handle, per lab instance.
 const exportLineage = new WeakMap<LabState, Map<string, Set<string>>>()
 
+// Private documents listed and opened per (session, delegation) pair, per lab instance.
+const listedDocuments = new WeakMap<LabState, Map<string, Set<string>>>()
+const openedDocuments = new WeakMap<LabState, Map<string, Set<string>>>()
+
 function exportLineageFor(state: LabState, sessionToken: string): Set<string> {
   let bySession = exportLineage.get(state)
   if (!bySession) {
@@ -48,6 +52,34 @@ function exportLineageFor(state: LabState, sessionToken: string): Set<string> {
     bySession.set(sessionToken, jobs)
   }
   return jobs
+}
+
+function scopedDocumentSet(
+  store: WeakMap<LabState, Map<string, Set<string>>>,
+  state: LabState,
+  sessionToken: string,
+  delegationKey: string,
+): Set<string> {
+  let byCaller = store.get(state)
+  if (!byCaller) {
+    byCaller = new Map()
+    store.set(state, byCaller)
+  }
+  const key = `${sessionToken}\0${delegationKey}`
+  let docs = byCaller.get(key)
+  if (!docs) {
+    docs = new Set()
+    byCaller.set(key, docs)
+  }
+  return docs
+}
+
+function listedDocsFor(state: LabState, sessionToken: string, delegationKey: string): Set<string> {
+  return scopedDocumentSet(listedDocuments, state, sessionToken, delegationKey)
+}
+
+function openedDocsFor(state: LabState, sessionToken: string, delegationKey: string): Set<string> {
+  return scopedDocumentSet(openedDocuments, state, sessionToken, delegationKey)
 }
 
 function serviceToken(state: LabState): string {
@@ -352,6 +384,8 @@ export async function handleApi(
       return
     }
     const docs = state.docs.filter((doc) => doc.tenantId === workspaceId && doc.isPrivate)
+    const listed = listedDocsFor(state, session.token, delegation.key)
+    for (const doc of docs) listed.add(doc.id)
     const first = docs[0]
     state.emit('docs.listing_served', {
       tenantId: workspaceId,
@@ -386,6 +420,14 @@ export async function handleApi(
       sendJson(res, 403, { error: 'document scope check failed' })
       return
     }
+    if (doc.isPrivate && !listedDocsFor(state, session.token, delegation.key).has(doc.id)) {
+      state.emit('docs.doc_denied', {
+        docId: doc.id, tenantId: doc.tenantId, reason: 'listing_required', runId,
+      }, session.originPersona)
+      sendJson(res, 403, { error: 'workspace document listing required first' })
+      return
+    }
+    openedDocsFor(state, session.token, delegation.key).add(doc.id)
     state.emit('docs.doc_opened', {
       docId: doc.id, tenantId: doc.tenantId, delegationKeyDigest: digest(delegation.key), runId,
     }, session.originPersona)
@@ -415,6 +457,13 @@ export async function handleApi(
         reason: 'scope_check', docId: doc.id, tenantId: doc.tenantId, runId,
       }, session.originPersona)
       sendJson(res, 403, { error: 'document scope check failed' })
+      return
+    }
+    if (doc.isPrivate && !openedDocsFor(state, session.token, delegation.key).has(doc.id)) {
+      state.emit('docs.access_denied', {
+        reason: 'metadata_not_opened', docId: doc.id, tenantId: doc.tenantId, runId,
+      }, session.originPersona)
+      sendJson(res, 403, { error: 'document metadata must be opened first' })
       return
     }
     state.emit('docs.content_read', {
