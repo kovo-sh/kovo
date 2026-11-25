@@ -3840,7 +3840,7 @@ export class VerifyRpcServer {
         exchangeId: record.exchangeId,
         durationMs: record.durationMs,
         ...(prov?.carrierText ? { carrierText: prov.carrierText } : {}),
-        ...(prov?.evidenceRole ? { evidenceRole: prov.evidenceRole } : {}),
+        ...(prov?.evidenceRole ? { evidenceRole: prov.evidenceRole } : (record.op === 'crypto' || record.op === 'capability' ? { evidenceRole: `host_${record.op}_op` } : {})),
         step: {
           id: record.exchangeId,
           arm,
