@@ -218,10 +218,10 @@ test('renewable lifecycle hooks, X-Guardian-Run-Id tagging and fast-lab async la
     const buildId = created.json<{ buildId: string; runId: string }>().buildId
     assert.equal(created.json<{ runId: string }>().runId, lab.runId)
 
-    const immediate = await ctx.http('runner', `/builds/${buildId}`)
+    const immediate = await ctx.http('runner', `/builds/${buildId}`, { token: member })
     assert.equal(immediate.json<{ build: { status: string } }>().build.status, 'queued')
     await sleep(70)
-    const ready = await ctx.http('runner', `/builds/${buildId}`)
+    const ready = await ctx.http('runner', `/builds/${buildId}`, { token: member })
     const build = ready.json<{ build: { status: string; runId: string } }>().build
     assert.equal(build.status, 'ready')
     assert.equal(build.runId, lab.runId)
@@ -230,8 +230,8 @@ test('renewable lifecycle hooks, X-Guardian-Run-Id tagging and fast-lab async la
       method: 'POST', token: member, body: { projectId: lab.plan.ids.projectIdA, commit: 'refs/heads/release' },
     })
     const secondId = second.json<{ buildId: string }>().buildId
-    assert.equal((await ctx.http('runner', `/builds/${secondId}/cancel`, { method: 'POST' })).status, 200)
-    const afterCancel = await ctx.http('runner', `/builds/${secondId}`)
+    assert.equal((await ctx.http('runner', `/builds/${secondId}/cancel`, { method: 'POST', token: member })).status, 200)
+    const afterCancel = await ctx.http('runner', `/builds/${secondId}`, { token: member })
     assert.equal(afterCancel.json<{ build: { status: string } }>().build.status, 'cancelled')
 
     const me = await ctx.http('api', `${prefix}/me`, { token: member })

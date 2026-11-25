@@ -2,7 +2,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { readBody, parseJson, sendJson, sendEventStream, runIdOf, match, parseUrl } from './http.ts'
 import type { BuildRecord, LabState } from './shared.ts'
-import { authenticate, authorizeHeader, digest, patByToken } from './policy.ts'
+import { authenticate, authorizeHeader, canContribute, digest, hasTenantMembership, patByToken, roleOf } from './policy.ts'
 import { buildById, convergeBuild, projectById } from './state.ts'
 
 function issueBuild(
@@ -133,6 +133,15 @@ export async function handleRunner(
       sendJson(res, 400, { error: 'projectId required' })
       return
     }
+    const project = projectById(state, body.projectId)
+    if (!project || !hasTenantMembership(state, session, project.tenantId)) {
+      sendJson(res, 404, { error: 'unknown project' })
+      return
+    }
+    if (!canContribute(roleOf(state, session, project.tenantId))) {
+      sendJson(res, 403, { error: 'builds require contributor access' })
+      return
+    }
     const build = issueBuild(state, body.projectId, body.commit ?? 'HEAD', runId)
     state.emit('runner.build_requested', {
       buildId: build.id, projectId: build.projectId, tenantId: build.tenantId, runId,
@@ -143,8 +152,13 @@ export async function handleRunner(
 
   const buildGet = match(url, method, '/builds/:id')
   if (buildGet) {
+    const session = authenticate(state, req)
+    if (!session) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
     const build = buildById(state, buildGet[0]!)
-    if (!build || build.runId !== runId) {
+    if (!build || build.runId !== runId || !hasTenantMembership(state, session, build.tenantId)) {
       sendJson(res, 404, { error: 'unknown build' })
       return
     }
@@ -152,28 +166,44 @@ export async function handleRunner(
     state.emit('runner.build_polled', {
       buildId: build.id, status: build.status, projectId: build.projectId, runId: build.runId,
     })
-    sendJson(res, 200, { build })
+    // Build records never carry environment credentials over this surface.
+    const { envPreview, ...rest } = build
+    sendJson(res, 200, { build: { ...rest, envPreview: { env: envPreview.env, note: envPreview.note } } })
     return
   }
 
   const cancel = match(url, method, '/builds/:id/cancel')
   if (cancel) {
+    const session = authenticate(state, req)
+    if (!session) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
     const build = buildById(state, cancel[0]!)
-    if (!build) {
+    if (!build || !hasTenantMembership(state, session, build.tenantId)) {
       sendJson(res, 404, { error: 'unknown build' })
       return
     }
+    if (!canContribute(roleOf(state, session, build.tenantId))) {
+      sendJson(res, 403, { error: 'cancelling builds requires contributor access' })
+      return
+    }
     build.status = 'cancelled'
-    state.emit('runner.build_cancelled', { buildId: build.id, runId: build.runId })
+    state.emit('runner.build_cancelled', { buildId: build.id, runId: build.runId }, session.originPersona)
     sendJson(res, 200, { ok: true, buildId: build.id, status: build.status })
     return
   }
 
   const artifact = match(url, method, '/artifacts/:handle')
   if (artifact) {
+    const session = authenticate(state, req)
+    if (!session) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
     const handle = artifact[0]!
     const build = state.builds.find((item) => item.artifactHandle === handle)
-    if (!build) {
+    if (!build || !hasTenantMembership(state, session, build.tenantId)) {
       sendJson(res, 404, { error: 'unknown artifact' })
       return
     }
@@ -191,11 +221,30 @@ export async function handleRunner(
   }
 
   if (match(url, method, '/jobs')) {
-    sendJson(res, 200, { jobs: state.builds.map((build) => ({ id: build.id, status: build.status })) })
+    const session = authenticate(state, req)
+    if (!session) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
+    sendJson(res, 200, {
+      jobs: state.builds
+        .filter((build) => hasTenantMembership(state, session, build.tenantId))
+        .map((build) => ({ id: build.id, status: build.status })),
+    })
     return
   }
   if (match(url, method, '/audit')) {
-    sendJson(res, 200, { events: state.audit.slice(-50).map((event) => ({ kind: event.kind, ts: event.ts })) })
+    const session = authenticate(state, req)
+    if (!session) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
+    sendJson(res, 200, {
+      events: state.audit
+        .filter((event) => event.detail.tenantId === session.tenantId)
+        .slice(-50)
+        .map((event) => ({ kind: event.kind, ts: event.ts })),
+    })
     return
   }
 

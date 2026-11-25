@@ -9,6 +9,14 @@ function tokenAccepted(state: LabState, token: string): boolean {
   return safeEqualText(token, state.plan.secrets.internalBearerToken)
 }
 
+/** True only for a webhook delivery the source-control service is dispatching right now. */
+function inFlightDelivery(state: LabState, deliveryId: string): boolean {
+  if (!deliveryId) return false
+  return state.webhooks.some((webhook) =>
+    webhook.targetHost === 'registry.internal' && webhook.deliveries.length === 0 &&
+    `mh_dlv_${webhook.id}_1` === deliveryId)
+}
+
 export async function handleRegistry(
   req: IncomingMessage, res: ServerResponse, state: LabState,
 ): Promise<void> {
@@ -29,11 +37,13 @@ export async function handleRegistry(
     const body = parseJson<{ tenant?: string; projectId?: string }>(await readBody(req))
     const token = header(req, 'x-registry-token')
     if (!tokenAccepted(state, token)) {
-      if (state.profile.internalDiagnosticLeak && !state.profile.deliveryLogRedacted) {
+      const deliveryId = url.search.get('delivery') ?? ''
+      if (state.profile.internalDiagnosticLeak && !state.profile.deliveryLogRedacted &&
+        inFlightDelivery(state, deliveryId)) {
         sendJson(res, 500, {
           error: 'sync rejected',
           detail: `service credential missing; expected ${state.plan.secrets.internalBearerToken}`,
-          requestId: digest(`${url.search.get('delivery') ?? ''}:${runId}`).slice(0, 12),
+          requestId: digest(`${deliveryId}:${runId}`).slice(0, 12),
         })
         return
       }
@@ -68,6 +78,12 @@ export async function handleRegistry(
       runId,
     })
     sendJson(res, 200, { tenant: tenantId, secrets: payload })
+    return
+  }
+
+  // Remaining registry surfaces are service-to-service only.
+  if (!tokenAccepted(state, header(req, 'x-registry-token'))) {
+    sendJson(res, 401, { error: 'registry credential required' })
     return
   }
 
