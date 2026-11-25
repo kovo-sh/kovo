@@ -85,7 +85,7 @@ export function ProjectGuardrailsTab({ data }: Props) {
     </div>
     <div className="pw-sheet-b">
       <p className="muted" style={{ margin: 0, fontSize: 12 }}>
-        Isolated multi-container Docker <code>--internal</code> target stack with optional persona seeding and opt-in IAST telemetry.
+        Isolated multi-container Docker <code>--internal</code> target stack with optional test account seeding and opt-in IAST telemetry.
         {!labAllowed && ' Requires a Local Lab project and server-side GUARDIAN_ALLOW_LOCAL_LAB=1.'}
       </p>
       {labNotice && <p role="status" className="notice" style={{ margin: 0 }}>{labNotice}</p>}

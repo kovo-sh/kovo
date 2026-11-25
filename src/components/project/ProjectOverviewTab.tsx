@@ -94,7 +94,7 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
       </div>
       <div>
         <h3>Auth &amp; Context</h3>
-        <div className="big num">{plural(personas.length, 'persona')} · {plural(specs.length, 'snapshot')}</div>
+        <div className="big num">{plural(personas.length, 'test account')} · {plural(specs.length, 'snapshot')}</div>
         <p>{formatGithubPatBadge(githubPatStatus)} · {plural(allowlistCount, 'write allowlist rule')}</p>
       </div>
       <div>
@@ -125,10 +125,10 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
           onClick={() => onSelectTab('personas')}
         >
           <PersonasSetupSvg ready={personas.length > 0} />
-          <span className="n">{personas.length > 0 ? `${plural(personas.length, 'persona')} ready` : 'Add Personas'}</span>
+          <span className="n">{personas.length > 0 ? `${plural(personas.length, 'test account')} ready` : 'Add Test Accounts'}</span>
           <span className="l">
             {personas.length > 0
-              ? 'Vault accounts configured for Tier 2/3 BOLA checks.'
+              ? 'Test accounts configured for Tier 2/3 BOLA checks.'
               : 'Configure User A & User B for cross-tenant authorization testing.'}
           </span>
         </button>

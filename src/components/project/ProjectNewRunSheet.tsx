@@ -70,10 +70,10 @@ const MODES: Record<ModeKey, ModePreset> = {
     rps: 5,
     concurrency: 6,
     maxTurns: 150,
-    goal: 'Verify authentication, cross-user BOLA/IDOR authorization boundaries, and business logic across approved hosts using paired personas.',
+    goal: 'Verify authentication, cross-user BOLA/IDOR authorization boundaries, and business logic across approved hosts using paired test accounts.',
     label: 'Core Pentest',
     badge: 'Recommended',
-    desc: 'Auth, BOLA & logic tests with personas.',
+    desc: 'Auth, BOLA & logic tests with test accounts.',
     badgeTone: 'accent',
   },
   tier3: {
@@ -293,7 +293,7 @@ export function ProjectNewRunSheet({
   const footerSummary = [
     capabilityTierMeta[tier].short,
     `$${budgetUsd} cap`,
-    ...(tier >= 2 ? [`${selectedPersonaIds.length} ${selectedPersonaIds.length === 1 ? 'persona' : 'personas'}`] : []),
+    ...(tier >= 2 ? [`${selectedPersonaIds.length} ${selectedPersonaIds.length === 1 ? 'test account' : 'test accounts'}`] : []),
   ].join(' · ')
 
   return (
@@ -341,7 +341,7 @@ export function ProjectNewRunSheet({
             <div className="pw-section-box">
               <div className="pw-section-box-h">
                 <span className="pw-section-label">
-                  Personas
+                  Test accounts
                   <span className="pw-tag solid num">{selectedPersonaIds.length}/{personas.length}</span>
                 </span>
                 <button type="button" className="pw-btn ghost" onClick={() => setInlinePersonaOpen(v => !v)}>
@@ -349,7 +349,7 @@ export function ProjectNewRunSheet({
                 </button>
               </div>
               {personas.length > 0 ? (
-                <div className="pw-pill-wrap" role="group" aria-label="Select personas for run">
+                <div className="pw-pill-wrap" role="group" aria-label="Select test accounts for run">
                   {personas.map(persona => {
                     const selected = selectedPersonaIds.includes(persona.id)
                     const test = personaTests[persona.id]
@@ -371,14 +371,14 @@ export function ProjectNewRunSheet({
                 </div>
               ) : (
                 <span className="muted" style={{ fontSize: 12 }}>
-                  No personas configured yet — add User A &amp; User B to test cross-user isolation.
+                  No test accounts configured yet — add User A &amp; User B to test cross-user isolation.
                 </span>
               )}
 
               {inlinePersonaOpen && (
                 <div style={{ borderTop: '1px solid var(--pw-line)', paddingTop: 10, display: 'grid', gap: 9 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-                    <strong style={{ fontSize: 12 }}>Quick-add persona</strong>
+                    <strong style={{ fontSize: 12 }}>Quick-add test account</strong>
                     <div className="pw-sec-actions">
                       <button type="button" className="pw-btn ghost" onClick={() => prefillPair('user_a')}>Preset User A</button>
                       <button type="button" className="pw-btn ghost" onClick={() => prefillPair('user_b')}>Preset User B</button>

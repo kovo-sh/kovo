@@ -367,7 +367,7 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
 
     <h2>Methodology and limitations</h2>
     <p className="rp-p">{reportEvidenceSource(detail.run.sourceMode, b.selectedChecks, b.capabilityTier)}{reportPlanLabel(b.selectedChecks) ? ' ' + reportPlanLabel(b.selectedChecks) : ''}</p>
-    <p className="rp-p">Guardian evaluated only the approved hosts, capability tier ({capabilityTierLabel(b.capabilityTier)}), personas and recorded evidence in this report. Model commentary and CVE version matches only create hypotheses; every confirmed finding requires deterministic Zero-LLM replay verification against a clean control check.</p>
+    <p className="rp-p">Kovo Hunter evaluated only the approved hosts, capability tier ({capabilityTierLabel(b.capabilityTier)}), test accounts and recorded evidence in this report. Model commentary and CVE version matches only create hypotheses; every confirmed finding requires deterministic Zero-LLM replay verification against a clean control check.</p>
     <p className="rp-p muted">Inconclusive, ruled-out, not-applicable and untested categories remain visible rather than counting as passes. This evidence-led review does not guarantee that no other vulnerability exists.</p>
   </article></div>
 }

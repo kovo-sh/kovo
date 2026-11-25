@@ -6,7 +6,7 @@ export type ProjectTabId = 'overview' | 'inventory' | 'personas' | 'sources' | '
 export const PROJECT_TABS: readonly { id: ProjectTabId; label: string }[] = [
   { id: 'overview', label: 'Overview & Runs' },
   { id: 'inventory', label: 'Inventory' },
-  { id: 'personas', label: 'Personas' },
+  { id: 'personas', label: 'Test Accounts' },
   { id: 'sources', label: 'Source & Specs' },
   { id: 'guardrails', label: 'Guardrails & Lab' },
 ]
@@ -59,10 +59,10 @@ export const MISSION_PRESETS: MissionPreset[] = [
   {
     id: 'bola-idor',
     name: 'Authenticated BOLA / IDOR',
-    tierLabel: 'Tier 2 · Multi-Persona',
+    tierLabel: 'Tier 2 · Authenticated',
     tier: 2,
     summary: 'Cross-user authorization matrix probing with User A vs User B sessions across APIs and Server Actions.',
-    goal: 'Verify tenant and user isolation across all authenticated API routes and Server Actions using paired personas. Capture control vs probe HTTP proofs for every cross-user boundary.',
+    goal: 'Verify tenant and user isolation across all authenticated API routes and Server Actions using paired test accounts. Capture control vs probe HTTP proofs for every cross-user boundary.',
     usdCap: 15,
     rps: 4,
     concurrency: 6,
@@ -73,7 +73,7 @@ export const MISSION_PRESETS: MissionPreset[] = [
     name: 'Full Grey-Box Deep Pentest',
     tierLabel: 'Tier 2 · Code + Live',
     tier: 2,
-    summary: 'Combine static repo/spec auditing with live multi-persona runtime probes and independent replay verification.',
+    summary: 'Combine static repo/spec auditing with live authenticated runtime probes and independent replay verification.',
     goal: 'Audit synced specs and source handlers alongside live authenticated endpoints. Trace Server Actions, middleware auth guards, business-logic workflows, and verify all findings via replay.',
     usdCap: 25,
     rps: 5,
