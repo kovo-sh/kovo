@@ -675,19 +675,28 @@ export function browserSessionSeam(input: {
     visits.forEach((visit, index) => {
       if (!visit) return
       const hits = visit.domSinkTraces.filter(trace => trace.containsCanary)
-      // Two non-sink execution channels the legacy verifier already accepted: the driver's canary
-      // flag, and an exact document-title match. The title is compared by equality (never
-      // containment) so a server-side reflection of the payload into `<title>` cannot satisfy it;
-      // only a handler that assigned the canary to `document.title` can.
-      const titleHit = visit.title === session.canaryToken
-      if (!hits.length && !visit.canaryCheck.triggered && !titleHit) return
+      // A sink trace proves only that a canary-bearing value reached a setter; the value itself may
+      // be inert. Likewise, the driver's generic canary flag also fires for a surviving marker
+      // attribute. Require an execution effect: the verifier-owned window flag, or a title change
+      // that was not already rendered by the server.
+      const globalFlag = visit.canaryCheck.triggered === true &&
+        visit.canaryCheck.token === session.canaryToken &&
+        visit.canaryCheck.detail === 'DOM execution canary flag observed on window.'
+      const serverRenderedTitle = (visit.exchanges ?? []).some(exchange =>
+        [...String(exchange.body ?? '').matchAll(/<title\b[^>]*>([\s\S]*?)<\/title>/gi)]
+          .some(match => match[1]!.trim() === session.canaryToken))
+      const titleHit = visit.title === session.canaryToken && !serverRenderedTitle
+      if (!globalFlag && !titleHit) return
       sinkHit = true
+      const sinks = [
+        ...new Set(hits.map(trace => `dom_xss:${trace.sink}`)),
+        ...(titleHit ? ['canary:title'] : []),
+        ...(globalFlag ? ['canary:executed'] : []),
+      ]
       traces.push({
         id: `browser-${index + 1}`,
         origin: input.origin,
-        sinks: hits.length > 0
-          ? [...new Set(hits.map(trace => `dom_xss:${trace.sink}`))]
-          : titleHit ? ['canary:title'] : ['canary:executed'],
+        sinks,
       })
     })
     return { traces, sinkHit }
@@ -1073,6 +1082,33 @@ export function recipeRetestResult(
 }
 
 /**
+ * A failed control is not evidence of a fix. It means the retest lost the entitled baseline (server
+ * failure, expired authentication, transport failure, or no host trace), so the patch gate must
+ * report `inconclusive` rather than treating the rejected probe as remediation.
+ */
+function retestControlFailureReason(execution: FloorRecipeExecution): string | null {
+  for (const step of execution.result.steps) {
+    if (step.arm !== 'control') continue
+    if (step.status === null || step.status === 0) {
+      return `Control arm "${step.role}" recorded no HTTP status (network/transport failure).`
+    }
+    if (step.status >= 500) {
+      return `Control arm "${step.role}" returned HTTP ${step.status}; the entitled baseline was not observed.`
+    }
+    // A denied-control arm is supposed to observe 401/403. A 401 on any control that must be served
+    // (entitled read, baseline, reset, benign injection control) means the test credential expired.
+    if (step.status === 401 && !/denied/i.test(step.role)) {
+      return `Control arm "${step.role}" returned HTTP 401; authentication for the entitled baseline was not valid.`
+    }
+  }
+  const missing = execution.failure?.missingRoles ?? []
+  if (missing.includes('browser_trace') || missing.includes('browser_control')) {
+    return execution.failure?.message ?? 'The retest produced no host-recorded browser control trace.'
+  }
+  return null
+}
+
+/**
  * Receipt-based retest of a persisted recipe (Cut 3 retest migration).
  *
  * Re-runs the exact `recipeId` + args the confirmation recorded, through the same broker seam, and
@@ -1081,9 +1117,8 @@ export function recipeRetestResult(
  *
  * Verdict mapping keeps the patch gate's semantics:
  *   - the receipt confirms again → `reproduced`
- *   - the receipt is rejected, or a precondition no longer holds (e.g. the vulnerable route now
- *     refuses the actor) → `fixed`
- *   - the recipe could not finish (aborted / schema error / timeout) → `inconclusive`
+ *   - a healthy control observes the vulnerable precondition disappear → `fixed`
+ *   - the control failed, lost auth/trace, or the recipe could not finish → `inconclusive`
  */
 export async function retestPersistedRecipe(input: {
   envelope: FloorRecipeEnvelope
@@ -1146,11 +1181,25 @@ export async function retestPersistedRecipe(input: {
   }
   const exchangeIds = [...execution.result.exchangeIds]
   const replay = recipeRetestResult(plan, execution, exchangeIds)
-  const verdict: RetestVerdict = execution.result.confirmed
-    ? 'reproduced'
-    : execution.failure?.code === 'recipe_error'
-      ? 'inconclusive'
+  const controlFailure = retestControlFailureReason(execution)
+  const recipeError = execution.failure?.code === 'recipe_error'
+  const verdict: RetestVerdict = controlFailure || recipeError
+    ? 'inconclusive'
+    : execution.result.confirmed
+      ? 'reproduced'
       : 'fixed'
+  if (verdict === 'inconclusive') {
+    const reason = controlFailure ?? execution.failure?.message ?? replay.outcome.reason ?? 'The persisted recipe could not complete.'
+    return {
+      verdict,
+      execution,
+      replay: {
+        ...replay,
+        verdict: 'inconclusive',
+        outcome: { ...replay.outcome, confirmed: false, controlPassed: false, reason },
+      },
+    }
+  }
   return { verdict, execution, replay }
 }
 

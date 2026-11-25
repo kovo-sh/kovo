@@ -1591,8 +1591,9 @@ function sameMutatingRequest(a: ImpactStep, b: ImpactStep): boolean {
 /**
  * Business-logic/workflow claims assert an invariant the server never modelled in HTTP evidence.
  * A self-service owner mutation of a field the caller is entitled to edit is in policy; impact
- * requires one of: a boundary differential, the same terminal transition accepted twice, a
- * persisted *protected* field change, or a declared invariant/workflow oracle event.
+ * requires a host-recorded boundary (denied peer or entitled cross-tenant read), the same terminal
+ * transition accepted twice, a persisted *protected* field change, or a declared invariant event.
+ * Declared role/resource labels alone never establish the boundary.
  */
 export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAssessment {
   const steps = input.steps
@@ -1614,22 +1615,23 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
       evidence: labels,
     }
   }
-  const probeTenant = mutatingProbe.actor.tenant ?? null
+  const probeTenants = actorTenants(mutatingProbe.actor)
   const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
   const mirrorCorroborated = resourceTenant !== null && steps.some(step =>
-    step.actor.tenant === resourceTenant &&
-    isReadMethod(step.method) &&
+    step.arm === 'control' &&
+    actorTenants(step.actor).has(resourceTenant) &&
+    stepReadsState(step) &&
     isSuccess(step.status) &&
-    sameRoute(step, mutatingProbe))
-  const crossTenantWrite = resourceTenant !== null && probeTenant !== null && resourceTenant !== probeTenant
+    relatedRoute(step, mutatingProbe))
+  const crossTenantWrite = resourceTenant !== null && probeTenants.size > 0 && !probeTenants.has(resourceTenant)
   const peerDenial = (control: ImpactStep): boolean => {
-    const tenant = control.actor.tenant ?? null
-    const unauthenticated = control.actor.handle === null && tenant === null
+    const controlTenants = actorTenants(control.actor)
+    const unauthenticated = control.actor.handle === null && controlTenants.size === 0
     // `anon=401` proves authentication, not authorization, for a cross-tenant write.
     if (unauthenticated && crossTenantWrite) return false
-    if (tenant === null || probeTenant === null) return true
-    return tenant === probeTenant ||
-      (mirrorCorroborated && resourceTenant !== null && tenant === resourceTenant && resourceTenant !== probeTenant)
+    if (controlTenants.size === 0 || probeTenants.size === 0) return true
+    return actorsShareTenant(control.actor, mutatingProbe.actor) ||
+      (mirrorCorroborated && resourceTenant !== null && controlTenants.has(resourceTenant) && !probeTenants.has(resourceTenant))
   }
   const boundaryControlDenied = steps.some(control =>
     control.arm === 'control' &&
@@ -1637,16 +1639,24 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     isDenied(control.status) &&
     sameRoute(control, mutatingProbe) &&
     steps.indexOf(control) < steps.indexOf(mutatingProbe))
-  const crossTenant = Boolean(resourceTenant && mutatingProbe.actor.tenant && resourceTenant !== mutatingProbe.actor.tenant)
-  const requiredRank = roleRank(normalizeRole(input.requiredRole) ?? null)
-  const probeRank = roleRank(mutatingProbe.actor.role)
-  const roleDifferential = requiredRank !== null && probeRank !== null && probeRank < requiredRank
-  labels.boundary = boundaryControlDenied || crossTenant || roleDifferential
+  // Declared role/resource labels are model-supplied. A cross-tenant boundary counts only when a
+  // host-recorded entitled control actually read the same resource tree in the declared tenant.
+  const crossTenantControlRead = resourceTenant !== null && probeTenants.size > 0 &&
+    !probeTenants.has(resourceTenant) && steps.some(control =>
+      control.arm === 'control' &&
+      actorTenants(control.actor).has(resourceTenant) &&
+      stepReadsState(control) &&
+      isSuccess(control.status) &&
+      control.json !== undefined &&
+      relatedRoute(control, mutatingProbe))
+  labels.boundary = boundaryControlDenied || crossTenantControlRead
   if (labels.boundary) {
     return {
       required: true,
       satisfied: true,
-      reason: 'Business-logic claim rides on a role/tenant boundary differential (the probe actor is outside the entitlement the control demonstrates).',
+      reason: boundaryControlDenied
+        ? 'Business-logic impact: a host-recorded peer control was denied on the same route before the successful mutating probe.'
+        : 'Business-logic impact: a host-recorded entitled control read the resource in another tenant before the cross-tenant mutating probe succeeded.',
       evidence: labels,
     }
   }
@@ -1754,6 +1764,7 @@ export interface BooleanDifferentialAssessment extends ImpactAssessment {
     requestShapeMismatch: boolean
     serverErrors: boolean
     echoedOnly: boolean
+    predicateContrast: boolean
     changedPaths: string[]
     echoPaths: string[]
   }
@@ -1865,6 +1876,62 @@ function paramValueFromJson(value: unknown, param: string): string | null {
   return walk(value)
 }
 
+function paramValueFromHeader(headers: Record<string, string> | null | undefined, param: string): string | null {
+  if (!headers) return null
+  const wanted = param.toLowerCase()
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === wanted) return value
+  }
+  return null
+}
+
+function decodedText(value: string): string {
+  try { return decodeURIComponent(value) } catch { return value }
+}
+
+function injectedParamValue(arm: BooleanDifferentialArm, param: string): string | null {
+  return paramValueFromQuery(arm.pathAndQuery, param) ??
+    paramValueFromJson(arm.requestJson, param) ??
+    paramValueFromHeader(arm.requestHeaders, param)
+}
+
+/**
+ * Evaluate only literal boolean predicates. A stable response difference between arbitrary values
+ * ("red" vs "blue", short vs long) is not a SQL boolean oracle. Recognising a narrow literal subset
+ * fails closed on expressions whose truth cannot be established without executing database code.
+ */
+function booleanPredicateTruth(raw: string | null): boolean | null {
+  if (raw === null) return null
+  let text = decodedText(raw)
+  text = text.replace(/--[^\r\n]*/g, ' ').replace(/\/\*[\s\S]*?\*\//g, ' ').trim()
+  if (/^(?:true|1)$/i.test(text)) return true
+  if (/^(?:false|0)$/i.test(text)) return false
+
+  const numeric = [...text.matchAll(/\b(\d+)\s*(==|=|!=|<>)\s*(\d+)(?:\s*([+-])\s*(\d+))?\b/gi)]
+  if (numeric.length === 1) {
+    const match = numeric[0]!
+    const left = Number(match[1])
+    let right = Number(match[3])
+    if (match[4] && match[5]) right += match[4] === '-' ? -Number(match[5]) : Number(match[5])
+    const equal = left === right
+    return match[2] === '!=' || match[2] === '<>' ? !equal : equal
+  }
+
+  const strings = [...text.matchAll(/(['"])([^'"]*)\1\s*(==|=|!=|<>)\s*(['"])([^'"]*)\4/g)]
+  if (strings.length === 1) {
+    const match = strings[0]!
+    const equal = match[2] === match[5]
+    return match[3] === '!=' || match[3] === '<>' ? !equal : equal
+  }
+
+  const literal = /\b(?:AND|OR)\s+(NOT\s+)?(TRUE|FALSE)\b/i.exec(text)
+  if (literal) {
+    const truth = literal[2]!.toLowerCase() === 'true'
+    return literal[1] ? !truth : truth
+  }
+  return null
+}
+
 function maskJsonParam(value: unknown, param: string): unknown {
   const wanted = param.split('.').pop() ?? param
   const walk = (node: unknown): unknown => {
@@ -1946,10 +2013,8 @@ function differentialPaths(control: BooleanDifferentialArm, probe: BooleanDiffer
   // so the union must include them; otherwise a signature-only difference is never compared.
   const paths = new Set([...controlRaw.keys(), ...probeRaw.keys(), ...controlSig.keys(), ...probeSig.keys()])
   const injected = [
-    paramValueFromQuery(probe.pathAndQuery, param) ?? '',
-    paramValueFromQuery(control.pathAndQuery, param) ?? '',
-    paramValueFromJson(probe.requestJson, param) ?? '',
-    paramValueFromJson(control.requestJson, param) ?? '',
+    injectedParamValue(probe, param) ?? '',
+    injectedParamValue(control, param) ?? '',
   ].filter(Boolean)
   const changed: string[] = []
   const echoed: string[] = []
@@ -1984,6 +2049,7 @@ function signatureMapKey(map: Map<string, string>): string {
  *  - no arm returned 5xx;
  *  - the control and probe structural signatures are each stable across rounds;
  *  - the control-vs-probe structural difference is non-empty and identical in every round;
+ *  - both injected values are recognisable, opposite literal boolean predicates;
  *  - the difference survives token stripping (echo/nonce-only changes are rejected).
  */
 export function assessBooleanDifferential(input: {
@@ -1999,6 +2065,7 @@ export function assessBooleanDifferential(input: {
     requestShapeMismatch: false,
     serverErrors: false,
     echoedOnly: false,
+    predicateContrast: false,
     changedPaths: [] as string[],
     echoPaths: [] as string[],
   }
@@ -2011,6 +2078,14 @@ export function assessBooleanDifferential(input: {
 
   if (!param) return reject('A boolean differential must name the injected parameter.')
   if (input.rounds.length < 2) return reject('A boolean differential needs at least two paired control/probe rounds.')
+  for (const round of input.rounds) {
+    const controlTruth = booleanPredicateTruth(injectedParamValue(round.control, param))
+    const probeTruth = booleanPredicateTruth(injectedParamValue(round.probe, param))
+    if (controlTruth === null || probeTruth === null || controlTruth === probeTruth) {
+      return reject('The control and probe arms must carry opposite, recognisable boolean predicates; an arbitrary two-value content/length difference is not a boolean oracle.')
+    }
+  }
+  evidence.predicateContrast = true
   for (const round of input.rounds) {
     if ((round.control.status ?? 0) >= 500 || (round.probe.status ?? 0) >= 500) {
       evidence.serverErrors = true
@@ -2052,7 +2127,7 @@ export function assessBooleanDifferential(input: {
   return {
     required: true,
     satisfied: true,
-    reason: `A paired control/probe differential reproduced across ${input.rounds.length} rounds: structural change in ${evidence.changedPaths.slice(0, 6).join(', ')} after token stripping, with a stable control baseline and no 5xx.`,
+    reason: `Opposite boolean predicates reproduced across ${input.rounds.length} rounds: structural change in ${evidence.changedPaths.slice(0, 6).join(', ')} after token stripping, with a stable true/false baseline and no 5xx.`,
     evidence,
   }
 }
@@ -2111,13 +2186,51 @@ function responseText(step: ImpactStep): string {
   return `${step.body ?? ''}\n${json}`.slice(0, 32 * 1024)
 }
 
+/** Request values that a generic validation/error response might reflect verbatim. */
+function requestEchoTokens(step: ImpactStep): string[] {
+  const tokens = new Set<string>()
+  const add = (value: string | null | undefined): void => {
+    if (!value || value.length < 4) return
+    tokens.add(value)
+    tokens.add(decodedText(value))
+  }
+  if (step.pathAndQuery) {
+    add(step.pathAndQuery)
+    try {
+      for (const value of new URL(step.pathAndQuery, 'http://kovo.invalid').searchParams.values()) add(value)
+    } catch { /* a path-carried probe is covered by the full target token */ }
+  }
+  if (step.requestJson !== undefined) {
+    for (const value of flattenJson(step.requestJson).values()) add(value)
+  }
+  for (const value of Object.values(step.requestHeaders ?? {})) add(value)
+  return [...tokens].sort((a, b) => b.length - a.length)
+}
+
+/**
+ * Remove echoed probe material before looking for engine/parser errors. A generic 400/500 that
+ * quotes the attacker's input has not produced a semantic database/template/shell oracle.
+ */
+function fingerprintResponseText(step: ImpactStep): string {
+  let text = responseText(step)
+  for (const token of requestEchoTokens(step)) {
+    const escapedJson = JSON.stringify(token).slice(1, -1)
+    const escapedHtml = token.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;').replaceAll("'", '&#39;')
+    for (const variant of new Set([token, decodedText(token), encodeURIComponent(token), escapedJson, escapedHtml])) {
+      if (variant.length >= 4) text = text.split(variant).join(' ')
+    }
+  }
+  return text
+}
+
 function stepText(step: ImpactStep): string {
   const request = step.requestJson === undefined ? '' : safeJson(step.requestJson)
   return `${step.method ?? ''} ${step.pathAndQuery ?? ''}\n${responseText(step)}\n${request}`.slice(0, 32 * 1024)
 }
 
 function safeJson(value: unknown): string {
-  try { return JSON.stringify(value) } catch { return '' }
+  try { return JSON.stringify(value) ?? '' } catch { return '' }
 }
 
 export interface StatusOnlyDivergence {
@@ -2177,7 +2290,7 @@ export function assessStatusOnlyDivergence(steps: readonly ImpactStep[]): Status
   }
   const controls = steps.filter(step => step.arm === 'control' || step.arm === 'setup')
   for (const probe of probes) {
-    const fingerprint = matchInjectionFingerprint(responseText(probe))
+    const fingerprint = matchInjectionFingerprint(fingerprintResponseText(probe))
     if (fingerprint) continue
     const route = routeFamily(probe.route ?? probe.pathAndQuery ?? '')
     const control = [...controls].reverse().find(step =>
@@ -2208,6 +2321,35 @@ function sameInjectionRoute(a: ImpactStep, b: ImpactStep): boolean {
   return routeFamily(a.route ?? a.pathAndQuery ?? '') === routeFamily(b.route ?? b.pathAndQuery ?? '')
 }
 
+function requestEnvelopeShape(step: ImpactStep): string {
+  let pathname = step.pathAndQuery ?? step.route ?? ''
+  let queryKeys: string[] = []
+  try {
+    const url = new URL(step.pathAndQuery ?? step.route ?? '', 'http://kovo.invalid')
+    pathname = url.pathname
+    queryKeys = [...new Set([...url.searchParams.keys()])].sort()
+  } catch { /* retain the raw target shape */ }
+  const jsonShape = (value: unknown): unknown => {
+    if (Array.isArray(value)) return { array: value.length }
+    if (!value || typeof value !== 'object') return '*'
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, child]) => [key, jsonShape(child)]))
+  }
+  return JSON.stringify({
+    method: step.method.toUpperCase(),
+    pathname,
+    queryKeys,
+    json: step.requestJson === undefined ? null : jsonShape(step.requestJson),
+    headerNames: Object.keys(step.requestHeaders ?? {}).map(name => name.toLowerCase()).sort(),
+  })
+}
+
+function booleanRequestTruth(step: ImpactStep): boolean | null {
+  const raw = `${step.pathAndQuery ?? ''}${safeJson(step.requestJson)}`
+  return booleanPredicateTruth(decodedText(raw))
+}
+
 /**
  * Injection confirmation requires a positive semantic oracle:
  *  - an engine/dialect error fingerprint present in the probe and absent from every control;
@@ -2233,9 +2375,9 @@ export function assessInjectionImpact(input: ImpactInput): ImpactAssessment {
   if (probes.length === 0) {
     return { required: true, satisfied: false, reason: 'Injection claim has no probe arm to assess.', evidence }
   }
-  const controlText = controls.map(responseText).join('\n')
+  const controlText = controls.map(fingerprintResponseText).join('\n')
   for (const probe of probes) {
-    const text = responseText(probe)
+    const text = fingerprintResponseText(probe)
     const fingerprint = matchInjectionFingerprint(text, input.injection?.family)
     if (!fingerprint) continue
     // A control that produces the same engine error is broken infrastructure, not injection.
@@ -2289,20 +2431,15 @@ export function assessInjectionImpact(input: ImpactInput): ImpactAssessment {
     const tautologyOk = isSuccess(tautology.status)
     const contradictionFails = contradiction.status !== null &&
       contradiction.status >= 400 && contradiction.status < 500
-    const sameShape = sameInjectionRoute(tautology, contradiction) &&
-      tautology.method.toUpperCase() === contradiction.method.toUpperCase()
-    // The request target is percent-encoded on the wire, so `%20AND%20` would defeat a bare word
-    // boundary. Decode before looking for the boolean operator (a failed decode leaves the raw text;
-    // the check only ever accepts a stronger match, never a weaker one).
-    const requestText = (step: ImpactStep): string => {
-      const raw = `${step.pathAndQuery ?? ''}${safeJson(step.requestJson)}`
-      try { return decodeURIComponent(raw) } catch { return raw }
-    }
-    const contrast = Boolean(
-      stepText(tautology) !== stepText(contradiction) &&
-      /\b(?:AND|OR)\b/i.test(requestText(tautology)) &&
-      /\b(?:AND|OR)\b/i.test(requestText(contradiction)),
-    )
+    const sameShape = sameInjectionRoute(benign, tautology) &&
+      sameInjectionRoute(benign, contradiction) &&
+      requestEnvelopeShape(benign) === requestEnvelopeShape(tautology) &&
+      requestEnvelopeShape(benign) === requestEnvelopeShape(contradiction)
+    // The third arm is a real confirmation only when it is the false predicate counterpart of the
+    // tautology, not merely another malformed value containing AND/OR.
+    const tautologyTruth = booleanRequestTruth(tautology)
+    const contradictionTruth = booleanRequestTruth(contradiction)
+    const contrast = tautologyTruth === true && contradictionTruth === false
     if (benignOk && tautologyOk && contradictionFails && sameShape && contrast) {
       evidence.statusBoolean = true
       return {
@@ -2645,6 +2782,46 @@ function boundarySignalOf(step: ImpactStep, successFamilies: ReadonlySet<string>
   return null
 }
 
+const boundaryNoiseKeyRe = /^(?:_|cb|nonce|ts|timestamp|time|request_?id|trace_?id|correlation_?id|cache_?buster)$/i
+const boundaryVolatileHeaders = new Set([
+  ...booleanVolatileHeaders, 'content-length', 'accept-encoding', 'connection',
+])
+
+function boundaryNoiseKey(key: string): boolean {
+  return boundaryNoiseKeyRe.test(key) || boundaryNoiseKeyRe.test(key.split('.').pop() ?? key)
+}
+
+function canonicalBoundaryJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalBoundaryJson)
+  if (!value || typeof value !== 'object') return value
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .filter(([key]) => !boundaryNoiseKey(key))
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, child]) => [key, canonicalBoundaryJson(child)]))
+}
+
+/** Meaningful request precondition only: rotating ids/timestamps/headers are not a boundary. */
+function canonicalBoundaryRequest(step: ImpactStep): string {
+  let target = step.pathAndQuery ?? step.route ?? ''
+  try {
+    const url = new URL(target, 'http://kovo.invalid')
+    const params = [...url.searchParams.entries()]
+      .filter(([key]) => !boundaryNoiseKey(key))
+      .sort(([a, av], [b, bv]) => a.localeCompare(b) || av.localeCompare(bv))
+    target = `${url.pathname}?${params.map(([key, value]) => `${key}=${value}`).join('&')}`
+  } catch { /* malformed targets remain comparable as raw preconditions */ }
+  const headers = Object.fromEntries(Object.entries(step.requestHeaders ?? {})
+    .filter(([key]) => !boundaryVolatileHeaders.has(key.toLowerCase()))
+    .sort(([a], [b]) => a.toLowerCase().localeCompare(b.toLowerCase()))
+    .map(([key, value]) => [key.toLowerCase(), value]))
+  return JSON.stringify({
+    method: step.method.toUpperCase(),
+    target,
+    json: step.requestJson === undefined ? null : canonicalBoundaryJson(step.requestJson),
+    headers,
+  })
+}
+
 /**
  * MFA/2FA bypass gate. A 2xx from an OTP endpoint is not a bypass unless:
  *   1. a control read shows the account is enrolled (`twofa_enabled`/`mfa`/`totp` claim);
@@ -2818,9 +2995,17 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
     .filter(signal => firstProbeIndex < 0 || steps.indexOf(signal.step) < firstProbeIndex)
   const probeStep = steps.find(step => step.arm === 'probe') ?? null
   const probeActor = probeStep?.actor ?? null
+  const requiredRank = roleRank(normalizeRole(input.requiredRole) ?? null)
+  // A required role on a cross-tenant object claim is an entitlement label, not a vertical
+  // escalation check. Owner denials remain valid tenant-boundary evidence in that shape.
+  const roleEscalation = boundaryClass === 'access' &&
+    (input.impactClass === 'bfla' || (requiredRank !== null && input.resourceTenant == null))
+  const probeBelowRequired = requiredRank === null ||
+    (probeActor?.role != null && roleRank(probeActor.role)! < requiredRank)
   const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
   const boundaryMirrorCorroborated = resourceTenant !== null && probeStep !== null && steps.some(step =>
-    step.actor.tenant === resourceTenant && isReadMethod(step.method) && isSuccess(step.status) && sameRoute(step, probeStep))
+    step.arm === 'control' && actorTenants(step.actor).has(resourceTenant) &&
+    stepReadsState(step) && isSuccess(step.status) && sameRoute(step, probeStep))
   // A post-mutation 404 readback (e.g. the control deletes the object, then reads it) is
   // persistence evidence, not a boundary denial; drop signals that follow a control mutation on the
   // same route.
@@ -2833,6 +3018,9 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
     return !controlMutationIndexes.some(mutatedAt => mutatedAt < at && sameRoute(steps[mutatedAt]!, entry.step))
   })
   const peerSignal = boundarySignals.find(entry => {
+    // An owner denial is not a role-escalation control: the owner is the top of the role order and
+    // may be refused for an unrelated policy/MFA/session reason while a lower role is served.
+    if (roleEscalation && entry.step.actor.role === 'owner') return false
     const tenant = entry.step.actor.tenant ?? null
     if (tenant === null || probeActor?.tenant == null) return true
     return tenant === probeActor.tenant ||
@@ -2848,19 +3036,18 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
     step.arm === 'probe' &&
     ((stepReadsState(step) && ((step.json !== undefined && step.json !== null) || (step.body?.length ?? 0) >= 8)) ||
       (stepMutatesState(step) && isSuccess(step.status)))))
-  const distinctActors = new Set(steps.map(step => step.actor.handle).filter((handle): handle is string => Boolean(handle)))
-  const roleOrTenantDifferential = steps.some(a => steps.some(b =>
-    a !== b &&
-    ((a.actor.role !== null && b.actor.role !== null && a.actor.role !== b.actor.role) ||
-      (a.actor.tenant !== null && b.actor.tenant !== null && a.actor.tenant !== b.actor.tenant))))
+  const distinctActors = new Set([...controlSteps, ...probeSteps]
+    .map(step => step.actor.handle).filter((handle): handle is string => Boolean(handle)))
+  const roleOrTenantDifferential = controlSteps.some(control => probeSteps.some(probe =>
+    (control.actor.role !== null && probe.actor.role !== null && control.actor.role !== probe.actor.role) ||
+    actorsAreCrossTenant(control.actor, probe.actor)))
   // A parameter/body precondition differential (e.g. ?id=pub vs ?id=priv) is the same kind of
-  // "the variant changed the precondition" evidence as an actor differential.
+  // "the variant changed the precondition" evidence as an actor differential. Rotating nonces,
+  // timestamps and tracing headers are transport noise, not a boundary.
   const requestDifferential = controlSteps.some(control => probeSteps.some(probe =>
-    (control.pathAndQuery ?? control.route ?? '') !== (probe.pathAndQuery ?? probe.route ?? '') ||
-    JSON.stringify(control.requestJson ?? null) !== JSON.stringify(probe.requestJson ?? null)))
+    canonicalBoundaryRequest(control) !== canonicalBoundaryRequest(probe)))
   const actorDifferential = distinctActors.size >= 2 || roleOrTenantDifferential || requestDifferential
   const strict = input.expectControlDenied === true
-  const escape = input.expectControlDenied === false
   const evidence = {
     boundaryClass,
     controlDenied,
@@ -2870,9 +3057,20 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
     arm: null as BoundaryArm,
     distinctActors: distinctActors.size,
     actorDifferential,
+    requestDifferential,
+    probeBelowRequired,
     expectControlDenied: input.expectControlDenied ?? null,
     probeSteps: probeSteps.length,
     controlSteps: controlSteps.length,
+  }
+
+  if (roleEscalation && !probeBelowRequired) {
+    return {
+      required: true, satisfied: false, boundaryClass, controlDenied, controlKind: signal?.kind ?? null, crossed,
+      arm: null,
+      reason: `Role-escalation claim dismissed: the probe actor's role does not fall below the declared required role${input.requiredRole ? ` (${input.requiredRole})` : ''}; an owner or equally privileged control cannot establish escalation.`,
+      evidence,
+    }
   }
 
   if (boundaryClass === 'auth') {
