@@ -2808,6 +2808,9 @@ type CodeAuditChainRole =
   | 'auth_session'
   | 'privileged_mutation'
   | 'async_worker'
+  | 'cache_permission'
+  | 'request_parsing'
+  | 'concurrent_settlement'
 
 interface NormalizedCodeAuditSuspect {
   fact: Fact
@@ -2870,27 +2873,42 @@ function classifyCodeAuditChainRoles(input: {
     roles.add('signing_webhook')
   }
   if (
-    /\b(?:leak(?:s|ed|ing)?|expos(?:e|es|ed|ure)|disclos(?:e|es|ed|ure)|plaintext|in[- ]?log|log\s+sink|debug\s+endpoint|diagnostic|directory\s+(?:listing|leak|expos)|enumerat(?:e|ion)|cache[- ]?key|cache\s+(?:deception|poison))\b/.test(lower)
+    /\b(?:leak(?:s|ed|ing)?|expos(?:e|es|ed|ure)|disclos(?:e|es|ed|ure)|plaintext|in[- ]?log|log\s+sink|debug\s+endpoint|diagnostic|directory(?:\s+(?:listing|leak|expos|lookup|endpoint))?|member\s+list|user\s+lookup|enumerat(?:e|ion)|cache[- ]?key|cache\s+(?:deception|poison))\b/.test(lower)
   ) {
     roles.add('info_disclosure')
   }
   if (
     sink === 'auth_config'
-    || /\b(?:session|jwt|oauth|oidc|sso|saml|invite|magic[- ]?link|impersonat|x-forwarded|forwarded[- ]?(?:role|user|identity|header)|trust[- ]?boundary|role[- ]?grant|roles\/grant|token\s+(?:mint|forg|exchange|leak|expos)|revok(?:e|ed|ation)|cookie\s+scope)\b/.test(lower)
+    || /\b(?:session|jwt|oauth|oidc|sso|saml|invite|magic[- ]?link|impersonat|x-forwarded|forwarded[- ]?(?:role|user|identity|header)|trust[- ]?boundary|role[- ]?grant|roles\/grant|identity|token\s+(?:mint|forg|exchange|leak|expos)|revok(?:e|ed|ation)|cookie\s+scope)\b/.test(lower)
   ) {
     roles.add('auth_session')
   }
   if (
     sink === 'upload_storage'
     || sink === 'db_query'
-    || /\b(?:transfer|payout|approve|self[- ]?approv|ledger|refund|credit|debit|billing|admin|roles\/grant|export|batch|delete|mutat(?:e|ion)|write|state[- ]?machine|creator\/approver|mass\s+assignment|cross[- ]?tenant|bola|bfla|idor|escalat(?:e|ion)|missing\s+authz?)\b/.test(lower)
+    || /\b(?:transfer|payout|approve|self[- ]?approv|ledger|refund|credit|debit|billing|admin|roles\/grant|export|download|batch|delete|mutat(?:e|ion)|write|state[- ]?(?:machine|change)|creator\/approver|mass\s+assignment|cross[- ]?tenant|bola|bfla|idor|escalat(?:e|ion)|missing\s+authz?)\b/.test(lower)
   ) {
     roles.add('privileged_mutation')
   }
   if (
-    /\b(?:async[- ]?worker|background\s+worker|queue|job|export|deliver|render(?:er)?|webhook|sse|stream|poll|callback)\b/.test(lower)
+    /\b(?:async[- ]?worker|background\s+worker|queue|job|export|download|deliver|render(?:er)?|webhook|sse|stream|poll|callback)\b/.test(lower)
   ) {
     roles.add('async_worker')
+  }
+  if (
+    /\b(?:cache[- ]?key|permission[- ]?cache|rbac[- ]?cache|policy[- ]?cache|tenant(?:less)?[- ]?cache|shared[- ]?cache|cache[- ]?(?:prime|priming|poison|deception|bleed)|edge[- ]?cache)\b/.test(lower)
+  ) {
+    roles.add('cache_permission')
+  }
+  if (
+    /\b(?:request[- ]?pars(?:e|er|ing)|parser[- ]?differential|smuggl(?:e|ing)|desync|path[- ]?normaliz|url[- ]?normaliz|duplicate[- ]?(?:key|param|header)|content[- ]?type\s+(?:mismatch|confusion)|parameter\s+pollution|header\s+override|multipart\s+pars|json\s+pars)\b/.test(lower)
+  ) {
+    roles.add('request_parsing')
+  }
+  if (
+    /\b(?:concurren(?:t|cy)|race(?:\s+condition|\s+burst)?|toctou|parallel\s+(?:burst|request|settlement)|double[- ]?spend|idempoten(?:cy|t)|over[- ]?credit|settlement|balance\s+conservation|quota\s+bypass|withdrawal\s+race|refund\s+race)\b/.test(lower)
+  ) {
+    roles.add('concurrent_settlement')
   }
   return roles
 }
@@ -2965,7 +2983,7 @@ function synthesizeCompositeCodeAuditChains(
   if (candidates.length < 2 || maxComposites <= 0) return []
   const composites: SynthesizedCompositeSpec[] = []
   const usedInPriorComposite = new Set<string>()
-  const emittedSignatures = new Set<string>()
+  const emittedFactSets: ReadonlySet<string>[] = []
 
   const pickCandidate = (
     predicate: (c: NormalizedCodeAuditSuspect) => boolean,
@@ -2994,9 +3012,10 @@ function synthesizeCompositeCodeAuditChains(
     hops: NormalizedCodeAuditSuspect[],
   ) => {
     if (composites.length >= maxComposites || hops.length < 2) return
-    const sig = [...hops.map(h => h.fact.id)].sort().join('|')
-    if (emittedSignatures.has(sig)) return
-    emittedSignatures.add(sig)
+    const hopIds = new Set(hops.map(h => h.fact.id))
+    // Skip duplicate or strict-subset composites whose facts are already covered by a richer chain.
+    if (emittedFactSets.some(prev => [...hopIds].every(id => prev.has(id)))) return
+    emittedFactSets.push(hopIds)
     for (const h of hops) usedInPriorComposite.add(h.fact.id)
     const host = hops[0]!.host
     composites.push({
@@ -3030,7 +3049,7 @@ function synthesizeCompositeCodeAuditChains(
     }
   }
 
-  // Pattern 2: Info-Disclosure / Cache + Auth/Invite/Session + Privileged Mutation
+  // Pattern 2a: Info-Disclosure / Directory + Auth/Invite/Session (+ optional Privileged Mutation)
   if (composites.length < maxComposites) {
     const used = new Set<string>()
     const leak = pickCandidate(c => c.roles.has('info_disclosure') && c.sinkKind !== 'auth_config', used)
@@ -3038,25 +3057,96 @@ function synthesizeCompositeCodeAuditChains(
     if (leak) used.add(leak.fact.id)
     const authPivot = pickCandidate(c => c.roles.has('auth_session') && c.sinkKind === 'auth_config', used, leak)
       ?? pickCandidate(c => c.roles.has('auth_session'), used, leak)
+    if (leak && authPivot) {
+      used.add(authPivot.fact.id)
+      const terminal = pickCandidate(c => c.roles.has('privileged_mutation'), used, authPivot)
+      const hops = terminal ? [leak, authPivot, terminal] : [leak, authPivot]
+      const label = terminal
+        ? 'Disclosure -> Auth/Session -> Privileged Mutation'
+        : 'Disclosure -> Auth/Session Pivot'
+      recordComposite('disclosure_auth_mutation', label, 'broken-access-control', hops)
+    }
+  }
+
+  // Pattern 3: Cache/Permission + Async Export/Download (+ optional terminal readback/mutation)
+  if (composites.length < maxComposites) {
+    const used = new Set<string>()
+    const cachePrime = pickCandidate(c => c.roles.has('cache_permission'), used)
+    if (cachePrime) {
+      used.add(cachePrime.fact.id)
+      const asyncStage = pickCandidate(c => c.roles.has('async_worker'), used, cachePrime)
+      if (asyncStage) {
+        used.add(asyncStage.fact.id)
+        const terminal = pickCandidate(
+          c => (c.roles.has('privileged_mutation') || c.roles.has('info_disclosure')) && c.fact.id !== asyncStage.fact.id,
+          used,
+          asyncStage,
+        )
+        const hops = terminal ? [cachePrime, asyncStage, terminal] : [cachePrime, asyncStage]
+        recordComposite(
+          'cache_permission_async_export',
+          terminal
+            ? 'Cache/Permission -> Async Export/Download -> Terminal Readback'
+            : 'Cache/Permission -> Async Export/Download Pivot',
+          'broken-access-control',
+          hops,
+        )
+      }
+    }
+  }
+
+  // Pattern 4: Request-Parsing + Concurrent Settlement (+ optional terminal conservation/mutation)
+  if (composites.length < maxComposites) {
+    const used = new Set<string>()
+    const parserStage = pickCandidate(c => c.roles.has('request_parsing'), used)
+    if (parserStage) {
+      used.add(parserStage.fact.id)
+      const concurrentStage = pickCandidate(c => c.roles.has('concurrent_settlement'), used, parserStage)
+      if (concurrentStage) {
+        used.add(concurrentStage.fact.id)
+        const terminal = pickCandidate(
+          c => (c.roles.has('privileged_mutation') || c.roles.has('async_worker')) && c.fact.id !== concurrentStage.fact.id,
+          used,
+          concurrentStage,
+        )
+        const hops = terminal ? [parserStage, concurrentStage, terminal] : [parserStage, concurrentStage]
+        recordComposite(
+          'request_parsing_concurrent_settlement',
+          terminal
+            ? 'Request-Parsing -> Concurrent Settlement -> Terminal Conservation'
+            : 'Request-Parsing -> Concurrent Settlement Pivot',
+          'business-logic',
+          hops,
+        )
+      }
+    }
+  }
+
+  // Pattern 2b (2-hop fallback): Info-Disclosure or Auth/Session -> Privileged Mutation
+  if (composites.length < maxComposites) {
+    const used = new Set<string>()
+    const leak = pickCandidate(c => c.roles.has('info_disclosure') && c.sinkKind !== 'auth_config', used)
+      ?? pickCandidate(c => c.roles.has('info_disclosure'), used)
+    if (leak) used.add(leak.fact.id)
+    const authPivot = !leak
+      ? (pickCandidate(c => c.roles.has('auth_session') && c.sinkKind === 'auth_config', used)
+        ?? pickCandidate(c => c.roles.has('auth_session'), used))
+      : undefined
     if (authPivot) used.add(authPivot.fact.id)
     const terminal = pickCandidate(c => c.roles.has('privileged_mutation'), used, authPivot ?? leak)
     const hops = [leak, authPivot, terminal].filter((h): h is NormalizedCodeAuditSuspect => Boolean(h))
     const distinctScopes = new Set(hops.map(h => h.serviceScope)).size
     const distinctSinks = new Set(hops.map(h => h.sinkKind)).size
-    const hasCrossBoundaryDiversity = Boolean(leak && (authPivot || terminal)) || distinctScopes >= 2 || distinctSinks >= 2
+    const hasCrossBoundaryDiversity = Boolean(leak && terminal) || distinctScopes >= 2 || distinctSinks >= 2
     if (hops.length >= 2 && hasCrossBoundaryDiversity) {
-      const label = leak && authPivot && terminal
-        ? 'Disclosure -> Auth/Session -> Privileged Mutation'
-        : leak && authPivot
-          ? 'Disclosure -> Auth/Session Pivot'
-          : leak && terminal
-            ? 'Disclosure -> Privileged Cross-Tenant Pivot'
-            : 'Auth/Session -> Privileged Mutation Pivot'
-      recordComposite('disclosure_auth_mutation', label, 'broken-access-control', hops)
+      const label = leak && terminal
+        ? 'Disclosure -> Privileged Cross-Tenant Pivot'
+        : 'Auth/Session -> Privileged Mutation Pivot'
+      recordComposite('disclosure_or_auth_mutation', label, 'broken-access-control', hops)
     }
   }
 
-  // Pattern 3 (Fallback): General cross-service multi-sink pivot when >=2 distinct services & sinks coexist
+  // Pattern 5 (Fallback): General cross-service multi-sink pivot when >=2 distinct services & sinks coexist
   if (composites.length < maxComposites) {
     const distinctServices = new Set(candidates.map(c => c.serviceScope))
     const distinctSinks = new Set(candidates.map(c => c.sinkKind))
@@ -3192,13 +3282,25 @@ export function convertCodeAuditSuspectsToChainSteps(
         Math.max(0, MAX_CODE_AUDIT_SIBLING_LEADS - Math.max(0, hopFactIds.length - 1)),
       )
       const siblingBlock = formatCrossServiceSiblingLeadsBlock(remainingSiblings)
-      const hopSequence = comp.hops
-        .map((h, idx) => {
-          const target = h.endpointHint || h.routeOrAction || compactSuspectCue(h.fact.summary, 44)
-          const loc = h.fileLoc || h.host
-          return `Hop ${idx + 1} (${target}, ${loc}, sink=${h.sinkKind}): ${compactSuspectCue(h.hypothesisBody, 110)}`
-        })
-        .join(' -> ')
+      const hopEntries = comp.hops.map((h, idx) => {
+        const target = h.endpointHint || h.routeOrAction || compactSuspectCue(h.fact.summary, 36)
+        const loc = h.fileLoc || h.host
+        return `Hop ${idx + 1} / Stage ${idx + 1} (${target}, ${loc}): ${compactSuspectCue(h.hypothesisBody, 48)}`
+      })
+      const compRoles = new Set(comp.hops.flatMap(h => [...h.roles]))
+      const helperHint = compRoles.has('concurrent_settlement')
+        ? 'ctx.prove_race_burst + ctx.seal_capability'
+        : compRoles.has('signing_webhook')
+          ? 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign'
+          : compRoles.has('async_worker') || compRoles.has('cache_permission')
+            ? 'ctx.seal_capability + ctx.await_async'
+            : 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign/ctx.await_async'
+      const intermediatePivotStage = comp.hops.length === 2
+        ? [`Stage 3 (pivot via ${helperHint})`]
+        : []
+      const terminalStage = 'Terminal Verification (denied control BEFORE Stage 1 -> final readback/state change -> ctx.prove_composite)'
+      const hopSequence = [...hopEntries, ...intermediatePivotStage, terminalStage].join(' -> ')
+      const stageCount = Math.min(5, Math.max(3, comp.hops.length + (comp.hops.length === 2 ? 2 : 1)))
       const dependsOnFactIds = [
         ...new Set([...hopFactIds, ...remainingSiblings.map(s => s.fact.id)]),
       ].slice(0, MAX_CODE_AUDIT_SIBLING_LEADS + 1)
@@ -3221,8 +3323,8 @@ export function convertCodeAuditSuspectsToChainSteps(
         sinkKind: comp.hops[0]!.sinkKind,
       })
       const hypothesisParts = [
-        `[chain_hops=${Math.max(3, comp.hops.length)}] Multi-service composite code-audit chain: ${hopSequence}.`,
-        'Execute end-to-end via guardian_verify from ONE starting low-privilege persona (or anonymous / freshly derived credential; never use a target-tenant persona on the probe arm): seal intermediate handles/keys with ctx.seal_capability, use ctx.hmac_sign / ctx.jwt_sign / ctx.await_async across signing/async boundaries, and confirm the full DAG via ctx.prove_composite (Mode A fresh_clean_replay) — never stop at an intermediate info-disclosure.',
+        `[chain_hops=${stageCount}] Composite workflow (${stageCount} stages): ${hopSequence}.`,
+        'Verify ALL stages in ONE guardian_verify script from ONE low-priv persona (never use a target-tenant persona on the probe arm): run clean denied control BEFORE Stage 1, seal via ctx.seal_capability, use ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst, and confirm via ctx.prove_composite (fresh_clean_replay) — never stop at an intermediate info-disclosure, job creation, cache prime, or token/link stub.',
       ]
       if (siblingBlock) hypothesisParts.push(siblingBlock)
 
@@ -3281,7 +3383,7 @@ export function convertCodeAuditSuspectsToChainSteps(
       `Auth check: ${item.authCheck}; Ownership check: ${item.ownershipCheck}; Sink: ${item.sinkKind}.`,
       item.hypothesisBody,
       promoteMultiHop
-        ? 'Verify live reachability via guardian_verify from ONE starting low-privilege persona (never use a target-tenant persona on the probe arm): seal intermediate handles/tokens/keys with ctx.seal_capability, chain across sibling services (using ctx.hmac_sign/ctx.jwt_sign/ctx.await_async as needed), and confirm the full DAG via ctx.prove_composite (Mode A fresh_clean_replay) — never stop at an intermediate info-disclosure when downstream pivots are reachable.'
+        ? 'Verify ALL stages in ONE cohesive guardian_verify script from ONE starting low-privilege persona (never use a target-tenant persona on the probe arm): run clean denied control BEFORE Stage 1, seal intermediate handles/tokens/keys with ctx.seal_capability, chain across sibling services (using ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst as needed), and confirm the full DAG via ctx.prove_composite (Mode A fresh_clean_replay) — never stop at an intermediate info-disclosure, job creation, cache prime, or token/link stub.'
         : 'Verify live reachability with negative control + differential probe (and cross-persona BOLA check if Tier >= 2) and submit a DeclarativeReplaySpec if confirmed.',
     ]
     if (siblingBlock) hypothesisParts.push(siblingBlock)
