@@ -13,6 +13,7 @@ import { CovSwatch, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import type { IconName } from '../icons.tsx'
 import { CHECK_HEADERS, COV_L, covCat, normFStatus, PHASE_LABEL, prettyCat, SEV_LABEL, stLabel } from '../meta.ts'
+import { isApprovalExpired } from '../model.ts'
 import type { Approval, Exchange, FindingRow, QueueItem, RunModel } from '../model.ts'
 import { useLinks } from '../nav.tsx'
 import { useToast } from '../toast.tsx'
@@ -355,7 +356,7 @@ interface RequestPreview { method?: string; origin?: string; pathAndQuery?: stri
 function parsePreview(a: Approval): RequestPreview {
   try { const v = JSON.parse(a.requestPreview) as unknown; return v && typeof v === 'object' ? v as RequestPreview : {} } catch { return {} }
 }
-export function ReadApproval({ it }: { it: ApprovalItem }) {
+export function ReadApproval({ it, now = Date.now() }: { it: ApprovalItem; now?: number }) {
   const model = useRunModel()
   const links = useLinks()
   const a = it.ap
@@ -366,6 +367,7 @@ export function ReadApproval({ it }: { it: ApprovalItem }) {
   const win = a.expiresAt && a.createdAt ? Math.round((a.expiresAt - a.createdAt) / 60000) : null
   const persona = a.personaHandle && a.personaHandle !== 'None' ? a.personaHandle : null
   const policy = model.run.approvalPolicy
+  const expired = isApprovalExpired(a, now)
   return <>
     <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-fg-subtle">
       <span className="inline-flex items-center gap-1.5 font-medium text-warn" title="State-changing request requiring approval"><Icon name="shield" />State-change approval</span><span>·</span>
@@ -378,13 +380,15 @@ export function ReadApproval({ it }: { it: ApprovalItem }) {
     </h2>
     <div className="mb-3 flex flex-wrap gap-1">
       <Tag icon={persona ? 'lock' : undefined}>{persona ?? 'Anonymous'}</Tag>
-      {a.status === 'pending'
-        ? <Tag className="tabular-nums">Expires {fmtTime(a.expiresAt)}</Tag>
-        : <Tag>{cap(a.status)}{a.decidedBy ? ' · ' + a.decidedBy : ''}</Tag>}
+      {expired
+        ? <Tag tone="warn">Expired</Tag>
+        : a.status === 'pending'
+          ? <Tag className="tabular-nums">Expires {fmtTime(a.expiresAt)}</Tag>
+          : <Tag>{cap(a.status)}{a.decidedBy ? ' · ' + a.decidedBy : ''}</Tag>}
     </div>
     <Section title="Why">
       <p className="text-fg!">{a.rationale}</p>
-      <p>The approval policy is <b className="font-medium text-fg">{approvalPolicyMeta[policy ?? 'auto_review'].label}</b>. {a.policyNote ? a.policyNote + ' ' : 'The safety reviewer deferred this state-changing request to you. '}{a.status === 'pending' ? 'Nothing is sent until you approve.' : ''}</p>
+      <p>The approval policy is <b className="font-medium text-fg">{approvalPolicyMeta[policy ?? 'auto_review'].label}</b>. {a.policyNote ? a.policyNote + ' ' : 'The safety reviewer deferred this state-changing request to you. '}{expired ? 'This approval window has expired.' : a.status === 'pending' ? 'Nothing is sent until you approve.' : ''}</p>
     </Section>
     <Section title="Request" right="Exactly what will be sent">
       {raw != null ? <pre className={RW.pre}>{raw}</pre> : <pre className={RW.pre}>
@@ -404,7 +408,7 @@ export function ReadApproval({ it }: { it: ApprovalItem }) {
   </>
 }
 
-export function ReadFollow({ it, local }: { it: FollowItem; local: boolean }) {
+export function ReadFollow({ it }: { it: FollowItem }) {
   const model = useRunModel()
   const links = useLinks()
   const x = it.cov
@@ -425,9 +429,7 @@ export function ReadFollow({ it, local }: { it: FollowItem; local: boolean }) {
       {related.slice(0, 5).map(f => <LinkRow key={f.id} glyph={<SevGlyph sev={f.severity} />} right={<VState status={f.status} />} trailing={null} onClick={() => links.finding(f.id)}>{f.title}</LinkRow>)}
     </Section>}
     <Section title="If queued">
-      {local
-        ? <p>The run is complete, so nothing can be scheduled. Queuing records the follow-up locally for the next run on <span className="font-mono text-[12px]">{host(x.origin)}</span>.</p>
-        : <p>Kovo Hunter sends the coordinator a steering hint for <span className="font-mono text-[12px]">{host(x.origin)}</span> · {prettyCat(x.category)}; it becomes a plan step in the next planner round. Requests requiring higher permissions come back here for approval.</p>}
+      <p>Kovo Hunter sends the coordinator a steering hint for <span className="font-mono text-[12px]">{host(x.origin)}</span> · {prettyCat(x.category)}; it becomes a plan step in the next planner round. Requests requiring higher permissions come back here for approval.</p>
     </Section>
     <Section title="Coordinator context"><CoordinatorContext origins={[x.origin]} category={x.category} excludeCoverageId={x.id} follow /></Section>
     <FoundBy workers={x.assignmentId && model.workerById.has(x.assignmentId) ? [x.assignmentId] : []} title="Recorded by" />
@@ -454,7 +456,7 @@ export function ReadConsent() {
       <p className="text-fg!">“{r.goal}”</p>
       {nw < 6 && <div className="mb-[18px] flex items-start gap-2.5 rounded-lg bg-warn-soft px-3 py-2.5 text-[12.5px] leading-[19px] text-fg-muted shadow-[inset_0_0_0_1px_var(--warn-line)]">
         <Icon name="alert" className="mt-[3px] text-warn" />
-        <div>{capF(words(nw))} word{nw === 1 ? '' : 's'} is broad. Sharpen it with the coordinator to focus the budget.</div>
+        <div>{capF(words(nw))} word{nw === 1 ? '' : 's'} is broad. Use Edit goal in the board or Revise goal in the header menu to focus the budget.</div>
       </div>}
     </Section>
     <Section title="Hosts" right="Project seeds">

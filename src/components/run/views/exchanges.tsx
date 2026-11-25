@@ -40,12 +40,38 @@ export interface XRow {
   partial: boolean
   eventId?: number
   note?: string
+  reason?: string | null
 }
 
 type Tab = 'all' | '2xx' | '3xx' | '4xx' | '5xx' | 'denied'
 type Group = 'none' | 'origin' | 'persona'
 const bucket = (r: XRow): Tab => r.denied ? 'denied' : r.status >= 500 ? '5xx' : r.status >= 400 ? '4xx' : r.status >= 300 ? '3xx' : '2xx'
-const str = (v: unknown) => (typeof v === 'string' ? v : null)
+const str = (v: unknown) => (typeof v === 'string' && v.length > 0 ? v : null)
+
+/** Convert a `broker.denied` / `broker.circuit_open` event into an Exchanges row, surfacing structured detail fields when present. */
+export function deniedEventToRow(ev: RunEvent): XRow {
+  const d = ev.detail ?? {}
+  const method = str(d.method) ?? '—'
+  const path = str(d.path) ?? str(d.pathAndQuery) ?? ''
+  const persona = str(d.persona) ?? str(d.personaHandle) ?? null
+  const reason = str(d.reason) ?? null
+  return {
+    id: 'ev:' + ev.id,
+    denied: true,
+    method,
+    status: Number(d.status ?? 0),
+    origin: str(d.origin) ?? '',
+    path,
+    persona,
+    dur: null,
+    t: ev.createdAt,
+    worker: str(d.assignmentId),
+    partial: false,
+    eventId: ev.id,
+    note: reason ?? ev.message,
+    reason,
+  }
+}
 
 /** Every exchange row we can show without fetching: summary window + event log + denials. */
 function useExchangeRows(hits: SearchHit[]) {
@@ -73,7 +99,7 @@ function useExchangeRows(hits: SearchHit[]) {
         const path = target.startsWith(origin) ? target.slice(origin.length) : target
         out.push({ id, denied: false, method: m?.[1] ?? '—', status: Number(ev.detail.status ?? m?.[3] ?? 0), origin, path: path || '/', persona: str(ev.detail.personaHandle), dur: null, t: ev.createdAt, worker: str(ev.detail.assignmentId), partial: true, eventId: ev.id })
       } else if (ev.kind === 'broker.denied' || ev.kind === 'broker.circuit_open') {
-        out.push({ id: 'ev:' + ev.id, denied: true, method: '—', status: Number(ev.detail.status ?? 0), origin: str(ev.detail.origin) ?? '', path: '', persona: null, dur: null, t: ev.createdAt, worker: str(ev.detail.assignmentId), partial: false, eventId: ev.id, note: ev.message })
+        out.push(deniedEventToRow(ev))
       }
     }
     out.sort((a, b) => b.t - a.t || (b.eventId ?? 0) - (a.eventId ?? 0))
@@ -114,9 +140,9 @@ export function ExchangesView() {
   const facets = useMemo(() => {
     const methods = new Map<string, number>(), origins = new Map<string, number>(), personas = new Map<string, number>()
     for (const r of rows) {
-      if (!r.denied) methods.set(r.method, (methods.get(r.method) ?? 0) + 1)
+      if (r.method && r.method !== '—') methods.set(r.method, (methods.get(r.method) ?? 0) + 1)
       if (r.origin) origins.set(r.origin, (origins.get(r.origin) ?? 0) + 1)
-      if (!r.denied) { const p = r.persona ?? ''; personas.set(p, (personas.get(p) ?? 0) + 1) }
+      if (!r.denied || r.persona) { const p = r.persona ?? ''; personas.set(p, (personas.get(p) ?? 0) + 1) }
     }
     const sorted = (m: Map<string, number>) => [...m.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     return { methods: sorted(methods), origins: sorted(origins), personas: sorted(personas) }
@@ -124,7 +150,7 @@ export function ExchangesView() {
 
   const base = useMemo(() => rows.filter(r =>
     (!method || r.method === method) && (!origin || r.origin === origin) && (!persona || (persona === '-' ? !r.persona && !r.denied : r.persona === persona))
-    && (!q.trim() || hitIds.has(r.id) || matchQ(q, [r.method, host(r.origin), r.path, r.status, r.persona ?? 'anonymous', r.denied ? 'denied' : 'allowed', r.note ?? ''].join(' ')))), [rows, method, origin, persona, q, hitIds])
+    && (!q.trim() || hitIds.has(r.id) || matchQ(q, [r.method, host(r.origin), r.path, r.status, r.persona ?? 'anonymous', r.denied ? 'denied' : 'allowed', r.reason ?? '', r.note ?? ''].join(' ')))), [rows, method, origin, persona, q, hitIds])
   const tabs = useMemo(() => {
     const t: Record<string, number> = { all: base.length }
     base.forEach(r => { const b = bucket(r); t[b] = (t[b] ?? 0) + 1 })
@@ -136,7 +162,7 @@ export function ExchangesView() {
   const items = useMemo<Item[]>(() => {
     if (group === 'none') return shown.map(r => ({ type: 'row', key: r.id, r }))
     const m = new Map<string, XRow[]>()
-    shown.forEach(r => { const k = group === 'origin' ? r.origin : (r.denied ? '(denied)' : r.persona ?? ''); m.set(k, [...(m.get(k) ?? []), r]) })
+    shown.forEach(r => { const k = group === 'origin' ? r.origin : (r.persona ?? (r.denied ? '(denied)' : '')); m.set(k, [...(m.get(k) ?? []), r]) })
     const out: Item[] = []
     ;[...m.entries()].sort((a, b) => group === 'origin' ? host(a[0]).localeCompare(host(b[0])) : a[0].localeCompare(b[0])).forEach(([k, list]) => {
       const ck = group + ':' + k
@@ -227,13 +253,17 @@ export function ExchangesView() {
           return <div key={it.key} style={style} className={cn(RW.row, selId === r.id && RW.rowCur)} data-id={r.id}
             onClick={() => nav.select({ kind: 'exchange', id: r.id })}>
             <span className="w-16 flex-none font-mono text-[12px] tabular-nums text-fg-subtle">{fmtRel(r.t, model.base)}</span>
-            <span className={cn('w-[46px] flex-none font-mono text-[12px] font-medium', r.denied ? 'text-fg-faint' : 'text-fg-muted')}>{r.method}</span>
+            <span className={cn('w-[46px] flex-none font-mono text-[12px] font-medium', r.denied && r.method === '—' ? 'text-fg-faint' : 'text-fg-muted')}>{r.method}</span>
             <span className={cn('w-[34px] flex-none text-right font-mono text-[12px] tabular-nums', r.denied ? 'inline-flex justify-end text-danger' : httpCodeClass(r.status))}>
               {r.denied ? <Icon name="slash" size={13} /> : r.status}
             </span>
             {group !== 'origin' && <span className="max-w-[190px] flex-none truncate font-mono text-[12px] text-fg-subtle">{host(r.origin)}</span>}
-            <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-fg" title={r.path}>
-              {r.denied ? <span className="font-sans text-[13px] text-danger">{r.note ?? 'Blocked by safety rules'}</span> : r.path}
+            <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-fg" title={r.denied ? [r.path, r.reason ?? r.note].filter(Boolean).join(' · ') : r.path}>
+              {r.denied
+                ? r.path
+                  ? <><span className="font-mono text-[12px] text-fg">{r.path}</span><span className="ml-2 font-sans text-[12.5px] text-danger">{r.reason ?? r.note ?? 'Blocked by safety rules'}</span></>
+                  : <span className="font-sans text-[13px] text-danger">{r.reason ?? r.note ?? 'Blocked by safety rules'}</span>
+                : r.path}
             </span>
             {r.persona && group !== 'persona' && <span className="flex-none"><Tag icon="lock">{r.persona}</Tag></span>}
             {hitIds.has(r.id) && <span className="inline-flex flex-none text-fg-subtle" title="Matched in the body or headers by server search"><Icon name="search" size={12} /></span>}
@@ -295,20 +325,35 @@ function ExchangeInspector({ sel }: InspectorProps) {
   const [bodyAll, setBodyAll] = useState(false)
 
   if (denied) {
-    const origin = str(ev?.detail.origin) ?? ''
+    const row = ev ? deniedEventToRow(ev) : null
+    const origin = row?.origin ?? ''
+    const method = row && row.method !== '—' ? row.method : null
+    const path = row?.path || null
+    const persona = row?.persona ?? null
+    const reason = row?.reason ?? null
     const w = ev ? model.workerById.get(str(ev.detail.assignmentId) ?? '') : undefined
     return <>
       <PaneHeader title="Blocked request" sub={ev ? <span title={`${fmtFullDateTime(ev.createdAt)} · Event #${ev.id}`} suppressHydrationWarning>{fmtAgo(ev.createdAt)}</span> : undefined} />
       <PaneBody><div className={RW.detail}>
         {!ev ? <Skeleton rows={4} /> : <>
-          <div className="mb-2.5 flex flex-wrap gap-1.5"><Tag icon="slash" title={ev.kind}>{ev.kind === 'broker.circuit_open' ? 'Rate limit pause' : 'Blocked by scope'}</Tag></div>
-          <h2 className="m-0 mb-3 break-words text-[14px] font-medium leading-[21px] text-fg">{ev.message}</h2>
+          <div className="mb-2.5 flex flex-wrap gap-1.5">
+            <Tag icon="slash" title={ev.kind}>{ev.kind === 'broker.circuit_open' ? 'Rate limit pause' : 'Blocked by safety proxy'}</Tag>
+            {method && <Tag mono>{method}</Tag>}
+            {persona && <Tag icon="lock">{persona}</Tag>}
+          </div>
+          {path
+            ? <h2 className="m-0 mb-3 break-all font-mono text-[13px] font-medium leading-5 text-fg"><span className="text-fg-subtle">{origin}</span>{path}</h2>
+            : <h2 className="m-0 mb-3 break-words text-[14px] font-medium leading-[21px] text-fg">{reason ?? ev.message}</h2>}
           <Props rows={[
             ['Time', <span className="tabular-nums" title={fmtFullDateTime(ev.createdAt)}>{fmtTimeS(ev.createdAt)} <span className="font-mono text-[12px] text-fg-subtle">{fmtRel(ev.createdAt, model.base)}</span></span>],
+            ...(reason ? [['Reason', <span className="text-danger">{reason}</span>] as [ReactNode, ReactNode]] : []),
+            ...(method ? [['Method', <span className="font-mono text-[12px]">{method}</span>] as [ReactNode, ReactNode]] : []),
+            ...(path ? [['Path', <span className="font-mono text-[12px] break-all">{path}</span>] as [ReactNode, ReactNode]] : []),
+            ...(persona ? [['Test account', <span className="font-mono text-[12px]">{persona}</span>] as [ReactNode, ReactNode]] : []),
             ...(origin ? [['Origin', <span className="font-mono text-[12px]">{host(origin)}</span>, () => links.host(origin)] as [ReactNode, ReactNode, () => void]] : []),
             ...(w ? [['Worker', <><StatusGlyph status={w.status} /><span className="min-w-0 truncate">{w.title}</span><Icon name="workflow" /></>, () => links.worker(w.id)] as [ReactNode, ReactNode, () => void]] : []),
           ]} />
-          <p className="my-1.5 mb-2 flex items-center gap-1.5 text-[12px] leading-[18px] text-fg-subtle">The safety proxy blocked this request before it left Kovo Hunter: the host is outside the approved scope or paused by a safety pause. Nothing was sent.</p>
+          <p className="my-1.5 mb-2 flex items-center gap-1.5 text-[12px] leading-[18px] text-fg-subtle">{reason ? ev.message : 'The safety proxy blocked this request before it left Kovo Hunter: the host is outside the approved scope or paused by a safety pause. Nothing was sent.'}</p>
           <Section title="Related"><LinkRow icon="activity" onClick={() => links.event(ev.id)}>Open in Activity</LinkRow></Section>
         </>}
       </div></PaneBody>

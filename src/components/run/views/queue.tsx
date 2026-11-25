@@ -1,19 +1,13 @@
 // Queue view (E's triage inside F's frame), owned by Agent Q.
 //
-// Decide / Review / Follow up / Done, identical baseline checks bundled
-// (model.queue + the shared decision store). The reading view lives in the
-// right pane (`queue` inspector) with a sticky action bar.
-//
-// Decisions: A / D / F on the current item (or the inline buttons). The row
-// and the action bar stamp, the row collapses its own height (rows above do
-// not move), the next open item slides into the inspector, and an undo toast
-// springs up. Approvals are real (`decide_approval` / `approve_similar_endpoint`,
-// sent when the 6 s undo window closes); follow-ups send `inject_hint` while
-// the run is live; finding triage is local (no server API), persisted per run.
-import { useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from 'react'
+// Decide / Follow up / Done (model.queue + the shared decision store). The
+// reading view lives in the right pane (`queue` inspector) with a sticky action
+// bar. Every action sends a real server command (`decide_approval`,
+// `approve_similar_endpoint`, `approve_all_pending`, `inject_hint`).
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { ReactNode } from 'react'
 import { capabilityTierMeta } from '../../run-state.ts'
-import { useRunModel } from '../data.tsx'
+import { useRun, useRunModel } from '../data.tsx'
 import { ACTIONS, actionsFor, approvalCommand, useDecisions } from '../decisions.tsx'
 import type { DecisionAct, DecisionsApi } from '../decisions.tsx'
 import type { Command } from '../data.tsx'
@@ -23,8 +17,8 @@ import { StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import type { IconName } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
-import { normFStatus, prettyCat } from '../meta.ts'
-import { QSEC } from '../model.ts'
+import { prettyCat } from '../meta.ts'
+import { isApprovalExpired, QSEC } from '../model.ts'
 import type { QueueItem, QueueSection, RunModel } from '../model.ts'
 import { AnimatedNumber, EASE_CSS, T } from '../motion.tsx'
 import { useListNav, useNav, useViewState } from '../nav.tsx'
@@ -57,7 +51,7 @@ function openKeys(q: DecisionsApi) {
   return [...q.sections.decide, ...q.sections.review, ...q.sections.follow].map(i => i.key)
 }
 
-/** Real command for a decision, if there is one. */
+/** Real command for a decision. */
 function commandFor(it: QueueItem, act: DecisionAct, model: RunModel, similar?: boolean): Command | undefined {
   if (it.kind === 'approval' && (act === 'approve' || act === 'deny')) {
     if (similar && act === 'approve') return { action: 'approve_similar_endpoint', approvalId: it.ap.id }
@@ -74,8 +68,6 @@ function commandFor(it: QueueItem, act: DecisionAct, model: RunModel, similar?: 
   }
   return undefined
 }
-/** Finding triage (accept / dismiss / false positive) has no server API; follow-ups on finished runs can't be sent either. */
-const localOnly = (it: QueueItem, m: RunModel) => it.kind === 'finding' || (it.kind === 'follow' && !followIsLive(m))
 /** Follow-ups can only be scheduled while the run can still plan. */
 export const followIsLive = (m: RunModel) => m.run.phase !== 'complete' && !['complete', 'stopped', 'failed'].includes(m.run.status)
 
@@ -94,16 +86,17 @@ function runDecision(deps: ActDeps, key: string, act: DecisionAct, opts: { simil
   if (!it || motion.phase !== 'idle') return false
   if (it.kind === 'consent') { nav.setView('overview'); return true }
   if (!q.canAct(key, act)) return false
+  const command = commandFor(it, act, model, opts.similar)
+  if (!command) return false
   const order = visibleOrder.length ? visibleOrder : openKeys(q)
   const idx = order.indexOf(key)
   const open = new Set(openKeys(q))
   const nextKey = order.slice(idx + 1).find(k => open.has(k) && k !== key) ?? order.slice(0, Math.max(0, idx)).reverse().find(k => open.has(k)) ?? null
   const commit = () => {
-    const command = commandFor(it, act, model, opts.similar)
     q.decide(key, act, {
       command,
       message: decisionMessage(it, act, opts.similar),
-      sub: command ? 'Sends when this closes' : it.kind === 'finding' || it.kind === 'follow' ? 'Saved locally in this browser · ' + it.title : it.title,
+      sub: 'Sends when this closes',
       onUndo: () => {
         setMotion({ enter: key })
         setTimeout(() => { if (motion.enter === key) setMotion({ enter: null }) }, 600)
@@ -146,7 +139,7 @@ function useAsk() {
   }
 }
 
-/** Keyboard: A / D / F on the selected item, C to ask about it. */
+/** Keyboard: A / D on the selected item, C to ask about it. */
 function useQueueKeys(priority: number) {
   const nav = useNav()
   const model = useRunModel()
@@ -163,16 +156,17 @@ function useQueueKeys(priority: number) {
   useShortcuts([
     { key: 'a', run: letter('a') },
     { key: 'd', run: letter('d') },
-    { key: 'f', run: letter('f') },
     { key: 'c', run: () => { const key = cur(); if (!key || nav.chat) return false; ask(key) } },
   ], { priority })
 }
 
 // ---------------------------------------------------------------- list
 
+const VISIBLE_QSEC = QSEC.filter(([k]) => k !== 'review')
+
 const EMPTY: Record<QueueSection, string> = {
   decide: 'Nothing is waiting on you.',
-  review: 'Every finding is verified or decided.',
+  review: 'Findings are reviewed in the Findings view.',
   follow: 'No coverage flagged for follow-up.',
   done: 'Nothing here yet.',
 }
@@ -195,16 +189,27 @@ function useEnterFlash(ref: React.RefObject<HTMLDivElement | null>, entering: bo
 }
 
 export function QueueView() {
+  const { send, pending } = useRun()
   const model = useRunModel()
   const q = useDecisions()
   const nav = useNav()
+  const toast = useToast()
   const m = useMotion()
   const decide = useDecide()
   const ask = useAsk()
   const [collapsed, setCollapsed] = useViewState<Partial<Record<QueueSection, boolean>>>('queue.collapsed', {})
+  const [now, setNow] = useState(() => Date.now())
   const listRef = useRef<HTMLDivElement>(null)
+  const hasPendingApprovals = model.detail.approvals.some(a => a.status === 'pending')
+  useEffect(() => {
+    if (!hasPendingApprovals) return
+    setNow(Date.now())
+    const id = window.setInterval(() => setNow(Date.now()), 15_000)
+    return () => window.clearInterval(id)
+  }, [hasPendingApprovals])
+
   const isCol = (k: QueueSection) => collapsed[k] ?? k === 'done'
-  const flat = useMemo(() => QSEC.flatMap(([k]) => (isCol(k) ? [] : q.sections[k].map(i => i.key))),
+  const flat = useMemo(() => VISIBLE_QSEC.flatMap(([k]) => (isCol(k) ? [] : q.sections[k].map(i => i.key))),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [q.sections, collapsed])
   visibleOrder = flat
@@ -224,8 +229,8 @@ export function QueueView() {
   useListNav({ ids: flat, kind: 'queue', anim: 'left' })
   useQueueKeys(10)
   usePaletteCommands([
-    ...(['decide', 'review', 'follow', 'done'] as const).map(k => ({
-      id: 'q.toggle.' + k, section: 'Actions', label: (isCol(k) ? 'Expand' : 'Collapse') + ' the ' + QSEC.find(s => s[0] === k)![1] + ' section', icon: 'queue' as IconName,
+    ...VISIBLE_QSEC.map(([k, l]) => ({
+      id: 'q.toggle.' + k, section: 'Actions', label: (isCol(k) ? 'Expand' : 'Collapse') + ' the ' + l + ' section', icon: 'queue' as IconName,
       run: () => setCollapsed(c => ({ ...c, [k]: !isCol(k) })),
     })),
   ])
@@ -237,9 +242,10 @@ export function QueueView() {
     el?.scrollIntoView({ block: 'nearest' })
   }, [selKey])
 
+  const activePendingApprovals = q.sections.decide.filter(it => it.kind === 'approval' && !isApprovalExpired(it.ap, now))
   const initial = q.initialCount
   const handled = q.handledCount
-  const pct = initial ? handled / initial : 0
+  const pct = initial ? Math.min(1, handled / initial) : 0
   const hero = <div className="flex flex-none items-center gap-3 border-b border-line px-[18px] py-3 text-[12.5px] tabular-nums text-fg-muted">
     <span className="min-w-0 truncate">
       <b className="font-medium text-fg"><AnimatedNumber id="q.open" value={q.openCount} /> open</b>
@@ -252,16 +258,16 @@ export function QueueView() {
     </span>
     <span className="min-w-2 flex-1" />
     <span className="inline-flex flex-none items-center gap-1.5 whitespace-nowrap text-[11.5px] text-fg-subtle [&_.kbd]:ml-1.5">
-      <Kbd>A</Kbd>accept<Kbd>D</Kbd>deny<Kbd>F</Kbd>false positive<Kbd>Z</Kbd>undo
+      <Kbd>A</Kbd>approve<Kbd>D</Kbd>deny<Kbd>Z</Kbd>undo
     </span>
   </div>
   if (!initial && !q.sections.done.length) {
-    return <>{hero}<EmptyState icon="queue" title="Queue is empty">Approvals, unverified findings and flagged coverage collect here as the run progresses.</EmptyState></>
+    return <>{hero}<EmptyState icon="queue" title="Queue is empty">State-change approvals and flagged coverage follow-ups collect here as the run progresses.</EmptyState></>
   }
   return <>
     {hero}
     <div className={RW.list} ref={listRef} tabIndex={-1}>
-      {QSEC.map(([k, label, sub]) => {
+      {VISIBLE_QSEC.map(([k, label, sub]) => {
         const items = q.sections[k]
         const col = isCol(k)
         return <div key={k} data-sec={k}>
@@ -277,11 +283,30 @@ export function QueueView() {
             <span>{label}</span>
             <span className="font-normal tabular-nums text-fg-subtle"><AnimatedNumber id={'q.sec.' + k} value={items.length} /></span>
             <span className="text-[12px] font-normal text-fg-subtle">{sub}</span>
+            {k === 'decide' && activePendingApprovals.length > 0 && (
+              <button
+                type="button"
+                className={cn(runBtn({ size: 'sm' }), 'ml-auto')}
+                disabled={pending > 0}
+                data-testid="queue-approve-all"
+                onClick={e => {
+                  e.stopPropagation()
+                  toast.undoable({
+                    message: `Approving ${plural(activePendingApprovals.length, 'pending request')}`,
+                    icon: 'check',
+                    sub: 'Sends when this closes',
+                    commit: () => send({ action: 'approve_all_pending' }),
+                  })
+                }}
+              >
+                <Icon name="check" />Approve all pending ({activePendingApprovals.length})
+              </button>
+            )}
           </div>
           {!col && (!items.length
             ? <div className="border-b border-line pb-3.5 pl-11 pr-[18px] pt-3 text-[12px] text-fg-subtle">{EMPTY[k]}</div>
             : k === 'done' ? <DoneRows items={items} selKey={selKey} />
-              : items.map(it => <QRow key={it.key} it={it} sec={k} cur={it.key === selKey} motion={m}
+              : items.map(it => <QRow key={it.key} it={it} sec={k} cur={it.key === selKey} motion={m} now={now}
                 onSelect={() => nav.select({ kind: 'queue', id: it.key })} onAct={act => decide(it.key, act)} onAsk={() => ask(it.key)} />))}
         </div>
       })}
@@ -301,8 +326,11 @@ function QTitle({ it, done }: { it: QueueItem; done?: boolean }) {
   return <span className={cn('min-w-0 flex-initial truncate', done ? 'text-fg-muted' : 'text-fg')}>{it.title}</span>
 }
 
-function QMeta({ it, model }: { it: QueueItem; model: RunModel }): ReactNode[] {
-  if (it.kind === 'approval') return ['Approval request', it.ap.status === 'pending' ? 'Expires ' + fmtTime(it.ap.expiresAt) : cap(it.ap.status)]
+function QMeta({ it, model, now }: { it: QueueItem; model: RunModel; now: number }): ReactNode[] {
+  if (it.kind === 'approval') {
+    const expired = isApprovalExpired(it.ap, now)
+    return ['Approval request', expired ? <span key="exp" className="font-medium text-warn">Expired</span> : it.ap.status === 'pending' ? 'Expires ' + fmtTime(it.ap.expiresAt) : cap(it.ap.status)]
+  }
   if (it.kind === 'consent') return [plural(model.detail.project.seeds.length, 'seed host'), capabilityTierMeta[model.run.capabilityTier].short, fmtUsd(model.run.budgetUsd)]
   if (it.kind === 'follow') return [<span key="h" className="font-mono text-[11.5px]">{host(it.cov.origin)}</span>, prettyCat(it.cov.category)]
   return [
@@ -312,11 +340,12 @@ function QMeta({ it, model }: { it: QueueItem; model: RunModel }): ReactNode[] {
   ]
 }
 
-function QRow({ it, sec, cur, motion: m, onSelect, onAct, onAsk }: {
+function QRow({ it, sec, cur, motion: m, now, onSelect, onAct, onAsk }: {
   it: QueueItem
   sec: QueueSection
   cur: boolean
   motion: Motion
+  now: number
   onSelect: () => void
   onAct: (act: DecisionAct) => void
   onAsk: () => void
@@ -337,8 +366,8 @@ function QRow({ it, sec, cur, motion: m, onSelect, onAct, onAsk }: {
     el.style.height = '0px'
     return () => { el.removeAttribute('data-leaving'); el.style.height = '' }
   }, [leaving])
-  const meta = QMeta({ it, model })
-  const acts = it.kind === 'consent' ? [['scope', 'Review scope', 'a', true] as const] : actionsFor(it)
+  const meta = QMeta({ it, model, now })
+  const acts = it.kind === 'consent' ? [['scope', 'Review scope', 'a', true] as const] : actionsFor(it, now)
   return <div
     ref={ref}
     className={cn(
@@ -377,7 +406,7 @@ function QRow({ it, sec, cur, motion: m, onSelect, onAct, onAsk }: {
           runBtn({ variant: p ? 'ink' : 'default', size: 'sm' }),
           !p && 'text-fg-muted hover:text-fg',
         )}
-        title={`${l} (${k.toUpperCase()})${localOnly(it, model) ? ' · Saved locally in this browser' : ''}`}
+        title={`${l} (${k.toUpperCase()})`}
         onClick={e => { e.stopPropagation(); onAct(a) }}
       >
         {l}<Kbd inverted={p} className="pointer-events-none h-[15px] min-w-[15px] text-[10px]">{k.toUpperCase()}</Kbd>
@@ -410,7 +439,7 @@ function DoneRow({ it, cur, entering, onSelect }: { it: QueueItem; cur: boolean;
   if (dec) {
     const A = ACTIONS[dec.act]
     right = <span className={cn(runDec({ tone: A.tone === 'no' ? 'default' : A.tone }), '[&_svg]:size-[13px]')}>
-      <Icon name={A.icon} />{A.label}{dec.state === 'pending' ? ' · sending' : dec.state === 'local' ? ' · local' : ''}
+      <Icon name={A.icon} />{A.label}{dec.state === 'pending' ? ' · sending' : ''}
     </span>
   } else if (it.kind === 'finding') right = <VState status={it.status} />
   else if (it.kind === 'approval') right = <span className={cn(runDec(), '[&_svg]:size-[13px]')}>
@@ -429,7 +458,7 @@ function DoneRow({ it, cur, entering, onSelect }: { it: QueueItem; cur: boolean;
   </div>
 }
 
-/** Done: your decisions first, then verified / dismissed findings, then the approval audit log. */
+/** Done: your decisions first, then the approval audit log. */
 function DoneRows({ items, selKey }: { items: QueueItem[]; selKey: string | null }) {
   const q = useDecisions()
   const nav = useNav()
@@ -460,7 +489,15 @@ function QueueInspector({ sel }: InspectorProps) {
   const m = useMotion()
   const decide = useDecide()
   const ask = useAsk()
+  const [now, setNow] = useState(() => Date.now())
   const it = model.queueItem.get(sel.id)
+  const isPendingApproval = it?.kind === 'approval' && it.ap.status === 'pending'
+  useEffect(() => {
+    if (!isPendingApproval) return
+    setNow(Date.now())
+    const id = window.setInterval(() => setNow(Date.now()), 15_000)
+    return () => window.clearInterval(id)
+  }, [isPendingApproval])
   if (!it) {
     return <>
       <PaneHeader title="Queue" />
@@ -472,6 +509,7 @@ function QueueInspector({ sel }: InspectorProps) {
   const pos = inSec.findIndex(i => i.key === it.key)
   const secName = QSEC.find(s => s[0] === sec)?.[1] ?? ''
   const dec = q.get(it.key)
+  const expiredApproval = it.kind === 'approval' && isApprovalExpired(it.ap, now)
   const order = visibleOrder.length ? visibleOrder : openKeys(q)
   const step = (d: number) => {
     const i = order.indexOf(it.key)
@@ -479,21 +517,20 @@ function QueueInspector({ sel }: InspectorProps) {
     if (k && k !== it.key) nav.select({ kind: 'queue', id: k }, { anim: d > 0 ? 'left' : 'up' })
   }
   const stamped = m.key === it.key && m.phase !== 'idle' && m.act ? ACTIONS[m.act] : null
-  const acts = sec !== 'done' ? (it.kind === 'consent' ? [['scope', 'Review scope', 'a', true] as const] : actionsFor(it)) : []
-  const icon = (a: DecisionAct): IconName => a === 'fp' ? 'slash' : a === 'dismiss' || a === 'close' ? 'archive' : a === 'deny' ? 'x' : a === 'queue' ? 'follow' : 'check'
+  const acts = sec !== 'done' ? (it.kind === 'consent' ? [['scope', 'Review scope', 'a', true] as const] : actionsFor(it, now)) : []
+  const icon = (a: DecisionAct): IconName => a === 'deny' ? 'x' : a === 'queue' ? 'follow' : 'check'
   const bannerCls = 'mb-3 flex items-center gap-2 rounded-[7px] bg-sunk px-2.5 py-2 text-[12px] text-fg-muted shadow-[inset_0_0_0_1px_var(--line)]'
   let banner: ReactNode = null
   if (dec) {
     banner = <div className={bannerCls}><Icon name={ACTIONS[dec.act].icon} />
-      <span>{ACTIONS[dec.act].label} by you · {fmtTimeS(dec.at)}{dec.state === 'pending' ? ' · sending when the undo window closes' : dec.state === 'sent' ? ' · sent to Kovo Hunter' : dec.state === 'local' ? ' · Saved locally in this browser' : ''}</span>
+      <span>{ACTIONS[dec.act].label} by you · {fmtTimeS(dec.at)}{dec.state === 'pending' ? ' · sending when the undo window closes' : dec.state === 'sent' ? ' · sent to Kovo Hunter' : ''}</span>
       {dec.state !== 'sent' && <button type="button" className={cn(runBtn({ variant: 'ghost' }), 'ml-auto')} onClick={() => q.reopen(it.key)}><Icon name="undo" />Move back</button>}
     </div>
-  } else if (sec === 'done' && it.kind === 'finding') {
-    banner = <div className={bannerCls}><StatusGlyph status={normFStatus(it.status)} /><span>{it.status === 'dismissed' ? 'Dismissed by verification.' : 'Confirmed by automated replay. Nothing to decide.'}</span></div>
+  } else if (expiredApproval) {
+    banner = <div className={bannerCls}><StatusGlyph status="expired" /><span>Expired · this approval window closed at {fmtTimeS(it.ap.expiresAt)}.</span></div>
   } else if (sec === 'done' && it.kind === 'approval') {
     banner = <div className={bannerCls}><StatusGlyph status={it.ap.status} /><span>{cap(it.ap.status)}{it.ap.decidedBy ? ' by ' + it.ap.decidedBy : ''}{it.ap.decidedAt ? ' · ' + fmtTimeS(it.ap.decidedAt) : ''}.</span></div>
   }
-  const local = it.kind === 'follow' && !followIsLive(model)
   return <>
     <PaneHeader title={secName} sub={pos >= 0 ? <span className="tabular-nums">{pos + 1} of {inSec.length}</span> : undefined}
       extra={<>
@@ -504,8 +541,8 @@ function QueueInspector({ sel }: InspectorProps) {
       <PaneBody><div className={cn(RW.detail, 'pb-6')}>
         {banner}
         {it.kind === 'finding' ? <ReadFinding it={it} />
-          : it.kind === 'approval' ? <ReadApproval it={it} />
-            : it.kind === 'follow' ? <ReadFollow it={it} local={local} />
+          : it.kind === 'approval' ? <ReadApproval it={it} now={now} />
+            : it.kind === 'follow' ? <ReadFollow it={it} />
               : <ReadConsent />}
       </div></PaneBody>
       <div className="relative flex min-h-12 flex-none items-center gap-1.5 border-t border-line bg-panel px-3 py-2.5">
@@ -515,11 +552,10 @@ function QueueInspector({ sel }: InspectorProps) {
             type="button"
             className={runBtn({ variant: p ? 'ink' : 'default' })}
             onClick={() => decide(it.key, a)}
-            title={localOnly(it, model) ? 'Saved locally in this browser' : undefined}
           >
             <Icon name={icon(a)} />{l}<Kbd inverted={p} className="ml-0.5">{k.toUpperCase()}</Kbd>
           </button>)}
-          {it.kind === 'approval' && sec !== 'done' && <button
+          {it.kind === 'approval' && sec !== 'done' && !expiredApproval && <button
             type="button"
             className={runBtn({ variant: 'ghost' })}
             title="Approve this request and future requests to the same endpoint pattern"

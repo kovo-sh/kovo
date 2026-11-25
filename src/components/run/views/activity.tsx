@@ -6,7 +6,7 @@ import type { ReactNode } from 'react'
 import { FilterBox, matchQ, Tabs, VList } from '../controls.tsx'
 import { useRun, useRunModel } from '../data.tsx'
 import { EmptyState, LinkRow, Props, Section, Skeleton, Tag } from '../display.tsx'
-import { fmtAgo, fmtEventKind, fmtFullDateTime, fmtRel, fmtTimeS, host } from '../format.ts'
+import { fmtAgo, fmtEventKind, fmtFullDateTime, fmtN, fmtRel, fmtTimeS, host } from '../format.ts'
 import { EventGlyph, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import type { RunEvent } from '../model.ts'
 import { useReducedMotion } from '../motion.tsx'
@@ -26,15 +26,37 @@ export function actFam(k: string): Exclude<Fam, 'all'> {
 }
 const FAMS: [Fam, string][] = [['all', 'All'], ['broker', 'Requests'], ['worker', 'Workers'], ['finding', 'Findings'], ['planner', 'Planner'], ['other', 'Other']]
 
+const ERROR_ACTIVITY_KINDS = new Set([
+  'broker.denied',
+  'broker.circuit_open',
+  'broker.persona_scope_mismatch',
+  'worker.failed',
+  'worker.stall_failed',
+  'persona.auth_failed',
+  'persona.refresh_failed',
+  'threat_model.failed',
+  'deterministic_lane.failed',
+])
+
+/** True for auth, scope, broker-denial, and failure events that should be highlighted in Activity. */
+export function isErrorActivityEvent(kind: string): boolean {
+  return ERROR_ACTIVITY_KINDS.has(kind)
+}
+
 export function ActivityView() {
-  const { events, eventsReady, detail } = useRun()
+  const { events, eventsReady, counts: runCounts, detail, refresh } = useRun()
   const model = useRunModel()
   const nav = useNav()
   const rm = useReducedMotion()
   const [tab, setTab] = useViewState<Fam>('activity.tab', 'all')
   const [q, setQ] = useViewState('activity.q', '')
   // Events newer than this arrived while the view was open: they animate in.
+  const seenRunRef = useRef<string>(detail.run.id)
   const seenMax = useRef<number | null>(null)
+  if (seenRunRef.current !== detail.run.id) {
+    seenRunRef.current = detail.run.id
+    seenMax.current = null
+  }
   if (seenMax.current == null && eventsReady) seenMax.current = events.length ? events[events.length - 1].id : 0
   const fresh = seenMax.current ?? Infinity
 
@@ -57,10 +79,16 @@ export function ActivityView() {
   const selId = nav.sel?.kind === 'event' ? nav.sel.id : null
   const height = useMemo(() => () => 36, [])
 
-  if (eventsReady && !events.length) {
+  if (eventsReady && !events.length && runCounts.events === 0) {
     return <EmptyState icon="activity" title="Quiet so far"
       action={detail.run.status === 'waiting' ? <button type="button" className={runBtn()} onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
       Run events stream here newest first: planner rounds, HTTP requests, worker lifecycle, and verification.
+    </EmptyState>
+  }
+  if (eventsReady && !events.length && runCounts.events > 0) {
+    return <EmptyState icon="activity" title={`${fmtN(runCounts.events)} events recorded`}
+      action={<button type="button" className={runBtn()} onClick={() => void refresh()}>Reload</button>}>
+      Historical run events did not finish streaming. Reload to retry fetching the event log.
     </EmptyState>
   }
   return <>
@@ -83,7 +111,7 @@ export function ActivityView() {
         render={(e, _i, style) => {
           const id = String(e.id)
           const label = fmtEventKind(e.kind)
-          const isBad = e.kind === 'broker.denied' || e.kind === 'worker.failed'
+          const isBad = isErrorActivityEvent(e.kind)
           return <div
             key={id}
             style={style}
@@ -91,13 +119,14 @@ export function ActivityView() {
             className={cn(
               RW.row,
               selId === id && RW.rowCur,
+              isBad && selId !== id && 'bg-danger-soft/40',
               !rm && e.id > fresh && 'transition-[background-color,opacity] duration-700 ease-kovo starting:bg-accent-soft starting:opacity-0',
             )}
             onClick={() => nav.select({ kind: 'event', id })}
           >
             <span className="w-16 flex-none font-mono text-[12px] tabular-nums text-fg-subtle" title={fmtFullDateTime(e.createdAt)}>{fmtRel(e.createdAt, model.base)}</span>
             <span className="inline-flex size-3.5 flex-none items-center justify-center"><EventGlyph kind={e.kind} /></span>
-            <span className="w-[132px] flex-none truncate text-fg-subtle" title={`${e.kind} · Event #${e.id}`}>{label}</span>
+            <span className={cn('w-[132px] flex-none truncate', isBad ? 'font-medium text-danger' : 'text-fg-subtle')} title={`${e.kind} · Event #${e.id}`}>{label}</span>
             <span className={cn('min-w-0 flex-1 truncate', isBad ? 'text-danger' : 'text-fg')}>{e.message}</span>
           </div>
         }} />}

@@ -141,14 +141,19 @@ export type QueueBase = Record<QueueSection, QueueItem[]>
  */
 export const consentKey = (run: Pick<Run, 'phase'>) => 'consent:' + run.phase
 
+/** True when a still-pending approval has passed its client-side expiry timestamp. */
+export function isApprovalExpired(a: Pick<Approval, 'status' | 'expiresAt'>, now = Date.now()): boolean {
+  return a.status === 'pending' && Number.isFinite(a.expiresAt) && a.expiresAt > 0 && now >= a.expiresAt
+}
+
 export const QSEC: [QueueSection, string, string][] = [
   ['decide', 'Decide', 'Needs your decision before work continues'],
   ['review', 'Review', 'Unverified findings, bundled by check'],
   ['follow', 'Follow up', 'Coverage the coordinator flagged'],
-  ['done', 'Done', 'Verified, dismissed, or decided'],
+  ['done', 'Done', 'Server-side decisions and approval audit log'],
 ]
 
-function buildQueue(d: Detail, findings: readonly FindingRow[], risk: Map<string, ThreatEntry>, evidenceById: Map<string, Evidence>): QueueBase {
+function buildQueue(d: Detail, _findings: readonly FindingRow[], risk: Map<string, ThreatEntry>, _evidenceById: Map<string, Evidence>): QueueBase {
   const run = d.run
   const riskRank = (o: string) => ({ critical: 0, high: 1, medium: 2, low: 3 } as Record<string, number>)[risk.get(o)?.riskTier ?? ''] ?? 4
   const base: QueueBase = { decide: [], review: [], follow: [], done: [] }
@@ -159,35 +164,15 @@ function buildQueue(d: Detail, findings: readonly FindingRow[], risk: Map<string
     const it: QueueItem = { key: 'ap:' + a.id, kind: 'approval', ap: a, title: a.method + ' ' + host(a.origin) + a.pathAndQuery, t: a.createdAt }
     ;(a.status === 'pending' ? base.decide : base.done).push(it)
   }
-  const groups = new Map<string, FindingRow[]>()
-  for (const f of findings) {
-    const k = f.findingKind === 'baseline_check' && f.check?.id ? 'b:' + f.check.id + ':' + f.status : 'f:' + f.id
-    const list = groups.get(k) ?? []
-    list.push(f)
-    groups.set(k, list)
+  // Follow-ups send a real `inject_hint` command only while the run can still plan.
+  const canScheduleFollowUp = run.phase !== 'complete' && !['complete', 'stopped', 'failed'].includes(run.status)
+  if (canScheduleFollowUp) {
+    for (const x of d.coverageEntries.filter(c => c.status === 'needs_follow_up')) {
+      base.follow.push({ key: 'cv:' + x.id, kind: 'follow', cov: x, title: firstSentence(x.summary), origins: [x.origin], t: x.updatedAt || run.createdAt, risk: riskRank(x.origin) })
+    }
+    base.follow.sort((a, b) => a.kind === 'follow' && b.kind === 'follow' ? a.risk - b.risk || host(a.cov.origin).localeCompare(host(b.cov.origin)) : 0)
   }
-  for (const [k, list] of groups) {
-    list.sort((a, b) => (SEV_ORDER[a.severity] ?? 9) - (SEV_ORDER[b.severity] ?? 9))
-    const F = list[0]
-    const sev = list.reduce<Severity>((s, f) => (SEV_ORDER[f.severity] < SEV_ORDER[s] ? f.severity : s), F.severity)
-    const origins = [...new Set(list.map(f => f.origin))]
-    const t = Math.min(...list.map(f => evidenceById.get(f.evidenceIds[0] ?? '')?.createdAt ?? run.createdAt))
-    const it: QueueItem = { key: k, kind: 'finding', bundle: k.startsWith('b:') && list.length > 1, list, finding: F, sev, status: F.status, origins, title: F.title, t }
-    ;(F.status === 'pending' || F.status === 'inconclusive' ? base.review : base.done).push(it)
-  }
-  const fi = (it: QueueItem) => it.kind === 'finding' ? it : null
-  base.review.sort((a, b) => {
-    const A = fi(a)!, B = fi(b)!
-    return SEV_ORDER[A.sev] - SEV_ORDER[B.sev] || Number(A.status === 'inconclusive') - Number(B.status === 'inconclusive')
-      || Number(A.bundle) - Number(B.bundle) || B.list.length - A.list.length
-  })
-  for (const x of d.coverageEntries.filter(c => c.status === 'needs_follow_up')) {
-    base.follow.push({ key: 'cv:' + x.id, kind: 'follow', cov: x, title: firstSentence(x.summary), origins: [x.origin], t: x.updatedAt || run.createdAt, risk: riskRank(x.origin) })
-  }
-  base.follow.sort((a, b) => a.kind === 'follow' && b.kind === 'follow' ? a.risk - b.risk || host(a.cov.origin).localeCompare(host(b.cov.origin)) : 0)
-  const rank = (it: QueueItem) => it.kind === 'finding' ? (it.status === 'dismissed' ? 2 : 0) : 1
-  const sevOf = (it: QueueItem) => it.kind === 'finding' ? SEV_ORDER[it.sev] : 9
-  base.done.sort((a, b) => rank(a) - rank(b) || sevOf(a) - sevOf(b))
+  base.done.sort((a, b) => b.t - a.t)
   return base
 }
 
@@ -388,6 +373,64 @@ const group = <T, K>(items: readonly T[], key: (t: T) => K | null | undefined) =
   return m
 }
 
+function pushTimestamp(times: number[], value: unknown) {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) times.push(value)
+}
+
+/**
+ * Derive the latest known timestamp for a run without snapping backward when the run pauses
+ * or finishes: incorporates `endedAt`/`updatedAt` on the run, assignments, chain steps,
+ * coverage entries, board members, approvals (`decidedAt`), patch proposals, and endpoints.
+ */
+export function computeRunEnd(d: Detail): number {
+  const times: number[] = []
+  const runMeta = d.run as Detail['run'] & { endedAt?: number | null; updatedAt?: number | null }
+  pushTimestamp(times, d.run.createdAt)
+  pushTimestamp(times, runMeta.endedAt)
+  pushTimestamp(times, runMeta.updatedAt)
+  pushTimestamp(times, d.run.phase0CompletedAt)
+  for (const e of d.exchangesSummary) {
+    pushTimestamp(times, e.createdAt)
+    if (typeof e.durationMs === 'number' && Number.isFinite(e.durationMs) && e.durationMs > 0) {
+      pushTimestamp(times, e.createdAt + e.durationMs)
+    }
+  }
+  for (const a of d.assignments) {
+    const am = a as Assignment & { endedAt?: number | null; updatedAt?: number | null }
+    pushTimestamp(times, a.createdAt)
+    pushTimestamp(times, am.endedAt)
+    pushTimestamp(times, am.updatedAt)
+  }
+  for (const s of d.chainSteps) {
+    pushTimestamp(times, s.createdAt)
+    pushTimestamp(times, s.updatedAt)
+  }
+  for (const c of d.coverageEntries) pushTimestamp(times, c.updatedAt)
+  for (const a of d.approvals) {
+    pushTimestamp(times, a.createdAt)
+    pushTimestamp(times, a.decidedAt)
+  }
+  for (const b of d.boardMembers) {
+    pushTimestamp(times, b.createdAt)
+    pushTimestamp(times, b.updatedAt)
+  }
+  for (const b of d.boardMessages) pushTimestamp(times, b.createdAt)
+  for (const f of d.facts) pushTimestamp(times, f.createdAt)
+  for (const e of d.evidence) pushTimestamp(times, e.createdAt)
+  for (const m of d.messages) pushTimestamp(times, m.createdAt)
+  for (const r of d.reports) pushTimestamp(times, r.createdAt)
+  for (const r of d.retestRuns) pushTimestamp(times, r.createdAt)
+  for (const p of d.patchProposals ?? []) {
+    pushTimestamp(times, p.createdAt)
+    pushTimestamp(times, p.updatedAt)
+  }
+  for (const ep of d.endpoints ?? []) {
+    pushTimestamp(times, ep.createdAt)
+    pushTimestamp(times, ep.updatedAt)
+  }
+  return times.length ? Math.max(...times) : d.run.createdAt
+}
+
 export function buildRunModel(d: Detail): RunModel {
   const allFindings = d.findings
   const findings = allFindings.filter(f => !f.supersededByFindingId)
@@ -429,14 +472,7 @@ export function buildRunModel(d: Detail): RunModel {
     for (const a of ws) workerFindings.set(a, [...(workerFindings.get(a) ?? []), f])
   }
 
-  const times = [d.run.createdAt]
-  for (const e of d.exchangesSummary) times.push(e.createdAt)
-  for (const a of d.assignments) times.push(a.createdAt)
-  for (const f of d.facts) times.push(f.createdAt)
-  for (const e of d.evidence) times.push(e.createdAt)
-  for (const m of d.messages) times.push(m.createdAt)
-  for (const r of d.reports) times.push(r.createdAt)
-  const end = Math.max(...times)
+  const end = computeRunEnd(d)
 
   const risk = new Map((d.threatModel?.entries ?? []).map(e => [e.origin, e]))
   const approved = new Set(d.run.approved)

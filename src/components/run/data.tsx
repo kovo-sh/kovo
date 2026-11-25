@@ -6,9 +6,11 @@
 //   useFullExchange(id) → one exchange with headers and body (shared cache)
 //
 // Live updates: one EventSource on /api/runs/:id/events?since=<initialCursor>
-// streams new events after the loader snapshot. Incoming events newer than the
-// loaded snapshot schedule a 350ms debounced `runData` refresh, and only refresh
-// `runShellData` when a run-status or finding-count-changing event arrives.
+// streams new events after the loader snapshot, while an initial bounded
+// historical backfill hydrates events up to <initialCursor> without triggering
+// DB refresh storms. Incoming live events newer than the loaded snapshot
+// schedule a 350ms debounced `runData` refresh, and only refresh `runShellData`
+// when a run-status or finding-count-changing event arrives.
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { commandRun, readExchange, runData, runShellData } from '../../actions.ts'
@@ -128,6 +130,114 @@ export function sseStreamSinceCursor(initialCursor: number): number {
   return Number.isSafeInteger(initialCursor) && initialCursor > 0 ? initialCursor : 0
 }
 
+/** Merge two event slices into an ascending, deduplicated list by numeric event id. */
+export function mergeRunEvents(existing: readonly RunEvent[], incoming: readonly RunEvent[]): RunEvent[] {
+  if (!incoming.length) return existing as RunEvent[]
+  if (!existing.length) {
+    const seen = new Map<number, RunEvent>()
+    for (const ev of incoming) seen.set(ev.id, ev)
+    return [...seen.values()].sort((a, b) => a.id - b.id)
+  }
+  const byId = new Map<number, RunEvent>()
+  for (const ev of existing) byId.set(ev.id, ev)
+  for (const ev of incoming) byId.set(ev.id, ev)
+  return [...byId.values()].sort((a, b) => a.id - b.id)
+}
+
+/** Parse complete SSE frames from a text buffer, returning parsed `RunEvent`s and leftover partial text. */
+export function parseSseEventsChunk(carry: string, chunk: string): { events: RunEvent[]; carry: string } {
+  const combined = carry + chunk
+  const parts = combined.split(/\r?\n\r?\n/)
+  const nextCarry = parts.pop() ?? ''
+  const events: RunEvent[] = []
+  for (const frame of parts) {
+    if (!frame.trim()) continue
+    const dataLines: string[] = []
+    for (const line of frame.split(/\r?\n/)) {
+      if (!line || line.startsWith(':')) continue
+      if (line.startsWith('data:')) {
+        dataLines.push(line.slice(5).replace(/^ /, ''))
+      }
+    }
+    if (!dataLines.length) continue
+    try {
+      const parsed = JSON.parse(dataLines.join('\n')) as RunEvent
+      if (parsed && Number.isFinite(parsed.id)) events.push(parsed)
+    } catch {
+      // Ignore malformed SSE frames.
+    }
+  }
+  return { events, carry: nextCarry }
+}
+
+/**
+ * Hydrate historical events (`id <= targetCursor`) from the SSE endpoint when a page reloads
+ * or opens a finished run whose snapshot cursor is already > 0. Aborts immediately once
+ * `targetCursor` is reached (or after a brief idle pause if the cursor row was pruned),
+ * without triggering any `runData` or `runShellData` refreshes.
+ */
+export async function hydrateHistoricalEvents(
+  runId: string,
+  targetCursor: number,
+  opts: {
+    signal: AbortSignal
+    onBatch: (batch: RunEvent[]) => void
+    fetchImpl?: typeof fetch
+    idleMs?: number
+  },
+): Promise<void> {
+  if (targetCursor <= 0 || opts.signal.aborted) return
+  const fetcher = opts.fetchImpl ?? (typeof fetch === 'function' ? fetch : undefined)
+  if (!fetcher) return
+  const localAbort = new AbortController()
+  const forwardAbort = () => localAbort.abort()
+  opts.signal.addEventListener('abort', forwardAbort, { once: true })
+  let idleTimer: ReturnType<typeof setTimeout> | undefined
+  const idleMs = opts.idleMs ?? 450
+  const armIdle = (ms: number) => {
+    if (idleTimer !== undefined) clearTimeout(idleTimer)
+    idleTimer = setTimeout(() => localAbort.abort(), ms)
+  }
+  try {
+    armIdle(Math.max(idleMs, 2500))
+    const response = await fetcher(`/api/runs/${runId}/events`, {
+      headers: { Accept: 'text/event-stream' },
+      signal: localAbort.signal,
+    })
+    if (!response.ok || !response.body) return
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let carry = ''
+    let maxSeenId = 0
+    armIdle(idleMs)
+    while (!localAbort.signal.aborted) {
+      const { value, done } = await reader.read()
+      if (done) break
+      armIdle(idleMs)
+      const parsed = parseSseEventsChunk(carry, decoder.decode(value, { stream: true }))
+      carry = parsed.carry
+      if (parsed.events.length) {
+        const historical: RunEvent[] = []
+        for (const ev of parsed.events) {
+          if (ev.id > maxSeenId) maxSeenId = ev.id
+          if (ev.id <= targetCursor) historical.push(ev)
+        }
+        if (historical.length) opts.onBatch(historical)
+        if (maxSeenId >= targetCursor) {
+          localAbort.abort()
+          break
+        }
+      }
+    }
+    try { await reader.cancel() } catch { /* ignore */ }
+  } catch {
+    // Expected AbortError once targetCursor is reached or on cleanup/offline.
+  } finally {
+    if (idleTimer !== undefined) clearTimeout(idleTimer)
+    opts.signal.removeEventListener('abort', forwardAbort)
+  }
+}
+
 export function RunDataProvider({ initial, children, onError }: {
   initial: Detail
   children: ReactNode
@@ -168,7 +278,8 @@ export function RunDataProvider({ initial, children, onError }: {
 
   useEffect(() => { void loadShell() }, [loadShell])
 
-  // Event stream: resume from initial snapshot cursor and debounce refreshes (350ms).
+  // Event stream: resume live updates from initial snapshot cursor (debounced 350ms) and
+  // hydrate historical events up to startCursor without triggering refresh storms.
   const cursor = useRef(sseStreamSinceCursor(initial.cursor))
   useEffect(() => {
     const startCursor = initialCursorRef.current
@@ -177,13 +288,19 @@ export function RunDataProvider({ initial, children, onError }: {
     let refreshing = false
     let again = false
     let pendingShell = false
+    let liveReady = false
+    let historyDone = startCursor <= 0
     let buffer: RunEvent[] = []
     let flushTimer: ReturnType<typeof setTimeout> | undefined
     let settleTimer: ReturnType<typeof setTimeout> | undefined
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
     let lastId = startCursor
+    const backfillAbort = new AbortController()
     setEvents([])
     setEventsReady(false)
+    const maybeReady = () => {
+      if (!disposed && liveReady && historyDone) setEventsReady(true)
+    }
     const runRefresh = () => {
       if (disposed) return
       if (refreshing) { again = true; return }
@@ -217,11 +334,28 @@ export function RunDataProvider({ initial, children, onError }: {
       if (!buffer.length || disposed) return
       const batch = buffer
       buffer = []
-      setEvents(prev => prev.concat(batch))
+      setEvents(prev => mergeRunEvents(prev, batch))
     }
     const settle = () => {
       clearTimeout(settleTimer)
-      settleTimer = setTimeout(() => { if (!disposed) setEventsReady(true) }, 350)
+      settleTimer = setTimeout(() => {
+        if (disposed) return
+        liveReady = true
+        maybeReady()
+      }, 350)
+    }
+    if (startCursor > 0) {
+      void hydrateHistoricalEvents(runId, startCursor, {
+        signal: backfillAbort.signal,
+        onBatch: batch => {
+          if (disposed) return
+          setEvents(prev => mergeRunEvents(prev, batch))
+        },
+      }).finally(() => {
+        if (disposed) return
+        historyDone = true
+        maybeReady()
+      })
     }
     const source = new EventSource(`/api/runs/${runId}/events?since=${startCursor}`)
     source.onopen = () => { setConnection('live'); settle() }
@@ -244,6 +378,7 @@ export function RunDataProvider({ initial, children, onError }: {
     }
     return () => {
       disposed = true
+      backfillAbort.abort()
       clearTimeout(flushTimer)
       clearTimeout(settleTimer)
       clearTimeout(refreshTimer)
