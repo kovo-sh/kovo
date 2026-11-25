@@ -9,3 +9,4 @@ dist/app.js
 /node_modules/
 /.env
 /.env.*
+__pycache__/
