@@ -1,0 +1,609 @@
+{
+  "schemaVersion": "1.0",
+  "bundleKind": "dev_anchors",
+  "description": "Guardian v8 M2 Dev OSS Multi-Hop Anchor Specs (4 targets: Gitea, Directus, Ghost, Mattermost). Defensive QA manifests, external impact oracles, and paired patch-retest contracts only — zero exploit payloads.",
+  "anchors": [
+    {
+      "schemaVersion": "1.0",
+      "anchorId": "oss-dev-gitea-01",
+      "name": "Gitea Webhook-to-Runner Internal Pivot & Token Escalation",
+      "project": "gitea",
+      "split": "dev",
+      "language": "go",
+      "domain": "devops-git-hosting",
+      "terminalVulnClass": "ssrf_internal_pivot_privilege_escalation",
+      "hopCount": 4,
+      "hops": [
+        {
+          "hopId": "H1",
+          "order": 1,
+          "serviceRole": "app",
+          "surface": "http",
+          "summary": "Low-privilege organization collaborator enumerates repository workflow metadata and webhook configuration surface.",
+          "postconditionCapabilityKind": "opaque_object_ref"
+        },
+        {
+          "hopId": "H2",
+          "order": 2,
+          "serviceRole": "worker",
+          "surface": "webhook",
+          "summary": "Repository webhook delivery path reaches isolated internal runner/metadata endpoint across trust boundary due to incomplete host allowlist canonicalization.",
+          "incomingEdgeKind": "async_pivot_binding",
+          "preconditionCapabilityKind": "opaque_object_ref",
+          "postconditionCapabilityKind": "internal_reach_handle",
+          "expectedPatchBreak": true
+        },
+        {
+          "hopId": "H3",
+          "order": 3,
+          "serviceRole": "internal_target",
+          "surface": "async_job",
+          "summary": "Webhook delivery inspection surface leaks a scoped runner/OAuth artifact returned by the internal lab service.",
+          "incomingEdgeKind": "value_binding",
+          "preconditionCapabilityKind": "internal_reach_handle",
+          "postconditionCapabilityKind": "scoped_token"
+        },
+        {
+          "hopId": "H4",
+          "order": 4,
+          "serviceRole": "app",
+          "surface": "http",
+          "summary": "Derived runner credential authorizes a cross-org protected action observed externally by the isolated loopback collector.",
+          "incomingEdgeKind": "derived_crypto_binding",
+          "preconditionCapabilityKind": "scoped_token",
+          "postconditionCapabilityKind": "identity_session"
+        }
+      ],
+      "vulnerableBuild": {
+        "repoUrl": "https://github.com/go-gitea/gitea",
+        "versionTag": "v1.21.11",
+        "commitSha": "1111111111111111111111111111111111111101",
+        "imageRef": "gitea/gitea:1.21.11",
+        "imageDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111101",
+        "pinVerification": "pending_docker_lock",
+        "advisoryCategory": "webhook-ssrf-and-token-pivot"
+      },
+      "patchedBuild": {
+        "repoUrl": "https://github.com/go-gitea/gitea",
+        "versionTag": "v1.22.6",
+        "commitSha": "1111111111111111111111111111111111111102",
+        "imageRef": "gitea/gitea:1.22.6",
+        "imageDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111102",
+        "pinVerification": "pending_docker_lock",
+        "advisoryCategory": "strict-webhook-egress-and-runner-scope-patch"
+      },
+      "expectedPatchBrokeHopIds": ["H2"],
+      "impactOracle": {
+        "oracleId": "ora-gitea-oob-01",
+        "kind": "loopback_oob_collector",
+        "description": "Verifies isolated internal pivot callback bearing run-scoped canary token on the loopback collector.",
+        "targetService": "internal_runner_meta",
+        "expectedCorrelationField": "X-Guardian-Run-Id",
+        "pollTimeoutMs": 5000,
+        "runScopedCanaryPrefix": "oss_canary_gitea_",
+        "collectorUrl": "http://127.0.0.1:19401/oob/gitea",
+        "expectedMethod": "POST",
+        "expectedPathPrefix": "/oob/gitea/",
+        "requireCanaryToken": true
+      },
+      "personas": [
+        {
+          "personaId": "gitea_collab_low",
+          "role": "attacker_low_priv",
+          "username": "collab_dev_a",
+          "credentialRef": "oss_lab_gitea_collab_low",
+          "allowedAsChainOrigin": true
+        },
+        {
+          "personaId": "gitea_org_admin",
+          "role": "victim_admin",
+          "username": "org_owner_a",
+          "credentialRef": "oss_lab_gitea_org_admin",
+          "allowedAsChainOrigin": false
+        }
+      ],
+      "composeTemplate": {
+        "version": "3.9",
+        "projectNamePrefix": "oss-lab-gitea",
+        "egressPolicy": "deny_all_internal_only",
+        "labProxyMode": "loopback_port_publish",
+        "networks": {
+          "gitea_internal": {
+            "driver": "bridge",
+            "internal": true
+          }
+        },
+        "services": {
+          "gitea_app": {
+            "role": "app",
+            "imageRef": "gitea/gitea:1.21.11",
+            "imageDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111101",
+            "networks": ["gitea_internal"],
+            "ports": ["127.0.0.1:0:3000"],
+            "capDrop": ["ALL"],
+            "environment": {
+              "GITEA__database__DB_TYPE": "postgres",
+              "GITEA__security__INSTALL_LOCK": "true",
+              "OSS_LAB_SEED_CRED": "oss_lab_gitea_seed_01"
+            }
+          },
+          "gitea_db": {
+            "role": "db",
+            "imageRef": "postgres:16.4-alpine",
+            "imageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "networks": ["gitea_internal"],
+            "capDrop": ["ALL"],
+            "environment": {
+              "POSTGRES_DB": "gitea_lab",
+              "POSTGRES_USER": "oss_lab_user",
+              "POSTGRES_PASSWORD": "oss_lab_pg_password_01"
+            }
+          },
+          "internal_runner_meta": {
+            "role": "internal_target",
+            "imageRef": "guardian-lab/internal-stub:1.0.0",
+            "imageDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "networks": ["gitea_internal"],
+            "readOnlyRootFs": true,
+            "capDrop": ["ALL"]
+          }
+        }
+      },
+      "evaluationModes": ["black-box", "grey-box", "white-box"]
+    },
+    {
+      "schemaVersion": "1.0",
+      "anchorId": "oss-dev-directus-01",
+      "name": "Directus Multi-Tenant Relational Filter & Flow Hook Privilege Chain",
+      "project": "directus",
+      "split": "dev",
+      "language": "typescript",
+      "domain": "headless-cms-and-data-platform",
+      "terminalVulnClass": "cross_tenant_rbac_privilege_escalation",
+      "hopCount": 4,
+      "hops": [
+        {
+          "hopId": "H1",
+          "order": 1,
+          "serviceRole": "app",
+          "surface": "graphql",
+          "summary": "Low-privilege tenant member queries relational collection schema and discovers cross-tenant reference identifiers.",
+          "postconditionCapabilityKind": "opaque_object_ref"
+        },
+        {
+          "hopId": "H2",
+          "order": 2,
+          "serviceRole": "app",
+          "surface": "http",
+          "summary": "Relational filter asymmetry across REST/GraphQL policy guards exposes a protected workflow trigger handle.",
+          "incomingEdgeKind": "value_binding",
+          "preconditionCapabilityKind": "opaque_object_ref",
+          "postconditionCapabilityKind": "policy_asymmetry",
+          "expectedPatchBreak": true
+        },
+        {
+          "hopId": "H3",
+          "order": 3,
+          "serviceRole": "worker",
+          "surface": "async_job",
+          "summary": "Triggered automation flow mutates a tenant-scoped entity under an elevated flow execution context.",
+          "incomingEdgeKind": "state_transition_binding",
+          "preconditionCapabilityKind": "policy_asymmetry",
+          "postconditionCapabilityKind": "state_handle",
+          "expectedPatchBreak": true
+        },
+        {
+          "hopId": "H4",
+          "order": 4,
+          "serviceRole": "db",
+          "surface": "http",
+          "summary": "Protected cross-tenant role assignment or canary record changes in Postgres, confirmed by external read-only DB oracle.",
+          "incomingEdgeKind": "state_transition_binding",
+          "preconditionCapabilityKind": "state_handle",
+          "postconditionCapabilityKind": "identity_session"
+        }
+      ],
+      "vulnerableBuild": {
+        "repoUrl": "https://github.com/directus/directus",
+        "versionTag": "v10.10.7",
+        "commitSha": "2222222222222222222222222222222222222201",
+        "imageRef": "directus/directus:10.10.7",
+        "imageDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222201",
+        "pinVerification": "pending_docker_lock",
+        "advisoryCategory": "rbac-filter-and-flow-hook-escalation"
+      },
+      "patchedBuild": {
+        "repoUrl": "https://github.com/directus/directus",
+        "versionTag": "v10.13.1",
+        "commitSha": "2222222222222222222222222222222222222202",
+        "imageRef": "directus/directus:10.13.1",
+        "imageDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222202",
+        "pinVerification": "pending_docker_lock",
+        "advisoryCategory": "strict-relational-rbac-and-flow-scope-patch"
+      },
+      "expectedPatchBrokeHopIds": ["H2", "H3"],
+      "impactOracle": {
+        "oracleId": "ora-directus-db-01",
+        "kind": "db_query",
+        "description": "Read-only Postgres check verifying unauthorized tenant role elevation or canary record modification.",
+        "targetService": "directus_db",
+        "expectedCorrelationField": "run_id",
+        "pollTimeoutMs": 4000,
+        "runScopedCanaryPrefix": "oss_canary_directus_",
+        "engine": "postgres",
+        "readOnlyQuery": "SELECT id, role_name, canary_marker FROM directus_lab_audit WHERE canary_marker LIKE 'oss_canary_directus_%'",
+        "expectedPredicate": {
+          "column": "canary_marker",
+          "matchMode": "contains",
+          "expectedValue": "oss_canary_directus_"
+        }
+      },
+      "personas": [
+        {
+          "personaId": "directus_tenant_b_member",
+          "role": "attacker_member",
+          "username": "editor_tenant_b",
+          "credentialRef": "oss_lab_directus_member_b",
+          "allowedAsChainOrigin": true
+        },
+        {
+          "personaId": "directus_tenant_a_admin",
+          "role": "victim_admin",
+          "username": "admin_tenant_a",
+          "credentialRef": "oss_lab_directus_admin_a",
+          "allowedAsChainOrigin": false
+        }
+      ],
+      "composeTemplate": {
+        "version": "3.9",
+        "projectNamePrefix": "oss-lab-directus",
+        "egressPolicy": "deny_all_internal_only",
+        "labProxyMode": "loopback_port_publish",
+        "networks": {
+          "directus_internal": {
+            "driver": "bridge",
+            "internal": true
+          }
+        },
+        "services": {
+          "directus_app": {
+            "role": "app",
+            "imageRef": "directus/directus:10.10.7",
+            "imageDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222201",
+            "networks": ["directus_internal"],
+            "ports": ["127.0.0.1:0:8055"],
+            "capDrop": ["ALL"],
+            "environment": {
+              "DB_CLIENT": "pg",
+              "KEY": "oss_lab_directus_key_01",
+              "SECRET": "oss_lab_directus_secret_01"
+            }
+          },
+          "directus_db": {
+            "role": "db",
+            "imageRef": "postgres:16.4-alpine",
+            "imageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "networks": ["directus_internal"],
+            "capDrop": ["ALL"],
+            "environment": {
+              "POSTGRES_DB": "directus_lab",
+              "POSTGRES_USER": "oss_lab_user",
+              "POSTGRES_PASSWORD": "oss_lab_pg_password_02"
+            }
+          },
+          "directus_cache": {
+            "role": "cache",
+            "imageRef": "redis:7.2.5-alpine",
+            "imageDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "networks": ["directus_internal"],
+            "readOnlyRootFs": true,
+            "capDrop": ["ALL"]
+          }
+        }
+      },
+      "evaluationModes": ["black-box", "grey-box", "white-box"]
+    },
+    {
+      "schemaVersion": "1.0",
+      "anchorId": "oss-dev-ghost-01",
+      "name": "Ghost Admin Preview & Session Pivot Chain",
+      "project": "ghost",
+      "split": "dev",
+      "language": "javascript",
+      "domain": "publishing-and-membership-cms",
+      "terminalVulnClass": "stored_preview_admin_session_pivot",
+      "hopCount": 4,
+      "hops": [
+        {
+          "hopId": "H1",
+          "order": 1,
+          "serviceRole": "app",
+          "surface": "http",
+          "summary": "Contributor account submits content/theme metadata accepted by public author validation.",
+          "postconditionCapabilityKind": "write_sink_handle"
+        },
+        {
+          "hopId": "H2",
+          "order": 2,
+          "serviceRole": "app",
+          "surface": "browser",
+          "summary": "Admin preview workflow renders the stored artifact in a privileged preview context (victim admin session).",
+          "incomingEdgeKind": "async_pivot_binding",
+          "preconditionCapabilityKind": "write_sink_handle",
+          "postconditionCapabilityKind": "identity_session",
+          "expectedPatchBreak": true
+        },
+        {
+          "hopId": "H3",
+          "order": 3,
+          "serviceRole": "app",
+          "surface": "http",
+          "summary": "Admin session context creates an elevated staff integration token or settings export trigger.",
+          "incomingEdgeKind": "value_binding",
+          "preconditionCapabilityKind": "identity_session",
+          "postconditionCapabilityKind": "scoped_token"
+        },
+        {
+          "hopId": "H4",
+          "order": 4,
+          "serviceRole": "worker",
+          "surface": "storage",
+          "summary": "Elevated export workflow writes a run-scoped canary marker to the isolated export integrity path.",
+          "incomingEdgeKind": "state_transition_binding",
+          "preconditionCapabilityKind": "scoped_token",
+          "postconditionCapabilityKind": "state_handle"
+        }
+      ],
+      "vulnerableBuild": {
+        "repoUrl": "https://github.com/TryGhost/Ghost",
+        "versionTag": "v5.82.2",
+        "commitSha": "3333333333333333333333333333333333333301",
+        "imageRef": "ghost:5.82.2-alpine",
+        "imageDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333301",
+        "pinVerification": "pending_docker_lock",
+        "advisoryCategory": "admin-preview-context-and-session-pivot"
+      },
+      "patchedBuild": {
+        "repoUrl": "https://github.com/TryGhost/Ghost",
+        "versionTag": "v5.96.0",
+        "commitSha": "3333333333333333333333333333333333333302",
+        "imageRef": "ghost:5.96.0-alpine",
+        "imageDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333302",
+        "pinVerification": "pending_docker_lock",
+        "advisoryCategory": "strict-preview-sanitization-and-session-boundary-patch"
+      },
+      "expectedPatchBrokeHopIds": ["H2"],
+      "impactOracle": {
+        "oracleId": "ora-ghost-file-01",
+        "kind": "file_integrity",
+        "description": "Verifies run-scoped canary marker written to the isolated admin export audit file.",
+        "targetService": "ghost_export_worker",
+        "expectedCorrelationField": "run_id",
+        "pollTimeoutMs": 5000,
+        "runScopedCanaryPrefix": "oss_canary_ghost_",
+        "containerRole": "worker",
+        "watchPath": "/var/lib/ghost-lab/exports/audit-marker.txt",
+        "checkMode": "canary_written"
+      },
+      "personas": [
+        {
+          "personaId": "ghost_contributor",
+          "role": "attacker_low_priv",
+          "username": "contrib_author",
+          "credentialRef": "oss_lab_ghost_contributor",
+          "allowedAsChainOrigin": true
+        },
+        {
+          "personaId": "ghost_site_owner",
+          "role": "victim_admin",
+          "username": "owner_admin",
+          "credentialRef": "oss_lab_ghost_owner",
+          "allowedAsChainOrigin": false
+        }
+      ],
+      "composeTemplate": {
+        "version": "3.9",
+        "projectNamePrefix": "oss-lab-ghost",
+        "egressPolicy": "deny_all_internal_only",
+        "labProxyMode": "loopback_port_publish",
+        "networks": {
+          "ghost_internal": {
+            "driver": "bridge",
+            "internal": true
+          }
+        },
+        "services": {
+          "ghost_app": {
+            "role": "app",
+            "imageRef": "ghost:5.82.2-alpine",
+            "imageDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333301",
+            "networks": ["ghost_internal"],
+            "ports": ["127.0.0.1:0:2368"],
+            "capDrop": ["ALL"],
+            "environment": {
+              "NODE_ENV": "production",
+              "url": "http://127.0.0.1:2368",
+              "OSS_LAB_SEED_CRED": "oss_lab_ghost_seed_01"
+            }
+          },
+          "ghost_db": {
+            "role": "db",
+            "imageRef": "mysql:8.0.39",
+            "imageDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "networks": ["ghost_internal"],
+            "capDrop": ["ALL"],
+            "environment": {
+              "MYSQL_DATABASE": "ghost_lab",
+              "MYSQL_USER": "oss_lab_user",
+              "MYSQL_PASSWORD": "oss_lab_mysql_password_03",
+              "MYSQL_ROOT_PASSWORD": "oss_lab_mysql_root_03"
+            }
+          },
+          "ghost_export_worker": {
+            "role": "worker",
+            "imageRef": "guardian-lab/ghost-preview-bot:1.0.0",
+            "imageDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "networks": ["ghost_internal"],
+            "capDrop": ["ALL"]
+          }
+        }
+      },
+      "evaluationModes": ["black-box", "grey-box", "white-box"]
+    },
+    {
+      "schemaVersion": "1.0",
+      "anchorId": "oss-dev-mattermost-01",
+      "name": "Mattermost Collab IAM / Webhook & SSO Assertion Chain",
+      "project": "mattermost",
+      "split": "dev",
+      "language": "go",
+      "domain": "enterprise-collaboration-and-iam",
+      "terminalVulnClass": "iam_sso_webhook_privilege_escalation",
+      "hopCount": 4,
+      "hops": [
+        {
+          "hopId": "H1",
+          "order": 1,
+          "serviceRole": "app",
+          "surface": "http",
+          "summary": "Regular team member enumerates channel/webhook metadata and workspace SSO identity linkage.",
+          "postconditionCapabilityKind": "opaque_object_ref"
+        },
+        {
+          "hopId": "H2",
+          "order": 2,
+          "serviceRole": "idp",
+          "surface": "idp",
+          "summary": "Identity binding across workspace SSO/OAuth assertion surface permits tenant or role scope confusion.",
+          "incomingEdgeKind": "derived_crypto_binding",
+          "preconditionCapabilityKind": "opaque_object_ref",
+          "postconditionCapabilityKind": "scoped_token",
+          "expectedPatchBreak": true
+        },
+        {
+          "hopId": "H3",
+          "order": 3,
+          "serviceRole": "app",
+          "surface": "webhook",
+          "summary": "Scoped integration token registers or invokes an administrative compliance export webhook.",
+          "incomingEdgeKind": "value_binding",
+          "preconditionCapabilityKind": "scoped_token",
+          "postconditionCapabilityKind": "state_handle"
+        },
+        {
+          "hopId": "H4",
+          "order": 4,
+          "serviceRole": "app",
+          "surface": "async_job",
+          "summary": "Compliance audit stream logs unauthorized privileged workspace export event verified by external container log oracle.",
+          "incomingEdgeKind": "async_pivot_binding",
+          "preconditionCapabilityKind": "state_handle",
+          "postconditionCapabilityKind": "identity_session"
+        }
+      ],
+      "vulnerableBuild": {
+        "repoUrl": "https://github.com/mattermost/mattermost",
+        "versionTag": "v9.5.8",
+        "commitSha": "4444444444444444444444444444444444444401",
+        "imageRef": "mattermost/mattermost-team-edition:9.5.8",
+        "imageDigest": "sha256:4444444444444444444444444444444444444444444444444444444444444401",
+        "pinVerification": "pending_docker_lock",
+        "advisoryCategory": "iam-sso-and-webhook-scope-chain"
+      },
+      "patchedBuild": {
+        "repoUrl": "https://github.com/mattermost/mattermost",
+        "versionTag": "v9.11.4",
+        "commitSha": "4444444444444444444444444444444444444402",
+        "imageRef": "mattermost/mattermost-team-edition:9.11.4",
+        "imageDigest": "sha256:4444444444444444444444444444444444444444444444444444444444444402",
+        "pinVerification": "pending_docker_lock",
+        "advisoryCategory": "strict-sso-claim-binding-and-webhook-authz-patch"
+      },
+      "expectedPatchBrokeHopIds": ["H2"],
+      "impactOracle": {
+        "oracleId": "ora-mattermost-log-01",
+        "kind": "container_log",
+        "description": "Monitors Mattermost structured audit stdout for unauthorized compliance export completion bearing run canary.",
+        "targetService": "mattermost_app",
+        "expectedCorrelationField": "run_id",
+        "pollTimeoutMs": 5000,
+        "runScopedCanaryPrefix": "oss_canary_mm_",
+        "containerRole": "app",
+        "stream": "stdout",
+        "expectedPattern": "audit_event=compliance_export_complete.*oss_canary_mm_[a-z0-9_-]+",
+        "forbidPattern": "audit_event=compliance_export_denied"
+      },
+      "personas": [
+        {
+          "personaId": "mm_team_member",
+          "role": "attacker_member",
+          "username": "member_collab_a",
+          "credentialRef": "oss_lab_mm_member_a",
+          "allowedAsChainOrigin": true
+        },
+        {
+          "personaId": "mm_sys_admin",
+          "role": "victim_admin",
+          "username": "sysadmin_lab",
+          "credentialRef": "oss_lab_mm_sysadmin",
+          "allowedAsChainOrigin": false
+        }
+      ],
+      "composeTemplate": {
+        "version": "3.9",
+        "projectNamePrefix": "oss-lab-mattermost",
+        "egressPolicy": "deny_all_internal_only",
+        "labProxyMode": "isolated_lab_proxy",
+        "networks": {
+          "mm_internal": {
+            "driver": "bridge",
+            "internal": true
+          }
+        },
+        "services": {
+          "mm_lab_proxy": {
+            "role": "lab_proxy",
+            "imageRef": "guardian-lab/loopback-proxy:1.0.0",
+            "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "networks": ["mm_internal"],
+            "ports": ["127.0.0.1:0:8065"],
+            "readOnlyRootFs": true,
+            "capDrop": ["ALL"]
+          },
+          "mattermost_app": {
+            "role": "app",
+            "imageRef": "mattermost/mattermost-team-edition:9.5.8",
+            "imageDigest": "sha256:4444444444444444444444444444444444444444444444444444444444444401",
+            "networks": ["mm_internal"],
+            "capDrop": ["ALL"],
+            "environment": {
+              "MM_SQLSETTINGS_DRIVERNAME": "postgres",
+              "OSS_LAB_SEED_CRED": "oss_lab_mm_seed_01"
+            }
+          },
+          "mattermost_idp": {
+            "role": "idp",
+            "imageRef": "guardian-lab/oidc-stub:1.0.0",
+            "imageDigest": "sha256:abababababababababababababababababababababababababababababababab",
+            "networks": ["mm_internal"],
+            "readOnlyRootFs": true,
+            "capDrop": ["ALL"]
+          },
+          "mattermost_db": {
+            "role": "db",
+            "imageRef": "postgres:16.4-alpine",
+            "imageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "networks": ["mm_internal"],
+            "capDrop": ["ALL"],
+            "environment": {
+              "POSTGRES_DB": "mm_lab",
+              "POSTGRES_USER": "oss_lab_user",
+              "POSTGRES_PASSWORD": "oss_lab_pg_password_04"
+            }
+          }
+        }
+      },
+      "evaluationModes": ["black-box", "grey-box", "white-box"]
+    }
+  ]
+}
