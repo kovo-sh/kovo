@@ -382,7 +382,7 @@ export function benchmarkCliHelp(): string {
     '  --verify-patches                              held-out-saas: verify reproduced -> fixed patch retests',
     '                                                (20 isolated patches + one all-patches pass)',
     '  --verifier-backend <auto|docker|local-jq>     Zero-LLM verifier backend (default: auto)',
-    '  --max-requests <n>                            Broker audit-unit budget (default: 3800, env GUARDIAN_BENCH_MAX_REQUESTS)',
+    '  --max-requests <n>                            Broker audit-unit budget (default: 6000, env GUARDIAN_BENCH_MAX_REQUESTS)',
     '  --deadline-ms <n>                             Wall-clock budget for the live pipeline (default: 480000)',
     '  --probe-concurrency <n>                       Parallel read-only hypotheses, 1-8 (default: 4, env GUARDIAN_BENCH_PROBE_CONCURRENCY)',
     '  --verify-concurrency <n>                      Candidate specs verified in parallel, 1-4 (default: 2)',

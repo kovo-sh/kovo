@@ -797,14 +797,17 @@ test('M4.8 computeMultiTrialFanout BVA and live Execution multi-trial early stop
   const engine = new Execution(storage, { backend: createLocalJqBackend() })
   await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
     engine.start()
-    engine.wake()
-    const deadline = Date.now() + 25_000
-    while (Date.now() < deadline) {
-      const steps = storage.listChainSteps(runId)
-      if (steps.length >= 2 && steps.some(s => s.status === 'canceled')) break
-      await new Promise(r => setTimeout(r, 50))
+    try {
+      engine.wake()
+      const deadline = Date.now() + 25_000
+      while (Date.now() < deadline) {
+        const steps = storage.listChainSteps(runId)
+        if (steps.length >= 2 && steps.some(s => s.status === 'canceled')) break
+        await new Promise(r => setTimeout(r, 50))
+      }
+    } finally {
+      await stopExecution(engine as never)
     }
-    await stopExecution(engine as never)
   })
 
   const steps = storage.listChainSteps(runId)
@@ -870,27 +873,30 @@ test('M4.9 Execution wires LabRunner startLabTarget -> expose origin -> teardown
   const engine = new Execution(storage, { labRunner: mockLabRunner, backend: createLocalJqBackend() })
   await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
     engine.start()
-    engine.wake()
-    const deadline = Date.now() + 6_000
-    while (Date.now() < deadline && startedCalls.length === 0) {
-      await new Promise(r => setTimeout(r, 50))
+    try {
+      engine.wake()
+      const deadline = Date.now() + 6_000
+      while (Date.now() < deadline && startedCalls.length === 0) {
+        await new Promise(r => setTimeout(r, 50))
+      }
+      // Wait briefly for lab.started event & origin exposure
+      const evDeadline = Date.now() + 3_000
+      while (Date.now() < evDeadline) {
+        const evs = storage.client.prepare('SELECT kind FROM events WHERE run_id = ?').all(runId) as Array<{ kind: string }>
+        if (evs.some(e => e.kind === 'lab.started')) break
+        await new Promise(r => setTimeout(r, 40))
+      }
+      assert.equal(startedCalls.length, 1, 'Expected LabRunner.startLabTarget to be invoked once')
+      assert.equal(engine.getLabTargetHandle(runId)?.origin, fx.origin)
+      const updatedRun = storage.run(runId)
+      assert.ok(updatedRun.candidates.some(c => c.origin === fx.origin && updatedRun.approved.includes(c.id)), 'Booted local-lab origin must be exposed in approved run scope')
+      // Mark run complete and trigger tick teardown
+      storage.updateRun(runId, { status: 'complete' })
+      engine.wake()
+      await new Promise(r => setTimeout(r, 100))
+    } finally {
+      await stopExecution(engine as never)
     }
-    // Wait briefly for lab.started event & origin exposure
-    const evDeadline = Date.now() + 3_000
-    while (Date.now() < evDeadline) {
-      const evs = storage.client.prepare('SELECT kind FROM events WHERE run_id = ?').all(runId) as Array<{ kind: string }>
-      if (evs.some(e => e.kind === 'lab.started')) break
-      await new Promise(r => setTimeout(r, 40))
-    }
-    assert.equal(startedCalls.length, 1, 'Expected LabRunner.startLabTarget to be invoked once')
-    assert.equal(engine.getLabTargetHandle(runId)?.origin, fx.origin)
-    const updatedRun = storage.run(runId)
-    assert.ok(updatedRun.candidates.some(c => c.origin === fx.origin && updatedRun.approved.includes(c.id)), 'Booted local-lab origin must be exposed in approved run scope')
-    // Mark run complete and trigger tick teardown
-    storage.updateRun(runId, { status: 'complete' })
-    engine.wake()
-    await new Promise(r => setTimeout(r, 100))
-    await stopExecution(engine as never)
   })
 
   assert.ok(stoppedRunIds.includes(runId) || stopAllCalled, 'Expected LabRunner teardown on run completion / stop')

@@ -737,13 +737,44 @@ const PREFIXED_SLUG_OBJECT_ID_RE = /^[a-z]{2,6}[_-][a-z0-9]{3,}$/i
 const ROUTE_PREFIX_OR_VERSION_RE = /^(?:api|v\d+|api[-_]?v\d+|v\d+[-_](?:alpha|beta|rc)\d*)$/i
 const NON_OBJECT_SEGMENT_RE = /^(?:api|v\d+|api[-_]?v\d+|v\d+[-_](?:alpha|beta|rc)\d*|oauth2?|http2|2fa|utf[-_]?8|sha[-_]?256|base[-_]?64|health[-_]?check|sign[-_]?(?:in|up|out)|log[-_]?(?:in|out)|reset[-_]?password|forgot[-_]?password|api[-_]?keys?|webhook[-_]?test|feature[-_]?flags?|user[-_]?profile|audit[-_]?logs?|credit[-_]?cards?|payment[-_]?methods?|rate[-_]?limits?)$/i
 const OBJECT_QUERY_PARAM_RE = /(?:^|[?&])(?:[a-z0-9_]*_?id|tenant|org|organization|account|user|owner|customer|email|slug|key|number|token|code|handle)=[^&]+/i
+const GRAPHQL_OBJECT_KEY_RE = /^(?:[a-z0-9_]*_?id|tenant|org|organization|account|user|owner|customer|email|slug|key|number|token|code|handle)$/i
+const GRAPHQL_INLINE_OBJECT_ARG_RE = /\(\s*[^)]*\b(?:[a-z0-9_]*_?id|tenant|org|organization|account|user|owner|customer|email|slug|key|number|token|code|handle)\s*:\s*(?:"[^"\s][^"]*"|\d+)/i
+const GRAPHQL_VAR_OBJECT_ARG_RE = /\(\s*[^)]*\b(?:[a-z0-9_]*_?id|tenant|org|organization|account|user|owner|customer|email|slug|key|number|token|code|handle)\s*:\s*\$([A-Za-z_][A-Za-z0-9_]*)/gi
 const TENANT_SCOPE_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:tenant|org|organization|workspace)(?:_?id)?$/i
 
+function hasNonEmptyScalar(val: unknown): boolean {
+  return (typeof val === 'string' && val.trim().length > 0) || (typeof val === 'number' && Number.isFinite(val))
+}
+
 /**
- * True when a request targets a specific object (concrete ID segment in the path or an explicit
- * identifier query parameter) rather than a bare collection listing like `GET /api/v1/charges`.
+ * True when a request targets a specific object (concrete ID segment in the path, an explicit
+ * identifier query parameter, or a read-only GraphQL query carrying an object-identifier argument
+ * or variable) rather than a bare collection listing like `GET /api/v1/charges`.
  */
-export function isObjectScopedRequest(step: Pick<ImpactStep, 'route' | 'pathAndQuery'>): boolean {
+export function isObjectScopedRequest(
+  step: Pick<ImpactStep, 'route' | 'pathAndQuery'> & Partial<Pick<ImpactStep, 'method' | 'requestJson'>>,
+): boolean {
+  if (step.method && step.requestJson !== undefined && isReadOnlyGraphqlRequest({ method: step.method, requestJson: step.requestJson })) {
+    const body = step.requestJson as { query?: unknown; variables?: unknown }
+    const vars = body.variables && typeof body.variables === 'object' && !Array.isArray(body.variables)
+      ? (body.variables as Record<string, unknown>)
+      : null
+    if (vars) {
+      for (const [key, val] of Object.entries(vars)) {
+        if (GRAPHQL_OBJECT_KEY_RE.test(key) && hasNonEmptyScalar(val)) return true
+      }
+    }
+    if (typeof body.query === 'string') {
+      if (GRAPHQL_INLINE_OBJECT_ARG_RE.test(body.query)) return true
+      if (vars) {
+        GRAPHQL_VAR_OBJECT_ARG_RE.lastIndex = 0
+        let match: RegExpExecArray | null
+        while ((match = GRAPHQL_VAR_OBJECT_ARG_RE.exec(body.query)) !== null) {
+          if (hasNonEmptyScalar(vars[match[1]!])) return true
+        }
+      }
+    }
+  }
   const pathAndQuery = (step.pathAndQuery ?? step.route ?? '').trim()
   if (!pathAndQuery) return false
   const [pathname, query = ''] = pathAndQuery.split('?', 2)

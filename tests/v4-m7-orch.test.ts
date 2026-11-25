@@ -30,10 +30,10 @@ import { withEnv } from './v4-tier-helpers.ts'
 const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
 describe('M7 orchestration: config knobs', () => {
-  test('defaults preserve the pre-M7 request/deadline compatibility values', () => {
+  test('defaults preserve the v7 floor request/deadline compatibility values', () => {
     const cfg = resolveBenchOrchestrationConfig({})
     assert.equal(cfg.maxRequests, BENCH_MAX_REQUESTS_DEFAULT)
-    assert.equal(cfg.maxRequests, 3800)
+    assert.equal(cfg.maxRequests, 6000)
     assert.equal(cfg.deadlineMs, BENCH_DEADLINE_MS_DEFAULT)
     assert.equal(cfg.deadlineMs, 8 * 60_000)
     assert.equal(cfg.probeConcurrency, BENCH_PROBE_CONCURRENCY_DEFAULT)
@@ -73,7 +73,7 @@ describe('M7 orchestration: config knobs', () => {
       GUARDIAN_BENCH_VERIFY_CONCURRENCY: '-3',
       GUARDIAN_BENCH_SLOW_PROBES: '900',
     })
-    assert.equal(cfg.maxRequests, 3800)
+    assert.equal(cfg.maxRequests, 6000)
     assert.equal(cfg.deadlineMs, 480_000)
     assert.equal(cfg.probeConcurrency, 1)
     assert.equal(cfg.verifyConcurrency, 1)
