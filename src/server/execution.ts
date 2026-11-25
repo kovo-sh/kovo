@@ -66,7 +66,13 @@ import {
   type ExecCoreServices,
 } from './exec-exchange.ts'
 import { ExecFloorLane } from './exec-floor-lane.ts'
-import { ExecReconPlanner } from './exec-recon-planner.ts'
+import {
+  ExecReconPlanner,
+  HOP_CONTINUATION_DIRECTIVE,
+  MAX_WORKSPACE_DIGEST_BYTES,
+  buildWorkspaceSourceDigest,
+} from './exec-recon-planner.ts'
+export { HOP_CONTINUATION_DIRECTIVE, MAX_WORKSPACE_DIGEST_BYTES, buildWorkspaceSourceDigest } from './exec-recon-planner.ts'
 import { ExecVerifier } from './exec-verify.ts'
 import { ExecWorkerRunner, type ExecBrokeredTransportContext } from './exec-worker-runner.ts'
 export { agentProofAttribution, probeCanaryClass, runV8AgentScriptProof, syncVerifyArtifactsToLedger } from './exec-verify.ts'
@@ -93,6 +99,7 @@ import { tenantTagForRun } from './scope-policy.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
 import { codeAuditSuspectLocationKey, runThreeStageSemanticAudit, toChainStepInputs, type SemanticAuditSuspect } from './semantic-audit.ts'
 import { cloneWorkerPersona } from './session-isolation.ts'
+import { buildStaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
 import {
   assessmentAssignments,
   store,
@@ -140,6 +147,8 @@ import {
   computeHostTiers,
   computeStepMaxTurns,
   isMultiStepAssignment,
+  resolveWorkerSettlementMs,
+  resolveWorkerWallClockMs,
   singleStepWallClockMs,
   planAssignmentBudget,
   percentile,
@@ -2011,6 +2020,19 @@ export class Execution {
 
     try {
       const stagedSpecs = await this.stageProjectSpecs(run.projectId, session, controller.signal)
+      const staticSnapshot = buildStaticWorkspaceSnapshot(reposDir, { mountedRepos })
+      const workspaceDigest = buildWorkspaceSourceDigest(staticSnapshot, MAX_WORKSPACE_DIGEST_BYTES)
+      const digestStagedPath = await session.stage('workspace-source-digest.md', workspaceDigest, controller.signal).catch(() => null)
+      const auditSpecsSummary: Array<{ name: string; kind: string; origin?: string | null; stagedPath?: string; digest?: string }> = [
+        ...stagedSpecs,
+        {
+          name: 'Pre-Indexed Multi-Service Route, Authz Guard & Sink Digest',
+          kind: 'workspace_source_digest',
+          origin: [...approvedOrigins][0] ?? null,
+          ...(digestStagedPath ? { stagedPath: digestStagedPath } : {}),
+          digest: workspaceDigest,
+        },
+      ]
       const handlers: WorkerToolHandlers = this.buildSharedSessionHandlers(job, session, currentSecrets, {
         offlineScriptLabel: 'Offline {runtime} script (code audit)',
         deriveEvidenceTitle: 'Code audit analysis',
@@ -2035,6 +2057,7 @@ export class Execution {
           session,
           reposDir,
           mountedRepos,
+          staticSnapshot,
           approvedOrigins: [...approvedOrigins],
           hostTiers: hostTiersForAudit,
           modelProfiles: resolveProfilePoolForRole('reasoning', profiles),
@@ -2053,6 +2076,7 @@ export class Execution {
           // Budgeted Stage-1 LLM spec + dynamic rule synthesis; opt out with GUARDIAN_STAGE1_LLM=0.
           enableStage1Llm: process.env.GUARDIAN_STAGE1_LLM !== '0',
           persistToStore: true,
+          staticSnapshot,
         })
         semanticPromise.catch(() => undefined)
         const semanticTimeout = new Promise<never>((_, reject) => {
@@ -2099,7 +2123,7 @@ export class Execution {
               approvedOrigins: [...approvedOrigins],
               mountedRepos,
               personas: personasPub,
-              specsSummary: stagedSpecs,
+              specsSummary: auditSpecsSummary,
               threatModel,
               maxTurns: auditMaxTurns,
             }),
@@ -3414,12 +3438,19 @@ export class Execution {
       Math.min(specialistConfig.maxTurnsCeiling, run.workerMaxTurns > 0 ? Math.min(run.workerMaxTurns, specialistConfig.defaultMaxTurns) : specialistConfig.defaultMaxTurns),
     )
     const stepMaxTurns = computeStepMaxTurns(targetOrigins, hostTiers, baseSpecialistTurns)
-    // Throughput: a standalone step gets a short cap so the slot turns over; only a step that
-    // cites upstream evidence keeps the long chain budget.
+    // Throughput: standalone single-route steps rotate quickly at 120s; multi-hop chain and
+    // continuation steps scale proportionally (180s–300s) so 3–6 hop chains reach ctx.prove_composite.
+    const runMaxDuration = Number((run as { maxDurationMs?: number }).maxDurationMs)
+    const effectiveRunDurationMs = Number.isFinite(runMaxDuration) && runMaxDuration > 0
+      ? runMaxDuration
+      : this.maxDurationMs
+    const multiHopChain = isMultiHopChainStep(step)
     const rawBudget = planAssignmentBudget({
       routes: this.reconPlanner.stepMentionedRoutes(step),
       parentEvidenceIds: step.dependsOnFactIds,
       dependsOnStepIds: step.dependsOnStepIds,
+      multiHopChain,
+      runDurationMs: effectiveRunDurationMs,
       multiStep: isMultiStepAssignment({
         title: step.title,
         hypothesis: step.hypothesis,
@@ -3430,9 +3461,15 @@ export class Execution {
       baseWallClockMs: this.specialistWallClockMs(stepMaxTurns),
       singleStepWallClockMs: singleStepWallClockMs(),
     })
-    const budget: AssignmentBudget = this.assignmentWallClockOverrideMs !== undefined
-      ? { ...rawBudget, wallClockMs: this.assignmentWallClockOverrideMs }
-      : rawBudget
+    const resolvedWallClockMs = resolveWorkerWallClockMs(step, effectiveRunDurationMs, {
+      singleStepWallClockMs: singleStepWallClockMs(),
+    })
+    const effectiveWallClockMs = this.assignmentWallClockOverrideMs ?? resolvedWallClockMs
+    const budget: AssignmentBudget = {
+      ...rawBudget,
+      wallClockMs: effectiveWallClockMs,
+      wallClockSettlementMs: resolveWorkerSettlementMs(effectiveWallClockMs, multiHopChain),
+    }
 
     const assignment = this.storage.transaction(() => {
       const worker = this.storage.makeWorker(run, 'investigation', primaryAsset, step.title, step.hypothesis, {

@@ -1479,16 +1479,43 @@ export function isDetLeadDispatchStep(step: Pick<DispatchLaneStep, 'title' | 'hy
     /\blead upgrade\b/i.test(text)
 }
 
+/** Prefix on `ChainStep.skills` tracking automatic hop-continuation depth (`chain_continuation:1`, `:2`). */
+export const CHAIN_CONTINUATION_SKILL_PREFIX = 'chain_continuation:'
+/** Maximum automatic hop-continuation steps enqueued per rotated multi-hop chain lineage. */
+export const MAX_CHAIN_CONTINUATIONS = 2
+
+/** Extract the continuation depth (`0` for original steps, `1..N` for continuation steps). */
+export function extractContinuationDepth(step: { skills?: readonly string[] }): number {
+  let maxDepth = 0
+  for (const skill of step.skills ?? []) {
+    if (!skill.startsWith(CHAIN_CONTINUATION_SKILL_PREFIX)) continue
+    const parsed = Number(skill.slice(CHAIN_CONTINUATION_SKILL_PREFIX.length).trim())
+    if (Number.isInteger(parsed) && parsed > maxDepth) maxDepth = parsed
+  }
+  return maxDepth
+}
+
+/** True when a step is an automatic hop-continuation step carrying a verified checkpoint. */
+export function isChainContinuationStep(step: { skills?: readonly string[] }): boolean {
+  return extractContinuationDepth(step) > 0
+}
+
 /** Identify genuine multi-hop / depth >= 2 chain steps eligible for dedicated frontier slot reservation. */
 export function isMultiHopChainStep(
   step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'category' | 'skills' | 'dependsOnStepIds'>,
 ): boolean {
   if ((step.dependsOnStepIds?.length ?? 0) > 0) return true
-  if ((step.skills ?? []).some(skill => skill === 'multihop-chains' || skill === 'chain-primitives' || skill.startsWith('chain:'))) {
+  if ((step.skills ?? []).some(skill =>
+    skill === 'multihop-chains'
+    || skill === 'chain-primitives'
+    || skill.startsWith('chain:')
+    || skill.startsWith(CHAIN_CONTINUATION_SKILL_PREFIX)
+    || skill.startsWith('checkpoint_cap:'),
+  )) {
     return true
   }
   const text = `${step.title} ${step.hypothesis ?? ''} ${step.category ?? ''}`
-  return /\[chain_hops=|\bhopCheckpoint\b|\bmulti[- ]?hop\b|\bchain_step\b/i.test(text)
+  return /\[chain_hops=|\bhopCheckpoint\b|\bmulti[- ]?hop\b|\bchain_step\b|\bchain_continuation\b/i.test(text)
 }
 
 /** Map a step onto the round-robin lane it competes in. */
@@ -1555,6 +1582,13 @@ export function planRoundRobinDispatch<T extends DispatchLaneStep>(
     else lanes.get(lane)!.push(step)
   }
   for (const lane of lanes.values()) lane.sort((a, b) => compareDispatchSteps(a, b, options.hostTiers))
+  // Prioritize automatic hop-continuation steps at the very top of the chain frontier lane so
+  // verified H1–H2 checkpoints resume H3–H5 immediately ahead of fresh cold chain hypotheses.
+  lanes.get('chain')!.sort((a, b) =>
+    Number(isChainContinuationStep(b)) - Number(isChainContinuationStep(a))
+    || extractContinuationDepth(b) - extractContinuationDepth(a)
+    || compareDispatchSteps(a, b, options.hostTiers),
+  )
   duplicateTrials.sort((a, b) => compareDispatchSteps(a.step, b.step, options.hostTiers))
 
   const leadCap = Math.max(
@@ -2055,6 +2089,14 @@ export function isMultiStepAssignment(input: {
 /** Multi-step chains that cite parent evidence keep the long cap (bounded below). */
 export const CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS = 120_000
 export const CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS = 180_000
+/** Proportional wall-clock bounds for multi-hop `chain` / continuation workers (180s–300s). */
+export const MULTI_HOP_CHAIN_MIN_WALL_CLOCK_MS = 180_000
+export const MULTI_HOP_CHAIN_MAX_WALL_CLOCK_MS = 300_000
+export const MULTI_HOP_CHAIN_DEFAULT_WALL_CLOCK_MS = 240_000
+export const MULTI_HOP_CHAIN_WALL_CLOCK_SHARE = 0.30
+/** Settlement buffer for multi-hop `chain` workers (`max(wall - 25s, wall * 0.82)`). */
+export const MULTI_HOP_CHAIN_SETTLEMENT_BUFFER_MS = 25_000
+export const MULTI_HOP_CHAIN_SETTLEMENT_SHARE = 0.82
 /** A provider generation longer than this is recorded as a stall turn (flag threshold). */
 export const PROVIDER_STALL_TURN_MS = 10_000
 /** Hard-stall abort threshold floor/ceiling (multiple of the observed median turn latency). */
@@ -2167,6 +2209,48 @@ export function singleStepWallClockMs(env: NodeJS.ProcessEnv = process.env): num
   return Math.max(30_000, Math.min(120_000, Math.round(raw)))
 }
 
+/**
+ * Resolve per-worker wall-clock budget:
+ *  - Multi-hop `chain` / continuation steps scale proportionally (`30%` of `runDurationMs`,
+ *    clamped to `180s..300s`; default `240s` when `runDurationMs` is unset) so 3–6 hop chains
+ *    have enough runway to finish Hops 3–5 and call `ctx.prove_composite(...)`.
+ *  - Single-route non-chain steps retain the fast `120s` rotation window so sweeps turn over
+ *    quickly and never starve the multi-hop frontier.
+ */
+export function resolveWorkerWallClockMs(
+  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'category' | 'skills' | 'dependsOnStepIds'>,
+  runDurationMs?: number,
+  options: { singleStepWallClockMs?: number } = {},
+): number {
+  if (isMultiHopChainStep(step)) {
+    if (typeof runDurationMs === 'number' && Number.isFinite(runDurationMs) && runDurationMs > 0) {
+      return Math.min(
+        MULTI_HOP_CHAIN_MAX_WALL_CLOCK_MS,
+        Math.max(MULTI_HOP_CHAIN_MIN_WALL_CLOCK_MS, Math.floor(runDurationMs * MULTI_HOP_CHAIN_WALL_CLOCK_SHARE)),
+      )
+    }
+    return MULTI_HOP_CHAIN_DEFAULT_WALL_CLOCK_MS
+  }
+  return Math.max(
+    30_000,
+    Math.min(SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS, Math.round(options.singleStepWallClockMs ?? SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS)),
+  )
+}
+
+/**
+ * Resolve when the worker settlement nudge fires:
+ *  - Multi-hop `chain` steps settle at `max(wallMs - 25s, wallMs * 0.82)` so the worker keeps a
+ *    full final turn to emit `ctx.prove_composite(...)`.
+ *  - Non-chain steps keep the standard `max(wallMs - 15s, wallMs * 0.80)` schedule.
+ */
+export function resolveWorkerSettlementMs(wallClockMs: number, isMultiHop: boolean): number {
+  const wall = Math.max(1, Math.floor(wallClockMs))
+  if (isMultiHop) {
+    return Math.max(1, Math.min(wall, Math.max(wall - MULTI_HOP_CHAIN_SETTLEMENT_BUFFER_MS, Math.floor(wall * MULTI_HOP_CHAIN_SETTLEMENT_SHARE))))
+  }
+  return Math.max(1, Math.min(wall, Math.max(wall - 15_000, Math.floor(wall * 0.8))))
+}
+
 export interface AssignmentBudgetInput {
   /** Endpoint templates the step names (see `stepMentionedRoutes`). */
   routes: readonly string[]
@@ -2175,6 +2259,10 @@ export interface AssignmentBudgetInput {
   dependsOnStepIds: readonly string[]
   /** Race / cross-persona / multi-step evidence work (see `isMultiStepAssignment`). */
   multiStep?: boolean
+  /** True when the step is a multi-hop `chain` or hop-continuation step (`isMultiHopChainStep`). */
+  multiHopChain?: boolean
+  /** Overall run wall-clock duration in ms (scales multi-hop chain budgets proportionally). */
+  runDurationMs?: number
   baseMaxTurns: number
   baseWallClockMs: number
   singleStepWallClockMs?: number
@@ -2184,6 +2272,8 @@ export interface AssignmentBudget {
   kind: 'single_step' | 'chain'
   maxTurns: number
   wallClockMs: number
+  /** Optional wall-clock settlement threshold in ms (multi-hop uses `max(wall - 25s, wall * 0.82)`). */
+  wallClockSettlementMs?: number
   /** Turn at which the hard settlement nudge fires (N-2). */
   settlementTurn: number
 }
@@ -2196,10 +2286,25 @@ export interface AssignmentBudget {
  * turns to reach the over-count/denied-control step, so they keep the long wall cap too.
  */
 export function planAssignmentBudget(input: AssignmentBudgetInput): AssignmentBudget {
-  const chain = input.parentEvidenceIds.length > 0 || input.dependsOnStepIds.length > 0
+  const multiHopChain = input.multiHopChain === true
+  const chain = multiHopChain || input.parentEvidenceIds.length > 0 || input.dependsOnStepIds.length > 0
   const multiStep = input.multiStep === true
   const baseTurns = Math.max(4, Math.floor(input.baseMaxTurns))
   const baseWall = Math.max(20_000, Math.round(input.baseWallClockMs))
+  if (multiHopChain) {
+    const maxTurns = Math.max(20, Math.min(34, baseTurns))
+    const wallClockMs = resolveWorkerWallClockMs(
+      { title: '', skills: ['multihop-chains'], dependsOnStepIds: [] },
+      input.runDurationMs,
+    )
+    return {
+      kind: 'chain',
+      maxTurns,
+      wallClockMs,
+      wallClockSettlementMs: resolveWorkerSettlementMs(wallClockMs, true),
+      settlementTurn: Math.max(1, maxTurns - 2),
+    }
+  }
   if (chain || multiStep) {
     const maxTurns = chain
       ? Math.max(20, Math.min(34, baseTurns))
