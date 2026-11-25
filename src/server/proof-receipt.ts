@@ -110,7 +110,7 @@ export interface ReceiptVerification {
   confirmed: boolean
   vulnClass: string
   /** Rule family used to validate the receipt. */
-  rule: 'impact' | 'oob' | 'timing' | 'boolean' | 'status_differential' | 'browser' | 'redirect' | 'conserved_balance' | 'none'
+  rule: 'impact' | 'oob' | 'timing' | 'boolean' | 'status_differential' | 'browser' | 'redirect' | 'conserved_balance' | 'auth_bypass' | 'none'
   reason: string
   observed: string
   expected: string
@@ -129,6 +129,7 @@ const BOOLEAN_CLASS_RE = /^(?:sqli|sql_boolean|sql_boolean_diff|boolean_sqli|boo
 const STATUS_DIFF_CLASS_RE = /^(?:sqli_status|sql_status|sql_status_diff|status_sqli|status_boolean)$/i
 const REDIRECT_CLASS_RE = /^(?:open_redirect|redirect|url_redirect|unvalidated_redirect)$/i
 const CONSERVED_BALANCE_CLASS_RE = /^(?:race|race_double_spend|race_condition|race_burst|double_spend|oversell|inventory_oversell|conserved_balance|toctou)$/i
+const AUTH_BYPASS_CLASS_RE = /^(?:auth_bypass|jwt_forgery|broken_auth|auth_protocol|token_forgery|authentication_bypass)$/i
 
 const IMPACT_CLASS_BY_VULN: Readonly<Record<string, ImpactClass>> = {
   bola: 'authorization',
@@ -159,6 +160,7 @@ const IMPACT_CLASS_BY_VULN: Readonly<Record<string, ImpactClass>> = {
   injection: 'injection',
   'injection-input': 'injection',
   injection_input: 'injection',
+  sqli_error: 'injection',
   nosqli: 'injection',
   nosql_injection: 'injection',
   ssti: 'injection',
@@ -176,6 +178,7 @@ export function receiptRuleFor(vulnClass: string): { rule: ReceiptVerification['
   if (BOOLEAN_CLASS_RE.test(vulnClass)) return { rule: 'boolean' }
   if (TIMING_CLASS_RE.test(vulnClass)) return { rule: 'timing' }
   if (CONSERVED_BALANCE_CLASS_RE.test(vulnClass)) return { rule: 'conserved_balance' }
+  if (AUTH_BYPASS_CLASS_RE.test(vulnClass)) return { rule: 'auth_bypass' }
   if (REDIRECT_CLASS_RE.test(vulnClass)) return { rule: 'redirect' }
   const impactClass = IMPACT_CLASS_BY_VULN[vulnClass.toLowerCase()]
   if (impactClass) return { rule: 'impact', impactClass }
@@ -472,6 +475,10 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
 
   if (rule === 'conserved_balance') {
     return verifyConservedBalanceReceipt(receipt, entriesById)
+  }
+
+  if (rule === 'auth_bypass') {
+    return verifyAuthBypassReceipt(receipt, entriesById)
   }
 
   // Impact rules: re-run the shared oracle model over the recorded steps.
@@ -809,7 +816,7 @@ function verifyConservedBalanceReceipt(
   }
 
   // Evaluate conservation violation on the concurrent burst.
-  let violationKind: 'under_debit' | 'negative_balance' | 'cap_overshoot' | null = null
+  let violationKind: 'under_debit' | 'negative_balance' | 'cap_overshoot' | 'over_credit' | null = null
   if (conserved.pre >= 0 && conserved.post < 0) {
     violationKind = 'negative_balance'
   } else if (cap && conserved.pre <= cap.value && conserved.post > cap.value) {
@@ -818,7 +825,13 @@ function verifyConservedBalanceReceipt(
     // Require concrete movement (either burst debited >0 but <expected, OR serial control proved a
     // single serial mutation debits >0 while the concurrent burst debited less than expected).
     const provedMutating = actualBurstDebit > 1e-6 || (serialDebitObserved !== null && serialDebitObserved > 1e-6)
-    if (provedMutating) violationKind = 'under_debit'
+    if (provedMutating) {
+      violationKind = 'under_debit'
+    } else if (serialControlKind === 'serial_rejection' && conserved.post > conserved.pre + 1e-6) {
+      // Single-use credit/coupon race: >=2 concurrent redemptions credited the balance while a
+      // subsequent serial redemption was rejected with 4xx.
+      violationKind = 'over_credit'
+    }
   }
 
   if (!violationKind) {
@@ -848,6 +861,208 @@ function verifyConservedBalanceReceipt(
       serialControlKind,
       ...(serialDebitObserved !== null ? { serialDebitObserved } : {}),
       ...(cap ? { capField: cap.field, capValue: cap.value } : {}),
+    },
+  }
+}
+
+const AUTH_BYPASS_BOILERPLATE_KEY_RE = /^(?:ok|status|success|message|msg|error|errors|detail|details|code|timestamp|time|date|version|health|healthy|alive|ping|pong|request_?id|trace_?id|correlation_?id|nonce)$/i
+const AUTH_BYPASS_VOLATILE_HEADER_RE = /^(?:host|content-length|connection|user-agent|accept|accept-encoding|x-request-id|x-correlation-id|x-trace-id|traceparent|tracestate|date)$/i
+
+function canonicalRequestHeaderMap(headers: Record<string, string> | null | undefined): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (!headers) return out
+  for (const [k, v] of Object.entries(headers)) {
+    const lower = k.trim().toLowerCase()
+    if (!lower || AUTH_BYPASS_VOLATILE_HEADER_RE.test(lower)) continue
+    out[lower] = String(v)
+  }
+  return out
+}
+
+function authBypassRequestDifferential(
+  control: ImpactStep,
+  probe: ImpactStep,
+): 'header' | 'query' | 'body' | null {
+  const controlHeaders = canonicalRequestHeaderMap(control.requestHeaders)
+  const probeHeaders = canonicalRequestHeaderMap(probe.requestHeaders)
+  const headerKeys = new Set([...Object.keys(controlHeaders), ...Object.keys(probeHeaders)])
+  for (const key of headerKeys) {
+    if (controlHeaders[key] !== probeHeaders[key]) return 'header'
+  }
+  if ((control.pathAndQuery ?? '') !== (probe.pathAndQuery ?? '')) return 'query'
+  if (JSON.stringify(control.requestJson ?? null) !== JSON.stringify(probe.requestJson ?? null)) return 'body'
+  return null
+}
+
+function collectSubstantiveAuthDataFields(value: unknown, prefix = '', depth = 0, out: string[] = []): string[] {
+  if (depth > 4 || out.length >= 16 || value === null || value === undefined) return out
+  if (Array.isArray(value)) {
+    if (value.length === 0) return out
+    for (let i = 0; i < Math.min(value.length, 4); i += 1) {
+      const item = value[i]
+      if (item && typeof item === 'object') {
+        collectSubstantiveAuthDataFields(item, `${prefix}[${i}]`, depth + 1, out)
+      } else if (typeof item === 'string' ? item.trim().length > 0 : item !== null && item !== undefined) {
+        const leaf = prefix.split('.').pop()?.replace(/\[\d+\]$/, '') ?? ''
+        if (leaf && !AUTH_BYPASS_BOILERPLATE_KEY_RE.test(leaf)) out.push(prefix)
+        break
+      }
+    }
+    return out
+  }
+  if (typeof value !== 'object') return out
+  const entries = Object.entries(value as Record<string, unknown>)
+  // Error-only envelopes (`{ error: "..." }`) never prove protected account data was returned.
+  const nonErrorKeys = entries.filter(([k]) => !/^(?:error|errors|message|msg|detail|details|status|code|ok|success)$/i.test(k))
+  if (depth === 0 && nonErrorKeys.length === 0) return out
+  for (const [key, child] of entries) {
+    const path = prefix ? `${prefix}.${key}` : key
+    if (child && typeof child === 'object') {
+      collectSubstantiveAuthDataFields(child, path, depth + 1, out)
+    } else if (!AUTH_BYPASS_BOILERPLATE_KEY_RE.test(key)) {
+      const nonEmpty = typeof child === 'string'
+        ? child.trim().length > 0
+        : child !== null && child !== undefined
+      if (nonEmpty) out.push(path)
+    }
+  }
+  return out
+}
+
+/**
+ * Fail-closed `auth_bypass` receipt rule (`CWE-287` / `CWE-347`):
+ * Proves authentication bypass or forged-token access on a protected route.
+ * Requires:
+ *  1. A 401/403 control on the exact same route & HTTP method (proving the route IS gated, never public),
+ *  2. A 2xx probe on the same route & method carrying a distinct auth header/token, bypass query param,
+ *     or request body differential (never a normal Layer-1 vault-persona login crossing an anon-401!),
+ *  3. Substantive structured private/account data in the probe response distinct from the control
+ *     (rejecting status-only, empty, boilerplate `{ok:true}`, error-only, and HTML shell responses).
+ */
+function verifyAuthBypassReceipt(
+  receipt: ProofReceipt,
+  entriesById: ReadonlyMap<string, ReceiptTranscriptEntry>,
+): ReceiptVerification {
+  const rule = 'auth_bypass' as const
+  if (receipt.exchangeIds.length < 2) {
+    return reject(receipt, rule, 'An auth_bypass receipt requires a denied (401/403) control and a bypassing 2xx probe exchange.')
+  }
+  const cited = receipt.exchangeIds.map(id => entriesById.get(id)!)
+  const controls = cited.filter(entry => entry.step.arm === 'control')
+  const probes = cited.filter(entry => entry.step.arm === 'probe')
+  if (controls.length === 0 || probes.length === 0) {
+    return reject(receipt, rule, 'An auth_bypass receipt requires at least one control arm and one probe arm.')
+  }
+
+  const deniedControls = controls.filter(entry => entry.step.status === 401 || entry.step.status === 403)
+  if (deniedControls.length === 0) {
+    return reject(
+      receipt,
+      rule,
+      'Auth bypass rejected: no control exchange was denied with 401 or 403 on the target route (a public or ungated endpoint is not an authentication bypass).',
+    )
+  }
+
+  const okProbes = probes.filter(entry => is2xxStatus(entry.step.status))
+  if (okProbes.length === 0) {
+    return reject(receipt, rule, 'Auth bypass rejected: no probe exchange succeeded with a 2xx status.')
+  }
+
+  let matchedPair: {
+    control: ReceiptTranscriptEntry
+    probe: ReceiptTranscriptEntry
+    differential: 'header' | 'query' | 'body'
+    dataFields: string[]
+  } | null = null
+  let lastRejection = 'No control/probe pair on the same protected route demonstrated a valid authentication bypass.'
+
+  for (const probe of okProbes) {
+    const probeRoute = routeOf(probe.step)
+    const probeMethod = probe.step.method.toUpperCase()
+    if (receipt.target.method && probeMethod !== receipt.target.method) {
+      lastRejection = `The probe method (${probeMethod}) does not match the receipt target (${receipt.target.method}).`
+      continue
+    }
+    if (receipt.target.pathAndQuery && probeRoute !== normalizePath(receipt.target.pathAndQuery)) {
+      lastRejection = `The probe route (${probeRoute}) does not match the receipt target (${normalizePath(receipt.target.pathAndQuery)}).`
+      continue
+    }
+    const sameRouteControls = deniedControls.filter(
+      control => routeOf(control.step) === probeRoute && control.step.method.toUpperCase() === probeMethod,
+    )
+    if (sameRouteControls.length === 0) {
+      lastRejection = `No 401/403 control exists on the exact same route and method (${probeMethod} ${probeRoute}).`
+      continue
+    }
+    for (const control of sameRouteControls) {
+      // Precision guard: unauthenticated 401 vs a legitimate host-injected vault persona 200 is
+      // normal authentication working, NOT an auth bypass.
+      if (control.step.actor.handle === null && probe.step.actor.handle !== null) {
+        lastRejection = `Normal authenticated persona "${probe.step.actor.handle}" crossing an unauthenticated 401 is standard login, not an authentication bypass.`
+        continue
+      }
+      const differential = authBypassRequestDifferential(control.step, probe.step)
+      if (!differential) {
+        lastRejection = 'Control and probe requests carry no distinct auth header, forged token, bypass parameter, or request body differential.'
+        continue
+      }
+      const probeBodyRaw = typeof probe.step.body === 'string'
+        ? probe.step.body
+        : probe.step.json !== undefined ? JSON.stringify(probe.step.json) : ''
+      const controlBodyRaw = typeof control.step.body === 'string'
+        ? control.step.body
+        : control.step.json !== undefined ? JSON.stringify(control.step.json) : ''
+      const probeTrim = probeBodyRaw.trim()
+      if (probeTrim.length < 12) {
+        lastRejection = 'Auth bypass rejected: probe returned an empty or trivially short body (status-only 2xx is never proof).'
+        continue
+      }
+      if (probeTrim === controlBodyRaw.trim()) {
+        lastRejection = 'Auth bypass rejected: probe response body is identical to the denied control response.'
+        continue
+      }
+      const parsedJson = parseStepJson(probe.step)
+      if (parsedJson !== undefined) {
+        const fields = collectSubstantiveAuthDataFields(parsedJson)
+        if (fields.length === 0) {
+          lastRejection = 'Auth bypass rejected: probe JSON contains only generic status/boilerplate/error keys and no structured private or account data.'
+          continue
+        }
+        matchedPair = { control, probe, differential, dataFields: fields }
+        break
+      }
+      // Non-JSON response: reject HTML shells/login pages and trivial text; require substantive data.
+      if (/^(?:<!doctype\s+html|<html\b)/i.test(probeTrim)) {
+        lastRejection = 'Auth bypass rejected: probe returned an HTML document/shell rather than structured protected data.'
+        continue
+      }
+      if (probeTrim.length < 24 || /^(?:ok|success|true|done|accepted|pong)$/i.test(probeTrim)) {
+        lastRejection = 'Auth bypass rejected: probe response lacks substantive protected data (status-only/trivial text).'
+        continue
+      }
+      matchedPair = { control, probe, differential, dataFields: ['text_body'] }
+      break
+    }
+    if (matchedPair) break
+  }
+
+  if (!matchedPair) {
+    return reject(receipt, rule, lastRejection)
+  }
+
+  return {
+    confirmed: true,
+    vulnClass: receipt.vulnClass,
+    rule,
+    reason: `Authentication bypass confirmed on ${matchedPair.probe.step.method.toUpperCase()} ${routeOf(matchedPair.probe.step)}: control denied (${matchedPair.control.step.status}) while probe with distinct ${matchedPair.differential} bypass returned ${matchedPair.probe.step.status} with structured protected data (${matchedPair.dataFields.slice(0, 6).join(', ')}).`,
+    observed: receipt.claimedDelta,
+    expected: 'forged tokens, bypass headers, or unauthenticated bypass parameters are rejected identically to the 401/403 control',
+    evidence: {
+      controlStatus: matchedPair.control.step.status,
+      probeStatus: matchedPair.probe.step.status,
+      route: routeOf(matchedPair.probe.step),
+      differentialKind: matchedPair.differential,
+      dataFields: matchedPair.dataFields.slice(0, 8),
     },
   }
 }
@@ -1016,6 +1231,7 @@ export interface ScriptProofExchange {
   /** Host-resolved persona role label (e.g. "owner (acme)"); never script-supplied. */
   actorRoleLabel?: string | null
   body?: string
+  requestBody?: string | null
   requestHeaders?: Record<string, string> | null
   responseHeaders?: Record<string, string> | null
 }
@@ -1098,27 +1314,35 @@ export function buildAgentScriptReceipt(input: {
     armOverrides: ReadonlyMap<string, ImpactStep['arm']>,
     extra?: {
       requestJson?: unknown
+      requestJsonById?: ReadonlyMap<string, unknown>
       ambientAuth?: ImpactStep['actor']['auth']
       sameSite?: string | null
       evidenceRoleOverrides?: ReadonlyMap<string, string>
     },
   ): ReceiptTranscript => ({
-    entries: input.exchanges.map(exchange => ({
-      exchangeId: exchange.exchangeId,
-      step: impactStepOf(exchange, {
-        ...(armOverrides.has(exchange.exchangeId) ? { arm: armOverrides.get(exchange.exchangeId)! } : {}),
-        ...(extra?.requestJson !== undefined ? { requestJson: extra.requestJson } : {}),
-        ...(extra?.ambientAuth ? { ambientAuth: extra.ambientAuth } : {}),
-        ...(extra?.sameSite !== undefined ? { sameSite: extra.sameSite } : {}),
-      }),
-      ...(exchange.durationMs !== undefined ? { durationMs: exchange.durationMs } : {}),
-      ...(exchange.body !== undefined
-        ? { carrierText: `${exchange.pathAndQuery}\n${JSON.stringify(exchange.requestHeaders ?? {})}\n${exchange.body}` }
-        : {}),
-      ...(extra?.evidenceRoleOverrides?.has(exchange.exchangeId)
-        ? { evidenceRole: extra.evidenceRoleOverrides.get(exchange.exchangeId)! }
-        : exchange.sessionRole ? { evidenceRole: exchange.sessionRole } : {}),
-    })),
+    entries: input.exchanges.map(exchange => {
+      const perExchangeReq = extra?.requestJsonById?.has(exchange.exchangeId)
+        ? extra.requestJsonById.get(exchange.exchangeId)
+        : exchange.requestBody !== undefined && exchange.requestBody !== null
+          ? (() => { try { return JSON.parse(exchange.requestBody) } catch { return exchange.requestBody } })()
+          : extra?.requestJson
+      return {
+        exchangeId: exchange.exchangeId,
+        step: impactStepOf(exchange, {
+          ...(armOverrides.has(exchange.exchangeId) ? { arm: armOverrides.get(exchange.exchangeId)! } : {}),
+          ...(perExchangeReq !== undefined ? { requestJson: perExchangeReq } : {}),
+          ...(extra?.ambientAuth ? { ambientAuth: extra.ambientAuth } : {}),
+          ...(extra?.sameSite !== undefined ? { sameSite: extra.sameSite } : {}),
+        }),
+        ...(exchange.durationMs !== undefined ? { durationMs: exchange.durationMs } : {}),
+        ...(exchange.body !== undefined
+          ? { carrierText: `${exchange.pathAndQuery}\n${JSON.stringify(exchange.requestHeaders ?? {})}\n${exchange.body}` }
+          : {}),
+        ...(extra?.evidenceRoleOverrides?.has(exchange.exchangeId)
+          ? { evidenceRole: extra.evidenceRoleOverrides.get(exchange.exchangeId)! }
+          : exchange.sessionRole ? { evidenceRole: exchange.sessionRole } : {}),
+      }
+    }),
   })
   const cited = (ids: readonly string[]) => ids.filter(id => byId.has(id))
 
@@ -1128,9 +1352,13 @@ export function buildAgentScriptReceipt(input: {
     if (typeof impactClass !== 'string') continue
     const rawVulnClass = recordField(claim, 'vulnClass')
     const explicitVuln = typeof rawVulnClass === 'string' ? rawVulnClass.trim().toLowerCase() : ''
-    const vulnClass = explicitVuln && IMPACT_CLASS_BY_VULN[explicitVuln] === impactClass
+    const vulnClass = explicitVuln && AUTH_BYPASS_CLASS_RE.test(explicitVuln)
       ? explicitVuln
-      : IMPACT_CLASS_TO_VULN_CLASS[impactClass]
+      : impactClass === 'injection' && /^(?:sqli|sql_injection)$/i.test(explicitVuln)
+        ? 'sqli_error'
+        : explicitVuln && IMPACT_CLASS_BY_VULN[explicitVuln] === impactClass
+          ? explicitVuln
+          : IMPACT_CLASS_TO_VULN_CLASS[impactClass]
     if (!vulnClass) continue
     const probeId = recordField(claim, 'probeExchangeId')
     if (typeof probeId !== 'string') continue
@@ -1210,25 +1438,42 @@ export function buildAgentScriptReceipt(input: {
     const control = byId.get(controlId)
     const probe = byId.get(probeId)
     if (!control || !probe) continue
-    // Mutating boundary claims require persisted before/after readbacks (`impact` claim); only
-    // non-mutating read boundaries map directly onto a `bola`/`bfla` ProofReceipt.
-    const probeMethod = probe.method.toUpperCase()
-    if (probeMethod !== 'GET' && probeMethod !== 'HEAD') continue
     const rawVuln = typeof recordField(claim, 'vulnClass') === 'string'
       ? (recordField(claim, 'vulnClass') as string).trim().toLowerCase()
       : ''
-    const vulnClass = rawVuln && IMPACT_CLASS_BY_VULN[rawVuln]
+    const isAuthBypass = AUTH_BYPASS_CLASS_RE.test(rawVuln) ||
+      (boundaryClass === 'auth' && !rawVuln && !control.personaHandle && !probe.personaHandle)
+    const probeMethod = probe.method.toUpperCase()
+    // Mutating BOLA/BFLA boundary claims require persisted before/after readbacks (`impact` claim);
+    // only non-mutating read boundaries map directly onto `bola`/`bfla`. Auth bypass / forged-token
+    // proofs on protected endpoints may use GET/HEAD/POST when control is 401/403 and probe returns
+    // structured protected data.
+    if (isAuthBypass) {
+      if (probeMethod !== 'GET' && probeMethod !== 'HEAD' && probeMethod !== 'POST') continue
+    } else if (probeMethod !== 'GET' && probeMethod !== 'HEAD') {
+      continue
+    }
+    const vulnClass = rawVuln && (AUTH_BYPASS_CLASS_RE.test(rawVuln) || IMPACT_CLASS_BY_VULN[rawVuln])
       ? rawVuln
-      : boundaryClass === 'auth'
-        ? 'bfla'
-        : 'bola'
+      : isAuthBypass
+        ? 'auth_bypass'
+        : boundaryClass === 'auth'
+          ? 'bfla'
+          : 'bola'
     const exchangeIds = [...new Set([controlId, probeId])]
       .sort((a, b) => (orderById.get(a) ?? 0) - (orderById.get(b) ?? 0))
     const armOverrides = new Map<string, ImpactStep['arm']>([
       [controlId, 'control'],
       [probeId, 'probe'],
     ])
-    const transcript = buildTranscript(armOverrides)
+    const requestJsonById = new Map<string, unknown>()
+    if (recordField(claim, 'controlRequestBody') !== undefined) {
+      requestJsonById.set(controlId, recordField(claim, 'controlRequestBody'))
+    }
+    if (recordField(claim, 'probeRequestBody') !== undefined) {
+      requestJsonById.set(probeId, recordField(claim, 'probeRequestBody'))
+    }
+    const transcript = buildTranscript(armOverrides, requestJsonById.size ? { requestJsonById } : undefined)
     const expectControlDenied = recordField(claim, 'expectControlDenied') !== false
     return {
       receipt: buildProofReceipt({
@@ -1241,8 +1486,73 @@ export function buildAgentScriptReceipt(input: {
         exchangeIds,
         oobEventIds: [],
         browserTraceIds: [],
-        claimedDelta: `${input.title} — access boundary crossed (${control.status ?? 'n/a'} control vs ${probe.status ?? 'n/a'} probe).`.slice(0, 1200),
+        claimedDelta: `${input.title} — ${isAuthBypass ? 'authentication' : 'access'} boundary crossed (${control.status ?? 'n/a'} control vs ${probe.status ?? 'n/a'} probe).`.slice(0, 1200),
         expectControlDenied,
+      }),
+      transcript,
+    }
+  }
+
+  // Paired non-reflected evaluated-expression claims (`body_contains` absent on control + present
+  // on probe for the same >=4-char marker, emitted by `ctx.prove_injection_differential`).
+  // Checked BEFORE `structural_diff` because `prove_injection_differential` also emits a 2-round
+  // `structural_diff` claim for the Layer-3 injection semantic oracle.
+  const bodyClaims = input.claims.filter(claim =>
+    recordField(claim, 'kind') === 'body_contains' &&
+    typeof recordField(claim, 'exchangeId') === 'string' &&
+    typeof recordField(claim, 'text') === 'string' &&
+    (recordField(claim, 'text') as string).length >= 4)
+  for (const present of bodyClaims) {
+    if (recordField(present, 'absent') === true) continue
+    const marker = recordField(present, 'text') as string
+    const probeId = recordField(present, 'exchangeId') as string
+    const probe = byId.get(probeId)
+    if (!probe) continue
+    const absent = bodyClaims.find(c =>
+      recordField(c, 'absent') === true &&
+      recordField(c, 'text') === marker &&
+      typeof recordField(c, 'exchangeId') === 'string' &&
+      recordField(c, 'exchangeId') !== probeId &&
+      byId.has(recordField(c, 'exchangeId') as string))
+    if (!absent) continue
+    const controlId = recordField(absent, 'exchangeId') as string
+    const exchangeIds = [controlId, probeId].sort((a, b) => (orderById.get(a) ?? 0) - (orderById.get(b) ?? 0))
+    const armOverrides = new Map<string, ImpactStep['arm']>([
+      [controlId, 'control'],
+      [probeId, 'probe'],
+    ])
+    const requestJsonById = new Map<string, unknown>()
+    const controlReqBody = recordField(absent, 'controlRequestBody') ?? recordField(absent, 'requestBody') ?? recordField(present, 'controlRequestBody')
+    const probeReqBody = recordField(present, 'probeRequestBody') ?? recordField(present, 'requestBody')
+    if (controlReqBody !== undefined) requestJsonById.set(controlId, controlReqBody)
+    if (probeReqBody !== undefined) requestJsonById.set(probeId, probeReqBody)
+    const transcript = buildTranscript(armOverrides, requestJsonById.size ? { requestJsonById } : undefined)
+    const rawExplicit = typeof recordField(present, 'vulnClass') === 'string'
+      ? (recordField(present, 'vulnClass') as string).trim().toLowerCase()
+      : ''
+    const msg = `${input.title} ${String(recordField(present, 'message') ?? '')}`.toLowerCase()
+    const vulnClass = rawExplicit && IMPACT_CLASS_BY_VULN[rawExplicit] === 'injection'
+      ? rawExplicit
+      : /^(?:sqli|sql_injection)$/i.test(rawExplicit)
+        ? 'sqli_error'
+        : /command|cmdi|os.command|rce/.test(msg)
+          ? 'command_injection'
+          : /ssti|template/.test(msg)
+            ? 'ssti'
+            : 'injection'
+    return {
+      receipt: buildProofReceipt({
+        vulnClass,
+        target: {
+          origin: probe.origin || input.origin,
+          method: probe.method.toUpperCase(),
+          pathAndQuery: probe.pathAndQuery,
+        },
+        exchangeIds,
+        oobEventIds: [],
+        browserTraceIds: [],
+        claimedDelta: `${input.title} — evaluated marker "${marker}" observed only in probe response.`.slice(0, 1200),
+        proofPatterns: [marker],
       }),
       transcript,
     }
@@ -1351,8 +1661,13 @@ export function buildAgentScriptReceipt(input: {
         ...serialIds,
         ...(serialPostId ? [serialPostId] : []),
       ])]
+      const raceRequestBody = recordField(claim, 'requestBody')
+      const requestJsonById = new Map<string, unknown>()
+      if (raceRequestBody !== undefined) {
+        for (const id of [...burstIds, ...serialIds]) requestJsonById.set(id, raceRequestBody)
+      }
       const transcript = buildTranscript(armOverrides, {
-        ...(recordField(claim, 'requestBody') !== undefined ? { requestJson: recordField(claim, 'requestBody') } : {}),
+        ...(requestJsonById.size ? { requestJsonById } : {}),
         evidenceRoleOverrides,
       })
       const rawClass = recordField(claim, 'vulnClass')
@@ -1390,52 +1705,6 @@ export function buildAgentScriptReceipt(input: {
     }
   }
 
-  // Paired non-reflected evaluated-expression claims (`body_contains` absent on control + present
-  // on probe for the same >=4-char marker, emitted by `ctx.prove_injection_differential`).
-  const bodyClaims = input.claims.filter(claim =>
-    recordField(claim, 'kind') === 'body_contains' &&
-    typeof recordField(claim, 'exchangeId') === 'string' &&
-    typeof recordField(claim, 'text') === 'string' &&
-    (recordField(claim, 'text') as string).length >= 4)
-  for (const present of bodyClaims) {
-    if (recordField(present, 'absent') === true) continue
-    const marker = recordField(present, 'text') as string
-    const probeId = recordField(present, 'exchangeId') as string
-    const probe = byId.get(probeId)
-    if (!probe) continue
-    const absent = bodyClaims.find(c =>
-      recordField(c, 'absent') === true &&
-      recordField(c, 'text') === marker &&
-      typeof recordField(c, 'exchangeId') === 'string' &&
-      recordField(c, 'exchangeId') !== probeId &&
-      byId.has(recordField(c, 'exchangeId') as string))
-    if (!absent) continue
-    const controlId = recordField(absent, 'exchangeId') as string
-    const exchangeIds = [controlId, probeId].sort((a, b) => (orderById.get(a) ?? 0) - (orderById.get(b) ?? 0))
-    const armOverrides = new Map<string, ImpactStep['arm']>([
-      [controlId, 'control'],
-      [probeId, 'probe'],
-    ])
-    const transcript = buildTranscript(armOverrides)
-    const msg = `${input.title} ${String(recordField(present, 'message') ?? '')}`.toLowerCase()
-    const vulnClass = /ssti|template/.test(msg) ? 'ssti' : 'injection'
-    return {
-      receipt: buildProofReceipt({
-        vulnClass,
-        target: {
-          origin: probe.origin || input.origin,
-          method: probe.method.toUpperCase(),
-          pathAndQuery: probe.pathAndQuery,
-        },
-        exchangeIds,
-        oobEventIds: [],
-        browserTraceIds: [],
-        claimedDelta: `${input.title} — evaluated marker "${marker}" observed only in probe response.`.slice(0, 1200),
-        proofPatterns: [marker],
-      }),
-      transcript,
-    }
-  }
   return null
 }
 

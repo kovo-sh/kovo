@@ -24,14 +24,41 @@ export type ClaimKind = 'status' | 'header' | 'body_contains' | 'jsonpath' | 'cs
 
 export interface StatusClaim { kind: 'status'; exchangeId: string; expected: number | number[]; message?: string }
 export interface HeaderClaim { kind: 'header'; exchangeId: string; name: string; equals?: string; matches?: string; absent?: boolean; message?: string }
-export interface BodyClaim { kind: 'body_contains'; exchangeId: string; text: string; absent?: boolean; message?: string }
+export interface BodyClaim {
+  kind: 'body_contains'
+  exchangeId: string
+  text: string
+  absent?: boolean
+  vulnClass?: string
+  controlRequestBody?: unknown
+  probeRequestBody?: unknown
+  message?: string
+}
 export interface JsonPathClaim { kind: 'jsonpath'; exchangeId: string; path: string; equals?: unknown; matches?: string; exists?: boolean; message?: string }
 export interface CssClaim { kind: 'css'; exchangeId: string; selector: string; exists?: boolean; count?: number; textEquals?: string; textContains?: string; message?: string }
 export interface SentinelsClaim { kind: 'dom_sentinel'; exchangeId: string; sentinel: string; mode?: 'source' | 'executed'; message?: string }
 export interface OobClaim { kind: 'oob'; exchangeId: string; expectHit?: boolean; message?: string }
 export interface TimingClaim { kind: 'timing'; controlIds: string[]; variantIds: string[]; minPairs?: number; maxPValue?: number; message?: string }
 export interface StructuralDiffClaim { kind: 'structural_diff'; controlIds: string[]; variantIds: string[]; minRounds?: number; minDeltaTokens?: number; maxSimilarity?: number; message?: string }
-export interface RaceClaim { kind: 'race'; exchangeIds: string[]; mode?: 'h2-single-packet' | 'http1-fallback'; minDistinctOutcomes?: number; expectAllSuccess?: boolean; message?: string }
+export interface RaceClaim {
+  kind: 'race'
+  exchangeIds: string[]
+  burstExchangeIds?: string[]
+  baselineExchangeId?: string
+  postExchangeId?: string
+  serialExchangeIds?: string[]
+  serialPreExchangeId?: string
+  serialPostExchangeId?: string
+  balanceField?: string
+  capField?: string
+  unitDebit?: number
+  vulnClass?: string
+  requestBody?: unknown
+  mode?: 'h2-single-packet' | 'http1-fallback'
+  minDistinctOutcomes?: number
+  expectAllSuccess?: boolean
+  message?: string
+}
 export interface ImpactClaim {
   kind: 'impact'
   impactClass: 'authorization' | 'bfla' | 'mass_assignment' | 'csrf' | 'injection'
@@ -54,9 +81,12 @@ export interface ImpactClaim {
 export interface BoundaryClaim {
   kind: 'boundary'
   boundaryClass: 'auth' | 'mfa' | 'access' | 'other'
+  vulnClass?: string
   controlExchangeId: string
   probeExchangeId: string
   expectControlDenied?: boolean
+  controlRequestBody?: unknown
+  probeRequestBody?: unknown
   actorRoles?: Record<string, string>
   actorTenants?: Record<string, string>
   message?: string
@@ -149,12 +179,17 @@ export interface RaceBurstProof extends ProofFeedback {
   fallbackReason: string | null
   summary: Record<string, unknown>
   exchanges: Array<{ exchangeId: string; status: number; durationMs: number; bodySha256: string }>
+  baseline?: HttpExchange | null
+  post?: HttpExchange | null
+  serial?: HttpExchange | null
+  serialPost?: HttpExchange | null
 }
 
 export interface AccessBoundaryInput {
-  controlPersona: string
-  probePersona: string
+  controlPersona?: string | null
+  probePersona?: string | null
   route: HttpTarget
+  probeRoute?: HttpTarget
   expectControlDenied?: boolean
   method?: string
   controlOptions?: HttpOptions
@@ -162,6 +197,7 @@ export interface AccessBoundaryInput {
   controlSession?: string
   probeSession?: string
   boundaryClass?: 'auth' | 'access'
+  vulnClass?: string
   actorRoles?: Record<string, string>
   actorTenants?: Record<string, string>
   message?: string
@@ -245,6 +281,21 @@ export interface RaceBurstInput {
   session?: string
   minDistinctOutcomes?: number
   expectAllSuccess?: boolean
+  /** Optional balance/stock/quota GET endpoint to automatically record conserved-balance readbacks + serial control. */
+  readRoute?: HttpTarget
+  readMethod?: string
+  readPersona?: string
+  serialRequest?: RaceRequestInput | HttpTarget
+  balanceField?: string
+  capField?: string
+  unitDebit?: number
+  vulnClass?: string
+  /** Optional manually recorded exchange IDs if caller ran readbacks/serial control explicitly. */
+  baselineExchangeId?: string
+  postExchangeId?: string
+  serialExchangeIds?: string[]
+  serialPreExchangeId?: string
+  serialPostExchangeId?: string
   message?: string
 }
 
@@ -880,7 +931,7 @@ export class VerifyContext {
    */
   async proveAccessBoundary(input: AccessBoundaryInput): Promise<AccessBoundaryProof> {
     if (!input || typeof input !== 'object') {
-      throw new Error('prove_access_boundary requires { controlPersona, probePersona, route, method?, expectControlDenied? }.')
+      throw new Error('prove_access_boundary requires { controlPersona?, probePersona?, route, method?, boundaryClass?, vulnClass?, expectControlDenied? }.')
     }
     if (!input.route) {
       throw new Error('prove_access_boundary requires `route` (path/URL string or { url|path|pathAndQuery }).')
@@ -888,17 +939,50 @@ export class VerifyContext {
     const controlSession = input.controlSession ?? 'access-boundary-control'
     const probeSession = input.probeSession ?? 'access-boundary-probe'
     const method = input.method ?? 'GET'
-    const control = await this.http(input.route, { ...input.controlOptions, method, as: input.controlPersona, role: 'control', session: controlSession })
-    const probe = await this.http(input.route, { ...input.probeOptions, method, as: input.probePersona, role: 'probe', session: probeSession })
+    const cleanPersona = (value: string | null | undefined): string | undefined => {
+      if (typeof value !== 'string') return undefined
+      const trimmed = value.trim()
+      if (!trimmed || /^(?:anonymous|anon|unauthenticated|none)$/i.test(trimmed)) return undefined
+      return trimmed
+    }
+    const controlPersona = cleanPersona(input.controlPersona ?? input.controlOptions?.as ?? input.controlOptions?.persona)
+    const probePersona = cleanPersona(input.probePersona ?? input.probeOptions?.as ?? input.probeOptions?.persona)
+    const control = await this.http(input.route, {
+      ...input.controlOptions,
+      method,
+      ...(controlPersona ? { as: controlPersona } : { as: undefined, persona: undefined }),
+      role: 'control',
+      session: controlSession,
+    })
+    const probe = await this.http(input.probeRoute ?? input.route, {
+      ...input.probeOptions,
+      method,
+      ...(probePersona ? { as: probePersona } : { as: undefined, persona: undefined }),
+      role: 'probe',
+      session: probeSession,
+    })
     const expectControlDenied = input.expectControlDenied !== false
     const controlDenied = isDeniedStatus(control.status)
     const crossed = isSuccessStatus(probe.status) && (probe.body?.length ?? 0) >= 8
+    const vulnClass = typeof input.vulnClass === 'string' && input.vulnClass.trim() ? input.vulnClass.trim() : undefined
+    const isAuthVuln = vulnClass ? /^(?:auth_bypass|jwt_forgery|broken_auth|auth_protocol|token_forgery|authentication_bypass)$/i.test(vulnClass) : false
+    const boundaryClass: 'auth' | 'access' = input.boundaryClass ?? (isAuthVuln ? 'auth' : 'access')
+    const parseOptBody = (body: unknown): unknown => {
+      if (body === undefined || body === null) return undefined
+      if (typeof body === 'string') return parseJsonBody(body) ?? body
+      return body
+    }
+    const controlReqBody = parseOptBody(input.controlOptions?.body)
+    const probeReqBody = parseOptBody(input.probeOptions?.body)
     const claim: BoundaryClaim = {
       kind: 'boundary',
-      boundaryClass: input.boundaryClass ?? 'access',
+      boundaryClass,
+      ...(vulnClass ? { vulnClass } : {}),
       controlExchangeId: control.exchangeId,
       probeExchangeId: probe.exchangeId,
       expectControlDenied,
+      ...(controlReqBody !== undefined ? { controlRequestBody: controlReqBody } : {}),
+      ...(probeReqBody !== undefined ? { probeRequestBody: probeReqBody } : {}),
       ...(input.actorRoles ? { actorRoles: input.actorRoles } : {}),
       ...(input.actorTenants ? { actorTenants: input.actorTenants } : {}),
       ...(input.message ? { message: input.message } : {}),
@@ -907,7 +991,7 @@ export class VerifyContext {
     const missingEvidence: string[] = []
     if (expectControlDenied && !controlDenied) missingEvidence.push('control_denied')
     if (!crossed) missingEvidence.push('variant_crossed')
-    if (!expectControlDenied && input.controlPersona === input.probePersona) missingEvidence.push('actor_differential')
+    if (!expectControlDenied && (controlPersona ?? '') === (probePersona ?? '')) missingEvidence.push('actor_differential')
     return {
       ok: missingEvidence.length === 0,
       claim,
@@ -1226,11 +1310,14 @@ export class VerifyContext {
 
   /**
    * Race/TOCTOU burst through the broker's synchronized HTTP/2 single-packet barrier (fallback
-   * reported explicitly). Emits a `race` claim that fails on an idempotent/serialized handler.
+   * reported explicitly). When `readRoute` is provided, automatically records the conserved-balance
+   * sequence (baseline readback -> concurrent burst -> post-burst readback -> serial control
+   * mutation [+ post-serial readback]) and attaches all exchange IDs onto the `race` claim so
+   * `buildAgentScriptReceipt` + `verifyConservedBalanceReceipt` confirm cleanly.
    */
   async proveRaceBurst(input: RaceBurstInput): Promise<RaceBurstProof> {
-    if (input.requests.length < 2 || input.requests.length > 10) {
-      const claim: RaceClaim = { kind: 'race', exchangeIds: [], mode: 'http1-fallback', minDistinctOutcomes: input.minDistinctOutcomes ?? 2 }
+    if (!input || !Array.isArray(input.requests) || input.requests.length < 2 || input.requests.length > 10) {
+      const claim: RaceClaim = { kind: 'race', exchangeIds: [], mode: 'http1-fallback', minDistinctOutcomes: input?.minDistinctOutcomes ?? 2 }
       return {
         ok: false,
         claim,
@@ -1241,12 +1328,13 @@ export class VerifyContext {
         ...feedback('race', ['race_requests'], []),
       }
     }
+    let firstRequestBody: unknown = undefined
     const requests = input.requests.map((request, index) => {
       if (typeof request === 'string') {
         const target = splitTarget(request, this.defaultOrigin)
         return { ...(target.origin ? { origin: target.origin } : { origin: this.defaultOrigin }), path: target.path, method: 'GET', sessionGroupRole: 'probe', session: input.session ?? 'race' }
       }
-      if ('url' in request && !('target' in request) && !('path' in request)) {
+      if ('url' in request && !('target' in request) && !('path' in request) && !('method' in request) && !('body' in request)) {
         const target = splitTarget(request as HttpTarget, this.defaultOrigin)
         return { ...(target.origin ? { origin: target.origin } : { origin: this.defaultOrigin }), path: target.path, method: 'GET', sessionGroupRole: 'probe', session: input.session ?? 'race' }
       }
@@ -1254,6 +1342,9 @@ export class VerifyContext {
       const rawTarget = spec.target ?? spec.url ?? spec.path ?? spec.pathAndQuery ?? spec.endpoint ?? spec.route ?? '/'
       const target = splitTarget(rawTarget as HttpTarget, this.defaultOrigin)
       const normalizedReq = normalizeBodyAndHeaders(spec.body, spec.headers)
+      if (index === 0 && normalizedReq.body !== undefined) {
+        firstRequestBody = parseJsonBody(normalizedReq.body) ?? normalizedReq.body
+      }
       return {
         origin: spec.origin ?? target.origin ?? this.defaultOrigin,
         path: target.path,
@@ -1265,6 +1356,18 @@ export class VerifyContext {
         session: input.session ?? `race-${index}`,
       }
     })
+    const firstPersona = requests[0]?.persona
+    const readPersona = input.readPersona ?? firstPersona
+    const readMethod = (input.readMethod ?? 'GET').toUpperCase()
+    let baseline: HttpExchange | null = null
+    if (input.readRoute) {
+      baseline = await this.http(input.readRoute, {
+        method: readMethod,
+        ...(readPersona ? { as: readPersona } : {}),
+        role: 'setup',
+        session: input.session ? `${input.session}-baseline` : 'race-baseline',
+      })
+    }
     const result = await rpc('race', { requests }, (this.timeoutFor(requests.length) + 10_000)) as {
       mode?: 'h2-single-packet' | 'http1-fallback'
       fallbackReason?: string | null
@@ -1278,23 +1381,76 @@ export class VerifyContext {
       durationMs: item.durationMs,
       bodySha256: item.bodySha256,
     }))
+    let post: HttpExchange | null = null
+    let serial: HttpExchange | null = null
+    let serialPost: HttpExchange | null = null
+    if (input.readRoute) {
+      post = await this.http(input.readRoute, {
+        method: readMethod,
+        ...(readPersona ? { as: readPersona } : {}),
+        role: 'control',
+        session: input.session ? `${input.session}-post` : 'race-post',
+      })
+      const serialSpec = input.serialRequest ?? input.requests[0]!
+      const serialArm = normalizeArm(serialSpec, 'prove_race_burst', 'serialRequest')
+      const serialOpts = serialArm.options ?? {}
+      serial = await this.http(serialArm.target, {
+        ...serialOpts,
+        method: serialOpts.method ?? requests[0]?.method ?? 'POST',
+        ...(serialOpts.as ?? serialOpts.persona ?? firstPersona ? { as: serialOpts.as ?? serialOpts.persona ?? firstPersona } : {}),
+        role: 'control',
+        session: input.session ? `${input.session}-serial` : 'race-serial',
+      })
+      if (isSuccessStatus(serial.status)) {
+        serialPost = await this.http(input.readRoute, {
+          method: readMethod,
+          ...(readPersona ? { as: readPersona } : {}),
+          role: 'control',
+          session: input.session ? `${input.session}-serial-post` : 'race-serial-post',
+        })
+      }
+    }
     const distinctBodies = new Set(exchanges.map(item => item.bodySha256)).size
     const distinctStatuses = new Set(exchanges.map(item => item.status)).size
     const distinctOutcomes = Math.max(distinctBodies, distinctStatuses)
     const minDistinct = input.minDistinctOutcomes ?? 2
+    const ackedCount = exchanges.filter(item => isSuccessStatus(item.status)).length
+    const hasConservedContext = Boolean(input.readRoute || input.baselineExchangeId || input.postExchangeId || input.serialExchangeIds?.length)
+    // For conserved-balance races where a subset (>=2) of burst requests succeeded and the rest
+    // returned 4xx (e.g., stock=1 with 2x 201 + 2x 409), allow partial success unless caller forced true.
+    const expectAllSuccess = input.expectAllSuccess !== undefined
+      ? input.expectAllSuccess
+      : (hasConservedContext && ackedCount >= 2 && ackedCount < exchanges.length ? false : true)
+    const burstIds = exchanges.map(item => item.exchangeId)
+    const baselineId = baseline?.exchangeId ?? input.baselineExchangeId
+    const postId = post?.exchangeId ?? input.postExchangeId
+    const serialIds = serial ? [serial.exchangeId] : (input.serialExchangeIds?.length ? [...input.serialExchangeIds] : undefined)
+    const serialPostId = serialPost?.exchangeId ?? input.serialPostExchangeId
     const claim: RaceClaim = {
       kind: 'race',
-      exchangeIds: exchanges.map(item => item.exchangeId),
+      exchangeIds: burstIds,
+      ...(hasConservedContext ? { burstExchangeIds: burstIds } : {}),
+      ...(baselineId ? { baselineExchangeId: baselineId } : {}),
+      ...(postId ? { postExchangeId: postId } : {}),
+      ...(input.serialPreExchangeId ? { serialPreExchangeId: input.serialPreExchangeId } : {}),
+      ...(serialIds ? { serialExchangeIds: serialIds } : {}),
+      ...(serialPostId ? { serialPostExchangeId: serialPostId } : {}),
+      ...(input.balanceField ? { balanceField: input.balanceField } : {}),
+      ...(input.capField ? { capField: input.capField } : {}),
+      ...(input.unitDebit !== undefined ? { unitDebit: input.unitDebit } : {}),
+      ...(input.vulnClass ? { vulnClass: input.vulnClass } : hasConservedContext ? { vulnClass: 'race_double_spend' } : {}),
+      ...(firstRequestBody !== undefined ? { requestBody: firstRequestBody } : {}),
       mode,
       minDistinctOutcomes: minDistinct,
-      expectAllSuccess: input.expectAllSuccess !== false,
+      expectAllSuccess,
       ...(input.message ? { message: input.message } : {}),
     }
     this.claims.push(claim)
     const missingEvidence: string[] = []
     if (input.barrier === 'h2' && mode !== 'h2-single-packet') missingEvidence.push('h2_single_packet_barrier')
     if (distinctOutcomes < minDistinct) missingEvidence.push('duplicate_effect')
-    if (input.expectAllSuccess !== false && exchanges.some(item => !isSuccessStatus(item.status))) missingEvidence.push('all_participants_success')
+    if (expectAllSuccess && exchanges.some(item => !isSuccessStatus(item.status))) missingEvidence.push('all_participants_success')
+    if (hasConservedContext && ackedCount < 2) missingEvidence.push('acked_burst_mutations')
     return {
       ok: missingEvidence.length === 0,
       claim,
@@ -1302,17 +1458,26 @@ export class VerifyContext {
       fallbackReason: result.fallbackReason ?? null,
       summary: result.summary ?? {},
       exchanges,
-      ...feedback(missingEvidence.length ? 'race' : null, missingEvidence,
-        exchanges.map((item, index) => ({
+      ...(baseline ? { baseline } : {}),
+      ...(post ? { post } : {}),
+      ...(serial ? { serial } : {}),
+      ...(serialPost ? { serialPost } : {}),
+      ...feedback(missingEvidence.length ? 'race' : null, missingEvidence, [
+        ...(baseline ? [transcriptEntry('setup', baseline, 'baseline_read')] : []),
+        ...exchanges.map((item, index) => ({
           exchangeId: item.exchangeId,
           role: 'race' as const,
-          personaHandle: null,
+          personaHandle: requests[index]?.persona ?? null,
           method: requests[index]?.method ?? null,
           pathAndQuery: requests[index]?.path ?? null,
           status: item.status,
           durationMs: item.durationMs,
           note: mode,
-        }))),
+        })),
+        ...(post ? [transcriptEntry('control', post, 'post_read')] : []),
+        ...(serial ? [transcriptEntry('control', serial, 'serial_control')] : []),
+        ...(serialPost ? [transcriptEntry('control', serialPost, 'serial_post_read')] : []),
+      ]),
     }
   }
 
@@ -1370,16 +1535,33 @@ export class VerifyContext {
     const controlArm = normalizeArm(rawControl, 'prove_injection_differential', 'control')
     const probeArm = normalizeArm(rawProbe, 'prove_injection_differential', 'probe')
     const session = input.session ?? 'injection-diff'
-    const control = await this.http(controlArm.target, { ...controlArm.options, role: 'control', session })
-    const probe = await this.http(probeArm.target, { ...probeArm.options, role: 'probe', session })
     const expected = input.expectedOutput?.trim() ?? ''
     const missingEvidence: string[] = []
     const emitted: VerifyClaim[] = []
     let evaluated = false
+    const parseBody = (body: unknown): unknown => {
+      if (body === undefined || body === null) return undefined
+      if (typeof body === 'string') return parseJsonBody(body) ?? body
+      return body
+    }
+    const controlReqBody = parseBody(controlArm.options?.body)
+    const probeReqBody = parseBody(probeArm.options?.body)
+    const control = await this.http(controlArm.target, { ...controlArm.options, role: 'control', session })
+    const probe = await this.http(probeArm.target, { ...probeArm.options, role: 'probe', session })
+    const transcriptEntries: ProofTranscriptEntry[] = [
+      transcriptEntry('control', control),
+      transcriptEntry('probe', probe),
+    ]
     if (expected.length >= 4) {
+      // Second interleaved round provides stable 2-round structural differential evidence for the
+      // Layer-3 injection semantic oracle while paired body_contains + anti-reflection verify the
+      // evaluated expression in ProofReceipt.
+      const probe2 = await this.http(probeArm.target, { ...probeArm.options, role: 'probe', session })
+      const control2 = await this.http(controlArm.target, { ...controlArm.options, role: 'control', session })
+      transcriptEntries.push(transcriptEntry('probe', probe2), transcriptEntry('control', control2))
       const probeReqText = `${typeof probeArm.target === 'string' ? probeArm.target : JSON.stringify(probeArm.target)}\n${JSON.stringify(probeArm.options?.body ?? '')}`
-      const inProbe = (probe.body ?? '').includes(expected)
-      const inControl = (control.body ?? '').includes(expected)
+      const inProbe = (probe.body ?? '').includes(expected) && (probe2.body ?? '').includes(expected)
+      const inControl = (control.body ?? '').includes(expected) || (control2.body ?? '').includes(expected)
       const reflected = probeReqText.includes(expected)
       evaluated = inProbe && !inControl && !reflected
       if (!isSuccessStatus(control.status)) missingEvidence.push('control_2xx')
@@ -1391,6 +1573,7 @@ export class VerifyContext {
         exchangeId: control.exchangeId,
         text: expected,
         absent: true,
+        ...(controlReqBody !== undefined ? { controlRequestBody: controlReqBody } : {}),
         message: `${input.vulnClass ?? 'ssti'} control lacks evaluated marker`,
       }
       const presentClaim: BodyClaim = {
@@ -1398,10 +1581,21 @@ export class VerifyContext {
         exchangeId: probe.exchangeId,
         text: expected,
         absent: false,
+        ...(input.vulnClass ? { vulnClass: input.vulnClass } : {}),
+        ...(controlReqBody !== undefined ? { controlRequestBody: controlReqBody } : {}),
+        ...(probeReqBody !== undefined ? { probeRequestBody: probeReqBody } : {}),
         message: input.message ?? `${input.vulnClass ?? 'ssti'} evaluated marker present in probe`,
       }
-      this.claims.push(absentClaim, presentClaim)
-      emitted.push(absentClaim, presentClaim)
+      const diffClaim: StructuralDiffClaim = {
+        kind: 'structural_diff',
+        controlIds: [control.exchangeId, control2.exchangeId],
+        variantIds: [probe.exchangeId, probe2.exchangeId],
+        minRounds: 2,
+        minDeltaTokens: 1,
+        message: input.message ?? `${input.vulnClass ?? 'ssti'} evaluated differential across 2 rounds`,
+      }
+      this.claims.push(absentClaim, presentClaim, diffClaim)
+      emitted.push(absentClaim, presentClaim, diffClaim)
     } else {
       const impactClaim: ImpactClaim = {
         kind: 'impact',
@@ -1409,6 +1603,7 @@ export class VerifyContext {
         ...(input.vulnClass ? { vulnClass: input.vulnClass } : {}),
         controlExchangeIds: [control.exchangeId],
         probeExchangeId: probe.exchangeId,
+        ...(probeReqBody !== undefined ? { requestBody: probeReqBody } : {}),
         ...(input.message ? { message: input.message } : {}),
       }
       this.claims.push(impactClaim)
@@ -1420,10 +1615,7 @@ export class VerifyContext {
       probe,
       claims: emitted,
       evaluated,
-      ...feedback(missingEvidence.length ? 'injection_differential' : null, missingEvidence, [
-        transcriptEntry('control', control),
-        transcriptEntry('probe', probe),
-      ]),
+      ...feedback(missingEvidence.length ? 'injection_differential' : null, missingEvidence, transcriptEntries),
     }
   }
 
@@ -1445,9 +1637,10 @@ export class VerifyContext {
     const raw = inputOrControl as Record<string, unknown>
     return this.proveAccessBoundary({
       ...(raw as unknown as AccessBoundaryInput),
-      controlPersona: String(raw.controlPersona ?? raw.control_persona ?? ''),
-      probePersona: String(raw.probePersona ?? raw.probe_persona ?? ''),
+      ...((raw.controlPersona ?? raw.control_persona) !== undefined ? { controlPersona: String(raw.controlPersona ?? raw.control_persona ?? '') } : {}),
+      ...((raw.probePersona ?? raw.probe_persona) !== undefined ? { probePersona: String(raw.probePersona ?? raw.probe_persona ?? '') } : {}),
       route: (raw.route ?? raw.url ?? raw.path ?? '/') as HttpTarget,
+      ...((raw.probeRoute ?? raw.probe_route) !== undefined ? { probeRoute: (raw.probeRoute ?? raw.probe_route) as HttpTarget } : {}),
       ...((raw.expectControlDenied ?? raw.expect_control_denied) !== undefined
         ? { expectControlDenied: Boolean(raw.expectControlDenied ?? raw.expect_control_denied) }
         : {}),
@@ -1456,6 +1649,7 @@ export class VerifyContext {
       ...((raw.controlSession ?? raw.control_session) ? { controlSession: String(raw.controlSession ?? raw.control_session) } : {}),
       ...((raw.probeSession ?? raw.probe_session) ? { probeSession: String(raw.probeSession ?? raw.probe_session) } : {}),
       ...((raw.boundaryClass ?? raw.boundary_class) ? { boundaryClass: (raw.boundaryClass ?? raw.boundary_class) as 'auth' | 'access' } : {}),
+      ...((raw.vulnClass ?? raw.vuln_class) ? { vulnClass: String(raw.vulnClass ?? raw.vuln_class) } : {}),
       ...((raw.actorRoles ?? raw.actor_roles) ? { actorRoles: (raw.actorRoles ?? raw.actor_roles) as Record<string, string> } : {}),
       ...((raw.actorTenants ?? raw.actor_tenants) ? { actorTenants: (raw.actorTenants ?? raw.actor_tenants) as Record<string, string> } : {}),
     })
@@ -1525,6 +1719,19 @@ export class VerifyContext {
       requests: raw.requests as RaceBurstInput['requests'],
       ...((raw.minDistinctOutcomes ?? raw.min_distinct_outcomes) !== undefined ? { minDistinctOutcomes: Number(raw.minDistinctOutcomes ?? raw.min_distinct_outcomes) } : {}),
       ...((raw.expectAllSuccess ?? raw.expect_all_success) !== undefined ? { expectAllSuccess: Boolean(raw.expectAllSuccess ?? raw.expect_all_success) } : {}),
+      ...((raw.readRoute ?? raw.read_route) !== undefined ? { readRoute: (raw.readRoute ?? raw.read_route) as HttpTarget } : {}),
+      ...((raw.readMethod ?? raw.read_method) ? { readMethod: String(raw.readMethod ?? raw.read_method) } : {}),
+      ...((raw.readPersona ?? raw.read_persona) ? { readPersona: String(raw.readPersona ?? raw.read_persona) } : {}),
+      ...((raw.serialRequest ?? raw.serial_request) !== undefined ? { serialRequest: (raw.serialRequest ?? raw.serial_request) as RaceRequestInput | HttpTarget } : {}),
+      ...((raw.balanceField ?? raw.balance_field) ? { balanceField: String(raw.balanceField ?? raw.balance_field) } : {}),
+      ...((raw.capField ?? raw.cap_field) ? { capField: String(raw.capField ?? raw.cap_field) } : {}),
+      ...((raw.unitDebit ?? raw.unit_debit) !== undefined ? { unitDebit: Number(raw.unitDebit ?? raw.unit_debit) } : {}),
+      ...((raw.vulnClass ?? raw.vuln_class) ? { vulnClass: String(raw.vulnClass ?? raw.vuln_class) } : {}),
+      ...((raw.baselineExchangeId ?? raw.baseline_exchange_id) ? { baselineExchangeId: String(raw.baselineExchangeId ?? raw.baseline_exchange_id) } : {}),
+      ...((raw.postExchangeId ?? raw.post_exchange_id) ? { postExchangeId: String(raw.postExchangeId ?? raw.post_exchange_id) } : {}),
+      ...((raw.serialExchangeIds ?? raw.serial_exchange_ids) ? { serialExchangeIds: (raw.serialExchangeIds ?? raw.serial_exchange_ids) as string[] } : {}),
+      ...((raw.serialPreExchangeId ?? raw.serial_pre_exchange_id) ? { serialPreExchangeId: String(raw.serialPreExchangeId ?? raw.serial_pre_exchange_id) } : {}),
+      ...((raw.serialPostExchangeId ?? raw.serial_post_exchange_id) ? { serialPostExchangeId: String(raw.serialPostExchangeId ?? raw.serial_post_exchange_id) } : {}),
     })
   }
 

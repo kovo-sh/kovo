@@ -1826,12 +1826,12 @@ export const GUARDIAN_VERIFY_USAGE_HINT =
 
 const GUARDIAN_VERIFY_SIGNATURES = [
   'Exact TS helper signatures (targets accept string path/URL or { url|path|pathAndQuery, method?, headers?, body?, as? }):',
-  '- ctx.prove_access_boundary({ controlPersona, probePersona, route, method?, expectControlDenied? })',
+  '- ctx.prove_access_boundary({ controlPersona?, probePersona?, route, probeRoute?, method?, boundaryClass?: "access"|"auth", vulnClass?, controlOptions?, probeOptions?, expectControlDenied? }) — for auth bypass / forged JWT, pass boundaryClass: "auth", vulnClass: "auth_bypass"|"jwt_forgery" with unauthenticated/bad-token control (401/403) and bypass header/token/param in probeOptions/probeRoute.',
   '- ctx.prove_persisted_mutation({ readRoute, mutation: { path|url, method, body, as? }, fieldPath, expectDelta, readPersona?, mutatePersona? })',
-  '- ctx.prove_injection_differential({ control: path|{ path, method?, body?, as? }, probe: path|{ path, method?, body?, as? }, expectedOutput?, vulnClass? })',
+  '- ctx.prove_injection_differential({ control: path|{ path, method?, body?, as? }, probe: path|{ path, method?, body?, as? }, expectedOutput?, vulnClass? }) — pass expectedOutput (>=4 chars, non-reflected) for SSTI/eval/cmdi or omit for engine error fingerprint.',
   '- ctx.prove_boolean_or_timing_diff({ control, variant, mode: "boolean"|"timing", rounds? })',
   '- ctx.prove_oob_callback({ inject: { target|path, method?, body?, as? } | (canary) => Promise<void>, timeoutMs? })',
-  '- ctx.prove_race_burst({ requests: [{ path|url, method, body?, as? }, ...], barrier?: "auto"|"h2"|"http1" })',
+  '- ctx.prove_race_burst({ requests: [{ path|url, method, body?, as? }, ...], readRoute?, balanceField?, capField?, unitDebit?, serialRequest?, barrier?: "auto"|"h2"|"http1" }) — pass readRoute (GET balance/stock/quota endpoint) so conserved-balance baseline/post/serial control exchanges are recorded automatically for ProofReceipt.',
 ].join('\n')
 
 const GUARDIAN_VERIFY_TS_EXAMPLE = [

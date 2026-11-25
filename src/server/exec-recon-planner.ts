@@ -165,6 +165,72 @@ function buildObservationFromHeaders(
   }
 }
 
+const SHORT_PREFIXED_DIGIT_ID_RE = /^[a-z]{1,12}[_-][0-9a-z]*\d[0-9a-z_-]*$/i
+const VERSION_OR_PROTOCOL_SEGMENT_RE = /^(?:api[_-]?v\d+|v\d+(?:[_-](?:alpha|beta|rc)\d*)?|oauth[_-]?2|http[_-]?2|2fa|utf[_-]?8|sha[_-]?256|base[_-]?64)$/i
+const PREFIXED_HEX_ID_RE = /^(?:[a-z]{1,10}[_-])?[0-9a-f]{8,}$/i
+const COMPACT_PREFIX_NUM_ID_RE = /^(?!sha256$|base64$|oauth2$|http2$|es20\d\d$)[a-z]{2,8}\d{3,}$/i
+
+/**
+ * Normalize concrete resource ID segments (UUIDs, numeric IDs, short prefixed IDs such as
+ * `tkt_123`, `tkt-1001`, `ord_42`, `tkt_a1b2c3`, `inv_deadbeef`, and `:param`/`{param}` template
+ * placeholders) to `:id` so floor-confirmed routes match template endpoints and sibling concrete IDs.
+ */
+export function normalizeConfirmedRouteTemplate(path?: string | null): string {
+  const base = normalizeEndpointTemplate(path)
+  if (!base || base === '/') return base
+  const segments = base.split('/').map((seg, idx) => {
+    if (idx === 0 || !seg || seg === ':id') return seg
+    if (VERSION_OR_PROTOCOL_SEGMENT_RE.test(seg)) return seg
+    if (
+      SHORT_PREFIXED_DIGIT_ID_RE.test(seg) ||
+      PREFIXED_HEX_ID_RE.test(seg) ||
+      COMPACT_PREFIX_NUM_ID_RE.test(seg)
+    ) {
+      return ':id'
+    }
+    return seg
+  })
+  return segments.join('/') || '/'
+}
+
+/** Build normalized confirmed path + `(METHOD, path)` lookup sets for floor-dedupe filtering. */
+export function buildConfirmedRouteSets(confirmed: readonly AlreadyConfirmedRef[]): {
+  paths: Set<string>
+  methodPaths: Set<string>
+  anyMethodPaths: Set<string>
+} {
+  const paths = new Set<string>()
+  const methodPaths = new Set<string>()
+  const anyMethodPaths = new Set<string>()
+  for (const ref of confirmed) {
+    const norm = normalizeConfirmedRouteTemplate(ref.path)
+    if (!norm || norm === '/') continue
+    paths.add(norm)
+    const method = ref.method?.trim().toUpperCase()
+    if (method && method !== 'ANY') {
+      methodPaths.add(`${method} ${norm}`)
+    } else {
+      anyMethodPaths.add(norm)
+    }
+  }
+  return { paths, methodPaths, anyMethodPaths }
+}
+
+/** True when a candidate `(method, path)` matches an already-confirmed floor/agent route template. */
+export function isRouteConfirmed(
+  candidate: { method?: string | null; path: string },
+  sets: { paths: ReadonlySet<string>; methodPaths: ReadonlySet<string>; anyMethodPaths: ReadonlySet<string> },
+  options?: { matchAnyMethod?: boolean },
+): boolean {
+  const norm = normalizeConfirmedRouteTemplate(candidate.path)
+  if (!norm || norm === '/') return false
+  if (options?.matchAnyMethod) return sets.paths.has(norm)
+  if (sets.anyMethodPaths.has(norm)) return true
+  const method = candidate.method?.trim().toUpperCase()
+  if (!method || method === 'ANY') return sets.paths.has(norm)
+  return sets.methodPaths.has(`${method} ${norm}`)
+}
+
 export interface ExecReconPlannerHost extends ExecCoreServices {
   labRunner: LabRunner
   maxDurationMs: number
@@ -910,10 +976,17 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         if (row.finding.status !== 'confirmed' && row.finding.status !== 'static_verified') continue
         const spec = row.replaySpecId ? specById.get(row.replaySpecId) : undefined
         const fields = spec ? extractSpecDedupeFields(spec.spec) : null
-        const path = fields?.endpoint?.trim()
+        const receiptTarget = spec?.proofReceipt?.receipt?.target
+        const rawPath = (fields?.endpoint?.trim() && fields.endpoint.trim() !== '/')
+          ? fields.endpoint.trim()
+          : (receiptTarget?.pathAndQuery?.trim() ?? fields?.endpoint?.trim() ?? '')
+        const path = rawPath.trim()
         if (!path) continue
-        const method = fields?.method && fields.method !== 'ANY' ? fields.method : null
-        const key = `${method ?? ''} ${path} ${fields?.param ?? ''} ${row.finding.cwe ?? ''}`
+        const rawMethod = (fields?.method && fields.method !== 'ANY')
+          ? fields.method
+          : (receiptTarget?.method?.trim() ?? null)
+        const method = rawMethod && rawMethod !== 'ANY' ? rawMethod.toUpperCase() : null
+        const key = `${method ?? ''} ${normalizeConfirmedRouteTemplate(path)} ${fields?.param ?? ''} ${row.finding.cwe ?? ''}`
         if (seen.has(key)) continue
         seen.add(key)
         refs.push({
@@ -936,7 +1009,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   /** High-risk or under-covered surface that has not been confirmed. Prompt context only. */
   unconfirmedHardSurfaceRefs(run: Run, confirmed: readonly AlreadyConfirmedRef[], limit = 8): UnconfirmedSurfaceRef[] {
     try {
-      const confirmedPaths = new Set(confirmed.map(ref => normalizeEndpointTemplate(ref.path)))
+      const confirmedSets = buildConfirmedRouteSets(confirmed)
       const refs: UnconfirmedSurfaceRef[] = []
       const seen = new Set<string>()
       for (const gap of this.storage.listOpenProofGaps(run.id, run.goalRevision)) {
@@ -954,7 +1027,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         const endpoints = this.storage.listEndpoints(run.id, { orderBy: 'risk', limit: 40 })
         for (const ep of endpoints) {
           if (refs.length >= limit) break
-          if (confirmedPaths.has(normalizeEndpointTemplate(ep.pathTemplate))) continue
+          if (isRouteConfirmed({ method: ep.method, path: ep.pathTemplate }, confirmedSets, { matchAnyMethod: true })) continue
           if (ep.riskScore < 60) continue
           const key = `${ep.method} ${ep.pathTemplate}`
           if (seen.has(key)) continue
@@ -988,7 +1061,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
   /** Endpoint templates a step explicitly names (normalized). Never used for eligibility. */
   stepMentionedRoutes(step: Pick<ChainStep, 'title' | 'hypothesis'>): string[] {
-    return templatesMentionedInText(`${step.title} ${step.hypothesis}`)
+    return [...new Set(templatesMentionedInText(`${step.title} ${step.hypothesis}`).map(normalizeConfirmedRouteTemplate))]
   }
 
 
@@ -1050,19 +1123,10 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       return { seeded: 0, endpoints: [] }
     }
     const confirmedRefs = this.alreadyConfirmedRefs(run, 100)
-    const confirmedPaths = new Set(
-      confirmedRefs.map(ref => normalizeEndpointTemplate(ref.path)),
-    )
-    const confirmedMethodPaths = new Set(
-      confirmedRefs
-        .filter(ref => ref.method)
-        .map(ref => `${ref.method!.toUpperCase()} ${normalizeEndpointTemplate(ref.path)}`),
-    )
-    const unconfirmedEndpoints = endpoints.filter(ep => {
-      const norm = normalizeEndpointTemplate(ep.pathTemplate)
-      const methodKey = `${(ep.method || 'GET').toUpperCase()} ${norm}`
-      return !confirmedPaths.has(norm) && !confirmedMethodPaths.has(methodKey)
-    })
+    const confirmedSets = buildConfirmedRouteSets(confirmedRefs)
+    const unconfirmedEndpoints = endpoints.filter(ep =>
+      !isRouteConfirmed({ method: ep.method, path: ep.pathTemplate }, confirmedSets) &&
+      !confirmedSets.paths.has(normalizeConfirmedRouteTemplate(ep.pathTemplate)))
     const coveredRoutes = new Set<string>()
     for (const step of existingSteps) {
       for (const route of this.stepMentionedRoutes(step)) coveredRoutes.add(route)
@@ -1070,7 +1134,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const candidates = selectUncoveredHighRiskEndpoints({
       endpoints: unconfirmedEndpoints,
       approvedOrigins,
-      confirmedPaths,
+      confirmedPaths: confirmedSets.paths,
       coveredRoutes,
       minRisk: 60,
       limit: cap,
@@ -1102,8 +1166,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     if ((step.dependsOnFactIds?.length ?? 0) > 0 || (step.dependsOnStepIds?.length ?? 0) > 0) return false
     const routes = this.stepMentionedRoutes(step)
     if (!routes.length) return false
-    const confirmedPaths = new Set(confirmed.map(ref => normalizeEndpointTemplate(ref.path)))
-    return routes.every(route => confirmedPaths.has(route))
+    const confirmedPaths = buildConfirmedRouteSets(confirmed).paths
+    return routes.every(route => confirmedPaths.has(normalizeConfirmedRouteTemplate(route)))
   }
 
 
@@ -1209,8 +1273,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
 
   queueDetLeadUpgradeSteps(run: Run, approvedOrigins: ReadonlySet<string>, budget: number): number {
-    const confirmedKeys = new Set(this.alreadyConfirmedRefs(run, 40).map(ref =>
-      `${normalizeEndpointTemplate(ref.path)}|${confirmedCategoryFamily(ref.probeClass ?? '')}`))
+    const confirmedKeys = new Set(this.alreadyConfirmedRefs(run, 100).map(ref =>
+      `${normalizeConfirmedRouteTemplate(ref.path)}|${confirmedCategoryFamily(ref.probeClass ?? '')}`))
     const facts = [...this.storage.listFacts(run.id, { includeTainted: false, limit: 200 })]
       .sort((a, b) => {
         const keyOf = (fact: typeof a) =>
@@ -1229,7 +1293,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const method = typeof fact.data.method === 'string' ? fact.data.method.toUpperCase() : 'GET'
       if (!endpoint.startsWith('/') || !probeClass) continue
       const category = detLeadCategory(probeClass)
-      const routeKey = `${normalizeEndpointTemplate(endpoint)}|${confirmedCategoryFamily(category)}`
+      const routeKey = `${normalizeConfirmedRouteTemplate(endpoint)}|${confirmedCategoryFamily(category)}`
       const dedupeKey = `${method} ${routeKey}`
       if (confirmedKeys.has(routeKey) || this.detLeadStepKeys.has(dedupeKey)) continue
       const gate = detLeadEvidenceGate(fact.data)
@@ -1318,11 +1382,11 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const confirmedPathSet = new Set(
         input.confirmed
           .filter(ref => !ref.origin || ref.origin === origin)
-          .map(ref => normalizeEndpointTemplate(ref.path)),
+          .map(ref => normalizeConfirmedRouteTemplate(ref.path)),
       )
       const originEndpoints = this.storage.listEndpoints(input.run.id, { orderBy: 'risk', limit: 40 })
         .filter(ep => input.targetOrigins.includes(ep.origin))
-      const unconfirmedOriginEndpoints = originEndpoints.filter(ep => !confirmedPathSet.has(normalizeEndpointTemplate(ep.pathTemplate)))
+      const unconfirmedOriginEndpoints = originEndpoints.filter(ep => !confirmedPathSet.has(normalizeConfirmedRouteTemplate(ep.pathTemplate)))
       const routes = (unconfirmedOriginEndpoints.length > 0 ? unconfirmedOriginEndpoints : originEndpoints)
         .slice(0, 6)
         .map(ep => ({
@@ -1620,23 +1684,23 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
     // Priority #3: bounded cross-persona BOLA/IDOR matrix per discovered resource type (excluding floor-confirmed BOLA routes).
     const confirmedForPlanner = this.alreadyConfirmedRefs(updated, 100)
-    const confirmedBolaPaths = new Set(
-      confirmedForPlanner
-        .filter(ref =>
-          ref.cwe === 'CWE-639' ||
-          ref.cwe === 'CWE-862' ||
-          ref.cwe === 'CWE-863' ||
-          confirmedCategoryFamily(ref.probeClass ?? '') === 'authz',
-        )
-        .map(ref => normalizeEndpointTemplate(ref.path)),
+    const confirmedBolaRefs = confirmedForPlanner.filter(ref =>
+      ref.cwe === 'CWE-639' ||
+      ref.cwe === 'CWE-862' ||
+      ref.cwe === 'CWE-863' ||
+      confirmedCategoryFamily(ref.probeClass ?? '') === 'authz',
     )
+    const confirmedBolaSets = buildConfirmedRouteSets(confirmedBolaRefs)
     let bolaAutoSteps = 0
     if (updated.capabilityTier >= 2 && personas.length >= 2 && allSteps.length < dynamicStepBudget) {
       const typeGroups = new Map<string, BolaTestQueueItem[]>()
       for (const item of buildBolaTestQueue(allUntaintedFacts, personas, approvedOrigins, this.storage.listResourceSamples(run.id))) {
-        const remainingVariants = item.variants.filter(v => !confirmedBolaPaths.has(normalizeEndpointTemplate(v.endpoint)))
-        if (confirmedBolaPaths.has(normalizeEndpointTemplate(item.endpoint)) && remainingVariants.length === 0) continue
-        const filteredItem: BolaTestQueueItem = remainingVariants.length ? { ...item, variants: remainingVariants } : item
+        const remainingVariants = item.variants.filter(v =>
+          (!v.destructive || updated.capabilityTier >= 3) &&
+          !isRouteConfirmed({ method: v.method, path: v.endpoint }, confirmedBolaSets),
+        )
+        if (remainingVariants.length === 0) continue
+        const filteredItem: BolaTestQueueItem = { ...item, variants: remainingVariants }
         const key = `${item.origin}\u0000${item.resourceKey}`
         typeGroups.set(key, [...(typeGroups.get(key) ?? []), filteredItem])
       }
@@ -1655,11 +1719,15 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         const asset = updated.candidates.find(candidate => candidate.origin === origin && updated.approved.includes(candidate.id))
         if (!asset) continue
         const itemsForOrigin = itemsForType.slice(0, 6)
+        const hasGetVariant = itemsForOrigin.some(item => item.variants.some(v => v.method.toUpperCase() === 'GET'))
         const variants = [...new Set(itemsForOrigin.flatMap(item => item.variants.map(variant =>
           `${variant.method} ${variant.endpoint}${variant.destructive ? ' (Tier 3 only)' : ''}`)))].slice(0, 8)
+        const readGuidance = hasGetVariant
+          ? 'Verify tenant isolation with GET first via guardian_verify(prove_access_boundary); use benign PUT/PATCH field deltas via guardian_verify(prove_persisted_mutation) only where reversible; DELETE stays Tier 3/local-lab.'
+          : 'GET read on this route template is ALREADY floor-confirmed — do NOT re-submit a read-only GET proof. Test only the unconfirmed write/mutation variants above with guardian_verify(prove_persisted_mutation) using reversible benign field deltas; DELETE stays Tier 3/local-lab.'
         this.storage.addChainStep(updated, {
           title: `Cross-persona BOLA/IDOR matrix · ${new URL(origin).hostname} · resource:${resourceKey}`,
-          hypothesis: `Replay ${itemsForOrigin.length} ${resourceKey} resource(s) owned by ${itemsForOrigin[0].ownerPersona} (e.g. ${itemsForOrigin.map(item => `${item.endpoint} [${item.resourceId}]`).join(', ')}) as ${itemsForOrigin[0].testAsPersonas?.join(', ') ?? 'alternate persona & anonymous'} using bounded consumer item variants: ${variants.join(', ')}. Verify tenant isolation with GET first; use benign PUT/PATCH field deltas only where reversible; DELETE stays Tier 3/local-lab. Submit a DeclarativeReplaySpec if unauthorized access succeeds.`,
+          hypothesis: `Replay ${itemsForOrigin.length} ${resourceKey} resource(s) owned by ${itemsForOrigin[0].ownerPersona} (e.g. ${itemsForOrigin.map(item => `${item.endpoint} [${item.resourceId}]`).join(', ')}) as ${itemsForOrigin[0].testAsPersonas?.join(', ') ?? 'alternate persona & anonymous'} using bounded consumer item variants: ${variants.join(', ')}. ${readGuidance}`,
           category: 'broken-access-control',
           priority: 92,
           targetAssetIds: [asset.id],

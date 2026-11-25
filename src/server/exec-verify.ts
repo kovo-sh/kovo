@@ -217,6 +217,24 @@ export function agentProofAttribution(vulnClass: string): {
       remediation: 'Enforce an object-level authorization check on every request that names a resource id.',
     }
   }
+  if (/^(?:jwt_forgery|token_forgery)$/.test(key)) {
+    return {
+      label: 'JWT / token forgery authentication bypass',
+      cwe: 'CWE-347',
+      category: 'auth-identity',
+      impact: 'A forged or improperly verified authentication token bypassed authentication on a protected route.',
+      remediation: 'Verify token signatures strictly against an explicit algorithm allowlist and server-controlled key material; reject alg=none and untrusted headers.',
+    }
+  }
+  if (/^(?:auth_bypass|broken_auth|auth_protocol|authentication_bypass)$/.test(key)) {
+    return {
+      label: 'authentication bypass',
+      cwe: 'CWE-287',
+      category: 'auth-identity',
+      impact: 'A crafted authentication header, token, or bypass parameter granted access to a route that denies unauthenticated callers.',
+      remediation: 'Enforce server-side session/token verification uniformly and never trust client-supplied identity or bypass headers.',
+    }
+  }
   if (/^(?:bfla|privilege_escalation)$/.test(key)) {
     return {
       label: 'broken function-level authorization',
@@ -253,7 +271,7 @@ export function agentProofAttribution(vulnClass: string): {
       remediation: 'Pass user input as template data rather than compiling it as template source; use a logic-less or sandboxed template context.',
     }
   }
-  if (/^(?:sqli|sql_boolean|sql_boolean_diff|blind_sqli|sqli_status|sqli_time)$/.test(key)) {
+  if (/^(?:sqli|sqli_error|sql_boolean|sql_boolean_diff|blind_sqli|sqli_status|sqli_time)$/.test(key)) {
     return {
       label: 'SQL injection',
       cwe: 'CWE-89',

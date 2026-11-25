@@ -719,29 +719,59 @@ class VerifyContext:
         return TimingResult(control_ids=control_ids, variant_ids=variant_ids, pairs=count)
 
     # -- first-class proof helpers ----------------------------------------
-    def prove_access_boundary(self, control_persona: str, probe_persona: str, route: Any,
-                              expect_control_denied: bool = True, **options: Any) -> dict[str, Any]:
+    def prove_access_boundary(self, control_persona: Optional[str] = None, probe_persona: Optional[str] = None,
+                              route: Any = None, expect_control_denied: bool = True, **options: Any) -> dict[str, Any]:
         """Denied control + crossing variant on one route; emits a `boundary` claim."""
+        if route is None:
+            route = options.get("url", options.get("path"))
+        if not route:
+            raise VerificationError("prove_access_boundary requires `route`.")
         method = str(options.get("method", "GET")).upper()
-        control = self.http(route, method=method, as_persona=control_persona, role="control",
-                            session=options.get("control_session", "access-boundary-control"),
-                            **(options.get("control_options") or {}))
-        probe = self.http(route, method=method, as_persona=probe_persona, role="probe",
-                          session=options.get("probe_session", "access-boundary-probe"),
-                          **(options.get("probe_options") or {}))
+        control_opts = dict(options.get("control_options") or options.get("controlOptions") or {})
+        probe_opts = dict(options.get("probe_options") or options.get("probeOptions") or {})
+
+        def _clean_persona(value: Any) -> Optional[str]:
+            if not isinstance(value, str):
+                return None
+            trimmed = value.strip()
+            if not trimmed or re.match(r"^(?:anonymous|anon|unauthenticated|none)$", trimmed, re.IGNORECASE):
+                return None
+            return trimmed
+
+        ctrl_p = _clean_persona(control_persona if control_persona is not None else control_opts.pop("as", control_opts.pop("as_persona", control_opts.pop("persona", None))))
+        prb_p = _clean_persona(probe_persona if probe_persona is not None else probe_opts.pop("as", probe_opts.pop("as_persona", probe_opts.pop("persona", None))))
+        probe_route = options.get("probe_route", options.get("probeRoute", route))
+        control = self.http(route, method=method, as_persona=ctrl_p, role="control",
+                            session=options.get("control_session", options.get("controlSession", "access-boundary-control")),
+                            **control_opts)
+        probe = self.http(probe_route, method=method, as_persona=prb_p, role="probe",
+                          session=options.get("probe_session", options.get("probeSession", "access-boundary-probe")),
+                          **probe_opts)
         control_denied = _is_denied(control.status)
         crossed = _is_success(probe.status) and len(probe.body) >= 8
+        vuln_class_raw = options.get("vuln_class", options.get("vulnClass"))
+        vuln_class = str(vuln_class_raw).strip() if isinstance(vuln_class_raw, str) and vuln_class_raw.strip() else None
+        is_auth_vuln = bool(vuln_class and re.match(r"^(?:auth_bypass|jwt_forgery|broken_auth|auth_protocol|token_forgery|authentication_bypass)$", vuln_class, re.IGNORECASE))
+        boundary_class = options.get("boundary_class", options.get("boundaryClass", "auth" if is_auth_vuln else "access"))
         claim: dict[str, Any] = {
             "kind": "boundary",
-            "boundaryClass": options.get("boundary_class", "access"),
+            "boundaryClass": boundary_class,
             "controlExchangeId": control.exchange_id,
             "probeExchangeId": probe.exchange_id,
             "expectControlDenied": bool(expect_control_denied),
         }
-        if options.get("actor_roles"):
-            claim["actorRoles"] = options["actor_roles"]
-        if options.get("actor_tenants"):
-            claim["actorTenants"] = options["actor_tenants"]
+        if vuln_class:
+            claim["vulnClass"] = vuln_class
+        if control_opts.get("body") is not None:
+            raw_cb = control_opts["body"]
+            claim["controlRequestBody"] = (_parse_json(raw_cb) or raw_cb) if isinstance(raw_cb, str) else raw_cb
+        if probe_opts.get("body") is not None:
+            raw_pb = probe_opts["body"]
+            claim["probeRequestBody"] = (_parse_json(raw_pb) or raw_pb) if isinstance(raw_pb, str) else raw_pb
+        if options.get("actor_roles") or options.get("actorRoles"):
+            claim["actorRoles"] = options.get("actor_roles") or options.get("actorRoles")
+        if options.get("actor_tenants") or options.get("actorTenants"):
+            claim["actorTenants"] = options.get("actor_tenants") or options.get("actorTenants")
         if options.get("message"):
             claim["message"] = options["message"]
         self._push(claim)
@@ -750,7 +780,7 @@ class VerifyContext:
             missing.append("control_denied")
         if not crossed:
             missing.append("variant_crossed")
-        if not expect_control_denied and control_persona == probe_persona:
+        if not expect_control_denied and (ctrl_p or "") == (prb_p or ""):
             missing.append("actor_differential")
         return _AwaitableDict({
             "ok": not missing,
@@ -1006,14 +1036,15 @@ class VerifyContext:
         })
 
     def prove_race_burst(self, requests: list[Any], barrier: str = "auto", **options: Any) -> dict[str, Any]:
-        """Synchronized HTTP/2 single-packet burst with an explicit HTTP/1.1 fallback report."""
+        """Synchronized HTTP/2 single-packet burst with optional conserved-balance readbacks + serial control."""
         if len(requests) < 2 or len(requests) > 10:
             claim = {"kind": "race", "exchangeIds": [], "mode": "http1-fallback",
-                     "minDistinctOutcomes": int(options.get("min_distinct_outcomes", 2))}
+                     "minDistinctOutcomes": int(options.get("min_distinct_outcomes", options.get("minDistinctOutcomes", 2)))}
             return {"ok": False, "claim": claim, "mode": "http1-fallback",
                     "fallbackReason": "race requires between 2 and 10 requests", "summary": {},
                     "exchanges": [], **_feedback("race", ["race_requests"], [])}
         payload: list[dict[str, Any]] = []
+        first_request_body: Any = None
         for index, request in enumerate(requests):
             if isinstance(request, str):
                 origin, path = _split_target(request, self._default_origin)
@@ -1022,74 +1053,225 @@ class VerifyContext:
                                 **({"session": options.get("session", "race")} if options.get("session") else {})})
                 continue
             spec = dict(request)
-            raw_target = spec.get("target", spec.get("url", spec.get("path", "/")))
+            raw_target = spec.get("target", spec.get("url", spec.get("path", spec.get("pathAndQuery", spec.get("endpoint", spec.get("route", "/"))))))
             origin, path = _split_target(raw_target, self._default_origin)
+            body_str, headers_norm = _normalize_body_and_headers(spec.get("body"), spec.get("headers"))
+            if index == 0 and body_str is not None:
+                parsed_req = _parse_json(body_str)
+                first_request_body = parsed_req if parsed_req is not None else body_str
             entry: dict[str, Any] = {
                 "path": path, "method": str(spec.get("method", "GET")).upper(),
                 "sessionGroupRole": "probe", "session": options.get("session", f"race-{index}"),
             }
             if spec.get("origin") or origin or self._default_origin:
                 entry["origin"] = spec.get("origin") or origin or self._default_origin
-            for camel, snake in (("headers", "headers"), ("body", "body")):
-                if spec.get(snake) is not None:
-                    entry[camel] = spec[snake]
-            if spec.get("as"):
-                entry["persona"] = spec["as"]
+            if headers_norm:
+                entry["headers"] = headers_norm
+            if body_str is not None:
+                entry["body"] = body_str
+            persona = spec.get("as_persona", spec.get("as", spec.get("persona")))
+            if persona:
+                entry["persona"] = persona
             payload.append(entry)
+        read_route = options.get("read_route", options.get("readRoute"))
+        first_persona = payload[0].get("persona") if payload else None
+        read_persona = options.get("read_persona", options.get("readPersona", first_persona))
+        read_method = str(options.get("read_method", options.get("readMethod", "GET"))).upper()
+        baseline: Optional[Exchange] = None
+        if read_route is not None:
+            baseline = self.http(
+                read_route,
+                method=read_method,
+                as_persona=read_persona,
+                role="setup",
+                session=f"{options['session']}-baseline" if options.get("session") else "race-baseline",
+            )
         result = _rpc("race", {"requests": payload}, 70.0) or {}
         mode = result.get("mode", "http1-fallback")
         exchanges = [{"exchangeId": item.get("exchangeId", ""), "status": int(item.get("status", 0)),
                       "durationMs": item.get("durationMs", 0), "bodySha256": item.get("bodySha256", "")}
                      for item in result.get("results", [])]
+        post: Optional[Exchange] = None
+        serial: Optional[Exchange] = None
+        serial_post: Optional[Exchange] = None
+        if read_route is not None:
+            post = self.http(
+                read_route,
+                method=read_method,
+                as_persona=read_persona,
+                role="control",
+                session=f"{options['session']}-post" if options.get("session") else "race-post",
+            )
+            serial_spec = options.get("serial_request", options.get("serialRequest", requests[0]))
+            serial_target, serial_opts = _normalize_arm(serial_spec, "prove_race_burst", "serial_request")
+            serial_opts.setdefault("method", payload[0]["method"])
+            if first_persona and not serial_opts.get("as_persona"):
+                serial_opts["as_persona"] = first_persona
+            serial = self.http(
+                serial_target,
+                role="control",
+                session=f"{options['session']}-serial" if options.get("session") else "race-serial",
+                **serial_opts,
+            )
+            if _is_success(serial.status):
+                serial_post = self.http(
+                    read_route,
+                    method=read_method,
+                    as_persona=read_persona,
+                    role="control",
+                    session=f"{options['session']}-serial-post" if options.get("session") else "race-serial-post",
+                )
         distinct_bodies = len({item["bodySha256"] for item in exchanges})
         distinct_statuses = len({item["status"] for item in exchanges})
         distinct_outcomes = max(distinct_bodies, distinct_statuses)
-        min_distinct = int(options.get("min_distinct_outcomes", 2))
-        claim = {"kind": "race", "exchangeIds": [item["exchangeId"] for item in exchanges],
-                 "mode": mode, "minDistinctOutcomes": min_distinct,
-                 "expectAllSuccess": options.get("expect_all_success", True)}
+        min_distinct = int(options.get("min_distinct_outcomes", options.get("minDistinctOutcomes", 2)))
+        acked_count = sum(1 for item in exchanges if _is_success(item["status"]))
+        baseline_id = baseline.exchange_id if baseline else options.get("baseline_exchange_id", options.get("baselineExchangeId"))
+        post_id = post.exchange_id if post else options.get("post_exchange_id", options.get("postExchangeId"))
+        serial_ids = [serial.exchange_id] if serial else options.get("serial_exchange_ids", options.get("serialExchangeIds"))
+        serial_pre_id = options.get("serial_pre_exchange_id", options.get("serialPreExchangeId"))
+        serial_post_id = serial_post.exchange_id if serial_post else options.get("serial_post_exchange_id", options.get("serialPostExchangeId"))
+        has_conserved = bool(read_route is not None or baseline_id or post_id or serial_ids)
+        explicit_expect_all = options.get("expect_all_success", options.get("expectAllSuccess"))
+        if explicit_expect_all is not None:
+            expect_all = bool(explicit_expect_all)
+        else:
+            expect_all = False if (has_conserved and acked_count >= 2 and acked_count < len(exchanges)) else True
+        burst_ids = [item["exchangeId"] for item in exchanges]
+        claim: dict[str, Any] = {
+            "kind": "race",
+            "exchangeIds": burst_ids,
+            "mode": mode,
+            "minDistinctOutcomes": min_distinct,
+            "expectAllSuccess": expect_all,
+        }
+        if has_conserved:
+            claim["burstExchangeIds"] = burst_ids
+        if baseline_id:
+            claim["baselineExchangeId"] = baseline_id
+        if post_id:
+            claim["postExchangeId"] = post_id
+        if serial_pre_id:
+            claim["serialPreExchangeId"] = serial_pre_id
+        if serial_ids:
+            claim["serialExchangeIds"] = list(serial_ids)
+        if serial_post_id:
+            claim["serialPostExchangeId"] = serial_post_id
+        balance_field = options.get("balance_field", options.get("balanceField"))
+        cap_field = options.get("cap_field", options.get("capField"))
+        unit_debit = options.get("unit_debit", options.get("unitDebit"))
+        vuln_class = options.get("vuln_class", options.get("vulnClass"))
+        if balance_field:
+            claim["balanceField"] = str(balance_field)
+        if cap_field:
+            claim["capField"] = str(cap_field)
+        if unit_debit is not None:
+            claim["unitDebit"] = float(unit_debit)
+        if vuln_class:
+            claim["vulnClass"] = str(vuln_class)
+        elif has_conserved:
+            claim["vulnClass"] = "race_double_spend"
+        if first_request_body is not None:
+            claim["requestBody"] = first_request_body
+        if options.get("message"):
+            claim["message"] = options["message"]
         self._push(claim)
         missing: list[str] = []
         if barrier == "h2" and mode != "h2-single-packet":
             missing.append("h2_single_packet_barrier")
         if distinct_outcomes < min_distinct:
             missing.append("duplicate_effect")
-        if options.get("expect_all_success", True) and any(not _is_success(item["status"]) for item in exchanges):
+        if expect_all and any(not _is_success(item["status"]) for item in exchanges):
             missing.append("all_participants_success")
-        transcript = [_entry("race", {"exchangeId": item["exchangeId"], "method": payload[index]["method"],
-                                      "pathAndQuery": payload[index]["path"], "status": item["status"],
-                                      "durationMs": item["durationMs"]}, mode)
-                      for index, item in enumerate(exchanges)]
-        return _AwaitableDict({
+        if has_conserved and acked_count < 2:
+            missing.append("acked_burst_mutations")
+        transcript: list[dict[str, Any]] = []
+        if baseline is not None:
+            transcript.append(_entry("setup", baseline, "baseline_read"))
+        transcript.extend(
+            _entry("race", {"exchangeId": item["exchangeId"], "method": payload[index]["method"],
+                            "pathAndQuery": payload[index]["path"], "status": item["status"],
+                            "durationMs": item["durationMs"]}, mode)
+            for index, item in enumerate(exchanges)
+        )
+        if post is not None:
+            transcript.append(_entry("control", post, "post_read"))
+        if serial is not None:
+            transcript.append(_entry("control", serial, "serial_control"))
+        if serial_post is not None:
+            transcript.append(_entry("control", serial_post, "serial_post_read"))
+        out: dict[str, Any] = {
             "ok": not missing, "claim": claim, "mode": mode,
             "fallbackReason": result.get("fallbackReason"), "summary": result.get("summary", {}),
             "exchanges": exchanges,
             **_feedback("race" if missing else None, missing, transcript),
-        })
+        }
+        if baseline is not None:
+            out["baseline"] = baseline
+        if post is not None:
+            out["post"] = post
+        if serial is not None:
+            out["serial"] = serial
+        if serial_post is not None:
+            out["serialPost"] = serial_post
+        return _AwaitableDict(out)
 
     def prove_injection_differential(
         self,
         control: Any = None,
         probe: Any = None,
         *,
+        variant: Any = None,
         expected_output: Optional[str] = None,
+        expectedOutput: Optional[str] = None,
         vuln_class: Optional[str] = None,
+        vulnClass: Optional[str] = None,
         session: str = "injection-diff",
         message: Optional[str] = None,
+        **options: Any,
     ) -> dict[str, Any]:
         """Benign control vs differential probe (evaluated marker with anti-reflection, or engine fingerprint)."""
-        c_target, c_opts = _normalize_arm(control, "prove_injection_differential", "control")
-        p_target, p_opts = _normalize_arm(probe, "prove_injection_differential", "probe")
+        base_route = options.get("url", options.get("path", options.get("pathAndQuery", options.get("endpoint", options.get("route")))))
+        base_opts: dict[str, Any] = {}
+        if options.get("method"):
+            base_opts["method"] = options["method"]
+        if options.get("headers"):
+            base_opts["headers"] = options["headers"]
+        persona = options.get("as_persona", options.get("as", options.get("persona")))
+        if persona:
+            base_opts["as_persona"] = persona
+        ctrl_body = options.get("control_body", options.get("controlBody"))
+        prb_body = options.get("probe_body", options.get("probeBody"))
+        raw_control = control if control is not None else ({"target": base_route, "options": {**base_opts, "body": ctrl_body}} if base_route and ctrl_body is not None else None)
+        raw_probe = probe if probe is not None else (variant if variant is not None else ({"target": base_route, "options": {**base_opts, "body": prb_body}} if base_route and prb_body is not None else None))
+        c_target, c_opts = _normalize_arm(raw_control, "prove_injection_differential", "control")
+        p_target, p_opts = _normalize_arm(raw_probe, "prove_injection_differential", "probe")
+        expected = (expected_output or expectedOutput or "").strip()
+        vclass = (vuln_class or vulnClass or "").strip() or None
+
+        def _parse_req_body(raw_b: Any) -> Any:
+            if raw_b is None:
+                return None
+            if isinstance(raw_b, str):
+                parsed_b = _parse_json(raw_b)
+                return parsed_b if parsed_b is not None else raw_b
+            return raw_b
+
+        c_req_body = _parse_req_body(c_opts.get("body"))
+        p_req_body = _parse_req_body(p_opts.get("body"))
         c_ex = self.http(c_target, role="control", session=session, **c_opts)
         p_ex = self.http(p_target, role="probe", session=session, **p_opts)
-        expected = (expected_output or "").strip()
+        transcript_entries = [_entry("control", c_ex), _entry("probe", p_ex)]
         missing: list[str] = []
         emitted: list[dict[str, Any]] = []
         evaluated = False
         if len(expected) >= 4:
-            probe_req_text = f"{p_target}\n{p_opts.get('body', '')}"
-            in_probe = expected in (p_ex.body or "")
-            in_control = expected in (c_ex.body or "")
+            p_ex2 = self.http(p_target, role="probe", session=session, **p_opts)
+            c_ex2 = self.http(c_target, role="control", session=session, **c_opts)
+            transcript_entries.extend([_entry("probe", p_ex2), _entry("control", c_ex2)])
+            probe_req_text = f"{p_target}\n{json.dumps(p_opts.get('body', '')) if not isinstance(p_opts.get('body'), str) else p_opts.get('body', '')}"
+            in_probe = expected in (p_ex.body or "") and expected in (p_ex2.body or "")
+            in_control = expected in (c_ex.body or "") or expected in (c_ex2.body or "")
             reflected = expected in probe_req_text
             evaluated = in_probe and not in_control and not reflected
             if not _is_success(c_ex.status):
@@ -1100,32 +1282,48 @@ class VerifyContext:
                 missing.append("marker_absent_from_control")
             if reflected:
                 missing.append("non_reflected_expression")
-            absent_claim = {
+            absent_claim: dict[str, Any] = {
                 "kind": "body_contains", "exchangeId": c_ex.exchange_id, "text": expected,
-                "absent": True, "message": f"{vuln_class or 'ssti'} control lacks evaluated marker",
+                "absent": True, "message": f"{vclass or 'ssti'} control lacks evaluated marker",
             }
-            present_claim = {
+            if c_req_body is not None:
+                absent_claim["controlRequestBody"] = c_req_body
+            present_claim: dict[str, Any] = {
                 "kind": "body_contains", "exchangeId": p_ex.exchange_id, "text": expected,
-                "absent": False, "message": message or f"{vuln_class or 'ssti'} evaluated marker present in probe",
+                "absent": False, "message": message or f"{vclass or 'ssti'} evaluated marker present in probe",
             }
-            self.claims.extend([absent_claim, present_claim])
-            emitted.extend([absent_claim, present_claim])
+            if vclass:
+                present_claim["vulnClass"] = vclass
+            if c_req_body is not None:
+                present_claim["controlRequestBody"] = c_req_body
+            if p_req_body is not None:
+                present_claim["probeRequestBody"] = p_req_body
+            diff_claim: dict[str, Any] = {
+                "kind": "structural_diff",
+                "controlIds": [c_ex.exchange_id, c_ex2.exchange_id],
+                "variantIds": [p_ex.exchange_id, p_ex2.exchange_id],
+                "minRounds": 2,
+                "minDeltaTokens": 1,
+                "message": message or f"{vclass or 'ssti'} evaluated differential across 2 rounds",
+            }
+            self.claims.extend([absent_claim, present_claim, diff_claim])
+            emitted.extend([absent_claim, present_claim, diff_claim])
         else:
             impact_claim: dict[str, Any] = {
                 "kind": "impact", "impactClass": "injection",
                 "controlExchangeIds": [c_ex.exchange_id], "probeExchangeId": p_ex.exchange_id,
             }
-            if vuln_class:
-                impact_claim["vulnClass"] = vuln_class
+            if vclass:
+                impact_claim["vulnClass"] = vclass
+            if p_req_body is not None:
+                impact_claim["requestBody"] = p_req_body
             if message:
                 impact_claim["message"] = message
             self.claims.append(impact_claim)
             emitted.append(impact_claim)
         return _AwaitableDict({
             "ok": not missing, "control": c_ex, "probe": p_ex, "claims": emitted, "evaluated": evaluated,
-            **_feedback("injection_differential" if missing else None, missing, [
-                _entry("control", c_ex), _entry("probe", p_ex),
-            ]),
+            **_feedback("injection_differential" if missing else None, missing, transcript_entries),
         })
 
     # -- camelCase aliases matching the TS contract ----------------------
