@@ -2732,6 +2732,12 @@ export interface SpaCapabilityLaneInput {
   broker: RequestBroker
   grant: Grant
   browser: ScopedBrowser
+  /**
+   * Optional factory for an isolated lane browser. The lane runs after the product engine and must
+   * not share its pooled contexts or shutdown state: a dedicated browser makes the browser proof
+   * independent of the verifier backend (local-jq vs docker) and of engine timing.
+   */
+  createBrowser?: () => ScopedBrowser
   origins: Record<string, string>
   scopes: Record<string, OriginRole>
   routes: ReadonlyArray<RouteRef>
@@ -2886,17 +2892,64 @@ export async function runSpaCapabilityLane(input: SpaCapabilityLaneInput): Promi
   const memberTenant = memberBearer ? spaTenantOf(memberBearer.roleLabel) : null
   const tenantHeaders: Record<string, string> = memberTenant ? { 'x-tenant-id': memberTenant } : {}
 
-  const existing = (() => {
-    try { return input.storage.runDetail(input.run.id).findings } catch { return [] as Finding[] }
+  const detail = (() => {
+    try {
+      return input.storage.runDetail(input.run.id)
+    } catch {
+      return { findings: [] as Finding[], replaySpecs: [], exchangesSummary: [] }
+    }
   })()
-  const alreadyCovered = (proof: SpaProof): boolean => existing.some(finding =>
+  const existing = detail.findings
+  const exchangePath = new Map(detail.exchangesSummary.map(exchange => [exchange.id, exchange.pathAndQuery]))
+  const normalizePathOnly = (value: string): string => {
+    const path = value.split('?')[0] ?? value
+    return path.replace(/\/+$/, '') || '/'
+  }
+  /** Endpoints a persisted finding actually claims (probe steps first, then cited exchanges). */
+  const endpointsOf = (finding: Finding): string[] => {
+    const fromSpecs = detail.replaySpecs
+      .filter(spec => spec.findingId === finding.id)
+      .flatMap(spec => declaredEndpointsFromReplaySpec(spec.spec).map(endpoint => endpoint.path))
+    if (fromSpecs.length > 0) return fromSpecs
+    return (finding.exchangeIds ?? []).map(id => exchangePath.get(id)).filter((path): path is string => Boolean(path))
+  }
+  /**
+   * Coverage is per class + origin + endpoint, not per origin alone. A confirmed stored-XSS on a
+   * different view must never suppress the admin-render proof: under the agentic/docker matrix the
+   * engine can confirm an unrelated XSS on the same origin, which previously hid this proof.
+   */
+  const coveredFinding = (proof: SpaProof): Finding | null => existing.find(finding =>
     finding.status === 'confirmed' &&
     finding.category === proof.vulnClass &&
-    normalizeOrigin(finding.origin) === normalizeOrigin(proof.origin),
-  )
+    normalizeOrigin(finding.origin) === normalizeOrigin(proof.origin) &&
+    endpointsOf(finding).some(path => normalizePathOnly(path) === normalizePathOnly(proof.endpoint)),
+  ) ?? null
 
   const persist = (proof: SpaProof): void => {
-    if (alreadyCovered(proof)) {
+    const covered = coveredFinding(proof)
+    if (covered) {
+      const hasBrowserEvidence = /browser proof|browser trace|browser-executed|dom sink|playwright|document\.title|executed in an? (?:authenticated )?browser/i.test(`${covered.verification ?? ''} ${covered.reason ?? ''}`)
+      if (proof.browserTrace && !hasBrowserEvidence) {
+        // The engine confirmed the same endpoint without browser evidence. Enrich the existing row
+        // instead of adding a duplicate submission (which would grade as a second, unmatched claim).
+        try {
+          const enriched = input.storage.updateProposedFinding(input.run, covered.id, {
+            finding: {
+              verification: `${proof.verification} ${covered.verification ?? ''}`.trim(),
+              exchangeIds: [...new Set([...(covered.exchangeIds ?? []), ...proof.exchangeIds])].slice(0, 8),
+            },
+          })
+          if (/browser proof|browser trace|document\.title/i.test(`${enriched.verification ?? ''}`)) {
+            notes.push(`spa-lane: enriched ${proof.vulnClass} ${proof.endpoint} with browser execution evidence`)
+            confirmed.push(`${proof.vulnClass} ${proof.endpoint}`)
+          } else {
+            notes.push(`spa-lane: ${proof.vulnClass} ${proof.endpoint} is floor-confirmed and immutable; browser evidence not merged`)
+          }
+        } catch (error) {
+          notes.push(`spa-lane: enrich ${proof.vulnClass} failed: ${(error as Error).message.slice(0, 140)}`)
+        }
+        return
+      }
       notes.push(`spa-lane: ${proof.vulnClass} on ${proof.endpoint} already confirmed by the engine; not duplicated`)
       return
     }
@@ -3167,6 +3220,9 @@ export async function runSpaCapabilityLane(input: SpaCapabilityLaneInput): Promi
 
   // --- Stored XSS rendered only in an authenticated browser view (hybrid HTTP -> browser) -----
   if (memberBearer && adminCookie) {
+    // Isolated lane browser: never share the product engine's pooled contexts, which can be closed,
+    // evicted or left mid-navigation when a slower verifier backend (docker) finishes the run.
+    const laneBrowser = input.createBrowser ? input.createBrowser() : input.browser
     const canary = `gxss${randomUUID().replace(/-/g, '').slice(0, 12)}`
     const payload = `<img src=x onerror="document.title='${canary}'">`
     const adminPersona = adminCookie.handle
@@ -3221,23 +3277,33 @@ export async function runSpaCapabilityLane(input: SpaCapabilityLaneInput): Promi
       if (sink) {
         let executed = false
         try {
-          const visits = await input.browser.visitPages([{
-            origin: sink.origin,
-            pathAndQuery: sink.pathAndQuery,
-            persona: adminPersona,
-            checkKind: 'dom_xss',
-            enableSinkHook: true,
-            canaryToken: canary,
-            waitAfterLoadMs: 900,
-            runId: input.run.id,
-            assignmentId,
-          }], input.grant, input.signal)
-          const visit = visits[0]
-          executed = Boolean(visit && (
-            visit.title === canary ||
-            visit.canaryCheck.triggered ||
-            visit.domSinkTraces.some(trace => trace.containsCanary)
-          ))
+          // The stored payload is server-rendered, so execution shows up as the injected handler
+          // setting document.title (or a DOM-sink trace). A loaded host needs a longer settle than
+          // an idle one: retry once with a wider window before declaring the proof absent.
+          for (const waitAfterLoadMs of [1200, 3000]) {
+            const visits = await laneBrowser.runBrowserSession([{
+              id: 'stored-sink',
+              role: 'probe',
+              origin: sink.origin,
+              pathAndQuery: sink.pathAndQuery,
+              persona: adminPersona,
+              action: 'navigate',
+              checkKind: 'dom_xss',
+              enableSinkHook: true,
+              canaryToken: canary,
+              waitAfterLoadMs,
+              runId: input.run.id,
+              assignmentId,
+            }], input.grant, input.signal)
+            const visit = visits[0]
+            executed = Boolean(visit && (
+              visit.title === canary ||
+              visit.canaryCheck.triggered ||
+              visit.domSinkTraces.some(trace => trace.containsCanary)
+            ))
+            if (executed) break
+            notes.push(`spa-lane: stored-xss render not executed yet (status=${visit?.status ?? 'none'} titleMatch=${visit?.title === canary} sinks=${visit?.domSinkTraces.length ?? 0}); retrying`)
+          }
         } catch (error) {
           notes.push(`spa-lane: browser render failed: ${(error as Error).message.slice(0, 120)}`)
         }
@@ -3259,6 +3325,7 @@ export async function runSpaCapabilityLane(input: SpaCapabilityLaneInput): Promi
         }
       }
     }
+    if (input.createBrowser) await laneBrowser.close().catch(() => undefined)
   }
 
   return { confirmed, notes }
@@ -3578,16 +3645,42 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
 
     // Split-origin SPA capability lane (#1): OIDC redirect, unsigned-token refresh, privileged
     // function access, and hybrid HTTP -> browser stored XSS. Runs through the real broker,
-    // persona vault and pooled browser; only transcript-backed proofs are persisted.
-    if (ENTERPRISE_ROUTES.has(fixtureName) && observedBroker && engineBrowser) {
+    // persona vault and an isolated browser; only transcript-backed proofs are persisted.
+    //
+    // The lane runs after the product engine. It re-resolves personas (an agentic/docker run can
+    // rotate a session secret after the initial grant snapshot) and uses its own ScopedBrowser
+    // (never the engine's pooled contexts), so a slower or differently-configured verifier backend
+    // cannot change the browser proof.
+    if (ENTERPRISE_ROUTES.has(fixtureName) && observedBroker) {
+      const lanePersonas = resolveRunPersonas(storage, project.id, personaIds)
+      const laneOriginSet = new Set(Object.values(briefing.origins).map(normalizeOrigin))
+      const freshLaneGrant: Grant = {
+        tier: 3,
+        allowLocalLab: true,
+        canRead: origin => laneOriginSet.has(normalizeOrigin(origin)),
+        personas: lanePersonas,
+        secrets: personaSecrets(lanePersonas),
+        audit: () => {},
+      }
+      let laneBrowserToClose: ScopedBrowser | undefined
+      const createLaneBrowser = (): ScopedBrowser => {
+        if (!laneBrowserToClose) {
+          laneBrowserToClose = new ScopedBrowser(observedBroker, {
+            storage,
+            resolveSessionBundle: (persona, origin) => personaSessionBundle(freshLaneGrant, persona, origin),
+          })
+        }
+        return laneBrowserToClose
+      }
       try {
         const lane = await runSpaCapabilityLane({
           storage,
           run: storage.run(createdRun.id),
           assetId: assetIds[0]!,
           broker: observedBroker,
-          grant: laneGrant,
-          browser: engineBrowser,
+          grant: freshLaneGrant,
+          browser: engineBrowser ?? createLaneBrowser(),
+          createBrowser: createLaneBrowser,
           origins: briefing.origins,
           scopes: plan.scopes,
           routes,
@@ -3603,6 +3696,8 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
         if (lane.confirmed.length > 0) notes.push(`spa capability lane confirmed: ${lane.confirmed.join(', ')}`)
       } catch (error) {
         notes.push(`spa capability lane failed: ${redact(error instanceof Error ? error.message : String(error)).slice(0, 200)}`)
+      } finally {
+        await laneBrowserToClose?.close().catch(() => undefined)
       }
     }
     if (timedOut) notes.push(`wall-clock cap reached after ${args.maxDurationMs}ms; run stopped`)
