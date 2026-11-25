@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { and, eq } from 'drizzle-orm'
 import {
   maxInlineVerifyRetries,
   type CheckCoverage,
@@ -46,8 +47,10 @@ import {
   ProviderNoTokenWatchdog,
   buildBolaTestQueue,
   extractAssignedTargetRoutes,
+  isMultiHopChainStep,
   percentile,
   providerStallAbortMs,
+  resolveWorkerSettlementMs,
   secretGenerationFingerprint,
   selectAssignmentBolaQueueItems,
   shouldRetryStalledAssignment,
@@ -74,6 +77,7 @@ import { crawlStateGraph } from './phase0-recon.ts'
 import { resolveProfileNoTokenWatchdogMs } from './provider-stream.ts'
 import { BudgetExceededError } from './provider.ts'
 import { redact, type NamedSecret } from './redact.ts'
+import { brokerExchanges } from './schema.ts'
 import type {
   Assignment,
   BoardMessageRow,
@@ -666,6 +670,12 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       const stalls = this.host.providerStallTurnsByRun.get(run.id) ?? 0
       if (ms > PROVIDER_STALL_TURN_MS) this.host.providerStallTurnsByRun.set(run.id, stalls + 1)
     }
+
+    const baselineCapIds = new Set(
+      this.storage.capabilityLedger(run.id).listCapabilities().map(c => c.capId),
+    )
+    const sessionSealedCapHandles: string[] = []
+    let confirmedDuringAssignment = false
 
     try {
       const stagedSpecs = await this.host.stageProjectSpecs(run.projectId, session, job.controller.signal)
@@ -1310,6 +1320,9 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
 
           if (verifyNow) {
             const inline = await verifyInline(parsed, savedFinding.id, specRow.id)
+            if (inline.status === 'confirmed' || inline.status === 'static_verified') {
+              confirmedDuringAssignment = true
+            }
             return {
               findingId: savedFinding.id,
               replaySpecId: inline.replaySpecId,
@@ -1414,6 +1427,9 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           const shouldVerifyNow = Boolean(parsedUpdatedSpec && (args.verifyNow ?? true) && !isAlreadyVerified)
           if (shouldVerifyNow && parsedUpdatedSpec) {
             const inline = await verifyInline(parsedUpdatedSpec, existingRow.id, createdSpecRowId ?? nextReplaySpecId)
+            if (inline.status === 'confirmed' || inline.status === 'static_verified') {
+              confirmedDuringAssignment = true
+            }
             return {
               findingId: updated.id,
               replaySpecId: inline.replaySpecId,
@@ -1438,6 +1454,9 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           const spec = args.spec ?? args.replaySpec
           if (!spec) throw new Error('verify_replay_spec requires spec or replaySpec.')
           const inline = await verifyInline(spec, args.findingId, args.replaySpecId)
+          if (inline.status === 'confirmed' || inline.status === 'static_verified') {
+            confirmedDuringAssignment = true
+          }
           return {
             findingId: inline.findingId ?? args.findingId ?? null,
             replaySpecId: inline.replaySpecId,
@@ -1479,6 +1498,11 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               proof,
               defaultOrigin: [...approved][0] ?? '',
             })
+            for (const sealed of ledgerSync.sealedCapabilities) {
+              if (sealed.handle && !sessionSealedCapHandles.includes(sealed.handle)) {
+                sessionSealedCapHandles.push(sealed.handle)
+              }
+            }
             if (ledgerSync.newCapabilityCount > 0 || ledgerSync.newEdgeCount > 0) {
               this.host.schedulePlanner(curRun.id)
             }
@@ -1502,6 +1526,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             if (!proof.verdict.confirmed) {
               return summarizeGuardianVerifyOutcome({ ...proof.verdict, ...v8Meta })
             }
+            confirmedDuringAssignment = true
             const persisted = this.host.persistAgentScriptProof({
               run: curRun,
               assignment: job.assignment,
@@ -1582,9 +1607,9 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         maxTurns: job.assignment.maxTurns,
       })
       const hasHopCheckpoint = Boolean(assignmentBrief && /\b(?:hopCheckpoint|cap:hop_|doNotRediscover)\b/.test(assignmentBrief))
-      const isMultiHopStep = hasHopCheckpoint
-        || step.dependsOnStepIds.length > 0
-        || step.skills.some(s => s === 'multihop-chains' || s === 'chain-primitives' || s.startsWith('chain:'))
+      const isMultiHopStep = hasHopCheckpoint || isMultiHopChainStep(step)
+      const effectiveSettlementMs = budget.wallClockSettlementMs
+        ?? (isMultiHopStep ? resolveWorkerSettlementMs(budget.wallClockMs, true) : wallClockSettlementMs(budget.wallClockMs))
       const preInjectedSkills = selectPreInjectionSkills({
         profileSkills: specialistConfig.skills,
         techTags: [...new Set(techTags)],
@@ -1650,7 +1675,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         compaction: true,
         enableSettlement: true,
         requireCompleteIntent: true,
-        shouldSettle: () => (Date.now() - startedAt) >= wallClockSettlementMs(budget.wallClockMs),
+        shouldSettle: () => (Date.now() - startedAt) >= effectiveSettlementMs,
         handlers: scopedHandlers,
         secrets,
         beforeCall: () => {
@@ -1754,6 +1779,39 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         this.completeWorker(job.assignment, latestRun, outcomeText, [], undefined, currentSecrets())
         this.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: job.assignment.id })
       }, { behavior: 'immediate' })
+      if (sessionResult.status === 'wall_clock_rotated' && isMultiHopChainStep(step) && !confirmedDuringAssignment) {
+        try {
+          const recordedFacts = this.storage.listFacts(run.id, { includeTainted: false, limit: 500 })
+            .filter(f => f.assignmentId === job.assignment.id)
+          const recordedExchanges = this.storage.db
+            .select({
+              id: brokerExchanges.id,
+              origin: brokerExchanges.origin,
+              method: brokerExchanges.method,
+              pathAndQuery: brokerExchanges.pathAndQuery,
+              status: brokerExchanges.status,
+            })
+            .from(brokerExchanges)
+            .where(and(eq(brokerExchanges.runId, run.id), eq(brokerExchanges.assignmentId, job.assignment.id)))
+            .all()
+          const newLedgerHandles = this.storage.capabilityLedger(run.id)
+            .listCapabilities()
+            .filter(c => !baselineCapIds.has(c.capId) && DERIVED_CAPABILITY_HANDLE_RE.test(c.capId))
+            .map(c => c.capId)
+          const sealedCapHandles = [...new Set([...sessionSealedCapHandles, ...newLedgerHandles])]
+          this.host.reconPlanner.enqueueHopContinuationOnRotation({
+            run: latestRun,
+            step,
+            assignment: job.assignment,
+            targetOrigins,
+            confirmed: confirmedDuringAssignment,
+            partialSummary: redact(outcomeText, currentSecrets()),
+            recordedFacts,
+            recordedExchanges,
+            sealedCapHandles,
+          })
+        } catch { /* continuation checkpointing is best-effort and must never fail worker completion */ }
+      }
     } finally {
       clearPreSessionTimer()
       stallWatchdog.clear()

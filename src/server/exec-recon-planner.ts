@@ -44,9 +44,12 @@ import {
 } from './broker.ts'
 import {
   CapabilityLedger,
+  DERIVED_CAPABILITY_HANDLE_RE,
   computeArtifactDigest,
   finalizeHopCheckpointBrief,
   formatDerivedCapabilityHandle,
+  sanitizeCheckpointHandleRef,
+  sanitizeCheckpointText,
   type AddCapabilityInput,
   type CapabilityKind,
   type CapabilitySurface,
@@ -55,9 +58,11 @@ import {
 import { extractSpecDedupeFields, normalizeEndpointTemplate } from './dedupe.ts'
 import { meetsBaseline, type EvidenceReview } from './evidence-checks.ts'
 import {
+  CHAIN_CONTINUATION_SKILL_PREFIX,
   DET_LEAD_STEP_PRIORITY,
   DRY_ROUND_LIMIT,
   FrontierWaveController,
+  MAX_CHAIN_CONTINUATIONS,
   TIER_A_MAX_SEEDED_STEPS,
   TIER_A_STEP_PRIORITY,
   WHITEBOX_BLACKBOX_CAP_PRIORITY,
@@ -83,10 +88,12 @@ import {
   dispatchableReadySteps,
   emptyDispatchFunnel,
   evaluateDispatchStop,
+  extractContinuationDepth,
   formatHopCheckpointForAssignment,
   hardChainStepsCeiling,
   hostTierOrder,
   isDetLeadDispatchStep,
+  isMultiHopChainStep,
   nextPlannerDryRounds,
   passOneCoverage,
   permanentlyBlockedStepIds,
@@ -166,6 +173,7 @@ import { responseReview } from './response-checks.ts'
 import { availableReviewChecks, parseReviewPlan, reviewPlanPrompt, standardChecks } from './review-plan.ts'
 import { findings, messages } from './schema.ts'
 import { runVariantSweepForFinding } from './semantic-audit.ts'
+import type { StaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
 import type { Assignment, ChainStep, Fact, Run, Store } from './store.ts'
 
 type Active = ExecActiveJob
@@ -507,6 +515,9 @@ function hopKindToCapabilityKind(kind: ChainHop['artifactKind']): CapabilityKind
 }
 
 export const CHECKPOINT_CAP_SKILL_PREFIX = 'checkpoint_cap:'
+export const MAX_WORKSPACE_DIGEST_BYTES = 8 * 1024
+export const HOP_CONTINUATION_DIRECTIVE =
+  'Continue from verified Hop 1–2 checkpoint — DO NOT re-read source or repeat Hops 1–2; execute Hops 3–5 using the sealed handles + ctx.hmac_sign/ctx.jwt_sign/ctx.await_async and confirm end-to-end via ctx.prove_composite!'
 
 export function extractCheckpointCapIdFromStep(step: { skills?: readonly string[] }): string | null {
   for (const skill of step.skills ?? []) {
@@ -516,6 +527,214 @@ export function extractCheckpointCapIdFromStep(step: { skills?: readonly string[
     }
   }
   return null
+}
+
+function serviceGroupForPath(relPath: string, mountedRepos: readonly string[]): string {
+  const parts = relPath.split('/').filter(Boolean)
+  if (parts.length <= 1) return '(root)'
+  // Strip mounted repo prefix (`owner/repo` or `repo`) when present so service subdirectories group cleanly.
+  let offset = 0
+  for (const repo of mountedRepos) {
+    const clean = repo.replace(/^\/+|\/+$/g, '')
+    if (clean && (relPath === clean || relPath.startsWith(`${clean}/`))) {
+      offset = clean.split('/').filter(Boolean).length
+      break
+    }
+  }
+  const rest = parts.slice(offset)
+  if (rest.length <= 1) return offset > 0 ? parts.slice(0, offset).join('/') : '(root)'
+  const first = rest[0]!
+  if ((first === 'services' || first === 'apps' || first === 'packages' || first === 'workers') && rest.length >= 3) {
+    return `${first}/${rest[1]}`
+  }
+  return first
+}
+
+const HIGH_SIGNAL_FILE_RE = /(?:route|router|controller|handler|endpoint|api|auth|guard|middleware|rbac|policy|tenant|webhook|sign|jwt|oauth|oidc|worker|queue|job|consumer|graphql|resolver|sse|stream|socket|proxy|gateway|edge|export|upload|storage|cache)/i
+const GRAPHQL_OP_RE = /\b(?:type\s+(?:Query|Mutation|Subscription)|(?:Query|Mutation|Subscription)\s*[:=]\s*\{)\b/
+const WEBHOOK_OR_WORKER_RE = /\b(?:webhook|hmac|verifySignature|x-signature|x-hub-signature|queue\.process|worker\.on|subscribe\(|EventSource|text\/event-stream|WebSocketServer|on\(['"](?:message|job|task)['"])/i
+
+/**
+ * Build a compact `<= 8 KB` Pre-Indexed Multi-Service Route, Authz Guard & Sink Digest directly
+ * from an in-memory `StaticWorkspaceSnapshot` (zero extra filesystem walks). Injected into
+ * `Source-First Code Audit` on Turn 1 so the auditor immediately sees services, routes, guards,
+ * GraphQL/webhook/worker handlers, and sinks with exact `file:line` references.
+ */
+export function buildWorkspaceSourceDigest(
+  snapshot: StaticWorkspaceSnapshot,
+  maxBytes = MAX_WORKSPACE_DIGEST_BYTES,
+): string {
+  const cap = Math.max(512, Math.min(MAX_WORKSPACE_DIGEST_BYTES, Math.floor(maxBytes)))
+  const pg = snapshot.programGraph
+  const lines: string[] = []
+  const frameworks = pg.frameworks.length ? pg.frameworks.join(', ') : 'unknown'
+  const reposLabel = snapshot.mountedRepos.length ? snapshot.mountedRepos.join(', ') : '(workspace-root)'
+  const sinkNodes = pg.nodes.filter(n => n.kind === 'sink')
+  const middlewareNodes = pg.nodes.filter(n => n.kind === 'middleware')
+
+  lines.push('# Pre-Indexed Multi-Service Route, Authz Guard & Sink Digest')
+  lines.push(
+    `Summary: files=${snapshot.walkStats.filesScanned}, repos=[${reposLabel}], frameworks=[${frameworks}], routes=${pg.routes.length}, sinks=${sinkNodes.length}, middleware=${middlewareNodes.length}`
+    + `${snapshot.compose ? ', compose=yes' : ''}${snapshot.ingress ? ', ingress=yes' : ''}`,
+  )
+
+  // 1. Group files by service / top-level directory (prioritizing high-signal files).
+  const byService = new Map<string, string[]>()
+  for (const relPath of snapshot.files) {
+    const svc = serviceGroupForPath(relPath, snapshot.mountedRepos)
+    const bucket = byService.get(svc) ?? []
+    bucket.push(relPath)
+    byService.set(svc, bucket)
+  }
+  if (byService.size > 0) {
+    lines.push('## Services & Key Files')
+    const sortedServices = [...byService.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+    for (const [svc, svcFiles] of sortedServices.slice(0, 24)) {
+      const prioritized = [...svcFiles].sort((a, b) =>
+        Number(HIGH_SIGNAL_FILE_RE.test(b)) - Number(HIGH_SIGNAL_FILE_RE.test(a))
+        || a.localeCompare(b),
+      )
+      const shown = prioritized.slice(0, 8).join(', ')
+      const extra = prioritized.length > 8 ? ` (+${prioritized.length - 8} more)` : ''
+      lines.push(`- ${svc} (${svcFiles.length} files): ${shown}${extra}`)
+    }
+  }
+
+  // 2. Discovered HTTP routes with authz guards & parameters (unguarded first so asymmetries jump out).
+  if (pg.routes.length > 0) {
+    lines.push('## Discovered HTTP Routes (method path @ file:line [guards])')
+    const unguardedFirst = [...pg.routes].sort((a, b) =>
+      Number(b.guards.length === 0) - Number(a.guards.length === 0)
+      || a.file.localeCompare(b.file)
+      || a.line - b.line,
+    )
+    for (const r of unguardedFirst.slice(0, 60)) {
+      const guardLabel = r.guards.length ? `guards=[${r.guards.slice(0, 4).join(',')}]` : 'guards=[NONE]'
+      const params = [...r.input.params, ...r.input.query, ...r.input.body].slice(0, 6)
+      const paramLabel = params.length ? ` params=[${params.join(',')}]` : ''
+      const handlerLabel = r.handler ? ` (${r.handler})` : ''
+      lines.push(`- ${r.method.toUpperCase()} ${r.path} @ ${r.file}:${r.line}${handlerLabel} ${guardLabel}${paramLabel}`)
+    }
+    if (unguardedFirst.length > 60) {
+      lines.push(`- ... +${unguardedFirst.length - 60} additional routes`)
+    }
+  }
+
+  // 3. GraphQL / Webhook / Async-Worker / SSE / WS entrypoints from cached snapshot sources.
+  const secondaryHandlers: string[] = []
+  const routeFilesSeen = new Set(pg.routes.map(r => `${r.file}:${r.line}`))
+  for (const [relPath, content] of snapshot.sourceByPath.entries()) {
+    if (secondaryHandlers.length >= 30) break
+    const isGqlFile = /\.(?:graphql|gql)$/i.test(relPath)
+    if (!isGqlFile && !GRAPHQL_OP_RE.test(content) && !WEBHOOK_OR_WORKER_RE.test(content)) continue
+    const fileLines = content.split(/\r?\n/)
+    for (let idx = 0; idx < fileLines.length && secondaryHandlers.length < 30; idx += 1) {
+      const lineText = fileLines[idx] ?? ''
+      if (
+        (isGqlFile && /^\s*(?:type\s+(?:Query|Mutation|Subscription)|[a-zA-Z_][A-Za-z0-9_]*\s*\()/.test(lineText))
+        || GRAPHQL_OP_RE.test(lineText)
+        || WEBHOOK_OR_WORKER_RE.test(lineText)
+      ) {
+        const loc = `${relPath}:${idx + 1}`
+        if (routeFilesSeen.has(loc)) continue
+        routeFilesSeen.add(loc)
+        const kindTag = isGqlFile || GRAPHQL_OP_RE.test(lineText) ? 'graphql' : 'webhook/worker'
+        secondaryHandlers.push(`- [${kindTag}] ${loc}: ${lineText.trim().slice(0, 96)}`)
+      }
+    }
+  }
+  if (secondaryHandlers.length > 0) {
+    lines.push('## GraphQL / Webhook / Async Worker Handlers')
+    lines.push(...secondaryHandlers)
+  }
+
+  // 4. Middleware & Authz Guards.
+  if (pg.globalMiddleware.length > 0 || middlewareNodes.length > 0) {
+    lines.push('## Middleware & Authz Guards')
+    if (pg.globalMiddleware.length > 0) {
+      lines.push(`- global: ${pg.globalMiddleware.slice(0, 16).join(', ')}`)
+    }
+    for (const mw of middlewareNodes.slice(0, 24)) {
+      lines.push(`- ${mw.symbol} @ ${mw.file}:${mw.line}${mw.guards.length ? ` [${mw.guards.join(',')}]` : ''}`)
+    }
+  }
+
+  // 5. Key Sinks & Static Leads (file:line).
+  if (sinkNodes.length > 0 || (pg.staticLeads?.length ?? 0) > 0) {
+    lines.push('## Key Sinks & Handlers (file:line)')
+    const sortedSinks = [...sinkNodes].sort((a, b) =>
+      Number(b.guards.length === 0) - Number(a.guards.length === 0)
+      || a.file.localeCompare(b.file)
+      || a.line - b.line,
+    )
+    for (const sink of sortedSinks.slice(0, 40)) {
+      const guards = sink.guards.length ? ` guards=[${sink.guards.slice(0, 3).join(',')}]` : ' guards=[NONE]'
+      lines.push(`- [${sink.sinkKind ?? 'sink'}] ${sink.symbol} @ ${sink.file}:${sink.line}${guards}`)
+    }
+    for (const lead of (pg.staticLeads ?? []).slice(0, 12)) {
+      lines.push(`- [static:${lead.kind}] ${lead.note} @ ${lead.file}:${lead.line}`)
+    }
+  }
+
+  // Strictly enforce `<= maxBytes` UTF-8 at clean line boundaries.
+  const footer = '\n[digest truncated to byte cap]'
+  const footerBytes = Buffer.byteLength(footer, 'utf8')
+  const outLines: string[] = []
+  let usedBytes = 0
+  let truncated = false
+  for (const line of lines) {
+    const prefix = outLines.length > 0 ? '\n' : ''
+    const chunk = `${prefix}${line}`
+    const chunkBytes = Buffer.byteLength(chunk, 'utf8')
+    if (usedBytes + chunkBytes + footerBytes > cap) {
+      if (usedBytes + chunkBytes <= cap && line === lines[lines.length - 1]) {
+        outLines.push(line)
+        usedBytes += chunkBytes
+      } else {
+        truncated = true
+      }
+      break
+    }
+    outLines.push(line)
+    usedBytes += chunkBytes
+  }
+  const joined = truncated ? `${outLines.join('\n')}${footer}` : outLines.join('\n')
+  if (Buffer.byteLength(joined, 'utf8') <= cap) return joined
+  let trimmed = joined
+  while (trimmed.length > 0 && Buffer.byteLength(trimmed, 'utf8') > cap) {
+    trimmed = trimmed.slice(0, -1)
+  }
+  return trimmed
+}
+
+export interface HopContinuationExchangeRef {
+  id: string
+  origin: string
+  method: string
+  pathAndQuery: string
+  status: number
+}
+
+export interface EnqueueHopContinuationInput {
+  run: Run
+  step: ChainStep
+  assignment: Assignment
+  targetOrigins: readonly string[]
+  confirmed: boolean
+  partialSummary: string
+  recordedFacts: readonly Fact[]
+  recordedExchanges: readonly HopContinuationExchangeRef[]
+  sealedCapHandles: readonly string[]
+  maxContinuations?: number
+}
+
+export interface EnqueueHopContinuationResult {
+  enqueued: boolean
+  reason?: 'not_multi_hop_chain' | 'already_confirmed' | 'max_continuations_reached' | 'no_concrete_progress' | 'already_enqueued' | 'dispatch_filtered'
+  continuationStep?: ChainStep
+  continuationDepth?: number
+  checkpointCapId?: string
+  checkpointBytes?: number
 }
 
 function parseHopCheckpointJson(raw: unknown): HopCheckpointBrief | null {
@@ -2405,11 +2624,18 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
    * Returns the structured funnel counts so a planner round can report exactly where planned
    * hypotheses were dropped (title dedupe, already-confirmed route, no approved asset, cap, budget).
    */
-  persistDispatchPlan(run: Run, plan: DispatchPlan, factIds: ReadonlySet<string>, detLeadFactIds: ReadonlySet<string> = new Set()): Pick<DispatchFunnelCounts, 'planned' | 'enqueued' | 'filteredDedupe' | 'filteredAlreadyConfirmed' | 'filteredNoAsset'> {
+  persistDispatchPlan(
+    run: Run,
+    plan: DispatchPlan,
+    factIds: ReadonlySet<string>,
+    detLeadFactIds: ReadonlySet<string> = new Set(),
+    options: { dependsOnStepIds?: readonly string[]; preservePriority?: boolean } = {},
+  ): Pick<DispatchFunnelCounts, 'planned' | 'enqueued' | 'filteredDedupe' | 'filteredAlreadyConfirmed' | 'filteredNoAsset'> {
     const existing = this.storage.listChainSteps(run.id, run.goalRevision)
     const titles = new Set(existing.map(step => step.title.trim().toLowerCase()))
     const confirmed = this.alreadyConfirmedRefs(run, 40)
     const counts = { planned: plan.plan.length, enqueued: 0, filteredDedupe: 0, filteredAlreadyConfirmed: 0, filteredNoAsset: 0 }
+    const depStepIds = [...new Set(options.dependsOnStepIds ?? [])]
     for (const step of plan.plan) {
       const title = compactChainTitle(step.hypothesis)
       const key = title.toLowerCase()
@@ -2417,7 +2643,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const boundFactIds = step.parentEvidenceIds.filter(id => factIds.has(id))
       // Tool-dispatched hypotheses obey the same no-re-dispatch rule as planner JSON steps.
       if (this.stepRepeatsConfirmedWork({
-        title, hypothesis: step.hypothesis, dependsOnFactIds: boundFactIds, dependsOnStepIds: [],
+        title, hypothesis: step.hypothesis, dependsOnFactIds: boundFactIds, dependsOnStepIds: depStepIds,
       }, confirmed)) { counts.filteredAlreadyConfirmed += 1; continue }
       const assetIds = run.candidates
         .filter(candidate => step.origins.includes(candidate.origin) && run.approved.includes(candidate.id))
@@ -2443,7 +2669,9 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const checkpointJson = parsedBrief?.checkpointJson
         ?? (typeof step.checkpointJson === 'string' && step.checkpointJson.trim() ? step.checkpointJson.trim().slice(0, MAX_CHECKPOINT_BRIEF_BYTES) : undefined)
       const stepSkills = [...step.skills]
-      if (checkpointCapId) stepSkills.push(`${CHECKPOINT_CAP_SKILL_PREFIX}${checkpointCapId}`)
+      if (checkpointCapId && !stepSkills.includes(`${CHECKPOINT_CAP_SKILL_PREFIX}${checkpointCapId}`)) {
+        stepSkills.push(`${CHECKPOINT_CAP_SKILL_PREFIX}${checkpointCapId}`)
+      }
       const finalFactIds = [...boundFactIds]
       if (checkpointCapId || checkpointJson) {
         const workers = this.storage.workerList(run.id)
@@ -2466,14 +2694,18 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           } catch { /* non-fatal: checkpoint_cap skill tag + ledger still persist */ }
         }
       }
+      const resolvedPriority = options.preservePriority
+        ? step.priority
+        : tierABound ? TIER_A_STEP_PRIORITY : leadBound ? Math.min(step.priority, DET_LEAD_STEP_PRIORITY) : step.priority
       const createdStep = this.storage.addChainStep(run, {
         title: title.slice(0, 200),
         hypothesis: step.hypothesis,
         category,
-        priority: tierABound ? TIER_A_STEP_PRIORITY : leadBound ? Math.min(step.priority, DET_LEAD_STEP_PRIORITY) : step.priority,
+        priority: resolvedPriority,
         targetAssetIds: assetIds,
         skills: stepSkills,
         dependsOnFactIds: finalFactIds,
+        ...(depStepIds.length ? { dependsOnStepIds: depStepIds } : {}),
         sourceOrigins: step.origins,
         specialistProfile: routeStepToSpecialist({ title, hypothesis: step.hypothesis, category, skills: step.skills }),
       })
@@ -2487,6 +2719,253 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       counts.enqueued += 1
     }
     return counts
+  }
+
+  /**
+   * Automatically enqueue ONE bounded Hop-Continuation `chain` step when a multi-hop worker exits
+   * with `wall_clock_rotated`, has not yet confirmed a finding, and made concrete progress
+   * (`>= 1` fact, exchange, or sealed `cap:hop_*` handle in `CapabilityLedger`). Reuses the exact
+   * `persistDispatchPlan` / `v8.hop_checkpoint.v1` `<= 2 KB` SQLite checkpoint mechanism.
+   */
+  enqueueHopContinuationOnRotation(input: EnqueueHopContinuationInput): EnqueueHopContinuationResult {
+    const { run, step, assignment } = input
+    if (!isMultiHopChainStep(step)) {
+      return { enqueued: false, reason: 'not_multi_hop_chain' }
+    }
+    if (input.confirmed) {
+      return { enqueued: false, reason: 'already_confirmed' }
+    }
+    const maxContinuations = Math.max(0, Math.floor(input.maxContinuations ?? MAX_CHAIN_CONTINUATIONS))
+    const currentDepth = extractContinuationDepth(step)
+    if (currentDepth >= maxContinuations) {
+      return { enqueued: false, reason: 'max_continuations_reached', continuationDepth: currentDepth }
+    }
+
+    const ledger = this.storage.capabilityLedger(run.id)
+    const ledgerNodes = ledger.listCapabilities()
+    const ledgerNodeById = new Map(ledgerNodes.map(n => [n.capId, n]))
+    const factHandleMatches = input.recordedFacts.flatMap(f =>
+      `${f.summary} ${JSON.stringify(f.data ?? {})}`.match(/cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+/g) ?? [],
+    )
+    const stepCapId = extractCheckpointCapIdFromStep(step)
+    const candidateHandles = [
+      ...input.sealedCapHandles,
+      ...factHandleMatches,
+      ...(stepCapId ? [stepCapId] : []),
+    ]
+      .map(h => h.trim())
+      .filter(h => DERIVED_CAPABILITY_HANDLE_RE.test(h))
+    const uniqueHandles = [...new Set(candidateHandles)]
+
+    const hasProgress = input.recordedFacts.length > 0
+      || input.recordedExchanges.length > 0
+      || uniqueHandles.length > 0
+    if (!hasProgress) {
+      return { enqueued: false, reason: 'no_concrete_progress' }
+    }
+
+    const nextDepth = currentDepth + 1
+    const existingSteps = this.storage.listChainSteps(run.id, run.goalRevision)
+    const existingContinuation = existingSteps.find(s =>
+      s.dependsOnStepIds.includes(step.id) && extractContinuationDepth(s) === nextDepth,
+    )
+    if (existingContinuation) {
+      return {
+        enqueued: false,
+        reason: 'already_enqueued',
+        continuationStep: existingContinuation,
+        continuationDepth: nextDepth,
+      }
+    }
+
+    // Prefer the most recent derived sealed capability handle present in SQLite CapabilityLedger.
+    const ledgerHandles = uniqueHandles.filter(id => ledgerNodeById.has(id))
+    const derivedLedgerHandles = ledgerHandles.filter(id => ledgerNodeById.get(id)?.provenance !== 'static_analysis')
+    const primaryCapId = (derivedLedgerHandles.at(-1) ?? ledgerHandles.at(-1))
+      ?? ledgerNodes.filter(n => n.provenance !== 'static_analysis' && DERIVED_CAPABILITY_HANDLE_RE.test(n.capId)).at(-1)?.capId
+      ?? undefined
+    const allSealedHandles = [...new Set([
+      ...uniqueHandles,
+      ...(primaryCapId ? [primaryCapId] : []),
+    ])].slice(0, 8)
+
+    const approvedOrigins = this.host.approvedOriginsSet(run)
+    const origins = [...new Set(input.targetOrigins.filter(o => approvedOrigins.has(o)))]
+    if (!origins.length) {
+      return { enqueued: false, reason: 'dispatch_filtered' }
+    }
+    const primaryOrigin = origins[0]!
+
+    const observedEndpoints = [...new Set(
+      input.recordedExchanges.map(ex => `${ex.method.toUpperCase()} ${ex.pathAndQuery.split('?')[0] || '/'} (${ex.status})`),
+    )].slice(0, 6)
+    const observedFactNotes = input.recordedFacts
+      .map(f => sanitizeCheckpointText(f.summary, 110))
+      .filter(Boolean)
+      .slice(0, 4)
+    const partialClean = sanitizeCheckpointText(
+      input.partialSummary.replace(/^\[partial\]\s*/i, '').trim(),
+      180,
+    )
+
+    const lastExchange = input.recordedExchanges[input.recordedExchanges.length - 1]
+    const nextEndpoint = lastExchange ? (lastExchange.pathAndQuery.split('?')[0] || '/') : '/'
+    const nextMethod = lastExchange?.method?.toUpperCase()
+    const branchKey = `cont:${step.id.slice(0, 12)}:d${nextDepth}`
+
+    let finalizedBrief: { brief: HopCheckpointBrief; checkpointJson: string; checkpointBytes: number }
+    if (primaryCapId && ledgerNodeById.has(primaryCapId)) {
+      const ledgerBrief = ledger.buildHopCheckpointBrief(primaryCapId, MAX_CHECKPOINT_BRIEF_BYTES, {
+        branchKey,
+        mode: 'pivot',
+        nextGoal: {
+          surface: 'http',
+          service: primaryOrigin,
+          endpoint: nextEndpoint,
+          ...(nextMethod ? { method: nextMethod } : {}),
+          hypothesisClass: step.category || 'multi_hop_chain',
+          goal: HOP_CONTINUATION_DIRECTIVE,
+        },
+      })
+      const mergedHandles = [...new Set([...ledgerBrief.capabilityHandles, ...allSealedHandles])]
+        .map((h, i) => sanitizeCheckpointHandleRef(h, `cap:redacted:${i + 1}`))
+      finalizedBrief = finalizeHopCheckpointBrief({
+        ...ledgerBrief,
+        depth: Math.max(ledgerBrief.depth, nextDepth),
+        targetHop: Math.min(6, Math.max(ledgerBrief.targetHop, nextDepth + 2)),
+        capabilityHandles: mergedHandles,
+        doNotRediscover: true,
+      }, MAX_CHECKPOINT_BRIEF_BYTES)
+    } else {
+      const fallbackHops = input.recordedExchanges.slice(-3).map((ex, idx) => ({
+        hop: idx + 1,
+        receiptId: sanitizeCheckpointHandleRef(`ex:${ex.id}`, `hop:${idx + 1}`),
+        capId: allSealedHandles[idx]
+          ? sanitizeCheckpointHandleRef(allSealedHandles[idx]!, `ref:hop_${idx + 1}`)
+          : `ref:hop_${idx + 1}`,
+        kind: 'state_handle' as CapabilityKind,
+        surface: 'http' as CapabilitySurface,
+        service: sanitizeCheckpointText(ex.origin || primaryOrigin, 48),
+        tenant: 'observed',
+        actor: 'worker',
+        at: sanitizeCheckpointText(`${ex.method.toUpperCase()} ${ex.pathAndQuery.split('?')[0] || '/'}`, 48),
+      }))
+      finalizedBrief = finalizeHopCheckpointBrief({
+        schema: 'v8.hop_checkpoint.v1',
+        branchKey,
+        depth: nextDepth,
+        targetHop: Math.min(6, nextDepth + 2),
+        mode: 'pivot',
+        evi: 1,
+        verifiedHops: fallbackHops,
+        capabilityHandles: allSealedHandles.map((h, i) => sanitizeCheckpointHandleRef(h, `cap:redacted:${i + 1}`)),
+        nextGoal: {
+          targetSurfaceKey: `${primaryOrigin}|http|${nextEndpoint}`,
+          surface: 'http',
+          service: primaryOrigin,
+          endpoint: nextEndpoint,
+          ...(nextMethod ? { method: nextMethod } : {}),
+          hypothesisClass: step.category || 'multi_hop_chain',
+          goal: HOP_CONTINUATION_DIRECTIVE,
+        },
+        doNotRediscover: true,
+      }, MAX_CHECKPOINT_BRIEF_BYTES)
+    }
+
+    const baseTitle = step.title
+      .replace(/\s*\[continuation\s*#\d+\]\s*$/i, '')
+      .trim()
+      .slice(0, 140) || 'Multi-hop chain'
+    const continuationTitle = `${baseTitle} [continuation #${nextDepth}]`
+    const detailParts = [
+      HOP_CONTINUATION_DIRECTIVE,
+      partialClean ? `Partial progress: ${partialClean}.` : '',
+      allSealedHandles.length ? `Sealed handles: ${allSealedHandles.join(', ')}.` : '',
+      observedEndpoints.length ? `Observed endpoints: ${observedEndpoints.join('; ')}.` : '',
+      observedFactNotes.length ? `Facts: ${observedFactNotes.join(' | ')}.` : '',
+    ].filter(Boolean)
+    const hypothesis = `${continuationTitle} — ${detailParts.join(' ')}`.slice(0, 1200)
+
+    const parentSkills = step.skills.filter(s =>
+      !s.startsWith(CHAIN_CONTINUATION_SKILL_PREFIX) && !s.startsWith(CHECKPOINT_CAP_SKILL_PREFIX),
+    )
+    const skills = [...new Set([
+      ...parentSkills,
+      'multihop-chains',
+      'chain-primitives',
+      `${CHAIN_CONTINUATION_SKILL_PREFIX}${nextDepth}`,
+    ])]
+
+    const parentFactIds = [...new Set([
+      ...step.dependsOnFactIds,
+      ...input.recordedFacts.map(f => f.id),
+    ])].slice(0, 12)
+    const liveFactIds = new Set(
+      this.storage.listFacts(run.id, { includeTainted: false, limit: 500 }).map(f => f.id),
+    )
+
+    const beforeIds = new Set(existingSteps.map(s => s.id))
+    const stepBudgetUsd = Math.max(0.05, Number(Math.max(0, run.budgetUsd - run.spentUsd).toFixed(4)))
+    const plan: DispatchPlan = {
+      dispatched: false,
+      totalBudgetUsd: stepBudgetUsd,
+      budgetUsd: stepBudgetUsd,
+      parentEvidenceIds: parentFactIds,
+      plan: [{
+        id: `cont_${step.id.slice(0, 12)}_d${nextDepth}`,
+        hypothesis,
+        origins,
+        capabilities: ['http'],
+        parentEvidenceIds: parentFactIds,
+        skills,
+        priority: Math.min(100, Math.max(step.priority, 98)),
+        budgetUsd: stepBudgetUsd,
+        ...(primaryCapId ? { checkpointCapId: primaryCapId } : {}),
+        checkpointBrief: finalizedBrief.brief,
+        checkpointJson: finalizedBrief.checkpointJson,
+      }],
+      rejected: [],
+    }
+    const counts = this.persistDispatchPlan(run, plan, liveFactIds, new Set(), {
+      dependsOnStepIds: [step.id],
+      preservePriority: true,
+    })
+    if (counts.enqueued === 0) {
+      return { enqueued: false, reason: 'dispatch_filtered', continuationDepth: nextDepth }
+    }
+    const afterSteps = this.storage.listChainSteps(run.id, run.goalRevision)
+    const created = afterSteps.find(s => !beforeIds.has(s.id))
+    if (!created) {
+      return { enqueued: false, reason: 'dispatch_filtered', continuationDepth: nextDepth }
+    }
+
+    try {
+      this.storage.event(
+        run.id,
+        'worker.hop_continuation_enqueued',
+        `Enqueued hop-continuation #${nextDepth} for rotated chain step "${step.title}" (${allSealedHandles.length} sealed handle(s), ${input.recordedFacts.length} fact(s), ${input.recordedExchanges.length} exchange(s)).`,
+        {
+          parentAssignmentId: assignment.id,
+          parentStepId: step.id,
+          continuationStepId: created.id,
+          continuationDepth: nextDepth,
+          maxContinuations,
+          ...(primaryCapId ? { checkpointCapId: primaryCapId } : {}),
+          checkpointBytes: finalizedBrief.checkpointBytes,
+          sealedHandleCount: allSealedHandles.length,
+          recordedFactCount: input.recordedFacts.length,
+          recordedExchangeCount: input.recordedExchanges.length,
+        },
+      )
+    } catch { /* telemetry is best-effort */ }
+
+    return {
+      enqueued: true,
+      continuationStep: created,
+      continuationDepth: nextDepth,
+      ...(primaryCapId ? { checkpointCapId: primaryCapId } : {}),
+      checkpointBytes: finalizedBrief.checkpointBytes,
+    }
   }
 
 
