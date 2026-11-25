@@ -364,8 +364,60 @@
   }
   const wpPos = w => w.xy ? w.xy : toStage(w.sel, w.ax ?? .5, w.ay ?? .5)
 
+  // ------------------------------------------------------------ focus camera (narrow embeds only)
+  // When the embed is so narrow that the whole 1440×810 stage would drop below
+  // 0.5×, the frame becomes a 4:5 crop that pans and zooms to where the action
+  // is. Like everything else it is a pure function of the playhead t: each row
+  // is [t, x, y, w, h], a stage-space rect to fit; rows with the same rect are
+  // holds, and the camera eases between consecutive rows. The fitted scale is
+  // floored so the crop never shows past the stage edge (≥ 0.55× on phones).
+  const FOCUS_AR = 1.25, FOCUS_MAX_H = 640, FOCUS_MAX_S = 1.25
+  const R_PROOF = [600, 140, 430, 520] // replay diff: variant column + CONFIRMED stamp
+  const R_INSP = [820, 60, 620, 720] // finding inspector: Verify fix, toast, retest row
+  const R_FULLH = [396, 0, 648, 810] // full-height centre column (rewind, end card)
+  const FOCUS = [
+    [0, 250, 130, 650, 480], [.45, 250, 130, 650, 480], // cold open: the whole replay sheet…
+    [1.25, ...R_PROOF], [5.05, ...R_PROOF], // …pushes in as the stamp lands
+    [5.6, ...R_FULLH], // rewind
+    [5.8, 440, 100, 560, 400], [6.95, 440, 100, 560, 400], // new-project modal
+    [7.45, 290, 120, 640, 500], [9.2, 290, 120, 640, 500], // scope consent: nothing sent yet, the host list…
+    [9.75, 356, 120, 620, 500], [12.0, 356, 120, 620, 500], // …3P host stays unchecked, Approve
+    [12.7, 236, 100, 610, 380], [14.35, 236, 100, 610, 380], // surface matrix
+    [15.0, 830, 90, 610, 640], [15.85, 830, 90, 610, 640], // board: an agent reaches for the 3P host
+    [16.3, 400, 160, 470, 380], [21.2, 400, 160, 470, 380], // broker BLOCKED receipt
+    [21.65, 0, 100, 620, 400], [23.45, 0, 100, 620, 400], // rail → findings row
+    [24.0, ...R_INSP], [24.6, ...R_INSP], // inspector: technical details
+    [25.15, ...R_PROOF], [30.2, ...R_PROOF], // replay diff + stamp
+    [30.7, 400, 140, 640, 440], [35.85, 400, 140, 640, 440], // terminal (re-laid out narrow, embed.css)
+    [36.3, ...R_INSP], [44.3, ...R_INSP], // Verify fix → toast → retest row
+    [44.8, ...R_FULLH], // end card (portrait layout, embed.css)
+  ]
+  let focus = false, fw = 0, fh = 0
+  const focusRect = t => {
+    const i = FOCUS.findIndex(k => k[0] > t)
+    if (i === -1) return FOCUS[FOCUS.length - 1].slice(1)
+    if (i === 0) return FOCUS[0].slice(1)
+    const a = FOCUS[i - 1], b = FOCUS[i], p = eio(seg(t, a[0], b[0]))
+    return [1, 2, 3, 4].map(k => lerp(a[k], b[k], p))
+  }
+  function camera(t) {
+    const [x, y, w, h] = focusRect(t)
+    const s = Math.max(Math.min(fw / w, fh / h, FOCUS_MAX_S), fw / W, fh / H)
+    const vw = fw / s, vh = fh / s
+    const x0 = clamp(x + w / 2 - vw / 2, 0, W - vw), y0 = clamp(y + h / 2 - vh / 2, 0, H - vh)
+    scale = s
+    el.stage.style.transform = `translate(${(-x0 * s).toFixed(2)}px, ${(-y0 * s).toFixed(2)}px) scale(${s.toFixed(4)})`
+  }
+
   function layout() {
     const w = el.frame.clientWidth
+    focus = EMBED && !REC && w > 0 && w <= W * .5
+    document.body.classList.toggle('focus', focus)
+    if (focus) {
+      fw = w; fh = Math.min(Math.round(w * FOCUS_AR), FOCUS_MAX_H)
+      el.frame.style.height = fh + 'px'
+      return // render(t) places the camera
+    }
     scale = w / W
     el.frame.style.height = Math.round(H * scale) + 'px'
     el.stage.style.transform = `scale(${scale})`
@@ -373,6 +425,7 @@
 
   // ------------------------------------------------------------ render(t)
   function render(t) {
+    if (focus) camera(t)
     const ut = uiTime(t)
     const story = t >= RW_B && t < END_A
 

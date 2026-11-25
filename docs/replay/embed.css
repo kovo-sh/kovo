@@ -133,3 +133,35 @@ body.embed.dark .colb .diff { background: rgba(242, 85, 90, .12); }
 body.embed.dark .tst .ub { background: rgba(0, 0, 0, .08); }
 body.embed.dark .tst .bar { background: rgba(0, 0, 0, .3); }
 body.embed.dark #ov-term { box-shadow: 0 0 0 1px rgba(255, 255, 255, .12), 0 50px 100px -30px rgba(0, 0, 0, .9); }
+
+/* ------------------------------------------------- focus camera (narrow embeds)
+   hero.js adds body.focus when the embed is ≤ 720 px wide: the frame becomes a
+   4:5 crop that pans across the stage. A few overlays are re-laid out so they
+   sit inside one ~640 px-wide crop instead of spanning the 1440 px stage. */
+body.embed.focus #toast { left: auto; right: 16px; transform: translateY(8px); }
+body.embed.focus #toast.on { transform: none; }
+body.embed.focus #ov-skip { left: 1116px; top: 250px; flex-wrap: wrap; justify-content: center; row-gap: 4px; width: 580px; border-radius: 22px; text-align: center; }
+body.embed.focus #ov-skip small { flex-basis: 100%; font-size: 17px; line-height: 22px; }
+body.embed.focus #ov-llm small { max-width: 175px; text-align: right; }
+body.embed.focus #ov-term { left: 410px; width: 620px; }
+body.embed.focus .tln { white-space: pre-wrap; overflow-wrap: anywhere; }
+body.embed.focus #ov-end > .in { width: 580px; }
+body.embed.focus #ov-end .lock { font-size: 26px; }
+body.embed.focus #ov-end h2 { margin: 34px 0 22px; font-size: 76px; line-height: 1.02; text-wrap: balance; }
+body.embed.focus #ov-end p { max-width: 560px; font-size: 22px; line-height: 32px; }
+body.embed.focus #ov-end .cmd { display: block; min-width: 0; width: 100%; min-height: 80px; font-size: 18px; line-height: 26px; overflow-wrap: anywhere; }
+body.embed.focus #ov-end .cmd .pr2 { margin-right: 10px; }
+body.embed.focus #ov-end .cmd .cp { display: none; }
+body.embed.focus #ov-end .pills { flex-direction: column; align-items: center; gap: 10px; }
+body.embed.focus #ov-end .pills span { font-size: 16px; padding: 8px 14px; }
+
+/* captions stay under the crop, large; controls sized for touch */
+body.embed.focus .capwrap { min-height: 88px; }
+body.embed.focus .cap, body.embed.focus .cap.top { font-size: 26px; line-height: 31px; }
+body.embed.focus .ctrl { height: 48px; padding: 0 14px 0 4px; }
+body.embed.focus .ctrl button { height: 44px; min-width: 44px; }
+body.embed.focus .ctrl svg { width: 16px; height: 16px; }
+body.embed.focus .scrub { height: 44px; }
+body.embed.focus .scrub input { height: 4px; }
+body.embed.focus .scrub input::-webkit-slider-thumb { width: 20px; height: 20px; }
+body.embed.focus .scrub input::-moz-range-thumb { width: 16px; height: 16px; }
