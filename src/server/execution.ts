@@ -38,6 +38,7 @@ import {
   selectPreInjectionSkills,
   runAgentSession,
   summarizeGuardianVerifyOutcome,
+  wallClockSettlementMs,
   WarmSpecialistController,
   workerInvestigationPrompt,
   type GapValidationEvent,
@@ -160,7 +161,9 @@ import {
   DET_LEAD_CONCURRENT_CAP,
   ReinvestigationGuard,
   isDetLeadDispatchStep,
+  isMultiHopChainStep,
   planRoundRobinDispatch,
+  resolveEffectivePhaseBConcurrency,
   extractAssignedTargetRoutes,
   selectAssignmentBolaQueueItems,
   countConsecutiveDrySteps,
@@ -276,6 +279,8 @@ export interface ExecutionOptions {
    */
   floorRequestBudget?: number
   agentRequestBudget?: number
+  /** Optional per-assignment wall-clock cap override (primarily for deterministic rotation tests). */
+  assignmentWallClockOverrideMs?: number
 }
 
 export type ExecutionCheckpoint = 'phase0' | 'deterministic-lane' | 'post-floor' | 'planner-round'
@@ -386,6 +391,8 @@ export class Execution {
   private readonly providerStallRetriesByRun = new Map<string, number>()
   private readonly providerStallTimeoutsByRun = new Map<string, number>()
   private readonly providerStallWallSavedByRun = new Map<string, number>()
+  private readonly wallClockRotationsByRun = new Map<string, number>()
+  private readonly wallClockRotatedAssignments = new Set<string>()
   private readonly warmSecretEpochByRun = new Map<string, string>()
   private readonly warmPoolPolicyRotationsByRun = new Map<string, number>()
   private readonly lastAssignmentMetrics = new Map<string, AssignmentThroughputMetrics>()
@@ -406,6 +413,7 @@ export class Execution {
   /** Opt-in per-run agentic trace (only populated when GUARDIAN_TRACE_DIR / GUARDIAN_TRACE is set). */
   private readonly runTraces = new Map<string, AgentTrace>()
   private readonly onCheckpoint?: (event: { runId: string; checkpoint: ExecutionCheckpoint }) => void
+  private readonly assignmentWallClockOverrideMs?: number
   /** v5 M5: chain-scoped warm specialist lifecycle (pure in-memory; mirrored to board_members). */
   private readonly warm = new WarmSpecialistController()
   /** v6 staging counters (per run): tagged mutations, locally skipped untaggable probes, cleanup. */
@@ -441,6 +449,8 @@ export class Execution {
         ? envMaxDuration
         : 600_000
     this.onCheckpoint = options.onCheckpoint
+    const wallOverride = Number(options.assignmentWallClockOverrideMs)
+    this.assignmentWallClockOverrideMs = Number.isFinite(wallOverride) && wallOverride > 0 ? Math.max(1, Math.floor(wallOverride)) : undefined
     this.phaseRequestBudgets = resolvePhaseRequestBudgets({
       ...(options.floorRequestBudget !== undefined ? { floorRequestBudget: options.floorRequestBudget } : {}),
       ...(options.agentRequestBudget !== undefined ? { agentRequestBudget: options.agentRequestBudget } : {}),
@@ -2860,6 +2870,7 @@ export class Execution {
         ? Math.round((containers.reused / containers.sessions) * 1000) / 1000
         : 0,
       warmPoolPolicyRotations: this.warmPoolPolicyRotationsByRun.get(runId) ?? 0,
+      wallClockRotations: this.wallClockRotationsByRun.get(runId) ?? 0,
       ...(this.proofObligationByRun.has(runId) ? { proofObligation: { ...this.proofObligationByRun.get(runId)! } } : {}),
       ...(this.gapValidationByRun.has(runId)
         ? {
@@ -3175,7 +3186,17 @@ export class Execution {
         return true
       })
 
-    const maxConc = Math.max(1, Math.min(maxWorkerConcurrency, run.workerConcurrency || defaultWorkerConcurrency))
+    const configuredConc = Math.max(1, Math.min(maxWorkerConcurrency, run.workerConcurrency || defaultWorkerConcurrency))
+    const readyPrimarySteps = readySteps.filter(step => !(typeof step.trialIndex === 'number' && step.trialIndex > 0)).length
+    const readyChainSteps = readySteps.filter(step => isMultiHopChainStep(step)).length
+    const maxConc = resolveEffectivePhaseBConcurrency({
+      configuredConcurrency: configuredConc,
+      readyPrimarySteps,
+      readyChainSteps,
+      budgetUsdRemaining: Math.max(0, run.budgetUsd - run.spentUsd),
+      budgetRequestsRemaining: Math.max(0, run.budgetRequests - run.spentRequests),
+      maxRpsPerOrigin: run.maxRpsPerOrigin,
+    })
     // One warm session container per worker slot: assignments reuse stopped containers instead of
     // paying a cold `container create` each dispatch.
     try { this.backend.setWarmCapacity?.(maxConc) } catch { /* pooling is best-effort */ }
@@ -3192,6 +3213,7 @@ export class Execution {
       return
     }
     const leadStepIds = new Set(steps.filter(step => isDetLeadDispatchStep(step)).map(step => step.id))
+    const chainStepIds = new Set(steps.filter(step => isMultiHopChainStep(step)).map(step => step.id))
     // Tier-A leads are exempt from the generic concurrent-lead cap; only generic leads count.
     const activeLeadCount = [...this.active.values()].filter(job =>
       job.assignment.runId === run.id &&
@@ -3199,6 +3221,11 @@ export class Execution {
       typeof job.assignment.stepId === 'string' &&
       leadStepIds.has(job.assignment.stepId) &&
       !this.tierAStepIds.has(job.assignment.stepId)).length
+    const activeChainCount = [...this.active.values()].filter(job =>
+      job.assignment.runId === run.id &&
+      job.assignment.phase === 'investigation' &&
+      typeof job.assignment.stepId === 'string' &&
+      chainStepIds.has(job.assignment.stepId)).length
 
     const slots = Math.max(0, maxConc - activeForRun)
     const hostTiers = computeHostTiers(
@@ -3208,6 +3235,7 @@ export class Execution {
     const dispatchPlan = planRoundRobinDispatch(readySteps, slots, {
       leadCap: DET_LEAD_CONCURRENT_CAP,
       activeLeadCount,
+      activeChainCount,
       hostTiers,
       tierALeadIds: this.tierAStepIds,
     })
@@ -3227,6 +3255,11 @@ export class Execution {
             .join(', ') || 'none'}.`,
           {
             slots,
+            effectiveConcurrency: maxConc,
+            configuredConcurrency: configuredConc,
+            readySteps: readySteps.length,
+            readyChainSteps,
+            activeChainCount,
             dispatched,
             selectedByLane: dispatchPlan.selectedByLane,
             activeLeadCount,
@@ -3466,7 +3499,7 @@ export class Execution {
     const stepMaxTurns = computeStepMaxTurns(targetOrigins, hostTiers, baseSpecialistTurns)
     // Throughput: a standalone step gets a short cap so the slot turns over; only a step that
     // cites upstream evidence keeps the long chain budget.
-    const budget = planAssignmentBudget({
+    const rawBudget = planAssignmentBudget({
       routes: this.reconPlanner.stepMentionedRoutes(step),
       parentEvidenceIds: step.dependsOnFactIds,
       dependsOnStepIds: step.dependsOnStepIds,
@@ -3480,6 +3513,9 @@ export class Execution {
       baseWallClockMs: this.specialistWallClockMs(stepMaxTurns),
       singleStepWallClockMs: singleStepWallClockMs(),
     })
+    const budget: AssignmentBudget = this.assignmentWallClockOverrideMs !== undefined
+      ? { ...rawBudget, wallClockMs: this.assignmentWallClockOverrideMs }
+      : rawBudget
 
     const assignment = this.storage.transaction(() => {
       const worker = this.storage.makeWorker(run, 'investigation', primaryAsset, step.title, step.hypothesis, {
@@ -3577,6 +3613,24 @@ export class Execution {
         })
         return
       }
+      if (this.wallClockRotatedAssignments.delete(assignment.id)) {
+        this.wallClockRotationsByRun.set(run.id, (this.wallClockRotationsByRun.get(run.id) ?? 0) + 1)
+        const outcome = `[partial] Bounded wall-clock rotation after ${budget.wallClockMs}ms (pre-session timeout); slot released.`
+        this.storage.transaction(() => {
+          this.storage.updateWorker(assignment.id, {
+            status: 'complete',
+            outcome,
+            lease: null,
+            leaseExpiresAt: null,
+          })
+          this.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: assignment.id })
+          this.storage.event(run.id, 'worker.wall_clock_rotated', `${step.title} rotated at wall-clock budget (${budget.wallClockMs}ms); slot released.`, {
+            assignmentId: assignment.id, stepId: step.id, specialistProfile: resolvedSpecialistId,
+            wallClockMs: budget.wallClockMs, boundedRotation: true, preSession: true,
+          })
+        })
+        return
+      }
       if (!this.authorize(job) || job.controller.signal.aborted) return
       const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 400)
       this.storage.transaction(() => {
@@ -3632,14 +3686,32 @@ export class Execution {
     this.warmSecretEpochByRun.set(run.id, secretEpoch)
     try { this.backend.setWarmPoolPolicy?.(`${run.id}:${secretEpoch}`) } catch { /* pooling is best-effort */ }
 
-    // Open ONE persistent air-gapped container for the entire intent
-    const { reposDir, mountedRepos } = this.projectReposMount(run.projectId)
-    const session = await this.backend.openSession(
-      job.assignment.id,
-      job.controller.signal,
-      reposDir ? { reposDir } : undefined,
-    )
+    // Open ONE persistent air-gapped container for the entire intent.
+    // Arm a pre-session wall-clock guard so a stalled openSession/staging call can never hold a
+    // slot past budget.wallClockMs; disarmed once runAgentSession takes over the exact timer.
     const startedAt = Date.now()
+    let preSessionTimer: NodeJS.Timeout | undefined = setTimeout(() => {
+      preSessionTimer = undefined
+      if (job.controller.signal.aborted) return
+      this.wallClockRotatedAssignments.add(job.assignment.id)
+      job.controller.abort(new Error(`Pre-session wall-clock deadline reached (${budget.wallClockMs}ms).`))
+    }, budget.wallClockMs)
+    preSessionTimer.unref?.()
+    const clearPreSessionTimer = () => {
+      if (preSessionTimer) { clearTimeout(preSessionTimer); preSessionTimer = undefined }
+    }
+    const { reposDir, mountedRepos } = this.projectReposMount(run.projectId)
+    let session
+    try {
+      session = await this.backend.openSession(
+        job.assignment.id,
+        job.controller.signal,
+        reposDir ? { reposDir } : undefined,
+      )
+    } catch (err) {
+      clearPreSessionTimer()
+      throw err
+    }
     // Per-turn generation latencies (provider stream) plus the no-token watchdog: 28 s of complete
     // provider silence aborts the turn, while every token re-arms the timer so slow streaming is
     // never killed. The old 45–90 s generation watchdog stays only as the wall-saved baseline.
@@ -5122,6 +5194,8 @@ export class Execution {
         defaultOrigin: targetOrigins[0],
       })
 
+      clearPreSessionTimer()
+      const remainingWallClockMs = Math.max(1, budget.wallClockMs - Math.max(0, Date.now() - startedAt))
       const sessionResult = await runAgentSession({
         directory: this.storage.directory,
         sessionId: job.assignment.sessionId,
@@ -5154,7 +5228,7 @@ export class Execution {
         }),
         signal: job.controller.signal,
         maxTurns: budget.maxTurns,
-        wallClockMs: budget.wallClockMs,
+        wallClockMs: remainingWallClockMs,
         ...(runTrace ? {
           trace: runTrace,
           traceContext: {
@@ -5166,7 +5240,7 @@ export class Execution {
         compaction: true,
         enableSettlement: true,
         requireCompleteIntent: true,
-        shouldSettle: () => (Date.now() - startedAt) >= intentLeaseMs * 0.85,
+        shouldSettle: () => (Date.now() - startedAt) >= wallClockSettlementMs(budget.wallClockMs),
         handlers: scopedHandlers,
         secrets,
         beforeCall: () => {
@@ -5244,14 +5318,35 @@ export class Execution {
       })
 
       const latestRun = this.check(job)
-      const outcomeText = sessionResult.completion
-        ? `[${sessionResult.completion.status}] ${sessionResult.completion.summary}`
-        : sessionResult.answer
+      const outcomeText = sessionResult.status === 'wall_clock_rotated'
+        ? `[partial] ${sessionResult.answer}`
+        : sessionResult.completion
+          ? `[${sessionResult.completion.status}] ${sessionResult.completion.summary}`
+          : sessionResult.answer
+      if (sessionResult.status === 'wall_clock_rotated') {
+        this.wallClockRotationsByRun.set(run.id, (this.wallClockRotationsByRun.get(run.id) ?? 0) + 1)
+        const elapsedMs = sessionResult.elapsedMs ?? Math.max(0, Date.now() - startedAt)
+        this.safeEvent(
+          run.id,
+          'worker.wall_clock_rotated',
+          `${step.title} rotated cleanly at wall-clock budget (${Math.round(elapsedMs / 1000)}s / ${Math.round(budget.wallClockMs / 1000)}s, ${sessionResult.turnsUsed} turn(s)); slot released.`,
+          {
+            assignmentId: job.assignment.id,
+            stepId: step.id,
+            specialistProfile: specialistProfileId,
+            elapsedMs,
+            wallClockMs: budget.wallClockMs,
+            turnsUsed: sessionResult.turnsUsed,
+            boundedRotation: true,
+          },
+        )
+      }
       this.storage.transaction(() => {
         this.completeWorker(job.assignment, latestRun, outcomeText, [], undefined, currentSecrets())
         this.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: job.assignment.id })
       }, { behavior: 'immediate' })
     } finally {
+      clearPreSessionTimer()
       stallWatchdog.clear()
       generationStartedAt = undefined
       const wallMs = Math.max(0, Date.now() - startedAt)

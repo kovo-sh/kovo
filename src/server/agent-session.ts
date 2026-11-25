@@ -108,6 +108,19 @@ export function resolveAgenticTurnBudget(missionKind?: MissionKind): number {
   }
 }
 
+/** Bounded grace window for an actively executing `guardian_verify` / proof call at `wallClockMs`. */
+export const WALL_CLOCK_PROOF_GRACE_MS = 5_000
+
+/**
+ * Elapsed-ms threshold at which the final wall-clock settlement nudge fires:
+ * `max(wallClockMs - 15s, wallClockMs * 0.8)` so every assignment gets a crisp wrap-up window
+ * before the hard `wallClockMs` rotation deadline aborts the session.
+ */
+export function wallClockSettlementMs(wallClockMs: number): number {
+  const wall = Math.max(1, Math.floor(wallClockMs))
+  return Math.max(1, Math.floor(Math.max(wall - 15_000, wall * 0.8)))
+}
+
 /** Hard settlement nudge at N-2 turns (independent of the 85% network-revocation threshold). */
 export function settlementNudgeTurnFor(maxTurns: number): number {
   return Math.max(1, Math.floor(maxTurns) - 2)
@@ -150,6 +163,26 @@ export function settlementNudgeMessage(input: {
   return [
     `[GUARDIAN SETTLEMENT NUDGE — Turn ${input.turn}/${input.maxTurns}]`,
     `Hard settlement starts at turn ${settlementNudgeTurnFor(input.maxTurns)} (N-2). ${proofPath}, or call complete_intent with status (proved | ruled_out | blocked | partial) and a concise summary. Do not start new exploration.`,
+    ...(input.specDirective ? [input.specDirective] : []),
+  ].join(' ')
+}
+
+/** Final wall-clock settlement nudge injected at `max(wallClockMs - 15s, wallClockMs * 0.8)`. */
+export function wallClockSettlementMessage(input: {
+  elapsedMs: number
+  wallClockMs: number
+  proofTools?: readonly string[]
+  specDirective?: string
+}): string {
+  const remainingSec = Math.max(0, Math.ceil((input.wallClockMs - input.elapsedMs) / 1000))
+  const typed = (input.proofTools ?? []).filter(name => name.trim())
+  const proofPath = typed.length
+    ? `submit your guardian_verify / composite.verify proof now (${typed.join(', ')})`
+    : 'submit your guardian_verify / composite.verify proof now'
+  return [
+    `[GUARDIAN WALL-CLOCK FINAL SETTLEMENT — ~${remainingSec}s remaining before slot rotation]`,
+    `Your assignment wall-clock budget (${Math.round(input.wallClockMs / 1000)}s) is almost exhausted; this worker will hard-rotate at the deadline.`,
+    `Do NOT start new exploration. Immediately ${proofPath}, or call record_coverage (with enforcingControl or coded proofGapReason) and complete_intent now.`,
     ...(input.specDirective ? [input.specDirective] : []),
   ].join(' ')
 }
@@ -5456,8 +5489,12 @@ export interface RunAgentSessionOptions {
   enableSettlement?: boolean
   /** Optional external settlement trigger (e.g., 85% wall-clock or request budget reached). */
   shouldSettle?: () => boolean
-  /** Optional wall-clock budget for the session; settlement starts at 85% of it. */
+  /** Optional wall-clock budget for the session; settles at `max(wallClockMs - 15s, 80%)` and hard-rotates at `wallClockMs`. */
   wallClockMs?: number
+  /** Optional grace window when a proof call (`guardian_verify`) is actively running at `wallClockMs` (default 5s). */
+  wallClockGraceMs?: number
+  /** Called once when the hard per-assignment `wallClockMs` deadline triggers a bounded rotation. */
+  onWallClockRotate?: (info: { elapsedMs: number; wallClockMs: number; turnsUsed: number; graceUsedMs: number }) => void
   /** Require complete_intent before finishing (with up to 2 empty-turn nudges; default: true when complete_intent handler is present). */
   requireCompleteIntent?: boolean
   handlers?: WorkerToolHandlers
@@ -5519,7 +5556,11 @@ export interface AgentSessionResult {
   settled: boolean
   nudgesUsed: number
   completion?: IntentCompletion
-  status: 'completed' | 'turn_limit' | 'nudged_out'
+  status: 'completed' | 'turn_limit' | 'nudged_out' | 'wall_clock_rotated'
+  /** True when the session terminated cleanly via its hard `wallClockMs` per-assignment rotation timer. */
+  wallClockRotated?: boolean
+  /** Elapsed wall-clock duration when rotated cleanly. */
+  elapsedMs?: number
   /** complete_intent rejections for a leaning conclusion without spec or coded proof gap. */
   specSubmissionRequired?: number
   /** Final spec-submission ledger (route evidence / spec attempts / coded gaps). */
@@ -5579,8 +5620,40 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   ]
   const scrub = (value: string) => redact(value, allSecrets)
 
+  const sessionStartedAt = Date.now()
+  const sessionController = new AbortController()
+  const onParentAbort = () => sessionController.abort(options.signal.reason)
+  options.signal.addEventListener('abort', onParentAbort, { once: true })
+  if (options.signal.aborted) sessionController.abort(options.signal.reason)
+
+  const effectiveWallClockMs = options.wallClockMs && Number.isFinite(options.wallClockMs) && options.wallClockMs > 0
+    ? Math.max(1, Math.floor(options.wallClockMs))
+    : undefined
+  const wallClockSettlementAt = effectiveWallClockMs !== undefined
+    ? sessionStartedAt + wallClockSettlementMs(effectiveWallClockMs)
+    : undefined
+  const proofGraceMs = effectiveWallClockMs === undefined
+    ? 0
+    : options.wallClockGraceMs !== undefined
+      ? Math.max(0, Math.floor(options.wallClockGraceMs))
+      : effectiveWallClockMs >= 20_000
+        ? WALL_CLOCK_PROOF_GRACE_MS
+        : Math.min(WALL_CLOCK_PROOF_GRACE_MS, Math.max(25, Math.floor(effectiveWallClockMs * 0.25)))
+
+  let wallClockRotated = false
+  let wallClockExpired = false
+  let wallClockNudgeSent = false
+  let wallClockGraceStartedAt: number | undefined
+  let wallClockTimer: NodeJS.Timeout | undefined
+  let wallClockGraceTimer: NodeJS.Timeout | undefined
+  const activeProofCallIds = new Set<string>()
+  const clearWallClockTimers = () => {
+    if (wallClockTimer) { clearTimeout(wallClockTimer); wallClockTimer = undefined }
+    if (wallClockGraceTimer) { clearTimeout(wallClockGraceTimer); wallClockGraceTimer = undefined }
+  }
+
   const providerOpts: ProviderOptions = {
-    signal: options.signal,
+    signal: sessionController.signal,
     record: options.record,
     secrets: options.secrets,
     maxCalls: Math.max(defaultMaxCalls, maxTurns + 40),
@@ -5602,14 +5675,43 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const requireCompleteIntent = options.requireCompleteIntent ?? Boolean(handlers.complete_intent)
   const settlementTurn = Math.max(1, Math.floor(maxTurns * 0.85))
   const settlementNudgeTurn = settlementNudgeTurnFor(maxTurns)
-  const wallClockDeadline = options.wallClockMs && options.wallClockMs > 0
-    ? Date.now() + Math.floor(options.wallClockMs)
-    : undefined
+  const wallClockDeadline = wallClockSettlementAt
 
   let turnsUsed = 0
   let nudgesUsed = 0
   let settled = false
   let completion: IntentCompletion | undefined
+
+  const triggerWallClockRotation = () => {
+    if (wallClockRotated || options.signal.aborted || effectiveWallClockMs === undefined) return
+    wallClockRotated = true
+    clearWallClockTimers()
+    const elapsedMs = Math.max(0, Date.now() - sessionStartedAt)
+    const graceUsedMs = wallClockGraceStartedAt !== undefined ? Math.max(0, Date.now() - wallClockGraceStartedAt) : 0
+    try {
+      options.onWallClockRotate?.({ elapsedMs, wallClockMs: effectiveWallClockMs, turnsUsed, graceUsedMs })
+    } catch { /* telemetry only */ }
+    sessionController.abort(new Error(`Assignment wall-clock deadline reached (${elapsedMs}ms / ${effectiveWallClockMs}ms).`))
+  }
+
+  if (effectiveWallClockMs !== undefined) {
+    wallClockTimer = setTimeout(() => {
+      wallClockTimer = undefined
+      wallClockExpired = true
+      if (options.signal.aborted || wallClockRotated) return
+      if (activeProofCallIds.size > 0 && proofGraceMs > 0) {
+        wallClockGraceStartedAt = Date.now()
+        wallClockGraceTimer = setTimeout(() => {
+          wallClockGraceTimer = undefined
+          triggerWallClockRotation()
+        }, proofGraceMs)
+        wallClockGraceTimer.unref?.()
+        return
+      }
+      triggerWallClockRotation()
+    }, effectiveWallClockMs)
+    wallClockTimer.unref?.()
+  }
   /** Shared with the tool layer: route evidence, spec attempts and coded proof gaps. */
   const specTracker = new SpecSubmissionTracker()
   specTracker.noteAssignedRoutes(options.assignedTargetRoutes)
@@ -5713,7 +5815,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const builtTools = buildWorkerTools(
     handlers,
     scrub,
-    options.signal,
+    sessionController.signal,
     inlineLimit,
     result => { completion = result },
     {
@@ -5745,12 +5847,26 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           role: 'user' as const, content, timestamp: Date.now(),
         }))
         const settlingNow = isSettling()
+        const wallClockSettlingNow = effectiveWallClockMs !== undefined && wallClockSettlementAt !== undefined
+          && Date.now() >= wallClockSettlementAt && !wallClockNudgeSent
         const willNudge = Boolean(handlers.complete_intent) && turnsUsed + 1 === settlementNudgeTurn
-        const specDirective = specDirectiveForRun(Boolean(earlyExit) || settlingNow || willNudge)
+        const specDirective = specDirectiveForRun(Boolean(earlyExit) || settlingNow || wallClockSettlingNow || willNudge)
         if (earlyExit) {
           extraMessages.push({
             role: 'user' as const,
             content: earlyExitDirectiveMessage({ ...earlyExit, proofTools: registeredProofTools, ...(specDirective ? { specDirective } : {}) }),
+            timestamp: Date.now(),
+          })
+        } else if (wallClockSettlingNow) {
+          wallClockNudgeSent = true
+          extraMessages.push({
+            role: 'user' as const,
+            content: wallClockSettlementMessage({
+              elapsedMs: Math.max(0, Date.now() - sessionStartedAt),
+              wallClockMs: effectiveWallClockMs,
+              proofTools: registeredProofTools,
+              ...(specDirective ? { specDirective } : {}),
+            }),
             timestamp: Date.now(),
           })
         } else if (settlingNow) {
@@ -5855,9 +5971,11 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           finalTurn: finalTurnForRun(),
           ...(specPending ? { specPending, specDirective: settlementSpecDirective(snapshot.obligationTarget ?? snapshot.route) } : {}),
         })
+        if (!block && SPEC_SUBMISSION_TOOLS.has(call.name)) activeProofCallIds.add(call.id)
         return block ? { block } : undefined
       },
       afterTool(call, result) {
+        const wasProofCall = activeProofCallIds.delete(call.id)
         if (trace && !call.parent) {
           const startedAt = toolStartedAt.get(call.id)
           toolStartedAt.delete(call.id)
@@ -5882,6 +6000,9 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
             // Tracing must never break an investigation run.
           }
         }
+        if (wasProofCall && wallClockExpired && activeProofCallIds.size === 0 && !wallClockRotated) {
+          queueMicrotask(() => triggerWallClockRotation())
+        }
         return undefined
       },
     }),
@@ -5904,7 +6025,48 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const keepRecentTokens = Math.min(20_000, Math.max(8_000, Math.floor(contextWindow * 0.18)))
   const backgroundTokens = contextWindow >= 64_000 ? Math.floor(contextWindow * 0.05) : 0
 
-  const context = withAbortSignal(options.signal, BACKGROUND_CONTEXT)
+  const context = withAbortSignal(sessionController.signal, BACKGROUND_CONTEXT)
+  const makeWallClockRotatedResult = (): AgentSessionResult => {
+    const elapsedMs = Math.max(0, Date.now() - sessionStartedAt)
+    return finish({
+      answer: completion
+        ? completion.summary
+        : `Bounded wall-clock rotation after ${elapsedMs}ms (${turnsUsed}/${maxTurns} turns); slot released.`,
+      turnsUsed,
+      settled: true,
+      nudgesUsed,
+      ...(completion ? { completion } : {}),
+      status: 'wall_clock_rotated',
+      wallClockRotated: true,
+      elapsedMs,
+      specSubmissionRequired: specTracker.snapshot().required,
+      specSubmission: specTracker.snapshot(),
+      ...earlyExitFields(),
+    })
+  }
+  const waitWithWallClockAbort = async <T>(promise: Promise<T>): Promise<{ rotated: true } | { rotated: false; value: T }> => {
+    if (wallClockRotated && !options.signal.aborted) {
+      void promise.catch(() => undefined)
+      return { rotated: true }
+    }
+    let onAbort: (() => void) | undefined
+    const abortRace = new Promise<{ rotated: true }>(resolve => {
+      onAbort = () => {
+        if (wallClockRotated && !options.signal.aborted) resolve({ rotated: true })
+      }
+      sessionController.signal.addEventListener('abort', onAbort, { once: true })
+    })
+    const wrapped = promise.then(value => ({ rotated: false as const, value }))
+    try {
+      return await Promise.race([wrapped, abortRace])
+    } catch (err) {
+      if (wallClockRotated && !options.signal.aborted) return { rotated: true }
+      throw err
+    } finally {
+      if (onAbort) sessionController.signal.removeEventListener('abort', onAbort)
+      if (wallClockRotated) void wrapped.catch(() => undefined)
+    }
+  }
   const harness = await Harness.open(await openNodeSqliteStorage(sessionPath), {
     models,
     registry,
@@ -5959,9 +6121,12 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
 
     const input = { type: 'input' as const, content: scrub(options.prompt) }
     const submission = await conversation.submit({ ...input, requestId: options.requestId }, context)
-    let result = await submission.wait(context)
+    const initialWait = await waitWithWallClockAbort(submission.wait(context))
+    if (initialWait.rotated) return makeWallClockRotatedResult()
+    let result = initialWait.value
 
     while (result.status === 'unanswered' && (result.reason === 'interrupted' || result.reason === 'aborted')) {
+      if (wallClockRotated && !options.signal.aborted) return makeWallClockRotatedResult()
       options.signal.throwIfAborted()
       const requestId = options.requestId + ':resume:' + result.id
       const continuation = result.reason === 'interrupted' || result.type === 'continue'
@@ -5969,8 +6134,12 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         continuation ? { type: 'continue', requestId } : { ...input, requestId },
         context,
       )
-      result = await retry.wait(context)
+      const retryWait = await waitWithWallClockAbort(retry.wait(context))
+      if (retryWait.rotated) return makeWallClockRotatedResult()
+      result = retryWait.value
     }
+
+    if (wallClockRotated && !options.signal.aborted) return makeWallClockRotatedResult()
 
     if (completion) {
       return finish({
@@ -6081,9 +6250,27 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       status: requireCompleteIntent && !completion ? 'nudged_out' : 'completed',
       ...earlyExitFields(),
     })
+  } catch (err) {
+    if (wallClockRotated && !options.signal.aborted) return makeWallClockRotatedResult()
+    throw err
   } finally {
+    clearWallClockTimers()
+    options.signal.removeEventListener('abort', onParentAbort)
     await activityWatch?.stop().catch(() => undefined)
-    await harness.close(BACKGROUND_CONTEXT)
+    const closePromise = harness.close(BACKGROUND_CONTEXT).catch(() => undefined)
+    if (wallClockRotated) {
+      let closeTimer: NodeJS.Timeout | undefined
+      await Promise.race([
+        closePromise,
+        new Promise<void>(resolve => {
+          closeTimer = setTimeout(resolve, 150)
+          closeTimer.unref?.()
+        }),
+      ])
+      if (closeTimer) clearTimeout(closeTimer)
+    } else {
+      await closePromise
+    }
   }
 }
 
