@@ -9,8 +9,25 @@ import {
   syncGithubRepositories,
 } from '../../actions.ts'
 import { maxSpecBytes } from '../../domain.ts'
+import { cn } from '../../lib/cn.ts'
 import { formatHumanTime, FormError, useAction } from '../common.tsx'
 import { useGithubDeviceFlow } from '../github/useGithubDeviceFlow.ts'
+import { Icon } from '../run/icons.tsx'
+import { Badge } from '../ui/badge.tsx'
+import { Button, buttonVariants } from '../ui/button.tsx'
+import { Card, CardBody, CardFooter, CardHeader } from '../ui/card.tsx'
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '../ui/dialog.tsx'
+import { Disclosure, DisclosureContent, DisclosureTrigger } from '../ui/disclosure.tsx'
+import { EmptyState } from '../ui/empty-state.tsx'
+import { Input, NativeSelect, Textarea } from '../ui/input.tsx'
 import { GithubInstallBanner } from './GithubInstallBanner.tsx'
 import { GroupedRepoPicker } from './GroupedRepoPicker.tsx'
 import type { DiscoveredGithubRepo, ProjectLoaderData } from './types.ts'
@@ -28,31 +45,21 @@ function SourcesEmptyIllustration() {
       viewBox="0 0 180 88"
       fill="none"
       aria-hidden="true"
-      style={{ display: 'block', color: 'var(--pw-fg)' }}
+      className="block text-fg"
     >
-      <rect x="6" y="8" width="168" height="72" rx="10" fill="var(--pw-sunk)" stroke="var(--pw-line-2)" strokeWidth="1.2" />
-      <rect x="22" y="22" width="46" height="44" rx="6" fill="var(--pw-panel)" stroke="var(--pw-line-strong)" strokeWidth="1.2" />
-      <circle cx="34" cy="34" r="3" fill="var(--pw-accent)" />
-      <circle cx="34" cy="54" r="3" fill="var(--pw-panel)" stroke="var(--pw-accent)" strokeWidth="1.4" />
-      <circle cx="52" cy="44" r="3" fill="var(--pw-panel)" stroke="currentColor" strokeWidth="1.4" />
-      <path d="M34 37v14M37 35.5c5 0 6 8.5 12 8.5" stroke="var(--pw-accent)" strokeWidth="1.4" strokeLinecap="round" />
-      <path d="M74 44h30" stroke="var(--pw-line-strong)" strokeWidth="1.4" strokeLinecap="round" strokeDasharray="3 3" />
-      <path d="M99 39.5 104.5 44 99 48.5" stroke="var(--pw-accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-      <rect x="112" y="22" width="46" height="44" rx="6" fill="var(--pw-panel)" stroke="var(--pw-accent)" strokeWidth="1.4" />
-      <path d="M122 34h26M122 43h18M122 52h22" stroke="var(--pw-fg-3)" strokeWidth="1.5" strokeLinecap="round" />
-      <circle cx="147" cy="43" r="2.2" fill="var(--pw-accent)" />
+      <rect x="6" y="8" width="168" height="72" rx="10" fill="var(--sunk)" stroke="var(--line-2)" strokeWidth="1.2" />
+      <rect x="22" y="22" width="46" height="44" rx="6" fill="var(--panel)" stroke="var(--line-strong)" strokeWidth="1.2" />
+      <circle cx="34" cy="34" r="3" fill="var(--accent)" />
+      <circle cx="34" cy="54" r="3" fill="var(--panel)" stroke="var(--accent)" strokeWidth="1.4" />
+      <circle cx="52" cy="44" r="3" fill="var(--panel)" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M34 37v14M37 35.5c5 0 6 8.5 12 8.5" stroke="var(--accent)" strokeWidth="1.4" strokeLinecap="round" />
+      <path d="M74 44h30" stroke="var(--line-strong)" strokeWidth="1.4" strokeLinecap="round" strokeDasharray="3 3" />
+      <path d="M99 39.5 104.5 44 99 48.5" stroke="var(--accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      <rect x="112" y="22" width="46" height="44" rx="6" fill="var(--panel)" stroke="var(--accent)" strokeWidth="1.4" />
+      <path d="M122 34h26M122 43h18M122 52h22" stroke="var(--fg-3)" strokeWidth="1.5" strokeLinecap="round" />
+      <circle cx="147" cy="43" r="2.2" fill="var(--accent)" />
     </svg>
   )
-}
-
-async function copyCodeToClipboard(text: string): Promise<boolean> {
-  if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return false
-  try {
-    await navigator.clipboard.writeText(text)
-    return true
-  } catch {
-    return false
-  }
 }
 
 function formatGithubConnectionBadge(status: ProjectLoaderData['githubPatStatus']): string {
@@ -66,6 +73,7 @@ export function ProjectSourcesTab({ data }: Props) {
   const [liveGithubStatus, setLiveGithubStatus] = useState(githubPatStatus)
   const [githubTokenInput, setGithubTokenInput] = useState('')
   const [editingGithubToken, setEditingGithubToken] = useState(false)
+  const [confirmDisconnectOpen, setConfirmDisconnectOpen] = useState(false)
   const [repoPickerOpen, setRepoPickerOpen] = useState(false)
   const [discoveredRepos, setDiscoveredRepos] = useState<DiscoveredGithubRepo[]>([])
   const [reposLoaded, setReposLoaded] = useState(false)
@@ -76,7 +84,8 @@ export function ProjectSourcesTab({ data }: Props) {
   const [specNotice, setSpecNotice] = useState('')
   const [specName, setSpecName] = useState('')
   const [specContent, setSpecContent] = useState('')
-  const manualUploadRef = useRef<HTMLDetailsElement | null>(null)
+  const [manualUploadOpen, setManualUploadOpen] = useState(false)
+  const manualUploadRef = useRef<HTMLDivElement | null>(null)
 
   const githubAction = useAction()
   const specAction = useAction()
@@ -109,10 +118,8 @@ export function ProjectSourcesTab({ data }: Props) {
   }, [githubPatStatus])
 
   function openManualUpload() {
-    if (manualUploadRef.current) {
-      manualUploadRef.current.open = true
-      manualUploadRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' })
-    }
+    setManualUploadOpen(true)
+    manualUploadRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
 
   function loadGithubRepos() {
@@ -139,6 +146,22 @@ export function ProjectSourcesTab({ data }: Props) {
     if (!reposLoaded) loadGithubRepos()
   }
 
+  function confirmDisconnectGithub() {
+    setGithubNotice('')
+    void githubAction.submit(() => clearGithubToken(), result => {
+      setConfirmDisconnectOpen(false)
+      setLiveGithubStatus(result.status)
+      setDiscoveredRepos([])
+      setSelectedRepos([])
+      setReposLoaded(false)
+      setRepoPickerOpen(false)
+      setRepoSearch('')
+      setGithubNotice(result.status.configured
+        ? 'Removed your saved credential (a local fallback token is still active).'
+        : 'Disconnected GitHub and removed the saved credential from this machine.')
+    })
+  }
+
   async function onSpecFileSelected(file: File | undefined) {
     if (!file) return
     if (file.size > maxSpecBytes) {
@@ -152,477 +175,656 @@ export function ProjectSourcesTab({ data }: Props) {
 
   const maxSyncBatch = 20
   const showBroadNote = discoveredRepos.length > 10 || githubPatStatus.tokenKind === 'classic'
+  const showConnectSheet = !githubPatStatus.configured || editingGithubToken
+  const showRepoSheet = githubPatStatus.configured && !editingGithubToken && repoPickerOpen
+  // Keep strictly ONE primary CTA visible at a time across header, active sheet, and empty state.
+  const emptyOwnsPrimary = specs.length === 0 && githubPatStatus.configured && !showConnectSheet && !showRepoSheet
+  const headerShowDiscoverBtn = specs.length > 0 || showRepoSheet || editingGithubToken
+  const disconnectLabel = githubPatStatus.authKind === 'github_app_device' ? 'Disconnect GitHub' : 'Remove saved token'
 
-  return <section aria-label="Source repositories">
-    <div className="pw-sec-head">
-      <div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <h2>Source repositories (read-only)</h2>
-          <span className={githubPatStatus.configured ? 'pw-tag ok' : 'pw-tag solid'}>
-            {formatGithubConnectionBadge(githubPatStatus)}
-          </span>
-        </div>
-        <p title="Credentials are stored privately on this machine and never shown again">
-          Optional read-only GitHub sync for source code, API schemas, and dependency checks. Credentials stay stored privately on your machine and are never shown again.
-        </p>
-      </div>
-      {githubPatStatus.configured && <div className="pw-sec-actions">
-        <button
-          type="button"
-          className="pw-btn primary"
-          disabled={githubAction.pending}
-          onClick={openRepoPicker}
-          aria-expanded={repoPickerOpen}
-        >
-          {repoPickerOpen ? 'Hide repos' : 'Discover & sync repos'}
-        </button>
-        <button
-          type="button"
-          className="pw-btn ghost"
-          disabled={githubAction.pending}
-          onClick={() => {
-            setEditingGithubToken(v => !v)
-            setGithubNotice('')
-            clearDeviceFlowError()
-          }}
-          aria-expanded={editingGithubToken}
-        >
-          {editingGithubToken ? 'Cancel' : 'Change connection'}
-        </button>
-      </div>}
-    </div>
-
-    {githubNotice && <p role="status" className="notice">{githubNotice}</p>}
-    {specNotice && <p role="status" className="notice">{specNotice}</p>}
-
-    {(!githubPatStatus.configured || editingGithubToken) && <div className="pw-sheet" id="pw-github-connect" style={{ marginBottom: 16 }}>
-      <div className="pw-sheet-h">
-        <span>{githubPatStatus.configured ? 'Reconnect GitHub account' : 'Sign in with GitHub'}</span>
-        <span className="pw-tag solid">Read-only · Auto-refresh</span>
-      </div>
-      <div className="pw-sheet-b pw-gh-device">
-        {!deviceFlow ? (
-          <>
-            <p
-              className="muted"
-              style={{ margin: 0, fontSize: 12 }}
-              title="Read-only GitHub App access with automatic token refresh, stored privately on this machine"
+  return (
+    <section aria-label="Source repositories">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="m-0 text-[13px] font-semibold text-fg">Source repositories (read-only)</h2>
+            <Badge
+              variant={githubPatStatus.configured ? 'ok' : 'neutral'}
+              className={!githubPatStatus.configured ? 'bg-sunk' : undefined}
             >
-              Sign in to Kovo Hunter with read-only GitHub App access (code and metadata only). Expiring tokens refresh automatically and stay stored privately on your machine.
-            </p>
-            {!githubPatStatus.githubDeviceFlowConfigured && (
-              <label className="pw-fld">
-                GitHub App Client ID
-                <div className="pw-gh-client-row">
-                  <input
-                    className="pw-in mono"
-                    type="text"
-                    value={clientIdInput}
-                    onChange={e => setClientIdInput(e.target.value)}
-                    placeholder="Iv23li…"
-                    autoComplete="off"
-                    disabled={deviceFlowStarting || githubAction.pending}
-                  />
-                </div>
-                <span
-                  className="hint"
-                  title="Stored privately on your machine for one-click GitHub sign-in"
-                >
-                  Entered once for one-click GitHub sign-in and stored privately on your machine.
-                </span>
-              </label>
-            )}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-              <button
-                type="button"
-                className="pw-btn primary"
-                disabled={deviceFlowStarting || githubAction.pending || (!githubPatStatus.githubDeviceFlowConfigured && clientIdInput.trim().length < 6)}
-                onClick={() => void device.start()}
-              >
-                {deviceFlowStarting ? 'Starting GitHub sign-in…' : 'Sign in with GitHub'}
-              </button>
-              {githubPatStatus.configured && (
-                <button
-                  type="button"
-                  className="pw-btn ghost"
-                  onClick={() => { setEditingGithubToken(false); setGithubTokenInput(''); clearDeviceFlowError() }}
-                >
-                  Cancel
-                </button>
-              )}
-            </div>
-          </>
-        ) : (
-          <>
-            <p className="muted" style={{ margin: 0, fontSize: 12 }}>
-              Copy this one-time verification code, open GitHub, and approve read-only access. This page updates automatically.
-            </p>
-            <div className="pw-gh-code-box" role="region" aria-label="GitHub device verification code">
-              <span className="pw-gh-user-code" data-testid="github-device-user-code">{deviceFlow.userCode}</span>
-              <button
-                type="button"
-                className="pw-btn"
-                onClick={() => void device.copyCode()}
-              >
-                {codeCopied ? 'Copied code' : 'Copy code'}
-              </button>
-              <a
-                className="pw-btn primary"
-                href={deviceFlow.verificationUri}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                Open GitHub verification ↗
-              </a>
-            </div>
-            <div className="pw-gh-poll-row">
-              <span className="pw-gh-poll-status" role="status">
-                <span className="pw-gh-pulse" aria-hidden="true" />
-                Waiting for GitHub approval… polling every <span className="num">{deviceFlow.intervalSec}s</span>
-              </span>
-              <button
-                type="button"
-                className="pw-btn ghost"
-                onClick={() => void device.cancel()}
-              >
-                Cancel
-              </button>
-            </div>
-          </>
-        )}
-
-        {deviceFlowError && <p role="alert" className="err" style={{ margin: 0 }}>{deviceFlowError}</p>}
-
-        <details className="pw-disclosure" style={{ marginTop: 4 }}>
-          <summary>Or connect with a read-only GitHub token</summary>
-          <div className="pw-disclosure-body">
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
-              <ol className="pw-steps" style={{ flex: 1 }}>
-                <li>Under <strong>Repository access</strong>, choose <strong>Only select repositories</strong> and pick the repos you want Kovo Hunter to inspect.</li>
-                <li>Under <strong>Repository permissions</strong>, set <strong>Contents: Read-only</strong>.</li>
-                <li>Click <strong>Generate token</strong> and paste it below — <span title="Stored privately on this machine">stored privately on your machine</span>.</li>
-              </ol>
-              <a
-                className="pw-btn"
-                href="https://github.com/settings/personal-access-tokens/new"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                Create read-only token on GitHub ↗
-              </a>
-            </div>
-            <form
-              style={{ display: 'grid', gap: 8 }}
-              onSubmit={event => {
-                event.preventDefault()
-                const token = githubTokenInput.trim()
-                if (!token) return
-                setGithubNotice('')
-                clearDeviceFlowError()
-                void githubAction.submit(() => saveGithubToken({ data: { token } }), result => {
-                  setLiveGithubStatus(result.status)
-                  setGithubTokenInput('')
-                  setEditingGithubToken(false)
-                  setDiscoveredRepos(result.repos)
-                  setSelectedRepos(result.defaultSelected)
-                  setReposTruncated(result.truncated)
-                  setReposLoaded(true)
-                  setRepoPickerOpen(true)
-                  setRepoSearch('')
-                  setGithubNotice(`Read-only token saved privately on your machine. Found ${result.repos.length} accessible ${result.repos.length === 1 ? 'repository' : 'repositories'}.`)
-                })
-              }}
-            >
-              <label className="pw-fld">Read-only GitHub access token
-                <input
-                  className="pw-in mono"
-                  name="githubPat"
-                  type="password"
-                  required
-                  minLength={10}
-                  maxLength={512}
-                  autoComplete="off"
-                  value={githubTokenInput}
-                  onChange={e => setGithubTokenInput(e.target.value)}
-                  placeholder="github_pat_…"
-                />
-              </label>
-              <FormError error={githubAction.error} />
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
-                <span className="hint">Read-only access; token stays stored privately on your machine.</span>
-                <button type="submit" className="pw-btn primary" disabled={githubAction.pending || githubTokenInput.trim().length < 10}>
-                  {githubAction.pending ? 'Saving & discovering…' : 'Save token & discover repos'}
-                </button>
-              </div>
-            </form>
+              {formatGithubConnectionBadge(githubPatStatus)}
+            </Badge>
           </div>
-        </details>
-      </div>
-    </div>}
-
-    {githubPatStatus.configured && !editingGithubToken && repoPickerOpen && <div className="pw-sheet pw-repo-sheet" style={{ marginBottom: 16 }}>
-      <div className="pw-sheet-h">
-        <span>Select repositories to sync</span>
-        <div className="pw-sec-actions">
-          <button type="button" className="pw-btn ghost" disabled={githubAction.pending} onClick={loadGithubRepos}>
-            {githubAction.pending && !reposLoaded ? 'Loading…' : 'Refresh'}
-          </button>
-          {githubPatStatus.source === 'vault' && (
-            <button
+          <p
+            className="mt-0.5 text-[12px] text-fg-subtle"
+            title="Credentials are stored privately on this machine and never shown again"
+          >
+            Optional read-only GitHub sync for source code, API schemas, and dependency checks. Credentials stay stored privately on your machine and are never shown again.
+          </p>
+        </div>
+        {githubPatStatus.configured && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {headerShowDiscoverBtn && (
+              <Button
+                type="button"
+                variant={showRepoSheet || editingGithubToken ? 'outline' : 'default'}
+                disabled={githubAction.pending}
+                onClick={openRepoPicker}
+                aria-expanded={repoPickerOpen}
+              >
+                {repoPickerOpen ? 'Hide repos' : 'Discover & sync repos'}
+              </Button>
+            )}
+            <Button
               type="button"
-              className="pw-btn ghost danger"
+              variant="ghost"
               disabled={githubAction.pending}
               onClick={() => {
+                setEditingGithubToken(v => !v)
                 setGithubNotice('')
-                void githubAction.submit(() => clearGithubToken(), result => {
-                  setLiveGithubStatus(result.status)
-                  setDiscoveredRepos([])
-                  setSelectedRepos([])
-                  setReposLoaded(false)
-                  setRepoPickerOpen(false)
-                  setRepoSearch('')
-                  setGithubNotice(result.status.configured
-                    ? 'Removed your saved credential (a local fallback token is still active).'
-                    : 'Disconnected GitHub and removed the saved credential from this machine.')
-                })
+                clearDeviceFlowError()
+              }}
+              aria-expanded={editingGithubToken}
+            >
+              {editingGithubToken ? 'Cancel' : 'Change connection'}
+            </Button>
+          </div>
+        )}
+      </div>
+
+      {githubNotice && (
+        <p
+          role="status"
+          className="mb-3.5 flex items-center gap-2 rounded-[7px] border border-line bg-sunk px-3 py-[7px] text-[12.5px] text-fg-muted"
+        >
+          {githubNotice}
+        </p>
+      )}
+      {specNotice && (
+        <p
+          role="status"
+          className="mb-3.5 flex items-center gap-2 rounded-[7px] border border-line bg-sunk px-3 py-[7px] text-[12.5px] text-fg-muted"
+        >
+          {specNotice}
+        </p>
+      )}
+
+      {showConnectSheet && (
+        <Card id="pw-github-connect" className="mb-4 overflow-hidden border-line">
+          <CardHeader className="items-center py-2.5">
+            <span className="text-[13px] font-semibold text-fg">
+              {githubPatStatus.configured ? 'Reconnect GitHub account' : 'Sign in with GitHub'}
+            </span>
+            <Badge variant="neutral" className="bg-sunk">Read-only · Auto-refresh</Badge>
+          </CardHeader>
+          <CardBody className="grid gap-2.5 py-3.5">
+            {!deviceFlow ? (
+              <>
+                <p
+                  className="m-0 text-[12px] text-fg-subtle"
+                  title="Read-only GitHub App access with automatic token refresh, stored privately on this machine"
+                >
+                  Sign in to Kovo Hunter with read-only GitHub App access (code and metadata only). Expiring tokens refresh automatically and stay stored privately on your machine.
+                </p>
+                {!githubPatStatus.githubDeviceFlowConfigured && (
+                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                    GitHub App Client ID
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Input
+                        className="min-w-[200px] flex-1 font-mono text-[12px]"
+                        type="text"
+                        value={clientIdInput}
+                        onChange={e => setClientIdInput(e.target.value)}
+                        placeholder="Iv23li…"
+                        autoComplete="off"
+                        disabled={deviceFlowStarting || githubAction.pending}
+                      />
+                    </div>
+                    <span
+                      className="text-[11.5px] font-normal text-fg-subtle"
+                      title="Stored privately on your machine for one-click GitHub sign-in"
+                    >
+                      Entered once for one-click GitHub sign-in and stored privately on your machine.
+                    </span>
+                  </label>
+                )}
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="default"
+                    disabled={
+                      deviceFlowStarting ||
+                      githubAction.pending ||
+                      (!githubPatStatus.githubDeviceFlowConfigured && clientIdInput.trim().length < 6)
+                    }
+                    onClick={() => void device.start()}
+                  >
+                    {deviceFlowStarting ? 'Starting GitHub sign-in…' : 'Sign in with GitHub'}
+                  </Button>
+                  {githubPatStatus.configured && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      onClick={() => {
+                        setEditingGithubToken(false)
+                        setGithubTokenInput('')
+                        clearDeviceFlowError()
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                  )}
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="m-0 text-[12px] text-fg-subtle">
+                  Copy this one-time verification code, open GitHub, and approve read-only access. This page updates automatically.
+                </p>
+                <div
+                  className="flex flex-wrap items-center gap-2.5 rounded-lg border border-line-2 bg-sunk px-3 py-2.5"
+                  role="region"
+                  aria-label="GitHub device verification code"
+                >
+                  <span
+                    className="select-all rounded-md border border-line-2 bg-panel px-2.5 py-1 font-mono text-[19px] font-semibold tracking-[0.14em] text-fg"
+                    data-testid="github-device-user-code"
+                  >
+                    {deviceFlow.userCode}
+                  </span>
+                  <Button type="button" variant="outline" onClick={() => void device.copyCode()}>
+                    {codeCopied ? 'Copied code' : 'Copy code'}
+                  </Button>
+                  <a
+                    className={cn(buttonVariants({ variant: 'default' }), 'no-underline')}
+                    href={deviceFlow.verificationUri}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Open GitHub verification ↗
+                  </a>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2.5 text-[12px] text-fg-muted">
+                  <span className="inline-flex items-center gap-[7px]" role="status">
+                    <span className="inline-block size-[7px] flex-none animate-pulse rounded-full bg-accent" aria-hidden="true" />
+                    Waiting for GitHub approval… polling every <span className="tabular-nums">{deviceFlow.intervalSec}s</span>
+                  </span>
+                  <Button type="button" variant="ghost" onClick={() => void device.cancel()}>
+                    Cancel
+                  </Button>
+                </div>
+              </>
+            )}
+
+            {deviceFlowError && (
+              <p role="alert" className="m-0 text-[12px] text-danger">
+                {deviceFlowError}
+              </p>
+            )}
+
+            <Disclosure className="mt-1 border-t border-line pt-2.5">
+              <DisclosureTrigger className="h-auto bg-transparent px-0 py-1 text-fg-muted shadow-none hover:bg-transparent hover:text-fg">
+                Or connect with a read-only GitHub token
+              </DisclosureTrigger>
+              <DisclosureContent className="grid gap-2.5 pt-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <ol className="m-0 grid flex-1 gap-1 pl-[18px] text-[12px] text-fg-muted">
+                    <li>
+                      Under <strong className="text-fg">Repository access</strong>, choose{' '}
+                      <strong className="text-fg">Only select repositories</strong> and pick the repos you want Kovo Hunter to inspect.
+                    </li>
+                    <li>
+                      Under <strong className="text-fg">Repository permissions</strong>, set{' '}
+                      <strong className="text-fg">Contents: Read-only</strong>.
+                    </li>
+                    <li>
+                      Click <strong className="text-fg">Generate token</strong> and paste it below —{' '}
+                      <span title="Stored privately on this machine">stored privately on your machine</span>.
+                    </li>
+                  </ol>
+                  <a
+                    className={cn(buttonVariants({ variant: 'outline' }), 'no-underline')}
+                    href="https://github.com/settings/personal-access-tokens/new"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Create read-only token on GitHub ↗
+                  </a>
+                </div>
+                <form
+                  className="grid gap-2"
+                  onSubmit={event => {
+                    event.preventDefault()
+                    const token = githubTokenInput.trim()
+                    if (!token) return
+                    setGithubNotice('')
+                    clearDeviceFlowError()
+                    void githubAction.submit(() => saveGithubToken({ data: { token } }), result => {
+                      setLiveGithubStatus(result.status)
+                      setGithubTokenInput('')
+                      setEditingGithubToken(false)
+                      setDiscoveredRepos(result.repos)
+                      setSelectedRepos(result.defaultSelected)
+                      setReposTruncated(result.truncated)
+                      setReposLoaded(true)
+                      setRepoPickerOpen(true)
+                      setRepoSearch('')
+                      setGithubNotice(`Read-only token saved privately on your machine. Found ${result.repos.length} accessible ${result.repos.length === 1 ? 'repository' : 'repositories'}.`)
+                    })
+                  }}
+                >
+                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                    Read-only GitHub access token
+                    <Input
+                      className="w-full font-mono text-[12px]"
+                      name="githubPat"
+                      type="password"
+                      required
+                      minLength={10}
+                      maxLength={512}
+                      autoComplete="off"
+                      value={githubTokenInput}
+                      onChange={e => setGithubTokenInput(e.target.value)}
+                      placeholder="github_pat_…"
+                    />
+                  </label>
+                  <FormError error={githubAction.error} />
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-[12px] text-fg-subtle">
+                      Read-only access; token stays stored privately on your machine.
+                    </span>
+                    <Button
+                      type="submit"
+                      variant="outline"
+                      disabled={githubAction.pending || githubTokenInput.trim().length < 10}
+                    >
+                      {githubAction.pending ? 'Saving & discovering…' : 'Save token & discover repos'}
+                    </Button>
+                  </div>
+                </form>
+              </DisclosureContent>
+            </Disclosure>
+          </CardBody>
+        </Card>
+      )}
+
+      {showRepoSheet && (
+        <Card className="pw-repo-sheet mb-4 overflow-hidden border-line">
+          <CardHeader className="items-center py-2.5">
+            <span className="text-[13px] font-semibold text-fg">Select repositories to sync</span>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <Button type="button" variant="ghost" disabled={githubAction.pending} onClick={loadGithubRepos}>
+                {githubAction.pending && !reposLoaded ? 'Loading…' : 'Refresh'}
+              </Button>
+              {githubPatStatus.source === 'vault' && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="data-[slot=button]:text-danger data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger"
+                  disabled={githubAction.pending}
+                  onClick={() => setConfirmDisconnectOpen(true)}
+                >
+                  {disconnectLabel}
+                </Button>
+              )}
+            </div>
+          </CardHeader>
+
+          <GithubInstallBanner
+            authKind={liveGithubStatus.authKind}
+            tokenKind={liveGithubStatus.tokenKind}
+            login={liveGithubStatus.login}
+            installUrl={liveGithubStatus.installUrl}
+            installations={liveGithubStatus.installations}
+            privateRepoCount={liveGithubStatus.privateRepoCount}
+            needsAppInstall={liveGithubStatus.needsAppInstall}
+            loading={githubAction.pending}
+            onRefresh={loadGithubRepos}
+            flush
+          />
+
+          <div className="grid gap-2 border-b border-line bg-panel px-4 py-2.5">
+            <p className="m-0 text-[12px] text-fg-subtle">
+              Read-only shallow clone + automatic OpenAPI, GraphQL, route, and lockfile extraction.
+              {reposTruncated && ' Showing the 200 most recently updated repositories.'}
+            </p>
+
+            {githubPatStatus.source === 'fixture' && (
+              <p className="m-0 text-[11.5px] text-fg-subtle">
+                Using a local fallback GitHub token. Click <strong className="text-fg-muted">Change connection</strong> to sign in with GitHub or save your own read-only token instead.
+              </p>
+            )}
+
+            {showBroadNote && discoveredRepos.length > 0 && (
+              <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-[7px] border border-warn-line bg-warn-soft px-2.5 py-2 text-[12px] text-fg-muted">
+                <span>
+                  {githubPatStatus.tokenKind === 'classic'
+                    ? `Classic GitHub token detected (${discoveredRepos.length} accessible repos).`
+                    : `Found ${discoveredRepos.length} accessible repos.`}{' '}
+                  {discoveredRepos.length > 10
+                    ? 'Nothing was pre-selected so you do not accidentally clone everything.'
+                    : 'Consider scoping a read-only token or GitHub App installation to only the target repositories.'}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {githubAction.pending && !reposLoaded ? (
+            <div className="px-4 py-3.5 text-[12.5px]">
+              <span className="text-fg-subtle">Discovering accessible repositories…</span>
+            </div>
+          ) : (
+            <GroupedRepoPicker
+              repos={discoveredRepos}
+              selectedRepos={selectedRepos}
+              onChangeSelectedRepos={setSelectedRepos}
+              search={repoSearch}
+              onSearchChange={setRepoSearch}
+              maxSelectable={maxSyncBatch}
+              disabled={githubAction.pending}
+              variant="detailed"
+              searchPlaceholder="Filter repositories by name, branch, or description…"
+              emptyMessage="No repositories were returned for this account. Verify the GitHub App installation or token grants Contents: Read-only on at least one repository."
+            />
+          )}
+
+          {(selectedRepos.length > maxSyncBatch || githubAction.error) && (
+            <div className="grid gap-1.5 border-t border-line px-4 py-2.5">
+              {selectedRepos.length > maxSyncBatch && (
+                <p role="alert" className="m-0 text-[12px] text-danger">
+                  Select at most {maxSyncBatch} repositories per sync batch.
+                </p>
+              )}
+              <FormError error={githubAction.error} />
+            </div>
+          )}
+
+          <CardFooter className="flex-wrap py-2.5">
+            <span className="mr-auto text-[12px] tabular-nums text-fg-subtle">
+              {selectedRepos.length} of {discoveredRepos.length} selected
+            </span>
+            <Button type="button" variant="ghost" onClick={() => setRepoPickerOpen(false)}>
+              Close
+            </Button>
+            <Button
+              type="button"
+              variant="default"
+              disabled={githubAction.pending || selectedRepos.length === 0 || selectedRepos.length > maxSyncBatch}
+              onClick={() => {
+                setGithubNotice('')
+                void githubAction.submit(
+                  () => syncGithubRepositories({ data: { projectId: project.id, repos: selectedRepos } }),
+                  result => {
+                    setRepoPickerOpen(false)
+                    const warnText = result.warnings.length ? ` Warnings: ${result.warnings.join('; ')}` : ''
+                    setGithubNotice(`Synced ${result.repos.length} ${result.repos.length === 1 ? 'repo' : 'repos'}: ${result.specsImported} specs imported, ${result.dependenciesExtracted} dependencies extracted.${warnText}`)
+                  },
+                )
               }}
             >
-              {githubPatStatus.authKind === 'github_app_device' ? 'Disconnect GitHub' : 'Remove saved token'}
-            </button>
-          )}
-        </div>
+              {githubAction.pending ? 'Syncing…' : `Sync selected (${selectedRepos.length})`}
+            </Button>
+          </CardFooter>
+        </Card>
+      )}
+
+      <div className="mb-2 mt-[18px] flex flex-wrap items-center justify-between gap-3">
+        <h2 className="m-0 text-[13px] font-semibold text-fg">
+          Synced snapshots &amp; specs <span className="font-normal tabular-nums text-fg-subtle">({specs.length})</span>
+        </h2>
       </div>
 
-      <GithubInstallBanner
-        authKind={liveGithubStatus.authKind}
-        tokenKind={liveGithubStatus.tokenKind}
-        login={liveGithubStatus.login}
-        installUrl={liveGithubStatus.installUrl}
-        installations={liveGithubStatus.installations}
-        privateRepoCount={liveGithubStatus.privateRepoCount}
-        needsAppInstall={liveGithubStatus.needsAppInstall}
-        loading={githubAction.pending}
-        onRefresh={loadGithubRepos}
-        flush
-      />
-
-      <div className="pw-repo-subbar">
-        <p className="muted" style={{ margin: 0, fontSize: 12 }}>
-          Read-only shallow clone + automatic OpenAPI, GraphQL, route, and lockfile extraction.
-          {reposTruncated && ' Showing the 200 most recently updated repositories.'}
-        </p>
-
-        {githubPatStatus.source === 'fixture' && (
-          <p
-            className="muted"
-            style={{ margin: 0, fontSize: 11.5 }}
-          >
-            Using a local fallback GitHub token. Click <strong>Change connection</strong> to sign in with GitHub or save your own read-only token instead.
-          </p>
-        )}
-
-        {showBroadNote && discoveredRepos.length > 0 && <div className="pw-broad-note">
-          <span>
-            {githubPatStatus.tokenKind === 'classic'
-              ? `Classic GitHub token detected (${discoveredRepos.length} accessible repos).`
-              : `Found ${discoveredRepos.length} accessible repos.`}{' '}
-            {discoveredRepos.length > 10
-              ? 'Nothing was pre-selected so you do not accidentally clone everything.'
-              : 'Consider scoping a read-only token or GitHub App installation to only the target repositories.'}
-          </span>
-        </div>}
-      </div>
-
-      {githubAction.pending && !reposLoaded ? (
-        <div className="pw-repo-state">
-          <span className="muted">Discovering accessible repositories…</span>
+      {specs.length > 0 ? (
+        <div className="border-t border-line">
+          {specs.map(spec => {
+            const imported = formatHumanTime(spec.createdAt)
+            return (
+              <div
+                key={spec.id}
+                className="flex min-h-[44px] items-center justify-between gap-3 border-b border-line px-1 py-2 transition-colors hover:bg-hover"
+              >
+                <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <div className="flex min-w-0 flex-wrap items-center gap-1.5 font-medium text-fg">
+                    <strong className="font-mono text-[12px] font-semibold">{spec.name}</strong>
+                    <Badge variant="neutral" className="bg-sunk">{spec.kind}</Badge>
+                    {spec.origin && <Badge variant="accent">{safeHost(spec.origin)}</Badge>}
+                  </div>
+                  <div className="text-[12px] tabular-nums text-fg-subtle">
+                    {Math.max(1, Math.round(spec.bytes / 1024))} KiB
+                    {imported.label && (
+                      <>
+                        {' · '}
+                        <span title={imported.full}>Imported {imported.label}</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+                <div className="flex flex-none items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="data-[slot=button]:text-danger data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger"
+                    disabled={specAction.pending}
+                    onClick={() => {
+                      void specAction.submit(() => removeProjectSpec({ data: {
+                        requestId: crypto.randomUUID(),
+                        projectId: project.id,
+                        specId: spec.id,
+                      } }), () => setSpecNotice(`Removed spec "${spec.name}".`))
+                    }}
+                  >
+                    Delete
+                  </Button>
+                </div>
+              </div>
+            )
+          })}
         </div>
       ) : (
-        <GroupedRepoPicker
-          repos={discoveredRepos}
-          selectedRepos={selectedRepos}
-          onChangeSelectedRepos={setSelectedRepos}
-          search={repoSearch}
-          onSearchChange={setRepoSearch}
-          maxSelectable={maxSyncBatch}
-          disabled={githubAction.pending}
-          variant="detailed"
-          searchPlaceholder="Filter repositories by name, branch, or description…"
-          emptyMessage="No repositories were returned for this account. Verify the GitHub App installation or token grants Contents: Read-only on at least one repository."
-        />
-      )}
-
-      {(selectedRepos.length > maxSyncBatch || githubAction.error) && (
-        <div className="pw-repo-errors">
-          {selectedRepos.length > maxSyncBatch && (
-            <p role="alert" className="err" style={{ margin: 0 }}>Select at most {maxSyncBatch} repositories per sync batch.</p>
-          )}
-          <FormError error={githubAction.error} />
+        <div className="mt-3.5 rounded-card border border-line bg-sunk">
+          <EmptyState
+            icon={<SourcesEmptyIllustration />}
+            title="No repositories or specs synced yet"
+            description="Connect GitHub to pull read-only code and dependency context, or upload an OpenAPI or GraphQL schema manually."
+            className="max-w-[440px] py-9 [&_[data-slot=empty-state-icon]]:size-auto [&_[data-slot=empty-state-icon]>svg]:h-[88px] [&_[data-slot=empty-state-icon]>svg]:w-[180px]"
+            action={
+              emptyOwnsPrimary ? (
+                <>
+                  <Button
+                    type="button"
+                    variant="default"
+                    disabled={githubAction.pending}
+                    onClick={() => {
+                      setEditingGithubToken(false)
+                      openRepoPicker()
+                    }}
+                  >
+                    Discover repositories
+                  </Button>
+                  <Button type="button" variant="ghost" onClick={openManualUpload}>
+                    Upload schema manually
+                  </Button>
+                </>
+              ) : (
+                <Button type="button" variant="outline" onClick={openManualUpload}>
+                  Upload schema manually
+                </Button>
+              )
+            }
+          />
         </div>
       )}
 
-      <div className="pw-sheet-f">
-        <span className="hint num">{selectedRepos.length} of {discoveredRepos.length} selected</span>
-        <button type="button" className="pw-btn ghost" onClick={() => setRepoPickerOpen(false)}>Close</button>
-        <button
-          type="button"
-          className="pw-btn primary"
-          disabled={githubAction.pending || selectedRepos.length === 0 || selectedRepos.length > maxSyncBatch}
-          onClick={() => {
-            setGithubNotice('')
-            void githubAction.submit(
-              () => syncGithubRepositories({ data: { projectId: project.id, repos: selectedRepos } }),
-              result => {
-                setRepoPickerOpen(false)
-                const warnText = result.warnings.length ? ` Warnings: ${result.warnings.join('; ')}` : ''
-                setGithubNotice(`Synced ${result.repos.length} ${result.repos.length === 1 ? 'repo' : 'repos'}: ${result.specsImported} specs imported, ${result.dependenciesExtracted} dependencies extracted.${warnText}`)
-              },
-            )
-          }}
+      <div ref={manualUploadRef}>
+        <Disclosure
+          open={manualUploadOpen}
+          onOpenChange={setManualUploadOpen}
+          className="mt-3.5 border-t border-line pt-2.5"
         >
-          {githubAction.pending ? 'Syncing…' : `Sync selected (${selectedRepos.length})`}
-        </button>
-      </div>
-    </div>}
-
-    <div className="pw-sec-head" style={{ marginTop: 18 }}>
-      <h2>Synced snapshots &amp; specs <span className="muted num">({specs.length})</span></h2>
-    </div>
-    {specs.length > 0 ? (
-      <div className="pw-table-wrap">
-        {specs.map(spec => {
-          const imported = formatHumanTime(spec.createdAt)
-          return <div key={spec.id} className="pw-row">
-            <div className="pw-row-main">
-              <div className="pw-row-title">
-                <strong className="mono">{spec.name}</strong>
-                <span className="pw-tag solid">{spec.kind}</span>
-                {spec.origin && <span className="pw-tag accent">{safeHost(spec.origin)}</span>}
-              </div>
-              <div className="pw-row-sub num">
-                {Math.max(1, Math.round(spec.bytes / 1024))} KiB
-                {imported.label && (
-                  <>
-                    {' · '}
-                    <span title={imported.full}>Imported {imported.label}</span>
-                  </>
-                )}
-              </div>
-            </div>
-            <div className="pw-row-right">
-              <button
-                type="button"
-                className="pw-btn ghost danger"
-                disabled={specAction.pending}
-                onClick={() => {
-                  void specAction.submit(() => removeProjectSpec({ data: {
+          <DisclosureTrigger className="h-auto bg-transparent px-0 py-1 text-fg-muted shadow-none hover:bg-transparent hover:text-fg">
+            Advanced configuration
+          </DisclosureTrigger>
+          <DisclosureContent className="grid gap-2.5 pt-2.5">
+            <p className="m-0 text-[12px] text-fg-subtle">
+              Kovo Hunter automatically discovers runtime schemas and extracts OpenAPI, GraphQL, and lockfile specs from synced repositories. Use manual upload only when you need to supply an extra schema or lockfile directly.
+            </p>
+            <Card className="overflow-hidden border-line">
+              <form
+                onSubmit={event => {
+                  event.preventDefault()
+                  const form = new FormData(event.currentTarget)
+                  const originVal = String(form.get('origin') ?? '').trim()
+                  const kindRaw = String(form.get('kind') ?? 'openapi')
+                  const kind = (['openapi', 'graphql', 'routes', 'notes'] as const).includes(kindRaw as 'openapi')
+                    ? kindRaw as 'openapi' | 'graphql' | 'routes' | 'notes' : 'notes'
+                  void specAction.submit(() => importSpec({ data: {
                     requestId: crypto.randomUUID(),
                     projectId: project.id,
-                    specId: spec.id,
-                  } }), () => setSpecNotice(`Removed spec "${spec.name}".`))
+                    name: specName.trim() || String(form.get('name') ?? '').trim(),
+                    kind,
+                    ...(originVal ? { origin: originVal } : {}),
+                    content: specContent,
+                  } }), saved => {
+                    setSpecName('')
+                    setSpecContent('')
+                    setSpecNotice(`Imported spec "${saved.name}" (${saved.kind}).`)
+                  })
                 }}
               >
-                Delete
-              </button>
-            </div>
-          </div>
-        })}
+                <CardHeader className="items-center py-2.5">
+                  <span className="text-[13px] font-semibold text-fg">Upload OpenAPI, GraphQL, or lockfile</span>
+                </CardHeader>
+                <CardBody className="grid gap-3 py-3.5">
+                  <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
+                    <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                      Name
+                      <Input
+                        className="w-full"
+                        name="name"
+                        required
+                        maxLength={160}
+                        value={specName}
+                        onChange={e => setSpecName(e.target.value)}
+                        placeholder="openapi.yaml or package-lock.json"
+                      />
+                    </label>
+                    <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                      Kind
+                      <NativeSelect className="w-full" name="kind" defaultValue="openapi">
+                        <option value="openapi">OpenAPI / Swagger</option>
+                        <option value="graphql">GraphQL schema</option>
+                        <option value="routes">Route map / Server handlers</option>
+                        <option value="notes">Lockfile / Dependencies / Notes</option>
+                      </NativeSelect>
+                    </label>
+                  </div>
+                  <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
+                    <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                      Target origin (optional)
+                      <Input
+                        className="w-full"
+                        name="origin"
+                        placeholder={project.seeds[0] ?? 'https://api.example.com'}
+                      />
+                    </label>
+                    <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                      Load from file (optional, up to 2 MiB)
+                      <Input
+                        className="w-full pt-[3px]!"
+                        type="file"
+                        accept=".json,.yaml,.yml,.graphql,.gql,.txt,.md,.lock"
+                        onChange={e => {
+                          void onSpecFileSelected(e.target.files?.[0])
+                        }}
+                      />
+                    </label>
+                  </div>
+                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                    Content
+                    <Textarea
+                      className="w-full font-mono text-[12px]"
+                      name="content"
+                      rows={6}
+                      required
+                      value={specContent}
+                      onChange={e => setSpecContent(e.target.value)}
+                      placeholder="Paste OpenAPI, GraphQL SDL, lockfile JSON, or route notes…"
+                    />
+                  </label>
+                  <FormError error={specAction.error} />
+                </CardBody>
+                <CardFooter className="py-2.5">
+                  <Button type="submit" variant="outline" disabled={specAction.pending || !specContent.trim()}>
+                    Import spec
+                  </Button>
+                </CardFooter>
+              </form>
+            </Card>
+          </DisclosureContent>
+        </Disclosure>
       </div>
-    ) : (
-      <div className="pw-empty-card">
-        <SourcesEmptyIllustration />
-        <h3>No repositories or specs synced yet</h3>
-        <p>
-          Connect GitHub to pull read-only code and dependency context, or upload an OpenAPI or GraphQL schema manually.
-        </p>
-        <div className="pw-sec-actions" style={{ justifyContent: 'center' }}>
-          <button
-            type="button"
-            className="pw-btn primary"
-            onClick={() => {
-              if (githubPatStatus.configured) {
-                setEditingGithubToken(false)
-                openRepoPicker()
-              } else {
-                document.getElementById('pw-github-connect')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-              }
-            }}
-          >
-            {githubPatStatus.configured ? 'Discover repositories' : 'Connect GitHub'}
-          </button>
-          <button type="button" className="pw-btn ghost" onClick={openManualUpload}>
-            Upload schema manually
-          </button>
-        </div>
-      </div>
-    )}
 
-    <details className="pw-disclosure" ref={manualUploadRef}>
-      <summary>Advanced configuration</summary>
-      <div className="pw-disclosure-body">
-        <p className="muted" style={{ margin: 0, fontSize: 12 }}>
-          Kovo Hunter automatically discovers runtime schemas and extracts OpenAPI, GraphQL, and lockfile specs from synced repositories. Use manual upload only when you need to supply an extra schema or lockfile directly.
-        </p>
-        <form
-          className="pw-sheet"
-          onSubmit={event => {
-            event.preventDefault()
-            const form = new FormData(event.currentTarget)
-            const originVal = String(form.get('origin') ?? '').trim()
-            const kindRaw = String(form.get('kind') ?? 'openapi')
-            const kind = (['openapi', 'graphql', 'routes', 'notes'] as const).includes(kindRaw as 'openapi')
-              ? kindRaw as 'openapi' | 'graphql' | 'routes' | 'notes' : 'notes'
-            void specAction.submit(() => importSpec({ data: {
-              requestId: crypto.randomUUID(),
-              projectId: project.id,
-              name: specName.trim() || String(form.get('name') ?? '').trim(),
-              kind,
-              ...(originVal ? { origin: originVal } : {}),
-              content: specContent,
-            } }), saved => {
-              setSpecName('')
-              setSpecContent('')
-              setSpecNotice(`Imported spec "${saved.name}" (${saved.kind}).`)
-            })
-          }}
+      <Dialog
+        open={confirmDisconnectOpen}
+        closeOnEscape={!githubAction.pending}
+        onOpenChange={nextOpen => {
+          if (!nextOpen && !githubAction.pending) setConfirmDisconnectOpen(false)
+        }}
+      >
+        <DialogContent
+          role="alertdialog"
+          className="flex max-h-[calc(100vh-56px)] max-w-[440px] flex-col overflow-hidden p-0"
         >
-          <div className="pw-sheet-h"><span>Upload OpenAPI, GraphQL, or lockfile</span></div>
-          <div className="pw-sheet-b">
-            <div className="pw-grid-2">
-              <label className="pw-fld">Name
-                <input className="pw-in" name="name" required maxLength={160} value={specName} onChange={e => setSpecName(e.target.value)}
-                  placeholder="openapi.yaml or package-lock.json" />
-              </label>
-              <label className="pw-fld">Kind
-                <select className="pw-select" name="kind" defaultValue="openapi">
-                  <option value="openapi">OpenAPI / Swagger</option>
-                  <option value="graphql">GraphQL schema</option>
-                  <option value="routes">Route map / Server handlers</option>
-                  <option value="notes">Lockfile / Dependencies / Notes</option>
-                </select>
-              </label>
-            </div>
-            <div className="pw-grid-2">
-              <label className="pw-fld">Target origin (optional)
-                <input className="pw-in" name="origin" placeholder={project.seeds[0] ?? 'https://api.example.com'} />
-              </label>
-              <label className="pw-fld">Load from file (optional, up to 2 MiB)
-                <input className="pw-in" style={{ paddingTop: 3 }} type="file" accept=".json,.yaml,.yml,.graphql,.gql,.txt,.md,.lock" onChange={e => {
-                  void onSpecFileSelected(e.target.files?.[0])
-                }} />
-              </label>
-            </div>
-            <label className="pw-fld">Content
-              <textarea className="pw-textarea mono" name="content" rows={6} required value={specContent} onChange={e => setSpecContent(e.target.value)}
-                placeholder="Paste OpenAPI, GraphQL SDL, lockfile JSON, or route notes…" />
-            </label>
-            <FormError error={specAction.error} />
-          </div>
-          <div className="pw-sheet-f">
-            <button type="submit" className="pw-btn primary" disabled={specAction.pending || !specContent.trim()}>Import spec</button>
-          </div>
-        </form>
-      </div>
-    </details>
-  </section>
+          <DialogHeader className="flex-row items-center justify-between gap-2.5 border-b border-line bg-raise px-4 py-2.5">
+            <DialogTitle className="inline-flex items-center gap-2 text-[13px] font-semibold text-fg">
+              <Icon name="alert" size={15} className="text-danger" />
+              <span>{disconnectLabel}</span>
+            </DialogTitle>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="size-[26px]"
+              disabled={githubAction.pending}
+              onClick={() => setConfirmDisconnectOpen(false)}
+              aria-label="Close"
+            >
+              <Icon name="close" size={14} />
+            </Button>
+          </DialogHeader>
+          <DialogBody className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+            <DialogDescription className="text-[12.5px] leading-5 text-fg-muted">
+              Remove the saved GitHub credential
+              {liveGithubStatus.login ? (
+                <>
+                  {' '}for <strong className="font-mono font-semibold text-fg">@{liveGithubStatus.login}</strong>
+                </>
+              ) : null}{' '}
+              from this machine? This applies across all projects. Already synced snapshots and specs stay intact, and you can reconnect anytime.
+            </DialogDescription>
+            <FormError error={githubAction.error} />
+          </DialogBody>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={githubAction.pending}
+              onClick={() => setConfirmDisconnectOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="default"
+              className="data-[slot=button]:bg-danger data-[slot=button]:text-white data-[slot=button]:hover:bg-danger hover:brightness-[1.08]"
+              disabled={githubAction.pending}
+              onClick={confirmDisconnectGithub}
+            >
+              {githubAction.pending ? 'Disconnecting…' : disconnectLabel}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </section>
+  )
 }

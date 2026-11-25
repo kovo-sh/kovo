@@ -2,12 +2,6 @@ import { createFileRoute, Link, useLocation, useNavigate, useRouter } from '@tan
 import { useEffect, useState } from 'react'
 import { projectData, removeProject, testPersonaAuthAction } from '../actions.ts'
 import { Icon } from '../components/run/icons.tsx'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '../components/ui/dropdown-menu.tsx'
 import { ProjectGuardrailsTab } from '../components/project/ProjectGuardrailsTab.tsx'
 import { ProjectInventoryTab } from '../components/project/ProjectInventoryTab.tsx'
 import { ProjectNewRunSheet } from '../components/project/ProjectNewRunSheet.tsx'
@@ -16,8 +10,25 @@ import { ProjectPersonasTab } from '../components/project/ProjectPersonasTab.tsx
 import { ProjectSourcesTab } from '../components/project/ProjectSourcesTab.tsx'
 import type { PersonaTestState, ProjectTabId } from '../components/project/types.ts'
 import { isProjectTab, PROJECT_TABS, safeHost } from '../components/project/types.ts'
-import '../components/project/project.css'
+import { Badge } from '../components/ui/badge.tsx'
+import { Button, buttonVariants } from '../components/ui/button.tsx'
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '../components/ui/dialog.tsx'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '../components/ui/dropdown-menu.tsx'
 import type { PublicPersona } from '../domain.ts'
+import { cn } from '../lib/cn.ts'
 
 type ProjectSearch = {
   tab?: ProjectTabId
@@ -53,19 +64,6 @@ function ProjectPage() {
   const activeRunsCount = runs.filter(r => r.status === 'running').length
   const totalFindings = runs.reduce((sum, r) => sum + r.findingCount, 0)
   const totalConfirmed = runs.reduce((sum, r) => sum + r.confirmedCount, 0)
-
-  useEffect(() => {
-    if (!deleteProjectOpen) return
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !deletingProject) {
-        e.preventDefault()
-        setDeleteProjectOpen(false)
-        setDeleteProjectError('')
-      }
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [deleteProjectOpen, deletingProject])
 
   async function confirmDeleteProject() {
     if (deletingProject) return
@@ -157,175 +155,210 @@ function ProjectPage() {
     ...(allowlistCount > 0 ? { guardrails: allowlistCount } : {}),
   }
 
-  return <main className="pw">
-    <header className="pw-hdr">
-      <div className="pw-hdr-top">
-        <Link className="pw-crumb" to="/">Projects</Link>
-        <span className="pw-crumb-sep" aria-hidden="true">/</span>
-        <h1 className="pw-title">{project.name}</h1>
-        {project.environment === 'local-lab' && <span className="pw-tag warn">Local Lab</span>}
-        <span className="pw-hdr-meta mono" title={project.seeds.join(', ')}>
-          {project.seeds.map(safeHost).join(', ')}
-        </span>
-        <div className="pw-hdr-actions">
-          <button type="button" className="pw-btn primary" onClick={() => setNewRunOpen(true)}>
-            New run
-          </button>
-          <DropdownMenu>
-            <DropdownMenuTrigger className="pw-btn ghost pw-hdr-more" aria-label="Project actions">
-              <Icon name="dots" size={15} />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="pw-menu">
-              <DropdownMenuItem
-                variant="destructive"
-                className="pw-menu-item"
-                onClick={() => {
-                  setDeleteProjectError('')
-                  setDeleteProjectOpen(true)
-                }}
-              >
-                <Icon name="trash" size={13} />
-                Delete project
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-      </div>
-    </header>
-
-    <div className="pw-toolbar">
-      <nav className="pw-tabs" role="tablist" aria-label="Project sections">
-        {PROJECT_TABS.map(tab => {
-          const isActive = activeTab === tab.id
-          const count = tabCounts[tab.id]
-          return <button
-            key={tab.id}
-            type="button"
-            role="tab"
-            aria-selected={isActive}
-            className={`pw-tab${isActive ? ' on' : ''}`}
-            onClick={() => selectTab(tab.id)}
+  return (
+    <main className="flex min-h-full flex-col bg-panel font-sans text-base text-fg antialiased">
+      <header className="sticky top-0 z-20 border-b border-line bg-panel px-3.5 md:px-[22px]">
+        <div className="flex h-11 min-w-0 items-center gap-2">
+          <Link className="whitespace-nowrap text-[13px] text-fg-subtle transition-colors hover:text-fg" to="/">
+            Projects
+          </Link>
+          <span className="text-fg-faint" aria-hidden="true">/</span>
+          <h1 className="min-w-0 truncate text-[13.5px] font-semibold tracking-[-0.005em] text-fg">
+            {project.name}
+          </h1>
+          {project.environment === 'local-lab' && <Badge variant="warn">Local Lab</Badge>}
+          <span
+            className="min-w-0 flex-1 truncate font-mono text-[12px] text-fg-subtle"
+            title={project.seeds.join(', ')}
           >
-            <span>{tab.label}</span>
-            {typeof count === 'number' && <span className="ct num">{count}</span>}
-          </button>
-        })}
-      </nav>
-    </div>
+            {project.seeds.map(safeHost).join(', ')}
+          </span>
+          <div className="ml-auto flex flex-none items-center gap-1.5">
+            <Button variant="default" onClick={() => setNewRunOpen(true)}>
+              New run
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                className={cn(
+                  buttonVariants({ variant: 'ghost', size: 'icon' }),
+                  'size-[26px] border-0 bg-transparent shadow-none hover:bg-hover hover:text-fg',
+                )}
+                aria-label="Project actions"
+              >
+                <Icon name="dots" size={15} />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-[168px]">
+                <DropdownMenuItem
+                  variant="destructive"
+                  className="justify-start gap-2"
+                  onClick={() => {
+                    setDeleteProjectError('')
+                    setDeleteProjectOpen(true)
+                  }}
+                >
+                  <Icon name="trash" size={13} />
+                  Delete project
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+      </header>
 
-    <div className="pw-body">
-      {activeTab === 'overview' && (
-        <ProjectOverviewTab
-          data={data}
-          onSelectTab={selectTab}
-        />
-      )}
-      {activeTab === 'inventory' && <ProjectInventoryTab data={data} />}
-      {activeTab === 'personas' && (
-        <ProjectPersonasTab
-          data={data}
-          personaTests={personaTests}
-          onTestPersona={persona => void handleTestPersonaAuth(persona)}
-          onPersonaCreated={created => {
-            setSelectedPersonaIds(prev => prev.includes(created.id) ? prev : [...prev, created.id])
-          }}
-        />
-      )}
-      {activeTab === 'sources' && <ProjectSourcesTab data={data} />}
-      {activeTab === 'guardrails' && <ProjectGuardrailsTab data={data} />}
-    </div>
+      <div className="flex h-10 items-center gap-1.5 overflow-x-auto border-b border-line bg-panel px-3.5 [scrollbar-width:none] md:px-[22px]">
+        <nav className="flex items-center gap-0.5" role="tablist" aria-label="Project sections">
+          {PROJECT_TABS.map(tab => {
+            const isActive = activeTab === tab.id
+            const count = tabCounts[tab.id]
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                role="tab"
+                aria-selected={isActive}
+                className={cn(
+                  'inline-flex h-[26px] cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-control border-0 px-[9px] text-[12.5px] font-medium shadow-none transition-colors',
+                  isActive
+                    ? 'bg-press text-fg hover:bg-press'
+                    : 'bg-transparent text-fg-muted hover:bg-hover hover:text-fg',
+                )}
+                onClick={() => selectTab(tab.id)}
+              >
+                <span>{tab.label}</span>
+                {typeof count === 'number' && (
+                  <span className="text-[11.5px] font-normal tabular-nums text-fg-subtle">{count}</span>
+                )}
+              </button>
+            )
+          })}
+        </nav>
+      </div>
 
-    <ProjectNewRunSheet
-      open={newRunOpen}
-      onClose={() => setNewRunOpen(false)}
-      data={data}
-      selectedPersonaIds={selectedPersonaIds}
-      setSelectedPersonaIds={setSelectedPersonaIds}
-      personaTests={personaTests}
-      onTestPersona={persona => void handleTestPersonaAuth(persona)}
-    />
+      <div className="w-full max-w-[1020px] flex-1 px-3.5 pb-12 pt-4 md:px-6 md:pb-16 md:pt-[22px]">
+        {activeTab === 'overview' && (
+          <ProjectOverviewTab
+            data={data}
+            onSelectTab={selectTab}
+          />
+        )}
+        {activeTab === 'inventory' && <ProjectInventoryTab data={data} />}
+        {activeTab === 'personas' && (
+          <ProjectPersonasTab
+            data={data}
+            personaTests={personaTests}
+            onTestPersona={persona => void handleTestPersonaAuth(persona)}
+            onPersonaCreated={created => {
+              setSelectedPersonaIds(prev => prev.includes(created.id) ? prev : [...prev, created.id])
+            }}
+          />
+        )}
+        {activeTab === 'sources' && <ProjectSourcesTab data={data} />}
+        {activeTab === 'guardrails' && <ProjectGuardrailsTab data={data} />}
+      </div>
 
-    {deleteProjectOpen && (
-      <div
-        className="pw-overlay"
-        onMouseDown={e => {
-          if (e.target === e.currentTarget && !deletingProject) {
+      <ProjectNewRunSheet
+        open={newRunOpen}
+        onClose={() => setNewRunOpen(false)}
+        data={data}
+        selectedPersonaIds={selectedPersonaIds}
+        setSelectedPersonaIds={setSelectedPersonaIds}
+        personaTests={personaTests}
+        onTestPersona={persona => void handleTestPersonaAuth(persona)}
+      />
+
+      <Dialog
+        open={deleteProjectOpen}
+        closeOnEscape={!deletingProject}
+        onOpenChange={nextOpen => {
+          if (!nextOpen && !deletingProject) {
             setDeleteProjectOpen(false)
             setDeleteProjectError('')
           }
         }}
       >
-        <div
-          className="pw-modal"
-          style={{ width: 460 }}
+        <DialogContent
           role="alertdialog"
-          aria-modal="true"
-          aria-labelledby="pw-del-project-title"
+          className="flex max-h-[calc(100vh-56px)] max-w-[460px] flex-col overflow-hidden p-0"
         >
-          <div className="pw-modal-hdr">
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-              <Icon name="trash" size={15} style={{ color: 'var(--pw-bad)' }} />
-              <span id="pw-del-project-title">Delete project</span>
-            </span>
-            <button
+          <DialogHeader className="flex-row items-center justify-between gap-2.5 border-b border-line bg-raise px-4 py-2.5">
+            <DialogTitle className="inline-flex items-center gap-2 text-[13px] font-semibold text-fg">
+              <Icon name="trash" size={15} className="text-danger" />
+              <span>Delete project</span>
+            </DialogTitle>
+            <Button
               type="button"
-              className="pw-btn ghost"
-              style={{ padding: '0 6px' }}
+              variant="ghost"
+              size="icon"
+              className="size-[26px]"
               disabled={deletingProject}
-              onClick={() => { setDeleteProjectOpen(false); setDeleteProjectError('') }}
+              onClick={() => {
+                setDeleteProjectOpen(false)
+                setDeleteProjectError('')
+              }}
               aria-label="Close"
             >
               <Icon name="close" size={14} />
-            </button>
-          </div>
-          <div className="pw-modal-body">
-            <p className="dim" style={{ margin: 0, fontSize: 12.5 }}>
-              Permanently delete <strong style={{ color: 'var(--pw-fg)' }}>{project.name}</strong> and all associated data, local synced repos, and test account credentials. This cannot be undone.
-            </p>
-            <div className="pw-confirm-summary">
-              <div className="pw-confirm-goal">{project.name}</div>
-              <div className="pw-confirm-meta num">
-                <span className="pw-tag solid">
+            </Button>
+          </DialogHeader>
+          <DialogBody className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto p-4">
+            <DialogDescription className="text-[12.5px] leading-5 text-fg-muted">
+              Permanently delete <strong className="font-semibold text-fg">{project.name}</strong> and all associated data, local synced repos, and test account credentials. This cannot be undone.
+            </DialogDescription>
+            <div className="flex flex-col gap-2 rounded-lg border border-line bg-sunk px-3 py-2.5">
+              <div className="line-clamp-2 text-[13px] font-medium text-fg">{project.name}</div>
+              <div className="flex flex-wrap items-center gap-1.5 tabular-nums">
+                <Badge variant="neutral" className="bg-panel">
                   {runs.length} {runs.length === 1 ? 'run' : 'runs'}
-                </span>
-                <span className="pw-tag solid">
+                </Badge>
+                <Badge variant="neutral" className="bg-panel">
                   {totalFindings} {totalFindings === 1 ? 'finding' : 'findings'}
                   {totalConfirmed > 0 ? ` (${totalConfirmed} confirmed)` : ''}
-                </span>
+                </Badge>
                 {personas.length > 0 && (
-                  <span className="pw-tag solid">
+                  <Badge variant="neutral" className="bg-panel">
                     {personas.length} {personas.length === 1 ? 'test account' : 'test accounts'}
-                  </span>
+                  </Badge>
                 )}
                 {specs.length > 0 && (
-                  <span className="pw-tag solid">
+                  <Badge variant="neutral" className="bg-panel">
                     {specs.length} {specs.length === 1 ? 'spec' : 'specs'}
-                  </span>
+                  </Badge>
                 )}
               </div>
             </div>
             {activeRunsCount > 0 && (
-              <div className="pw-confirm-warn" role="status">
-                <Icon name="alert" size={14} />
+              <div
+                className="flex items-start gap-2 rounded-lg border border-warn-line bg-warn-soft px-3 py-2 text-[12px] leading-[17px] text-fg"
+                role="status"
+              >
+                <Icon name="alert" size={14} className="mt-0.5 flex-none text-warn" />
                 <span>
                   {activeRunsCount} {activeRunsCount === 1 ? 'run is' : 'runs are'} currently active. Confirming will stop active runs before deleting the project.
                 </span>
               </div>
             )}
-            {deleteProjectError && <p className="err" role="alert" style={{ margin: 0 }}>{deleteProjectError}</p>}
-          </div>
-          <div className="pw-modal-ftr">
-            <button
+            {deleteProjectError && (
+              <p className="m-0 text-[12px] text-danger" role="alert">
+                {deleteProjectError}
+              </p>
+            )}
+          </DialogBody>
+          <DialogFooter>
+            <Button
               type="button"
-              className="pw-btn ghost"
+              variant="ghost"
               disabled={deletingProject}
-              onClick={() => { setDeleteProjectOpen(false); setDeleteProjectError('') }}
+              onClick={() => {
+                setDeleteProjectOpen(false)
+                setDeleteProjectError('')
+              }}
             >
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
-              className="pw-btn danger-solid"
+              variant="default"
+              className="data-[slot=button]:bg-danger data-[slot=button]:text-white data-[slot=button]:hover:bg-danger hover:brightness-[1.08]"
               disabled={deletingProject}
               onClick={() => void confirmDeleteProject()}
             >
@@ -333,10 +366,10 @@ function ProjectPage() {
               {deletingProject
                 ? (activeRunsCount > 0 ? 'Stopping & deleting…' : 'Deleting…')
                 : (activeRunsCount > 0 ? 'Stop runs & delete project' : 'Delete project')}
-            </button>
-          </div>
-        </div>
-      </div>
-    )}
-  </main>
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </main>
+  )
 }

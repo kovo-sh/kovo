@@ -1,5 +1,5 @@
 import { useNavigate } from '@tanstack/react-router'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { createRun, registerPersona } from '../../actions.ts'
 import type {
   ApprovalPolicy,
@@ -16,11 +16,24 @@ import {
   maxWorkerConcurrency,
   maxWorkerMaxTurns,
 } from '../../domain.ts'
+import { cn } from '../../lib/cn.ts'
 import { FormError, useAction } from '../common.tsx'
 import { parseCurlOrHeader } from '../curl-parser.ts'
 import { Icon } from '../run/icons.tsx'
 import { approvalPolicyMeta } from '../run-state.ts'
+import { Badge } from '../ui/badge.tsx'
+import { Button } from '../ui/button.tsx'
 import { Checkbox } from '../ui/checkbox.tsx'
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '../ui/dialog.tsx'
+import { Disclosure, DisclosureContent, DisclosureTrigger } from '../ui/disclosure.tsx'
+import { Input, NativeSelect, Textarea } from '../ui/input.tsx'
 import type { PersonaTestState, ProjectLoaderData } from './types.ts'
 import { formatPersonaAuthBadge, LOGIN_URL_PLACEHOLDERS } from './types.ts'
 
@@ -69,7 +82,7 @@ interface ModePreset {
   label: string
   badge: string
   desc: string
-  badgeTone: 'solid' | 'accent' | 'warn'
+  badgeVariant: 'neutral' | 'accent' | 'warn'
 }
 
 const MODES: Record<ModeKey, ModePreset> = {
@@ -84,7 +97,7 @@ const MODES: Record<ModeKey, ModePreset> = {
     label: 'Safe Audit',
     badge: 'Read-only',
     desc: 'Surface map & passive checks. Zero writes.',
-    badgeTone: 'solid',
+    badgeVariant: 'neutral',
   },
   tier2: {
     key: 'tier2',
@@ -97,7 +110,7 @@ const MODES: Record<ModeKey, ModePreset> = {
     label: 'Core Pentest',
     badge: 'Recommended',
     desc: 'Auth, access-control & logic checks with test accounts.',
-    badgeTone: 'accent',
+    badgeVariant: 'accent',
   },
   tier3: {
     key: 'tier3',
@@ -110,7 +123,7 @@ const MODES: Record<ModeKey, ModePreset> = {
     label: 'Active Pentest',
     badge: 'Approval-gated',
     desc: 'Full active proofs with human approval.',
-    badgeTone: 'warn',
+    badgeVariant: 'warn',
   },
 }
 
@@ -118,41 +131,41 @@ const BUDGET_CHIPS = [10, 25, 50] as const
 
 function RadarAuditSvg() {
   return (
-    <svg className="pw-vcard-art" viewBox="0 0 64 40" fill="none" aria-hidden="true">
-      <rect x="1.5" y="1.5" width="61" height="37" rx="7" fill="var(--pw-sunk)" stroke="var(--pw-line-2)" strokeWidth="1.2" />
-      <circle cx="32" cy="20" r="12.5" stroke="var(--pw-line-strong)" strokeWidth="1.2" />
-      <circle cx="32" cy="20" r="7" stroke="var(--pw-line-strong)" strokeWidth="1.2" strokeDasharray="2.5 2.5" />
-      <path d="M32 20L41 12" stroke="var(--pw-accent)" strokeWidth="1.6" strokeLinecap="round" />
-      <circle cx="32" cy="20" r="2.25" fill="var(--pw-panel)" stroke="currentColor" strokeWidth="1.4" />
-      <circle cx="41" cy="12" r="2.6" fill="var(--pw-accent)" />
-      <circle cx="24" cy="25" r="1.9" fill="var(--pw-fg-3)" />
+    <svg className="block h-[38px] w-[60px] flex-none text-fg" viewBox="0 0 64 40" fill="none" aria-hidden="true">
+      <rect x="1.5" y="1.5" width="61" height="37" rx="7" fill="var(--sunk)" stroke="var(--line-2)" strokeWidth="1.2" />
+      <circle cx="32" cy="20" r="12.5" stroke="var(--line-strong)" strokeWidth="1.2" />
+      <circle cx="32" cy="20" r="7" stroke="var(--line-strong)" strokeWidth="1.2" strokeDasharray="2.5 2.5" />
+      <path d="M32 20L41 12" stroke="var(--accent)" strokeWidth="1.6" strokeLinecap="round" />
+      <circle cx="32" cy="20" r="2.25" fill="var(--panel)" stroke="currentColor" strokeWidth="1.4" />
+      <circle cx="41" cy="12" r="2.6" fill="var(--accent)" />
+      <circle cx="24" cy="25" r="1.9" fill="var(--fg-3)" />
     </svg>
   )
 }
 
 function CorePentestSvg() {
   return (
-    <svg className="pw-vcard-art" viewBox="0 0 64 40" fill="none" aria-hidden="true">
-      <rect x="1.5" y="1.5" width="61" height="37" rx="7" fill="var(--pw-sunk)" stroke="var(--pw-line-2)" strokeWidth="1.2" />
-      <circle cx="15" cy="14" r="3" fill="var(--pw-panel)" stroke="currentColor" strokeWidth="1.4" />
-      <circle cx="15" cy="26" r="3" fill="var(--pw-accent)" />
-      <path d="M18.5 14h10c3 0 4 6 7.5 6h5.5" stroke="var(--pw-fg-3)" strokeWidth="1.3" strokeLinecap="round" />
-      <path d="M18.5 26h10c3 0 4-6 7.5-6h5.5" stroke="var(--pw-accent)" strokeWidth="1.6" strokeLinecap="round" />
-      <path d="M47 10.5 53 13v5.2c0 3.7-2.4 6.5-6 7.8-3.6-1.3-6-4.1-6-7.8V13l6-2.5Z" fill="var(--pw-panel)" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" />
-      <path d="M44.6 18.2 46.3 20l3.3-3.5" stroke="var(--pw-accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    <svg className="block h-[38px] w-[60px] flex-none text-fg" viewBox="0 0 64 40" fill="none" aria-hidden="true">
+      <rect x="1.5" y="1.5" width="61" height="37" rx="7" fill="var(--sunk)" stroke="var(--line-2)" strokeWidth="1.2" />
+      <circle cx="15" cy="14" r="3" fill="var(--panel)" stroke="currentColor" strokeWidth="1.4" />
+      <circle cx="15" cy="26" r="3" fill="var(--accent)" />
+      <path d="M18.5 14h10c3 0 4 6 7.5 6h5.5" stroke="var(--fg-3)" strokeWidth="1.3" strokeLinecap="round" />
+      <path d="M18.5 26h10c3 0 4-6 7.5-6h5.5" stroke="var(--accent)" strokeWidth="1.6" strokeLinecap="round" />
+      <path d="M47 10.5 53 13v5.2c0 3.7-2.4 6.5-6 7.8-3.6-1.3-6-4.1-6-7.8V13l6-2.5Z" fill="var(--panel)" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" />
+      <path d="M44.6 18.2 46.3 20l3.3-3.5" stroke="var(--accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   )
 }
 
 function ActiveGateSvg() {
   return (
-    <svg className="pw-vcard-art" viewBox="0 0 64 40" fill="none" aria-hidden="true">
-      <rect x="1.5" y="1.5" width="61" height="37" rx="7" fill="var(--pw-sunk)" stroke="var(--pw-line-2)" strokeWidth="1.2" />
-      <path d="M10 20h14M40 20h14" stroke="var(--pw-line-strong)" strokeWidth="1.4" strokeLinecap="round" />
+    <svg className="block h-[38px] w-[60px] flex-none text-fg" viewBox="0 0 64 40" fill="none" aria-hidden="true">
+      <rect x="1.5" y="1.5" width="61" height="37" rx="7" fill="var(--sunk)" stroke="var(--line-2)" strokeWidth="1.2" />
+      <path d="M10 20h14M40 20h14" stroke="var(--line-strong)" strokeWidth="1.4" strokeLinecap="round" />
       <path d="M14 14l4 6-4 6" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-      <rect x="24.5" y="11" width="15" height="18" rx="4" fill="var(--pw-panel)" stroke="var(--pw-accent)" strokeWidth="1.5" />
-      <path d="M29 20.2 31.2 22.4 35.4 17.8" stroke="var(--pw-accent)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="M49 16l4.5 4-4.5 4" stroke="var(--pw-accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      <rect x="24.5" y="11" width="15" height="18" rx="4" fill="var(--panel)" stroke="var(--accent)" strokeWidth="1.5" />
+      <path d="M29 20.2 31.2 22.4 35.4 17.8" stroke="var(--accent)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M49 16l4.5 4-4.5 4" stroke="var(--accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   )
 }
@@ -201,17 +214,7 @@ export function ProjectNewRunSheet({
 
   const runAction = useAction()
   const personaAction = useAction()
-
-  useEffect(() => {
-    if (!open) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !runAction.pending && !personaAction.pending) onClose()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [open, onClose, runAction.pending, personaAction.pending])
-
-  if (!open) return null
+  const busy = runAction.pending || personaAction.pending
 
   function applyMode(next: ModeKey) {
     const preset = MODES[next]
@@ -322,373 +325,510 @@ export function ProjectNewRunSheet({
   ].join(' · ')
 
   return (
-    <div
-      className="pw-overlay"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Start a run"
-      onMouseDown={e => {
-        if (e.target === e.currentTarget && !runAction.pending && !personaAction.pending) onClose()
+    <Dialog
+      open={open}
+      closeOnEscape={!busy}
+      onOpenChange={nextOpen => {
+        if (!nextOpen && !busy) onClose()
       }}
     >
-      <form className="pw-modal" onSubmit={handleSubmit}>
-        <div className="pw-modal-hdr">
-          <span>New run · {project.name}</span>
-          <button
-            type="button"
-            className="pw-btn ghost"
-            style={{ padding: '0 6px' }}
-            onClick={onClose}
-            disabled={runAction.pending || personaAction.pending}
-            aria-label="Close"
-          >
-            <Icon name="close" size={14} />
-          </button>
-        </div>
+      <DialogContent className="flex max-h-[calc(100vh-56px)] max-w-[680px] flex-col overflow-hidden p-0">
+        <form className="flex min-h-0 flex-1 flex-col" onSubmit={handleSubmit}>
+          <DialogHeader className="flex-row items-center justify-between gap-2.5 border-b border-line bg-raise px-4 py-2.5">
+            <DialogTitle className="text-[13px] font-semibold text-fg">
+              New run · {project.name}
+            </DialogTitle>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="size-[26px]"
+              onClick={onClose}
+              disabled={busy}
+              aria-label="Close"
+            >
+              <Icon name="close" size={14} />
+            </Button>
+          </DialogHeader>
 
-        <div className="pw-modal-body">
-          <div className="pw-vcard-grid-3" role="radiogroup" aria-label="Assessment mode">
-            {(['tier1', 'tier2', 'tier3'] as const).map(k => {
-              const m = MODES[k]
-              const active = mode === k
-              return (
-                <button
-                  key={k}
-                  type="button"
-                  role="radio"
-                  aria-checked={active}
-                  className={`pw-vcard${active ? ' on' : ''}`}
-                  onClick={() => applyMode(k)}
-                >
-                  <div className="pw-vcard-top">
-                    <ModeIllustration mode={k} />
-                    <span className={`pw-tag ${m.badgeTone}`}>{m.badge}</span>
-                  </div>
-                  <div className="pw-vcard-copy">
-                    <strong>{m.label}</strong>
-                    <span>{m.desc}</span>
-                  </div>
-                </button>
-              )
-            })}
-          </div>
+          <DialogBody className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto p-4">
+            <div className="grid grid-cols-1 gap-[9px] sm:grid-cols-3" role="radiogroup" aria-label="Assessment mode">
+              {(['tier1', 'tier2', 'tier3'] as const).map(k => {
+                const m = MODES[k]
+                const active = mode === k
+                return (
+                  <button
+                    key={k}
+                    type="button"
+                    role="radio"
+                    aria-checked={active}
+                    className={cn(
+                      'flex h-auto w-full cursor-pointer flex-col gap-[9px] whitespace-normal rounded-[9px] border px-[13px] py-3 text-left shadow-none transition-colors',
+                      active
+                        ? 'border-accent-line bg-accent-soft text-fg hover:bg-accent-soft'
+                        : 'border-line-2 bg-panel text-fg hover:border-line-strong hover:bg-hover',
+                    )}
+                    onClick={() => applyMode(k)}
+                  >
+                    <div className="flex w-full items-start justify-between gap-2">
+                      <ModeIllustration mode={k} />
+                      <Badge
+                        variant={m.badgeVariant}
+                        className={m.badgeVariant === 'neutral' ? 'bg-sunk' : undefined}
+                      >
+                        {m.badge}
+                      </Badge>
+                    </div>
+                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                      <strong className="text-[13px] font-semibold leading-[18px] text-fg">{m.label}</strong>
+                      <span className="text-[11.5px] font-normal leading-4 text-fg-muted">{m.desc}</span>
+                    </div>
+                  </button>
+                )
+              })}
+            </div>
 
-          {tier >= 2 && (
-            <div className="pw-section-group">
-              <div className="pw-section-box-h">
-                <span className="pw-section-label">
-                  Test accounts
-                  <span className="pw-tag solid num">{selectedPersonaIds.length}/{personas.length}</span>
-                </span>
-                <button type="button" className="pw-btn" onClick={() => setInlinePersonaOpen(v => !v)}>
-                  {inlinePersonaOpen ? 'Hide form' : '+ Quick add account'}
-                </button>
+            {tier >= 2 && (
+              <div className="flex flex-col gap-2.5 border-t border-line pt-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-fg">
+                    Test accounts
+                    <Badge variant="neutral" className="bg-sunk tabular-nums">
+                      {selectedPersonaIds.length}/{personas.length}
+                    </Badge>
+                  </span>
+                  <Button type="button" variant="outline" onClick={() => setInlinePersonaOpen(v => !v)}>
+                    {inlinePersonaOpen ? 'Hide form' : '+ Quick add account'}
+                  </Button>
+                </div>
+                {personas.length > 0 ? (
+                  <div className="flex flex-wrap gap-1.5" role="group" aria-label="Select test accounts for run">
+                    {personas.map(persona => {
+                      const selected = selectedPersonaIds.includes(persona.id)
+                      const test = personaTests[persona.id]
+                      return (
+                        <button
+                          key={persona.id}
+                          type="button"
+                          aria-pressed={selected}
+                          className={cn(
+                            'inline-flex h-auto min-h-[28px] cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-full border px-2.5 py-1 text-[12px] font-medium shadow-none transition-colors',
+                            selected
+                              ? 'border-accent-line bg-accent-soft text-fg hover:bg-accent-soft'
+                              : 'border-line-2 bg-sunk text-fg-muted hover:bg-hover hover:text-fg',
+                          )}
+                          onClick={() => togglePersona(persona.id)}
+                          title={`${persona.handle} · ${persona.roleLabel} (${formatPersonaAuthBadge(persona)})${test ? ` — ${test.message}` : ''}`}
+                        >
+                          <span
+                            className={cn(
+                              'inline-grid size-[13px] flex-none place-items-center rounded-full border text-[9px] font-bold',
+                              selected
+                                ? 'border-accent bg-accent text-accent-fg'
+                                : 'border-line-strong text-transparent',
+                            )}
+                            aria-hidden="true"
+                          >
+                            ✓
+                          </span>
+                          <span className="font-mono text-[12px]">{persona.handle}</span>
+                          <span className="font-normal text-fg-subtle">{persona.roleLabel}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                ) : (
+                  <span className="text-[12px] text-fg-subtle">
+                    No test accounts configured yet — add User A &amp; User B to test cross-user isolation.
+                  </span>
+                )}
+
+                {inlinePersonaOpen && (
+                  <div className="grid gap-[9px] border-t border-line pt-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <strong className="text-[12px] font-semibold text-fg">Quick-add test account</strong>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <Button type="button" variant="ghost" onClick={() => prefillPair('user_a')}>
+                          Preset User A
+                        </Button>
+                        <Button type="button" variant="ghost" onClick={() => prefillPair('user_b')}>
+                          Preset User B
+                        </Button>
+                      </div>
+                    </div>
+                    {authKind !== 'login' && (
+                      <div className="grid gap-1">
+                        <div className="flex items-center gap-1.5">
+                          <Input
+                            className="flex-1 font-mono text-[12px]"
+                            value={curlPaste}
+                            onChange={e => setCurlPaste(e.target.value)}
+                            onPaste={e => {
+                              const pasted = e.clipboardData.getData('text')
+                              if (pasted) {
+                                e.preventDefault()
+                                applyCurlParse(pasted)
+                              }
+                            }}
+                            placeholder="Paste cURL or Cookie:/Authorization: header"
+                          />
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => applyCurlParse(curlPaste)}
+                            disabled={!curlPaste.trim()}
+                          >
+                            Parse
+                          </Button>
+                        </div>
+                        {curlNote && <span className="text-[11.5px] text-fg-subtle">{curlNote}</span>}
+                      </div>
+                    )}
+                    <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
+                      <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                        Handle
+                        <Input
+                          className="w-full font-mono text-[12px]"
+                          value={personaHandle}
+                          onChange={e => setPersonaHandle(e.target.value)}
+                          placeholder="user_a"
+                        />
+                      </label>
+                      <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                        Role
+                        <Input
+                          className="w-full"
+                          value={personaRole}
+                          onChange={e => setPersonaRole(e.target.value)}
+                          placeholder="Standard user"
+                        />
+                      </label>
+                    </div>
+                    <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                      Auth kind
+                      <NativeSelect
+                        className="w-full"
+                        value={authKind}
+                        onChange={e => setAuthKind(e.target.value as PersonaAuthKind)}
+                      >
+                        <option value="login">Email + Password (auto-login &amp; refresh)</option>
+                        <option value="cookie">Session cookie</option>
+                        <option value="bearer">Bearer token</option>
+                        <option value="header">Custom header</option>
+                      </NativeSelect>
+                    </label>
+                    {authKind === 'login' ? (
+                      <>
+                        <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
+                          <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                            Email
+                            <Input
+                              className="w-full"
+                              type="email"
+                              value={loginEmail}
+                              onChange={e => setLoginEmail(e.target.value)}
+                              placeholder="test-user-a@example.com"
+                              autoComplete="off"
+                            />
+                          </label>
+                          <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                            Password
+                            <Input
+                              className="w-full"
+                              type="password"
+                              value={personaSecret}
+                              onChange={e => setPersonaSecret(e.target.value)}
+                              placeholder="Stored privately on your machine"
+                              autoComplete="off"
+                            />
+                          </label>
+                        </div>
+                        <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
+                          <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                            Auth method
+                            <NativeSelect
+                              className="w-full"
+                              value={loginAdapter}
+                              onChange={e => setLoginAdapter(e.target.value as PersonaLoginAdapter)}
+                            >
+                              <option value="auto">Auto-detect</option>
+                              <option value="clerk">Clerk (auto-refresh)</option>
+                              <option value="json">JSON API / Better Auth</option>
+                              <option value="supabase">Supabase Auth</option>
+                              <option value="form">Login Form (Browser)</option>
+                            </NativeSelect>
+                          </label>
+                          <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                            Login URL (optional)
+                            <Input
+                              className="w-full"
+                              type="url"
+                              value={loginUrl}
+                              onChange={e => setLoginUrl(e.target.value)}
+                              placeholder={LOGIN_URL_PLACEHOLDERS[loginAdapter]}
+                              autoComplete="off"
+                            />
+                          </label>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
+                        {authKind === 'header' && (
+                          <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                            Header name
+                            <Input
+                              className="w-full font-mono text-[12px]"
+                              value={personaHeaderName}
+                              onChange={e => setPersonaHeaderName(e.target.value)}
+                              placeholder="X-Api-Key"
+                            />
+                          </label>
+                        )}
+                        <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                          Secret (masked)
+                          <Input
+                            className="w-full"
+                            type="password"
+                            value={personaSecret}
+                            onChange={e => setPersonaSecret(e.target.value)}
+                            autoComplete="off"
+                            placeholder="Never echoed after save"
+                          />
+                        </label>
+                      </div>
+                    )}
+                    <FormError error={personaAction.error} />
+                    <div className="flex justify-end gap-1.5">
+                      <Button type="button" variant="ghost" onClick={() => setInlinePersonaOpen(false)}>
+                        Cancel
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        disabled={
+                          personaAction.pending ||
+                          !personaHandle.trim() ||
+                          !personaRole.trim() ||
+                          !personaSecret ||
+                          (authKind === 'login' ? !loginEmail.trim() : !personaSecret.trim())
+                        }
+                        onClick={saveInlinePersona}
+                      >
+                        Save &amp; select
+                      </Button>
+                    </div>
+                  </div>
+                )}
               </div>
-              {personas.length > 0 ? (
-                <div className="pw-pill-wrap" role="group" aria-label="Select test accounts for run">
-                  {personas.map(persona => {
-                    const selected = selectedPersonaIds.includes(persona.id)
-                    const test = personaTests[persona.id]
+            )}
+
+            {tier === 3 && (
+              <div className="flex flex-col gap-2.5 border-t border-line pt-3" role="radiogroup" aria-label="Approval policy">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-fg">
+                    Approval policy
+                  </span>
+                  <span className="text-[11.5px] text-fg-subtle">Switchable mid-run</span>
+                </div>
+                <div className="grid grid-cols-1 gap-[7px] sm:grid-cols-3">
+                  {approvalPolicies.map(policy => {
+                    const meta = approvalPolicyMeta[policy]
+                    const copy = APPROVAL_POLICY_COPY[policy]
+                    const active = approvalPolicy === policy
                     return (
                       <button
-                        key={persona.id}
+                        key={policy}
                         type="button"
-                        aria-pressed={selected}
-                        className={`pw-persona-pill${selected ? ' on' : ''}`}
-                        onClick={() => togglePersona(persona.id)}
-                        title={`${persona.handle} · ${persona.roleLabel} (${formatPersonaAuthBadge(persona)})${test ? ` — ${test.message}` : ''}`}
+                        role="radio"
+                        aria-checked={active}
+                        className={cn(
+                          'flex h-auto w-full cursor-pointer flex-col gap-[3px] whitespace-normal rounded-[7px] border px-2.5 py-2 text-left shadow-none transition-colors',
+                          active
+                            ? 'border-accent-line bg-accent-soft text-fg hover:bg-accent-soft'
+                            : 'border-line bg-panel text-fg hover:bg-hover',
+                        )}
+                        onClick={() => setApprovalPolicy(policy)}
+                        title={meta.summary}
                       >
-                        <span className="pcheck" aria-hidden="true">✓</span>
-                        <span className="mono">{persona.handle}</span>
-                        <span className="muted" style={{ fontWeight: 400 }}>{persona.roleLabel}</span>
+                        <span className="flex w-full items-center justify-between gap-1.5">
+                          <b className="text-[12.5px] font-semibold text-fg">{copy.label}</b>
+                          {policy === 'auto_review' && <Badge variant="ok">Default</Badge>}
+                          {policy === 'strict' && <Badge variant="neutral" className="bg-sunk">Manual</Badge>}
+                          {policy === 'yolo' && <Badge variant="warn">Auto</Badge>}
+                        </span>
+                        <small className="text-[11.5px] font-normal leading-4 text-fg-subtle">{copy.desc}</small>
                       </button>
                     )
                   })}
                 </div>
-              ) : (
-                <span className="muted" style={{ fontSize: 12 }}>
-                  No test accounts configured yet — add User A &amp; User B to test cross-user isolation.
-                </span>
-              )}
-
-              {inlinePersonaOpen && (
-                <div style={{ borderTop: '1px solid var(--pw-line)', paddingTop: 10, display: 'grid', gap: 9 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-                    <strong style={{ fontSize: 12 }}>Quick-add test account</strong>
-                    <div className="pw-sec-actions">
-                      <button type="button" className="pw-btn ghost" onClick={() => prefillPair('user_a')}>Preset User A</button>
-                      <button type="button" className="pw-btn ghost" onClick={() => prefillPair('user_b')}>Preset User B</button>
-                    </div>
-                  </div>
-                  {authKind !== 'login' && (
-                    <div style={{ display: 'grid', gap: 4 }}>
-                      <div style={{ display: 'flex', gap: 6 }}>
-                        <input
-                          className="pw-in mono"
-                          value={curlPaste}
-                          onChange={e => setCurlPaste(e.target.value)}
-                          onPaste={e => {
-                            const pasted = e.clipboardData.getData('text')
-                            if (pasted) { e.preventDefault(); applyCurlParse(pasted) }
-                          }}
-                          placeholder="Paste cURL or Cookie:/Authorization: header"
-                        />
-                        <button type="button" className="pw-btn" onClick={() => applyCurlParse(curlPaste)} disabled={!curlPaste.trim()}>Parse</button>
-                      </div>
-                      {curlNote && <span className="muted" style={{ fontSize: 11.5 }}>{curlNote}</span>}
-                    </div>
-                  )}
-                  <div className="pw-grid-2">
-                    <label className="pw-fld">Handle
-                      <input className="pw-in mono" value={personaHandle} onChange={e => setPersonaHandle(e.target.value)} placeholder="user_a" />
-                    </label>
-                    <label className="pw-fld">Role
-                      <input className="pw-in" value={personaRole} onChange={e => setPersonaRole(e.target.value)} placeholder="Standard user" />
-                    </label>
-                  </div>
-                  <label className="pw-fld">Auth kind
-                    <select className="pw-select" value={authKind} onChange={e => setAuthKind(e.target.value as PersonaAuthKind)}>
-                      <option value="login">Email + Password (auto-login &amp; refresh)</option>
-                      <option value="cookie">Session cookie</option>
-                      <option value="bearer">Bearer token</option>
-                      <option value="header">Custom header</option>
-                    </select>
-                  </label>
-                  {authKind === 'login' ? (
-                    <>
-                      <div className="pw-grid-2">
-                        <label className="pw-fld">Email
-                          <input className="pw-in" type="email" value={loginEmail} onChange={e => setLoginEmail(e.target.value)} placeholder="test-user-a@example.com" autoComplete="off" />
-                        </label>
-                        <label className="pw-fld">Password
-                          <input className="pw-in" type="password" value={personaSecret} onChange={e => setPersonaSecret(e.target.value)} placeholder="Stored privately on your machine" autoComplete="off" />
-                        </label>
-                      </div>
-                      <div className="pw-grid-2">
-                        <label className="pw-fld">Auth method
-                          <select className="pw-select" value={loginAdapter} onChange={e => setLoginAdapter(e.target.value as PersonaLoginAdapter)}>
-                            <option value="auto">Auto-detect</option>
-                            <option value="clerk">Clerk (auto-refresh)</option>
-                            <option value="json">JSON API / Better Auth</option>
-                            <option value="supabase">Supabase Auth</option>
-                            <option value="form">Login Form (Browser)</option>
-                          </select>
-                        </label>
-                        <label className="pw-fld">Login URL (optional)
-                          <input className="pw-in" type="url" value={loginUrl} onChange={e => setLoginUrl(e.target.value)} placeholder={LOGIN_URL_PLACEHOLDERS[loginAdapter]} autoComplete="off" />
-                        </label>
-                      </div>
-                    </>
-                  ) : (
-                    <div className="pw-grid-2">
-                      {authKind === 'header' && (
-                        <label className="pw-fld">Header name
-                          <input className="pw-in mono" value={personaHeaderName} onChange={e => setPersonaHeaderName(e.target.value)} placeholder="X-Api-Key" />
-                        </label>
-                      )}
-                      <label className="pw-fld">Secret (masked)
-                        <input className="pw-in" type="password" value={personaSecret} onChange={e => setPersonaSecret(e.target.value)} autoComplete="off" placeholder="Never echoed after save" />
-                      </label>
-                    </div>
-                  )}
-                  <FormError error={personaAction.error} />
-                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6 }}>
-                    <button type="button" className="pw-btn ghost" onClick={() => setInlinePersonaOpen(false)}>Cancel</button>
-                    <button
-                      type="button"
-                      className="pw-btn"
-                      disabled={
-                        personaAction.pending ||
-                        !personaHandle.trim() ||
-                        !personaRole.trim() ||
-                        !personaSecret ||
-                        (authKind === 'login' ? !loginEmail.trim() : !personaSecret.trim())
-                      }
-                      onClick={saveInlinePersona}
-                    >
-                      Save &amp; select
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          {tier === 3 && (
-            <div className="pw-section-group" role="radiogroup" aria-label="Approval policy">
-              <div className="pw-section-box-h">
-                <span className="pw-section-label">Approval policy</span>
-                <span className="muted" style={{ fontSize: 11.5 }}>Switchable mid-run</span>
               </div>
-              <div className="pw-policy-grid">
-                {approvalPolicies.map(policy => {
-                  const meta = approvalPolicyMeta[policy]
-                  const copy = APPROVAL_POLICY_COPY[policy]
-                  const active = approvalPolicy === policy
+            )}
+
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-2.5">
+              <div>
+                <div className="text-[12.5px] font-semibold text-fg">Budget cap</div>
+                <div className="text-[11.5px] text-fg-subtle">Hard stop when spend reaches limit</div>
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {BUDGET_CHIPS.map(v => {
+                  const on = budgetUsd === v
                   return (
                     <button
-                      key={policy}
+                      key={v}
                       type="button"
-                      role="radio"
-                      aria-checked={active}
-                      className={`pw-opt${active ? ' on' : ''}`}
-                      onClick={() => setApprovalPolicy(policy)}
-                      title={meta.summary}
+                      className={cn(
+                        'h-6 cursor-pointer rounded-[5px] border px-2 text-[11.5px] font-medium tabular-nums shadow-none transition-colors',
+                        on
+                          ? 'border-accent-line bg-accent-soft text-accent hover:bg-accent-soft'
+                          : 'border-line-2 bg-panel text-fg-muted hover:bg-hover hover:text-fg',
+                      )}
+                      onClick={() => setBudgetUsd(v)}
                     >
-                      <span className="pw-opt-top">
-                        <b>{copy.label}</b>
-                        {policy === 'auto_review' && <span className="pw-tag ok">Default</span>}
-                        {policy === 'strict' && <span className="pw-tag solid">Manual</span>}
-                        {policy === 'yolo' && <span className="pw-tag warn">Auto</span>}
-                      </span>
-                      <small>{copy.desc}</small>
+                      ${v}
                     </button>
                   )
                 })}
-              </div>
-            </div>
-          )}
-
-          <div className="pw-budget-row is-flat">
-            <div>
-              <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--pw-fg)' }}>Budget cap</div>
-              <div className="muted" style={{ fontSize: 11.5 }}>Hard stop when spend reaches limit</div>
-            </div>
-            <div className="pw-budget-ctrl">
-              {BUDGET_CHIPS.map(v => (
-                <button
-                  key={v}
-                  type="button"
-                  className={`pw-chip num${budgetUsd === v ? ' on' : ''}`}
-                  onClick={() => setBudgetUsd(v)}
-                >
-                  ${v}
-                </button>
-              ))}
-              <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--pw-fg-2)' }}>
-                <span>$</span>
-                <input
-                  className="pw-budget-in"
-                  name="budgetUsd"
-                  aria-label="USD Spend Cap"
-                  type="number"
-                  min={0.1}
-                  max={500}
-                  step="any"
-                  required
-                  value={budgetUsd}
-                  onChange={e => setBudgetUsd(Number(e.target.value))}
-                />
-              </label>
-            </div>
-          </div>
-
-          <details className="pw-disclosure" style={{ marginTop: 0 }}>
-            <summary>
-              Advanced configuration <span className="muted num">({SCAN_DEPTH_LABELS[tier].short} · {maxRps} req/s · {concurrency} workers · {maxTurns} turns)</span>
-            </summary>
-            <div className="pw-disclosure-body">
-              <label className="pw-fld">Scan depth
-                <select
-                  className="pw-select"
-                  name="capabilityTier"
-                  value={tier}
-                  onChange={e => setTier(Number(e.target.value) as CapabilityTier)}
-                >
-                  <option value={0}>{SCAN_DEPTH_LABELS[0].option}</option>
-                  <option value={1}>{SCAN_DEPTH_LABELS[1].option}</option>
-                  <option value={2}>{SCAN_DEPTH_LABELS[2].option}</option>
-                  <option value={3}>{SCAN_DEPTH_LABELS[3].option}</option>
-                </select>
-              </label>
-              <label className="pw-fld">Run goal
-                <textarea
-                  className="pw-textarea"
-                  name="goal"
-                  rows={2}
-                  maxLength={8000}
-                  value={goal}
-                  onChange={e => setGoal(e.target.value)}
-                  placeholder={MODES[mode].goal}
-                />
-              </label>
-              <div className="pw-grid-3">
-                <label className="pw-fld">Rate (req/s)
-                  <input
-                    className="pw-in num"
-                    name="maxRpsPerOrigin"
+                <label className="inline-flex items-center gap-1 text-[12px] text-fg-muted">
+                  <span>$</span>
+                  <Input
+                    className="h-[26px]! w-[84px] tabular-nums"
+                    name="budgetUsd"
+                    aria-label="USD Spend Cap"
                     type="number"
-                    min={1}
-                    max={maxRpsPerOriginCeiling}
-                    step={1}
+                    min={0.1}
+                    max={500}
+                    step="any"
                     required
-                    value={maxRps}
-                    onChange={e => setMaxRps(Number(e.target.value))}
-                  />
-                </label>
-                <label className="pw-fld">Workers
-                  <input
-                    className="pw-in num"
-                    name="workerConcurrency"
-                    type="number"
-                    min={1}
-                    max={maxWorkerConcurrency}
-                    step={1}
-                    required
-                    value={concurrency}
-                    onChange={e => setConcurrency(Number(e.target.value))}
-                  />
-                </label>
-                <label className="pw-fld">Max turns
-                  <input
-                    className="pw-in num"
-                    name="workerMaxTurns"
-                    type="number"
-                    min={1}
-                    max={maxWorkerMaxTurns}
-                    step={1}
-                    required
-                    value={maxTurns}
-                    onChange={e => setMaxTurns(Number(e.target.value))}
+                    value={budgetUsd}
+                    onChange={e => setBudgetUsd(Number(e.target.value))}
                   />
                 </label>
               </div>
-              <label className="pw-chk">
-                <Checkbox
-                  checked={unlimitedReqs}
-                  aria-label="Unlimited max requests"
-                  onCheckedChange={checked => setUnlimitedReqs(Boolean(checked))}
-                />
-                <span>Unlimited requests (recommended)</span>
-              </label>
-              {!unlimitedReqs && (
-                <label className="pw-fld" title="Maximum HTTP requests sent through the request guardrail">Max requests
-                  <input
-                    className="pw-in num"
-                    name="budgetRequests"
-                    type="number"
-                    min={1}
-                    max={maxBudgetRequests}
-                    step={1}
-                    value={budgetReqs}
-                    onChange={e => setBudgetReqs(Number(e.target.value))}
+            </div>
+
+            <Disclosure className="border-t border-line pt-2.5">
+              <DisclosureTrigger className="h-auto bg-transparent px-0 py-1 text-fg-muted shadow-none hover:bg-transparent hover:text-fg">
+                <span>
+                  Advanced configuration{' '}
+                  <span className="font-normal tabular-nums text-fg-subtle">
+                    ({SCAN_DEPTH_LABELS[tier].short} · {maxRps} req/s · {concurrency} workers · {maxTurns} turns)
+                  </span>
+                </span>
+              </DisclosureTrigger>
+              <DisclosureContent className="grid gap-2.5 pt-2.5">
+                <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                  Scan depth
+                  <NativeSelect
+                    className="w-full"
+                    name="capabilityTier"
+                    value={tier}
+                    onChange={e => setTier(Number(e.target.value) as CapabilityTier)}
+                  >
+                    <option value={0}>{SCAN_DEPTH_LABELS[0].option}</option>
+                    <option value={1}>{SCAN_DEPTH_LABELS[1].option}</option>
+                    <option value={2}>{SCAN_DEPTH_LABELS[2].option}</option>
+                    <option value={3}>{SCAN_DEPTH_LABELS[3].option}</option>
+                  </NativeSelect>
+                </label>
+                <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                  Run goal
+                  <Textarea
+                    className="w-full"
+                    name="goal"
+                    rows={2}
+                    maxLength={8000}
+                    value={goal}
+                    onChange={e => setGoal(e.target.value)}
+                    placeholder={MODES[mode].goal}
                   />
                 </label>
-              )}
-            </div>
-          </details>
+                <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-3">
+                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                    Rate (req/s)
+                    <Input
+                      className="w-full tabular-nums"
+                      name="maxRpsPerOrigin"
+                      type="number"
+                      min={1}
+                      max={maxRpsPerOriginCeiling}
+                      step={1}
+                      required
+                      value={maxRps}
+                      onChange={e => setMaxRps(Number(e.target.value))}
+                    />
+                  </label>
+                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                    Workers
+                    <Input
+                      className="w-full tabular-nums"
+                      name="workerConcurrency"
+                      type="number"
+                      min={1}
+                      max={maxWorkerConcurrency}
+                      step={1}
+                      required
+                      value={concurrency}
+                      onChange={e => setConcurrency(Number(e.target.value))}
+                    />
+                  </label>
+                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                    Max turns
+                    <Input
+                      className="w-full tabular-nums"
+                      name="workerMaxTurns"
+                      type="number"
+                      min={1}
+                      max={maxWorkerMaxTurns}
+                      step={1}
+                      required
+                      value={maxTurns}
+                      onChange={e => setMaxTurns(Number(e.target.value))}
+                    />
+                  </label>
+                </div>
+                <label className="inline-flex cursor-pointer select-none items-center gap-[7px] text-[12.5px] font-normal text-fg-muted">
+                  <Checkbox
+                    checked={unlimitedReqs}
+                    aria-label="Unlimited max requests"
+                    onCheckedChange={checked => setUnlimitedReqs(Boolean(checked))}
+                  />
+                  <span>Unlimited requests (recommended)</span>
+                </label>
+                {!unlimitedReqs && (
+                  <label
+                    className="grid gap-1 text-[12px] font-medium text-fg-muted"
+                    title="Maximum HTTP requests sent through the request guardrail"
+                  >
+                    Max requests
+                    <Input
+                      className="w-full tabular-nums"
+                      name="budgetRequests"
+                      type="number"
+                      min={1}
+                      max={maxBudgetRequests}
+                      step={1}
+                      value={budgetReqs}
+                      onChange={e => setBudgetReqs(Number(e.target.value))}
+                    />
+                  </label>
+                )}
+              </DisclosureContent>
+            </Disclosure>
 
-          <FormError error={runAction.error} />
-        </div>
+            <FormError error={runAction.error} />
+          </DialogBody>
 
-        <div className="pw-modal-ftr">
-          <span className="hint mono num">{footerSummary}</span>
-          <button type="button" className="pw-btn ghost" onClick={onClose}>Cancel</button>
-          <button type="submit" className="pw-btn primary" disabled={runAction.pending}>
-            {runAction.pending ? 'Starting…' : 'Start run'}
-          </button>
-        </div>
-      </form>
-    </div>
+          <DialogFooter className="flex-wrap">
+            <span className="mr-auto font-mono text-[12px] tabular-nums text-fg-subtle">{footerSummary}</span>
+            <Button type="button" variant="ghost" disabled={busy} onClick={onClose}>
+              Cancel
+            </Button>
+            <Button type="submit" variant="default" disabled={runAction.pending}>
+              {runAction.pending ? 'Starting…' : 'Start run'}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
   )
 }
