@@ -1,13 +1,13 @@
 # Multi-Hop Chain Playbook
-Tags: multihop, multi-hop, chaining, chain, capability-ledger, composite-receipt, hop-checkpoint, derived-custody, async-pivot, hardened-twin
-Summary: Verify 3-6 hop CompositeProofReceipt chains via ctx.seal_capability, ctx.hmac_sign/jwt_sign, ctx.await_async, and ctx.prove_composite.
+Tags: multihop, hop-checkpoint, composite-receipt, derived-custody, async-pivot, hardened-twin
+Summary: Verify 3-6 hop CompositeProofReceipt chains via seal_capability, hmac_sign/jwt_sign, await_async, prove_composite.
 
 ## 1. Quick-Reference Contract
-1. **Origin/Tokens:** ONE low-priv/derived probe persona (NEVER `owner`/`admin`); minted token: `kind:"bearer_token"`, `{capability:{handle,target:"bearer"}}`, OMIT `as`.
-2. **One-Script:** Stage 1->2->3->4->`ctx.prove_composite` in ONE script; NEVER stop at leaks, job creation, cache prime, or link/token stubs.
+1. **Origin:** ONE low-priv/derived persona (NEVER `owner`/`admin`); minted: `kind:"bearer_token"`, `{capability:{handle,target:"bearer"}}`, OMIT `as`.
+2. **Composite:** Stage 1->2->3->4->`ctx.prove_composite` in ONE script; NEVER stop at job creation, cache prime, or link/token stubs, and NEVER use standalone `prove_race_burst`/`prove_access_boundary`/`prove_persisted_mutation` after setup hops.
 3. **Helpers:** `ctx.seal_capability`, `ctx.hmac_sign`/`ctx.jwt_sign`, `ctx.await_async`, `ctx.prove_race_burst`.
-4. **Control/Econ:** Denied `role:"control"` BEFORE Stage 1 (`state_transition_binding`); `economic_conservation`: baseline BEFORE & final AFTER (`baselineReadbackExchangeId`/`finalReadbackExchangeId`).
-5. **DAG/Twins:** All `hops[]` reach `terminalHopId` via `causalEdges[]` (no orphan hops); `fresh_clean_replay`+`ctx.result`; blocked->`invariant_enforced_hardened`.
+4. **Control/Econ:** Denied `role:"control"` BEFORE Stage 1 (`state_transition_binding`); `economic_conservation`: baseline+final (`baselineReadbackExchangeId`/`finalReadbackExchangeId`).
+5. **DAG/Twins:** Declare EVERY executed causal hop (Hop 1->terminal) in `hops[]`->`terminalHopId` via `causalEdges[]` (no orphan hops); `fresh_clean_replay`+`ctx.result`; blocked->`invariant_enforced_hardened`.
 
 ## 2. Working from a Pre-Hydrated `hopCheckpoint`
 Your `AssignmentBrief` may include a bounded (`<= 2 KB`) `hopCheckpoint` object:
@@ -50,6 +50,9 @@ For asynchronous cross-service hops (document/PDF renderers, webhook delivery lo
 
 ## 6. Submitting a `CompositeProofReceipt` DAG (`ctx.prove_composite`)
 A multi-hop finding confirms ONLY when `ctx.prove_composite` verifies a complete `CompositeProofReceipt` DAG strictly over host-signed transcripts:
+
+- **Mandatory `ctx.prove_composite` Rule (No Standalone Terminal Helpers After Setup Hops):** ALWAYS finalize with `ctx.prove_composite` — **NEVER** call standalone `ctx.prove_race_burst`, `ctx.prove_access_boundary`, or `ctx.prove_persisted_mutation` as your final proof — whenever your verification script executes prerequisite setup hops (e.g., disclosure/extraction, token/session acquisition, parser differential, cache prime, state rebind, or async job polling) before the terminal impact. Even when the terminal hop is a concurrent race burst, execute the race burst inside the chain and wrap ALL prerequisite setup hops plus the terminal race hop inside `ctx.prove_composite` (calling standalone `prove_race_burst` records `hopCount = 0` and fails multi-hop chain confirmation).
+- **Complete Causal Hop Declaration Rule (Hop 1 Through Terminal):** Declare **EVERY** causal hop your verification script executed — from Hop 1 (entry disclosure/extraction) through every intermediate pivot, token/invite resolve, parser differential, cache prime, state rebind, signing, or async-poll hop to the terminal hop — in `prove_composite.hops[]` and connect them end-to-end with `causalEdges[]`. Omitting Hop 1 or any intermediate setup hop yields an incomplete receipt even when all hops executed in the transcript.
 
 ```ts
 // Mode-A defensive verification shape (all IDs reference host-signed transcript records)

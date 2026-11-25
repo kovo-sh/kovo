@@ -1,0 +1,218 @@
+/**
+ * v8 Queue #36 Two-Side Confirmation Prompt/Playbook Closure & Residual v7-Compat Pruning Tests.
+ *
+ * Verifies (Docker-free, 100% generic, zero benchmark contamination):
+ *  1. Rule 1 (no standalone terminal helper after setup hops): `multiHopDirectives`,
+ *     `guardianVerifyPromptHint`, `guardianVerifyHelperGuidance`,
+ *     `GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN`, `GUARDIAN_VERIFY_TOOL_DESCRIPTION`,
+ *     `workerSessionInstructions`, and `src/skills/multihop-chains.md` (excerpt + full playbook)
+ *     instruct workers to ALWAYS finalize with `ctx.prove_composite` — NEVER standalone
+ *     `prove_race_burst` / `prove_access_boundary` / `prove_persisted_mutation` — whenever a
+ *     script executes prerequisite setup hops (disclosure/extraction, token/session acquisition,
+ *     parser differential, cache prime, state rebind, or async job polling).
+ *  2. Rule 2 (complete causal hop declaration): the same prompt & playbook surfaces instruct
+ *     workers to declare EVERY executed causal hop from Hop 1 through intermediate hops to the
+ *     terminal hop in `prove_composite.hops[]` connected with `causalEdges[]`, warning that
+ *     omitting Hop 1 or intermediate hops yields an incomplete receipt.
+ *  3. Residual v7-compat cleanup: `GUARDIAN_VERIFY_SPEC_SHAPE` is removed from
+ *     `guardianVerifyPromptHint()` and `guardianVerifyHelperGuidance()` (while remaining exported
+ *     for legacy fallback callers), and zero-caller `deterministicLaneMaxWallClockMs` /
+ *     `deterministicLaneWallClockShare` aliases are removed from `src/server/exec-dispatch.ts`.
+ *  4. All prompt byte/line/excerpt budgets, single-hop isolation, and zero v8 contamination pass.
+ */
+import assert from 'node:assert/strict'
+import { resolve } from 'node:path'
+import { test } from 'node:test'
+
+import {
+  GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+  GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN,
+  GUARDIAN_VERIFY_SPEC_SHAPE,
+  GUARDIAN_VERIFY_TOOL_DESCRIPTION,
+  guardianVerifyHelperGuidance,
+  guardianVerifyPromptHint,
+  workerInvestigationPrompt,
+  workerSessionInstructions,
+} from '../src/server/agent-prompts.ts'
+import * as execDispatch from '../src/server/exec-dispatch.ts'
+import {
+  MULTIHOP_CHAINS_SKILL,
+  clearSkillsCache,
+  loadSkill,
+  selectPreInjectionSkills,
+} from '../src/server/skills.ts'
+import { scanSourceTreeForContamination } from '../scripts/check-v8-contamination.ts'
+
+const REPO_ROOT = resolve(new URL('..', import.meta.url).pathname)
+const ORIGIN = 'https://q36-twoside.example.invalid'
+
+type Q36MultiHopDirectives = {
+  requiredCompositeProof?: string
+  declareAllExecutedHops?: string
+  connectedDagTopology?: string
+}
+
+function renderMultiHopDirectives(): Q36MultiHopDirectives {
+  const parsed = JSON.parse(workerInvestigationPrompt({
+    goal: 'Verify multi-stage cross-service workflow end-to-end',
+    step: {
+      id: 'step-q36-multihop',
+      title: 'Clean-session chain · Parser differential, state rebind, and terminal impact',
+      hypothesis: 'Stage 1 -> Stage 2 -> Stage 3 -> Terminal verification.',
+      category: 'broken-access-control',
+      skills: ['multihop-chains'],
+    },
+    origins: [ORIGIN],
+    capabilityTier: 2,
+    maxTurns: 12,
+  })) as { multiHopDirectives?: Q36MultiHopDirectives }
+  assert.ok(parsed.multiHopDirectives, 'multi-hop step must receive multiHopDirectives')
+  return parsed.multiHopDirectives!
+}
+
+test('Q36.1: Rule 1 enforces ctx.prove_composite (never standalone terminal helpers) whenever prerequisite setup hops execute', () => {
+  const directives = renderMultiHopDirectives()
+  const reqComposite = directives.requiredCompositeProof ?? ''
+
+  assert.match(reqComposite, /ALWAYS use ctx\.prove_composite/i)
+  assert.match(reqComposite, /NEVER.*standalone.*prove_race_burst.*prove_access_boundary.*prove_persisted_mutation/i)
+  assert.match(reqComposite, /prerequisite setup hops/i)
+  assert.match(reqComposite, /parser differential/i)
+  assert.match(reqComposite, /state rebind/i)
+  assert.match(reqComposite, /async job polling/i)
+
+  const sysPrompt = workerSessionInstructions('worker-investigation', { hasGuardianVerify: true })
+  for (const [label, text] of [
+    ['guardianVerifyPromptHint', guardianVerifyPromptHint()],
+    ['guardianVerifyHelperGuidance', guardianVerifyHelperGuidance()],
+    ['GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
+    ['GUARDIAN_VERIFY_TOOL_DESCRIPTION', GUARDIAN_VERIFY_TOOL_DESCRIPTION],
+    ['workerSessionInstructions', sysPrompt],
+  ] as const) {
+    assert.match(text, /prerequisite setup hops/i, `${label} must mention prerequisite setup hops`)
+    assert.match(text, /NEVER standalone.*prove_race_burst/i, `${label} must forbid standalone prove_race_burst after setup hops`)
+    assert.match(text, /prove_access_boundary/i, `${label} must mention prove_access_boundary`)
+    assert.match(text, /prove_persisted_mutation/i, `${label} must mention prove_persisted_mutation`)
+    assert.match(text, /prove_composite/i, `${label} must direct workers to prove_composite`)
+  }
+
+  clearSkillsCache()
+  const mhSkill = selectPreInjectionSkills({ profileSkills: ['bola-idor-race'], lane: 'chain', limit: 2 })
+    .find(s => s.name === MULTIHOP_CHAINS_SKILL)
+  assert.ok(mhSkill, 'multihop-chains must be pre-injected for chain lane')
+  assert.match(mhSkill!.excerpt, /NEVER.*standalone.*prove_race_burst.*prove_access_boundary.*prove_persisted_mutation/i)
+
+  const playbook = loadSkill(MULTIHOP_CHAINS_SKILL)?.content ?? ''
+  assert.match(playbook, /Mandatory `ctx\.prove_composite` Rule/i)
+  assert.match(playbook, /NEVER.*standalone `ctx\.prove_race_burst`, `ctx\.prove_access_boundary`, or `ctx\.prove_persisted_mutation`/i)
+  assert.match(playbook, /prerequisite setup hops/i)
+  assert.match(playbook, /parser differential/i)
+  assert.match(playbook, /state rebind/i)
+  assert.match(playbook, /async job polling/i)
+})
+
+test('Q36.2: Rule 2 enforces declaring EVERY executed causal hop from Hop 1 through terminal in prove_composite.hops[] + causalEdges[]', () => {
+  const directives = renderMultiHopDirectives()
+  const allHops = directives.declareAllExecutedHops ?? ''
+
+  assert.match(allHops, /Declare EVERY causal hop/i)
+  assert.match(allHops, /Hop 1/i)
+  assert.match(allHops, /prove_composite\.hops\[\]/i)
+  assert.match(allHops, /causalEdges\[\]/i)
+  assert.match(allHops, /omitting Hop 1 or intermediate hops yields an incomplete receipt/i)
+
+  const sysPrompt = workerSessionInstructions('worker-investigation', { hasGuardianVerify: true })
+  for (const [label, text] of [
+    ['guardianVerifyPromptHint', guardianVerifyPromptHint()],
+    ['guardianVerifyHelperGuidance', guardianVerifyHelperGuidance()],
+    ['GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
+    ['GUARDIAN_VERIFY_TOOL_DESCRIPTION', GUARDIAN_VERIFY_TOOL_DESCRIPTION],
+    ['workerSessionInstructions', sysPrompt],
+  ] as const) {
+    assert.match(text, /declare EVERY (?:executed )?causal hop/i, `${label} must require declaring every executed causal hop`)
+    assert.match(text, /hops\[\]/i, `${label} must reference hops[]`)
+    assert.match(text, /causalEdges\[\]/i, `${label} must reference causalEdges[]`)
+  }
+
+  for (const [label, text] of [
+    ['GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
+    ['GUARDIAN_VERIFY_TOOL_DESCRIPTION', GUARDIAN_VERIFY_TOOL_DESCRIPTION],
+    ['workerSessionInstructions', sysPrompt],
+  ] as const) {
+    assert.match(text, /omitting Hop 1 or intermediate hops yields an incomplete receipt/i, `${label} must warn about incomplete receipts`)
+  }
+
+  clearSkillsCache()
+  const mhSkill = selectPreInjectionSkills({ profileSkills: ['bola-idor-race'], lane: 'chain', limit: 2 })
+    .find(s => s.name === MULTIHOP_CHAINS_SKILL)
+  assert.ok(mhSkill)
+  assert.match(mhSkill!.excerpt, /Declare EVERY executed causal hop \(Hop 1->terminal\) in `hops\[\]`/i)
+
+  const playbook = loadSkill(MULTIHOP_CHAINS_SKILL)?.content ?? ''
+  assert.match(playbook, /Complete Causal Hop Declaration Rule/i)
+  assert.match(playbook, /Declare \*\*EVERY\*\* causal hop your verification script executed/i)
+  assert.match(playbook, /Omitting Hop 1 or any intermediate setup hop yields an incomplete receipt/i)
+})
+
+test('Q36.3: residual v7-compat cleanup removes GUARDIAN_VERIFY_SPEC_SHAPE from guardian_verify summaries and dead lane aliases from exec-dispatch', () => {
+  assert.equal(
+    guardianVerifyPromptHint().includes(GUARDIAN_VERIFY_SPEC_SHAPE),
+    false,
+    'guardianVerifyPromptHint must not append retired DeclarativeReplaySpec fields',
+  )
+  assert.equal(
+    guardianVerifyHelperGuidance().includes(GUARDIAN_VERIFY_SPEC_SHAPE),
+    false,
+    'guardianVerifyHelperGuidance must not append retired DeclarativeReplaySpec fields',
+  )
+  assert.equal(
+    GUARDIAN_VERIFY_TOOL_DESCRIPTION.includes(GUARDIAN_VERIFY_SPEC_SHAPE),
+    false,
+    'GUARDIAN_VERIFY_TOOL_DESCRIPTION must not append retired DeclarativeReplaySpec fields',
+  )
+  assert.ok(GUARDIAN_VERIFY_SPEC_SHAPE.includes('DeclarativeReplaySpec'), 'legacy export remains available for fallback callers')
+
+  assert.equal('deterministicLaneMaxWallClockMs' in execDispatch, false, 'dead alias deterministicLaneMaxWallClockMs must be removed')
+  assert.equal('deterministicLaneWallClockShare' in execDispatch, false, 'dead alias deterministicLaneWallClockShare must be removed')
+  assert.equal(typeof execDispatch.deterministicFloorMaxWallClockMs, 'number')
+  assert.equal(typeof execDispatch.deterministicFloorWallClockShare, 'number')
+})
+
+test('Q36.4: prompt byte/line/excerpt budgets, single-hop isolation, and zero v8 contamination hold', () => {
+  const guidanceBytes = Buffer.byteLength(guardianVerifyHelperGuidance(), 'utf8')
+  const hintBytes = Buffer.byteLength(guardianVerifyPromptHint(), 'utf8')
+  const patternLines = GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.split('\n').length
+
+  assert.ok(
+    guidanceBytes <= GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+    `guardianVerifyHelperGuidance() is ${guidanceBytes} B (> ${GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES} B)`,
+  )
+  assert.ok(hintBytes <= 512, `guardianVerifyPromptHint() is ${hintBytes} B (> 512 B)`)
+  assert.ok(patternLines <= 12, `GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN has ${patternLines} lines (> 12)`)
+
+  const singlePrompt = JSON.parse(workerInvestigationPrompt({
+    goal: 'Check single endpoint response policy',
+    step: {
+      id: 'step-q36-single',
+      title: 'Single-route header check',
+      hypothesis: 'Inspect GET /api/v1/health response headers.',
+      category: 'misconfig-exposure',
+      skills: ['false-positive-elimination'],
+    },
+    origins: [ORIGIN],
+    capabilityTier: 2,
+    maxTurns: 6,
+  })) as { multiHopDirectives?: unknown }
+  assert.equal(singlePrompt.multiHopDirectives, undefined)
+
+  clearSkillsCache()
+  const mhSkill = selectPreInjectionSkills({ profileSkills: ['bola-idor-race'], lane: 'chain', limit: 2 })
+    .find(s => s.name === MULTIHOP_CHAINS_SKILL)
+  assert.ok(mhSkill)
+  assert.ok(mhSkill!.excerpt.length <= 1200, `excerpt length ${mhSkill!.excerpt.length} > 1200`)
+  assert.ok(mhSkill!.excerpt.includes('invariant_enforced_hardened'), 'excerpt must preserve invariant_enforced_hardened')
+
+  const scan = scanSourceTreeForContamination(REPO_ROOT)
+  assert.equal(scan.ok, true, `v8 contamination detected: ${JSON.stringify(scan.hits)}`)
+  assert.equal(scan.hits.length, 0)
+})
