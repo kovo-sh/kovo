@@ -975,7 +975,7 @@ export function guardianVerifyHelperGuidance(): string {
     'Typed helpers (prefer the helper for the class; each records the transcript roles the oracle checks):',
     ...GUARDIAN_VERIFY_HELPERS.map(helper => `- ${helper.name} — ${helper.use}`),
     `Class hints: ${GUARDIAN_VERIFY_CLASS_HINTS.map(([klass, helper]) => `${klass} -> ${helper}`).join('; ')}.`,
-    'Multi-hop chains (2-6 hops): ALWAYS seal intermediate artifacts via ctx.seal_capability, inject host-side via ctx.http_send({ ..., capability }), derive crypto via ctx.hmac_sign / ctx.jwt_sign, poll async workers via ctx.await_async, and confirm the full DAG via ctx.prove_composite (Mode A: replayMode="fresh_clean_replay"). Start attack hops strictly from a low-privilege/cross-tenant attacker persona (never pre-seeded owner/admin on the attack arm).',
+    'Multi-hop chains (2-6 hops): ALWAYS seal intermediate artifacts via ctx.seal_capability, inject host-side via ctx.http_send({ ..., capability }), derive crypto via ctx.hmac_sign / ctx.jwt_sign, poll async workers via ctx.await_async, and confirm the full DAG via ctx.prove_composite (Mode A: replayMode="fresh_clean_replay"). Never stop at a single-hop disclosure/handle when downstream pivots are reachable. Run ALL probe-arm hops as ONE low-priv/cross-tenant persona (or anonymous/derived cred) — never pre-seeded owner/admin or target-tenant personas on the attack arm.',
     GUARDIAN_VERIFY_SPEC_SHAPE,
     GUARDIAN_VERIFY_REPAIR_INSTRUCTION,
   ].join('\n')
@@ -1104,6 +1104,8 @@ export const GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN = [
   '- Async worker poll: `const p = await ctx.await_async({ pollRequest, matchPredicate, triggerExchangeId: h1.exchangeId, correlationId })` -> cite `p.pollRecordId` + `correlationId` in `{ kind: "async_pivot_binding", fromHopId, toHopId, correlationId, channel: "poll_convergence", pollRecordId: p.pollRecordId }`.',
   '- `edge_binding`: bind every edge `capabilityHandle`/`sourceCapabilityId`/`derivedCapabilityId`/`correlationId` to the exact upstream sealed handle or derived output and cite producing/consuming `exchangeIds` in monotonic order.',
   '- Terminal impact: ALWAYS run a clean pre-chain denied `control` (`role: "control"`, HTTP `401`/`403`/`404`) on the exact terminal route (`preChainControlExchangeIds`) AND fetch actual foreign-tenant business records or persisted state-mutation readback (`postChainReadbackExchangeIds`) — NEVER stop at a job handle, export stub, or signed URL.',
+  '- No premature single-hop filing: NEVER stop at or file an intermediate single-hop info-disclosure, handle, or directory leak when downstream cross-service/auth/state-machine pivots are reachable — seal it via `ctx.seal_capability(...)` and continue through Hops 2-4 to `ctx.prove_composite(...)`.',
+  '- Single-origin probe arm (no cross-tenant collusion): ALL probe-arm hops MUST run as a single starting low-privilege persona (or anonymous / freshly derived credential); NEVER use a target-tenant persona on the probe arm to mint handles for your starting persona (use target-tenant personas only for baseline/readback checks).',
 ].join('\n')
 
 const GUARDIAN_VERIFY_TOOL_DESCRIPTION_BASE =
@@ -1994,6 +1996,7 @@ export const scenarioInstructions: Record<AgentScenario, string> = {
     '5. Every outbound `fetch`/HTTP client (SSRF sink), redirect handler, file-upload/path-traversal handler, WebSocket Origin/authz handler, CORS/cookie policy config, `postMessage`/DOM sink, and IaC/CI workflow (Dockerfile/K8s/Terraform/GitHub Actions).',
     'For EACH concrete suspect (skip clean, properly authorized handlers and static brochure files), call `record_fact` targeting the best-matching approved origin with kind="code_audit_suspect" and full structured data (subkind, repo, file, line, routeOrAction, authCheck, ownershipCheck, sinkKind, hypothesis, recommendedTier).',
     'Record incrementally: call `record_fact` with kind="code_audit_suspect" the moment you identify each high-signal defect in a service/handler file — do NOT wait until every file in the repository is read before recording facts. Prioritize, in order: (a) cross-service trust boundaries and forwarded identity/role headers, (b) multi-tenant authz or cache-key asymmetries, (c) entity creator/approver and state-machine transitions, (d) signing/webhook verification boundaries, (e) async-worker outbound fetch/webhook/log sinks (SSRF pivots and secret-in-log exposure).',
+    'End-to-end 3-5 hop cross-service chain synthesis: using the pre-indexed multi-service route/guard/sink digest, look across services for composable defects (`Entry/Leak/Outbound-Fetch -> Internal/Signing/Invite/Cache Pivot -> Forged Session/Webhook/Export -> Cross-Tenant Data or Unauthorized State Mutation`). Whenever defects across 2+ services compose into a multi-hop chain, record the COMPLETE chain as a `code_audit_suspect` fact with explicit `Hop 1 -> Hop 2 -> Hop 3 -> Hop 4` endpoints, `file:line` locations, and sinks in `hypothesis`.',
     'For source-only Tier 0 engagements where runtime reproduction is unavailable, submit verified source-to-sink findings via `propose_chain_finding` using `kind: "static_ast_proof"` (strictly `static_verified` tier) with non-empty `counterevidence`, `confidenceRationale`, `codeLocations`, and `runtimeProofGap`. Record 3-state closure (`reported` / `ruled_out` with exact `enforcingControl` file:line / `needs_follow_up` with `proofGapReason`) via `record_coverage`.',
     'Prioritize suspects on crown-jewel surfaces (auth, billing, webhooks, APIs, uploads, LLM gateways, sandboxes). When the wall-clock settlement prompt arrives, STOP reading more files and immediately record your top 3-6 suspects as `code_audit_suspect` facts, then call `complete_intent`; also commit all coverage when done.',
   ].join('\n'),
@@ -2413,12 +2416,18 @@ export function codeAuditPrompt(input: CodeAuditPromptInput): string {
       rule: 'Call record_fact(kind="code_audit_suspect") IMMEDIATELY as soon as you spot each high-signal defect in a service or handler file. Do NOT wait until you have read every file in the repository before recording facts.',
       settlement: 'When the wall-clock settlement prompt arrives, STOP reading more files and immediately record your top 3-6 suspects, then call complete_intent. Partial suspects are strictly better than an empty audit.',
       priorityOrder: [
+        'end-to-end 3-5 hop cross-service causal chains composing defects across 2+ services (Entry/Leak/Outbound-Fetch -> Internal/Signing/Invite/Cache Pivot -> Forged Session/Webhook/Export -> Cross-Tenant Data or Unauthorized State Mutation)',
         'cross-service trust boundaries and forwarded identity/role headers between services',
         'multi-tenant authorization or cache-key asymmetries (tenantless keys, missing tenant/org scope)',
         'entity creator/approver and state-machine transitions (who may mutate, approve, transfer, reopen)',
         'signing/webhook verification boundaries (signature and scope checks, fail-open verification)',
         'async-worker outbound fetch/webhook/log sinks (SSRF pivots and secret-in-log exposure)',
       ],
+    },
+    chainSynthesisPolicy: {
+      goal: 'Prioritize end-to-end 3-5 hop cross-service causal chains using the pre-indexed multi-service route/guard/sink digest instead of stopping at isolated single-service suspects.',
+      compositionPattern: 'Entry/Leak/Outbound-Fetch -> Internal/Signing/Invite/Cache Pivot -> Forged Session/Webhook/Export -> Cross-Tenant Data or Unauthorized State Mutation',
+      hypothesisFormat: 'When defects across 2+ services compose, record the complete multi-hop chain as a code_audit_suspect fact with explicit "Hop 1 (METHOD /path, file:line, sink) -> Hop 2 (...) -> Hop 3 (...) -> Hop 4 (...)" in hypothesis, specifying the starting low-privilege persona, intermediate capability/secret handoff, and terminal cross-tenant impact.',
     },
     personas: input.personas ?? [],
     specs: input.specsSummary ?? [],
@@ -2740,9 +2749,27 @@ export function workerInvestigationPrompt(input: {
   // Slim the skill catalog: a specialist only needs its own matching playbooks. The 41-skill
   // catalog dump was pure schema/token cost on every turn.
   const matchingSkills = specialistConfig ? [...new Set(specialistConfig.skills)] : undefined
+  const isMultiHopStep = input.step.skills.some(skill =>
+    skill === 'multihop-chains'
+    || skill === 'chain-primitives'
+    || skill.startsWith('chain:')
+    || skill.startsWith('chain_continuation:')
+    || skill.startsWith('checkpoint_cap:'),
+  ) || /\[chain_hops=|\bmulti[- ]?hop\b|\bHop\s+1\b[\s\S]{0,120}(?:->|→)\s*Hop\s+2\b/i.test(
+    `${input.step.title} ${input.step.hypothesis}`,
+  )
   return JSON.stringify({
     task: 'defensive chain investigation',
     ...(specialistConfig ? { specialistProfile: specialistConfig.id, specialistFocus: specialistConfig.focusPrompt } : {}),
+    ...(isMultiHopStep
+      ? {
+          multiHopDirectives: {
+            noPrematureSingleHop: 'Never stop at an intermediate single-hop info-disclosure, handle, or directory leak when downstream cross-service/auth/state-machine pivots are reachable — seal it via ctx.seal_capability(...) and continue through Hops 2-4 to ctx.prove_composite(...).',
+            singleOriginProbeArm: 'All probe-arm hops must run as a single starting low-privilege persona (or anonymous / freshly derived credential); never use a target-tenant persona on the probe arm to mint handles for your starting persona (use target-tenant personas only for baseline/readback checks).',
+            cryptoAndAsyncHelpers: 'Invoke ctx.hmac_sign / ctx.jwt_sign whenever crossing signing or token-forgery boundaries and ctx.await_async whenever waiting on background-job/async-worker convergence, then confirm the full DAG via ctx.prove_composite(replayMode="fresh_clean_replay").',
+          },
+        }
+      : {}),
     goal: input.goal,
     step: input.step,
     targetOrigins: input.origins,
