@@ -32,6 +32,45 @@ function Go({ to, children }: { to: ViewId; children: string }) {
   </button>
 }
 
+/** Compute the live-strip status line, surfacing login-persona auth before threat-model workers spawn. */
+export function liveOverviewSummary(input: {
+  phase: string
+  roundNo: number
+  runningWorkers: readonly { title: string }[]
+  approvedPersonaIds: readonly string[]
+  personas: readonly { id: string; handle: string; authKind: string }[]
+  events: readonly { id: number; kind: string; detail?: Record<string, unknown> | null }[]
+  hasThreatModel: boolean
+}): string {
+  if (input.runningWorkers.length > 0) {
+    return input.runningWorkers.slice(0, 2).map(w => w.title).join(' · ')
+      + (input.runningWorkers.length > 2 ? ` +${input.runningWorkers.length - 2} more` : '')
+  }
+  if (input.phase === 'threat_model' && !input.hasThreatModel && input.approvedPersonaIds.length > 0) {
+    const approvedSet = new Set(input.approvedPersonaIds)
+    const loginPersonas = input.personas.filter(p => approvedSet.has(p.id) && p.authKind === 'login')
+    if (loginPersonas.length > 0) {
+      const latestScopeEventId = input.events.reduce(
+        (max, ev) => (ev.kind === 'scope.approved' ? Math.max(max, ev.id) : max),
+        0,
+      )
+      const authedPersonaIds = new Set<string>()
+      for (const ev of input.events) {
+        if (ev.id < latestScopeEventId) continue
+        if (ev.kind === 'persona.authenticated') {
+          const pid = typeof ev.detail?.personaId === 'string' ? ev.detail.personaId : null
+          if (pid) authedPersonaIds.add(pid)
+        }
+      }
+      const pending = loginPersonas.filter(p => !authedPersonaIds.has(p.id))
+      if (pending.length > 0) {
+        return `Authenticating test accounts… (${pending.map(p => p.handle).join(', ')})`
+      }
+    }
+  }
+  return `${PHASE_LABEL[input.phase] ?? input.phase} · Round ${input.roundNo}`
+}
+
 function RunOverview() {
   const { detail, counts, events } = useRun()
   const model = useRunModel()
@@ -67,9 +106,15 @@ function RunOverview() {
 
   const phases = model.workflow.phases
   const maxP = Math.max(1, ...phases.map(p => model.workflow.byPhase.get(p)?.length ?? 0))
-  const liveSummary = runningWorkers.length > 0
-    ? runningWorkers.slice(0, 2).map(w => w.title).join(' · ') + (runningWorkers.length > 2 ? ` +${runningWorkers.length - 2} more` : '')
-    : `${PHASE_LABEL[r.phase] ?? r.phase} · Round ${r.roundNo}`
+  const liveSummary = liveOverviewSummary({
+    phase: r.phase,
+    roundNo: r.roundNo,
+    runningWorkers,
+    approvedPersonaIds: r.approvedPersonaIds,
+    personas: detail.personas,
+    events,
+    hasThreatModel: Boolean(detail.threatModel),
+  })
 
   return <div className="min-h-0 flex-1 overflow-auto">
     <div className="max-w-[980px] px-6 pb-14 pt-[22px]">
