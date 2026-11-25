@@ -1620,7 +1620,11 @@ function differentialPaths(control: BooleanDifferentialArm, probe: BooleanDiffer
 } {
   const controlRaw = flattenedRaw(control)
   const probeRaw = flattenedRaw(probe)
-  const paths = new Set([...controlRaw.keys(), ...probeRaw.keys()])
+  const controlSig = bodySignature(control, param)
+  const probeSig = bodySignature(probe, param)
+  // The signature map uses its own keys for non-JSON bodies (`body.length`, `body.tags`, `$status`),
+  // so the union must include them; otherwise a signature-only difference is never compared.
+  const paths = new Set([...controlRaw.keys(), ...probeRaw.keys(), ...controlSig.keys(), ...probeSig.keys()])
   const injected = [
     paramValueFromQuery(probe.pathAndQuery, param) ?? '',
     paramValueFromQuery(control.pathAndQuery, param) ?? '',
@@ -1629,8 +1633,6 @@ function differentialPaths(control: BooleanDifferentialArm, probe: BooleanDiffer
   ].filter(Boolean)
   const changed: string[] = []
   const echoed: string[] = []
-  const controlSig = bodySignature(control, param)
-  const probeSig = bodySignature(probe, param)
   for (const path of paths) {
     const cRaw = controlRaw.get(path) ?? ''
     const pRaw = probeRaw.get(path) ?? ''
