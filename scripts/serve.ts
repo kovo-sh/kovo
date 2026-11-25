@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { chmodSync, createReadStream, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, createReadStream, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { join, resolve } from 'node:path'
@@ -8,6 +8,10 @@ import { pipeline } from 'node:stream/promises'
 
 const maxBody = 8 * 1024 * 1024
 const bootstrapParam = 'bootstrap'
+const defaultPairingTtlMs = 5 * 60 * 1000
+const maxActivePairingTokens = 10
+const pairingLinkPath = '/_guardian/auth/pairing-link'
+const rotateSessionPath = '/_guardian/auth/rotate-session'
 
 export interface LocalApp {
   fetch(request: Request): Promise<Response> | Response
@@ -20,6 +24,10 @@ export interface LocalSessionOptions {
   port: number
   /** Additional HTTPS origin presented by a deliberately configured local reverse proxy. */
   publicOrigin?: string
+  /** TTL for ephemeral device-pairing links in milliseconds (default: 5 minutes). */
+  pairingTtlMs?: number
+  /** Optional clock override for deterministic expiration tests. */
+  now?: () => number
 }
 
 export interface GuardianLocalServer {
@@ -50,6 +58,27 @@ export function readOrCreateSessionToken(directory: string): string {
   const value = readFileSync(file, 'utf8')
   if (!/^[a-f0-9]{64}$/.test(value)) throw new Error('Invalid local session file.')
   return value
+}
+
+/**
+ * Atomically rotates the long-lived local session token in `<data>/local-session` (mode 0600).
+ * Writes a fresh 0600 temp file and renames it into place so the file is never empty or world-readable.
+ */
+export function rotateSessionToken(directory: string): string {
+  mkdirSync(directory, { recursive: true, mode: 0o700 })
+  const next = randomBytes(32).toString('hex')
+  const file = join(directory, 'local-session')
+  const tmp = join(directory, `.local-session.${randomBytes(8).toString('hex')}.tmp`)
+  writeFileSync(tmp, next, { flag: 'wx', mode: 0o600 })
+  try {
+    chmodSync(tmp, 0o600)
+    if ((statSync(tmp).mode & 0o077) !== 0) throw new Error('The local session file must have owner-only permissions.')
+    renameSync(tmp, file)
+  } catch (error) {
+    rmSync(tmp, { force: true })
+    throw error
+  }
+  return next
 }
 
 /**
@@ -98,6 +127,14 @@ function reject(res: ServerResponse, status: number, message: string) {
   res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' }).end(message)
 }
 
+function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}) {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    ...extraHeaders,
+  }).end(JSON.stringify(body))
+}
+
 function rejectSession(res: ServerResponse) {
   res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' }).end(bootstrapNotice())
 }
@@ -134,10 +171,47 @@ function allowedOrigins(port: number, publicOrigin?: string): Map<string, string
 export function createGuardianLocalServer(options: LocalSessionOptions): GuardianLocalServer {
   const { app, directory, port } = options
   const origins = allowedOrigins(port, options.publicOrigin)
-  const token = readOrCreateSessionToken(directory)
+  const pairingTtlMs = options.pairingTtlMs ?? defaultPairingTtlMs
+  const now = options.now ?? Date.now
+  let token = readOrCreateSessionToken(directory)
   const secret = readOrCreateBootstrapSecret(directory)
   let bootstrapConsumed = false
+  const pairingTokens = new Map<string, number>()
   const clientRoot = resolve('build/client')
+
+  function prunePairingTokens(currentMs: number): void {
+    for (const [candidate, expiresAtMs] of pairingTokens) {
+      if (expiresAtMs <= currentMs) pairingTokens.delete(candidate)
+    }
+  }
+
+  function mintPairingToken(): { token: string; expiresAtMs: number } {
+    const currentMs = now()
+    prunePairingTokens(currentMs)
+    while (pairingTokens.size >= maxActivePairingTokens) {
+      const oldest = pairingTokens.keys().next().value
+      if (oldest === undefined) break
+      pairingTokens.delete(oldest)
+    }
+    const pairingToken = randomBytes(32).toString('hex')
+    const expiresAtMs = currentMs + pairingTtlMs
+    pairingTokens.set(pairingToken, expiresAtMs)
+    return { token: pairingToken, expiresAtMs }
+  }
+
+  function consumePairingToken(candidate: string, currentMs: number): boolean {
+    prunePairingTokens(currentMs)
+    if (!/^[a-f0-9]{64}$/.test(candidate)) return false
+    let matchedKey: string | undefined
+    for (const [stored, expiresAtMs] of pairingTokens) {
+      if (expiresAtMs > currentMs && constantTimeEquals(candidate, stored)) {
+        matchedKey = stored
+      }
+    }
+    if (!matchedKey) return false
+    pairingTokens.delete(matchedKey)
+    return true
+  }
 
   async function serve(req: IncomingMessage, res: ServerResponse) {
     const origin = origins.get(req.headers.host ?? '')
@@ -170,15 +244,22 @@ export function createGuardianLocalServer(options: LocalSessionOptions): Guardia
       return
     }
 
-    // Explicit, owner-only bootstrap handshake. Consumes the per-start secret on first success.
-    // The secret is accepted only as a query parameter on a top-level document GET.
+    // Explicit, owner-only bootstrap handshake. Accepts either the per-start secret or an active
+    // ephemeral pairing token; both are consumed on first successful handshake (strictly single-use).
     const bootstrapCandidate = path.searchParams.get(bootstrapParam)
     if (method === 'GET' && bootstrapCandidate !== null) {
-      if (bootstrapConsumed || !isBootstrapAuthorized(bootstrapCandidate, secret)) {
+      const currentMs = now()
+      let authorized = false
+      if (!bootstrapConsumed && isBootstrapAuthorized(bootstrapCandidate, secret)) {
+        bootstrapConsumed = true
+        consumeBootstrapSecret(directory)
+        authorized = true
+      } else if (consumePairingToken(bootstrapCandidate, currentMs)) {
+        authorized = true
+      }
+      if (!authorized) {
         return reject(res, 401, 'Invalid or already consumed bootstrap secret.')
       }
-      bootstrapConsumed = true
-      consumeBootstrapSecret(directory)
       path.searchParams.delete(bootstrapParam)
       res.setHeader('set-cookie', sessionCookie(token, origin))
       res.writeHead(303, { location: path.pathname + (path.search || '') })
@@ -188,10 +269,39 @@ export function createGuardianLocalServer(options: LocalSessionOptions): Guardia
     const session = isSessionAuthorized(req.headers.cookie, token)
     if (!session) {
       if (req.headers['sec-fetch-site'] === 'cross-site') return reject(res, 403, 'Open Guardian directly.')
+      if (path.pathname.startsWith('/_guardian/auth/')) return sendJson(res, 401, { error: 'Local session required.' })
       return rejectSession(res)
     }
     if (req.headers['sec-fetch-site'] === 'cross-site') return reject(res, 403, 'Open Guardian directly.')
     if (Number(req.headers['content-length'] ?? 0) > maxBody) return reject(res, 413, 'Request body is too large.')
+
+    // Authenticated local-server session management endpoints (never exposed without an active
+    // guardian_local session cookie + exact matching Origin header).
+    if (path.pathname === pairingLinkPath) {
+      if (method !== 'POST') return reject(res, 405, 'Method not allowed.')
+      if (req.headers.origin !== origin) return reject(res, 403, 'Unexpected origin.')
+      req.resume()
+      const minted = mintPairingToken()
+      return sendJson(res, 200, {
+        url: `${origin}/?${bootstrapParam}=${minted.token}`,
+        expiresAt: new Date(minted.expiresAtMs).toISOString(),
+        ttlSeconds: Math.round(pairingTtlMs / 1000),
+      })
+    }
+
+    if (path.pathname === rotateSessionPath) {
+      if (method !== 'POST') return reject(res, 405, 'Method not allowed.')
+      if (req.headers.origin !== origin) return reject(res, 403, 'Unexpected origin.')
+      req.resume()
+      token = rotateSessionToken(directory)
+      pairingTokens.clear()
+      res.setHeader('set-cookie', sessionCookie(token, origin))
+      return sendJson(res, 200, { rotated: true })
+    }
+
+    if (path.pathname.startsWith('/_guardian/auth/')) {
+      return reject(res, 404, 'Not found.')
+    }
 
     const headers = new Headers()
     for (const [name, value] of Object.entries(req.headers)) {
@@ -236,7 +346,9 @@ export function createGuardianLocalServer(options: LocalSessionOptions): Guardia
 
   return {
     server,
-    token,
+    get token() {
+      return token
+    },
     bootstrapSecret: secret,
     bootstrapUrl: (origin: string) => `${origin}/?${bootstrapParam}=${secret}`,
   }
