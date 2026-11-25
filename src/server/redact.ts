@@ -9,9 +9,9 @@ const credentialPatterns = [
   /\b(?:sk-or-v1-[a-z0-9_-]+|sk-ant-[a-z0-9_-]+|sk-proj-[a-z0-9_-]+|github_pat_[a-z0-9_]+|gh[pousr]_[a-z0-9_]+)\b/gi,
   /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?/g,
   /-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\n]*PRIVATE KEY-----/g,
-  /\b(?:authorization|proxy-authorization|cookie|set-cookie)\s*:\s*[^\n\r]+/gi,
+  /\b(?:authorization|proxy-authorization|cookie|set-cookie)\s*:\s*[^\n\r"]+/gi,
   /\bBearer\s+[a-z0-9._~+/=-]{8,}/gi,
-  /(?<![A-Za-z0-9])(password|api[_-]?key|token|secret|session[_-]?(?:id|key)|client[_-]?secret|service[_-]?role[_-]?key)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s&,;]+)/gi,
+  /("(?:[^"\n\r\\]*[_-])?(?:password|api[_-]?key|token|secret|session[_-]?(?:id|key)|client[_-]?secret|service[_-]?role[_-]?key)"\s*:\s*)(?:(null|\{|\[)|"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false)|(?<![A-Za-z0-9])(?:password|api[_-]?key|token|secret|session[_-]?(?:id|key)|client[_-]?secret|service[_-]?role[_-]?key)["']?\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'[^']*'|[^\s&,;}]+)/gi,
 ]
 
 export function redact(text: string, secrets: readonly NamedSecret[] = []): string {
@@ -27,7 +27,10 @@ export function redact(text: string, secrets: readonly NamedSecret[] = []): stri
     const b64url = Buffer.from(secret.value, 'utf8').toString('base64url')
     if (b64url !== secret.value && b64url !== b64 && b64url.length >= 4) out = out.replaceAll(b64url, secret.placeholder)
   }
-  return credentialPatterns.reduce((value, pattern) => value.replace(pattern, '[redacted]'), out)
+  out = credentialPatterns.slice(0, 5).reduce((value, pattern) => value.replace(pattern, '[redacted]'), out)
+  return out.replace(credentialPatterns[5]!, (_m, jsonPrefix?: string, preserved?: string) => (
+    jsonPrefix ? `${jsonPrefix}${preserved ?? '"[redacted]"'}` : '[redacted]'
+  ))
 }
 
 export const secretMatchKinds = [

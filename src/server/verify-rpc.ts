@@ -33,6 +33,7 @@ import ipaddr from 'ipaddr.js'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import { buildPersonaHeader } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
+import { redact } from './redact.ts'
 import {
   DerivedCapabilityVault,
   awaitAsyncConvergence,
@@ -249,8 +250,9 @@ const DERIVED_SECRET_KINDS = new Set<DerivedSecretKind>([
 const INJECT_CAPABILITY_TARGETS = new Set<InjectCapabilityTarget>(['bearer', 'header', 'cookie', 'url'])
 const BROKER_FORBIDDEN_CALLER_HEADER_RE = /^(?:authorization|proxy-authorization|cookie)$/i
 const INLINE_CAP_RE = /(?<!\[redacted:)(?<![A-Za-z0-9_])cap(?::|%3[aA])hop_[A-Za-z0-9._-]+(?::|%3[aA])[A-Za-z0-9._-]+/g
-const EXACT_BEARER_CAP_RE = /^(?:Bearer\s+)?(cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+)\s*$/i
+const EXACT_BEARER_CAP_RE = /^\s*(?:Bearer\s+)*(cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+)\s*$/i
 const EXACT_INLINE_CAP_RE = /^cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$/
+const COOKIE_PAIR_VALUE_RE = /^(?:__Host-|__Secure-)?[A-Za-z][A-Za-z0-9_.-]{0,63}=[^;=\s&]{4,}$/
 const STATIC_PATH_SEG_RE = /^(?:api|rest|v\d+|read|public|admin|me|settings|login|logout|auth|token|refresh|verify|mfa|2fa|otp|session)$/i
 const ENTITY_PATH_SEG_RE = /^\d+$|(?:^|[-_.])\d|^[0-9a-f]{8,}$|^[a-z]{2,10}_[A-Za-z0-9_-]{4,}$|^[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*$/i
 const BODY_ENTITY_KEY_RE = /^(?:id|entity_?id|[a-z]+_?id)$/i
@@ -330,7 +332,7 @@ function normalizeDerivedSecretKind(raw: unknown): DerivedSecretKind | undefined
   if (/cookie/.test(norm)) return 'cookie'
   if (/signed.*url|presigned|url/.test(norm)) return 'signed_url'
   if (/header/.test(norm)) return 'header_secret'
-  if (/bearer|access_token|identity_session/.test(norm)) return 'bearer_token'
+  if (/bearer|access_token|session_token|identity_session/.test(norm)) return 'bearer_token'
   if (/signing|hmac|secret_key|private_key|mac_key|key_material/.test(norm)) return 'hmac_key'
   if (/api_key|token|pat/.test(norm)) return 'api_token'
   if (/secret|key/.test(norm)) return 'hmac_key'
@@ -697,35 +699,31 @@ export class VerifyRpcServer {
   private parseCapabilityArg(args: Record<string, unknown>): ParsedCapabilityArg | null {
     const raw = args.capability
     if (raw === undefined || raw === null) return null
+    let targetRaw = args.capabilityTarget ?? args.capability_target
+    let headerNameRaw = args.capabilityHeaderName ?? args.capability_header_name
+    let cookieNameRaw = args.capabilityCookieName ?? args.capability_cookie_name
+    let queryParamRaw = args.capabilityQueryParam ?? args.capability_query_param
     let handle = ''
-    let targetRaw = args.capabilityTarget
-    let headerNameRaw = args.capabilityHeaderName
-    let cookieNameRaw = args.capabilityCookieName
-    let queryParamRaw = args.capabilityQueryParam
     if (typeof raw === 'string') {
       handle = raw.trim()
     } else {
       const obj = asRecord(raw)
-      if (!obj || typeof obj.handle !== 'string') throw new Error('capability must be a handle string or { handle, target?, headerName?, cookieName?, queryParam? }.')
-      handle = obj.handle.trim()
-      if (obj.target !== undefined) targetRaw = obj.target
-      if (obj.headerName !== undefined) headerNameRaw = obj.headerName
-      if (obj.cookieName !== undefined) cookieNameRaw = obj.cookieName
-      if (obj.queryParam !== undefined) queryParamRaw = obj.queryParam
+      const rawHandle = obj ? (obj.handle ?? obj.derivedHandle ?? obj.cap_id) : undefined
+      if (!obj || typeof rawHandle !== 'string') throw new Error('capability must be a handle string or { handle, target?, headerName?, cookieName?, queryParam? }.')
+      handle = rawHandle.trim()
+      targetRaw = obj.target ?? targetRaw
+      headerNameRaw = obj.headerName ?? obj.header_name ?? headerNameRaw
+      cookieNameRaw = obj.cookieName ?? obj.cookie_name ?? cookieNameRaw
+      queryParamRaw = obj.queryParam ?? obj.query_param ?? queryParamRaw
     }
-    if (!isDerivedCapabilityHandle(handle)) {
-      throw new Error(`Invalid derived capability handle "${handle}".`)
-    }
+    if (!isDerivedCapabilityHandle(handle)) throw new Error(`Invalid derived capability handle "${handle}".`)
     let target: InjectCapabilityTarget | undefined
     if (targetRaw !== undefined) {
-      if (typeof targetRaw !== 'string' || !INJECT_CAPABILITY_TARGETS.has(targetRaw as InjectCapabilityTarget)) {
-        throw new Error(`Unsupported capability target "${String(targetRaw)}".`)
-      }
+      if (typeof targetRaw !== 'string' || !INJECT_CAPABILITY_TARGETS.has(targetRaw as InjectCapabilityTarget)) throw new Error(`Unsupported capability target "${String(targetRaw)}".`)
       target = targetRaw as InjectCapabilityTarget
     }
     return {
-      handle,
-      ...(target ? { target } : {}),
+      handle, ...(target ? { target } : {}),
       ...(typeof headerNameRaw === 'string' && headerNameRaw.trim() ? { headerName: headerNameRaw.trim() } : {}),
       ...(typeof cookieNameRaw === 'string' && cookieNameRaw.trim() ? { cookieName: cookieNameRaw.trim() } : {}),
       ...(typeof queryParamRaw === 'string' && queryParamRaw.trim() ? { queryParam: queryParamRaw.trim() } : {}),
@@ -740,7 +738,7 @@ export class VerifyRpcServer {
     const meta = this.capabilityVault.getMeta(cap.handle)
     if (meta?.kind === 'cookie' || meta?.defaultCookieName) return 'cookie'
     if (meta?.kind === 'signed_url') return 'url'
-    if (meta?.kind === 'header_secret' || meta?.defaultHeaderName) return 'header'
+    if (meta?.defaultHeaderName) return 'header'
     return 'bearer'
   }
 
@@ -830,16 +828,18 @@ export class VerifyRpcServer {
         nextPathAndQuery = parsedUrl.pathname + parsedUrl.search
       }
       for (const [k, v] of Object.entries(injected.request.headers ?? {})) {
-        if (capInputHeaders[k] === v) continue
-        injectedHeaders[k] = v
+        const isAuthHdr = BROKER_FORBIDDEN_CALLER_HEADER_RE.test(k)
+        if (!isAuthHdr && capInputHeaders[k] === v) continue
+        const normVal = /^authorization$/i.test(k) ? v.replace(/^\s*(?:Bearer\s+)+/i, 'Bearer ') : v
+        injectedHeaders[k] = normVal
         injectedByCapKeys.add(k.toLowerCase())
-        if (BROKER_FORBIDDEN_CALLER_HEADER_RE.test(k)) {
-          setHeaderCI(authHeaders, k, v)
+        if (isAuthHdr) {
+          setHeaderCI(authHeaders, k, normVal)
           setHeaderCI(metaHeaders, k, `[redacted:${cap.handle}]`)
           primaryAuthHandle = primaryAuthHandle ?? cap.handle
           for (const wk of Object.keys(workingHeaders)) if (wk.toLowerCase() === k.toLowerCase()) delete workingHeaders[wk]
         } else {
-          setHeaderCI(workingHeaders, k, v)
+          setHeaderCI(workingHeaders, k, normVal)
           setHeaderCI(metaHeaders, k, `[redacted:${cap.handle}]`)
         }
       }
@@ -895,7 +895,7 @@ export class VerifyRpcServer {
           recordAtt(injected.attestation)
           primaryAuthHandle = primaryAuthHandle ?? handle
         } else {
-          const resolvedAuth = replaceInline(v, targetUrl, 'bearer', { onHandle: h => { primaryAuthHandle = primaryAuthHandle ?? h } })
+          const resolvedAuth = replaceInline(v, targetUrl, 'bearer', { onHandle: h => { primaryAuthHandle = primaryAuthHandle ?? h } }).replace(/^\s*Bearer(?:\s+Bearer)+\s+/i, 'Bearer ')
           setHeaderCI(authHeaders, 'Authorization', resolvedAuth)
           injectedHeaders['Authorization'] = resolvedAuth
           setHeaderCI(metaHeaders, k, redactCaps(v))
@@ -982,12 +982,17 @@ export class VerifyRpcServer {
       const mergedBundleHeaders: Record<string, string> = {}
       const basePersonaHandle = baseReq.persona ?? baseReq.personaHandle
       let baseRoleLabel = 'derived'
+      const authHasBearer = Object.keys(authHeaders).some(k => /^authorization$/i.test(k))
+      const authHasCookie = Object.keys(authHeaders).some(k => /^cookie$/i.test(k))
       if (basePersonaHandle) {
         const basePersona = this.options.grant.personas?.get(basePersonaHandle)
         if (!basePersona) throw new Error(`Persona "${basePersonaHandle}" is not approved for this run.`)
         const baseInjected = buildPersonaHeader(basePersona, nextOrigin)
         if (!baseInjected) throw new Error(`Persona "${basePersonaHandle}" does not have an active authenticated session.`)
-        Object.assign(mergedBundleHeaders, baseInjected)
+        for (const [bk, bv] of Object.entries(baseInjected)) {
+          if (authHasBearer && !authHasCookie && /^cookie$/i.test(bk)) continue
+          mergedBundleHeaders[bk] = bv
+        }
         baseRoleLabel = basePersona.roleLabel
       }
       for (const [k, v] of Object.entries(authHeaders)) setHeaderCI(mergedBundleHeaders, k, v)
@@ -995,7 +1000,7 @@ export class VerifyRpcServer {
       const ephemeralPersona: ResolvedPersona = {
         id: ephemeralHandle, handle: ephemeralHandle, roleLabel: baseRoleLabel, originAllowlist: [nextOrigin],
         authKind: 'login', headerName: null, secret: '', canaryMarkers: [],
-        session: { headerType: 'header', value: 'derived', adapterUsed: 'derived-capability', bundle: { v: 2, headers: mergedBundleHeaders } },
+        session: { headerType: 'header', value: '', adapterUsed: 'derived-capability', bundle: { v: 2, headers: mergedBundleHeaders } },
       }
       const nextPersonas = new Map(this.options.grant.personas ?? [])
       nextPersonas.set(ephemeralHandle, ephemeralPersona)
@@ -1009,7 +1014,7 @@ export class VerifyRpcServer {
       pathAndQuery: nextPathAndQuery,
       ...(nextBody !== undefined ? { body: nextBody } : {}),
       ...(Object.keys(nextHeaders).length > 0 ? { headers: nextHeaders } : { headers: undefined }),
-      ...(effectivePersona ? { persona: effectivePersona } : {}),
+      ...(effectivePersona ? { persona: effectivePersona, personaHandle: undefined } : {}),
       secrets: [...(baseReq.secrets ?? []), ...vaultScrubDescriptors(this.capabilityVault)],
     }
     const nextMeta: VerifyTranscriptRequest = {
@@ -1176,7 +1181,9 @@ export class VerifyRpcServer {
     const prep = this.prepareCapRequest(args, nonce)
     const started = this.nextHostTimestampMs()
     try {
-      const result = await this.options.broker.executeHttp(prep.applied.brokerRequest, prep.applied.grant, AbortSignal.timeout(this.options.callTimeoutMs ?? 30_000))
+      const rawBox: { value: { body: string; headers: Record<string, string> } | null } = { value: null }
+      const reqWithRaw: BrokerHttpRequest = { ...prep.applied.brokerRequest, onRawResponse: raw => { rawBox.value = raw } }
+      const result = await this.options.broker.executeHttp(reqWithRaw, prep.applied.grant, AbortSignal.timeout(this.options.callTimeoutMs ?? 30_000))
       this.recordSessionMutation(prep.sessionKey, prep.applied.brokerRequest.method, prep.entityIds, prep.isControlOrAblation, result.status)
       const body = this.scrub(result.body)
       const record = this.transcript.record({
@@ -1187,7 +1194,8 @@ export class VerifyRpcServer {
           ...(result.finalPathAndQuery ? { finalPathAndQuery: this.scrub(result.finalPathAndQuery) } : {}),
         },
       })
-      this.recordRequestProvenance(record.exchangeId, started, args, prep.applied.brokerRequest, prep.requestMeta, { body: result.body, respHeaders: result.respHeaders }, prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession)
+      const rawProv = rawBox.value ? { body: rawBox.value.body, respHeaders: rawBox.value.headers } : { body: result.body, respHeaders: result.respHeaders }
+      this.recordRequestProvenance(record.exchangeId, started, args, prep.applied.brokerRequest, prep.requestMeta, rawProv, prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession)
       return this.exchangeView(record, { ...result, body }, {
         consumedCapabilityId: prep.applied.attestation?.consumedCapabilityId ?? null,
         consumedCapabilities: prep.consumedIds,
@@ -1429,8 +1437,9 @@ export class VerifyRpcServer {
       : { mode: 'http1-fallback' as const, fallbackReason: summary.proxy ? 'proxy transport disables the HTTP/2 single-packet barrier' : 'HTTP/2 transport is unavailable; the burst runs on the HTTP/1.1 fallback' }
     const started = this.nextHostTimestampMs()
     try {
+      const rawCaptures: Array<{ body: string; headers: Record<string, string> } | null> = items.map(() => null)
       const burst = await this.options.broker.executeRaceBurst(
-        items.map(i => i.prep.applied.brokerRequest),
+        items.map((i, idx) => ({ ...i.prep.applied.brokerRequest, onRawResponse: raw => { rawCaptures[idx] = raw } })),
         burstGrant,
         AbortSignal.timeout(this.options.callTimeoutMs ?? 30_000),
       )
@@ -1443,7 +1452,8 @@ export class VerifyRpcServer {
           startedAt: started, durationMs: result.durationMs, request: prep.requestMeta, body,
           response: { status: result.status, headers: this.scrubRecord(result.respHeaders), bodyBytes: result.bodyBytes, bodySha256: result.bodySha256, mediaType: result.mediaType },
         })
-        this.recordRequestProvenance(record.exchangeId, started, itemArgs, prep.applied.brokerRequest, prep.requestMeta, { body: result.body, respHeaders: result.respHeaders }, prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession)
+        const capRaw = rawCaptures[index]
+        this.recordRequestProvenance(record.exchangeId, started, itemArgs, prep.applied.brokerRequest, prep.requestMeta, capRaw ? { body: capRaw.body, respHeaders: capRaw.headers } : { body: result.body, respHeaders: result.respHeaders }, prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession)
         return this.exchangeView(record, { ...result, body }, {
           consumedCapabilityId: prep.applied.attestation?.consumedCapabilityId ?? null,
           consumedCapabilities: prep.consumedIds,
@@ -1600,15 +1610,22 @@ export class VerifyRpcServer {
     const artifactText = record?.artifact?.token ?? record?.artifact?.url ?? ''
 
     if (typeof args.jsonPath === 'string' && args.jsonPath.trim()) {
-      let parsed: unknown
-      try { parsed = JSON.parse(rawBody) } catch { throw new Error(`Exchange "${exchangeId}" response body is not valid JSON for jsonPath extraction.`) }
-      const evalRes = resolveSealJsonPath(parsed, args.jsonPath.trim())
-      if (!evalRes.found || evalRes.value === undefined || evalRes.value === null) {
-        throw new Error(`jsonPath "${args.jsonPath}" did not match exchange "${exchangeId}" (${this.scrub(describeJsonTopKeys(parsed))}).`)
+      let parsed: unknown, jsonOk = true
+      try { parsed = JSON.parse(rawBody) } catch { jsonOk = false }
+      if (!jsonOk) {
+        if (!(typeof args.regex === 'string' && args.regex.trim())) {
+          const st = record?.response?.status ?? 'unknown'
+          const ct = Object.entries(rawHeaders).find(([k]) => k.toLowerCase() === 'content-type')?.[1] ?? record?.response?.mediaType ?? 'unknown'
+          const preview = redact(this.scrub(rawBody)).replace(/\s+/g, ' ').trim().slice(0, 60)
+          throw new Error(`Exchange "${exchangeId}" response body is not valid JSON for jsonPath extraction (HTTP ${st} ${ct}; preview: "${preview}"). Use regex/header/cookie for non-JSON bodies.`)
+        }
+      } else {
+        const evalRes = resolveSealJsonPath(parsed, args.jsonPath.trim())
+        if (!evalRes.found || evalRes.value === undefined || evalRes.value === null) throw new Error(`jsonPath "${args.jsonPath}" did not match exchange "${exchangeId}" (${this.scrub(describeJsonTopKeys(parsed))}).`)
+        const extracted = typeof evalRes.value === 'string' ? evalRes.value : String(evalRes.value)
+        if (!extracted) throw new Error(`jsonPath "${args.jsonPath}" resolved to an empty value.`)
+        return extracted
       }
-      const extracted = typeof evalRes.value === 'string' ? evalRes.value : String(evalRes.value)
-      if (!extracted) throw new Error(`jsonPath "${args.jsonPath}" resolved to an empty value.`)
-      return extracted
     }
 
     if (typeof args.header === 'string' && args.header.trim()) {
@@ -1657,26 +1674,18 @@ export class VerifyRpcServer {
 
     const slot = typeof args.slot === 'string' ? args.slot.trim() : ''
     if (!slot) throw new Error('capability.seal requires a non-empty slot name.')
-    const hopReceiptId = typeof args.hopReceiptId === 'string' && args.hopReceiptId.trim()
-      ? args.hopReceiptId.trim()
-      : typeof args.hopId === 'string' && args.hopId.trim()
-        ? args.hopId.trim()
-        : exchangeId
-
+    const hopReceiptId = typeof args.hopReceiptId === 'string' && args.hopReceiptId.trim() ? args.hopReceiptId.trim() : typeof args.hopId === 'string' && args.hopId.trim() ? args.hopId.trim() : exchangeId
     const kind = normalizeDerivedSecretKind(args.kind)
     const ttlMs = args.ttlMs === null ? null : typeof args.ttlMs === 'number' ? args.ttlMs : undefined
-    const allowedOrigins = Array.isArray(args.allowedOrigins)
-      ? args.allowedOrigins.filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
-      : undefined
+    const allowedOrigins = Array.isArray(args.allowedOrigins) ? args.allowedOrigins.filter((v): v is string => typeof v === 'string' && v.trim().length > 0) : undefined
     const rawValue = this.extractSecretFromExchange(exchangeId, args)
+    const defaultHeaderName = typeof args.defaultHeaderName === 'string' && args.defaultHeaderName.trim() ? args.defaultHeaderName.trim() : undefined
+    const defaultCookieName = typeof args.defaultCookieName === 'string' && args.defaultCookieName.trim() ? args.defaultCookieName.trim() : (typeof args.cookie === 'string' && args.cookie.trim() ? args.cookie.trim() : undefined)
+    const effectiveKind = kind ?? (defaultCookieName || (!defaultHeaderName && COOKIE_PAIR_VALUE_RE.test(rawValue)) ? 'cookie' : undefined)
     const meta = this.capabilityVault.seal({
-      hopReceiptId,
-      slot,
-      rawValue,
-      ...(kind ? { kind } : {}),
-      ...(ttlMs !== undefined ? { ttlMs } : {}),
-      ...(typeof args.defaultHeaderName === 'string' && args.defaultHeaderName.trim() ? { defaultHeaderName: args.defaultHeaderName.trim() } : {}),
-      ...(typeof args.defaultCookieName === 'string' && args.defaultCookieName.trim() ? { defaultCookieName: args.defaultCookieName.trim() } : {}),
+      hopReceiptId, slot, rawValue,
+      ...(effectiveKind ? { kind: effectiveKind } : {}), ...(ttlMs !== undefined ? { ttlMs } : {}),
+      ...(defaultHeaderName ? { defaultHeaderName } : {}), ...(defaultCookieName ? { defaultCookieName } : {}),
       ...(allowedOrigins?.length ? { allowedOrigins } : {}),
     })
 
@@ -1713,7 +1722,7 @@ export class VerifyRpcServer {
     sealProv.emittedCapabilities.add(meta.handle)
     sealProv.observedResponseDigests.add(meta.sha256)
 
-    const scrubbedPreview = this.scrub((this.rawBodies.get(exchangeId) ?? '').slice(0, 1024))
+    const scrubbedPreview = redact(this.scrub((this.rawBodies.get(exchangeId) ?? '').slice(0, 1024)))
     return this.scrubRecord({
       handle: meta.handle,
       meta,
@@ -1929,7 +1938,7 @@ export class VerifyRpcServer {
 
     const parsedPoll = this.parseHttpArgs(pollReqArgs)
     const capArg = this.parseCapabilityArg(pollReqArgs)
-    type LastPoll = { result: BrokerExchangeResult; startedAt: number; applied: ReturnType<VerifyRpcServer['applyCapabilityInjection']>; cryptoAtts: HostCryptoAttestation[]; cleanSession: boolean }
+    type LastPoll = { result: BrokerExchangeResult; rawResp: { body: string; headers: Record<string, string> } | null; startedAt: number; applied: ReturnType<VerifyRpcServer['applyCapabilityInjection']>; cryptoAtts: HostCryptoAttestation[]; cleanSession: boolean }
     let lastBrokerResult: LastPoll | null = null
 
     const convergence = await awaitAsyncConvergence({
@@ -1949,9 +1958,10 @@ export class VerifyRpcServer {
         const sessionKey = applied.brokerRequest.session ?? '__default__'
         const { isControlOrAblation, cleanSession, entityIds } = this.computeControlCleanSession(sessionKey, pollReqArgs, applied.brokerRequest, applied.requestMeta.sessionRole)
         const startedAt = this.nextHostTimestampMs()
-        const result = await this.options.broker.executeHttp(applied.brokerRequest, applied.grant, signal)
+        let rawResp: { body: string; headers: Record<string, string> } | null = null
+        const result = await this.options.broker.executeHttp({ ...applied.brokerRequest, onRawResponse: raw => { rawResp = raw } }, applied.grant, signal)
         this.recordSessionMutation(sessionKey, applied.brokerRequest.method, entityIds, isControlOrAblation, result.status)
-        lastBrokerResult = { result, startedAt, applied, cryptoAtts, cleanSession }
+        lastBrokerResult = { result, rawResp, startedAt, applied, cryptoAtts, cleanSession }
         return { status: result.status, body: result.body, headers: result.respHeaders, observedAtMs: this.nextHostTimestampMs() }
       },
       matchPredicate: (val) => this.matchAsyncPredicate(matchPredicate, val),
@@ -1977,7 +1987,8 @@ export class VerifyRpcServer {
         },
       })
       const mergedPollArgs = { ...pollReqArgs, ...(args.entityId !== undefined ? { entityId: args.entityId } : {}), ...(args.correlationId !== undefined ? { correlationId: args.correlationId } : {}), ...(args.correlationIds !== undefined ? { correlationIds: args.correlationIds } : {}) }
-      this.recordRequestProvenance(finalRecord.exchangeId, last.startedAt, mergedPollArgs, last.applied.brokerRequest, reqMeta, { body: last.result.body, respHeaders: last.result.respHeaders }, last.applied.attestations, last.cryptoAtts, last.cleanSession)
+      const rawProv = last.rawResp ? { body: last.rawResp.body, respHeaders: last.rawResp.headers } : { body: last.result.body, respHeaders: last.result.respHeaders }
+      this.recordRequestProvenance(finalRecord.exchangeId, last.startedAt, mergedPollArgs, last.applied.brokerRequest, reqMeta, rawProv, last.applied.attestations, last.cryptoAtts, last.cleanSession)
       finalExchangeView = this.exchangeView(finalRecord, { ...last.result, body: scrubbedBody }, {
         consumedCapabilityId: last.applied.attestation?.consumedCapabilityId ?? null,
         consumedCapabilities: last.applied.attestations.map(a => a.consumedCapabilityId),
