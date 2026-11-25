@@ -233,6 +233,7 @@ export interface VerifyAttemptSession {
 
 export type VerifyReason =
   | 'confirmed'
+  | 'checkpoint_only'
   | 'execution_failed'
   | 'claims_missing'
   | 'claims_invalid'
@@ -292,6 +293,96 @@ export interface VerifyScriptOptions {
   timeoutMs?: number
 }
 
+interface CheckpointTranscriptSummary {
+  hasCheckpointOps: boolean
+  sealedHandles: string[]
+  cryptoOpCount: number
+  asyncPollCount: number
+}
+
+function inspectCheckpointTranscript(transcript: TranscriptStore): CheckpointTranscriptSummary {
+  const sealedHandles = new Set<string>()
+  let hasCheckpointOps = false
+  let cryptoOpCount = 0
+  let asyncPollCount = 0
+
+  for (const record of transcript.list()) {
+    if (record.error) continue
+    const artifact = record.artifact
+    const ext = record as unknown as Record<string, unknown>
+
+    if (record.op === 'capability' || artifact?.kind === 'capability') {
+      hasCheckpointOps = true
+      if (typeof artifact?.capabilityHandle === 'string' && artifact.capabilityHandle.trim()) {
+        sealedHandles.add(artifact.capabilityHandle.trim())
+      }
+    }
+    if (record.op === 'crypto' || artifact?.kind === 'crypto') {
+      hasCheckpointOps = true
+      cryptoOpCount += 1
+      if (typeof artifact?.derivedCapabilityId === 'string' && artifact.derivedCapabilityId.trim()) {
+        sealedHandles.add(artifact.derivedCapabilityId.trim())
+      }
+      if (typeof artifact?.capabilityHandle === 'string' && artifact.capabilityHandle.trim()) {
+        sealedHandles.add(artifact.capabilityHandle.trim())
+      }
+    }
+    if (record.op === 'async_poll' || artifact?.kind === 'async_poll' || Boolean(artifact?.pollRecordId)) {
+      hasCheckpointOps = true
+      asyncPollCount += 1
+    }
+    if (typeof artifact?.capabilityHandle === 'string' && artifact.capabilityHandle.trim()) {
+      hasCheckpointOps = true
+      sealedHandles.add(artifact.capabilityHandle.trim())
+    }
+    if (typeof artifact?.derivedCapabilityId === 'string' && artifact.derivedCapabilityId.trim()) {
+      hasCheckpointOps = true
+      sealedHandles.add(artifact.derivedCapabilityId.trim())
+    }
+    if (ext.evidenceRole === 'host_capability_op' || ext.evidenceRole === 'host_crypto_op') {
+      hasCheckpointOps = true
+      if (ext.evidenceRole === 'host_crypto_op' && record.op !== 'crypto') cryptoOpCount += 1
+    }
+    if (Array.isArray(ext.emittedCapabilities)) {
+      for (const cap of ext.emittedCapabilities) {
+        if (typeof cap === 'string' && cap.trim()) {
+          hasCheckpointOps = true
+          sealedHandles.add(cap.trim())
+        }
+      }
+    }
+  }
+
+  const tExt = transcript as unknown as Record<string, unknown>
+  if (typeof tExt.capabilitiesSealed === 'number' && tExt.capabilitiesSealed > 0) {
+    hasCheckpointOps = true
+  }
+  if (Array.isArray(tExt.polls) && tExt.polls.length > 0) {
+    hasCheckpointOps = true
+    asyncPollCount += tExt.polls.length
+  }
+
+  return {
+    hasCheckpointOps,
+    sealedHandles: [...sealedHandles],
+    cryptoOpCount,
+    asyncPollCount,
+  }
+}
+
+function formatCheckpointNextStepHint(summary: CheckpointTranscriptSummary): string {
+  if (summary.sealedHandles.length > 0) {
+    const preview = summary.sealedHandles.slice(0, 8).join(', ')
+    const extra = summary.sealedHandles.length > 8 ? ` (+${summary.sealedHandles.length - 8} more)` : ''
+    return `Checkpoint saved (sealed: ${preview}${extra}). Continue chaining and call ctx.prove_composite(...) to confirm.`
+  }
+  const parts: string[] = []
+  if (summary.cryptoOpCount > 0) parts.push(`${summary.cryptoOpCount} crypto op${summary.cryptoOpCount === 1 ? '' : 's'}`)
+  if (summary.asyncPollCount > 0) parts.push(`${summary.asyncPollCount} async poll${summary.asyncPollCount === 1 ? '' : 's'}`)
+  const label = parts.length > 0 ? parts.join(', ') : 'host checkpoint operations'
+  return `Checkpoint saved (${label}). Continue chaining and call ctx.prove_composite(...) to confirm.`
+}
+
 function describeFingerprint(fingerprint: CausalFingerprint): string {
   return `${fingerprint.kind}|${fingerprint.method}|${fingerprint.path}|${fingerprint.status}|${JSON.stringify(fingerprint.expectation)}|${JSON.stringify(fingerprint.observed)}`
 }
@@ -300,7 +391,7 @@ async function runAttempt(
   options: VerifyScriptOptions,
   attempt: 1 | 2,
   nonce: string,
-): Promise<{ report: VerifyAttemptReport; fingerprints: string[] }> {
+): Promise<{ report: VerifyAttemptReport; fingerprints: string[]; checkpointOps?: CheckpointTranscriptSummary }> {
   const session = await options.openAttempt({ attempt, nonce })
   try {
     if (session.nonce !== nonce) {
@@ -311,9 +402,12 @@ async function runAttempt(
     const execution = await session.execute(options.candidate, deadline)
     const rawResultError = execution.result && typeof execution.result === 'object' && !Array.isArray(execution.result)
       && typeof (execution.result as { error?: unknown }).error === 'string'
-      ? (execution.result as { error: string }).error
+      ? (execution.result as { error: string }).error.trim()
       : ''
-    const rawStderr = execution.stderr.trim() ? execution.stderr : rawResultError
+    const trimmedStderr = execution.stderr.trim()
+    const rawStderr = rawResultError && trimmedStderr && !trimmedStderr.includes(rawResultError)
+      ? `${rawResultError}\n${trimmedStderr}`
+      : (trimmedStderr || rawResultError)
     const base = {
       attempt,
       nonce,
@@ -340,13 +434,13 @@ async function runAttempt(
     try {
       parsed = parseVerifyScriptResult(execution.result)
     } catch (error) {
+      const rawTitle = execution.result && typeof execution.result === 'object' && !Array.isArray(execution.result) && typeof (execution.result as { title?: unknown }).title === 'string'
+        ? (execution.result as { title: string }).title
+        : null
       const latestComp = session.transcript.latestCompositeVerification()
       if (latestComp && !latestComp.confirmed) {
         const compRejectedBy = latestComp.rejectedBy ?? (latestComp.failedStage ? `composite_${latestComp.failedStage}` : 'composite_receipt')
         const compMissing = latestComp.missingEvidence.length > 0 ? latestComp.missingEvidence : [compRejectedBy]
-        const rawTitle = execution.result && typeof execution.result === 'object' && !Array.isArray(execution.result) && typeof (execution.result as { title?: unknown }).title === 'string'
-          ? (execution.result as { title: string }).title
-          : null
         return {
           report: {
             ...base,
@@ -359,7 +453,38 @@ async function runAttempt(
           fingerprints: [],
         }
       }
-      return { report: { ...base, failures: [error instanceof Error ? error.message : 'Invalid result.'], rejectedBy: 'claims', missingEvidence: ['valid_proof_document'] }, fingerprints: [] }
+      if (execution.exitCode !== 0 || rawResultError.length > 0) {
+        const execDetail = redactStderrPreview(rawResultError || execution.stderr)
+        const failureMessage = execDetail
+          ? `Verification script execution failed (exitCode=${execution.exitCode}): ${execDetail}`
+          : `Verification script exited non-zero (exitCode=${execution.exitCode}).`
+        return {
+          report: {
+            ...base,
+            title: rawTitle,
+            failures: [failureMessage],
+            rejectedBy: 'execution',
+            missingEvidence: ['script_completion'],
+          },
+          fingerprints: [],
+        }
+      }
+      const checkpointOps = inspectCheckpointTranscript(session.transcript)
+      if (checkpointOps.hasCheckpointOps) {
+        const checkpointHint = formatCheckpointNextStepHint(checkpointOps)
+        return {
+          report: {
+            ...base,
+            title: rawTitle,
+            failures: [checkpointHint],
+            rejectedBy: 'checkpoint',
+            missingEvidence: ['composite_receipt'],
+          },
+          fingerprints: [],
+          checkpointOps,
+        }
+      }
+      return { report: { ...base, title: rawTitle, failures: [error instanceof Error ? error.message : 'Invalid result.'], rejectedBy: 'claims', missingEvidence: ['valid_proof_document'] }, fingerprints: [] }
     }
     if (typeof parsed.nonce === 'string' && parsed.nonce !== nonce) {
       return {
@@ -409,7 +534,7 @@ async function runAttemptSafe(
   options: VerifyScriptOptions,
   attempt: 1 | 2,
   nonce: string,
-): Promise<{ report: VerifyAttemptReport; fingerprints: string[] }> {
+): Promise<{ report: VerifyAttemptReport; fingerprints: string[]; checkpointOps?: CheckpointTranscriptSummary }> {
   try {
     return await runAttempt(options, attempt, nonce)
   } catch (error) {
@@ -460,8 +585,12 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
     const rawStderr = source.map(report => report.stderr ?? '').find(text => text.trim().length > 0) ?? ''
     const stderrPreview = redactStderrPreview(rawStderr)
     const showDiagnostics = includeScriptDiagnostics || (typeof failingExit === 'number' && failingExit !== 0) || stderrPreview.length > 0
+    const primaryRejectedBy =
+      source.find(report => report.rejectedBy !== null && report.rejectedBy !== 'checkpoint')?.rejectedBy
+      ?? source.find(report => report.rejectedBy !== null)?.rejectedBy
+      ?? null
     return {
-      rejectedBy: source.find(report => report.rejectedBy !== null)?.rejectedBy ?? null,
+      rejectedBy: primaryRejectedBy,
       missingEvidence: [...new Set(source.flatMap(report => report.missingEvidence))],
       transcriptSummary: source[0]?.transcriptSummary ?? [],
       ...(showDiagnostics && typeof failingExit === 'number' ? { exitCode: failingExit } : {}),
@@ -480,6 +609,33 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
   if (attempts.some(a => a.nonceMismatch)) {
     return withFeedback({ confirmed: false, reason: 'nonce_mismatch', detail: 'A proof document did not match its fresh attempt nonce.', attempts, disagreements: [], claimTitle: first.report.title })
   }
+  const checkpointSummaries = [first.checkpointOps, second.checkpointOps]
+    .filter((summary): summary is CheckpointTranscriptSummary => Boolean(summary?.hasCheckpointOps))
+  if (
+    checkpointSummaries.length > 0
+    && attempts.every(a => a.exitCode === 0 && a.claimCount === 0 && a.rejectedBy !== 'execution' && a.signaturesValid)
+  ) {
+    const merged: CheckpointTranscriptSummary = {
+      hasCheckpointOps: true,
+      sealedHandles: [...new Set(checkpointSummaries.flatMap(s => s.sealedHandles))],
+      cryptoOpCount: checkpointSummaries.reduce((acc, s) => acc + s.cryptoOpCount, 0),
+      asyncPollCount: checkpointSummaries.reduce((acc, s) => acc + s.asyncPollCount, 0),
+    }
+    const checkpointHint = formatCheckpointNextStepHint(merged)
+    return {
+      ...withFeedback({
+        confirmed: false,
+        reason: 'checkpoint_only',
+        detail: checkpointHint,
+        attempts,
+        disagreements: [],
+        claimTitle: first.report.title ?? second.report.title,
+        usageHint: checkpointHint,
+      }, false),
+      rejectedBy: 'checkpoint',
+      missingEvidence: ['composite_receipt'],
+    }
+  }
   if (attempts.some(a => a.claimCount === 0)) {
     const diag = feedback(true)
     const suffix = diag.stderrPreview
@@ -497,14 +653,17 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
   if (attempts.some(a => a.exitCode !== 0)) {
     const diag = feedback(true)
     const suffix = diag.stderrPreview ? `: ${diag.stderrPreview.slice(0, 200)}` : ''
-    return withFeedback({
-      confirmed: false,
-      reason: 'execution_failed',
-      detail: `A verification run exited non-zero (${detailBase}, exitCode=${diag.exitCode ?? 1}${suffix}).`,
-      attempts,
-      disagreements: [],
-      claimTitle: first.report.title,
-    }, true)
+    return {
+      ...withFeedback({
+        confirmed: false,
+        reason: 'execution_failed',
+        detail: `A verification run exited non-zero (${detailBase}, exitCode=${diag.exitCode ?? 1}${suffix}).`,
+        attempts,
+        disagreements: [],
+        claimTitle: first.report.title,
+      }, true),
+      rejectedBy: diag.rejectedBy && diag.rejectedBy !== 'claims' ? diag.rejectedBy : 'execution',
+    }
   }
   if (!attempts.every(a => a.signaturesValid)) {
     return withFeedback({ confirmed: false, reason: 'transcript_mismatch', detail: 'A transcript failed signature verification.', attempts, disagreements: [], claimTitle: first.report.title })
