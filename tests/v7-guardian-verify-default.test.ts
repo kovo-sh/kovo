@@ -7,6 +7,7 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
+import { statSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
@@ -30,7 +31,14 @@ import type { Grant } from '../src/server/broker.ts'
 import { agentProofAttribution } from '../src/server/exec-verify.ts'
 import type { ResolvedPersona } from '../src/server/persona-vault.ts'
 import { buildAgentScriptReceipt, verifyReceipt, type ScriptProofExchange } from '../src/server/proof-receipt.ts'
-import { createLocalAttemptFactory, prepareVerifyScript, verifyScript } from '../src/server/verify-rpc.ts'
+import {
+  VERIFY_RPC_CONTEXT_NAME,
+  VERIFY_RPC_TOKEN_NAME,
+  VerifyRpcServer,
+  createLocalAttemptFactory,
+  prepareVerifyScript,
+  verifyScript,
+} from '../src/server/verify-rpc.ts'
 import { makeLabGrant } from './v4-tier-helpers.ts'
 
 process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
@@ -553,4 +561,110 @@ console.log('confirmed: true')
   assert.notEqual(payload.exitCode, 0)
   assert.ok(payload.stderrPreview && payload.stderrPreview.length > 0 && payload.stderrPreview.length <= 400)
   assert.equal(payload.usageHint, GUARDIAN_VERIFY_USAGE_HINT)
+})
+
+test('VerifyRpcServer stages hostDir, token, context.json, and verify.sock with container-UID-accessible modes even under umask 0077', async t => {
+  const fixture = await startBoundaryFixture()
+  t.after(() => fixture.close())
+  const previousUmask = process.umask(0o077)
+  const server = new VerifyRpcServer({
+    broker: new RequestBroker({ rejectUnauthorized: false }),
+    grant: fixture.grant,
+    runId: `run-umask-${randomUUID().slice(0, 8)}`,
+    assignmentId: 'assignment-umask',
+    targetOrigins: [fixture.origin],
+  })
+  t.after(async () => {
+    process.umask(previousUmask)
+    await server.close()
+  })
+  await server.start()
+  const dirMode = statSync(server.hostDir).mode & 0o777
+  const contextMode = statSync(join(server.hostDir, VERIFY_RPC_CONTEXT_NAME)).mode & 0o777
+  const tokenMode = statSync(join(server.hostDir, VERIFY_RPC_TOKEN_NAME)).mode & 0o777
+  const socketMode = statSync(server.socketPath).mode & 0o777
+  assert.ok((dirMode & 0o001) !== 0, `RPC hostDir must be traversable by container UID 10001 (got 0${dirMode.toString(8)})`)
+  assert.ok((contextMode & 0o004) !== 0, `context.json must be world-readable for container UID 10001 (got 0${contextMode.toString(8)})`)
+  assert.ok((tokenMode & 0o004) !== 0, `token must be world-readable for container UID 10001 (got 0${tokenMode.toString(8)})`)
+  assert.equal(socketMode & 0o006, 0o006, `verify.sock must be connectable by container UID 10001 (got 0${socketMode.toString(8)})`)
+})
+
+test('TS wrapper edge cases (markdown fences, inline semicolon export default, standalone async fn) and Python await parity', async t => {
+  const fixture = await startBoundaryFixture()
+  t.after(() => fixture.close())
+  const makeFactory = () => createLocalAttemptFactory({
+    sdkDir: SDK_DIR,
+    createRpcOptions() {
+      return {
+        broker: new RequestBroker({ rejectUnauthorized: false }),
+        grant: fixture.grant,
+        runId: `run-edge-${randomUUID().slice(0, 8)}`,
+        assignmentId: 'assignment-edge',
+        targetOrigins: [fixture.origin],
+      }
+    },
+  })
+
+  assert.match(GUARDIAN_VERIFY_TOOL_DESCRIPTION, /Python.*synchronous/i)
+  assert.match(GUARDIAN_VERIFY_USAGE_HINT, /Python.*synchronous/i)
+
+  // 1. Markdown-fenced TS script
+  const fencedVerdict = await verifyScript({
+    candidate: {
+      name: 'fenced.ts',
+      runtime: 'ts',
+      code: [
+        '```ts',
+        "await ctx.prove_access_boundary({ controlPersona: 'user_b', probePersona: 'user_a', route: '/api/v1/items/1' })",
+        "return ctx.result({ title: 'Fenced TS BOLA read (CWE-639)' })",
+        '```',
+      ].join('\n'),
+    },
+    openAttempt: makeFactory(),
+  })
+  assert.equal(fencedVerdict.confirmed, true, `${fencedVerdict.reason}: ${fencedVerdict.detail}`)
+
+  // 2. Single-line statement followed by `; export default async (ctx) => ...`
+  const inlineExportVerdict = await verifyScript({
+    candidate: {
+      name: 'inline-export.ts',
+      runtime: 'ts',
+      code: "const route = '/api/v1/items/1'; export default async (ctx) => { await ctx.prove_access_boundary({ controlPersona: 'user_b', probePersona: 'user_a', route }); return ctx.result({ title: 'Inline export default read (CWE-639)' }) }",
+    },
+    openAttempt: makeFactory(),
+  })
+  assert.equal(inlineExportVerdict.confirmed, true, `${inlineExportVerdict.reason}: ${inlineExportVerdict.detail}`)
+
+  // 3. Standalone `async (ctx) => { ... }` and `async function(ctx) { ... }` without `export default`
+  const standaloneFnVerdict = await verifyScript({
+    candidate: {
+      name: 'standalone-fn.ts',
+      runtime: 'ts',
+      code: "async function(ctx) { await ctx.prove_access_boundary({ controlPersona: 'user_b', probePersona: 'user_a', route: '/api/v1/items/1' }); return ctx.result({ title: 'Standalone async fn read (CWE-639)' }) }",
+    },
+    openAttempt: makeFactory(),
+  })
+  assert.equal(standaloneFnVerdict.confirmed, true, `${standaloneFnVerdict.reason}: ${standaloneFnVerdict.detail}`)
+
+  // 4. Python inline script using `await ctx.prove_access_boundary(...)` (bare body + async def)
+  const pyAwaitBareVerdict = await verifyScript({
+    candidate: {
+      name: 'py-await-bare.py',
+      runtime: 'python',
+      title: 'Python await bare BOLA read',
+      code: "proof = await ctx.prove_access_boundary('user_b', 'user_a', '/api/v1/items/1')\nreturn ctx.result('Python await bare BOLA read')",
+    },
+    openAttempt: makeFactory(),
+  })
+  assert.equal(pyAwaitBareVerdict.confirmed, true, `${pyAwaitBareVerdict.reason}: ${pyAwaitBareVerdict.detail} | stderr=${pyAwaitBareVerdict.stderrPreview ?? ''}`)
+
+  const pyAsyncDefVerdict = await verifyScript({
+    candidate: {
+      name: 'py-async-def.py',
+      runtime: 'python',
+      code: "async def verify(ctx):\n    ex = await ctx.http('/api/v1/items/1', as_persona='user_a')\n    await ctx.prove_access_boundary('user_b', 'user_a', '/api/v1/items/1')\n    return ctx.result('Python async def BOLA read')",
+    },
+    openAttempt: makeFactory(),
+  })
+  assert.equal(pyAsyncDefVerdict.confirmed, true, `${pyAsyncDefVerdict.reason}: ${pyAsyncDefVerdict.detail} | stderr=${pyAsyncDefVerdict.stderrPreview ?? ''}`)
 })

@@ -1940,10 +1940,14 @@ export class VerifyRpcServer {
       }
     }
     // 0711: the sandbox uid can traverse to the mounted files without listing the host directory.
+    // Explicit chmodSync on every file bypasses restrictive host umasks (e.g. 0077) so the
+    // non-root worker container UID (10001) never hits EACCES reading /guardian-rpc/*.
     chmodSync(this.hostDirValue, 0o711)
     this.socketPathValue = join(this.hostDirValue, VERIFY_RPC_SOCKET_NAME)
     this.tokenValue = randomBytes(24).toString('hex')
-    writeFileSync(join(this.hostDirValue, VERIFY_RPC_TOKEN_NAME), this.tokenValue + '\n', { mode: 0o444 })
+    const tokenPath = join(this.hostDirValue, VERIFY_RPC_TOKEN_NAME)
+    writeFileSync(tokenPath, this.tokenValue + '\n', { mode: 0o444 })
+    chmodSync(tokenPath, 0o444)
     const context = {
       nonce: this.nonce,
       runId: this.options.runId,
@@ -1951,7 +1955,9 @@ export class VerifyRpcServer {
       targetOrigins: this.options.targetOrigins ?? [],
       sdkVersion: 'guardian_verify/v6-mvp',
     }
-    writeFileSync(join(this.hostDirValue, VERIFY_RPC_CONTEXT_NAME), JSON.stringify(context, null, 2), { mode: 0o444 })
+    const contextPath = join(this.hostDirValue, VERIFY_RPC_CONTEXT_NAME)
+    writeFileSync(contextPath, JSON.stringify(context, null, 2), { mode: 0o444 })
+    chmodSync(contextPath, 0o444)
 
     const server = createServer((req, res) => { void this.handle(req, res) })
     server.on('clientError', (_err, socket) => {
@@ -2621,7 +2627,14 @@ export class VerifyRpcServer {
 export const GUARDIAN_VERIFY_STDERR_PREVIEW_MAX_CHARS = 400
 
 export const GUARDIAN_VERIFY_USAGE_HINT =
-  'Inline TS scripts receive `ctx` directly (no imports required): `await ctx.prove_access_boundary({ controlPersona, probePersona, route }); return ctx.result({ title: "..." })` (or `export default async (ctx) => { ... }`).'
+  'Inline TS scripts receive `ctx` directly (no imports required): `await ctx.prove_access_boundary({ controlPersona, probePersona, route }); return ctx.result({ title: "..." })` (or `export default async (ctx) => { ... }`). Python `ctx.*` helpers are synchronous (no `await` needed).'
+
+/** Strip accidental outer markdown code fences (```ts ... ``` / ```python ... ```) from LLM scripts. */
+function stripCodeFences(rawCode: string): string {
+  const trimmed = rawCode.trim()
+  const match = /^```[a-zA-Z0-9_-]*[ \t]*\r?\n([\s\S]*?)\r?\n```$/.exec(trimmed)
+  return match ? match[1]! : rawCode
+}
 
 /** Redact credential-shaped tokens and bound stderr preview to 400 chars for repair feedback. */
 export function redactStderrPreview(raw: string, maxChars = GUARDIAN_VERIFY_STDERR_PREVIEW_MAX_CHARS): string {
@@ -2700,17 +2713,18 @@ function splitLeadingTsImports(code: string): { imports: string; body: string } 
  * Idempotent: calling twice produces the exact same output. Never fabricates claims.
  */
 export function prepareVerifyScript(rawCode: string, runtime: 'ts' | 'python', defaultTitle?: string): string {
-  const trimmed = rawCode.trim()
+  const unfenced = stripCodeFences(rawCode)
+  const trimmed = unfenced.trim()
   if (!trimmed) return rawCode
   const titleLiteral = JSON.stringify(defaultTitle?.trim() || 'Verification script proof')
 
   if (runtime === 'python') {
     if (/\b(?:run|run_entrypoint|_guardian_run)\s*\(/.test(trimmed) || /\bGUARDIAN_PROOF_RESULT_FILE\b/.test(trimmed)) {
-      return rawCode
+      return unfenced
     }
-    if (/^[ \t]*def\s+verify\s*\(/m.test(trimmed)) {
+    if (/^[ \t]*(?:async\s+)?def\s+verify\s*\(/m.test(trimmed)) {
       return [
-        rawCode,
+        unfenced,
         '',
         'from guardian_verify import run_entrypoint as _guardian_run',
         `_guardian_run(verify, setup=globals().get("setup"), cleanup=globals().get("cleanup"), default_title=${titleLiteral})`,
@@ -2718,25 +2732,26 @@ export function prepareVerifyScript(rawCode: string, runtime: 'ts' | 'python', d
       ].join('\n')
     }
     if (/\bctx\b/.test(trimmed)) {
-      const indented = rawCode
+      const defPrefix = /\bawait\b/.test(trimmed) ? 'async def' : 'def'
+      const indented = unfenced
         .split(/\r?\n/)
         .map(line => (line.trim() ? `    ${line}` : ''))
         .join('\n')
       return [
         'from guardian_verify import run_entrypoint as _guardian_run',
         '',
-        'def _guardian_inline_verify(ctx):',
+        `${defPrefix} _guardian_inline_verify(ctx):`,
         indented,
         '',
         `_guardian_run(_guardian_inline_verify, default_title=${titleLiteral})`,
         '',
       ].join('\n')
     }
-    return rawCode
+    return unfenced
   }
 
   // TypeScript runtime
-  const normalized = normalizeTsSdkImports(rawCode)
+  const normalized = normalizeTsSdkImports(unfenced)
   if (
     /\b(?:runVerification|runEntrypoint|__guardian_run)\s*\(/.test(normalized)
     || /\bGUARDIAN_PROOF_RESULT_FILE\b/.test(normalized)
@@ -2750,8 +2765,9 @@ export function prepareVerifyScript(rawCode: string, runtime: 'ts' | 'python', d
     ? "import { defineVerification, runEntrypoint as __guardian_run } from './guardian_verify.ts'\n"
     : "import { runEntrypoint as __guardian_run } from './guardian_verify.ts'\n"
 
-  if (/^[ \t]*export\s+default\b/m.test(normalized)) {
-    const rewritten = normalized.replace(/^([ \t]*)export\s+default\s+/m, '$1const __guardian_default_export = ')
+  const exportDefaultRe = /(^|;[ \t]*|\n[ \t]*)export\s+default\s+/
+  if (exportDefaultRe.test(normalized)) {
+    const rewritten = normalized.replace(exportDefaultRe, '$1const __guardian_default_export = ')
     return `${sdkImport}${rewritten}\n;\nawait __guardian_run(__guardian_default_export, ${titleLiteral})\n`
   }
 
@@ -2767,6 +2783,13 @@ export function prepareVerifyScript(rawCode: string, runtime: 'ts' | 'python', d
   if (/\bctx\b/.test(normalized)) {
     const { imports, body } = splitLeadingTsImports(normalized)
     const prefix = imports ? `${sdkImport}${imports}\n` : sdkImport
+    const bodyTrimmed = body.trim()
+    // Standalone function expression (e.g. `async (ctx) => { ... }` or `async function(ctx) { ... }`)
+    const isStandaloneFnExpr = /^(?:async\s+)?(?:\(\s*ctx\b[^)]*\)\s*=>|ctx\s*=>|function\s*(?:[A-Za-z_$][\w$]*)?\s*\(\s*ctx\b[^)]*\))/.test(bodyTrimmed)
+    if (isStandaloneFnExpr) {
+      const expr = bodyTrimmed.replace(/;\s*$/, '')
+      return `${prefix}await __guardian_run((\n${expr}\n), ${titleLiteral})\n`
+    }
     return `${prefix}await __guardian_run(async (ctx) => {\n${body}\n}, ${titleLiteral})\n`
   }
 

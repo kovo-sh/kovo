@@ -1822,10 +1822,10 @@ export function gapValidationRejectedMessage(
 
 
 export const GUARDIAN_VERIFY_USAGE_HINT =
-  'Inline TS scripts receive `ctx` directly (no imports required): `await ctx.prove_access_boundary({ controlPersona, probePersona, route }); return ctx.result({ title: "..." })` (or `export default async (ctx) => { ... }`).'
+  'Inline TS scripts receive `ctx` directly (no imports required): `await ctx.prove_access_boundary({ controlPersona, probePersona, route }); return ctx.result({ title: "..." })` (or `export default async (ctx) => { ... }`). Python `ctx.*` helpers are synchronous (no `await` needed).'
 
 const GUARDIAN_VERIFY_TS_EXAMPLE = [
-  'Working inline TS example (`ctx` is pre-injected — no imports needed; `export default async (ctx) => ...` also works):',
+  'Working inline TS example (`ctx` is pre-injected — no imports needed; `export default async (ctx) => ...` also works; in Python `ctx.*` is synchronous, no `await` needed):',
   '```ts',
   'const proof = await ctx.prove_access_boundary({',
   '  controlPersona: "user_b", probePersona: "user_a", route: "/api/v1/items/1",',

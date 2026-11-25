@@ -17,7 +17,9 @@ Only Python standard library modules are used (http.client, json, os, socket, st
 
 from __future__ import annotations
 
+import asyncio
 import http.client
+import inspect
 import json
 import math
 import os
@@ -26,6 +28,15 @@ import socket
 import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
+
+
+class _AwaitableDict(dict):
+    """Dict that also supports `await` so inline Python scripts work with or without `await`."""
+
+    def __await__(self):  # type: ignore[no-untyped-def]
+        if False:
+            yield None
+        return self
 
 
 class VerificationError(RuntimeError):
@@ -149,6 +160,11 @@ class Exchange:
     def json(self) -> Any:
         return json.loads(self.body)
 
+    def __await__(self):  # type: ignore[no-untyped-def]
+        if False:
+            yield None
+        return self
+
 
 @dataclass
 class BrowserExchange(Exchange):
@@ -180,6 +196,11 @@ class OobHandle:
     @property
     def dns_host(self) -> str:
         return str(self.raw.get("dnsHost", ""))
+
+    def __await__(self):  # type: ignore[no-untyped-def]
+        if False:
+            yield None
+        return self
 
 
 @dataclass
@@ -225,6 +246,11 @@ class ProofResult:
         if self.description:
             out["description"] = self.description
         return out
+
+    def __await__(self):  # type: ignore[no-untyped-def]
+        if False:
+            yield None
+        return self
 
 
 def _split_target(target: Any, default_origin: Optional[str]) -> tuple[Optional[str], str]:
@@ -649,7 +675,7 @@ class VerifyContext:
             missing.append("variant_crossed")
         if not expect_control_denied and control_persona == probe_persona:
             missing.append("actor_differential")
-        return {
+        return _AwaitableDict({
             "ok": not missing,
             "claim": claim,
             "control": control,
@@ -660,7 +686,7 @@ class VerifyContext:
             **_feedback("boundary" if missing else None, missing, [
                 _entry("control_denied", control), _entry("variant_crossed", probe),
             ]),
-        }
+        })
 
     def prove_persisted_mutation(self, read_route: Any, mutation: Any, field_path: str,
                                  expect_delta: Any = ..., **options: Any) -> dict[str, Any]:
@@ -729,13 +755,13 @@ class VerifyContext:
             missing.append(f"field_delta:{field_path}")
         if not expectation_matched:
             missing.append("expected_delta")
-        return {
+        return _AwaitableDict({
             "ok": not missing, "claim": claim, "before": before, "mutation": write, "after": after,
             "delta": delta, "expectationMatched": expectation_matched,
             **_feedback("impact" if missing else None, missing, [
                 _entry("before_get", before), _entry("mutation", write), _entry("after_get", after),
             ]),
-        }
+        })
 
     def prove_boolean_or_timing_diff(self, control: Any, variant: Any, mode: str,
                                      rounds: Optional[int] = None, **options: Any) -> dict[str, Any]:
@@ -779,7 +805,7 @@ class VerifyContext:
                 missing.append("variant_arm")
             if stats["pValue"] > float(options.get("max_p_value", 0.05)) or stats["separation"] < 3:
                 missing.append("timing_separation")
-            return {
+            return _AwaitableDict({
                 "ok": not missing, "mode": "timing", "controlIds": control_ids,
                 "variantIds": variant_ids, "claim": claim, "stats": stats,
                 "exchanges": {"control": control_exchanges, "variant": variant_exchanges},
@@ -787,7 +813,7 @@ class VerifyContext:
                     *[_entry("control", item, f"timing {item.duration_ms}ms") for item in control_exchanges],
                     *[_entry("probe", item, f"timing {item.duration_ms}ms") for item in variant_exchanges],
                 ]),
-            }
+            })
 
         count = max(2, min(int(rounds or 3), 6))
         for index in range(count):
@@ -830,7 +856,7 @@ class VerifyContext:
         if _normalize_equals(control_bodies[0] if control_bodies else "",
                              variant_bodies[0] if variant_bodies else "") or similarity >= max_similarity:
             missing.append("arm_differential")
-        return {
+        return _AwaitableDict({
             "ok": not missing, "mode": "boolean", "controlIds": control_ids,
             "variantIds": variant_ids, "claim": claim,
             "stats": {"stableDelta": stable_delta, "similarity": round(similarity, 4),
@@ -840,7 +866,7 @@ class VerifyContext:
                 *[_entry("control", item) for item in control_exchanges],
                 *[_entry("probe", item) for item in variant_exchanges],
             ]),
-        }
+        })
 
     def prove_oob_callback(self, inject: Any, token: Optional[str] = None,
                            timeout_ms: int = 6000, immediate_ms: int = 3000,
@@ -901,7 +927,7 @@ class VerifyContext:
         if wait.get("exchangeId"):
             transcript.append(_entry("oob_wait", {"exchangeId": wait["exchangeId"], "method": "WAIT",
                                                   "pathAndQuery": "/oob/wait"}, "hit" if hit else "no callback"))
-        return {
+        return _AwaitableDict({
             "ok": not missing, "claim": claim, "token": handle.token, "url": handle.url,
             "dnsHost": handle.dns_host, "hit": hit,
             "stage": wait.get("stage", "immediate" if hit else ("pending" if subscription.get("subscriptionId") else "none")),
@@ -911,7 +937,7 @@ class VerifyContext:
                           "injection": injection.exchange_id if injection else None,
                           "wait": wait.get("exchangeId")},
             **_feedback("injection" if injection_error else ("oob" if missing else None), missing, transcript),
-        }
+        })
 
     def prove_race_burst(self, requests: list[Any], barrier: str = "auto", **options: Any) -> dict[str, Any]:
         """Synchronized HTTP/2 single-packet burst with an explicit HTTP/1.1 fallback report."""
@@ -968,12 +994,12 @@ class VerifyContext:
                                       "pathAndQuery": payload[index]["path"], "status": item["status"],
                                       "durationMs": item["durationMs"]}, mode)
                       for index, item in enumerate(exchanges)]
-        return {
+        return _AwaitableDict({
             "ok": not missing, "claim": claim, "mode": mode,
             "fallbackReason": result.get("fallbackReason"), "summary": result.get("summary", {}),
             "exchanges": exchanges,
             **_feedback("race" if missing else None, missing, transcript),
-        }
+        })
 
     def prove_injection_differential(
         self,
@@ -1033,12 +1059,12 @@ class VerifyContext:
                 impact_claim["message"] = message
             self.claims.append(impact_claim)
             emitted.append(impact_claim)
-        return {
+        return _AwaitableDict({
             "ok": not missing, "control": c_ex, "probe": p_ex, "claims": emitted, "evaluated": evaluated,
             **_feedback("injection_differential" if missing else None, missing, [
                 _entry("control", c_ex), _entry("probe", p_ex),
             ]),
-        }
+        })
 
     # -- camelCase aliases matching the TS contract ----------------------
     def proveAccessBoundary(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -1124,15 +1150,22 @@ def _normalize_proof_result(ctx: VerifyContext, returned: Any, default_title: Op
     }
 
 
+def _invoke_hook(fn: Callable[[VerifyContext], Any], ctx: VerifyContext) -> Any:
+    res = fn(ctx)
+    if inspect.iscoroutine(res):
+        return asyncio.run(res)
+    return res
+
+
 def run(script: VerificationScript, default_title: Optional[str] = None) -> None:
     """Run the 3-hook contract and emit the claims document. Stdout is never evidence."""
     ctx = VerifyContext()
     try:
         if script.setup:
-            script.setup(ctx)
-        result = script.verify(ctx)
+            _invoke_hook(script.setup, ctx)
+        result = _invoke_hook(script.verify, ctx)
         if script.cleanup:
-            script.cleanup(ctx)
+            _invoke_hook(script.cleanup, ctx)
     except Exception as error:  # noqa: BLE001 - scripts must fail closed
         _write_result({"sdk": "guardian_verify.py", "nonce": ctx.nonce, "error": str(error)[:2000], "claims": []})
         print(f"guardian_verify: {error}", file=sys.stderr)
