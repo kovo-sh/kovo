@@ -174,6 +174,46 @@ test('C1.3: verify_replay_spec is hidden from tool schemas when guardian_verify 
   assert.match(proposeTool.description, /static_ast_proof/)
   assert.equal(proposeTool.description.includes('- dns_takeover:'), false, 'retired runtime DSL schemas must not dilute tool prompt')
   assert.equal(proposeTool.description.includes('- sql_boolean_diff'), false, 'disabled runtime DSL schemas must not dilute tool prompt')
+  assert.doesNotMatch(
+    proposeTool.description,
+    /\b(?:verify_replay_spec|http_chain|dns_takeover|tls_audit|browser_dom|ws_chain|upload_probe)\b/,
+    'active guardian_verify propose_chain_finding description must not mention legacy verify_replay_spec or retired/runtime DSL kinds',
+  )
+
+  // Retired fail-closed DSL kinds are scrubbed from proposeChainFindingDescription in all modes,
+  // while active legacy replay kinds remain intact when guardian_verify is absent.
+  const legacyOnlyProposeDesc = agentPrompts.proposeChainFindingDescription(false)
+  assert.match(legacyOnlyProposeDesc, /\bhttp_chain\b/)
+  assert.doesNotMatch(
+    legacyOnlyProposeDesc,
+    /\b(?:dns_takeover|tls_audit|browser_dom|ws_chain|upload_probe)\b/,
+    'retired fail-closed DSL kinds must stay scrubbed even in legacy replay-only mode',
+  )
+
+  // Proof-gap repair nudges scrub verify_replay_spec / DeclarativeReplaySpec when guardian_verify is active,
+  // while keeping legacy replay-only sessions intact when guardian_verify is absent.
+  const sampleRoute = { method: 'POST', path: '/api/v1/orders/:id', params: ['amount'] }
+  const activeReqNudge = agentPrompts.specSubmissionRequiredMessage(sampleRoute, { hasGuardianVerify: true })
+  assert.match(activeReqNudge, /guardian_verify\(script=/)
+  assert.doesNotMatch(activeReqNudge, /\bverify_replay_spec\b|DeclarativeReplaySpec/)
+  const legacyReqNudge = agentPrompts.specSubmissionRequiredMessage(sampleRoute, { hasGuardianVerify: false })
+  assert.match(legacyReqNudge, /\bverify_replay_spec\b/)
+  assert.ok(legacyReqNudge.includes(agentPrompts.GUARDIAN_VERIFY_SPEC_SHAPE))
+
+  const activeGapNudge = agentPrompts.gapValidationRejectedMessage(
+    [{ key: 'POST /api/v1/orders/:id', code: 'auth_blocked', missing: 'a 401/403' }],
+    sampleRoute,
+    { hasGuardianVerify: true },
+  )
+  assert.match(activeGapNudge, /guardian_verify\(script=/)
+  assert.doesNotMatch(activeGapNudge, /\bverify_replay_spec\b|DeclarativeReplaySpec/)
+  const legacyGapNudge = agentPrompts.gapValidationRejectedMessage(
+    [{ key: 'POST /api/v1/orders/:id', code: 'auth_blocked', missing: 'a 401/403' }],
+    sampleRoute,
+    { hasGuardianVerify: false },
+  )
+  assert.match(legacyGapNudge, /\bverify_replay_spec\b/)
+  assert.ok(legacyGapNudge.includes(agentPrompts.GUARDIAN_VERIFY_SPEC_SHAPE))
 
   // Explicit allowLegacyReplaySpec opt-in re-exposes verify_replay_spec (for legacy/static tests).
   const optedInTools = agentSession.buildWorkerTools(
