@@ -962,6 +962,14 @@ export class VerifyRpcServer {
       nextBody = replaceInline(nextBody, targetUrl, 'url', { jsonEscape: isJsonBody })
     }
 
+    // 4b) Encapsulated vault auto-detection for literal sealed values in path/query, headers, or body
+    const autoParts = [nextPathAndQuery, ...Object.values(nextHeaders), ...Object.values(injectedHeaders), ...(typeof nextBody === 'string' && nextBody ? [nextBody] : [])]
+    for (const hit of this.capabilityVault.matchSealedHandlesInRequest({ runId: this.capabilityVault.runId, targetOrigin: nextOrigin, parts: autoParts })) {
+      if (!attestationsById.has(hit.handleId)) {
+        attestationsById.set(hit.handleId, { consumedCapabilityId: hit.handleId, digest: hit.rawDigest, sha256Prefix: hit.rawDigest.slice(0, 12), target: 'url', runId: this.capabilityVault.runId, timestampMs: Date.now() })
+      }
+    }
+
     const attestations = [...attestationsById.values()]
     if (attestations.length === 0) {
       return { brokerRequest: baseReq, grant: this.options.grant, requestMeta, attestation: null, attestations: [], injectedHeaders: {} }
@@ -1008,7 +1016,7 @@ export class VerifyRpcServer {
       ...requestMeta,
       origin: nextOrigin,
       pathAndQuery: this.scrub(nextPathAndQuery),
-      headers: metaHeaders,
+      headers: this.scrubRecord(metaHeaders),
       ...(nextBody !== baseReq.body ? {
         bodyBytes: nextBody ? Buffer.byteLength(nextBody) : 0,
         bodySha256: createHash('sha256').update(this.scrub(nextBody ?? '')).digest('hex'),
@@ -1044,9 +1052,7 @@ export class VerifyRpcServer {
       ]
       const hay = searchParts.join('\n')
       for (const [signature, att] of this.hmacDerivations.entries()) {
-        if (signature.length >= 8 && hay.includes(signature)) {
-          add(att)
-        }
+        if (signature.length >= 8 && (hay.includes(signature) || hay.includes(encodeURIComponent(signature)))) add(att)
       }
     }
     return matched
@@ -1150,93 +1156,83 @@ export class VerifyRpcServer {
     for (const eid of entityIds) this.mutatedSessionEntities.add(`${sessionKey}::${eid}`)
   }
 
-  private async handleHttp(args: Record<string, unknown>, nonce: string, proto: 'http' | 'http2'): Promise<unknown> {
+  private prepareCapRequest(args: Record<string, unknown>, nonce: string) {
     const parsed = this.parseHttpArgs(args)
-    const capArg = this.parseCapabilityArg(args)
-    const applied = this.applyCapabilityInjection(parsed.brokerRequest, parsed.requestMeta, capArg)
+    const applied = this.applyCapabilityInjection(parsed.brokerRequest, parsed.requestMeta, this.parseCapabilityArg(args))
     const consumedIds = applied.attestations.map(a => a.consumedCapabilityId)
     const cryptoAttestations = this.detectCryptoAttestationsForRequest(applied.brokerRequest, consumedIds, applied.injectedHeaders)
+    const derivedFromCapabilityIds = [...new Set(cryptoAttestations.map(a => a.derivedFromCapabilityId))]
     const requestMeta: VerifyTranscriptRequest = {
       ...applied.requestMeta,
       ...(cryptoAttestations.length > 0 ? { derivedFromCapabilityId: cryptoAttestations[0]!.derivedFromCapabilityId } : {}),
       nonce,
     }
     const sessionKey = applied.brokerRequest.session ?? '__default__'
-    const { isControlOrAblation, cleanSession, entityIds } = this.computeControlCleanSession(sessionKey, args, applied.brokerRequest, requestMeta.sessionRole)
+    const control = this.computeControlCleanSession(sessionKey, args, applied.brokerRequest, requestMeta.sessionRole)
+    return { applied, consumedIds, cryptoAttestations, derivedFromCapabilityIds, requestMeta, sessionKey, ...control }
+  }
+
+  private async handleHttp(args: Record<string, unknown>, nonce: string, proto: 'http' | 'http2'): Promise<unknown> {
+    const prep = this.prepareCapRequest(args, nonce)
     const started = this.nextHostTimestampMs()
     try {
-      const result = await this.options.broker.executeHttp(applied.brokerRequest, applied.grant, AbortSignal.timeout(this.options.callTimeoutMs ?? 30_000))
-      this.recordSessionMutation(sessionKey, applied.brokerRequest.method, entityIds, isControlOrAblation, result.status)
+      const result = await this.options.broker.executeHttp(prep.applied.brokerRequest, prep.applied.grant, AbortSignal.timeout(this.options.callTimeoutMs ?? 30_000))
+      this.recordSessionMutation(prep.sessionKey, prep.applied.brokerRequest.method, prep.entityIds, prep.isControlOrAblation, result.status)
       const body = this.scrub(result.body)
       const record = this.transcript.record({
-        op: proto, startedAt: started, durationMs: result.durationMs, request: requestMeta, body,
+        op: proto, startedAt: started, durationMs: result.durationMs, request: prep.requestMeta, body,
         response: {
           status: result.status, headers: this.scrubRecord(result.respHeaders), bodyBytes: result.bodyBytes,
           bodySha256: result.bodySha256, mediaType: result.mediaType, redirectOrigins: result.redirectOrigins,
           ...(result.finalPathAndQuery ? { finalPathAndQuery: this.scrub(result.finalPathAndQuery) } : {}),
         },
       })
-      this.recordRequestProvenance(record.exchangeId, started, args, applied.brokerRequest, requestMeta, { body: result.body, respHeaders: result.respHeaders }, applied.attestations, cryptoAttestations, cleanSession)
+      this.recordRequestProvenance(record.exchangeId, started, args, prep.applied.brokerRequest, prep.requestMeta, { body: result.body, respHeaders: result.respHeaders }, prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession)
       return this.exchangeView(record, { ...result, body }, {
-        consumedCapabilityId: applied.attestation?.consumedCapabilityId ?? null,
-        consumedCapabilities: consumedIds,
-        derivedFromCapabilityIds: [...new Set(cryptoAttestations.map(a => a.derivedFromCapabilityId))],
+        consumedCapabilityId: prep.applied.attestation?.consumedCapabilityId ?? null,
+        consumedCapabilities: prep.consumedIds,
+        derivedFromCapabilityIds: prep.derivedFromCapabilityIds,
       })
     } catch (error) {
       const msg = this.scrub(error instanceof Error ? error.message : 'HTTP exchange failed.')
-      const record = this.transcript.record({ op: proto, startedAt: started, durationMs: Date.now() - started, request: requestMeta, error: msg, errorCode: /scope|denied|approval|forbidden|outside|header/i.test(msg) ? 'denied' : 'failed' })
+      const record = this.transcript.record({ op: proto, startedAt: started, durationMs: Date.now() - started, request: prep.requestMeta, error: msg, errorCode: /scope|denied|approval|forbidden|outside|header/i.test(msg) ? 'denied' : 'failed' })
       throw new Error(`${record.exchangeId}: ${msg}`)
     }
   }
 
   private async handleHttp2(args: Record<string, unknown>, nonce: string): Promise<unknown> {
-    const { brokerRequest, requestMeta } = this.parseHttpArgs(args)
-    const started = Date.now()
+    const prep = this.prepareCapRequest(args, nonce)
+    const started = this.nextHostTimestampMs()
     const signal = AbortSignal.timeout(this.options.callTimeoutMs ?? 30_000)
     try {
-      const h2 = await this.executeHttp2(brokerRequest, signal)
+      const h2 = await this.executeHttp2(prep.applied.brokerRequest, signal, prep.applied.grant)
+      this.recordSessionMutation(prep.sessionKey, prep.applied.brokerRequest.method, prep.entityIds, prep.isControlOrAblation, h2.status)
       const body = this.scrub(h2.body)
       const record = this.transcript.record({
-        op: 'http2',
-        startedAt: started,
-        durationMs: h2.durationMs,
-        request: { ...requestMeta, nonce },
+        op: 'http2', startedAt: started, durationMs: h2.durationMs, request: prep.requestMeta, body,
         response: {
-          status: h2.status,
-          headers: this.scrubRecord(h2.headers),
-          bodyBytes: Buffer.byteLength(h2.body),
-          bodySha256: createHash('sha256').update(body).digest('hex'),
-          mediaType: h2.headers['content-type'] ?? 'application/octet-stream',
+          status: h2.status, headers: this.scrubRecord(h2.headers), bodyBytes: Buffer.byteLength(h2.body),
+          bodySha256: createHash('sha256').update(body).digest('hex'), mediaType: h2.headers['content-type'] ?? 'application/octet-stream',
         },
-        body,
       })
+      this.recordRequestProvenance(record.exchangeId, started, args, prep.applied.brokerRequest, prep.requestMeta, { body: h2.body, respHeaders: h2.headers }, prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession)
       return this.scrubRecord({
-        exchangeId: record.exchangeId,
-        status: h2.status,
-        headers: h2.headers,
-        body: body.slice(0, 512 * 1024),
-        bodyBytes: Buffer.byteLength(h2.body),
-        bodySha256: record.response?.bodySha256,
-        durationMs: h2.durationMs,
-        mediaType: record.response?.mediaType,
-        protocol: 'h2',
+        exchangeId: record.exchangeId, status: h2.status, headers: h2.headers, body: body.slice(0, 512 * 1024),
+        bodyBytes: Buffer.byteLength(h2.body), bodySha256: record.response?.bodySha256, durationMs: h2.durationMs,
+        mediaType: record.response?.mediaType, protocol: 'h2',
+        ...(prep.applied.attestation?.consumedCapabilityId ? { consumedCapabilityId: prep.applied.attestation.consumedCapabilityId } : {}),
+        ...(prep.consumedIds.length ? { consumedCapabilities: prep.consumedIds } : {}),
+        ...(prep.derivedFromCapabilityIds.length ? { derivedFromCapabilityIds: prep.derivedFromCapabilityIds } : {}),
       })
     } catch (error) {
-      const record = this.transcript.record({
-        op: 'http2',
-        startedAt: started,
-        durationMs: Date.now() - started,
-        request: { ...requestMeta, nonce },
-        error: error instanceof Error ? error.message : 'HTTP/2 exchange failed.',
-        errorCode: /scope|denied|approval|forbidden|outside|header/i.test(error instanceof Error ? error.message : '') ? 'denied' : 'failed',
-      })
-      throw new Error(`${record.exchangeId}: ${error instanceof Error ? error.message : 'HTTP/2 exchange failed.'}`)
+      const msg = this.scrub(error instanceof Error ? error.message : 'HTTP/2 exchange failed.')
+      const record = this.transcript.record({ op: 'http2', startedAt: started, durationMs: Date.now() - started, request: prep.requestMeta, error: msg, errorCode: /scope|denied|approval|forbidden|outside|header/i.test(msg) ? 'denied' : 'failed' })
+      throw new Error(`${record.exchangeId}: ${msg}`)
     }
   }
 
   /** HTTP/2 stays on the same grant: scope, persona injection, method approval. */
-  private async executeHttp2(req: BrokerHttpRequest, signal: AbortSignal): Promise<{ status: number; headers: Record<string, string>; body: string; durationMs: number }> {
-    const grant = this.options.grant
+  private async executeHttp2(req: BrokerHttpRequest, signal: AbortSignal, grant: Grant = this.options.grant): Promise<{ status: number; headers: Record<string, string>; body: string; durationMs: number }> {
     const localLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
     let url: URL
     try {
@@ -1415,59 +1411,53 @@ export class VerifyRpcServer {
     if (!Array.isArray(rawRequests) || rawRequests.length < 2 || rawRequests.length > 10) {
       throw new Error('race requires between 2 and 10 request objects.')
     }
-    const parsed = rawRequests.map((item, index) => {
+    const items = rawRequests.map((item, index) => {
       const record = asRecord(item)
       if (!record) throw new Error(`race request ${index + 1} must be an object.`)
-      return this.parseHttpArgs({ sessionGroupRole: 'probe', ...record })
+      const itemArgs = { sessionGroupRole: 'probe', ...record }
+      return { itemArgs, prep: this.prepareCapRequest(itemArgs, nonce) }
     })
-    const mode = (() => {
-      const summary = this.options.broker.getTransportSummary()
-      return summary.http2 && !summary.proxy
-        ? { mode: 'h2-single-packet' as const, fallbackReason: null as string | null }
-        : { mode: 'http1-fallback' as const, fallbackReason: summary.proxy ? 'proxy transport disables the HTTP/2 single-packet barrier' : 'HTTP/2 transport is unavailable; the burst runs on the HTTP/1.1 fallback' }
-    })()
-    const started = Date.now()
+    let burstGrant: Grant = this.options.grant
+    if (items.some(i => i.prep.applied.grant !== this.options.grant)) {
+      const mergedPersonas = new Map(this.options.grant.personas ?? [])
+      for (const i of items) for (const [k, v] of i.prep.applied.grant.personas ?? []) mergedPersonas.set(k, v)
+      burstGrant = { ...this.options.grant, personas: mergedPersonas }
+    }
+    const summary = this.options.broker.getTransportSummary()
+    const mode = summary.http2 && !summary.proxy
+      ? { mode: 'h2-single-packet' as const, fallbackReason: null as string | null }
+      : { mode: 'http1-fallback' as const, fallbackReason: summary.proxy ? 'proxy transport disables the HTTP/2 single-packet barrier' : 'HTTP/2 transport is unavailable; the burst runs on the HTTP/1.1 fallback' }
+    const started = this.nextHostTimestampMs()
     try {
       const burst = await this.options.broker.executeRaceBurst(
-        parsed.map(item => item.brokerRequest),
-        this.options.grant,
+        items.map(i => i.prep.applied.brokerRequest),
+        burstGrant,
         AbortSignal.timeout(this.options.callTimeoutMs ?? 30_000),
       )
       const results = burst.results.map((result, index) => {
-        const meta = parsed[index]!.requestMeta
+        const { itemArgs, prep } = items[index]!
+        this.recordSessionMutation(prep.sessionKey, prep.applied.brokerRequest.method, prep.entityIds, prep.isControlOrAblation, result.status)
         const body = this.scrub(result.body)
         const record = this.transcript.record({
           op: mode.mode === 'h2-single-packet' ? 'http2' : 'http',
-          startedAt: started,
-          durationMs: result.durationMs,
-          request: { ...meta, nonce },
-          response: {
-            status: result.status,
-            headers: this.scrubRecord(result.respHeaders),
-            bodyBytes: result.bodyBytes,
-            bodySha256: result.bodySha256,
-            mediaType: result.mediaType,
-          },
-          body,
+          startedAt: started, durationMs: result.durationMs, request: prep.requestMeta, body,
+          response: { status: result.status, headers: this.scrubRecord(result.respHeaders), bodyBytes: result.bodyBytes, bodySha256: result.bodySha256, mediaType: result.mediaType },
         })
-        return this.exchangeView(record, { ...result, body })
+        this.recordRequestProvenance(record.exchangeId, started, itemArgs, prep.applied.brokerRequest, prep.requestMeta, { body: result.body, respHeaders: result.respHeaders }, prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession)
+        return this.exchangeView(record, { ...result, body }, {
+          consumedCapabilityId: prep.applied.attestation?.consumedCapabilityId ?? null,
+          consumedCapabilities: prep.consumedIds,
+          derivedFromCapabilityIds: prep.derivedFromCapabilityIds,
+        })
       })
-      return this.scrubRecord({
-        mode: mode.mode,
-        fallbackReason: mode.fallbackReason,
-        summary: burst.summary,
-        results,
-      })
+      return this.scrubRecord({ mode: mode.mode, fallbackReason: mode.fallbackReason, summary: burst.summary, results })
     } catch (error) {
+      const msg = this.scrub(error instanceof Error ? error.message : 'Race burst failed.')
       const record = this.transcript.record({
-        op: 'race',
-        startedAt: started,
-        durationMs: Date.now() - started,
-        request: { ...parsed[0]!.requestMeta, nonce },
-        error: error instanceof Error ? error.message : 'Race burst failed.',
-        errorCode: /scope|denied|approval|forbidden|outside|header|tier/i.test(error instanceof Error ? error.message : '') ? 'denied' : 'failed',
+        op: 'race', startedAt: started, durationMs: Date.now() - started, request: items[0]!.prep.requestMeta,
+        error: msg, errorCode: /scope|denied|approval|forbidden|outside|header|tier/i.test(msg) ? 'denied' : 'failed',
       })
-      throw new Error(`${record.exchangeId}: ${error instanceof Error ? error.message : 'Race burst failed.'}`)
+      throw new Error(`${record.exchangeId}: ${msg}`)
     }
   }
 
@@ -2028,7 +2018,7 @@ export class VerifyRpcServer {
       request: {
         origin: parsedPoll.requestMeta.origin,
         method: 'POLL',
-        pathAndQuery: parsedPoll.requestMeta.pathAndQuery,
+        pathAndQuery: this.scrub(parsedPoll.requestMeta.pathAndQuery),
         headers: {},
         bodyBytes: 0,
         bodySha256: createHash('sha256').update(pollRecordId).digest('hex'),

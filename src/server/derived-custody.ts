@@ -41,6 +41,16 @@ export interface SealDerivedCapabilityInput {
   derivedFromCapabilityId?: DerivedCapabilityHandle; defaultHeaderName?: string; defaultCookieName?: string
   allowedOrigins?: readonly string[]
 }
+export interface MatchedSealedHandle {
+  handleId: DerivedCapabilityHandle
+  rawDigest: string
+}
+export interface MatchSealedHandlesInput {
+  runId?: string
+  targetOrigin?: string
+  parts: readonly string[]
+  minLength?: number
+}
 
 const SAFE_ID_RE = /^[A-Za-z0-9._-]{1,128}$/
 const SAFE_SLOT_RE = /^[A-Za-z0-9._-]{1,64}$/
@@ -51,6 +61,15 @@ const CRLF_RE = /[\r\n\0]/
 const MAX_SECRET_BYTES = 32_768
 const DEFAULT_MAX_ENTRIES = 512
 const MIN_SCRUB_LENGTH = 4
+const DEFAULT_AUTOBIND_MIN_LENGTH = 8
+const TRIVIAL_AUTOBIND_VALUES = new Set([
+  'undefined', 'approved', 'accepted', 'rejected', 'completed', 'complete',
+  'processing', 'succeeded', 'disabled', 'password', 'username', 'anonymous',
+  'localhost', 'application/json', 'text/plain', 'text/html', 'authorization',
+  'content-type', 'connection', 'keep-alive', 'transfer-encoding', 'not_found',
+  'internal_error', 'forbidden', 'unauthorized', 'bad_request', 'placeholder',
+  'default_value', 'readonly', 'readwrite',
+])
 const UNSAFE_HEADERS = new Set(['host', 'content-length', 'connection', 'transfer-encoding', 'upgrade', 'keep-alive', 'te', 'trailer', 'proxy-connection'])
 
 function assertCustody(cond: unknown, code: DerivedCustodyErrorCode, msg: string): asserts cond {
@@ -244,6 +263,44 @@ export class DerivedCapabilityVault {
   injectCapabilityIntoRequest(options: Omit<InjectCapabilityOptions, 'vault'>): InjectCapabilityResult { return injectCapabilityIntoRequest({ ...options, vault: this }) }
   hostHmacSign(options: Omit<HostHmacSignOptions, 'vault'>): HostHmacSignResult { return hostHmacSign({ ...options, vault: this }) }
   hostJwtSign(options: Omit<HostJwtSignOptions, 'vault'>): HostJwtSignResult { return hostJwtSign({ ...options, vault: this }) }
+  matchSealedHandlesInRequest(input: MatchSealedHandlesInput): MatchedSealedHandle[] {
+    const state = getInternals(this)
+    if (input.runId !== undefined && input.runId !== state.runId) return []
+    const parts = input.parts.filter((p): p is string => typeof p === 'string' && p.length > 0)
+    if (parts.length === 0) return []
+    const minLen = typeof input.minLength === 'number' && Number.isFinite(input.minLength)
+      ? Math.max(1, Math.floor(input.minLength))
+      : DEFAULT_AUTOBIND_MIN_LENGTH
+    let normalizedTargetOrigin: string | null = null
+    if (input.targetOrigin) {
+      try { normalizedTargetOrigin = normalizeOrigin(input.targetOrigin) } catch { normalizedTargetOrigin = null }
+    }
+    const nowMs = state.now()
+    const matches: MatchedSealedHandle[] = []
+    for (const entry of state.entries.values()) {
+      if (entry.meta.runId !== state.runId) continue
+      if (entry.meta.expiresAtMs !== null && nowMs >= entry.meta.expiresAtMs) continue
+      if (entry.meta.allowedOrigins?.length) {
+        if (!normalizedTargetOrigin || !entry.meta.allowedOrigins.includes(normalizedTargetOrigin)) continue
+      }
+      const raw = entry.rawValue
+      const trimmed = raw.trim()
+      if (trimmed.length < minLen || /^(.)\1+$/.test(trimmed) || TRIVIAL_AUTOBIND_VALUES.has(trimmed.toLowerCase())) continue
+      const needles: string[] = [raw]
+      const encoded = encodeURIComponent(raw)
+      if (encoded !== raw) {
+        needles.push(encoded)
+        const lowerEncoded = encoded.replace(/%[0-9A-F]{2}/g, m => m.toLowerCase())
+        if (lowerEncoded !== encoded) needles.push(lowerEncoded)
+        if (encoded.includes('%20')) needles.push(encoded.replaceAll('%20', '+'))
+      }
+      if (/["\\\r\n\t\x00-\x1f]/.test(raw)) needles.push(JSON.stringify(raw).slice(1, -1))
+      if (needles.some(n => parts.some(p => p.includes(n)))) {
+        matches.push({ handleId: entry.meta.handle, rawDigest: entry.meta.sha256 })
+      }
+    }
+    return matches
+  }
   toJSON(): { runId: string; count: number; handles: DerivedCapabilityHandle[] } {
     const state = getInternals(this)
     return { runId: state.runId, count: state.entries.size, handles: Array.from(state.entries.keys()) }
