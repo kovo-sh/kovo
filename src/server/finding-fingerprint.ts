@@ -73,7 +73,26 @@ const MONGO_ID_SEGMENT = /^[0-9a-f]{24}$/i
 const NUMERIC_SEGMENT = /^\d+$/
 const LONG_HEX_SEGMENT = /^[0-9a-f]{16,}$/i
 const PREFIXED_ID_SEGMENT = /^[a-z]{2,10}_[a-zA-Z0-9]{8,}$/
-const OPAQUE_TOKEN_SEGMENT = /^(?=.*\d)(?=.*[a-zA-Z])[a-zA-Z0-9_-]{14,}$/
+// Generic prefixed/underscore runtime IDs containing at least one digit (e.g. `pfx_item_9_5ed534`,
+// `job_export_38_c4f8e5`, `ord_123`), while preserving static words (`api_keys`, `api_v1`).
+const PREFIXED_UNDERSCORE_ID_SEGMENT = /^[a-z]{1,8}_(?!v\d+$)[a-z0-9_]*\d[a-z0-9_]*$/i
+// Generic underscore/hyphenated runtime IDs ending in a numeric or mixed alphanumeric/hex ID
+// suffix (e.g. `inv-9001`, `ord-a1b2`, `export-job-38-c4f8e5`), preserving static route words
+// (`settle-race`, `user-profile`, `health-check`, `api-v2`, `oauth2-callback`).
+const SUFFIXED_RUNTIME_ID_SEGMENT =
+  /^(?!cwe-|rfc-|iso-|utf-|sha-|aes-|http-|oauth-|saml-)[a-z]{1,12}(?:[_-][a-z0-9]+)*[_-](?:\d+|(?=[a-z0-9]*\d)(?=[a-z0-9]*[a-z])(?!v\d+$)[a-z0-9]{4,})$/i
+const OPAQUE_TOKEN_SEGMENT = /^(?:(?=.*\d)(?=.*[a-zA-Z])[a-zA-Z0-9]{14,}|(?=(?:.*\d){2})(?=.*[a-zA-Z])[a-zA-Z0-9_-]{14,})$/
+const REDACTED_PLACEHOLDER_SEGMENT = /\[redacted(?::[^\]]*)?\]/i
+const CAPABILITY_HANDLE_SEGMENT = /^cap:[a-z0-9_.:-]+$/i
+
+function decodeSegmentSafe(segment: string): string {
+  if (!segment.includes('%')) return segment
+  try {
+    return decodeURIComponent(segment)
+  } catch {
+    return segment
+  }
+}
 
 export function normalizeOrigin(origin: string): string {
   const trimmed = origin.trim().toLowerCase()
@@ -127,16 +146,25 @@ export function normalizeEndpointTemplate(endpoint?: string | null, options?: { 
   const segments = pathname.split('/').map((seg, idx) => {
     if (idx === 0 && seg === '') return ''
     if (!seg) return ''
-    if (seg.startsWith(':') || (seg.startsWith('{') && seg.endsWith('}')) || (seg.startsWith('[') && seg.endsWith(']'))) {
+    const decoded = decodeSegmentSafe(seg)
+    if (
+      decoded.startsWith(':') ||
+      (decoded.startsWith('{') && decoded.endsWith('}')) ||
+      (decoded.startsWith('[') && decoded.endsWith(']')) ||
+      REDACTED_PLACEHOLDER_SEGMENT.test(decoded) ||
+      CAPABILITY_HANDLE_SEGMENT.test(decoded)
+    ) {
       return ':id'
     }
     if (
-      UUID_SEGMENT.test(seg) ||
-      MONGO_ID_SEGMENT.test(seg) ||
-      NUMERIC_SEGMENT.test(seg) ||
-      LONG_HEX_SEGMENT.test(seg) ||
-      PREFIXED_ID_SEGMENT.test(seg) ||
-      OPAQUE_TOKEN_SEGMENT.test(seg)
+      UUID_SEGMENT.test(decoded) ||
+      MONGO_ID_SEGMENT.test(decoded) ||
+      NUMERIC_SEGMENT.test(decoded) ||
+      LONG_HEX_SEGMENT.test(decoded) ||
+      PREFIXED_ID_SEGMENT.test(decoded) ||
+      PREFIXED_UNDERSCORE_ID_SEGMENT.test(decoded) ||
+      SUFFIXED_RUNTIME_ID_SEGMENT.test(decoded) ||
+      OPAQUE_TOKEN_SEGMENT.test(decoded)
     ) {
       return ':id'
     }

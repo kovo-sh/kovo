@@ -2727,8 +2727,10 @@ export interface MultiHopStepMatchInput {
   dependsOnFactIds?: readonly string[]
 }
 
+const DET_LEAD_STEP_TITLE_RE = /\bdet[_ ]lead\b|\blead upgrade\b/i
+
 const MULTI_HOP_STEP_TEXT_RE =
-  /\[chain_hops=|\bhopCheckpoint\b|\bmulti[- ]?hop\b|\bchain_step\b|\bchain_continuation\b|\bclean[- ]?session\s+chain\b|\bcompose\s+verified\s+intermediates\b|\bcausal\s+proof\b|\bproof\s+gap\b|\bfinal\s+confirm(?:ation)?\b|\bcomposite\s+(?:chain|proof)\b/i
+  /\[chain_hops=|\bhopCheckpoint\b|\bmulti[- ]?(?:hop|step|stage)\b|\bchain_step\b|\bchain_continuation\b|\bclean[- ]?session\s+chain\b|\bcompose\s+verified\s+intermediates\b|\bcausal\s+proof\b|\bproof\s+gap\b|\bfinal\s+confirm(?:ation)?\b|(?<![a-z0-9])(?:composite|prefix|startswith|edge|proxy|cross[- _]?tenant|cross[- _]?service|tenant[- _]?boundary|async(?:hronous)?|signed[- _]?urls?|readiness|cache)(?![a-z0-9])/i
 
 const MULTI_HOP_STAGE_ARROW_RE =
   /(?:\/[A-Za-z0-9._:{}/-]+|[A-Za-z][A-Za-z0-9_./:-]{1,})(?:\s+[A-Za-z0-9_./:-]{1,24}){0,3}\s*(?:(?<!-)->|→)\s*(?:\d+[.)]\s*)?(?:\/[A-Za-z0-9._:{}/-]+|[A-Za-z][A-Za-z0-9_./:-]{1,})/
@@ -2736,7 +2738,8 @@ const MULTI_HOP_STAGE_ARROW_RE =
 /**
  * Shared multi-hop step matcher used by both `isMultiHopChainStep` (dispatch/wall-clock) and
  * `workerInvestigationPrompt` (`multiHopDirectives`) so late-wave planner multi-stage steps
- * receive both the scaled 270s–300s wall-clock window and full composite verification directives.
+ * and cross-service / proxy / edge-bypass / async / tenant-boundary / composite verification
+ * steps receive both the scaled 270s–300s wall-clock window and full composite directives.
  */
 export function matchesMultiHopStepSignal(step: MultiHopStepMatchInput): boolean {
   if ((step.dependsOnStepIds?.length ?? 0) > 0) return true
@@ -2750,6 +2753,7 @@ export function matchesMultiHopStepSignal(step: MultiHopStepMatchInput): boolean
   )) {
     return true
   }
+  if (DET_LEAD_STEP_TITLE_RE.test(step.title)) return false
   const text = `${step.title} ${step.hypothesis ?? ''} ${step.category ?? ''}`
   if (MULTI_HOP_STEP_TEXT_RE.test(text)) return true
   if ((text.includes('->') || text.includes('→')) && MULTI_HOP_STAGE_ARROW_RE.test(text)) return true
@@ -2807,6 +2811,7 @@ export function workerInvestigationPrompt(input: {
     ...(isMultiHopStep
       ? {
           multiHopDirectives: {
+            scopeAnchor: 'Stay strictly anchored to your assigned chain/suspect endpoints and pivot across hops of THAT hypothesis.\nDo not spend turns re-confirming an unrelated endpoint already covered by another finding or step (see alreadyConfirmed).',
             requiredCompositeProof: 'For this multi-hop step, you MUST verify the end-to-end causal chain with ctx.seal_capability(...) + ctx.prove_composite(...) (using ctx.hmac_sign / ctx.jwt_sign / ctx.await_async / ctx.prove_race_burst as intermediate hop primitives inside the SAME script) — do NOT substitute a standalone single-hop prove_access_boundary / prove_persisted_mutation call as your final proof.',
             compositeCallSignature: 'ctx.seal_capability({ exchangeId, slot, jsonPath, kind }) -> ctx.hmac_sign/jwt_sign/await_async -> ctx.prove_composite({ chainId, terminalVulnClass, replayMode: "fresh_clean_replay", hops, causalEdges, terminalImpact })',
             noPrematureSingleHop: 'Never stop at an intermediate single-hop info-disclosure, handle, directory leak, job creation, cache prime, or link/token generation when downstream cross-service/auth/state-machine pivots are reachable — seal it via ctx.seal_capability(...) and continue in the SAME verification script through Stages 2-4 to final readback or persisted state change and ctx.prove_composite(...).',

@@ -2172,13 +2172,21 @@ const MULTI_STEP_ASSIGNMENT_RE = /\brace\b|race[_-]|bola|bfla|idor|cross[_-]?per
 /** Multi-step/race assignments keep the long wall cap (never the 85 s single-step cap). */
 export function isMultiStepAssignment(input: {
   title?: string
-  hypothesis?: string
+  hypothesis?: string | null
   category?: string | null
   skills?: readonly string[]
 }): boolean {
   // A det_lead upgrade is one hypothesis, not a multi-step assignment: its prose says "chain it
   // into a higher-impact finding" on every upgrade, and it must keep the 12-turn single-step lane.
   if (/\bdet[_ ]lead\b|\blead upgrade\b/i.test(input.title ?? '')) return false
+  if (matchesMultiHopStepSignal({
+    title: input.title ?? '',
+    hypothesis: input.hypothesis,
+    category: input.category,
+    skills: input.skills,
+  })) {
+    return true
+  }
   const skillText = (input.skills ?? []).join(' ')
   return MULTI_STEP_ASSIGNMENT_RE.test(`${input.title ?? ''} ${input.category ?? ''} ${skillText}`)
 }
