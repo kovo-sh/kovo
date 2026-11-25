@@ -83,10 +83,11 @@ export function codeHypothesisProbeClass(hypothesis: CodeToRuntimeHypothesis): s
     case 'code_review': {
       const sink = (hypothesis.sinkKind ?? '').toLowerCase()
       if (/sql/.test(sink)) return 'sqli_boolean'
-      if (/ssrf|http/.test(sink)) return 'ssrf_canary'
-      if (/xss|html/.test(sink)) return 'xss_context'
+      if (/ssrf|http|outbound/.test(sink)) return 'ssrf_canary'
+      if (/xss|html|template/.test(sink)) return 'xss_context'
       if (/command|exec|shell/.test(sink)) return 'command_injection'
       if (/path|file/.test(sink)) return 'path_traversal_benign'
+      if (/redirect/.test(sink)) return 'open_redirect_differential'
       return 'authz_matrix'
     }
     default:
@@ -107,6 +108,8 @@ export function codeToRuntimeLead(hypothesis: CodeSliceHypothesis): CodeToRuntim
   const path = typeof hypothesis.path === 'string' ? hypothesis.path : ''
   const method = typeof hypothesis.method === 'string' ? hypothesis.method.toUpperCase() : ''
   const runtime = method && path.startsWith('/') ? { method, path } : null
+  const isPolicyDiff = hypothesis.kind === 'middleware_policy_diff' || hypothesis.kind === 'admin_route_missing_admin_guard' || hypothesis.kind === 'tenant_param_without_scope'
+  const isStaticLead = hypothesis.kind === 'static_secret_or_iac'
   return {
     runtime,
     probeClass: runtime ? codeHypothesisProbeClass(hypothesis) : null,
@@ -114,6 +117,10 @@ export function codeToRuntimeLead(hypothesis: CodeSliceHypothesis): CodeToRuntim
     data: {
       kind: 'det_lead',
       source: 'program_graph',
+      whiteBoxSource: 'program_graph',
+      hypothesisKind: hypothesis.kind,
+      ...(isPolicyDiff ? { policyDiff: true } : {}),
+      ...(isStaticLead ? { staticLeadKind: hypothesis.evidence.some(e => e.includes('kind=iac')) ? 'iac' : 'secret' } : {}),
       probeClass: codeHypothesisProbeClass(hypothesis),
       endpoint: path,
       method,

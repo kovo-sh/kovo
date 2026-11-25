@@ -49,9 +49,12 @@ import {
   DRY_ROUND_LIMIT,
   TIER_A_MAX_SEEDED_STEPS,
   TIER_A_STEP_PRIORITY,
+  WHITEBOX_BLACKBOX_CAP_PRIORITY,
+  WHITEBOX_TIER_A_MAX_SEEDED_STEPS,
   addFunnelCounts,
   applyCrownJewelStepBudget,
   buildBolaTestQueue,
+  chainHopFactPayload,
   chainHypothesisDispatchSteps,
   classifyHostHeuristic,
   collectAllPages,
@@ -77,6 +80,8 @@ import {
   permanentlyBlockedStepIds,
   plannerResponseSchema,
   plannerWaveDispatchCap,
+  prioritizeMountedSourceInitialSteps,
+  readChainHopsFromFacts,
   reinvestigationKey,
   selectUncoveredHighRiskEndpoints,
   stripJsonFences,
@@ -99,6 +104,8 @@ import {
 } from './exec-exchange.ts'
 import {
   createGraphCoordinator,
+  formatChainHopsBrief,
+  type ChainHop,
   type CoordinatorDeps,
   type CoordinatorEndpoint,
   type CoordinatorProgramGraph,
@@ -712,9 +719,11 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       }, { behavior: 'immediate' })
       if (!savedTm) return
 
-      // 4. Priority #1: Dedicated Source-First Code Audit Phase BEFORE live HTTP investigation rounds
+      // 4. Priority #1 (v7 M2 white-box-first default): Dedicated Source-First Code Audit +
+      // Program-Graph Tier-A AST/RBAC/dataflow seeding BEFORE live black-box HTTP steps.
+      const sourceMounted = mountedRepos.length > 0
       let codeAuditStepsCreated = 0
-      if (mountedRepos.length > 0 && freshRun.capabilityTier > 0 && profiles.length > 0 && this.host.authorize(job)) {
+      if (sourceMounted && freshRun.capabilityTier > 0 && profiles.length > 0 && this.host.authorize(job)) {
         try {
           const auditResult = await this.host.runSourceFirstCodeAudit(
             this.storage.run(freshRun.id),
@@ -726,15 +735,29 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         } catch {
           // Code audit failure should not block live investigation rounds
         }
+        try {
+          const tierASeeded = this.queueTierALeadSteps(
+            this.storage.run(freshRun.id),
+            approvedOrigins,
+            computeDynamicStepBudget(this.storage, freshRun.id),
+            { sourceMounted: true },
+          )
+          codeAuditStepsCreated += tierASeeded
+        } catch {
+          // Tier-A white-box seeding is additive
+        }
       }
 
       if (!this.host.authorize(job)) return
 
-      // Ensure at least initial investigation steps exist when Tier >= 1
-      if (!seededSteps.length && freshRun.capabilityTier > 0 && approvedAssets.length > 0) {
+      // Ensure at least initial investigation steps exist when Tier >= 1.
+      // When source repos are mounted, delete black-box-first overrides: generic fallback recon
+      // steps never outrank white-box AST/RBAC/dataflow leads (priority capped <= 65).
+      if (!seededSteps.length && freshRun.capabilityTier > 0 && approvedAssets.length > 0 && (!sourceMounted || codeAuditStepsCreated === 0)) {
         const topHosts = finalEntries.slice(0, Math.min(8, finalEntries.length))
         seededSteps = topHosts.map((entry, idx) => {
           const tier = finalHostTiers[entry.origin] ?? classifyHostTier(entry.origin, entry.surfaceTags)
+          const basePriority = tier === 'low_value_static' ? 30 : Math.max(55, 95 - idx * 6)
           return {
             title: `Surface & chain investigation · ${new URL(entry.origin).hostname}`,
             hypothesis: `Harvest JS/API routes, inspect DNS/TLS/CORS/auth headers, fingerprint stack & CVEs, and verify any candidate vulnerabilities on ${entry.origin} (${entry.surfaceTags.join(', ')}).`,
@@ -743,12 +766,17 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
                 : entry.surfaceTags.includes('upload') ? 'upload-storage'
                   : entry.surfaceTags.includes('llm-proxy') ? 'llm-ai-security'
                     : 'misconfig-exposure',
-            priority: tier === 'low_value_static' ? 30 : Math.max(55, 95 - idx * 6),
+            priority: sourceMounted ? Math.min(basePriority, WHITEBOX_BLACKBOX_CAP_PRIORITY - 5) : basePriority,
             origins: [entry.origin],
             skills: ['recon-modern-spa', 'cve-runtime-correlation', 'false-positive-elimination'],
           }
         })
       }
+
+      const prioritizedInitialSteps = prioritizeMountedSourceInitialSteps(
+        seededSteps.map(step => ({ ...step, origins: step.origins.filter(o => approvedOrigins.has(o)) })),
+        { sourceMounted, hasWhiteBoxSteps: codeAuditStepsCreated > 0, whiteBoxFactIds: this.host.tierAFactIds },
+      )
 
       this.storage.transaction(() => {
         const current = this.storage.run(freshRun.id)
@@ -757,7 +785,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         const existingSteps = this.storage.listChainSteps(current.id, current.goalRevision)
         const remainingInitialSlots = Math.max(0, 12 - existingSteps.length)
         const budgetedSteps = applyCrownJewelStepBudget(
-          seededSteps.map(step => ({ ...step, origins: step.origins.filter(o => approvedOrigins.has(o)) })),
+          prioritizedInitialSteps,
           finalHostTiers,
           existingSteps,
           remainingInitialSlots,
@@ -1138,6 +1166,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       coveredRoutes,
       minRisk: 60,
       limit: cap,
+      sourceMounted: this.host.projectReposMount(run.projectId).mountedRepos.length > 0,
     })
     const seededEndpoints: string[] = []
     for (const ep of candidates) {
@@ -1180,14 +1209,17 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
    * Priority is deliberately below planner-authored class steps; the scheduler also caps lead
    * concurrency independently, so a lead backlog can never pre-empt unproven target classes.
    */
-  /** Program-Graph code leads that carry a dataflow slice (Tier-A white-box hypotheses). */
+  /** Program-Graph code leads carrying a dataflow slice, RBAC policy diff, or static secret/IaC lead. */
   tierALeadFacts(run: Pick<Run, 'id'>): Fact[] {
     return this.storage.listFacts(run.id, { includeTainted: false, limit: 200 })
       .filter(fact => {
         const data = fact.data
         if (data?.kind !== 'det_lead' || data.source !== 'program_graph') return false
         const slice = data.codeSlice as { hops?: unknown } | undefined
-        return Boolean(slice && Array.isArray(slice.hops) && slice.hops.length > 0)
+        const hasSlice = Boolean(slice && Array.isArray(slice.hops) && slice.hops.length > 0)
+        const hasPolicyDiff = (Array.isArray(data.guardDiff) && data.guardDiff.length > 0) || data.policyDiff === true
+        const hasStaticLead = data.staticLeadKind === 'secret' || data.staticLeadKind === 'iac'
+        return hasSlice || hasPolicyDiff || hasStaticLead
       })
       .sort((a, b) => {
         const keyOf = (fact: typeof a) =>
@@ -1235,15 +1267,23 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
   /**
    * Seed every Tier-A Program-Graph lead as a ready step before the planner's first round. These
-   * are the white-box 4-hop hypotheses; they must never wait behind generic class/route steps or a
-   * dry-round stop. Idempotent per (route, class), bounded by {@link TIER_A_MAX_SEEDED_STEPS}.
+   * are the white-box AST/RBAC/dataflow hypotheses; they must never wait behind generic class/route
+   * steps or a dry-round stop. Idempotent per (route, class), bounded by
+   * {@link WHITEBOX_TIER_A_MAX_SEEDED_STEPS} when source is mounted (or {@link TIER_A_MAX_SEEDED_STEPS}).
    */
-  queueTierALeadSteps(run: Run, approvedOrigins: ReadonlySet<string>, budget: number): number {
+  queueTierALeadSteps(
+    run: Run,
+    approvedOrigins: ReadonlySet<string>,
+    budget: number,
+    options: { sourceMounted?: boolean } = {},
+  ): number {
     const facts = this.tierALeadFacts(run)
     if (!facts.length) return 0
     const existing = this.storage.listChainSteps(run.id, run.goalRevision)
     const boundFactIds = new Set(existing.flatMap(step => step.dependsOnFactIds))
-    let slots = Math.max(0, Math.min(TIER_A_MAX_SEEDED_STEPS, budget - existing.length))
+    const sourceMounted = options.sourceMounted ?? (this.host.projectReposMount(run.projectId).mountedRepos.length > 0)
+    const maxSeeded = sourceMounted ? WHITEBOX_TIER_A_MAX_SEEDED_STEPS : TIER_A_MAX_SEEDED_STEPS
+    let slots = Math.max(0, Math.min(maxSeeded, budget - existing.length))
     let created = 0
     for (const fact of facts) {
       if (slots <= 0) break
@@ -1396,21 +1436,51 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         }))
       const samples = this.storage.listResourceSamples(input.run.id)
         .filter(sample => input.targetOrigins.includes(sample.origin))
-      const personas = input.personas.map(persona => ({
-        handle: persona.handle,
-        role: persona.roleLabel,
-        harvestedIds: [...new Set(samples.filter(s => s.ownerPersona === persona.handle).map(s => s.resourceId))].slice(0, 4),
-      }))
+      // v7 M2: extract typed ChainHop artifacts persisted from prior/current rounds so follow-on
+      // round briefs receive structured handles (tokens, leaked IDs, SSRF/redirect targets, role
+      // transitions, workflow state handles) without prompt soup.
+      const parentChainHops: ChainHop[] = readChainHopsFromFacts(input.parentFacts)
+      const hopLinkedRoutes = parentChainHops
+        .filter(hop => Boolean(hop.endpoint && hop.endpoint.startsWith('/')))
+        .map(hop => ({
+          method: hop.method ?? 'GET',
+          path: hop.endpoint!,
+          riskScore: hop.verified ? 95 : 85,
+        }))
+      const hopLeakedIds = parentChainHops
+        .filter(hop => hop.artifactKind === 'leaked_id' || hop.artifactKind === 'workflow_state_handle')
+        .map(hop => hop.artifactRef)
+      const personas = input.personas.map(persona => {
+        const hopIdsForPersona = parentChainHops
+          .filter(hop =>
+            (hop.artifactKind === 'leaked_id' || hop.artifactKind === 'workflow_state_handle')
+            && (!hop.persona || hop.persona.toLowerCase() === persona.handle.toLowerCase()))
+          .map(hop => hop.artifactRef)
+        return {
+          handle: persona.handle,
+          role: persona.roleLabel,
+          harvestedIds: [
+            ...new Set([
+              ...samples.filter(s => s.ownerPersona === persona.handle).map(s => s.resourceId),
+              ...hopIdsForPersona,
+              ...(hopIdsForPersona.length === 0 ? hopLeakedIds.slice(0, 2) : []),
+            ]),
+          ].slice(0, 6),
+        }
+      })
       const parentDetLead = input.detLeads.find(lead =>
         input.parentFacts.some(f => f.data?.kind === 'det_lead' && f.id === lead.exchangeId) ||
         (Boolean(lead.endpoint) && input.targetOrigins.includes(origin)),
       )
-      const missionKind = this.missionKindForStep(input.step, Boolean(parentDetLead))
+      const missionKind = parentChainHops.length > 0 && input.step.dependsOnFactIds.length > 0
+        ? 'chain_step_2'
+        : this.missionKindForStep(input.step, Boolean(parentDetLead))
       // v7 whitebox hop: the persisted slice for this assignment's route reaches the brief.
       // Compact by default; only chain / 4-hop assignments pay for the expanded slice.
       const codeSlice = this.host.codeSliceForAssignment(input.run, input.step, input.parentFacts)
       const codeExpansion: 'compact' | 'full' = missionKind === 'chain_step_2' ||
         input.step.dependsOnStepIds.length > 0 ||
+        parentChainHops.length > 0 ||
         (codeSlice?.hops.length ?? 0) >= 4
         ? 'full'
         : 'compact'
@@ -1424,10 +1494,15 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
             tenantOfPersona(persona.roleLabel) !== tenantOfPersona(controlPersona.roleLabel))
           ?? tierAPersonas.find(persona => persona.handle !== controlPersona.handle)
         : undefined
+      const hopChainSummary = parentChainHops.length > 0
+        ? parentChainHops.slice(0, 4).map(hop =>
+            `${hop.artifactKind}:${hop.artifactRef}${hop.stateAfter ? `[${hop.stateBefore ?? '*'}->${hop.stateAfter}]` : ''}`).join('→')
+        : ''
       const text = buildAssignmentBrief({
         missionKind,
         origin,
         routes,
+        ...(hopLinkedRoutes.length ? { linkedRoutes: hopLinkedRoutes } : {}),
         personas,
         alreadyConfirmedOnOrigin: input.confirmed
           .filter(ref => !ref.origin || ref.origin === origin)
@@ -1449,9 +1524,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
             }
           : {}),
         ...(codeSlice ? { codeSlice, codeExpansion } : {}),
-        // One explicit proof obligation for a white-box assignment: exact mounted route, declared
-        // parameter names, the middleware verdict and the sink chain. Names only; the specialist
-        // still has to build and verify the spec through the normal replay path.
+        // Explicit proof obligation for a white-box assignment or a typed multi-round chain step.
         ...(codeSlice
           ? {
               proofObligation: {
@@ -1464,7 +1537,9 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
                 ],
                 auth: codeSlice.auth,
                 ...(codeSlice.sink ? { sink: `${codeSlice.sink.kind}@${codeSlice.sink.at}` } : {}),
-                chain: codeSlice.hops.slice(0, 6).map(hop => hop.at).join('→'),
+                chain: hopChainSummary
+                  ? `${hopChainSummary} | ${codeSlice.hops.slice(0, 4).map(hop => hop.at).join('→')}`
+                  : codeSlice.hops.slice(0, 6).map(hop => hop.at).join('→'),
                 ...(controlPersona
                   ? {
                       controlPersona: controlPersona.handle,
@@ -1479,7 +1554,27 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
                 }),
               },
             }
-          : {}),
+          : parentChainHops.length > 0
+            ? {
+                proofObligation: {
+                  route: hopLinkedRoutes[hopLinkedRoutes.length - 1]
+                    ? `${hopLinkedRoutes[hopLinkedRoutes.length - 1]!.method} ${hopLinkedRoutes[hopLinkedRoutes.length - 1]!.path}`
+                    : routes[0] ? `${routes[0].method} ${routes[0].path}` : 'ANY /',
+                  chain: formatChainHopsBrief(parentChainHops, 200),
+                  ...(controlPersona
+                    ? {
+                        controlPersona: controlPersona.handle,
+                        variantPersona: (variantPersona ?? controlPersona).handle,
+                      }
+                    : {}),
+                  deliverable: this.tierAProofDeliverable({
+                    category: input.step.category,
+                    title: input.step.title,
+                    hypothesis: input.step.hypothesis,
+                  }),
+                },
+              }
+            : {}),
         targetCount: routes.length > 1 ? 2 : 1,
         turnBudget: input.maxTurns,
       })
@@ -1607,22 +1702,76 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
 
   /**
-   * Explicit chaining round: derive typed primitives from the untruncated store (same-origin and
-   * cross-origin), plan 2–3 hop hypotheses and dispatch each with parent evidence + capabilities.
+   * Persist newly discovered typed `ChainHop` artifacts as structured `chain_hop` facts so follow-on
+   * coordinator rounds and assignment briefs consume typed hop handles instead of prompt soup.
+   * Idempotent by `hopId`.
+   */
+  persistChainHopFacts(run: Run, hops: readonly ChainHop[], existingFacts: readonly Fact[]): Map<string, string> {
+    const hopFactById = new Map<string, string>()
+    for (const fact of existingFacts) {
+      if (fact.tainted) continue
+      const hopId = typeof fact.data?.hopId === 'string' ? fact.data.hopId : ''
+      if ((fact.data?.subkind === 'chain_hop' || fact.data?.kind === 'chain_hop') && hopId) {
+        hopFactById.set(hopId, fact.id)
+      }
+    }
+    const workers = this.storage.workerList(run.id)
+    const anchorWorker = workers.find(w => w.phase === 'investigation') ?? workers[0]
+    if (!anchorWorker) return hopFactById
+    for (const hop of hops.slice(0, 32)) {
+      if (hopFactById.has(hop.hopId)) continue
+      try {
+        const payload = chainHopFactPayload(hop)
+        const created = this.storage.addFact(run, anchorWorker, {
+          kind: 'note',
+          origin: hop.origin,
+          summary: payload.summary,
+          data: payload.data,
+          evidenceIds: hop.evidenceIds,
+        })
+        hopFactById.set(hop.hopId, created.id)
+      } catch { /* best-effort additive persistence */ }
+    }
+    return hopFactById
+  }
+
+  /**
+   * Explicit chaining round: extract & persist typed `ChainHop` artifacts across rounds, plan 2–4
+   * hop hypotheses (same-origin and cross-origin), and dispatch each with typed hop inputs + parent
+   * evidence + capabilities.
    */
   dispatchChainRound(run: Run, coordinator: GraphCoordinator, budget: number, factIds: ReadonlySet<string>, funnel?: DispatchFunnelCounts): number {
     const existing = this.storage.listChainSteps(run.id, run.goalRevision)
     const remaining = Math.max(0, budget - existing.length)
     if (remaining <= 0) return 0
-    const hypotheses = coordinator.planChainRound({ maxHops: 3, limit: Math.min(12, remaining) })
+    const roundNo = Math.max(1, run.roundNo || 1)
+    const hops = coordinator.extractChainHops(roundNo)
+    const hypotheses = coordinator.planChainRound({ hops, maxHops: 4, limit: Math.min(12, remaining) })
     if (!hypotheses.length) return 0
-    const plan = coordinator.dispatchInvestigations(chainHypothesisDispatchSteps(hypotheses), { maxSteps: remaining })
-    const counts = this.persistDispatchPlan(run, plan, factIds)
+    const existingFacts = this.pageAll((offset, limit) =>
+      this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
+    const hopFactById = this.persistChainHopFacts(run, hops, existingFacts)
+    const liveFactIds = new Set<string>([...factIds, ...hopFactById.values()])
+    // Attach persisted chain_hop fact IDs onto parentEvidenceIds so follow-on briefs receive them
+    // while always preserving the originating fact IDs.
+    const enrichedHypotheses = hypotheses.map(hypothesis => {
+      const hopFactIds = (hypothesis.chainHops ?? [])
+        .map(hop => hopFactById.get(hop.hopId))
+        .filter((id): id is string => Boolean(id))
+      return hopFactIds.length
+        ? { ...hypothesis, parentEvidenceIds: [...new Set([...hypothesis.parentEvidenceIds, ...hopFactIds])] }
+        : hypothesis
+    })
+    const plan = coordinator.dispatchInvestigations(chainHypothesisDispatchSteps(enrichedHypotheses), { maxSteps: remaining })
+    const counts = this.persistDispatchPlan(run, plan, liveFactIds)
     if (funnel) addFunnelCounts(funnel, counts)
-    this.storage.event(run.id, 'chain.round', `Chain round dispatched ${counts.enqueued} hypothesis(es) with parent evidence.`, {
+    this.storage.event(run.id, 'chain.round', `Chain round dispatched ${counts.enqueued} hypothesis(es) with ${hops.length} typed hop artifact(s).`, {
       hypotheses: hypotheses.length, dispatched: counts.enqueued, rejected: plan.rejected.length,
       crossOrigin: hypotheses.filter(hypothesis => hypothesis.scope === 'cross_origin').length,
       primitives: [...new Set(hypotheses.flatMap(hypothesis => hypothesis.primitiveKinds))],
+      chainHopCount: hops.length,
+      hopArtifactKinds: [...new Set(hops.map(hop => hop.artifactKind))],
+      maxChainHops: hypotheses.reduce((max, h) => Math.max(max, h.hops), 0),
     })
     return counts.enqueued
   }
@@ -1642,17 +1791,29 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     this.host.noteDryStreak(fresh)
     // v7 dispatch funnel: planned → filtered* → enqueued → dispatched, from step objects only.
     const funnel = emptyDispatchFunnel(roundNo)
+    const approvedOrigins = this.host.approvedOriginsSet(updated)
+    const sourceMounted = this.host.projectReposMount(updated.projectId).mountedRepos.length > 0
+
+    // v7 M2 white-box-first default: when source repos are mounted, seed Tier-A AST/RBAC/dataflow
+    // leads BEFORE generic black-box floor leads or BOLA auto-steps.
+    let tierAPlannerSteps = 0
+    if (sourceMounted) {
+      try {
+        tierAPlannerSteps = this.queueTierALeadSteps(updated, approvedOrigins, dynamicStepBudget, { sourceMounted: true })
+      } catch { /* white-box seeding is additive */ }
+      funnel.planned += tierAPlannerSteps
+      funnel.enqueued += tierAPlannerSteps
+    }
 
     // v6 Phase 1: prioritized deterministic leads become upgrade assignments before the planner
     // runs, so the agentic lane never idles on confirmed routes and never loses a floor signal.
     let detLeadSteps = 0
     try {
-      detLeadSteps = this.queueDetLeadUpgradeSteps(fresh, this.host.approvedOriginsSet(fresh), dynamicStepBudget)
+      detLeadSteps = this.queueDetLeadUpgradeSteps(fresh, approvedOrigins, dynamicStepBudget)
     } catch { /* lead queueing is additive */ }
     funnel.planned += detLeadSteps
     funnel.enqueued += detLeadSteps
 
-    const approvedOrigins = this.host.approvedOriginsSet(updated)
     const factIds = new Set(this.pageAll((offset, limit) =>
       this.storage.listFacts(fresh.id, { includeTainted: false, limit, offset })).map(fact => fact.id))
     const remainingBudget = Math.max(0, dynamicStepBudget - this.storage.listChainSteps(fresh.id, updated.goalRevision).length)
@@ -1665,10 +1826,11 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       maxDispatchSteps: plannerWaveDispatchCap(maxConcForPlan, remainingBudget),
     })
 
-    // Chain round after the floor + first planner round. Deterministic hypotheses over the full
-    // store dispatch *before* the LLM turn, so a planner failure can never leave an empty window.
+    // Explicit chaining round: runs on round >= 2, and also on round 1 when Phase-0/floor already
+    // yielded >= 2 composable typed ChainHop artifacts. Deterministic hypotheses dispatch *before*
+    // the LLM turn so a planner failure can never leave an empty window.
     let chainSteps = 0
-    if (roundNo >= 2) {
+    if (roundNo >= 2 || coordinator.extractChainHops(roundNo).length >= 2) {
       try { chainSteps = this.dispatchChainRound(updated, coordinator, dynamicStepBudget, factIds, funnel) } catch { /* additive */ }
     }
 
@@ -1729,7 +1891,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           title: `Cross-persona BOLA/IDOR matrix · ${new URL(origin).hostname} · resource:${resourceKey}`,
           hypothesis: `Replay ${itemsForOrigin.length} ${resourceKey} resource(s) owned by ${itemsForOrigin[0].ownerPersona} (e.g. ${itemsForOrigin.map(item => `${item.endpoint} [${item.resourceId}]`).join(', ')}) as ${itemsForOrigin[0].testAsPersonas?.join(', ') ?? 'alternate persona & anonymous'} using bounded consumer item variants: ${variants.join(', ')}. ${readGuidance}`,
           category: 'broken-access-control',
-          priority: 92,
+          priority: sourceMounted && this.host.tierAStepIds.size > 0 ? 72 : 92,
           targetAssetIds: [asset.id],
           skills: ['bola-idor-race', 'false-positive-elimination'],
           dependsOnFactIds: itemsForOrigin.map(item => item.factId).filter((id): id is string => Boolean(id)),
@@ -1836,7 +1998,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const currentRun = this.storage.run(run.id)
     const currentApproved = this.host.approvedOriginsSet(currentRun)
     const existingSteps = this.storage.listChainSteps(run.id, currentRun.goalRevision)
-    let addedCount = detLeadSteps + chainSteps + bolaAutoSteps + secondOrderAutoSteps + toolDispatched
+    let addedCount = tierAPlannerSteps + detLeadSteps + chainSteps + bolaAutoSteps + secondOrderAutoSteps + toolDispatched
 
     if (parsedPlanner?.success) {
       for (const cancelId of parsedPlanner.data.cancelStepIds) {
