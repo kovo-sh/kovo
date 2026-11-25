@@ -269,6 +269,25 @@ export interface ExecutionOptions {
   assignmentWallClockOverrideMs?: number
   /** Optional explicit Phase-B worker concurrency override (takes precedence over dynamic AIMD). */
   workerConcurrencyOverride?: number
+  /** Optional planner retry backoff overrides (defaults: 500ms base, 15s cap, 7 consecutive errors). */
+  plannerBackoffBaseMs?: number
+  plannerBackoffCapMs?: number
+  plannerMaxConsecutiveErrors?: number
+}
+
+export const PLANNER_BACKOFF_BASE_MS = 500
+export const PLANNER_BACKOFF_CAP_MS = 15_000
+export const PLANNER_MAX_CONSECUTIVE_ERRORS = 7
+
+/** Exponential backoff for consecutive planner failures: 500ms -> 1s -> 2s -> 4s -> 8s -> 15s cap. */
+export function computePlannerBackoffMs(
+  consecutiveErrors: number,
+  baseMs = PLANNER_BACKOFF_BASE_MS,
+  capMs = PLANNER_BACKOFF_CAP_MS,
+): number {
+  if (!Number.isFinite(consecutiveErrors) || consecutiveErrors <= 0) return 0
+  const exp = Math.min(30, Math.max(0, Math.floor(consecutiveErrors) - 1))
+  return Math.min(capMs, baseMs * (2 ** exp))
 }
 
 export type ExecutionCheckpoint = 'phase0' | 'deterministic-lane' | 'post-floor' | 'planner-round'
@@ -459,6 +478,15 @@ export class Execution {
   private readonly plannerTimers = new Map<string, NodeJS.Timeout>()
   private readonly plannerDirty = new Set<string>()
   private readonly plannerDoneRound = new Map<string, number>()
+  private readonly plannerErrorState = new Map<string, {
+    goalRevision: number
+    consecutiveErrors: number
+    backoffUntil: number
+    breakerTripped: boolean
+  }>()
+  private readonly plannerBackoffBaseMs: number
+  private readonly plannerBackoffCapMs: number
+  private readonly plannerMaxConsecutiveErrors: number
   /** runId → last dry-streak length reported as telemetry (never a halt signal in v6). */
   private readonly dryStreakObserved = new Map<string, number>()
   /** Phase-0 ranked probe plans (probe breadth hint; the endpoint store stays lossless). */
@@ -602,6 +630,18 @@ export class Execution {
     this.workerConcurrencyOverride = Number.isFinite(concOverride) && concOverride > 0
       ? Math.max(1, Math.min(maxWorkerConcurrency, Math.floor(concOverride)))
       : undefined
+    const backoffBase = Number(options.plannerBackoffBaseMs)
+    this.plannerBackoffBaseMs = Number.isFinite(backoffBase) && backoffBase > 0
+      ? Math.floor(backoffBase)
+      : PLANNER_BACKOFF_BASE_MS
+    const backoffCap = Number(options.plannerBackoffCapMs)
+    this.plannerBackoffCapMs = Number.isFinite(backoffCap) && backoffCap >= this.plannerBackoffBaseMs
+      ? Math.floor(backoffCap)
+      : Math.max(this.plannerBackoffBaseMs, PLANNER_BACKOFF_CAP_MS)
+    const maxPlannerErrors = Number(options.plannerMaxConsecutiveErrors)
+    this.plannerMaxConsecutiveErrors = Number.isFinite(maxPlannerErrors) && maxPlannerErrors >= 1
+      ? Math.floor(maxPlannerErrors)
+      : PLANNER_MAX_CONSECUTIVE_ERRORS
     this.phaseRequestBudgets = resolvePhaseRequestBudgets({
       ...(options.floorRequestBudget !== undefined ? { floorRequestBudget: options.floorRequestBudget } : {}),
       ...(options.agentRequestBudget !== undefined ? { agentRequestBudget: options.agentRequestBudget } : {}),
@@ -865,6 +905,7 @@ export class Execution {
     if (this.reclaimTimer) { clearInterval(this.reclaimTimer); this.reclaimTimer = undefined }
     for (const timer of this.plannerTimers.values()) clearTimeout(timer)
     this.plannerTimers.clear()
+    this.plannerErrorState.clear()
     for (const job of this.active.values()) job.controller.abort()
     for (const task of this.coordinator.values()) task.controller.abort()
     for (const task of this.threatModeling.values()) task.controller.abort()
@@ -1106,6 +1147,7 @@ export class Execution {
 
     const grant: Grant = {
       tier: run.capabilityTier,
+      tenantId: project.tenantId,
       get maxRpsPerOrigin() {
         return readLiveMaxRpsPerOrigin()
       },
@@ -1774,9 +1816,6 @@ export class Execution {
         pathAndQuery: input.pathAndQuery,
       })
     }
-    if (this.authorize(job)) {
-      this.storage.updateWorker(job.assignment.id, { status: 'running' })
-    }
     if (decision === 'approved') {
       // Resume the parked worker with a fresh lease and re-enter the scheduler. The exact
       // single-use ledger remains: the durable operator lease is route-scoped and auditable.
@@ -1785,23 +1824,107 @@ export class Execution {
         job.assignment = resumed
         this.active.set(resumed.id, job)
         this.scheduleWake()
-      } catch { /* resume is best-effort; the request still retries under the approval ledger */ }
+      } catch {
+        if (this.authorize(job)) {
+          try { this.storage.updateWorker(job.assignment.id, { status: 'running', approvalParkedAt: null }) } catch { /* ignore */ }
+        }
+      }
       // A human/operator approval authorizes exactly this fingerprint once; broader reuse requires
       // an explicit operator pattern (approve_similar_endpoint), never a prefix match on the card.
       registerStateChangeGrant(this.stateChangeApprovals, this.burstApprovalInstances, run, grantTarget(postedApprovalId), input.additionalApprovalTargets ?? [])
     } else {
-      // A denied/expired/canceled decision ends this assignment; its slot was already released.
-      try {
-        this.storage.updateWorker(job.assignment.id, {
-          status: 'failed',
-          approvalParkedAt: null,
-          lease: null,
-          leaseExpiresAt: null,
-          outcome: `Tier 3 approval ${decision}.`,
-        })
-      } catch { /* worker may already be terminal */ }
+      // A denied/expired/canceled decision ends this assignment and settles its chain step so
+      // neither investigation nor verification wedges waiting on a permanently blocked worker.
+      this.terminateApprovalBlockedAssignment(run.id, job.assignment.id, decision)
     }
     return { approved: decision === 'approved' }
+  }
+
+  private terminateApprovalBlockedAssignment(
+    runId: string,
+    assignmentId: string,
+    decision: 'denied' | 'expired' | 'canceled',
+  ): void {
+    try {
+      this.storage.transaction(() => {
+        const current = this.storage.worker(assignmentId)
+        if (current.status !== 'complete' && current.status !== 'canceled' && current.status !== 'failed') {
+          this.storage.updateWorker(assignmentId, {
+            status: 'failed',
+            approvalParkedAt: null,
+            lease: null,
+            leaseExpiresAt: null,
+            outcome: `Tier 3 approval ${decision}.`,
+          })
+        }
+        if (current.phase === 'investigation' && current.stepId) {
+          const latestRun = this.storage.run(runId)
+          const step = this.storage.listChainSteps(latestRun.id, latestRun.goalRevision)
+            .find(s => s.id === current.stepId)
+          if (step && ['pending', 'ready', 'running'].includes(step.status)) {
+            this.storage.updateChainStep(step.id, {
+              status: 'canceled',
+              assignedWorkerId: assignmentId,
+            })
+            this.storage.refreshReadyChainSteps(latestRun.id, latestRun.goalRevision)
+          }
+        }
+      }, { behavior: 'immediate' })
+    } catch { /* worker or run may already be terminal or removed */ }
+    this.active.delete(assignmentId)
+    this.scheduleWake()
+  }
+
+  /**
+   * Reconcile parked `waiting_approval` workers whose approval request has already been denied,
+   * expired, or canceled (including after a restart or outside an active `waitForTier3Approval`
+   * coroutine), and settle any investigation chain steps orphaned on a terminal worker.
+   */
+  private reconcileSettledApprovalWorkers(run: Run): void {
+    const now = Date.now()
+    const workers = this.storage.workerList(run.id)
+    const waitingWorkers = workers.filter(w => w.status === 'waiting_approval' && !this.active.has(w.id))
+    if (waitingWorkers.length > 0) {
+      const requests = this.storage.listApprovalRequests(run.id)
+      for (const worker of waitingWorkers) {
+        const forWorker = requests.filter(r => r.assignmentId === worker.id)
+        if (!forWorker.length) continue
+        let hasLivePending = false
+        for (const req of forWorker) {
+          if (req.status !== 'pending') continue
+          if (now >= req.expiresAt) {
+            try {
+              this.storage.db.update(approvalRequests).set({ status: 'expired', decidedAt: now })
+                .where(eq(approvalRequests.id, req.id)).run()
+              req.status = 'expired'
+              req.decidedAt = now
+            } catch { /* ignore */ }
+          } else {
+            hasLivePending = true
+          }
+        }
+        if (hasLivePending) continue
+        const latest = [...forWorker].sort((a, b) => (b.decidedAt ?? b.createdAt) - (a.decidedAt ?? a.createdAt))[0]
+        if (latest && (latest.status === 'denied' || latest.status === 'expired' || latest.status === 'canceled')) {
+          this.terminateApprovalBlockedAssignment(run.id, worker.id, latest.status)
+        }
+      }
+    }
+
+    if (run.phase === 'investigation') {
+      const workerById = new Map(this.storage.workerList(run.id).map(w => [w.id, w]))
+      for (const step of this.storage.listChainSteps(run.id, run.goalRevision)) {
+        if (step.status !== 'running' || !step.assignedWorkerId) continue
+        if (this.active.has(step.assignedWorkerId)) continue
+        const assigned = workerById.get(step.assignedWorkerId)
+        if (!assigned) continue
+        if (assigned.status === 'complete') {
+          this.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: assigned.id })
+        } else if (assigned.status === 'failed' || assigned.status === 'canceled') {
+          this.storage.updateChainStep(step.id, { status: 'canceled', assignedWorkerId: assigned.id })
+        }
+      }
+    }
   }
 
   // --- Event-Driven Scheduler ---
@@ -3201,6 +3324,8 @@ export class Execution {
   }
 
   private driveInvestigation(run: Run, profiles: readonly ResolvedModelProfile[]) {
+    try { this.reconcileSettledApprovalWorkers(run) } catch { /* reconciliation is best-effort */ }
+
     if (!profiles.length) {
       // Explicit --no-llm mode runs the deterministic engine. Without that flag the legacy M1
       // no-profile fallback stays byte-for-byte unchanged; it is suppressed while a worker is
@@ -3401,7 +3526,12 @@ export class Execution {
     // exhaustion, per-assignment caps, drained OOB, or explicit coordinator completion.
     const updatedSteps = this.storage.listChainSteps(run.id, run.goalRevision)
     const anyActive = updatedSteps.some(s => ['pending', 'ready', 'running'].includes(s.status))
+    const plannerErr = this.getPlannerErrorState(run.id, run.goalRevision)
     if (!anyActive && !this.plannerTasks.has(run.id) && !this.plannerTimers.has(run.id)) {
+      if (plannerErr?.breakerTripped) {
+        this.advanceToVerification(run)
+        return
+      }
       this.noteDryStreak(run)
       const hasCanceledSibling = updatedSteps.some(s => Boolean(s.trialGroupId) && s.status === 'canceled')
       if (hasCanceledSibling) {
@@ -3421,7 +3551,9 @@ export class Execution {
         this.schedulePlanner(run.id, 100)
       }
     } else if (this.plannerDirty.has(run.id) && !this.plannerTasks.has(run.id) && !this.plannerTimers.has(run.id)) {
-      this.schedulePlanner(run.id, plannerDebounceMs)
+      if (!plannerErr?.breakerTripped) {
+        this.schedulePlanner(run.id, plannerDebounceMs)
+      }
     }
   }
 
@@ -3553,9 +3685,28 @@ export class Execution {
     })
   }
 
+  private getPlannerErrorState(runId: string, goalRevision?: number) {
+    const state = this.plannerErrorState.get(runId)
+    if (!state) return undefined
+    if (goalRevision !== undefined && state.goalRevision !== goalRevision) {
+      this.plannerErrorState.delete(runId)
+      return undefined
+    }
+    return state
+  }
+
   private schedulePlanner(runId: string, delayMs = plannerDebounceMs) {
+    let goalRevision: number | undefined
+    try { goalRevision = this.storage.run(runId).goalRevision } catch { /* run may be gone */ }
+    const errState = this.getPlannerErrorState(runId, goalRevision)
+    if (errState?.breakerTripped) {
+      this.plannerDirty.delete(runId)
+      return
+    }
     this.plannerDirty.add(runId)
     if (this.plannerTimers.has(runId) || this.plannerTasks.has(runId)) return
+    const backoffRemaining = errState ? Math.max(0, errState.backoffUntil - Date.now()) : 0
+    const effectiveDelayMs = Math.max(delayMs, backoffRemaining)
     const timer = setTimeout(() => {
       this.plannerTimers.delete(runId)
       this.plannerDirty.delete(runId)
@@ -3566,28 +3717,69 @@ export class Execution {
           this.startChainPlanner(run, profiles)
         }
       } catch { /* ignore */ }
-    }, delayMs)
+    }, effectiveDelayMs)
     timer.unref?.()
     this.plannerTimers.set(runId, timer)
   }
 
   private startChainPlanner(run: Run, profiles: readonly ResolvedModelProfile[]) {
     if (this.plannerTasks.has(run.id)) return
+    if (this.getPlannerErrorState(run.id, run.goalRevision)?.breakerTripped) return
     const controller = new AbortController()
     const task: CoordinatorTask = { controller, goalRevision: run.goalRevision, scopeRevision: run.scopeRevision }
     this.plannerTasks.set(run.id, task)
-    void this.runChainPlanner(run, profiles, task).catch(() => {
-      // Planner errors should not crash active workers; retry on next wake or advance cleanly
-    }).finally(() => {
-      this.plannerTasks.delete(run.id)
-      try {
-        const latest = this.storage.run(run.id)
-        if (latest.status === 'running' && latest.phase === 'investigation') {
-          this.notifyCheckpoint(latest.id, 'planner-round')
+    void Promise.resolve()
+      .then(() => this.runChainPlanner(run, profiles, task))
+      .then(() => {
+        this.plannerErrorState.delete(run.id)
+      })
+      .catch(error => {
+        if (!this.currentCoordinator(run.id, task) || task.controller.signal.aborted) return
+        const prev = this.getPlannerErrorState(run.id, run.goalRevision)
+        const consecutiveErrors = (prev?.consecutiveErrors ?? 0) + 1
+        const breakerTripped = consecutiveErrors >= this.plannerMaxConsecutiveErrors
+        const backoffMs = breakerTripped
+          ? 0
+          : computePlannerBackoffMs(consecutiveErrors, this.plannerBackoffBaseMs, this.plannerBackoffCapMs)
+        this.plannerErrorState.set(run.id, {
+          goalRevision: run.goalRevision,
+          consecutiveErrors,
+          backoffUntil: breakerTripped ? 0 : Date.now() + backoffMs,
+          breakerTripped,
+        })
+        const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
+        if (breakerTripped) {
+          this.plannerDirty.delete(run.id)
+          const pendingTimer = this.plannerTimers.get(run.id)
+          if (pendingTimer) {
+            clearTimeout(pendingTimer)
+            this.plannerTimers.delete(run.id)
+          }
+          this.safeEvent(
+            run.id,
+            'planner.circuit_open',
+            `Planner paused after ${consecutiveErrors} consecutive error(s): ${msg}. Advancing once active steps settle.`,
+            { consecutiveErrors, maxConsecutiveErrors: this.plannerMaxConsecutiveErrors, error: msg },
+          )
+        } else {
+          this.safeEvent(
+            run.id,
+            'planner.error',
+            `Planner round failed (${consecutiveErrors}/${this.plannerMaxConsecutiveErrors}); backing off ${backoffMs}ms: ${msg}`,
+            { consecutiveErrors, maxConsecutiveErrors: this.plannerMaxConsecutiveErrors, backoffMs, error: msg },
+          )
         }
-      } catch { /* run/store may already be gone */ }
-      this.scheduleWake()
-    })
+      })
+      .finally(() => {
+        this.plannerTasks.delete(run.id)
+        try {
+          const latest = this.storage.run(run.id)
+          if (latest.status === 'running' && latest.phase === 'investigation') {
+            this.notifyCheckpoint(latest.id, 'planner-round')
+          }
+        } catch { /* run/store may already be gone */ }
+        this.scheduleWake()
+      })
   }
 
   private startInvestigationStep(run: Run, step: ChainStep, profiles: readonly ResolvedModelProfile[]) {
@@ -4284,9 +4476,11 @@ export class Execution {
     } catch { /* metrics are best-effort */ }
     try { this.recordFloorMetrics(run.id, 'phase3') } catch { /* metrics are best-effort */ }
     try { this.recordAssignmentMetrics(run.id, 'phase3') } catch { /* metrics are best-effort */ }
+    this.scheduleWake()
   }
 
   private driveVerification(run: Run) {
+    try { this.reconcileSettledApprovalWorkers(run) } catch { /* reconciliation is best-effort */ }
     const approvedOrigins = this.approvedOriginsSet(run)
     const workers = this.storage.workerList(run.id)
     const maxConc = Math.max(1, Math.min(maxWorkerConcurrency, run.workerConcurrency || defaultWorkerConcurrency))
@@ -4338,7 +4532,7 @@ export class Execution {
     const queued = updatedWorkers.filter(w => w.status === 'queued')
     const activeCount = [...this.active.values()].filter(j => j.assignment.runId === run.id).length
 
-    if (!queued.length && updatedWorkers.every(w => w.status === 'complete' || w.status === 'canceled')) {
+    if (!queued.length && updatedWorkers.every(w => w.status === 'complete' || w.status === 'canceled' || w.status === 'failed')) {
       // v6: never finalize while async OOB callbacks can still land. A bounded drain promotes late
       // callbacks (Fixture #2 delivers 15–30 s after the response) before the report is written.
       this.scheduleFinalReport(run)
