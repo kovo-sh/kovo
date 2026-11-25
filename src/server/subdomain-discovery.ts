@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto'
 import { resolve4, resolve6, resolveCname } from 'node:dns/promises'
 import { isIP } from 'node:net'
 import type { Candidate, DnsSource } from '../domain.ts'
+import { isPublicSuffixHost, registrableDomain } from './public-suffix.ts'
 import type { Run, Store } from './store.ts'
 
 export interface DnsLookupResult {
@@ -44,6 +45,8 @@ export interface SubdomainDiscoveryOptions {
   maxCandidates?: number
   wildcardProbeLabel?: string
   signal?: AbortSignal
+  /** Invoked incrementally as each discovery source finishes resolving live subdomains. */
+  onBatch?: (hosts: DiscoveredSubdomain[]) => void
 }
 
 export interface SubdomainDiscoveryResult {
@@ -80,35 +83,67 @@ export const THIRD_PARTY_SAAS_CNAME_SUFFIXES: readonly string[] = [
   'readme.io',
 ]
 
-const MULTI_PART_PUBLIC_SUFFIXES = new Set([
-  'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'me.uk', 'net.uk',
-  'com.au', 'net.au', 'org.au', 'edu.au', 'gov.au',
-  'co.jp', 'ne.jp', 'or.jp', 'go.jp', 'ac.jp',
-  'com.br', 'net.br', 'org.br', 'gov.br',
-  'com.cn', 'net.cn', 'org.cn', 'gov.cn',
-  'co.nz', 'net.nz', 'org.nz', 'govt.nz',
-  'co.in', 'net.in', 'org.in', 'gov.in',
-  'co.kr', 'or.kr', 'go.kr',
-  'com.mx', 'org.mx', 'gob.mx',
-  'com.sg', 'org.sg', 'gov.sg',
-  'com.hk', 'org.hk', 'gov.hk',
-  'com.tw', 'org.tw', 'gov.tw',
-  'co.za', 'org.za', 'gov.za',
-  'co.il', 'org.il', 'gov.il',
-  'com.tr', 'org.tr', 'gov.tr',
-  'com.ar', 'com.co', 'com.my', 'com.ph', 'com.vn', 'com.ua', 'com.pl',
-])
+/**
+ * Shared multi-tenant PaaS / cloud hosting suffixes whose subdomains belong to unrelated tenants.
+ * Origins hosted directly on these suffixes must NEVER collapse to a shared apex or auto-admit
+ * sibling subdomains during passive discovery.
+ */
+export const SHARED_PAAS_HOST_SUFFIXES: readonly string[] = [
+  'vercel.app',
+  'now.sh',
+  'netlify.app',
+  'netlify.com',
+  'herokuapp.com',
+  'herokudns.com',
+  'github.io',
+  'gitlab.io',
+  'bitbucket.io',
+  'pages.dev',
+  'workers.dev',
+  'r2.dev',
+  'trycloudflare.com',
+  'onrender.com',
+  'fly.dev',
+  'railway.app',
+  'up.railway.app',
+  'web.app',
+  'firebaseapp.com',
+  'azurewebsites.net',
+  'azurestaticapps.net',
+  'cloudapp.azure.com',
+  'cloudfront.net',
+  'amazonaws.com',
+  'amplifyapp.com',
+  'appspot.com',
+  'run.app',
+  'cloudfunctions.net',
+  'storage.googleapis.com',
+  'replit.app',
+  'repl.co',
+  'surge.sh',
+  'glitch.me',
+  'deno.dev',
+  'koyeb.app',
+  'pythonanywhere.com',
+  'ngrok.io',
+  'ngrok-free.app',
+  'loca.lt',
+  'b-cdn.net',
+  'fastly.net',
+  'edgekey.net',
+  'akamaized.net',
+]
 
 const SKIPPED_LOCAL_SUFFIXES = ['.localhost', '.local', '.internal', '.test', '.invalid', '.home.arpa']
 const VALID_HOSTNAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/
-const PRIORITY_PREFIXES = ['www', 'api', 'app', 'auth', 'admin', 'portal', 'dashboard', 'account', 'accounts', 'login', 'sso', 'staging', 'dev', 'docs', 'blog', 'status']
+const PRIORITY_PREFIXES = ['www', 'api', 'app', 'auth', 'oauth', 'admin', 'billing', 'portal', 'dashboard', 'account', 'accounts', 'login', 'sso', 'staging', 'dev', 'docs', 'blog', 'status']
 
 /**
  * Curated high-value first-party subdomain prefixes probed during wildcard-safe DNS sweeps
  * so discovery stays resilient even when every external passive CT API is rate-limited or down.
  */
 export const COMMON_SUBDOMAIN_PREFIXES: readonly string[] = [
-  'www', 'api', 'app', 'auth', 'login', 'sso', 'account', 'accounts', 'clerk',
+  'www', 'api', 'app', 'auth', 'oauth', 'login', 'sso', 'account', 'accounts', 'clerk',
   'admin', 'dashboard', 'console', 'portal', 'docs', 'blog', 'status', 'mail',
   'staging', 'stage', 'dev', 'beta', 'preview', 'sandbox', 'test',
   'cdn', 'static', 'assets', 'media', 'files', 'uploads',
@@ -145,17 +180,34 @@ function isLocalOrNonPublicHost(hostname: string): boolean {
   return false
 }
 
+/**
+ * Returns true when `hostname` is a shared multi-tenant PaaS/hosting domain or tenant subdomain
+ * (e.g. `my-app.vercel.app`, `foo.netlify.app`, `bar.github.io`, `app.railway.app`).
+ */
+export function isSharedPaasHost(hostname: string): boolean {
+  const host = normalizeHostname(hostname)
+  if (!host) return false
+  for (const suffix of SHARED_PAAS_HOST_SUFFIXES) {
+    if (host === suffix || host.endsWith(`.${suffix}`)) return true
+  }
+  return false
+}
+
+export function isSharedPaasOrigin(origin: string): boolean {
+  try {
+    return isSharedPaasHost(new URL(origin).hostname)
+  } catch {
+    return false
+  }
+}
+
 export function apexDomainOfHost(hostname: string): string | null {
   const host = normalizeHostname(hostname)
   if (isLocalOrNonPublicHost(host) || !VALID_HOSTNAME_RE.test(host)) return null
-  const labels = host.split('.')
-  if (labels.length < 2) return null
-  const lastTwo = `${labels[labels.length - 2]}.${labels[labels.length - 1]}`
-  if (MULTI_PART_PUBLIC_SUFFIXES.has(lastTwo)) {
-    if (labels.length < 3) return null
-    return `${labels[labels.length - 3]}.${lastTwo}`
-  }
-  return lastTwo
+  if (isSharedPaasHost(host) || isPublicSuffixHost(host)) return null
+  const registrable = registrableDomain(host)
+  if (!registrable || isSharedPaasHost(registrable) || isPublicSuffixHost(registrable)) return null
+  return registrable
 }
 
 /**
@@ -217,10 +269,54 @@ function normalizeCandidateHost(raw: string, normalizedApex: string, excludedHos
   return host
 }
 
+function sprawlPatternKey(prefix: string): string | null {
+  const labels = prefix.split('.')
+  let changed = false
+  const generalized = labels.map(label => {
+    if (/^pr-\d+$/.test(label)) { changed = true; return 'pr-*' }
+    if (/^deploy-preview-\d+$/.test(label)) { changed = true; return 'deploy-preview-*' }
+    if (/^preview-\d+$/.test(label)) { changed = true; return 'preview-*' }
+    const numShard = /^([a-z0-9-]+)-\d{3,}$/.exec(label)
+    if (numShard) { changed = true; return `${numShard[1]}-*` }
+    const hexDeploy = /^([a-z0-9-]+)-([0-9a-f]{7,})$/.exec(label)
+    if (hexDeploy && /\d/.test(hexDeploy[2])) { changed = true; return `${hexDeploy[1]}-*` }
+    return label
+  })
+  return changed ? generalized.join('.') : null
+}
+
+/**
+ * Collapse repetitive generated preview/shard subdomains (`pr-\d+.*`, `deploy-preview-\d+.*`,
+ * `preview-\d+.*`, `[a-z0-9-]+-\d{3,}.*`, hex deploy hashes) to at most 1 representative per
+ * pattern so noisy preview deploys never crowd out high-signal first-party hosts.
+ */
+export function collapseSprawlCandidates(hosts: readonly string[], normalizedApex: string): string[] {
+  const suffix = `.${normalizedApex}`
+  const seenPatterns = new Set<string>()
+  const out: string[] = []
+  for (const host of hosts) {
+    if (!host.endsWith(suffix)) {
+      out.push(host)
+      continue
+    }
+    const prefix = host.slice(0, -suffix.length)
+    const key = sprawlPatternKey(prefix)
+    if (!key) {
+      out.push(host)
+      continue
+    }
+    if (seenPatterns.has(key)) continue
+    seenPatterns.add(key)
+    out.push(host)
+  }
+  return out
+}
+
 function rankAndCapCandidates(
   hosts: Iterable<string>,
   normalizedApex: string,
   maxCandidates: number,
+  options: { collapseSprawl?: boolean } = {},
 ): string[] {
   const deduped = [...new Set(hosts)]
   deduped.sort((a, b) => {
@@ -230,7 +326,10 @@ function rankAndCapCandidates(
     if (ar1 !== br1) return ar1 - br1
     return ar2.localeCompare(br2)
   })
-  return deduped.slice(0, Math.max(1, Math.min(Math.floor(maxCandidates), 200)))
+  const filtered = options.collapseSprawl === false
+    ? deduped
+    : collapseSprawlCandidates(deduped, normalizedApex)
+  return filtered.slice(0, Math.max(1, Math.min(Math.floor(maxCandidates), 200)))
 }
 
 function collectCtHosts(
@@ -266,7 +365,7 @@ export function extractCtCandidates(
     found.add(wwwHost)
   }
 
-  return rankAndCapCandidates(found, normalizedApex, maxCandidates)
+  return rankAndCapCandidates(found, normalizedApex, maxCandidates, { collapseSprawl: false })
 }
 
 export function extractCertspotterCandidates(
@@ -493,6 +592,62 @@ export async function discoverSubdomainsForOrigins(
       return pending
     }
 
+    const discoveredByOrigin = new Map<string, DiscoveredSubdomain>()
+    let apexEmittedCount = 0
+
+    const emitLiveBatch = (hosts: readonly string[], source: SubdomainDiscoverySource) => {
+      const liveForSource: string[] = []
+      for (const hostname of hosts) {
+        if (hostname === probeHost || excludedHosts.has(hostname)) continue
+        const dns = resolvedDns.get(hostname)
+        if (!dns || (dns.cnames.length === 0 && dns.addresses.length === 0)) continue
+        liveForSource.push(hostname)
+      }
+      if (liveForSource.length === 0) return
+
+      const rankedBatch = rankAndCapCandidates(liveForSource, apex, maxCandidates)
+      const newlyEmitted: DiscoveredSubdomain[] = []
+      for (const hostname of rankedBatch) {
+        const origin = `https://${hostname}`
+        const existing = discoveredByOrigin.get(origin)
+        if (existing) {
+          if (!existing.sources) existing.sources = []
+          if (!existing.sources.includes(source)) existing.sources.push(source)
+          continue
+        }
+        if (seenOrigins.has(origin) || apexEmittedCount >= maxCandidates) continue
+        const dns = resolvedDns.get(hostname)
+        if (!dns) continue
+        const classification = classifyThirdPartyCname(dns.cnames)
+        const entry: DiscoveredSubdomain = {
+          hostname,
+          origin,
+          parentOrigin,
+          apexDomain: apex,
+          cnames: dns.cnames,
+          addresses: dns.addresses,
+          thirdParty: classification.thirdParty,
+          thirdPartyVendor: classification.matchedVendor,
+          cnameTarget: classification.cnameTarget,
+          sources: [...(sourcesByHost.get(hostname) ?? [source])],
+        }
+        if (!entry.sources!.includes(source)) entry.sources!.push(source)
+        seenOrigins.add(origin)
+        discoveredByOrigin.set(origin, entry)
+        discovered.push(entry)
+        apexEmittedCount += 1
+        newlyEmitted.push(entry)
+      }
+
+      if (newlyEmitted.length > 0 && options.onBatch) {
+        try {
+          options.onBatch(newlyEmitted)
+        } catch {
+          // Incremental batch consumer errors must never disrupt discovery
+        }
+      }
+    }
+
     const resolveSourceCandidates = async (hosts: readonly string[], source: SubdomainDiscoverySource) => {
       if (hosts.length === 0) return
       for (const host of hosts) recordSource(host, source)
@@ -500,6 +655,7 @@ export async function discoverSubdomainsForOrigins(
         if (options.signal?.aborted) return
         await resolveHostCached(hostname)
       })
+      emitLiveBatch(hosts, source)
     }
 
     // 1. Wildcard DNS check + common-prefix sweep (runs concurrently with passive HTTP CT sources)
@@ -525,19 +681,22 @@ export async function discoverSubdomainsForOrigins(
       const sweepHosts = COMMON_SUBDOMAIN_PREFIXES
         .map(prefix => `${prefix}.${apex}`)
         .filter(host => !excludedHosts.has(host) && VALID_HOSTNAME_RE.test(host))
+      const resolvedSweepHosts: string[] = []
       await mapWithConcurrency(sweepHosts, dnsConcurrency, async hostname => {
         if (options.signal?.aborted) return
         const res = await resolveHostCached(hostname)
         if (res.cnames.length > 0 || res.addresses.length > 0) {
           recordSource(hostname, 'dns_sweep')
+          resolvedSweepHosts.push(hostname)
         }
       })
+      emitLiveBatch(resolvedSweepHosts, 'dns_sweep')
     })()
 
     // 2. Primary passive CT source: crt.sh (15s timeout, 1 fast retry on 429/502/503/504)
     const crtTask = (async () => {
       if (options.signal?.aborted) return
-      const url = `https://crt.sh/?q=%25.${encodeURIComponent(apex)}&output=json`
+      const url = `https://crt.sh/?q=%25.${encodeURIComponent(apex)}&output=json&exclude=expired&deduplicate=Y`
       const startedAt = Date.now()
       try {
         let res = await fetchFn(url, {
@@ -655,7 +814,7 @@ export async function discoverSubdomainsForOrigins(
       warnings.push(`Passive subdomain discovery issues for ${apex}: ${apexErrors.join('; ')}.`)
     }
 
-    // Union & dedupe all live resolved subdomains across every source
+    // Reconcile sources and ensure any remaining resolved hosts (within maxCandidates) are included
     const liveHosts: string[] = []
     for (const hostname of sourcesByHost.keys()) {
       const dns = resolvedDns.get(hostname)
@@ -665,14 +824,20 @@ export async function discoverSubdomainsForOrigins(
     }
 
     const rankedLiveHosts = rankAndCapCandidates(liveHosts, apex, maxCandidates)
+    const remainingBatch: DiscoveredSubdomain[] = []
     for (const hostname of rankedLiveHosts) {
       const origin = `https://${hostname}`
-      if (seenOrigins.has(origin)) continue
+      const existing = discoveredByOrigin.get(origin)
+      if (existing) {
+        existing.sources = [...(sourcesByHost.get(hostname) ?? existing.sources ?? [])]
+        continue
+      }
+      if (seenOrigins.has(origin) || apexEmittedCount >= maxCandidates) continue
       const dns = resolvedDns.get(hostname)
       if (!dns) continue
       const classification = classifyThirdPartyCname(dns.cnames)
       seenOrigins.add(origin)
-      discovered.push({
+      const entry: DiscoveredSubdomain = {
         hostname,
         origin,
         parentOrigin,
@@ -683,7 +848,18 @@ export async function discoverSubdomainsForOrigins(
         thirdPartyVendor: classification.matchedVendor,
         cnameTarget: classification.cnameTarget,
         sources: [...(sourcesByHost.get(hostname) ?? [])],
-      })
+      }
+      discoveredByOrigin.set(origin, entry)
+      discovered.push(entry)
+      apexEmittedCount += 1
+      remainingBatch.push(entry)
+    }
+    if (remainingBatch.length > 0 && options.onBatch) {
+      try {
+        options.onBatch(remainingBatch)
+      } catch {
+        // Ignore consumer errors
+      }
     }
   }
 
@@ -733,8 +909,11 @@ export function applyDiscoveredSubdomainsToRun(
   for (const asset of detail.assets) {
     if (!asset.includeSubdomains || asset.thirdParty) continue
     if (!approvedOrigins.has(asset.origin)) continue
+    if (isSharedPaasOrigin(asset.origin)) continue
     const apex = extractDiscoverableApex(asset.origin)
-    if (apex) wildcardApexes.add(apex)
+    if (apex && !isSharedPaasHost(apex) && !isPublicSuffixHost(apex)) {
+      wildcardApexes.add(apex)
+    }
   }
 
   const admitted: Candidate[] = []
@@ -746,8 +925,23 @@ export function applyDiscoveredSubdomainsToRun(
 
   for (const sub of result.discovered) {
     if (approvedOrigins.has(sub.origin)) continue
+    // Defense-in-depth: shared-PaaS hosts and bare public suffixes must never auto-admit
+    // sibling tenants even if a caller supplies synthetic discovery entries directly.
+    const subApex = apexDomainOfHost(sub.hostname)
+    const isSharedOrUnsafeTenant =
+      isSharedPaasHost(sub.hostname) ||
+      isSharedPaasOrigin(sub.origin) ||
+      isSharedPaasHost(sub.apexDomain) ||
+      isSharedPaasOrigin(sub.parentOrigin) ||
+      isPublicSuffixHost(sub.apexDomain)
+    if (isSharedOrUnsafeTenant) continue
+
     const dnsSource = buildDnsSource(sub)
-    const shouldAutoAdmit = !sub.thirdParty && wildcardApexes.has(sub.apexDomain)
+    const shouldAutoAdmit =
+      !sub.thirdParty &&
+      subApex !== null &&
+      subApex === normalizeHostname(sub.apexDomain) &&
+      wildcardApexes.has(subApex)
 
     const latestRun: Run = storage.run(runId)
     storage.suggestCandidateHost(latestRun, sub.origin, 'phase0_ct_discovery', sub.thirdParty, dnsSource)
@@ -876,23 +1070,49 @@ export async function runDiscoverySubdomainsForRun(
   const timeoutMs = Math.max(500, Math.min(options.timeoutMs ?? DEFAULT_RUN_DISCOVERY_TIMEOUT_MS, 60_000))
   const boundedSignal = combineSignals(options.signal, timeoutMs)
 
+  const addedOrigins: string[] = []
+  const thirdPartyOrigins: string[] = []
+  const persistedOrigins = new Set<string>()
+
+  const persistBatch = (batch: DiscoveredSubdomain[], emitBatchEvent: boolean) => {
+    const batchAdded: string[] = []
+    for (const sub of batch) {
+      if (persistedOrigins.has(sub.origin)) continue
+      persistedOrigins.add(sub.origin)
+      const dnsSource = buildDnsSource(sub)
+      const latestRun = storage.run(runId)
+      const res = storage.suggestCandidateHost(latestRun, sub.origin, 'subdomain_discovery', sub.thirdParty, dnsSource)
+      if (res.added) {
+        addedOrigins.push(sub.origin)
+        batchAdded.push(sub.origin)
+        if (sub.thirdParty) thirdPartyOrigins.push(sub.origin)
+      }
+    }
+    if (emitBatchEvent && batchAdded.length > 0) {
+      storage.event(
+        runId,
+        'discovery.subdomains_batch',
+        `Discovered ${batchAdded.length} live ${batchAdded.length === 1 ? 'subdomain' : 'subdomains'} (${addedOrigins.length} total so far).`,
+        {
+          addedCount: batchAdded.length,
+          totalAddedCount: addedOrigins.length,
+          addedOrigins: batchAdded,
+        },
+      )
+    }
+  }
+
   const discovery = await discoverSubdomainsForOrigins(seedOrigins, {
     ...options,
     signal: boundedSignal,
+    onBatch: batch => {
+      persistBatch(batch, true)
+      options.onBatch?.(batch)
+    },
   })
 
-  const addedOrigins: string[] = []
-  const thirdPartyOrigins: string[] = []
-
-  for (const sub of discovery.discovered) {
-    const dnsSource = buildDnsSource(sub)
-    const latestRun = storage.run(runId)
-    const res = storage.suggestCandidateHost(latestRun, sub.origin, 'subdomain_discovery', sub.thirdParty, dnsSource)
-    if (res.added) {
-      addedOrigins.push(sub.origin)
-      if (sub.thirdParty) thirdPartyOrigins.push(sub.origin)
-    }
-  }
+  // Ensure any remaining entries not already persisted during streaming are recorded
+  persistBatch(discovery.discovered, false)
 
   const finalRun = storage.run(runId)
   storage.event(
