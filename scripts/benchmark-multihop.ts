@@ -1238,6 +1238,12 @@ export interface MultihopCapabilityLedgerTelemetry {
   compositeReceiptsCount: number
 }
 
+export interface MultihopRejectDetail {
+  reason: string
+  signature: string
+  count: number
+}
+
 export interface MultihopV8SdkAdoptionTelemetry {
   guardianVerifyCalls: number
   sealCapabilityCalls: number
@@ -1247,6 +1253,7 @@ export interface MultihopV8SdkAdoptionTelemetry {
   proveCompositeCalls: number
   compositeConfirmed: number
   topRejectReasons: Array<{ reason: string; count: number }>
+  topRejectDetails?: MultihopRejectDetail[]
 }
 
 export interface MultihopRunTelemetry {
@@ -1340,6 +1347,114 @@ function bumpRejectReason(map: Map<string, number>, raw: unknown, delta = 1): vo
   const normalized = normalizeRejectReason(raw)
   if (!normalized || delta <= 0) return
   map.set(normalized, (map.get(normalized) ?? 0) + delta)
+}
+
+/**
+ * Sanitize a rejection error message into a compact, secret-free failure signature (<= 140 chars).
+ * Normalizes UUIDs, gx-IDs, capability handles, runtime IDs, IP/ports, and numbers to `<id>`,
+ * and strips inline secrets and raw HTTP/HTML/JSON bodies.
+ */
+export function sanitizeRejectSignature(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  const redacted = redact(raw)
+  const lines = redacted
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(Boolean)
+  if (!lines.length) return null
+  let picked = lines[0]!
+  if (/^Traceback \(most recent call last\):/i.test(picked)) {
+    picked = lines[lines.length - 1]!
+  } else if (lines.length > 1) {
+    const errLine = lines.find(l => /\b(?:[A-Z][A-Za-z0-9]*Error|Exception|ERR_[A-Z0-9_]+|AssertionError)\b/.test(l))
+    if (errLine) picked = errLine
+  }
+  let s = picked
+    .replace(/^CompositeProofReceipt rejected at stage ['"][^'"]+['"]:\s*/i, '')
+    .replace(/\b(body|responseBody|response|payload)\s*[:=]\s*(?:[\[{<]|["'][\[{<]).*$/i, '$1=<redacted>')
+    .replace(/<!DOCTYPE[^>]*>.*$/i, '<html>')
+    .replace(/<(?:html|head|body)\b[^>]*>.*$/i, '<html>')
+    .replace(/\bHTTP\/\d(?:\.\d)?\s+\d{3}\b.*$/i, '<http>')
+    .replace(/\b(authorization|cookie|set-cookie|token|secret|password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?id)\s*[:=]\s*(?:Bearer\s+|Basic\s+)?[^\s,;}"']+/gi, '$1=<redacted>')
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9._-]+/g, '<redacted>')
+    .replace(/\{[^{}]{32,}\}/g, '<json>')
+    .replace(/\{[^{}]{32,}\}/g, '<json>')
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '<id>')
+    .replace(/\bcap:[A-Za-z0-9._:-]+/g, '<id>')
+    .replace(/\bgx[-_][A-Za-z0-9_-]+/gi, '<id>')
+    .replace(/\b(?:ex|chain|job|run|sess|req|resp|oob|poll|spec|finding|worker|assign|gv)[-_](?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]+/gi, '<id>')
+    .replace(/\b[0-9a-f]{16,}\b/gi, '<id>')
+    .replace(/\b\d{1,3}(?:\.\d{1,3}){3}:\d{2,5}\b/g, '<id>:<id>')
+    .replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g, '<id>')
+    .replace(/:(\d{2,5})(?=[/\s"'`),;]|$)/g, ':<id>')
+    .replace(/\bport\s+\d{2,5}\b/gi, 'port <id>')
+    .replace(/(?<=\b[a-z]+_)\d+\b/gi, '<id>')
+    .replace(/#\d+\b/g, '#<id>')
+    .replace(/\b\d+\b/g, '<id>')
+    .replace(/<id>(?:,\s*<id>)+/g, '<id>')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!s) return null
+  if (s.length > 140) s = s.slice(0, 140).trimEnd()
+  return s || null
+}
+
+function pickRejectSignature(
+  primary: Record<string, unknown> | null | undefined,
+  secondary?: Record<string, unknown> | null,
+  reasonHint?: unknown,
+): unknown {
+  const nonEmptyStr = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v.trim() : null)
+  const firstMeaningful = (list: unknown): string | null => {
+    if (!Array.isArray(list)) return null
+    let fallback: string | null = null
+    for (const item of list) {
+      const t = nonEmptyStr(item)
+      if (!t) continue
+      if (!fallback) fallback = t
+      if (!/^(?:rejected-by|missing-evidence):/i.test(t)) return t
+    }
+    return fallback
+  }
+  const hint = typeof reasonHint === 'string' ? reasonHint.trim().toLowerCase() : ''
+  const detailStr = nonEmptyStr(secondary?.reason) ?? nonEmptyStr(secondary?.detail) ?? nonEmptyStr(primary?.detail)
+  const stderrStr = nonEmptyStr(primary?.stderrPreview) ?? nonEmptyStr(primary?.stderr)
+  const isExecGeneric = hint === 'execution' || hint === 'execution_failed'
+    || (detailStr !== null && /^(?:script exited|execution failed|worker exited)/i.test(detailStr))
+  if (stderrStr && (isExecGeneric || !detailStr)) return stderrStr
+  if (detailStr) return detailStr
+  const errStr = nonEmptyStr(primary?.error) ?? nonEmptyStr(primary?.message) ?? firstMeaningful(primary?.failures)
+  if (errStr) return errStr
+  if (Array.isArray(primary?.attempts)) {
+    for (const att of primary.attempts) {
+      if (!att || typeof att !== 'object') continue
+      const a = att as Record<string, unknown>
+      const attSig = nonEmptyStr(a.stderrPreview) ?? nonEmptyStr(a.stderr) ?? firstMeaningful(a.failures) ?? nonEmptyStr(a.error)
+      if (attSig) return attSig
+    }
+  }
+  return nonEmptyStr(primary?.reason)
+    ?? firstMeaningful(primary?.missingEvidence)
+    ?? nonEmptyStr(primary?.rejectedBy)
+    ?? nonEmptyStr(secondary?.failedStage)
+    ?? nonEmptyStr(primary?.failedStage)
+    ?? nonEmptyStr(primary?.errorCode)
+    ?? null
+}
+
+function bumpRejectDetail(
+  map: Map<string, MultihopRejectDetail>,
+  rawReason: unknown,
+  rawSignature: unknown,
+  delta = 1,
+): void {
+  const reason = normalizeRejectReason(rawReason)
+  if (!reason || delta <= 0) return
+  const signature = sanitizeRejectSignature(rawSignature) ?? sanitizeRejectSignature(reason) ?? reason
+  const key = `${reason}\0${signature}`
+  const prev = map.get(key)
+  if (prev) prev.count += delta
+  else map.set(key, { reason, signature, count: delta })
 }
 
 function isChainStepRow(row: {
@@ -1528,6 +1643,7 @@ export function extractMultihopRunTelemetry(
   const confirmedCompositeChainIds = new Set<string>()
   let anonymousCompositeConfirmed = 0
   const rejectReasons = new Map<string, number>()
+  const rejectDetails = new Map<string, MultihopRejectDetail>()
 
   const bumpSdkOp = (op: unknown, count = 1): void => {
     if (typeof op !== 'string' || count <= 0) return
@@ -1737,7 +1853,9 @@ export function extractMultihopRunTelemetry(
             else anonymousCompositeConfirmed += 1
           } else if (detail.ok === false || detail.confirmed === false) {
             if (detail.op === 'composite.verify' || detail.method === 'composite.verify') eventCompositeRejected += 1
-            bumpRejectReason(rejectReasons, detail.rejectReason ?? detail.failedStage ?? detail.rejectedBy ?? detail.reason ?? detail.errorCode)
+            const r = detail.rejectReason ?? detail.failedStage ?? detail.rejectedBy ?? detail.reason ?? detail.errorCode
+            bumpRejectReason(rejectReasons, r)
+            bumpRejectDetail(rejectDetails, r, pickRejectSignature(detail, null, r))
           }
         } else if (kind === 'capability.seal' || kind === 'capability.sealed' || kind === 'verify_rpc.capability_seal') {
           eventSealCapabilityCalls += 1
@@ -1754,12 +1872,16 @@ export function extractMultihopRunTelemetry(
             else anonymousCompositeConfirmed += 1
           } else if (detail.confirmed === false) {
             eventCompositeRejected += 1
-            bumpRejectReason(rejectReasons, detail.failedStage ?? detail.rejectReason ?? detail.rejectedBy ?? detail.reason)
+            const r = detail.failedStage ?? detail.rejectReason ?? detail.rejectedBy ?? detail.reason
+            bumpRejectReason(rejectReasons, r)
+            bumpRejectDetail(rejectDetails, r, pickRejectSignature(detail, null, r))
           }
         } else if (kind === 'composite.rejected') {
           eventProveCompositeCalls += 1
           eventCompositeRejected += 1
-          bumpRejectReason(rejectReasons, detail.failedStage ?? detail.rejectReason ?? detail.rejectedBy ?? detail.reason)
+          const r = detail.failedStage ?? detail.rejectReason ?? detail.rejectedBy ?? detail.reason
+          bumpRejectReason(rejectReasons, r)
+          bumpRejectDetail(rejectDetails, r, pickRejectSignature(detail, null, r))
         } else if (kind === 'agent.script_proof_confirmed') {
           const rule = typeof detail.receiptRule === 'string' ? detail.receiptRule : ''
           const chainId = typeof detail.chainId === 'string' && detail.chainId.trim() ? detail.chainId.trim() : null
@@ -1776,7 +1898,9 @@ export function extractMultihopRunTelemetry(
           || kind === 'verify_rpc.rejected'
           || kind === 'verify_rpc.error'
         ) {
-          bumpRejectReason(rejectReasons, detail.failedStage ?? detail.rejectReason ?? detail.rejectedBy ?? detail.reason ?? detail.errorCode ?? detail.rule)
+          const r = detail.failedStage ?? detail.rejectReason ?? detail.rejectedBy ?? detail.reason ?? detail.errorCode ?? detail.rule
+          bumpRejectReason(rejectReasons, r)
+          bumpRejectDetail(rejectDetails, r, pickRejectSignature(detail, null, r))
         }
 
         const rpcBag = (detail.rpcCounts && typeof detail.rpcCounts === 'object')
@@ -1899,7 +2023,9 @@ export function extractMultihopRunTelemetry(
         if (verification.confirmed === true) {
           confirmedCompositeChainIds.add(receipt.chainId)
         } else if (verification.confirmed === false) {
-          bumpRejectReason(rejectReasons, verification.failedStage ?? verification.reason)
+          const r = verification.failedStage ?? verification.reason
+          bumpRejectReason(rejectReasons, r)
+          bumpRejectDetail(rejectDetails, r, pickRejectSignature(verification, null, r))
         }
       }
     } else if (typeof obj.chainId === 'string' && Array.isArray(obj.hops) && obj.hops.length > 0) {
@@ -2021,7 +2147,9 @@ export function extractMultihopRunTelemetry(
                     else anonymousCompositeConfirmed += 1
                   }
                   if (rec.confirmed === false || rec.ok === false || cr?.confirmed === false) {
-                    bumpRejectReason(rejectReasons, cr?.failedStage ?? rec.rejectedBy ?? rec.reason ?? rec.errorCode)
+                    const r = cr?.failedStage ?? rec.rejectedBy ?? rec.reason ?? rec.errorCode
+                    bumpRejectReason(rejectReasons, r)
+                    bumpRejectDetail(rejectDetails, r, pickRejectSignature(rec, cr, r))
                   }
                 }
               }
@@ -2117,6 +2245,9 @@ export function extractMultihopRunTelemetry(
     .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
     .slice(0, 10)
     .map(([reason, count]) => ({ reason, count }))
+  const topRejectDetails = [...rejectDetails.values()]
+    .sort((a, b) => b.count - a.count || (a.reason < b.reason ? -1 : a.reason > b.reason ? 1 : a.signature < b.signature ? -1 : a.signature > b.signature ? 1 : 0))
+    .slice(0, 12)
 
   return {
     phaseTiming: {
@@ -2153,6 +2284,7 @@ export function extractMultihopRunTelemetry(
       proveCompositeCalls,
       compositeConfirmed,
       topRejectReasons,
+      topRejectDetails,
     },
   }
 }
@@ -2185,15 +2317,23 @@ export function aggregateMultihopTelemetry(
     : roundPct(items.reduce((n, t) => n + t.scheduler.deadEndWastePct, 0) / (items.length * 100))
 
   const rejectMap = new Map<string, number>()
+  const rejectDetailMap = new Map<string, MultihopRejectDetail>()
+  const hasAnyRejectDetails = items.some(t => t.v8SdkAdoption.topRejectDetails !== undefined)
   for (const t of items) {
     for (const entry of t.v8SdkAdoption.topRejectReasons) {
       bumpRejectReason(rejectMap, entry.reason, entry.count)
+    }
+    for (const detailEntry of t.v8SdkAdoption.topRejectDetails ?? []) {
+      bumpRejectDetail(rejectDetailMap, detailEntry.reason, detailEntry.signature, detailEntry.count)
     }
   }
   const topRejectReasons = [...rejectMap.entries()]
     .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
     .slice(0, 10)
     .map(([reason, count]) => ({ reason, count }))
+  const topRejectDetails = [...rejectDetailMap.values()]
+    .sort((a, b) => b.count - a.count || (a.reason < b.reason ? -1 : a.reason > b.reason ? 1 : a.signature < b.signature ? -1 : a.signature > b.signature ? 1 : 0))
+    .slice(0, 12)
 
   return {
     phaseTiming: {
@@ -2230,6 +2370,7 @@ export function aggregateMultihopTelemetry(
       proveCompositeCalls: items.reduce((n, t) => n + t.v8SdkAdoption.proveCompositeCalls, 0),
       compositeConfirmed: items.reduce((n, t) => n + t.v8SdkAdoption.compositeConfirmed, 0),
       topRejectReasons,
+      ...(hasAnyRejectDetails ? { topRejectDetails } : {}),
     },
   }
 }
@@ -3465,6 +3606,12 @@ export function renderMultihopReport(report: MultihopReport, format: 'json' | 'm
           'v8 SDK Adoption',
           `guardian_verify=${sdk.guardianVerifyCalls}, seal=${sdk.sealCapabilityCalls}, hmac=${sdk.hmacSignCalls}, jwt=${sdk.jwtSignCalls}, awaitAsync=${sdk.awaitAsyncCalls}, proveComposite=${sdk.proveCompositeCalls} (confirmed=${sdk.compositeConfirmed}), topRejects=${rejectSummary}`,
         ],
+        ...(sdk.topRejectDetails?.length
+          ? [[
+              'Top Reject Details',
+              sdk.topRejectDetails.slice(0, 5).map(d => `\`${d.reason}\`: ${d.signature.replace(/\|/g, '/')} (${d.count})`).join('; '),
+            ]]
+          : []),
       ],
     ))
     lines.push('')
