@@ -1,6 +1,7 @@
-import { createFileRoute, Link, useLocation, useNavigate } from '@tanstack/react-router'
+import { createFileRoute, Link, useLocation, useNavigate, useRouter } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
-import { projectData, testPersonaAuthAction } from '../actions.ts'
+import { projectData, removeProject, testPersonaAuthAction } from '../actions.ts'
+import { Icon } from '../components/run/icons.tsx'
 import { ProjectGuardrailsTab } from '../components/project/ProjectGuardrailsTab.tsx'
 import { ProjectInventoryTab } from '../components/project/ProjectInventoryTab.tsx'
 import { ProjectNewRunSheet } from '../components/project/ProjectNewRunSheet.tsx'
@@ -32,12 +33,48 @@ function ProjectPage() {
   const search = Route.useSearch()
   const location = useLocation()
   const navigate = useNavigate()
+  const router = useRouter()
 
   const activeTab: ProjectTabId = search.tab ?? 'overview'
   const hashWantsNewRun = location.hash === 'new-run' || location.hash === '#new-run'
   const [newRunOpen, setNewRunOpen] = useState(() => Boolean(search.newRun) || hashWantsNewRun)
+  const [deleteProjectOpen, setDeleteProjectOpen] = useState(false)
+  const [deletingProject, setDeletingProject] = useState(false)
+  const [deleteProjectError, setDeleteProjectError] = useState('')
   const [selectedPersonaIds, setSelectedPersonaIds] = useState<string[]>(() => personas.map(p => p.id))
   const [personaTests, setPersonaTests] = useState<Record<string, PersonaTestState>>({})
+
+  const activeRunsCount = runs.filter(r => r.status === 'running').length
+  const totalFindings = runs.reduce((sum, r) => sum + r.findingCount, 0)
+  const totalConfirmed = runs.reduce((sum, r) => sum + r.confirmedCount, 0)
+
+  useEffect(() => {
+    if (!deleteProjectOpen) return
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !deletingProject) {
+        e.preventDefault()
+        setDeleteProjectOpen(false)
+        setDeleteProjectError('')
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [deleteProjectOpen, deletingProject])
+
+  async function confirmDeleteProject() {
+    if (deletingProject) return
+    setDeletingProject(true)
+    setDeleteProjectError('')
+    try {
+      await removeProject({ data: { projectId: project.id, stopActive: activeRunsCount > 0 } })
+      setDeleteProjectOpen(false)
+      await router.invalidate()
+      await navigate({ to: '/', replace: true })
+    } catch (err) {
+      setDeleteProjectError(err instanceof Error ? err.message : 'Could not delete the project.')
+      setDeletingProject(false)
+    }
+  }
 
   useEffect(() => {
     const openAndCleanUrl = () => {
@@ -125,13 +162,25 @@ function ProjectPage() {
         <span className="pw-hdr-meta mono" title={project.seeds.join(', ')}>
           {project.seeds.map(safeHost).join(', ')}
         </span>
-        {showHeaderNewRun && (
-          <div className="pw-hdr-actions">
+        <div className="pw-hdr-actions">
+          <button
+            type="button"
+            className="pw-btn ghost danger-hover"
+            title="Delete project"
+            onClick={() => {
+              setDeleteProjectError('')
+              setDeleteProjectOpen(true)
+            }}
+          >
+            <Icon name="trash" size={13} />
+            Delete project
+          </button>
+          {showHeaderNewRun && (
             <button type="button" className="pw-btn primary" onClick={() => setNewRunOpen(true)}>
               New run
             </button>
-          </div>
-        )}
+          )}
+        </div>
       </div>
     </header>
 
@@ -187,5 +236,99 @@ function ProjectPage() {
       personaTests={personaTests}
       onTestPersona={persona => void handleTestPersonaAuth(persona)}
     />
+
+    {deleteProjectOpen && (
+      <div
+        className="pw-overlay"
+        onMouseDown={e => {
+          if (e.target === e.currentTarget && !deletingProject) {
+            setDeleteProjectOpen(false)
+            setDeleteProjectError('')
+          }
+        }}
+      >
+        <div
+          className="pw-modal"
+          style={{ width: 460 }}
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="pw-del-project-title"
+        >
+          <div className="pw-modal-hdr">
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+              <Icon name="trash" size={15} style={{ color: 'var(--pw-bad)' }} />
+              <span id="pw-del-project-title">Delete project</span>
+            </span>
+            <button
+              type="button"
+              className="pw-btn ghost"
+              style={{ padding: '0 6px' }}
+              disabled={deletingProject}
+              onClick={() => { setDeleteProjectOpen(false); setDeleteProjectError('') }}
+              aria-label="Close"
+            >
+              <Icon name="close" size={14} />
+            </button>
+          </div>
+          <div className="pw-modal-body">
+            <p className="dim" style={{ margin: 0, fontSize: 12.5 }}>
+              Permanently delete <strong style={{ color: 'var(--pw-fg)' }}>{project.name}</strong> and all associated data, local synced repos, and test account credentials. This cannot be undone.
+            </p>
+            <div className="pw-confirm-summary">
+              <div className="pw-confirm-goal">{project.name}</div>
+              <div className="pw-confirm-meta num">
+                <span className="pw-tag solid">
+                  {runs.length} {runs.length === 1 ? 'run' : 'runs'}
+                </span>
+                <span className="pw-tag solid">
+                  {totalFindings} {totalFindings === 1 ? 'finding' : 'findings'}
+                  {totalConfirmed > 0 ? ` (${totalConfirmed} confirmed)` : ''}
+                </span>
+                {personas.length > 0 && (
+                  <span className="pw-tag solid">
+                    {personas.length} {personas.length === 1 ? 'test account' : 'test accounts'}
+                  </span>
+                )}
+                {specs.length > 0 && (
+                  <span className="pw-tag solid">
+                    {specs.length} {specs.length === 1 ? 'spec' : 'specs'}
+                  </span>
+                )}
+              </div>
+            </div>
+            {activeRunsCount > 0 && (
+              <div className="pw-confirm-warn" role="status">
+                <Icon name="alert" size={14} />
+                <span>
+                  {activeRunsCount} {activeRunsCount === 1 ? 'run is' : 'runs are'} currently active. Confirming will stop active runs before deleting the project.
+                </span>
+              </div>
+            )}
+            {deleteProjectError && <p className="err" role="alert" style={{ margin: 0 }}>{deleteProjectError}</p>}
+          </div>
+          <div className="pw-modal-ftr">
+            <button
+              type="button"
+              className="pw-btn ghost"
+              disabled={deletingProject}
+              onClick={() => { setDeleteProjectOpen(false); setDeleteProjectError('') }}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="pw-btn danger-solid"
+              disabled={deletingProject}
+              onClick={() => void confirmDeleteProject()}
+            >
+              <Icon name="trash" size={13} />
+              {deletingProject
+                ? (activeRunsCount > 0 ? 'Stopping & deleting…' : 'Deleting…')
+                : (activeRunsCount > 0 ? 'Stop runs & delete project' : 'Delete project')}
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
   </main>
 }

@@ -763,6 +763,29 @@ export function deleteProjectPersona(storage: Store, input: z.output<typeof dele
   })
 }
 
+/**
+ * Remove local 0600 persona credential & minted session files for one or more credential IDs.
+ * Intended to run after a project-deletion transaction commits so credential files are never
+ * orphaned on disk and a rolled-back transaction never loses credentials.
+ */
+export function deletePersonaCredentialFiles(dataDirectory: string, credentialIds: readonly string[]): number {
+  let removed = 0
+  const credDir = join(dataDirectory, 'credentials')
+  for (const credentialId of credentialIds) {
+    if (!credentialId || credentialId.includes('..') || /[\\/\0]/.test(credentialId)) continue
+    const basePath = join(credDir, credentialId)
+    for (const candidate of [basePath, `${basePath}.session`]) {
+      try {
+        unlinkSync(candidate)
+        removed += 1
+      } catch {
+        // Already absent or unreadable; best-effort cleanup.
+      }
+    }
+  }
+  return removed
+}
+
 export function resolveRunPersonas(storage: Store, projectId: string, approvedPersonaIds: readonly string[]): Map<string, ResolvedPersona> {
   const allowed = new Set(approvedPersonaIds)
   const map = new Map<string, ResolvedPersona>()

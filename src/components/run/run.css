@@ -1026,3 +1026,14 @@
 .rw .pane{transition:opacity var(--d2) var(--ease)}
 .rw .app.pane-collapsed .pane{border-left-color:transparent;overflow:hidden;opacity:0;pointer-events:none;transition:opacity var(--d1) var(--ease)}
 .rw .btn.ghost.on{background:var(--press);color:var(--fg)}
+.rw .btn.danger-solid{background:var(--bad);color:#fff;box-shadow:none}
+.rw .btn.danger-solid:hover{background:var(--bad);filter:brightness(1.08)}
+.rw .del-dialog{width:460px;max-width:calc(100vw - 32px);padding:0;overflow:hidden}
+.rw .del-dialog .sheet{border:0;border-radius:12px}
+.rw .del-dialog-b{padding:14px 16px;display:flex;flex-direction:column;gap:12px}
+.rw .del-dialog-lede{margin:0;color:var(--fg-2);font-size:12.5px;line-height:18px}
+.rw .del-dialog-summary{border:1px solid var(--line);border-radius:8px;background:var(--sunk);padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+.rw .del-dialog-goal{font-weight:500;font-size:13px;color:var(--fg);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.rw .del-dialog-meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.rw .del-dialog-warn{display:flex;align-items:flex-start;gap:8px;padding:9px 11px;border-radius:8px;background:var(--warn-soft);box-shadow:inset 0 0 0 1px var(--warn-line);color:var(--fg);font-size:12px;line-height:17px}
+.rw .del-dialog-warn .ico{color:var(--warn);flex:none;margin-top:2px}
