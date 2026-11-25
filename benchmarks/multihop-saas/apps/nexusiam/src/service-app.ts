@@ -74,7 +74,8 @@ export async function handleApp(
       bot: true,
       runId: body?.runId ?? runId,
     })
-    if (state.profile.moderationRendersRaw && state.profile.botSameOriginMint) {
+    // The moderation integration holds provisioning rights for the primary workspace only.
+    if (comment.tenantId === 'org_a' && state.profile.moderationRendersRaw && state.profile.botSameOriginMint) {
       try {
         const minted = await egress.fetch('api', '/internal/scim/tokens', {
           method: 'POST',
@@ -150,6 +151,13 @@ export async function handleApp(
       sendHtml(res, 200, '<!doctype html><title>Shared item</title><p>Shared item preview</p>')
       return
     }
+    // Only a code that /authorize issued for a share-link handoff links the delegated client.
+    const issued = state.authCodes.get(code)
+    if (!issued || !issued.shareHandoff) {
+      sendJson(res, 200, { shareId: share[0]!, linked: false, state: url.search.get('state') ?? '' })
+      return
+    }
+    issued.linked = true
     state.emit('share.delegated_code_captured', {
       codeDigest: digest(code),
       shareId: share[0]!,

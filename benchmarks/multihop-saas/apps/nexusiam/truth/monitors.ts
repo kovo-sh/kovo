@@ -28,7 +28,7 @@ function actor(event: AuditEvent, fallback: PersonaId): PersonaId {
 
 export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runId: string) {
   const c1 = {
-    commentId: '', commentDigest: '', visitDigest: '', tokenDigest: '', targetUserId: '',
+    commentId: '', commentDigest: '', visitDigest: '', tokenDigest: '', targetUserId: '', targetRole: '',
     deniedUserId: '', h2: false, h3: false, h4: false,
   }
   const c2 = { codeDigest: '', inviteTokenDigest: '', h2: false, h3: false }
@@ -92,14 +92,17 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
     if (event.kind === 'scim.user_patched') {
       if (!c1.tokenDigest || text(event, 'tokenDigest') !== c1.tokenDigest) return
       const targetUserId = text(event, 'targetUserId')
-      if (targetUserId !== plan.personas.member_a.userId || text(event, 'role') !== 'owner') return
+      // The audit vault admits owners and admins, so either promotion completes the escalation.
+      const role = text(event, 'role')
+      if (targetUserId !== plan.personas.member_a.userId || (role !== 'owner' && role !== 'admin')) return
       c1.targetUserId = targetUserId
+      c1.targetRole = role
       c1.h4 = true
-      const artifact = digest(`role:${targetUserId}:owner`)
+      const artifact = digest(`role:${targetUserId}:${role}`)
       oracle.recordHop({
         chainId: 'NX-C1', hopId: 'nx-c1-h4', service: sid('api'), routeKey: 'api.scimUserPatch',
         actor: 'member_a', artifactDigest: artifact, entityId: targetUserId, ts: event.ts,
-        effectiveRole: 'owner',
+        effectiveRole: role === 'admin' ? 'admin' : 'owner',
       })
       oracle.recordEdge({
         chainId: 'NX-C1', fromHopId: 'nx-c1-h3', toHopId: 'nx-c1-h4', kind: 'value_binding',
@@ -126,11 +129,11 @@ export function createNexusiamMonitor(oracle: ChainOracle, plan: NexusPlan, runI
       oracle.recordHop({
         chainId: 'NX-C1', hopId: 'nx-c1-h5', service: sid('api'), routeKey: 'api.auditVaultRead',
         actor: 'member_a', artifactDigest: artifact, entityId: readerUserId, ts: event.ts,
-        effectiveRole: 'owner',
+        effectiveRole: c1.targetRole === 'admin' ? 'admin' : 'owner',
       })
       oracle.recordEdge({
         chainId: 'NX-C1', fromHopId: 'nx-c1-h4', toHopId: 'nx-c1-h5', kind: 'state_transition_binding',
-        fromArtifactDigest: c1.targetUserId ? digest(`role:${c1.targetUserId}:owner`) : '',
+        fromArtifactDigest: c1.targetUserId ? digest(`role:${c1.targetUserId}:${c1.targetRole}`) : '',
         toConsumedDigest: artifact, entityId: readerUserId, ts: event.ts,
       })
       if (c1.deniedUserId === readerUserId) {

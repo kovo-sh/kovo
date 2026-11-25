@@ -51,6 +51,8 @@ export function createLabState(plan: NexusPlan, profile: LabProfile, runId: stri
     docs: [],
     jobs: [],
     cache: new Map(),
+    authCodes: new Map(),
+    indexedFolders: new Set(),
     audit,
     listeners,
     seq: 0,

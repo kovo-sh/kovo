@@ -417,7 +417,9 @@ export async function handleApi(
     const session = auth(state, req, res)
     if (!session) return
     const folder = url.search.get('folder') ?? ''
-    if (!state.profile.shareMetadataLeaksHandle || folder !== state.plan.nexus.privateFolderName) {
+    // Folder handles resolve from the search index, which facet queries populate.
+    if (!state.profile.shareMetadataLeaksHandle || folder !== state.plan.nexus.privateFolderName
+      || !state.indexedFolders.has(folder)) {
       state.emit('doc.share_denied', { linkId: shareMetadata[0]!, reason: 'folder_scope', runId }, session.originPersona)
       sendJson(res, 404, { error: 'share link not found' })
       return
@@ -446,6 +448,7 @@ export async function handleApi(
     const tenantId = tenantBySlug(state, tenantSlug)
     const privateMatch = tenantId === 'org_a' && query === state.plan.nexus.privateFolderName
     const count = state.profile.facetsLeakCounts && privateMatch ? 1 : 0
+    if (count > 0) state.indexedFolders.add(query)
     state.emit('search.facets_returned', {
       query,
       count,

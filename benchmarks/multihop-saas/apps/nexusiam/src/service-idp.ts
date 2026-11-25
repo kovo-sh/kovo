@@ -16,16 +16,13 @@ function mint(prefix: string): string {
   return `${prefix}${randomBytes(9).toString('hex')}`
 }
 
-/** Authorization codes handed out by /authorize and not yet exchanged, per lab state. */
-const issuedCodes = new WeakMap<LabState, Set<string>>()
-
-function codesOf(state: LabState): Set<string> {
-  let codes = issuedCodes.get(state)
-  if (!codes) {
-    codes = new Set()
-    issuedCodes.set(state, codes)
+/** A delegated client is one whose share-link handoff code was delivered and linked by the app. */
+function linkedDelegation(state: LabState, derivedFromDigest: string): boolean {
+  if (!derivedFromDigest) return false
+  for (const record of state.authCodes.values()) {
+    if (record.linked && record.codeDigest === derivedFromDigest) return true
   }
-  return codes
+  return false
 }
 
 function tenantRole(state: LabState, session: SessionRecord, tenantId: TenantKey): LabRole | null {
@@ -175,8 +172,8 @@ export async function handleIdp(
       return
     }
     const code = mint('mh_fake_code_')
-    codesOf(state).add(code)
     const openRedirect = state.profile.redirectSubpathAccepted && next.startsWith('/s/')
+    state.authCodes.set(code, { codeDigest: digest(code), shareHandoff: openRedirect, linked: false, runId })
     state.emit('idp.authorize_redirect', {
       codeDigest: digest(code),
       redirect: openRedirect ? next : redirect,
@@ -195,7 +192,7 @@ export async function handleIdp(
   if (method === 'POST' && match(url, method, '/token')) {
     const body = parseJson<{ code?: string }>(await readBody(req))
     // Codes are single-use and must have been issued by /authorize.
-    const codes = codesOf(state)
+    const codes = state.authCodes
     if (!body?.code || !codes.has(body.code)) {
       state.emit('idp.token_denied', { reason: 'invalid_grant', runId })
       sendJson(res, 400, { error: 'invalid_grant' })
@@ -237,14 +234,16 @@ export async function handleIdp(
         return
       }
       const invites = state.invites.filter((invite) => invite.tenantId === tenantId)
-      if (!state.profile.inviteListLeaksToken) {
+      // Pending invitations are listed only to a linked delegated client, identified by the digest of
+      // its share-link handoff code in x-derived-from.
+      if (!state.profile.inviteListLeaksToken || !linkedDelegation(state, header(req, 'x-derived-from'))) {
         state.emit('invite.pending_denied', {
           tenantId,
           reason: 'live_role_check',
           derivedFromDigest: header(req, 'x-derived-from'),
           runId,
         }, session.originPersona)
-        sendJson(res, 403, { error: 'invite listing requires tenant administration' })
+        sendJson(res, 403, { error: 'invite listing requires tenant administration or a linked delegated client (x-derived-from)' })
         return
       }
       const listed = invites.map((invite) => {
