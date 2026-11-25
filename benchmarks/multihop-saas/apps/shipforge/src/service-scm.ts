@@ -9,8 +9,8 @@ import type {
   WebhookRecord,
 } from './shared.ts'
 import {
-  authenticate, authorizeHeader, canContribute, canManage, digest, hasTenantMembership, patByToken, roleOf,
-  roleRank,
+  authenticate, authorizeHeader, canContribute, canManage, digest, hasTenantMembership, patByToken,
+  permissionsFor, roleOf, roleRank, RUNNER_POOL_TENANT,
 } from './policy.ts'
 import { projectById, tenantBySlug } from './state.ts'
 
@@ -132,12 +132,20 @@ export async function handleScm(
       sendJson(res, 403, { error: 'not a member of this tenant' })
       return
     }
+    const boundTenant = requestedTenant ?? session.tenantId
+    const scopes = body?.scopes ?? ['repo:read']
+    const allowed = permissionsFor(roleOf(state, session, boundTenant))
+    // A token never carries a scope beyond the holder's role in the tenant it is bound to.
+    if (!Array.isArray(scopes) || scopes.some((scope) => !allowed.includes(scope))) {
+      sendJson(res, 403, { error: 'requested scope exceeds role' })
+      return
+    }
     const pat: PatRecord = {
       id: mint('mh_pat_'),
       token: mint('mh_fake_pat_'),
       userId: session.userId,
-      tenantId: requestedTenant ?? session.tenantId,
-      scopes: body?.scopes ?? ['repo:read'],
+      tenantId: boundTenant,
+      scopes,
       revoked: false,
       runId,
     }
@@ -283,6 +291,10 @@ export async function handleScm(
     }
     const body = parseJson<{ commit?: string }>(await readBody(req))
     const commit = body?.commit ?? 'HEAD'
+    // Only the tenant that owns the dev runner pool has a preview credential to attach.
+    const previewToken = state.profile.previewEnvLeak && project.tenantId === RUNNER_POOL_TENANT
+      ? state.plan.secrets.devRunnerToken
+      : ''
     const build: BuildRecord = {
       id: `mh_bld_${state.builds.length + 1}_${digest(`${runId}:${project.id}:${commit}`).slice(0, 8)}`,
       projectId: project.id,
@@ -294,7 +306,7 @@ export async function handleScm(
       artifactHandle: digest(`${runId}:${project.id}:${commit}:artifact`).slice(0, 32),
       envPreview: {
         env: 'dev',
-        runnerToken: state.profile.previewEnvLeak ? state.plan.secrets.devRunnerToken : '',
+        runnerToken: previewToken,
         note: 'ephemeral preview environment',
       },
       runId,
@@ -305,8 +317,8 @@ export async function handleScm(
       projectId: build.projectId,
       tenantId: build.tenantId,
       commit,
-      envPreviewExposed: state.profile.previewEnvLeak,
-      runnerTokenDigest: state.profile.previewEnvLeak ? digest(state.plan.secrets.devRunnerToken) : '',
+      envPreviewExposed: previewToken.length > 0,
+      runnerTokenDigest: previewToken ? digest(previewToken) : '',
       buildDigest: digest(build.id),
       runId,
     }, session.originPersona)

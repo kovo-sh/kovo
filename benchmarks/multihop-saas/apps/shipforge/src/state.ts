@@ -101,7 +101,7 @@ export function createLabState(plan: ShipforgePlan, profile: LabProfile, runId: 
       createdAt: now - 60_000,
       readyAt: now - 59_000,
       artifactHandle: plan.ids.sharedArtifactHandle,
-      envPreview: { env: 'dev', runnerToken: plan.secrets.devRunnerToken, note: 'shared runner pool' },
+      envPreview: { env: 'dev', runnerToken: '', note: 'shared runner pool' },
       runId,
     }],
     deployments: [

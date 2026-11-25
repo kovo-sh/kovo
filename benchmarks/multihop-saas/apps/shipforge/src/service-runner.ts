@@ -2,7 +2,9 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { readBody, parseJson, sendJson, sendEventStream, runIdOf, match, parseUrl } from './http.ts'
 import type { BuildRecord, LabState } from './shared.ts'
-import { authenticate, authorizeHeader, canContribute, digest, hasTenantMembership, patByToken, roleOf } from './policy.ts'
+import {
+  authenticate, authorizeHeader, canContribute, digest, hasTenantMembership, patByToken, POOL_STREAM_SCOPE, roleOf,
+} from './policy.ts'
 import { buildById, convergeBuild, projectById } from './state.ts'
 
 function issueBuild(
@@ -18,11 +20,8 @@ function issueBuild(
     createdAt: Date.now(),
     readyAt: Date.now() + state.profile.asyncLatencyMs,
     artifactHandle: digest(`${runId}:${projectId}:${commit}:artifact`).slice(0, 32),
-    envPreview: {
-      env: 'dev',
-      runnerToken: state.profile.previewEnvLeak ? state.plan.secrets.devRunnerToken : '',
-      note: 'ephemeral preview environment',
-    },
+    // CI builds run on the shared pool without a preview environment, so they hold no credential.
+    envPreview: { env: 'dev', runnerToken: '', note: 'shared pool build' },
     runId,
   }
   state.builds.push(build)
@@ -97,6 +96,16 @@ export async function handleRunner(
       return
     }
     convergeBuild(state, build.id)
+    // Artifact frames go only to pool operator tokens; every other credential sees progress only.
+    const poolOperator = Boolean(pat?.scopes.includes(POOL_STREAM_SCOPE))
+    if (build.status === 'ready' && !poolOperator) {
+      sendEventStream(res, [
+        { type: 'stream.open', streamId, pool: 'shared' },
+        { type: 'build.progress', buildId: build.id, percent: 100 },
+        { type: 'stream.idle', streamId },
+      ])
+      return
+    }
     if (build.status === 'ready') {
       state.emit('runner.stream_event', {
         streamId,
@@ -166,8 +175,9 @@ export async function handleRunner(
     state.emit('runner.build_polled', {
       buildId: build.id, status: build.status, projectId: build.projectId, runId: build.runId,
     })
-    // Build records never carry environment credentials over this surface.
-    const { envPreview, ...rest } = build
+    // Build records never carry environment credentials or artifact handles over this surface.
+    const { envPreview, artifactHandle, ...rest } = build
+    void artifactHandle
     sendJson(res, 200, { build: { ...rest, envPreview: { env: envPreview.env, note: envPreview.note } } })
     return
   }

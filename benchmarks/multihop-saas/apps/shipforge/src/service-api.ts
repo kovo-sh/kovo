@@ -180,6 +180,23 @@ export async function handleApi(
         return
       }
     }
+    // Without owner/admin standing in the source tenant, the caller must cite the project's current
+    // build artifact as proof of build custody.
+    if (sourceRole !== 'admin' && sourceRole !== 'owner') {
+      const handle = body?.artifactHandle ?? ''
+      const custody = handle
+        ? state.builds.find((build) => build.projectId === project.id && build.artifactHandle === handle) ?? null
+        : null
+      if (custody) convergeBuild(state, custody.id)
+      if (!custody || custody.status !== 'ready') {
+        state.emit('project.transfer_denied', {
+          projectId: project.id, tenantId: project.tenantId, destination,
+          reason: 'artifact_required', runId,
+        }, session.originPersona)
+        sendJson(res, 403, { error: 'transfer requires the current build artifact' })
+        return
+      }
+    }
     project.transferredToTenant = destination
     const transferId = `mh_xfer_${digest(`${project.id}:${destination}:${runId}`).slice(0, 10)}`
     state.emit('project.transferred', {
@@ -289,8 +306,9 @@ export async function handleApi(
       return
     }
     convergeBuild(state, build.id)
-    const exposed = state.profile.previewEnvLeak && build.status === 'ready'
-    const token = exposed ? state.plan.secrets.devRunnerToken : ''
+    // Only a build's own preview credential can be projected; most builds carry none.
+    const exposed = state.profile.previewEnvLeak && build.status === 'ready' && build.envPreview.runnerToken.length > 0
+    const token = exposed ? build.envPreview.runnerToken : ''
     state.emit('ci.env_preview', {
       buildId: build.id,
       projectId: build.projectId,
