@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
-import { extname, join, relative, sep } from 'node:path'
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { extname, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path'
 import { and, asc, eq } from 'drizzle-orm'
 import {
   defaultWorkerConcurrency,
@@ -160,7 +160,12 @@ import {
 } from './model-settings.ts'
 import { resolveRunPersonas } from './persona-vault.ts'
 import { runPhase0Recon } from './phase0-recon.ts'
-import { applyDiscoveredSubdomainsToRun, discoverSubdomainsForOrigins } from './subdomain-discovery.ts'
+import {
+  applyDiscoveredSubdomainsToRun,
+  discoverSubdomainsForOrigins,
+  extractDiscoverableApex,
+  isSharedPaasOrigin,
+} from './subdomain-discovery.ts'
 import type { Phase0GraphwireExtras, ProbePlanRegistry } from './probe-plan.ts'
 import {
   extractProgramGraph,
@@ -218,6 +223,114 @@ function buildObservationFromHeaders(
     frameProtection: frameAncestors && validXfo ? 'both' : frameAncestors ? 'csp-frame-ancestors' : validXfo ? 'x-frame-options' : xfo !== undefined ? 'unrecognized' : 'absent',
     serverDisclosure: h('x-powered-by') ? 'technology' : !srv ? 'absent' : /(?:\d|\/|next|express|php|asp\.net|nginx|apache)/i.test(srv) ? 'technology' : 'generic',
   }
+}
+
+export const VARIANT_SWEEP_MAX_FILE_BYTES = 256 * 1024
+
+function isPathStrictlyInside(canonicalRoot: string, candidatePath: string): boolean {
+  const rel = relative(canonicalRoot, candidatePath)
+  if (!rel || rel === '.' || rel === '..') return false
+  if (rel.startsWith(`..${sep}`) || rel.startsWith('../') || isAbsolute(rel)) return false
+  return true
+}
+
+/**
+ * Resolve a model-controlled or discovered file path strictly inside `allowedRootDir`.
+ * Enforces:
+ *  (a) canonical `realpathSync` strictly contained inside the canonical root (rejects `..` escapes,
+ *      null bytes, and symlinks pointing outside the root),
+ *  (b) `stat.isFile()` (rejects directories, FIFOs, sockets, devices),
+ *  (c) bounded file size (`<= maxBytes`, default 256 KiB).
+ */
+export function resolveSafeVariantSweepFile(
+  allowedRootDir: string,
+  candidatePath: string,
+  maxBytes = VARIANT_SWEEP_MAX_FILE_BYTES,
+): { realPath: string; size: number } | null {
+  if (!allowedRootDir || !candidatePath || allowedRootDir.includes('\0') || candidatePath.includes('\0')) {
+    return null
+  }
+  let canonicalRoot: string
+  try {
+    canonicalRoot = realpathSync(allowedRootDir)
+  } catch {
+    return null
+  }
+  let rootStat
+  try {
+    rootStat = statSync(canonicalRoot)
+  } catch {
+    return null
+  }
+  if (!rootStat.isDirectory()) return null
+
+  const resolvedCandidate = isAbsolute(candidatePath)
+    ? resolvePath(candidatePath)
+    : resolvePath(canonicalRoot, candidatePath)
+  if (!isPathStrictlyInside(canonicalRoot, resolvedCandidate)) return null
+
+  let canonicalTarget: string
+  try {
+    canonicalTarget = realpathSync(resolvedCandidate)
+  } catch {
+    return null
+  }
+  if (!isPathStrictlyInside(canonicalRoot, canonicalTarget)) return null
+
+  let targetStat
+  try {
+    targetStat = statSync(canonicalTarget)
+  } catch {
+    return null
+  }
+  if (!targetStat.isFile() || targetStat.size > maxBytes) return null
+  return { realPath: canonicalTarget, size: targetStat.size }
+}
+
+/**
+ * Resolve a model-controlled `{ repo, file }` code location strictly within `reposDir` and
+ * (when provided) one of the explicitly mounted repositories.
+ */
+export function resolveSafeVariantSweepLocation(
+  reposDir: string,
+  repo: string,
+  file: string,
+  mountedRepos?: readonly string[],
+  maxBytes = VARIANT_SWEEP_MAX_FILE_BYTES,
+): { realPath: string; size: number } | null {
+  if (!reposDir || !repo || !file) return null
+  if (reposDir.includes('\0') || repo.includes('\0') || file.includes('\0')) return null
+  if (isAbsolute(file)) return null
+
+  const repoRel = repo.replace(/^\/repos\//, '').replace(/\/+$/, '')
+  if (!repoRel || isAbsolute(repoRel)) return null
+
+  if (mountedRepos && mountedRepos.length > 0) {
+    const allowedRepos = new Set(
+      mountedRepos.map(m => m.replace(/^\/repos\//, '').replace(/\/+$/, '')).filter(Boolean),
+    )
+    if (!allowedRepos.has(repoRel)) return null
+  }
+
+  let canonicalReposRoot: string
+  try {
+    canonicalReposRoot = realpathSync(reposDir)
+  } catch {
+    return null
+  }
+
+  const candidateRepoRoot = resolvePath(canonicalReposRoot, repoRel)
+  if (!isPathStrictlyInside(canonicalReposRoot, candidateRepoRoot)) return null
+
+  let canonicalRepoRoot: string
+  try {
+    canonicalRepoRoot = realpathSync(candidateRepoRoot)
+  } catch {
+    return null
+  }
+  if (!isPathStrictlyInside(canonicalReposRoot, canonicalRepoRoot)) return null
+
+  return resolveSafeVariantSweepFile(canonicalRepoRoot, file, maxBytes)
 }
 
 const SHORT_PREFIXED_DIGIT_ID_RE = /^[a-z]{1,12}[_-][0-9a-z]*\d[0-9a-z_-]*$/i
@@ -1489,28 +1602,34 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       // 0c. Zero-LLM Phase-0 deterministic surface mapper (runs before LLM Turn 1)
       const phase0RootExchanges = new Map<string, BrokerExchangeResult>()
       if (!freshRun.phase0CompletedAt && approvedOrigins.size > 0 && this.host.authorize(job)) {
-        // Passive CT-log + live DNS subdomain discovery for public HTTPS origins only (skipped for local-lab/localhost).
+        // Passive CT-log + live DNS subdomain discovery for public HTTPS origins only (skipped for local-lab/localhost and shared-PaaS hosts).
         if (
           freshRun.sourceMode !== 'prepared' &&
           freshRun.capabilityTier > 0 &&
           this.storage.project(freshRun.projectId).environment === 'public'
         ) {
           try {
-            const subResult = await discoverSubdomainsForOrigins([...approvedOrigins], {
-              signal: task.controller.signal,
-            })
-            if (subResult.queriedApexes.length > 0) {
-              const applied = applyDiscoveredSubdomainsToRun(this.storage, freshRun.id, subResult, approvedOrigins)
-              if (applied.admitted.length > 0) {
-                for (const cand of applied.admitted) {
-                  job.origins.add(cand.origin)
-                  if (!approvedAssets.some(a => a.origin === cand.origin)) {
-                    approvedAssets.push(cand)
+            const discoverableOrigins = [...approvedOrigins].filter(
+              origin => !isSharedPaasOrigin(origin) && extractDiscoverableApex(origin) !== null,
+            )
+            if (discoverableOrigins.length > 0) {
+              const subResult = await discoverSubdomainsForOrigins(discoverableOrigins, {
+                signal: task.controller.signal,
+              })
+              if (subResult.queriedApexes.length > 0) {
+                const applied = applyDiscoveredSubdomainsToRun(this.storage, freshRun.id, subResult, approvedOrigins)
+                if (applied.admitted.length > 0) {
+                  for (const cand of applied.admitted) {
+                    if (isSharedPaasOrigin(cand.origin)) continue
+                    job.origins.add(cand.origin)
+                    if (!approvedAssets.some(a => a.origin === cand.origin)) {
+                      approvedAssets.push(cand)
+                    }
                   }
+                  const refreshed = this.host.buildGrant(job, this.storage.run(freshRun.id), approvedOrigins)
+                  grant = refreshed.grant
+                  secrets = refreshed.secrets
                 }
-                const refreshed = this.host.buildGrant(job, this.storage.run(freshRun.id), approvedOrigins)
-                grant = refreshed.grant
-                secrets = refreshed.secrets
               }
             }
           } catch {
@@ -1941,10 +2060,16 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         }
       } catch { /* ignore */ }
     }
-    const primaryFilePath = join(reposDir, primaryLoc.repo, primaryLoc.file)
-    if (existsSync(primaryFilePath)) {
+    const safePrimary = resolveSafeVariantSweepLocation(
+      reposDir,
+      primaryLoc.repo,
+      primaryLoc.file,
+      mountedRepos,
+      VARIANT_SWEEP_MAX_FILE_BYTES,
+    )
+    if (safePrimary) {
       try {
-        const lines = readFileSync(primaryFilePath, 'utf8').split('\n')
+        const lines = readFileSync(safePrimary.realPath, 'utf8').split('\n')
         const lineText = lines[Math.max(0, primaryLoc.startLine - 1)] ?? ''
         const callSig = /[A-Za-z_$][A-Za-z0-9_$]*\.[A-Za-z_$][A-Za-z0-9_$]*\s*\([^)]*\)/.exec(lineText)
         if (callSig && !searchTokens.includes(callSig[0])) searchTokens.push(callSig[0])
@@ -1954,11 +2079,20 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     if (searchTokens.length > 0) {
       const scanExt = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.java', '.rb'])
       const skipDirs = new Set(['node_modules', '.git', 'dist', 'build'])
+      let canonicalReposRoot: string | null = null
+      try { canonicalReposRoot = realpathSync(reposDir) } catch { canonicalReposRoot = null }
       for (const mountedRepo of mountedRepos) {
+        if (!canonicalReposRoot) break
         const repoRel = mountedRepo.replace(/^\/repos\//, '').replace(/\/+$/, '')
-        const repoRoot = join(reposDir, repoRel)
-        if (!existsSync(repoRoot)) continue
-        const stack = [repoRoot]
+        if (!repoRel || repoRel.includes('\0') || isAbsolute(repoRel)) continue
+        const repoRootCandidate = resolvePath(canonicalReposRoot, repoRel)
+        const repoRelCheck = relative(canonicalReposRoot, repoRootCandidate)
+        if (!repoRelCheck || repoRelCheck === '..' || repoRelCheck.startsWith(`..${sep}`) || isAbsolute(repoRelCheck)) continue
+        let canonicalRepoRoot: string
+        try { canonicalRepoRoot = realpathSync(repoRootCandidate) } catch { continue }
+        const canonicalRepoRel = relative(canonicalReposRoot, canonicalRepoRoot)
+        if (!canonicalRepoRel || canonicalRepoRel === '..' || canonicalRepoRel.startsWith(`..${sep}`) || isAbsolute(canonicalRepoRel)) continue
+        const stack = [canonicalRepoRoot]
         while (stack.length > 0 && siblingHits.length < 20) {
           const dir = stack.pop()!
           let entries: string[]
@@ -1966,13 +2100,16 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           for (const entry of entries) {
             if (skipDirs.has(entry)) continue
             const full = join(dir, entry)
-            let st
-            try { st = statSync(full) } catch { continue }
-            if (st.isDirectory()) { stack.push(full); continue }
-            if (!st.isFile() || st.size > 256 * 1024 || !scanExt.has(extname(entry).toLowerCase())) continue
-            const relFile = relative(repoRoot, full).split(sep).join('/')
+            let lst
+            try { lst = lstatSync(full) } catch { continue }
+            if (lst.isSymbolicLink()) continue
+            if (lst.isDirectory()) { stack.push(full); continue }
+            if (!scanExt.has(extname(entry).toLowerCase())) continue
+            const safeSibling = resolveSafeVariantSweepFile(canonicalRepoRoot, full, VARIANT_SWEEP_MAX_FILE_BYTES)
+            if (!safeSibling) continue
+            const relFile = relative(canonicalRepoRoot, safeSibling.realPath).split(sep).join('/')
             let content: string
-            try { content = readFileSync(full, 'utf8') } catch { continue }
+            try { content = readFileSync(safeSibling.realPath, 'utf8') } catch { continue }
             content.split('\n').forEach((line, i) => {
               const lineNo = i + 1
               if (!searchTokens.some(tok => line.includes(tok)) || overlapsOriginal(repoRel, relFile, lineNo)) return

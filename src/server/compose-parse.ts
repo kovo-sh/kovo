@@ -28,6 +28,8 @@ const MAX_ANCHORS = 256
 const MAX_FLOW_ITEMS = 256
 const MAX_SCALAR_LENGTH = 8_192
 const MAX_SERVICE_COUNT = 6
+const MAX_EXPANDED_NODES = 10_000
+const MAX_INTERPOLATION_DEPTH = 16
 
 export class ComposeParseError extends Error {
   readonly lineNumber?: number
@@ -42,7 +44,7 @@ export class ComposeParseError extends Error {
 }
 
 export interface ComposeParseOptions {
-  /** Interpolation environment. Defaults to `process.env`. */
+  /** Explicit interpolation environment map (e.g. from a compose `.env` file). Defaults to `{}` and never reads host `process.env`. */
   env?: Record<string, string | undefined>
   /** Hard cap on `services` entries. Defaults to 6 (LabRunner container budget). */
   maxServices?: number
@@ -277,9 +279,53 @@ function coercePlainScalar(raw: string): unknown {
   return text
 }
 
-function cloneValue<T>(value: T): T {
+class ExpansionBudget {
+  nodes = 0
+  readonly maxNodes: number
+  readonly maxDepth: number
+
+  constructor(maxNodes = MAX_EXPANDED_NODES, maxDepth = MAX_YAML_DEPTH) {
+    this.maxNodes = maxNodes
+    this.maxDepth = maxDepth
+  }
+
+  consume(count: number, lineNumber?: number): void {
+    this.nodes += count
+    if (this.nodes > this.maxNodes) {
+      throw new ComposeParseError(
+        `YAML alias/node expansion exceeds maximum budget of ${this.maxNodes} nodes`,
+        lineNumber,
+      )
+    }
+  }
+}
+
+function cloneValueBounded<T>(
+  value: T,
+  budget: ExpansionBudget,
+  depth: number,
+  lineNumber?: number,
+): T {
+  budget.consume(1, lineNumber)
   if (value === null || typeof value !== 'object') return value
-  return structuredClone(value)
+  if (depth >= budget.maxDepth) {
+    throw new ComposeParseError(
+      `YAML alias expansion exceeds maximum nesting depth of ${budget.maxDepth} levels`,
+      lineNumber,
+    )
+  }
+  if (Array.isArray(value)) {
+    const out = new Array<unknown>(value.length)
+    for (let i = 0; i < value.length; i += 1) {
+      out[i] = cloneValueBounded(value[i], budget, depth + 1, lineNumber)
+    }
+    return out as unknown as T
+  }
+  const out: Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    out[key] = cloneValueBounded(entry, budget, depth + 1, lineNumber)
+  }
+  return out as unknown as T
 }
 
 function isPlainMapping(value: unknown): value is Record<string, unknown> {
@@ -333,15 +379,21 @@ class FlowParser {
   private readonly text: string
   private readonly lineNumber: number
   private readonly anchors: Map<string, unknown>
+  private readonly budget: ExpansionBudget
+  private depth: number
 
   constructor(
     text: string,
     lineNumber: number,
     anchors: Map<string, unknown>,
+    budget: ExpansionBudget,
+    initialDepth: number,
   ) {
     this.text = text
     this.lineNumber = lineNumber
     this.anchors = anchors
+    this.budget = budget
+    this.depth = initialDepth
   }
 
   parseComplete(): unknown {
@@ -351,6 +403,17 @@ class FlowParser {
       throw new ComposeParseError('unexpected characters after flow collection', this.lineNumber)
     }
     return value
+  }
+
+  private enter(): void {
+    this.depth += 1
+    if (this.depth > this.budget.maxDepth) {
+      throw new ComposeParseError(`nesting depth exceeds ${this.budget.maxDepth} levels`, this.lineNumber)
+    }
+  }
+
+  private leave(): void {
+    this.depth -= 1
   }
 
   private skipWhitespace(): void {
@@ -363,6 +426,7 @@ class FlowParser {
     if (ch === '[') return this.parseSequence()
     if (ch === '{') return this.parseMapping()
     if (ch === '"' || ch === "'") {
+      this.budget.consume(1, this.lineNumber)
       const quoted = readQuotedScalar(this.text, this.i, this.lineNumber)
       this.i = quoted.next
       return quoted.value
@@ -374,7 +438,7 @@ class FlowParser {
       if (!this.anchors.has(match[1])) {
         throw new ComposeParseError(`alias "*${match[1]}" was never defined`, this.lineNumber)
       }
-      return cloneValue(this.anchors.get(match[1]))
+      return cloneValueBounded(this.anchors.get(match[1]), this.budget, this.depth, this.lineNumber)
     }
     if (ch === '&') {
       const match = /^&([A-Za-z0-9_.-]{1,64})\s*/.exec(this.text.slice(this.i))
@@ -382,10 +446,11 @@ class FlowParser {
       this.i += match[0].length
       const value = this.parseValue()
       if (this.anchors.size >= MAX_ANCHORS) throw new ComposeParseError('too many anchors', this.lineNumber)
-      this.anchors.set(match[1], cloneValue(value))
+      this.anchors.set(match[1], cloneValueBounded(value, this.budget, 0, this.lineNumber))
       return value
     }
     if (ch === '!') throw new ComposeParseError('YAML tags are not supported', this.lineNumber)
+    this.budget.consume(1, this.lineNumber)
     return coercePlainScalar(this.readPlain())
   }
 
@@ -401,43 +466,55 @@ class FlowParser {
   }
 
   private parseSequence(): unknown[] {
+    this.enter()
+    this.budget.consume(1, this.lineNumber)
     this.i += 1
     const out: unknown[] = []
-    for (;;) {
-      this.skipWhitespace()
-      if (this.text[this.i] === ']') { this.i += 1; return out }
-      out.push(this.parseValue())
-      if (out.length > MAX_FLOW_ITEMS) {
-        throw new ComposeParseError('flow sequence exceeds 256 items', this.lineNumber)
+    try {
+      for (;;) {
+        this.skipWhitespace()
+        if (this.text[this.i] === ']') { this.i += 1; return out }
+        out.push(this.parseValue())
+        if (out.length > MAX_FLOW_ITEMS) {
+          throw new ComposeParseError('flow sequence exceeds 256 items', this.lineNumber)
+        }
+        this.skipWhitespace()
+        if (this.text[this.i] === ',') { this.i += 1; continue }
+        if (this.text[this.i] === ']') { this.i += 1; return out }
+        throw new ComposeParseError('expected "," or "]" in flow sequence', this.lineNumber)
       }
-      this.skipWhitespace()
-      if (this.text[this.i] === ',') { this.i += 1; continue }
-      if (this.text[this.i] === ']') { this.i += 1; return out }
-      throw new ComposeParseError('expected "," or "]" in flow sequence', this.lineNumber)
+    } finally {
+      this.leave()
     }
   }
 
   private parseMapping(): Record<string, unknown> {
+    this.enter()
+    this.budget.consume(1, this.lineNumber)
     this.i += 1
     const out: Record<string, unknown> = {}
-    for (;;) {
-      this.skipWhitespace()
-      if (this.text[this.i] === '}') { this.i += 1; return out }
-      const key = this.parseKey()
-      this.skipWhitespace()
-      if (this.text[this.i] !== ':') {
-        throw new ComposeParseError('expected ":" in flow mapping', this.lineNumber)
+    try {
+      for (;;) {
+        this.skipWhitespace()
+        if (this.text[this.i] === '}') { this.i += 1; return out }
+        const key = this.parseKey()
+        this.skipWhitespace()
+        if (this.text[this.i] !== ':') {
+          throw new ComposeParseError('expected ":" in flow mapping', this.lineNumber)
+        }
+        this.i += 1
+        const value = this.parseValue()
+        if (Object.prototype.hasOwnProperty.call(out, key)) {
+          throw new ComposeParseError(`duplicate mapping key "${key}"`, this.lineNumber)
+        }
+        out[key] = value
+        this.skipWhitespace()
+        if (this.text[this.i] === ',') { this.i += 1; continue }
+        if (this.text[this.i] === '}') { this.i += 1; return out }
+        throw new ComposeParseError('expected "," or "}" in flow mapping', this.lineNumber)
       }
-      this.i += 1
-      const value = this.parseValue()
-      if (Object.prototype.hasOwnProperty.call(out, key)) {
-        throw new ComposeParseError(`duplicate mapping key "${key}"`, this.lineNumber)
-      }
-      out[key] = value
-      this.skipWhitespace()
-      if (this.text[this.i] === ',') { this.i += 1; continue }
-      if (this.text[this.i] === '}') { this.i += 1; return out }
-      throw new ComposeParseError('expected "," or "}" in flow mapping', this.lineNumber)
+    } finally {
+      this.leave()
     }
   }
 
@@ -469,6 +546,7 @@ class FlowParser {
 class YamlSubsetParser {
   private readonly cursor: LineCursor
   private readonly anchors = new Map<string, unknown>()
+  private readonly budget = new ExpansionBudget()
   private depth = 0
 
   constructor(lines: SourceLine[]) {
@@ -502,6 +580,7 @@ class YamlSubsetParser {
       throw new ComposeParseError('unexpected indentation', next.number)
     }
     this.enter()
+    this.budget.consume(1, next.number)
     const value = isSequenceLine(next.text)
       ? this.parseSequence(indent)
       : this.parseMapping(indent)
@@ -511,7 +590,7 @@ class YamlSubsetParser {
 
   private parseMapping(indent: number, seed?: Record<string, unknown>): Record<string, unknown> {
     const out = seed ?? {}
-    const merges: Record<string, unknown>[] = []
+    const merges: Array<{ contribution: Record<string, unknown>; lineNumber: number }> = []
     for (;;) {
       const line = this.cursor.peek()
       if (!line || line.indent < indent) break
@@ -532,7 +611,7 @@ class YamlSubsetParser {
             throw new ComposeParseError('merge key "<<" requires a mapping or a list of mappings', line.number)
           }
           if (merges.length >= MAX_ANCHORS) throw new ComposeParseError('too many merge keys', line.number)
-          merges.push(contribution)
+          merges.push({ contribution, lineNumber: line.number })
         }
         continue
       }
@@ -540,9 +619,11 @@ class YamlSubsetParser {
     }
 
     // YAML merge semantics: explicit keys win, and earlier merge sources win over later ones.
-    for (const contribution of [...merges].reverse()) {
+    for (const { contribution, lineNumber } of [...merges].reverse()) {
       for (const [key, value] of Object.entries(contribution)) {
-        if (!Object.prototype.hasOwnProperty.call(out, key)) out[key] = cloneValue(value)
+        if (!Object.prototype.hasOwnProperty.call(out, key)) {
+          out[key] = cloneValueBounded(value, this.budget, this.depth, lineNumber)
+        }
       }
     }
     return out
@@ -607,7 +688,7 @@ class YamlSubsetParser {
       } else {
         value = this.parseValue(parentIndent, lineNumber, inner)
       }
-      this.anchors.set(name, cloneValue(value))
+      this.anchors.set(name, cloneValueBounded(value, this.budget, 0, lineNumber))
       return value
     }
 
@@ -619,7 +700,7 @@ class YamlSubsetParser {
       if (!this.anchors.has(name)) {
         throw new ComposeParseError(`alias "*${name}" was never defined`, lineNumber)
       }
-      return cloneValue(this.anchors.get(name))
+      return cloneValueBounded(this.anchors.get(name), this.budget, this.depth, lineNumber)
     }
 
     if (text.startsWith('!')) throw new ComposeParseError('YAML tags are not supported', lineNumber)
@@ -629,14 +710,16 @@ class YamlSubsetParser {
     }
 
     if (text.startsWith('|') || text.startsWith('>')) {
+      this.budget.consume(1, lineNumber)
       return this.readBlockScalar(text, parentIndent, lineNumber)
     }
 
     if (text.startsWith('[') || text.startsWith('{')) {
-      return new FlowParser(text, lineNumber, this.anchors).parseComplete()
+      return new FlowParser(text, lineNumber, this.anchors, this.budget, this.depth).parseComplete()
     }
 
     if (text.startsWith('"') || text.startsWith("'")) {
+      this.budget.consume(1, lineNumber)
       const quoted = readQuotedScalar(text, 0, lineNumber)
       if (text.slice(quoted.next).trim() !== '') {
         throw new ComposeParseError('unexpected characters after quoted scalar', lineNumber)
@@ -650,6 +733,7 @@ class YamlSubsetParser {
     if (text.length > MAX_SCALAR_LENGTH) {
       throw new ComposeParseError(`scalar exceeds ${MAX_SCALAR_LENGTH} characters`, lineNumber)
     }
+    this.budget.consume(1, lineNumber)
     return coercePlainScalar(text)
   }
 
@@ -695,7 +779,13 @@ export function interpolateComposeString(
   text: string,
   env: Record<string, string | undefined>,
   lineNumber?: number,
+  depth = 0,
 ): string {
+  if (depth > MAX_INTERPOLATION_DEPTH) {
+    throw new ComposeParseError(`interpolation nesting exceeds ${MAX_INTERPOLATION_DEPTH} levels`, lineNumber)
+  }
+  // Never resolve against host `process.env`; only explicit env maps (e.g. from compose `.env`).
+  const safeEnv: Record<string, string | undefined> = env === process.env ? {} : env
   let out = ''
   let i = 0
   while (i < text.length) {
@@ -712,7 +802,7 @@ export function interpolateComposeString(
       const name = match[1]
       const operator = match[2]
       const argument = match[3] ?? ''
-      const raw = env[name]
+      const raw = Object.prototype.hasOwnProperty.call(safeEnv, name) ? safeEnv[name] : undefined
       const present = raw !== undefined && raw !== ''
       if (!operator) {
         if (raw === undefined) {
@@ -720,9 +810,9 @@ export function interpolateComposeString(
         }
         out += raw
       } else if (operator === ':-') {
-        out += present ? raw : interpolateComposeString(argument, env, lineNumber)
+        out += present ? raw : interpolateComposeString(argument, safeEnv, lineNumber, depth + 1)
       } else if (operator === '-') {
-        out += raw !== undefined ? raw : interpolateComposeString(argument, env, lineNumber)
+        out += raw !== undefined ? raw : interpolateComposeString(argument, safeEnv, lineNumber, depth + 1)
       } else {
         if (operator === ':?' ? !present : raw === undefined) {
           throw new ComposeParseError(
@@ -739,7 +829,7 @@ export function interpolateComposeString(
       let j = i + 1
       while (j < text.length && /[A-Za-z0-9_]/.test(text[j])) j += 1
       const name = text.slice(i + 1, j)
-      const raw = env[name]
+      const raw = Object.prototype.hasOwnProperty.call(safeEnv, name) ? safeEnv[name] : undefined
       if (raw === undefined) {
         throw new ComposeParseError(`required environment variable "${name}" is not set`)
       }
@@ -752,6 +842,26 @@ export function interpolateComposeString(
   }
   if (out.length > MAX_SCALAR_LENGTH) {
     throw new ComposeParseError(`interpolated scalar exceeds ${MAX_SCALAR_LENGTH} characters`, lineNumber)
+  }
+  return out
+}
+
+/** Parse a compose `.env` file body into an explicit key/value map without touching `process.env`. */
+export function parseComposeEnvFile(content: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const rawLine of content.replace(/^\uFEFF/, '').split(/\r?\n/)) {
+    const trimmed = rawLine.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    const line = trimmed.startsWith('export ') ? trimmed.slice(7).trim() : trimmed
+    const eq = line.indexOf('=')
+    if (eq <= 0) continue
+    const key = line.slice(0, eq).trim()
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(key)) continue
+    let val = line.slice(eq + 1).trim()
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1)
+    }
+    out[key] = val
   }
   return out
 }
@@ -807,10 +917,12 @@ function prepareLines(yamlText: string, maxBytes: number): SourceLine[] {
 }
 
 /** Parse the bounded YAML subset into plain JS values (exported for parser tests). */
-export function parseYamlSubset(yamlText: string, options: { env?: Record<string, string | undefined> } = {}): unknown {
-  const lines = prepareLines(yamlText, MAX_COMPOSE_BYTES)
+export function parseYamlSubset(yamlText: string, options: { env?: Record<string, string | undefined>; maxBytes?: number } = {}): unknown {
+  const lines = prepareLines(yamlText, options.maxBytes ?? MAX_COMPOSE_BYTES)
   const parsed = new YamlSubsetParser(lines).parseRoot()
-  return interpolateTree(parsed, options.env ?? (process.env as Record<string, string | undefined>))
+  const explicitEnv: Record<string, string | undefined> =
+    options.env && options.env !== process.env ? options.env : {}
+  return interpolateTree(parsed, explicitEnv)
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,7 +1259,7 @@ function normalizeService(name: string, config: unknown): ComposeServiceSource {
  */
 export function parseComposeDocument(yamlText: string, options: ComposeParseOptions = {}): ParsedComposeDocument {
   const maxServices = options.maxServices ?? MAX_SERVICE_COUNT
-  const root = parseYamlSubset(yamlText, { env: options.env })
+  const root = parseYamlSubset(yamlText, { env: options.env, maxBytes: options.maxBytes })
   if (!isPlainMapping(root)) throw new ComposeParseError('compose document root must be a mapping')
 
   for (const key of Object.keys(root)) {
@@ -1204,4 +1316,5 @@ export const COMPOSE_PARSER_LIMITS = {
   maxAnchors: MAX_ANCHORS,
   maxFlowItems: MAX_FLOW_ITEMS,
   maxScalarLength: MAX_SCALAR_LENGTH,
+  maxExpandedNodes: MAX_EXPANDED_NODES,
 } as const
