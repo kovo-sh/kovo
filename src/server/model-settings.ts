@@ -1,5 +1,5 @@
-import { createHash, randomUUID } from 'node:crypto'
-import { accessSync, chmodSync, constants, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
+import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { and, desc, eq } from 'drizzle-orm'
 import type { z } from 'zod'
@@ -29,6 +29,85 @@ const hash = (settings: Pick<ProviderSettings, 'endpoint' | 'model' | 'protocol'
     protocol: settings.protocol,
     key: settings.key,
   })).digest('hex')
+
+export function normalizeModelEndpoint(endpoint: string): string {
+  const trimmed = endpoint.trim()
+  try {
+    const url = new URL(trimmed)
+    return `${url.origin.toLowerCase()}${url.pathname.replace(/\/+$/, '')}`
+  } catch {
+    return trimmed.replace(/\/+$/, '')
+  }
+}
+
+/**
+ * Compute a SHA-256 binding pin for `(normalizedEndpoint, protocol)` so a stored
+ * API key cannot be silently redirected to another host or protocol (M-15).
+ */
+export function computeCredentialEndpointPin(
+  endpoint: string,
+  protocol: ProviderSettings['protocol'],
+): string {
+  const normalizedEndpoint = normalizeModelEndpoint(endpoint)
+  return createHash('sha256')
+    .update(`kovo.model-credential-pin.v1\0${normalizedEndpoint}\0${protocol}`, 'utf8')
+    .digest('hex')
+}
+
+function pinsEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a.toLowerCase(), 'utf8')
+  const bb = Buffer.from(b.toLowerCase(), 'utf8')
+  return ab.length === bb.length && timingSafeEqual(ab, bb)
+}
+
+function credentialPinPath(directory: string, credentialId: string): string {
+  return join(directory, 'credentials', `${credentialId}.pin`)
+}
+
+function readCredentialPin(
+  directory: string,
+  credentialId: string,
+): { present: false; pinSha256: null } | { present: true; pinSha256: string } {
+  const path = credentialPinPath(directory, credentialId)
+  if (!existsSync(path)) {
+    return { present: false, pinSha256: null }
+  }
+  const st = lstatSync(path)
+  if (st.isSymbolicLink() || !st.isFile() || (st.mode & 0o077) !== 0) {
+    throw new Error('The workspace credential pin metadata has invalid permissions.')
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8'))
+  } catch {
+    throw new Error('The workspace credential pin metadata is unreadable.')
+  }
+  const pinSha256 = (parsed && typeof parsed === 'object' ? (parsed as { pinSha256?: unknown }).pinSha256 : null)
+  if (typeof pinSha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(pinSha256)) {
+    throw new Error('The workspace credential pin metadata is malformed.')
+  }
+  return { present: true, pinSha256: pinSha256.toLowerCase() }
+}
+
+function writeCredentialPin(
+  directory: string,
+  credentialId: string,
+  endpoint: string,
+  protocol: ProviderSettings['protocol'],
+): string {
+  const dir = join(directory, 'credentials')
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  chmodSync(dir, 0o700)
+  const path = credentialPinPath(directory, credentialId)
+  const payload = JSON.stringify({
+    version: 1,
+    pinSha256: computeCredentialEndpointPin(endpoint, protocol),
+    pinnedAt: Date.now(),
+  })
+  writeFileSync(path, payload, { mode: 0o600 })
+  chmodSync(path, 0o600)
+  return path
+}
 
 function credentialPath(directory: string, credentialId: string): string {
   const path = join(directory, 'credentials', credentialId)
@@ -90,6 +169,14 @@ export function privateModelProfiles(storage: Store = store()): ResolvedModelPro
   const resolved: ResolvedModelProfile[] = []
   for (const row of rows) {
     try {
+      const pin = readCredentialPin(storage.directory, row.credentialId)
+      if (pin.present) {
+        const expectedPin = computeCredentialEndpointPin(row.endpoint, row.protocol)
+        if (!pinsEqual(pin.pinSha256, expectedPin)) {
+          // Stored API key is pinned to a different (endpoint, protocol) pair; refuse to load.
+          continue
+        }
+      }
       const key = readFileSync(credentialPath(storage.directory, row.credentialId), 'utf8').trim()
       let healthState = row.healthState
       let cooldownUntil = row.cooldownUntil
@@ -256,6 +343,19 @@ function resolveEffectiveKey(
 ): string {
   if (settings.key) return settings.key
   if (!existing) throw new Error('API key is required when adding a new model profile.')
+
+  // M-15: Bind stored API keys to (normalizedEndpoint, protocol). Never send a previously
+  // stored key to a different endpoint or protocol without re-entering the API key.
+  const requestedPin = computeCredentialEndpointPin(settings.endpoint, settings.protocol)
+  const existingPin = computeCredentialEndpointPin(existing.endpoint, existing.protocol)
+  if (!pinsEqual(requestedPin, existingPin)) {
+    throw new Error('Changing a model profile endpoint or protocol requires re-entering the API key.')
+  }
+  const storedPin = readCredentialPin(storage.directory, existing.credentialId)
+  if (storedPin.present && !pinsEqual(storedPin.pinSha256, requestedPin)) {
+    throw new Error('Stored API key is pinned to a different endpoint or protocol. Re-enter the API key to continue.')
+  }
+
   return readFileSync(credentialPath(storage.directory, existing.credentialId), 'utf8').trim()
 }
 
@@ -322,12 +422,19 @@ export async function saveModelProfile(
 
   let credentialId: string
   let newCredentialPath: string | null = null
+  let newPinPath: string | null = null
   if (existing && !rotatingKey) {
     credentialId = existing.credentialId
+    // M-15 lazy-pin: preserve legacy profiles without a pin file yet, and pin on first save/update.
+    if (!existsSync(credentialPinPath(storage.directory, credentialId))) {
+      writeCredentialPin(storage.directory, credentialId, settings.endpoint, settings.protocol)
+    }
   } else {
     credentialId = 'model-' + randomUUID()
     newCredentialPath = join(directory, credentialId)
     writeFileSync(newCredentialPath, resolvedKey, { mode: 0o600, flag: 'wx' })
+    chmodSync(newCredentialPath, 0o600)
+    newPinPath = writeCredentialPin(storage.directory, credentialId, settings.endpoint, settings.protocol)
   }
   const profileId = existing?.id ?? settings.id ?? randomUUID()
   const finalName = existing ? settings.name : resolveUniqueProfileName(storage, settings.name)
@@ -367,11 +474,15 @@ export async function saveModelProfile(
     if (newCredentialPath) {
       try { unlinkSync(newCredentialPath) } catch { /* ignore */ }
     }
+    if (newPinPath) {
+      try { unlinkSync(newPinPath) } catch { /* ignore */ }
+    }
     throw new Error('Could not save the workspace model profile.')
   }
 
   if (existing && newCredentialPath && existing.credentialId !== credentialId) {
     try { unlinkSync(join(directory, existing.credentialId)) } catch { /* ignore */ }
+    try { unlinkSync(credentialPinPath(storage.directory, existing.credentialId)) } catch { /* ignore */ }
   }
   return { ok: true as const, id: profileId }
 }
@@ -404,5 +515,6 @@ export function deleteModelProfile(profileId: string, storage: Store = store()):
   storage.db.delete(modelProfiles).where(eq(modelProfiles.id, row.id)).run()
   transientFailures.delete(row.id)
   try { unlinkSync(join(storage.directory, 'credentials', row.credentialId)) } catch { /* ignore */ }
+  try { unlinkSync(credentialPinPath(storage.directory, row.credentialId)) } catch { /* ignore */ }
   return { ok: true as const, id: row.id }
 }

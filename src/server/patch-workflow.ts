@@ -40,6 +40,7 @@ import type { NamedSecret } from './redact.ts'
 import { retestReplaySpec } from './replay-verifier.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
 import type { Store } from './store.ts'
+import { parseUnifiedDiff } from './unified-diff.ts'
 import type { WorkerBackend } from './worker-backend.ts'
 
 export type PatchStatus = 'draft' | 'approved' | 'rejected' | 'withheld'
@@ -352,35 +353,60 @@ export function buildUnifiedDiffFromSnippet(
   }
 }
 
+export interface PatchApplicabilityResult {
+  applicable: boolean
+  filesModified: string[]
+  syntaxCheck: PatchSyntaxCheckResult
+  hasSubstantiveDiffChange: boolean
+  citedFileModified: boolean
+  fixAppliedToCitedFile: boolean
+  error?: string
+}
+
+function normalizeRepoRelPath(file: string): string {
+  return file.replace(/^\/+/, '').replace(/\\/g, '/').replace(/^[ab]\//, '')
+}
+
 export async function verifyPatchApplicability(params: {
   repoRoot: string
   repo: string
   reposDir: string
   diff: string
   fixBefore: string
+  fixAfter?: string
   codeLocations: readonly PatchCodeLocation[]
   backend?: WorkerBackend
   signal?: AbortSignal
-}): Promise<{ applicable: boolean; filesModified: string[]; syntaxCheck: PatchSyntaxCheckResult; error?: string }> {
-  const { repoRoot, repo, reposDir, diff, fixBefore, codeLocations, backend, signal } = params
+}): Promise<PatchApplicabilityResult> {
+  const { repoRoot, repo, reposDir, diff, fixBefore, fixAfter, codeLocations, backend, signal } = params
 
   // Verify fixBefore matches verbatim in at least one referenced file when provided.
+  let originalCitedContent: string | null = null
+  const primaryRelFile = codeLocations.length > 0 ? normalizeRepoRelPath(codeLocations[0]!.file) : null
+  if (primaryRelFile) {
+    originalCitedContent = safeReadRepoFile(repoRoot, primaryRelFile)
+  }
   if (fixBefore.trim() && codeLocations.length > 0) {
-    const primary = codeLocations[0]
-    const content = safeReadRepoFile(repoRoot, primary.file)
-    if (content === null) {
+    const primary = codeLocations[0]!
+    if (originalCitedContent === null) {
       return {
         applicable: false,
         filesModified: [],
         syntaxCheck: { ran: false, passed: false, output: `File not found: ${primary.file}` },
+        hasSubstantiveDiffChange: false,
+        citedFileModified: false,
+        fixAppliedToCitedFile: false,
         error: `Referenced file ${primary.file} does not exist in ${repo}.`,
       }
     }
-    if (!content.includes(fixBefore)) {
+    if (!originalCitedContent.includes(fixBefore)) {
       return {
         applicable: false,
         filesModified: [],
         syntaxCheck: { ran: false, passed: false, output: 'fixBefore mismatch' },
+        hasSubstantiveDiffChange: false,
+        citedFileModified: false,
+        fixAppliedToCitedFile: false,
         error: `fixBefore does not match ${primary.file} verbatim.`,
       }
     }
@@ -389,8 +415,38 @@ export async function verifyPatchApplicability(params: {
   // Test applying unified diff in an isolated temporary clone (never mutating /repos!).
   const workDir = mkdtempSync(join(tmpdir(), 'kovo-patch-check-'))
   try {
+    // M-24: Strictly validate hunk counts, headers, paths, binary/symlink markers first.
+    const parsedPatches = parseUnifiedDiff(diff)
+    const hasSubstantiveDiffChange = parsedPatches.some(fp =>
+      fp.hunks.some(h => h.entries.some(e => e.kind === 'add' || e.kind === 'remove')),
+    )
+
     copyRepoTreeWithoutSymlinks(repoRoot, workDir)
     const { filesModified } = applyUnifiedDiffToDirectory(workDir, diff)
+
+    const normalizedModified = new Set(filesModified.map(normalizeRepoRelPath))
+    const citedFileModified = primaryRelFile ? normalizedModified.has(primaryRelFile) : filesModified.length > 0
+    let fixAppliedToCitedFile = false
+    if (primaryRelFile && citedFileModified) {
+      const patchedCitedContent = safeReadRepoFile(workDir, primaryRelFile)
+      if (patchedCitedContent !== null && originalCitedContent !== null) {
+        const normOrig = originalCitedContent.replace(/\r\n/g, '\n')
+        const normPatched = patchedCitedContent.replace(/\r\n/g, '\n')
+        const changed = normPatched !== normOrig
+        if (changed) {
+          if (fixAfter !== undefined) {
+            const normFixAfter = fixAfter.replace(/\r\n/g, '\n')
+            fixAppliedToCitedFile = normFixAfter.trim() === ''
+              ? !normPatched.includes(fixBefore.replace(/\r\n/g, '\n'))
+              : normPatched.includes(normFixAfter)
+          } else {
+            fixAppliedToCitedFile = true
+          }
+        }
+      }
+    } else if (!primaryRelFile && hasSubstantiveDiffChange && filesModified.length > 0) {
+      fixAppliedToCitedFile = true
+    }
 
     // Run offline syntax check inside air-gapped --network none worker container if backend provided,
     // or local Node syntax check on modified JS/TS/MJS/CJS files as fallback.
@@ -479,6 +535,9 @@ export async function verifyPatchApplicability(params: {
       applicable: true,
       filesModified,
       syntaxCheck,
+      hasSubstantiveDiffChange,
+      citedFileModified,
+      fixAppliedToCitedFile,
       ...(syntaxCheck.ran && !syntaxCheck.passed ? { error: `Offline syntax check failed: ${syntaxCheck.output}` } : {}),
     }
   } catch (err) {
@@ -486,6 +545,9 @@ export async function verifyPatchApplicability(params: {
       applicable: false,
       filesModified: [],
       syntaxCheck: { ran: false, passed: false },
+      hasSubstantiveDiffChange: false,
+      citedFileModified: false,
+      fixAppliedToCitedFile: false,
       error: err instanceof Error ? err.message : String(err),
     }
   } finally {
@@ -651,6 +713,7 @@ export async function runPatchAuthor(params: PatchWorkflowParams): Promise<Patch
       reposDir: params.reposDir,
       diff,
       fixBefore,
+      fixAfter,
       codeLocations: locations,
       backend: params.backend,
       signal: params.signal,
@@ -745,6 +808,7 @@ export async function runPatchAuthor(params: PatchWorkflowParams): Promise<Patch
     reposDir: params.reposDir,
     diff,
     fixBefore: parsed.fixBefore,
+    fixAfter: parsed.fixAfter,
     codeLocations: locations,
     backend: params.backend,
     signal: params.signal,
@@ -762,62 +826,181 @@ export async function runPatchAuthor(params: PatchWorkflowParams): Promise<Patch
   }
 }
 
+const reviewerGateSchema = z.object({
+  passed: z.boolean(),
+  detail: z.string().min(1),
+})
+
+const reviewerSecurityGateSchema = reviewerGateSchema.extend({
+  enforcingLocation: z.string().optional(),
+})
+
+const reviewerGatesObjectSchema = z.object({
+  applicability: reviewerGateSchema,
+  security_closure: reviewerSecurityGateSchema,
+  sibling_coverage: reviewerGateSchema,
+  caller_compatibility: reviewerGateSchema,
+  repo_conventions: reviewerGateSchema,
+})
+
+const reviewerGateArrayItemSchema = z.object({
+  gate: z.number().int().min(1).max(6).optional(),
+  name: z.enum(['applicability', 'security_closure', 'sibling_coverage', 'caller_compatibility', 'repo_conventions', 'dynamic_retest']),
+  passed: z.boolean(),
+  detail: z.string().min(1),
+  enforcingLocation: z.string().optional(),
+})
+
+function normalizeReviewerGates(
+  raw: z.output<typeof reviewerGatesObjectSchema> | Array<z.output<typeof reviewerGateArrayItemSchema>>,
+  ctx: z.RefinementCtx,
+): z.output<typeof reviewerGatesObjectSchema> {
+  if (!Array.isArray(raw)) return raw
+  const byName = new Map<string, z.output<typeof reviewerGateArrayItemSchema>>()
+  for (const item of raw) {
+    if (byName.has(item.name)) {
+      ctx.addIssue({ code: 'custom', message: `Duplicate reviewer gate "${item.name}".` })
+      return z.NEVER
+    }
+    byName.set(item.name, item)
+  }
+  const required = ['applicability', 'security_closure', 'sibling_coverage', 'caller_compatibility', 'repo_conventions'] as const
+  for (const name of required) {
+    if (!byName.has(name)) {
+      ctx.addIssue({ code: 'custom', message: `Missing required reviewer gate "${name}".` })
+      return z.NEVER
+    }
+  }
+  const sec = byName.get('security_closure')!
+  return {
+    applicability: { passed: byName.get('applicability')!.passed, detail: byName.get('applicability')!.detail },
+    security_closure: {
+      passed: sec.passed,
+      detail: sec.detail,
+      ...(sec.enforcingLocation ? { enforcingLocation: sec.enforcingLocation } : {}),
+    },
+    sibling_coverage: { passed: byName.get('sibling_coverage')!.passed, detail: byName.get('sibling_coverage')!.detail },
+    caller_compatibility: { passed: byName.get('caller_compatibility')!.passed, detail: byName.get('caller_compatibility')!.detail },
+    repo_conventions: { passed: byName.get('repo_conventions')!.passed, detail: byName.get('repo_conventions')!.detail },
+  }
+}
+
 const reviewerOutputSchema = z.object({
   approved: z.boolean(),
   callerCompatibility: z.enum(['attacker_only', 'needs_operator_step', 'breaks_callers']),
   enforcingLocation: z.string().optional(),
-  gates: z.object({
-    applicability: z.object({ passed: z.boolean(), detail: z.string() }),
-    security_closure: z.object({ passed: z.boolean(), detail: z.string(), enforcingLocation: z.string().optional() }),
-    sibling_coverage: z.object({ passed: z.boolean(), detail: z.string() }),
-    caller_compatibility: z.object({ passed: z.boolean(), detail: z.string() }),
-    repo_conventions: z.object({ passed: z.boolean(), detail: z.string() }),
-  }),
+  gates: z.union([
+    reviewerGatesObjectSchema,
+    z.array(reviewerGateArrayItemSchema).min(5),
+  ]).transform(normalizeReviewerGates),
   reviewNotes: z.string().min(1),
 })
 
 const BLOCKING_STATEMENT_RE = /^(?:return\s+.*\b(?:status\s*\(\s*(?:401|403|404|500)|new\s+Response\s*\([^)]*(?:401|403))|res(?:ponse)?\.status\s*\(\s*(?:401|403)\s*\)\s*\.|throw\s+new\s+Error\s*\(\s*['"](?:disabled|forbidden|unauthorized)['"])/i
 
+/** Extract added content lines using the hunk-counted unified diff parser (never matching `+++` headers). */
+function extractAddedDiffLines(diff: string): string[] {
+  try {
+    const patches = parseUnifiedDiff(diff, { allowEmpty: true })
+    const added: string[] = []
+    for (const fp of patches) {
+      for (const hunk of fp.hunks) {
+        for (const entry of hunk.entries) {
+          if (entry.kind === 'add') added.push(entry.text)
+        }
+      }
+    }
+    return added
+  } catch {
+    const added: string[] = []
+    let inHunk = false
+    for (const raw of diff.replace(/\r\n/g, '\n').split('\n')) {
+      if (raw.startsWith('@@ ')) {
+        inHunk = true
+        continue
+      }
+      if (!inHunk) continue
+      if (raw.startsWith('+') && !raw.startsWith('+++ ')) added.push(raw.slice(1))
+    }
+    return added
+  }
+}
+
 /**
  * Detect a patch that unconditionally blocks legitimate callers.
  *
  * The v4 regex matched any added `return res.status(403)` line, including the body of
- * a legitimate guard such as `if (!authorized) { return res.status(403) }`. We now track
- * conditional/block scope per hunk and only flag blocking statements that are *not*
- * nested inside an `if`/`else`/`switch`/`catch`/loop. `if (true)` counts as unconditional.
+ * a legitimate guard such as `if (!authorized) { return res.status(403) }`. We now parse
+ * hunks via `parseUnifiedDiff` (M-24) and track conditional/block scope per hunk, flagging
+ * blocking statements that are *not* nested inside an `if`/`else`/`switch`/`catch`/loop.
+ * `if (true)` counts as unconditional.
  */
 export function detectUnconditionalCallerBreak(diff: string): boolean {
-  const lines: Array<{ added: boolean; text: string }> = []
-  for (const raw of diff.split('\n')) {
-    if (raw.startsWith('+++') || raw.startsWith('---') || raw.startsWith('@@')) continue
-    if (raw.startsWith('+')) lines.push({ added: true, text: raw.slice(1) })
-    else if (raw.startsWith(' ')) lines.push({ added: false, text: raw.slice(1) })
-    // Removed lines are irrelevant: they no longer exist in the patched program.
+  const hunkGroups: Array<Array<{ added: boolean; text: string }>> = []
+  try {
+    const patches = parseUnifiedDiff(diff, { allowEmpty: true })
+    for (const fp of patches) {
+      for (const hunk of fp.hunks) {
+        const group: Array<{ added: boolean; text: string }> = []
+        for (const entry of hunk.entries) {
+          if (entry.kind === 'add') group.push({ added: true, text: entry.text })
+          else if (entry.kind === 'context') group.push({ added: false, text: entry.text })
+          // Removed lines are irrelevant: they no longer exist in the patched program.
+        }
+        if (group.length > 0) hunkGroups.push(group)
+      }
+    }
+  } catch {
+    // Fallback for informal partial diff snippets passed directly to unit tests.
+    const lines: Array<{ added: boolean; text: string }> = []
+    for (const raw of diff.replace(/\r\n/g, '\n').split('\n')) {
+      if (raw.startsWith('+++ ') || raw.startsWith('--- ') || raw.startsWith('@@ ')) continue
+      if (raw.startsWith('+')) lines.push({ added: true, text: raw.slice(1) })
+      else if (raw.startsWith(' ')) lines.push({ added: false, text: raw.slice(1) })
+    }
+    if (lines.length > 0) hunkGroups.push(lines)
   }
-  const addedCount = lines.filter(l => l.added).length
-  if (addedCount === 0) return false
-  const frames: Array<{ conditional: boolean }> = []
-  for (const entry of lines) {
-    const trimmed = entry.text.trim()
-    if (!trimmed) continue
-    // Close scopes that end on this line before evaluating it.
-    const leadingCloses = (trimmed.match(/^\}+/) ?? [''])[0].length
-    for (let i = 0; i < leadingCloses; i += 1) frames.pop()
 
-    const isConditionalOpener = /^(?:if|else|switch|catch|for|while|unless|when|case|elif)\b/.test(trimmed)
-      && !/^if\s*\(\s*true\s*\)/.test(trimmed)
-    const blockingInline = BLOCKING_STATEMENT_RE.test(trimmed) && !/^if\b/.test(trimmed)
-    if (entry.added && blockingInline && !frames.some(f => f.conditional)) return true
+  for (const lines of hunkGroups) {
+    const addedCount = lines.filter(l => l.added).length
+    if (addedCount === 0) continue
+    const frames: Array<{ conditional: boolean }> = []
+    for (const entry of lines) {
+      const trimmed = entry.text.trim()
+      if (!trimmed) continue
+      // Close scopes that end on this line before evaluating it.
+      const leadingCloses = (trimmed.match(/^\}+/) ?? [''])[0].length
+      for (let i = 0; i < leadingCloses; i += 1) frames.pop()
 
-    const opens = (trimmed.match(/\{/g) ?? []).length
-    const closes = (trimmed.match(/\}/g) ?? []).length - leadingCloses
-    for (let i = 0; i < opens; i += 1) frames.push({ conditional: isConditionalOpener })
-    for (let i = 0; i < Math.max(0, closes); i += 1) frames.pop()
+      const isConditionalOpener = /^(?:if|else|switch|catch|for|while|unless|when|case|elif)\b/.test(trimmed)
+        && !/^if\s*\(\s*true\s*\)/.test(trimmed)
+      const blockingInline = BLOCKING_STATEMENT_RE.test(trimmed) && !/^if\b/.test(trimmed)
+      if (entry.added && blockingInline && !frames.some(f => f.conditional)) return true
+
+      const opens = (trimmed.match(/\{/g) ?? []).length
+      const closes = (trimmed.match(/\}/g) ?? []).length - leadingCloses
+      for (let i = 0; i < opens; i += 1) frames.push({ conditional: isConditionalOpener })
+      for (let i = 0; i < Math.max(0, closes); i += 1) frames.pop()
+    }
   }
   return false
 }
 
-const HARDCODED_SECRET_IN_DIFF = /^\+.*(?:sk-or-v1-|sk-ant-|ghp_|github_pat_|-----BEGIN [A-Z ]*PRIVATE KEY-----)/m
+const HARDCODED_SECRET_LINE_RE = /(?:sk-or-v1-|sk-ant-|ghp_|github_pat_|-----BEGIN [A-Z ]*PRIVATE KEY-----)/
+const DEBUG_ARTIFACT_LINE_RE = /(?:\b(?:console\.log\(['"]DEBUG|debugger;)|^(?:<{7}|={7}|>{7}))/
+const OPERATOR_ENV_LINE_RE = /\bprocess\.env\.[A-Z0-9_]+/
+
+function hasHardcodedSecretInDiff(diff: string): boolean {
+  return extractAddedDiffLines(diff).some(line => HARDCODED_SECRET_LINE_RE.test(line))
+}
+
+function hasDebugArtifactInDiff(diff: string): boolean {
+  return extractAddedDiffLines(diff).some(line => DEBUG_ARTIFACT_LINE_RE.test(line))
+}
+
+function hasOperatorEnvInDiff(diff: string): boolean {
+  return extractAddedDiffLines(diff).some(line => OPERATOR_ENV_LINE_RE.test(line))
+}
 
 function detectDeterministicCallerBreak(authorOutput: PatchAuthorOutput): boolean {
   return detectUnconditionalCallerBreak(authorOutput.diff)
@@ -826,7 +1009,7 @@ function detectDeterministicCallerBreak(authorOutput: PatchAuthorOutput): boolea
 
 function deterministicOfflineReview(
   authorOutput: PatchAuthorOutput,
-  applicability: { applicable: boolean; filesModified: string[]; syntaxCheck: PatchSyntaxCheckResult; error?: string },
+  applicability: PatchApplicabilityResult,
 ): PatchReviewOutput {
   const primaryLoc = authorOutput.codeLocations[0]
   const enforcingLocation = primaryLoc ? `${primaryLoc.file}:${primaryLoc.startLine}` : undefined
@@ -841,7 +1024,13 @@ function deterministicOfflineReview(
       : (applicability.error || 'Patch failed applicability or syntax check.'),
   }
 
-  const diffHasSubstantiveChange = authorOutput.fixBefore.trim() !== authorOutput.fixAfter.trim() && authorOutput.diff.includes('+')
+  // M-22: Gate 2 must verify real hunk changes in the cited file transforming fixBefore -> fixAfter,
+  // never approving on a header `+++` or an unrelated-file edit.
+  const diffHasSubstantiveChange =
+    authorOutput.fixBefore.trim() !== authorOutput.fixAfter.trim()
+    && applicability.hasSubstantiveDiffChange
+    && applicability.citedFileModified
+    && applicability.fixAppliedToCitedFile
   const gate2Passed = Boolean(enforcingLocation && /^[^:\s]+:\d+$/.test(enforcingLocation) && diffHasSubstantiveChange)
   const gate2: PatchGateResult = {
     gate: 2,
@@ -850,7 +1039,11 @@ function deterministicOfflineReview(
     enforcingLocation,
     detail: gate2Passed
       ? `Security control enforced at ${enforcingLocation}.`
-      : 'Patch lacks a concrete enforcing file:line location or substantive fix.',
+      : (!applicability.citedFileModified
+          ? `Patch diff does not modify the cited enforcing file (${primaryLoc?.file ?? 'unknown'}).`
+          : !applicability.fixAppliedToCitedFile
+            ? `Patch diff does not apply fixBefore -> fixAfter in ${primaryLoc?.file ?? 'cited file'}.`
+            : 'Patch lacks a concrete enforcing file:line location or substantive fix.'),
   }
 
   const uncoveredSiblings = authorOutput.coverageInventory.filter(
@@ -867,7 +1060,7 @@ function deterministicOfflineReview(
   }
 
   const breaksCallers = detectDeterministicCallerBreak(authorOutput)
-  const needsOperatorStep = /^\+.*process\.env\.[A-Z0-9_]+/m.test(authorOutput.diff) && !breaksCallers
+  const needsOperatorStep = hasOperatorEnvInDiff(authorOutput.diff) && !breaksCallers
   const callerCompatibility: CallerCompatibility = breaksCallers
     ? 'breaks_callers'
     : needsOperatorStep
@@ -886,9 +1079,8 @@ function deterministicOfflineReview(
         : 'Patch refuses attacker input while preserving legitimate callers.',
   }
 
-  const hasSecretLeak = HARDCODED_SECRET_IN_DIFF.test(authorOutput.diff)
-  const hasDebugArtifacts = /^\+.*\b(?:console\.log\(['"]DEBUG|debugger;)/m.test(authorOutput.diff)
-    || /^\+(?:<{7}|={7}|>{7})/m.test(authorOutput.diff)
+  const hasSecretLeak = hasHardcodedSecretInDiff(authorOutput.diff)
+  const hasDebugArtifacts = hasDebugArtifactInDiff(authorOutput.diff)
   const gate5Passed = !hasSecretLeak && !hasDebugArtifacts && applicability.filesModified.length <= 12
   const gate5: PatchGateResult = {
     gate: 5,
@@ -949,6 +1141,7 @@ export async function runPatchReviewer(params: {
     reposDir: params.reposDir,
     diff: params.authorOutput.diff,
     fixBefore: params.authorOutput.fixBefore,
+    fixAfter: params.authorOutput.fixAfter,
     codeLocations: params.authorOutput.codeLocations,
     backend: params.backend,
     signal: params.signal,
@@ -1009,6 +1202,9 @@ export async function runPatchReviewer(params: {
 
   try {
     const raw = await reviewerCall({ systemPrompt, userPrompt })
+    if (typeof raw !== 'string' || !raw.trim()) {
+      throw new Error('Empty response from patch reviewer.')
+    }
     const parsed = reviewerOutputSchema.parse(extractJsonBlock(raw))
 
     // Enforce deterministic hard gates regardless of LLM optimism.
@@ -1018,7 +1214,14 @@ export async function runPatchReviewer(params: {
 
     const enforcingLocation = parsed.gates.security_closure.enforcingLocation || parsed.enforcingLocation
     const validEnforcingLoc = Boolean(enforcingLocation && /^[^:\s]+:\d+$/.test(enforcingLocation.trim()))
-    const gate2Passed = parsed.gates.security_closure.passed && validEnforcingLoc
+    const enforcingFile = validEnforcingLoc ? normalizeRepoRelPath(enforcingLocation!.trim().split(':')[0]!) : null
+    const modifiedSet = new Set(applicability.filesModified.map(normalizeRepoRelPath))
+    const enforcingFileTouched = Boolean(enforcingFile && modifiedSet.has(enforcingFile))
+    const gate2Passed = parsed.gates.security_closure.passed
+      && validEnforcingLoc
+      && enforcingFileTouched
+      && applicability.hasSubstantiveDiffChange
+      && applicability.fixAppliedToCitedFile
 
     const gate3Passed = parsed.gates.sibling_coverage.passed
     const deterministicBreaksCallers = detectDeterministicCallerBreak(params.authorOutput)
@@ -1027,11 +1230,19 @@ export async function runPatchReviewer(params: {
       : parsed.callerCompatibility
     // HARD INVARIANT: breaks_callers ALWAYS fails Gate 4 and forces status='withheld' (even if LLM approved)!
     const gate4Passed = callerCompatibility !== 'breaks_callers' && parsed.gates.caller_compatibility.passed
-    const gate5Passed = parsed.gates.repo_conventions.passed && !HARDCODED_SECRET_IN_DIFF.test(params.authorOutput.diff)
+    const gate5Passed = parsed.gates.repo_conventions.passed && !hasHardcodedSecretInDiff(params.authorOutput.diff)
+
+    const gate2Detail = !validEnforcingLoc
+      ? `${parsed.gates.security_closure.detail} (Missing exact file:line citation.)`
+      : !enforcingFileTouched
+        ? `${parsed.gates.security_closure.detail} (Cited file "${enforcingFile}" was not modified by the diff.)`
+        : !applicability.hasSubstantiveDiffChange || !applicability.fixAppliedToCitedFile
+          ? `${parsed.gates.security_closure.detail} (Diff did not apply a substantive fixBefore -> fixAfter change to the cited file.)`
+          : parsed.gates.security_closure.detail
 
     const gates: PatchGateResult[] = [
       { gate: 1, name: 'applicability', passed: gate1Passed, detail: gate1Passed ? parsed.gates.applicability.detail : (applicability.error || parsed.gates.applicability.detail) },
-      { gate: 2, name: 'security_closure', passed: gate2Passed, enforcingLocation, detail: validEnforcingLoc ? parsed.gates.security_closure.detail : `${parsed.gates.security_closure.detail} (Missing exact file:line citation.)` },
+      { gate: 2, name: 'security_closure', passed: gate2Passed, enforcingLocation, detail: gate2Detail },
       { gate: 3, name: 'sibling_coverage', passed: gate3Passed, detail: parsed.gates.sibling_coverage.detail },
       {
         gate: 4,
@@ -1064,8 +1275,70 @@ export async function runPatchReviewer(params: {
       enforcingLocation,
       reviewNotes: redact(parsed.reviewNotes, params.secrets),
     }
-  } catch {
-    return deterministicOfflineReview(params.authorOutput, applicability)
+  } catch (err) {
+    // M-22: Strictly FAIL CLOSED when an LLM reviewer call throws, times out, returns
+    // malformed/truncated JSON, or omits required verdict fields. Never silently approve!
+    const reason = redact(err instanceof Error ? err.message : String(err), params.secrets).slice(0, 300)
+    const deterministicBreaksCallers = detectDeterministicCallerBreak(params.authorOutput)
+    const callerCompatibility: CallerCompatibility = deterministicBreaksCallers
+      ? 'breaks_callers'
+      : 'attacker_only'
+    const status: PatchStatus = deterministicBreaksCallers ? 'withheld' : 'rejected'
+    const gate1Passed = applicability.applicable && (!applicability.syntaxCheck.ran || applicability.syntaxCheck.passed)
+
+    const gates: PatchGateResult[] = [
+      {
+        gate: 1,
+        name: 'applicability',
+        passed: gate1Passed,
+        detail: gate1Passed
+          ? `Diff applied cleanly to ${applicability.filesModified.join(', ')}.`
+          : (applicability.error || 'Patch failed applicability or syntax check.'),
+      },
+      {
+        gate: 2,
+        name: 'security_closure',
+        passed: false,
+        detail: `Fail-closed: automated patch reviewer error (${reason}); security closure unverified.`,
+      },
+      {
+        gate: 3,
+        name: 'sibling_coverage',
+        passed: false,
+        detail: 'Fail-closed: automated patch reviewer unavailable or returned an invalid verdict.',
+      },
+      {
+        gate: 4,
+        name: 'caller_compatibility',
+        passed: false,
+        detail: deterministicBreaksCallers
+          ? 'Automatically withheld (deterministic breaks_callers pattern matched while reviewer failed closed).'
+          : 'Fail-closed: caller compatibility unverified due to reviewer error.',
+      },
+      {
+        gate: 5,
+        name: 'repo_conventions',
+        passed: false,
+        detail: 'Fail-closed: repository conventions unverified due to reviewer error.',
+      },
+      {
+        gate: 6,
+        name: 'dynamic_retest',
+        passed: false,
+        detail: 'Dynamic retest skipped because patch review failed closed.',
+      },
+    ]
+
+    return {
+      approved: false,
+      status,
+      callerCompatibility,
+      gates,
+      reviewNotes: redact(
+        `Patch review failed closed (${status}): reviewer error or invalid response — ${reason}`,
+        params.secrets,
+      ),
+    }
   }
 }
 
