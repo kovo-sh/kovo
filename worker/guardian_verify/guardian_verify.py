@@ -255,22 +255,94 @@ class ProofResult:
 
 def _split_target(target: Any, default_origin: Optional[str]) -> tuple[Optional[str], str]:
     if isinstance(target, str):
-        if target.startswith("http://") or target.startswith("https://"):
+        trimmed = target.strip()
+        if not trimmed:
+            raise VerificationError("HTTP target path/URL must be non-empty.")
+        if trimmed.startswith("http://") or trimmed.startswith("https://"):
             from urllib.parse import urlsplit
 
-            parts = urlsplit(target)
+            parts = urlsplit(trimmed)
             origin = f"{parts.scheme}://{parts.netloc}"
             path = parts.path or "/"
             if parts.query:
                 path += "?" + parts.query
             return origin, path
-        if not target.startswith("/"):
-            raise VerificationError('Relative verification paths must start with "/".')
-        return None, target
-    if isinstance(target, dict) and isinstance(target.get("url"), str):
-        origin, path = _split_target(target["url"], default_origin)
-        return target.get("origin", origin), path
-    raise VerificationError("HTTP target requires a path string or a {'url': ...} mapping.")
+        path = trimmed if trimmed.startswith("/") else "/" + trimmed
+        return default_origin, path
+    if isinstance(target, dict):
+        for key in ("url", "path", "pathAndQuery", "endpoint", "route"):
+            value = target.get(key)
+            if isinstance(value, str) and value.strip():
+                origin, path = _split_target(value, target.get("origin") or default_origin)
+                return target.get("origin", origin), path
+        if target.get("target") is not None:
+            origin, path = _split_target(target["target"], target.get("origin") or default_origin)
+            return target.get("origin", origin), path
+    raise VerificationError("HTTP target requires a path/URL string or a {'url' | 'path' | 'pathAndQuery' | 'endpoint': ...} mapping.")
+
+
+def _extract_inline_options(spec: Any) -> dict[str, Any]:
+    if not isinstance(spec, dict):
+        return {}
+    out: dict[str, Any] = {}
+    if isinstance(spec.get("method"), str) and spec["method"].strip():
+        out["method"] = spec["method"].strip().upper()
+    if isinstance(spec.get("headers"), dict):
+        out["headers"] = dict(spec["headers"])
+    if spec.get("body") is not None:
+        out["body"] = spec["body"]
+    persona = spec.get("as_persona", spec.get("as", spec.get("persona")))
+    if isinstance(persona, str) and persona:
+        out["as_persona"] = persona
+    if isinstance(spec.get("session"), str) and spec["session"]:
+        out["session"] = spec["session"]
+    if isinstance(spec.get("role"), str) and spec["role"]:
+        out["role"] = spec["role"]
+    if spec.get("follow_redirects") is not None:
+        out["follow_redirects"] = bool(spec["follow_redirects"])
+    elif spec.get("followRedirects") is not None:
+        out["follow_redirects"] = bool(spec["followRedirects"])
+    return out
+
+
+def _normalize_body_and_headers(body: Any, headers: Optional[dict[str, str]] = None) -> tuple[Optional[str], Optional[dict[str, str]]]:
+    next_headers = dict(headers) if headers else None
+    if body is None:
+        return None, next_headers
+    if isinstance(body, str):
+        return body, next_headers
+    serialized = json.dumps(body)
+    if next_headers is None:
+        next_headers = {"content-type": "application/json"}
+    elif not any(key.lower() == "content-type" for key in next_headers):
+        next_headers["content-type"] = "application/json"
+    return serialized, next_headers
+
+
+def _normalize_arm(arm: Any, helper_name: str, arm_name: str) -> tuple[Any, dict[str, Any]]:
+    if arm is None:
+        raise VerificationError(
+            f"{helper_name} requires `{arm_name}` (path/URL string or {{'target'|'url'|'path'|'pathAndQuery', 'method'?, 'body'?, 'headers'?, 'as'?}})."
+        )
+    if isinstance(arm, tuple) and len(arm) == 2:
+        return arm[0], dict(arm[1] or {})
+    if isinstance(arm, str):
+        return arm, {}
+    if isinstance(arm, dict):
+        raw_target = None
+        for key in ("target", "url", "path", "pathAndQuery", "endpoint", "route"):
+            if arm.get(key) is not None:
+                raw_target = arm[key]
+                break
+        if raw_target is None:
+            raise VerificationError(f"{helper_name}.{arm_name} requires a target string or 'url'/'path'/'pathAndQuery'.")
+        opts = _extract_inline_options(arm)
+        if isinstance(arm.get("options"), dict):
+            opts.update(arm["options"])
+        if isinstance(raw_target, str) and arm.get("origin"):
+            raw_target = {"url": raw_target, "origin": arm["origin"]}
+        return raw_target, opts
+    raise VerificationError(f"{helper_name}.{arm_name} must be a path/URL string or request mapping.")
 
 
 def _is_success(status: int) -> bool:
@@ -462,6 +534,7 @@ class VerifyContext:
         self.nonce: str = os.environ.get("GUARDIAN_VERIFY_NONCE", context.get("nonce", ""))
         self.run_id: str = str(context.get("runId", "unknown-run"))
         self.target_origins: list[str] = list(context.get("targetOrigins") or [])
+        self.target_origin: str = self.target_origins[0] if self.target_origins else ""
         self.sdk_version: str = str(context.get("sdkVersion", "guardian_verify/v6-mvp"))
         self.claims: list[dict[str, Any]] = []
         self._default_origin = self.target_origins[0] if self.target_origins else None
@@ -469,41 +542,45 @@ class VerifyContext:
     # -- network ---------------------------------------------------------
     def http(self, target: Any, **options: Any) -> Exchange:
         origin, path = _split_target(target, self._default_origin)
+        merged = {**_extract_inline_options(target), **options}
+        body, headers = _normalize_body_and_headers(merged.get("body"), merged.get("headers"))
         args: dict[str, Any] = {
             "path": path,
-            "method": str(options.get("method", "GET")).upper(),
+            "method": str(merged.get("method", "GET")).upper(),
         }
         if origin:
             args["origin"] = origin
-        if options.get("headers"):
-            args["headers"] = options["headers"]
-        if options.get("body") is not None:
-            args["body"] = options["body"]
-        persona = options.get("as_persona", options.get("as"))
+        if headers:
+            args["headers"] = headers
+        if body is not None:
+            args["body"] = body
+        persona = merged.get("as_persona", merged.get("as", merged.get("persona")))
         if persona:
             args["persona"] = persona
-        if options.get("session"):
-            args["session"] = options["session"]
-        if options.get("role"):
-            args["sessionGroupRole"] = options["role"]
-        if options.get("follow_redirects") is not None:
-            args["followRedirects"] = bool(options["follow_redirects"])
-        timeout = float(options.get("timeout", 60.0))
+        if merged.get("session"):
+            args["session"] = merged["session"]
+        if merged.get("role"):
+            args["sessionGroupRole"] = merged["role"]
+        if merged.get("follow_redirects") is not None:
+            args["followRedirects"] = bool(merged["follow_redirects"])
+        timeout = float(merged.get("timeout", 60.0))
         return Exchange(_rpc("http", args, timeout))
 
     def http2(self, target: Any, **options: Any) -> Exchange:
         origin, path = _split_target(target, self._default_origin)
-        args: dict[str, Any] = {"path": path, "method": str(options.get("method", "GET")).upper()}
+        merged = {**_extract_inline_options(target), **options}
+        body, headers = _normalize_body_and_headers(merged.get("body"), merged.get("headers"))
+        args: dict[str, Any] = {"path": path, "method": str(merged.get("method", "GET")).upper()}
         if origin:
             args["origin"] = origin
-        if options.get("headers"):
-            args["headers"] = options["headers"]
-        if options.get("body") is not None:
-            args["body"] = options["body"]
-        persona = options.get("as_persona", options.get("as"))
+        if headers:
+            args["headers"] = headers
+        if body is not None:
+            args["body"] = body
+        persona = merged.get("as_persona", merged.get("as", merged.get("persona")))
         if persona:
             args["persona"] = persona
-        return Exchange(_rpc("http2", args, float(options.get("timeout", 60.0))))
+        return Exchange(_rpc("http2", args, float(merged.get("timeout", 60.0))))
 
     def browser(self, target: Any, **options: Any) -> BrowserExchange:
         origin, path = _split_target(target, self._default_origin)
@@ -691,22 +768,18 @@ class VerifyContext:
     def prove_persisted_mutation(self, read_route: Any, mutation: Any, field_path: str,
                                  expect_delta: Any = ..., **options: Any) -> dict[str, Any]:
         """Baseline GET + probe write + clean readback GET; emits an `impact` claim."""
-        if isinstance(mutation, dict) and "target" in mutation:
-            spec = dict(mutation)
-        else:
-            spec = {"target": mutation}
-        read_persona = options.get("read_persona", spec.get("as"))
-        mutate_persona = options.get("mutate_persona", spec.get("as"))
+        mut_target, mut_opts = _normalize_arm(mutation, "prove_persisted_mutation", "mutation")
+        read_persona = options.get("read_persona", mut_opts.get("as_persona"))
+        mutate_persona = options.get("mutate_persona", mut_opts.get("as_persona"))
         read_session = options.get("read_session", "persisted-read")
         before = self.http(read_route, method=options.get("read_method", "GET"),
                            as_persona=read_persona, role="control", session=read_session)
-        body = spec.get("body")
-        headers = dict(spec.get("headers") or {})
-        if body is not None and not any(key.lower() == "content-type" for key in headers):
-            headers["content-type"] = "application/json"
-        write = self.http(spec["target"], method=str(spec.get("method", "POST")).upper(),
-                          body=body, headers=headers or None, as_persona=mutate_persona,
-                          role="probe", session=spec.get("session", read_session))
+        body, headers = _normalize_body_and_headers(mut_opts.get("body"), mut_opts.get("headers"))
+        if body is not None and not any(key.lower() == "content-type" for key in (headers or {})):
+            headers = {"content-type": "application/json", **(headers or {})}
+        write = self.http(mut_target, method=str(mut_opts.get("method", "POST")).upper(),
+                          body=body, headers=headers, as_persona=mutate_persona,
+                          role="probe", session=mut_opts.get("session", read_session))
         after = self.http(read_route, method=options.get("read_method", "GET"),
                           as_persona=read_persona, role="control", session=read_session)
         before_json, after_json = _parse_json(before.body), _parse_json(after.body)
@@ -766,15 +839,8 @@ class VerifyContext:
     def prove_boolean_or_timing_diff(self, control: Any, variant: Any, mode: str,
                                      rounds: Optional[int] = None, **options: Any) -> dict[str, Any]:
         """Interleaved boolean/content or timing differential; emits the matching claim."""
-        def arm_of(arm: Any) -> tuple[Any, dict[str, Any]]:
-            if isinstance(arm, tuple) and len(arm) == 2:
-                return arm[0], dict(arm[1] or {})
-            if isinstance(arm, dict) and "target" in arm:
-                return arm["target"], dict(arm.get("options") or {})
-            return arm, {}
-
-        control_target, control_options = arm_of(control)
-        variant_target, variant_options = arm_of(variant)
+        control_target, control_options = _normalize_arm(control, "prove_boolean_or_timing_diff", "control")
+        variant_target, variant_options = _normalize_arm(variant, "prove_boolean_or_timing_diff", "variant")
         session = options.get("session", f"diff-{mode}")
         control_exchanges: list[Exchange] = []
         variant_exchanges: list[Exchange] = []
@@ -1003,21 +1069,17 @@ class VerifyContext:
 
     def prove_injection_differential(
         self,
-        control: Any,
-        probe: Any,
+        control: Any = None,
+        probe: Any = None,
         *,
         expected_output: Optional[str] = None,
         vuln_class: Optional[str] = None,
         session: str = "injection-diff",
         message: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Benign control vs injection/SSTI probe (evaluated marker with anti-reflection, or engine fingerprint)."""
-        def _split_arm(arm: Any) -> tuple[Any, dict[str, Any]]:
-            if isinstance(arm, dict) and "target" in arm:
-                return arm["target"], dict(arm.get("options") or {})
-            return arm, {}
-        c_target, c_opts = _split_arm(control)
-        p_target, p_opts = _split_arm(probe)
+        """Benign control vs differential probe (evaluated marker with anti-reflection, or engine fingerprint)."""
+        c_target, c_opts = _normalize_arm(control, "prove_injection_differential", "control")
+        p_target, p_opts = _normalize_arm(probe, "prove_injection_differential", "probe")
         c_ex = self.http(c_target, role="control", session=session, **c_opts)
         p_ex = self.http(p_target, role="probe", session=session, **p_opts)
         expected = (expected_output or "").strip()
