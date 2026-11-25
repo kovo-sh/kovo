@@ -116,9 +116,9 @@ export function sessionCookie(token: string, origin: string): string {
 }
 
 function bootstrapNotice(): string {
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Guardian local session</title></head>
-<body><h1>Guardian needs a local session</h1>
-<p>Open the one-time bootstrap URL printed by the Guardian server in your terminal, or read
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Kovo Hunter local session</title><link rel="icon" type="image/svg+xml" href="/favicon.svg"></head>
+<body><h1>Kovo Hunter needs a local session</h1>
+<p>Open the one-time bootstrap URL printed by the Kovo Hunter server in your terminal, or read
 <code>&lt;data-dir&gt;/bootstrap</code> (mode 0600) and open <code>/?bootstrap=&lt;secret&gt;</code>.</p>
 <p>A plain request to this server no longer receives an owner session cookie.</p></body></html>`
 }
@@ -178,6 +178,7 @@ export function createGuardianLocalServer(options: LocalSessionOptions): Guardia
   let bootstrapConsumed = false
   const pairingTokens = new Map<string, number>()
   const clientRoot = resolve('build/client')
+  const publicRoot = resolve('public')
 
   function prunePairingTokens(currentMs: number): void {
     for (const [candidate, expiresAtMs] of pairingTokens) {
@@ -226,6 +227,30 @@ export function createGuardianLocalServer(options: LocalSessionOptions): Guardia
     if (path.origin !== origin) return reject(res, 421, 'Unexpected request URL.')
     if (!readOnly && req.headers.origin !== origin) return reject(res, 403, 'Unexpected origin.')
     if (readOnly && path.pathname === '/health') return reject(res, 200, 'ok')
+
+    if (readOnly && (path.pathname === '/favicon.svg' || path.pathname === '/favicon-stealth.svg' || /^\/brand\/[A-Za-z0-9._-]+\.svg$/.test(path.pathname))) {
+      const relPath = path.pathname.slice(1)
+      let file = join(clientRoot, relPath)
+      let size: number
+      try {
+        size = statSync(file).size
+      } catch {
+        file = join(publicRoot, relPath)
+        try {
+          size = statSync(file).size
+        } catch {
+          return reject(res, 404, 'Asset not found.')
+        }
+      }
+      res.writeHead(200, {
+        'Content-Type': mime.svg,
+        'Content-Length': size,
+        'Cache-Control': 'public, max-age=86400',
+      })
+      if (method === 'HEAD') return res.end()
+      await pipeline(createReadStream(file), res)
+      return
+    }
 
     if (readOnly && /^\/assets\/[A-Za-z0-9._-]+\.(?:js|css|woff2|svg|png)$/.test(path.pathname)) {
       const file = join(clientRoot, 'assets', path.pathname.split('/').at(-1)!)

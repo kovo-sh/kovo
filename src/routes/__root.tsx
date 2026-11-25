@@ -11,9 +11,10 @@ export const Route = createRootRoute({
     meta: [
       { charSet: 'utf-8' },
       { name: 'viewport', content: 'width=device-width, initial-scale=1' },
-      { title: 'Kovo Guardian' },
+      { title: 'Kovo Hunter' },
     ],
     links: [
+      { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' },
       { rel: 'stylesheet', href: appStyles },
       { rel: 'stylesheet', href: shellStyles },
     ],
@@ -21,7 +22,7 @@ export const Route = createRootRoute({
   component: Shell,
   shellComponent: Document,
   errorComponent: ({ error }) => <main className="workspace-page">
-    <h1>Guardian couldn’t open this view</h1>
+    <h1>Kovo Hunter couldn’t open this view</h1>
     <p className="muted" style={{ margin: '8px 0 14px' }}>
       {error instanceof Error ? error.message : 'This view is unavailable.'}
     </p>
