@@ -3,12 +3,12 @@ Tags: multihop, multi-hop, chaining, chain, capability-ledger, composite-receipt
 Summary: Verify 3-6 hop chains via ctx.seal_capability, ctx.hmac_sign/ctx.jwt_sign, ctx.await_async, and CompositeProofReceipt DAGs (ctx.prove_composite) with zero-FP hardened-twin discipline.
 
 ## 1. Quick-Reference Contract
-1. **Checkpoint (`doNotRediscover: true`):** Start from `verifiedHops` and `cap:hop_<id>:<slot>`; never rediscover Hop 1.
-2. **Seal (`ctx.seal_capability`):** Never echo raw tokens/cookies/salts/signed URLs; seal to `cap:hop_<id>:<slot>`.
-3. **Derive (`ctx.hmac_sign` / `ctx.jwt_sign`):** Sign host-side from handles for `derivedFromCapabilityId` attestations.
-4. **Async (`ctx.await_async`):** Poll internal workers/relays with monotonic `t_trigger <= t_observed`.
-5. **DAG (`ctx.prove_composite`):** Submit a `CompositeProofReceipt` (1–8 hops) with typed edges + attacker-origin provenance.
-6. **Hardened Twins:** NEVER emit standalone `CWE-200` on `capability_only` intermediates; settle enforced Hop 3/4 with `record_coverage(proofGapReason="invariant_enforced_hardened")`.
+1. **Checkpoint (`doNotRediscover: true`):** Start from `verifiedHops` + `cap:hop_<id>:<slot>`; never rediscover Hop 1.
+2. **Attacker-Origin:** Start Hop 1 from a low-priv/cross-tenant persona (never `owner`/`admin` on attack arm).
+3. **Seal & Inject:** `ctx.seal_capability({ exchange, slot, jsonPath|header|cookie|regex|value })` -> `ctx.http_send(path, { capability })`.
+4. **Derive & Async:** `ctx.hmac_sign`/`ctx.jwt_sign` (`derivedFromCapabilityId`); `ctx.await_async` (`tTriggerMs <= tObservedMs`).
+5. **DAG:** `ctx.prove_composite` (1–8 hops, `fresh_clean_replay`) + `return ctx.result({ title })`.
+6. **Hardened Twins:** Never emit standalone `CWE-200` on `capability_only` hops; settle enforced guards with `record_coverage(proofGapReason="invariant_enforced_hardened")`.
 
 ## 2. Working from a Pre-Hydrated `hopCheckpoint`
 Your `AssignmentBrief` may include a bounded (`<= 2 KB`) `hopCheckpoint` object:
@@ -21,15 +21,16 @@ Your `AssignmentBrief` may include a bounded (`<= 2 KB`) `hopCheckpoint` object:
 ## 3. Layer-1 Derived Capability Custody (`ctx.seal_capability`)
 Whenever a host-signed HTTP exchange, GraphQL response, SSE event, browser trace, or async readback yields a reusable credential or authorization artifact (bearer token, API key, session cookie, signed URL, OIDC assertion, signing salt, or HMAC key):
 1. Call `ctx.seal_capability` inside your `guardian_verify` script to seal the artifact in host-side `DerivedCapabilityVault` custody:
-   - Inputs: `{ hopReceiptId, slot, kind, fromExchangeId | rawValue, allowedOrigins?, defaultHeaderName?, defaultCookieName? }`
-   - Output: opaque handle `cap:hop_<id>:<slot>` plus truncated `sha256Prefix` (raw bytes remain host-side and are scrubbed from prompts/transcripts).
-2. Inject the sealed capability into Hop `k+1` via Layer-1 request options (`capability: "cap:hop_<id>:<slot>"` targeting `bearer`, `header`, `cookie`, or `url`).
+   - TS inputs: `{ exchange | exchangeId, slot, hopReceiptId?, hopId?, jsonPath | header | cookie | regex | value, kind?, ttlMs?, allowedOrigins?, defaultHeaderName?, defaultCookieName? }` (at least one extraction selector — `jsonPath`, `header`, `cookie`, `regex`, or `value` — is required).
+   - Python inputs: `ctx.seal_capability(exchange_or_id, slot, hop_receipt_id=..., json_path=..., header=..., cookie=..., regex=..., value=..., kind=..., ttl_ms=..., default_header_name=..., default_cookie_name=..., allowed_origins=...)`.
+   - Output: `{ handle, meta, exchangeId, sealExchangeId, scrubbedPreview }` where `handle` is opaque `cap:hop_<id>:<slot>` and `meta.sha256Prefix` holds the truncated digest (raw bytes remain host-side and are scrubbed from prompts/transcripts).
+2. Inject the sealed capability into Hop `k+1` via Layer-1 request options: `ctx.http_send(target, { capability: "cap:hop_<id>:<slot>", capabilityTarget?: "bearer" | "header" | "cookie" | "url", capabilityHeaderName?, capabilityCookieName?, capabilityQueryParam?, role: "probe" })` (or `{ capability: { handle, target?, headerName?, cookieName?, queryParam? } }`).
 3. Layer 1 performs the injection host-side and records `consumedCapabilityId` in the host-signed transcript, enabling deterministic `value_binding` verification.
 
 ## 4. Host-Side Cryptographic Derivation (`ctx.hmac_sign` / `ctx.jwt_sign`)
 When a multi-hop workflow requires signing a webhook body, token, or request with sealed `signing_material` (`cap:hop_<id>:<slot>`):
-- **HMAC signing:** Call `ctx.hmac_sign({ secretHandle: "cap:hop_<id>:<slot>", payload, alg: "sha256" | "sha384" | "sha512", encoding: "hex" | "base64" | "base64url" })`.
-- **JWT signing:** Call `ctx.jwt_sign({ secretHandle: "cap:hop_<id>:<slot>", claims, header?, alg: "HS256" | "HS384" | "HS512", hopReceiptId?, slot? })`. This seals the newly minted token as a child `derivedHandle` (`cap:hop_<id>:<slot>`) linked to the parent handle.
+- **HMAC signing:** Call `ctx.hmac_sign({ secretHandle: "cap:hop_<id>:<slot>", payload, alg: "sha256" | "sha384" | "sha512", encoding: "hex" | "base64" | "base64url" })` (Python: `ctx.hmac_sign(secret_handle, payload, alg="sha256", encoding="hex")`). Returns `{ exchangeId, signature, attestation: { derivedFromCapabilityId, alg, encoding, payloadDigest, signatureDigest, sourceSecretDigest, runId, timestampMs } }`.
+- **JWT signing:** Call `ctx.jwt_sign({ secretHandle: "cap:hop_<id>:<slot>", claims, header?, alg: "HS256" | "HS384" | "HS512", hopReceiptId?, slot?, ttlMs?, allowedOrigins? })` (Python: `ctx.jwt_sign(secret_handle, claims, alg="HS256", header=..., hop_receipt_id=..., slot=...)`). Returns `{ exchangeId, derivedHandle, attestation: { derivedFromCapabilityId, derivedHandle, ... } }`, sealing the minted token as child `derivedHandle` (`cap:hop_<id>:<slot>`).
 - Both helpers emit a host-signed `derivedFromCapabilityId` attestation in the transcript so `derived_crypto_binding` verifies end-to-end lineage without exposing raw key bytes to the worker.
 - For cryptographic scope-replay verification, always capture three host-signed observations:
   1. Tampered/invalid signature is rejected (`401`/`403`) — rules out signature-skip decoys.
@@ -38,44 +39,58 @@ When a multi-hop workflow requires signing a webhook body, token, or request wit
 
 ## 5. Bounded Async Worker Pivots (`ctx.await_async`)
 For asynchronous cross-service hops (document/PDF renderers, webhook delivery logs, batch export workers, async queues, or simulated review-bot workflows) where side effects converge on an internal service rather than an external OOB collector:
-- Trigger the async action in Hop `i` and record the trigger exchange timestamp (`tTriggerMs`) and run-scoped `correlationId` / `entityId`.
-- Call `ctx.await_async({ pollRequest, matchPredicate, profile: "fast_lab" | "wan", timeoutMs?, intervalMs?, correlationId })`:
+- Trigger the async action in Hop `i` and pass `triggerExchangeId: triggerEx.exchangeId` (or `tTriggerMs`) plus run-scoped `correlationId` / `entityId`.
+- Call `ctx.await_async({ pollRequest, matchPredicate?, profile: "fast_lab" | "wan", timeoutMs?, intervalMs?, maxAttempts?, triggerExchangeId?, tTriggerMs?, correlationId?, correlationIds?, entityId? })` (Python: `ctx.await_async(poll_request, match_predicate=..., profile=..., timeout_ms=..., interval_ms=..., trigger_exchange_id=..., correlation_id=..., entity_id=...)`):
   - `fast_lab`: default/max `5,000 ms` (`150 ms` interval).
   - `wan`: default/max `30,000 ms` (`500 ms` interval).
-- Layer 1 enforces strict monotonic ordering (`tTriggerMs <= tObservedMs`) and records an auditable `HostAsyncPollRecord` (`pollRecordId`) for `async_pivot_binding`.
+  - `matchPredicate` supports `{ status?, bodyContains?, bodyMatches?, jsonPath?, equals?, in?, matches?, header?: { name, equals?, matches? } }`.
+- Returns `{ pollRecordId, converged, status, exchangeId, exchange, evidence }`. Layer 1 enforces strict monotonic ordering (`tTriggerMs <= tObservedMs`) and records an auditable `HostAsyncPollRecord` (`pollRecordId`) for `async_pivot_binding`.
 - Never use unbounded sleep loops; if convergence times out cleanly, record the negative observation rather than fabricating state.
 
 ## 6. Submitting a `CompositeProofReceipt` DAG (`ctx.prove_composite`)
 A multi-hop finding confirms ONLY when `ctx.prove_composite` verifies a complete `CompositeProofReceipt` DAG strictly over host-signed transcripts:
 
 ```ts
-// Conceptual defensive verification shape (all IDs reference host-signed transcript records)
+// Mode-A defensive verification shape (all IDs reference host-signed transcript records)
+const preDenied = await ctx.http_send('/api/v1/terminal', { as: 'member_b', role: 'control' })
+const ex1 = await ctx.http_send('/api/v1/resource-meta', { as: 'member_b', role: 'probe' })
+const cap1 = await ctx.seal_capability({ exchange: ex1, hopReceiptId: '1', slot: 'scoped_tok', jsonPath: '$.token', kind: 'bearer_token' })
+const postReadback = await ctx.http_send('/api/v1/terminal', { capability: cap1.handle, role: 'probe' })
 await ctx.prove_composite({
   chainId: 'chain-authz-pivot-1',
   terminalVulnClass: 'dual_tenant_abac', // canonical terminal class
   replayMode: 'fresh_clean_replay',      // Mode A mandatory default
   hops: [
     {
-      hopId: 'hop-1',
+      hopId: 'hop_1',
       surface: 'http',
-      target: { origin, method: 'GET', pathAndQuery: '/api/v1/resource-meta' },
+      target: { origin: ctx.targetOrigin, method: 'GET', pathAndQuery: '/api/v1/resource-meta' },
       exchangeIds: [ex1.exchangeId],
       claimedDelta: 'Attacker persona obtains scoped capability handle from Hop 1.',
-      producedCapabilities: ['cap:hop_1:scoped_tok'],
+      producedCapabilities: [cap1.handle],
       consumedCapabilities: [],
     },
-    // ... Hop 2 .. Hop N (1..8 hops, acyclic DAG)
+    {
+      hopId: 'hop_2',
+      surface: 'http',
+      target: { origin: ctx.targetOrigin, method: 'GET', pathAndQuery: '/api/v1/terminal' },
+      exchangeIds: [postReadback.exchangeId],
+      claimedDelta: 'Attacker crosses terminal boundary using sealed Hop 1 capability.',
+      producedCapabilities: [],
+      consumedCapabilities: [cap1.handle],
+    },
   ],
   causalEdges: [
-    // Link every dependent hop using one of the 4 typed bindings below
+    { kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: cap1.handle },
   ],
   terminalImpact: {
-    terminalHopId: 'hop-n',
+    terminalHopId: 'hop_2',
     claimedImpact: 'Unauthorized cross-tenant read/mutation confirmed on terminal resource.',
     preChainControlExchangeIds: [preDenied.exchangeId],
     postChainReadbackExchangeIds: [postReadback.exchangeId],
   },
 })
+return ctx.result({ title: 'Multi-hop cross-tenant capability pivot' })
 ```
 
 ### The 4 Typed Causal Edge Bindings

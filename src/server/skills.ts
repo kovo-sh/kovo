@@ -118,12 +118,16 @@ export interface PreInjectedSkill extends SkillSummary {
 
 export interface SelectPreInjectionSkillsInput {
   profileSkills?: readonly string[]
+  /** Optional step-level skill slugs (e.g. 'multihop-chains', 'chain-primitives', 'chain:*'). */
+  stepSkills?: readonly string[]
   techTags?: readonly string[]
   sinkKind?: string
   category?: string
   title?: string
   hypothesis?: string
-  /** Optional mission kind (e.g. 'chain_step_2', 'multihop_chain', 'second_order'). */
+  /** Optional dispatch lane (e.g. 'chain' | 'multihop' | 'frontier'). */
+  lane?: string
+  /** Optional mission kind (e.g. 'chain', 'chain_step_2', 'multihop_chain', 'second_order'). */
   missionKind?: string
   /** Explicit signal that this assignment is a multi-hop chain or frontier continuation. */
   multiHop?: boolean
@@ -136,10 +140,12 @@ export interface SelectPreInjectionSkillsInput {
 
 const maxPreInjectedSkillChars = 1200
 
-const MULTIHOP_MISSION_KINDS = new Set(['chain_step_2', 'multihop_chain', 'second_order'])
-const MULTIHOP_CATEGORY_RE = /^(?:multi[-_]?hop|chain[-_]?pivot|cross[-_]?service[-_]?chain|composite[-_]?chain)$/i
+const MULTIHOP_MISSION_KINDS = new Set(['chain', 'chain_step', 'chain_step_2', 'multihop_chain', 'second_order'])
+const MULTIHOP_MISSION_KIND_RE = /^(?:chain(?:[-_]?step(?:[-_]?\d+)?)?|multi[-_]?hop(?:[-_]?chain)?|second[-_]?order)$/i
+const MULTIHOP_LANE_RE = /^(?:chain|multi[-_]?hop|frontier(?:[-_]?chain)?)$/i
+const MULTIHOP_CATEGORY_RE = /^(?:chain|chain[-_]?step(?:[-_]?\d+)?|multi[-_]?hop(?:[-_]?chain)?|chain[-_]?pivot|cross[-_]?service[-_]?chain|cross[-_]?tenant[-_]?chain|composite[-_]?chain)$/i
 const MULTIHOP_TEXT_RE =
-  /\b(?:multi[- ]?hop|hop[- ]?checkpoint|hop\s+[2-8]\b|chain\s+step\s+[2-8]\b|composite\s*proof|prove_composite|seal_capability|hmac_sign|jwt_sign|await_async|derived_crypto_binding|state_transition_binding|async_pivot_binding|sub[- ]?chain\s+fus(?:e|ion)|cap:hop_)\b/i
+  /\b(?:multi[- ]?hop|[2-8][- ]?hops?|hop[- ]?checkpoint|hop[-_ ]?[2-8]\b|chain[-_ ]?step(?:[-_ ]?[2-8])?\b|composite\s*(?:proof|receipt)|prove_composite|seal_capability|hmac_sign|jwt_sign|await_async|value_binding|derived_crypto_binding|state_transition_binding|async_pivot_binding|derived\s+capability|(?:cross[- ](?:service|tenant|surface)|capability)\s+(?:pivot|chain)|sub[- ]?chain\s+fus(?:e|ion)|cap:hop_)\b/i
 
 /** Map a sinkKind to the skill tags that document how to audit it. */
 const SINK_SKILL_TAGS: Record<string, readonly string[]> = {
@@ -164,8 +170,16 @@ const SINK_SKILL_TAGS: Record<string, readonly string[]> = {
 export function isMultiHopChainAssignment(input: Omit<SelectPreInjectionSkillsInput, 'limit'>): boolean {
   if (input.multiHop === true || input.hasHopCheckpoint === true) return true
   if (typeof input.hopDepth === 'number' && Number.isFinite(input.hopDepth) && input.hopDepth >= 2) return true
-  if (input.missionKind && MULTIHOP_MISSION_KINDS.has(input.missionKind.trim().toLowerCase())) return true
+  if (input.lane && MULTIHOP_LANE_RE.test(input.lane.trim())) return true
+  if (input.missionKind) {
+    const normalized = input.missionKind.trim().toLowerCase()
+    if (MULTIHOP_MISSION_KINDS.has(normalized) || MULTIHOP_MISSION_KIND_RE.test(normalized)) return true
+  }
   if ((input.profileSkills ?? []).some(name => resolveSkillName(name) === MULTIHOP_CHAINS_SKILL)) return true
+  if ((input.stepSkills ?? []).some(name => {
+    const trimmed = name.trim().toLowerCase()
+    return resolveSkillName(trimmed) === MULTIHOP_CHAINS_SKILL || trimmed === 'chain-primitives' || trimmed.startsWith('chain:')
+  })) return true
   if (input.category && MULTIHOP_CATEGORY_RE.test(input.category.trim())) return true
   if (input.sinkKind && ['async_job', 'cross_surface'].includes(input.sinkKind.trim().toLowerCase())) return true
   const text = `${input.title ?? ''} ${input.hypothesis ?? ''}`
