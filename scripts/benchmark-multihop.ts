@@ -137,6 +137,7 @@ export interface MultihopBriefing {
 export interface MultihopStartedApp {
   app: MultihopAppName | string
   origin: string
+  primaryOrigin?: string
   origins?: Record<string, string>
   plan?: { seedSet?: 'dev' | 'held-out' }
   groundTruth: unknown
@@ -146,6 +147,7 @@ export interface MultihopStartedApp {
     requests(): unknown[]
     egress?(): unknown[]
     chainStates?(): unknown[]
+    export?(): unknown
     reset?(): void
   }
   stop(): Promise<void>
@@ -171,6 +173,7 @@ export interface MultihopGradeInput {
   oracleEvents: unknown[]
   requestLog: unknown[]
   egressLog: unknown[]
+  oracleExport?: unknown
   telemetry: RunTelemetry
   mode: MultihopMode
 }
@@ -921,7 +924,16 @@ export async function probeLoginPath(
 ): Promise<string | null> {
   const first = personas[0]
   if (!first) return null
-  const candidates = ['/login', '/api/auth/login', '/api/v1/login', '/auth/login', '/api/login', '/session']
+  const candidates = [
+    '/login',
+    '/v1/auth/login',
+    '/api/v1/auth/login',
+    '/api/auth/login',
+    '/api/v1/login',
+    '/auth/login',
+    '/api/login',
+    '/session',
+  ]
   for (const path of candidates) {
     try {
       const res = await fetch(new URL(path, origin), {
@@ -939,16 +951,63 @@ export async function probeLoginPath(
   return null
 }
 
-export function pickLoginPath(briefing: Pick<MultihopBriefing, 'apiReference'>): string | null {
+function selectLoginRoute(briefing: Pick<MultihopBriefing, 'apiReference'>): MultihopApiRef | null {
   const routes = briefing.apiReference ?? []
   const named = routes.filter(r => /login|signin|sign-in|session/i.test(`${r.routeKey} ${r.path}`))
   const posts = named.filter(r => r.method.toUpperCase() === 'POST')
   const ranked = (posts.length ? posts : named).slice().sort((a, b) => {
     const legacy = (r: MultihopApiRef) => (/legacy|v1\//i.test(r.routeKey) ? 1 : 0)
-    const exact = (r: MultihopApiRef) => (/^(login|signin|session)$/i.test(r.routeKey) ? 0 : 1)
+    const exact = (r: MultihopApiRef) => (/^(?:login|signin|session|(?:idp|scm|auth)\.login)$/i.test(r.routeKey) ? 0 : 1)
     return exact(a) - exact(b) || legacy(a) - legacy(b)
   })
-  return ranked[0]?.path ?? null
+  return ranked[0] ?? null
+}
+
+export function pickLoginPath(briefing: Pick<MultihopBriefing, 'apiReference'>): string | null {
+  return selectLoginRoute(briefing)?.path ?? null
+}
+
+export function pickLoginUrl(
+  briefing: Pick<MultihopBriefing, 'origin' | 'origins' | 'apiReference'>,
+  loginPath: string | null,
+): string | null {
+  if (!loginPath) return null
+  if (/^https?:\/\//i.test(loginPath)) return loginPath
+  const routes = briefing.apiReference ?? []
+  const matched = routes.find(r => r.path === loginPath && r.method.toUpperCase() === 'POST')
+    ?? routes.find(r => r.path === loginPath)
+  const serviceOrigin = matched?.service && briefing.origins?.[matched.service]
+    ? briefing.origins[matched.service]!
+    : briefing.origin
+  return new URL(loginPath, serviceOrigin).toString()
+}
+
+export function briefingToOpenApiByOrigin(
+  briefing: Pick<MultihopBriefing, 'app' | 'origin' | 'origins' | 'apiReference'>,
+): Array<{ service: string; origin: string; spec: NonNullable<MultihopCellPlan['openApi']> }> {
+  const routes = briefing.apiReference ?? []
+  if (!routes.length) return []
+  const hasOriginMap = Boolean(briefing.origins && Object.keys(briefing.origins).length > 0)
+  const grouped = new Map<string, { service: string; origin: string; routes: MultihopApiRef[] }>()
+  for (const route of routes) {
+    let service = route.service ?? 'default'
+    let origin: string | undefined
+    if (route.service && hasOriginMap) {
+      origin = briefing.origins![route.service]
+      if (!origin) continue // skip internal-only services whose origins are not public
+    } else {
+      origin = briefing.origin
+      service = 'default'
+    }
+    const existing = grouped.get(origin)
+    if (existing) existing.routes.push(route)
+    else grouped.set(origin, { service, origin, routes: [route] })
+  }
+  return [...grouped.values()].map(group => ({
+    service: group.service,
+    origin: group.origin,
+    spec: briefingToOpenApi({ app: `${String(briefing.app)}-${group.service}`, apiReference: group.routes }),
+  }))
 }
 
 export function briefingToOpenApi(
@@ -1393,11 +1452,23 @@ export async function runCell(
   let gitSha = 'unknown'
   let model: ModelInfo = { mode: 'deterministic-no-llm', profiles: [] }
 
+  const stopStartedApp = async (target: MultihopStartedApp): Promise<boolean> => {
+    try {
+      const outcome = await Promise.race([
+        target.stop().then(() => 'stopped' as const),
+        delay(10_000).then(() => 'timeout' as const),
+      ])
+      return outcome === 'stopped'
+    } catch {
+      return false
+    }
+  }
+
   const unregisterCleanup = cleanup.add(async () => {
     if (engine) { try { engineBusy = await stopEngine(engine) } catch { engineBusy = -1 } }
     if (backend instanceof LinuxWorkerBackend) { try { await backend.reclaimInactive() } catch { /* best-effort */ } }
     try { await canary.stopListener(); canaryStopped = true } catch { canaryStopped = false }
-    if (started) { try { await started.stop(); appStopped = true } catch { appStopped = false } }
+    if (started) { appStopped = await stopStartedApp(started) }
   })
 
   try {
@@ -1503,14 +1574,28 @@ export async function runCell(
       projectId = project.id
 
       if (plan.openApi) {
-        storage.importProjectSpec({
-          requestId: randomUUID(),
-          projectId,
-          name: `multihop-saas-${app}-api.json`,
-          kind: 'openapi',
-          origin: briefing.origin,
-          content: JSON.stringify(plan.openApi, null, 2),
-        })
+        const perOriginSpecs = briefingToOpenApiByOrigin(briefing)
+        if (perOriginSpecs.length) {
+          for (const entry of perOriginSpecs) {
+            storage.importProjectSpec({
+              requestId: randomUUID(),
+              projectId,
+              name: `multihop-saas-${app}-${entry.service}-api.json`,
+              kind: 'openapi',
+              origin: entry.origin,
+              content: JSON.stringify(entry.spec, null, 2),
+            })
+          }
+        } else {
+          storage.importProjectSpec({
+            requestId: randomUUID(),
+            projectId,
+            name: `multihop-saas-${app}-api.json`,
+            kind: 'openapi',
+            origin: briefing.origin,
+            content: JSON.stringify(plan.openApi, null, 2),
+          })
+        }
       }
 
       if (args.mode === 'white-box' && briefing.sourceDir) {
@@ -1521,7 +1606,8 @@ export async function runCell(
         }
       }
 
-      if (loginPath) {
+      const resolvedLoginUrl = pickLoginUrl(briefing, loginPath)
+      if (resolvedLoginUrl) {
         for (const p of plan.personas) {
           const created = createProjectPersona(storage, {
             requestId: randomUUID(),
@@ -1533,7 +1619,7 @@ export async function runCell(
             loginConfig: {
               adapter: 'json',
               email: p.email,
-              loginUrl: new URL(loginPath, briefing.origin).toString(),
+              loginUrl: resolvedLoginUrl,
             },
             secret: p.password,
             canaryMarkers: p.canaryMarkers,
@@ -1684,6 +1770,7 @@ export async function runCell(
       oracleEvents: started.oracle.events(),
       requestLog: started.oracle.requests(),
       egressLog: started.oracle.egress?.() ?? [],
+      ...(started.oracle.export ? { oracleExport: started.oracle.export() } : {}),
       telemetry,
       mode: args.mode,
     }
@@ -1849,7 +1936,7 @@ export async function runCell(
     if (engine) { try { engineBusy = await stopEngine(engine) } catch { engineBusy = -1 } }
     if (backend instanceof LinuxWorkerBackend) { try { await backend.reclaimInactive() } catch { /* best-effort */ } }
     try { await canary.stopListener(); canaryStopped = true } catch { canaryStopped = false }
-    if (started) { try { await started.stop(); appStopped = true } catch { appStopped = false } }
+    if (started) { appStopped = await stopStartedApp(started) }
     engine = undefined
     started = undefined
     if (whiteBoxRoot) { try { unlockAndRemove(whiteBoxRoot) } catch { /* best-effort */ } }
