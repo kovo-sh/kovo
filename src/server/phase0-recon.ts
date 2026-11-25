@@ -29,6 +29,12 @@ import type {
 } from './program-graph.ts'
 import { buildSoft404ProbePaths } from './scoped-browser.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
+import {
+  getOrBuildStaticWorkspaceSnapshot,
+  SNAPSHOT_STATIC_ROUTE_EXTS,
+  snapshotSourceFiles,
+  type StaticWorkspaceSnapshot,
+} from './static-workspace-snapshot.ts'
 import type { EndpointRow, Store } from './store.ts'
 import { parseGraphqlIntrospection, probeSurface, runSafeTemplates } from './surface-engine.ts'
 
@@ -56,6 +62,8 @@ export interface Phase0ReconParams {
   readOnlyMode?: boolean
   /** Lower the per-run code-slice cap for tests/tight budgets (hard-capped at 200). */
   maxCodeSlices?: number
+  /** Optional Phase A StaticWorkspaceSnapshot (reused across manifest, route, and graph extraction). */
+  staticSnapshot?: StaticWorkspaceSnapshot
 }
 
 export interface Phase0ReconResult {
@@ -119,6 +127,8 @@ export interface Phase0ReconResult {
   }
   /** Set when speculative sibling derivation was disabled because declared/AST routes exist. */
   siblingDerivationSuppressed?: 'declared_surface'
+  /** Cached Phase A StaticWorkspaceSnapshot built or reused during Phase 0. */
+  staticSnapshot?: StaticWorkspaceSnapshot
 }
 
 export interface RepoStaticExtractionSummary {
@@ -446,17 +456,34 @@ function walkRepoFiles(rootDir: string, maxFiles = 1500): string[] {
  * Covers: Next.js (App/Pages/Server Actions), Express, Fastify, NestJS, Django/DRF,
  * FastAPI, Flask, Spring Boot, Rails, Go (net/http, gin, echo, chi), and GraphQL SDL.
  */
-export function extractStaticFrameworkRoutes(reposDir: string): {
+export function extractStaticFrameworkRoutes(
+  reposDir: string,
+  staticSnapshot?: StaticWorkspaceSnapshot,
+): {
   routes: StaticExtractedRoute[]
   frameworks: string[]
 } {
-  if (!reposDir || !existsSync(reposDir)) return { routes: [], frameworks: [] }
-  const files = walkRepoFiles(reposDir)
-  let rootReal: string
-  try {
-    rootReal = realpathSync(reposDir)
-  } catch {
-    return { routes: [], frameworks: [] }
+  const sourceEntries: Array<{ rel: string; code: string }> = []
+  if (staticSnapshot) {
+    for (const [rel, code] of staticSnapshot.sourceByPath.entries()) {
+      const ext = extname(rel).toLowerCase()
+      if (!SNAPSHOT_STATIC_ROUTE_EXTS.has(ext)) continue
+      sourceEntries.push({ rel, code })
+    }
+  } else {
+    if (!reposDir || !existsSync(reposDir)) return { routes: [], frameworks: [] }
+    const files = walkRepoFiles(reposDir)
+    let rootReal: string
+    try {
+      rootReal = realpathSync(reposDir)
+    } catch {
+      return { routes: [], frameworks: [] }
+    }
+    for (const fullPath of files) {
+      const code = readRepoRegularFile(fullPath)
+      if (code === null) continue
+      sourceEntries.push({ rel: relative(rootReal, fullPath).split(sep).join('/'), code })
+    }
   }
   const routes: StaticExtractedRoute[] = []
   const frameworks = new Set<string>()
@@ -470,12 +497,9 @@ export function extractStaticFrameworkRoutes(reposDir: string): {
     routes.push({ ...r, extraction: r.extraction ?? 'regex' })
   }
 
-  for (const fullPath of files) {
-    const code = readRepoRegularFile(fullPath)
-    if (code === null) continue
-    const rel = relative(rootReal, fullPath).split(sep).join('/')
+  for (const { rel, code } of sourceEntries) {
     const repoName = rel.split('/')[0] || 'repo'
-    const ext = extname(fullPath).toLowerCase()
+    const ext = extname(rel).toLowerCase()
     const meta = detectSinksAndGuards(code)
 
     // 1. Next.js App Router: .../app/<route>/route.{ts,tsx,js,jsx}
@@ -952,11 +976,34 @@ export function extractRepoProgramGraph(input: {
   maxFiles?: number
   /** Security-relevant commit signals (from the graph producer) folded into hypotheses. */
   recentDiffSignals?: readonly CommitDiffSignal[]
+  /** Optional Phase A StaticWorkspaceSnapshot (reuses cached files + ProgramGraph without walking disk). */
+  staticSnapshot?: StaticWorkspaceSnapshot
 }): RepoProgramGraphExtraction | null {
-  if (!input.reposDir) return null
-  const inputs = collectRepoGraphInputs(input.reposDir, input.maxFiles)
-  if (!inputs) return null
-  const graph = extractProgramGraph({ files: inputs.sourceFiles, repo: inputs.mountedRepos.join(',') || undefined })
+  let inputs: RepoGraphInputs | null
+  let graph: ProgramGraph
+  if (input.staticSnapshot) {
+    const snap = input.staticSnapshot
+    const sourceFiles = snapshotSourceFiles(snap)
+    const dockerfiles = snap.dockerfiles.map(d => ({ path: d.path, content: d.content }))
+    if (sourceFiles.length === 0 && dockerfiles.length === 0) return null
+    inputs = {
+      sourceFiles,
+      dockerfiles,
+      manifests: snap.manifests
+        .filter(m => m.name.toLowerCase() === 'package.json' || m.name.toLowerCase().endsWith('/package.json'))
+        .slice(0, 80)
+        .map(m => ({ path: m.name, content: m.content })),
+      ...(snap.compose !== undefined ? { compose: snap.compose } : {}),
+      ...(snap.ingress !== undefined ? { ingress: snap.ingress } : {}),
+      mountedRepos: [...snap.mountedRepos],
+    }
+    graph = snap.programGraph
+  } else {
+    if (!input.reposDir) return null
+    inputs = collectRepoGraphInputs(input.reposDir, input.maxFiles)
+    if (!inputs) return null
+    graph = extractProgramGraph({ files: inputs.sourceFiles, repo: inputs.mountedRepos.join(',') || undefined })
+  }
   const services = discoverGraphServices(inputs)
   const originMappings = services.length
     ? mapServicesToOrigins({
@@ -1353,7 +1400,14 @@ function isManifestBasename(name: string): boolean {
 }
 
 /** Read dependency manifests from the mounted repo tree (bounded; never executes a package manager). */
-export function readRepoManifests(reposDir: string, maxFiles = 60): ManifestFile[] {
+export function readRepoManifests(
+  reposDir: string,
+  maxFiles = 60,
+  staticSnapshot?: StaticWorkspaceSnapshot,
+): ManifestFile[] {
+  if (staticSnapshot) {
+    return staticSnapshot.manifests.slice(0, maxFiles).map(m => ({ name: m.name, content: m.content }))
+  }
   if (!reposDir || !existsSync(reposDir)) return []
   let rootReal: string
   try {
@@ -3331,9 +3385,14 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     } catch { /* skip malformed */ }
   }
 
+  // Build or reuse ONE StaticWorkspaceSnapshot per Phase 0 run so manifests, regex fallback routes,
+  // and ProgramGraph extraction all read from memory without redundant repo filesystem walks.
+  const staticSnapshot = params.staticSnapshot
+    ?? (params.reposDir && existsSync(params.reposDir) ? getOrBuildStaticWorkspaceSnapshot(params.reposDir) : undefined)
+
   // Repo dependency manifests contribute tech tags even when live responses are uninformative
   // (or when Tier 0 sends no requests at all).
-  for (const tag of mergeTechTags(techTagsFromManifests(readRepoManifests(params.reposDir ?? '')))) {
+  for (const tag of mergeTechTags(techTagsFromManifests(readRepoManifests(params.reposDir ?? '', 60, staticSnapshot)))) {
     techFingerprint.add(tag)
   }
 
@@ -3345,12 +3404,16 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   let codeToRuntimeHypotheses: CodeSliceHypothesis[] | undefined
   let codeSlices = emptyCodeSliceSummary(params.maxCodeSlices)
   let probePlan: Phase0ReconResult['probePlan']
-  if (params.reposDir && normalizedOrigins.length > 0) {
+  if ((params.reposDir || staticSnapshot) && normalizedOrigins.length > 0) {
     const primaryOrigin = normalizedOrigins[0]!
-    const regexExtracted = extractStaticFrameworkRoutes(params.reposDir)
+    const regexExtracted = extractStaticFrameworkRoutes(params.reposDir ?? '', staticSnapshot)
     let graphExtraction: RepoProgramGraphExtraction | null = null
     try {
-      graphExtraction = extractRepoProgramGraph({ reposDir: params.reposDir, origins: normalizedOrigins })
+      graphExtraction = extractRepoProgramGraph({
+        reposDir: params.reposDir,
+        origins: normalizedOrigins,
+        ...(staticSnapshot ? { staticSnapshot } : {}),
+      })
     } catch {
       graphExtraction = null
     }
@@ -5177,6 +5240,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     ...(probePlan ? { probePlan } : {}),
     ...(siblingDerivationSuppressed ? { siblingDerivationSuppressed } : {}),
     ...(privilegedSurface.length > 0 ? { privilegedEndpoints: privilegedSurface } : {}),
+    ...(staticSnapshot ? { staticSnapshot } : {}),
   }
 }
 

@@ -11,6 +11,7 @@
  * structural scanner cannot attribute to a handler; those routes are marked
  * with `extraction: 'regex'` and recorded in `warnings`.
  */
+import type { StaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
 
 export type ProgramFramework =
   | 'express'
@@ -1638,14 +1639,44 @@ function buildGraph(
   }
 }
 
-/** Extract the cross-framework Program Graph from a set of repository sources. */
+/** Extract the cross-framework Program Graph from a set of repository sources or a StaticWorkspaceSnapshot. */
 export function extractProgramGraph(input: {
-  files: ReadonlyArray<{ path: string; content: string }>
+  files?: ReadonlyArray<{ path: string; content: string }>
   repo?: string
   maxFileBytes?: number
+  staticSnapshot?: StaticWorkspaceSnapshot
 }): ProgramGraph {
+  if (input.staticSnapshot && (!input.files || input.files.length === 0)) {
+    const snap = input.staticSnapshot
+    const repoPrefix = input.repo && snap.files.some(f => f.startsWith(`${input.repo}/`))
+      ? `${input.repo}/`
+      : ''
+    if (input.maxFileBytes === undefined && !repoPrefix) {
+      if (!input.repo || input.repo === snap.programGraph.repo) {
+        return snap.programGraph
+      }
+      return { ...snap.programGraph, repo: input.repo }
+    }
+    const maxBytes = Math.max(4096, input.maxFileBytes ?? 1024 * 1024)
+    const files: Array<{ path: string; content: string }> = []
+    for (const [path, content] of snap.sourceByPath.entries()) {
+      if (repoPrefix && !path.startsWith(repoPrefix)) continue
+      if (!/\.(?:[cm]?[jt]sx?|py|java|kt|go|rb)$/i.test(path)) continue
+      if (content.length <= maxBytes) files.push({ path, content })
+    }
+    const warnings: string[] = []
+    const extractions: Extraction[] = []
+    const globalMiddleware: string[] = []
+    for (const file of files) {
+      const extraction = extractFile(file.path, file.content)
+      extractions.push(extraction)
+      globalMiddleware.push(...extraction.globalMiddleware)
+      warnings.push(...extraction.warnings)
+    }
+    return buildGraph(input.repo, files, extractions, [...new Set(globalMiddleware)], warnings)
+  }
   const maxBytes = Math.max(4096, input.maxFileBytes ?? 1024 * 1024)
-  const files = input.files.filter(file => file.content.length <= maxBytes)
+  const files = (input.files ?? []).filter(file => file.content.length <= maxBytes)
   const warnings: string[] = []
   const extractions: Extraction[] = []
   const globalMiddleware: string[] = []
