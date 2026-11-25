@@ -248,5 +248,7 @@ export interface LabState {
   audit: AuditEvent[]
   listeners: Array<(event: AuditEvent) => void>
   seq: number
+  /** Per-instance secret the edge attaches when forwarding to api; never leaves the process. */
+  edgeBridgeToken: string
   emit(kind: string, detail?: Detail, actorPersona?: PersonaKey): AuditEvent
 }
