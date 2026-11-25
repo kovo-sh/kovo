@@ -46,7 +46,7 @@ import {
   type CapabilitySealSelectorKind,
 } from './egress-sanitizer.ts'
 import { globalKillSwitch, KillSwitchTrippedError, type GlobalKillSwitch } from './kill-switch.ts'
-import { evaluateScopeRequest } from './scope-policy.ts'
+import { defaultRequestAdmissionEngine, type RequestAdmissionEngine } from './request-admission.ts'
 import {
   DerivedCapabilityVault,
   awaitAsyncConvergence,
@@ -225,6 +225,8 @@ export interface VerifyRpcSessionOptions {
   compositeVerifyOptions?: Omit<CompositeVerifyOptions, 'signingKey'>
   /** Maximum `capability.seal` attempts allowed per exchangeId (default 12, C-3 anti-oracle cap). */
   maxSealsPerExchange?: number
+  /** Canonical request admission engine (defaults to the broker's engine). */
+  admissionEngine?: RequestAdmissionEngine
 }
 
 interface RpcPayload {
@@ -282,6 +284,7 @@ export class VerifyRpcServer {
   readonly transcript: TranscriptStore
   readonly capabilityVault: DerivedCapabilityVault
   private readonly options: VerifyRpcSessionOptions
+  private readonly admissionEngine: RequestAdmissionEngine
   private readonly compositeSigningKey: string
   private readonly egress: EgressSanitizer
   private readonly kernelSanitizer: EgressSanitizer
@@ -309,6 +312,8 @@ export class VerifyRpcServer {
 
   constructor(options: VerifyRpcSessionOptions) {
     this.options = options
+    this.admissionEngine = options.admissionEngine
+      ?? (typeof options.broker?.getAdmissionEngine === 'function' ? options.broker.getAdmissionEngine() : defaultRequestAdmissionEngine)
     this.nonce = options.nonce ?? randomBytes(12).toString('hex')
     this.transcript = new TranscriptStore()
     this.compositeSigningKey = randomBytes(32).toString('hex')
@@ -539,12 +544,9 @@ export class VerifyRpcServer {
       ? raw
       : this.options.targetOrigins?.[0]
     if (!requested) throw new Error('No target origin is configured for this verification session.')
-    let url: URL
-    try { url = new URL(requested) } catch { throw new Error('Target origin is malformed.') }
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('Destination protocol is outside the current assignment scope.')
-    const origin = url.origin
-    if (!this.options.grant.canRead(origin)) throw new Error('Destination is outside the current assignment scope.')
-    return { origin, url }
+    const decision = this.admissionEngine.admitOrigin(requested, this.options.grant)
+    if (!decision.allowed || !decision.normalizedOrigin || !decision.parsedUrl) throw new Error(decision.reason)
+    return { origin: decision.normalizedOrigin, url: decision.parsedUrl }
   }
 
   private parseHttpArgs(args: Record<string, unknown>): { brokerRequest: BrokerHttpRequest; requestMeta: VerifyTranscriptRequest } {
@@ -591,7 +593,9 @@ export class VerifyRpcServer {
     const persona = rawPersona && !isAnonSentinel ? rawPersona : undefined
     const session = typeof args.session === 'string' ? args.session : undefined
     const role = typeof args.sessionGroupRole === 'string' ? args.sessionGroupRole : (typeof args.arm === 'string' ? args.arm : undefined)
-    if (role !== undefined && !['setup', 'control', 'probe', 'cleanup'].includes(role)) throw new Error('Invalid session group role.')
+    if (role !== undefined && !['setup', 'control', 'probe', 'cleanup'].includes(role)) {
+      throw new Error(`Invalid session group role "${role}"; expected one of: setup|control|probe|cleanup.`)
+    }
     const brokerRequest: BrokerHttpRequest = {
       origin,
       method: method as BrokerHttpRequest['method'],
@@ -776,7 +780,7 @@ export class VerifyRpcServer {
       recordAtt(injected.attestation)
       if (injected.request.url !== baseUrl) {
         const parsedUrl = new URL(injected.request.url)
-        if (!this.options.grant.canRead(parsedUrl.origin)) throw new Error('Derived capability destination is outside the current assignment scope.')
+        if (!this.admissionEngine.admitOrigin(parsedUrl.origin, this.options.grant).allowed) throw new Error('Derived capability destination is outside the current assignment scope.')
         nextOrigin = parsedUrl.origin
         nextPathAndQuery = parsedUrl.pathname + parsedUrl.search
       }
@@ -808,7 +812,7 @@ export class VerifyRpcServer {
           handle: trimmedPath, target: 'url', runId: this.capabilityVault.runId, request: { url: urlBase, method: baseReq.method, headers: {} },
         })
         const parsedUrl = new URL(injected.request.url)
-        if (!this.options.grant.canRead(parsedUrl.origin)) throw new Error('Derived capability destination is outside the current assignment scope.')
+        if (!this.admissionEngine.admitOrigin(parsedUrl.origin, this.options.grant).allowed) throw new Error('Derived capability destination is outside the current assignment scope.')
         nextOrigin = parsedUrl.origin
         nextPathAndQuery = parsedUrl.pathname + parsedUrl.search
         recordAtt(injected.attestation)
@@ -1196,25 +1200,23 @@ export class VerifyRpcServer {
     }
   }
 
-  /** HTTP/2 stays on the same grant: kill switch, scope, persona injection, method approval. */
+  private resolvePersonaHeaders(grant: Grant, personaHandle: string, origin: string): Record<string, string> {
+    const persona = grant.personas?.get(personaHandle)
+    if (!persona) throw new Error(`Persona "${personaHandle}" is not approved for this run.`)
+    const injected = buildPersonaHeader(persona, origin)
+    if (!injected) throw new Error(`Persona "${personaHandle}" does not have an active authenticated session.`)
+    return injected
+  }
+
+  /** HTTP/2 stays on the same grant & canonical RequestAdmissionEngine: kill switch, scope, tier, denylist, approval, persona injection. */
   private async executeHttp2(req: BrokerHttpRequest, signal: AbortSignal, grant: Grant = this.options.grant): Promise<{ status: number; headers: Record<string, string>; rawHeaders: Record<string, string>; body: string; durationMs: number }> {
     const ks = (this.options.broker as unknown as { options?: { killSwitch?: GlobalKillSwitch } })?.options?.killSwitch ?? globalKillSwitch
     const tenantId = grant.tenantId ?? null
     ks.assertAllowed(tenantId)
-    const localLab = Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
-    let url: URL, originUrl: URL
-    try { originUrl = new URL(req.origin); url = new URL(req.pathAndQuery, originUrl) } catch { throw new Error('Request origin or path is malformed.') }
-    const protocolOk = url.protocol === 'https:' || (localLab && url.protocol === 'http:')
-    if (!protocolOk || url.username || url.password || url.hash) throw new Error('HTTP/2 destination is outside the current assignment scope.')
-    if (url.origin !== originUrl.origin || !grant.canRead(url.origin)) throw new Error('Destination is outside the current assignment scope.')
-    if (grant.scopePolicy) {
-      const decision = evaluateScopeRequest(grant.scopePolicy, { origin: url.origin, method: req.method, pathAndQuery: req.pathAndQuery, body: req.body ?? null, headers: req.headers })
-      if (!decision.allowed) throw new Error(decision.reason)
-    }
-    if (!localLab && url.port && url.port !== '443') {
-      const numeric = Number(url.port)
-      if (!Number.isInteger(numeric) || !(grant.allowedPorts ?? []).includes(numeric)) throw new Error('HTTP/2 destination port is not approved for this run.')
-    }
+    const decision = this.admissionEngine.admit({ kind: 'http2', origin: req.origin, method: req.method, pathAndQuery: req.pathAndQuery, headers: req.headers, body: req.body, personaHandle: req.persona ?? req.personaHandle ?? null, scopeHook: req.scopeHook ?? null, stripPseudoHeaders: true, runId: req.runId, assignmentId: req.assignmentId }, grant)
+    if (!decision.allowed || !decision.parsedUrl) throw new Error(decision.reason)
+    const url = decision.parsedUrl
+    const localLab = Boolean(decision.localLab)
     const addresses = await lookup(url.hostname, { all: true, order: 'verbatim' })
     if (addresses.length === 0) throw new Error('Target hostname did not resolve.')
     for (const address of addresses) {
@@ -1222,27 +1224,13 @@ export class VerifyRpcServer {
       if (range === 'linkLocal') throw new Error('Link-local/metadata destinations are never permitted.')
       if (!localLab && range !== 'unicast') throw new Error('Target hostname did not resolve exclusively to public addresses.')
     }
-    if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS') {
-      const tier = grant.tier ?? 1
-      if (tier < 2) throw new Error('HTTP/2 state changes require Tier 2 or higher.')
-      const approved = grant.isStateChangeApproved?.(url.origin, req.method, req.pathAndQuery, { personaHandle: req.persona ?? req.personaHandle ?? null, body: req.body ?? null })
-      if (!approved) throw new Error('Tier 3 operator approval required for this HTTP/2 state change.')
-    }
-    const forwarded = new Set(['authorization', 'proxy-authorization', 'cookie', 'host', 'content-length', 'transfer-encoding', 'x-kovo-trace-id'])
     const headers: Record<string, string> = {}
     for (const [key, value] of Object.entries(req.headers ?? {})) {
-      if (key.trimStart().startsWith(':')) continue
-      const lower = key.toLowerCase()
-      if (forwarded.has(lower)) throw new Error(`Header "${key}" cannot be set directly; reference an approved persona handle instead.`)
-      headers[lower] = value
+      if (!key.trimStart().startsWith(':')) headers[key.toLowerCase()] = value
     }
     const personaHandle = req.persona ?? req.personaHandle
     if (personaHandle) {
-      const persona = grant.personas?.get(personaHandle)
-      if (!persona) throw new Error(`Persona "${personaHandle}" is not approved for this run.`)
-      const injected = buildPersonaHeader(persona, url.origin)
-      if (!injected) throw new Error(`Persona "${personaHandle}" does not have an active authenticated session.`)
-      for (const [k, v] of Object.entries(injected)) headers[k.toLowerCase()] = v
+      for (const [k, v] of Object.entries(this.resolvePersonaHeaders(grant, personaHandle, url.origin))) headers[k.toLowerCase()] = v
     }
     const ksBound = ks.bindSignal(signal, tenantId)
     const started = Date.now()
@@ -1291,81 +1279,46 @@ export class VerifyRpcServer {
   }
 
   private async handleBrowser(args: Record<string, unknown>, nonce: string): Promise<unknown> {
-    const { origin } = this.scopeOrigin(args.origin)
+    const requestedOrigin = typeof args.origin === 'string' && args.origin.length > 0 ? args.origin : this.options.targetOrigins?.[0]
+    if (!requestedOrigin) throw new Error('No target origin is configured for this verification session.')
     const rawPath = typeof args.path === 'string' ? args.path : '/'
-    const url = new URL(rawPath, origin)
-    if (url.origin !== origin || !this.options.grant.canRead(url.origin)) throw new Error('Destination is outside the current assignment scope.')
+    const personaHandle = typeof args.persona === 'string' ? args.persona : typeof args.as === 'string' ? args.as : null
+    const decision = this.admissionEngine.admit({ kind: 'browser', origin: requestedOrigin, method: 'GET', pathAndQuery: rawPath, personaHandle, surface: 'browser', checkCallerHeaders: false, runId: this.options.runId, assignmentId: this.options.assignmentId }, this.options.grant)
+    if (!decision.allowed || !decision.normalizedOrigin || !decision.parsedUrl) throw new Error(decision.reason)
+    const origin = decision.normalizedOrigin
+    const url = decision.parsedUrl
     const driver = this.options.browser
     if (!driver) throw new Error('Browser verification is not available for this run.')
-    const personaHandle = typeof args.persona === 'string' ? args.persona : typeof args.as === 'string' ? args.as : null
-    const headers: Record<string, string> = {}
-    if (personaHandle) {
-      const persona = this.options.grant.personas?.get(personaHandle)
-      if (!persona) throw new Error(`Persona "${personaHandle}" is not approved for this run.`)
-      const injected = buildPersonaHeader(persona, url.origin)
-      if (!injected) throw new Error(`Persona "${personaHandle}" does not have an active authenticated session.`)
-      Object.assign(headers, injected)
-    }
+    const headers: Record<string, string> = personaHandle ? { ...this.resolvePersonaHeaders(this.options.grant, personaHandle, url.origin) } : {}
     const started = Date.now()
+    const recordedHeaders = Object.fromEntries(Object.keys(headers).map(key => [key, '[injected]']))
+    const emptySha = createHash('sha256').update('').digest('hex')
     try {
+      const timeoutMs = this.options.callTimeoutMs ?? 30_000
       const result = await driver.open({
-        url: url.href,
-        origin,
-        personaHandle,
-        headers,
+        url: url.href, origin, personaHandle, headers, timeoutMs,
         ...(typeof args.waitForSelector === 'string' ? { waitForSelector: args.waitForSelector } : {}),
-        timeoutMs: this.options.callTimeoutMs ?? 30_000,
-      }, AbortSignal.timeout(this.options.callTimeoutMs ?? 30_000))
+      }, AbortSignal.timeout(timeoutMs))
       const kernelHtml = this.scrubKernel(result.html)
-      // Never persist injected persona headers: the transcript is readable by the script.
-      const recordedHeaders = Object.fromEntries(Object.keys(headers).map(key => [key, '[injected]']))
+      const htmlSha = createHash('sha256').update(kernelHtml).digest('hex')
       const record = this.transcript.record({
-        op: 'browser',
-        startedAt: started,
-        durationMs: Date.now() - started,
-        request: {
-          origin,
-          method: 'GET',
-          pathAndQuery: this.scrub(rawPath),
-          headers: recordedHeaders,
-          bodyBytes: 0,
-          bodySha256: createHash('sha256').update('').digest('hex'),
-          personaHandle,
-          nonce: this.nonce,
-        },
-        response: {
-          status: result.status,
-          headers: {},
-          bodyBytes: Buffer.byteLength(kernelHtml),
-          bodySha256: createHash('sha256').update(kernelHtml).digest('hex'),
-          mediaType: 'text/html',
-        },
-        artifact: {
-          kind: 'browser',
-          ...(result.executedSentinels?.length ? { executedSentinels: this.kernelSanitizer.sanitizeValue(result.executedSentinels, 'storage_log') } : {}),
-          domHtmlSha256: createHash('sha256').update(kernelHtml).digest('hex'),
-        },
+        op: 'browser', startedAt: started, durationMs: Date.now() - started,
+        request: { origin, method: 'GET', pathAndQuery: this.scrub(rawPath), headers: recordedHeaders, bodyBytes: 0, bodySha256: emptySha, personaHandle, nonce: this.nonce },
+        response: { status: result.status, headers: {}, bodyBytes: Buffer.byteLength(kernelHtml), bodySha256: htmlSha, mediaType: 'text/html' },
+        artifact: { kind: 'browser', ...(result.executedSentinels?.length ? { executedSentinels: this.kernelSanitizer.sanitizeValue(result.executedSentinels, 'storage_log') } : {}), domHtmlSha256: htmlSha },
         body: kernelHtml,
       })
       this.rawBodies.set(record.exchangeId, result.html)
-      const prov = this.getOrCreateProvenance(record.exchangeId, started)
-      prov.timestampMs = started
+      this.getOrCreateProvenance(record.exchangeId, started).timestampMs = started
       return this.egress.sanitizeBrowserResult({
-        exchangeId: record.exchangeId,
-        status: result.status,
-        url: result.url,
-        html: result.html.slice(0, 512 * 1024),
-        title: result.title,
-        executedSentinels: result.executedSentinels ?? [],
-        durationMs: record.durationMs,
+        exchangeId: record.exchangeId, status: result.status, url: result.url, html: result.html.slice(0, 512 * 1024),
+        title: result.title, executedSentinels: result.executedSentinels ?? [], durationMs: record.durationMs,
       })
     } catch (error) {
       const msg = this.scrub(error instanceof Error ? error.message : 'Browser verification failed.')
       const record = this.transcript.record({
-        op: 'browser',
-        startedAt: started,
-        durationMs: Date.now() - started,
-        request: { origin, method: 'GET', pathAndQuery: this.scrub(rawPath), headers: Object.fromEntries(Object.keys(headers).map(key => [key, '[injected]'])), bodyBytes: 0, bodySha256: createHash('sha256').update('').digest('hex'), personaHandle, nonce },
+        op: 'browser', startedAt: started, durationMs: Date.now() - started,
+        request: { origin, method: 'GET', pathAndQuery: this.scrub(rawPath), headers: recordedHeaders, bodyBytes: 0, bodySha256: emptySha, personaHandle, nonce },
         error: msg,
       })
       throw new Error(`${record.exchangeId}: ${msg}`)
