@@ -1727,12 +1727,20 @@ export class RequestBroker {
   private readonly seenGcbTokens = new Map<string, { probeClass: string; verifyUsed: boolean }>()
   private readonly transportConfig: TransportConfig
   private readonly httpTransport: Transport
-  private latestScopeRevision = 0
+  /** Per-run scope revision floor so bumping Run A's scope never invalidates Run B. */
+  private readonly latestScopeRevisionByRun = new Map<string, number>()
+  private reauthHandler?: BrokerOptions['reauth']
 
   constructor(options: BrokerOptions = {}) {
     this.options = options
+    this.reauthHandler = options.reauth
     this.transportConfig = resolveTransportConfig(process.env, options.transportConfig)
     this.httpTransport = options.transport ?? createHttpTransport(this.transportConfig, defaultTransport)
+  }
+
+  /** Attach or replace the broker's persona 401 re-authentication callback. */
+  setReauth(reauth: BrokerOptions['reauth']): void {
+    this.reauthHandler = reauth
   }
 
   private getKillSwitch(): GlobalKillSwitch {
@@ -1884,22 +1892,53 @@ export class RequestBroker {
     this.redactedSecrets.set(value, { placeholder: `[redacted:${label}]`, value })
   }
 
-  revokeOrigin(origin: string, scopeRevision?: number) {
+  private resolveScopeRunKey(
+    req?: Pick<BrokerHttpRequest, 'runId'>,
+    grant?: Pick<Grant, 'scopePolicy'>,
+  ): string {
+    return req?.runId ?? grant?.scopePolicy?.runId ?? 'default'
+  }
+
+  revokeOrigin(origin: string, scopeRevision?: number, runId?: string) {
     let normalized: string
     try {
       normalized = new URL(origin).origin
     } catch {
       normalized = origin
     }
-    if (scopeRevision !== undefined && scopeRevision > this.latestScopeRevision) {
-      this.latestScopeRevision = scopeRevision
+    if (scopeRevision !== undefined) {
+      const key = runId ?? 'default'
+      const prev = this.latestScopeRevisionByRun.get(key) ?? 0
+      if (scopeRevision > prev) {
+        this.latestScopeRevisionByRun.set(key, scopeRevision)
+      }
     }
-    this.purgeSessionJars(undefined, normalized)
+    this.purgeSessionJars(runId, normalized)
   }
 
-  revokeScope(scopeRevision: number) {
-    if (scopeRevision > this.latestScopeRevision) {
-      this.latestScopeRevision = scopeRevision
+  revokeScope(scopeRevision: number): void
+  revokeScope(runId: string, scopeRevision: number): void
+  revokeScope(runIdOrRevision: string | number, maybeRevision?: number): void {
+    if (typeof runIdOrRevision === 'string') {
+      const runId = runIdOrRevision
+      const scopeRevision = maybeRevision ?? 0
+      const prev = this.latestScopeRevisionByRun.get(runId) ?? 0
+      if (scopeRevision > prev) {
+        this.latestScopeRevisionByRun.set(runId, scopeRevision)
+      }
+      for (const [key, jar] of this.sessionJars.entries()) {
+        if (jar.runId === runId && jar.scopeRevision < scopeRevision) {
+          this.sessionJars.delete(key)
+        }
+      }
+      return
+    }
+    // Legacy single-arg signature `revokeScope(scopeRevision)`: updates the `'default'` run
+    // floor and evicts stale jars without locking out unrelated named runs.
+    const scopeRevision = runIdOrRevision
+    const prev = this.latestScopeRevisionByRun.get('default') ?? 0
+    if (scopeRevision > prev) {
+      this.latestScopeRevisionByRun.set('default', scopeRevision)
     }
     for (const [key, jar] of this.sessionJars.entries()) {
       if (jar.scopeRevision < scopeRevision) {
@@ -1946,12 +1985,13 @@ export class RequestBroker {
     // A jar exists only for requests that carry or need session state. Creating one eagerly for
     // every persona read would evict the CSRF/setup jars the probe families rely on.
     if (req.session === undefined && (persona === undefined || req.csrfBind === undefined)) return undefined
-    const runId = req.runId ?? 'default'
+    const runId = this.resolveScopeRunKey(req, grant)
     const assignmentId = req.assignmentId ?? 'default'
     const role = req.sessionGroupRole ?? 'default'
     const assignmentKey = `${runId}\0${assignmentId}`
     const jarKey = sessionJarKey(assignmentKey, role, persona, req.session)
-    const effectiveRevision = Math.max(this.latestScopeRevision, req.scopeRevision ?? grant.scopeRevision ?? 0)
+    const latestForRun = this.latestScopeRevisionByRun.get(runId) ?? 0
+    const effectiveRevision = Math.max(latestForRun, req.scopeRevision ?? grant.scopeRevision ?? 0)
 
     const existing = this.sessionJars.get(jarKey)
     if (existing) {
@@ -2588,13 +2628,15 @@ export class RequestBroker {
     if (req.session !== undefined && !sessionHandleRegex.test(req.session)) {
       throw new BrokerDenied('Invalid session handle; expected /^[a-z0-9_-]{1,32}$/.')
     }
+    const scopeRunId = this.resolveScopeRunKey(req, grant)
     const reqScopeRev = req.scopeRevision ?? grant.scopeRevision
     if (reqScopeRev !== undefined) {
-      if (reqScopeRev < this.latestScopeRevision) {
+      const latestForRun = this.latestScopeRevisionByRun.get(scopeRunId) ?? 0
+      if (reqScopeRev < latestForRun) {
         throw new BrokerDenied('Request scopeRevision is stale relative to the current scope revision.')
       }
-      if (reqScopeRev > this.latestScopeRevision) {
-        this.revokeScope(reqScopeRev)
+      if (reqScopeRev > latestForRun) {
+        this.revokeScope(scopeRunId, reqScopeRev)
       }
     }
 
@@ -2618,7 +2660,7 @@ export class RequestBroker {
       throw new BrokerDenied('Request path escaped the requested origin.')
     }
     if (!safeUrl(url, true, localLab, grant.allowedPorts) || !this.originInGrantScope(grant, initialOrigin)) {
-      this.purgeSessionJars(undefined, initialOrigin)
+      this.purgeSessionJars(req.runId ?? grant.scopePolicy?.runId ?? undefined, initialOrigin)
       grant.audit('denied', initialOrigin)
       throw new BrokerDenied('Destination is outside the current assignment scope.')
     }
@@ -2911,7 +2953,7 @@ export class RequestBroker {
     if (runId && store && typeof store.run === 'function') {
       try {
         const liveRun = store.run(runId)
-        if (!effectivePolicy && liveRun.approvalPolicy) effectivePolicy = liveRun.approvalPolicy
+        if (liveRun.approvalPolicy) effectivePolicy = liveRun.approvalPolicy
         if (liveRun.environmentMode) liveEnvironmentMode = liveRun.environmentMode
         if (typeof store.eventsAfter === 'function') {
           explicitEnvironmentMode = store.eventsAfter(runId, 0, 500).some(e => e.kind === 'scope.environment_mode')
@@ -3242,7 +3284,7 @@ export class RequestBroker {
       ks.assertAllowed(grant.tenantId ?? null)
       deadline.throwIfAborted()
       if (!safeUrl(url, true, localLab, grant.allowedPorts) || !this.originInGrantScope(grant, url.origin)) {
-        this.purgeSessionJars(undefined, url.origin)
+        this.purgeSessionJars(req.runId ?? grant.scopePolicy?.runId ?? undefined, url.origin)
         deny('Destination is outside the current assignment scope.')
       }
     }
@@ -3546,14 +3588,15 @@ export class RequestBroker {
         personaHandle &&
         !req.authMutation &&
         !options.reauthAttempted &&
-        this.options.reauth &&
+        this.reauthHandler &&
         !deadline.aborted
       ) {
-        const refreshed = await this.options.reauth(personaHandle, url.origin).catch(() => false)
+        const refreshed = await this.reauthHandler(personaHandle, url.origin).catch(() => false)
         if (refreshed !== false) {
           const refreshedPersona = grant.personas?.get(personaHandle)
           const rebuilt = refreshedPersona ? buildPersonaHeader(refreshedPersona, initialOrigin) : null
-          return this.executePreparedHttp(prepared, req, grant, signal, {
+          const refreshedPrepared = { ...prepared, secrets: collectSecrets(req, grant) }
+          return this.executePreparedHttp(refreshedPrepared, req, grant, signal, {
             ...options,
             reauthAttempted: true,
             ...(rebuilt ? { refreshedPersonaHeaders: rebuilt } : {}),
