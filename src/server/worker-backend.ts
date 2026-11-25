@@ -504,12 +504,98 @@ function readOneShotRef(dir: string, rawRef: unknown): Record<string, unknown> {
 }
 
 const verifySdkFiles = ['kovo_verify.ts'] as const
+
+export interface PreparedReadableMount {
+  /** Host directory guaranteed readable/traversable by container UID 10001 (`0o755` dirs / `0o644` files). */
+  mountDir: string
+  /** True when Kovo Hunter staged a clean container-readable copy in `tmpdir()` instead of binding directly. */
+  staged: boolean
+  /** Remove any temporary staged directory (idempotent no-op when `staged === false`). */
+  cleanup(): void
+}
+
+function resolveVerifySdkDir(sdkDir?: string): string {
+  return sdkDir ?? process.env.KOVO_VERIFY_SDK_DIR ?? join(dirname(fileURLToPath(import.meta.url)), '../../worker/kovo_verify')
+}
+
+/**
+ * Validate and prepare the `kovo_verify` SDK directory for container UID `10001` readability.
+ * Under restrictive host `umask 0077` (e.g. `0o700` dir / `0o600` `kovo_verify.ts`), stages a
+ * clean copy in `tmpdir()` with explicit `0o755` directory and `0o644` file permissions without
+ * modifying host file modes, and tracks it for process-exit cleanup.
+ */
+export function prepareVerifySdkMount(sdkDir?: string): PreparedReadableMount {
+  const dir = resolveVerifySdkDir(sdkDir)
+  if (/[\0,\r\n]/.test(dir)) {
+    throw new Error('Invalid kovo_verify SDK path.')
+  }
+  if (!existsSync(dir)) {
+    throw new Error('kovo_verify SDK files are unavailable on this host.')
+  }
+  const rootStat = statSync(dir)
+  if (!rootStat.isDirectory()) {
+    throw new Error('kovo_verify SDK path must be a directory.')
+  }
+  const resolved = realpathSync(dir)
+  if (/[\0,\r\n]/.test(resolved)) {
+    throw new Error('Invalid resolved kovo_verify SDK path.')
+  }
+
+  const available: Array<{ name: string; fullPath: string; mode: number }> = []
+  let needsStaging = (rootStat.mode & 0o005) !== 0o005
+  for (const name of verifySdkFiles) {
+    const fullPath = join(resolved, name)
+    if (!existsSync(fullPath)) continue
+    const st = statSync(fullPath)
+    if (!st.isFile()) continue
+    if (st.size > 256 * 1024) throw new Error('kovo_verify SDK file exceeds the size limit.')
+    if ((st.mode & 0o004) !== 0o004) needsStaging = true
+    available.push({ name, fullPath, mode: st.mode })
+  }
+  if (available.length === 0) {
+    throw new Error('kovo_verify SDK files are unavailable on this host.')
+  }
+  if (!needsStaging) {
+    return {
+      mountDir: resolved,
+      staged: false,
+      cleanup() { /* direct host dir: never remove caller's directory */ },
+    }
+  }
+
+  const rawStageDir = mkdtempSync(join(tmpdir(), 'kovo-sdk-'))
+  chmodSync(rawStageDir, 0o755)
+  const mountDir = realpathSync(rawStageDir)
+  try {
+    for (const file of available) {
+      const dstPath = join(mountDir, file.name)
+      copyFileSync(file.fullPath, dstPath)
+      chmodSync(dstPath, 0o644)
+    }
+  } catch (error) {
+    try { rmSync(mountDir, { recursive: true, force: true }) } catch { /* ignore */ }
+    throw error
+  }
+  trackLiveStagedRepoDir(mountDir)
+  let cleaned = false
+  return {
+    mountDir,
+    staged: true,
+    cleanup() {
+      if (cleaned) return
+      cleaned = true
+      liveStagedRepoDirs.delete(mountDir)
+      try { rmSync(mountDir, { recursive: true, force: true }) } catch { /* best-effort */ }
+    },
+  }
+}
+
 /**
  * The worker image predates the SDK, so the host stages it per call. This keeps the container
  * filesystem immutable and makes the SDK version auditable alongside the verifier that ran it.
  */
-export function readVerifySdkFiles(): Array<{ name: string; content: string }> {
-  const dir = process.env.KOVO_VERIFY_SDK_DIR ?? join(dirname(fileURLToPath(import.meta.url)), '../../worker/kovo_verify')
+export function readVerifySdkFiles(sdkDir?: string): Array<{ name: string; content: string }> {
+  const dir = resolveVerifySdkDir(sdkDir)
   const files: Array<{ name: string; content: string }> = []
   for (const name of verifySdkFiles) {
     const path = join(dir, name)
@@ -884,18 +970,48 @@ function resolveReposMountArgs(reposDir?: string): string[] {
 }
 
 /**
- * Mount the per-session verification RPC directory read-only at `/kovo-rpc`. The socket is
- * the only egress a `--network none` verification script needs; the rest of the container stays
- * read-only and the script never receives a persona credential (Layer 1 injects it).
+ * Ensure a host verification RPC mount directory and its expected IPC artifacts (`token`,
+ * `context.json`, `verify.sock`) are traversable/accessible by non-root container UID `10001`
+ * even when created under a restrictive host `umask 0077`.
  */
-function resolveRpcMountArgs(rpcDir?: string): string[] {
-  if (!rpcDir) return []
+export function ensureRpcMountReadable(rpcDir: string): string {
   if (/[\0,\r\n]/.test(rpcDir)) throw new Error('Invalid verification RPC mount path.')
   if (!existsSync(rpcDir)) throw new Error('Verification RPC mount path does not exist.')
   const st = statSync(rpcDir)
   if (!st.isDirectory()) throw new Error('Verification RPC mount path must be a directory.')
   const resolved = realpathSync(rpcDir)
   if (/[\0,\r\n]/.test(resolved)) throw new Error('Invalid resolved verification RPC mount path.')
+
+  // Non-root UID 10001 needs o+x (e.g. 0o711 or 0o755) to traverse `/kovo-rpc`.
+  if ((st.mode & 0o001) !== 0o001) {
+    chmodSync(resolved, (st.mode & 0o777) | 0o011)
+  }
+  for (const name of [VERIFY_RPC_TOKEN_NAME, VERIFY_RPC_CONTEXT_NAME]) {
+    const filePath = join(resolved, name)
+    if (!existsSync(filePath)) continue
+    const fileStat = lstatSync(filePath)
+    if (fileStat.isFile() && (fileStat.mode & 0o004) !== 0o004) {
+      chmodSync(filePath, (fileStat.mode & 0o777) | 0o044)
+    }
+  }
+  const socketPath = join(resolved, VERIFY_RPC_SOCKET_NAME)
+  if (existsSync(socketPath)) {
+    const sockStat = lstatSync(socketPath)
+    if ((sockStat.isSocket() || sockStat.isFile()) && (sockStat.mode & 0o006) !== 0o006) {
+      chmodSync(socketPath, (sockStat.mode & 0o777) | 0o066)
+    }
+  }
+  return resolved
+}
+
+/**
+ * Mount the per-session verification RPC directory read-only at `/kovo-rpc`. The socket is
+ * the only egress a `--network none` verification script needs; the rest of the container stays
+ * read-only and the script never receives a persona credential (Layer 1 injects it).
+ */
+function resolveRpcMountArgs(rpcDir?: string): string[] {
+  if (!rpcDir) return []
+  const resolved = ensureRpcMountReadable(rpcDir)
   return [
     '--mount', `type=bind,source=${resolved},target=${VERIFY_RPC_CONTAINER_DIR},readonly`,
     '--env', `${VERIFY_RPC_SOCKET_ENV}=${VERIFY_RPC_CONTAINER_DIR}/${VERIFY_RPC_SOCKET_NAME}`,
@@ -1030,6 +1146,7 @@ export class WarmWorkerPool {
   private readonly owner?: string
   private readonly options: WorkerSessionOptions
   private readonly signature: string
+  private preparedRepos?: PreparedReposMount | null
   private capacity: number
   private readonly idle: string[] = []
   private readonly inflight = new Set<Promise<void>>()
@@ -1129,6 +1246,14 @@ export class WarmWorkerPool {
     }
   }
 
+  private effectiveCreateOptions(): WorkerSessionOptions {
+    if (!this.options.reposDir) return this.options
+    if (this.preparedRepos === undefined) {
+      this.preparedRepos = prepareReposMount(this.options.reposDir)
+    }
+    return this.preparedRepos ? { ...this.options, reposDir: this.preparedRepos.mountDir } : this.options
+  }
+
   private async create(): Promise<void> {
     const name = 'kovo-' + randomUUID()
     try {
@@ -1141,7 +1266,7 @@ export class WarmWorkerPool {
         ...(this.owner ? { owner: this.owner } : {}),
         cell: this.cell,
         warm: true,
-        options: this.options,
+        options: this.effectiveCreateOptions(),
       }), AbortSignal.timeout(15_000))
       if (this.closed) {
         await this.docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
@@ -1237,6 +1362,9 @@ export class WarmWorkerPool {
     this.closed = true
     const idle = this.idle.splice(0)
     await Promise.all(idle.map(name => this.removeIdle(name)))
+    const staged = this.preparedRepos
+    this.preparedRepos = undefined
+    staged?.cleanup()
   }
 }
 
