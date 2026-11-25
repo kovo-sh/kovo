@@ -51,16 +51,96 @@ export function roleRank(role: string | null | undefined): number | null {
   return normalized === null ? null : ROLE_RANK[normalized]
 }
 
+export interface RoleMembership {
+  role: RoleName | null
+  tenant: string | null
+}
+
+const AT_MEMBERSHIP_RE = /^([a-z0-9_.-]{1,40})@([a-z0-9_.:-]{1,64})$/i
+const COLON_MEMBERSHIP_RE = /^([a-z0-9_.-]{1,40}):([a-z0-9_.-]{1,64})$/i
+const MEMBERSHIPS_ATTR_RE = /\bmemberships\s*=\s*([^\];)]+)/i
+const EMAIL_LIKE_PART_RE = /^[^\s@]{1,64}@[^\s@]{1,128}\.[a-z]{2,24}$/i
+
 /**
- * Persona labels carry the app role and tenant, e.g. `owner (acme)`, `viewer (acme)` or a bare
- * `admin`. The verifier never guesses a role from a path it has not seen a role label for.
+ * Parse one or more `(role, tenant)` memberships from a persona's role label.
+ * Supports:
+ *  - `role (tenant)` (e.g. `owner (acme)`, `viewer (acme)`)
+ *  - `role [..; memberships=role:tenant,role:tenant] (tenant)`
+ *  - `role@tenant` and comma/semicolon-separated multi-tenant lists (e.g. `admin@org_a, viewer@org_b`)
+ *  - bare role (`admin`) or bare tenant (`acme`)
+ * Raw email addresses whose local-part is not a role word are never misparsed as a tenant scope.
+ */
+export function parseRoleMemberships(label: string | null | undefined): RoleMembership[] {
+  if (!label) return []
+  const out: RoleMembership[] = []
+  const seen = new Set<string>()
+  const push = (role: RoleName | null, tenant: string | null): void => {
+    if (role === null && tenant === null) return
+    const key = `${role ?? ''}|${tenant ?? ''}`
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push({ role, tenant })
+  }
+
+  // Extract explicit structured bracket metadata (`[...; memberships=admin:org_a,viewer:org_b]`)
+  // before splitting the outer label on commas/semicolons.
+  const membershipAttr = MEMBERSHIPS_ATTR_RE.exec(label)
+  const stripped = label.replace(/\[[^\]]*\]/g, ' ').trim()
+  const parts = stripped.split(/[,;]+/).map(part => part.trim()).filter(Boolean)
+  for (const part of parts) {
+    const atMatch = AT_MEMBERSHIP_RE.exec(part)
+    if (atMatch) {
+      const lhs = atMatch[1]!
+      const rhs = atMatch[2]!
+      const lhsRole = normalizeRole(lhs)
+      if (EMAIL_LIKE_PART_RE.test(part) && lhsRole === null) {
+        continue
+      }
+      push(lhsRole, rhs.toLowerCase())
+      continue
+    }
+    const role = normalizeRole(part)
+    const parenthetical = /\(([^)]{1,64})\)/.exec(part)?.[1]?.trim().toLowerCase() ?? null
+    const tenant = parenthetical || (/^[a-z0-9_.:-]{1,64}$/i.test(part) && role === null ? part.toLowerCase() : null)
+    push(role, tenant)
+  }
+
+  if (membershipAttr?.[1]) {
+    for (const token of membershipAttr[1].split(',').map(item => item.trim()).filter(Boolean)) {
+      const atMatch = AT_MEMBERSHIP_RE.exec(token)
+      if (atMatch) {
+        push(normalizeRole(atMatch[1]!), atMatch[2]!.toLowerCase())
+        continue
+      }
+      const colonMatch = COLON_MEMBERSHIP_RE.exec(token)
+      if (colonMatch) {
+        push(normalizeRole(colonMatch[1]!), colonMatch[2]!.toLowerCase())
+      }
+    }
+  }
+  return out
+}
+
+/** Return all distinct lowercase tenant identifiers carried by a persona role label. */
+export function parseRoleTenants(label: string | null | undefined): string[] {
+  const seen = new Set<string>()
+  for (const membership of parseRoleMemberships(label)) {
+    if (membership.tenant) seen.add(membership.tenant)
+  }
+  return [...seen]
+}
+
+/**
+ * Persona labels carry the app role and tenant, e.g. `owner (acme)`, `owner@org_a`,
+ * `admin@org_a, viewer@org_b`, or a bare `admin`. The verifier never guesses a role from a path
+ * it has not seen a role label for.
  */
 export function parseRoleLabel(label: string | null | undefined): { role: RoleName | null; tenant: string | null } {
   if (!label) return { role: null, tenant: null }
-  const role = normalizeRole(label)
-  const parenthetical = /\(([^)]{1,64})\)/.exec(label)?.[1]?.trim().toLowerCase() ?? null
-  const tenant = parenthetical || (/^[a-z0-9_.:-]{1,64}$/i.test(label.trim()) && role === null ? label.trim().toLowerCase() : null)
-  return { role, tenant }
+  const memberships = parseRoleMemberships(label)
+  const firstRole = memberships.find(m => m.role !== null)?.role ?? normalizeRole(label)
+  const firstTenant = memberships.find(m => m.tenant !== null)?.tenant ?? null
+  return { role: firstRole, tenant: firstTenant }
 }
 
 export interface PersonaCredentialSource {
@@ -75,8 +155,48 @@ export interface ActorIdentity {
   handle: string | null
   role: RoleName | null
   tenant: string | null
+  /** Additional/all tenant memberships when a persona belongs to multiple tenants. */
+  tenants?: readonly string[]
   auth: AmbientAuth
   sameSite: string | null
+}
+
+/** All normalized lowercase tenant memberships declared for an actor. */
+export function actorTenants(actor: Pick<ActorIdentity, 'tenant' | 'tenants'>): Set<string> {
+  const out = new Set<string>()
+  if (actor.tenant) out.add(actor.tenant.toLowerCase())
+  for (const t of actor.tenants ?? []) {
+    if (t) out.add(t.toLowerCase())
+  }
+  return out
+}
+
+/** True when both actors share at least one tenant membership. */
+export function actorsShareTenant(
+  a: Pick<ActorIdentity, 'tenant' | 'tenants'>,
+  b: Pick<ActorIdentity, 'tenant' | 'tenants'>,
+): boolean {
+  const left = actorTenants(a)
+  if (left.size === 0) return false
+  const right = actorTenants(b)
+  for (const t of left) {
+    if (right.has(t)) return true
+  }
+  return false
+}
+
+/** True when both actors carry tenant metadata and have strictly disjoint tenant memberships. */
+export function actorsAreCrossTenant(
+  a: Pick<ActorIdentity, 'tenant' | 'tenants'>,
+  b: Pick<ActorIdentity, 'tenant' | 'tenants'>,
+): boolean {
+  const left = actorTenants(a)
+  const right = actorTenants(b)
+  if (left.size === 0 || right.size === 0) return false
+  for (const t of left) {
+    if (right.has(t)) return false
+  }
+  return true
 }
 
 const EMPTY_ACTOR: ActorIdentity = { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null }
@@ -100,12 +220,16 @@ export function actorFromPersona(
   const source = personas.find(persona => persona.handle === handle)
   const parsed = parseRoleLabel(source?.roleLabel ?? null)
   const role = normalizeRole(declared?.roles?.[handle] ?? null) ?? parsed.role ?? normalizeRole(handle)
-  const tenant = declared?.tenants?.[handle]?.toLowerCase() ?? parsed.tenant
+  const declaredTenant = declared?.tenants?.[handle]?.toLowerCase() ?? null
+  const tenant = declaredTenant ?? parsed.tenant
+  const parsedTenants = parseRoleTenants(source?.roleLabel ?? null)
+  const allTenants = [...new Set([...(declaredTenant ? [declaredTenant] : []), ...parsedTenants])]
   const sameSite = source?.cookies?.find(cookie => cookie.sameSite)?.sameSite ?? null
   return {
     handle,
     role,
     tenant,
+    ...(allTenants.length > 1 ? { tenants: allTenants } : {}),
     auth: source ? ambientAuthOf(source) : 'unknown',
     sameSite,
   }
@@ -329,10 +453,9 @@ export function assessPublicness(args: { steps: readonly ImpactStep[]; probe: Im
   const listing = listingLeaves(steps)
   const probeFlat = probe.json !== undefined && probe.json !== null && typeof probe.json === 'object' ? flattenJson(probe.json) : null
   for (const reference of references) {
-    const referenceTenant = reference.actor.tenant ?? null
     // Only an anonymous caller or a caller outside the reference tenant can be a "public" reader.
-    if (probeTenant !== null && referenceTenant !== null && probeTenant === referenceTenant) continue
-    if (!probeTenant && !referenceTenant) continue
+    if (actorsShareTenant(probe.actor, reference.actor)) continue
+    if (actorTenants(probe.actor).size === 0 && actorTenants(reference.actor).size === 0) continue
     const same = payloadKey(reference) === probeKey
     let differingOnlyPublic = false
     if (!same) {
@@ -854,7 +977,48 @@ export function hasForeignTenantOrOwnerDisclosure(
 }
 
 function sameTenant(a: ActorIdentity, b: ActorIdentity): boolean {
-  return Boolean(a.tenant && b.tenant && a.tenant === b.tenant)
+  return actorsShareTenant(a, b)
+}
+
+/**
+ * A 404 returned on a different request path (a nonexistent/bogus-ID selectivity control) only
+ * proves the route rejects unknown IDs — never that the probe actor is denied access to the real
+ * target object.
+ */
+function isBogusIdSelectivity404(control: ImpactStep, success: ImpactStep): boolean {
+  return control.status === 404 &&
+    control.pathAndQuery !== undefined &&
+    success.pathAndQuery !== undefined &&
+    control.pathAndQuery !== success.pathAndQuery
+}
+
+/**
+ * Secret/credential field names that still represent a genuine same-tenant read disclosure even
+ * without a role differential or denied boundary control (business/org-shared fields such as
+ * `amountCents`, `title`, `body`, `createdBy`, `tenantId` are legitimately readable by peers in
+ * the same tenant).
+ */
+const SAME_TENANT_SECRET_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:secret|api_?key|access_?token|password|hash|private_?note|ssn)$/i
+
+/**
+ * True when a probe JSON payload carries explicit tenant/org/workspace scope field(s) and every
+ * observed scope value belongs to the probe actor's own tenant membership(s).
+ */
+function responseScopedToOwnTenant(probe: ImpactStep): boolean {
+  const ownTenants = actorTenants(probe.actor)
+  if (ownTenants.size === 0) return false
+  if (probe.json === undefined || probe.json === null || typeof probe.json !== 'object') return false
+  const flat = flattenJson(probe.json)
+  let foundTenantField = false
+  for (const [path, rawValue] of flat) {
+    const leaf = deRedactIdentity(path.replace(/\[\d+\]/g, '').split('.').pop() ?? '')
+    if (!TENANT_SCOPE_FIELD_RE.test(leaf)) continue
+    const val = deRedactIdentity(rawValue.trim())
+    if (!val || val === 'null' || val === 'undefined') continue
+    foundTenantField = true
+    if (!ownTenants.has(val)) return false
+  }
+  return foundTenantField
 }
 
 export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAssessment {
@@ -874,12 +1038,12 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
   // A denial proves *this actor* is unentitled only when the denied control is a peer of the probe
   // (same tenant, or both unknown). A cross-tenant control that is denied shows tenant isolation,
   // which is the app working, not a boundary the probe crossed.
-  const probeTenant = probe?.actor.tenant ?? null
+  const probeTenants = probe ? actorTenants(probe.actor) : new Set<string>()
   const declaredResourceTenant = input.resourceTenant?.toLowerCase() ?? null
   // A claim-declared resource tenant is untrusted: the mirror direction only counts when an actor
   // in that tenant actually read the same resource successfully (a control on the same object).
   const mirrorCorroborated = declaredResourceTenant !== null && probe !== undefined && steps.some(step =>
-    step.actor.tenant === declaredResourceTenant &&
+    actorTenants(step.actor).has(declaredResourceTenant) &&
     isReadMethod(step.method) &&
     isSuccess(step.status) &&
     sameRoute(step, probe))
@@ -888,19 +1052,19 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
   // probe crossed an ownership boundary (the probe already authenticated). This was the
   // `GET /api/me`-style misattribution where `anonAssign=401` was offered as the control for a
   // viewer writing another tenant's ticket.
-  const crossTenantMutation = declaredResourceTenant !== null && probeTenant !== null && declaredResourceTenant !== probeTenant
+  const crossTenantMutation = declaredResourceTenant !== null && probeTenants.size > 0 && !probeTenants.has(declaredResourceTenant)
   const peerDenial = (control: ImpactStep): boolean => {
-    const tenant = control.actor.tenant ?? null
-    const unauthenticated = control.actor.handle === null && tenant === null
+    const controlTenants = actorTenants(control.actor)
+    const unauthenticated = control.actor.handle === null && controlTenants.size === 0
     if (unauthenticated && crossTenantMutation && mutatingProbe !== undefined) return false
-    if (tenant === null || probeTenant === null) return true
-    return tenant === probeTenant ||
-      (mirrorCorroborated && declaredResourceTenant !== null && tenant === declaredResourceTenant && declaredResourceTenant !== probeTenant)
+    if (controlTenants.size === 0 || probeTenants.size === 0) return true
+    return (probe !== undefined && actorsShareTenant(control.actor, probe.actor)) ||
+      (mirrorCorroborated && declaredResourceTenant !== null && controlTenants.has(declaredResourceTenant) && !probeTenants.has(declaredResourceTenant))
   }
   const boundaryControlDenied = deniedControls.some(control =>
     peerDenial(control) &&
     (firstProbeIndex === -1 || steps.indexOf(control) < firstProbeIndex) &&
-    probeSuccesses.some(success => sameRoute(control, success)))
+    probeSuccesses.some(success => sameRoute(control, success) && !isBogusIdSelectivity404(control, success)))
 
   const base = {
     probeRole: probe?.actor.role ?? null,
@@ -922,15 +1086,21 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
   // collection); a same-tenant `/api/me` read by two actors is not a victim readback for the object
   // the probe mutated.
   const crossTenantControlRead = controls.some(control =>
-    isReadMethod(control.method) &&
+    stepReadsState(control) &&
     isSuccess(control.status) &&
     control.json !== undefined &&
     relatedRoute(control, probe) &&
-    Boolean(control.actor.tenant && probe.actor.tenant && control.actor.tenant !== probe.actor.tenant))
+    actorsAreCrossTenant(control.actor, probe.actor))
+  const sameTenantControlRead = controls.some(control =>
+    stepReadsState(control) &&
+    isSuccess(control.status) &&
+    control.json !== undefined &&
+    relatedRoute(control, probe) &&
+    actorsShareTenant(control.actor, probe.actor))
   // A claim-declared `resourceTenant` is model-supplied; it only counts when a signed control arm
   // corroborates the boundary (a denial on the same route, or a read served to the other tenant).
   const crossTenant = crossTenantControlRead ||
-    Boolean(resourceTenant && probe.actor.tenant && resourceTenant !== probe.actor.tenant && boundaryControlDenied)
+    Boolean(resourceTenant && probeTenants.size > 0 && !probeTenants.has(resourceTenant) && boundaryControlDenied)
   const vertical = input.impactClass === 'bfla'
 
   let roleDifferential = false
@@ -942,9 +1112,12 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
       : `probe role ${probe.actor.role} already satisfies the required ${requiredRole}`
   } else if (requiredRank === null) {
     // Infer the required role only from a same-tenant denied control (a cross-tenant denial is a
-    // tenant boundary, not a role reference and must not be read as a vertical differential). When
+    // tenant boundary, not a role reference and must not be read as a vertical differential; a
+    // bogus-ID 404 selectivity control on another path is not a denial on the target object). When
     // neither arm carries tenant metadata, a strictly lower probe role is the only available reading.
-    const sameTenantDenial = deniedControls.find(control => sameRoute(control, probe) &&
+    const sameTenantDenial = deniedControls.find(control =>
+      sameRoute(control, probe) &&
+      !isBogusIdSelectivity404(control, probe) &&
       (sameTenant(control.actor, probe.actor) || (!control.actor.tenant && !probe.actor.tenant)))
     const controlRank = sameTenantDenial ? roleRank(sameTenantDenial.actor.role) : null
     if (controlRank !== null && probeRank !== null) {
@@ -1078,11 +1251,11 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     // owner-scoped principal identifier, tenant canary, or secret fingerprint; otherwise any
     // public item fetched after listing another tenant's collection would bypass publicness.
     const sameRouteControlRead = controls.some(control =>
-      isReadMethod(control.method) &&
+      stepReadsState(control) &&
       isSuccess(control.status) &&
       control.json !== undefined &&
       sameRoute(control, probe) &&
-      Boolean(control.actor.tenant && probe.actor.tenant && control.actor.tenant !== probe.actor.tenant))
+      actorsAreCrossTenant(control.actor, probe.actor))
     if (!sameRouteControlRead && !boundaryControlDenied && !roleDifferential) {
       const probeFlat = probe.json !== undefined && probe.json !== null && typeof probe.json === 'object'
         ? flattenJson(probe.json)
@@ -1161,14 +1334,21 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     }
   }
   if (disclosure.satisfied && !roleDifferential && !crossTenant && !boundaryControlDenied) {
-    // Same-tenant, same-role read: the tenant is the object boundary, so an owner/identity field
-    // alone is in policy (viewer reading a peer's space). Only private/secret data proves impact.
-    const privateFields = disclosure.fields.filter(path => PRIVATE_DATA_RE.test(path.split('.').pop() ?? ''))
+    // Same-tenant read of an org-shared resource: members of the same tenant legitimately share
+    // tenant-scoped business records (including amounts, titles, descriptions, and creator/tenant
+    // metadata). Without a role differential, cross-tenant crossing, or denied boundary control,
+    // only an explicit credential/secret field proves disclosure. When neither actor carries tenant
+    // metadata (single-tenant user-vs-user apps), retain the broader private-data check.
+    const sameTenantOrgRead = sameTenantControlRead || responseScopedToOwnTenant(probe)
+    const fieldFilter = sameTenantOrgRead ? SAME_TENANT_SECRET_FIELD_RE : PRIVATE_DATA_RE
+    const privateFields = disclosure.fields.filter(path => fieldFilter.test(path.split('.').pop() ?? ''))
     if (privateFields.length === 0) {
       return {
         required: true,
         satisfied: false,
-        reason: `Same-tenant read of owner-scoped field(s) (${disclosure.fields.slice(0, 6).join(', ')}) without a role/tenant differential: tenant content is readable by every member, so no private data was disclosed.`,
+        reason: sameTenantOrgRead
+          ? `Same-tenant read of org-shared resource (${disclosure.fields.slice(0, 6).join(', ')}) without a role/tenant differential or denied boundary control: members of the same tenant legitimately share tenant-scoped records.`
+          : `Same-tenant read of owner-scoped field(s) (${disclosure.fields.slice(0, 6).join(', ')}) without a role/tenant differential: tenant content is readable by every member, so no private data was disclosed.`,
         evidence: base,
       }
     }
@@ -1234,11 +1414,13 @@ export function assessReadDisclosure(args: {
     step.json !== undefined)
   const baselineFields = probeBaseline?.json !== undefined ? flattenJson(probeBaseline.json) : null
   const probeIdentities = new Set(
-    [probe.actor.handle, probe.actor.tenant, probe.actor.role].filter((value): value is string => Boolean(value)).map(value => value.toLowerCase()),
+    [probe.actor.handle, probe.actor.tenant, ...(probe.actor.tenants ?? []), probe.actor.role]
+      .filter((value): value is string => Boolean(value))
+      .map(value => value.toLowerCase()),
   )
   const controlIdentities = new Set<string>()
   for (const control of controls) {
-    for (const value of [control.actor.handle, control.actor.tenant, control.actor.role]) {
+    for (const value of [control.actor.handle, control.actor.tenant, ...(control.actor.tenants ?? []), control.actor.role]) {
       if (value) controlIdentities.add(value.toLowerCase())
     }
   }
