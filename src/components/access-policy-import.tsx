@@ -5,6 +5,10 @@ import type { AccessPolicySnapshot } from '../access-policy.ts'
 import { importProjectAccessPolicy } from '../actions.ts'
 import type { Candidate } from '../domain.ts'
 import { formatHumanTime, FormError, useAction } from './common.tsx'
+import { Badge } from './ui/badge.tsx'
+import { Button } from './ui/button.tsx'
+import { Card, CardBody, CardFooter, CardHeader } from './ui/card.tsx'
+import { Input } from './ui/input.tsx'
 
 function safeHostname(origin: string): string {
   try {
@@ -57,66 +61,83 @@ export function AccessPolicyImport({ projectId, assets, cancel, imported }: {
     const replacement = assets.some(asset => asset.origin === snapshot.origin && asset.accessPolicy)
     const ratedCases = snapshot.expected.filter(item => item.impactIfAllowed).length
     const recorded = formatHumanTime(snapshot.recordedAt)
-    return <section className="pw-sheet" aria-label="Access policy import preview">
-      <div className="pw-sheet-h">
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <span>Review access records</span>
-          <span className="pw-tag accent mono">{safeHostname(snapshot.origin)}</span>
-        </div>
-        <button type="button" className="pw-btn ghost" disabled={action.pending} onClick={cancel}>Close</button>
-      </div>
-      <div className="pw-sheet-b">
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <span className="pw-tag solid num">{snapshot.expected.length} expected {snapshot.expected.length === 1 ? 'case' : 'cases'}</span>
-          <span className="pw-tag solid num">{snapshot.observed.length} recorded {snapshot.observed.length === 1 ? 'decision' : 'decisions'}</span>
-          {ratedCases > 0 && (
-            <span className="pw-tag solid num">{ratedCases} with impact rating</span>
-          )}
-        </div>
-        <p className="muted" style={{ margin: 0, fontSize: 12 }}>
-          Recorded{' '}
-          <span className="num" title={recorded.full || undefined}>{recorded.label || snapshot.recordedAt}</span>.
-          {' '}Available during the next discovery pass.
-        </p>
-        <FormError error={action.error} />
-      </div>
-      <div className="pw-sheet-f">
-        <button type="button" className="pw-btn ghost" onClick={() => setPreview(undefined)} disabled={action.pending}>
-          Choose another file
-        </button>
-        <button
-          type="button"
-          className="pw-btn primary"
-          disabled={action.pending}
-          onClick={() => {
-            void action.submit(() => importProjectAccessPolicy({ data: { projectId, requestId, snapshot } }), imported)
-          }}
-        >
-          {action.pending ? 'Importing…' : replacement ? 'Replace access records' : 'Import records'}
-        </button>
-      </div>
-    </section>
+    return (
+      <Card className="overflow-hidden border-line" aria-label="Access policy import preview">
+        <CardHeader className="items-center py-2.5">
+          <div className="flex flex-wrap items-center gap-2 text-[13px] font-semibold text-fg">
+            <span>Review access records</span>
+            <Badge variant="accent" className="font-mono">{safeHostname(snapshot.origin)}</Badge>
+          </div>
+          <Button type="button" variant="ghost" disabled={action.pending} onClick={cancel}>
+            Close
+          </Button>
+        </CardHeader>
+        <CardBody className="grid gap-3 py-3.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="neutral" className="bg-sunk tabular-nums">
+              {snapshot.expected.length} expected {snapshot.expected.length === 1 ? 'case' : 'cases'}
+            </Badge>
+            <Badge variant="neutral" className="bg-sunk tabular-nums">
+              {snapshot.observed.length} recorded {snapshot.observed.length === 1 ? 'decision' : 'decisions'}
+            </Badge>
+            {ratedCases > 0 && (
+              <Badge variant="neutral" className="bg-sunk tabular-nums">
+                {ratedCases} with impact rating
+              </Badge>
+            )}
+          </div>
+          <p className="m-0 text-[12px] text-fg-subtle">
+            Recorded{' '}
+            <span className="tabular-nums" title={recorded.full || undefined}>
+              {recorded.label || snapshot.recordedAt}
+            </span>.
+            {' '}Available during the next discovery pass.
+          </p>
+          <FormError error={action.error} />
+        </CardBody>
+        <CardFooter className="py-2.5">
+          <Button type="button" variant="ghost" onClick={() => setPreview(undefined)} disabled={action.pending}>
+            Choose another file
+          </Button>
+          <Button
+            type="button"
+            variant="default"
+            disabled={action.pending}
+            onClick={() => {
+              void action.submit(() => importProjectAccessPolicy({ data: { projectId, requestId, snapshot } }), imported)
+            }}
+          >
+            {action.pending ? 'Importing…' : replacement ? 'Replace access records' : 'Import records'}
+          </Button>
+        </CardFooter>
+      </Card>
+    )
   }
 
-  return <form className="pw-sheet" onSubmit={event => { void review(event) }}>
-    <div className="pw-sheet-h">
-      <span>Import access policy records</span>
-      <button type="button" className="pw-btn ghost" onClick={cancel}>Close</button>
-    </div>
-    <div className="pw-sheet-b">
-      <p className="muted" style={{ margin: 0, fontSize: 12 }}>
-        Upload expected access rules and test decisions from your authorization test suite.
-      </p>
-      <label className="pw-fld">Access policy JSON
-        <input className="pw-in" style={{ paddingTop: 3 }} name="records" type="file" accept=".json,application/json" required />
-      </label>
-      <FormError error={error} />
-    </div>
-    <div className="pw-sheet-f">
-      <button type="button" className="pw-btn ghost" onClick={cancel}>Cancel</button>
-      <button type="submit" className="pw-btn primary" disabled={reading}>
-        {reading ? 'Reading…' : 'Review records'}
-      </button>
-    </div>
-  </form>
+  return (
+    <Card className="overflow-hidden border-line">
+      <form onSubmit={event => { void review(event) }}>
+        <CardHeader className="items-center py-2.5">
+          <span className="text-[13px] font-semibold text-fg">Import access policy records</span>
+          <Button type="button" variant="ghost" onClick={cancel}>Close</Button>
+        </CardHeader>
+        <CardBody className="grid gap-3 py-3.5">
+          <p className="m-0 text-[12px] text-fg-subtle">
+            Upload expected access rules and test decisions from your authorization test suite.
+          </p>
+          <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+            Access policy JSON
+            <Input className="w-full pt-[3px]!" name="records" type="file" accept=".json,application/json" required />
+          </label>
+          <FormError error={error} />
+        </CardBody>
+        <CardFooter className="py-2.5">
+          <Button type="button" variant="ghost" onClick={cancel}>Cancel</Button>
+          <Button type="submit" variant="default" disabled={reading}>
+            {reading ? 'Reading…' : 'Review records'}
+          </Button>
+        </CardFooter>
+      </form>
+    </Card>
+  )
 }

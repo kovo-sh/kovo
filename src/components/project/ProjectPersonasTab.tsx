@@ -1,9 +1,23 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { registerPersona, removePersona } from '../../actions.ts'
 import type { PersonaAuthKind, PersonaLoginAdapter, PublicPersona } from '../../domain.ts'
 import { FormError, useAction } from '../common.tsx'
 import { parseCurlOrHeader } from '../curl-parser.ts'
 import { Icon } from '../run/icons.tsx'
+import { Badge } from '../ui/badge.tsx'
+import { Button } from '../ui/button.tsx'
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '../ui/dialog.tsx'
+import { Disclosure, DisclosureContent, DisclosureTrigger } from '../ui/disclosure.tsx'
+import { EmptyState } from '../ui/empty-state.tsx'
+import { Input, NativeSelect, Textarea } from '../ui/input.tsx'
 import type { PersonaTestState, ProjectLoaderData } from './types.ts'
 import { formatPersonaAuthBadge, LOGIN_URL_PLACEHOLDERS, safeHost } from './types.ts'
 
@@ -17,7 +31,7 @@ interface Props {
 function CrossAccountEmptySvg() {
   return (
     <svg
-      className="pw-empty-art"
+      className="block"
       width="180"
       height="88"
       viewBox="0 0 180 88"
@@ -31,37 +45,37 @@ function CrossAccountEmptySvg() {
         width="68"
         height="60"
         rx="8"
-        fill="var(--pw-panel)"
-        stroke="var(--pw-line-2)"
+        fill="var(--panel)"
+        stroke="var(--line-2)"
         strokeWidth="1.2"
       />
       <circle
         cx="19"
         cy="31"
         r="7.5"
-        fill="var(--pw-accent-soft)"
-        stroke="var(--pw-accent-line)"
+        fill="var(--accent-soft)"
+        stroke="var(--accent-line)"
         strokeWidth="1.1"
       />
-      <circle cx="19" cy="29.3" r="2.1" stroke="var(--pw-accent)" strokeWidth="1.2" />
+      <circle cx="19" cy="29.3" r="2.1" stroke="var(--accent)" strokeWidth="1.2" />
       <path
         d="M15.4 35.1c.65-1.75 1.9-2.55 3.6-2.55s2.95.8 3.6 2.55"
-        stroke="var(--pw-accent)"
+        stroke="var(--accent)"
         strokeWidth="1.2"
         strokeLinecap="round"
       />
       <text
         x="31"
         y="34"
-        fill="var(--pw-fg)"
+        fill="var(--fg)"
         fontSize="9.5"
         fontWeight="600"
         fontFamily="inherit"
       >
         User A
       </text>
-      <rect x="13" y="47" width="46" height="4.5" rx="2.25" fill="var(--pw-line-2)" />
-      <rect x="13" y="56" width="31" height="4.5" rx="2.25" fill="var(--pw-line)" />
+      <rect x="13" y="47" width="46" height="4.5" rx="2.25" fill="var(--line-2)" />
+      <rect x="13" y="56" width="31" height="4.5" rx="2.25" fill="var(--line)" />
 
       {/* Right card: User B */}
       <rect
@@ -70,37 +84,37 @@ function CrossAccountEmptySvg() {
         width="68"
         height="60"
         rx="8"
-        fill="var(--pw-panel)"
-        stroke="var(--pw-line-2)"
+        fill="var(--panel)"
+        stroke="var(--line-2)"
         strokeWidth="1.2"
       />
       <circle
         cx="123"
         cy="31"
         r="7.5"
-        fill="var(--pw-sunk)"
-        stroke="var(--pw-line-strong)"
+        fill="var(--sunk)"
+        stroke="var(--line-strong)"
         strokeWidth="1.1"
       />
-      <circle cx="123" cy="29.3" r="2.1" stroke="var(--pw-fg-2)" strokeWidth="1.2" />
+      <circle cx="123" cy="29.3" r="2.1" stroke="var(--fg-2)" strokeWidth="1.2" />
       <path
         d="M119.4 35.1c.65-1.75 1.9-2.55 3.6-2.55s2.95.8 3.6 2.55"
-        stroke="var(--pw-fg-2)"
+        stroke="var(--fg-2)"
         strokeWidth="1.2"
         strokeLinecap="round"
       />
       <text
         x="135"
         y="34"
-        fill="var(--pw-fg)"
+        fill="var(--fg)"
         fontSize="9.5"
         fontWeight="600"
         fontFamily="inherit"
       >
         User B
       </text>
-      <rect x="117" y="47" width="46" height="4.5" rx="2.25" fill="var(--pw-line-2)" />
-      <rect x="117" y="56" width="34" height="4.5" rx="2.25" fill="var(--pw-line)" />
+      <rect x="117" y="47" width="46" height="4.5" rx="2.25" fill="var(--line-2)" />
+      <rect x="117" y="56" width="34" height="4.5" rx="2.25" fill="var(--line)" />
 
       {/* Center vertical isolation boundary */}
       <line
@@ -108,7 +122,7 @@ function CrossAccountEmptySvg() {
         y1="6"
         x2="90"
         y2="24"
-        stroke="var(--pw-line-strong)"
+        stroke="var(--line-strong)"
         strokeWidth="1.25"
         strokeDasharray="3 3"
         strokeLinecap="round"
@@ -118,7 +132,7 @@ function CrossAccountEmptySvg() {
         y1="64"
         x2="90"
         y2="82"
-        stroke="var(--pw-line-strong)"
+        stroke="var(--line-strong)"
         strokeWidth="1.25"
         strokeDasharray="3 3"
         strokeLinecap="round"
@@ -127,14 +141,14 @@ function CrossAccountEmptySvg() {
       {/* Shield + lock emblem on the boundary */}
       <path
         d="M90 26L102 30.8V42.4C102 50.6 96.9 56.8 90 60.5C83.1 56.8 78 50.6 78 42.4V30.8L90 26Z"
-        fill="var(--pw-panel)"
-        stroke="var(--pw-accent)"
+        fill="var(--panel)"
+        stroke="var(--accent)"
         strokeWidth="1.4"
         strokeLinejoin="round"
       />
       <path
         d="M90 28.6L99.5 32.4V42.2C99.5 48.9 95.4 54.1 90 57.3C84.6 54.1 80.5 48.9 80.5 42.2V32.4L90 28.6Z"
-        fill="var(--pw-accent-soft)"
+        fill="var(--accent-soft)"
       />
       <rect
         x="85.8"
@@ -142,15 +156,15 @@ function CrossAccountEmptySvg() {
         width="8.4"
         height="6.8"
         rx="1.6"
-        fill="var(--pw-accent)"
+        fill="var(--accent)"
       />
       <path
         d="M87.4 41.8V39.6A2.6 2.6 0 0 1 92.6 39.6V41.8"
-        stroke="var(--pw-accent)"
+        stroke="var(--accent)"
         strokeWidth="1.4"
         strokeLinecap="round"
       />
-      <circle cx="90" cy="45.1" r="1" fill="var(--pw-panel)" />
+      <circle cx="90" cy="45.1" r="1" fill="var(--panel)" />
     </svg>
   )
 }
@@ -173,18 +187,6 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
   const [curlNote, setCurlNote] = useState('')
   const [notice, setNotice] = useState('')
   const personaAction = useAction()
-
-  useEffect(() => {
-    if (!modalOpen && !personaToDelete) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape' || personaAction.pending) return
-      e.preventDefault()
-      if (personaToDelete) setPersonaToDelete(null)
-      else setModalOpen(false)
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [modalOpen, personaToDelete, personaAction.pending])
 
   function deriveHandle(label: string): string {
     return label
@@ -216,7 +218,7 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
 
   function prefillPair(which: 'user_a' | 'user_b') {
     setHandle(which)
-    setRoleLabel(which === 'user_a' ? 'User A (Control / Owner)' : 'User B (Cross-User Probe)')
+    setRoleLabel(which === 'user_a' ? 'User A (Control / Owner)' : 'User B (Cross-User)')
     setAuthKind('login')
     setLoginAdapter('auto')
     setOrigins(project.seeds.join('\n'))
@@ -240,320 +242,506 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
     setCurlNote(parsed.summary)
   }
 
-  return <section aria-label="Test accounts">
-    <div className="pw-sec-head">
-      <div>
-        <h2>Test accounts <span className="muted num">({personas.length})</span></h2>
-        <p>Add test logins so Kovo Hunter can scan behind sign-in and check whether one user can reach another user&apos;s data. Credentials stay encrypted on your machine.</p>
+  return (
+    <section aria-label="Test accounts">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="m-0 text-[13px] font-semibold text-fg">
+            Test accounts <span className="font-normal tabular-nums text-fg-subtle">({personas.length})</span>
+          </h2>
+          <p className="mt-0.5 text-[12px] text-fg-subtle">
+            Add test logins so Kovo Hunter can scan behind sign-in and check whether one user can reach another user&apos;s data. Credentials stay encrypted on your machine.
+          </p>
+        </div>
+        {personas.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Button
+              type="button"
+              variant="default"
+              onClick={() => {
+                setModalOpen(true)
+                setNotice('')
+              }}
+            >
+              Add test account
+            </Button>
+          </div>
+        )}
       </div>
-      {personas.length > 0 && (
-        <div className="pw-sec-actions">
-          <button type="button" className="pw-btn primary" onClick={() => { setModalOpen(true); setNotice('') }}>
-            Add test account
-          </button>
+
+      {notice && (
+        <p
+          role="status"
+          className="mb-3.5 flex items-center gap-2 rounded-[7px] border border-line bg-sunk px-3 py-[7px] text-[12.5px] text-fg-muted"
+        >
+          {notice}
+        </p>
+      )}
+
+      {personas.length > 0 ? (
+        <div className="border-t border-line">
+          {personas.map(persona => {
+            const test = personaTests[persona.id]
+            const testVariant = test?.status === 'ok'
+              ? 'ok'
+              : test?.status === 'warn'
+                ? 'warn'
+                : test?.status === 'error'
+                  ? 'danger'
+                  : 'neutral'
+            return (
+              <div
+                key={persona.id}
+                className="flex min-h-[44px] items-center justify-between gap-3 border-b border-line px-1 py-2 transition-colors hover:bg-hover"
+              >
+                <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <div className="flex min-w-0 flex-wrap items-center gap-1.5 font-medium text-fg">
+                    <strong className="font-mono text-[12px] font-semibold">{persona.handle}</strong>
+                    <Badge variant="accent">{persona.roleLabel}</Badge>
+                    <Badge variant="neutral" className="bg-sunk">{formatPersonaAuthBadge(persona)}</Badge>
+                    {test && (
+                      <Badge variant={testVariant} className={testVariant === 'neutral' ? 'bg-sunk' : undefined}>
+                        {test.message}
+                      </Badge>
+                    )}
+                  </div>
+                  <div className="text-[12px] text-fg-subtle">
+                    Allowlist: {persona.originAllowlist.map(safeHost).join(', ')}
+                    {persona.canaryMarkers.length > 0 && ` · ${persona.canaryMarkers.length} leak detection ${persona.canaryMarkers.length === 1 ? 'marker' : 'markers'}`}
+                  </div>
+                </div>
+                <div className="flex flex-none items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    disabled={test?.status === 'testing'}
+                    onClick={() => onTestPersona(persona)}
+                  >
+                    {test?.status === 'testing' ? 'Verifying…' : test?.status === 'ok' ? 'Verify sign-in ✓' : 'Verify sign-in'}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="data-[slot=button]:text-danger data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger"
+                    disabled={personaAction.pending}
+                    onClick={() => setPersonaToDelete(persona)}
+                  >
+                    Delete
+                  </Button>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      ) : (
+        <div className="mt-3.5 rounded-card border border-line bg-sunk">
+          <EmptyState
+            icon={<CrossAccountEmptySvg />}
+            title="No test accounts yet"
+            description="Add one login to scan signed-in views, or two logins (User A & User B) to test cross-account isolation."
+            className="max-w-[440px] py-9 [&_[data-slot=empty-state-icon]]:size-auto [&_[data-slot=empty-state-icon]>svg]:h-[88px] [&_[data-slot=empty-state-icon]>svg]:w-[180px]"
+            action={
+              <Button
+                type="button"
+                variant="default"
+                onClick={() => {
+                  setModalOpen(true)
+                  setNotice('')
+                }}
+              >
+                Add test account
+              </Button>
+            }
+          />
         </div>
       )}
-    </div>
 
-    {notice && <p role="status" className="notice">{notice}</p>}
-
-    {personas.length > 0 ? (
-      <div className="pw-table-wrap">
-        {personas.map(persona => {
-          const test = personaTests[persona.id]
-          return <div key={persona.id} className="pw-row">
-            <div className="pw-row-main">
-              <div className="pw-row-title">
-                <strong className="mono">{persona.handle}</strong>
-                <span className="pw-tag accent">{persona.roleLabel}</span>
-                <span className="pw-tag solid">{formatPersonaAuthBadge(persona)}</span>
-                {test && (
-                  <span className={`pw-tag ${test.status === 'ok' ? 'ok' : test.status === 'warn' ? 'warn' : test.status === 'error' ? 'bad' : 'solid'}`}>
-                    {test.message}
-                  </span>
-                )}
-              </div>
-              <div className="pw-row-sub">
-                Allowlist: {persona.originAllowlist.map(safeHost).join(', ')}
-                {persona.canaryMarkers.length > 0 && ` · ${persona.canaryMarkers.length} canary ${persona.canaryMarkers.length === 1 ? 'marker' : 'markers'}`}
-              </div>
-            </div>
-            <div className="pw-row-right">
-              <button
-                type="button"
-                className="pw-btn ghost"
-                disabled={test?.status === 'testing'}
-                onClick={() => onTestPersona(persona)}
-              >
-                {test?.status === 'testing' ? 'Verifying…' : test?.status === 'ok' ? 'Verify sign-in ✓' : 'Verify sign-in'}
-              </button>
-              <button
-                type="button"
-                className="pw-btn ghost danger"
-                disabled={personaAction.pending}
-                onClick={() => setPersonaToDelete(persona)}
-              >
-                Delete
-              </button>
-            </div>
-          </div>
-        })}
-      </div>
-    ) : (
-      <div className="pw-empty-card">
-        <CrossAccountEmptySvg />
-        <h3>No test accounts yet</h3>
-        <p>Add one login to scan signed-in views, or two logins (User A &amp; User B) to test cross-account isolation.</p>
-        <button type="button" className="pw-btn primary" onClick={() => { setModalOpen(true); setNotice('') }}>
-          Add test account
-        </button>
-      </div>
-    )}
-
-    {modalOpen && <div
-      className="pw-overlay"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Add test account"
-      onMouseDown={e => {
-        if (e.target === e.currentTarget && !personaAction.pending) setModalOpen(false)
-      }}
-    >
-      <form
-        className="pw-modal"
-        onSubmit={event => {
-          event.preventDefault()
-          const allowlist = origins.split(/[\s,]+/).filter(Boolean)
-          const canaryMarkers = canaries.split(',').map(s => s.trim()).filter(Boolean)
-          const headerNameRaw = headerName.trim()
-          const loginUrlRaw = loginUrl.trim()
-          void personaAction.submit(() => registerPersona({ data: {
-            requestId: crypto.randomUUID(),
-            projectId: project.id,
-            handle: handle.trim(),
-            roleLabel: roleLabel.trim(),
-            originAllowlist: allowlist,
-            authKind,
-            ...(authKind === 'header' && headerNameRaw ? { headerName: headerNameRaw } : {}),
-            ...(authKind === 'login' ? {
-              loginConfig: {
-                adapter: loginAdapter,
-                email: loginEmail.trim(),
-                ...(loginUrlRaw ? { loginUrl: loginUrlRaw } : {}),
-              },
-            } : {}),
-            secret,
-            canaryMarkers,
-          } }), created => {
-            resetForm()
-            setModalOpen(false)
-            setNotice(`Saved test account "${created.handle}". Credentials stay encrypted on your machine.`)
-            onPersonaCreated(created)
-          })
+      <Dialog
+        open={modalOpen}
+        closeOnEscape={!personaAction.pending}
+        onOpenChange={nextOpen => {
+          if (!nextOpen && !personaAction.pending) setModalOpen(false)
         }}
       >
-        <div className="pw-sheet-h">
-          <span>Add test account</span>
-          <button
-            type="button"
-            className="pw-btn ghost"
-            style={{ padding: '0 6px' }}
-            onClick={() => setModalOpen(false)}
-            disabled={personaAction.pending}
-            aria-label="Close"
+        <DialogContent className="flex max-h-[calc(100vh-56px)] max-w-[680px] flex-col overflow-hidden p-0">
+          <form
+            className="flex min-h-0 flex-1 flex-col"
+            onSubmit={event => {
+              event.preventDefault()
+              const allowlist = origins.split(/[\s,]+/).filter(Boolean)
+              const canaryMarkers = canaries.split(',').map(s => s.trim()).filter(Boolean)
+              const headerNameRaw = headerName.trim()
+              const loginUrlRaw = loginUrl.trim()
+              void personaAction.submit(() => registerPersona({ data: {
+                requestId: crypto.randomUUID(),
+                projectId: project.id,
+                handle: handle.trim(),
+                roleLabel: roleLabel.trim(),
+                originAllowlist: allowlist,
+                authKind,
+                ...(authKind === 'header' && headerNameRaw ? { headerName: headerNameRaw } : {}),
+                ...(authKind === 'login' ? {
+                  loginConfig: {
+                    adapter: loginAdapter,
+                    email: loginEmail.trim(),
+                    ...(loginUrlRaw ? { loginUrl: loginUrlRaw } : {}),
+                  },
+                } : {}),
+                secret,
+                canaryMarkers,
+              } }), created => {
+                resetForm()
+                setModalOpen(false)
+                setNotice(`Saved test account "${created.handle}". Credentials stay encrypted on your machine.`)
+                onPersonaCreated(created)
+              })
+            }}
           >
-            <Icon name="close" size={14} />
-          </button>
-        </div>
-        <div className="pw-sheet-b">
-          <div className="pw-persona-quickfill">
-            <span className="muted">Quick fill</span>
-            <button type="button" className="pw-chip" onClick={() => prefillPair('user_a')}>User A</button>
-            <button type="button" className="pw-chip" onClick={() => prefillPair('user_b')}>User B</button>
-          </div>
-
-          <div className="pw-grid-2">
-            <label className="pw-fld">Account label
-              <input
-                className="pw-in"
-                name="roleLabel"
-                required
-                maxLength={160}
-                placeholder="User A (Owner)"
-                value={roleLabel}
-                onChange={e => handleAccountLabel(e.target.value)}
-              />
-              <small>Used as the readable name; the handle is derived automatically.</small>
-            </label>
-            <label className="pw-fld">Sign-in method
-              <select className="pw-select" name="authKind" value={authKind} onChange={e => setAuthKind(e.target.value as PersonaAuthKind)}>
-                <option value="login">Email + Password (auto-login &amp; refresh)</option>
-                <option value="cookie">Session cookie (Cookie: …)</option>
-                <option value="bearer">Bearer token (Authorization: Bearer …)</option>
-                <option value="header">Custom request header</option>
-              </select>
-            </label>
-          </div>
-
-          {authKind !== 'login' && <div className="pw-curl-helper">
-            <div style={{ display: 'flex', gap: 6 }}>
-              <input
-                className="pw-in mono"
-                value={curlPaste}
-                onChange={e => setCurlPaste(e.target.value)}
-                onPaste={e => {
-                  const pasted = e.clipboardData.getData('text')
-                  if (pasted) {
-                    e.preventDefault()
-                    applyCurlParse(pasted)
-                  }
-                }}
-                placeholder="Paste cURL or Cookie / Authorization header to auto-extract credentials…"
-              />
-              <button type="button" className="pw-btn" onClick={() => applyCurlParse(curlPaste)} disabled={!curlPaste.trim()}>
-                Parse
-              </button>
-            </div>
-            {curlNote && <span className="muted" style={{ fontSize: 11.5 }}>{curlNote}</span>}
-          </div>}
-
-          {authKind === 'login' ? (
-            <div className="pw-grid-2">
-              <label className="pw-fld">Email
-                <input className="pw-in" name="loginEmail" type="email" required maxLength={320} autoComplete="off"
-                  value={loginEmail} onChange={e => setLoginEmail(e.target.value)} placeholder="test-a@example.com" />
-              </label>
-              <label className="pw-fld">Password
-                <input className="pw-in" name="secret" type="password" required maxLength={4096} autoComplete="off"
-                  value={secret} onChange={e => setSecret(e.target.value)} placeholder="Encrypted on your machine" />
-              </label>
-            </div>
-          ) : (
-            <label className="pw-fld">Credential secret
-              <input className="pw-in" name="secret" type="password" required maxLength={4096} autoComplete="off"
-                value={secret} onChange={e => setSecret(e.target.value)} placeholder="Never displayed back after saving" />
-            </label>
-          )}
-
-          <details className="pw-disclosure pw-persona-advanced">
-            <summary>Advanced configuration</summary>
-            <div className="pw-disclosure-body">
-              <div className="pw-grid-2">
-                <label className="pw-fld">Handle (lowercase identifier)
-                  <input className="pw-in mono" name="handle" required pattern="[a-z0-9][a-z0-9_-]{0,47}" placeholder="user-a"
-                    value={handle} onChange={e => setHandle(e.target.value)} />
-                </label>
-                {authKind === 'login' ? (
-                  <label className="pw-fld">Auth provider
-                    <select className="pw-select" name="loginAdapter" value={loginAdapter} onChange={e => setLoginAdapter(e.target.value as PersonaLoginAdapter)}>
-                      <option value="auto">Auto-detect</option>
-                      <option value="clerk">Clerk (auto-refresh 60s JWT)</option>
-                      <option value="json">JSON API / Better Auth</option>
-                      <option value="supabase">Supabase Auth</option>
-                      <option value="form">Login Form (Browser)</option>
-                    </select>
-                  </label>
-                ) : authKind === 'header' ? (
-                  <label className="pw-fld">Header name
-                    <input className="pw-in mono" name="headerName" required pattern="[A-Za-z0-9-]{1,64}" placeholder="X-Api-Key"
-                      value={headerName} onChange={e => setHeaderName(e.target.value)} />
-                  </label>
-                ) : null}
+            <DialogHeader className="flex-row items-center justify-between gap-2.5 border-b border-line bg-raise px-4 py-2.5">
+              <DialogTitle className="text-[13px] font-semibold text-fg">Add test account</DialogTitle>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="size-[26px]"
+                onClick={() => setModalOpen(false)}
+                disabled={personaAction.pending}
+                aria-label="Close"
+              >
+                <Icon name="close" size={14} />
+              </Button>
+            </DialogHeader>
+            <DialogBody className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto p-4">
+              <div className="flex flex-wrap items-center gap-1.5 text-[12px]">
+                <span className="mr-0.5 text-fg-subtle">Quick fill</span>
+                <button
+                  type="button"
+                  className="h-6 cursor-pointer rounded-[5px] border border-line-2 bg-panel px-2 text-[11.5px] font-medium text-fg-muted shadow-none transition-colors hover:bg-hover hover:text-fg"
+                  onClick={() => prefillPair('user_a')}
+                >
+                  User A
+                </button>
+                <button
+                  type="button"
+                  className="h-6 cursor-pointer rounded-[5px] border border-line-2 bg-panel px-2 text-[11.5px] font-medium text-fg-muted shadow-none transition-colors hover:bg-hover hover:text-fg"
+                  onClick={() => prefillPair('user_b')}
+                >
+                  User B
+                </button>
               </div>
 
-              {authKind === 'login' && (
-                <label className="pw-fld">Login URL (optional)
-                  <input className="pw-in" name="loginUrl" type="url" maxLength={500} autoComplete="off"
-                    value={loginUrl} onChange={e => setLoginUrl(e.target.value)} placeholder={LOGIN_URL_PLACEHOLDERS[loginAdapter]} />
+              <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
+                <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                  Account label
+                  <Input
+                    className="w-full"
+                    name="roleLabel"
+                    required
+                    maxLength={160}
+                    placeholder="User A (Owner)"
+                    value={roleLabel}
+                    onChange={e => handleAccountLabel(e.target.value)}
+                  />
+                  <small className="text-[11.5px] font-normal text-fg-subtle">
+                    Used as the readable name; the handle is derived automatically.
+                  </small>
+                </label>
+                <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                  Sign-in method
+                  <NativeSelect
+                    className="w-full"
+                    name="authKind"
+                    value={authKind}
+                    onChange={e => setAuthKind(e.target.value as PersonaAuthKind)}
+                  >
+                    <option value="login">Email + Password (auto-login &amp; refresh)</option>
+                    <option value="cookie">Session cookie (Cookie: …)</option>
+                    <option value="bearer">Bearer token (Authorization: Bearer …)</option>
+                    <option value="header">Custom request header</option>
+                  </NativeSelect>
+                </label>
+              </div>
+
+              {authKind !== 'login' && (
+                <div className="grid gap-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <Input
+                      className="flex-1 font-mono text-[12px]"
+                      value={curlPaste}
+                      onChange={e => setCurlPaste(e.target.value)}
+                      onPaste={e => {
+                        const pasted = e.clipboardData.getData('text')
+                        if (pasted) {
+                          e.preventDefault()
+                          applyCurlParse(pasted)
+                        }
+                      }}
+                      placeholder="Paste cURL or Cookie / Authorization header to auto-extract credentials…"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => applyCurlParse(curlPaste)}
+                      disabled={!curlPaste.trim()}
+                    >
+                      Parse
+                    </Button>
+                  </div>
+                  {curlNote && <span className="text-[11.5px] text-fg-subtle">{curlNote}</span>}
+                </div>
+              )}
+
+              {authKind === 'login' ? (
+                <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
+                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                    Email
+                    <Input
+                      className="w-full"
+                      name="loginEmail"
+                      type="email"
+                      required
+                      maxLength={320}
+                      autoComplete="off"
+                      value={loginEmail}
+                      onChange={e => setLoginEmail(e.target.value)}
+                      placeholder="test-a@example.com"
+                    />
+                  </label>
+                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                    Password
+                    <Input
+                      className="w-full"
+                      name="secret"
+                      type="password"
+                      required
+                      maxLength={4096}
+                      autoComplete="off"
+                      value={secret}
+                      onChange={e => setSecret(e.target.value)}
+                      placeholder="Encrypted on your machine"
+                    />
+                  </label>
+                </div>
+              ) : (
+                <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                  Credential secret
+                  <Input
+                    className="w-full"
+                    name="secret"
+                    type="password"
+                    required
+                    maxLength={4096}
+                    autoComplete="off"
+                    value={secret}
+                    onChange={e => setSecret(e.target.value)}
+                    placeholder="Never displayed back after saving"
+                  />
                 </label>
               )}
 
-              <label className="pw-fld">Allowed sites (one per line or comma-separated)
-                <textarea className="pw-textarea mono" name="originAllowlist" rows={2} required
-                  value={origins} onChange={e => setOrigins(e.target.value)} />
-              </label>
+              <Disclosure className="border-t border-line pt-2.5">
+                <DisclosureTrigger className="h-auto bg-transparent px-0 py-1 text-fg-muted shadow-none hover:bg-transparent hover:text-fg">
+                  Advanced configuration
+                </DisclosureTrigger>
+                <DisclosureContent className="grid gap-2.5 pt-2.5">
+                  <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
+                    <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                      Handle (lowercase identifier)
+                      <Input
+                        className="w-full font-mono text-[12px]"
+                        name="handle"
+                        required
+                        pattern="[a-z0-9][a-z0-9_-]{0,47}"
+                        placeholder="user-a"
+                        value={handle}
+                        onChange={e => setHandle(e.target.value)}
+                      />
+                    </label>
+                    {authKind === 'login' ? (
+                      <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                        Auth provider
+                        <NativeSelect
+                          className="w-full"
+                          name="loginAdapter"
+                          value={loginAdapter}
+                          onChange={e => setLoginAdapter(e.target.value as PersonaLoginAdapter)}
+                        >
+                          <option value="auto">Auto-detect</option>
+                          <option value="clerk">Clerk (auto-refresh 60s JWT)</option>
+                          <option value="json">JSON API / Better Auth</option>
+                          <option value="supabase">Supabase Auth</option>
+                          <option value="form">Login Form (Browser)</option>
+                        </NativeSelect>
+                      </label>
+                    ) : authKind === 'header' ? (
+                      <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                        Header name
+                        <Input
+                          className="w-full font-mono text-[12px]"
+                          name="headerName"
+                          required
+                          pattern="[A-Za-z0-9-]{1,64}"
+                          placeholder="X-Api-Key"
+                          value={headerName}
+                          onChange={e => setHeaderName(e.target.value)}
+                        />
+                      </label>
+                    ) : null}
+                  </div>
 
-              <label className="pw-fld">Leak detection markers (optional, comma-separated)
-                <input className="pw-in mono" name="canaryMarkers" value={canaries} onChange={e => setCanaries(e.target.value)}
-                  placeholder="tenant-a-canary@example.test, org_alpha_001" />
-                <small>Strings that indicate cross-tenant data leakage if seen by another test account.</small>
-              </label>
-            </div>
-          </details>
+                  {authKind === 'login' && (
+                    <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                      Login URL (optional)
+                      <Input
+                        className="w-full"
+                        name="loginUrl"
+                        type="url"
+                        maxLength={500}
+                        autoComplete="off"
+                        value={loginUrl}
+                        onChange={e => setLoginUrl(e.target.value)}
+                        placeholder={LOGIN_URL_PLACEHOLDERS[loginAdapter]}
+                      />
+                    </label>
+                  )}
 
-          <FormError error={personaAction.error} />
-        </div>
-        <div className="pw-sheet-f">
-          <span className="hint">Credentials stay encrypted on your machine and are never sent to AI models.</span>
-          <button type="button" className="pw-btn ghost" disabled={personaAction.pending} onClick={() => setModalOpen(false)}>Cancel</button>
-          <button type="submit" className="pw-btn primary" disabled={personaAction.pending}>Save test account</button>
-        </div>
-      </form>
-    </div>}
+                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                    Allowed sites (one per line or comma-separated)
+                    <Textarea
+                      className="w-full font-mono text-[12px]"
+                      name="originAllowlist"
+                      rows={2}
+                      required
+                      value={origins}
+                      onChange={e => setOrigins(e.target.value)}
+                    />
+                  </label>
 
-    {personaToDelete && (
-      <div
-        className="pw-overlay"
-        onMouseDown={e => {
-          if (e.target === e.currentTarget && !personaAction.pending) setPersonaToDelete(null)
+                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                    Leak detection markers (optional, comma-separated)
+                    <Input
+                      className="w-full font-mono text-[12px]"
+                      name="canaryMarkers"
+                      value={canaries}
+                      onChange={e => setCanaries(e.target.value)}
+                      placeholder="test-marker@example.com, org_alpha_001"
+                    />
+                    <small className="text-[11.5px] font-normal text-fg-subtle">
+                      Strings that indicate cross-tenant data leakage if seen by another test account.
+                    </small>
+                  </label>
+                </DisclosureContent>
+              </Disclosure>
+
+              <FormError error={personaAction.error} />
+            </DialogBody>
+            <DialogFooter className="flex-wrap">
+              <span className="mr-auto text-[12px] text-fg-subtle">
+                Credentials stay encrypted on your machine and are never sent to AI models.
+              </span>
+              <Button
+                type="button"
+                variant="ghost"
+                disabled={personaAction.pending}
+                onClick={() => setModalOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" variant="default" disabled={personaAction.pending}>
+                Save test account
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(personaToDelete)}
+        closeOnEscape={!personaAction.pending}
+        onOpenChange={nextOpen => {
+          if (!nextOpen && !personaAction.pending) setPersonaToDelete(null)
         }}
       >
-        <div className="pw-modal" style={{ width: 440 }} role="alertdialog" aria-modal="true" aria-labelledby="pw-del-persona-title">
-          <div className="pw-modal-hdr">
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-              <Icon name="trash" size={15} style={{ color: 'var(--pw-bad)' }} />
-              <span id="pw-del-persona-title">Delete test account</span>
-            </span>
-            <button
-              type="button"
-              className="pw-btn ghost"
-              style={{ padding: '0 6px' }}
-              disabled={personaAction.pending}
-              onClick={() => setPersonaToDelete(null)}
-              aria-label="Close"
-            >
-              <Icon name="close" size={14} />
-            </button>
-          </div>
-          <div className="pw-modal-body">
-            <p className="dim" style={{ margin: 0, fontSize: 12.5 }}>
-              Remove <strong style={{ color: 'var(--pw-fg)' }}>{personaToDelete.handle}</strong> and its saved credential from this project. This cannot be undone.
-            </p>
-            <div className="pw-confirm-summary">
-              <div className="pw-confirm-goal">{personaToDelete.roleLabel}</div>
-              <div className="pw-confirm-meta num">
-                <span className="pw-tag solid">{formatPersonaAuthBadge(personaToDelete)}</span>
-                <span className="pw-tag solid">{personaToDelete.originAllowlist.map(safeHost).join(', ') || 'No sites listed'}</span>
-              </div>
-            </div>
-            {personaAction.error && <p className="err" role="alert" style={{ margin: 0 }}>{personaAction.error}</p>}
-          </div>
-          <div className="pw-modal-ftr">
-            <button type="button" className="pw-btn ghost" disabled={personaAction.pending} onClick={() => setPersonaToDelete(null)}>
-              Cancel
-            </button>
-            <button
-              type="button"
-              className="pw-btn danger-solid"
-              disabled={personaAction.pending}
-              onClick={() => {
-                const target = personaToDelete
-                void personaAction.submit(() => removePersona({ data: {
-                  requestId: crypto.randomUUID(),
-                  projectId: project.id,
-                  personaId: target.id,
-                } }), () => {
-                  setPersonaToDelete(null)
-                  setNotice(`Removed test account "${target.handle}".`)
-                })
-              }}
-            >
-              <Icon name="trash" size={13} />
-              {personaAction.pending ? 'Deleting…' : 'Delete account'}
-            </button>
-          </div>
-        </div>
-      </div>
-    )}
-  </section>
+        <DialogContent
+          role="alertdialog"
+          className="flex max-h-[calc(100vh-56px)] max-w-[440px] flex-col overflow-hidden p-0"
+        >
+          {personaToDelete && (
+            <>
+              <DialogHeader className="flex-row items-center justify-between gap-2.5 border-b border-line bg-raise px-4 py-2.5">
+                <DialogTitle className="inline-flex items-center gap-2 text-[13px] font-semibold text-fg">
+                  <Icon name="trash" size={15} className="text-danger" />
+                  <span>Delete test account</span>
+                </DialogTitle>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-[26px]"
+                  disabled={personaAction.pending}
+                  onClick={() => setPersonaToDelete(null)}
+                  aria-label="Close"
+                >
+                  <Icon name="close" size={14} />
+                </Button>
+              </DialogHeader>
+              <DialogBody className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto p-4">
+                <DialogDescription className="text-[12.5px] leading-5 text-fg-muted">
+                  Remove <strong className="font-semibold text-fg">{personaToDelete.handle}</strong> and its saved credential from this project. This cannot be undone.
+                </DialogDescription>
+                <div className="flex flex-col gap-2 rounded-lg border border-line bg-sunk px-3 py-2.5">
+                  <div className="line-clamp-2 text-[13px] font-medium text-fg">
+                    {personaToDelete.roleLabel}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5 tabular-nums">
+                    <Badge variant="neutral" className="bg-panel">
+                      {formatPersonaAuthBadge(personaToDelete)}
+                    </Badge>
+                    <Badge variant="neutral" className="bg-panel">
+                      {personaToDelete.originAllowlist.map(safeHost).join(', ') || 'No sites listed'}
+                    </Badge>
+                  </div>
+                </div>
+                {personaAction.error && (
+                  <p className="m-0 text-[12px] text-danger" role="alert">
+                    {personaAction.error}
+                  </p>
+                )}
+              </DialogBody>
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  disabled={personaAction.pending}
+                  onClick={() => setPersonaToDelete(null)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  variant="default"
+                  className="data-[slot=button]:bg-danger data-[slot=button]:text-white data-[slot=button]:hover:bg-danger hover:brightness-[1.08]"
+                  disabled={personaAction.pending}
+                  onClick={() => {
+                    const target = personaToDelete
+                    void personaAction.submit(() => removePersona({ data: {
+                      requestId: crypto.randomUUID(),
+                      projectId: project.id,
+                      personaId: target.id,
+                    } }), () => {
+                      setPersonaToDelete(null)
+                      setNotice(`Removed test account "${target.handle}".`)
+                    })
+                  }}
+                >
+                  <Icon name="trash" size={13} />
+                  {personaAction.pending ? 'Deleting…' : 'Delete account'}
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+    </section>
+  )
 }
