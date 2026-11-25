@@ -191,7 +191,7 @@ export function ProjectNewRunSheet({
 
   // Quick-add persona inside Tier >= 2 runs
   const [inlinePersonaOpen, setInlinePersonaOpen] = useState(false)
-  const [authKind, setAuthKind] = useState<PersonaAuthKind>('login')
+  const [signInMethod, setSignInMethod] = useState<PersonaAuthKind | 'clerk_client'>('login')
   const [loginAdapter, setLoginAdapter] = useState<PersonaLoginAdapter>('auto')
   const [loginEmail, setLoginEmail] = useState('')
   const [loginUrl, setLoginUrl] = useState('')
@@ -202,6 +202,8 @@ export function ProjectNewRunSheet({
   const [personaSecret, setPersonaSecret] = useState('')
   const [curlPaste, setCurlPaste] = useState('')
   const [curlNote, setCurlNote] = useState('')
+  const isClerkClient = signInMethod === 'clerk_client'
+  const effectiveAuthKind: PersonaAuthKind = isClerkClient ? 'login' : signInMethod
 
   const runAction = useAction()
   const personaAction = useAction()
@@ -228,8 +230,10 @@ export function ProjectNewRunSheet({
   function prefillPair(which: 'user_a' | 'user_b') {
     setPersonaHandle(which)
     setPersonaRole(which === 'user_a' ? 'User A (Owner)' : 'User B (Cross-User)')
-    setAuthKind('login')
-    setLoginAdapter('auto')
+    if (!isClerkClient) {
+      setSignInMethod('login')
+      setLoginAdapter('auto')
+    }
     setPersonaOrigins(project.seeds.join('\n'))
     setPersonaSecret('')
     setCurlNote('')
@@ -241,7 +245,7 @@ export function ProjectNewRunSheet({
       setCurlNote('Could not detect a Cookie:, Authorization: Bearer, or custom auth header.')
       return
     }
-    setAuthKind(parsed.authKind)
+    setSignInMethod(parsed.authKind)
     if (parsed.headerName) setPersonaHeaderName(parsed.headerName)
     if (parsed.origin && !personaOrigins.includes(parsed.origin)) {
       setPersonaOrigins(prev => prev.trim() ? `${prev.trim()}\n${parsed.origin}` : parsed.origin!)
@@ -261,12 +265,12 @@ export function ProjectNewRunSheet({
       handle: personaHandle.trim(),
       roleLabel: personaRole.trim(),
       originAllowlist: allowlist,
-      authKind,
-      ...(authKind === 'header' && headerNameRaw ? { headerName: headerNameRaw } : {}),
-      ...(authKind === 'login' ? {
+      authKind: effectiveAuthKind,
+      ...(effectiveAuthKind === 'header' && headerNameRaw ? { headerName: headerNameRaw } : {}),
+      ...(effectiveAuthKind === 'login' ? {
         loginConfig: {
-          adapter: loginAdapter,
-          email: loginEmail.trim(),
+          adapter: isClerkClient ? 'clerk_client' : loginAdapter,
+          ...(!isClerkClient ? { email: loginEmail.trim() } : {}),
           ...(loginUrlRaw ? { loginUrl: loginUrlRaw } : {}),
         },
       } : {}),
@@ -447,7 +451,7 @@ export function ProjectNewRunSheet({
                         </Button>
                       </div>
                     </div>
-                    {authKind !== 'login' && (
+                    {effectiveAuthKind !== 'login' && (
                       <div className="grid gap-1">
                         <div className="flex items-center gap-1.5">
                           <Input
@@ -496,19 +500,48 @@ export function ProjectNewRunSheet({
                       </label>
                     </div>
                     <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
-                      Auth kind
+                      Sign-in method
                       <NativeSelect
                         className="w-full"
-                        value={authKind}
-                        onChange={e => setAuthKind(e.target.value as PersonaAuthKind)}
+                        value={signInMethod}
+                        onChange={e => setSignInMethod(e.target.value as PersonaAuthKind | 'clerk_client')}
                       >
                         <option value="login">Email + Password (auto-login &amp; refresh)</option>
+                        <option value="clerk_client">Clerk __client cookie (auto-refresh)</option>
                         <option value="cookie">Session cookie</option>
                         <option value="bearer">Bearer token</option>
                         <option value="header">Custom header</option>
                       </NativeSelect>
                     </label>
-                    {authKind === 'login' ? (
+                    {isClerkClient ? (
+                      <div className="grid gap-2">
+                        <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                          Clerk __client cookie
+                          <Input
+                            className="w-full font-mono text-[12px]"
+                            type="password"
+                            value={personaSecret}
+                            onChange={e => setPersonaSecret(e.target.value)}
+                            placeholder="Paste __client cookie value from DevTools (clerk.yourdomain.com)"
+                            autoComplete="off"
+                          />
+                          <small className="text-[11.5px] font-normal text-fg-subtle">
+                            Copy <code className="font-mono">__client</code> from DevTools → Application → Cookies on <code className="font-mono">clerk.&lt;domain&gt;</code> or <code className="font-mono">*.clerk.accounts.dev</code>.
+                          </small>
+                        </label>
+                        <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                          Clerk Frontend API URL (optional)
+                          <Input
+                            className="w-full"
+                            type="url"
+                            value={loginUrl}
+                            onChange={e => setLoginUrl(e.target.value)}
+                            placeholder={LOGIN_URL_PLACEHOLDERS.clerk_client}
+                            autoComplete="off"
+                          />
+                        </label>
+                      </div>
+                    ) : effectiveAuthKind === 'login' ? (
                       <>
                         <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
                           <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
@@ -540,10 +573,19 @@ export function ProjectNewRunSheet({
                             <NativeSelect
                               className="w-full"
                               value={loginAdapter}
-                              onChange={e => setLoginAdapter(e.target.value as PersonaLoginAdapter)}
+                              onChange={e => {
+                                const next = e.target.value as PersonaLoginAdapter
+                                if (next === 'clerk_client') {
+                                  setSignInMethod('clerk_client')
+                                  setLoginAdapter('auto')
+                                } else {
+                                  setLoginAdapter(next)
+                                }
+                              }}
                             >
                               <option value="auto">Auto-detect</option>
                               <option value="clerk">Clerk (auto-refresh)</option>
+                              <option value="clerk_client">Clerk __client cookie (auto-refresh)</option>
                               <option value="json">JSON API / Better Auth</option>
                               <option value="supabase">Supabase Auth</option>
                               <option value="form">Login Form (Browser)</option>
@@ -564,7 +606,7 @@ export function ProjectNewRunSheet({
                       </>
                     ) : (
                       <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
-                        {authKind === 'header' && (
+                        {effectiveAuthKind === 'header' && (
                           <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
                             Header name
                             <Input
@@ -600,8 +642,8 @@ export function ProjectNewRunSheet({
                           personaAction.pending ||
                           !personaHandle.trim() ||
                           !personaRole.trim() ||
-                          !personaSecret ||
-                          (authKind === 'login' ? !loginEmail.trim() : !personaSecret.trim())
+                          !personaSecret.trim() ||
+                          (signInMethod === 'login' && !loginEmail.trim())
                         }
                         onClick={saveInlinePersona}
                       >

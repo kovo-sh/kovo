@@ -33,6 +33,7 @@ export interface DiscoveredGithubRepo {
 export const LOGIN_URL_PLACEHOLDERS: Record<PersonaLoginAdapter, string> = {
   auto: 'Optional — auto-detected for Clerk',
   clerk: 'Optional — auto-detected for Clerk',
+  clerk_client: 'Optional — auto-detected, or https://<instance>.clerk.accounts.dev',
   json: 'https://app.example.com/api/auth/sign-in/email',
   supabase: 'Optional — defaults to <origin>/auth/v1/token?grant_type=password',
   form: 'Optional — defaults to <origin>/login',
@@ -51,6 +52,9 @@ export function formatPersonaAuthBadge(persona: PublicPersona): string {
   if (persona.authKind === 'login') {
     const email = persona.loginConfig?.email
     const adapter = persona.loginConfig?.adapter ?? 'auto'
+    if (adapter === 'clerk_client') {
+      return email ? `${email} · Clerk __client (auto-refresh)` : 'Clerk __client (auto-refresh)'
+    }
     return email ? `${email} · login (${adapter})` : `login (${adapter})`
   }
   return persona.headerName ? `${persona.authKind} · ${persona.headerName}` : persona.authKind

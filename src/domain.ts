@@ -497,7 +497,7 @@ export const personaHandle = z.string().trim().regex(/^[a-z0-9][a-z0-9_-]{0,47}$
 export const personaAuthKinds = ['login', 'cookie', 'bearer', 'header'] as const
 export type PersonaAuthKind = typeof personaAuthKinds[number]
 
-export const personaLoginAdapters = ['auto', 'clerk', 'supabase', 'json', 'form'] as const
+export const personaLoginAdapters = ['auto', 'clerk', 'clerk_client', 'supabase', 'json', 'form'] as const
 export type PersonaLoginAdapter = typeof personaLoginAdapters[number]
 
 const personaLoginUrl = z.string().trim().max(500).transform((input, ctx) => {
@@ -516,7 +516,7 @@ const personaLoginUrl = z.string().trim().max(500).transform((input, ctx) => {
 
 export const personaLoginConfigSchema = z.object({
   adapter: z.enum(personaLoginAdapters).default('auto'),
-  email: z.string().trim().min(1).max(320),
+  email: z.string().trim().max(320).transform(v => v || undefined).optional(),
   loginUrl: personaLoginUrl.optional(),
   emailField: z.string().trim().min(1).max(64).optional(),
   passwordField: z.string().trim().min(1).max(64).optional(),
@@ -526,6 +526,14 @@ export const personaLoginConfigSchema = z.object({
   refreshUrl: personaLoginUrl.optional(),
   refreshTokenJsonPath: z.string().trim().min(1).max(160).optional(),
   csrfPrefetchUrl: personaLoginUrl.optional(),
+}).superRefine((val, ctx) => {
+  if (val.adapter !== 'clerk_client' && !val.email) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['email'],
+      message: 'Email is required for password-based login adapters.',
+    })
+  }
 })
 export type PersonaLoginConfig = z.output<typeof personaLoginConfigSchema>
 
@@ -547,6 +555,12 @@ export const createPersona = z.object({
         code: 'custom',
         path: ['loginConfig'],
         message: 'Email and login configuration are required for Email + Password personas.',
+      })
+    } else if (val.loginConfig.adapter === 'clerk_client' && !val.secret.trim()) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['secret'],
+        message: 'Clerk __client cookie value is required.',
       })
     }
   } else if (!val.secret.trim()) {

@@ -169,11 +169,13 @@ function CrossAccountEmptySvg() {
   )
 }
 
+type PersonaSignInMethod = PersonaAuthKind | 'clerk_client'
+
 export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPersonaCreated }: Props) {
   const { project, personas } = data
   const [modalOpen, setModalOpen] = useState(false)
   const [personaToDelete, setPersonaToDelete] = useState<PublicPersona | null>(null)
-  const [authKind, setAuthKind] = useState<PersonaAuthKind>('login')
+  const [signInMethod, setSignInMethod] = useState<PersonaSignInMethod>('login')
   const [loginAdapter, setLoginAdapter] = useState<PersonaLoginAdapter>('auto')
   const [loginEmail, setLoginEmail] = useState('')
   const [loginUrl, setLoginUrl] = useState('')
@@ -187,6 +189,8 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
   const [curlNote, setCurlNote] = useState('')
   const [notice, setNotice] = useState('')
   const personaAction = useAction()
+  const isClerkClient = signInMethod === 'clerk_client'
+  const effectiveAuthKind: PersonaAuthKind = isClerkClient ? 'login' : signInMethod
 
   function deriveHandle(label: string): string {
     return label
@@ -206,6 +210,7 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
     setHandle('')
     setRoleLabel('')
     setHeaderName('')
+    setSignInMethod('login')
     setLoginAdapter('auto')
     setLoginEmail('')
     setLoginUrl('')
@@ -219,8 +224,10 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
   function prefillPair(which: 'user_a' | 'user_b') {
     setHandle(which)
     setRoleLabel(which === 'user_a' ? 'User A (Control / Owner)' : 'User B (Cross-User)')
-    setAuthKind('login')
-    setLoginAdapter('auto')
+    if (!isClerkClient) {
+      setSignInMethod('login')
+      setLoginAdapter('auto')
+    }
     setOrigins(project.seeds.join('\n'))
     setSecret('')
     setCurlNote('')
@@ -232,7 +239,7 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
       setCurlNote('Could not detect a Cookie:, Authorization: Bearer, or custom auth header.')
       return
     }
-    setAuthKind(parsed.authKind)
+    setSignInMethod(parsed.authKind)
     if (parsed.headerName) setHeaderName(parsed.headerName)
     if (parsed.origin && !origins.includes(parsed.origin)) {
       setOrigins(prev => prev.trim() ? `${prev.trim()}\n${parsed.origin}` : parsed.origin!)
@@ -378,12 +385,12 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
                 handle: handle.trim(),
                 roleLabel: roleLabel.trim(),
                 originAllowlist: allowlist,
-                authKind,
-                ...(authKind === 'header' && headerNameRaw ? { headerName: headerNameRaw } : {}),
-                ...(authKind === 'login' ? {
+                authKind: effectiveAuthKind,
+                ...(effectiveAuthKind === 'header' && headerNameRaw ? { headerName: headerNameRaw } : {}),
+                ...(effectiveAuthKind === 'login' ? {
                   loginConfig: {
-                    adapter: loginAdapter,
-                    email: loginEmail.trim(),
+                    adapter: isClerkClient ? 'clerk_client' : loginAdapter,
+                    ...(!isClerkClient ? { email: loginEmail.trim() } : {}),
                     ...(loginUrlRaw ? { loginUrl: loginUrlRaw } : {}),
                   },
                 } : {}),
@@ -451,10 +458,11 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
                   <NativeSelect
                     className="w-full"
                     name="authKind"
-                    value={authKind}
-                    onChange={e => setAuthKind(e.target.value as PersonaAuthKind)}
+                    value={signInMethod}
+                    onChange={e => setSignInMethod(e.target.value as PersonaSignInMethod)}
                   >
                     <option value="login">Email + Password (auto-login &amp; refresh)</option>
+                    <option value="clerk_client">Clerk __client cookie (auto-refresh)</option>
                     <option value="cookie">Session cookie (Cookie: …)</option>
                     <option value="bearer">Bearer token (Authorization: Bearer …)</option>
                     <option value="header">Custom request header</option>
@@ -462,7 +470,7 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
                 </label>
               </div>
 
-              {authKind !== 'login' && (
+              {effectiveAuthKind !== 'login' && (
                 <div className="grid gap-1.5">
                   <div className="flex items-center gap-1.5">
                     <Input
@@ -491,7 +499,40 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
                 </div>
               )}
 
-              {authKind === 'login' ? (
+              {isClerkClient ? (
+                <div className="grid gap-2.5">
+                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                    Clerk __client cookie
+                    <Input
+                      className="w-full font-mono text-[12px]"
+                      name="secret"
+                      type="password"
+                      required
+                      maxLength={4096}
+                      autoComplete="off"
+                      value={secret}
+                      onChange={e => setSecret(e.target.value)}
+                      placeholder="Paste __client cookie value from DevTools (clerk.yourdomain.com)"
+                    />
+                    <small className="text-[11.5px] font-normal text-fg-subtle">
+                      In your signed-in browser, open DevTools → Application → Cookies on <code className="font-mono">clerk.&lt;domain&gt;</code> or <code className="font-mono">*.clerk.accounts.dev</code> and copy <code className="font-mono">__client</code>. Accepts raw value, <code className="font-mono">__client=…</code>, or a full <code className="font-mono">Cookie:</code> header.
+                    </small>
+                  </label>
+                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                    Clerk Frontend API URL (optional)
+                    <Input
+                      className="w-full"
+                      name="loginUrl"
+                      type="url"
+                      maxLength={500}
+                      autoComplete="off"
+                      value={loginUrl}
+                      onChange={e => setLoginUrl(e.target.value)}
+                      placeholder={LOGIN_URL_PLACEHOLDERS.clerk_client}
+                    />
+                  </label>
+                </div>
+              ) : effectiveAuthKind === 'login' ? (
                 <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
                   <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
                     Email
@@ -557,23 +598,32 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
                         onChange={e => setHandle(e.target.value)}
                       />
                     </label>
-                    {authKind === 'login' ? (
+                    {effectiveAuthKind === 'login' && !isClerkClient ? (
                       <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
                         Auth provider
                         <NativeSelect
                           className="w-full"
                           name="loginAdapter"
                           value={loginAdapter}
-                          onChange={e => setLoginAdapter(e.target.value as PersonaLoginAdapter)}
+                          onChange={e => {
+                            const next = e.target.value as PersonaLoginAdapter
+                            if (next === 'clerk_client') {
+                              setSignInMethod('clerk_client')
+                              setLoginAdapter('auto')
+                            } else {
+                              setLoginAdapter(next)
+                            }
+                          }}
                         >
                           <option value="auto">Auto-detect</option>
                           <option value="clerk">Clerk (auto-refresh 60s JWT)</option>
+                          <option value="clerk_client">Clerk __client cookie (auto-refresh)</option>
                           <option value="json">JSON API / Better Auth</option>
                           <option value="supabase">Supabase Auth</option>
                           <option value="form">Login Form (Browser)</option>
                         </NativeSelect>
                       </label>
-                    ) : authKind === 'header' ? (
+                    ) : effectiveAuthKind === 'header' ? (
                       <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
                         Header name
                         <Input
@@ -589,7 +639,7 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
                     ) : null}
                   </div>
 
-                  {authKind === 'login' && (
+                  {effectiveAuthKind === 'login' && !isClerkClient && (
                     <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
                       Login URL (optional)
                       <Input
