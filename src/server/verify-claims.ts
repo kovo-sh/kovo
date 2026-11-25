@@ -2072,7 +2072,11 @@ export function causalFingerprints(
         path: pathFingerprint(probe?.request?.pathAndQuery),
         status: probe?.response?.status != null ? Number(probe.response.status) : null,
         expectation: { minRounds: claim.minRounds ?? 3, minDeltaTokens: claim.minDeltaTokens ?? 1 },
-        observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
+        observed: {
+          passed: Boolean(check.passed),
+          separated: Boolean(check.passed),
+          minRounds: claim.minRounds ?? 3,
+        },
       }
     }
     if (claim.kind === 'race') {
@@ -2173,13 +2177,28 @@ export function causalFingerprints(
         default: return null
       }
     })()
+    const observed = (() => {
+      if (claim.kind === 'body_contains') {
+        return { passed: Boolean(check.passed), absent: Boolean(claim.absent) }
+      }
+      if (claim.kind === 'jsonpath' && claim.equals === undefined) {
+        const obs = asRecord(check.observed)
+        const val = obs && 'value' in obs ? obs.value : check.observed
+        return {
+          passed: Boolean(check.passed),
+          exists: val !== undefined && val !== null,
+          valueType: val === null ? 'null' : Array.isArray(val) ? 'array' : typeof val,
+        }
+      }
+      return normalizedValue(check.observed ?? null, nonce)
+    })()
     return {
       kind: claim.kind,
       method: record?.request?.method ?? '',
       path: pathFingerprint(record?.request?.pathAndQuery),
       status: record?.response?.status ?? null,
       expectation: normalizedValue(expectation, nonce),
-      observed: normalizedValue(check.observed ?? null, nonce),
+      observed,
     }
   })
 }
