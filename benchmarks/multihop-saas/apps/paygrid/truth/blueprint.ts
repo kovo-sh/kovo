@@ -115,7 +115,8 @@ function profile(base: Partial<LabProfile>, asyncLatencyMs: number): LabProfile 
 }
 
 export function profileFor(mode: LabMode, twinId?: string, asyncLatencyMs = 25): LabProfile {
-  if (mode === 'hardened') return profile({}, asyncLatencyMs)
+  // Hardened keeps every protection on, including the exact export prefix + mint role re-check.
+  if (mode === 'hardened') return profile({ strictExportPath: true }, asyncLatencyMs)
   if (!twinId) {
     return profile({
       directoryShowsPendingEmail: true,

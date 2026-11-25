@@ -82,6 +82,14 @@ export async function handleEdge(
       sendJson(res, 403, { error: 'invalid signature' })
       return
     }
+    // The signature binds job, tenant and file; additionally the job must be a real export of the
+    // signed tenant so a link can never outlive or out-scope the job that minted it.
+    const job = state.jobs.find((item) => item.id === jobId && item.kind === 'export')
+    if (!job || job.status !== 'ready' || state.orgs[job.tenantId]?.slug !== signedTenant) {
+      state.emit('file.download_denied', { reason: 'job_scope', path: url.pathname, runId })
+      sendJson(res, 403, { error: 'export job does not match signed tenant' })
+      return
+    }
     const prefix = `/files/export/${signedTenant}`
     const allowed = state.profile.strictExportPath
       ? url.pathname.startsWith(`${prefix}/`) && pathTenant === signedTenant

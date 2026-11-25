@@ -22,6 +22,16 @@ function mint(_state: LabState, prefix: string, _label: string): string {
   return `${prefix}${randomBytes(9).toString('hex')}`
 }
 
+function tenantRole(state: LabState, session: SessionRecord, tenantId: TenantKey): LabRole | null {
+  return state.users.find((user) => user.id === session.userId)?.rolesByTenant[tenantId] ?? null
+}
+
+/** Invitation / token administration is limited to tenant owners and admins. */
+function tenantAdmin(state: LabState, session: SessionRecord, tenantId: TenantKey): boolean {
+  const role = tenantRole(state, session, tenantId)
+  return role === 'owner' || role === 'admin'
+}
+
 function issueSession(
   state: LabState, userIndex: number, tenantId: TenantKey, role: LabRole,
   originPersona: SessionRecord['originPersona'], runId: string,
@@ -150,8 +160,13 @@ export async function handleIdp(req: IncomingMessage, res: ServerResponse, state
 
   if (match(url, method, '/invites')) {
     if (method === 'GET') {
+      const viewer = authenticate(state, req)
+      if (!viewer) {
+        sendJson(res, 401, { error: 'session required' })
+        return
+      }
       sendJson(res, 200, {
-        invites: state.invites.map((invite) => ({
+        invites: state.invites.filter((invite) => tenantAdmin(state, viewer, invite.tenantId)).map((invite) => ({
           id: invite.id, tenant: invite.tenantId, role: invite.role,
           email: invite.emailRaw, revoked: invite.revoked, verified: invite.verified,
         })),
@@ -165,6 +180,17 @@ export async function handleIdp(req: IncomingMessage, res: ServerResponse, state
     const tenantId = body?.tenant ? tenantBySlug(state, body.tenant) : null
     if (!body?.email || !tenantId) {
       sendJson(res, 400, { error: 'tenant and email required' })
+      return
+    }
+    // Issuing an invite is a privileged act: without this gate any caller could mint a verified
+    // invite for an existing user's email and redeem it via /invites/resolve as that user.
+    const inviter = authenticate(state, req)
+    if (!inviter) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
+    if (!tenantAdmin(state, inviter, tenantId)) {
+      sendJson(res, 403, { error: 'invite requires owner or admin' })
       return
     }
     const invite: InviteRecord = {
@@ -186,8 +212,13 @@ export async function handleIdp(req: IncomingMessage, res: ServerResponse, state
 
   const revokeInvite = match(url, method, '/invites/:id/revoke')
   if (revokeInvite) {
+    const actor = authenticate(state, req)
+    if (!actor) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
     const invite = state.invites.find((item) => item.id === revokeInvite[0])
-    if (!invite) {
+    if (!invite || !tenantAdmin(state, actor, invite.tenantId)) {
       sendJson(res, 404, { error: 'unknown invite' })
       return
     }
@@ -257,11 +288,16 @@ export async function handleIdp(req: IncomingMessage, res: ServerResponse, state
       sendJson(res, 401, { error: 'session required' })
       return
     }
+    const requestedTenant = body?.tenant ? tenantBySlug(state, body.tenant) : null
+    if (body?.tenant && (!requestedTenant || !tenantRole(state, session, requestedTenant))) {
+      sendJson(res, 403, { error: 'not a member of this tenant' })
+      return
+    }
     const pat: PatRecord = {
       id: mint(state, 'mh_pat_', `pat-id:${session.userId}`),
       token: mint(state, 'mh_fake_pat_', `pat:${session.userId}`),
       userId: session.userId,
-      tenantId: (body?.tenant ? tenantBySlug(state, body.tenant) : null) ?? session.tenantId,
+      tenantId: requestedTenant ?? session.tenantId,
       scopes: body?.scopes ?? ['read'],
       revoked: false,
       runId,
@@ -274,13 +310,20 @@ export async function handleIdp(req: IncomingMessage, res: ServerResponse, state
 
   const revokePat = match(url, method, '/pats/:id/revoke')
   if (revokePat) {
+    // Revocation needs a live session owned by the token holder (or an owner/admin of its tenant);
+    // unknown and foreign ids share one 404 so the route cannot be used to probe id existence.
+    const actor = authenticate(state, req)
+    if (!actor) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
     const pat = state.pats.find((item) => item.id === revokePat[0])
-    if (!pat) {
+    if (!pat || (pat.userId !== actor.userId && !tenantAdmin(state, actor, pat.tenantId))) {
       sendJson(res, 404, { error: 'unknown token' })
       return
     }
     pat.revoked = true
-    state.emit('pat.revoked', { patId: pat.id, tenantId: pat.tenantId, runId })
+    state.emit('pat.revoked', { patId: pat.id, tenantId: pat.tenantId, runId }, actor.originPersona)
     sendJson(res, 200, { ok: true })
     return
   }
