@@ -10,7 +10,7 @@ import type { DetailedPeerCertificate } from 'node:tls'
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib'
 import ipaddr from 'ipaddr.js'
 import { referrerPolicies } from '../domain.ts'
-import type { ApprovedEndpointPattern, CapabilityTier, HttpMethod, PreparedObservation } from '../domain.ts'
+import type { ApprovalPolicy, ApprovedEndpointPattern, CapabilityTier, HttpMethod, PreparedObservation } from '../domain.ts'
 import { cacheBusterValueRegex, containsDestructivePayload, containsWebshellSignature } from '../replay-spec.ts'
 import type { AuthMutation, CsrfBind } from '../replay-spec.ts'
 import { computeStateChangeBodyHash, isLocalLabAutoApprovalOrigin } from './approval-judge.ts'
@@ -22,7 +22,7 @@ import type { ResolvedPersona } from './persona-vault.ts'
 import { redact, redactHeaders, scanSecretHeaders, scanSecrets } from './redact.ts'
 import type { NamedSecret, SecretMatch } from './redact.ts'
 import { evaluateScopeRequest, isVerifiedReadOnlyGraphqlQuery, originRoleFor } from './scope-policy.ts'
-import type { ScopeHook, ScopePolicy } from './scope-policy.ts'
+import type { EnvironmentMode, ScopeHook, ScopePolicy } from './scope-policy.ts'
 import { globalKillSwitch, KillSwitchTrippedError } from './kill-switch.ts'
 import type { GlobalKillSwitch } from './kill-switch.ts'
 import {
@@ -297,6 +297,8 @@ export type Grant = {
    * mutations without per-request approval. Omitted grants keep legacy v5 behavior exactly.
    */
   scopePolicy?: ScopePolicy
+  /** Optional Tier-3 approval policy (`auto_review` | `yolo` | `strict`) when supplied directly. */
+  approvalPolicy?: ApprovalPolicy
   /** v7 M4: optional tenant namespace used for tenant-scoped kill-switch checks. */
   tenantId?: string
   /**
@@ -2724,9 +2726,21 @@ export class RequestBroker {
 
     // v6 Layer-1: one policy decision for every request shape (including reads, so active probing
     // of auth/asset origins is refused here rather than only in the mutation gate).
+    //
+    // Explicit `prod_readonly` / `staging_isolated` contracts (via `setEnvironmentMode()` or a
+    // standalone unit-test grant) keep strict v6 contract enforcement. For derived Tier-3 runs
+    // where Tier + Approval Policy is the single source of truth, authorized Tier-3 writes flow
+    // cleanly through `approvalPolicy` (`yolo` = autonomous, `auto_review` = safe auto + ask risky,
+    // `strict` = ask every write) while hard scope boundaries (out-of-scope, auth/asset origins,
+    // routeDenylist) always stay enforced.
+    const approvalMeta = this.resolveGrantApprovalContext(grant)
     let contractApproved = false
     if (grant.scopePolicy) {
-      const decision = evaluateScopeRequest(grant.scopePolicy, {
+      const effectiveScopePolicy: ScopePolicy =
+        approvalMeta.liveEnvironmentMode && approvalMeta.liveEnvironmentMode !== grant.scopePolicy.mode
+          ? { ...grant.scopePolicy, mode: approvalMeta.liveEnvironmentMode }
+          : grant.scopePolicy
+      const decision = evaluateScopeRequest(effectiveScopePolicy, {
         origin: initialOrigin,
         method: req.method,
         pathAndQuery: req.pathAndQuery,
@@ -2734,11 +2748,35 @@ export class RequestBroker {
         headers: req.headers,
         hook: req.scopeHook ?? null,
       })
-      const contractApplies = grant.scopePolicy.mode !== 'ephemeral_lab'
+      const contractApplies = effectiveScopePolicy.mode !== 'ephemeral_lab'
+      const verifiedGraphqlRead = req.method === 'POST' &&
+        isVerifiedReadOnlyGraphqlQuery(req.pathAndQuery, req.body ?? null, req.headers)
+      const isStructuralMutation = req.method === 'DELETE' || hasMultipart || hasMultipartContentType || hasCompressedBody
+      const sandboxPostAllowed = !hasMultipart && !hasMultipartContentType &&
+        req.method === 'POST' && tier === 2 &&
+        grant.sandboxWriteAllowlist !== undefined &&
+        matchesSandboxWriteAllowlist(initialOrigin, url.pathname, req.pathAndQuery, grant.sandboxWriteAllowlist)
+
       if (decision.allowed) {
-        // Ephemeral labs keep the legacy approval flow unless an operator granted a durable lease.
-        contractApproved = contractApplies ||
-          (!isReadOnlyMethod && grant.approvalLeases?.(initialOrigin, req.method, req.pathAndQuery) === true)
+        if (isReadOnlyMethod || verifiedGraphqlRead) {
+          contractApproved = contractApplies
+        } else if (approvalMeta.explicitEnvironmentMode) {
+          // Explicit v6 environment contract (or ephemeral lab): preserve contract semantics verbatim.
+          contractApproved = contractApplies ||
+            grant.approvalLeases?.(initialOrigin, req.method, req.pathAndQuery) === true
+        } else if (!contractApplies) {
+          contractApproved = grant.approvalLeases?.(initialOrigin, req.method, req.pathAndQuery) === true
+        } else if (approvalMeta.effectivePolicy === 'yolo') {
+          contractApproved = true
+        } else if (approvalMeta.effectivePolicy === 'strict') {
+          contractApproved = grant.approvalLeases?.(initialOrigin, req.method, req.pathAndQuery) === true
+        } else {
+          // auto_review: durable leases and safe tagged writes auto-approve; DELETE / multipart /
+          // compressed requests still flow through approvalPatterns / Safety Judge / HITL.
+          contractApproved =
+            grant.approvalLeases?.(initialOrigin, req.method, req.pathAndQuery) === true ||
+            !isStructuralMutation
+        }
       } else {
         // A durable operator lease may authorize a route the environment contract would otherwise
         // refuse. It can never widen origin scope or permit active auth/asset probing.
@@ -2748,14 +2786,23 @@ export class RequestBroker {
           decision.code !== 'asset_origin_active_probe'
         const leased = leaseEligible &&
           grant.approvalLeases?.(initialOrigin, req.method, req.pathAndQuery) === true
-        if (!leased) {
+        if (leased) {
+          contractApproved = true
+        } else if (decision.code === 'readonly_environment' && sandboxPostAllowed) {
+          // Tier-2 project sandboxWriteAllowlist explicitly authorizes this non-multipart POST.
+          contractApproved = false
+        } else if (
+          decision.code === 'staging_untagged_mutation' &&
+          !approvalMeta.explicitEnvironmentMode &&
+          tier >= 3
+        ) {
+          // Derived Tier-3 run: let `approvalPolicy` decide instead of hard-failing untagged writes.
+          contractApproved = approvalMeta.effectivePolicy === 'yolo'
+        } else {
           grant.audit('denied', initialOrigin)
           throw new BrokerDenied(decision.reason)
         }
-        contractApproved = true
       }
-      const verifiedGraphqlRead = req.method === 'POST' &&
-        isVerifiedReadOnlyGraphqlQuery(req.pathAndQuery, req.body ?? null, req.headers)
       if (contractApproved && !isReadOnlyMethod && !verifiedGraphqlRead && tier < 3) {
         grant.audit('denied', initialOrigin)
         throw new BrokerDenied(`Method ${req.method} requires Tier 3 (approval-gated state validation).`)
@@ -2846,6 +2893,39 @@ export class RequestBroker {
       maxRps,
       timeoutMs,
     }
+  }
+
+  private resolveGrantApprovalContext(grant: Grant): {
+    effectivePolicy: ApprovalPolicy | undefined
+    liveEnvironmentMode: EnvironmentMode | undefined
+    explicitEnvironmentMode: boolean
+  } {
+    let effectivePolicy = grant.approvalPolicy
+    let liveEnvironmentMode: EnvironmentMode | undefined
+    let explicitEnvironmentMode = false
+    const runId = grant.scopePolicy?.runId
+    const store = grant.storage as {
+      run?: (id: string) => { approvalPolicy?: ApprovalPolicy; environmentMode?: EnvironmentMode }
+      eventsAfter?: (id: string, after: number, limit?: number) => Array<{ kind: string }>
+    } | undefined
+    if (runId && store && typeof store.run === 'function') {
+      try {
+        const liveRun = store.run(runId)
+        if (!effectivePolicy && liveRun.approvalPolicy) effectivePolicy = liveRun.approvalPolicy
+        if (liveRun.environmentMode) liveEnvironmentMode = liveRun.environmentMode
+        if (typeof store.eventsAfter === 'function') {
+          explicitEnvironmentMode = store.eventsAfter(runId, 0, 500).some(e => e.kind === 'scope.environment_mode')
+        }
+      } catch {
+        // Stub store without run record: fall back to static grant fields.
+        explicitEnvironmentMode = grant.approvalPolicy === undefined
+      }
+    } else {
+      // Standalone grant without a live store (e.g. unit tests): treat scopePolicy.mode as explicit
+      // unless the caller explicitly supplied `grant.approvalPolicy`.
+      explicitEnvironmentMode = grant.approvalPolicy === undefined
+    }
+    return { effectivePolicy, liveEnvironmentMode, explicitEnvironmentMode }
   }
 
   private async applyAuthMutationIfNeeded(
@@ -3176,8 +3256,17 @@ export class RequestBroker {
       if (activeMethod === 'GET' || activeMethod === 'HEAD' ||
           (activeMethod === 'OPTIONS' && (activeBody === undefined || activeBody === ''))) return
       const targetPathAndQuery = `${target.pathname}${target.search}`
+      const multipart = Array.isArray(req.multipartParts) && req.multipartParts.length > 0
+      const hasMultipartHeader = /^\s*multipart\//i.test(
+        Object.entries(cleanHeaders).find(([k]) => k.toLowerCase() === 'content-type')?.[1] ?? '',
+      )
       if (grant.scopePolicy) {
-        const decision = evaluateScopeRequest(grant.scopePolicy, {
+        const approvalMeta = this.resolveGrantApprovalContext(grant)
+        const effectiveScopePolicy: ScopePolicy =
+          approvalMeta.liveEnvironmentMode && approvalMeta.liveEnvironmentMode !== grant.scopePolicy.mode
+            ? { ...grant.scopePolicy, mode: approvalMeta.liveEnvironmentMode }
+            : grant.scopePolicy
+        const decision = evaluateScopeRequest(effectiveScopePolicy, {
           origin: target.origin,
           method: activeMethod,
           pathAndQuery: targetPathAndQuery,
@@ -3186,23 +3275,36 @@ export class RequestBroker {
           redirectHop: true,
           hook: req.scopeHook ?? null,
         })
+        const contractApplies = effectiveScopePolicy.mode !== 'ephemeral_lab'
         if (!decision.allowed) {
-          const leaseEligible = grant.scopePolicy.mode !== 'ephemeral_lab' &&
+          const leaseEligible = contractApplies &&
             decision.code !== 'out_of_scope' &&
             decision.code !== 'auth_origin_active_probe' &&
             decision.code !== 'asset_origin_active_probe'
           const leased = leaseEligible &&
             grant.approvalLeases?.(target.origin, activeMethod, targetPathAndQuery) === true
-          if (!leased) {
+          if (leased) return
+          if (
+            decision.code === 'staging_untagged_mutation' &&
+            !approvalMeta.explicitEnvironmentMode &&
+            (grant.tier ?? 1) >= 3
+          ) {
+            if (approvalMeta.effectivePolicy === 'yolo') return
+          } else {
             grant.audit('denied', target.origin)
             throw new BrokerDenied(decision.reason)
           }
-        } else if (grant.scopePolicy.mode !== 'ephemeral_lab') {
-          // Environment contract authorized the redirect target; no per-request approval popup.
-          return
+        } else if (contractApplies) {
+          if (approvalMeta.explicitEnvironmentMode) {
+            // Explicit environment contract authorized the redirect target; no per-request approval popup.
+            return
+          }
+          if (approvalMeta.effectivePolicy === 'yolo') return
+          if (grant.approvalLeases?.(target.origin, activeMethod, targetPathAndQuery) === true) return
+          const isStructural = activeMethod === 'DELETE' || multipart || hasMultipartHeader || hasCompressedBody
+          if (approvalMeta.effectivePolicy !== 'strict' && !isStructural) return
         }
       }
-      const multipart = Array.isArray(req.multipartParts) && req.multipartParts.length > 0
       const context: StateChangeApprovalContext = {
         personaHandle: includePersona ? (personaHandle ?? null) : null,
         body: multipart ? null : (bodyForHop ?? null),

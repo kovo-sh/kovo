@@ -338,19 +338,18 @@ export function authorizeStateChange(input: {
   }
 
   const context = input.context
-  // Structural escalations are evaluated before patterns: multipart/upload, DELETE, RCE, race
-  // bursts and compressed or over-cap bodies can never be pre-authorized by a broad operator
-  // pattern. Patterns additionally require the caller to supply the exact request context — a
-  // context-less call (e.g. a replay retry that cannot describe the request) fails closed instead
-  // of inheriting a pattern grant. Keyword payloads are deliberately not a gate in v6.
-  const hardEscalation = !context || Boolean(detectStructuralEscalationReason({
-    method: input.method.toUpperCase(),
+  // Non-overridable structural invariants are ALWAYS evaluated before operator patterns:
+  // RCE proof, compressed or over-cap bodies, malformed multipart uploads, race bursts, and
+  // context-less calls can never be pre-authorized by a pattern. Once those pass, an explicit
+  // operator pattern ("Approve similar") honors the operator's approval on that normalized route,
+  // including DELETE and well-formed multipart routes they explicitly approved.
+  const nonOverridable = !context || Boolean(detectNonOverridableEscalationReason({
     bodyPreview: context?.body ?? null,
     hasMultipart: context?.hasMultipart,
     isRceProof: context?.isRceProof,
     hasCompressedBody: context?.hasCompressedBody,
   }))
-  if (context && !context.isRaceBurst && !hardEscalation) {
+  if (context && !context.isRaceBurst && !nonOverridable) {
     const pattern = matchesApprovedEndpointPattern(
       { origin: input.origin, method: input.method, pathAndQuery: input.pathAndQuery },
       input.approvedPatterns,
@@ -521,13 +520,11 @@ function isReadOnlySearchPost(pathAndQuery: string, body: string | null | undefi
 }
 
 /**
- * Structural escalations only. These describe the *shape* of a request that cannot be classified
- * deterministically (RCE proof, compressed or oversized body, malformed/multipart upload, DELETE);
- * they are not keyword scans. A real human gate is an operator opt-in (`strict` policy or an
- * explicit sensitive-route pattern), never a guess about English words in a path or payload.
+ * Non-overridable structural safety invariants that ALWAYS require explicit human approval, even
+ * when an operator has approved a route pattern ("Approve similar"): RCE proofs, compressed
+ * request bodies, over-cap bodies (>64 KiB), and malformed multipart uploads.
  */
-function detectStructuralEscalationReason(input: {
-  method: string
+function detectNonOverridableEscalationReason(input: {
   bodyPreview?: string | null
   headers?: Record<string, string>
   hasMultipart?: boolean
@@ -548,6 +545,21 @@ function detectStructuralEscalationReason(input: {
   if (multipartKind === 'malformed_multipart') {
     return 'Malformed multipart upload (missing or invalid boundary) always requires explicit human approval.'
   }
+  return null
+}
+
+/**
+ * Route-level structural escalations (well-formed multipart upload and HTTP DELETE). These
+ * escalate in Stage 1A when unapproved, but are honored once the operator explicitly approves the
+ * exact normalized route via "Approve similar" (Stage 1B).
+ */
+function detectRouteStructuralEscalationReason(input: {
+  method: string
+  bodyPreview?: string | null
+  headers?: Record<string, string>
+  hasMultipart?: boolean
+}): string | null {
+  const multipartKind = detectMultipartRequest(input)
   if (multipartKind === 'multipart') {
     return 'Multipart file upload probe always requires explicit human approval.'
   }
@@ -706,29 +718,29 @@ export async function evaluateTier3Approval(
     }
   }
 
-  // Stage 1A — Structural escalations (RCE proof, compressed/over-cap bodies, multipart upload,
-  // DELETE). These run BEFORE operator pattern matching so a broad pattern can never pre-approve a
-  // request shape that cannot be classified. Keyword payloads are not escalated in v6.
-  const hardEscalationReason = detectStructuralEscalationReason({
-    method,
+  // Stage 1A (non-overridable) — RCE proof, compressed/over-cap bodies, and malformed multipart
+  // uploads ALWAYS escalate to a human operator and can never be bypassed by an operator pattern.
+  const nonOverridableReason = detectNonOverridableEscalationReason({
     bodyPreview: input.bodyPreview,
     headers: input.headers,
     hasMultipart: input.hasMultipart,
     isRceProof: input.isRceProof,
     hasCompressedBody: input.hasCompressedBody,
   })
-  if (hardEscalationReason) {
+  if (nonOverridableReason) {
     return {
       decision: 'escalate_human',
       decidedBy: 'operator',
       riskLevel: 'high',
-      reason: hardEscalationReason,
+      reason: nonOverridableReason,
       usedLlm: false,
       stage: 'hard_escalation',
     }
   }
 
-  // Stage 1B — Operator-approved endpoint pattern (only after hard escalations passed).
+  // Stage 1B — Operator-approved endpoint pattern ("Approve similar").
+  // Checked after non-overridable invariants so an operator's explicit "Approve similar" decision
+  // on a DELETE or well-formed multipart route suppresses repeat prompts on that exact route.
   const matchedPattern = !input.isRceProof && !input.isRaceBurst
     ? matchesApprovedEndpointPattern(
         { origin: input.origin, method, pathAndQuery },
@@ -743,6 +755,25 @@ export async function evaluateTier3Approval(
       reason: `Matched run-scoped approved endpoint pattern (${matchedPattern.method} ${matchedPattern.pathPattern}).`,
       usedLlm: false,
       stage: 'approved_pattern',
+    }
+  }
+
+  // Stage 1A (route-level) — Unapproved DELETE and multipart uploads escalate to a human operator
+  // until the operator approves that route (or switches to Autonomous / yolo).
+  const routeEscalationReason = detectRouteStructuralEscalationReason({
+    method,
+    bodyPreview: input.bodyPreview,
+    headers: input.headers,
+    hasMultipart: input.hasMultipart,
+  })
+  if (routeEscalationReason) {
+    return {
+      decision: 'escalate_human',
+      decidedBy: 'operator',
+      riskLevel: 'high',
+      reason: routeEscalationReason,
+      usedLlm: false,
+      stage: 'hard_escalation',
     }
   }
 
