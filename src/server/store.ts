@@ -465,6 +465,59 @@ export interface ProjectSpecSummary {
   createdAt: number
 }
 
+export interface WorkspaceProjectLatestRun {
+  id: string
+  goal: string
+  status: string
+  phase: string
+  startedAt: number
+  confirmedCount: number
+  findingCount: number
+}
+
+export interface WorkspaceProjectSummary extends Project {
+  runCount: number
+  hostCount: number
+  latestRun: WorkspaceProjectLatestRun | null
+}
+
+export interface WorkspaceRecentRunSummary {
+  id: string
+  projectId: string
+  projectName: string
+  goal: string
+  status: string
+  phase: string
+  startedAt: number
+  confirmedCount: number
+  findings: number
+}
+
+export interface WorkspaceSummary {
+  workspace: { id: string; name: string }
+  projects: WorkspaceProjectSummary[]
+  recentRuns: WorkspaceRecentRunSummary[]
+}
+
+export interface RunShellIndexEntry {
+  id: string
+  goal: string
+  status: string
+  phase: string
+  createdAt: number
+  projectId: string
+  projectName: string
+  findings: number
+}
+
+export interface RunShellSummary {
+  runs: RunShellIndexEntry[]
+  counts: {
+    exchanges: number
+    events: number
+  }
+}
+
 /** v6 pagination contract: `limit` is explicit (never silently capped); offset is stable. */
 export interface PaginationOptions {
   limit?: number
@@ -2409,6 +2462,109 @@ export class Store {
       workspace: { id: this.workspace.id, name: this.workspace.name },
       projects: this.db.select().from(tables.projects).where(eq(tables.projects.workspaceId, this.workspace.id))
         .orderBy(desc(tables.projects.createdAt)).all(),
+    }
+  }
+
+  /** Typed workspace dashboard summary (projects with run/host/latest-run rollups + recent runs). */
+  workspaceSummary(recentLimit = 15): WorkspaceSummary {
+    const workspaceList = this.listWorkspace()
+    const workspaceId = workspaceList.workspace.id
+    const safeRecentLimit = resolvePageLimit(recentLimit, 15)
+
+    const runCountRows = this.client.prepare(`
+      select project_id as projectId, count(*) as runCount
+      from runs
+      where workspace_id = ?
+      group by project_id
+    `).all(workspaceId) as { projectId: string; runCount: number }[]
+    const runCounts = new Map(runCountRows.map(r => [r.projectId, Number(r.runCount)]))
+
+    const hostCountRows = this.client.prepare(`
+      select a.project_id as projectId, count(*) as hostCount
+      from project_assets a
+      join projects p on p.id = a.project_id
+      where p.workspace_id = ?
+      group by a.project_id
+    `).all(workspaceId) as { projectId: string; hostCount: number }[]
+    const hostCounts = new Map(hostCountRows.map(r => [r.projectId, Number(r.hostCount)]))
+
+    const latestRunRows = this.client.prepare(`
+      select r.id as id, r.project_id as projectId, r.goal as goal, r.status as status, r.phase as phase,
+        r.created_at as startedAt,
+        (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
+          and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
+        (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findingCount
+      from runs r
+      where r.workspace_id = ?
+        and r.id = (
+          select r2.id from runs r2
+          where r2.project_id = r.project_id and r2.workspace_id = r.workspace_id
+          order by r2.created_at desc, r2.rowid desc
+          limit 1
+        )
+    `).all(workspaceId) as unknown as (WorkspaceProjectLatestRun & { projectId: string })[]
+    const latestRuns = new Map<string, WorkspaceProjectLatestRun>(latestRunRows.map(r => [r.projectId, {
+      id: r.id,
+      goal: r.goal,
+      status: r.status,
+      phase: r.phase,
+      startedAt: Number(r.startedAt),
+      confirmedCount: Number(r.confirmedCount),
+      findingCount: Number(r.findingCount),
+    }]))
+
+    const recentRunRows = this.client.prepare(`
+      select r.id as id, r.project_id as projectId, p.name as projectName, r.goal as goal,
+        r.status as status, r.phase as phase, r.created_at as startedAt,
+        (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
+          and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
+        (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findings
+      from runs r
+      join projects p on p.id = r.project_id
+      where r.workspace_id = ?
+      order by r.created_at desc, r.rowid desc
+      limit ?
+    `).all(workspaceId, safeRecentLimit) as unknown as WorkspaceRecentRunSummary[]
+
+    return {
+      workspace: workspaceList.workspace,
+      projects: workspaceList.projects.map(project => ({
+        ...project,
+        runCount: runCounts.get(project.id) ?? 0,
+        hostCount: hostCounts.get(project.id) ?? project.seeds.length,
+        latestRun: latestRuns.get(project.id) ?? null,
+      })),
+      recentRuns: recentRunRows.map(r => ({
+        ...r,
+        startedAt: Number(r.startedAt),
+        confirmedCount: Number(r.confirmedCount),
+        findings: Number(r.findings),
+      })),
+    }
+  }
+
+  /** Run workspace shell summary: workspace run index (newest first) and exact totals for one run. */
+  runShellSummary(runId: string, limit = 200): RunShellSummary {
+    const run = this.run(runId)
+    const safeLimit = resolvePageLimit(limit, 200)
+    const runs = this.client.prepare(`
+      select r.id as id, r.goal as goal, r.status as status, r.phase as phase,
+        r.created_at as createdAt, r.project_id as projectId, p.name as projectName,
+        (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findings
+      from runs r
+      join projects p on p.id = r.project_id
+      where r.workspace_id = ?
+      order by r.created_at desc, r.rowid desc
+      limit ?
+    `).all(run.workspaceId, safeLimit) as unknown as RunShellIndexEntry[]
+    const counts = this.client.prepare(`
+      select
+        (select count(*) from broker_exchanges where run_id = ?) as exchanges,
+        (select count(*) from events where run_id = ?) as events
+    `).get(run.id, run.id) as { exchanges: number; events: number }
+    return {
+      runs: runs.map(r => ({ ...r, createdAt: Number(r.createdAt), findings: Number(r.findings) })),
+      counts: { exchanges: Number(counts.exchanges), events: Number(counts.events) },
     }
   }
 

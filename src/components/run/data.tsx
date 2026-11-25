@@ -5,10 +5,10 @@
 //   useRunModel()   → the memoised RunModel (selectors, indexes, verdict inputs)
 //   useFullExchange(id) → one exchange with headers and body (shared cache)
 //
-// Live updates: one EventSource on /api/runs/:id/events?since=0 replays the
-// run's full event history (used by Activity, the traffic histogram, replay)
-// and then streams new events. Any event newer than the loaded snapshot
-// schedules a coalesced `runData` refresh, so paused/running runs update in place.
+// Live updates: one EventSource on /api/runs/:id/events?since=<initialCursor>
+// streams new events after the loader snapshot. Incoming events newer than the
+// loaded snapshot schedule a 350ms debounced `runData` refresh, and only refresh
+// `runShellData` when a run-status or finding-count-changing event arrives.
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { commandRun, readExchange, runData, runShellData } from '../../actions.ts'
@@ -96,6 +96,38 @@ export function useVerdict(): Verdict {
   return useMemo(() => buildVerdict(detail, model.findings, interrupted), [detail, model, interrupted])
 }
 
+/** Coalescing delay for SSE-triggered `runData` refreshes to prevent per-tick DB storms. */
+export const SSE_REFRESH_DEBOUNCE_MS = 350
+
+const SHELL_REFRESH_PREFIXES = ['run.', 'finding.', 'report.', 'project.'] as const
+const SHELL_REFRESH_EXACT = new Set([
+  'goal.revised',
+  'interrupted',
+  'recovery.completed',
+  'scope.approved',
+  'scope.revoked',
+  'discovery.consented',
+  'discovery.complete',
+  'phase0.completed',
+  'threat_model.saved',
+  'threat_model.failed',
+  'verification.started',
+  'retest.complete',
+  'agent.script_proof_confirmed',
+  'oob.receipt_confirmed',
+])
+
+/** True only when an SSE event can change the run switcher status/phase or finding count. */
+export function shouldRefreshRunShell(eventKind: string): boolean {
+  if (SHELL_REFRESH_EXACT.has(eventKind)) return true
+  return SHELL_REFRESH_PREFIXES.some(prefix => eventKind.startsWith(prefix))
+}
+
+/** Starting SSE cursor: resume from the loaded snapshot cursor instead of replaying from 0. */
+export function sseStreamSinceCursor(initialCursor: number): number {
+  return Number.isSafeInteger(initialCursor) && initialCursor > 0 ? initialCursor : 0
+}
+
 export function RunDataProvider({ initial, children, onError }: {
   initial: Detail
   children: ReactNode
@@ -113,44 +145,72 @@ export function RunDataProvider({ initial, children, onError }: {
   const [error, setError] = useState('')
   const onErrorRef = useRef(onError)
   onErrorRef.current = onError
+  const initialCursorRef = useRef(sseStreamSinceCursor(initial.cursor))
+  initialCursorRef.current = sseStreamSinceCursor(initial.cursor)
 
   const loadShell = useCallback(async () => {
     try { setShell(await runShellData({ data: { runId } })) } catch { /* keep the last index */ }
   }, [runId])
 
-  const refresh = useCallback(async () => {
+  const refreshDetail = useCallback(async () => {
     try {
       const latest = await runData({ data: { runId } })
       setSnapshot(prev => !prev || latest.cursor >= prev.cursor ? latest : prev)
     } catch {
       // Keep the last committed view while the local server restarts.
     }
+  }, [runId])
+
+  const refresh = useCallback(async () => {
+    await refreshDetail()
     void loadShell()
-  }, [runId, loadShell])
+  }, [refreshDetail, loadShell])
 
   useEffect(() => { void loadShell() }, [loadShell])
 
-  // Event stream: full replay, then live. Coalesce refreshes.
-  const cursor = useRef(initial.cursor)
+  // Event stream: resume from initial snapshot cursor and debounce refreshes (350ms).
+  const cursor = useRef(sseStreamSinceCursor(initial.cursor))
   useEffect(() => {
+    const startCursor = initialCursorRef.current
+    cursor.current = startCursor
     let disposed = false
     let refreshing = false
     let again = false
+    let pendingShell = false
     let buffer: RunEvent[] = []
     let flushTimer: ReturnType<typeof setTimeout> | undefined
     let settleTimer: ReturnType<typeof setTimeout> | undefined
-    let lastId = 0
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined
+    let lastId = startCursor
     setEvents([])
     setEventsReady(false)
-    const requestRefresh = () => {
+    const runRefresh = () => {
+      if (disposed) return
       if (refreshing) { again = true; return }
+      const refreshShellNow = pendingShell
+      pendingShell = false
       refreshing = true
-      void refresh().finally(() => {
+      const tasks: Promise<unknown>[] = [refreshDetail()]
+      if (refreshShellNow) tasks.push(loadShell())
+      void Promise.all(tasks).finally(() => {
         refreshing = false
         if (disposed || !again) return
         again = false
-        requestRefresh()
+        scheduleRefresh(false)
       })
+    }
+    const scheduleRefresh = (needsShell: boolean) => {
+      if (disposed) return
+      if (needsShell) pendingShell = true
+      if (refreshing) {
+        again = true
+        return
+      }
+      if (refreshTimer !== undefined) return
+      refreshTimer = setTimeout(() => {
+        refreshTimer = undefined
+        runRefresh()
+      }, SSE_REFRESH_DEBOUNCE_MS)
     }
     const flush = () => {
       flushTimer = undefined
@@ -163,28 +223,34 @@ export function RunDataProvider({ initial, children, onError }: {
       clearTimeout(settleTimer)
       settleTimer = setTimeout(() => { if (!disposed) setEventsReady(true) }, 350)
     }
-    const source = new EventSource(`/api/runs/${runId}/events?since=0`)
+    const source = new EventSource(`/api/runs/${runId}/events?since=${startCursor}`)
     source.onopen = () => { setConnection('live'); settle() }
     source.onerror = () => setConnection('reconnecting')
     source.onmessage = message => {
       const id = Number(message.lastEventId)
       if (!Number.isFinite(id) || id <= lastId) return
       lastId = id
-      try { buffer.push(JSON.parse(message.data) as RunEvent) } catch { /* ignore malformed */ }
+      let parsed: RunEvent | undefined
+      try {
+        parsed = JSON.parse(message.data) as RunEvent
+        buffer.push(parsed)
+      } catch { /* ignore malformed */ }
       flushTimer ??= setTimeout(flush, 60)
       settle()
       if (id > cursor.current) {
         cursor.current = id
-        requestRefresh()
+        scheduleRefresh(parsed ? shouldRefreshRunShell(parsed.kind) : false)
       }
     }
     return () => {
       disposed = true
       clearTimeout(flushTimer)
       clearTimeout(settleTimer)
+      clearTimeout(refreshTimer)
+      refreshTimer = undefined
       source.close()
     }
-  }, [runId, refresh])
+  }, [runId, refreshDetail, loadShell])
 
   const send = useCallback(async (command: Command) => {
     setPending(p => p + 1)
