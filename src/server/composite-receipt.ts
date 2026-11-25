@@ -9,11 +9,14 @@ import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
 import { parseRoleLabel, routeFamily, stepReadsState } from './oracle-invariants.ts'
 import { proofReceiptSchema, receiptIdSchema, verifyReceipt } from './proof-receipt.ts'
-import { isJobOrHandleStub } from './v8-oracle-families.ts'
+import { evaluateV8OracleFamily, isJobOrHandleStub } from './v8-oracle-families.ts'
+import type { CrossSurfaceHop, CrossSurfacePivotInput, HostSignedRecord as V8OracleRecord, V8OracleFamily, V8OracleInputMap } from './v8-oracle-families.ts'
 import type { ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 
 export const HOP_SURFACES = ['http', 'graphql', 'ws', 'sse', 'browser', 'webhook', 'async_job', 'idp', 'cdn', 'storage'] as const
 export type HopSurface = (typeof HOP_SURFACES)[number]
+const V8_ORACLE_FAMILIES = ['dual_tenant_abac', 'temporal_revocation', 'economic_conservation', 'cryptographic_scope_replay', 'parser_cache_differential', 'cross_surface_pivot'] as const
+const V8_ORACLE_FAMILY_SET: ReadonlySet<string> = new Set(V8_ORACLE_FAMILIES)
 export const CAUSAL_EDGE_KINDS = ['value_binding', 'derived_crypto_binding', 'state_transition_binding', 'async_pivot_binding'] as const
 export type CausalEdgeKind = (typeof CAUSAL_EDGE_KINDS)[number]
 export const REPLAY_MODES = ['fresh_clean_replay', 'one_shot_transcript'] as const
@@ -59,6 +62,7 @@ export type CausalEdgeBinding = z.output<typeof causalEdgeBindingSchema>
 export const terminalImpactSchema = z.object({
   terminalHopId: receiptIdSchema, claimedImpact: z.string().trim().max(1200).optional(), summary: z.string().trim().max(1200).optional(),
   terminalExchangeId: receiptIdSchema.optional(), proofReceipt: proofReceiptSchema.optional(),
+  oracleFamily: z.enum(V8_ORACLE_FAMILIES).optional(), oracleInput: z.record(z.string(), z.unknown()).optional(),
   preChainControlExchangeIds: idList(16), postChainReadbackExchangeIds: idList(16), modeAFailureExchangeId: receiptIdSchema.optional(),
 }).transform(ti => ({ ...ti, claimedImpact: ti.claimedImpact && ti.claimedImpact.length > 0 ? ti.claimedImpact : (ti.summary ?? '') }))
 export type TerminalImpact = z.output<typeof terminalImpactSchema>
@@ -86,6 +90,7 @@ export interface HostSignedTranscript extends ReceiptTranscript { entries?: read
 export type HostSignableRecord = HostTranscriptEntry | HostOobEvent | HostBrowserTrace | HostAsyncPollRecord
 export interface CompositeVerifyOptions {
   attackerPersonas?: readonly string[]; forbiddenShortcutPersonas?: readonly string[]; benchmarkMode?: boolean; requireCleanSessionFlag?: boolean; signingKey?: string
+  v8OracleInput?: Record<string, unknown>
   verifyTerminalImpact?: (receipt: CompositeProofReceipt, transcript: HostSignedTranscript) => { confirmed: boolean; reason: string; family?: string; evidence?: Record<string, unknown> }
 }
 export interface VerifiedEdgeResult { edgeIndex: number; kind: CausalEdgeKind; fromHopId: string; toHopId: string; verified: boolean; reason: string; evidence?: Record<string, unknown> }
@@ -117,42 +122,28 @@ function collectTenantMarkers(value: unknown, out: Set<string>, depth = 0): void
     else if (v && typeof v === 'object') collectTenantMarkers(v, out, depth + 1)
   }
 }
-
 function entryTenants(entry: HostTranscriptEntry): Set<string> {
   const out = new Set<string>()
   let json = entry.step.json
-  if (json === undefined && typeof entry.step.body === 'string' && entry.step.body.trim().startsWith('{')) {
-    try { json = JSON.parse(entry.step.body) } catch { json = undefined }
-  }
-  collectTenantMarkers(json, out)
-  return out
+  if (json === undefined && typeof entry.step.body === 'string' && entry.step.body.trim().startsWith('{')) try { json = JSON.parse(entry.step.body) } catch { json = undefined }
+  collectTenantMarkers(json, out); return out
 }
-
 export const sha256Hex = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex')
-
 function canonicalStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value)
   if (Array.isArray(value)) return `[${value.map(canonicalStringify).join(',')}]`
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([k, v]) => k !== 'hostSignature' && v !== undefined).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalStringify(v)}`).join(',')}}`
+  return `{${Object.entries(value as Record<string, unknown>).filter(([k, v]) => k !== 'hostSignature' && v !== undefined).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([k, v]) => `${JSON.stringify(k)}:${canonicalStringify(v)}`).join(',')}}`
 }
-
-export const signHostRecord = (record: HostSignableRecord, signingKey: string): string =>
-  createHmac('sha256', signingKey).update(canonicalStringify(record), 'utf8').digest('hex')
-
+export const signHostRecord = (record: HostSignableRecord, signingKey: string): string => createHmac('sha256', signingKey).update(canonicalStringify(record), 'utf8').digest('hex')
 export function verifyHostRecordSignature(record: HostSignableRecord, signingKey: string): boolean {
   if (!record.hostSignature || !SHA256_RE.test(record.hostSignature.toLowerCase())) return false
-  const expected = Buffer.from(signHostRecord(record, signingKey), 'hex')
-  const actual = Buffer.from(record.hostSignature.toLowerCase(), 'hex')
+  const expected = Buffer.from(signHostRecord(record, signingKey), 'hex'), actual = Buffer.from(record.hostSignature.toLowerCase(), 'hex')
   return expected.length === actual.length && timingSafeEqual(expected, actual)
 }
-
 const is2xx = (st: number | null | undefined): boolean => typeof st === 'number' && st >= 200 && st < 300
 const isFiniteTs = (ts: unknown): ts is number => typeof ts === 'number' && Number.isFinite(ts) && ts >= 0
 const actorOf = (e: HostTranscriptEntry): string | null => (e.actorPersona !== undefined ? e.actorPersona : (e.step.actor.handle ?? null))
 const roleOf = (e: HostTranscriptEntry): string | null => (e.actorRoleLabel ? parseRoleLabel(e.actorRoleLabel).role : (e.step.actor.role ?? null))
-
 function collectLeaves(value: unknown, out: Set<string>, depth = 0): void {
   if (depth > 5 || out.size > 256 || value == null) return
   if (typeof value === 'string') { const t = value.trim(); if (t.length > 0 && t.length <= 2048) out.add(t) }
@@ -160,62 +151,46 @@ function collectLeaves(value: unknown, out: Set<string>, depth = 0): void {
   else if (Array.isArray(value)) for (const x of value) collectLeaves(x, out, depth + 1)
   else if (typeof value === 'object') for (const x of Object.values(value as Record<string, unknown>)) collectLeaves(x, out, depth + 1)
 }
-
 function collectHeaderTokens(headers: Record<string, string> | null | undefined, out: Set<string>): void {
   if (!headers) return
   for (const raw of Object.values(headers)) {
-    const t = raw.trim()
-    if (!t) continue
-    out.add(t)
+    const t = raw.trim(); if (!t) continue; out.add(t)
     const scheme = /^(?:Bearer|Basic|Token|ApiKey)\s+(.+)$/i.exec(t)
     if (scheme?.[1]) out.add(scheme[1].trim())
-    if (t.includes('=')) {
-      for (const p of t.split(';')) { const eq = p.indexOf('='); if (eq > 0 && p.slice(eq + 1).trim()) out.add(p.slice(eq + 1).trim()) }
-    }
+    if (t.includes('=')) for (const p of t.split(';')) { const eq = p.indexOf('='); if (eq > 0 && p.slice(eq + 1).trim()) out.add(p.slice(eq + 1).trim()) }
   }
 }
 
 function collectEntryDigests(entry: HostTranscriptEntry, side: 'response' | 'request'): Set<string> {
-  const digests = new Set<string>()
-  const leaves = new Set<string>()
+  const digests = new Set<string>(), leaves = new Set<string>()
   if (side === 'response') {
     for (const d of [...(entry.observedResponseDigests ?? []), ...(entry.step.secretMatches ?? [])]) digests.add(d.toLowerCase())
-    collectLeaves(entry.step.json, leaves)
-    collectHeaderTokens(entry.step.responseHeaders, leaves)
+    collectLeaves(entry.step.json, leaves); collectHeaderTokens(entry.step.responseHeaders, leaves)
   } else {
     for (const d of entry.injectedRequestDigests ?? []) digests.add(d.toLowerCase())
-    collectLeaves(entry.step.requestJson, leaves)
-    collectHeaderTokens(entry.step.requestHeaders, leaves)
+    collectLeaves(entry.step.requestJson, leaves); collectHeaderTokens(entry.step.requestHeaders, leaves)
     const q = entry.step.pathAndQuery?.indexOf('?') ?? -1
-    if (q >= 0 && entry.step.pathAndQuery) {
-      for (const v of new URLSearchParams(entry.step.pathAndQuery.slice(q + 1)).values()) if (v) leaves.add(v)
-    }
+    if (q >= 0 && entry.step.pathAndQuery) for (const v of new URLSearchParams(entry.step.pathAndQuery.slice(q + 1)).values()) if (v) leaves.add(v)
   }
   for (const leaf of leaves) digests.add(sha256Hex(leaf))
   return digests
 }
-
 function entryLeaves(entry: HostTranscriptEntry, withHeaders: boolean): Set<string> {
   const out = new Set<string>()
-  collectLeaves(entry.step.requestJson, out)
-  collectLeaves(entry.step.json, out)
+  collectLeaves(entry.step.requestJson, out); collectLeaves(entry.step.json, out)
   if (withHeaders) { collectHeaderTokens(entry.step.requestHeaders, out); collectHeaderTokens(entry.step.responseHeaders, out) }
   return out
 }
-
 function entryMatchesEntity(entry: HostTranscriptEntry, entityId: string): boolean {
   if (entry.entityId === entityId) return true
   const path = entry.step.pathAndQuery ?? entry.step.route ?? ''
-  if (path && new RegExp(`(?:^|[/=?&])${entityId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[/&?#])`).test(path)) return true
-  return entryLeaves(entry, false).has(entityId)
+  return (Boolean(path) && new RegExp(`(?:^|[/=?&])${entityId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[/&?#])`).test(path)) || entryLeaves(entry, false).has(entityId)
 }
-
 function entryMatchesCorrelation(entry: HostTranscriptEntry, correlationId: string): boolean {
   if (entry.correlationIds?.includes(correlationId) || entry.entityId === correlationId || entry.carrierText?.includes(correlationId)) return true
   for (const leaf of entryLeaves(entry, true)) if (leaf === correlationId || leaf.includes(correlationId)) return true
   return false
 }
-
 function serializeBodyText(entry: HostTranscriptEntry): string {
   if (typeof entry.step.body === 'string' && entry.step.body.length > 0) return entry.step.body
   try { return entry.step.json !== undefined ? JSON.stringify(entry.step.json) : '' } catch { return '' }
@@ -582,6 +557,57 @@ function verifyReplayMode(
 
 // --- Public Verifier & Single-Hop Bridge ------------------------------------
 
+function toOracleRecord(e: HostTranscriptEntry, fallbackSig: string): V8OracleRecord {
+  return {
+    id: e.exchangeId, hostSignature: e.hostSignature ?? fallbackSig, timestampMs: isFiniteTs(e.timestampMs) && e.timestampMs > 0 ? e.timestampMs : 1,
+    status: e.step.status, method: e.step.method, route: e.step.route ?? e.step.pathAndQuery, actorId: actorOf(e), tenantId: e.step.actor.tenant ?? null,
+    body: e.step.body, json: e.step.json, requestHeaders: e.step.requestHeaders, responseHeaders: e.step.responseHeaders,
+    capabilityHandle: e.emittedCapabilities?.[0] ?? e.consumedCapabilities?.[0] ?? null,
+    artifactDigest: e.observedResponseDigests?.[0] ?? sha256Hex(e.step.body ?? JSON.stringify(e.step.json ?? null)),
+    derivedFromCapabilityId: e.cryptoAttestations?.[0]?.derivedFromCapabilityId ?? null,
+  }
+}
+
+function dispatchDefaultV8Oracle(
+  receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, termEx: HostTranscriptEntry | undefined, options: CompositeVerifyOptions,
+): { ok: true; family: V8OracleFamily } | { ok: false; reason: string; rejectedBy: string; missingEvidence: string[] } | null {
+  const ti = receipt.terminalImpact
+  const family = ti.oracleFamily ?? (V8_ORACLE_FAMILY_SET.has(receipt.terminalVulnClass) ? receipt.terminalVulnClass as V8OracleFamily : null)
+  if (!family) return null
+  const verifySignature = options.signingKey ? (rec: V8OracleRecord): boolean => { const e = idx.entriesById.get(rec.id); return e ? e.hostSignature === rec.hostSignature : rec.hostSignature.length >= 8 } : undefined
+  const explicitInput = ti.oracleInput ?? options.v8OracleInput
+  if (explicitInput) {
+    const dec = evaluateV8OracleFamily(family, { ...explicitInput, ...(verifySignature ? { verifySignature } : {}) } as V8OracleInputMap[typeof family])
+    return dec.satisfied ? { ok: true, family } : { ok: false, reason: `v8_oracle_failed (${family}): ${dec.reason}`, rejectedBy: `v8_oracle_${family}`, missingEvidence: [dec.reason] }
+  }
+  if (family !== 'cross_surface_pivot' || receipt.hops.length < 2) return null
+  const sig = options.signingKey ? '' : 'host-verified-sig'
+  const ctrl = ti.preChainControlExchangeIds.map(id => idx.entriesById.get(id)).find((e): e is HostTranscriptEntry => Boolean(e))
+  const rootHop = dag.hopsById.get(dag.roots[0]!)!
+  const rootEx = rootHop.exchangeIds.map(id => idx.entriesById.get(id)!).find(e => e.step.arm === 'probe') ?? idx.entriesById.get(rootHop.exchangeIds[0]!)
+  if (!ctrl || !rootEx || !termEx) return { ok: false, reason: `v8_oracle_failed (${family}): missing_pivot_control_or_terminal_record`, rejectedBy: `v8_oracle_${family}`, missingEvidence: ['pre_chain_control_denied', 'cross_surface_pivot'] }
+  const hops: CrossSurfaceHop[] = dag.topoOrder.map((hopId, i) => {
+    const h = dag.hopsById.get(hopId)!, edge = (dag.incomingByHop.get(hopId) ?? [])[0]?.edge
+    const ex = (i === dag.topoOrder.length - 1 ? termEx : h.exchangeIds.map(id => idx.entriesById.get(id)!).find(e => e.step.arm === 'probe')) ?? idx.entriesById.get(h.exchangeIds[0]!)!
+    const rec = toOracleRecord(ex, sig), abl = edge?.kind === 'state_transition_binding' ? idx.entriesById.get(edge.ablationExchangeIds[0]!) : undefined
+    return {
+      surface: h.surface, role: i === dag.topoOrder.length - 1 ? 'terminal_impact' : h.surface === 'browser' ? 'browser_dom_trace' : h.surface === 'webhook' ? 'oob_callback' : 'trigger_write',
+      record: rec, ...(edge ? { bindingKind: edge.kind } : {}), emittedArtifactDigest: h.producedCapabilities[0] ?? rec.artifactDigest,
+      ...(edge?.kind === 'value_binding' ? { consumedArtifactDigest: edge.capabilityHandle ?? edge.valueDigest ?? h.consumedCapabilities[0] } : {}),
+      ...(edge?.kind === 'derived_crypto_binding' ? { derivedFromCapabilityId: edge.sourceCapabilityId } : {}),
+      ...(edge?.kind === 'async_pivot_binding' ? { correlationToken: edge.correlationId } : {}),
+      ...(edge?.kind === 'state_transition_binding' ? { correlationToken: edge.entityId, ...(abl ? { ablationControlDenied: toOracleRecord(abl, sig) } : {}) } : {}),
+    }
+  })
+  const postRb = ti.postChainReadbackExchangeIds.map(id => idx.entriesById.get(id)).find((e): e is HostTranscriptEntry => Boolean(e && e.exchangeId !== termEx.exchangeId))
+  const dec = evaluateV8OracleFamily('cross_surface_pivot', {
+    attackerOriginPersona: { actorId: actorOf(rootEx) ?? 'attacker', role: roleOf(rootEx) ?? 'member', tenantId: rootEx.step.actor.tenant ?? null, isPrivilegedPreSeeded: false },
+    preChainControlDenied: toOracleRecord(ctrl, sig), hops, ...(verifySignature ? { verifySignature } : {}),
+    terminalImpact: { kind: postRb ? 'privileged_mutation' : 'privileged_read', verified: true, impactDigest: sha256Hex(termEx.step.body ?? JSON.stringify(termEx.step.json ?? termEx.exchangeId)), ...(postRb ? { postImpactReadback: toOracleRecord(postRb, sig) } : {}) },
+  } satisfies CrossSurfacePivotInput)
+  return dec.satisfied ? { ok: true, family } : { ok: false, reason: `v8_oracle_failed (${family}): ${dec.reason}`, rejectedBy: `v8_oracle_${family}`, missingEvidence: [dec.reason] }
+}
+
 function verifyTerminalImpactGate(
   receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, verifiedEdges: VerifiedEdgeResult[],
   hostTranscript: HostSignedTranscript, options: CompositeVerifyOptions,
@@ -609,12 +635,15 @@ function verifyTerminalImpactGate(
   const termEx = ti.terminalExchangeId
     ? idx.entriesById.get(ti.terminalExchangeId)!
     : [...termHop.exchangeIds].reverse().map(id => idx.entriesById.get(id)!).find(e => e.step.arm === 'probe' && is2xx(e.step.status))
+  const v8Default = dispatchDefaultV8Oracle(receipt, dag, idx, termEx, options)
+  if (v8Default) return v8Default.ok ? { ok: true } : v8Default
   if (ti.terminalExchangeId && (!termEx || termEx.step.arm === 'control' || !is2xx(termEx.step.status))) {
     return { ok: false, reason: `terminalExchangeId "${ti.terminalExchangeId}" is not a succeeding probe exchange.`, rejectedBy: 'terminal_impact_unproven', missingEvidence: [TERMINAL_IMPACT_UNPROVEN_HINT] }
   }
   const hasOob = termHop.oobEventIds.some(id => idx.oobById.get(id)?.delivered === true)
   const hasBrowser = termHop.browserTraceIds.some(id => (idx.tracesById.get(id)?.sinks?.length ?? 0) > 0)
   const hasAsyncEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'async_pivot_binding' && e.verified)
+  const hasDerivedCryptoEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'derived_crypto_binding' && e.verified)
   if (!termEx && !hasOob && !hasBrowser && !hasAsyncEdge) {
     return { ok: false, reason: `Terminal hop "${termHop.hopId}" has no succeeding terminal evidence.`, rejectedBy: 'terminal_impact_unproven', missingEvidence: [TERMINAL_IMPACT_UNPROVEN_HINT] }
   }
@@ -649,7 +678,9 @@ function verifyTerminalImpactGate(
   const ownTenantOnly = respTenants.size > 0 && attackerTenants.size > 0 && [...respTenants].every(t => attackerTenants.has(t))
   if (termEx && ownTenantOnly && !hasPostMutation && !hasCleanDeniedCtrl) return { ok: false, reason: TERMINAL_IMPACT_UNPROVEN_HINT, rejectedBy: 'terminal_impact_unproven', missingEvidence: [TERMINAL_IMPACT_UNPROVEN_HINT] }
   if (STRICT_TERMINAL_CLASS_RE.test(receipt.terminalVulnClass)) {
-    if (!hasCleanDeniedCtrl && !hasOob && !hasBrowser) return { ok: false, reason: `Missing clean denied control (401/403/404) on terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, rejectedBy: 'terminal_impact_unproven', missingEvidence: ['clean_denied_control_401_403_404', TERMINAL_IMPACT_UNPROVEN_HINT] }
+    if (!hasCleanDeniedCtrl && !hasOob && !hasBrowser && !(receipt.terminalVulnClass === 'cryptographic_scope_replay' && hasDerivedCryptoEdge)) {
+      return { ok: false, reason: `Missing clean denied control (401/403/404) on terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, rejectedBy: 'terminal_impact_unproven', missingEvidence: ['clean_denied_control_401_403_404', TERMINAL_IMPACT_UNPROVEN_HINT] }
+    }
     if (termEx && !hasPostMutation && (!hasBody || isStub || ownTenantOnly)) return { ok: false, reason: TERMINAL_IMPACT_UNPROVEN_HINT, rejectedBy: 'terminal_impact_unproven', missingEvidence: [TERMINAL_IMPACT_UNPROVEN_HINT] }
   }
   return { ok: true }
@@ -702,26 +733,14 @@ export function verifyCompositeReceipt(rawReceipt: unknown, hostTranscript: Host
 }
 
 /** Wrap a single-hop v7 ProofReceipt as a valid 1-node CompositeProofReceipt DAG. */
-export function singleReceiptToComposite(
-  rawReceipt: ProofReceipt,
-  options?: { chainId?: string; surface?: HopSurface; replayMode?: ReplayMode; benchmarkMode?: boolean },
-): CompositeProofReceipt {
+export function singleReceiptToComposite(rawReceipt: ProofReceipt, options?: { chainId?: string; surface?: HopSurface; replayMode?: ReplayMode; benchmarkMode?: boolean }): CompositeProofReceipt {
   const receipt = proofReceiptSchema.parse(rawReceipt)
-  const surface: HopSurface = options?.surface ?? (
-    receipt.browserTraceIds.length > 0 ? 'browser'
-      : receipt.oobEventIds.length > 0 ? 'webhook'
-        : receipt.target.pathAndQuery?.includes('/graphql') ? 'graphql' : 'http'
-  )
-  const digest = sha256Hex(JSON.stringify({
-    v: receipt.vulnClass, o: receipt.target.origin, p: receipt.target.pathAndQuery ?? '',
-    ex: receipt.exchangeIds, oob: receipt.oobEventIds, tr: receipt.browserTraceIds,
-  })).slice(0, 16)
+  const surface: HopSurface = options?.surface ?? (receipt.browserTraceIds.length > 0 ? 'browser' : receipt.oobEventIds.length > 0 ? 'webhook' : receipt.target.pathAndQuery?.includes('/graphql') ? 'graphql' : 'http')
+  const digest = sha256Hex(JSON.stringify({ v: receipt.vulnClass, o: receipt.target.origin, p: receipt.target.pathAndQuery ?? '', ex: receipt.exchangeIds, oob: receipt.oobEventIds, tr: receipt.browserTraceIds })).slice(0, 16)
   return compositeProofReceiptSchema.parse({
     chainId: options?.chainId ?? `single:${digest}`, terminalVulnClass: receipt.vulnClass,
     hops: [{ hopId: 'hop_1', surface, target: receipt.target, exchangeIds: receipt.exchangeIds, oobEventIds: receipt.oobEventIds, browserTraceIds: receipt.browserTraceIds, claimedDelta: receipt.claimedDelta, proofReceipt: receipt }],
-    causalEdges: [],
-    terminalImpact: { terminalHopId: 'hop_1', claimedImpact: receipt.claimedDelta, proofReceipt: receipt, preChainControlExchangeIds: [], postChainReadbackExchangeIds: [] },
-    replayMode: options?.replayMode ?? 'fresh_clean_replay',
-    ...(options?.benchmarkMode !== undefined ? { benchmarkMode: options.benchmarkMode } : {}),
+    causalEdges: [], terminalImpact: { terminalHopId: 'hop_1', claimedImpact: receipt.claimedDelta, proofReceipt: receipt, preChainControlExchangeIds: [], postChainReadbackExchangeIds: [] },
+    replayMode: options?.replayMode ?? 'fresh_clean_replay', ...(options?.benchmarkMode !== undefined ? { benchmarkMode: options.benchmarkMode } : {}),
   })
 }

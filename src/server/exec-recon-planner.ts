@@ -45,10 +45,12 @@ import {
 import {
   CapabilityLedger,
   computeArtifactDigest,
+  finalizeHopCheckpointBrief,
   formatDerivedCapabilityHandle,
   type AddCapabilityInput,
   type CapabilityKind,
   type CapabilitySurface,
+  type HopCheckpointBrief,
 } from './capability-ledger.ts'
 import { extractSpecDedupeFields, normalizeEndpointTemplate } from './dedupe.ts'
 import { meetsBaseline, type EvidenceReview } from './evidence-checks.ts'
@@ -504,12 +506,41 @@ function hopKindToCapabilityKind(kind: ChainHop['artifactKind']): CapabilityKind
   }
 }
 
+export const CHECKPOINT_CAP_SKILL_PREFIX = 'checkpoint_cap:'
+
+export function extractCheckpointCapIdFromStep(step: { skills?: readonly string[] }): string | null {
+  for (const skill of step.skills ?? []) {
+    if (skill.startsWith(CHECKPOINT_CAP_SKILL_PREFIX)) {
+      const capId = skill.slice(CHECKPOINT_CAP_SKILL_PREFIX.length).trim()
+      if (capId) return capId
+    }
+  }
+  return null
+}
+
+function parseHopCheckpointJson(raw: unknown): HopCheckpointBrief | null {
+  if (!raw) return null
+  let obj: unknown = raw
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim()
+    if (!trimmed.startsWith('{')) return null
+    try { obj = JSON.parse(trimmed) } catch { return null }
+  }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null
+  const rec = obj as Record<string, unknown>
+  if (rec.schema !== 'v8.hop_checkpoint.v1' || typeof rec.branchKey !== 'string' || !rec.nextGoal || typeof rec.nextGoal !== 'object') {
+    return null
+  }
+  return rec as unknown as HopCheckpointBrief
+}
+
 export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   private readonly plannerEmptyRounds = new Map<string, number>()
   private readonly plannerDryRounds = new Map<string, number>()
   private readonly plannerCompletedAtLastRound = new Map<string, number>()
   private readonly plannerEvidenceFrontier = new Map<string, { confirmed: number; primitives: number }>()
   private readonly frontierControllers = new Map<string, FrontierWaveController>()
+  private readonly persistedStepCheckpoints = new Map<string, { checkpointCapId?: string; checkpointJson?: string }>()
   private readonly invariantsSeededRuns = new Set<string>()
   private readonly wave1InvariantChainsPromoted = new Set<string>()
   private readonly plannerSeenCausalEdges = new Map<string, Set<string>>()
@@ -2171,21 +2202,44 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         ? parentChainHops.slice(0, 4).map(hop =>
             `${hop.artifactKind}:${hop.artifactRef}${hop.stateAfter ? `[${hop.stateBefore ?? '*'}->${hop.stateAfter}]` : ''}`).join('→')
         : ''
-      // v8 M3: For depth >= 2 assignments, pre-hydrate a bounded <= 2 KB hop-checkpoint summary
-      // when FrontierScheduler/CapabilityLedger has active lineage for the run.
-      let hopCheckpointChainText = ''
-      if (parentChainHops.length >= 2) {
+      // v8: Resolve canonical <= 2 KB HopCheckpointBrief from SQLite CapabilityLedger (restart-safe)
+      // or persisted step/fact checkpoint metadata, without 480 B truncation or 'artifact' skip.
+      const checkpointFact = input.parentFacts.find(f => !f.tainted && f.data?.subkind === 'hop_checkpoint')
+      const cachedCheckpoint = this.persistedStepCheckpoints.get(input.step.id)
+      const persistedBrief = parseHopCheckpointJson(checkpointFact?.data?.checkpointBrief ?? checkpointFact?.data?.checkpointJson)
+        ?? parseHopCheckpointJson(cachedCheckpoint?.checkpointJson)
+      const checkpointCapId = extractCheckpointCapIdFromStep(input.step)
+        ?? (typeof checkpointFact?.data?.checkpointCapId === 'string' ? checkpointFact.data.checkpointCapId : null)
+        ?? cachedCheckpoint?.checkpointCapId
+        ?? persistedBrief?.capabilityHandles[persistedBrief.capabilityHandles.length - 1]
+        ?? parentChainHops.map(h => h.artifactRef).find(ref => ref.startsWith('cap:hop_'))
+        ?? null
+      let hopCheckpoint: HopCheckpointBrief | undefined
+      if (checkpointCapId) {
+        const ledger = this.storage.capabilityLedger(input.run.id)
+        if (ledger.getCapability(checkpointCapId)) {
+          hopCheckpoint = ledger.buildHopCheckpointBrief(checkpointCapId, MAX_CHECKPOINT_BRIEF_BYTES, {
+            ...(persistedBrief?.branchKey ? { branchKey: persistedBrief.branchKey } : {}),
+            ...(persistedBrief?.evi !== undefined ? { evi: persistedBrief.evi } : {}),
+            ...(persistedBrief?.mode ? { mode: persistedBrief.mode } : {}),
+            ...(persistedBrief?.fuseWithBranchKey ? { fuseWithBranchKey: persistedBrief.fuseWithBranchKey } : {}),
+            ...(persistedBrief?.nextGoal ? { nextGoal: persistedBrief.nextGoal } : {}),
+          })
+        }
+      }
+      if (!hopCheckpoint && persistedBrief) {
+        hopCheckpoint = finalizeHopCheckpointBrief(persistedBrief, MAX_CHECKPOINT_BRIEF_BYTES).brief
+      }
+      if (!hopCheckpoint && parentChainHops.length > 0) {
         const controller = this.frontierControllers.get(input.run.id)
         const matchingBranch = controller?.scheduler.getActiveBeam().find(item =>
           item.branch.depth >= 2 && item.branch.verifiedHops.some(h =>
             parentChainHops.some(p => p.endpoint && h.endpoint === p.endpoint)))
         if (matchingBranch) {
-          const formatted = formatHopCheckpointForAssignment(
+          hopCheckpoint = formatHopCheckpointForAssignment(
             { branch: matchingBranch.branch, evi: matchingBranch.evi },
-            Math.min(MAX_CHECKPOINT_BRIEF_BYTES, 480),
-          )
-          // Keep proofObligation.chain compact and free of noisy tokens.
-          if (!formatted.json.includes('artifact')) hopCheckpointChainText = formatted.json
+            MAX_CHECKPOINT_BRIEF_BYTES,
+          ).brief
         }
       }
       const text = buildAssignmentBrief({
@@ -2214,6 +2268,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
             }
           : {}),
         ...(codeSlice ? { codeSlice, codeExpansion } : {}),
+        ...(hopCheckpoint ? { hopCheckpoint } : {}),
         // Explicit proof obligation for a white-box assignment or a typed multi-round chain step.
         ...(codeSlice
           ? {
@@ -2250,7 +2305,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
                   route: hopLinkedRoutes[hopLinkedRoutes.length - 1]
                     ? `${hopLinkedRoutes[hopLinkedRoutes.length - 1]!.method} ${hopLinkedRoutes[hopLinkedRoutes.length - 1]!.path}`
                     : routes[0] ? `${routes[0].method} ${routes[0].path}` : 'ANY /',
-                  chain: hopCheckpointChainText || formatChainHopsBrief(parentChainHops, 200),
+                  chain: formatChainHopsBrief(parentChainHops, 200),
                   ...(controlPersona
                     ? {
                         controlPersona: controlPersona.handle,
@@ -2375,17 +2430,59 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const leadBound = boundFactIds.some(id => detLeadFactIds.has(id)) ||
         isDetLeadDispatchStep({ title, hypothesis: step.hypothesis })
       const tierABound = boundFactIds.some(id => this.host.tierAFactIds.has(id))
-      this.storage.addChainStep(run, {
+      const parsedBrief = step.checkpointBrief
+        ? finalizeHopCheckpointBrief(step.checkpointBrief, MAX_CHECKPOINT_BRIEF_BYTES)
+        : (() => {
+            const parsed = parseHopCheckpointJson(step.checkpointJson)
+            return parsed ? finalizeHopCheckpointBrief(parsed, MAX_CHECKPOINT_BRIEF_BYTES) : null
+          })()
+      const checkpointCapId = step.checkpointCapId?.trim()
+        || parsedBrief?.brief.capabilityHandles[parsedBrief.brief.capabilityHandles.length - 1]
+        || parsedBrief?.brief.verifiedHops[parsedBrief.brief.verifiedHops.length - 1]?.capId
+        || undefined
+      const checkpointJson = parsedBrief?.checkpointJson
+        ?? (typeof step.checkpointJson === 'string' && step.checkpointJson.trim() ? step.checkpointJson.trim().slice(0, MAX_CHECKPOINT_BRIEF_BYTES) : undefined)
+      const stepSkills = [...step.skills]
+      if (checkpointCapId) stepSkills.push(`${CHECKPOINT_CAP_SKILL_PREFIX}${checkpointCapId}`)
+      const finalFactIds = [...boundFactIds]
+      if (checkpointCapId || checkpointJson) {
+        const workers = this.storage.workerList(run.id)
+        const anchorWorker = workers.find(w => w.phase === 'investigation') ?? workers[0]
+        if (anchorWorker) {
+          try {
+            const cpFact = this.storage.addFact(run, anchorWorker, {
+              kind: 'note',
+              origin: step.origins[0] ?? run.candidates[0]?.origin ?? '',
+              summary: `Hop checkpoint (${checkpointCapId ?? parsedBrief?.brief.branchKey ?? 'branch'})`,
+              data: {
+                subkind: 'hop_checkpoint',
+                ...(checkpointCapId ? { checkpointCapId } : {}),
+                ...(checkpointJson ? { checkpointJson } : {}),
+                ...(parsedBrief ? { checkpointBrief: parsedBrief.brief } : {}),
+              },
+              sourceOrigins: step.origins,
+            })
+            finalFactIds.push(cpFact.id)
+          } catch { /* non-fatal: checkpoint_cap skill tag + ledger still persist */ }
+        }
+      }
+      const createdStep = this.storage.addChainStep(run, {
         title: title.slice(0, 200),
         hypothesis: step.hypothesis,
         category,
         priority: tierABound ? TIER_A_STEP_PRIORITY : leadBound ? Math.min(step.priority, DET_LEAD_STEP_PRIORITY) : step.priority,
         targetAssetIds: assetIds,
-        skills: step.skills,
-        dependsOnFactIds: boundFactIds,
+        skills: stepSkills,
+        dependsOnFactIds: finalFactIds,
         sourceOrigins: step.origins,
         specialistProfile: routeStepToSpecialist({ title, hypothesis: step.hypothesis, category, skills: step.skills }),
       })
+      if (checkpointCapId || checkpointJson) {
+        this.persistedStepCheckpoints.set(createdStep.id, {
+          ...(checkpointCapId ? { checkpointCapId } : {}),
+          ...(checkpointJson ? { checkpointJson } : {}),
+        })
+      }
       titles.add(key)
       counts.enqueued += 1
     }

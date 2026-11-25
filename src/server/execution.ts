@@ -179,7 +179,6 @@ import {
   requeueInterruptedAssignments,
   convertCodeAuditSuspectsToChainSteps,
   buildBolaTestQueue,
-  nextPlannerDryRounds,
   type FrontierWaveController,
   type DeterministicSweepMode,
   type PhaseRequestBudgets,
@@ -1341,60 +1340,6 @@ export class Execution {
       attemptCount: negativeEdge.attemptCount,
       negativeEdge,
     }
-  }
-
-  /**
-   * Evaluate round-level verified `HopReceipt` reach expansion via `FrontierWaveController` and
-   * feed the count into `nextPlannerDryRounds` so Phase B advances multi-hop chains before terminal confirmation.
-   */
-  evaluateFrontierProgressForRound(
-    runId: string,
-    input: {
-      roundNo: number
-      previousDryRounds: number
-      newRuntimeConfirmed: number
-      newChainPrimitives: number
-      completedInvestigations: number
-      previousCompletedInvestigations: number
-      verifiedHopReachExpansions?: number
-    },
-  ): { verifiedHopReachExpansions: number; dryRounds: number } {
-    const controller = this.reconPlanner.frontierControllerFor(runId)
-    const ledger = this.storage.capabilityLedger(runId)
-    let expansions = input.verifiedHopReachExpansions
-    if (expansions === undefined) {
-      const hopEvents = ledger.listCausalEdges().map(edge => {
-        const postNode = edge.postconditionCapId ? ledger.getCapability(edge.postconditionCapId) : null
-        return {
-          hopReceiptId: edge.hopReceiptId,
-          branchKey: edge.postconditionCapId ?? edge.edgeId,
-          depth: Math.max(1, edge.preconditionCapIds.length + 1),
-          hostVerified: true,
-          tenantScope: postNode?.tenantScope ?? edge.actorContext.tenantScope ?? 'default_tenant',
-          ...(edge.actorContext.roleLabel ? { roleLabel: edge.actorContext.roleLabel } : {}),
-          serviceOrigin: postNode?.serviceOrigin ?? edge.actorContext.serviceOrigin ?? 'unknown',
-          surface: postNode?.surface ?? 'http',
-          ...(postNode ? { capabilityId: postNode.capId } : {}),
-        }
-      })
-      const decision = hopEvents.length > 0
-        ? controller.evaluateWaveProgress({
-            completedAssignments: Math.max(0, input.completedInvestigations - input.previousCompletedInvestigations),
-            verifiedHopReceipts: hopEvents,
-          })
-        : null
-      expansions = decision?.reachDelta.newHopReceiptIds.length ?? 0
-    }
-    const dryRounds = nextPlannerDryRounds({
-      roundNo: input.roundNo,
-      previousDryRounds: input.previousDryRounds,
-      newRuntimeConfirmed: input.newRuntimeConfirmed,
-      newChainPrimitives: input.newChainPrimitives,
-      completedInvestigations: input.completedInvestigations,
-      previousCompletedInvestigations: input.previousCompletedInvestigations,
-      verifiedHopReachExpansions: expansions,
-    })
-    return { verifiedHopReachExpansions: expansions, dryRounds }
   }
 
   /**

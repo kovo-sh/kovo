@@ -631,14 +631,16 @@ test('buildHopCheckpointBrief formats <= 2 KB briefs accurately and truncates sa
     }
   }
 
-  // Normal compact brief at hop 2 stays untruncated and well under 2 KB.
+  // Normal compact brief at hop 2 stays untruncated and well under 2 KB (unified v8.hop_checkpoint.v1 schema).
   const normalBrief = ledger.buildHopCheckpointBrief(ids[2]!)
   const normalBytes = Buffer.byteLength(JSON.stringify(normalBrief), 'utf8')
-  assert.equal(normalBrief.schemaVersion, 1)
-  assert.equal(normalBrief.capId, ids[2])
-  assert.equal(normalBrief.hopDepth, 2)
+  assert.equal(normalBrief.schema, 'v8.hop_checkpoint.v1')
+  assert.equal(normalBrief.branchKey, ids[2])
+  assert.equal(normalBrief.depth, 2)
   assert.equal(normalBrief.truncated, false)
-  assert.equal(normalBrief.lineageEdges.length, 2)
+  assert.equal(normalBrief.doNotRediscover, true)
+  assert.equal(normalBrief.verifiedHops.length, 3)
+  assert.ok(normalBrief.capabilityHandles.includes(ids[2]!))
   assert.ok(normalBytes <= DEFAULT_CHECKPOINT_BRIEF_MAX_BYTES, `Expected <= 2048 B, got ${normalBytes} B`)
 
   // Stress brief at hop 5 with 25 pruned branches + huge summary strictly fits <= 2048 B and <= 768 B.
@@ -655,14 +657,15 @@ test('buildHopCheckpointBrief formats <= 2 KB briefs accurately and truncates sa
 
   const stressDefault = ledger.buildHopCheckpointBrief(ids[5]!, 2048)
   const stressDefaultBytes = Buffer.byteLength(JSON.stringify(stressDefault), 'utf8')
-  assert.equal(stressDefault.capId, ids[5])
-  assert.equal(stressDefault.hopDepth, 5)
+  assert.equal(stressDefault.schema, 'v8.hop_checkpoint.v1')
+  assert.equal(stressDefault.branchKey, ids[5])
+  assert.equal(stressDefault.depth, 5)
   assert.equal(stressDefault.truncated, true)
   assert.ok(stressDefaultBytes <= 2048, `Expected <= 2048 B, got ${stressDefaultBytes} B`)
 
   const stressTight = ledger.buildHopCheckpointBrief(ids[5]!, 768)
   const stressTightBytes = Buffer.byteLength(JSON.stringify(stressTight), 'utf8')
-  assert.equal(stressTight.capId, ids[5])
+  assert.equal(stressTight.schema, 'v8.hop_checkpoint.v1')
   assert.equal(stressTight.truncated, true)
   assert.ok(stressTightBytes <= 768, `Expected <= 768 B, got ${stressTightBytes} B`)
 

@@ -36,14 +36,15 @@ import {
 } from '../src/server/oracle-invariants.ts'
 import type { HostSignedRecord } from '../src/server/oracle-invariants.ts'
 import {
-  buildProofReceipt,
   signHostRecord,
   singleReceiptToComposite,
   verifyCompositeReceipt,
+} from '../src/server/composite-receipt.ts'
+import type { HostSignedTranscript } from '../src/server/composite-receipt.ts'
+import {
+  buildProofReceipt,
   verifyReceipt,
-  verifyReceiptUnified,
 } from '../src/server/proof-receipt.ts'
-import type { HostSignedTranscript } from '../src/server/proof-receipt.ts'
 import {
   VERIFY_NONCE_ENV,
   VERIFY_NONCE_HEADER,
@@ -659,11 +660,6 @@ test('proof-receipt.ts unified re-exports preserve 1-hop backward compatibility 
   const v8 = verifyCompositeReceipt(wrapped, signedTranscript, { signingKey })
   assert.equal(v8.confirmed, true)
   assert.equal(v8.hopCount, 1)
-
-  // Unified entry point accepts 1-hop ProofReceipt directly
-  const unified = verifyReceiptUnified(receipt, signedTranscript, { signingKey })
-  assert.equal(unified.confirmed, true)
-  assert.equal(unified.hopCount, 1)
 })
 
 test('oracle-invariants.ts re-exports evaluateV8OracleFamily for all 6 v8 families', () => {
