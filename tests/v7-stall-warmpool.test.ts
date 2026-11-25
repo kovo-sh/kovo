@@ -12,6 +12,12 @@
  * container backend is a recording docker stub.
  */
 import assert from 'node:assert/strict'
+import { spawnSync, type ChildProcess } from 'node:child_process'
+import { EventEmitter } from 'node:events'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { PassThrough } from 'node:stream'
 import { test } from 'node:test'
 
 import {
@@ -25,6 +31,8 @@ import {
 } from '../src/server/execution.ts'
 import {
   LinuxWorkerBackend,
+  MAX_WARM_POOL_CAPACITY,
+  WARM_SCRATCH_RESET_COMMAND,
   WarmWorkerPool,
   warmPoolCapacity,
   type DockerRunner,
@@ -242,10 +250,166 @@ test('teardown removes idle warm containers from the host', async () => {
   )
 })
 
-test('warm capacity is bounded like the worker-slot pool (K=6 requested)', () => {
+test('warm capacity is bounded up to 12 to match dynamic worker concurrency', () => {
+  assert.equal(MAX_WARM_POOL_CAPACITY, 12)
   assert.equal(warmPoolCapacity({ GUARDIAN_WARM_SLOTS: '6' }), 6)
-  assert.equal(warmPoolCapacity({ GUARDIAN_WARM_SLOTS: '99' }), 8, 'hard ceiling')
+  assert.equal(warmPoolCapacity({ GUARDIAN_WARM_SLOTS: '12' }), 12)
+  assert.equal(warmPoolCapacity({ GUARDIAN_WARM_SLOTS: '99' }), 12, 'hard ceiling')
   assert.equal(warmPoolCapacity({}), 1, 'platform default before Execution sizes the pool')
+
+  const docker = dockerStub()
+  const pool = new WarmWorkerPool({
+    cell: 'cell-cap-12',
+    image: 'guardian-worker:test',
+    dockerRunner: docker.runner,
+    runLabel: 'run-cap',
+    capacity: 12,
+  })
+  assert.equal(pool.stats.capacity, 12)
+  pool.setCapacity(20)
+  assert.equal(pool.stats.capacity, 12, 'setCapacity enforces the hard ceiling of 12')
+})
+
+test('warm scratch reset wipes regular files, single-dot hidden files, and double-dot files in /tmp', t => {
+  assert.match(WARM_SCRATCH_RESET_COMMAND, /\/tmp\/\*/)
+  assert.match(WARM_SCRATCH_RESET_COMMAND, /\/tmp\/\.\[!\.\]\*/)
+  assert.match(WARM_SCRATCH_RESET_COMMAND, /\/tmp\/\.\.\?\*/)
+  assert.doesNotMatch(WARM_SCRATCH_RESET_COMMAND, /\/repos|\/guardian-rpc|\/guardian-ipc/)
+
+  const dir = mkdtempSync(join(tmpdir(), 'guardian-warm-reset-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  writeFileSync(join(dir, 'scratch.txt'), 'a')
+  writeFileSync(join(dir, '.hidden'), 'b')
+  writeFileSync(join(dir, '..double'), 'c')
+  mkdirSync(join(dir, '.nested-dir'))
+  writeFileSync(join(dir, '.nested-dir', 'inside.txt'), 'd')
+  mkdirSync(join(dir, '..double-dir'))
+  writeFileSync(join(dir, '..double-dir', 'inside.txt'), 'e')
+
+  const cmd = WARM_SCRATCH_RESET_COMMAND.replaceAll('/tmp', dir)
+  const firstRun = spawnSync('sh', ['-c', cmd], { encoding: 'utf8' })
+  assert.equal(firstRun.status, 0)
+  assert.deepEqual(readdirSync(dir), [], 'all regular, .dot, and ..dot entries are removed')
+
+  // Idempotent when the scratch directory is already empty.
+  const secondRun = spawnSync('sh', ['-c', cmd], { encoding: 'utf8' })
+  assert.equal(secondRun.status, 0)
+})
+
+function fakeSessionSpawner(onStop?: Map<string, () => void>) {
+  const started: string[] = []
+  const spawner = (name: string): ChildProcess => {
+    started.push(name)
+    const emitter = new EventEmitter() as EventEmitter & {
+      stdin: PassThrough
+      stdout: PassThrough
+      stderr: PassThrough
+      kill: () => boolean
+    }
+    emitter.stdin = new PassThrough()
+    emitter.stdout = new PassThrough()
+    emitter.stderr = new PassThrough()
+    let closed = false
+    const finish = () => {
+      if (closed) return
+      closed = true
+      emitter.emit('close', 0)
+    }
+    emitter.kill = () => { finish(); return true }
+    onStop?.set(name, finish)
+    return emitter as unknown as ChildProcess
+  }
+  return { spawner, started }
+}
+
+test('white-box reposDir reuses warm containers, resets /tmp, bypasses on rpcMountDir, and cleans up staged mounts', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'guardian-warm-wb-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+
+  // Restrictive host mode (0o700) forces prepareReposMount() to stage a clean container-readable copy.
+  const reposDir = join(root, 'repo-src')
+  mkdirSync(reposDir, { mode: 0o700 })
+  chmodSync(reposDir, 0o700)
+  writeFileSync(join(reposDir, 'app.ts'), 'export const ok = true\n', { mode: 0o600 })
+  writeFileSync(join(reposDir, '.env'), 'SECRET=should-not-be-mounted\n', { mode: 0o600 })
+
+  const rpcDir = join(root, 'rpc-sock')
+  mkdirSync(rpcDir, { mode: 0o755 })
+
+  const stopHooks = new Map<string, () => void>()
+  const docker = dockerStub()
+  const runner: DockerRunner = async (args, signal, input) => {
+    const out = await docker.runner(args, signal, input)
+    if (args[0] === 'container' && args[1] === 'stop') {
+      const name = args[args.length - 1]!
+      stopHooks.get(name)?.()
+    }
+    return out
+  }
+  const { spawner, started } = fakeSessionSpawner(stopHooks)
+
+  const backend = new LinuxWorkerBackend({
+    workspace: { id: 'tenant-whitebox', directory: root },
+    cell: 'wb-cell',
+    dockerRunner: runner,
+    sessionSpawner: spawner,
+  })
+  t.after(() => backend.closeWarmPool())
+
+  backend.setWarmPoolPolicy('run-wb:gen1', { reposDir })
+  await waitFor(() => backend.warmPoolStats?.idle === 1, 'white-box warm pool ready')
+
+  const createCalls = () => docker.calls.filter(args => args[0] === 'container' && args[1] === 'create')
+  assert.equal(createCalls().length, 1, 'prewarms exactly one container with /repos mounted')
+  const mountFlag = createCalls()[0]!.find(arg => arg.includes('target=/repos,readonly'))
+  assert.ok(mountFlag, 'warm container mounts /repos read-only')
+  const stagedDir1 = /^type=bind,source=(.+),target=\/repos,readonly$/.exec(mountFlag!)?.[1]
+  assert.ok(stagedDir1 && stagedDir1 !== reposDir && existsSync(stagedDir1), 'staged /repos dir exists once for policy')
+  assert.equal(existsSync(join(stagedDir1!, 'app.ts')), true, 'source file staged')
+  assert.equal(existsSync(join(stagedDir1!, '.env')), false, 'sensitive .env excluded from staged /repos')
+
+  // First white-box assignment: warm hit (no cold create).
+  const s1 = await backend.openSession('asgn-wb-1', new AbortController().signal, { reposDir })
+  assert.equal(backend.containerStats().coldSessions, 0, 'first white-box assignment hits warm pool')
+  assert.equal(backend.containerStats().created, 1)
+  await s1.close()
+  assert.equal(backend.warmPoolStats?.idle, 1, 'clean white-box container returns to idle pool')
+  assert.ok(
+    docker.calls.some(args => args[0] === 'container' && args[1] === 'exec' && args.includes(WARM_SCRATCH_RESET_COMMAND)),
+    'closing pooled session runs hardened /tmp reset command',
+  )
+
+  // Second white-box assignment: reuses the exact same warm container without re-staging or re-creating.
+  const s2 = await backend.openSession('asgn-wb-2', new AbortController().signal, { reposDir })
+  assert.equal(started[1], started[0], 'second assignment reuses the same container')
+  assert.equal(backend.containerStats().reused, 1, 'reuse counter increments on white-box hit')
+  assert.equal(backend.containerStats().coldSessions, 0, 'still zero cold creates')
+  assert.equal(createCalls().length, 1, 'no second container create')
+  await s2.close()
+  assert.equal(backend.warmPoolStats?.idle, 1)
+
+  // Layer-1 rpcMountDir session MUST cold-bypass the warm pool even when reposDir matches.
+  const sRpc = await backend.openSession('asgn-rpc-1', new AbortController().signal, { reposDir, rpcMountDir: rpcDir })
+  assert.equal(backend.containerStats().coldSessions, 1, 'rpcMountDir forces cold container bypass')
+  assert.equal(backend.warmPoolStats?.idle, 1, 'warm container remains untouched in idle pool')
+  assert.equal(createCalls().length, 2, 'cold create runs for rpcMountDir session')
+  assert.ok(
+    createCalls()[1]!.some(arg => arg.includes('target=/guardian-rpc,readonly')),
+    'cold rpc session mounts per-call /guardian-rpc',
+  )
+  await sRpc.close()
+
+  // Policy rotation cleans up previous staged /repos mount and prepares a new one.
+  backend.setWarmPoolPolicy('run-wb:gen2', { reposDir })
+  await waitFor(() => backend.warmPoolStats?.idle === 1 && createCalls().length >= 3, 'rotated warm pool ready')
+  assert.equal(existsSync(stagedDir1!), false, 'previous staged /repos dir cleaned up on policy rotation')
+  const mountFlag2 = createCalls()[2]!.find(arg => arg.includes('target=/repos,readonly'))
+  const stagedDir2 = /^type=bind,source=(.+),target=\/repos,readonly$/.exec(mountFlag2 ?? '')?.[1]
+  assert.ok(stagedDir2 && existsSync(stagedDir2), 'new staged /repos dir created for rotated policy')
+
+  // Teardown cleans up the active staged /repos mount as well.
+  await backend.closeWarmPool()
+  assert.equal(existsSync(stagedDir2!), false, 'staged /repos dir cleaned up on closeWarmPool()')
 })
 
 // ============================================================================

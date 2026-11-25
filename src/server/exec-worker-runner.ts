@@ -590,8 +590,14 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         assignmentId: job.assignment.id, stepId: step.id, previous: priorEpoch, next: secretEpoch,
       })
     }
+    const { reposDir, mountedRepos } = this.host.projectReposMount(run.projectId)
     this.host.warmSecretEpochByRun.set(run.id, secretEpoch)
-    try { this.backend.setWarmPoolPolicy?.(`${run.id}:${secretEpoch}`) } catch { /* pooling is best-effort */ }
+    try {
+      this.backend.setWarmPoolPolicy?.(
+        `${run.id}:${secretEpoch}`,
+        reposDir ? { reposDir } : undefined,
+      )
+    } catch { /* pooling is best-effort */ }
 
     // Open ONE persistent air-gapped container for the entire intent.
     // Arm a pre-session wall-clock guard so a stalled openSession/staging call can never hold a
@@ -607,7 +613,6 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
     const clearPreSessionTimer = () => {
       if (preSessionTimer) { clearTimeout(preSessionTimer); preSessionTimer = undefined }
     }
-    const { reposDir, mountedRepos } = this.host.projectReposMount(run.projectId)
     let session: Awaited<ReturnType<WorkerBackend['openSession']>>
     try {
       session = await this.backend.openSession(
