@@ -24,7 +24,7 @@ Summary: Identify and deterministically verify reflected/DOM XSS, unsafe postMes
 ## 3. Benign Non-Destructive DOM/Reflected XSS Verification
 - Never inject destructive or external-exfil scripts (`fetch("https://evil...")`).
 - Test reflection first via `request_http` with a unique inert marker (`guardian_xss_probe_9182`). Check exact HTML/JS/attribute context and whether `<`, `>`, `"`, `'`, `/` are unescaped.
-- Verify execution deterministically using `browser_visit` (`domCheck: "dom_xss"`) or `DeclarativeReplaySpec` `kind: "browser_dom"` comparing `controlPath` (clean URL) vs `probePath` (benign DOM canary payload that sets a harmless `window.__guardian_dom_canary` or triggers an inert marker in the broker-proxied Playwright DOM—zero external network calls).
+- Verify execution deterministically using `browser_visit` (`domCheck: "dom_xss"`) or a TypeScript `guardian_verify` script that calls `ctx.browser(...)` on a clean control URL vs. a probe URL (benign DOM canary that sets a harmless `window.__guardian_dom_canary` or triggers an inert marker in the broker-proxied Playwright DOM—zero external network calls) and asserts execution with `ctx.assert.domSentinel(...)` on the probe while verifying absence on the control.
 
 ## 4. Sandboxed Preview / Bundler Isolation
 - If the target runs user-code previews (e.g., Sandpack/iframe bundlers), verify:

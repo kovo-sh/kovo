@@ -21,4 +21,4 @@ The reviewer operates in a fresh session with zero shared context from the autho
    - `needs_operator_step` — safe code change that requires an operator config step (e.g., setting a webhook secret env var or DB migration).
    - `breaks_callers` — breaks valid existing callers, UI clients, or API contracts. **MANDATORY: automatically withhold (`status: "withheld"`) any patch classified `breaks_callers`!**
 5. **Gate 5 — Repo Conventions & Minimality:** Confirm the diff is minimal, readable, and idiomatic without introducing new regressions or leaking secrets.
-6. **Gate 6 — Optional Dynamic Fix Retest (`local-lab`):** When running in opt-in `local-lab` mode, rebuild the isolated `--internal` target with the patch applied and run Zero-LLM `retestReplaySpec` to verify `reproduced -> fixed`.
+6. **Gate 6 — Optional Dynamic Fix Retest (`local-lab`):** When running in opt-in `local-lab` mode, rebuild the isolated `--internal` target with the patch applied and re-run the persisted TypeScript `guardian_verify` proof (Zero-LLM dynamic fix retest) to verify `reproduced -> fixed`.

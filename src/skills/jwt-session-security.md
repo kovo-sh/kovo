@@ -20,5 +20,5 @@ Summary: Inspect JWT headers/claims, signature verification discipline, cookie a
   - Check whether auth tokens, magic links, or session IDs appear in URL query strings combined with permissive `Referrer-Policy` or missing `Cache-Control: no-store`.
 
 ## 3. Verification Rules
-- Never put raw `Authorization` or `Cookie` headers into `DeclarativeReplaySpec` (schema rejects them; use opaque `persona` handles for legitimate authenticated controls).
-- For synthetic invalid/alg-none JWT probes, pass via a custom non-secret test path or verify via `http_chain` asserting control `401/403` vs probe `200` with authenticated JSON payload.
+- Never hardcode raw `Authorization` or `Cookie` headers in a TypeScript `guardian_verify` script (the broker rejects raw secret injection; use opaque `as` / `persona` handles for legitimate authenticated controls, or sealed capability handles via `ctx.sealCapability` / `ctx.jwtSign`).
+- For synthetic invalid/alg-none JWT probes, verify in a TypeScript `guardian_verify` script via `ctx.http(...)` or `ctx.proveAccessBoundary(...)` asserting control `401`/`403` vs. probe `200` with an authenticated JSON payload.

@@ -820,8 +820,6 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
    * facts. No specialist steps are cancelled or hidden in this slice.
    */
   async runEngineInvestigation(run: Run, laneOptions: {
-    /** @deprecated Phase A runs the same depth as `--no-llm`; kept for typed callers. */
-    lane?: boolean
     signal?: AbortSignal
     maxDurationMs?: number
     onAssignment?: (assignmentId: string) => void
@@ -990,17 +988,13 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
           tenant: tenantOf(persona.roleLabel),
         }))
 
-      const envNumber = (name: string): number | undefined => {
-        const parsed = Number(process.env[name])
-        return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
-      }
       // Phase A has its own allowance in split mode (`floorRequestBudget`), so the floor can never
       // spend the agents' requests. Legacy mode keeps the shared remainder as the only cap. The
       // deep policy is unchanged: the floor is still never halved just because agents will run.
       this.host.beginFloorRequestPhase(current)
       const remainingRequests = this.host.phaseRequestRemaining(current) ?? 700
-      const requestCap = Math.max(0, Math.min(envNumber('GUARDIAN_DETERMINISTIC_MAX_REQUESTS') ?? 1800, remainingRequests))
-      const durationCap = laneOptions.maxDurationMs ?? envNumber('GUARDIAN_DETERMINISTIC_MAX_MS') ?? 240_000
+      const requestCap = Math.max(0, Math.min(1800, remainingRequests))
+      const durationCap = laneOptions.maxDurationMs ?? 240_000
       // v6 environment contract: shared staging gets a short, tightly capped floor pass so it can
       // never dominate the engagement budget, and every created entity carries the run tag.
       const environmentMode = this.storage.scopePolicy(current).mode
@@ -1012,7 +1006,7 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
       const maxDurationMs = environmentMode === 'staging_isolated'
         ? Math.min(durationCap, 90_000)
         : durationCap
-      const maxHypotheses = envNumber('GUARDIAN_DETERMINISTIC_MAX_HYPOTHESES') ?? 90
+      const maxHypotheses = 90
 
       this.storage.event(
         current.id,
