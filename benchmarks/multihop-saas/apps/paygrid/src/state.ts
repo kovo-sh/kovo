@@ -142,6 +142,20 @@ export function tenantById(state: LabState, id: string): TenantKey | null {
   return found ? found.id : null
 }
 
+// Export paths are exact unless the target declares a direct slug overlap.
+export function exportPathPrefix(
+  state: LabState, signedTenantId: TenantKey, pathTenantId: TenantKey,
+): string | null {
+  const signedSlug = state.orgs[signedTenantId].slug
+  const pathTenant = state.distro.find((tenant) => tenant.id === pathTenantId)
+  const base = `/files/export/${signedSlug}`
+  if (signedTenantId === pathTenantId) return `${base}/`
+  if (!pathTenant || pathTenant.prefixOverlapWith !== signedTenantId || !pathTenant.slug.startsWith(`${signedSlug}-`)) {
+    return null
+  }
+  return `${base}-`
+}
+
 export function rolePermissions(role: LabRole): LabRole[] {
   switch (role) {
     case 'owner':

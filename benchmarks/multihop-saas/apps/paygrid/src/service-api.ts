@@ -320,7 +320,7 @@ export async function handleApi(
       'content-type': header(req, 'content-type') || 'application/json',
       'x-guardian-run-id': runId,
     }
-    for (const name of ['x-signature', 'x-lab-derived-from', 'x-scope']) {
+    for (const name of ['x-signature', 'x-scope']) {
       const value = header(req, name)
       if (value) forwardHeaders[name] = value
     }

@@ -105,6 +105,18 @@ export async function handleIdp(req: IncomingMessage, res: ServerResponse, state
     return
   }
 
+  if (method === 'POST' && match(url, method, '/sessions/revoke')) {
+    const session = authenticate(state, req)
+    if (!session) {
+      sendJson(res, 401, { error: 'session required' })
+      return
+    }
+    state.sessions.delete(session.token)
+    state.emit('session.revoked', { sessionDigest: digest(session.token), runId }, session.originPersona)
+    sendJson(res, 200, { ok: true })
+    return
+  }
+
   const sessionParams = match(url, method, '/sessions/:id')
   if (sessionParams) {
     const session = state.sessions.get(sessionParams[0]!)
@@ -116,17 +128,6 @@ export async function handleIdp(req: IncomingMessage, res: ServerResponse, state
       user: session.userId, tenant: session.tenantId, role: session.role,
       revoked: session.revoked, verified: session.emailVerified,
     })
-    return
-  }
-
-  if (match(url, method, '/sessions/revoke')) {
-    const body = parseJson<{ token?: string }>(await readBody(req))
-    const target = body?.token ? state.sessions.get(body.token) : authenticate(state, req)
-    if (target) {
-      target.revoked = true
-      state.emit('session.revoked', { sessionDigest: digest(target.token), runId }, target.originPersona)
-    }
-    sendJson(res, 200, { ok: true })
     return
   }
 
