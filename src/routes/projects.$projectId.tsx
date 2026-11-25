@@ -85,9 +85,7 @@ function ProjectPage() {
         <Link className="pw-crumb" to="/">Projects</Link>
         <span className="pw-crumb-sep" aria-hidden="true">/</span>
         <h1 className="pw-title">{project.name}</h1>
-        {project.environment === 'local-lab'
-          ? <span className="pw-tag warn">Local Lab</span>
-          : <span className="pw-tag solid">Public HTTPS</span>}
+        {project.environment === 'local-lab' && <span className="pw-tag warn">Local Lab</span>}
         <span className="pw-hdr-meta mono" title={project.seeds.join(', ')}>
           {project.seeds.map(safeHost).join(', ')}
         </span>

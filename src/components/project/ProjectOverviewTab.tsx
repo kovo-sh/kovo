@@ -31,8 +31,7 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
 
   return <>
     <div className="pw-eyebrow">
-      <span>{project.environment === 'local-lab' ? 'Local Lab project' : 'Public HTTPS project'}</span>
-      <span>·</span>
+      {project.environment === 'local-lab' && <><span>Local Lab</span><span>·</span></>}
       <span className="num">{plural(assets.length, 'host')}</span>
       {wildcardCount > 0 && <><span>·</span><span>{plural(wildcardCount, '*.domain scope')}</span></>}
     </div>
