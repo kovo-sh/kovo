@@ -1,0 +1,184 @@
+{
+  "schemaVersion": "1.0",
+  "bundleKind": "clean_controls",
+  "description": "Two clean patched negative-control OSS targets enforcing a hard 0-FP gate (maxAllowedFindings: 0). Any finding or unexpected external oracle trigger fails the run.",
+  "cleanControls": [
+    {
+      "schemaVersion": "1.0",
+      "controlId": "oss-clean-vikunja-01",
+      "name": "Vikunja Clean Patched Negative Control (Go)",
+      "project": "vikunja",
+      "language": "go",
+      "domain": "multi-tenant-task-management",
+      "patchedBuild": {
+        "repoUrl": "https://github.com/go-vikunja/vikunja",
+        "versionTag": "v0.24.4",
+        "commitSha": "7777777777777777777777777777777777777701",
+        "imageRef": "vikunja/vikunja:0.24.4",
+        "imageDigest": "sha256:7777777777777777777777777777777777777777777777777777777777777701",
+        "pinVerification": "pending_docker_lock",
+        "advisoryCategory": "clean-patched-negative-control"
+      },
+      "rationale": "Clean patched multi-tenant Go API with webhook/sharing workflows and strict authorization checks; verifies 0 false positives on complex benign SaaS surfaces.",
+      "maxAllowedFindings": 0,
+      "personas": [
+        {
+          "personaId": "vikunja_member_a",
+          "role": "attacker_member",
+          "username": "member_clean_a",
+          "credentialRef": "oss_lab_vikunja_member_a",
+          "allowedAsChainOrigin": true
+        },
+        {
+          "personaId": "vikunja_owner_b",
+          "role": "victim_admin",
+          "username": "owner_clean_b",
+          "credentialRef": "oss_lab_vikunja_owner_b",
+          "allowedAsChainOrigin": false
+        }
+      ],
+      "composeTemplate": {
+        "version": "3.9",
+        "projectNamePrefix": "oss-clean-vikunja",
+        "egressPolicy": "deny_all_internal_only",
+        "labProxyMode": "loopback_port_publish",
+        "networks": {
+          "vikunja_clean_internal": {
+            "driver": "bridge",
+            "internal": true
+          }
+        },
+        "services": {
+          "vikunja_app": {
+            "role": "app",
+            "imageRef": "vikunja/vikunja:0.24.4",
+            "imageDigest": "sha256:7777777777777777777777777777777777777777777777777777777777777701",
+            "networks": ["vikunja_clean_internal"],
+            "ports": ["127.0.0.1:0:3456"],
+            "capDrop": ["ALL"],
+            "environment": {
+              "VIKUNJA_SERVICE_JWTSECRET": "oss_lab_vikunja_jwt_01",
+              "VIKUNJA_DATABASE_TYPE": "postgres"
+            }
+          },
+          "vikunja_db": {
+            "role": "db",
+            "imageRef": "postgres:16.4-alpine",
+            "imageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "networks": ["vikunja_clean_internal"],
+            "capDrop": ["ALL"],
+            "environment": {
+              "POSTGRES_DB": "vikunja_clean",
+              "POSTGRES_USER": "oss_lab_user",
+              "POSTGRES_PASSWORD": "oss_lab_pg_clean_01"
+            }
+          }
+        }
+      },
+      "impactOracles": [
+        {
+          "oracleId": "ora-clean-vikunja-db-01",
+          "kind": "db_query",
+          "description": "Must remain strictly silent (0 cross-tenant mutations on clean patched Vikunja).",
+          "targetService": "vikunja_db",
+          "expectedCorrelationField": "run_id",
+          "pollTimeoutMs": 3000,
+          "runScopedCanaryPrefix": "oss_canary_clean_vikunja_",
+          "engine": "postgres",
+          "readOnlyQuery": "SELECT id, owner_id FROM projects WHERE title LIKE 'oss_canary_clean_vikunja_%'",
+          "expectedPredicate": {
+            "column": "id",
+            "matchMode": "row_count_gt_zero"
+          }
+        }
+      ]
+    },
+    {
+      "schemaVersion": "1.0",
+      "controlId": "oss-clean-outline-02",
+      "name": "Outline Clean Patched Negative Control (TypeScript)",
+      "project": "outline",
+      "language": "typescript",
+      "domain": "team-knowledge-base",
+      "patchedBuild": {
+        "repoUrl": "https://github.com/outline/outline",
+        "versionTag": "v0.80.1",
+        "commitSha": "8888888888888888888888888888888888888801",
+        "imageRef": "outlinewiki/outline:0.80.1",
+        "imageDigest": "sha256:8888888888888888888888888888888888888888888888888888888888888801",
+        "pinVerification": "pending_docker_lock",
+        "advisoryCategory": "clean-patched-negative-control"
+      },
+      "rationale": "Clean patched TypeScript collaborative wiki with collections, sharing, exports, and strict RBAC; verifies 0 false positives on modern SPA/API stacks.",
+      "maxAllowedFindings": 0,
+      "personas": [
+        {
+          "personaId": "outline_viewer_a",
+          "role": "attacker_low_priv",
+          "username": "viewer_clean_a",
+          "credentialRef": "oss_lab_outline_viewer_a",
+          "allowedAsChainOrigin": true
+        },
+        {
+          "personaId": "outline_admin_b",
+          "role": "victim_admin",
+          "username": "admin_clean_b",
+          "credentialRef": "oss_lab_outline_admin_b",
+          "allowedAsChainOrigin": false
+        }
+      ],
+      "composeTemplate": {
+        "version": "3.9",
+        "projectNamePrefix": "oss-clean-outline",
+        "egressPolicy": "deny_all_internal_only",
+        "labProxyMode": "loopback_port_publish",
+        "networks": {
+          "outline_clean_internal": {
+            "driver": "bridge",
+            "internal": true
+          }
+        },
+        "services": {
+          "outline_app": {
+            "role": "app",
+            "imageRef": "outlinewiki/outline:0.80.1",
+            "imageDigest": "sha256:8888888888888888888888888888888888888888888888888888888888888801",
+            "networks": ["outline_clean_internal"],
+            "ports": ["127.0.0.1:0:3000"],
+            "capDrop": ["ALL"],
+            "environment": {
+              "SECRET_KEY": "oss_lab_outline_secret_02",
+              "UTILS_SECRET": "oss_lab_outline_utils_02"
+            }
+          },
+          "outline_db": {
+            "role": "db",
+            "imageRef": "postgres:16.4-alpine",
+            "imageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "networks": ["outline_clean_internal"],
+            "capDrop": ["ALL"],
+            "environment": {
+              "POSTGRES_DB": "outline_clean",
+              "POSTGRES_USER": "oss_lab_user",
+              "POSTGRES_PASSWORD": "oss_lab_pg_clean_02"
+            }
+          }
+        }
+      },
+      "impactOracles": [
+        {
+          "oracleId": "ora-clean-outline-log-01",
+          "kind": "container_log",
+          "description": "Must remain strictly silent (0 unauthorized export or privilege log events on clean patched Outline).",
+          "targetService": "outline_app",
+          "expectedCorrelationField": "run_id",
+          "pollTimeoutMs": 3000,
+          "runScopedCanaryPrefix": "oss_canary_clean_outline_",
+          "containerRole": "app",
+          "stream": "stdout",
+          "expectedPattern": "audit_event=unauthorized_export.*oss_canary_clean_outline_[a-z0-9_-]+"
+        }
+      ]
+    }
+  ]
+}

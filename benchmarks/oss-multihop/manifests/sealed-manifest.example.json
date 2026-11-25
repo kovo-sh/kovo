@@ -1,0 +1,465 @@
+{
+  "schemaVersion": "1.0",
+  "bundleKind": "sealed_anchors",
+  "description": "Schema template for the 4 sealed M4 OSS multi-hop anchors. Contains ONLY redacted slot placeholders (no sealed project names, advisories, or chain specifics). The real sealed manifest is stored outside dev hill-climbing and evaluated only at M4 certification.",
+  "anchors": [
+    {
+      "schemaVersion": "1.0",
+      "anchorId": "oss-sealed-slot-01",
+      "name": "Sealed M4 Anchor Slot 1 (IAM Federation Category)",
+      "project": "sealed-target-slot-1",
+      "split": "sealed",
+      "language": "java",
+      "domain": "iam-federation",
+      "terminalVulnClass": "multi_hop_iam_privilege_escalation",
+      "hopCount": 4,
+      "hops": [
+        {
+          "hopId": "H1",
+          "order": 1,
+          "serviceRole": "idp",
+          "surface": "idp",
+          "summary": "Sealed slot 1 hop 1 placeholder (federated identity entry surface).",
+          "postconditionCapabilityKind": "opaque_object_ref"
+        },
+        {
+          "hopId": "H2",
+          "order": 2,
+          "serviceRole": "idp",
+          "surface": "http",
+          "summary": "Sealed slot 1 hop 2 placeholder (claim/scope transition).",
+          "incomingEdgeKind": "derived_crypto_binding",
+          "preconditionCapabilityKind": "opaque_object_ref",
+          "postconditionCapabilityKind": "scoped_token",
+          "expectedPatchBreak": true
+        },
+        {
+          "hopId": "H3",
+          "order": 3,
+          "serviceRole": "app",
+          "surface": "http",
+          "summary": "Sealed slot 1 hop 3 placeholder (cross-realm delegation step).",
+          "incomingEdgeKind": "value_binding",
+          "preconditionCapabilityKind": "scoped_token",
+          "postconditionCapabilityKind": "state_handle"
+        },
+        {
+          "hopId": "H4",
+          "order": 4,
+          "serviceRole": "db",
+          "surface": "http",
+          "summary": "Sealed slot 1 hop 4 placeholder (external DB impact verification).",
+          "incomingEdgeKind": "state_transition_binding",
+          "preconditionCapabilityKind": "state_handle",
+          "postconditionCapabilityKind": "identity_session"
+        }
+      ],
+      "vulnerableBuild": {
+        "repoUrl": "https://example.invalid/sealed/slot-1",
+        "versionTag": "v0.0.1-sealed-vuln",
+        "commitSha": "9000000000000000000000000000000000000011",
+        "imageRef": "sealed-registry.invalid/slot-1:0.0.1-vuln",
+        "imageDigest": "sha256:9000000000000000000000000000000000000000000000000000000000000011",
+        "pinVerification": "pending_docker_lock"
+      },
+      "patchedBuild": {
+        "repoUrl": "https://example.invalid/sealed/slot-1",
+        "versionTag": "v0.0.2-sealed-patched",
+        "commitSha": "9000000000000000000000000000000000000012",
+        "imageRef": "sealed-registry.invalid/slot-1:0.0.2-patched",
+        "imageDigest": "sha256:9000000000000000000000000000000000000000000000000000000000000012",
+        "pinVerification": "pending_docker_lock"
+      },
+      "expectedPatchBrokeHopIds": ["H2"],
+      "impactOracle": {
+        "oracleId": "ora-sealed-slot-01",
+        "kind": "db_query",
+        "description": "Template read-only DB oracle for sealed slot 1.",
+        "targetService": "slot1_db",
+        "expectedCorrelationField": "run_id",
+        "pollTimeoutMs": 5000,
+        "runScopedCanaryPrefix": "oss_canary_sealed1_",
+        "engine": "postgres",
+        "readOnlyQuery": "SELECT id, canary_marker FROM sealed_audit WHERE canary_marker LIKE 'oss_canary_sealed1_%'",
+        "expectedPredicate": {
+          "column": "canary_marker",
+          "matchMode": "contains",
+          "expectedValue": "oss_canary_sealed1_"
+        }
+      },
+      "personas": [
+        {
+          "personaId": "sealed1_low_priv",
+          "role": "attacker_low_priv",
+          "username": "sealed1_user",
+          "credentialRef": "oss_lab_sealed1_low",
+          "allowedAsChainOrigin": true
+        }
+      ],
+      "composeTemplate": {
+        "version": "3.9",
+        "projectNamePrefix": "oss-sealed-slot1",
+        "egressPolicy": "deny_all_internal_only",
+        "labProxyMode": "loopback_port_publish",
+        "networks": {
+          "slot1_internal": {
+            "driver": "bridge",
+            "internal": true
+          }
+        },
+        "services": {
+          "slot1_app": {
+            "role": "app",
+            "imageRef": "sealed-registry.invalid/slot-1:0.0.1-vuln",
+            "imageDigest": "sha256:9000000000000000000000000000000000000000000000000000000000000011",
+            "networks": ["slot1_internal"],
+            "ports": ["127.0.0.1:0:8080"],
+            "capDrop": ["ALL"]
+          },
+          "slot1_db": {
+            "role": "db",
+            "imageRef": "postgres:16.4-alpine",
+            "imageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "networks": ["slot1_internal"],
+            "capDrop": ["ALL"]
+          }
+        }
+      },
+      "evaluationModes": ["grey-box", "white-box"]
+    },
+    {
+      "schemaVersion": "1.0",
+      "anchorId": "oss-sealed-slot-02",
+      "name": "Sealed M4 Anchor Slot 2 (CI Runner Category)",
+      "project": "sealed-target-slot-2",
+      "split": "sealed",
+      "language": "go",
+      "domain": "ci-runner-pipeline",
+      "terminalVulnClass": "multi_hop_runner_secret_access",
+      "hopCount": 4,
+      "hops": [
+        {
+          "hopId": "H1",
+          "order": 1,
+          "serviceRole": "app",
+          "surface": "http",
+          "summary": "Sealed slot 2 hop 1 placeholder (pipeline entry).",
+          "postconditionCapabilityKind": "opaque_object_ref"
+        },
+        {
+          "hopId": "H2",
+          "order": 2,
+          "serviceRole": "worker",
+          "surface": "async_job",
+          "summary": "Sealed slot 2 hop 2 placeholder (runner dispatch).",
+          "incomingEdgeKind": "async_pivot_binding",
+          "preconditionCapabilityKind": "opaque_object_ref",
+          "postconditionCapabilityKind": "scoped_token",
+          "expectedPatchBreak": true
+        },
+        {
+          "hopId": "H3",
+          "order": 3,
+          "serviceRole": "internal_target",
+          "surface": "http",
+          "summary": "Sealed slot 2 hop 3 placeholder (internal artifact pivot).",
+          "incomingEdgeKind": "value_binding",
+          "preconditionCapabilityKind": "scoped_token",
+          "postconditionCapabilityKind": "internal_reach_handle"
+        },
+        {
+          "hopId": "H4",
+          "order": 4,
+          "serviceRole": "app",
+          "surface": "webhook",
+          "summary": "Sealed slot 2 hop 4 placeholder (external loopback OOB confirmation).",
+          "incomingEdgeKind": "async_pivot_binding",
+          "preconditionCapabilityKind": "internal_reach_handle",
+          "postconditionCapabilityKind": "state_handle"
+        }
+      ],
+      "vulnerableBuild": {
+        "repoUrl": "https://example.invalid/sealed/slot-2",
+        "versionTag": "v0.0.1-sealed-vuln",
+        "commitSha": "9000000000000000000000000000000000000021",
+        "imageRef": "sealed-registry.invalid/slot-2:0.0.1-vuln",
+        "imageDigest": "sha256:9000000000000000000000000000000000000000000000000000000000000021",
+        "pinVerification": "pending_docker_lock"
+      },
+      "patchedBuild": {
+        "repoUrl": "https://example.invalid/sealed/slot-2",
+        "versionTag": "v0.0.2-sealed-patched",
+        "commitSha": "9000000000000000000000000000000000000022",
+        "imageRef": "sealed-registry.invalid/slot-2:0.0.2-patched",
+        "imageDigest": "sha256:9000000000000000000000000000000000000000000000000000000000000022",
+        "pinVerification": "pending_docker_lock"
+      },
+      "expectedPatchBrokeHopIds": ["H2"],
+      "impactOracle": {
+        "oracleId": "ora-sealed-slot-02",
+        "kind": "loopback_oob_collector",
+        "description": "Template loopback OOB collector oracle for sealed slot 2.",
+        "targetService": "slot2_worker",
+        "expectedCorrelationField": "X-Guardian-Run-Id",
+        "pollTimeoutMs": 5000,
+        "runScopedCanaryPrefix": "oss_canary_sealed2_",
+        "collectorUrl": "http://127.0.0.1:19402/oob/slot2",
+        "expectedMethod": "POST",
+        "expectedPathPrefix": "/oob/slot2/",
+        "requireCanaryToken": true
+      },
+      "personas": [
+        {
+          "personaId": "sealed2_member",
+          "role": "attacker_member",
+          "username": "sealed2_user",
+          "credentialRef": "oss_lab_sealed2_member",
+          "allowedAsChainOrigin": true
+        }
+      ],
+      "composeTemplate": {
+        "version": "3.9",
+        "projectNamePrefix": "oss-sealed-slot2",
+        "egressPolicy": "deny_all_internal_only",
+        "labProxyMode": "loopback_port_publish",
+        "networks": {
+          "slot2_internal": {
+            "driver": "bridge",
+            "internal": true
+          }
+        },
+        "services": {
+          "slot2_app": {
+            "role": "app",
+            "imageRef": "sealed-registry.invalid/slot-2:0.0.1-vuln",
+            "imageDigest": "sha256:9000000000000000000000000000000000000000000000000000000000000021",
+            "networks": ["slot2_internal"],
+            "ports": ["127.0.0.1:0:8080"],
+            "capDrop": ["ALL"]
+          },
+          "slot2_worker": {
+            "role": "worker",
+            "imageRef": "sealed-registry.invalid/slot-2-worker:0.0.1-vuln",
+            "imageDigest": "sha256:9000000000000000000000000000000000000000000000000000000000000023",
+            "networks": ["slot2_internal"],
+            "capDrop": ["ALL"]
+          }
+        }
+      },
+      "evaluationModes": ["grey-box", "white-box"]
+    },
+    {
+      "schemaVersion": "1.0",
+      "anchorId": "oss-sealed-slot-03",
+      "name": "Sealed M4 Anchor Slot 3 (BI Worker Category)",
+      "project": "sealed-target-slot-3",
+      "split": "sealed",
+      "language": "python",
+      "domain": "bi-analytics-worker",
+      "terminalVulnClass": "multi_hop_bi_worker_data_access",
+      "hopCount": 3,
+      "hops": [
+        {
+          "hopId": "H1",
+          "order": 1,
+          "serviceRole": "app",
+          "surface": "http",
+          "summary": "Sealed slot 3 hop 1 placeholder (query/report entry).",
+          "postconditionCapabilityKind": "write_sink_handle"
+        },
+        {
+          "hopId": "H2",
+          "order": 2,
+          "serviceRole": "worker",
+          "surface": "async_job",
+          "summary": "Sealed slot 3 hop 2 placeholder (async worker boundary).",
+          "incomingEdgeKind": "async_pivot_binding",
+          "preconditionCapabilityKind": "write_sink_handle",
+          "postconditionCapabilityKind": "state_handle",
+          "expectedPatchBreak": true
+        },
+        {
+          "hopId": "H3",
+          "order": 3,
+          "serviceRole": "worker",
+          "surface": "storage",
+          "summary": "Sealed slot 3 hop 3 placeholder (file integrity verification).",
+          "incomingEdgeKind": "state_transition_binding",
+          "preconditionCapabilityKind": "state_handle",
+          "postconditionCapabilityKind": "opaque_object_ref"
+        }
+      ],
+      "vulnerableBuild": {
+        "repoUrl": "https://example.invalid/sealed/slot-3",
+        "versionTag": "v0.0.1-sealed-vuln",
+        "commitSha": "9000000000000000000000000000000000000031",
+        "imageRef": "sealed-registry.invalid/slot-3:0.0.1-vuln",
+        "imageDigest": "sha256:9000000000000000000000000000000000000000000000000000000000000031",
+        "pinVerification": "pending_docker_lock"
+      },
+      "patchedBuild": {
+        "repoUrl": "https://example.invalid/sealed/slot-3",
+        "versionTag": "v0.0.2-sealed-patched",
+        "commitSha": "9000000000000000000000000000000000000032",
+        "imageRef": "sealed-registry.invalid/slot-3:0.0.2-patched",
+        "imageDigest": "sha256:9000000000000000000000000000000000000000000000000000000000000032",
+        "pinVerification": "pending_docker_lock"
+      },
+      "expectedPatchBrokeHopIds": ["H2"],
+      "impactOracle": {
+        "oracleId": "ora-sealed-slot-03",
+        "kind": "file_integrity",
+        "description": "Template file integrity oracle for sealed slot 3.",
+        "targetService": "slot3_worker",
+        "expectedCorrelationField": "run_id",
+        "pollTimeoutMs": 5000,
+        "runScopedCanaryPrefix": "oss_canary_sealed3_",
+        "containerRole": "worker",
+        "watchPath": "/var/lib/sealed-slot3/exports/marker.txt",
+        "checkMode": "canary_written"
+      },
+      "personas": [
+        {
+          "personaId": "sealed3_analyst",
+          "role": "attacker_low_priv",
+          "username": "sealed3_user",
+          "credentialRef": "oss_lab_sealed3_analyst",
+          "allowedAsChainOrigin": true
+        }
+      ],
+      "composeTemplate": {
+        "version": "3.9",
+        "projectNamePrefix": "oss-sealed-slot3",
+        "egressPolicy": "deny_all_internal_only",
+        "labProxyMode": "loopback_port_publish",
+        "networks": {
+          "slot3_internal": {
+            "driver": "bridge",
+            "internal": true
+          }
+        },
+        "services": {
+          "slot3_app": {
+            "role": "app",
+            "imageRef": "sealed-registry.invalid/slot-3:0.0.1-vuln",
+            "imageDigest": "sha256:9000000000000000000000000000000000000000000000000000000000000031",
+            "networks": ["slot3_internal"],
+            "ports": ["127.0.0.1:0:8088"],
+            "capDrop": ["ALL"]
+          },
+          "slot3_worker": {
+            "role": "worker",
+            "imageRef": "sealed-registry.invalid/slot-3-worker:0.0.1-vuln",
+            "imageDigest": "sha256:9000000000000000000000000000000000000000000000000000000000000033",
+            "networks": ["slot3_internal"],
+            "capDrop": ["ALL"]
+          }
+        }
+      },
+      "evaluationModes": ["grey-box", "white-box"]
+    },
+    {
+      "schemaVersion": "1.0",
+      "anchorId": "oss-sealed-slot-04",
+      "name": "Sealed M4 Anchor Slot 4 (Commerce Workflow Category)",
+      "project": "sealed-target-slot-4",
+      "split": "sealed",
+      "language": "typescript",
+      "domain": "commerce-order-workflow",
+      "terminalVulnClass": "multi_hop_commerce_state_violation",
+      "hopCount": 3,
+      "hops": [
+        {
+          "hopId": "H1",
+          "order": 1,
+          "serviceRole": "app",
+          "surface": "graphql",
+          "summary": "Sealed slot 4 hop 1 placeholder (draft order/checkout initialization).",
+          "postconditionCapabilityKind": "state_handle"
+        },
+        {
+          "hopId": "H2",
+          "order": 2,
+          "serviceRole": "app",
+          "surface": "http",
+          "summary": "Sealed slot 4 hop 2 placeholder (state transition / fulfillment boundary).",
+          "incomingEdgeKind": "state_transition_binding",
+          "preconditionCapabilityKind": "state_handle",
+          "postconditionCapabilityKind": "policy_asymmetry",
+          "expectedPatchBreak": true
+        },
+        {
+          "hopId": "H3",
+          "order": 3,
+          "serviceRole": "app",
+          "surface": "async_job",
+          "summary": "Sealed slot 4 hop 3 placeholder (external audit log confirmation).",
+          "incomingEdgeKind": "async_pivot_binding",
+          "preconditionCapabilityKind": "policy_asymmetry",
+          "postconditionCapabilityKind": "state_handle"
+        }
+      ],
+      "vulnerableBuild": {
+        "repoUrl": "https://example.invalid/sealed/slot-4",
+        "versionTag": "v0.0.1-sealed-vuln",
+        "commitSha": "9000000000000000000000000000000000000041",
+        "imageRef": "sealed-registry.invalid/slot-4:0.0.1-vuln",
+        "imageDigest": "sha256:9000000000000000000000000000000000000000000000000000000000000041",
+        "pinVerification": "pending_docker_lock"
+      },
+      "patchedBuild": {
+        "repoUrl": "https://example.invalid/sealed/slot-4",
+        "versionTag": "v0.0.2-sealed-patched",
+        "commitSha": "9000000000000000000000000000000000000042",
+        "imageRef": "sealed-registry.invalid/slot-4:0.0.2-patched",
+        "imageDigest": "sha256:9000000000000000000000000000000000000000000000000000000000000042",
+        "pinVerification": "pending_docker_lock"
+      },
+      "expectedPatchBrokeHopIds": ["H2"],
+      "impactOracle": {
+        "oracleId": "ora-sealed-slot-04",
+        "kind": "container_log",
+        "description": "Template container log oracle for sealed slot 4.",
+        "targetService": "slot4_app",
+        "expectedCorrelationField": "run_id",
+        "pollTimeoutMs": 5000,
+        "runScopedCanaryPrefix": "oss_canary_sealed4_",
+        "containerRole": "app",
+        "stream": "stdout",
+        "expectedPattern": "audit_event=order_invariant_violation.*oss_canary_sealed4_[a-z0-9_-]+"
+      },
+      "personas": [
+        {
+          "personaId": "sealed4_buyer",
+          "role": "attacker_low_priv",
+          "username": "sealed4_user",
+          "credentialRef": "oss_lab_sealed4_buyer",
+          "allowedAsChainOrigin": true
+        }
+      ],
+      "composeTemplate": {
+        "version": "3.9",
+        "projectNamePrefix": "oss-sealed-slot4",
+        "egressPolicy": "deny_all_internal_only",
+        "labProxyMode": "loopback_port_publish",
+        "networks": {
+          "slot4_internal": {
+            "driver": "bridge",
+            "internal": true
+          }
+        },
+        "services": {
+          "slot4_app": {
+            "role": "app",
+            "imageRef": "sealed-registry.invalid/slot-4:0.0.1-vuln",
+            "imageDigest": "sha256:9000000000000000000000000000000000000000000000000000000000000041",
+            "networks": ["slot4_internal"],
+            "ports": ["127.0.0.1:0:9000"],
+            "capDrop": ["ALL"]
+          }
+        }
+      },
+      "evaluationModes": ["grey-box", "white-box"]
+    }
+  ]
+}
