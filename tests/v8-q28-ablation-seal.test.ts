@@ -7,19 +7,16 @@
  *  2. `capability.seal` `jsonPath` ergonomics (`$.items[0].id`, `data.token`, `token`,
  *     `$[0].token`, quoted bracket keys) + top-level key-only mismatch diagnostics (never values).
  *  3. Consistent top-level `.json`, `.data`, `.body`, `.text`, `.status`, `.headers`, `.exchangeId`
- *     (and `.exchange_id` / dict access in Python) on `ctx.http` / `ctx.http_send` / `ctx.await_async`.
+ *     on `ctx.http` / `ctx.http_send` / `ctx.await_async`.
  */
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { promisify } from 'node:util'
 
 import { scanSourceTreeForContamination } from '../scripts/check-v8-contamination.ts'
 import { RequestBroker } from '../src/server/broker.ts'
@@ -34,11 +31,9 @@ import {
 } from '../src/server/verify-rpc.ts'
 import { VerifyContext } from '../worker/guardian_verify/guardian_verify.ts'
 
-const execFileAsync = promisify(execFile)
 process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const SDK_DIR = join(REPO_ROOT, 'worker', 'guardian_verify')
 const MEMBER_A_SECRET = 'member-a-q28-secret-token-01'
 
 function jsonRes(res: ServerResponse, status: number, value: unknown): void {
@@ -445,11 +440,11 @@ test('capability.seal supports bare, dot, $., bracket array, root array, and quo
 })
 
 // ============================================================================
-// 3. Consistent Top-Level .json / .data / .text / .body / .status / .headers / .exchangeId (TS + Python)
+// 3. Consistent Top-Level .json / .data / .text / .body / .status / .headers / .exchangeId (TS)
 // ============================================================================
 
-test('TS and Python ctx.http / ctx.http_send / ctx.await_async populate top-level .json, .data, .text, .body, .status, .headers, .exchangeId', async (t) => {
-  const { server, ctx } = await startRpc(t)
+test('TS ctx.http / ctx.http_send / ctx.await_async populate top-level .json, .data, .text, .body, .status, .headers, .exchangeId', async (t) => {
+  const { ctx } = await startRpc(t)
 
   // TypeScript SDK: JSON response via ctx.http & ctx.http_send
   const tsHttp = await ctx.http('/api/seal-sample', { as: 'member_a' })
@@ -477,48 +472,6 @@ test('TS and Python ctx.http / ctx.http_send / ctx.await_async populate top-leve
   assert.equal((tsAsync.exchange?.json as { status: string }).status, 'open')
   assert.equal(tsAsync.exchange?.text, tsAsync.exchange?.body)
   assert.deepEqual(tsAsync.exchange?.data, tsAsync.exchange?.json)
-
-  // Python SDK: attribute + dict access on http, http_send, non-JSON, and await_async
-  const workDir = mkdtempSync(join(tmpdir(), 'guardian-q28-py-'))
-  t.after(() => rmSync(workDir, { recursive: true, force: true }))
-  const pyScript = join(workDir, 'test_q28_http.py')
-  writeFileSync(pyScript, `
-import sys
-sys.path.insert(0, ${JSON.stringify(SDK_DIR)})
-from guardian_verify import VerifyContext
-
-ctx = VerifyContext()
-for res in (ctx.http("/api/seal-sample", as_persona="member_a"), ctx.http_send("/api/seal-sample", as_persona="member_a")):
-    assert res.status == 200 and res["status"] == 200
-    assert res.exchangeId.startswith("gx-") and res.exchange_id == res.exchangeId
-    assert res["exchangeId"] == res.exchangeId and res["exchange_id"] == res.exchangeId
-    assert res.text == res.body and res["text"] == res["body"]
-    assert isinstance(res.headers, dict) and isinstance(res["headers"], dict)
-    assert res.json["authRef"] == "bare-tok-111" and res["json"]["authRef"] == "bare-tok-111"
-    assert res.data == res.json and res["data"] == res["json"]
-
-plain = ctx.http_send("/api/plain", as_persona="member_a")
-assert plain.status == 200
-assert plain.body == "plain-text-ok" and plain.text == "plain-text-ok"
-assert plain.json is None and plain["json"] is None and plain.data is None
-
-pol = ctx.await_async(path="/api/seal-sample", persona="member_a", expect_status=200, timeout_ms=2000, interval_ms=20)
-assert pol.converged is True
-assert pol.exchange.json["status"] == "open"
-assert pol.exchange["json"]["status"] == "open"
-assert pol.exchange.exchange_id == pol.exchange.exchangeId
-assert pol.exchange.text == pol.exchange.body
-print("PY_Q28_OK")
-`)
-  const env = {
-    ...process.env,
-    [VERIFY_RPC_SOCKET_ENV]: server.socketPath,
-    [VERIFY_RPC_TOKEN_ENV]: join(server.hostDir, 'token'),
-    [VERIFY_RPC_CONTEXT_ENV]: join(server.hostDir, 'context.json'),
-    [VERIFY_NONCE_ENV]: server.nonce,
-  }
-  const pyRun = await execFileAsync('python3', [pyScript], { env, timeout: 15_000 })
-  assert.match(pyRun.stdout, /PY_Q28_OK/)
 })
 
 // ============================================================================
@@ -530,7 +483,6 @@ test('LOC ceilings and zero v8 benchmark contamination hold across all touched f
   assert.ok(loc('src/server/verify-rpc.ts') <= 2300, `verify-rpc.ts LOC=${loc('src/server/verify-rpc.ts')} > 2300`)
   assert.ok(loc('src/server/composite-receipt.ts') <= 750, `composite-receipt.ts LOC=${loc('src/server/composite-receipt.ts')} > 750`)
   assert.ok(loc('worker/guardian_verify/guardian_verify.ts') <= 900, `guardian_verify.ts LOC=${loc('worker/guardian_verify/guardian_verify.ts')} > 900`)
-  assert.ok(loc('worker/guardian_verify/guardian_verify.py') <= 800, `guardian_verify.py LOC=${loc('worker/guardian_verify/guardian_verify.py')} > 800`)
 
   const scan = scanSourceTreeForContamination(REPO_ROOT)
   assert.equal(scan.ok, true, `Unexpected contamination: ${JSON.stringify(scan.hits)}`)

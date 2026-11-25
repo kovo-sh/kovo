@@ -738,7 +738,7 @@ test('v7 agent-script-proofs: runAgentScriptProof + persistAgentScriptProof sati
       run: Run
       assignment: Assignment
       script: string
-      runtime: 'ts' | 'python'
+      runtime: 'ts'
       title?: string
       proof: AgentScriptProofResult
       secrets: ReadonlyArray<{ label: string; value: string }>
@@ -881,7 +881,7 @@ test('v7 agent-script-proofs: executeInlineVerification short-circuits receipt-f
       run: Run
       assignment: Assignment
       script: string
-      runtime: 'ts' | 'python'
+      runtime: 'ts'
       title?: string
       proof: AgentScriptProofResult
       secrets: ReadonlyArray<{ label: string; value: string }>
@@ -1010,7 +1010,7 @@ test('v7 agent-script-proofs: retestReplaySpec runs persisted agent script (repr
       run: Run
       assignment: Assignment
       script: string
-      runtime: 'ts' | 'python'
+      runtime: 'ts'
       title?: string
       proof: AgentScriptProofResult
       secrets: ReadonlyArray<{ label: string; value: string }>
@@ -1192,7 +1192,7 @@ test('v7 agent-script-proofs: mutating POST boundary claim without readback fail
       run: Run
       assignment: Assignment
       script: string
-      runtime: 'ts' | 'python'
+      runtime: 'ts'
       title?: string
       proof: AgentScriptProofResult
       secrets: ReadonlyArray<{ label: string; value: string }>

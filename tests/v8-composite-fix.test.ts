@@ -1,7 +1,7 @@
 /**
  * Regression suite for v8 composite verification fixes:
  *  1. `ctx.prove_composite` / `ctx.proveComposite` auto-records a host-backed `composite_receipt`
- *     claim in BOTH TS and Python SDKs -> ZERO `claims_missing` on passing or failing DAGs.
+ *     claim in the TS SDK -> ZERO `claims_missing` on passing or failing DAGs.
  *  2. Rejected `composite.verify` calls surface exact `rejectedBy` + `missingEvidence` feedback
  *     instead of `claims_missing`, and forged client-only `composite_receipt` claims fail closed.
  *  3. Empty/short `terminalImpact.summary` is rejected with `rejectedBy: 'terminal_impact_summary_missing'`,
@@ -11,7 +11,7 @@
  *     `evaluateDualTenantAbac`, and `evaluateParserCacheDifferential` with actionable
  *     `terminal_impact_unproven` guidance.
  *  5. Full end-to-end multi-hop chain proving actual unauthorized foreign-tenant data read +
- *     clean denied control (`401`/`403`/`404`) PASSES in both TS and Python SDKs.
+ *     clean denied control (`401`/`403`/`404`) PASSES in the TS SDK.
  */
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
@@ -369,12 +369,12 @@ test('composite.verify & v8-oracle-families REJECT benign cache-prime + export-j
 })
 
 // ============================================================================
-// 3. TS & Python SDK `ctx.prove_composite` end-to-end via `verifyScript()`:
-//    - 0 `claims_missing` on passing chains (BOTH TS & Python)
+// 3. TS SDK `ctx.prove_composite` end-to-end via `verifyScript()`:
+//    - 0 `claims_missing` on passing chains
 //    - Rejected decoy chain surfaces `terminal_impact_unproven` (NEVER `claims_missing`)
 // ============================================================================
 
-test('TS and Python SDK ctx.prove_composite auto-records claims in verifyScript(): full foreign-read passes, decoy stub rejects without claims_missing', async (t) => {
+test('TS SDK ctx.prove_composite auto-records claims in verifyScript(): full foreign-read passes, decoy stub rejects without claims_missing', async (t) => {
   const vulnFixture = await startDualTenantExportFixture({ hardenedTwin: false })
   t.after(() => vulnFixture.close())
   const decoyFixture = await startDualTenantExportFixture({ hardenedTwin: true })
@@ -436,83 +436,44 @@ test('TS and Python SDK ctx.prove_composite auto-records claims in verifyScript(
   assert.equal(tsPass.reason, 'confirmed')
   assert.ok(tsPass.attempts.every(a => a.claimCount >= 1))
 
-  // (B) Python SDK — FULL 3-hop chain -> CONFIRMED (0 claims_missing!)
-  const pyFullCode = `
-ctrl = ctx.http_send("/api/exports/exp-foreign-99/download", as_persona="dual_attacker", role="control")
-h1 = ctx.http_send("/api/me/permissions", as_persona="dual_attacker", role="probe")
-cache_cap = ctx.seal_capability(h1, "cache_tok", hop_receipt_id="1", json_path="$.cacheToken", kind="header_secret", default_header_name="x-cache-token")
-h2 = ctx.http_send("/api/exports", method="POST", as_persona="dual_attacker", capability={"handle": cache_cap["handle"], "target": "header", "headerName": "x-cache-token"}, role="probe")
-cap = ctx.seal_capability(h2, "export_tok", hop_receipt_id="2", json_path="$.exportToken", kind="header_secret", default_header_name="x-export-token")
-h3 = ctx.http_send("/api/exports/exp-foreign-99/download", as_persona="dual_attacker", capability={"handle": cap["handle"], "target": "header", "headerName": "x-export-token"}, role="probe")
-verdict = ctx.prove_composite({
-    "chainId": "chain-py-dual-abac-full",
-    "terminalVulnClass": "dual_tenant_abac",
-    "hops": [
-        {"hopId": "hop_1", "surface": "http", "target": {"origin": ctx.target_origin, "method": "GET", "pathAndQuery": "/api/me/permissions"}, "exchangeIds": [h1.exchange_id], "producedCapabilities": [cache_cap["handle"]], "claimedDelta": "Primed permission cache on own tenant."},
-        {"hopId": "hop_2", "surface": "http", "target": {"origin": ctx.target_origin, "method": "POST", "pathAndQuery": "/api/exports"}, "exchangeIds": [h2.exchange_id], "consumedCapabilities": [cache_cap["handle"]], "producedCapabilities": [cap["handle"]], "claimedDelta": "Created export handle."},
-        {"hopId": "hop_3", "surface": "http", "target": {"origin": ctx.target_origin, "method": "GET", "pathAndQuery": "/api/exports/exp-foreign-99/download"}, "exchangeIds": [h3.exchange_id], "consumedCapabilities": [cap["handle"]], "claimedDelta": "Downloaded foreign org_target confidential invoice records."},
-    ],
-    "causalEdges": [
-        {"kind": "value_binding", "fromHopId": "hop_1", "toHopId": "hop_2", "capabilityHandle": cache_cap["handle"]},
-        {"kind": "value_binding", "fromHopId": "hop_2", "toHopId": "hop_3", "capabilityHandle": cap["handle"]},
-    ],
-    "terminalImpact": {
-        "terminalHopId": "hop_3",
-        "summary": "Cross-tenant download exposed confidential org_target invoice records after cache prime.",
-        "terminalExchangeId": h3.exchange_id,
-        "preChainControlExchangeIds": [ctrl.exchange_id],
-    },
-    "replayMode": "fresh_clean_replay",
-})
-assert verdict["ok"] is True and len(ctx.claims) >= 1, verdict
-return ctx.result(title="Dual-tenant ABAC cross-org export disclosure (Python)")
-`
-  const pyPass = await verifyScript({
-    candidate: { name: 'py-full.py', runtime: 'python', code: pyFullCode, title: 'Dual-tenant ABAC cross-org export disclosure (Python)' },
-    openAttempt: makeFactory(vulnFixture.origin),
-  })
-  assert.equal(pyPass.confirmed, true, `Python full chain failed: ${pyPass.reason} / ${pyPass.detail}`)
-  assert.equal(pyPass.reason, 'confirmed')
-  assert.ok(pyPass.attempts.every(a => a.claimCount >= 1))
-
-  // (C) Hardened-twin decoy FP attempt via Python SDK: cache prime + export job stub -> REJECTED with terminal_impact_unproven (NOT claims_missing!)
-  const pyDecoyCode = `
-ctrl = ctx.http_send("/api/exports/exp-foreign-99/download", as_persona="dual_attacker", role="control")
-h1 = ctx.http_send("/api/me/permissions", as_persona="dual_attacker", role="probe")
-cache_cap = ctx.seal_capability(h1, "cache_tok", hop_receipt_id="1", json_path="$.cacheToken", kind="header_secret", default_header_name="x-cache-token")
-h2 = ctx.http_send("/api/exports", method="POST", as_persona="dual_attacker", capability={"handle": cache_cap["handle"], "target": "header", "headerName": "x-cache-token"}, role="probe")
-verdict = ctx.prove_composite({
-    "chainId": "chain-py-decoy-stub",
-    "terminalVulnClass": "parser_cache_differential",
-    "hops": [
-        {"hopId": "hop_1", "surface": "http", "target": {"origin": ctx.target_origin, "method": "GET", "pathAndQuery": "/api/me/permissions"}, "exchangeIds": [h1.exchange_id], "producedCapabilities": [cache_cap["handle"]], "claimedDelta": "Primed permission cache."},
-        {"hopId": "hop_2", "surface": "http", "target": {"origin": ctx.target_origin, "method": "POST", "pathAndQuery": "/api/exports"}, "exchangeIds": [h2.exchange_id], "consumedCapabilities": [cache_cap["handle"]], "claimedDelta": "Created export job stub."},
-    ],
-    "causalEdges": [
-        {"kind": "value_binding", "fromHopId": "hop_1", "toHopId": "hop_2", "capabilityHandle": cache_cap["handle"]},
-    ],
-    "terminalImpact": {
-        "terminalHopId": "hop_2",
-        "summary": "Cache prime enabled export job creation stub on hardened twin.",
-        "terminalExchangeId": h2.exchange_id,
-        "preChainControlExchangeIds": [ctrl.exchange_id],
-    },
-    "replayMode": "fresh_clean_replay",
-})
-assert verdict["ok"] is False
-return ctx.result(title="Hardened twin decoy stub attempt (Python)")
-`
-  const pyDecoy = await verifyScript({
-    candidate: { name: 'py-decoy.py', runtime: 'python', code: pyDecoyCode, title: 'Hardened twin decoy stub attempt (Python)' },
+  // (B) Hardened-twin decoy FP attempt via TypeScript SDK: cache prime + export job stub -> REJECTED with terminal_impact_unproven (NOT claims_missing!)
+  const tsDecoyCode = `
+    const ctrl = await ctx.http_send('/api/exports/exp-foreign-99/download', { as: 'dual_attacker', role: 'control' })
+    const h1 = await ctx.http_send('/api/me/permissions', { as: 'dual_attacker', role: 'probe' })
+    const cacheCap = await ctx.seal_capability({ exchange: h1, hopReceiptId: '1', slot: 'cache_tok', jsonPath: '$.cacheToken', kind: 'header_secret', defaultHeaderName: 'x-cache-token' })
+    const h2 = await ctx.http_send('/api/exports', { method: 'POST', as: 'dual_attacker', capability: { handle: cacheCap.handle, target: 'header', headerName: 'x-cache-token' }, role: 'probe' })
+    const verdict = await ctx.prove_composite({
+      chainId: 'chain-ts-decoy-stub',
+      terminalVulnClass: 'parser_cache_differential',
+      hops: [
+        { hopId: 'hop_1', surface: 'http', target: { origin: ctx.targetOrigin, method: 'GET', pathAndQuery: '/api/me/permissions' }, exchangeIds: [h1.exchangeId], producedCapabilities: [cacheCap.handle], claimedDelta: 'Primed permission cache.' },
+        { hopId: 'hop_2', surface: 'http', target: { origin: ctx.targetOrigin, method: 'POST', pathAndQuery: '/api/exports' }, exchangeIds: [h2.exchangeId], consumedCapabilities: [cacheCap.handle], claimedDelta: 'Created export job stub.' },
+      ],
+      causalEdges: [
+        { kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: cacheCap.handle },
+      ],
+      terminalImpact: {
+        terminalHopId: 'hop_2',
+        summary: 'Cache prime enabled export job creation stub on hardened twin.',
+        terminalExchangeId: h2.exchangeId,
+        preChainControlExchangeIds: [ctrl.exchangeId],
+      },
+      replayMode: 'fresh_clean_replay',
+    })
+    if (verdict.ok !== false) throw new Error('expected decoy rejection: ' + JSON.stringify(verdict))
+    return ctx.result({ title: 'Hardened twin decoy stub attempt (TS)' })
+  `
+  const tsDecoy = await verifyScript({
+    candidate: { name: 'ts-decoy.ts', runtime: 'ts', code: tsDecoyCode, title: 'Hardened twin decoy stub attempt (TS)' },
     openAttempt: makeFactory(decoyFixture.origin),
   })
-  assert.equal(pyDecoy.confirmed, false)
-  assert.notEqual(pyDecoy.reason, 'claims_missing', 'Rejected composite.verify must surface exact composite rejection, NEVER claims_missing')
-  assert.equal(pyDecoy.reason, 'oracle_failed')
-  assert.equal(pyDecoy.rejectedBy, 'terminal_impact_unproven')
-  assert.match(pyDecoy.missingEvidence.join(' '), /terminal_impact_unproven/i)
+  assert.equal(tsDecoy.confirmed, false)
+  assert.notEqual(tsDecoy.reason, 'claims_missing', 'Rejected composite.verify must surface exact composite rejection, NEVER claims_missing')
+  assert.equal(tsDecoy.reason, 'oracle_failed')
+  assert.equal(tsDecoy.rejectedBy, 'terminal_impact_unproven')
+  assert.match(tsDecoy.missingEvidence.join(' '), /terminal_impact_unproven/i)
 
-  // (D) Forged client-only composite_receipt claim without host verification MUST fail closed!
+  // (C) Forged client-only composite_receipt claim without host verification MUST fail closed!
   const store = new TranscriptStore()
   const forged = evaluateClaims(store, [{
     kind: 'composite_receipt',

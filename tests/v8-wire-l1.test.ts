@@ -14,7 +14,7 @@
  *   4. Unified `proof-receipt.ts` re-exports (`verifyReceipt`, `singleReceiptToComposite`,
  *      `verifyCompositeReceipt`, `verifyReceiptUnified`) with 1-hop backward compatibility.
  *   5. Unified `oracle-invariants.ts` re-exports of `evaluateV8OracleFamily` across all 6 families.
- *   6. Both TypeScript (`guardian_verify.ts`) and Python (`guardian_verify.py`) SDK helpers
+ *   6. TypeScript (`guardian_verify.ts`) SDK helpers
  *      (`seal_capability`, `hmac_sign`, `jwt_sign`, `await_async`, `prove_composite`,
  *      `http_send`/`request` with `capability=`) end-to-end against a live `VerifyRpcServer`.
  */
@@ -745,7 +745,7 @@ test('oracle-invariants.ts re-exports evaluateV8OracleFamily for all 6 v8 famili
   assert.equal(d6.satisfied, true)
 })
 
-test('worker/guardian_verify TS and Python SDK helpers work end-to-end against VerifyRpcServer', async (t) => {
+test('worker/guardian_verify TS SDK helpers work end-to-end against VerifyRpcServer', async (t) => {
   const fixture = await startMultiHopFixture()
   t.after(() => fixture.close())
 
@@ -822,71 +822,4 @@ console.log('TS_SDK_OK')
 `)
   const tsRun = await execFileAsync(process.execPath, [tsScriptPath], { env, timeout: 15_000 })
   assert.match(tsRun.stdout, /TS_SDK_OK/)
-
-  // 2. Python SDK test script (fresh VerifyRpcServer / capability vault for isolated session)
-  fixture.resetAsyncCounter()
-  const pyRpcServer = new VerifyRpcServer({
-    broker: new RequestBroker(),
-    grant,
-    runId: 'run-v8-sdk-py-01',
-    assignmentId: 'assign-v8-sdk-py',
-    targetOrigins: [fixture.origin],
-  })
-  await pyRpcServer.start()
-  t.after(() => pyRpcServer.close())
-  const pyEnv = {
-    ...process.env,
-    [VERIFY_RPC_SOCKET_ENV]: pyRpcServer.socketPath,
-    [VERIFY_RPC_TOKEN_ENV]: join(pyRpcServer.hostDir, VERIFY_RPC_TOKEN_NAME),
-    [VERIFY_RPC_CONTEXT_ENV]: join(pyRpcServer.hostDir, VERIFY_RPC_CONTEXT_NAME),
-    [VERIFY_NONCE_ENV]: pyRpcServer.nonce,
-  }
-  const pyScriptPath = join(workDir, 'verify_py.py')
-  writeFileSync(pyScriptPath, `
-import sys
-sys.path.insert(0, ${JSON.stringify(SDK_DIR)})
-from guardian_verify import VerifyContext
-
-ctx = VerifyContext()
-h1 = ctx.http_send("/api/debug/runtime-meta", as_persona="member_b", role="probe")
-sealed = ctx.seal_capability(h1, "salt", hop_receipt_id="py1", json_path="$.signing_salt", kind="signing_salt")
-assert sealed["handle"] == "cap:hop_py1:salt", sealed
-hmac = ctx.hmac_sign(sealed["handle"], '{"ok":2}', alg="sha256")
-h2 = ctx.request("/api/webhooks/settle", method="POST", headers={"x-webhook-signature": hmac["signature"]}, body='{"ok":2}', role="probe")
-assert h2.status == 200, h2.status
-jwt = ctx.jwt_sign(sealed["handle"], {"scope": "vault:export"}, alg="HS256", hop_receipt_id="py2", slot="jwt")
-h3 = ctx.http_send("/api/vault/export", capability=jwt["derivedHandle"], role="probe")
-assert h3.status == 200, h3.status
-assert h3.consumed_capability_id == jwt["derivedHandle"]
-
-trig = ctx.http_send("/api/jobs/trigger", method="POST", as_persona="member_b", role="probe", correlation_ids=["job-async-42"])
-pol = ctx.await_async(
-    {"path": "/api/jobs/job-async-42", "as_persona": "member_b", "role": "probe"},
-    {"status": 200, "jsonPath": "$.state", "equals": "completed"},
-    timeout_ms=3000,
-    interval_ms=20,
-    trigger_exchange_id=trig.exchange_id,
-    correlation_id="job-async-42",
-)
-assert pol["converged"] is True, pol
-
-verdict = ctx.prove_composite({
-    "chainId": "sdk-py-chain",
-    "terminalVulnClass": "auth_bypass",
-    "hops": [
-        {"hopId": "hop_1", "surface": "http", "target": {"origin": ctx.target_origin, "method": "GET", "pathAndQuery": "/api/debug/runtime-meta"}, "exchangeIds": [h1.exchange_id], "claimedDelta": "Leaked salt."},
-        {"hopId": "hop_2", "surface": "webhook", "target": {"origin": ctx.target_origin, "method": "POST", "pathAndQuery": "/api/webhooks/settle"}, "exchangeIds": [h2.exchange_id, jwt["exchangeId"]], "claimedDelta": "Derived HMAC + JWT."},
-        {"hopId": "hop_3", "surface": "http", "target": {"origin": ctx.target_origin, "method": "GET", "pathAndQuery": "/api/vault/export"}, "exchangeIds": [h3.exchange_id], "claimedDelta": "Vault export via derived JWT."},
-    ],
-    "causalEdges": [
-        {"kind": "derived_crypto_binding", "fromHopId": "hop_1", "toHopId": "hop_2", "sourceCapabilityId": sealed["handle"], "alg": "sha256"},
-        {"kind": "value_binding", "fromHopId": "hop_2", "toHopId": "hop_3", "capabilityHandle": jwt["derivedHandle"]},
-    ],
-    "terminalImpact": {"terminalHopId": "hop_3", "claimedImpact": "Python SDK composite confirmed."},
-})
-assert verdict["confirmed"] is True, verdict
-print("PY_SDK_OK")
-`)
-  const pyRun = await execFileAsync('python3', [pyScriptPath], { env: pyEnv, timeout: 15_000 })
-  assert.match(pyRun.stdout, /PY_SDK_OK/)
 })

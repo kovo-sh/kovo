@@ -599,7 +599,7 @@ test('proveRaceBurst reports h2 single-packet vs explicit HTTP/1.1 fallback', as
 })
 
 // ---------------------------------------------------------------------------
-// End-to-end: helpers flow through verifyScript (two fresh runs) + Python parity
+// End-to-end: helpers flow through verifyScript (two fresh runs)
 // ---------------------------------------------------------------------------
 
 test('access-boundary helper confirms through verifyScript fresh-session double run', async () => {
@@ -684,90 +684,4 @@ runVerification(defineVerification({
   assert.match(failureText, /missing-evidence: variant_crossed/)
   assert.match(failureText, /rejected-by: boundary/)
   assert.match(failureText, /transcript-role: (control_denied|control)/)
-})
-
-test('Python helper parity: boundary helper emits the same claim and feedback shape', async () => {
-  resetFixture()
-  const factory = createLocalAttemptFactory({
-    sdkDir: SDK_DIR,
-    createRpcOptions() {
-      return {
-        broker: new RequestBroker(),
-        grant: makeGrant(),
-        runId: `run-helper-python-${randomUUID().slice(0, 8)}`,
-        assignmentId: 'assignment-helper-python',
-        targetOrigins: [origin],
-      }
-    },
-  })
-  const { verifyScript } = await import('../src/server/verify-rpc.ts')
-  const verdict = await verifyScript({
-    candidate: {
-      name: 'helpers.py',
-      runtime: 'python',
-      code: `
-from guardian_verify import define, run
-
-def verify(ctx):
-    proof = ctx.proveAccessBoundary('bob', 'alice', '/boundary/secret')
-    assert proof['claim']['kind'] == 'boundary', proof
-    assert proof['transcript']['control_denied'], proof
-    assert proof['transcript']['variant_crossed'], proof
-    assert proof['missingEvidence'] == [], proof
-    assert [item['role'] for item in proof['transcriptSummary']] == ['control_denied', 'variant_crossed'], proof
-    return ctx.result('BOLA access-control boundary')
-
-run(define(verify=verify))
-`,
-    },
-    openAttempt: factory,
-  })
-  assert.equal(verdict.confirmed, true, `${verdict.reason}: ${verdict.attempts.map(attempt => attempt.failures.join('; ')).join(' | ')}`)
-  assert.equal(verdict.attempts[0]?.claimCount, 1)
-})
-
-test('Python helper parity: persisted mutation and boolean diff emit oracle-backed claims', async () => {
-  resetFixture()
-  const factory = createLocalAttemptFactory({
-    sdkDir: SDK_DIR,
-    createRpcOptions() {
-      return {
-        broker: new RequestBroker(),
-        grant: makeGrant(),
-        runId: `run-helper-python2-${randomUUID().slice(0, 8)}`,
-        assignmentId: 'assignment-helper-python2',
-        targetOrigins: [origin],
-      }
-    },
-  })
-  const { verifyScript } = await import('../src/server/verify-rpc.ts')
-  const verdict = await verifyScript({
-    candidate: {
-      name: 'mutation-diff.py',
-      runtime: 'python',
-      code: `
-import time
-from guardian_verify import define, run
-
-def verify(ctx):
-    value = int(time.time() * 1000) % 1000000
-    mutation = ctx.prove_persisted_mutation(
-        '/state/item',
-        {'target': '/state/mutate', 'method': 'POST', 'body': '{"balance": %d}' % value, 'as': 'alice'},
-        'balance',
-        value,
-        read_persona='alice',
-    )
-    assert mutation['ok'], (mutation['missingEvidence'], mutation['delta'])
-    diff = ctx.prove_boolean_or_timing_diff('/diff?view=user', '/diff?view=admin', 'boolean', rounds=3)
-    assert diff['ok'], diff['missingEvidence']
-    return ctx.result('Mass assignment and boolean differential')
-
-run(define(verify=verify))
-`,
-    },
-    openAttempt: factory,
-  })
-  assert.equal(verdict.confirmed, true, `${verdict.reason}: ${verdict.attempts.map(attempt => attempt.failures.join('; ') + ' | stderr=' + (attempt.stderr ?? '')).join(' | ')}`)
-  assert.equal(verdict.attempts[0]?.claimCount, 2)
 })

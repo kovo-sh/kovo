@@ -429,39 +429,6 @@ runVerification(defineVerification({
   assert.equal(verdict.attempts[0].signaturesValid, true)
 })
 
-test('Python SDK smoke confirms the same fixture through the two-run policy', async () => {
-  const factory = createLocalAttemptFactory({
-    sdkDir: SDK_DIR,
-    createRpcOptions(nonce) {
-      return {
-        broker: new RequestBroker(),
-        grant: makeGrant(),
-        runId: `run-python-${nonce.slice(0, 8)}`,
-        assignmentId: 'assignment-python',
-        targetOrigins: [origin],
-      }
-    },
-  })
-  const candidate = {
-    name: 'smoke.py',
-    runtime: 'python' as const,
-    code: `
-from guardian_verify import define, run
-
-def verify(ctx):
-    owner = ctx.http('/items/8', as_persona='alice')
-    ctx.expect_status(owner, 200)
-    ctx.expect_json_path(owner, 'owner', 'alice')
-    return ctx.result('python sdk smoke', severity='medium')
-
-run(define(verify=verify))
-`,
-  }
-  const verdict = await verifyScript({ candidate, openAttempt: factory })
-  assert.equal(verdict.confirmed, true, `${verdict.reason}: ${verdict.detail}`)
-  assert.equal(verdict.attempts[0].claimCount, 2)
-})
-
 test('forged stdout or fabricated exchange ids are rejected by the transcript oracle', async () => {
   const factory = createLocalAttemptFactory({
     sdkDir: SDK_DIR,
@@ -593,9 +560,9 @@ runVerification(defineVerification({
 
     // Oversized script output is spilled by the bridge and still delivered intact.
     const large = await session.verifyScript!({
-      runtime: 'python',
+      runtime: 'ts',
       nonce: 'f'.repeat(32),
-      code: 'print("x" * 100000)\n',
+      code: "console.log('x'.repeat(100000))\n",
     }, AbortSignal.timeout(60_000))
     assert.equal(large.exitCode, 0, large.stderr)
     assert.ok(large.stdout.length >= 100_000)

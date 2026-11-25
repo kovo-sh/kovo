@@ -459,21 +459,7 @@ export default defineVerification({
   })
   assert.equal(importExportVerdict.confirmed, true, `${importExportVerdict.reason}: ${importExportVerdict.detail}`)
 
-  // 5. Python bare inline script parity
-  const pyBareVerdict = await verifyScript({
-    candidate: {
-      name: 'bare.py',
-      runtime: 'python',
-      title: 'Python bare inline BOLA read',
-      code: `
-ctx.prove_access_boundary('user_b', 'user_a', '/api/v1/items/1')
-`,
-    },
-    openAttempt: makeFactory(),
-  })
-  assert.equal(pyBareVerdict.confirmed, true, `${pyBareVerdict.reason}: ${pyBareVerdict.detail}`)
-
-  // 6. prepareVerifyScript is idempotent across styles
+  // 5. prepareVerifyScript is idempotent across styles
   const onceWrapped = prepareVerifyScript(`await ctx.prove_access_boundary({ controlPersona: 'user_b', probePersona: 'user_a', route: '/api/v1/items/1' })`, 'ts')
   assert.equal(prepareVerifyScript(onceWrapped, 'ts'), onceWrapped)
 })
@@ -606,7 +592,7 @@ test('VerifyRpcServer stages hostDir, token, context.json, and verify.sock with 
   assert.equal(socketMode & 0o006, 0o006, `verify.sock must be connectable by container UID 10001 (got 0${socketMode.toString(8)})`)
 })
 
-test('TS wrapper edge cases (markdown fences, inline semicolon export default, standalone async fn) and Python await parity', async t => {
+test('TS wrapper edge cases (markdown fences, inline semicolon export default, standalone async fn)', async t => {
   const fixture = await startBoundaryFixture()
   t.after(() => fixture.close())
   const makeFactory = () => createLocalAttemptFactory({
@@ -621,9 +607,6 @@ test('TS wrapper edge cases (markdown fences, inline semicolon export default, s
       }
     },
   })
-
-  assert.match(GUARDIAN_VERIFY_TOOL_DESCRIPTION, /Python.*synchronous/i)
-  assert.match(GUARDIAN_VERIFY_USAGE_HINT, /Python.*synchronous/i)
 
   // 1. Markdown-fenced TS script
   const fencedVerdict = await verifyScript({
@@ -662,28 +645,6 @@ test('TS wrapper edge cases (markdown fences, inline semicolon export default, s
     openAttempt: makeFactory(),
   })
   assert.equal(standaloneFnVerdict.confirmed, true, `${standaloneFnVerdict.reason}: ${standaloneFnVerdict.detail}`)
-
-  // 4. Python inline script using `await ctx.prove_access_boundary(...)` (bare body + async def)
-  const pyAwaitBareVerdict = await verifyScript({
-    candidate: {
-      name: 'py-await-bare.py',
-      runtime: 'python',
-      title: 'Python await bare BOLA read',
-      code: "proof = await ctx.prove_access_boundary('user_b', 'user_a', '/api/v1/items/1')\nreturn ctx.result('Python await bare BOLA read')",
-    },
-    openAttempt: makeFactory(),
-  })
-  assert.equal(pyAwaitBareVerdict.confirmed, true, `${pyAwaitBareVerdict.reason}: ${pyAwaitBareVerdict.detail} | stderr=${pyAwaitBareVerdict.stderrPreview ?? ''}`)
-
-  const pyAsyncDefVerdict = await verifyScript({
-    candidate: {
-      name: 'py-async-def.py',
-      runtime: 'python',
-      code: "async def verify(ctx):\n    ex = await ctx.http('/api/v1/items/1', as_persona='user_a')\n    await ctx.prove_access_boundary('user_b', 'user_a', '/api/v1/items/1')\n    return ctx.result('Python async def BOLA read')",
-    },
-    openAttempt: makeFactory(),
-  })
-  assert.equal(pyAsyncDefVerdict.confirmed, true, `${pyAsyncDefVerdict.reason}: ${pyAsyncDefVerdict.detail} | stderr=${pyAsyncDefVerdict.stderrPreview ?? ''}`)
 })
 
 test('guardian_verify tool accepts code/source aliases, returns 1-line JSON example on missing script, and flags repeated validation loops', async () => {
