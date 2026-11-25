@@ -185,6 +185,18 @@ function freezeStringList(values: readonly string[] | undefined): readonly strin
   return Object.freeze([...values])
 }
 
+function freezeHostEntry(entry: HostTranscriptEntry): HostTranscriptEntry {
+  const freeze = (value: unknown): unknown => {
+    if (Array.isArray(value)) return Object.freeze(value.map(freeze))
+    if (value && typeof value === 'object') {
+      for (const child of Object.values(value as Record<string, unknown>)) freeze(child)
+      return Object.freeze(value)
+    }
+    return value
+  }
+  return freeze(entry) as HostTranscriptEntry
+}
+
 function freezeOobFact(ev: HostOobCallbackFact): HostOobCallbackFact {
   return Object.freeze({
     ...ev,
@@ -269,6 +281,7 @@ function parseBodyFromCarrierText(carrierText: string | undefined): string | nul
 
 export class HostFactLog {
   private readonly exchanges = new Map<string, HostExchangeFact>()
+  private readonly signedEntries = new Map<string, HostTranscriptEntry>()
   private readonly oobEvents = new Map<string, HostOobCallbackFact>()
   private readonly browserTraces = new Map<string, HostBrowserTrace>()
   private readonly asyncPolls = new Map<string, HostAsyncPollRecord>()
@@ -591,6 +604,9 @@ export class HostFactLog {
     evidenceRoleOverrides?: ReadonlyMap<string, string>
   }): HostSignedTranscript {
     const entries: HostTranscriptEntry[] = this.orderedExchanges().map(fact => {
+      // A signature covers the original signed entry, not a later projection with derived defaults.
+      const signed = this.signedEntries.get(fact.exchangeId)
+      if (signed) return signed
       const evidenceRole = options?.evidenceRoleOverrides?.get(fact.exchangeId) ?? fact.evidenceRole ?? fact.sessionRole ?? undefined
       const step = this.toImpactStep(fact.exchangeId, {
         ...(options?.armOverrides?.has(fact.exchangeId) ? { arm: options.armOverrides.get(fact.exchangeId)! } : {}),
@@ -695,6 +711,9 @@ export class HostFactLog {
         ...(entry.carrierText !== undefined ? { carrierText: entry.carrierText } : {}),
         ...(step.secretMatches ? { secretMatches: step.secretMatches } : {}),
       })
+      if (entry.hostSignature && !log.signedEntries.has(entry.exchangeId)) {
+        log.signedEntries.set(entry.exchangeId, freezeHostEntry(entry))
+      }
     })
     for (const oob of transcript.oobEvents ?? []) log.recordOobEvent(oob)
     for (const trace of transcript.browserTraces ?? []) log.recordBrowserTrace(trace)

@@ -232,7 +232,7 @@ function requestFromInjection(input: {
     ...(hyp.headers ? { headers: hyp.headers } : {}),
     ...(hyp.jsonBody ? { jsonBody: hyp.jsonBody } : {}),
     ...(hyp.formBody ? { formBody: hyp.formBody } : {}),
-    ...(hyp.xmlTemplate ? { xmlTemplate: hyp.xmlTemplate } : {}),
+    ...(hyp.xmlTemplate ? { xmlTemplate: hyp.xmlTemplate.replaceAll('{{value}}', '{{val}}') } : {}),
     ...(hyp.graphqlQuery ? { graphqlQuery: hyp.graphqlQuery } : {}),
     ...(hyp.session ? { session: hyp.session } : {}),
   })
@@ -783,6 +783,11 @@ export interface RunPlannedRecipeInput {
 
 /** Run a plan through the broker-backed Layer-1 adapter. Never falls back to the legacy verifier. */
 export async function runPlannedRecipe(input: RunPlannedRecipeInput): Promise<FloorRecipeExecution> {
+  if (input.plan.recipeId === 'boolean_or_timing' &&
+      (input.plan.args as BooleanOrTimingArgs).mode === 'timing' && (input.grant.tier ?? 1) < 3) {
+    input.grant.audit('denied', input.plan.args.origin || input.hypothesis.endpoint.origin)
+    throw new BrokerDenied('Timing differential recipes require Tier 3 verification scope.')
+  }
   const deps = brokerFloorRecipeDeps({
     broker: input.broker,
     grant: input.grant,
@@ -2723,6 +2728,22 @@ function normalizedReplayPath(value: string | undefined): string {
   return value.split('?')[0].split('#')[0].replace(/\/{2,}/g, '/').replace(/\/+$/, '').toLowerCase() || '/'
 }
 
+/** Parse the body the host actually sent, including form/XML carriers, for shared impact oracles. */
+function recordedRequestJson(entry: Record<string, unknown> | undefined, request: ReplayStep['request']): unknown {
+  const raw = typeof entry?.requestBody === 'string' ? entry.requestBody : request.textBody
+  if (raw === undefined) return request.jsonBody
+  const contentType = String(entry?.requestHeaders && typeof entry.requestHeaders === 'object'
+    ? Object.entries(entry.requestHeaders as Record<string, unknown>).find(([name]) => name.toLowerCase() === 'content-type')?.[1] ?? ''
+    : Object.entries(request.headers ?? {}).find(([name]) => name.toLowerCase() === 'content-type')?.[1] ?? '')
+  if (/application\/x-www-form-urlencoded/i.test(contentType)) {
+    return Object.fromEntries(new URLSearchParams(raw).entries())
+  }
+  if (/json/i.test(contentType) || /^(?:\{|\[)/.test(raw.trim())) {
+    try { return JSON.parse(raw) } catch { return raw }
+  }
+  return raw
+}
+
 /**
  * Map recorded replay steps onto the shared evidence model. Role/tenant/auth metadata is enriched
  * into each step summary at record time (see `personaActorFields`), so the same validators can run
@@ -2747,8 +2768,8 @@ export function impactStepsFromStepsOut(
       id: step.id,
       arm: step.role,
       method: step.request.method.toUpperCase(),
-      route: normalizedReplayPath(step.request.pathAndQuery),
-      pathAndQuery: step.request.pathAndQuery,
+      route: normalizedReplayPath(typeof entry?.pathAndQuery === 'string' ? entry.pathAndQuery : step.request.pathAndQuery),
+      pathAndQuery: typeof entry?.pathAndQuery === 'string' ? entry.pathAndQuery : step.request.pathAndQuery,
       status: typeof entry?.status === 'number' ? entry.status : null,
       actor: {
         handle,
@@ -2762,8 +2783,8 @@ export function impactStepsFromStepsOut(
       ...(Array.isArray(entry?.secretMatches)
         ? { secretMatches: (entry.secretMatches as Array<Record<string, unknown>>).map(match => String(match.sha256Prefix ?? '')).filter(Boolean) }
         : {}),
-      requestJson: step.request.jsonBody,
-      requestHeaders: step.request.headers ?? null,
+      requestJson: recordedRequestJson(entry, step.request),
+      requestHeaders: (entry?.requestHeaders as Record<string, string> | undefined) ?? step.request.headers ?? null,
       responseHeaders: (entry?.headers as Record<string, string> | undefined) ?? null,
     }
   })
@@ -3489,6 +3510,7 @@ export function receiptVulnClassFor(spec: DeclarativeReplaySpec): string | null 
   if (/CWE-918|\bssrf\b|server[- ]side request/i.test(text)) return 'ssrf'
   if (/CWE-611|\bxxe\b|external entit/i.test(text)) return 'xxe'
   if (/CWE-601|\bopen[-_ ]?redirect\b|unvalidated[- ]redirect/i.test(text)) return 'open_redirect'
+  if (/CWE-345/i.test(text) || /webhook[^.]*(?:signature|forger|tamper)|(?:signature|forger)[^.]*webhook/i.test(text)) return 'webhook_forgery'
   if (spec.kind !== 'http_chain' && spec.kind !== 'auth_protocol_proof') return null
   return vulnClassForImpactClass(classifyImpactDescriptor({
     cwe: spec.cwe,
@@ -3535,10 +3557,13 @@ export function buildReplayReceipt(input: {
   const isBoundaryAuth = !baseVulnClass && boundaryGate?.required === true && boundaryGate.satisfied === true && boundaryGate.boundaryClass === 'auth'
   const vulnClass = baseVulnClass ?? (isBoundaryAuth ? 'auth_bypass' : null)
   if (!vulnClass) return null
-  const isOob = vulnClass === 'ssrf' || vulnClass === 'xxe'
+  const isOob = vulnClass === 'ssrf' || vulnClass === 'xxe' ||
+    (vulnClass === 'webhook_forgery' && (input.evidencePayload.canary as { triggered?: boolean } | undefined)?.triggered === true)
   const isRedirect = vulnClass === 'open_redirect'
-  // Require a gated class (impactGate, OOB, redirect, or boundaryGate auth bypass) to emit a receipt.
-  if (!isOob && !isRedirect && !isBoundaryAuth && impactGate?.required !== true) return null
+  const isWebhook = vulnClass === 'webhook_forgery' && !isOob
+  // Require a gated class (impactGate, OOB, redirect, webhook differential, or boundaryGate auth
+  // bypass) to emit a receipt. Dedicated rules re-derive their evidence from the host transcript.
+  if (!isOob && !isRedirect && !isWebhook && !isBoundaryAuth && impactGate?.required !== true) return null
   const stepsOut = (input.evidencePayload.steps ?? {}) as Record<string, unknown>
   const steps = impactStepsFromStepsOut(input.spec, stepsOut)
   if (steps.length === 0 && vulnClass !== 'ssrf' && vulnClass !== 'xxe') return null
@@ -3550,20 +3575,22 @@ export function buildReplayReceipt(input: {
   const entries: ReceiptTranscriptEntry[] = []
   const orderedIds: string[] = []
   for (const [index, step] of steps.entries()) {
-    const recorded = stepsOut[step.id] as { exchangeId?: unknown } | undefined
+    const recorded = stepsOut[step.id] as { exchangeId?: unknown; durationMs?: unknown; requestBody?: unknown } | undefined
     const id = typeof recorded?.exchangeId === 'string'
       ? recorded.exchangeId
       : input.exchangeIds[index] ?? `exchange-${index}`
     if (!id) continue
-    const exchange = exchangeById.get(id)
+    const exchange = exchangeById.get(id) ?? (input.exchangeIds.length === 0 ? input.exchanges[index] : undefined)
+    const durationMs = typeof recorded?.durationMs === 'number' ? recorded.durationMs : exchange?.durationMs
+    const requestBody = typeof recorded?.requestBody === 'string' ? recorded.requestBody : ''
     entries.push({
       exchangeId: id,
       step,
-      ...(typeof (recorded as { durationMs?: unknown } | undefined)?.durationMs === 'number'
-        ? { durationMs: (recorded as { durationMs: number }).durationMs }
-        : {}),
-      ...(exchange
-        ? { carrierText: `${exchange.pathAndQuery}\n${JSON.stringify(exchange.reqHeaders ?? {})}\n${String(exchange.body ?? '').slice(0, 32 * 1024)}` }
+      seq: index + 1,
+      origin: exchange?.origin || input.spec.origin,
+      ...(typeof durationMs === 'number' ? { durationMs } : {}),
+      ...(exchange || requestBody
+        ? { carrierText: `${exchange?.pathAndQuery ?? step.pathAndQuery ?? ''}\n${JSON.stringify(step.requestHeaders ?? {})}\n${requestBody}` }
         : {}),
     })
     orderedIds.push(id)

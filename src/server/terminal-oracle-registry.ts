@@ -59,6 +59,7 @@ export const SINGLE_HOP_ORACLE_RULES: readonly SingleHopOracleRule[] = [
   'redirect',
   'conserved_balance',
   'auth_bypass',
+  'webhook',
 ]
 
 export const REGISTERED_V8_ORACLE_FAMILIES: readonly V8OracleFamily[] = [
@@ -213,7 +214,7 @@ function defaultSingleHopHandler(
   transcript: HostSignedTranscript,
   policy: TerminalOraclePolicyContext,
 ): ReceiptVerification {
-  const { rule } = receiptRuleFor(receipt.vulnClass)
+  const { rule } = receiptRuleFor(receipt.vulnClass, receipt)
   const custodyErr = checkHostCustodySignatures(receipt, transcript, policy)
   if (custodyErr) {
     return {
@@ -253,6 +254,28 @@ function defaultV8FamilyHandler(
     return pollsById.has(rec.id) || matchesHydratedRecord(rec, idx, fallbackSig)
   })
   const hydrated = hydrateV8OracleInput(family, rawInput, idx, fallbackSig, opts?.econCtx)
+  // An internal transfer amount moves value between ledger accounts; it is not an external
+  // authorized deposit. Do not let hydration erase a host-observed increase in total balances.
+  if (family === 'economic_conservation' && hydrated.equation === 'balance_minting' && Array.isArray(hydrated.actions)) {
+    const successful = hydrated.actions.filter((action): action is V8OracleRecord => {
+      if (!action || typeof action !== 'object') return false
+      const status = (action as V8OracleRecord).status
+      return typeof status === 'number' && status >= 200 && status < 300
+    })
+    const transferPairs = [['from', 'to'], ['source', 'destination'], ['fromaccount', 'toaccount'], ['sourceaccount', 'destinationaccount'], ['debitaccount', 'creditaccount']]
+    const transferOnly = successful.length > 0 && successful.every(action => {
+      const request = entriesById.get(action.id)?.step.requestJson
+      if (!request || typeof request !== 'object' || Array.isArray(request)) return false
+      const keys = new Set(Object.keys(request).map(key => key.replace(/[_-]/g, '').toLowerCase()))
+      return transferPairs.some(([from, to]) => keys.has(from) && keys.has(to))
+    })
+    if (transferOnly) {
+      const declaredDeposits = rawInput.authorizedDeposits
+      hydrated.authorizedDeposits = typeof declaredDeposits === 'number' && Number.isFinite(declaredDeposits) && declaredDeposits >= 0
+        ? declaredDeposits
+        : 0
+    }
+  }
   if (family === 'economic_conservation' && isHydratedStub(hydrated.finalReadback)) {
     return {
       family,
@@ -371,7 +394,7 @@ export class TerminalOracleRegistry {
       }
     }
     const receipt = parsed.data
-    const { rule } = receiptRuleFor(receipt.vulnClass)
+    const { rule } = receiptRuleFor(receipt.vulnClass, receipt)
     if (rule === 'none') {
       const singleHop: ReceiptVerification = {
         confirmed: false,

@@ -12,6 +12,7 @@
  * produce the same artifact, so promotion, patch retest, and reporting share one confirmation
  * path instead of three.
  */
+import { createHmac } from 'node:crypto'
 import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
 import { HostFactLog } from './host-fact-log.ts'
@@ -128,14 +129,14 @@ export interface ReceiptVerification {
   confirmed: boolean
   vulnClass: string
   /** Rule family used to validate the receipt. */
-  rule: 'impact' | 'oob' | 'timing' | 'boolean' | 'status_differential' | 'browser' | 'redirect' | 'conserved_balance' | 'auth_bypass' | 'none'
+  rule: 'impact' | 'oob' | 'timing' | 'boolean' | 'status_differential' | 'browser' | 'redirect' | 'conserved_balance' | 'auth_bypass' | 'webhook' | 'none'
   reason: string
   observed: string
   expected: string
   evidence?: Record<string, unknown>
 }
 
-const OOB_CLASS_RE = /^(?:ssrf|xxe|blind_ssrf|blind_xxe|oob|webhook_forgery)$/i
+const OOB_CLASS_RE = /^(?:ssrf|xxe|blind_ssrf|blind_xxe|oob)$/i
 const TIMING_CLASS_RE = /^(?:blind_sqli|sqli_time|sql_time|timing)$/i
 const BOOLEAN_CLASS_RE = /^(?:sqli|sql_boolean|sql_boolean_diff|boolean_sqli|boolean_differential)$/i
 /**
@@ -190,8 +191,13 @@ const IMPACT_CLASS_BY_VULN: Readonly<Record<string, ImpactClass>> = {
 }
 
 /** Classify a receipt's vulnerability label into the shared impact model (or a non-impact rule). */
-export function receiptRuleFor(vulnClass: string): { rule: ReceiptVerification['rule']; impactClass?: ImpactClass } {
+export function receiptRuleFor(vulnClass: string, receipt?: Pick<ProofReceipt, 'oobEventIds'>): { rule: ReceiptVerification['rule']; impactClass?: ImpactClass } {
   if (OOB_CLASS_RE.test(vulnClass)) return { rule: 'oob' }
+  // Webhook forgery has two evidence models: a durable callback remains OOB, while an inline-key
+  // self-signed delivery must prove the signature/control differential over host-recorded requests.
+  if (/^webhook_forgery$/i.test(vulnClass)) {
+    return receipt && receipt.oobEventIds.length === 0 ? { rule: 'webhook' } : { rule: 'oob' }
+  }
   if (STATUS_DIFF_CLASS_RE.test(vulnClass)) return { rule: 'status_differential' }
   if (BOOLEAN_CLASS_RE.test(vulnClass)) return { rule: 'boolean' }
   if (TIMING_CLASS_RE.test(vulnClass)) return { rule: 'timing' }
@@ -240,6 +246,84 @@ function hostOf(value: string | null, base?: string | null): string | null {
   try { return new URL(value, base ?? 'http://kovo.invalid').host.toLowerCase() } catch { return null }
 }
 
+interface InlineWebhookSignature {
+  valid: boolean
+  delivery: string
+  keyField: string
+  signatureField: string
+}
+
+/** Recompute an inline-key webhook HMAC strictly from the host-recorded request body. */
+function inlineWebhookSignature(step: ImpactStep): InlineWebhookSignature | null {
+  const body = step.requestJson
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null
+  const record = body as Record<string, unknown>
+  const entries = Object.entries(record)
+  const keyField = entries.find(([key, value]) => typeof value === 'string' && value.length > 0 &&
+    /(?:^|_)(?:key|secret)$|^(?:signing|webhook|hmac)(?:key|secret)$/i.test(key))?.[0]
+  const signatureField = entries.find(([key, value]) => typeof value === 'string' && value.length > 0 &&
+    /(?:^|_)(?:signature|sig)$|signature$/i.test(key))?.[0]
+  if (!keyField || !signatureField) return null
+  const key = String(record[keyField])
+  const signature = String(record[signatureField])
+  const timestampField = entries.find(([name]) => /(?:^|_)(?:ts|timestamp)$/i.test(name))?.[0]
+  const eventField = entries.find(([name]) => /^(?:event|payload|data)$/i.test(name))?.[0]
+  const withoutSignature: Record<string, unknown> = { ...record }
+  delete withoutSignature[signatureField]
+  const event = eventField ? withoutSignature[eventField] : withoutSignature
+  const asText = (value: unknown): string => typeof value === 'string' ? value : (JSON.stringify(value) ?? String(value))
+  const comparable = eventField ? event : Object.fromEntries(Object.entries(withoutSignature).filter(([name]) =>
+    name !== keyField && name !== timestampField))
+  const result: InlineWebhookSignature = {
+    valid: false,
+    delivery: JSON.stringify(comparable),
+    keyField,
+    signatureField,
+  }
+  const candidates: string[] = []
+  if (timestampField && withoutSignature[timestampField] !== undefined) {
+    candidates.push(`${String(withoutSignature[timestampField])}.${asText(event)}`)
+    candidates.push(`${String(withoutSignature[timestampField])}.${JSON.stringify(withoutSignature)}`)
+  }
+  candidates.push(asText(event), JSON.stringify(withoutSignature))
+  for (const canonical of candidates) {
+    const hex = createHmac('sha256', key).update(canonical).digest('hex')
+    const base64 = createHmac('sha256', key).update(canonical).digest('base64')
+    if (signature === hex || signature === base64) return { ...result, valid: true }
+  }
+  return result
+}
+
+function webhookAcknowledged(step: ImpactStep): boolean {
+  const visit = (value: unknown, depth: number): boolean => {
+    if (depth > 4 || !value || typeof value !== 'object') return false
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (/^(?:ok|received|processed|accepted|success)$/i.test(key) &&
+          (child === true || (typeof child === 'string' && /^(?:true|processed|accepted|received)$/i.test(child)))) return true
+      if (visit(child, depth + 1)) return true
+    }
+    return false
+  }
+  return visit(step.json, 0)
+}
+
+function webhookReadbackBound(steps: readonly ImpactStep[], probeIndex: number, request: ImpactStep['requestJson']): boolean {
+  const ids = new Set<string>()
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 4 || !value || typeof value !== 'object') return
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (/(?:^|_)(?:id|uuid)$/i.test(key) && typeof child === 'string' && child.length <= 128) ids.add(child)
+      visit(child, depth + 1)
+    }
+  }
+  visit(request, 0)
+  return ids.size > 0 && steps.slice(probeIndex + 1).some(step => {
+    if (!/^(?:GET|HEAD|OPTIONS)$/i.test(step.method ?? '') || !is2xxStatus(step.status)) return false
+    const response = step.body ?? (step.json !== undefined ? JSON.stringify(step.json) : '')
+    return [...ids].some(id => response.includes(id))
+  })
+}
+
 /**
  * Validate one receipt against the transcript. A receipt with a missing exchange, a missing OOB
  * event, a mismatched target, or an impact claim the oracle model cannot substantiate is rejected —
@@ -259,7 +343,7 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     }
   }
   const receipt = parsed.data
-  const { rule, impactClass } = receiptRuleFor(receipt.vulnClass)
+  const { rule, impactClass } = receiptRuleFor(receipt.vulnClass, receipt)
   if (rule === 'none') {
     return reject(receipt, rule, `No confirmation rule for vulnerability class "${receipt.vulnClass}".`)
   }
@@ -553,6 +637,56 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
       observed: receipt.claimedDelta,
       expected: 'the marker-bearing request stays local',
       evidence: { locationHost, canaryPattern: canaryPattern ?? null },
+    }
+  }
+
+  if (rule === 'webhook') {
+    if (receipt.exchangeIds.length < 2) return reject(receipt, rule, 'An inline-key webhook receipt needs a rejected control and an accepted probe delivery.')
+    const entries = receipt.exchangeIds.map(id => entriesById.get(id)!)
+    const control = entries.find(entry => entry.step.arm === 'control' && entry.step.status !== null &&
+      entry.step.status >= 400 && entry.step.status < 500)
+    const probe = entries.find(entry => entry.step.arm === 'probe' && is2xxStatus(entry.step.status))
+    if (!control || !probe) return reject(receipt, rule, 'An inline-key webhook receipt needs a 4xx control and a 2xx probe on the recorded receiver route.')
+    if (control.step.method.toUpperCase() !== probe.step.method.toUpperCase() || routeOf(control.step) !== routeOf(probe.step)) {
+      return reject(receipt, rule, 'The webhook control and probe deliveries do not target the same method and route.')
+    }
+    if ((control.step.actor.handle ?? null) !== (probe.step.actor.handle ?? null)) {
+      return reject(receipt, rule, 'The webhook control and probe deliveries use different actors.')
+    }
+    if (receipt.target.method && receipt.target.method.toUpperCase() !== probe.step.method.toUpperCase()) {
+      return reject(receipt, rule, 'The webhook receipt target method does not match the accepted delivery.')
+    }
+    if (receipt.target.pathAndQuery && normalizePath(receipt.target.pathAndQuery) !== routeOf(probe.step)) {
+      return reject(receipt, rule, 'The webhook receipt target route does not match the accepted delivery.')
+    }
+    if ((control.origin && normalizeOrigin(control.origin) !== normalizeOrigin(receipt.target.origin)) ||
+        (probe.origin && normalizeOrigin(probe.origin) !== normalizeOrigin(receipt.target.origin))) {
+      return reject(receipt, rule, 'The webhook delivery origin does not match the receipt target.')
+    }
+    const controlSignature = inlineWebhookSignature(control.step)
+    const probeSignature = inlineWebhookSignature(probe.step)
+    if (!controlSignature || !probeSignature) return reject(receipt, rule, 'The host-recorded webhook bodies do not carry inline key/signature fields.')
+    if (controlSignature.valid) return reject(receipt, rule, 'The webhook control signature is valid; it is not a tampered-signature control.')
+    if (!probeSignature.valid) return reject(receipt, rule, 'The accepted webhook probe body does not carry a valid signature under its inline key.')
+    if (controlSignature.keyField !== probeSignature.keyField || controlSignature.signatureField !== probeSignature.signatureField) {
+      return reject(receipt, rule, 'The webhook control and probe use different inline key/signature fields.')
+    }
+    if (controlSignature.delivery !== probeSignature.delivery) {
+      return reject(receipt, rule, 'The webhook control and probe differ beyond their key, timestamp, and signature fields.')
+    }
+    const steps = entries.map(entry => entry.step)
+    const probeIndex = steps.indexOf(probe.step)
+    if (!webhookAcknowledged(probe.step) && !webhookReadbackBound(steps, probeIndex, probe.step.requestJson)) {
+      return reject(receipt, rule, 'The accepted webhook delivery has neither a processing acknowledgement nor an identifier-bound readback.')
+    }
+    return {
+      confirmed: true,
+      vulnClass: receipt.vulnClass,
+      rule,
+      reason: 'A tampered inline signature was rejected while the same delivery signed with an attacker-supplied inline key was accepted and acknowledged.',
+      observed: receipt.claimedDelta,
+      expected: 'webhook deliveries signed with an attacker-supplied key are rejected',
+      evidence: { controlExchangeId: control.exchangeId, probeExchangeId: probe.exchangeId },
     }
   }
 

@@ -336,6 +336,8 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
               ...(batchExchangeIds.length ? { exchangeIds: batchExchangeIds } : {}),
               ...(batchExchangeIds[0] ? { exchangeId: batchExchangeIds[0] } : {}),
               ...(first ? summarizeExchange(first) : {}),
+              ...(brokerReq.body !== undefined ? { requestBody: brokerReq.body } : {}),
+              ...(first ? { requestHeaders: first.reqHeaders } : {}),
               ...actorContextFor(step),
             }
             stepsOut[step.id] = stepEntry
@@ -354,6 +356,8 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
               role: step.role,
               ...(exchangeId ? { exchangeId } : {}),
               ...summarizeExchange(ex),
+              ...(brokerReq.body !== undefined ? { requestBody: brokerReq.body } : {}),
+              requestHeaders: ex.reqHeaders,
               ...actorContextFor(step),
             }
             stepsOut[step.id] = stepEntry
