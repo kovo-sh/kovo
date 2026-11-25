@@ -12,6 +12,16 @@
 import { createHash, createHmac, sign as cryptoSign, timingSafeEqual, verify as cryptoVerify } from 'node:crypto'
 import type { KeyLike } from 'node:crypto'
 import { desc, eq } from 'drizzle-orm'
+import { CAUSAL_EDGE_KINDS, REPLAY_MODES, compositeProofReceiptSchema } from './composite-receipt.ts'
+import type {
+  CausalEdgeBinding,
+  CausalEdgeKind,
+  CompositeProofReceipt,
+  CompositeReceiptVerification,
+  HopReceipt,
+  HopSurface,
+  ReplayMode,
+} from './composite-receipt.ts'
 import { buildCoverageGapReport } from './coverage-gaps.ts'
 import type { CoverageGapReport } from './coverage-gaps.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
@@ -99,6 +109,90 @@ export interface PortableReceiptRecord {
   recordSha256: string
 }
 
+export interface CompositeReceiptExportInput {
+  findingId?: string | null
+  title?: string | null
+  severity?: string | null
+  cwe?: string | null
+  receipt: CompositeProofReceipt
+  verification?: Partial<Pick<CompositeReceiptVerification, 'confirmed' | 'modeBVerified' | 'reason' | 'verifiedEdges'>>
+  /** Optional actor persona handles keyed by hopId when known outside broker_exchanges. */
+  hopActors?: Readonly<Record<string, string | null>>
+  /** Optional hopId where a post-patch DAG retest broke the chain. */
+  patchBrokeHopId?: string | null
+  /** Optional post-patch retest verdict if retested. */
+  patchRetestVerdict?: 'reproduced' | 'fixed' | 'inconclusive' | null
+}
+
+export interface PortableCompositeHopSummary {
+  hopId: string
+  order: number
+  surface: HopSurface
+  actor: string | null
+  origin: string
+  method: string | null
+  pathAndQuery: string | null
+  param: string | null
+  claimedDelta: string
+  exchangeIds: string[]
+  oobEventIds: string[]
+  browserTraceIds: string[]
+  producedCapabilities: string[]
+  consumedCapabilities: string[]
+  entityId: string | null
+}
+
+export interface PortableCompositeEdgeBinding {
+  kind: CausalEdgeKind
+  fromHopId: string
+  toHopId: string
+  verified: boolean | null
+  bindingDetail: {
+    capabilityHandle?: string
+    valueDigest?: string
+    sourceExchangeId?: string
+    targetExchangeId?: string
+    sourceCapabilityId?: string
+    derivedCapabilityId?: string
+    alg?: string
+    entityId?: string
+    ablationExchangeIds?: string[]
+    mutationKind?: string
+    correlationId?: string
+    channel?: 'poll_convergence' | 'oob_relay' | 'browser_trace' | 'async_job'
+    oobEventId?: string
+    browserTraceId?: string
+    pollRecordId?: string
+  }
+}
+
+export interface PortableCompositeReceiptRecord {
+  chainId: string
+  findingId: string | null
+  title: string | null
+  severity: string | null
+  cwe: string | null
+  terminalVulnClass: string
+  replayMode: ReplayMode
+  confirmed: boolean
+  modeBVerified: boolean
+  verificationReason: string | null
+  hopCount: number
+  hops: PortableCompositeHopSummary[]
+  causalEdges: PortableCompositeEdgeBinding[]
+  terminalImpact: {
+    terminalHopId: string
+    claimedImpact: string
+    preChainControlExchangeIds: string[]
+    postChainReadbackExchangeIds: string[]
+    modeAFailureExchangeId: string | null
+  }
+  patchBrokeHopId: string | null
+  patchRetestVerdict: 'reproduced' | 'fixed' | 'inconclusive' | null
+  transcriptSlices: PortableTranscriptSlice[]
+  recordSha256: string
+}
+
 export interface ProofReceiptExportPayload {
   schemaVersion: 1
   exportedAt: string
@@ -107,6 +201,7 @@ export interface ProofReceiptExportPayload {
   zdrRedacted: boolean
   receiptCount: number
   records: PortableReceiptRecord[]
+  compositeReceipts?: PortableCompositeReceiptRecord[]
   coverageGaps: CoverageGapReport
 }
 
@@ -127,6 +222,8 @@ export interface ExportRunReceiptOptions {
   signing?: ReceiptBundleSignOptions
   /** Actor recorded in the append-only tenant audit log. */
   actor?: string
+  /** Optional multi-hop CompositeProofReceipt records to bundle alongside single-hop receipts. */
+  compositeReceipts?: readonly CompositeReceiptExportInput[]
   now?: number
 }
 
@@ -134,6 +231,7 @@ export interface VerifyProofReceiptBundleResult {
   valid: boolean
   reason?: string
   verifiedRecords: number
+  verifiedCompositeRecords?: number
 }
 
 function sha256Hex(text: string): string {
@@ -171,6 +269,315 @@ function buildCommandHint(steps: readonly PortableReproducerStep[]): string {
 
 function recordDigest(record: Omit<PortableReceiptRecord, 'recordSha256'>): string {
   return sha256Hex(`guardian.receipt-record.v1\n${canonicalJson(record)}`)
+}
+
+function compositeRecordDigest(record: Omit<PortableCompositeReceiptRecord, 'recordSha256'>): string {
+  return sha256Hex(`guardian.composite-receipt-record.v1\n${canonicalJson(record)}`)
+}
+
+const VALID_EDGE_KINDS = new Set<string>(CAUSAL_EDGE_KINDS)
+const VALID_REPLAY_MODES = new Set<string>(REPLAY_MODES)
+
+/** Deterministic topological hop ordering for DAG export, Markdown, and SARIF codeFlows. */
+export function orderCompositeHops(receipt: CompositeProofReceipt): HopReceipt[] {
+  const indexById = new Map<string, number>()
+  const hopsById = new Map<string, HopReceipt>()
+  for (let i = 0; i < receipt.hops.length; i += 1) {
+    const hop = receipt.hops[i]!
+    indexById.set(hop.hopId, i)
+    hopsById.set(hop.hopId, hop)
+  }
+  const inDeg = new Map<string, number>(receipt.hops.map(h => [h.hopId, 0]))
+  const outAdj = new Map<string, string[]>(receipt.hops.map(h => [h.hopId, []]))
+  for (const edge of receipt.causalEdges) {
+    if (!hopsById.has(edge.fromHopId) || !hopsById.has(edge.toHopId) || edge.fromHopId === edge.toHopId) continue
+    outAdj.get(edge.fromHopId)!.push(edge.toHopId)
+    inDeg.set(edge.toHopId, (inDeg.get(edge.toHopId) ?? 0) + 1)
+  }
+
+  const ready = receipt.hops
+    .filter(h => (inDeg.get(h.hopId) ?? 0) === 0)
+    .map(h => h.hopId)
+  const ordered: HopReceipt[] = []
+  const visited = new Set<string>()
+  while (ready.length > 0) {
+    ready.sort((a, b) => (indexById.get(a) ?? 0) - (indexById.get(b) ?? 0))
+    const id = ready.shift()!
+    if (visited.has(id)) continue
+    visited.add(id)
+    const hop = hopsById.get(id)
+    if (hop) ordered.push(hop)
+    for (const next of outAdj.get(id) ?? []) {
+      const rem = (inDeg.get(next) ?? 0) - 1
+      inDeg.set(next, rem)
+      if (rem === 0 && !visited.has(next)) ready.push(next)
+    }
+  }
+  for (const hop of receipt.hops) {
+    if (!visited.has(hop.hopId)) ordered.push(hop)
+  }
+  return ordered
+}
+
+export function isPortableCompositeReceiptRecord(value: unknown): value is PortableCompositeReceiptRecord {
+  if (!value || typeof value !== 'object') return false
+  const obj = value as Record<string, unknown>
+  return (
+    typeof obj.chainId === 'string' &&
+    typeof obj.terminalVulnClass === 'string' &&
+    typeof obj.recordSha256 === 'string' &&
+    Array.isArray(obj.hops) &&
+    Array.isArray(obj.causalEdges) &&
+    !!obj.terminalImpact &&
+    typeof obj.terminalImpact === 'object'
+  )
+}
+
+function scrubCausalEdgeBinding(
+  edge: CausalEdgeBinding,
+  verified: boolean | null,
+  secrets: readonly NamedSecret[],
+  zdr: boolean,
+): PortableCompositeEdgeBinding {
+  if (edge.kind === 'value_binding') {
+    return {
+      kind: edge.kind,
+      fromHopId: edge.fromHopId,
+      toHopId: edge.toHopId,
+      verified,
+      bindingDetail: {
+        ...(edge.capabilityHandle ? { capabilityHandle: scrubText(edge.capabilityHandle, secrets, zdr) } : {}),
+        ...(edge.valueDigest ? { valueDigest: edge.valueDigest.toLowerCase() } : {}),
+        ...(edge.sourceExchangeId ? { sourceExchangeId: edge.sourceExchangeId } : {}),
+        ...(edge.targetExchangeId ? { targetExchangeId: edge.targetExchangeId } : {}),
+      },
+    }
+  }
+  if (edge.kind === 'derived_crypto_binding') {
+    return {
+      kind: edge.kind,
+      fromHopId: edge.fromHopId,
+      toHopId: edge.toHopId,
+      verified,
+      bindingDetail: {
+        sourceCapabilityId: scrubText(edge.sourceCapabilityId, secrets, zdr),
+        ...(edge.derivedCapabilityId ? { derivedCapabilityId: scrubText(edge.derivedCapabilityId, secrets, zdr) } : {}),
+        ...(edge.alg ? { alg: scrubText(edge.alg, secrets, zdr) } : {}),
+      },
+    }
+  }
+  if (edge.kind === 'state_transition_binding') {
+    return {
+      kind: edge.kind,
+      fromHopId: edge.fromHopId,
+      toHopId: edge.toHopId,
+      verified,
+      bindingDetail: {
+        entityId: scrubText(edge.entityId, secrets, zdr),
+        ablationExchangeIds: [...edge.ablationExchangeIds],
+        ...(edge.mutationKind ? { mutationKind: scrubText(edge.mutationKind, secrets, zdr) } : {}),
+      },
+    }
+  }
+  return {
+    kind: edge.kind,
+    fromHopId: edge.fromHopId,
+    toHopId: edge.toHopId,
+    verified,
+    bindingDetail: {
+      correlationId: scrubText(edge.correlationId, secrets, zdr),
+      channel: edge.channel,
+      ...(edge.oobEventId ? { oobEventId: edge.oobEventId } : {}),
+      ...(edge.browserTraceId ? { browserTraceId: edge.browserTraceId } : {}),
+      ...(edge.pollRecordId ? { pollRecordId: edge.pollRecordId } : {}),
+    },
+  }
+}
+
+export interface BuildPortableCompositeContext {
+  secrets?: readonly NamedSecret[]
+  zdr?: boolean
+  exchangesById?: ReadonlyMap<string, typeof brokerExchanges.$inferSelect>
+}
+
+/**
+ * Normalize, redact (with optional ZDR/PII scrubbing), and digest a `CompositeProofReceipt`
+ * into a self-contained `PortableCompositeReceiptRecord`.
+ */
+export function buildPortableCompositeReceiptRecord(
+  input: CompositeReceiptExportInput,
+  ctx: BuildPortableCompositeContext = {},
+): PortableCompositeReceiptRecord {
+  const secrets = ctx.secrets ?? []
+  const zdr = ctx.zdr === true
+  const exchangesById = ctx.exchangesById
+  const receipt = input.receipt
+  const orderedHops = orderCompositeHops(receipt)
+
+  const verifiedEdgeByKey = new Map<string, boolean>()
+  for (const ve of input.verification?.verifiedEdges ?? []) {
+    verifiedEdgeByKey.set(`${ve.fromHopId}->${ve.toHopId}:${ve.kind}`, ve.verified)
+  }
+
+  const citedExchangeIds = new Set<string>()
+  const hops: PortableCompositeHopSummary[] = orderedHops.map((hop, idx) => {
+    for (const exId of hop.exchangeIds) citedExchangeIds.add(exId)
+    let rawActor: string | null = input.hopActors?.[hop.hopId] ?? null
+    if (rawActor === null && exchangesById) {
+      for (const exId of hop.exchangeIds) {
+        const ex = exchangesById.get(exId)
+        if (ex?.personaHandle) {
+          rawActor = ex.personaHandle
+          break
+        }
+      }
+    }
+    return {
+      hopId: hop.hopId,
+      order: idx + 1,
+      surface: hop.surface,
+      actor: rawActor !== null ? scrubText(rawActor, secrets, zdr) : null,
+      origin: hop.target.origin,
+      method: hop.target.method ?? null,
+      pathAndQuery: hop.target.pathAndQuery ? scrubText(hop.target.pathAndQuery, secrets, zdr) : null,
+      param: hop.target.param ? scrubText(hop.target.param, secrets, zdr) : null,
+      claimedDelta: scrubText(hop.claimedDelta, secrets, zdr),
+      exchangeIds: [...hop.exchangeIds],
+      oobEventIds: [...hop.oobEventIds],
+      browserTraceIds: [...hop.browserTraceIds],
+      producedCapabilities: hop.producedCapabilities.map(c => scrubText(c, secrets, zdr)),
+      consumedCapabilities: hop.consumedCapabilities.map(c => scrubText(c, secrets, zdr)),
+      entityId: hop.entityId ? scrubText(hop.entityId, secrets, zdr) : null,
+    }
+  })
+
+  const causalEdges: PortableCompositeEdgeBinding[] = receipt.causalEdges.map(edge => {
+    if (edge.kind === 'state_transition_binding') {
+      for (const abId of edge.ablationExchangeIds) citedExchangeIds.add(abId)
+    }
+    const key = `${edge.fromHopId}->${edge.toHopId}:${edge.kind}`
+    const verified = verifiedEdgeByKey.has(key) ? (verifiedEdgeByKey.get(key) ?? null) : null
+    return scrubCausalEdgeBinding(edge, verified, secrets, zdr)
+  })
+
+  for (const exId of receipt.terminalImpact.preChainControlExchangeIds) citedExchangeIds.add(exId)
+  for (const exId of receipt.terminalImpact.postChainReadbackExchangeIds) citedExchangeIds.add(exId)
+  if (receipt.terminalImpact.modeAFailureExchangeId) citedExchangeIds.add(receipt.terminalImpact.modeAFailureExchangeId)
+
+  const transcriptSlices: PortableTranscriptSlice[] = []
+  if (exchangesById) {
+    for (const exId of citedExchangeIds) {
+      const ex = exchangesById.get(exId)
+      if (!ex) continue
+      transcriptSlices.push({
+        exchangeId: ex.id,
+        origin: ex.origin,
+        finalOrigin: ex.finalOrigin,
+        method: ex.method,
+        pathAndQuery: scrubText(ex.pathAndQuery, secrets, zdr),
+        personaHandle: ex.personaHandle ? scrubText(ex.personaHandle, secrets, zdr) : null,
+        status: ex.status,
+        mediaType: ex.mediaType,
+        reqHeaders: scrubHeaders(ex.reqHeaders, secrets, zdr),
+        respHeaders: scrubHeaders(ex.respHeaders, secrets, zdr),
+        bodyPreview: scrubText(ex.bodyPreview.slice(0, 2048), secrets, zdr),
+        bodySha256: ex.bodySha256,
+        durationMs: ex.durationMs,
+        capturedAt: new Date(ex.createdAt).toISOString(),
+      })
+    }
+  }
+
+  const baseRecord: Omit<PortableCompositeReceiptRecord, 'recordSha256'> = {
+    chainId: receipt.chainId,
+    findingId: input.findingId ?? null,
+    title: input.title ? scrubText(input.title, secrets, zdr) : null,
+    severity: input.severity ?? null,
+    cwe: input.cwe ?? null,
+    terminalVulnClass: receipt.terminalVulnClass,
+    replayMode: receipt.replayMode,
+    confirmed: input.verification?.confirmed ?? true,
+    modeBVerified: input.verification?.modeBVerified ?? (receipt.replayMode === 'one_shot_transcript'),
+    verificationReason: input.verification?.reason ? scrubText(input.verification.reason, secrets, zdr) : null,
+    hopCount: hops.length,
+    hops,
+    causalEdges,
+    terminalImpact: {
+      terminalHopId: receipt.terminalImpact.terminalHopId,
+      claimedImpact: scrubText(receipt.terminalImpact.claimedImpact, secrets, zdr),
+      preChainControlExchangeIds: [...receipt.terminalImpact.preChainControlExchangeIds],
+      postChainReadbackExchangeIds: [...receipt.terminalImpact.postChainReadbackExchangeIds],
+      modeAFailureExchangeId: receipt.terminalImpact.modeAFailureExchangeId ?? null,
+    },
+    patchBrokeHopId: input.patchBrokeHopId ? scrubText(input.patchBrokeHopId, secrets, zdr) : null,
+    patchRetestVerdict: input.patchRetestVerdict ?? null,
+    transcriptSlices,
+  }
+
+  return {
+    ...baseRecord,
+    recordSha256: compositeRecordDigest(baseRecord),
+  }
+}
+
+const PATCH_BROKE_HOP_RE = /\bpatchBrokeHopId\s*[:=]\s*["']?([A-Za-z0-9._:-]{1,128})["']?/i
+
+/**
+ * Best-effort extraction of persisted `CompositeProofReceipt` records from `replaySpecs` and
+ * matching `retestRuns` (e.g., `patchBrokeHopId`) without requiring schema migrations.
+ */
+export function extractStoreCompositeReceipts(
+  specRows: ReadonlyArray<typeof replaySpecs.$inferSelect>,
+  retestRows: ReadonlyArray<typeof retestRuns.$inferSelect> = [],
+  findingsById?: ReadonlyMap<string, { title?: string; severity?: string; cwe?: string | null }>,
+): CompositeReceiptExportInput[] {
+  const retestsByFinding = new Map<string, Array<typeof retestRuns.$inferSelect>>()
+  for (const rt of retestRows) {
+    const arr = retestsByFinding.get(rt.findingId) ?? []
+    arr.push(rt)
+    retestsByFinding.set(rt.findingId, arr)
+  }
+
+  const extracted: CompositeReceiptExportInput[] = []
+  for (const specRow of specRows) {
+    const rawProof = specRow.proofReceipt as unknown
+    if (!rawProof || typeof rawProof !== 'object') continue
+    const obj = rawProof as Record<string, unknown>
+    const candidate = obj.compositeReceipt ?? (Array.isArray(obj.hops) && typeof obj.chainId === 'string' ? obj : undefined)
+    if (!candidate) continue
+    const parsed = compositeProofReceiptSchema.safeParse(candidate)
+    if (!parsed.success) continue
+
+    const findingMeta = findingsById?.get(specRow.findingId)
+    const latestRetest = (retestsByFinding.get(specRow.findingId) ?? [])[0]
+    let patchBrokeHopId: string | null = typeof obj.patchBrokeHopId === 'string' ? obj.patchBrokeHopId : null
+    if (!patchBrokeHopId && latestRetest) {
+      const rtAny = latestRetest as unknown as Record<string, unknown>
+      if (typeof rtAny.patchBrokeHopId === 'string' && rtAny.patchBrokeHopId.trim()) {
+        patchBrokeHopId = rtAny.patchBrokeHopId.trim()
+      } else {
+        const match = PATCH_BROKE_HOP_RE.exec(latestRetest.summary)
+        if (match?.[1]) patchBrokeHopId = match[1]
+      }
+    }
+    const rawVer = obj.compositeVerification as CompositeReceiptExportInput['verification'] | undefined
+    const hopActors = (obj.hopActors && typeof obj.hopActors === 'object')
+      ? obj.hopActors as Record<string, string | null>
+      : undefined
+
+    extracted.push({
+      findingId: specRow.findingId,
+      title: findingMeta?.title ?? null,
+      severity: findingMeta?.severity ?? null,
+      cwe: findingMeta?.cwe ?? null,
+      receipt: parsed.data,
+      ...(rawVer ? { verification: rawVer } : {}),
+      ...(hopActors ? { hopActors } : {}),
+      ...(patchBrokeHopId ? { patchBrokeHopId } : {}),
+      ...(latestRetest ? { patchRetestVerdict: latestRetest.verdict } : {}),
+    })
+  }
+  return extracted
 }
 
 function payloadSigningBytes(payload: ProofReceiptExportPayload, payloadSha256: string): Buffer {
@@ -352,6 +759,20 @@ export function exportRunReceiptBundle(
     })
   }
 
+  const findingsMetaById = new Map(
+    findingRows.map(row => [row.id, { title: row.finding.title, severity: row.finding.severity, cwe: row.finding.cwe ?? null }]),
+  )
+  const compositeInputByChain = new Map<string, CompositeReceiptExportInput>()
+  for (const extracted of extractStoreCompositeReceipts(specRows, retestRows, findingsMetaById)) {
+    compositeInputByChain.set(extracted.receipt.chainId, extracted)
+  }
+  for (const supplied of options.compositeReceipts ?? []) {
+    compositeInputByChain.set(supplied.receipt.chainId, supplied)
+  }
+  const compositeReceipts: PortableCompositeReceiptRecord[] = [...compositeInputByChain.values()]
+    .map(item => buildPortableCompositeReceiptRecord(item, { secrets, zdr, exchangesById }))
+    .sort((a, b) => a.chainId.localeCompare(b.chainId))
+
   const coverageGaps = buildCoverageGapReport(storage, run.id, { secrets, zdr, now: nowMs })
   const payload: ProofReceiptExportPayload = {
     schemaVersion: 1,
@@ -361,6 +782,7 @@ export function exportRunReceiptBundle(
     zdrRedacted: zdr,
     receiptCount: records.length,
     records,
+    ...(compositeReceipts.length > 0 ? { compositeReceipts } : {}),
     coverageGaps,
   }
   const payloadSha256 = sha256Hex(canonicalJson(payload))
@@ -382,7 +804,12 @@ export function exportRunReceiptBundle(
     resourceKind: 'run',
     resourceId: run.id,
     outcome: 'exported',
-    detail: { receiptCount: records.length, zdrRedacted: zdr, algorithm: signing.algorithm },
+    detail: {
+      receiptCount: records.length,
+      ...(compositeReceipts.length > 0 ? { compositeReceiptCount: compositeReceipts.length } : {}),
+      zdrRedacted: zdr,
+      algorithm: signing.algorithm,
+    },
     now: nowMs,
   })
 
@@ -396,8 +823,9 @@ export function exportRunReceiptBundle(
 }
 
 /**
- * Independently verify a portable `SignedProofReceiptBundle` — checks every record SHA-256,
- * the bundle payload SHA-256, and the cryptographic signature (HMAC-SHA256 or Ed25519).
+ * Independently verify a portable `SignedProofReceiptBundle` — checks every single-hop and
+ * composite record SHA-256, the bundle payload SHA-256, and the cryptographic signature
+ * (HMAC-SHA256 or Ed25519).
  */
 export function verifyProofReceiptBundle(
   bundle: unknown,
@@ -435,6 +863,28 @@ export function verifyProofReceiptBundle(
     }
   }
 
+  const rawComposites = candidate.payload.compositeReceipts
+  if (rawComposites !== undefined) {
+    if (!Array.isArray(rawComposites)) {
+      return { valid: false, reason: 'Composite receipts field is malformed.', verifiedRecords: 0 }
+    }
+    for (const comp of rawComposites) {
+      if (!isPortableCompositeReceiptRecord(comp) || !VALID_REPLAY_MODES.has(comp.replayMode)) {
+        return { valid: false, reason: 'Composite receipt record is malformed.', verifiedRecords: 0 }
+      }
+      for (const edge of comp.causalEdges) {
+        if (!edge || typeof edge !== 'object' || !VALID_EDGE_KINDS.has(edge.kind)) {
+          return { valid: false, reason: `Composite receipt ${comp.chainId} contains an invalid causal edge kind.`, verifiedRecords: 0 }
+        }
+      }
+      const { recordSha256, ...rest } = comp
+      const expectedCompHash = compositeRecordDigest(rest)
+      if (expectedCompHash !== recordSha256) {
+        return { valid: false, reason: `Composite receipt SHA-256 mismatch for chain ${comp.chainId}.`, verifiedRecords: 0 }
+      }
+    }
+  }
+
   const providedSig = Buffer.from(candidate.signature, 'base64url')
   if (providedSig.length === 0) {
     return { valid: false, reason: 'Bundle signature is empty.', verifiedRecords: 0 }
@@ -463,5 +913,11 @@ export function verifyProofReceiptBundle(
     }
   }
 
-  return { valid: true, verifiedRecords: candidate.payload.records.length }
+  return rawComposites !== undefined
+    ? {
+        valid: true,
+        verifiedRecords: candidate.payload.records.length,
+        verifiedCompositeRecords: rawComposites.length,
+      }
+    : { valid: true, verifiedRecords: candidate.payload.records.length }
 }
