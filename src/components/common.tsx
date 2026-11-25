@@ -1,9 +1,60 @@
 import { Link, useRouter } from '@tanstack/react-router'
 import { useState } from 'react'
+import { KovoHunterMark } from './brand/KovoHunterMark.tsx'
 
 export const timeText = (value: number) => new Date(value).toLocaleString(undefined, {
   month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
 })
+
+export interface HumanTime {
+  label: string
+  full: string
+}
+
+export function formatHumanTime(
+  isoOrMs: string | number | Date | null | undefined,
+  nowMs: number = Date.now(),
+): HumanTime {
+  if (isoOrMs === null || isoOrMs === undefined || isoOrMs === '') {
+    return { label: '', full: '' }
+  }
+  const ms = typeof isoOrMs === 'number'
+    ? isoOrMs
+    : isoOrMs instanceof Date
+      ? isoOrMs.getTime()
+      : Date.parse(isoOrMs)
+  if (!Number.isFinite(ms)) return { label: '', full: '' }
+
+  const date = new Date(ms)
+  const full = date.toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+
+  const diffMs = nowMs - ms
+  const oneDayMs = 24 * 60 * 60 * 1000
+  if (diffMs >= -60_000 && diffMs < oneDayMs) {
+    if (diffMs < 60_000) return { label: 'just now', full }
+    const minutes = Math.floor(diffMs / 60_000)
+    if (minutes < 60) {
+      return { label: minutes === 1 ? '1 minute ago' : `${minutes} minutes ago`, full }
+    }
+    const hours = Math.floor(minutes / 60)
+    return { label: hours === 1 ? '1 hour ago' : `${hours} hours ago`, full }
+  }
+
+  const sameYear = date.getFullYear() === new Date(nowMs).getFullYear()
+  const label = date.toLocaleDateString(
+    undefined,
+    sameYear
+      ? { month: 'short', day: 'numeric' }
+      : { month: 'short', day: 'numeric', year: 'numeric' },
+  )
+  return { label, full }
+}
 
 export function useAction(refresh?: () => Promise<void>) {
   const router = useRouter()
@@ -19,7 +70,7 @@ export function useAction(refresh?: () => Promise<void>) {
       else await router.invalidate()
       await onSuccess?.(result)
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : 'Guardian could not complete the action.')
+      setError(failure instanceof Error ? failure.message : 'Kovo Hunter could not complete the action.')
     } finally {
       setPending(false)
     }
@@ -32,12 +83,9 @@ export function FormError({ error }: { error: string }) {
 }
 
 export function Brand() {
-  return <Link className="brand" to="/" aria-label="Guardian workspace">
-    <svg width="22" height="24" viewBox="0 0 26 28" aria-hidden="true">
-      <path fill="currentColor" d="M13 1 24 5.8V13c0 6.6-5.7 11.4-11 13.8C7.7 24.4 2 19.6 2 13V5.8L13 1Z" />
-      <path fill="var(--on-accent)" d="M17.9 8.6a7 7 0 0 0-9 .9 6.2 6.2 0 0 0 3.1 10.3v-3.1h3.5v-4.2H12v-1.9h5.9V8.6Z" />
-    </svg>
-    <span>Guardian</span>
+  return <Link className="brand" to="/" aria-label="Kovo Hunter workspace">
+    <KovoHunterMark size={20} />
+    <span>Kovo Hunter</span>
   </Link>
 }
 

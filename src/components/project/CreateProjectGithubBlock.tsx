@@ -42,10 +42,10 @@ function patKindTag(status: GithubPatStatusSummary): string {
   if (status.authKind === 'github_app_device') {
     return status.login ? `GitHub App · @${status.login}` : 'GitHub App'
   }
-  if (status.tokenKind === 'fine_grained') return 'Fine-grained PAT'
-  if (status.tokenKind === 'classic') return 'Classic PAT'
+  if (status.tokenKind === 'fine_grained') return 'Read-only token'
+  if (status.tokenKind === 'classic') return 'Classic token'
   if (status.tokenKind === 'github_app') return 'GitHub App'
-  return 'GitHub PAT'
+  return 'GitHub token'
 }
 
 async function copyText(text: string): Promise<boolean> {
@@ -177,7 +177,7 @@ export function CreateProjectGithubBlock({
     if (startingDeviceFlow || savingToken || disabled) return
     const trimmedClientId = clientIdInput.trim()
     if (!patStatus.githubDeviceFlowConfigured && trimmedClientId.length < 6) {
-      setError('Enter your GitHub App Client ID (or set GUARDIAN_GITHUB_CLIENT_ID).')
+      setError('Enter your GitHub App Client ID to start sign-in.')
       return
     }
     setStartingDeviceFlow(true)
@@ -290,7 +290,7 @@ export function CreateProjectGithubBlock({
         }}
       >
         <span style={{ color: 'var(--fg-3)', display: 'inline-block', transform: expandedConnect ? 'rotate(90deg)' : 'none', transition: 'transform 140ms' }}>▸</span>
-        <span>Connect GitHub for grey-box source &amp; CVE context</span>
+        <span>Connect GitHub for source code &amp; dependency context</span>
         <span className="tag solid" style={{ marginLeft: 'auto' }}>Optional</span>
       </button>
 
@@ -307,8 +307,11 @@ export function CreateProjectGithubBlock({
         {!deviceFlow ? (
           <div style={{ display: 'grid', gap: 8 }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
-              <span style={{ fontSize: 12, color: 'var(--fg-2)' }}>
-                Sign in via read-only GitHub App Device Flow (auto-refreshing local <code>0600</code> vault).
+              <span
+                style={{ fontSize: 12, color: 'var(--fg-2)' }}
+                title="Uses GitHub App Device Flow with automatic token refresh in an owner-only (0600) local credential file"
+              >
+                Sign in with a read-only GitHub App (tokens refresh automatically and stay stored privately on your machine).
               </span>
               {patStatus.githubDeviceFlowConfigured && (
                 <button
@@ -403,7 +406,7 @@ export function CreateProjectGithubBlock({
 
         <details style={{ borderTop: '1px solid var(--line)', paddingTop: 8 }}>
           <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--fg-2)', fontWeight: 500 }}>
-            Or connect with a Fine-Grained PAT
+            Or connect with a read-only GitHub token
           </summary>
           <div style={{ display: 'grid', gap: 8, marginTop: 8 }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
@@ -416,7 +419,7 @@ export function CreateProjectGithubBlock({
                 target="_blank"
                 rel="noopener noreferrer"
               >
-                Create Fine-Grained PAT ↗
+                Create read-only token ↗
               </a>
             </div>
             <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
@@ -433,7 +436,7 @@ export function CreateProjectGithubBlock({
                 placeholder="github_pat_…"
                 autoComplete="off"
                 disabled={savingToken || disabled}
-                aria-label="GitHub Personal Access Token"
+                aria-label="Read-only GitHub access token"
                 style={{ flex: 1 }}
               />
               <button
@@ -448,7 +451,9 @@ export function CreateProjectGithubBlock({
           </div>
         </details>
 
-        <span className="sh-hint">Stored locally in your 0600 vault and never echoed back.</span>
+        <span className="sh-hint" title="Saved locally in an owner-only (0600) credential file">
+          Stored privately on your machine and never shown again.
+        </span>
       </div>}
     </div>
   }

@@ -23,6 +23,28 @@ import { Checkbox } from '../ui/checkbox.tsx'
 import type { PersonaTestState, ProjectLoaderData } from './types.ts'
 import { formatPersonaAuthBadge, LOGIN_URL_PLACEHOLDERS } from './types.ts'
 
+const SCAN_DEPTH_LABELS: Record<CapabilityTier, { short: string; option: string }> = {
+  0: { short: 'Offline Audit', option: 'Offline Audit — no live traffic (imported specs & files only)' },
+  1: { short: 'Safe Audit', option: 'Safe Audit — read-only surface map & passive checks' },
+  2: { short: 'Core Pentest', option: 'Core Pentest — authenticated multi-account checks' },
+  3: { short: 'Active Pentest', option: 'Active Pentest — approval-gated active verification' },
+}
+
+const APPROVAL_POLICY_COPY: Record<ApprovalPolicy, { label: string; desc: string }> = {
+  auto_review: {
+    label: 'Smart Review',
+    desc: 'Auto-approves safe checks and asks before risky actions.',
+  },
+  strict: {
+    label: 'Ask Every Time',
+    desc: 'Pauses for your approval before every state-changing action.',
+  },
+  yolo: {
+    label: 'Autonomous',
+    desc: 'Runs in-scope active checks automatically with full audit logs.',
+  },
+}
+
 interface Props {
   open: boolean
   onClose: () => void
@@ -57,7 +79,7 @@ const MODES: Record<ModeKey, ModePreset> = {
     rps: 3,
     concurrency: 4,
     maxTurns: 40,
-    goal: 'Enumerate public attack surfaces, map API routes and JS bundles, and verify read-only exposures without state-changing requests.',
+    goal: 'Map public endpoints, API routes, and client bundles, and verify read-only exposures without state-changing requests.',
     label: 'Safe Audit',
     badge: 'Read-only',
     desc: 'Surface map & passive checks. Zero writes.',
@@ -70,10 +92,10 @@ const MODES: Record<ModeKey, ModePreset> = {
     rps: 5,
     concurrency: 6,
     maxTurns: 150,
-    goal: 'Verify authentication, cross-user BOLA/IDOR authorization boundaries, and business logic across approved hosts using paired test accounts.',
+    goal: 'Check authentication, cross-account access controls, and business logic across approved hosts using paired test accounts.',
     label: 'Core Pentest',
     badge: 'Recommended',
-    desc: 'Auth, BOLA & logic tests with test accounts.',
+    desc: 'Auth, access-control & logic checks with test accounts.',
     badgeTone: 'accent',
   },
   tier3: {
@@ -83,7 +105,7 @@ const MODES: Record<ModeKey, ModePreset> = {
     rps: 3,
     concurrency: 4,
     maxTurns: 120,
-    goal: 'Validate high-impact state transitions, race conditions, and active proofs with human-in-the-loop approval gates.',
+    goal: 'Verify high-impact state changes, race conditions, and active proofs with human approval before risky requests.',
     label: 'Active Pentest',
     badge: 'Approval-gated',
     desc: 'Full active proofs with human approval.',
@@ -291,7 +313,7 @@ export function ProjectNewRunSheet({
   }
 
   const footerSummary = [
-    capabilityTierMeta[tier].short,
+    SCAN_DEPTH_LABELS[tier].short,
     `$${budgetUsd} cap`,
     ...(tier >= 2 ? [`${selectedPersonaIds.length} ${selectedPersonaIds.length === 1 ? 'test account' : 'test accounts'}`] : []),
   ].join(' · ')
@@ -422,10 +444,10 @@ export function ProjectNewRunSheet({
                     <>
                       <div className="pw-grid-2">
                         <label className="pw-fld">Email
-                          <input className="pw-in" type="email" value={loginEmail} onChange={e => setLoginEmail(e.target.value)} placeholder="guardian-a@example.com" autoComplete="off" />
+                          <input className="pw-in" type="email" value={loginEmail} onChange={e => setLoginEmail(e.target.value)} placeholder="test-user-a@example.com" autoComplete="off" />
                         </label>
                         <label className="pw-fld">Password
-                          <input className="pw-in" type="password" value={personaSecret} onChange={e => setPersonaSecret(e.target.value)} placeholder="Stored in 0600 vault" autoComplete="off" />
+                          <input className="pw-in" type="password" value={personaSecret} onChange={e => setPersonaSecret(e.target.value)} placeholder="Stored privately on your machine" autoComplete="off" />
                         </label>
                       </div>
                       <div className="pw-grid-2">
@@ -479,7 +501,7 @@ export function ProjectNewRunSheet({
           )}
 
           {tier === 3 && (
-            <div className="pw-section-box" role="radiogroup" aria-label="Tier 3 Approval Policy">
+            <div className="pw-section-box" role="radiogroup" aria-label="Approval policy">
               <div className="pw-section-box-h">
                 <span className="pw-section-label">Approval policy</span>
                 <span className="muted" style={{ fontSize: 11.5 }}>Switchable mid-run</span>
@@ -487,6 +509,7 @@ export function ProjectNewRunSheet({
               <div className="pw-policy-grid">
                 {approvalPolicies.map(policy => {
                   const meta = approvalPolicyMeta[policy]
+                  const copy = APPROVAL_POLICY_COPY[policy]
                   const active = approvalPolicy === policy
                   return (
                     <button
@@ -496,14 +519,15 @@ export function ProjectNewRunSheet({
                       aria-checked={active}
                       className={`pw-opt${active ? ' on' : ''}`}
                       onClick={() => setApprovalPolicy(policy)}
+                      title={meta.summary}
                     >
                       <span className="pw-opt-top">
-                        <b>{meta.short}</b>
+                        <b>{copy.label}</b>
                         {policy === 'auto_review' && <span className="pw-tag ok">Default</span>}
                         {policy === 'strict' && <span className="pw-tag solid">Manual</span>}
                         {policy === 'yolo' && <span className="pw-tag warn">Auto</span>}
                       </span>
-                      <small>{meta.optionLabel}</small>
+                      <small>{copy.desc}</small>
                     </button>
                   )
                 })}
@@ -546,21 +570,21 @@ export function ProjectNewRunSheet({
           </div>
 
           <details className="pw-disclosure" style={{ marginTop: 0 }}>
-            <summary>
-              Custom configuration <span className="muted num">({capabilityTierMeta[tier].short} · {maxRps} rps · {concurrency}w · {maxTurns}t)</span>
+            <summary title={capabilityTierMeta[tier].name}>
+              Custom configuration <span className="muted num">({SCAN_DEPTH_LABELS[tier].short} · {maxRps} req/s · {concurrency} workers · {maxTurns} turns)</span>
             </summary>
             <div className="pw-disclosure-body">
-              <label className="pw-fld">Capability tier
+              <label className="pw-fld" title="Maps to internal capability tiers 0–3">Scan depth
                 <select
                   className="pw-select"
                   name="capabilityTier"
                   value={tier}
                   onChange={e => setTier(Number(e.target.value) as CapabilityTier)}
                 >
-                  <option value={0}>{capabilityTierMeta[0].name}</option>
-                  <option value={1}>{capabilityTierMeta[1].name}</option>
-                  <option value={2}>{capabilityTierMeta[2].name}</option>
-                  <option value={3}>{capabilityTierMeta[3].name}</option>
+                  <option value={0}>{SCAN_DEPTH_LABELS[0].option}</option>
+                  <option value={1}>{SCAN_DEPTH_LABELS[1].option}</option>
+                  <option value={2}>{SCAN_DEPTH_LABELS[2].option}</option>
+                  <option value={3}>{SCAN_DEPTH_LABELS[3].option}</option>
                 </select>
               </label>
               <label className="pw-fld">Run goal
@@ -624,7 +648,7 @@ export function ProjectNewRunSheet({
                 <span>Unlimited requests (recommended)</span>
               </label>
               {!unlimitedReqs && (
-                <label className="pw-fld">Max brokered requests
+                <label className="pw-fld" title="Maximum HTTP requests sent through the request guardrail">Max requests
                   <input
                     className="pw-in num"
                     name="budgetRequests"

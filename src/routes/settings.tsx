@@ -12,11 +12,37 @@ import {
   testModel,
   toggleModelProfile,
 } from '../actions.ts'
-import { timeText, useAction } from '../components/common.tsx'
+import { formatHumanTime, useAction } from '../components/common.tsx'
 import { ModelProfileSheet } from '../components/settings/ModelProfileSheet.tsx'
 import '../components/settings/settings.css'
 import { id } from '../domain.ts'
 import type { PublicModelProfile } from '../domain.ts'
+
+function ModelProfilesEmptyIllustration() {
+  return (
+    <svg
+      width="180"
+      height="88"
+      viewBox="0 0 180 88"
+      fill="none"
+      aria-hidden="true"
+      style={{ display: 'block', color: 'var(--sw-fg)' }}
+    >
+      <rect x="6" y="8" width="168" height="72" rx="10" fill="var(--sw-sunk)" stroke="var(--sw-line-2)" strokeWidth="1.2" />
+      <rect x="20" y="29" width="34" height="30" rx="6" fill="var(--sw-panel)" stroke="var(--sw-line-strong)" strokeWidth="1.2" />
+      <path d="M29 41h16M29 48h10" stroke="var(--sw-fg-3)" strokeWidth="1.5" strokeLinecap="round" />
+      <path d="M54 44h22c8 0 10-16 20-16h18" stroke="var(--sw-accent)" strokeWidth="1.6" strokeLinecap="round" />
+      <path d="M54 44h22c8 0 10 16 20 16h18" stroke="var(--sw-line-strong)" strokeWidth="1.4" strokeLinecap="round" strokeDasharray="3 3" />
+      <circle cx="54" cy="44" r="3" fill="var(--sw-panel)" stroke="currentColor" strokeWidth="1.4" />
+      <rect x="114" y="17" width="46" height="22" rx="5" fill="var(--sw-panel)" stroke="var(--sw-accent)" strokeWidth="1.4" />
+      <circle cx="124" cy="28" r="3" fill="var(--sw-accent)" />
+      <path d="M132 28h18" stroke="var(--sw-fg-2)" strokeWidth="1.5" strokeLinecap="round" />
+      <rect x="114" y="49" width="46" height="22" rx="5" fill="var(--sw-panel)" stroke="var(--sw-line-strong)" strokeWidth="1.2" />
+      <circle cx="124" cy="60" r="3" fill="var(--sw-panel)" stroke="var(--sw-fg-3)" strokeWidth="1.4" />
+      <path d="M132 60h18" stroke="var(--sw-fg-3)" strokeWidth="1.5" strokeLinecap="round" />
+    </svg>
+  )
+}
 
 export const Route = createFileRoute('/settings')({
   validateSearch: (search): { runId?: string } => ({ runId: id.safeParse(search.runId).data }),
@@ -56,12 +82,12 @@ function githubConnectionSummary(status: GithubStatusData): { label: string; ton
     }
   }
   const kind = status.tokenKind === 'fine_grained'
-    ? 'Fine-grained PAT'
+    ? 'Read-only token'
     : status.tokenKind === 'classic'
-      ? 'Classic PAT'
-      : 'GitHub PAT'
+      ? 'Classic token'
+      : 'GitHub token'
   return {
-    label: status.source === 'fixture' ? `${kind} · fixture` : `${kind} saved`,
+    label: status.source === 'fixture' ? `${kind} · local preset` : `${kind} saved`,
     tone: 'ok',
   }
 }
@@ -148,7 +174,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
     if (startingFlow || savingPat || disconnecting) return
     const trimmedClientId = clientIdInput.trim()
     if (!status.githubDeviceFlowConfigured && trimmedClientId.length < 6) {
-      setError('Enter your GitHub App Client ID (or set GUARDIAN_GITHUB_CLIENT_ID) to start sign-in.')
+      setError('Enter your GitHub App Client ID to start sign-in.')
       return
     }
     setStartingFlow(true)
@@ -192,7 +218,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
       setPatInput('')
       setReconnecting(false)
       setStatus(res.status)
-      setNotice(`Fine-Grained PAT saved to local 0600 vault. Found ${res.repos.length} accessible ${res.repos.length === 1 ? 'repository' : 'repositories'}.`)
+      setNotice(`Read-only GitHub token saved privately on your machine. Found ${res.repos.length} accessible ${res.repos.length === 1 ? 'repository' : 'repositories'}.`)
       await router.invalidate()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not save GitHub token.')
@@ -211,8 +237,8 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
       setStatus(res.status)
       setReconnecting(false)
       setNotice(res.status.configured
-        ? 'Removed saved vault credential (fallback fixture PAT is still present).'
-        : 'Disconnected GitHub from local 0600 vault.')
+        ? 'Removed your saved GitHub credential (a local fallback token is still active).'
+        : 'Disconnected GitHub and removed the saved credential from this machine.')
       await router.invalidate()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not remove GitHub credential.')
@@ -228,7 +254,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
     <section className="sw-band" aria-labelledby="github-integration-heading">
       <div className="sw-sec-head">
         <div>
-          <p className="sw-eyebrow">Grey-box source &amp; CVE sync</p>
+          <p className="sw-eyebrow">Source code &amp; dependency sync</p>
           <h2 id="github-integration-heading" className="sw-sec-title">GitHub integration</h2>
         </div>
         <span className={`sw-tag ${badge.tone}`}>
@@ -241,14 +267,17 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
         <div className="sw-sheet-row">
           <div className="sw-sheet-row-main">
             <span className="sw-sheet-row-title">
-              {status.configured ? 'Read-only GitHub connection' : 'Sign in with GitHub (Device Flow)'}
+              {status.configured ? 'Read-only GitHub connection' : 'Sign in with GitHub'}
             </span>
-            <p className="sw-sheet-row-desc">
+            <p
+              className="sw-sheet-row-desc"
+              title="Credentials are stored locally in an owner-only (0600) credential file"
+            >
               {status.configured && status.authKind === 'github_app_device'
-                ? 'Authorized via read-only GitHub App (Contents: Read-only, Metadata: Read-only). Expiring tokens refresh automatically in your local 0600 vault.'
+                ? 'Authorized with read-only GitHub App access (code and metadata only). Tokens refresh automatically and stay stored privately on your machine.'
                 : status.configured
-                  ? 'Connected using a local 0600 GitHub personal access token for read-only repository syncing.'
-                  : 'Connect a read-only GitHub App using OAuth Device Flow with automatic silent token refresh in your local 0600 vault.'}
+                  ? 'Connected using a read-only GitHub access token stored privately on your machine.'
+                  : 'Connect a read-only GitHub App with one-time code sign-in and automatic token refresh, stored privately on your machine.'}
             </p>
           </div>
           <div className="sw-sheet-row-act">
@@ -296,7 +325,12 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
               <>
                 <div className="sw-pair-top">
                   <strong>GitHub App Client ID</strong>
-                  <span className="sw-muted">Or set <code>GUARDIAN_GITHUB_CLIENT_ID</code> for 1-click sign-in</span>
+                  <span
+                    className="sw-muted"
+                    title="Server administrators can set GUARDIAN_GITHUB_CLIENT_ID in the environment for one-click sign-in"
+                  >
+                    Needed once for one-click GitHub sign-in
+                  </span>
                 </div>
                 <div className="sw-pair-row">
                   <input
@@ -390,12 +424,15 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
           <div className="sw-sheet-row" style={{ flexDirection: 'column', gap: 8 }}>
             <details style={{ width: '100%' }}>
               <summary style={{ cursor: 'pointer', fontSize: '12.5px', color: 'var(--sw-fg-2)', fontWeight: 500 }}>
-                Or connect with a Fine-Grained PAT
+                Or connect with a read-only GitHub token
               </summary>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
-                  <span className="sw-sheet-row-desc">
-                    Scope a Fine-Grained PAT to <strong>Contents: Read-only</strong> and paste it below (stored in local <code>0600</code> vault).
+                  <span
+                    className="sw-sheet-row-desc"
+                    title="Saved locally in an owner-only (0600) credential file"
+                  >
+                    Scope a read-only token to <strong>Contents: Read-only</strong> and paste it below (stored privately on your machine).
                   </span>
                   <a
                     className="sw-btn sm"
@@ -403,7 +440,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
                     target="_blank"
                     rel="noopener noreferrer"
                   >
-                    Create Fine-Grained PAT ↗
+                    Create read-only token ↗
                   </a>
                 </div>
                 <div className="sw-pair-row">
@@ -415,7 +452,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
                     placeholder="github_pat_…"
                     autoComplete="off"
                     disabled={savingPat || disconnecting}
-                    aria-label="GitHub Personal Access Token"
+                    aria-label="Read-only GitHub access token"
                   />
                   <button
                     type="button"
@@ -423,7 +460,7 @@ function GithubConnectionBand({ initialStatus }: { initialStatus: GithubStatusDa
                     disabled={savingPat || disconnecting || patInput.trim().length < 10}
                     onClick={() => void handleSavePat()}
                   >
-                    {savingPat ? 'Saving…' : 'Save PAT'}
+                    {savingPat ? 'Saving…' : 'Save token'}
                   </button>
                 </div>
               </div>
@@ -566,12 +603,14 @@ function SettingsWorkbenchPage() {
             {pool.label}
           </span>
           <span className="sw-hdr-sp" />
-          <div className="sw-hdr-actions">
-            <button type="button" className="sw-btn primary" onClick={openCreate}>
-              <span aria-hidden="true">+</span>
-              Add model profile
-            </button>
-          </div>
+          {profiles.length > 0 && (
+            <div className="sw-hdr-actions">
+              <button type="button" className="sw-btn primary" onClick={openCreate}>
+                <span aria-hidden="true">+</span>
+                Add model profile
+              </button>
+            </div>
+          )}
         </div>
       </header>
 
@@ -591,23 +630,36 @@ function SettingsWorkbenchPage() {
         <section className="sw-sec" aria-labelledby="model-pool-heading">
           <div className="sw-sec-head">
             <div>
-              <p className="sw-eyebrow">Multi-profile failover pool</p>
+              <p className="sw-eyebrow">Automatic failover pool</p>
               <h2 id="model-pool-heading" className="sw-sec-title">Model profiles</h2>
             </div>
-            <span className="sw-sec-meta sw-num">
+            <span
+              className="sw-sec-meta sw-num"
+              title="Keys are stored locally in owner-only (0600) credential files"
+            >
               {profiles.length > 0
                 ? `${enabledCount} of ${profiles.length} enabled · highest priority tried first`
-                : '0 profiles configured · 0600 local credentials'}
+                : '0 profiles configured · keys stored privately on your machine'}
             </span>
           </div>
 
           {profiles.length === 0 ? (
-            <div className="sw-empty-sheet">
+            <div
+              className="sw-empty-sheet"
+              style={{
+                flexDirection: 'column',
+                justifyContent: 'center',
+                textAlign: 'center',
+                padding: '40px 24px',
+                gap: 14,
+              }}
+            >
+              <ModelProfilesEmptyIllustration />
               <div>
                 <h3>No model profiles configured</h3>
                 <p>
-                  Connect OpenRouter or any OpenAI Responses / Anthropic Messages provider to run autonomous
-                  investigations, threat modeling, and proof verification.
+                  Connect OpenRouter or any OpenAI / Anthropic compatible provider so Kovo Hunter can map attack surfaces,
+                  investigate security issues, and verify findings.
                 </p>
               </div>
               <button type="button" className="sw-btn primary" onClick={openCreate}>
@@ -630,6 +682,7 @@ function SettingsWorkbenchPage() {
                   {profiles.map(profile => {
                     const status = healthLabel(profile)
                     const isRowTesting = testingId === profile.id && poolAction.pending
+                    const updated = formatHumanTime(profile.updatedAt)
                     return (
                       <tr key={profile.id} data-enabled={profile.enabled}>
                         <td>
@@ -648,8 +701,12 @@ function SettingsWorkbenchPage() {
                               <span className="sw-mono" title={profile.endpoint}>{shortEndpointHost(profile.endpoint)}</span>
                               <span aria-hidden="true">·</span>
                               <span>Role: {profile.roleAffinity ?? 'any'}</span>
-                              <span aria-hidden="true">·</span>
-                              <span className="sw-num">Updated {timeText(profile.updatedAt)}</span>
+                              {updated.label && (
+                                <>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="sw-num" title={updated.full}>Updated {updated.label}</span>
+                                </>
+                              )}
                             </div>
                             {profile.lastError && (
                               <span className="sw-prof-err" title={profile.lastError}>

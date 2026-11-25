@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { addProjectAsset, updateProjectAssetScope } from '../../actions.ts'
 import { AccessPolicyImport } from '../access-policy-import.tsx'
-import { FormError, useAction } from '../common.tsx'
+import { formatHumanTime, FormError, useAction } from '../common.tsx'
 import { DnsInventoryImport } from '../dns-inventory-import.tsx'
 import { Checkbox } from '../ui/checkbox.tsx'
 import type { ProjectLoaderData } from './types.ts'
@@ -9,6 +9,15 @@ import { safeHost } from './types.ts'
 
 interface Props {
   data: ProjectLoaderData
+}
+
+function safeHostname(raw: string | undefined): string {
+  if (!raw) return ''
+  try {
+    return new URL(raw).hostname
+  } catch {
+    return raw.replace(/^https?:\/\//i, '').split(/[/:?#]/)[0] ?? ''
+  }
 }
 
 export function ProjectInventoryTab({ data }: Props) {
@@ -28,7 +37,7 @@ export function ProjectInventoryTab({ data }: Props) {
     <div className="pw-sec-head">
       <div>
         <h2>Hosts &amp; Assets <span className="muted num">({assets.length})</span></h2>
-        <p>Seed hosts, DNS exports, and passive CT-discovered subdomains. Managed third-party SaaS CNAMEs stay unchecked unless explicitly approved.</p>
+        <p>Starting hosts, DNS exports, and passively discovered subdomains. Third-party hosted services stay unchecked unless explicitly approved.</p>
       </div>
       <div className="pw-sec-actions">
         <button type="button" className="pw-btn primary" onClick={() => togglePanel('candidate')} aria-expanded={panel === 'candidate'}>
@@ -44,7 +53,7 @@ export function ProjectInventoryTab({ data }: Props) {
     {panel === 'dns' && <div style={{ marginBottom: 14 }}>
       <DnsInventoryImport
         projectId={project.id}
-        defaultZone={new URL(project.seeds[0]).hostname}
+        defaultZone={safeHostname(project.seeds[0])}
         cancel={() => setPanel(undefined)}
         imported={({ added, existing }) => {
           setPanel(undefined)
@@ -60,7 +69,7 @@ export function ProjectInventoryTab({ data }: Props) {
         cancel={() => setPanel(undefined)}
         imported={({ origin, cases }) => {
           setPanel(undefined)
-          setNotice(`Imported ${cases} access ${cases === 1 ? 'case' : 'cases'} for ${new URL(origin).hostname}.`)
+          setNotice(`Imported ${cases} access ${cases === 1 ? 'case' : 'cases'} for ${safeHostname(origin) || origin}.`)
         }}
       />
     </div>}
@@ -133,8 +142,12 @@ export function ProjectInventoryTab({ data }: Props) {
             />
             <span>Include subdomains (<code>*.domain</code>)</span>
           </label>
-          <span className="muted" style={{ fontSize: 11.5 }}>
-            Enables passive CT-log + live DNS discovery in Phase 0 for first-party subdomains. Managed third-party SaaS CNAMEs stay unchecked and require explicit approval.
+          <span
+            className="muted"
+            style={{ fontSize: 11.5 }}
+            title="Uses passive Certificate Transparency logs and live DNS during initial discovery"
+          >
+            Automatically discovers first-party subdomains before scanning. Third-party hosted services stay unchecked until you explicitly approve them.
           </span>
         </div>}
         <details className="pw-disclosure" style={{ marginTop: 4 }}>
@@ -163,6 +176,9 @@ export function ProjectInventoryTab({ data }: Props) {
         const externalCname = asset.dnsSource?.externalAliases?.[0]
         const isDefaultApproved = project.defaultScope.includes(asset.origin)
         const hostLabel = safeHost(asset.origin)
+        const policyRecorded = asset.accessPolicy?.recordedAt
+          ? formatHumanTime(asset.accessPolicy.recordedAt)
+          : null
         return <div key={asset.id} className="pw-row">
           <div className="pw-row-main">
             <div className="pw-row-title">
@@ -180,6 +196,12 @@ export function ProjectInventoryTab({ data }: Props) {
             <div className="pw-row-sub">
               {asset.source}
               {asset.dnsSource ? ` · ${asset.dnsSource.zone}` : ''}
+              {policyRecorded?.label && (
+                <>
+                  {' · '}
+                  <span className="num" title={policyRecorded.full}>Policy recorded {policyRecorded.label}</span>
+                </>
+              )}
             </div>
           </div>
           <div className="pw-row-right">
@@ -187,7 +209,7 @@ export function ProjectInventoryTab({ data }: Props) {
               <label
                 className="pw-chk"
                 style={{ fontSize: 12 }}
-                title="Auto-admit live first-party subdomains discovered via passive CT logs (excludes third-party SaaS CNAMEs)"
+                title="Automatically include live first-party subdomains discovered passively (excludes third-party hosted services)"
               >
                 <Checkbox
                   checked={Boolean(asset.includeSubdomains)}
@@ -200,7 +222,7 @@ export function ProjectInventoryTab({ data }: Props) {
                       projectId: project.id,
                       assetId: asset.id,
                       includeSubdomains: next,
-                    } }), () => setNotice(`${next ? 'Enabled' : 'Disabled'} *.domain passive discovery for ${hostLabel}.`))
+                    } }), () => setNotice(`${next ? 'Enabled' : 'Disabled'} subdomain discovery for ${hostLabel}.`))
                   }}
                 />
                 <code>*.domain</code>
