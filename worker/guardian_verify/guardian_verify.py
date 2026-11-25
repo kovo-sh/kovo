@@ -111,45 +111,52 @@ def _rpc(op: str, args: dict[str, Any], timeout: float = 60.0) -> Any:
     return envelope.get("result")
 
 
-@dataclass
-class Exchange:
-    raw: dict[str, Any]
+def _parse_json_safe(body: str) -> Any:
+    if not body or not body.strip():
+        return None
+    try:
+        return json.loads(body)
+    except (ValueError, TypeError):
+        return None
+
+
+class Exchange(_AttrDict):
+    """HTTP exchange result supporting attribute & dict access with auto-parsed top-level `.json`."""
+
+    def __init__(self, raw: Optional[dict[str, Any]] = None) -> None:
+        base = dict(raw or {})
+        body = str(base.get("body", "") or "")
+        parsed = base["json"] if "json" in base and base["json"] is not None else _parse_json_safe(body)
+        ex_id = str(base.get("exchangeId", base.get("exchange_id", "")) or "")
+        base.update({
+            "exchangeId": ex_id, "exchange_id": ex_id,
+            "status": int(base.get("status", 0) or 0),
+            "headers": dict(base.get("headers") or {}),
+            "body": body, "text": body, "json": parsed, "data": parsed,
+        })
+        super().__init__(base)
 
     @property
-    def exchange_id(self) -> str: return str(self.raw.get("exchangeId", ""))
+    def raw(self) -> dict[str, Any]: return dict(self)
     @property
-    def exchangeId(self) -> str: return self.exchange_id  # noqa: N802
-    @property
-    def status(self) -> int: return int(self.raw.get("status", 0))
-    @property
-    def headers(self) -> dict[str, str]: return dict(self.raw.get("headers") or {})
-    @property
-    def body(self) -> str: return str(self.raw.get("body", ""))
-    @property
-    def duration_ms(self) -> float: return float(self.raw.get("durationMs", 0))
+    def duration_ms(self) -> float: return float(self.get("durationMs", 0))
     @property
     def persona_handle(self) -> Optional[str]:
-        v = self.raw.get("personaHandle")
+        v = self.get("personaHandle")
         return str(v) if v is not None else None
     @property
     def consumed_capability_id(self) -> Optional[str]:
-        v = self.raw.get("consumedCapabilityId")
+        v = self.get("consumedCapabilityId")
         return str(v) if v is not None else None
     @property
-    def derived_from_capability_ids(self) -> list[str]: return list(self.raw.get("derivedFromCapabilityIds") or [])
+    def derived_from_capability_ids(self) -> list[str]: return list(self.get("derivedFromCapabilityIds") or [])
     @property
-    def executed_sentinels(self) -> list[str]: return list(self.raw.get("executedSentinels") or [])
-    def json(self) -> Any: return json.loads(self.body)
-    def __await__(self):  # type: ignore[no-untyped-def]
-        if False:
-            yield None
-        return self
+    def executed_sentinels(self) -> list[str]: return list(self.get("executedSentinels") or [])
 
 
-@dataclass
 class BrowserExchange(Exchange):
     @property
-    def html(self) -> str: return str(self.raw.get("html", ""))
+    def html(self) -> str: return str(self.get("html", ""))
 
 
 @dataclass
@@ -302,22 +309,16 @@ class VerifyContext:
         merged: dict[str, Any] = {**(target if isinstance(target, dict) else {}), **options}
         body, headers = _normalize_body_and_headers(merged.get("body"), merged.get("headers"))
         args: dict[str, Any] = {"path": path, "method": str(merged.get("method", "GET")).upper()}
-        if origin:
-            args["origin"] = origin
-        if headers:
-            args["headers"] = headers
-        if body is not None:
-            args["body"] = body
+        if origin: args["origin"] = origin
+        if headers: args["headers"] = headers
+        if body is not None: args["body"] = body
         persona = merged.get("as_persona", merged.get("as", merged.get("persona")))
-        if persona:
-            args["persona"] = persona
-        if merged.get("session"):
-            args["session"] = merged["session"]
-        if merged.get("role"):
-            args["sessionGroupRole"] = merged["role"]
+        if persona: args["persona"] = persona
+        if merged.get("session"): args["session"] = merged["session"]
+        role = merged.get("role", merged.get("arm"))
+        if role: args["sessionGroupRole"] = role
         fr = merged.get("follow_redirects", merged.get("followRedirects"))
-        if fr is not None:
-            args["followRedirects"] = bool(fr)
+        if fr is not None: args["followRedirects"] = bool(fr)
         cap = merged.get("capability")
         if cap is not None:
             if isinstance(cap, dict):
@@ -423,7 +424,7 @@ class VerifyContext:
         cids = correlation_ids or _pick(m, "correlationIds", "correlation_ids")
         if cids: args["correlationIds"] = list(cids)
         res = dict(_rpc("async.awaitResult", args, max((float(t_ms) / 1000.0 if t_ms else 30.0) + 10.0, 15.0)) or {})
-        if isinstance(res.get("exchange"), dict): res["exchange"] = _AttrDict(res["exchange"])
+        if isinstance(res.get("exchange"), dict): res["exchange"] = Exchange(res["exchange"])
         return _AttrDict(res)
 
     def prove_composite(self, receipt: dict[str, Any]) -> dict[str, Any]:

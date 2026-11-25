@@ -243,22 +243,80 @@ interface ParsedCapabilityArg {
 }
 
 const DERIVED_SECRET_KINDS = new Set<DerivedSecretKind>([
-  'bearer_token',
-  'api_token',
-  'cookie',
-  'signed_url',
-  'oidc_assertion',
-  'signing_salt',
-  'hmac_key',
-  'jwt',
-  'header_secret',
-  'generic_secret',
+  'bearer_token', 'api_token', 'cookie', 'signed_url', 'oidc_assertion',
+  'signing_salt', 'hmac_key', 'jwt', 'header_secret', 'generic_secret',
 ])
 const INJECT_CAPABILITY_TARGETS = new Set<InjectCapabilityTarget>(['bearer', 'header', 'cookie', 'url'])
 const BROKER_FORBIDDEN_CALLER_HEADER_RE = /^(?:authorization|proxy-authorization|cookie)$/i
 const INLINE_CAP_RE = /(?<!\[redacted:)(?<![A-Za-z0-9_])cap(?::|%3[aA])hop_[A-Za-z0-9._-]+(?::|%3[aA])[A-Za-z0-9._-]+/g
 const EXACT_BEARER_CAP_RE = /^(?:Bearer\s+)?(cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+)\s*$/i
 const EXACT_INLINE_CAP_RE = /^cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$/
+const STATIC_PATH_SEG_RE = /^(?:api|rest|v\d+|read|public|admin|me|settings|login|logout|auth|token|refresh|verify|mfa|2fa|otp|session)$/i
+const ENTITY_PATH_SEG_RE = /^\d+$|(?:^|[-_.])\d|^[0-9a-f]{8,}$|^[a-z]{2,10}_[A-Za-z0-9_-]{4,}$|^[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*$/i
+const BODY_ENTITY_KEY_RE = /^(?:id|entity_?id|[a-z]+_?id)$/i
+const BODY_SCOPE_KEY_RE = /^(?:tenant|org|organization|workspace|project|user|actor|session|client)_?id$/i
+
+function extractRequestEntityIds(args: Record<string, unknown>, pathAndQuery: string, rawBody?: string): string[] {
+  const ids = new Set<string>()
+  if (typeof args.entityId === 'string' && args.entityId.trim()) ids.add(args.entityId.trim().slice(0, 256))
+  for (const rawSeg of (pathAndQuery.split(/[?#]/, 1)[0] ?? '').split('/')) {
+    if (!rawSeg) continue
+    let seg = rawSeg; try { seg = decodeURIComponent(rawSeg) } catch { /* keep raw */ }
+    if (!STATIC_PATH_SEG_RE.test(seg) && ENTITY_PATH_SEG_RE.test(seg) && (/^\d+$/.test(seg) || seg.length >= 4 || /^[a-z]\d{1,3}$/i.test(seg))) ids.add(seg.slice(0, 256))
+  }
+  if (ids.size === 0 && rawBody && rawBody.trim().startsWith('{')) {
+    try {
+      const parsed = JSON.parse(rawBody) as Record<string, unknown>
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed)) {
+          if (!BODY_ENTITY_KEY_RE.test(k) || BODY_SCOPE_KEY_RE.test(k)) continue
+          if (typeof v === 'string' && v.trim()) ids.add(v.trim().slice(0, 256))
+          else if (typeof v === 'number' && Number.isFinite(v)) ids.add(String(v))
+        }
+      }
+    } catch { /* non-JSON body */ }
+  }
+  return [...ids]
+}
+
+function resolveSealJsonPath(root: unknown, rawPath: string): { found: boolean; value?: unknown } {
+  const cleaned = rawPath.trim().replace(/^\$/, '')
+  if (!cleaned) return { found: root !== undefined, value: root }
+  const tokens: Array<string | number> = []
+  const re = /\.?([^.[\]]+)|\[(\d+|'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")\]/g
+  let m: RegExpExecArray | null, consumed = 0
+  while ((m = re.exec(cleaned)) !== null) {
+    if (m.index !== consumed && cleaned.slice(consumed, m.index).replace(/^\.+/, '') !== '') return evaluateJsonPath(root, rawPath)
+    consumed = re.lastIndex
+    if (m[1] !== undefined) tokens.push(/^\d+$/.test(m[1]) ? Number(m[1]) : m[1])
+    else if (m[2] !== undefined) tokens.push((m[2].startsWith("'") || m[2].startsWith('"')) ? m[2].slice(1, -1).replace(/\\(.)/g, '$1') : Number(m[2]))
+  }
+  if (consumed < cleaned.length) return evaluateJsonPath(root, rawPath)
+  let cur: unknown = root
+  for (const tok of tokens) {
+    if (Array.isArray(cur)) { if (typeof tok !== 'number' || tok < 0 || tok >= cur.length) return { found: false }; cur = cur[tok] }
+    else if (cur && typeof cur === 'object') { const rec = cur as Record<string, unknown>, k = String(tok); if (!Object.prototype.hasOwnProperty.call(rec, k)) return { found: false }; cur = rec[k] }
+    else return { found: false }
+    if (cur === undefined) return { found: false }
+  }
+  return { found: true, value: cur }
+}
+
+function describeJsonTopKeys(parsed: unknown): string {
+  if (Array.isArray(parsed)) {
+    const first = parsed[0]
+    if (first && typeof first === 'object' && !Array.isArray(first)) {
+      const keys = Object.keys(first as Record<string, unknown>).slice(0, 20)
+      return `top-level array length=${parsed.length}, [0] keys: ${keys.join(', ') || 'none'}`
+    }
+    return `top-level array length=${parsed.length}`
+  }
+  if (parsed && typeof parsed === 'object') {
+    const keys = Object.keys(parsed as Record<string, unknown>).slice(0, 20)
+    return keys.length ? `top-level keys: ${keys.join(', ')}` : 'top-level object is empty'
+  }
+  return `top-level type: ${parsed === null ? 'null' : typeof parsed}`
+}
 
 function normalizeDerivedSecretKind(raw: unknown): DerivedSecretKind | undefined {
   if (raw === undefined || raw === null) return undefined
@@ -304,6 +362,7 @@ export class VerifyRpcServer {
   private readonly jwtDerivations = new Map<string, HostCryptoAttestation>()
   private readonly asyncPollRecords = new Map<string, HostAsyncPollRecord>()
   private readonly mutatedSessions = new Set<string>()
+  private readonly mutatedSessionEntities = new Set<string>()
   private lastHostTsMs = 0
   private server: ReturnType<typeof createServer> | null = null
   private hostDirValue = ''
@@ -578,7 +637,7 @@ export class VerifyRpcServer {
     )
     const persona = rawPersona && !isAnonSentinel ? rawPersona : undefined
     const session = typeof args.session === 'string' ? args.session : undefined
-    const role = typeof args.sessionGroupRole === 'string' ? args.sessionGroupRole : undefined
+    const role = typeof args.sessionGroupRole === 'string' ? args.sessionGroupRole : (typeof args.arm === 'string' ? args.arm : undefined)
     if (role !== undefined && !['setup', 'control', 'probe', 'cleanup'].includes(role)) throw new Error('Invalid session group role.')
     const brokerRequest: BrokerHttpRequest = {
       origin,
@@ -1075,79 +1134,58 @@ export class VerifyRpcServer {
     })
   }
 
+  private computeControlCleanSession(sessionKey: string, args: Record<string, unknown>, req: BrokerHttpRequest, role?: string | null): { isControlOrAblation: boolean; cleanSession: boolean; entityIds: string[] } {
+    const isControlOrAblation = args.replayAttempt === 'ablation_control' || role === 'control'
+    const entityIds = extractRequestEntityIds(args, req.pathAndQuery, req.body)
+    if (!isControlOrAblation) return { isControlOrAblation, cleanSession: true, entityIds }
+    const cleanSession = entityIds.length > 0
+      ? entityIds.every(eid => !this.mutatedSessionEntities.has(`${sessionKey}::${eid}`))
+      : !this.mutatedSessions.has(sessionKey)
+    return { isControlOrAblation, cleanSession, entityIds }
+  }
+
+  private recordSessionMutation(sessionKey: string, method: string, entityIds: readonly string[], isControlOrAblation: boolean, status: number): void {
+    if (isReadMethod(method) || (isControlOrAblation && status >= 400)) return
+    this.mutatedSessions.add(sessionKey)
+    for (const eid of entityIds) this.mutatedSessionEntities.add(`${sessionKey}::${eid}`)
+  }
+
   private async handleHttp(args: Record<string, unknown>, nonce: string, proto: 'http' | 'http2'): Promise<unknown> {
     const parsed = this.parseHttpArgs(args)
     const capArg = this.parseCapabilityArg(args)
     const applied = this.applyCapabilityInjection(parsed.brokerRequest, parsed.requestMeta, capArg)
     const consumedIds = applied.attestations.map(a => a.consumedCapabilityId)
-    const cryptoAttestations = this.detectCryptoAttestationsForRequest(
-      applied.brokerRequest,
-      consumedIds,
-      applied.injectedHeaders,
-    )
+    const cryptoAttestations = this.detectCryptoAttestationsForRequest(applied.brokerRequest, consumedIds, applied.injectedHeaders)
     const requestMeta: VerifyTranscriptRequest = {
       ...applied.requestMeta,
       ...(cryptoAttestations.length > 0 ? { derivedFromCapabilityId: cryptoAttestations[0]!.derivedFromCapabilityId } : {}),
       nonce,
     }
     const sessionKey = applied.brokerRequest.session ?? '__default__'
-    const isAblation = args.replayAttempt === 'ablation_control'
-    // A VerifyRpcServer session is a fresh attempt with a fresh nonce; ablation controls must use
-    // an unmutated session handle so they genuinely test Hop j without Hop i's state mutation.
-    const cleanSession = isAblation ? !this.mutatedSessions.has(sessionKey) : true
+    const { isControlOrAblation, cleanSession, entityIds } = this.computeControlCleanSession(sessionKey, args, applied.brokerRequest, requestMeta.sessionRole)
     const started = this.nextHostTimestampMs()
     try {
-      const result = await this.options.broker.executeHttp(
-        applied.brokerRequest,
-        applied.grant,
-        AbortSignal.timeout(this.options.callTimeoutMs ?? 30_000),
-      )
-      if (!isReadMethod(applied.brokerRequest.method)) {
-        this.mutatedSessions.add(sessionKey)
-      }
+      const result = await this.options.broker.executeHttp(applied.brokerRequest, applied.grant, AbortSignal.timeout(this.options.callTimeoutMs ?? 30_000))
+      this.recordSessionMutation(sessionKey, applied.brokerRequest.method, entityIds, isControlOrAblation, result.status)
       const body = this.scrub(result.body)
       const record = this.transcript.record({
-        op: proto,
-        startedAt: started,
-        durationMs: result.durationMs,
-        request: requestMeta,
+        op: proto, startedAt: started, durationMs: result.durationMs, request: requestMeta, body,
         response: {
-          status: result.status,
-          headers: this.scrubRecord(result.respHeaders),
-          bodyBytes: result.bodyBytes,
-          bodySha256: result.bodySha256,
-          mediaType: result.mediaType,
-          redirectOrigins: result.redirectOrigins,
+          status: result.status, headers: this.scrubRecord(result.respHeaders), bodyBytes: result.bodyBytes,
+          bodySha256: result.bodySha256, mediaType: result.mediaType, redirectOrigins: result.redirectOrigins,
           ...(result.finalPathAndQuery ? { finalPathAndQuery: this.scrub(result.finalPathAndQuery) } : {}),
         },
-        body,
       })
-      this.recordRequestProvenance(
-        record.exchangeId,
-        started,
-        args,
-        applied.brokerRequest,
-        requestMeta,
-        { body: result.body, respHeaders: result.respHeaders },
-        applied.attestations,
-        cryptoAttestations,
-        cleanSession,
-      )
+      this.recordRequestProvenance(record.exchangeId, started, args, applied.brokerRequest, requestMeta, { body: result.body, respHeaders: result.respHeaders }, applied.attestations, cryptoAttestations, cleanSession)
       return this.exchangeView(record, { ...result, body }, {
         consumedCapabilityId: applied.attestation?.consumedCapabilityId ?? null,
         consumedCapabilities: consumedIds,
         derivedFromCapabilityIds: [...new Set(cryptoAttestations.map(a => a.derivedFromCapabilityId))],
       })
     } catch (error) {
-      const record = this.transcript.record({
-        op: proto,
-        startedAt: started,
-        durationMs: Date.now() - started,
-        request: requestMeta,
-        error: this.scrub(error instanceof Error ? error.message : 'HTTP exchange failed.'),
-        errorCode: /scope|denied|approval|forbidden|outside|header/i.test(error instanceof Error ? error.message : '') ? 'denied' : 'failed',
-      })
-      throw new Error(`${record.exchangeId}: ${this.scrub(error instanceof Error ? error.message : 'HTTP exchange failed.')}`)
+      const msg = this.scrub(error instanceof Error ? error.message : 'HTTP exchange failed.')
+      const record = this.transcript.record({ op: proto, startedAt: started, durationMs: Date.now() - started, request: requestMeta, error: msg, errorCode: /scope|denied|approval|forbidden|outside|header/i.test(msg) ? 'denied' : 'failed' })
+      throw new Error(`${record.exchangeId}: ${msg}`)
     }
   }
 
@@ -1574,9 +1612,9 @@ export class VerifyRpcServer {
     if (typeof args.jsonPath === 'string' && args.jsonPath.trim()) {
       let parsed: unknown
       try { parsed = JSON.parse(rawBody) } catch { throw new Error(`Exchange "${exchangeId}" response body is not valid JSON for jsonPath extraction.`) }
-      const evalRes = evaluateJsonPath(parsed, args.jsonPath.trim())
+      const evalRes = resolveSealJsonPath(parsed, args.jsonPath.trim())
       if (!evalRes.found || evalRes.value === undefined || evalRes.value === null) {
-        throw new Error(`jsonPath "${args.jsonPath}" did not match any value in exchange "${exchangeId}".`)
+        throw new Error(`jsonPath "${args.jsonPath}" did not match exchange "${exchangeId}" (${this.scrub(describeJsonTopKeys(parsed))}).`)
       }
       const extracted = typeof evalRes.value === 'string' ? evalRes.value : String(evalRes.value)
       if (!extracted) throw new Error(`jsonPath "${args.jsonPath}" resolved to an empty value.`)
@@ -1901,7 +1939,8 @@ export class VerifyRpcServer {
 
     const parsedPoll = this.parseHttpArgs(pollReqArgs)
     const capArg = this.parseCapabilityArg(pollReqArgs)
-    let lastBrokerResult: { result: BrokerExchangeResult; startedAt: number; applied: ReturnType<VerifyRpcServer['applyCapabilityInjection']>; cryptoAtts: HostCryptoAttestation[]; cleanSession: boolean } | null = null
+    type LastPoll = { result: BrokerExchangeResult; startedAt: number; applied: ReturnType<VerifyRpcServer['applyCapabilityInjection']>; cryptoAtts: HostCryptoAttestation[]; cleanSession: boolean }
+    let lastBrokerResult: LastPoll | null = null
 
     const convergence = await awaitAsyncConvergence({
       ...(profile ? { profile } : {}),
@@ -1918,10 +1957,10 @@ export class VerifyRpcServer {
           applied.injectedHeaders,
         )
         const sessionKey = applied.brokerRequest.session ?? '__default__'
-        const cleanSession = pollReqArgs.replayAttempt === 'ablation_control' ? !this.mutatedSessions.has(sessionKey) : true
+        const { isControlOrAblation, cleanSession, entityIds } = this.computeControlCleanSession(sessionKey, pollReqArgs, applied.brokerRequest, applied.requestMeta.sessionRole)
         const startedAt = this.nextHostTimestampMs()
         const result = await this.options.broker.executeHttp(applied.brokerRequest, applied.grant, signal)
-        if (!isReadMethod(applied.brokerRequest.method)) this.mutatedSessions.add(sessionKey)
+        this.recordSessionMutation(sessionKey, applied.brokerRequest.method, entityIds, isControlOrAblation, result.status)
         lastBrokerResult = { result, startedAt, applied, cryptoAtts, cleanSession }
         return { status: result.status, body: result.body, headers: result.respHeaders, observedAtMs: this.nextHostTimestampMs() }
       },
@@ -1932,13 +1971,7 @@ export class VerifyRpcServer {
     let finalRecord: VerifyTranscriptRecord | null = null
     let finalExchangeView: unknown = null
     if (lastBrokerResult) {
-      const last = lastBrokerResult as {
-        result: BrokerExchangeResult
-        startedAt: number
-        applied: ReturnType<VerifyRpcServer['applyCapabilityInjection']>
-        cryptoAtts: HostCryptoAttestation[]
-        cleanSession: boolean
-      }
+      const last = lastBrokerResult as LastPoll
       const reqMeta: VerifyTranscriptRequest = {
         ...last.applied.requestMeta,
         ...(last.cryptoAtts.length > 0 ? { derivedFromCapabilityId: last.cryptoAtts[0]!.derivedFromCapabilityId } : {}),
@@ -1946,32 +1979,15 @@ export class VerifyRpcServer {
       }
       const scrubbedBody = this.scrub(last.result.body)
       finalRecord = this.transcript.record({
-        op: 'http',
-        startedAt: last.startedAt,
-        durationMs: last.result.durationMs,
-        request: reqMeta,
+        op: 'http', startedAt: last.startedAt, durationMs: last.result.durationMs, request: reqMeta, body: scrubbedBody,
         response: {
-          status: last.result.status,
-          headers: this.scrubRecord(last.result.respHeaders),
-          bodyBytes: last.result.bodyBytes,
-          bodySha256: last.result.bodySha256,
-          mediaType: last.result.mediaType,
-          redirectOrigins: last.result.redirectOrigins,
+          status: last.result.status, headers: this.scrubRecord(last.result.respHeaders), bodyBytes: last.result.bodyBytes,
+          bodySha256: last.result.bodySha256, mediaType: last.result.mediaType, redirectOrigins: last.result.redirectOrigins,
           ...(last.result.finalPathAndQuery ? { finalPathAndQuery: this.scrub(last.result.finalPathAndQuery) } : {}),
         },
-        body: scrubbedBody,
       })
-      this.recordRequestProvenance(
-        finalRecord.exchangeId,
-        last.startedAt,
-        { ...pollReqArgs, ...(args.entityId !== undefined ? { entityId: args.entityId } : {}), ...(args.correlationId !== undefined ? { correlationId: args.correlationId } : {}), ...(args.correlationIds !== undefined ? { correlationIds: args.correlationIds } : {}) },
-        last.applied.brokerRequest,
-        reqMeta,
-        { body: last.result.body, respHeaders: last.result.respHeaders },
-        last.applied.attestations,
-        last.cryptoAtts,
-        last.cleanSession,
-      )
+      const mergedPollArgs = { ...pollReqArgs, ...(args.entityId !== undefined ? { entityId: args.entityId } : {}), ...(args.correlationId !== undefined ? { correlationId: args.correlationId } : {}), ...(args.correlationIds !== undefined ? { correlationIds: args.correlationIds } : {}) }
+      this.recordRequestProvenance(finalRecord.exchangeId, last.startedAt, mergedPollArgs, last.applied.brokerRequest, reqMeta, { body: last.result.body, respHeaders: last.result.respHeaders }, last.applied.attestations, last.cryptoAtts, last.cleanSession)
       finalExchangeView = this.exchangeView(finalRecord, { ...last.result, body: scrubbedBody }, {
         consumedCapabilityId: last.applied.attestation?.consumedCapabilityId ?? null,
         consumedCapabilities: last.applied.attestations.map(a => a.consumedCapabilityId),

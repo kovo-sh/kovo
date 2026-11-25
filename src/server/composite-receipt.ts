@@ -130,6 +130,7 @@ export function verifyHostRecordSignature(record: HostSignableRecord, signingKey
 }
 const is2xx = (st: number | null | undefined): boolean => typeof st === 'number' && st >= 200 && st < 300
 const isFiniteTs = (ts: unknown): ts is number => typeof ts === 'number' && Number.isFinite(ts) && ts >= 0
+const normRouteFam = (p: string | null | undefined, eid?: string): string => !p ? '' : routeFamily(p.split(/[?#]/, 1)[0]!.split('/').map(s => (s && ((eid && s === eid) || /^\d+$/.test(s))) ? ':id' : s).join('/'))
 const actorOf = (e: HostTranscriptEntry): string | null => (e.actorPersona !== undefined ? e.actorPersona : (e.step.actor.handle ?? null))
 const roleOf = (e: HostTranscriptEntry): string | null => (e.actorRoleLabel ? parseRoleLabel(e.actorRoleLabel).role : (e.step.actor.role ?? null))
 const probeTenantOf = (e: HostTranscriptEntry): string | null => { const a = actorOf(e); return (!a || ANON_ACTOR_RE.test(a) || a.startsWith('cap:')) ? null : ((e.step.actor.tenant ?? parseRoleLabel(e.actorRoleLabel ?? e.actorPersona ?? '').tenant ?? '').trim().toLowerCase() || null) }
@@ -380,19 +381,18 @@ function verifyStateTransitionBinding(
 
   const hopExSet = new Set([...fromHop.exchangeIds, ...toHop.exchangeIds])
   const toUsesNewCap = (pair.to.consumedCapabilities ?? []).some(c => dagDerivedCaps.has(c))
-  const toActor = actorOf(pair.to), toFam = routeFamily(pair.to.step.route ?? pair.to.step.pathAndQuery ?? '')
+  const toActor = actorOf(pair.to), toFam = normRouteFam(pair.to.step.route ?? pair.to.step.pathAndQuery, edge.entityId)
   let validAblation: HostTranscriptEntry | null = null
 
   for (const abId of edge.ablationExchangeIds) {
     if (hopExSet.has(abId)) return edgeFail(base, `Ablation exchange "${abId}" cannot reuse a hop exchange.`)
     const ab = idx.entriesById.get(abId)!
-    if (!(ab.cleanSession === true && (ab.step.arm === 'control' || ab.replayAttempt === 'ablation_control'))) {
-      return edgeFail(base, `Ablation exchange "${abId}" must be a clean-session control arm.`)
-    }
+    if (ab.cleanSession === false) return edgeFail(base, `Ablation exchange "${abId}" had cleanSession=false (session/entity already mutated); run the ablation control BEFORE Hop "${fromHop.hopId}" or on a fresh untouched sibling entity (pass entityId).`)
+    if (!(ab.cleanSession === true && (ab.step.arm === 'control' || ab.replayAttempt === 'ablation_control'))) return edgeFail(base, `Ablation exchange "${abId}" must be a clean-session control arm (role: "control" or replayAttempt: "ablation_control").`)
     const st = ab.step.status
     if (typeof st === 'number' && st >= 500) return edgeFail(base, `Ablation exchange "${abId}" returned server error ${st}.`)
     if (is2xx(st) && ab.step.evidenceRole !== 'invariant_preserved') return edgeFail(base, `Ablation control "${abId}" succeeded (${st}); Hop j is not dependent on Hop i.`)
-    if (!entryMatchesEntity(ab, edge.entityId) && !(toFam && routeFamily(ab.step.route ?? ab.step.pathAndQuery ?? '') === toFam)) continue
+    if (!entryMatchesEntity(ab, edge.entityId) && !(toFam && normRouteFam(ab.step.route ?? ab.step.pathAndQuery, ab.entityId) === toFam)) continue
     const abActor = actorOf(ab)
     if (!toUsesNewCap && toActor && abActor && abActor !== toActor) return edgeFail(base, `Ablation "${abId}" actor "${abActor}" mismatches toHop actor "${toActor}".`)
     if ((typeof st === 'number' && ABLATION_DENIED_STATUSES.has(st)) || ab.step.evidenceRole === 'invariant_preserved') validAblation = ab
@@ -631,7 +631,7 @@ function verifyTerminalImpactGate(
   const termHop = dag.hopsById.get(ti.terminalHopId)!
   if (ti.terminalExchangeId && !termHop.exchangeIds.includes(ti.terminalExchangeId)) return { ok: false, reason: `terminalExchangeId "${ti.terminalExchangeId}" does not belong to terminal hop "${termHop.hopId}".`, rejectedBy: 'terminal_exchange_invalid', missingEvidence: ['terminal_exchange_in_final_hop'] }
   const termEx = ti.terminalExchangeId ? idx.entriesById.get(ti.terminalExchangeId)! : [...termHop.exchangeIds].reverse().map(id => idx.entriesById.get(id)!).find(e => e.step.arm === 'probe' && is2xx(e.step.status))
-  const termEndpoint = (termEx?.step.route ?? termEx?.step.pathAndQuery ?? termHop.target.pathAndQuery ?? '').trim(), termFam = routeFamily(termEndpoint)
+  const termEndpoint = (termEx?.step.route ?? termEx?.step.pathAndQuery ?? termHop.target.pathAndQuery ?? '').trim(), termFam = normRouteFam(termEndpoint, termEx?.entityId ?? termHop.entityId)
   let terminalVerification: ReceiptVerification | undefined, customOracleFamily: string | undefined
   if (ti.proofReceipt) { terminalVerification = verifyReceipt(ti.proofReceipt, hostTranscript); if (!terminalVerification.confirmed) return { ok: false, reason: terminalVerification.reason, terminalVerification } }
   if (options.verifyTerminalImpact) { const v = options.verifyTerminalImpact(receipt, hostTranscript); if (!v.confirmed) return { ok: false, reason: v.reason, terminalVerification }; customOracleFamily = v.family }
@@ -659,7 +659,7 @@ function verifyTerminalImpactGate(
     if (!c || (termEx && c.exchangeId === termEx.exchangeId) || nonTermExSet.has(c.exchangeId)) return false
     if ((c.step.arm !== 'control' && c.replayAttempt !== 'ablation_control') || typeof c.step.status !== 'number' || !DENIED_CONTROL_STATUSES.has(c.step.status)) return false
     const ca = actorOf(c); if (c.step.status === 401 && termAuthd && (!ca || ANON_ACTOR_RE.test(ca))) return false
-    const cf = routeFamily(c.step.route ?? c.step.pathAndQuery ?? '')
+    const cf = normRouteFam(c.step.route ?? c.step.pathAndQuery, c.entityId)
     return Boolean(termFam) && Boolean(cf) && cf === termFam
   })
   const hasCleanDeniedCtrl = Boolean(terminalCtrl)
