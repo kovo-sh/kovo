@@ -17,142 +17,71 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  docker:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
+  pr-smoke:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
+      - name: Reclaim runner disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
 
-      - name: Prepare image names and tags
+      - name: Prepare image names
         id: prep
         run: |
           set -euo pipefail
           owner="$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
-          short_sha="${GITHUB_SHA::7}"
           echo "owner=${owner}" >> "$GITHUB_OUTPUT"
-          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
-            echo "push=false" >> "$GITHUB_OUTPUT"
-            echo "load=true" >> "$GITHUB_OUTPUT"
-            echo "worker_image=ghcr.io/${owner}/kovo-worker:pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
-            echo "hunter_image=ghcr.io/${owner}/kovo-hunter:pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
-            echo "push=true" >> "$GITHUB_OUTPUT"
-            echo "load=false" >> "$GITHUB_OUTPUT"
-            echo "worker_image=ghcr.io/${owner}/kovo-worker:${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-            echo "hunter_image=ghcr.io/${owner}/kovo-hunter:${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
-            echo "push=true" >> "$GITHUB_OUTPUT"
-            echo "load=false" >> "$GITHUB_OUTPUT"
-            echo "worker_image=ghcr.io/${owner}/kovo-worker:sha-${short_sha}" >> "$GITHUB_OUTPUT"
-            echo "hunter_image=ghcr.io/${owner}/kovo-hunter:sha-${short_sha}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Set up QEMU
-        if: github.event_name != 'pull_request'
-        uses: docker/setup-qemu-action@v3
+          echo "worker_image=ghcr.io/${owner}/kovo-worker:pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+          echo "hunter_image=ghcr.io/${owner}/kovo-hunter:pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata for kovo-worker
-        id: meta-worker
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-worker
-          tags: |
-            type=raw,value=pr-${{ github.event.number }},enable=${{ github.event_name == 'pull_request' }}
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
-            type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern=v{{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
-
-      - name: Build and push kovo-worker
-        id: build-worker
+      - name: Build kovo-worker (linux/amd64)
         uses: docker/build-push-action@v6
         with:
           context: ./worker
           file: ./worker/Dockerfile
-          platforms: ${{ steps.prep.outputs.platforms }}
-          push: ${{ steps.prep.outputs.push == 'true' }}
-          load: ${{ steps.prep.outputs.load == 'true' }}
-          tags: ${{ steps.meta-worker.outputs.tags }}
-          labels: ${{ steps.meta-worker.outputs.labels }}
-          cache-from: type=gha,scope=kovo-worker
-          cache-to: type=gha,mode=max,scope=kovo-worker
-          sbom: ${{ steps.prep.outputs.push == 'true' }}
-          provenance: ${{ steps.prep.outputs.push == 'true' && 'mode=max' || 'false' }}
-
-      - name: Attest kovo-worker provenance
-        if: steps.prep.outputs.push == 'true'
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-worker
-          subject-digest: ${{ steps.build-worker.outputs.digest }}
-          push-to-registry: true
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ${{ steps.prep.outputs.worker_image }}
+          cache-from: type=gha,scope=kovo-worker-amd64
+          cache-to: type=gha,mode=max,scope=kovo-worker-amd64
+          sbom: false
+          provenance: false
 
       - name: Smoke-test kovo-worker (UID 10001 + bridge handshake)
-        if: github.event_name == 'pull_request'
         env:
           KOVO_WORKER_IMAGE: ${{ steps.prep.outputs.worker_image }}
         run: bash scripts/docker-smoke.sh
 
-      - name: Extract metadata for kovo-hunter
-        id: meta-hunter
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-hunter
-          tags: |
-            type=raw,value=pr-${{ github.event.number }},enable=${{ github.event_name == 'pull_request' }}
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
-            type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern=v{{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
-
-      - name: Build and push kovo-hunter
-        id: build-hunter
+      - name: Build kovo-hunter (linux/amd64)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          platforms: ${{ steps.prep.outputs.platforms }}
-          push: ${{ steps.prep.outputs.push == 'true' }}
-          load: ${{ steps.prep.outputs.load == 'true' }}
+          platforms: linux/amd64
+          push: false
+          load: true
           build-args: |
             KOVO_WORKER_IMAGE=${{ steps.prep.outputs.worker_image }}
-          tags: ${{ steps.meta-hunter.outputs.tags }}
-          labels: ${{ steps.meta-hunter.outputs.labels }}
-          cache-from: type=gha,scope=kovo-hunter
-          cache-to: type=gha,mode=max,scope=kovo-hunter
-          sbom: ${{ steps.prep.outputs.push == 'true' }}
-          provenance: ${{ steps.prep.outputs.push == 'true' && 'mode=max' || 'false' }}
-
-      - name: Attest kovo-hunter provenance
-        if: steps.prep.outputs.push == 'true'
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-hunter
-          subject-digest: ${{ steps.build-hunter.outputs.digest }}
-          push-to-registry: true
+          tags: ${{ steps.prep.outputs.hunter_image }}
+          cache-from: type=gha,scope=kovo-hunter-amd64
+          cache-to: type=gha,mode=max,scope=kovo-hunter-amd64
+          sbom: false
+          provenance: false
 
       - name: Smoke-test kovo-hunter startup health check
-        if: github.event_name == 'pull_request'
         env:
           KOVO_HUNTER_IMAGE: ${{ steps.prep.outputs.hunter_image }}
         run: |
@@ -171,3 +100,306 @@ jobs:
           done
           docker logs "$cid" >&2 || true
           exit 1
+
+  build-worker:
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Reclaim runner disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Prepare owner
+        id: prep
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "owner=${owner}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for kovo-worker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-worker
+          tags: |
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+
+      - name: Build and push kovo-worker (${{ matrix.platform }}) by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./worker
+          file: ./worker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-worker,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=kovo-worker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=kovo-worker-${{ matrix.arch }}
+          sbom: true
+          provenance: mode=max
+
+      - name: Export kovo-worker digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          test -n "$digest"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload kovo-worker digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-worker-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  build-hunter:
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Reclaim runner disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Prepare owner and worker image reference
+        id: prep
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          short_sha="${GITHUB_SHA::7}"
+          echo "owner=${owner}" >> "$GITHUB_OUTPUT"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "worker_image=ghcr.io/${owner}/kovo-worker:${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "worker_image=ghcr.io/${owner}/kovo-worker:sha-${short_sha}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for kovo-hunter
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-hunter
+          tags: |
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+
+      - name: Build and push kovo-hunter (${{ matrix.platform }}) by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            KOVO_WORKER_IMAGE=${{ steps.prep.outputs.worker_image }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-hunter,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=kovo-hunter-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=kovo-hunter-${{ matrix.arch }}
+          sbom: true
+          provenance: mode=max
+
+      - name: Export kovo-hunter digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          test -n "$digest"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload kovo-hunter digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-hunter-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-manifests:
+    if: github.event_name != 'pull_request'
+    needs: [build-worker, build-hunter]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Prepare owner
+        id: prep
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "owner=${owner}" >> "$GITHUB_OUTPUT"
+
+      - name: Download kovo-worker digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-worker-*
+          merge-multiple: true
+          path: /tmp/digests-worker
+
+      - name: Download kovo-hunter digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-hunter-*
+          merge-multiple: true
+          path: /tmp/digests-hunter
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for kovo-worker
+        id: meta-worker
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-worker
+          tags: |
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+
+      - name: Create and push kovo-worker multi-arch manifest
+        id: merge-worker
+        run: |
+          set -euo pipefail
+          image="${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-worker"
+          TAG_ARGS=()
+          first_tag=""
+          while IFS= read -r tag; do
+            if [[ -n "$tag" ]]; then
+              TAG_ARGS+=(--tag "$tag")
+              [[ -z "$first_tag" ]] && first_tag="$tag"
+            fi
+          done <<< "${{ steps.meta-worker.outputs.tags }}"
+          test -n "$first_tag"
+          SOURCES=()
+          for f in /tmp/digests-worker/*; do
+            SOURCES+=("${image}@sha256:$(basename "$f")")
+          done
+          test "${#SOURCES[@]}" -ge 2
+          docker buildx imagetools create "${TAG_ARGS[@]}" "${SOURCES[@]}"
+          digest="sha256:$(docker buildx imagetools inspect --raw "$first_tag" | sha256sum | awk '{print $1}')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          docker buildx imagetools inspect "$first_tag"
+
+      - name: Attest kovo-worker provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-worker
+          subject-digest: ${{ steps.merge-worker.outputs.digest }}
+          push-to-registry: true
+
+      - name: Extract metadata for kovo-hunter
+        id: meta-hunter
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-hunter
+          tags: |
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+
+      - name: Create and push kovo-hunter multi-arch manifest
+        id: merge-hunter
+        run: |
+          set -euo pipefail
+          image="${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-hunter"
+          TAG_ARGS=()
+          first_tag=""
+          while IFS= read -r tag; do
+            if [[ -n "$tag" ]]; then
+              TAG_ARGS+=(--tag "$tag")
+              [[ -z "$first_tag" ]] && first_tag="$tag"
+            fi
+          done <<< "${{ steps.meta-hunter.outputs.tags }}"
+          test -n "$first_tag"
+          SOURCES=()
+          for f in /tmp/digests-hunter/*; do
+            SOURCES+=("${image}@sha256:$(basename "$f")")
+          done
+          test "${#SOURCES[@]}" -ge 2
+          docker buildx imagetools create "${TAG_ARGS[@]}" "${SOURCES[@]}"
+          digest="sha256:$(docker buildx imagetools inspect --raw "$first_tag" | sha256sum | awk '{print $1}')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          docker buildx imagetools inspect "$first_tag"
+
+      - name: Attest kovo-hunter provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-hunter
+          subject-digest: ${{ steps.merge-hunter.outputs.digest }}
+          push-to-registry: true

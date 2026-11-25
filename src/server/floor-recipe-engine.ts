@@ -3512,6 +3512,14 @@ export function receiptVulnClassFor(spec: DeclarativeReplaySpec): string | null 
   if (/CWE-601|\bopen[-_ ]?redirect\b|unvalidated[- ]redirect/i.test(text)) return 'open_redirect'
   if (/CWE-345/i.test(text) || /webhook[^.]*(?:signature|forger|tamper)|(?:signature|forger)[^.]*webhook/i.test(text)) return 'webhook_forgery'
   if (spec.kind !== 'http_chain' && spec.kind !== 'auth_protocol_proof') return null
+  if (classifyBoundaryClaim({
+    cwe: spec.cwe,
+    category: spec.category,
+    title: spec.title,
+    impact: spec.impact,
+  }) === 'auth') {
+    return 'auth_bypass'
+  }
   return vulnClassForImpactClass(classifyImpactDescriptor({
     cwe: spec.cwe,
     category: spec.category,
@@ -3554,7 +3562,8 @@ export function buildReplayReceipt(input: {
     ? input.evidencePayload.evidenceClass
     : null
   const baseVulnClass = vulnClassForImpactClass(evidenceClass) ?? receiptVulnClassFor(input.spec)
-  const isBoundaryAuth = !baseVulnClass && boundaryGate?.required === true && boundaryGate.satisfied === true && boundaryGate.boundaryClass === 'auth'
+  const isBoundaryAuth = (baseVulnClass === null || baseVulnClass === 'auth_bypass') &&
+    boundaryGate?.required === true && boundaryGate.satisfied === true && boundaryGate.boundaryClass === 'auth'
   const vulnClass = baseVulnClass ?? (isBoundaryAuth ? 'auth_bypass' : null)
   if (!vulnClass) return null
   const isOob = vulnClass === 'ssrf' || vulnClass === 'xxe' ||
