@@ -17,7 +17,7 @@ import { useRunModel } from '../data.tsx'
 import { ACTIONS, actionsFor, approvalCommand, useDecisions } from '../decisions.tsx'
 import type { DecisionAct, DecisionsApi } from '../decisions.tsx'
 import type { Command } from '../data.tsx'
-import { EmptyState, Kbd } from '../display.tsx'
+import { EmptyState, Kbd, Tag } from '../display.tsx'
 import { cap, fmtTime, fmtTimeS, fmtUsd, host, plural } from '../format.ts'
 import { StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
@@ -26,7 +26,7 @@ import { useShortcuts } from '../keyboard.tsx'
 import { normFStatus, prettyCat } from '../meta.ts'
 import { QSEC } from '../model.ts'
 import type { QueueItem, QueueSection, RunModel } from '../model.ts'
-import { AnimatedNumber, T } from '../motion.tsx'
+import { AnimatedNumber, EASE_CSS, T } from '../motion.tsx'
 import { useListNav, useNav, useViewState } from '../nav.tsx'
 import type { NavApi } from '../nav.tsx'
 import { PaneBody, PaneHeader } from '../pane.tsx'
@@ -34,6 +34,7 @@ import type { InspectorMap, InspectorProps } from '../pane.tsx'
 import { usePaletteCommands } from '../palette.tsx'
 import { useToast } from '../toast.tsx'
 import type { ToastApi } from '../toast.tsx'
+import { cn, runBtn, runDec, runIconBtn, runStamp, RW } from '../tw.ts'
 import { QGlyph, ReadApproval, ReadConsent, ReadFinding, ReadFollow, VState } from './queue-read.tsx'
 
 // ---------------------------------------------------------------- decision motion store
@@ -176,6 +177,23 @@ const EMPTY: Record<QueueSection, string> = {
   done: 'Nothing here yet.',
 }
 
+function useEnterFlash(ref: React.RefObject<HTMLDivElement | null>, entering: boolean) {
+  useLayoutEffect(() => {
+    const el = ref.current
+    const dur = T(420)
+    if (!el || !entering || !dur || typeof el.animate !== 'function') return
+    const anim = el.animate(
+      [
+        { opacity: 0, backgroundColor: 'var(--accent-soft)' },
+        { opacity: 1, backgroundColor: 'var(--accent-soft)', offset: 0.4 },
+        { backgroundColor: 'transparent' },
+      ],
+      { duration: dur, easing: EASE_CSS },
+    )
+    return () => anim.cancel()
+  }, [ref, entering])
+}
+
 export function QueueView() {
   const model = useRunModel()
   const q = useDecisions()
@@ -215,36 +233,53 @@ export function QueueView() {
   // Keep the current row in view (j/k, advance).
   useEffect(() => {
     if (!selKey) return
-    const el = listRef.current?.querySelector<HTMLElement>(`.row[data-id="${CSS.escape(selKey)}"]`)
+    const el = listRef.current?.querySelector<HTMLElement>(`[data-id="${CSS.escape(selKey)}"]`)
     el?.scrollIntoView({ block: 'nearest' })
   }, [selKey])
 
   const initial = q.initialCount
   const handled = q.handledCount
   const pct = initial ? handled / initial : 0
-  const hero = <div className="qhero num">
-    <span><b><AnimatedNumber id="q.open" value={q.openCount} /> open</b><span style={{ color: 'var(--fg-3)' }}> · {handled} decided by you this session</span></span>
-    <span className="prog" title={`${handled} of ${initial} handled`}>{Array.from({ length: 12 }, (_, i) => <i key={i} className={i < Math.ceil(pct * 12) ? 'on' : ''} />)}</span>
-    <span className="tb-sp" />
-    <span className="hint qkeys"><Kbd>A</Kbd>accept<Kbd>D</Kbd>deny<Kbd>F</Kbd>false positive<Kbd>Z</Kbd>undo</span>
+  const hero = <div className="flex flex-none items-center gap-3 border-b border-line px-[18px] py-3 text-[12.5px] tabular-nums text-fg-muted">
+    <span className="min-w-0 truncate">
+      <b className="font-medium text-fg"><AnimatedNumber id="q.open" value={q.openCount} /> open</b>
+      <span className="text-fg-subtle"> · {handled} decided by you this session</span>
+    </span>
+    <span className="flex h-1 w-24 flex-none gap-0.5 max-[1320px]:hidden" title={`${handled} of ${initial} handled`}>
+      {Array.from({ length: 12 }, (_, i) => (
+        <i key={i} className={cn('flex-1 rounded-[2px] transition-colors duration-[var(--d3)]', i < Math.ceil(pct * 12) ? 'bg-fg-subtle' : 'bg-line-2')} />
+      ))}
+    </span>
+    <span className="min-w-2 flex-1" />
+    <span className="inline-flex flex-none items-center gap-1.5 whitespace-nowrap text-[11.5px] text-fg-subtle [&_.kbd]:ml-1.5">
+      <Kbd>A</Kbd>accept<Kbd>D</Kbd>deny<Kbd>F</Kbd>false positive<Kbd>Z</Kbd>undo
+    </span>
   </div>
   if (!initial && !q.sections.done.length) {
     return <>{hero}<EmptyState icon="queue" title="Queue is empty">Approvals, unverified findings and flagged coverage collect here as the run progresses.</EmptyState></>
   }
   return <>
     {hero}
-    <div className="list" ref={listRef} tabIndex={-1}>
+    <div className={RW.list} ref={listRef} tabIndex={-1}>
       {QSEC.map(([k, label, sub]) => {
         const items = q.sections[k]
         const col = isCol(k)
-        return <div key={k} className="qsec" data-sec={k}>
-          <div className={'ghead' + (col ? ' collapsed' : '')} role="button" tabIndex={0} aria-expanded={!col}
+        return <div key={k} data-sec={k}>
+          <div
+            className={RW.ghead}
+            role="button"
+            tabIndex={0}
+            aria-expanded={!col}
             onClick={() => setCollapsed(c => ({ ...c, [k]: !col }))}
-            onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setCollapsed(c => ({ ...c, [k]: !col })) } }}>
-            <Icon name="chev" /><span>{label}</span><span className="ct num"><AnimatedNumber id={'q.sec.' + k} value={items.length} /></span><span className="sub">{sub}</span>
+            onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setCollapsed(c => ({ ...c, [k]: !col })) } }}
+          >
+            <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-guardian', col && '-rotate-90')} />
+            <span>{label}</span>
+            <span className="font-normal tabular-nums text-fg-subtle"><AnimatedNumber id={'q.sec.' + k} value={items.length} /></span>
+            <span className="text-[12px] font-normal text-fg-subtle">{sub}</span>
           </div>
           {!col && (!items.length
-            ? <div className="qempty">{EMPTY[k]}</div>
+            ? <div className="border-b border-line pb-3.5 pl-11 pr-[18px] pt-3 text-[12px] text-fg-subtle">{EMPTY[k]}</div>
             : k === 'done' ? <DoneRows items={items} selKey={selKey} />
               : items.map(it => <QRow key={it.key} it={it} sec={k} cur={it.key === selKey} motion={m}
                 onSelect={() => nav.select({ kind: 'queue', id: it.key })} onAct={act => decide(it.key, act)} onAsk={() => ask(it.key)} />))}
@@ -254,20 +289,24 @@ export function QueueView() {
   </>
 }
 
-function QTitle({ it }: { it: QueueItem }) {
+function QTitle({ it, done }: { it: QueueItem; done?: boolean }) {
   if (it.kind === 'approval') {
     const a = it.ap
-    return <span className="title mono qurl"><span className="m">{a.method}</span>{host(a.origin)}<span className="pq">{a.pathAndQuery}</span></span>
+    return <span className={cn('min-w-0 flex-initial truncate font-mono text-[12px]', done ? 'text-fg-muted' : 'text-fg')}>
+      <span className={cn('mr-1.5 font-semibold', done ? 'text-fg-subtle' : 'text-warn')}>{a.method}</span>
+      {host(a.origin)}
+      <span className="text-fg-subtle">{a.pathAndQuery}</span>
+    </span>
   }
-  return <span className="title">{it.title}</span>
+  return <span className={cn('min-w-0 flex-initial truncate', done ? 'text-fg-muted' : 'text-fg')}>{it.title}</span>
 }
 
 function QMeta({ it, model }: { it: QueueItem; model: RunModel }): ReactNode[] {
   if (it.kind === 'approval') return ['Approval request', it.ap.status === 'pending' ? 'Expires ' + fmtTime(it.ap.expiresAt) : cap(it.ap.status)]
   if (it.kind === 'consent') return [plural(model.detail.project.seeds.length, 'seed host'), capabilityTierMeta[model.run.capabilityTier].short, fmtUsd(model.run.budgetUsd)]
-  if (it.kind === 'follow') return [<span key="h" className="mono">{host(it.cov.origin)}</span>, prettyCat(it.cov.category)]
+  if (it.kind === 'follow') return [<span key="h" className="font-mono text-[11.5px]">{host(it.cov.origin)}</span>, prettyCat(it.cov.category)]
   return [
-    it.bundle ? <span key="o" className="tag num">{it.origins.length} origins</span> : <span key="h" className="mono">{host(it.origins[0])}</span>,
+    it.bundle ? <Tag key="o" className="h-[18px] text-[11px] tabular-nums">{it.origins.length} origins</Tag> : <span key="h" className="font-mono text-[11.5px]">{host(it.origins[0])}</span>,
     it.finding.findingKind === 'multi_step_chain' ? 'Chain' : 'Baseline',
     <VState key="v" status={it.status} />,
   ]
@@ -287,30 +326,106 @@ function QRow({ it, sec, cur, motion: m, onSelect, onAct, onAsk }: {
   const stamping = m.key === it.key && m.phase !== 'idle'
   const leaving = stamping && m.phase === 'leave'
   const A = stamping && m.act ? ACTIONS[m.act] : null
+  useEnterFlash(ref, m.enter === it.key)
   // Collapse our own height so the reflow that follows lands on the same layout.
   useLayoutEffect(() => {
     const el = ref.current
     if (!el || !leaving) return
     el.style.height = el.offsetHeight + 'px'
     void el.offsetHeight
-    el.classList.add('leaving')
+    el.setAttribute('data-leaving', '')
     el.style.height = '0px'
-    return () => { el.classList.remove('leaving'); el.style.height = '' }
+    return () => { el.removeAttribute('data-leaving'); el.style.height = '' }
   }, [leaving])
   const meta = QMeta({ it, model })
   const acts = it.kind === 'consent' ? [['scope', 'Review scope', 'a', true] as const] : actionsFor(it)
-  return <div ref={ref} className={'row qrow' + (cur ? ' cur' : '') + (stamping ? ' stamp' : '') + (m.enter === it.key ? ' entering' : '')} data-id={it.key}
-    onClick={onSelect} aria-selected={cur}>
+  return <div
+    ref={ref}
+    className={cn(
+      RW.row,
+      'group/row h-10 cursor-pointer [contain-intrinsic-size:auto_40px]',
+      'data-[leaving]:overflow-hidden data-[leaving]:border-b-transparent data-[leaving]:opacity-0 data-[leaving]:[transition:height_var(--d3)_var(--ease),opacity_var(--d2)_var(--ease),border-color_var(--d2)]',
+      cur && RW.rowCur,
+    )}
+    data-id={it.key}
+    onClick={onSelect}
+    aria-selected={cur}
+  >
     <QGlyph it={it} />
-    <span className="qt"><QTitle it={it} /></span>
-    <span className="meta">{meta.map((x, i) => <span key={i} className="qm">{i > 0 && <span className="qdot">·</span>}{x}</span>)}</span>
-    {sec !== 'done' && <span className="acts">
-      {acts.map(([a, l, k, p]) => <button key={a} type="button" className={'qbtn' + (p ? ' pri' : '')} title={`${l} (${k.toUpperCase()})${localOnly(it, model) ? ' · Saved locally in this browser' : ''}`} onClick={e => { e.stopPropagation(); onAct(a) }}>
-        {l}<Kbd>{k.toUpperCase()}</Kbd>
+    <span className="flex min-w-0 flex-1 items-center gap-2"><QTitle it={it} /></span>
+    <span className={cn(
+      'flex flex-none items-center gap-2 whitespace-nowrap text-[12px] text-fg-subtle transition-opacity duration-[var(--d1)] group-hover/row:opacity-0',
+      (cur || stamping) && 'opacity-0',
+    )}>
+      {meta.map((x, i) => <span key={i} className="inline-flex items-center gap-2">{i > 0 && <span className="text-fg-faint">·</span>}{x}</span>)}
+    </span>
+    {sec !== 'done' && <span className={cn(
+      'pointer-events-none absolute right-3 top-1/2 flex -translate-y-1/2 translate-x-1 gap-1 pl-6 opacity-0 transition-[opacity,transform] duration-[var(--d1)] ease-guardian',
+      cur
+        ? 'bg-gradient-to-r from-transparent via-[var(--row-s)] to-[var(--row-s)]'
+        : 'bg-gradient-to-r from-transparent via-[var(--row-h)] to-[var(--row-h)]',
+      stamping
+        ? 'pointer-events-none opacity-0!'
+        : cur
+          ? 'pointer-events-auto translate-x-0 opacity-100'
+          : 'group-hover/row:pointer-events-auto group-hover/row:translate-x-0 group-hover/row:opacity-100',
+    )}>
+      {acts.map(([a, l, k, p]) => <button
+        key={a}
+        type="button"
+        className={cn(
+          runBtn({ variant: p ? 'ink' : 'default', size: 'sm' }),
+          !p && 'text-fg-muted hover:text-fg',
+        )}
+        title={`${l} (${k.toUpperCase()})${localOnly(it, model) ? ' · Saved locally in this browser' : ''}`}
+        onClick={e => { e.stopPropagation(); onAct(a) }}
+      >
+        {l}<Kbd inverted={p} className="pointer-events-none h-[15px] min-w-[15px] text-[10px]">{k.toUpperCase()}</Kbd>
       </button>)}
-      <button type="button" className="qbtn icon" title="Ask coordinator (C)" aria-label="Ask coordinator" onClick={e => { e.stopPropagation(); onAsk() }}><Icon name="chat" /></button>
+      <button
+        type="button"
+        className={cn(runBtn({ variant: 'default', size: 'iconSm' }), 'text-fg-muted hover:text-fg')}
+        title="Ask coordinator (C)"
+        aria-label="Ask coordinator"
+        onClick={e => { e.stopPropagation(); onAsk() }}
+      >
+        <Icon name="chat" />
+      </button>
     </span>}
-    {A && <span className={'stampl ' + A.tone}><Icon name={A.icon} />{A.label}</span>}
+    {A && <span className={cn(
+      runStamp({ tone: A.tone }),
+      'absolute right-4 top-1/2 z-[2] h-6 -translate-y-1/2 transition-[opacity,transform] duration-[var(--d2)] ease-spring',
+    )}>
+      <Icon name={A.icon} />{A.label}
+    </span>}
+  </div>
+}
+
+function DoneRow({ it, cur, entering, onSelect }: { it: QueueItem; cur: boolean; entering: boolean; onSelect: () => void }) {
+  const q = useDecisions()
+  const ref = useRef<HTMLDivElement>(null)
+  useEnterFlash(ref, entering)
+  const dec = q.get(it.key)
+  let right: ReactNode = null
+  if (dec) {
+    const A = ACTIONS[dec.act]
+    right = <span className={cn(runDec({ tone: A.tone === 'no' ? 'default' : A.tone }), '[&_svg]:size-[13px]')}>
+      <Icon name={A.icon} />{A.label}{dec.state === 'pending' ? ' · sending' : dec.state === 'local' ? ' · local' : ''}
+    </span>
+  } else if (it.kind === 'finding') right = <VState status={it.status} />
+  else if (it.kind === 'approval') right = <span className={cn(runDec(), '[&_svg]:size-[13px]')}>
+    <StatusGlyph status={it.ap.status} />{cap(it.ap.status)}{it.ap.decidedBy ? ' · ' + it.ap.decidedBy : ''}
+  </span>
+  return <div
+    ref={ref}
+    className={cn(RW.row, 'h-10 cursor-pointer [contain-intrinsic-size:auto_40px]', cur && RW.rowCur)}
+    data-id={it.key}
+    onClick={onSelect}
+    aria-selected={cur}
+  >
+    <QGlyph it={it} />
+    <span className="flex min-w-0 flex-1 items-center gap-2"><QTitle it={it} done /></span>
+    <span className="flex flex-none items-center gap-2 whitespace-nowrap text-[12px] text-fg-subtle">{right}</span>
   </div>
 }
 
@@ -322,26 +437,16 @@ function DoneRows({ items, selKey }: { items: QueueItem[]; selKey: string | null
   const auto = (it: QueueItem) => it.kind === 'approval' && !q.get(it.key) && (it.ap.decidedBy ?? '').startsWith('auto')
   const main = items.filter(it => !auto(it))
   const log = items.filter(auto)
-  const row = (it: QueueItem) => {
-    const dec = q.get(it.key)
-    let right: ReactNode = null
-    if (dec) {
-      const A = ACTIONS[dec.act]
-      right = <span className={'dec ' + A.tone}><Icon name={A.icon} />{A.label}{dec.state === 'pending' ? ' · sending' : dec.state === 'local' ? ' · local' : ''}</span>
-    } else if (it.kind === 'finding') right = <VState status={it.status} />
-    else if (it.kind === 'approval') right = <span className="dec"><StatusGlyph status={it.ap.status} />{cap(it.ap.status)}{it.ap.decidedBy ? ' · ' + it.ap.decidedBy : ''}</span>
-    return <div key={it.key} className={'row qrow done' + (it.key === selKey ? ' cur' : '') + (m.enter === it.key ? ' entering' : '')} data-id={it.key}
-      onClick={() => nav.select({ kind: 'queue', id: it.key })}>
-      <QGlyph it={it} />
-      <span className="qt"><QTitle it={it} /></span>
-      <span className="meta">{right}</span>
-    </div>
-  }
   return <>
-    {main.map(row)}
+    {main.map(it => <DoneRow key={it.key} it={it} cur={it.key === selKey} entering={m.enter === it.key} onSelect={() => nav.select({ kind: 'queue', id: it.key })} />)}
     {log.length > 0 && <>
-      <div className="qsub"><Icon name="shield" /><span>Auto-approved by policy</span><span className="ct num">{log.length}</span><span className="sub">Audit log of active test requests the policy approved automatically</span></div>
-      {log.map(row)}
+      <div className="flex h-[30px] items-center gap-2 border-b border-line bg-[color-mix(in_srgb,var(--sunk)_55%,transparent)] pl-11 pr-[18px] text-[12px] font-medium text-fg-muted">
+        <Icon name="shield" className="text-fg-subtle" />
+        <span>Auto-approved by policy</span>
+        <span className="font-normal tabular-nums text-fg-subtle">{log.length}</span>
+        <span className="truncate font-normal text-fg-subtle">Audit log of active test requests the policy approved automatically</span>
+      </div>
+      {log.map(it => <DoneRow key={it.key} it={it} cur={it.key === selKey} entering={m.enter === it.key} onSelect={() => nav.select({ kind: 'queue', id: it.key })} />)}
     </>}
   </>
 }
@@ -376,44 +481,69 @@ function QueueInspector({ sel }: InspectorProps) {
   const stamped = m.key === it.key && m.phase !== 'idle' && m.act ? ACTIONS[m.act] : null
   const acts = sec !== 'done' ? (it.kind === 'consent' ? [['scope', 'Review scope', 'a', true] as const] : actionsFor(it)) : []
   const icon = (a: DecisionAct): IconName => a === 'fp' ? 'slash' : a === 'dismiss' || a === 'close' ? 'archive' : a === 'deny' ? 'x' : a === 'queue' ? 'follow' : 'check'
+  const bannerCls = 'mb-3 flex items-center gap-2 rounded-[7px] bg-sunk px-2.5 py-2 text-[12px] text-fg-muted shadow-[inset_0_0_0_1px_var(--line)]'
   let banner: ReactNode = null
   if (dec) {
-    banner = <div className="banner"><Icon name={ACTIONS[dec.act].icon} />
+    banner = <div className={bannerCls}><Icon name={ACTIONS[dec.act].icon} />
       <span>{ACTIONS[dec.act].label} by you · {fmtTimeS(dec.at)}{dec.state === 'pending' ? ' · sending when the undo window closes' : dec.state === 'sent' ? ' · sent to Kovo Hunter' : dec.state === 'local' ? ' · Saved locally in this browser' : ''}</span>
-      {dec.state !== 'sent' && <button type="button" className="btn ghost" onClick={() => q.reopen(it.key)}><Icon name="undo" />Move back</button>}
+      {dec.state !== 'sent' && <button type="button" className={cn(runBtn({ variant: 'ghost' }), 'ml-auto')} onClick={() => q.reopen(it.key)}><Icon name="undo" />Move back</button>}
     </div>
   } else if (sec === 'done' && it.kind === 'finding') {
-    banner = <div className="banner"><StatusGlyph status={normFStatus(it.status)} /><span>{it.status === 'dismissed' ? 'Dismissed by verification.' : 'Confirmed by automated replay. Nothing to decide.'}</span></div>
+    banner = <div className={bannerCls}><StatusGlyph status={normFStatus(it.status)} /><span>{it.status === 'dismissed' ? 'Dismissed by verification.' : 'Confirmed by automated replay. Nothing to decide.'}</span></div>
   } else if (sec === 'done' && it.kind === 'approval') {
-    banner = <div className="banner"><StatusGlyph status={it.ap.status} /><span>{cap(it.ap.status)}{it.ap.decidedBy ? ' by ' + it.ap.decidedBy : ''}{it.ap.decidedAt ? ' · ' + fmtTimeS(it.ap.decidedAt) : ''}.</span></div>
+    banner = <div className={bannerCls}><StatusGlyph status={it.ap.status} /><span>{cap(it.ap.status)}{it.ap.decidedBy ? ' by ' + it.ap.decidedBy : ''}{it.ap.decidedAt ? ' · ' + fmtTimeS(it.ap.decidedAt) : ''}.</span></div>
   }
   const local = it.kind === 'follow' && !followIsLive(model)
   return <>
-    <PaneHeader title={secName} sub={pos >= 0 ? <span className="num">{pos + 1} of {inSec.length}</span> : undefined}
+    <PaneHeader title={secName} sub={pos >= 0 ? <span className="tabular-nums">{pos + 1} of {inSec.length}</span> : undefined}
       extra={<>
-        <button type="button" className="icon-btn" onClick={() => step(-1)} title="Previous (K)" aria-label="Previous item"><Icon name="chevU" /></button>
-        <button type="button" className="icon-btn" onClick={() => step(1)} title="Next (J)" aria-label="Next item"><Icon name="chevD" /></button>
+        <button type="button" className={runIconBtn()} onClick={() => step(-1)} title="Previous (K)" aria-label="Previous item"><Icon name="chevU" /></button>
+        <button type="button" className={runIconBtn()} onClick={() => step(1)} title="Next (J)" aria-label="Next item"><Icon name="chevD" /></button>
       </>} />
-    <div className="read">
-      <PaneBody><div className="d">
+    <div className="flex min-h-0 flex-1 flex-col">
+      <PaneBody><div className={cn(RW.detail, 'pb-6')}>
         {banner}
         {it.kind === 'finding' ? <ReadFinding it={it} />
           : it.kind === 'approval' ? <ReadApproval it={it} />
             : it.kind === 'follow' ? <ReadFollow it={it} local={local} />
               : <ReadConsent />}
       </div></PaneBody>
-      <div className={'abar' + (stamped ? ' stamped' : '')}>
-        {acts.map(([a, l, k, p]) => <button key={a} type="button" className={'btn' + (p ? ' ink' : '')} onClick={() => decide(it.key, a)}
-          title={localOnly(it, model) ? 'Saved locally in this browser' : undefined}>
-          <Icon name={icon(a)} />{l}<Kbd>{k.toUpperCase()}</Kbd>
-        </button>)}
-        {it.kind === 'approval' && sec !== 'done' && <button type="button" className="btn ghost" title="Approve this request and future requests to the same endpoint pattern"
-          onClick={() => decide(it.key, 'approve', { similar: true })}><Icon name="check" />Approve similar</button>}
-        {acts.length <= 2 && <button type="button" className="btn ghost" title="Ask the coordinator about this item (C)" aria-label="Ask the coordinator" onClick={() => ask(it.key)}>
-          <Icon name="chat" />{sec === 'done' || it.kind === 'approval' ? null : <>Ask<Kbd>C</Kbd></>}
-        </button>}
-        <span className="sp" />
-        <span className={'rstamp stampl ' + (stamped?.tone ?? '')}>{stamped && <><Icon name={stamped.icon} />{stamped.label} <span className="rstamp-sub">· next item</span></>}</span>
+      <div className="relative flex min-h-12 flex-none items-center gap-1.5 border-t border-line bg-panel px-3 py-2.5">
+        <div className={cn('flex min-w-0 flex-1 items-center gap-1.5 transition-opacity duration-[var(--d1)]', stamped && 'pointer-events-none opacity-0')}>
+          {acts.map(([a, l, k, p]) => <button
+            key={a}
+            type="button"
+            className={runBtn({ variant: p ? 'ink' : 'default' })}
+            onClick={() => decide(it.key, a)}
+            title={localOnly(it, model) ? 'Saved locally in this browser' : undefined}
+          >
+            <Icon name={icon(a)} />{l}<Kbd inverted={p} className="ml-0.5">{k.toUpperCase()}</Kbd>
+          </button>)}
+          {it.kind === 'approval' && sec !== 'done' && <button
+            type="button"
+            className={runBtn({ variant: 'ghost' })}
+            title="Approve this request and future requests to the same endpoint pattern"
+            onClick={() => decide(it.key, 'approve', { similar: true })}
+          >
+            <Icon name="check" />Approve similar
+          </button>}
+          {acts.length <= 2 && <button
+            type="button"
+            className={runBtn({ variant: 'ghost' })}
+            title="Ask the coordinator about this item (C)"
+            aria-label="Ask the coordinator"
+            onClick={() => ask(it.key)}
+          >
+            <Icon name="chat" />{sec === 'done' || it.kind === 'approval' ? null : <>Ask<Kbd className="ml-0.5">C</Kbd></>}
+          </button>}
+          <span className="flex-1" />
+        </div>
+        {stamped && <span className={cn(
+          runStamp({ tone: stamped.tone }),
+          'pointer-events-none absolute inset-x-3 inset-y-2.5 flex items-center gap-2 rounded-control px-3 text-[12.5px] font-semibold',
+        )}>
+          <Icon name={stamped.icon} />{stamped.label} <span className="font-normal opacity-70">· next item</span>
+        </span>}
       </div>
     </div>
   </>

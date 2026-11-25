@@ -387,10 +387,10 @@ export const suppliedResponseLabel = 'Supplied response metadata'
 
 export function capabilityTierLabel(tier: CapabilityTier): string {
   switch (tier) {
-    case 0: return 'Tier 0 · Offline Prepared'
-    case 1: return 'Tier 1 · Deep Read-Only + Safe Probes'
-    case 2: return 'Tier 2 · Multi-Persona Safe Validation'
-    case 3: return 'Tier 3 · Approval-Gated State & Execution'
+    case 0: return 'Offline Review'
+    case 1: return 'Read-Only Scan'
+    case 2: return 'Authenticated Testing'
+    case 3: return 'Active Testing (Approval-Gated)'
   }
 }
 

@@ -5,6 +5,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { CSSProperties } from 'react'
 import { clamp } from './format.ts'
+import { cn } from './tw.ts'
 
 export const DUR = { d1: 120, d2: 180, d3: 240, counter: 420, camera: 320 } as const
 export const EASE_CSS = 'cubic-bezier(.2,.8,.2,1)'
@@ -90,7 +91,7 @@ export function AnimatedNumber({ id, value, format = n => Math.round(n).toLocale
  * Thin meter that grows (scaleX) from its previous value. `wide` fills the row.
  * Warns above 80% unless `warn` is given explicitly.
  */
-export function Meter({ id, value, warn, wide, className, style, title }: {
+export function Meter({ id, value, warn, wide, className, style, title, barColor }: {
   id: string
   value: number
   warn?: boolean
@@ -98,6 +99,7 @@ export function Meter({ id, value, warn, wide, className, style, title }: {
   className?: string
   style?: CSSProperties
   title?: string
+  barColor?: string
 }) {
   const target = clamp(Number.isFinite(value) ? value : 0, 0, 1)
   const ref = useRef<HTMLElement>(null)
@@ -114,9 +116,23 @@ export function Meter({ id, value, warn, wide, className, style, title }: {
     el.style.setProperty('--v', String(target))
   }, [id, target])
   const w = warn ?? target > 0.8
-  return <span className={'meter' + (w ? ' warn' : '') + (wide ? ' wide' : '') + (className ? ' ' + className : '')} style={style} title={title}
-    role="meter" aria-valuemin={0} aria-valuemax={1} aria-valuenow={Number(target.toFixed(3))}>
-    <i ref={ref} />
+  return <span
+    className={cn('relative inline-block h-1 flex-none overflow-hidden rounded-[4px] bg-line-2', wide ? 'w-full' : 'w-11', className)}
+    style={style}
+    title={title}
+    role="meter"
+    aria-valuemin={0}
+    aria-valuemax={1}
+    aria-valuenow={Number(target.toFixed(3))}
+  >
+    <i
+      ref={ref}
+      className={cn(
+        'absolute inset-0 origin-left rounded-[4px] transition-transform duration-500 ease-guardian motion-reduce:transition-none',
+        w ? 'bg-warn' : 'bg-fg-muted',
+      )}
+      style={{ transform: 'scaleX(var(--v, 0))', ...(barColor ? { background: barColor } : undefined) }}
+    />
   </span>
 }
 

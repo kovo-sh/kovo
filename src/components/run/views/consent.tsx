@@ -1,30 +1,26 @@
 // Consent sheet for waiting runs (rendered by Overview), and the scope
-// editor it shares with the header's "Edit scope" overlay.
-//
-// Real commands:
-//   phase `consent` → { action: 'discover', consent: true }      (start discovery on the project seeds)
-//   phase `review`  → { action: 'scope', assetIds, expectedScopeRevision, consent: true, tier, policy, budget… }
-//   later phases    → the same `scope` command saves a scope revision; `candidate` adds a host for review.
-// Approving goes through the shared decision store: it stamps immediately and
-// sends when the 6 s undo window closes.
+// editor it shares with the header's "Edit scope" dialog (@base-ui/react Dialog).
 import { Link } from '@tanstack/react-router'
 import { useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { approvalPolicies, canReviewScope, maxBudgetRequests, maxRpsPerOriginCeiling, maxScopeHosts } from '../../../domain.ts'
 import type { ApprovalPolicy, CapabilityTier } from '../../../domain.ts'
 import { approvalPolicyMeta, capabilityTierMeta } from '../../run-state.ts'
+import { Dialog, DialogContent, DialogTitle } from '../../ui/dialog.tsx'
 import { useRun } from '../data.tsx'
 import type { Command } from '../data.tsx'
 import { useDecisions } from '../decisions.tsx'
-import { consentKey } from '../model.ts'
 import { Kbd } from '../display.tsx'
 import { cap, fmtN, fmtUsd, host, plural, words } from '../format.ts'
 import { StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
+import { runStatusLabel } from '../meta.ts'
+import { consentKey } from '../model.ts'
 import { useOverlays } from '../overlays.tsx'
-import { LabPanel } from './lab.tsx'
 import { useToast } from '../toast.tsx'
+import { cn, runBtn, RW } from '../tw.ts'
+import { LabPanel } from './lab.tsx'
 
 interface Draft {
   assetIds: string[]
@@ -74,83 +70,130 @@ function scopeCommand(r: ReturnType<typeof useRun>['detail']['run'], d: Draft, s
   }
 }
 
+const selectClass =
+  'mt-[3px] h-[26px] max-w-full rounded-control border-0 bg-panel px-1.5 font-sans text-[12.5px] font-medium text-fg shadow-hairline outline-none focus:shadow-[0_0_0_1px_var(--accent-line),0_0_0_3px_var(--accent-soft)]'
+
 /**
- * The scope card: capability / budget / approvals / rate / workers / personas,
+ * The scope card: testing mode / budget / approvals / rate / workers / test accounts,
  * the host grid, and a footer with the primary action. Editable when `editing`.
  */
-function ScopeCard({ editing, draft, setDraft, footer }: {
+function ScopeCard({ editing, draft, setDraft, footer, inDialog = false }: {
   editing: boolean
   draft: Draft
   setDraft: (fn: (d: Draft) => Draft) => void
   footer: ReactNode
+  inDialog?: boolean
 }) {
   const { detail } = useRun()
   const r = detail.run
   const { discovery, hosts } = useScopeModel()
   const selected = new Set(draft.assetIds)
   const shownHosts = editing || discovery ? hosts : hosts.filter(h => selected.has(h.id))
-  const kv = (k: string, v: ReactNode) => <div><div className="k">{k}</div><div className="v">{v}</div></div>
   const canEditConfig = editing && !discovery
-  return <div className="sheet">
-    <div className="sheet-h">
-      <Icon name="globe" /><span>Proposed scope</span>
-      <span className="muted num">{discovery ? plural(hosts.length, 'host') + ' from project seeds' : `${selected.size} of ${plural(hosts.length, 'discovered host')}`}</span>
-      {editing && !discovery && <span style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
-        <button type="button" className="btn ghost" style={{ height: 22 }} onClick={() => setDraft(d => ({ ...d, assetIds: hosts.filter(h => !h.thirdParty).slice(0, maxScopeHosts).map(h => h.id) }))}>First-party</button>
-        <button type="button" className="btn ghost" style={{ height: 22 }} onClick={() => setDraft(d => ({ ...d, assetIds: [] }))}>Clear</button>
+  const kvItems: [string, ReactNode][] = [
+    ['Testing mode', canEditConfig
+      ? <select className={selectClass} value={draft.capabilityTier} onChange={e => setDraft(d => ({ ...d, capabilityTier: Number(e.target.value) as CapabilityTier }))} aria-label="Testing mode">
+        {([0, 1, 2, 3] as const).map(t => <option key={t} value={t}>{capabilityTierMeta[t].name}</option>)}
+      </select>
+      : <span title={capabilityTierMeta[draft.capabilityTier].summary}>{capabilityTierMeta[draft.capabilityTier].name}</span>],
+    ['Budget', canEditConfig
+      ? <span className="mt-[3px] flex gap-1">
+        <input className={cn(RW.fieldInput, 'num h-[26px] w-[74px]')} type="number" min={0.1} max={500} step="any" value={draft.budgetUsd} aria-label="Budget USD" onChange={e => setDraft(d => ({ ...d, budgetUsd: Number(e.target.value) }))} />
+        <input className={cn(RW.fieldInput, 'num h-[26px] w-[74px]')} type="number" min={0} max={maxBudgetRequests} step={1} value={draft.budgetRequests} aria-label="Request cap (0 = uncapped)" title="Request cap (0 = uncapped)" onChange={e => setDraft(d => ({ ...d, budgetRequests: Number(e.target.value) }))} />
+      </span>
+      : <>{fmtUsd(draft.budgetUsd)} · {draft.budgetRequests ? fmtN(draft.budgetRequests) + ' requests' : 'uncapped requests'}</>],
+    ['Approvals', canEditConfig && draft.capabilityTier === 3
+      ? <select className={selectClass} value={draft.approvalPolicy} onChange={e => setDraft(d => ({ ...d, approvalPolicy: e.target.value as ApprovalPolicy }))} aria-label="Approval policy">
+        {approvalPolicies.map(p => <option key={p} value={p}>{approvalPolicyMeta[p].label}</option>)}
+      </select>
+      : <>{draft.capabilityTier === 3 ? approvalPolicyMeta[draft.approvalPolicy].label : cap(draft.approvalPolicy)}</>],
+    ['Rate limit', canEditConfig
+      ? <input className={cn(RW.fieldInput, 'num mt-[3px] h-[26px] w-[74px]')} type="number" min={1} max={maxRpsPerOriginCeiling} step={1} value={draft.maxRpsPerOrigin} aria-label="Requests per second per origin" onChange={e => setDraft(d => ({ ...d, maxRpsPerOrigin: Number(e.target.value) }))} />
+      : <>{draft.maxRpsPerOrigin} req/s per origin</>],
+    ['Workers', <>{r.workerConcurrency} concurrent · {r.workerMaxTurns} turns</>],
+    ['Test accounts', draft.approvedPersonaIds.length && draft.capabilityTier >= 2 ? plural(draft.approvedPersonaIds.length, 'test account') : 'None (anonymous)'],
+  ]
+
+  return <div className={inDialog ? 'overflow-hidden bg-panel' : RW.sheet}>
+    <div className={RW.sheetH}>
+      <Icon name="globe" />
+      {inDialog
+        ? <DialogTitle className="text-[13px] font-medium text-fg">Proposed scope</DialogTitle>
+        : <span>Proposed scope</span>}
+      <span className="num font-normal text-fg-subtle">{discovery ? plural(hosts.length, 'host') + ' from project seeds' : `${selected.size} of ${plural(hosts.length, 'discovered host')}`}</span>
+      {editing && !discovery && <span className="ml-auto flex gap-1">
+        <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={() => setDraft(d => ({ ...d, assetIds: hosts.filter(h => !h.thirdParty).slice(0, maxScopeHosts).map(h => h.id) }))}>First-party</button>
+        <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={() => setDraft(d => ({ ...d, assetIds: [] }))}>Clear</button>
       </span>}
     </div>
-    <div className="kv num">
-      {kv('Testing mode', canEditConfig
-        ? <select value={draft.capabilityTier} onChange={e => setDraft(d => ({ ...d, capabilityTier: Number(e.target.value) as CapabilityTier }))} aria-label="Testing mode">
-          {([0, 1, 2, 3] as const).map(t => <option key={t} value={t}>{capabilityTierMeta[t].name}</option>)}
-        </select>
-        : <span title={`Tier ${draft.capabilityTier}`}>{capabilityTierMeta[draft.capabilityTier].name}</span>)}
-      {kv('Budget', canEditConfig
-        ? <span style={{ display: 'flex', gap: 4 }}>
-          <input className="field-in num" type="number" min={0.1} max={500} step="any" value={draft.budgetUsd} aria-label="Budget USD" style={{ width: 74, height: 26 }} onChange={e => setDraft(d => ({ ...d, budgetUsd: Number(e.target.value) }))} />
-          <input className="field-in num" type="number" min={0} max={maxBudgetRequests} step={1} value={draft.budgetRequests} aria-label="Request cap (0 = uncapped)" title="Request cap (0 = uncapped)" style={{ width: 74, height: 26 }} onChange={e => setDraft(d => ({ ...d, budgetRequests: Number(e.target.value) }))} />
-        </span>
-        : <>{fmtUsd(draft.budgetUsd)} · {draft.budgetRequests ? fmtN(draft.budgetRequests) + ' requests' : 'uncapped requests'}</>)}
-      {kv('Approvals', canEditConfig && draft.capabilityTier === 3
-        ? <select value={draft.approvalPolicy} onChange={e => setDraft(d => ({ ...d, approvalPolicy: e.target.value as ApprovalPolicy }))} aria-label="Approval policy">
-          {approvalPolicies.map(p => <option key={p} value={p}>{approvalPolicyMeta[p].label}</option>)}
-        </select>
-        : <>{draft.capabilityTier === 3 ? approvalPolicyMeta[draft.approvalPolicy].label : cap(draft.approvalPolicy)}</>)}
-      {kv('Rate limit', canEditConfig
-        ? <input className="field-in num" type="number" min={1} max={maxRpsPerOriginCeiling} step={1} value={draft.maxRpsPerOrigin} aria-label="Requests per second per origin" style={{ width: 74, height: 26 }} onChange={e => setDraft(d => ({ ...d, maxRpsPerOrigin: Number(e.target.value) }))} />
-        : <>{draft.maxRpsPerOrigin} req/s per origin</>)}
-      {kv('Workers', <>{r.workerConcurrency} concurrent · {r.workerMaxTurns} turns</>)}
-      {kv('Test accounts', draft.approvedPersonaIds.length && draft.capabilityTier >= 2 ? plural(draft.approvedPersonaIds.length, 'test account') : 'None (anonymous)')}
+    <div className="num grid grid-cols-3 border-b border-line">
+      {kvItems.map(([k, v], i) => (
+        <div key={k} className={cn('px-4 py-2.5', i % 3 !== 2 && 'border-r border-line', i >= 3 && 'border-t border-line')}>
+          <div className="text-[11.5px] text-fg-subtle">{k}</div>
+          <div className="font-medium text-fg">{v}</div>
+        </div>
+      ))}
     </div>
-    {canEditConfig && detail.personas.length > 0 && <div className="sheet-x">
-      <span className="muted">Bind test accounts{draft.capabilityTier < 2 ? ' (requires Authenticated or Active mode)' : ''}</span>
-      {detail.personas.map(p => <label key={p.id} className="chk">
-        <input type="checkbox" disabled={draft.capabilityTier < 2} checked={draft.approvedPersonaIds.includes(p.id)}
-          onChange={e => setDraft(d => ({ ...d, approvedPersonaIds: e.target.checked ? [...d.approvedPersonaIds, p.id] : d.approvedPersonaIds.filter(x => x !== p.id) }))} />
-        <b style={{ fontWeight: 500, color: 'var(--fg)' }}>{p.handle}</b> · {p.roleLabel}
+    {canEditConfig && detail.personas.length > 0 && <div className="flex flex-col gap-2 border-t border-line px-4 pb-3 pt-2.5">
+      <span className="text-[12px] text-fg-subtle">Bind test accounts{draft.capabilityTier < 2 ? ' (requires Authenticated or Active mode)' : ''}</span>
+      {detail.personas.map(p => <label key={p.id} className="flex cursor-pointer select-none items-center gap-2 text-[12.5px] text-fg-muted">
+        <input
+          className="m-0 size-[13px] accent-[var(--accent)]"
+          type="checkbox"
+          disabled={draft.capabilityTier < 2}
+          checked={draft.approvedPersonaIds.includes(p.id)}
+          onChange={e => setDraft(d => ({ ...d, approvedPersonaIds: e.target.checked ? [...d.approvedPersonaIds, p.id] : d.approvedPersonaIds.filter(x => x !== p.id) }))}
+        />
+        <b className="font-medium text-fg">{p.handle}</b> · {p.roleLabel}
       </label>)}
     </div>}
     {editing && !discovery
-      ? <div className="hosts mono edit">
-        {hosts.map(h => <label key={h.id} className={selected.has(h.id) ? '' : 'off'} title={`${h.origin} · ${h.source}`}>
-          <input type="checkbox" aria-label={'Include ' + host(h.origin)} checked={selected.has(h.id)} onChange={e => setDraft(d => ({ ...d, assetIds: e.target.checked ? [...d.assetIds, h.id] : d.assetIds.filter(x => x !== h.id) }))} />
-          <span>{host(h.origin)}</span>
-          {h.thirdParty && <span className="third" title={h.externalCname ? `Third-party CNAME (${h.externalCname}) — unchecked by default` : 'Third-party host — unchecked by default'}>
-            {h.externalCname ? `Third-party CNAME (${h.externalCname})` : '3P'}
-          </span>}
-        </label>)}
+      ? <div className="grid max-h-[224px] grid-cols-3 overflow-auto p-2 font-mono text-[12px]">
+        {hosts.map(h => {
+          const on = selected.has(h.id)
+          return <label
+            key={h.id}
+            className={cn(
+              'flex cursor-pointer items-center gap-[7px] overflow-hidden whitespace-nowrap rounded-[4px] px-2 py-[3px] hover:bg-hover',
+              on ? 'text-fg-muted' : 'text-fg-faint',
+            )}
+            title={`${h.origin} · ${h.source}`}
+          >
+            <input
+              className="m-0 flex-none accent-[var(--accent)]"
+              type="checkbox"
+              aria-label={'Include ' + host(h.origin)}
+              checked={on}
+              onChange={e => setDraft(d => ({ ...d, assetIds: e.target.checked ? [...d.assetIds, h.id] : d.assetIds.filter(x => x !== h.id) }))}
+            />
+            <span className="truncate">{host(h.origin)}</span>
+            {h.thirdParty && <span className="ml-1 text-[10.5px] text-fg-subtle" title={h.externalCname ? `Third-party CNAME (${h.externalCname}) — unchecked by default` : 'Third-party host — unchecked by default'}>
+              {h.externalCname ? `Third-party CNAME (${h.externalCname})` : '3P'}
+            </span>}
+          </label>
+        })}
       </div>
-      : <div className="hosts mono">
-        {shownHosts.map(h => <span key={h.id} title={`${h.origin} · ${h.source}`}>{host(h.origin)}</span>)}
-        {!shownHosts.length && <span style={{ color: 'var(--fg-3)' }}>No hosts selected.</span>}
+      : <div className="grid max-h-[224px] grid-cols-3 overflow-auto p-2 font-mono text-[12px]">
+        {shownHosts.map(h => <span key={h.id} className="truncate px-2 py-[3px] text-fg-muted" title={`${h.origin} · ${h.source}`}>{host(h.origin)}</span>)}
+        {!shownHosts.length && <span className="px-2 py-[3px] text-fg-subtle">No hosts selected.</span>}
       </div>}
-    {editing && discovery && <div className="sheet-x"><span className="muted">Discovery runs on the project seeds. Hosts it finds come back here for scope review; edit the seeds on the <Link to="/projects/$projectId" params={{ projectId: detail.project.id }} style={{ textDecoration: 'underline' }}>project page</Link>.</span></div>}
+    {editing && discovery && <div className="flex flex-col gap-2 border-t border-line px-4 pb-3 pt-2.5">
+      <span className="text-[12px] text-fg-subtle">
+        Discovery runs on the project seeds. Hosts it finds come back here for scope review; edit the seeds on the{' '}
+        <Link to="/projects/$projectId" params={{ projectId: detail.project.id }} className="underline">project page</Link>.
+      </span>
+    </div>}
     {footer}
   </div>
 }
 
-const STEPS: [string, string][] = [['Consent', 'Approve hosts, mode, and budget.'], ['Threat model', 'Rank hosts by attack surface.'], ['Investigation', 'Workers test through the safety proxy.'], ['Verification', 'Automated replay confirms every finding.'], ['Report', 'Findings, coverage, and gaps.']]
+const STEPS: [string, string][] = [
+  ['Consent', 'Approve hosts, mode, and budget.'],
+  ['Threat model', 'Rank hosts by attack surface.'],
+  ['Investigation', 'Workers test through the safety proxy.'],
+  ['Verification', 'Automated replay confirms every finding.'],
+  ['Report', 'Findings, coverage, and gaps.'],
+]
 
 /** Overview for a waiting run: "Nothing has been sent yet." */
 export function ConsentView() {
@@ -183,29 +226,62 @@ export function ConsentView() {
   const eyebrow = scoped
     ? decision!.state === 'sent' ? 'Approved · the coordinator is starting' : 'Approved · sends when the undo window closes'
     : r.phase === 'review' ? 'Waiting on your scope approval' : 'Waiting on your consent'
-  return <div className="consent"><div className="consent-in">
-    <span className="eyebrow"><StatusGlyph status={scoped ? 'complete' : 'waiting'} />{eyebrow}</span>
-    <div className="display">Nothing has been sent <em>yet.</em></div>
-    <p className="lede">The coordinator received the goal “{r.goal}” and is holding until you approve the {discovery ? 'discovery' : 'scope'} below. No request leaves Kovo Hunter before that.</p>
-    {nw < 6 && <div className="callout"><Icon name="alert" /><div>This goal is {words(nw)} word{nw === 1 ? '' : 's'} long. The coordinator will plan broadly across all {plural(count, 'host')}. Sharpen it in the coordinator chat to focus the {fmtUsd(draft.budgetUsd)} budget.</div></div>}
-    <ScopeCard editing={editing} draft={draft} setDraft={setDraft} footer={
-      <div className="sheet-f">
-        <span className="muted">{overLimit ? `Choose up to ${maxScopeHosts} hosts.` : draft.capabilityTier === 3 ? 'State-changing requests will still ask before sending.' : `Approving authorizes a scoped defensive assessment (${capabilityTierMeta[draft.capabilityTier].short}).`}</span>
-        {scoped
-          ? decision!.state !== 'sent' && <button type="button" className="btn" onClick={() => q.reopen(ck)}><Icon name="undo" />Undo</button>
-          : <>
-            <button type="button" className="btn ghost" onClick={() => { if (editing) setDraftState(initialDraft(r, defaults)); setEditing(!editing) }}>{editing ? 'Reset' : 'Edit scope'}</button>
-            <button type="button" className="btn primary" disabled={!canApprove} onClick={approve}>
-              Approve &amp; start<Kbd style={{ background: 'transparent', color: 'inherit', boxShadow: 'inset 0 0 0 1px currentColor', opacity: 0.7 }}>A</Kbd>
-            </button>
-          </>}
-      </div>} />
-    <div className="next">{STEPS.map((s, i) => <div key={s[0]} className={(scoped ? 1 : 0) === i ? 'cur' : ''}><b>{s[0]}</b>{s[1]}</div>)}</div>
-    <LabPanel />
-  </div></div>
+  return <div className="min-h-0 flex-1 overflow-auto px-10 pb-12 pt-11">
+    <div className="mx-auto max-w-[680px]">
+      <span className="inline-flex items-center gap-2 text-[12px] font-medium text-fg-muted">
+        <StatusGlyph status={scoped ? 'complete' : 'waiting'} />{eyebrow}
+      </span>
+      <div className="mb-2 mt-3 text-[24px] font-semibold leading-[31px] tracking-[-0.02em] text-fg">
+        Nothing has been sent <em className="not-italic text-fg-subtle">yet.</em>
+      </div>
+      <p className="m-0 mb-[22px] max-w-[560px] text-[13.5px] leading-[21px] text-fg-muted">
+        The coordinator received the goal “{r.goal}” and is holding until you approve the {discovery ? 'discovery' : 'scope'} below. No request leaves Kovo Hunter before that.
+      </p>
+      {nw < 6 && <div className="mb-[18px] flex items-start gap-2.5 rounded-lg bg-warn-soft px-3 py-2.5 text-[12.5px] leading-[19px] text-fg-muted shadow-[inset_0_0_0_1px_var(--warn-line)]">
+        <Icon name="alert" className="mt-[3px] flex-none text-warn" />
+        <div>This goal is {words(nw)} word{nw === 1 ? '' : 's'} long. The coordinator will plan broadly across all {plural(count, 'host')}. Sharpen it in the coordinator chat to focus the {fmtUsd(draft.budgetUsd)} budget.</div>
+      </div>}
+      <ScopeCard
+        editing={editing}
+        draft={draft}
+        setDraft={setDraft}
+        footer={
+          <div className={RW.sheetF}>
+            <span className="mr-auto text-[12px] text-fg-subtle">
+              {overLimit ? `Choose up to ${maxScopeHosts} hosts.` : draft.capabilityTier === 3 ? 'State-changing requests will still ask before sending.' : `Approving authorizes a scoped defensive assessment (${capabilityTierMeta[draft.capabilityTier].short}).`}
+            </span>
+            {scoped
+              ? decision!.state !== 'sent' && <button type="button" className={runBtn()} onClick={() => q.reopen(ck)}><Icon name="undo" />Undo</button>
+              : <>
+                <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => { if (editing) setDraftState(initialDraft(r, defaults)); setEditing(!editing) }}>{editing ? 'Reset' : 'Edit scope'}</button>
+                <button type="button" className={runBtn({ variant: 'primary' })} disabled={!canApprove} onClick={approve}>
+                  Approve &amp; start<Kbd inverted className="ml-0.5">A</Kbd>
+                </button>
+              </>}
+          </div>
+        }
+      />
+      <div className="mt-[26px] grid grid-cols-5 border-t border-line">
+        {STEPS.map((s, i) => {
+          const cur = (scoped ? 1 : 0) === i
+          return <div
+            key={s[0]}
+            className={cn(
+              'relative pr-3 pt-3 text-[12px] leading-[18px] text-fg-subtle before:absolute before:-top-px before:left-0 before:w-7 before:content-[""]',
+              cur ? 'before:h-0.5 before:bg-accent' : 'before:h-px before:bg-fg-subtle',
+            )}
+          >
+            <b className={cn('mb-0.5 block font-medium', cur ? 'text-fg' : 'text-fg-muted')}>{s[0]}</b>
+            {s[1]}
+          </div>
+        })}
+      </div>
+      <LabPanel className="mt-[26px] border-t border-line" />
+    </div>
+  </div>
 }
 
-/** Header "Edit scope" overlay for runs past consent: save a scope revision or add a candidate host. */
+/** Header "Edit scope" dialog for runs past consent: save a scope revision or add a candidate host. */
 export function ScopeOverlay() {
   const { detail, send, pending } = useRun()
   const overlays = useOverlays()
@@ -226,31 +302,50 @@ export function ScopeOverlay() {
     overlays.closeScope()
     toast.undoable({ message: `Saving scope revision ${r.scopeRevision + 1} (${plural(draft.assetIds.length, 'host')})`, icon: 'globe', sub: 'Sends when this closes', commit: () => send(command) })
   }
-  return <div className="overlay open" onMouseDown={e => { if (e.target === e.currentTarget) overlays.closeScope() }}>
-    <div className="pal" role="dialog" aria-modal="true" aria-label="Edit scope" style={{ width: 720, maxHeight: '80vh', overflow: 'auto', padding: 0 }}>
-      <ScopeCard editing={editable} draft={draft} setDraft={fn => setDraftState(fn)} footer={<>
-        {adding && <form className="sheet-x" onSubmit={e => {
-          e.preventDefault()
-          setErr('')
-          send({ action: 'candidate', candidate: { origin, source, thirdParty } }).then(() => { setAdding(false); setOrigin(''); setSource('') }, (x: unknown) => setErr(x instanceof Error ? x.message : 'Could not add the host'))
-        }}>
-          <span className="muted">Add a candidate host for scope review</span>
-          <div style={{ display: 'flex', gap: 6 }}>
-            <input className="field-in" required placeholder="docs.example.com" value={origin} onChange={e => setOrigin(e.target.value)} aria-label="Host" style={{ flex: 1 }} />
-            <input className="field-in" required maxLength={160} placeholder="Source (e.g. service inventory)" value={source} onChange={e => setSource(e.target.value)} aria-label="Source" style={{ flex: 1 }} />
+  return <Dialog open onOpenChange={open => { if (!open) overlays.closeScope() }}>
+    <DialogContent className="max-h-[80vh] max-w-[720px] overflow-auto rounded-2xl border-line-2 p-0" aria-label="Edit scope">
+      <ScopeCard
+        inDialog
+        editing={editable}
+        draft={draft}
+        setDraft={fn => setDraftState(fn)}
+        footer={<>
+          {adding && <form
+            className="flex flex-col gap-2 border-t border-line px-4 pb-3 pt-2.5"
+            onSubmit={e => {
+              e.preventDefault()
+              setErr('')
+              send({ action: 'candidate', candidate: { origin, source, thirdParty } }).then(() => { setAdding(false); setOrigin(''); setSource('') }, (x: unknown) => setErr(x instanceof Error ? x.message : 'Could not add the host'))
+            }}
+          >
+            <span className="text-[12px] text-fg-subtle">Add a candidate host for scope review</span>
+            <div className="flex gap-1.5">
+              <input className={cn(RW.fieldInput, 'flex-1')} required placeholder="docs.example.com" value={origin} onChange={e => setOrigin(e.target.value)} aria-label="Host" />
+              <input className={cn(RW.fieldInput, 'flex-1')} required maxLength={160} placeholder="Source (e.g. service inventory)" value={source} onChange={e => setSource(e.target.value)} aria-label="Source" />
+            </div>
+            <label className="flex cursor-pointer select-none items-center gap-2 text-[12.5px] text-fg-muted">
+              <input className="m-0 size-[13px] accent-[var(--accent)]" type="checkbox" checked={thirdParty} onChange={e => setThirdParty(e.target.checked)} />
+              Third-party service
+            </label>
+            {err && <span className="text-[12px] text-danger">{err}</span>}
+            <div className="flex justify-end gap-1.5">
+              <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => setAdding(false)}>Cancel</button>
+              <button type="submit" className={runBtn()} disabled={pending > 0}>Add for review</button>
+            </div>
+          </form>}
+          <div className={RW.sheetF}>
+            {editable
+              ? <label className="mr-auto flex cursor-pointer select-none items-center gap-2 text-[12px] text-fg-subtle">
+                <input className="m-0 size-[13px] accent-[var(--accent)]" type="checkbox" checked={saveProject} onChange={e => setSaveProject(e.target.checked)} />
+                Save as the project default
+              </label>
+              : <span className="mr-auto text-[12px] text-fg-subtle">{discovery ? 'Scope is reviewed after discovery.' : `Scope can’t change while the run is ${runStatusLabel(r.status).toLowerCase()}.`}</span>}
+            {r.phase !== 'complete' && !discovery && !adding && <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => setAdding(true)}><Icon name="plus" />Add host</button>}
+            <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => overlays.closeScope()}>Close</button>
+            {editable && <button type="button" className={runBtn({ variant: 'primary' })} disabled={!draft.assetIds.length || draft.assetIds.length > maxScopeHosts} onClick={save}>{r.phase === 'review' ? 'Approve scope' : 'Save scope revision'}</button>}
           </div>
-          <label className="chk"><input type="checkbox" checked={thirdParty} onChange={e => setThirdParty(e.target.checked)} />Third-party service</label>
-          {err && <span className="err-line">{err}</span>}
-          <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}><button type="button" className="btn ghost" onClick={() => setAdding(false)}>Cancel</button><button type="submit" className="btn" disabled={pending > 0}>Add for review</button></div>
-        </form>}
-        <div className="sheet-f">
-          {editable ? <label className="chk muted" style={{ marginRight: 'auto' }}><input type="checkbox" checked={saveProject} onChange={e => setSaveProject(e.target.checked)} />Save as the project default</label>
-            : <span className="muted">{discovery ? 'Scope is reviewed after discovery.' : `Scope can’t change while the run is ${r.status}.`}</span>}
-          {r.phase !== 'complete' && !discovery && !adding && <button type="button" className="btn ghost" onClick={() => setAdding(true)}><Icon name="plus" />Add host</button>}
-          <button type="button" className="btn ghost" onClick={() => overlays.closeScope()}>Close</button>
-          {editable && <button type="button" className="btn primary" disabled={!draft.assetIds.length || draft.assetIds.length > maxScopeHosts} onClick={save}>{r.phase === 'review' ? 'Approve scope' : 'Save scope revision'}</button>}
-        </div>
-      </>} />
-    </div>
-  </div>
+        </>}
+      />
+    </DialogContent>
+  </Dialog>
 }

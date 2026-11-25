@@ -1,6 +1,7 @@
 // One icon family: 16px grid, 1.5 stroke, round caps (from prototype F).
 // Markup is static and trusted, so it is injected as inner SVG.
 import type { CSSProperties } from 'react'
+import { cn } from '../../lib/cn.ts'
 import { KovoHunterMark } from '../brand/KovoHunterMark.tsx'
 
 const P = {
@@ -76,7 +77,11 @@ export function Icon({ name, size, className, style, title }: {
 }) {
   const s = size ?? SMALL[name]
   return <svg
-    className={'ico' + (name === 'chev' ? ' chev' : '') + (className ? ' ' + className : '')}
+    className={cn(
+      'ico block size-3.5 flex-none fill-none stroke-current [stroke-linecap:round] [stroke-linejoin:round] [stroke-width:1.5]',
+      name === 'chev' && 'chev',
+      className,
+    )}
     viewBox="0 0 16 16"
     aria-hidden={title ? undefined : true}
     role={title ? 'img' : undefined}

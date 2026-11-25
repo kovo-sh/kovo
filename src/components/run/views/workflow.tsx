@@ -1,4 +1,4 @@
-// Workflow view (Agent W): the original Guardian trace, elevated (prototype F).
+// Workflow view (Agent W): execution trace in graph and list modes.
 // Graph mode: phase columns of worker cards, handoff + causal edges, stacks,
 // lineage highlight, camera, minimap, phase nav, replay. List mode: grouped
 // worker rows. Inspectors: worker, stack, queued steps, step, graph digest.
@@ -6,9 +6,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Dropdown, FilterBox, Tabs } from '../controls.tsx'
 import { useRun, useRunModel } from '../data.tsx'
-import { EmptyState, Kbd, KbdGroup, Seg } from '../display.tsx'
+import { EmptyState, Kbd, KbdGroup, Seg, Tag } from '../display.tsx'
 import { fmtN, host, plural, readRunUrlParam, syncRunUrlParam } from '../format.ts'
-import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
+import { LiveDot, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
 import { PHASE_LABEL, PHASE_ORDER, stLabel } from '../meta.ts'
@@ -17,6 +17,7 @@ import type { Assignment } from '../model.ts'
 import { useListNav, useNav, useViewState } from '../nav.tsx'
 import { usePaletteCommands } from '../palette.tsx'
 import type { InspectorMap } from '../pane.tsx'
+import { cn, runBtn, runDdItem, RW } from '../tw.ts'
 import { WorkflowGraph } from './workflow-graph.tsx'
 import { DigestInspector, StackInspector, StepInspector, StepsInspector, WorkerInspector } from './workflow-inspector.tsx'
 import { isLive, QUEUE_ID, setExpanded, useWorkflowLayout } from './workflow-layout.ts'
@@ -157,22 +158,51 @@ export function WorkflowView() {
     filterRef.current?.blur()
   }
 
-  const toolbar = <div className="toolbar" data-tb="workflow">
+  const modeBtnCls = (on: boolean) => cn(
+    'inline-flex h-[22px] cursor-pointer items-center justify-center gap-[5px] rounded-[4px] border-0 px-2 font-sans text-[12px] font-medium transition-[background-color,color,box-shadow] duration-[var(--d1)] @max-[760px]/wftb:px-[7px]',
+    on
+      ? 'bg-raise text-fg shadow-[0_0_0_1px_var(--line-2),0_1px_2px_rgba(0,0,0,.05)] hover:bg-raise'
+      : 'bg-transparent text-fg-muted shadow-none hover:bg-transparent hover:text-fg',
+  )
+
+  const toolbar = <div className={cn(RW.toolbar, 'relative @container/wftb')} data-tb="workflow">
     <Tabs tabs={tabs.map(t => [t.k, t.l, t.n] as [Filter, string, number])} value={effFilter} onChange={setFilter} label="Filter workers" />
-    <span className="tb-sp" />
-    <FilterBox ref={filterRef} value={query} onChange={setQuery} onEnter={firstMatch} label="Filter workers" />
+    <FilterBox
+      ref={filterRef}
+      value={query}
+      onChange={setQuery}
+      onEnter={firstMatch}
+      label="Filter workers"
+      className="@max-[760px]/wftb:w-24 @max-[760px]/wftb:focus-within:w-40"
+    />
     {mode === 'list' && <GroupMenu />}
     {detail.digests.length > 0 && <DigestMenu />}
-    <button type="button" className={'btn ghost' + (replay ? ' on' : '')} title="Replay the run (⇧R)" onClick={startReplay} disabled={!assignments.length}><Icon name="replay" /><span className="wf-lbl">Replay</span></button>
-    <div className="seg" title="Graph or list (L)" role="radiogroup">
-      <button type="button" role="radio" aria-checked={mode === 'graph'} className={mode === 'graph' ? 'on' : ''} onClick={() => setMode('graph')}><Icon name="graph" /><span className="wf-lbl">Graph</span></button>
-      <button type="button" role="radio" aria-checked={mode === 'list'} className={mode === 'list' ? 'on' : ''} onClick={() => { setReplay(false); setMode('list') }}><Icon name="list" /><span className="wf-lbl">List</span></button>
+    <button
+      type="button"
+      className={runBtn({ variant: replay ? 'ghostOn' : 'ghost' })}
+      title="Replay the run (⇧R)"
+      onClick={startReplay}
+      disabled={!assignments.length}
+    >
+      <Icon name="replay" /><span className="@max-[760px]/wftb:hidden">Replay</span>
+    </button>
+    <div
+      className="inline-flex h-[26px] flex-none items-center rounded-control bg-sunk p-0.5 shadow-[inset_0_0_0_1px_var(--line)]"
+      title="Graph or list (L)"
+      role="radiogroup"
+    >
+      <button type="button" role="radio" aria-checked={mode === 'graph'} className={modeBtnCls(mode === 'graph')} onClick={() => setMode('graph')}>
+        <Icon name="graph" /><span className="@max-[760px]/wftb:hidden">Graph</span>
+      </button>
+      <button type="button" role="radio" aria-checked={mode === 'list'} className={modeBtnCls(mode === 'list')} onClick={() => { setReplay(false); setMode('list') }}>
+        <Icon name="list" /><span className="@max-[760px]/wftb:hidden">List</span>
+      </button>
     </div>
   </div>
 
   if (!assignments.length) {
     return <>{toolbar}<EmptyState icon="workers" title="No workers dispatched"
-      action={detail.run.status === 'waiting' ? <button type="button" className="btn" onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
+      action={detail.run.status === 'waiting' ? <button type="button" className={runBtn()} onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
       The coordinator plans chain steps after scope consent, then dispatches sandboxed workers. Their execution graph builds up here.
     </EmptyState></>
   }
@@ -190,29 +220,34 @@ export function WorkflowView() {
 function GroupMenu() {
   const [group, setGroup] = useViewState<Group>('wf.group', 'phase')
   return <Dropdown icon="sliders" title="Display options (⇧G cycles grouping)"
-    label={<><span className="dim wf-lbl">Group</span><span>{GROUPS.find(g => g[0] === group)?.[1]}</span></>}>
-    <div className="dd-sec">Grouping<KbdGroup keys={['⇧', 'G']} style={{ marginLeft: 'auto' }} /></div>
-    <Seg<Group> value={group} onChange={setGroup} options={GROUPS.map(([value, label]) => ({ value, label }))} />
+    label={<><span className="text-fg-subtle @max-[760px]/wftb:hidden">Group</span><span>{GROUPS.find(g => g[0] === group)?.[1]}</span></>}>
+    <div className={RW.ddSec}>Grouping<KbdGroup keys={['⇧', 'G']} className="ml-auto" /></div>
+    <Seg<Group> value={group} onChange={setGroup} fullWidth options={GROUPS.map(([value, label]) => ({ value, label }))} />
   </Dropdown>
 }
 
-/** Memory summaries (cold-graph digests: compacted summaries of older facts). */
+/** Memory summaries (saved workspace snapshots of older facts). */
 function DigestMenu() {
   const { detail } = useRun()
   const nav = useNav()
   const ds = detail.digests
   const active = ds.filter(d => d.active).length
-  return <Dropdown icon="archive" title="Memory summaries (cold-graph digests): compacted summaries of older facts" menuClassName="wf-dg-menu"
-    btnClassName={'btn ghost dd-btn' + (nav.sel?.kind === 'digest' ? ' on' : '')}
-    label={<><span className="dim wf-lbl">Summaries</span><span className="num">{active || ds.length}</span></>}>
+  return <Dropdown icon="archive" title="Memory summaries: compacted summaries of older facts" menuClassName="w-[320px] p-1.5"
+    btnClassName={runBtn({ variant: nav.sel?.kind === 'digest' ? 'ghostOn' : 'ghost' })}
+    label={<><span className="text-fg-subtle @max-[760px]/wftb:hidden">Summaries</span><span className="tabular-nums">{active || ds.length}</span></>}>
     {close => <>
-      <div className="dd-sec">Memory summaries<span className="num" style={{ marginLeft: 'auto', fontWeight: 400 }}>{active} active · {ds.length} total</span></div>
-      {ds.map(d => <button key={d.id} type="button" role="menuitem" className={'dd-item wf-dg-item' + (nav.sel?.kind === 'digest' && nav.sel.id === d.id ? ' on' : '')}
-        onClick={() => { close(); nav.select({ kind: 'digest', id: d.id }) }}>
-        <span className="wf-dg-t">Round {d.roundNo} · {d.level} summary{!d.active && <span className="dim"> · superseded</span>}</span>
-        <span className="ct num">{plural(d.coveredFactIds.length, 'fact')} · {d.coveredAssignmentIds.length} w</span>
+      <div className={cn(RW.ddSec, 'px-2 py-1.5')}>Memory summaries<span className="ml-auto font-normal tabular-nums">{active} active · {ds.length} total</span></div>
+      {ds.map(d => <button
+        key={d.id}
+        type="button"
+        role="menuitem"
+        className={cn(runDdItem({ active: nav.sel?.kind === 'digest' && nav.sel.id === d.id }), 'h-auto min-h-8 py-[5px]')}
+        onClick={() => { close(); nav.select({ kind: 'digest', id: d.id }) }}
+      >
+        <span className="min-w-0 truncate">Round {d.roundNo} · {d.level} summary{!d.active && <span className="text-fg-subtle"> · superseded</span>}</span>
+        <span className="ml-auto flex-none text-fg-subtle tabular-nums">{plural(d.coveredFactIds.length, 'fact')} · {d.coveredAssignmentIds.length} w</span>
       </button>)}
-      <p className="wf-dg-note">Selecting a summary highlights the workers it covers.</p>
+      <p className="mx-2 mb-0.5 mt-1.5 text-[11.5px] text-fg-subtle">Selecting a summary highlights the workers it covers.</p>
     </>}
   </Dropdown>
 }
@@ -238,7 +273,7 @@ function WorkerList({ matches }: { matches: (a: Assignment) => boolean }) {
     return keys.map(k => {
       const step = group === 'step' ? model.stepById.get(k) : undefined
       const label = group === 'phase' ? PHASE_LABEL[k] ?? k : group === 'status' ? stLabel(k) : step ? '#' + step.seq + ' ' + step.title : 'Unplanned (system workers)'
-      const glyph: ReactNode = group === 'phase' ? <span style={{ color: 'var(--fg-3)', display: 'flex' }}><Icon name="workers" /></span> : <StatusGlyph status={group === 'status' ? k : step?.status ?? 'complete'} />
+      const glyph: ReactNode = group === 'phase' ? <span className="flex text-fg-subtle"><Icon name="workers" /></span> : <StatusGlyph status={group === 'status' ? k : step?.status ?? 'complete'} />
       return { key: k, label, glyph, items: by.get(k)! }
     })
   }, [items, group, model])
@@ -249,7 +284,7 @@ function WorkerList({ matches }: { matches: (a: Assignment) => boolean }) {
   const listRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (index < 0) return
-    listRef.current?.querySelector(`.row[data-id="${CSS.escape(ids[index])}"]`)?.scrollIntoView({ block: 'nearest' })
+    listRef.current?.querySelector(`[data-id="${CSS.escape(ids[index])}"]`)?.scrollIntoView({ block: 'nearest' })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [index])
   const row = (a: Assignment) => {
@@ -257,33 +292,41 @@ function WorkerList({ matches }: { matches: (a: Assignment) => boolean }) {
     const nfa = (model.factsByWorker.get(a.id) ?? []).length
     const pct = a.maxTurns ? Math.min(100, a.turnsUsed / a.maxTurns * 100) : 0
     const cur = nav.sel?.kind === 'worker' && nav.sel.id === a.id
-    return <div key={a.id} className={'row' + (cur ? ' cur' : '')} data-id={a.id} onClick={() => nav.select({ kind: 'worker', id: a.id })}>
-      <span className="g" title={stLabel(a.status)}>{isLive(a) ? <span className={'live' + (a.status === 'running' ? '' : ' paused')} style={{ margin: '0 3px' }} /> : <StatusGlyph status={a.status} />}</span>
-      <span className="title">{a.title}</span>
-      {fs.length > 0 && <span className="nbadge f" title="Findings citing this worker's evidence or exchanges"><SevGlyph sev={worstSeverity(fs)} />{fs.length}</span>}
-      {nfa > 0 && <span className="nbadge" title="Facts recorded">{nfa} facts</span>}
-      {group !== 'phase' && <span className="c-tag"><span className="tag">{PHASE_LABEL[a.phase] ?? a.phase}</span></span>}
-      <span className="c-host mono">{host(a.sourceOrigins[0] ?? '')}</span>
-      <span className="c-turns num" title="Turns used"><span className="minibar"><i style={{ width: pct + '%' }} /></span>{a.turnsUsed}/{a.maxTurns}</span>
-      <span className="c-req num" title="Requests">{fmtN(a.requestsUsed)} req</span>
+    return <div key={a.id} className={cn(RW.row, cur && RW.rowCur)} data-id={a.id} onClick={() => nav.select({ kind: 'worker', id: a.id })}>
+      <span className="inline-flex size-3.5 flex-none items-center justify-center" title={stLabel(a.status)}>
+        {isLive(a) ? <LiveDot paused={a.status !== 'running'} className="mx-[3px]" /> : <StatusGlyph status={a.status} />}
+      </span>
+      <span className="min-w-0 flex-1 truncate text-fg">{a.title}</span>
+      {fs.length > 0 && <span className="inline-flex h-[17px] flex-none items-center gap-1 rounded-[9px] bg-panel px-1.5 text-[11px] font-medium text-fg shadow-[inset_0_0_0_1px_var(--line-2)]" title="Findings citing this worker's evidence or exchanges"><SevGlyph sev={worstSeverity(fs)} />{fs.length}</span>}
+      {nfa > 0 && <span className="inline-flex h-[17px] flex-none items-center gap-1 rounded-[9px] bg-sunk px-1.5 text-[11px] font-medium text-fg-muted shadow-[inset_0_0_0_1px_var(--line-2)]" title="Facts recorded">{nfa} facts</span>}
+      {group !== 'phase' && <span className="max-w-[170px] flex-none truncate"><Tag>{PHASE_LABEL[a.phase] ?? a.phase}</Tag></span>}
+      <span className="w-[150px] flex-none truncate text-right font-mono text-[12px] text-fg-subtle max-[1320px]:w-[120px] max-[1180px]:hidden">{host(a.sourceOrigins[0] ?? '')}</span>
+      <span className="flex w-[88px] flex-none items-center justify-end gap-[7px] text-fg-subtle tabular-nums" title="Turns used">
+        <span className="relative h-[3px] w-9 overflow-hidden rounded-[3px] bg-line-2"><i className="absolute inset-y-0 left-0 bg-fg-subtle" style={{ width: pct + '%' }} /></span>
+        {a.turnsUsed}/{a.maxTurns}
+      </span>
+      <span className="w-[52px] flex-none text-right text-fg-subtle tabular-nums" title="Requests">{fmtN(a.requestsUsed)} req</span>
     </div>
   }
   if (!items.length) return <EmptyState icon="search" title="Nothing matches" style={{ paddingTop: 80 }}>Try a different filter or switch tabs.</EmptyState>
-  return <div className="list wf-list" ref={listRef} tabIndex={-1} role="region" aria-label="Worker list">
+  return <div className={RW.list} ref={listRef} tabIndex={-1} role="region" aria-label="Worker list">
     {groups ? groups.map(g => {
       const col = !!collapsed[ck(g.key)]
       const tu = g.items.reduce((s, a) => s + a.turnsUsed, 0), req = g.items.reduce((s, a) => s + a.requestsUsed, 0)
       return <div key={g.key}>
-        <div className={'ghead' + (col ? ' collapsed' : '')} role="button" tabIndex={0} aria-expanded={!col}
+        <div className={RW.ghead} role="button" tabIndex={0} aria-expanded={!col}
           onClick={() => setCollapsed(c => ({ ...c, [ck(g.key)]: !col }))}
           onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setCollapsed(c => ({ ...c, [ck(g.key)]: !col })) } }}>
-          <Icon name="chev" /><span className="g">{g.glyph}</span><span>{g.label}</span><span className="ct num">{g.items.length}</span>
-          <span className="gbar num">{fmtN(tu)} turns · {fmtN(req)} req</span>
+          <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-guardian', col && '-rotate-90')} />
+          <span className="inline-flex size-3.5 flex-none items-center justify-center">{g.glyph}</span>
+          <span>{g.label}</span>
+          <span className="font-normal text-fg-subtle tabular-nums">{g.items.length}</span>
+          <span className="ml-auto flex items-center gap-2 font-normal text-fg-subtle tabular-nums">{fmtN(tu)} turns · {fmtN(req)} req</span>
         </div>
         {!col && g.items.map(row)}
       </div>
     }) : items.map(row)}
-    <div className="listnote"><Kbd>L</Kbd> graph · <Kbd>⇧</Kbd><Kbd>G</Kbd> grouping</div>
+    <div className={cn(RW.listnote, 'gap-1')}><Kbd>L</Kbd> graph · <Kbd>⇧</Kbd><Kbd>G</Kbd> grouping</div>
   </div>
 }
 

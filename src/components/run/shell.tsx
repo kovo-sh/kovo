@@ -5,14 +5,14 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { BoardPane, useBoardSeen } from './coordinator.tsx'
 import { RunDataProvider, useRun } from './data.tsx'
-import type { Detail } from './model.ts'
 import { DecisionsProvider, useDecisions } from './decisions.tsx'
-import { fmtUsd, fmtN, RUN_SUBMODE_PARAMS } from './format.ts'
+import { fmtN, fmtUsd, RUN_SUBMODE_PARAMS } from './format.ts'
 import { RunHeader } from './header.tsx'
 import { Icon } from './icons.tsx'
 import { KeyboardProvider, useShortcuts } from './keyboard.tsx'
 import { VIEWS } from './meta.ts'
 import type { ViewId } from './meta.ts'
+import type { Detail } from './model.ts'
 import { useReducedMotion } from './motion.tsx'
 import { NavProvider, selKey, useNav } from './nav.tsx'
 import type { Sel } from './nav.tsx'
@@ -22,6 +22,7 @@ import { PaletteProvider, usePalette } from './palette.tsx'
 import { Rail } from './rail.tsx'
 import { useTheme } from './theme.ts'
 import { ToastProvider, useToast } from './toast.tsx'
+import { cn, runBtn, RW } from './tw.ts'
 import { ScopeOverlay } from './views/consent.tsx'
 import { CHAT_FIRST_VIEWS, INSPECTORS, VIEW_COMPONENTS } from './views/index.tsx'
 
@@ -62,7 +63,7 @@ export function RunShell({ detail, view, sel }: { detail: Detail; view: ViewId; 
   const switchRun = useCallback((id: string, v?: ViewId) => {
     void navigate({ to: '/runs/$runId', params: { runId: id }, search: v ? { view: v } : {} })
   }, [navigate])
-  return <div className="rw">
+  return <div className="relative h-screen overflow-hidden bg-bg font-sans text-[13px] leading-5 tracking-[-0.003em] text-fg antialiased">
     <KeyboardProvider>
       <ToastProvider>
         <DataWithToasts detail={detail}>
@@ -108,6 +109,7 @@ function Workspace() {
   const overlays = useOverlays()
   const [paneW, setPaneW] = useState<number | null>(null)
   const [resizing, setResizing] = useState(false)
+  const paneRef = useRef<HTMLElement>(null)
   useEffect(() => {
     const saved = Number(localStorage.getItem(PANE_KEY))
     if (saved >= PANE_MIN && saved <= PANE_MAX) setPaneW(saved)
@@ -116,23 +118,44 @@ function Workspace() {
   useBoardSeen()
   const View = VIEW_COMPONENTS[nav.view]
   const rm = useReducedMotion()
-  const appClass = 'app' + (nav.paneCollapsed ? ' pane-collapsed' : '') + (resizing ? ' pane-resizing' : '')
-  return <div className={appClass} style={paneW && !nav.paneCollapsed ? { ['--pane-w' as string]: paneW + 'px' } : undefined}>
+  const cols = nav.paneCollapsed
+    ? 'grid-cols-[232px_minmax(0,1fr)_0px]'
+    : 'grid-cols-[232px_minmax(0,1fr)_var(--pane-w,404px)] max-[1180px]:[--pane-w:360px]'
+  return <div
+    className={cn(
+      'grid h-screen',
+      cols,
+      !resizing && !rm && 'transition-[grid-template-columns] duration-[var(--d2)] ease-guardian',
+    )}
+    style={paneW && !nav.paneCollapsed ? { ['--pane-w' as string]: paneW + 'px' } : undefined}
+  >
     <Rail />
-    <main className="main" aria-label="Run">
+    <main className="relative flex min-h-0 min-w-0 flex-col bg-panel" aria-label="Run">
       <RunHeader />
       <RunBanners />
-      <div key={nav.view} className={'view-host' + (rm ? '' : ' view-in')} id="vh"><View /></div>
+      <div key={nav.view} className="relative flex min-h-0 flex-1 flex-col" id="vh"><View /></div>
     </main>
-    <aside className="pane" aria-label="Inspector" aria-hidden={nav.paneCollapsed || undefined}>
-      {!nav.paneCollapsed && <Resizer onResize={setPaneW} onDraggingChange={setResizing} />}
-      <div id="paneInner"><PaneContent /></div>
+    <aside
+      ref={paneRef}
+      className={cn(
+        'relative flex min-h-0 min-w-0 flex-col border-l border-line bg-panel transition-opacity duration-[var(--d2)] ease-guardian motion-reduce:transition-none',
+        nav.paneCollapsed && 'pointer-events-none overflow-hidden border-l-transparent opacity-0 duration-[var(--d1)]',
+      )}
+      aria-label="Inspector"
+      aria-hidden={nav.paneCollapsed || undefined}
+    >
+      {!nav.paneCollapsed && <Resizer paneRef={paneRef} onResize={setPaneW} onDraggingChange={setResizing} />}
+      <div id="paneInner" className="flex min-h-0 flex-1 flex-col"><PaneContent /></div>
     </aside>
     {overlays.scopeOpen && <ScopeOverlay />}
   </div>
 }
 
-function Resizer({ onResize, onDraggingChange }: { onResize: (w: number) => void; onDraggingChange: (dragging: boolean) => void }) {
+function Resizer({ paneRef, onResize, onDraggingChange }: {
+  paneRef: React.RefObject<HTMLElement | null>
+  onResize: (w: number) => void
+  onDraggingChange: (dragging: boolean) => void
+}) {
   const [drag, setDrag] = useState(false)
   const start = useRef({ x: 0, w: 0 })
   useEffect(() => {
@@ -142,32 +165,39 @@ function Resizer({ onResize, onDraggingChange }: { onResize: (w: number) => void
     const up = () => {
       setDrag(false)
       document.body.style.cursor = ''
-      const w = document.querySelector('.rw .pane')?.getBoundingClientRect().width
+      const w = paneRef.current?.getBoundingClientRect().width
       if (w) try { localStorage.setItem(PANE_KEY, String(Math.round(w))) } catch { /* ignore */ }
     }
     document.body.style.cursor = 'col-resize'
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', up)
     return () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up) }
-  }, [drag, onResize, onDraggingChange])
-  return <div className={'resizer' + (drag ? ' drag' : '')} role="separator" aria-orientation="vertical" aria-label="Resize inspector" title="Drag to resize · double-click to reset"
+  }, [drag, onResize, onDraggingChange, paneRef])
+  return <div
+    className={cn(
+      'absolute -left-[3px] bottom-0 top-0 z-[5] w-1.5 cursor-col-resize hover:bg-[linear-gradient(90deg,transparent_2px,var(--accent-line)_2px,var(--accent-line)_4px,transparent_4px)]',
+      drag && 'bg-[linear-gradient(90deg,transparent_2px,var(--accent-line)_2px,var(--accent-line)_4px,transparent_4px)]',
+    )}
+    role="separator"
+    aria-orientation="vertical"
+    aria-label="Resize inspector"
+    title="Drag to resize · double-click to reset"
     onPointerDown={e => {
       e.preventDefault()
       start.current = { x: e.clientX, w: (e.currentTarget.parentElement as HTMLElement).getBoundingClientRect().width }
       setDrag(true)
     }}
-    onDoubleClick={() => { onResize(404); try { localStorage.removeItem(PANE_KEY) } catch { /* ignore */ } }} />
+    onDoubleClick={() => { onResize(404); try { localStorage.removeItem(PANE_KEY) } catch { /* ignore */ } }}
+  />
 }
 
 function PaneContent() {
   const nav = useNav()
-  const rm = useReducedMotion()
   const sel = nav.sel
   const showChat = nav.chat || !sel || (CHAT_FIRST_VIEWS.includes(nav.view) && !sel)
   const key = showChat ? 'chat' : selKey(sel!)
   const Inspector = !showChat ? INSPECTORS[sel!.kind] ?? FallbackInspector : null
-  const anim = rm ? '' : nav.paneAnim === 'left' ? ' pane-in-l' : ' pane-in'
-  return <div key={key} className={'pane-tx' + anim}>
+  return <div key={key} className="flex min-h-0 min-w-0 flex-1 flex-col">
     {showChat ? <BoardPane /> : Inspector && <Inspector sel={sel!} />}
   </div>
 }
@@ -179,26 +209,39 @@ function RunBanners() {
   const [usd, setUsd] = useState(() => Math.min(500, Math.max(r.budgetUsd + 10, Math.ceil(r.spentUsd + 10))))
   const [reqs, setReqs] = useState(0)
   return <>
-    {r.status === 'budget_paused' && <form className="rbanner warn" aria-label="Budget paused" onSubmit={e => {
-      e.preventDefault()
-      void send({ action: 'raise_budget', budgetUsd: usd, budgetRequests: reqs, resume: true }).catch(() => {})
-    }}>
-      <Icon name="budget" />
-      <span className="grow"><b>Paused at the budget ceiling.</b> Spent {fmtUsd(r.spentUsd)} of {fmtUsd(r.budgetUsd)} and {fmtN(r.spentRequests)} of {r.budgetRequests ? fmtN(r.budgetRequests) : 'uncapped'} requests. A partial report is saved; raise the limits to resume without repeating work.</span>
-      <label>USD<input className="field-in num" type="number" min={0.1} max={500} step="any" required value={usd} onChange={e => setUsd(Number(e.target.value))} aria-label="New USD budget" /></label>
-      <label>Requests<input className="field-in num" type="number" min={0} step={1} required value={reqs} onChange={e => setReqs(Number(e.target.value))} aria-label="New request cap (0 = uncapped)" title="0 = uncapped" /></label>
-      <button type="submit" className="btn primary" disabled={pending > 0}>Raise and resume</button>
+    {r.status === 'budget_paused' && <form
+      className="flex min-h-10 flex-none items-center gap-2.5 border-b border-line bg-warn-soft py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted shadow-[inset_0_-1px_0_var(--warn-line)]"
+      aria-label="Budget paused"
+      onSubmit={e => {
+        e.preventDefault()
+        void send({ action: 'raise_budget', budgetUsd: usd, budgetRequests: reqs, resume: true }).catch(() => {})
+      }}
+    >
+      <Icon name="budget" className="text-warn" />
+      <span className="min-w-0 flex-1"><b className="font-medium text-fg">Paused at the budget ceiling.</b> Spent {fmtUsd(r.spentUsd)} of {fmtUsd(r.budgetUsd)} and {fmtN(r.spentRequests)} of {r.budgetRequests ? fmtN(r.budgetRequests) : 'uncapped'} requests. A partial report is saved; raise the limits to resume without repeating work.</span>
+      <label className="flex flex-none items-center gap-1.5 text-[12px] text-fg-subtle">
+        USD
+        <input className={cn(RW.fieldInput, 'num h-[26px] w-[86px]')} type="number" min={0.1} max={500} step="any" required value={usd} onChange={e => setUsd(Number(e.target.value))} aria-label="New USD budget" />
+      </label>
+      <label className="flex flex-none items-center gap-1.5 text-[12px] text-fg-subtle">
+        Requests
+        <input className={cn(RW.fieldInput, 'num h-[26px] w-[86px]')} type="number" min={0} step={1} required value={reqs} onChange={e => setReqs(Number(e.target.value))} aria-label="New request cap (0 = uncapped)" title="0 = uncapped" />
+      </label>
+      <button type="submit" className={runBtn({ variant: 'primary' })} disabled={pending > 0}>Raise and resume</button>
     </form>}
-    {model.needsModel && <div className="rbanner warn" role="status">
-      <Icon name="alert" />
-      <span className="grow"><b>Connect a model to continue.</b> No enabled model profile; settings bring you back here.</span>
-      <Link className="btn" to="/settings" search={{ runId: r.id }}>Set up model<Icon name="arrowR" /></Link>
+    {model.needsModel && <div className="flex min-h-10 flex-none items-center gap-2.5 border-b border-line bg-warn-soft py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted shadow-[inset_0_-1px_0_var(--warn-line)]" role="status">
+      <Icon name="alert" className="text-warn" />
+      <span className="min-w-0 flex-1"><b className="font-medium text-fg">Connect a model to continue.</b> No enabled model profile; settings bring you back here.</span>
+      <Link className={runBtn()} to="/settings" search={{ runId: r.id }}>Set up model<Icon name="arrowR" /></Link>
     </div>}
-    {connection === 'reconnecting' && <div className="rbanner" role="status"><Icon name="activity" /><span className="grow">Reconnecting to Kovo Hunter… the view keeps the last data it had.</span></div>}
+    {connection === 'reconnecting' && <div className="flex min-h-10 flex-none items-center gap-2.5 border-b border-line bg-sunk py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted" role="status">
+      <Icon name="activity" />
+      <span className="min-w-0 flex-1">Reconnecting to Kovo Hunter… the view keeps the last data it had.</span>
+    </div>}
   </>
 }
 
-/** Global keyboard model (F): ⌘K, ?, g+letter, 1–8, [ ], ⇧T, C, Esc stack, Z / ⌘Z undo. */
+/** Global keyboard model: ⌘K, ?, g+letter, 1–8, [ ], ⇧T, C, Esc stack, Z / ⌘Z undo. */
 function useGlobalShortcuts() {
   const nav = useNav()
   const pal = usePalette()

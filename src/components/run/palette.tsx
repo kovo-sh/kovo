@@ -1,15 +1,8 @@
-// ⌘K command palette and the keyboard-shortcut sheet.
-//
-// Views add their own commands while mounted:
-//   usePaletteCommands([
-//     { id: 'wf.replay', section: 'Actions', label: 'Replay the run in the workflow graph', icon: 'replay', keys: ['⇧', 'R'], run: startReplay },
-//   ])
-// Sections render in this order: Views, Runs, Findings, Workers, Hosts, Actions
-// (any other section name is appended). With an empty query the palette shows
-// Views, Runs, Actions and the top five findings.
+// ⌘K command palette and the keyboard-shortcut sheet, built on @base-ui/react Dialog.
 import { useNavigate } from '@tanstack/react-router'
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
+import { Dialog, DialogContent, DialogTitle } from '../ui/dialog.tsx'
 import { useRun } from './data.tsx'
 import { Kbd, KbdGroup } from './display.tsx'
 import { fmtAgo, fmtFullDateTime, host, modKey, runLabel, short } from './format.ts'
@@ -17,9 +10,10 @@ import { SevGlyph, StatusGlyph } from './glyphs.tsx'
 import { Icon } from './icons.tsx'
 import type { IconName } from './icons.tsx'
 import { useShortcuts } from './keyboard.tsx'
-import { RISKL, runStatusLabel, SEV_ORDER, PHASE_LABEL, VIEWS } from './meta.ts'
+import { PHASE_LABEL, RISKL, runStatusLabel, SEV_ORDER, VIEWS } from './meta.ts'
 import { useLinks, useNav } from './nav.tsx'
 import { useTheme } from './theme.ts'
+import { cn, RW } from './tw.ts'
 
 export interface PaletteCommand {
   id: string
@@ -91,7 +85,7 @@ function Highlight({ text, q }: { text: string; q: string }) {
   const toks = q.split(/\s+/).filter(Boolean).map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
   if (!toks.length) return <>{text}</>
   const parts = text.split(new RegExp('(' + toks.join('|') + ')', 'gi'))
-  return <>{parts.map((p, i) => i % 2 ? <mark key={i}>{p}</mark> : p)}</>
+  return <>{parts.map((p, i) => i % 2 ? <mark key={i} className="bg-transparent font-medium text-accent">{p}</mark> : p)}</>
 }
 
 function useBaseCommands(): PaletteCommand[] {
@@ -120,7 +114,7 @@ function useBaseCommands(): PaletteCommand[] {
       id: 'w.' + a.id, section: 'Workers', label: a.title, icon: <StatusGlyph status={a.status} />, right: PHASE_LABEL[a.phase] ?? a.phase, run: () => links.worker(a.id),
     }))
     model.surface.origins.forEach(o => out.push({
-      id: 'h.' + o.origin, section: 'Hosts', label: o.host, icon: <span style={{ color: 'var(--fg-3)', display: 'flex' }}><Icon name="globe" /></span>, right: RISKL[o.tier], run: () => links.host(o.origin),
+      id: 'h.' + o.origin, section: 'Hosts', label: o.host, icon: <span className="flex text-fg-subtle"><Icon name="globe" /></span>, right: RISKL[o.tier], run: () => links.host(o.origin),
     }))
     return out
   }, [model, runs, navigate, nav, links, pal, theme, toggle])
@@ -152,45 +146,82 @@ function Palette({ prefill }: { prefill: string }) {
     return secs.flatMap(s => scored.filter(i => i.section === s).slice(0, 10))
   }, [base, pal, q])
   const cur = Math.min(idx, Math.max(0, items.length - 1))
-  useEffect(() => { listRef.current?.querySelector('.pi.on')?.scrollIntoView({ block: 'nearest' }) }, [cur, items])
+  useEffect(() => { listRef.current?.querySelector('[data-active="true"]')?.scrollIntoView({ block: 'nearest' }) }, [cur, items])
   const run = (i: number) => { const it = items[i]; if (!it) return; pal.close(); it.run() }
   useShortcuts([{ key: 'Escape', allowInInput: true, run: () => pal.close() }], { priority: 100, exclusive: true })
   let last = ''
-  return <div className="overlay open" onMouseDown={e => { if (e.target === e.currentTarget) pal.close() }}>
-    <div className="pal" role="dialog" aria-modal="true" aria-label="Command palette">
-      <div className="pal-in">
+  return <Dialog open onOpenChange={open => { if (!open) pal.close() }}>
+    <DialogContent
+      className="max-w-[620px] overflow-hidden rounded-2xl border-line-2 bg-raise p-0"
+      aria-label="Command palette"
+    >
+      <div className="flex h-[50px] items-center gap-2.5 border-b border-line px-4 text-fg-subtle">
         <Icon name="search" />
-        <input autoFocus value={q} placeholder="Jump to a run, view, finding, worker, or action…" autoComplete="off" spellCheck={false}
+        <input
+          autoFocus
+          value={q}
+          placeholder="Jump to a run, view, finding, worker, or action…"
+          autoComplete="off"
+          spellCheck={false}
           aria-label="Search commands"
+          className={cn(RW.rawInput, 'text-[14.5px]')}
           onChange={e => { setQ(e.target.value); setIdx(0) }}
           onKeyDown={e => {
             if (e.key === 'ArrowDown' || (e.ctrlKey && e.key === 'n')) { e.preventDefault(); setIdx(Math.min(items.length - 1, cur + 1)) }
             else if (e.key === 'ArrowUp' || (e.ctrlKey && e.key === 'p')) { e.preventDefault(); setIdx(Math.max(0, cur - 1)) }
             else if (e.key === 'Enter') { e.preventDefault(); run(cur) }
-          }} />
-        <span className="pal-scope" title={`${detail.project.name} · Started ${fmtFullDateTime(model.run.createdAt)} · Run ${short(model.run.id)}`} suppressHydrationWarning>{detail.project.name} · {fmtAgo(model.run.createdAt)}</span>
+          }}
+        />
+        <span
+          className="flex-none rounded-[5px] px-[7px] py-0.5 text-[11.5px] text-fg-subtle shadow-[inset_0_0_0_1px_var(--line-2)]"
+          title={`${detail.project.name} · Started ${fmtFullDateTime(model.run.createdAt)} · Run ${short(model.run.id)}`}
+          suppressHydrationWarning
+        >
+          {detail.project.name} · {fmtAgo(model.run.createdAt)}
+        </span>
       </div>
-      <div className="pal-list" ref={listRef} role="listbox">
-        {!items.length && <div className="pal-empty">No matches for “{q}”</div>}
+      <div className="max-h-[400px] overflow-auto p-1.5" ref={listRef} role="listbox">
+        {!items.length && <div className="p-7 text-center text-fg-subtle">No matches for “{q}”</div>}
         {items.map((it, i) => {
-          const head = it.section !== last ? <div className="pal-sec">{it.section}</div> : null
+          const head = it.section !== last ? <div className="px-2.5 pb-1 pt-2 text-[11.5px] font-medium text-fg-subtle">{it.section}</div> : null
           last = it.section
+          const active = i === cur
           return <div key={it.id}>
             {head}
-            <div className={'pi' + (i === cur ? ' on' : '')} role="option" aria-selected={i === cur} onMouseMove={() => { if (i !== cur) setIdx(i) }} onClick={() => run(i)}>
-              <span className="g">{typeof it.icon === 'string' ? <Icon name={it.icon as IconName} /> : it.icon}</span>
-              <span className="l"><Highlight text={it.label} q={q.trim()} /></span>
-              {it.keys ? <span className="r"><KbdGroup keys={it.keys} /></span> : it.right ? <span className="r mono">{it.right}</span> : null}
+            <div
+              className={cn(
+                'flex h-9 cursor-pointer items-center gap-2.5 rounded-[7px] px-2.5 text-fg-muted',
+                active && 'bg-press',
+              )}
+              data-active={active ? 'true' : undefined}
+              role="option"
+              aria-selected={active}
+              onMouseMove={() => { if (!active) setIdx(i) }}
+              onClick={() => run(i)}
+            >
+              <span className="inline-flex size-3.5 flex-none items-center justify-center">
+                {typeof it.icon === 'string' ? <Icon name={it.icon as IconName} /> : it.icon}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-fg"><Highlight text={it.label} q={q.trim()} /></span>
+              {it.keys
+                ? <span className="max-w-[200px] truncate whitespace-nowrap text-[12px] text-fg-subtle"><KbdGroup keys={it.keys} /></span>
+                : it.right
+                  ? <span className="max-w-[200px] truncate whitespace-nowrap font-mono text-[12px] text-fg-subtle">{it.right}</span>
+                  : null}
             </div>
           </div>
         })}
       </div>
-      <div className="pal-f"><span><Kbd>↑</Kbd><Kbd>↓</Kbd> navigate</span><span><Kbd>↵</Kbd> open</span><span><Kbd>esc</Kbd> close</span></div>
-    </div>
-  </div>
+      <div className="flex items-center gap-4 border-t border-line bg-sunk px-3.5 py-2 text-[11.5px] text-fg-subtle">
+        <span className="inline-flex items-center gap-1.5"><Kbd>↑</Kbd><Kbd>↓</Kbd> navigate</span>
+        <span className="inline-flex items-center gap-1.5"><Kbd>↵</Kbd> open</span>
+        <span className="inline-flex items-center gap-1.5"><Kbd>esc</Kbd> close</span>
+      </div>
+    </DialogContent>
+  </Dialog>
 }
 
-/** The shortcut sheet (F's help). Views that add keys should add rows here. */
+/** The shortcut sheet. Views that add keys should add rows here. */
 export const SHORTCUT_SHEET: [string, [string, string][]][] = [
   ['General', [['mod K', 'Command palette'], ['?', 'This sheet'], ['G then O Q F W S E A R', 'Go to a view'], ['1 – 8', 'Go to a view'], ['[', 'Previous run'], [']', 'Hide / show right panel'], ['⇧ T', 'Toggle theme'], ['C', 'Board · message the coordinator'], ['Esc', 'Close detail / overlay']]],
   ['Lists', [['J / K', 'Next / previous row'], ['↵ / O', 'Open row'], ['/', 'Filter'], ['⇧ G', 'Cycle grouping']]],
@@ -204,15 +235,18 @@ function HelpSheet() {
   const [mod, setMod] = useState('Ctrl')
   useEffect(() => setMod(modKey()), [])
   useShortcuts([{ key: ['Escape', '?'], run: () => pal.closeHelp() }], { priority: 100, exclusive: true })
-  return <div className="overlay open" onMouseDown={e => { if (e.target === e.currentTarget) pal.closeHelp() }}>
-    <div className="help" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
-      <h3>Keyboard shortcuts</h3>
+  return <Dialog open onOpenChange={open => { if (!open) pal.closeHelp() }}>
+    <DialogContent className="max-h-[76vh] max-w-[600px] overflow-auto rounded-2xl border-line-2 bg-raise px-5 pb-3.5 pt-[18px]">
+      <DialogTitle className="m-0 mb-1 text-[13.5px] font-semibold text-fg">Keyboard shortcuts</DialogTitle>
       {SHORTCUT_SHEET.map(([h, rows]) => <div key={h}>
-        <h5>{h}</h5>
-        <div className="help-grid">
-          {rows.map(([k, l]) => <div key={l}><span>{l}</span><span className="kbd-group">{k.split(' ').map((x, i) => <span key={i} className="kbd">{x === 'mod' ? mod : x}</span>)}</span></div>)}
+        <h5 className="mb-1 mt-3.5 text-[11.5px] font-medium text-fg-subtle">{h}</h5>
+        <div className="grid grid-cols-2 gap-x-7">
+          {rows.map(([k, l]) => <div key={l} className="flex items-center justify-between border-b border-line py-[5px] text-[12.5px] text-fg-muted">
+            <span>{l}</span>
+            <KbdGroup keys={k.split(' ').map(x => (x === 'mod' ? mod : x))} />
+          </div>)}
         </div>
       </div>)}
-    </div>
-  </div>
+    </DialogContent>
+  </Dialog>
 }

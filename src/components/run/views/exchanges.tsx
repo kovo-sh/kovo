@@ -10,7 +10,7 @@ import { searchRunExchanges } from '../../../actions.ts'
 import { formatExchangeAsCurl } from '../../curl-parser.ts'
 import { Dropdown, FilterBox, matchQ, Tabs, useDebounced, VList } from '../controls.tsx'
 import { useFullExchange, useRun, useRunModel } from '../data.tsx'
-import { EmptyState, LinkRow, Props, Section, Seg, Skeleton, Tag } from '../display.tsx'
+import { EmptyState, KbdGroup, LinkRow, Props, Section, Seg, Skeleton, Tag } from '../display.tsx'
 import { fmtAgo, fmtFullDateTime, fmtN, fmtRel, fmtTimeS, host, plural, prettyBody } from '../format.ts'
 import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
@@ -21,6 +21,7 @@ import { useLinks, useListNav, useNav, useViewState } from '../nav.tsx'
 import { PaneBody, PaneHeader } from '../pane.tsx'
 import type { InspectorMap, InspectorProps } from '../pane.tsx'
 import { useToast } from '../toast.tsx'
+import { cn, httpCodeClass, runBtn, runDdItem, runIconBtn, RW } from '../tw.ts'
 
 type SearchHit = Awaited<ReturnType<typeof searchRunExchanges>>[number]
 
@@ -159,13 +160,13 @@ export function ExchangesView() {
 
   if (!rows.length && eventsReady && !counts.exchanges) {
     return <EmptyState icon="exchanges" title="No exchanges yet"
-      action={detail.run.status === 'waiting' ? <button type="button" className="btn" onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
+      action={detail.run.status === 'waiting' ? <button type="button" className={runBtn()} onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
       Every request a worker makes passes through the safety proxy and is logged here, whether allowed or blocked.
     </EmptyState>
   }
 
   const missing = Math.max(0, counts.exchanges - allowedCount)
-  const footer = <div className="listnote">
+  const footer = <div className={RW.listnote}>
     <Icon name="exchanges" />
     {missing > 0
       ? <span>{fmtN(allowedCount)} of {fmtN(counts.exchanges)} exchanges loaded{!eventsReady ? '; the event log is still replaying' : ''}.</span>
@@ -173,39 +174,40 @@ export function ExchangesView() {
   </div>
 
   return <>
-    <div className="toolbar">
+    <div className={RW.toolbar}>
       <Tabs tabs={tabs} value={tab} onChange={setTab} />
-      <span className="tb-sp" />
       <FilterBox value={q} onChange={setQ} placeholder="Filter" onEnter={() => ids[0] && nav.select({ kind: 'exchange', id: ids[0] })} />
-      <Dropdown icon="sliders" title="Grouping (⇧G cycles) and filters" menuClassName="sf-ddw"
-        label={<><span className="dim">Group</span><span>{group === 'none' ? 'Time' : group === 'origin' ? 'Origin' : 'Test account'}</span>{active.length > 0 && <span className="sf-ddn num">{active.length}</span>}</>}>
-        <div className="dd-sec">Grouping<span className="kbd-group" style={{ marginLeft: 'auto' }}><span className="kbd">⇧</span><span className="kbd">G</span></span></div>
-        <Seg<Group> value={group} onChange={setGroup} options={[{ value: 'none', label: 'Time' }, { value: 'origin', label: 'Origin' }, { value: 'persona', label: 'Test account' }]} />
-        <div className="dd-sec">Method</div>
-        <div className="sf-chips">{[['', rows.filter(r => !r.denied).length] as [string, number], ...facets.methods].map(([m, n]) =>
-          <button key={m || 'all'} type="button" className={'sf-chip' + (method === m ? ' on' : '')} onClick={() => setMethod(m)}>{m || 'All'}<span className="num">{fmtN(n)}</span></button>)}</div>
-        <div className="dd-sec">Test account</div>
-        <div className="sf-chips">{[['', 0] as [string, number], ...facets.personas].map(([p, n]) => {
+      <Dropdown icon="sliders" title="Grouping (⇧G cycles) and filters" menuClassName="w-[320px]"
+        label={<><span className="text-fg-subtle">Group</span><span>{group === 'none' ? 'Time' : group === 'origin' ? 'Origin' : 'Test account'}</span>{active.length > 0 && <span className="inline-grid h-4 min-w-4 place-items-center rounded-[8px] bg-press px-1 text-[10.5px] font-semibold tabular-nums text-fg">{active.length}</span>}</>}>
+        <div className={RW.ddSec}>Grouping<KbdGroup keys={['⇧', 'G']} className="ml-auto" /></div>
+        <Seg<Group> fullWidth value={group} onChange={setGroup} options={[{ value: 'none', label: 'Time' }, { value: 'origin', label: 'Origin' }, { value: 'persona', label: 'Test account' }]} />
+        <div className={RW.ddSec}>Method</div>
+        <div className="flex flex-wrap gap-1">{[['', rows.filter(r => !r.denied).length] as [string, number], ...facets.methods].map(([m, n]) =>
+          <button key={m || 'all'} type="button" className={cn(RW.chip, method === m && RW.chipOn)} onClick={() => setMethod(m)}>{m || 'All'}<span className="text-[11px] tabular-nums text-fg-subtle">{fmtN(n)}</span></button>)}</div>
+        <div className={RW.ddSec}>Test account</div>
+        <div className="flex flex-wrap gap-1">{[['', 0] as [string, number], ...facets.personas].map(([p, n]) => {
           const v = p === '' && n ? '-' : p
-          return <button key={v || 'all'} type="button" className={'sf-chip' + (persona === v ? ' on' : '')} onClick={() => setPersona(v)}>
-            {v === '' ? 'All' : v === '-' ? 'Anonymous' : v}{n > 0 && <span className="num">{fmtN(n)}</span>}</button>
+          return <button key={v || 'all'} type="button" className={cn(RW.chip, persona === v && RW.chipOn)} onClick={() => setPersona(v)}>
+            {v === '' ? 'All' : v === '-' ? 'Anonymous' : v}{n > 0 && <span className="text-[11px] tabular-nums text-fg-subtle">{fmtN(n)}</span>}</button>
         })}</div>
-        <div className="dd-sec">Origin<span className="sf-dd-r num">{facets.origins.length}</span></div>
-        <div className="sf-olist">
-          <button type="button" className={'dd-item' + (!origin ? ' on' : '')} onClick={() => setOrigin('')}>All origins</button>
-          {facets.origins.map(([o, n]) => <button key={o} type="button" className={'dd-item' + (origin === o ? ' on' : '')} onClick={() => setOrigin(o)}>
-            <span className="mono sf-ell">{host(o)}</span><span className="ct num">{fmtN(n)}</span>
+        <div className={RW.ddSec}>Origin<span className="ml-auto font-normal tabular-nums">{facets.origins.length}</span></div>
+        <div className="-mx-1 max-h-[240px] overflow-auto px-1">
+          <button type="button" className={cn(runDdItem({ active: !origin }), 'h-7')} onClick={() => setOrigin('')}>All origins</button>
+          {facets.origins.map(([o, n]) => <button key={o} type="button" className={cn(runDdItem({ active: origin === o }), 'h-7')} onClick={() => setOrigin(o)}>
+            <span className="min-w-0 flex-1 truncate font-mono text-[12px]">{host(o)}</span><span className="ml-auto tabular-nums text-fg-subtle">{fmtN(n)}</span>
           </button>)}
         </div>
       </Dropdown>
     </div>
-    {(active.length > 0 || search.busy || search.q) && <div className="strip sf-fstrip">
-      {active.map(([k, v, clear]) => <span key={k} className="sf-af"><span className="muted">{k}</span><span className="mono">{v}</span>
-        <button type="button" aria-label={'Clear ' + k} onClick={clear}><Icon name="close" size={11} /></button></span>)}
-      {search.busy ? <span className="muted">Searching paths, bodies and headers…</span>
-        : search.q ? <span className="muted">{search.error ? 'Server search failed; showing local matches.' : search.hits.length >= 100 ? 'Server search stops at 100 matches in paths, bodies and headers; more may exist. Refine the query or add a filter to narrow it.' : `Server search: ${plural(search.hits.length, 'match', 'matches')} in paths, bodies and headers.`}</span> : null}
-      <span className="tb-sp" />
-      {active.length > 0 && <button type="button" className="linkbtn" style={{ margin: 0 }} onClick={() => { setMethod(''); setOrigin(''); setPersona('') }}>Clear filters</button>}
+    {(active.length > 0 || search.busy || search.q) && <div className={cn(RW.strip, 'min-h-9 gap-2 py-1.5 pl-[18px] pr-3')}>
+      {active.map(([k, v, clear]) => <span key={k} className="inline-flex h-[22px] items-center gap-1.5 rounded-[5px] bg-sunk pl-2 pr-1 text-[12px] text-fg shadow-[inset_0_0_0_1px_var(--line)]">
+        <span className="text-fg-subtle">{k}</span><span className="font-mono text-[12px]">{v}</span>
+        <button type="button" className="inline-flex h-auto cursor-pointer items-center justify-center rounded-[3px] border-0 bg-transparent p-0.5 text-fg-subtle shadow-none hover:bg-hover hover:text-fg" aria-label={'Clear ' + k} onClick={clear}><Icon name="close" size={11} /></button>
+      </span>)}
+      {search.busy ? <span className="text-fg-subtle">Searching paths, bodies and headers…</span>
+        : search.q ? <span className="text-fg-subtle">{search.error ? 'Server search failed; showing local matches.' : search.hits.length >= 100 ? 'Server search stops at 100 matches in paths, bodies and headers; more may exist. Refine the query or add a filter to narrow it.' : `Server search: ${plural(search.hits.length, 'match', 'matches')} in paths, bodies and headers.`}</span> : null}
+      <span className="min-w-2 flex-1" />
+      {active.length > 0 && <button type="button" className={runBtn({ variant: 'link', size: 'none' })} onClick={() => { setMethod(''); setOrigin(''); setPersona('') }}>Clear filters</button>}
     </div>}
     {!rows.length && !eventsReady ? <Skeleton /> :
       <VList items={items} itemKey={it => it.key} height={height} scrollToIndex={scrollIdx} footer={shown.length ? footer : undefined}
@@ -214,21 +216,28 @@ export function ExchangesView() {
           if (it.type === 'head') {
             const ck = it.key.slice(2)
             const col = !!collapsed[ck]
-            return <div key={it.key} style={style} className={'ghead sf-ghead' + (col ? ' collapsed' : '')} role="button" tabIndex={-1} onClick={() => setCollapsed(c => ({ ...c, [ck]: !col }))}>
-              <Icon name="chev" /><span className="g muted"><Icon name={it.icon} /></span><span className={it.icon === 'globe' ? 'mono' : ''}>{it.label}</span><span className="ct num">{fmtN(it.count)}</span>
+            return <div key={it.key} style={style} className={cn(RW.ghead, 'absolute')} role="button" tabIndex={-1} onClick={() => setCollapsed(c => ({ ...c, [ck]: !col }))}>
+              <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-guardian', col && '-rotate-90')} />
+              <span className="inline-flex size-3.5 flex-none items-center justify-center text-fg-subtle"><Icon name={it.icon} /></span>
+              <span className={it.icon === 'globe' ? 'font-mono text-[12px]' : undefined}>{it.label}</span>
+              <span className="font-normal tabular-nums text-fg-subtle">{fmtN(it.count)}</span>
             </div>
           }
           const r = it.r
-          return <div key={it.key} style={style} className={'row' + (selId === r.id ? ' cur' : '') + (r.denied ? ' sf-denied' : '')} data-id={r.id}
+          return <div key={it.key} style={style} className={cn(RW.row, selId === r.id && RW.rowCur)} data-id={r.id}
             onClick={() => nav.select({ kind: 'exchange', id: r.id })}>
-            <span className="c-time mono num">{fmtRel(r.t, model.base)}</span>
-            <span className="c-meth mono">{r.method}</span>
-            <span className={'c-code mono num ' + (r.denied ? 'sf-deny' : 'code-' + String(r.status)[0])}>{r.denied ? <Icon name="slash" size={13} /> : r.status}</span>
-            {group !== 'origin' && <span className="mono muted sf-xhost">{host(r.origin)}</span>}
-            <span className="c-path mono" title={r.path}>{r.denied ? <span className="sf-deny-t">{r.note ?? 'Blocked by safety rules'}</span> : r.path}</span>
-            {r.persona && group !== 'persona' && <span className="c-persona"><Tag icon="lock">{r.persona}</Tag></span>}
-            {hitIds.has(r.id) && <span className="sf-hit" title="Matched in the body or headers by server search"><Icon name="search" size={12} /></span>}
-            <span className="c-dur mono num">{r.dur != null ? fmtN(r.dur) + 'ms' : ''}</span>
+            <span className="w-16 flex-none font-mono text-[12px] tabular-nums text-fg-subtle">{fmtRel(r.t, model.base)}</span>
+            <span className={cn('w-[46px] flex-none font-mono text-[12px] font-medium', r.denied ? 'text-fg-faint' : 'text-fg-muted')}>{r.method}</span>
+            <span className={cn('w-[34px] flex-none text-right font-mono text-[12px] tabular-nums', r.denied ? 'inline-flex justify-end text-danger' : httpCodeClass(r.status))}>
+              {r.denied ? <Icon name="slash" size={13} /> : r.status}
+            </span>
+            {group !== 'origin' && <span className="max-w-[190px] flex-none truncate font-mono text-[12px] text-fg-subtle">{host(r.origin)}</span>}
+            <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-fg" title={r.path}>
+              {r.denied ? <span className="font-sans text-[13px] text-danger">{r.note ?? 'Blocked by safety rules'}</span> : r.path}
+            </span>
+            {r.persona && group !== 'persona' && <span className="flex-none"><Tag icon="lock">{r.persona}</Tag></span>}
+            {hitIds.has(r.id) && <span className="inline-flex flex-none text-fg-subtle" title="Matched in the body or headers by server search"><Icon name="search" size={12} /></span>}
+            <span className="w-[56px] flex-none text-right font-mono text-[12px] tabular-nums text-fg-subtle">{r.dur != null ? fmtN(r.dur) + 'ms' : ''}</span>
           </div>
         }} />}
   </>
@@ -250,11 +259,23 @@ const BASELINE: [string, string][] = [
 
 function HeaderTable({ headers, flagged }: { headers: Record<string, string> | undefined; flagged: Set<string> }) {
   const ks = Object.keys(headers ?? {})
-  if (!ks.length) return <p className="muted">None recorded</p>
-  return <table className="hdrs mono"><tbody>{ks.map(k => {
+  if (!ks.length) return <p className="text-fg-subtle!">None recorded</p>
+  return <table className={cn(RW.hdrs, 'font-mono text-[12px]')}><tbody>{ks.map(k => {
     const lk = k.toLowerCase()
-    return <tr key={k} className={flagged.has(lk) ? 'sf-flag' : SECURITY_HEADERS.has(lk) ? 'sf-sec' : undefined}>
-      <td>{k}</td><td>{String(headers![k])}</td>
+    const isFlag = flagged.has(lk)
+    const isSec = !isFlag && SECURITY_HEADERS.has(lk)
+    return <tr key={k}>
+      <td className={cn(
+        'w-[42%] break-all border-b border-line py-[3px] pr-2.5 align-top text-[11.5px] leading-[17px]',
+        isFlag
+          ? 'bg-warn-soft font-medium text-warn before:mb-px before:mr-1.5 before:inline-block before:size-[5px] before:rounded-full before:bg-warn before:align-middle before:content-[""]'
+          : isSec
+            ? 'text-fg before:mb-px before:mr-1.5 before:inline-block before:size-[5px] before:rounded-full before:bg-fg-subtle before:align-middle before:content-[""]'
+            : 'text-fg-subtle',
+      )}>{k}</td>
+      <td className={cn('break-all border-b border-line py-[3px] align-top text-[11.5px] leading-[17px] text-fg-muted', isFlag && 'bg-warn-soft')}>
+        {String(headers![k])}
+      </td>
     </tr>
   })}</tbody></table>
 }
@@ -278,16 +299,16 @@ function ExchangeInspector({ sel }: InspectorProps) {
     const w = ev ? model.workerById.get(str(ev.detail.assignmentId) ?? '') : undefined
     return <>
       <PaneHeader title="Blocked request" sub={ev ? <span title={`${fmtFullDateTime(ev.createdAt)} · Event #${ev.id}`} suppressHydrationWarning>{fmtAgo(ev.createdAt)}</span> : undefined} />
-      <PaneBody><div className="d">
+      <PaneBody><div className={RW.detail}>
         {!ev ? <Skeleton rows={4} /> : <>
-          <div className="d-meta"><Tag icon="slash" title={ev.kind}>{ev.kind === 'broker.circuit_open' ? 'Rate limit pause' : 'Blocked by scope'}</Tag></div>
-          <h2 style={{ fontSize: 14, lineHeight: '21px', fontWeight: 500 }}>{ev.message}</h2>
+          <div className="mb-2.5 flex flex-wrap gap-1.5"><Tag icon="slash" title={ev.kind}>{ev.kind === 'broker.circuit_open' ? 'Rate limit pause' : 'Blocked by scope'}</Tag></div>
+          <h2 className="m-0 mb-3 break-words text-[14px] font-medium leading-[21px] text-fg">{ev.message}</h2>
           <Props rows={[
-            ['Time', <span className="num" title={fmtFullDateTime(ev.createdAt)}>{fmtTimeS(ev.createdAt)} <span className="mono muted">{fmtRel(ev.createdAt, model.base)}</span></span>],
-            ...(origin ? [['Origin', <span className="mono">{host(origin)}</span>, () => links.host(origin)] as [ReactNode, ReactNode, () => void]] : []),
-            ...(w ? [['Worker', <><StatusGlyph status={w.status} /><span className="sf-ell">{w.title}</span><Icon name="workflow" /></>, () => links.worker(w.id)] as [ReactNode, ReactNode, () => void]] : []),
+            ['Time', <span className="tabular-nums" title={fmtFullDateTime(ev.createdAt)}>{fmtTimeS(ev.createdAt)} <span className="font-mono text-[12px] text-fg-subtle">{fmtRel(ev.createdAt, model.base)}</span></span>],
+            ...(origin ? [['Origin', <span className="font-mono text-[12px]">{host(origin)}</span>, () => links.host(origin)] as [ReactNode, ReactNode, () => void]] : []),
+            ...(w ? [['Worker', <><StatusGlyph status={w.status} /><span className="min-w-0 truncate">{w.title}</span><Icon name="workflow" /></>, () => links.worker(w.id)] as [ReactNode, ReactNode, () => void]] : []),
           ]} />
-          <p className="sf-note">The safety proxy blocked this request before it left Kovo Hunter: the host is outside the approved scope or paused by its circuit breaker. Nothing was sent.</p>
+          <p className="my-1.5 mb-2 flex items-center gap-1.5 text-[12px] leading-[18px] text-fg-subtle">The safety proxy blocked this request before it left Kovo Hunter: the host is outside the approved scope or paused by a safety pause. Nothing was sent.</p>
           <Section title="Related"><LinkRow icon="activity" onClick={() => links.event(ev.id)}>Open in Activity</LinkRow></Section>
         </>}
       </div></PaneBody>
@@ -333,23 +354,23 @@ function ExchangeInspector({ sel }: InspectorProps) {
           {[method || null, status || null, t ? fmtAgo(t) : null].filter(Boolean).join(' · ') || 'Details'}
         </span>
       }
-      extra={<button type="button" className="icon-btn" title="Copy as cURL" aria-label="Copy as cURL" onClick={copyCurl}><Icon name="copy" />cURL</button>}
+      extra={<button type="button" className={runIconBtn()} title="Copy as cURL" aria-label="Copy as cURL" onClick={copyCurl}><Icon name="copy" />cURL</button>}
     />
-    <PaneBody><div className="d">
-      <div className="d-meta">
+    <PaneBody><div className={RW.detail}>
+      <div className="mb-2.5 flex flex-wrap gap-1.5">
         <Tag mono>{method || '—'}</Tag>
-        <Tag mono className={'code-' + String(status)[0]}>{status || '—'}</Tag>
+        <Tag mono className={httpCodeClass(status)}>{status || '—'}</Tag>
         {persona ? <Tag icon="lock">{persona}</Tag> : <Tag>Anonymous</Tag>}
-        {dur != null && <Tag className="num">{fmtN(dur)} ms</Tag>}
+        {dur != null && <Tag className="tabular-nums">{fmtN(dur)} ms</Tag>}
       </div>
-      <h2 className="mono sf-url"><span className="muted">{origin}</span>{path || (full ? '' : '…')}</h2>
+      <h2 className="m-0 mb-3 break-all font-mono text-[13px] font-medium leading-5 text-fg"><span className="text-fg-subtle">{origin}</span>{path || (full ? '' : '…')}</h2>
       <Props rows={[
-        ...(t ? [['Time', <span className="num">{fmtTimeS(t)} <span className="mono muted">{fmtRel(t, model.base)}</span></span>] as [ReactNode, ReactNode]] : []),
-        ['Origin', <span className="mono">{host(origin)}</span>, () => links.host(origin)],
-        ...(finalOrigin && finalOrigin !== origin ? [['Final origin', <span className="mono">{host(finalOrigin)}</span>] as [ReactNode, ReactNode]] : []),
-        ...(redirects.some(x => x !== origin && x !== finalOrigin) ? [['Redirects', <span className="mono sf-wrap">{redirects.map(host).join(' → ')}</span>] as [ReactNode, ReactNode]] : []),
-        ['Media type', <span className="mono">{mediaType || (full ? '—' : '…')}</span>],
-        ...(w ? [['Worker', <><StatusGlyph status={w.status} /><span className="sf-ell">{w.title}</span><Icon name="workflow" /></>, () => links.worker(w.id)] as [ReactNode, ReactNode, () => void]] : []),
+        ...(t ? [['Time', <span className="tabular-nums">{fmtTimeS(t)} <span className="font-mono text-[12px] text-fg-subtle">{fmtRel(t, model.base)}</span></span>] as [ReactNode, ReactNode]] : []),
+        ['Origin', <span className="font-mono text-[12px]">{host(origin)}</span>, () => links.host(origin)],
+        ...(finalOrigin && finalOrigin !== origin ? [['Final origin', <span className="font-mono text-[12px]">{host(finalOrigin)}</span>] as [ReactNode, ReactNode]] : []),
+        ...(redirects.some(x => x !== origin && x !== finalOrigin) ? [['Redirects', <span className="rw-wrap whitespace-normal break-words font-mono text-[12px] leading-[18px]">{redirects.map(host).join(' → ')}</span>] as [ReactNode, ReactNode]] : []),
+        ['Media type', <span className="font-mono text-[12px]">{mediaType || (full ? '—' : '…')}</span>],
+        ...(w ? [['Worker', <><StatusGlyph status={w.status} /><span className="min-w-0 truncate">{w.title}</span><Icon name="workflow" /></>, () => links.worker(w.id)] as [ReactNode, ReactNode, () => void]] : []),
       ]} />
       {fs.length > 0 && <Section title="Cited by" right={plural(fs.length, 'finding')}>
         {fs.map(f => <LinkRow key={f.id} glyph={<SevGlyph sev={f.severity} />} right={stLabel(normFStatus(f.status))} onClick={() => links.finding(f.id)}>{f.title}</LinkRow>)}
@@ -360,12 +381,22 @@ function ExchangeInspector({ sel }: InspectorProps) {
           return <LinkRow key={e} icon="fact" right={evd.kind} trailing="chevR" onClick={() => links.evidence(e)}>{evd.title}</LinkRow>
         })}
       </Section>}
-      {err ? <p className="sf-note">Couldn’t load the full request and response for this exchange.</p> : !full ? <Section title="Headers"><Skeleton rows={5} /></Section> : <>
+      {err ? <p className="my-1.5 mb-2 flex items-center gap-1.5 text-[12px] leading-[18px] text-fg-subtle">Couldn’t load the full request and response for this exchange.</p> : !full ? <Section title="Headers"><Skeleton rows={5} /></Section> : <>
         <Section title="Security headers" right={BASELINE.filter(([h]) => respKeys.has(h)).length + ' of ' + BASELINE.length}>
-          <div className="sf-sh">{BASELINE.map(([h, l]) => {
+          <div className="mb-2.5 flex flex-wrap gap-[5px]">{BASELINE.map(([h, l]) => {
             const has = respKeys.has(h)
-            return <span key={h} className={'sf-shi' + (has ? '' : ' absent') + (flagged.has(h) ? ' flag' : '')} title={has ? h + ': ' + resp[Object.keys(resp).find(k => k.toLowerCase() === h)!] : h + ' is absent'}>
-              <Icon name={has ? 'check' : 'x'} size={12} />{l}
+            return <span
+              key={h}
+              className={cn(
+                'inline-flex h-[22px] items-center gap-1 rounded-[5px] pl-1.5 pr-2 text-[12px]',
+                has
+                  ? 'text-fg-muted shadow-[inset_0_0_0_1px_var(--line-2)]'
+                  : 'bg-warn-soft text-warn shadow-[inset_0_0_0_1px_var(--warn-line)]',
+                flagged.has(h) && 'font-medium',
+              )}
+              title={has ? h + ': ' + resp[Object.keys(resp).find(k => k.toLowerCase() === h)!] : h + ' is absent'}
+            >
+              <Icon name={has ? 'check' : 'x'} size={12} className={has ? 'text-fg-subtle' : 'text-warn'} />{l}
             </span>
           })}</div>
         </Section>
@@ -380,8 +411,8 @@ function ExchangeInspector({ sel }: InspectorProps) {
         </LinkRow>)}
       </Section>}
       {body && <Section title={full && full.body.length > (sum?.bodyPreview.length ?? 0) ? 'Response body' : 'Body preview'} right={full ? fmtN(full.body.length) + ' chars' : undefined}>
-        <pre className="block mono sf-body">{bodyAll ? body : body.slice(0, CAP)}</pre>
-        {body.length > CAP && !bodyAll && <button type="button" className="linkbtn" onClick={() => setBodyAll(true)}>Show all {fmtN(body.length)} characters</button>}
+        <pre className={cn(RW.pre, 'max-h-[420px]')}>{bodyAll ? body : body.slice(0, CAP)}</pre>
+        {body.length > CAP && !bodyAll && <button type="button" className={cn(runBtn({ variant: 'link', size: 'none' }), 'mt-1')} onClick={() => setBodyAll(true)}>Show all {fmtN(body.length)} characters</button>}
       </Section>}
       {w && <Section title="Related">
         <LinkRow glyph={<StatusGlyph status={w.status} />} right={PHASE_LABEL[w.phase] ?? w.phase} trailing="workflow" onClick={() => links.worker(w.id)}>{w.title}</LinkRow>
