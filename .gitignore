@@ -10,3 +10,7 @@ dist/app.js
 /.env
 /.env.*
 __pycache__/
+
+# landing replay recordings (regenerate with docs/replay/record.mjs)
+docs/replay/*.mp4
+docs/replay/*.webm
