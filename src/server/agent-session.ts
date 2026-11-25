@@ -65,9 +65,9 @@ import {
   EARLY_EXIT_GRACE_TURNS,
   EARLY_EXIT_HARDENED_STATUSES,
   EARLY_EXIT_STATE_CHANGE_METHODS,
-  GUARDIAN_VERIFY_SPEC_SHAPE,
-  GUARDIAN_VERIFY_TOOL_DESCRIPTION,
-  GUARDIAN_VERIFY_TS_ONLY_ERROR,
+  KOVO_VERIFY_SPEC_SHAPE,
+  KOVO_VERIFY_TOOL_DESCRIPTION,
+  KOVO_VERIFY_TS_ONLY_ERROR,
   SPEC_PROOF_GAP_ALIASES,
   SPEC_PROOF_GAP_CODES,
   WALL_CLOCK_PROOF_GRACE_MS,
@@ -91,7 +91,7 @@ import {
   fallbackCommand,
   formatReplaySpecValidationIssues,
   gapValidationRejectedMessage,
-  guardianVerifyRedirectMessage,
+  kovoVerifyRedirectMessage,
   httpRequestSchema,
   intentCompletionStatuses,
   isPlainRecord,
@@ -111,7 +111,7 @@ import {
   settlementNudgeTurnFor,
   settlementSpecDirective,
   specSubmissionRequiredMessage,
-  summarizeGuardianVerifyOutcome,
+  summarizeKovoVerifyOutcome,
   surfaceWordlistNames,
   truncateUtf8Head,
   verifierFeedbackKeys,
@@ -127,8 +127,8 @@ import type {
   GapDenialKind,
   GapValidationEvent,
   GapValidationStats,
-  GuardianVerifyArgs,
-  GuardianVerifyRuntime,
+  KovoVerifyArgs,
+  KovoVerifyRuntime,
   IntentCompletion,
   ProofObligationEvent,
   ProofObligationStats,
@@ -161,16 +161,16 @@ export {
   EARLY_EXIT_MIN_TURNS,
   EARLY_EXIT_STATE_CHANGE_METHODS,
   EARLY_EXIT_UNCHANGED_MIN_ATTEMPTS,
-  GUARDIAN_VERIFY_CLASS_HINTS,
-  GUARDIAN_VERIFY_ENFORCED_RUNTIME_KINDS,
-  GUARDIAN_VERIFY_HELPERS,
-  GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-  GUARDIAN_VERIFY_MULTIHOP_HELPERS,
-  GUARDIAN_VERIFY_REPAIR_INSTRUCTION,
-  GUARDIAN_VERIFY_SPEC_SHAPE,
-  GUARDIAN_VERIFY_TOOL_DESCRIPTION,
-  GUARDIAN_VERIFY_TS_ONLY_ERROR,
-  GUARDIAN_VERIFY_USAGE_HINT,
+  KOVO_VERIFY_CLASS_HINTS,
+  KOVO_VERIFY_ENFORCED_RUNTIME_KINDS,
+  KOVO_VERIFY_HELPERS,
+  KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+  KOVO_VERIFY_MULTIHOP_HELPERS,
+  KOVO_VERIFY_REPAIR_INSTRUCTION,
+  KOVO_VERIFY_SPEC_SHAPE,
+  KOVO_VERIFY_TOOL_DESCRIPTION,
+  KOVO_VERIFY_TS_ONLY_ERROR,
+  KOVO_VERIFY_USAGE_HINT,
   NEGATIVE_EDGE_PROOF_GAP_CODES,
   SPECIALIST_COMMON_TOOLS,
   SPECIALIST_PROFILES,
@@ -206,9 +206,9 @@ export {
   filterHandlersForSpecialist,
   formatReplaySpecValidationIssues,
   gapValidationRejectedMessage,
-  guardianVerifyHelperGuidance,
-  guardianVerifyPromptHint,
-  guardianVerifyRedirectMessage,
+  kovoVerifyHelperGuidance,
+  kovoVerifyPromptHint,
+  kovoVerifyRedirectMessage,
   intentCompletionStatuses,
   investigatorTools,
   maxEmptyTurnNudges,
@@ -234,7 +234,7 @@ export {
   settlementNudgeTurnFor,
   settlementSpecDirective,
   specSubmissionRequiredMessage,
-  summarizeGuardianVerifyOutcome,
+  summarizeKovoVerifyOutcome,
   surfaceWordlistNames,
   threatModelPrompt,
   verifierRepairFeedback,
@@ -271,14 +271,14 @@ export type {
   GapDenialKind,
   GapValidationEvent,
   GapValidationStats,
-  GuardianVerifyArgs,
-  GuardianVerifyAttemptSummary,
-  GuardianVerifyCompositeSummary,
-  GuardianVerifyHandler,
-  GuardianVerifyHopSummary,
-  GuardianVerifyRuntime,
-  GuardianVerifySealedCapabilitySummary,
-  GuardianVerifyToolResult,
+  KovoVerifyArgs,
+  KovoVerifyAttemptSummary,
+  KovoVerifyCompositeSummary,
+  KovoVerifyHandler,
+  KovoVerifyHopSummary,
+  KovoVerifyRuntime,
+  KovoVerifySealedCapabilitySummary,
+  KovoVerifyToolResult,
   HostTier,
   IntentCompletion,
   IntentCompletionStatus,
@@ -333,7 +333,7 @@ export {
 } from "./board-tools.ts"
 
 
-/** Settlement: probe tools revoked at 85%; read/query tools kept until the final turn; guardian_verify stays available through the final turn as the primary proof submission tool. */
+/** Settlement: probe tools revoked at 85%; read/query tools kept until the final turn; kovo_verify stays available through the final turn as the primary proof submission tool. */
 const SETTLEMENT_REVOKED_TOOLS = new Set(['request_http', 'request_http_batch', 'request_http_race', 'requestHttpRace', 'browser_visit', 'browser_session', 'probe_surface', 'probe_differential', 'run_safe_templates', 'probe_websocket'])
 const SETTLEMENT_WRAPUP_TOOLS = new Set(['verify_replay_spec', 'search_facts', 'search_exchanges', 'get_exchange', 'read_peer_trace', 'expand_digest', 'board_read', 'query_cves', 'load_skill'])
 
@@ -347,17 +347,17 @@ export const ROUTE_EVIDENCE_TOOLS: ReadonlySet<string> = new Set([
   'browser_session', 'probe_surface', 'probe_differential', 'run_safe_templates', 'probe_websocket',
 ])
 export const SPEC_SUBMISSION_TOOLS: ReadonlySet<string> = new Set([
-  'guardian_verify', 'verify_replay_spec', 'propose_chain_finding', 'update_proposed_finding',
+  'kovo_verify', 'verify_replay_spec', 'propose_chain_finding', 'update_proposed_finding',
   'prove_authz_read_diff', 'prove_state_mutation_diff', 'prove_business_invariant', 'prove_canary_or_redirect',
 ])
 /** Tools whose arguments carry a replay spec/script we can bind to route evidence. */
 const ROUTE_BOUND_SPEC_TOOLS: ReadonlySet<string> = new Set([
-  'guardian_verify', 'verify_replay_spec', 'propose_chain_finding', 'update_proposed_finding',
+  'kovo_verify', 'verify_replay_spec', 'propose_chain_finding', 'update_proposed_finding',
 ])
 
 /**
  * Offline/analysis tools paused during settlement while a probed route still has no spec. The
- * reserved wrap-up turn is for one guardian_verify call or an explicit coded proof gap, not more
+ * reserved wrap-up turn is for one kovo_verify call or an explicit coded proof gap, not more
  * analysis. Network tools are already revoked above; verification/closure tools stay available.
  */
 const SETTLEMENT_SPEC_PAUSED_TOOLS = new Set([
@@ -678,7 +678,7 @@ export class SpecSubmissionTracker {
     this.markCovered(routes)
   }
 
-  /** A guardian_verify script: cover host-observed transcript routes first, then matched script paths. */
+  /** A kovo_verify script: cover host-observed transcript routes first, then matched script paths. */
   noteVerifyScript(
     script: string | undefined,
     transcriptRoutes?: readonly { method?: string; path?: string }[],
@@ -994,7 +994,7 @@ export class SpecSubmissionTracker {
   }
 
   /**
-   * Record a host-side denial (tier/scope/auth/runtime) that reached Guardian but never the app.
+   * Record a host-side denial (tier/scope/auth/runtime) that reached Kovo Hunter but never the app.
    * This is the transcript evidence that can substantiate a `tier_blocked`/`out_of_scope` gap;
    * it never increments probe attempts.
    */
@@ -1148,7 +1148,7 @@ export function settlementToolBlock(input: {
   /**
    * Effective final turn. Defaults to `maxTurns`; an earned early exit passes
    * `min(maxTurns, triggerTurn + EARLY_EXIT_GRACE_TURNS)` so the last grace turn is reserved for
-   * complete_intent while the turn before it can still run the one wrap-up guardian_verify.
+   * complete_intent while the turn before it can still run the one wrap-up kovo_verify.
    */
   finalTurn?: number
 }): string | undefined {
@@ -1161,7 +1161,7 @@ export function settlementToolBlock(input: {
     return `Final settlement turn (${input.turnsUsed}/${finalTurn}). ${input.name} is disabled on the final turn; commit results and call complete_intent.`
   }
   if (input.specPending && SETTLEMENT_SPEC_PAUSED_TOOLS.has(input.name)) {
-    return `${input.specDirective ? `${input.specDirective} ` : ''}${input.name} is paused during settlement while the proof obligation is open; call guardian_verify (or record a coded record_coverage proof gap) before complete_intent.`
+    return `${input.specDirective ? `${input.specDirective} ` : ''}${input.name} is paused during settlement while the proof obligation is open; call kovo_verify (or record a coded record_coverage proof gap) before complete_intent.`
   }
   return undefined
 }
@@ -1239,7 +1239,7 @@ export interface SpecSubmissionToolOptions {
   tracker?: SpecSubmissionTracker
   /** Called once per rejected simple conclusion so the caller can emit `agent.spec_submission_required`. */
   onRequired?: (info: { status: string; count: number; route?: SpecRouteEvidence }) => void
-  /** Explicitly opt in to registering legacy `verify_replay_spec` while `guardian_verify` is active (default false to prevent LLM DSL dilution). */
+  /** Explicitly opt in to registering legacy `verify_replay_spec` while `kovo_verify` is active (default false to prevent LLM DSL dilution). */
   allowLegacyReplaySpec?: boolean
 }
 
@@ -1383,7 +1383,7 @@ export function buildWorkerTools(
     }
     tools.push(defineTool({
       name: 'request_http',
-      description: 'Send a scoped HTTP request through Guardian’s RequestBroker. Responses are redacted and auto-staged into /evidence/exchanges/<id>.json.',
+      description: 'Send a scoped HTTP request through Kovo Hunter’s RequestBroker. Responses are redacted and auto-staged into /evidence/exchanges/<id>.json.',
       parameters: httpRequestSchema,
       replay: 'unsafe',
       outputLimits,
@@ -1516,7 +1516,7 @@ export function buildWorkerTools(
     const fn = handlers.browser_visit
     tools.push(defineTool({
       name: 'browser_visit',
-      description: 'Load an approved URL in Guardian’s 100% broker-proxied Playwright browser (zero direct egress) and optionally execute safe interactive actions (fill, click, select_option, wait_for_selector, wait_for_xhr, evaluate_builtin, dom_xss_sink_hook). Captures rendered DOM, live XHR/fetch URLs, DOM sink taint traces, console logs, postMessage listeners, and safe storage keys.',
+      description: 'Load an approved URL in Kovo Hunter’s 100% broker-proxied Playwright browser (zero direct egress) and optionally execute safe interactive actions (fill, click, select_option, wait_for_selector, wait_for_xhr, evaluate_builtin, dom_xss_sink_hook). Captures rendered DOM, live XHR/fetch URLs, DOM sink taint traces, console logs, postMessage listeners, and safe storage keys.',
       parameters: obj({
         origin: str({ maxLength: 256 }),
         pathAndQuery: str({ maxLength: 4096 }),
@@ -1577,7 +1577,7 @@ export function buildWorkerTools(
     })
     tools.push(defineTool({
       name: 'browser_session',
-      description: 'Execute a multi-step stateful browser session in Guardian’s 100%-brokered Playwright browser, preserving DOM, cookies, and localStorage across contiguous steps of the same role/persona and isolating control vs probe groups automatically.',
+      description: 'Execute a multi-step stateful browser session in Kovo Hunter’s 100%-brokered Playwright browser, preserving DOM, cookies, and localStorage across contiguous steps of the same role/persona and isolating control vs probe groups automatically.',
       parameters: obj({
         steps: arr(browserSessionStepSchema, { minItems: 1, maxItems: 16 }),
       }),
@@ -1624,7 +1624,7 @@ export function buildWorkerTools(
     const fn = handlers.crawl_state_graph
     tools.push(defineTool({
       name: 'crawl_state_graph',
-      description: 'Run a bounded multi-persona SPA state-graph crawl through Guardian’s 100%-brokered ScopedBrowser, discovering routes, HTML forms/CSRF fields, XHR/fetch/GraphQL/Next-Action endpoints, postMessage listeners, and storage key names into SQLite.',
+      description: 'Run a bounded multi-persona SPA state-graph crawl through Kovo Hunter’s 100%-brokered ScopedBrowser, discovering routes, HTML forms/CSRF fields, XHR/fetch/GraphQL/Next-Action endpoints, postMessage listeners, and storage key names into SQLite.',
       parameters: obj({
         origin: str({ description: 'Approved origin to crawl.', maxLength: 256 }),
         personas: opt(arr(str({ maxLength: 64 }), { maxItems: 6, description: 'Optional approved persona handles to crawl alongside anonymous.' })),
@@ -1775,7 +1775,7 @@ export function buildWorkerTools(
     const fn = handlers.run_safe_templates
     tools.push(defineTool({
       name: 'run_safe_templates',
-      description: 'Run Guardian’s vetted, non-destructive YAML template pack filtered by techTags or templateIds, executed 100% through RequestBroker with SPA-catchall exclusion. Matches produce candidate leads/hypotheses (still require Zero-LLM Replay Verification).',
+      description: 'Run Kovo Hunter’s vetted, non-destructive YAML template pack filtered by techTags or templateIds, executed 100% through RequestBroker with SPA-catchall exclusion. Matches produce candidate leads/hypotheses (still require Zero-LLM Replay Verification).',
       parameters: obj({
         origin: str({ description: 'Approved origin.', maxLength: 256 }),
         techTags: opt(arr(str({ maxLength: 64 }), { maxItems: 24, description: 'Fingerprinted tech tags (e.g. nextjs, django, fastapi, springboot, graphql, clerk, supabase).' })),
@@ -1869,7 +1869,7 @@ export function buildWorkerTools(
     const fn = handlers.query_cves
     tools.push(defineTool({
       name: 'query_cves',
-      description: 'Query OSV.dev and Guardian’s curated web CVE registry for a fingerprinted (ecosystem, package, version?). Returns advisories and safe verification hints; never confirms a finding on version alone.',
+      description: 'Query OSV.dev and Kovo Hunter’s curated web CVE registry for a fingerprinted (ecosystem, package, version?). Returns advisories and safe verification hints; never confirms a finding on version alone.',
       parameters: obj({
         ecosystem: str({ description: 'Package ecosystem (e.g. npm, PyPI, Go, Debian, infra).', maxLength: 64 }),
         package: str({ description: 'Package or framework name (e.g. next, react, vite, express).', maxLength: 160 }),
@@ -1903,7 +1903,7 @@ export function buildWorkerTools(
     const fn = handlers.mint_canary
     tools.push(defineTool({
       name: 'mint_canary',
-      description: 'Mint a signed, single-use benign Guardian canary token/URL for blind reflection or OOB callback validation.',
+      description: 'Mint a signed, single-use benign Kovo Hunter canary token/URL for blind reflection or OOB callback validation.',
       parameters: obj({ purpose: str({ maxLength: 200 }) }),
       replay: 'unsafe',
       outputLimits,
@@ -1918,7 +1918,7 @@ export function buildWorkerTools(
     const fn = handlers.check_canary
     tools.push(defineTool({
       name: 'check_canary',
-      description: 'Check whether a previously minted Guardian canary token has received a benign callback.',
+      description: 'Check whether a previously minted Kovo Hunter canary token has received a benign callback.',
       parameters: obj({ token: str({ maxLength: 128 }) }),
       replay: 'safe',
       outputLimits,
@@ -2281,9 +2281,9 @@ export function buildWorkerTools(
   }
 
   // Script-first default: when the Layer-3 runner is supplied, agents verify with executable
-  // guardian_verify scripts. Keep the compilers available (proof-tools.ts) for deterministic
+  // kovo_verify scripts. Keep the compilers available (proof-tools.ts) for deterministic
   // internal callers, but do not expose the four JSON-only proof tools to agents.
-  if (!handlers.guardian_verify) {
+  if (!handlers.kovo_verify) {
     for (const name of proofToolHandlerNames) {
       const handler = handlers[name]
       if (!handler) continue
@@ -2313,15 +2313,15 @@ export function buildWorkerTools(
     }
   }
 
-  const hasGuardianVerify = Boolean(handlers.guardian_verify)
+  const hasKovoVerify = Boolean(handlers.kovo_verify)
   const allowLegacyReplaySpec = Boolean(specSubmission?.allowLegacyReplaySpec)
 
-  if (handlers.guardian_verify) {
-    const fn = handlers.guardian_verify
+  if (handlers.kovo_verify) {
+    const fn = handlers.kovo_verify
     let gvValidationErrors = 0
     tools.push(defineTool({
-      name: 'guardian_verify',
-      description: GUARDIAN_VERIFY_TOOL_DESCRIPTION,
+      name: 'kovo_verify',
+      description: KOVO_VERIFY_TOOL_DESCRIPTION,
       parameters: obj({
         script: opt(str({ description: 'Inline TypeScript verification script. Takes precedence over scriptPath.', maxLength: 64 * 1024 })),
         code: opt(str({ description: 'Alias for `script` (inline verification script).', maxLength: 64 * 1024 })),
@@ -2343,7 +2343,7 @@ export function buildWorkerTools(
             isError: true,
             output: [{
               type: 'text' as const,
-              text: GUARDIAN_VERIFY_TS_ONLY_ERROR,
+              text: KOVO_VERIFY_TS_ONLY_ERROR,
             }],
           }
         }
@@ -2351,29 +2351,29 @@ export function buildWorkerTools(
           gvValidationErrors += 1
           const example = '{"script":"await ctx.prove_access_boundary({ controlPersona: \'user_b\', probePersona: \'user_a\', route: \'/api/items/1\' }); return ctx.result({ title: \'BOLA read\' })","runtime":"ts"}'
           const loopStop = gvValidationErrors >= 3
-            ? ` Repeated guardian_verify validation errors (${gvValidationErrors}x): stop retrying malformed calls — either pass a non-empty \`script\` string matching the example or call record_coverage(proofGapReason="cannot_build_spec") and complete_intent.`
+            ? ` Repeated kovo_verify validation errors (${gvValidationErrors}x): stop retrying malformed calls — either pass a non-empty \`script\` string matching the example or call record_coverage(proofGapReason="cannot_build_spec") and complete_intent.`
             : ''
           return {
             isError: true,
             output: [{
               type: 'text' as const,
-              text: `guardian_verify validation failed: provide non-empty inline code in \`script\` (or workspace file in \`scriptPath\`). Example call: ${example}.${loopStop}`,
+              text: `kovo_verify validation failed: provide non-empty inline code in \`script\` (or workspace file in \`scriptPath\`). Example call: ${example}.${loopStop}`,
             }],
           }
         }
         gvValidationErrors = 0
-        const runtime: GuardianVerifyRuntime = 'ts'
-        const payload: GuardianVerifyArgs = {
+        const runtime: KovoVerifyRuntime = 'ts'
+        const payload: KovoVerifyArgs = {
           ...(inlineScript ? { script: inlineScript } : { scriptPath }),
           runtime,
           ...(args.title?.trim() ? { title: args.title.trim() } : {}),
           ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),
         }
         return wrapExec(
-          'guardian_verify',
+          'kovo_verify',
           async () => {
             const result = await fn(payload, signal)
-            const summary = summarizeGuardianVerifyOutcome(result)
+            const summary = summarizeKovoVerifyOutcome(result)
             const transcriptRoutes = summary.transcriptSummary
               .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object')
               .map(entry => ({
@@ -2400,7 +2400,7 @@ export function buildWorkerTools(
     const fn = handlers.propose_chain_finding
     tools.push(defineTool({
       name: 'propose_chain_finding',
-      description: proposeChainFindingDescription(hasGuardianVerify, allowLegacyReplaySpec),
+      description: proposeChainFindingDescription(hasKovoVerify, allowLegacyReplaySpec),
       parameters: obj({
         replaySpec: unsafe<Record<string, unknown>>({
           type: 'object',
@@ -2440,12 +2440,12 @@ export function buildWorkerTools(
           errors.push('- confidenceRationale: must be a non-empty justification explaining why the finding holds (>= 10 chars).')
         }
         const parsed = declarativeReplaySpecSchema.safeParse(args.replaySpec)
-        if (hasGuardianVerify && parsed.success && parsed.data.kind !== 'static_ast_proof') {
+        if (hasKovoVerify && parsed.success && parsed.data.kind !== 'static_ast_proof') {
           return {
             isError: true,
             output: [{
               type: 'text' as const,
-              text: guardianVerifyRedirectMessage(parsed.data.kind),
+              text: kovoVerifyRedirectMessage(parsed.data.kind),
             }],
           }
         }
@@ -2472,7 +2472,7 @@ export function buildWorkerTools(
           verifyNow: args.verifyNow ?? true,
         }, signal).then(result => {
           specSubmission?.tracker?.noteSpecAttempt(replaySpecRouteSteps(parsed.data))
-          return withVerifierRepairFeedback(result, hasGuardianVerify)
+          return withVerifierRepairFeedback(result, hasKovoVerify)
         }), signal)
       },
     }))
@@ -2529,19 +2529,19 @@ export function buildWorkerTools(
           verifyNow: args.verifyNow,
         }, signal).then(result => {
           specSubmission?.tracker?.noteSpecAttempt(parsedSpec ? replaySpecRouteSteps(parsedSpec) : undefined)
-          return withVerifierRepairFeedback(result, hasGuardianVerify)
+          return withVerifierRepairFeedback(result, hasKovoVerify)
         }), signal)
       },
     }))
   }
 
-  // Wave 3 C1: hide legacy verify_replay_spec from LLM tool schemas whenever guardian_verify is
+  // Wave 3 C1: hide legacy verify_replay_spec from LLM tool schemas whenever kovo_verify is
   // active (unless explicitly opted in via allowLegacyReplaySpec: true) to prevent DSL dilution.
-  if (handlers.verify_replay_spec && (!hasGuardianVerify || allowLegacyReplaySpec)) {
+  if (handlers.verify_replay_spec && (!hasKovoVerify || allowLegacyReplaySpec)) {
     const fn = handlers.verify_replay_spec
     tools.push(defineTool({
       name: 'verify_replay_spec',
-      description: `${hasGuardianVerify ? '[LEGACY FALLBACK — `guardian_verify` is active in this session. Prefer `guardian_verify(script="<inline TS using ctx.prove_*>", runtime="ts")` for all runtime proofs so findings persist ProofReceipt (`proof_kind="agent_script"`). Use `verify_replay_spec` ONLY for `static_ast_proof` or when `guardian_verify` is unavailable.] ' : ''}Execute a DeclarativeReplaySpec synchronously through Guardian’s Zero-LLM ReplayVerifier and return sanitized InlineVerifyFeedback (jqError, failedStepId, spaCatchallMatched, canaryTriggered, stepStatuses, retriesRemaining). Maximum 2 repair retries (3 attempts total) per hypothesis. ${GUARDIAN_VERIFY_SPEC_SHAPE}`,
+      description: `${hasKovoVerify ? '[LEGACY FALLBACK — `kovo_verify` is active in this session. Prefer `kovo_verify(script="<inline TS using ctx.prove_*>", runtime="ts")` for all runtime proofs so findings persist ProofReceipt (`proof_kind="agent_script"`). Use `verify_replay_spec` ONLY for `static_ast_proof` or when `kovo_verify` is unavailable.] ' : ''}Execute a DeclarativeReplaySpec synchronously through Kovo Hunter’s Zero-LLM ReplayVerifier and return sanitized InlineVerifyFeedback (jqError, failedStepId, spaCatchallMatched, canaryTriggered, stepStatuses, retriesRemaining). Maximum 2 repair retries (3 attempts total) per hypothesis. ${KOVO_VERIFY_SPEC_SHAPE}`,
       parameters: obj({
         spec: opt(unsafe<Record<string, unknown>>({
           type: 'object',
@@ -2569,12 +2569,12 @@ export function buildWorkerTools(
           }
         }
         const parsed = declarativeReplaySpecSchema.safeParse(rawSpec)
-        if (hasGuardianVerify && parsed.success && parsed.data.kind !== 'static_ast_proof') {
+        if (hasKovoVerify && parsed.success && parsed.data.kind !== 'static_ast_proof') {
           return {
             isError: true,
             output: [{
               type: 'text' as const,
-              text: guardianVerifyRedirectMessage(parsed.data.kind),
+              text: kovoVerifyRedirectMessage(parsed.data.kind),
             }],
           }
         }
@@ -2594,7 +2594,7 @@ export function buildWorkerTools(
           replaySpecId: args.replaySpecId?.trim() || undefined,
         }, signal).then(result => {
           specSubmission?.tracker?.noteSpecAttempt(replaySpecRouteSteps(parsed.data))
-          return withVerifierRepairFeedback(result, hasGuardianVerify)
+          return withVerifierRepairFeedback(result, hasKovoVerify)
         }), signal)
       },
     }))
@@ -2681,7 +2681,7 @@ export function buildWorkerTools(
         if (snapshot && (args.status === 'proved' || args.status === 'partial')) {
           // Validate every coded gap against the host-observed exchange ledger for its route.
           // An unsupported gap is rejected once per route (never a loop) and the next turn is
-          // reserved for guardian_verify or for recording the missing exchange.
+          // reserved for kovo_verify or for recording the missing exchange.
           const gapCheck = specSubmission?.tracker?.validateGapsForSettlement()
           if (gapCheck && gapCheck.rejected.length > 0) {
             const count = specSubmission?.tracker?.noteRequired() ?? 0
@@ -2697,7 +2697,7 @@ export function buildWorkerTools(
             })
             return {
               isError: true,
-              output: [{ type: 'text' as const, text: gapValidationRejectedMessage(gapCheck.rejected, target, { hasGuardianVerify: hasGuardianVerify && !allowLegacyReplaySpec }) }],
+              output: [{ type: 'text' as const, text: gapValidationRejectedMessage(gapCheck.rejected, target, { hasKovoVerify: hasKovoVerify && !allowLegacyReplaySpec }) }],
             }
           }
         }
@@ -2713,7 +2713,7 @@ export function buildWorkerTools(
           })
           return {
             isError: true,
-            output: [{ type: 'text' as const, text: specSubmissionRequiredMessage(target, { hasGuardianVerify: hasGuardianVerify && !allowLegacyReplaySpec }) }],
+            output: [{ type: 'text' as const, text: specSubmissionRequiredMessage(target, { hasKovoVerify: hasKovoVerify && !allowLegacyReplaySpec }) }],
           }
         }
         const completion: IntentCompletion = {
@@ -2877,7 +2877,7 @@ export interface RunAgentSessionOptions {
   shouldSettle?: () => boolean
   /** Optional wall-clock budget for the session; settles at `max(wallClockMs - 15s, 80%)` and hard-rotates at `wallClockMs`. */
   wallClockMs?: number
-  /** Optional grace window when a proof call (`guardian_verify`) is actively running at `wallClockMs` (default 5s). */
+  /** Optional grace window when a proof call (`kovo_verify`) is actively running at `wallClockMs` (default 5s). */
   wallClockGraceMs?: number
   /** Called once when the hard per-assignment `wallClockMs` deadline triggers a bounded rotation. */
   onWallClockRotate?: (info: { elapsedMs: number; wallClockMs: number; turnsUsed: number; graceUsedMs: number }) => void
@@ -2930,7 +2930,7 @@ export interface RunAgentSessionOptions {
   onEarlyExit?: (info: EarlyExitEvent) => void
   onProfileSuccess?: (profileId: string) => void
   onProfileFailure?: (profileId: string, err: string, hard: boolean) => void
-  /** Explicitly opt in to registering legacy `verify_replay_spec` while `guardian_verify` is active (default false). */
+  /** Explicitly opt in to registering legacy `verify_replay_spec` while `kovo_verify` is active (default false). */
   allowLegacyReplaySpec?: boolean
   /** Opt-in agentic trace writer (see createAgentTrace). Nothing is recorded when omitted. */
   trace?: AgentTrace
@@ -3165,8 +3165,8 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     ? { earlyExit, earlyExitTurnsSaved: earlyExit.turnsSaved }
     : {}
 
-  const registeredProofTools = handlers.guardian_verify
-    ? ['guardian_verify']
+  const registeredProofTools = handlers.kovo_verify
+    ? ['kovo_verify']
     : proofToolHandlerNames.filter(name => Boolean(handlers[name]))
   const trace = options.trace
   const traceRunId = options.traceContext?.runId ?? options.requestId
@@ -3401,7 +3401,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const extensions = []
   if (allTools.length || hooks.length) {
     const extension = defineExtension({
-      name: 'guardian-v2-worker',
+      name: 'kovo-v2-worker',
       tools: allTools,
       hooks,
     })
@@ -3482,7 +3482,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       maxTurns,
       extensions,
       instructions: options.instructions ?? workerSessionInstructions(options.scenario, {
-        hasGuardianVerify: Boolean(options.handlers?.guardian_verify),
+        hasKovoVerify: Boolean(options.handlers?.kovo_verify),
       }),
     }
     const conversation = await harness.root(context, { agent })
@@ -3579,7 +3579,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           options.signal,
         )
         return finish({
-          answer: 'The model did not provide a usable evidence command. Guardian recorded the standard observation extraction.',
+          answer: 'The model did not provide a usable evidence command. Kovo Hunter recorded the standard observation extraction.',
           turnsUsed,
           settled,
           nudgesUsed,

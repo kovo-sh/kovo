@@ -415,9 +415,9 @@ export class FindingsRepository {
   /** Current on-disk DB/WAL/artifact sizes plus FTS/exchange row counts. */
   storeFootprint(): StoreFootprint {
     this.session.flushNow()
-    const mainDbBytes = safeFileSize(join(this.session.directory, 'guardian.sqlite'))
-    const walBytes = safeFileSize(join(this.session.directory, 'guardian.sqlite-wal'))
-    const shmBytes = safeFileSize(join(this.session.directory, 'guardian.sqlite-shm'))
+    const mainDbBytes = safeFileSize(join(this.session.directory, 'kovo.sqlite'))
+    const walBytes = safeFileSize(join(this.session.directory, 'kovo.sqlite-wal'))
+    const shmBytes = safeFileSize(join(this.session.directory, 'kovo.sqlite-shm'))
     const { total: artifactBytes, blobs: blobBytes } = boundedArtifactSize(join(this.session.directory, 'artifacts'))
     let ftsRows = 0
     if (this.session.ftsTableExists) {

@@ -37,9 +37,9 @@ import type {
 // Independent re-run: verifyScript()
 // ---------------------------------------------------------------------------
 
-export const GUARDIAN_VERIFY_STDERR_PREVIEW_MAX_CHARS = 400
+export const KOVO_VERIFY_STDERR_PREVIEW_MAX_CHARS = 400
 
-export const GUARDIAN_VERIFY_USAGE_HINT =
+export const KOVO_VERIFY_USAGE_HINT =
   'Inline TS scripts receive `ctx` directly (no imports required): `await ctx.prove_access_boundary({ controlPersona, probePersona, route }); return ctx.result({ title: "..." })` (or `export default async (ctx) => { ... }`).'
 
 /** Strip accidental outer markdown code fences (```ts ... ```) from LLM scripts. */
@@ -50,7 +50,7 @@ function stripCodeFences(rawCode: string): string {
 }
 
 /** Redact credential-shaped tokens and bound stderr preview to 400 chars for repair feedback. */
-export function redactStderrPreview(raw: string, maxChars = GUARDIAN_VERIFY_STDERR_PREVIEW_MAX_CHARS): string {
+export function redactStderrPreview(raw: string, maxChars = KOVO_VERIFY_STDERR_PREVIEW_MAX_CHARS): string {
   const cleaned = redact(raw ?? '').replace(/\u001b\[[0-9;]*m/g, '').trim()
   if (!cleaned) return ''
   return cleaned.length <= maxChars ? cleaned : `${cleaned.slice(0, Math.max(0, maxChars - 3))}...`
@@ -58,8 +58,8 @@ export function redactStderrPreview(raw: string, maxChars = GUARDIAN_VERIFY_STDE
 
 function normalizeTsSdkImports(code: string): string {
   return code
-    .replace(/(\bfrom\s*)(['"])(?:\.\/)?guardian_verify(?:\.(?:ts|mts|js|mjs))?\2/g, "$1'./guardian_verify.ts'")
-    .replace(/\bimport\(\s*(['"])(?:\.\/)?guardian_verify(?:\.(?:ts|mts|js|mjs))?\1\s*\)/g, "import('./guardian_verify.ts')")
+    .replace(/(\bfrom\s*)(['"])(?:\.\/)?kovo_verify(?:\.(?:ts|mts|js|mjs))?\2/g, "$1'./kovo_verify.ts'")
+    .replace(/\bimport\(\s*(['"])(?:\.\/)?kovo_verify(?:\.(?:ts|mts|js|mjs))?\1\s*\)/g, "import('./kovo_verify.ts')")
 }
 
 function splitLeadingTsImports(code: string): { imports: string; body: string } {
@@ -116,8 +116,8 @@ function splitLeadingTsImports(code: string): { imports: string; body: string } 
 }
 
 /**
- * Normalize an inline `guardian_verify` script so every documented authoring style works identically:
- *   1. Explicit `runVerification(...)` / `runEntrypoint(...)` / `GUARDIAN_PROOF_RESULT_FILE` -> run as-is (with SDK import paths normalized).
+ * Normalize an inline `kovo_verify` script so every documented authoring style works identically:
+ *   1. Explicit `runVerification(...)` / `runEntrypoint(...)` / `KOVO_PROOF_RESULT_FILE` -> run as-is (with SDK import paths normalized).
  *   2. `export default async (ctx) => ...` / `export default defineVerification(...)` / `export default { verify(ctx) {} }` -> invoke via `runEntrypoint`.
  *   3. Named `export async function verify(ctx)` / `async function verify(ctx)` -> invoke via `runEntrypoint`.
  *   4. Bare inline script body using `ctx` (`await ctx.prove_access_boundary(...)`) -> wrap in `runEntrypoint(async (ctx) => { ... })`.
@@ -127,7 +127,7 @@ function splitLeadingTsImports(code: string): { imports: string; body: string } 
  */
 export function prepareVerifyScript(rawCode: string, runtime: 'ts' = 'ts', defaultTitle?: string): string {
   if (runtime !== 'ts') {
-    throw new Error(`Unsupported verification runtime: ${String(runtime)}. guardian_verify supports TypeScript only (runtime='ts').`)
+    throw new Error(`Unsupported verification runtime: ${String(runtime)}. kovo_verify supports TypeScript only (runtime='ts').`)
   }
   const unfenced = stripCodeFences(rawCode)
   const trimmed = unfenced.trim()
@@ -137,8 +137,8 @@ export function prepareVerifyScript(rawCode: string, runtime: 'ts' = 'ts', defau
   // TypeScript runtime
   const normalized = normalizeTsSdkImports(unfenced)
   if (
-    /\b(?:runVerification|runEntrypoint|__guardian_run)\s*\(/.test(normalized)
-    || /\bGUARDIAN_PROOF_RESULT_FILE\b/.test(normalized)
+    /\b(?:runVerification|runEntrypoint|__kovo_run)\s*\(/.test(normalized)
+    || /\bKOVO_PROOF_RESULT_FILE\b/.test(normalized)
   ) {
     return normalized
   }
@@ -146,13 +146,13 @@ export function prepareVerifyScript(rawCode: string, runtime: 'ts' = 'ts', defau
   const needsDefineAlias = /\bdefineVerification\s*\(/.test(normalized)
     && !/\bimport\b[^;]*\bdefineVerification\b/.test(normalized)
   const sdkImport = needsDefineAlias
-    ? "import { defineVerification, runEntrypoint as __guardian_run } from './guardian_verify.ts'\n"
-    : "import { runEntrypoint as __guardian_run } from './guardian_verify.ts'\n"
+    ? "import { defineVerification, runEntrypoint as __kovo_run } from './kovo_verify.ts'\n"
+    : "import { runEntrypoint as __kovo_run } from './kovo_verify.ts'\n"
 
   const exportDefaultRe = /(^|;[ \t]*|\n[ \t]*)export\s+default\s+/
   if (exportDefaultRe.test(normalized)) {
-    const rewritten = normalized.replace(exportDefaultRe, '$1const __guardian_default_export = ')
-    return `${sdkImport}${rewritten}\n;\nawait __guardian_run(__guardian_default_export, ${titleLiteral})\n`
+    const rewritten = normalized.replace(exportDefaultRe, '$1const __kovo_default_export = ')
+    return `${sdkImport}${rewritten}\n;\nawait __kovo_run(__kovo_default_export, ${titleLiteral})\n`
   }
 
   const hasExportVerify = /^[ \t]*export\s+(?:(?:async\s+)?function\s+verify\s*\(|(?:const|let|var)\s+verify\s*=)/m.test(normalized)
@@ -161,7 +161,7 @@ export function prepareVerifyScript(rawCode: string, runtime: 'ts' = 'ts', defau
     const hasSetup = /^[ \t]*(?:export\s+)?(?:(?:async\s+)?function\s+setup\s*\(|(?:const|let|var)\s+setup\s*=)/m.test(normalized)
     const hasCleanup = /^[ \t]*(?:export\s+)?(?:(?:async\s+)?function\s+cleanup\s*\(|(?:const|let|var)\s+cleanup\s*=)/m.test(normalized)
     const hooks = ['verify', ...(hasSetup ? ['setup'] : []), ...(hasCleanup ? ['cleanup'] : [])].join(', ')
-    return `${sdkImport}${normalized}\n;\nawait __guardian_run({ ${hooks} }, ${titleLiteral})\n`
+    return `${sdkImport}${normalized}\n;\nawait __kovo_run({ ${hooks} }, ${titleLiteral})\n`
   }
 
   if (/\bctx\b/.test(normalized)) {
@@ -172,9 +172,9 @@ export function prepareVerifyScript(rawCode: string, runtime: 'ts' = 'ts', defau
     const isStandaloneFnExpr = /^(?:async\s+)?(?:\(\s*ctx\b[^)]*\)\s*=>|ctx\s*=>|function\s*(?:[A-Za-z_$][\w$]*)?\s*\(\s*ctx\b[^)]*\))/.test(bodyTrimmed)
     if (isStandaloneFnExpr) {
       const expr = bodyTrimmed.replace(/;\s*$/, '')
-      return `${prefix}await __guardian_run((\n${expr}\n), ${titleLiteral})\n`
+      return `${prefix}await __kovo_run((\n${expr}\n), ${titleLiteral})\n`
     }
-    return `${prefix}await __guardian_run(async (ctx) => {\n${body}\n}, ${titleLiteral})\n`
+    return `${prefix}await __kovo_run(async (ctx) => {\n${body}\n}, ${titleLiteral})\n`
   }
 
   return normalized
@@ -569,7 +569,7 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
       transcriptSummary: source[0]?.transcriptSummary ?? [],
       ...(showDiagnostics && typeof failingExit === 'number' ? { exitCode: failingExit } : {}),
       ...(showDiagnostics ? { stderrPreview } : {}),
-      ...(includeScriptDiagnostics ? { usageHint: GUARDIAN_VERIFY_USAGE_HINT } : {}),
+      ...(includeScriptDiagnostics ? { usageHint: KOVO_VERIFY_USAGE_HINT } : {}),
     }
   }
   const withFeedback = <T extends Omit<VerifyVerdict, 'rejectedBy' | 'missingEvidence' | 'transcriptSummary'>>(
@@ -711,10 +711,10 @@ const RESULT_FILE_MAX_BYTES = 1024 * 1024
 const SCRIPT_OUTPUT_MAX_BYTES = 512 * 1024
 
 function copySdkFiles(sdkDir: string, targetDir: string) {
-  if (!existsSync(sdkDir)) throw new Error('guardian_verify SDK directory is missing.')
-  const file = 'guardian_verify.ts'
+  if (!existsSync(sdkDir)) throw new Error('kovo_verify SDK directory is missing.')
+  const file = 'kovo_verify.ts'
   const source = join(sdkDir, file)
-  if (!existsSync(source)) throw new Error('guardian_verify.ts SDK file is missing.')
+  if (!existsSync(source)) throw new Error('kovo_verify.ts SDK file is missing.')
   if (statSync(source).size > 256 * 1024) throw new Error('SDK file exceeds the size limit.')
   copyFileSync(source, join(targetDir, basename(file)))
   chmodSync(join(targetDir, basename(file)), 0o644)
@@ -784,9 +784,9 @@ export async function runCandidateLocally(
   options: RunCandidateLocallyOptions,
 ): Promise<AttemptExecution> {
   if (candidate.runtime !== 'ts') {
-    throw new Error(`Unsupported verification runtime: ${String(candidate.runtime)}. guardian_verify supports TypeScript only (runtime='ts').`)
+    throw new Error(`Unsupported verification runtime: ${String(candidate.runtime)}. kovo_verify supports TypeScript only (runtime='ts').`)
   }
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-verify-candidate-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-verify-candidate-'))
   const resultPath = join(dir, 'result.json')
   try {
     copySdkFiles(options.sdkDir, dir)

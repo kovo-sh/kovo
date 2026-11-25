@@ -1886,10 +1886,10 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
               ? 'Threat model complete (no model profile configured). Starting bounded deterministic differential probing.'
               : `Threat model complete${codeAuditStepsCreated ? ` (${codeAuditStepsCreated} source-audit steps + ${addedInitial} initial steps)` : ` (${totalQueued} initial steps)`}. Starting closed-loop chain investigation.`
             : 'Baseline captures complete. Starting deterministic Zero-LLM verification.')
-        this.storage.message(current.id, current.coordinatorId, 'guardian',
+        this.storage.message(current.id, current.coordinatorId, 'kovo',
           nextPhase === 'investigation'
             ? deterministicMode
-              ? `Threat model ranked ${finalEntries.length} hosts. No model profile is configured, so Guardian will run a bounded deterministic probe pass over discovered endpoints instead of agentic investigation.`
+              ? `Threat model ranked ${finalEntries.length} hosts. No model profile is configured, so Kovo Hunter will run a bounded deterministic probe pass over discovered endpoints instead of agentic investigation.`
               : `Threat model ranked ${finalEntries.length} hosts and queued ${totalQueued} initial investigation steps${codeAuditStepsCreated ? ` (including ${codeAuditStepsCreated} from Source-First Code Audit)` : ''}.`
             : 'Baseline capture complete. Deterministic verification is checking the recorded evidence.')
       }, { behavior: 'immediate' })
@@ -2620,7 +2620,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       : /sqli|sql|inject|xss|ssti|command|template|xml|xxe/.test(text)
         ? 'prove_boolean_or_timing_diff'
         : 'prove_access_boundary'
-    return `Invoke guardian_verify(${tool}) against this sink (control vs variant on the exact route above), or record_coverage(proofGapReason="<status|cannot_build_spec>") with the blocking HTTP status. A bare "leaning true" without either is rejected at settlement.`
+    return `Invoke kovo_verify(${tool}) against this sink (control vs variant on the exact route above), or record_coverage(proofGapReason="<status|cannot_build_spec>") with the blocking HTTP status. A bare "leaning true" without either is rejected at settlement.`
   }
 
 
@@ -3666,8 +3666,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         const variants = [...new Set(itemsForOrigin.flatMap(item => item.variants.map(variant =>
           `${variant.method} ${variant.endpoint}${variant.destructive ? ' (Tier 3 only)' : ''}`)))].slice(0, 8)
         const readGuidance = hasGetVariant
-          ? 'Verify tenant isolation with GET first via guardian_verify(prove_access_boundary); use benign PUT/PATCH field deltas via guardian_verify(prove_persisted_mutation) only where reversible; DELETE stays Tier 3/local-lab.'
-          : 'GET read on this route template is ALREADY floor-confirmed — do NOT re-submit a read-only GET proof. Test only the unconfirmed write/mutation variants above with guardian_verify(prove_persisted_mutation) using reversible benign field deltas; DELETE stays Tier 3/local-lab.'
+          ? 'Verify tenant isolation with GET first via kovo_verify(prove_access_boundary); use benign PUT/PATCH field deltas via kovo_verify(prove_persisted_mutation) only where reversible; DELETE stays Tier 3/local-lab.'
+          : 'GET read on this route template is ALREADY floor-confirmed — do NOT re-submit a read-only GET proof. Test only the unconfirmed write/mutation variants above with kovo_verify(prove_persisted_mutation) using reversible benign field deltas; DELETE stays Tier 3/local-lab.'
         this.storage.addChainStep(updated, {
           title: `Cross-persona BOLA/IDOR matrix · ${new URL(origin).hostname} · resource:${resourceKey}`,
           hypothesis: `Replay ${itemsForOrigin.length} ${resourceKey} resource(s) owned by ${itemsForOrigin[0].ownerPersona} (e.g. ${itemsForOrigin.map(item => `${item.endpoint} [${item.resourceId}]`).join(', ')}) as ${itemsForOrigin[0].testAsPersonas?.join(', ') ?? 'alternate persona & anonymous'} using bounded consumer item variants: ${variants.join(', ')}. ${readGuidance}`,
@@ -4118,7 +4118,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     }).catch(() => {
       if (!this.host.currentCoordinator(run.id, task)) return
       this.storage.transaction(() => {
-        this.storage.message(run.id, run.coordinatorId, 'guardian',
+        this.storage.message(run.id, run.coordinatorId, 'kovo',
           'The coordinator could not reach the model. Review the workflow for current progress.', next.id)
         this.storage.event(run.id, 'coordinator.unavailable', 'The coordinator could not complete its reply.')
       })

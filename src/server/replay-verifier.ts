@@ -193,7 +193,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
   }
   if (!isStatic && hasDestructiveContent(JSON.stringify(spec))) {
     grant.audit('denied', spec.origin)
-    return inconclusiveResult('Replay spec rejected by Guardian destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
+    return inconclusiveResult('Replay spec rejected by Kovo Hunter destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
   }
   const tier = grant.tier ?? 1
   if (tier === 0 && !isStatic) {
@@ -421,7 +421,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
 
         let spaCatchall: Record<string, unknown> | undefined
         if (spec.spaCatchallControl) {
-          const catchallPath = `/.guardian-nonexistent-${randomUUID()}`
+          const catchallPath = `/.kovo-nonexistent-${randomUUID()}`
           const catchallEx = await broker.executeHttp({
             origin: spec.origin,
             method: 'GET',
@@ -460,7 +460,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           const htmlProbes = probeStepExchanges.filter(probe =>
             probe.exchange.status >= 200 && probe.exchange.status < 300 && probe.exchange.mediaType.includes('html'))
           if (htmlProbes.length > 0) {
-            const catchallPath = `/.guardian-nonexistent-${randomUUID()}`
+            const catchallPath = `/.kovo-nonexistent-${randomUUID()}`
             const catchallEx = await broker.executeHttp({
               origin: spec.origin,
               method: 'GET',
@@ -837,7 +837,7 @@ export async function verifyReplaySpec(params: VerifyReplaySpecParams): Promise<
 
 /** Cut 3 no-fallback invariant at the product floor boundary. */
 export class RecipeWiredLegacyCallError extends Error {
-  readonly code = 'GUARDIAN_RECIPE_WIRED_LEGACY_CALL'
+  readonly code = 'KOVO_RECIPE_WIRED_LEGACY_CALL'
   readonly specKind: string
   readonly vulnClass: string
 

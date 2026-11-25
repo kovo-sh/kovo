@@ -16,7 +16,7 @@ export async function diffPathNormalization(ctx: DiffContext): Promise<DiffOutco
   const dir = '/' + segments.slice(0, -1).join('/')
   const orig = await send({ method: 'GET', pathAndQuery: req.pathAndQuery, headers: req.headers })
   if (!orig || orig.status >= 400) return { verdict: 'inconclusive', summary: 'The reference resource must return a 2xx/3xx response.', details: { status: orig?.status ?? null } }
-  const missing = `guardian-none-${randToken(6)}`
+  const missing = `kovo-none-${randToken(6)}`
   const control = await send({ method: 'GET', pathAndQuery: `${dir}/..%2f${missing}/${leaf}${qs}`, headers: req.headers })
   const variants = [
     { name: 'dot_segment', path: `${dir}/./${leaf}${qs}` },
@@ -59,7 +59,7 @@ export async function diffFileTraversal(ctx: DiffContext): Promise<DiffOutcome> 
   const param = req.param
   if (!param) return { verdict: 'inconclusive', summary: 'A file/path parameter is required for the traversal oracle.', details: {} }
   const location: SurfaceParamLocation = req.paramLocation ?? 'query'
-  const missing = `guardian-none-${randToken(8)}.txt`
+  const missing = `kovo-none-${randToken(8)}.txt`
   const controlValues = [`../${missing}`, `..%2f${missing}`, missing]
   const controls: Array<{ value: string; status: number; body: string }> = []
   for (const value of controlValues.slice(0, 2)) {

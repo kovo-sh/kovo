@@ -290,7 +290,7 @@ export const labConfigSchema = z.object({
 export type LabConfig = z.output<typeof labConfigSchema>
 
 export function isLocalLabEnvEnabled(): boolean {
-  return typeof process !== 'undefined' && process.env?.GUARDIAN_ALLOW_LOCAL_LAB === '1'
+  return typeof process !== 'undefined' && process.env?.KOVO_ALLOW_LOCAL_LAB === '1'
 }
 
 function isAllowedLabIpv4(hostname: string): boolean {
@@ -357,13 +357,13 @@ export const publicAssetOrigin = z.string().trim().min(1).max(253).transform((in
 
 export const labAssetOrigin = z.string().trim().min(1).max(253).transform((input, ctx) => {
   if (!isLocalLabEnvEnabled()) {
-    // Without GUARDIAN_ALLOW_LOCAL_LAB=1 only strict public HTTPS hostnames are accepted
+    // Without KOVO_ALLOW_LOCAL_LAB=1 only strict public HTTPS hostnames are accepted
     // (backwards compatible with v2 local-lab projects); http/port/IP origins stay rejected.
     const pub = parsePublicOrigin(input)
     if (pub) return pub
     ctx.addIssue({
       code: 'custom',
-      message: 'Local-lab http/port/IP origins are blocked unless GUARDIAN_ALLOW_LOCAL_LAB=1.',
+      message: 'Local-lab http/port/IP origins are blocked unless KOVO_ALLOW_LOCAL_LAB=1.',
     })
     return z.NEVER
   }
@@ -381,7 +381,7 @@ export const labAssetOrigin = z.string().trim().min(1).max(253).transform((input
 /** Backwards-compatible public origin schema (strict HTTPS hostname, no port, no IP). */
 export const assetOrigin = publicAssetOrigin
 
-/** Accepts public HTTPS origins always, and lab HTTP/port origins ONLY when GUARDIAN_ALLOW_LOCAL_LAB=1. */
+/** Accepts public HTTPS origins always, and lab HTTP/port origins ONLY when KOVO_ALLOW_LOCAL_LAB=1. */
 export const scopedAssetOrigin = z.string().trim().min(1).max(253).transform((input, ctx) => {
   const pub = parsePublicOrigin(input)
   if (pub) return pub

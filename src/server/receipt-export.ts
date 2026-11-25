@@ -253,9 +253,9 @@ function scrubHeaders(headers: Record<string, string>, secrets: readonly NamedSe
 }
 
 function defaultSigningSecret(storage: Store): string {
-  const fromEnv = (process.env.GUARDIAN_RECEIPT_SIGNING_KEY ?? '').trim()
+  const fromEnv = (process.env.KOVO_RECEIPT_SIGNING_KEY ?? '').trim()
   if (fromEnv.length >= 16) return fromEnv
-  return createHash('sha256').update(`guardian.receipt-export.v1\0${storage.workspace.id}`).digest('hex')
+  return createHash('sha256').update(`kovo.receipt-export.v1\0${storage.workspace.id}`).digest('hex')
 }
 
 function buildCommandHint(steps: readonly PortableReproducerStep[]): string {
@@ -268,11 +268,11 @@ function buildCommandHint(steps: readonly PortableReproducerStep[]): string {
 }
 
 function recordDigest(record: Omit<PortableReceiptRecord, 'recordSha256'>): string {
-  return sha256Hex(`guardian.receipt-record.v1\n${canonicalJson(record)}`)
+  return sha256Hex(`kovo.receipt-record.v1\n${canonicalJson(record)}`)
 }
 
 function compositeRecordDigest(record: Omit<PortableCompositeReceiptRecord, 'recordSha256'>): string {
-  return sha256Hex(`guardian.composite-receipt-record.v1\n${canonicalJson(record)}`)
+  return sha256Hex(`kovo.composite-receipt-record.v1\n${canonicalJson(record)}`)
 }
 
 const VALID_EDGE_KINDS = new Set<string>(CAUSAL_EDGE_KINDS)
@@ -581,7 +581,7 @@ export function extractStoreCompositeReceipts(
 }
 
 function payloadSigningBytes(payload: ProofReceiptExportPayload, payloadSha256: string): Buffer {
-  return Buffer.from(`guardian.receipt-bundle.v1\n${payloadSha256}\n${canonicalJson(payload)}`, 'utf8')
+  return Buffer.from(`kovo.receipt-bundle.v1\n${payloadSha256}\n${canonicalJson(payload)}`, 'utf8')
 }
 
 /**

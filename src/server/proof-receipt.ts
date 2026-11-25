@@ -221,7 +221,7 @@ function locationOf(step: ImpactStep): string | null {
 
 function hostOf(value: string | null, base?: string | null): string | null {
   if (!value) return null
-  try { return new URL(value, base ?? 'http://guardian.invalid').host.toLowerCase() } catch { return null }
+  try { return new URL(value, base ?? 'http://kovo.invalid').host.toLowerCase() } catch { return null }
 }
 
 /**
@@ -1197,8 +1197,8 @@ function statusDifferentialRounds(arms: readonly ImpactStep[]): { rounds: Array<
 
 function deriveDifferingParam(control: ReceiptTranscriptEntry, probe: ReceiptTranscriptEntry): string | null {
   try {
-    const controlUrl = new URL(control.step.pathAndQuery ?? '', 'http://guardian.invalid')
-    const probeUrl = new URL(probe.step.pathAndQuery ?? '', 'http://guardian.invalid')
+    const controlUrl = new URL(control.step.pathAndQuery ?? '', 'http://kovo.invalid')
+    const probeUrl = new URL(probe.step.pathAndQuery ?? '', 'http://kovo.invalid')
     for (const [key, value] of probeUrl.searchParams.entries()) {
       if (controlUrl.searchParams.get(key) !== value) return key
     }

@@ -385,7 +385,7 @@ export async function verifyPatchApplicability(params: {
   }
 
   // Test applying unified diff in an isolated temporary clone (never mutating /repos!).
-  const workDir = mkdtempSync(join(tmpdir(), 'guardian-patch-check-'))
+  const workDir = mkdtempSync(join(tmpdir(), 'kovo-patch-check-'))
   try {
     copyRepoTreeWithoutSymlinks(repoRoot, workDir)
     const { filesModified } = applyUnifiedDiffToDirectory(workDir, diff)
@@ -416,7 +416,7 @@ export async function verifyPatchApplicability(params: {
           } else if (/\.go$/i.test(origName)) {
             checks.push(`if command -v go >/dev/null 2>&1; then go vet "./${origName}" || exit 1; else echo "go toolchain unavailable (skipped)"; fi`)
           } else if (/\.(?:java|kt)$/i.test(origName)) {
-            checks.push(`if command -v javac >/dev/null 2>&1; then javac -proc:none -d /tmp/guardian-javac "${staged}" || exit 1; else echo "javac unavailable (skipped)"; fi`)
+            checks.push(`if command -v javac >/dev/null 2>&1; then javac -proc:none -d /tmp/kovo-javac "${staged}" || exit 1; else echo "javac unavailable (skipped)"; fi`)
           }
         }
         // Language-appropriate project typecheck/build when a toolchain exists in the image.
@@ -701,7 +701,7 @@ export async function runPatchAuthor(params: PatchWorkflowParams): Promise<Patch
   })
 
   const systemPrompt = [
-    'You are Guardian’s air-gapped Patch Author (Stage 1).',
+    'You are Kovo Hunter’s air-gapped Patch Author (Stage 1).',
     'Produce a minimal, repository-native security patch that closes the confirmed vulnerability WITHOUT breaking legitimate callers.',
     '1. Build a Coverage Inventory listing the primary vulnerable sink and any sibling routes/handlers/writers sharing the broken invariant.',
     '2. Provide exact verbatim `fixBefore` and `fixAfter`, plus a valid unified `diff` (`--- a/<file>`, `+++ b/<file>`, `@@ ... @@`).',
@@ -974,7 +974,7 @@ export async function runPatchReviewer(params: {
   }))
 
   const systemPrompt = [
-    'You are Guardian’s independent air-gapped Patch Reviewer (Stage 2).',
+    'You are Kovo Hunter’s independent air-gapped Patch Reviewer (Stage 2).',
     'You have ZERO shared context with the patch author. Independently verify the proposed diff against 5 static gates (Gate 6 dynamic retest runs separately):',
     '1. applicability: Does fixBefore match verbatim, does the diff apply cleanly, and does offline syntax/typecheck pass?',
     '2. security_closure: Does the patch close the vulnerability? Quote the EXACT enforcing file:line.',

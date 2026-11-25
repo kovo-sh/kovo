@@ -24,7 +24,7 @@ Summary: Harvest hidden API routes, build manifests, source maps, client-side se
 
 ## 4. SPA Catch-All Defense (Critical)
 - Single-page apps return `200 OK` with `text/html` (`index.html`) for unknown paths.
-- Before recording any discovered path as a real endpoint, compare it against a guaranteed nonexistent path `/.guardian-nonexistent-check` using `analyze_artifact` (`tool: "diff-response"`). If `likelySpaCatchall: true`, it is NOT a real backend route.
+- Before recording any discovered path as a real endpoint, compare it against a guaranteed nonexistent path `/.kovo-nonexistent-check` using `analyze_artifact` (`tool: "diff-response"`). If `likelySpaCatchall: true`, it is NOT a real backend route.
 
 ## 5. Recording & Escalation
 - Record discovered API routes (`kind: "endpoint"`), stack fingerprints (`kind: "tech_fingerprint"`), leaked non-public keys (`kind: "secret"`), and DOM sinks (`kind: "dom"`).

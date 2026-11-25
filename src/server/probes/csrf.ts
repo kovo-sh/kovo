@@ -61,8 +61,8 @@ export async function diffCsrfCreate(
   }
   const bodyField = req.bodyField ?? req.stateField ?? 'amount'
   const numeric = /(?:amount|value|total|price|qty|quantity|count|number|balance)/i.test(bodyField)
-  const expectedValue: string = String(req.expectedValue ?? (numeric ? 120_000 + Math.floor(Math.random() * 700_000) : `guardian_state_${randToken(8)}`))
-  const controlValue: string = String(req.controlValue ?? (numeric ? Math.max(1, Number(expectedValue) - 1) : `guardian_control_${randToken(8)}`))
+  const expectedValue: string = String(req.expectedValue ?? (numeric ? 120_000 + Math.floor(Math.random() * 700_000) : `kovo_state_${randToken(8)}`))
+  const controlValue: string = String(req.controlValue ?? (numeric ? Math.max(1, Number(expectedValue) - 1) : `kovo_control_${randToken(8)}`))
   if (String(expectedValue) === String(controlValue)) {
     return { verdict: 'no_signal', summary: 'Create differential values collided.', details: {} }
   }

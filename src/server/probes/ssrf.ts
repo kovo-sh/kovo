@@ -7,7 +7,7 @@ import type { ProbeModule } from './registry.ts'
 
 /**
  * Carry the canary token as the broker's correlation id. In a local lab the broker adds it to the
- * outbound request as `X-Guardian-Trace-Id`, so the recorded exchange itself names the canary that
+ * outbound request as `X-Kovo-Trace-Id`, so the recorded exchange itself names the canary that
  * was injected. That is what lets a callback arriving after the probe window be attributed to this
  * exact request by the run-level OOB drain (the persisted request body is not indexed for search).
  */
@@ -19,21 +19,21 @@ function withCanaryCorrelation(req: InjectedRequest, token: string): InjectedReq
 
 export async function diffCanaryCallback(ctx: DiffContext, canaryBroker: CanaryBroker | undefined, grant: Grant, signal: AbortSignal): Promise<DiffOutcome> {
   const { req, send, anomalies, notes } = ctx
-  if (!canaryBroker) return { verdict: 'inconclusive', summary: 'CanaryBroker is unavailable; callback probing needs a Guardian-operated listener.', details: {} }
+  if (!canaryBroker) return { verdict: 'inconclusive', summary: 'CanaryBroker is unavailable; callback probing needs a Kovo Hunter-operated listener.', details: {} }
   const params = (req.ssrfParams?.length ? req.ssrfParams : req.param ? [req.param] : []).filter(p => /^[A-Za-z0-9_.\-[\]]{1,64}$/.test(p)).slice(0, 10)
   if (params.length === 0) return { verdict: 'inconclusive', summary: 'ssrfParams (candidate URL parameters) are required.', details: {} }
 
   let info = canaryBroker.listenerInfo()
   if (!info.running) info = await canaryBroker.startListener()
   const base = info.effectiveBaseUrl
-  const localLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+  const localLab = Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
   if (base) {
     let host = ''
     try { host = new URL(base).hostname } catch { /* handled below */ }
     if (!host || (isPrivateOrLoopbackHost(host) && !localLab)) {
       return {
         verdict: 'inconclusive',
-        summary: 'Canary base URL is private/loopback; configure GUARDIAN_CANARY_PUBLIC_URL to a public operator-controlled listener before callback probing a public target.',
+        summary: 'Canary base URL is private/loopback; configure KOVO_CANARY_PUBLIC_URL to a public operator-controlled listener before callback probing a public target.',
         details: { canaryHost: host },
       }
     }
@@ -63,7 +63,7 @@ export async function diffCanaryCallback(ctx: DiffContext, canaryBroker: CanaryB
   const internalTargets = (req.internalTargets ?? []).filter(u => /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{2,5}(?:\/|$)/i.test(u)).slice(0, 2)
   let inbandHit = false
   if (internalTargets.length > 0) {
-    const controlUrl = 'http://guardian-control.invalid/'
+    const controlUrl = 'http://kovo-control.invalid/'
     for (const param of params.slice(0, 2)) {
       const control = await send(injectParam({ ...req, param }, controlUrl))
       for (const target of internalTargets) {
@@ -116,7 +116,7 @@ export async function diffCanaryCallback(ctx: DiffContext, canaryBroker: CanaryB
   return {
     verdict: hitCount > 0 || inbandHit ? 'signal' : 'no_signal',
     summary: hitCount > 0
-      ? `${hitCount} correlated out-of-band callback(s) received from the target for Guardian-minted canary tokens.`
+      ? `${hitCount} correlated out-of-band callback(s) received from the target for Kovo Hunter-minted canary tokens.`
       : inbandHit
         ? 'The sink fetched a loopback service origin published by the target itself (response differential, no OOB callback).'
         : 'No out-of-band callback was observed within the wait window.',

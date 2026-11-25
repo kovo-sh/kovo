@@ -3,7 +3,7 @@
  *
  * A background worker can trigger an SSRF/XXE/webhook callback long after the HTTP response
  * (Fixture #2: 15–30 s). Finalizing the report as soon as verification workers settle dropped
- * exactly those callbacks. This waits up to `GUARDIAN_OOB_DRAIN_MS` (default 45 s), promotes late
+ * exactly those callbacks. This waits up to `KOVO_OOB_DRAIN_MS` (default 45 s), promotes late
  * callbacks on every poll, and returns the recorded metrics. It never waits when nothing is
  * pending, so local-lab benchmark runs keep their zero-latency behavior.
  */
@@ -14,9 +14,9 @@ export const DEFAULT_OOB_DRAIN_MS = 45_000
 /** How often the drain promotes pending subscriptions while it waits. */
 export const OOB_DRAIN_POLL_MS = 1_000
 
-/** Resolve the bounded pre-report OOB drain grace (`GUARDIAN_OOB_DRAIN_MS`, default 45 s). */
+/** Resolve the bounded pre-report OOB drain grace (`KOVO_OOB_DRAIN_MS`, default 45 s). */
 export function resolveOobDrainMs(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = Number(env.GUARDIAN_OOB_DRAIN_MS)
+  const raw = Number(env.KOVO_OOB_DRAIN_MS)
   if (!Number.isFinite(raw) || raw < 0) return DEFAULT_OOB_DRAIN_MS
   return Math.min(10 * 60_000, Math.round(raw))
 }
@@ -127,7 +127,7 @@ function commitFinalReport(host: FinalizeHost, run: Run): void {
     const drainNote = drain && drain.promotedLate > 0
       ? ` ${drain.promotedLate} late async callback(s) were promoted before finalizing.`
       : ''
-    host.storage.message(current.id, current.coordinatorId, 'guardian',
+    host.storage.message(current.id, current.coordinatorId, 'kovo',
       `Verification finished. The complete report is ready.${drainNote}`)
   }, { behavior: 'immediate' })
 }

@@ -258,7 +258,7 @@ export async function resolveGraphqlArgQuery(
 
 export async function diffGraphqlSurface(ctx: DiffContext, grant: Grant): Promise<DiffOutcome> {
   const { req, send, notes, anomalies } = ctx
-  const localLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+  const localLab = Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
   const tier = grant.tier ?? 1
   const useGet = req.method === 'GET'
   const gql = (

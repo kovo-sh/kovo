@@ -13,13 +13,13 @@ export async function diffAuthProtocolAudit(
   grant: Grant,
 ): Promise<DiffOutcome> {
   const { req, runner, send, anomalies } = ctx
-  const localLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+  const localLab = Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
   const tier = grant.tier ?? 1
   const checks: Array<Record<string, unknown>> = []
 
   // Branch A: OAuth / OIDC redirect_uri & PKCE downgrade audit
   if (/redirect_uri=/i.test(req.pathAndQuery) || /oauth|authorize/i.test(req.pathAndQuery)) {
-    const baseUrl = new URL(req.pathAndQuery, 'http://guardian.invalid')
+    const baseUrl = new URL(req.pathAndQuery, 'http://kovo.invalid')
     // Learn the app's registered redirect target behaviourally: when the caller did not supply a
     // redirect_uri, the authorize endpoint still issues its default 3xx Location. Use that host as the
     // baseline for substring/prefix bypass variants instead of assuming a hardcoded client origin.
@@ -34,13 +34,13 @@ export async function diffAuthProtocolAudit(
       try { return new URL(origRedirect) } catch { return new URL('https://app.example.invalid/cb') }
     })()
 
-    const badControlUrl = new URL(baseUrl.pathname + baseUrl.search, 'http://guardian.invalid')
+    const badControlUrl = new URL(baseUrl.pathname + baseUrl.search, 'http://kovo.invalid')
     badControlUrl.searchParams.set('redirect_uri', 'https://unrelated-control.invalid/cb')
     badControlUrl.searchParams.set('code_challenge_method', 'S256')
     badControlUrl.searchParams.set('code_challenge', 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM')
     const badCtrlEx = await send({ method: 'GET', pathAndQuery: badControlUrl.pathname + badControlUrl.search, headers: req.headers })
 
-    const s256Url = new URL(baseUrl.pathname + baseUrl.search, 'http://guardian.invalid')
+    const s256Url = new URL(baseUrl.pathname + baseUrl.search, 'http://kovo.invalid')
     s256Url.searchParams.set('redirect_uri', origParsed.href)
     s256Url.searchParams.set('code_challenge_method', 'S256')
     s256Url.searchParams.set('code_challenge', 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM')
@@ -54,7 +54,7 @@ export async function diffAuthProtocolAudit(
     ]
     const badCtrlStatus = badCtrlEx?.status ?? 400
     for (const rv of redirectVariants) {
-      const u = new URL(baseUrl.pathname + baseUrl.search, 'http://guardian.invalid')
+      const u = new URL(baseUrl.pathname + baseUrl.search, 'http://kovo.invalid')
       u.searchParams.set('redirect_uri', rv.value)
       u.searchParams.set('code_challenge_method', 'S256')
       u.searchParams.set('code_challenge', 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM')
@@ -70,7 +70,7 @@ export async function diffAuthProtocolAudit(
     }
 
     // PKCE downgrade to plain
-    const pkcePlainUrl = new URL(baseUrl.pathname + baseUrl.search, 'http://guardian.invalid')
+    const pkcePlainUrl = new URL(baseUrl.pathname + baseUrl.search, 'http://kovo.invalid')
     pkcePlainUrl.searchParams.set('redirect_uri', origParsed.href)
     pkcePlainUrl.searchParams.set('code_challenge_method', 'plain')
     pkcePlainUrl.searchParams.set('code_challenge', 'plain-challenge-token-123456')

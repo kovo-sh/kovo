@@ -241,7 +241,7 @@ function normalizeLocation(location: string | undefined, probePath: string): str
 }
 
 async function calibrateOrigin(runner: ProbeRunner, origin: string): Promise<SurfaceCalibration> {
-  const paths = [`/.guardian-cal-${randomUUID()}`, `/.guardian-cal-${randomUUID()}`]
+  const paths = [`/.kovo-cal-${randomUUID()}`, `/.kovo-cal-${randomUUID()}`]
   const exchanges: BrokerExchangeResult[] = []
   for (const path of paths) {
     const res = await runner.send({ origin, method: 'GET', pathAndQuery: path })
@@ -783,7 +783,7 @@ export const defaultTemplateLimit = 60
 export const templateLimitCeiling = 250
 
 function substitute(text: string, vars: Record<string, string>, encode: boolean): string {
-  return text.replace(/\{\{(rand|guardian_canary_http|guardian_canary_dns|discovered_protected_path|discovered_api_path)\}\}/g, (_m, name: string) => {
+  return text.replace(/\{\{(rand|kovo_canary_http|kovo_canary_dns|discovered_protected_path|discovered_api_path)\}\}/g, (_m, name: string) => {
     const value = vars[name] ?? ''
     // Discovered paths are complete, already-safe path templates: never percent-encode the leading "/".
     return encode && !name.startsWith('discovered_') ? encodeURIComponent(value) : value
@@ -901,8 +901,8 @@ export async function runSafeTemplates(
     await runner.pool(selection.selected, async template => {
       const vars: Record<string, string> = {
         rand: randToken(8),
-        guardian_canary_http: '',
-        guardian_canary_dns: '',
+        kovo_canary_http: '',
+        kovo_canary_dns: '',
         ...dynamicVars,
       }
       if (templateNeedsDiscoveredPath(template) && !pathResolves(template, vars)) {
@@ -916,15 +916,15 @@ export async function runSafeTemplates(
         if (!info.running) info = await canaryBroker.startListener()
         let host = ''
         try { host = info.effectiveBaseUrl ? new URL(info.effectiveBaseUrl).hostname : '' } catch { /* ignored */ }
-        const localLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+        const localLab = Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
         if (!host || (isPrivateOrLoopbackHost(host) && !localLab)) {
           skipped.push({ id: template.id, reason: 'canary base URL is private' })
           return
         }
         const minted = canaryBroker.mintCanary(runId, `template:${template.id}`, origin, req.storage ? { storage: req.storage, assignmentId: req.assignmentId } : undefined)
         canaryToken = minted.token
-        vars.guardian_canary_http = minted.httpUrl
-        vars.guardian_canary_dns = minted.dnsHost
+        vars.kovo_canary_http = minted.httpUrl
+        vars.kovo_canary_dns = minted.dnsHost
       }
 
       const path = substitute(template.request.path, vars, true)

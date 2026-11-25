@@ -56,7 +56,7 @@ export async function diffWebhookSignature(ctx: DiffContext): Promise<DiffOutcom
   const controlHeader = req.webhookHeader ?? webhookHeaderNames[0]
   const control = await send({
     method: 'POST', pathAndQuery: req.pathAndQuery,
-    headers: { 'Content-Type': 'application/json', [controlHeader]: `guardian_invalid_${randToken(12)}` },
+    headers: { 'Content-Type': 'application/json', [controlHeader]: `kovo_invalid_${randToken(12)}` },
     body: JSON.stringify(delivery),
   })
   if (!control) return { verdict: 'inconclusive', summary: 'Webhook control request failed.', details: {} }
@@ -73,7 +73,7 @@ export async function diffWebhookSignature(ctx: DiffContext): Promise<DiffOutcom
   }
   // (b) attacker-chosen key echoed inline (a receiver that trusts an inline signing key)
   if (accepted.length === 0) {
-    const attackerKey = `guardian_whk_${randToken(10)}`
+    const attackerKey = `kovo_whk_${randToken(10)}`
     const canonicals = webhookCanonicals(delivery, ts)
     for (const keyField of webhookKeyFields.slice(0, 3)) {
       for (const sigField of webhookSignatureKeyFields.slice(0, 3)) {

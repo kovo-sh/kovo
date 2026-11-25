@@ -763,7 +763,7 @@ function receiptFindingTemplate(vulnClass: 'ssrf' | 'xxe', origin: string, param
       coverageCategory: 'ssrf-redirects' as const,
       impact: 'A server-side fetch of an attacker-controlled URL completes after the HTTP response, so synchronous SSRF filtering and response-time evidence miss it.',
       remediation: 'Resolve and allowlist outbound destinations against a strict scheme/host policy, block metadata and loopback ranges, and perform the fetch inside the request scope so failures are observable.',
-      recheck: 'Re-inject the same canary URL and confirm no callback is delivered to the Guardian relay after the response.',
+      recheck: 'Re-inject the same canary URL and confirm no callback is delivered to the Kovo Hunter relay after the response.',
     }
   }
   return {
@@ -1110,7 +1110,7 @@ export function syncVerifyArtifactsToLedger(input: {
           sourceTimestampMs,
           targetTimestampMs,
           bindingDigest: meta.sha256,
-          metadata: { source: 'guardian_verify', slot: meta.slot },
+          metadata: { source: 'kovo_verify', slot: meta.slot },
         })
         newEdgeCount += 1
         verifiedHops.push({
@@ -1271,7 +1271,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     return vault
   }
 
-  /** Execute a `guardian_verify` script bound to this run's shared `DerivedCapabilityVault`. */
+  /** Execute a `kovo_verify` script bound to this run's shared `DerivedCapabilityVault`. */
   runAgentScriptProof(
     params: Omit<V8AgentScriptProofParams, 'broker' | 'backend' | 'canaryBroker' | 'capabilityVault'> & {
       capabilityVault?: DerivedCapabilityVault
@@ -1286,7 +1286,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     })
   }
 
-  /** Persist sealed capabilities and verified hops from a `guardian_verify` run into `CapabilityLedger`. */
+  /** Persist sealed capabilities and verified hops from a `kovo_verify` run into `CapabilityLedger`. */
   syncVerifyArtifactsToLedger(input: {
     runId: string
     proof: V8AgentScriptProofResult
@@ -1399,7 +1399,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
    *
    * A background worker can trigger an SSRF/XXE/webhook callback long after the HTTP response.
    * Finalizing the report as soon as verification workers settle dropped exactly those callbacks.
-   * This waits up to `GUARDIAN_OOB_DRAIN_MS` (default 45 s), promotes late callbacks on every poll,
+   * This waits up to `KOVO_OOB_DRAIN_MS` (default 45 s), promotes late callbacks on every poll,
    * and records `oobDrainMs` / `promotedLate` in run-event meta. It never waits when nothing is
    * pending, so local-lab benchmark runs keep their zero-latency behavior.
    */
@@ -1762,17 +1762,17 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
 
   /** Resolve a workspace-relative script path inside the read-only repo mount, bounded. */
   readAgentProofScript(reposDir: string | undefined, scriptPath: string): string {
-    if (!reposDir) throw new Error('guardian_verify scriptPath requires a mounted workspace; pass `script` inline.')
+    if (!reposDir) throw new Error('kovo_verify scriptPath requires a mounted workspace; pass `script` inline.')
     const clean = scriptPath.trim().replace(/^\/+/, '')
     if (!clean || clean.includes('\0') || clean.split(/[\\/]/).includes('..')) {
-      throw new Error('guardian_verify scriptPath must stay inside the mounted workspace.')
+      throw new Error('kovo_verify scriptPath must stay inside the mounted workspace.')
     }
     const full = join(reposDir, clean)
     if (!full.startsWith(reposDir + sep) || !existsSync(full)) {
-      throw new Error('guardian_verify scriptPath was not found in the mounted workspace; pass the script inline via `script` instead.')
+      throw new Error('kovo_verify scriptPath was not found in the mounted workspace; pass the script inline via `script` instead.')
     }
     const size = statSync(full).size
-    if (size <= 0 || size > 64 * 1024) throw new Error('guardian_verify script must be between 1 byte and 64 KiB.')
+    if (size <= 0 || size > 64 * 1024) throw new Error('kovo_verify script must be between 1 byte and 64 KiB.')
     return readFileSync(full, 'utf8')
   }
 
@@ -1793,7 +1793,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     secrets: readonly NamedSecret[]
   }): { findingId: string; replaySpecId: string; receiptId: string | null } {
     if (input.runtime !== 'ts') {
-      throw new Error(`Unsupported guardian_verify runtime: ${String(input.runtime)}. guardian_verify supports TypeScript only (runtime='ts').`)
+      throw new Error(`Unsupported kovo_verify runtime: ${String(input.runtime)}. kovo_verify supports TypeScript only (runtime='ts').`)
     }
     const { run, assignment, proof } = input
     const compositeBundle = 'compositeReceipt' in proof ? proof.compositeReceipt : null
@@ -2166,7 +2166,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       severityRationale: `Confirmed by a Layer-3 verification script whose receipt was re-checked against the host transcript (${input.attribution.label}).`,
       impact: input.attribution.impact,
       remediation: input.attribution.remediation,
-      recheckInstructions: 'Re-run the persisted guardian_verify script; the finding is confirmed only by its receipt.',
+      recheckInstructions: 'Re-run the persisted kovo_verify script; the finding is confirmed only by its receipt.',
       assertionsJq: '[.[] | select(.status >= 200)]',
       agentScript: input.envelope,
       steps,
@@ -2742,7 +2742,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       const summary = `${retestRes.verdict}: ${cleanObserved}`
       this.storage.recordRetestRun(current, findingId, specRow.id, retestRes.verdict, summary, [ev.id], retestRes.replay.exchangeIds)
       this.host.completeWorker(job.assignment, current, `Verify Fix verdict: ${retestRes.verdict}`, [ev.id], undefined, secretsList)
-      this.storage.message(current.id, current.coordinatorId, 'guardian',
+      this.storage.message(current.id, current.coordinatorId, 'kovo',
         `Verify Fix retest for "${findingRow.finding.title}": ${retestRes.verdict}. ${cleanObserved}`, undefined, undefined, secretsList)
     }, { behavior: 'immediate' })
   }

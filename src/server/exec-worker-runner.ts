@@ -7,7 +7,7 @@ import {
 } from '../domain.ts'
 import { declarativeReplaySpecSchema, replaySpecOrigins, type DeclarativeReplaySpec } from '../replay-spec.ts'
 import {
-  GUARDIAN_VERIFY_TS_ONLY_ERROR,
+  KOVO_VERIFY_TS_ONLY_ERROR,
   createBoardTools,
   filterHandlersForSpecialist,
   injectBoardTurnInstructions,
@@ -18,12 +18,12 @@ import {
   routeStepToSpecialist,
   runAgentSession,
   selectPreInjectionSkills,
-  summarizeGuardianVerifyOutcome,
+  summarizeKovoVerifyOutcome,
   wallClockSettlementMs,
   workerInvestigationPrompt,
   type GapValidationEvent,
-  type GuardianVerifyArgs,
-  type GuardianVerifyRuntime,
+  type KovoVerifyArgs,
+  type KovoVerifyRuntime,
   type ProofObligationEvent,
   type WorkerToolHandlers,
 } from './agent-session.ts'
@@ -1473,23 +1473,23 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         },
 
         ...(this.host.verifier.backendSupportsVerifyScript() ? {
-          guardian_verify: async (args: GuardianVerifyArgs) => {
+          kovo_verify: async (args: KovoVerifyArgs) => {
             const curRun = this.host.check(job)
             const rawRuntime = args.runtime as string | undefined
             if (
               (rawRuntime !== undefined && rawRuntime !== 'ts')
               || (typeof args.scriptPath === 'string' && /\.py$/i.test(args.scriptPath.trim()))
             ) {
-              throw new Error(GUARDIAN_VERIFY_TS_ONLY_ERROR)
+              throw new Error(KOVO_VERIFY_TS_ONLY_ERROR)
             }
-            const runtime: GuardianVerifyRuntime = 'ts'
+            const runtime: KovoVerifyRuntime = 'ts'
             const script = typeof args.script === 'string' && args.script.trim()
               ? args.script.trim()
               : args.scriptPath
                 ? this.host.verifier.readAgentProofScript(reposDir, args.scriptPath)
                 : ''
             if (!script) {
-              throw new Error('guardian_verify requires `script` (inline) or `scriptPath` (a file in the mounted workspace).')
+              throw new Error('kovo_verify requires `script` (inline) or `scriptPath` (a file in the mounted workspace).')
             }
             const approved = this.host.approvedOriginsSet(curRun)
             const runVault = this.host.capabilityVaultFor(curRun.id)
@@ -1536,7 +1536,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               } : {}),
             }
             if (!proof.verdict.confirmed) {
-              return summarizeGuardianVerifyOutcome({ ...proof.verdict, ...v8Meta })
+              return summarizeKovoVerifyOutcome({ ...proof.verdict, ...v8Meta })
             }
             confirmedDuringAssignment = true
             const persisted = this.host.persistAgentScriptProof({
@@ -1549,7 +1549,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               secrets: [...currentSecrets(), ...vaultScrubDescriptors(runVault)],
             })
             this.host.schedulePlanner(curRun.id)
-            return summarizeGuardianVerifyOutcome({
+            return summarizeKovoVerifyOutcome({
               ...proof.verdict,
               ...v8Meta,
               detail: `${proof.verdict.detail} Finding ${persisted.findingId} cites ${persisted.receiptId ? `ProofReceipt ${persisted.receiptId}` : 'the persisted script proof'} (replay spec ${persisted.replaySpecId}).`

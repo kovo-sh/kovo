@@ -234,7 +234,7 @@ export function resolveLabServiceResourceLimits(
   labConfig: Pick<LabConfig, 'memoryLimit' | 'cpus' | 'pidsLimit'>,
   env: NodeJS.ProcessEnv = process.env,
 ): { memoryLimit: string; cpus: string; pidsLimit: number } {
-  const maxMemMbRaw = parseDockerMemoryLimitMb(env.GUARDIAN_LAB_MAX_MEMORY_LIMIT)
+  const maxMemMbRaw = parseDockerMemoryLimitMb(env.KOVO_LAB_MAX_MEMORY_LIMIT)
   const maxMemMb = maxMemMbRaw ? Math.max(128, Math.min(8192, maxMemMbRaw)) : MAX_LAB_MEMORY_LIMIT_MB
   const rawMemory = (service.memoryLimit ?? labConfig.memoryLimit ?? '').trim()
   const parsedMemMb = parseDockerMemoryLimitMb(rawMemory)
@@ -261,8 +261,8 @@ export function assertLocalLabAllowed(environment: string): void {
       `Local-lab app runner is forbidden on "${environment}" projects. Requires project.environment === 'local-lab'.`,
     )
   }
-  if (process.env.GUARDIAN_ALLOW_LOCAL_LAB !== '1') {
-    throw new Error('Local-lab app runner requires GUARDIAN_ALLOW_LOCAL_LAB=1.')
+  if (process.env.KOVO_ALLOW_LOCAL_LAB !== '1') {
+    throw new Error('Local-lab app runner requires KOVO_ALLOW_LOCAL_LAB=1.')
   }
 }
 
@@ -412,7 +412,7 @@ function writeFileNoFollow(fullPath: string, content: string, createOnly: boolea
   }
 
   const parent = dirname(fullPath)
-  const tmpPath = join(parent, `.guardian-patch-${randomUUID()}.tmp`)
+  const tmpPath = join(parent, `.kovo-patch-${randomUUID()}.tmp`)
   let fd: number | undefined
   try {
     fd = openSync(
@@ -707,7 +707,7 @@ function labRunRecordFileName(runId: string): string {
 /** Directory holding crash-recovery records; owner-only, never inside the repo. */
 export function labStateDir(env: NodeJS.ProcessEnv = process.env): string {
   const configured = env[LAB_STATE_DIR_ENV]?.trim()
-  return configured && isAbsolute(configured) ? configured : join(tmpdir(), 'guardian-lab-state')
+  return configured && isAbsolute(configured) ? configured : join(tmpdir(), 'kovo-lab-state')
 }
 
 export function labRunRecordPath(stateDir: string, runId: string): string {
@@ -839,7 +839,7 @@ function installLabSignalHooks(): void {
 // ===========================================================================
 
 export interface LabRunnerOptions {
-  /** Where crash-recovery records live. Defaults to GUARDIAN_LAB_STATE_DIR or <tmp>/guardian-lab-state. */
+  /** Where crash-recovery records live. Defaults to KOVO_LAB_STATE_DIR or <tmp>/kovo-lab-state. */
   stateDir?: string
   /** Injectable Docker CLI runner (tests use a deterministic fake). */
   docker?: DockerRunner
@@ -910,7 +910,7 @@ export class LabRunner {
 
   /**
    * Persist crash-recovery state. When a SQLite `LabContainerStore` is attached, `lab_containers`
-   * rows plus Docker `dev.guardian.run` labels are the durable authority, so we avoid duplicating
+   * rows plus Docker `dev.kovo.run` labels are the durable authority, so we avoid duplicating
    * JSON crash-recovery files in `stateDir`. Standalone callers without a Store fall back to the
    * JSON file record.
    */
@@ -1015,7 +1015,7 @@ export class LabRunner {
 
   /**
    * Reclaim containers returned by `Store.recover()`. Each candidate is removed only when its
-   * `dev.guardian.run` label matches the requested run, so a stale/corrupt row can never delete a
+   * `dev.kovo.run` label matches the requested run, so a stale/corrupt row can never delete a
    * container belonging to another run. Missing containers are treated as already reclaimed.
    */
   async reclaimPersisted(
@@ -1086,7 +1086,7 @@ export class LabRunner {
     const containerUser = resolveLabContainerUser(this.env)
     const shortId = createHash('sha256').update(`${runId}:${service.name}:${randomUUID()}`).digest('hex').slice(0, 10)
     const safeSvc = service.name.replace(/[^a-z0-9_-]/g, '').slice(0, 20) || 'svc'
-    const containerName = `guardian-lab-${safeSvc}-${shortId}`
+    const containerName = `kovo-lab-${safeSvc}-${shortId}`
     const { memoryLimit, cpus, pidsLimit } = resolveLabServiceResourceLimits(service, labConfig, this.env)
 
     let imageName: string
@@ -1116,7 +1116,7 @@ export class LabRunner {
       if (!existsSync(dockerfileFull)) {
         throw new Error(`Lab Dockerfile not found: ${dockerfileRel}`)
       }
-      imageName = `guardian-lab-img-${safeSvc}-${shortId}:local`
+      imageName = `kovo-lab-img-${safeSvc}-${shortId}:local`
       const buildSignal = AbortSignal.any([
         AbortSignal.timeout(labConfig.buildTimeoutMs ?? 120_000),
         ...(signal ? [signal] : []),
@@ -1280,7 +1280,7 @@ export class LabRunner {
       ?? '/health'
     const runSlug = params.runId.replace(/[^a-z0-9]/gi, '').slice(0, 8).toLowerCase() || 'run'
     const shortRand = createHash('sha256').update(`${params.runId}:${randomUUID()}`).digest('hex').slice(0, 8)
-    const networkName = `guardian-lab-${runSlug}-${shortRand}`
+    const networkName = `kovo-lab-${runSlug}-${shortRand}`
 
     const sanitizedRepoDir = mkdtempSync(join(tmpdir(), LAB_PATHS.repoPrefix))
     const repoReal = realpathSync(params.repoDir)
@@ -1294,7 +1294,7 @@ export class LabRunner {
     })
 
     const proxyDir = createLabProxyDir(params.runId, containerUser)
-    const proxyContainerName = `guardian-lab-proxy-${shortRand}`
+    const proxyContainerName = `kovo-lab-proxy-${shortRand}`
     const socketMode = labProxySocketMode(containerUser)
 
     let networkCreated = false

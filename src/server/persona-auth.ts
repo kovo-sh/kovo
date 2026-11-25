@@ -118,7 +118,7 @@ export interface PlaywrightFormBrowserLike {
 
 export interface PersonaAuthManagerOptions {
   /**
-   * Transport override for tests/embedders. When supplied without `resolveHost`, Guardian cannot
+   * Transport override for tests/embedders. When supplied without `resolveHost`, Kovo Hunter cannot
    * observe or pin that transport's DNS, so the injector owns the pinning contract. Production
    * (default fetch) always resolves and connects to the validated address.
    */
@@ -138,11 +138,11 @@ const CAPTCHA_PATTERN = /challenges\.cloudflare\.com|cf-turnstile|turnstile|capt
 const MFA_PATTERN = /needs_second_factor|second_factor|mfa_required|two_factor|totp_required|multi[- ]?factor/i
 
 function captchaAbortMessage(target: string): string {
-  return `Authentication aborted: CAPTCHA / Cloudflare Turnstile challenge detected on ${target}. Guardian never bypasses CAPTCHA or anti-bot challenges — use a Session Cookie / Bearer persona or disable CAPTCHA for dedicated test accounts.`
+  return `Authentication aborted: CAPTCHA / Cloudflare Turnstile challenge detected on ${target}. Kovo Hunter never bypasses CAPTCHA or anti-bot challenges — use a Session Cookie / Bearer persona or disable CAPTCHA for dedicated test accounts.`
 }
 
 function mfaAbortMessage(email: string): string {
-  return `Authentication aborted: Multi-factor authentication (MFA / second factor) is required for ${email}. Guardian cannot bypass MFA — use a Session Cookie / Bearer persona or a test account without MFA.`
+  return `Authentication aborted: Multi-factor authentication (MFA / second factor) is required for ${email}. Kovo Hunter cannot bypass MFA — use a Session Cookie / Bearer persona or a test account without MFA.`
 }
 
 function decodeJwtPayload(jwt: string): { exp?: number; iat?: number; sub?: string; sid?: string } | null {
@@ -781,7 +781,7 @@ export function formChromiumLaunchArgs(options: FormChromiumLaunchOptions = {}):
 }
 
 const webrtcGuardScript = `(() => {
-  const deny = function () { throw new Error('WebRTC is disabled inside Guardian browser sessions.'); };
+  const deny = function () { throw new Error('WebRTC is disabled inside Kovo Hunter browser sessions.'); };
   for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel', 'WebTransport']) {
     try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
   }
@@ -793,16 +793,16 @@ const webrtcGuardScript = `(() => {
  * unreachable for non-pinned names because of `--host-resolver-rules`.
  */
 const formTransportDenyScript = `(() => {
-  const deny = function () { throw new Error('WebSocket/WebTransport are disabled inside Guardian browser sessions.'); };
+  const deny = function () { throw new Error('WebSocket/WebTransport are disabled inside Kovo Hunter browser sessions.'); };
   for (const name of ['WebSocket', 'WebTransport', 'RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel']) {
     try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
   }
 })();`
 
 async function launchDefaultChromium(pinnedHosts?: ReadonlyMap<string, readonly string[]>): Promise<PlaywrightFormBrowserLike> {
-  const insecureNoSandbox = process.env.GUARDIAN_INSECURE_NO_SANDBOX === '1'
+  const insecureNoSandbox = process.env.KOVO_INSECURE_NO_SANDBOX === '1'
   if (insecureNoSandbox) {
-    console.warn('WARNING: Chromium sandbox disabled (GUARDIAN_INSECURE_NO_SANDBOX=1). Detection fidelity is reduced.')
+    console.warn('WARNING: Chromium sandbox disabled (KOVO_INSECURE_NO_SANDBOX=1). Detection fidelity is reduced.')
   }
   const args = formChromiumLaunchArgs({ insecureNoSandbox, pinnedHosts })
   try {
@@ -880,7 +880,7 @@ function responseHeadersFromNode(raw: IncomingHttpHeaders): Headers {
  * `Response` so the adapter code stays identical to the injected-fetch path.
  *
  * `NODE_USE_ENV_PROXY`/`--use-env-proxy` is unsupported for credential flows: the proxy
- * re-resolves and egresses on Guardian's behalf, so the pinned addresses no longer describe
+ * re-resolves and egresses on Kovo Hunter's behalf, so the pinned addresses no longer describe
  * the actual connection. A warning is logged once when that mode is detected.
  */
 export async function pinnedFetch(
@@ -956,7 +956,7 @@ function warnIfEnvProxyEnabled(): void {
   warnedEnvProxy = true
   console.warn(
     'WARNING: NODE_USE_ENV_PROXY is set. Credential flows are unsupported behind an environment proxy: ' +
-    'the proxy re-resolves and egresses on Guardian\'s behalf, so pinned credential addresses cannot be guaranteed.',
+    'the proxy re-resolves and egresses on Kovo Hunter\'s behalf, so pinned credential addresses cannot be guaranteed.',
   )
 }
 
@@ -986,7 +986,7 @@ function rejectUnexpectedRedirect(res: Response, label: string): void {
     const location = res.headers.get('location') ?? ''
     throw new PersonaAuthError(
       'AUTH_FAILED',
-      `${label} returned an unexpected ${res.status} redirect${location ? ` to ${location.slice(0, 200)}` : ''}; Guardian never replays credentials across redirects.`,
+      `${label} returned an unexpected ${res.status} redirect${location ? ` to ${location.slice(0, 200)}` : ''}; Kovo Hunter never replays credentials across redirects.`,
     )
   }
 }
@@ -1483,7 +1483,7 @@ export class PersonaAuthManager {
         `${label} host ${parsed.hostname} is a shared public/private suffix or an opaque single-label host and cannot anchor a credential scope.`,
       )
     }
-    // An injected transport without an injected resolver is an embedding/test seam: Guardian
+    // An injected transport without an injected resolver is an embedding/test seam: Kovo Hunter
     // cannot observe or pin that transport's DNS, so resolution is the injector's contract.
     // Production (default fetch) always resolves and pins.
     if (options.requireResolution === false || (this.fetchImplInjected && !this.resolveHostInjected)) {
@@ -1688,7 +1688,7 @@ export class PersonaAuthManager {
         adapter = 'supabase'
       } else if (config.loginUrl && /\/api\//i.test(config.loginUrl)) {
         adapter = 'json'
-      } else if (/data-guardian-sso|authorize\?client_id|\/oauth2\/|\/oidc\/|single sign-on/i.test(inspected.html)) {
+      } else if (/data-kovo-sso|authorize\?client_id|\/oauth2\/|\/oidc\/|single sign-on/i.test(inspected.html)) {
         adapter = 'oidc'
       } else {
         adapter = 'form'
@@ -2385,12 +2385,12 @@ export class PersonaAuthManager {
             const websocketOrigin = `${url.protocol === 'wss:' ? 'https:' : 'http:'}//${url.host}`
             if ((url.protocol !== 'wss:' && url.protocol !== 'ws:') || !allowedOrigins.has(websocketOrigin) ||
               typeof ws.connectToServer !== 'function') {
-              await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
               return
             }
             await ws.connectToServer()
           } catch {
-            await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+            await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
           }
         })
       } else if (context.addInitScript) {
@@ -2461,7 +2461,7 @@ export class PersonaAuthManager {
         throw new PersonaAuthError('CAPTCHA_DETECTED', captchaAbortMessage(validatedLoginUrl))
       }
 
-      const ssoSelector = '[data-guardian-sso], a[href*="authorize?client_id"], a[href*="/oauth2/"], a[href*="/oidc/"], button:has-text("Single sign-on"), button:has-text("SSO"), button:has-text("Sign in with"), button:has-text("Continue with")'
+      const ssoSelector = '[data-kovo-sso], a[href*="authorize?client_id"], a[href*="/oauth2/"], a[href*="/oidc/"], button:has-text("Single sign-on"), button:has-text("SSO"), button:has-text("Sign in with"), button:has-text("Continue with")'
       const ssoButton = page.locator(ssoSelector).first()
       if (await ssoButton.count() > 0) {
         await ssoButton.click({ timeout: 5_000 })
@@ -2676,21 +2676,21 @@ export class PersonaAuthManager {
           try {
             const url = new URL(ws.url())
             if (url.protocol !== 'wss:' && url.protocol !== 'ws:') {
-              await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
               return
             }
             const websocketOrigin = `${url.protocol === 'wss:' ? 'https:' : 'http:'}//${url.host}`
             if (!allowedOrigins.has(websocketOrigin)) {
-              await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
               return
             }
             if (typeof ws.connectToServer !== 'function') {
-              await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
               return
             }
             await ws.connectToServer()
           } catch {
-            await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+            await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
           }
         })
       } else {

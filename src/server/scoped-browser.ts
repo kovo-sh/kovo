@@ -383,7 +383,7 @@ function captureXhrJsonBody(input: {
 
 /** Chromium launch hardening shared by every ScopedBrowser context. */
 export interface ChromiumLaunchOptions {
-  /** Explicit insecure opt-in (GUARDIAN_INSECURE_NO_SANDBOX=1). */
+  /** Explicit insecure opt-in (KOVO_INSECURE_NO_SANDBOX=1). */
   insecureNoSandbox?: boolean
 }
 
@@ -409,7 +409,7 @@ export function chromiumLaunchArgs(options: ChromiumLaunchOptions = {}): string[
 
 /** Neutralise WebRTC constructors for target JS even if a platform ignores the launch flags. */
 export const browserWebRtcGuardScript = `(() => {
-  const deny = function () { throw new Error('WebRTC is disabled inside Guardian browser sessions.'); };
+  const deny = function () { throw new Error('WebRTC is disabled inside Kovo Hunter browser sessions.'); };
   for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel', 'WebTransport']) {
     try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
   }
@@ -420,7 +420,7 @@ export const browserWebRtcGuardScript = `(() => {
  * socket constructors entirely instead of being allowed to open an unchecked connection.
  */
 export const browserSocketDenyScript = `(() => {
-  const deny = function () { throw new Error('WebSocket/WebTransport are disabled inside Guardian browser sessions.'); };
+  const deny = function () { throw new Error('WebSocket/WebTransport are disabled inside Kovo Hunter browser sessions.'); };
   for (const name of ['WebSocket', 'WebTransport', 'RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel']) {
     try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
   }
@@ -462,21 +462,21 @@ export async function installWebSocketGuard(
       const secure = url.protocol === 'wss:'
       if (!secure && !(options.allowLocalLab && url.protocol === 'ws:')) {
         options.audit?.('denied', url.origin)
-        await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
         return
       }
       origin = `${secure ? 'https:' : 'http:'}//${url.host}`
     } catch {
-      await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+      await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
       return
     }
     if (!options.canRead(origin)) {
       options.audit?.('denied', origin)
-      await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+      await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
       return
     }
     if (typeof ws.connectToServer !== 'function') {
-      await ws.close({ code: 1008, reason: 'Blocked by Guardian scope.' })
+      await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
       return
     }
     await ws.connectToServer()
@@ -484,9 +484,9 @@ export async function installWebSocketGuard(
 }
 
 async function launchChromium(): Promise<PlaywrightBrowserLike> {
-  const insecureNoSandbox = process.env.GUARDIAN_INSECURE_NO_SANDBOX === '1'
+  const insecureNoSandbox = process.env.KOVO_INSECURE_NO_SANDBOX === '1'
   if (insecureNoSandbox) {
-    console.warn('WARNING: Chromium sandbox disabled (GUARDIAN_INSECURE_NO_SANDBOX=1). Detection fidelity is reduced.')
+    console.warn('WARNING: Chromium sandbox disabled (KOVO_INSECURE_NO_SANDBOX=1). Detection fidelity is reduced.')
   }
   const args = chromiumLaunchArgs({ insecureNoSandbox })
   try {
@@ -512,7 +512,7 @@ const postMessageInstrumentationScript = `
     domCanaryTriggered: false,
     sinkTraces: [],
   };
-  Object.defineProperty(window, '__guardianBrowserProbe', {
+  Object.defineProperty(window, '__kovoBrowserProbe', {
     value: state,
     writable: false,
     configurable: false,
@@ -558,7 +558,7 @@ const postMessageInstrumentationScript = `
     state.observedEvents += 1;
     try {
       const serialized = typeof ev.data === 'string' ? ev.data : JSON.stringify(ev.data ?? '');
-      if (serialized && serialized.includes('guardian-pm-canary')) {
+      if (serialized && serialized.includes('kovo-pm-canary')) {
         state.canaryObserved = true;
       }
     } catch {}
@@ -570,7 +570,7 @@ function buildDomSinkHookScript(canaryToken: string | null): string {
   const tokenJson = JSON.stringify(canaryToken ?? '')
   return `
 (() => {
-  const probe = window.__guardianBrowserProbe;
+  const probe = window.__kovoBrowserProbe;
   if (!probe || probe.__sinkHookInstalled) return;
   probe.__sinkHookInstalled = true;
   const canary = ${tokenJson};
@@ -898,12 +898,12 @@ export function buildSoft404ProbePaths(count = 3): string[] {
   const n = Math.max(1, Math.min(6, count))
   const token = randomBytes(6).toString('hex')
   const bases = [
-    `/.guardian-cal-${token}`,
-    `/api/.guardian-cal-${token}/missing`,
-    `/app/.guardian-cal-${token}/detail/view`,
-    `/v1/.guardian-cal-${token}?probe=1`,
-    `/.well-known/guardian-cal-${token}`,
-    `/static/.guardian-cal-${token}/absent.json`,
+    `/.kovo-cal-${token}`,
+    `/api/.kovo-cal-${token}/missing`,
+    `/app/.kovo-cal-${token}/detail/view`,
+    `/v1/.kovo-cal-${token}?probe=1`,
+    `/.well-known/kovo-cal-${token}`,
+    `/static/.kovo-cal-${token}/absent.json`,
   ]
   return bases.slice(0, n)
 }
@@ -1514,7 +1514,7 @@ export class ScopedBrowser {
       javaScriptEnabled: true,
       bypassCSP: false,
       serviceWorkers: 'block',
-      userAgent: 'Guardian/6 pooled scoped inspector',
+      userAgent: 'KovoHunter/6 pooled scoped inspector',
     })
     this.poolStats.contextsCreated += 1
     await context.addInitScript(postMessageInstrumentationScript)
@@ -1707,7 +1707,7 @@ export class ScopedBrowser {
     }
     const browser = await this.ensurePoolBrowser()
     const results: BrowserVisitResult[] = []
-    const allowLocalLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+    const allowLocalLab = Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
 
     for (const req of requests) {
       signal.throwIfAborted()
@@ -1799,8 +1799,8 @@ export class ScopedBrowser {
 
         const snapshot = await runtime.page.evaluate(() => {
           const probe = (window as unknown as {
-            __guardianBrowserProbe?: { handlers: Array<{ preview: string; checksOrigin: boolean }>; hasOnMessage: boolean; observedEvents: number }
-          }).__guardianBrowserProbe
+            __kovoBrowserProbe?: { handlers: Array<{ preview: string; checksOrigin: boolean }>; hasOnMessage: boolean; observedEvents: number }
+          }).__kovoBrowserProbe
           const domHtml = document.documentElement?.outerHTML ?? ''
           const links = Array.from(document.querySelectorAll('a[href]'))
             .map(el => el.getAttribute('href') || '').filter(Boolean).slice(0, 160)
@@ -1994,7 +1994,7 @@ export class ScopedBrowser {
     deadline.throwIfAborted()
 
     const secrets = [...collectSecrets(req, grant), ...this.broker.getRegisteredSecrets()]
-    const allowLocalLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+    const allowLocalLab = Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
     const secondOrderStorage = this.options.storage ?? grant.storage ?? this.broker.getStorage()
     const exchanges: BrokerExchangeResult[] = []
     const exchangeIds: string[] = []
@@ -2028,7 +2028,7 @@ export class ScopedBrowser {
         javaScriptEnabled: true,
         bypassCSP: false,
         serviceWorkers: 'block',
-        userAgent: 'Guardian/3 scoped headless inspector',
+        userAgent: 'KovoHunter/3 scoped headless inspector',
       })
       await context.addInitScript(postMessageInstrumentationScript)
       await context.addInitScript(browserWebRtcGuardScript)
@@ -2285,16 +2285,16 @@ export class ScopedBrowser {
               })
             }
           } else if (action.type === 'evaluate_builtin') {
-            // Strictly Guardian-authored read-only DOM/sink inspectors (never arbitrary JS!)
+            // Strictly Kovo Hunter-authored read-only DOM/sink inspectors (never arbitrary JS!)
             const data = await page.evaluate((opts: { check: BrowserBuiltinCheck; canaryToken: string | null }) => {
               const probe = (window as unknown as {
-                __guardianBrowserProbe?: {
+                __kovoBrowserProbe?: {
                   handlers: Array<{ preview: string; checksOrigin: boolean }>
                   hasOnMessage: boolean
                   observedEvents: number
                   sinkTraces?: BrowserDomSinkTrace[]
                 }
-              }).__guardianBrowserProbe
+              }).__kovoBrowserProbe
 
               if (opts.check === 'dom_sinks') {
                 return {
@@ -2371,7 +2371,7 @@ export class ScopedBrowser {
         sameSiteFetch: { url: string; origin: string; method: string; credentials: RequestCredentials } | null
       }) => {
         const probe = (window as unknown as {
-          __guardianBrowserProbe?: {
+          __kovoBrowserProbe?: {
             handlers: Array<{ preview: string; checksOrigin: boolean }>
             hasOnMessage: boolean
             observedEvents: number
@@ -2379,7 +2379,7 @@ export class ScopedBrowser {
             domCanaryTriggered?: boolean
             sinkTraces?: BrowserDomSinkTrace[]
           }
-        }).__guardianBrowserProbe
+        }).__kovoBrowserProbe
 
         const handlers = (probe?.handlers ?? []).slice(0, 30)
         const hasUncheckedPostMessage = handlers.some(h => !h.checksOrigin)
@@ -2389,11 +2389,11 @@ export class ScopedBrowser {
         let canaryHandledWithoutOriginCheck = false
 
         if ((opts.checkKind === 'postmessage' || opts.hasCustomPostMessage) && handlers.length > 0) {
-          const pmToken = opts.canaryToken ?? 'guardian-pm-canary'
+          const pmToken = opts.canaryToken ?? 'kovo-pm-canary'
           const pmOrigin = opts.postMessageOrigin ?? 'https://untrusted-origin.invalid'
           const pmData = opts.hasCustomPostMessage && opts.postMessagePayload !== undefined
             ? opts.postMessagePayload
-            : { guardianCanary: pmToken, type: 'guardian-probe' }
+            : { kovoCanary: pmToken, type: 'kovo-probe' }
           try {
             window.dispatchEvent(new MessageEvent('message', {
               data: pmData,
@@ -2454,8 +2454,8 @@ export class ScopedBrowser {
         }
 
         if (!canaryTriggered && opts.canaryToken) {
-          const markerEl = document.querySelector(`[data-guardian-canary="${opts.canaryToken}"], [id="${opts.canaryToken}"]`)
-          const globalFlag = Boolean((window as unknown as Record<string, unknown>).__guardianDomCanary === opts.canaryToken)
+          const markerEl = document.querySelector(`[data-kovo-canary="${opts.canaryToken}"], [id="${opts.canaryToken}"]`)
+          const globalFlag = Boolean((window as unknown as Record<string, unknown>).__kovoDomCanary === opts.canaryToken)
           if (markerEl || globalFlag) {
             canaryTriggered = true
             canaryDetail = globalFlag
@@ -2751,7 +2751,7 @@ export class ScopedBrowser {
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(sessionTimeoutMs)])
     deadline.throwIfAborted()
 
-    const allowLocalLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+    const allowLocalLab = Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
     const secondOrderStorage = this.options.storage ?? grant.storage ?? this.broker.getStorage()
     const browser = await (this.options.launchBrowser ? this.options.launchBrowser() : launchChromium())
 
@@ -2872,7 +2872,7 @@ export class ScopedBrowser {
             javaScriptEnabled: true,
             bypassCSP: false,
             serviceWorkers: 'block',
-            userAgent: 'Guardian/4 scoped headless session inspector',
+            userAgent: 'KovoHunter/4 scoped headless session inspector',
           })
           await context.addInitScript(postMessageInstrumentationScript)
           await context.addInitScript(browserWebRtcGuardScript)
@@ -3070,7 +3070,7 @@ export class ScopedBrowser {
         )
         if (stepNeedsSinkHook && !sinkHookInstalled) {
           await page.evaluate((tok) => {
-            const probe = (window as unknown as { __guardianBrowserProbe?: Record<string, unknown> }).__guardianBrowserProbe
+            const probe = (window as unknown as { __kovoBrowserProbe?: Record<string, unknown> }).__kovoBrowserProbe
             if (!probe || probe.__sinkHookInstalled) return
             probe.__sinkHookInstalled = true
             const sinkTraces = Array.isArray(probe.sinkTraces) ? probe.sinkTraces as Array<Record<string, unknown>> : []
@@ -3189,13 +3189,13 @@ export class ScopedBrowser {
             } else if (action.type === 'evaluate_builtin') {
               const data = await page.evaluate((opts: { check: BrowserBuiltinCheck; canaryToken: string | null }) => {
                 const probe = (window as unknown as {
-                  __guardianBrowserProbe?: {
+                  __kovoBrowserProbe?: {
                     handlers: Array<{ preview: string; checksOrigin: boolean }>
                     hasOnMessage: boolean
                     observedEvents: number
                     sinkTraces?: BrowserDomSinkTrace[]
                   }
-                }).__guardianBrowserProbe
+                }).__kovoBrowserProbe
                 if (opts.check === 'dom_sinks') {
                   return {
                     sinkTraces: (probe?.sinkTraces ?? []).slice(0, 50),
@@ -3275,7 +3275,7 @@ export class ScopedBrowser {
           sameSiteFetch: { url: string; origin: string; method: string; credentials: RequestCredentials } | null
         }) => {
           const probe = (window as unknown as {
-            __guardianBrowserProbe?: {
+            __kovoBrowserProbe?: {
               handlers: Array<{ preview: string; checksOrigin: boolean }>
               hasOnMessage: boolean
               observedEvents: number
@@ -3283,7 +3283,7 @@ export class ScopedBrowser {
               domCanaryTriggered?: boolean
               sinkTraces?: BrowserDomSinkTrace[]
             }
-          }).__guardianBrowserProbe
+          }).__kovoBrowserProbe
 
           const handlers = (probe?.handlers ?? []).slice(0, 30)
           const hasUncheckedPostMessage = handlers.some(h => !h.checksOrigin)
@@ -3292,11 +3292,11 @@ export class ScopedBrowser {
           let canaryHandledWithoutOriginCheck = false
 
           if ((opts.checkKind === 'postmessage' || opts.hasCustomPostMessage) && handlers.length > 0) {
-            const pmToken = opts.canaryToken ?? 'guardian-pm-canary'
+            const pmToken = opts.canaryToken ?? 'kovo-pm-canary'
             const pmOrigin = opts.postMessageOrigin ?? 'https://untrusted-origin.invalid'
             const pmData = opts.hasCustomPostMessage && opts.postMessagePayload !== undefined
               ? opts.postMessagePayload
-              : { guardianCanary: pmToken, type: 'guardian-probe' }
+              : { kovoCanary: pmToken, type: 'kovo-probe' }
             try {
               window.dispatchEvent(new MessageEvent('message', { data: pmData, origin: pmOrigin }))
             } catch { /* ignore */ }
@@ -3353,8 +3353,8 @@ export class ScopedBrowser {
               : 'Canary triggered DOM XSS sink hook.'
           }
           if (!canaryTriggered && opts.canaryToken) {
-            const markerEl = document.querySelector(`[data-guardian-canary="${opts.canaryToken}"], [id="${opts.canaryToken}"]`)
-            const globalFlag = Boolean((window as unknown as Record<string, unknown>).__guardianDomCanary === opts.canaryToken)
+            const markerEl = document.querySelector(`[data-kovo-canary="${opts.canaryToken}"], [id="${opts.canaryToken}"]`)
+            const globalFlag = Boolean((window as unknown as Record<string, unknown>).__kovoDomCanary === opts.canaryToken)
             if (markerEl || globalFlag) {
               canaryTriggered = true
               canaryDetail = globalFlag

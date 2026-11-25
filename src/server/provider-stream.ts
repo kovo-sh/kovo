@@ -20,14 +20,14 @@ const REASONING_MODEL_RE = /(?:reasoner|thinking|(?:^|[-_/])r1\b|(?:^|[-_/])o[13
 /**
  * Profile-aware no-token watchdog window. Reasoning / thinking models routinely pause 25–45 s
  * before emitting their first SSE frame (or between reasoning bursts under concurrent load),
- * whereas a flat 28 s threshold aborts healthy turns. An explicit `GUARDIAN_PROVIDER_NO_TOKEN_MS`
+ * whereas a flat 28 s threshold aborts healthy turns. An explicit `KOVO_PROVIDER_NO_TOKEN_MS`
  * override always wins (clamped 5–180 s).
  */
 export function resolveProfileNoTokenWatchdogMs(
   profile?: { model?: string; thinkingLevel?: ThinkingLevel; roleAffinity?: RoleAffinity },
   env: NodeJS.ProcessEnv = process.env,
 ): number {
-  const raw = Number(env.GUARDIAN_PROVIDER_NO_TOKEN_MS)
+  const raw = Number(env.KOVO_PROVIDER_NO_TOKEN_MS)
   if (Number.isFinite(raw) && raw > 0) {
     return Math.max(5_000, Math.min(180_000, Math.floor(raw)))
   }
@@ -286,7 +286,7 @@ export function sanitizeProviderStream(
   return body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
       size += chunk.byteLength
-      if (size > responseLimit) throw new Error('The model response exceeded Guardian’s size limit.')
+      if (size > responseLimit) throw new Error('The model response exceeded Kovo Hunter’s size limit.')
       append(decoder.decode(chunk, { stream: true }), controller)
     },
     flush(controller) {

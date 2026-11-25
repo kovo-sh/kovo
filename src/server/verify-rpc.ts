@@ -139,8 +139,8 @@ export type {
   CausalFingerprint,
 } from './verify-claims.ts'
 export {
-  GUARDIAN_VERIFY_STDERR_PREVIEW_MAX_CHARS,
-  GUARDIAN_VERIFY_USAGE_HINT,
+  KOVO_VERIFY_STDERR_PREVIEW_MAX_CHARS,
+  KOVO_VERIFY_USAGE_HINT,
   redactStderrPreview,
   prepareVerifyScript,
   verifyScript,
@@ -446,14 +446,14 @@ export class VerifyRpcServer {
       // Prefer a real tmpfs so the socket directory is memory-backed on the host too.
       const tmpfsBase = existsSync('/dev/shm') ? '/dev/shm' : tmpdir()
       try {
-        this.hostDirValue = mkdtempSync(join(tmpfsBase, 'guardian-verify-rpc-'))
+        this.hostDirValue = mkdtempSync(join(tmpfsBase, 'kovo-verify-rpc-'))
       } catch {
-        this.hostDirValue = mkdtempSync(join(tmpdir(), 'guardian-verify-rpc-'))
+        this.hostDirValue = mkdtempSync(join(tmpdir(), 'kovo-verify-rpc-'))
       }
     }
     // 0711: the sandbox uid can traverse to the mounted files without listing the host directory.
     // Explicit chmodSync on every file bypasses restrictive host umasks (e.g. 0077) so the
-    // non-root worker container UID (10001) never hits EACCES reading /guardian-rpc/*.
+    // non-root worker container UID (10001) never hits EACCES reading /kovo-rpc/*.
     chmodSync(this.hostDirValue, 0o711)
     this.socketPathValue = join(this.hostDirValue, VERIFY_RPC_SOCKET_NAME)
     this.tokenValue = randomBytes(24).toString('hex')
@@ -465,7 +465,7 @@ export class VerifyRpcServer {
       runId: this.options.runId,
       assignmentId: this.options.assignmentId,
       targetOrigins: this.options.targetOrigins ?? [],
-      sdkVersion: 'guardian_verify/v6-mvp',
+      sdkVersion: 'kovo_verify/v6-mvp',
     }
     const contextPath = join(this.hostDirValue, VERIFY_RPC_CONTEXT_NAME)
     writeFileSync(contextPath, JSON.stringify(context, null, 2), { mode: 0o444 })
@@ -752,12 +752,12 @@ export class VerifyRpcServer {
       return { rawValue: (injected.request.headers?.Authorization ?? '').replace(/^Bearer\s+/i, ''), attestation: injected.attestation }
     }
     if (mode === 'header') {
-      const hName = headerName ?? 'X-Guardian-Inline-Resolve'
+      const hName = headerName ?? 'X-Kovo-Inline-Resolve'
       const injected = this.capabilityVault.injectCapabilityIntoRequest({ handle, target: 'header', headerName: hName, runId: this.capabilityVault.runId, request: { url: targetUrl, method, headers: {} } })
       return { rawValue: injected.request.headers?.[hName] ?? '', attestation: injected.attestation }
     }
-    const injected = this.capabilityVault.injectCapabilityIntoRequest({ handle, target: 'url', queryParam: '__guardian_resolve__', runId: this.capabilityVault.runId, request: { url: targetUrl, method, headers: {} } })
-    return { rawValue: new URL(injected.request.url).searchParams.get('__guardian_resolve__') ?? '', attestation: injected.attestation }
+    const injected = this.capabilityVault.injectCapabilityIntoRequest({ handle, target: 'url', queryParam: '__kovo_resolve__', runId: this.capabilityVault.runId, request: { url: targetUrl, method, headers: {} } })
+    return { rawValue: new URL(injected.request.url).searchParams.get('__kovo_resolve__') ?? '', attestation: injected.attestation }
   }
 
   private applyCapabilityInjection(
@@ -928,7 +928,7 @@ export class VerifyRpcServer {
             firstHandle = firstHandle ?? rhs
             metaSegs.push(cookieName ? `${cookieName}=[redacted:${rhs}]` : `[redacted:${rhs}]`)
           } else {
-            const resolvedSeg = replaceInline(seg, targetUrl, 'header', { headerName: 'X-Guardian-Inline-Resolve', onHandle: h => { firstHandle = firstHandle ?? h } })
+            const resolvedSeg = replaceInline(seg, targetUrl, 'header', { headerName: 'X-Kovo-Inline-Resolve', onHandle: h => { firstHandle = firstHandle ?? h } })
             cookieHeaders.Cookie = cookieHeaders.Cookie ? `${cookieHeaders.Cookie}; ${resolvedSeg}` : resolvedSeg
             metaSegs.push(redactCaps(seg))
           }
@@ -1243,7 +1243,7 @@ export class VerifyRpcServer {
 
   /** HTTP/2 stays on the same grant: scope, persona injection, method approval. */
   private async executeHttp2(req: BrokerHttpRequest, signal: AbortSignal, grant: Grant = this.options.grant): Promise<{ status: number; headers: Record<string, string>; body: string; durationMs: number }> {
-    const localLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+    const localLab = Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
     let url: URL
     try {
       url = new URL(req.pathAndQuery, req.origin)
@@ -1272,7 +1272,7 @@ export class VerifyRpcServer {
       })
       if (!approved) throw new Error('Tier 3 operator approval required for this HTTP/2 state change.')
     }
-    const forwarded = new Set(['authorization', 'proxy-authorization', 'cookie', 'host', 'content-length', 'transfer-encoding', 'x-guardian-trace-id'])
+    const forwarded = new Set(['authorization', 'proxy-authorization', 'cookie', 'host', 'content-length', 'transfer-encoding', 'x-kovo-trace-id'])
     const headers: Record<string, string> = {}
     for (const [key, value] of Object.entries(req.headers ?? {})) {
       if (forwarded.has(key.toLowerCase())) throw new Error(`Header "${key}" cannot be set directly; reference an approved persona handle instead.`)

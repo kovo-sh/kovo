@@ -1837,7 +1837,7 @@ function flattenedRaw(arm: BooleanDifferentialArm): Map<string, string> {
 function paramValueFromQuery(pathAndQuery: string | undefined, param: string): string | null {
   if (!pathAndQuery) return null
   try {
-    return new URL(pathAndQuery, 'http://guardian.invalid').searchParams.get(param)
+    return new URL(pathAndQuery, 'http://kovo.invalid').searchParams.get(param)
   } catch {
     return null
   }
@@ -1882,7 +1882,7 @@ function maskJsonParam(value: unknown, param: string): unknown {
 function maskedPath(pathAndQuery: string | undefined, param: string): string {
   if (!pathAndQuery) return ''
   try {
-    const url = new URL(pathAndQuery, 'http://guardian.invalid')
+    const url = new URL(pathAndQuery, 'http://kovo.invalid')
     if (url.searchParams.has(param)) url.searchParams.set(param, '{{injected}}')
     let pathname = url.pathname
     // A path-carried parameter shows up as a segment carrying SQL syntax (quote/comment/operator).

@@ -52,7 +52,7 @@ export async function diffOpenRedirectDifferential(ctx: DiffContext): Promise<Di
   if (!param) return { verdict: 'inconclusive', summary: 'open_redirect_differential needs a candidate parameter.', details: {} }
   const originHost = new URL(req.origin).hostname.toLowerCase()
   const canaryHost = `gxr${randToken(10)}.invalid`
-  const controlTarget = `/guardian-return-${randToken(6)}`
+  const controlTarget = `/kovo-return-${randToken(6)}`
   const trusted = (req.redirectBaseTargets ?? []).slice(0, 3)
   const payloads: string[] = [
     `https://${canaryHost}/cb`,

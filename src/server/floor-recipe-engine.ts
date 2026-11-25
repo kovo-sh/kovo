@@ -470,7 +470,7 @@ function baselineWriteFor(body: unknown): { body: Record<string, unknown>; field
     ? !value
     : typeof value === 'number' || /^-?\d+(?:\.\d+)?$/.test(String(value))
       ? 424_242 + (Number.parseInt(nonce.slice(0, 4), 16) % 1_000)
-      : `guardian-baseline-${nonce}`
+      : `kovo-baseline-${nonce}`
   return { field, body: { ...(body as Record<string, unknown>), [field]: baseline } }
 }
 
@@ -1316,7 +1316,7 @@ function runnerApplyBodySignature(interpolated: unknown, signable: NonNullable<R
   const input = interpolated && typeof interpolated === 'object' && !Array.isArray(interpolated)
     ? { ...(interpolated as Record<string, unknown>) }
     : {}
-  const key = `guardian_whk_${randomBytes(8).toString('hex')}`
+  const key = `kovo_whk_${randomBytes(8).toString('hex')}`
   const ts = String(Math.floor(Date.now() / 1000))
   if (signable.timestampField) input[signable.timestampField] = ts
   input[signable.keyField] = key
@@ -1643,7 +1643,7 @@ export async function runRceProofRecipe(
     ctx.grant.audit('denied', gateRequest.origin)
     return runnerInconclusive(`${spec.kind} replay specs are blocked below Tier 3.`, exchanges, exchangeIds, { kind: spec.kind })
   }
-  const localLab = Boolean(ctx.grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+  const localLab = Boolean(ctx.grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
   const approvalContext: StateChangeApprovalContext = {
     personaHandle: gateRequest.persona ?? null,
     body: gateRequest.textBody ?? (gateRequest.jsonBody !== undefined ? JSON.stringify(gateRequest.jsonBody) : null),
@@ -2022,7 +2022,7 @@ export async function runCacheDifferentialRecipe(
 
     let spaCatchall: Record<string, unknown> | undefined
     if (spec.spaCatchallControl) {
-      const catchallPath = `/.guardian-nonexistent-${randomUUID()}`
+      const catchallPath = `/.kovo-nonexistent-${randomUUID()}`
       const catchallEx = await ctx.broker.executeHttp({
         origin: spec.targetOrigin,
         method: 'GET',
@@ -2325,7 +2325,7 @@ export async function runAuthProtocolProofRecipe(
 
     let spaCatchall: Record<string, unknown> | undefined
     if (spec.spaCatchallControl) {
-      const catchallPath = `/.guardian-nonexistent-${randomUUID()}`
+      const catchallPath = `/.kovo-nonexistent-${randomUUID()}`
       const catchallEx = await ctx.broker.executeHttp({
         origin: spec.origin,
         method: 'GET',
@@ -3175,7 +3175,7 @@ export const RETIRED_LEGACY_SPEC_KINDS: ReadonlySet<string> = new Set([
   'dns_takeover', 'tls_audit', 'browser_dom', 'ws_chain', 'upload_probe',
   'sql_boolean_diff', 'sql_time_diff', 'race_burst', 'browser_chain',
 ])
-export const RETIRED_LEGACY_SPEC_REASON = 'retired_legacy_spec_kind: use guardian_verify'
+export const RETIRED_LEGACY_SPEC_REASON = 'retired_legacy_spec_kind: use kovo_verify'
 
 export function retiredLegacyResult(
   kind: string,
@@ -3190,7 +3190,7 @@ export function retiredLegacyResult(
       confirmed: false,
       controlPassed: false,
       observed: RETIRED_LEGACY_SPEC_REASON,
-      expected: 'Proof submitted via guardian_verify or a wired floor recipe.',
+      expected: 'Proof submitted via kovo_verify or a wired floor recipe.',
       reason: RETIRED_LEGACY_SPEC_REASON,
     },
     exchangeIds,
@@ -3233,7 +3233,7 @@ function applyBodySignature(interpolated: unknown, signable: NonNullable<ReplayS
   const input = interpolated && typeof interpolated === 'object' && !Array.isArray(interpolated)
     ? { ...(interpolated as Record<string, unknown>) }
     : {}
-  const key = `guardian_whk_${randomBytes(8).toString('hex')}`
+  const key = `kovo_whk_${randomBytes(8).toString('hex')}`
   const ts = String(Math.floor(Date.now() / 1000))
   if (signable.timestampField) input[signable.timestampField] = ts
   input[signable.keyField] = key
@@ -3391,7 +3391,7 @@ function vulnClassForImpactClass(impactClass: string | null | undefined): string
   }
 }
 
-const replayCanaryTokenRe = /guardian-canary-[a-f0-9]{24}/i
+const replayCanaryTokenRe = /kovo-canary-[a-f0-9]{24}/i
 
 /**
  * Build a ProofReceipt + transcript from a completed replay. The transcript is the host-recorded
@@ -3565,12 +3565,12 @@ export function receiptCheckForResult(input: {
 }
 
 /**
- * `GUARDIAN_PROOF_RECEIPT=off` restores the pure legacy DSL verdict, `shadow` (default) records the
+ * `KOVO_PROOF_RECEIPT=off` restores the pure legacy DSL verdict, `shadow` (default) records the
  * receipt without changing a verdict, and `strict` makes `verifyReceipt` the final confirmation
  * gate. Strict is opt-in until parity across every suite is certified.
  */
 export function proofReceiptMode(env: NodeJS.ProcessEnv = process.env): ProofReceiptMode {
-  const raw = (env.GUARDIAN_PROOF_RECEIPT ?? '').trim().toLowerCase()
+  const raw = (env.KOVO_PROOF_RECEIPT ?? '').trim().toLowerCase()
   if (raw === '0' || raw === 'off' || raw === 'false' || raw === 'no') return 'off'
   if (raw === 'strict' || raw === 'enforce' || raw === '1') return 'strict'
   return 'shadow'

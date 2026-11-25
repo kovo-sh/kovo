@@ -505,7 +505,7 @@ export function assessTimingDifferential(sample: TimingDifferentialSample): Timi
 
 export async function diffSqlTimeDifferential(ctx: DiffContext, grant: Grant): Promise<DiffOutcome> {
   const { req, send, anomalies } = ctx
-  const localLab = Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+  const localLab = Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
   const tier = grant.tier ?? 1
   const location: SurfaceParamLocation = req.paramLocation ?? (req.method && req.method !== 'GET' ? 'json' : 'query')
   const method = req.method ?? (['json', 'form', 'xml', 'graphql_var'].includes(location) ? 'POST' : 'GET')
@@ -610,7 +610,7 @@ export async function diffSqlTimeDifferential(ctx: DiffContext, grant: Grant): P
 
 export async function diffTemplateMath(ctx: DiffContext): Promise<DiffOutcome> {
   const { req, send, anomalies } = ctx
-  const baseValue = req.baselineValue ?? 'guardianbase'
+  const baseValue = req.baselineValue ?? 'kovobase'
   const base = await send(injectParam(req, baseValue))
   if (!base) return { verdict: 'inconclusive', summary: 'Baseline request failed.', details: {} }
   const results: Array<Record<string, unknown>> = []

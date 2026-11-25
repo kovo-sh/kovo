@@ -1,5 +1,5 @@
 /**
- * Frontier / Beam Multi-Wave Scheduler — Guardian v8 Layer 3 (plans/v8.md §5 & §M3).
+ * Frontier / Beam Multi-Wave Scheduler — Kovo Hunter v8 Layer 3 (plans/v8.md §5 & §M3).
  *
  * Pure, deterministic orchestration primitives ready to plug into `graph-coordinator.ts` and
  * `exec-dispatch.ts`:

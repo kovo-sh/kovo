@@ -40,15 +40,15 @@ const repoRelativePathSchema = z.string().min(1).max(512).refine(
   v => !v.startsWith('/') && !v.startsWith('\\') && !/[\0\r\n]/.test(v) && !v.split(/[\\/]+/).includes('..'),
   'Invalid repository-relative path.',
 )
-const workerNamespace = 'dev.guardian.workspace'
+const workerNamespace = 'dev.kovo.workspace'
 // Attribution labels: a leaked container must identify its run/assignment/session.
-const runNamespace = 'dev.guardian.run'
-const assignmentNamespace = 'dev.guardian.assignment'
-const sessionNamespace = 'dev.guardian.session'
-const createdAtNamespace = 'dev.guardian.created-at'
+const runNamespace = 'dev.kovo.run'
+const assignmentNamespace = 'dev.kovo.assignment'
+const sessionNamespace = 'dev.kovo.session'
+const createdAtNamespace = 'dev.kovo.created-at'
 /** Matrix cells label every container so the cell reaper can remove exactly its own. */
-const cellNamespace = 'dev.guardian.cell'
-const warmNamespace = 'dev.guardian.warm'
+const cellNamespace = 'dev.kovo.cell'
+const warmNamespace = 'dev.kovo.warm'
 /** A container may legitimately sit in `created` only for the create→start instant. */
 const DEFAULT_STALE_CREATED_MS = 120_000
 const processSessionId = randomUUID()
@@ -152,7 +152,7 @@ function trackLiveStagedRepoDir(dir: string) {
   liveStagedRepoDirs.add(dir)
   ensureLiveExitHooks()
 }
-const workerName = /^guardian-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
+const workerName = /^kovo-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
 
 const jobSchema = z.object({
   assignmentId: z.uuid(),
@@ -369,7 +369,7 @@ export interface WorkerSession {
   analyze(tool: AnalyzerName, args: Record<string, unknown>, signal: AbortSignal): Promise<Record<string, unknown>>
   sast(req: SastScanRequest, signal: AbortSignal): Promise<SastScanResult>
   runScript(req: OfflineScriptRequest, signal: AbortSignal): Promise<OfflineScriptResult>
-  /** Layer-3 `guardian_verify` script; claims are oracle-checked host-side. */
+  /** Layer-3 `kovo_verify` script; claims are oracle-checked host-side. */
   verifyScript?(req: VerifyScriptRequest, signal: AbortSignal): Promise<VerifyScriptResult>
   verifyStaticAst(req: AstVerifyRequest, signal: AbortSignal): Promise<AstVerifyResult>
   callGraph?(req: CallGraphRequest, signal: AbortSignal): Promise<CallGraphResult>
@@ -384,7 +384,7 @@ export interface WorkerSessionOptions {
   tmpfsMb?: number
   /**
    * Host directory holding the Layer-1 verification RPC socket/token/context. Mounted read-only
-   * at `/guardian-rpc`; the rest of the container filesystem stays read-only.
+   * at `/kovo-rpc`; the rest of the container filesystem stays read-only.
    */
   rpcMountDir?: string
 }
@@ -430,7 +430,7 @@ function clamp(val: number | undefined, fallback: number, min: number, max: numb
 function dockerHost() {
   const host = process.env.DOCKER_HOST || 'unix:///var/run/docker.sock'
   if (!/^unix:\/\/\/[^/?#\r\n][^?#\r\n]*$/.test(host)) {
-    throw new Error('Guardian requires a local Docker Unix socket.')
+    throw new Error('Kovo Hunter requires a local Docker Unix socket.')
   }
   return host
 }
@@ -474,8 +474,8 @@ export const MAX_WORKER_OUTPUT_BYTES = 4 * 1024 * 1024
 /** Cap for a spilled (file-pointer) worker payload; larger refs are rejected as hostile. */
 export const MAX_WORKER_REF_BYTES = 8 * 1024 * 1024
 
-const workerRefPath = /^\/tmp\/guardian-ipc\/[a-f0-9-]{36}\.json$/
-const oneShotRefPath = /^\/guardian-ipc\/[a-f0-9-]{36}\.json$/
+const workerRefPath = /^\/tmp\/kovo-ipc\/[a-f0-9-]{36}\.json$/
+const oneShotRefPath = /^\/kovo-ipc\/[a-f0-9-]{36}\.json$/
 const resultRefSchema = z.object({
   path: z.string().regex(workerRefPath),
   bytes: z.number().int().positive().max(MAX_WORKER_REF_BYTES),
@@ -483,10 +483,10 @@ const resultRefSchema = z.object({
 })
 const oneShotRefSchema = resultRefSchema.extend({ path: z.string().regex(oneShotRefPath) })
 
-/** Per-one-shot tmpfs directory bind-mounted at `/guardian-ipc` (host-readable). */
+/** Per-one-shot tmpfs directory bind-mounted at `/kovo-ipc` (host-readable). */
 function makeOneShotIpcDir(): string {
   const base = existsSync('/dev/shm') ? '/dev/shm' : tmpdir()
-  const dir = mkdtempSync(join(base, 'guardian-ipc-'))
+  const dir = mkdtempSync(join(base, 'kovo-ipc-'))
   chmodSync(dir, 0o777)
   return dir
 }
@@ -503,21 +503,21 @@ function readOneShotRef(dir: string, rawRef: unknown): Record<string, unknown> {
   return parsed as Record<string, unknown>
 }
 
-const verifySdkFiles = ['guardian_verify.ts'] as const
+const verifySdkFiles = ['kovo_verify.ts'] as const
 /**
  * The worker image predates the SDK, so the host stages it per call. This keeps the container
  * filesystem immutable and makes the SDK version auditable alongside the verifier that ran it.
  */
 export function readVerifySdkFiles(): Array<{ name: string; content: string }> {
-  const dir = process.env.GUARDIAN_VERIFY_SDK_DIR ?? join(dirname(fileURLToPath(import.meta.url)), '../../worker/guardian_verify')
+  const dir = process.env.KOVO_VERIFY_SDK_DIR ?? join(dirname(fileURLToPath(import.meta.url)), '../../worker/kovo_verify')
   const files: Array<{ name: string; content: string }> = []
   for (const name of verifySdkFiles) {
     const path = join(dir, name)
     if (!existsSync(path)) continue
-    if (statSync(path).size > 256 * 1024) throw new Error('guardian_verify SDK file exceeds the size limit.')
+    if (statSync(path).size > 256 * 1024) throw new Error('kovo_verify SDK file exceeds the size limit.')
     files.push({ name, content: readFileSync(path, 'utf8') })
   }
-  if (files.length === 0) throw new Error('guardian_verify SDK files are unavailable on this host.')
+  if (files.length === 0) throw new Error('kovo_verify SDK files are unavailable on this host.')
   return files
 }
 
@@ -617,7 +617,7 @@ function docker(args: string[], signal: AbortSignal, input?: string) {
       if (code === 0) resolve(Buffer.concat(chunks).toString('utf8'))
       else {
         const stderr = Buffer.concat(stderrChunks).toString('utf8')
-        if (process.env.GUARDIAN_WORKER_DEBUG === '1') {
+        if (process.env.KOVO_WORKER_DEBUG === '1') {
           console.error('[worker-docker]', args.slice(0, 3).join(' '), 'exit', code, stderr.trim().split('\n').slice(0, 2).join(' | '))
         }
         reject(new Error(formatWorkerFailure(stderr, code)))
@@ -667,14 +667,14 @@ interface ContainerArgsInput {
   cell?: string
   warm?: boolean
   options?: WorkerSessionOptions
-  /** One-shot only: host tmpfs dir bind-mounted at /guardian-ipc for large-output pointers. */
+  /** One-shot only: host tmpfs dir bind-mounted at /kovo-ipc for large-output pointers. */
   ipcDir?: string
 }
 
 export interface PreparedReposMount {
   /** Host directory bind-mounted read-only at `/repos`. */
   mountDir: string
-  /** True when Guardian staged a clean container-readable copy instead of binding `reposDir` directly. */
+  /** True when Kovo Hunter staged a clean container-readable copy instead of binding `reposDir` directly. */
   staged: boolean
   /** Number of secret/sensitive or unsafe entries excluded while staging. */
   excludedCount: number
@@ -777,7 +777,7 @@ function reposTreeNeedsStaging(resolvedRoot: string): boolean {
 }
 
 function stageReadableReposTree(resolvedRoot: string): { mountDir: string; excludedCount: number } {
-  const rawStageDir = mkdtempSync(join(tmpdir(), 'guardian-repos-'))
+  const rawStageDir = mkdtempSync(join(tmpdir(), 'kovo-repos-'))
   chmodSync(rawStageDir, 0o755)
   const mountDir = realpathSync(rawStageDir)
   let excludedCount = 0
@@ -884,7 +884,7 @@ function resolveReposMountArgs(reposDir?: string): string[] {
 }
 
 /**
- * Mount the per-session verification RPC directory read-only at `/guardian-rpc`. The socket is
+ * Mount the per-session verification RPC directory read-only at `/kovo-rpc`. The socket is
  * the only egress a `--network none` verification script needs; the rest of the container stays
  * read-only and the script never receives a persona credential (Layer 1 injects it).
  */
@@ -930,8 +930,8 @@ export function workerContainerCreateArgs(input: ContainerArgsInput): string[] {
     ...resolveRpcMountArgs(options?.rpcMountDir),
     ...(input.ipcDir
       ? [
-          '--mount', `type=bind,source=${realpathSync(input.ipcDir)},target=/guardian-ipc`,
-          '--env', 'GUARDIAN_IPC_DIR=/guardian-ipc',
+          '--mount', `type=bind,source=${realpathSync(input.ipcDir)},target=/kovo-ipc`,
+          '--env', 'KOVO_IPC_DIR=/kovo-ipc',
         ]
       : []),
     '--label', `${assignmentNamespace}=` + input.assignmentId,
@@ -946,9 +946,9 @@ export function workerContainerCreateArgs(input: ContainerArgsInput): string[] {
   ]
 }
 
-/** Warm-pool escape hatch: `GUARDIAN_WARM_WORKERS=0` (or false/off) disables pooling. */
+/** Warm-pool escape hatch: `KOVO_WARM_WORKERS=0` (or false/off) disables pooling. */
 export function warmWorkersEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const value = env.GUARDIAN_WARM_WORKERS
+  const value = env.KOVO_WARM_WORKERS
   return value !== '0' && value !== 'false' && value !== 'off'
 }
 
@@ -957,7 +957,7 @@ export const MAX_WARM_POOL_CAPACITY = 12
 
 /** Idle warm containers kept per cell (one per worker slot); bounded 1..12. */
 export function warmPoolCapacity(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = Number(env.GUARDIAN_WARM_SLOTS)
+  const raw = Number(env.KOVO_WARM_SLOTS)
   if (!Number.isFinite(raw) || raw <= 0) return 1
   return Math.max(1, Math.min(MAX_WARM_POOL_CAPACITY, Math.floor(raw)))
 }
@@ -1130,7 +1130,7 @@ export class WarmWorkerPool {
   }
 
   private async create(): Promise<void> {
-    const name = 'guardian-' + randomUUID()
+    const name = 'kovo-' + randomUUID()
     try {
       await this.docker(workerContainerCreateArgs({
         image: this.image,
@@ -1159,7 +1159,7 @@ export class WarmWorkerPool {
     } catch (error) {
       this.failures += 1
       this.disabled = true
-      if (process.env.GUARDIAN_WORKER_DEBUG === '1') {
+      if (process.env.KOVO_WORKER_DEBUG === '1') {
         console.error('[worker-pool] prewarm failed; falling back to cold create:', error instanceof Error ? error.message.slice(0, 160) : String(error))
       }
     }
@@ -1266,7 +1266,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
   private coldSessionCreates = 0
   private reclaiming?: Promise<void>
 
-  constructor({ image = 'guardian-worker:v4', workspace, runId, dockerRunner, sessionSpawner, staleCreatedMs, cell }: {
+  constructor({ image = 'kovo-worker:v4', workspace, runId, dockerRunner, sessionSpawner, staleCreatedMs, cell }: {
     image?: string
     workspace?: { id: string; directory: string }
     runId?: string
@@ -1277,8 +1277,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
     /** Grace before an abandoned `created` container is reclaimed (default 2 min). */
     staleCreatedMs?: number
     /**
-     * Matrix cell id (default: `GUARDIAN_CELL_ID`). Labels every container `dev.guardian.cell`
-     * and enables the best-effort warm session pool unless `GUARDIAN_WARM_WORKERS=0`.
+     * Matrix cell id (default: `KOVO_CELL_ID`). Labels every container `dev.kovo.cell`
+     * and enables the best-effort warm session pool unless `KOVO_WARM_WORKERS=0`.
      */
     cell?: string
   } = {}) {
@@ -1290,7 +1290,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       stdio: ['pipe', 'pipe', 'pipe'],
     }))
     this.staleCreatedMs = Math.max(0, staleCreatedMs ?? DEFAULT_STALE_CREATED_MS)
-    const cellId = cell ?? process.env.GUARDIAN_CELL_ID
+    const cellId = cell ?? process.env.KOVO_CELL_ID
     this.cell = cellId && cellId.trim() ? cellId.trim() : undefined
     if (workspace) {
       this.owner = createHash('sha256').update(workspace.id).update('\0').update(realpathSync(workspace.directory)).digest('hex')
@@ -1440,7 +1440,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
         if (this.owner) await this.removeInactive(this.owner)
         await this.removeStaleCreated()
       } catch (error) {
-        if (process.env.GUARDIAN_WORKER_DEBUG === '1') {
+        if (process.env.KOVO_WORKER_DEBUG === '1') {
           console.error('[worker-docker] reclaim skipped:', error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160))
         }
       } finally {
@@ -1465,7 +1465,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
   }
 
   /**
-   * Remove guardian containers abandoned before use (`created`) or after they stopped
+   * Remove kovo containers abandoned before use (`created`) or after they stopped
    * (`exited`/`dead`) — e.g. a SIGKILLed test process or a crashed CLI. Running (`Up`)
    * containers are left alone: they may belong to a concurrent stream. Only containers
    * older than the grace window are touched so an in-flight create is never killed.
@@ -1477,7 +1477,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       rows = await this.docker([
         'container', 'ls', '--all', '--no-trunc',
         '--filter', 'status=created', '--filter', 'status=exited', '--filter', 'status=dead',
-        '--format', '{{.ID}}\t{{.Names}}\t{{.Label "dev.guardian.created-at"}}\t{{.CreatedAt}}',
+        '--format', '{{.ID}}\t{{.Names}}\t{{.Label "dev.kovo.created-at"}}\t{{.CreatedAt}}',
       ], signal)
     } catch {
       return
@@ -1497,7 +1497,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       stale.push(id)
     }
     if (stale.length) {
-      if (process.env.GUARDIAN_WORKER_DEBUG === '1') {
+      if (process.env.KOVO_WORKER_DEBUG === '1') {
         console.error('[worker-docker] removeStaleCreated ids', stale.map(i => i.slice(0, 12)).join(','), 'rows', rows.trim().split('\n').length)
       }
       await this.docker(['container', 'rm', '--force', ...stale], signal).catch(() => undefined)
@@ -1510,7 +1510,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     try {
       const rows = await this.docker([
         'container', 'ls', '--all', '--no-trunc', '--filter', `label=${workerNamespace}=${owner}`,
-        '--format', '{{.ID}}\t{{.Names}}\t{{.Label "dev.guardian.created-at"}}\t{{.CreatedAt}}\t{{.Label "dev.guardian.session"}}',
+        '--format', '{{.ID}}\t{{.Names}}\t{{.Label "dev.kovo.created-at"}}\t{{.CreatedAt}}\t{{.Label "dev.kovo.session"}}',
       ], signal)
       inactive = rows.trim().split('\n').flatMap(row => {
         if (!row) return []
@@ -1525,7 +1525,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       return
     }
     if (!inactive.length) return
-    if (process.env.GUARDIAN_WORKER_DEBUG === '1') {
+    if (process.env.KOVO_WORKER_DEBUG === '1') {
       console.error('[worker-docker] removeInactive owner', owner.slice(0, 8), 'active', this.activeContainers.size, 'ids', inactive.map(i => i.slice(0, 12)).join(','))
     }
     await this.docker(['container', 'rm', '--force', ...inactive], signal).catch(() => undefined)
@@ -1555,7 +1555,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     if (Buffer.byteLength(payload) > 16 * 1024 * 1024) throw new Error('Worker inputs exceeded their limit.')
     await this.reclaimInactive()
     signal.throwIfAborted()
-    const name = 'guardian-' + randomUUID()
+    const name = 'kovo-' + randomUUID()
     const timeoutMs = (job.timeoutMs ?? 60_000) + 10_000
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
     // One-shot containers exit before a pointer can be read via `docker exec`, so bind a host
@@ -1593,7 +1593,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const payload = JSON.stringify({ op: 'ast_verify', ...req })
     await this.reclaimInactive()
     signal.throwIfAborted()
-    const name = 'guardian-' + randomUUID()
+    const name = 'kovo-' + randomUUID()
     const timeoutMs = (req.timeoutMs ?? 30_000) + 15_000
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
     const preparedRepos = prepareReposMount(options?.reposDir)
@@ -1653,7 +1653,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     }
     if (warm === null) releaseWarmRepos()
     const pooled = warm !== null
-    const name = warm ?? 'guardian-' + randomUUID()
+    const name = warm ?? 'kovo-' + randomUUID()
     this.sessionsServed += 1
     if (pooled) this.pooled.add(name)
     else this.coldSessionCreates += 1

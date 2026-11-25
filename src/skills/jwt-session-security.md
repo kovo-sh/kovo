@@ -9,7 +9,7 @@ Summary: Inspect JWT headers/claims, signature verification discipline, cookie a
 
 ## 2. High-Signal Checks
 - **Algorithm Confusion & `alg: none` (Tier 1/2 Safe Differential):**
-  - If an API accepts bearer JWTs, test a synthetic unsigned token (`{"alg":"none","typ":"JWT"}.{"sub":"guardian-probe","role":"user"}.`) against an authenticated endpoint vs a control invalid token (`Bearer invalid.token.sig`).
+  - If an API accepts bearer JWTs, test a synthetic unsigned token (`{"alg":"none","typ":"JWT"}.{"sub":"kovo-probe","role":"user"}.`) against an authenticated endpoint vs a control invalid token (`Bearer invalid.token.sig`).
   - Only propose a finding if the unsigned token produces an authenticated `200` response (distinct from control `401`/`403` and distinct from SPA catch-all).
 - **Privileged Claim / Service Role Exposure in Client Bundles:**
   - In Supabase/Firebase/JWT stacks, inspect JS-embedded JWTs with `jwt-inspect`. An `anon` role JWT is expected public client config (NOT a vulnerability by itself unless RLS is broken). A `service_role` or `admin` JWT embedded in client JS is **Critical**!
@@ -20,5 +20,5 @@ Summary: Inspect JWT headers/claims, signature verification discipline, cookie a
   - Check whether auth tokens, magic links, or session IDs appear in URL query strings combined with permissive `Referrer-Policy` or missing `Cache-Control: no-store`.
 
 ## 3. Verification Rules
-- Never hardcode raw `Authorization` or `Cookie` headers in a TypeScript `guardian_verify` script (the broker rejects raw secret injection; use opaque `as` / `persona` handles for legitimate authenticated controls, or sealed capability handles via `ctx.sealCapability` / `ctx.jwtSign`).
-- For synthetic invalid/alg-none JWT probes, verify in a TypeScript `guardian_verify` script via `ctx.http(...)` or `ctx.proveAccessBoundary(...)` asserting control `401`/`403` vs. probe `200` with an authenticated JSON payload.
+- Never hardcode raw `Authorization` or `Cookie` headers in a TypeScript `kovo_verify` script (the broker rejects raw secret injection; use opaque `as` / `persona` handles for legitimate authenticated controls, or sealed capability handles via `ctx.sealCapability` / `ctx.jwtSign`).
+- For synthetic invalid/alg-none JWT probes, verify in a TypeScript `kovo_verify` script via `ctx.http(...)` or `ctx.proveAccessBoundary(...)` asserting control `401`/`403` vs. probe `200` with an authenticated JSON payload.

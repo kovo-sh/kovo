@@ -1,6 +1,6 @@
 /**
  * Authoritative host proof RPC executors (`prove.*`) — single source of truth
- * for both thin worker SDKs (`guardian_verify.ts` and `guardian_verify.py`).
+ * for both thin worker SDKs (`kovo_verify.ts` and `kovo_verify.py`).
  *
  * Depends strictly downward on `verify-claims.ts` and `oracle-invariants.ts`;
  * receives host runtime capabilities via the narrow `ProveHandlerHost` seam.

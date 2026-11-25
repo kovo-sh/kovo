@@ -3,7 +3,7 @@ Tags: deserialization, serialization, pickle, yaml, jackson, java, python, php, 
 Summary: Audit binary and polymorphic deserialization boundaries statically via offline SAST and passive response/cookie fingerprinting without sending destructive gadget chains.
 
 ## 1. Strictly Defensive Boundary
-Guardian strictly prohibits sending weaponized gadget chains, arbitrary code-execution serialized objects, or destructive deserialization payloads. Deserialization risks MUST be audited primarily through source code (`/repos`), dependency inventory (`query_cves`), and strictly passive format fingerprinting.
+Kovo Hunter strictly prohibits sending weaponized gadget chains, arbitrary code-execution serialized objects, or destructive deserialization payloads. Deserialization risks MUST be audited primarily through source code (`/repos`), dependency inventory (`query_cves`), and strictly passive format fingerprinting.
 
 ## 2. Source-First Deserialization Audit (`/repos`)
 Run `run_sast_scan` (`opengrep`, `ast-grep`, `bandit`, `trivy-fs`) and search `/repos` via `derive_evidence` for unsafe deserializers reachable from HTTP bodies, cookies, headers, message queues, or caches:

@@ -1209,7 +1209,7 @@ export class RunsRepository {
       approvalId: row.id, assignmentId: assignment.id, origin: row.origin, method: row.method,
       riskLevel: row.riskLevel, policyNote: row.policyNote,
     })
-    this.session.message(run.id, run.coordinatorId, 'guardian',
+    this.session.message(run.id, run.coordinatorId, 'kovo',
       `Tier 3 approval required: ${row.method} ${row.origin}${row.pathAndQuery}\nRationale: ${row.rationale}`)
     return row
   }
@@ -1490,7 +1490,7 @@ export class RunsRepository {
         createdBy: 'operator',
       })
     }
-    this.session.message(run.id, run.coordinatorId, 'guardian',
+    this.session.message(run.id, run.coordinatorId, 'kovo',
       `Tier 3 request ${decision}: ${updated.method} ${updated.origin}${updated.pathAndQuery}`)
     return updated
   }
@@ -1527,7 +1527,7 @@ export class RunsRepository {
     this.session.event(run.id, 'approval.policy_changed', `Tier 3 approval policy switched from ${previous} to ${approvalPolicy}.`, {
       previous, approvalPolicy, autoApprovedCount,
     })
-    this.session.message(run.id, run.coordinatorId, 'guardian',
+    this.session.message(run.id, run.coordinatorId, 'kovo',
       `Tier 3 approval policy updated to ${approvalPolicy}${autoApprovedCount > 0 ? ` (${autoApprovedCount} pending ${autoApprovedCount === 1 ? 'request' : 'requests'} auto-approved)` : ''}.`)
   }
 
@@ -1601,7 +1601,7 @@ export class RunsRepository {
       sourceApprovalId: existing.id,
       createdBy: 'operator',
     })
-    this.session.message(run.id, run.coordinatorId, 'guardian',
+    this.session.message(run.id, run.coordinatorId, 'kovo',
       `Approved ${existing.method} ${existing.origin}${existing.pathAndQuery} and future probes matching ${newPattern.method} ${newPattern.pathPattern}.`)
   }
 
@@ -1635,7 +1635,7 @@ export class RunsRepository {
       approvedCount,
     })
     if (approvedCount > 0) {
-      this.session.message(run.id, run.coordinatorId, 'guardian',
+      this.session.message(run.id, run.coordinatorId, 'kovo',
         `Batch-approved ${approvedCount} pending Tier 3 ${approvedCount === 1 ? 'probe' : 'probes'}.`)
     }
     return approvedCount
@@ -1671,7 +1671,7 @@ export class RunsRepository {
           spentUsd: current.spentUsd, budgetUsd: current.budgetUsd,
           spentRequests: current.spentRequests, budgetRequests: current.budgetRequests,
         })
-        this.session.message(runId, current.coordinatorId, 'guardian',
+        this.session.message(runId, current.coordinatorId, 'kovo',
           `Run paused: ${reason} A partial report has been saved. Raise the budget to resume.`)
         this.writeReport(this.run(runId), true)
       }, { behavior: 'immediate' })
@@ -1842,7 +1842,7 @@ export class RunsRepository {
       this.updateRun(run.id, { reviewPlan: { status: 'ready', goalMessageId: plan.goalMessageId, ...selection } })
       const titles = selection.checks.map(id => assessmentCheckTitles[id]).join(', ')
       const planned = selection.source === 'coordinator'
-      this.session.message(run.id, run.coordinatorId, planned ? 'coordinator' : 'guardian',
+      this.session.message(run.id, run.coordinatorId, planned ? 'coordinator' : 'kovo',
         (planned ? 'Baseline checks selected: ' : 'Standard baseline checks selected: ') + titles + '.', plan.goalMessageId)
       this.session.event(run.id, 'review.planned', 'Baseline check plan saved.', {
         goalRevision: run.goalRevision, scopeRevision: run.scopeRevision, ...selection,
@@ -1895,7 +1895,7 @@ export class RunsRepository {
       candidates: inventory.map(asset => ({ ...asset, sourceEvidenceId: initial.id })),
     })
     this.session.event(run.id, 'discovery.complete', 'Discovery complete. Review scope and capability tier to continue.')
-    this.session.message(run.id, run.coordinatorId, 'guardian', 'Review the candidate hosts, capability tier, and personas before approving assessment.')
+    this.session.message(run.id, run.coordinatorId, 'kovo', 'Review the candidate hosts, capability tier, and personas before approving assessment.')
   }
 
   private recordInventory(run: Run, worker: Assignment, title: string, assets: readonly Candidate[]) {
@@ -2169,7 +2169,7 @@ export class RunsRepository {
       removed,
       added,
     })
-    this.session.message(run.id, run.coordinatorId, 'guardian',
+    this.session.message(run.id, run.coordinatorId, 'kovo',
       `Scope revision ${scopeRevision} approved for ${approved.length} ${approved.length === 1 ? 'host' : 'hosts'} at Tier ${capabilityTier}.`)
   }
 
@@ -2179,7 +2179,7 @@ export class RunsRepository {
     const revision = run.goalRevision + 1
     const phase = ['investigation', 'verification'].includes(run.phase) ? 'threat_model' : run.phase
     if (run.reviewPlan?.status === 'pending') {
-      this.session.message(run.id, run.coordinatorId, 'guardian', 'This goal was superseded by a revision.', run.reviewPlan.goalMessageId)
+      this.session.message(run.id, run.coordinatorId, 'kovo', 'This goal was superseded by a revision.', run.reviewPlan.goalMessageId)
     }
     const goalMessageId = this.session.message(run.id, run.coordinatorId, 'operator', `Revised goal: ${goal}`)
     this.updateRun(run.id, { goal, goalRevision: revision, phase, reviewPlan: { status: 'pending', goalMessageId } })
@@ -2499,10 +2499,10 @@ export class RunsRepository {
             const history = workerHistory(run, workers)
             const count = workers.filter(worker => worker.status === 'complete' && !history.has(worker.id)).length
             const complete = count === 1 ? '1 assignment is complete.' : `${count} assignments are complete.`
-            this.session.message(run.id, run.coordinatorId, 'guardian',
+            this.session.message(run.id, run.coordinatorId, 'kovo',
               `The run is ${run.status}. ${complete} See Workflow for the next available action.`, questionId)
           } else if (!canUseModel) {
-            this.session.message(run.id, run.coordinatorId, 'guardian',
+            this.session.message(run.id, run.coordinatorId, 'kovo',
               'This run needs a configured model profile. Open Settings to add a model profile.', questionId)
           }
           break

@@ -17,7 +17,7 @@ Audit `/repos` via `run_sast_scan` (`opengrep`, `ast-grep`) and `derive_evidence
 
 ## 2. Strictly Safe Verification Standards
 - **Never pollute shared persistent global server state on public targets!** Server-side prototype pollution should be audited statically in `/repos` first, and verified dynamically ONLY in isolated `local-lab` environments or via strictly non-destructive, non-persistent read-only marker checks approved at Tier 3.
-- **Client-Side DOM Verification:** Use Guardian’s broker-proxied `browser_visit` with `dom_xss_sink_hook` and a benign non-destructive marker query parameter (comparing clean baseline control vs canary parameter) to detect whether a client-side parser mutates a harmless custom test property or reaches a DOM sink.
+- **Client-Side DOM Verification:** Use Kovo Hunter’s broker-proxied `browser_visit` with `dom_xss_sink_hook` and a benign non-destructive marker query parameter (comparing clean baseline control vs canary parameter) to detect whether a client-side parser mutates a harmless custom test property or reaches a DOM sink.
 - **Offline Proof via `run_offline_script`:** When source code is mounted, validate the exact merge/setter function behavior offline inside the air-gapped `--network none` Node runtime on isolated synthetic inputs.
 
 ## 3. Closure & Replay Spec Discipline
