@@ -1,4 +1,4 @@
-# Guardian v4 Hardened Air-Gapped Worker Image (guardian-worker:v4 / guardian-worker:local)
+# Kovo Hunter v4 Hardened Air-Gapped Worker Image (kovo-worker:v4 / kovo-worker:local)
 # Runs strictly with --network none --read-only --cap-drop ALL --security-opt no-new-privileges --user 10001:10001
 
 FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS tools-downloader
@@ -57,11 +57,11 @@ FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00
 RUN apt-get update \
   && apt-get install -y --no-install-recommends python3 python3-venv git ca-certificates \
   && rm -rf /var/lib/apt/lists/* \
-  && python3 -m venv /opt/guardian-venv \
-  && /opt/guardian-venv/bin/pip install --no-cache-dir --upgrade pip \
-  && /opt/guardian-venv/bin/pip install --no-cache-dir bandit==1.8.3 PyJWT==2.10.1 cryptography==44.0.2 \
-  && chmod -R a+rX /opt/guardian-venv \
-  && ln -s /tmp/guardian-evidence /evidence
+  && python3 -m venv /opt/kovo-venv \
+  && /opt/kovo-venv/bin/pip install --no-cache-dir --upgrade pip \
+  && /opt/kovo-venv/bin/pip install --no-cache-dir bandit==1.8.3 PyJWT==2.10.1 cryptography==44.0.2 \
+  && chmod -R a+rX /opt/kovo-venv \
+  && ln -s /tmp/kovo-evidence /evidence
 
 COPY --from=tools-downloader /out/bin/gitleaks /usr/local/bin/gitleaks
 COPY --from=tools-downloader /out/bin/trufflehog /usr/local/bin/trufflehog
@@ -81,26 +81,26 @@ RUN mkdir -p /opt/trivy-cache /tmp/trivy-tmp \
   && test -d /opt/trivy-cache/policy/content \
   && rm -rf /tmp/trivy-tmp /root/.cache
 
-WORKDIR /opt/guardian-worker
+WORKDIR /opt/kovo-worker
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
   && mkdir -p /tmp/swc-out && chmod 0700 /tmp/swc-out \
   && SWC_NATIVE_BINDING_CACHE=/tmp/swc-out node -e 'require("@swc/core")' \
   && SWC_NODE_BIN="$(find /tmp/swc-out -name '*.node' | head -n1)" \
-  && SWC_TARGET="$(find /opt/guardian-worker/node_modules/@swc -name 'swc.*.node' | head -n1)" \
+  && SWC_TARGET="$(find /opt/kovo-worker/node_modules/@swc -name 'swc.*.node' | head -n1)" \
   && test -n "${SWC_NODE_BIN}" && test -n "${SWC_TARGET}" \
   && cp "${SWC_NODE_BIN}" "${SWC_TARGET}" \
   && chmod 0755 "${SWC_TARGET}" \
   && rm -rf /tmp/swc-out \
-  && chmod -R a+rX /opt/guardian-worker/node_modules \
-  && AST_GREP_BIN="$(find /opt/guardian-worker/node_modules/@ast-grep -maxdepth 2 -type f -name ast-grep | head -n1)" \
+  && chmod -R a+rX /opt/kovo-worker/node_modules \
+  && AST_GREP_BIN="$(find /opt/kovo-worker/node_modules/@ast-grep -maxdepth 2 -type f -name ast-grep | head -n1)" \
   && test -n "${AST_GREP_BIN}" \
   && chmod 0755 "${AST_GREP_BIN}" \
   && ln -sf "${AST_GREP_BIN}" /usr/local/bin/ast-grep \
   && ln -sf "${AST_GREP_BIN}" /usr/local/bin/sg
 
-COPY rules /opt/guardian-rules
-RUN chmod -R a+rX /opt/guardian-rules \
+COPY rules /opt/kovo-rules
+RUN chmod -R a+rX /opt/kovo-rules \
   && mkdir -p /tmp/.config /tmp/.cache /tmp/rule-check \
   && printf 'const x = req.query.id; el.innerHTML = x;\n' > /tmp/rule-check/a.js \
   && printf 'const x: string = req.query.id; el.innerHTML = String(x);\n' > /tmp/rule-check/a.ts \
@@ -113,19 +113,19 @@ RUN chmod -R a+rX /opt/guardian-rules \
   && printf 'resource "aws_s3_bucket" "b" { bucket = "x" }\n' > /tmp/rule-check/a.tf \
   && printf 'hostNetwork: true\n' > /tmp/rule-check/a.yaml \
   && printf 'FROM ubuntu:latest\nUSER root\n' > /tmp/rule-check/Dockerfile \
-  && HOME=/tmp XDG_CONFIG_HOME=/tmp/.config XDG_CACHE_HOME=/tmp/.cache opengrep scan --config /opt/guardian-rules/opengrep --json --no-git-ignore /tmp/rule-check \
+  && HOME=/tmp XDG_CONFIG_HOME=/tmp/.config XDG_CACHE_HOME=/tmp/.cache opengrep scan --config /opt/kovo-rules/opengrep --json --no-git-ignore /tmp/rule-check \
      | node -e 'const d = JSON.parse(require("fs").readFileSync(0,"utf8")); if ((d.errors||[]).length || (d.skipped_rules||[]).length) { console.error(JSON.stringify(d, null, 2)); process.exit(1); } if (!(d.results||[]).length) { console.error("No opengrep matches on fixture"); process.exit(1); }' \
-  && ast-grep scan --config /opt/guardian-rules/ast-grep/sgconfig.yml --json=compact /tmp/rule-check \
-     | node -e 'const d = JSON.parse(require("fs").readFileSync(0,"utf8")); if (!Array.isArray(d) || !d.some(m => m.ruleId === "guardian-ast-tsx-dangerous-html")) { console.error("Missing ast-grep tsx match", d); process.exit(1); }' \
+  && ast-grep scan --config /opt/kovo-rules/ast-grep/sgconfig.yml --json=compact /tmp/rule-check \
+     | node -e 'const d = JSON.parse(require("fs").readFileSync(0,"utf8")); if (!Array.isArray(d) || !d.some(m => m.ruleId === "kovo-ast-tsx-dangerous-html")) { console.error("Missing ast-grep tsx match", d); process.exit(1); }' \
   && TRIVY_CACHE_DIR=/opt/trivy-cache trivy fs --scanners vuln,misconfig --offline-scan --skip-db-update --skip-java-db-update --skip-check-update --cache-dir /opt/trivy-cache --format json --quiet /tmp/rule-check \
      | node -e 'const d = JSON.parse(require("fs").readFileSync(0,"utf8")); if (!Array.isArray(d.Results)) { console.error("Trivy offline failed"); process.exit(1); }' \
   && XDG_CACHE_HOME=/nonexistent node -e 'const swc = require("@swc/core"); const m = swc.parseSync("export const x: number = 1;", { syntax: "typescript" }); if (m.type !== "Module") process.exit(1);' \
   && rm -rf /tmp/rule-check /tmp/.config /tmp/.cache
 
 COPY analyzers.ts bridge.ts ./
-RUN chmod 0644 /opt/guardian-worker/analyzers.ts /opt/guardian-worker/bridge.ts
+RUN chmod 0644 /opt/kovo-worker/analyzers.ts /opt/kovo-worker/bridge.ts
 
-ENV PATH="/opt/guardian-venv/bin:/opt/guardian-worker/node_modules/.bin:/usr/local/bin:/usr/bin:/bin" \
+ENV PATH="/opt/kovo-venv/bin:/opt/kovo-worker/node_modules/.bin:/usr/local/bin:/usr/bin:/bin" \
     HOME="/tmp" \
     XDG_CACHE_HOME="/tmp/.cache" \
     XDG_CONFIG_HOME="/tmp/.config" \
@@ -136,4 +136,4 @@ ENV PATH="/opt/guardian-venv/bin:/opt/guardian-worker/node_modules/.bin:/usr/loc
     PYTHONDONTWRITEBYTECODE="1"
 
 USER 10001:10001
-ENTRYPOINT ["node", "--max-old-space-size=512", "/opt/guardian-worker/bridge.ts"]
+ENTRYPOINT ["node", "--max-old-space-size=512", "/opt/kovo-worker/bridge.ts"]

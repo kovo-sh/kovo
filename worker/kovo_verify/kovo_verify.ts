@@ -1,7 +1,7 @@
 /**
- * guardian_verify (TypeScript) — thin, zero-dependency verification SDK for Guardian Layer 3.
+ * kovo_verify (TypeScript) — thin, zero-dependency verification SDK for Kovo Hunter Layer 3.
  *
- * Every network/DOM/OOB/crypto/proof action crosses a Unix-domain socket into the Guardian host
+ * Every network/DOM/OOB/crypto/proof action crosses a Unix-domain socket into the Kovo Hunter host
  * process (`VerifyRpcServer`), which owns scope, credentials, HMAC-signed transcripts, and the
  * authoritative oracle (`prove.*` / `composite.verify`). Zero runtime dependencies beyond Node builtins.
  */
@@ -130,7 +130,7 @@ export interface InjectionDifferentialInput {
   expectedOutput?: string; vulnClass?: string; session?: string; message?: string
 }
 
-export interface ProofResult { sdk: 'guardian_verify.ts'; nonce: string; title: string; severity: string; description?: string; claims: VerifyClaim[] }
+export interface ProofResult { sdk: 'kovo_verify.ts'; nonce: string; title: string; severity: string; description?: string; claims: VerifyClaim[] }
 export interface RpcContext { nonce: string; runId: string; targetOrigins: string[]; sdkVersion: string }
 interface RpcEnvelope { ok: boolean; result?: unknown; error?: string }
 
@@ -222,20 +222,20 @@ export interface Expectations {
 }
 
 function readContext(): RpcContext {
-  const raw = JSON.parse(readFileSync(process.env.GUARDIAN_RPC_CONTEXT_FILE ?? '/guardian-rpc/context.json', 'utf8')) as Record<string, unknown>
+  const raw = JSON.parse(readFileSync(process.env.KOVO_RPC_CONTEXT_FILE ?? '/kovo-rpc/context.json', 'utf8')) as Record<string, unknown>
   return {
     nonce: typeof raw.nonce === 'string' ? raw.nonce : '',
     runId: typeof raw.runId === 'string' ? raw.runId : 'unknown-run',
     targetOrigins: Array.isArray(raw.targetOrigins) ? raw.targetOrigins.filter((v): v is string => typeof v === 'string') : [],
-    sdkVersion: typeof raw.sdkVersion === 'string' ? raw.sdkVersion : 'guardian_verify/v6-mvp',
+    sdkVersion: typeof raw.sdkVersion === 'string' ? raw.sdkVersion : 'kovo_verify/v8',
   }
 }
 
 function rpc(op: string, args: Record<string, unknown>, timeoutMs = 60_000): Promise<unknown> {
-  const socketPath = process.env.GUARDIAN_RPC_SOCKET ?? '/guardian-rpc/verify.sock'
+  const socketPath = process.env.KOVO_RPC_SOCKET ?? '/kovo-rpc/verify.sock'
   const context = readContext()
-  const nonce = process.env.GUARDIAN_VERIFY_NONCE ?? context.nonce
-  const token = readFileSync(process.env.GUARDIAN_RPC_TOKEN_FILE ?? '/guardian-rpc/token', 'utf8').trim()
+  const nonce = process.env.KOVO_VERIFY_NONCE ?? context.nonce
+  const token = readFileSync(process.env.KOVO_RPC_TOKEN_FILE ?? '/kovo-rpc/token', 'utf8').trim()
   const payload = JSON.stringify({ op, args })
   return new Promise((resolve, reject) => {
     const req = httpRequest({
@@ -245,8 +245,8 @@ function rpc(op: string, args: Record<string, unknown>, timeoutMs = 60_000): Pro
       headers: {
         'content-type': 'application/json',
         'content-length': Buffer.byteLength(payload),
-        'x-guardian-rpc-token': token,
-        'x-guardian-verify-nonce': nonce,
+        'x-kovo-rpc-token': token,
+        'x-kovo-verify-nonce': nonce,
       },
       timeout: timeoutMs,
     }, res => {
@@ -388,7 +388,7 @@ export class VerifyContext {
 
   constructor() {
     const context = readContext()
-    this.nonce = process.env.GUARDIAN_VERIFY_NONCE ?? context.nonce
+    this.nonce = process.env.KOVO_VERIFY_NONCE ?? context.nonce
     this.runId = context.runId
     this.targetOrigins = context.targetOrigins
     this.targetOrigin = this.targetOrigins[0] ?? ''
@@ -809,7 +809,7 @@ export class VerifyContext {
   result(input: { title: string; severity?: string; description?: string }): ProofResult {
     if (!input.title || !input.title.trim()) throw new Error('Proof result requires a title.')
     return {
-      sdk: 'guardian_verify.ts',
+      sdk: 'kovo_verify.ts',
       nonce: this.nonce,
       title: input.title.slice(0, 300),
       severity: (input.severity ?? 'high').slice(0, 32),
@@ -829,7 +829,7 @@ export type VerificationEntrypoint = VerificationScript | ((ctx: VerifyContext) 
 export function defineVerification(script: VerificationScript): VerificationScript { return script }
 
 function writeResult(value: unknown): void {
-  const path = process.env.GUARDIAN_PROOF_RESULT_FILE ?? join(dirname(process.env.GUARDIAN_RPC_CONTEXT_FILE ?? '/guardian-rpc/context.json'), 'result.json')
+  const path = process.env.KOVO_PROOF_RESULT_FILE ?? join(dirname(process.env.KOVO_RPC_CONTEXT_FILE ?? '/kovo-rpc/context.json'), 'result.json')
   writeFileSync(path, JSON.stringify(value), { mode: 0o600 })
 }
 
@@ -840,7 +840,7 @@ function normalizeProofResult(ctx: VerifyContext, returned: unknown, defaultTitl
     const rec = returned as Record<string, unknown>
     if (Array.isArray(rec.claims)) {
       return {
-        sdk: 'guardian_verify.ts',
+        sdk: 'kovo_verify.ts',
         nonce: typeof rec.nonce === 'string' && rec.nonce ? rec.nonce : ctx.nonce,
         title: typeof rec.title === 'string' && rec.title.trim() ? rec.title.trim().slice(0, 300) : fallbackTitle,
         severity: typeof rec.severity === 'string' && rec.severity.trim() ? rec.severity.trim().slice(0, 32) : 'high',
@@ -849,7 +849,7 @@ function normalizeProofResult(ctx: VerifyContext, returned: unknown, defaultTitl
       }
     }
   }
-  return { sdk: 'guardian_verify.ts', nonce: ctx.nonce, title: fallbackTitle, severity: 'high', claims: fallbackClaims }
+  return { sdk: 'kovo_verify.ts', nonce: ctx.nonce, title: fallbackTitle, severity: 'high', claims: fallbackClaims }
 }
 
 export async function runVerification(script: VerificationScript, defaultTitle?: string): Promise<void> {
@@ -861,22 +861,22 @@ export async function runVerification(script: VerificationScript, defaultTitle?:
     await script.cleanup?.(ctx)
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Verification script failed.'
-    writeResult({ sdk: 'guardian_verify.ts', nonce: ctx.nonce, error: message.slice(0, 2000), claims: [] })
-    process.stderr.write(`guardian_verify: ${message}\n`)
+    writeResult({ sdk: 'kovo_verify.ts', nonce: ctx.nonce, error: message.slice(0, 2000), claims: [] })
+    process.stderr.write(`kovo_verify: ${message}\n`)
     process.exitCode = 1
     return
   }
   const normalized = normalizeProofResult(ctx, result, defaultTitle)
   writeResult(normalized)
-  process.stdout.write(`guardian_verify: ${normalized.claims.length} transcript-backed claim(s) recorded\n`)
+  process.stdout.write(`kovo_verify: ${normalized.claims.length} transcript-backed claim(s) recorded\n`)
 }
 
 export async function runEntrypoint(entry: VerificationEntrypoint, defaultTitle?: string): Promise<void> {
   if (typeof entry === 'function') { await runVerification({ verify: entry }, defaultTitle); return }
   if (entry && typeof entry === 'object' && typeof entry.verify === 'function') { await runVerification(entry, defaultTitle); return }
   const ctx = new VerifyContext()
-  const message = 'guardian_verify script must export a default async (ctx) => ... function, an object with verify(ctx), or execute ctx.prove_* directly.'
-  writeResult({ sdk: 'guardian_verify.ts', nonce: ctx.nonce, error: message, claims: [] })
-  process.stderr.write(`guardian_verify: ${message}\n`)
+  const message = 'kovo_verify script must export a default async (ctx) => ... function, an object with verify(ctx), or execute ctx.prove_* directly.'
+  writeResult({ sdk: 'kovo_verify.ts', nonce: ctx.nonce, error: message, claims: [] })
+  process.stderr.write(`kovo_verify: ${message}\n`)
   process.exitCode = 1
 }

@@ -1,5 +1,5 @@
 {
-  "name": "guardian-evidence-worker",
+  "name": "kovo-evidence-worker",
   "private": true,
   "type": "module",
   "dependencies": {
