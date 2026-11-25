@@ -1,15 +1,41 @@
 /**
- * Graph Coordinator — v6 Phase 4 pure coordinator core (plans/better-architecture.md §3.3).
+ * Graph Coordinator — v6 Phase 4 / v8 M0-M3 causal coordinator core (plans/v8.md §2 & §5).
  *
- * Replaces `execution.ts`'s stateless single-shot `runChainPlanner` with five paginated
- * read/dispatch tools, typed chain primitives and an explicit chaining round. The module is
- * standalone (zero imports): data arrives through `CoordinatorDeps`, so wiring can adapt the live
- * store/program graph after v6-delete releases `execution.ts`.
+ * Exposes five paginated read/dispatch tools, typed chain primitives, and causal multi-hop
+ * frontier planning backed by `CapabilityLedger` + `FrontierScheduler` (depth 1..6, exact EVI
+ * beam ranking, `capability_only` quarantine enforcement, negative-edge dead-end suppression,
+ * and strictly bounded <= 2 KB hop-checkpoint briefs).
  *
  * Pure and deterministic: identical deps + arguments produce identical output. Dispatch never
  * performs HTTP — it validates and normalises hypotheses into a plan for Layer 1.
- * Chain primitives never carry raw credentials: secrets are represented by `secret:<factId>`.
+ * Chain primitives never carry raw credentials: secrets are represented by `secret:<factId>`
+ * or opaque `cap:hop_<id>:<slot>` handles.
  */
+import {
+  ALWAYS_QUARANTINED_KINDS,
+  CapabilityLedger,
+  type CapabilityKind,
+  type CapabilityNode,
+  type CapabilitySurface,
+  type CausalEdge,
+  type CausalEdgeBindingKind,
+} from './capability-ledger.ts'
+import {
+  FrontierScheduler,
+  MAX_CHAIN_DEPTH,
+  MAX_CHECKPOINT_BRIEF_BYTES,
+  MIN_CHAIN_DEPTH,
+  buildHopCheckpointBrief,
+  clampBeamWidth,
+  computeBranchEvi,
+  computeNegativeEdgeKey,
+  rankAndPruneBeam,
+  type FrontierBranch,
+  type FrontierTargetSurface,
+  type HopCheckpointBrief,
+  type NegativeEdgeRecord,
+  type VerifiedHopHandle,
+} from './frontier-scheduler.ts'
 
 // ---------------------------------------------------------------------------
 // Contracts
@@ -110,6 +136,10 @@ export interface CoordinatorDeps {
   programGraph?(): CoordinatorProgramGraph | null
   commitSignals?(): readonly CoordinatorCommitSignal[]
   approvedOrigins?(): readonly string[]
+  /** Optional v8 run-scoped CapabilityLedger backing causal DAG planning & negative-edge pruning. */
+  capabilityLedger?(): CapabilityLedger | null
+  /** Optional v8 FrontierScheduler backing EVI beam ranking & wave progression. */
+  frontierScheduler?(): FrontierScheduler | null
 }
 
 export class CoordinatorInputError extends Error {
@@ -1023,7 +1053,7 @@ export function formatChainHopsBrief(hops: readonly ChainHop[], maxBytes = 640):
 }
 
 // ---------------------------------------------------------------------------
-// Explicit chaining round
+// Explicit chaining round — v8 CapabilityLedger + FrontierScheduler beam planner
 // ---------------------------------------------------------------------------
 
 export type ChainScope = 'same_origin' | 'cross_origin'
@@ -1045,6 +1075,20 @@ export interface ChainHypothesis {
   target?: { endpoint: string; method?: string; origin: string }
   /** Ordered typed hop inputs feeding follow-on rounds without prompt soup (v7 M2). */
   chainHops?: ChainHop[]
+  /** v8 Frontier branch identifier for wave tracking and 2-strike dead-end pruning. */
+  branchKey?: string
+  /** Exact v8 EVI score computed by `FrontierScheduler`. */
+  evi?: number
+  /** Ordered CapabilityLedger handle IDs participating in this causal branch. */
+  capabilityIds?: string[]
+  /** Ordered causal edge binding kinds across hops. */
+  edgeBindingKinds?: CausalEdgeBindingKind[]
+  /** Strictly bounded (<= 2 KB) pre-hydrated Hop-Checkpoint brief for follow-on workers. */
+  checkpointBrief?: HopCheckpointBrief
+  /** Serialized UTF-8 JSON of `checkpointBrief` (<= 2048 bytes). */
+  checkpointJson?: string
+  /** UTF-8 byte length of `checkpointJson`. */
+  checkpointBytes?: number
 }
 
 export interface PlanChainRoundArgs {
@@ -1052,71 +1096,24 @@ export interface PlanChainRoundArgs {
   endpoints?: readonly CoordinatorEndpoint[]
   /** Typed hops from prior/current rounds to attach onto planned multi-step hypotheses. */
   hops?: readonly ChainHop[]
+  /** Maximum chain depth (v8 supports 1..6; defaults to 4). */
   maxHops?: number
+  /** Minimum chain depth (defaults to 2 for multi-hop composition; set 1 to include terminal-eligible 1-hop nodes). */
+  minHops?: number
   limit?: number
   approvedOrigins?: readonly string[]
+  /** Optional v8 CapabilityLedger for causal DAG lineage, quarantine, and negative-edge filtering. */
+  capabilityLedger?: CapabilityLedger | null
+  /** Optional v8 FrontierScheduler for beam ranking, strike telemetry, and negative-edge sync. */
+  frontierScheduler?: FrontierScheduler | null
+  /** Beam width B clamped to [8, 16] per plans/v8.md §5. */
+  beamWidth?: number
+  /** Current wave number for FrontierBranch metadata. */
+  waveNo?: number
+  /** Maximum UTF-8 byte budget for hop-checkpoint briefs (default 2048 B). */
+  maxCheckpointBriefBytes?: number
 }
 
-const keyOf = (kinds: readonly ChainPrimitiveKind[]): string => [...kinds].sort().join('+')
-const normalizeComboKey = (raw: string): string => raw.split('+').sort().join('+')
-
-const PAIR_WEIGHTS: Readonly<Record<string, number>> = Object.fromEntries(
-  Object.entries({
-    'admin_route+leaked_token': 0.86,
-    'admin_route+weak_jwt': 0.84,
-    'discovered_id+leaked_token': 0.80,
-    'discovered_id+stored_write': 0.78,
-    'ssrf_internal_reach+stored_write': 0.82,
-    'admin_route+stored_write': 0.74,
-    'admin_route+discovered_id': 0.75,
-    'leaked_token+ssrf_internal_reach': 0.76,
-    'discovered_id+weak_jwt': 0.72,
-    'admin_route+ssrf_internal_reach': 0.70,
-    'discovered_id+ssrf_internal_reach': 0.68,
-    'admin_route+role_transition': 0.88,
-    'leaked_token+role_transition': 0.85,
-    'role_transition+weak_jwt': 0.83,
-    'role_transition+workflow_state_handle': 0.84,
-    'discovered_id+workflow_state_handle': 0.81,
-    'admin_route+workflow_state_handle': 0.79,
-    'discovered_id+role_transition': 0.82,
-    'leaked_token+workflow_state_handle': 0.77,
-    'ssrf_internal_reach+workflow_state_handle': 0.75,
-    'role_transition+stored_write': 0.76,
-    'stored_write+workflow_state_handle': 0.74,
-    'role_transition+ssrf_internal_reach': 0.75,
-  }).map(([combo, weight]) => [normalizeComboKey(combo), weight]),
-)
-
-const THREE_HOP_SETS: ReadonlySet<string> = new Set([
-  'discovered_id+ssrf_internal_reach+stored_write',
-  'admin_route+discovered_id+leaked_token',
-  'admin_route+discovered_id+weak_jwt',
-  'leaked_token+ssrf_internal_reach+stored_write',
-  'admin_route+ssrf_internal_reach+stored_write',
-  'admin_route+discovered_id+role_transition',
-  'admin_route+role_transition+workflow_state_handle',
-  'discovered_id+role_transition+workflow_state_handle',
-  'leaked_token+role_transition+workflow_state_handle',
-  'admin_route+leaked_token+role_transition',
-  'admin_route+role_transition+weak_jwt',
-  'discovered_id+leaked_token+workflow_state_handle',
-  'admin_route+leaked_token+ssrf_internal_reach',
-  'leaked_token+role_transition+ssrf_internal_reach',
-  'role_transition+ssrf_internal_reach+workflow_state_handle',
-  'discovered_id+role_transition+stored_write',
-].map(normalizeComboKey))
-
-const FOUR_HOP_SETS: ReadonlySet<string> = new Set([
-  'admin_route+discovered_id+role_transition+workflow_state_handle',
-  'admin_route+discovered_id+leaked_token+role_transition',
-  'admin_route+leaked_token+role_transition+workflow_state_handle',
-  'admin_route+leaked_token+ssrf_internal_reach+stored_write',
-  'admin_route+discovered_id+ssrf_internal_reach+workflow_state_handle',
-  'discovered_id+leaked_token+role_transition+workflow_state_handle',
-  'admin_route+role_transition+ssrf_internal_reach+workflow_state_handle',
-  'admin_route+discovered_id+role_transition+weak_jwt',
-].map(normalizeComboKey))
 const PROBE_CLASS: Record<ChainPrimitiveKind, string> = {
   leaked_token: 'authz_replay',
   discovered_id: 'bola_idor',
@@ -1127,13 +1124,76 @@ const PROBE_CLASS: Record<ChainPrimitiveKind, string> = {
   role_transition: 'auth_bypass',
   workflow_state_handle: 'workflow_invariant',
 }
+
+const AUTHORITY_CAP_KINDS: ReadonlySet<CapabilityKind> = new Set([
+  'identity_session', 'scoped_token', 'signing_material', 'signed_artifact_or_url',
+])
+const PIVOT_CAP_KINDS: ReadonlySet<CapabilityKind> = new Set([
+  'internal_reach_handle', 'state_handle', 'write_sink_handle', 'parser_or_cache_primitive',
+])
+const TARGET_CAP_KINDS: ReadonlySet<CapabilityKind> = new Set([
+  'opaque_object_ref', 'policy_asymmetry',
+])
+
 const hostOf = (origin: string): string => origin.replace(/^https?:\/\//, '')
 
-function capabilitySet(kinds: readonly ChainPrimitiveKind[]): CoordinatorCapability[] {
+function primitiveToCapabilityKind(kind: ChainPrimitiveKind): CapabilityKind {
+  switch (kind) {
+    case 'leaked_token': return 'scoped_token'
+    case 'weak_jwt': return 'signing_material'
+    case 'discovered_id': return 'opaque_object_ref'
+    case 'ssrf_internal_reach': return 'internal_reach_handle'
+    case 'stored_write': return 'write_sink_handle'
+    case 'admin_route': return 'policy_asymmetry'
+    case 'role_transition': return 'identity_session'
+    case 'workflow_state_handle': return 'state_handle'
+  }
+}
+
+function capabilityKindToPrimitiveKind(kind: CapabilityKind): ChainPrimitiveKind {
+  switch (kind) {
+    case 'scoped_token':
+    case 'signed_artifact_or_url':
+      return 'leaked_token'
+    case 'signing_material':
+      return 'weak_jwt'
+    case 'opaque_object_ref':
+      return 'discovered_id'
+    case 'internal_reach_handle':
+      return 'ssrf_internal_reach'
+    case 'write_sink_handle':
+      return 'stored_write'
+    case 'policy_asymmetry':
+    case 'parser_or_cache_primitive':
+      return 'admin_route'
+    case 'identity_session':
+      return 'role_transition'
+    case 'state_handle':
+      return 'workflow_state_handle'
+  }
+}
+
+function inferSurfaceFromEndpoint(endpoint: string | undefined, kind: ChainPrimitiveKind): CapabilitySurface {
+  if (kind === 'stored_write') return 'browser'
+  if (kind === 'ssrf_internal_reach') return 'webhook'
+  if (kind === 'workflow_state_handle') return 'async_job'
+  const path = (endpoint ?? '').toLowerCase()
+  if (/\/(?:graphql|gql)(?:\/|$)/.test(path)) return 'graphql'
+  if (/\/(?:sse|events|stream)(?:\/|$)/.test(path)) return 'sse'
+  if (/\/(?:ws|wss|socket)(?:\/|$)/.test(path)) return 'ws'
+  if (/\/(?:oauth|oidc|idp|sso|scim|authorize)(?:\/|$)/.test(path)) return 'idp'
+  if (/\/(?:cdn|static|public\/profile|cache)(?:\/|$)/.test(path)) return 'cdn'
+  if (/\/(?:storage|buckets?|blobs?|files?|artifacts?|downloads?)(?:\/|$)/.test(path)) return 'storage'
+  if (/\/(?:jobs?|workers?|exports?|async)(?:\/|$)/.test(path)) return 'async_job'
+  if (/\/(?:webhooks?|callbacks?|hooks?)(?:\/|$)/.test(path)) return 'webhook'
+  return 'http'
+}
+
+function capabilitySet(kinds: readonly ChainPrimitiveKind[], surfaces: readonly CapabilitySurface[] = []): CoordinatorCapability[] {
   return COORDINATOR_CAPABILITIES.filter(capability =>
     capability === 'http'
-    || (capability === 'oob' && kinds.includes('ssrf_internal_reach'))
-    || (capability === 'browser' && kinds.includes('stored_write'))
+    || (capability === 'oob' && (kinds.includes('ssrf_internal_reach') || surfaces.includes('webhook') || surfaces.includes('async_job')))
+    || (capability === 'browser' && (kinds.includes('stored_write') || surfaces.includes('browser')))
     || (capability === 'race' && kinds.includes('workflow_state_handle')))
 }
 
@@ -1173,97 +1233,584 @@ function matchHopForPrimitive(primitive: ChainPrimitive, hops: readonly ChainHop
   }
 }
 
-function buildHypothesis(
-  scope: ChainScope,
-  chain: readonly ChainPrimitive[],
+interface CausalPlanUnit {
+  unitId: string
+  capId: string
+  capKind: CapabilityKind
+  primitive: ChainPrimitive
+  surface: CapabilitySurface
+  tenantScope: string
+  actorPersona: string
+  serviceOrigin: string
+  hopReceiptId: string
+  verified: boolean
+  quarantined: boolean
+  terminalEligible: boolean
+  targetSurfaceKey: string
+  hypothesisClass: string
+  endpoint: string
+  method: string
+}
+
+function sanitizeUnitToken(raw: string): string {
+  const clean = raw.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[^A-Za-z0-9]+/, '')
+  return (clean || 'u0').slice(0, 48)
+}
+
+function inferCausalBinding(from: CausalPlanUnit, to: CausalPlanUnit): CausalEdgeBindingKind {
+  if (from.capKind === 'signing_material' || to.capKind === 'signed_artifact_or_url') return 'derived_crypto_binding'
+  if (
+    from.capKind === 'write_sink_handle'
+    || from.capKind === 'internal_reach_handle'
+    || to.surface === 'async_job'
+    || to.surface === 'webhook'
+    || to.surface === 'browser'
+    || to.surface === 'sse'
+  ) {
+    return 'async_pivot_binding'
+  }
+  if (
+    from.capKind === 'state_handle'
+    || from.capKind === 'parser_or_cache_primitive'
+    || to.capKind === 'state_handle'
+    || to.capKind === 'parser_or_cache_primitive'
+  ) {
+    return 'state_transition_binding'
+  }
+  return 'value_binding'
+}
+
+function parseRouteTarget(rawRoute: unknown): { method?: string; endpoint?: string } {
+  if (typeof rawRoute !== 'string' || !rawRoute.trim()) return {}
+  const trimmed = rawRoute.trim()
+  const parts = trimmed.split(/\s+/, 2)
+  if (parts.length === 2 && /^[A-Z]+$/i.test(parts[0]!)) {
+    return { method: parts[0]!.toUpperCase(), endpoint: parts[1]! }
+  }
+  return { endpoint: trimmed }
+}
+
+function ledgerNodeToUnit(node: CapabilityNode, fallbackOrigin: string): CausalPlanUnit {
+  const meta = node.metadata ?? {}
+  const parsedRoute = parseRouteTarget(meta.targetRoute)
+  const endpoint = parsedRoute.endpoint ?? (typeof meta.endpoint === 'string' ? meta.endpoint : `/${node.surface}/${node.kind}`)
+  const method = parsedRoute.method ?? (typeof meta.method === 'string' ? meta.method.toUpperCase() : 'POST')
+  const origin = /^https?:\/\//i.test(node.serviceOrigin) ? node.serviceOrigin : fallbackOrigin
+  const primitiveKind = capabilityKindToPrimitiveKind(node.kind)
+  const hypothesisClass = typeof meta.hypothesisKind === 'string' && meta.hypothesisKind.trim()
+    ? meta.hypothesisKind.trim()
+    : PROBE_CLASS[primitiveKind]
+  const targetSurfaceKey = typeof meta.targetSurfaceKey === 'string' && meta.targetSurfaceKey.trim()
+    ? meta.targetSurfaceKey.trim()
+    : `${node.serviceOrigin}|${node.surface}|${endpoint}`
+  const quarantined = ALWAYS_QUARANTINED_KINDS.has(node.kind) || node.promotionStatus === 'capability_only'
+  const terminalEligible = !ALWAYS_QUARANTINED_KINDS.has(node.kind)
+    && node.promotionStatus === 'terminal_eligible'
+    && node.terminalImpactOracleVerified
+  const detail = node.artifactSummary
+    || `Capability ${node.capId} (${node.kind} on ${node.surface}/${node.serviceOrigin})`
+  return {
+    unitId: `ledger:${node.capId}`,
+    capId: node.capId,
+    capKind: node.kind,
+    primitive: {
+      kind: primitiveKind,
+      origin,
+      value: node.capId,
+      evidenceIds: dedupe([node.capId, ...node.parentHopReceiptIds]),
+      factIds: typeof meta.factId === 'string' ? [meta.factId] : [],
+      endpoint,
+      method,
+      persona: node.actorPersona,
+      detail,
+    },
+    surface: node.surface,
+    tenantScope: node.tenantScope,
+    actorPersona: node.actorPersona,
+    serviceOrigin: node.serviceOrigin,
+    hopReceiptId: node.parentHopReceiptIds[0] ?? `hop:${sanitizeUnitToken(node.capId)}`,
+    verified: node.provenance === 'derived_hop' || node.parentHopReceiptIds.length > 0 || terminalEligible,
+    quarantined,
+    terminalEligible,
+    targetSurfaceKey,
+    hypothesisClass,
+    endpoint,
+    method,
+  }
+}
+
+function primitiveToUnit(primitive: ChainPrimitive, hops: readonly ChainHop[], ordinal: number): CausalPlanUnit {
+  const capKind = primitiveToCapabilityKind(primitive.kind)
+  const surface = inferSurfaceFromEndpoint(primitive.endpoint, primitive.kind)
+  const matched = matchHopForPrimitive(primitive, hops, ordinal)
+  const capId = `cap:hop_prim${ordinal}:${sanitizeUnitToken(primitive.kind)}`
+  const endpoint = primitive.endpoint ?? `/${surface}/${primitive.kind}`
+  const method = (primitive.method ?? 'POST').toUpperCase()
+  const targetSurfaceKey = `${primitive.origin}|${surface}|${endpoint}`
+  const hypothesisClass = PROBE_CLASS[primitive.kind]
+  const quarantined = ALWAYS_QUARANTINED_KINDS.has(capKind)
+  return {
+    unitId: `prim:${primitive.kind}:${primitive.origin}:${primitive.value}`,
+    capId,
+    capKind,
+    primitive,
+    surface,
+    tenantScope: 'default_tenant',
+    actorPersona: primitive.persona ?? 'attacker',
+    serviceOrigin: primitive.origin,
+    hopReceiptId: matched.hopId,
+    verified: matched.verified,
+    quarantined,
+    terminalEligible: !quarantined && matched.verified,
+    targetSurfaceKey,
+    hypothesisClass,
+    endpoint,
+    method,
+  }
+}
+
+function structuralTransitionFeasibility(
+  units: readonly CausalPlanUnit[],
+  verifiedEdgeCount: number,
+): { feasibilityProb: number; terminalImpactWeight: number; surfaceNovelty: number } {
+  const capKinds = units.map(u => u.capKind)
+  const distinctSurfaces = new Set(units.map(u => u.surface)).size
+  const distinctOrigins = new Set(units.map(u => u.serviceOrigin)).size
+  const distinctTenants = new Set(units.map(u => u.tenantScope).filter(t => t && t !== 'unscoped_hypothesis')).size
+  const hasAuthority = capKinds.some(k => AUTHORITY_CAP_KINDS.has(k))
+  const hasPivot = capKinds.some(k => PIVOT_CAP_KINDS.has(k))
+  const hasTarget = capKinds.some(k => TARGET_CAP_KINDS.has(k))
+  const stagesCovered = Number(hasAuthority) + Number(hasPivot) + Number(hasTarget)
+  const verifiedUnits = units.filter(u => u.verified).length
+
+  let feasibility = 0.56
+  if (hasAuthority && (hasTarget || hasPivot)) feasibility += 0.16
+  else if (hasPivot && hasTarget) feasibility += 0.11
+  else if (stagesCovered >= 2) feasibility += 0.08
+  feasibility += Math.min(0.16, verifiedEdgeCount * 0.06 + verifiedUnits * 0.03)
+  if (units.length >= 2 && units[0]!.capKind === units[units.length - 1]!.capKind && verifiedEdgeCount === 0) {
+    feasibility -= 0.12
+  }
+  const feasibilityProb = Math.max(0.25, Math.min(0.96, Number(feasibility.toFixed(4))))
+
+  let impact = 6.2 + stagesCovered * 0.9
+  if (hasAuthority) impact += 0.8
+  if (distinctOrigins > 1) impact += 0.6
+  if (distinctTenants > 1) impact += 0.6
+  if (verifiedEdgeCount > 0) impact += Math.min(1.0, verifiedEdgeCount * 0.35)
+  const terminalImpactWeight = Math.min(10, Number(impact.toFixed(4)))
+
+  // Distinct surfaces + cross-service/cross-origin transitions drive v8 SurfaceNovelty.
+  const surfaceNovelty = Number((
+    1.0
+    + Math.max(0, distinctSurfaces - 1) * 0.42
+    + (distinctOrigins > 1 ? 0.18 : 0)
+    + Math.min(0.35, Math.max(0, units.length - 2) * 0.08)
+  ).toFixed(4))
+
+  return { feasibilityProb, terminalImpactWeight, surfaceNovelty }
+}
+
+interface PlannedCausalCandidate {
+  branch: FrontierBranch
+  units: CausalPlanUnit[]
+  bindings: CausalEdgeBindingKind[]
+  evi: number
+  isLedgerDag: boolean
+}
+
+function buildCausalBranch(input: {
+  units: CausalPlanUnit[]
+  bindings: CausalEdgeBindingKind[]
+  waveNo: number
+  verifiedEdgeCount: number
+  attemptsOnBranch: number
+}): FrontierBranch {
+  const { units, bindings, waveNo, verifiedEdgeCount, attemptsOnBranch } = input
+  const tail = units[units.length - 1]!
+  const scoring = structuralTransitionFeasibility(units, verifiedEdgeCount)
+  const verifiedHops: VerifiedHopHandle[] = units.map((unit, idx) => ({
+    hopIndex: idx + 1,
+    hopReceiptId: unit.hopReceiptId,
+    capabilityId: unit.capId,
+    kind: unit.capKind,
+    surface: unit.surface,
+    serviceOrigin: unit.serviceOrigin,
+    tenantScope: unit.tenantScope,
+    actorPersona: unit.actorPersona,
+    endpoint: unit.endpoint,
+    method: unit.method,
+    ...(idx > 0 && bindings[idx - 1] ? { edgeBindingKind: bindings[idx - 1] } : {}),
+    summary: truncate(unit.primitive.detail, 120),
+  }))
+  const nextTarget: FrontierTargetSurface = {
+    targetSurfaceKey: tail.targetSurfaceKey,
+    surface: tail.surface,
+    serviceOrigin: tail.serviceOrigin,
+    endpoint: tail.endpoint,
+    method: tail.method,
+    hypothesisClass: tail.hypothesisClass,
+    ...(bindings.length ? { expectedBindingKind: bindings[bindings.length - 1] } : {}),
+    ...(tail.tenantScope ? { targetTenantScope: tail.tenantScope } : {}),
+    goalSummary: truncate(
+      `Verify ${units.length}-hop causal chain reaching ${tail.method} ${tail.endpoint} (${tail.capKind})`,
+      160,
+    ),
+  }
+  const branchKey = `b:${units.map(u => sanitizeUnitToken(u.capId)).join('>')}`
+  return {
+    branchKey,
+    depth: units.length,
+    verifiedHops,
+    nextTarget,
+    feasibilityProb: scoring.feasibilityProb,
+    terminalImpactWeight: scoring.terminalImpactWeight,
+    surfaceNovelty: scoring.surfaceNovelty,
+    attemptsOnBranch,
+    consecutiveFailedAttempts: attemptsOnBranch,
+    lane: 'partial_chain',
+    createdWave: waveNo,
+    lastUpdatedWave: waveNo,
+  }
+}
+
+function buildHypothesisFromCausalCandidate(
+  candidate: PlannedCausalCandidate,
   endpoints: readonly CoordinatorEndpoint[],
   hops: readonly ChainHop[],
+  maxCheckpointBriefBytes: number,
   ordinal: number,
 ): ChainHypothesis {
+  const chain = candidate.units.map(u => u.primitive)
   const kinds = chain.map(primitive => primitive.kind)
+  const surfaces = candidate.units.map(u => u.surface)
   const origins = [...new Set(chain.map(primitive => primitive.origin))]
+  const scope: ChainScope = origins.length === 1 ? 'same_origin' : 'cross_origin'
   const entry = chain.map(primitive => endpointFor(primitive, endpoints)).find(Boolean)
   const target = [...chain].reverse().map(primitive => endpointFor(primitive, endpoints)).find(Boolean)
-  const pairScore = (a: ChainPrimitiveKind, b: ChainPrimitiveKind): number => PAIR_WEIGHTS[keyOf([a, b])] ?? 0.55
-  let base = 0.55
-  if (chain.length === 2) {
-    base = pairScore(kinds[0], kinds[1])
-  } else {
-    const scores: number[] = []
-    for (let i = 0; i < kinds.length - 1; i += 1) scores.push(pairScore(kinds[i], kinds[i + 1]))
-    base = Math.min(...scores, 0.9)
-  }
   const chainHops = chain.map((primitive, index) => matchHopForPrimitive(primitive, hops, index))
   for (let i = 1; i < chainHops.length; i += 1) {
-    if (!chainHops[i].parentHopId) chainHops[i] = { ...chainHops[i], parentHopId: chainHops[i - 1].hopId }
+    if (!chainHops[i]!.parentHopId) chainHops[i] = { ...chainHops[i]!, parentHopId: chainHops[i - 1]!.hopId }
   }
+  const { brief, checkpointJson, checkpointBytes } = buildHopCheckpointBrief(
+    candidate.branch,
+    candidate.evi,
+    maxCheckpointBriefBytes,
+  )
+  // Monotonically project EVI into [0.35, 0.99] confidence for legacy consumers.
+  const confidence = Math.round(Math.min(0.99, Math.max(0.35, candidate.evi / (candidate.evi + 3.0))) * 100) / 100
   return {
     id: `chain:${scope}:${kinds.join('>')}:${ordinal}`,
-    scope, hops: chain.length, origin: chain[0].origin, chainOrigins: origins, primitiveKinds: kinds,
+    scope,
+    hops: chain.length,
+    origin: chain[0]!.origin,
+    chainOrigins: origins,
+    primitiveKinds: kinds,
     parentEvidenceIds: dedupe(chain.flatMap(primitive => [...primitive.evidenceIds, ...primitive.factIds])),
     title: `${kinds.join(' → ')} chain on ${origins.map(hostOf).join(' → ')}`,
     rationale: `Connect ${chain.map(primitive => primitive.detail).join(' Then ')}`,
     probeClasses: [...new Set(kinds.map(kind => PROBE_CLASS[kind]))].sort(),
-    capabilities: capabilitySet(kinds),
-    confidence: Math.round((base - (chain.length - 2) * 0.03) * 100) / 100,
+    capabilities: capabilitySet(kinds, surfaces),
+    confidence,
     ...(entry ? { entry: { endpoint: entry.pathTemplate, method: entry.method, origin: entry.origin } } : {}),
     ...(target ? { target: { endpoint: target.pathTemplate, method: target.method, origin: target.origin } } : {}),
     chainHops,
+    branchKey: candidate.branch.branchKey,
+    evi: Number(candidate.evi.toFixed(6)),
+    capabilityIds: candidate.units.map(u => u.capId),
+    edgeBindingKinds: [...candidate.bindings],
+    checkpointBrief: brief,
+    checkpointJson,
+    checkpointBytes,
   }
 }
 
+function collectNegativeEdgeState(
+  ledger: CapabilityLedger | null | undefined,
+  scheduler: FrontierScheduler | null | undefined,
+): { prunedKeys: Set<string>; strikeCountByKey: Map<string, number>; records: NegativeEdgeRecord[] } {
+  const prunedKeys = new Set<string>()
+  const strikeCountByKey = new Map<string, number>()
+  const records: NegativeEdgeRecord[] = []
+  if (ledger) {
+    for (const neg of ledger.listNegativeEdges()) {
+      const key = computeNegativeEdgeKey(neg.preconditionCapIds, neg.targetSurfaceKey, neg.hypothesisClass)
+      strikeCountByKey.set(key, Math.max(strikeCountByKey.get(key) ?? 0, neg.attemptCount))
+      if (neg.pruned || neg.attemptCount >= ledger.pruneStrikeThreshold) {
+        prunedKeys.add(key)
+        records.push({
+          negativeEdgeKey: key,
+          branchKey: `ledger:${neg.preconditionKey}`,
+          preconditionCapIds: [...neg.preconditionCapIds],
+          targetSurfaceKey: neg.targetSurfaceKey,
+          hypothesisClass: neg.hypothesisClass,
+          reason: neg.reason,
+          failedAttempts: neg.attemptCount,
+          falsifiedByExchangeIds: [...neg.falsifiedByExchangeIds],
+          recordedAtWave: 0,
+        })
+      }
+    }
+  }
+  if (scheduler) {
+    for (const rec of scheduler.exportNegativeEdges()) {
+      prunedKeys.add(rec.negativeEdgeKey)
+      strikeCountByKey.set(rec.negativeEdgeKey, Math.max(strikeCountByKey.get(rec.negativeEdgeKey) ?? 0, rec.failedAttempts))
+    }
+  }
+  return { prunedKeys, strikeCountByKey, records }
+}
+
 /**
- * Propose explicit 2–4 hop hypotheses over the full primitive set: same-origin chains pair
- * primitives on one target; cross-origin chains pair a credential/ID/state handle from one
- * approved origin with a privileged or stateful surface on another. Every hypothesis carries
- * parent evidence and typed `chainHops` inputs for follow-on rounds.
+ * Plan multi-hop causal hypotheses (depth 1..6) using `CapabilityLedger` causal lineage +
+ * `FrontierScheduler` EVI-ranked beam search, enforcing `capability_only` quarantine,
+ * negative-edge dead-end suppression, and bounded <= 2 KB hop-checkpoint briefs.
  */
 export function planChainRound(args: PlanChainRoundArgs): ChainHypothesis[] {
-  const maxHops = Math.max(2, Math.min(Math.floor(args.maxHops ?? 3), 4))
+  const maxHops = Math.max(MIN_CHAIN_DEPTH, Math.min(Math.floor(args.maxHops ?? 4), MAX_CHAIN_DEPTH))
+  const minHops = Math.max(MIN_CHAIN_DEPTH, Math.min(Math.floor(args.minHops ?? (maxHops === 1 ? 1 : 2)), maxHops))
   const limit = resolveLimit(args.limit, 12)
+  const beamWidth = clampBeamWidth(args.beamWidth ?? args.frontierScheduler?.beamWidth)
+  const waveNo = Math.max(1, Math.floor(args.waveNo ?? 1))
+  const maxBriefBytes = Math.min(MAX_CHECKPOINT_BRIEF_BYTES, Math.max(256, Math.floor(args.maxCheckpointBriefBytes ?? MAX_CHECKPOINT_BRIEF_BYTES)))
   const approved = args.approvedOrigins?.length ? new Set(args.approvedOrigins) : null
   const endpoints = args.endpoints ?? []
   const hops = args.hops ?? []
-  const primitives = args.primitives
+  const ledger = args.capabilityLedger ?? null
+  const scheduler = args.frontierScheduler ?? null
+
+  const { prunedKeys, strikeCountByKey, records } = collectNegativeEdgeState(ledger, scheduler)
+  if (scheduler && records.length > 0) scheduler.seedNegativeEdges(records)
+
+  const isPrunedCandidate = (units: readonly CausalPlanUnit[]): { pruned: boolean; attempts: number } => {
+    const tail = units[units.length - 1]!
+    const allCapIds = units.map(u => u.capId)
+    const preCapIds = units.length > 1 ? units.slice(0, -1).map(u => u.capId) : allCapIds
+    const keyPre = computeNegativeEdgeKey(preCapIds, tail.targetSurfaceKey, tail.hypothesisClass)
+    const keyAll = computeNegativeEdgeKey(allCapIds, tail.targetSurfaceKey, tail.hypothesisClass)
+    const pruned =
+      prunedKeys.has(keyPre)
+      || prunedKeys.has(keyAll)
+      || Boolean(ledger?.isBranchPruned(preCapIds, tail.targetSurfaceKey, tail.hypothesisClass))
+      || Boolean(ledger?.isBranchPruned(allCapIds, tail.targetSurfaceKey, tail.hypothesisClass))
+      || Boolean(scheduler?.hasNegativeEdge(preCapIds, tail.targetSurfaceKey, tail.hypothesisClass))
+      || Boolean(scheduler?.hasNegativeEdge(allCapIds, tail.targetSurfaceKey, tail.hypothesisClass))
+    const attempts = Math.max(strikeCountByKey.get(keyPre) ?? 0, strikeCountByKey.get(keyAll) ?? 0)
+    return { pruned, attempts }
+  }
+
+  const filteredPrimitives = args.primitives
     .filter(primitive => !approved || approved.has(primitive.origin))
     .slice()
     .sort((a, b) => PRIMITIVE_RANK[a.kind] - PRIMITIVE_RANK[b.kind]
       || (a.origin < b.origin ? -1 : a.origin > b.origin ? 1 : 0)
       || (a.value < b.value ? -1 : a.value > b.value ? 1 : 0))
 
-  const chains: Array<{ scope: ChainScope; chain: ChainPrimitive[] }> = []
-  const push = (chain: ChainPrimitive[]): void => {
-    chains.push({ scope: new Set(chain.map(primitive => primitive.origin)).size === 1 ? 'same_origin' : 'cross_origin', chain })
+  const fallbackOrigin = args.approvedOrigins?.[0] ?? filteredPrimitives[0]?.origin ?? endpoints[0]?.origin ?? 'https://target.local'
+  const primitiveUnits = filteredPrimitives.map((primitive, idx) => primitiveToUnit(primitive, hops, idx))
+
+  const ledgerNodes = ledger ? ledger.listCapabilities() : []
+  const ledgerUnitsByCapId = new Map<string, CausalPlanUnit>()
+  for (const node of ledgerNodes) {
+    const unit = ledgerNodeToUnit(node, fallbackOrigin)
+    if (approved && /^https?:\/\//i.test(node.serviceOrigin) && !approved.has(node.serviceOrigin)) continue
+    ledgerUnitsByCapId.set(node.capId, unit)
   }
-  for (let i = 0; i < primitives.length; i += 1) {
-    for (let j = i + 1; j < primitives.length; j += 1) {
-      const pair = [primitives[i], primitives[j]]
-      if (pair[0].kind === pair[1].kind || !PAIR_WEIGHTS[keyOf(pair.map(primitive => primitive.kind))]) continue
-      push(pair)
-      if (maxHops < 3) continue
-      for (let k = j + 1; k < primitives.length; k += 1) {
-        const third = primitives[k]
-        const kinds3 = [...pair.map(primitive => primitive.kind), third.kind]
-        if (new Set(kinds3).size === 3 && THREE_HOP_SETS.has(keyOf(kinds3))) {
-          const triple = [...pair, third]
-          push(triple)
-          if (maxHops < 4) continue
-          for (let l = k + 1; l < primitives.length; l += 1) {
-            const fourth = primitives[l]
-            const kinds4 = [...kinds3, fourth.kind]
-            if (new Set(kinds4).size === 4 && FOUR_HOP_SETS.has(keyOf(kinds4))) {
-              push([...triple, fourth])
-            }
+
+  const candidatesByKey = new Map<string, PlannedCausalCandidate>()
+  const registerCandidate = (units: CausalPlanUnit[], bindings: CausalEdgeBindingKind[], verifiedEdgeCount: number, isLedgerDag: boolean): void => {
+    if (units.length < minHops || units.length > maxHops) return
+    // Quarantine enforcement: a single `capability_only` / always-quarantined node is NEVER
+    // promoted as a standalone 1-hop hypothesis; it must compose into a multi-hop chain.
+    if (units.length === 1 && (units[0]!.quarantined || !units[0]!.terminalEligible)) return
+    const check = isPrunedCandidate(units)
+    if (check.pruned) return
+    const branch = buildCausalBranch({
+      units,
+      bindings,
+      waveNo,
+      verifiedEdgeCount,
+      attemptsOnBranch: check.attempts,
+    })
+    const evi = computeBranchEvi(branch)
+    const prev = candidatesByKey.get(branch.branchKey)
+    if (!prev || evi > prev.evi) {
+      candidatesByKey.set(branch.branchKey, { branch, units, bindings, evi, isLedgerDag })
+    }
+  }
+
+  // 1. Walk explicit CapabilityLedger causal DAG edges (verified depth 1..6 lineage).
+  const ledgerEdges: CausalEdge[] = ledger ? ledger.listCausalEdges() : []
+  if (ledgerUnitsByCapId.size > 0) {
+    const outgoing = new Map<string, CausalEdge[]>()
+    const hasIncoming = new Set<string>()
+    for (const edge of ledgerEdges) {
+      if (edge.postconditionCapId) hasIncoming.add(edge.postconditionCapId)
+      for (const preId of edge.preconditionCapIds) {
+        const bucket = outgoing.get(preId) ?? []
+        bucket.push(edge)
+        outgoing.set(preId, bucket)
+      }
+    }
+    const allLedgerUnits = [...ledgerUnitsByCapId.values()]
+    const rootUnits = allLedgerUnits.filter(u => !hasIncoming.has(u.capId))
+    const startUnits = rootUnits.length > 0 ? rootUnits : allLedgerUnits
+
+    const walkDag = (path: CausalPlanUnit[], bindings: CausalEdgeBindingKind[], verifiedEdges: number): void => {
+      registerCandidate(path, bindings, verifiedEdges, true)
+      if (path.length >= maxHops) return
+      const tip = path[path.length - 1]!
+      const visited = new Set(path.map(u => u.capId))
+      const nextEdges = outgoing.get(tip.capId) ?? []
+      let extendedViaEdge = false
+      for (const edge of nextEdges) {
+        if (!edge.postconditionCapId || visited.has(edge.postconditionCapId)) continue
+        const nextUnit = ledgerUnitsByCapId.get(edge.postconditionCapId)
+        if (!nextUnit) continue
+        extendedViaEdge = true
+        walkDag([...path, nextUnit], [...bindings, edge.edgeBindingKind], verifiedEdges + 1)
+      }
+      // If a verified DAG path reaches a frontier tip, allow causal extension onto compatible
+      // unvisited ledger targets (e.g., synthesized policy_asymmetry / state_handle seeds).
+      if (!extendedViaEdge && path.length < maxHops) {
+        const extensions: PlannedCausalCandidate[] = []
+        for (const nextUnit of allLedgerUnits) {
+          if (visited.has(nextUnit.capId)) continue
+          if (nextUnit.capKind === tip.capKind && nextUnit.surface === tip.surface) continue
+          const nextUnits = [...path, nextUnit]
+          const check = isPrunedCandidate(nextUnits)
+          if (check.pruned) continue
+          const nextBindings = [...bindings, inferCausalBinding(tip, nextUnit)]
+          const branch = buildCausalBranch({
+            units: nextUnits,
+            bindings: nextBindings,
+            waveNo,
+            verifiedEdgeCount: verifiedEdges,
+            attemptsOnBranch: check.attempts,
+          })
+          extensions.push({ branch, units: nextUnits, bindings: nextBindings, evi: computeBranchEvi(branch), isLedgerDag: true })
+        }
+        extensions.sort((a, b) => b.evi - a.evi || a.branch.branchKey.localeCompare(b.branch.branchKey))
+        for (const ext of extensions.slice(0, Math.min(4, beamWidth))) {
+          registerCandidate(ext.units, ext.bindings, verifiedEdges, true)
+        }
+      }
+    }
+
+    for (const root of startUnits) {
+      walkDag([root], [], 0)
+    }
+  }
+
+  // 2. Beam-search causal composition across primitives + ledger capability nodes (depth up to maxHops <= 6).
+  //    Replaces v7's flat lookup tables with bounded EVI beam expansion via `rankAndPruneBeam`.
+  const allUnits: CausalPlanUnit[] = [...primitiveUnits]
+  const existingCapIds = new Set(allUnits.map(u => u.capId))
+  for (const unit of ledgerUnitsByCapId.values()) {
+    if (!existingCapIds.has(unit.capId)) {
+      existingCapIds.add(unit.capId)
+      allUnits.push(unit)
+    }
+  }
+
+  if (allUnits.length > 0) {
+    // Seed depth-1 frontier states (even quarantined nodes may serve as Hop-1 prefixes for depth >= 2).
+    let beamPaths: Array<{ units: CausalPlanUnit[]; bindings: CausalEdgeBindingKind[]; lastIdx: number }> = allUnits.map((unit, idx) => ({
+      units: [unit],
+      bindings: [],
+      lastIdx: idx,
+    }))
+    if (minHops === 1) {
+      for (const seed of beamPaths) registerCandidate(seed.units, [], 0, false)
+    }
+
+    for (let depth = 2; depth <= maxHops; depth += 1) {
+      const nextByKey = new Map<string, { branch: FrontierBranch; units: CausalPlanUnit[]; bindings: CausalEdgeBindingKind[]; lastIdx: number }>()
+      for (const prefix of beamPaths) {
+        const usedKinds = new Set(prefix.units.map(u => u.primitive.kind))
+        const usedCaps = new Set(prefix.units.map(u => u.capId))
+        for (let idx = prefix.lastIdx + 1; idx < allUnits.length; idx += 1) {
+          const next = allUnits[idx]!
+          if (usedCaps.has(next.capId)) continue
+          // Avoid degenerate same-kind primitive pairs unless backed by distinct ledger capabilities on distinct surfaces.
+          const isDistinctLedgerSurface = next.unitId.startsWith('ledger:') && prefix.units.every(u => u.surface !== next.surface)
+          if (usedKinds.has(next.primitive.kind) && !isDistinctLedgerSurface) continue
+          const nextUnits = [...prefix.units, next]
+          const check = isPrunedCandidate(nextUnits)
+          if (check.pruned) continue
+          const nextBindings = [...prefix.bindings, inferCausalBinding(prefix.units[prefix.units.length - 1]!, next)]
+          const branch = buildCausalBranch({
+            units: nextUnits,
+            bindings: nextBindings,
+            waveNo,
+            verifiedEdgeCount: 0,
+            attemptsOnBranch: check.attempts,
+          })
+          if (!nextByKey.has(branch.branchKey)) {
+            nextByKey.set(branch.branchKey, { branch, units: nextUnits, bindings: nextBindings, lastIdx: idx })
           }
         }
       }
+      if (nextByKey.size === 0) break
+
+      // Bound each depth's active frontier through FrontierScheduler's exact EVI beam ranker.
+      const depthBeamLimit = Math.max(beamWidth, Math.min(beamWidth * 2, limit * 2))
+      const ranked = rankAndPruneBeam(
+        [...nextByKey.values()].map(item => item.branch),
+        depthBeamLimit,
+        prunedKeys,
+      )
+      // Also preserve top branches across distinct depths/scopes before capping beam expansion.
+      const keptPaths: Array<{ units: CausalPlanUnit[]; bindings: CausalEdgeBindingKind[]; lastIdx: number }> = []
+      for (const scored of ranked) {
+        const item = nextByKey.get(scored.branch.branchKey)
+        if (!item) continue
+        registerCandidate(item.units, item.bindings, 0, false)
+        keptPaths.push({ units: item.units, bindings: item.bindings, lastIdx: item.lastIdx })
+      }
+      beamPaths = keptPaths
+    }
+  }
+
+  // 3. Final EVI-ranked selection with depth diversity (preserving top deep chains & 2-hop baselines).
+  const allCandidates = [...candidatesByKey.values()].sort((a, b) =>
+    Number(b.isLedgerDag) - Number(a.isLedgerDag)
+    || b.evi - a.evi
+    || b.units.length - a.units.length
+    || Number(new Set(a.units.map(u => u.primitive.origin)).size > 1) - Number(new Set(b.units.map(u => u.primitive.origin)).size > 1)
+    || a.branch.branchKey.localeCompare(b.branch.branchKey))
+
+  const selected: PlannedCausalCandidate[] = []
+  const selectedKeys = new Set<string>()
+  const pick = (candidate: PlannedCausalCandidate): void => {
+    if (selected.length >= limit || selectedKeys.has(candidate.branch.branchKey)) return
+    selectedKeys.add(candidate.branch.branchKey)
+    selected.push(candidate)
+  }
+
+  // Reserve at least one top candidate per achievable depth (deepest first) so deep chains
+  // (3..6 hops) are never starved out of the top-N frontier slice by shallow 2-hop pairs.
+  for (let depth = maxHops; depth >= minHops; depth -= 1) {
+    const topForDepth = allCandidates.find(c => c.units.length === depth)
+    if (topForDepth) pick(topForDepth)
+  }
+  for (const candidate of allCandidates) {
+    if (selected.length >= limit) break
+    pick(candidate)
+  }
+
+  if (scheduler) {
+    for (const candidate of selected) {
+      scheduler.admitBranch(candidate.branch)
     }
   }
 
   const counters = new Map<string, number>()
-  return chains
-    .map(chain => buildHypothesis(chain.scope, chain.chain, endpoints, hops, 0))
-    .sort((a, b) => b.confidence - a.confidence
+  return selected
+    .map(candidate => buildHypothesisFromCausalCandidate(candidate, endpoints, hops, maxBriefBytes, 0))
+    .sort((a, b) =>
+      (b.evi ?? 0) - (a.evi ?? 0)
+      || b.confidence - a.confidence
       || b.hops - a.hops
       || Number(a.scope === 'cross_origin') - Number(b.scope === 'cross_origin')
       || (a.title < b.title ? -1 : a.title > b.title ? 1 : 0))
@@ -1293,6 +1840,9 @@ export interface DispatchStepInput {
   priority?: number
   /** Optional typed multi-round hop artifacts feeding follow-on briefs without prompt soup. */
   chainHops?: readonly ChainHop[]
+  /** Optional v8 bounded (<= 2 KB) pre-hydrated hop-checkpoint brief for depth >= 2 assignments. */
+  checkpointBrief?: HopCheckpointBrief
+  checkpointJson?: string
 }
 
 export interface DispatchOptions {
@@ -1314,6 +1864,8 @@ export interface NormalizedDispatchStep {
   skills: string[]
   priority: number
   chainHops?: ChainHop[]
+  checkpointBrief?: HopCheckpointBrief
+  checkpointJson?: string
 }
 
 export type DispatchRejectionCode =
@@ -1416,6 +1968,8 @@ export function dispatchInvestigations(steps: readonly DispatchStepInput[], opti
             })),
           }
         : {}),
+      ...(step.checkpointBrief ? { checkpointBrief: step.checkpointBrief } : {}),
+      ...(step.checkpointJson ? { checkpointJson: step.checkpointJson } : {}),
     })
   })
 
@@ -1519,6 +2073,8 @@ export function createGraphCoordinator(options: GraphCoordinatorOptions): GraphC
       hops: args?.hops ?? chainHops(),
       endpoints: args?.endpoints ?? deps.listEndpoints(),
       approvedOrigins: args?.approvedOrigins ?? approvedOrigins(),
+      capabilityLedger: args?.capabilityLedger !== undefined ? args.capabilityLedger : (deps.capabilityLedger?.() ?? null),
+      frontierScheduler: args?.frontierScheduler !== undefined ? args.frontierScheduler : (deps.frontierScheduler?.() ?? null),
     }),
     decideNext,
   }
