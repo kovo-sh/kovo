@@ -154,6 +154,15 @@ class Exchange:
         return str(value) if value is not None else None
 
     @property
+    def consumed_capability_id(self) -> Optional[str]:
+        value = self.raw.get("consumedCapabilityId")
+        return str(value) if value is not None else None
+
+    @property
+    def derived_from_capability_ids(self) -> list[str]:
+        return list(self.raw.get("derivedFromCapabilityIds") or [])
+
+    @property
     def executed_sentinels(self) -> list[str]:
         return list(self.raw.get("executedSentinels") or [])
 
@@ -302,6 +311,21 @@ def _extract_inline_options(spec: Any) -> dict[str, Any]:
         out["follow_redirects"] = bool(spec["follow_redirects"])
     elif spec.get("followRedirects") is not None:
         out["follow_redirects"] = bool(spec["followRedirects"])
+    if spec.get("capability") is not None:
+        out["capability"] = spec["capability"]
+    for py_key, js_key in (
+        ("capability_target", "capabilityTarget"),
+        ("capability_header_name", "capabilityHeaderName"),
+        ("capability_cookie_name", "capabilityCookieName"),
+        ("capability_query_param", "capabilityQueryParam"),
+        ("entity_id", "entityId"),
+        ("correlation_ids", "correlationIds"),
+        ("evidence_role", "evidenceRole"),
+        ("replay_attempt", "replayAttempt"),
+    ):
+        val = spec.get(py_key, spec.get(js_key))
+        if val is not None:
+            out[py_key] = val
     return out
 
 
@@ -540,7 +564,7 @@ class VerifyContext:
         self._default_origin = self.target_origins[0] if self.target_origins else None
 
     # -- network ---------------------------------------------------------
-    def http(self, target: Any, **options: Any) -> Exchange:
+    def _build_http_args(self, target: Any, options: dict[str, Any]) -> tuple[dict[str, Any], float]:
         origin, path = _split_target(target, self._default_origin)
         merged = {**_extract_inline_options(target), **options}
         body, headers = _normalize_body_and_headers(merged.get("body"), merged.get("headers"))
@@ -563,8 +587,203 @@ class VerifyContext:
             args["sessionGroupRole"] = merged["role"]
         if merged.get("follow_redirects") is not None:
             args["followRedirects"] = bool(merged["follow_redirects"])
+        cap = merged.get("capability")
+        if cap is not None:
+            if isinstance(cap, dict):
+                cap_norm = dict(cap)
+                if "header_name" in cap_norm and "headerName" not in cap_norm:
+                    cap_norm["headerName"] = cap_norm.pop("header_name")
+                if "cookie_name" in cap_norm and "cookieName" not in cap_norm:
+                    cap_norm["cookieName"] = cap_norm.pop("cookie_name")
+                if "query_param" in cap_norm and "queryParam" not in cap_norm:
+                    cap_norm["queryParam"] = cap_norm.pop("query_param")
+                args["capability"] = cap_norm
+            else:
+                args["capability"] = cap
+        for py_key, rpc_key in (
+            ("capability_target", "capabilityTarget"),
+            ("capability_header_name", "capabilityHeaderName"),
+            ("capability_cookie_name", "capabilityCookieName"),
+            ("capability_query_param", "capabilityQueryParam"),
+            ("entity_id", "entityId"),
+            ("correlation_ids", "correlationIds"),
+            ("evidence_role", "evidenceRole"),
+            ("replay_attempt", "replayAttempt"),
+        ):
+            val = merged.get(py_key, merged.get(rpc_key))
+            if val is not None:
+                args[rpc_key] = val
         timeout = float(merged.get("timeout", 60.0))
+        return args, timeout
+
+    def http(self, target: Any, **options: Any) -> Exchange:
+        args, timeout = self._build_http_args(target, options)
         return Exchange(_rpc("http", args, timeout))
+
+    def http_send(self, target: Any, **options: Any) -> Exchange:
+        args, timeout = self._build_http_args(target, options)
+        return Exchange(_rpc("http.send", args, timeout))
+
+    def httpSend(self, target: Any, **options: Any) -> Exchange:
+        return self.http_send(target, **options)
+
+    def request(self, target: Any, **options: Any) -> Exchange:
+        return self.http_send(target, **options)
+
+    def seal_capability(
+        self,
+        exchange_or_id: Any,
+        slot: str,
+        *,
+        hop_receipt_id: Optional[str] = None,
+        hop_id: Optional[str] = None,
+        json_path: Optional[str] = None,
+        header: Optional[str] = None,
+        cookie: Optional[str] = None,
+        regex: Optional[str] = None,
+        value: Optional[str] = None,
+        kind: Optional[str] = None,
+        ttl_ms: Optional[int] = None,
+        default_header_name: Optional[str] = None,
+        default_cookie_name: Optional[str] = None,
+        allowed_origins: Optional[list[str]] = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        exchange_id = exchange_or_id.exchange_id if isinstance(exchange_or_id, Exchange) else str(exchange_or_id)
+        args: dict[str, Any] = {"exchangeId": exchange_id, "slot": slot}
+        hop_r = hop_receipt_id or kwargs.get("hopReceiptId")
+        if hop_r:
+            args["hopReceiptId"] = hop_r
+        hop_i = hop_id or kwargs.get("hopId")
+        if hop_i:
+            args["hopId"] = hop_i
+        jp = json_path or kwargs.get("jsonPath")
+        if jp:
+            args["jsonPath"] = jp
+        if header:
+            args["header"] = header
+        if cookie:
+            args["cookie"] = cookie
+        if regex:
+            args["regex"] = regex
+        if value is not None:
+            args["value"] = value
+        if kind:
+            args["kind"] = kind
+        ttl = ttl_ms if ttl_ms is not None else kwargs.get("ttlMs")
+        if ttl is not None:
+            args["ttlMs"] = ttl
+        dhn = default_header_name or kwargs.get("defaultHeaderName")
+        if dhn:
+            args["defaultHeaderName"] = dhn
+        dcn = default_cookie_name or kwargs.get("defaultCookieName")
+        if dcn:
+            args["defaultCookieName"] = dcn
+        ao = allowed_origins or kwargs.get("allowedOrigins")
+        if ao:
+            args["allowedOrigins"] = list(ao)
+        return _AwaitableDict(_rpc("capability.seal", args, 30.0))
+
+    def hmac_sign(
+        self,
+        secret_handle: str,
+        payload: str,
+        alg: str = "sha256",
+        encoding: str = "hex",
+    ) -> dict[str, Any]:
+        return _AwaitableDict(_rpc("crypto.hmacSign", {
+            "secretHandle": secret_handle,
+            "payload": payload,
+            "alg": alg,
+            "encoding": encoding,
+        }, 30.0))
+
+    def jwt_sign(
+        self,
+        secret_handle: str,
+        claims: dict[str, Any],
+        alg: str = "HS256",
+        *,
+        header: Optional[dict[str, Any]] = None,
+        hop_receipt_id: Optional[str] = None,
+        slot: Optional[str] = None,
+        ttl_ms: Optional[int] = None,
+        allowed_origins: Optional[list[str]] = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        args: dict[str, Any] = {
+            "secretHandle": secret_handle,
+            "claims": dict(claims),
+            "alg": alg,
+        }
+        if header is not None:
+            args["header"] = dict(header)
+        hop_r = hop_receipt_id or kwargs.get("hopReceiptId")
+        if hop_r:
+            args["hopReceiptId"] = hop_r
+        if slot:
+            args["slot"] = slot
+        ttl = ttl_ms if ttl_ms is not None else kwargs.get("ttlMs")
+        if ttl is not None:
+            args["ttlMs"] = ttl
+        ao = allowed_origins or kwargs.get("allowedOrigins")
+        if ao:
+            args["allowedOrigins"] = list(ao)
+        return _AwaitableDict(_rpc("crypto.jwtSign", args, 30.0))
+
+    def await_async(
+        self,
+        poll_request: Any,
+        match_predicate: Optional[dict[str, Any]] = None,
+        *,
+        profile: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        interval_ms: Optional[int] = None,
+        max_attempts: Optional[int] = None,
+        trigger_exchange_id: Optional[str] = None,
+        t_trigger_ms: Optional[int] = None,
+        correlation_id: Optional[str] = None,
+        correlation_ids: Optional[list[str]] = None,
+        entity_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        poll_args, _ = self._build_http_args(poll_request, {})
+        args: dict[str, Any] = {"pollRequest": poll_args}
+        mp = match_predicate if match_predicate is not None else kwargs.get("matchPredicate")
+        if mp is not None:
+            args["matchPredicate"] = dict(mp)
+        if profile:
+            args["profile"] = profile
+        t_ms = timeout_ms if timeout_ms is not None else kwargs.get("timeoutMs")
+        if t_ms is not None:
+            args["timeoutMs"] = t_ms
+        i_ms = interval_ms if interval_ms is not None else kwargs.get("intervalMs")
+        if i_ms is not None:
+            args["intervalMs"] = i_ms
+        m_att = max_attempts if max_attempts is not None else kwargs.get("maxAttempts")
+        if m_att is not None:
+            args["maxAttempts"] = m_att
+        trig = trigger_exchange_id or kwargs.get("triggerExchangeId")
+        if trig:
+            args["triggerExchangeId"] = trig.exchange_id if isinstance(trig, Exchange) else str(trig)
+        tt = t_trigger_ms if t_trigger_ms is not None else kwargs.get("tTriggerMs")
+        if tt is not None:
+            args["tTriggerMs"] = tt
+        cid = correlation_id or kwargs.get("correlationId")
+        if cid:
+            args["correlationId"] = cid
+        cids = correlation_ids or kwargs.get("correlationIds")
+        if cids:
+            args["correlationIds"] = list(cids)
+        eid = entity_id or kwargs.get("entityId")
+        if eid:
+            args["entityId"] = eid
+        rpc_timeout = max((float(t_ms) / 1000.0 if t_ms else 30.0) + 10.0, 15.0)
+        return _AwaitableDict(_rpc("async.awaitResult", args, rpc_timeout))
+
+    def prove_composite(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        payload = receipt if isinstance(receipt, dict) and "receipt" in receipt else {"receipt": receipt}
+        return _AwaitableDict(_rpc("composite.verify", payload, 30.0))
 
     def http2(self, target: Any, **options: Any) -> Exchange:
         origin, path = _split_target(target, self._default_origin)
@@ -1344,6 +1563,21 @@ class VerifyContext:
 
     def proveRaceBurst(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         return self.prove_race_burst(*args, **kwargs)
+
+    def sealCapability(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self.seal_capability(*args, **kwargs)
+
+    def hmacSign(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self.hmac_sign(*args, **kwargs)
+
+    def jwtSign(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self.jwt_sign(*args, **kwargs)
+
+    def awaitAsync(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self.await_async(*args, **kwargs)
+
+    def proveComposite(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self.prove_composite(*args, **kwargs)
 
     def result(self, title: str, severity: str = "high", description: Optional[str] = None) -> ProofResult:
         if not title or not title.strip():
