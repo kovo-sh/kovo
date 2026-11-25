@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { stripTypeScriptTypes } from 'node:module'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 import { createKovoLocalServer } from '../scripts/serve.ts'
 import {
   createRunWithAsyncDiscovery,
@@ -20,7 +22,7 @@ import type { Grant } from '../src/server/broker.ts'
 import { GlobalKillSwitch, globalKillSwitch, KillSwitchTrippedError } from '../src/server/kill-switch.ts'
 import { PersonaAuthManager, personaPoolKey, PersonaSessionPool } from '../src/server/persona-auth.ts'
 import type { MintedPersonaSession } from '../src/server/persona-vault.ts'
-import { Store } from '../src/server/store.ts'
+import { Store, store } from '../src/server/store.ts'
 import type { RunDiscoverySubdomainsResult } from '../src/server/subdomain-discovery.ts'
 
 const REPO_ROOT = resolve(import.meta.dirname, '..')
@@ -604,4 +606,116 @@ test('Scope Review consent.tsx: pre-selects live subdomains (Top 30 ranked), kee
     { includeSubdomainOrigins: [] },
   )
   assert.deepEqual(strictPicked, ['seed'])
+})
+
+test('store() shares globalThis[Symbol.for("kovo.storeSingleton")] across dual module loads and close() clears it', async t => {
+  const prevDataDir = process.env.KOVO_DATA_DIR
+  const root = mkdtempSync(join(tmpdir(), 'kovo-store-singleton-'))
+  const dirA = join(root, 'a')
+  const dirB = join(root, 'b')
+  const opened: Store[] = []
+  t.after(() => {
+    for (const s of opened) {
+      try { s.close() } catch { /* best-effort */ }
+    }
+    if (prevDataDir === undefined) delete process.env.KOVO_DATA_DIR
+    else process.env.KOVO_DATA_DIR = prevDataDir
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  process.env.KOVO_DATA_DIR = dirA
+  const s1 = store()
+  opened.push(s1)
+
+  // Simulate a second bundled copy of store.ts (e.g. build/server/server.js alongside raw ESM)
+  const mod2 = await import(`../src/server/store.ts?dual=${Date.now()}`) as { store: () => Store }
+  const s2 = mod2.store()
+  assert.strictEqual(s2, s1, 'dual module imports pointing at the same KOVO_DATA_DIR must share the exact Store instance')
+
+  const registry = (globalThis as Record<symbol, Map<string, Store> | undefined>)[Symbol.for('kovo.storeSingleton')]
+  assert.ok(registry instanceof Map, 'globalThis[Symbol.for("kovo.storeSingleton")] must hold a Map keyed by resolved directory')
+  assert.strictEqual(registry.get(resolve(dirA)), s1)
+
+  // Keying by resolved directory isolates distinct KOVO_DATA_DIR values
+  process.env.KOVO_DATA_DIR = dirB
+  const sB = store()
+  opened.push(sB)
+  assert.notStrictEqual(sB, s1)
+  assert.strictEqual(registry.get(resolve(dirB)), sB)
+
+  // close() removes only the closed store's directory entry so reopening succeeds cleanly
+  s1.close()
+  assert.equal(registry.has(resolve(dirA)), false)
+  assert.strictEqual(registry.get(resolve(dirB)), sB)
+
+  process.env.KOVO_DATA_DIR = dirA
+  const reopened = store()
+  opened.push(reopened)
+  assert.notStrictEqual(reopened, s1)
+  assert.strictEqual(registry.get(resolve(dirA)), reopened)
+})
+
+test('booting scripts/serve.ts against built build/server/server.js succeeds without process-lock self-collision', async t => {
+  const builtEntry = join(REPO_ROOT, 'build', 'server', 'server.js')
+  if (!existsSync(builtEntry)) {
+    t.skip('build/server/server.js not found; run npm run build to execute live bundle boot check')
+    return
+  }
+
+  const dataDir = mkdtempSync(join(tmpdir(), 'kovo-serve-boot-'))
+  const port = await availablePort()
+  let output = ''
+  const child = spawn(process.execPath, ['scripts/serve.ts'], {
+    cwd: REPO_ROOT,
+    env: {
+      ...process.env,
+      KOVO_DATA_DIR: dataDir,
+      KOVO_OFFLINE: '1',
+      KOVO_PUBLIC_ORIGIN: '',
+      PORT: String(port),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  child.stdout.on('data', chunk => { output += String(chunk) })
+  child.stderr.on('data', chunk => { output += String(chunk) })
+
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = once(child, 'exit')
+      child.kill('SIGTERM')
+      const timedOut = await Promise.race([
+        exited.then(() => false),
+        delay(3_000).then(() => true),
+      ])
+      if (timedOut && child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL')
+        await once(child, 'exit')
+      }
+    }
+    rmSync(dataDir, { recursive: true, force: true })
+  })
+
+  const healthUrl = `http://127.0.0.1:${port}/health`
+  let healthy = false
+  for (let attempt = 0; attempt < 130; attempt += 1) {
+    if (child.exitCode !== null) break
+    try {
+      const res = await fetch(healthUrl, { signal: AbortSignal.timeout(300) })
+      if (res.ok) {
+        healthy = true
+        break
+      }
+    } catch {
+      // Server still starting up.
+    }
+    await delay(70)
+  }
+
+  assert.equal(
+    output.includes('Another Kovo Hunter server is using this data directory'),
+    false,
+    `serve.ts hit process-lock self-collision:\n${output}`,
+  )
+  assert.equal(healthy, true, `serve.ts failed to reach /health (exitCode=${String(child.exitCode)}):\n${output}`)
+  assert.equal(child.exitCode, null, `serve.ts exited prematurely:\n${output}`)
 })
