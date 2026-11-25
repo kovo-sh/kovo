@@ -93,8 +93,10 @@ import { matchesApprovedEndpointPattern, normalizeApprovalPathPattern } from './
 import { computeFindingFingerprint, isOriginWideCwe, normalizeEndpointTemplate } from './dedupe.ts'
 import type { ApprovalDecidedBy, ApprovalRiskLevel } from './approval-judge.ts'
 import { listProjectPersonas } from './persona-vault.ts'
-import { isSafeMetadataPath, redact, redactHeaders, redactJsonValue, secretMatchKinds } from './redact.ts'
+import { isSafeMetadataPath, redact, redactHeaders, redactJsonValue, redactZdrJsonValue, secretMatchKinds } from './redact.ts'
 import type { NamedSecret, SecretMatch } from './redact.ts'
+import { purgeExpiredArtifacts } from './artifact-ttl.ts'
+import type { ArtifactTtlPolicy, ArtifactTtlPurgeResult } from './artifact-ttl.ts'
 import { responseCapture, restrictAccessVerification } from './report-evidence.ts'
 import { responseReview } from './response-checks.ts'
 import { availableReviewChecks } from './review-plan.ts'
@@ -1426,8 +1428,39 @@ export class Store {
     ensureColumn('replay_specs', 'proof_artifact_id', 'TEXT')
     ensureColumn('replay_specs', 'proof_receipt', 'TEXT')
     ensureColumn('project_assets', 'include_subdomains', 'INTEGER NOT NULL DEFAULT 0')
+    // v7 M4: per-tenant isolation & append-only tenant audit log (additive, safe on legacy DBs).
+    ensureColumn('projects', 'tenant_id', "TEXT NOT NULL DEFAULT 'default'")
+    ensureColumn('runs', 'tenant_id', "TEXT NOT NULL DEFAULT 'default'")
     this.client.exec(`
       CREATE INDEX IF NOT EXISTS replay_specs_proof ON replay_specs (run_id, proof_kind);
+      CREATE INDEX IF NOT EXISTS projects_tenant ON projects (tenant_id);
+      CREATE INDEX IF NOT EXISTS runs_tenant ON runs (tenant_id);
+      CREATE TABLE IF NOT EXISTS tenant_audit_log (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL UNIQUE,
+        tenant_id TEXT NOT NULL,
+        run_id TEXT,
+        actor TEXT NOT NULL,
+        action TEXT NOT NULL,
+        resource_kind TEXT NOT NULL,
+        resource_id TEXT,
+        outcome TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        prev_hash TEXT NOT NULL,
+        entry_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS tenant_audit_log_tenant ON tenant_audit_log (tenant_id, seq);
+      CREATE TRIGGER IF NOT EXISTS tenant_audit_log_no_update
+        BEFORE UPDATE ON tenant_audit_log
+        BEGIN
+          SELECT RAISE(ABORT, 'invariant.audit_log_append_only');
+        END;
+      CREATE TRIGGER IF NOT EXISTS tenant_audit_log_no_delete
+        BEFORE DELETE ON tenant_audit_log
+        BEGIN
+          SELECT RAISE(ABORT, 'invariant.audit_log_append_only');
+        END;
     `)
     this.client.exec(`PRAGMA user_version = ${STORE_SCHEMA_VERSION}`)
   }
@@ -6861,6 +6894,308 @@ export class Store {
     const clamped = Math.max(1, Math.min(300, Math.round(budget)))
     return this.updateRun(runId, { dynamicStepBudget: clamped })
   }
+
+  // --- v7 M4: Per-tenant isolation, append-only audit log, and TTL purge ---
+
+  private normalizeTenantId(tenantId: string): string {
+    const trimmed = tenantId.trim()
+    if (!trimmed || trimmed.length > 128 || /[\r\n\0]/.test(trimmed)) {
+      throw new Error('Invalid tenantId: must be a non-empty identifier <= 128 characters.')
+    }
+    return trimmed
+  }
+
+  /** Assign a project (and its existing runs) to a tenant namespace. */
+  setProjectTenant(projectId: string, tenantId: string): void {
+    const normalized = this.normalizeTenantId(tenantId)
+    this.project(projectId)
+    this.client.prepare('UPDATE projects SET tenant_id = ? WHERE id = ?').run(normalized, projectId)
+    this.client.prepare('UPDATE runs SET tenant_id = ? WHERE project_id = ?').run(normalized, projectId)
+  }
+
+  getProjectTenant(projectId: string): string {
+    const row = this.client.prepare('SELECT tenant_id FROM projects WHERE id = ?').get(projectId) as
+      | { tenant_id: string }
+      | undefined
+    if (!row) throw new Error(`Unknown project ${projectId}`)
+    return row.tenant_id || 'default'
+  }
+
+  /** Assign a specific run to a tenant namespace. */
+  setRunTenant(runId: string, tenantId: string): void {
+    const normalized = this.normalizeTenantId(tenantId)
+    this.run(runId)
+    this.client.prepare('UPDATE runs SET tenant_id = ? WHERE id = ?').run(normalized, runId)
+  }
+
+  /** Resolve a run's effective tenant (inheriting its parent project tenant if unset). */
+  getRunTenant(runId: string): string {
+    const row = this.client.prepare(
+      'SELECT r.tenant_id AS run_tenant, p.tenant_id AS project_tenant FROM runs r LEFT JOIN projects p ON p.id = r.project_id WHERE r.id = ?',
+    ).get(runId) as { run_tenant: string | null; project_tenant: string | null } | undefined
+    if (!row) throw new Error(`Unknown run ${runId}`)
+    if (row.run_tenant && row.run_tenant !== 'default') return row.run_tenant
+    if (row.project_tenant && row.project_tenant !== 'default') return row.project_tenant
+    return row.run_tenant || 'default'
+  }
+
+  /** Fail closed if `tenantId` does not own `runId`, recording a denied audit entry. */
+  assertRunTenantAccess(runId: string, tenantId: string, actor = 'operator'): void {
+    const requested = this.normalizeTenantId(tenantId)
+    const owner = this.getRunTenant(runId)
+    if (owner !== requested) {
+      this.appendTenantAuditLog({
+        tenantId: requested,
+        runId,
+        actor,
+        action: 'tenant.access_denied',
+        resourceKind: 'run',
+        resourceId: runId,
+        outcome: 'denied',
+        detail: { reason: 'Cross-tenant run access rejected.' },
+      })
+      throw new TenantIsolationError(requested, owner, runId)
+    }
+  }
+
+  /** List projects strictly belonging to `tenantId` (zero cross-tenant visibility). */
+  listProjectsForTenant(tenantId: string): Project[] {
+    const normalized = this.normalizeTenantId(tenantId)
+    const rows = this.client.prepare(
+      'SELECT id FROM projects WHERE tenant_id = ? ORDER BY created_at DESC',
+    ).all(normalized) as Array<{ id: string }>
+    return rows.map(r => this.project(r.id))
+  }
+
+  /** List runs strictly belonging to `tenantId` (zero cross-tenant visibility). */
+  listRunsForTenant(tenantId: string): Run[] {
+    const normalized = this.normalizeTenantId(tenantId)
+    const rows = this.client.prepare(
+      `SELECT r.id FROM runs r
+       LEFT JOIN projects p ON p.id = r.project_id
+       WHERE r.tenant_id = ?
+          OR (r.tenant_id = 'default' AND p.tenant_id = ?)
+       ORDER BY r.created_at DESC`,
+    ).all(normalized, normalized) as Array<{ id: string }>
+    return rows.map(r => this.run(r.id))
+  }
+
+  /** Append a hash-chained, PII/secret-scrubbed entry to the immutable `tenant_audit_log`. */
+  appendTenantAuditLog(input: AppendTenantAuditLogInput): TenantAuditLogEntry {
+    const tenantId = this.normalizeTenantId(input.tenantId)
+    const now = input.now ?? Date.now()
+    const id = randomUUID()
+    const actor = (input.actor || 'system').trim().slice(0, 128)
+    const action = (input.action || 'unknown').trim().slice(0, 128)
+    const resourceKind = (input.resourceKind || 'system').trim().slice(0, 64)
+    const resourceId = input.resourceId ?? null
+    const runId = input.runId ?? null
+    const scrubbedDetail = redactZdrJsonValue(input.detail ?? {}) as Record<string, unknown>
+    const detailJson = JSON.stringify(scrubbedDetail)
+
+    const prevRow = this.client.prepare(
+      'SELECT entry_hash FROM tenant_audit_log WHERE tenant_id = ? ORDER BY seq DESC LIMIT 1',
+    ).get(tenantId) as { entry_hash: string } | undefined
+    const prevHash = prevRow?.entry_hash ?? 'GENESIS'
+    const entryHash = computeTenantAuditHash({
+      id,
+      tenantId,
+      runId,
+      actor,
+      action,
+      resourceKind,
+      resourceId,
+      outcome: input.outcome,
+      detailJson,
+      prevHash,
+      createdAt: now,
+    })
+
+    const inserted = this.client.prepare(
+      `INSERT INTO tenant_audit_log
+       (id, tenant_id, run_id, actor, action, resource_kind, resource_id, outcome, detail, prev_hash, entry_hash, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, tenantId, runId, actor, action, resourceKind, resourceId, input.outcome, detailJson, prevHash, entryHash, now)
+
+    return {
+      seq: Number(inserted.lastInsertRowid),
+      id,
+      tenantId,
+      runId,
+      actor,
+      action,
+      resourceKind,
+      resourceId,
+      outcome: input.outcome,
+      detail: scrubbedDetail,
+      prevHash,
+      entryHash,
+      createdAt: now,
+    }
+  }
+
+  /** Query append-only audit log entries strictly scoped to `tenantId`. */
+  listTenantAuditLog(
+    tenantId: string,
+    options: { runId?: string; limit?: number } = {},
+  ): TenantAuditLogEntry[] {
+    const normalized = this.normalizeTenantId(tenantId)
+    const limit = Math.max(1, Math.min(1000, Math.trunc(options.limit ?? 200)))
+    const rows = options.runId
+      ? (this.client.prepare(
+          'SELECT seq, id, tenant_id, run_id, actor, action, resource_kind, resource_id, outcome, detail, prev_hash, entry_hash, created_at FROM tenant_audit_log WHERE tenant_id = ? AND run_id = ? ORDER BY seq ASC LIMIT ?',
+        ).all(normalized, options.runId, limit) as unknown as RawTenantAuditRow[])
+      : (this.client.prepare(
+          'SELECT seq, id, tenant_id, run_id, actor, action, resource_kind, resource_id, outcome, detail, prev_hash, entry_hash, created_at FROM tenant_audit_log WHERE tenant_id = ? ORDER BY seq ASC LIMIT ?',
+        ).all(normalized, limit) as unknown as RawTenantAuditRow[])
+    return rows.map(row => ({
+      seq: row.seq,
+      id: row.id,
+      tenantId: row.tenant_id,
+      runId: row.run_id,
+      actor: row.actor,
+      action: row.action,
+      resourceKind: row.resource_kind,
+      resourceId: row.resource_id,
+      outcome: row.outcome as TenantAuditOutcome,
+      detail: JSON.parse(row.detail) as Record<string, unknown>,
+      prevHash: row.prev_hash,
+      entryHash: row.entry_hash,
+      createdAt: row.created_at,
+    }))
+  }
+
+  /** Verify the cryptographic hash chain of all audit log entries for `tenantId`. */
+  verifyTenantAuditLogChain(tenantId: string): { valid: boolean; count: number; brokenAtSeq?: number } {
+    const normalized = this.normalizeTenantId(tenantId)
+    const rows = this.client.prepare(
+      'SELECT seq, id, tenant_id, run_id, actor, action, resource_kind, resource_id, outcome, detail, prev_hash, entry_hash, created_at FROM tenant_audit_log WHERE tenant_id = ? ORDER BY seq ASC',
+    ).all(normalized) as unknown as RawTenantAuditRow[]
+    let expectedPrev = 'GENESIS'
+    for (const row of rows) {
+      if (row.prev_hash !== expectedPrev) {
+        return { valid: false, count: rows.length, brokenAtSeq: row.seq }
+      }
+      const recomputed = computeTenantAuditHash({
+        id: row.id,
+        tenantId: row.tenant_id,
+        runId: row.run_id,
+        actor: row.actor,
+        action: row.action,
+        resourceKind: row.resource_kind,
+        resourceId: row.resource_id,
+        outcome: row.outcome,
+        detailJson: row.detail,
+        prevHash: row.prev_hash,
+        createdAt: row.created_at,
+      })
+      if (recomputed !== row.entry_hash) {
+        return { valid: false, count: rows.length, brokenAtSeq: row.seq }
+      }
+      expectedPrev = row.entry_hash
+    }
+    return { valid: true, count: rows.length }
+  }
+
+  /** Deterministically purge expired exchanges, artifacts, and temp files according to `policy`. */
+  purgeArtifactsByTtl(policy: ArtifactTtlPolicy): ArtifactTtlPurgeResult {
+    return purgeExpiredArtifacts(this, policy)
+  }
+}
+
+export type TenantAuditOutcome = 'allowed' | 'denied' | 'tripped' | 'purged' | 'exported'
+
+export interface AppendTenantAuditLogInput {
+  tenantId: string
+  runId?: string | null
+  actor: string
+  action: string
+  resourceKind: string
+  resourceId?: string | null
+  outcome: TenantAuditOutcome
+  detail?: Record<string, unknown>
+  now?: number
+}
+
+export interface TenantAuditLogEntry {
+  seq: number
+  id: string
+  tenantId: string
+  runId: string | null
+  actor: string
+  action: string
+  resourceKind: string
+  resourceId: string | null
+  outcome: TenantAuditOutcome
+  detail: Record<string, unknown>
+  prevHash: string
+  entryHash: string
+  createdAt: number
+}
+
+interface RawTenantAuditRow {
+  seq: number
+  id: string
+  tenant_id: string
+  run_id: string | null
+  actor: string
+  action: string
+  resource_kind: string
+  resource_id: string | null
+  outcome: string
+  detail: string
+  prev_hash: string
+  entry_hash: string
+  created_at: number
+}
+
+export class TenantIsolationError extends Error {
+  readonly code = 'TENANT_ISOLATION_DENIED'
+  readonly requestedTenant: string
+  readonly resourceTenant: string
+  readonly resourceId: string
+
+  constructor(requestedTenant: string, resourceTenant: string, resourceId: string) {
+    super(`Tenant "${requestedTenant}" is not authorized to access resource "${resourceId}".`)
+    this.name = 'TenantIsolationError'
+    this.requestedTenant = requestedTenant
+    this.resourceTenant = resourceTenant
+    this.resourceId = resourceId
+  }
+}
+
+function computeTenantAuditHash(fields: {
+  id: string
+  tenantId: string
+  runId: string | null
+  actor: string
+  action: string
+  resourceKind: string
+  resourceId: string | null
+  outcome: string
+  detailJson: string
+  prevHash: string
+  createdAt: number
+}): string {
+  return createHash('sha256')
+    .update(
+      [
+        'guardian.tenant-audit.v1',
+        fields.prevHash,
+        fields.id,
+        fields.tenantId,
+        fields.runId ?? '',
+        fields.actor,
+        fields.action,
+        fields.resourceKind,
+        fields.resourceId ?? '',
+        fields.outcome,
+        fields.detailJson,
+        String(fields.createdAt),
+      ].join('\0'),
+      'utf8',
+    )
+    .digest('hex')
 }
 
 export type StoreRunDetail = ReturnType<Store['runDetail']>

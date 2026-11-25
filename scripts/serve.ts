@@ -5,13 +5,21 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { join, resolve } from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
+import { globalKillSwitch } from '../src/server/kill-switch.ts'
+import type { GlobalKillSwitch } from '../src/server/kill-switch.ts'
+import { exportRunReceiptBundle } from '../src/server/receipt-export.ts'
+import { TenantIsolationError } from '../src/server/store.ts'
+import type { Store } from '../src/server/store.ts'
 
 const maxBody = 8 * 1024 * 1024
+const maxOpsBody = 64 * 1024
 const bootstrapParam = 'bootstrap'
 const defaultPairingTtlMs = 5 * 60 * 1000
 const maxActivePairingTokens = 10
 const pairingLinkPath = '/_guardian/auth/pairing-link'
 const rotateSessionPath = '/_guardian/auth/rotate-session'
+const killSwitchPath = '/api/ops/kill-switch'
+const receiptExportPathRegex = /^\/api\/runs\/([A-Za-z0-9_-]{1,128})\/receipts\/export$/
 
 export interface LocalApp {
   fetch(request: Request): Promise<Response> | Response
@@ -28,6 +36,10 @@ export interface LocalSessionOptions {
   pairingTtlMs?: number
   /** Optional clock override for deterministic expiration tests. */
   now?: () => number
+  /** v7 M4: kill-switch instance exposed at `/api/ops/kill-switch` (defaults to `globalKillSwitch`). */
+  killSwitch?: GlobalKillSwitch
+  /** v7 M4: optional Store handle for `/api/runs/:runId/receipts/export` and ops audit logging. */
+  store?: Store
 }
 
 export interface GuardianLocalServer {
@@ -135,6 +147,26 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extraHeade
   }).end(JSON.stringify(body))
 }
 
+async function readBoundedJsonBody(req: IncomingMessage, limitBytes = maxOpsBody): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = []
+  let total = 0
+  for await (const chunk of req) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    total += buf.length
+    if (total > limitBytes) {
+      throw new Error('Request body is too large.')
+    }
+    chunks.push(buf)
+  }
+  const raw = Buffer.concat(chunks).toString('utf8').trim()
+  if (!raw) return {}
+  const parsed = JSON.parse(raw) as unknown
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Request body must be a JSON object.')
+  }
+  return parsed as Record<string, unknown>
+}
+
 function rejectSession(res: ServerResponse) {
   res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' }).end(bootstrapNotice())
 }
@@ -173,6 +205,8 @@ export function createGuardianLocalServer(options: LocalSessionOptions): Guardia
   const origins = allowedOrigins(port, options.publicOrigin)
   const pairingTtlMs = options.pairingTtlMs ?? defaultPairingTtlMs
   const now = options.now ?? Date.now
+  const killSwitch = options.killSwitch ?? globalKillSwitch
+  const storeHandle = options.store
   let token = readOrCreateSessionToken(directory)
   const secret = readOrCreateBootstrapSecret(directory)
   let bootstrapConsumed = false
@@ -294,11 +328,102 @@ export function createGuardianLocalServer(options: LocalSessionOptions): Guardia
     const session = isSessionAuthorized(req.headers.cookie, token)
     if (!session) {
       if (req.headers['sec-fetch-site'] === 'cross-site') return reject(res, 403, 'Open Guardian directly.')
-      if (path.pathname.startsWith('/_guardian/auth/')) return sendJson(res, 401, { error: 'Local session required.' })
+      if (
+        path.pathname.startsWith('/_guardian/auth/') ||
+        path.pathname.startsWith('/api/ops/') ||
+        receiptExportPathRegex.test(path.pathname)
+      ) {
+        return sendJson(res, 401, { error: 'Local session required.' })
+      }
       return rejectSession(res)
     }
     if (req.headers['sec-fetch-site'] === 'cross-site') return reject(res, 403, 'Open Guardian directly.')
     if (Number(req.headers['content-length'] ?? 0) > maxBody) return reject(res, 413, 'Request body is too large.')
+
+    // v7 M4 Production Ops: global < 2s kill-switch control endpoint.
+    if (path.pathname === killSwitchPath) {
+      if (method === 'GET' || method === 'HEAD') {
+        const state = killSwitch.status()
+        return sendJson(res, 200, state)
+      }
+      if (method !== 'POST') return reject(res, 405, 'Method not allowed.')
+      if (req.headers.origin !== origin) return reject(res, 403, 'Unexpected origin.')
+      let body: Record<string, unknown>
+      try {
+        body = await readBoundedJsonBody(req)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Invalid JSON body.'
+        return sendJson(res, msg.includes('too large') ? 413 : 400, { error: msg })
+      }
+      const action = typeof body.action === 'string' ? body.action.toLowerCase() : 'trip'
+      if (action !== 'trip' && action !== 'reset') {
+        return sendJson(res, 400, { error: 'action must be "trip" or "reset".' })
+      }
+      const tenantId = typeof body.tenantId === 'string' && body.tenantId.trim() ? body.tenantId.trim() : null
+      const state = action === 'trip'
+        ? killSwitch.trip({
+            reason: typeof body.reason === 'string' && body.reason.trim()
+              ? body.reason.trim()
+              : 'Operator triggered emergency kill switch via HTTP API.',
+            trippedBy: 'operator:http',
+            tenantId,
+            now: now(),
+          })
+        : killSwitch.reset({ resetBy: 'operator:http', now: now() })
+      if (storeHandle) {
+        try {
+          storeHandle.appendTenantAuditLog({
+            tenantId: tenantId ?? 'default',
+            actor: 'operator:http',
+            action: action === 'trip' ? 'ops.kill_switch.tripped' : 'ops.kill_switch.reset',
+            resourceKind: 'kill_switch',
+            outcome: action === 'trip' ? 'tripped' : 'allowed',
+            detail: { reason: state.reason, generation: state.generation, scope: tenantId ? 'tenant' : 'global' },
+            now: now(),
+          })
+        } catch {
+          // Never block kill-switch response if audit log write fails.
+        }
+      }
+      return sendJson(res, 200, state)
+    }
+
+    // v7 M4 Production Ops: portable signed ProofReceipt bundle export.
+    const receiptMatch = receiptExportPathRegex.exec(path.pathname)
+    if (receiptMatch) {
+      if (method !== 'GET') return reject(res, 405, 'Method not allowed.')
+      if (!storeHandle) {
+        return sendJson(res, 503, { error: 'Store is not attached to this local server.' })
+      }
+      const runId = receiptMatch[1]!
+      const zdrParam = path.searchParams.get('zdr')
+      const zdr = zdrParam === '1' || zdrParam === 'true'
+        ? true
+        : zdrParam === '0' || zdrParam === 'false'
+          ? false
+          : undefined
+      const tenantId = path.searchParams.get('tenantId')?.trim() || undefined
+      try {
+        const bundle = exportRunReceiptBundle(storeHandle, runId, {
+          ...(zdr !== undefined ? { zdr } : {}),
+          ...(tenantId ? { tenantId } : {}),
+          actor: 'operator:http',
+          now: now(),
+        })
+        return sendJson(res, 200, bundle, {
+          'content-disposition': `attachment; filename="guardian-receipts-${runId.slice(0, 12)}.json"`,
+        })
+      } catch (err) {
+        if (err instanceof TenantIsolationError) {
+          return sendJson(res, 403, { error: err.message, code: err.code })
+        }
+        const message = err instanceof Error ? err.message : 'Unable to export run receipts.'
+        if (/unknown run|not found/i.test(message)) {
+          return sendJson(res, 404, { error: message })
+        }
+        return sendJson(res, 500, { error: message })
+      }
+    }
 
     // Authenticated local-server session management endpoints (never exposed without an active
     // guardian_local session cookie + exact matching Origin header).

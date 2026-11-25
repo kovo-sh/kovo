@@ -1,3 +1,6 @@
+import { createHmac, sign as cryptoSign, timingSafeEqual, verify as cryptoVerify } from 'node:crypto'
+import type { KeyLike } from 'node:crypto'
+
 /**
  * v6 Layer-1 origin scope + environment contract.
  *
@@ -62,6 +65,7 @@ export type ScopeDecisionCode =
   | 'readonly_environment'
   | 'staging_denylist'
   | 'staging_untagged_mutation'
+  | 'invalid_scope_manifest'
 
 export interface ScopeDecision {
   allowed: boolean
@@ -436,4 +440,186 @@ export function evaluateBrowserScopeRequest(policy: ScopePolicy, request: Omit<S
 /** Default mode when an operator has not chosen one: disposable labs stay open, live stays read-only. */
 export function defaultEnvironmentMode(projectEnvironment: 'public' | 'local-lab' | string): EnvironmentMode {
   return projectEnvironment === 'local-lab' ? 'ephemeral_lab' : 'prod_readonly'
+}
+
+// ============================================================================
+// v7 M4: Cryptographically Signed Scope Manifests (HMAC-SHA256 & Ed25519)
+// ============================================================================
+
+export type ScopeManifestAlgorithm = 'hmac-sha256' | 'ed25519'
+
+export interface ScopeManifestPayload {
+  version: 1
+  manifestId: string
+  tenantId: string
+  issuedAt: string
+  expiresAt: string
+  policy: ScopePolicy
+}
+
+export interface SignedScopeManifest {
+  payload: ScopeManifestPayload
+  algorithm: ScopeManifestAlgorithm
+  keyId?: string
+  signature: string
+}
+
+export type ScopeManifestSignOptions =
+  | { algorithm: 'hmac-sha256'; secret: string | Buffer; keyId?: string }
+  | { algorithm: 'ed25519'; privateKey: KeyLike | string | Buffer; keyId?: string }
+
+export interface ScopeManifestVerifyOptions {
+  algorithm?: ScopeManifestAlgorithm
+  secret?: string | Buffer
+  publicKey?: KeyLike | string | Buffer
+  now?: number
+  expectedTenantId?: string
+}
+
+export type ScopeManifestVerifyFailureCode =
+  | 'malformed'
+  | 'algorithm_mismatch'
+  | 'missing_key'
+  | 'invalid_signature'
+  | 'expired'
+  | 'not_yet_valid'
+  | 'tenant_mismatch'
+
+export type ScopeManifestVerification =
+  | { valid: true; payload: ScopeManifestPayload }
+  | { valid: false; code: ScopeManifestVerifyFailureCode; reason: string }
+
+/** Deterministic canonical JSON serialization (recursively sorted keys, undefined omitted). */
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) {
+    return '[' + value.map(item => (item === undefined ? 'null' : canonicalJson(item))).join(',') + ']'
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  return '{' + entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',') + '}'
+}
+
+function manifestSigningBytes(payload: ScopeManifestPayload): Buffer {
+  return Buffer.from(`guardian.scope-manifest.v1\n${canonicalJson(payload)}`, 'utf8')
+}
+
+export function signScopeManifest(
+  payload: ScopeManifestPayload,
+  options: ScopeManifestSignOptions,
+): SignedScopeManifest {
+  const bytes = manifestSigningBytes(payload)
+  let signature: string
+  if (options.algorithm === 'hmac-sha256') {
+    signature = createHmac('sha256', options.secret).update(bytes).digest('base64url')
+  } else {
+    signature = cryptoSign(null, bytes, options.privateKey).toString('base64url')
+  }
+  return {
+    payload,
+    algorithm: options.algorithm,
+    ...(options.keyId ? { keyId: options.keyId } : {}),
+    signature,
+  }
+}
+
+export function verifyScopeManifest(
+  manifest: unknown,
+  options: ScopeManifestVerifyOptions,
+): ScopeManifestVerification {
+  if (!manifest || typeof manifest !== 'object') {
+    return { valid: false, code: 'malformed', reason: 'Scope manifest must be a JSON object.' }
+  }
+  const candidate = manifest as Partial<SignedScopeManifest>
+  const payload = candidate.payload
+  if (
+    !payload ||
+    typeof payload !== 'object' ||
+    payload.version !== 1 ||
+    typeof payload.manifestId !== 'string' || !payload.manifestId.trim() ||
+    typeof payload.tenantId !== 'string' || !payload.tenantId.trim() ||
+    typeof payload.issuedAt !== 'string' ||
+    typeof payload.expiresAt !== 'string' ||
+    !payload.policy ||
+    typeof payload.policy !== 'object' ||
+    !Array.isArray(payload.policy.targetOrigins) ||
+    !environmentModes.includes(payload.policy.mode) ||
+    typeof candidate.signature !== 'string' || !candidate.signature.trim() ||
+    (candidate.algorithm !== 'hmac-sha256' && candidate.algorithm !== 'ed25519')
+  ) {
+    return { valid: false, code: 'malformed', reason: 'Scope manifest is missing required fields.' }
+  }
+
+  if (options.algorithm && candidate.algorithm !== options.algorithm) {
+    return {
+      valid: false,
+      code: 'algorithm_mismatch',
+      reason: `Scope manifest algorithm "${candidate.algorithm}" does not match expected "${options.algorithm}".`,
+    }
+  }
+
+  const bytes = manifestSigningBytes(payload)
+  const providedSig = Buffer.from(candidate.signature, 'base64url')
+  if (providedSig.length === 0) {
+    return { valid: false, code: 'invalid_signature', reason: 'Scope manifest signature is empty.' }
+  }
+
+  if (candidate.algorithm === 'hmac-sha256') {
+    if (!options.secret) {
+      return { valid: false, code: 'missing_key', reason: 'HMAC secret is required to verify scope manifest.' }
+    }
+    const expected = createHmac('sha256', options.secret).update(bytes).digest()
+    if (expected.length !== providedSig.length || !timingSafeEqual(expected, providedSig)) {
+      return { valid: false, code: 'invalid_signature', reason: 'Scope manifest HMAC signature verification failed.' }
+    }
+  } else {
+    if (!options.publicKey) {
+      return { valid: false, code: 'missing_key', reason: 'Ed25519 public key is required to verify scope manifest.' }
+    }
+    let ok = false
+    try {
+      ok = cryptoVerify(null, bytes, options.publicKey, providedSig)
+    } catch {
+      ok = false
+    }
+    if (!ok) {
+      return { valid: false, code: 'invalid_signature', reason: 'Scope manifest Ed25519 signature verification failed.' }
+    }
+  }
+
+  const now = options.now ?? Date.now()
+  const issuedMs = Date.parse(payload.issuedAt)
+  const expiresMs = Date.parse(payload.expiresAt)
+  if (!Number.isFinite(issuedMs) || !Number.isFinite(expiresMs)) {
+    return { valid: false, code: 'malformed', reason: 'Scope manifest timestamps must be valid ISO-8601 strings.' }
+  }
+  if (now < issuedMs - 60_000) {
+    return { valid: false, code: 'not_yet_valid', reason: 'Scope manifest issuedAt is in the future.' }
+  }
+  if (now >= expiresMs) {
+    return { valid: false, code: 'expired', reason: `Scope manifest expired at ${payload.expiresAt}.` }
+  }
+  if (options.expectedTenantId && payload.tenantId !== options.expectedTenantId) {
+    return {
+      valid: false,
+      code: 'tenant_mismatch',
+      reason: `Scope manifest tenant "${payload.tenantId}" does not match "${options.expectedTenantId}".`,
+    }
+  }
+
+  return { valid: true, payload }
+}
+
+/** Fail-closed scope evaluation backed by a cryptographically verified scope manifest. */
+export function evaluateSignedScopeRequest(
+  manifest: unknown,
+  verifyOptions: ScopeManifestVerifyOptions,
+  request: ScopeRequest,
+): ScopeDecision {
+  const verified = verifyScopeManifest(manifest, verifyOptions)
+  if (!verified.valid) {
+    return deny('invalid_scope_manifest', null, verified.reason)
+  }
+  return evaluateScopeRequest(verified.payload.policy, request)
 }

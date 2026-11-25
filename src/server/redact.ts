@@ -386,3 +386,112 @@ export function redactJsonValue<T>(value: T, secrets: readonly NamedSecret[] = [
   }
   return value
 }
+
+// ============================================================================
+// v7 M4: Zero-Data-Retention (ZDR) & PII Redaction
+// ============================================================================
+
+export interface PiiRedactionOptions {
+  secrets?: readonly NamedSecret[]
+  /** Scrub email addresses (`[pii:email]`). Default true. */
+  emails?: boolean
+  /** Scrub US SSN shapes (`[pii:ssn]`). Default true. */
+  ssns?: boolean
+  /** Scrub Luhn-valid payment card numbers (`[pii:card]`). Default true. */
+  cards?: boolean
+  /** Scrub phone numbers (`[pii:phone]`). Default true. */
+  phones?: boolean
+  /** Scrub IPv4 client addresses (`[pii:ip]`). Default false. */
+  ipAddresses?: boolean
+  /** Scrub auth tokens, cookies, JWTs, API keys, and named secrets. Default true. */
+  credentials?: boolean
+}
+
+const emailPiiPattern = /\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,24}\b/g
+const ssnPiiPattern = /(?<![A-Za-z0-9-])(?!000|666|9\d\d)\d{3}[-\s](?!00)\d{2}[-\s](?!0000)\d{4}(?![A-Za-z0-9-])/g
+const cardCandidatePattern = /(?<!\d)(?:\d[ -]?){13,19}(?!\d)/g
+const phonePiiPattern = /(?<![A-Za-z0-9-])(?:\+\d{1,3}[\s.-]?(?:\(\d{1,4}\)|\d{1,4})[\s.-]?\d{2,4}[\s.-]?\d{3,4}(?:[\s.-]?\d{2,4})?|\(\d{3}\)\s?\d{3}[-\s]\d{4}|\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b)(?![A-Za-z0-9-])/g
+const ipv4PiiPattern = /(?<!\d)(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(?!\d)/g
+const sensitivePiiKeyPattern = /^(?:ssn|social[_-]?security|credit[_-]?card|card[_-]?number|pan|cvv|cvc|phone|phone[_-]?number|mobile|email|email[_-]?address|dob|date[_-]?of[_-]?birth|tax[_-]?id|passport|national[_-]?id)$/i
+
+function passesLuhn(digits: string): boolean {
+  if (digits.length < 13 || digits.length > 19) return false
+  let sum = 0
+  let alt = false
+  for (let i = digits.length - 1; i >= 0; i -= 1) {
+    let n = digits.charCodeAt(i) - 48
+    if (n < 0 || n > 9) return false
+    if (alt) {
+      n *= 2
+      if (n > 9) n -= 9
+    }
+    sum += n
+    alt = !alt
+  }
+  return sum % 10 === 0
+}
+
+/** True when Zero-Data-Retention (ZDR) mode is enabled via environment configuration. */
+export function isZdrModeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.GUARDIAN_ZDR_MODE ?? '').trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'yes'
+}
+
+/**
+ * Scrubs credentials (tokens, cookies, JWTs, named secrets) and PII (emails, SSNs, Luhn-valid
+ * payment cards, phone numbers, optional IPs) from free text for ZDR storage and portable exports.
+ */
+export function redactPii(text: string, options: PiiRedactionOptions = {}): string {
+  if (!text) return text
+  let out = options.credentials === false ? text : redact(text, options.secrets ?? [])
+  if (options.emails !== false) {
+    out = out.replace(emailPiiPattern, '[pii:email]')
+  }
+  if (options.cards !== false) {
+    out = out.replace(cardCandidatePattern, match => {
+      const digits = match.replace(/\D/g, '')
+      return passesLuhn(digits) ? '[pii:card]' : match
+    })
+  }
+  if (options.ssns !== false) {
+    out = out.replace(ssnPiiPattern, '[pii:ssn]')
+  }
+  if (options.phones !== false) {
+    out = out.replace(phonePiiPattern, match => {
+      // Avoid redacting ISO dates like 2026-11-24 or version strings.
+      if (/^\d{4}-\d{2}-\d{2}$/.test(match.trim())) return match
+      const digitCount = match.replace(/\D/g, '').length
+      return digitCount >= 10 && digitCount <= 15 ? '[pii:phone]' : match
+    })
+  }
+  if (options.ipAddresses === true) {
+    out = out.replace(ipv4PiiPattern, '[pii:ip]')
+  }
+  return out
+}
+
+/** Full ZDR text scrubber (all credentials + emails/SSNs/cards/phones). */
+export function redactZdr(text: string, secrets: readonly NamedSecret[] = []): string {
+  return redactPii(text, { secrets })
+}
+
+/** Recursively scrubs secrets AND PII across JSON payloads (including PII-named keys). */
+export function redactZdrJsonValue<T>(value: T, options: PiiRedactionOptions = {}): T {
+  if (typeof value === 'string') return redactPii(value, options) as unknown as T
+  if (Array.isArray(value)) return value.map(item => redactZdrJsonValue(item, options)) as unknown as T
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      const isCredentialKey = /^(?:password|api[_-]?key|x-api-key|x-auth-token|x-csrf-token|x-xsrf-token|token|access[_-]?token|refresh[_-]?token|id[_-]?token|bearer[_-]?token|secret|client[_-]?secret|service[_-]?role[_-]?key|private[_-]?key|session[_-]?(?:id|key)|credentials?|authorization|cookie|set-cookie)$/i.test(k)
+      if (isCredentialKey) {
+        out[k] = scrubSensitiveSubtree(v)
+      } else if (sensitivePiiKeyPattern.test(k)) {
+        out[k] = typeof v === 'string' || typeof v === 'number' ? '[pii:redacted]' : scrubSensitiveSubtree(v)
+      } else {
+        out[k] = redactZdrJsonValue(v, options)
+      }
+    }
+    return out as T
+  }
+  return value
+}
