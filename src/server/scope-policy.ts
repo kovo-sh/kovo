@@ -182,70 +182,188 @@ export function isReadOnlyHttpMethod(method: string, body?: string | null): bool
   return false
 }
 
-const graphqlEndpointPath = /(?:^|\/)graphql(?:\/|$|\?)/i
-const graphqlEnvelopeKeys = new Set(['query', 'operationname', 'variables', 'extensions'])
-const mutationOrSubscription = /\b(?:mutation|subscription)\b/i
+const MAX_GRAPHQL_READONLY_BODY_CHARS = 64 * 1024
+const MAX_JSON_NESTING_DEPTH = 32
+const MAX_GRAPHQL_NESTING_DEPTH = 24
+const graphqlEnvelopeKeys = new Set(['query', 'operationName', 'variables', 'extensions'])
 
-function topLevelJsonKeys(raw: string): string[] | undefined {
-  const text = raw.trim()
-  if (!text.startsWith('{') || !text.endsWith('}')) return undefined
-  let i = 0
-  let depth = 0
-  let inString = false
-  let escaped = false
-  const keys: string[] = []
-  while (i < text.length) {
-    const ch = text[i]!
-    if (inString) {
-      if (escaped) escaped = false
-      else if (ch === '\\') escaped = true
-      else if (ch === '"') inString = false
-      i += 1
-      continue
+/**
+ * True only when the request pathname (never query string or fragment, and never path traversal)
+ * terminates at a GraphQL route segment such as `/graphql` or `/api/v1/graphql`.
+ */
+function isGraphqlEndpointPath(pathAndQuery: string): boolean {
+  let pathname = (pathAndQuery || '').trim()
+  if (!pathname) return false
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(pathname)) {
+    try {
+      pathname = new URL(pathname).pathname || '/'
+    } catch {
+      return false
     }
-    if (ch === '"') {
-      let j = i + 1
-      let value = ''
-      let closed = false
-      while (j < text.length) {
-        const c = text[j]!
-        if (c === '\\') {
-          value += text[j + 1] ?? ''
-          j += 2
+  }
+  const q = pathname.indexOf('?')
+  if (q >= 0) pathname = pathname.slice(0, q)
+  const h = pathname.indexOf('#')
+  if (h >= 0) pathname = pathname.slice(0, h)
+  if (pathname.includes('\\') || /%(?:2e|2f|5c)/i.test(pathname)) return false
+  if (!pathname.startsWith('/')) pathname = '/' + pathname
+  const segments = pathname.split('/').filter(Boolean)
+  if (segments.length === 0) return false
+  if (segments.some(seg => seg === '.' || seg === '..')) return false
+  return segments[segments.length - 1]!.toLowerCase() === 'graphql'
+}
+
+/**
+ * Strict RFC 8259 JSON structure validator that rejects:
+ *  - ANY backslash-escaped top-level key (e.g. `\u0071uery`),
+ *  - ANY duplicate key at any object depth (after JSON decoding),
+ *  - ANY case-insensitive duplicate top-level key (e.g. `"query"` + `"Query"`),
+ *  - malformed tokens, excessive nesting, or trailing bytes.
+ */
+function validateStrictJsonObject(raw: string): boolean {
+  const text = raw.trim()
+  if (!text.startsWith('{') || !text.endsWith('}')) return false
+  let i = 0
+  const n = text.length
+
+  const skipWs = () => {
+    while (i < n) {
+      const c = text.charCodeAt(i)
+      if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) i += 1
+      else break
+    }
+  }
+
+  const parseString = (): { value: string; hasEscape: boolean } | undefined => {
+    if (text[i] !== '"') return undefined
+    const start = i
+    i += 1
+    let hasEscape = false
+    while (i < n) {
+      const ch = text[i]!
+      const code = text.charCodeAt(i)
+      if (code < 0x20) return undefined
+      if (ch === '\\') {
+        hasEscape = true
+        i += 1
+        if (i >= n) return undefined
+        const esc = text[i]!
+        if (esc === 'u') {
+          if (i + 4 >= n) return undefined
+          for (let k = 1; k <= 4; k += 1) {
+            if (!/[0-9a-fA-F]/.test(text[i + k]!)) return undefined
+          }
+          i += 5
+        } else if ('"\\/bfnrt'.includes(esc)) {
+          i += 1
+        } else {
+          return undefined
+        }
+        continue
+      }
+      if (ch === '"') {
+        i += 1
+        try {
+          const decoded = JSON.parse(text.slice(start, i)) as unknown
+          if (typeof decoded !== 'string') return undefined
+          return { value: decoded, hasEscape }
+        } catch {
+          return undefined
+        }
+      }
+      i += 1
+    }
+    return undefined
+  }
+
+  const parseValue = (depth: number): boolean => {
+    if (depth > MAX_JSON_NESTING_DEPTH) return false
+    skipWs()
+    if (i >= n) return false
+    const ch = text[i]!
+    if (ch === '{') return parseObject(depth)
+    if (ch === '[') {
+      i += 1
+      skipWs()
+      if (i < n && text[i] === ']') {
+        i += 1
+        return true
+      }
+      while (i < n) {
+        if (!parseValue(depth + 1)) return false
+        skipWs()
+        if (i < n && text[i] === ',') {
+          i += 1
           continue
         }
-        if (c === '"') {
-          closed = true
-          j += 1
-          break
+        if (i < n && text[i] === ']') {
+          i += 1
+          return true
         }
-        value += c
-        j += 1
+        return false
       }
-      if (!closed) return undefined
-      if (depth === 1) {
-        let k = j
-        while (k < text.length && /\s/.test(text[k]!)) k += 1
-        if (text[k] === ':') keys.push(value)
-      }
-      i = j
-      continue
+      return false
     }
-    if (ch === '{' || ch === '[') depth += 1
-    else if (ch === '}' || ch === ']') {
-      depth -= 1
-      if (depth < 0) return undefined
-    }
-    i += 1
+    if (ch === '"') return parseString() !== undefined
+    if (text.startsWith('true', i)) { i += 4; return true }
+    if (text.startsWith('false', i)) { i += 5; return true }
+    if (text.startsWith('null', i)) { i += 4; return true }
+    // JSON number
+    const numMatch = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(text.slice(i))
+    if (!numMatch) return false
+    i += numMatch[0].length
+    return true
   }
-  return depth === 0 ? keys : undefined
+
+  const parseObject = (depth: number): boolean => {
+    if (text[i] !== '{') return false
+    i += 1
+    skipWs()
+    if (i < n && text[i] === '}') {
+      i += 1
+      return true
+    }
+    const seenExact = new Set<string>()
+    const seenLower = depth === 0 ? new Set<string>() : undefined
+    while (i < n) {
+      skipWs()
+      const key = parseString()
+      if (!key) return false
+      if (depth === 0 && key.hasEscape) return false
+      if (seenExact.has(key.value)) return false
+      seenExact.add(key.value)
+      if (seenLower) {
+        const lower = key.value.toLowerCase()
+        if (seenLower.has(lower)) return false
+        seenLower.add(lower)
+      }
+      skipWs()
+      if (i >= n || text[i] !== ':') return false
+      i += 1
+      if (!parseValue(depth + 1)) return false
+      skipWs()
+      if (i < n && text[i] === ',') {
+        i += 1
+        continue
+      }
+      if (i < n && text[i] === '}') {
+        i += 1
+        return true
+      }
+      return false
+    }
+    return false
+  }
+
+  if (!parseObject(0)) return false
+  skipWs()
+  return i === n
 }
 
 function parseJsonObject(raw: string): Record<string, unknown> | undefined {
   const trimmed = raw.trim()
   if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return undefined
-  const keys = topLevelJsonKeys(trimmed)
-  if (!keys || new Set(keys).size !== keys.length) return undefined
+  if (!validateStrictJsonObject(trimmed)) return undefined
   try {
     const parsed = JSON.parse(trimmed) as unknown
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
@@ -253,6 +371,361 @@ function parseJsonObject(raw: string): Record<string, unknown> | undefined {
   } catch {
     return undefined
   }
+}
+
+type GraphqlTokenKind = 'name' | 'punct' | 'spread' | 'string' | 'number'
+interface GraphqlToken {
+  kind: GraphqlTokenKind
+  value: string
+}
+
+function tokenizeGraphqlDocument(source: string): GraphqlToken[] | undefined {
+  const tokens: GraphqlToken[] = []
+  let i = 0
+  const n = source.length
+  while (i < n) {
+    const ch = source[i]!
+    const code = source.charCodeAt(i)
+    // Whitespace, BOM, and insignificant commas
+    if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n' || ch === ',' || code === 0xfeff) {
+      i += 1
+      continue
+    }
+    // Line comment
+    if (ch === '#') {
+      while (i < n && source[i] !== '\n' && source[i] !== '\r') i += 1
+      continue
+    }
+    // Spread `...`
+    if (ch === '.') {
+      if (source.startsWith('...', i)) {
+        tokens.push({ kind: 'spread', value: '...' })
+        i += 3
+        continue
+      }
+      return undefined
+    }
+    // Punctuators
+    if ('!$&():=@[]{|}'.includes(ch)) {
+      tokens.push({ kind: 'punct', value: ch })
+      i += 1
+      continue
+    }
+    // Block string `"""..."""` or single-line string `"..."`
+    if (ch === '"') {
+      if (source.startsWith('"""', i)) {
+        i += 3
+        let closed = false
+        while (i < n) {
+          if (source.startsWith('\\"""', i)) {
+            i += 4
+            continue
+          }
+          if (source.startsWith('"""', i)) {
+            i += 3
+            closed = true
+            break
+          }
+          i += 1
+        }
+        if (!closed) return undefined
+        tokens.push({ kind: 'string', value: '' })
+        continue
+      }
+      i += 1
+      let closed = false
+      while (i < n) {
+        const c = source[i]!
+        const cc = source.charCodeAt(i)
+        if (c === '\n' || c === '\r' || cc < 0x20) return undefined
+        if (c === '\\') {
+          i += 1
+          if (i >= n) return undefined
+          const esc = source[i]!
+          if (esc === 'u') {
+            if (i + 4 >= n) return undefined
+            for (let k = 1; k <= 4; k += 1) {
+              if (!/[0-9a-fA-F]/.test(source[i + k]!)) return undefined
+            }
+            i += 5
+          } else if ('"\\/bfnrt'.includes(esc)) {
+            i += 1
+          } else {
+            return undefined
+          }
+          continue
+        }
+        if (c === '"') {
+          i += 1
+          closed = true
+          break
+        }
+        i += 1
+      }
+      if (!closed) return undefined
+      tokens.push({ kind: 'string', value: '' })
+      continue
+    }
+    // IntValue / FloatValue
+    if (ch === '-' || (code >= 0x30 && code <= 0x39)) {
+      const match = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(source.slice(i))
+      if (!match) return undefined
+      i += match[0].length
+      // Reject numbers immediately followed by a NameStart character (GraphQL spec)
+      if (i < n && /[_A-Za-z.]/.test(source[i]!)) return undefined
+      tokens.push({ kind: 'number', value: match[0] })
+      continue
+    }
+    // Name
+    if (/[_A-Za-z]/.test(ch)) {
+      let j = i + 1
+      while (j < n && /[_0-9A-Za-z]/.test(source[j]!)) j += 1
+      tokens.push({ kind: 'name', value: source.slice(i, j) })
+      i = j
+      continue
+    }
+    return undefined
+  }
+  return tokens
+}
+
+/**
+ * Strict GraphQL executable document parser for read-only verification:
+ *  - Accepts ONLY a single read-only `query` operation (explicit `query` or shorthand `{ ... }`)
+ *    plus zero or more `fragment` definitions.
+ *  - Rejects `mutation`, `subscription`, SDL definitions, multi-operation documents, field aliases
+ *    (`alias: field`), malformed syntax, and mismatched `operationName`.
+ */
+function isStrictReadOnlyGraphqlDocument(
+  source: string,
+  expectedOperationName?: string | null,
+): boolean {
+  const trimmed = source.trim()
+  if (!trimmed || trimmed.length > MAX_GRAPHQL_READONLY_BODY_CHARS) return false
+  const tokens = tokenizeGraphqlDocument(trimmed)
+  if (!tokens || tokens.length === 0) return false
+
+  let pos = 0
+  const peek = (offset = 0): GraphqlToken | undefined => tokens[pos + offset]
+  const eatPunct = (value: string): boolean => {
+    const tok = peek()
+    if (tok?.kind === 'punct' && tok.value === value) {
+      pos += 1
+      return true
+    }
+    return false
+  }
+  const eatName = (): string | undefined => {
+    const tok = peek()
+    if (tok?.kind === 'name') {
+      pos += 1
+      return tok.value
+    }
+    return undefined
+  }
+
+  const definedFragments = new Set<string>()
+  const usedFragments = new Set<string>()
+
+  const parseType = (depth: number): boolean => {
+    if (depth > MAX_GRAPHQL_NESTING_DEPTH) return false
+    if (eatPunct('[')) {
+      if (!parseType(depth + 1)) return false
+      if (!eatPunct(']')) return false
+    } else if (!eatName()) {
+      return false
+    }
+    eatPunct('!')
+    return true
+  }
+
+  const parseValue = (depth: number, isConst: boolean): boolean => {
+    if (depth > MAX_GRAPHQL_NESTING_DEPTH) return false
+    const tok = peek()
+    if (!tok) return false
+    if (tok.kind === 'punct' && tok.value === '$') {
+      if (isConst) return false
+      pos += 1
+      return eatName() !== undefined
+    }
+    if (tok.kind === 'number' || tok.kind === 'string') {
+      pos += 1
+      return true
+    }
+    if (tok.kind === 'name') {
+      pos += 1
+      return true
+    }
+    if (eatPunct('[')) {
+      while (peek() && !(peek()!.kind === 'punct' && peek()!.value === ']')) {
+        if (!parseValue(depth + 1, isConst)) return false
+      }
+      return eatPunct(']')
+    }
+    if (eatPunct('{')) {
+      const seenKeys = new Set<string>()
+      while (peek() && !(peek()!.kind === 'punct' && peek()!.value === '}')) {
+        const key = eatName()
+        if (!key || seenKeys.has(key)) return false
+        seenKeys.add(key)
+        if (!eatPunct(':')) return false
+        if (!parseValue(depth + 1, isConst)) return false
+      }
+      return eatPunct('}')
+    }
+    return false
+  }
+
+  const parseArguments = (depth: number, isConst: boolean): boolean => {
+    if (!eatPunct('(')) return true
+    let count = 0
+    const seenArgs = new Set<string>()
+    while (peek() && !(peek()!.kind === 'punct' && peek()!.value === ')')) {
+      const argName = eatName()
+      if (!argName || seenArgs.has(argName)) return false
+      seenArgs.add(argName)
+      if (!eatPunct(':')) return false
+      if (!parseValue(depth + 1, isConst)) return false
+      count += 1
+    }
+    return count > 0 && eatPunct(')')
+  }
+
+  const parseDirectives = (depth: number, isConst: boolean): boolean => {
+    while (eatPunct('@')) {
+      const name = eatName()
+      if (!name) return false
+      const lower = name.toLowerCase()
+      if (lower === 'mutation' || lower === 'subscription') return false
+      if (!parseArguments(depth + 1, isConst)) return false
+    }
+    return true
+  }
+
+  const parseVariableDefinitions = (depth: number): boolean => {
+    if (!eatPunct('(')) return true
+    let count = 0
+    const seenVars = new Set<string>()
+    while (peek() && !(peek()!.kind === 'punct' && peek()!.value === ')')) {
+      if (!eatPunct('$')) return false
+      const varName = eatName()
+      if (!varName || seenVars.has(varName)) return false
+      seenVars.add(varName)
+      if (!eatPunct(':')) return false
+      if (!parseType(depth + 1)) return false
+      if (eatPunct('=')) {
+        if (!parseValue(depth + 1, true)) return false
+      }
+      if (!parseDirectives(depth + 1, true)) return false
+      count += 1
+    }
+    return count > 0 && eatPunct(')')
+  }
+
+  const parseSelectionSet = (depth: number): boolean => {
+    if (depth > MAX_GRAPHQL_NESTING_DEPTH) return false
+    if (!eatPunct('{')) return false
+    let count = 0
+    while (peek() && !(peek()!.kind === 'punct' && peek()!.value === '}')) {
+      const tok = peek()!
+      if (tok.kind === 'spread') {
+        pos += 1
+        const next = peek()
+        if (next?.kind === 'name' && next.value === 'on') {
+          // InlineFragment: `... on TypeName Directives? SelectionSet`
+          pos += 1
+          if (!eatName()) return false
+          if (!parseDirectives(depth + 1, false)) return false
+          if (!parseSelectionSet(depth + 1)) return false
+        } else if (next?.kind === 'punct' && (next.value === '{' || next.value === '@')) {
+          // InlineFragment without type condition: `... Directives? SelectionSet`
+          if (!parseDirectives(depth + 1, false)) return false
+          if (!parseSelectionSet(depth + 1)) return false
+        } else {
+          // FragmentSpread: `... FragmentName Directives?`
+          const fragName = eatName()
+          if (!fragName || fragName === 'on') return false
+          usedFragments.add(fragName)
+          if (!parseDirectives(depth + 1, false)) return false
+        }
+      } else if (tok.kind === 'name') {
+        // Field — reject field aliases (`alias: field`) to prevent alias batching / smuggling tricks
+        const fieldName = eatName()!
+        if (peek()?.kind === 'punct' && peek()!.value === ':') return false
+        const lower = fieldName.toLowerCase()
+        if (lower === 'mutation' || lower === 'subscription') return false
+        if (!parseArguments(depth + 1, false)) return false
+        if (!parseDirectives(depth + 1, false)) return false
+        if (peek()?.kind === 'punct' && peek()!.value === '{') {
+          if (!parseSelectionSet(depth + 1)) return false
+        }
+      } else {
+        return false
+      }
+      count += 1
+    }
+    return count > 0 && eatPunct('}')
+  }
+
+  let operationCount = 0
+  let parsedOperationName: string | null = null
+  let isShorthand = false
+
+  while (pos < tokens.length) {
+    const tok = peek()!
+    if (tok.kind === 'punct' && tok.value === '{') {
+      operationCount += 1
+      if (operationCount > 1) return false
+      isShorthand = true
+      if (!parseSelectionSet(0)) return false
+      continue
+    }
+    if (tok.kind === 'name' && tok.value === 'query') {
+      pos += 1
+      operationCount += 1
+      if (operationCount > 1) return false
+      // Reject `query: ...` alias/syntax confusion at definition boundary
+      if (peek()?.kind === 'punct' && peek()!.value === ':') return false
+      if (peek()?.kind === 'name') {
+        const opName = eatName()!
+        const lower = opName.toLowerCase()
+        if (lower === 'mutation' || lower === 'subscription') return false
+        if (peek()?.kind === 'punct' && peek()!.value === ':') return false
+        parsedOperationName = opName
+      }
+      if (!parseVariableDefinitions(0)) return false
+      if (!parseDirectives(0, false)) return false
+      if (!parseSelectionSet(0)) return false
+      continue
+    }
+    if (tok.kind === 'name' && tok.value === 'fragment') {
+      pos += 1
+      const fragName = eatName()
+      if (!fragName || fragName === 'on') return false
+      const lower = fragName.toLowerCase()
+      if (lower === 'mutation' || lower === 'subscription') return false
+      if (definedFragments.has(fragName)) return false
+      definedFragments.add(fragName)
+      const onKw = eatName()
+      if (onKw !== 'on') return false
+      if (!eatName()) return false
+      if (!parseDirectives(0, false)) return false
+      if (!parseSelectionSet(0)) return false
+      continue
+    }
+    // Reject `mutation`, `subscription`, SDL keywords, or any unknown top-level definition.
+    return false
+  }
+
+  if (operationCount !== 1) return false
+  for (const frag of usedFragments) {
+    if (!definedFragments.has(frag)) return false
+  }
+  const expectedOp = (expectedOperationName ?? '').trim()
+  if (expectedOp) {
+    if (isShorthand || parsedOperationName !== expectedOp) return false
+  }
+  return true
 }
 
 function headerValue(
@@ -268,8 +741,10 @@ function headerValue(
 }
 
 /**
- * Verified read-only GraphQL: an exact `query` envelope (no mutation/subscription, no extra keys)
- * or a raw `query`/`fragment` document on a GraphQL endpoint. This never guesses from path words.
+ * Verified read-only GraphQL: MUST target a GraphQL route AND carry either a strict, ambiguity-free
+ * JSON `query` envelope or a raw GraphQL `query` document whose parsed AST is strictly a single
+ * read-only `query` operation (no `mutation`/`subscription`, no multi-operation smuggling, no
+ * escaped/duplicate JSON keys, no field aliases, and no persisted-query extensions).
  */
 export function isVerifiedReadOnlyGraphqlQuery(
   pathAndQuery: string,
@@ -277,25 +752,56 @@ export function isVerifiedReadOnlyGraphqlQuery(
   headers?: Record<string, string | string[] | undefined>,
 ): boolean {
   const trimmed = (body ?? '').trim()
-  if (!trimmed) return false
+  if (!trimmed || trimmed.length > MAX_GRAPHQL_READONLY_BODY_CHARS) return false
+  if (!isGraphqlEndpointPath(pathAndQuery)) return false
 
-  const envelope = parseJsonObject(trimmed)
-  if (envelope) {
-    if (!Object.prototype.hasOwnProperty.call(envelope, 'query')) return false
-    const keys = Object.keys(envelope)
-    if (!keys.every(key => graphqlEnvelopeKeys.has(key.toLowerCase()))) return false
-    const document = envelope.query
-    if (typeof document !== 'string' || !document.trim()) return false
-    if (mutationOrSubscription.test(document)) return false
-    return true
+  const contentEncoding = headerValue(headers, 'content-encoding').trim()
+  if (contentEncoding && !/^identity$/i.test(contentEncoding)) return false
+
+  const contentType = headerValue(headers, 'content-type').toLowerCase().trim()
+  if (/^multipart\//i.test(contentType)) return false
+
+  const isRawGraphqlHeader = contentType.includes('application/graphql') && !contentType.includes('json')
+  if (isRawGraphqlHeader) {
+    return isStrictReadOnlyGraphqlDocument(trimmed)
   }
 
-  const contentType = headerValue(headers, 'content-type').toLowerCase()
-  const looksGraphql = contentType.includes('application/graphql') || graphqlEndpointPath.test(pathAndQuery)
-  if (!looksGraphql) return false
-  if (trimmed.startsWith('{')) return false
-  if (!/^\s*(?:query|fragment)\b/i.test(trimmed)) return false
-  return !mutationOrSubscription.test(trimmed)
+  const isJsonOrUnspecified = !contentType || contentType.includes('json')
+  if (!isJsonOrUnspecified) return false
+
+  if (trimmed.startsWith('{')) {
+    const envelope = parseJsonObject(trimmed)
+    if (!envelope) return false
+    if (!Object.prototype.hasOwnProperty.call(envelope, 'query')) return false
+    const keys = Object.keys(envelope)
+    if (!keys.every(key => graphqlEnvelopeKeys.has(key))) return false
+    const document = envelope.query
+    if (typeof document !== 'string' || !document.trim()) return false
+    if (
+      envelope.operationName !== undefined &&
+      envelope.operationName !== null &&
+      typeof envelope.operationName !== 'string'
+    ) {
+      return false
+    }
+    if (
+      envelope.variables !== undefined &&
+      envelope.variables !== null &&
+      (typeof envelope.variables !== 'object' || Array.isArray(envelope.variables))
+    ) {
+      return false
+    }
+    if (envelope.extensions !== undefined && envelope.extensions !== null) {
+      if (typeof envelope.extensions !== 'object' || Array.isArray(envelope.extensions)) return false
+      // Reject non-empty extensions (e.g. persistedQuery / APQ hashes that can resolve to mutations).
+      if (Object.keys(envelope.extensions as Record<string, unknown>).length > 0) return false
+    }
+    const expectedOp = typeof envelope.operationName === 'string' ? envelope.operationName : null
+    return isStrictReadOnlyGraphqlDocument(document, expectedOp)
+  }
+
+  if (contentType) return false
+  return isStrictReadOnlyGraphqlDocument(trimmed)
 }
 
 const authTokenPath = /(?:^|\/)(?:oauth2?\/token|token|connect\/token|auth\/token|\.well-known\/openid-configuration)(?:$|\/|\?)/i
