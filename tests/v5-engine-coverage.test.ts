@@ -86,12 +86,12 @@ describe('new hypothesis enumeration', () => {
   test('a render write forms a template-math hypothesis on a semantic body field', () => {
     const surface = [endpoint({ method: 'POST', pathTemplate: '/api/docs/render' })]
     const hypotheses = enumerateHypotheses(surface, new Map(), { tier: 3, personas })
-    const ssti = hypotheses.find(hyp => hyp.intent === 'ssti')
-    assert.ok(ssti)
-    assert.equal(ssti.probeClass, 'ssti_math')
-    assert.equal(ssti.method, 'POST')
-    assert.equal(ssti.param?.name, 'template')
-    assert.equal(ssti.location, 'json')
+    const sstiHyps = hypotheses.filter(hyp => hyp.intent === 'ssti')
+    assert.ok(sstiHyps.length >= 1)
+    assert.ok(sstiHyps.every(hyp => hyp.probeClass === 'ssti_math' && hyp.method === 'POST' && hyp.location === 'json'))
+    const paramNames = sstiHyps.map(hyp => hyp.param?.name)
+    assert.ok(paramNames.includes('template'), `expected 'template' in ${JSON.stringify(paramNames)}`)
+    assert.ok(paramNames.includes('content'), `expected 'content' in ${JSON.stringify(paramNames)}`)
   })
 
   test('a diagnostic write prefers the field name the target published over the fallback', () => {
@@ -244,7 +244,7 @@ describe('new replay-spec converters', () => {
     assert.equal(steps.find(step => step.id === 'p1')?.request.method, 'PATCH')
   })
 
-  test('an OR-branch boolean spec tries the broad empty baseline first', () => {
+  test('an OR-branch boolean spec tries a fresh non-matching baseline first and keeps the empty fallback', () => {
     const hyp: EngineHypothesis = {
       key: 'sqli-search',
       endpoint: endpoint({ method: 'GET', pathTemplate: '/api/v1/search' }),
@@ -264,7 +264,11 @@ describe('new replay-spec converters', () => {
       anomalies: [{ type: 'boolean_differential', style: 'or_branch' }],
     }))
     assert.ok(specs.length >= 2)
-    assert.equal((specs[1].spec as { baselineValue?: string }).baselineValue, '')
+    assert.match((specs[1].spec as { baselineValue?: string }).baselineValue ?? '', /^guardian-[0-9a-f]{8}$/)
+    assert.ok(
+      specs.some(s => (s.spec as { baselineValue?: string }).baselineValue === ''),
+      'expected empty-string fallback baseline in OR-branch candidates',
+    )
   })
 
   test('a fingerprint-proven disclosure does not rely on the scrubbed body', () => {

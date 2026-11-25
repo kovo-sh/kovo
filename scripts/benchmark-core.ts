@@ -173,8 +173,8 @@ export function countFalsePositives(traces: readonly TargetTrace[]): number {
 // Orchestration: config knobs, budget maths, safety classification, scheduler
 // ---------------------------------------------------------------------------
 
-/** Default request budget in broker audit units (each HTTP exchange is counted twice: allowed + observed). */
-export const BENCH_MAX_REQUESTS_DEFAULT = 3800
+/** Default request budget in broker audit units (each HTTP exchange is counted twice: allowed + observed). Aligned with v7 M0 6,000-unit floor budget (3,000 HTTP exchanges). */
+export const BENCH_MAX_REQUESTS_DEFAULT = 6000
 export const BENCH_DEADLINE_MS_DEFAULT = 8 * 60_000
 export const BENCH_PROBE_CONCURRENCY_DEFAULT = 4
 export const BENCH_PROBE_CONCURRENCY_MAX = 8
