@@ -5,6 +5,7 @@ import { readBody, parseJson, sendJson, runIdOf, match, parseUrl } from './http.
 import type { JobRecord, LabState, TenantKey } from './shared.ts'
 
 const SALT_PATTERN = /mh_fake_salt_[a-z0-9]+/
+const rawFooterJobs = new WeakSet<JobRecord>()
 
 function newJob(
   state: LabState, kind: JobRecord['kind'], tenantId: TenantKey, runId: string, extra: Partial<JobRecord>,
@@ -29,6 +30,11 @@ async function processJob(state: LabState, job: JobRecord, egress: Egress): Prom
   if (Date.now() < job.readyAt) return
   job.processed = true
   if (job.kind === 'export') {
+    job.status = 'ready'
+    return
+  }
+  if (!rawFooterJobs.has(job)) {
+    job.trace = 'pdf rendered cleanly'
     job.status = 'ready'
     return
   }
@@ -91,7 +97,7 @@ export async function handleWorker(
 
   if (method === 'POST' && match(url, method, '/jobs/render')) {
     const body = parseJson<{
-      invoiceId?: string; templateId?: string; tenantId?: TenantKey; footer?: string; runId?: string
+      invoiceId?: string; templateId?: string; tenantId?: TenantKey; footer?: string; rawStored?: boolean; runId?: string
     }>(await readBody(req))
     if (!body?.tenantId || !body.invoiceId || !body.templateId) {
       sendJson(res, 400, { error: 'invoiceId, templateId and tenantId required' })
@@ -102,6 +108,9 @@ export async function handleWorker(
       templateId: body.templateId,
       artifactKey: `invoice-${body.invoiceId}.pdf`,
     })
+    const template = state.templates.find((item) => item.id === body.templateId && item.tenantId === body.tenantId)
+    const rawStored = typeof body.rawStored === 'boolean' ? body.rawStored : Boolean(template?.rawStored)
+    if (rawStored) rawFooterJobs.add(job)
     state.emit('worker.job_created', {
       jobId: job.id, kind: 'pdf', tenantId: job.tenantId, templateId: body.templateId,
       invoiceId: body.invoiceId, footerLength: (body.footer ?? '').length, runId: job.runId,

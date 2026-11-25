@@ -452,7 +452,7 @@ export async function handleApi(
     const session = auth(state, req, res)
     if (!session) return
     const invoice = state.invoices.find((item) => item.id === render[0])
-    if (!invoice) {
+    if (!invoice || invoice.tenantId !== session.tenantId) {
       sendJson(res, 404, { error: 'unknown invoice' })
       return
     }
@@ -465,6 +465,7 @@ export async function handleApi(
         templateId: invoice.templateId,
         tenantId: invoice.tenantId,
         footer: template?.footer ?? '',
+        rawStored: Boolean(template?.rawStored),
         runId,
       }),
     })
