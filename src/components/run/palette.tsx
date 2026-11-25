@@ -107,6 +107,7 @@ function useBaseCommands(): PaletteCommand[] {
       icon: <StatusGlyph status={r.status} />, right: short(r.id) + ' · ' + runStatusLabel(r.status), run: () => nav.switchRun(r.id),
     }))
     out.push({ id: 'act.chat', section: 'Actions', label: 'Open the board · message the coordinator', icon: 'chat', keys: ['C'], run: () => nav.openChat(null) })
+    out.push({ id: 'act.pane', section: 'Actions', label: nav.paneCollapsed ? 'Show right panel' : 'Hide right panel', icon: 'panelR', keys: [']'], run: () => nav.togglePane() })
     out.push({ id: 'act.theme', section: 'Actions', label: 'Toggle light / dark theme', icon: theme === 'dark' ? 'sun' : 'moon', keys: ['⇧', 'T'], run: toggle })
     out.push({ id: 'act.help', section: 'Actions', label: 'Show keyboard shortcuts', icon: 'keyboard', keys: ['?'], run: pal.openHelp })
     model.findings.slice().sort((a, b) => SEV_ORDER[a.severity] - SEV_ORDER[b.severity]).forEach(f => out.push({
@@ -188,7 +189,7 @@ function Palette({ prefill }: { prefill: string }) {
 
 /** The shortcut sheet (F's help). Views that add keys should add rows here. */
 export const SHORTCUT_SHEET: [string, [string, string][]][] = [
-  ['General', [['mod K', 'Command palette'], ['?', 'This sheet'], ['G then O Q F W S E A R', 'Go to a view'], ['1 – 8', 'Go to a view'], ['[ / ]', 'Previous / next run'], ['⇧ T', 'Toggle theme'], ['C', 'Board · message the coordinator'], ['Esc', 'Close detail / overlay']]],
+  ['General', [['mod K', 'Command palette'], ['?', 'This sheet'], ['G then O Q F W S E A R', 'Go to a view'], ['1 – 8', 'Go to a view'], ['[', 'Previous run'], [']', 'Hide / show right panel'], ['⇧ T', 'Toggle theme'], ['C', 'Board · message the coordinator'], ['Esc', 'Close detail / overlay']]],
   ['Lists', [['J / K', 'Next / previous row'], ['↵ / O', 'Open row'], ['/', 'Filter'], ['⇧ G', 'Cycle grouping']]],
   ['Queue', [['A', 'Approve · accept · queue'], ['D', 'Deny · dismiss · not needed'], ['F', 'False positive'], ['C', 'Ask coordinator about item'], ['Z', 'Undo last decision']]],
   ['Workflow', [['← ↑ ↓ →', 'Move between workers'], ['+ / −', 'Zoom'], ['0', 'Fit graph'], ['↵', 'Center selection'], ['L', 'Graph / list'], ['⇧ R', 'Replay · Space plays']]],

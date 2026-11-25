@@ -866,7 +866,7 @@
   margin: 0;
 }
 
-.sw-adv-btn {
+.sw button.sw-adv-btn {
   align-self: flex-start;
   display: inline-flex;
   align-items: center;
@@ -877,6 +877,7 @@
   border: 0;
   border-radius: 5px;
   background: transparent;
+  box-shadow: none;
   color: var(--sw-fg-2);
   font: inherit;
   font-size: 12px;
@@ -912,6 +913,152 @@
   color: var(--sw-ok);
 }
 
+/* Two-card visual mode picker in Add Model Profile modal */
+.sw-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.sw button.sw-mode-card {
+  appearance: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  height: auto;
+  white-space: normal;
+  text-align: left;
+  width: 100%;
+  padding: 12px 13px;
+  border: 0;
+  border-radius: 9px;
+  background: var(--sw-panel);
+  color: var(--sw-fg);
+  box-shadow: inset 0 0 0 1px var(--sw-line-2);
+  cursor: pointer;
+  transition: background var(--sw-d1), box-shadow var(--sw-d1), transform var(--sw-d1) var(--sw-ease);
+}
+
+.sw button.sw-mode-card:hover {
+  background: var(--sw-hover);
+  box-shadow: inset 0 0 0 1px var(--sw-line-strong);
+}
+
+.sw button.sw-mode-card.active {
+  background: var(--sw-accent-soft);
+  box-shadow: inset 0 0 0 1.5px var(--sw-accent-line);
+}
+
+.sw-mode-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sw-mode-art {
+  width: 64px;
+  height: 40px;
+  display: block;
+  flex: none;
+  color: var(--sw-fg);
+}
+
+.sw-mode-card-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.sw-mode-card-copy strong {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 18px;
+  color: var(--sw-fg);
+}
+
+.sw-mode-card-copy span {
+  font-size: 11.5px;
+  line-height: 16px;
+  color: var(--sw-fg-2);
+}
+
+.sw-preset-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: var(--sw-sunk);
+  border: 1px solid var(--sw-line);
+}
+
+.sw-fld-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sw-ext-link {
+  color: var(--sw-accent);
+  font-size: 11.5px;
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.sw-ext-link:hover {
+  text-decoration: underline;
+}
+
+.sw-details {
+  border: 1px solid var(--sw-line);
+  border-radius: 8px;
+  background: var(--sw-sunk);
+  overflow: hidden;
+}
+
+.sw-details-sum {
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--sw-fg-2);
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sw-details-sum::-webkit-details-marker {
+  display: none;
+}
+
+.sw-details-sum::before {
+  content: '▸';
+  font-size: 11px;
+  color: var(--sw-fg-3);
+  transition: transform var(--sw-d1);
+}
+
+.sw-details[open] > .sw-details-sum::before {
+  transform: rotate(90deg);
+}
+
+.sw-details-sum:hover {
+  color: var(--sw-fg);
+}
+
+.sw-details-body {
+  padding: 12px;
+  border-top: 1px solid var(--sw-line);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
 @media (max-width: 720px) {
   .sw-hdr,
   .sw-body {
@@ -919,7 +1066,8 @@
     padding-right: 16px;
   }
   .sw-grid-2,
-  .sw-grid-3 {
+  .sw-grid-3,
+  .sw-mode-grid {
     grid-template-columns: minmax(0, 1fr);
   }
   .sw-sheet-row {

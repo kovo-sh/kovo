@@ -73,6 +73,7 @@ function Workspace() {
   const nav = useNav()
   const overlays = useOverlays()
   const [paneW, setPaneW] = useState<number | null>(null)
+  const [resizing, setResizing] = useState(false)
   useEffect(() => {
     const saved = Number(localStorage.getItem(PANE_KEY))
     if (saved >= PANE_MIN && saved <= PANE_MAX) setPaneW(saved)
@@ -81,25 +82,27 @@ function Workspace() {
   useBoardSeen()
   const View = VIEW_COMPONENTS[nav.view]
   const rm = useReducedMotion()
-  return <div className="app" style={paneW ? { ['--pane-w' as string]: paneW + 'px' } : undefined}>
+  const appClass = 'app' + (nav.paneCollapsed ? ' pane-collapsed' : '') + (resizing ? ' pane-resizing' : '')
+  return <div className={appClass} style={paneW && !nav.paneCollapsed ? { ['--pane-w' as string]: paneW + 'px' } : undefined}>
     <Rail />
     <main className="main" aria-label="Run">
       <RunHeader />
       <RunBanners />
       <div key={nav.view} className={'view-host' + (rm ? '' : ' view-in')} id="vh"><View /></div>
     </main>
-    <aside className="pane" aria-label="Inspector">
-      <Resizer onResize={setPaneW} />
+    <aside className="pane" aria-label="Inspector" aria-hidden={nav.paneCollapsed || undefined}>
+      {!nav.paneCollapsed && <Resizer onResize={setPaneW} onDraggingChange={setResizing} />}
       <div id="paneInner"><PaneContent /></div>
     </aside>
     {overlays.scopeOpen && <ScopeOverlay />}
   </div>
 }
 
-function Resizer({ onResize }: { onResize: (w: number) => void }) {
+function Resizer({ onResize, onDraggingChange }: { onResize: (w: number) => void; onDraggingChange: (dragging: boolean) => void }) {
   const [drag, setDrag] = useState(false)
   const start = useRef({ x: 0, w: 0 })
   useEffect(() => {
+    onDraggingChange(drag)
     if (!drag) return
     const move = (e: PointerEvent) => onResize(Math.max(PANE_MIN, Math.min(PANE_MAX, start.current.w + (start.current.x - e.clientX))))
     const up = () => {
@@ -112,7 +115,7 @@ function Resizer({ onResize }: { onResize: (w: number) => void }) {
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', up)
     return () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up) }
-  }, [drag, onResize])
+  }, [drag, onResize, onDraggingChange])
   return <div className={'resizer' + (drag ? ' drag' : '')} role="separator" aria-orientation="vertical" aria-label="Resize inspector" title="Drag to resize · double-click to reset"
     onPointerDown={e => {
       e.preventDefault()
@@ -183,7 +186,7 @@ function useGlobalShortcuts() {
     { key: 'T', run: toggle },
     ...VIEWS.map((v, i) => ({ key: ['g ' + v.key, String(i + 1)], run: () => nav.setView(v.id) })),
     { key: '[', run: () => switchBy(-1) },
-    { key: ']', run: () => switchBy(1) },
+    { key: ']', run: () => nav.togglePane() },
     { key: 'c', run: () => nav.openChat(null) },
     { key: 'mod+z', run: undo },
     { key: 'z', run: undo },
