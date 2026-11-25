@@ -1200,11 +1200,14 @@ export interface PersonaSessionRegistration {
   allowlist: readonly string[]
   /** Upstream renewer (adapter refresh closure or full re-authentication). */
   refresh?: () => Promise<MintedPersonaSession | null>
+  /** Optional run namespace so concurrent runs sharing a handle never overwrite each other. */
+  runId?: string
 }
 
 export interface PersonaSessionClone {
   readonly id: string
   readonly handle: string
+  readonly runId?: string
   /** Shared credential generation this clone has observed. */
   readonly generation: number
   isLoggedOut(): boolean
@@ -1221,7 +1224,21 @@ export interface PersonaSessionClone {
   dispose(): void
 }
 
+function normalizePoolRunId(runId?: string | null): string | undefined {
+  if (typeof runId !== 'string') return undefined
+  const trimmed = runId.trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}
+
+/** Canonical PersonaSessionPool key: `${runId}:${handle}` when run-scoped, else bare `handle`. */
+export function personaPoolKey(handle: string, runId?: string | null): string {
+  const normalized = normalizePoolRunId(runId)
+  return normalized ? `${normalized}:${handle}` : handle
+}
+
 interface PersonaSessionPoolEntry {
+  key: string
+  runId?: string
   handle: string
   session: MintedPersonaSession
   allowlist: string[]
@@ -1301,6 +1318,7 @@ function parseSetCookieLine(line: string, origin: URL): PersonaCookieRecord | nu
 export class PersonaSessionCloneImpl implements PersonaSessionClone {
   readonly id: string
   readonly handle: string
+  readonly runId?: string
   private loggedOut = false
   private localCookies: PersonaCookieRecord[] = []
   private seenGeneration: number
@@ -1309,6 +1327,7 @@ export class PersonaSessionCloneImpl implements PersonaSessionClone {
   constructor(handle: string, entry: PersonaSessionPoolEntry, id?: string) {
     this.id = id ?? `clone-${handle}-${Math.random().toString(36).slice(2, 10)}`
     this.handle = handle
+    this.runId = entry.runId
     this.entry = entry
     this.seenGeneration = entry.generation
     entry.clones.add(this)
@@ -1385,8 +1404,26 @@ export class PersonaSessionCloneImpl implements PersonaSessionClone {
 export class PersonaSessionPool {
   private readonly entries = new Map<string, PersonaSessionPoolEntry>()
 
-  register(handle: string, registration: PersonaSessionRegistration): void {
-    const existing = this.entries.get(handle)
+  private resolveEntry(handle: string, runId?: string): PersonaSessionPoolEntry | undefined {
+    const normalized = normalizePoolRunId(runId)
+    if (normalized) {
+      return this.entries.get(personaPoolKey(handle, normalized))
+    }
+    const exact = this.entries.get(handle)
+    if (exact) return exact
+    // Backwards-compatible fallback for callers/tests omitting `runId`: return the most recently
+    // registered run-scoped entry for `handle`, if any.
+    let matched: PersonaSessionPoolEntry | undefined
+    for (const entry of this.entries.values()) {
+      if (entry.handle === handle) matched = entry
+    }
+    return matched
+  }
+
+  register(handle: string, registration: PersonaSessionRegistration, runId?: string): void {
+    const effectiveRunId = normalizePoolRunId(runId ?? registration.runId)
+    const key = personaPoolKey(handle, effectiveRunId)
+    const existing = this.entries.get(key)
     if (existing) {
       existing.session = registration.session
       existing.allowlist = [...registration.allowlist]
@@ -1394,7 +1431,9 @@ export class PersonaSessionPool {
       existing.generation += 1
       return
     }
-    this.entries.set(handle, {
+    this.entries.set(key, {
+      key,
+      ...(effectiveRunId ? { runId: effectiveRunId } : {}),
       handle,
       session: registration.session,
       allowlist: [...registration.allowlist],
@@ -1405,30 +1444,43 @@ export class PersonaSessionPool {
     })
   }
 
-  unregister(handle: string): void {
-    const entry = this.entries.get(handle)
+  unregister(handle: string, runId?: string): void {
+    const key = personaPoolKey(handle, runId)
+    const entry = this.entries.get(key)
     if (!entry) return
     for (const clone of entry.clones) clone.dispose()
-    this.entries.delete(handle)
+    this.entries.delete(key)
   }
 
-  has(handle: string): boolean { return this.entries.has(handle) }
+  /** Remove all session entries belonging to one run without touching concurrent runs. */
+  unregisterRun(runId: string): void {
+    const normalized = normalizePoolRunId(runId)
+    if (!normalized) return
+    for (const [key, entry] of [...this.entries.entries()]) {
+      if (entry.runId === normalized) {
+        for (const clone of entry.clones) clone.dispose()
+        this.entries.delete(key)
+      }
+    }
+  }
 
-  generation(handle: string): number { return this.entries.get(handle)?.generation ?? 0 }
+  has(handle: string, runId?: string): boolean { return this.resolveEntry(handle, runId) !== undefined }
 
-  session(handle: string): MintedPersonaSession | null { return this.entries.get(handle)?.session ?? null }
+  generation(handle: string, runId?: string): number { return this.resolveEntry(handle, runId)?.generation ?? 0 }
 
-  refreshCount(handle: string): number { return this.entries.get(handle)?.refreshCount ?? 0 }
+  session(handle: string, runId?: string): MintedPersonaSession | null { return this.resolveEntry(handle, runId)?.session ?? null }
 
-  clone(handle: string, id?: string): PersonaSessionClone | null {
-    const entry = this.entries.get(handle)
+  refreshCount(handle: string, runId?: string): number { return this.resolveEntry(handle, runId)?.refreshCount ?? 0 }
+
+  clone(handle: string, id?: string, runId?: string): PersonaSessionClone | null {
+    const entry = this.resolveEntry(handle, runId)
     if (!entry) return null
-    return new PersonaSessionCloneImpl(handle, entry, id)
+    return new PersonaSessionCloneImpl(entry.handle, entry, id)
   }
 
   /** Log out one tracked clone; siblings and the shared credential are untouched. */
-  logoutClone(handle: string, cloneId: string): boolean {
-    const entry = this.entries.get(handle)
+  logoutClone(handle: string, cloneId: string, runId?: string): boolean {
+    const entry = this.resolveEntry(handle, runId)
     if (!entry) return false
     for (const clone of entry.clones) {
       if (clone.id === cloneId) {
@@ -1440,16 +1492,16 @@ export class PersonaSessionPool {
   }
 
   /** Replace the shared credential without an upstream call (logout probe / token swap). */
-  rotate(handle: string, session: MintedPersonaSession): number | null {
-    const entry = this.entries.get(handle)
+  rotate(handle: string, session: MintedPersonaSession, runId?: string): number | null {
+    const entry = this.resolveEntry(handle, runId)
     if (!entry) return null
     entry.session = session
     entry.generation += 1
     return entry.generation
   }
 
-  async refresh(handle: string, observedGeneration?: number): Promise<PersonaSessionRefreshOutcome> {
-    const entry = this.entries.get(handle)
+  async refresh(handle: string, observedGeneration?: number, runId?: string): Promise<PersonaSessionRefreshOutcome> {
+    const entry = this.resolveEntry(handle, runId)
     if (!entry) return 'unknown'
     return PersonaSessionPool.refreshEntry(entry, observedGeneration)
   }
@@ -1777,11 +1829,12 @@ export class PersonaAuthManager {
    * legacy per-handle pacing; personas registered through `registerSession()` use coordinated
    * single-flight refresh with no global 60 s lockout.
    */
-  registerReauth(handle: string, fn: () => Promise<void>): () => void {
-    this.reauthHandlers.set(handle, { fn, lastAt: 0 })
+  registerReauth(handle: string, fn: () => Promise<void>, runId?: string): () => void {
+    const key = personaPoolKey(handle, runId)
+    this.reauthHandlers.set(key, { fn, lastAt: 0 })
     return () => {
-      const current = this.reauthHandlers.get(handle)
-      if (current?.fn === fn) this.reauthHandlers.delete(handle)
+      const current = this.reauthHandlers.get(key)
+      if (current?.fn === fn) this.reauthHandlers.delete(key)
     }
   }
 
@@ -1789,18 +1842,18 @@ export class PersonaAuthManager {
    * Register a persona's composite session for clone/refresh coordination.
    * `refresh` runs at most once for concurrent 401s across every clone of the handle.
    */
-  registerSession(handle: string, registration: PersonaSessionRegistration): void {
-    this.sessionPool.register(handle, registration)
+  registerSession(handle: string, registration: PersonaSessionRegistration, runId?: string): void {
+    this.sessionPool.register(handle, registration, runId)
   }
 
   /** Create an independent per-worker session clone (credentials shared, cookie jar local). */
-  cloneSession(handle: string, workerId?: string): PersonaSessionClone | null {
-    return this.sessionPool.clone(handle, workerId)
+  cloneSession(handle: string, workerId?: string, runId?: string): PersonaSessionClone | null {
+    return this.sessionPool.clone(handle, workerId, runId)
   }
 
   /** Log out one worker clone without invalidating siblings or the shared credential. */
-  logoutSession(handle: string, cloneId: string): boolean {
-    return this.sessionPool.logoutClone(handle, cloneId)
+  logoutSession(handle: string, cloneId: string, runId?: string): boolean {
+    return this.sessionPool.logoutClone(handle, cloneId, runId)
   }
 
   /**
@@ -1808,12 +1861,22 @@ export class PersonaAuthManager {
    * (or a sibling already refreshed this generation, in which case the caller retries with the
    * fresh credential). Pool-backed personas never use the 60 s lockout.
    */
-  async requestReauth(handle: string, observedGeneration?: number): Promise<boolean> {
-    if (this.sessionPool.has(handle)) {
-      const outcome = await this.sessionPool.refresh(handle, observedGeneration)
+  async requestReauth(handle: string, observedGeneration?: number, runId?: string): Promise<boolean> {
+    if (this.sessionPool.has(handle, runId)) {
+      const outcome = await this.sessionPool.refresh(handle, observedGeneration, runId)
       return outcome === 'refreshed' || outcome === 'already-fresh'
     }
-    const entry = this.reauthHandlers.get(handle)
+    const normalizedRunId = normalizePoolRunId(runId)
+    const entry = normalizedRunId
+      ? this.reauthHandlers.get(personaPoolKey(handle, normalizedRunId))
+      : this.reauthHandlers.get(handle) ?? (() => {
+          const suffix = `:${handle}`
+          let matched: { fn: () => Promise<void>; lastAt: number; inFlight?: Promise<boolean> } | undefined
+          for (const [k, v] of this.reauthHandlers.entries()) {
+            if (k.endsWith(suffix)) matched = v
+          }
+          return matched
+        })()
     if (!entry) return false
     if (entry.inFlight) return entry.inFlight
     const now = Date.now()
@@ -3445,19 +3508,21 @@ export class PersonaAuthManager {
         }
         const seeded = reloadSession() ?? result.session ?? null
         if (seeded) {
-          // v6: per-worker clones coordinate a single-flight refresh with no 60 s lockout.
+          // v6 + H-22: per-worker clones coordinate a single-flight refresh with no 60 s lockout,
+          // keyed by `${runId}:${handle}` so concurrent runs never swap or clobber credentials.
           this.registerSession(persona.handle, {
             session: seeded,
             allowlist: persona.originAllowlist,
             refresh: runRefresh,
-          })
+            runId,
+          }, runId)
         }
         // Raw-handler registration is kept for embedders that call requestReauth() directly
         // without the pool; pool-backed requests bypass this pacing entirely.
         this.registerReauth(persona.handle, async () => {
           const fresh = await runRefresh()
-          if (fresh) this.sessionPool.rotate(persona.handle, fresh)
-        })
+          if (fresh) this.sessionPool.rotate(persona.handle, fresh, runId)
+        }, runId)
         storage.event(
           runId,
           'persona.authenticated',
@@ -3493,7 +3558,7 @@ export class PersonaAuthManager {
             }).finally(() => {
               refreshing = false
               const latest = reloadSession()
-              if (latest) this.sessionPool.rotate(persona.handle, latest)
+              if (latest) this.sessionPool.rotate(persona.handle, latest, runId)
             })
           }, intervalMs)
           timer.unref?.()
@@ -3502,6 +3567,7 @@ export class PersonaAuthManager {
       }
     } catch (err) {
       for (const t of timers) clearInterval(t)
+      this.sessionPool.unregisterRun(runId)
       throw err
     }
 
@@ -3513,15 +3579,23 @@ export class PersonaAuthManager {
 
   stopRunRefreshers(runId: string): void {
     const timers = this.runTimers.get(runId)
-    if (!timers) return
-    for (const timer of timers) clearInterval(timer)
-    this.runTimers.delete(runId)
+    if (timers) {
+      for (const timer of timers) clearInterval(timer)
+      this.runTimers.delete(runId)
+    }
+    this.sessionPool.unregisterRun(runId)
+    const prefix = `${runId}:`
+    for (const key of [...this.reauthHandlers.keys()]) {
+      if (key.startsWith(prefix)) this.reauthHandlers.delete(key)
+    }
   }
 
   stopAll(): void {
-    for (const timers of this.runTimers.values()) {
+    for (const [runId, timers] of this.runTimers.entries()) {
       for (const timer of timers) clearInterval(timer)
+      this.sessionPool.unregisterRun(runId)
     }
     this.runTimers.clear()
+    this.reauthHandlers.clear()
   }
 }

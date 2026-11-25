@@ -63,19 +63,47 @@ interface RegisteredController {
   tenantId: string | null
 }
 
-function emptyState(generation = 0): KillSwitchState {
+function normalizeTenantId(tenantId?: string | null): string | null {
+  if (typeof tenantId !== 'string') return null
+  const trimmed = tenantId.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+function emptyState(generation = 0, tenantId: string | null = null): KillSwitchState {
   return {
     active: false,
     reason: null,
     trippedBy: null,
     trippedAt: null,
-    tenantId: null,
+    tenantId,
     generation,
   }
 }
 
+interface ExternalKillSwitchSnapshot {
+  global: KillSwitchState
+  tenants: Map<string, KillSwitchState>
+  generation: number
+}
+
+function parseKillSwitchEntry(raw: unknown, fallbackTenantId: string | null, fallbackGeneration: number): KillSwitchState | null {
+  if (!raw || typeof raw !== 'object') return null
+  const parsed = raw as Partial<KillSwitchState>
+  if (typeof parsed.active !== 'boolean') return null
+  return {
+    active: parsed.active,
+    reason: typeof parsed.reason === 'string' ? parsed.reason : null,
+    trippedBy: typeof parsed.trippedBy === 'string' ? parsed.trippedBy : null,
+    trippedAt: typeof parsed.trippedAt === 'number' ? parsed.trippedAt : null,
+    tenantId: fallbackTenantId ?? normalizeTenantId(parsed.tenantId),
+    generation: typeof parsed.generation === 'number' ? parsed.generation : fallbackGeneration,
+  }
+}
+
 export class GlobalKillSwitch {
-  private state: KillSwitchState = emptyState(0)
+  private globalState: KillSwitchState = emptyState(0)
+  private readonly tenantStates = new Map<string, KillSwitchState>()
+  private generation = 0
   private readonly controllers = new Set<RegisteredController>()
   private readonly listeners = new Set<(state: KillSwitchState) => void>()
   private filePath: string | null = null
@@ -120,21 +148,44 @@ export class GlobalKillSwitch {
         tenant_id TEXT,
         generation INTEGER NOT NULL DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS kill_switch_tenants (
+        tenant_id TEXT PRIMARY KEY,
+        active INTEGER NOT NULL DEFAULT 0,
+        reason TEXT,
+        tripped_by TEXT,
+        tripped_at INTEGER,
+        generation INTEGER NOT NULL DEFAULT 0
+      );
     `)
   }
 
   private matchesScope(state: KillSwitchState, tenantId?: string | null): boolean {
     if (!state.active) return false
     if (state.tenantId === null) return true
-    if (!tenantId) return false
-    return state.tenantId === tenantId
+    const normalized = normalizeTenantId(tenantId)
+    if (!normalized) return false
+    return state.tenantId === normalized
   }
 
-  private persistExternal(state: KillSwitchState): void {
+  private resolveActiveState(tenantId?: string | null): KillSwitchState | null {
+    if (this.globalState.active) return this.globalState
+    const normalized = normalizeTenantId(tenantId)
+    if (!normalized) return null
+    const tenantState = this.tenantStates.get(normalized)
+    if (tenantState && this.matchesScope(tenantState, normalized)) return tenantState
+    return null
+  }
+
+  private persistExternal(): void {
     if (this.filePath) {
       mkdirSync(dirname(this.filePath), { recursive: true, mode: 0o700 })
       const tmp = `${this.filePath}.${randomBytes(6).toString('hex')}.tmp`
-      writeFileSync(tmp, JSON.stringify(state) + '\n', { flag: 'wx', mode: 0o600 })
+      const payload = {
+        ...this.globalState,
+        generation: this.generation,
+        tenants: Object.fromEntries(this.tenantStates),
+      }
+      writeFileSync(tmp, JSON.stringify(payload) + '\n', { flag: 'wx', mode: 0o600 })
       try {
         chmodSync(tmp, 0o600)
         renameSync(tmp, this.filePath)
@@ -148,40 +199,92 @@ export class GlobalKillSwitch {
       this.ensureDbTable(this.db)
       this.db.prepare(`
         INSERT INTO kill_switch_state (id, active, reason, tripped_by, tripped_at, tenant_id, generation)
-        VALUES (1, ?, ?, ?, ?, ?, ?)
+        VALUES (1, ?, ?, ?, ?, NULL, ?)
         ON CONFLICT(id) DO UPDATE SET
           active = excluded.active,
           reason = excluded.reason,
           tripped_by = excluded.tripped_by,
           tripped_at = excluded.tripped_at,
-          tenant_id = excluded.tenant_id,
+          tenant_id = NULL,
           generation = excluded.generation
       `).run(
-        state.active ? 1 : 0,
-        state.reason,
-        state.trippedBy,
-        state.trippedAt,
-        state.tenantId,
-        state.generation,
+        this.globalState.active ? 1 : 0,
+        this.globalState.reason,
+        this.globalState.trippedBy,
+        this.globalState.trippedAt,
+        this.generation,
       )
+      this.db.prepare('DELETE FROM kill_switch_tenants').run()
+      const upsertTenant = this.db.prepare(`
+        INSERT INTO kill_switch_tenants (tenant_id, active, reason, tripped_by, tripped_at, generation)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(tenant_id) DO UPDATE SET
+          active = excluded.active,
+          reason = excluded.reason,
+          tripped_by = excluded.tripped_by,
+          tripped_at = excluded.tripped_at,
+          generation = excluded.generation
+      `)
+      for (const [tenantId, state] of this.tenantStates) {
+        if (!state.active) continue
+        upsertTenant.run(
+          tenantId,
+          1,
+          state.reason,
+          state.trippedBy,
+          state.trippedAt,
+          state.generation,
+        )
+      }
     }
   }
 
-  private readExternalState(): KillSwitchState | null {
+  private readExternalState(): ExternalKillSwitchSnapshot | null {
     if (this.filePath) {
       try {
         const info = statSync(this.filePath)
         if (info.mtimeMs !== this.lastFileMtimeMs) {
           this.lastFileMtimeMs = info.mtimeMs
-          const parsed = JSON.parse(readFileSync(this.filePath, 'utf8')) as Partial<KillSwitchState>
+          const parsed = JSON.parse(readFileSync(this.filePath, 'utf8')) as Partial<KillSwitchState> & {
+            tenants?: Record<string, unknown>
+          }
+          const topGen = typeof parsed.generation === 'number' ? parsed.generation : this.generation + 1
+          const tenants = new Map<string, KillSwitchState>()
+          if (parsed.tenants && typeof parsed.tenants === 'object' && !Array.isArray(parsed.tenants)) {
+            for (const [rawKey, rawVal] of Object.entries(parsed.tenants)) {
+              const key = normalizeTenantId(rawKey)
+              if (!key) continue
+              const entry = parseKillSwitchEntry(rawVal, key, topGen)
+              if (entry?.active) tenants.set(key, entry)
+            }
+          }
           if (typeof parsed.active === 'boolean') {
+            const topTenant = normalizeTenantId(parsed.tenantId)
+            // Backwards compatibility: legacy single-slot tenant file must not overwrite global state.
+            if (topTenant && parsed.active) {
+              if (!tenants.has(topTenant)) {
+                tenants.set(topTenant, {
+                  active: true,
+                  reason: typeof parsed.reason === 'string' ? parsed.reason : null,
+                  trippedBy: typeof parsed.trippedBy === 'string' ? parsed.trippedBy : null,
+                  trippedAt: typeof parsed.trippedAt === 'number' ? parsed.trippedAt : null,
+                  tenantId: topTenant,
+                  generation: topGen,
+                })
+              }
+              return { global: emptyState(0), tenants, generation: topGen }
+            }
             return {
-              active: parsed.active,
-              reason: typeof parsed.reason === 'string' ? parsed.reason : null,
-              trippedBy: typeof parsed.trippedBy === 'string' ? parsed.trippedBy : null,
-              trippedAt: typeof parsed.trippedAt === 'number' ? parsed.trippedAt : null,
-              tenantId: typeof parsed.tenantId === 'string' ? parsed.tenantId : null,
-              generation: typeof parsed.generation === 'number' ? parsed.generation : this.state.generation + 1,
+              global: {
+                active: parsed.active,
+                reason: typeof parsed.reason === 'string' ? parsed.reason : null,
+                trippedBy: typeof parsed.trippedBy === 'string' ? parsed.trippedBy : null,
+                trippedAt: typeof parsed.trippedAt === 'number' ? parsed.trippedAt : null,
+                tenantId: null,
+                generation: topGen,
+              },
+              tenants,
+              generation: topGen,
             }
           }
         }
@@ -201,14 +304,65 @@ export class GlobalKillSwitch {
           tenant_id: string | null
           generation: number
         } | undefined
-        if (row) {
+        const tenantRows = (() => {
+          try {
+            return this.db!.prepare(
+              'SELECT tenant_id, active, reason, tripped_by, tripped_at, generation FROM kill_switch_tenants WHERE active = 1',
+            ).all() as Array<{
+              tenant_id: string
+              active: number
+              reason: string | null
+              tripped_by: string | null
+              tripped_at: number | null
+              generation: number
+            }>
+          } catch {
+            return []
+          }
+        })()
+        if (row || tenantRows.length > 0) {
+          const tenants = new Map<string, KillSwitchState>()
+          let maxGen = row?.generation ?? 0
+          for (const tr of tenantRows) {
+            const key = normalizeTenantId(tr.tenant_id)
+            if (!key || tr.active !== 1) continue
+            if (tr.generation > maxGen) maxGen = tr.generation
+            tenants.set(key, {
+              active: true,
+              reason: tr.reason,
+              trippedBy: tr.tripped_by,
+              trippedAt: tr.tripped_at,
+              tenantId: key,
+              generation: tr.generation,
+            })
+          }
+          const legacyTenant = normalizeTenantId(row?.tenant_id)
+          if (row && legacyTenant && row.active === 1) {
+            if (!tenants.has(legacyTenant)) {
+              tenants.set(legacyTenant, {
+                active: true,
+                reason: row.reason,
+                trippedBy: row.tripped_by,
+                trippedAt: row.tripped_at,
+                tenantId: legacyTenant,
+                generation: row.generation,
+              })
+            }
+            return { global: emptyState(0), tenants, generation: maxGen }
+          }
           return {
-            active: row.active === 1,
-            reason: row.reason,
-            trippedBy: row.tripped_by,
-            trippedAt: row.tripped_at,
-            tenantId: row.tenant_id,
-            generation: row.generation,
+            global: row
+              ? {
+                  active: row.active === 1,
+                  reason: row.reason,
+                  trippedBy: row.tripped_by,
+                  trippedAt: row.tripped_at,
+                  tenantId: null,
+                  generation: row.generation,
+                }
+              : emptyState(0),
+            tenants,
+            generation: maxGen,
           }
         }
       } catch {
@@ -226,15 +380,31 @@ export class GlobalKillSwitch {
     this.lastExternalCheckMs = now
     const external = this.readExternalState()
     if (!external) return
+    const hasNewTenantTrip = [...external.tenants.keys()].some(tid => !this.tenantStates.get(tid)?.active)
     const shouldAdopt =
-      external.generation > this.state.generation ||
-      (external.active && !this.state.active)
+      external.generation > this.generation ||
+      (external.global.active && !this.globalState.active) ||
+      hasNewTenantTrip
     if (!shouldAdopt) return
-    const wasActive = this.state.active
-    this.state = { ...external }
-    if (this.state.active && !wasActive) {
-      this.abortMatchingControllers(this.state)
-      this.notifyListeners(this.state)
+    const wasGlobalActive = this.globalState.active
+    const prevActiveTenants = new Set(
+      [...this.tenantStates.entries()].filter(([, s]) => s.active).map(([tid]) => tid),
+    )
+    this.globalState = { ...external.global, tenantId: null }
+    this.tenantStates.clear()
+    for (const [tid, st] of external.tenants) {
+      if (st.active) this.tenantStates.set(tid, { ...st, tenantId: tid })
+    }
+    this.generation = Math.max(this.generation, external.generation)
+    if (this.globalState.active && !wasGlobalActive) {
+      this.abortMatchingControllers(this.globalState)
+      this.notifyListeners(this.globalState)
+    }
+    for (const [tid, st] of this.tenantStates) {
+      if (st.active && !prevActiveTenants.has(tid)) {
+        this.abortMatchingControllers(st)
+        this.notifyListeners(st)
+      }
     }
   }
 
@@ -266,48 +436,81 @@ export class GlobalKillSwitch {
   /** Trip the kill switch immediately, persisting externally and aborting all matching in-flight work. */
   trip(input: KillSwitchTripInput): KillSwitchState {
     const now = input.now ?? this.nowFn()
+    const tenantId = normalizeTenantId(input.tenantId)
+    this.generation += 1
     const next: KillSwitchState = {
       active: true,
       reason: (input.reason || 'Emergency kill switch tripped.').trim().slice(0, 500),
       trippedBy: (input.trippedBy || 'operator').trim().slice(0, 128),
       trippedAt: now,
-      tenantId: input.tenantId ?? null,
-      generation: this.state.generation + 1,
+      tenantId,
+      generation: this.generation,
     }
-    this.state = next
+    if (tenantId === null) {
+      this.globalState = next
+    } else {
+      // Tenant-scoped trip MUST NOT overwrite global state or other tenants' state.
+      this.tenantStates.set(tenantId, next)
+    }
     this.lastExternalCheckMs = now
     this.abortMatchingControllers(next)
-    this.persistExternal(next)
+    this.persistExternal()
     this.notifyListeners(next)
     return { ...next }
   }
 
-  /** Clear the kill switch so new runs/requests may proceed. */
-  reset(options: { resetBy?: string; now?: number } = {}): KillSwitchState {
+  /** Clear the kill switch (globally, or for a single tenant when `tenantId` is supplied). */
+  reset(options: { resetBy?: string; tenantId?: string | null; now?: number } = {}): KillSwitchState {
     const now = options.now ?? this.nowFn()
-    const next = emptyState(this.state.generation + 1)
-    this.state = next
+    const tenantId = normalizeTenantId(options.tenantId)
+    this.generation += 1
+    if (tenantId !== null) {
+      this.tenantStates.delete(tenantId)
+      const next = emptyState(this.generation, tenantId)
+      this.lastExternalCheckMs = now
+      this.persistExternal()
+      this.notifyListeners(next)
+      return { ...next }
+    }
+    const next = emptyState(this.generation, null)
+    this.globalState = next
+    this.tenantStates.clear()
     this.lastExternalCheckMs = now
-    this.persistExternal(next)
+    this.persistExternal()
     this.notifyListeners(next)
     return { ...next }
   }
 
-  status(): KillSwitchState {
+  status(tenantId?: string | null): KillSwitchState {
     this.syncFromExternal(false)
-    return { ...this.state }
+    const normalized = normalizeTenantId(tenantId)
+    if (normalized) {
+      const active = this.resolveActiveState(normalized)
+      return active ? { ...active } : emptyState(this.generation, normalized)
+    }
+    return { ...this.globalState }
+  }
+
+  activeTenants(): KillSwitchState[] {
+    this.syncFromExternal(false)
+    return [...this.tenantStates.values()].filter(s => s.active).map(s => ({ ...s }))
   }
 
   isActive(tenantId?: string | null): boolean {
-    if (this.matchesScope(this.state, tenantId)) return true
+    if (this.resolveActiveState(tenantId)) return true
     this.syncFromExternal(false)
-    return this.matchesScope(this.state, tenantId)
+    return this.resolveActiveState(tenantId) !== null
   }
 
   /** Fail closed immediately if the kill switch is active globally or for `tenantId`. */
   assertAllowed(tenantId?: string | null): void {
-    if (this.isActive(tenantId)) {
-      throw new KillSwitchTrippedError(this.state)
+    let active = this.resolveActiveState(tenantId)
+    if (!active) {
+      this.syncFromExternal(false)
+      active = this.resolveActiveState(tenantId)
+    }
+    if (active) {
+      throw new KillSwitchTrippedError(active)
     }
   }
 
@@ -319,14 +522,16 @@ export class GlobalKillSwitch {
     callerSignal: AbortSignal,
     tenantId: string | null = null,
   ): { signal: AbortSignal; release: () => void } {
-    this.assertAllowed(tenantId)
+    const normalizedTenant = normalizeTenantId(tenantId)
+    this.assertAllowed(normalizedTenant)
     const controller = new AbortController()
-    const entry: RegisteredController = { controller, tenantId }
+    const entry: RegisteredController = { controller, tenantId: normalizedTenant }
     this.controllers.add(entry)
     // Re-check after registration to close any race window.
-    if (this.isActive(tenantId)) {
+    const active = this.resolveActiveState(normalizedTenant)
+    if (active) {
       this.controllers.delete(entry)
-      const err = new KillSwitchTrippedError(this.state)
+      const err = new KillSwitchTrippedError(active)
       controller.abort(err)
       throw err
     }
@@ -351,7 +556,19 @@ export class GlobalKillSwitch {
   }
 }
 
-export const globalKillSwitch = new GlobalKillSwitch()
+const GLOBAL_KILL_SWITCH_SYMBOL = Symbol.for('kovo.globalKillSwitch')
+
+function getOrCreateGlobalKillSwitch(): GlobalKillSwitch {
+  const g = globalThis as Record<symbol, GlobalKillSwitch | undefined>
+  let existing = g[GLOBAL_KILL_SWITCH_SYMBOL]
+  if (!existing) {
+    existing = new GlobalKillSwitch()
+    g[GLOBAL_KILL_SWITCH_SYMBOL] = existing
+  }
+  return existing
+}
+
+export const globalKillSwitch: GlobalKillSwitch = getOrCreateGlobalKillSwitch()
 
 export function configureGlobalKillSwitch(options: KillSwitchOptions): GlobalKillSwitch {
   globalKillSwitch.configure(options)
