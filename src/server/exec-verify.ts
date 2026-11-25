@@ -184,6 +184,160 @@ function deriveReplayOutcomeStatus(spec: DeclarativeReplaySpec, replay: ReplayVe
 }
 
 
+/**
+ * Confirmed findings have immutable core identity fields once runtime_confirmed or static_verified.
+ * Post-confirmation updates (`update_proposed_finding`, inline retries, etc.) must never mutate
+ * these fields to disguise or swap the confirmed vulnerability class, origin, endpoint, or title.
+ */
+export const IMMUTABLE_CONFIRMED_FINDING_FIELDS = [
+  'cwe',
+  'origin',
+  'title',
+  'category',
+  'fingerprintHash',
+  'endpoint',
+] as const
+
+export function extractSpecEndpointAndMethod(
+  spec: DeclarativeReplaySpec,
+  replay: Pick<ReplayVerificationResult, 'receipt' | 'exchanges'>,
+): { endpoint: string | null; method: string | null } {
+  const receiptTarget = replay.receipt?.receipt.target
+  if (receiptTarget?.pathAndQuery) {
+    return {
+      endpoint: receiptTarget.pathAndQuery,
+      method: receiptTarget.method ? receiptTarget.method.toUpperCase() : null,
+    }
+  }
+  if (spec.kind === 'http_chain') {
+    const probe = spec.steps.find(s => s.role === 'probe') ?? spec.steps[spec.steps.length - 1]
+    if (probe) {
+      return {
+        endpoint: probe.request.pathAndQuery,
+        method: probe.request.method.toUpperCase(),
+      }
+    }
+  } else if (spec.kind === 'rce_proof') {
+    return {
+      endpoint: spec.probeStep.request.pathAndQuery,
+      method: spec.probeStep.request.method.toUpperCase(),
+    }
+  } else if (spec.kind === 'cache_differential') {
+    const probeReq = (spec as { probeRequest?: { pathAndQuery?: string; method?: string }; pathAndQuery?: string; method?: string })
+    const path = probeReq.probeRequest?.pathAndQuery ?? probeReq.pathAndQuery ?? null
+    const method = probeReq.probeRequest?.method ?? probeReq.method ?? null
+    if (path) return { endpoint: path, method: method ? method.toUpperCase() : null }
+  } else if (spec.kind === 'auth_protocol_proof') {
+    const authSpec = spec as { steps?: Array<{ role?: string; request?: { pathAndQuery?: string; method?: string } }>; targetPath?: string; pathAndQuery?: string }
+    const probeStep = authSpec.steps?.find(s => s.role === 'probe') ?? authSpec.steps?.[authSpec.steps.length - 1]
+    const path = probeStep?.request?.pathAndQuery ?? authSpec.targetPath ?? authSpec.pathAndQuery ?? null
+    const method = probeStep?.request?.method ?? null
+    if (path) return { endpoint: path, method: method ? method.toUpperCase() : null }
+  } else if (spec.kind === 'static_ast_proof') {
+    return {
+      endpoint: `${spec.repo}/${spec.file}:${spec.startLine}`,
+      method: null,
+    }
+  }
+  const ex = replay.exchanges[replay.exchanges.length - 1]
+  if (ex) {
+    return {
+      endpoint: ex.pathAndQuery,
+      method: ex.method.toUpperCase(),
+    }
+  }
+  return { endpoint: null, method: null }
+}
+
+/**
+ * H-18: Bind a confirmed/static_verified finding's identity (`cwe`, `category`, `origin`, `title`,
+ * and `fingerprintHash` derived from endpoint/method) strictly to the confirming spec and receipt
+ * so a stale proposed finding can never retain a mismatched CWE/origin/endpoint/title.
+ */
+export function bindConfirmedFindingIdentity(
+  existingFinding: Finding,
+  spec: DeclarativeReplaySpec,
+  replay: ReplayVerificationResult,
+  secretsList: readonly NamedSecret[] = [],
+): Finding {
+  const aligned = alignFindingForEvidence(existingFinding, replay)
+  const payload = replay.evidencePayload
+  const evidenceClass = payload && typeof payload.evidenceClass === 'string' ? payload.evidenceClass : null
+  const evidenceAligned = alignClaimClass({ cwe: spec.cwe, category: spec.category }, evidenceClass)
+  const confirmedReceipt = replay.receipt?.verification.confirmed ? replay.receipt.receipt : null
+  const receiptAttr = confirmedReceipt?.vulnClass ? agentProofAttribution(confirmedReceipt.vulnClass) : null
+  const boundOrigin = confirmedReceipt?.target.origin ?? spec.origin
+  const boundCwe = evidenceAligned?.cwe
+    ?? (spec.cwe ? normalizeCwe(spec.cwe) : null)
+    ?? receiptAttr?.cwe
+    ?? aligned.cwe
+  const boundCategory = evidenceAligned?.category
+    ?? spec.category
+    ?? receiptAttr?.category
+    ?? aligned.category
+  const boundTitle = redact(spec.title, secretsList).slice(0, 200) || aligned.title
+  const { endpoint, method } = extractSpecEndpointAndMethod(spec, replay)
+  const computedFp = endpoint
+    ? computeFindingFingerprint({
+        origin: boundOrigin,
+        cwe: boundCwe,
+        category: boundCategory,
+        endpoint,
+        method,
+      })
+    : null
+  return {
+    ...aligned,
+    origin: boundOrigin,
+    cwe: boundCwe,
+    category: boundCategory,
+    title: boundTitle,
+    ...(computedFp ? { fingerprintHash: computedFp.hash } : {}),
+  }
+}
+
+/**
+ * H-18: Guard post-confirmation updates (`update_proposed_finding`, etc.) from mutating a
+ * confirmed or static_verified finding's CWE, origin, endpoint, category, fingerprint, or title.
+ */
+export function guardConfirmedFindingMutation(
+  existingFinding: Finding & { endpoint?: string },
+  patch: Partial<Finding> & { endpoint?: string },
+): { allowed: boolean; blockedFields: string[]; sanitizedPatch: Partial<Finding> } {
+  const isVerified = existingFinding.status === 'confirmed' || existingFinding.status === 'static_verified'
+  if (!isVerified) {
+    const { endpoint: _ep, ...rest } = patch
+    return { allowed: true, blockedFields: [], sanitizedPatch: rest }
+  }
+  const blockedFields: string[] = []
+  const sanitizedPatch: Partial<Finding> = { ...patch }
+  delete (sanitizedPatch as { endpoint?: string }).endpoint
+  if (patch.cwe !== undefined && normalizeCwe(patch.cwe) !== normalizeCwe(existingFinding.cwe ?? '')) {
+    blockedFields.push('cwe')
+    delete sanitizedPatch.cwe
+  }
+  if (patch.origin !== undefined && normalizeOrigin(patch.origin) !== normalizeOrigin(existingFinding.origin)) {
+    blockedFields.push('origin')
+    delete sanitizedPatch.origin
+  }
+  if (patch.title !== undefined && patch.title.trim() !== existingFinding.title.trim()) {
+    blockedFields.push('title')
+    delete sanitizedPatch.title
+  }
+  if (patch.category !== undefined && patch.category !== existingFinding.category) {
+    blockedFields.push('category')
+    delete sanitizedPatch.category
+  }
+  if (patch.fingerprintHash !== undefined && patch.fingerprintHash !== existingFinding.fingerprintHash) {
+    blockedFields.push('fingerprintHash')
+    delete sanitizedPatch.fingerprintHash
+  }
+  if (patch.endpoint !== undefined && patch.endpoint !== existingFinding.endpoint) {
+    blockedFields.push('endpoint')
+  }
+  return { allowed: blockedFields.length === 0, blockedFields, sanitizedPatch }
+}
+
 function buildReplayFindingPatch(
   spec: DeclarativeReplaySpec,
   replay: ReplayVerificationResult,
@@ -205,16 +359,27 @@ function buildReplayFindingPatch(
     : existingFinding.codeLocations
   const cleanReason = redact(replay.outcome.reason || replay.outcome.observed || existingFinding.reason, secretsList)
   const cleanObserved = redact(replay.outcome.observed, secretsList)
+  const isConfirming = finalStatus === 'confirmed' || finalStatus === 'static_verified'
+  const bound = isConfirming
+    ? bindConfirmedFindingIdentity(existingFinding, spec, replay, secretsList)
+    : null
   const patch: Partial<Finding> = {
     status: finalStatus,
     verificationTier,
     reason: cleanReason,
-    confidence: (finalStatus === 'confirmed' || finalStatus === 'static_verified')
+    confidence: isConfirming
       ? 'high'
       : finalStatus === 'dismissed'
         ? 'medium'
         : 'low',
     verification: `${staticSpec ? 'Deterministic offline static_ast_proof' : `Zero-LLM ${spec.kind} ${verificationVerb}`} verdict: ${finalStatus} (controlPassed=${replay.outcome.controlPassed}, observed: ${cleanObserved}).`,
+    ...(bound ? {
+      origin: bound.origin,
+      cwe: bound.cwe,
+      category: bound.category,
+      title: bound.title,
+      ...(bound.fingerprintHash !== undefined ? { fingerprintHash: bound.fingerprintHash } : {}),
+    } : {}),
     ...(staticSpec ? { runtimeProofGap: staticSpec.runtimeProofGap } : {}),
     ...(staticCodeLocations?.length ? { codeLocations: staticCodeLocations } : {}),
   }
@@ -1331,10 +1496,24 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     finalStatus: Finding['status'],
     cancelSiblingStepId?: string | null,
   ): void {
-    this.storage.upsertChainFinding(run, findingRow.assetId, alignFindingForEvidence(updatedFinding, result), specRowId, origins)
+    // H-18: If the finding is already runtime_confirmed, preserve its immutable core identity
+    // (CWE, origin, title, category, fingerprintHash); otherwise bind identity strictly to the
+    // confirming spec & receipt before persisting.
+    const alreadyRuntimeConfirmed = findingRow.finding.status === 'confirmed'
+    const boundFinding = alreadyRuntimeConfirmed
+      ? {
+          ...updatedFinding,
+          cwe: findingRow.finding.cwe,
+          origin: findingRow.finding.origin,
+          title: findingRow.finding.title,
+          category: findingRow.finding.category,
+          fingerprintHash: findingRow.finding.fingerprintHash,
+        }
+      : bindConfirmedFindingIdentity(updatedFinding, spec, result)
+    this.storage.upsertChainFinding(run, findingRow.assetId, boundFinding, specRowId, origins)
     recordReportedFindingCoverage(
-      this.storage, run, assignment.id, spec.origin, spec.category,
-      `${finalStatus === 'static_verified' ? 'Static verified' : 'Confirmed'}: ${spec.title}`,
+      this.storage, run, assignment.id, boundFinding.origin, boundFinding.category ?? spec.category,
+      `${finalStatus === 'static_verified' ? 'Static verified' : 'Confirmed'}: ${boundFinding.title}`,
       findingRow.id, (r, o) => this.host.permitted(r, o),
     )
     if (cancelSiblingStepId !== undefined) this.host.cancelSiblingTrialsOnConfirmation(run, cancelSiblingStepId, findingRow.id)
@@ -1650,13 +1829,16 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       }
     }
 
-    const verifyParams = this.baseReplayRunnerParams(
-      specRow.spec, run.id, job.assignment.id, grant, job.controller.signal, reposDir,
-      createExchangeRecorder(this.storage, () => run, job.assignment.id, currentSecrets, {
-        trackResources: true,
-        markCoverage: (r, o, m, p) => this.host.markEndpointCoverage(r, o, m, p, `replay:${specRow.spec.kind}`),
-      }),
-    )
+    const verifyParams = {
+      ...this.baseReplayRunnerParams(
+        specRow.spec, run.id, job.assignment.id, grant, job.controller.signal, reposDir,
+        createExchangeRecorder(this.storage, () => run, job.assignment.id, currentSecrets, {
+          trackResources: true,
+          markCoverage: (r, o, m, p) => this.host.markEndpointCoverage(r, o, m, p, `replay:${specRow.spec.kind}`),
+        }),
+      ),
+      envelopeTrust: findingRow.provenance === 'floor' ? 'host_persisted' as const : 'untrusted' as const,
+    }
     const result = await verifyReplaySpec(verifyParams)
     this.host.markReplaySpecCoverage(run, specRow.spec, `replay:${specRow.spec.kind}`)
     if (result.receipt && !result.receipt.verification.confirmed) {
@@ -1985,8 +2167,8 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       ? {
           ...existingDup.finding,
           id: existingDup.id,
-          severity,
-          ...(effectiveFingerprintHash ? { fingerprintHash: effectiveFingerprintHash } : {}),
+          // H-18: Preserve immutable confirmed identity (cwe, origin, title, category, fingerprintHash, severity).
+          ...(effectiveFingerprintHash && !existingDup.finding.fingerprintHash ? { fingerprintHash: effectiveFingerprintHash } : {}),
           replaySpecId: canonicalSpecId,
           exchangeIds: [...new Set([...(existingDup.finding.exchangeIds ?? []), ...incomingExchangeIds])],
           evidenceIds: [...new Set([...existingDup.finding.evidenceIds, artifact.id])],
@@ -2405,7 +2587,16 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       const receiptFirst = await this.reverifyAgentScriptProof(curRun, params, agentProof)
       if (receiptFirst) return receiptFirst
     }
-    const parsed = declarativeReplaySpecSchema.parse(params.spec)
+    // H-5: Strip untrusted model-supplied `recipe` / `agentScript` envelopes before parsing inline specs.
+    const sanitizedSpecInput = params.spec && typeof params.spec === 'object' && !Array.isArray(params.spec)
+      ? (() => {
+          const copy = { ...(params.spec as Record<string, unknown>) }
+          delete copy.recipe
+          delete copy.agentScript
+          return copy
+        })()
+      : params.spec
+    const parsed = declarativeReplaySpecSchema.parse(sanitizedSpecInput)
     const specOrigins = replaySpecOrigins(parsed)
     const currentApproved = this.host.approvedOriginsSet(curRun)
     if (specOrigins.some(o => !currentApproved.has(o))) {
@@ -2416,6 +2607,31 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     const isAlreadyVerified = Boolean(
       findingRow && (findingRow.finding.status === 'confirmed' || findingRow.finding.status === 'static_verified'),
     )
+    // H-18: Once a finding is confirmed or static_verified, forbid post-confirmation inline spec
+    // swaps or identity edits (CWE, origin, endpoint, title). Return the immutable confirmed state.
+    if (findingRow && isAlreadyVerified) {
+      const immutableSpecId = findingRow.replaySpecId ?? params.replaySpecId ?? findingRow.id
+      const immutableFeedback: InlineVerifyFeedback = {
+        verdict: findingRow.finding.status === 'confirmed' ? 'confirmed' : 'static_verified',
+        ...(findingRow.verificationTier ? { verificationTier: findingRow.verificationTier } : {}),
+        controlPassed: true,
+        assertionSummary: {
+          observed: `Finding "${findingRow.finding.title}" is already ${findingRow.finding.status}; confirmed finding identity (CWE, origin, endpoint, title) is immutable.`,
+          expected: 'confirmed findings cannot be mutated post-confirmation',
+          reason: 'Confirmed finding is immutable; post-confirmation edits are rejected.',
+        },
+        stepStatuses: [],
+        retriesRemaining: 0,
+      }
+      return {
+        findingId: findingRow.id,
+        replaySpecId: immutableSpecId,
+        attemptCount: this.storage.listReplaySpecsForFinding(curRun.id, findingRow.id).reduce((m, r) => Math.max(m, r.attemptCount), 1),
+        status: findingRow.finding.status,
+        verificationTier: findingRow.verificationTier ?? undefined,
+        feedback: immutableFeedback,
+      }
+    }
 
     const standaloneKey = !params.findingId
       ? 'inline:' + params.job.assignment.id + ':' + createHash('sha256')
@@ -2515,6 +2731,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
           },
         ),
       ),
+      envelopeTrust: 'untrusted',
       findingId: findingRow?.id,
       attemptCount: nextAttempt,
       maxRetries: maxInlineVerifyRetries,
@@ -2584,7 +2801,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     this.host.postVerificationVerdict(verdictRun, {
       replaySpecId: updatedSpec.id,
       findingId: findingRow?.id ?? params.findingId ?? null,
-      title: parsed.title,
+      title: verdictRow?.finding.title ?? parsed.title,
       status: verdictStatus,
       verificationTier: verdictTier,
       feedback: normalizedFeedback,
@@ -2700,10 +2917,16 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     await this.ensureCanaryListenerForSpec(specRow.spec)
 
     const { reposDir } = this.host.projectReposMount(run.projectId)
-    const retestRes = await retestReplaySpec(this.baseReplayRunnerParams(
-      specRow.spec, run.id, job.assignment.id, grant, job.controller.signal, reposDir,
-      createExchangeRecorder(this.storage, () => run, job.assignment.id, currentSecrets),
-    ))
+    const persistedProof = this.storage.replaySpecProof(run.id, specRow.id)
+    const hasHostTrustedEnvelope = findingRow.provenance === 'floor'
+      || Boolean(persistedProof && persistedProof.verdict === 'confirmed')
+    const retestRes = await retestReplaySpec({
+      ...this.baseReplayRunnerParams(
+        specRow.spec, run.id, job.assignment.id, grant, job.controller.signal, reposDir,
+        createExchangeRecorder(this.storage, () => run, job.assignment.id, currentSecrets),
+      ),
+      envelopeTrust: hasHostTrustedEnvelope ? 'host_persisted' : 'untrusted',
+    })
 
     const current = this.storage.run(run.id)
     this.storage.transaction(() => {
