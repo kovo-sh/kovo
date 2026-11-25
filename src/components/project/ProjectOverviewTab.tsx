@@ -1,6 +1,6 @@
 import { Link } from '@tanstack/react-router'
 import { formatFullDateTime, formatRelativeTime, useNow } from '../shell/AppShell.tsx'
-import { capabilityTierMeta, formatUsd, phaseNames } from '../run-state.ts'
+import { formatUsd, phaseNames } from '../run-state.ts'
 import type { ProjectLoaderData, ProjectTabId } from './types.ts'
 import { formatGithubPatBadge } from './types.ts'
 
@@ -10,8 +10,114 @@ interface Props {
   onOpenNewRun: () => void
 }
 
+const RUN_MODE_LABEL: Record<number, string> = {
+  0: 'Offline Audit',
+  1: 'Safe Audit',
+  2: 'Core Pentest',
+  3: 'Active Pentest',
+}
+
 function plural(count: number, singular: string, pluralWord = `${singular}s`): string {
   return `${count} ${count === 1 ? singular : pluralWord}`
+}
+
+function RunsEmptySvg() {
+  return (
+    <svg
+      className="pw-empty-art"
+      width="180"
+      height="88"
+      viewBox="0 0 180 88"
+      fill="none"
+      aria-hidden="true"
+    >
+      {/* Left card: Target surface radar */}
+      <rect
+        x="4"
+        y="14"
+        width="64"
+        height="60"
+        rx="8"
+        fill="var(--pw-panel)"
+        stroke="var(--pw-line-2)"
+        strokeWidth="1.2"
+      />
+      <circle cx="36" cy="44" r="18" stroke="var(--pw-line-2)" strokeWidth="1.1" />
+      <circle cx="36" cy="44" r="10.5" stroke="var(--pw-line-strong)" strokeWidth="1.1" strokeDasharray="2.5 2.5" />
+      <path d="M36 44L48.5 31.5" stroke="var(--pw-accent)" strokeWidth="1.5" strokeLinecap="round" />
+      <circle cx="36" cy="44" r="2.6" fill="var(--pw-panel)" stroke="var(--pw-fg-2)" strokeWidth="1.25" />
+      <circle cx="48.5" cy="31.5" r="2.6" fill="var(--pw-accent)" />
+      <circle cx="25.5" cy="51.5" r="2" fill="var(--pw-fg-3)" />
+
+      {/* Center dashed connector + launch emblem */}
+      <line
+        x1="68"
+        y1="44"
+        x2="77"
+        y2="44"
+        stroke="var(--pw-line-strong)"
+        strokeWidth="1.25"
+        strokeDasharray="2.5 2.5"
+        strokeLinecap="round"
+      />
+      <line
+        x1="103"
+        y1="44"
+        x2="112"
+        y2="44"
+        stroke="var(--pw-line-strong)"
+        strokeWidth="1.25"
+        strokeDasharray="2.5 2.5"
+        strokeLinecap="round"
+      />
+      <circle
+        cx="90"
+        cy="44"
+        r="13"
+        fill="var(--pw-panel)"
+        stroke="var(--pw-accent)"
+        strokeWidth="1.4"
+      />
+      <circle cx="90" cy="44" r="10.5" fill="var(--pw-accent-soft)" />
+      <path
+        d="M87.5 39.2L95.2 44L87.5 48.8V39.2Z"
+        fill="var(--pw-accent)"
+        stroke="var(--pw-accent)"
+        strokeWidth="1.1"
+        strokeLinejoin="round"
+      />
+
+      {/* Right card: Verified findings report */}
+      <rect
+        x="112"
+        y="14"
+        width="64"
+        height="60"
+        rx="8"
+        fill="var(--pw-panel)"
+        stroke="var(--pw-line-2)"
+        strokeWidth="1.2"
+      />
+      <circle
+        cx="127"
+        cy="30"
+        r="6.5"
+        fill="var(--pw-ok-soft)"
+        stroke="color-mix(in srgb, var(--pw-ok) 45%, transparent)"
+        strokeWidth="1.1"
+      />
+      <path
+        d="M124.2 30.1L126.2 32.1L130.1 28.1"
+        stroke="var(--pw-ok)"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <rect x="138" y="27.75" width="28" height="4.5" rx="2.25" fill="var(--pw-line-strong)" />
+      <rect x="121" y="45" width="45" height="4.5" rx="2.25" fill="var(--pw-line-2)" />
+      <rect x="121" y="54" width="33" height="4.5" rx="2.25" fill="var(--pw-line)" />
+    </svg>
+  )
 }
 
 function PersonasSetupSvg({ ready }: { ready: boolean }) {
@@ -73,7 +179,7 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
     ? `Ready for your first assessment across ${plural(assets.length, 'host')}`
     : activeRuns > 0
       ? `${plural(activeRuns, 'active run')} in progress across ${plural(assets.length, 'host')} — ${plural(completedRuns, 'completed run')} on record`
-      : `${plural(completedRuns, 'completed run')} across ${plural(assets.length, 'host')} — latest ${phaseNames[latestRun!.phase].toLowerCase()} (${latestRun!.status})`
+      : `${plural(completedRuns, 'completed run')} across ${plural(assets.length, 'host')} — latest ${phaseNames[latestRun!.phase].toLowerCase()} (${latestRun!.status.replaceAll('_', ' ')})`
 
   return <>
     <div className="pw-eyebrow">
@@ -90,11 +196,11 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
         <p>
           {plural(project.seeds.length, 'seed')}
           {wildcardCount > 0 ? ` · ${wildcardCount} *.domain` : ''}
-          {thirdPartyCount > 0 ? ` · ${thirdPartyCount} third-party CNAME` : ''}
+          {thirdPartyCount > 0 ? ` · ${plural(thirdPartyCount, 'third-party host')}` : ''}
         </p>
       </div>
       <div>
-        <h3>Auth &amp; Context</h3>
+        <h3>Accounts &amp; Context</h3>
         <div className="big num">{plural(personas.length, 'test account')} · {plural(specs.length, 'snapshot')}</div>
         <p>{formatGithubPatBadge(githubPatStatus)} · {plural(allowlistCount, 'write allowlist rule')}</p>
       </div>
@@ -106,11 +212,11 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
             <span style={{ textTransform: 'capitalize' }}>{latestRun.status.replaceAll('_', ' ')}</span>
           </div>
           <p className="num">
-            {capabilityTierMeta[latestRun.capabilityTier].short} · {phaseNames[latestRun.phase]} · {latestRun.spentRequests} reqs · {formatUsd(latestRun.spentUsd)}
+            {RUN_MODE_LABEL[latestRun.capabilityTier] ?? 'Standard'} · {phaseNames[latestRun.phase]} · {latestRun.spentRequests} reqs · {formatUsd(latestRun.spentUsd)}
           </p>
         </> : <>
           <div className="big">No runs yet</div>
-          <p>Launch a Passive Recon or Authenticated BOLA run in one click.</p>
+          <p>Launch a Safe Audit or Core Pentest in one click.</p>
         </>}
       </div>
     </div>
@@ -161,7 +267,9 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
         <div>
           <h2>Runs <span className="muted num">({runs.length})</span></h2>
         </div>
-        <button type="button" className="pw-btn primary" onClick={onOpenNewRun}>New run</button>
+        {runs.length > 0 && (
+          <button type="button" className="pw-btn" onClick={onOpenNewRun}>New run</button>
+        )}
       </div>
       {runs.length > 0 ? (
         <div className="pw-table-wrap">
@@ -173,7 +281,7 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
                   <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{run.goal}</span>
                 </span>
                 <span className="pw-row-sub num">
-                  {capabilityTierMeta[run.capabilityTier].short} · {phaseNames[run.phase]} · {run.turnsUsed} turns · {run.spentRequests} reqs · {formatUsd(run.spentUsd)}
+                  {RUN_MODE_LABEL[run.capabilityTier] ?? 'Standard'} · {phaseNames[run.phase]} · {run.turnsUsed} turns · {run.spentRequests} reqs · {formatUsd(run.spentUsd)}
                 </span>
               </span>
               <span className="pw-row-right">
@@ -192,8 +300,10 @@ export function ProjectOverviewTab({ data, onSelectTab, onOpenNewRun }: Props) {
           ))}
         </div>
       ) : (
-        <div className="pw-empty">
-          <p>No assessment runs yet for {project.name}.</p>
+        <div className="pw-empty-card">
+          <RunsEmptySvg />
+          <h3>No runs yet</h3>
+          <p>Start a Safe Audit to map your surface, or run a Core Pentest with test accounts to verify access controls across {project.name}.</p>
           <button type="button" className="pw-btn primary" onClick={onOpenNewRun}>Start first run</button>
         </div>
       )}

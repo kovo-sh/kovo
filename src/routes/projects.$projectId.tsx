@@ -1,5 +1,5 @@
-import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { useState } from 'react'
+import { createFileRoute, Link, useLocation, useNavigate } from '@tanstack/react-router'
+import { useEffect, useState } from 'react'
 import { projectData, testPersonaAuthAction } from '../actions.ts'
 import { ProjectGuardrailsTab } from '../components/project/ProjectGuardrailsTab.tsx'
 import { ProjectInventoryTab } from '../components/project/ProjectInventoryTab.tsx'
@@ -12,9 +12,15 @@ import { isProjectTab, PROJECT_TABS, safeHost } from '../components/project/type
 import '../components/project/project.css'
 import type { PublicPersona } from '../domain.ts'
 
+type ProjectSearch = {
+  tab?: ProjectTabId
+  newRun?: string
+}
+
 export const Route = createFileRoute('/projects/$projectId')({
-  validateSearch: (search: Record<string, unknown>): { tab?: ProjectTabId } => ({
+  validateSearch: (search: Record<string, unknown>): ProjectSearch => ({
     ...(isProjectTab(search.tab) ? { tab: search.tab } : {}),
+    ...(search.newRun === '1' || search.newRun === 1 || search.newRun === true ? { newRun: '1' } : {}),
   }),
   loader: ({ params }) => projectData({ data: { projectId: params.projectId } }),
   component: ProjectPage,
@@ -24,12 +30,40 @@ function ProjectPage() {
   const data = Route.useLoaderData()
   const { project, assets, personas, specs, runs } = data
   const search = Route.useSearch()
+  const location = useLocation()
   const navigate = useNavigate()
 
   const activeTab: ProjectTabId = search.tab ?? 'overview'
-  const [newRunOpen, setNewRunOpen] = useState(false)
+  const hashWantsNewRun = location.hash === 'new-run' || location.hash === '#new-run'
+  const [newRunOpen, setNewRunOpen] = useState(() => Boolean(search.newRun) || hashWantsNewRun)
   const [selectedPersonaIds, setSelectedPersonaIds] = useState<string[]>(() => personas.map(p => p.id))
   const [personaTests, setPersonaTests] = useState<Record<string, PersonaTestState>>({})
+
+  useEffect(() => {
+    const openAndCleanUrl = () => {
+      setNewRunOpen(true)
+      void navigate({
+        to: '/projects/$projectId',
+        params: { projectId: project.id },
+        search: search.tab ? { tab: search.tab } : {},
+        hash: '',
+        replace: true,
+      })
+    }
+    const windowHashWantsNewRun =
+      typeof window !== 'undefined' && window.location.hash === '#new-run'
+    if (search.newRun || hashWantsNewRun || windowHashWantsNewRun) {
+      openAndCleanUrl()
+    }
+    if (typeof window === 'undefined') return
+    const onHashChange = () => {
+      if (window.location.hash === '#new-run') {
+        openAndCleanUrl()
+      }
+    }
+    window.addEventListener('hashchange', onHashChange)
+    return () => window.removeEventListener('hashchange', onHashChange)
+  }, [search.newRun, search.tab, hashWantsNewRun, project.id, navigate])
 
   function selectTab(next: ProjectTabId) {
     if (next === activeTab) return
@@ -46,7 +80,7 @@ function ProjectPage() {
       ...prev,
       [persona.id]: {
         status: 'testing',
-        message: persona.authKind === 'login' ? 'Logging in & testing GET…' : 'Testing safe GET…',
+        message: persona.authKind === 'login' ? 'Signing in and checking access…' : 'Checking access…',
       },
     }))
     try {
@@ -65,7 +99,7 @@ function ProjectPage() {
         ...prev,
         [persona.id]: {
           status: 'error',
-          message: err instanceof Error ? err.message : 'Auth check failed.',
+          message: err instanceof Error ? err.message : 'Sign-in check failed.',
         },
       }))
     }
@@ -79,6 +113,7 @@ function ProjectPage() {
     sources: specs.length,
     ...(allowlistCount > 0 ? { guardrails: allowlistCount } : {}),
   }
+  const showHeaderNewRun = !(activeTab === 'overview' && runs.length === 0)
 
   return <main className="pw">
     <header className="pw-hdr">
@@ -90,11 +125,13 @@ function ProjectPage() {
         <span className="pw-hdr-meta mono" title={project.seeds.join(', ')}>
           {project.seeds.map(safeHost).join(', ')}
         </span>
-        <div className="pw-hdr-actions">
-          <button type="button" className="pw-btn primary" onClick={() => setNewRunOpen(true)}>
-            New run
-          </button>
-        </div>
+        {showHeaderNewRun && (
+          <div className="pw-hdr-actions">
+            <button type="button" className="pw-btn primary" onClick={() => setNewRunOpen(true)}>
+              New run
+            </button>
+          </div>
+        )}
       </div>
     </header>
 
