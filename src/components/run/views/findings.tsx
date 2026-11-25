@@ -265,7 +265,7 @@ export function FindingsView() {
       {toolbar}
       <EmptyState icon="findings" title="No findings yet"
         action={model.run.status === 'waiting' ? <button type="button" className="btn" onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
-        Findings appear here as workers propose them; each one is replayed by the Zero-LLM verifier before it is marked confirmed.
+        Findings appear here as workers propose them; each one is verified by automated replay before it is marked confirmed.
       </EmptyState>
     </>
   }

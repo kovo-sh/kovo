@@ -37,7 +37,7 @@ export function LabPanel() {
     <div className="d-meta">
       <Tag tone={target ? 'accent' : undefined} icon="node">{state}</Tag>
       <Tag icon="activity">{cfg?.iastEnabled ? 'IAST enabled' : 'IAST off'}</Tag>
-      {!detail.localLabEnvEnabled && <Tag tone="warn" icon="alert">GUARDIAN_ALLOW_LOCAL_LAB is not set</Tag>}
+      {!detail.localLabEnvEnabled && <Tag tone="warn" icon="alert" title="Set GUARDIAN_ALLOW_LOCAL_LAB=1 to enable local lab containers">Local lab disabled in environment</Tag>}
     </div>
     <Props rows={[
       ['Stack', <span>Isolated Docker <span className="mono">--internal</span> · port <span className="num">{cfg?.internalPort ?? 8080}</span> · health <span className="mono">{cfg?.healthPath ?? '/health'}</span></span>],

@@ -14,6 +14,162 @@ export const fmtTime = (ms: number) => { const d = new Date(ms); return pad(d.ge
 export const fmtTimeS = (ms: number) => { const d = new Date(ms); return fmtTime(ms) + ':' + pad(d.getSeconds()) }
 export const fmtDay = (ms: number) => { const d = new Date(ms); return MON[d.getMonth()] + ' ' + d.getDate() }
 export const fmtDate = (ms: number) => fmtDay(ms) + ', ' + fmtTime(ms)
+/** Full local date + time for `title` tooltips (e.g. "Nov 22, 2026, 2:15 PM"). */
+export const fmtFullDateTime = (ms: number) => {
+  if (!Number.isFinite(ms)) return ''
+  try {
+    return new Date(ms).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+  } catch {
+    return fmtDate(ms)
+  }
+}
+/** Human relative time: `< 24h` -> "Just now" / "8m ago" / "3h ago"; `>= 24h` -> "Nov 22". */
+export const fmtAgo = (ms: number, now = Date.now()) => {
+  if (!Number.isFinite(ms)) return ''
+  const diff = Math.max(0, now - ms)
+  if (diff < 60_000) return 'Just now'
+  if (diff < 3_600_000) return Math.floor(diff / 60_000) + 'm ago'
+  if (diff < 86_400_000) return Math.floor(diff / 3_600_000) + 'h ago'
+  return fmtDay(ms)
+}
+
+/** Known URL query params used by run view sub-modes (preserved across selection updates). */
+export const RUN_SUBMODE_PARAMS = ['mode', 'version'] as const
+
+/** Read a single URL query param from `window.location.search` (SSR-safe). */
+export function readRunUrlParam(key: string): string | null {
+  if (typeof window === 'undefined') return null
+  return new URLSearchParams(window.location.search).get(key)
+}
+
+/** Sync a single URL query param via `history.replaceState` without disturbing TanStack Router state. */
+export function syncRunUrlParam(key: string, value: string | null | undefined) {
+  if (typeof window === 'undefined') return
+  const url = new URL(window.location.href)
+  const prev = url.searchParams.get(key)
+  if (!value) {
+    if (prev === null) return
+    url.searchParams.delete(key)
+  } else {
+    if (prev === value) return
+    url.searchParams.set(key, value)
+  }
+  const next = url.pathname + url.search + url.hash
+  window.history.replaceState(window.history.state, '', next)
+}
+
+const EVENT_KIND_LABELS: Record<string, string> = {
+  'broker.exchange': 'HTTP exchange',
+  'broker.allowed': 'Request allowed',
+  'broker.denied': 'Request blocked',
+  'broker.circuit_open': 'Host rate-limited',
+  'broker.route_circuit': 'Route paused',
+  'broker.persona_scope_mismatch': 'Test account scope mismatch',
+  'worker.started': 'Worker started',
+  'worker.complete': 'Worker finished',
+  'worker.failed': 'Worker failed',
+  'worker.canceled': 'Worker canceled',
+  'worker.stall_retry': 'Worker retry',
+  'worker.stall_failed': 'Worker stalled',
+  'worker.provider_stall': 'Model response stalled',
+  'worker.warm_pool_rotated': 'Worker container refreshed',
+  'finding.proposed': 'Finding drafted',
+  'finding.verified': 'Finding confirmed',
+  'finding.updated': 'Finding updated',
+  'finding.confirmation_conflict': 'Verification conflict',
+  'finding.floor_preserved': 'Verified finding preserved',
+  'verification.started': 'Verification started',
+  'retest.queued': 'Fix verification queued',
+  'retest.complete': 'Fix verification finished',
+  'planner.round': 'Planning round',
+  'planner.dry_streak': 'Planning stalled',
+  'planner.capped_reinvestigations': 'Re-investigation limit reached',
+  'planner.ready_steps_stranded': 'Queued steps waiting',
+  'chain_step.created': 'Plan step added',
+  'chain_step.canceled': 'Plan step canceled',
+  'graph.compacted': 'Memory compacted',
+  'fact.recorded': 'Fact recorded',
+  'evidence.reused': 'Evidence reused',
+  'evidence.restricted': 'Evidence restricted',
+  'approval.requested': 'Approval requested',
+  'approval.decided': 'Approval decided',
+  'approval.auto_approved': 'Auto-approved by policy',
+  'approval.auto_denied': 'Auto-denied by policy',
+  'approval.policy_changed': 'Approval policy updated',
+  'approval.pattern_approved': 'Similar requests approved',
+  'approval.batch_approved': 'Pending requests approved',
+  'approval.lease_granted': 'Approval window granted',
+  'approval.lease_revoked': 'Approval window revoked',
+  'approval.worker_parked': 'Worker waiting for approval',
+  'approval.worker_resumed': 'Worker resumed after approval',
+  'run.created': 'Run created',
+  'run.paused': 'Run paused',
+  'run.resumed': 'Run resumed',
+  'run.budget_paused': 'Paused at budget limit',
+  'budget.raised': 'Budget updated',
+  'scope.approved': 'Scope approved',
+  'scope.revoked': 'Scope updated',
+  'scope.environment_mode': 'Environment mode set',
+  'scope.route_denylist': 'Route blocklist updated',
+  'scope.origin_role': 'Host role updated',
+  'goal.revised': 'Goal updated',
+  'discovery.consented': 'Discovery started',
+  'discovery.complete': 'Discovery finished',
+  'threat_model.saved': 'Threat model saved',
+  'threat_model.failed': 'Threat model failed',
+  'review.planned': 'Review planned',
+  'report.partial': 'Partial report saved',
+  'report.complete': 'Final report ready',
+  'board.message': 'Board message',
+  'board.tainted': 'Board message marked outdated',
+  'coordinator.message': 'Coordinator message',
+  'hint.injected': 'Operator guidance added',
+  'asset.candidate': 'Host discovered',
+  'surface.probe': 'Surface check',
+  'sast.run': 'Code scan',
+  'code_audit.started': 'Code review started',
+  'code_audit.complete': 'Code review finished',
+  'patch.saved': 'Verified patch saved',
+  'persona.auth_failed': 'Test account sign-in failed',
+  'scheduler.dispatch': 'Worker dispatched',
+  'scheduler.queue_drain': 'Queue drained',
+  'scheduler.multi_trial': 'Parallel verification',
+  'trial.early_stopped': 'Trial stopped early',
+  'deterministic_engine.confirmed': 'Automated check confirmed',
+  'deterministic_engine.lead': 'Automated lead found',
+  'deterministic_engine.summary': 'Automated scan summary',
+  'deterministic_lane.started': 'Automated scan started',
+  'deterministic_lane.failed': 'Automated scan failed',
+  'deterministic_lane.aborting': 'Automated scan stopping',
+  'deterministic_lane.metrics': 'Automated scan metrics',
+  'deterministic_floor.summary': 'Baseline scan summary',
+  'request_budget.phase_started': 'Request budget phase started',
+  'request_budget.phase_ended': 'Request budget phase ended',
+  'request_budget.floor_settled': 'Baseline budget settled',
+  'request_budget.floor_exhausted': 'Baseline budget reached',
+  'request_budget.agent_exhausted': 'Agent request budget reached',
+  'agentic.assignment_metrics': 'Worker metrics',
+  'agent.proof_obligation': 'Verification check',
+  'agent.gap_validation': 'Coverage gap check',
+  'agent.early_exit': 'Worker finished early',
+  'oob.drain_complete': 'Callback check finished',
+  'oob.receipt_confirmed': 'Callback verified',
+  'proof_gaps.surfaced': 'Coverage gaps noted',
+  'second_order_canary.surfaced': 'Delayed signal detected',
+  'recovery.completed': 'Run recovered',
+  'retention.pruned': 'Old records pruned',
+  'staging.teardown': 'Lab teardown',
+  'staging.untagged_skipped': 'Untagged route skipped',
+  'interrupted': 'Run interrupted',
+}
+
+/** Convert raw dotted event keys (`broker.exchange`) into plain-English labels (`HTTP exchange`). */
+export function fmtEventKind(kind: string): string {
+  const exact = EVENT_KIND_LABELS[kind]
+  if (exact) return exact
+  const clean = kind.replace(/[._]+/g, ' ').trim()
+  return clean ? clean.charAt(0).toUpperCase() + clean.slice(1) : 'Event'
+}
 /** "+mm:ss" / "h:mm:ss" offset from the run start, used in time columns. */
 export const fmtRel = (ms: number, base: number) => {
   let s = Math.max(0, Math.round((ms - base) / 1000))

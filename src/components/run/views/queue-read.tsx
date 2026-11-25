@@ -4,6 +4,7 @@
 import { useState } from 'react'
 import type { ReactNode } from 'react'
 
+import { approvalPolicyMeta, capabilityTierMeta } from '../../run-state.ts'
 import { useFullExchange, useRun, useRunModel } from '../data.tsx'
 import { LinkRow, Section } from '../display.tsx'
 import { cap, capF, fmtDate, fmtN, fmtRel, fmtTime, fmtUsd, host, plural, prettyBody, words } from '../format.ts'
@@ -260,7 +261,7 @@ export function ReadApproval({ it }: { it: ApprovalItem }) {
   const policy = model.run.approvalPolicy
   return <>
     <div className="kicker">
-      <span className="sevlab" style={{ color: 'var(--warn)' }}><Icon name="shield" />Tier 3 approval</span><span>·</span>
+      <span className="sevlab" style={{ color: 'var(--warn)' }} title="Tier 3 state-changing request"><Icon name="shield" />State-change approval</span><span>·</span>
       <span className="num">Requested {fmtRel(a.createdAt, model.base)}</span>
       {win != null && win > 0 && <><span>·</span><span>{win}-minute window</span></>}
       <span>·</span><span>Risk {a.riskLevel ? a.riskLevel : 'unrated'}</span>
@@ -272,7 +273,7 @@ export function ReadApproval({ it }: { it: ApprovalItem }) {
     </div>
     <Section title="Why">
       <p className="lead">{a.rationale}</p>
-      <p>The approval policy is <b className="ctx-strong">{cap(policy)}</b>. {a.policyNote ? a.policyNote + ' ' : 'The Safety Judge deferred this state-changing method to you. '}{a.status === 'pending' ? 'Nothing is sent until you approve.' : ''}</p>
+      <p>The approval policy is <b className="ctx-strong">{approvalPolicyMeta[policy ?? 'auto_review'].label}</b>. {a.policyNote ? a.policyNote + ' ' : 'The safety reviewer deferred this state-changing request to you. '}{a.status === 'pending' ? 'Nothing is sent until you approve.' : ''}</p>
     </Section>
     <Section title="Request" right="Exactly what will be sent">
       {raw != null ? <pre className="block mono">{raw}</pre> : <pre className="block mono"><span className="pm">{rp.method ?? a.method}</span> {rp.pathAndQuery ?? a.pathAndQuery}{'\n'}<span className="pk">Host:</span> {host(rp.origin ?? a.origin)}
@@ -312,7 +313,7 @@ export function ReadFollow({ it, local }: { it: FollowItem; local: boolean }) {
     <Section title="If queued">
       {local
         ? <p>The run is complete, so nothing can be scheduled. Queuing records the follow-up locally for the next run on <span className="mono">{host(x.origin)}</span>.</p>
-        : <p>Guardian sends the coordinator a steering hint for <span className="mono">{host(x.origin)}</span> · {prettyCat(x.category)}; it becomes a plan step in the next planner round. Anything outside Tier {model.run.capabilityTier} comes back here as an approval.</p>}
+        : <p>Kovo Hunter sends the coordinator a steering hint for <span className="mono">{host(x.origin)}</span> · {prettyCat(x.category)}; it becomes a plan step in the next planner round. Requests requiring higher permissions come back here for approval.</p>}
     </Section>
     <Section title="Coordinator context"><CoordinatorContext origins={[x.origin]} category={x.category} excludeCoverageId={x.id} follow /></Section>
     <FoundBy workers={x.assignmentId && model.workerById.has(x.assignmentId) ? [x.assignmentId] : []} title="Recorded by" />
@@ -329,7 +330,7 @@ export function ReadConsent() {
     <div className="kicker"><span className="sevlab"><Icon name="flag" />Consent</span><span>·</span><span>Created {fmtDate(r.createdAt)}</span></div>
     <h2 className="rtitle">{r.phase === 'review' ? 'Approve scope to start the run' : 'Approve discovery to start the run'}</h2>
     <div className="rorigins">
-      <span className="tag num">{plural(seeds.length, 'host')}</span><span className="tag">Tier {r.capabilityTier}</span>
+      <span className="tag num">{plural(seeds.length, 'host')}</span><span className="tag" title={`Tier ${r.capabilityTier}`}>{capabilityTierMeta[r.capabilityTier].short}</span>
       <span className="tag num">{fmtUsd(r.budgetUsd)} · {r.budgetRequests ? fmtN(r.budgetRequests) + ' req' : 'uncapped'}</span>
     </div>
     <Section title="Goal">

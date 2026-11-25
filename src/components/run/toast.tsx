@@ -83,10 +83,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     try {
       const r = p.commit()
       if (r && typeof (r as Promise<unknown>).then === 'function') {
-        ;(r as Promise<unknown>).catch((e: unknown) => apiRef.current?.show(e instanceof Error ? e.message : 'Guardian could not complete the action.', { tone: 'error' }))
+        ;(r as Promise<unknown>).catch((e: unknown) => apiRef.current?.show(e instanceof Error ? e.message : 'Kovo Hunter could not complete the action.', { tone: 'error' }))
       }
     } catch (e) {
-      apiRef.current?.show(e instanceof Error ? e.message : 'Guardian could not complete the action.', { tone: 'error' })
+      apiRef.current?.show(e instanceof Error ? e.message : 'Kovo Hunter could not complete the action.', { tone: 'error' })
     }
   }, [])
 

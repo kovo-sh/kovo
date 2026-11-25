@@ -3,13 +3,13 @@
 // findings per host, fading crosshair, arrow-key cursor, ↵ opens the cell.
 // List: every coverage note (with enforcing controls and proof gaps).
 // Endpoints: the discovered route inventory (when the run recorded one).
-import { useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import type { MouseEvent as RMouseEvent, ReactNode } from 'react'
 import { Dropdown, FilterBox, matchQ, Tabs, Tip } from '../controls.tsx'
 import type { TipHandle } from '../controls.tsx'
 import { useRun, useRunModel } from '../data.tsx'
 import { EmptyState, HostLabel, LinkRow, Props, Section, Seg, Tag } from '../display.tsx'
-import { fmtDate, fmtN, host, plural } from '../format.ts'
+import { fmtDate, fmtN, host, plural, readRunUrlParam, syncRunUrlParam } from '../format.ts'
 import { CovSwatch, PinGlyph, SevGlyph, StatusGlyph, TierBars } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
@@ -25,6 +25,7 @@ import { EndpointInspector, EndpointsList } from './surface-endpoints.tsx'
 
 type Sort = 'risk' | 'findings' | 'az'
 type Mode = 'matrix' | 'list' | 'endpoints'
+const isSurfaceMode = (v: string | null): v is Mode => v === 'matrix' || v === 'list' || v === 'endpoints'
 const SHORT: Record<string, string> = { reported: 'Reported', needs_follow_up: 'Follow-up', no_issue_found: 'No issue', ruled_out: 'Ruled out', not_applicable: 'N/A', untested: 'Uncharted' }
 /** model.cellStatus, typed to include 'untested' (index access hides the fallback from TS). */
 const cellStatus = (m: SurfaceModel, o: string, c: string) => cellStatusRaw(m, o, c) as CoverageStatus
@@ -45,9 +46,28 @@ export function SurfaceView() {
   const nav = useNav()
   const M = model.surface
   const [sort, setSort] = useViewState<Sort>('surface.sort', 'risk')
-  const [mode, setMode] = useViewState<Mode>('surface.mode', 'matrix')
+  const [mode, setModeState] = useViewState<Mode>('surface.mode', 'matrix')
   const [filter, setFilter] = useViewState<CoverageStatus | ''>('surface.filter', '')
   const [, setListTab] = useViewState<string>('surface.list.tab', 'all')
+  const setMode = useCallback((next: Mode) => {
+    setModeState(next)
+    syncRunUrlParam('mode', next === 'matrix' ? null : next)
+  }, [setModeState])
+  useEffect(() => {
+    const fromUrl = readRunUrlParam('mode')
+    if (isSurfaceMode(fromUrl)) {
+      if (fromUrl !== mode) setModeState(fromUrl)
+    } else if (mode !== 'matrix') {
+      syncRunUrlParam('mode', mode)
+    }
+    const onPop = () => {
+      const u = readRunUrlParam('mode')
+      setModeState(isSurfaceMode(u) ? u : 'matrix')
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
   const hasList = detail.coverageEntries.length > 0
   const hasEndpoints = (detail.endpoints?.length ?? 0) > 0
   const effMode: Mode = mode === 'list' && !hasList ? 'matrix' : mode === 'endpoints' && !hasEndpoints ? 'matrix' : mode

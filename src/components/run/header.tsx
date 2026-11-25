@@ -11,7 +11,7 @@ import { approvalPolicies, maxBudgetRequests, maxRpsPerOriginCeiling } from '../
 import type { ApprovalPolicy } from '../../domain.ts'
 import { approvalPolicyMeta, capabilityTierMeta } from '../run-state.ts'
 import { useRun, useRunModel } from './data.tsx'
-import { fmtDate, fmtDur, fmtN, fmtTime, fmtUsd, host, plural, short } from './format.ts'
+import { fmtAgo, fmtFullDateTime, fmtDur, fmtN, fmtTime, fmtUsd, host, plural, short } from './format.ts'
 import { PhaseTrack, StatusGlyph, TierBars } from './glyphs.tsx'
 import { Icon } from './icons.tsx'
 import type { IconName } from './icons.tsx'
@@ -113,7 +113,19 @@ export function RunHeader() {
     <div className="hdr-top">
       <Link to="/projects/$projectId" params={{ projectId: detail.project.id }} className="crumb" title="Open project">{detail.project.name}</Link>
       <span className="crumb-sep">/</span>
-      <span className="crumb mono" style={{ color: 'var(--fg-2)' }}>{short(r.id)}</span>
+      <button
+        type="button"
+        className="crumb num"
+        style={{ color: 'var(--fg-2)' }}
+        title={`Started ${fmtFullDateTime(r.createdAt)} · Run ${r.id} (click to copy ID)`}
+        suppressHydrationWarning
+        onClick={() => void navigator.clipboard?.writeText(r.id).then(
+          () => toast.show('Copied run ID', { icon: 'check', sub: short(r.id) }),
+          () => toast.show('Could not copy run ID', { tone: 'error' }),
+        )}
+      >
+        {fmtAgo(r.createdAt)}
+      </button>
       <span className="goal" title={r.goal}>{r.goal}</span>
       <span className="hdr-actions" ref={wrap} style={{ position: 'relative' }}>
         {action}
@@ -178,14 +190,14 @@ export function RunHeader() {
       <button type="button" className="rl rl-btn" title={`Budget ${fmtUsd(r.spentUsd)} of ${fmtUsd(r.budgetUsd)} · ${fmtN(r.spentTokens)} tokens`} onClick={() => setPop(pop === 'budget' ? null : 'budget')}>
         <Meter id="hdr.budget" value={bPct} /><b>{fmtUsd(r.spentUsd)}</b><span className="dim">/ {fmtUsd(r.budgetUsd)}</span>
       </button>
-      <span className="rl" title="Brokered requests">
+      <span className="rl" title="HTTP requests sent through the safety proxy">
         {r.budgetRequests > 0 && <Meter id="hdr.req" value={rPct} />}
         <b>{fmtN(r.spentRequests)}</b><span className="dim">{r.budgetRequests ? '/ ' + fmtN(r.budgetRequests) + ' req' : 'req · uncapped'}</span>
       </span>
-      <button type="button" className="rl rl-btn" data-p="2" title={`${capabilityTierMeta[r.capabilityTier].name} · ${approvalPolicyMeta[r.approvalPolicy ?? 'auto_review'].label}`} onClick={() => setPop(pop === 'scope' ? null : 'scope')}>
-        <span>Tier {r.capabilityTier}</span><span className="dim">· {plural(scopeN, 'host')}</span>
+      <button type="button" className="rl rl-btn" data-p="2" title={`Tier ${r.capabilityTier} · ${capabilityTierMeta[r.capabilityTier].name} · ${approvalPolicyMeta[r.approvalPolicy ?? 'auto_review'].label}`} onClick={() => setPop(pop === 'scope' ? null : 'scope')}>
+        <span>{capabilityTierMeta[r.capabilityTier].short}</span><span className="dim">· {plural(scopeN, 'host')}</span>
       </button>
-      <span className="rl" data-p="1" title={`Started ${fmtDate(r.createdAt)}`}><span className="dim">{dur > 60_000 ? fmtDur(dur) : 'Created ' + fmtTime(r.createdAt)}</span></span>
+      <span className="rl" data-p="1" title={`Started ${fmtFullDateTime(r.createdAt)}`}><span className="dim">{dur > 60_000 ? fmtDur(dur) : 'Created ' + fmtTime(r.createdAt)}</span></span>
     </div>
   </header>
 }
@@ -236,7 +248,7 @@ function PolicyPopover({ onClose }: { onClose: () => void }) {
   const current: ApprovalPolicy = r.approvalPolicy ?? 'auto_review'
   const editable = !['complete', 'stopped', 'failed'].includes(r.status)
   const [err, setErr] = useState('')
-  return <PopShell title="Tier 3 approval policy" sub={editable ? 'Switches live' : runStatusLabel(r.status)} footer={err ? <span className="err">{err}</span> : undefined}>
+  return <PopShell title="Approval policy" sub={editable ? 'Switches live' : runStatusLabel(r.status)} footer={err ? <span className="err">{err}</span> : undefined}>
     {approvalPolicies.map(p => {
       const m = approvalPolicyMeta[p]
       return <button key={p} type="button" className={'opt' + (p === current ? ' on' : '')} disabled={!editable || pending > 0 || p === current}

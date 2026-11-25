@@ -63,7 +63,7 @@ export function EndpointsList({ modeSeg }: { modeSeg: ReactNode }) {
           <span className="c-dur num" title="Coverage">{ep.coveragePct != null ? Math.round(ep.coveragePct) + '%' : '—'}</span>
         </div>
       })}
-      {deps.length > 0 && <div className="listnote" style={{ paddingBottom: 12 }}><Icon name="chain" />{fmtN(deps.length)} producer → consumer dependencies, {deps.filter(d => d.testedBola).length} BOLA-tested. Open an endpoint to see its edges.</div>}
+      {deps.length > 0 && <div className="listnote" style={{ paddingBottom: 12 }} title="Producer → consumer dependencies checked for BOLA/IDOR"><Icon name="chain" />{fmtN(deps.length)} endpoint data-flow links, {deps.filter(d => d.testedBola).length} checked for cross-account access. Open an endpoint to see its links.</div>}
     </div>
   </>
 }
@@ -107,7 +107,7 @@ export function EndpointInspector({ sel }: InspectorProps) {
       {deps.length > 0 && <Section title="API dependencies" right={deps.length}>
         {deps.map(d => {
           const other = d.producerEndpointId === ep.id ? d.consumerEndpointId : d.producerEndpointId
-          return <LinkRow key={d.id} icon="chain" trailing={null} right={d.testedBola ? 'BOLA tested' : 'Pending BOLA'}
+          return <LinkRow key={d.id} icon="chain" trailing={null} right={<span title="Cross-account object access check (BOLA/IDOR)">{d.testedBola ? 'Access checked' : 'Pending access check'}</span>}
             sub={[d.resourceKey, d.personaHandle, d.observedTransitions.join(' → ')].filter(Boolean).join(' · ')}
             onClick={() => nav.select({ kind: 'endpoint', id: other }, { push: true })}>
             {d.producerEndpointId === ep.id ? 'Produces for ' : 'Consumes from '}<span className="mono">{label(other)}</span>

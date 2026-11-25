@@ -11,7 +11,7 @@ import { formatExchangeAsCurl } from '../../curl-parser.ts'
 import { Dropdown, FilterBox, matchQ, Tabs, useDebounced, VList } from '../controls.tsx'
 import { useFullExchange, useRun, useRunModel } from '../data.tsx'
 import { EmptyState, LinkRow, Props, Section, Seg, Skeleton, Tag } from '../display.tsx'
-import { fmtN, fmtRel, fmtTimeS, host, plural, prettyBody, short } from '../format.ts'
+import { fmtAgo, fmtFullDateTime, fmtN, fmtRel, fmtTimeS, host, plural, prettyBody } from '../format.ts'
 import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
@@ -160,7 +160,7 @@ export function ExchangesView() {
   if (!rows.length && eventsReady && !counts.exchanges) {
     return <EmptyState icon="exchanges" title="No exchanges yet"
       action={detail.run.status === 'waiting' ? <button type="button" className="btn" onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
-      Every request a worker makes passes through the policy broker and is logged here, allowed or denied.
+      Every request a worker makes passes through the safety proxy and is logged here, whether allowed or blocked.
     </EmptyState>
   }
 
@@ -169,7 +169,7 @@ export function ExchangesView() {
     <Icon name="exchanges" />
     {missing > 0
       ? <span>{fmtN(allowedCount)} of {fmtN(counts.exchanges)} exchanges loaded{!eventsReady ? '; the event log is still replaying' : ''}.</span>
-      : <span>All {fmtN(counts.exchanges)} brokered exchanges{rows.length > allowedCount ? ` and ${plural(rows.length - allowedCount, 'denial')}` : ''}. Rows older than the newest {fmtN(detail.exchangesSummary.length)} load their headers when opened.</span>}
+      : <span>All {fmtN(counts.exchanges)} HTTP exchanges{rows.length > allowedCount ? ` and ${plural(rows.length - allowedCount, 'blocked request')}` : ''}. Rows older than the newest {fmtN(detail.exchangesSummary.length)} load their headers when opened.</span>}
   </div>
 
   return <>
@@ -225,7 +225,7 @@ export function ExchangesView() {
             <span className="c-meth mono">{r.method}</span>
             <span className={'c-code mono num ' + (r.denied ? 'sf-deny' : 'code-' + String(r.status)[0])}>{r.denied ? <Icon name="slash" size={13} /> : r.status}</span>
             {group !== 'origin' && <span className="mono muted sf-xhost">{host(r.origin)}</span>}
-            <span className="c-path mono" title={r.path}>{r.denied ? <span className="sf-deny-t">{r.note ?? 'Denied by the broker'}</span> : r.path}</span>
+            <span className="c-path mono" title={r.path}>{r.denied ? <span className="sf-deny-t">{r.note ?? 'Blocked by safety rules'}</span> : r.path}</span>
             {r.persona && group !== 'persona' && <span className="c-persona"><Tag icon="lock">{r.persona}</Tag></span>}
             {hitIds.has(r.id) && <span className="sf-hit" title="Matched in the body or headers by server search"><Icon name="search" size={12} /></span>}
             <span className="c-dur mono num">{r.dur != null ? fmtN(r.dur) + 'ms' : ''}</span>
@@ -277,17 +277,17 @@ function ExchangeInspector({ sel }: InspectorProps) {
     const origin = str(ev?.detail.origin) ?? ''
     const w = ev ? model.workerById.get(str(ev.detail.assignmentId) ?? '') : undefined
     return <>
-      <PaneHeader title="Denied request" sub={ev ? '#' + ev.id : undefined} />
+      <PaneHeader title="Blocked request" sub={ev ? <span title={`${fmtFullDateTime(ev.createdAt)} · Event #${ev.id}`} suppressHydrationWarning>{fmtAgo(ev.createdAt)}</span> : undefined} />
       <PaneBody><div className="d">
         {!ev ? <Skeleton rows={4} /> : <>
-          <div className="d-meta"><Tag icon="slash">{ev.kind === 'broker.circuit_open' ? 'Circuit open' : 'Denied by broker'}</Tag></div>
+          <div className="d-meta"><Tag icon="slash" title={ev.kind}>{ev.kind === 'broker.circuit_open' ? 'Rate limit pause' : 'Blocked by scope'}</Tag></div>
           <h2 style={{ fontSize: 14, lineHeight: '21px', fontWeight: 500 }}>{ev.message}</h2>
           <Props rows={[
-            ['Time', <span className="num">{fmtTimeS(ev.createdAt)} <span className="mono muted">{fmtRel(ev.createdAt, model.base)}</span></span>],
+            ['Time', <span className="num" title={fmtFullDateTime(ev.createdAt)}>{fmtTimeS(ev.createdAt)} <span className="mono muted">{fmtRel(ev.createdAt, model.base)}</span></span>],
             ...(origin ? [['Origin', <span className="mono">{host(origin)}</span>, () => links.host(origin)] as [ReactNode, ReactNode, () => void]] : []),
             ...(w ? [['Worker', <><StatusGlyph status={w.status} /><span className="sf-ell">{w.title}</span><Icon name="workflow" /></>, () => links.worker(w.id)] as [ReactNode, ReactNode, () => void]] : []),
           ]} />
-          <p className="sf-note">The policy broker refused this request before it left Guardian: the origin is outside the approved scope or its circuit breaker is open. Nothing was sent.</p>
+          <p className="sf-note">The safety proxy blocked this request before it left Kovo Hunter: the host is outside the approved scope or paused by its circuit breaker. Nothing was sent.</p>
           <Section title="Related"><LinkRow icon="activity" onClick={() => links.event(ev.id)}>Open in Activity</LinkRow></Section>
         </>}
       </div></PaneBody>
@@ -323,7 +323,18 @@ function ExchangeInspector({ sel }: InspectorProps) {
       () => toast.show('Could not copy to the clipboard', { tone: 'error' }))
   }
   return <>
-    <PaneHeader title="Exchange" sub={short(id)} extra={<button type="button" className="icon-btn" title="Copy as cURL" aria-label="Copy as cURL" onClick={copyCurl}><Icon name="download" />cURL</button>} />
+    <PaneHeader
+      title="HTTP exchange"
+      sub={
+        <span
+          title={`${method ? method + ' ' : ''}${origin}${path}${t ? ' · ' + fmtFullDateTime(t) : ''} · ID ${id}`}
+          suppressHydrationWarning
+        >
+          {[method || null, status || null, t ? fmtAgo(t) : null].filter(Boolean).join(' · ') || 'Details'}
+        </span>
+      }
+      extra={<button type="button" className="icon-btn" title="Copy as cURL" aria-label="Copy as cURL" onClick={copyCurl}><Icon name="download" />cURL</button>}
+    />
     <PaneBody><div className="d">
       <div className="d-meta">
         <Tag mono>{method || '—'}</Tag>
@@ -361,11 +372,11 @@ function ExchangeInspector({ sel }: InspectorProps) {
         <Section title="Request headers" right={Object.keys(full.reqHeaders ?? {}).length || undefined}><HeaderTable headers={full.reqHeaders} flagged={new Set()} /></Section>
         <Section title="Response headers" right={Object.keys(resp).length || undefined}><HeaderTable headers={resp} flagged={flagged} /></Section>
       </>}
-      {iast.length > 0 && <Section title="IAST traces" right={iast.length}>
-        {iast.map(x => <LinkRow key={x.id} icon="node" trailing={model.evidenceById.has(x.artifactId) ? 'chevR' : null}
+      {iast.length > 0 && <Section title="Runtime traces" right={iast.length}>
+        {iast.map(x => <LinkRow key={x.id} icon="node" title={`Trace ${x.traceId}`} trailing={model.evidenceById.has(x.artifactId) ? 'chevR' : null}
           sub={x.routesHit.join(', ') || undefined} right={`${x.newLinesCovered} lines · ${x.sinkEventsCount} sinks`}
           onClick={() => model.evidenceById.has(x.artifactId) && links.evidence(x.artifactId)}>
-          {x.hasUnhandledException ? 'Unhandled exception' : 'Trace'} <span className="mono muted">{short(x.traceId)}</span>
+          {x.hasUnhandledException ? 'Unhandled exception' : 'Runtime trace'}
         </LinkRow>)}
       </Section>}
       {body && <Section title={full && full.body.length > (sum?.bodyPreview.length ?? 0) ? 'Response body' : 'Body preview'} right={full ? fmtN(full.body.length) + ' chars' : undefined}>
