@@ -42,6 +42,7 @@ import {
   websocketResultToExchange,
   type BrokerExchangeResult,
   type BrokerHttpRequest,
+  type BrokerOptions,
   type BrokerRaceBurstResult,
   type Grant,
 } from './broker.ts'
@@ -176,12 +177,17 @@ import { ExecBoardManager } from './exec-board.ts'
 type Active = ExecActiveJob
 type CoordinatorTask = ExecCoordinatorTask
 
-function createBroker(options: { storage: SecondOrderStore; canaryBroker: CanaryBroker }) {
+function createBroker(options: {
+  storage: SecondOrderStore
+  canaryBroker: CanaryBroker
+  reauth?: BrokerOptions['reauth']
+}) {
   const target = process.env.KOVO_NETWORK_FIXTURE
+  const reauthOpt = options.reauth ? { reauth: options.reauth } : {}
   if (!target) {
     return process.env.KOVO_OFFLINE === '1'
-      ? new RequestBroker({ resolve: async () => [], storage: options.storage, canaryBroker: options.canaryBroker })
-      : new RequestBroker({ storage: options.storage, canaryBroker: options.canaryBroker })
+      ? new RequestBroker({ resolve: async () => [], storage: options.storage, canaryBroker: options.canaryBroker, ...reauthOpt })
+      : new RequestBroker({ storage: options.storage, canaryBroker: options.canaryBroker, ...reauthOpt })
   }
   const fixture = new URL(target)
   if (fixture.origin !== target || fixture.hostname !== '127.0.0.1' || fixture.protocol !== 'http:' || !fixture.port) {
@@ -190,6 +196,7 @@ function createBroker(options: { storage: SecondOrderStore; canaryBroker: Canary
   return new RequestBroker({
     storage: options.storage,
     canaryBroker: options.canaryBroker,
+    ...reauthOpt,
     source: 'fixture response',
     resolve: async host => host.endsWith('.private-fixture.example')
       ? [{ address: '127.0.0.1', family: 4 }]
@@ -600,13 +607,16 @@ export class Execution {
       ...(options.agentRequestBudget !== undefined ? { agentRequestBudget: options.agentRequestBudget } : {}),
     })
     this.canaryBroker = options.canaryBroker ?? new CanaryBroker({ storage })
+    this.personaAuth = options.personaAuth ?? new PersonaAuthManager()
     this.broker = options.broker ?? createBroker({ storage, canaryBroker: this.canaryBroker })
+    if (!options.broker) {
+      this.broker.setReauth(personaHandle => this.personaAuth.requestReauth(personaHandle))
+    }
     // `storage` activates second-order canary scanning inside the browser context too.
     this.browser = options.browser ?? new ScopedBrowser(this.broker, { storage })
     this.backend = options.backend ?? new LinuxWorkerBackend({
       workspace: { id: storage.workspace.id, directory: storage.directory },
     })
-    this.personaAuth = options.personaAuth ?? new PersonaAuthManager()
     this.labRunner = options.labRunner ?? new LabRunner()
     const core: ExecCoreServices = {
       storage: this.storage, broker: this.broker, browser: this.browser,
@@ -1059,7 +1069,12 @@ export class Execution {
     // session clone. A logout/rotation in one clone can never 401 a sibling worker.
     const personas = new Map(
       [...resolvedPersonas.entries()].map(([handle, persona]) => {
-        const cloned = cloneWorkerPersona(persona, job.assignment.id, (h, wid) => this.personaAuth.cloneSession(h, wid))
+        const cloned = cloneWorkerPersona(
+          persona,
+          job.assignment.id,
+          (h, wid) => this.personaAuth.cloneSession(h, wid),
+          h => this.personaAuth.sessions.session(h),
+        )
         if (!cloned) return [handle, persona] as const
         const tracked = this.workerSessionClones.get(job.assignment.id) ?? []
         tracked.push({ handle: cloned.persona.handle, clone: cloned.clone })
@@ -1088,6 +1103,7 @@ export class Execution {
       allowLocalLab,
       personas,
       secrets,
+      ...(project.sandboxWriteAllowlist?.length ? { sandboxWriteAllowlist: project.sandboxWriteAllowlist } : {}),
       // Second-order canary scanning needs both the store and the minting broker; without these
       // the broker/browser silently skip `scanSecondOrderMarkers`.
       storage: this.storage,
@@ -1096,6 +1112,7 @@ export class Execution {
       // v6 Layer-1: every request is evaluated against the run's 3-tier origin policy, and an
       // explicit operator lease (never a body-hash token) authorizes an otherwise-refused route.
       scopePolicy: this.storage.scopePolicy(run),
+      approvalPolicy: run.approvalPolicy,
       // Explicit operator leases authorize otherwise-refused routes for long-lived engagements.
       // Ephemeral local labs keep the exact single-use fingerprint ledger authoritative, so a
       // consumed instance can never be replayed.
@@ -3232,7 +3249,11 @@ export class Execution {
     const readyChainSteps = readySteps.filter(step => isMultiHopChainStep(step)).length
     const activeForRun = [...this.active.values()].filter(j => j.assignment.runId === run.id && j.assignment.phase === 'investigation').length
     const budgetUsdRemaining = Math.max(0, run.budgetUsd - run.spentUsd)
-    const budgetRequestsRemaining = Math.max(0, run.budgetRequests - run.spentRequests)
+    // `budgetRequests === 0` means "Unlimited requests" (uncapped); treat as Infinity so AIMD is
+    // not forced into `tightControlBounds` on default uncapped runs.
+    const budgetRequestsRemaining = run.budgetRequests > 0
+      ? Math.max(0, run.budgetRequests - run.spentRequests)
+      : Number.POSITIVE_INFINITY
     const controller = this.phaseBControllerFor(run)
     const explicitOverride = this.workerConcurrencyOverride ?? parseEnvPhaseBConcurrencyOverride()
     const tightControlBounds = run.maxRpsPerOrigin < PHASE_B_MIN_CONCURRENCY_FLOOR
