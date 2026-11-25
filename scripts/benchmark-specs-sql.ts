@@ -226,7 +226,11 @@ function cut3RecipeEnvelope(
     ...(selection.baselineValue ? { baselineValue: selection.baselineValue } : {}),
     ...(selection.quoteStyle ? { quoteStyle: selection.quoteStyle } : {}),
     ...(selection.valueTemplate ? { valueTemplate: selection.valueTemplate } : {}),
-    ...(env.caps.sessionAndCsrf ? { session: env.session, csrfBind: true, primePath: '/' } : {}),
+    // CSRF material only belongs on a form carrier: binding a token into an XML/JSON/header/path
+    // arm would rewrite the payload and make both arms identical.
+    ...(env.caps.sessionAndCsrf && location === 'form'
+      ? { session: env.session, csrfBind: true, primePath: '/' }
+      : {}),
   }
   const args = mode === 'timing'
     ? {
