@@ -1026,3 +1026,23 @@ Dev floor 36/59 (3 runs, 0 spread), xben 25/25, held-out-saas 20/20 + 20/20 patc
 **Erratum resolution:** The 26-vs-28 certificate erratum resolves to **28/58** (`VERIFICATION-v5.md` §V7.1–V7.2 updated from `PROVISIONAL` to `PASS`). The `viewer` persona legitimately owns store `9ca676`; `0df720d` had dropped post-observation `state_restore`, leaving the session pinned to another store for subsequent probes.
 
 **Unrelated follow-up surfaced on the agentic cell:** 1 `agent_only` `http_chain` CWE-639 `unmatchedFalsePositive` on a public storefront read (public attribution field `author` defeating `assessPublicness` + multi-probe read selection / collection-only cross-tenant read gap) — closed in `oracle-invariants.ts` with Tier-0 FP corpus coverage.
+
+### 2026-11-24 — v7 Milestone Wave (`222bc90 -> eec6419`): Decomposition, VM Retirements, 3/3 Realism PASS, Live `ProofReceipt`, & Kovo Hunter UX
+
+Major verified milestones merged onto `main` through `eec6419` (all backed by `worker-gate.sh` 66/66 PASS and serialized Docker verification):
+
+1. **`execution.ts` decomposition & wave-pipeline throughput (`2e1b2ed`):**
+   - Decomposed `src/server/execution.ts` from **13,960 -> 5,388 LOC (−61.4%)**, **−468 net `src/` LOC**, 4/4 parity PASS @ 100%, eliminated Round-1/mid-wave false dry stops, and buffered 2-wave planner pipelines (`worker.started: 23`, `worker.complete: 18`, `0` provider stalls).
+2. **`replay-verifier.ts` VM retirement (`51819a8`, `c3da71f`):**
+   - Retired 8 legacy declarative VM kinds across Cut 3c-1 (5 kinds), Cut 3c-2 (`sql_boolean_diff`/`sql_time_diff`), and Cut 3d (`race_burst`), reducing `src/server/replay-verifier.ts` from **4,268 -> 3,507 LOC (−761 LOC)** (`3,524 LOC` at `eec6419` with the strict receipt guard).
+   - Restored `xben-25` to **25/25 (100% recall, 100% precision, 0 FP)** on Docker (`51819a8`), and restored `held-out-saas` `hos-08` to **19/20 + 19/20 patches @ 100%** on Docker (`c3da71f`; `hos-07` probe-stage signal miss remains open).
+3. **All 3 Realism suites CAPABILITY PASS + new deterministic floor highs (`aca8262`):**
+   - **Realism #2 (`wan-oob --no-llm`, Docker):** **CAPABILITY PASS — 4/4 (100%)**, blind SQLi timing (`CWE-89`), async SSRF ✅, async XXE ✅, `wan-oob-exfil` **3/3**, `oob_wiring_fnr: 0.0%`, 100% precision. Combined with #3 (`staging-concurrency` 3/3) and #4 (`monorepo-whitebox` 3/3, chain 2/2), **all 3 Realism suites now CAPABILITY PASS @ 100%**.
+   - **Deterministic floors (`Execution --no-llm --no-conventional-wordlist --isolate-data-dir --concurrency 1`, Docker):** dev **37/59 (14/13/10) @ 100%**, salted held-out (`seed 1000042`) **29/58 (11/11/7) @ 100%** (`api-jwt-alg-none` confirmed on both).
+4. **Live Docker `guardian_verify` `ProofReceipt` (`proof_kind='agent_script'`) unlocked & hardened (`d1e0192`, `b0767c5`, `b608e69`, `9828e5d`, `eec6419`):**
+   - Fixed inline TS/Python wrapper contract (`d1e0192`), fixed Docker `umask 0077` `EACCES` on `/guardian-rpc` staging (`b0767c5`), allowed `guardian_verify` on final settlement turns + normalized SDK arg shapes (`b608e69`), and confirmed the **first live Docker `proof_kind='agent_script'` `ProofReceipt`** (`CWE-639` on `9828e5d`).
+   - Closed the receiptless mutating-boundary `CWE-200` FP fail-closed in `runAgentScriptProof` + `persistAgentScriptProof`, added `code`/`source` aliases + 3-error loop breaker, raised `alreadyConfirmed` cap `10 -> 30`, and excluded floor-confirmed routes from BOLA/high-risk dispatch (`eec6419`).
+5. **Product UX & Kovo Hunter Brand Kit (`4d70351`, `266c478`, `3e075f0`, `e7f526d`, `ecd953a`, `03e9cdf`, `cce25e3`, `107cc31`, `370b9c2`, `a985be9`):**
+   - Shipped Option 3 unified `.rw` left-rail workbench (`/` Projects Home, 5-tab `/projects/$projectId`, `/settings`, global `⌘K`), Kovo Hunter SVG/favicon kit, vault-backed `0600` Fine-Grained GitHub PAT + repo auto-discovery (in both `/projects/$projectId` and `Create project` modal), Phase-0 CT-log subdomain discovery (`*.domain` opt-in + unchecked third-party CNAMEs with explicit approval), multi-device ephemeral pairing links + session rotation, Prototype A `New run` dialog, and `Test Accounts` UI rename.
+6. **Next — Queue #13b Final Unified Agentic Certification (`eec6419`, IN FLIGHT):**
+   - Running serialized Docker matrices on `eec6419` (`deepseek/deepseek-v4.1-flash-1017`): Dev unified (`>= 40/59` target), Salted held-out unified (`>= 32/58` target), and Tier-1 Smoke (`8/8` warm agentic post-floor snapshots). Results will be recorded in `VERIFICATION-v5.md` §V7.7 upon completion.

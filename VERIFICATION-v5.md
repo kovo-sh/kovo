@@ -19,61 +19,54 @@
 
 > **This section is new and supersedes nothing.** The v5.0 freeze record (§2–§3, §6) and the v5.1 integration record (§0) stay intact and historical. Nothing below is a release gate result, a certification, or a shipped number. It records what the v6 line measured, what it did not, and the battery/protocol v7 will use to turn a measurement into a claim.
 
-**Status:** v7 **M0-interim** (2026-11-24). Recorded: floor + legacy regression + realism wiring milestone (see V7.2). **Not certified for agentic lift** — held-out lift is 0 and 2 unmatched FPs remain. v6 remains the shipped baseline. Floor + realism numbers below supersede V7.1 from the 2026-11-23 snapshot.
+**Status:** v7 **M0/M1-pre-certification** (2026-11-24, `main` @ `eec6419`). Recorded: **all 3 Realism suites CAPABILITY PASS @ 100%**, new deterministic floor highs on both dev (**37/59**) and salted held-out (**29/58**) @ 100% precision, `execution.ts` decomposed (`13,960 -> 5,388 LOC`, `-61.4%`), `replay-verifier.ts` VM cut (`4,268 -> 3,507 LOC`, `xben-25` **25/25 @ 100%**), first live Docker `proof_kind='agent_script'` `ProofReceipt` confirmed (`9828e5d`), and strict fail-closed receipt gate + floor-confirmed route exclusion landed (`eec6419`). **Queue #13b Final Unified Agentic Certification (`eec6419`) is in flight** (see §V7.7) — agentic lift is **not yet certified** until Queue #13b completes.
 
-### V7.1 Current measured numbers
+### V7.1 Current measured numbers (`main` through `eec6419`)
 
-All product rows are real `Execution` on the 3-app realistic dev cells (acme-saas, shopflow, opsportal), seed 1, grey-box, Tier-3 local-lab, Docker verifier, wordlists off, serial unless noted.
+All product rows are real `Execution` on the 3-app realistic cells (`acme-saas`, `shopflow`, `opsportal`), grey-box, Tier-3 local-lab, Docker verifier (`--verifier docker --isolate-data-dir --concurrency 1`), wordlists off (`--no-conventional-wordlist`), serial unless noted.
 
-| Measure | Result | Scope / caveat |
+| Measure | Result | Commit / Scope / Caveat |
 | :--- | :--- | :--- |
-| Product floor (`Execution --no-llm`) | **36 / 59 (61.0%)**, **100%** precision, 0 decoy/unmatched | acme **14**, shopflow 12, opsportal 10; 3 runs, 0 spread, identical site-set hash |
-| Floor determinism | **0 spread**, 3 repeats identical (site sets included, `driftApps=0`) | Re-gated on the current tree |
-| Salted held-out product floor (seed 1000042) | **28 / 58 (48.3%)**, **100%** precision, 0 decoy/unmatched | acme 11, shopflow **10**, opsportal 7; 0 `broker.persona_scope_mismatch` events; `persona-binding` (`222bc90`) resolved the 26-vs-28 erratum (viewer legitimately owns `9ca676`; `0df720d` had dropped `state_restore`) |
-| Agentic, 600 s generous, 3 apps dev | **35 / 59 (59.3%)**, **100%** precision, 0 unmatched, **+2 net** | acme 13 (+1), shopflow 12 (+1), opsportal 10 (**+0**); ~$1.0 total |
-| Agentic, 600 s generous, 3 apps salted held-out | **29 / 58 (50.0%)**, **+1 net**, **100%** precision, 0 unmatched, 0 decoy | acme 11, shopflow **11**, opsportal 7; floor 28/58; 39 investigations; first fully quotable precision run |
-| Agentic rotation (shopflow, resumed, 300 s) | **3 / 19**, **100%** precision, p50 **77.5 s** | After injection-class precedence fix |
-| XBEN-25 | **25 / 25**, 100% precision | Hard regression gate |
-| held-out-saas | **20 / 20** + **20 / 20 patches** (`allPatches=fixed`) | Hard regression gate |
-| Realism #2 (`wan-oob`, no-llm) | **2 TP / 0 FP**; async **SSRF ✅**, async **XXE ✅**; gate still fails on blind-SQLi, blended async FNR 33.3%, chain 2/3 | Gate denominator split in flight |
-| Realism #3 (`staging-concurrency`) | **capability PASS** — write-BOLA, h2 single-packet race (2 ms spread, 4 acks / 1 debit), checkout tampering; 0 leaks; 100% precision | |
-| Realism #4 (`monorepo-whitebox`) | wiring PASS; 4-hop confirmations **3 / 3** at 100% precision, chain `mono-tenant-takeover` 2/2, canonical spec synthesis (fallbacks deleted) | v7's #1 bet converted |
-| `execution.ts` size | ~**11.5K LOC** | Grew with brief slices; Cut 3a target < 8.5K |
+| Product floor (`Execution --no-llm`, dev seed 1) | **37 / 59 (62.7%)**, **100%** precision, 0 decoy/unmatched FPs | `aca8262`: acme **14/22**, shopflow **13/19** (`api-jwt-alg-none` confirmed), opsportal **10/17**; 0 spread on prior 36/59 repeat |
+| Salted held-out product floor (`Execution --no-llm`, seed `1000042`) | **29 / 58 (50.0%)**, **100%** precision, 0 decoy/unmatched FPs | `aca8262`: acme **11/22**, shopflow **11/19** (`api-jwt-alg-none` confirmed), opsportal **7/17**; 0 `broker.persona_scope_mismatch` events |
+| Live `guardian_verify` (`proof_kind='agent_script'`) on Docker | First live Docker `ProofReceipt` confirmed (`CWE-639`); 0 `EACCES`, 0 stalls, 23 started / 18 completed | `9828e5d` (`600s` `acme-saas` dev seed 1, `$0.52`, `K=6`); 1 receiptless `CWE-200` FP closed fail-closed in `eec6419` |
+| Unified agentic — Dev seed 1 (`600s`, `K=6`, `$5.0` cap) | **PENDING Queue #13b** (target `>= 40/59` @ 100%) | In flight on `eec6419` (prior `aca8262` acme single-cell: 14/22 @ 100%, 0 stalls) |
+| Unified agentic — Salted held-out `1000042` (`600s`, `K=6`, `$5.0` cap) | **PENDING Queue #13b** (target `>= 32/58` @ 100%) | In flight on `eec6419` (prior baseline: 29/58 @ 100%) |
+| Tier-1 Smoke (`--tier 1`, warm agentic post-floor snapshots, `$0.80`/cell) | **PENDING Queue #13b** (target `8/8` PASS) | In flight on `eec6419` (`trap-zero` 0 confirmed, `0` stalls verified on `aca8262`) |
+| XBEN-25 (`--verifier-backend docker`) | **25 / 25 (100%)**, 100% precision, 0 FP | `51819a8` (after Cut 3c-1/3c-2 SQL + Cut 3d `race_burst` VM retirement) |
+| `held-out-saas --verify-patches` (`--verifier-backend docker`) | **19 / 20 (95%)** + **19 / 20 patches fixed**, 100% precision | `c3da71f` (`hos-08` restored via dotted JSON param carrier fix; `hos-07` probe-stage miss open) |
+| Realism #2 (`wan-oob --no-llm`, Docker) | **CAPABILITY PASS — 4 / 4 (100%)**, 100% precision (3 TP / 0 FP) | `aca8262`: blind SQLi timing (`CWE-89`), async SSRF ✅, async XXE ✅, `wan-oob-exfil` **3/3**, `oob_wiring_fnr: 0.0%` |
+| Realism #3 (`staging-concurrency`, Docker) | **CAPABILITY PASS — 3 / 3 (100%)**, 100% precision | Write-BOLA, h2 single-packet race (2 ms spread, 4 acks / 1 debit), checkout tampering; 0 leaks |
+| Realism #4 (`monorepo-whitebox`, Docker) | **CAPABILITY PASS — 3 / 3 (100%)**, chain `2/2`, 100% precision | Canonical spec synthesis (`fe578db`, fallbacks deleted) |
+| `src/server/execution.ts` size | **5,388 LOC** (down from `13,960 LOC`, **−61.4%**) | `2e1b2ed`: −468 net `src/` LOC, 4/4 parity PASS @ 100% |
+| `src/server/replay-verifier.ts` size | **3,507 LOC** at Cut 3d (`51819a8`, **−761 LOC** from `4,268`); **3,524 LOC** at `eec6419` | Cut 3c-1 (5 kinds) + Cut 3c-2 (SQL) + Cut 3d (`race_burst`) retired; +17 LOC fail-closed receipt guard in `eec6419` |
+| Product UX & Kovo Hunter brand kit | Shipped on `main` (`eec6419`) | Option 3 unified `.rw` workbench (`e7f526d`, `ecd953a`, `03e9cdf`), Kovo Hunter SVG/favicon kit (`cce25e3`), vault GitHub PAT + repo auto-discovery (`4d70351`, `370b9c2`), Phase-0 CT-log subdomain discovery + `*.domain` opt-in & unchecked third-party CNAMEs (`266c478`), multi-device pairing (`3e075f0`), Prototype A `New run` dialog (`107cc31`), `Test Accounts` UI rename (`a985be9`) |
 
 **Scope rule carried forward:** product capability is always reported as `Execution --no-llm` (deterministic floor) **and** agentic (increment over that floor), on dev **and** salted held-out. Harness/procedural numbers are secondary evidence, never the product score.
 
 ### V7.2 Certification status
 
-**CERTIFICATE M0/M1-interim — issued 2026-11-24 (reviewer-ratified).** Scope is deliberately narrow:
+**CERTIFICATE M0/M1-interim — updated 2026-11-24 (`main` @ `eec6419`).**
 
-> **Floor + Realism wiring + precision are certified. Agentic lift is NOT certified.**
+> **Deterministic floors (37/59 dev, 29/58 held-out), ALL 3 Realism suites (#2/#3/#4), `xben-25` (25/25), and confirmation integrity are PASS. Final Unified Agentic Lift certification (Queue #13b on `eec6419`) is in flight.**
 
 | Gate | Target | Measured | Status |
 | :--- | :--- | :--- | :--- |
-| **Floor** dev | 0 spread, 100% precision | **36/59 (61.0%)**, 3 runs, 0 spread, identical site sets | **PASS** |
-| **Floor** salted held-out | 100% precision, no regression | **28/58 (48.3%)** (11/10/7) on `main` @ `222bc90` (`persona-binding`), **100%** precision, 0 decoy/unmatched FPs, 0 `broker.persona_scope_mismatch` events — 26-vs-28 erratum resolved (viewer legitimately owns `9ca676`; `0df720d` had dropped `state_restore`) | **PASS** |
-| Worst-run precision (agentic) | 100% on every cell | dev **36/59** and held-out **29/58**, both **100%**, 0 unmatched / 0 decoy / 0 misclassified | **PASS** |
-| Confirmation integrity | no confirmed finding with a non-confirming diff | store-level `InvariantError`; `audit-confirmation-consistency` clean on every kept cell | **PASS** |
-| Legacy regression | xben 25/25, held-out 20/20 + 20/20 patches | holds on every validation run | **PASS** |
-| Realism wiring | #2–#4 wiring pass | #2 PASS, #3 PASS, #4 PASS | **PASS** |
-| Realism capability | #1–#4 ≥75% | #3 **PASS (3/3)**, #4 **PASS (3/3 confirmed, 100% precision, chain 2/2)**, #2 2/4 planted | **PARTIAL (2 suites pass; #2 open)** |
-| **Total Product Recall** | ≥ 40/59 dev and ≥ 32/58 held-out | dev **36/59**, held-out **29/58** | **FAIL** |
-| **Anti-inert agentic guard** | ≥ +4 net-new over the frozen floor | dev **+0**, held-out **+1** (shopflow only) | **FAIL** |
-| Chains | ≥ 4/6 | #2 chain 2/3; not re-measured elsewhere | **PARTIAL** |
+| **Floor** dev (`--no-llm`) | 0 spread, 100% precision | **37/59 (62.7%)** (14/13/10) on `aca8262`, **100%** precision, 0 decoy/unmatched FPs | **PASS** |
+| **Floor** salted held-out (`--no-llm`) | 100% precision, no regression | **29/58 (50.0%)** (11/11/7) on `aca8262`, **100%** precision, 0 decoy/unmatched FPs, 0 `broker.persona_scope_mismatch` | **PASS** |
+| Confirmation integrity | no confirmed finding without verified receipt/evidence | Strict fail-closed `ProofReceipt` gate in `runAgentScriptProof` + `persistAgentScriptProof` (`eec6419`); `audit-confirmation-consistency` 0 conflicts | **PASS** |
+| Legacy regression (`xben-25`) | `>= 23/25` @ 100% | **25/25 (100%)**, 0 FP on `51819a8` (post-Cut 3c-2 + 3d VM retirements) | **PASS** |
+| Legacy regression (`held-out-saas`) | `20/20` + `20/20` patches | **19/20 + 19/20 patches** @ 100% on `c3da71f` (`hos-08` fixed; `hos-07` probe-stage miss open) | **PARTIAL (`hos-07` open)** |
+| Realism capability (#2, #3, #4) | #2–#4 capability PASS @ 100% | #2 **PASS (4/4, 0% OOB FNR)**, #3 **PASS (3/3)**, #4 **PASS (3/3, chain 2/2)** on `aca8262` | **PASS (3/3 suites)** |
+| `execution.ts` decomposition | `< 8.5K LOC`, parity preserved | **5,388 LOC** (−61.4% from 13,960), −468 net `src/` LOC, 4/4 parity PASS (`2e1b2ed`) | **PASS** |
+| **Total Product Recall (Unified Agentic)** | `>= 40/59` dev and `>= 32/58` held-out @ 100% | Queue #13b in flight on `eec6419` (see §V7.7) | **IN FLIGHT** |
+| **Anti-inert agentic guard (`proof_kind='agent_script'`)** | `>= +4` net-new over frozen floor @ 100% | First live Docker `ProofReceipt` confirmed (`9828e5d`); Queue #13b in flight on `eec6419` | **IN FLIGHT** |
+| **Tier-1 Smoke (warm agentic snapshots)** | 8/8 gates PASS, `trap-zero = 0`, 0 stalls | Queue #13b Step 3 in flight on `eec6419` | **IN FLIGHT** |
 
-**Hard numbers behind the certificate (provenance: docker verifier, 600 s cells, K=6, generous budgets, serialized agentic runs):**
-
-| Surface | Floor | Unified | Lift | Precision |
-| :--- | :--- | :--- | :--- | :--- |
-| Dev seed 1 | 36/59 | 36/59 | **0** | 100% |
-| Salted held-out 1000042 | 28/58 | 29/58 | **+1** | 100% |
-
-**What must not be claimed:**
-1. **"Agentic lift"** — 67 agent investigations converted **1** target (1.5%). Honest lift is ~0–1 at 100% precision; the acme 16/22 → 14/22 swing shows ±2 is single-run noise.
-2. **"Realism is done"** — #4 is now fully canonical at 3/3, but #2 still misses blind SQLi and the exfil chain leg 3/3.
-3. **"The DSL is retired"** — Cut 3a moved one family; `replay-verifier.ts` is still ~3.9K and `http_chain` carries 8/33 dev confirmations. Cut 3b is in flight.
-
-**Next gate (M1):** Total Product Recall ≥40/59 dev and ≥32/58 held-out at 100% precision, **and** ≥+4 net-new over the frozen floor. The binding constraint is agentic conversion, not floor coverage.
+**What must not be claimed until Queue #13b completes:**
+1. **"Agentic lift certified"** — Queue #13b on `eec6419` is the first unified matrix run with working live Docker `guardian_verify` + strict `ProofReceipt` + floor-confirmed route exclusion; wait for its exact dev/held-out/Tier-1 numbers before issuing the M1 certificate.
+2. **"`held-out-saas` 20/20 restored"** — currently 19/20 on `c3da71f` (`hos-07` probe-stage signal miss still open).
+3. **"Full DSL retirement complete"** — Cut 3c-1, 3c-2, and 3d retired 8 legacy kinds (`replay-verifier.ts` −761 LOC to 3,507 / 3,524), while remaining recipe migrations continue behind parity gates.
 
 ### V7.3 Smoke battery (adopted design)
 
@@ -113,25 +106,36 @@ The fast battery answers one question: **did this change break the funnel, the p
 | 3 unmatched FPs in the K=6 cell: a planted mass-assignment target labelled BOLA; two fixture XSS escape defects | Evidence-first impact classification (CWE-915) and fixture escaping | **100%** precision on K=6 |
 | Stored 2FA over-claim and `/api/admin/activity` false charge | Universal default-deny boundary + real MFA gate; `misclassifiedFindingIds` grader bucket (neither TP nor FP) | Over-claim dismissed; acme samples 100% precision |
 | Salted held-out floor dropped **28/58 → 26/58** (shopflow 10 → 8; 26-vs-28 certificate erratum) | `persona-binding` (`222bc90`): per-request `(run, assignment, role, persona, session)` broker jars + fail-closed `broker.persona_scope_mismatch` + `floor-recipes.ts` post-observation `state_restore` | **28/58 (48.3%, 11/10/7) @ 100%** precision, 0 decoy/unmatched FPs, 0 `broker.persona_scope_mismatch` events; erratum resolved |
+| `xben-25` dropped **25/25 → 17/25** (−8 SQL targets) after Cut 3c-2 retired legacy `sql_boolean_diff`/`sql_time_diff` | `boolean_or_timing` carriers (`form`/`path`/`header`/`xml`/`graphql_var`), tautology-vs-contradiction arms, timing `blind_sqli` receipt class, CSRF form binding, and non-JSON body signature keys (`0004070`, `4945f93`, `fabbb89`, `51819a8`) | **25/25 (100%)** restored on Docker with Cut 3c-2 & 3d VM deletions intact |
+| `held-out-saas` dropped **20/20 → 18/20** (`hos-07`, `hos-08`) after Cut 3c-2 | Nested object construction for dotted JSON parameters in SQL recipe envelopes (`1bb36a6` / `c3da71f`) | **19/20 + 19/20 patches @ 100%** (`hos-08` restored; `hos-07` probe-stage miss open) |
+| Live Docker `guardian_verify` had **0 confirmations** (`12/12 claims_missing` → `51/51 EACCES` → 22x missing-script loop + 1 receiptless `CWE-200` FP) | Idempotent TS/Python script wrapper (`d1e0192`), container-UID-readable `umask`-safe RPC staging (`b0767c5`), final-settlement allowance + SDK arg normalization (`b608e69`), and strict fail-closed `ProofReceipt` gate + `code`/`source` alias + 3-error loop stop (`eec6419`) | First live Docker `ProofReceipt` confirmed (`9828e5d`), zero `EACCES`, receiptless `CWE-200` FP closed fail-closed (`eec6419`) |
 | **Open:** 45-min "invoice amount accepts negative values" claim | Triage in flight (genuine invariant bug vs echo/clamp) | **Unresolved** — reason the 45-min worst-run precision is not 100% |
+| **Open:** `held-out-saas` `hos-07` probe-stage miss (`19/20` on `c3da71f`) | Probe-stage signal investigation (`hypothesisFormed: 20 -> signalObserved: 19`) | Open |
 
 ### V7.5 Honest limitations
 
-1. **The agentic increment is currently ~0.** Dev +2 and held-out +0, with the dev +2 produced while 13 of 14 planned acme steps and 6 of 7 opsportal steps were never dispatched. Treat every prior "+2 net" as unproven until the dispatch funnel is fixed and re-measured.
-2. **Longer horizon trades precision for recall.** 15/22 at 88.2% is not better than 13/22 at 100% until the unmatched claims are triaged. Worst-run precision at the horizon is the gate, not budget.
-3. **Budgets are not the constraint.** The binding limits are dispatch coverage, hypothesis/proof quality, and (on randomized held-out surfaces) structural assumptions in the deterministic layer. 45 min produced 0 marginal recall over 10 min.
-4. **Realism capability is partial, not complete.** #3 passes end-to-end. #2 confirms async SSRF and XXE (2 TP / 0 FP) but misses blind SQLi and one chain leg; the 33.3% "async FNR" blended an unrelated capability miss into the OOB denominator and is being split into `oob_wiring_fnr` and `fixture_capability_recall`. #4 has 0 of 3 4-hop confirmations despite 600 B slices attached.
-5. **The deterministic floor is re-gated and green** (33/59 dev, 0 spread, 24/58 held-out, 100% precision).
-6. **Held-out surfaces lag dev by 14.5 pp** on the floor (55.9% vs 41.4%). That is residual Layer-2 structure on randomized routes; it must be closed by Layer 3 (agents + white-box), not by more deterministic regexes.
-7. **Chains, white-box conversion, and reason-bench remain M1/M2 gates.** #2's chain is at 2/3; #4's 4-hop conversion is at 0/3.
-8. **The smoke battery is not yet calibrated.** Tier 1 is a tripwire until the 8-variant study lands; Tier 2 blind spots (cold integration, DB drift) are real.
-9. **DSL retirement is partially started.** Cut 1–2 landed (agent path on ProofReceipt; floor receipts in shadow) and six typed floor recipes exist, but the production caller is not wired, so `execution.ts` is ~11.5K LOC and `replay-verifier.ts` still confirms the floor. Cut 3a is in flight with a no-fallback assertion.
+1. **Unified agentic lift certification is in flight (Queue #13b on `eec6419`).** All prior plumbing blockers (`EACCES`, `claims_missing`, settlement-turn block, 22x arg loop, receiptless `CWE-200` FP, and floor-confirmed route re-proving) are now fixed, but dev/held-out/Tier-1 aggregate lift is not yet certified until Queue #13b completes.
+2. **Longer horizon trades precision for recall.** Worst-run precision at the horizon (100% with 0 decoy/unmatched FPs) remains a hard release gate.
+3. **Held-out floor still lags dev by 12.7 pp** (62.7% vs 50.0% on `aca8262`: 37/59 dev vs 29/58 salted held-out). Closing the remainder on randomized routes belongs to Layer 3 (`guardian_verify` + white-box), not more deterministic regexes.
+4. **Tier-1 smoke is not yet calibrated** via the 8-variant study; warm snapshots must be captured from agentic post-floor runs (not `--no-llm` checkpoints, which skip Phase B on resume).
+5. **`held-out-saas` has 1 open probe-stage miss (`hos-07`: 19/20 on `c3da71f`).**
+6. **DSL retirement is substantially advanced, not finished:** `execution.ts` is down to **5,388 LOC** (−61.4% from 13,960) and `replay-verifier.ts` is down to **3,524 LOC** (−744 LOC from 4,268 across Cut 3c-1/3c-2/3d), with remaining legacy kinds still pending migration.
 
 ### V7.6 Reporting rule
 
 - §2–§3 and §6 are the **v5.0 freeze record**. §0 is the **v5.1 integration record**. Both are historical; do not update their numbers to match the current line.
-- Nothing in §V7 is a release claim. A v7 number becomes citable only when it is produced by the protocol in [plans/v7.md](plans/v7.md#certification-protocol-adopted) and the M0 gates are green.
+- Nothing in §V7 is a release claim until the corresponding M0/M1 gates in [plans/v7.md](plans/v7.md#certification-protocol-adopted) pass on `main`.
 - Never cite a harness/procedural number as the product score; never cite a wiring pass as a capability result; never cite a per-app lift as an aggregate.
+
+### V7.7 Pending — Queue #13b Final Unified Agentic Certification (`main` @ `eec6419`)
+
+**Status:** **IN FLIGHT** (`@bench-verifier`, `--verifier docker`, model `deepseek/deepseek-v4.1-flash-1017`, `GUARDIAN_DATA_DIR=/home/omarchy/guardian-data`). Fill in exact measured numbers upon Queue #13b completion:
+
+| Leg | Command / Parameters | Target Gate | Measured (`eec6419`) | Status |
+| :--- | :--- | :--- | :--- | :--- |
+| **1. Dev Unified Agentic Matrix** | `--app all --seeds 1 --mode grey-box --verifier docker --isolate-data-dir --keep-data-dirs --concurrency 1 --worker-concurrency 6 --budget-usd 5.0 --max-duration-ms 600000` | `>= 40/59` total, `100.0%` precision, `0` conflicts, `proof_kind='agent_script'` + `with_receipt` > 0 | *pending* (acme / shopflow / opsportal; floor vs `agent_only`, cost, stalls, `audit-confirmation-consistency`) | **PENDING** |
+| **2. Salted Held-Out Unified Agentic Matrix** | `--app all --seeds 1000042 --held-out --mode grey-box --verifier docker --isolate-data-dir --keep-data-dirs --concurrency 1 --worker-concurrency 6 --budget-usd 5.0 --max-duration-ms 600000` (with `GUARDIAN_RB_HELDOUT_SALT`) | `>= 32/58` total, `100.0%` precision, `0` conflicts, `proof_kind='agent_script'` + `with_receipt` > 0 | *pending* (acme / shopflow / opsportal; floor vs `agent_only`, cost, stalls, `audit-confirmation-consistency`) | **PENDING** |
+| **3. Tier-1 Smoke (warm agentic post-floor snapshots)** | Cold warm-up `scripts/smoke-agentic.ts --tier 1 --snapshot-root /tmp/v7-q13b-snaps --budget-usd-per-cell 0.80` → gated warm pass | `8/8` gates PASS, `trap-zero = 0`, `100%` precision, `0` stalls, `p50 <= 75s` | *pending* (8/8 gate breakdown, cost, p50, stalls) | **PENDING** |
 
 ---
 
