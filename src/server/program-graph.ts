@@ -99,6 +99,8 @@ export interface ProgramGraph {
   warnings: string[]
   /** Bounded, value-free secret/IaC hints per route module (v7 white-box evidence). */
   codeHints?: Record<string, CodeSliceHint[]>
+  /** Bounded, value-free repository-wide secret & IaC static leads (v7 M2). */
+  staticLeads?: StaticCodeLead[]
 }
 
 export interface RouteSinkPath {
@@ -119,6 +121,8 @@ export type CodeHypothesisKind =
   | 'tenant_param_without_scope'
   | 'unauthenticated_sink'
   | 'recent_diff_touches_sink'
+  | 'middleware_policy_diff'
+  | 'static_secret_or_iac'
 
 export interface CodeToRuntimeHypothesis {
   id: string
@@ -752,12 +756,30 @@ function extractExpressLike(file: string, content: string, out: Extraction): voi
     }
     const middleware = flattenMiddlewareTokens(args.slice(1, -1))
     const handlerToken = args[args.length - 1] ?? 'anonymous'
-    const handler = handlerNameFromToken(handlerToken)
+    let handler = handlerNameFromToken(handlerToken)
+    const routeLine = lineNumberAt(content, match.index)
+    if (handler === 'anonymous' && /=>|\bfunction\b/.test(handlerToken)) {
+      const syntheticName = `inline_${method}_${routeLine}`
+      const tokenOffset = content.indexOf(handlerToken, open)
+      const bodyStart = tokenOffset >= 0 ? tokenOffset : open
+      const bodyEnd = bodyStart + handlerToken.length
+      out.functions.push({
+        name: syntheticName,
+        file,
+        line: routeLine,
+        endLine: lineNumberAt(content, Math.min(content.length - 1, bodyEnd)),
+        startIndex: bodyStart,
+        endIndex: Math.min(content.length, bodyEnd),
+        calls: collectCalls(maskCode(handlerToken, false)),
+        guardNames: guardIdentifiers(handlerToken),
+      })
+      handler = syntheticName
+    }
     for (const routePath of routePaths) {
       out.routes.push({
         framework,
         method: method === 'all' ? 'ANY' : method.toUpperCase(),
-        path: routePath, file, line: lineNumberAt(content, match.index), handler,
+        path: routePath, file, line: routeLine, handler,
         routerKey: parent.key,
         middleware: [...parent.middleware, ...middleware],
         guards: guardsFromMiddleware([...parent.middleware, ...middleware]),
@@ -1509,13 +1531,90 @@ function buildGraph(
     }
   }
 
-  // Call graph edges: same-file first, then unambiguous repo-wide matches.
+  // Build per-file import maps so cross-file calls resolve deterministically even when
+  // multiple modules export helpers with identical names (e.g., `findById`, `execute`, `save`).
+  const normalizedFileByStem = new Map<string, string>()
+  for (const file of files) {
+    const norm = file.path.replaceAll('\\', '/')
+    const stem = norm.replace(/\.(?:[cm]?[jt]sx?|py|go|java|rb)$/, '')
+    normalizedFileByStem.set(stem, file.path)
+    if (stem.endsWith('/index')) normalizedFileByStem.set(stem.slice(0, -6), file.path)
+  }
+  const importsByFile = new Map<string, Map<string, { targetFile: string; exportedName: string }>>()
+  const namespaceImportsByFile = new Map<string, string[]>()
+  for (const file of files) {
+    const symbolMap = new Map<string, { targetFile: string; exportedName: string }>()
+    const nsFiles: string[] = []
+    const lang = languageOfFile(file.path)
+    if (lang === 'js') {
+      for (const m of file.content.matchAll(/import\s+\{([^}]+)\}\s+from\s+(['"])([^'"]+)\2/g)) {
+        const stem = resolveImportTarget(file.path, m[3])
+        const targetFile = stem ? normalizedFileByStem.get(stem) : undefined
+        if (!targetFile) continue
+        for (const spec of m[1].split(',')) {
+          const clean = spec.replace(/\btype\s+/, '').trim()
+          if (!clean) continue
+          const [orig, alias] = clean.split(/\s+as\s+/).map(s => s.trim())
+          if (orig) symbolMap.set(alias || orig, { targetFile, exportedName: orig })
+        }
+      }
+      for (const m of file.content.matchAll(/import\s+(?:\*\s+as\s+)?([A-Za-z_$][\w$]*)\s+from\s+(['"])([^'"]+)\2/g)) {
+        const stem = resolveImportTarget(file.path, m[3])
+        const targetFile = stem ? normalizedFileByStem.get(stem) : undefined
+        if (!targetFile) continue
+        nsFiles.push(targetFile)
+        symbolMap.set(m[1], { targetFile, exportedName: m[1] })
+      }
+      for (const m of file.content.matchAll(/(?:const|let|var)\s+\{([^}]+)\}\s*=\s*require\s*\(\s*(['"])([^'"]+)\2\s*\)/g)) {
+        const stem = resolveImportTarget(file.path, m[3])
+        const targetFile = stem ? normalizedFileByStem.get(stem) : undefined
+        if (!targetFile) continue
+        for (const spec of m[1].split(',')) {
+          const [orig, alias] = spec.trim().split(/\s*:\s*/).map(s => s.trim())
+          if (orig) symbolMap.set(alias || orig, { targetFile, exportedName: orig })
+        }
+      }
+    } else if (lang === 'python') {
+      for (const m of file.content.matchAll(/from\s+(\.{1,3}[A-Za-z0-9_.]*)\s+import\s+([^\n#]+)/g)) {
+        const dots = /^\.+/.exec(m[1])?.[0].length ?? 1
+        const modPath = m[1].slice(dots).replaceAll('.', '/')
+        const prefix = dots === 1 ? './' : '../'.repeat(dots - 1)
+        const stem = resolveImportTarget(file.path, `${prefix}${modPath}`)
+        const targetFile = stem ? normalizedFileByStem.get(stem) : undefined
+        if (!targetFile) continue
+        for (const spec of m[2].split(',')) {
+          const [orig, alias] = spec.trim().split(/\s+as\s+/).map(s => s.trim())
+          if (orig) symbolMap.set(alias || orig, { targetFile, exportedName: orig })
+        }
+      }
+    }
+    if (symbolMap.size) importsByFile.set(file.path, symbolMap)
+    if (nsFiles.length) namespaceImportsByFile.set(file.path, [...new Set(nsFiles)])
+  }
+
+  // Call graph edges: same-file first, then explicit import target, then namespace imports,
+  // then unambiguous repo-wide matches.
   let edgeCount = 0
   for (const fn of functions) {
+    const fileImports = importsByFile.get(fn.file)
+    const nsFiles = namespaceImportsByFile.get(fn.file)
     for (const call of fn.calls) {
       if (edgeCount >= 8000) break
-      const target = fnByFile.get(fn.file)?.get(call) ?? (fnByName.get(call)?.length === 1 ? fnByName.get(call)![0] : undefined)
-      if (!target || target.name === fn.name) continue
+      let target = fnByFile.get(fn.file)?.get(call)
+      if (!target && fileImports) {
+        const imported = fileImports.get(call)
+        if (imported) target = fnByFile.get(imported.targetFile)?.get(imported.exportedName)
+      }
+      if (!target && nsFiles) {
+        for (const nsFile of nsFiles) {
+          const candidate = fnByFile.get(nsFile)?.get(call)
+          if (candidate) { target = candidate; break }
+        }
+      }
+      if (!target && fnByName.get(call)?.length === 1) {
+        target = fnByName.get(call)![0]
+      }
+      if (!target || (target.name === fn.name && target.file === fn.file)) continue
       edges.push({ fromId: fnId(fn), toId: fnId(target), file: fn.file, line: fn.line })
       edgeCount += 1
     }
@@ -1524,6 +1623,7 @@ function buildGraph(
   const frameworks = [...new Set(routes.map(r => r.framework))]
   if (routes.some(r => r.framework === 'unknown')) warningsOut.push('Some routes were extracted with unknown framework.')
   const codeHints = deriveGraphCodeHints(files, routes)
+  const staticLeads = extractStaticSecretsAndIacLeads(files, routes)
   return {
     repo,
     filesScanned: files.length,
@@ -1534,6 +1634,7 @@ function buildGraph(
     globalMiddleware,
     warnings: warningsOut,
     ...(Object.keys(codeHints).length ? { codeHints } : {}),
+    ...(staticLeads.length ? { staticLeads } : {}),
   }
 }
 
@@ -1891,6 +1992,56 @@ export function deriveCodeToRuntimeHypotheses(
         : sinkKind === 'outbound_fetch' ? 'ssrf' : 'auth_bypass',
     })
   }
+
+  // v7 M2: Middleware / RBAC policy diffs across sibling routes in the same module.
+  for (const diff of diffMiddlewarePolicies(graph)) {
+    if (diff.missingFamily === 'admin' && seen.has(`hyp:admin:${diff.routeId}`)) continue
+    if (diff.missingFamily === 'tenant' && seen.has(`hyp:tenant:${diff.routeId}`)) continue
+    const route = graph.routes.find(candidate => candidate.id === diff.routeId)
+    if (!route) continue
+    push({
+      id: `hyp:policy:${diff.missingFamily}:${diff.routeId}`,
+      kind: 'middleware_policy_diff',
+      severity: diff.severity,
+      confidence: diff.guardedSiblings >= 2 ? 0.84 : 0.72,
+      framework: route.framework,
+      method: route.method,
+      path: route.path,
+      file: route.file,
+      line: route.line,
+      routeId: route.id,
+      rationale: `Middleware/RBAC policy diff on ${route.method} ${route.path}: missing ${diff.missingFamily} guard (${diff.siblingGuard}) enforced on ${diff.guardedSiblings}/${diff.totalSiblings} sibling route(s) in module "${diff.module}".`,
+      evidence: [
+        `missing_guard=${diff.missingFamily} ${diff.siblingGuard}@${diff.siblingAt} (sibling ${diff.siblingRoute})`,
+        `sibling_coverage=${diff.guardedSiblings}/${diff.totalSiblings}`,
+        `guards=[${route.guards.join(', ')}]`,
+      ],
+      probeClass: diff.missingFamily === 'tenant' ? 'bola_bfla' : 'auth_bypass',
+    })
+  }
+
+  // v7 M2: Value-free static secrets & IaC exposure leads.
+  for (const lead of (graph.staticLeads ?? []).slice(0, 20)) {
+    const route = lead.routeId ? graph.routes.find(candidate => candidate.id === lead.routeId) : undefined
+    push({
+      id: `hyp:static:${lead.kind}:${lead.file}:${lead.line}`,
+      kind: 'static_secret_or_iac',
+      severity: lead.severity,
+      confidence: lead.kind === 'secret' ? 0.78 : 0.72,
+      framework: route?.framework ?? 'unknown',
+      ...(route ? { method: route.method, path: route.path, routeId: route.id } : {}),
+      file: lead.file,
+      line: lead.line,
+      rationale: `Static ${lead.kind} exposure at ${lead.at}: ${lead.note} (value withheld).`,
+      evidence: [
+        `kind=${lead.kind}`,
+        `at=${lead.at}`,
+        `note=${lead.note}`,
+        ...(lead.module ? [`module=${lead.module}`] : []),
+      ],
+      probeClass: /jwt|signing|token|auth/i.test(lead.note) ? 'auth_bypass' : 'code_review',
+    })
+  }
   return hypotheses
 }
 
@@ -1989,40 +2140,79 @@ export function routeModuleKey(routePath: string): string {
   return ''
 }
 
-function guardsByFamily(guards: readonly string[]): Map<'admin' | 'tenant', string> {
-  const found = new Map<'admin' | 'tenant', string>()
+export interface MiddlewarePolicyDiff {
+  routeId: string
+  method: string
+  path: string
+  file: string
+  line: number
+  module: string
+  missingFamily: 'admin' | 'tenant' | 'auth'
+  siblingGuard: string
+  siblingRoute: string
+  siblingAt: string
+  guardedSiblings: number
+  totalSiblings: number
+  severity: 'high' | 'medium'
+}
+
+export interface StaticCodeLead {
+  id: string
+  kind: 'secret' | 'iac'
+  file: string
+  line: number
+  at: string
+  /** Bounded, value-free description; matched literal text is never copied. */
+  note: string
+  severity: 'high' | 'medium'
+  module?: string
+  routeId?: string
+  method?: string
+  path?: string
+}
+
+const PUBLIC_AUTH_EXEMPT_ROUTE_RE = /\/(?:login|signin|sign-in|register|signup|sign-up|logout|health|healthz|ready|readyz|livez|metrics|public|status|ping|jwks|openid-configuration)(?:\/|$)/i
+
+function guardsByFamily(guards: readonly string[]): Map<'admin' | 'tenant' | 'auth', string> {
+  const found = new Map<'admin' | 'tenant' | 'auth', string>()
   for (const guard of guards) {
     if (!found.has('admin') && ADMIN_GUARD_RE.test(guard)) found.set('admin', guard)
     if (!found.has('tenant') && TENANT_GUARD_RE.test(guard)) found.set('tenant', guard)
+    if (!found.has('auth') && AUTH_GUARD_RE.test(guard)) found.set('auth', guard)
   }
   return found
 }
 
 interface SiblingGuardIndex {
-  byModule: Map<string, Map<'admin' | 'tenant', ProgramRoute>>
+  byModule: Map<string, Map<'admin' | 'tenant' | 'auth', { route: ProgramRoute; guard: string; guardedCount: number }>>
+  moduleRouteCount: Map<string, number>
 }
 
 const SIBLING_GUARD_INDEX_CACHE = new WeakMap<ProgramGraph, SiblingGuardIndex>()
 
-/** Precompute the first guarded sibling per (module, guard family) once per graph pass. */
+/** Precompute sibling guard coverage per (module, guard family) once per graph pass. */
 function buildSiblingGuardIndex(graph: ProgramGraph): SiblingGuardIndex {
   const cached = SIBLING_GUARD_INDEX_CACHE.get(graph)
   if (cached) return cached
-  const byModule = new Map<string, Map<'admin' | 'tenant', ProgramRoute>>()
+  const byModule = new Map<string, Map<'admin' | 'tenant' | 'auth', { route: ProgramRoute; guard: string; guardedCount: number }>>()
+  const moduleRouteCount = new Map<string, number>()
   const routes = [...graph.routes].sort((a, b) =>
     a.path.localeCompare(b.path) || a.method.localeCompare(b.method) || a.file.localeCompare(b.file) || a.line - b.line)
   for (const route of routes) {
     const module = routeModuleKey(route.path)
     if (!module) continue
+    moduleRouteCount.set(module, (moduleRouteCount.get(module) ?? 0) + 1)
     const families = guardsByFamily(route.guards)
     if (!families.size) continue
-    const perModule = byModule.get(module) ?? new Map<'admin' | 'tenant', ProgramRoute>()
-    for (const [family, _guard] of families) {
-      if (!perModule.has(family)) perModule.set(family, route)
+    const perModule = byModule.get(module) ?? new Map<'admin' | 'tenant' | 'auth', { route: ProgramRoute; guard: string; guardedCount: number }>()
+    for (const [family, guard] of families) {
+      const existing = perModule.get(family)
+      if (!existing) perModule.set(family, { route, guard, guardedCount: 1 })
+      else existing.guardedCount += 1
     }
     byModule.set(module, perModule)
   }
-  const index = { byModule }
+  const index = { byModule, moduleRouteCount }
   SIBLING_GUARD_INDEX_CACHE.set(graph, index)
   return index
 }
@@ -2030,7 +2220,7 @@ function buildSiblingGuardIndex(graph: ProgramGraph): SiblingGuardIndex {
 function guardDiffsForRoute(
   route: ProgramRoute,
   index: SiblingGuardIndex,
-  options: { limit?: number; excludeRouteId?: string } = {},
+  options: { limit?: number; excludeRouteId?: string; includeAuthFamily?: boolean } = {},
 ): CodeSliceGuardDiff[] {
   const module = routeModuleKey(route.path)
   if (!module) return []
@@ -2038,23 +2228,82 @@ function guardDiffsForRoute(
   if (!siblings) return []
   const owned = guardsByFamily(route.guards)
   const out: CodeSliceGuardDiff[] = []
+  const reportedSymbols = new Set<string>()
   const limit = Math.max(1, Math.min(options.limit ?? 2, 4))
-  for (const family of ['admin', 'tenant'] as const) {
+  const families: Array<'admin' | 'tenant' | 'auth'> = options.includeAuthFamily === false
+    ? ['admin', 'tenant']
+    : ['admin', 'tenant', 'auth']
+  for (const family of families) {
     if (out.length >= limit) break
     if (owned.has(family)) continue
-    const sibling = siblings.get(family)
-    if (!sibling || sibling.id === route.id || sibling.id === options.excludeRouteId) continue
-    const guardSymbol = guardsByFamily(sibling.guards).get(family)
-    if (!guardSymbol) continue
+    if (family === 'auth' && PUBLIC_AUTH_EXEMPT_ROUTE_RE.test(route.path)) continue
+    const entry = siblings.get(family)
+    if (!entry || entry.route.id === route.id || entry.route.id === options.excludeRouteId) continue
+    // Avoid emitting a duplicate `auth` diff when the exact same sibling guard symbol (e.g.
+    // `requireAdmin`) was already reported under `admin` or `tenant`.
+    if (family === 'auth' && reportedSymbols.has(entry.guard)) continue
+    reportedSymbols.add(entry.guard)
     out.push({
       kind: 'missing_guard',
       guard: family,
-      symbol: guardSymbol.slice(0, 48),
-      sibling: `${sibling.method} ${sibling.path}`.slice(0, 120),
-      at: `${sibling.file}:${sibling.line}`.slice(0, 160),
+      symbol: entry.guard.slice(0, 48),
+      sibling: `${entry.route.method} ${entry.route.path}`.slice(0, 120),
+      at: `${entry.route.file}:${entry.route.line}`.slice(0, 160),
     })
   }
   return out
+}
+
+/**
+ * Compare middleware/RBAC enforcement across sibling routes in every module and return
+ * deterministic `MiddlewarePolicyDiff` entries for routes missing a guard enforced by siblings.
+ */
+export function diffMiddlewarePolicies(graph: ProgramGraph): MiddlewarePolicyDiff[] {
+  const index = buildSiblingGuardIndex(graph)
+  const diffs: MiddlewarePolicyDiff[] = []
+  const orderedRoutes = [...graph.routes].sort((a, b) =>
+    a.path.localeCompare(b.path) || a.method.localeCompare(b.method) || a.file.localeCompare(b.file) || a.line - b.line)
+  for (const route of orderedRoutes) {
+    const module = routeModuleKey(route.path)
+    if (!module) continue
+    const siblings = index.byModule.get(module)
+    if (!siblings) continue
+    const totalSiblings = index.moduleRouteCount.get(module) ?? 1
+    if (totalSiblings < 2) continue
+    const owned = guardsByFamily(route.guards)
+    const reportedSymbols = new Set<string>()
+    for (const family of ['admin', 'tenant', 'auth'] as const) {
+      if (owned.has(family)) continue
+      if (family === 'auth' && PUBLIC_AUTH_EXEMPT_ROUTE_RE.test(route.path)) continue
+      const entry = siblings.get(family)
+      if (!entry || entry.route.id === route.id) continue
+      if (family === 'auth' && reportedSymbols.has(entry.guard)) continue
+      reportedSymbols.add(entry.guard)
+      const mutating = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(route.method.toUpperCase())
+      const severity: 'high' | 'medium' = family === 'admin' || family === 'tenant' || mutating || entry.guardedCount >= 2 ? 'high' : 'medium'
+      diffs.push({
+        routeId: route.id,
+        method: route.method,
+        path: route.path,
+        file: route.file,
+        line: route.line,
+        module,
+        missingFamily: family,
+        siblingGuard: entry.guard.slice(0, 48),
+        siblingRoute: `${entry.route.method} ${entry.route.path}`.slice(0, 120),
+        siblingAt: `${entry.route.file}:${entry.route.line}`.slice(0, 160),
+        guardedSiblings: entry.guardedCount,
+        totalSiblings,
+        severity,
+      })
+    }
+  }
+  return diffs.sort((a, b) =>
+    (a.severity === b.severity ? 0 : a.severity === 'high' ? -1 : 1)
+    || b.guardedSiblings - a.guardedSiblings
+    || a.path.localeCompare(b.path)
+    || a.method.localeCompare(b.method)
+    || a.missingFamily.localeCompare(b.missingFamily))
 }
 
 const SECRET_HINT_PATTERNS: ReadonlyArray<{ re: RegExp; note: string }> = [
@@ -2062,18 +2311,22 @@ const SECRET_HINT_PATTERNS: ReadonlyArray<{ re: RegExp; note: string }> = [
   { re: /\bsk_(?:live|test)_[A-Za-z0-9]{8,}\b/, note: 'payment secret key' },
   { re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/, note: 'private key block' },
   { re: /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp):\/\/[^\s'"`]*:[^\s'"`@]+@/i, note: 'credentialed conn-string' },
+  { re: /\b(?:jwt[_-]?secret|signing[_-]?secret|webhook[_-]?secret|hmac[_-]?secret)\b\s*[:=]\s*['"][^'"\n]{6,}['"]/i, note: 'hardcoded JWT/signing secret' },
   { re: /\b(?:api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|password|passwd|private[_-]?key)\b\s*[:=]\s*['"][^'"\n]{8,}['"]/i, note: 'secret-shaped assignment' },
   { re: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/, note: 'forge access token' },
   { re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/, note: 'chat app token' },
 ]
 
-const IAC_FILE_RE = /(?:^|\/)(?:\.?env(?:\.[\w.-]+)?|infra|deploy(?:ment)?s?|k8s|kubernetes|helm|terraform|ops|docker-compose[\w.-]*\.ya?ml|Dockerfile[\w.-]*)$/i
+const IAC_FILE_RE = /(?:^|\/)(?:\.?env(?:\.[\w.-]+)?|infra|deploy(?:ment)?s?|k8s|kubernetes|helm|terraform|ops|docker-compose[\w.-]*\.ya?ml|Dockerfile[\w.-]*|[\w.-]+\.tf|[\w.-]+\.ya?ml)$/i
 const IAC_HINT_PATTERNS: ReadonlyArray<{ re: RegExp; note: string }> = [
   { re: /\b0\.0\.0\.0\/0\b|\b::\/0\b/, note: 'open ingress CIDR' },
   { re: /\bprivileged\s*:\s*true\b/, note: 'privileged container' },
   { re: /\bhostNetwork\s*:\s*true\b/, note: 'host network namespace' },
   { re: /\brunAsUser\s*:\s*0\b/, note: 'container runs as root' },
   { re: /\b(?:allow_privilege_escalation|allowPrivilegeEscalation)\s*:\s*true\b/, note: 'privilege escalation allowed' },
+  { re: /\b(?:CAP_)?SYS_ADMIN\b/, note: 'dangerous SYS_ADMIN Linux capability' },
+  { re: /"(?:Action|Principal)"\s*:\s*"\*"|(?:\bactions?\s*=\s*\[\s*"\*"|\bprincipals?\s*=\s*\[\s*"\*")/i, note: 'wildcard IAM policy' },
+  { re: /\bNODE_TLS_REJECT_UNAUTHORIZED\s*[:=]\s*['"]?0['"]?/, note: 'TLS certificate verification disabled' },
 ]
 
 function fileInModule(file: string, module: string): boolean {
@@ -2083,7 +2336,90 @@ function fileInModule(file: string, module: string): boolean {
 }
 
 /** Single fast prefilter so a repository-wide hint pass stays cheap on generated trees. */
-const HINT_PREFILTER_RE = /(?:AKIA|ASIA)[0-9A-Z]{16}|sk_(?:live|test)_[A-Za-z0-9]{8,}|-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----|:\/\/[^\s'"`]*:[^\s'"`@]+@|(?:api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|password|passwd|private[_-]?key)\s*[:=]\s*['"]|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|0\.0\.0\.0\/0|::\/0|privileged\s*:\s*true|hostNetwork\s*:\s*true|runAsUser\s*:\s*0|allow[_]?[Pp]rivilege[_]?[Ee]scalation\s*:\s*true/
+const HINT_PREFILTER_RE = /(?:AKIA|ASIA)[0-9A-Z]{16}|sk_(?:live|test)_[A-Za-z0-9]{8,}|-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----|:\/\/[^\s'"`]*:[^\s'"`@]+@|(?:jwt[_-]?secret|signing[_-]?secret|webhook[_-]?secret|hmac[_-]?secret|api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|password|passwd|private[_-]?key)\s*[:=]\s*['"]|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|0\.0\.0\.0\/0|::\/0|privileged\s*:\s*true|hostNetwork\s*:\s*true|runAsUser\s*:\s*0|allow[_]?[Pp]rivilege[_]?[Ee]scalation\s*:\s*true|(?:CAP_)?SYS_ADMIN|"(?:Action|Principal)"\s*:\s*"\*"|NODE_TLS_REJECT_UNAUTHORIZED\s*[:=]\s*['"]?0/
+
+/**
+ * Scan repository sources (including root/infra/k8s/terraform/docker/.env files outside route
+ * directories) for value-free secret and IaC static leads. Matched text is never copied.
+ */
+export function extractStaticSecretsAndIacLeads(
+  files: ReadonlyArray<{ path: string; content: string }>,
+  routes: readonly ProgramRoute[] = [],
+  options: { limit?: number; maxFileBytes?: number } = {},
+): StaticCodeLead[] {
+  const limit = Math.max(1, Math.min(options.limit ?? 40, 200))
+  const maxFileBytes = Math.max(4096, options.maxFileBytes ?? 512 * 1024)
+  const routeByModule = new Map<string, ProgramRoute>()
+  for (const route of [...routes].sort((a, b) => a.path.localeCompare(b.path) || a.method.localeCompare(b.method))) {
+    const mod = routeModuleKey(route.path)
+    if (mod && !routeByModule.has(mod)) routeByModule.set(mod, route)
+  }
+  const modules = [...routeByModule.keys()].sort()
+  const ordered = [...files]
+    .filter(file => file.content.length <= maxFileBytes && HINT_PREFILTER_RE.test(file.content))
+    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+
+  const leads: StaticCodeLead[] = []
+  const seen = new Set<string>()
+  for (const file of ordered) {
+    if (leads.length >= limit) break
+    const matchedModule = modules.find(mod => fileInModule(file.path, mod))
+    const relatedRoute = matchedModule ? routeByModule.get(matchedModule) : undefined
+    const looksIac = IAC_FILE_RE.test(file.path)
+      || /\b(?:resource|module)\s+["']/.test(file.content.slice(0, 2048))
+      || /\b(?:apiVersion|kind\s*:\s*(?:Deployment|Pod|DaemonSet|StatefulSet|Role|ClusterRole)|services\s*:)\b/.test(file.content.slice(0, 2048))
+    const lines = file.content.split('\n')
+    for (let i = 0; i < lines.length; i += 1) {
+      if (leads.length >= limit) break
+      const line = lines[i]
+      if (!line || line.length > 4096) continue
+      const trimmed = line.trim()
+      if (trimmed.startsWith('//') || trimmed.startsWith('#') && !/\.env/i.test(file.path)) continue
+      for (const pattern of SECRET_HINT_PATTERNS) {
+        if (!pattern.re.test(line)) continue
+        const at = `${file.path}:${i + 1}`.slice(0, 160)
+        const key = `secret|${at}|${pattern.note}`
+        if (!seen.has(key)) {
+          seen.add(key)
+          leads.push({
+            id: `static:secret:${file.path}:${i + 1}`,
+            kind: 'secret',
+            file: file.path,
+            line: i + 1,
+            at,
+            note: pattern.note,
+            severity: 'high',
+            ...(matchedModule ? { module: matchedModule } : {}),
+            ...(relatedRoute ? { routeId: relatedRoute.id, method: relatedRoute.method, path: relatedRoute.path } : {}),
+          })
+        }
+        break
+      }
+      if (!looksIac || leads.length >= limit) continue
+      for (const pattern of IAC_HINT_PATTERNS) {
+        if (!pattern.re.test(line)) continue
+        const at = `${file.path}:${i + 1}`.slice(0, 160)
+        const key = `iac|${at}|${pattern.note}`
+        if (!seen.has(key)) {
+          seen.add(key)
+          leads.push({
+            id: `static:iac:${file.path}:${i + 1}`,
+            kind: 'iac',
+            file: file.path,
+            line: i + 1,
+            at,
+            note: pattern.note,
+            severity: /privileged|root|wildcard|SYS_ADMIN|TLS/i.test(pattern.note) ? 'high' : 'medium',
+            ...(matchedModule ? { module: matchedModule } : {}),
+            ...(relatedRoute ? { routeId: relatedRoute.id, method: relatedRoute.method, path: relatedRoute.path } : {}),
+          })
+        }
+        break
+      }
+    }
+  }
+  return leads
+}
 
 /**
  * Build per-module hint blocks once per extraction. Files are prefilted, so generated route

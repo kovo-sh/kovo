@@ -10,8 +10,19 @@ import { type CodeAuditSuspectData, type HostTier, classifyHostTier } from './ag
 import { isProfileHealthy, resolveProfilePoolForRole, type ResolvedModelProfile } from './model-settings.ts'
 import { providerPool, type UsageCallback } from './provider.ts'
 import { type NamedSecret, redact } from './redact.ts'
-import { resolveRouteForLocation, resolveRouteSinkPaths } from './program-graph.ts'
-import type { ProgramGraph, ProgramNode, ProgramRoute, ProgramSinkKind, RouteSinkPath } from './program-graph.ts'
+import {
+  diffMiddlewarePolicies,
+  resolveRouteForLocation,
+  resolveRouteSinkPaths,
+} from './program-graph.ts'
+import type {
+  ProgramGraph,
+  ProgramNode,
+  ProgramRoute,
+  ProgramSinkKind,
+  RouteSinkPath,
+  StaticCodeLead,
+} from './program-graph.ts'
 import type { Assignment, Run, Store } from './store.ts'
 import type {
   CallGraphResult,
@@ -319,6 +330,8 @@ export interface SemanticAuditContext {
   onUsage?: UsageCallback
   /** Live Phase-0 endpoints for reconciling code-derived routes to runnable HTTP targets. */
   liveEndpoints?: ReadonlyArray<{ method: string; path: string }>
+  /** Mounted Program Graph for interprocedural AST/RBAC policy diffing & static leads (v7 M2). */
+  programGraph?: ProgramGraph
   signal: AbortSignal
 }
 
@@ -1742,8 +1755,10 @@ export function scoreAndBuildSuspects(params: {
   backwardPaths: readonly SinkBackwardPath[]
   hostTiers?: Record<string, HostTier>
   callGraph?: CallGraphIndex
-  /** Mounted Program Graph used to extend the reverse route binding past one hop. */
+  /** Mounted Program Graph used to extend reverse route binding, RBAC policy diffing, and static leads. */
   programGraph?: ProgramGraph
+  /** Optional explicit static secrets/IaC leads (falls back to `programGraph.staticLeads`). */
+  staticLeads?: readonly StaticCodeLead[]
   liveEndpoints?: ReadonlyArray<{ method: string; path: string }>
 }): SemanticAuditSuspect[] {
   const suspects: SemanticAuditSuspect[] = []
@@ -1876,6 +1891,121 @@ export function scoreAndBuildSuspects(params: {
       specialistProfile: mapSinkToSpecialist(bp.sinkKind),
       hypothesis,
       sourceToSinkTrace: trace,
+      data,
+    })
+  }
+
+  // v7 M2: Middleware / RBAC policy diffs from mounted Program Graph.
+  if (params.programGraph) {
+    for (const diff of diffMiddlewarePolicies(params.programGraph)) {
+      const origin = pickApprovedOrigin(params.approvedOrigins, `${params.repo} ${diff.path}`)
+      if (!origin) continue
+      const sinkKind: AuditSinkKind = 'api_route'
+      const sev: SemanticAuditSuspect['severity'] = diff.severity
+      const priorityScore = computePriorityScore({
+        severity: sev,
+        isUnguarded: true,
+        hasPartialGuards: false,
+        sinkKind,
+        origin,
+        hostTiers: params.hostTiers,
+        corroborated: diff.guardedSiblings >= 2,
+      })
+      const authCheck = diff.missingFamily === 'tenant'
+        ? 'partial (missing tenant guard)'
+        : `missing (${diff.siblingGuard} on ${diff.guardedSiblings}/${diff.totalSiblings} siblings)`
+      const ownershipCheck = diff.missingFamily === 'tenant'
+        ? `missing (${diff.siblingGuard} on sibling ${diff.siblingRoute})`
+        : 'unknown'
+      const hypothesis = `RBAC/middleware policy diff on ${diff.method} ${diff.path} (${diff.file}:${diff.line}): lacks ${diff.missingFamily} guard "${diff.siblingGuard}" enforced by ${diff.guardedSiblings}/${diff.totalSiblings} sibling route(s) (e.g. ${diff.siblingRoute} @ ${diff.siblingAt}).`
+      const fingerprint = makeSuspectFingerprint(origin, params.repo, diff.file, diff.line, `${sinkKind}:${diff.missingFamily}`, diff.path)
+      const reconciled = reconcileSuspectWithEndpoints(diff.method, diff.path, params.liveEndpoints)
+      const data: CodeAuditSuspectData = {
+        subkind: 'code_audit_suspect',
+        repo: params.repo,
+        file: diff.file,
+        line: Math.max(1, diff.line),
+        routeOrAction: diff.path,
+        authCheck,
+        ownershipCheck,
+        sinkKind,
+        hypothesis,
+        recommendedTier: 2,
+      }
+      suspects.push({
+        id: randomUUID(),
+        fingerprint,
+        stage: 'stage2_backward_taint',
+        origin,
+        repo: params.repo,
+        file: diff.file,
+        line: Math.max(1, diff.line),
+        routeOrAction: diff.path,
+        httpMethod: diff.method,
+        paramNames: routeTemplateParamNames(diff.path),
+        ...(reconciled ? { reconciledEndpoint: reconciled } : {}),
+        authCheck,
+        ownershipCheck,
+        sinkKind,
+        cwe: diff.missingFamily === 'tenant' ? 'CWE-639' : 'CWE-862',
+        severity: sev,
+        priorityScore,
+        recommendedTier: 2,
+        specialistProfile: 'bola-bfla-specialist',
+        hypothesis,
+        data,
+      })
+    }
+  }
+
+  // v7 M2: Value-free static secrets & IaC leads (never echoing literal credential values).
+  const staticLeads = params.staticLeads ?? params.programGraph?.staticLeads ?? []
+  for (const lead of staticLeads.slice(0, 20)) {
+    const origin = pickApprovedOrigin(params.approvedOrigins, `${params.repo} ${lead.file} ${lead.path ?? ''}`)
+    if (!origin) continue
+    const sinkKind: AuditSinkKind = 'auth_config'
+    const routeOrAction = lead.path ?? lead.file
+    const hypothesis = `Static ${lead.kind} exposure at ${lead.at}: ${lead.note} (value withheld). Verify whether this configuration or credential exposes live authenticated surfaces.`
+    const fingerprint = makeSuspectFingerprint(origin, params.repo, lead.file, lead.line, `static_${lead.kind}`, routeOrAction)
+    const priorityScore = computePriorityScore({
+      severity: lead.severity,
+      isUnguarded: true,
+      hasPartialGuards: false,
+      sinkKind,
+      origin,
+      hostTiers: params.hostTiers,
+    })
+    const data: CodeAuditSuspectData = {
+      subkind: 'code_audit_suspect',
+      repo: params.repo,
+      file: lead.file,
+      line: Math.max(1, lead.line),
+      routeOrAction,
+      authCheck: lead.kind === 'secret' ? 'weak (hardcoded secret indicator)' : 'misconfigured (IaC exposure)',
+      ownershipCheck: 'unknown',
+      sinkKind,
+      hypothesis,
+      recommendedTier: 1,
+    }
+    suspects.push({
+      id: randomUUID(),
+      fingerprint,
+      stage: 'stage1_dynamic_rule',
+      origin,
+      repo: params.repo,
+      file: lead.file,
+      line: Math.max(1, lead.line),
+      routeOrAction,
+      ...(lead.method ? { httpMethod: lead.method } : {}),
+      authCheck: data.authCheck,
+      ownershipCheck: data.ownershipCheck,
+      sinkKind,
+      cwe: lead.kind === 'secret' ? 'CWE-798' : 'CWE-250',
+      severity: lead.severity,
+      priorityScore,
+      recommendedTier: 1,
+      specialistProfile: 'auth-session-oauth-specialist',
+      hypothesis,
       data,
     })
   }
@@ -2526,6 +2656,7 @@ export async function runThreeStageSemanticAudit(
         backwardPaths,
         hostTiers: ctx.hostTiers,
         callGraph: graph,
+        ...(ctx.programGraph ? { programGraph: ctx.programGraph } : {}),
         ...(ctx.liveEndpoints ? { liveEndpoints: ctx.liveEndpoints } : {}),
       }))
 

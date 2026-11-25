@@ -20,7 +20,11 @@ import { normalizeEndpointTemplate } from './dedupe.ts'
 import { hasDynamicIdSegment, identifierFormsForRoute, intentFamily } from './deterministic-engine.ts'
 import {
   decideNext,
+  extractChainHops,
+  formatChainHopsBrief,
+  type ChainHop,
   type ChainHypothesis,
+  type CoordinatorFact,
   type DispatchPlan,
   type DispatchStepInput,
   type GraphCoordinator,
@@ -382,17 +386,86 @@ export function plannerWaveDispatchCap(workerConcurrency: number, remainingBudge
   return Math.max(0, Math.min(Math.max(12, conc * 2), remainingBudget))
 }
 
-/** Map chained hypotheses onto validated dispatch inputs (ordered by the planner's ranking). */
+/**
+ * Serialize a typed `ChainHop` artifact into a store `fact` payload for cross-round persistence.
+ * Strictly non-secret: token references stay opaque handles (`secret:<factId>` / `jwt:<factId>`).
+ */
+export function chainHopFactPayload(hop: ChainHop): {
+  summary: string
+  data: Record<string, unknown>
+} {
+  const endpointPart = hop.endpoint ? ` at ${hop.method ? `${hop.method} ` : ''}${hop.endpoint}` : ''
+  const statePart = hop.stateBefore || hop.stateAfter
+    ? ` [${hop.stateBefore ?? '*'}→${hop.stateAfter ?? '*'}]`
+    : ''
+  return {
+    summary: `ChainHop r${hop.roundNo} (${hop.artifactKind}): ${hop.artifactRef}${endpointPart}${statePart}`.slice(0, 220),
+    data: {
+      kind: 'chain_hop',
+      subkind: 'chain_hop',
+      roundNo: hop.roundNo,
+      hopId: hop.hopId,
+      artifactKind: hop.artifactKind,
+      artifactRef: hop.artifactRef,
+      verified: hop.verified,
+      ...(hop.endpoint ? { endpoint: hop.endpoint } : {}),
+      ...(hop.method ? { method: hop.method } : {}),
+      ...(hop.persona ? { persona: hop.persona } : {}),
+      ...(hop.targetPersona ? { targetPersona: hop.targetPersona } : {}),
+      ...(hop.stateBefore ? { stateBefore: hop.stateBefore } : {}),
+      ...(hop.stateAfter ? { stateAfter: hop.stateAfter } : {}),
+      ...(hop.parentHopId ? { parentHopId: hop.parentHopId } : {}),
+      hop: {
+        hopId: hop.hopId,
+        roundNo: hop.roundNo,
+        hopIndex: hop.hopIndex,
+        artifactKind: hop.artifactKind,
+        artifactRef: hop.artifactRef,
+        origin: hop.origin,
+        ...(hop.endpoint ? { endpoint: hop.endpoint } : {}),
+        ...(hop.method ? { method: hop.method } : {}),
+        ...(hop.persona ? { persona: hop.persona } : {}),
+        ...(hop.targetPersona ? { targetPersona: hop.targetPersona } : {}),
+        ...(hop.stateBefore ? { stateBefore: hop.stateBefore } : {}),
+        ...(hop.stateAfter ? { stateAfter: hop.stateAfter } : {}),
+        verified: hop.verified,
+        evidenceIds: hop.evidenceIds.slice(0, 8),
+        factIds: hop.factIds.slice(0, 8),
+        ...(hop.parentHopId ? { parentHopId: hop.parentHopId } : {}),
+        summary: hop.summary.slice(0, 160),
+      },
+    },
+  }
+}
+
+/** Rehydrate typed `ChainHop` artifacts from untainted parent/store facts. */
+export function readChainHopsFromFacts(
+  facts: readonly Pick<CoordinatorFact, 'id' | 'origin' | 'kind' | 'summary' | 'data' | 'tainted' | 'evidenceIds' | 'createdAt'>[],
+): ChainHop[] {
+  const hopFacts = facts.filter(fact => !fact.tainted && (fact.data?.subkind === 'chain_hop' || fact.data?.kind === 'chain_hop'))
+  if (!hopFacts.length) return []
+  return extractChainHops({ facts: hopFacts })
+}
+
+/** Map chained hypotheses onto validated dispatch inputs with typed `ChainHop` metadata (no prompt soup). */
 export function chainHypothesisDispatchSteps(hypotheses: readonly ChainHypothesis[]): DispatchStepInput[] {
-  return hypotheses.map(hypothesis => ({
-    hypothesis: `${hypothesis.title} — ${hypothesis.rationale}`.slice(0, 1200),
-    origins: hypothesis.chainOrigins,
-    capabilities: hypothesis.capabilities,
-    parentEvidenceIds: hypothesis.parentEvidenceIds,
-    ...(hypothesis.probeClasses.length ? { probeClass: hypothesis.probeClasses[0] } : {}),
-    skills: [...new Set([...hypothesis.primitiveKinds.map(kind => `chain:${kind}`), 'chain-primitives', ...hypothesis.probeClasses])],
-    priority: Math.round(hypothesis.confidence * 100),
-  }))
+  return hypotheses.map(hypothesis => {
+    const hopBlock = hypothesis.chainHops?.length
+      ? ` [chain_hops=${formatChainHopsBrief(hypothesis.chainHops, 420)}]`
+      : ''
+    const baseText = `${hypothesis.title} — ${hypothesis.rationale}`
+    const maxBase = Math.max(200, 1200 - hopBlock.length)
+    return {
+      hypothesis: `${baseText.slice(0, maxBase)}${hopBlock}`,
+      origins: hypothesis.chainOrigins,
+      capabilities: hypothesis.capabilities,
+      parentEvidenceIds: hypothesis.parentEvidenceIds,
+      ...(hypothesis.probeClasses.length ? { probeClass: hypothesis.probeClasses[0] } : {}),
+      skills: [...new Set([...hypothesis.primitiveKinds.map(kind => `chain:${kind}`), 'chain-primitives', ...hypothesis.probeClasses])],
+      priority: Math.round(hypothesis.confidence * 100),
+      ...(hypothesis.chainHops?.length ? { chainHops: hypothesis.chainHops } : {}),
+    }
+  })
 }
 
 export interface CoordinatorPlannerSessionDeps {
@@ -869,8 +942,12 @@ export const DET_LEAD_CONCURRENT_CAP = 2
  * slots, never gated behind class/route steps and never killed by a dry-round stop.
  */
 export const TIER_A_STEP_PRIORITY = 90
-/** Hard per-run cap on Tier-A lead steps seeded from Program-Graph facts. */
+/** Hard per-run cap on Tier-A lead steps seeded from Program-Graph facts (black-box/default). */
 export const TIER_A_MAX_SEEDED_STEPS = 6
+/** Expanded Tier-A white-box cap when repository source is mounted (`sourceDir` / `mountedRepos`). */
+export const WHITEBOX_TIER_A_MAX_SEEDED_STEPS = 16
+/** Maximum initial priority for generic black-box recon steps when source repos are mounted. */
+export const WHITEBOX_BLACKBOX_CAP_PRIORITY = 65
 /** Up to this many interesting BOLA queue items are injected into a single assignment prompt. */
 export const ASSIGNMENT_BOLA_QUEUE_MAX_ITEMS = 10
 /** Hard byte ceiling for the per-assignment BOLA queue slice (was 53 KB for the full queue). */
@@ -973,13 +1050,19 @@ export function detLeadEvidenceGate(data: Record<string, unknown> | null | undef
   if (!data || data.kind !== 'det_lead') return { admitted: false, reason: 'not_a_det_lead' }
   if (data.controlPassed === false) return { admitted: false, reason: 'control_collapsed' }
   if (data.contrast === false || data.differsFromControl === false) return { admitted: false, reason: 'no_contrast' }
-  // A Program-Graph white-box lead carries a bounded dataflow slice (route -> hops -> sink) as its
-  // contrast: the code path is the hypothesis, not a bare runtime anomaly. It is admit-eligible
-  // without the runtime control contrast a black-box det_lead requires.
+  // A Program-Graph white-box lead carries a bounded dataflow slice (route -> hops -> sink),
+  // sibling RBAC/middleware policy diff, or static secret/IaC lead as its evidence: it is
+  // admit-eligible without the runtime control contrast a black-box det_lead requires.
   if (data.source === 'program_graph') {
     const slice = data.codeSlice as { hops?: unknown } | undefined
     if (slice && Array.isArray(slice.hops) && slice.hops.length > 0) {
       return { admitted: true, reason: 'code_dataflow_slice' }
+    }
+    if ((Array.isArray(data.guardDiff) && data.guardDiff.length > 0) || data.policyDiff === true) {
+      return { admitted: true, reason: 'rbac_policy_diff' }
+    }
+    if (data.staticLeadKind === 'secret' || data.staticLeadKind === 'iac') {
+      return { admitted: true, reason: 'static_secret_or_iac' }
     }
     return { admitted: false, reason: 'code_slice_missing' }
   }
@@ -1058,6 +1141,14 @@ export interface RoundRobinDispatchOptions {
    * concurrent-lead cap, so every Tier-A slice reaches a slot in Round 1.
    */
   tierALeadIds?: ReadonlySet<string>
+  /**
+   * v7 M2 white-box-first default: when repository source is mounted (`sourceDir` / `mountedRepos`),
+   * AST/RBAC/dataflow/source-audit steps are prioritized strictly ahead of generic black-box steps
+   * without being throttled by `DET_LEAD_CONCURRENT_CAP`.
+   */
+  sourceMounted?: boolean
+  /** Additional white-box step ids (e.g. source-audit or RBAC policy diff steps). */
+  whiteBoxStepIds?: ReadonlySet<string>
   /** Allow leads past the cap only when no non-lead ready step remains (default true). */
   allowLeadOverflow?: boolean
 }
@@ -1067,6 +1158,52 @@ export interface RoundRobinDispatchPlan<T extends DispatchLaneStep> {
   selectedByLane: Record<DispatchLane, number>
   leadCapRemaining: number
   deferredLeads: number
+}
+
+/** Identify white-box AST/RBAC/dataflow/source-audit steps so mounted-source runs prioritize them first. */
+export function isWhiteBoxStep(
+  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'skills' | 'dependsOnFactIds'>,
+  whiteBoxFactIds?: ReadonlySet<string>,
+): boolean {
+  if (whiteBoxFactIds?.size && (step.dependsOnFactIds ?? []).some(id => whiteBoxFactIds.has(id))) return true
+  if ((step.skills ?? []).includes('source-first-audit')) return true
+  const text = `${step.title} ${step.hypothesis ?? ''}`
+  return /\btier[- ]a code lead\b/i.test(text)
+    || /\bsource[- ]first code audit\b/i.test(text)
+    || /\bsource audit verify\b/i.test(text)
+    || /\bsemantic audit\b/i.test(text)
+    || /\bwhite[- ]box dataflow slice\b/i.test(text)
+    || /\bmiddleware\/rbac policy diff\b|\brbac\/middleware policy diff\b|\bmissing_guard\b/i.test(text)
+    || /\bprogram[- ]graph\b/i.test(text)
+}
+
+/**
+ * Remove black-box-first priority overrides when repository source is mounted (`sourceDir` /
+ * `mountedRepos`): white-box steps retain full priority, while generic black-box steps are capped
+ * below white-box AST/RBAC/dataflow leads (`<= WHITEBOX_BLACKBOX_CAP_PRIORITY`).
+ */
+export function prioritizeMountedSourceInitialSteps<T extends {
+  title: string
+  hypothesis?: string | null
+  skills?: readonly string[]
+  dependsOnFactIds?: readonly string[]
+  priority: number
+}>(
+  steps: readonly T[],
+  options: { sourceMounted: boolean; hasWhiteBoxSteps?: boolean; whiteBoxFactIds?: ReadonlySet<string> },
+): T[] {
+  if (!options.sourceMounted) return [...steps]
+  return steps
+    .map(step => {
+      if (isWhiteBoxStep(step, options.whiteBoxFactIds)) return step
+      return {
+        ...step,
+        priority: Math.min(step.priority, WHITEBOX_BLACKBOX_CAP_PRIORITY),
+      }
+    })
+    .sort((a, b) =>
+      Number(isWhiteBoxStep(b, options.whiteBoxFactIds)) - Number(isWhiteBoxStep(a, options.whiteBoxFactIds))
+      || b.priority - a.priority)
 }
 
 /** A det_lead upgrade is identified by its title/hypothesis contract, not by numeric priority. */
@@ -1152,10 +1289,43 @@ export function planRoundRobinDispatch<T extends DispatchLaneStep>(
   const ordered: T[] = []
   const leadQueue = lanes.get('lead')!
   const tierALeadIds = options.tierALeadIds
-  // Tier-A first: every Tier-A slice must reach a slot in Round 1, independent of the generic
-  // concurrent-lead cap (it is still bounded by the worker capacity).
+  const whiteBoxStepIds = options.whiteBoxStepIds
+  const whiteBoxFirst = options.sourceMounted === true || Boolean(whiteBoxStepIds?.size)
+
+  // v7 M2 white-box-first default: when repository source is mounted, pull every white-box
+  // AST/RBAC/dataflow/source-audit step across all lanes strictly ahead of generic black-box steps
+  // (never throttled by DET_LEAD_CONCURRENT_CAP).
   let tierASelected = 0
-  if (tierALeadIds?.size) {
+  if (whiteBoxFirst) {
+    const isPrioritizedWhiteBox = (step: T): boolean =>
+      Boolean(tierALeadIds?.has(step.id))
+      || Boolean(whiteBoxStepIds?.has(step.id))
+      || isWhiteBoxStep(step)
+    const whiteBoxCandidates: Array<{ lane: DispatchLane; step: T }> = []
+    for (const [lane, queue] of lanes.entries()) {
+      for (let idx = 0; idx < queue.length;) {
+        if (!isPrioritizedWhiteBox(queue[idx]!)) { idx += 1; continue }
+        whiteBoxCandidates.push({ lane, step: queue.splice(idx, 1)[0]! })
+      }
+    }
+    whiteBoxCandidates.sort((a, b) => compareDispatchSteps(a.step, b.step, options.hostTiers))
+    const remainingWhiteBox: Array<{ lane: DispatchLane; step: T }> = []
+    for (const entry of whiteBoxCandidates) {
+      if (ordered.length < capacity) {
+        ordered.push(entry.step)
+        selectedByLane[entry.lane] += 1
+        if (entry.lane === 'lead') tierASelected += 1
+      } else {
+        remainingWhiteBox.push(entry)
+      }
+    }
+    // Put any overflow white-box steps back at the front of their lanes so deferredLeads stays accurate.
+    for (const entry of remainingWhiteBox.reverse()) {
+      lanes.get(entry.lane)!.unshift(entry.step)
+    }
+  } else if (tierALeadIds?.size) {
+    // Tier-A first: every Tier-A slice must reach a slot in Round 1, independent of the generic
+    // concurrent-lead cap (it is still bounded by the worker capacity).
     for (let idx = 0; idx < leadQueue.length && ordered.length < capacity;) {
       if (!tierALeadIds.has(leadQueue[idx]!.id)) { idx += 1; continue }
       ordered.push(leadQueue.splice(idx, 1)[0]!)
@@ -1208,8 +1378,14 @@ export interface HighRiskEndpointCandidate {
   method: string
   pathTemplate: string
   riskScore: number
+  source?: string | null
   coveragePct?: number | null
   testedClasses?: readonly string[] | null
+}
+
+function isWhiteBoxEndpointSource(source?: string | null): boolean {
+  const s = (source ?? '').toLowerCase()
+  return s === 'repo_ast' || s === 'program_graph' || s === 'code_audit'
 }
 
 /**
@@ -1224,6 +1400,8 @@ export function selectUncoveredHighRiskEndpoints<T extends HighRiskEndpointCandi
   coveredRoutes: ReadonlySet<string>
   minRisk?: number
   limit?: number
+  /** When repository source is mounted, prioritize AST/Program-Graph endpoints ahead of crawled routes. */
+  sourceMounted?: boolean
 }): T[] {
   const minRisk = input.minRisk ?? 60
   const limit = Math.max(0, Math.floor(input.limit ?? 6))
@@ -1244,6 +1422,9 @@ export function selectUncoveredHighRiskEndpoints<T extends HighRiskEndpointCandi
     eligible.push(ep)
   }
   eligible.sort((a, b) =>
+    (input.sourceMounted
+      ? Number(isWhiteBoxEndpointSource(b.source)) - Number(isWhiteBoxEndpointSource(a.source))
+      : 0) ||
     b.riskScore - a.riskScore ||
     (a.coveragePct ?? 0) - (b.coveragePct ?? 0) ||
     a.method.localeCompare(b.method) ||

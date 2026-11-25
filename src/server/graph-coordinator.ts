@@ -614,10 +614,52 @@ export function queryProgramGraph<T extends ProgramSinkItem | MiddlewareDiffItem
 }
 
 // ---------------------------------------------------------------------------
-// Chain primitives
+// Chain primitives & typed multi-round ChainHop artifacts (v7 M2)
 // ---------------------------------------------------------------------------
 
-export type ChainPrimitiveKind = 'leaked_token' | 'discovered_id' | 'ssrf_internal_reach' | 'stored_write' | 'weak_jwt' | 'admin_route'
+export type ChainPrimitiveKind =
+  | 'leaked_token'
+  | 'discovered_id'
+  | 'ssrf_internal_reach'
+  | 'stored_write'
+  | 'weak_jwt'
+  | 'admin_route'
+  | 'role_transition'
+  | 'workflow_state_handle'
+
+export type ChainHopArtifactKind =
+  | 'token_ref'
+  | 'leaked_id'
+  | 'ssrf_redirect_target'
+  | 'role_transition'
+  | 'workflow_state_handle'
+  | 'stored_write_handle'
+
+/**
+ * Typed, deterministic chain-hop artifact persisted across coordinator rounds.
+ * Never carries raw credentials or secrets: credential material is always represented as an
+ * opaque non-secret handle (`secret:<factId>`, `jwt:<factId>`, `finding:<id>`).
+ */
+export interface ChainHop {
+  hopId: string
+  roundNo: number
+  hopIndex: number
+  artifactKind: ChainHopArtifactKind
+  /** Non-secret typed handle usable by follow-on round briefs without prompt soup. */
+  artifactRef: string
+  origin: string
+  endpoint?: string
+  method?: string
+  persona?: string | null
+  targetPersona?: string | null
+  stateBefore?: string | null
+  stateAfter?: string | null
+  verified: boolean
+  evidenceIds: string[]
+  factIds: string[]
+  parentHopId?: string | null
+  summary: string
+}
 
 export interface ChainPrimitive {
   kind: ChainPrimitiveKind
@@ -635,7 +677,23 @@ export interface ChainPrimitive {
 }
 
 const PRIMITIVE_RANK: Record<ChainPrimitiveKind, number> = {
-  leaked_token: 0, weak_jwt: 1, discovered_id: 2, ssrf_internal_reach: 3, stored_write: 4, admin_route: 5,
+  leaked_token: 0,
+  weak_jwt: 1,
+  discovered_id: 2,
+  ssrf_internal_reach: 3,
+  stored_write: 4,
+  admin_route: 5,
+  role_transition: 6,
+  workflow_state_handle: 7,
+}
+
+const HOP_ARTIFACT_RANK: Record<ChainHopArtifactKind, number> = {
+  token_ref: 0,
+  leaked_id: 1,
+  ssrf_redirect_target: 2,
+  role_transition: 3,
+  workflow_state_handle: 4,
+  stored_write_handle: 5,
 }
 
 export interface DeriveChainPrimitivesInput {
@@ -647,6 +705,34 @@ export interface DeriveChainPrimitivesInput {
 const dedupe = (values: readonly string[]): string[] => [...new Set(values.filter(value => typeof value === 'string' && value.length > 0))]
 const matches = (text: string, patterns: readonly RegExp[]): boolean => patterns.some(pattern => pattern.test(text))
 
+const RAW_SECRET_REF_RE = /^(?:bearer\s+)?eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$|^(?:sk|pk|ghp|gho|ghs|ghu|ghr|xox[baprs]|AKIA|ASIA)[_-]?[A-Za-z0-9_-]{8,}$/i
+
+function safeArtifactRef(raw: string, fallback: string, artifactKind: ChainHopArtifactKind): string {
+  if (artifactKind === 'token_ref') return fallback
+  const trimmed = raw.trim()
+  if (!trimmed || trimmed === '[redacted]' || RAW_SECRET_REF_RE.test(trimmed)) return fallback
+  return truncate(trimmed, 96)
+}
+
+function primitiveKindToHopArtifactKind(kind: ChainPrimitiveKind): ChainHopArtifactKind {
+  switch (kind) {
+    case 'leaked_token':
+    case 'weak_jwt':
+      return 'token_ref'
+    case 'discovered_id':
+      return 'leaked_id'
+    case 'ssrf_internal_reach':
+      return 'ssrf_redirect_target'
+    case 'role_transition':
+    case 'admin_route':
+      return 'role_transition'
+    case 'workflow_state_handle':
+      return 'workflow_state_handle'
+    case 'stored_write':
+      return 'stored_write_handle'
+  }
+}
+
 /** Derive typed, deduplicated chain tags from untainted facts, confirmed findings and endpoints. */
 export function deriveChainPrimitives(input: DeriveChainPrimitivesInput): ChainPrimitive[] {
   const out: ChainPrimitive[] = []
@@ -656,7 +742,7 @@ export function deriveChainPrimitives(input: DeriveChainPrimitivesInput): ChainP
     const data = fact.data ?? {}
     const subkind = str(data.subkind) ?? ''
     const probeClass = str(data.probeClass) ?? ''
-    const text = `${subkind} ${probeClass} ${str(data.kind) ?? ''}`.toLowerCase()
+    const text = `${subkind} ${probeClass} ${str(data.kind) ?? ''} ${str(data.artifactKind) ?? ''}`.toLowerCase()
     const endpoint = str(data.endpoint) ?? str(data.path) ?? undefined
     const method = str(data.method)?.toUpperCase()
     const persona = str(data.persona) ?? str(data.personaHandle) ?? str(data.ownerPersona)
@@ -670,7 +756,45 @@ export function deriveChainPrimitives(input: DeriveChainPrimitivesInput): ChainP
     const anomalyTypes = anomalies
       .map(anomaly => anomaly && typeof anomaly === 'object' ? str((anomaly as { type?: unknown }).type) ?? '' : '')
       .filter(Boolean).join(' ').toLowerCase()
-    const ssrfText = `${text} ${anomalyTypes} ${str(data.internalTarget) ?? ''}`
+    const ssrfText = `${text} ${anomalyTypes} ${str(data.internalTarget) ?? ''} ${str(data.redirectTarget) ?? ''}`
+
+    // Rehydrate persisted typed chain_hop facts cleanly onto their primitive kinds, preserving
+    // original factIds/evidenceIds and canonical artifactRef so they dedupe with source facts.
+    if (subkind === 'chain_hop' || data.kind === 'chain_hop') {
+      const hop = (data.hop && typeof data.hop === 'object' ? data.hop : data) as Record<string, unknown>
+      const artifactKind = str(hop.artifactKind) as ChainHopArtifactKind | null
+      const hopEndpoint = str(hop.endpoint) ?? endpoint
+      const hopMethod = str(hop.method)?.toUpperCase() ?? method
+      const hopPersona = str(hop.persona) ?? persona
+      const hopRef = str(hop.artifactRef) ?? `hop:${fact.id}`
+      const origFactIds = Array.isArray(hop.factIds) ? hop.factIds.map(str).filter((v): v is string => v !== null) : []
+      const origEvidenceIds = Array.isArray(hop.evidenceIds) ? hop.evidenceIds.map(str).filter((v): v is string => v !== null) : []
+      const hopBase = {
+        ...base,
+        evidenceIds: dedupe([...origEvidenceIds, fact.id, ...(fact.evidenceIds ?? [])]),
+        factIds: dedupe([...origFactIds, fact.id]),
+        ...(hopEndpoint ? { endpoint: hopEndpoint } : {}),
+        ...(hopMethod ? { method: hopMethod } : {}),
+        ...(hopPersona ? { persona: hopPersona } : {}),
+      }
+      if (artifactKind === 'token_ref') {
+        const canonicalTokenRef = hopRef.startsWith('secret:') || hopRef.startsWith('jwt:') || hopRef.startsWith('finding:')
+          ? hopRef
+          : `secret:${origFactIds[0] ?? fact.id}`
+        out.push({ ...hopBase, kind: 'leaked_token', value: canonicalTokenRef, detail: truncate(str(hop.summary) ?? 'Persisted token_ref chain hop (value withheld).', 160) })
+      } else if (artifactKind === 'leaked_id') {
+        out.push({ ...hopBase, kind: 'discovered_id', value: safeArtifactRef(hopRef, `id:${fact.id}`, 'leaked_id'), detail: truncate(str(hop.summary) ?? `Persisted leaked_id hop ${hopRef}.`, 160) })
+      } else if (artifactKind === 'ssrf_redirect_target') {
+        out.push({ ...hopBase, kind: 'ssrf_internal_reach', value: safeArtifactRef(hopRef, `ssrf:${hopEndpoint ?? fact.id}`, 'ssrf_redirect_target'), detail: truncate(str(hop.summary) ?? `Persisted SSRF/redirect hop at ${hopEndpoint ?? 'target'}.`, 160) })
+      } else if (artifactKind === 'role_transition') {
+        out.push({ ...hopBase, kind: 'role_transition', value: safeArtifactRef(hopRef, `role:${fact.id}`, 'role_transition'), detail: truncate(str(hop.summary) ?? 'Persisted role transition hop.', 160) })
+      } else if (artifactKind === 'workflow_state_handle') {
+        out.push({ ...hopBase, kind: 'workflow_state_handle', value: safeArtifactRef(hopRef, `workflow:${fact.id}`, 'workflow_state_handle'), detail: truncate(str(hop.summary) ?? 'Persisted workflow state handle hop.', 160) })
+      } else if (artifactKind === 'stored_write_handle') {
+        out.push({ ...hopBase, kind: 'stored_write', value: safeArtifactRef(hopRef, `stored:${fact.id}`, 'stored_write_handle'), detail: truncate(str(hop.summary) ?? 'Persisted stored write hop.', 160) })
+      }
+      continue
+    }
 
     if (fact.kind === 'secret' || matches(text, [/leak(?:ed)?[_-]?token/, /token[_-]?leak/, /credential[_-]?leak/, /secret[_-]?exposure/, /api[_-]?key[_-]?(?:exposed|leak)/])) {
       out.push({ ...base, kind: 'leaked_token', value: `secret:${fact.id}`, detail: 'Leaked credential material recorded as a secret fact (value withheld).' })
@@ -678,8 +802,9 @@ export function deriveChainPrimitives(input: DeriveChainPrimitivesInput): ChainP
     if ((fact.kind === 'object_ref' || subkind === 'persona_resource') && resourceId && resourceId !== '[redacted]') {
       out.push({ ...base, kind: 'discovered_id', value: resourceId, detail: `Discovered object identifier ${truncate(resourceId, 48)}${endpoint ? ` at ${endpoint}` : ''}.` })
     }
-    if (matches(ssrfText, [/ssrf/, /internal[_-]?(?:reach|fetch|target)/, /oob[_-]?(?:callback|hit)/]) || probeClass.toLowerCase().startsWith('ssrf')) {
-      out.push({ ...base, kind: 'ssrf_internal_reach', value: `ssrf:${endpoint ?? fact.id}`, detail: `Server-side fetch reached internal/out-of-band infrastructure via ${endpoint ?? 'a recorded sink'}.` })
+    if (matches(ssrfText, [/ssrf/, /internal[_-]?(?:reach|fetch|target)/, /oob[_-]?(?:callback|hit)/, /open[_-]?redirect/, /redirect[_-]?target/]) || probeClass.toLowerCase().startsWith('ssrf')) {
+      const targetRef = str(data.redirectTarget) ?? str(data.internalTarget) ?? endpoint ?? fact.id
+      out.push({ ...base, kind: 'ssrf_internal_reach', value: `ssrf:${truncate(targetRef, 64)}`, detail: `Server-side fetch or redirect pivot reached ${truncate(targetRef, 64)} via ${endpoint ?? 'a recorded sink'}.` })
     }
     if (subkind === 'second_order_surface' || matches(text, [/stored[_-]?(?:xss|write)/, /persistent[_-]?xss/, /second[_-]?order/])) {
       out.push({ ...base, kind: 'stored_write', value: `stored:${str(data.marker) ?? str(data.canaryId) ?? endpoint ?? fact.id}`, detail: `Stateful write persisted and resurfaced${endpoint ? ` at ${endpoint}` : ''}.` })
@@ -689,6 +814,14 @@ export function deriveChainPrimitives(input: DeriveChainPrimitivesInput): ChainP
     }
     if (matches(text, [/admin[_-]?route/, /role[_-]?exclusive/, /privileged[_-]?route/, /auth[_-]?bypass/]) || data.roleExclusive === true) {
       out.push({ ...base, kind: 'admin_route', value: `admin:${endpoint ?? fact.id}`, detail: `Privileged route primitive recorded${endpoint ? ` at ${endpoint}` : ''}.` })
+    }
+    if (matches(text, [/role[_-]?(?:transition|change|escalat|grant|demot|revok)/, /stale[_-]?privilege/, /impersonat/, /self[_-]?approv/, /invite[_-]?(?:accept|redeem)/, /tenant[_-]?confusion/]) || str(data.roleAfter)) {
+      const transition = str(data.roleAfter) ? `${str(data.roleBefore) ?? persona ?? 'member'}->${str(data.roleAfter)}` : (endpoint ?? fact.id)
+      out.push({ ...base, kind: 'role_transition', value: `role:${truncate(transition, 64)}`, detail: `Role/privilege transition observed (${truncate(transition, 64)})${endpoint ? ` at ${endpoint}` : ''}.` })
+    }
+    if (matches(text, [/workflow[_-]?(?:state|handle|transition|bypass)/, /approval[_-]?(?:id|handle|pending)/, /checkout[_-]?(?:state|handle)/, /payout[_-]?handle/, /pipeline[_-]?(?:run|handle)/, /signed[_-]?url/]) || str(data.workflowHandle) || str(data.stateHandle)) {
+      const handle = str(data.workflowHandle) ?? str(data.stateHandle) ?? resourceId ?? endpoint ?? fact.id
+      out.push({ ...base, kind: 'workflow_state_handle', value: `workflow:${truncate(handle, 64)}`, detail: `Workflow state handle ${truncate(handle, 48)}${str(data.stateAfter) ? ` (state=${str(data.stateAfter)})` : ''}${endpoint ? ` at ${endpoint}` : ''}.` })
     }
   }
 
@@ -705,8 +838,8 @@ export function deriveChainPrimitives(input: DeriveChainPrimitivesInput): ChainP
     if (matches(text, [/jwt/, /json web token/, /alg(?:orithm)?[ -]?none/, /weak[ -]?secret/])) {
       out.push({ ...base, kind: 'weak_jwt', value: `finding:${finding.id}`, detail: `Confirmed JWT/session weakness (${claim}).` })
     }
-    if (matches(text, [/ssrf/, /server[ -]?side request/, /internal (?:reach|metadata|network)/])) {
-      out.push({ ...base, kind: 'ssrf_internal_reach', value: `finding:${finding.id}`, detail: `Confirmed server-side request reach (${claim}).` })
+    if (matches(text, [/ssrf/, /server[ -]?side request/, /internal (?:reach|metadata|network)/, /open[ -]?redirect/])) {
+      out.push({ ...base, kind: 'ssrf_internal_reach', value: `finding:${finding.id}`, detail: `Confirmed server-side request/redirect reach (${claim}).` })
     }
     if (/stored|persistent|second[ -]?order/.test(text) && /xss|write|inject/.test(text)) {
       out.push({ ...base, kind: 'stored_write', value: `finding:${finding.id}`, detail: `Confirmed persisted write primitive (${claim}).` })
@@ -716,6 +849,12 @@ export function deriveChainPrimitives(input: DeriveChainPrimitivesInput): ChainP
     }
     if (matches(text, [/idor/, /bola/, /object reference/, /tenant isolation/])) {
       out.push({ ...base, kind: 'discovered_id', value: `finding:${finding.id}`, detail: `Confirmed cross-object access primitive (${claim}).` })
+    }
+    if (matches(text, [/role escalation/, /privilege escalation/, /revok/, /demot/, /self[ -]?approv/, /impersonat/, /sso.*tenant/])) {
+      out.push({ ...base, kind: 'role_transition', value: `finding:${finding.id}`, detail: `Confirmed role/privilege transition (${claim}).` })
+    }
+    if (matches(text, [/workflow/, /state[ -]?machine/, /approval[ -]?bypass/, /checkout/, /payout/, /race[ -]?condition/, /double[ -]?spend/])) {
+      out.push({ ...base, kind: 'workflow_state_handle', value: `finding:${finding.id}`, detail: `Confirmed workflow state primitive (${claim}).` })
     }
   }
 
@@ -739,6 +878,150 @@ export function deriveChainPrimitives(input: DeriveChainPrimitivesInput): ChainP
     || (a.value < b.value ? -1 : a.value > b.value ? 1 : 0))
 }
 
+/**
+ * Extract typed, non-secret `ChainHop` artifacts from untainted facts (including persisted
+ * `chain_hop` facts from earlier coordinator rounds), confirmed findings, and endpoints.
+ */
+export function extractChainHops(
+  input: DeriveChainPrimitivesInput & { roundNo?: number; priorHops?: readonly ChainHop[] },
+): ChainHop[] {
+  const defaultRound = Math.max(1, Math.floor(input.roundNo ?? 1))
+  const byKey = new Map<string, ChainHop>()
+  const upsert = (hop: ChainHop): void => {
+    const key = `${hop.artifactKind}\u0000${hop.origin}\u0000${hop.artifactRef}`
+    const existing = byKey.get(key)
+    if (!existing) {
+      byKey.set(key, { ...hop, evidenceIds: dedupe(hop.evidenceIds), factIds: dedupe(hop.factIds) })
+      return
+    }
+    byKey.set(key, {
+      ...existing,
+      roundNo: Math.min(existing.roundNo, hop.roundNo),
+      verified: existing.verified || hop.verified,
+      evidenceIds: dedupe([...existing.evidenceIds, ...hop.evidenceIds]),
+      factIds: dedupe([...existing.factIds, ...hop.factIds]),
+      ...(!existing.endpoint && hop.endpoint ? { endpoint: hop.endpoint } : {}),
+      ...(!existing.method && hop.method ? { method: hop.method } : {}),
+      ...(!existing.persona && hop.persona ? { persona: hop.persona } : {}),
+      ...(!existing.targetPersona && hop.targetPersona ? { targetPersona: hop.targetPersona } : {}),
+      ...(!existing.stateBefore && hop.stateBefore ? { stateBefore: hop.stateBefore } : {}),
+      ...(!existing.stateAfter && hop.stateAfter ? { stateAfter: hop.stateAfter } : {}),
+      ...(!existing.parentHopId && hop.parentHopId ? { parentHopId: hop.parentHopId } : {}),
+    })
+  }
+
+  for (const prior of input.priorHops ?? []) {
+    upsert({
+      ...prior,
+      artifactRef: safeArtifactRef(prior.artifactRef, `secret:${prior.hopId}`, prior.artifactKind),
+    })
+  }
+
+  // Rehydrate persisted chain_hop facts directly so round/parentHopId/state metadata survives intact.
+  for (const fact of input.facts ?? []) {
+    if (fact.tainted) continue
+    const data = fact.data ?? {}
+    if (data.subkind !== 'chain_hop' && data.kind !== 'chain_hop') continue
+    const raw = (data.hop && typeof data.hop === 'object' ? data.hop : data) as Record<string, unknown>
+    const artifactKind = str(raw.artifactKind) as ChainHopArtifactKind | null
+    if (!artifactKind || !(artifactKind in HOP_ARTIFACT_RANK)) continue
+    const roundNo = num(raw.roundNo) ?? factRound(fact) ?? defaultRound
+    const hopId = str(raw.hopId) ?? `hop:${artifactKind}:${fact.id}`
+    const fallbackRef = artifactKind === 'token_ref' ? `secret:${fact.id}` : `${artifactKind}:${fact.id}`
+    const artifactRef = safeArtifactRef(str(raw.artifactRef) ?? fallbackRef, fallbackRef, artifactKind)
+    upsert({
+      hopId,
+      roundNo: Math.max(1, Math.floor(roundNo)),
+      hopIndex: Math.max(0, Math.floor(num(raw.hopIndex) ?? 0)),
+      artifactKind,
+      artifactRef,
+      origin: fact.origin,
+      ...(str(raw.endpoint) ? { endpoint: str(raw.endpoint)! } : {}),
+      ...(str(raw.method) ? { method: str(raw.method)!.toUpperCase() } : {}),
+      ...(str(raw.persona) ? { persona: str(raw.persona) } : {}),
+      ...(str(raw.targetPersona) ? { targetPersona: str(raw.targetPersona) } : {}),
+      ...(str(raw.stateBefore) ? { stateBefore: str(raw.stateBefore) } : {}),
+      ...(str(raw.stateAfter) ? { stateAfter: str(raw.stateAfter) } : {}),
+      verified: raw.verified === true,
+      evidenceIds: dedupe([fact.id, ...(fact.evidenceIds ?? []), ...(Array.isArray(raw.evidenceIds) ? raw.evidenceIds.map(String) : [])]),
+      factIds: dedupe([fact.id, ...(Array.isArray(raw.factIds) ? raw.factIds.map(String) : [])]),
+      ...(str(raw.parentHopId) ? { parentHopId: str(raw.parentHopId) } : {}),
+      summary: truncate(str(raw.summary) ?? fact.summary, 160),
+    })
+  }
+
+  // Synthesize typed ChainHops from all derived primitives (facts, confirmed findings, endpoints).
+  const confirmedFindingIds = new Set((input.findings ?? []).filter(f => f.status === 'confirmed').map(f => f.id))
+  const factById = new Map((input.facts ?? []).map(f => [f.id, f]))
+  const primitives = deriveChainPrimitives(input)
+  primitives.forEach((primitive, idx) => {
+    const artifactKind = primitiveKindToHopArtifactKind(primitive.kind)
+    const primaryFact = primitive.factIds.length ? factById.get(primitive.factIds[0]) : undefined
+    const factData = primaryFact?.data ?? {}
+    const verified = primitive.evidenceIds.some(id => confirmedFindingIds.has(id)) || factData.verified === true
+    const roundNo = (primaryFact ? factRound(primaryFact) : null) ?? defaultRound
+    const fallbackRef = artifactKind === 'token_ref'
+      ? (primitive.value.startsWith('secret:') || primitive.value.startsWith('jwt:') || primitive.value.startsWith('finding:') ? primitive.value : `secret:${primitive.factIds[0] ?? idx}`)
+      : primitive.value
+    const artifactRef = safeArtifactRef(primitive.value, fallbackRef, artifactKind)
+    const stateBefore = str(factData.stateBefore) ?? str(factData.roleBefore)
+    const stateAfter = str(factData.stateAfter) ?? str(factData.roleAfter)
+    const targetPersona = str(factData.targetPersona) ?? str(factData.surfacedPersona)
+    upsert({
+      hopId: `hop:${artifactKind}:${hostOf(primitive.origin)}:${artifactRef.replace(/[^A-Za-z0-9:._-]/g, '_').slice(0, 48)}`,
+      roundNo: Math.max(1, Math.floor(roundNo)),
+      hopIndex: idx,
+      artifactKind,
+      artifactRef,
+      origin: primitive.origin,
+      ...(primitive.endpoint ? { endpoint: primitive.endpoint } : {}),
+      ...(primitive.method ? { method: primitive.method } : {}),
+      ...(primitive.persona ? { persona: primitive.persona } : {}),
+      ...(targetPersona ? { targetPersona } : {}),
+      ...(stateBefore ? { stateBefore } : {}),
+      ...(stateAfter ? { stateAfter } : {}),
+      verified,
+      evidenceIds: primitive.evidenceIds,
+      factIds: primitive.factIds,
+      ...(str(factData.parentHopId) ? { parentHopId: str(factData.parentHopId) } : {}),
+      summary: truncate(primitive.detail, 160),
+    })
+  })
+
+  return [...byKey.values()]
+    .sort((a, b) =>
+      a.roundNo - b.roundNo
+      || Number(b.verified) - Number(a.verified)
+      || HOP_ARTIFACT_RANK[a.artifactKind] - HOP_ARTIFACT_RANK[b.artifactKind]
+      || (a.origin < b.origin ? -1 : a.origin > b.origin ? 1 : 0)
+      || (a.artifactRef < b.artifactRef ? -1 : a.artifactRef > b.artifactRef ? 1 : 0))
+    .map((hop, index) => ({ ...hop, hopIndex: index }))
+}
+
+/**
+ * Compact, deterministic JSON encoding of typed `ChainHop` inputs for follow-on round briefs.
+ * Strictly bounded by `maxBytes` and guaranteed free of raw credentials.
+ */
+export function formatChainHopsBrief(hops: readonly ChainHop[], maxBytes = 640): string {
+  const cap = Math.max(128, Math.floor(maxBytes))
+  const compact = hops.map(hop => ({
+    hop: hop.hopIndex + 1,
+    r: hop.roundNo,
+    kind: hop.artifactKind,
+    ref: safeArtifactRef(hop.artifactRef, `secret:${hop.hopId}`, hop.artifactKind),
+    ...(hop.method && hop.endpoint ? { at: `${hop.method} ${truncate(hop.endpoint, 80)}` } : hop.endpoint ? { at: truncate(hop.endpoint, 80) } : {}),
+    ...(hop.persona ? { actor: truncate(hop.persona, 32) } : {}),
+    ...(hop.targetPersona ? { target: truncate(hop.targetPersona, 32) } : {}),
+    ...(hop.stateBefore || hop.stateAfter ? { state: `${hop.stateBefore ?? '*'}->${hop.stateAfter ?? '*'}` } : {}),
+    v: hop.verified ? 1 : 0,
+  }))
+  for (let count = compact.length; count >= 1; count -= 1) {
+    const text = JSON.stringify(compact.slice(0, count))
+    if (Buffer.byteLength(text, 'utf8') <= cap) return text
+  }
+  return '[]'
+}
+
 // ---------------------------------------------------------------------------
 // Explicit chaining round
 // ---------------------------------------------------------------------------
@@ -760,33 +1043,89 @@ export interface ChainHypothesis {
   confidence: number
   entry?: { endpoint: string; method?: string; origin: string }
   target?: { endpoint: string; method?: string; origin: string }
+  /** Ordered typed hop inputs feeding follow-on rounds without prompt soup (v7 M2). */
+  chainHops?: ChainHop[]
 }
 
 export interface PlanChainRoundArgs {
   primitives: readonly ChainPrimitive[]
   endpoints?: readonly CoordinatorEndpoint[]
+  /** Typed hops from prior/current rounds to attach onto planned multi-step hypotheses. */
+  hops?: readonly ChainHop[]
   maxHops?: number
   limit?: number
   approvedOrigins?: readonly string[]
 }
 
-const PAIR_WEIGHTS: Readonly<Record<string, number>> = {
-  'admin_route+leaked_token': 0.86, 'admin_route+weak_jwt': 0.84, 'discovered_id+leaked_token': 0.80,
-  'discovered_id+stored_write': 0.78, 'ssrf_internal_reach+stored_write': 0.82, 'admin_route+stored_write': 0.74,
-  'discovered_id+admin_route': 0.75, 'leaked_token+ssrf_internal_reach': 0.76, 'discovered_id+weak_jwt': 0.72,
-  'admin_route+ssrf_internal_reach': 0.70, 'discovered_id+ssrf_internal_reach': 0.68,
-}
+const keyOf = (kinds: readonly ChainPrimitiveKind[]): string => [...kinds].sort().join('+')
+const normalizeComboKey = (raw: string): string => raw.split('+').sort().join('+')
+
+const PAIR_WEIGHTS: Readonly<Record<string, number>> = Object.fromEntries(
+  Object.entries({
+    'admin_route+leaked_token': 0.86,
+    'admin_route+weak_jwt': 0.84,
+    'discovered_id+leaked_token': 0.80,
+    'discovered_id+stored_write': 0.78,
+    'ssrf_internal_reach+stored_write': 0.82,
+    'admin_route+stored_write': 0.74,
+    'admin_route+discovered_id': 0.75,
+    'leaked_token+ssrf_internal_reach': 0.76,
+    'discovered_id+weak_jwt': 0.72,
+    'admin_route+ssrf_internal_reach': 0.70,
+    'discovered_id+ssrf_internal_reach': 0.68,
+    'admin_route+role_transition': 0.88,
+    'leaked_token+role_transition': 0.85,
+    'role_transition+weak_jwt': 0.83,
+    'role_transition+workflow_state_handle': 0.84,
+    'discovered_id+workflow_state_handle': 0.81,
+    'admin_route+workflow_state_handle': 0.79,
+    'discovered_id+role_transition': 0.82,
+    'leaked_token+workflow_state_handle': 0.77,
+    'ssrf_internal_reach+workflow_state_handle': 0.75,
+    'role_transition+stored_write': 0.76,
+    'stored_write+workflow_state_handle': 0.74,
+    'role_transition+ssrf_internal_reach': 0.75,
+  }).map(([combo, weight]) => [normalizeComboKey(combo), weight]),
+)
 
 const THREE_HOP_SETS: ReadonlySet<string> = new Set([
-  'discovered_id+ssrf_internal_reach+stored_write', 'admin_route+discovered_id+leaked_token',
-  'admin_route+discovered_id+weak_jwt', 'leaked_token+ssrf_internal_reach+stored_write',
+  'discovered_id+ssrf_internal_reach+stored_write',
+  'admin_route+discovered_id+leaked_token',
+  'admin_route+discovered_id+weak_jwt',
+  'leaked_token+ssrf_internal_reach+stored_write',
   'admin_route+ssrf_internal_reach+stored_write',
-])
+  'admin_route+discovered_id+role_transition',
+  'admin_route+role_transition+workflow_state_handle',
+  'discovered_id+role_transition+workflow_state_handle',
+  'leaked_token+role_transition+workflow_state_handle',
+  'admin_route+leaked_token+role_transition',
+  'admin_route+role_transition+weak_jwt',
+  'discovered_id+leaked_token+workflow_state_handle',
+  'admin_route+leaked_token+ssrf_internal_reach',
+  'leaked_token+role_transition+ssrf_internal_reach',
+  'role_transition+ssrf_internal_reach+workflow_state_handle',
+  'discovered_id+role_transition+stored_write',
+].map(normalizeComboKey))
 
-const keyOf = (kinds: readonly ChainPrimitiveKind[]): string => [...kinds].sort().join('+')
+const FOUR_HOP_SETS: ReadonlySet<string> = new Set([
+  'admin_route+discovered_id+role_transition+workflow_state_handle',
+  'admin_route+discovered_id+leaked_token+role_transition',
+  'admin_route+leaked_token+role_transition+workflow_state_handle',
+  'admin_route+leaked_token+ssrf_internal_reach+stored_write',
+  'admin_route+discovered_id+ssrf_internal_reach+workflow_state_handle',
+  'discovered_id+leaked_token+role_transition+workflow_state_handle',
+  'admin_route+role_transition+ssrf_internal_reach+workflow_state_handle',
+  'admin_route+discovered_id+role_transition+weak_jwt',
+].map(normalizeComboKey))
 const PROBE_CLASS: Record<ChainPrimitiveKind, string> = {
-  leaked_token: 'authz_replay', discovered_id: 'bola_idor', ssrf_internal_reach: 'ssrf',
-  stored_write: 'stored_xss', weak_jwt: 'jwt_forgery', admin_route: 'auth_bypass',
+  leaked_token: 'authz_replay',
+  discovered_id: 'bola_idor',
+  ssrf_internal_reach: 'ssrf',
+  stored_write: 'stored_xss',
+  weak_jwt: 'jwt_forgery',
+  admin_route: 'auth_bypass',
+  role_transition: 'auth_bypass',
+  workflow_state_handle: 'workflow_invariant',
 }
 const hostOf = (origin: string): string => origin.replace(/^https?:\/\//, '')
 
@@ -794,7 +1133,8 @@ function capabilitySet(kinds: readonly ChainPrimitiveKind[]): CoordinatorCapabil
   return COORDINATOR_CAPABILITIES.filter(capability =>
     capability === 'http'
     || (capability === 'oob' && kinds.includes('ssrf_internal_reach'))
-    || (capability === 'browser' && kinds.includes('stored_write')))
+    || (capability === 'browser' && kinds.includes('stored_write'))
+    || (capability === 'race' && kinds.includes('workflow_state_handle')))
 }
 
 function endpointFor(primitive: ChainPrimitive, endpoints: readonly CoordinatorEndpoint[]): CoordinatorEndpoint | undefined {
@@ -804,14 +1144,59 @@ function endpointFor(primitive: ChainPrimitive, endpoints: readonly CoordinatorE
       && (!primitive.method || endpoint.method.toUpperCase() === primitive.method))
 }
 
-function buildHypothesis(scope: ChainScope, chain: readonly ChainPrimitive[], endpoints: readonly CoordinatorEndpoint[], ordinal: number): ChainHypothesis {
+function matchHopForPrimitive(primitive: ChainPrimitive, hops: readonly ChainHop[], hopIndex: number): ChainHop {
+  const artifactKind = primitiveKindToHopArtifactKind(primitive.kind)
+  const matched = hops.find(hop =>
+    hop.origin === primitive.origin
+    && hop.artifactKind === artifactKind
+    && (hop.artifactRef === primitive.value
+      || (primitive.factIds.length > 0 && primitive.factIds.some(id => hop.factIds.includes(id)))
+      || (primitive.endpoint && hop.endpoint === primitive.endpoint)))
+  if (matched) return { ...matched, hopIndex }
+  const fallbackRef = artifactKind === 'token_ref'
+    ? (primitive.value.startsWith('secret:') || primitive.value.startsWith('jwt:') || primitive.value.startsWith('finding:') ? primitive.value : `secret:${primitive.factIds[0] ?? hopIndex}`)
+    : primitive.value
+  return {
+    hopId: `hop:${artifactKind}:${hostOf(primitive.origin)}:${hopIndex}`,
+    roundNo: 1,
+    hopIndex,
+    artifactKind,
+    artifactRef: safeArtifactRef(primitive.value, fallbackRef, artifactKind),
+    origin: primitive.origin,
+    ...(primitive.endpoint ? { endpoint: primitive.endpoint } : {}),
+    ...(primitive.method ? { method: primitive.method } : {}),
+    ...(primitive.persona ? { persona: primitive.persona } : {}),
+    verified: false,
+    evidenceIds: dedupe(primitive.evidenceIds),
+    factIds: dedupe(primitive.factIds),
+    summary: truncate(primitive.detail, 160),
+  }
+}
+
+function buildHypothesis(
+  scope: ChainScope,
+  chain: readonly ChainPrimitive[],
+  endpoints: readonly CoordinatorEndpoint[],
+  hops: readonly ChainHop[],
+  ordinal: number,
+): ChainHypothesis {
   const kinds = chain.map(primitive => primitive.kind)
   const origins = [...new Set(chain.map(primitive => primitive.origin))]
   const entry = chain.map(primitive => endpointFor(primitive, endpoints)).find(Boolean)
   const target = [...chain].reverse().map(primitive => endpointFor(primitive, endpoints)).find(Boolean)
-  const base = chain.length === 2
-    ? PAIR_WEIGHTS[keyOf(kinds)] ?? 0.55
-    : Math.min(PAIR_WEIGHTS[keyOf(kinds.slice(0, 2))] ?? 0.55, PAIR_WEIGHTS[keyOf(kinds.slice(1))] ?? 0.55, 0.9)
+  const pairScore = (a: ChainPrimitiveKind, b: ChainPrimitiveKind): number => PAIR_WEIGHTS[keyOf([a, b])] ?? 0.55
+  let base = 0.55
+  if (chain.length === 2) {
+    base = pairScore(kinds[0], kinds[1])
+  } else {
+    const scores: number[] = []
+    for (let i = 0; i < kinds.length - 1; i += 1) scores.push(pairScore(kinds[i], kinds[i + 1]))
+    base = Math.min(...scores, 0.9)
+  }
+  const chainHops = chain.map((primitive, index) => matchHopForPrimitive(primitive, hops, index))
+  for (let i = 1; i < chainHops.length; i += 1) {
+    if (!chainHops[i].parentHopId) chainHops[i] = { ...chainHops[i], parentHopId: chainHops[i - 1].hopId }
+  }
   return {
     id: `chain:${scope}:${kinds.join('>')}:${ordinal}`,
     scope, hops: chain.length, origin: chain[0].origin, chainOrigins: origins, primitiveKinds: kinds,
@@ -823,19 +1208,22 @@ function buildHypothesis(scope: ChainScope, chain: readonly ChainPrimitive[], en
     confidence: Math.round((base - (chain.length - 2) * 0.03) * 100) / 100,
     ...(entry ? { entry: { endpoint: entry.pathTemplate, method: entry.method, origin: entry.origin } } : {}),
     ...(target ? { target: { endpoint: target.pathTemplate, method: target.method, origin: target.origin } } : {}),
+    chainHops,
   }
 }
 
 /**
- * Propose explicit 2–3 hop hypotheses over the full primitive set: same-origin chains pair
- * primitives on one target; cross-origin chains pair a credential/ID from one approved origin
- * with a privileged or stateful surface on another. Every hypothesis carries parent evidence.
+ * Propose explicit 2–4 hop hypotheses over the full primitive set: same-origin chains pair
+ * primitives on one target; cross-origin chains pair a credential/ID/state handle from one
+ * approved origin with a privileged or stateful surface on another. Every hypothesis carries
+ * parent evidence and typed `chainHops` inputs for follow-on rounds.
  */
 export function planChainRound(args: PlanChainRoundArgs): ChainHypothesis[] {
-  const maxHops = Math.max(2, Math.min(Math.floor(args.maxHops ?? 3), 3))
+  const maxHops = Math.max(2, Math.min(Math.floor(args.maxHops ?? 3), 4))
   const limit = resolveLimit(args.limit, 12)
   const approved = args.approvedOrigins?.length ? new Set(args.approvedOrigins) : null
   const endpoints = args.endpoints ?? []
+  const hops = args.hops ?? []
   const primitives = args.primitives
     .filter(primitive => !approved || approved.has(primitive.origin))
     .slice()
@@ -855,15 +1243,26 @@ export function planChainRound(args: PlanChainRoundArgs): ChainHypothesis[] {
       if (maxHops < 3) continue
       for (let k = j + 1; k < primitives.length; k += 1) {
         const third = primitives[k]
-        const kinds = [...pair.map(primitive => primitive.kind), third.kind]
-        if (new Set(kinds).size === 3 && THREE_HOP_SETS.has(keyOf(kinds))) push([...pair, third])
+        const kinds3 = [...pair.map(primitive => primitive.kind), third.kind]
+        if (new Set(kinds3).size === 3 && THREE_HOP_SETS.has(keyOf(kinds3))) {
+          const triple = [...pair, third]
+          push(triple)
+          if (maxHops < 4) continue
+          for (let l = k + 1; l < primitives.length; l += 1) {
+            const fourth = primitives[l]
+            const kinds4 = [...kinds3, fourth.kind]
+            if (new Set(kinds4).size === 4 && FOUR_HOP_SETS.has(keyOf(kinds4))) {
+              push([...triple, fourth])
+            }
+          }
+        }
       }
     }
   }
 
   const counters = new Map<string, number>()
   return chains
-    .map(chain => buildHypothesis(chain.scope, chain.chain, endpoints, 0))
+    .map(chain => buildHypothesis(chain.scope, chain.chain, endpoints, hops, 0))
     .sort((a, b) => b.confidence - a.confidence
       || b.hops - a.hops
       || Number(a.scope === 'cross_origin') - Number(b.scope === 'cross_origin')
@@ -892,6 +1291,8 @@ export interface DispatchStepInput {
   expectedSignal?: string
   skills?: readonly string[]
   priority?: number
+  /** Optional typed multi-round hop artifacts feeding follow-on briefs without prompt soup. */
+  chainHops?: readonly ChainHop[]
 }
 
 export interface DispatchOptions {
@@ -912,6 +1313,7 @@ export interface NormalizedDispatchStep {
   expectedSignal?: string
   skills: string[]
   priority: number
+  chainHops?: ChainHop[]
 }
 
 export type DispatchRejectionCode =
@@ -1004,6 +1406,16 @@ export function dispatchInvestigations(steps: readonly DispatchStepInput[], opti
       ...(step.expectedSignal?.trim() ? { expectedSignal: step.expectedSignal.trim() } : {}),
       skills: [...new Set((step.skills ?? []).map(skill => skill.trim()).filter(Boolean))].sort(),
       priority: Math.max(0, Math.min(100, Math.round(step.priority ?? 50))),
+      ...(step.chainHops?.length
+        ? {
+            chainHops: step.chainHops.map(hop => ({
+              ...hop,
+              artifactRef: safeArtifactRef(hop.artifactRef, `secret:${hop.hopId}`, hop.artifactKind),
+              evidenceIds: dedupe(hop.evidenceIds),
+              factIds: dedupe(hop.factIds),
+            })),
+          }
+        : {}),
     })
   })
 
@@ -1073,6 +1485,7 @@ export interface GraphCoordinator {
   queryFindings(args: QueryFindingsArgs): FindingsPage
   dispatchInvestigations(steps: readonly DispatchStepInput[], options?: DispatchOptions): DispatchPlan
   deriveChainPrimitives(): ChainPrimitive[]
+  extractChainHops(roundNo?: number, priorHops?: readonly ChainHop[]): ChainHop[]
   planChainRound(args?: Partial<Omit<PlanChainRoundArgs, 'primitives'>>): ChainHypothesis[]
   decideNext(input: SchedulerInput): SchedulerDecision
 }
@@ -1083,6 +1496,9 @@ export function createGraphCoordinator(options: GraphCoordinatorOptions): GraphC
   const approvedOrigins = (): readonly string[] => options.approvedOrigins ?? deps.approvedOrigins?.() ?? []
   const primitives = (): ChainPrimitive[] => deriveChainPrimitives({
     facts: deps.listFacts(), findings: deps.listFindings(), endpoints: deps.listEndpoints(),
+  })
+  const chainHops = (roundNo = 1, priorHops: readonly ChainHop[] = []): ChainHop[] => extractChainHops({
+    facts: deps.listFacts(), findings: deps.listFindings(), endpoints: deps.listEndpoints(), roundNo, priorHops,
   })
   return {
     queryEndpoints: (args = {}) => queryEndpoints(deps, args),
@@ -1096,8 +1512,12 @@ export function createGraphCoordinator(options: GraphCoordinatorOptions): GraphC
       allowedCapabilities: dispatch.allowedCapabilities ?? options.allowedCapabilities,
     }),
     deriveChainPrimitives: primitives,
+    extractChainHops: chainHops,
     planChainRound: args => planChainRound({
-      ...args, primitives: primitives(), endpoints: args?.endpoints ?? deps.listEndpoints(),
+      ...args,
+      primitives: primitives(),
+      hops: args?.hops ?? chainHops(),
+      endpoints: args?.endpoints ?? deps.listEndpoints(),
       approvedOrigins: args?.approvedOrigins ?? approvedOrigins(),
     }),
     decideNext,
