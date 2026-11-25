@@ -561,6 +561,7 @@ class VerifyContext:
         self.target_origin: str = self.target_origins[0] if self.target_origins else ""
         self.sdk_version: str = str(context.get("sdkVersion", "guardian_verify/v6-mvp"))
         self.claims: list[dict[str, Any]] = []
+        self._last_failed_composite_claim: Optional[dict[str, Any]] = None
         self._default_origin = self.target_origins[0] if self.target_origins else None
 
     # -- network ---------------------------------------------------------
@@ -782,8 +783,99 @@ class VerifyContext:
         return _AwaitableDict(_rpc("async.awaitResult", args, rpc_timeout))
 
     def prove_composite(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        raw_receipt = (
+            receipt["receipt"]
+            if isinstance(receipt, dict) and isinstance(receipt.get("receipt"), dict)
+            else (receipt if isinstance(receipt, dict) else {})
+        )
         payload = receipt if isinstance(receipt, dict) and "receipt" in receipt else {"receipt": receipt}
-        return _AwaitableDict(_rpc("composite.verify", payload, 30.0))
+        raw_result = _rpc("composite.verify", payload, 30.0)
+        res: dict[str, Any] = dict(raw_result) if isinstance(raw_result, dict) else {}
+        confirmed = bool(res.get("confirmed") is True or res.get("ok") is True or res.get("verified") is True)
+        hops = raw_receipt.get("hops") if isinstance(raw_receipt.get("hops"), list) else []
+        ti = raw_receipt.get("terminalImpact") if isinstance(raw_receipt.get("terminalImpact"), dict) else {}
+        term_hop_id = ti.get("terminalHopId") if isinstance(ti.get("terminalHopId"), str) else ""
+        term_hop = next((h for h in hops if isinstance(h, dict) and h.get("hopId") == term_hop_id), hops[-1] if hops and isinstance(hops[-1], dict) else None)
+        term_target = term_hop.get("target") if isinstance(term_hop, dict) and isinstance(term_hop.get("target"), dict) else {}
+        route = term_target.get("pathAndQuery") if isinstance(term_target.get("pathAndQuery"), str) else None
+
+        def _str_ids(val: Any) -> list[str]:
+            return [x for x in val if isinstance(x, str) and x] if isinstance(val, list) else []
+
+        ex_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for h in hops:
+            if isinstance(h, dict):
+                for x in _str_ids(h.get("exchangeIds")):
+                    if x not in seen_ids:
+                        seen_ids.add(x)
+                        ex_ids.append(x)
+        for key in ("preChainControlExchangeIds", "postChainReadbackExchangeIds"):
+            for x in _str_ids(ti.get(key)):
+                if x not in seen_ids:
+                    seen_ids.add(x)
+                    ex_ids.append(x)
+        term_ex_field = ti.get("terminalExchangeId")
+        if isinstance(term_ex_field, str) and term_ex_field.strip() and term_ex_field.strip() not in seen_ids:
+            seen_ids.add(term_ex_field.strip())
+            ex_ids.append(term_ex_field.strip())
+        ex_ids = ex_ids[:64]
+
+        term_hop_ex_ids = _str_ids(term_hop.get("exchangeIds")) if isinstance(term_hop, dict) else []
+        terminal_exchange_id = (
+            term_ex_field.strip()
+            if isinstance(term_ex_field, str) and term_ex_field.strip()
+            else (term_hop_ex_ids[-1] if term_hop_ex_ids else None)
+        )
+        cwe_blob = f"{raw_receipt.get('cwe', '')} {ti.get('cwe', '')} {raw_receipt.get('terminalVulnClass', '')} {ti.get('summary') or ti.get('claimedImpact') or ''}"
+        cwe_match = re.search(r"\bCWE-\d{1,4}\b", cwe_blob, re.IGNORECASE)
+        rejected_by = None if confirmed else (
+            res.get("rejectedBy")
+            or (f"composite_{res['failedStage']}" if res.get("failedStage") else "composite_receipt")
+        )
+        raw_missing = res.get("missingEvidence")
+        missing_evidence = [] if confirmed else (
+            list(raw_missing) if isinstance(raw_missing, list) and raw_missing else [str(rejected_by or "composite_receipt")]
+        )
+        claim: dict[str, Any] = {
+            "kind": "composite_receipt",
+            "chainId": str(res.get("chainId") or raw_receipt.get("chainId") or "invalid"),
+            "terminalVulnClass": str(res.get("terminalVulnClass") or raw_receipt.get("terminalVulnClass") or "unknown"),
+            "exchangeIds": ex_ids,
+            "hopCount": int(res["hopCount"]) if isinstance(res.get("hopCount"), int) else len(hops),
+            "compositeReceipt": raw_receipt,
+        }
+        if isinstance(res.get("verificationId"), str) and res["verificationId"]:
+            claim["verificationId"] = res["verificationId"]
+        if cwe_match:
+            claim["cwe"] = cwe_match.group(0).upper()
+        if route:
+            claim["route"] = route
+        if terminal_exchange_id:
+            claim["terminalExchangeId"] = terminal_exchange_id
+        if isinstance(res.get("replayMode"), str) and res["replayMode"]:
+            claim["replayMode"] = res["replayMode"]
+        if not confirmed:
+            claim["rejectedBy"] = rejected_by
+            claim["missingEvidence"] = missing_evidence
+            if isinstance(res.get("reason"), str):
+                claim["reason"] = res["reason"]
+            self._last_failed_composite_claim = claim
+        else:
+            self._last_failed_composite_claim = None
+            self.claims.append(claim)
+        res["confirmed"] = confirmed
+        res["ok"] = confirmed
+        res["verified"] = confirmed
+        res["rejectedBy"] = rejected_by
+        res["missingEvidence"] = missing_evidence
+        res["claim"] = claim
+        return _AwaitableDict(res)
+
+    def _effective_claims(self) -> list[dict[str, Any]]:
+        if self.claims:
+            return list(self.claims)
+        return [self._last_failed_composite_claim] if self._last_failed_composite_claim else []
 
     def http2(self, target: Any, **options: Any) -> Exchange:
         origin, path = _split_target(target, self._default_origin)
@@ -1586,7 +1678,7 @@ class VerifyContext:
             nonce=self.nonce,
             title=title[:300],
             severity=severity[:32],
-            claims=list(self.claims),
+            claims=self._effective_claims(),
             description=description[:4000] if description else None,
         )
 
@@ -1616,15 +1708,16 @@ def _write_result(value: dict[str, Any]) -> None:
 
 def _normalize_proof_result(ctx: VerifyContext, returned: Any, default_title: Optional[str] = None) -> dict[str, Any]:
     fallback_title = (default_title.strip() if isinstance(default_title, str) and default_title.strip() else "Verification script proof")[:300]
+    fallback_claims = ctx._effective_claims()
     if isinstance(returned, ProofResult):
         payload = returned.to_json()
-        if not payload.get("claims") and ctx.claims:
-            payload["claims"] = list(ctx.claims)
+        if not payload.get("claims") and fallback_claims:
+            payload["claims"] = fallback_claims
         return payload
     if isinstance(returned, dict) and isinstance(returned.get("claims"), list):
         title = str(returned.get("title") or "").strip()[:300] or fallback_title
         severity = str(returned.get("severity") or "high").strip()[:32] or "high"
-        claims = returned["claims"] if returned["claims"] else list(ctx.claims)
+        claims = returned["claims"] if returned["claims"] else fallback_claims
         out: dict[str, Any] = {
             "sdk": "guardian_verify.py",
             "nonce": str(returned.get("nonce") or ctx.nonce),
@@ -1640,7 +1733,7 @@ def _normalize_proof_result(ctx: VerifyContext, returned: Any, default_title: Op
         "nonce": ctx.nonce,
         "title": fallback_title,
         "severity": "high",
-        "claims": list(ctx.claims),
+        "claims": fallback_claims,
     }
 
 

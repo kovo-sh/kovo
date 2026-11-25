@@ -190,10 +190,30 @@ export interface TranscriptSummary {
   hit?: boolean
 }
 
+export interface TranscriptCompositeVerification {
+  verificationId: string
+  seq: number
+  chainId: string
+  terminalVulnClass: string
+  replayMode: 'fresh_clean_replay' | 'one_shot_transcript'
+  hopCount: number
+  confirmed: boolean
+  verifiedEdgeCount: number
+  reason: string
+  failedStage?: string
+  rejectedBy: string | null
+  missingEvidence: string[]
+  exchangeIds: string[]
+  terminalExchangeId?: string | null
+  route?: string | null
+  signature: string
+}
+
 export class TranscriptStore {
   private readonly secret: Buffer
   private readonly records = new Map<string, VerifyTranscriptRecord>()
   private readonly bodies = new Map<string, string>()
+  private readonly compositeVerifications = new Map<string, TranscriptCompositeVerification>()
   private seq = 0
 
   constructor(secret?: Buffer) {
@@ -208,6 +228,37 @@ export class TranscriptStore {
     return createHmac('sha256', this.secret)
       .update(JSON.stringify(record))
       .digest('hex')
+  }
+
+  private signComposite(record: Omit<TranscriptCompositeVerification, 'signature'>): string {
+    return createHmac('sha256', this.secret)
+      .update(`composite:${JSON.stringify(record)}`)
+      .digest('hex')
+  }
+
+  recordCompositeVerification(
+    input: Omit<TranscriptCompositeVerification, 'verificationId' | 'seq' | 'signature'>,
+  ): TranscriptCompositeVerification {
+    this.seq += 1
+    const verificationId = `gc-${randomUUID()}`
+    const unsigned: Omit<TranscriptCompositeVerification, 'signature'> = {
+      verificationId,
+      seq: this.seq,
+      ...input,
+    }
+    const record: TranscriptCompositeVerification = { ...unsigned, signature: this.signComposite(unsigned) }
+    this.compositeVerifications.set(verificationId, record)
+    return record
+  }
+
+  getCompositeVerification(verificationId: string): TranscriptCompositeVerification | undefined {
+    return this.compositeVerifications.get(verificationId)
+  }
+
+  latestCompositeVerification(): TranscriptCompositeVerification | undefined {
+    let latest: TranscriptCompositeVerification | undefined
+    for (const rec of this.compositeVerifications.values()) latest = rec
+    return latest
   }
 
   record(input: {
@@ -305,6 +356,10 @@ export class TranscriptStore {
       h.update(record.signature)
       h.update('\0')
     }
+    for (const comp of this.compositeVerifications.values()) {
+      h.update(comp.signature)
+      h.update('\0')
+    }
     return h.digest('hex')
   }
 
@@ -313,6 +368,12 @@ export class TranscriptStore {
     for (const record of this.records.values()) {
       const { signature, ...unsigned } = record
       const expected = this.sign(unsigned)
+      if (signature.length !== expected.length) return false
+      if (!timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return false
+    }
+    for (const comp of this.compositeVerifications.values()) {
+      const { signature, ...unsigned } = comp
+      const expected = this.signComposite(unsigned)
       if (signature.length !== expected.length) return false
       if (!timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return false
     }
@@ -410,6 +471,27 @@ export type VerifyClaim =
       challengeExchangeId?: string
       actorRoles?: Record<string, string>
       actorTenants?: Record<string, string>
+      message?: string
+    }
+  /**
+   * Host-verified multi-hop CompositeProofReceipt claim emitted by `ctx.proveComposite()` /
+   * `ctx.prove_composite()`. Verified strictly against the host-signed TranscriptStore record.
+   */
+  | {
+      kind: 'composite_receipt'
+      verificationId?: string
+      chainId: string
+      terminalVulnClass: string
+      cwe?: string
+      route?: string
+      exchangeIds: string[]
+      terminalExchangeId?: string
+      replayMode?: 'fresh_clean_replay' | 'one_shot_transcript'
+      hopCount?: number
+      compositeReceipt?: Record<string, unknown>
+      rejectedBy?: string | null
+      missingEvidence?: string[]
+      reason?: string
       message?: string
     }
 
@@ -582,6 +664,11 @@ function isClaim(value: unknown): value is VerifyClaim {
       return typeof rec.enrolledExchangeId === 'string' &&
         typeof rec.preChallengeExchangeId === 'string' &&
         typeof rec.postChallengeExchangeId === 'string'
+    case 'composite_receipt':
+      return typeof rec.chainId === 'string' &&
+        typeof rec.terminalVulnClass === 'string' &&
+        Array.isArray(rec.exchangeIds) &&
+        rec.exchangeIds.every(v => typeof v === 'string')
 
     default:
       return false
@@ -1115,6 +1202,10 @@ function claimedExchangeIds(claims: readonly VerifyClaim[]): string[] {
       if (claim.challengeExchangeId) ids.add(claim.challengeExchangeId)
       continue
     }
+    if (claim.kind === 'composite_receipt') {
+      for (const id of claim.exchangeIds) ids.add(id)
+      continue
+    }
     ids.add(claim.exchangeId)
   }
   return [...ids]
@@ -1456,6 +1547,65 @@ function evaluateClaim(
         },
       }
     }
+    case 'composite_receipt': {
+      const hostRec = claim.verificationId ? store.getCompositeVerification(claim.verificationId) : undefined
+      if (!hostRec) {
+        return {
+          claim,
+          passed: false,
+          detail: 'composite_receipt claim must reference a host-verified composite.verify verificationId recorded in this session transcript.',
+          observed: { confirmed: false, rejectedBy: 'composite_receipt', missingEvidence: ['host_composite_verification'] },
+        }
+      }
+      if (hostRec.chainId !== claim.chainId || hostRec.terminalVulnClass !== claim.terminalVulnClass) {
+        return {
+          claim,
+          passed: false,
+          detail: 'composite_receipt claim identity does not match the host-signed composite verification record.',
+          observed: { confirmed: false, rejectedBy: 'composite_receipt', missingEvidence: ['composite_identity_match'] },
+        }
+      }
+      if (!hostRec.confirmed) {
+        return {
+          claim,
+          passed: false,
+          detail: `CompositeProofReceipt rejected at stage '${hostRec.failedStage ?? 'unknown'}': ${hostRec.reason}`,
+          observed: {
+            confirmed: false,
+            chainId: hostRec.chainId,
+            terminalVulnClass: hostRec.terminalVulnClass,
+            hopCount: hostRec.hopCount,
+            failedStage: hostRec.failedStage ?? null,
+            rejectedBy: hostRec.rejectedBy ?? 'composite_receipt',
+            missingEvidence: hostRec.missingEvidence,
+            reason: hostRec.reason,
+          },
+        }
+      }
+      for (const id of hostRec.exchangeIds) {
+        if (!requireRecord(id)) {
+          return {
+            claim,
+            passed: false,
+            detail: `composite_receipt cites exchange ${id} outside this attempt transcript.`,
+            observed: { confirmed: false, rejectedBy: 'composite_transcript_integrity', missingEvidence: ['attempt_transcript_exchange'] },
+          }
+        }
+      }
+      return {
+        claim,
+        passed: true,
+        detail: hostRec.reason,
+        observed: {
+          confirmed: true,
+          chainId: hostRec.chainId,
+          terminalVulnClass: hostRec.terminalVulnClass,
+          replayMode: hostRec.replayMode,
+          hopCount: hostRec.hopCount,
+          verifiedEdgeCount: hostRec.verifiedEdgeCount,
+        },
+      }
+    }
     default:
       return { claim, passed: false, detail: 'Unsupported claim.' }
   }
@@ -1552,6 +1702,17 @@ export function describeMissingEvidence(check: VerifyClaimCheck): string[] {
     case 'oob':
       missing.add('oob_callback_hit')
       break
+    case 'composite_receipt': {
+      if (Array.isArray(observed.missingEvidence)) {
+        for (const item of observed.missingEvidence) {
+          if (typeof item === 'string' && item.trim()) missing.add(item.trim())
+        }
+      }
+      if (missing.size === 0 && typeof observed.rejectedBy === 'string' && observed.rejectedBy.trim()) {
+        missing.add(observed.rejectedBy.trim())
+      }
+      break
+    }
     case 'status':
     case 'header':
     case 'body_contains':
@@ -1623,6 +1784,8 @@ function claimEvidenceText(store: TranscriptStore, check: VerifyClaimCheck): str
     ids.push(claim.controlExchangeId, claim.probeExchangeId)
   } else if (claim.kind === 'mfa') {
     ids.push(claim.enrolledExchangeId, claim.preChallengeExchangeId, claim.postChallengeExchangeId)
+  } else if (claim.kind === 'composite_receipt') {
+    ids.push(...claim.exchangeIds)
   }
   return ids.map(id => store.body(id) ?? '').join('\n').slice(0, 64 * 1024)
 }
@@ -1643,6 +1806,7 @@ function hasStatusIndependentEvidence(check: VerifyClaimCheck): boolean {
     case 'boundary':
     case 'mfa':
     case 'dom_sentinel':
+    case 'composite_receipt':
       return true
     default:
       return false
@@ -1682,7 +1846,8 @@ export function evaluateClaims(
   const boundaryClaimPassed = checks.some(check =>
     check.passed && check.claim.kind === 'boundary' &&
     (check.observed as { arm?: unknown } | undefined)?.arm === 'control_denied')
-  const impactBacked = checks.some(check =>
+  const compositePassed = checks.some(check => check.passed && check.claim.kind === 'composite_receipt')
+  const impactBacked = compositePassed || checks.some(check =>
     check.passed && check.claim.kind === 'impact' &&
     (check.claim.impactClass === claimed ||
       ((claimed === 'bfla' || claimed === 'disclosure') && check.claim.impactClass === 'authorization')))
@@ -1709,13 +1874,13 @@ export function evaluateClaims(
   // control that the variant crosses. No label can pass on a 2xx from an ungated request.
   const claimedBoundary = context.claimedBoundary
   const mfaClaimPassed = checks.some(check => check.passed && check.claim.kind === 'mfa')
-  if (claimedBoundary === 'mfa' && !mfaClaimPassed) {
+  if (!compositePassed && claimedBoundary === 'mfa' && !mfaClaimPassed) {
     failures.push('boundary: MFA/2FA claim requires an `mfa` claim showing an enrolled account, a protected read denied/challenged before the code check, and the same actor granted the same resource after it; an OTP endpoint that returns {ok:true} without gating anything is advisory only.')
   }
-  if (claimedBoundary === 'auth' && !boundaryClaimPassed) {
+  if (!compositePassed && claimedBoundary === 'auth' && !boundaryClaimPassed) {
     failures.push('boundary: authentication/bypass claim requires a `boundary` claim over a denied/challenged control (401/403, login redirect or MFA challenge) and a variant that crosses it; a 2xx from an ungated request is not a bypass.')
   }
-  if (claimedBoundary === 'access' && !boundaryClaimPassed && !impactBacked) {
+  if (!compositePassed && claimedBoundary === 'access' && !boundaryClaimPassed && !impactBacked) {
     const disclosure = implicitReadDisclosure(store, claims, context)
     if (!disclosure.satisfied) {
       failures.push('boundary: access-control claim requires a denied/challenged control plus a crossing variant, or an actor/precondition differential backed by data/state evidence.')
@@ -1731,7 +1896,9 @@ export function evaluateClaims(
   if (failures.some(failure => /^boundary: MFA/.test(failure))) missingEvidence.add('mfa_claim')
   if (failures.some(failure => /^boundary: access-control/.test(failure))) missingEvidence.add('boundary_or_disclosure')
   const rejectedBy = failedCheck
-    ? failedCheck.claim.kind
+    ? (failedCheck.claim.kind === 'composite_receipt' && typeof failedCheck.observed?.rejectedBy === 'string'
+        ? failedCheck.observed.rejectedBy
+        : failedCheck.claim.kind)
     : failures.length > 0
       ? (failures.some(failure => failure.startsWith('boundary:')) ? 'boundary_gate' : failures.some(failure => failure.startsWith('impact:')) ? 'impact_gate' : 'oracle')
       : null
@@ -1855,6 +2022,23 @@ export function causalFingerprints(
         status: probe?.response?.status != null ? Number(probe.response.status) : null,
         expectation: { mfa: true },
         observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
+      }
+    }
+    if (claim.kind === 'composite_receipt') {
+      const termId = claim.terminalExchangeId ?? claim.exchangeIds[claim.exchangeIds.length - 1]
+      const term = termId ? store.get(termId) : undefined
+      return {
+        kind: claim.kind,
+        method: term?.request?.method ?? '',
+        path: pathFingerprint(claim.route ?? term?.request?.pathAndQuery),
+        status: term?.response?.status != null ? Number(term.response.status) : null,
+        expectation: {
+          chainId: claim.chainId,
+          terminalVulnClass: claim.terminalVulnClass,
+          hopCount: claim.hopCount ?? null,
+          replayMode: claim.replayMode ?? 'fresh_clean_replay',
+        },
+        observed: normalizedValue(check.observed ?? { confirmed: check.passed }, nonce),
       }
     }
     const record = store.get(claim.exchangeId)
@@ -3720,7 +3904,54 @@ export class VerifyRpcServer {
     // Security invariant: RPC callers can never weaken host-configured attackerPersonas,
     // forbiddenShortcutPersonas, benchmarkMode, requireCleanSessionFlag, or signingKey.
     const verdict = this.verifyComposite(rawReceipt)
-    return this.scrubRecord(verdict)
+    const rawObj = asRecord(rawReceipt)
+    const hops = Array.isArray(rawObj?.hops) ? rawObj.hops : []
+    const ti = asRecord(rawObj?.terminalImpact)
+    const terminalHopId = typeof ti?.terminalHopId === 'string' ? ti.terminalHopId : ''
+    const termHop = hops.find(h => asRecord(h)?.hopId === terminalHopId) ?? hops[hops.length - 1]
+    const termHopObj = asRecord(termHop)
+    const termTarget = asRecord(termHopObj?.target)
+    const route = typeof termTarget?.pathAndQuery === 'string' ? termTarget.pathAndQuery : null
+    const strIds = (v: unknown): string[] => Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.length > 0) : []
+    const exchangeIds = [...new Set([
+      ...hops.flatMap(h => strIds(asRecord(h)?.exchangeIds)),
+      ...strIds(ti?.preChainControlExchangeIds),
+      ...strIds(ti?.postChainReadbackExchangeIds),
+      ...(typeof ti?.terminalExchangeId === 'string' && ti.terminalExchangeId.trim() ? [ti.terminalExchangeId.trim()] : []),
+    ])].slice(0, 64)
+    const termExIds = strIds(termHopObj?.exchangeIds)
+    const terminalExchangeId = (typeof ti?.terminalExchangeId === 'string' && ti.terminalExchangeId.trim())
+      ? ti.terminalExchangeId.trim()
+      : (termExIds[termExIds.length - 1] ?? null)
+    const rejectedBy = verdict.confirmed
+      ? null
+      : (verdict.rejectedBy ?? (verdict.failedStage ? `composite_${verdict.failedStage}` : 'composite_receipt'))
+    const missingEvidence = verdict.confirmed
+      ? []
+      : (verdict.missingEvidence?.length ? [...verdict.missingEvidence] : [rejectedBy ?? 'composite_receipt'])
+    const recorded = this.transcript.recordCompositeVerification({
+      chainId: verdict.chainId,
+      terminalVulnClass: verdict.terminalVulnClass,
+      replayMode: verdict.replayMode,
+      hopCount: verdict.hopCount,
+      confirmed: verdict.confirmed,
+      verifiedEdgeCount: verdict.verifiedEdges.filter(e => e.verified).length,
+      reason: verdict.reason,
+      ...(verdict.failedStage ? { failedStage: verdict.failedStage } : {}),
+      rejectedBy,
+      missingEvidence,
+      exchangeIds,
+      terminalExchangeId,
+      route,
+    })
+    return this.scrubRecord({
+      ...verdict,
+      ok: verdict.confirmed,
+      verified: verdict.confirmed,
+      verificationId: recorded.verificationId,
+      rejectedBy,
+      missingEvidence,
+    })
   }
 }
 
@@ -4032,6 +4263,25 @@ async function runAttempt(
     try {
       parsed = parseVerifyScriptResult(execution.result)
     } catch (error) {
+      const latestComp = session.transcript.latestCompositeVerification()
+      if (latestComp && !latestComp.confirmed) {
+        const compRejectedBy = latestComp.rejectedBy ?? (latestComp.failedStage ? `composite_${latestComp.failedStage}` : 'composite_receipt')
+        const compMissing = latestComp.missingEvidence.length > 0 ? latestComp.missingEvidence : [compRejectedBy]
+        const rawTitle = execution.result && typeof execution.result === 'object' && !Array.isArray(execution.result) && typeof (execution.result as { title?: unknown }).title === 'string'
+          ? (execution.result as { title: string }).title
+          : null
+        return {
+          report: {
+            ...base,
+            title: rawTitle,
+            claimCount: 1,
+            failures: [`composite_receipt: CompositeProofReceipt rejected at stage '${latestComp.failedStage ?? 'unknown'}': ${latestComp.reason}`],
+            rejectedBy: compRejectedBy,
+            missingEvidence: compMissing,
+          },
+          fingerprints: [],
+        }
+      }
       return { report: { ...base, failures: [error instanceof Error ? error.message : 'Invalid result.'], rejectedBy: 'claims', missingEvidence: ['valid_proof_document'] }, fingerprints: [] }
     }
     if (typeof parsed.nonce === 'string' && parsed.nonce !== nonce) {
@@ -4183,10 +4433,13 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
     return withFeedback({ confirmed: false, reason: 'transcript_mismatch', detail: 'A transcript failed signature verification.', attempts, disagreements: [], claimTitle: first.report.title })
   }
   if (!attempts.every(a => a.oraclePassed)) {
+    const compFail = attempts.flatMap(a => a.failures).find(f => f.startsWith('composite_receipt:'))
     return withFeedback({
       confirmed: false,
       reason: 'oracle_failed',
-      detail: `Claims did not survive transcript re-check (${detailBase}).`,
+      detail: compFail
+        ? `${compFail} (${detailBase}).`
+        : `Claims did not survive transcript re-check (${detailBase}).`,
       attempts,
       disagreements: [],
       claimTitle: first.report.title,
