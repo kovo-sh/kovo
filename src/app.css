@@ -123,28 +123,7 @@ code, pre, kbd, .mono {
 .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 small, .muted { color: var(--fg-3); }
 
-/* Shared .rw-parity controls (kept for unmigrated Project & Run routes) */
-.btn {
-  height: 26px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  padding: 0 9px;
-  border: 0;
-  border-radius: 6px;
-  font-size: 12.5px;
-  font-weight: 500;
-  color: var(--fg);
-  background: var(--raise);
-  box-shadow: var(--shadow-sm);
-  transition: background var(--d1), box-shadow var(--d1), transform var(--d1) var(--ease);
-  white-space: nowrap;
-}
-.btn:hover { background: var(--sunk); }
-.btn:active { transform: scale(.98); }
-.btn.primary,
-.primary,
+/* Shared button data-variant/size primitives (src/components/ui/button.tsx) */
 button[data-variant=default] {
   background: var(--accent);
   color: var(--accent-fg);
@@ -153,21 +132,15 @@ button[data-variant=default] {
   white-space: nowrap;
   flex-shrink: 0;
 }
-.btn.primary:hover,
-.primary:hover,
 button[data-variant=default]:hover {
   background: var(--accent);
   filter: brightness(1.06);
 }
-.btn.ink { background: var(--fg); color: var(--panel); box-shadow: none; }
-.btn.ink:hover { filter: brightness(1.12); }
-.btn.ghost,
 button[data-variant=ghost] {
   background: transparent;
   box-shadow: none;
   color: var(--fg-2);
 }
-.btn.ghost:hover,
 button[data-variant=ghost]:hover,
 button[data-slot=dropdown-menu-trigger][data-popup-open] {
   background: var(--hover);
@@ -191,28 +164,7 @@ button[data-size=icon] {
   white-space: nowrap;
 }
 
-/* Shared .tag, .kbd, .rbanner, .sheet primitives (still used by /runs/$runId) */
-.tag {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 20px;
-  padding: 0 7px;
-  border-radius: 10px;
-  font-size: 11.5px;
-  color: var(--fg-2);
-  box-shadow: inset 0 0 0 1px var(--line-2);
-  white-space: nowrap;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.tag .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--fg-3); }
-.tag.accent { color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent-line); }
-.tag.warn { color: var(--warn); box-shadow: inset 0 0 0 1px var(--warn-line); background: var(--warn-soft); }
-.tag.ok { color: var(--ok); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ok) 35%, transparent); background: var(--ok-soft); }
-.tag.solid { background: var(--sunk); }
-
+/* Keyboard keycaps (GlobalPalette & Run views) */
 .kbd {
   display: inline-flex;
   align-items: center;
@@ -230,53 +182,6 @@ button[data-size=icon] {
   line-height: 1;
 }
 .kbd-group { display: inline-flex; gap: 3px; align-items: center; }
-
-.rbanner {
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 14px 8px 18px;
-  border-bottom: 1px solid var(--line);
-  font-size: 12.5px;
-  color: var(--fg-2);
-  background: var(--sunk);
-  min-height: 40px;
-}
-.rbanner .ico { flex: none; }
-.rbanner b { color: var(--fg); font-weight: 500; }
-.rbanner .grow { flex: 1; min-width: 0; }
-.rbanner.warn { background: var(--warn-soft); box-shadow: inset 0 -1px 0 var(--warn-line); }
-.rbanner.warn > .ico { color: var(--warn); }
-.rbanner.bad { background: var(--bad-soft); }
-.rbanner.bad > .ico { color: var(--bad); }
-
-.sheet {
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--panel);
-  overflow: hidden;
-}
-.sheet-h {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 11px 16px;
-  border-bottom: 1px solid var(--line);
-  font-weight: 500;
-  color: var(--fg);
-}
-.sheet-h .muted { color: var(--fg-3); font-weight: 400; font-size: 12px; }
-.sheet-f {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 10px 16px;
-  border-top: 1px solid var(--line);
-  background: var(--sunk);
-}
-.sheet-f .muted { color: var(--fg-3); font-size: 12px; margin-right: auto; }
 
 /* Dropdowns (src/components/ui/dropdown-menu.tsx) */
 [data-slot=dropdown-menu-positioner] { z-index: 60; }
@@ -307,7 +212,6 @@ button[data-size=icon] {
 [data-slot=dropdown-menu-content] [data-disabled] { opacity: .5; cursor: default; }
 
 /* Shared checkbox primitive (src/components/ui/checkbox.tsx) & common helpers */
-.checkbox { display: flex !important; align-items: center; gap: 8px; font-weight: 450; }
 [data-slot=checkbox] {
   display: inline-grid;
   place-items: center;
@@ -324,8 +228,6 @@ button[data-size=icon] {
 [data-slot=checkbox][data-checked] { border-color: var(--accent); background: var(--accent); }
 [data-slot=checkbox-indicator] { display: grid; place-items: center; }
 .form-error { color: var(--bad); white-space: pre-wrap; font-size: 12.5px; }
-.eyebrow { color: var(--fg-3); font-size: 11.5px; font-weight: 500; margin-bottom: 3px; }
-.toolbar { display: flex; align-items: center; gap: 5px; }
 
 /* Status indicator used by src/components/common.tsx */
 .state {
@@ -349,49 +251,6 @@ button[data-size=icon] {
 .state[data-status=failed] i, .state[data-status=paused] i, .state[data-status=budget_paused] i, .state[data-status=waiting_approval] i, .state[data-status=half_open] i, .state[data-status=inconclusive] i, .state[data-status="Awaiting scope approval"] i { background: var(--warn); }
 .state[data-status=reproduced], .state[data-status=open], .state[data-status=denied], .state[data-status=tainted] { color: var(--bad); }
 .state[data-status=reproduced] i, .state[data-status=open] i, .state[data-status=denied] i, .state[data-status=tainted] i { background: var(--bad); }
-
-/* Temporary compat shim for unmigrated /runs/$runId rail session chip (src/components/run/rail.tsx) */
-.sh-rail-session {
-  border-top: 1px solid var(--line);
-  padding: 6px 8px;
-  flex: none;
-}
-button.sh-session-chip {
-  appearance: none;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  height: 32px;
-  min-height: 32px;
-  padding: 0 8px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  box-shadow: none;
-  color: var(--fg-2);
-  font-size: 12.5px;
-  font-weight: 500;
-  line-height: 1;
-  text-align: left;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: background var(--d1), color var(--d1);
-}
-button.sh-session-chip:hover { background: var(--hover); color: var(--fg); box-shadow: none; }
-button.sh-session-chip[aria-expanded="true"],
-button.sh-session-chip:active { background: var(--press); color: var(--fg); }
-button.sh-session-chip .ico { color: var(--fg-3); transition: color var(--d1); }
-button.sh-session-chip:hover .ico,
-button.sh-session-chip[aria-expanded="true"] .ico { color: var(--fg-2); }
-.sh-session-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.sh-session-hint { font-size: 11px; font-weight: 400; color: var(--fg-3); flex: none; transition: color var(--d1); }
-button.sh-session-chip:hover .sh-session-hint { color: var(--fg-2); }
-.sh-session-chev { color: var(--fg-4); flex: none; transition: color var(--d1), transform var(--d1) var(--ease); }
-button.sh-session-chip:hover .sh-session-chev { color: var(--fg-3); transform: translateX(1px); }
-@media (max-width: 720px) {
-  .sh-session-hint { display: none; }
-}
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0s !important; animation-duration: 0s !important; }
