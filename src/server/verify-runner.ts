@@ -23,6 +23,7 @@ import {
   TranscriptStore,
   causalFingerprints,
   evaluateClaims,
+  normalizeDynamic,
   parseVerifyScriptResult,
 } from './verify-claims.ts'
 import type {
@@ -701,7 +702,9 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
       claimTitle: first.report.title,
     })
   }
-  if (!first.report.title || !second.report.title || first.report.title !== second.report.title) {
+  const normFirstTitle = first.report.title ? normalizeDynamic(first.report.title, first.report.nonce) : ''
+  const normSecondTitle = second.report.title ? normalizeDynamic(second.report.title, second.report.nonce) : ''
+  if (!normFirstTitle || !normSecondTitle || normFirstTitle !== normSecondTitle) {
     return withFeedback({
       confirmed: false,
       reason: 'transcript_mismatch',

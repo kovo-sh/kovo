@@ -564,18 +564,24 @@ export interface VerifyCanaryBroker {
 // Assertion primitives (shared semantics with `worker/guardian_verify`).
 // ---------------------------------------------------------------------------
 
+const GX_ID_RE = /\bgx-[0-9a-f-]{8,}\b/gi
+const CAP_HANDLE_RE = /\bcap:[A-Za-z0-9_.:-]+\b/g
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
 const LONG_HEX_RE = /\b[0-9a-f]{16,}\b/gi
 const ISO_TS_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?/g
+const PREFIXED_ID_RE = /(?<![a-z0-9])(?!(?:cwe|cve|rfc|iso|sha|aes|rsa|hmac|http|https|utf|tls|jwt)[-_])[a-z]{2,12}[_-](?=[a-z0-9]*\d)[a-z0-9]{3,}(?![a-z0-9])/gi
 
 /** Remove run-scoped nonces and standard dynamic tokens (for cross-attempt comparison). */
 export function normalizeDynamic(input: string, nonce?: string): string {
   let out = input
   if (nonce) out = out.split(nonce).join('<nonce>')
   return out
+    .replace(GX_ID_RE, '<gx>')
+    .replace(CAP_HANDLE_RE, '<cap>')
     .replace(UUID_RE, '<uuid>')
     .replace(ISO_TS_RE, '<ts>')
     .replace(LONG_HEX_RE, '<hex>')
+    .replace(PREFIXED_ID_RE, '<id>')
 }
 
 export function asRecord(value: unknown): Record<string, unknown> | null {
@@ -1897,12 +1903,72 @@ function pathFingerprint(path: string | undefined): string {
   const [pathname, search] = path.split('?')
   const templated = pathname.split('/').map((segment, index) => {
     if (index === 0 || segment === '') return segment
-    if (/^\d+$/.test(segment) || /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(segment) || /^[a-z]{2,10}_[A-Za-z0-9]{8,}$/.test(segment)) return '*'
+    let decoded = segment
+    if (segment.includes('%')) {
+      try { decoded = decodeURIComponent(segment) } catch { decoded = segment }
+    }
+    if (
+      /^\d+$/.test(decoded) ||
+      /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(decoded) ||
+      /^[0-9a-f]{16,}$/i.test(decoded) ||
+      /^gx-[0-9a-f-]{4,}$/i.test(decoded) ||
+      /^cap:[A-Za-z0-9_.:-]+$/.test(decoded) ||
+      /^\[redacted:[^\]]+\]$/i.test(decoded) ||
+      /^[a-z]{2,10}_[A-Za-z0-9]{8,}$/.test(decoded) ||
+      (/^[a-z]{2,12}[-_][A-Za-z0-9]{3,}$/i.test(decoded) && /\d/.test(decoded) && !/^(?:cwe|cve|rfc|iso|sha|aes|rsa|hmac|http|https|utf|tls|jwt)[-_]/i.test(decoded))
+    ) return '*'
     return segment.toLowerCase()
   }).join('/')
   // Query parameter names are causal; values are usually nonces/ids.
   const params = (search ?? '').split('&').filter(Boolean).map(pair => pair.split('=')[0]).sort()
   return `${templated}${params.length ? '?' + params.join('&') : ''}`
+}
+
+function sortedUniqueStrings(value: unknown, nonce: string): string[] {
+  if (!Array.isArray(value)) return []
+  return [...new Set(value.filter((item): item is string => typeof item === 'string' && item.length > 0).map(item => normalizeDynamic(item, nonce)))].sort()
+}
+
+function impactDeltaKind(obs: Record<string, unknown> | null, hasPersistedDelta: boolean, hasProtectedDelta: boolean): string | null {
+  if (typeof obs?.deltaKind === 'string' && obs.deltaKind.length > 0) return obs.deltaKind
+  if (obs?.crossTenant === true) return 'cross_tenant'
+  if (obs?.roleDifferential === true) return 'role_differential'
+  if (obs?.repeatedTransition === true) return 'repeated_transition'
+  if (hasProtectedDelta) return 'protected_field'
+  if (Array.isArray(obs?.disclosureFields) && obs.disclosureFields.length > 0) return 'disclosure'
+  if (obs?.activeMarkup === true) return 'active_markup'
+  if (obs?.oobDelivered === true) return 'oob'
+  if (obs?.fingerprint != null) return 'error_fingerprint'
+  if (obs?.boolean != null || obs?.statusBoolean === true) return 'boolean_differential'
+  if (obs?.timing != null) return 'timing'
+  if (hasPersistedDelta) return 'persisted_delta'
+  if (obs?.boundaryControlDenied === true || obs?.boundary === true) return 'boundary'
+  return null
+}
+
+function compositeVerifiedEdgeKinds(
+  obs: Record<string, unknown> | null,
+  receipt: Record<string, unknown> | null,
+  passed: boolean,
+): string[] {
+  if (Array.isArray(obs?.verifiedEdgeKinds)) {
+    return obs.verifiedEdgeKinds.filter((k): k is string => typeof k === 'string' && k.length > 0).sort()
+  }
+  if (Array.isArray(obs?.verifiedEdges)) {
+    return obs.verifiedEdges
+      .map(asRecord)
+      .filter((edge): edge is Record<string, unknown> => edge !== null && edge.verified !== false && typeof edge.kind === 'string' && edge.kind.length > 0)
+      .map(edge => edge.kind as string)
+      .sort()
+  }
+  if (passed && Array.isArray(receipt?.causalEdges)) {
+    return receipt.causalEdges
+      .map(asRecord)
+      .filter((edge): edge is Record<string, unknown> => edge !== null && typeof edge.kind === 'string' && edge.kind.length > 0)
+      .map(edge => edge.kind as string)
+      .sort()
+  }
+  return []
 }
 
 export interface CausalFingerprint {
@@ -1934,24 +2000,68 @@ export function causalFingerprints(
     }
     if (claim.kind === 'impact') {
       const probe = store.get(claim.probeExchangeId)
+      const obs = asRecord(check.observed)
+      const statusCode = probe?.response?.status != null
+        ? Number(probe.response.status)
+        : (typeof obs?.statusCode === 'number' ? obs.statusCode : null)
+      const changedFields = Array.isArray(obs?.changedFields)
+        ? sortedUniqueStrings(obs.changedFields, nonce)
+        : (Array.isArray(obs?.persisted) ? sortedUniqueStrings(obs.persisted, nonce) : [])
+      const hasPersistedDelta = typeof obs?.hasPersistedDelta === 'boolean'
+        ? obs.hasPersistedDelta
+        : typeof obs?.persisted === 'boolean'
+          ? obs.persisted
+          : Array.isArray(obs?.persisted)
+            ? obs.persisted.length > 0
+            : changedFields.length > 0
+      const hasProtectedDelta = typeof obs?.hasProtectedDelta === 'boolean'
+        ? obs.hasProtectedDelta
+        : (Array.isArray(obs?.protectedFields) ? obs.protectedFields.length > 0 : false)
       return {
         kind: claim.kind,
         method: probe?.request?.method ?? '',
         path: pathFingerprint(probe?.request?.pathAndQuery),
-        status: probe?.response?.status != null ? Number(probe.response.status) : null,
+        status: statusCode,
         expectation: { impactClass: claim.impactClass, oracleEvents: [...(claim.oracleEvents ?? [])].sort() },
-        observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
+        observed: {
+          passed: Boolean(check.passed),
+          impactClass: claim.impactClass,
+          changedFields,
+          deltaKind: impactDeltaKind(obs, hasPersistedDelta, hasProtectedDelta),
+          hasPersistedDelta,
+          hasProtectedDelta,
+          statusCode,
+        },
       }
     }
     if (claim.kind === 'boundary') {
+      const control = store.get(claim.controlExchangeId)
       const probe = store.get(claim.probeExchangeId)
+      const obs = asRecord(check.observed)
+      const controlStatus = control?.response?.status != null
+        ? Number(control.response.status)
+        : (typeof obs?.controlStatus === 'number' ? obs.controlStatus : null)
+      const probeStatus = probe?.response?.status != null
+        ? Number(probe.response.status)
+        : (typeof obs?.probeStatus === 'number' ? obs.probeStatus : null)
+      const actorRoleDiff = typeof obs?.actorRoleDiff === 'boolean'
+        ? obs.actorRoleDiff
+        : typeof obs?.actorDifferential === 'boolean'
+          ? obs.actorDifferential
+          : (control?.request?.personaHandle ?? null) !== (probe?.request?.personaHandle ?? null)
       return {
         kind: claim.kind,
         method: probe?.request?.method ?? '',
         path: pathFingerprint(probe?.request?.pathAndQuery),
-        status: probe?.response?.status != null ? Number(probe.response.status) : null,
+        status: probeStatus,
         expectation: { boundaryClass: claim.boundaryClass },
-        observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
+        observed: {
+          passed: Boolean(check.passed),
+          boundaryClass: claim.boundaryClass,
+          controlStatus,
+          probeStatus,
+          actorRoleDiff,
+        },
       }
     }
     if (claim.kind === 'structural_diff') {
@@ -1966,14 +2076,36 @@ export function causalFingerprints(
       }
     }
     if (claim.kind === 'race') {
-      const probe = store.get(claim.exchangeIds[0])
+      const raceRecords = claim.exchangeIds
+        .map(id => store.get(id))
+        .filter((rec): rec is VerifyTranscriptRecord => rec !== undefined)
+      const probe = raceRecords[0]
+      const winningRecord = raceRecords.find(rec => {
+        const s = rec.response?.status != null ? Number(rec.response.status) : null
+        return s !== null && s >= 200 && s < 300
+      }) ?? probe
+      const obs = asRecord(check.observed)
+      const succeededCount = typeof obs?.succeededCount === 'number'
+        ? obs.succeededCount
+        : Array.isArray(obs?.statuses)
+          ? obs.statuses.filter(s => typeof s === 'number' && s >= 200 && s < 300).length
+          : raceRecords.length > 0
+            ? raceRecords.filter(rec => {
+                const s = rec.response?.status != null ? Number(rec.response.status) : null
+                return s !== null && s >= 200 && s < 300
+              }).length
+            : (typeof obs?.distinctOutcomes === 'number' ? obs.distinctOutcomes : 0)
       return {
         kind: claim.kind,
-        method: probe?.request?.method ?? '',
-        path: pathFingerprint(probe?.request?.pathAndQuery),
-        status: probe?.response?.status != null ? Number(probe.response.status) : null,
+        method: winningRecord?.request?.method ?? '',
+        path: pathFingerprint(winningRecord?.request?.pathAndQuery),
+        status: winningRecord?.response?.status != null ? Number(winningRecord.response.status) : null,
         expectation: { mode: claim.mode ?? null, minDistinctOutcomes: claim.minDistinctOutcomes ?? 2 },
-        observed: normalizedValue(check.observed ?? { passed: check.passed }, nonce),
+        observed: {
+          passed: Boolean(check.passed),
+          mode: claim.mode ?? (typeof obs?.mode === 'string' ? obs.mode : null),
+          succeededCountBucket: succeededCount >= 2 ? '>=2' : succeededCount,
+        },
       }
     }
     if (claim.kind === 'mfa') {
@@ -1990,18 +2122,42 @@ export function causalFingerprints(
     if (claim.kind === 'composite_receipt') {
       const termId = claim.terminalExchangeId ?? claim.exchangeIds[claim.exchangeIds.length - 1]
       const term = termId ? store.get(termId) : undefined
+      const obs = asRecord(check.observed)
+      const hostRec = claim.verificationId ? store.getCompositeVerification(claim.verificationId) : undefined
+      const receipt = asRecord(claim.compositeReceipt)
+      const terminalImpact = asRecord(receipt?.terminalImpact)
+      const terminalOracleFamily = typeof obs?.terminalOracleFamily === 'string'
+        ? obs.terminalOracleFamily
+        : (typeof terminalImpact?.oracleFamily === 'string' ? terminalImpact.oracleFamily : null)
+      const hopCount = typeof obs?.hopCount === 'number'
+        ? obs.hopCount
+        : typeof hostRec?.hopCount === 'number'
+          ? hostRec.hopCount
+          : typeof claim.hopCount === 'number'
+            ? claim.hopCount
+            : (Array.isArray(receipt?.hops) ? receipt.hops.length : null)
+      const verifiedEdgeKinds = compositeVerifiedEdgeKinds(obs, receipt, Boolean(check.passed))
+      const modeBVerified = typeof obs?.modeBVerified === 'boolean'
+        ? obs.modeBVerified
+        : Boolean(check.passed && (hostRec?.replayMode ?? claim.replayMode ?? receipt?.replayMode) === 'one_shot_transcript')
       return {
         kind: claim.kind,
         method: term?.request?.method ?? '',
         path: pathFingerprint(claim.route ?? term?.request?.pathAndQuery),
         status: term?.response?.status != null ? Number(term.response.status) : null,
         expectation: {
-          chainId: claim.chainId,
+          chainId: normalizeDynamic(claim.chainId, nonce),
           terminalVulnClass: claim.terminalVulnClass,
           hopCount: claim.hopCount ?? null,
           replayMode: claim.replayMode ?? 'fresh_clean_replay',
         },
-        observed: normalizedValue(check.observed ?? { confirmed: check.passed }, nonce),
+        observed: {
+          confirmed: Boolean(check.passed),
+          terminalOracleFamily,
+          hopCount,
+          verifiedEdgeKinds,
+          modeBVerified,
+        },
       }
     }
     const record = store.get(claim.exchangeId)
