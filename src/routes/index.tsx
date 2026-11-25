@@ -1,7 +1,11 @@
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import { useEffect, useMemo, useState } from 'react'
-import { createProject, workspaceData } from '../actions.ts'
+import { createProject, syncGithubRepositories, workspaceData } from '../actions.ts'
 import { FormError, useAction } from '../components/common.tsx'
+import {
+  CreateProjectGithubBlock,
+  type GithubPatStatusSummary,
+} from '../components/project/CreateProjectGithubBlock.tsx'
 import { fmtDate, host, plural } from '../components/run/format.ts'
 import { StatusGlyph } from '../components/run/glyphs.tsx'
 import { Icon } from '../components/run/icons.tsx'
@@ -24,31 +28,42 @@ export const Route = createFileRoute('/')({
 function CreateProjectSheet({
   isModal,
   canCancel,
+  githubPatStatus,
   onClose,
 }: {
   isModal: boolean
   canCancel: boolean
+  githubPatStatus: GithubPatStatusSummary
   onClose: () => void
 }) {
   const navigate = useNavigate()
   const [environment, setEnvironment] = useState<'public' | 'local-lab'>('public')
   const [includeSubdomains, setIncludeSubdomains] = useState(false)
+  const [selectedRepos, setSelectedRepos] = useState<string[]>([])
+  const [submitStatus, setSubmitStatus] = useState('')
   const action = useAction()
 
   useEffect(() => {
     if (!isModal) return
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      if (e.key === 'Escape' && !action.pending) {
         e.preventDefault()
         onClose()
       }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [isModal, onClose])
+  }, [isModal, onClose, action.pending])
 
   const sheetContent = <form
     className={isModal ? 'sh-modal-sheet' : 'sheet'}
+    style={isModal ? {
+      width: 600,
+      maxHeight: 'calc(100vh - 56px)',
+      display: 'flex',
+      flexDirection: 'column',
+      overflow: 'hidden',
+    } : undefined}
     role={isModal ? 'dialog' : undefined}
     aria-modal={isModal ? 'true' : undefined}
     aria-label={isModal ? 'Create a project' : undefined}
@@ -56,26 +71,42 @@ function CreateProjectSheet({
       event.preventDefault()
       const form = new FormData(event.currentTarget)
       const nextEnv = form.get('environment') === 'local-lab' ? 'local-lab' as const : 'public' as const
-      void action.submit(() => createProject({ data: {
-        requestId: crypto.randomUUID(),
-        name: String(form.get('name')),
-        seeds: String(form.get('seeds')).split(/[\s,]+/).filter(Boolean),
-        environment: nextEnv,
-        includeSubdomains: nextEnv === 'public' ? includeSubdomains : false,
-      } }), async project => {
+      const reposToSync = selectedRepos.slice(0, 20)
+      setSubmitStatus('Creating project…')
+      void action.submit(async () => {
+        const project = await createProject({ data: {
+          requestId: crypto.randomUUID(),
+          name: String(form.get('name')),
+          seeds: String(form.get('seeds')).split(/[\s,]+/).filter(Boolean),
+          environment: nextEnv,
+          includeSubdomains: nextEnv === 'public' ? includeSubdomains : false,
+        } })
+        if (reposToSync.length > 0) {
+          setSubmitStatus(`Syncing ${reposToSync.length} ${reposToSync.length === 1 ? 'repo' : 'repos'}…`)
+          try {
+            await syncGithubRepositories({ data: { projectId: project.id, repos: reposToSync } })
+          } catch {
+            // Non-blocking: still open the newly created project cleanly so the user can retry sync if needed.
+          }
+        }
+        return project
+      }, async project => {
+        setSubmitStatus('')
         setIncludeSubdomains(false)
+        setSelectedRepos([])
         onClose()
         await navigate({ to: '/projects/$projectId', params: { projectId: project.id } })
-      })
+      }).finally(() => setSubmitStatus(''))
     }}
   >
-    <div className="sheet-h">
+    <div className="sheet-h" style={isModal ? { flex: 'none' } : undefined}>
       <Icon name="plus" />
       <span>Create a project</span>
       <span className="muted">Define authorized seed hosts</span>
       {isModal && <button
         type="button"
         className="sh-icon-btn sh-sheet-close"
+        disabled={action.pending}
         onClick={onClose}
         aria-label="Close modal"
       >
@@ -83,10 +114,19 @@ function CreateProjectSheet({
       </button>}
     </div>
 
-    <div className="sh-sheet-body">
+    <div
+      className="sh-sheet-body"
+      style={isModal ? { flex: '1 1 auto', minHeight: 0, overflowY: 'auto' } : undefined}
+    >
       <label>
         Project name
         <Input name="name" placeholder="Product website" required maxLength={160} autoFocus={isModal} />
+      </label>
+
+      <label>
+        Primary target URL / seed hosts
+        <Textarea name="seeds" rows={2} placeholder={'example.com\ndocs.example.com'} required />
+        <span className="muted">Enter up to 100 related hosts you own or have written authorization to assess.</span>
       </label>
 
       <label>
@@ -100,12 +140,6 @@ function CreateProjectSheet({
           <option value="local-lab">Local Lab (opt-in loopback/private staging when enabled)</option>
         </NativeSelect>
         <span className="muted">Local lab requires server-side GUARDIAN_ALLOW_LOCAL_LAB=1 to permit loopback or RFC1918 targets.</span>
-      </label>
-
-      <label>
-        Seed hosts
-        <Textarea name="seeds" rows={3} placeholder={'example.com\ndocs.example.com'} required />
-        <span className="muted">Enter up to 100 related hosts you own or have written authorization to assess.</span>
       </label>
 
       {environment === 'public' && <div className="field-grid">
@@ -123,19 +157,34 @@ function CreateProjectSheet({
         </span>
       </div>}
 
+      <CreateProjectGithubBlock
+        initialPatStatus={githubPatStatus}
+        selectedRepos={selectedRepos}
+        onChangeSelectedRepos={setSelectedRepos}
+        disabled={action.pending}
+      />
+
       <FormError error={action.error} />
     </div>
 
-    <div className="sheet-f">
-      <span className="muted">Scope stays fail-closed until approved.</span>
-      {canCancel && <Button type="button" onClick={onClose}>Cancel</Button>}
-      <Button type="submit" variant="default" disabled={action.pending}>Create project</Button>
+    <div className="sheet-f" style={isModal ? { flex: 'none' } : undefined}>
+      <span className="muted">
+        {submitStatus || 'Scope stays fail-closed until approved.'}
+      </span>
+      {canCancel && <Button type="button" disabled={action.pending} onClick={onClose}>Cancel</Button>}
+      <Button type="submit" variant="default" disabled={action.pending}>
+        {submitStatus || (selectedRepos.length > 0 ? `Create & sync (${selectedRepos.length})` : 'Create project')}
+      </Button>
     </div>
   </form>
 
   if (!isModal) return sheetContent
 
-  return <div className="sh-overlay" onMouseDown={e => { if (e.target === e.currentTarget) onClose() }}>
+  return <div
+    className="sh-overlay"
+    style={{ alignItems: 'center', padding: '28px 16px', overflow: 'hidden' }}
+    onMouseDown={e => { if (e.target === e.currentTarget && !action.pending) onClose() }}
+  >
     {sheetContent}
   </div>
 }
@@ -149,7 +198,7 @@ function formatRunPhase(status: string, phase: string): string {
 }
 
 function Workspace() {
-  const { workspace, projects, hasModel, poolHealth } = Route.useLoaderData()
+  const { workspace, projects, hasModel, poolHealth, githubPatStatus } = Route.useLoaderData()
   const search = Route.useSearch()
   const navigate = useNavigate()
   const shell = useShell()
@@ -240,7 +289,7 @@ function Workspace() {
         <p className="sh-onboard-lede">
           Register the hosts you own or have written authorization to test. Kovo Hunter verifies scope before dispatching any live requests.
         </p>
-        <CreateProjectSheet isModal={false} canCancel={false} onClose={() => setModalOpen(false)} />
+        <CreateProjectSheet isModal={false} canCancel={false} githubPatStatus={githubPatStatus} onClose={() => setModalOpen(false)} />
       </div>
     </div> : <div className="proj-table-wrap">
       <div className="proj-head" role="row">
@@ -274,9 +323,7 @@ function Workspace() {
             >
               {project.name}
             </Link>
-            {project.environment === 'local-lab'
-              ? <span className="tag warn">Local lab</span>
-              : <span className="tag">Public</span>}
+            {project.environment === 'local-lab' && <span className="tag warn">Local Lab</span>}
           </div>
 
           <div className="proj-hosts-col" title={seedHosts.join(', ')}>
@@ -330,7 +377,7 @@ function Workspace() {
     </div>}
 
     {projects.length > 0 && modalOpen && (
-      <CreateProjectSheet isModal={true} canCancel={true} onClose={() => setModalOpen(false)} />
+      <CreateProjectSheet isModal={true} canCancel={true} githubPatStatus={githubPatStatus} onClose={() => setModalOpen(false)} />
     )}
   </main>
 }
