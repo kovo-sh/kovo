@@ -1,9 +1,13 @@
 import { useEffect, useState } from 'react'
 import { listGithubRepositories, saveGithubToken } from '../../actions.ts'
+import { cn } from '../../lib/cn.ts'
+import type { GithubAppInstallationSummary } from '../../server/github-connector.ts'
 import { useGithubDeviceFlow } from '../github/useGithubDeviceFlow.ts'
 import { Icon } from '../run/icons.tsx'
+import { Badge } from '../ui/badge.tsx'
+import { Button, buttonVariants } from '../ui/button.tsx'
+import { Disclosure, DisclosureContent, DisclosureTrigger } from '../ui/disclosure.tsx'
 import { Input } from '../ui/input.tsx'
-import type { GithubAppInstallationSummary } from '../../server/github-connector.ts'
 import { GithubInstallBanner } from './GithubInstallBanner.tsx'
 import { GroupedRepoPicker } from './GroupedRepoPicker.tsx'
 import type { DiscoveredGithubRepo } from './types.ts'
@@ -42,7 +46,7 @@ function connectionBadge(status: GithubPatStatusSummary): string {
 function GithubMarkIcon() {
   return (
     <svg
-      className="cp-gh-mark"
+      className="block flex-none text-fg-muted"
       width="16"
       height="16"
       viewBox="0 0 16 16"
@@ -62,7 +66,7 @@ function GithubMarkIcon() {
 function GithubBannerSvg() {
   return (
     <svg
-      className="cp-gh-art"
+      className="block flex-none text-fg-muted"
       width="54"
       height="40"
       viewBox="0 0 58 44"
@@ -209,10 +213,15 @@ export function CreateProjectGithubBlock({
 
   if (!patStatus.configured) {
     return (
-      <div className={`cp-gh-card${expandedConnect ? ' open' : ''}`}>
+      <div
+        className={cn(
+          'overflow-hidden rounded-card border bg-sunk transition-[border-color,background-color,box-shadow] duration-[var(--d1)] dark:bg-raise',
+          expandedConnect ? 'border-line-strong' : 'border-line-2 hover:border-line-strong',
+        )}
+      >
         <button
           type="button"
-          className="cp-gh-banner"
+          className="flex h-auto min-h-[70px] w-full cursor-pointer items-center gap-[13px] whitespace-normal rounded-none border-0 bg-transparent px-[15px] py-[13px] text-left text-fg shadow-none transition-colors duration-[var(--d1)] hover:bg-hover disabled:cursor-default disabled:opacity-50"
           onClick={() => {
             setExpandedConnect(v => !v)
             setError('')
@@ -221,35 +230,37 @@ export function CreateProjectGithubBlock({
           disabled={disabled}
         >
           <GithubBannerSvg />
-          <span className="cp-gh-copy">
-            <span className="cp-gh-title-row">
-              <strong>Connect GitHub</strong>
-              <span className="cp-gh-rec-badge">Recommended</span>
+          <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+            <span className="flex flex-wrap items-center gap-2">
+              <strong className="text-[13.5px] font-semibold leading-[19px] text-fg">Connect GitHub</strong>
+              <Badge className="h-[19px] bg-panel text-[11px] font-medium tracking-[0.01em] text-fg-muted">
+                Recommended
+              </Badge>
             </span>
-            <span className="cp-gh-sub">
+            <span className="text-[12px] font-normal leading-[17px] text-fg-muted">
               Add source code to find deeper vulnerabilities
             </span>
           </span>
-          <span className="cp-gh-chev" aria-hidden="true">
+          <span className="inline-flex flex-none items-center justify-center text-fg-subtle" aria-hidden="true">
             <Icon name={expandedConnect ? 'chevU' : 'chevR'} size={14} />
           </span>
         </button>
 
         {expandedConnect && (
-          <div className="cp-gh-panel">
+          <div className="grid gap-2.5 border-t border-line bg-panel px-[15px] py-3">
             {!deviceFlow ? (
-              <div className="cp-gh-flow-row">
+              <div className="flex items-center gap-2">
                 {patStatus.githubDeviceFlowConfigured ? (
-                  <button
+                  <Button
                     type="button"
-                    className="btn primary"
+                    variant="default"
                     disabled={startingDeviceFlow || savingToken || disabled}
                     onClick={() => void device.start()}
                   >
                     {startingDeviceFlow ? 'Starting…' : 'Sign in with GitHub'}
-                  </button>
+                  </Button>
                 ) : (
-                  <div className="cp-gh-input-row">
+                  <div className="flex w-full items-center gap-1.5">
                     <Input
                       type="text"
                       value={clientIdInput}
@@ -264,32 +275,34 @@ export function CreateProjectGithubBlock({
                       autoComplete="off"
                       disabled={startingDeviceFlow || savingToken || disabled}
                       aria-label="GitHub App Client ID"
-                      style={{ flex: 1 }}
+                      className="flex-1"
                     />
-                    <button
+                    <Button
                       type="button"
-                      className="btn primary"
+                      variant="default"
                       disabled={startingDeviceFlow || savingToken || disabled || clientIdInput.trim().length < 6}
                       onClick={() => void device.start()}
                     >
                       {startingDeviceFlow ? 'Starting…' : 'Sign in'}
-                    </button>
+                    </Button>
                   </div>
                 )}
               </div>
             ) : (
-              <div className="cp-gh-device">
-                <div className="cp-gh-code-row">
-                  <span className="cp-gh-code mono">{deviceFlow.userCode}</span>
-                  <button
+              <div className="grid gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="select-all rounded-control border border-line-2 bg-sunk px-2.5 py-1 font-mono text-[16px] font-semibold tracking-[0.12em] text-fg">
+                    {deviceFlow.userCode}
+                  </span>
+                  <Button
                     type="button"
-                    className="btn"
+                    variant="outline"
                     onClick={() => void device.copyCode()}
                   >
                     {codeCopied ? 'Copied' : 'Copy code'}
-                  </button>
+                  </Button>
                   <a
-                    className="btn primary"
+                    className={buttonVariants({ variant: 'default' })}
                     href={deviceFlow.verificationUri}
                     target="_blank"
                     rel="noopener noreferrer"
@@ -297,27 +310,31 @@ export function CreateProjectGithubBlock({
                     Open GitHub ↗
                   </a>
                 </div>
-                <div className="cp-gh-poll-row">
-                  <span role="status" className="muted num">
+                <div className="flex items-center justify-between gap-2 text-[12px]">
+                  <span role="status" className="tabular-nums text-fg-subtle">
                     Waiting for approval…
                   </span>
-                  <button
+                  <Button
                     type="button"
-                    className="btn ghost"
+                    variant="ghost"
                     onClick={() => void device.cancel()}
                   >
                     Cancel
-                  </button>
+                  </Button>
                 </div>
               </div>
             )}
 
-            {(error || deviceFlowError) && <p role="alert" className="cp-gh-err">{error || deviceFlowError}</p>}
+            {(error || deviceFlowError) && (
+              <p role="alert" className="m-0 text-[12px] text-danger">{error || deviceFlowError}</p>
+            )}
 
-            <details className="cp-gh-alt">
-              <summary>Or connect with an access token</summary>
-              <div className="cp-gh-alt-body">
-                <div className="cp-gh-input-row">
+            <Disclosure className="border-t border-line pt-[9px]">
+              <DisclosureTrigger className="h-auto w-auto rounded-sm bg-transparent px-0 py-0.5 text-[12px] font-medium text-fg-subtle shadow-none hover:bg-transparent hover:text-fg-muted">
+                <span>Or connect with an access token</span>
+              </DisclosureTrigger>
+              <DisclosureContent className="mt-2 grid gap-[7px] pt-0">
+                <div className="flex w-full items-center gap-1.5">
                   <Input
                     type="password"
                     value={tokenInput}
@@ -332,27 +349,27 @@ export function CreateProjectGithubBlock({
                     autoComplete="off"
                     disabled={savingToken || disabled}
                     aria-label="Read-only GitHub access token"
-                    style={{ flex: 1 }}
+                    className="flex-1"
                   />
-                  <button
+                  <Button
                     type="button"
-                    className="btn primary"
+                    variant="default"
                     disabled={savingToken || disabled || tokenInput.trim().length < 10}
                     onClick={() => void handleSaveToken()}
                   >
                     {savingToken ? 'Connecting…' : 'Connect'}
-                  </button>
+                  </Button>
                 </div>
                 <a
-                  className="cp-gh-token-link"
+                  className="w-fit text-[11.5px] text-accent hover:underline"
                   href="https://github.com/settings/personal-access-tokens/new"
                   target="_blank"
                   rel="noopener noreferrer"
                 >
                   Create a read-only token on GitHub ↗
                 </a>
-              </div>
-            </details>
+              </DisclosureContent>
+            </Disclosure>
           </div>
         )}
       </div>
@@ -360,24 +377,29 @@ export function CreateProjectGithubBlock({
   }
 
   return (
-    <div className="cp-gh-card connected">
-      <div className="cp-gh-connected-bar">
-        <div className="cp-gh-connected-left">
+    <div className="overflow-hidden rounded-card border border-line-2 bg-panel">
+      <div className="flex min-h-[38px] items-center justify-between gap-2 bg-sunk py-1.5 pl-3 pr-2.5">
+        <div className="flex min-w-0 flex-wrap items-center gap-[7px]">
           <GithubMarkIcon />
-          <strong className="cp-gh-connected-title">GitHub</strong>
-          <span className="cp-gh-login-pill">{connectionBadge(patStatus)}</span>
+          <strong className="text-[12.5px] font-semibold leading-[18px] text-fg">GitHub</strong>
+          <Badge className="max-w-[180px] bg-panel font-medium text-fg-muted">
+            {connectionBadge(patStatus)}
+          </Badge>
           {selectedRepos.length > 0 && (
-            <span className="cp-gh-sel-pill num">{selectedRepos.length} selected</span>
+            <Badge variant="accent" className="text-[11px] font-medium tabular-nums">
+              {selectedRepos.length} selected
+            </Badge>
           )}
         </div>
-        <button
+        <Button
           type="button"
-          className="btn ghost cp-gh-refresh-btn"
+          variant="ghost"
+          className="h-6 px-[7px] text-[12px] text-fg-muted"
           disabled={loadingRepos || disabled}
           onClick={() => void handleRefresh()}
         >
           {loadingRepos ? 'Loading…' : 'Refresh'}
-        </button>
+        </Button>
       </div>
 
       <GithubInstallBanner
@@ -394,15 +416,15 @@ export function CreateProjectGithubBlock({
         flush
       />
 
-      <div className="cp-gh-connected-body">
+      <div className="border-t border-line bg-panel">
         {loadingRepos && !reposLoaded ? (
-          <div className="cp-gh-state">
-            <span className="muted">Loading repositories…</span>
+          <div className="px-3.5 py-3 text-[12.5px]">
+            <span className="text-fg-subtle">Loading repositories…</span>
           </div>
         ) : error ? (
-          <div className="cp-gh-state cp-gh-state-err">
-            <span role="alert" className="cp-gh-err">{error}</span>
-            <button type="button" className="btn ghost" onClick={() => void handleRefresh()}>Retry</button>
+          <div className="flex items-center justify-between gap-2 px-3.5 py-3 text-[12.5px]">
+            <span role="alert" className="text-[12px] text-danger">{error}</span>
+            <Button type="button" variant="ghost" onClick={() => void handleRefresh()}>Retry</Button>
           </div>
         ) : (
           <GroupedRepoPicker
