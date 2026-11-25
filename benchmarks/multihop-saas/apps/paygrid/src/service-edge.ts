@@ -126,6 +126,8 @@ export async function handleEdge(
     const headers: Record<string, string> = {
       'x-guardian-run-id': runId,
       'x-edge-region': 'mh-lab-1',
+      // Internal bridge credential: lets api trust edge-computed headers on forwarded requests.
+      'x-edge-bridge': state.edgeBridgeToken,
     }
     const authorization = header(req, 'authorization')
     if (authorization) headers.authorization = authorization

@@ -1,7 +1,8 @@
 // Billing and ledger surfaces: payouts, maker/checker approval, orders and settlement capture.
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { timingSafeEqual } from 'node:crypto'
 import { readBody, parseJson, sendJson, runIdOf, match, parseUrl, header } from './http.ts'
-import type { LabState, OrderRecord } from './shared.ts'
+import type { LabState, OrderRecord, SessionRecord } from './shared.ts'
 import { authenticate, digest, firstJsonNumber, lastJsonNumber, roleOf, sessionTenantOk } from './policy.ts'
 
 function auth(state: LabState, req: IncomingMessage, res: ServerResponse) {
@@ -16,6 +17,27 @@ function auth(state: LabState, req: IncomingMessage, res: ServerResponse) {
     return null
   }
   return session
+}
+
+/** Reads (`GET`) on order and ledger data require a verified session. */
+function requireVerified(session: SessionRecord, res: ServerResponse): boolean {
+  if (session.emailVerified) return true
+  sendJson(res, 403, { error: 'verified session required' })
+  return false
+}
+
+/** Order mutations are not available to the read-only viewer role. */
+function requireWriteRole(state: LabState, session: SessionRecord, res: ServerResponse): boolean {
+  if (roleOf(state, session, session.tenantId) !== 'viewer') return true
+  sendJson(res, 403, { error: 'write role required' })
+  return false
+}
+
+/** True only when the request was forwarded by the edge service of this lab instance. */
+function fromEdge(state: LabState, req: IncomingMessage): boolean {
+  const presented = Buffer.from(header(req, 'x-edge-bridge'))
+  const expected = Buffer.from(state.edgeBridgeToken)
+  return presented.length === expected.length && timingSafeEqual(presented, expected)
 }
 
 function delay(ms: number): Promise<void> {
@@ -109,6 +131,18 @@ export async function handleBilling(
       sendJson(res, 403, { error: 'finance role required' })
       return true
     }
+    // An unverified session may only act on drafts it owns; ownership must be rebound first.
+    if (!session.emailVerified && payout.createdBy !== session.userId) {
+      state.emit('payout.approve_denied', {
+        payoutId: payout.id,
+        tenantId: payout.tenantId,
+        reason: 'rebind_required',
+        sessionDigest: digest(session.token),
+        runId,
+      }, session.originPersona)
+      sendJson(res, 403, { error: 'rebind required before approval' })
+      return true
+    }
     // Verified staff sessions always go through the separation-of-duties check.
     const legacyApprovalPath = state.profile.makerCheckerBypass && !session.emailVerified
     if (payout.createdBy === session.userId && !legacyApprovalPath) {
@@ -149,10 +183,12 @@ export async function handleBilling(
   if (match(url, method, at('/orders'))) {
     const session = auth(state, req, res)
     if (!session) return true
+    if (method === 'GET' ? !requireVerified(session, res) : !requireWriteRole(state, session, res)) return true
     const raw = await readBody(req)
     const first = firstJsonNumber(raw, 'amountCents')
     const last = lastJsonNumber(raw, 'amountCents')
-    const edgeHeader = Number(header(req, 'x-lab-edge-amount'))
+    // The edge-computed amount is only honoured on requests the edge actually forwarded.
+    const edgeHeader = fromEdge(state, req) ? Number(header(req, 'x-lab-edge-amount')) : Number.NaN
     const edgeAmount = Number.isFinite(edgeHeader) && edgeHeader > 0 ? edgeHeader : last
     const duplicated = first !== null && last !== null && first !== last
     if (duplicated && !state.profile.duplicateKeyCapRelaxed) {
@@ -205,6 +241,7 @@ export async function handleBilling(
   if (orderById) {
     const session = auth(state, req, res)
     if (!session) return true
+    if (!requireVerified(session, res)) return true
     const order = state.orders.find((item) => item.id === orderById[0])
     if (!order || order.tenantId !== session.tenantId) {
       sendJson(res, 404, { error: 'unknown order' })
@@ -218,6 +255,7 @@ export async function handleBilling(
   if (orderRebind) {
     const session = auth(state, req, res)
     if (!session) return true
+    if (!requireWriteRole(state, session, res)) return true
     const order = state.orders.find((item) => item.id === orderRebind[0])
     if (!order || order.tenantId !== session.tenantId) {
       sendJson(res, 404, { error: 'unknown order' })
@@ -253,6 +291,7 @@ export async function handleBilling(
   if (settleRace) {
     const session = auth(state, req, res)
     if (!session) return true
+    if (!requireWriteRole(state, session, res)) return true
     const order = state.orders.find((item) => item.id === settleRace[0])
     if (!order || order.tenantId !== session.tenantId) {
       sendJson(res, 404, { error: 'unknown order' })
@@ -308,6 +347,7 @@ export async function handleBilling(
   if (match(url, method, at('/ledger'))) {
     const session = auth(state, req, res)
     if (!session) return true
+    if (!requireVerified(session, res)) return true
     sendJson(res, 200, { entries: state.ledger.filter((entry) => entry.tenantId === session.tenantId) })
     return true
   }
@@ -315,6 +355,7 @@ export async function handleBilling(
   if (match(url, method, at('/balance'))) {
     const session = auth(state, req, res)
     if (!session) return true
+    if (!requireVerified(session, res)) return true
     const total = state.ledger
       .filter((entry) => entry.tenantId === session.tenantId)
       .reduce((sum, entry) => sum + entry.amountCents, 0)

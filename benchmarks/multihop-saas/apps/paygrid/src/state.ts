@@ -1,6 +1,6 @@
 // Per-run lab state. The five services share this store the way separate deployments share a
 // control database, but every network surface is still an independent loopback listener.
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import type {
   Detail, InviteRecord, LabProfile, LabRole, LabState, PaygridPlan, PersonaKey, TenantKey, UserRecord,
 } from './shared.ts'
@@ -78,6 +78,7 @@ export function createLabState(plan: PaygridPlan, profile: LabProfile, runId: st
     audit,
     listeners,
     seq: 0,
+    edgeBridgeToken: randomBytes(24).toString('hex'),
     emit(kind: string, detail: Detail = {}, actorPersona?: PersonaKey) {
       const event = {
         seq: state.seq,
