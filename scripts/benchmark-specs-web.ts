@@ -427,6 +427,85 @@ export function synthRace(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[
   const jq = '{ controlPassed: ((.control.status >= 200 and .control.status < 300) or (.setup | length) >= 1), ' +
     'confirmed: (([(.burst.results // [])[] | select(.status >= 200 and .status < 300)] | length) >= 2), ' +
     'observed: ("accepted=" + (([(.burst.results // [])[] | select(.status >= 200 and .status < 300)] | length) | tostring)), expected: "one single-use value is accepted exactly once" }'
+
+  // Cut 3d: attach a typed floor-recipe envelope (`conserved_balance` for balance/stock races,
+  // `race_burst` for single-use voucher/coupon races) so verification runs through ProofReceipt.
+  const recipeActor = { handle: env.owner ?? 'anonymous' }
+  const toRecipeStep = (raw: Record<string, unknown>) => {
+    const path = typeof raw.path === 'string' && raw.path.startsWith('/') ? raw.path : null
+    if (!path) return null
+    const rawMethod = String(raw.method ?? 'GET').toUpperCase()
+    const m = rawMethod === 'POST' || rawMethod === 'PUT' || rawMethod === 'PATCH' ? rawMethod : 'GET'
+    const extracts = Array.isArray(raw.extract)
+      ? raw.extract
+        .filter((e): e is { varName: string; selector: string } =>
+          Boolean(e && typeof e === 'object' && typeof (e as Record<string, unknown>).varName === 'string' && typeof (e as Record<string, unknown>).selector === 'string'))
+        .map(e => ({ varName: e.varName, selector: e.selector }))
+      : []
+    return {
+      method: m,
+      pathAndQuery: path,
+      ...(raw.body && typeof raw.body === 'object' ? { jsonBody: raw.body } : {}),
+      ...(typeof raw.persona === 'string' ? { actor: { handle: raw.persona } } : {}),
+      ...(extracts.length > 0 ? { extract: extracts } : {}),
+    }
+  }
+  const recipeSetupSteps = setup
+    .slice(0, 4)
+    .map(raw => (raw && typeof raw === 'object' ? toRecipeStep(raw as Record<string, unknown>) : null))
+    .filter((s): s is NonNullable<typeof s> => Boolean(s))
+  if (recipeSetupSteps.length === 0 && producerPath.startsWith('/') && /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(param)) {
+    recipeSetupSteps.push({
+      method: 'POST',
+      pathAndQuery: producerPath,
+      jsonBody: {},
+      extract: [{ varName: 'code', selector: param }],
+    })
+  }
+  const recipeCleanupSteps = cleanup
+    .slice(0, 3)
+    .map(raw => (raw && typeof raw === 'object' ? toRecipeStep(raw as Record<string, unknown>) : null))
+    .filter((s): s is NonNullable<typeof s> => Boolean(s))
+  const readbackPath = balancePath ?? (typeof hit.parentPath === 'string' && hit.parentPath.startsWith('/') ? hit.parentPath : null)
+  const bodyRecord = body as Record<string, unknown>
+  const numericDebitInBody = Object.entries(bodyRecord).some(([k, v]) =>
+    /^(?:amount|quantity|qty|debit|delta|value|count|seats|points|credits|transfer_amount|redeem_amount)$/i.test(k) &&
+    typeof v === 'number' && Number.isFinite(v) && v > 0)
+  const useConservedBalance = Boolean(readbackPath) && hit.mode !== 'single_use' && (Boolean(balanceField) || numericDebitInBody)
+  const recipe = useConservedBalance
+    ? {
+        recipeId: 'conserved_balance' as const,
+        args: {
+          origin: env.origin,
+          method,
+          pathAndQuery: consumePath,
+          vulnClass: 'race_double_spend',
+          actor: recipeActor,
+          body: bodyRecord,
+          burst: 4,
+          headers,
+          readback: { method: 'GET', pathAndQuery: readbackPath! },
+          ...(recipeSetupSteps.length > 0 ? { setupSteps: recipeSetupSteps } : {}),
+          ...(recipeCleanupSteps.length > 0 ? { cleanupSteps: recipeCleanupSteps } : {}),
+          ...(balanceField ? { balanceField } : {}),
+          ...(typeof hit.value === 'number' && Number.isFinite(hit.value) && hit.value > 0 ? { unitDebit: hit.value } : {}),
+        },
+      }
+    : {
+        recipeId: 'race_burst' as const,
+        args: {
+          origin: env.origin,
+          method,
+          pathAndQuery: consumePath,
+          vulnClass: 'business_logic',
+          actor: recipeActor,
+          body: bodyRecord,
+          burst: 4,
+          headers,
+          ...(recipeSetupSteps.length > 0 ? { setupSteps: recipeSetupSteps } : {}),
+          ...(recipeCleanupSteps.length > 0 ? { cleanupSteps: recipeCleanupSteps } : {}),
+        },
+      }
   return [{
     kind: 'race_burst',
     spec: {
@@ -439,6 +518,7 @@ export function synthRace(o: HypothesisOutcome, env: ProbeEnv): SynthesizedSpec[
         ? { postCheckStep: stepOf(env, 'p1', 'probe', 'Read the balance after the burst', { method: 'GET', pathAndQuery: hit.parentPath }) }
         : {}),
       ...(cleanupSteps.length > 0 ? { cleanupSteps } : {}),
+      recipe,
     },
   }]
 }

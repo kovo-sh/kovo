@@ -209,6 +209,7 @@ export const floorRecipeIds = [
   'redirect',
   'browser_sink',
   'injection_fingerprint',
+  'conserved_balance',
 ] as const
 
 export const floorRecipeEnvelopeSchema = z.object({

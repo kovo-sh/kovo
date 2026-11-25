@@ -13,7 +13,7 @@ import {
   agentScriptProofEnvelopeSchema,
   replaySpecOrigins,
 } from '../replay-spec.ts'
-import type { AgentScriptProofEnvelope, AuthMutation, DeclarativeReplaySpec, FloorRecipeEnvelope, RaceBurstRequest, ReplayAssertionOutcome, ReplayStep } from '../replay-spec.ts'
+import type { AgentScriptProofEnvelope, AuthMutation, DeclarativeReplaySpec, FloorRecipeEnvelope, ReplayAssertionOutcome, ReplayStep } from '../replay-spec.ts'
 import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied, RequestBroker } from './broker.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
@@ -798,7 +798,7 @@ function singleQuoteEscape(value: string): string {
 
 export const RETIRED_LEGACY_SPEC_KINDS: ReadonlySet<string> = new Set([
   'dns_takeover', 'tls_audit', 'browser_dom', 'ws_chain', 'upload_probe',
-  'sql_boolean_diff', 'sql_time_diff',
+  'sql_boolean_diff', 'sql_time_diff', 'race_burst',
 ])
 export const RETIRED_LEGACY_SPEC_REASON = 'retired_legacy_spec_kind: use guardian_verify'
 
@@ -883,7 +883,7 @@ function base64urlJson(value: unknown): string {
 }
 
 function requestShapeToBrokerRequest(
-  req: ReplayStep['request'] | RaceBurstRequest,
+  req: ReplayStep['request'],
   vars: Record<string, string>,
   opts?: {
     sessionId?: string
@@ -2002,107 +2002,6 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         ...(firstControlStep ? { control: firstControlStep } : {}),
         ...(firstProbeStep ? { probe: firstProbeStep } : {}),
         ...(spaCatchall ? { spaCatchall } : {}),
-      }
-    } else if (spec.kind === 'race_burst') {
-      if (tier < 2) {
-        grant.audit('denied', spec.origin)
-        return inconclusiveResult('race_burst replay specs require Capability Tier 2 or Tier 3.', exchanges, exchangeIds, { kind: spec.kind })
-      }
-      const vars: Record<string, string> = {}
-      let controlSummary: Record<string, unknown> | null = null
-      let postCheckSummary: Record<string, unknown> | null = null
-      const setupSummaries: Array<Record<string, unknown>> = []
-      const cleanupSummaries: Array<Record<string, unknown>> = []
-
-      // Ordered prerequisites (create cart, read balance, mint stock) feed the burst through vars.
-      for (const step of spec.setupSteps ?? []) {
-        signal.throwIfAborted()
-        const setupReq = stepToBrokerRequest(step, vars)
-        if (hasDestructiveContent(JSON.stringify(setupReq))) {
-          return inconclusiveResult('Interpolated race_burst setupStep matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
-        }
-        const setupEx = await broker.executeHttp(setupReq, grant, signal)
-        recordExchange(setupEx)
-        extractVariables(step, setupEx, vars)
-        setupSummaries.push({ id: step.id, role: step.role, ...summarizeExchange(setupEx) })
-      }
-
-      const runCleanup = async (): Promise<void> => {
-        for (const step of spec.cleanupSteps ?? []) {
-          const cleanupReq = stepToBrokerRequest(step, vars)
-          if (hasDestructiveContent(JSON.stringify(cleanupReq))) {
-            cleanupSummaries.push({ id: step.id, role: step.role, skipped: 'destructive-denylist' })
-            continue
-          }
-          try {
-            const cleanupEx = await broker.executeHttp(cleanupReq, grant, signal)
-            recordExchange(cleanupEx)
-            extractVariables(step, cleanupEx, vars)
-            cleanupSummaries.push({ id: step.id, role: step.role, ...summarizeExchange(cleanupEx) })
-          } catch (err) {
-            cleanupSummaries.push({
-              id: step.id, role: step.role,
-              error: redact(err instanceof Error ? err.message : String(err), grant.secrets ?? []).slice(0, 200),
-            })
-          }
-        }
-      }
-
-      try {
-        if (spec.controlStep) {
-          signal.throwIfAborted()
-          const controlReq = stepToBrokerRequest(spec.controlStep, vars)
-          if (hasDestructiveContent(JSON.stringify(controlReq))) {
-            return inconclusiveResult('Interpolated race_burst controlStep matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
-          }
-          const controlEx = await broker.executeHttp(controlReq, grant, signal)
-          recordExchange(controlEx)
-          extractVariables(spec.controlStep, controlEx, vars)
-          controlSummary = {
-            id: spec.controlStep.id,
-            role: spec.controlStep.role,
-            ...summarizeExchange(controlEx),
-          }
-        }
-
-        const burstReqs = spec.burst.map(req => requestShapeToBrokerRequest(req, vars))
-        if (hasDestructiveContent(JSON.stringify(burstReqs))) {
-          return inconclusiveResult('Interpolated race_burst requests matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
-        }
-
-        const burstResult = await broker.executeRaceBurst(burstReqs, grant, signal)
-        for (const ex of burstResult.results) recordExchange(ex)
-
-        if (spec.postCheckStep) {
-          signal.throwIfAborted()
-          const postReq = stepToBrokerRequest(spec.postCheckStep, vars)
-          if (hasDestructiveContent(JSON.stringify(postReq))) {
-            return inconclusiveResult('Interpolated race_burst postCheckStep matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
-          }
-          const postEx = await broker.executeHttp(postReq, grant, signal)
-          recordExchange(postEx)
-          extractVariables(spec.postCheckStep, postEx, vars)
-          postCheckSummary = {
-            id: spec.postCheckStep.id,
-            role: spec.postCheckStep.role,
-            ...summarizeExchange(postEx),
-          }
-        }
-
-        evidencePayload = {
-          ...evidencePayload,
-          ...(setupSummaries.length > 0 ? { setup: setupSummaries } : {}),
-          control: controlSummary,
-          burst: {
-            summary: burstResult.summary,
-            results: burstResult.results.map(summarizeExchange),
-          },
-          postCheck: postCheckSummary,
-          extractedVars: vars,
-        }
-      } finally {
-        await runCleanup()
-        if (cleanupSummaries.length > 0) evidencePayload = { ...evidencePayload, cleanup: cleanupSummaries }
       }
     } else if (spec.kind === 'rce_proof') {
       const controlVars: Record<string, string> = {}
@@ -3392,23 +3291,6 @@ export function buildInlineVerifyFeedback(
       const id = typeof entry.id === 'string' ? entry.id : key
       const role = typeof entry.role === 'string' ? entry.role : 'probe'
       stepStatuses.push(toStepStatusItem(id, role, entry))
-    }
-  } else if (kind === 'race_burst') {
-    if (payload.control && typeof payload.control === 'object') {
-      const c = payload.control as Record<string, unknown>
-      stepStatuses.push(toStepStatusItem(typeof c.id === 'string' ? c.id : 'control', 'control', c))
-    }
-    const burstResults = (payload.burst as { results?: unknown[] } | undefined)?.results
-    if (Array.isArray(burstResults)) {
-      burstResults.forEach((item, idx) => {
-        if (item && typeof item === 'object') {
-          stepStatuses.push(toStepStatusItem(`burst-${idx + 1}`, 'probe', item as Record<string, unknown>))
-        }
-      })
-    }
-    if (payload.postCheck && typeof payload.postCheck === 'object') {
-      const p = payload.postCheck as Record<string, unknown>
-      stepStatuses.push(toStepStatusItem(typeof p.id === 'string' ? p.id : 'postCheck', 'probe', p))
     }
   } else if (kind === 'rce_proof') {
     if (payload.control && typeof payload.control === 'object') {

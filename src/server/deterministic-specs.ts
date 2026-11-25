@@ -1961,6 +1961,27 @@ function synthRaceBurst(hyp: EngineHypothesis, result: DifferentialResult): Synt
       postCheckStep: stepOf(origin, 'post', 'cleanup', 'Re-read the conserved balance after the burst', {
         method: 'POST', pathAndQuery: path, headers: hyp.headers, jsonBody: bodyFor(0),
       }, hyp.ownerPersona, {}, [200, 201]),
+      recipe: {
+        recipeId: 'conserved_balance' as const,
+        args: {
+          origin,
+          method: 'POST',
+          pathAndQuery: path,
+          vulnClass: 'race_double_spend',
+          actor: { handle: hyp.ownerPersona ?? 'anonymous' },
+          body: bodyFor(amount),
+          burst: Math.min(8, burstSize),
+          readback: {
+            method: 'POST',
+            pathAndQuery: path,
+            jsonBody: bodyFor(0),
+            ...(hyp.headers ? { headers: hyp.headers } : {}),
+          },
+          balanceField,
+          unitDebit: amount,
+          ...(hyp.headers ? { headers: hyp.headers } : {}),
+        },
+      },
     },
   }]
 }
