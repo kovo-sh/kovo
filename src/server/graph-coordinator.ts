@@ -128,11 +128,28 @@ export interface CoordinatorCommitSignal {
   reasons?: readonly string[]
 }
 
+export interface CoordinatorApiDependency {
+  id?: string
+  producerEndpointId?: string
+  consumerEndpointId?: string
+  producer?: string
+  consumer?: string
+  producerOrigin?: string
+  consumerOrigin?: string
+  producerMethod?: string
+  consumerMethod?: string
+  resourceKey: string
+  personaHandle?: string | null
+  observedTransitions?: readonly string[]
+  testedBola?: boolean
+}
+
 /** Complete, untruncated data access (adapters page the store past its default page size). */
 export interface CoordinatorDeps {
   listEndpoints(): readonly CoordinatorEndpoint[]
   listFacts(): readonly CoordinatorFact[]
   listFindings(): readonly CoordinatorFinding[]
+  listApiDependencies?(): readonly CoordinatorApiDependency[]
   programGraph?(): CoordinatorProgramGraph | null
   commitSignals?(): readonly CoordinatorCommitSignal[]
   approvedOrigins?(): readonly string[]
@@ -1096,6 +1113,10 @@ export interface PlanChainRoundArgs {
   endpoints?: readonly CoordinatorEndpoint[]
   /** Typed hops from prior/current rounds to attach onto planned multi-step hypotheses. */
   hops?: readonly ChainHop[]
+  /** Runtime producer->consumer API dependency edges (e.g. from `endpointGraphCatalog.apiDependencies`). */
+  apiDependencies?: readonly CoordinatorApiDependency[]
+  /** False/omitted in grey-box/black-box runs where no repo source is mounted. */
+  sourceMounted?: boolean
   /** Maximum chain depth (v8 supports 1..6; defaults to 4). */
   maxHops?: number
   /** Minimum chain depth (defaults to 2 for multi-hop composition; set 1 to include terminal-eligible 1-hop nodes). */
@@ -1561,6 +1582,120 @@ function collectNegativeEdgeState(
   return { prunedKeys, strikeCountByKey, records }
 }
 
+function inferRuntimeRoutePrimitiveKind(
+  method: string,
+  endpoint: string,
+  resourceKey = '',
+  sinkKinds: readonly string[] = [],
+): ChainPrimitiveKind {
+  const lower = `${endpoint} ${resourceKey} ${sinkKinds.join(' ')}`.toLowerCase()
+  if (sinkKinds.includes('outbound_fetch') || /\/(?:webhooks?|callbacks?|hooks?|render|preview|proxy|fetch|import|redirect)(?:\/|$)/.test(lower)) {
+    return 'ssrf_internal_reach'
+  }
+  if (/\/(?:oauth|oidc|idp|sso|token|jwks|keys?|sign|signing)(?:\/|$)/.test(lower) || /token|jwt|secret|key/.test(resourceKey.toLowerCase())) {
+    return 'leaked_token'
+  }
+  if (/\/(?:invite|impersonate|roles?|grant|session|login|auth)(?:\/|$)/.test(lower)) {
+    return 'role_transition'
+  }
+  if (ROLE_PATH_RE.test(endpoint)) {
+    return 'admin_route'
+  }
+  if (
+    SEMANTIC_MUTATING_METHODS.has(method.toUpperCase())
+    && (WORKFLOW_PATH_RE.test(endpoint) || BUSINESS_LOGIC_PATH_RE.test(endpoint) || RACE_PATH_RE.test(endpoint) || /\/(?:exports?|jobs?|async|batch|bulk)(?:\/|$)/.test(lower))
+  ) {
+    return 'workflow_state_handle'
+  }
+  return 'discovered_id'
+}
+
+function makeRuntimePlanUnit(input: {
+  origin: string
+  method: string
+  endpoint: string
+  endpointId?: string
+  resourceKey?: string
+  persona?: string | null
+  detail: string
+  sinkKinds?: readonly string[]
+  unitTag: string
+  ordinal: number
+}): CausalPlanUnit {
+  const method = input.method.toUpperCase()
+  const kind = inferRuntimeRoutePrimitiveKind(method, input.endpoint, input.resourceKey, input.sinkKinds)
+  const capKind = primitiveToCapabilityKind(kind)
+  const surface = inferSurfaceFromEndpoint(input.endpoint, kind)
+  const capId = `cap:hop_${sanitizeUnitToken(input.unitTag)}_${input.ordinal}:${sanitizeUnitToken(input.resourceKey || kind)}`
+  const primitive: ChainPrimitive = {
+    kind,
+    origin: input.origin,
+    value: input.resourceKey ? `${input.resourceKey}@${input.endpoint}` : `${method} ${input.endpoint}`,
+    evidenceIds: [],
+    factIds: [],
+    ...(input.endpointId ? { endpointId: input.endpointId } : {}),
+    endpoint: input.endpoint,
+    method,
+    ...(input.persona ? { persona: input.persona } : {}),
+    detail: input.detail,
+  }
+  return {
+    unitId: `rt:${input.unitTag}:${input.origin}:${method}:${input.endpoint}`,
+    capId,
+    capKind,
+    primitive,
+    surface,
+    tenantScope: 'default_tenant',
+    actorPersona: input.persona ?? 'attacker',
+    serviceOrigin: input.origin,
+    hopReceiptId: `hop:${sanitizeUnitToken(input.unitTag)}:${input.ordinal}`,
+    verified: false,
+    quarantined: ALWAYS_QUARANTINED_KINDS.has(capKind),
+    terminalEligible: !ALWAYS_QUARANTINED_KINDS.has(capKind),
+    targetSurfaceKey: `${input.origin}|${surface}|${input.endpoint}`,
+    hypothesisClass: PROBE_CLASS[kind],
+    endpoint: input.endpoint,
+    method,
+  }
+}
+
+function resolveDependencySide(
+  endpointId: string | undefined,
+  rawRoute: string | undefined,
+  explicitOrigin: string | undefined,
+  explicitMethod: string | undefined,
+  endpointsById: ReadonlyMap<string, CoordinatorEndpoint>,
+  endpointsByMethodPath: ReadonlyMap<string, CoordinatorEndpoint>,
+  fallbackOrigin: string,
+): { origin: string; method: string; endpoint: string; endpointId?: string; sinkKinds?: readonly string[] } | null {
+  if (endpointId) {
+    const found = endpointsById.get(endpointId)
+    if (found) {
+      return {
+        origin: explicitOrigin ?? found.origin,
+        method: (explicitMethod ?? found.method).toUpperCase(),
+        endpoint: found.pathTemplate,
+        endpointId: found.id,
+        sinkKinds: found.sinkKinds,
+      }
+    }
+  }
+  if (!rawRoute || !rawRoute.trim()) return null
+  const parsed = parseRouteTarget(rawRoute)
+  const rawEndpoint = parsed.endpoint?.trim()
+  if (!rawEndpoint || !rawEndpoint.startsWith('/')) return null
+  const method = (explicitMethod ?? parsed.method ?? 'GET').toUpperCase()
+  const matched = endpointsByMethodPath.get(`${method} ${rawEndpoint}`)
+    ?? endpointsByMethodPath.get(`* ${rawEndpoint}`)
+  return {
+    origin: explicitOrigin ?? matched?.origin ?? fallbackOrigin,
+    method,
+    endpoint: rawEndpoint,
+    ...(matched?.id ? { endpointId: matched.id } : {}),
+    ...(matched?.sinkKinds ? { sinkKinds: matched.sinkKinds } : {}),
+  }
+}
+
 /**
  * Plan multi-hop causal hypotheses (depth 1..6) using `CapabilityLedger` causal lineage +
  * `FrontierScheduler` EVI-ranked beam search, enforcing `capability_only` quarantine,
@@ -1576,6 +1711,8 @@ export function planChainRound(args: PlanChainRoundArgs): ChainHypothesis[] {
   const approved = args.approvedOrigins?.length ? new Set(args.approvedOrigins) : null
   const endpoints = args.endpoints ?? []
   const hops = args.hops ?? []
+  const apiDependencies = args.apiDependencies ?? []
+  const sourceMounted = args.sourceMounted === true
   const ledger = args.capabilityLedger ?? null
   const scheduler = args.frontierScheduler ?? null
 
@@ -1702,11 +1839,219 @@ export function planChainRound(args: PlanChainRoundArgs): ChainHypothesis[] {
     }
   }
 
-  // 2. Beam-search causal composition across primitives + ledger capability nodes (depth up to maxHops <= 6).
+  // 1b. Seed producer->consumer API dependency chains & cross-origin runtime edges (critical for
+  //     grey-box mode where `!sourceMounted`, and additive when mounted source also exists).
+  const runtimeUnits: CausalPlanUnit[] = []
+  const unitByRouteKey = new Map<string, CausalPlanUnit>()
+  for (const unit of [...primitiveUnits, ...ledgerUnitsByCapId.values()]) {
+    const key = `${unit.serviceOrigin}|${unit.method.toUpperCase()}|${unit.endpoint}`
+    if (!unitByRouteKey.has(key)) unitByRouteKey.set(key, unit)
+  }
+  const endpointsById = new Map<string, CoordinatorEndpoint>()
+  const endpointsByMethodPath = new Map<string, CoordinatorEndpoint>()
+  for (const ep of endpoints) {
+    if (approved && !approved.has(ep.origin)) continue
+    endpointsById.set(ep.id, ep)
+    const mk = `${ep.method.toUpperCase()} ${ep.pathTemplate}`
+    if (!endpointsByMethodPath.has(mk)) endpointsByMethodPath.set(mk, ep)
+    const wk = `* ${ep.pathTemplate}`
+    if (!endpointsByMethodPath.has(wk)) endpointsByMethodPath.set(wk, ep)
+  }
+
+  let runtimeUnitOrd = 0
+  const getOrCreateRuntimeUnit = (spec: {
+    origin: string
+    method: string
+    endpoint: string
+    endpointId?: string
+    resourceKey?: string
+    persona?: string | null
+    detail: string
+    sinkKinds?: readonly string[]
+    unitTag: string
+  }): CausalPlanUnit => {
+    const key = `${spec.origin}|${spec.method.toUpperCase()}|${spec.endpoint}`
+    const existing = unitByRouteKey.get(key)
+    if (existing) return existing
+    runtimeUnitOrd += 1
+    const created = makeRuntimePlanUnit({ ...spec, ordinal: runtimeUnitOrd })
+    unitByRouteKey.set(key, created)
+    runtimeUnits.push(created)
+    return created
+  }
+
+  if (apiDependencies.length > 0) {
+    const depOutgoing = new Map<string, Array<{ next: CausalPlanUnit; binding: CausalEdgeBindingKind }>>()
+    const depIncoming = new Set<string>()
+    const depStarts: CausalPlanUnit[] = []
+    const depStartSeen = new Set<string>()
+    const depByPathPrefix = new Map<string, CausalPlanUnit[]>()
+
+    for (const dep of apiDependencies.slice(0, 64)) {
+      const prod = resolveDependencySide(
+        dep.producerEndpointId, dep.producer, dep.producerOrigin, dep.producerMethod,
+        endpointsById, endpointsByMethodPath, fallbackOrigin,
+      )
+      const cons = resolveDependencySide(
+        dep.consumerEndpointId, dep.consumer, dep.consumerOrigin, dep.consumerMethod,
+        endpointsById, endpointsByMethodPath, prod?.origin ?? fallbackOrigin,
+      )
+      if (!prod || !cons) continue
+      if (approved && (!approved.has(prod.origin) || !approved.has(cons.origin))) continue
+      if (prod.origin === cons.origin && prod.method === cons.method && prod.endpoint === cons.endpoint) continue
+
+      const prodUnit = getOrCreateRuntimeUnit({
+        ...prod,
+        resourceKey: dep.resourceKey,
+        persona: dep.personaHandle,
+        detail: `API dependency producer ${prod.method} ${prod.endpoint} yields resource "${dep.resourceKey}"`,
+        unitTag: 'apidep_prod',
+      })
+      const consUnit = getOrCreateRuntimeUnit({
+        ...cons,
+        resourceKey: dep.resourceKey,
+        persona: dep.personaHandle,
+        detail: `API dependency consumer ${cons.method} ${cons.endpoint} consumes resource "${dep.resourceKey}"`,
+        unitTag: 'apidep_cons',
+      })
+      const binding = inferCausalBinding(prodUnit, consUnit)
+      const bucket = depOutgoing.get(prodUnit.capId) ?? []
+      if (!bucket.some(e => e.next.capId === consUnit.capId)) {
+        bucket.push({ next: consUnit, binding })
+        depOutgoing.set(prodUnit.capId, bucket)
+      }
+      depIncoming.add(consUnit.capId)
+      if (!depStartSeen.has(prodUnit.capId)) {
+        depStartSeen.add(prodUnit.capId)
+        depStarts.push(prodUnit)
+      }
+      const prodPathKey = `${prodUnit.serviceOrigin}|${prodUnit.endpoint}`
+      const pList = depByPathPrefix.get(prodPathKey) ?? []
+      if (!pList.some(u => u.capId === prodUnit.capId)) {
+        pList.push(prodUnit)
+        depByPathPrefix.set(prodPathKey, pList)
+      }
+    }
+
+    const rootDeps = depStarts.filter(u => !depIncoming.has(u.capId))
+    const startNodes = rootDeps.length > 0 ? rootDeps : depStarts
+    const walkApiDeps = (path: CausalPlanUnit[], bindings: CausalEdgeBindingKind[]): void => {
+      if (path.length >= minHops) registerCandidate(path, bindings, path.length - 1, false)
+      if (path.length >= maxHops) return
+      const tip = path[path.length - 1]!
+      const visited = new Set(path.map(u => u.capId))
+      const directNext = depOutgoing.get(tip.capId) ?? []
+      // Also allow chaining when consumer's path matches another dependency producer's path (different HTTP method).
+      const pathAliasProducers = (depByPathPrefix.get(`${tip.serviceOrigin}|${tip.endpoint}`) ?? [])
+        .filter(u => u.capId !== tip.capId)
+      const aliasNext = pathAliasProducers.flatMap(u => depOutgoing.get(u.capId) ?? [])
+      const nextEdges = [...directNext, ...aliasNext]
+      let extended = false
+      for (const edge of nextEdges.slice(0, 6)) {
+        if (visited.has(edge.next.capId)) continue
+        extended = true
+        walkApiDeps([...path, edge.next], [...bindings, edge.binding])
+      }
+      // If a dependency path stops short of maxHops and another origin has a ledger/primitive unit,
+      // extend across the cross-origin boundary so GB dependency chains reach multi-origin targets.
+      if (!extended && path.length < maxHops) {
+        const crossOriginTargets = [...ledgerUnitsByCapId.values(), ...primitiveUnits]
+          .filter(u => !visited.has(u.capId) && u.serviceOrigin !== tip.serviceOrigin)
+          .slice(0, 3)
+        for (const target of crossOriginTargets) {
+          registerCandidate([...path, target], [...bindings, inferCausalBinding(tip, target)], path.length - 1, false)
+        }
+      }
+    }
+    for (const root of startNodes.slice(0, 16)) {
+      walkApiDeps([root], [])
+    }
+  }
+
+  // In grey-box mode (`!sourceMounted`), synthesize cross-origin runtime boundary units when the
+  // discovered endpoint surface spans >= 2 approved origins so multi-origin chains seed in Round 1.
+  if (!sourceMounted) {
+    const runtimeByOrigin = new Map<string, CoordinatorEndpoint[]>()
+    for (const ep of endpoints) {
+      if (approved && !approved.has(ep.origin)) continue
+      if (ep.pathTemplate === '/' || /^\/(?:health|healthz|ready|metrics|favicon)/i.test(ep.pathTemplate)) continue
+      const list = runtimeByOrigin.get(ep.origin) ?? []
+      list.push(ep)
+      runtimeByOrigin.set(ep.origin, list)
+    }
+    if (runtimeByOrigin.size >= 2) {
+      const originSeedUnits: CausalPlanUnit[] = []
+      const sortedOrigins = [...runtimeByOrigin.keys()].sort()
+      for (const origin of sortedOrigins) {
+        const eps = (runtimeByOrigin.get(origin) ?? [])
+          .slice()
+          .sort((a, b) =>
+            ((b.riskScore ?? 50) - (a.riskScore ?? 50))
+            || Number(isRoleExclusive(b) || SEMANTIC_MUTATING_METHODS.has(b.method.toUpperCase()))
+              - Number(isRoleExclusive(a) || SEMANTIC_MUTATING_METHODS.has(a.method.toUpperCase()))
+            || a.pathTemplate.localeCompare(b.pathTemplate))
+        let pickedForOrigin = 0
+        for (const ep of eps) {
+          if (pickedForOrigin >= 3 || originSeedUnits.length >= 12) break
+          const kind = inferRuntimeRoutePrimitiveKind(ep.method, ep.pathTemplate, '', ep.sinkKinds)
+          const hasSignal = (ep.riskScore ?? 0) >= 65
+            || isRoleExclusive(ep)
+            || isMissingAuthGuard(ep)
+            || kind !== 'discovered_id'
+            || classifySemanticEndpointClasses(ep).length > 0
+          if (!hasSignal) continue
+          const unit = getOrCreateRuntimeUnit({
+            origin: ep.origin,
+            method: ep.method,
+            endpoint: ep.pathTemplate,
+            endpointId: ep.id,
+            sinkKinds: ep.sinkKinds,
+            detail: `Cross-origin runtime surface ${ep.method.toUpperCase()} ${ep.pathTemplate} on ${hostOf(ep.origin)}`,
+            unitTag: 'xorigin',
+          })
+          if (!originSeedUnits.some(u => u.capId === unit.capId)) {
+            originSeedUnits.push(unit)
+            pickedForOrigin += 1
+          }
+        }
+      }
+      // Seed bounded 2-hop and 3-hop cross-origin runtime transitions across distinct origins.
+      for (let i = 0; i < originSeedUnits.length; i += 1) {
+        const first = originSeedUnits[i]!
+        for (let j = i + 1; j < originSeedUnits.length; j += 1) {
+          const second = originSeedUnits[j]!
+          if (first.serviceOrigin === second.serviceOrigin) continue
+          const pairBindings: CausalEdgeBindingKind[] = [inferCausalBinding(first, second)]
+          registerCandidate([first, second], pairBindings, 0, false)
+          if (maxHops >= 3) {
+            const third = originSeedUnits.find((u, k) =>
+              k !== i && k !== j
+              && u.serviceOrigin !== first.serviceOrigin
+              && u.serviceOrigin !== second.serviceOrigin,
+            ) ?? originSeedUnits.find((u, k) =>
+              k !== i && k !== j
+              && u.serviceOrigin !== second.serviceOrigin
+              && u.capKind !== second.capKind,
+            )
+            if (third) {
+              registerCandidate(
+                [first, second, third],
+                [...pairBindings, inferCausalBinding(second, third)],
+                0,
+                false,
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Beam-search causal composition across primitives + ledger capability nodes + runtime units (depth up to maxHops <= 6).
   //    Replaces v7's flat lookup tables with bounded EVI beam expansion via `rankAndPruneBeam`.
   const allUnits: CausalPlanUnit[] = [...primitiveUnits]
   const existingCapIds = new Set(allUnits.map(u => u.capId))
-  for (const unit of ledgerUnitsByCapId.values()) {
+  for (const unit of [...ledgerUnitsByCapId.values(), ...runtimeUnits]) {
     if (!existingCapIds.has(unit.capId)) {
       existingCapIds.add(unit.capId)
       allUnits.push(unit)
@@ -1732,9 +2077,12 @@ export function planChainRound(args: PlanChainRoundArgs): ChainHypothesis[] {
         for (let idx = prefix.lastIdx + 1; idx < allUnits.length; idx += 1) {
           const next = allUnits[idx]!
           if (usedCaps.has(next.capId)) continue
-          // Avoid degenerate same-kind primitive pairs unless backed by distinct ledger capabilities on distinct surfaces.
+          // Avoid degenerate same-kind primitive pairs unless backed by distinct ledger surfaces,
+          // cross-origin transitions, or explicit runtime API dependency edges.
           const isDistinctLedgerSurface = next.unitId.startsWith('ledger:') && prefix.units.every(u => u.surface !== next.surface)
-          if (usedKinds.has(next.primitive.kind) && !isDistinctLedgerSurface) continue
+          const isCrossOriginTransition = prefix.units.every(u => u.serviceOrigin !== next.serviceOrigin)
+          const isRuntimeDepUnit = next.unitId.startsWith('rt:apidep_')
+          if (usedKinds.has(next.primitive.kind) && !isDistinctLedgerSurface && !isCrossOriginTransition && !isRuntimeDepUnit) continue
           const nextUnits = [...prefix.units, next]
           const check = isPrunedCandidate(nextUnits)
           if (check.pruned) continue
@@ -2078,6 +2426,7 @@ export function createGraphCoordinator(options: GraphCoordinatorOptions): GraphC
       primitives: primitives(),
       hops: args?.hops ?? chainHops(),
       endpoints: args?.endpoints ?? deps.listEndpoints(),
+      apiDependencies: args?.apiDependencies ?? deps.listApiDependencies?.(),
       approvedOrigins: args?.approvedOrigins ?? approvedOrigins(),
       capabilityLedger: args?.capabilityLedger !== undefined ? args.capabilityLedger : (deps.capabilityLedger?.() ?? null),
       frontierScheduler: args?.frontierScheduler !== undefined ? args.frontierScheduler : (deps.frontierScheduler?.() ?? null),

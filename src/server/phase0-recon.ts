@@ -35,8 +35,15 @@ import {
   snapshotSourceFiles,
   type StaticWorkspaceSnapshot,
 } from './static-workspace-snapshot.ts'
+import {
+  classifySurface,
+  type RuntimeGraphqlCatalog,
+  type RuntimeGraphqlField,
+  type RuntimeOpenApiOperation,
+  type RuntimeSpaRoute,
+} from './invariant-synthesizer.ts'
 import type { EndpointRow, Store } from './store.ts'
-import { parseGraphqlIntrospection, probeSurface, runSafeTemplates } from './surface-engine.ts'
+import { parseGraphqlIntrospection, parseGraphqlSdl, probeSurface, runSafeTemplates } from './surface-engine.ts'
 
 export interface Phase0ReconParams {
   storage: Store
@@ -129,6 +136,12 @@ export interface Phase0ReconResult {
   siblingDerivationSuppressed?: 'declared_surface'
   /** Cached Phase A StaticWorkspaceSnapshot built or reused during Phase 0. */
   staticSnapshot?: StaticWorkspaceSnapshot
+  /** Structured SPA routes harvested from JS bundles and browser state-graph crawl for InvariantSynthesizer. */
+  runtimeSpaRoutes?: RuntimeSpaRoute[]
+  /** Structured GraphQL catalogs harvested from introspection, SDL specs, and JS bundles. */
+  runtimeGraphqlCatalogs?: RuntimeGraphqlCatalog[]
+  /** Structured OpenAPI operations (preserving `security`, `operationId`, and auth hints) parsed in Phase 0. */
+  runtimeOpenApiOperations?: RuntimeOpenApiOperation[]
 }
 
 export interface RepoStaticExtractionSummary {
@@ -180,6 +193,8 @@ export interface CrawlStateGraphResult {
   privilegedEndpoints?: Array<{ method: string; pathTemplate: string; personas: string[]; reason: string }>
   /** Full-surface paged read the crawl's route lookups ran against (see `phase0.crawl_paged`). */
   crawlPaged?: PagedReadMetric
+  /** Structured SPA route summaries (route -> intercepted API calls + persona role gating). */
+  spaRoutes?: RuntimeSpaRoute[]
 }
 
 export interface StaticExtractedRoute {
@@ -2839,6 +2854,284 @@ export function harvestJsRouteTable(code: string): string[] {
   return [...out]
 }
 
+export interface ParsedOpenApiOperation {
+  method: string
+  pathTemplate: string
+  operationId?: string
+  security?: Array<Record<string, string[]>>
+  authRequirement?: string | null
+  parameters?: string[]
+  requestBodyKeys?: string[]
+  tags?: string[]
+}
+
+const OPENAPI_AUTH_HEADER_RE = /^(?:authorization|x-api-key|api-key|x-auth-token|x-access-token)$/i
+const SPA_LIFECYCLE_ACTION_RE = /\b(approve|reject|cancel|revoke|demote|promote|transfer|refund|credit|debit|payout|settle|release|publish|archive|export|download|invite|impersonate|grant|webhook|dispute|reopen|checkout|billing|quota|balance|roleUpdate|selfApprove)\b/gi
+const SPA_ROLE_GUARD_PATTERNS: readonly RegExp[] = [
+  /\b(?:requiredRoles?|allowedRoles?|roles?)\s*[:=]\s*\[\s*([^\]]{1,120})\]/g,
+  /\b(?:requiredRole|minRole|roleGuard|allowRole)\s*[:=(]\s*["'`]([A-Za-z0-9_:-]{2,32})["'`]/g,
+  /\b(?:hasRole|requireRole|checkRole|isRole)\s*\(\s*["'`]([A-Za-z0-9_:-]{2,32})["'`]/g,
+  /\b(?:requiresAdmin|requireAdmin|adminOnly|isAdmin|isOwner|isStaff)\b/g,
+]
+const GQL_PRIVILEGED_FIELD_RE = /(?:admin|internal|role|grant|revoke|impersonat|secret|key|config|billing|export|audit|delete|mutat|transfer|approve)/i
+
+function normalizeOpenApiSecurity(raw: unknown): Array<Record<string, string[]>> | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const out: Array<Record<string, string[]>> = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    const rec: Record<string, string[]> = {}
+    for (const [scheme, scopes] of Object.entries(item as Record<string, unknown>)) {
+      const cleanScheme = scheme.trim()
+      if (!cleanScheme) continue
+      rec[cleanScheme] = Array.isArray(scopes)
+        ? scopes.filter((s): s is string => typeof s === 'string' && s.trim().length > 0).map(s => s.trim())
+        : []
+    }
+    out.push(rec)
+  }
+  return out
+}
+
+function deriveOpenApiAuthRequirement(
+  effectiveSecurity: Array<Record<string, string[]>> | undefined,
+  op: Record<string, unknown>,
+  opParams: readonly unknown[],
+  resolveNode: (node: unknown) => Record<string, unknown> | null,
+): string | null {
+  if (effectiveSecurity !== undefined) {
+    if (effectiveSecurity.length === 0) return 'none'
+    const hasEmptyAlt = effectiveSecurity.some(entry => Object.keys(entry).length === 0)
+    const parts: string[] = []
+    for (const entry of effectiveSecurity) {
+      for (const [scheme, scopes] of Object.entries(entry)) {
+        const label = scopes.length > 0 ? `${scheme}:${scopes.slice(0, 4).join(',')}` : scheme
+        if (!parts.includes(label)) parts.push(label)
+      }
+    }
+    if (parts.length === 0 || hasEmptyAlt) return 'none'
+    return parts.join(',').slice(0, 120)
+  }
+
+  // Secondary OpenAPI auth extension hints (x-auth-required / x-roles / x-required-roles / required auth header).
+  if (op['x-auth-required'] === false || op['x-public'] === true) return 'none'
+  const roleExt = op['x-required-roles'] ?? op['x-roles'] ?? op['x-permissions']
+  if (Array.isArray(roleExt)) {
+    const roles = roleExt.filter((r): r is string => typeof r === 'string' && r.trim().length > 0).map(r => r.trim())
+    if (roles.length > 0) return `role:${roles.slice(0, 4).join(',')}`.slice(0, 120)
+  } else if (typeof roleExt === 'string' && roleExt.trim()) {
+    return `role:${roleExt.trim()}`.slice(0, 120)
+  }
+  if (op['x-auth-required'] === true) return 'auth_required'
+  for (const rawParam of opParams) {
+    const rec = resolveNode(rawParam)
+    if (!rec) continue
+    const inRaw = typeof rec.in === 'string' ? rec.in.toLowerCase() : ''
+    const name = typeof rec.name === 'string' ? rec.name.trim() : ''
+    if (inRaw === 'header' && OPENAPI_AUTH_HEADER_RE.test(name) && rec.required === true) {
+      return `header:${name.toLowerCase()}`
+    }
+  }
+  return null
+}
+
+/** Extract structured `RuntimeSpaRoute[]` summaries from a harvested JS bundle + router table. */
+export function extractRuntimeSpaRoutesFromJs(
+  code: string,
+  harvested: {
+    routes?: Array<{ path?: string }>
+    adminPaths?: string[]
+    apiPaths?: string[]
+    httpCalls?: Array<{ url?: string; method?: string; bodyKeys?: string[] }>
+  },
+  origin: string,
+  pagePath?: string,
+): RuntimeSpaRoute[] {
+  const apiCalls: Array<{ method: string; path: string; surface: ReturnType<typeof classifySurface>; serviceOrigin?: string }> = []
+  const seenCall = new Set<string>()
+  const pushCall = (method: string, rawUrl: string): void => {
+    if (apiCalls.length >= 24) return
+    let callOrigin: string | undefined
+    let cleanPath: string | null = null
+    if (/^https?:\/\//i.test(rawUrl.trim())) {
+      try {
+        const parsed = new URL(rawUrl.trim())
+        callOrigin = parsed.origin
+        cleanPath = normalizeDiscoveryTemplate(parsed.pathname || '/')
+      } catch { /* ignore */ }
+    } else {
+      const clean = sanitizePathCandidate(rawUrl, origin)
+      if (clean && !STATIC_ASSET_RE.test(clean)) cleanPath = normalizeDiscoveryTemplate(clean.split('?')[0] || '/')
+    }
+    if (!cleanPath || cleanPath === '/') return
+    const upper = (method || 'GET').toUpperCase()
+    const key = `${callOrigin ?? origin}|${upper}|${cleanPath}`
+    if (seenCall.has(key)) return
+    seenCall.add(key)
+    apiCalls.push({
+      method: upper,
+      path: cleanPath,
+      surface: classifySurface(cleanPath, upper),
+      ...(callOrigin && callOrigin !== origin ? { serviceOrigin: callOrigin } : {}),
+    })
+  }
+
+  for (const call of harvested.httpCalls ?? []) {
+    if (call.url) pushCall(call.method || 'GET', call.url)
+  }
+  for (const p of harvested.apiPaths ?? []) {
+    if (/^\/(?:api|rest|graphql|trpc|v\d+|internal|admin)\b/i.test(p)) pushCall('GET', p)
+  }
+  for (const spec of harvestJsRequestParams(code).slice(0, 24)) {
+    pushCall(spec.method, spec.path)
+  }
+
+  const bundleRoles = new Set<string>()
+  for (const re of SPA_ROLE_GUARD_PATTERNS) {
+    re.lastIndex = 0
+    for (const m of code.matchAll(re)) {
+      if (m[1]) {
+        for (const token of m[1].split(',')) {
+          const clean = token.replace(/["'`\s]/g, '').trim()
+          if (clean && clean.length <= 32) bundleRoles.add(clean)
+        }
+      } else if (m[0]) {
+        const lower = m[0].toLowerCase()
+        if (lower.includes('owner')) bundleRoles.add('owner')
+        else if (lower.includes('staff')) bundleRoles.add('staff')
+        else bundleRoles.add('admin')
+      }
+      if (bundleRoles.size >= 8) break
+    }
+  }
+
+  const stateActions = new Set<string>()
+  SPA_LIFECYCLE_ACTION_RE.lastIndex = 0
+  for (const m of code.matchAll(SPA_LIFECYCLE_ACTION_RE)) {
+    if (m[1]) stateActions.add(m[1].toLowerCase())
+    if (stateActions.size >= 16) break
+  }
+
+  const candidateRoutes = new Set<string>()
+  for (const r of harvested.routes ?? []) {
+    if (r.path) candidateRoutes.add(r.path)
+  }
+  for (const p of harvested.adminPaths ?? []) candidateRoutes.add(p)
+  for (const p of harvestJsRouteTable(code).slice(0, 24)) candidateRoutes.add(p)
+  if (candidateRoutes.size === 0 && pagePath && (apiCalls.length > 0 || stateActions.size > 0 || bundleRoles.size > 0)) {
+    candidateRoutes.add(pagePath)
+  }
+
+  const out: RuntimeSpaRoute[] = []
+  const seenRoute = new Set<string>()
+  for (const rawRoute of candidateRoutes) {
+    if (out.length >= 24) break
+    const clean = sanitizePathCandidate(rawRoute, origin)
+    if (!clean || STATIC_ASSET_RE.test(clean)) continue
+    const routePath = normalizeDiscoveryTemplate(clean.split('?')[0] || '/')
+    if (seenRoute.has(routePath)) continue
+    seenRoute.add(routePath)
+    // Skip pure API routes when we have UI routes, unless they carry role/lifecycle cues.
+    const isAdminOrPriv = isPrivilegedPathTemplate(routePath)
+    const routeRoles = new Set<string>()
+    if (isAdminOrPriv) {
+      if (bundleRoles.size > 0) for (const role of bundleRoles) routeRoles.add(role)
+      else routeRoles.add('admin')
+    } else if (bundleRoles.size > 0 && apiCalls.length > 0) {
+      for (const role of bundleRoles) routeRoles.add(role)
+    }
+    const matchingCalls = apiCalls.filter(c =>
+      c.serviceOrigin
+      || c.path === routePath
+      || routePath === '/'
+      || isAdminOrPriv
+      || c.path.toLowerCase().includes((routePath.split('/').filter(Boolean)[0] ?? '').toLowerCase()),
+    )
+    const attachedCalls = (matchingCalls.length > 0 ? matchingCalls : apiCalls).slice(0, 6)
+    const routeActions = [...stateActions].slice(0, 8)
+    if (attachedCalls.length === 0 && routeActions.length === 0 && routeRoles.size === 0) continue
+    out.push({
+      path: routePath,
+      serviceOrigin: origin,
+      ...(attachedCalls.length > 0 ? { apiCalls: attachedCalls } : {}),
+      ...(routeActions.length > 0 ? { stateActions: routeActions } : {}),
+      ...(routeRoles.size > 0 ? { requiredRoles: [...routeRoles] } : {}),
+    })
+  }
+  return out
+}
+
+/** Extract `RuntimeGraphqlField[]` summaries from JS-harvested GraphQL documents. */
+export function extractRuntimeGraphqlFieldsFromJs(
+  graphqlDocs: ReadonlyArray<{ kind?: string; name?: string; fields?: string[]; preview?: string }>,
+): RuntimeGraphqlField[] {
+  const out: RuntimeGraphqlField[] = []
+  const seen = new Set<string>()
+  for (const doc of graphqlDocs) {
+    const rawKind = (doc.kind ?? '').toLowerCase()
+    if (rawKind !== 'query' && rawKind !== 'mutation' && rawKind !== 'subscription') continue
+    const kind = rawKind as RuntimeGraphqlField['kind']
+    const args: string[] = []
+    if (typeof doc.preview === 'string') {
+      for (const m of doc.preview.matchAll(/\$([A-Za-z_][A-Za-z0-9_]{0,48})/g)) {
+        if (m[1] && !args.includes(m[1])) args.push(m[1])
+      }
+    }
+    const fieldNames = Array.isArray(doc.fields) && doc.fields.length > 0
+      ? doc.fields
+      : doc.name ? [doc.name] : []
+    for (const rawName of fieldNames.slice(0, 12)) {
+      const name = String(rawName).trim()
+      if (!name || name.startsWith('__')) continue
+      const key = `${kind}:${name}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push({
+        name,
+        kind,
+        ...(args.length > 0 ? { args: args.slice(0, 12) } : {}),
+      })
+    }
+  }
+  return out
+}
+
+/** Convert parsed GraphQL introspection / SDL schema into a `RuntimeGraphqlCatalog`. */
+export function buildRuntimeGraphqlCatalogFromSchema(
+  schema: ReturnType<typeof parseGraphqlIntrospection>,
+  endpoint: string,
+  serviceOrigin: string,
+  options: { defaultRequiresAuth?: boolean } = {},
+): RuntimeGraphqlCatalog {
+  const fields: RuntimeGraphqlField[] = []
+  const seen = new Set<string>()
+  const pushRoot = (typeName: string | null | undefined, kind: RuntimeGraphqlField['kind']) => {
+    if (!typeName) return
+    for (const field of (schema.types[typeName] ?? []).slice(0, 64)) {
+      const key = `${kind}:${field.name}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      const privileged = GQL_PRIVILEGED_FIELD_RE.test(field.name)
+      fields.push({
+        name: field.name,
+        kind,
+        ...(field.args.length > 0 ? { args: field.args.map(a => a.name).slice(0, 16) } : {}),
+        ...(field.returnTypeName ? { returnType: field.returnTypeName } : {}),
+        ...(options.defaultRequiresAuth ? { requiresAuth: true } : {}),
+        ...(privileged && kind === 'mutation' ? { requiredRole: 'admin' } : {}),
+      })
+    }
+  }
+  pushRoot(schema.queryType, 'query')
+  pushRoot(schema.mutationType, 'mutation')
+  if (schema.types.Subscription) pushRoot('Subscription', 'subscription')
+  return {
+    endpoint,
+    serviceOrigin,
+    fields,
+  }
+}
+
 export function parseOpenApiDoc(
   rawBody: string,
   origin: string,
@@ -2847,7 +3140,7 @@ export function parseOpenApiDoc(
   scopeRevision: number,
   dynamicPaths: Set<string>,
   dynamicParams: Set<string>,
-): { endpoints: number; params: number; operations: Array<{ method: string; pathTemplate: string }> } {
+): { endpoints: number; params: number; operations: ParsedOpenApiOperation[] } {
   const parsed = parseJsonOrYaml(rawBody)
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { endpoints: 0, params: 0, operations: [] }
   const doc = parsed as Record<string, unknown>
@@ -2855,8 +3148,9 @@ export function parseOpenApiDoc(
   if (!pathsObj || typeof pathsObj !== 'object' || Array.isArray(pathsObj)) return { endpoints: 0, params: 0, operations: [] }
   let endpoints = 0
   let params = 0
-  const operations: Array<{ method: string; pathTemplate: string }> = []
+  const operations: ParsedOpenApiOperation[] = []
   const validMethods = new Set(['get', 'post', 'put', 'patch', 'delete', 'head', 'options'])
+  const docDefaultSecurity = normalizeOpenApiSecurity(doc.security)
 
   // OpenAPI `servers[].url` / Swagger 2 `basePath` may carry a deployment prefix.
   let basePrefix = ''
@@ -3026,6 +3320,18 @@ export function parseOpenApiDoc(
     for (const [mKey, opVal] of Object.entries(pathItem)) {
       if (!validMethods.has(mKey.toLowerCase())) continue
       const method = mKey.toUpperCase()
+      const op = resolveNode(opVal) ?? {}
+      const opParams = [...pathLevelParams, ...(Array.isArray(op.parameters) ? op.parameters : [])]
+      const effectiveSecurity = op.security !== undefined
+        ? normalizeOpenApiSecurity(op.security)
+        : docDefaultSecurity
+      const authRequirement = deriveOpenApiAuthRequirement(effectiveSecurity, op, opParams, resolveNode)
+      const operationId = typeof op.operationId === 'string' && op.operationId.trim()
+        ? op.operationId.trim().slice(0, 120)
+        : undefined
+      const tags = Array.isArray(op.tags)
+        ? op.tags.filter((t): t is string => typeof t === 'string' && t.trim().length > 0).map(t => t.trim()).slice(0, 8)
+        : undefined
       const ep = storage.upsertEndpoint({
         runId,
         scopeRevision,
@@ -3033,14 +3339,29 @@ export function parseOpenApiDoc(
         method,
         pathTemplate,
         source: 'openapi',
+        ...(authRequirement !== null ? { authRequirement } : {}),
         riskScore: scoreEndpointRisk(method, pathTemplate),
       })
       endpoints += 1
-      operations.push({ method, pathTemplate })
-      const op = resolveNode(opVal) ?? {}
-      const opParams = [...pathLevelParams, ...(Array.isArray(op.parameters) ? op.parameters : [])]
       const declared = new Set<string>()
+      const requestBodyKeys: string[] = []
+      const collectBodyKeys = (schemaNode: unknown, depth = 0): void => {
+        if (depth > 2 || requestBodyKeys.length >= 24) return
+        const schema = resolveNode(schemaNode)
+        if (!schema) return
+        if (isRecord(schema.properties)) {
+          for (const key of Object.keys(schema.properties)) {
+            if (key && !requestBodyKeys.includes(key) && requestBodyKeys.length < 24) requestBodyKeys.push(key)
+          }
+        }
+        if (Array.isArray(schema.allOf)) {
+          for (const branch of schema.allOf) collectBodyKeys(branch, depth + 1)
+        }
+      }
       for (const rawParam of opParams) {
+        const rec = resolveNode(rawParam)
+        const inRaw = typeof rec?.in === 'string' ? rec.in.toLowerCase() : ''
+        if (inRaw === 'body' || inRaw === 'formdata') collectBodyKeys(rec?.schema ?? rec)
         const name = addParameterRecord(rawParam, ep.id)
         if (name) declared.add(name)
       }
@@ -3057,6 +3378,7 @@ export function parseOpenApiDoc(
         if (!location) continue
         const media = resolveNode(mediaNode)
         if (!media) continue
+        collectBodyKeys(media.schema)
         addSchemaParams(media.schema, location, ep.id)
       }
       // OpenAPI path template placeholders that were not declared as parameters.
@@ -3066,6 +3388,16 @@ export function parseOpenApiDoc(
         declared.add(name)
         addParam(ep.id, name, 'path')
       }
+      operations.push({
+        method,
+        pathTemplate,
+        ...(operationId ? { operationId } : {}),
+        ...(effectiveSecurity !== undefined ? { security: effectiveSecurity } : {}),
+        ...(authRequirement !== null ? { authRequirement } : {}),
+        ...(declared.size > 0 ? { parameters: [...declared].slice(0, 24) } : {}),
+        ...(requestBodyKeys.length > 0 ? { requestBodyKeys } : {}),
+        ...(tags && tags.length > 0 ? { tags } : {}),
+      })
     }
   }
   return { endpoints, params, operations }
@@ -3204,6 +3536,10 @@ export type DeclaredSurfaceSummary = {
   declaredOpsMatched: number
   /** Malformed references whose tolerant scan was truncated by the safety cap. */
   declaredTolerantCapped: number
+  /** Parsed OpenAPI operations (preserving `security` & `operationId`) for runtime invariant synthesis. */
+  openApiOperations?: RuntimeOpenApiOperation[]
+  /** Parsed GraphQL SDL catalogs from project specs. */
+  graphqlCatalogs?: RuntimeGraphqlCatalog[]
 }
 
 /**
@@ -3260,6 +3596,27 @@ export function ingestDeclaredApiSurface(input: {
 
   for (const [specIndex, spec] of specs.slice(0, 6).entries()) {
     const head = spec.content.slice(0, 400)
+    if (spec.kind === 'graphql' || /\btype\s+(?:Query|Mutation|Subscription)\s*\{/.test(spec.content)) {
+      try {
+        const schema = parseGraphqlSdl(spec.content)
+        const catalog = buildRuntimeGraphqlCatalogFromSchema(schema, '/graphql', origin)
+        if (catalog.fields.length > 0) {
+          result.graphqlCatalogs = [...(result.graphqlCatalogs ?? []), catalog]
+          storage.upsertEndpoint({
+            runId,
+            scopeRevision,
+            origin,
+            method: 'POST',
+            pathTemplate: '/graphql',
+            source: 'graphql',
+            framework: 'graphql',
+            riskScore: 85,
+          })
+          noteDeclared('POST', '/graphql')
+        }
+      } catch { /* ignore malformed SDL */ }
+      if (spec.kind === 'graphql') continue
+    }
     const looksOpenApi = /openapi|swagger/i.test(spec.kind)
       || /"(?:openapi|swagger)"\s*:/.test(head)
       || /^\s*openapi\s*:/m.test(head)
@@ -3269,7 +3626,22 @@ export function ingestDeclaredApiSurface(input: {
     result.params += parsed.params
     if (parsed.endpoints > 0) {
       // Lossless path: no operation cap. Enumerate exactly what the parser persisted.
-      for (const op of parsed.operations) noteDeclared(op.method, op.pathTemplate)
+      const collected = result.openApiOperations ?? []
+      for (const op of parsed.operations) {
+        noteDeclared(op.method, op.pathTemplate)
+        collected.push({
+          method: op.method,
+          path: op.pathTemplate,
+          serviceOrigin: origin,
+          ...(op.operationId ? { operationId: op.operationId } : {}),
+          ...(op.security !== undefined ? { security: op.security } : {}),
+          ...(op.authRequirement !== undefined ? { authRequirement: op.authRequirement } : {}),
+          ...(op.parameters ? { parameters: op.parameters } : {}),
+          ...(op.requestBodyKeys ? { requestBodyKeys: op.requestBodyKeys } : {}),
+          ...(op.tags ? { tags: op.tags } : {}),
+        })
+      }
+      result.openApiOperations = collected
       continue
     }
     // Stored references can be truncated or carry a redaction placeholder, so JSON/YAML parsing
@@ -3374,6 +3746,79 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   const techFingerprint = new Set<string>()
   const dynamicPaths = new Set<string>()
   const dynamicParams = new Set<string>()
+  // Structured runtime catalogs for grey-box / black-box InvariantSynthesizer parity.
+  const runtimeOpenApiMap = new Map<string, RuntimeOpenApiOperation>()
+  const runtimeSpaMap = new Map<string, RuntimeSpaRoute>()
+  const runtimeGraphqlMap = new Map<string, { endpoint: string; serviceOrigin: string; fields: Map<string, RuntimeGraphqlField> }>()
+  const mergeRuntimeOpenApiOp = (op: RuntimeOpenApiOperation): void => {
+    const key = `${op.serviceOrigin ?? ''}|${op.method.toUpperCase()}|${op.path}`
+    const prev = runtimeOpenApiMap.get(key)
+    if (!prev) {
+      runtimeOpenApiMap.set(key, { ...op, method: op.method.toUpperCase() })
+      return
+    }
+    runtimeOpenApiMap.set(key, {
+      ...prev,
+      ...op,
+      method: op.method.toUpperCase(),
+      operationId: op.operationId ?? prev.operationId,
+      security: op.security !== undefined ? op.security : prev.security,
+      authRequirement: op.authRequirement ?? prev.authRequirement,
+      parameters: op.parameters?.length ? op.parameters : prev.parameters,
+      requestBodyKeys: op.requestBodyKeys?.length ? op.requestBodyKeys : prev.requestBodyKeys,
+      tags: op.tags?.length ? op.tags : prev.tags,
+    })
+  }
+  const mergeRuntimeSpaRoute = (route: RuntimeSpaRoute): void => {
+    if (runtimeSpaMap.size >= 120) return
+    const key = `${route.serviceOrigin ?? ''}|${route.path}`
+    const prev = runtimeSpaMap.get(key)
+    if (!prev) {
+      runtimeSpaMap.set(key, { ...route })
+      return
+    }
+    const mergedCalls = [...(prev.apiCalls ?? [])]
+    for (const c of route.apiCalls ?? []) {
+      if (!mergedCalls.some(x => x.method === c.method && x.path === c.path && x.serviceOrigin === c.serviceOrigin) && mergedCalls.length < 12) {
+        mergedCalls.push(c)
+      }
+    }
+    const mergedActions = [...new Set([...(prev.stateActions ?? []), ...(route.stateActions ?? [])])].slice(0, 12)
+    const mergedRoles = [...new Set([...(prev.requiredRoles ?? []), ...(route.requiredRoles ?? [])])].slice(0, 8)
+    runtimeSpaMap.set(key, {
+      path: prev.path,
+      ...(prev.serviceOrigin ?? route.serviceOrigin ? { serviceOrigin: prev.serviceOrigin ?? route.serviceOrigin } : {}),
+      ...(mergedCalls.length > 0 ? { apiCalls: mergedCalls } : {}),
+      ...(mergedActions.length > 0 ? { stateActions: mergedActions } : {}),
+      ...(mergedRoles.length > 0 ? { requiredRoles: mergedRoles } : {}),
+    })
+  }
+  const mergeRuntimeGraphqlCatalog = (catalog: RuntimeGraphqlCatalog): void => {
+    const endpoint = catalog.endpoint ?? '/graphql'
+    const serviceOrigin = catalog.serviceOrigin ?? ''
+    const key = `${serviceOrigin}|${endpoint}`
+    let bucket = runtimeGraphqlMap.get(key)
+    if (!bucket) {
+      bucket = { endpoint, serviceOrigin, fields: new Map() }
+      runtimeGraphqlMap.set(key, bucket)
+    }
+    for (const field of catalog.fields) {
+      const fKey = `${field.kind}:${field.name}`
+      const prev = bucket.fields.get(fKey)
+      if (!prev) {
+        bucket.fields.set(fKey, { ...field })
+      } else {
+        bucket.fields.set(fKey, {
+          ...prev,
+          ...field,
+          args: [...new Set([...(prev.args ?? []), ...(field.args ?? [])])].slice(0, 16),
+          returnType: field.returnType ?? prev.returnType,
+          requiresAuth: prev.requiresAuth || field.requiresAuth,
+          requiredRole: field.requiredRole ?? prev.requiredRole,
+        })
+      }
+    }
+  }
   // Per-phase paged-read metrics for the discovery planning reads (nav, GraphQL, sibling derivation).
   const readPagedMetrics: PagedReadMetric[] = []
 
@@ -3591,6 +4036,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       total.declaredOpsMatched += part.declaredOpsMatched
       total.declaredTolerantCapped += part.declaredTolerantCapped
       for (const [method, count] of Object.entries(part.methods)) total.methods[method] = (total.methods[method] ?? 0) + count
+      for (const op of part.openApiOperations ?? []) mergeRuntimeOpenApiOp(op)
+      for (const cat of part.graphqlCatalogs ?? []) mergeRuntimeGraphqlCatalog(cat)
     }
     declaredSurface = total
     endpointsDiscovered += total.endpoints
@@ -4108,6 +4555,19 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         const parsed = parseOpenApiDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams)
         endpointsDiscovered += parsed.endpoints
         paramsDiscovered += parsed.params
+        for (const op of parsed.operations) {
+          mergeRuntimeOpenApiOp({
+            method: op.method,
+            path: op.pathTemplate,
+            serviceOrigin: origin,
+            ...(op.operationId ? { operationId: op.operationId } : {}),
+            ...(op.security !== undefined ? { security: op.security } : {}),
+            ...(op.authRequirement !== undefined ? { authRequirement: op.authRequirement } : {}),
+            ...(op.parameters ? { parameters: op.parameters } : {}),
+            ...(op.requestBodyKeys ? { requestBodyKeys: op.requestBodyKeys } : {}),
+            ...(op.tags ? { tags: op.tags } : {}),
+          })
+        }
         if (parsed.endpoints > 0) {
           const specDoc = parseJsonOrYaml(ex.body)
           if (specDoc && typeof specDoc === 'object') {
@@ -4251,6 +4711,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       for (const routePath of harvestJsRouteTable(ex.body).slice(0, 24)) {
         if (addJsEndpoint('GET', routePath)) jsRouterRoutes += 1
       }
+      // Emit structured SPA route summaries (route -> API calls + client roles + lifecycle actions).
+      for (const spaRoute of extractRuntimeSpaRoutesFromJs(ex.body, harvested, origin, jsPageByScript.get(jsPath))) {
+        mergeRuntimeSpaRoute(spaRoute)
+      }
       // tRPC procedures: batched GET uses a query `input`, mutations POST a JSON `input`.
       for (const proc of harvestTrpcProcedures(ex.body).slice(0, 24)) {
         const trpcPath = `/trpc/${proc.router}.${proc.procedure}`
@@ -4276,6 +4740,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
       if ((harvested.graphqlDocs?.length ?? 0) > 0) {
         recordEndpoint('POST', '/graphql', 'graphql', { framework: 'graphql', riskScore: 85 })
+        const jsGqlFields = extractRuntimeGraphqlFieldsFromJs(harvested.graphqlDocs ?? [])
+        if (jsGqlFields.length > 0) {
+          mergeRuntimeGraphqlCatalog({ endpoint: '/graphql', serviceOrigin: origin, fields: jsGqlFields })
+        }
       }
       for (const act of (harvested.nextActions ?? []).slice(0, 10)) {
         if (!act.id) continue
@@ -4851,6 +5319,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           if (schemaObj && Array.isArray((schemaObj as { types?: unknown[] }).types)) {
             const gqlEp = recordEndpoint('POST', gqlPath, 'graphql', { framework: 'graphql', riskScore: 85 })
             const schema = parseGraphqlIntrospection(schemaObj)
+            const gqlCatalog = buildRuntimeGraphqlCatalogFromSchema(schema, gqlPath, origin)
+            if (gqlCatalog.fields.length > 0) mergeRuntimeGraphqlCatalog(gqlCatalog)
             const roots = [schema.queryType, schema.mutationType].filter((t): t is string => Boolean(t))
             const args = new Set<string>()
             for (const rootType of roots) {
@@ -4947,6 +5417,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         const set = phase0Visibility.get(key) ?? new Set<string>()
         for (const handle of personas) set.add(handle)
         phase0Visibility.set(key, set)
+      }
+      for (const spaRoute of crawlRes.spaRoutes ?? []) {
+        mergeRuntimeSpaRoute(spaRoute)
       }
       // Browser traffic is accounted per accepted exchange above; page visits that produced no
       // recorded exchange still consumed a broker call.
@@ -5195,6 +5668,104 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       { endpoints: paramDiscovery.endpoints, totals: paramDiscovery.totals, sensitivity: { ...paramSensitivity } })
   }
 
+  const runtimeSpaRoutes = [...runtimeSpaMap.values()].slice(0, 80)
+  const runtimeGraphqlCatalogs: RuntimeGraphqlCatalog[] = [...runtimeGraphqlMap.values()]
+    .filter(entry => entry.fields.size > 0)
+    .map(entry => ({
+      endpoint: entry.endpoint,
+      ...(entry.serviceOrigin ? { serviceOrigin: entry.serviceOrigin } : {}),
+      fields: [...entry.fields.values()].slice(0, 80),
+    }))
+  const runtimeOpenApiOperations = [...runtimeOpenApiMap.values()].slice(0, 200)
+
+  if (runtimeSpaRoutes.length > 0 || runtimeGraphqlCatalogs.length > 0 || runtimeOpenApiOperations.length > 0) {
+    storage.event(
+      runId,
+      'phase0.runtime_catalog',
+      `Phase-0 runtime catalog: ${runtimeSpaRoutes.length} SPA route(s), ${runtimeGraphqlCatalogs.reduce((sum, c) => sum + c.fields.length, 0)} GraphQL field(s) across ${runtimeGraphqlCatalogs.length} catalog(s), ${runtimeOpenApiOperations.length} OpenAPI op(s).`,
+      {
+        spaRoutes: runtimeSpaRoutes.length,
+        graphqlCatalogs: runtimeGraphqlCatalogs.length,
+        graphqlFields: runtimeGraphqlCatalogs.reduce((sum, c) => sum + c.fields.length, 0),
+        openApiOperations: runtimeOpenApiOperations.length,
+      },
+    )
+    // Persist bounded summary facts so `collectRuntimeDiscoveryInput` / `extractRuntimeCatalogFromFacts`
+    // can feed SPA routes, GraphQL catalogs, and OpenAPI security/operationId metadata directly into
+    // `inferRuntimeInvariantHypotheses` both pre-floor and post-Phase-A-floor.
+    try {
+      const runRow = storage.run(runId)
+      const assignmentRow = params.assignmentId
+        ? storage.worker(params.assignmentId)
+        : undefined
+      if (runRow && assignmentRow) {
+        const primaryOrigin = normalizedOrigins[0] ?? assignmentRow.sourceOrigins[0]
+        if (runtimeSpaRoutes.length > 0 && primaryOrigin) {
+          const spaByOrigin = new Map<string, RuntimeSpaRoute[]>()
+          for (const route of runtimeSpaRoutes) {
+            const routeOrigin = route.serviceOrigin ?? primaryOrigin
+            const bucket = spaByOrigin.get(routeOrigin) ?? []
+            bucket.push(route)
+            spaByOrigin.set(routeOrigin, bucket)
+          }
+          for (const [routeOrigin, routes] of spaByOrigin) {
+            storage.addFact(runRow, assignmentRow, {
+              kind: 'note',
+              origin: routeOrigin,
+              summary: `Phase-0 runtime SPA route catalog (${routes.length} route(s)) on ${routeOrigin}.`,
+              data: {
+                subkind: 'runtime_spa_routes',
+                origin: routeOrigin,
+                spaRoutes: routes.slice(0, 40),
+              },
+              sourceOrigins: [routeOrigin],
+            })
+          }
+        }
+        for (const catalog of runtimeGraphqlCatalogs) {
+          const gqlOrigin = catalog.serviceOrigin ?? primaryOrigin
+          if (!gqlOrigin) continue
+          storage.addFact(runRow, assignmentRow, {
+            kind: 'note',
+            origin: gqlOrigin,
+            summary: `Phase-0 runtime GraphQL catalog (${catalog.fields.length} field(s) at ${catalog.endpoint ?? '/graphql'}) on ${gqlOrigin}.`,
+            data: {
+              subkind: 'runtime_graphql_catalog',
+              origin: gqlOrigin,
+              graphqlCatalog: catalog,
+            },
+            sourceOrigins: [gqlOrigin],
+          })
+        }
+        const openApiWithMeta = runtimeOpenApiOperations.filter(op =>
+          op.operationId || op.security !== undefined || op.authRequirement !== undefined,
+        )
+        if (openApiWithMeta.length > 0 && primaryOrigin) {
+          const opsByOrigin = new Map<string, RuntimeOpenApiOperation[]>()
+          for (const op of openApiWithMeta) {
+            const opOrigin = op.serviceOrigin ?? primaryOrigin
+            const bucket = opsByOrigin.get(opOrigin) ?? []
+            bucket.push(op)
+            opsByOrigin.set(opOrigin, bucket)
+          }
+          for (const [opOrigin, ops] of opsByOrigin) {
+            storage.addFact(runRow, assignmentRow, {
+              kind: 'note',
+              origin: opOrigin,
+              summary: `Phase-0 runtime OpenAPI catalog (${ops.length} operation(s) with security/operationId metadata) on ${opOrigin}.`,
+              data: {
+                subkind: 'runtime_openapi_catalog',
+                origin: opOrigin,
+                openApiOperations: ops.slice(0, 120),
+              },
+              sourceOrigins: [opOrigin],
+            })
+          }
+        }
+      }
+    } catch { /* structured catalog fact persistence is best-effort */ }
+  }
+
   storage.event(runId, 'phase0.discovery', 'Phase-0 discovery counts.', {
     requestsUsed,
     perOriginCap,
@@ -5241,6 +5812,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     ...(siblingDerivationSuppressed ? { siblingDerivationSuppressed } : {}),
     ...(privilegedSurface.length > 0 ? { privilegedEndpoints: privilegedSurface } : {}),
     ...(staticSnapshot ? { staticSnapshot } : {}),
+    ...(runtimeSpaRoutes.length > 0 ? { runtimeSpaRoutes } : {}),
+    ...(runtimeGraphqlCatalogs.length > 0 ? { runtimeGraphqlCatalogs } : {}),
+    ...(runtimeOpenApiOperations.length > 0 ? { runtimeOpenApiOperations } : {}),
   }
 }
 
@@ -5286,6 +5860,42 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
   let stoppedReason: string | undefined
   const visibility = new Map<string, Set<string>>()
   const privilegedByKey = new Map<string, { method: string; pathTemplate: string; personas: string[]; reason: string }>()
+  const crawlSpaMap = new Map<string, {
+    apiCalls: Map<string, { method: string; path: string; surface: ReturnType<typeof classifySurface>; serviceOrigin?: string }>
+    stateActions: Set<string>
+    personas: Set<string>
+  }>()
+  const noteCrawlSpaPage = (
+    pageTemplate: string,
+    who: string,
+    call?: { method: string; path: string; serviceOrigin?: string },
+    actionText?: string,
+  ): void => {
+    let entry = crawlSpaMap.get(pageTemplate)
+    if (!entry) {
+      if (crawlSpaMap.size >= 48) return
+      entry = { apiCalls: new Map(), stateActions: new Set(), personas: new Set() }
+      crawlSpaMap.set(pageTemplate, entry)
+    }
+    entry.personas.add(who)
+    if (call && entry.apiCalls.size < 10) {
+      const key = `${call.serviceOrigin ?? normalizedOrigin}|${call.method}|${call.path}`
+      if (!entry.apiCalls.has(key)) {
+        entry.apiCalls.set(key, {
+          method: call.method,
+          path: call.path,
+          surface: classifySurface(call.path, call.method),
+          ...(call.serviceOrigin && call.serviceOrigin !== normalizedOrigin ? { serviceOrigin: call.serviceOrigin } : {}),
+        })
+      }
+    }
+    if (actionText) {
+      SPA_LIFECYCLE_ACTION_RE.lastIndex = 0
+      for (const m of actionText.matchAll(SPA_LIFECYCLE_ACTION_RE)) {
+        if (m[1] && entry.stateActions.size < 10) entry.stateActions.add(m[1].toLowerCase())
+      }
+    }
+  }
 
   // Intercepted-query, Next-Action and persona-union lookups must see the whole stored surface.
   // `storage.listEndpoints(runId, { origin })` pages at the store default (500 rows) and silently
@@ -5515,6 +6125,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
         riskScore: scoreEndpointRisk('GET', routeTemplate),
       }))
       tagVisibility('GET', routeTemplate, who)
+      noteCrawlSpaPage(routeTemplate, who, undefined, routeTemplate)
       endpointsDiscovered += 1
 
       // Record query params from URL
@@ -5620,6 +6231,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
           riskScore: scoreEndpointRisk(shape.method, tmpl),
         }))
         tagVisibility(shape.method, tmpl, who)
+        noteCrawlSpaPage(routeTemplate, who, { method: shape.method, path: tmpl }, tmpl)
         endpointsDiscovered += 1
         for (const p of shape.params) {
           storage.upsertEndpointParam({
@@ -5768,6 +6380,28 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
       crawlPagedMetric)
   }
 
+  const spaRoutes: RuntimeSpaRoute[] = []
+  for (const [pagePath, entry] of crawlSpaMap) {
+    const apiCalls = [...entry.apiCalls.values()]
+    const stateActions = [...entry.stateActions]
+    const personas = [...entry.personas]
+    const rolePersonas = personas.filter(p => p !== 'anonymous')
+    const requiredRoles: string[] = []
+    if (rolePersonas.length > 0 && !personas.includes('anonymous')) {
+      for (const handle of rolePersonas) requiredRoles.push(handle)
+    } else if (isPrivilegedPathTemplate(pagePath)) {
+      requiredRoles.push('admin')
+    }
+    if (apiCalls.length === 0 && stateActions.length === 0 && requiredRoles.length === 0) continue
+    spaRoutes.push({
+      path: pagePath,
+      serviceOrigin: normalizedOrigin,
+      ...(apiCalls.length > 0 ? { apiCalls } : {}),
+      ...(stateActions.length > 0 ? { stateActions } : {}),
+      ...(requiredRoles.length > 0 ? { requiredRoles } : {}),
+    })
+  }
+
   return {
     origin: normalizedOrigin,
     pagesVisited,
@@ -5780,6 +6414,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
     visibleToPersonas,
     ...(crawlPagedMetric.reads > 0 ? { crawlPaged: { ...crawlPagedMetric } } : {}),
     ...(privilegedEndpoints.length > 0 ? { privilegedEndpoints } : {}),
+    ...(spaRoutes.length > 0 ? { spaRoutes } : {}),
     ...(stoppedReason ? { stoppedReason } : {}),
   }
 }
