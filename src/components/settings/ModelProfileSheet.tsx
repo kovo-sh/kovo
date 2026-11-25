@@ -176,7 +176,7 @@ export function ModelProfileSheet({
                 }
                 const input = element.elements.namedItem('key') as HTMLInputElement | null
                 if (input) input.value = ''
-                await onSaved(editing ? 'Model profile updated.' : 'Model profile added to failover pool.')
+                await onSaved(editing ? 'Model profile updated.' : 'Model profile added.')
               },
             )
           }}
@@ -255,7 +255,9 @@ export function ModelProfileSheet({
                     autoFocus
                     placeholder="sk-or-v1-..."
                   />
-                  <small>Stored locally in 0600 credential files; never returned to the browser or target containers.</small>
+                  <small title="Saved locally in owner-only (0600) credential files">
+                    Stored privately on your machine; never returned to the browser or target environments.
+                  </small>
                 </label>
 
                 <details className="sw-details">
@@ -295,9 +297,9 @@ export function ModelProfileSheet({
                         type="checkbox"
                         name="enabled"
                         defaultChecked
-                        aria-label="Enable this profile in the failover pool"
+                        aria-label="Enable this profile for automatic failover"
                       />
-                      Enable this profile in the failover pool
+                      Enable this profile for automatic failover
                     </label>
 
                     <div className="sw-grid-3">
@@ -446,7 +448,9 @@ export function ModelProfileSheet({
                     autoComplete="off"
                     placeholder={isEditing ? 'Leave blank to keep existing API key' : 'Enter your provider key'}
                   />
-                  <small>Stored locally in 0600 credential files; never returned to the browser or target containers.</small>
+                  <small title="Saved locally in owner-only (0600) credential files">
+                    Stored privately on your machine; never returned to the browser or target environments.
+                  </small>
                 </label>
 
                 <label className="sw-chk">
@@ -454,9 +458,9 @@ export function ModelProfileSheet({
                     type="checkbox"
                     name="enabled"
                     defaultChecked={defaults.enabled}
-                    aria-label="Enable this profile in the failover pool"
+                    aria-label="Enable this profile for automatic failover"
                   />
-                  Enable this profile in the failover pool
+                  Enable this profile for automatic failover
                 </label>
 
                 <button
@@ -559,7 +563,7 @@ export function ModelProfileSheet({
 
           <div className="sw-modal-f">
             <span className="sw-muted" style={{ fontSize: '11.5px' }}>
-              Failover triggers only before a turn emits output.
+              Automatic failover only switches providers before a response begins streaming.
             </span>
             <div className="sw-modal-f-acts">
               <button type="button" className="sw-btn ghost" disabled={action.pending} onClick={onClose}>

@@ -12,10 +12,10 @@ import {
   syncGithubRepositories,
 } from '../../actions.ts'
 import { maxSpecBytes } from '../../domain.ts'
-import { FormError, timeText, useAction } from '../common.tsx'
+import { formatHumanTime, FormError, useAction } from '../common.tsx'
 import { Checkbox } from '../ui/checkbox.tsx'
 import type { DiscoveredGithubRepo, ProjectLoaderData } from './types.ts'
-import { formatGithubPatBadge, formatIsoDay, safeHost } from './types.ts'
+import { safeHost } from './types.ts'
 
 interface Props {
   data: ProjectLoaderData
@@ -27,6 +27,31 @@ interface ActiveDeviceFlow {
   verificationUri: string
   expiresIn: number
   intervalSec: number
+}
+
+function SourcesEmptyIllustration() {
+  return (
+    <svg
+      width="180"
+      height="88"
+      viewBox="0 0 180 88"
+      fill="none"
+      aria-hidden="true"
+      style={{ display: 'block', color: 'var(--pw-fg)' }}
+    >
+      <rect x="6" y="8" width="168" height="72" rx="10" fill="var(--pw-sunk)" stroke="var(--pw-line-2)" strokeWidth="1.2" />
+      <rect x="22" y="22" width="46" height="44" rx="6" fill="var(--pw-panel)" stroke="var(--pw-line-strong)" strokeWidth="1.2" />
+      <circle cx="34" cy="34" r="3" fill="var(--pw-accent)" />
+      <circle cx="34" cy="54" r="3" fill="var(--pw-panel)" stroke="var(--pw-accent)" strokeWidth="1.4" />
+      <circle cx="52" cy="44" r="3" fill="var(--pw-panel)" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M34 37v14M37 35.5c5 0 6 8.5 12 8.5" stroke="var(--pw-accent)" strokeWidth="1.4" strokeLinecap="round" />
+      <path d="M74 44h30" stroke="var(--pw-line-strong)" strokeWidth="1.4" strokeLinecap="round" strokeDasharray="3 3" />
+      <path d="M99 39.5 104.5 44 99 48.5" stroke="var(--pw-accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      <rect x="112" y="22" width="46" height="44" rx="6" fill="var(--pw-panel)" stroke="var(--pw-accent)" strokeWidth="1.4" />
+      <path d="M122 34h26M122 43h18M122 52h22" stroke="var(--pw-fg-3)" strokeWidth="1.5" strokeLinecap="round" />
+      <circle cx="147" cy="43" r="2.2" fill="var(--pw-accent)" />
+    </svg>
+  )
 }
 
 async function copyCodeToClipboard(text: string): Promise<boolean> {
@@ -44,7 +69,12 @@ function formatGithubConnectionBadge(status: ProjectLoaderData['githubPatStatus'
   if (status.authKind === 'github_app_device') {
     return status.login ? `Connected via GitHub App · @${status.login}` : 'Connected via GitHub App'
   }
-  return formatGithubPatBadge(status)
+  const kindLabel = status.tokenKind === 'fine_grained'
+    ? 'Read-only token'
+    : status.tokenKind === 'classic'
+      ? 'Classic token'
+      : 'GitHub token'
+  return status.source === 'fixture' ? `${kindLabel} · local preset` : `${kindLabel} saved`
 }
 
 export function ProjectSourcesTab({ data }: Props) {
@@ -137,7 +167,7 @@ export function ProjectSourcesTab({ data }: Props) {
     if (deviceFlowStarting || githubAction.pending) return
     const trimmedClientId = clientIdInput.trim()
     if (!githubPatStatus.githubDeviceFlowConfigured && trimmedClientId.length < 6) {
-      setDeviceFlowError('Enter your GitHub App Client ID (or set GUARDIAN_GITHUB_CLIENT_ID) to start sign-in.')
+      setDeviceFlowError('Enter your GitHub App Client ID to start sign-in.')
       return
     }
     setDeviceFlowStarting(true)
@@ -238,7 +268,9 @@ export function ProjectSourcesTab({ data }: Props) {
             {formatGithubConnectionBadge(githubPatStatus)}
           </span>
         </div>
-        <p>Optional read-only GitHub sync for grey-box code, schema, and CVE context. Credentials stay in your local 0600 vault and are never echoed back.</p>
+        <p title="Credentials are stored locally in an owner-only (0600) credential file and never echoed back">
+          Optional read-only GitHub sync for source code, API schemas, and dependency checks. Credentials stay stored privately on your machine and are never shown again.
+        </p>
       </div>
       {githubPatStatus.configured && <div className="pw-sec-actions">
         <button
@@ -277,8 +309,12 @@ export function ProjectSourcesTab({ data }: Props) {
       <div className="pw-sheet-b pw-gh-device">
         {!deviceFlow ? (
           <>
-            <p className="muted" style={{ margin: 0, fontSize: 12 }}>
-              Authorize Kovo Hunter via GitHub App Device Flow (<code>Contents: Read-only</code>, <code>Metadata: Read-only</code>). Expiring tokens rotate automatically in your local <code>0600</code> vault.
+            <p
+              className="muted"
+              style={{ margin: 0, fontSize: 12 }}
+              title="Uses GitHub App Device Flow (Contents: Read-only, Metadata: Read-only) with automatic refresh in a local 0600 file"
+            >
+              Sign in to Kovo Hunter with read-only GitHub App access (code and metadata only). Expiring tokens refresh automatically and stay stored privately on your machine.
             </p>
             {!githubPatStatus.githubDeviceFlowConfigured && (
               <label className="pw-fld">
@@ -294,8 +330,11 @@ export function ProjectSourcesTab({ data }: Props) {
                     disabled={deviceFlowStarting || githubAction.pending}
                   />
                 </div>
-                <span className="hint">
-                  Or set <code>GUARDIAN_GITHUB_CLIENT_ID</code> in the server environment for 1-click sign-in. Saved locally with <code>0600</code> permissions.
+                <span
+                  className="hint"
+                  title="Server administrators can set GUARDIAN_GITHUB_CLIENT_ID in the environment for one-click sign-in. Saved locally with 0600 permissions."
+                >
+                  Entered once for one-click GitHub sign-in and stored privately on your machine.
                 </span>
               </label>
             )}
@@ -361,13 +400,13 @@ export function ProjectSourcesTab({ data }: Props) {
         {deviceFlowError && <p role="alert" className="err" style={{ margin: 0 }}>{deviceFlowError}</p>}
 
         <details className="pw-disclosure" style={{ marginTop: 4 }}>
-          <summary>Or connect with a Fine-Grained PAT</summary>
+          <summary>Or connect with a read-only GitHub token</summary>
           <div className="pw-disclosure-body">
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
               <ol className="pw-steps" style={{ flex: 1 }}>
-                <li>Under <strong>Repository access</strong>, choose <strong>Only select repositories</strong> and pick the repos you want Guardian to inspect.</li>
+                <li>Under <strong>Repository access</strong>, choose <strong>Only select repositories</strong> and pick the repos you want Kovo Hunter to inspect.</li>
                 <li>Under <strong>Repository permissions</strong>, set <strong>Contents: Read-only</strong>.</li>
-                <li>Click <strong>Generate token</strong> and paste it below — stored in your local <code>0600</code> vault.</li>
+                <li>Click <strong>Generate token</strong> and paste it below — <span title="Saved locally in an owner-only (0600) credential file">stored privately on your machine</span>.</li>
               </ol>
               <a
                 className="pw-btn"
@@ -375,7 +414,7 @@ export function ProjectSourcesTab({ data }: Props) {
                 target="_blank"
                 rel="noopener noreferrer"
               >
-                Create Fine-Grained PAT on GitHub ↗
+                Create read-only token on GitHub ↗
               </a>
             </div>
             <form
@@ -395,11 +434,11 @@ export function ProjectSourcesTab({ data }: Props) {
                   setReposLoaded(true)
                   setRepoPickerOpen(true)
                   setRepoSearch('')
-                  setGithubNotice(`Token saved to local 0600 vault. Found ${result.repos.length} accessible ${result.repos.length === 1 ? 'repository' : 'repositories'}.`)
+                  setGithubNotice(`Read-only token saved privately on your machine. Found ${result.repos.length} accessible ${result.repos.length === 1 ? 'repository' : 'repositories'}.`)
                 })
               }}
             >
-              <label className="pw-fld">GitHub Personal Access Token
+              <label className="pw-fld">Read-only GitHub access token
                 <input
                   className="pw-in mono"
                   name="githubPat"
@@ -415,7 +454,7 @@ export function ProjectSourcesTab({ data }: Props) {
               </label>
               <FormError error={githubAction.error} />
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
-                <span className="hint">Read-only access; token never leaves the local vault.</span>
+                <span className="hint">Read-only access; token stays stored privately on your machine.</span>
                 <button type="submit" className="pw-btn primary" disabled={githubAction.pending || githubTokenInput.trim().length < 10}>
                   {githubAction.pending ? 'Saving & discovering…' : 'Save token & discover repos'}
                 </button>
@@ -447,8 +486,8 @@ export function ProjectSourcesTab({ data }: Props) {
                   setRepoPickerOpen(false)
                   setRepoSearch('')
                   setGithubNotice(result.status.configured
-                    ? 'Removed saved vault credential (fallback fixture PAT is still present).'
-                    : 'Disconnected GitHub from local vault.')
+                    ? 'Removed your saved credential (a local fallback token is still active).'
+                    : 'Disconnected GitHub and removed the saved credential from this machine.')
                 })
               }}
             >
@@ -464,28 +503,24 @@ export function ProjectSourcesTab({ data }: Props) {
         </p>
 
         {githubPatStatus.source === 'fixture' && (
-          <p className="muted" style={{ margin: 0, fontSize: 11.5 }}>
-            Using fallback fixture PAT from <code>~/.config/guardian-fixtures/github.pat</code>. Click <strong>Change connection</strong> to sign in with GitHub or store a vault token instead.
+          <p
+            className="muted"
+            style={{ margin: 0, fontSize: 11.5 }}
+            title="Loaded from local fallback token file (~/.config/guardian-fixtures/github.pat)"
+          >
+            Using a local fallback GitHub token. Click <strong>Change connection</strong> to sign in with GitHub or save your own read-only token instead.
           </p>
         )}
 
         {showBroadNote && discoveredRepos.length > 0 && <div className="pw-broad-note">
           <span>
             {githubPatStatus.tokenKind === 'classic'
-              ? `Classic PAT detected (${discoveredRepos.length} accessible repos).`
+              ? `Classic GitHub token detected (${discoveredRepos.length} accessible repos).`
               : `Found ${discoveredRepos.length} accessible repos.`}{' '}
             {discoveredRepos.length > 10
               ? 'Nothing was pre-selected so you do not accidentally clone everything.'
-              : 'Consider scoping a Fine-Grained PAT or GitHub App installation to only the target repositories.'}
+              : 'Consider scoping a read-only token or GitHub App installation to only the target repositories.'}
           </span>
-          <button
-            type="button"
-            className="pw-btn"
-            disabled={githubAction.pending || filteredRepos.length === 0}
-            onClick={() => setSelectedRepos(filteredRepos.slice(0, maxSyncBatch).map(r => r.fullName))}
-          >
-            Select all{filteredRepos.length > maxSyncBatch ? ` (first ${maxSyncBatch})` : ` (${filteredRepos.length})`}
-          </button>
         </div>}
 
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -504,7 +539,7 @@ export function ProjectSourcesTab({ data }: Props) {
             disabled={githubAction.pending || filteredRepos.length === 0}
             onClick={() => setSelectedRepos(filteredRepos.slice(0, maxSyncBatch).map(r => r.fullName))}
           >
-            Select all
+            Select all{filteredRepos.length > maxSyncBatch ? ` (first ${maxSyncBatch})` : filteredRepos.length > 0 ? ` (${filteredRepos.length})` : ''}
           </button>
           <button
             type="button"
@@ -522,7 +557,7 @@ export function ProjectSourcesTab({ data }: Props) {
           <ul className="pw-repo-list" aria-label="Accessible GitHub repositories">
             {filteredRepos.map(repo => {
               const checked = selectedRepos.includes(repo.fullName)
-              const updatedLabel = formatIsoDay(repo.updatedAt)
+              const updated = formatHumanTime(repo.updatedAt)
               return <li key={repo.fullName} className="pw-repo-row">
                 <label className="pw-repo-label">
                   <Checkbox
@@ -535,7 +570,11 @@ export function ProjectSourcesTab({ data }: Props) {
                       <strong className="mono">{repo.fullName}</strong>
                       <span className="pw-tag solid">{repo.private ? 'private' : 'public'}</span>
                       <span className="pw-tag accent">{repo.defaultBranch}</span>
-                      {updatedLabel && <span className="muted" style={{ fontSize: 11.5 }}>Updated {updatedLabel}</span>}
+                      {updated.label && (
+                        <span className="muted num" style={{ fontSize: 11.5 }} title={updated.full}>
+                          Updated {updated.label}
+                        </span>
+                      )}
                     </span>
                     {repo.description && <small className="muted" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{repo.description}</small>}
                   </span>
@@ -585,38 +624,53 @@ export function ProjectSourcesTab({ data }: Props) {
     </div>
     {specs.length > 0 ? (
       <div className="pw-table-wrap">
-        {specs.map(spec => <div key={spec.id} className="pw-row">
-          <div className="pw-row-main">
-            <div className="pw-row-title">
-              <strong className="mono">{spec.name}</strong>
-              <span className="pw-tag solid">{spec.kind}</span>
-              {spec.origin && <span className="pw-tag accent">{safeHost(spec.origin)}</span>}
+        {specs.map(spec => {
+          const imported = formatHumanTime(spec.createdAt)
+          return <div key={spec.id} className="pw-row">
+            <div className="pw-row-main">
+              <div className="pw-row-title">
+                <strong className="mono">{spec.name}</strong>
+                <span className="pw-tag solid">{spec.kind}</span>
+                {spec.origin && <span className="pw-tag accent">{safeHost(spec.origin)}</span>}
+              </div>
+              <div className="pw-row-sub num">
+                {Math.max(1, Math.round(spec.bytes / 1024))} KiB
+                {imported.label && (
+                  <>
+                    {' · '}
+                    <span title={imported.full}>Imported {imported.label}</span>
+                  </>
+                )}
+              </div>
             </div>
-            <div className="pw-row-sub num">
-              {Math.max(1, Math.round(spec.bytes / 1024))} KiB · Imported {timeText(spec.createdAt)}
+            <div className="pw-row-right">
+              <button
+                type="button"
+                className="pw-btn ghost danger"
+                disabled={specAction.pending}
+                onClick={() => {
+                  void specAction.submit(() => removeProjectSpec({ data: {
+                    requestId: crypto.randomUUID(),
+                    projectId: project.id,
+                    specId: spec.id,
+                  } }), () => setSpecNotice(`Removed spec "${spec.name}".`))
+                }}
+              >
+                Delete
+              </button>
             </div>
           </div>
-          <div className="pw-row-right">
-            <button
-              type="button"
-              className="pw-btn ghost danger"
-              disabled={specAction.pending}
-              onClick={() => {
-                void specAction.submit(() => removeProjectSpec({ data: {
-                  requestId: crypto.randomUUID(),
-                  projectId: project.id,
-                  specId: spec.id,
-                } }), () => setSpecNotice(`Removed spec "${spec.name}".`))
-              }}
-            >
-              Delete
-            </button>
-          </div>
-        </div>)}
+        })}
       </div>
     ) : (
-      <div className="pw-empty">
-        <p>No repositories or specs synced yet.</p>
+      <div className="pw-empty" style={{ padding: '32px 20px', gap: 12 }}>
+        <SourcesEmptyIllustration />
+        <div style={{ display: 'grid', gap: 4 }}>
+          <strong style={{ color: 'var(--pw-fg)', fontSize: 13.5 }}>No repositories or specs synced yet</strong>
+          <p style={{ margin: 0, maxWidth: 440 }}>
+            Connect GitHub above to pull read-only code and dependency context, or upload an OpenAPI or GraphQL schema manually below.
+          </p>
+        </div>
       </div>
     )}
 
@@ -624,7 +678,7 @@ export function ProjectSourcesTab({ data }: Props) {
       <summary>Advanced: upload schemas or lockfiles manually</summary>
       <div className="pw-disclosure-body">
         <p className="muted" style={{ margin: 0, fontSize: 12 }}>
-          Guardian automatically discovers runtime schemas and extracts OpenAPI, GraphQL, and lockfile specs from synced repositories. Use manual upload only when you need to supply an extra schema or lockfile directly.
+          Kovo Hunter automatically discovers runtime schemas and extracts OpenAPI, GraphQL, and lockfile specs from synced repositories. Use manual upload only when you need to supply an extra schema or lockfile directly.
         </p>
         <form
           className="pw-sheet"

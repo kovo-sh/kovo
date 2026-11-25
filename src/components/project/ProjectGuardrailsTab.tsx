@@ -6,16 +6,49 @@ import {
 import type { IastRuntime, LabServiceConfig } from '../../domain.ts'
 import { iastRuntimes } from '../../domain.ts'
 import { FormError, useAction } from '../common.tsx'
+import { Checkbox } from '../ui/checkbox.tsx'
 import type { ProjectLoaderData } from './types.ts'
 
 interface Props {
   data: ProjectLoaderData
 }
 
+function GuardrailsEmptyIllustration() {
+  return (
+    <svg
+      width="180"
+      height="88"
+      viewBox="0 0 180 88"
+      fill="none"
+      aria-hidden="true"
+      style={{ display: 'block', color: 'var(--pw-fg)' }}
+    >
+      <rect x="6" y="8" width="168" height="72" rx="10" fill="var(--pw-sunk)" stroke="var(--pw-line-2)" strokeWidth="1.2" />
+      <path d="M24 44h38" stroke="var(--pw-line-strong)" strokeWidth="1.4" strokeLinecap="round" strokeDasharray="3 3" />
+      <path d="M118 44h38" stroke="var(--pw-line-strong)" strokeWidth="1.4" strokeLinecap="round" />
+      <rect x="20" y="34" width="26" height="20" rx="5" fill="var(--pw-panel)" stroke="var(--pw-line-strong)" strokeWidth="1.2" />
+      <path d="M27 44h12" stroke="var(--pw-fg-3)" strokeWidth="1.5" strokeLinecap="round" />
+      <path
+        d="M90 19 112 27v16.5c0 12.2-8.7 21.6-22 26-13.3-4.4-22-13.8-22-26V27l22-8Z"
+        fill="var(--pw-panel)"
+        stroke="var(--pw-accent)"
+        strokeWidth="1.5"
+        strokeLinejoin="round"
+      />
+      <rect x="83" y="42" width="14" height="11" rx="2.5" fill="var(--pw-accent-soft)" stroke="var(--pw-accent)" strokeWidth="1.4" />
+      <path d="M86.5 42v-3.2a3.5 3.5 0 0 1 7 0V42" stroke="var(--pw-accent)" strokeWidth="1.4" strokeLinecap="round" />
+      <circle cx="90" cy="47.5" r="1.4" fill="var(--pw-accent)" />
+      <rect x="134" y="34" width="26" height="20" rx="5" fill="var(--pw-panel)" stroke="var(--pw-line-strong)" strokeWidth="1.2" />
+      <path d="M142 40l8 8M150 40l-8 8" stroke="var(--pw-fg-3)" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 export function ProjectGuardrailsTab({ data }: Props) {
   const { project, localLabEnvEnabled } = data
   const labAllowed = project.environment === 'local-lab' && localLabEnvEnabled
 
+  const [addRuleOpen, setAddRuleOpen] = useState(false)
   const [allowOrigin, setAllowOrigin] = useState(() => project.seeds[0] ?? '')
   const [allowMethod, setAllowMethod] = useState('POST')
   const [allowPath, setAllowPath] = useState('')
@@ -79,19 +112,30 @@ export function ProjectGuardrailsTab({ data }: Props) {
   >
     <div className="pw-sheet-h">
       <span>Local lab runner</span>
-      <span className={`pw-tag ${labAllowed ? (labEnabled ? 'ok' : 'accent') : 'solid'}`}>
-        {labAllowed ? (labEnabled ? 'Lab enabled' : 'Lab ready') : 'Disabled (fail-closed)'}
+      <span
+        className={`pw-tag ${labAllowed ? (labEnabled ? 'ok' : 'accent') : 'solid'}`}
+        title={labAllowed ? undefined : 'Fail-closed: requires a Local Lab project and server-side GUARDIAN_ALLOW_LOCAL_LAB=1'}
+      >
+        {labAllowed ? (labEnabled ? 'Lab enabled' : 'Lab ready') : 'Blocked by default'}
       </span>
     </div>
     <div className="pw-sheet-b">
       <p className="muted" style={{ margin: 0, fontSize: 12 }}>
-        Isolated multi-container Docker <code>--internal</code> target stack with optional test account seeding and opt-in IAST telemetry.
-        {!labAllowed && ' Requires a Local Lab project and server-side GUARDIAN_ALLOW_LOCAL_LAB=1.'}
+        Isolated local Docker target stack with optional test-account seeding and runtime code telemetry.
+        {!labAllowed && (
+          <span title="Requires a Local Lab project and GUARDIAN_ALLOW_LOCAL_LAB=1 on the server">
+            {' '}Available only on Local Lab projects when enabled on this server.
+          </span>
+        )}
       </p>
       {labNotice && <p role="status" className="notice" style={{ margin: 0 }}>{labNotice}</p>}
       <label className="pw-chk">
-        <input type="checkbox" checked={labEnabled} disabled={!labAllowed || labAction.pending}
-          onChange={e => setLabEnabled(e.target.checked)} />
+        <Checkbox
+          checked={labEnabled}
+          disabled={!labAllowed || labAction.pending}
+          aria-label="Enable local lab"
+          onCheckedChange={checked => setLabEnabled(Boolean(checked))}
+        />
         <span>Enable local lab</span>
       </label>
       <div className="pw-grid-2">
@@ -128,9 +172,15 @@ export function ProjectGuardrailsTab({ data }: Props) {
         </label>
       </div>
       <label className="pw-chk">
-        <input type="checkbox" checked={labIastEnabled} disabled={!labAllowed || labAction.pending}
-          onChange={e => setLabIastEnabled(e.target.checked)} />
-        <span>Enable IAST telemetry (redacted local-lab sink &amp; coverage side-channel)</span>
+        <Checkbox
+          checked={labIastEnabled}
+          disabled={!labAllowed || labAction.pending}
+          aria-label="Enable runtime telemetry (IAST)"
+          onCheckedChange={checked => setLabIastEnabled(Boolean(checked))}
+        />
+        <span title="Redacted local-lab IAST sink and coverage side-channel">
+          Enable runtime telemetry (capture redacted code coverage and sink traces in the local lab)
+        </span>
       </label>
       <FormError error={labAction.error} />
     </div>
@@ -145,14 +195,31 @@ export function ProjectGuardrailsTab({ data }: Props) {
     <section aria-label="Sandbox write allowlist">
       <div className="pw-sec-head">
         <div>
-          <h2>Tier-2 sandbox write allowlist <span className="muted num">({rules.length})</span></h2>
-          <p>Explicitly allow non-destructive Tier-2 POST probes on approved staging or test-account endpoints. Defaults to fail-closed empty list on public projects.</p>
+          <h2>Approved write endpoints <span className="muted num">({rules.length})</span></h2>
+          <p title="Tier-2 sandbox write allowlist; defaults to fail-closed empty list on public projects">
+            Allow non-destructive POST checks on specific staging or test-account endpoints. Write requests are blocked by default on public projects.
+          </p>
         </div>
+        {(rules.length > 0 || addRuleOpen) && (
+          <div className="pw-sec-actions">
+            <button
+              type="button"
+              className={addRuleOpen ? 'pw-btn ghost' : 'pw-btn primary'}
+              aria-expanded={addRuleOpen}
+              onClick={() => {
+                setAddRuleOpen(v => !v)
+                setAllowNotice('')
+              }}
+            >
+              {addRuleOpen ? 'Close' : 'Add write rule'}
+            </button>
+          </div>
+        )}
       </div>
 
       {allowNotice && <p role="status" className="notice">{allowNotice}</p>}
 
-      <form
+      {addRuleOpen && <form
         className="pw-sheet"
         style={{ marginBottom: 14 }}
         onSubmit={event => {
@@ -172,13 +239,18 @@ export function ProjectGuardrailsTab({ data }: Props) {
             },
           }), () => {
             setAllowPath('')
-            setAllowNotice('Sandbox write allowlist updated.')
+            setAddRuleOpen(false)
+            setAllowNotice('Approved write rules updated.')
           })
         }}
       >
+        <div className="pw-sheet-h">
+          <span>Add write rule</span>
+          <button type="button" className="pw-btn ghost" onClick={() => setAddRuleOpen(false)}>Close</button>
+        </div>
         <div className="pw-sheet-b">
           <div className="pw-grid-3">
-            <label className="pw-fld">Allowlist origin
+            <label className="pw-fld">Endpoint origin
               <input className="pw-in mono" name="allowOrigin" required value={allowOrigin}
                 onChange={e => setAllowOrigin(e.target.value)} placeholder={project.seeds[0] ?? 'https://example.com'} />
             </label>
@@ -198,11 +270,12 @@ export function ProjectGuardrailsTab({ data }: Props) {
           <FormError error={allowlistAction.error} />
         </div>
         <div className="pw-sheet-f">
+          <button type="button" className="pw-btn ghost" onClick={() => setAddRuleOpen(false)}>Cancel</button>
           <button type="submit" className="pw-btn primary" disabled={allowlistAction.pending || !allowOrigin.trim() || !allowPath.trim()}>
-            Add allowlist rule
+            {allowlistAction.pending ? 'Saving…' : 'Save allowlist rule'}
           </button>
         </div>
-      </form>
+      </form>}
 
       {rules.length > 0 ? (
         <div className="pw-table-wrap">
@@ -225,7 +298,7 @@ export function ProjectGuardrailsTab({ data }: Props) {
                       projectId: project.id,
                       sandboxWriteAllowlist: updated,
                     },
-                  }), () => setAllowNotice('Removed allowlist rule.'))
+                  }), () => setAllowNotice('Removed write rule.'))
                 }}
               >
                 Remove
@@ -234,8 +307,26 @@ export function ProjectGuardrailsTab({ data }: Props) {
           ))}
         </div>
       ) : (
-        <div className="pw-empty">
-          <p>No sandbox write allowlist rules configured (default fail-closed empty list).</p>
+        <div className="pw-empty" style={{ padding: '32px 20px', gap: 12 }}>
+          <GuardrailsEmptyIllustration />
+          <div style={{ display: 'grid', gap: 4 }}>
+            <strong style={{ color: 'var(--pw-fg)', fontSize: 13.5 }}>Write requests are blocked by default</strong>
+            <p style={{ margin: 0, maxWidth: 440 }}>
+              Kovo Hunter will not send state-changing requests unless you explicitly approve a staging or test-account endpoint here.
+            </p>
+          </div>
+          {!addRuleOpen && (
+            <button
+              type="button"
+              className="pw-btn primary"
+              onClick={() => {
+                setAddRuleOpen(true)
+                setAllowNotice('')
+              }}
+            >
+              Add write rule
+            </button>
+          )}
         </div>
       )}
     </section>
@@ -245,7 +336,7 @@ export function ProjectGuardrailsTab({ data }: Props) {
         labRunnerForm
       ) : (
         <details className="pw-disclosure">
-          <summary>Local lab runner (disabled on Public HTTPS projects)</summary>
+          <summary>Local lab runner (unavailable on public HTTPS projects)</summary>
           <div className="pw-disclosure-body">{labRunnerForm}</div>
         </details>
       )}
