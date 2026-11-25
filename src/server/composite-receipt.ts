@@ -9,6 +9,7 @@ import { parseRoleLabel, routeFamily, stepReadsState } from './oracle-invariants
 import { proofReceiptSchema, receiptIdSchema, verifyReceipt } from './proof-receipt.ts'
 import { evaluateV8OracleFamily, extractTenantMarkers, isJobOrHandleStub } from './v8-oracle-families.ts'
 import type { CrossSurfaceHop, CrossSurfacePivotInput, HostSignedRecord as V8OracleRecord, V8OracleFamily, V8OracleInputMap } from './v8-oracle-families.ts'
+import { hydrateV8OracleInput, selectStateTransitionPair, toOracleRecord } from './v8-oracle-hydrate.ts'
 import type { ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 
 export const HOP_SURFACES = ['http', 'graphql', 'ws', 'sse', 'browser', 'webhook', 'async_job', 'idp', 'cdn', 'storage'] as const
@@ -366,16 +367,18 @@ function verifyStateTransitionBinding(
   fromHop: HopReceipt, toHop: HopReceipt, idx: IndexedTranscript, dagDerivedCaps: ReadonlySet<string>,
 ): VerifiedEdgeResult {
   const hopEntries = (hop: HopReceipt) => hop.exchangeIds.map(id => idx.entriesById.get(id)!)
-  const okOnEntity = (hop: HopReceipt) => hopEntries(hop).filter(e => is2xx(e.step.status) && isFiniteTs(e.timestampMs) && entryMatchesEntity(e, edge.entityId))
   const hopDiag = (hop: HopReceipt, side: string) => { const es = hopEntries(hop); return `[${side}Ok=0: exchanges=${es.length}, 2xx=${es.filter(e => is2xx(e.step.status)).length}, timestamped=${es.filter(e => isFiniteTs(e.timestampMs)).length}, entityMatch=${es.filter(e => entryMatchesEntity(e, edge.entityId)).length}]` }
-  const fromOk = okOnEntity(fromHop), toOk = okOnEntity(toHop)
-  if (fromOk.length === 0) return edgeFail(base, `fromHop "${fromHop.hopId}" has no succeeding exchange on "${edge.entityId}" ${hopDiag(fromHop, 'from')}.`)
-  if (toOk.length === 0) return edgeFail(base, `toHop "${toHop.hopId}" has no succeeding exchange on "${edge.entityId}" ${hopDiag(toHop, 'to')}.`)
-  const pair = fromOk.flatMap(f => toOk.filter(t => f.timestampMs! <= t.timestampMs!).map(t => ({ from: f, to: t })))[0]
-  if (!pair) return edgeFail(base, `state_transition_binding on "${edge.entityId}" violated monotonic ordering (t_i > t_j).`)
+  const sel = selectStateTransitionPair(edge.entityId, hopEntries(fromHop), hopEntries(toHop), dagDerivedCaps, { actorOf, probeTenantOf, entryMatchesEntity, anonActorRe: ANON_ACTOR_RE })
+  if (!sel.ok) {
+    if (sel.reason === 'non_monotonic') return edgeFail(base, `state_transition_binding on "${edge.entityId}" violated monotonic ordering (t_i > t_j).`)
+    const side = sel.reason === 'missing_to' || sel.missingSide === 'to' ? 'to' : 'from', hop = side === 'to' ? toHop : fromHop
+    return edgeFail(base, `${side}Hop "${hop.hopId}" has no succeeding exchange on "${edge.entityId}" ${hopDiag(hop, side)}${sel.reason === 'actor_discontinuity' ? ' [actor_discontinuity]' : ''}.`)
+  }
+  const pair = { from: sel.from, to: sel.to }, { logicalFallback } = sel
   const hopExSet = new Set([...fromHop.exchangeIds, ...toHop.exchangeIds])
-  const toUsesNewCap = (pair.to.consumedCapabilities ?? []).some(c => dagDerivedCaps.has(c))
+  const toUsesNewCap = (pair.to.consumedCapabilities ?? []).some(c => dagDerivedCaps.has(c)) || (pair.to.cryptoAttestations ?? []).some(x => dagDerivedCaps.has(x.derivedFromCapabilityId))
   const toActor = actorOf(pair.to), toFam = normRouteFam(pair.to.step.route ?? pair.to.step.pathAndQuery, edge.entityId)
+  const normActor = (a: string | null) => (!a || ANON_ACTOR_RE.test(a.trim())) ? null : a.trim().toLowerCase()
   // Sibling is untouched when no succeeding state-changing exchange on it precedes the ablation (missing timestamps count as touched).
   const touchedBefore = (eid: string, ab: HostTranscriptEntry) => [...idx.entriesById.values()].some(e => e.exchangeId !== ab.exchangeId && is2xx(e.step.status) && !stepReadsState(e.step) && (!isFiniteTs(e.timestampMs) || !isFiniteTs(ab.timestampMs) || e.timestampMs <= ab.timestampMs) && entryMatchesEntity(e, eid))
   let validAblation: HostTranscriptEntry | null = null; const diags: string[] = []
@@ -384,21 +387,22 @@ function verifyStateTransitionBinding(
     const ab = idx.entriesById.get(abId)!, st = ab.step.status, denied = typeof st === 'number' && ABLATION_DENIED_STATUSES.has(st)
     if (ab.cleanSession === false) return edgeFail(base, `Ablation exchange "${abId}" had cleanSession=false (session/entity already mutated); run the ablation control BEFORE Hop "${fromHop.hopId}" or on a fresh untouched sibling entity (pass entityId).`)
     if (typeof st === 'number' && st >= 500) return edgeFail(base, `Ablation exchange "${abId}" returned server error ${st} [status=5xx].`)
-    if (is2xx(st) && ab.step.evidenceRole !== 'invariant_preserved') return edgeFail(base, `Ablation control "${abId}" succeeded (${st}) [status=2xx]; Hop j is not dependent on Hop i.`)
+    if (is2xx(st) && (logicalFallback || ab.step.evidenceRole !== 'invariant_preserved')) return edgeFail(base, `Ablation control "${abId}" succeeded (${st}) [status=2xx]; Hop j is not dependent on Hop i.`)
     const labeled = ab.cleanSession === true && (ab.step.arm === 'control' || ab.replayAttempt === 'ablation_control')
-    if (!entryMatchesEntity(ab, edge.entityId) && !(toFam && normRouteFam(ab.step.route ?? ab.step.pathAndQuery, ab.entityId) === toFam)) { diags.push(`${abId}: route_family_mismatch (entity and toHop route family "${toFam || 'none'}" unmatched)`); continue }
+    const sameRouteFam = Boolean(toFam) && normRouteFam(ab.step.route ?? ab.step.pathAndQuery, ab.entityId ?? edge.entityId) === toFam
+    if (logicalFallback ? !sameRouteFam : (!entryMatchesEntity(ab, edge.entityId) && !sameRouteFam)) { diags.push(`${abId}: route_family_mismatch (entity and toHop route family "${toFam || 'none'}" unmatched)`); continue }
     if (!labeled) { // unlabeled clean-session denial: sound only before Hop i ran or on a host-bound untouched sibling; never 2xx/dirty/mutated
       const before = isFiniteTs(ab.timestampMs) && ab.timestampMs < pair.from.timestampMs!
       const sibling = Boolean(ab.entityId && ab.entityId.trim().toLowerCase() !== edge.entityId.trim().toLowerCase() && !touchedBefore(ab.entityId, ab))
       if (ab.cleanSession !== true || !denied || !(before || sibling)) { diags.push(`${abId}: unlabeled_control (cleanSession=${ab.cleanSession ?? 'unset'}, status=${st ?? 'null'}, beforeFromHop=${before}, untouchedSibling=${sibling}; pass role: "control")`); continue }
     }
     const abActor = actorOf(ab)
-    if (!toUsesNewCap && toActor && abActor && abActor !== toActor) return edgeFail(base, `Ablation "${abId}" actor "${abActor}" mismatches toHop actor "${toActor}" [actor_mismatch].`)
-    if (denied || (labeled && ab.step.evidenceRole === 'invariant_preserved')) validAblation = ab
+    if (!toUsesNewCap && toActor && (logicalFallback ? normActor(abActor) !== normActor(toActor) : (abActor && abActor !== toActor))) return edgeFail(base, `Ablation "${abId}" actor "${abActor ?? 'anon'}" mismatches toHop actor "${toActor}" [actor_mismatch].`)
+    if (denied || (!logicalFallback && labeled && ab.step.evidenceRole === 'invariant_preserved')) validAblation = ab
     else diags.push(`${abId}: status=${st ?? 'null'} not a denial (401/403/404/409/412/422)`)
   }
   if (!validAblation) return edgeFail(base, `state_transition_binding on "${edge.entityId}" lacks a passing clean-session ablation control [${diags.join('; ') || 'no ablationExchangeIds cited'}].`)
-  return edgeOk(base, 'state_transition_binding verified with clean-session ablation control.', { entityId: edge.entityId, fromExchangeId: pair.from.exchangeId, toExchangeId: pair.to.exchangeId, ablationExchangeId: validAblation.exchangeId, ablationStatus: validAblation.step.status })
+  return edgeOk(base, 'state_transition_binding verified with clean-session ablation control.', { entityId: edge.entityId, fromExchangeId: pair.from.exchangeId, toExchangeId: pair.to.exchangeId, ablationExchangeId: validAblation.exchangeId, ablationStatus: validAblation.step.status, ...(logicalFallback ? { bindingMode: 'logical_key_ablation' } : {}) })
 }
 
 function verifyAsyncPivotBinding(
@@ -549,17 +553,6 @@ function verifyReplayMode(
 
 // --- Public Verifier & Single-Hop Bridge ------------------------------------
 
-function toOracleRecord(e: HostTranscriptEntry, fallbackSig: string): V8OracleRecord {
-  return {
-    id: e.exchangeId, hostSignature: e.hostSignature ?? fallbackSig, timestampMs: isFiniteTs(e.timestampMs) && e.timestampMs > 0 ? e.timestampMs : 1,
-    status: e.step.status, method: e.step.method, route: e.step.route ?? e.step.pathAndQuery, actorId: actorOf(e), tenantId: e.step.actor.tenant ?? null,
-    body: e.step.body, json: e.step.json, requestHeaders: e.step.requestHeaders, responseHeaders: e.step.responseHeaders,
-    capabilityHandle: e.emittedCapabilities?.[0] ?? e.consumedCapabilities?.[0] ?? null,
-    artifactDigest: e.observedResponseDigests?.[0] ?? sha256Hex(e.step.body ?? JSON.stringify(e.step.json ?? null)),
-    derivedFromCapabilityId: e.cryptoAttestations?.[0]?.derivedFromCapabilityId ?? null,
-  }
-}
-
 type DefaultV8Ctx = { termEndpoint: string; termFam: string; hasOob: boolean; hasBrowser: boolean; hasBody: boolean; isStub: boolean; ownTenantOnly: boolean }
 
 function dispatchDefaultV8Oracle(
@@ -571,21 +564,28 @@ function dispatchDefaultV8Oracle(
   if (!family) return null
   const verifySignature = options.signingKey ? (rec: V8OracleRecord): boolean => {
     const e = idx.entriesById.get(rec.id) ?? idx.oobById.get(rec.id) ?? idx.tracesById.get(rec.id) ?? idx.pollsById.get(rec.id)
-    return Boolean(e && e.hostSignature === rec.hostSignature)
+    return Boolean(e && e.hostSignature === rec.hostSignature && verifyHostRecordSignature(e, options.signingKey!))
   } : undefined
   const rejectFam = (reason: string, missingEvidence: string[], rejectedBy = `v8_oracle_${family}`) => ({ ok: false as const, reason, rejectedBy, missingEvidence })
   const mapFail = (reason: string) => (reason === 'terminal_impact_unproven_intermediate_stub' || reason === 'bled_access_own_tenant_only')
     ? rejectFam(TERMINAL_IMPACT_UNPROVEN_HINT, [TERMINAL_IMPACT_UNPROVEN_HINT], 'terminal_impact_unproven')
     : rejectFam(`v8_oracle_failed (${family}): ${reason}`, [reason])
+  const sig = options.signingKey ? '' : 'host-verified-sig'
+  const econCtx = { preChainControlExchangeIds: ti.preChainControlExchangeIds, termHopExchangeIds: dag.hopsById.get(ti.terminalHopId)!.exchangeIds, postChainReadbackExchangeIds: ti.postChainReadbackExchangeIds }
   const explicitInput = ti.oracleInput ?? options.v8OracleInput
   if (explicitInput) {
-    const dec = evaluateV8OracleFamily(family, { ...explicitInput, ...(verifySignature ? { verifySignature } : {}) } as V8OracleInputMap[typeof family])
+    const hydrated = hydrateV8OracleInput(family, explicitInput, idx, sig, econCtx)
+    const dec = evaluateV8OracleFamily(family, { ...hydrated, ...(verifySignature ? { verifySignature } : {}) } as V8OracleInputMap[typeof family])
     return dec.satisfied ? { ok: true, family, explicit: true } : mapFail(dec.reason)
   }
-  if (family === 'economic_conservation') return rejectFam('v8_oracle_failed (economic_conservation): missing_economic_oracle_input — provide terminalImpact.oracleInput.', ['terminalImpact.oracleInput'])
+  if (family === 'economic_conservation') {
+    const hydrated = hydrateV8OracleInput(family, {}, idx, sig, econCtx)
+    const dec = evaluateV8OracleFamily(family, { ...hydrated, ...(verifySignature ? { verifySignature } : {}) } as V8OracleInputMap['economic_conservation'])
+    const reason = dec.reason === 'unknown_economic_equation' ? 'missing_economic_oracle_input' : dec.reason
+    return rejectFam(`v8_oracle_failed (economic_conservation): ${reason} — provide terminalImpact.oracleInput.`, [reason, 'terminalImpact.oracleInput'])
+  }
   if (family === 'cross_surface_pivot') {
     if (receipt.hops.length < 2) return rejectFam('v8_oracle_failed (cross_surface_pivot): invalid_hop_count — requires >= 2 hops across distinct surfaces.', ['cross_surface_pivot_requires_2_plus_hops'])
-    const sig = options.signingKey ? '' : 'host-verified-sig'
     const rootHop = dag.hopsById.get(dag.roots[0]!)!
     const rootEx = rootHop.exchangeIds.map(id => idx.entriesById.get(id)!).find(e => e.step.arm === 'probe') ?? idx.entriesById.get(rootHop.exchangeIds[0]!)
     if (!terminalCtrl || !rootEx || !termEx) return rejectFam(`v8_oracle_failed (${family}): missing_pivot_control_or_terminal_record`, ['pre_chain_control_denied', TERMINAL_IMPACT_UNPROVEN_HINT])
@@ -665,7 +665,7 @@ function verifyTerminalImpactGate(
     if (!c || (termEx && c.exchangeId === termEx.exchangeId) || nonTermExSet.has(c.exchangeId)) return false
     if ((c.step.arm !== 'control' && c.replayAttempt !== 'ablation_control') || typeof c.step.status !== 'number' || !DENIED_CONTROL_STATUSES.has(c.step.status)) return false
     const ca = actorOf(c); if (c.step.status === 401 && termAuthd && (!ca || ANON_ACTOR_RE.test(ca))) return false
-    const cf = normRouteFam(c.step.route ?? c.step.pathAndQuery, c.entityId)
+    const cf = normRouteFam(c.step.route ?? c.step.pathAndQuery, c.entityId ?? termEx?.entityId ?? termHop.entityId)
     return Boolean(termFam) && Boolean(cf) && cf === termFam
   })
   const hasCleanDeniedCtrl = Boolean(terminalCtrl), hasAsyncEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'async_pivot_binding' && e.verified), hasAnyDerivedCrypto = verifiedEdges.some(e => e.kind === 'derived_crypto_binding' && e.verified)
