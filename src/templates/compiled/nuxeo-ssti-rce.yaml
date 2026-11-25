@@ -18,7 +18,7 @@ request:
   path: "/nuxeo/login.jsp/pwn${31333333330+7}.xhtml"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "or"
 matchers:
   - type: "word"

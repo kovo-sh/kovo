@@ -16,7 +16,7 @@ request:
   path: "/answer/api/v1/siteinfo"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "and"
 matchers:
   - type: "word"

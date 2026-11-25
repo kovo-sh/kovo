@@ -10,7 +10,7 @@ request:
   method: GET
   path: /metrics
 control:
-  path: "/metrics-guardian-none-{{rand}}"
+  path: "/metrics-kovo-none-{{rand}}"
 matchers-condition: and
 matchers:
   - type: status

@@ -10,7 +10,7 @@ request:
   method: GET
   path: /server-status
 control:
-  path: "/guardian-none-{{rand}}"
+  path: "/kovo-none-{{rand}}"
 matchers-condition: and
 matchers:
   - type: word

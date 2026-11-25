@@ -17,7 +17,7 @@ request:
   path: "/data/manage/cmd.php?cmd=id"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "and"
 matchers:
   - type: "regex"

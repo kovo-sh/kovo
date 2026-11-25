@@ -111,7 +111,7 @@ export class TemplateValidationError extends Error {
 
 const thirdPartyOastPattern = /(?:interact\.sh|interactsh|oast\.(?:pro|live|site|online|fun|me)|oast\.[a-z]{2,10}\b|burpcollaborator|requestbin|pipedream|webhook\.site|ngrok|canarytokens|dnslog|ceye\.io|oastify|beeceptor|requestcatcher|dnsbin\.|bxss\.me|xss\.ht)/i
 const privateHostPattern = /(?:\b(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\b192\.168\.\d{1,3}\.\d{1,3}\b|\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b|\b169\.254\.\d{1,3}\.\d{1,3}\b|\b0\.0\.0\.0\b|\blocalhost\b|\[::1?\]|::ffff:|metadata\.google\.internal|metadata\.azure\.internal|100\.100\.100\.200|\b2852039166\b|\b0xa9fea9fe\b|\bfd[0-9a-f]{2}:)/i
-const allowedPlaceholders = /\{\{(?:rand|guardian_canary_http|guardian_canary_dns|discovered_protected_path|discovered_api_path)\}\}/g
+const allowedPlaceholders = /\{\{(?:rand|kovo_canary_http|kovo_canary_dns|discovered_protected_path|discovered_api_path)\}\}/g
 const originLikeHeaders = /^(?:origin|referer)$/i
 
 function decodeLoose(text: string): string {
@@ -121,7 +121,7 @@ function decodeLoose(text: string): string {
 function assertRequestFieldSafe(label: string, value: string, headerName?: string) {
   const stripped = value.replace(allowedPlaceholders, 'X')
   if (/\{\{[^}]*\}\}/.test(stripped)) {
-    throw new TemplateValidationError(`${label} uses an unknown {{placeholder}}; only rand, guardian_canary_http, guardian_canary_dns, discovered_protected_path and discovered_api_path are allowed.`)
+    throw new TemplateValidationError(`${label} uses an unknown {{placeholder}}; only rand, kovo_canary_http, kovo_canary_dns, discovered_protected_path and discovered_api_path are allowed.`)
   }
   const decoded = decodeLoose(decodeLoose(stripped))
   if (/[\r\n\0]/.test(decoded)) throw new TemplateValidationError(`${label} contains control characters.`)
@@ -129,7 +129,7 @@ function assertRequestFieldSafe(label: string, value: string, headerName?: strin
     throw new TemplateValidationError(`${label} references an internal/loopback/metadata address.`)
   }
   if (thirdPartyOastPattern.test(decoded)) {
-    throw new TemplateValidationError(`${label} references a third-party OAST service; use {{guardian_canary_http}}/{{guardian_canary_dns}}.`)
+    throw new TemplateValidationError(`${label} references a third-party OAST service; use {{kovo_canary_http}}/{{kovo_canary_dns}}.`)
   }
   if (decoded.includes('://')) {
     const allowedOriginHeader = headerName && originLikeHeaders.test(headerName) &&
@@ -210,11 +210,11 @@ export function assertTemplateSafety(t: SafeTemplate): void {
       }
     }
   }
-  const usesCanary = JSON.stringify(t.request).includes('guardian_canary_')
+  const usesCanary = JSON.stringify(t.request).includes('kovo_canary_')
   if (usesCanary !== t.matchers.some(m => m.type === 'canary')) {
     throw new TemplateValidationError('Canary placeholders and a `canary` matcher must be used together.')
   }
-  if (t.control && JSON.stringify(t.control).includes('guardian_canary_')) {
+  if (t.control && JSON.stringify(t.control).includes('kovo_canary_')) {
     throw new TemplateValidationError('Control requests must not use canary placeholders.')
   }
 }
@@ -250,7 +250,7 @@ const cache = new Map<string, LoadedTemplates>()
 function candidateDirs(explicit?: string): string[] {
   const dirs: string[] = []
   if (explicit) dirs.push(resolve(explicit))
-  if (process.env.GUARDIAN_TEMPLATES_DIR) dirs.push(resolve(process.env.GUARDIAN_TEMPLATES_DIR))
+  if (process.env.KOVO_TEMPLATES_DIR) dirs.push(resolve(process.env.KOVO_TEMPLATES_DIR))
   try { dirs.push(fileURLToPath(new URL('./', import.meta.url))) } catch { /* bundled */ }
   try { dirs.push(fileURLToPath(new URL('../templates/', import.meta.url))) } catch { /* bundled */ }
   dirs.push(resolve(process.cwd(), 'src/templates'))

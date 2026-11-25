@@ -15,7 +15,7 @@ request:
   path: "/index.php/javascript%26colon%3Balert(document.domain);dd%26sol%3b%26sol%3b"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "and"
 matchers:
   - type: "word"

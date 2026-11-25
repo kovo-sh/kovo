@@ -15,7 +15,7 @@ request:
   path: "/.settings/rules.json?auth=FIREBASE_SECRET"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "or"
 matchers:
   - type: "word"

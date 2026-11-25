@@ -15,7 +15,7 @@ request:
   path: "/sitecore/shell/sitecore.version.xml"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "and"
 matchers:
   - type: "status"

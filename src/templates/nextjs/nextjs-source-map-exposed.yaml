@@ -9,7 +9,7 @@ request:
   method: GET
   path: /_next/static/chunks/main.js.map
 control:
-  path: "/_next/static/chunks/guardian-none-{{rand}}.js.map"
+  path: "/_next/static/chunks/kovo-none-{{rand}}.js.map"
 matchers-condition: and
 matchers:
   - type: status

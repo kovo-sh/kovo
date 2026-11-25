@@ -7,7 +7,7 @@ tags: [debug, misconfig]
 cwe: CWE-489
 request:
   method: GET
-  path: "/guardian-none-{{rand}}/"
+  path: "/kovo-none-{{rand}}/"
 control:
   path: /
 matchers-condition: and

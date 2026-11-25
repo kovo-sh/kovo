@@ -20,7 +20,7 @@ request:
     "Accept-Language": "en-US,en;q=0.9,hi;q=0.8"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "and"
 matchers:
   - type: "word"

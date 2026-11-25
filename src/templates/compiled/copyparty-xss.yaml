@@ -16,7 +16,7 @@ request:
   path: "/?hc=%22%3E%3Cscript%3Ealert(document.domain)%3C/script%3E"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "and"
 matchers:
   - type: "word"

@@ -9,7 +9,7 @@ request:
   method: GET
   path: /actuator/mappings
 control:
-  path: "/actuator/guardian-none-{{rand}}"
+  path: "/actuator/kovo-none-{{rand}}"
 matchers-condition: and
 matchers:
   - type: status

@@ -17,7 +17,7 @@ request:
   path: "/login.php?mid=0&usr=test%27%20draggable=true%20ondrag=alert(document.domain)%20value=%27p"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "and"
 matchers:
   - type: "word"

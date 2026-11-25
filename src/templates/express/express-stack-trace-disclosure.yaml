@@ -9,7 +9,7 @@ request:
   method: GET
   path: "/%E0%A4%A"
 control:
-  path: "/guardian-none-{{rand}}"
+  path: "/kovo-none-{{rand}}"
 matchers-condition: and
 matchers:
   - type: regex

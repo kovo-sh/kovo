@@ -9,7 +9,7 @@ request:
   method: GET
   path: /_next/static/development/_buildManifest.js
 control:
-  path: "/_next/static/development/guardian-none-{{rand}}.js"
+  path: "/_next/static/development/kovo-none-{{rand}}.js"
 matchers-condition: and
 matchers:
   - type: status

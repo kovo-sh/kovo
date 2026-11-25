@@ -9,7 +9,7 @@ request:
   method: GET
   path: /.git/config
 control:
-  path: "/.git/guardian-none-{{rand}}"
+  path: "/.git/kovo-none-{{rand}}"
 matchers-condition: and
 matchers:
   - type: status

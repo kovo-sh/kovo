@@ -9,7 +9,7 @@ request:
   method: GET
   path: /static/js/main.js.map
 control:
-  path: "/static/js/guardian-none-{{rand}}.js.map"
+  path: "/static/js/kovo-none-{{rand}}.js.map"
 matchers-condition: and
 matchers:
   - type: status

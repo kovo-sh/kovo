@@ -10,7 +10,7 @@ request:
   method: GET
   path: /wp-json/wp/v2/users
 control:
-  path: "/wp-json/wp/v2/guardian-none-{{rand}}"
+  path: "/wp-json/wp/v2/kovo-none-{{rand}}"
 matchers-condition: and
 matchers:
   - type: status

@@ -10,7 +10,7 @@ request:
   method: GET
   path: /swagger-ui/index.html
 control:
-  path: "/swagger-ui/guardian-none-{{rand}}.html"
+  path: "/swagger-ui/kovo-none-{{rand}}.html"
 matchers-condition: and
 matchers:
   - type: status

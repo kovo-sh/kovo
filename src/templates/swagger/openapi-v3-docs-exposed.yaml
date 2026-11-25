@@ -10,7 +10,7 @@ request:
   method: GET
   path: /v3/api-docs
 control:
-  path: "/v3/guardian-none-{{rand}}"
+  path: "/v3/kovo-none-{{rand}}"
 matchers-condition: and
 matchers:
   - type: status
