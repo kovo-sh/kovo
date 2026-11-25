@@ -7,6 +7,7 @@ import {
 } from '../domain.ts'
 import { declarativeReplaySpecSchema, replaySpecOrigins, type DeclarativeReplaySpec } from '../replay-spec.ts'
 import {
+  GUARDIAN_VERIFY_TS_ONLY_ERROR,
   createBoardTools,
   filterHandlersForSpecialist,
   injectBoardTurnInstructions,
@@ -1469,8 +1470,14 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         ...(this.host.verifier.backendSupportsVerifyScript() ? {
           guardian_verify: async (args: GuardianVerifyArgs) => {
             const curRun = this.host.check(job)
-            const runtime: GuardianVerifyRuntime = args.runtime
-              ?? (args.scriptPath && /\.py$/i.test(args.scriptPath) ? 'python' : 'ts')
+            const rawRuntime = args.runtime as string | undefined
+            if (
+              (rawRuntime !== undefined && rawRuntime !== 'ts')
+              || (typeof args.scriptPath === 'string' && /\.py$/i.test(args.scriptPath.trim()))
+            ) {
+              throw new Error(GUARDIAN_VERIFY_TS_ONLY_ERROR)
+            }
+            const runtime: GuardianVerifyRuntime = 'ts'
             const script = typeof args.script === 'string' && args.script.trim()
               ? args.script.trim()
               : args.scriptPath

@@ -67,6 +67,7 @@ import {
   EARLY_EXIT_STATE_CHANGE_METHODS,
   GUARDIAN_VERIFY_SPEC_SHAPE,
   GUARDIAN_VERIFY_TOOL_DESCRIPTION,
+  GUARDIAN_VERIFY_TS_ONLY_ERROR,
   SPEC_PROOF_GAP_ALIASES,
   SPEC_PROOF_GAP_CODES,
   WALL_CLOCK_PROOF_GRACE_MS,
@@ -168,6 +169,7 @@ export {
   GUARDIAN_VERIFY_REPAIR_INSTRUCTION,
   GUARDIAN_VERIFY_SPEC_SHAPE,
   GUARDIAN_VERIFY_TOOL_DESCRIPTION,
+  GUARDIAN_VERIFY_TS_ONLY_ERROR,
   GUARDIAN_VERIFY_USAGE_HINT,
   NEGATIVE_EDGE_PROOF_GAP_CODES,
   SPECIALIST_COMMON_TOOLS,
@@ -2321,11 +2323,11 @@ export function buildWorkerTools(
       name: 'guardian_verify',
       description: GUARDIAN_VERIFY_TOOL_DESCRIPTION,
       parameters: obj({
-        script: opt(str({ description: 'Inline verification script (TypeScript or Python). Takes precedence over scriptPath.', maxLength: 64 * 1024 })),
+        script: opt(str({ description: 'Inline TypeScript verification script. Takes precedence over scriptPath.', maxLength: 64 * 1024 })),
         code: opt(str({ description: 'Alias for `script` (inline verification script).', maxLength: 64 * 1024 })),
         source: opt(str({ description: 'Alias for `script` (inline verification script).', maxLength: 64 * 1024 })),
-        scriptPath: opt(str({ description: 'Workspace-relative path to a previously written verification script.', maxLength: 512 })),
-        runtime: opt(oneOf(['ts', 'python'] as const)),
+        scriptPath: opt(str({ description: 'Workspace-relative path to a previously written TypeScript verification script.', maxLength: 512 })),
+        runtime: opt(oneOf(['ts'] as const)),
         title: opt(str({ description: 'Short proof title (echoed by the verdict).', maxLength: 300 })),
         timeoutMs: opt(int({ minimum: 1_000, maximum: 120_000 })),
       }),
@@ -2335,6 +2337,16 @@ export function buildWorkerTools(
         const signal = combineSignal(ctx.abortSignal)
         const inlineScript = (args.script ?? args.code ?? args.source)?.trim()
         const scriptPath = args.scriptPath?.trim()
+        const rawRuntime = args.runtime as string | undefined
+        if ((rawRuntime !== undefined && rawRuntime !== 'ts') || (scriptPath && /\.py$/i.test(scriptPath))) {
+          return {
+            isError: true,
+            output: [{
+              type: 'text' as const,
+              text: GUARDIAN_VERIFY_TS_ONLY_ERROR,
+            }],
+          }
+        }
         if (!inlineScript && !scriptPath) {
           gvValidationErrors += 1
           const example = '{"script":"await ctx.prove_access_boundary({ controlPersona: \'user_b\', probePersona: \'user_a\', route: \'/api/items/1\' }); return ctx.result({ title: \'BOLA read\' })","runtime":"ts"}'
@@ -2350,8 +2362,7 @@ export function buildWorkerTools(
           }
         }
         gvValidationErrors = 0
-        const runtime: GuardianVerifyRuntime = args.runtime
-          ?? (scriptPath && /\.py$/i.test(scriptPath) ? 'python' : 'ts')
+        const runtime: GuardianVerifyRuntime = 'ts'
         const payload: GuardianVerifyArgs = {
           ...(inlineScript ? { script: inlineScript } : { scriptPath }),
           runtime,
@@ -2530,7 +2541,7 @@ export function buildWorkerTools(
     const fn = handlers.verify_replay_spec
     tools.push(defineTool({
       name: 'verify_replay_spec',
-      description: `${hasGuardianVerify ? '[LEGACY FALLBACK — `guardian_verify` is active in this session. Prefer `guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")` for all runtime proofs so findings persist ProofReceipt (`proof_kind="agent_script"`). Use `verify_replay_spec` ONLY for `static_ast_proof` or when `guardian_verify` is unavailable.] ' : ''}Execute a DeclarativeReplaySpec synchronously through Guardian’s Zero-LLM ReplayVerifier and return sanitized InlineVerifyFeedback (jqError, failedStepId, spaCatchallMatched, canaryTriggered, stepStatuses, retriesRemaining). Maximum 2 repair retries (3 attempts total) per hypothesis. ${GUARDIAN_VERIFY_SPEC_SHAPE}`,
+      description: `${hasGuardianVerify ? '[LEGACY FALLBACK — `guardian_verify` is active in this session. Prefer `guardian_verify(script="<inline TS using ctx.prove_*>", runtime="ts")` for all runtime proofs so findings persist ProofReceipt (`proof_kind="agent_script"`). Use `verify_replay_spec` ONLY for `static_ast_proof` or when `guardian_verify` is unavailable.] ' : ''}Execute a DeclarativeReplaySpec synchronously through Guardian’s Zero-LLM ReplayVerifier and return sanitized InlineVerifyFeedback (jqError, failedStepId, spaCatchallMatched, canaryTriggered, stepStatuses, retriesRemaining). Maximum 2 repair retries (3 attempts total) per hypothesis. ${GUARDIAN_VERIFY_SPEC_SHAPE}`,
       parameters: obj({
         spec: opt(unsafe<Record<string, unknown>>({
           type: 'object',
