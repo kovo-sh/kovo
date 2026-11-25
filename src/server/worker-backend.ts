@@ -1,8 +1,20 @@
 import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+} from 'node:fs'
+import { basename, dirname, join, relative, sep } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { z } from 'zod'
@@ -41,11 +53,18 @@ const warmNamespace = 'dev.guardian.warm'
 const DEFAULT_STALE_CREATED_MS = 120_000
 const processSessionId = randomUUID()
 const liveContainers = new Set<string>()
+const liveStagedRepoDirs = new Set<string>()
 /** Process-scoped label value carried by every worker container (test/diagnostic seam). */
 export function workerProcessSessionId() {
   return processSessionId
 }
 let liveExitHookInstalled = false
+function removeLiveStagedRepoDirs() {
+  for (const dir of [...liveStagedRepoDirs]) {
+    try { rmSync(dir, { recursive: true, force: true }) } catch { /* best-effort */ }
+    liveStagedRepoDirs.delete(dir)
+  }
+}
 function removeLiveContainers(budgetMs = 4_000) {
   const deadline = Date.now() + budgetMs
   for (const container of [...liveContainers]) {
@@ -54,9 +73,9 @@ function removeLiveContainers(budgetMs = 4_000) {
     try { spawnSync('docker', ['container', 'rm', '--force', container], { stdio: 'ignore', timeout: Math.min(5_000, remaining) }) } catch { /* best-effort */ }
     liveContainers.delete(container)
   }
+  removeLiveStagedRepoDirs()
 }
-function trackLiveContainer(name: string) {
-  liveContainers.add(name)
+function ensureLiveExitHooks() {
   if (liveExitHookInstalled) return
   liveExitHookInstalled = true
   // Remove any container this process created but did not get to start/close
@@ -66,6 +85,14 @@ function trackLiveContainer(name: string) {
   process.once('exit', () => removeLiveContainers(1_500))
   process.once('SIGTERM', () => { removeLiveContainers(2_000); process.exit(143) })
   process.once('SIGINT', () => { removeLiveContainers(2_000); process.exit(130) })
+}
+function trackLiveContainer(name: string) {
+  liveContainers.add(name)
+  ensureLiveExitHooks()
+}
+function trackLiveStagedRepoDir(dir: string) {
+  liveStagedRepoDirs.add(dir)
+  ensureLiveExitHooks()
 }
 const workerName = /^guardian-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
 
@@ -583,6 +610,201 @@ interface ContainerArgsInput {
   options?: WorkerSessionOptions
   /** One-shot only: host tmpfs dir bind-mounted at /guardian-ipc for large-output pointers. */
   ipcDir?: string
+}
+
+export interface PreparedReposMount {
+  /** Host directory bind-mounted read-only at `/repos`. */
+  mountDir: string
+  /** True when Guardian staged a clean container-readable copy instead of binding `reposDir` directly. */
+  staged: boolean
+  /** Number of secret/sensitive or unsafe entries excluded while staging. */
+  excludedCount: number
+  /** Remove any temporary staged directory (idempotent no-op when `staged === false`). */
+  cleanup(): void
+}
+
+const SENSITIVE_DOT_DIRS = new Set(['.ssh', '.aws', '.gnupg', '.kube', '.docker'])
+const SENSITIVE_EXACT_FILES = new Set([
+  '.git-credentials',
+  '.netrc',
+  '.npmrc',
+  '.pypirc',
+  '.htpasswd',
+  'id_rsa',
+  'id_ed25519',
+  'id_ecdsa',
+  'id_dsa',
+  'github-app.json',
+  'credentials.json',
+  'service-account.json',
+  'vault.json',
+  'vault.key',
+  'token.txt',
+  'secrets.json',
+])
+const SENSITIVE_FILE_EXT_RE = /\.(?:pat|salt|pem|key|p12|pfx|jks|keystore|kdbx|token)$/i
+const SAFE_ENV_TEMPLATE_RE = /^\.env\.(?:example|sample|template|dist|schema)$/i
+const SOURCE_CODE_EXT_RE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|cs|c|h|cc|cpp|hpp|swift|scala|sql|graphql|gql|md|html|css|scss|vue|svelte)$/i
+const GIT_CREDENTIAL_FILE_RE = /(?:^|\/)\.git\/(?:config|credentials|fetch_head)$/i
+const GIT_CONFIG_FILE_RE = /(?:^|\/)\.git\/config$/i
+const GIT_CONFIG_SECRET_RE = /^\s*\[credential(?:\s|\])|extraheader|^\s*(?:username|password|token)\s*=|https?:\/\/[^/@\s]+@/im
+
+function isSensitiveRepoEntry(relPosixPath: string, entryName: string, isDir: boolean): boolean {
+  const relLower = relPosixPath.toLowerCase()
+  const nameLower = entryName.toLowerCase()
+  if (isDir) {
+    if (SENSITIVE_DOT_DIRS.has(nameLower)) return true
+    if (relLower === '.git/hooks' || relLower.endsWith('/.git/hooks')) return true
+    return false
+  }
+  if (GIT_CREDENTIAL_FILE_RE.test(relLower)) return true
+  if (SENSITIVE_EXACT_FILES.has(nameLower)) return true
+  if (SENSITIVE_FILE_EXT_RE.test(nameLower)) return true
+  if (nameLower === '.env' || (nameLower.startsWith('.env.') && !SAFE_ENV_TEMPLATE_RE.test(nameLower))) {
+    return true
+  }
+  const parentSegments = relLower.split('/').slice(0, -1)
+  if (parentSegments.includes('credentials') && !SOURCE_CODE_EXT_RE.test(nameLower)) {
+    return true
+  }
+  return false
+}
+
+function gitConfigHasCredentials(filePath: string): boolean {
+  try {
+    const st = lstatSync(filePath)
+    if (!st.isFile() || st.size > 256 * 1024) return true
+    return GIT_CONFIG_SECRET_RE.test(readFileSync(filePath, 'utf8'))
+  } catch {
+    return true
+  }
+}
+
+function reposTreeNeedsStaging(resolvedRoot: string): boolean {
+  const rootStat = statSync(resolvedRoot)
+  // Non-root worker container (UID 10001) needs o+rx on `/repos` and every subdirectory,
+  // and o+r on every non-secret file inside it.
+  if ((rootStat.mode & 0o005) !== 0o005) return true
+
+  const inspect = (dir: string): boolean => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const fullPath = join(dir, entry.name)
+      const st = lstatSync(fullPath)
+      if (st.isSymbolicLink()) continue
+      const relPosix = relative(resolvedRoot, fullPath).split(sep).join('/')
+      if (st.isDirectory()) {
+        if (isSensitiveRepoEntry(relPosix, entry.name, true)) {
+          if ((st.mode & 0o005) !== 0) return true
+          continue
+        }
+        if ((st.mode & 0o005) !== 0o005) return true
+        if (inspect(fullPath)) return true
+      } else if (st.isFile()) {
+        if (isSensitiveRepoEntry(relPosix, entry.name, false)) {
+          if (GIT_CONFIG_FILE_RE.test(relPosix)) {
+            if ((st.mode & 0o004) !== 0 && gitConfigHasCredentials(fullPath)) return true
+            continue
+          }
+          if ((st.mode & 0o004) !== 0) return true
+          continue
+        }
+        if ((st.mode & 0o004) !== 0o004) return true
+      }
+    }
+    return false
+  }
+
+  return inspect(resolvedRoot)
+}
+
+function stageReadableReposTree(resolvedRoot: string): { mountDir: string; excludedCount: number } {
+  const rawStageDir = mkdtempSync(join(tmpdir(), 'guardian-repos-'))
+  chmodSync(rawStageDir, 0o755)
+  const mountDir = realpathSync(rawStageDir)
+  let excludedCount = 0
+
+  const copyDir = (srcDir: string, dstDir: string) => {
+    for (const entry of readdirSync(srcDir, { withFileTypes: true })) {
+      const srcChild = join(srcDir, entry.name)
+      const st = lstatSync(srcChild)
+      if (st.isSymbolicLink()) {
+        excludedCount += 1
+        continue
+      }
+      const relPosix = relative(resolvedRoot, srcChild).split(sep).join('/')
+      if (st.isDirectory()) {
+        if (isSensitiveRepoEntry(relPosix, entry.name, true)) {
+          excludedCount += 1
+          continue
+        }
+        const dstChild = join(dstDir, entry.name)
+        mkdirSync(dstChild)
+        chmodSync(dstChild, 0o755)
+        copyDir(srcChild, dstChild)
+      } else if (st.isFile()) {
+        if (isSensitiveRepoEntry(relPosix, entry.name, false)) {
+          excludedCount += 1
+          continue
+        }
+        const dstChild = join(dstDir, entry.name)
+        copyFileSync(srcChild, dstChild)
+        chmodSync(dstChild, 0o644)
+      }
+    }
+  }
+
+  try {
+    copyDir(resolvedRoot, mountDir)
+  } catch (error) {
+    try { rmSync(mountDir, { recursive: true, force: true }) } catch { /* ignore */ }
+    throw error
+  }
+  return { mountDir, excludedCount }
+}
+
+/**
+ * Validate and prepare a host `reposDir` for a read-only `/repos` bind mount into the non-root
+ * Docker worker (`UID 10001`). When the host tree lacks `o+rx` on directories or `o+r` on
+ * non-secret files (e.g. created under host `umask 0077` or `0o700`), stages a clean read-only
+ * copy with explicit `0o755`/`0o644` permissions while excluding credential/token files and
+ * leaving original host files (including `0600` secrets) completely unmodified.
+ */
+export function prepareReposMount(reposDir?: string): PreparedReposMount | null {
+  if (!reposDir) return null
+  if (/[\0,\r\n]/.test(reposDir)) {
+    throw new Error('Invalid repository mount path.')
+  }
+  if (!existsSync(reposDir)) return null
+  const st = statSync(reposDir)
+  if (!st.isDirectory()) {
+    throw new Error('Repository mount path must be an existing directory.')
+  }
+  const resolved = realpathSync(reposDir)
+  if (/[\0,\r\n]/.test(resolved)) {
+    throw new Error('Invalid resolved repository mount path.')
+  }
+  if (!reposTreeNeedsStaging(resolved)) {
+    return {
+      mountDir: resolved,
+      staged: false,
+      excludedCount: 0,
+      cleanup() { /* direct mount: never remove caller's directory */ },
+    }
+  }
+  const { mountDir, excludedCount } = stageReadableReposTree(resolved)
+  trackLiveStagedRepoDir(mountDir)
+  let cleaned = false
+  return {
+    mountDir,
+    staged: true,
+    excludedCount,
+    cleanup() {
+      if (cleaned) return
+      cleaned = true
+      liveStagedRepoDirs.delete(mountDir)
+      try { rmSync(mountDir, { recursive: true, force: true }) } catch { /* best-effort */ }
+    },
+  }
 }
 
 function resolveReposMountArgs(reposDir?: string): string[] {
@@ -1197,10 +1419,12 @@ export class LinuxWorkerBackend implements WorkerBackend {
     // One-shot containers exit before a pointer can be read via `docker exec`, so bind a host
     // tmpfs and read the spilled payload directly (validated by size + sha256).
     const ipcDir = makeOneShotIpcDir()
+    const preparedRepos = prepareReposMount(options?.reposDir)
+    const effectiveOptions = preparedRepos ? { ...options, reposDir: preparedRepos.mountDir } : options
     this.activeContainers.add(name)
     trackLiveContainer(name)
     try {
-      await this.docker(this.containerCreateArgs(name, job.assignmentId, [], options, ipcDir), deadline)
+      await this.docker(this.containerCreateArgs(name, job.assignmentId, [], effectiveOptions, ipcDir), deadline)
       const result = await this.docker(['container', 'start', '--attach', '--interactive', name], deadline, payload)
       const parsed = JSON.parse(result) as Record<string, unknown>
       if (parsed.resultRef) {
@@ -1210,6 +1434,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     } finally {
       try { rmSync(ipcDir, { recursive: true, force: true }) } catch { /* ignore */ }
       await this.removeContainer(name)
+      preparedRepos?.cleanup()
       this.activeContainers.delete(name)
       liveContainers.delete(name)
     }
@@ -1229,14 +1454,17 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const name = 'guardian-' + randomUUID()
     const timeoutMs = (req.timeoutMs ?? 30_000) + 15_000
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+    const preparedRepos = prepareReposMount(options?.reposDir)
+    const effectiveOptions = preparedRepos ? { ...options, reposDir: preparedRepos.mountDir } : options
     this.activeContainers.add(name)
     trackLiveContainer(name)
     try {
-      await this.docker(this.containerCreateArgs(name, assignmentId, [], options), deadline)
+      await this.docker(this.containerCreateArgs(name, assignmentId, [], effectiveOptions), deadline)
       const result = await this.docker(['container', 'start', '--attach', '--interactive', name], deadline, payload)
       return astVerifyResultSchema.parse(JSON.parse(result))
     } finally {
       await this.removeContainer(name)
+      preparedRepos?.cleanup()
       this.activeContainers.delete(name)
       liveContainers.delete(name)
     }
@@ -1256,11 +1484,16 @@ export class LinuxWorkerBackend implements WorkerBackend {
     else this.coldSessionCreates += 1
     this.activeContainers.add(name)
     trackLiveContainer(name)
+    let preparedRepos: PreparedReposMount | null = null
+    const cleanupRepos = () => { preparedRepos?.cleanup() }
     if (!pooled) {
       try {
-        await this.docker(this.containerCreateArgs(name, assignmentId, ['--session'], options), AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
+        preparedRepos = prepareReposMount(options?.reposDir)
+        const effectiveOptions = preparedRepos ? { ...options, reposDir: preparedRepos.mountDir } : options
+        await this.docker(this.containerCreateArgs(name, assignmentId, ['--session'], effectiveOptions), AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
       } catch (error) {
         await this.removeContainer(name)
+        cleanupRepos()
         this.activeContainers.delete(name)
         liveContainers.delete(name)
         throw error
@@ -1277,6 +1510,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       })
     } catch (error) {
       await this.removeContainer(name)
+      cleanupRepos()
       this.activeContainers.delete(name)
       liveContainers.delete(name)
       throw error
@@ -1363,7 +1597,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       this.activeContainers.delete(name)
       if (!preserveOnExit) {
         liveContainers.delete(name)
-        void removeContainer()
+        void removeContainer().finally(cleanupRepos)
       }
     })
     cli.once('error', error => {
@@ -1374,7 +1608,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       preserveOnExit = false
       this.activeContainers.delete(name)
       liveContainers.delete(name)
-      void removeContainer()
+      void removeContainer().finally(cleanupRepos)
     })
 
     const close = () => {
@@ -1432,6 +1666,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
         }
         preserveOnExit = false
         await this.removeContainer(name)
+        cleanupRepos()
         this.pooled.delete(name)
         this.activeContainers.delete(name)
         liveContainers.delete(name)
