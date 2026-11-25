@@ -63,6 +63,12 @@ import {
   type ExecReviewInput,
   type ExecTier3ApprovalInput,
 } from './exec-exchange.ts'
+import {
+  computeFindingFingerprint,
+  normalizeCwe,
+  normalizeEndpointTemplate,
+  normalizeOrigin,
+} from './finding-fingerprint.ts'
 import { alignClaimClass, parseRoleLabel } from './oracle-invariants.ts'
 import {
   buildOobReceipt,
@@ -232,6 +238,283 @@ function buildReplayFindingPatch(
   return { patch, cleanObserved }
 }
 
+
+const LEADING_HTTP_METHOD_RE = /^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS|TRACE)\s+(.+)$/i
+
+const CWE_ALIAS_GROUP_BY_CWE: Readonly<Record<string, string>> = {
+  'CWE-362': 'conservation_race',
+  'CWE-367': 'conservation_race',
+  'CWE-840': 'conservation_race',
+  'CWE-639': 'authorization',
+  'CWE-285': 'authorization',
+  'CWE-862': 'authorization',
+  'CWE-863': 'authorization',
+  'CWE-284': 'authorization',
+  'CWE-347': 'auth_crypto',
+  'CWE-287': 'auth_crypto',
+  'CWE-345': 'auth_crypto',
+  'CWE-613': 'session_revocation',
+  'CWE-384': 'session_revocation',
+  'CWE-444': 'parser_cache',
+  'CWE-436': 'parser_cache',
+  'CWE-918': 'cross_surface_ssrf',
+}
+
+const ORACLE_FAMILY_ALIAS_GROUP: Readonly<Record<string, string>> = {
+  economic_conservation: 'conservation_race',
+  dual_tenant_abac: 'authorization',
+  cryptographic_scope_replay: 'auth_crypto',
+  temporal_revocation: 'session_revocation',
+  parser_cache_differential: 'parser_cache',
+  cross_surface_pivot: 'cross_surface_ssrf',
+}
+
+const FINDING_STATUS_PRIORITY: Readonly<Record<Finding['status'], number>> = {
+  confirmed: 0,
+  static_verified: 1,
+  pending: 2,
+  inconclusive: 3,
+  dismissed: 4,
+}
+
+export interface AgentProofTargetInfo {
+  endpoint: string | null
+  normalizedEndpoint: string | null
+  method: string | null
+  terminalOracleFamily: string | null
+}
+
+function parseEndpointAndMethodCandidate(raw: unknown): { endpoint: string; method: string | null } | null {
+  if (typeof raw !== 'string') return null
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+  const verbMatch = LEADING_HTTP_METHOD_RE.exec(trimmed)
+  if (verbMatch?.[1] && verbMatch[2]) {
+    const path = verbMatch[2].trim()
+    if (path) return { endpoint: path, method: verbMatch[1].toUpperCase() }
+  }
+  return { endpoint: trimmed, method: null }
+}
+
+function normalizeMethodToken(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  const upper = raw.trim().toUpperCase()
+  if (!upper || upper === 'ANY') return null
+  return upper
+}
+
+function isLoopbackOrigin(origin: string): boolean {
+  try {
+    const host = new URL(origin).hostname.toLowerCase()
+    return (
+      host === 'localhost'
+      || host === '127.0.0.1'
+      || host === '::1'
+      || host === '[::1]'
+      || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
+    )
+  } catch {
+    return false
+  }
+}
+
+export function originsEquivalentForAgentProofDedupe(
+  originA: string,
+  originB: string,
+  normalizedEndpoint: string,
+): boolean {
+  const a = normalizeOrigin(originA)
+  const b = normalizeOrigin(originB)
+  if (!a || !b) return false
+  if (a === b) return true
+  // Local test targets frequently expose the same route through both a proxy origin and a direct
+  // API port on loopback; collapse only on matching non-root route templates.
+  return normalizedEndpoint !== '/' && isLoopbackOrigin(a) && isLoopbackOrigin(b)
+}
+
+export function methodsCompatibleForAgentProofDedupe(
+  methodA: string | null | undefined,
+  methodB: string | null | undefined,
+): boolean {
+  const a = normalizeMethodToken(methodA)
+  const b = normalizeMethodToken(methodB)
+  if (!a || !b) return true
+  return a === b
+}
+
+export function vulnClassesEquivalentForAgentProofDedupe(
+  a: { cwe?: string | null; category?: string | null; terminalOracleFamily?: string | null },
+  b: { cwe?: string | null; category?: string | null; terminalOracleFamily?: string | null },
+): boolean {
+  const famA = a.terminalOracleFamily?.trim().toLowerCase() || null
+  const famB = b.terminalOracleFamily?.trim().toLowerCase() || null
+  if (famA && famB) return famA === famB
+  const cweA = normalizeCwe(a.cwe, a.category)
+  const cweB = normalizeCwe(b.cwe, b.category)
+  if (cweA === cweB) return true
+  const groupA = (famA ? ORACLE_FAMILY_ALIAS_GROUP[famA] : undefined) ?? CWE_ALIAS_GROUP_BY_CWE[cweA]
+  const groupB = (famB ? ORACLE_FAMILY_ALIAS_GROUP[famB] : undefined) ?? CWE_ALIAS_GROUP_BY_CWE[cweB]
+  return Boolean(groupA && groupB && groupA === groupB)
+}
+
+export function extractAgentProofTarget(input: {
+  cleanCompositeBundle: V8CompositeProofBundle | null
+  receipt: ProofReceipt | null
+  baseSpec: DeclarativeReplaySpec
+  proof: Pick<AgentScriptProofResult, 'exchanges'>
+  envelope?: AgentScriptProofEnvelope
+}): AgentProofTargetInfo {
+  const terminalHop = input.cleanCompositeBundle
+    ? (input.cleanCompositeBundle.receipt.hops.find(
+        h => h.hopId === input.cleanCompositeBundle!.receipt.terminalImpact.terminalHopId,
+      ) ?? input.cleanCompositeBundle.receipt.hops[input.cleanCompositeBundle.receipt.hops.length - 1])
+    : undefined
+  const exchangeById = new Map(input.proof.exchanges.map(ex => [ex.exchangeId, ex]))
+  const terminalExchange = (() => {
+    const termExId = input.cleanCompositeBundle?.receipt.terminalImpact.terminalExchangeId
+    if (termExId && exchangeById.has(termExId)) return exchangeById.get(termExId)
+    if (!terminalHop) return undefined
+    const hopExchanges = [...terminalHop.exchangeIds]
+      .reverse()
+      .map(id => exchangeById.get(id))
+      .filter((ex): ex is NonNullable<typeof ex> => Boolean(ex))
+    return (
+      hopExchanges.find(ex => ex.sessionRole === 'probe' && typeof ex.status === 'number' && ex.status >= 200 && ex.status < 300)
+      ?? hopExchanges.find(ex => ex.sessionRole === 'probe')
+      ?? hopExchanges[0]
+    )
+  })()
+  const receiptExchange = (() => {
+    const ids = input.receipt?.exchangeIds ?? []
+    const matched = ids.map(id => exchangeById.get(id)).filter((ex): ex is NonNullable<typeof ex> => Boolean(ex))
+    return matched.find(ex => ex.sessionRole === 'probe') ?? matched[0]
+  })()
+  const baseSpecStep = input.baseSpec.kind === 'http_chain'
+    ? (input.baseSpec.steps.find(step => step.role === 'probe') ?? input.baseSpec.steps[0])
+    : undefined
+  const receiptRecord = input.receipt as (ProofReceipt & { endpoint?: string | null }) | null
+  const envelopeRecord = input.envelope as (AgentScriptProofEnvelope & { endpoint?: string; path?: string }) | undefined
+
+  const endpointCandidates: unknown[] = [
+    input.cleanCompositeBundle?.verification.terminalEndpoint,
+    terminalHop?.target.pathAndQuery,
+    terminalExchange?.pathAndQuery,
+    receiptRecord?.endpoint,
+    input.receipt?.target.pathAndQuery,
+    receiptExchange?.pathAndQuery,
+    baseSpecStep?.request.pathAndQuery,
+    envelopeRecord?.endpoint,
+    envelopeRecord?.path,
+    input.proof.exchanges.find(ex => ex.sessionRole === 'probe')?.pathAndQuery,
+    input.proof.exchanges[0]?.pathAndQuery,
+  ]
+  let parsedEndpoint: { endpoint: string; method: string | null } | null = null
+  for (const candidate of endpointCandidates) {
+    parsedEndpoint = parseEndpointAndMethodCandidate(candidate)
+    if (parsedEndpoint) break
+  }
+  const endpoint = parsedEndpoint?.endpoint ?? null
+  const normalizedEndpoint = endpoint ? normalizeEndpointTemplate(endpoint) : null
+
+  const matchingExchangeMethod = (() => {
+    if (!normalizedEndpoint) return null
+    const matching = [...input.proof.exchanges]
+      .reverse()
+      .filter(ex => normalizeEndpointTemplate(ex.pathAndQuery) === normalizedEndpoint)
+    const chosen = matching.find(ex => ex.sessionRole === 'probe') ?? matching[0]
+    return normalizeMethodToken(chosen?.method)
+  })()
+  const baseSpecMethod = baseSpecStep && (
+    !normalizedEndpoint || normalizeEndpointTemplate(baseSpecStep.request.pathAndQuery) === normalizedEndpoint
+  )
+    ? normalizeMethodToken(baseSpecStep.request.method)
+    : null
+
+  const method = parsedEndpoint?.method
+    ?? normalizeMethodToken(terminalHop?.target.method)
+    ?? normalizeMethodToken(terminalExchange?.method)
+    ?? normalizeMethodToken(input.receipt?.target.method)
+    ?? normalizeMethodToken(receiptExchange?.method)
+    ?? matchingExchangeMethod
+    ?? baseSpecMethod
+    ?? null
+
+  const rawFamily = input.cleanCompositeBundle?.verification.terminalOracleFamily
+    ?? input.cleanCompositeBundle?.receipt.terminalImpact.oracleFamily
+    ?? null
+  const terminalOracleFamily = typeof rawFamily === 'string' && rawFamily.trim()
+    ? rawFamily.trim().toLowerCase()
+    : null
+
+  return { endpoint, normalizedEndpoint, method, terminalOracleFamily }
+}
+
+function extractExistingFindingTargetMeta(
+  row: typeof findings.$inferSelect,
+  specRow?: ReplaySpecRow,
+): AgentProofTargetInfo {
+  const findingObj = row.finding as Finding & { evidence?: Record<string, unknown> }
+  const ev = findingObj.evidence && typeof findingObj.evidence === 'object' ? findingObj.evidence : undefined
+  const proofReceiptObj = specRow?.proofReceipt && typeof specRow.proofReceipt === 'object'
+    ? specRow.proofReceipt as unknown as Record<string, unknown>
+    : undefined
+  const compReceipt = (ev?.compositeReceipt ?? proofReceiptObj?.compositeReceipt) as CompositeProofReceipt | undefined
+  const compVer = (ev?.compositeVerification ?? proofReceiptObj?.compositeVerification) as CompositeReceiptVerification | undefined
+  const terminalHop = compReceipt && Array.isArray(compReceipt.hops)
+    ? (compReceipt.hops.find(h => h.hopId === compReceipt.terminalImpact?.terminalHopId)
+        ?? compReceipt.hops[compReceipt.hops.length - 1])
+    : undefined
+  const singleReceipt = specRow?.proofReceipt?.receipt
+  const specStep = specRow?.spec && specRow.spec.kind === 'http_chain'
+    ? (specRow.spec.steps.find(step => step.role === 'probe') ?? specRow.spec.steps[0])
+    : undefined
+
+  const endpointCandidates: unknown[] = [
+    ev?.terminalEndpoint,
+    compVer?.terminalEndpoint,
+    terminalHop?.target?.pathAndQuery,
+    singleReceipt?.target?.pathAndQuery,
+    specStep?.request?.pathAndQuery,
+  ]
+  let parsedEndpoint: { endpoint: string; method: string | null } | null = null
+  for (const candidate of endpointCandidates) {
+    parsedEndpoint = parseEndpointAndMethodCandidate(candidate)
+    if (parsedEndpoint) break
+  }
+  const endpoint = parsedEndpoint?.endpoint ?? null
+  const normalizedEndpoint = endpoint ? normalizeEndpointTemplate(endpoint) : null
+
+  const specMethod = specStep && (
+    !normalizedEndpoint || normalizeEndpointTemplate(specStep.request.pathAndQuery) === normalizedEndpoint
+  )
+    ? normalizeMethodToken(specStep.request.method)
+    : null
+  const method = parsedEndpoint?.method
+    ?? normalizeMethodToken(terminalHop?.target?.method)
+    ?? normalizeMethodToken(singleReceipt?.target?.method)
+    ?? specMethod
+    ?? null
+
+  const rawFamily = ev?.terminalOracleFamily
+    ?? compVer?.terminalOracleFamily
+    ?? compReceipt?.terminalImpact?.oracleFamily
+    ?? null
+  const terminalOracleFamily = typeof rawFamily === 'string' && rawFamily.trim()
+    ? rawFamily.trim().toLowerCase()
+    : null
+
+  return { endpoint, normalizedEndpoint, method, terminalOracleFamily }
+}
+
+function existingRowHasCompositeProof(
+  row: typeof findings.$inferSelect,
+  specRow?: ReplaySpecRow,
+): boolean {
+  const ev = (row.finding as Finding & { evidence?: Record<string, unknown> }).evidence
+  if (ev && typeof ev === 'object' && ev.compositeReceipt) return true
+  const pr = specRow?.proofReceipt as unknown as Record<string, unknown> | null | undefined
+  return Boolean(pr && typeof pr === 'object' && pr.compositeReceipt)
+}
 
 /**
  * Confirmation attribution for an agent script proof: reporting vocabulary for a class whose
@@ -1614,12 +1897,6 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       stepStatuses: [],
       retriesRemaining: maxInlineVerifyRetries,
     }
-    const findingId = this.storage.findDuplicateChainFinding(run.id, run.goalRevision, {
-      origin,
-      cwe: attribution.cwe,
-      category: attribution.category,
-      title: cleanTitle,
-    })?.id ?? randomUUID()
     const baseSpec = this.agentProofAttributionSpec({
       origin,
       title: cleanTitle,
@@ -1629,82 +1906,157 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       proof,
       receipt,
     })
-    const spec: DeclarativeReplaySpec = cleanCompositeBundle
-      ? ({
-          ...baseSpec,
-          compositeReceipt: cleanCompositeBundle.receipt,
-          compositeVerification: cleanCompositeBundle.verification,
-        } as unknown as DeclarativeReplaySpec)
-      : baseSpec
-    const proofReceiptRow: ReplayProofReceiptRow | null = cleanCompositeBundle
-      ? serializeCompositeProofReceiptRow(cleanCompositeBundle, receipt && verification ? { receipt, verification } : null)
-      : receipt && verification
-        ? serializeProofReceiptRow({ receipt, verification })
-        : null
-    const proofRecord: AgentScriptProofRecord = {
-      replaySpecId: '',
-      findingId,
-      verdict: 'confirmed',
-      runtime: input.runtime,
-      scriptSha256,
-      artifactId: artifact.id,
-      receipt: proofReceiptRow,
-      createdAt: Date.now(),
-    }
-    const specRow = this.storage.createReplaySpec(
-      run,
-      assignment,
-      findingId,
-      spec,
-      [origin],
-      { initialAttemptCount: 1, verifiedInline: true, lastVerificationDiff: feedback, proof: proofRecord },
+    const proofTarget = extractAgentProofTarget({
+      cleanCompositeBundle,
+      receipt,
+      baseSpec,
+      proof,
+      envelope,
+    })
+    const computedFingerprint = proofTarget.endpoint
+      ? computeFindingFingerprint({
+          origin,
+          cwe: attribution.cwe,
+          category: attribution.category,
+          endpoint: proofTarget.endpoint,
+          method: proofTarget.method,
+        })
+      : null
+    const fingerprintHash = computedFingerprint?.hash
+    const primaryDup = this.storage.findDuplicateChainFinding(run.id, run.goalRevision, {
+      origin,
+      cwe: attribution.cwe,
+      category: attribution.category,
+      title: cleanTitle,
+      ...(proofTarget.endpoint ? { endpoint: proofTarget.endpoint } : {}),
+      ...(proofTarget.method ? { method: proofTarget.method } : {}),
+      ...(fingerprintHash ? { fingerprintHash } : {}),
+    })
+    const existingDup = primaryDup ?? this.findCorroboratingAgentProofFinding(run, {
+      origin,
+      cwe: attribution.cwe,
+      category: attribution.category,
+      normalizedEndpoint: proofTarget.normalizedEndpoint,
+      method: proofTarget.method,
+      terminalOracleFamily: proofTarget.terminalOracleFamily,
+    })
+    const findingId = existingDup?.id ?? randomUUID()
+    const effectiveFingerprintHash = existingDup?.fingerprintHash ?? existingDup?.finding.fingerprintHash ?? fingerprintHash
+    const existingCanonicalSpecId = existingDup?.replaySpecId ?? existingDup?.finding.replaySpecId ?? null
+    const existingSpecRow = existingDup && existingCanonicalSpecId
+      ? this.storage.listReplaySpecsForFinding(run.id, existingDup.id).find(s => s.id === existingCanonicalSpecId)
+      : undefined
+    const existingHasComposite = Boolean(existingDup && existingRowHasCompositeProof(existingDup, existingSpecRow))
+    const reuseExistingConfirmedSpec = Boolean(
+      existingDup
+      && existingDup.finding.status === 'confirmed'
+      && existingCanonicalSpecId
+      && (!cleanCompositeBundle || existingHasComposite),
     )
 
-    const finding: Finding & { evidence?: Record<string, unknown> } = {
-      id: findingId,
-      origin,
-      title: cleanTitle,
-      status: 'confirmed',
-      severity,
-      reason: cleanCompositeBundle?.verification.reason ?? verification?.reason ?? proof.verdict.detail ?? 'Confirmed by a Layer-3 verification script.',
-      remediation: attribution.remediation,
-      impact: cleanCompositeBundle?.receipt.terminalImpact.claimedImpact ?? receipt?.claimedDelta ?? attribution.impact,
-      recheck: `Re-run the persisted ${input.runtime} proof script and re-validate its receipt.`,
-      category: attribution.category,
-      cwe: attribution.cwe,
-      confidence: 'high',
-      verification: cleanCompositeBundle
-        ? `ProofReceipt (Composite) ${cleanCompositeBundle.receipt.chainId} · ${cleanCompositeBundle.verification.hopCount} hops · ${cleanCompositeBundle.receipt.replayMode} · ${cleanCompositeBundle.verification.reason}`
-        : receipt
-          ? `ProofReceipt ${receipt.exchangeIds[0] ?? scriptSha256.slice(0, 12)} · ${verification?.rule ?? 'receipt'} rule · ${verification?.reason ?? 'verified'}`
-          : `Layer-3 script proof (${input.runtime}) · ${proof.verdict.attempts.length} signed runs · digest ${proof.transcriptDigests[0]?.slice(0, 12) ?? 'n/a'}`,
-      verificationTier: 'runtime_confirmed',
-      findingKind: 'multi_step_chain',
-      replaySpecId: specRow.id,
-      exchangeIds: compositeExchangeIds.length
-        ? compositeExchangeIds
-        : receipt?.exchangeIds?.length
-          ? [...receipt.exchangeIds]
-          : envelope.exchangeIds,
-      evidenceIds: [artifact.id],
-      ...(cleanCompositeBundle ? {
-        evidence: {
-          compositeReceipt: cleanCompositeBundle.receipt,
-          compositeVerification: cleanCompositeBundle.verification,
-          hopActors: cleanCompositeBundle.hopActors,
-          ...(cleanCompositeBundle.verification.terminalOracleFamily ? { terminalOracleFamily: cleanCompositeBundle.verification.terminalOracleFamily } : {}),
-          ...(cleanCompositeBundle.verification.terminalEndpoint ? { terminalEndpoint: cleanCompositeBundle.verification.terminalEndpoint } : {}),
-        },
-      } : {}),
-      scopeRevision: run.scopeRevision,
+    let canonicalSpecId: string
+    if (reuseExistingConfirmedSpec) {
+      canonicalSpecId = existingCanonicalSpecId!
+    } else {
+      const spec: DeclarativeReplaySpec = cleanCompositeBundle
+        ? ({
+            ...baseSpec,
+            compositeReceipt: cleanCompositeBundle.receipt,
+            compositeVerification: cleanCompositeBundle.verification,
+          } as unknown as DeclarativeReplaySpec)
+        : baseSpec
+      const proofReceiptRow: ReplayProofReceiptRow | null = cleanCompositeBundle
+        ? serializeCompositeProofReceiptRow(cleanCompositeBundle, receipt && verification ? { receipt, verification } : null)
+        : receipt && verification
+          ? serializeProofReceiptRow({ receipt, verification })
+          : null
+      const proofRecord: AgentScriptProofRecord = {
+        replaySpecId: '',
+        findingId,
+        verdict: 'confirmed',
+        runtime: input.runtime,
+        scriptSha256,
+        artifactId: artifact.id,
+        receipt: proofReceiptRow,
+        createdAt: Date.now(),
+      }
+      const specRow = this.storage.createReplaySpec(
+        run,
+        assignment,
+        findingId,
+        spec,
+        [origin],
+        { initialAttemptCount: 1, verifiedInline: true, lastVerificationDiff: feedback, proof: proofRecord },
+      )
+      canonicalSpecId = specRow.id
     }
-    this.storage.upsertChainFinding(run, asset.id, finding, specRow.id, [origin])
+
+    const incomingExchangeIds = compositeExchangeIds.length
+      ? compositeExchangeIds
+      : receipt?.exchangeIds?.length
+        ? [...receipt.exchangeIds]
+        : envelope.exchangeIds
+
+    const finding: Finding & { evidence?: Record<string, unknown> } = reuseExistingConfirmedSpec && existingDup
+      ? {
+          ...existingDup.finding,
+          id: existingDup.id,
+          severity,
+          ...(effectiveFingerprintHash ? { fingerprintHash: effectiveFingerprintHash } : {}),
+          replaySpecId: canonicalSpecId,
+          exchangeIds: [...new Set([...(existingDup.finding.exchangeIds ?? []), ...incomingExchangeIds])],
+          evidenceIds: [...new Set([...existingDup.finding.evidenceIds, artifact.id])],
+          scopeRevision: run.scopeRevision,
+        }
+      : {
+          id: findingId,
+          origin,
+          title: cleanTitle,
+          status: 'confirmed',
+          severity,
+          reason: cleanCompositeBundle?.verification.reason ?? verification?.reason ?? proof.verdict.detail ?? 'Confirmed by a Layer-3 verification script.',
+          remediation: attribution.remediation,
+          impact: cleanCompositeBundle?.receipt.terminalImpact.claimedImpact ?? receipt?.claimedDelta ?? attribution.impact,
+          recheck: `Re-run the persisted ${input.runtime} proof script and re-validate its receipt.`,
+          category: attribution.category,
+          cwe: attribution.cwe,
+          confidence: 'high',
+          verification: cleanCompositeBundle
+            ? `ProofReceipt (Composite) ${cleanCompositeBundle.receipt.chainId} · ${cleanCompositeBundle.verification.hopCount} hops · ${cleanCompositeBundle.receipt.replayMode} · ${cleanCompositeBundle.verification.reason}`
+            : receipt
+              ? `ProofReceipt ${receipt.exchangeIds[0] ?? scriptSha256.slice(0, 12)} · ${verification?.rule ?? 'receipt'} rule · ${verification?.reason ?? 'verified'}`
+              : `Layer-3 script proof (${input.runtime}) · ${proof.verdict.attempts.length} signed runs · digest ${proof.transcriptDigests[0]?.slice(0, 12) ?? 'n/a'}`,
+          verificationTier: 'runtime_confirmed',
+          findingKind: 'multi_step_chain',
+          ...(effectiveFingerprintHash ? { fingerprintHash: effectiveFingerprintHash } : {}),
+          replaySpecId: canonicalSpecId,
+          exchangeIds: incomingExchangeIds,
+          evidenceIds: [artifact.id],
+          ...(cleanCompositeBundle ? {
+            evidence: {
+              compositeReceipt: cleanCompositeBundle.receipt,
+              compositeVerification: cleanCompositeBundle.verification,
+              hopActors: cleanCompositeBundle.hopActors,
+              ...(cleanCompositeBundle.verification.terminalOracleFamily ? { terminalOracleFamily: cleanCompositeBundle.verification.terminalOracleFamily } : {}),
+              ...(cleanCompositeBundle.verification.terminalEndpoint ? { terminalEndpoint: cleanCompositeBundle.verification.terminalEndpoint } : {}),
+            },
+          } : {}),
+          scopeRevision: run.scopeRevision,
+        }
+    const upsertAssetId = existingDup?.assetId ?? asset.id
+    const upsertOrigins = existingDup
+      ? [...new Set([...existingDup.sourceOrigins, origin])]
+      : [origin]
+    this.storage.upsertChainFinding(run, upsertAssetId, finding, canonicalSpecId, upsertOrigins)
     recordReportedFindingCoverage(this.storage, run, assignment.id, origin, attribution.category, `Confirmed via agent script proof: ${cleanTitle}`, findingId, (r, o) => this.host.permitted(r, o))
     this.storage.event(run.id, 'agent.script_proof_confirmed', `Agent script proof confirmed a ${attribution.label} finding on ${origin}.`, {
       findingId,
-      replaySpecId: specRow.id,
+      replaySpecId: canonicalSpecId,
       artifactId: artifact.id,
       scriptSha256,
+      deduplicated: Boolean(existingDup),
+      ...(effectiveFingerprintHash ? { fingerprintHash: effectiveFingerprintHash } : {}),
+      ...(proofTarget.normalizedEndpoint ? { normalizedEndpoint: proofTarget.normalizedEndpoint } : {}),
       receiptRule: cleanCompositeBundle ? `composite:${cleanCompositeBundle.receipt.replayMode}` : (verification?.rule ?? null),
       ...(cleanCompositeBundle ? {
         chainId: cleanCompositeBundle.receipt.chainId,
@@ -1716,9 +2068,55 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     })
     return {
       findingId,
-      replaySpecId: specRow.id,
+      replaySpecId: canonicalSpecId,
       receiptId: cleanCompositeBundle?.receipt.chainId ?? receipt?.exchangeIds[0] ?? null,
     }
+  }
+
+  private findCorroboratingAgentProofFinding(
+    run: Run,
+    candidate: {
+      origin: string
+      cwe: string
+      category: OwaspCategory
+      normalizedEndpoint: string | null
+      method: string | null
+      terminalOracleFamily: string | null
+    },
+  ): typeof findings.$inferSelect | undefined {
+    if (!candidate.normalizedEndpoint) return undefined
+    const rows = this.storage.db.select().from(findings).where(and(
+      eq(findings.runId, run.id),
+      eq(findings.goalRevision, run.goalRevision),
+      eq(findings.findingKind, 'multi_step_chain'),
+    )).all()
+    if (!rows.length) return undefined
+
+    const allSpecs = this.storage.listReplaySpecs(run.id)
+    const specById = new Map(allSpecs.map(s => [s.id, s]))
+    const specByFindingId = new Map<string, ReplaySpecRow>()
+    for (const spec of allSpecs) {
+      if (!specByFindingId.has(spec.findingId)) specByFindingId.set(spec.findingId, spec)
+    }
+
+    const matches = rows.filter(row => {
+      const linkedSpec = (row.replaySpecId ? specById.get(row.replaySpecId) : undefined)
+        ?? specByFindingId.get(row.id)
+      const meta = extractExistingFindingTargetMeta(row, linkedSpec)
+      if (!meta.normalizedEndpoint || meta.normalizedEndpoint !== candidate.normalizedEndpoint) return false
+      if (!methodsCompatibleForAgentProofDedupe(candidate.method, meta.method)) return false
+      if (!vulnClassesEquivalentForAgentProofDedupe(
+        candidate,
+        { cwe: row.finding.cwe, category: row.finding.category, terminalOracleFamily: meta.terminalOracleFamily },
+      )) return false
+      const existingOrigins = [row.finding.origin, ...(row.sourceOrigins ?? [])]
+      return existingOrigins.some(existingOrigin =>
+        originsEquivalentForAgentProofDedupe(candidate.origin, existingOrigin, candidate.normalizedEndpoint!),
+      )
+    })
+    if (!matches.length) return undefined
+    matches.sort((a, b) => FINDING_STATUS_PRIORITY[a.finding.status] - FINDING_STATUS_PRIORITY[b.finding.status])
+    return matches[0]
   }
 
 
