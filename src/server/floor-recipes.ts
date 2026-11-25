@@ -120,6 +120,10 @@ export interface FloorRequestSpec {
   jsonBody?: unknown
   textBody?: string
   headers?: Record<string, string>
+  /** Opaque browser-session jar handle (cookie/CSRF state) for form carriers. */
+  session?: string
+  /** Bind the route's CSRF token (hidden field + cookie) on this arm. */
+  csrfBind?: boolean
 }
 
 /** One host-recorded exchange. Ids/timings are the host's, never the recipe's. */
@@ -266,6 +270,28 @@ export interface BooleanOrTimingArgs extends FloorRecipeBaseArgs {
   quoteStyle?: 'single' | 'double' | 'numeric'
   /** Exact proven single-template shape (`{{baseline}}` / `{{sql_expr}}` placeholders). */
   valueTemplate?: string
+  /**
+   * Full per-arm request overrides. Needed for carriers the path/body shortcuts cannot express:
+   * a header parameter, a path segment, an XML document, or a GraphQL variable envelope.
+   */
+  controlRequest?: FloorArmRequest
+  probeRequest?: FloorArmRequest
+  contradictionRequest?: FloorArmRequest
+  /** Opaque session jar and CSRF binding applied to every arm (form carriers). */
+  session?: string
+  csrfBind?: boolean
+  /** Same-origin page fetched first so the jar obtains cookies + a CSRF token. */
+  primePath?: string
+}
+
+/** Per-arm request override used by the boolean/status/timing modes. */
+export interface FloorArmRequest {
+  pathAndQuery?: string
+  headers?: Record<string, string>
+  jsonBody?: unknown
+  textBody?: string
+  session?: string
+  csrfBind?: boolean
 }
 
 export interface OobCallbackArgs extends FloorRecipeBaseArgs {
@@ -526,7 +552,7 @@ class RecipeContext implements FloorRecipeContext {
     }
   }
 
-  private recordExchange(spec: FloorRequestSpec, exchange: FloorExchange, index: number): FloorRecipeStep {
+  private recordExchange(spec: FloorRequestSpec, exchange: FloorExchange, index: number, measuredDurationMs?: number): FloorRecipeStep {
     const exchangeId = exchange.exchangeId
       ?? this.deps.nextExchangeId?.()
       ?? `fr-${index}`
@@ -569,7 +595,7 @@ class RecipeContext implements FloorRecipeContext {
     this.entries.push({
       exchangeId,
       step,
-      ...(exchange.durationMs !== undefined ? { durationMs: exchange.durationMs } : {}),
+      durationMs: exchange.durationMs ?? measuredDurationMs ?? 0,
       carrierText: exchange.carrierText ?? carrierTextOf(spec),
       evidenceRole: spec.role,
     })
@@ -589,8 +615,9 @@ class RecipeContext implements FloorRecipeContext {
     }
     this.exchangeCount += 1
     const index = this.exchangeCount
+    const startedAt = Date.now()
     const exchange = await this.deps.request(spec)
-    return this.recordExchange(spec, exchange, index)
+    return this.recordExchange(spec, exchange, index, Math.max(0, Date.now() - startedAt))
   }
 
   async sendBurst(specs: readonly FloorRequestSpec[]): Promise<FloorRecipeStep[]> {
@@ -878,10 +905,46 @@ const persistedMutation = defineRecipe<PersistedMutationArgs>('persisted_mutatio
  * Boolean-or-timing SQL injection. Timing uses host-recorded durations (>3x separation); boolean
  * uses paired rounds whose structural response difference must reproduce with a stable control.
  */
+/** Build one arm, honouring a full per-arm override when the carrier is not path/JSON. */
+function armRequest(
+  args: BooleanOrTimingArgs,
+  arm: 'control' | 'probe',
+  fallbackPath: string,
+  fallbackJson: unknown,
+  actor: FloorActor,
+  role?: string,
+): FloorRequestSpec {
+  const override = arm === 'control' ? args.controlRequest : args.probeRequest
+  const jsonBody = override?.jsonBody !== undefined ? override.jsonBody : fallbackJson
+  return {
+    arm,
+    role: role ?? (arm === 'control' ? 'boolean_control' : 'boolean_probe'),
+    method: args.method,
+    pathAndQuery: override?.pathAndQuery ?? fallbackPath,
+    actor,
+    ...(override?.headers ?? args.headers ? { headers: { ...(args.headers ?? {}), ...(override?.headers ?? {}) } } : {}),
+    ...(jsonBody !== undefined ? { jsonBody } : {}),
+    ...(override?.textBody !== undefined ? { textBody: override.textBody } : {}),
+    ...(override?.session ?? args.session ? { session: override?.session ?? args.session } : {}),
+    ...((override?.csrfBind ?? args.csrfBind) ? { csrfBind: true } : {}),
+  }
+}
+
 const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', async (args, ctx) => {
   const actor = args.actor ?? ANONYMOUS
   const controlPath = args.controlPathAndQuery ?? args.pathAndQuery
   const probePath = args.probePathAndQuery ?? args.pathAndQuery
+  if (args.session && args.primePath) {
+    // Prime the jar (cookies + hidden CSRF token) before any arm; not part of the receipt.
+    await ctx.send({
+      arm: 'setup',
+      role: 'session_prime',
+      method: 'GET',
+      pathAndQuery: args.primePath,
+      actor,
+      ...(args.headers ? { headers: args.headers } : {}),
+    })
+  }
 
   if (args.mode === 'boolean') {
     const param = args.param ?? deriveDifferingParam(controlPath, probePath)
@@ -894,24 +957,8 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
     const exchangeIds: string[] = []
     let serverError = false
     for (let round = 0; round < rounds; round += 1) {
-      const control = await ctx.send({
-        arm: 'control',
-        role: 'boolean_control',
-        method: args.method,
-        pathAndQuery: controlPath,
-        actor,
-        ...(args.headers ? { headers: args.headers } : {}),
-        ...(args.controlJsonBody !== undefined ? { jsonBody: args.controlJsonBody } : {}),
-      })
-      const probe = await ctx.send({
-        arm: 'probe',
-        role: 'boolean_probe',
-        method: args.method,
-        pathAndQuery: probePath,
-        actor,
-        ...(args.headers ? { headers: args.headers } : {}),
-        ...(args.probeJsonBody !== undefined ? { jsonBody: args.probeJsonBody } : {}),
-      })
+      const control = await ctx.send(armRequest(args, 'control', controlPath, args.controlJsonBody, actor))
+      const probe = await ctx.send(armRequest(args, 'probe', probePath, args.probeJsonBody, actor))
       exchangeIds.push(control.exchangeId, probe.exchangeId)
       if ((control.exchange.status ?? 0) >= 500 || (probe.exchange.status ?? 0) >= 500) serverError = true
     }
@@ -939,33 +986,9 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
     for (let round = 0; round < rounds; round += 1) {
       // The benign baseline is what separates a predicate contrast from a single malformed request:
       // it is the same request without the boolean operator and must answer 2xx.
-      const benign = await ctx.send({
-        arm: 'control',
-        role: 'benign_baseline',
-        method: args.method,
-        pathAndQuery: controlPath,
-        actor,
-        ...(args.headers ? { headers: args.headers } : {}),
-        ...(args.controlJsonBody !== undefined ? { jsonBody: args.controlJsonBody } : {}),
-      })
-      const tautology = await ctx.send({
-        arm: 'probe',
-        role: 'tautology',
-        method: args.method,
-        pathAndQuery: probePath,
-        actor,
-        ...(args.headers ? { headers: args.headers } : {}),
-        ...(args.probeJsonBody !== undefined ? { jsonBody: args.probeJsonBody } : {}),
-      })
-      const contradiction = await ctx.send({
-        arm: 'probe',
-        role: 'contradiction',
-        method: args.method,
-        pathAndQuery: contradictionPath,
-        actor,
-        ...(args.headers ? { headers: args.headers } : {}),
-        ...(args.contradictionJsonBody !== undefined ? { jsonBody: args.contradictionJsonBody } : {}),
-      })
+      const benign = await ctx.send(armRequest(args, 'control', controlPath, args.controlJsonBody, actor, 'benign_baseline'))
+      const tautology = await ctx.send(armRequest(args, 'probe', probePath, args.probeJsonBody, actor, 'tautology'))
+      const contradiction = await ctx.send(armRequest(args, 'probe', contradictionPath, args.contradictionJsonBody, actor, 'contradiction'))
       exchangeIds.push(benign.exchangeId, tautology.exchangeId, contradiction.exchangeId)
       ctx.require(isSuccess(benign.exchange.status), 'benign_baseline', `The benign baseline returned ${benign.exchange.status ?? 'no status'} instead of a 2xx.`)
       ctx.require(isSuccess(tautology.exchange.status), 'tautology', `The tautology arm returned ${tautology.exchange.status ?? 'no status'} instead of a 2xx.`)
@@ -985,24 +1008,8 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
     })
   }
 
-  const control = await ctx.send({
-    arm: 'control',
-    role: 'timing_control',
-    method: args.method,
-    pathAndQuery: controlPath,
-    actor,
-    ...(args.headers ? { headers: args.headers } : {}),
-    ...(args.controlJsonBody !== undefined ? { jsonBody: args.controlJsonBody } : {}),
-  })
-  const probe = await ctx.send({
-    arm: 'probe',
-    role: 'timing_probe',
-    method: args.method,
-    pathAndQuery: probePath,
-    actor,
-    ...(args.headers ? { headers: args.headers } : {}),
-    ...(args.probeJsonBody !== undefined ? { jsonBody: args.probeJsonBody } : {}),
-  })
+  const control = await ctx.send(armRequest(args, 'control', controlPath, args.controlJsonBody, actor, 'timing_control'))
+  const probe = await ctx.send(armRequest(args, 'probe', probePath, args.probeJsonBody, actor, 'timing_probe'))
 
   return buildProofReceipt({
     vulnClass: args.receiptClass ?? args.vulnClass,
@@ -1782,6 +1789,8 @@ export function brokerFloorRecipeDeps(options: FloorRecipeBrokerOptions): FloorR
       ...(options.runId ? { runId: options.runId } : {}),
       ...(options.assignmentId ? { assignmentId: options.assignmentId } : {}),
       ...(options.traceId ? { traceId: options.traceId } : {}),
+      ...(spec.session ? { session: spec.session } : {}),
+      ...(spec.csrfBind ? { csrfBind: true as never } : {}),
       followRedirects: false,
     }
   }

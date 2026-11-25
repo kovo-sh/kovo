@@ -1499,6 +1499,10 @@ function bodySignature(arm: BooleanDifferentialArm, param?: string | null): Map<
           const lines = text.split('\n').length
           return lines <= 1 ? 'len:1' : lines <= 8 ? 'len:few' : 'len:many'
         })())
+        // Non-JSON payloads (XML/HTML/text) still carry structure: the number of tags/elements is a
+        // stable shape signal for a boolean differential (e.g. two `<item>` rows vs none).
+        const tags = (text.match(/<\s*[A-Za-z][^>]*>/g) ?? []).length
+        out.set('body.tags', tags === 0 ? 'tags:0' : tags <= 2 ? 'tags:few' : tags <= 8 ? 'tags:many' : 'tags:lots')
         return out
       })()
   signature.set('$status', arm.status === null ? 'none' : `${Math.floor(arm.status / 100)}xx`)
@@ -1560,17 +1564,26 @@ function maskedPath(pathAndQuery: string | undefined, param: string): string {
   try {
     const url = new URL(pathAndQuery, 'http://guardian.invalid')
     if (url.searchParams.has(param)) url.searchParams.set(param, '{{injected}}')
-    return `${url.pathname}?${[...url.searchParams.entries()].map(([k, v]) => `${k}=${v}`).sort().join('&')}`
+    let pathname = url.pathname
+    // A path-carried parameter shows up as a segment carrying SQL syntax (quote/comment/operator).
+    // Masking that segment is masking the injected value itself, not a different route.
+    if (!url.searchParams.has(param) && /(?:%27|'|%20AND%20|%20OR%20|--|%2F\*)/i.test(pathname)) {
+      pathname = pathname.replace(/\/[^/]+$/, '/{{injected}}')
+    }
+    return `${pathname}?${[...url.searchParams.entries()].map(([k, v]) => `${k}=${v}`).sort().join('&')}`
   } catch {
     return pathAndQuery
   }
 }
 
-function canonicalHeaders(headers: Record<string, string> | null | undefined): Record<string, string> {
+function canonicalHeaders(headers: Record<string, string> | null | undefined, param?: string): Record<string, string> {
   const out: Record<string, string> = {}
+  const injected = param ? param.toLowerCase() : null
   for (const [key, value] of Object.entries(headers ?? {})) {
-    if (booleanVolatileHeaders.has(key.toLowerCase())) continue
-    out[key.toLowerCase()] = value
+    const lower = key.toLowerCase()
+    if (booleanVolatileHeaders.has(lower)) continue
+    // A header-carried parameter is the injected value; mask exactly that header, nothing else.
+    out[lower] = injected && lower === injected ? '{{injected}}' : value
   }
   return out
 }
@@ -1580,7 +1593,7 @@ function requestShape(arm: BooleanDifferentialArm, param: string): string {
     method: (arm.method ?? '').toUpperCase(),
     path: maskedPath(arm.pathAndQuery, param),
     json: arm.requestJson === undefined ? null : maskJsonParam(arm.requestJson, param),
-    headers: canonicalHeaders(arm.requestHeaders),
+    headers: canonicalHeaders(arm.requestHeaders, param),
   })
 }
 

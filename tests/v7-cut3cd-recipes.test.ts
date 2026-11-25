@@ -230,8 +230,10 @@ describe('cut3cd: SQL spec envelope emission', () => {
     assert.ok(recipe, 'expected a recipe envelope')
     assert.equal(recipe!.recipeId, 'boolean_or_timing')
     assert.equal(recipe!.args.mode, 'boolean')
-    assert.match(String(recipe!.args.controlPathAndQuery), /q=widgets/)
-    assert.match(String(recipe!.args.probePathAndQuery), /1%3D1|1=1/)
+    // The receipt boolean rule pairs a TRUE predicate (control) with a FALSE one (probe): a
+    // benign baseline vs true arm is structurally identical and could never confirm.
+    assert.match(String(recipe!.args.controlPathAndQuery), /1%3D1|1=1/)
+    assert.match(String(recipe!.args.probePathAndQuery), /1%3D2|1=2/)
   })
 
   test('an error-fingerprint spec carries a status mode envelope', () => {
@@ -337,5 +339,67 @@ describe('cut3cd: conserved_balance recipe', () => {
     }
     const execution = await runCut3Recipe(cut3FloorRecipe('conserved_balance', { ...conservedArgs }), failing)
     assert.equal(execution.result.confirmed, false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Cut 3d/3c: carrier coverage for the SQL recipe envelope (xben-25 regression)
+// ---------------------------------------------------------------------------
+
+function outcomeFor(location: 'form' | 'header' | 'path' | 'xml' | 'query', anomalies: Array<Record<string, unknown>>, pathAndQuery: string): HypothesisOutcome {
+  return {
+    hyp: {
+      endpoint: { origin, path: pathAndQuery, method: 'POST', params: [{ name: 'q', location }] },
+      method: 'POST',
+      path: pathAndQuery,
+      param: { name: 'q', location },
+      location,
+    },
+    verdict: 'signal',
+    anomalies,
+    details: { booleanSignals: [{ passed: true, rounds: [{ statusBase: 200, statusTrue: 200, statusFalse: 200 }] }] },
+    csrfRejected: false,
+    contextReset: false,
+    tierBlocked: false,
+    requests: 4,
+    ctx: { baseline: 'manuals' },
+  } as unknown as HypothesisOutcome
+}
+
+const carrierEnv = { origin, owner: 'owner', caps: { sessionAndCsrf: false }, session: 's' } as unknown as ProbeEnv
+
+describe('cut3cd: SQL recipe carrier coverage', () => {
+  test('form carriers send url-encoded true/false arms, not JSON', () => {
+    const specs = synthSqlBoolean(outcomeFor('form', [{ type: 'boolean_differential', style: 'and_branch', baselineValue: 'manuals' }], '/search/form'), carrierEnv)
+    const args = (specs[0]!.spec as { recipe: { args: Record<string, { textBody?: string }> } }).recipe.args
+    assert.match(String(args.controlRequest.textBody), /q=manuals%27\+AND\+1%3D1/)
+    assert.match(String(args.probeRequest.textBody), /q=manuals%27\+AND\+1%3D2/)
+  })
+
+  test('header carriers vary the named header', () => {
+    const specs = synthSqlBoolean(outcomeFor('header', [{ type: 'boolean_differential', style: 'and_branch', baselineValue: 'trk-100' }], '/api/track'), carrierEnv)
+    const args = (specs[0]!.spec as { recipe: { args: Record<string, { headers?: Record<string, string> }> } }).recipe.args
+    assert.equal(args.controlRequest.headers?.q, "trk-100' AND 1=1-- -")
+    assert.equal(args.probeRequest.headers?.q, "trk-100' AND 1=2-- -")
+  })
+
+  test('xml carriers replace the parameter element', () => {
+    const specs = synthSqlBoolean(outcomeFor('xml', [{ type: 'boolean_differential', style: 'and_branch', baselineValue: 'atlas' }], '/api/xml/lookup'), carrierEnv)
+    const args = (specs[0]!.spec as { recipe: { args: Record<string, { textBody?: string }> } }).recipe.args
+    assert.match(String(args.probeRequest.textBody), /<q>.*1=2/)
+  })
+
+  test('path carriers vary only the injected segment', () => {
+    const specs = synthSqlBoolean(outcomeFor('path', [{ type: 'boolean_differential', style: 'and_branch', baselineValue: 'sku-100' }], '/api/items/sku-100'), carrierEnv)
+    const args = (specs[0]!.spec as { recipe: { args: Record<string, { pathAndQuery?: string }> } }).recipe.args
+    assert.match(String(args.probeRequest.pathAndQuery), /^\/api\/items\//)
+    assert.notEqual(args.controlRequest.pathAndQuery, args.probeRequest.pathAndQuery)
+  })
+
+  test('timing carriers send a conditional delay and select the timing receipt rule', () => {
+    const specs = synthSqlTime(outcomeFor('query', [{ type: 'sql_time_differential', style: 'single_quote', dialect: 'sqlite', delayMs: 1500, baselineValue: 'ref-100' }], '/api/orders/lookup'), carrierEnv)
+    const args = (specs[0]!.spec as { recipe: { args: Record<string, unknown> } }).recipe.args
+    assert.equal(args.receiptClass, 'blind_sqli')
+    assert.match(String((args.probeRequest as { pathAndQuery?: string }).pathAndQuery), /RANDOMBLOB|SLEEP|pg_sleep|WAITFOR/)
   })
 })
