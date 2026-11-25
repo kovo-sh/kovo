@@ -8,6 +8,27 @@ import type { Finding } from '../domain.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
 import type { BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
+import {
+  compositeProofReceiptSchema,
+  sha256Hex,
+  verifyCompositeReceipt,
+  verifyHostRecordSignature,
+} from './composite-receipt.ts'
+import type {
+  CausalEdgeBinding,
+  CausalEdgeKind,
+  CompositeProofReceipt,
+  CompositeReceiptVerification,
+  CompositeVerifyOptions,
+  HopReceipt,
+  HopSurface,
+  HostAsyncPollRecord,
+  HostBrowserTrace,
+  HostOobEvent,
+  HostSignableRecord,
+  HostSignedTranscript,
+  HostTranscriptEntry,
+} from './composite-receipt.ts'
 import { applyUnifiedDiffToDirectory } from './lab-runner.ts'
 import type { LabRunner } from './lab-runner.ts'
 import { isProfileHealthy, resolveProfilePoolForRole } from './model-settings.ts'
@@ -1170,4 +1191,1390 @@ export async function generateAndReviewPatch(params: PatchWorkflowParams): Promi
     createdAt: now,
     updatedAt: Date.now(),
   }
+}
+
+// ============================================================================
+// v8 Stream B — Multi-Hop CompositeProofReceipt DAG Patch-Retest
+// ============================================================================
+
+export type CompositePatchRetestVerdict =
+  | 'fixed'
+  | 'still_vulnerable'
+  | 'inconclusive'
+  | 'precondition_changed'
+
+export type CompositeHopReplayOutcome =
+  | 'succeeded'
+  | 'blocked'
+  | 'transport_error'
+  | 'auth_setup_failed'
+  | 'precondition_changed'
+  | 'inconclusive'
+
+export interface CompositeBrokeCausalEdge {
+  edgeIndex: number
+  kind: CausalEdgeKind
+  fromHopId: string
+  toHopId: string
+}
+
+export interface CompositeHopReplaySummary {
+  hopId: string
+  surface: HopSurface
+  outcome: CompositeHopReplayOutcome | 'skipped_after_break'
+  httpStatuses: number[]
+  exchangeIds: string[]
+  oobEventIds: string[]
+  browserTraceIds: string[]
+  emittedCapabilities: string[]
+  consumedCapabilities: string[]
+  reason?: string
+  errorCode?: string
+}
+
+export interface CompositeHopReplayContext {
+  receipt: CompositeProofReceipt
+  hop: HopReceipt
+  hopIndex: number
+  topoOrder: readonly string[]
+  incomingEdges: readonly CausalEdgeBinding[]
+  outgoingEdges: readonly CausalEdgeBinding[]
+  availableCapabilities: readonly string[]
+  priorHopResults: Readonly<Record<string, CompositeHopReplaySummary>>
+  transcriptSoFar: HostSignedTranscript
+  signal?: AbortSignal
+}
+
+export interface CompositeHopReplayResult {
+  outcome?: CompositeHopReplayOutcome
+  entries?: readonly HostTranscriptEntry[]
+  oobEvents?: readonly HostOobEvent[]
+  browserTraces?: readonly HostBrowserTrace[]
+  asyncPollRecords?: readonly HostAsyncPollRecord[]
+  replayedExchangeIds?: readonly string[]
+  replayedOobEventIds?: readonly string[]
+  replayedBrowserTraceIds?: readonly string[]
+  replayedAblationExchangeIds?: Readonly<Record<string, readonly string[]>>
+  replayedPollRecordIds?: Readonly<Record<string, string>>
+  preChainControlExchangeIds?: readonly string[]
+  postChainReadbackExchangeIds?: readonly string[]
+  reason?: string
+  errorCode?: string
+  httpStatus?: number | null
+}
+
+export interface CompositePreconditionSetupResult {
+  status: 'ok' | 'precondition_changed' | 'transport_error' | 'auth_setup_failed' | 'inconclusive'
+  reason?: string
+  errorCode?: string
+  httpStatus?: number | null
+  entries?: readonly HostTranscriptEntry[]
+  oobEvents?: readonly HostOobEvent[]
+  browserTraces?: readonly HostBrowserTrace[]
+  asyncPollRecords?: readonly HostAsyncPollRecord[]
+  preChainControlExchangeIds?: readonly string[]
+}
+
+export interface CompositePatchReplayRunner {
+  preparePreconditions?: (ctx: {
+    receipt: CompositeProofReceipt
+    topoOrder: readonly string[]
+    signal?: AbortSignal
+  }) => Promise<CompositePreconditionSetupResult> | CompositePreconditionSetupResult
+  replayHop: (ctx: CompositeHopReplayContext) => Promise<CompositeHopReplayResult> | CompositeHopReplayResult
+  readbackTerminalState?: (ctx: {
+    receipt: CompositeProofReceipt
+    transcriptSoFar: HostSignedTranscript
+    signal?: AbortSignal
+  }) => Promise<{
+    status?: 'ok' | 'transport_error' | 'precondition_changed' | 'inconclusive'
+    reason?: string
+    errorCode?: string
+    httpStatus?: number | null
+    entries?: readonly HostTranscriptEntry[]
+    postChainReadbackExchangeIds?: readonly string[]
+  }> | {
+    status?: 'ok' | 'transport_error' | 'precondition_changed' | 'inconclusive'
+    reason?: string
+    errorCode?: string
+    httpStatus?: number | null
+    entries?: readonly HostTranscriptEntry[]
+    postChainReadbackExchangeIds?: readonly string[]
+  }
+}
+
+export interface RetestCompositeChainParams {
+  receipt: CompositeProofReceipt
+  runner: CompositePatchReplayRunner
+  verifyOptions?: CompositeVerifyOptions
+  retestId?: string
+  targetRevision?: string
+  patchId?: string
+  secrets?: readonly NamedSecret[]
+  signal?: AbortSignal
+  now?: () => number
+}
+
+export interface CompositePatchRetestProof {
+  schemaVersion: 1
+  retestId: string
+  chainId: string
+  terminalVulnClass: string
+  terminalHopId: string
+  verdict: CompositePatchRetestVerdict
+  /** True strictly when verdict === 'fixed' (fail-closed OSS M4 grading signal). */
+  patchClosed: boolean
+  /** Exact hop where the patch broke the multi-hop chain (non-null iff verdict === 'fixed'). */
+  patchBrokeHopId: string | null
+  /** Causal edge disrupted by the patch when applicable. */
+  brokeCausalEdge: CompositeBrokeCausalEdge | null
+  /** Redacted explanation of how the patch broke the chain (non-null iff verdict === 'fixed'). */
+  brokeReason: string | null
+  /** Ordered topological prefix of hops that still succeeded benignly before `patchBrokeHopId`. */
+  benignPrefixHops: string[]
+  /** Topological execution order of the DAG. */
+  topoOrder: string[]
+  /** Per-hop redacted replay summaries in topological order. */
+  hopResults: CompositeHopReplaySummary[]
+  /** All host-recorded exchange IDs captured during the retest. */
+  exchangeIds: string[]
+  /** Concise redacted verdict summary suitable for portable receipt export & reports. */
+  summary: string
+  /** Underlying `verifyCompositeReceipt()` result when full DAG verification ran. */
+  compositeVerification?: CompositeReceiptVerification
+  targetRevision?: string
+  patchId?: string
+  testedAt: string
+  /** Canonical SHA-256 hex digest of this proof record (excluding `proofSha256`). */
+  proofSha256: string
+}
+
+export interface PortableCompositePatchRetestRecord {
+  retestId: string
+  verdict: 'reproduced' | 'fixed' | 'inconclusive'
+  compositeVerdict: CompositePatchRetestVerdict
+  chainId: string
+  terminalVulnClass: string
+  patchClosed: boolean
+  patchBrokeHopId: string | null
+  brokeCausalEdge: CompositeBrokeCausalEdge | null
+  brokeReason: string | null
+  benignPrefixHops: string[]
+  summary: string
+  exchangeIds: string[]
+  testedAt: string
+  proofSha256: string
+}
+
+export interface CompositePatchClosureSummary {
+  total: number
+  fixed: number
+  stillVulnerable: number
+  inconclusive: number
+  preconditionChanged: number
+  closureRate: number
+  meetsM4ClosureGate: boolean
+}
+
+interface IndexedDagEdge {
+  edgeIndex: number
+  edge: CausalEdgeBinding
+}
+
+interface CompositeDagLayout {
+  hopsById: Map<string, HopReceipt>
+  topoOrder: string[]
+  roots: string[]
+  incomingByHop: Map<string, IndexedDagEdge[]>
+  outgoingByHop: Map<string, IndexedDagEdge[]>
+}
+
+interface ReplayedHopArtifacts {
+  exchangeIds: string[]
+  oobEventIds: string[]
+  browserTraceIds: string[]
+  entries: HostTranscriptEntry[]
+  oobEvents: HostOobEvent[]
+  browserTraces: HostBrowserTrace[]
+  asyncPollRecords: HostAsyncPollRecord[]
+  ablationByEdge: Record<string, readonly string[]>
+  pollByEdge: Record<string, string>
+}
+
+const TRANSPORT_ERROR_CODE_RE =
+  /^(?:ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|EHOSTUNREACH|ENETUNREACH|UND_ERR_[A-Z_]+|TIMEOUT|ABORTED|ABORT_ERR|TLS_ERROR|AUTH_SETUP_FAILED)$/i
+
+function canonicalProofStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(canonicalProofStringify).join(',')}]`
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([k, v]) => k !== 'proofSha256' && v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalProofStringify(v)}`).join(',')}}`
+}
+
+export function computeCompositeRetestProofDigest(
+  proof: Omit<CompositePatchRetestProof, 'proofSha256'> & { proofSha256?: string },
+): string {
+  return sha256Hex(canonicalProofStringify(proof))
+}
+
+export function verifyCompositePatchRetestProofIntegrity(proof: CompositePatchRetestProof): boolean {
+  if (!proof || typeof proof.proofSha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(proof.proofSha256)) {
+    return false
+  }
+  return proof.proofSha256.toLowerCase() === computeCompositeRetestProofDigest(proof)
+}
+
+export function toPortablePatchRetestProof(proof: CompositePatchRetestProof): PortableCompositePatchRetestRecord {
+  const verdict: PortableCompositePatchRetestRecord['verdict'] =
+    proof.verdict === 'fixed'
+      ? 'fixed'
+      : proof.verdict === 'still_vulnerable'
+        ? 'reproduced'
+        : 'inconclusive'
+  return {
+    retestId: proof.retestId,
+    verdict,
+    compositeVerdict: proof.verdict,
+    chainId: proof.chainId,
+    terminalVulnClass: proof.terminalVulnClass,
+    patchClosed: proof.patchClosed,
+    patchBrokeHopId: proof.patchBrokeHopId,
+    brokeCausalEdge: proof.brokeCausalEdge,
+    brokeReason: proof.brokeReason,
+    benignPrefixHops: [...proof.benignPrefixHops],
+    summary: proof.summary,
+    exchangeIds: [...proof.exchangeIds],
+    testedAt: proof.testedAt,
+    proofSha256: proof.proofSha256,
+  }
+}
+
+export function summarizeCompositePatchClosure(
+  proofs: readonly CompositePatchRetestProof[],
+  threshold = 0.8,
+): CompositePatchClosureSummary {
+  let fixed = 0
+  let stillVulnerable = 0
+  let inconclusive = 0
+  let preconditionChanged = 0
+  for (const p of proofs) {
+    if (p.verdict === 'fixed') fixed += 1
+    else if (p.verdict === 'still_vulnerable') stillVulnerable += 1
+    else if (p.verdict === 'precondition_changed') preconditionChanged += 1
+    else inconclusive += 1
+  }
+  const total = proofs.length
+  const closureRate = total > 0 ? fixed / total : 0
+  return {
+    total,
+    fixed,
+    stillVulnerable,
+    inconclusive,
+    preconditionChanged,
+    closureRate,
+    meetsM4ClosureGate: total > 0 && closureRate >= threshold,
+  }
+}
+
+function computeCompositeDagLayout(
+  receipt: CompositeProofReceipt,
+): { ok: true; dag: CompositeDagLayout } | { ok: false; reason: string } {
+  const hopsById = new Map<string, HopReceipt>()
+  for (const hop of receipt.hops) {
+    if (hopsById.has(hop.hopId)) return { ok: false, reason: `Duplicate hopId "${hop.hopId}".` }
+    hopsById.set(hop.hopId, hop)
+  }
+  if (!hopsById.has(receipt.terminalImpact.terminalHopId)) {
+    return { ok: false, reason: `terminalHopId "${receipt.terminalImpact.terminalHopId}" not in hops.` }
+  }
+  if (receipt.hops.length === 1 && receipt.causalEdges.length > 0) {
+    return { ok: false, reason: 'A 1-hop receipt cannot declare causalEdges.' }
+  }
+
+  const inDeg = new Map<string, number>(receipt.hops.map(h => [h.hopId, 0]))
+  const outAdj = new Map<string, string[]>(receipt.hops.map(h => [h.hopId, []]))
+  const revAdj = new Map<string, string[]>(receipt.hops.map(h => [h.hopId, []]))
+  const incomingByHop = new Map<string, IndexedDagEdge[]>(receipt.hops.map(h => [h.hopId, []]))
+  const outgoingByHop = new Map<string, IndexedDagEdge[]>(receipt.hops.map(h => [h.hopId, []]))
+  const seen = new Set<string>()
+
+  for (let i = 0; i < receipt.causalEdges.length; i += 1) {
+    const e = receipt.causalEdges[i]!
+    if (!hopsById.has(e.fromHopId) || !hopsById.has(e.toHopId)) {
+      return { ok: false, reason: `Edge #${i} references unknown hop.` }
+    }
+    if (e.fromHopId === e.toHopId) {
+      return { ok: false, reason: `Edge #${i} forms a self-loop on "${e.fromHopId}".` }
+    }
+    const key = `${e.fromHopId}->${e.toHopId}:${e.kind}`
+    if (seen.has(key)) return { ok: false, reason: `Duplicate causal edge "${key}".` }
+    seen.add(key)
+    outAdj.get(e.fromHopId)!.push(e.toHopId)
+    revAdj.get(e.toHopId)!.push(e.fromHopId)
+    inDeg.set(e.toHopId, (inDeg.get(e.toHopId) ?? 0) + 1)
+    incomingByHop.get(e.toHopId)!.push({ edgeIndex: i, edge: e })
+    outgoingByHop.get(e.fromHopId)!.push({ edgeIndex: i, edge: e })
+  }
+
+  const roots = receipt.hops.filter(h => inDeg.get(h.hopId) === 0).map(h => h.hopId)
+  const queue = [...roots]
+  const rem = new Map(inDeg)
+  const topoOrder: string[] = []
+  while (queue.length > 0) {
+    const hopId = queue.shift()!
+    topoOrder.push(hopId)
+    for (const next of outAdj.get(hopId) ?? []) {
+      const d = (rem.get(next) ?? 0) - 1
+      rem.set(next, d)
+      if (d === 0) queue.push(next)
+    }
+  }
+  if (topoOrder.length !== receipt.hops.length) {
+    return { ok: false, reason: 'Causal DAG contains a cycle.' }
+  }
+
+  const reachesTerminal = new Set<string>([receipt.terminalImpact.terminalHopId])
+  const rq = [receipt.terminalImpact.terminalHopId]
+  while (rq.length > 0) {
+    const cur = rq.shift()!
+    for (const prev of revAdj.get(cur) ?? []) {
+      if (!reachesTerminal.has(prev)) {
+        reachesTerminal.add(prev)
+        rq.push(prev)
+      }
+    }
+  }
+  const orphan = receipt.hops.find(h => !reachesTerminal.has(h.hopId))
+  if (orphan) {
+    return { ok: false, reason: `Hop "${orphan.hopId}" does not reach terminalHopId.` }
+  }
+  return { ok: true, dag: { hopsById, topoOrder, roots, incomingByHop, outgoingByHop } }
+}
+
+const is2xxStatus = (status: number | null | undefined): boolean =>
+  typeof status === 'number' && status >= 200 && status < 300
+
+const isFiniteTimestamp = (ts: unknown): ts is number =>
+  typeof ts === 'number' && Number.isFinite(ts) && ts >= 0
+
+const isTransportOrServerFailureStatus = (status: number | null | undefined): boolean =>
+  status === null || status === undefined || !Number.isFinite(status) || status === 0 || status === 429 || status >= 500
+
+const isSecurityDenialStatus = (status: number | null | undefined): boolean =>
+  typeof status === 'number' && status >= 400 && status < 500 && status !== 429
+
+function extractErrorCode(err: unknown): string | undefined {
+  if (!err || typeof err !== 'object') return undefined
+  const rec = err as { code?: unknown; name?: unknown; cause?: { code?: unknown } }
+  if (typeof rec.code === 'string' && rec.code.trim()) return rec.code.trim()
+  if (typeof rec.cause?.code === 'string' && rec.cause.code.trim()) return rec.cause.code.trim()
+  if (typeof rec.name === 'string' && rec.name.trim() && rec.name !== 'Error') return rec.name.trim()
+  return undefined
+}
+
+function collectRetestLeaves(value: unknown, out: Set<string>, depth = 0): void {
+  if (depth > 5 || out.size > 256 || value == null) return
+  if (typeof value === 'string') {
+    const t = value.trim()
+    if (t.length > 0 && t.length <= 2048) out.add(t)
+  } else if (typeof value === 'number' || typeof value === 'boolean') {
+    out.add(String(value))
+  } else if (Array.isArray(value)) {
+    for (const item of value) collectRetestLeaves(item, out, depth + 1)
+  } else if (typeof value === 'object') {
+    for (const item of Object.values(value as Record<string, unknown>)) {
+      collectRetestLeaves(item, out, depth + 1)
+    }
+  }
+}
+
+function collectRetestHeaderTokens(headers: Record<string, string> | null | undefined, out: Set<string>): void {
+  if (!headers) return
+  for (const raw of Object.values(headers)) {
+    const t = raw.trim()
+    if (!t) continue
+    out.add(t)
+    const scheme = /^(?:Bearer|Basic|Token|ApiKey)\s+(.+)$/i.exec(t)
+    if (scheme?.[1]) out.add(scheme[1].trim())
+    if (t.includes('=')) {
+      for (const part of t.split(';')) {
+        const eq = part.indexOf('=')
+        if (eq > 0 && part.slice(eq + 1).trim()) out.add(part.slice(eq + 1).trim())
+      }
+    }
+  }
+}
+
+function collectResponseDigests(entry: HostTranscriptEntry): Set<string> {
+  const digests = new Set<string>()
+  const leaves = new Set<string>()
+  for (const d of [...(entry.observedResponseDigests ?? []), ...(entry.step.secretMatches ?? [])]) {
+    digests.add(d.toLowerCase())
+  }
+  collectRetestLeaves(entry.step.json, leaves)
+  collectRetestHeaderTokens(entry.step.responseHeaders, leaves)
+  for (const leaf of leaves) digests.add(sha256Hex(leaf))
+  return digests
+}
+
+function retestEntryMatchesEntity(entry: HostTranscriptEntry, entityId: string): boolean {
+  if (entry.entityId === entityId) return true
+  const path = entry.step.pathAndQuery ?? entry.step.route ?? ''
+  if (path && new RegExp(`(?:^|[/=?&])${entityId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[/&?#])`).test(path)) {
+    return true
+  }
+  const leaves = new Set<string>()
+  collectRetestLeaves(entry.step.requestJson, leaves)
+  collectRetestLeaves(entry.step.json, leaves)
+  return leaves.has(entityId)
+}
+
+function retestEntryMatchesCorrelation(entry: HostTranscriptEntry, correlationId: string): boolean {
+  if (
+    entry.correlationIds?.includes(correlationId)
+    || entry.entityId === correlationId
+    || entry.carrierText?.includes(correlationId)
+  ) {
+    return true
+  }
+  const leaves = new Set<string>()
+  collectRetestLeaves(entry.step.requestJson, leaves)
+  collectRetestLeaves(entry.step.json, leaves)
+  collectRetestHeaderTokens(entry.step.requestHeaders, leaves)
+  collectRetestHeaderTokens(entry.step.responseHeaders, leaves)
+  for (const leaf of leaves) {
+    if (leaf === correlationId || leaf.includes(correlationId)) return true
+  }
+  return false
+}
+
+function inspectRecordsForTransportOrSignatureError(
+  records: {
+    entries?: readonly HostTranscriptEntry[]
+    oobEvents?: readonly HostOobEvent[]
+    browserTraces?: readonly HostBrowserTrace[]
+    asyncPollRecords?: readonly HostAsyncPollRecord[]
+  },
+  signingKey?: string,
+): { failed: false } | { failed: true; reason: string; errorCode: string } {
+  for (const entry of records.entries ?? []) {
+    if (isTransportOrServerFailureStatus(entry.step.status)) {
+      const st = entry.step.status
+      return {
+        failed: true,
+        reason: `Exchange "${entry.exchangeId}" returned ${st === null || st === undefined ? 'no HTTP status' : `HTTP ${st}`} (transport/server failure; failing closed).`,
+        errorCode: typeof st === 'number' && st > 0 ? `HTTP_${st}` : 'TRANSPORT_NO_STATUS',
+      }
+    }
+  }
+  if (signingKey) {
+    const check = (list: readonly HostSignableRecord[] | undefined, label: string, idOf: (r: HostSignableRecord) => string) => {
+      for (const rec of list ?? []) {
+        if (!verifyHostRecordSignature(rec, signingKey)) {
+          return {
+            failed: true as const,
+            reason: `Host transcript signature verification failed on ${label} "${idOf(rec)}" (failing closed).`,
+            errorCode: 'HOST_SIGNATURE_INVALID',
+          }
+        }
+      }
+      return null
+    }
+    const sigErr =
+      check(records.entries, 'exchange', r => (r as HostTranscriptEntry).exchangeId)
+      ?? check(records.oobEvents, 'OOB event', r => (r as HostOobEvent).id)
+      ?? check(records.browserTraces, 'browser trace', r => (r as HostBrowserTrace).id)
+      ?? check(records.asyncPollRecords, 'async poll record', r => (r as HostAsyncPollRecord).id)
+    if (sigErr) return sigErr
+  }
+  return { failed: false }
+}
+
+function collectHopEmittedCapabilities(
+  entries: readonly HostTranscriptEntry[],
+  oobEvents: readonly HostOobEvent[],
+  browserTraces: readonly HostBrowserTrace[],
+  asyncPollRecords: readonly HostAsyncPollRecord[],
+): string[] {
+  const out = new Set<string>()
+  for (const e of entries) {
+    for (const c of e.emittedCapabilities ?? []) out.add(c)
+    for (const a of e.cryptoAttestations ?? []) if (a.derivedCapabilityId) out.add(a.derivedCapabilityId)
+  }
+  for (const o of oobEvents) for (const c of o.emittedCapabilities ?? []) out.add(c)
+  for (const t of browserTraces) for (const c of t.emittedCapabilities ?? []) out.add(c)
+  for (const p of asyncPollRecords) for (const c of p.emittedCapabilities ?? []) out.add(c)
+  return [...out]
+}
+
+function collectHopConsumedCapabilities(entries: readonly HostTranscriptEntry[]): string[] {
+  const out = new Set<string>()
+  for (const e of entries) {
+    for (const c of e.consumedCapabilities ?? []) out.add(c)
+    for (const a of e.cryptoAttestations ?? []) out.add(a.derivedFromCapabilityId)
+  }
+  return [...out]
+}
+
+function classifyHopReplayOutcome(
+  hop: HopReceipt,
+  result: CompositeHopReplayResult,
+  signingKey?: string,
+): { outcome: CompositeHopReplayOutcome; reason?: string; errorCode?: string; blockedWith4xx: boolean } {
+  const entries = result.entries ?? []
+  const oobEvents = result.oobEvents ?? []
+  const browserTraces = result.browserTraces ?? []
+  const asyncPollRecords = result.asyncPollRecords ?? []
+
+  // Transport, server 5xx/429, auth setup, and host-signature failures ALWAYS take precedence (fail closed).
+  if (
+    result.outcome === 'transport_error'
+    || result.outcome === 'auth_setup_failed'
+    || result.outcome === 'inconclusive'
+  ) {
+    return {
+      outcome: result.outcome,
+      reason: result.reason ?? `Hop "${hop.hopId}" encountered ${result.outcome}.`,
+      errorCode: result.errorCode ?? result.outcome.toUpperCase(),
+      blockedWith4xx: false,
+    }
+  }
+  if (result.httpStatus !== undefined && isTransportOrServerFailureStatus(result.httpStatus)) {
+    return {
+      outcome: 'transport_error',
+      reason: result.reason ?? `Hop "${hop.hopId}" returned HTTP ${result.httpStatus ?? 'error'} (transport/server failure).`,
+      errorCode: result.errorCode ?? (result.httpStatus ? `HTTP_${result.httpStatus}` : 'TRANSPORT_ERROR'),
+      blockedWith4xx: false,
+    }
+  }
+  if (result.errorCode && TRANSPORT_ERROR_CODE_RE.test(result.errorCode)) {
+    return {
+      outcome: result.errorCode === 'AUTH_SETUP_FAILED' ? 'auth_setup_failed' : 'transport_error',
+      reason: result.reason ?? `Hop "${hop.hopId}" failed with ${result.errorCode}.`,
+      errorCode: result.errorCode,
+      blockedWith4xx: false,
+    }
+  }
+  const recErr = inspectRecordsForTransportOrSignatureError({ entries, oobEvents, browserTraces, asyncPollRecords }, signingKey)
+  if (recErr.failed) {
+    return { outcome: 'transport_error', reason: recErr.reason, errorCode: recErr.errorCode, blockedWith4xx: false }
+  }
+
+  if (result.outcome === 'precondition_changed') {
+    return {
+      outcome: 'precondition_changed',
+      reason: result.reason ?? `Target route or schema changed before/during hop "${hop.hopId}".`,
+      errorCode: result.errorCode ?? 'PRECONDITION_CHANGED',
+      blockedWith4xx: false,
+    }
+  }
+
+  const probeEntries = entries.filter(e => e.step.arm === 'probe' && e.replayAttempt !== 'ablation_control')
+  const probe4xx = probeEntries.length > 0 && probeEntries.every(e => isSecurityDenialStatus(e.step.status))
+  const result4xx = isSecurityDenialStatus(result.httpStatus)
+
+  if (result.outcome === 'blocked') {
+    const statuses = probeEntries.map(e => e.step.status).filter((s): s is number => typeof s === 'number')
+    const statusHint = statuses.length > 0 ? ` (HTTP ${statuses.join(', ')})` : result4xx ? ` (HTTP ${result.httpStatus})` : ''
+    return {
+      outcome: 'blocked',
+      reason: result.reason ?? `Hop "${hop.hopId}" was cleanly blocked by patched target${statusHint}.`,
+      errorCode: result.errorCode,
+      blockedWith4xx: probe4xx || result4xx,
+    }
+  }
+
+  // Implicit block detection: every probe exchange in the hop was denied (4xx non-429) and no side-channel/capability succeeded.
+  const emittedCaps = collectHopEmittedCapabilities(entries, oobEvents, browserTraces, asyncPollRecords)
+  const hasOob = oobEvents.some(o => o.delivered)
+  const hasTrace = browserTraces.some(t => (t.sinks?.length ?? 0) > 0 || (t.emittedCapabilities?.length ?? 0) > 0)
+  const hasPoll = asyncPollRecords.some(p => p.converged)
+
+  if (probe4xx && emittedCaps.length === 0 && !hasOob && !hasTrace && !hasPoll) {
+    const statuses = probeEntries.map(e => e.step.status).join(', ')
+    return {
+      outcome: 'blocked',
+      reason: result.reason ?? `Hop "${hop.hopId}" probe denied by patched target (HTTP ${statuses}).`,
+      errorCode: result.errorCode,
+      blockedWith4xx: true,
+    }
+  }
+
+  return { outcome: 'succeeded', reason: result.reason, errorCode: result.errorCode, blockedWith4xx: false }
+}
+
+function hopSatisfiesOutgoingProducerEdge(
+  edge: CausalEdgeBinding,
+  fromHop: HopReceipt,
+  artifacts: ReplayedHopArtifacts,
+): { ok: true } | { ok: false; reason: string } {
+  const hopEntries = artifacts.entries.filter(e => artifacts.exchangeIds.includes(e.exchangeId))
+  const hopOob = artifacts.oobEvents.filter(o => artifacts.oobEventIds.includes(o.id))
+  const hopTraces = artifacts.browserTraces.filter(t => artifacts.browserTraceIds.includes(t.id))
+
+  if (edge.kind === 'value_binding') {
+    const emittedCaps = new Set<string>()
+    const digests = new Set<string>()
+    let hasTimestampedOutput = false
+    for (const e of hopEntries) {
+      if (!isFiniteTimestamp(e.timestampMs)) continue
+      hasTimestampedOutput = true
+      for (const c of e.emittedCapabilities ?? []) emittedCaps.add(c)
+      for (const a of e.cryptoAttestations ?? []) if (a.derivedCapabilityId) emittedCaps.add(a.derivedCapabilityId)
+      for (const d of collectResponseDigests(e)) digests.add(d)
+    }
+    for (const o of hopOob) {
+      if (!o.delivered || !isFiniteTimestamp(o.receivedAtMs)) continue
+      hasTimestampedOutput = true
+      for (const c of o.emittedCapabilities ?? []) emittedCaps.add(c)
+      for (const d of o.observedValueDigests ?? []) digests.add(d.toLowerCase())
+      if (o.token) digests.add(sha256Hex(o.token))
+    }
+    for (const t of hopTraces) {
+      if (!isFiniteTimestamp(t.timestampMs)) continue
+      hasTimestampedOutput = true
+      for (const c of t.emittedCapabilities ?? []) emittedCaps.add(c)
+      for (const d of t.observedValueDigests ?? []) digests.add(d.toLowerCase())
+    }
+    if (!hasTimestampedOutput) {
+      return { ok: false, reason: `Hop "${fromHop.hopId}" produced no host-timestamped output for value_binding to "${edge.toHopId}".` }
+    }
+    if (edge.capabilityHandle && !emittedCaps.has(edge.capabilityHandle)) {
+      return { ok: false, reason: `Hop "${fromHop.hopId}" no longer emits required capability "${edge.capabilityHandle}" for "${edge.toHopId}".` }
+    }
+    if (edge.valueDigest && !digests.has(edge.valueDigest.toLowerCase())) {
+      return { ok: false, reason: `Hop "${fromHop.hopId}" no longer emits required value digest for "${edge.toHopId}".` }
+    }
+    return { ok: true }
+  }
+
+  if (edge.kind === 'derived_crypto_binding') {
+    const emittedCaps = new Set<string>()
+    for (const e of hopEntries) {
+      if (!isFiniteTimestamp(e.timestampMs)) continue
+      for (const c of e.emittedCapabilities ?? []) emittedCaps.add(c)
+      for (const a of e.cryptoAttestations ?? []) if (a.derivedCapabilityId) emittedCaps.add(a.derivedCapabilityId)
+    }
+    for (const o of hopOob) {
+      if (o.delivered && isFiniteTimestamp(o.receivedAtMs)) {
+        for (const c of o.emittedCapabilities ?? []) emittedCaps.add(c)
+      }
+    }
+    for (const t of hopTraces) {
+      if (isFiniteTimestamp(t.timestampMs)) {
+        for (const c of t.emittedCapabilities ?? []) emittedCaps.add(c)
+      }
+    }
+    if (!emittedCaps.has(edge.sourceCapabilityId)) {
+      return { ok: false, reason: `Hop "${fromHop.hopId}" no longer emits signing material "${edge.sourceCapabilityId}" for derived_crypto_binding to "${edge.toHopId}".` }
+    }
+    return { ok: true }
+  }
+
+  if (edge.kind === 'state_transition_binding') {
+    const okMutation = hopEntries.some(
+      e => is2xxStatus(e.step.status) && isFiniteTimestamp(e.timestampMs) && retestEntryMatchesEntity(e, edge.entityId),
+    )
+    if (!okMutation) {
+      return { ok: false, reason: `Hop "${fromHop.hopId}" no longer succeeds on shared entity "${edge.entityId}" for state_transition_binding to "${edge.toHopId}".` }
+    }
+    return { ok: true }
+  }
+
+  // async_pivot_binding
+  const triggered =
+    hopEntries.some(e => is2xxStatus(e.step.status) && isFiniteTimestamp(e.timestampMs) && retestEntryMatchesCorrelation(e, edge.correlationId))
+    || hopTraces.some(t => isFiniteTimestamp(t.timestampMs) && (t.correlationIds?.includes(edge.correlationId) ?? false))
+  if (!triggered) {
+    return { ok: false, reason: `Hop "${fromHop.hopId}" no longer produces async trigger "${edge.correlationId}" for "${edge.toHopId}".` }
+  }
+  return { ok: true }
+}
+
+function selectBrokeEdgeForBlockedHop(
+  hopId: string,
+  blockedWith4xx: boolean,
+  dag: CompositeDagLayout,
+): CompositeBrokeCausalEdge | null {
+  const incoming = dag.incomingByHop.get(hopId) ?? []
+  const outgoing = dag.outgoingByHop.get(hopId) ?? []
+  const chosen = blockedWith4xx
+    ? (incoming[0] ?? outgoing[0])
+    : (outgoing[0] ?? incoming[0])
+  if (!chosen) return null
+  return {
+    edgeIndex: chosen.edgeIndex,
+    kind: chosen.edge.kind,
+    fromHopId: chosen.edge.fromHopId,
+    toHopId: chosen.edge.toHopId,
+  }
+}
+
+function buildReplayedCompositeReceipt(
+  receipt: CompositeProofReceipt,
+  dag: CompositeDagLayout,
+  hopArtifacts: ReadonlyMap<string, ReplayedHopArtifacts>,
+  allEntriesById: ReadonlyMap<string, HostTranscriptEntry>,
+  allOobById: ReadonlyMap<string, HostOobEvent>,
+  allTracesById: ReadonlyMap<string, HostBrowserTrace>,
+  allPollsById: ReadonlyMap<string, HostAsyncPollRecord>,
+  extraPreChainControlIds: readonly string[],
+  extraPostChainReadbackIds: readonly string[],
+): CompositeProofReceipt {
+  const exchangeIdMap = new Map<string, string>()
+  const oobIdMap = new Map<string, string>()
+  const traceIdMap = new Map<string, string>()
+
+  const replayedHops: HopReceipt[] = receipt.hops.map(hop => {
+    const art = hopArtifacts.get(hop.hopId)
+    if (!art) return hop
+    if (hop.exchangeIds.length === art.exchangeIds.length) {
+      for (let i = 0; i < hop.exchangeIds.length; i += 1) {
+        exchangeIdMap.set(hop.exchangeIds[i]!, art.exchangeIds[i]!)
+      }
+    }
+    if (hop.oobEventIds.length === art.oobEventIds.length) {
+      for (let i = 0; i < hop.oobEventIds.length; i += 1) {
+        oobIdMap.set(hop.oobEventIds[i]!, art.oobEventIds[i]!)
+      }
+    }
+    if (hop.browserTraceIds.length === art.browserTraceIds.length) {
+      for (let i = 0; i < hop.browserTraceIds.length; i += 1) {
+        traceIdMap.set(hop.browserTraceIds[i]!, art.browserTraceIds[i]!)
+      }
+    }
+    return {
+      ...hop,
+      exchangeIds: art.exchangeIds,
+      oobEventIds: art.oobEventIds,
+      browserTraceIds: art.browserTraceIds,
+    }
+  })
+
+  const remapEx = (id: string): string => (allEntriesById.has(id) ? id : (exchangeIdMap.get(id) ?? id))
+  const remapOob = (id: string): string => (allOobById.has(id) ? id : (oobIdMap.get(id) ?? id))
+  const remapTrace = (id: string): string => (allTracesById.has(id) ? id : (traceIdMap.get(id) ?? id))
+
+  const replayedEdges: CausalEdgeBinding[] = receipt.causalEdges.map(edge => {
+    const edgeKey = `${edge.fromHopId}->${edge.toHopId}`
+    const typedEdgeKey = `${edgeKey}:${edge.kind}`
+    const toArt = hopArtifacts.get(edge.toHopId)
+
+    if (edge.kind === 'value_binding') {
+      const src = edge.sourceExchangeId
+        ? (allEntriesById.has(edge.sourceExchangeId) ? edge.sourceExchangeId : exchangeIdMap.get(edge.sourceExchangeId))
+        : undefined
+      const tgt = edge.targetExchangeId
+        ? (allEntriesById.has(edge.targetExchangeId) ? edge.targetExchangeId : exchangeIdMap.get(edge.targetExchangeId))
+        : undefined
+      return {
+        ...edge,
+        ...(src ? { sourceExchangeId: src } : { sourceExchangeId: undefined }),
+        ...(tgt ? { targetExchangeId: tgt } : { targetExchangeId: undefined }),
+      }
+    }
+    if (edge.kind === 'state_transition_binding') {
+      const explicitAblation = toArt?.ablationByEdge[typedEdgeKey] ?? toArt?.ablationByEdge[edgeKey]
+      let ablationIds: string[]
+      if (explicitAblation && explicitAblation.length > 0) {
+        ablationIds = [...explicitAblation]
+      } else if (edge.ablationExchangeIds.every(id => allEntriesById.has(id))) {
+        ablationIds = [...edge.ablationExchangeIds]
+      } else {
+        const inferred = (toArt?.entries ?? [])
+          .filter(e => e.replayAttempt === 'ablation_control')
+          .map(e => e.exchangeId)
+        ablationIds = inferred.length > 0 ? inferred : edge.ablationExchangeIds.map(remapEx)
+      }
+      return { ...edge, ablationExchangeIds: ablationIds }
+    }
+    if (edge.kind === 'async_pivot_binding') {
+      const explicitPoll = toArt?.pollByEdge[typedEdgeKey] ?? toArt?.pollByEdge[edgeKey]
+      const pollRecordId = explicitPoll
+        ?? (edge.pollRecordId
+          ? (allPollsById.has(edge.pollRecordId) ? edge.pollRecordId : toArt?.asyncPollRecords[0]?.id ?? edge.pollRecordId)
+          : undefined)
+      return {
+        ...edge,
+        ...(edge.oobEventId ? { oobEventId: remapOob(edge.oobEventId) } : {}),
+        ...(edge.browserTraceId ? { browserTraceId: remapTrace(edge.browserTraceId) } : {}),
+        ...(pollRecordId ? { pollRecordId } : {}),
+      }
+    }
+    return edge
+  })
+
+  const ti = receipt.terminalImpact
+  const preChainIds = extraPreChainControlIds.length > 0
+    ? [...new Set(extraPreChainControlIds)]
+    : ti.preChainControlExchangeIds.map(remapEx).filter(id => allEntriesById.has(id))
+  const postChainIds = extraPostChainReadbackIds.length > 0
+    ? [...new Set(extraPostChainReadbackIds)]
+    : ti.postChainReadbackExchangeIds.map(remapEx).filter(id => allEntriesById.has(id))
+
+  const remappedTerminalProof = ti.proofReceipt
+    ? {
+        ...ti.proofReceipt,
+        exchangeIds: ti.proofReceipt.exchangeIds.map(remapEx),
+        oobEventIds: ti.proofReceipt.oobEventIds.map(remapOob),
+        browserTraceIds: ti.proofReceipt.browserTraceIds.map(remapTrace),
+      }
+    : undefined
+
+  void dag
+  return {
+    ...receipt,
+    hops: replayedHops,
+    causalEdges: replayedEdges,
+    terminalImpact: {
+      ...ti,
+      preChainControlExchangeIds: preChainIds,
+      postChainReadbackExchangeIds: postChainIds,
+      ...(remappedTerminalProof ? { proofReceipt: remappedTerminalProof } : {}),
+      modeAFailureExchangeId: undefined,
+    },
+    replayMode: 'fresh_clean_replay',
+  }
+}
+
+function finalizeCompositeRetestProof(args: {
+  retestId: string
+  chainId: string
+  terminalVulnClass: string
+  terminalHopId: string
+  verdict: CompositePatchRetestVerdict
+  patchBrokeHopId: string | null
+  brokeCausalEdge: CompositeBrokeCausalEdge | null
+  brokeReason: string | null
+  benignPrefixHops: string[]
+  topoOrder: string[]
+  hopResults: CompositeHopReplaySummary[]
+  exchangeIds: string[]
+  summary: string
+  compositeVerification?: CompositeReceiptVerification
+  targetRevision?: string
+  patchId?: string
+  testedAt: string
+  secrets?: readonly NamedSecret[]
+}): CompositePatchRetestProof {
+  const isFixed = args.verdict === 'fixed'
+  const redactedHopResults: CompositeHopReplaySummary[] = args.hopResults.map(hr => ({
+    ...hr,
+    ...(hr.reason !== undefined ? { reason: redact(hr.reason, args.secrets) } : {}),
+  }))
+  const base: Omit<CompositePatchRetestProof, 'proofSha256'> = {
+    schemaVersion: 1,
+    retestId: args.retestId,
+    chainId: args.chainId,
+    terminalVulnClass: args.terminalVulnClass,
+    terminalHopId: args.terminalHopId,
+    verdict: args.verdict,
+    patchClosed: isFixed,
+    patchBrokeHopId: isFixed ? args.patchBrokeHopId : null,
+    brokeCausalEdge: isFixed ? args.brokeCausalEdge : null,
+    brokeReason: isFixed && args.brokeReason ? redact(args.brokeReason, args.secrets) : null,
+    benignPrefixHops: isFixed ? [...args.benignPrefixHops] : [],
+    topoOrder: [...args.topoOrder],
+    hopResults: redactedHopResults,
+    exchangeIds: [...new Set(args.exchangeIds)],
+    summary: redact(args.summary, args.secrets),
+    ...(args.compositeVerification ? { compositeVerification: args.compositeVerification } : {}),
+    ...(args.targetRevision ? { targetRevision: args.targetRevision } : {}),
+    ...(args.patchId ? { patchId: args.patchId } : {}),
+    testedAt: args.testedAt,
+  }
+  return {
+    ...base,
+    proofSha256: computeCompositeRetestProofDigest(base),
+  }
+}
+
+/**
+ * Full `CompositeProofReceipt` DAG patch-retest (v8 Stream B / Open Decision #3).
+ *
+ * Replays hops in strict topological order against the patched target via an injected host
+ * replay runner and verifies full chain completion via `verifyCompositeReceipt()`.
+ *
+ * Distinguishes 4 honest verdicts (strictly fail-closed — transport/network/auth errors and
+ * precondition drift NEVER falsely claim `'fixed'`):
+ *  - `'fixed'`: chain cleanly breaks at `patchBrokeHopId` (even when benign prefix hops still succeed)
+ *    and terminal impact is no longer achievable.
+ *  - `'still_vulnerable'`: full DAG completes and confirms via `verifyCompositeReceipt()`.
+ *  - `'inconclusive'`: transport/network/5xx/429/auth setup/signature failure or invalid DAG.
+ *  - `'precondition_changed'`: target route/schema changed so pre-chain setup could not execute cleanly.
+ */
+export async function retestCompositeChainPatch(
+  params: RetestCompositeChainParams,
+): Promise<CompositePatchRetestProof> {
+  const retestId = params.retestId ?? randomUUID()
+  const nowFn = params.now ?? Date.now
+  const testedAt = () => new Date(nowFn()).toISOString()
+
+  const emitEarly = (
+    chainId: string,
+    terminalVulnClass: string,
+    terminalHopId: string,
+    summary: string,
+  ) =>
+    finalizeCompositeRetestProof({
+      retestId,
+      chainId,
+      terminalVulnClass,
+      terminalHopId,
+      verdict: 'inconclusive',
+      patchBrokeHopId: null,
+      brokeCausalEdge: null,
+      brokeReason: null,
+      benignPrefixHops: [],
+      topoOrder: [],
+      hopResults: [],
+      exchangeIds: [],
+      summary,
+      targetRevision: params.targetRevision,
+      patchId: params.patchId,
+      testedAt: testedAt(),
+      secrets: params.secrets,
+    })
+
+  const parsed = compositeProofReceiptSchema.safeParse(params.receipt)
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0]
+    const detail = `Invalid CompositeProofReceipt schema: ${issue?.path.join('.') || 'receipt'} ${issue?.message ?? ''}`.trim()
+    return emitEarly('invalid', 'invalid', 'invalid', `Composite patch retest inconclusive: ${detail}`)
+  }
+
+  const receipt = parsed.data
+  const dagRes = computeCompositeDagLayout(receipt)
+  if (!dagRes.ok) {
+    return emitEarly(
+      receipt.chainId,
+      receipt.terminalVulnClass,
+      receipt.terminalImpact.terminalHopId,
+      `Composite patch retest inconclusive: invalid DAG topology (${dagRes.reason})`,
+    )
+  }
+
+  const { dag } = dagRes
+  const signingKey = params.verifyOptions?.signingKey
+  const allEntries: HostTranscriptEntry[] = []
+  const allOob: HostOobEvent[] = []
+  const allTraces: HostBrowserTrace[] = []
+  const allPolls: HostAsyncPollRecord[] = []
+  const extraPreChainControlIds: string[] = []
+  const extraPostChainReadbackIds: string[] = []
+  const hopResults: CompositeHopReplaySummary[] = []
+  const priorHopResults: Record<string, CompositeHopReplaySummary> = {}
+  const hopArtifacts = new Map<string, ReplayedHopArtifacts>()
+  const availableCapabilities = new Set<string>()
+
+  const emit = (
+    verdict: CompositePatchRetestVerdict,
+    summary: string,
+    extra: {
+      patchBrokeHopId?: string | null
+      brokeCausalEdge?: CompositeBrokeCausalEdge | null
+      brokeReason?: string | null
+      benignPrefixHops?: string[]
+      compositeVerification?: CompositeReceiptVerification
+    } = {},
+  ) =>
+    finalizeCompositeRetestProof({
+      retestId,
+      chainId: receipt.chainId,
+      terminalVulnClass: receipt.terminalVulnClass,
+      terminalHopId: receipt.terminalImpact.terminalHopId,
+      verdict,
+      patchBrokeHopId: extra.patchBrokeHopId ?? null,
+      brokeCausalEdge: extra.brokeCausalEdge ?? null,
+      brokeReason: extra.brokeReason ?? null,
+      benignPrefixHops: extra.benignPrefixHops ?? [],
+      topoOrder: dag.topoOrder,
+      hopResults,
+      exchangeIds: allEntries.map(e => e.exchangeId),
+      summary,
+      compositeVerification: extra.compositeVerification,
+      targetRevision: params.targetRevision,
+      patchId: params.patchId,
+      testedAt: testedAt(),
+      secrets: params.secrets,
+    })
+
+  const appendRecords = (rec: {
+    entries?: readonly HostTranscriptEntry[]
+    oobEvents?: readonly HostOobEvent[]
+    browserTraces?: readonly HostBrowserTrace[]
+    asyncPollRecords?: readonly HostAsyncPollRecord[]
+  }) => {
+    if (rec.entries) allEntries.push(...rec.entries)
+    if (rec.oobEvents) allOob.push(...rec.oobEvents)
+    if (rec.browserTraces) allTraces.push(...rec.browserTraces)
+    if (rec.asyncPollRecords) allPolls.push(...rec.asyncPollRecords)
+  }
+
+  const abortCheck = (stage: string): CompositePatchRetestProof | null =>
+    params.signal?.aborted ? emit('inconclusive', `Composite patch retest inconclusive: aborted during ${stage}.`) : null
+
+  const abortedStart = abortCheck('initialization')
+  if (abortedStart) return abortedStart
+
+  // Step 1: Optional pre-chain setup / precondition verification.
+  if (params.runner.preparePreconditions) {
+    let setup: CompositePreconditionSetupResult
+    try {
+      setup = await params.runner.preparePreconditions({
+        receipt,
+        topoOrder: dag.topoOrder,
+        signal: params.signal,
+      })
+    } catch (err) {
+      const code = extractErrorCode(err)
+      const msg = err instanceof Error ? err.message : String(err)
+      return emit('inconclusive', `Composite patch retest inconclusive: pre-chain setup failed${code ? ` (${code})` : ''}: ${msg}`)
+    }
+
+    appendRecords(setup)
+    if (setup.preChainControlExchangeIds) extraPreChainControlIds.push(...setup.preChainControlExchangeIds)
+
+    const setupRecErr = inspectRecordsForTransportOrSignatureError(setup, signingKey)
+    if (
+      setup.status === 'transport_error'
+      || setup.status === 'auth_setup_failed'
+      || setup.status === 'inconclusive'
+      || (setup.httpStatus !== undefined && isTransportOrServerFailureStatus(setup.httpStatus))
+      || setupRecErr.failed
+    ) {
+      const reason = setup.reason ?? (setupRecErr.failed ? setupRecErr.reason : `Pre-chain setup returned "${setup.status}".`)
+      return emit('inconclusive', `Composite patch retest inconclusive: ${reason}`)
+    }
+
+    if (setup.status === 'precondition_changed') {
+      const reason = setup.reason ?? 'Target route or schema changed; pre-chain setup could not execute cleanly.'
+      return emit('precondition_changed', `Composite patch retest precondition changed: ${reason}`)
+    }
+  }
+
+  // Step 2: Replay every hop strictly in topological order.
+  for (let hopIndex = 0; hopIndex < dag.topoOrder.length; hopIndex += 1) {
+    const hopId = dag.topoOrder[hopIndex]!
+    const hop = dag.hopsById.get(hopId)!
+    const aborted = abortCheck(`hop "${hopId}"`)
+    if (aborted) return aborted
+
+    const incomingEdges = (dag.incomingByHop.get(hopId) ?? []).map(x => x.edge)
+    const outgoingEdges = (dag.outgoingByHop.get(hopId) ?? []).map(x => x.edge)
+
+    let rawResult: CompositeHopReplayResult
+    try {
+      rawResult = await params.runner.replayHop({
+        receipt,
+        hop,
+        hopIndex,
+        topoOrder: dag.topoOrder,
+        incomingEdges,
+        outgoingEdges,
+        availableCapabilities: [...availableCapabilities],
+        priorHopResults: { ...priorHopResults },
+        transcriptSoFar: {
+          entries: [...allEntries],
+          oobEvents: [...allOob],
+          browserTraces: [...allTraces],
+          asyncPollRecords: [...allPolls],
+        },
+        signal: params.signal,
+      })
+    } catch (err) {
+      const code = extractErrorCode(err)
+      const msg = err instanceof Error ? err.message : String(err)
+      hopResults.push({
+        hopId,
+        surface: hop.surface,
+        outcome: 'transport_error',
+        httpStatuses: [],
+        exchangeIds: [],
+        oobEventIds: [],
+        browserTraceIds: [],
+        emittedCapabilities: [],
+        consumedCapabilities: [],
+        reason: msg,
+        ...(code ? { errorCode: code } : {}),
+      })
+      return emit('inconclusive', `Composite patch retest inconclusive at hop "${hopId}"${code ? ` (${code})` : ''}: ${msg}`)
+    }
+
+    const entries = [...(rawResult.entries ?? [])]
+    const oobEvents = [...(rawResult.oobEvents ?? [])]
+    const browserTraces = [...(rawResult.browserTraces ?? [])]
+    const asyncPollRecords = [...(rawResult.asyncPollRecords ?? [])]
+    appendRecords({ entries, oobEvents, browserTraces, asyncPollRecords })
+    if (rawResult.preChainControlExchangeIds) extraPreChainControlIds.push(...rawResult.preChainControlExchangeIds)
+    if (rawResult.postChainReadbackExchangeIds) extraPostChainReadbackIds.push(...rawResult.postChainReadbackExchangeIds)
+
+    const entryIdSet = new Set(entries.map(e => e.exchangeId))
+    const oobIdSet = new Set(oobEvents.map(o => o.id))
+    const traceIdSet = new Set(browserTraces.map(t => t.id))
+
+    const hopExchangeIds = rawResult.replayedExchangeIds
+      ? [...rawResult.replayedExchangeIds]
+      : (hop.exchangeIds.length > 0 && hop.exchangeIds.every(id => entryIdSet.has(id))
+          ? [...hop.exchangeIds]
+          : entries.filter(e => e.replayAttempt !== 'ablation_control').map(e => e.exchangeId))
+    const hopOobIds = rawResult.replayedOobEventIds
+      ? [...rawResult.replayedOobEventIds]
+      : (hop.oobEventIds.length > 0 && hop.oobEventIds.every(id => oobIdSet.has(id))
+          ? [...hop.oobEventIds]
+          : oobEvents.map(o => o.id))
+    const hopTraceIds = rawResult.replayedBrowserTraceIds
+      ? [...rawResult.replayedBrowserTraceIds]
+      : (hop.browserTraceIds.length > 0 && hop.browserTraceIds.every(id => traceIdSet.has(id))
+          ? [...hop.browserTraceIds]
+          : browserTraces.map(t => t.id))
+
+    const classified = classifyHopReplayOutcome(hop, rawResult, signingKey)
+    const emittedCapabilities = collectHopEmittedCapabilities(entries, oobEvents, browserTraces, asyncPollRecords)
+    const consumedCapabilities = collectHopConsumedCapabilities(entries)
+    const httpStatuses = entries
+      .map(e => e.step.status)
+      .filter((s): s is number => typeof s === 'number' && Number.isFinite(s))
+    if (httpStatuses.length === 0 && typeof rawResult.httpStatus === 'number' && Number.isFinite(rawResult.httpStatus)) {
+      httpStatuses.push(rawResult.httpStatus)
+    }
+
+    const summaryRec: CompositeHopReplaySummary = {
+      hopId,
+      surface: hop.surface,
+      outcome: classified.outcome,
+      httpStatuses,
+      exchangeIds: hopExchangeIds,
+      oobEventIds: hopOobIds,
+      browserTraceIds: hopTraceIds,
+      emittedCapabilities,
+      consumedCapabilities,
+      ...(classified.reason ? { reason: classified.reason } : {}),
+      ...(classified.errorCode ? { errorCode: classified.errorCode } : {}),
+    }
+    hopResults.push(summaryRec)
+    priorHopResults[hopId] = summaryRec
+
+    const artifacts: ReplayedHopArtifacts = {
+      exchangeIds: hopExchangeIds,
+      oobEventIds: hopOobIds,
+      browserTraceIds: hopTraceIds,
+      entries,
+      oobEvents,
+      browserTraces,
+      asyncPollRecords,
+      ablationByEdge: rawResult.replayedAblationExchangeIds ? { ...rawResult.replayedAblationExchangeIds } : {},
+      pollByEdge: rawResult.replayedPollRecordIds ? { ...rawResult.replayedPollRecordIds } : {},
+    }
+    hopArtifacts.set(hopId, artifacts)
+
+    if (
+      classified.outcome === 'transport_error'
+      || classified.outcome === 'auth_setup_failed'
+      || classified.outcome === 'inconclusive'
+    ) {
+      return emit('inconclusive', `Composite patch retest inconclusive at hop "${hopId}": ${classified.reason ?? classified.outcome}`)
+    }
+
+    if (classified.outcome === 'precondition_changed') {
+      return emit('precondition_changed', `Composite patch retest precondition changed at hop "${hopId}": ${classified.reason ?? 'target route/schema drifted'}`)
+    }
+
+    const markRemainingSkipped = () => {
+      for (let j = hopIndex + 1; j < dag.topoOrder.length; j += 1) {
+        const remId = dag.topoOrder[j]!
+        const remHop = dag.hopsById.get(remId)!
+        hopResults.push({
+          hopId: remId,
+          surface: remHop.surface,
+          outcome: 'skipped_after_break',
+          httpStatuses: [],
+          exchangeIds: [],
+          oobEventIds: [],
+          browserTraceIds: [],
+          emittedCapabilities: [],
+          consumedCapabilities: [],
+          reason: `Skipped because predecessor hop "${hopId}" broke the chain.`,
+        })
+      }
+    }
+
+    const benignPrefix = dag.topoOrder.slice(0, hopIndex).filter(id => priorHopResults[id]?.outcome === 'succeeded')
+    const prefixNote = benignPrefix.length > 0 ? ` (benign prefix succeeded: ${benignPrefix.join(' -> ')})` : ''
+
+    if (classified.outcome === 'blocked') {
+      markRemainingSkipped()
+      const brokeEdge = selectBrokeEdgeForBlockedHop(hopId, classified.blockedWith4xx, dag)
+      const brokeReason = classified.reason ?? `Hop "${hopId}" was blocked by the patched target.`
+      return emit('fixed', `Fixed: multi-hop chain broke cleanly at "${hopId}"${prefixNote}: ${brokeReason}`, {
+        patchBrokeHopId: hopId,
+        brokeCausalEdge: brokeEdge,
+        brokeReason,
+        benignPrefixHops: benignPrefix,
+      })
+    }
+
+    // Even when a hop returned 2xx (e.g., sanitized response), verify whether it still produced
+    // the causal outputs required by its outgoing edges before advancing downstream hops.
+    for (const outEdge of dag.outgoingByHop.get(hopId) ?? []) {
+      const prodCheck = hopSatisfiesOutgoingProducerEdge(outEdge.edge, hop, artifacts)
+      if (!prodCheck.ok) {
+        summaryRec.outcome = 'blocked'
+        summaryRec.reason = prodCheck.reason
+        markRemainingSkipped()
+        return emit('fixed', `Fixed: multi-hop chain broke cleanly at "${hopId}"${prefixNote}: ${prodCheck.reason}`, {
+          patchBrokeHopId: hopId,
+          brokeCausalEdge: {
+            edgeIndex: outEdge.edgeIndex,
+            kind: outEdge.edge.kind,
+            fromHopId: outEdge.edge.fromHopId,
+            toHopId: outEdge.edge.toHopId,
+          },
+          brokeReason: prodCheck.reason,
+          benignPrefixHops: benignPrefix,
+        })
+      }
+    }
+
+    for (const cap of emittedCapabilities) availableCapabilities.add(cap)
+  }
+
+  // Step 3: Optional terminal state readback when all hops ran cleanly.
+  if (params.runner.readbackTerminalState) {
+    const abortedReadback = abortCheck('terminal readback')
+    if (abortedReadback) return abortedReadback
+    try {
+      const rb = await params.runner.readbackTerminalState({
+        receipt,
+        transcriptSoFar: {
+          entries: [...allEntries],
+          oobEvents: [...allOob],
+          browserTraces: [...allTraces],
+          asyncPollRecords: [...allPolls],
+        },
+        signal: params.signal,
+      })
+      if (rb.entries) allEntries.push(...rb.entries)
+      if (rb.postChainReadbackExchangeIds) extraPostChainReadbackIds.push(...rb.postChainReadbackExchangeIds)
+      const rbErr = inspectRecordsForTransportOrSignatureError({ entries: rb.entries }, signingKey)
+      if (
+        rb.status === 'transport_error'
+        || rb.status === 'inconclusive'
+        || (rb.httpStatus !== undefined && isTransportOrServerFailureStatus(rb.httpStatus))
+        || rbErr.failed
+      ) {
+        const reason = rb.reason ?? (rbErr.failed ? rbErr.reason : 'Terminal readback failed.')
+        return emit('inconclusive', `Composite patch retest inconclusive during terminal readback: ${reason}`)
+      }
+      if (rb.status === 'precondition_changed') {
+        return emit('precondition_changed', `Composite patch retest precondition changed during terminal readback: ${rb.reason ?? 'schema/route changed'}`)
+      }
+    } catch (err) {
+      const code = extractErrorCode(err)
+      const msg = err instanceof Error ? err.message : String(err)
+      return emit('inconclusive', `Composite patch retest inconclusive during terminal readback${code ? ` (${code})` : ''}: ${msg}`)
+    }
+  }
+
+  // Step 4: Verify the replayed DAG strictly through `verifyCompositeReceipt()`.
+  const allEntriesById = new Map(allEntries.map(e => [e.exchangeId, e]))
+  const allOobById = new Map(allOob.map(o => [o.id, o]))
+  const allTracesById = new Map(allTraces.map(t => [t.id, t]))
+  const allPollsById = new Map(allPolls.map(p => [p.id, p]))
+
+  const replayedReceipt = buildReplayedCompositeReceipt(
+    receipt,
+    dag,
+    hopArtifacts,
+    allEntriesById,
+    allOobById,
+    allTracesById,
+    allPollsById,
+    extraPreChainControlIds,
+    extraPostChainReadbackIds,
+  )
+  const replayedTranscript: HostSignedTranscript = {
+    entries: allEntries,
+    oobEvents: allOob,
+    browserTraces: allTraces,
+    asyncPollRecords: allPolls,
+  }
+
+  const verification = verifyCompositeReceipt(replayedReceipt, replayedTranscript, params.verifyOptions)
+
+  if (verification.confirmed) {
+    return emit(
+      'still_vulnerable',
+      `Still vulnerable: full ${receipt.hops.length}-hop DAG confirmed against patched target (${verification.reason}).`,
+      { compositeVerification: verification },
+    )
+  }
+
+  // Fail closed on harness/signing/provenance/replay-mode errors — never falsely claim 'fixed'.
+  if (
+    verification.failedStage === 'schema'
+    || verification.failedStage === 'dag_topology'
+    || verification.failedStage === 'transcript_integrity'
+    || verification.failedStage === 'attacker_provenance'
+    || verification.failedStage === 'replay_mode'
+  ) {
+    return emit('inconclusive', `Composite patch retest inconclusive (${verification.failedStage}): ${verification.reason}`, {
+      compositeVerification: verification,
+    })
+  }
+
+  if (verification.failedStage === 'edge_binding') {
+    const failedEdge = verification.verifiedEdges.find(e => !e.verified)
+    if (failedEdge) {
+      const edgeObj = replayedReceipt.causalEdges[failedEdge.edgeIndex]
+      const fromArt = hopArtifacts.get(failedEdge.fromHopId)
+      const fromHop = dag.hopsById.get(failedEdge.fromHopId)
+      const fromProduced = edgeObj && fromArt && fromHop
+        ? hopSatisfiesOutgoingProducerEdge(edgeObj, fromHop, fromArt).ok
+        : true
+      const brokeHopId = fromProduced ? failedEdge.toHopId : failedEdge.fromHopId
+      const brokeIdx = dag.topoOrder.indexOf(brokeHopId)
+      const benignPrefix = brokeIdx > 0
+        ? dag.topoOrder.slice(0, brokeIdx).filter(id => priorHopResults[id]?.outcome === 'succeeded')
+        : []
+      const prefixNote = benignPrefix.length > 0 ? ` (benign prefix succeeded: ${benignPrefix.join(' -> ')})` : ''
+      return emit(
+        'fixed',
+        `Fixed: causal edge ${failedEdge.fromHopId} -> ${failedEdge.toHopId} (${failedEdge.kind}) broke at "${brokeHopId}"${prefixNote}: ${failedEdge.reason}`,
+        {
+          patchBrokeHopId: brokeHopId,
+          brokeCausalEdge: {
+            edgeIndex: failedEdge.edgeIndex,
+            kind: failedEdge.kind,
+            fromHopId: failedEdge.fromHopId,
+            toHopId: failedEdge.toHopId,
+          },
+          brokeReason: failedEdge.reason,
+          benignPrefixHops: benignPrefix,
+          compositeVerification: verification,
+        },
+      )
+    }
+  }
+
+  // `failedStage === 'terminal_impact'` (all hops & causal edges ran cleanly, terminal impact neutralized).
+  const terminalHopId = receipt.terminalImpact.terminalHopId
+  const terminalIdx = dag.topoOrder.indexOf(terminalHopId)
+  const benignPrefix = terminalIdx > 0
+    ? dag.topoOrder.slice(0, terminalIdx).filter(id => priorHopResults[id]?.outcome === 'succeeded')
+    : []
+  const prefixNote = benignPrefix.length > 0 ? ` (benign prefix succeeded: ${benignPrefix.join(' -> ')})` : ''
+  return emit(
+    'fixed',
+    `Fixed: terminal impact neutralized at "${terminalHopId}"${prefixNote}: ${verification.reason}`,
+    {
+      patchBrokeHopId: terminalHopId,
+      brokeCausalEdge: null,
+      brokeReason: verification.reason,
+      benignPrefixHops: benignPrefix,
+      compositeVerification: verification,
+    },
+  )
 }
