@@ -276,7 +276,7 @@ export class StateChangeApprovalLedger {
   grant(input: StateChangeFingerprintInput, options: StateChangeApprovalGrant): string {
     const key = buildStateChangeFingerprint(input)
     this.grants.set(key, options)
-    this.prune(options.expiresAt)
+    this.prune(Date.now())
     return key
   }
 
