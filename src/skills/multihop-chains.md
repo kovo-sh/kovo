@@ -19,7 +19,7 @@ Your `AssignmentBrief` may include a bounded (`<= 2 KB`) `hopCheckpoint` object:
 
 ## 3. Layer-1 Derived Capability Custody (`ctx.seal_capability`)
 Whenever a host-signed HTTP exchange, GraphQL response, SSE event, browser trace, or async readback yields a reusable credential or authorization artifact (bearer token, API key, session cookie, signed URL, OIDC assertion, signing salt, or HMAC key):
-1. Call `ctx.seal_capability` inside your `guardian_verify` script to seal the artifact in host-side `DerivedCapabilityVault` custody:
+1. Call `ctx.seal_capability` inside your `kovo_verify` script to seal the artifact in host-side `DerivedCapabilityVault` custody:
    - Inputs: `{ exchange | exchangeId, slot, hopReceiptId?, hopId?, jsonPath | header | cookie | regex | value, kind?, ttlMs?, allowedOrigins?, defaultHeaderName?, defaultCookieName? }` (at least one extraction selector — `jsonPath`, `header`, `cookie`, `regex`, or `value` — is required).
    - Output: `{ handle, meta, exchangeId, sealExchangeId, scrubbedPreview }` where `handle` is opaque `cap:hop_<id>:<slot>` and `meta.sha256Prefix` holds the truncated digest (raw bytes remain host-side and are scrubbed from prompts/transcripts).
 2. Inject the sealed capability into Hop `k+1` via Layer-1 request options: `ctx.http_send(target, { capability: "cap:hop_<id>:<slot>", capabilityTarget?: "bearer" | "header" | "cookie" | "url", capabilityHeaderName?, capabilityCookieName?, capabilityQueryParam?, role: "probe" })` (or `{ capability: { handle, target?, headerName?, cookieName?, queryParam? } }`).
@@ -160,7 +160,7 @@ return ctx.result({ title: '4-hop cross-service signing and async export pivot' 
 4. **`async_pivot_binding`:** `{ kind: "async_pivot_binding", fromHopId, toHopId, correlationId, channel: "poll_convergence" | "oob_relay" | "browser_trace" | "async_job", pollRecordId? | oobEventId? | browserTraceId? }` — connects trigger Hop `i` to downstream effect Hop `j` with monotonic timestamps (`t_i <= t_j`) and run-scoped correlation.
 
 ### White-Box Single-Script Consolidation (3–5 Stage Workflows)
-- Once source routes across services are known from code-audit facts, do **not** burn 10–15 turns probing isolated stages one by one. Write **ONE cohesive `guardian_verify` script** that runs:
+- Once source routes across services are known from code-audit facts, do **not** burn 10–15 turns probing isolated stages one by one. Write **ONE cohesive `kovo_verify` script** that runs:
   1. **Clean Baseline Control (`role: "control"`):** BEFORE Stage 1 mutates any entity/cache state (or on a fresh untouched sibling entity), record both `preChainControlExchangeIds` and any `state_transition_binding` `ablationExchangeIds`.
   2. **Stage 1 -> Stage 2 -> Stage 3 -> Stage 4:** Seal each intermediate capability (`ctx.seal_capability`), bridge signing/token boundaries (`ctx.hmac_sign`/`ctx.jwt_sign`), poll async convergence (`ctx.await_async`), or test concurrent settlement bursts (`ctx.prove_race_burst`) in the same script.
   3. **Terminal Verification (`ctx.prove_composite`):** Fetch the final foreign-tenant business record or persisted state-mutation readback (`postChainReadbackExchangeIds`) — never stopping at job creation, cache priming, or token/link stubs — then call `ctx.prove_composite` and `return ctx.result(...)`.

@@ -280,9 +280,9 @@ export function resolvePhaseRequestBudgets(
   env: NodeJS.ProcessEnv = process.env,
 ): PhaseRequestBudgets | null {
   const floor = positiveRequestBudget(options.floorRequestBudget)
-    ?? positiveRequestBudget(env.GUARDIAN_FLOOR_REQUEST_BUDGET)
+    ?? positiveRequestBudget(env.KOVO_FLOOR_REQUEST_BUDGET)
   const agent = positiveRequestBudget(options.agentRequestBudget)
-    ?? positiveRequestBudget(env.GUARDIAN_AGENT_REQUEST_BUDGET)
+    ?? positiveRequestBudget(env.KOVO_AGENT_REQUEST_BUDGET)
   if (floor === undefined && agent === undefined) return null
   return {
     floor: floor ?? DEFAULT_FLOOR_REQUEST_BUDGET,
@@ -298,7 +298,7 @@ function parseSweepMode(
   if (option === 'always') return 'always'
   if (option === true) return 'on'
   if (option === false) return 'off'
-  const raw = env.GUARDIAN_DETERMINISTIC_SWEEP?.trim().toLowerCase()
+  const raw = env.KOVO_DETERMINISTIC_SWEEP?.trim().toLowerCase()
   if (raw === 'always') return 'always'
   if (defaultMode === 'off') return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on' ? 'on' : 'off'
   return raw === '0' || raw === 'off' || raw === 'false' || raw === 'no' ? 'off' : 'on'
@@ -1406,9 +1406,9 @@ export function detectHostAvailableMemoryBytes(): number {
   return osFreemem()
 }
 
-/** Parse explicit operator env override (`GUARDIAN_PHASE_B_CONCURRENCY` or `GUARDIAN_WORKER_CONCURRENCY`). */
+/** Parse explicit operator env override (`KOVO_PHASE_B_CONCURRENCY` or `KOVO_WORKER_CONCURRENCY`). */
 export function parseEnvPhaseBConcurrencyOverride(env: NodeJS.ProcessEnv = process.env): number | undefined {
-  const raw = env.GUARDIAN_PHASE_B_CONCURRENCY ?? env.GUARDIAN_WORKER_CONCURRENCY
+  const raw = env.KOVO_PHASE_B_CONCURRENCY ?? env.KOVO_WORKER_CONCURRENCY
   if (raw === undefined || raw.trim() === '') return undefined
   const parsed = Number(raw.trim())
   if (!Number.isFinite(parsed) || parsed <= 0) return undefined
@@ -2474,7 +2474,7 @@ export const PROVIDER_STALL_NO_TOKEN_MS = 28_000
 
 /** Env override for the no-token watchdog (bounded 5–120 s; the product default is 28 s). */
 export function resolveProviderStallNoTokenMs(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = Number(env.GUARDIAN_PROVIDER_NO_TOKEN_MS)
+  const raw = Number(env.KOVO_PROVIDER_NO_TOKEN_MS)
   if (!Number.isFinite(raw) || raw <= 0) return PROVIDER_STALL_NO_TOKEN_MS
   return Math.max(5_000, Math.min(120_000, Math.floor(raw)))
 }
@@ -2561,7 +2561,7 @@ export function secretGenerationFingerprint(generations: readonly string[]): str
 
 /** Env override for the single-step wall cap (bounded to 30–120 s so a slot still turns over). */
 export function singleStepWallClockMs(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = Number(env.GUARDIAN_SINGLE_STEP_WALL_CLOCK_MS)
+  const raw = Number(env.KOVO_SINGLE_STEP_WALL_CLOCK_MS)
   if (!Number.isFinite(raw) || raw <= 0) return SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS
   return Math.max(30_000, Math.min(120_000, Math.round(raw)))
 }
@@ -3575,7 +3575,7 @@ export function convertCodeAuditSuspectsToChainSteps(
       })
       const hypothesisParts = [
         `[chain_hops=${stageCount}] Composite workflow (${stageCount} stages): ${hopSequence}.`,
-        'Verify ALL stages in ONE guardian_verify script from ONE low-priv persona (never use a target-tenant persona on the probe arm): run clean denied control BEFORE Stage 1, seal via ctx.seal_capability, use ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst, and confirm via ctx.prove_composite (fresh_clean_replay) — never stop at an intermediate info-disclosure, job creation, cache prime, or token/link stub.',
+        'Verify ALL stages in ONE kovo_verify script from ONE low-priv persona (never use a target-tenant persona on the probe arm): run clean denied control BEFORE Stage 1, seal via ctx.seal_capability, use ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst, and confirm via ctx.prove_composite (fresh_clean_replay) — never stop at an intermediate info-disclosure, job creation, cache prime, or token/link stub.',
       ]
       if (siblingBlock) hypothesisParts.push(siblingBlock)
 
@@ -3634,7 +3634,7 @@ export function convertCodeAuditSuspectsToChainSteps(
       `Auth check: ${item.authCheck}; Ownership check: ${item.ownershipCheck}; Sink: ${item.sinkKind}.`,
       item.hypothesisBody,
       promoteMultiHop
-        ? 'Verify ALL stages in ONE cohesive guardian_verify script from ONE starting low-privilege persona (never use a target-tenant persona on the probe arm): run clean denied control BEFORE Stage 1, seal intermediate handles/tokens/keys with ctx.seal_capability, chain across sibling services (using ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst as needed), and confirm the full DAG via ctx.prove_composite (Mode A fresh_clean_replay) — never stop at an intermediate info-disclosure, job creation, cache prime, or token/link stub.'
+        ? 'Verify ALL stages in ONE cohesive kovo_verify script from ONE starting low-privilege persona (never use a target-tenant persona on the probe arm): run clean denied control BEFORE Stage 1, seal intermediate handles/tokens/keys with ctx.seal_capability, chain across sibling services (using ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst as needed), and confirm the full DAG via ctx.prove_composite (Mode A fresh_clean_replay) — never stop at an intermediate info-disclosure, job creation, cache prime, or token/link stub.'
         : 'Verify live reachability with negative control + differential probe (and cross-persona BOLA check if Tier >= 2) and submit a DeclarativeReplaySpec if confirmed.',
     ]
     if (siblingBlock) hypothesisParts.push(siblingBlock)

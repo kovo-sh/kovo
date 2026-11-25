@@ -728,7 +728,7 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
           const method = item.ep.method === 'POST' ? 'POST' : 'GET'
           if (method === 'POST' && !['query', 'json', 'form'].includes(location)) continue
           const isNumeric = DETERMINISTIC_NUMERIC_PARAM_RE.test(candidate.name)
-          const baselineValue = isNumeric ? '1' : 'guardian'
+          const baselineValue = isNumeric ? '1' : 'kovo'
           const quoteStyle: 'single' | 'double' | 'numeric' = isNumeric ? 'numeric' : 'single'
           const pathAndQuery = location === 'query'
             ? withQueryParam(item.ep.pathTemplate, candidate.name, baselineValue)
@@ -803,8 +803,8 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
         { requestsUsed, endpointsConsidered: ranked.length, endpointsProbed: Math.min(ranked.length, maxEndpoints), findingsCreated, requestCap },
       )
       this.storage.message(
-        current.id, current.coordinatorId, 'guardian',
-        `No model profile is configured, so Guardian ran a bounded deterministic probe pass (${requestsUsed} requests) and proposed ${findingsCreated} deterministic replay spec(s) for Zero-LLM verification.`,
+        current.id, current.coordinatorId, 'kovo',
+        `No model profile is configured, so Kovo Hunter ran a bounded deterministic probe pass (${requestsUsed} requests) and proposed ${findingsCreated} deterministic replay spec(s) for Zero-LLM verification.`,
       )
     } finally {
       this.completeFloorWorker(claimed.id, `Deterministic probes: ${requestsUsed} request(s), ${findingsCreated} spec(s).`)
@@ -909,7 +909,7 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
           ...await this.deriveRuntimeRouteMapTargets(current, approvedOrigins, grant, claimed, signal, recordExchange),
           ...codeLeadIdentifierTargets,
           ...codeLeadTargets,
-          ...(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1'
+          ...(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1'
             ? [...approvedOrigins].sort().flatMap(origin =>
                 this.expandConventionalSurfaceTargets(
                   origin,
@@ -1110,7 +1110,7 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
       this.storage.message(
         current.id,
         current.coordinatorId,
-        'guardian',
+        'kovo',
         `Deterministic engine finished: ${report.confirmed} confirmed finding(s) from ${report.hypothesesFormed} hypothesis(es), ${report.specsSubmitted} replay spec(s), ${report.requestsUsed} request(s) (${report.stoppedReason}).${byClass ? ` Classes ${byClass}.` : ''}`,
       )
     } finally {

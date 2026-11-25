@@ -13,7 +13,7 @@ import type { NamedSecret } from './redact.ts'
 
 type Protocol = 'openai-responses' | 'anthropic-messages'
 
-const providerId = 'guardian'
+const providerId = 'kovo'
 export const defaultMaxRequestBytes = 4 * 1024 * 1024
 export const maxRequestBytesCeiling = 12 * 1024 * 1024
 export const defaultFirstEventTimeoutMs = 120_000
@@ -232,7 +232,7 @@ function makeFetch(
     const beta = settings.protocol === 'messages' && actual.search === '?beta=true'
     if (beta) actual.search = ''
     if (actual.href !== endpoint || request.method !== 'POST') throw new Error('Unexpected model endpoint.')
-    if (process.env.GUARDIAN_OFFLINE === '1' && actual.hostname !== '127.0.0.1') {
+    if (process.env.KOVO_OFFLINE === '1' && actual.hostname !== '127.0.0.1') {
       throw new Error('Offline mode requires a loopback model fixture endpoint.')
     }
     const headers = new Headers(request.headers)
@@ -243,7 +243,7 @@ function makeFetch(
 
     const raw = await request.text()
     if (Buffer.byteLength(raw) > maxRequestBytes) {
-      throw new Error('The model request exceeded Guardian’s size limit.')
+      throw new Error('The model request exceeded Kovo Hunter’s size limit.')
     }
     const payload = JSON.parse(raw) as Record<string, unknown>
     const totalSignal = AbortSignal.any([
@@ -395,7 +395,7 @@ function buildSingleStreamImpl(
       ...streamOpts,
       thinkingEnabled,
       ...(thinkingEnabled ? { effort: effectiveThinking } : {}),
-      ...(connection ? { toolChoice: { type: 'tool' as const, name: 'guardian_connection' } } : {}),
+      ...(connection ? { toolChoice: { type: 'tool' as const, name: 'kovo_connection' } } : {}),
     }),
     streamSimple: (selected, transcript, sOpts) =>
       chooseEvidenceTool(transcript)
@@ -436,7 +436,7 @@ export function provider(
 let rrCounter = 0
 
 export function classifyFailoverError(message: string): { failover: boolean; hard: boolean } {
-  if (/aborted|cancelled|canceled|budget|exceeded Guardian’s size limit|Unexpected model endpoint/i.test(message)) {
+  if (/aborted|cancelled|canceled|budget|exceeded Kovo Hunter’s size limit|Unexpected model endpoint/i.test(message)) {
     return { failover: false, hard: false }
   }
   if (/rejected the API key|quota|credit balance|401|402|403|404|not found/i.test(message)) {
@@ -647,10 +647,10 @@ export function providerPool(
 export async function testProvider(settings: ProviderConfig, record?: CallRecorder): Promise<{ ok: true }> {
   const { models, model } = provider(settings, 'connection', { record, maxCalls: 2, firstEventTimeoutMs: 35_000, idleTimeoutMs: 35_000, totalTimeoutMs: 45_000 })
   const stream = models.stream(model, {
-    systemPrompt: 'Guardian connection test. Call guardian_connection with status ready. Do not add prose.',
-    messages: [{ role: 'user', content: 'Check the Guardian connection.', timestamp: Date.now() }],
+    systemPrompt: 'Kovo Hunter connection test. Call kovo_connection with status ready. Do not add prose.',
+    messages: [{ role: 'user', content: 'Check the Kovo Hunter connection.', timestamp: Date.now() }],
     tools: [{
-      name: 'guardian_connection',
+      name: 'kovo_connection',
       description: 'Return status ready to confirm this synthetic connection test.',
       parameters: obj({ status: str() }),
     }],
@@ -667,7 +667,7 @@ export async function testProvider(settings: ProviderConfig, record?: CallRecord
   }
   if (
     !toolEvents ||
-    !result.content.some(part => part.type === 'toolCall' && part.name === 'guardian_connection' &&
+    !result.content.some(part => part.type === 'toolCall' && part.name === 'kovo_connection' &&
       part.arguments.status === 'ready')
   ) {
     throw new Error('The model did not return the expected streamed tool call.')

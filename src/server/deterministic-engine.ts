@@ -44,7 +44,7 @@ export const defaultEnginePerProbeRequests = 28
  */
 export const deterministicWallMarginMs = 120_000
 
-export const engineDisableEnv = 'GUARDIAN_DETERMINISTIC_ENGINE'
+export const engineDisableEnv = 'KOVO_DETERMINISTIC_ENGINE'
 
 /**
  * Conventional noun/action route wordlists (e.g. `/api/tokens`, `/api/admin/users`) are a local-lab
@@ -53,7 +53,7 @@ export const engineDisableEnv = 'GUARDIAN_DETERMINISTIC_ENGINE'
  * measured from discovered/declared surface only. The switch never changes what is probed on a route
  * the target itself exposed; it only drops endpoints whose sole source is that wordlist.
  */
-export const conventionalWordlistEnv = 'GUARDIAN_CONVENTIONAL_WORDLIST'
+export const conventionalWordlistEnv = 'KOVO_CONVENTIONAL_WORDLIST'
 
 export function conventionalWordlistEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env[conventionalWordlistEnv]
@@ -71,7 +71,7 @@ export function engineWordlistSurface(
   return enabled ? [...endpoints] : endpoints.filter(endpoint => endpoint.source !== 'conventional')
 }
 
-/** The engine is on by default; `GUARDIAN_DETERMINISTIC_ENGINE=0|false|off` disables it. */
+/** The engine is on by default; `KOVO_DETERMINISTIC_ENGINE=0|false|off` disables it. */
 export function deterministicEngineEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env[engineDisableEnv]
   return !(raw === '0' || raw === 'false' || raw === 'off' || raw === 'no')
@@ -1445,11 +1445,11 @@ function semanticValue(name: string, observed?: string): string | number | boole
   const lower = name.toLowerCase()
   if (/(?:^|_)(?:is|has)_|enabled|active|verified|admin|paid|approved|marketing|optin|boolean|visibility/.test(lower)) return true
   if (/(qty|quantity|count|limit|amount|price|total|number|num|page|size|offset|age)/.test(lower)) return 1
-  if (/email/.test(lower)) return 'guardian@example.test'
-  if (/(url|uri|link|callback|webhook|redirect|avatar|image|src)/.test(lower)) return 'http://guardian-control.invalid/'
+  if (/email/.test(lower)) return 'kovo@example.test'
+  if (/(url|uri|link|callback|webhook|redirect|avatar|image|src)/.test(lower)) return 'http://kovo-control.invalid/'
   if (/(date|time|timestamp|at)$/.test(lower)) return '2026-01-01T00:00:00Z'
   if (/(id|ref|key|code|token)$/.test(lower)) return '1'
-  return 'guardian'
+  return 'kovo'
 }
 
 function siblingBody(fields: readonly string[], values: Record<string, string[]>, exclude?: string, coerceNumeric = false): Record<string, unknown> {
@@ -1854,7 +1854,7 @@ export function enumerateHypotheses(
       for (const param of params) {
         const numeric = /^(?:id|page|limit|offset|qty|quantity|amount|price|count|num|index)$/i.test(param.name)
         const observed = harvest?.values[param.name]?.[0] ?? harvest?.seedValues.find(v => v.length >= 3 && v.length <= 40)
-        const baselineValue = numeric ? '1' : (observed && !/[<>{}\\]/.test(observed) ? observed.slice(0, 48) : 'guardian')
+        const baselineValue = numeric ? '1' : (observed && !/[<>{}\\]/.test(observed) ? observed.slice(0, 48) : 'kovo')
         add({
           key: `sqli_boolean|${endpoint.id}|${param.name}`,
           endpoint,
@@ -2026,7 +2026,7 @@ export function enumerateHypotheses(
             param,
             location: 'json',
             ownerPersona: picks.owner?.handle,
-            baselineValue: 'guardian',
+            baselineValue: 'kovo',
             jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name, coerceNumericBodies),
             risk: endpointRiskScore(endpoint) + 14,
           })
@@ -2450,8 +2450,8 @@ export function enumerateHypotheses(
       const delivery: Record<string, unknown> = {}
       for (const field of observedFields.slice(0, 8)) delivery[field] = semanticValue(field, observedValues[field]?.[0])
       if (Object.keys(delivery).length === 0) {
-        delivery.event = 'guardian.verification'
-        delivery.type = 'guardian.verification'
+        delivery.event = 'kovo.verification'
+        delivery.type = 'kovo.verification'
       }
       const detail = endpoints.find(candidate => {
         const candidatePath = candidate.pathTemplate.split('?')[0] || '/'
@@ -3056,10 +3056,10 @@ async function harvestSurface(
         .filter(param => pathHasSearchHint(bare) || pathHasFileHint(bare) || pathHasUrlHint(bare) || pathHasRedirectHint(bare))
         .slice(0, 5)
       const sampleFor = (name: string): string => {
-        if (pathHasFileHint(bare) || /(?:file|path|name|log|doc)/i.test(name)) return 'guardian.txt'
-        if (pathHasUrlHint(bare) || /(?:url|uri|callback|avatar|image|src)/i.test(name)) return 'http://guardian-control.invalid/'
-        if (pathHasRedirectHint(bare)) return '/guardian-return'
-        return target.seedValues[0] ?? 'guardian'
+        if (pathHasFileHint(bare) || /(?:file|path|name|log|doc)/i.test(name)) return 'kovo.txt'
+        if (pathHasUrlHint(bare) || /(?:url|uri|callback|avatar|image|src)/i.test(name)) return 'http://kovo-control.invalid/'
+        if (pathHasRedirectHint(bare)) return '/kovo-return'
+        return target.seedValues[0] ?? 'kovo'
       }
       for (const candidate of candidates) {
         const separator = bare.includes('?') ? '&' : '?'
@@ -3112,9 +3112,9 @@ async function harvestSurface(
 // ---------------------------------------------------------------------------------------------
 
 /** Run-scoped synthetic-tenant marker carried on every staging mutation (scope-policy contract). */
-export const STAGING_TENANT_HEADER = 'x-guardian-tenant-tag'
+export const STAGING_TENANT_HEADER = 'x-kovo-tenant-tag'
 /** Fixture/run journal key: lets the target attribute created rows to this run for teardown. */
-export const STAGING_RUN_HEADER = 'x-guardian-run-id'
+export const STAGING_RUN_HEADER = 'x-kovo-run-id'
 
 /**
  * Benign, human-visible fields the floor creates in a staging/isolated environment. Injecting the
@@ -3636,7 +3636,7 @@ async function probeSecondOrderSsrf(
         pathAndQuery: target,
         headers: { 'Content-Type': 'application/json', ...stagingHeaders },
         body: JSON.stringify(body),
-        // In a local lab the broker records this as `X-Guardian-Trace-Id`, so the exchange that
+        // In a local lab the broker records this as `X-Kovo-Trace-Id`, so the exchange that
         // carried the injected canary is identifiable when the callback arrives after the probe
         // window (request bodies are not indexed, headers are).
         ...(traceId ? { traceId } : {}),
@@ -3678,7 +3678,7 @@ async function probeSecondOrderSsrf(
     }
   }
 
-  const control = await send(hyp.pathAndQuery, 'http://guardian-control.invalid/')
+  const control = await send(hyp.pathAndQuery, 'http://kovo-control.invalid/')
   const controlId = control ? extractCreatedId(control.body) : null
   if (controlId && !triggerIsSelf) await triggerFetch(controlId)
 
@@ -4616,7 +4616,7 @@ export function trackFloorCanarySubscriptions(
               assignmentId: input.assignmentId,
               canaryId: minted.id,
               token: minted.token,
-              // Empty artifact: a real async callback does not carry Guardian's artifact marker,
+              // Empty artifact: a real async callback does not carry Kovo Hunter's artifact marker,
               // and a truthy artifact would reject it at ingest. Token↔canary binding is the link.
               artifact: '',
               immediateMs: floorOobImmediateMs,

@@ -17,7 +17,7 @@ import { dirname, join, resolve } from 'node:path'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 
-export const DEFAULT_GITHUB_PAT_PATH = join(homedir(), '.config', 'guardian-fixtures', 'github.pat')
+export const DEFAULT_GITHUB_PAT_PATH = join(homedir(), '.config', 'kovo-fixtures', 'github.pat')
 export const DEFAULT_GITHUB_MAX_AUTO_SELECT = 10
 export const DEFAULT_GITHUB_BASE_URL = 'https://github.com'
 export const DEFAULT_GITHUB_API_BASE_URL = 'https://api.github.com'
@@ -249,7 +249,7 @@ export function saveGithubClientId(dataDir: string, rawClientId: string): string
 }
 
 export function resolveGithubAppSlug(dataDir?: string): string | null {
-  const envRaw = process.env.GUARDIAN_GITHUB_APP_SLUG
+  const envRaw = process.env.KOVO_GITHUB_APP_SLUG
   if (typeof envRaw === 'string' && envRaw.trim().length > 0) {
     return normalizeGithubAppSlug(envRaw)
   }
@@ -288,7 +288,7 @@ export function resolveGithubClientId(
   if (typeof explicitClientId === 'string' && explicitClientId.trim()) {
     return { clientId: validateGithubClientId(explicitClientId), source: 'input' }
   }
-  const envClientId = process.env.GUARDIAN_GITHUB_CLIENT_ID?.trim()
+  const envClientId = process.env.KOVO_GITHUB_CLIENT_ID?.trim()
   if (envClientId) {
     try {
       return { clientId: validateGithubClientId(envClientId), source: 'env' }
@@ -630,7 +630,7 @@ export async function resolveFreshGithubCredential(options: {
       headers: {
         Accept: 'application/json',
         'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'Guardian/2 read-only repo connector',
+        'User-Agent': 'KovoHunter/2 read-only repo connector',
       },
       body: new URLSearchParams({
         client_id: clientId,
@@ -709,7 +709,7 @@ export async function startGithubDeviceFlow(
   input.signal?.throwIfAborted()
   const resolved = resolveGithubClientId(input.dataDir, input.clientId)
   if (!resolved.clientId) {
-    throw new Error('GitHub App Client ID is required. Set GUARDIAN_GITHUB_CLIENT_ID or enter your GitHub App Client ID.')
+    throw new Error('GitHub App Client ID is required. Set KOVO_GITHUB_CLIENT_ID or enter your GitHub App Client ID.')
   }
   const clientId = resolved.clientId
   if (input.clientId && input.dataDir) {
@@ -728,7 +728,7 @@ export async function startGithubDeviceFlow(
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': 'Guardian/2 read-only repo connector',
+      'User-Agent': 'KovoHunter/2 read-only repo connector',
     },
     body: new URLSearchParams({ client_id: clientId }).toString(),
     signal: reqSignal,
@@ -821,7 +821,7 @@ export async function pollGithubDeviceFlow(
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': 'Guardian/2 read-only repo connector',
+      'User-Agent': 'KovoHunter/2 read-only repo connector',
     },
     body: new URLSearchParams({
       client_id: flow.clientId,
@@ -915,7 +915,7 @@ export async function pollGithubDeviceFlow(
         Authorization: `Bearer ${accessToken}`,
         Accept: 'application/vnd.github+json',
         'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'Guardian/2 read-only repo connector',
+        'User-Agent': 'KovoHunter/2 read-only repo connector',
       },
       signal: options.signal
         ? AbortSignal.any([options.signal, AbortSignal.timeout(10_000)])
@@ -1043,7 +1043,7 @@ export async function listAccessibleGithubRepos(
     Authorization: `Bearer ${pat}`,
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
-    'User-Agent': 'Guardian/2 read-only repo connector',
+    'User-Agent': 'KovoHunter/2 read-only repo connector',
   }
 
   const repos: AccessibleGithubRepo[] = []

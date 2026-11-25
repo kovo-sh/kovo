@@ -425,7 +425,7 @@ export interface InjectionFingerprintArgs extends FloorRecipeBaseArgs {
   actor: FloorActor
   /** The injected value (the payload itself; sent only to the target). */
   payload: string
-  /** Benign value for the control arm; defaults to `guardian-benign`. */
+  /** Benign value for the control arm; defaults to `kovo-benign`. */
   controlValue?: string
   /** Injection family used to select the fingerprint vocabulary. */
   family?: InjectionFamily
@@ -719,8 +719,8 @@ class RecipeContext implements FloorRecipeContext {
 
 function deriveDifferingParam(controlPath: string, probePath: string): string | null {
   try {
-    const control = new URL(controlPath, 'http://guardian.invalid').searchParams
-    const probe = new URL(probePath, 'http://guardian.invalid').searchParams
+    const control = new URL(controlPath, 'http://kovo.invalid').searchParams
+    const probe = new URL(probePath, 'http://kovo.invalid').searchParams
     const keys = new Set([...control.keys(), ...probe.keys()])
     for (const key of keys) {
       if (control.get(key) !== probe.get(key)) return key
@@ -1377,7 +1377,7 @@ const browserSink = defineRecipe<BrowserSinkArgs>('browser_sink', async (args, c
   )
   // Verifier-minted canary: deterministic for the same proof inputs, and never a stored literal.
   const canaryToken = args.canaryToken
-    ?? `guardian-dom-${createHash('sha256').update(`${args.origin}|${args.pathAndQuery}|${args.vulnClass}`).digest('hex').slice(0, 10)}`
+    ?? `kovo-dom-${createHash('sha256').update(`${args.origin}|${args.pathAndQuery}|${args.vulnClass}`).digest('hex').slice(0, 10)}`
   const interpolate = (value: string | undefined): string | undefined => value?.replaceAll('{{canary_token}}', canaryToken)
 
   // `verifyReceipt` selects the `browser` rule only for browser-class vulnClasses (`dom_xss`, etc.),
@@ -1531,7 +1531,7 @@ export function browserSinkEnvelopeFromSteps(input: {
 
 /** Fingerprinted SQL error / traversal / command injection → receipt `impact` rule (never status). */
 const injectionFingerprint = defineRecipe<InjectionFingerprintArgs>('injection_fingerprint', async (args, ctx) => {
-  const controlValue = args.controlValue ?? 'guardian-benign'
+  const controlValue = args.controlValue ?? 'kovo-benign'
   // The recipe owns the arm shapes: a query-located parameter is substituted in the query string,
   // a JSON-located one in the body. An unmovable carrier fails closed rather than sending the same
   // value twice (which would make a control/fingerprint comparison meaningless).
@@ -1545,7 +1545,7 @@ const injectionFingerprint = defineRecipe<InjectionFingerprintArgs>('injection_f
     }
     if (!args.param) return null
     try {
-      const url = new URL(args.pathAndQuery, 'http://guardian.invalid')
+      const url = new URL(args.pathAndQuery, 'http://kovo.invalid')
       if (!url.searchParams.has(args.param)) return null
       url.searchParams.set(args.param, value)
       return { pathAndQuery: `${url.pathname}${url.search}` }

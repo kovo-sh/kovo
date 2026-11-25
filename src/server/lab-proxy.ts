@@ -77,22 +77,22 @@ export const MAX_LAB_CONTAINERS = 6
 
 /** Docker labels used to persist and reap every lab resource. */
 export const LAB_LABELS = {
-  lab: 'dev.guardian.lab',
-  run: 'dev.guardian.run',
-  service: 'dev.guardian.service',
-  role: 'dev.guardian.role',
+  lab: 'dev.kovo.lab',
+  run: 'dev.kovo.run',
+  service: 'dev.kovo.service',
+  role: 'dev.kovo.role',
 } as const
 
 /** Proxy container image: a known-good Node runtime that runs only the trusted relay script. */
 export const LAB_PROXY_IMAGE_DEFAULT = 'node:24-bookworm-slim'
-export const LAB_PROXY_IMAGE_ENV = 'GUARDIAN_LAB_PROXY_IMAGE'
-export const LAB_DB_VOLUMES_ENV = 'GUARDIAN_LAB_DB_VOLUMES'
-export const LAB_STATE_DIR_ENV = 'GUARDIAN_LAB_STATE_DIR'
+export const LAB_PROXY_IMAGE_ENV = 'KOVO_LAB_PROXY_IMAGE'
+export const LAB_DB_VOLUMES_ENV = 'KOVO_LAB_DB_VOLUMES'
+export const LAB_STATE_DIR_ENV = 'KOVO_LAB_STATE_DIR'
 const LAB_PROXY_TARGET_FILE = 'target'
 const LAB_PROXY_SOCKET_FILE = 'proxy.sock'
-const LAB_PROXY_DIR_PREFIX = 'guardian-lab-proxy-'
-const LAB_REPO_DIR_PREFIX = 'guardian-lab-repo-'
-const LAB_TELEMETRY_DIR_PREFIX = 'guardian-lab-telemetry-'
+const LAB_PROXY_DIR_PREFIX = 'kovo-lab-proxy-'
+const LAB_REPO_DIR_PREFIX = 'kovo-lab-repo-'
+const LAB_TELEMETRY_DIR_PREFIX = 'kovo-lab-telemetry-'
 
 /** Scratch-directory prefixes; exported so recovery/cleanup policies are unit-testable. */
 export const LAB_PATHS = {
@@ -140,11 +140,11 @@ const FORBIDDEN_COMPOSE_KEYS = new Set([
 ])
 
 /** Operator override for the lab container uid:gid. Must be a non-root numeric user. */
-export const LAB_CONTAINER_USER_ENV = 'GUARDIAN_LAB_USER'
+export const LAB_CONTAINER_USER_ENV = 'KOVO_LAB_USER'
 
 /**
  * Choose the non-root user lab containers run as. Defaults to the invoking uid:gid so a bind
- * mounted, owner-only IAST telemetry dir stays writable without world permissions; when Guardian
+ * mounted, owner-only IAST telemetry dir stays writable without world permissions; when Kovo Hunter
  * itself runs as root the container falls back to nobody:nogroup.
  */
 export function resolveLabContainerUser(env: NodeJS.ProcessEnv = process.env): string {
@@ -529,7 +529,7 @@ export function labDataVolumeName(runId: string, serviceName: string, nonce?: st
   const runSlug = runId.replace(/[^a-z0-9]/gi, '').slice(0, 12).toLowerCase() || 'run'
   const svcSlug = serviceName.replace(/[^a-z0-9]/gi, '').slice(0, 20).toLowerCase() || 'svc'
   const suffix = (nonce ?? createHash('sha256').update(`${runId}:${serviceName}:${randomUUID()}`).digest('hex')).slice(0, 8)
-  return `guardian-lab-vol-${runSlug}-${svcSlug}-${suffix}`
+  return `kovo-lab-vol-${runSlug}-${svcSlug}-${suffix}`
 }
 
 export interface LabWritableOverlayInput {
@@ -613,7 +613,7 @@ export function buildWritableDataOverlay(input: LabWritableOverlayInput): LabWri
       // SQLite runs inside the app container: keep the app rootfs read-only but give the DB file a
       // writable per-run data dir, and point DATABASE_URL at it when the URL names a repo file.
       return {
-        ...plan('/app/data', [socketTmpfs('/data', 0o700)], { GUARDIAN_LAB_DATA_DIR: '/app/data' }),
+        ...plan('/app/data', [socketTmpfs('/data', 0o700)], { KOVO_LAB_DATA_DIR: '/app/data' }),
         readOnlyRootfs: true,
       }
   }
@@ -635,7 +635,7 @@ export function buildSyntheticEnvArgs(
     PORT: String(internalPort),
     HOST: '0.0.0.0',
     NODE_ENV: 'test',
-    GUARDIAN_LAB: '1',
+    KOVO_LAB: '1',
   }
   for (const [k, v] of Object.entries(env ?? {})) {
     if (!SAFE_ENV_KEY.test(k) || FORBIDDEN_ENV_KEYS.has(k)) {
@@ -690,7 +690,7 @@ export function buildLabContainerRunArgs(input: LabContainerRunArgsInput): strin
     `${LAB_LABELS.service}=${input.serviceName}`,
   ]
   for (const [key, value] of Object.entries(input.extraLabels ?? {})) {
-    if (!/^dev\.guardian\.[a-z-]{1,32}$/.test(key) || !SAFE_LABEL_VALUE.test(value)) continue
+    if (!/^dev\.kovo\.[a-z-]{1,32}$/.test(key) || !SAFE_LABEL_VALUE.test(value)) continue
     labels.push(`${key}=${value}`)
   }
   const args: string[] = [
@@ -736,7 +736,7 @@ export function buildLabContainerRunArgs(input: LabContainerRunArgsInput): strin
  */
 export const LAB_PROXY_SCRIPT = [
   "const net=require('net'),fs=require('fs')",
-  "const dir='/guardian-proxy'",
+  "const dir='/kovo-proxy'",
   "const sock=dir+'/proxy.sock'",
   "const targetFile=dir+'/target'",
   "function target(){",
@@ -749,7 +749,7 @@ export const LAB_PROXY_SCRIPT = [
   "      if(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(host)&&Number.isInteger(port)&&port>0&&port<65536)return{host,port}",
   "    }",
   "  }catch{}",
-  "  return{host:process.env.GUARDIAN_PROXY_TARGET_HOST||'127.0.0.1',port:Number(process.env.GUARDIAN_PROXY_TARGET_PORT||'8080')}",
+  "  return{host:process.env.KOVO_PROXY_TARGET_HOST||'127.0.0.1',port:Number(process.env.KOVO_PROXY_TARGET_PORT||'8080')}",
   "}",
   "try{fs.unlinkSync(sock)}catch{}",
   "net.createServer(client=>{",
@@ -765,8 +765,8 @@ export const LAB_PROXY_SCRIPT = [
   "  upstream.setTimeout(120000,teardown)",
   "  client.setTimeout(120000,teardown)",
   "}).listen(sock,()=>{",
-  "  try{fs.chmodSync(sock,process.env.GUARDIAN_PROXY_SOCKET_MODE==='666'?0o666:0o600)}catch{}",
-  "  console.log('guardian-lab-proxy-ready')",
+  "  try{fs.chmodSync(sock,process.env.KOVO_PROXY_SOCKET_MODE==='666'?0o666:0o600)}catch{}",
+  "  console.log('kovo-lab-proxy-ready')",
   "})",
 ].join('\n')
 
@@ -836,10 +836,10 @@ export function buildLabProxyRunArgs(input: LabProxyRunArgsInput): string[] {
     '--label', `${LAB_LABELS.lab}=1`,
     '--label', `${LAB_LABELS.run}=${input.runId}`,
     '--label', `${LAB_LABELS.role}=proxy`,
-    '--mount', `type=bind,source=${input.proxyDir},target=/guardian-proxy`,
-    '-e', 'GUARDIAN_PROXY_SOCKET_MODE=' + input.socketMode,
-    '-e', 'GUARDIAN_PROXY_TARGET_HOST=' + input.targetHost,
-    '-e', 'GUARDIAN_PROXY_TARGET_PORT=' + String(input.targetPort),
+    '--mount', `type=bind,source=${input.proxyDir},target=/kovo-proxy`,
+    '-e', 'KOVO_PROXY_SOCKET_MODE=' + input.socketMode,
+    '-e', 'KOVO_PROXY_TARGET_HOST=' + input.targetHost,
+    '-e', 'KOVO_PROXY_TARGET_PORT=' + String(input.targetPort),
     image,
     'node', '-e', LAB_PROXY_SCRIPT,
   ]
@@ -857,8 +857,8 @@ export function createLabProxyDir(
   if (hostUid !== undefined && hostUid !== 0 && containerUid !== hostUid) {
     throw new Error(
       `Lab proxy handshake dir must be writable by the lab container user (uid ${containerUid}); ` +
-      `Guardian runs as uid ${hostUid}. Set ${LAB_CONTAINER_USER_ENV}=${hostUid}:${containerUser.split(':')[1]} ` +
-      'or run Guardian as root.',
+      `Kovo Hunter runs as uid ${hostUid}. Set ${LAB_CONTAINER_USER_ENV}=${hostUid}:${containerUser.split(':')[1]} ` +
+      'or run Kovo Hunter as root.',
     )
   }
   const slug = runId.replace(/[^a-z0-9]/gi, '').slice(0, 12).toLowerCase() || 'run'
@@ -1052,7 +1052,7 @@ export function resolveStartCommand(sanitizedRepoDir: string, labConfig: LabConf
     return { image, cmd: ['npm', 'start'] }
   }
   if (existsSync(join(sanitizedRepoDir, 'app.py'))) {
-    return { image: labConfig.image || 'guardian-worker:local', cmd: ['python3', '/app/app.py'] }
+    return { image: labConfig.image || 'kovo-worker:local', cmd: ['python3', '/app/app.py'] }
   }
   throw new Error('Unable to infer lab start command. Specify labConfig.startCommand or labConfig.dockerfile.')
 }
@@ -1190,7 +1190,7 @@ export function resolveLabStackServices(params: {
 function dockerHost(): string {
   const host = process.env.DOCKER_HOST || 'unix:///var/run/docker.sock'
   if (!/^unix:\/\/\/[^/?#\r\n][^?#\r\n]*$/.test(host)) {
-    throw new Error('Guardian LabRunner requires a local Docker Unix socket.')
+    throw new Error('Kovo Hunter LabRunner requires a local Docker Unix socket.')
   }
   return host
 }

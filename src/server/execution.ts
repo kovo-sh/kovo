@@ -177,15 +177,15 @@ type Active = ExecActiveJob
 type CoordinatorTask = ExecCoordinatorTask
 
 function createBroker(options: { storage: SecondOrderStore; canaryBroker: CanaryBroker }) {
-  const target = process.env.GUARDIAN_NETWORK_FIXTURE
+  const target = process.env.KOVO_NETWORK_FIXTURE
   if (!target) {
-    return process.env.GUARDIAN_OFFLINE === '1'
+    return process.env.KOVO_OFFLINE === '1'
       ? new RequestBroker({ resolve: async () => [], storage: options.storage, canaryBroker: options.canaryBroker })
       : new RequestBroker({ storage: options.storage, canaryBroker: options.canaryBroker })
   }
   const fixture = new URL(target)
   if (fixture.origin !== target || fixture.hostname !== '127.0.0.1' || fixture.protocol !== 'http:' || !fixture.port) {
-    throw new Error('GUARDIAN_NETWORK_FIXTURE must identify a loopback HTTP origin.')
+    throw new Error('KOVO_NETWORK_FIXTURE must identify a loopback HTTP origin.')
   }
   return new RequestBroker({
     storage: options.storage,
@@ -197,7 +197,7 @@ function createBroker(options: { storage: SecondOrderStore; canaryBroker: Canary
     transport: async (url, _address, signal, options) => {
       const reqHeaders: Record<string, string> = {
         ...(options?.headers ?? {}),
-        'x-guardian-fixture-target': url.href,
+        'x-kovo-fixture-target': url.href,
       }
       const response = await fetch(fixture, {
         method: options?.method ?? 'GET',
@@ -233,7 +233,7 @@ export interface ExecutionOptions {
   deterministicOnly?: boolean
   /**
    * v6 Phase 1: run the deterministic floor as a concurrent, isolated sibling lane on **every**
-   * agentic run. Default ON; `deterministicSweep: false` (or `GUARDIAN_DETERMINISTIC_SWEEP=0`) is
+   * agentic run. Default ON; `deterministicSweep: false` (or `KOVO_DETERMINISTIC_SWEEP=0`) is
    * an operator kill switch, and `'always'` bypasses the resumed-run guard. The lane never blocks
    * dispatch, never consumes specialist worker slots, never cancels steps and never hides
    * confirmed routes.
@@ -242,7 +242,7 @@ export interface ExecutionOptions {
   /**
    * Wall-clock ceiling the harness will allow for the whole run. The concurrent lane derives its
    * own deadline as `min(240 s, 40% × maxDurationMs)`. Falls back to
-   * `GUARDIAN_MAX_DURATION_MS`, then 600 s (which keeps the 240 s lane cap).
+   * `KOVO_MAX_DURATION_MS`, then 600 s (which keeps the 240 s lane cap).
    */
   maxDurationMs?: number
   /**
@@ -253,8 +253,8 @@ export interface ExecutionOptions {
   onCheckpoint?: (event: { runId: string; checkpoint: ExecutionCheckpoint }) => void
   /**
    * v6 budget split: per-phase request allowances (see `PhaseRequestBudgets`). Omit both to keep
-   * the legacy single shared `run.budgetRequests` behavior. `GUARDIAN_FLOOR_REQUEST_BUDGET` /
-   * `GUARDIAN_AGENT_REQUEST_BUDGET` are the env equivalents.
+   * the legacy single shared `run.budgetRequests` behavior. `KOVO_FLOOR_REQUEST_BUDGET` /
+   * `KOVO_AGENT_REQUEST_BUDGET` are the env equivalents.
    */
   floorRequestBudget?: number
   agentRequestBudget?: number
@@ -544,7 +544,7 @@ export class Execution {
   /** Tier-A Program-Graph facts/steps: seeded first, exempt from the generic lead cap. */
   private readonly tierAFactIds = new Set<string>()
   private readonly tierAStepIds = new Set<string>()
-  /** Opt-in per-run agentic trace (only populated when GUARDIAN_TRACE_DIR / GUARDIAN_TRACE is set). */
+  /** Opt-in per-run agentic trace (only populated when KOVO_TRACE_DIR / KOVO_TRACE is set). */
   private readonly runTraces = new Map<string, AgentTrace>()
   private readonly onCheckpoint?: (event: { runId: string; checkpoint: ExecutionCheckpoint }) => void
   private readonly assignmentWallClockOverrideMs?: number
@@ -580,7 +580,7 @@ export class Execution {
     this.deterministicOnly = options.deterministicOnly === true
     this.deterministicSweep = resolveFloorLaneMode(options.deterministicSweep)
     const optionMaxDuration = Number(options.maxDurationMs)
-    const envMaxDuration = Number(process.env.GUARDIAN_MAX_DURATION_MS)
+    const envMaxDuration = Number(process.env.KOVO_MAX_DURATION_MS)
     this.maxDurationMs = Number.isFinite(optionMaxDuration) && optionMaxDuration > 0
       ? optionMaxDuration
       : Number.isFinite(envMaxDuration) && envMaxDuration > 0
@@ -721,18 +721,18 @@ export class Execution {
 
   private isCanaryDnsConfigured(): boolean {
     return Boolean(
-      process.env.GUARDIAN_CANARY_DNS_HOST ||
-      process.env.GUARDIAN_CANARY_DNS_PORT ||
-      process.env.GUARDIAN_CANARY_DNS_DOMAIN,
+      process.env.KOVO_CANARY_DNS_HOST ||
+      process.env.KOVO_CANARY_DNS_PORT ||
+      process.env.KOVO_CANARY_DNS_DOMAIN,
     )
   }
 
   private isCanaryListenerConfigured(): boolean {
     return Boolean(
-      process.env.GUARDIAN_CANARY_PUBLIC_URL ||
-      process.env.GUARDIAN_CANARY_BASE_URL ||
-      process.env.GUARDIAN_CANARY_PORT ||
-      process.env.GUARDIAN_CANARY_ENABLE === '1' ||
+      process.env.KOVO_CANARY_PUBLIC_URL ||
+      process.env.KOVO_CANARY_BASE_URL ||
+      process.env.KOVO_CANARY_PORT ||
+      process.env.KOVO_CANARY_ENABLE === '1' ||
       this.isCanaryDnsConfigured(),
     )
   }
@@ -896,8 +896,8 @@ export class Execution {
   }
 
   /**
-   * Opt-in trace writer (v5.1 fast loop). Returns `null` unless GUARDIAN_TRACE_DIR /
-   * GUARDIAN_TRACE enabled tracing. Never throws: a trace failure must not disturb a run.
+   * Opt-in trace writer (v5.1 fast loop). Returns `null` unless KOVO_TRACE_DIR /
+   * KOVO_TRACE enabled tracing. Never throws: a trace failure must not disturb a run.
    */
   private ensureRunTrace(
     run: Run,
@@ -909,9 +909,9 @@ export class Execution {
       let app = run.id.slice(0, 8)
       try { app = this.storage.project(run.projectId).name } catch { /* project may be gone */ }
       const trace = createAgentTraceFromEnv({
-        gitSha: process.env.GUARDIAN_GIT_SHA?.trim() || 'unknown',
+        gitSha: process.env.KOVO_GIT_SHA?.trim() || 'unknown',
         app,
-        seed: process.env.GUARDIAN_BENCH_SEED ?? null,
+        seed: process.env.KOVO_BENCH_SEED ?? null,
         mode: this.deterministicOnly ? 'deterministic' : 'agentic',
         model: profiles[0]?.model ?? 'none',
       })
@@ -1096,7 +1096,7 @@ export class Execution {
         const fresh = this.storage.run(run.id)
         const localLabAutoApproval =
           project.environment === 'local-lab' &&
-          allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1' &&
+          allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1' &&
           fresh.capabilityTier >= 3 &&
           (fresh.approvalPolicy ?? 'auto_review') !== 'strict' &&
           isLocalLabAutoApprovalOrigin(origin)
@@ -1192,7 +1192,7 @@ export class Execution {
             const notifyKey = `${run.id}:${origin}`
             if (!this.circuitNotified.has(notifyKey)) {
               this.circuitNotified.add(notifyKey)
-              this.storage.message(run.id, fresh.coordinatorId, 'guardian',
+              this.storage.message(run.id, fresh.coordinatorId, 'kovo',
                 action === 'pause_run'
                   ? `Defensive circuit breaker opened for ${origin} due to elevated 5xx/429 responses. Run paused to protect target availability.`
                   : `Defensive circuit breaker opened for ${origin} due to elevated 5xx/429 responses. Further traffic to ${origin} is blocked while healthy hosts continue.`)
@@ -1916,7 +1916,7 @@ export class Execution {
           this.storage.message(
             run.id,
             run.coordinatorId,
-            'guardian',
+            'kovo',
             `Paused run because Email + Password persona authentication failed: ${msg}`,
           )
         })
@@ -2125,8 +2125,8 @@ export class Execution {
             })
           },
         }, {
-          // Budgeted Stage-1 LLM spec + dynamic rule synthesis; opt out with GUARDIAN_STAGE1_LLM=0.
-          enableStage1Llm: process.env.GUARDIAN_STAGE1_LLM !== '0',
+          // Budgeted Stage-1 LLM spec + dynamic rule synthesis; opt out with KOVO_STAGE1_LLM=0.
+          enableStage1Llm: process.env.KOVO_STAGE1_LLM !== '0',
           persistToStore: true,
           staticSnapshot,
         })
@@ -2906,7 +2906,7 @@ export class Execution {
   }
 
   private specialistWallClockMs(maxTurns: number): number {
-    const envMs = Number(process.env.GUARDIAN_AGENTIC_SPECIALIST_WALL_CLOCK_MS)
+    const envMs = Number(process.env.KOVO_AGENTIC_SPECIALIST_WALL_CLOCK_MS)
     const base = Number.isFinite(envMs) && envMs > 0 ? envMs : AGENTIC_SPECIALIST_WALL_CLOCK_MS
     // Batched micro-specialists sit at AGENTIC_SPECIALIST_MAX_TURNS; longer legacy assignments
     // scale linearly up to 2x the base wall clock, always inside the 30-minute intent lease.
@@ -3720,7 +3720,7 @@ export class Execution {
       }
       if (args.textBody !== undefined) {
         body = args.textBody
-        if (headers['x-guardian-tenant-tag'] && jsonBody === undefined) {
+        if (headers['x-kovo-tenant-tag'] && jsonBody === undefined) {
           try {
             const parsed = JSON.parse(args.textBody) as unknown
             if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
@@ -4178,7 +4178,7 @@ export class Execution {
       }
       this.storage.updateRun(current.id, { phase: 'verification' })
       this.storage.event(current.id, 'verification.started', 'Investigation complete. Starting Zero-LLM Replay Verification.')
-      this.storage.message(current.id, current.coordinatorId, 'guardian',
+      this.storage.message(current.id, current.coordinatorId, 'kovo',
         `Investigation complete${openProofGaps.length ? ` (${openProofGaps.length} open proof ${openProofGaps.length === 1 ? 'gap' : 'gaps'} surfaced)` : ''}. Deterministic Zero-LLM verification is replaying every proposed finding and checking baselines.`)
     }, { behavior: 'immediate' })
     try {

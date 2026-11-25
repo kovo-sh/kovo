@@ -3,7 +3,7 @@
 // A hill-climb iteration pays ~240 s of recon + deterministic floor before the first agentic
 // assignment. This module captures a phase/assignment/planner-round boundary as:
 //
-//   <snapshot-dir>/guardian.sqlite   VACUUM INTO copy of the run DB (WAL-safe, consistent)
+//   <snapshot-dir>/kovo.sqlite   VACUUM INTO copy of the run DB (WAL-safe, consistent)
 //   <snapshot-dir>/snapshot.json     typed coordinator state + version stamps (redacted)
 //   <snapshot-dir>/target.json       rehydration spec (app/seed/mode/mutating log, redacted)
 //
@@ -280,7 +280,7 @@ export function captureRunSnapshot(input: CaptureRunSnapshotInput): CaptureRunSn
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   chmodSync(dir, 0o700)
 
-  const databasePath = join(dir, 'guardian.sqlite')
+  const databasePath = join(dir, 'kovo.sqlite')
   const tmpDb = `${databasePath}.tmp-${randomUUID()}`
   try {
     rmSync(tmpDb, { force: true })
@@ -395,12 +395,12 @@ export function readRunSnapshot(directory: string): LoadedRunSnapshot {
   const dir = resolve(directory)
   const snapshotPath = join(dir, 'snapshot.json')
   const targetPath = join(dir, 'target.json')
-  const databasePath = join(dir, 'guardian.sqlite')
+  const databasePath = join(dir, 'kovo.sqlite')
   if (!existsSync(snapshotPath) || !existsSync(targetPath)) {
     throw new SnapshotError('SNAPSHOT_NOT_FOUND', `no snapshot.json/target.json in ${dir}`)
   }
   if (!existsSync(databasePath)) {
-    throw new SnapshotError('SNAPSHOT_NOT_FOUND', `no guardian.sqlite in ${dir}`)
+    throw new SnapshotError('SNAPSHOT_NOT_FOUND', `no kovo.sqlite in ${dir}`)
   }
   let snapshotRaw: unknown
   let targetRaw: unknown
@@ -509,9 +509,9 @@ export function copySnapshotDatabase(input: {
   rmSync(target, { recursive: true, force: true })
   mkdirSync(target, { recursive: true, mode: 0o700 })
   mkdirSync(join(target, 'credentials'), { recursive: true, mode: 0o700 })
-  const source = join(resolve(input.snapshotDir), 'guardian.sqlite')
-  if (!existsSync(source)) throw new SnapshotError('SNAPSHOT_NOT_FOUND', `no guardian.sqlite in ${input.snapshotDir}`)
-  const databasePath = join(target, 'guardian.sqlite')
+  const source = join(resolve(input.snapshotDir), 'kovo.sqlite')
+  if (!existsSync(source)) throw new SnapshotError('SNAPSHOT_NOT_FOUND', `no kovo.sqlite in ${input.snapshotDir}`)
+  const databasePath = join(target, 'kovo.sqlite')
   copyFileSync(source, databasePath)
   chmodSync(databasePath, 0o600)
   return { directory: target, databasePath }
@@ -759,7 +759,7 @@ export function applyRunSnapshot(input: ApplyRunSnapshotInput): ApplyRunSnapshot
 export function snapshotFileModes(directory: string): Record<string, number> {
   const dir = resolve(directory)
   const out: Record<string, number> = { '.': statSync(dir).mode & 0o777 }
-  for (const name of ['guardian.sqlite', 'snapshot.json', 'target.json']) {
+  for (const name of ['kovo.sqlite', 'snapshot.json', 'target.json']) {
     const path = join(dir, name)
     if (existsSync(path)) out[name] = statSync(path).mode & 0o777
   }

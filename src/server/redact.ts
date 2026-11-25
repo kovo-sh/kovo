@@ -437,7 +437,7 @@ function passesLuhn(digits: string): boolean {
 
 /** True when Zero-Data-Retention (ZDR) mode is enabled via environment configuration. */
 export function isZdrModeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = (env.GUARDIAN_ZDR_MODE ?? '').trim().toLowerCase()
+  const raw = (env.KOVO_ZDR_MODE ?? '').trim().toLowerCase()
   return raw === '1' || raw === 'true' || raw === 'yes'
 }
 

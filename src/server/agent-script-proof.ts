@@ -1,7 +1,7 @@
 /**
  * Unified agent-script proof execution and retest (v7 M5 + v8 CompositeProofReceipt).
  *
- * One place that runs a Layer-3 `guardian_verify` script for both live execution and patch retest:
+ * One place that runs a Layer-3 `kovo_verify` script for both live execution and patch retest:
  * every attempt opens a real worker session with the attempt's RPC directory mounted, shares an
  * optional run-scoped `DerivedCapabilityVault`, and captures both single-hop `ProofReceipt`s and
  * multi-hop `CompositeProofReceipt`s without monkey-patching `VerifyRpcServer`.
@@ -209,7 +209,7 @@ class CapturingVerifyRpcServer extends VerifyRpcServer {
 
 export async function runAgentScriptProof(params: AgentScriptProofParams): Promise<AgentScriptProofResult> {
   if (params.runtime !== 'ts') {
-    throw new Error(`Unsupported guardian_verify runtime: ${String(params.runtime)}. guardian_verify supports TypeScript only (runtime='ts').`)
+    throw new Error(`Unsupported kovo_verify runtime: ${String(params.runtime)}. kovo_verify supports TypeScript only (runtime='ts').`)
   }
   const code = params.script.trim()
   if (!code) throw new Error('An agent proof script is required.')

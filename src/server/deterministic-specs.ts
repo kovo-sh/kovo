@@ -499,7 +499,7 @@ function baselineWriteFor(bodyTemplate: unknown): BaselineWrite | null {
     const base = 424_242 + (Number.parseInt(nonce.slice(0, 4), 16) % 1_000)
     return { field, baselineValue: base, probeValue: base + 1 }
   }
-  return { field, baselineValue: `guardian-baseline-${nonce}`, probeValue: `guardian-probe-${nonce}` }
+  return { field, baselineValue: `kovo-baseline-${nonce}`, probeValue: `kovo-probe-${nonce}` }
 }
 
 function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
@@ -637,7 +637,7 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
       ? `((( .steps.c2.status >= 400) and (.steps.c2.status < 500)) or ((${is2xx('c3')}) and (.steps.c3.body == .steps.c1.body)))`
       : null
     const steps: Array<Record<string, unknown>> = []
-    const negativeId = matrix === null ? `guardian-none-${randomBytes(5).toString('hex')}` : bogusIdFor(id)
+    const negativeId = matrix === null ? `kovo-none-${randomBytes(5).toString('hex')}` : bogusIdFor(id)
     const buildMutatingChain = (read: AuthzReadback) => {
       // The baseline write precedes the negative controls: `findPersistence` treats the first
       // successful control mutation as the comparison arm, and a 404 readback of a bogus object is
@@ -809,7 +809,7 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
       `observed: ("probe status=" + (.steps.p1.status | tostring)${neg ? ' + " bogus status=" + (.steps.c2.status | tostring)' : ''}), ` +
       'expected: "non-owner denied" }'
     if (!functionLevel) {
-      const negativeId = matrix === null ? `guardian-none-${randomBytes(5).toString('hex')}` : bogusIdFor(id)
+      const negativeId = matrix === null ? `kovo-none-${randomBytes(5).toString('hex')}` : bogusIdFor(id)
       steps.push(stepOf(
         hyp.endpoint.origin, 'c2', 'control',
         `Authorized actor addresses a nonexistent identifier (${negativeId})`,
@@ -899,7 +899,7 @@ function synthSqlBoolean(hyp: EngineHypothesis, result: DifferentialResult): Syn
     // both arms look identical; a fresh non-matching term is tried first, then short discriminators.
     // This is a control-vs-variant choice, not a weaker assertion.
     const broadStyle = style === 'or_branch' || style === 'like_breakout'
-    const broadBaselines = [`guardian-${randomBytes(4).toString('hex')}`, '1', 'zz', '', 'a', 'e']
+    const broadBaselines = [`kovo-${randomBytes(4).toString('hex')}`, '1', 'zz', '', 'a', 'e']
     for (const baseline of (broadStyle ? broadBaselines : ['a', 'e', '1'])) {
       const candidate = make(style)
       candidate.spec.baselineValue = baseline
@@ -1023,7 +1023,7 @@ export function buildSqlErrorChain(hyp: EngineHypothesis, result: DifferentialRe
 // XML external entity
 // ---------------------------------------------------------------------------------------------
 
-const xmlBenign = '<?xml version="1.0" encoding="UTF-8"?><guardian><ping>ok</ping></guardian>'
+const xmlBenign = '<?xml version="1.0" encoding="UTF-8"?><kovo><ping>ok</ping></kovo>'
 const xxeBodies: Record<string, string> = {
   general_entity: '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE root [<!ENTITY gxxe SYSTEM "{{canary_url}}">]><root>&gxxe;</root>',
   param_entity: '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE root [<!ENTITY % gxxep SYSTEM "{{canary_url}}"> %gxxep;]><root>ok</root>',
@@ -1097,7 +1097,7 @@ function synthXxe(hyp: EngineHypothesis, result: DifferentialResult): Synthesize
       kind: 'http_chain',
       steps: [
         stepOf(hyp.endpoint.origin, 'c1', 'control', 'Benign XML document', { method, pathAndQuery: hyp.pathAndQuery, headers, textBody: xmlBenign }, hyp.ownerPersona),
-        stepOf(hyp.endpoint.origin, 'p1', 'probe', `XML document with external entity to Guardian canary${canaryOobStepTag(result)}`, { method, pathAndQuery: hyp.pathAndQuery, headers, textBody: body }, hyp.ownerPersona),
+        stepOf(hyp.endpoint.origin, 'p1', 'probe', `XML document with external entity to Kovo Hunter canary${canaryOobStepTag(result)}`, { method, pathAndQuery: hyp.pathAndQuery, headers, textBody: body }, hyp.ownerPersona),
       ],
     },
   }]
@@ -1113,7 +1113,7 @@ function synthSsrf(hyp: EngineHypothesis, result: DifferentialResult): Synthesiz
   const evidence = canaryOobEvidence(result)
   const tag = canaryOobStepTag(result)
   if (hyp.triggerPath) {
-    const control = requestParts(hyp, 'http://guardian-control.invalid/')
+    const control = requestParts(hyp, 'http://kovo-control.invalid/')
     const probe = requestParts(hyp, '{{canary_url}}')
     if (!control || !probe) return []
     const trigger = hyp.triggerPath.replace('{{id}}', '{{resource_id}}')
@@ -1137,7 +1137,7 @@ function synthSsrf(hyp: EngineHypothesis, result: DifferentialResult): Synthesiz
       },
     }]
   }
-  const control = requestParts(hyp, 'http://guardian-control.invalid/')
+  const control = requestParts(hyp, 'http://kovo-control.invalid/')
   const probe = requestParts(hyp, '{{canary_url}}')
   if (!control || !probe) return []
   return [{
@@ -1150,7 +1150,7 @@ function synthSsrf(hyp: EngineHypothesis, result: DifferentialResult): Synthesiz
       kind: 'http_chain',
       steps: [
         stepOf(hyp.endpoint.origin, 'c1', 'control', 'Benign URL value (no callback expected)', control, hyp.ownerPersona),
-        stepOf(hyp.endpoint.origin, 'p1', 'probe', `Guardian canary URL value${tag}`, probe, hyp.ownerPersona),
+        stepOf(hyp.endpoint.origin, 'p1', 'probe', `Kovo Hunter canary URL value${tag}`, probe, hyp.ownerPersona),
       ],
     },
   }]
@@ -1165,7 +1165,7 @@ function synthTraversal(hyp: EngineHypothesis, result: DifferentialResult): Synt
   if (!hit || !hyp.param) return []
   const raw = String(hit.payload ?? '')
   if (!raw || raw.length > 200 || /[\r\n\0\\]/.test(raw)) return []
-  const controlValue = `../guardian-none-${randomBytes(4).toString('hex')}.txt`
+  const controlValue = `../kovo-none-${randomBytes(4).toString('hex')}.txt`
   const build = (value: string): RequestParts => {
     const parts = requestParts(hyp, value)
     if (parts) return parts
@@ -1209,7 +1209,7 @@ function synthRedirect(hyp: EngineHypothesis, result: DifferentialResult): Synth
   const payload = String(hit.payload ?? '')
   const host = canaryHostOf(payload)
   if (!host) return []
-  const control = requestParts(hyp, `/guardian-return-${randomBytes(4).toString('hex')}`)
+  const control = requestParts(hyp, `/kovo-return-${randomBytes(4).toString('hex')}`)
   const probe = requestParts(hyp, payload)
   if (!control || !probe) return []
   const jq = `{ controlPassed: (.steps.c1.status < 400), ` +
@@ -1293,12 +1293,12 @@ function massAssignmentValue(field: string, privileged: boolean, observed?: stri
     if (/role|admin|permission|privilege|scope/i.test(field)) return 'admin'
     if (/plan|tier/i.test(field)) return 'enterprise'
     if (/org|tenant|team|group|owner/i.test(field)) return '1'
-    return 'guardian-privileged'
+    return 'kovo-privileged'
   }
   if (/role|permission|privilege|scope/i.test(field)) return 'user'
   if (/plan|tier/i.test(field)) return 'free'
   if (/org|tenant|team|group|owner/i.test(field)) return '0'
-  return 'guardian-low'
+  return 'kovo-low'
 }
 
 function synthMassAssignment(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
@@ -1326,8 +1326,8 @@ function synthMassAssignment(hyp: EngineHypothesis, result: DifferentialResult):
     const expected = scopedField ? hyp.candidateValues?.[scopedField] : undefined
     if (scopedField && expected !== undefined) {
       const marker = randomBytes(5).toString('hex')
-      const controlName = `guardian-ma-control-${marker}`
-      const probeName = `guardian-ma-probe-${marker}`
+      const controlName = `kovo-ma-control-${marker}`
+      const probeName = `kovo-ma-probe-${marker}`
       const nameField = (hyp.candidateFields ?? []).find(field => /^(?:name|title|label|subject)$/i.test(field)) ?? 'name'
       const body = (name: string, value: unknown) => ({ ...(hyp.jsonBody ?? {}), [nameField]: name, [scopedField]: value })
       const jq = `{ controlPassed: ((${is2xx('c1')}) and (${is2xx('b1')}) and (((.steps.b1.body | contains(${jqStr(probeName)})) | not))), ` +
@@ -1653,7 +1653,7 @@ function synthReflectedXss(hyp: EngineHypothesis, result: DifferentialResult): S
   const context = String(hit.context ?? 'html_body')
   const chars = Array.isArray(hit.unencodedChars) ? hit.unencodedChars.map(String) : []
   if (context !== 'html_body' || !chars.includes('<') || !chars.includes('"')) return []
-  const controlPath = appendQuery(hyp.pathAndQuery, hyp.param.name, 'guardian')
+  const controlPath = appendQuery(hyp.pathAndQuery, hyp.param.name, 'kovo')
   const payload = `<img src=x onerror="document.title='{{canary_token}}'">`
   const encodedPayload = payload.split('{{canary_token}}').map(encodeURIComponent).join('{{canary_token}}')
   const probePath = appendQuery(hyp.pathAndQuery, hyp.param.name, encodedPayload, false)
@@ -1698,7 +1698,7 @@ function synthSsti(hyp: EngineHypothesis, result: DifferentialResult): Synthesiz
   if (!hit || !hyp.param) return []
   const template = sstiTemplates[String(hit.engine)]
   if (!template) return []
-  const control = requestParts(hyp, 'guardian')
+  const control = requestParts(hyp, 'kovo')
   const probe = requestParts(hyp, template)
   if (!control || !probe) return []
   const jq = '{ controlPassed: (.control.status < 500), confirmed: (.proof.mathVerified == true), ' +
@@ -2110,7 +2110,7 @@ function synthWebhook(hyp: EngineHypothesis, result: DifferentialResult): Synthe
     stepOf(hyp.endpoint.origin, 'c1', 'control', 'Tampered delivery signature', {
       method: 'POST',
       pathAndQuery: hyp.pathAndQuery,
-      headers: { 'Content-Type': 'application/json', [header]: 'guardian_invalid_signature' },
+      headers: { 'Content-Type': 'application/json', [header]: 'kovo_invalid_signature' },
       jsonBody: body,
     }, hyp.ownerPersona, {}, [200, 201, 202, 204, 400, 401, 403, 422]),
     stepOf(hyp.endpoint.origin, 'p1', 'probe', 'Unsigned delivery acceptance', {

@@ -28,18 +28,18 @@ import { isJobOrHandleStub } from './v8-oracle-families.ts'
 // Constants shared with the container mount (worker-backend) and both SDKs.
 // ---------------------------------------------------------------------------
 
-export const VERIFY_RPC_CONTAINER_DIR = '/guardian-rpc'
+export const VERIFY_RPC_CONTAINER_DIR = '/kovo-rpc'
 export const VERIFY_RPC_SOCKET_NAME = 'verify.sock'
 export const VERIFY_RPC_TOKEN_NAME = 'token'
 export const VERIFY_RPC_CONTEXT_NAME = 'context.json'
-export const VERIFY_RPC_SOCKET_ENV = 'GUARDIAN_RPC_SOCKET'
-export const VERIFY_RPC_TOKEN_ENV = 'GUARDIAN_RPC_TOKEN_FILE'
-export const VERIFY_RPC_CONTEXT_ENV = 'GUARDIAN_RPC_CONTEXT_FILE'
-export const VERIFY_NONCE_ENV = 'GUARDIAN_VERIFY_NONCE'
-export const VERIFY_RESULT_ENV = 'GUARDIAN_PROOF_RESULT_FILE'
-export const VERIFY_RPC_HEADER = 'x-guardian-rpc-token'
-export const VERIFY_NONCE_HEADER = 'x-guardian-verify-nonce'
-export const VERIFY_RESULT_MARKER = 'GUARDIAN_PROOF_RESULT:'
+export const VERIFY_RPC_SOCKET_ENV = 'KOVO_RPC_SOCKET'
+export const VERIFY_RPC_TOKEN_ENV = 'KOVO_RPC_TOKEN_FILE'
+export const VERIFY_RPC_CONTEXT_ENV = 'KOVO_RPC_CONTEXT_FILE'
+export const VERIFY_NONCE_ENV = 'KOVO_VERIFY_NONCE'
+export const VERIFY_RESULT_ENV = 'KOVO_PROOF_RESULT_FILE'
+export const VERIFY_RPC_HEADER = 'x-kovo-rpc-token'
+export const VERIFY_NONCE_HEADER = 'x-kovo-verify-nonce'
+export const VERIFY_RESULT_MARKER = 'KOVO_PROOF_RESULT:'
 
 
 const MAX_RECORDED_BODY_BYTES = 512 * 1024
@@ -564,7 +564,7 @@ export interface VerifyCanaryBroker {
 }
 
 // ---------------------------------------------------------------------------
-// Assertion primitives (shared semantics with `worker/guardian_verify`).
+// Assertion primitives (shared semantics with `worker/kovo_verify`).
 // ---------------------------------------------------------------------------
 
 const GX_ID_RE = /\bgx-[0-9a-f-]{8,}\b/gi

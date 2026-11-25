@@ -1,15 +1,15 @@
 /**
- * Guardian v5.1 — agentic trace capture (standalone, unwired).
+ * Kovo Hunter v5.1 — agentic trace capture (standalone, unwired).
  *
  * The trace is the fast-iteration substrate for agentic runs: every LLM turn, tool result,
  * planner decision, and lane lifecycle transition is appended to `events.jsonl` under
- * `.guardian/traces/<traceId>/`. Large repeated text (system prompt, tool schemas, prompt
+ * `.kovo/traces/<traceId>/`. Large repeated text (system prompt, tool schemas, prompt
  * prefixes) and bounded sanitized previews live in content-addressed `blobs/<sha256>`.
  *
  * Design constraints:
  * - No imports from the engine (`agent-session`, `execution`, `store`, probes, benchmarks) so
  *   both call sites can import this module without a cycle.
- * - Opt-in only (`GUARDIAN_TRACE=1` or `GUARDIAN_TRACE_DIR`), off by default.
+ * - Opt-in only (`KOVO_TRACE=1` or `KOVO_TRACE_DIR`), off by default.
  * - Best-effort: a trace failure must never break an agentic run. Failures are logged once per
  *   writer and the writer degrades to a no-op.
  * - Redaction happens before anything touches disk. The secret map is memory-only and is never
@@ -535,7 +535,7 @@ export function readBlob(dir: string, sha: string): string | null {
 }
 
 function resolveGitSha(): string {
-  const fromEnv = process.env.GUARDIAN_GIT_SHA?.trim()
+  const fromEnv = process.env.KOVO_GIT_SHA?.trim()
   if (fromEnv) return fromEnv
   try {
     return execFileSync('git', ['rev-parse', 'HEAD'], {
@@ -831,7 +831,7 @@ class TraceWriter implements AgentTrace {
     this.#warned = true
     const message = error instanceof Error ? error.message : String(error)
     try {
-      console.warn(`[guardian-trace] disabled after write failure at ${this.dir}: ${message}`)
+      console.warn(`[kovo-trace] disabled after write failure at ${this.dir}: ${message}`)
     } catch {
       // never throw from logging
     }
@@ -877,7 +877,7 @@ export function createAgentTrace(options: AgentTraceOptions): AgentTrace {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     try {
-      console.warn(`[guardian-trace] disabled, could not open ${options.dir}: ${message}`)
+      console.warn(`[kovo-trace] disabled, could not open ${options.dir}: ${message}`)
     } catch {
       // never throw from logging
     }
@@ -896,13 +896,13 @@ export interface TraceEnvConfig {
 
 /** Resolve trace opt-in from the environment. Off unless explicitly enabled. */
 export function resolveTraceConfig(env: NodeJS.ProcessEnv = process.env): TraceEnvConfig {
-  const explicitDir = env.GUARDIAN_TRACE_DIR?.trim()
+  const explicitDir = env.KOVO_TRACE_DIR?.trim()
   if (explicitDir) return { enabled: true, dir: explicitDir }
-  const flag = env.GUARDIAN_TRACE?.trim().toLowerCase()
+  const flag = env.KOVO_TRACE?.trim().toLowerCase()
   if (flag === '1' || flag === 'true' || flag === 'yes') {
-    const root = env.GUARDIAN_TRACE_ROOT?.trim() || join('.guardian', 'traces')
-    const id = env.GUARDIAN_TRACE_ID?.trim()
-      || `${env.GUARDIAN_TRACE_NAME?.trim() || 'run'}-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`
+    const root = env.KOVO_TRACE_ROOT?.trim() || join('.kovo', 'traces')
+    const id = env.KOVO_TRACE_ID?.trim()
+      || `${env.KOVO_TRACE_NAME?.trim() || 'run'}-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`
     return { enabled: true, dir: join(root, id) }
   }
   return { enabled: false, dir: null }

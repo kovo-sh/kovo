@@ -1,6 +1,6 @@
 # Access Control: BOLA, BFLA, IDOR & Multi-Tenant Isolation
 Tags: access-control, bola, bfla, idor, rbac, multi-tenant, persona
-Summary: Prove broken object-level authorization (BOLA/IDOR), broken function-level authorization (BFLA), and tenant isolation failures using Guardian’s opaque multi-persona Tier 2 differential controls.
+Summary: Prove broken object-level authorization (BOLA/IDOR), broken function-level authorization (BFLA), and tenant isolation failures using Kovo Hunter’s opaque multi-persona Tier 2 differential controls.
 
 ## 1. Preconditions
 - Requires **Tier 2** (or Tier 3 for state-changing mutations) with approved opaque personas (e.g., `tenant_a`, `tenant_b`, or `user_low` vs `admin`).

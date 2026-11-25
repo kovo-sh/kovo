@@ -67,7 +67,7 @@ export interface OobAcmeHttpChallenge {
 }
 
 /**
- * ACME hook points. Guardian deliberately does not embed a CA: operators plug in
+ * ACME hook points. Kovo Hunter deliberately does not embed a CA: operators plug in
  * certbot/acme.sh/Caddy/their existing ACME client and provide a loader (plus an optional
  * renewal hook). Without one, the public HTTPS profile refuses to start.
  */
@@ -286,8 +286,8 @@ export class OobProfileError extends Error {
 const defaultImmediateMs = 3_000
 const maxWindowMs = 30 * 60_000
 export const defaultOobWindowMs = 15 * 60_000
-const defaultDnsDomain = 'canary.guardian.invalid'
-const callbackTokenPattern = /^(guardian-canary-[a-f0-9]{24}|gn2o_[a-f0-9]{8,16})$/
+const defaultDnsDomain = 'canary.kovo.invalid'
+const callbackTokenPattern = /^(kovo-canary-[a-f0-9]{24}|gn2o_[a-f0-9]{8,16})$/
 const maxStoredCallbacks = 20_000
 
 interface SubscriptionRow {
@@ -414,7 +414,7 @@ export function resolveOobRelayProfile(
   config: OobPublicRelayConfig = {},
   env: Record<string, string | undefined> = process.env,
 ): OobRelayProfile {
-  const envEnabled = env.GUARDIAN_OOB_PUBLIC === '1' || env.GUARDIAN_OOB_PUBLIC?.toLowerCase() === 'true'
+  const envEnabled = env.KOVO_OOB_PUBLIC === '1' || env.KOVO_OOB_PUBLIC?.toLowerCase() === 'true'
   const hasExplicitConfig = Boolean(
     config.enabled ||
     config.publicBaseUrl ||
@@ -423,19 +423,19 @@ export function resolveOobRelayProfile(
     config.dns ||
     config.smtp ||
     envEnabled ||
-    env.GUARDIAN_OOB_PUBLIC_URL ||
-    env.GUARDIAN_OOB_TLS_CERT ||
-    env.GUARDIAN_OOB_TLS_KEY ||
-    env.GUARDIAN_OOB_DNS_TCP_PORT,
+    env.KOVO_OOB_PUBLIC_URL ||
+    env.KOVO_OOB_TLS_CERT ||
+    env.KOVO_OOB_TLS_KEY ||
+    env.KOVO_OOB_DNS_TCP_PORT,
   )
 
   const publicBaseUrl = normalizePublicBaseUrl(
-    config.publicBaseUrl ?? env.GUARDIAN_OOB_PUBLIC_URL ?? env.GUARDIAN_CANARY_PUBLIC_URL,
+    config.publicBaseUrl ?? env.KOVO_OOB_PUBLIC_URL ?? env.KOVO_CANARY_PUBLIC_URL,
   )
-  const domain = normalizeDomain(config.dns?.domain ?? env.GUARDIAN_OOB_DNS_DOMAIN ?? env.GUARDIAN_CANARY_DNS_DOMAIN)
+  const domain = normalizeDomain(config.dns?.domain ?? env.KOVO_OOB_DNS_DOMAIN ?? env.KOVO_CANARY_DNS_DOMAIN)
   const acme = config.https?.acme ?? null
-  const certPath = config.https?.certPath ?? env.GUARDIAN_OOB_TLS_CERT ?? null
-  const keyPath = config.https?.keyPath ?? env.GUARDIAN_OOB_TLS_KEY ?? null
+  const certPath = config.https?.certPath ?? env.KOVO_OOB_TLS_CERT ?? null
+  const keyPath = config.https?.keyPath ?? env.KOVO_OOB_TLS_KEY ?? null
   const dnsProvider = config.dns?.provider ?? null
   const smtpProvider = config.smtp?.provider ?? null
   const allowlist = [...(config.allowlist ?? [])].map(entry => entry.trim()).filter(Boolean)
@@ -451,9 +451,9 @@ export function resolveOobRelayProfile(
         acme: null, certPath: null, keyPath: null,
       },
       dns: {
-        domain: domain ?? normalizeDomain(env.GUARDIAN_CANARY_DNS_DOMAIN) ?? defaultDnsDomain,
+        domain: domain ?? normalizeDomain(env.KOVO_CANARY_DNS_DOMAIN) ?? defaultDnsDomain,
         host: '127.0.0.1',
-        udpPort: parsePort(env.GUARDIAN_CANARY_DNS_PORT, 0),
+        udpPort: parsePort(env.KOVO_CANARY_DNS_PORT, 0),
         tcpPort: 0,
         authoritative: false,
         provider: dnsProvider,
@@ -468,12 +468,12 @@ export function resolveOobRelayProfile(
   const certificate: OobRelayProfile['https']['certificate'] =
     acme ? 'acme-hook' : (certPath && keyPath ? 'files' : 'missing')
 
-  if (!publicBaseUrl) problems.push('public base URL is not configured (GUARDIAN_OOB_PUBLIC_URL)')
+  if (!publicBaseUrl) problems.push('public base URL is not configured (KOVO_OOB_PUBLIC_URL)')
   else if (!publicBaseUrl.startsWith('https://')) problems.push('public base URL must be https for external OOB callbacks')
   if (certificate === 'missing') problems.push('HTTPS certificate source is missing: provide ACME hooks or cert/key files')
-  if (!domain) problems.push('authoritative DNS domain is not configured (GUARDIAN_OOB_DNS_DOMAIN)')
+  if (!domain) problems.push('authoritative DNS domain is not configured (KOVO_OOB_DNS_DOMAIN)')
   if (!dnsProvider) problems.push('authoritative DNS provider hook is not configured')
-  if (config.dns && config.dns.tcpPort === undefined && env.GUARDIAN_OOB_DNS_TCP_PORT === undefined) {
+  if (config.dns && config.dns.tcpPort === undefined && env.KOVO_OOB_DNS_TCP_PORT === undefined) {
     // TCP DNS is advertised by an authoritative profile; default to 53 when unset is acceptable.
   }
 
@@ -482,13 +482,13 @@ export function resolveOobRelayProfile(
     publicEnabled: problems.length === 0,
     publicBaseUrl,
     http: {
-      host: config.http?.host ?? env.GUARDIAN_OOB_HTTP_HOST ?? '0.0.0.0',
-      port: config.http?.port ?? parsePort(env.GUARDIAN_OOB_HTTP_PORT, 80),
+      host: config.http?.host ?? env.KOVO_OOB_HTTP_HOST ?? '0.0.0.0',
+      port: config.http?.port ?? parsePort(env.KOVO_OOB_HTTP_PORT, 80),
       enabled: true,
     },
     https: {
-      host: config.https?.host ?? env.GUARDIAN_OOB_HTTPS_HOST ?? '0.0.0.0',
-      port: config.https?.port ?? parsePort(env.GUARDIAN_OOB_HTTPS_PORT, 443),
+      host: config.https?.host ?? env.KOVO_OOB_HTTPS_HOST ?? '0.0.0.0',
+      port: config.https?.port ?? parsePort(env.KOVO_OOB_HTTPS_PORT, 443),
       enabled: true,
       certificate,
       acme,
@@ -497,15 +497,15 @@ export function resolveOobRelayProfile(
     },
     dns: {
       domain: domain ?? defaultDnsDomain,
-      host: config.dns?.host ?? env.GUARDIAN_OOB_DNS_HOST ?? '0.0.0.0',
-      udpPort: config.dns?.udpPort ?? parsePort(env.GUARDIAN_OOB_DNS_UDP_PORT, 53),
-      tcpPort: config.dns?.tcpPort ?? parsePort(env.GUARDIAN_OOB_DNS_TCP_PORT, 53),
+      host: config.dns?.host ?? env.KOVO_OOB_DNS_HOST ?? '0.0.0.0',
+      udpPort: config.dns?.udpPort ?? parsePort(env.KOVO_OOB_DNS_UDP_PORT, 53),
+      tcpPort: config.dns?.tcpPort ?? parsePort(env.KOVO_OOB_DNS_TCP_PORT, 53),
       authoritative: Boolean(domain && dnsProvider),
       provider: dnsProvider,
     },
     smtp: {
-      host: config.smtp?.host ?? env.GUARDIAN_OOB_SMTP_HOST ?? '0.0.0.0',
-      port: config.smtp?.port ?? parsePort(env.GUARDIAN_OOB_SMTP_PORT, 25),
+      host: config.smtp?.host ?? env.KOVO_OOB_SMTP_HOST ?? '0.0.0.0',
+      port: config.smtp?.port ?? parsePort(env.KOVO_OOB_SMTP_PORT, 25),
       enabled: Boolean(smtpProvider),
       provider: smtpProvider,
     },

@@ -10,7 +10,7 @@ import type { DeclarativeReplaySpec, ReplayStep } from '../replay-spec.ts'
  *  - `src/server/agent-session.ts`: `describeProofTools`, `validateProofInput`,
  *    `proveAuthzReadDiff`, `proveStateMutationDiff`, `proveBusinessInvariant`,
  *    `proveCanaryOrRedirect`, `CompiledProof`, `ProofToolName` (deterministic compiler fallback
- *    when `guardian_verify` is not registered).
+ *    when `kovo_verify` is not registered).
  *  - `tests/v5-proof-tools.test.ts`, `tests/v5-agentic-tools.test.ts`,
  *    `tests/v5-agentic-lane.test.ts`: additionally import `proofToolNames` and `ProofCompileError`.
  *

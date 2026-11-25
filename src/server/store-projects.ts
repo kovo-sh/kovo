@@ -334,7 +334,7 @@ export class ProjectsRepository {
       const validatedSeeds = [...new Set(input.seeds.map(seed => originValidator.parse(seed)))]
       const labConfig = environment === 'local-lab' && input.labConfig
         ? ((input.labConfig.enabled || input.labConfig.iastEnabled) && !isLocalLabEnvEnabled()
-            ? (() => { throw new Error('Enabling local-lab execution requires GUARDIAN_ALLOW_LOCAL_LAB=1.') })()
+            ? (() => { throw new Error('Enabling local-lab execution requires KOVO_ALLOW_LOCAL_LAB=1.') })()
             : input.labConfig)
         : (input.labConfig?.enabled || input.labConfig?.iastEnabled
             ? (() => { throw new Error('Local-lab execution and IAST telemetry are forbidden on public projects.') })()
@@ -367,7 +367,7 @@ export class ProjectsRepository {
           throw new Error('Local-lab app execution and IAST telemetry are forbidden on public projects.')
         }
         if (!isLocalLabEnvEnabled()) {
-          throw new Error('Local-lab app execution and IAST telemetry require GUARDIAN_ALLOW_LOCAL_LAB=1 on the server.')
+          throw new Error('Local-lab app execution and IAST telemetry require KOVO_ALLOW_LOCAL_LAB=1 on the server.')
         }
       }
       const nextConfig = project.environment === 'local-lab' ? input.labConfig : null

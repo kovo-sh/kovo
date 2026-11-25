@@ -1,17 +1,17 @@
 # OOB Canary SSRF & Broker-Proxied Browser Chain Verification
 Tags: ssrf, oob, canary, browser-chain, playwright, postmessage, cors, dom, redirects
-Summary: Verify blind server-side outbound fetches using Guardian’s live OOB Canary Broker and validate multi-step client-side or cross-origin browser chains using Zero-LLM broker-proxied Playwright browser_chain Replay Specs.
+Summary: Verify blind server-side outbound fetches using Kovo Hunter’s live OOB Canary Broker and validate multi-step client-side or cross-origin browser chains using Zero-LLM broker-proxied Playwright browser_chain Replay Specs.
 
 ## 1. Strict Defensive Boundaries
-- **Zero internal network probing:** Never pass loopback (`127.0.0.1`, `::1`, `localhost`), RFC1918 private IPs, or cloud metadata addresses (`169.254.169.254`, `metadata.google.internal`) in URL parameters or Replay Specs. Guardian's broker and schema strictly block them.
-- **Zero weaponized payloads:** Never craft exploit shells, credential stealers, persistent defacement, or destructive actions. Prove reachability and policy gaps exclusively with benign signed Guardian canary tokens and non-destructive read-only checks.
-- **100% broker-proxied browser:** `browser_visit` and `browser_chain` route every request through Guardian's RequestBroker and abort any unapproved third-party origin automatically.
+- **Zero internal network probing:** Never pass loopback (`127.0.0.1`, `::1`, `localhost`), RFC1918 private IPs, or cloud metadata addresses (`169.254.169.254`, `metadata.google.internal`) in URL parameters or Replay Specs. Kovo Hunter's broker and schema strictly block them.
+- **Zero weaponized payloads:** Never craft exploit shells, credential stealers, persistent defacement, or destructive actions. Prove reachability and policy gaps exclusively with benign signed Kovo Hunter canary tokens and non-destructive read-only checks.
+- **100% broker-proxied browser:** `browser_visit` and `browser_chain` route every request through Kovo Hunter's RequestBroker and abort any unapproved third-party origin automatically.
 
 ## 2. Out-of-Band (OOB) Benign Canary Workflow (`mint_canary` / `check_canary`)
 Use OOB canaries to prove blind server-side URL fetching (SSRF sinks, webhook test buttons, OpenGraph/link-preview fetchers, avatar/image importers, PDF/screenshot renderers, Server Actions calling `fetch(userUrl)`):
 1. **Mint Benign Canaries:** Call `mint_canary({ purpose: "<short description>" })` to receive `{ token, httpUrl, dnsHost, listenerActive, synthetic }`.
    - Mint a separate token for the negative control and the probe whenever comparing behaviors.
-   - Check `listenerActive`: when Guardian's OOB callback listener (or `GUARDIAN_CANARY_PUBLIC_URL`) is active, `httpUrl` is a real reachable benign callback endpoint.
+   - Check `listenerActive`: when Kovo Hunter's OOB callback listener (or `KOVO_CANARY_PUBLIC_URL`) is active, `httpUrl` is a real reachable benign callback endpoint.
 2. **Trigger & Observe:**
    - Submit `httpUrl` to the approved URL-fetching endpoint (respecting Tier 2/3 method rules and non-destructive payloads).
    - Call `check_canary({ token })` to inspect `{ found, hit, triggered, hits }`. Each hit records `{ method, path, query, remoteIp, userAgent, headers, receivedAt }` with sensitive headers redacted.

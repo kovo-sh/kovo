@@ -226,7 +226,7 @@ export interface PruneResult {
 
 export interface StoreFootprint {
   directory: string
-  /** `guardian.sqlite` main file size. */
+  /** `kovo.sqlite` main file size. */
   mainDbBytes: number
   walBytes: number
   shmBytes: number
@@ -550,7 +550,7 @@ export function computeTenantAuditHash(fields: {
   return createHash('sha256')
     .update(
       [
-        'guardian.tenant-audit.v1',
+        'kovo.tenant-audit.v1',
         fields.prevHash,
         fields.id,
         fields.tenantId,
@@ -585,7 +585,7 @@ export function evidenceTitle(run: Run, kind: EvidenceSummary['kind'], title: st
     ? suppliedResponseLabel : title
 }
 
-export const dataDirectory = () => resolve(process.env.GUARDIAN_DATA_DIR ?? '.guardian')
+export const dataDirectory = () => resolve(process.env.KOVO_DATA_DIR ?? '.kovo')
 
 /** Explicit limits are honored (never silently capped); non-finite input falls back. */
 export function resolvePageLimit(value: number | undefined, fallback: number): number {

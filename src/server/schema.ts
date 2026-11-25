@@ -362,7 +362,7 @@ export const replaySpecs = sqliteTable('replay_specs', {
   verifiedInline: integer('verified_inline', { mode: 'boolean' }).default(false).notNull(),
   lastVerificationDiff: text('last_verification_diff', { mode: 'json' }).$type<InlineVerifyFeedback | null>(),
   /**
-   * v7 M5 agent-script proof columns. A `guardian_verify` script proof persists the oracle verdict,
+   * v7 M5 agent-script proof columns. A `kovo_verify` script proof persists the oracle verdict,
    * the receipt it was re-checked with and the owner-only artifact holding the script source +
    * receipt. The declarative fields above stay for attribution; confirmation and retest are
    * receipt-first (`verifyReceipt()` over the cited exchanges), never a DSL re-interpretation.
@@ -534,7 +534,7 @@ export const messages = sqliteTable('messages', {
   id: text('id').primaryKey().notNull(),
   runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
   threadId: text('thread_id').notNull(),
-  role: text('role').$type<'operator' | 'coordinator' | 'worker' | 'guardian'>().notNull(),
+  role: text('role').$type<'operator' | 'coordinator' | 'worker' | 'kovo'>().notNull(),
   content: text('content').notNull(),
   replyTo: text('reply_to'),
   evidenceIds: text('evidence_ids', { mode: 'json' }).$type<string[]>(),

@@ -225,12 +225,12 @@ interface MintedSecondOrderMeta {
   storage?: Store | SecondOrderStore
 }
 
-const tokenPattern = /guardian-canary-[a-f0-9]{24}/i
+const tokenPattern = /kovo-canary-[a-f0-9]{24}/i
 const secondOrderPattern = /gn2o_[a-f0-9]{8,16}/i
 const secondOrderGlobalPattern = /gn2o_[a-f0-9]{8,16}/gi
 const maxHitsPerToken = 50
 const maxTrackedTokens = 5_000
-const defaultDnsDomain = 'canary.guardian.invalid'
+const defaultDnsDomain = 'canary.kovo.invalid'
 
 const dnsTypeNames: Record<number, string> = {
   1: 'A',
@@ -265,7 +265,7 @@ function normalizePublicBaseUrl(raw: string | undefined): string | null {
 function inferDnsDomain(explicit: string | undefined, publicBaseUrl: string | null): string {
   const fromExplicit = explicit?.trim().toLowerCase().replace(/^\.+|\.+$/g, '')
   if (fromExplicit) return fromExplicit
-  const fromEnv = process.env.GUARDIAN_CANARY_DNS_DOMAIN?.trim().toLowerCase().replace(/^\.+|\.+$/g, '')
+  const fromEnv = process.env.KOVO_CANARY_DNS_DOMAIN?.trim().toLowerCase().replace(/^\.+|\.+$/g, '')
   if (fromEnv) return fromEnv
   if (publicBaseUrl) {
     try {
@@ -276,7 +276,7 @@ function inferDnsDomain(explicit: string | undefined, publicBaseUrl: string | nu
   return defaultDnsDomain
 }
 
-function parsePort(explicit: number | undefined, envKey = 'GUARDIAN_CANARY_PORT'): number {
+function parsePort(explicit: number | undefined, envKey = 'KOVO_CANARY_PORT'): number {
   if (typeof explicit === 'number' && Number.isInteger(explicit) && explicit >= 0 && explicit <= 65_535) {
     return explicit
   }
@@ -368,8 +368,8 @@ function buildDnsResponse(
     answerType = 1
     rdata = parseIpv4Bytes(sinkIp)
   } else if (parsed.qtype === 16) {
-    // TXT record -> "guardian-canary-ok"
-    const txt = Buffer.from('guardian-canary-ok', 'utf8')
+    // TXT record -> "kovo-canary-ok"
+    const txt = Buffer.from('kovo-canary-ok', 'utf8')
     rdata = Buffer.concat([Buffer.from([txt.length]), txt])
   } else if (parsed.qtype === 28) {
     // AAAA record -> ::1
@@ -484,7 +484,7 @@ function extractTokenFromRequest(url: URL, hostHeader: string | undefined): stri
   return null
 }
 
-/** Causal artifact carried by a callback (`g_art` query param or `x-guardian-artifact`). */
+/** Causal artifact carried by a callback (`g_art` query param or `x-kovo-artifact`). */
 function extractArtifact(url: URL, headerValue: string | string[] | undefined): string | undefined {
   const fromQuery = url.searchParams.get('g_art') ?? url.searchParams.get('artifact')
   if (fromQuery && fromQuery.trim()) return fromQuery.trim().slice(0, 256)
@@ -768,7 +768,7 @@ export class CanaryBroker {
     this.defaultStorage = options.storage
     this.publicProfileConfig = options.publicProfile
     this.publicBaseUrl = normalizePublicBaseUrl(
-      process.env.GUARDIAN_CANARY_PUBLIC_URL ?? process.env.GUARDIAN_CANARY_BASE_URL,
+      process.env.KOVO_CANARY_PUBLIC_URL ?? process.env.KOVO_CANARY_BASE_URL,
     )
     this.dnsDomain = inferDnsDomain(options.dnsDomain, this.publicBaseUrl)
     const directory = options.oobDirectory ?? (isFullStore(options.storage) ? options.storage.directory : undefined)
@@ -949,8 +949,8 @@ export class CanaryBroker {
   /** Authoritative DNS over TCP (length-prefixed), for a started public profile. */
   async startDnsTcpListener(options: CanaryDnsListenerOptions = {}): Promise<CanaryListenerInfo> {
     if (this.dnsTcpServer) return this.listenerInfo()
-    const host = (options.dnsHost ?? process.env.GUARDIAN_CANARY_DNS_HOST ?? '127.0.0.1').trim() || '127.0.0.1'
-    const envTcpPort = Number(process.env.GUARDIAN_OOB_DNS_TCP_PORT ?? '')
+    const host = (options.dnsHost ?? process.env.KOVO_CANARY_DNS_HOST ?? '127.0.0.1').trim() || '127.0.0.1'
+    const envTcpPort = Number(process.env.KOVO_OOB_DNS_TCP_PORT ?? '')
     const port = options.dnsPort
       ?? (Number.isInteger(envTcpPort) && envTcpPort >= 0 && envTcpPort <= 65_535 ? envTcpPort : 0)
     if (options.dnsProvider) this.dnsProvider = options.dnsProvider
@@ -1001,9 +1001,9 @@ export class CanaryBroker {
       return this.listenerInfo()
     }
 
-    const host = (options.dnsHost ?? process.env.GUARDIAN_CANARY_DNS_HOST ?? '127.0.0.1').trim() || '127.0.0.1'
-    const port = parsePort(options.dnsPort, 'GUARDIAN_CANARY_DNS_PORT')
-    const sinkIp = (options.dnsSinkIp ?? process.env.GUARDIAN_CANARY_DNS_SINK_IP ?? '127.0.0.1').trim() || '127.0.0.1'
+    const host = (options.dnsHost ?? process.env.KOVO_CANARY_DNS_HOST ?? '127.0.0.1').trim() || '127.0.0.1'
+    const port = parsePort(options.dnsPort, 'KOVO_CANARY_DNS_PORT')
+    const sinkIp = (options.dnsSinkIp ?? process.env.KOVO_CANARY_DNS_SINK_IP ?? '127.0.0.1').trim() || '127.0.0.1'
     if (options.dnsProvider) this.dnsProvider = options.dnsProvider
     this.dnsSinkIp = sinkIp
 
@@ -1071,7 +1071,7 @@ export class CanaryBroker {
         try {
           const url = new URL(req.url ?? '/', `http://${formatHostForUrl(host)}`)
           const token = extractTokenFromRequest(url, req.headers.host)
-          const artifact = extractArtifact(url, req.headers['x-guardian-artifact'])
+          const artifact = extractArtifact(url, req.headers['x-kovo-artifact'])
           if (token) {
             const now = Date.now()
             const rawBody = Buffer.concat(chunks).toString('utf8')
@@ -1101,7 +1101,7 @@ export class CanaryBroker {
           'content-type': 'text/plain; charset=utf-8',
           'cache-control': 'no-store',
           connection: 'close',
-        }).end('guardian-canary-ok')
+        }).end('kovo-canary-ok')
       }
       req.on('end', finish)
       req.on('close', () => {
@@ -1112,7 +1112,7 @@ export class CanaryBroker {
 
   async startListener(options: CanaryListenerOptions = {}): Promise<CanaryListenerInfo> {
     const resolvedPublic = normalizePublicBaseUrl(
-      options.publicBaseUrl ?? process.env.GUARDIAN_CANARY_PUBLIC_URL ?? process.env.GUARDIAN_CANARY_BASE_URL,
+      options.publicBaseUrl ?? process.env.KOVO_CANARY_PUBLIC_URL ?? process.env.KOVO_CANARY_BASE_URL,
     )
     if (resolvedPublic) this.publicBaseUrl = resolvedPublic
     this.dnsDomain = inferDnsDomain(options.dnsDomain, this.publicBaseUrl)
@@ -1121,13 +1121,13 @@ export class CanaryBroker {
       options.enableDns ||
       options.dnsHost !== undefined ||
       options.dnsPort !== undefined ||
-      process.env.GUARDIAN_CANARY_DNS_HOST ||
-      process.env.GUARDIAN_CANARY_DNS_PORT,
+      process.env.KOVO_CANARY_DNS_HOST ||
+      process.env.KOVO_CANARY_DNS_PORT,
     )
 
     if (!this.server) {
-      const host = (options.host ?? process.env.GUARDIAN_CANARY_HOST ?? '127.0.0.1').trim() || '127.0.0.1'
-      const port = parsePort(options.port, 'GUARDIAN_CANARY_PORT')
+      const host = (options.host ?? process.env.KOVO_CANARY_HOST ?? '127.0.0.1').trim() || '127.0.0.1'
+      const port = parsePort(options.port, 'KOVO_CANARY_PORT')
 
       const server = createServer(options.httpHandler ?? this.callbackHandler(host))
 
@@ -1424,7 +1424,7 @@ export class CanaryBroker {
       .update(randomBytes(8))
       .digest('hex')
       .slice(0, 24)
-    const token = `guardian-canary-${digest}`
+    const token = `kovo-canary-${digest}`
     const createdAt = Date.now()
     const storage = options?.storage ?? this.defaultStorage
 

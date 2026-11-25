@@ -85,13 +85,13 @@ export async function diffCachePoisonDeception(ctx: DiffContext): Promise<DiffOu
   })
   if (!ctrlEx) return { verdict: 'inconclusive', summary: 'Cache control baseline failed.', details: {} }
 
-  const marker = `poison-${randToken(6)}.guardian.invalid`
+  const marker = `poison-${randToken(6)}.kovo.invalid`
   const headerVariants: Array<{ name: string; headers: Record<string, string>; checkMarker: string }> = [
     { name: 'X-Forwarded-Host', headers: { 'X-Forwarded-Host': marker }, checkMarker: marker },
     { name: 'X-Host', headers: { 'X-Host': marker }, checkMarker: marker },
     { name: 'X-Forwarded-Scheme', headers: { 'X-Forwarded-Scheme': 'http' }, checkMarker: '' },
-    { name: 'X-Original-URL', headers: { 'X-Original-URL': `/guardian-cache-${randToken(4)}` }, checkMarker: 'guardian-cache-' },
-    { name: 'X-Rewrite-URL', headers: { 'X-Rewrite-URL': `/guardian-cache-${randToken(4)}` }, checkMarker: 'guardian-cache-' },
+    { name: 'X-Original-URL', headers: { 'X-Original-URL': `/kovo-cache-${randToken(4)}` }, checkMarker: 'kovo-cache-' },
+    { name: 'X-Rewrite-URL', headers: { 'X-Rewrite-URL': `/kovo-cache-${randToken(4)}` }, checkMarker: 'kovo-cache-' },
   ]
 
   const variantsOut: Array<Record<string, unknown>> = []

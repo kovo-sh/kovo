@@ -90,12 +90,12 @@ export const authMutationSchema = z.discriminatedUnion('kind', [
           if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false
           const host = parsed.hostname.toLowerCase()
           if (host === '169.254.169.254' || host === 'metadata.google.internal' || host.startsWith('169.254.')) return false
-          return /^\/c\/guardian-canary-[a-f0-9]{24}$/i.test(parsed.pathname) && !parsed.search && !parsed.hash
+          return /^\/c\/kovo-canary-[a-f0-9]{24}$/i.test(parsed.pathname) && !parsed.search && !parsed.hash
         } catch {
           return false
         }
       },
-      'jku_x5u_canary url must be a safe http/https Guardian CanaryBroker URL.',
+      'jku_x5u_canary url must be a safe http/https Kovo Hunter CanaryBroker URL.',
     ).optional(),
     value: z.string().max(512).refine(
       v => {
@@ -106,12 +106,12 @@ export const authMutationSchema = z.discriminatedUnion('kind', [
           if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false
           const host = parsed.hostname.toLowerCase()
           if (host === '169.254.169.254' || host === 'metadata.google.internal' || host.startsWith('169.254.')) return false
-          return /^\/c\/guardian-canary-[a-f0-9]{24}$/i.test(parsed.pathname) && !parsed.search && !parsed.hash
+          return /^\/c\/kovo-canary-[a-f0-9]{24}$/i.test(parsed.pathname) && !parsed.search && !parsed.hash
         } catch {
           return false
         }
       },
-      'jku_x5u_canary value must be a safe http/https Guardian CanaryBroker URL.',
+      'jku_x5u_canary value must be a safe http/https Kovo Hunter CanaryBroker URL.',
     ).optional(),
   }),
   z.object({
@@ -133,7 +133,7 @@ export const cacheBusterValueRegex = /^[a-f0-9-]{16,36}$/i
 
 export function extractCacheBusterParam(pathAndQuery: string): string | null {
   try {
-    return new URL(pathAndQuery, 'http://guardian.invalid').searchParams.get('_gcb')
+    return new URL(pathAndQuery, 'http://kovo.invalid').searchParams.get('_gcb')
   } catch {
     return null
   }
@@ -223,7 +223,7 @@ export type FloorRecipeEnvelope = z.output<typeof floorRecipeEnvelopeSchema>
 /**
  * Persisted agent-script proof envelope (v7 M5 script-proof migration).
  *
- * An agent proof is a Layer-3 `guardian_verify` script whose claims the independent transcript
+ * An agent proof is a Layer-3 `kovo_verify` script whose claims the independent transcript
  * oracle confirmed twice (fresh nonce, fresh session). The declarative fields on the row are only
  * attribution for reporting; they are never the confirmation or retest contract. This envelope
  * carries the bounded, redacted-at-rest script and the host-recorded confirmation so a retest can

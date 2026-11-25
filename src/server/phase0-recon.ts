@@ -1588,7 +1588,7 @@ export function harvestJsRequestParams(code: string): JsRequestSpec[] {
     const qIdx = path.indexOf('?')
     if (qIdx >= 0) {
       try {
-        for (const name of new URL(path, 'http://guardian.invalid').searchParams.keys()) {
+        for (const name of new URL(path, 'http://kovo.invalid').searchParams.keys()) {
           if (!/^[A-Za-z_][A-Za-z0-9_.[-]{0,63}$/.test(name)) continue
           const key = `${name}|query`
           if (keys.has(key)) continue
@@ -1672,7 +1672,7 @@ export function harvestJsRequestParams(code: string): JsRequestSpec[] {
       const concatTag = /<([A-Za-z_][\w.-]{0,31})>\s*['"`]\s*\+/.exec(initText)?.[1]
       const literalTags = [...initText.matchAll(/<([A-Za-z_][\w.-]{0,31})[^>]*>/g)]
         .map(m => m[1])
-        .filter(t => !/^(?:request|root|guardian|envelope|body)$/i.test(t))
+        .filter(t => !/^(?:request|root|kovo|envelope|body)$/i.test(t))
       const name = concatTag ?? literalTags[literalTags.length - 1]
       pushSpec(method, path, name ? [{ name, location: 'xml' }] : [])
       return
@@ -1993,7 +1993,7 @@ export function inferXhrRequestShape(input: {
   if (!trimmedUrl) return null
   let parsed: URL
   try {
-    parsed = new URL(trimmedUrl, 'http://guardian.invalid')
+    parsed = new URL(trimmedUrl, 'http://kovo.invalid')
   } catch {
     return null
   }
@@ -2031,7 +2031,7 @@ export function inferXhrRequestShape(input: {
     } else if (body.startsWith('<')) {
       const tags = [...body.matchAll(/<([A-Za-z_][\w.:-]{0,63})[^>]*>/g)]
         .map(match => match[1])
-        .filter(tag => !/^(?:\?xml|request|root|envelope|body|guardian)$/i.test(tag))
+        .filter(tag => !/^(?:\?xml|request|root|envelope|body|kovo)$/i.test(tag))
       const last = tags[tags.length - 1]
       if (last) push(last, 'xml')
     } else if (/^[\w.-]+=[\s\S]*$/.test(body)) {
@@ -3609,7 +3609,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   // Sibling derivation and its OPTIONS probes are opt-in and stay a blind-target fallback: when
   // the mounted AST or the declared API reference already describes the surface, speculative
   // collection->item derivation is disabled (the declared truth is strictly better evidence).
-  const siblingDerivationRequested = /^(?:1|true|on|yes)$/i.test((process.env.GUARDIAN_RECON_SIBLINGS ?? '').trim())
+  const siblingDerivationRequested = /^(?:1|true|on|yes)$/i.test((process.env.KOVO_RECON_SIBLINGS ?? '').trim())
   const declaredOrAstSurfacePresent = (repoStaticExtraction?.mergedRoutes ?? 0) > 0 || (declaredSurface?.declaredOpsMatched ?? 0) > 0
   const siblingDerivationEnabled = siblingDerivationRequested && !declaredOrAstSurfacePresent
   const siblingDerivationSuppressed = siblingDerivationRequested && declaredOrAstSurfacePresent ? 'declared_surface' as const : undefined
@@ -4463,9 +4463,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       if (apiPrefix) {
         const token = randomUUID().replace(/-/g, '').slice(0, 12)
         const prefixProbes = [
-          `${apiPrefix}/.guardian-cal-${token}`,
-          `${apiPrefix}/.guardian-cal-${token}/missing`,
-          `${apiPrefix}/.guardian-cal-${token}/detail/view`,
+          `${apiPrefix}/.kovo-cal-${token}`,
+          `${apiPrefix}/.kovo-cal-${token}/missing`,
+          `${apiPrefix}/.kovo-cal-${token}/detail/view`,
         ]
         for (const probePath of prefixProbes) {
           if (originHalted || signal.aborted || originUsed >= perOriginCap) break
@@ -4804,7 +4804,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         const xmlEx = await safeGet(xmlPath, {
           method: 'POST',
           headers: { 'Content-Type': 'application/xml' },
-          body: '<?xml version="1.0" encoding="UTF-8"?><guardian><probe>guardian-shape</probe></guardian>',
+          body: '<?xml version="1.0" encoding="UTF-8"?><kovo><probe>kovo-shape</probe></kovo>',
         })
         if (!xmlEx || xmlEx.status === 404 || xmlEx.status === 405 || xmlEx.status === 415 || xmlEx.status === 501) continue
         const xmlEp = recordEndpoint('POST', xmlPath, 'surface_probe')

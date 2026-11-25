@@ -873,7 +873,7 @@ export function inferProjectSecuritySpecDeterministic(
       patterns: [call],
       severity: 'critical',
     })
-    const ruleId = `guardian.dynamic.custom-sink-${method.replace(/[^a-z0-9]/gi, '').toLowerCase()}`
+    const ruleId = `kovo.dynamic.custom-sink-${method.replace(/[^a-z0-9]/gi, '').toLowerCase()}`
     candidateRules.push({
       id: ruleId,
       engine: 'opengrep',
@@ -1042,7 +1042,7 @@ try {
   fs.mkdirSync('/tmp/.config', { recursive: true });
   fs.mkdirSync('/tmp/.cache', { recursive: true });
   for (const rule of rules) {
-    const p = '/tmp/guardian-dyn-og-' + randomUUID() + '.yaml';
+    const p = '/tmp/kovo-dyn-og-' + randomUUID() + '.yaml';
     tmpFiles.push(p);
     fs.writeFileSync(p, rule.yaml, { mode: 0o600 });
     try {
@@ -1082,7 +1082,7 @@ const findings = [];
 const tmpFiles = [];
 try {
   for (const rule of rules) {
-    const p = '/tmp/guardian-dyn-sg-' + randomUUID() + '.yaml';
+    const p = '/tmp/kovo-dyn-sg-' + randomUUID() + '.yaml';
     tmpFiles.push(p);
     fs.writeFileSync(p, rule.yaml, { mode: 0o600 });
     try {
@@ -2402,7 +2402,7 @@ export async function generateVariantSweepQueries(
   if (callMatch) {
     const methodPart = callMatch[1].split('.').pop()!.trim()
     candidates.push({
-      id: `guardian.variant.${finding.id.slice(0, 12)}.${methodPart.replace(/[^a-z0-9]/gi, '').toLowerCase()}`,
+      id: `kovo.variant.${finding.id.slice(0, 12)}.${methodPart.replace(/[^a-z0-9]/gi, '').toLowerCase()}`,
       engine: 'opengrep',
       languages: langs,
       severity: finding.severity === 'informational' ? 'medium' : finding.severity,
@@ -2419,7 +2419,7 @@ export async function generateVariantSweepQueries(
     })
   } else {
     candidates.push({
-      id: `guardian.variant.${finding.id.slice(0, 12)}.sink`,
+      id: `kovo.variant.${finding.id.slice(0, 12)}.sink`,
       engine: 'opengrep',
       languages: langs,
       severity: finding.severity === 'informational' ? 'medium' : finding.severity,
@@ -2805,7 +2805,7 @@ export async function runThreeStageSemanticAudit(
       const stage1Session = staticSnapshot ? (session as WorkerSession) : await ensureSession()
       const stage1 = await extractProjectSecuritySpecAndRules(ctx, cleanRepo, stage1Session, {
         enableLlm: options.enableStage1Llm
-          ?? (ctx.modelProfiles?.length ? process.env.GUARDIAN_STAGE1_LLM !== '0' : false),
+          ?? (ctx.modelProfiles?.length ? process.env.KOVO_STAGE1_LLM !== '0' : false),
         ...(staticSnapshot ? { staticSnapshot } : {}),
       })
       specsByRepo[cleanRepo] = stage1.spec

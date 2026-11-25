@@ -177,9 +177,9 @@ export class Store {
       this.processLock.exec('BEGIN EXCLUSIVE')
     } catch {
       this.processLock.close()
-      throw new Error('Another Guardian server is using this data directory.')
+      throw new Error('Another Kovo Hunter server is using this data directory.')
     }
-    const path = join(directory, 'guardian.sqlite')
+    const path = join(directory, 'kovo.sqlite')
     if (!existsSync(path)) {
       try {
         writeFileSync(path, '', { flag: 'wx', mode: 0o600 })
@@ -1162,7 +1162,7 @@ export class Store {
   /**
    * v7 M5 agent-script proof storage (additive, safe on legacy databases).
    *
-   * A Layer-3 `guardian_verify` proof persists its oracle verdict, the receipt it was re-checked
+   * A Layer-3 `kovo_verify` proof persists its oracle verdict, the receipt it was re-checked
    * with and the owner-only artifact holding script source + receipt. Declarative columns stay for
    * attribution; confirmation/retest are receipt-first. No backfill is needed: pre-migration rows
    * are simply not script proofs.

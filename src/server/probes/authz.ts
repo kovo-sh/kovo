@@ -191,7 +191,7 @@ export async function diffAuthorizationMatrix(ctx: DiffContext): Promise<DiffOut
     if (!functionLevel) {
       // Id-selectivity gate: a value only identifies a resource when it differs from a random
       // nonexistent value. This keeps public/list pages and arbitrary query fields out of the matrix.
-      const probeValue = `guardian-none-${randToken(8)}`
+      const probeValue = `kovo-none-${randToken(8)}`
       // A mutating route rejects an empty body with a schema error that masks the identifier
       // differential. The selectivity gate and the owner reference must carry the same body the
       // matrix will use, so a 2xx means the object was addressed (not that the route accepts junk).

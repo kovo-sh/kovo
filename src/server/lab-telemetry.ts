@@ -211,7 +211,7 @@ export function ingestLabTelemetry(input: IngestLabTelemetryInput): IngestLabTel
 
 /**
  * Prepare the IAST telemetry dir: owner-only (0700) rather than world-writable, optionally handed
- * to the non-root container user when Guardian itself runs as root.
+ * to the non-root container user when Kovo Hunter itself runs as root.
  */
 export function prepareIastTelemetryDir(dir: string, containerUser = resolveLabContainerUser()): string {
   mkdirSync(dir, { recursive: true, mode: 0o700 })
@@ -225,7 +225,7 @@ export function prepareIastTelemetryDir(dir: string, containerUser = resolveLabC
 
 /**
  * Fail fast when the 0700 telemetry dir is not writable by the user the lab container runs as.
- * Non-root Guardian cannot chown, so a `GUARDIAN_LAB_USER` uid different from Guardian's own uid
+ * Non-root Kovo Hunter cannot chown, so a `KOVO_LAB_USER` uid different from Kovo Hunter's own uid
  * would silently produce no IAST data; that combination is rejected explicitly instead.
  */
 export function assertIastTelemetryDirWritable(
@@ -236,9 +236,9 @@ export function assertIastTelemetryDirWritable(
   const containerUid = Number(uidRaw)
   const containerGid = Number(gidRaw)
   const st = statSync(dir)
-  const guardianUid = typeof process.getuid === 'function' ? process.getuid() : undefined
+  const kovoUid = typeof process.getuid === 'function' ? process.getuid() : undefined
 
-  if (guardianUid === 0) {
+  if (kovoUid === 0) {
     if (st.uid !== containerUid || st.gid !== containerGid) {
       throw new Error(
         `IAST telemetry dir ${dir} could not be handed to lab container user ${containerUser} ` +
@@ -247,18 +247,18 @@ export function assertIastTelemetryDirWritable(
     }
     return
   }
-  if (guardianUid !== undefined && guardianUid !== containerUid) {
+  if (kovoUid !== undefined && kovoUid !== containerUid) {
     throw new Error(
-      `IAST telemetry dir ${dir} is owned by uid ${guardianUid}, but the lab container runs as ` +
+      `IAST telemetry dir ${dir} is owned by uid ${kovoUid}, but the lab container runs as ` +
       `${containerUser}. A 0700 telemetry dir cannot be written by a different uid, so IAST data ` +
-      `would be silently lost. Set ${LAB_CONTAINER_USER_ENV}=${guardianUid}:${st.gid} or run Guardian as root.`,
+      `would be silently lost. Set ${LAB_CONTAINER_USER_ENV}=${kovoUid}:${st.gid} or run Kovo Hunter as root.`,
     )
   }
 }
 
 /** Mount args for the IAST telemetry bind; read-only unless IAST telemetry is enabled. */
 export function buildIastTelemetryMountArgs(dir: string, iastEnabled: boolean): string[] {
-  return ['--mount', `type=bind,source=${dir},target=/var/run/guardian-iast${iastEnabled ? '' : ',readonly'}`]
+  return ['--mount', `type=bind,source=${dir},target=/var/run/kovo-iast${iastEnabled ? '' : ',readonly'}`]
 }
 
 function boundedDirectorySize(root: string): number {
@@ -400,14 +400,14 @@ export function buildIastContainerWiring(
   const mountArgs = [...buildIastTelemetryMountArgs(telemetryDir, iastActive)]
   const extraEnv: Record<string, string> = {}
   if (iastActive) {
-    extraEnv.GUARDIAN_IAST_OUT_DIR = '/var/run/guardian-iast'
+    extraEnv.KOVO_IAST_OUT_DIR = '/var/run/kovo-iast'
     if (existsSync(IAST_HOOKS_DIR)) {
-      mountArgs.push('--mount', `type=bind,source=${IAST_HOOKS_DIR},target=/opt/guardian-iast,readonly`)
+      mountArgs.push('--mount', `type=bind,source=${IAST_HOOKS_DIR},target=/opt/kovo-iast,readonly`)
       const runtime = labConfig.iastRuntime ?? 'node'
       if (runtime === 'node' && existsSync(join(IAST_HOOKS_DIR, 'node-hook.mjs'))) {
-        extraEnv.NODE_OPTIONS = '--import=/opt/guardian-iast/node-hook.mjs'
+        extraEnv.NODE_OPTIONS = '--import=/opt/kovo-iast/node-hook.mjs'
       } else if (runtime === 'python' && existsSync(join(IAST_HOOKS_DIR, 'python', 'sitecustomize.py'))) {
-        extraEnv.PYTHONPATH = '/opt/guardian-iast/python'
+        extraEnv.PYTHONPATH = '/opt/kovo-iast/python'
       }
     }
   }

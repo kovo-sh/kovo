@@ -110,7 +110,7 @@ export interface AssignmentBriefProofObligation {
   controlPersona?: string
   /** Exact variant actor for the differential (persona handle). */
   variantPersona?: string
-  /** Explicit deliverable: invoke guardian_verify(<tool>) or record a coded proofGapReason. */
+  /** Explicit deliverable: invoke kovo_verify(<tool>) or record a coded proofGapReason. */
   deliverable?: string
 }
 
@@ -697,7 +697,7 @@ function detectMultiHopHelperPatterns(input?: AssignmentBriefInput, compact = fa
   return patterns
 }
 
-/** Exact Mode-A TypeScript guardian_verify recipe (<= 18 lines, live SDK parameter names). */
+/** Exact Mode-A TypeScript kovo_verify recipe (<= 18 lines, live SDK parameter names). */
 export const MULTIHOP_MODE_A_TS_RECIPE = [
   'const ctrl = await ctx.http_send("/api/target", { as: "member_b", role: "control" })',
   'const h1 = await ctx.http_send("/api/hop1", { as: "member_b", role: "probe" })',
@@ -1106,7 +1106,7 @@ export function renderSettlementSpecDirective(
   const codes = proofGapCodes.map(code => cleanText(code, 40)).filter(Boolean).slice(0, 8).join(', ')
   return [
     `[PROOF OBLIGATION — settlement] Your route evidence is ${route}.`,
-    'This wrap-up turn is reserved: submit ONE guardian_verify inline script (ctx.prove_*) or replay spec for that route before complete_intent.',
+    'This wrap-up turn is reserved: submit ONE kovo_verify inline script (ctx.prove_*) or replay spec for that route before complete_intent.',
     `Smallest valid spec: ${specShape}`,
     `If no valid spec can be built, call record_coverage(status="needs_follow_up", proofGapReason="<code>") with a machine-readable code (${codes}) instead of silently skipping.`,
   ].join(' ')

@@ -119,7 +119,7 @@ export interface SarifThreadFlowLocation {
   kinds?: string[]
   importance?: 'essential' | 'important' | 'unimportant'
   properties?: {
-    guardian: Record<string, unknown>
+    kovo: Record<string, unknown>
   }
 }
 
@@ -158,7 +158,7 @@ export interface SarifResult {
   partialFingerprints?: Record<string, string>
   fixes?: SarifFix[]
   properties: {
-    guardian: Record<string, unknown>
+    kovo: Record<string, unknown>
   }
 }
 
@@ -484,7 +484,7 @@ export function compositeReceiptsToSarifCodeFlows(
         kinds,
         importance: hop.order === 1 || isTerminal ? 'essential' : 'important',
         properties: {
-          guardian: {
+          kovo: {
             chainId: record.chainId,
             hopId: hop.hopId,
             hopIndex: hop.order,
@@ -600,7 +600,7 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
         tags: [
           'security',
           ...(ruleMeta.cweNumber ? [`external/cwe/cwe-${ruleMeta.cweNumber}`] : []),
-          ...(finding.category ? [`guardian/category/${finding.category}`] : []),
+          ...(finding.category ? [`kovo/category/${finding.category}`] : []),
         ],
         precision: isStaticVerified ? 'high' : 'very-high',
       },
@@ -669,7 +669,7 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
       fixes.push({
         description: {
           text: redact(
-            `Guardian verified patch (${patch.id.slice(0, 8)})${patch.dynamicRetestVerdict === 'fixed' ? ' [dynamically retested: reproduced -> fixed]' : ''}: ${patch.reviewNotes?.split('\n')[0] || finding.remediation}`,
+            `Kovo Hunter verified patch (${patch.id.slice(0, 8)})${patch.dynamicRetestVerdict === 'fixed' ? ' [dynamically retested: reproduced -> fixed]' : ''}: ${patch.reviewNotes?.split('\n')[0] || finding.remediation}`,
             secrets,
           ),
         },
@@ -710,12 +710,12 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
       locations,
       ...(codeFlows.length > 0 ? { codeFlows } : {}),
       partialFingerprints: {
-        'guardian/v3/fingerprint': fp,
+        'kovo/v3/fingerprint': fp,
         'primaryLocationLineHash': createHash('sha256').update(`${finding.id}:${fp}`).digest('hex').slice(0, 32),
       },
       ...(fixes.length > 0 ? { fixes } : {}),
       properties: {
-        guardian: {
+        kovo: {
           findingId: finding.id,
           origin: finding.origin,
           severity: finding.severity,
@@ -749,13 +749,13 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
   for (const cov of input.coverageEntries ?? []) {
     if (!approved.has(cov.origin)) continue
     const cleanCat = String(cov.category).replace(/[^a-zA-Z0-9_-]/g, '-')
-    const covRuleId = `GUARDIAN-COVERAGE-${cleanCat}`
+    const covRuleId = `KOVO-COVERAGE-${cleanCat}`
     const catTitle = owaspCategoryTitles[cov.category as OwaspCategory] ?? cov.category
 
     const ruleIndex = ensureRule(covRuleId, () => ({
       id: covRuleId,
       name: `Coverage: ${catTitle}`,
-      shortDescription: { text: `Guardian coverage ledger for ${catTitle}` },
+      shortDescription: { text: `Kovo Hunter coverage ledger for ${catTitle}` },
       fullDescription: { text: `Tracks defensive review coverage, ruled-out controls, and open proof gaps for ${catTitle}.` },
       help: {
         text: 'Non-failing coverage record documenting verified controls or open follow-up proof gaps.',
@@ -763,7 +763,7 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
       },
       defaultConfiguration: { level: 'none' },
       properties: {
-        tags: ['security', 'guardian/coverage', `guardian/category/${cleanCat}`],
+        tags: ['security', 'kovo/coverage', `kovo/category/${cleanCat}`],
       },
     }))
 
@@ -799,7 +799,7 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
         },
       ],
       properties: {
-        guardian: {
+        kovo: {
           recordType: 'coverage_entry',
           origin: cov.origin,
           category: cov.category,
@@ -819,10 +819,10 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
       {
         tool: {
           driver: {
-            name: 'Guardian',
-            fullName: 'Guardian v3 Defensive Security Platform',
+            name: 'Kovo Hunter',
+            fullName: 'Kovo Hunter v3 Defensive Security Platform',
             semanticVersion: '3.0.0',
-            informationUri: 'https://github.com/guardian-sec/guardian',
+            informationUri: 'https://github.com/kovo-sec/kovo',
             rules,
           },
         },
@@ -1001,7 +1001,7 @@ export function exportReportSarif(
   const content = (options.zdr ? redactPii(serialized, { secrets: allSecrets }) : redact(serialized, allSecrets)) + '\n'
   const finalLog = JSON.parse(content) as SarifLog
   return {
-    filename: `guardian-report-${run.id.slice(0, 8)}-v${reportVersion}.sarif.json`,
+    filename: `kovo-report-${run.id.slice(0, 8)}-v${reportVersion}.sarif.json`,
     content,
     log: finalLog,
   }

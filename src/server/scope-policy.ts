@@ -20,7 +20,7 @@ export type EnvironmentMode = typeof environmentModes[number]
 export const originRoles = ['target', 'auth', 'asset'] as const
 export type OriginRole = typeof originRoles[number]
 
-export const TENANT_TAG_PREFIX = 'guardian-qa-'
+export const TENANT_TAG_PREFIX = 'kovo-qa-'
 
 export interface ScopePolicy {
   mode: EnvironmentMode
@@ -32,7 +32,7 @@ export interface ScopePolicy {
   assetOrigins?: readonly string[]
   /** Optional `staging_isolated` denylist of routes (path prefixes). */
   routeDenylist?: readonly string[]
-  /** Run-scoped synthetic-tenant tag (`guardian-qa-<runId>-`). */
+  /** Run-scoped synthetic-tenant tag (`kovo-qa-<runId>-`). */
   tenantTag?: string | null
   runId?: string | null
 }
@@ -502,7 +502,7 @@ export function canonicalJson(value: unknown): string {
 }
 
 function manifestSigningBytes(payload: ScopeManifestPayload): Buffer {
-  return Buffer.from(`guardian.scope-manifest.v1\n${canonicalJson(payload)}`, 'utf8')
+  return Buffer.from(`kovo.scope-manifest.v1\n${canonicalJson(payload)}`, 'utf8')
 }
 
 export function signScopeManifest(

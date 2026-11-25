@@ -375,8 +375,8 @@ export type BrokerOptions = {
   /** Injectable clock (test-only) used by circuit-breaker accounting. */
   now?: () => number
   /**
-   * Layer-1 transport configuration. Merged over `GUARDIAN_HTTP2` / `GUARDIAN_EGRESS_PROXY` /
-   * `GUARDIAN_MTLS_*` / `GUARDIAN_USER_AGENT` / `GUARDIAN_AUTHORIZED_HEADERS` (/`GUARDIAN_UA_PROFILE`).
+   * Layer-1 transport configuration. Merged over `KOVO_HTTP2` / `KOVO_EGRESS_PROXY` /
+   * `KOVO_MTLS_*` / `KOVO_USER_AGENT` / `KOVO_AUTHORIZED_HEADERS` (/`KOVO_UA_PROFILE`).
    * Invalid configuration fails closed at construction time.
    */
   transportConfig?: Partial<TransportConfig>
@@ -404,7 +404,7 @@ const defaultWsTimeoutMs = 10_000
 const hardWsTimeoutMs = 20_000
 const bodyPreviewLimit = 8192
 const defaultRequestTimeoutMs = 30_000
-const forbiddenCallerHeaders = /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding|x-guardian-trace-id)$/i
+const forbiddenCallerHeaders = /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding|x-kovo-trace-id)$/i
 /**
  * A token-verification test needs to present a token the caller minted itself. Allow exactly the
  * unsigned shape: a three-segment JWT whose signature segment is empty. Such a token cannot carry a
@@ -427,7 +427,7 @@ const wsGuid = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 const sessionHandleRegex = /^[a-z0-9_-]{1,32}$/
 const csrfCookieNameRegex = /^(?:xsrf-token|csrf[_-]?token|_csrf|csrf)$/i
 const csrfInputNameRegex = /^(?:_csrf|csrf[_-]?token|csrfmiddlewaretoken|__RequestVerificationToken|authenticity_token|_token)$/i
-const canaryUrlRegex = /^\/c\/guardian-canary-[a-f0-9]{24}$/i
+const canaryUrlRegex = /^\/c\/kovo-canary-[a-f0-9]{24}$/i
 /**
  * Cookie names that carry a server-side session handle. Excludes CSRF/tracking names: a stateless
  * double-submit token may legitimately repeat across identities, while a session id may not.
@@ -866,7 +866,7 @@ function hasDestructiveContent(text: string): boolean {
 }
 
 function allowLocalLab(grant: Grant): boolean {
-  return Boolean(grant.allowLocalLab && process.env.GUARDIAN_ALLOW_LOCAL_LAB === '1')
+  return Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
 }
 
 export function isPublicAddress({ address }: PublicAddress): boolean {
@@ -974,11 +974,11 @@ function sessionCookiePolicy(headers: IncomingHttpHeaders): PublicObservation['s
 
 /**
  * Non-default ports are refused on public targets unless the operator explicitly
- * allowlists them (grant.allowedPorts) or exports GUARDIAN_ALLOWED_PORTS=8080,8443.
+ * allowlists them (grant.allowedPorts) or exports KOVO_ALLOWED_PORTS=8080,8443.
  * This keeps the port invariant while permitting authorized staging origins.
  */
 function operatorApprovedPorts(): number[] {
-  const raw = process.env.GUARDIAN_ALLOWED_PORTS
+  const raw = process.env.KOVO_ALLOWED_PORTS
   if (!raw) return []
   const out: number[] = []
   for (const part of raw.split(',')) {
@@ -1061,18 +1061,18 @@ function encodeMultipartParts(parts: readonly BrokerMultipartPart[]): { contentT
     }
     const serialized = `${part.name}\n${part.filename ?? ''}\n${part.contentType}\n${part.content}`
     if (hasDestructiveContent(serialized)) {
-      throw new BrokerDenied('Multipart upload blocked by Guardian destructive-payload denylist.')
+      throw new BrokerDenied('Multipart upload blocked by Kovo Hunter destructive-payload denylist.')
     }
     if (containsWebshellSignature(serialized)) {
-      throw new BrokerDenied('Multipart upload blocked by Guardian webshell signature filter.')
+      throw new BrokerDenied('Multipart upload blocked by Kovo Hunter webshell signature filter.')
     }
     totalBytes += Buffer.byteLength(part.content, 'utf8')
     if (totalBytes > maxMultipartBytes) {
-      throw new BrokerDenied(`Multipart upload exceeds Guardian 256 KiB limit (${totalBytes} bytes).`)
+      throw new BrokerDenied(`Multipart upload exceeds Kovo Hunter 256 KiB limit (${totalBytes} bytes).`)
     }
   }
 
-  const boundary = `----GuardianBoundary${randomBytes(12).toString('hex')}`
+  const boundary = `----KovoBoundary${randomBytes(12).toString('hex')}`
   const chunks: string[] = []
   for (const part of parts) {
     chunks.push(`--${boundary}\r\n`)
@@ -1153,7 +1153,7 @@ function defaultWsTransport(
       'Connection: Upgrade',
       `Sec-WebSocket-Key: ${wsKey}`,
       'Sec-WebSocket-Version: 13',
-      'User-Agent: Guardian/3 defensive websocket probe',
+      'User-Agent: KovoHunter/3 defensive websocket probe',
     ]
     if (options.subprotocols && options.subprotocols.length > 0) {
       reqLines.push(`Sec-WebSocket-Protocol: ${options.subprotocols.join(', ')}`)
@@ -1410,7 +1410,7 @@ function defaultTransport(
       Host: url.host,
       Accept: 'text/html, application/json;q=0.9, */*;q=0.1',
       'Accept-Encoding': 'gzip, deflate, br',
-      'User-Agent': 'Guardian/2 defensive evidence review',
+      'User-Agent': 'KovoHunter/2 defensive evidence review',
       ...(options?.headers ?? {}),
     }
     if (options?.body !== undefined && !headers['Content-Type'] && !headers['content-type']) {
@@ -1667,7 +1667,7 @@ export function brokerPerOriginConcurrencyCap(
 ): number {
   const isLocal = isLoopbackOrigin(origin) || (allowLocalLabOrigin && isLocalLabAutoApprovalOrigin(origin))
   if (!isLocal) return EXTERNAL_ORIGIN_MAX_IN_FLIGHT
-  const raw = Number(env.GUARDIAN_BROKER_LOOPBACK_IN_FLIGHT)
+  const raw = Number(env.KOVO_BROKER_LOOPBACK_IN_FLIGHT)
   if (Number.isFinite(raw) && raw >= 2) return Math.min(24, Math.floor(raw))
   return LOOPBACK_ORIGIN_MAX_IN_FLIGHT
 }
@@ -2487,7 +2487,7 @@ export class RequestBroker {
     const localLab = allowLocalLab(grant)
     // Link-local ranges (169.254.0.0/16 incl. cloud metadata, fe80::/10) are never legitimate
     // targets — not even in an authorized local-lab. This guard stays fail-closed regardless of
-    // Tier-3 auto-approval or GUARDIAN_ALLOW_LOCAL_LAB.
+    // Tier-3 auto-approval or KOVO_ALLOW_LOCAL_LAB.
     const linkLocal = addresses.some(address => {
       try {
         return ipaddr.process(address.address).range() === 'linkLocal'
@@ -2609,7 +2609,7 @@ export class RequestBroker {
     if (!req.pathAndQuery.startsWith('/') || req.pathAndQuery.startsWith('//') ||
         req.pathAndQuery.length > maxPathLength || /[\r\n\0]/.test(req.pathAndQuery)) {
       grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('Request path is invalid or exceeds Guardian 8 KiB limit.')
+      throw new BrokerDenied('Request path is invalid or exceeds Kovo Hunter 8 KiB limit.')
     }
     if (url.origin !== initialOrigin) {
       grant.audit('denied', initialOrigin)
@@ -2652,17 +2652,17 @@ export class RequestBroker {
       (req.body !== undefined && hasDestructiveContent(req.body))
     ) {
       grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('Request blocked by Guardian destructive-payload denylist.')
+      throw new BrokerDenied('Request blocked by Kovo Hunter destructive-payload denylist.')
     }
     if (req.authMutation?.kind === 'kid_inject' && hasDestructiveContent(req.authMutation.value)) {
       grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('authMutation kid_inject blocked by Guardian destructive-payload denylist.')
+      throw new BrokerDenied('authMutation kid_inject blocked by Kovo Hunter destructive-payload denylist.')
     }
     if (req.authMutation?.kind === 'jku_x5u_canary') {
       const candidateUrl = req.authMutation.url ?? req.authMutation.value
       if (candidateUrl && (hasDestructiveContent(candidateUrl) || /[\r\n\0]/.test(candidateUrl))) {
         grant.audit('denied', initialOrigin)
-        throw new BrokerDenied('authMutation jku_x5u_canary blocked by Guardian destructive-payload denylist.')
+        throw new BrokerDenied('authMutation jku_x5u_canary blocked by Kovo Hunter destructive-payload denylist.')
       }
     }
 
@@ -2952,7 +2952,7 @@ export class RequestBroker {
         }
         if (!canaryUrlRegex.test(parsedCanary.pathname)) {
           grant.audit('denied', prepared.initialOrigin)
-          throw new BrokerDenied('jku_x5u_canary URL must target a Guardian CanaryBroker endpoint.')
+          throw new BrokerDenied('jku_x5u_canary URL must target a Kovo Hunter CanaryBroker endpoint.')
         }
         const canaryHost = parsedCanary.hostname.toLowerCase().replace(/^\[|\]$/g, '')
         if (
@@ -2992,7 +2992,7 @@ export class RequestBroker {
           }
           if (allowedOrigins.size > 0 && !allowedOrigins.has(parsedCanary.origin)) {
             grant.audit('denied', prepared.initialOrigin)
-            throw new BrokerDenied('jku_x5u_canary URL origin does not match the active Guardian CanaryBroker.')
+            throw new BrokerDenied('jku_x5u_canary URL origin does not match the active Kovo Hunter CanaryBroker.')
           }
         }
       } else {
@@ -3249,7 +3249,7 @@ export class RequestBroker {
       }
 
       if (localLab && req.traceId && !/[\r\n\0]/.test(req.traceId)) {
-        outboundHeaders['X-Guardian-Trace-Id'] = req.traceId.slice(0, 128)
+        outboundHeaders['X-Kovo-Trace-Id'] = req.traceId.slice(0, 128)
       }
 
       // Merge session jar cookies with Persona Vault cookies.
@@ -3826,7 +3826,7 @@ export class RequestBroker {
       /[\r\n\0]/.test(req.pathAndQuery)
     ) {
       grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('WebSocket path is invalid or exceeds Guardian 8 KiB limit.')
+      throw new BrokerDenied('WebSocket path is invalid or exceeds Kovo Hunter 8 KiB limit.')
     }
     if (url.origin !== initialOrigin || !safeUrl(url, true, localLab, grant.allowedPorts) || !this.originInGrantScope(grant, initialOrigin)) {
       grant.audit('denied', initialOrigin)
@@ -3846,7 +3846,7 @@ export class RequestBroker {
     ].join('\n')
     if (hasDestructiveContent(serializedInputs)) {
       grant.audit('denied', initialOrigin)
-      throw new BrokerDenied('WebSocket probe blocked by Guardian destructive-payload denylist.')
+      throw new BrokerDenied('WebSocket probe blocked by Kovo Hunter destructive-payload denylist.')
     }
 
     const personaHandle = req.persona ?? req.personaHandle
@@ -4055,7 +4055,7 @@ export function websocketResultToExchange(result: BrokerWebsocketResult): Broker
     personaHandle: result.personaHandle,
     status,
     mediaType: 'text/plain',
-    reqHeaders: { origin: result.originHeader ?? '', ...(sent ? { 'x-guardian-ws-sent-frames': String(result.sentFrames) } : {}) },
+    reqHeaders: { origin: result.originHeader ?? '', ...(sent ? { 'x-kovo-ws-sent-frames': String(result.sentFrames) } : {}) },
     respHeaders: result.upgradeHeaders,
     setCookies: [],
     bodyPreview: body.slice(0, bodyPreviewLimit),

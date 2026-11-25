@@ -138,7 +138,7 @@ export async function awaitReplayCanary(
       // when the caller only has an opaque handle.
       canaryId: input.canaryId ?? input.token,
       token: input.token,
-      // Empty artifact: real callbacks rarely carry Guardian's artifact header, and a truthy
+      // Empty artifact: real callbacks rarely carry Kovo Hunter's artifact header, and a truthy
       // artifact would reject them at ingest. Token↔canary binding is the causal link.
       artifact: '',
       immediateMs,
@@ -248,7 +248,7 @@ export async function openCanarySession(
   const callbacks = new Map<string, Record<string, unknown>>()
   const server: Server = createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
-    const match = /^\/c\/(guardian-canary-[a-f0-9]{24})$/.exec(url.pathname)
+    const match = /^\/c\/(kovo-canary-[a-f0-9]{24})$/.exec(url.pathname)
     if (match) {
       callbacks.set(match[1], {
         method: req.method ?? 'GET',
@@ -256,7 +256,7 @@ export async function openCanarySession(
         receivedAt: new Date().toISOString(),
       })
     }
-    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end('guardian-canary-ok')
+    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end('kovo-canary-ok')
   })
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
@@ -268,8 +268,8 @@ export async function openCanarySession(
   const baseUrl = `http://127.0.0.1:${addr.port}`
   return {
     mint() {
-      const token = `guardian-canary-${randomBytes(12).toString('hex')}`
-      return { token, url: `${baseUrl}/c/${token}`, dnsHost: `${token}.canary.guardian.invalid` }
+      const token = `kovo-canary-${randomBytes(12).toString('hex')}`
+      return { token, url: `${baseUrl}/c/${token}`, dnsHost: `${token}.canary.kovo.invalid` }
     },
     check(token: string) {
       const detail = callbacks.get(token) ?? null

@@ -166,7 +166,7 @@ export function buildInlineVerifyFeedback(
     : (typeof payload.kind === 'string' ? payload.kind : '')
 
   // Retired legacy DSL kinds fail closed immediately: skip dead step/SPA/header/body enrichment
-  // and report retriesRemaining=0 so agents switch to guardian_verify instead of retrying DSL.
+  // and report retriesRemaining=0 so agents switch to kovo_verify instead of retrying DSL.
   if (payload.retired === true) {
     const retiredReason = replay.outcome.reason ?? (typeof payload.reason === 'string' ? payload.reason : '')
     return redactJsonValue({

@@ -331,7 +331,7 @@ export async function discoverSubdomainsForOrigins(
         method: 'GET',
         headers: {
           Accept: 'application/json',
-          'User-Agent': 'Guardian/2 passive subdomain discovery',
+          'User-Agent': 'KovoHunter/2 passive subdomain discovery',
         },
         signal: reqSignal,
       })

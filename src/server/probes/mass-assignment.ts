@@ -34,7 +34,7 @@ export async function diffMassAssignment(ctx: DiffContext): Promise<DiffOutcome>
 
   for (const field of candidates.slice(0, 12)) {
     const isBoolField = /^(?:is|has|verified|admin|emailVerified)/i.test(field)
-    const testVal = isBoolField ? 'true' : `guardian_ma_${randToken(4)}`
+    const testVal = isBoolField ? 'true' : `kovo_ma_${randToken(4)}`
     const typedVal: string | boolean = testVal === 'true' && location === 'json'
       ? true
       : testVal

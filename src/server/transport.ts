@@ -100,15 +100,15 @@ function parseHeaderProfileFile(path: string): HeaderProfile {
     if (!statSync(path).isFile()) throw new Error('not a regular file')
     raw = readFileSync(path, 'utf8')
   } catch (err) {
-    throw new TransportConfigError(`GUARDIAN_UA_PROFILE could not be read: ${(err as Error).message}`)
+    throw new TransportConfigError(`KOVO_UA_PROFILE could not be read: ${(err as Error).message}`)
   }
   let parsed: unknown
   try {
     parsed = JSON.parse(raw)
   } catch (err) {
-    throw new TransportConfigError(`GUARDIAN_UA_PROFILE is not valid JSON: ${(err as Error).message}`)
+    throw new TransportConfigError(`KOVO_UA_PROFILE is not valid JSON: ${(err as Error).message}`)
   }
-  return normalizeHeaderProfile(parsed, 'GUARDIAN_UA_PROFILE')
+  return normalizeHeaderProfile(parsed, 'KOVO_UA_PROFILE')
 }
 
 function normalizeHeaderProfile(value: unknown, source: string): HeaderProfile {
@@ -148,22 +148,22 @@ function normalizeProxy(raw: string): EgressProxy {
   try {
     url = new URL(raw)
   } catch {
-    throw new TransportConfigError('GUARDIAN_EGRESS_PROXY is not a valid URL')
+    throw new TransportConfigError('KOVO_EGRESS_PROXY is not a valid URL')
   }
   if (!['http:', 'https:', 'socks5:', 'socks5h:'].includes(url.protocol)) {
-    throw new TransportConfigError(`GUARDIAN_EGRESS_PROXY scheme ${url.protocol} is unsupported (http/https/socks5/socks5h only)`)
+    throw new TransportConfigError(`KOVO_EGRESS_PROXY scheme ${url.protocol} is unsupported (http/https/socks5/socks5h only)`)
   }
-  if (!url.hostname) throw new TransportConfigError('GUARDIAN_EGRESS_PROXY is missing a host')
+  if (!url.hostname) throw new TransportConfigError('KOVO_EGRESS_PROXY is missing a host')
   const port = url.port ? Number(url.port) : (url.protocol === 'https:' ? 443 : url.protocol === 'http:' ? 80 : 1080)
   if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
-    throw new TransportConfigError('GUARDIAN_EGRESS_PROXY has an invalid port')
+    throw new TransportConfigError('KOVO_EGRESS_PROXY has an invalid port')
   }
   const proxy: EgressProxy = { protocol: url.protocol as EgressProxy['protocol'], host: url.hostname, port }
   if (url.username || url.password) {
     const username = decodeURIComponent(url.username)
     const password = decodeURIComponent(url.password)
     if (crlf.test(username) || crlf.test(password)) {
-      throw new TransportConfigError('GUARDIAN_EGRESS_PROXY credentials contain CR/LF/NUL')
+      throw new TransportConfigError('KOVO_EGRESS_PROXY credentials contain CR/LF/NUL')
     }
     proxy.username = username
     proxy.password = password
@@ -173,15 +173,15 @@ function normalizeProxy(raw: string): EgressProxy {
 }
 
 function loadMtls(env: Record<string, string | undefined>): MtlsMaterial | undefined {
-  const certPath = env.GUARDIAN_MTLS_CERT
-  const keyPath = env.GUARDIAN_MTLS_KEY
-  const caPath = env.GUARDIAN_MTLS_CA
+  const certPath = env.KOVO_MTLS_CERT
+  const keyPath = env.KOVO_MTLS_KEY
+  const caPath = env.KOVO_MTLS_CA
   if (!certPath && !keyPath) {
-    if (caPath) throw new TransportConfigError('GUARDIAN_MTLS_CA requires GUARDIAN_MTLS_CERT and GUARDIAN_MTLS_KEY')
+    if (caPath) throw new TransportConfigError('KOVO_MTLS_CA requires KOVO_MTLS_CERT and KOVO_MTLS_KEY')
     return undefined
   }
   if (!certPath || !keyPath) {
-    throw new TransportConfigError('mTLS requires both GUARDIAN_MTLS_CERT and GUARDIAN_MTLS_KEY')
+    throw new TransportConfigError('mTLS requires both KOVO_MTLS_CERT and KOVO_MTLS_KEY')
   }
   const read = (path: string, label: string): string => {
     try {
@@ -197,9 +197,9 @@ function loadMtls(env: Record<string, string | undefined>): MtlsMaterial | undef
     certPath,
     keyPath,
     ...(caPath ? { caPath } : {}),
-    cert: read(certPath, 'GUARDIAN_MTLS_CERT'),
-    key: read(keyPath, 'GUARDIAN_MTLS_KEY'),
-    ...(caPath ? { ca: read(caPath, 'GUARDIAN_MTLS_CA') } : {}),
+    cert: read(certPath, 'KOVO_MTLS_CERT'),
+    key: read(keyPath, 'KOVO_MTLS_KEY'),
+    ...(caPath ? { ca: read(caPath, 'KOVO_MTLS_CA') } : {}),
   }
 }
 
@@ -211,32 +211,32 @@ export function resolveTransportConfig(
   env: Record<string, string | undefined> = process.env,
   overrides: Partial<TransportConfig> = {},
 ): TransportConfig {
-  const envHttp2 = parseBooleanFlag(env.GUARDIAN_HTTP2, 'GUARDIAN_HTTP2')
-  const proxyRaw = env.GUARDIAN_EGRESS_PROXY
+  const envHttp2 = parseBooleanFlag(env.KOVO_HTTP2, 'KOVO_HTTP2')
+  const proxyRaw = env.KOVO_EGRESS_PROXY
   const proxy = proxyRaw ? normalizeProxy(proxyRaw) : undefined
   const mtls = loadMtls(env)
 
   let headerProfile: HeaderProfile | undefined
-  if (env.GUARDIAN_UA_PROFILE) {
-    headerProfile = parseHeaderProfileFile(env.GUARDIAN_UA_PROFILE)
+  if (env.KOVO_UA_PROFILE) {
+    headerProfile = parseHeaderProfileFile(env.KOVO_UA_PROFILE)
   }
-  if (env.GUARDIAN_USER_AGENT !== undefined) {
-    if (env.GUARDIAN_USER_AGENT.trim() === '') {
-      throw new TransportConfigError('GUARDIAN_USER_AGENT must not be empty')
+  if (env.KOVO_USER_AGENT !== undefined) {
+    if (env.KOVO_USER_AGENT.trim() === '') {
+      throw new TransportConfigError('KOVO_USER_AGENT must not be empty')
     }
-    if (crlf.test(env.GUARDIAN_USER_AGENT)) {
-      throw new TransportConfigError('GUARDIAN_USER_AGENT contains CR/LF/NUL')
+    if (crlf.test(env.KOVO_USER_AGENT)) {
+      throw new TransportConfigError('KOVO_USER_AGENT contains CR/LF/NUL')
     }
-    headerProfile = { ...(headerProfile ?? { headers: {} }), userAgent: env.GUARDIAN_USER_AGENT }
+    headerProfile = { ...(headerProfile ?? { headers: {} }), userAgent: env.KOVO_USER_AGENT }
   }
-  if (env.GUARDIAN_AUTHORIZED_HEADERS) {
+  if (env.KOVO_AUTHORIZED_HEADERS) {
     let parsed: unknown
     try {
-      parsed = JSON.parse(env.GUARDIAN_AUTHORIZED_HEADERS)
+      parsed = JSON.parse(env.KOVO_AUTHORIZED_HEADERS)
     } catch (err) {
-      throw new TransportConfigError(`GUARDIAN_AUTHORIZED_HEADERS is not valid JSON: ${(err as Error).message}`)
+      throw new TransportConfigError(`KOVO_AUTHORIZED_HEADERS is not valid JSON: ${(err as Error).message}`)
     }
-    const fromEnv = normalizeHeaderProfile(parsed, 'GUARDIAN_AUTHORIZED_HEADERS')
+    const fromEnv = normalizeHeaderProfile(parsed, 'KOVO_AUTHORIZED_HEADERS')
     headerProfile = {
       ...(headerProfile?.userAgent ? { userAgent: headerProfile.userAgent } : {}),
       headers: { ...(headerProfile?.headers ?? {}), ...fromEnv.headers },
@@ -255,7 +255,7 @@ export function resolveTransportConfig(
   }
 }
 
-export const defaultUserAgent = 'Guardian/2 defensive evidence review'
+export const defaultUserAgent = 'KovoHunter/2 defensive evidence review'
 
 // ---------------------------------------------------------------------------
 // TLS metadata (shared with the broker)
@@ -1312,7 +1312,7 @@ export class WebSocketSession {
       Connection: 'Upgrade',
       'Sec-WebSocket-Key': key,
       'Sec-WebSocket-Version': '13',
-      'User-Agent': options.userAgent ?? 'Guardian/3 defensive websocket probe',
+      'User-Agent': options.userAgent ?? 'KovoHunter/3 defensive websocket probe',
     }
     if (options.subprotocols?.length) headers['Sec-WebSocket-Protocol'] = options.subprotocols.join(', ')
     for (const [k, v] of Object.entries(options.headers ?? {})) {
