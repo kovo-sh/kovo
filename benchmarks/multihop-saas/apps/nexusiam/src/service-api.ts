@@ -440,6 +440,22 @@ export async function handleApi(
     return
   }
 
+  // Export status and download relayed from the document worker, which owns job state.
+  const exportResult = match(url, method, at('/exports/:id/result'))
+  const exportStatus = exportResult ? null : match(url, method, at('/exports/:id'))
+  if (exportResult || exportStatus) {
+    const session = auth(state, req, res)
+    if (!session) return
+    const jobId = encodeURIComponent((exportResult ?? exportStatus)![0]!)
+    const response = await deps.egress.fetch('docs-worker', exportResult ? `/jobs/${jobId}/result` : `/jobs/${jobId}`, {
+      headers: { 'x-guardian-run-id': runId },
+    })
+    const text = await response.text()
+    res.writeHead(response.status, { 'content-type': response.headers.get('content-type') ?? 'application/json' })
+    res.end(text)
+    return
+  }
+
   if (match(url, method, at('/search/facets'))) {
     const session = auth(state, req, res)
     if (!session) return

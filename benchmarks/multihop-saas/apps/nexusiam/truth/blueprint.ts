@@ -233,6 +233,8 @@ export function apiCatalog(plan: NexusPlan): ApiRef[] {
     ['api.docGet', 'api', 'GET', `${p}/docs/:id`, 'id', 'session'],
     ['api.docContent', 'api', 'GET', `${p}/docs/:id/content`, 'id', 'session'],
     ['api.shareMetadata', 'api', 'GET', `${p}/docs/share/:id/metadata`, 'id,folder', 'session'],
+    ['api.exportStatus', 'api', 'GET', `${p}/exports/:id`, 'id', 'session'],
+    ['api.exportResult', 'api', 'GET', `${p}/exports/:id/result`, 'id', 'session'],
     ['api.searchFacets', 'api', 'GET', `${p}/search/facets`, 'q,tenant', 'session'],
     ['api.auditVault', 'api', 'GET', `${p}/audit/vault`, 'tenant', 'session'],
     ['api.graphql', 'api', 'POST', `${p}/graphql`, '', 'session'],

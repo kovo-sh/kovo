@@ -40,8 +40,10 @@ export async function solveC3(ctx: SolverContext): Promise<CompositeProofReceipt
   const token = INTERNAL_TOKEN_PATTERN.exec(deliveries.text)?.[0] ?? ''
   if (!token) return null
 
-  const sync = await ctx.http('registry.internal', '/sync', {
+  // Public registry-integration relay (the registry itself is internal-only).
+  const sync = await ctx.http('api', `${prefix}/integrations/registry/sync`, {
     method: 'POST',
+    token: member,
     headers: { 'x-registry-token': token },
     body: { tenant: plan.tenants.b.slug, projectId: plan.ids.projectIdB },
   })

@@ -31,7 +31,8 @@ export async function solveC2(ctx: SolverContext): Promise<CompositeProofReceipt
   const restProbe = await ctx.http('scm', '/api/user', { token: plan.ids.revokedPatToken })
   if (restProbe.status !== 401) return null
 
-  const stream = await ctx.http('runner', '/streams/shared', {
+  // Public relay of the runner's shared pool feed (the runner itself is internal-only).
+  const stream = await ctx.http('api', `${prefix}/runners/shared/events`, {
     token: plan.ids.revokedPatToken,
   })
   if (stream.status !== 200) return null
