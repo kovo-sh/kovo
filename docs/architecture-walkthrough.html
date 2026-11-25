@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Guardian / Kovo Hunter: Architecture Walkthrough</title>
+<title>Kovo Hunter: Architecture Walkthrough</title>
 <style>
 :root {
   --bg: #fbfbfa; --bg-2: #f2f2ef; --panel: #ffffff; --ink: #1b1d21; --ink-2: #4a4f58; --ink-3: #7b818c;
@@ -213,7 +213,7 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
 <body>
 <header class="top">
   <button class="btn" id="toc-toggle" aria-label="Toggle contents">☰</button>
-  <div class="brand">Guardian / Kovo Hunter <span>Architecture walkthrough · principal-to-principal</span></div>
+  <div class="brand">Kovo Hunter <span>Architecture walkthrough · principal-to-principal</span></div>
   <div class="spacer"></div>
   <span class="small muted mono" title="Snapshot this document was written against">main @ 3aee419</span>
   <button class="btn" id="theme-toggle" aria-label="Toggle dark mode">◐ Theme</button>
@@ -238,7 +238,7 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
 <section class="doc" id="thesis">
   <div class="kicker">Section 1</div>
   <h2>Executive architecture &amp; design thesis</h2>
-  <p class="lede">Guardian is a defensive web-application security verifier. It finds vulnerabilities in authorized targets,
+  <p class="lede">Kovo Hunter is a defensive web-application security verifier. It finds vulnerabilities in authorized targets,
   <em>proves</em> them with host-verified evidence, and re-tests patches. v8 targets deep multi-hop causal chains (3–6 hops) across
   multi-service SaaS, where each endpoint looks fine alone and the impact only shows up when the steps are combined.</p>
   <blockquote class="thesis">The LLM is a cheap, creative, <strong>untrusted</strong> hypothesis generator. The host is an expensive, boring,
@@ -279,7 +279,7 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
     <span><i style="border-color:var(--target);background:var(--target-soft)"></i>Target (authorized)</span>
   </div>
   <div class="topo">
-    <div class="topo-svg-wrap"><svg id="topo" viewBox="0 0 1000 560" role="img" aria-label="Guardian system topology"></svg></div>
+    <div class="topo-svg-wrap"><svg id="topo" viewBox="0 0 1000 560" role="img" aria-label="Kovo Hunter system topology"></svg></div>
     <aside class="inspector" id="inspector" aria-live="polite">
       <div class="empty">Select a component in the diagram.<br><br>Try <b>RequestBroker</b> to follow the only path to the target, or <b>DerivedCapabilityVault</b> to see where raw bytes end up.</div>
     </aside>
@@ -291,7 +291,7 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
       <tr><td>SPA ↔ host</td><td>HTTP + SSE, <code>api.runs.$runId.events.ts</code>, cursor via <code>last-event-id</code> / <code>?since=</code></td><td>run state, redacted events</td><td>secrets, raw bodies</td></tr>
       <tr><td>Agent loop ↔ model</td><td><code>provider.ts</code> / <code>provider-stream.ts</code></td><td>prompts, redacted tool output</td><td>persona creds, vault contents</td></tr>
       <tr><td>Host → worker tools</td><td><code>WorkerSession.exec</code> / <code>runScript</code>, read-only repo bind, IPC dir</td><td>repo snapshot, scripts, result files</td><td>network, credentials</td></tr>
-      <tr><td>Worker → host verify</td><td>HTTP over UDS <code>/guardian-rpc/verify.sock</code>, token file + <code>x-guardian-rpc-token</code>, <code>x-guardian-verify-nonce</code></td><td><code>VerifyExchangeOp</code> requests, handles, exchange IDs</td><td>raw bytes, cookies, bearer tokens, HMAC keys</td></tr>
+      <tr><td>Worker → host verify</td><td>HTTP over UDS <code>/kovo-rpc/verify.sock</code>, token file + <code>x-kovo-rpc-token</code>, <code>x-kovo-verify-nonce</code></td><td><code>VerifyExchangeOp</code> requests, handles, exchange IDs</td><td>raw bytes, cookies, bearer tokens, HMAC keys</td></tr>
       <tr><td>Host ↔ target</td><td><code>RequestBroker.executeHttp</code> + <code>transport.ts</code></td><td>scoped requests with host-injected creds</td><td>anything outside <code>Grant.canRead</code> or after the kill switch</td></tr>
     </tbody>
   </table>
@@ -309,7 +309,7 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
       <code>ExecFloorLane</code> runs the deterministic <code>--no-llm</code> floor.</p></div>
     <div class="card"><h4>Phase B: dynamic scheduler</h4><p class="small muted"><code>FrontierWaveController</code> over <code>frontier-scheduler.ts</code>: beam depth 1..6, width 8..16, ranked by EVI.
       Chain hypotheses interleave with route sweeps. Wall-clock settlement exports <code>v8.hop_checkpoint.v1</code> (≤2 KB, handles only) to seed the next assignment.</p></div>
-    <div class="card"><h4>Layer 3: dual clean replay</h4><p class="small muted"><code>verifyScript</code> runs the <code>guardian_verify.ts</code> script twice in fresh <code>VerifyRpcServer</code> sessions with fresh nonces.
+    <div class="card"><h4>Layer 3: dual clean replay</h4><p class="small muted"><code>verifyScript</code> runs the <code>kovo_verify.ts</code> script twice in fresh <code>VerifyRpcServer</code> sessions with fresh nonces.
       Both oracles, both signatures and <code>causalFingerprints</code> must agree.</p></div>
     <div class="card"><h4>Confirm + dedupe</h4><p class="small muted"><code>verifyCompositeReceipt</code> for chains, <code>verifyReceipt</code> for single findings. <code>evaluateSubmissionDedupe</code> =
       structural <code>computeFindingFingerprint</code> + a semantic judge that only suppresses duplicates and never confirms.</p></div>
@@ -364,9 +364,9 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
 <section class="doc" id="wire">
   <div class="kicker">Section 5</div>
   <h2>Wire protocol: worker ↔ <code>VerifyRpcServer</code></h2>
-  <p class="lede">The protocol is HTTP over a Unix-domain socket that is bind-mounted into the container at <code>/guardian-rpc</code>. The SDK reads the token from
-  <code>GUARDIAN_RPC_TOKEN_FILE</code>, sends it as <code>x-guardian-rpc-token</code>, and echoes the attempt nonce (<code>GUARDIAN_VERIFY_NONCE</code>) in <code>x-guardian-verify-nonce</code>.
-  The proof document is written to <code>GUARDIAN_PROOF_RESULT_FILE</code> with the marker <code>GUARDIAN_PROOF_RESULT:</code>.</p>
+  <p class="lede">The protocol is HTTP over a Unix-domain socket that is bind-mounted into the container at <code>/kovo-rpc</code>. The SDK reads the token from
+  <code>KOVO_RPC_TOKEN_FILE</code>, sends it as <code>x-kovo-rpc-token</code>, and echoes the attempt nonce (<code>KOVO_VERIFY_NONCE</code>) in <code>x-kovo-verify-nonce</code>.
+  The proof document is written to <code>KOVO_PROOF_RESULT_FILE</code> with the marker <code>KOVO_PROOF_RESULT:</code>.</p>
   <table class="t">
     <thead><tr><th>Op</th><th>Host action</th><th>Transcript record</th></tr></thead>
     <tbody>
@@ -380,7 +380,7 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
       <tr><td><code>transcript</code></td><td>Read back redacted exchange summaries</td><td>none (read-only)</td></tr>
     </tbody>
   </table>
-  <p class="small muted">The SDK is <code>worker/guardian_verify/guardian_verify.ts</code> (zero-dep, Node builtins). <code>guardian_verify.py</code> is being retired. Both are thin clients,
+  <p class="small muted">The SDK is <code>worker/kovo_verify/kovo_verify.ts</code> (zero-dep, Node builtins). <code>kovo_verify.py</code> is being retired. Both are thin clients,
   so dropping Python removes code without changing semantics.</p>
 </section>
 
@@ -401,8 +401,8 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
     <thead><tr><th>Debt</th><th>Current state</th><th>Direction</th></tr></thead>
     <tbody>
       <tr><td><b>Dual receipt primitives</b></td><td><code>proof-receipt.ts</code> (1759) next to <code>composite-receipt.ts</code> (748), bridged by <code>singleReceiptToComposite</code></td><td>Make the 1-hop <code>CompositeProofReceipt</code> the only primitive. Keep <code>verifyReceipt</code> as an adapter, then delete it</td></tr>
-      <tr><td><b>Legacy <code>DeclarativeReplaySpec</code> / <code>proof-tools.ts</code></b></td><td><code>src/replay-spec.ts</code> (900) + <code>proof-tools.ts</code> (1319) still referenced by <code>exec-*</code>, <code>agent-*</code>, <code>deterministic-engine</code></td><td>All agentic proofs through <code>guardian_verify</code>. Declarative specs only floor-internal, then retire</td></tr>
-      <tr><td><b>Python SDK</b></td><td><code>guardian_verify.py</code> (796) still in tree</td><td>Delete once TS-only lands. No host change needed</td></tr>
+      <tr><td><b>Legacy <code>DeclarativeReplaySpec</code> / <code>proof-tools.ts</code></b></td><td><code>src/replay-spec.ts</code> (900) + <code>proof-tools.ts</code> (1319) still referenced by <code>exec-*</code>, <code>agent-*</code>, <code>deterministic-engine</code></td><td>All agentic proofs through <code>kovo_verify</code>. Declarative specs only floor-internal, then retire</td></tr>
+      <tr><td><b>Python SDK</b></td><td><code>kovo_verify.py</code> (796) still in tree</td><td>Delete once TS-only lands. No host change needed</td></tr>
       <tr><td><b><code>verify-rpc.ts</code> size</b></td><td>2299 LOC after the 4-way split</td><td>Extract capability/crypto/async handlers behind a seam. The trust boundary should be the smallest code we have</td></tr>
       <tr><td><b>Kernel runtime cycle</b></td><td><code>oracle-invariants.ts</code> re-exports from <code>v8-oracle-families.ts</code>, which imports <code>ROLE_RANK</code> back</td><td>Pure <code>oracle-roles</code> leaf, or drop the barrel re-export</td></tr>
       <tr><td><b>Static concurrency</b></td><td>The product scheduler isn't adaptive. Only the bench model gate has 429 AIMD</td><td>Dynamic AIMD on provider stall/429 inside <code>exec-dispatch</code></td></tr>
@@ -435,13 +435,13 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
   /* ---------------------------------------------------------------- theme */
   var root = document.documentElement
   var stored = null
-  try { stored = localStorage.getItem('guardian-arch-theme') } catch (e) { stored = null }
+  try { stored = localStorage.getItem('kovo-arch-theme') } catch (e) { stored = null }
   var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
   root.setAttribute('data-theme', stored || (prefersDark ? 'dark' : 'light'))
   $('#theme-toggle').addEventListener('click', function () {
     var next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark'
     root.setAttribute('data-theme', next)
-    try { localStorage.setItem('guardian-arch-theme', next) } catch (e) { /* storage disabled */ }
+    try { localStorage.setItem('kovo-arch-theme', next) } catch (e) { /* storage disabled */ }
   })
   $('#toc-toggle').addEventListener('click', function () { $('#toc').classList.toggle('open') })
   $$('#toc a').forEach(function (a) { a.addEventListener('click', function () { $('#toc').classList.remove('open') }) })
@@ -513,7 +513,7 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
     { id: 'vrpc', zone: 'host', x: 574, y: 354, w: 150, h: 54, label: 'VerifyRpcServer', sub: 'verify-rpc.ts (UDS)',
       desc: 'The Layer-3 RPC bridge. It authenticates by token + nonce, routes VerifyExchangeOp, injects credentials host-side, redacts responses and appends HMAC-signed transcript entries. verifyScript creates two fresh instances for dual replay.',
       files: ['src/server/verify-rpc.ts', 'src/server/verify-runner.ts', 'src/server/verify-prove-handlers.ts', 'src/server/verify-claims.ts'],
-      inputs: ['SDK RPC over /guardian-rpc/verify.sock'], outputs: ['Redacted responses + exchange IDs', 'Signed transcript'],
+      inputs: ['SDK RPC over /kovo-rpc/verify.sock'], outputs: ['Redacted responses + exchange IDs', 'Signed transcript'],
       inv: ['Scope is the same Grant.canRead the broker uses', 'Stdout is never evidence', 'Fresh session + nonce per attempt'] },
     { id: 'lab', zone: 'host', x: 206, y: 456, w: 150, h: 54, label: 'LabRunner', sub: 'lab-runner.ts',
       desc: 'The single owner of local lab target containers: start, patch (applyUnifiedDiffToDirectory), reclaim, run records and signal hooks.',
@@ -550,9 +550,9 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
       files: ['worker/bridge.ts', 'worker/analyzers.ts', 'worker/Dockerfile'],
       inputs: ['WorkerSession.exec / runScript jobs'], outputs: ['Result files (masked secrets)'],
       inv: ['No network', 'maskSecretValue on findings', 'Path validation (validateRelativeSubpath)'] },
-    { id: 'gv', zone: 'worker', x: 778, y: 272, w: 190, h: 54, label: 'guardian_verify.ts', sub: 'zero-dep SDK',
+    { id: 'gv', zone: 'worker', x: 778, y: 272, w: 190, h: 54, label: 'kovo_verify.ts', sub: 'zero-dep SDK',
       desc: 'A thin TypeScript verification SDK. Every network, OOB, crypto or proof action is an RPC to the host. Scripts return claims that cite exchange IDs. The Python SDK is being retired.',
-      files: ['worker/guardian_verify/guardian_verify.ts', 'worker/guardian_verify/guardian_verify.py (retiring)'],
+      files: ['worker/kovo_verify/kovo_verify.ts', 'worker/kovo_verify/kovo_verify.py (retiring)'],
       inputs: ['Script authored by the agent'], outputs: ['RPC calls', 'Proof document with nonce'],
       inv: ['Never sees raw bytes or credentials', 'Holds handles, not values'] },
     { id: 'target', zone: 'target', x: 778, y: 438, w: 190, h: 60, label: 'Target app', sub: 'authorized / local lab',
@@ -672,11 +672,11 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
     { k: 'Stage 2 · Phase B', title: 'Worker dispatch', short: 'Worker dispatch',
       files: ['exec-dispatch.ts', 'frontier-scheduler.ts', 'exec-worker-runner.ts', 'worker-backend.ts'],
       desc: 'FrontierWaveController ranks the branch by EVI and protects it through the wave quota. ExecWorkerRunner creates a container from workerContainerCreateArgs (or reuses one from WarmWorkerPool) with the UDS mount. The assignment brief carries a hop goal, never a secret.',
-      worker: 'assignment brief:\n{\n  "goal": "reach victim-tenant billing export",\n  "personas": ["' + S('hdl', 'persona:attacker@acme') + '"],   // label only\n  "hopCheckpoint": null,\n  "rpc": "/guardian-rpc/verify.sock"\n}\n$ id → uid=10001\n$ net → ' + S('badc', 'network unreachable (--network none)'),
-      host: 'FrontierWaveController.selectNextWaveAssignments()\n  EVI = P(next) × impact × novelty / (1 + attempts) = 0.41\n  lane: chain   depth target: 3\nGrant { origins: [lab.acme.test, lab.globex.test], canRead: fn }\npersona-vault:\n  attacker@acme  cookie ' + S('sealed', '●●●●●●●● (host only)') + '\nVerifyRpcServer token  ' + S('sealed', '●●●●●●●● → /guardian-rpc/token (0600)'),
+      worker: 'assignment brief:\n{\n  "goal": "reach victim-tenant billing export",\n  "personas": ["' + S('hdl', 'persona:attacker@acme') + '"],   // label only\n  "hopCheckpoint": null,\n  "rpc": "/kovo-rpc/verify.sock"\n}\n$ id → uid=10001\n$ net → ' + S('badc', 'network unreachable (--network none)'),
+      host: 'FrontierWaveController.selectNextWaveAssignments()\n  EVI = P(next) × impact × novelty / (1 + attempts) = 0.41\n  lane: chain   depth target: 3\nGrant { origins: [lab.acme.test, lab.globex.test], canRead: fn }\npersona-vault:\n  attacker@acme  cookie ' + S('sealed', '●●●●●●●● (host only)') + '\nVerifyRpcServer token  ' + S('sealed', '●●●●●●●● → /kovo-rpc/token (0600)'),
       inv: ['Single container-arg builder', 'Brief ≤ 2 KB, handles only', 'Grant == broker canRead'] },
     { k: 'Stage 3 · Hops 1..N', title: 'Hops via RequestBroker + raw-byte capability.seal', short: 'Hops + seal',
-      files: ['guardian_verify.ts', 'verify-rpc.ts', 'broker.ts', 'derived-custody.ts', 'redact.ts'],
+      files: ['kovo_verify.ts', 'verify-rpc.ts', 'broker.ts', 'derived-custody.ts', 'redact.ts'],
       desc: 'Hop 1: the script calls http.send. The host injects the attacker cookie, the broker executes, and onRawResponse captures the raw body in host memory before redaction. The script calls capability.seal against that exchange, and the vault extracts the invite artifact from the raw bytes. The worker receives only a handle and a scrubbed preview. Hop 2 names the handle, and the host substitutes the real value and attests consumption.',
       worker: 'const r1 = await gv.http({ method: "GET", path: "/invites?mine=1",\n                            persona: "attacker@acme" })\n// r1.exchangeId = "gx-7c1e"   r1.body (redacted):\n// { "invites": [{ "id": 42, "token": "' + S('sv', '[REDACTED]') + '" }] }\n\nconst cap = await gv.sealCapability({ exchangeId: "gx-7c1e",\n                                      jsonPath: "$.invites[0].token" })\n// cap.handle = "' + S('hdl', 'cap:hop_gx7c1e:invite_token') + '"\n// cap.scrubbedPreview = "inv_…(32)"\n\nconst r2 = await gv.http({ method: "POST", path: "/invites/42/redeem",\n                           capability: cap.handle })   // gx-91ab',
       host: 'broker.executeHttp(req + Cookie ' + S('sealed', '●●●●') + ')\n  onRawResponse → rawBox["gx-7c1e"] = { body: ' + S('sealed', '<raw, host-only>') + ' }\ntranscript[gx-7c1e] { status 200, bodySha256 9e1f…, actorRoleLabel "member (acme)",\n                      hmac ' + S('okc', 'a41c…✓') + ' }\nDerivedCapabilityVault.seal()\n  cap:hop_gx7c1e:invite_token = ' + S('sealed', '<value, 0600, runId-bound, expires>') + '\ninjectCapabilityIntoRequest(gx-91ab)\n  CapabilityConsumptionAttestation { consumedCapabilityId: cap:hop_gx7c1e:invite_token }\ntranscript[gx-91ab] { status 200, consumedCapabilityId ✓, hmac ' + S('okc', '5b02…✓') + ' }',
@@ -684,7 +684,7 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
     { k: 'Stage 4 · Layer 3', title: 'Clean ablation + dual replay (Run 1 & Run 2)', short: 'Ablation + replay',
       files: ['verify-runner.ts', 'verify-rpc.ts', 'composite-receipt.ts'],
       desc: 'verifyScript() runs the whole script twice from scratch, in two fresh VerifyRpcServer sessions with two fresh nonces. For the state_transition_binding edge, the script also runs an ablation control: the same redeem from a clean session that never held the precondition, which must be denied. The ablation shows that the effect depends on the earlier hop.',
-      worker: 'Run 1  GUARDIAN_VERIFY_NONCE=' + S('hdl', 'n1=3fa0…') + '\n  hop1 gx-7c1e  hop2 gx-91ab  hop3 gx-c3d0\n  ablation (clean session, no invite): gx-ab01 → 403\nRun 2  GUARDIAN_VERIFY_NONCE=' + S('hdl', 'n2=b84e…') + '\n  hop1 gx-1d22  hop2 gx-5e70  hop3 gx-0f9c\n  ablation: gx-ab02 → 403\n\nproof doc (each echoes its own nonce):\n  edges: [value_binding, state_transition_binding{ablationExchangeIds:[gx-ab01]}]',
+      worker: 'Run 1  KOVO_VERIFY_NONCE=' + S('hdl', 'n1=3fa0…') + '\n  hop1 gx-7c1e  hop2 gx-91ab  hop3 gx-c3d0\n  ablation (clean session, no invite): gx-ab01 → 403\nRun 2  KOVO_VERIFY_NONCE=' + S('hdl', 'n2=b84e…') + '\n  hop1 gx-1d22  hop2 gx-5e70  hop3 gx-0f9c\n  ablation: gx-ab02 → 403\n\nproof doc (each echoes its own nonce):\n  edges: [value_binding, state_transition_binding{ablationExchangeIds:[gx-ab01]}]',
       host: 'attempt 1: session S1, transcript T1 (signed)  oracle ' + S('okc', 'PASS') + '\nattempt 2: session S2, transcript T2 (signed)  oracle ' + S('okc', 'PASS') + '\nablation_control gx-ab01: cleanSession=true replayAttempt="ablation_control"\n  status 403 → precondition necessary ' + S('okc', '✓') + '\nnonces differ ' + S('okc', '✓') + '   each doc echoes own nonce ' + S('okc', '✓'),
       inv: ['Dual clean replay', 'Clean ablation for state transitions', 'Fresh nonce per attempt'] },
     { k: 'Stage 5 · Kernel', title: 'Host verifyCompositeReceipt + causalFingerprints', short: 'Composite verify',
@@ -701,7 +701,7 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
       inv: ['Confirmed ⇒ evidence confirms', 'Hash-chained audit log', 'LLM judge never confirms'] },
     { k: 'Stage 7 · Grading', title: 'Two-side grader (benchmark only)', short: 'Two-side grader',
       files: ['scripts/benchmark-multihop.ts', 'scripts/certify-v8.ts', 'scripts/check-v8-contamination.ts'],
-      desc: 'In certification, a TP needs both sides. Side 1: ChainOracle v2, the lab\'s own observation of the full ordered causal DAG from an attacker-eligible persona with no shortcut personas. Side 2: Guardian\'s host-verified CompositeProofReceipt (Mode A clean replay). The hardened twin of the same chain must not confirm.',
+      desc: 'In certification, a TP needs both sides. Side 1: ChainOracle v2, the lab\'s own observation of the full ordered causal DAG from an attacker-eligible persona with no shortcut personas. Side 2: Kovo Hunter\'s host-verified CompositeProofReceipt (Mode A clean replay). The hardened twin of the same chain must not confirm.',
       worker: S('sv', '// not involved: grading is outside the product boundary'),
       host: 'Side 1 ChainOracle v2: H1 → H2 → H3 ordered, attacker persona, 0 shortcuts ' + S('okc', '✓') + '\nSide 2 CompositeProofReceipt (Mode A) confirmed ' + S('okc', '✓') + '\n→ TP\nhardened twin: no receipt, no oracle hit → ' + S('okc', '0 decoy FPs') + '\nfunnel: H1 → H2 → H3 → H4+ → FinalOracle → CompositeReceiptConfirmed\nanti-heuristic gate: --no-llm ≤ 5% · precision gate: 100% worst-run',
       inv: ['Both sides or no TP', 'Hardened twins = 0 FPs', 'Anti-contamination lint'] }
@@ -809,8 +809,8 @@ footer { color: var(--ink-3); font-size: 12.5px; padding: 30px 0 0; }
 
     M('bridge', 'worker/bridge.ts', 1772, 'worker', 'In-container SAST/SCA/secret scan, AST verify, call graph, offline scripts.', ['runSastScan', 'runOfflineScript', 'runVerifyScript', 'maskSecretValue'], ['analyzers']),
     M('analyzers', 'worker/analyzers.ts', 2783, 'worker', 'Static analyzers used by the bridge.', ['analyzers'], []),
-    M('guardian-verify-ts', 'worker/guardian_verify/guardian_verify.ts', 882, 'worker', 'Zero-dep TS verification SDK (RPC client over UDS).', ['defineVerification', 'runVerification', 'sealCapability', 'CompositeReceiptClaim'], []),
-    M('guardian-verify-py', 'worker/guardian_verify/guardian_verify.py', 796, 'worker', 'Python SDK (being retired; TS-only target).', ['run_verification'], [], { retiring: true }),
+    M('kovo-verify-ts', 'worker/kovo_verify/kovo_verify.ts', 882, 'worker', 'Zero-dep TS verification SDK (RPC client over UDS).', ['defineVerification', 'runVerification', 'sealCapability', 'CompositeReceiptClaim'], []),
+    M('kovo-verify-py', 'worker/kovo_verify/kovo_verify.py', 796, 'worker', 'Python SDK (being retired; TS-only target).', ['run_verification'], [], { retiring: true }),
 
     M('serve', 'scripts/serve.ts', 535, 'ui', 'Production server: static, health, kill switch, pairing, session rotation.', ['read-only mode', 'killSwitchPath'], ['kill-switch', 'store']),
     M('route-events', 'src/routes/api.runs.$runId.events.ts', 85, 'ui', 'SSE stream with Last-Event-ID resume.', ['eventsResponse'], ['store']),

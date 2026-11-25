@@ -277,12 +277,12 @@ function Matrix({ M, sort, setSort, filter, setFilter, modeSeg, onGaps }: {
           data-cell=""
           data-r={ri}
           data-c={ci}
-          className="group/cell relative h-7 w-[42px] cursor-pointer p-0 after:pointer-events-none after:absolute after:inset-0 after:bg-hover after:opacity-0 after:transition-opacity after:duration-[var(--d2)] after:ease-guardian group-data-[hr]/row:after:opacity-100 data-[hc]:after:opacity-100"
+          className="group/cell relative h-7 w-[42px] cursor-pointer p-0 after:pointer-events-none after:absolute after:inset-0 after:bg-hover after:opacity-0 after:transition-opacity after:duration-[var(--d2)] after:ease-kovo group-data-[hr]/row:after:opacity-100 data-[hc]:after:opacity-100"
           onClick={() => { setCur([ri, ci]); nav.select({ kind: 'cell', id: k }) }}
         >
           <span
             className={cn(
-              'absolute inset-0.5 grid place-items-center rounded-[4px] border transition-[transform,box-shadow,border-color,opacity] duration-[var(--d1)] ease-guardian',
+              'absolute inset-0.5 grid place-items-center rounded-[4px] border transition-[transform,box-shadow,border-color,opacity] duration-[var(--d1)] ease-kovo',
               covTileClass(st, { borderless: !isSel }),
               covHoverBorderClass(st),
               'group-hover/cell:z-[1] group-hover/cell:shadow-[0_0_0_1px_var(--fg-3)]',
@@ -425,7 +425,7 @@ function CoverageList({ modeSeg }: { modeSeg: ReactNode }) {
         const col = !!collapsed[ck]
         return <div key={ck}>
           <div className={RW.ghead} role="button" tabIndex={-1} onClick={() => setCollapsed(c => ({ ...c, [ck]: !col }))}>
-            <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-guardian', col && '-rotate-90')} />
+            <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-kovo', col && '-rotate-90')} />
             <span className="inline-flex size-3.5 flex-none items-center justify-center">{group === 'status' ? <CovSwatch status={g.k} size={[16, 12]} /> : group === 'origin' ? <TierBars tier={(model.risk.get(g.k)?.riskTier ?? 'unranked') as RiskTier} /> : <Icon name="surface" />}</span>
             <span>{group === 'origin' ? host(g.k) : group === 'category' ? prettyCat(g.k) : COV_L[g.k] ?? g.k}</span>
             <span className="font-normal tabular-nums text-fg-subtle">{g.list.length}</span>
@@ -461,7 +461,7 @@ function Locator({ origin, current }: { origin: string; current: string | null }
       return <button
         key={c[0]}
         type="button"
-        className="h-[22px] w-full cursor-pointer border-0 bg-transparent p-0 shadow-none transition-transform duration-[var(--d1)] ease-guardian hover:-translate-y-px hover:bg-transparent"
+        className="h-[22px] w-full cursor-pointer border-0 bg-transparent p-0 shadow-none transition-transform duration-[var(--d1)] ease-kovo hover:-translate-y-px hover:bg-transparent"
         title={`${c[1]}: ${COV_L[st]}`}
         onClick={() => nav.select({ kind: 'cell', id: cellKey(origin, c[0]) }, { push: nav.sel?.kind === 'host' })}
       >

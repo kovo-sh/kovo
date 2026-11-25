@@ -317,7 +317,7 @@ function WorkerList({ matches }: { matches: (a: Assignment) => boolean }) {
         <div className={RW.ghead} role="button" tabIndex={0} aria-expanded={!col}
           onClick={() => setCollapsed(c => ({ ...c, [ck(g.key)]: !col }))}
           onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setCollapsed(c => ({ ...c, [ck(g.key)]: !col })) } }}>
-          <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-guardian', col && '-rotate-90')} />
+          <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-kovo', col && '-rotate-90')} />
           <span className="inline-flex size-3.5 flex-none items-center justify-center">{g.glyph}</span>
           <span>{g.label}</span>
           <span className="font-normal text-fg-subtle tabular-nums">{g.items.length}</span>

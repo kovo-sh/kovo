@@ -11,7 +11,7 @@
 // Decisions with a `command` are real: they stamp immediately, show an undo
 // toast, and the command is sent when the 6 s window closes (or when the
 // next decision replaces the toast). Undo inside the window sends nothing.
-// Local-only decisions persist in localStorage (`guardian-queue:<runId>`).
+// Local-only decisions persist in localStorage (`kovo-queue:<runId>`).
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useRun } from './data.tsx'
@@ -82,7 +82,7 @@ export function DecisionsProvider({ children }: { children: ReactNode }) {
   const { model, send } = useRun()
   const toast = useToast()
   const runId = model.run.id
-  const storageKey = 'guardian-queue:' + runId
+  const storageKey = 'kovo-queue:' + runId
   const [all, setAll] = useState<Record<string, Decision>>({})
   const order = useRef<string[]>([])
 

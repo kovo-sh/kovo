@@ -25,7 +25,7 @@ import type { PoolHealth, ShellWorkspaceData } from './GlobalPalette.tsx'
 export { formatFullDateTime, formatRelativeTime, useNow } from './GlobalPalette.tsx'
 export type { PoolHealth, ShellProjectItem, ShellRecentRun, ShellWorkspaceData } from './GlobalPalette.tsx'
 
-const APPEARANCE_KEY = 'guardian-appearance'
+const APPEARANCE_KEY = 'kovo-appearance'
 
 const railItemVariants = cva(
   'relative flex w-full cursor-pointer select-none items-center gap-[9px] rounded-control border-0 bg-transparent px-2 text-left text-[13px] text-fg-muted transition-colors duration-[var(--d1)] hover:bg-hover hover:text-fg',
@@ -373,7 +373,7 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
             </span>
             <Icon
               name="chevR"
-              className="flex-none text-fg-faint transition-[color,transform] duration-[var(--d1)] ease-guardian group-hover/sess:translate-x-[1px] group-hover/sess:text-fg-subtle"
+              className="flex-none text-fg-faint transition-[color,transform] duration-[var(--d1)] ease-kovo group-hover/sess:translate-x-[1px] group-hover/sess:text-fg-subtle"
             />
           </button>
         </div>

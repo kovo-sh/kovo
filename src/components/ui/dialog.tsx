@@ -60,7 +60,7 @@ export function DialogContent({ className, children, ...props }: DialogPrimitive
     <DialogPrimitive.Portal>
       <DialogPrimitive.Backdrop
         data-slot="dialog-backdrop"
-        className="fixed inset-0 z-[60] bg-scrim transition-opacity duration-150 ease-guardian data-[ending-style]:opacity-0 data-[starting-style]:opacity-0"
+        className="fixed inset-0 z-[60] bg-scrim transition-opacity duration-150 ease-kovo data-[ending-style]:opacity-0 data-[starting-style]:opacity-0"
       />
       <DialogPrimitive.Viewport
         data-slot="dialog-viewport"
@@ -70,7 +70,7 @@ export function DialogContent({ className, children, ...props }: DialogPrimitive
           data-slot="dialog-content"
           className={cn(
             'w-full max-w-[520px] rounded-card border border-line-2 bg-panel text-fg shadow-popover outline-none',
-            'transition-[opacity,scale] duration-150 ease-guardian',
+            'transition-[opacity,scale] duration-150 ease-kovo',
             'data-[ending-style]:scale-[.98] data-[ending-style]:opacity-0',
             'data-[starting-style]:scale-[.98] data-[starting-style]:opacity-0',
             className,

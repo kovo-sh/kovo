@@ -30,7 +30,7 @@ const themes = [
   { id: 'forest', name: 'Forest', swatches: ['#eef5ef', '#327657', '#203b32'] },
   { id: 'sand', name: 'Sand', swatches: ['#faf4ea', '#a44b34', '#4b352c'] },
 ];
-const savedTheme = localStorage.getItem('guardian-theme');
+const savedTheme = localStorage.getItem('kovo-theme');
 const legacyPalette = themes.find(item => item.id === savedTheme)?.id ?? (savedTheme === 'midnight' ? 'slate' : undefined);
 let theme = legacyPalette ?? 'neutral';
 const studioColors = [
@@ -44,7 +44,7 @@ const studioColors = [
 function studioColor(id: string | null) {
   return [...studioColors, ...themes].find(color => color.id === id)?.id;
 }
-const savedStudioColor = localStorage.getItem('guardian-studio-light');
+const savedStudioColor = localStorage.getItem('kovo-studio-light');
 let studioLight = studioColor(savedStudioColor) ?? legacyPalette ?? 'porcelain';
 const visualStyles = {
   studio: 'Soft surfaces, open spacing',
@@ -56,12 +56,12 @@ function validStyle(value: string | null): value is VisualStyle {
   return value !== null && Object.hasOwn(visualStyles, value);
 }
 const requestedStyle = new URLSearchParams(location.search).get('style');
-const savedStyle = localStorage.getItem('guardian-style');
+const savedStyle = localStorage.getItem('kovo-style');
 let visualStyle: VisualStyle = validStyle(requestedStyle) ? requestedStyle : validStyle(savedStyle) ? savedStyle : 'studio';
 document.documentElement.dataset.style = visualStyle;
 const appearances = ['system', 'light', 'dark'] as const;
 type Appearance = typeof appearances[number];
-const savedAppearance = localStorage.getItem('guardian-appearance');
+const savedAppearance = localStorage.getItem('kovo-appearance');
 let appearance: Appearance = appearances.find(option => option === savedAppearance)
   ?? (savedTheme === 'midnight' ? 'dark' : 'system');
 let lightPreview = visualStyle === 'studio' ? studioColor(new URLSearchParams(location.search).get('light')) : undefined;
@@ -99,7 +99,7 @@ const layouts = {
   review: { name: 'Review', description: 'Wide chat and transcript pane', columns: [1, 1, 1], nodeWidth: 196, gap: 31, rowHeight: 37 },
 };
 type Layout = keyof typeof layouts;
-const savedLayout = localStorage.getItem('guardian-layout') as Layout | null;
+const savedLayout = localStorage.getItem('kovo-layout') as Layout | null;
 let layout: Layout = savedLayout && Object.hasOwn(layouts, savedLayout) ? savedLayout : 'workspace';
 document.documentElement.dataset.layout = layout;
 const navigationStyles = {
@@ -109,7 +109,7 @@ const navigationStyles = {
   top: 'Top bar',
 };
 type NavigationStyle = keyof typeof navigationStyles;
-const savedNavigation = localStorage.getItem('guardian-navigation') as NavigationStyle | null;
+const savedNavigation = localStorage.getItem('kovo-navigation') as NavigationStyle | null;
 let navigation: NavigationStyle = savedNavigation && Object.hasOwn(navigationStyles, savedNavigation) ? savedNavigation : 'top';
 let projectExpanded = true;
 document.documentElement.dataset.navigation = navigation;
@@ -139,7 +139,7 @@ function graphGeometry() {
   };
 }
 
-let dockOpen = localStorage.getItem('guardian-run-pane') !== 'closed';
+let dockOpen = localStorage.getItem('kovo-run-pane') !== 'closed';
 let dockTab: 'coordinator' | 'worker' = 'coordinator';
 let coordinatorDraft = '';
 let coordinatorScroll = 0;
@@ -371,7 +371,7 @@ function render() {
         ? `<article class="coordinator-message coordinator-user"><strong>You</strong><p>${esc(message.text)}</p></article>`
         : `<article class="coordinator-message coordinator-reply"><span class="thread-avatar coordinator-avatar" aria-hidden="true">${brandMark}</span><div><strong>Coordinator</strong><p>${esc(message.text)}</p></div></article>`).join('')}
       ${stage === 'review' && !paused ? '<div class="chat-scope-action"><button data-action="gate">Review discovered hosts <span aria-hidden="true">→</span></button></div>' : ''}
-      ${stage === 'discover' ? '<section class="scope"><h2>Authorize discovery</h2><p>Guardian will review a prepared inventory for the project’s seed domain in this demo.</p><button class="primary" data-action="discover">Consent and discover</button></section>' : ''}
+      ${stage === 'discover' ? '<section class="scope"><h2>Authorize discovery</h2><p>Kovo Hunter will review a prepared inventory for the project’s seed domain in this demo.</p><button class="primary" data-action="discover">Consent and discover</button></section>' : ''}
     </div>
     <form id="chat"><input name="message" aria-label="Message the coordinator" placeholder="Message coordinator…" autocomplete="off" value="${esc(coordinatorDraft)}" required><button class="primary" aria-label="Send message">↑</button></form>
   </section>`;
@@ -614,7 +614,7 @@ function render() {
   const currentPage = tab === 'Report' ? 'Report' : 'Workflow';
   const statusClass = stage === 'done' ? 'done' : stage === 'review' || paused ? 'attention' : stage === 'analyze' || stage === 'verify' ? 'running' : '';
   const tabs = ['Workflow', 'Report'];
-  const brand = `<div class="brand" aria-label="Guardian">${brandMark}<span class="rail-text">Guardian</span></div>`;
+  const brand = `<div class="brand" aria-label="Kovo Hunter">${brandMark}<span class="rail-text">Kovo Hunter</span></div>`;
   const workspace = '<div class="workspace"><span class="initial" aria-hidden="true">P</span><span class="rail-text">Personal workspace</span></div>';
   const runIndicator = `<i class="nav-state ${statusClass}" aria-hidden="true"></i>`;
   const runLink = `<button class="run-link" data-action="tab:Run" aria-label="Website review" title="Website review">
@@ -861,7 +861,7 @@ app.addEventListener('click', async event => {
       visualStyle = a;
       updateAppearance();
       document.documentElement.dataset.style = a;
-      localStorage.setItem('guardian-style', a);
+      localStorage.setItem('kovo-style', a);
       const url = new URL(location.href);
       if (url.searchParams.has('style')) {
         url.searchParams.set('style', a);
@@ -873,7 +873,7 @@ app.addEventListener('click', async event => {
     case 'navigation':
       if (!Object.hasOwn(navigationStyles, a)) return;
       navigation = a as NavigationStyle;
-      localStorage.setItem('guardian-navigation', navigation);
+      localStorage.setItem('kovo-navigation', navigation);
       document.documentElement.dataset.navigation = navigation;
       focusSelector = `[data-action="navigation:${navigation}"]`;
       break;
@@ -891,7 +891,7 @@ app.addEventListener('click', async event => {
       if (!Object.hasOwn(layouts, a)) return;
       layout = a as Layout;
       document.documentElement.dataset.layout = layout;
-      localStorage.setItem('guardian-layout', layout);
+      localStorage.setItem('kovo-layout', layout);
       viewOptionsOpen = false;
       zoom = undefined;
       focusSelector = '[data-action="view-options"]';
@@ -901,7 +901,7 @@ app.addEventListener('click', async event => {
       if (editingStudioLight) {
         if (!studioColor(a)) return;
         studioLight = a;
-        localStorage.setItem('guardian-studio-light', a);
+        localStorage.setItem('kovo-studio-light', a);
         if (lightPreview) {
           lightPreview = a;
           const url = new URL(location.href);
@@ -910,9 +910,9 @@ app.addEventListener('click', async event => {
         }
       } else {
         if (!themes.some(item => item.id === a)) return;
-        localStorage.setItem('guardian-studio-light', studioLight);
+        localStorage.setItem('kovo-studio-light', studioLight);
         theme = a;
-        localStorage.setItem('guardian-theme', a);
+        localStorage.setItem('kovo-theme', a);
       }
       updateAppearance();
       const inGallery = editingStudioLight && studioColors.some(item => item.id === a);
@@ -925,11 +925,11 @@ app.addEventListener('click', async event => {
       if (!option) return;
       if (option === 'light' && lightPreview) {
         studioLight = lightPreview;
-        localStorage.setItem('guardian-studio-light', studioLight);
+        localStorage.setItem('kovo-studio-light', studioLight);
       }
       clearLightPreview();
       appearance = option;
-      localStorage.setItem('guardian-appearance', option);
+      localStorage.setItem('kovo-appearance', option);
       updateAppearance();
       focusSelector = `[data-action="appearance:${option}"]`;
       break;
@@ -952,7 +952,7 @@ app.addEventListener('click', async event => {
       break;
     case 'dock-toggle':
       dockOpen = !dockOpen;
-      localStorage.setItem('guardian-run-pane', dockOpen ? 'open' : 'closed');
+      localStorage.setItem('kovo-run-pane', dockOpen ? 'open' : 'closed');
       focusSelector = '.viewbar [data-action="dock-toggle"]';
       break;
     case 'dock':
@@ -1091,7 +1091,7 @@ document.addEventListener('keydown', event => {
       restore = stage === 'review' ? '.phase-rail [data-action="gate"]' : '[data-action="scope"]';
     } else {
       dockOpen = false;
-      localStorage.setItem('guardian-run-pane', 'closed');
+      localStorage.setItem('kovo-run-pane', 'closed');
       restore = '.viewbar [data-action="dock-toggle"]';
     }
     render();

@@ -320,7 +320,7 @@ export function GroupedRepoPicker({
                   >
                     <span
                       className={cn(
-                        'inline-flex size-3.5 flex-none items-center justify-center text-fg-subtle transition-[transform,color] duration-[var(--d1)] ease-guardian',
+                        'inline-flex size-3.5 flex-none items-center justify-center text-fg-subtle transition-[transform,color] duration-[var(--d1)] ease-kovo',
                         expanded && 'rotate-90 text-fg-muted',
                       )}
                       aria-hidden="true"

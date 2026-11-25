@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Re-run the Guardian v5 release gate on the current tree.
+# Re-run the Kovo Hunter v5 release gate on the current tree.
 #
 #   bash docs/reverify-v5.sh --full    # release gate: build + all suites + Playwright + orphan hygiene
 #   bash docs/reverify-v5.sh --fast    # no Docker: typecheck, build, Docker-free unit suites only
@@ -9,10 +9,10 @@
 # (a failure does not stop the run) and a gate table plus a non-zero exit reports the
 # truth. Exit 0 is reserved for: every suite green, 0 skips, 0 Docker orphans.
 #
-# Orphan hygiene fails the gate when a `guardian-*` container is stuck in `created`
+# Orphan hygiene fails the gate when a `kovo-*` container is stuck in `created`
 # for longer than 2 minutes (create succeeded, start never did) or when a
-# `guardian-*` / `dev.guardian.*` network was left behind. Active `Up` containers
-# from a concurrent stream are not gate failures. Set GUARDIAN_GATE_SKIP_NETWORKS=1
+# `kovo-*` / `dev.kovo.*` network was left behind. Active `Up` containers
+# from a concurrent stream are not gate failures. Set KOVO_GATE_SKIP_NETWORKS=1
 # only when another stream is intentionally running a lab network.
 #
 # Run under `newgrp docker -c 'bash docs/reverify-v5.sh --full'` when docker group
@@ -23,7 +23,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=2048}"
-export GUARDIAN_ALLOW_LOCAL_LAB=1
+export KOVO_ALLOW_LOCAL_LAB=1
 
 MODE=""
 for arg in "$@"; do
@@ -55,14 +55,14 @@ if [[ "$MODE" == full ]]; then
     echo "Use --fast for the Docker-free subset; it does not certify the release gate." >&2
     exit 2
   fi
-  if ! docker image inspect guardian-worker:v4 >/dev/null 2>&1; then
-    echo "FULL GATE UNAVAILABLE (exit 2): guardian-worker:v4 image not found." >&2
+  if ! docker image inspect kovo-worker:v4 >/dev/null 2>&1; then
+    echo "FULL GATE UNAVAILABLE (exit 2): kovo-worker:v4 image not found." >&2
     echo "Build it with: npm run worker:build" >&2
     exit 2
   fi
 fi
 
-TMP="$(mktemp -d /tmp/guardian-reverify-v5.XXXXXX)"
+TMP="$(mktemp -d /tmp/kovo-reverify-v5.XXXXXX)"
 declare -a ROWS=()
 TOTAL=0 PASS=0 FAIL=0 SKIP=0 SUITES=0 GATE_FAIL=0
 
@@ -141,7 +141,7 @@ orphan_check() {
     if (( now - created > 120 )); then
       stale_rows+=$'\n'"  $name  ($id, $status, $(( (now - created) / 60 ))m old)"
     fi
-  done < <(docker ps -a --filter name=^guardian- --format '{{.ID}}\t{{.CreatedAt}}\t{{.Names}}\t{{.Status}}' 2>/dev/null)
+  done < <(docker ps -a --filter name=^kovo- --format '{{.ID}}\t{{.CreatedAt}}\t{{.Names}}\t{{.Status}}' 2>/dev/null)
 
   # A network still attached to a running container belongs to an active stream, not a leak.
   local leaked_networks="" active_networks=""
@@ -152,34 +152,34 @@ orphan_check() {
     if [[ "${attached:-0}" -gt 0 ]]; then active_networks+=" $net"
     else leaked_networks+=$'\n'"  $net"
     fi
-  done < <(docker network ls --filter name=^guardian- --format '{{.Name}}' 2>/dev/null; docker network ls --filter label=dev.guardian --format '{{.Name}}' 2>/dev/null | sed '/^$/d' | sort -u)
+  done < <(docker network ls --filter name=^kovo- --format '{{.Name}}' 2>/dev/null; docker network ls --filter label=dev.kovo --format '{{.Name}}' 2>/dev/null | sed '/^$/d' | sort -u)
   networks="$leaked_networks"
   if [[ -n "$stale_rows" ]]; then
     GATE_FAIL=1
-    echo "-- ORPHAN FAILURE: guardian containers abandoned in created state >2m:" >&2
+    echo "-- ORPHAN FAILURE: kovo containers abandoned in created state >2m:" >&2
     printf '%s\n' "$stale_rows" >&2
   fi
-  if [[ -n "$networks" && "${GUARDIAN_GATE_SKIP_NETWORKS:-0}" != "1" ]]; then
+  if [[ -n "$networks" && "${KOVO_GATE_SKIP_NETWORKS:-0}" != "1" ]]; then
     GATE_FAIL=1
-    echo "-- ORPHAN FAILURE: detached guardian networks left behind:" >&2
+    echo "-- ORPHAN FAILURE: detached kovo networks left behind:" >&2
     printf '%s\n' "$networks" >&2
   elif [[ -n "$networks" ]]; then
-    echo "!! detached networks present but GUARDIAN_GATE_SKIP_NETWORKS=1: $(printf '%s ' $networks)"
+    echo "!! detached networks present but KOVO_GATE_SKIP_NETWORKS=1: $(printf '%s ' $networks)"
   fi
   if [[ -n "$active_networks" ]]; then
-    echo "   active guardian networks (attached to running containers, not failures):$active_networks"
+    echo "   active kovo networks (attached to running containers, not failures):$active_networks"
   fi
   local up
-  up="$(docker ps --filter name=^guardian- --format '{{.Names}}' 2>/dev/null | wc -l | tr -d ' ')"
-  if [[ -z "$stale_rows" && ( -z "$networks" || "${GUARDIAN_GATE_SKIP_NETWORKS:-0}" == "1" ) ]]; then
+  up="$(docker ps --filter name=^kovo- --format '{{.Names}}' 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ -z "$stale_rows" && ( -z "$networks" || "${KOVO_GATE_SKIP_NETWORKS:-0}" == "1" ) ]]; then
     record_row "orphan hygiene" "-" "-" "-" "-" "pass"
   else
     record_row "orphan hygiene" "-" "-" "-" "-" "FAIL"
   fi
-  echo "   active guardian containers (not a gate failure): $up"
+  echo "   active kovo containers (not a gate failure): $up"
 }
 
-echo "Guardian v5 gate ($MODE) — repo: $ROOT"
+echo "Kovo Hunter v5 gate ($MODE) — repo: $ROOT"
 echo "logs: $TMP"
 echo
 

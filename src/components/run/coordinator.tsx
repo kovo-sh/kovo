@@ -379,7 +379,7 @@ function ThreadMessage({ m }: { m: Message }) {
   const model = useRunModel()
   const q = useDecisions()
   const links = useLinks()
-  const am = m.role === 'guardian' ? m.content.match(APPROVAL_RE) : null
+  const am = m.role === 'kovo' ? m.content.match(APPROVAL_RE) : null
   if (am) {
     const ap = model.detail.approvals.find(a => a.origin + a.pathAndQuery === am[2] || (a.method === am[1] && am[2].startsWith(a.origin)))
     const d = ap ? q.get('ap:' + ap.id) : undefined
@@ -418,7 +418,7 @@ function ThreadMessage({ m }: { m: Message }) {
         <span className="max-w-[240px] truncate">{who[0]}</span>
         <span className="num text-[11.5px] font-normal text-fg-subtle">{fmtTime(m.createdAt)}</span>
       </div>
-      <MessageBody text={m.content} muted={m.role === 'guardian'} />
+      <MessageBody text={m.content} muted={m.role === 'kovo'} />
       {evidence.map(ev => <button key={ev.id} type="button" className={cn(runBtn({ variant: 'link', size: 'none' }), 'mt-1 flex')} onClick={() => links.evidence(ev.id)}><Icon name="fact" />{ev.title}</button>)}
     </div>
   </div>

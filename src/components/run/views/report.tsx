@@ -276,7 +276,7 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
               <div className="font-mono text-[12px] text-fg-subtle">{host(f.origin)}{f.cwe ? ' · ' + f.cwe : ''} · {prettyCat(f.category)}{f.findingKind === 'multi_step_chain' ? ' · chain' : ''}</div>
             </td>
             <td className={cn('w-6 pb-[7px] pt-2.5 text-right align-top text-fg-faint', rowBorder)}>
-              <Icon name="chev" className={cn('ml-auto transition-transform duration-[var(--d2)] ease-guardian', isOpen ? 'rotate-0 text-fg-muted' : '-rotate-90')} />
+              <Icon name="chev" className={cn('ml-auto transition-transform duration-[var(--d2)] ease-kovo', isOpen ? 'rotate-0 text-fg-muted' : '-rotate-90')} />
             </td>
           </tr>
           {isOpen && <tr>
@@ -386,7 +386,7 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
             return <td key={c[0]} className="whitespace-nowrap border-b border-line px-0.5 py-[3px] text-center" title={`${c[1]}: ${COV_L[st]}${x ? '\n' + x.summary : ''}${x?.enforcingControl ? '\nControl: ' + x.enforcingControl : ''}${x?.proofGapReason ? '\nProof gap: ' + x.proofGapReason : ''}`}>
               <button
                 type="button"
-                className="inline-grid h-auto cursor-pointer place-items-center rounded-[4px] border-0 bg-transparent p-0.5 shadow-none transition-transform duration-[var(--d1)] ease-guardian hover:-translate-y-px hover:bg-transparent"
+                className="inline-grid h-auto cursor-pointer place-items-center rounded-[4px] border-0 bg-transparent p-0.5 shadow-none transition-transform duration-[var(--d1)] ease-kovo hover:-translate-y-px hover:bg-transparent"
                 onClick={() => links.cell(o, c[0])}
               >
                 <CovSwatch status={st} size={[16, 12]} />

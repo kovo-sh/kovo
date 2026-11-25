@@ -286,7 +286,7 @@ function Workspace() {
       <span className="min-w-2 flex-1" />
       <div className="flex flex-none items-center gap-1.5">
         {projects.length > 0 && (
-          <div className="flex h-[26px] w-[140px] flex-none items-center gap-1.5 rounded-control px-2 text-fg-subtle transition-[width,background-color] duration-[var(--d2)] ease-guardian hover:bg-hover focus-within:w-[210px] focus-within:bg-sunk focus-within:text-fg-muted focus-within:shadow-hairline">
+          <div className="flex h-[26px] w-[140px] flex-none items-center gap-1.5 rounded-control px-2 text-fg-subtle transition-[width,background-color] duration-[var(--d2)] ease-kovo hover:bg-hover focus-within:w-[210px] focus-within:bg-sunk focus-within:text-fg-muted focus-within:shadow-hairline">
             <Icon name="search" />
             <input
               type="search"
@@ -454,7 +454,7 @@ function Workspace() {
                 </span>
               </div>
 
-              <div className="pointer-events-none absolute right-3.5 top-1/2 flex -translate-y-1/2 translate-x-1 items-center gap-[5px] bg-[linear-gradient(90deg,transparent,var(--row-h)_22px)] pl-7 opacity-0 transition-[opacity,transform] duration-[var(--d2)] ease-guardian group-hover/row:pointer-events-auto group-hover/row:translate-x-0 group-hover/row:opacity-100 group-focus-within/row:pointer-events-auto group-focus-within/row:translate-x-0 group-focus-within/row:opacity-100">
+              <div className="pointer-events-none absolute right-3.5 top-1/2 flex -translate-y-1/2 translate-x-1 items-center gap-[5px] bg-[linear-gradient(90deg,transparent,var(--row-h)_22px)] pl-7 opacity-0 transition-[opacity,transform] duration-[var(--d2)] ease-kovo group-hover/row:pointer-events-auto group-hover/row:translate-x-0 group-hover/row:opacity-100 group-focus-within/row:pointer-events-auto group-focus-within/row:translate-x-0 group-focus-within/row:opacity-100">
                 <Link
                   to="/projects/$projectId"
                   params={{ projectId: project.id }}

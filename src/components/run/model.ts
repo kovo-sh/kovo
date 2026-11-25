@@ -369,7 +369,7 @@ export interface RunModel {
   workflow: WorkflowModel
   /** Latest report, if any. */
   report: Report | null
-  /** Coordinator thread (operator, coordinator and guardian messages) and worker report messages. */
+  /** Coordinator thread (operator, coordinator and kovo messages) and worker report messages. */
   coordinatorMessages: Message[]
   workerMessages: Message[]
   /** Model missing: scope approved and the run is in a model-driven phase without a usable model. */
@@ -451,7 +451,7 @@ export function buildRunModel(d: Detail): RunModel {
   const surface = buildSurface(d, findings, partial)
   const workflow = buildWorkflow(d, partial)
   const report = d.reports.slice().sort((a, b) => b.version - a.version)[0] ?? null
-  const coordinatorMessages = d.messages.filter(m => m.threadId === d.run.coordinatorId || m.role === 'operator' || m.role === 'guardian')
+  const coordinatorMessages = d.messages.filter(m => m.threadId === d.run.coordinatorId || m.role === 'operator' || m.role === 'kovo')
   const workerMessages = d.messages.filter(m => m.role === 'worker')
   const needsModel = !d.hasModel && d.run.approved.length > 0 && ['threat_model', 'investigation', 'verification'].includes(d.run.phase)
     && d.run.status !== 'complete' && d.run.status !== 'stopped'

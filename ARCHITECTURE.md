@@ -1,4 +1,4 @@
-# Guardian (Kovo Hunter) — Architecture
+# Kovo Hunter — Architecture
 
 > Principal-to-principal guide. Real paths, real symbols, real invariants, honest debt.
 > Interactive companion: [`docs/architecture-walkthrough.html`](docs/architecture-walkthrough.html) (standalone, open locally).
@@ -10,7 +10,7 @@
 
 ## 1. Executive architecture & design thesis
 
-Guardian is a defensive web-application security verifier. It finds vulnerabilities in
+Kovo Hunter is a defensive web-application security verifier. It finds vulnerabilities in
 authorized targets, **proves** them with host-verified evidence, and re-tests patches. v8's scope
 is deep multi-hop causal chains (3–6 hops) across multi-service SaaS apps, where each endpoint
 looks fine on its own and the impact only shows up when identities, state transitions and
@@ -52,7 +52,7 @@ Three layers (unchanged since v6; v8 deepens them and does not add a fourth):
 - **Layer 1: Safety / session / transcript boundary.** Broker, redaction, custody, signing. Can't be bypassed.
 - **Layer 2: Always-on code-first + deterministic floor.** Phase A static audit and the
   `--no-llm` floor run without a model and set the deterministic baseline.
-- **Layer 3: Agentic verification.** Model-driven exploration and `guardian_verify` scripts,
+- **Layer 3: Agentic verification.** Model-driven exploration and `kovo_verify` scripts,
   whose results only count after Layer-1 replay.
 
 ---
@@ -78,7 +78,7 @@ flowchart LR
   end
   subgraph Worker["Docker worker (untrusted)<br/>--network none, --read-only, --cap-drop ALL, uid 10001"]
     BR["worker/bridge.ts<br/>SAST, AST, call-graph, offline scripts"]
-    GV["guardian_verify.ts SDK"]
+    GV["kovo_verify.ts SDK"]
   end
   TGT["Target app<br/>(authorized / local lab)"]
 
@@ -87,7 +87,7 @@ flowchart LR
   EXE --> AGT
   AGT -->|"tool exec: WorkerSession.exec/runScript"| BR
   AGT -->|"http tools"| BRK
-  GV -->|"UDS /guardian-rpc/verify.sock<br/>x-guardian-rpc-token"| VRPC
+  GV -->|"UDS /kovo-rpc/verify.sock<br/>x-kovo-rpc-token"| VRPC
   VRPC --> BRK
   VRPC --> VLT
   VRPC --> KRN
@@ -107,7 +107,7 @@ flowchart LR
 | SPA ↔ host | HTTP + SSE (`src/routes/api.runs.$runId.events.ts`, cursor via `last-event-id` / `?since=`) | run/project state, redacted events | secrets, raw bodies |
 | Host agent loop ↔ model | `provider.ts` / `provider-stream.ts` | prompts, redacted tool output (`truncateUtf8Head`, spill files) | persona creds, vault contents |
 | Host ↔ worker (tools) | `WorkerSession.exec` / `runScript` (`worker-backend.ts`) via bind-mounted repos and IPC dir | repo snapshot (read-only), scripts, result files | network, credentials |
-| Worker ↔ host (verification) | HTTP over Unix socket `VERIFY_RPC_CONTAINER_DIR=/guardian-rpc`, `verify.sock`, token file + `x-guardian-rpc-token`, nonce in `x-guardian-verify-nonce` | `VerifyExchangeOp` requests, handles, exchange IDs, redacted responses | raw bytes, cookies, bearer tokens, HMAC keys |
+| Worker ↔ host (verification) | HTTP over Unix socket `VERIFY_RPC_CONTAINER_DIR=/kovo-rpc`, `verify.sock`, token file + `x-kovo-rpc-token`, nonce in `x-kovo-verify-nonce` | `VerifyExchangeOp` requests, handles, exchange IDs, redacted responses | raw bytes, cookies, bearer tokens, HMAC keys |
 | Host ↔ target | `RequestBroker.executeHttp` + `transport.ts` | scoped requests with host-injected credentials | anything outside `Grant.canRead`, anything after kill-switch |
 
 The worker container flags come from a **single** builder,
@@ -131,7 +131,7 @@ flowchart TD
     FW["FrontierWaveController<br/>exec-dispatch.ts + frontier-scheduler.ts"] --> WK["Specialist worker sessions<br/>exec-worker-runner.ts"]
     WK -->|"wall-clock settle → v8.hop_checkpoint.v1"| FW
   end
-  PB --> L3["Layer-3 guardian_verify<br/>Dual clean replay (verifyScript)"]
+  PB --> L3["Layer-3 kovo_verify<br/>Dual clean replay (verifyScript)"]
   L3 --> CF["Confirmation: verifyCompositeReceipt / verifyReceipt<br/>+ causalFingerprints"]
   CF --> DD["Dedupe + persist<br/>dedupe.ts, finding-fingerprint.ts, store-findings.ts"]
   DD --> PV["Patch verification<br/>patch-workflow.ts retestCompositeChainPatch"]
@@ -169,7 +169,7 @@ canonical **`v8.hop_checkpoint.v1`** brief (`CapabilityLedger` → `finalizeHopC
 ≤2 KB, opaque handles only, `nextGoal`, `targetHop`). The next assignment is seeded with
 `formatHopCheckpointForAssignment`. Rotation costs a container, never the chain.
 
-**Layer-3 verification: dual clean replay.** The worker writes a `guardian_verify.ts` script
+**Layer-3 verification: dual clean replay.** The worker writes a `kovo_verify.ts` script
 (`defineVerification` / `runVerification`). `verifyScript()` in `verify-runner.ts` runs it **twice
 from scratch** in fresh `VerifyRpcServer` sessions with fresh nonces. Confirmation requires all of:
 (1) both runs returned claims; (2) both transcript oracles passed, and stdout never counts as evidence;
@@ -304,7 +304,7 @@ rejection carries `failedStage`, `rejectedBy` and `missingEvidence`, which feed 
 | `src/server/worker-backend.ts` | 1837 | Docker lifecycle, warm pool, typed job schemas | `WorkerBackend`, `WorkerSession` (`exec`, `runScript`), `WarmWorkerPool`, `workerContainerCreateArgs`, `installLiveExitHooks` |
 | `src/server/lab-runner.ts` | 1726 | Local lab target lifecycle and patching | `LabRunner`, `assertLocalLabAllowed`, `applyUnifiedDiffToDirectory`, `bindLabSignalHooks` |
 | `worker/bridge.ts` | 1772 | In-container tool bridge: SAST/SCA/secret scan, AST verify, call graph, offline scripts | `runSastScan`, `runOfflineScript`, `runVerifyScript`, `maskSecretValue` |
-| `worker/guardian_verify/guardian_verify.ts` | 882 | Zero-dep TS verification SDK (Node builtins only) | `defineVerification`, `runVerification`, `sealCapability`, claim types (`StatusClaim` … `CompositeReceiptClaim`) |
+| `worker/kovo_verify/kovo_verify.ts` | 882 | Zero-dep TS verification SDK (Node builtins only) | `defineVerification`, `runVerification`, `sealCapability`, claim types (`StatusClaim` … `CompositeReceiptClaim`) |
 
 **Custody flow (the core v8 trick).** `RequestBroker.executeHttp` calls `req.onRawResponse({ body, headers })`
 *inside the host* before redaction (`broker.ts` ~L3464; wrapped in `try` so a host hook can't abort
@@ -321,7 +321,7 @@ Vault hardening (`derived-custody.ts`): handle regex validation, run-ID binding 
 **Single `LabRunner`.** `Execution` takes `options.labRunner ?? new LabRunner()`. One process-level owner of lab
 containers means signal hooks, reclaim and run records (`writeLabRunRecord`) never race each other.
 
-**`guardian_verify` SDK.** It is TypeScript-only (`guardian_verify.ts`). `guardian_verify.py` is still in the tree
+**`kovo_verify` SDK.** It is TypeScript-only (`kovo_verify.ts`). `kovo_verify.py` is still in the tree
 but is being retired. Both SDKs are thin clients, and the authoritative semantics live in `verify-prove-handlers.ts`,
 so retiring the Python SDK removes code without changing behavior.
 
@@ -429,8 +429,8 @@ Each row: the invariant, where it is enforced, and the failure it prevents.
 | Debt | Current state | Why it matters | Direction |
 |---|---|---|---|
 | **Dual receipt primitives** | `proof-receipt.ts` (1759 LOC, single-finding `ProofReceipt`) sits next to `composite-receipt.ts` (748 LOC). `singleReceiptToComposite` bridges them, and `composite-receipt` imports `proof-receipt` | Two confirmation vocabularies, and two places to get a rule subtly wrong | Make `CompositeProofReceipt` (hop count 1) the only primitive. Keep `verifyReceipt` as a thin adapter, then delete it |
-| **Legacy `DeclarativeReplaySpec` / `proof-tools.ts`** | `src/replay-spec.ts` (900) + `proof-tools.ts` (1319) are still referenced across `exec-*`, `agent-*` and `deterministic-engine.ts`. `assertNotRecipeWiredLegacyCall` guards recipe-wired classes | A second, less expressive proof path the model can fall back to | Route all agentic proofs through `guardian_verify` scripts. Keep declarative specs only as a floor-internal format, then retire |
-| **Python SDK** | `guardian_verify.py` (796) still in tree, and the `verify-prove-handlers.ts` header still names it | Parity tax on every new op | Delete it once the TS-only migration lands. No host change is needed |
+| **Legacy `DeclarativeReplaySpec` / `proof-tools.ts`** | `src/replay-spec.ts` (900) + `proof-tools.ts` (1319) are still referenced across `exec-*`, `agent-*` and `deterministic-engine.ts`. `assertNotRecipeWiredLegacyCall` guards recipe-wired classes | A second, less expressive proof path the model can fall back to | Route all agentic proofs through `kovo_verify` scripts. Keep declarative specs only as a floor-internal format, then retire |
+| **Python SDK** | `kovo_verify.py` (796) still in tree, and the `verify-prove-handlers.ts` header still names it | Parity tax on every new op | Delete it once the TS-only migration lands. No host change is needed |
 | **`verify-rpc.ts` size** | Still 2299 LOC after the 4-way split. It owns transport, injection, capability/crypto/async ops and composite verify | The trust boundary is the code we most want to be small and auditable | Extract capability/crypto/async handlers behind a `ProveHandlerHost`-style seam |
 | **`oracle-invariants` ↔ `v8-oracle-families` cycle** | A barrel re-export at the bottom of `oracle-invariants.ts` (~L2950) plus a value import back from `v8-oracle-families.ts` | ESM tolerates it, but load order becomes significant, and it is the one runtime cycle in the kernel | Move `ROLE_RANK` / `normalizeRole` into a pure `oracle-roles` leaf, or drop the barrel re-export |
 | **Static concurrency** | Worker concurrency is configured, not adaptive. The model gate in `benchmark-agentic-matrix.ts` has 429 AIMD, but the product scheduler doesn't | Under-uses headroom on fast providers, thrashes on slow ones | Dynamic AIMD on provider stall/429 signals inside `exec-dispatch` |

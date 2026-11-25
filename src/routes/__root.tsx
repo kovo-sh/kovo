@@ -47,7 +47,7 @@ function Shell() {
   return <AppShell data={data}><Outlet /></AppShell>
 }
 
-const THEME_BOOT_SCRIPT = `(function(){try{var s=localStorage.getItem('guardian-appearance');var a=(s==='dark'||s==='light'||s==='system')?s:'light';document.documentElement.dataset.appearance=a;var d=a==='dark'||(a==='system'&&window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);document.documentElement.dataset.theme=d?'dark':'light';}catch(e){}})();`
+const THEME_BOOT_SCRIPT = `(function(){try{var s=localStorage.getItem('kovo-appearance');var a=(s==='dark'||s==='light'||s==='system')?s:'light';document.documentElement.dataset.appearance=a;var d=a==='dark'||(a==='system'&&window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);document.documentElement.dataset.theme=d?'dark':'light';}catch(e){}})();`
 
 function Document({ children }: { children: ReactNode }) {
   return <html lang="en" data-appearance="light" data-theme="light">

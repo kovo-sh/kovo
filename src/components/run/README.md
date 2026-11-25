@@ -26,7 +26,7 @@ before adding a view, an inspector or a cross-link.
 - `coordinator.tsx`: the **Board** (v5 swarm message board), shown in the pane when nothing is selected,
   on Overview and Report, or after C / the Board button in any inspector header. It holds the roster,
   pinned Tier 3 approvals, kind and handle filters, and a timeline that merges board posts with the
-  coordinator thread. Coordinator and Guardian replies are not posted to the board; operator messages
+  coordinator thread. Coordinator and Kovo Hunter replies are not posted to the board; operator messages
   are mirrored onto it by the server. Plain text sends `message`; text with @mentions sends `board_post`.
 
 ## Rules that are easy to break
@@ -34,7 +34,7 @@ before adding a view, an inspector or a cross-link.
 - **Mutations**: only `send()` from `useRun()`. Anything irreversible goes through the decision store
   or `toast.undoable` (the command is sent when the 6 s undo window closes; Undo sends nothing).
 - **Local-only state must say so.** There is no server API for accepting, dismissing or marking a
-  finding as a false positive, so that triage lives in `localStorage` (`guardian-queue:<runId>`), and
+  finding as a false positive, so that triage lives in `localStorage` (`kovo-queue:<runId>`), and
   every place that shows it says "saved in this browser only". Follow-ups on finished runs are local
   for the same reason.
 - **Capped data must say so.** `detail.exchangesSummary` holds the newest 500 exchanges; true totals are
@@ -50,7 +50,7 @@ before adding a view, an inspector or a cross-link.
 
 ## Verifying changes
 
-- `npm run check`, then `npm run build` and `PORT=<port> GUARDIAN_DATA_DIR=<a private copy of a data dir> npm start`.
+- `npm run check`, then `npm run build` and `PORT=<port> KOVO_DATA_DIR=<a private copy of a data dir> npm start`.
 - In Playwright scripts, intercept every non-GET request (`context.route('**/*', …)`), fulfil it with a
   mock, and assert the payload. Never let approve, resume, consent, retest, cancel or message reach a
   real server.

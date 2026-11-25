@@ -225,7 +225,7 @@ export function Disclosure({ title, right, defaultOpen = false, children }: {
     <CollapsiblePrimitive.Trigger
       className="group flex min-h-[34px] w-full cursor-pointer items-center gap-1.5 rounded-none border-0 bg-transparent px-0 py-1.5 text-left text-[12px] font-medium text-fg-muted shadow-none transition-colors duration-[var(--d1)] hover:bg-transparent hover:text-fg"
     >
-      <Icon name="chev" className="-rotate-90 text-fg-subtle transition-transform duration-[var(--d2)] ease-guardian group-data-[panel-open]:rotate-0 group-data-[panel-open]:text-fg-muted" />
+      <Icon name="chev" className="-rotate-90 text-fg-subtle transition-transform duration-[var(--d2)] ease-kovo group-data-[panel-open]:rotate-0 group-data-[panel-open]:text-fg-muted" />
       <span>{title}</span>
       {right != null && <span className="ml-auto text-[11.5px] font-normal text-fg-subtle">{right}</span>}
     </CollapsiblePrimitive.Trigger>

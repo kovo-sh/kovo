@@ -18,7 +18,7 @@ export function DisclosureTrigger({ className, children, ...props }: Collapsible
       data-slot="disclosure-trigger"
       className={cn(
         'group flex h-auto w-full cursor-pointer items-center gap-2 rounded-control border-0 bg-transparent px-2 py-1.5 text-left font-sans text-[12.5px] font-medium text-fg shadow-none',
-        'transition-colors duration-[var(--d1)] ease-guardian hover:bg-hover',
+        'transition-colors duration-[var(--d1)] ease-kovo hover:bg-hover',
         className,
       )}
       {...props}
@@ -26,7 +26,7 @@ export function DisclosureTrigger({ className, children, ...props }: Collapsible
       {children}
       <svg
         data-slot="disclosure-chevron"
-        className="ms-auto size-3 flex-none text-fg-subtle transition-transform duration-150 ease-guardian group-data-[panel-open]:rotate-180"
+        className="ms-auto size-3 flex-none text-fg-subtle transition-transform duration-150 ease-kovo group-data-[panel-open]:rotate-180"
         viewBox="0 0 12 12"
         fill="none"
         aria-hidden="true"

@@ -12,7 +12,7 @@ export { cn }
  * so ghost / link / primary / ink buttons never inherit legacy chrome.
  */
 export const runBtn = cva(
-  'inline-flex cursor-pointer items-center justify-center whitespace-nowrap border-0 font-sans font-medium transition-[background-color,color,box-shadow,transform,filter] duration-[var(--d1)] ease-guardian active:scale-[.98] disabled:cursor-default disabled:opacity-50 disabled:active:scale-100',
+  'inline-flex cursor-pointer items-center justify-center whitespace-nowrap border-0 font-sans font-medium transition-[background-color,color,box-shadow,transform,filter] duration-[var(--d1)] ease-kovo active:scale-[.98] disabled:cursor-default disabled:opacity-50 disabled:active:scale-100',
   {
     variants: {
       variant: {
@@ -45,7 +45,7 @@ export type RunBtnProps = VariantProps<typeof runBtn>
 
 /** Toolbar icon button (ghost, quiet muted color, 28px square by default). */
 export const runIconBtn = cva(
-  'inline-flex cursor-pointer items-center justify-center gap-1.5 whitespace-nowrap rounded-control border-0 bg-transparent font-sans font-normal text-fg-subtle shadow-none transition-[background-color,color] duration-[var(--d1)] ease-guardian hover:bg-hover hover:text-fg disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-fg-subtle',
+  'inline-flex cursor-pointer items-center justify-center gap-1.5 whitespace-nowrap rounded-control border-0 bg-transparent font-sans font-normal text-fg-subtle shadow-none transition-[background-color,color] duration-[var(--d1)] ease-kovo hover:bg-hover hover:text-fg disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-fg-subtle',
   {
     variants: {
       size: {
@@ -68,7 +68,7 @@ export const runIconBtn = cva(
 
 /** Dropdown / popover menu item. */
 export const runDdItem = cva(
-  'flex h-[30px] w-full cursor-pointer items-center gap-2 whitespace-nowrap rounded-control border-0 bg-transparent px-2 text-left font-sans text-[12.5px] font-normal shadow-none transition-[background-color,color] duration-[var(--d1)] ease-guardian hover:bg-hover hover:text-fg disabled:cursor-default disabled:opacity-45 disabled:hover:bg-transparent',
+  'flex h-[30px] w-full cursor-pointer items-center gap-2 whitespace-nowrap rounded-control border-0 bg-transparent px-2 text-left font-sans text-[12.5px] font-normal shadow-none transition-[background-color,color] duration-[var(--d1)] ease-kovo hover:bg-hover hover:text-fg disabled:cursor-default disabled:opacity-45 disabled:hover:bg-transparent',
   {
     variants: {
       active: {
