@@ -10,6 +10,7 @@ import { runLabel, short } from '../run/format.ts'
 import { StatusGlyph } from '../run/glyphs.tsx'
 import { Icon } from '../run/icons.tsx'
 import { runStatusLabel } from '../run/meta.ts'
+import { DevicesIcon, DevicesSessionModal } from '../settings/DevicesSessionModal.tsx'
 import { GlobalHelpSheet, GlobalPalette } from './GlobalPalette.tsx'
 import type { PoolHealth, ShellWorkspaceData } from './GlobalPalette.tsx'
 
@@ -67,6 +68,7 @@ interface ShellContextApi {
   openPalette: (prefill?: string) => void
   closePalette: () => void
   openHelp: () => void
+  openDevices: () => void
   openNewProject: () => void
   registerNewProjectHandler: (fn: (() => void) | null) => void
   theme: 'light' | 'dark'
@@ -100,11 +102,13 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
   const { theme, toggle: toggleTheme } = useShellTheme()
   const [palette, setPalette] = useState<{ open: boolean; prefill: string }>({ open: false, prefill: '' })
   const [helpOpen, setHelpOpen] = useState(false)
+  const [devicesOpen, setDevicesOpen] = useState(false)
   const newProjectHandlerRef = useRef<(() => void) | null>(null)
   const chordRef = useRef<{ key: string; at: number } | null>(null)
 
   const openPalette = useCallback((prefill = '') => {
     setHelpOpen(false)
+    setDevicesOpen(false)
     setPalette({ open: true, prefill })
   }, [])
 
@@ -114,7 +118,18 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
 
   const openHelp = useCallback(() => {
     setPalette(s => ({ ...s, open: false }))
+    setDevicesOpen(false)
     setHelpOpen(true)
+  }, [])
+
+  const openDevices = useCallback(() => {
+    setPalette(s => ({ ...s, open: false }))
+    setHelpOpen(false)
+    setDevicesOpen(true)
+  }, [])
+
+  const closeDevices = useCallback(() => {
+    setDevicesOpen(false)
   }, [])
 
   const registerNewProjectHandler = useCallback((fn: (() => void) | null) => {
@@ -134,6 +149,7 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault()
         setHelpOpen(false)
+        setDevicesOpen(false)
         setPalette(s => ({ open: !s.open, prefill: '' }))
         return
       }
@@ -142,7 +158,7 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
         if (helpOpen) { e.preventDefault(); setHelpOpen(false); return }
         return
       }
-      if (palette.open || helpOpen) return
+      if (palette.open || helpOpen || devicesOpen) return
       if (e.metaKey || e.ctrlKey || e.altKey) return
       if (isEditableTarget(e.target)) return
 
@@ -184,7 +200,7 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [palette.open, helpOpen, navigate, toggleTheme, openNewProject])
+  }, [palette.open, helpOpen, devicesOpen, navigate, toggleTheme, openNewProject])
 
   const groupedRecent = useMemo(() => {
     const groups: { projectId: string; projectName: string; runs: ShellWorkspaceData['recentRuns'] }[] = []
@@ -205,12 +221,13 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
     openPalette,
     closePalette,
     openHelp,
+    openDevices,
     openNewProject,
     registerNewProjectHandler,
     theme,
     toggleTheme,
     data,
-  }), [openPalette, closePalette, openHelp, openNewProject, registerNewProjectHandler, theme, toggleTheme, data])
+  }), [openPalette, closePalette, openHelp, openDevices, openNewProject, registerNewProjectHandler, theme, toggleTheme, data])
 
   const isProjectsActive = pathname === '/' || pathname.startsWith('/projects/')
   const isSettingsActive = pathname === '/settings' || pathname.startsWith('/settings/')
@@ -294,6 +311,22 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
             </div>)}
         </div>
 
+        <div className="sh-rail-session">
+          <button
+            type="button"
+            className="sh-session-chip"
+            onClick={openDevices}
+            aria-haspopup="dialog"
+            aria-expanded={devicesOpen}
+            title="Devices & local session — pair another browser or phone"
+          >
+            <DevicesIcon />
+            <span className="sh-session-label">Local session</span>
+            <span className="sh-session-hint">Pair device</span>
+            <Icon name="chevR" className="sh-session-chev" />
+          </button>
+        </div>
+
         <div className="sh-rail-foot">
           <button
             type="button"
@@ -326,10 +359,12 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
       onClose={closePalette}
       onOpenNewProject={openNewProject}
       onOpenHelp={openHelp}
+      onOpenDevices={openDevices}
       theme={theme}
       toggleTheme={toggleTheme}
       data={data}
     />
     <GlobalHelpSheet open={helpOpen} onClose={() => setHelpOpen(false)} />
+    {devicesOpen && <DevicesSessionModal onClose={closeDevices} />}
   </ShellContext.Provider>
 }
