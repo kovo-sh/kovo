@@ -181,7 +181,7 @@ test('guardian_verify rejects a call with neither script nor scriptPath', async 
   assert.ok(tool)
   const result = await invoke(tool!, {})
   assert.equal(result.isError, true)
-  assert.match(textOf(result), /provide `script` .* or `scriptPath`/i)
+  assert.match(textOf(result), /provide .*`script`.*or .*`scriptPath`/i)
 })
 
 test('guardian_verify downgrades a handler claim that is not backed by oracle attempts', () => {

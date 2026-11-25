@@ -1022,14 +1022,23 @@ export function settlementSpecDirective(route?: SpecRouteEvidence): string {
  * complete_intent repair message for a leaning conclusion with route evidence but no spec and no
  * coded proof gap. Names the exact missing field so the next turn is a one-shot repair.
  */
-export function specSubmissionRequiredMessage(route?: SpecRouteEvidence): string {
+export function specSubmissionRequiredMessage(
+  route?: SpecRouteEvidence,
+  options?: { hasGuardianVerify?: boolean },
+): string {
   const routeText = route ? ` for ${route.method} ${route.path}${route.params.length ? ` param=${route.params.join('|')}` : ''}` : ''
   const codes = SPEC_PROOF_GAP_CODES.join(', ')
   const routeArg = route ? `, route="${route.method} ${route.path}"` : ''
+  const scriptOnly = options?.hasGuardianVerify === true
+  const missingArtifact = scriptOnly ? 'a submitted guardian_verify proof' : 'a submitted replay spec'
+  const submissionLabel = scriptOnly ? 'guardian_verify' : 'guardian_verify/verify_replay_spec'
+  const repairProof = scriptOnly
+    ? `call guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")${routeText}`
+    : `call guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")${routeText} (or verify_replay_spec with DeclarativeReplaySpec: ${GUARDIAN_VERIFY_SPEC_SHAPE})`
   return [
-    `complete_intent rejected (agent.spec_submission_required): missing required field \`proofGapReason\` or a submitted replay spec${routeText}.`,
-    `You probed a route but never submitted a guardian_verify/verify_replay_spec result covering it, so a proved/partial conclusion is unsupported. Each probed route owes its own proof; a gap on another route does not discharge this one.`,
-    `Repair now: call guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")${routeText} (or verify_replay_spec with DeclarativeReplaySpec: ${GUARDIAN_VERIFY_SPEC_SHAPE}), or call record_coverage(status="needs_follow_up"${routeArg}, proofGapReason="<code>") with one machine-readable code from: ${codes}.`,
+    `complete_intent rejected (agent.spec_submission_required): missing required field \`proofGapReason\` or ${missingArtifact}${routeText}.`,
+    `You probed a route but never submitted a ${submissionLabel} result covering it, so a proved/partial conclusion is unsupported. Each probed route owes its own proof; a gap on another route does not discharge this one.`,
+    `Repair now: ${repairProof}, or call record_coverage(status="needs_follow_up"${routeArg}, proofGapReason="<code>") with one machine-readable code from: ${codes}.`,
     'If the hypothesis genuinely cannot be proven, complete_intent(status="blocked") is accepted with a concise reason.',
   ].join(' ')
 }
@@ -1042,12 +1051,17 @@ export function specSubmissionRequiredMessage(route?: SpecRouteEvidence): string
 export function gapValidationRejectedMessage(
   rejected: readonly RejectedProofGap[],
   route?: SpecRouteEvidence,
+  options?: { hasGuardianVerify?: boolean },
 ): string {
   const evidence = rejected.map(gap => `- ${gap.code} on ${gap.key}: missing ${gap.missing}`).join('; ')
   const routeText = route ? ` for ${route.method} ${route.path}` : ''
+  const scriptOnly = options?.hasGuardianVerify === true
+  const repairProof = scriptOnly
+    ? `call guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")${routeText}`
+    : `call guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")${routeText} (or verify_replay_spec with DeclarativeReplaySpec: ${GUARDIAN_VERIFY_SPEC_SHAPE})`
   return [
     `complete_intent rejected (agent.gap_validation): the coded proof gap is not supported by the recorded Layer-1 exchange transcript (${evidence}).`,
-    `Repair now: call guardian_verify(script="<inline TS/Python using ctx.prove_*>", runtime="ts")${routeText} (or verify_replay_spec with DeclarativeReplaySpec: ${GUARDIAN_VERIFY_SPEC_SHAPE}), or probe the route to record the missing exchange and re-record the proof gap with the same route.`,
+    `Repair now: ${repairProof}, or probe the route to record the missing exchange and re-record the proof gap with the same route.`,
     'Each route gap is validated once per assignment: a repeated unsupported gap will not block completion again. complete_intent(status="blocked") remains accepted.',
   ].join(' ')
 }
@@ -1360,20 +1374,15 @@ export function summarizeGuardianVerifyOutcome(value: unknown): GuardianVerifyTo
 
 
 const PROPOSE_CHAIN_FINDING_LEGACY_SCHEMAS = [
-  "Submit a candidate (pending) finding with mandatory counterevidence, confidenceRationale, and a strict DeclarativeReplaySpec for Zero-LLM Replay Verification (http_chain, browser_chain, race_burst, rce_proof, sql_boolean_diff, static_ast_proof, auth_protocol_proof, cache_differential, sql_time_diff; retired legacy kinds dns_takeover, tls_audit, browser_dom, ws_chain, upload_probe fail closed).",
+  "Submit a candidate (pending) finding with mandatory counterevidence, confidenceRationale, and a strict DeclarativeReplaySpec for Zero-LLM Replay Verification (http_chain, browser_chain, race_burst, rce_proof, sql_boolean_diff, static_ast_proof, auth_protocol_proof, cache_differential, sql_time_diff).",
   "NOTE: static_ast_proof promotes ONLY to status=\"static_verified\" (never runtime \"confirmed\"). If submission deduplication detects a duplicate of an existing finding, call update_proposed_finding(findingId) instead.",
   "assertionsJq runs against /evidence/replay-results.json and MUST emit { \"confirmed\": boolean, \"controlPassed\": boolean, \"observed\": string, \"expected\": string } where observed and expected are concise STRINGS.",
   "Exact /evidence/replay-results.json schema by kind:",
   "- http_chain: { steps: { \"<stepId>\": { id, role, status, headers (lowercase), mediaType, body, bodyPreview, json? } }, control, probe, extractedVars, spaCatchall? }.",
-  "- dns_takeover: { targetOrigin, dns: { hostname, cname, a, aaaa, nxdomain }, http: { status, headers, body } | null, httpError, analysis: { likelyTakeover, danglingNoIp, matchedProviders } }.",
-  "- tls_audit: { targetOrigin, tls: { protocol, cipher, authorized, validTo, subject, issuer, sans } }.",
-  "- browser_dom: { targetOrigin, checkKind, canaryToken, control, probe }.",
   "- browser_chain (2..8 steps; actions: navigate|dom_check|postmessage_probe|same_site_fetch|redirect_observe|fill|click|select_option|wait_for_selector|wait_for_xhr|evaluate_builtin|dom_xss_sink_hook): { kind, origin, replayedAt, canaryToken, steps, pages, consoleMessages, requests, domSinkTraces, control, probe, spaCatchall? }.",
   "- race_burst (Tier 2/3 synchronized burst 2..10): { kind, origin, replayedAt, control, burst: { summary: { total, statuses, statusCounts, distinctBodies, minDurationMs, maxDurationMs, spreadMs }, results }, postCheck, extractedVars }.",
   "- rce_proof (Tier 3 non-destructive dynamic_math|split_echo|oob_canary): { proofMode, control, probe, proof: { cryptographicProofPassed, ... } }.",
   "- sql_boolean_diff (3 fresh unseen random (k=k)/(k=k+1) triplets across query|json|form|path|header|xml|graphql_var): { kind, targetOrigin, paramName, quoteStyle, sqlDiff: { passed, controlPassed, thresholds, rounds: [{ round, k, similarityBaselineTrue, similarityTrueFalse, statusDivergence, pass, baseline, true, false }] }, control, probe }.",
-  "- ws_chain (2..8 brokered WebSocket steps with >=1 control & >=1 probe): { kind, origin, steps: { \"<stepId>\": { id, role, status, connected, upgradeStatus, upgradeHeaders, subprotocol, originHeader, persona, sentFrames, receivedFrames, messages, firstMessage, body, json?, closeCode, closeReason, error } }, control?, probe? }.",
-  "- upload_probe (Tier 3 / local-lab benign {{upload_nonce}} upload + fetch + optional cleanup): { kind, origin, uploadNonce, steps, extractedVars, uploadProof: { nonceInFetchBody, fetchStatus, fetchContentType, contentDisposition, hasAttachmentDisposition, unsafeInlineRender, controlLeak }, control?, probe }.",
   "- static_ast_proof (deterministic offline opengrep/ast-grep re-run over RO /repos -> static_verified tier ONLY): { kind, repo, file, startLine, endLine, engine, ruleOrPattern, sourceToSinkTrace, runtimeProofGap, verificationTier, astVerify, static: { verified, matchCount, matchedLines, controlPassed } }.",
   "- auth_protocol_proof (JWT authMutation or OAuth/OIDC protocol differential): { kind, protocol, steps: { \"<stepId>\": { id, role, status, headers, body, bodyPreview, json? } }, control, probe, canaryProof?, extractedVars, spaCatchall? }.",
   "- cache_differential (requires distinct ?_gcb= tokens on controlPath and probePath): { kind, targetOrigin, mode, control, probe, verify, steps: { control, probe, verify }, cacheProof: { cacheHitObserved, poisonPersistedToVictim, simControlVsVerify, simProbeVsVerify, age } }.",
@@ -1388,14 +1397,14 @@ const PROPOSE_CHAIN_FINDING_LEGACY_SCHEMAS = [
 export function proposeChainFindingDescription(hasGuardianVerify: boolean, allowLegacyReplaySpec = false): string {
   if (hasGuardianVerify && !allowLegacyReplaySpec) {
     return [
-      "[LEGACY FALLBACK — `guardian_verify` is active in this session. For runtime vulnerabilities, call `guardian_verify(script=\"<inline TS/Python using ctx.prove_*>\", runtime=\"ts\")` instead of proposing `http_chain` specs so findings persist a verified ProofReceipt (`proof_kind=\"agent_script\"`). Use `propose_chain_finding` ONLY for `static_ast_proof` or when `guardian_verify` is unavailable.]",
+      "[LEGACY FALLBACK — `guardian_verify` is active in this session. For runtime vulnerabilities, call `guardian_verify(script=\"<inline TS/Python using ctx.prove_*>\", runtime=\"ts\")` instead of proposing runtime replay specs so findings persist a verified ProofReceipt (`proof_kind=\"agent_script\"`). Use `propose_chain_finding` ONLY for `static_ast_proof` or when `guardian_verify` is unavailable.]",
       "Submit a static-AST source-to-sink finding with mandatory counterevidence, confidenceRationale, and replaySpec.kind=\"static_ast_proof\" (promotes ONLY to status=\"static_verified\", never runtime \"confirmed\").",
       "- static_ast_proof (deterministic offline opengrep/ast-grep re-run over RO /repos -> static_verified tier ONLY): { kind, repo, file, startLine, endLine, engine, ruleOrPattern, sourceToSinkTrace, runtimeProofGap, verificationTier, astVerify, static: { verified, matchCount, matchedLines, controlPassed } }.",
     ].join(" ")
   }
   return [
     ...(hasGuardianVerify ? [
-      "[LEGACY FALLBACK — `guardian_verify` is active in this session. For runtime vulnerabilities, call `guardian_verify(script=\"<inline TS/Python using ctx.prove_*>\", runtime=\"ts\")` instead of proposing `http_chain` specs so findings persist a verified ProofReceipt (`proof_kind=\"agent_script\"`). Use `propose_chain_finding` ONLY for `static_ast_proof` or when `guardian_verify` is unavailable.]",
+      "[LEGACY FALLBACK — `guardian_verify` is active in this session. For runtime vulnerabilities, call `guardian_verify(script=\"<inline TS/Python using ctx.prove_*>\", runtime=\"ts\")` instead of proposing runtime replay specs so findings persist a verified ProofReceipt (`proof_kind=\"agent_script\"`). Use `propose_chain_finding` ONLY for `static_ast_proof` or when `guardian_verify` is unavailable.]",
     ] : []),
     ...PROPOSE_CHAIN_FINDING_LEGACY_SCHEMAS,
   ].join(" ")

@@ -2686,7 +2686,7 @@ export function buildWorkerTools(
             })
             return {
               isError: true,
-              output: [{ type: 'text' as const, text: gapValidationRejectedMessage(gapCheck.rejected, target) }],
+              output: [{ type: 'text' as const, text: gapValidationRejectedMessage(gapCheck.rejected, target, { hasGuardianVerify: hasGuardianVerify && !allowLegacyReplaySpec }) }],
             }
           }
         }
@@ -2702,7 +2702,7 @@ export function buildWorkerTools(
           })
           return {
             isError: true,
-            output: [{ type: 'text' as const, text: specSubmissionRequiredMessage(target) }],
+            output: [{ type: 'text' as const, text: specSubmissionRequiredMessage(target, { hasGuardianVerify: hasGuardianVerify && !allowLegacyReplaySpec }) }],
           }
         }
         const completion: IntentCompletion = {
