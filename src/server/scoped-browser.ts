@@ -7,6 +7,8 @@ import { scanSecondOrderMarkers } from './canary-broker.ts'
 import type { SecondOrderStore } from './canary-broker.ts'
 import { cookieRecordsFromHeader } from './persona-auth.ts'
 import { buildPersonaBrowserAttachment, personaSecrets } from './persona-vault.ts'
+import { EgressGateway } from './egress-gateway.ts'
+import type { EgressLoopbackProxy } from './egress-gateway.ts'
 import { createEgressSanitizer } from './egress-sanitizer.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
@@ -343,6 +345,8 @@ export interface ScopedBrowserOptions {
   captureWebSockets?: boolean
   /** Upper bound on simultaneously pooled per-persona contexts. Defaults to 8. */
   maxPooledContexts?: number
+  /** Optional injectable DNS resolver for deterministic EgressGateway loopback proxy tests. */
+  proxyResolveHost?: (hostname: string) => Promise<string[]>
 }
 
 const maxBrowserTimeoutMs = 30_000
@@ -390,14 +394,16 @@ export interface ChromiumLaunchOptions {
 
 /**
  * Sandboxing is on by default. Target JavaScript must not be able to reach loopback/LAN/metadata
- * directly: resolver rules fail closed for every non-brokered name, and WebRTC's non-proxied UDP
- * paths are disabled. HTTP is still fulfilled through Playwright's request interception.
+ * directly: resolver rules fail closed for every non-proxy name (allowing only the host loopback
+ * `EgressGateway` proxy on `127.0.0.1`), `--proxy-bypass-list=<-loopback>` prevents Chromium from
+ * bypassing the proxy for localhost/127.0.0.1 targets, and WebRTC/QUIC UDP paths are disabled.
  */
 export function chromiumLaunchArgs(options: ChromiumLaunchOptions = {}): string[] {
   const args = [
     '--disable-dev-shm-usage',
     '--disable-background-networking',
-    '--host-resolver-rules=MAP * ~NOTFOUND',
+    '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1',
+    '--proxy-bypass-list=<-loopback>',
     '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
     '--webrtc-ip-handling-policy=disable_non_proxied_udp',
     // WebTransport is HTTP/3 over UDP: it bypasses HTTP interception and the WebRTC flags.
@@ -1041,7 +1047,7 @@ interface PooledVisitState {
 function normalizeSeedBundle(raw: unknown): BrowserSessionBundle | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   const record = raw as Record<string, unknown>
-  const hasShape = 'cookies' in record || 'localStorage' in record || 'sessionStorage' in record
+  const hasShape = 'cookies' in record || 'localStorage' in record || 'sessionStorage' in record || 'initScript' in record
   if (!hasShape) return null
   const bundle: BrowserSessionBundle = {}
   if (Array.isArray(record.cookies)) {
@@ -1155,8 +1161,22 @@ export function personaSessionBundle(grant: Grant, persona: string | undefined, 
   })
 }
 
+/** Wrap any storage hydration script so it executes ONLY when `window.location.origin === targetOrigin`. */
+export function originLockInitScript(script: string, targetOrigin: string): string {
+  const originJson = JSON.stringify(targetOrigin)
+  return `(() => {
+  try {
+    if (window.location.origin !== ${originJson}) return;
+  } catch { return; }
+  ${script}
+})();`
+}
+
 function seedStorageInitScript(bundle: BrowserSessionBundle | null, origin: string): string | null {
   if (!bundle) return null
+  if (bundle.initScript) {
+    return originLockInitScript(bundle.initScript, origin)
+  }
   const local = bundle.localStorage ?? {}
   const session = bundle.sessionStorage ?? {}
   if (Object.keys(local).length === 0 && Object.keys(session).length === 0) return null
@@ -1457,6 +1477,8 @@ export class ScopedBrowser {
   private readonly options: ScopedBrowserOptions
   private poolBrowser: PlaywrightBrowserLike | null = null
   private poolLaunch: Promise<PlaywrightBrowserLike> | null = null
+  private poolProxy: EgressLoopbackProxy | null = null
+  private poolProxyLaunch: Promise<EgressLoopbackProxy> | null = null
   private readonly pooled = new Map<string, PooledRuntime>()
   private readonly poolStats: BrowserPoolStats = {
     launches: 0, contextsCreated: 0, contextsClosed: 0, pagesCreated: 0, activeContexts: 0,
@@ -1483,6 +1505,111 @@ export class ScopedBrowser {
       })()
     }
     return await this.poolLaunch
+  }
+
+  private async ensurePoolProxy(): Promise<EgressLoopbackProxy> {
+    if (this.poolProxy) return this.poolProxy
+    if (!this.poolProxyLaunch) {
+      this.poolProxyLaunch = (async () => {
+        const proxy = await EgressGateway.createLoopbackProxy({
+          allowLocalLab: () => {
+            for (const entry of this.pooled.values()) {
+              if (entry.active && entry.activeAllowLocalLab) return true
+            }
+            return false
+          },
+          allowOrigin: (origin, method, url) => {
+            let hasActive = false
+            for (const entry of this.pooled.values()) {
+              if (!entry.active || !entry.activeGrant) continue
+              hasActive = true
+              const decision = classifyBrowserHttpRequest({
+                method: method === 'CONNECT' ? 'GET' : method,
+                url: url.href,
+                tier: entry.active.tier,
+                canRead: o => entry.activeGrant!.canRead(o),
+                allowLocalLab: entry.activeAllowLocalLab,
+                assetScope: entry.active.assetScope,
+                scopePolicy: entry.activeGrant.scopePolicy,
+              })
+              if (decision.allowed) return true
+              if (method === 'CONNECT' && entry.activeAllowLocalLab && url.protocol === 'https:') {
+                const httpDecision = classifyBrowserHttpRequest({
+                  method: 'GET',
+                  url: url.href.replace(/^https:/i, 'http:'),
+                  tier: entry.active.tier,
+                  canRead: o => entry.activeGrant!.canRead(o),
+                  allowLocalLab: entry.activeAllowLocalLab,
+                  assetScope: entry.active.assetScope,
+                  scopePolicy: entry.activeGrant.scopePolicy,
+                })
+                if (httpDecision.allowed) return true
+              }
+            }
+            return {
+              allowed: false,
+              reason: hasActive
+                ? `Browser proxy denied out-of-scope origin "${origin}".`
+                : 'Browser proxy denied request without an active visit grant.',
+            }
+          },
+          ...(this.options.proxyResolveHost ? { resolveHost: this.options.proxyResolveHost } : {}),
+          onDenied: event => {
+            for (const entry of this.pooled.values()) {
+              if (!entry.active || !entry.activeGrant) continue
+              if (event.origin) entry.active.blockedOrigins.add(event.origin)
+              try { entry.activeGrant.audit('denied', event.origin || event.url) } catch { /* ignore */ }
+            }
+          },
+        })
+        this.poolProxy = proxy
+        return proxy
+      })()
+    }
+    return await this.poolProxyLaunch
+  }
+
+  private async createVisitLoopbackProxy(params: {
+    grant: Grant
+    tier: number
+    allowLocalLab: boolean
+    assetScope?: AssetOriginScope
+    getBlockedOrigins: () => Set<string>
+  }): Promise<EgressLoopbackProxy> {
+    const { grant, tier, allowLocalLab, assetScope, getBlockedOrigins } = params
+    return await EgressGateway.createLoopbackProxy({
+      allowLocalLab,
+      allowOrigin: (origin, method, url) => {
+        const decision = classifyBrowserHttpRequest({
+          method: method === 'CONNECT' ? 'GET' : method,
+          url: url.href,
+          tier,
+          canRead: o => grant.canRead(o),
+          allowLocalLab,
+          assetScope,
+          scopePolicy: grant.scopePolicy,
+        })
+        if (decision.allowed) return true
+        if (method === 'CONNECT' && allowLocalLab && url.protocol === 'https:') {
+          const httpDecision = classifyBrowserHttpRequest({
+            method: 'GET',
+            url: url.href.replace(/^https:/i, 'http:'),
+            tier,
+            canRead: o => grant.canRead(o),
+            allowLocalLab,
+            assetScope,
+            scopePolicy: grant.scopePolicy,
+          })
+          if (httpDecision.allowed) return true
+        }
+        return { allowed: false, reason: decision.reason ?? `Browser proxy denied origin "${origin}".` }
+      },
+      ...(this.options.proxyResolveHost ? { resolveHost: this.options.proxyResolveHost } : {}),
+      onDenied: event => {
+        if (event.origin) getBlockedOrigins().add(event.origin)
+        try { grant.audit('denied', event.origin || event.url) } catch { /* ignore */ }
+      },
+    })
   }
 
   private assetScopeFor(req: BrowserVisitRequest): AssetOriginScope | undefined {
@@ -1544,11 +1671,13 @@ export class ScopedBrowser {
       }
     }
 
+    const poolProxy = await this.ensurePoolProxy()
     const context = await browser.newContext({
       ignoreHTTPSErrors: false,
       javaScriptEnabled: true,
       bypassCSP: false,
       serviceWorkers: 'block',
+      proxy: poolProxy.proxyConfig,
       userAgent: 'KovoHunter/6 pooled scoped inspector',
     })
     this.poolStats.contextsCreated += 1
@@ -1573,7 +1702,7 @@ export class ScopedBrowser {
       allowLocalLab: () => runtime.activeAllowLocalLab,
       audit: (decision, origin) => { runtime.activeGrant?.audit(decision, origin) },
     })
-    const storageSeed = bundle?.initScript ?? seedStorageInitScript(bundle, initialOrigin)
+    const storageSeed = seedStorageInitScript(bundle, initialOrigin)
     if (storageSeed) await context.addInitScript(storageSeed)
 
     await context.route('**/*', async route => {
@@ -1966,6 +2095,11 @@ export class ScopedBrowser {
       this.poolBrowser = null
       this.poolLaunch = null
     }
+    if (this.poolProxy) {
+      await this.poolProxy.close().catch(() => undefined)
+      this.poolProxy = null
+      this.poolProxyLaunch = null
+    }
   }
 
 
@@ -2053,6 +2187,15 @@ export class ScopedBrowser {
     const consoleMessages: Array<{ type: 'error' | 'warning'; text: string }> = []
     const xhrWaiters: Array<(rec: BrowserXhrRecord) => void> = []
 
+    const bundle = req.sessionBundle ? normalizeSeedBundle(req.sessionBundle) : null
+    if (bundle) secrets.push(...collectBundleSecrets(bundle))
+    const loopbackProxy = await this.createVisitLoopbackProxy({
+      grant,
+      tier,
+      allowLocalLab,
+      assetScope: this.assetScopeFor(req),
+      getBlockedOrigins: () => blockedOrigins,
+    })
     const browser = await (this.options.launchBrowser ? this.options.launchBrowser() : launchChromium())
     let context: PlaywrightContext | undefined
     let page: PlaywrightPage | undefined
@@ -2064,6 +2207,7 @@ export class ScopedBrowser {
       await page?.close().catch(() => undefined)
       await context?.close().catch(() => undefined)
       await browser.close().catch(() => undefined)
+      await loopbackProxy.close().catch(() => undefined)
     }
 
     const onAbort = () => { void forceClose() }
@@ -2076,6 +2220,7 @@ export class ScopedBrowser {
         javaScriptEnabled: true,
         bypassCSP: false,
         serviceWorkers: 'block',
+        proxy: loopbackProxy.proxyConfig,
         userAgent: 'KovoHunter/3 scoped headless inspector',
       })
       await context.addInitScript(postMessageInstrumentationScript)
@@ -2085,6 +2230,9 @@ export class ScopedBrowser {
         allowLocalLab,
         audit: (decision, origin) => grant.audit(decision, origin),
       })
+      const storageSeed = seedStorageInitScript(bundle, initialOrigin)
+      if (storageSeed) await context.addInitScript(storageSeed)
+      await hydrateContextSession(context, bundle, initialOrigin)
 
       const shouldInstallSinkHook = Boolean(
         req.enableSinkHook ||
@@ -2802,6 +2950,13 @@ export class ScopedBrowser {
 
     const allowLocalLab = Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
     const secondOrderStorage = this.options.storage ?? grant.storage ?? this.broker.getStorage()
+    let stepBlockedOrigins = new Set<string>()
+    const loopbackProxy = await this.createVisitLoopbackProxy({
+      grant,
+      tier,
+      allowLocalLab,
+      getBlockedOrigins: () => stepBlockedOrigins,
+    })
     const browser = await (this.options.launchBrowser ? this.options.launchBrowser() : launchChromium())
 
     let context: PlaywrightContext | undefined
@@ -2814,6 +2969,7 @@ export class ScopedBrowser {
       await page?.close().catch(() => undefined)
       await context?.close().catch(() => undefined)
       await browser.close().catch(() => undefined)
+      await loopbackProxy.close().catch(() => undefined)
     }
 
     const onAbort = () => { void forceClose() }
@@ -2836,7 +2992,6 @@ export class ScopedBrowser {
       let stepXhrRequests: BrowserXhrRecord[] = []
       let stepAllRequests: BrowserXhrRecord[] = []
       let stepXhrBodyBudget = { chars: 0 }
-      let stepBlockedOrigins = new Set<string>()
       let stepConsoleMessages: Array<{ type: 'error' | 'warning'; text: string }> = []
       const xhrWaiters: Array<(rec: BrowserXhrRecord) => void> = []
 
@@ -2921,6 +3076,7 @@ export class ScopedBrowser {
             javaScriptEnabled: true,
             bypassCSP: false,
             serviceWorkers: 'block',
+            proxy: loopbackProxy.proxyConfig,
             userAgent: 'KovoHunter/4 scoped headless session inspector',
           })
           await context.addInitScript(postMessageInstrumentationScript)

@@ -1,10 +1,15 @@
 import type { PersonaLoginAdapter, PersonaLoginConfig } from '../domain.ts'
 import { createHmac } from 'node:crypto'
-import { lookup } from 'node:dns/promises'
-import { request as httpRequest } from 'node:http'
-import type { IncomingHttpHeaders } from 'node:http'
-import { request as httpsRequest } from 'node:https'
-import ipaddr from 'ipaddr.js'
+import {
+  EgressDeniedError,
+  EgressGateway,
+  classifyAddress,
+  createPinnedLookup,
+  defaultResolveHost,
+  isLoopbackLiteral,
+  warnIfEnvProxyEnabled,
+} from './egress-gateway.ts'
+import type { AddressClass } from './egress-gateway.ts'
 import {
   normalizeClerkClientCookie,
   normalizePersonaBundle,
@@ -20,10 +25,12 @@ import type {
   ResolvedPersona,
 } from './persona-vault.ts'
 import { bundleSecrets, frameForSessionOrigin } from './persona-vault.ts'
-import { isCredentialScopeHost, isIpLiteralHost, normalizeHostname, registrableDomain } from './public-suffix.ts'
+import { isCredentialScopeHost, normalizeHostname, registrableDomain } from './public-suffix.ts'
 import { redact } from './redact.ts'
 import type { Store } from './store.ts'
 
+export { classifyAddress, createPinnedLookup } from './egress-gateway.ts'
+export type { AddressClass } from './egress-gateway.ts'
 export { registrableDomain } from './public-suffix.ts'
 
 export type PersonaAuthErrorCode =
@@ -253,32 +260,6 @@ export function isOriginInScope(origin: string, allowlist: readonly string[]): b
   }
 }
 
-
-/** Loopback is allowed only for an explicitly allowlisted local-lab origin; link-local is never allowed. */
-export type AddressClass = 'public' | 'loopback' | 'blocked'
-
-export function classifyAddress(address: string): AddressClass {
-  const bare = address.trim().replace(/^\[|\]$/g, '')
-  // `localhost` is a loopback name, not an IP literal. Treating it as `blocked` broke
-  // explicitly allowlisted local-lab logins while 127.0.0.1/[::1] worked.
-  if (bare.toLowerCase() === 'localhost') return 'loopback'
-  try {
-    const ip = ipaddr.process(bare)
-    const range = ip.range()
-    if (range === 'unicast') return 'public'
-    if (range === 'loopback') return 'loopback'
-    return 'blocked'
-  } catch {
-    return 'blocked'
-  }
-}
-
-function isLoopbackLiteral(host: string): boolean {
-  const bare = host.replace(/^\[|\]$/g, '')
-  if (bare.toLowerCase() === 'localhost') return true
-  if (!ipaddr.isValid(bare)) return false
-  return ipaddr.process(bare).range() === 'loopback'
-}
 
 function extractSetCookies(headers: Headers): Map<string, string> {
   const map = new Map<string, string>()
@@ -823,145 +804,17 @@ async function launchDefaultChromium(pinnedHosts?: ReadonlyMap<string, readonly 
 
 const MAX_PINNED_RESPONSE_BYTES = 2 * 1024 * 1024
 
-/**
- * DNS lookup pinned to the addresses validated by `assertCredentialTarget`. The transport never
- * asks the system resolver again, so a NXDOMAIN-then-rebind or public-then-loopback answer
- * sequence cannot move the connection. Any other hostname is refused.
- */
-export function createPinnedLookup(
-  expectedHost: string,
-  addresses: readonly string[],
-): (hostname: string, options: unknown, callback: (...args: unknown[]) => void) => void {
-  const host = normalizeHostname(expectedHost.replace(/^\[|\]$/g, ''))
-  const pinned = addresses
-    .map(address => address.replace(/^\[|\]$/g, '').trim())
-    .filter(Boolean)
-    .map(address => ({ address, family: ipaddr.isValid(address) && ipaddr.parse(address).kind() === 'ipv6' ? 6 : 4 }))
-  return (hostname, options, callback) => {
-    const asked = normalizeHostname(String(hostname).replace(/^\[|\]$/g, ''))
-    if (!host || !pinned.length || asked !== host) {
-      callback(new Error(`Pinned resolver refused ${asked || '<empty>'} (validated host: ${host || '<none>'}).`))
-      return
-    }
-    const opts = (options && typeof options === 'object' ? options : {}) as { family?: number; all?: boolean }
-    const wanted = opts.family === 4 || opts.family === 6 ? pinned.filter(entry => entry.family === opts.family) : pinned
-    if (!wanted.length) {
-      callback(new Error(`Pinned resolver has no address for family ${String(opts.family)} on ${host}.`))
-      return
-    }
-    if (opts.all) {
-      callback(null, wanted)
-      return
-    }
-    callback(null, wanted[0].address, wanted[0].family)
-  }
-}
-
-function headersToRecord(headers: Headers): Record<string, string> {
-  const record: Record<string, string> = {}
-  headers.forEach((value, key) => { record[key] = value })
-  return record
-}
-
-function responseHeadersFromNode(raw: IncomingHttpHeaders): Headers {
-  const headers = new Headers()
-  for (const [key, value] of Object.entries(raw)) {
-    if (value === undefined) continue
-    if (Array.isArray(value)) {
-      for (const entry of value) headers.append(key, entry)
-    } else {
-      headers.set(key, value)
-    }
-  }
-  return headers
+interface ValidatedCredentialTarget {
+  url: URL
+  addresses: string[]
+  exactAllowlisted: boolean
 }
 
 /**
- * Credential transport with a pinned DNS answer (node:http(s) + custom lookup). Returns a
- * `Response` so the adapter code stays identical to the injected-fetch path.
- *
- * `NODE_USE_ENV_PROXY`/`--use-env-proxy` is unsupported for credential flows: the proxy
- * re-resolves and egresses on Kovo Hunter's behalf, so the pinned addresses no longer describe
- * the actual connection. A warning is logged once when that mode is detected.
+ * Test/embedder transport seam only. Production traffic ALWAYS routes through
+ * `EgressGateway.egressFetch` (single-resolution DNS pinning + SSRF enforcement).
  */
-export async function pinnedFetch(
-  url: string,
-  init: RequestInit,
-  options: { addresses: readonly string[]; timeoutMs: number; signal?: AbortSignal },
-): Promise<Response> {
-  const target = new URL(url)
-  if (target.protocol !== 'https:' && target.protocol !== 'http:') {
-    throw new PersonaAuthError('AUTH_FAILED', `Unsupported credential URL scheme ${target.protocol}.`)
-  }
-  const host = normalizeHostname(target.hostname.replace(/^\[|\]$/g, ''))
-  const body = typeof init.body === 'string' ? Buffer.from(init.body)
-    : init.body instanceof Uint8Array ? Buffer.from(init.body)
-      : undefined
-  const requestFn = target.protocol === 'https:' ? httpsRequest : httpRequest
-  const headers = headersToRecord(new Headers(init.headers))
-  if (body) headers['content-length'] = String(body.byteLength)
-
-  return await new Promise<Response>((resolve, reject) => {
-    const req = requestFn({
-      protocol: target.protocol,
-      hostname: host,
-      port: target.port || undefined,
-      path: `${target.pathname}${target.search}`,
-      method: init.method ?? 'GET',
-      headers,
-      lookup: createPinnedLookup(host, options.addresses) as never,
-      servername: target.protocol === 'https:' && !isIpLiteralHost(host) ? host : undefined,
-    }, res => {
-      const chunks: Buffer[] = []
-      let total = 0
-      let tooLarge = false
-      res.on('data', (chunk: Buffer) => {
-        total += chunk.byteLength
-        if (total > MAX_PINNED_RESPONSE_BYTES) {
-          tooLarge = true
-          req.destroy(new Error('Credential response exceeded the size limit.'))
-          return
-        }
-        chunks.push(chunk)
-      })
-      res.on('end', () => {
-        if (tooLarge) return
-        const status = res.statusCode ?? 0
-        const responseBody = status === 204 || status === 304 ? null : Buffer.concat(chunks)
-        resolve(new Response(responseBody, {
-          status,
-          statusText: res.statusMessage ?? '',
-          headers: responseHeadersFromNode(res.headers),
-        }))
-      })
-      res.on('error', reject)
-    })
-    req.setTimeout(options.timeoutMs, () => {
-      req.destroy(new Error(`Login request timed out after ${options.timeoutMs}ms.`))
-    })
-    req.on('error', reject)
-    const onAbort = () => req.destroy(options.signal?.reason instanceof Error ? options.signal.reason : new Error('Credential request aborted.'))
-    if (options.signal?.aborted) onAbort()
-    else options.signal?.addEventListener('abort', onAbort, { once: true })
-    req.on('close', () => options.signal?.removeEventListener('abort', onAbort))
-    if (body) req.write(body)
-    req.end()
-  })
-}
-
-let warnedEnvProxy = false
-function warnIfEnvProxyEnabled(): void {
-  if (warnedEnvProxy) return
-  const setting = process.env.NODE_USE_ENV_PROXY
-  if (!setting || setting === '0' || setting.toLowerCase() === 'false') return
-  warnedEnvProxy = true
-  console.warn(
-    'WARNING: NODE_USE_ENV_PROXY is set. Credential flows are unsupported behind an environment proxy: ' +
-    'the proxy re-resolves and egresses on Kovo Hunter\'s behalf, so pinned credential addresses cannot be guaranteed.',
-  )
-}
-
-async function fetchWithTimeout(
+async function fetchWithInjectedTransport(
   fetchImpl: typeof fetch,
   url: string,
   init: RequestInit,
@@ -1533,7 +1386,7 @@ export class PersonaSessionPool {
 }
 
 export class PersonaAuthManager {
-  private readonly fetchImpl: typeof fetch
+  private readonly fetchImpl: typeof fetch | undefined
   private readonly fetchImplInjected: boolean
   private readonly resolveHostInjected: boolean
   private readonly launchBrowser: (pinnedHosts?: ReadonlyMap<string, readonly string[]>) => Promise<PlaywrightFormBrowserLike>
@@ -1548,46 +1401,52 @@ export class PersonaAuthManager {
   constructor(options: PersonaAuthManagerOptions = {}) {
     this.fetchImplInjected = Boolean(options.fetchImpl)
     this.resolveHostInjected = Boolean(options.resolveHost)
-    this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis)
+    this.fetchImpl = options.fetchImpl
     this.launchBrowser = options.launchBrowser ?? launchDefaultChromium
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     // Legacy pacing for raw registerReauth() handlers only. Session clones (the product path)
     // never use a time-based lockout; they coordinate through PersonaSessionPool generations.
     this.reauthMinIntervalMs = Math.max(1_000, options.reauthMinIntervalMs ?? 60_000)
-    this.resolveHost = options.resolveHost ?? (async hostname => {
-      const bare = hostname.replace(/^\[|\]$/g, '')
-      if (isIpLiteralHost(bare)) return [bare]
-      // `localhost` is a name; resolve it to the loopback literals so the pinned lookup has
-      // real addresses instead of passing the name through as if it were an IP.
-      if (bare.toLowerCase() === 'localhost') return ['127.0.0.1', '::1']
-      try {
-        const addresses = await lookup(hostname, { all: true, order: 'verbatim' })
-        return addresses.map(entry => entry.address)
-      } catch {
-        // Empty resolution is refused by assertCredentialTarget: NXDOMAIN at check time
-        // must never be re-resolved into a private address at connect time.
-        return []
-      }
-    })
+    this.resolveHost = options.resolveHost ?? defaultResolveHost
   }
 
   /**
-   * Credential transport. The default path pins the validated addresses with a custom lookup
-   * so the connection cannot be re-resolved; an injected `fetchImpl` (tests/embedders) keeps
-   * the existing fetch contract and is expected to enforce pinning itself.
+   * Credential transport routed exclusively through `EgressGateway.egressFetch`.
+   * An injected `fetchImpl` (tests/embedders) keeps the existing mock-fetch contract.
    */
   private async credentialFetch(
     url: string,
     init: RequestInit,
-    pinnedAddresses: readonly string[] | null,
+    target: ValidatedCredentialTarget,
     signal?: AbortSignal,
     timeoutMs = this.timeoutMs,
   ): Promise<Response> {
     warnIfEnvProxyEnabled()
-    if (this.fetchImplInjected || !pinnedAddresses) {
-      return await fetchWithTimeout(this.fetchImpl, url, init, timeoutMs, signal)
+    if (this.fetchImpl) {
+      return await fetchWithInjectedTransport(this.fetchImpl, url, init, timeoutMs, signal)
     }
-    return await pinnedFetch(url, init, { addresses: pinnedAddresses, timeoutMs, signal })
+    const hostname = normalizeHostname(target.url.hostname.replace(/^\[|\]$/g, ''))
+    const allowLoopback = target.exactAllowlisted
+    try {
+      return await EgressGateway.egressFetch(
+        url,
+        { ...init, redirect: 'manual', signal },
+        {
+          pinnedAddresses: target.addresses,
+          resolveHost: this.resolveHost,
+          timeoutMs,
+          maxResponseBytes: MAX_PINNED_RESPONSE_BYTES,
+          followRedirects: false,
+          allowHttp: allowLoopback && isLoopbackLiteral(hostname),
+          ...(allowLoopback ? { allowedLoopbackOnlyHosts: [hostname] } : {}),
+        },
+      )
+    } catch (err) {
+      if (err instanceof EgressDeniedError) {
+        throw new PersonaAuthError('AUTH_FAILED', err.message)
+      }
+      throw err
+    }
   }
 
   private async inspectTargetOrigin(
@@ -1619,7 +1478,7 @@ export class PersonaAuthManager {
       const res = await this.credentialFetch(
         targetOrigin,
         { method: 'GET', headers: { Accept: 'text/html,application/xhtml+xml,*/*' }, redirect: 'manual' },
-        target.addresses,
+        target,
         signal,
         Math.min(this.timeoutMs, 8_000),
       )
@@ -1682,7 +1541,7 @@ export class PersonaAuthManager {
             const sRes = await this.credentialFetch(
               scriptUrl,
               { method: 'GET', headers: { Accept: 'application/javascript,text/javascript,*/*' }, redirect: 'manual' },
-              target.addresses,
+              target,
               signal,
               Math.min(this.timeoutMs, 4_000),
             )
@@ -1728,7 +1587,7 @@ export class PersonaAuthManager {
     allowlist: readonly string[],
     label: string,
     options: { requireResolution?: boolean } = {},
-  ): Promise<{ url: URL; addresses: string[] }> {
+  ): Promise<ValidatedCredentialTarget> {
     let parsed: URL
     try {
       parsed = new URL(rawUrl)
@@ -1768,9 +1627,9 @@ export class PersonaAuthManager {
     }
     // An injected transport without an injected resolver is an embedding/test seam: Kovo Hunter
     // cannot observe or pin that transport's DNS, so resolution is the injector's contract.
-    // Production (default fetch) always resolves and pins.
+    // Production (default EgressGateway) always resolves and pins.
     if (options.requireResolution === false || (this.fetchImplInjected && !this.resolveHostInjected)) {
-      return { url: parsed, addresses: [] }
+      return { url: parsed, addresses: [], exactAllowlisted }
     }
     const addresses = await this.resolveHost(parsed.hostname)
     if (addresses.length === 0) {
@@ -1785,7 +1644,7 @@ export class PersonaAuthManager {
         throw new PersonaAuthError('AUTH_FAILED', `${label} host ${parsed.hostname} resolves to a private, loopback, or metadata address.`)
       }
     }
-    return { url: parsed, addresses }
+    return { url: parsed, addresses, exactAllowlisted }
   }
 
   /**
@@ -2121,7 +1980,7 @@ export class PersonaAuthManager {
       const tokRes = await this.credentialFetch(
         tokenUrl,
         { method: 'POST', headers: tokenHeaders },
-        tokenTarget.addresses,
+        tokenTarget,
       )
       const tokText = await tokRes.text()
       rejectUnexpectedRedirect(tokRes, 'Clerk token refresh')
@@ -2209,7 +2068,7 @@ export class PersonaAuthManager {
           Cookie: `__client=${initialClientCookie}`,
         },
       },
-      clientTarget.addresses,
+      clientTarget,
       signal,
     )
 
@@ -2325,7 +2184,7 @@ export class PersonaAuthManager {
         },
         body: form.toString(),
       },
-      signInTarget.addresses,
+      signInTarget,
       signal,
     )
 
@@ -2545,7 +2404,7 @@ export class PersonaAuthManager {
         headers: baseHeaders,
         body: JSON.stringify({ email, password }),
       },
-      loginTarget.addresses,
+      loginTarget,
       signal,
     )
 
@@ -2604,7 +2463,7 @@ export class PersonaAuthManager {
           headers: baseHeaders,
           body: JSON.stringify({ refresh_token: refreshToken }),
         },
-        refreshTarget.addresses,
+        refreshTarget,
       )
       const rText = await rRes.text()
       rejectUnexpectedRedirect(rRes, 'Supabase token refresh')
@@ -2669,8 +2528,8 @@ export class PersonaAuthManager {
         const csrfTarget = await this.assertCredentialTarget(ext.csrfPrefetchUrl, persona.originAllowlist, 'CSRF pre-fetch URL')
         const csrfRes = await this.credentialFetch(
           ext.csrfPrefetchUrl,
-          { method: 'GET', headers: { Accept: 'application/json,text/html;q=0.9,*/*;q=0.8' }, redirect: 'follow' },
-          csrfTarget.addresses,
+          { method: 'GET', headers: { Accept: 'application/json,text/html;q=0.9,*/*;q=0.8' }, redirect: 'manual' },
+          csrfTarget,
           signal,
           Math.min(this.timeoutMs, 8_000),
         )
@@ -2706,7 +2565,7 @@ export class PersonaAuthManager {
         headers: loginHeaders,
         body: JSON.stringify({ [emailField]: email, [passwordField]: password }),
       },
-      loginTarget.addresses,
+      loginTarget,
       signal,
     )
 
@@ -2751,7 +2610,7 @@ export class PersonaAuthManager {
                 headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
                 body: JSON.stringify({ refresh_token: currentRefreshToken }),
               },
-              refreshTarget.addresses,
+              refreshTarget,
             )
             const rt = await rr.text()
             rejectUnexpectedRedirect(rr, 'JSON refresh')
