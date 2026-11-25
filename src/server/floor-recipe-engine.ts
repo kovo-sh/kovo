@@ -46,9 +46,13 @@ import type {
 } from './floor-recipes.ts'
 import { actorFromPersona, assessBoundary, assessImpactEvidence, assessMassAssignmentImpact, assessMfaBypass, assessStatusOnlyDivergence, classifyBoundaryClaim, classifyImpactDescriptor, normalizeRole, parseRoleLabel } from './oracle-invariants.ts'
 import type { ActorIdentity, AmbientAuth, ImpactStep, PersonaCredentialSource, RoleName } from './oracle-invariants.ts'
-import { verifyReceipt } from './proof-receipt.ts'
+import { HostFactLog } from './host-fact-log.ts'
+import { proofReceiptMode } from './proof-receipt.ts'
 import type { ProofReceipt, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
+import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
 import type { ProofReceiptMode, ReplayReceiptCheck, ReplayVerdict, ReplayVerificationResult, RetestVerdict } from './replay-verifier.ts'
+
+export { proofReceiptMode }
 import { cacheBusterValueRegex, containsDestructivePayload, extractCacheBusterParam, replayAssertionOutcomeSchema } from '../replay-spec.ts'
 import type { AuthMutation, DeclarativeReplaySpec, FloorRecipeEnvelope, ReplayAssertionOutcome, ReplayStep } from '../replay-spec.ts'
 import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied } from './broker.ts'
@@ -72,22 +76,46 @@ function isCut3RecipeId(id: PersistedFloorRecipeId): id is Cut3FloorRecipeId {
   return CUT3_RECIPE_ID_SET.has(id)
 }
 
-/** Dispatch any persisted floor recipe id (core 6 + Cut 3 recipes) through its typed runner. */
-export function executeFloorRecipeById(
+/** Dispatch any persisted floor recipe id (core 6 + Cut 3 recipes) through its typed runner and TerminalOracleRegistry. */
+export async function executeFloorRecipeById(
   recipeId: PersistedFloorRecipeId,
   args: PersistedFloorRecipeArgs,
   deps: FloorRecipeDeps,
 ): Promise<FloorRecipeExecution> {
-  if (isCut3RecipeId(recipeId)) {
-    return runCut3Recipe(
-      cut3FloorRecipe(recipeId, args as Cut3FloorRecipeArgsMap[typeof recipeId]),
-      deps,
-    )
-  }
-  return runFloorRecipe(
-    floorRecipe(recipeId, args as FloorRecipeArgsMap[typeof recipeId]),
-    deps,
+  const exec = isCut3RecipeId(recipeId)
+    ? await runCut3Recipe(
+        cut3FloorRecipe(recipeId, args as Cut3FloorRecipeArgsMap[typeof recipeId]),
+        deps,
+      )
+    : await runFloorRecipe(
+        floorRecipe(recipeId, args as FloorRecipeArgsMap[typeof recipeId]),
+        deps,
+      )
+  if (!exec.result.confirmed) return exec
+  const factLog = HostFactLog.fromTranscript(exec.result.transcript)
+  const oracle = defaultTerminalOracleRegistry.evaluate(
+    factLog,
+    { kind: 'single_hop', receipt: exec.receipt },
+    { strictHostDerivation: false },
   )
+  if (oracle.confirmed) return exec
+  const verification: ReceiptVerification = oracle.singleHop ?? {
+    confirmed: false,
+    vulnClass: exec.receipt.vulnClass,
+    rule: exec.result.verification.rule,
+    reason: oracle.reason,
+    observed: exec.receipt.claimedDelta,
+    expected: 'host-custody verified floor receipt',
+  }
+  return {
+    ...exec,
+    result: { ...exec.result, confirmed: false, verification },
+    failure: {
+      code: 'receipt_rejected',
+      message: verification.reason,
+      missingRoles: ['impact_evidence'],
+    },
+  }
 }
 
 /** The exact target a wired recipe confirmed; the record spec re-uses it. */
@@ -204,7 +232,7 @@ function requestFromInjection(input: {
     ...(hyp.headers ? { headers: hyp.headers } : {}),
     ...(hyp.jsonBody ? { jsonBody: hyp.jsonBody } : {}),
     ...(hyp.formBody ? { formBody: hyp.formBody } : {}),
-    ...(hyp.xmlTemplate ? { xmlTemplate: hyp.xmlTemplate } : {}),
+    ...(hyp.xmlTemplate ? { xmlTemplate: hyp.xmlTemplate.replaceAll('{{value}}', '{{val}}') } : {}),
     ...(hyp.graphqlQuery ? { graphqlQuery: hyp.graphqlQuery } : {}),
     ...(hyp.session ? { session: hyp.session } : {}),
   })
@@ -257,6 +285,22 @@ function planBooleanRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
     const control = requestFromInjection({ hyp, value: baseline })
     const probe = requestFromInjection({ hyp, value: probeValue })
     if (!control || !probe) return { ...sketch, skipReason: 'sqli timing injection point could not be expressed as a recipe request' }
+    const controlReq = (control.textBody !== undefined || control.headers)
+      ? {
+          pathAndQuery: control.pathAndQuery,
+          ...(control.jsonBody !== undefined ? { jsonBody: control.jsonBody } : {}),
+          ...(control.textBody !== undefined ? { textBody: control.textBody } : {}),
+          ...(control.headers ? { headers: control.headers } : {}),
+        }
+      : undefined
+    const probeReq = (probe.textBody !== undefined || probe.headers)
+      ? {
+          pathAndQuery: probe.pathAndQuery,
+          ...(probe.jsonBody !== undefined ? { jsonBody: probe.jsonBody } : {}),
+          ...(probe.textBody !== undefined ? { textBody: probe.textBody } : {}),
+          ...(probe.headers ? { headers: probe.headers } : {}),
+        }
+      : undefined
     const args: BooleanOrTimingArgs = {
       mode: 'timing',
       origin: hyp.endpoint.origin,
@@ -272,6 +316,8 @@ function planBooleanRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
       quoteStyle: 'single',
       ...(control.jsonBody !== undefined ? { controlJsonBody: control.jsonBody } : {}),
       ...(probe.jsonBody !== undefined ? { probeJsonBody: probe.jsonBody } : {}),
+      ...(controlReq ? { controlRequest: controlReq } : {}),
+      ...(probeReq ? { probeRequest: probeReq } : {}),
       ...(input.headers ?? hyp.headers ? { headers: { ...(hyp.headers ?? {}), ...(input.headers ?? {}) } } : {}),
     }
     return { ...sketch, args, paramLocation: hyp.location ?? hyp.param.location }
@@ -294,6 +340,22 @@ function planBooleanRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   const control = requestFromInjection({ hyp, value: booleanArm({ template: rawTemplate, style, baseline, key, arm: 'true' }) })
   const probe = requestFromInjection({ hyp, value: booleanArm({ template: rawTemplate, style, baseline, key, arm: 'false' }) })
   if (!control || !probe) return { ...sketch, skipReason: 'sqli injection point could not be expressed as a recipe request' }
+  const controlReq = (control.textBody !== undefined || control.headers)
+    ? {
+        pathAndQuery: control.pathAndQuery,
+        ...(control.jsonBody !== undefined ? { jsonBody: control.jsonBody } : {}),
+        ...(control.textBody !== undefined ? { textBody: control.textBody } : {}),
+        ...(control.headers ? { headers: control.headers } : {}),
+      }
+    : undefined
+  const probeReq = (probe.textBody !== undefined || probe.headers)
+    ? {
+        pathAndQuery: probe.pathAndQuery,
+        ...(probe.jsonBody !== undefined ? { jsonBody: probe.jsonBody } : {}),
+        ...(probe.textBody !== undefined ? { textBody: probe.textBody } : {}),
+        ...(probe.headers ? { headers: probe.headers } : {}),
+      }
+    : undefined
   const args: BooleanOrTimingArgs = {
     mode: 'boolean',
     origin: hyp.endpoint.origin,
@@ -309,6 +371,8 @@ function planBooleanRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
     ...(rawTemplate ? { valueTemplate: rawTemplate, quoteStyle } : { quoteStyle }),
     ...(control.jsonBody !== undefined ? { controlJsonBody: control.jsonBody } : {}),
     ...(probe.jsonBody !== undefined ? { probeJsonBody: probe.jsonBody } : {}),
+    ...(controlReq ? { controlRequest: controlReq } : {}),
+    ...(probeReq ? { probeRequest: probeReq } : {}),
     ...(input.headers ?? hyp.headers ? { headers: { ...(hyp.headers ?? {}), ...(input.headers ?? {}) } } : {}),
   }
   return { ...sketch, args, paramLocation: hyp.location ?? hyp.param.location }
@@ -719,6 +783,11 @@ export interface RunPlannedRecipeInput {
 
 /** Run a plan through the broker-backed Layer-1 adapter. Never falls back to the legacy verifier. */
 export async function runPlannedRecipe(input: RunPlannedRecipeInput): Promise<FloorRecipeExecution> {
+  if (input.plan.recipeId === 'boolean_or_timing' &&
+      (input.plan.args as BooleanOrTimingArgs).mode === 'timing' && (input.grant.tier ?? 1) < 3) {
+    input.grant.audit('denied', input.plan.args.origin || input.hypothesis.endpoint.origin)
+    throw new BrokerDenied('Timing differential recipes require Tier 3 verification scope.')
+  }
   const deps = brokerFloorRecipeDeps({
     broker: input.broker,
     grant: input.grant,
@@ -1844,7 +1913,11 @@ export async function runRceProofRecipe(
           injectedAtMs,
         }],
       }
-      const verification = verifyReceipt(receipt, transcript)
+      const verification = defaultTerminalOracleRegistry.evaluate(
+        HostFactLog.fromTranscript(transcript),
+        { kind: 'single_hop', receipt },
+        { strictHostDerivation: true },
+      ).singleHop!
       receiptCheck = { receipt, verification, mode: 'strict' }
       deterministicProofPassed = probeWait.triggered && !controlCheck.triggered && verification.confirmed
       observed = `probeCanary=${probeWait.triggered}, controlCanary=${controlCheck.triggered}`
@@ -2363,7 +2436,11 @@ export async function runAuthProtocolProofRecipe(
             injectedAtMs,
           }],
         }
-        const verification = verifyReceipt(receipt, transcript)
+        const verification = defaultTerminalOracleRegistry.evaluate(
+          HostFactLog.fromTranscript(transcript),
+          { kind: 'single_hop', receipt },
+          { strictHostDerivation: true },
+        ).singleHop!
         oobReceiptCheck = { receipt, verification, mode: 'strict' }
         if (!verification.confirmed) {
           deterministicProofPassed = false
@@ -2651,6 +2728,22 @@ function normalizedReplayPath(value: string | undefined): string {
   return value.split('?')[0].split('#')[0].replace(/\/{2,}/g, '/').replace(/\/+$/, '').toLowerCase() || '/'
 }
 
+/** Parse the body the host actually sent, including form/XML carriers, for shared impact oracles. */
+function recordedRequestJson(entry: Record<string, unknown> | undefined, request: ReplayStep['request']): unknown {
+  const raw = typeof entry?.requestBody === 'string' ? entry.requestBody : request.textBody
+  if (raw === undefined) return request.jsonBody
+  const contentType = String(entry?.requestHeaders && typeof entry.requestHeaders === 'object'
+    ? Object.entries(entry.requestHeaders as Record<string, unknown>).find(([name]) => name.toLowerCase() === 'content-type')?.[1] ?? ''
+    : Object.entries(request.headers ?? {}).find(([name]) => name.toLowerCase() === 'content-type')?.[1] ?? '')
+  if (/application\/x-www-form-urlencoded/i.test(contentType)) {
+    return Object.fromEntries(new URLSearchParams(raw).entries())
+  }
+  if (/json/i.test(contentType) || /^(?:\{|\[)/.test(raw.trim())) {
+    try { return JSON.parse(raw) } catch { return raw }
+  }
+  return raw
+}
+
 /**
  * Map recorded replay steps onto the shared evidence model. Role/tenant/auth metadata is enriched
  * into each step summary at record time (see `personaActorFields`), so the same validators can run
@@ -2675,8 +2768,8 @@ export function impactStepsFromStepsOut(
       id: step.id,
       arm: step.role,
       method: step.request.method.toUpperCase(),
-      route: normalizedReplayPath(step.request.pathAndQuery),
-      pathAndQuery: step.request.pathAndQuery,
+      route: normalizedReplayPath(typeof entry?.pathAndQuery === 'string' ? entry.pathAndQuery : step.request.pathAndQuery),
+      pathAndQuery: typeof entry?.pathAndQuery === 'string' ? entry.pathAndQuery : step.request.pathAndQuery,
       status: typeof entry?.status === 'number' ? entry.status : null,
       actor: {
         handle,
@@ -2690,8 +2783,8 @@ export function impactStepsFromStepsOut(
       ...(Array.isArray(entry?.secretMatches)
         ? { secretMatches: (entry.secretMatches as Array<Record<string, unknown>>).map(match => String(match.sha256Prefix ?? '')).filter(Boolean) }
         : {}),
-      requestJson: step.request.jsonBody,
-      requestHeaders: step.request.headers ?? null,
+      requestJson: recordedRequestJson(entry, step.request),
+      requestHeaders: (entry?.requestHeaders as Record<string, string> | undefined) ?? step.request.headers ?? null,
       responseHeaders: (entry?.headers as Record<string, string> | undefined) ?? null,
     }
   })
@@ -3416,6 +3509,8 @@ export function receiptVulnClassFor(spec: DeclarativeReplaySpec): string | null 
   const text = `${spec.cwe} ${spec.category} ${spec.title} ${spec.impact}`
   if (/CWE-918|\bssrf\b|server[- ]side request/i.test(text)) return 'ssrf'
   if (/CWE-611|\bxxe\b|external entit/i.test(text)) return 'xxe'
+  if (/CWE-601|\bopen[-_ ]?redirect\b|unvalidated[- ]redirect/i.test(text)) return 'open_redirect'
+  if (/CWE-345/i.test(text) || /webhook[^.]*(?:signature|forger|tamper)|(?:signature|forger)[^.]*webhook/i.test(text)) return 'webhook_forgery'
   if (spec.kind !== 'http_chain' && spec.kind !== 'auth_protocol_proof') return null
   return vulnClassForImpactClass(classifyImpactDescriptor({
     cwe: spec.cwe,
@@ -3452,18 +3547,23 @@ export function buildReplayReceipt(input: {
   evidencePayload: Record<string, unknown>
   exchangeIds: readonly string[]
   exchanges: readonly BrokerExchangeResult[]
-}): { receipt: ProofReceipt; transcript: ReceiptTranscript } | null {
+}): { receipt: ProofReceipt; transcript: ReceiptTranscript; factLog: HostFactLog } | null {
   const impactGate = input.evidencePayload.impactGate as { required?: boolean } | undefined
+  const boundaryGate = input.evidencePayload.boundaryGate as { required?: boolean; satisfied?: boolean; boundaryClass?: string } | undefined
   const evidenceClass = typeof input.evidencePayload.evidenceClass === 'string'
     ? input.evidencePayload.evidenceClass
     : null
-  const vulnClass = vulnClassForImpactClass(evidenceClass) ?? receiptVulnClassFor(input.spec)
+  const baseVulnClass = vulnClassForImpactClass(evidenceClass) ?? receiptVulnClassFor(input.spec)
+  const isBoundaryAuth = !baseVulnClass && boundaryGate?.required === true && boundaryGate.satisfied === true && boundaryGate.boundaryClass === 'auth'
+  const vulnClass = baseVulnClass ?? (isBoundaryAuth ? 'auth_bypass' : null)
   if (!vulnClass) return null
-  const isOob = vulnClass === 'ssrf' || vulnClass === 'xxe'
-  // The DSL only confirms an impact claim when its shared oracle gate applies. Do not manufacture a
-  // receipt for a class the replay never gated (auth-boundary, redirect, injection differentials):
-  // those keep their existing evidence model instead of being downgraded by a rule they never had.
-  if (!isOob && impactGate?.required !== true) return null
+  const isOob = vulnClass === 'ssrf' || vulnClass === 'xxe' ||
+    (vulnClass === 'webhook_forgery' && (input.evidencePayload.canary as { triggered?: boolean } | undefined)?.triggered === true)
+  const isRedirect = vulnClass === 'open_redirect'
+  const isWebhook = vulnClass === 'webhook_forgery' && !isOob
+  // Require a gated class (impactGate, OOB, redirect, webhook differential, or boundaryGate auth
+  // bypass) to emit a receipt. Dedicated rules re-derive their evidence from the host transcript.
+  if (!isOob && !isRedirect && !isWebhook && !isBoundaryAuth && impactGate?.required !== true) return null
   const stepsOut = (input.evidencePayload.steps ?? {}) as Record<string, unknown>
   const steps = impactStepsFromStepsOut(input.spec, stepsOut)
   if (steps.length === 0 && vulnClass !== 'ssrf' && vulnClass !== 'xxe') return null
@@ -3475,20 +3575,22 @@ export function buildReplayReceipt(input: {
   const entries: ReceiptTranscriptEntry[] = []
   const orderedIds: string[] = []
   for (const [index, step] of steps.entries()) {
-    const recorded = stepsOut[step.id] as { exchangeId?: unknown } | undefined
+    const recorded = stepsOut[step.id] as { exchangeId?: unknown; durationMs?: unknown; requestBody?: unknown } | undefined
     const id = typeof recorded?.exchangeId === 'string'
       ? recorded.exchangeId
       : input.exchangeIds[index] ?? `exchange-${index}`
     if (!id) continue
-    const exchange = exchangeById.get(id)
+    const exchange = exchangeById.get(id) ?? (input.exchangeIds.length === 0 ? input.exchanges[index] : undefined)
+    const durationMs = typeof recorded?.durationMs === 'number' ? recorded.durationMs : exchange?.durationMs
+    const requestBody = typeof recorded?.requestBody === 'string' ? recorded.requestBody : ''
     entries.push({
       exchangeId: id,
       step,
-      ...(typeof (recorded as { durationMs?: unknown } | undefined)?.durationMs === 'number'
-        ? { durationMs: (recorded as { durationMs: number }).durationMs }
-        : {}),
-      ...(exchange
-        ? { carrierText: `${exchange.pathAndQuery}\n${JSON.stringify(exchange.reqHeaders ?? {})}\n${String(exchange.body ?? '').slice(0, 32 * 1024)}` }
+      seq: index + 1,
+      origin: exchange?.origin || input.spec.origin,
+      ...(typeof durationMs === 'number' ? { durationMs } : {}),
+      ...(exchange || requestBody
+        ? { carrierText: `${exchange?.pathAndQuery ?? step.pathAndQuery ?? ''}\n${JSON.stringify(step.requestHeaders ?? {})}\n${requestBody}` }
         : {}),
     })
     orderedIds.push(id)
@@ -3523,7 +3625,7 @@ export function buildReplayReceipt(input: {
       }],
       browserTraces: [],
     }
-    return { receipt: receipt as ProofReceipt, transcript }
+    return { receipt: receipt as ProofReceipt, transcript, factLog: HostFactLog.fromTranscript(transcript) }
   }
 
   if (orderedIds.length === 0) return null
@@ -3556,7 +3658,8 @@ export function buildReplayReceipt(input: {
     ...('resourceTenant' in input.spec && input.spec.resourceTenant ? { resourceTenant: input.spec.resourceTenant } : {}),
     ...('expectControlDenied' in input.spec && input.spec.expectControlDenied ? { expectControlDenied: true } : {}),
   }
-  return { receipt: receipt as ProofReceipt, transcript: { entries } }
+  const transcript: ReceiptTranscript = { entries }
+  return { receipt: receipt as ProofReceipt, transcript, factLog: HostFactLog.fromTranscript(transcript) }
 }
 
 /**
@@ -3602,8 +3705,36 @@ export function receiptCheckForResult(input: {
     exchangeIds: input.exchangeIds,
     exchanges: input.exchanges,
   })
-  if (!built) return { verdict: input.verdict, outcome: input.outcome }
-  const verification = verifyReceipt(built.receipt, built.transcript)
+  // Fail closed in strict mode whenever a confirmed replay cannot construct a host-verified ProofReceipt.
+  if (!built) {
+    if (input.mode === 'strict') {
+      return {
+        verdict: 'inconclusive',
+        outcome: {
+          ...input.outcome,
+          confirmed: false,
+          reason: 'ProofReceipt could not be built from host-recorded replay exchanges (fail-closed strict mode).',
+        },
+      }
+    }
+    return { verdict: input.verdict, outcome: input.outcome }
+  }
+  const oracleRes = defaultTerminalOracleRegistry.evaluate(
+    built.factLog,
+    { kind: 'single_hop', receipt: built.receipt },
+    {
+      strictHostDerivation: true,
+      ...(built.receipt.oracleEvents?.length ? { trustedOracleEvents: built.receipt.oracleEvents } : {}),
+    },
+  )
+  const verification: ReceiptVerification = oracleRes.singleHop ?? {
+    confirmed: oracleRes.confirmed,
+    vulnClass: built.receipt.vulnClass,
+    rule: 'none',
+    reason: oracleRes.reason,
+    observed: built.receipt.claimedDelta,
+    expected: 'host-custody verified floor receipt',
+  }
   return applyReceiptGate({
     mode: input.mode,
     verdict: input.verdict,
@@ -3611,16 +3742,4 @@ export function receiptCheckForResult(input: {
     receipt: built.receipt,
     verification,
   })
-}
-
-/**
- * `KOVO_PROOF_RECEIPT=off` restores the pure legacy DSL verdict, `shadow` (default) records the
- * receipt without changing a verdict, and `strict` makes `verifyReceipt` the final confirmation
- * gate. Strict is opt-in until parity across every suite is certified.
- */
-export function proofReceiptMode(env: NodeJS.ProcessEnv = process.env): ProofReceiptMode {
-  const raw = (env.KOVO_PROOF_RECEIPT ?? '').trim().toLowerCase()
-  if (raw === '0' || raw === 'off' || raw === 'false' || raw === 'no') return 'off'
-  if (raw === 'strict' || raw === 'enforce' || raw === '1') return 'strict'
-  return 'shadow'
 }

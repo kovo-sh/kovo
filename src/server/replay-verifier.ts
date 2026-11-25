@@ -336,6 +336,8 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
               ...(batchExchangeIds.length ? { exchangeIds: batchExchangeIds } : {}),
               ...(batchExchangeIds[0] ? { exchangeId: batchExchangeIds[0] } : {}),
               ...(first ? summarizeExchange(first) : {}),
+              ...(brokerReq.body !== undefined ? { requestBody: brokerReq.body } : {}),
+              ...(first ? { requestHeaders: first.reqHeaders } : {}),
               ...actorContextFor(step),
             }
             stepsOut[step.id] = stepEntry
@@ -354,6 +356,8 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
               role: step.role,
               ...(exchangeId ? { exchangeId } : {}),
               ...summarizeExchange(ex),
+              ...(brokerReq.body !== undefined ? { requestBody: brokerReq.body } : {}),
+              requestHeaders: ex.reqHeaders,
               ...actorContextFor(step),
             }
             stepsOut[step.id] = stepEntry
@@ -713,22 +717,15 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
   }
 
   // Coerce structured observed/expected/reason fields to bounded strings while keeping confirmed/controlPassed strictly boolean.
-  const coerceOutcomeText = (value: unknown): string => {
-    if (typeof value === 'string') return value.slice(0, 1200)
-    try {
-      return (JSON.stringify(value) ?? String(value)).slice(0, 1200)
-    } catch {
-      return String(value).slice(0, 1200)
-    }
+  const coerceText = (v: unknown): string => {
+    if (typeof v === 'string') return v.slice(0, 1200)
+    try { return (JSON.stringify(v) ?? String(v)).slice(0, 1200) } catch { return String(v).slice(0, 1200) }
   }
   if (parsedJson && typeof parsedJson === 'object' && !Array.isArray(parsedJson)) {
     const obj = { ...(parsedJson as Record<string, unknown>) }
-    if ('observed' in obj && obj.observed !== undefined) obj.observed = coerceOutcomeText(obj.observed)
-    if ('expected' in obj && obj.expected !== undefined) obj.expected = coerceOutcomeText(obj.expected)
-    if ('reason' in obj) {
-      if (obj.reason === undefined || obj.reason === null) delete obj.reason
-      else obj.reason = coerceOutcomeText(obj.reason)
-    }
+    if (obj.observed !== undefined) obj.observed = coerceText(obj.observed)
+    if (obj.expected !== undefined) obj.expected = coerceText(obj.expected)
+    if ('reason' in obj) { if (obj.reason == null) delete obj.reason; else obj.reason = coerceText(obj.reason) }
     parsedJson = obj
   }
 

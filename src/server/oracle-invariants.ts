@@ -524,6 +524,8 @@ const MARKUP_CWE_RE = /^CWE-(?:79|80|83)$/i
 // as it always has, so a narrative word cannot promote an unrelated claim into an ungated class.
 const INJECTION_CWE_RE = /^CWE-(?:89|564|943)$/i
 const INJECTION_CATEGORY_RE = /^(?:sqli|sql[-_ ]?injection|blind[-_ ]?sqli|injection[-_ ]input)$/i
+const OPEN_REDIRECT_CWE_RE = /^CWE-601$/i
+const OPEN_REDIRECT_CATEGORY_RE = /^(?:open[-_ ]?redirect|url[-_ ]?redirect|unvalidated[-_ ]?redirect)$/i
 const DISCLOSURE_RE = /\b(?:disclosure|data[- ]leak|information[- ]leak|leak(?:ed|s|age)?|exposure|expos(?:ed|ure)|sensitive[- ]data|unauthori[sz]ed[- ]read)\b/i
 const DISCLOSURE_CWE_RE = /^CWE-(?:200|359|522|532)$/i
 /**
@@ -551,17 +553,26 @@ export function classifyImpactDescriptor(parts: {
   // narrative ("cross-store data disclosure") can rebrand it as information disclosure.
   if (INJECTION_CWE_RE.test(parts.cwe ?? '') ||
       INJECTION_CATEGORY_RE.test((parts.category ?? '').trim())) return 'injection'
+  // Open redirect has its own redirect receipt rule and must never be rebranded as disclosure
+  // when its narrative mentions exposure or phishing/token leak.
+  if (OPEN_REDIRECT_CWE_RE.test(parts.cwe ?? '') ||
+      OPEN_REDIRECT_CATEGORY_RE.test((parts.category ?? '').trim()) ||
+      /\bopen[- ]redirect\b/i.test(parts.title ?? '')) return 'other'
   if (/\b(?:vertical|bfla|function[- ]level|privilege[- ]escalation)\b/i.test(text) ||
       /^CWE-(?:269|285|862|863)$/i.test(parts.cwe ?? '')) return 'bfla'
   // Business-logic/workflow claims carry their own impact model (invariant, repeat transition,
   // protected-field delta); they must never fall through to the ungated 'other' bucket.
   if (BUSINESS_LOGIC_CWE_RE.test(parts.cwe ?? '') || BUSINESS_LOGIC_RE.test(text) ||
       BUSINESS_LOGIC_RE.test(parts.category ?? '')) return 'business_logic'
-  if (AUTHZ_CWE_RE.test(parts.cwe ?? '') || AUTHZ_RE.test(parts.category ?? '') || AUTHZ_RE.test(text)) return 'authorization'
+  if (AUTHZ_CWE_RE.test(parts.cwe ?? '')) return 'authorization'
+  // Explicit disclosure metadata outranks generic authorization prose in the impact narrative
+  // (for example, "read or alter data outside their authorization" on a CWE-200 credential read).
+  if (DISCLOSURE_CWE_RE.test(parts.cwe ?? '') ||
+      /^(?:information[-_ ]disclosure|sensitive[-_ ]data[-_ ]exposure)$/i.test((parts.category ?? '').trim())) return 'disclosure'
+  if (AUTHZ_RE.test(parts.category ?? '') || AUTHZ_RE.test(text)) return 'authorization'
   // Disclosure has no role/tenant differential of its own; it needs an entitled control or a
-  // secret-shaped value. Classified last so authz-titled proof vocabulary keeps precedence.
-  if (DISCLOSURE_CWE_RE.test(parts.cwe ?? '') || DISCLOSURE_RE.test(text) ||
-      DISCLOSURE_RE.test(parts.category ?? '')) return 'disclosure'
+  // secret-shaped value. Narrative-only disclosure words remain last so authz vocabulary wins.
+  if (DISCLOSURE_RE.test(text) || DISCLOSURE_RE.test(parts.category ?? '')) return 'disclosure'
   return 'other'
 }
 
@@ -1588,6 +1599,27 @@ function sameMutatingRequest(a: ImpactStep, b: ImpactStep): boolean {
   return aBody === bBody
 }
 
+const RESOURCE_ID_KEY_RE = /^(?:id|_id|uuid|(?:job|order|item|resource|record|entity|invoice|task)_id)$/i
+const NON_RESOURCE_ID_KEY_RE = /(?:tenant|user|owner|account|workspace|organization|org)_id$/i
+
+function resourceIdsInJson(value: unknown): Set<string> {
+  const ids = new Set<string>()
+  if (value === undefined || value === null) return ids
+  for (const [path, raw] of flattenJson(value)) {
+    const key = path.split('.').pop() ?? ''
+    const id = raw.trim()
+    if (RESOURCE_ID_KEY_RE.test(key) && !NON_RESOURCE_ID_KEY_RE.test(key) && id.length > 0 && id.length <= 128) ids.add(id)
+  }
+  return ids
+}
+
+function pathAddressesResource(pathAndQuery: string | null | undefined, id: string): boolean {
+  if (!pathAndQuery) return false
+  return pathAndQuery.split('?')[0]!.split('/').some(segment => {
+    try { return decodeURIComponent(segment) === id } catch { return segment === id }
+  })
+}
+
 /**
  * Business-logic/workflow claims assert an invariant the server never modelled in HTTP evidence.
  * A self-service owner mutation of a field the caller is entitled to edit is in policy; impact
@@ -1681,6 +1713,20 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     labels.changedFields = [...delta.changed, ...delta.added, ...delta.removed]
   }
   labels.protectedFields = labels.changedFields.filter(isProtectedField)
+  // A creator step can establish ownership of a fresh resource id even when the later transition
+  // body is empty (or form-encoded). Bind that id through the mutation route and both readbacks so
+  // a concurrent writer on an unrelated object cannot supply the observed state delta.
+  const createdResourceIds = new Set<string>()
+  for (const step of steps) {
+    if (step === mutatingProbe || steps.indexOf(step) >= steps.indexOf(mutatingProbe) ||
+        !stepMutatesState(step) || !isSuccess(step.status) ||
+        (step.actor.handle ?? null) !== (mutatingProbe.actor.handle ?? null)) continue
+    for (const id of resourceIdsInJson(step.json)) createdResourceIds.add(id)
+  }
+  const beforeResourceIds = beforeRead ? resourceIdsInJson(beforeRead.json) : new Set<string>()
+  const afterResourceIds = afterRead ? resourceIdsInJson(afterRead.json) : new Set<string>()
+  const resourceBound = Boolean(beforeRead && afterRead && [...createdResourceIds].some(id =>
+    pathAddressesResource(mutatingProbe.pathAndQuery, id) && beforeResourceIds.has(id) && afterResourceIds.has(id)))
   // K=6 cross-talk guard: a delta caused by another worker's write is not this probe's impact.
   // The after-read must reflect a value this probe sent (or a marker it injected).
   const sent = new Set<string>()
@@ -1690,9 +1736,11 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
       for (const token of value.slice(0, 256).match(/[A-Za-z0-9_-]{8,64}/g) ?? []) sent.add(token)
     }
   }
+  labels.oracleDeclared = hasOracle(input.oracleEvents, ['invariant_violation', 'workflow_skip', 'race_double_spend', 'state_delta', 'privilege_escalation'])
   const afterFields = afterRead?.json !== undefined ? flattenJson(afterRead.json) : new Map<string, string>()
   const attributable = labels.changedFields.some(path => sent.has(afterFields.get(path) ?? '')) ||
-    (afterRead !== null && [...sent].some(token => String(afterRead.body ?? '').includes(token)))
+    (afterRead !== null && [...sent].some(token => String(afterRead.body ?? '').includes(token))) ||
+    resourceBound
   if (labels.persisted && !attributable && !labels.oracleDeclared) {
     return {
       required: true,
@@ -1701,7 +1749,6 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
       evidence: labels,
     }
   }
-  labels.oracleDeclared = hasOracle(input.oracleEvents, ['invariant_violation', 'workflow_skip', 'race_double_spend', 'state_delta', 'privilege_escalation'])
   // A create-time caller-chosen *money* value (invoice amount, price) is not an invariant: the app
   // may legitimately accept it, and no control arm binds it. Require the endpoint's declared
   // invariant event for price/amount-only persistences on create-shaped probes.
@@ -1714,11 +1761,13 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
       evidence: labels,
     }
   }
-  if (labels.persisted && (labels.protectedFields.length > 0 || labels.oracleDeclared)) {
+  if (labels.persisted && (labels.protectedFields.length > 0 || labels.oracleDeclared || resourceBound)) {
     return {
       required: true,
       satisfied: true,
-      reason: `Persisted ${labels.protectedFields.length ? `protected field(s) ${labels.protectedFields.slice(0, 6).join(', ')}` : 'state change with a declared invariant event'}${labels.oracleDeclared ? `; oracle ${input.oracleEvents!.join(',')}` : ''}`,
+      reason: resourceBound
+        ? `A fresh resource created by this proof moved from its recorded initial state after the bound transition (${labels.changedFields.slice(0, 6).join(', ')}), so the skipped-prerequisite delta is attributable to this replay.`
+        : `Persisted ${labels.protectedFields.length ? `protected field(s) ${labels.protectedFields.slice(0, 6).join(', ')}` : 'state change with a declared invariant event'}${labels.oracleDeclared ? `; oracle ${input.oracleEvents!.join(',')}` : ''}`,
       evidence: labels,
     }
   }
@@ -1745,6 +1794,8 @@ export interface BooleanDifferentialArm {
   method?: string
   pathAndQuery?: string
   requestJson?: unknown
+  /** Raw non-JSON request body (e.g. application/x-www-form-urlencoded or application/xml). */
+  requestBody?: string
   requestHeaders?: Record<string, string> | null
   json?: unknown
   body?: string
@@ -1889,9 +1940,61 @@ function decodedText(value: string): string {
   try { return decodeURIComponent(value) } catch { return value }
 }
 
+function paramValueFromTextBody(rawBody: string | undefined, param: string): string | null {
+  if (!rawBody || !rawBody.trim()) return null
+  const trimmed = rawBody.trim()
+  const wanted = param.split('.').pop() ?? param
+  if (trimmed.startsWith('<')) {
+    const esc = wanted.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const match = new RegExp(`<${esc}(?:\\s[^>]*)?>([\\s\\S]*?)</${esc}>`, 'i').exec(trimmed)
+    if (match?.[1] !== undefined) {
+      return match[1]
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&amp;/g, '&')
+    }
+  }
+  if (trimmed.includes('=')) {
+    try {
+      const sp = new URLSearchParams(trimmed)
+      if (sp.has(param)) return sp.get(param)
+      if (wanted !== param && sp.has(wanted)) return sp.get(wanted)
+    } catch { /* ignore */ }
+  }
+  return null
+}
+
+function maskTextBodyParam(rawBody: string | undefined, param: string): string | null {
+  if (!rawBody || !rawBody.trim()) return null
+  const trimmed = rawBody.trim()
+  const wanted = param.split('.').pop() ?? param
+  if (trimmed.startsWith('<')) {
+    const esc = wanted.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return trimmed.replace(new RegExp(`(<${esc}(?:\\s[^>]*)?>)[\\s\\S]*?(</${esc}>)`, 'gi'), '$1{{injected}}$2')
+  }
+  if (trimmed.includes('=')) {
+    try {
+      const sp = new URLSearchParams(trimmed)
+      if (sp.has(param)) sp.set(param, '{{injected}}')
+      else if (wanted !== param && sp.has(wanted)) sp.set(wanted, '{{injected}}')
+      return [...sp.entries()].map(([k, v]) => `${k}=${v}`).sort().join('&')
+    } catch { /* ignore */ }
+  }
+  return trimmed
+}
+
+function rawTextBodyOf(arm: BooleanDifferentialArm): string | undefined {
+  if (typeof arm.requestBody === 'string' && arm.requestBody.length > 0) return arm.requestBody
+  if (typeof arm.requestJson === 'string' && arm.requestJson.length > 0) return arm.requestJson
+  return undefined
+}
+
 function injectedParamValue(arm: BooleanDifferentialArm, param: string): string | null {
   return paramValueFromQuery(arm.pathAndQuery, param) ??
     paramValueFromJson(arm.requestJson, param) ??
+    paramValueFromTextBody(rawTextBodyOf(arm), param) ??
     paramValueFromHeader(arm.requestHeaders, param)
 }
 
@@ -1976,10 +2079,12 @@ function canonicalHeaders(headers: Record<string, string> | null | undefined, pa
 }
 
 function requestShape(arm: BooleanDifferentialArm, param: string): string {
+  const rawBody = rawTextBodyOf(arm)
   return JSON.stringify({
     method: (arm.method ?? '').toUpperCase(),
     path: maskedPath(arm.pathAndQuery, param),
-    json: arm.requestJson === undefined ? null : maskJsonParam(arm.requestJson, param),
+    json: arm.requestJson === undefined || typeof arm.requestJson === 'string' ? null : maskJsonParam(arm.requestJson, param),
+    body: rawBody === undefined ? null : maskTextBodyParam(rawBody, param),
     headers: canonicalHeaders(arm.requestHeaders, param),
   })
 }

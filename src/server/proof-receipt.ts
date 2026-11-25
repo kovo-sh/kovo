@@ -12,8 +12,10 @@
  * produce the same artifact, so promotion, patch retest, and reporting share one confirmation
  * path instead of three.
  */
+import { createHmac } from 'node:crypto'
 import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
+import { HostFactLog } from './host-fact-log.ts'
 import {
   assessBooleanDifferential,
   assessImpactEvidence,
@@ -22,7 +24,6 @@ import {
   hasForeignTenantOrOwnerDisclosure,
   isObjectScopedRequest,
   knownOracleEvent,
-  parseRoleLabel,
   routeFamily,
   stepMutatesState,
 } from './oracle-invariants.ts'
@@ -128,14 +129,14 @@ export interface ReceiptVerification {
   confirmed: boolean
   vulnClass: string
   /** Rule family used to validate the receipt. */
-  rule: 'impact' | 'oob' | 'timing' | 'boolean' | 'status_differential' | 'browser' | 'redirect' | 'conserved_balance' | 'auth_bypass' | 'none'
+  rule: 'impact' | 'oob' | 'timing' | 'boolean' | 'status_differential' | 'browser' | 'redirect' | 'conserved_balance' | 'auth_bypass' | 'webhook' | 'none'
   reason: string
   observed: string
   expected: string
   evidence?: Record<string, unknown>
 }
 
-const OOB_CLASS_RE = /^(?:ssrf|xxe|blind_ssrf|blind_xxe|oob|webhook_forgery)$/i
+const OOB_CLASS_RE = /^(?:ssrf|xxe|blind_ssrf|blind_xxe|oob)$/i
 const TIMING_CLASS_RE = /^(?:blind_sqli|sqli_time|sql_time|timing)$/i
 const BOOLEAN_CLASS_RE = /^(?:sqli|sql_boolean|sql_boolean_diff|boolean_sqli|boolean_differential)$/i
 /**
@@ -190,8 +191,13 @@ const IMPACT_CLASS_BY_VULN: Readonly<Record<string, ImpactClass>> = {
 }
 
 /** Classify a receipt's vulnerability label into the shared impact model (or a non-impact rule). */
-export function receiptRuleFor(vulnClass: string): { rule: ReceiptVerification['rule']; impactClass?: ImpactClass } {
+export function receiptRuleFor(vulnClass: string, receipt?: Pick<ProofReceipt, 'oobEventIds'>): { rule: ReceiptVerification['rule']; impactClass?: ImpactClass } {
   if (OOB_CLASS_RE.test(vulnClass)) return { rule: 'oob' }
+  // Webhook forgery has two evidence models: a durable callback remains OOB, while an inline-key
+  // self-signed delivery must prove the signature/control differential over host-recorded requests.
+  if (/^webhook_forgery$/i.test(vulnClass)) {
+    return receipt && receipt.oobEventIds.length === 0 ? { rule: 'webhook' } : { rule: 'oob' }
+  }
   if (STATUS_DIFF_CLASS_RE.test(vulnClass)) return { rule: 'status_differential' }
   if (BOOLEAN_CLASS_RE.test(vulnClass)) return { rule: 'boolean' }
   if (TIMING_CLASS_RE.test(vulnClass)) return { rule: 'timing' }
@@ -240,6 +246,84 @@ function hostOf(value: string | null, base?: string | null): string | null {
   try { return new URL(value, base ?? 'http://kovo.invalid').host.toLowerCase() } catch { return null }
 }
 
+interface InlineWebhookSignature {
+  valid: boolean
+  delivery: string
+  keyField: string
+  signatureField: string
+}
+
+/** Recompute an inline-key webhook HMAC strictly from the host-recorded request body. */
+function inlineWebhookSignature(step: ImpactStep): InlineWebhookSignature | null {
+  const body = step.requestJson
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null
+  const record = body as Record<string, unknown>
+  const entries = Object.entries(record)
+  const keyField = entries.find(([key, value]) => typeof value === 'string' && value.length > 0 &&
+    /(?:^|_)(?:key|secret)$|^(?:signing|webhook|hmac)(?:key|secret)$/i.test(key))?.[0]
+  const signatureField = entries.find(([key, value]) => typeof value === 'string' && value.length > 0 &&
+    /(?:^|_)(?:signature|sig)$|signature$/i.test(key))?.[0]
+  if (!keyField || !signatureField) return null
+  const key = String(record[keyField])
+  const signature = String(record[signatureField])
+  const timestampField = entries.find(([name]) => /(?:^|_)(?:ts|timestamp)$/i.test(name))?.[0]
+  const eventField = entries.find(([name]) => /^(?:event|payload|data)$/i.test(name))?.[0]
+  const withoutSignature: Record<string, unknown> = { ...record }
+  delete withoutSignature[signatureField]
+  const event = eventField ? withoutSignature[eventField] : withoutSignature
+  const asText = (value: unknown): string => typeof value === 'string' ? value : (JSON.stringify(value) ?? String(value))
+  const comparable = eventField ? event : Object.fromEntries(Object.entries(withoutSignature).filter(([name]) =>
+    name !== keyField && name !== timestampField))
+  const result: InlineWebhookSignature = {
+    valid: false,
+    delivery: JSON.stringify(comparable),
+    keyField,
+    signatureField,
+  }
+  const candidates: string[] = []
+  if (timestampField && withoutSignature[timestampField] !== undefined) {
+    candidates.push(`${String(withoutSignature[timestampField])}.${asText(event)}`)
+    candidates.push(`${String(withoutSignature[timestampField])}.${JSON.stringify(withoutSignature)}`)
+  }
+  candidates.push(asText(event), JSON.stringify(withoutSignature))
+  for (const canonical of candidates) {
+    const hex = createHmac('sha256', key).update(canonical).digest('hex')
+    const base64 = createHmac('sha256', key).update(canonical).digest('base64')
+    if (signature === hex || signature === base64) return { ...result, valid: true }
+  }
+  return result
+}
+
+function webhookAcknowledged(step: ImpactStep): boolean {
+  const visit = (value: unknown, depth: number): boolean => {
+    if (depth > 4 || !value || typeof value !== 'object') return false
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (/^(?:ok|received|processed|accepted|success)$/i.test(key) &&
+          (child === true || (typeof child === 'string' && /^(?:true|processed|accepted|received)$/i.test(child)))) return true
+      if (visit(child, depth + 1)) return true
+    }
+    return false
+  }
+  return visit(step.json, 0)
+}
+
+function webhookReadbackBound(steps: readonly ImpactStep[], probeIndex: number, request: ImpactStep['requestJson']): boolean {
+  const ids = new Set<string>()
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 4 || !value || typeof value !== 'object') return
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (/(?:^|_)(?:id|uuid)$/i.test(key) && typeof child === 'string' && child.length <= 128) ids.add(child)
+      visit(child, depth + 1)
+    }
+  }
+  visit(request, 0)
+  return ids.size > 0 && steps.slice(probeIndex + 1).some(step => {
+    if (!/^(?:GET|HEAD|OPTIONS)$/i.test(step.method ?? '') || !is2xxStatus(step.status)) return false
+    const response = step.body ?? (step.json !== undefined ? JSON.stringify(step.json) : '')
+    return [...ids].some(id => response.includes(id))
+  })
+}
+
 /**
  * Validate one receipt against the transcript. A receipt with a missing exchange, a missing OOB
  * event, a mismatched target, or an impact claim the oracle model cannot substantiate is rejected —
@@ -259,7 +343,7 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     }
   }
   const receipt = parsed.data
-  const { rule, impactClass } = receiptRuleFor(receipt.vulnClass)
+  const { rule, impactClass } = receiptRuleFor(receipt.vulnClass, receipt)
   if (rule === 'none') {
     return reject(receipt, rule, `No confirmation rule for vulnerability class "${receipt.vulnClass}".`)
   }
@@ -336,15 +420,31 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     }
     const param = receipt.target.param ?? deriveDifferingParam(controls[0]!, probes[0]!)
     if (!param) return reject(receipt, rule, 'A boolean differential must name the injected parameter.')
-    const toArm = (entry: ReceiptTranscriptEntry): BooleanDifferentialArm => ({
-      status: entry.step.status,
-      method: entry.step.method,
-      pathAndQuery: entry.step.pathAndQuery,
-      ...(entry.step.requestJson !== undefined ? { requestJson: entry.step.requestJson } : {}),
-      requestHeaders: entry.step.requestHeaders ?? null,
-      ...(entry.step.json !== undefined ? { json: entry.step.json } : {}),
-      ...(entry.step.body !== undefined ? { body: entry.step.body } : {}),
-    })
+    const extractCarrierRequestBody = (entry: ReceiptTranscriptEntry): string | undefined => {
+      if (typeof entry.step.requestJson === 'string' && entry.step.requestJson.length > 0) return entry.step.requestJson
+      if (entry.step.requestJson !== undefined || !entry.carrierText) return undefined
+      const lines = entry.carrierText.split('\n').map(l => l.trim()).filter(Boolean)
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        const line = lines[i]!
+        if (/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\//i.test(line)) continue
+        if (/^[A-Za-z0-9-]+:\s/.test(line)) continue
+        return line
+      }
+      return undefined
+    }
+    const toArm = (entry: ReceiptTranscriptEntry): BooleanDifferentialArm => {
+      const requestBody = extractCarrierRequestBody(entry)
+      return {
+        status: entry.step.status,
+        method: entry.step.method,
+        pathAndQuery: entry.step.pathAndQuery,
+        ...(entry.step.requestJson !== undefined ? { requestJson: entry.step.requestJson } : {}),
+        ...(requestBody !== undefined ? { requestBody } : {}),
+        requestHeaders: entry.step.requestHeaders ?? null,
+        ...(entry.step.json !== undefined ? { json: entry.step.json } : {}),
+        ...(entry.step.body !== undefined ? { body: entry.step.body } : {}),
+      }
+    }
     const rounds: BooleanDifferentialRound[] = controls.map((control, index) => ({
       control: toArm(control),
       probe: toArm(probes[index]!),
@@ -537,6 +637,56 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
       observed: receipt.claimedDelta,
       expected: 'the marker-bearing request stays local',
       evidence: { locationHost, canaryPattern: canaryPattern ?? null },
+    }
+  }
+
+  if (rule === 'webhook') {
+    if (receipt.exchangeIds.length < 2) return reject(receipt, rule, 'An inline-key webhook receipt needs a rejected control and an accepted probe delivery.')
+    const entries = receipt.exchangeIds.map(id => entriesById.get(id)!)
+    const control = entries.find(entry => entry.step.arm === 'control' && entry.step.status !== null &&
+      entry.step.status >= 400 && entry.step.status < 500)
+    const probe = entries.find(entry => entry.step.arm === 'probe' && is2xxStatus(entry.step.status))
+    if (!control || !probe) return reject(receipt, rule, 'An inline-key webhook receipt needs a 4xx control and a 2xx probe on the recorded receiver route.')
+    if (control.step.method.toUpperCase() !== probe.step.method.toUpperCase() || routeOf(control.step) !== routeOf(probe.step)) {
+      return reject(receipt, rule, 'The webhook control and probe deliveries do not target the same method and route.')
+    }
+    if ((control.step.actor.handle ?? null) !== (probe.step.actor.handle ?? null)) {
+      return reject(receipt, rule, 'The webhook control and probe deliveries use different actors.')
+    }
+    if (receipt.target.method && receipt.target.method.toUpperCase() !== probe.step.method.toUpperCase()) {
+      return reject(receipt, rule, 'The webhook receipt target method does not match the accepted delivery.')
+    }
+    if (receipt.target.pathAndQuery && normalizePath(receipt.target.pathAndQuery) !== routeOf(probe.step)) {
+      return reject(receipt, rule, 'The webhook receipt target route does not match the accepted delivery.')
+    }
+    if ((control.origin && normalizeOrigin(control.origin) !== normalizeOrigin(receipt.target.origin)) ||
+        (probe.origin && normalizeOrigin(probe.origin) !== normalizeOrigin(receipt.target.origin))) {
+      return reject(receipt, rule, 'The webhook delivery origin does not match the receipt target.')
+    }
+    const controlSignature = inlineWebhookSignature(control.step)
+    const probeSignature = inlineWebhookSignature(probe.step)
+    if (!controlSignature || !probeSignature) return reject(receipt, rule, 'The host-recorded webhook bodies do not carry inline key/signature fields.')
+    if (controlSignature.valid) return reject(receipt, rule, 'The webhook control signature is valid; it is not a tampered-signature control.')
+    if (!probeSignature.valid) return reject(receipt, rule, 'The accepted webhook probe body does not carry a valid signature under its inline key.')
+    if (controlSignature.keyField !== probeSignature.keyField || controlSignature.signatureField !== probeSignature.signatureField) {
+      return reject(receipt, rule, 'The webhook control and probe use different inline key/signature fields.')
+    }
+    if (controlSignature.delivery !== probeSignature.delivery) {
+      return reject(receipt, rule, 'The webhook control and probe differ beyond their key, timestamp, and signature fields.')
+    }
+    const steps = entries.map(entry => entry.step)
+    const probeIndex = steps.indexOf(probe.step)
+    if (!webhookAcknowledged(probe.step) && !webhookReadbackBound(steps, probeIndex, probe.step.requestJson)) {
+      return reject(receipt, rule, 'The accepted webhook delivery has neither a processing acknowledgement nor an identifier-bound readback.')
+    }
+    return {
+      confirmed: true,
+      vulnClass: receipt.vulnClass,
+      rule,
+      reason: 'A tampered inline signature was rejected while the same delivery signed with an attacker-supplied inline key was accepted and acknowledged.',
+      observed: receipt.claimedDelta,
+      expected: 'webhook deliveries signed with an attacker-supplied key are rejected',
+      evidence: { controlExchangeId: control.exchangeId, probeExchangeId: probe.exchangeId },
     }
   }
 
@@ -1567,41 +1717,6 @@ export interface ScriptProofExchange {
   responseHeaders?: Record<string, string> | null
 }
 
-function deriveHostAmbientAuth(exchange: ScriptProofExchange): ImpactStep['actor']['auth'] {
-  if (exchange.ambientAuth && exchange.ambientAuth !== 'unknown') return exchange.ambientAuth
-  const headers = exchange.requestHeaders
-  if (headers) {
-    const auth = headerValue(headers, 'authorization')
-    const cookie = headerValue(headers, 'cookie')
-    if (cookie && !auth) return 'cookie'
-    if (auth) return /^bearer\s+/i.test(auth) ? 'bearer' : 'header'
-    if (headerValue(headers, 'x-api-key') || headerValue(headers, 'x-auth-token')) return 'header'
-  }
-  return 'unknown'
-}
-
-function extractSameSiteFromSetCookie(setCookie: string | null): string | null {
-  if (!setCookie) return null
-  const m = /;\s*samesite\s*=\s*(strict|lax|none)\b/i.exec(setCookie)
-  if (!m?.[1]) return null
-  const lower = m[1].toLowerCase()
-  return lower === 'strict' ? 'Strict' : lower === 'lax' ? 'Lax' : 'None'
-}
-
-function deriveHostSameSite(exchange: ScriptProofExchange, allExchanges: readonly ScriptProofExchange[]): string | null {
-  if (exchange.sessionSameSite !== undefined) return exchange.sessionSameSite
-  const own = extractSameSiteFromSetCookie(headerValue(exchange.responseHeaders, 'set-cookie'))
-  if (own) return own
-  const exchangeOrigin = normalizeOrigin(exchange.origin)
-  for (const item of allExchanges) {
-    if (exchangeOrigin && item.origin && normalizeOrigin(item.origin) !== exchangeOrigin) continue
-    if (exchange.personaHandle && item.personaHandle && item.personaHandle !== exchange.personaHandle) continue
-    const found = extractSameSiteFromSetCookie(headerValue(item.responseHeaders, 'set-cookie'))
-    if (found) return found
-  }
-  return null
-}
-
 const IMPACT_CLASS_TO_VULN_CLASS: Readonly<Record<string, string>> = {
   authorization: 'authorization',
   bfla: 'bfla',
@@ -1621,127 +1736,42 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.length > 0) : []
 }
 
-function impactStepOf(
-  exchange: ScriptProofExchange,
-  overrides?: {
-    arm?: ImpactStep['arm']
-    requestJson?: unknown
-    ambientAuth?: ImpactStep['actor']['auth']
-    sameSite?: string | null
-  },
-): ImpactStep {
-  const roleLabel = exchange.actorRoleLabel ?? null
-  const parsed = parseRoleLabel(roleLabel ?? exchange.personaHandle ?? null)
-  const arm = overrides?.arm ?? (exchange.sessionRole === 'control' || exchange.sessionRole === 'probe' ||
-    exchange.sessionRole === 'cleanup' || exchange.sessionRole === 'setup'
-    ? exchange.sessionRole
-    : 'setup')
-  let json: unknown
-  if (exchange.body !== undefined) {
-    try { json = JSON.parse(exchange.body) } catch { json = undefined }
-  }
-  return {
-    id: exchange.exchangeId,
-    arm,
-    method: (exchange.method || 'GET').toUpperCase(),
-    route: (exchange.pathAndQuery || '/').split('?')[0],
-    pathAndQuery: exchange.pathAndQuery || '/',
-    status: exchange.status,
-    actor: {
-      handle: exchange.personaHandle ?? null,
-      role: parsed.role,
-      tenant: parsed.tenant,
-      auth: overrides?.ambientAuth ?? 'unknown',
-      sameSite: overrides?.sameSite ?? null,
-    },
-    ...(json !== undefined ? { json } : {}),
-    ...(exchange.body !== undefined ? { body: exchange.body } : {}),
-    ...(overrides?.requestJson !== undefined ? { requestJson: overrides.requestJson } : {}),
-    ...(exchange.requestHeaders ? { requestHeaders: exchange.requestHeaders } : {}),
-    ...(exchange.responseHeaders ? { responseHeaders: exchange.responseHeaders } : {}),
-    ...(exchange.durationMs !== undefined ? { durationMs: exchange.durationMs } : {}),
-  }
-}
-
 /**
- * Derive a receipt from a confirmed script run. `claims` are the oracle-checked claim objects the
- * SDK returned (already re-evaluated against the signed transcript); they are used only to name the
- * class, the target and the exchange set. Every cited id must exist in `exchanges`.
+ * Derive a receipt from a confirmed script run. `claims` are used only to select the class,
+ * target, and exchange IDs; all request bodies, actor roles/tenants, ambient auth, SameSite,
+ * and exchange ordering are derived strictly from the immutable `HostFactLog`.
  */
 export function buildAgentScriptReceipt(input: {
   claims: readonly Record<string, unknown>[]
   exchanges: readonly ScriptProofExchange[]
+  /** Optional pre-populated immutable HostFactLog (takes precedence over `exchanges`). */
+  factLog?: HostFactLog
   /** Host-recorded OOB callback events (for `kind === 'oob'` claims). */
   oobEvents?: readonly ReceiptOobEvent[]
   origin: string
   title: string
-}): { receipt: ProofReceipt; transcript: ReceiptTranscript } | null {
+}): {
+  receipt: ProofReceipt
+  transcript: ReceiptTranscript
+  factLog: HostFactLog
+  armOverrides: Map<string, ImpactStep['arm']>
+  evidenceRoleOverrides?: Map<string, string>
+} | null {
+  const factLog = input.factLog ?? HostFactLog.fromScriptExchanges(input.exchanges, input.oobEvents)
   const byId = new Map(input.exchanges.map(exchange => [exchange.exchangeId, exchange]))
-  const orderById = new Map(input.exchanges.map((exchange, index) => [exchange.exchangeId, index]))
-  const hostOrderOf = (id: string): number => {
-    const ex = byId.get(id)
-    if (ex && typeof ex.seq === 'number' && Number.isFinite(ex.seq)) return ex.seq
-    return orderById.get(id) ?? 0
-  }
+  const hasExchange = (id: string): boolean => Boolean(factLog.getExchange(id) || byId.has(id))
   const sortByHostOrder = (ids: readonly string[]): string[] =>
-    [...new Set(ids)].sort((a, b) => {
-      const diff = hostOrderOf(a) - hostOrderOf(b)
-      if (diff !== 0) return diff
-      const startA = byId.get(a)?.startedAt ?? 0
-      const startB = byId.get(b)?.startedAt ?? 0
-      return startA - startB
-    })
+    factLog.orderedExchanges(ids).map(fact => fact.exchangeId)
   const buildTranscript = (
     armOverrides: ReadonlyMap<string, ImpactStep['arm']>,
     extra?: {
-      requestJsonById?: ReadonlyMap<string, unknown>
       evidenceRoleOverrides?: ReadonlyMap<string, string>
     },
-  ): ReceiptTranscript => ({
-    entries: input.exchanges.map(exchange => {
-      // C-5 / H-13: Host-recorded `exchange.requestBody` ALWAYS takes precedence and can never
-      // be overridden by `requestJsonById` or script-declared `claim.requestBody`.
-      const hostReq = exchange.requestBody !== undefined && exchange.requestBody !== null
-        ? (() => { try { return JSON.parse(exchange.requestBody) } catch { return exchange.requestBody } })()
-        : undefined
-      const perExchangeReq = hostReq !== undefined
-        ? hostReq
-        : extra?.requestJsonById?.has(exchange.exchangeId)
-          ? extra.requestJsonById.get(exchange.exchangeId)
-          : undefined
-      const hostAmbientAuth = deriveHostAmbientAuth(exchange)
-      const hostSameSite = deriveHostSameSite(exchange, input.exchanges)
-      const carrierParts = [
-        exchange.pathAndQuery ?? '',
-        exchange.requestHeaders ? JSON.stringify(exchange.requestHeaders) : '',
-        exchange.requestBody ?? '',
-        exchange.body ?? '',
-      ].filter(Boolean)
-      return {
-        exchangeId: exchange.exchangeId,
-        step: impactStepOf(exchange, {
-          ...(armOverrides.has(exchange.exchangeId) ? { arm: armOverrides.get(exchange.exchangeId)! } : {}),
-          ...(perExchangeReq !== undefined ? { requestJson: perExchangeReq } : {}),
-          ambientAuth: hostAmbientAuth,
-          sameSite: hostSameSite,
-        }),
-        ...(exchange.durationMs !== undefined ? { durationMs: exchange.durationMs } : {}),
-        ...(exchange.op ? { op: exchange.op } : {}),
-        seq: hostOrderOf(exchange.exchangeId),
-        ...(exchange.startedAt !== undefined ? { startedAt: exchange.startedAt } : {}),
-        ...(exchange.endedAt !== undefined ? { endedAt: exchange.endedAt } : {}),
-        ...(exchange.origin ? { origin: exchange.origin } : {}),
-        ...(exchange.consumedCapabilityId !== undefined ? { consumedCapabilityId: exchange.consumedCapabilityId } : {}),
-        ...(exchange.consumedCapabilities !== undefined ? { consumedCapabilities: exchange.consumedCapabilities } : {}),
-        ...(exchange.sessionId !== undefined ? { sessionId: exchange.sessionId } : {}),
-        ...(carrierParts.length > 0 ? { carrierText: carrierParts.join('\n') } : {}),
-        ...(extra?.evidenceRoleOverrides?.has(exchange.exchangeId)
-          ? { evidenceRole: extra.evidenceRoleOverrides.get(exchange.exchangeId)! }
-          : exchange.sessionRole ? { evidenceRole: exchange.sessionRole } : {}),
-      }
-    }),
+  ): ReceiptTranscript => factLog.toReceiptTranscript({
+    armOverrides,
+    ...(extra?.evidenceRoleOverrides ? { evidenceRoleOverrides: extra.evidenceRoleOverrides } : {}),
   })
-  const cited = (ids: readonly string[]) => ids.filter(id => byId.has(id))
+  const cited = (ids: readonly string[]) => ids.filter(hasExchange)
 
   for (const claim of input.claims) {
     if (recordField(claim, 'kind') !== 'impact') continue
@@ -1800,8 +1830,6 @@ export function buildAgentScriptReceipt(input: {
         }
       }
     }
-    const requiredRole = recordField(claim, 'requiredRole')
-    const resourceTenant = recordField(claim, 'resourceTenant')
     const proofPatterns = stringArray(recordField(claim, 'proofPatterns')).filter(p => p.length >= 4 && p.length <= 200).slice(0, 4)
     return {
       receipt: buildProofReceipt({
@@ -1815,15 +1843,13 @@ export function buildAgentScriptReceipt(input: {
         oobEventIds: [],
         browserTraceIds: [],
         claimedDelta: `${input.title} — script claims ${impactClass} impact over ${exchangeIds.length} host-recorded exchange(s).`.slice(0, 1200),
-        ...(requiredRole === 'viewer' || requiredRole === 'member' || requiredRole === 'admin' || requiredRole === 'owner'
-          ? { requiredRole }
-          : {}),
-        ...(typeof resourceTenant === 'string' && resourceTenant ? { resourceTenant } : {}),
         ...(recordField(claim, 'expectControlDenied') === true ? { expectControlDenied: true } : {}),
         ...(hostOracleEvents.length ? { oracleEvents: hostOracleEvents } : {}),
         ...(proofPatterns.length ? { proofPatterns } : {}),
       }),
       transcript,
+      factLog,
+      armOverrides,
     }
   }
 
@@ -1892,6 +1918,8 @@ export function buildAgentScriptReceipt(input: {
         expectControlDenied,
       }),
       transcript,
+      factLog,
+      armOverrides,
     }
   }
 
@@ -1915,20 +1943,16 @@ export function buildAgentScriptReceipt(input: {
       recordField(c, 'text') === marker &&
       typeof recordField(c, 'exchangeId') === 'string' &&
       recordField(c, 'exchangeId') !== probeId &&
-      byId.has(recordField(c, 'exchangeId') as string))
+      hasExchange(recordField(c, 'exchangeId') as string))
     if (!absent) continue
     const controlId = recordField(absent, 'exchangeId') as string
-    const exchangeIds = [controlId, probeId].sort((a, b) => (orderById.get(a) ?? 0) - (orderById.get(b) ?? 0))
+    const exchangeIds = sortByHostOrder([controlId, probeId])
     const armOverrides = new Map<string, ImpactStep['arm']>([
       [controlId, 'control'],
       [probeId, 'probe'],
     ])
-    const requestJsonById = new Map<string, unknown>()
-    const controlReqBody = recordField(absent, 'controlRequestBody') ?? recordField(absent, 'requestBody') ?? recordField(present, 'controlRequestBody')
-    const probeReqBody = recordField(present, 'probeRequestBody') ?? recordField(present, 'requestBody')
-    if (controlReqBody !== undefined) requestJsonById.set(controlId, controlReqBody)
-    if (probeReqBody !== undefined) requestJsonById.set(probeId, probeReqBody)
-    const transcript = buildTranscript(armOverrides, requestJsonById.size ? { requestJsonById } : undefined)
+    // Request bodies come strictly from immutable HostFactLog — never from worker claim scalars.
+    const transcript = buildTranscript(armOverrides)
     const rawExplicit = typeof recordField(present, 'vulnClass') === 'string'
       ? (recordField(present, 'vulnClass') as string).trim().toLowerCase()
       : ''
@@ -1957,6 +1981,8 @@ export function buildAgentScriptReceipt(input: {
         proofPatterns: [marker],
       }),
       transcript,
+      factLog,
+      armOverrides,
     }
   }
 
@@ -1991,6 +2017,8 @@ export function buildAgentScriptReceipt(input: {
           claimedDelta: `${input.title} — paired boolean differential over ${controls.length} recorded round(s).`.slice(0, 1200),
         }),
         transcript,
+        factLog,
+        armOverrides,
       }
     }
     if (kind === 'timing') {
@@ -2038,6 +2066,8 @@ export function buildAgentScriptReceipt(input: {
           claimedDelta: `${input.title} — timing separation over ${controls.length}/${variants.length} recorded arms.`.slice(0, 1200),
         }),
         transcript,
+        factLog,
+        armOverrides,
       }
     }
     if (kind === 'conserved_balance' || kind === 'race') {
@@ -2122,6 +2152,9 @@ export function buildAgentScriptReceipt(input: {
             : {}),
         }),
         transcript,
+        factLog,
+        armOverrides,
+        evidenceRoleOverrides,
       }
     }
   }
@@ -2227,6 +2260,7 @@ export function buildAgentScriptReceipt(input: {
       ...(oobEvent.targetOrigin ? {} : { targetOrigin: primaryCarrier?.origin || input.origin }),
       ...(injectedAtMs !== undefined && oobEvent.injectedAtMs === undefined ? { injectedAtMs } : {}),
     }
+    factLog.recordOobEvent(normalizedOobEvent)
     return {
       receipt: buildOobReceipt({
         vulnClass,
@@ -2242,6 +2276,8 @@ export function buildAgentScriptReceipt(input: {
         ...baseTranscript,
         oobEvents: [normalizedOobEvent],
       },
+      factLog,
+      armOverrides,
     }
   }
 
