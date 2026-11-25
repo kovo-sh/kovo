@@ -132,8 +132,6 @@ function Matrix({ M, sort, setSort, filter, setFilter, modeSeg, onGaps }: {
     rows.forEach(o => CATS.forEach(c => { ct[cellStatus(M, o.origin, c[0])]++ }))
     return ct
   }, [rows, M])
-  const total = rows.length * CATS.length
-  const charted = total - counts.untested
   const nf = model.findings.length
   const conf = model.findings.filter(f => normFStatus(f.status) === 'confirmed').length
   const gaps = detail.coverageEntries.filter(x => x.proofGapReason).length
@@ -246,13 +244,13 @@ function Matrix({ M, sort, setSort, filter, setFilter, modeSeg, onGaps }: {
   })
 
   return <>
-    <div className="toolbar sf-lgbar" style={{ paddingLeft: 12 }}>{legend}</div>
-    <div className="strip num sf-strip">
-      <span><b className="sf-b">{rows.length}</b> {M.ghost ? 'seed hosts' : 'origins'} × <b className="sf-b">{CATS.length}</b> categories</span>
-      <span className="hide-n sf-dim">{fmtN(charted)} of {fmtN(total)} charted</span>
-      <span className="hide-n sf-dim">{plural(nf, 'finding')}{nf ? ', ' + conf + ' confirmed' : ''}</span>
-      {gaps > 0 && <button type="button" className="linkbtn hide-n" style={{ margin: 0 }} title="Coverage notes the coordinator could not prove either way"
-        onClick={onGaps}>{plural(gaps, 'proof gap')}<Icon name="arrowR" /></button>}
+    <div className="toolbar sf-mxbar num" style={{ paddingLeft: 12 }}>
+      {legend}
+      <span className="sf-mxmeta hide-n" title={`${plural(rows.length, M.ghost ? 'seed host' : 'origin')} × ${CATS.length} categories · ${plural(nf, 'finding')}${nf ? ', ' + conf + ' confirmed' : ''}`}>
+        {plural(rows.length, M.ghost ? 'seed' : 'origin')}
+        {gaps > 0 && <> · <button type="button" className="linkbtn" style={{ margin: 0 }} title="Coverage notes the coordinator could not prove either way"
+          onClick={onGaps}>{plural(gaps, 'gap')}<Icon name="arrowR" /></button></>}
+      </span>
       <span className="tb-sp" />
       {!M.ghost && <Seg<Sort> label="Sort" value={sort} onChange={setSort} options={[{ value: 'risk', label: 'Risk' }, { value: 'findings', label: 'Findings' }, { value: 'az', label: 'A–Z' }]} />}
       {modeSeg}

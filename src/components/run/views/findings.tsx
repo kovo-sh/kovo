@@ -117,16 +117,13 @@ function FindingRowView({ f, group, cur, onClick, style, local }: {
   local?: string | null
 }) {
   const st = normFStatus(f.status)
-  const chain = f.findingKind === 'multi_step_chain'
   return <div className={'row frow' + (cur ? ' cur' : '')} data-id={f.id} onClick={onClick} style={style} aria-selected={cur}>
     {group !== 'severity' && <span className="g" title={SEV_LABEL[f.severity] ?? f.severity}><SevGlyph sev={f.severity} /></span>}
     <span className="g" title={stLabel(st)}><StatusGlyph status={st} /></span>
     <span className="title">{f.title}</span>
-    {local && <span className="dec fdec" title="Local triage, saved in this browser only">{local}</span>}
-    {chain && <span className="tag" title="Multi-step chain"><Icon name="chain" />Chain</span>}
-    {f.category && <span className="c-tag"><span className="tag">{prettyCat(f.category)}</span></span>}
+    {local && <span className="dec fdec" title="Saved locally in this browser">{local}</span>}
+    {f.category && <span className="c-cat">{prettyCat(f.category)}</span>}
     {group !== 'origin' && <span className="c-host mono">{host(f.origin)}</span>}
-    <span className="c-cwe mono">{f.cwe ?? ''}</span>
   </div>
 }
 

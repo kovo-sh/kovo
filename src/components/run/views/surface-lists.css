@@ -19,12 +19,10 @@
 .rw .sf-olist .dd-item{height:28px}
 
 /* surface: matrix ------------------------------------------------------- */
-.rw .sf-strip{padding-top:7px;padding-bottom:7px;container-type:inline-size}
-.rw .sf-strip .sf-b{color:var(--fg);font-weight:500}
-.rw .sf-strip .sf-dim{color:var(--fg-3)}
-@container (max-width: 900px){ .rw .sf-strip .hide-n{display:none} }
-.rw .sf-lgbar{container-type:inline-size}
-@container (max-width: 620px){ .rw .sf-lgbar .lg .lt{display:none} }
+.rw .sf-mxbar{container-type:inline-size;gap:8px}
+.rw .sf-mxmeta{font-size:12px;color:var(--fg-3);white-space:nowrap;flex:none;display:inline-flex;align-items:center;gap:4px}
+@container (max-width: 960px){ .rw .sf-mxbar .hide-n{display:none} }
+@container (max-width: 780px){ .rw .sf-mxbar .lg .lt{display:none} }
 .rw .sf-oh{display:flex;align-items:flex-end;height:40px;padding-left:6px;font-size:11.5px;color:var(--fg-2)}
 .rw .sf-fh{font-size:11px;color:var(--fg-2)}
 .rw .sf-pinlegend{margin-top:14px;color:var(--fg-3);font-size:11.5px;gap:6px 14px}
@@ -34,14 +32,18 @@
 .rw .sf:focus-visible{box-shadow:inset 0 0 0 2px var(--accent-line)}
 .rw .sf-cs{font-size:12px;color:var(--fg-2);margin-bottom:12px;gap:6px 12px}
 
-/* surface: list --------------------------------------------------------- */
+/* surface: list & endpoints --------------------------------------------- */
 .rw .row .sf-cat{width:150px}
-.rw .row .sf-host{flex:none;width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rw .row .sf-host,.rw .sf-ep-head .sf-host{flex:none;width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .rw .row .sf-sum{color:var(--fg-2)}
 .rw .sf-mark{display:inline-flex;color:var(--fg-3);flex:none}
 .rw .sf-mark.warn{color:var(--warn)}
 .rw .sf-tbt{font-size:12px;color:var(--fg-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .rw .sf-tbt b{color:var(--fg);font-weight:500}
+.rw .sf-ep-head{flex:none;height:28px;display:flex;align-items:center;gap:10px;padding:0 18px 0 18px;border-bottom:1px solid var(--line);background:var(--sunk);color:var(--fg-3);font-size:11px;font-weight:500;letter-spacing:.01em;user-select:none}
+.rw .sf-ep-head .c-meth,.rw .sf-ep-head .c-path{color:var(--fg-3);font-weight:500}
+.rw .sf-ep-auth{flex:none;width:120px;display:inline-flex;align-items:center;min-width:0;overflow:hidden}
+.rw .sf-ep-pnum{color:var(--fg-3);font-size:11px}
 
 
 /* exchanges --------------------------------------------------------------- */

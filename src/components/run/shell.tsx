@@ -66,7 +66,7 @@ export function RunShell({ detail, view, sel }: { detail: Detail; view: ViewId; 
     <KeyboardProvider>
       <ToastProvider>
         <DataWithToasts detail={detail}>
-          <NavProvider runId={runId} view={view} sel={sel} go={go} switchRun={switchRun}>
+          <NavWithRun runId={runId} view={view} sel={sel} go={go} switchRun={switchRun}>
             <DecisionsProvider>
               <OverlaysProvider>
                 <PaletteProvider>
@@ -74,7 +74,7 @@ export function RunShell({ detail, view, sel }: { detail: Detail; view: ViewId; 
                 </PaletteProvider>
               </OverlaysProvider>
             </DecisionsProvider>
-          </NavProvider>
+          </NavWithRun>
         </DataWithToasts>
       </ToastProvider>
     </KeyboardProvider>
@@ -84,6 +84,19 @@ export function RunShell({ detail, view, sel }: { detail: Detail; view: ViewId; 
 function DataWithToasts({ detail, children }: { detail: Detail; children: ReactNode }) {
   const toast = useToast()
   return <RunDataProvider initial={detail} onError={m => toast.show(m, { tone: 'error' })}>{children}</RunDataProvider>
+}
+
+function NavWithRun({ runId, view, sel, go, switchRun, children }: {
+  runId: string
+  view: ViewId
+  sel: Sel | null
+  go: (view: ViewId, sel: Sel | null, push: boolean) => void
+  switchRun: (runId: string, view?: ViewId) => void
+  children: ReactNode
+}) {
+  const { detail } = useRun()
+  const hasPendingApprovals = detail.approvals.some(a => a.status === 'pending')
+  return <NavProvider runId={runId} view={view} sel={sel} go={go} switchRun={switchRun} hasPendingApprovals={hasPendingApprovals}>{children}</NavProvider>
 }
 
 const PANE_KEY = 'guardian-rw-pane'

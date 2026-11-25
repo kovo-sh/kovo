@@ -78,7 +78,7 @@ export function buildVerdict(d: Detail, findings: readonly FindingRow[], interru
       ? capF(words(findings.length)) + ' finding' + (findings.length === 1 ? '' : 's') + ' drafted, none yet verified; ' + state + '.'
       : 'No findings drafted yet; ' + state + '.'
     dek = (interrupted ? 'The application restarted mid-round. ' : '') + (p
-      ? capF(words(p)) + ' Tier 3 request' + (p > 1 ? 's are' : ' is') + ' waiting on your decision before work can resume.'
+      ? capF(words(p)) + ' approval-gated write request' + (p > 1 ? 's' : '') + ' waiting on your decision before work can resume.'
       : r.status === 'running' ? null : 'Resume to continue from saved evidence.')
     worst = findings.filter(f => f.status !== 'dismissed').slice().sort(bySev)[0] ?? null
   } else {
@@ -99,14 +99,14 @@ export function buildVerdict(d: Detail, findings: readonly FindingRow[], interru
   }
   let conf: Verdict['conf']
   if (r.status === 'waiting') {
-    conf = { word: 'Not yet assessed', text: 'Confidence is earned by deterministic replay once work begins. Nothing has been observed.', seg: [] }
+    conf = { word: 'Not yet assessed', text: 'Confidence is earned by automated replay once work begins. Nothing has been observed.', seg: [] }
   } else {
     const standing = findings.length - n.dismissed
     const k = confirmed.length
     const ratio = standing ? k / standing : 0
     let word = ratio >= 0.6 ? 'High' : ratio >= 0.3 ? 'Moderate' : 'Limited'
     if (live) word = 'Provisional'
-    const parts = [k + ' of ' + standing + ' standing findings reproduced by Zero-LLM replay']
+    const parts = [k + ' of ' + standing + ' standing findings confirmed by automated replay']
     if (n.dismissed) parts.push(n.dismissed + ' dismissed on replay')
     if (n.inconclusive) parts.push(n.inconclusive + ' inconclusive')
     if (n.pending) parts.push(n.pending + ' awaiting verification')

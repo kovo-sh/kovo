@@ -274,7 +274,7 @@ export function collapseBaselineHeaderFindings(findings: readonly Finding[]): {
       category: HEADER_POSTURE_CATEGORY,
       cwe: cwes.join(' / ') || 'CWE-693',
       confidence: status === 'confirmed' ? 'high' : status === 'inconclusive' ? 'low' : 'medium',
-      verification: `Consolidated from ${items.length} deterministic baseline header hygiene ${items.length === 1 ? 'check' : 'checks'}.`,
+      verification: `Consolidated from ${items.length} baseline HTTP security header ${items.length === 1 ? 'check' : 'checks'}.`,
       findingKind: 'baseline_check',
       evidenceIds,
       ...(exchangeIds.length ? { exchangeIds } : {}),

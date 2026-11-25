@@ -5,7 +5,7 @@ import { capabilityTierMeta } from '../../run-state.ts'
 import { useRun, useRunModel, useVerdict } from '../data.tsx'
 import { useDecisions } from '../decisions.tsx'
 import { HostLabel } from '../display.tsx'
-import { fmtDate, fmtDur, fmtN, fmtTime, fmtTok, fmtUsd, host } from '../format.ts'
+import { fmtDate, fmtN, fmtTime, fmtTok, host, plural } from '../format.ts'
 import { CovSwatch, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { PHASE_LABEL, SEV, SEV_COL, SEV_LABEL } from '../meta.ts'
@@ -48,6 +48,7 @@ function RunOverview() {
   const goal = r.goal || ''
   const long = goal.length > 260
   const done = detail.assignments.filter(a => a.status === 'complete').length
+  const runningWorkers = useMemo(() => detail.assignments.filter(a => a.status === 'running'), [detail.assignments])
   const top = useMemo(() => model.findings.filter(f => f.status !== 'dismissed').slice().sort(bySeriousness).slice(0, 7), [model])
   const hist = useMemo(() => trafficHistogram(model, events), [model, events])
   const cov = coverageCounts(detail.coverageEntries)
@@ -62,8 +63,22 @@ function RunOverview() {
 
   const phases = model.workflow.phases
   const maxP = Math.max(1, ...phases.map(p => model.workflow.byPhase.get(p)?.length ?? 0))
+  const liveSummary = runningWorkers.length > 0
+    ? runningWorkers.slice(0, 2).map(w => w.title).join(' · ') + (runningWorkers.length > 2 ? ` +${runningWorkers.length - 2} more` : '')
+    : `${PHASE_LABEL[r.phase] ?? r.phase} · Round ${r.roundNo}`
 
   return <div className="ov"><div className="ov-in">
+    {r.status === 'running' && <div className="live-bar" role="status" aria-live="polite">
+      <span className="live" aria-hidden="true" />
+      <span className="live-k">What Kovo Hunter is doing now</span>
+      <span className="live-v" title={liveSummary}>
+        {runningWorkers.length > 0 && <b className="num">{plural(runningWorkers.length, 'active worker')} · </b>}
+        {liveSummary}
+      </span>
+      <button type="button" className="linkbtn live-go" onClick={() => runningWorkers[0] ? links.worker(runningWorkers[0].id) : nav.setView('workflow')}>
+        {runningWorkers.length > 0 ? 'Inspect' : 'Workflow'}<Icon name="arrowR" />
+      </button>
+    </div>}
     <div className="ov-eyebrow num">
       <span style={{ color: 'var(--fg-2)', fontWeight: 500 }}>{r.status === 'complete' ? 'Run summary' : 'Provisional summary'}</span>
       <span className="sep">·</span>
@@ -106,13 +121,10 @@ function RunOverview() {
       </div>
     </div>
 
-    <div className="stats num">
-      <div><div className="k">Budget</div><div className="v"><AnimatedNumber id="ov.usd" value={r.spentUsd} format={fmtUsd} /><small>of {fmtUsd(r.budgetUsd)}</small></div></div>
-      <div><div className="k">Requests</div><div className="v"><AnimatedNumber id="ov.req" value={r.spentRequests} /><small>{r.budgetRequests ? 'of ' + fmtN(r.budgetRequests) : 'uncapped'}</small></div></div>
+    <div className="stats stats-3 num">
       <div><div className="k">Tokens</div><div className="v"><AnimatedNumber id="ov.tok" value={r.spentTokens} format={x => fmtTok(Math.round(x))} /><small>{fmtN(r.turnsUsed)} turns</small></div></div>
-      <div><div className="k">Workers</div><div className="v"><AnimatedNumber id="ov.wk" value={detail.assignments.length} /><small>{fmtN(done)} complete</small></div></div>
+      <div><div className="k">Workers</div><div className="v"><AnimatedNumber id="ov.wk" value={detail.assignments.length} /><small>{runningWorkers.length ? `${fmtN(runningWorkers.length)} running · ` : ''}{fmtN(done)} complete</small></div></div>
       <div><div className="k">Facts · evidence</div><div className="v"><AnimatedNumber id="ov.fa" value={detail.facts.length} /><small>· {fmtN(detail.evidence.length)}</small></div></div>
-      <div><div className="k">{r.status === 'complete' ? 'Duration' : 'Elapsed'}</div><div className="v">{fmtDur(model.end - r.createdAt)}</div></div>
     </div>
 
     <div className="ov-grid">

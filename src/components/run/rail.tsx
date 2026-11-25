@@ -27,13 +27,25 @@ export function Rail() {
   const [devicesOpen, setDevicesOpen] = useState(false)
   const pulse = usePulse(detail.run.id + ':' + q.openCount)
   const cnt: Partial<Record<ViewId, string>> = {
-    findings: fmtN(model.findings.length),
-    workflow: fmtN(detail.assignments.length),
-    surface: fmtN(model.surface.origins.length),
-    exchanges: fmtN(counts.exchanges),
-    activity: fmtN(counts.events),
+    findings: model.findings.length > 0 ? fmtN(model.findings.length) : '',
+    workflow: detail.assignments.length > 0 ? fmtN(detail.assignments.length) : '',
+    surface: model.surface.origins.length > 0 ? fmtN(model.surface.origins.length) : '',
+    exchanges: counts.exchanges > 0 ? fmtN(counts.exchanges) : '',
+    activity: counts.events > 0 ? fmtN(counts.events) : '',
     report: model.report ? 'v' + model.report.version : '',
   }
+  const investigationViews = VIEWS.filter(v => v.group === 'investigation')
+  const telemetryViews = VIEWS.filter(v => v.group === 'telemetry')
+  const renderViewBtn = (v: (typeof VIEWS)[number]) => (
+    <button key={v.id} type="button" className={'ritem' + (v.id === nav.view ? ' on' : '')} aria-current={v.id === nav.view ? 'page' : undefined}
+      title={`${v.label} (G then ${v.key.toUpperCase()})`} onClick={() => nav.setView(v.id)}>
+      <Icon name={v.icon} />
+      <span className="lbl">{v.label}</span>
+      {v.id === 'queue'
+        ? (q.openCount > 0 && <span className={'badge num' + (q.decideCount ? ' hot' : '') + (pulse ? ' pulse' : '')} title={`${q.decideCount} to decide · ${q.openCount} open`}>{q.openCount}</span>)
+        : (cnt[v.id] ? <span className="ct num">{cnt[v.id]}</span> : null)}
+    </button>
+  )
   const projectGroups = useMemo(() => {
     const groups: { projectId: string; projectName: string; runs: typeof runs }[] = []
     const byProject = new Map<string, (typeof groups)[number]>()
@@ -56,16 +68,13 @@ export function Rail() {
         <Icon name="search" /><span style={{ whiteSpace: 'nowrap' }}>Search…</span><KbdGroup keys={['mod', 'K']} />
       </button>
       <div className="rail-scroll">
-        <div className="rail-h"><span>Run</span></div>
-        <nav aria-label="Run views">
-          {VIEWS.map(v => <button key={v.id} type="button" className={'ritem' + (v.id === nav.view ? ' on' : '')} aria-current={v.id === nav.view ? 'page' : undefined}
-            title={`${v.label} (G then ${v.key.toUpperCase()})`} onClick={() => nav.setView(v.id)}>
-            <Icon name={v.icon} />
-            <span className="lbl">{v.label}</span>
-            {v.id === 'queue'
-              ? <span className={'badge num' + (q.decideCount ? ' hot' : '') + (pulse ? ' pulse' : '')} title={`${q.decideCount} to decide · ${q.openCount} open`}>{q.openCount}</span>
-              : <span className="ct num">{cnt[v.id] ?? ''}</span>}
-          </button>)}
+        <div className="rail-h"><span>Investigation</span></div>
+        <nav aria-label="Investigation views">
+          {investigationViews.map(renderViewBtn)}
+        </nav>
+        <div className="rail-h"><span>Telemetry</span></div>
+        <nav aria-label="Telemetry views">
+          {telemetryViews.map(renderViewBtn)}
         </nav>
         <div className="rail-h"><span>Workspace</span></div>
         <nav aria-label="Workspace">

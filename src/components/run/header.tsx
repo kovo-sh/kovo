@@ -66,7 +66,14 @@ export function RunHeader() {
   const [deleteOpen, setDeleteOpen] = useState(false)
   const wrap = useRef<HTMLDivElement>(null)
   const rl = useRef<HTMLDivElement>(null)
-  const dur = model.end - r.createdAt
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (r.status !== 'running') return
+    setNow(Date.now())
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(id)
+  }, [r.status])
+  const dur = r.status === 'running' ? Math.max(0, now - r.createdAt) : Math.max(0, model.end - r.createdAt)
   const bPct = r.budgetUsd ? r.spentUsd / r.budgetUsd : 0
   const rPct = r.budgetRequests ? r.spentRequests / r.budgetRequests : 0
   const scopeN = model.scopeOrigins.length
@@ -121,16 +128,17 @@ export function RunHeader() {
       <span className="crumb-sep">/</span>
       <button
         type="button"
-        className="crumb num"
-        style={{ color: 'var(--fg-2)' }}
-        title={`Started ${fmtFullDateTime(r.createdAt)} · Run ${r.id} (click to copy ID)`}
+        className="crumb crumb-copy num"
+        title={`Copy run ID (${short(r.id)}) · Started ${fmtFullDateTime(r.createdAt)}`}
+        aria-label={`Copy run ID ${short(r.id)}`}
         suppressHydrationWarning
         onClick={() => void navigator.clipboard?.writeText(r.id).then(
           () => toast.show('Copied run ID', { icon: 'check', sub: short(r.id) }),
           () => toast.show('Could not copy run ID', { tone: 'error' }),
         )}
       >
-        {fmtAgo(r.createdAt)}
+        <span>{fmtAgo(r.createdAt)}</span>
+        <Icon name="copy" size={11} className="crumb-copy-ico" />
       </button>
       <span className="goal" title={r.goal}>{r.goal}</span>
       <span className="hdr-actions" ref={wrap} style={{ position: 'relative' }}>
@@ -215,7 +223,7 @@ export function RunHeader() {
       <button type="button" className="rl rl-btn" data-p="2" title={`Tier ${r.capabilityTier} · ${capabilityTierMeta[r.capabilityTier].name} · ${approvalPolicyMeta[r.approvalPolicy ?? 'auto_review'].label}`} onClick={() => setPop(pop === 'scope' ? null : 'scope')}>
         <span>{capabilityTierMeta[r.capabilityTier].short}</span><span className="dim">· {plural(scopeN, 'host')}</span>
       </button>
-      <span className="rl" data-p="1" title={`Started ${fmtFullDateTime(r.createdAt)}`}><span className="dim">{dur > 60_000 ? fmtDur(dur) : 'Created ' + fmtTime(r.createdAt)}</span></span>
+      <span className="rl" data-p="1" title={`Started ${fmtFullDateTime(r.createdAt)}`} suppressHydrationWarning><span className="dim">{r.status === 'running' || dur > 60_000 ? fmtDur(dur) : 'Created ' + fmtTime(r.createdAt)}</span></span>
     </div>
   </header>
 }
@@ -367,12 +375,12 @@ function DeleteRunDialog({ isActive, onClose, onDeleted }: {
           <div className="del-dialog-summary">
             <div className="del-dialog-goal" title={r.goal}>{r.goal}</div>
             <div className="del-dialog-meta num">
-              <span className="tag solid"><StatusGlyph status={r.status} />{runStatusLabel(r.status)}</span>
-              <span className="tag solid">
-                {plural(totalFindings, 'finding')}
-                {confirmedFindings > 0 ? ` (${confirmedFindings} confirmed)` : ''}
-              </span>
-              <span className="tag solid">{fmtN(r.spentRequests)} req · {fmtUsd(r.spentUsd)}</span>
+              <StatusGlyph status={r.status} />
+              <span>{runStatusLabel(r.status)}</span>
+              <span className="sep">·</span>
+              <span>{plural(totalFindings, 'finding')}{confirmedFindings > 0 ? ` (${confirmedFindings} confirmed)` : ''}</span>
+              <span className="sep">·</span>
+              <span>{fmtN(r.spentRequests)} req · {fmtUsd(r.spentUsd)}</span>
             </div>
           </div>
           {isActive && <div className="del-dialog-warn" role="status">
