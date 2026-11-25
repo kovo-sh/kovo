@@ -173,17 +173,20 @@ function staticAstSpec() {
   }
 }
 
-test('when kovo_verify is active, propose_chain_finding and verify_replay_spec reject runtime specs and allow static_ast_proof', async () => {
+test('when kovo_verify is active, propose_chain_finding, update_proposed_finding and verify_replay_spec reject runtime specs and allow static_ast_proof', async () => {
   let proposeCalls = 0
+  let updateCalls = 0
   let verifyCalls = 0
   const activeTools = buildWorkerTools({
     kovo_verify: async () => ({ confirmed: true, attempts: [] }),
     propose_chain_finding: async () => { proposeCalls += 1; return { ok: true } },
+    update_proposed_finding: async () => { updateCalls += 1; return { ok: true } },
     verify_replay_spec: async () => { verifyCalls += 1; return { ok: true } },
   }, v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {})
 
   assert.equal(activeTools.find(t => t.name === 'verify_replay_spec'), undefined, 'verify_replay_spec is hidden by default when kovo_verify is active')
   const proposeTool = activeTools.find(t => t.name === 'propose_chain_finding')!
+  const updateTool = activeTools.find(t => t.name === 'update_proposed_finding')!
 
   const optedInTools = buildWorkerTools({
     kovo_verify: async () => ({ confirmed: true, attempts: [] }),
@@ -199,6 +202,21 @@ test('when kovo_verify is active, propose_chain_finding and verify_replay_spec r
   assert.equal(rejectedPropose.isError, true)
   assert.match(rejectedPropose.output[0]?.text ?? '', /kovo_verify\(script=/)
   assert.equal(proposeCalls, 0, 'legacy handler must never execute for runtime specs while kovo_verify is active')
+
+  const rejectedUpdate = await updateTool.execute({
+    findingId: 'finding-1',
+    replaySpec: httpChainSpec(),
+  } as never, {} as never, { abortSignal: AbortSignal.timeout(5_000) } as never) as { isError?: boolean; output: Array<{ text?: string }> }
+  assert.equal(rejectedUpdate.isError, true)
+  assert.match(rejectedUpdate.output[0]?.text ?? '', /kovo_verify\(script=/)
+  assert.equal(updateCalls, 0, 'update_proposed_finding must also reject runtime specs while kovo_verify is active')
+
+  const allowedStaticUpdate = await updateTool.execute({
+    findingId: 'finding-1',
+    replaySpec: staticAstSpec(),
+  } as never, {} as never, { abortSignal: AbortSignal.timeout(5_000) } as never) as { isError?: boolean }
+  assert.notEqual(allowedStaticUpdate.isError, true)
+  assert.equal(updateCalls, 1)
 
   const rejectedVerify = await verifyTool.execute({
     spec: httpChainSpec(),

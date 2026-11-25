@@ -328,10 +328,12 @@ test('M0 receipt: boolean differential rejects one round, echo-only, nonce-only 
 // Cut 2 — replay/retest adapter + promotion classifier
 // ============================================================================
 
-test('M0 receipt: mode env is off/shadow/strict and defaults to shadow', () => {
-  assert.equal(proofReceiptMode({} as NodeJS.ProcessEnv), 'shadow')
+test('M0 receipt: mode env is off/shadow/strict and defaults to strict', () => {
+  assert.equal(proofReceiptMode({} as NodeJS.ProcessEnv), 'strict')
   assert.equal(proofReceiptMode({ KOVO_PROOF_RECEIPT: '0' } as NodeJS.ProcessEnv), 'off')
   assert.equal(proofReceiptMode({ KOVO_PROOF_RECEIPT: 'off' } as NodeJS.ProcessEnv), 'off')
+  assert.equal(proofReceiptMode({ KOVO_PROOF_RECEIPT: 'shadow' } as NodeJS.ProcessEnv), 'shadow')
+  assert.equal(proofReceiptMode({ KOVO_PROOF_RECEIPT: 'advisory' } as NodeJS.ProcessEnv), 'shadow')
   assert.equal(proofReceiptMode({ KOVO_PROOF_RECEIPT: 'strict' } as NodeJS.ProcessEnv), 'strict')
   assert.equal(proofReceiptMode({ KOVO_PROOF_RECEIPT: '1' } as NodeJS.ProcessEnv), 'strict')
 })
@@ -476,18 +478,18 @@ test('M0: verifyReplaySpec and retestReplaySpec confirm through the receipt on a
   assert.equal(verified.verdict, 'confirmed', verified.outcome.reason ?? 'no reason')
   assert.ok(verified.receipt, 'a confirmed impact replay must carry a receipt')
   assert.equal(verified.receipt!.verification.confirmed, true, verified.receipt!.verification.reason)
-  assert.equal(verified.receipt!.mode, 'shadow')
+  assert.equal(verified.receipt!.mode, 'strict')
   assert.equal(verified.receipt!.receipt.exchangeIds.length, 3)
 
-  // Strict mode runs the same receipt as the final gate and still confirms a substantiated replay.
+  // Explicit KOVO_PROOF_RECEIPT=shadow env override remains supported for parity tests.
   const priorMode = process.env.KOVO_PROOF_RECEIPT
-  process.env.KOVO_PROOF_RECEIPT = 'strict'
+  process.env.KOVO_PROOF_RECEIPT = 'shadow'
   try {
     state = { owner_id: 'u1', status: 'open' }
-    const strict = await verifyReplaySpec(params)
-    assert.equal(strict.verdict, 'confirmed', strict.outcome.reason ?? 'no reason')
-    assert.equal(strict.receipt?.mode, 'strict')
-    assert.equal(strict.receipt?.verification.confirmed, true)
+    const shadow = await verifyReplaySpec(params)
+    assert.equal(shadow.verdict, 'confirmed', shadow.outcome.reason ?? 'no reason')
+    assert.equal(shadow.receipt?.mode, 'shadow')
+    assert.equal(shadow.receipt?.verification.confirmed, true)
   } finally {
     if (priorMode === undefined) delete process.env.KOVO_PROOF_RECEIPT
     else process.env.KOVO_PROOF_RECEIPT = priorMode

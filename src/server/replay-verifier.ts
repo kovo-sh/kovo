@@ -29,7 +29,8 @@ import {
   classifyImpactDescriptor,
 } from './oracle-invariants.ts'
 import type { PersonaCredentialSource } from './oracle-invariants.ts'
-import type { ProofReceipt, ReceiptVerification } from './proof-receipt.ts'
+import { proofReceiptMode } from './proof-receipt.ts'
+import type { ProofReceipt, ProofReceiptMode, ReceiptVerification } from './proof-receipt.ts'
 import { persistedAgentScriptOf, retestPersistedAgentScript } from './agent-script-proof.ts'
 import {
   assessBflaImpact,
@@ -42,7 +43,6 @@ import {
   inconclusiveResult,
   isSuccessStatus,
   isUnexpectedErrorStatus,
-  proofReceiptMode,
   receiptCheckForResult,
   retiredLegacyResult,
   RETIRED_LEGACY_SPEC_KINDS,
@@ -75,8 +75,9 @@ export {
   classifyHttpChainAssertion,
   impactStepsFromStepsOut,
   inconclusiveResult,
-  proofReceiptMode,
 } from './floor-recipe-engine.ts'
+export { proofReceiptMode } from './proof-receipt.ts'
+export type { ProofReceiptMode } from './proof-receipt.ts'
 export type {
   BflaImpactAssessment,
   HttpChainAssertionEvidence,
@@ -140,14 +141,12 @@ export interface ReplayVerificationResult {
   evidencePayload: Record<string, unknown>
   evidenceSha256: string
   /**
-   * v7 ProofReceipt check over the host-recorded transcript. Present whenever the replay could be
-   * expressed as a receipt (impact or out-of-band). `mode` says whether the receipt was advisory
-   * ('shadow') or gating ('strict'); see `proofReceiptMode`.
+   * ProofReceipt check over the host-recorded transcript. Present whenever the replay could be
+   * expressed as a receipt (impact or out-of-band). `mode` defaults to `'strict'` (gating), or
+   * `'shadow'` when explicitly opted in via `KOVO_PROOF_RECEIPT=shadow`; see `proofReceiptMode`.
    */
   receipt?: ReplayReceiptCheck
 }
-
-export type ProofReceiptMode = 'off' | 'shadow' | 'strict'
 
 export interface ReplayReceiptCheck {
   receipt: ProofReceipt
@@ -807,8 +806,8 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     verdict = 'inconclusive'
   }
 
-  // v7: one confirmation primitive. Shadow mode annotates the result for parity measurement;
-  // strict mode lets the receipt veto a DSL confirmation (never widen it).
+  // ProofReceipt confirmation gate: strict by default (vetoes unsubstantiated DSL confirmations,
+  // never widens a non-confirming verdict); KOVO_PROOF_RECEIPT=shadow|off overrides for tests.
   const gated = receiptCheckForResult({
     mode: proofReceiptMode(),
     verdict,
@@ -850,7 +849,7 @@ export class RecipeWiredLegacyCallError extends Error {
 }
 
 /** The class a spec claims, in the vocabulary the recipe table uses. */
-export function recipeClassOfSpec(spec: DeclarativeReplaySpec): string | null {
+function recipeClassOfSpec(spec: DeclarativeReplaySpec): string | null {
   switch (spec.kind) {
     case 'sql_boolean_diff':
     case 'sql_time_diff':

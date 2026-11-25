@@ -1756,4 +1756,21 @@ export function buildOobReceipt(input: {
   })
 }
 
+export type ProofReceiptMode = 'off' | 'shadow' | 'strict'
+
+/**
+ * Confirmation gate mode for legacy declarative replay specs:
+ *  - `strict` (default): `verifyReceipt()` is the final confirmation gate and vetoes any
+ *    unsubstantiated DSL confirmation (never widens a non-confirming verdict).
+ *  - `shadow` / `advisory`: records the receipt without changing the DSL verdict (explicit env
+ *    override for parity/regression tests).
+ *  - `off` / `0` / `false` / `no`: disables receipt evaluation on legacy DSL replays.
+ */
+export function proofReceiptMode(env: NodeJS.ProcessEnv = process.env): ProofReceiptMode {
+  const raw = (env.KOVO_PROOF_RECEIPT ?? '').trim().toLowerCase()
+  if (raw === '0' || raw === 'off' || raw === 'false' || raw === 'no') return 'off'
+  if (raw === 'shadow' || raw === 'advisory') return 'shadow'
+  return 'strict'
+}
+
 export type { ImpactClass, ImpactStep, RoleName }

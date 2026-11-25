@@ -51,15 +51,6 @@ import {
 import type { CallRecorder, ProviderConfig, ProviderOptions, UsageCallback } from "./provider.ts"
 import { redact } from "./redact.ts"
 import type { NamedSecret } from "./redact.ts"
-import {
-  describeProofTools,
-  proveAuthzReadDiff,
-  proveBusinessInvariant,
-  proveCanaryOrRedirect,
-  proveStateMutationDiff,
-  validateProofInput,
-} from "./proof-tools.ts"
-import type { CompiledProof, ProofToolName } from "./proof-tools.ts"
 import { listSkills, listSkillTags, loadSkill, searchSkills, selectPreInjectionSkills, skillsByTag } from "./skills.ts"
 import {
   EARLY_EXIT_GRACE_TURNS,
@@ -101,7 +92,6 @@ import {
   normalizePiAuthMutation,
   parseProofGapCode,
   probeParamLocations,
-  proofToolHandlerNames,
   proposeChainFindingDescription,
   roleAffinityForScenario,
   sastEngineNames,
@@ -133,7 +123,6 @@ import type {
   ProofObligationEvent,
   ProofObligationStats,
   ProofRouteObligation,
-  ProofToolHandlerName,
   RejectedProofGap,
   RequestHttpArgs,
   RouteAttemptObservation,
@@ -348,7 +337,6 @@ export const ROUTE_EVIDENCE_TOOLS: ReadonlySet<string> = new Set([
 ])
 export const SPEC_SUBMISSION_TOOLS: ReadonlySet<string> = new Set([
   'kovo_verify', 'verify_replay_spec', 'propose_chain_finding', 'update_proposed_finding',
-  'prove_authz_read_diff', 'prove_state_mutation_diff', 'prove_business_invariant', 'prove_canary_or_redirect',
 ])
 /** Tools whose arguments carry a replay spec/script we can bind to route evidence. */
 const ROUTE_BOUND_SPEC_TOOLS: ReadonlySet<string> = new Set([
@@ -1213,26 +1201,8 @@ async function formatToolOutput(
 }
 
 // ---------------------------------------------------------------------------
-// Typed proof tools & verifier repair feedback
+// Spec submission & verifier repair feedback
 // ---------------------------------------------------------------------------
-
-const proofCompilers: Record<ProofToolHandlerName, (input: unknown) => CompiledProof> = {
-  prove_authz_read_diff: proveAuthzReadDiff as (input: unknown) => CompiledProof,
-  prove_state_mutation_diff: proveStateMutationDiff as (input: unknown) => CompiledProof,
-  prove_business_invariant: proveBusinessInvariant as (input: unknown) => CompiledProof,
-  prove_canary_or_redirect: proveCanaryOrRedirect as (input: unknown) => CompiledProof,
-}
-
-function proofToolParameters(name: ProofToolName): Record<string, unknown> {
-  const description = describeProofTools().find(tool => tool.name === name)
-  if (!description) throw new Error(`Missing proof tool description for ${name}.`)
-  return {
-    type: 'object',
-    required: [...description.inputSchema.required],
-    properties: { ...description.inputSchema.properties },
-    additionalProperties: true,
-  }
-}
 
 export interface SpecSubmissionToolOptions {
   /** Shared ledger; when omitted, spec enforcement and settlement reservation stay inert. */
@@ -2280,39 +2250,6 @@ export function buildWorkerTools(
     }))
   }
 
-  // Script-first default: when the Layer-3 runner is supplied, agents verify with executable
-  // kovo_verify scripts. Keep the compilers available (proof-tools.ts) for deterministic
-  // internal callers, but do not expose the four JSON-only proof tools to agents.
-  if (!handlers.kovo_verify) {
-    for (const name of proofToolHandlerNames) {
-      const handler = handlers[name]
-      if (!handler) continue
-      const description = describeProofTools().find(tool => tool.name === name)
-      if (!description) continue
-      tools.push(defineTool({
-        name,
-        description: `${description.usage} Arguments are validated before compilation; a failure returns { ok: false, errors: [{ field, code, message, fix }] } and the handler is not called.`,
-        parameters: unsafe<Record<string, unknown>>(proofToolParameters(name)),
-        replay: 'safe',
-        outputLimits,
-        execute: async (args, _api, ctx) => {
-          const signal = combineSignal(ctx.abortSignal)
-          const validation = validateProofInput(name, args)
-          if (!validation.ok) {
-            return {
-              output: [{
-                type: 'text' as const,
-                text: JSON.stringify({ ok: false, errors: validation.errors }, null, 2),
-              }],
-            }
-          }
-          const compiled = proofCompilers[name](args)
-          return wrapExec(name, () => handler(compiled, signal), signal)
-        },
-      }))
-    }
-  }
-
   const hasKovoVerify = Boolean(handlers.kovo_verify)
   const allowLegacyReplaySpec = Boolean(specSubmission?.allowLegacyReplaySpec)
 
@@ -2505,6 +2442,15 @@ export function buildWorkerTools(
         let parsedSpec: DeclarativeReplaySpec | undefined
         if (args.replaySpec !== undefined) {
           const parsed = declarativeReplaySpecSchema.safeParse(args.replaySpec)
+          if (hasKovoVerify && parsed.success && parsed.data.kind !== 'static_ast_proof') {
+            return {
+              isError: true,
+              output: [{
+                type: 'text' as const,
+                text: kovoVerifyRedirectMessage(parsed.data.kind),
+              }],
+            }
+          }
           if (!parsed.success) {
             return {
               isError: true,
@@ -3165,9 +3111,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     ? { earlyExit, earlyExitTurnsSaved: earlyExit.turnsSaved }
     : {}
 
-  const registeredProofTools = handlers.kovo_verify
-    ? ['kovo_verify']
-    : proofToolHandlerNames.filter(name => Boolean(handlers[name]))
+  const registeredProofTools = handlers.kovo_verify ? ['kovo_verify'] : []
   const trace = options.trace
   const traceRunId = options.traceContext?.runId ?? options.requestId
   const traceAssignmentId = options.traceContext?.assignmentId ?? options.sessionId

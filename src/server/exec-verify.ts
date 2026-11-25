@@ -149,36 +149,18 @@ function alignFindingForEvidence(
 }
 
 
-function buildTier3VerifyGateReq(spec: Extract<DeclarativeReplaySpec, { kind: 'rce_proof' | 'upload_probe' }>, label: string) {
-  if (spec.kind === 'rce_proof') {
-    return {
-      origin: spec.probeStep.request.origin,
-      method: spec.probeStep.request.method,
-      pathAndQuery: spec.probeStep.request.pathAndQuery,
-      personaHandle: spec.probeStep.request.persona ?? null,
-      rationale: `[rce_proof:${spec.proofMode}] ${label} for "${spec.title}"`,
-      requestPreview: JSON.stringify({ proofMode: spec.proofMode, controlStep: spec.controlStep, probeStep: spec.probeStep }, null, 2),
-      bodyPreview: spec.probeStep.request.textBody
-        ?? (spec.probeStep.request.jsonBody !== undefined ? JSON.stringify(spec.probeStep.request.jsonBody) : undefined),
-      hasMultipart: false,
-      isRceProof: true,
-    }
-  }
+function buildTier3VerifyGateReq(spec: Extract<DeclarativeReplaySpec, { kind: 'rce_proof' }>, label: string) {
   return {
-    origin: spec.uploadStep.origin,
-    method: spec.uploadStep.method,
-    pathAndQuery: spec.uploadStep.pathAndQuery,
-    personaHandle: spec.uploadStep.persona ?? null,
-    rationale: `[upload_probe] ${label} for "${spec.title}"`,
-    requestPreview: JSON.stringify({
-      filename: spec.uploadStep.filename,
-      contentType: spec.uploadStep.contentType,
-      uploadStep: spec.uploadStep.pathAndQuery,
-      fetchStep: spec.fetchStep.request.pathAndQuery,
-    }, null, 2),
-    bodyPreview: spec.uploadStep.contentTemplate,
-    hasMultipart: true,
-    isRceProof: false,
+    origin: spec.probeStep.request.origin,
+    method: spec.probeStep.request.method,
+    pathAndQuery: spec.probeStep.request.pathAndQuery,
+    personaHandle: spec.probeStep.request.persona ?? null,
+    rationale: `[rce_proof:${spec.proofMode}] ${label} for "${spec.title}"`,
+    requestPreview: JSON.stringify({ proofMode: spec.proofMode, controlStep: spec.controlStep, probeStep: spec.probeStep }, null, 2),
+    bodyPreview: spec.probeStep.request.textBody
+      ?? (spec.probeStep.request.jsonBody !== undefined ? JSON.stringify(spec.probeStep.request.jsonBody) : undefined),
+    hasMultipart: false,
+    isRceProof: true,
   }
 }
 
@@ -1645,13 +1627,11 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
 
     await this.ensureCanaryListenerForSpec(specRow.spec)
 
-    // Tier 3 HITL gate for rce_proof and upload_probe specs on non-local-lab targets
-    if (specRow.spec.kind === 'rce_proof' || specRow.spec.kind === 'upload_probe') {
+    // Tier 3 HITL gate for rce_proof specs on non-local-lab targets (upload_probe is retired).
+    if (specRow.spec.kind === 'rce_proof') {
       const gateReq = buildTier3VerifyGateReq(
         specRow.spec,
-        specRow.spec.kind === 'rce_proof'
-          ? 'Zero-LLM non-destructive PoE verification'
-          : 'Zero-LLM benign multipart upload verification',
+        'Zero-LLM non-destructive PoE verification',
       )
       const approval = await this.host.waitForTier3Approval(job, { ...gateReq, secrets }, job.controller.signal)
       if (!approval.approved) {
@@ -1680,7 +1660,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     const result = await verifyReplaySpec(verifyParams)
     this.host.markReplaySpecCoverage(run, specRow.spec, `replay:${specRow.spec.kind}`)
     if (result.receipt && !result.receipt.verification.confirmed) {
-      // Parity telemetry only: shadow receipts never change this verdict.
+      // Receipt rejection telemetry (strict mode vetoes confirmation; shadow mode is advisory).
       try {
         this.storage.event(run.id, 'proof_receipt.shadow_reject',
           `ProofReceipt did not substantiate spec ${specRow.id}: ${result.receipt.verification.reason}`.slice(0, 400), {
@@ -2473,7 +2453,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
 
     if (nextAttempt <= maxAttempts) {
       await this.ensureCanaryListenerForSpec(parsed)
-      if (parsed.kind === 'rce_proof' || parsed.kind === 'upload_probe') {
+      if (parsed.kind === 'rce_proof') {
         const gateReq = buildTier3VerifyGateReq(parsed, 'Inline Zero-LLM verification')
         const approval = await this.host.waitForTier3Approval(params.job, {
           ...gateReq,
