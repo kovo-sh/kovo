@@ -977,17 +977,51 @@ test('Header hygiene noise collapse, (origin, cwe) chain dedup, 80/20 crown-jewe
   const run = storage.run(runId)
   const clerkAsset = run.candidates.find(c => c.origin === clerkOrigin)!
   const appAsset = run.candidates.find(c => c.origin === appOrigin)!
+  const verifyWorker = storage.makeWorker(run, 'verification', clerkAsset, 'Dedup Replay Evidence', 'CWE-942')
+  const makeConfirmedReplaySpec = (findingId: string, origin: string, title: string, cwe: string) => {
+    const spec: DeclarativeReplaySpec = {
+      version: 1,
+      kind: 'http_chain',
+      origin,
+      title,
+      category: 'cors-client-side',
+      cwe,
+      severity: 'high',
+      spaCatchallControl: false,
+      severityRationale: 'Verified multi-step chain evidence.',
+      impact: 'Cross-origin exposure.',
+      remediation: 'Restrict trusted origins.',
+      recheckInstructions: 'Replay request.',
+      assertionsJq: '{ controlPassed: true, confirmed: true, observed: "confirmed", expected: "blocked" }',
+      steps: [
+        { id: 'c1', role: 'control', description: 'Control', request: { origin, method: 'GET', pathAndQuery: '/api/me', followRedirects: false } },
+        { id: 'p1', role: 'probe', description: 'Probe', request: { origin, method: 'GET', pathAndQuery: '/api/me', followRedirects: false } },
+      ],
+    }
+    return storage.createReplaySpec(run, verifyWorker, findingId, spec, [origin], {
+      verifiedInline: true,
+      lastVerificationDiff: {
+        verdict: 'confirmed',
+        controlPassed: true,
+        assertionSummary: { observed: 'confirmed', expected: 'blocked' },
+        stepStatuses: [{ id: 'p1', role: 'probe', status: 200, bodyLen: 32 }],
+        retriesRemaining: 0,
+      },
+    })
+  }
 
   // Upsert confirmed CWE-942 on clerkOrigin
+  const confirmed1Id = randomUUID()
+  const confirmed1Spec = makeConfirmedReplaySpec(confirmed1Id, clerkOrigin, realHighChain.title, 'CWE-942')
   const confirmed1 = storage.upsertChainFinding(run, clerkAsset.id, {
     ...realHighChain,
-    id: randomUUID(),
+    id: confirmed1Id,
     severity: 'medium',
     status: 'confirmed',
     evidenceIds: ['ev-a'],
     exchangeIds: ['ex-a'],
     chainFactIds: ['fact-a'],
-  }, 'spec-1', [clerkOrigin])
+  }, confirmed1Spec.id, [clerkOrigin])
 
   // Upsert duplicate (clerkOrigin, CWE-942) with different ID & pending status -> MUST merge into 1 row and NOT downgrade confirmed!
   const dupPending = storage.upsertChainFinding(run, clerkAsset.id, {
@@ -1009,25 +1043,29 @@ test('Header hygiene noise collapse, (origin, cwe) chain dedup, 80/20 crown-jewe
   assert.deepEqual(dupPending.chainFactIds?.sort(), ['fact-a', 'fact-b'])
 
   // Different CWE on same origin stays separate
+  const diffCweId = randomUUID()
+  const diffCweSpec = makeConfirmedReplaySpec(diffCweId, clerkOrigin, 'OAuth Open Redirect on Clerk', 'CWE-601')
   const diffCwe = storage.upsertChainFinding(run, clerkAsset.id, {
     ...realHighChain,
-    id: randomUUID(),
+    id: diffCweId,
     title: 'OAuth Open Redirect on Clerk',
     cwe: 'CWE-601',
     status: 'confirmed',
     evidenceIds: ['ev-c'],
-  }, 'spec-3', [clerkOrigin])
+  }, diffCweSpec.id, [clerkOrigin])
   assert.notEqual(diffCwe.id, confirmed1.id)
 
   // Same CWE on different origin stays separate
+  const diffOriginId = randomUUID()
+  const diffOriginSpec = makeConfirmedReplaySpec(diffOriginId, appOrigin, realHighChain.title, 'CWE-942')
   const diffOrigin = storage.upsertChainFinding(run, appAsset.id, {
     ...realHighChain,
-    id: randomUUID(),
+    id: diffOriginId,
     origin: appOrigin,
     cwe: 'CWE-942',
     status: 'confirmed',
     evidenceIds: ['ev-d'],
-  }, 'spec-4', [appOrigin])
+  }, diffOriginSpec.id, [appOrigin])
   assert.notEqual(diffOrigin.id, confirmed1.id)
 
   const chainRows = storage.runDetail(runId).findings.filter(f => f.findingKind === 'multi_step_chain')

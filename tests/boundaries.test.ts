@@ -362,7 +362,7 @@ test('isolates persona secrets at 0600, strips auth on cross-origin redirect, an
       return {
         status: 200,
         headers: { 'content-type': 'application/json', 'x-echo': rawSecret },
-        body: JSON.stringify({ echoedSecret: rawSecret, user: 'tenant_a' }),
+        body: JSON.stringify({ echoedValue: rawSecret, user: 'tenant_a' }),
       }
     },
   })
@@ -546,10 +546,19 @@ test('enforces --network none intent container, NDJSON staging, all offline anal
     rmSync(wsDirB, { recursive: true, force: true })
   })
 
-  const backendA = new LinuxWorkerBackend({ workspace: { id: 'ws-a', directory: wsDirA } })
+  const prevWarm = process.env.KOVO_WARM_WORKERS
+  process.env.KOVO_WARM_WORKERS = '0'
+  let backendA: LinuxWorkerBackend
+  let session: Awaited<ReturnType<LinuxWorkerBackend['openSession']>>
   const assignmentId = randomUUID()
   const sessionAbort = new AbortController()
-  const session = await backendA.openSession(assignmentId, sessionAbort.signal)
+  try {
+    backendA = new LinuxWorkerBackend({ workspace: { id: 'ws-a', directory: wsDirA } })
+    session = await backendA.openSession(assignmentId, sessionAbort.signal)
+  } finally {
+    if (prevWarm === undefined) delete process.env.KOVO_WARM_WORKERS
+    else process.env.KOVO_WARM_WORKERS = prevWarm
+  }
   t.after(() => session.close())
 
   // Verify container host config & zero network reachability to Docker bridge gateway
