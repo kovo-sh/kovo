@@ -23,6 +23,8 @@ import { createHash, randomUUID } from 'node:crypto'
 import { chmodSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { cancelOobDrainForRun } from './oob-drain.ts'
+import { assertValidRunId } from './run-context.ts'
 
 export type OobProtocol = 'http' | 'dns' | 'smtp'
 
@@ -272,6 +274,12 @@ export interface OobRelayStatus {
   immediateMs: number
   windowMs: number
   problems: string[]
+}
+
+export interface OobUnsubscribeRunResult {
+  runId: string
+  expiredSubscriptions: number
+  removedBindings: number
 }
 
 export class OobProfileError extends Error {
@@ -702,6 +710,7 @@ export class OobRelay {
 
   /** Register the token↔canary binding so callbacks validate even before a subscription. */
   registerCanary(binding: { token: string; canaryId: string; runId: string; assignmentId?: string }): void {
+    const runId = assertValidRunId(binding.runId, 'OobRelay.registerCanary')
     const token = binding.token.trim().toLowerCase()
     if (!callbackTokenPattern.test(token)) return
     this.assertOpen()
@@ -712,11 +721,12 @@ export class OobRelay {
         canary_id = excluded.canary_id,
         run_id = excluded.run_id,
         assignment_id = excluded.assignment_id
-    `).run(token, binding.canaryId, binding.runId, binding.assignmentId ?? 'canary-broker', this.now())
+    `).run(token, binding.canaryId, runId, binding.assignmentId ?? 'canary-broker', this.now())
   }
 
   subscribe(input: OobSubscriptionInput): OobSubscription {
     this.assertOpen()
+    const runId = assertValidRunId(input.runId, 'OobRelay.subscribe')
     const token = input.token.trim().toLowerCase()
     if (!callbackTokenPattern.test(token)) throw new Error(`Invalid OOB canary token: ${token.slice(0, 32)}`)
     const now = this.now()
@@ -725,7 +735,7 @@ export class OobRelay {
     const allowlist = input.allowlist ?? (this.defaultAllowlist.length ? this.defaultAllowlist : this.profile.allowlist)
     const existing = this.client.prepare(
       'SELECT * FROM pending_oob WHERE run_id = ? AND canary_id = ? AND artifact = ?',
-    ).get(input.runId, input.canaryId, input.artifact) as unknown as SubscriptionRow | undefined
+    ).get(runId, input.canaryId, input.artifact) as unknown as SubscriptionRow | undefined
     if (existing) {
       if (existing.status === 'pending') {
         const expiresAt = now + windowMs
@@ -744,11 +754,34 @@ export class OobRelay {
         created_at, immediate_ms, window_ms, expires_at, status, allowlist
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
     `).run(
-      id, input.runId, input.assignmentId, input.canaryId, token, input.artifact,
+      id, runId, input.assignmentId, input.canaryId, token, input.artifact,
       input.protocol ?? 'http', now, immediateMs, windowMs, now + windowMs,
       allowlist.length ? JSON.stringify(allowlist) : null,
     )
     return this.subscription(id)
+  }
+
+  /**
+   * Unsubscribe and clean up all active OOB subscriptions, bindings, and in-flight drains
+   * owned by `runId` (called deterministically from `RunContext.dispose()`).
+   */
+  unsubscribeRun(runId: string): OobUnsubscribeRunResult {
+    const validRunId = assertValidRunId(runId, 'OobRelay.unsubscribeRun')
+    cancelOobDrainForRun(validRunId)
+    if (this.closed) {
+      return { runId: validRunId, expiredSubscriptions: 0, removedBindings: 0 }
+    }
+    const expired = this.client.prepare(
+      "UPDATE pending_oob SET status = 'expired' WHERE run_id = ? AND status = 'pending'",
+    ).run(validRunId) as { changes?: number | bigint }
+    const removed = this.client.prepare(
+      'DELETE FROM oob_bindings WHERE run_id = ?',
+    ).run(validRunId) as { changes?: number | bigint }
+    return {
+      runId: validRunId,
+      expiredSubscriptions: Number(expired?.changes ?? 0),
+      removedBindings: Number(removed?.changes ?? 0),
+    }
   }
 
   subscription(id: string): OobSubscription {
@@ -833,9 +866,9 @@ export class OobRelay {
       path: (input.path ?? '').slice(0, 512),
       query: input.query?.slice(0, 512) ?? null,
       artifact,
-      run_id: input.runId ?? binding?.run_id ?? null,
-      assignment_id: input.assignmentId ?? binding?.assignment_id ?? null,
-      canary_id: declaredCanary ?? binding?.canary_id ?? null,
+      run_id: binding?.run_id ?? subscriptions[0]?.runId ?? input.runId ?? null,
+      assignment_id: binding?.assignment_id ?? subscriptions[0]?.assignmentId ?? input.assignmentId ?? null,
+      canary_id: declaredCanary ?? binding?.canary_id ?? subscriptions[0]?.canaryId ?? null,
       received_at: input.receivedAt ?? now,
       claimed_by: null,
       detail: input.detail ? JSON.stringify(input.detail) : null,
@@ -925,9 +958,9 @@ export class OobRelay {
       callbacks.push(...rows.map(callbackFromRow))
     }
     const filtered = callbacks.filter(callback => {
-      if (query.runId && callback.runId && callback.runId !== query.runId) return false
-      if (query.assignmentId && callback.assignmentId && callback.assignmentId !== query.assignmentId) return false
-      if (query.canaryId && callback.canaryId && callback.canaryId !== query.canaryId) return false
+      if (query.runId && callback.runId !== query.runId) return false
+      if (query.assignmentId && callback.assignmentId !== query.assignmentId) return false
+      if (query.canaryId && callback.canaryId !== query.canaryId) return false
       return true
     })
     const subscriptions = query.token ? this.subscriptionsForToken(query.token) : []
@@ -1033,6 +1066,7 @@ export class OobRelay {
   }
 
   private matchesSubscription(subscription: OobSubscription, callback: OobCallback): boolean {
+    if (callback.runId && callback.runId !== subscription.runId) return false
     if (callback.receivedAt > subscription.expiresAt) return false
     if (subscription.artifact && callback.artifact !== subscription.artifact) return false
     if (subscription.allowlist.length > 0 && !ipInAllowlist(callback.sourceIp, subscription.allowlist)) return false

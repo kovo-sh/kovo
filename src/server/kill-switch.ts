@@ -106,6 +106,8 @@ export class GlobalKillSwitch {
   private generation = 0
   private readonly controllers = new Set<RegisteredController>()
   private readonly listeners = new Set<(state: KillSwitchState) => void>()
+  private readonly sseRevocationListeners = new Set<(state: KillSwitchState) => void>()
+  private signalController: AbortController = new AbortController()
   private filePath: string | null = null
   private db: DatabaseSync | null = null
   private pollIntervalMs = 25
@@ -397,13 +399,20 @@ export class GlobalKillSwitch {
     }
     this.generation = Math.max(this.generation, external.generation)
     if (this.globalState.active && !wasGlobalActive) {
+      if (!this.signalController.signal.aborted) {
+        this.signalController.abort(new KillSwitchTrippedError(this.globalState))
+      }
       this.abortMatchingControllers(this.globalState)
       this.notifyListeners(this.globalState)
+      this.notifySseRevocation(this.globalState)
+    } else if (!this.globalState.active && wasGlobalActive && this.signalController.signal.aborted) {
+      this.signalController = new AbortController()
     }
     for (const [tid, st] of this.tenantStates) {
       if (st.active && !prevActiveTenants.has(tid)) {
         this.abortMatchingControllers(st)
         this.notifyListeners(st)
+        this.notifySseRevocation(st)
       }
     }
   }
@@ -433,6 +442,29 @@ export class GlobalKillSwitch {
     }
   }
 
+  private notifySseRevocation(state: KillSwitchState): void {
+    for (const listener of [...this.sseRevocationListeners]) {
+      try {
+        listener({ ...state })
+      } catch {
+        // SSE revocation failures must never block other subscribers or abort propagation.
+      }
+    }
+  }
+
+  /** Live global AbortSignal that aborts synchronously on a global trip and refreshes on global reset. */
+  get signal(): AbortSignal {
+    return this.signalController.signal
+  }
+
+  /** Convenience active trigger accepting either a plain reason string or full `KillSwitchTripInput`. */
+  trigger(reasonOrInput: string | KillSwitchTripInput): KillSwitchState {
+    if (typeof reasonOrInput === 'string') {
+      return this.trip({ reason: reasonOrInput })
+    }
+    return this.trip(reasonOrInput)
+  }
+
   /** Trip the kill switch immediately, persisting externally and aborting all matching in-flight work. */
   trip(input: KillSwitchTripInput): KillSwitchState {
     const now = input.now ?? this.nowFn()
@@ -448,6 +480,9 @@ export class GlobalKillSwitch {
     }
     if (tenantId === null) {
       this.globalState = next
+      if (!this.signalController.signal.aborted) {
+        this.signalController.abort(new KillSwitchTrippedError(next))
+      }
     } else {
       // Tenant-scoped trip MUST NOT overwrite global state or other tenants' state.
       this.tenantStates.set(tenantId, next)
@@ -456,6 +491,7 @@ export class GlobalKillSwitch {
     this.abortMatchingControllers(next)
     this.persistExternal()
     this.notifyListeners(next)
+    this.notifySseRevocation(next)
     return { ...next }
   }
 
@@ -475,6 +511,9 @@ export class GlobalKillSwitch {
     const next = emptyState(this.generation, null)
     this.globalState = next
     this.tenantStates.clear()
+    if (this.signalController.signal.aborted) {
+      this.signalController = new AbortController()
+    }
     this.lastExternalCheckMs = now
     this.persistExternal()
     this.notifyListeners(next)
@@ -542,12 +581,63 @@ export class GlobalKillSwitch {
     return { signal, release }
   }
 
+  /**
+   * Register an existing AbortController (e.g. a `RunContext.abortController`) directly with the
+   * kill switch. If already active for `tenantId`, aborts the controller synchronously and returns
+   * a no-op release callback.
+   */
+  registerAbortController(
+    controller: AbortController,
+    tenantId: string | null = null,
+  ): () => void {
+    const normalizedTenant = normalizeTenantId(tenantId)
+    const active = this.resolveActiveState(normalizedTenant)
+    if (active) {
+      if (!controller.signal.aborted) {
+        controller.abort(new KillSwitchTrippedError(active))
+      }
+      return () => {}
+    }
+    const entry: RegisteredController = { controller, tenantId: normalizedTenant }
+    this.controllers.add(entry)
+    // Re-check after registration to close any race window.
+    const raced = this.resolveActiveState(normalizedTenant)
+    if (raced) {
+      this.controllers.delete(entry)
+      if (!controller.signal.aborted) {
+        controller.abort(new KillSwitchTrippedError(raced))
+      }
+      return () => {}
+    }
+    return () => {
+      this.controllers.delete(entry)
+    }
+  }
+
   /** Subscribe to kill-switch state transitions. Returns an unsubscribe function. */
   onChange(listener: (state: KillSwitchState) => void): () => void {
     this.listeners.add(listener)
     return () => {
       this.listeners.delete(listener)
     }
+  }
+
+  /** Subscribe to kill-switch state transitions (alias for `onChange`). */
+  subscribe(listener: (state: KillSwitchState) => void): () => void {
+    return this.onChange(listener)
+  }
+
+  /** Register an SSE revocation callback broadcast synchronously when the kill switch trips. */
+  onSseRevocation(listener: (state: KillSwitchState) => void): () => void {
+    this.sseRevocationListeners.add(listener)
+    return () => {
+      this.sseRevocationListeners.delete(listener)
+    }
+  }
+
+  /** Active SSE revocation subscriber count (diagnostics & tests). */
+  sseSubscriberCount(): number {
+    return this.sseRevocationListeners.size
   }
 
   /** Active registered in-flight controller count (diagnostics & chaos tests). */
