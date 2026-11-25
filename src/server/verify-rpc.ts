@@ -2071,9 +2071,22 @@ export class VerifyRpcServer {
   }
 
   private parseHttpArgs(args: Record<string, unknown>): { brokerRequest: BrokerHttpRequest; requestMeta: VerifyTranscriptRequest } {
-    const { origin } = this.scopeOrigin(args.origin)
-    if (args.origin !== undefined && typeof args.origin !== 'string') throw new Error('origin must be a string.')
-    const rawPath = args.path ?? args.pathAndQuery ?? '/'
+    let originArg = args.origin
+    let rawPathInput = args.path ?? args.pathAndQuery ?? args.endpoint
+    if (rawPathInput === undefined && typeof args.url === 'string' && args.url.trim()) {
+      const trimmedUrl = args.url.trim()
+      if (/^https?:\/\//i.test(trimmedUrl)) {
+        let parsedUrl: URL
+        try { parsedUrl = new URL(trimmedUrl) } catch { throw new Error('Request URL is malformed.') }
+        originArg = originArg ?? parsedUrl.origin
+        rawPathInput = parsedUrl.pathname + parsedUrl.search
+      } else {
+        rawPathInput = trimmedUrl
+      }
+    }
+    const { origin } = this.scopeOrigin(originArg)
+    if (originArg !== undefined && typeof originArg !== 'string') throw new Error('origin must be a string.')
+    const rawPath = rawPathInput ?? '/'
     if (typeof rawPath !== 'string' || !rawPath.startsWith('/') || rawPath.startsWith('//') || rawPath.length > MAX_PATH_LENGTH || /[\r\n\0]/.test(rawPath)) {
       throw new Error('Request path is invalid or exceeds the 8 KiB limit.')
     }

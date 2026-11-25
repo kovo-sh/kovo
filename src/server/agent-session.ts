@@ -183,9 +183,9 @@ export const AGENTIC_CONTRACT_LINES = [
   'Use typed proof tools (control-vs-probe differentials and state deltas) or a guardian_verify script; status-only claims fail verification.',
 ] as const
 
-/** Settlement: probe tools revoked at 85%; read/query/verify kept until the final turn. */
+/** Settlement: probe tools revoked at 85%; read/query tools kept until the final turn; guardian_verify stays available through the final turn as the primary proof submission tool. */
 const SETTLEMENT_REVOKED_TOOLS = new Set(['request_http', 'request_http_batch', 'request_http_race', 'requestHttpRace', 'browser_visit', 'browser_session', 'probe_surface', 'probe_differential', 'run_safe_templates', 'probe_websocket'])
-const SETTLEMENT_WRAPUP_TOOLS = new Set(['guardian_verify', 'verify_replay_spec', 'search_facts', 'search_exchanges', 'get_exchange', 'read_peer_trace', 'expand_digest', 'board_read', 'query_cves', 'load_skill'])
+const SETTLEMENT_WRAPUP_TOOLS = new Set(['verify_replay_spec', 'search_facts', 'search_exchanges', 'get_exchange', 'read_peer_trace', 'expand_digest', 'board_read', 'query_cves', 'load_skill'])
 
 /**
  * Tools that count as route evidence (the worker actually requested a target route) and as spec
@@ -1824,6 +1824,16 @@ export function gapValidationRejectedMessage(
 export const GUARDIAN_VERIFY_USAGE_HINT =
   'Inline TS scripts receive `ctx` directly (no imports required): `await ctx.prove_access_boundary({ controlPersona, probePersona, route }); return ctx.result({ title: "..." })` (or `export default async (ctx) => { ... }`). Python `ctx.*` helpers are synchronous (no `await` needed).'
 
+const GUARDIAN_VERIFY_SIGNATURES = [
+  'Exact TS helper signatures (targets accept string path/URL or { url|path|pathAndQuery, method?, headers?, body?, as? }):',
+  '- ctx.prove_access_boundary({ controlPersona, probePersona, route, method?, expectControlDenied? })',
+  '- ctx.prove_persisted_mutation({ readRoute, mutation: { path|url, method, body, as? }, fieldPath, expectDelta, readPersona?, mutatePersona? })',
+  '- ctx.prove_injection_differential({ control: path|{ path, method?, body?, as? }, probe: path|{ path, method?, body?, as? }, expectedOutput?, vulnClass? })',
+  '- ctx.prove_boolean_or_timing_diff({ control, variant, mode: "boolean"|"timing", rounds? })',
+  '- ctx.prove_oob_callback({ inject: { target|path, method?, body?, as? } | (canary) => Promise<void>, timeoutMs? })',
+  '- ctx.prove_race_burst({ requests: [{ path|url, method, body?, as? }, ...], barrier?: "auto"|"h2"|"http1" })',
+].join('\n')
+
 const GUARDIAN_VERIFY_TS_EXAMPLE = [
   'Working inline TS example (`ctx` is pre-injected — no imports needed; `export default async (ctx) => ...` also works; in Python `ctx.*` is synchronous, no `await` needed):',
   '```ts',
@@ -1835,7 +1845,7 @@ const GUARDIAN_VERIFY_TS_EXAMPLE = [
 ].join('\n')
 
 const GUARDIAN_VERIFY_TOOL_DESCRIPTION_BASE =
-  `Run a short TypeScript or Python verification script through Guardian’s Layer-1 RPC bridge and the independent transcript oracle. Confirmation requires two fresh-session runs whose signed exchanges satisfy every claimed assertion; the script’s stdout is never evidence. Confirmation BOTH proves AND persists the confirmed finding directly (with ProofReceipt / proof_kind="agent_script") — no propose_chain_finding or verify_replay_spec call is needed. Pass \`script\` inline (works with or without a mounted repo; \`scriptPath\` only reads from a mounted workspace): call a typed helper (ctx.prove_access_boundary / ctx.prove_persisted_mutation / ctx.prove_boolean_or_timing_diff / ctx.prove_injection_differential / ctx.prove_oob_callback / ctx.prove_race_burst) or ctx.http/ctx.browser/ctx.oob, then return ctx.result({ title }).\n\n${GUARDIAN_VERIFY_TS_EXAMPLE}`
+  `Run a short TypeScript or Python verification script through Guardian’s Layer-1 RPC bridge and the independent transcript oracle. Confirmation requires two fresh-session runs whose signed exchanges satisfy every claimed assertion; the script’s stdout is never evidence. Confirmation BOTH proves AND persists the confirmed finding directly (with ProofReceipt / proof_kind="agent_script") — no propose_chain_finding or verify_replay_spec call is needed. Pass \`script\` inline (works with or without a mounted repo; \`scriptPath\` only reads from a mounted workspace): call a typed helper (ctx.prove_access_boundary / ctx.prove_persisted_mutation / ctx.prove_boolean_or_timing_diff / ctx.prove_injection_differential / ctx.prove_oob_callback / ctx.prove_race_burst) or ctx.http/ctx.browser/ctx.oob, then return ctx.result({ title }).\n\n${GUARDIAN_VERIFY_SIGNATURES}\n\n${GUARDIAN_VERIFY_TS_EXAMPLE}`
 
 /** Runtime DeclarativeReplaySpec kinds rejected on legacy tools while `guardian_verify` is active. */
 export const GUARDIAN_VERIFY_ENFORCED_RUNTIME_KINDS: ReadonlySet<string> = new Set([

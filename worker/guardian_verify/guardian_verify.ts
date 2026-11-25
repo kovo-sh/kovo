@@ -378,35 +378,127 @@ export interface OobCheck extends OobHandle {
   hits: Array<{ protocol: string; token: string; remoteIp?: string; timestamp?: number }>
 }
 
-export type HttpTarget = string | { url: string; origin?: string }
+export type HttpTarget =
+  | string
+  | {
+      url?: string
+      path?: string
+      pathAndQuery?: string
+      endpoint?: string
+      route?: string
+      target?: HttpTarget
+      origin?: string
+      method?: string
+      headers?: Record<string, string>
+      body?: string | Record<string, unknown> | unknown[]
+      as?: string
+      persona?: string
+      session?: string
+      role?: 'setup' | 'control' | 'probe' | 'cleanup'
+      followRedirects?: boolean
+      timeoutMs?: number
+    }
 
 export interface HttpOptions {
   /** Approved persona handle; Layer 1 injects the credential. */
   as?: string
+  persona?: string
   session?: string
   role?: 'setup' | 'control' | 'probe' | 'cleanup'
   method?: string
   headers?: Record<string, string>
-  body?: string
+  body?: string | Record<string, unknown> | unknown[]
   followRedirects?: boolean
   timeoutMs?: number
 }
 
+function normalizeBodyAndHeaders(
+  rawBody: unknown,
+  rawHeaders?: Record<string, string>,
+): { body?: string; headers?: Record<string, string> } {
+  const headers = rawHeaders ? { ...rawHeaders } : undefined
+  if (rawBody === undefined || rawBody === null) return { ...(headers ? { headers } : {}) }
+  if (typeof rawBody === 'string') return { body: rawBody, ...(headers ? { headers } : {}) }
+  const serialized = JSON.stringify(rawBody)
+  const hasContentType = Object.keys(headers ?? {}).some(key => key.toLowerCase() === 'content-type')
+  const nextHeaders = hasContentType ? headers : { 'content-type': 'application/json', ...(headers ?? {}) }
+  return { body: serialized, ...(nextHeaders ? { headers: nextHeaders } : {}) }
+}
+
+function extractInlineHttpOptions(input: unknown): HttpOptions {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {}
+  const rec = input as Record<string, unknown>
+  const out: HttpOptions = {}
+  if (typeof rec.method === 'string' && rec.method.trim()) out.method = rec.method.trim().toUpperCase()
+  if (rec.headers && typeof rec.headers === 'object' && !Array.isArray(rec.headers)) {
+    out.headers = rec.headers as Record<string, string>
+  }
+  if (rec.body !== undefined) out.body = rec.body as HttpOptions['body']
+  const persona = typeof rec.as === 'string' ? rec.as : typeof rec.persona === 'string' ? rec.persona : undefined
+  if (persona) out.as = persona
+  if (typeof rec.session === 'string' && rec.session) out.session = rec.session
+  if (typeof rec.role === 'string' && rec.role) out.role = rec.role as HttpOptions['role']
+  if (typeof rec.followRedirects === 'boolean') out.followRedirects = rec.followRedirects
+  if (typeof rec.timeoutMs === 'number') out.timeoutMs = rec.timeoutMs
+  return out
+}
+
 function splitTarget(input: HttpTarget, defaultOrigin: string | undefined): { origin?: string; path: string } {
   if (typeof input === 'string') {
-    if (/^https?:\/\//i.test(input)) {
-      const url = new URL(input)
+    const trimmed = input.trim()
+    if (!trimmed) throw new Error('HTTP target path/URL must be non-empty.')
+    if (/^https?:\/\//i.test(trimmed)) {
+      const url = new URL(trimmed)
       return { origin: url.origin, path: url.pathname + url.search }
     }
-    if (!input.startsWith('/')) throw new Error('Relative verification paths must start with "/".')
-    return { path: input }
+    const path = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+    return { ...(defaultOrigin ? { origin: defaultOrigin } : {}), path }
   }
-  if (typeof input?.url !== 'string') throw new Error('HTTP target requires a url string.')
-  if (/^https?:\/\//i.test(input.url)) {
-    const url = new URL(input.url)
-    return { origin: input.origin ?? url.origin, path: url.pathname + url.search }
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error('HTTP target requires a path/URL string or an object with { url | path | pathAndQuery | endpoint }.')
   }
-  return { ...(input.origin ? { origin: input.origin } : {}), path: input.url }
+  const raw = input.url ?? input.path ?? input.pathAndQuery ?? input.endpoint ?? input.route
+  if (typeof raw === 'string' && raw.trim()) {
+    const trimmed = raw.trim()
+    if (/^https?:\/\//i.test(trimmed)) {
+      const url = new URL(trimmed)
+      return { origin: input.origin ?? url.origin, path: url.pathname + url.search }
+    }
+    const path = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+    return { ...((input.origin ?? defaultOrigin) ? { origin: input.origin ?? defaultOrigin } : {}), path }
+  }
+  if (input.target !== undefined) {
+    const nested = splitTarget(input.target, input.origin ?? defaultOrigin)
+    return { ...(input.origin ? { origin: input.origin } : (nested.origin ? { origin: nested.origin } : {})), path: nested.path }
+  }
+  throw new Error('HTTP target requires a path/URL string or an object with { url | path | pathAndQuery | endpoint }.')
+}
+
+function normalizeArm(arm: unknown, helperName: string, armName: string): DifferentialArmInput {
+  if (arm === undefined || arm === null) {
+    throw new Error(`${helperName} requires \`${armName}\` (path/URL string or { target|url|path|pathAndQuery, method?, headers?, body?, as?, options? }).`)
+  }
+  if (typeof arm === 'string') return { target: arm }
+  if (typeof arm === 'object' && !Array.isArray(arm)) {
+    const rec = arm as Record<string, unknown>
+    const rawTarget = rec.target ?? rec.url ?? rec.path ?? rec.pathAndQuery ?? rec.endpoint ?? rec.route
+    if (rawTarget === undefined || rawTarget === null) {
+      throw new Error(`${helperName}.${armName} requires a target string or { target|url|path|pathAndQuery }.`)
+    }
+    const nestedOpts = (rec.options && typeof rec.options === 'object' && !Array.isArray(rec.options))
+      ? (rec.options as HttpOptions)
+      : {}
+    const flatOpts = extractInlineHttpOptions(rec)
+    const mergedOptions: HttpOptions = { ...flatOpts, ...nestedOpts }
+    const target: HttpTarget = typeof rawTarget === 'string'
+      ? (typeof rec.origin === 'string' ? { url: rawTarget, origin: rec.origin } : rawTarget)
+      : rawTarget as HttpTarget
+    return {
+      target,
+      ...(Object.keys(mergedOptions).length > 0 ? { options: mergedOptions } : {}),
+    }
+  }
+  throw new Error(`${helperName}.${armName} must be a path/URL string or request object.`)
 }
 
 function isSuccessStatus(status: number): boolean {
@@ -636,6 +728,7 @@ export class VerifyContext {
   readonly nonce: string
   readonly runId: string
   readonly targetOrigins: string[]
+  readonly targetOrigin: string
   readonly sdkVersion: string
   readonly claims: VerifyClaim[] = []
   readonly expect: Expectations
@@ -648,6 +741,7 @@ export class VerifyContext {
     this.nonce = process.env.GUARDIAN_VERIFY_NONCE ?? context.nonce
     this.runId = context.runId
     this.targetOrigins = context.targetOrigins
+    this.targetOrigin = this.targetOrigins[0] ?? ''
     this.sdkVersion = context.sdkVersion
     this.defaultOrigin = this.targetOrigins[0]
     const push = (claim: VerifyClaim): VerifyClaim => { this.claims.push(claim); return claim }
@@ -691,32 +785,38 @@ export class VerifyContext {
 
   async http(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {
     const target = splitTarget(input, this.defaultOrigin)
+    const merged: HttpOptions = { ...extractInlineHttpOptions(input), ...options }
+    const { body, headers } = normalizeBodyAndHeaders(merged.body, merged.headers)
+    const persona = merged.as ?? merged.persona
     const result = await rpc('http', {
       ...(target.origin ? { origin: target.origin } : {}),
       path: target.path,
-      method: options.method ?? 'GET',
-      ...(options.headers ? { headers: options.headers } : {}),
-      ...(options.body !== undefined ? { body: options.body } : {}),
-      ...(options.as ? { persona: options.as } : {}),
-      ...(options.session ? { session: options.session } : {}),
-      ...(options.role ? { sessionGroupRole: options.role } : {}),
-      ...(options.followRedirects !== undefined ? { followRedirects: options.followRedirects } : {}),
-    }, (options.timeoutMs ?? 60_000) + 10_000)
+      method: (merged.method ?? 'GET').toUpperCase(),
+      ...(headers ? { headers } : {}),
+      ...(body !== undefined ? { body } : {}),
+      ...(persona ? { persona } : {}),
+      ...(merged.session ? { session: merged.session } : {}),
+      ...(merged.role ? { sessionGroupRole: merged.role } : {}),
+      ...(merged.followRedirects !== undefined ? { followRedirects: merged.followRedirects } : {}),
+    }, (merged.timeoutMs ?? 60_000) + 10_000)
     return result as HttpExchange
   }
 
   async http2(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {
     const target = splitTarget(input, this.defaultOrigin)
+    const merged: HttpOptions = { ...extractInlineHttpOptions(input), ...options }
+    const { body, headers } = normalizeBodyAndHeaders(merged.body, merged.headers)
+    const persona = merged.as ?? merged.persona
     const result = await rpc('http2', {
       ...(target.origin ? { origin: target.origin } : {}),
       path: target.path,
-      method: options.method ?? 'GET',
-      ...(options.headers ? { headers: options.headers } : {}),
-      ...(options.body !== undefined ? { body: options.body } : {}),
-      ...(options.as ? { persona: options.as } : {}),
-      ...(options.session ? { session: options.session } : {}),
-      ...(options.role ? { sessionGroupRole: options.role } : {}),
-    }, (options.timeoutMs ?? 60_000) + 10_000)
+      method: (merged.method ?? 'GET').toUpperCase(),
+      ...(headers ? { headers } : {}),
+      ...(body !== undefined ? { body } : {}),
+      ...(persona ? { persona } : {}),
+      ...(merged.session ? { session: merged.session } : {}),
+      ...(merged.role ? { sessionGroupRole: merged.role } : {}),
+    }, (merged.timeoutMs ?? 60_000) + 10_000)
     return result as HttpExchange
   }
 
@@ -779,6 +879,12 @@ export class VerifyContext {
    * re-evaluates. `control_denied` + `variant_crossed` ids are returned.
    */
   async proveAccessBoundary(input: AccessBoundaryInput): Promise<AccessBoundaryProof> {
+    if (!input || typeof input !== 'object') {
+      throw new Error('prove_access_boundary requires { controlPersona, probePersona, route, method?, expectControlDenied? }.')
+    }
+    if (!input.route) {
+      throw new Error('prove_access_boundary requires `route` (path/URL string or { url|path|pathAndQuery }).')
+    }
     const controlSession = input.controlSession ?? 'access-boundary-control'
     const probeSession = input.probeSession ?? 'access-boundary-probe'
     const method = input.method ?? 'GET'
@@ -821,19 +927,28 @@ export class VerifyContext {
    * delta and emits an `impact` claim (mass-assignment by default) with the write body attached.
    */
   async provePersistedMutation(input: PersistedMutationInput): Promise<PersistedMutationProof> {
-    const mut = (typeof input.mutation === 'object' && input.mutation !== null && 'target' in input.mutation)
-      ? input.mutation
-      : { target: input.mutation as HttpTarget }
-    const readPersona = input.readPersona ?? mut.as
-    const mutatePersona = input.mutatePersona ?? mut.as
+    if (!input || typeof input !== 'object') {
+      throw new Error('prove_persisted_mutation requires { readRoute, mutation: { path|url, method, body, as? }, fieldPath, expectDelta }.')
+    }
+    if (!input.readRoute || !input.mutation) {
+      throw new Error('prove_persisted_mutation requires `readRoute` and `mutation` (path/URL or { path|url|target, method, body, as? }).')
+    }
+    const mutArm = normalizeArm(input.mutation, 'prove_persisted_mutation', 'mutation')
+    const mut = {
+      target: mutArm.target,
+      ...(mutArm.options ?? {}),
+    }
+    const readPersona = input.readPersona ?? mut.as ?? mut.persona
+    const mutatePersona = input.mutatePersona ?? mut.as ?? mut.persona
     const readSession = input.readSession ?? 'persisted-read'
     const before = await this.http(input.readRoute, { method: input.readMethod ?? 'GET', ...(readPersona ? { as: readPersona } : {}), role: 'control', session: readSession })
-    const writeHeaders = mut.body !== undefined && !Object.keys(mut.headers ?? {}).some(key => key.toLowerCase() === 'content-type')
-      ? { 'content-type': 'application/json', ...(mut.headers ?? {}) }
-      : mut.headers
+    const normalizedWrite = normalizeBodyAndHeaders(mut.body, mut.headers)
+    const writeHeaders = normalizedWrite.body !== undefined && !Object.keys(normalizedWrite.headers ?? {}).some(key => key.toLowerCase() === 'content-type')
+      ? { 'content-type': 'application/json', ...(normalizedWrite.headers ?? {}) }
+      : normalizedWrite.headers
     const mutation = await this.http(mut.target, {
       method: mut.method ?? 'POST',
-      ...(mut.body !== undefined ? { body: mut.body } : {}),
+      ...(normalizedWrite.body !== undefined ? { body: normalizedWrite.body } : {}),
       ...(writeHeaders ? { headers: writeHeaders } : {}),
       ...(mutatePersona ? { as: mutatePersona } : {}),
       role: 'probe',
@@ -867,7 +982,7 @@ export class VerifyContext {
       ...(input.oracleEvents ? { oracleEvents: input.oracleEvents } : {}),
       ...(input.actorRoles ? { actorRoles: input.actorRoles } : {}),
       ...(input.actorTenants ? { actorTenants: input.actorTenants } : {}),
-      ...(mut.body !== undefined && parseJsonBody(mut.body) !== undefined ? { requestBody: parseJsonBody(mut.body) } : {}),
+      ...(normalizedWrite.body !== undefined && parseJsonBody(normalizedWrite.body) !== undefined ? { requestBody: parseJsonBody(normalizedWrite.body) } : {}),
       ...(input.message ? { message: input.message } : {}),
     }
     this.claims.push(claim)
@@ -900,12 +1015,11 @@ export class VerifyContext {
    * `structural_diff` or `timing` claim.
    */
   async proveBooleanOrTimingDiff(input: BooleanOrTimingDiffInput): Promise<DifferentialProof> {
-    const armOf = (arm: DifferentialArmInput | HttpTarget): DifferentialArmInput =>
-      (typeof arm === 'string' || (typeof arm === 'object' && arm !== null && 'url' in arm && !('target' in arm)))
-        ? { target: arm as HttpTarget }
-        : arm as DifferentialArmInput
-    const controlArm = armOf(input.control)
-    const variantArm = armOf(input.variant)
+    if (!input || typeof input !== 'object') {
+      throw new Error('prove_boolean_or_timing_diff requires { control, variant, mode: "boolean"|"timing", rounds? }.')
+    }
+    const controlArm = normalizeArm(input.control, 'prove_boolean_or_timing_diff', 'control')
+    const variantArm = normalizeArm(input.variant, 'prove_boolean_or_timing_diff', 'variant')
     const session = input.session ?? `diff-${input.mode}`
     const controlExchanges: HttpExchange[] = []
     const variantExchanges: HttpExchange[] = []
@@ -1033,12 +1147,16 @@ export class VerifyContext {
         const returned = await input.inject(handle)
         injection = returned ?? null
       } else {
-        const spec = input.inject
-        injection = await this.http(spec.target, {
-          method: spec.method ?? 'POST',
-          ...(spec.body !== undefined ? { body: renderInjection(spec.body, handle) } : {}),
-          ...(spec.headers ? { headers: spec.headers } : {}),
-          ...(spec.as ? { as: spec.as } : {}),
+        const spec = input.inject as OobInjectionInput & Record<string, unknown>
+        const injectArm = normalizeArm(spec, 'prove_oob_callback', 'inject')
+        const injectBody = injectArm.options?.body !== undefined
+          ? renderInjection(typeof injectArm.options.body === 'string' ? injectArm.options.body : JSON.stringify(injectArm.options.body), handle)
+          : undefined
+        const injectTarget = typeof injectArm.target === 'string' ? renderInjection(injectArm.target, handle) : injectArm.target
+        injection = await this.http(injectTarget, {
+          ...injectArm.options,
+          method: injectArm.options?.method ?? spec.method ?? 'POST',
+          ...(injectBody !== undefined ? { body: injectBody } : {}),
           role: 'probe',
           session: 'oob-injection',
         })
@@ -1132,16 +1250,17 @@ export class VerifyContext {
         const target = splitTarget(request as HttpTarget, this.defaultOrigin)
         return { ...(target.origin ? { origin: target.origin } : { origin: this.defaultOrigin }), path: target.path, method: 'GET', sessionGroupRole: 'probe', session: input.session ?? 'race' }
       }
-      const spec = request as RaceRequestInput
-      const rawTarget = spec.target ?? spec.url ?? spec.path ?? '/'
+      const spec = request as RaceRequestInput & Record<string, unknown>
+      const rawTarget = spec.target ?? spec.url ?? spec.path ?? spec.pathAndQuery ?? spec.endpoint ?? spec.route ?? '/'
       const target = splitTarget(rawTarget as HttpTarget, this.defaultOrigin)
+      const normalizedReq = normalizeBodyAndHeaders(spec.body, spec.headers)
       return {
         origin: spec.origin ?? target.origin ?? this.defaultOrigin,
         path: target.path,
         method: (spec.method ?? 'GET').toUpperCase(),
-        ...(spec.headers ? { headers: spec.headers } : {}),
-        ...(spec.body !== undefined ? { body: spec.body } : {}),
-        ...(spec.as ? { persona: spec.as } : {}),
+        ...(normalizedReq.headers ? { headers: normalizedReq.headers } : {}),
+        ...(normalizedReq.body !== undefined ? { body: normalizedReq.body } : {}),
+        ...(spec.as ? { persona: spec.as } : (typeof spec.persona === 'string' ? { persona: spec.persona } : {})),
         sessionGroupRole: 'probe',
         session: input.session ?? `race-${index}`,
       }
@@ -1209,8 +1328,19 @@ export class VerifyContext {
    * fingerprint verification.
    */
   async proveInjectionDifferential(input: {
-    control: DifferentialArmInput | HttpTarget
-    probe: DifferentialArmInput | HttpTarget
+    control?: DifferentialArmInput | HttpTarget
+    probe?: DifferentialArmInput | HttpTarget
+    variant?: DifferentialArmInput | HttpTarget
+    url?: string
+    path?: string
+    pathAndQuery?: string
+    endpoint?: string
+    route?: string
+    method?: string
+    headers?: Record<string, string>
+    as?: string
+    controlBody?: string | Record<string, unknown>
+    probeBody?: string | Record<string, unknown>
     expectedOutput?: string
     vulnClass?: string
     session?: string
@@ -1222,12 +1352,23 @@ export class VerifyContext {
     claims: VerifyClaim[]
     evaluated: boolean
   } & ProofFeedback> {
-    const armOf = (arm: DifferentialArmInput | HttpTarget): DifferentialArmInput =>
-      (typeof arm === 'string' || (typeof arm === 'object' && arm !== null && 'url' in arm && !('target' in arm)))
-        ? { target: arm as HttpTarget }
-        : arm as DifferentialArmInput
-    const controlArm = armOf(input.control)
-    const probeArm = armOf(input.probe)
+    if (!input || typeof input !== 'object') {
+      throw new Error('prove_injection_differential requires { control, probe, expectedOutput?, vulnClass? } where control/probe are path/URL strings or { url|path|target, method?, headers?, body?, as? }.')
+    }
+    const baseRoute = input.url ?? input.path ?? input.pathAndQuery ?? input.endpoint ?? input.route
+    const baseOpts: HttpOptions = {
+      ...(input.method ? { method: input.method } : {}),
+      ...(input.headers ? { headers: input.headers } : {}),
+      ...(input.as ? { as: input.as } : {}),
+    }
+    const rawControl = input.control ?? (baseRoute && input.controlBody !== undefined
+      ? { target: baseRoute, options: { ...baseOpts, body: input.controlBody } }
+      : undefined)
+    const rawProbe = input.probe ?? input.variant ?? (baseRoute && input.probeBody !== undefined
+      ? { target: baseRoute, options: { ...baseOpts, body: input.probeBody } }
+      : undefined)
+    const controlArm = normalizeArm(rawControl, 'prove_injection_differential', 'control')
+    const probeArm = normalizeArm(rawProbe, 'prove_injection_differential', 'probe')
     const session = input.session ?? 'injection-diff'
     const control = await this.http(controlArm.target, { ...controlArm.options, role: 'control', session })
     const probe = await this.http(probeArm.target, { ...probeArm.options, role: 'probe', session })
@@ -1353,11 +1494,16 @@ export class VerifyContext {
     })
   }
   prove_injection_differential(input: Parameters<VerifyContext['proveInjectionDifferential']>[0] | Record<string, unknown>) {
+    if (!input || typeof input !== 'object') {
+      throw new Error('prove_injection_differential requires { control, probe, expectedOutput?, vulnClass? }.')
+    }
     const raw = input as Record<string, unknown>
     return this.proveInjectionDifferential({
       ...(raw as unknown as Parameters<VerifyContext['proveInjectionDifferential']>[0]),
-      control: raw.control as DifferentialArmInput | HttpTarget,
-      probe: (raw.probe ?? raw.variant) as DifferentialArmInput | HttpTarget,
+      ...((raw.control !== undefined) ? { control: raw.control as DifferentialArmInput | HttpTarget } : {}),
+      ...((raw.probe ?? raw.variant) !== undefined ? { probe: (raw.probe ?? raw.variant) as DifferentialArmInput | HttpTarget } : {}),
+      ...((raw.controlBody ?? raw.control_body) !== undefined ? { controlBody: (raw.controlBody ?? raw.control_body) as string | Record<string, unknown> } : {}),
+      ...((raw.probeBody ?? raw.probe_body) !== undefined ? { probeBody: (raw.probeBody ?? raw.probe_body) as string | Record<string, unknown> } : {}),
       ...((raw.expectedOutput ?? raw.expected_output) !== undefined ? { expectedOutput: String(raw.expectedOutput ?? raw.expected_output) } : {}),
       ...((raw.vulnClass ?? raw.vuln_class) !== undefined ? { vulnClass: String(raw.vulnClass ?? raw.vuln_class) } : {}),
     })
