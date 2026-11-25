@@ -1,5 +1,5 @@
 /**
- * Guardian v7 — `crawlStateGraph` route lookups must page past the store's default 500-row view.
+ * Kovo Hunter v7 — `crawlStateGraph` route lookups must page past the store's default 500-row view.
  *
  * Regression for the state-graph crawl finding: `runPhase0Recon` planning reads were paged, but
  * the crawl still resolved intercepted-query, Next-Action and persona-union routes through
@@ -128,10 +128,10 @@ async function crawlSurface(
   label: string,
   options: { reverse?: boolean } = {},
 ): Promise<CrawlSurface> {
-  const { storage } = makeStore(t, `guardian-v7-crawl-paging-${label}-`)
+  const { storage } = makeStore(t, `kovo-v7-crawl-paging-${label}-`)
   const setup = await setupApprovedRun(storage, { seeds: [ORIGIN], budgetRequests: 900 })
   seedSurface(storage, setup.runId, options)
-  const result = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+  const result = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
     crawlStateGraph({
       storage,
       runId: setup.runId,

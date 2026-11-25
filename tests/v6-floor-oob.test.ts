@@ -45,7 +45,7 @@ const tempDirs: string[] = []
 
 function fakeClockBroker(): { clock: FakeClock; broker: CanaryBroker } {
   const clock = new FakeClock()
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-floor-oob-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-floor-oob-'))
   tempDirs.push(dir)
   const broker = new CanaryBroker({ now: clock.now, oobDirectory: dir })
   brokers.push(broker)
@@ -269,7 +269,7 @@ test('a non-canary probe never registers a pending_oob row and keeps its evidenc
     pathAndQuery: '/api/search',
     param: { name: 'q', location: 'query' },
     location: 'query',
-    baselineValue: 'guardian',
+    baselineValue: 'kovo',
     risk: 80,
   }
   const result = differential({

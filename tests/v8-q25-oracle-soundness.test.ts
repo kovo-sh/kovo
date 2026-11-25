@@ -12,7 +12,7 @@
  *  3. `isJobOrHandleStub` classifies signed-URL / presigned-download / export-job / token-handle
  *     envelopes as intermediate stubs while accepting genuine foreign-tenant records and mutation
  *     readbacks.
- *  4. `GUARDIAN_VERIFY_TOOL_DESCRIPTION` and `workerSessionInstructions` surface the compact
+ *  4. `KOVO_VERIFY_TOOL_DESCRIPTION` and `workerSessionInstructions` surface the compact
  *     (<= 12 lines) Multi-Hop Cryptographic & Async Pivot Pattern (`ctx.hmac_sign`, `ctx.jwt_sign`,
  *     `ctx.await_async`, `edge_binding`, exact terminal denied control, no stub stop) within byte
  *     budgets and with zero benchmark contamination.
@@ -22,10 +22,10 @@ import { dirname, join } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import {
-  GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-  GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN,
-  GUARDIAN_VERIFY_TOOL_DESCRIPTION,
-  guardianVerifyHelperGuidance,
+  KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+  KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN,
+  KOVO_VERIFY_TOOL_DESCRIPTION,
+  kovoVerifyHelperGuidance,
   workerSessionInstructions,
 } from '../src/server/agent-prompts.ts'
 import {
@@ -442,18 +442,18 @@ test('isJobOrHandleStub rejects signed-URL / presigned-download / export-job / t
 // ============================================================================
 
 test('agent-prompts surfaces compact (<= 12 lines) Multi-Hop Cryptographic & Async Pivot Pattern within budgets and with zero contamination', () => {
-  const lines = GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.split('\n')
+  const lines = KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.split('\n')
   assert.ok(lines.length <= 12, `Pattern must be <= 12 lines, got ${lines.length}`)
 
-  const sysPrompt = workerSessionInstructions('worker-investigation', { hasGuardianVerify: true })
-  const guidance = guardianVerifyHelperGuidance()
+  const sysPrompt = workerSessionInstructions('worker-investigation', { hasKovoVerify: true })
+  const guidance = kovoVerifyHelperGuidance()
   assert.ok(
-    Buffer.byteLength(guidance, 'utf8') <= GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-    `guidance ${Buffer.byteLength(guidance, 'utf8')} B > ${GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES} B`,
+    Buffer.byteLength(guidance, 'utf8') <= KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+    `guidance ${Buffer.byteLength(guidance, 'utf8')} B > ${KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES} B`,
   )
 
   for (const [label, text] of [
-    ['GUARDIAN_VERIFY_TOOL_DESCRIPTION', GUARDIAN_VERIFY_TOOL_DESCRIPTION],
+    ['KOVO_VERIFY_TOOL_DESCRIPTION', KOVO_VERIFY_TOOL_DESCRIPTION],
     ['workerSessionInstructions', sysPrompt],
   ] as const) {
     assert.ok(text.includes('ctx.hmac_sign('), `${label} missing exact ctx.hmac_sign(...) call`)

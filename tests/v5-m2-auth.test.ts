@@ -153,7 +153,7 @@ test('V5-M2.1 RFC-6265 Domain cookies cross in-scope subdomains while host-only 
   const apiOrigin = `http://api.localhost:${fixture.port}`
   const sig = AbortSignal.timeout(10_000)
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const grant = makeGrant([appOrigin, apiOrigin])
 
     // Domain cookie shared across subdomains; host-only cookie must not leak.
@@ -196,14 +196,14 @@ test('V5-M2.1b Persona Vault rotation: fresh jar Set-Cookie rotation supersedes 
   const { tmpdir } = await import('node:os')
   const { join } = await import('node:path')
   const { Store } = await import('../src/server/store.ts')
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v5m2-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v5m2-'))
   const storage = new Store(dir)
   t.after(() => {
     storage.close()
     rmSync(dir, { recursive: true, force: true })
   })
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const { id: projectId } = storage.createProject({
       requestId: randomUUID(), name: 'M2 auth cookies', seeds: [appOrigin], environment: 'local-lab',
     })
@@ -251,7 +251,7 @@ test('V5-M2.1c LB cap raised to 12 jars per assignment', async t => {
   const grant = makeGrant([origin])
   const sig = AbortSignal.timeout(10_000)
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     for (let i = 0; i < 12; i += 1) {
       await broker.executeHttp({ origin, method: 'GET', pathAndQuery: '/set', session: `j${i}`, runId: 'r', assignmentId: 'a' }, grant, sig)
     }
@@ -320,7 +320,7 @@ test('V5-M2.2 CSRF: rotated URL-encoded XSRF cookie, response headers, (origin,p
     origin, method: 'GET' as const, pathAndQuery, session, runId: 'r', assignmentId: 'a', ...extra,
   })
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     // URL-encoded double-submit cookie, rotated: second value wins and is decoded once.
     await broker.executeHttp(req('/xsrf-boot', 'csrf1'), grant, sig)
     await broker.executeHttp(req('/xsrf-rotate', 'csrf1'), grant, sig)
@@ -416,7 +416,7 @@ test('V5-M2.3 PersonaAuthManager 401 re-auth is rate-limited and the broker retr
   const { tmpdir } = await import('node:os')
   const { join } = await import('node:path')
   const { Store } = await import('../src/server/store.ts')
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v5m2-auth-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v5m2-auth-'))
   const storage = new Store(dir)
   t.after(() => {
     storage.close()
@@ -433,7 +433,7 @@ test('V5-M2.3 PersonaAuthManager 401 re-auth is rate-limited and the broker retr
 
   const origin = `http://127.0.0.1:${fixture.port}`
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const { id: projectId } = storage.createProject({
       requestId: randomUUID(), name: 'M2 401 refresh', seeds: [origin], environment: 'local-lab',
     })
@@ -565,7 +565,7 @@ test('V5-M2.5 explicit operator-approved non-default ports are allowed; unapprov
     broker.executeHttp({ origin: 'https://app.m5ports.example:9443', method: 'GET', pathAndQuery: '/' }, deniedGrant, AbortSignal.timeout(5_000)),
     BrokerDenied,
   )
-  await withEnv({ GUARDIAN_ALLOWED_PORTS: '9443' }, async () => {
+  await withEnv({ KOVO_ALLOWED_PORTS: '9443' }, async () => {
     const envOk = await broker.executeHttp({ origin: 'https://app.m5ports.example:9443', method: 'GET', pathAndQuery: '/' }, deniedGrant, AbortSignal.timeout(5_000))
     assert.equal(envOk.status, 200)
   })

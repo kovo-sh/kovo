@@ -38,7 +38,7 @@ import { blueprint as opsportalBlueprint } from '../benchmarks/realistic-bench/a
 import { makeClient } from '../benchmarks/realistic-bench/apps/opsportal/truth/matrix-helpers.ts'
 import opsportal from '../benchmarks/realistic-bench/apps/opsportal/index.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 function finding(overrides: Partial<SubmittedFinding> & Pick<SubmittedFinding, 'id' | 'endpoints'>): SubmittedFinding {
   return {

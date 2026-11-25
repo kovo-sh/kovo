@@ -30,12 +30,12 @@ class FakeClock {
   }
 }
 
-const tokenA = `guardian-canary-${'a'.repeat(24)}`
-const tokenB = `guardian-canary-${'b'.repeat(24)}`
+const tokenA = `kovo-canary-${'a'.repeat(24)}`
+const tokenB = `kovo-canary-${'b'.repeat(24)}`
 
 const tempDirs: string[] = []
 function tempDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v6-oob-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v6-oob-'))
   tempDirs.push(dir)
   return dir
 }
@@ -315,7 +315,7 @@ describe('v6 OOB: relay profiles', () => {
       assert.equal(canary.synthetic, false)
       const response = await fetch(`${canary.httpUrl}?probe=ok`, { signal: AbortSignal.timeout(5_000) })
       assert.equal(response.status, 200)
-      assert.equal(await response.text(), 'guardian-canary-ok')
+      assert.equal(await response.text(), 'kovo-canary-ok')
       assert.equal(broker.checkCanary(canary.token).hit, true)
 
       const status = broker.relayStatus()
@@ -329,8 +329,8 @@ describe('v6 OOB: relay profiles', () => {
   })
 
   test('public profile refuses to activate without explicit operator config', async () => {
-    const previous = process.env.GUARDIAN_OOB_PUBLIC
-    delete process.env.GUARDIAN_OOB_PUBLIC
+    const previous = process.env.KOVO_OOB_PUBLIC
+    delete process.env.KOVO_OOB_PUBLIC
     const broker = new CanaryBroker()
     try {
       const defaults = resolveOobRelayProfile({}, {})
@@ -362,8 +362,8 @@ describe('v6 OOB: relay profiles', () => {
       assert.equal(complete.dns.authoritative, true)
       assert.doesNotThrow(() => assertPublicProfileStartable(complete))
     } finally {
-      if (previous === undefined) delete process.env.GUARDIAN_OOB_PUBLIC
-      else process.env.GUARDIAN_OOB_PUBLIC = previous
+      if (previous === undefined) delete process.env.KOVO_OOB_PUBLIC
+      else process.env.KOVO_OOB_PUBLIC = previous
       await broker.stopListener()
       broker.closeOob()
     }
@@ -420,7 +420,7 @@ describe('v6 OOB: relay profiles', () => {
 
       const canary = broker.mintCanary('run-public', 'oob-probe', 'https://target.example')
       const callback = await fetch(`${info.localBaseUrl}/c/${canary.token}`, { signal: AbortSignal.timeout(5_000) })
-      assert.equal(await callback.text(), 'guardian-canary-ok')
+      assert.equal(await callback.text(), 'kovo-canary-ok')
       assert.equal(broker.checkCanary(canary.token).hit, true)
       assert.equal(broker.relayStatus().publicEnabled, true)
     } finally {
@@ -478,7 +478,7 @@ describe('v6 OOB: authoritative DNS hooks', () => {
       name: 'test-authoritative',
       resolve: query => {
         calls.push({ name: query.name, type: query.type, typeName: query.typeName })
-        if (query.type === 16) return { type: 'TXT', value: 'guardian-canary-ok' } satisfies OobDnsAnswer
+        if (query.type === 16) return { type: 'TXT', value: 'kovo-canary-ok' } satisfies OobDnsAnswer
         if (query.type === 1) return { type: 'A', value: '127.0.0.1' } satisfies OobDnsAnswer
         return null
       },
@@ -489,7 +489,7 @@ describe('v6 OOB: authoritative DNS hooks', () => {
     })
     try {
       const txt = await relay.resolveDns({ name: 'verify.oob.example', type: 16, typeName: 'TXT' })
-      assert.deepEqual(txt, { type: 'TXT', value: 'guardian-canary-ok' })
+      assert.deepEqual(txt, { type: 'TXT', value: 'kovo-canary-ok' })
       const address = await relay.resolveDns({ name: 'verify.oob.example', type: 1, typeName: 'A' })
       assert.deepEqual(address, { type: 'A', value: '127.0.0.1' })
       assert.deepEqual(calls.map(call => call.typeName), ['TXT', 'A'])

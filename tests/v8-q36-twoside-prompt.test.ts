@@ -3,8 +3,8 @@
  *
  * Verifies (Docker-free, 100% generic, zero benchmark contamination):
  *  1. Rule 1 (no standalone terminal helper after setup hops): `multiHopDirectives`,
- *     `guardianVerifyPromptHint`, `guardianVerifyHelperGuidance`,
- *     `GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN`, `GUARDIAN_VERIFY_TOOL_DESCRIPTION`,
+ *     `kovoVerifyPromptHint`, `kovoVerifyHelperGuidance`,
+ *     `KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN`, `KOVO_VERIFY_TOOL_DESCRIPTION`,
  *     `workerSessionInstructions`, and `src/skills/multihop-chains.md` (excerpt + full playbook)
  *     instruct workers to ALWAYS finalize with `ctx.prove_composite` — NEVER standalone
  *     `prove_race_burst` / `prove_access_boundary` / `prove_persisted_mutation` — whenever a
@@ -14,8 +14,8 @@
  *     workers to declare EVERY executed causal hop from Hop 1 through intermediate hops to the
  *     terminal hop in `prove_composite.hops[]` connected with `causalEdges[]`, warning that
  *     omitting Hop 1 or intermediate hops yields an incomplete receipt.
- *  3. Residual v7-compat cleanup: `GUARDIAN_VERIFY_SPEC_SHAPE` is removed from
- *     `guardianVerifyPromptHint()` and `guardianVerifyHelperGuidance()` (while remaining exported
+ *  3. Residual v7-compat cleanup: `KOVO_VERIFY_SPEC_SHAPE` is removed from
+ *     `kovoVerifyPromptHint()` and `kovoVerifyHelperGuidance()` (while remaining exported
  *     for legacy fallback callers), and zero-caller `deterministicLaneMaxWallClockMs` /
  *     `deterministicLaneWallClockShare` aliases are removed from `src/server/exec-dispatch.ts`.
  *  4. All prompt byte/line/excerpt budgets, single-hop isolation, and zero v8 contamination pass.
@@ -25,12 +25,12 @@ import { resolve } from 'node:path'
 import { test } from 'node:test'
 
 import {
-  GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-  GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN,
-  GUARDIAN_VERIFY_SPEC_SHAPE,
-  GUARDIAN_VERIFY_TOOL_DESCRIPTION,
-  guardianVerifyHelperGuidance,
-  guardianVerifyPromptHint,
+  KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+  KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN,
+  KOVO_VERIFY_SPEC_SHAPE,
+  KOVO_VERIFY_TOOL_DESCRIPTION,
+  kovoVerifyHelperGuidance,
+  kovoVerifyPromptHint,
   workerInvestigationPrompt,
   workerSessionInstructions,
 } from '../src/server/agent-prompts.ts'
@@ -81,12 +81,12 @@ test('Q36.1: Rule 1 enforces ctx.prove_composite (never standalone terminal help
   assert.match(reqComposite, /state rebind/i)
   assert.match(reqComposite, /async job polling/i)
 
-  const sysPrompt = workerSessionInstructions('worker-investigation', { hasGuardianVerify: true })
+  const sysPrompt = workerSessionInstructions('worker-investigation', { hasKovoVerify: true })
   for (const [label, text] of [
-    ['guardianVerifyPromptHint', guardianVerifyPromptHint()],
-    ['guardianVerifyHelperGuidance', guardianVerifyHelperGuidance()],
-    ['GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
-    ['GUARDIAN_VERIFY_TOOL_DESCRIPTION', GUARDIAN_VERIFY_TOOL_DESCRIPTION],
+    ['kovoVerifyPromptHint', kovoVerifyPromptHint()],
+    ['kovoVerifyHelperGuidance', kovoVerifyHelperGuidance()],
+    ['KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
+    ['KOVO_VERIFY_TOOL_DESCRIPTION', KOVO_VERIFY_TOOL_DESCRIPTION],
     ['workerSessionInstructions', sysPrompt],
   ] as const) {
     assert.match(text, /prerequisite setup hops/i, `${label} must mention prerequisite setup hops`)
@@ -121,12 +121,12 @@ test('Q36.2: Rule 2 enforces declaring EVERY executed causal hop from Hop 1 thro
   assert.match(allHops, /causalEdges\[\]/i)
   assert.match(allHops, /omitting Hop 1 or intermediate hops yields an incomplete receipt/i)
 
-  const sysPrompt = workerSessionInstructions('worker-investigation', { hasGuardianVerify: true })
+  const sysPrompt = workerSessionInstructions('worker-investigation', { hasKovoVerify: true })
   for (const [label, text] of [
-    ['guardianVerifyPromptHint', guardianVerifyPromptHint()],
-    ['guardianVerifyHelperGuidance', guardianVerifyHelperGuidance()],
-    ['GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
-    ['GUARDIAN_VERIFY_TOOL_DESCRIPTION', GUARDIAN_VERIFY_TOOL_DESCRIPTION],
+    ['kovoVerifyPromptHint', kovoVerifyPromptHint()],
+    ['kovoVerifyHelperGuidance', kovoVerifyHelperGuidance()],
+    ['KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
+    ['KOVO_VERIFY_TOOL_DESCRIPTION', KOVO_VERIFY_TOOL_DESCRIPTION],
     ['workerSessionInstructions', sysPrompt],
   ] as const) {
     assert.match(text, /declare EVERY (?:executed )?causal hop/i, `${label} must require declaring every executed causal hop`)
@@ -135,8 +135,8 @@ test('Q36.2: Rule 2 enforces declaring EVERY executed causal hop from Hop 1 thro
   }
 
   for (const [label, text] of [
-    ['GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
-    ['GUARDIAN_VERIFY_TOOL_DESCRIPTION', GUARDIAN_VERIFY_TOOL_DESCRIPTION],
+    ['KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
+    ['KOVO_VERIFY_TOOL_DESCRIPTION', KOVO_VERIFY_TOOL_DESCRIPTION],
     ['workerSessionInstructions', sysPrompt],
   ] as const) {
     assert.match(text, /omitting Hop 1 or intermediate hops yields an incomplete receipt/i, `${label} must warn about incomplete receipts`)
@@ -154,23 +154,23 @@ test('Q36.2: Rule 2 enforces declaring EVERY executed causal hop from Hop 1 thro
   assert.match(playbook, /Omitting Hop 1 or any intermediate setup hop yields an incomplete receipt/i)
 })
 
-test('Q36.3: residual v7-compat cleanup removes GUARDIAN_VERIFY_SPEC_SHAPE from guardian_verify summaries and dead lane aliases from exec-dispatch', () => {
+test('Q36.3: residual v7-compat cleanup removes KOVO_VERIFY_SPEC_SHAPE from kovo_verify summaries and dead lane aliases from exec-dispatch', () => {
   assert.equal(
-    guardianVerifyPromptHint().includes(GUARDIAN_VERIFY_SPEC_SHAPE),
+    kovoVerifyPromptHint().includes(KOVO_VERIFY_SPEC_SHAPE),
     false,
-    'guardianVerifyPromptHint must not append retired DeclarativeReplaySpec fields',
+    'kovoVerifyPromptHint must not append retired DeclarativeReplaySpec fields',
   )
   assert.equal(
-    guardianVerifyHelperGuidance().includes(GUARDIAN_VERIFY_SPEC_SHAPE),
+    kovoVerifyHelperGuidance().includes(KOVO_VERIFY_SPEC_SHAPE),
     false,
-    'guardianVerifyHelperGuidance must not append retired DeclarativeReplaySpec fields',
+    'kovoVerifyHelperGuidance must not append retired DeclarativeReplaySpec fields',
   )
   assert.equal(
-    GUARDIAN_VERIFY_TOOL_DESCRIPTION.includes(GUARDIAN_VERIFY_SPEC_SHAPE),
+    KOVO_VERIFY_TOOL_DESCRIPTION.includes(KOVO_VERIFY_SPEC_SHAPE),
     false,
-    'GUARDIAN_VERIFY_TOOL_DESCRIPTION must not append retired DeclarativeReplaySpec fields',
+    'KOVO_VERIFY_TOOL_DESCRIPTION must not append retired DeclarativeReplaySpec fields',
   )
-  assert.ok(GUARDIAN_VERIFY_SPEC_SHAPE.includes('DeclarativeReplaySpec'), 'legacy export remains available for fallback callers')
+  assert.ok(KOVO_VERIFY_SPEC_SHAPE.includes('DeclarativeReplaySpec'), 'legacy export remains available for fallback callers')
 
   assert.equal('deterministicLaneMaxWallClockMs' in execDispatch, false, 'dead alias deterministicLaneMaxWallClockMs must be removed')
   assert.equal('deterministicLaneWallClockShare' in execDispatch, false, 'dead alias deterministicLaneWallClockShare must be removed')
@@ -179,16 +179,16 @@ test('Q36.3: residual v7-compat cleanup removes GUARDIAN_VERIFY_SPEC_SHAPE from 
 })
 
 test('Q36.4: prompt byte/line/excerpt budgets, single-hop isolation, and zero v8 contamination hold', () => {
-  const guidanceBytes = Buffer.byteLength(guardianVerifyHelperGuidance(), 'utf8')
-  const hintBytes = Buffer.byteLength(guardianVerifyPromptHint(), 'utf8')
-  const patternLines = GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.split('\n').length
+  const guidanceBytes = Buffer.byteLength(kovoVerifyHelperGuidance(), 'utf8')
+  const hintBytes = Buffer.byteLength(kovoVerifyPromptHint(), 'utf8')
+  const patternLines = KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.split('\n').length
 
   assert.ok(
-    guidanceBytes <= GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-    `guardianVerifyHelperGuidance() is ${guidanceBytes} B (> ${GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES} B)`,
+    guidanceBytes <= KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+    `kovoVerifyHelperGuidance() is ${guidanceBytes} B (> ${KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES} B)`,
   )
-  assert.ok(hintBytes <= 512, `guardianVerifyPromptHint() is ${hintBytes} B (> 512 B)`)
-  assert.ok(patternLines <= 12, `GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN has ${patternLines} lines (> 12)`)
+  assert.ok(hintBytes <= 512, `kovoVerifyPromptHint() is ${hintBytes} B (> 512 B)`)
+  assert.ok(patternLines <= 12, `KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN has ${patternLines} lines (> 12)`)
 
   const singlePrompt = JSON.parse(workerInvestigationPrompt({
     goal: 'Check single endpoint response policy',

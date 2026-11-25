@@ -131,14 +131,14 @@ test('price-trust proof names the caller price field and replays the terminal tr
     ownerPersona: 'alice',
     priceTrust: true,
     flowCreatePath: '/v1/checkout/start',
-    headers: { 'x-guardian-run-id': 'run-1' },
+    headers: { 'x-kovo-run-id': 'run-1' },
     risk: 60,
   }
   const result = diffSignal([{
     type: 'price_tampering',
     path: '/v1/checkout/pay',
     idField: 'cartId',
-    resourceId: 'guardian-qa-run-1-cart-1',
+    resourceId: 'kovo-qa-run-1-cart-1',
     priceField: 'unitPrice',
     serverPrice: 249,
     tamperedPrice: 1,
@@ -165,8 +165,8 @@ test('price-trust proof names the caller price field and replays the terminal tr
   for (const step of body.steps) {
     assert.equal(step.request.method, 'POST')
     assert.equal(step.request.pathAndQuery, '/v1/checkout/pay')
-    assert.equal(step.request.jsonBody.cartId, 'guardian-qa-run-1-cart-1')
-    assert.equal(step.request.headers?.['x-guardian-run-id'], 'run-1', 'staging write steps carry the run tag')
+    assert.equal(step.request.jsonBody.cartId, 'kovo-qa-run-1-cart-1')
+    assert.equal(step.request.headers?.['x-kovo-run-id'], 'run-1', 'staging write steps carry the run tag')
   }
   assert.equal(body.steps[0]!.request.jsonBody.unitPrice, 249, 'control pays the server price')
   assert.equal(body.steps[1]!.request.jsonBody.unitPrice, 1, 'probe pays the caller price')
@@ -186,7 +186,7 @@ test('race proof asserts acknowledged transfers against a single balance debit',
     pathAndQuery: '/v2/transfers',
     ownerPersona: 'alice',
     raceBurst: true,
-    headers: { 'x-guardian-run-id': 'run-1' },
+    headers: { 'x-kovo-run-id': 'run-1' },
     risk: 70,
   }
   const result = diffSignal([{
@@ -231,7 +231,7 @@ test('race proof asserts acknowledged transfers against a single balance debit',
     assert.equal(request.method, 'POST')
     assert.equal(request.pathAndQuery, '/v2/transfers')
     assert.equal(request.jsonBody.amount, 1)
-    assert.equal(request.headers?.['x-guardian-run-id'], 'run-1')
+    assert.equal(request.headers?.['x-kovo-run-id'], 'run-1')
   }
   assert.equal(body.postCheckStep.id, 'post')
   assert.match(body.assertionsJq, /\.setup\[0\]\.json\.observedBalance/)
@@ -253,7 +253,7 @@ test('write-BOLA replay binds the exact mutated field to a fresh non-idempotent 
     resourceIds: ['inv-alpha-1'],
     readbackPath: '/v1/invoices/{{id}}',
     jsonBody: { total: 100 },
-    headers: { 'x-guardian-run-id': 'run-1' },
+    headers: { 'x-kovo-run-id': 'run-1' },
     risk: 80,
   }
   const result: DifferentialResult = {
@@ -303,7 +303,7 @@ test('write-BOLA replay binds the exact mutated field to a fresh non-idempotent 
   assert.match(body.assertionsJq, /\["total"\]/, 'the assertion names the mutated field')
   assert.match(body.assertionsJq, new RegExp(`== ${probe}\\b`), 'the assertion binds the exact non-idempotent probe value')
   assert.match(body.assertionsJq, new RegExp(`== ${baseline}\\b`), 'the assertion binds the control baseline value')
-  assert.equal(body.steps[3]!.request.headers?.['x-guardian-run-id'], 'run-1', 'the cross-actor write carries the staging tag')
+  assert.equal(body.steps[3]!.request.headers?.['x-kovo-run-id'], 'run-1', 'the cross-actor write carries the staging tag')
   assert.equal(body.steps[3]!.request.pathAndQuery, '/v1/invoices/inv-alpha-1')
 })
 

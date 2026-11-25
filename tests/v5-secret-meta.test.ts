@@ -208,7 +208,7 @@ function makeRun(storage: Store, origin: string) {
 }
 
 test('secretMatches persist with the exchange and raw values never reach the database or artifacts', async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-secret-meta-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-secret-meta-'))
   const storage = new Store(dir)
   t.after(() => {
     storage.close()
@@ -247,7 +247,7 @@ test('secretMatches persist with the exchange and raw values never reach the dat
   assert.ok(read.secretMatches.some((m: SecretMatch) => m.kind === 'jwt'))
 
   // Nothing written to disk (row, blob artifact, or full DB file) carries the raw values.
-  const dbBytes = readFileSync(join(dir, 'guardian.sqlite')).toString('utf8')
+  const dbBytes = readFileSync(join(dir, 'kovo.sqlite')).toString('utf8')
   assertNoRawSecrets(dbBytes, [jwt, rbsSecret])
   const artifactsDir = join(dir, 'artifacts')
   const artifactText = artifactContents(artifactsDir)
@@ -256,7 +256,7 @@ test('secretMatches persist with the exchange and raw values never reach the dat
 })
 
 test('store whitelists secret metadata fields so a caller cannot smuggle raw values', (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-secret-meta-sanitize-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-secret-meta-sanitize-'))
   const storage = new Store(dir)
   t.after(() => {
     storage.close()
@@ -298,7 +298,7 @@ test('store whitelists secret metadata fields so a caller cannot smuggle raw val
   assert.deepEqual(Object.keys(saved.secretMatches[0]!).sort(), ['count', 'kind', 'sha256Prefix'])
   assertNoRawSecrets(JSON.stringify(saved.secretMatches), [rbsSecret])
   assertNoRawSecrets(
-    readFileSync(join(dir, 'guardian.sqlite')).toString('utf8'),
+    readFileSync(join(dir, 'kovo.sqlite')).toString('utf8'),
     [rbsSecret],
   )
   assert.equal(createHash('sha256').update(rbsSecret).digest('hex').slice(0, 12), saved.secretMatches[0]!.sha256Prefix)

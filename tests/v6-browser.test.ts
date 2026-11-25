@@ -318,7 +318,7 @@ describe('v6 browser: pooled per-persona contexts', () => {
   test('hydrates HttpOnly cookies and localStorage/sessionStorage into the persona context', async (t: TestContext) => {
     const { broker } = makeFakeBroker()
     const { browser, fake } = await withBrowser(t, { broker })
-    fake.runtime.localStorageKeys = ['guardian_session', 'tenant']
+    fake.runtime.localStorageKeys = ['kovo_session', 'tenant']
     fake.runtime.sessionStorageKeys = ['step']
     const cookie: BrowserSeedCookie = {
       name: 'sid', value: 'fixture-session-value', domain: 'app.fixture.test', path: '/',
@@ -326,7 +326,7 @@ describe('v6 browser: pooled per-persona contexts', () => {
     }
     const bundle: BrowserSessionBundle = {
       cookies: [cookie],
-      localStorage: { guardian_session: 'local-fixture-value', tenant: 't1' },
+      localStorage: { kovo_session: 'local-fixture-value', tenant: 't1' },
       sessionStorage: { step: '2' },
     }
 
@@ -340,16 +340,16 @@ describe('v6 browser: pooled per-persona contexts', () => {
     assert.equal(context.cookies[0]!.httpOnly, true, 'HttpOnly cookies survive hydration')
     assert.equal(context.cookies[0]!.sameSite, 'Lax')
     const initScript = context.initScripts.join('\n')
-    assert.ok(initScript.includes('guardian_session'), 'localStorage seed key is installed')
+    assert.ok(initScript.includes('kovo_session'), 'localStorage seed key is installed')
     assert.ok(initScript.includes('tenant'), 'localStorage seed values are installed')
     assert.ok(initScript.includes('step'), 'sessionStorage seed key is installed')
-    assert.deepEqual(visit.localStorageKeys, ['guardian_session', 'tenant'])
+    assert.deepEqual(visit.localStorageKeys, ['kovo_session', 'tenant'])
     assert.deepEqual(visit.sessionStorageKeys, ['step'])
   })
 
   test('seeds pooled contexts from the v6-auth persona browser attachment (HttpOnly + storage)', async (t: TestContext) => {
     const { chmodSync } = await import('node:fs')
-    const dir = mkdtempSync(join(tmpdir(), 'guardian-v6-attach-'))
+    const dir = mkdtempSync(join(tmpdir(), 'kovo-v6-attach-'))
     t.after(() => rmSync(dir, { recursive: true, force: true }))
     const sessionPath = join(dir, 'session.json')
     writeFileSync(sessionPath, JSON.stringify({
@@ -521,7 +521,7 @@ describe('v6 browser: multi-persona union', () => {
   }
 
   test('crawls every persona and surfaces an admin-only route immediately', async (t: TestContext) => {
-    const { storage } = makeStore(t, 'guardian-v6-union-')
+    const { storage } = makeStore(t, 'kovo-v6-union-')
     const origin = appOrigin
     const { runId, run } = await setupApprovedRun(storage, { seeds: [origin], budgetRequests: 900 })
     const visited: Array<{ persona?: string; path: string }> = []
@@ -572,7 +572,7 @@ describe('v6 browser: multi-persona union', () => {
 
 describe('v6 browser: per-origin soft-404 calibration', () => {
   test('calibrates with several unmatched nested paths and still records real JSON surface', async (t: TestContext) => {
-    const { storage } = makeStore(t, 'guardian-v6-soft404-')
+    const { storage } = makeStore(t, 'kovo-v6-soft404-')
     const origin = appOrigin
     const setup = await setupApprovedRun(storage, {
       seeds: [origin],
@@ -615,7 +615,7 @@ describe('v6 browser: per-origin soft-404 calibration', () => {
       signal: AbortSignal.timeout(20_000),
     })
 
-    const calibrationProbes = requested.filter(path => path.includes('.guardian-cal-'))
+    const calibrationProbes = requested.filter(path => path.includes('.kovo-cal-'))
     assert.ok(calibrationProbes.length >= 3, `expected several unmatched calibration paths, saw ${calibrationProbes.join(',')}`)
     assert.ok(new Set(calibrationProbes.map(path => path.split('?')[0])).size >= 3, 'calibration probes use distinct nested paths')
     assert.ok((result.soft404Rejected ?? 0) >= 1, 'SPA catch-all responses are rejected')

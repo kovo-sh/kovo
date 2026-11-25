@@ -7,8 +7,8 @@
  *  1. `economic_conservation` baseline -> action -> final readback pattern and host-hydrated
  *     `terminalImpact.oracleInput` (`baselineReadbackExchangeId`, `finalReadbackExchangeId`,
  *     `actionExchangeIds`, `equation`, `balancesBefore`/`paidAmount`) are clearly taught across
- *     `multiHopDirectives`, `GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN`,
- *     `GUARDIAN_VERIFY_TOOL_DESCRIPTION`, `workerSessionInstructions`, `guardianVerifyHelperGuidance`,
+ *     `multiHopDirectives`, `KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN`,
+ *     `KOVO_VERIFY_TOOL_DESCRIPTION`, `workerSessionInstructions`, `kovoVerifyHelperGuidance`,
  *     and `src/skills/multihop-chains.md` (pre-injected excerpt + full playbook).
  *  2. `dag_topology` connected-DAG rule (every hop in `hops[]` must connect via `causalEdges[]`
  *     on a path reaching `terminalImpact.terminalHopId`; never include unused/orphan exploratory hops)
@@ -17,8 +17,8 @@
  *  3. Derived session token injection rule (`kind: "bearer_token"`,
  *     `{ capability: { handle, target: "bearer" } }` or `{ headers: { Authorization: "Bearer " + handle } }`,
  *     and OMIT `as` / `persona`) is taught consistently across prompts, tool guidance, and playbook.
- *  4. All hard prompt budgets (`guardianVerifyHelperGuidance() <= 2048 B`,
- *     `guardianVerifyPromptHint() <= 512 B`, `GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN <= 12` lines,
+ *  4. All hard prompt budgets (`kovoVerifyHelperGuidance() <= 2048 B`,
+ *     `kovoVerifyPromptHint() <= 512 B`, `KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN <= 12` lines,
  *     pre-injected `multihop-chains` excerpt retains `invariant_enforced_hardened`), stale-symbol bans,
  *     and zero v8 benchmark contamination pass cleanly.
  */
@@ -27,11 +27,11 @@ import { resolve } from 'node:path'
 import { test } from 'node:test'
 
 import {
-  GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-  GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN,
-  GUARDIAN_VERIFY_TOOL_DESCRIPTION,
-  guardianVerifyHelperGuidance,
-  guardianVerifyPromptHint,
+  KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+  KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN,
+  KOVO_VERIFY_TOOL_DESCRIPTION,
+  kovoVerifyHelperGuidance,
+  kovoVerifyPromptHint,
   workerInvestigationPrompt,
   workerSessionInstructions,
 } from '../src/server/agent-prompts.ts'
@@ -92,10 +92,10 @@ test('Q33.1: economic_conservation baseline + final readback and host-hydrated o
   assert.match(econDirective, /terminalImpact\.oracleInput/)
   assert.match(econDirective, /hydrates host-signed records/i)
 
-  const sysPrompt = workerSessionInstructions('worker-investigation', { hasGuardianVerify: true })
+  const sysPrompt = workerSessionInstructions('worker-investigation', { hasKovoVerify: true })
   for (const [label, text] of [
-    ['GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
-    ['GUARDIAN_VERIFY_TOOL_DESCRIPTION', GUARDIAN_VERIFY_TOOL_DESCRIPTION],
+    ['KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
+    ['KOVO_VERIFY_TOOL_DESCRIPTION', KOVO_VERIFY_TOOL_DESCRIPTION],
     ['workerSessionInstructions', sysPrompt],
   ] as const) {
     assert.match(text, /economic_conservation/, `${label} missing economic_conservation`)
@@ -105,7 +105,7 @@ test('Q33.1: economic_conservation baseline + final readback and host-hydrated o
     assert.match(text, /terminalImpact\.oracleInput/, `${label} missing terminalImpact.oracleInput`)
   }
 
-  const guidance = guardianVerifyHelperGuidance()
+  const guidance = kovoVerifyHelperGuidance()
   assert.match(guidance, /economic_conservation.*baseline\+final readback IDs in oracleInput/i)
 
   clearSkillsCache()
@@ -170,10 +170,10 @@ test('Q33.2: dag_topology connected-DAG rule forbids unused/orphan exploratory h
   assert.match(dagDirective, /hops\[\].*connected by causalEdges\[\].*terminalImpact\.terminalHopId/i)
   assert.match(dagDirective, /never include unused or orphan exploratory hops in hops\[\]/i)
 
-  const sysPrompt = workerSessionInstructions('worker-investigation', { hasGuardianVerify: true })
+  const sysPrompt = workerSessionInstructions('worker-investigation', { hasKovoVerify: true })
   for (const [label, text] of [
-    ['GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
-    ['GUARDIAN_VERIFY_TOOL_DESCRIPTION', GUARDIAN_VERIFY_TOOL_DESCRIPTION],
+    ['KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
+    ['KOVO_VERIFY_TOOL_DESCRIPTION', KOVO_VERIFY_TOOL_DESCRIPTION],
     ['workerSessionInstructions', sysPrompt],
   ] as const) {
     assert.match(text, /dag_topology/, `${label} missing dag_topology`)
@@ -181,7 +181,7 @@ test('Q33.2: dag_topology connected-DAG rule forbids unused/orphan exploratory h
     assert.match(text, /orphan exploratory hops/i, `${label} missing no-orphan-hops reminder`)
   }
 
-  assert.match(guardianVerifyHelperGuidance(), /connected DAG \(no orphan hops\)/i)
+  assert.match(kovoVerifyHelperGuidance(), /connected DAG \(no orphan hops\)/i)
 
   clearSkillsCache()
   const mhSkill = selectPreInjectionSkills({ profileSkills: ['bola-idor-race'], lane: 'chain', limit: 2 })
@@ -203,10 +203,10 @@ test('Q33.3: derived session token injection rule teaches kind="bearer_token", t
   assert.match(tokenDirective, /Authorization:\s*"Bearer "\s*\+\s*handle/)
   assert.match(tokenDirective, /OMIT as \/ persona/)
 
-  const sysPrompt = workerSessionInstructions('worker-investigation', { hasGuardianVerify: true })
+  const sysPrompt = workerSessionInstructions('worker-investigation', { hasKovoVerify: true })
   for (const [label, text] of [
-    ['GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
-    ['GUARDIAN_VERIFY_TOOL_DESCRIPTION', GUARDIAN_VERIFY_TOOL_DESCRIPTION],
+    ['KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN', KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN],
+    ['KOVO_VERIFY_TOOL_DESCRIPTION', KOVO_VERIFY_TOOL_DESCRIPTION],
     ['workerSessionInstructions', sysPrompt],
   ] as const) {
     assert.match(text, /kind:\s*"bearer_token"/, `${label} missing kind: "bearer_token"`)
@@ -215,7 +215,7 @@ test('Q33.3: derived session token injection rule teaches kind="bearer_token", t
     assert.match(text, /OMIT `as`\/`persona`/, `${label} missing OMIT as/persona rule`)
   }
 
-  assert.match(guardianVerifyHelperGuidance(), /kind:"bearer_token".*target:"bearer".*OMIT as/i)
+  assert.match(kovoVerifyHelperGuidance(), /kind:"bearer_token".*target:"bearer".*OMIT as/i)
 
   clearSkillsCache()
   const mhSkill = selectPreInjectionSkills({ profileSkills: ['bola-idor-race'], lane: 'chain', limit: 2 })
@@ -232,16 +232,16 @@ test('Q33.3: derived session token injection rule teaches kind="bearer_token", t
 })
 
 test('Q33.4: prompt byte/line budgets, pre-injection excerpt invariants, single-hop isolation, and zero v8 contamination hold', () => {
-  const guidanceBytes = Buffer.byteLength(guardianVerifyHelperGuidance(), 'utf8')
-  const hintBytes = Buffer.byteLength(guardianVerifyPromptHint(), 'utf8')
-  const patternLines = GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.split('\n').length
+  const guidanceBytes = Buffer.byteLength(kovoVerifyHelperGuidance(), 'utf8')
+  const hintBytes = Buffer.byteLength(kovoVerifyPromptHint(), 'utf8')
+  const patternLines = KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN.split('\n').length
 
   assert.ok(
-    guidanceBytes <= GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-    `guardianVerifyHelperGuidance() is ${guidanceBytes} B (> ${GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES} B)`,
+    guidanceBytes <= KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+    `kovoVerifyHelperGuidance() is ${guidanceBytes} B (> ${KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES} B)`,
   )
-  assert.ok(hintBytes <= 512, `guardianVerifyPromptHint() is ${hintBytes} B (> 512 B)`)
-  assert.ok(patternLines <= 12, `GUARDIAN_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN has ${patternLines} lines (> 12)`)
+  assert.ok(hintBytes <= 512, `kovoVerifyPromptHint() is ${hintBytes} B (> 512 B)`)
+  assert.ok(patternLines <= 12, `KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN has ${patternLines} lines (> 12)`)
 
   // Single-hop step still omits multiHopDirectives.
   const singlePrompt = JSON.parse(workerInvestigationPrompt({

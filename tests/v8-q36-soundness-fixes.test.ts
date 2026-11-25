@@ -36,7 +36,7 @@ import {
 } from '../src/server/verify-rpc.ts'
 import { verifyScript } from '../src/server/verify-runner.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const ORIGIN = 'https://api.example.test'
 const SIGNING_KEY = 'q36-soundness-signing-key-9e4f1a2b3c5d6e7f'

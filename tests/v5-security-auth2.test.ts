@@ -22,12 +22,12 @@ import { createProjectPersona } from '../src/server/persona-vault.ts'
 import { Store } from '../src/server/store.ts'
 
 // Loopback credential targets are a local-lab feature; the store validates seeds against it.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB ??= '1'
+process.env.KOVO_ALLOW_LOCAL_LAB ??= '1'
 
 const targetOrigin = 'https://app.example.com'
 
 function makeStorage(t: { after(fn: () => void): void }): Store {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-sec2-auth-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-sec2-auth-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())

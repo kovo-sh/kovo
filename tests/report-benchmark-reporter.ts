@@ -110,7 +110,7 @@ export default class ReportBenchmarkReporter implements Reporter {
             ? { severity: row.reportedSeverity, evidence: row.linkedEvidence ? 'supported' : 'missing' }
             : {}) }
       })
-      return { id, input, cases, guardian: {
+      return { id, input, cases, kovo: {
         version, model: DEFAULT_PROVIDER.model, inputSha256: input.sha256,
         report: exportedReport, runRecord, verdicts,
       } }
@@ -121,11 +121,11 @@ export default class ReportBenchmarkReporter implements Reporter {
     const comparison = await compareReports(join(this.directory, manifest.path))
     this.writeJson('comparison-scorecard.json', comparison)
     if (comparison.status === 'failed' || comparison.evidence.status !== 'passed' ||
-        !comparison.accuracy.guardian || !comparison.coverage.multiHost) {
-      throw new Error('The Guardian report comparison did not pass its local checks. See comparison-scorecard.json.')
+        !comparison.accuracy.kovo || !comparison.coverage.multiHost) {
+      throw new Error('The Kovo Hunter report comparison did not pass its local checks. See comparison-scorecard.json.')
     }
-    console.log('Saved Guardian run evidence for ' + comparison.accuracy.guardian.agreeingVerdicts + '/' +
-      comparison.accuracy.guardian.cases + ' matched case verdicts. Release comparison is ' + comparison.status + '.')
+    console.log('Saved Kovo Hunter run evidence for ' + comparison.accuracy.kovo.agreeingVerdicts + '/' +
+      comparison.accuracy.kovo.cases + ' matched case verdicts. Release comparison is ' + comparison.status + '.')
   }
 
   private async writeScorecard(browserStatus: 'passed' | 'failed') {
@@ -138,19 +138,19 @@ export default class ReportBenchmarkReporter implements Reporter {
       return benchmarkScenarios[scenario].cases.map(expected => {
         const id = benchmarkCaseId(scenario, expected)
         const row = entries.get(id)
-        if (!row) throw new Error('Missing Guardian verdict for ' + id + '.')
+        if (!row) throw new Error('Missing Kovo Hunter verdict for ' + id + '.')
         return { ...expected, ...row, scenario }
       })
     })
     const unexpected = regressionIds.reduce((count, id) => count + this.snapshots.get(id)!.report.unmatchedConfirmations, 0)
     const version = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout?.trim() || 'local checkout'
-    const guardian = {
+    const kovo = {
       version, model: DEFAULT_PROVIDER.model,
       ...scoreReportCases(cases, unexpected),
       linkedEvidence: cases.filter(row => row.linkedEvidence).length,
       fixGuidance: cases.filter(row => row.fixGuidance).length,
     }
-    const baselinePath = process.env.GUARDIAN_ARTEX_REPORT_RESULTS
+    const baselinePath = process.env.KOVO_ARTEX_REPORT_RESULTS
     const baseline = baselinePath ? readArtexResults(baselinePath, cases.map(row => row.id)) : undefined
     const artex = baseline && {
       version: baseline.version, model: baseline.model,
@@ -165,11 +165,11 @@ export default class ReportBenchmarkReporter implements Reporter {
       return { id, version, partial, basis, report: file, sha256 }
     })
     const rows = cases.map(row => ({ ...row, ...(baseline ? { artex: baseline.cases[row.id] } : {}) }))
-    this.writeJson('summary.json', { suite: benchmarkSuite, browserStatus, guardian, artex: artex ?? null, scenarios, cases: rows })
-    console.log('\nGuardian report benchmark')
-    console.log(guardian.agreeingVerdicts + '/' + guardian.cases + ' verdicts matched, ' +
-      percent(guardian.precision) + ' precision, ' + percent(guardian.recall) + ' recall.')
-    console.log(guardian.linkedEvidence + '/' + guardian.reportedConfirmations + ' confirmations have linked evidence and a verification receipt.')
+    this.writeJson('summary.json', { suite: benchmarkSuite, browserStatus, kovo, artex: artex ?? null, scenarios, cases: rows })
+    console.log('\nKovo report benchmark')
+    console.log(kovo.agreeingVerdicts + '/' + kovo.cases + ' verdicts matched, ' +
+      percent(kovo.precision) + ' precision, ' + percent(kovo.recall) + ' recall.')
+    console.log(kovo.linkedEvidence + '/' + kovo.reportedConfirmations + ' confirmations have linked evidence and a verification receipt.')
     console.log(artex
       ? 'Imported Artex results had ' + percent(artex.precision) + ' precision and ' + percent(artex.recall) + ' recall.'
       : 'Awaiting matched Artex results.')

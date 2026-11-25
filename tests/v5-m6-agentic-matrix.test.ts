@@ -16,7 +16,7 @@ import {
 } from '../scripts/benchmark-agentic-matrix.ts'
 import type { MatrixArgs, MatrixCell, MatrixCellResult } from '../scripts/benchmark-agentic-matrix.ts'
 
-const SALT_ENV = { GUARDIAN_RB_HELDOUT_SALT: 'a'.repeat(48) }
+const SALT_ENV = { KOVO_RB_HELDOUT_SALT: 'a'.repeat(48) }
 
 function matrixArgs(over: Partial<MatrixArgs> = {}): MatrixArgs {
   return {
@@ -27,7 +27,7 @@ function matrixArgs(over: Partial<MatrixArgs> = {}): MatrixArgs {
     maxDurationMs: DEFAULT_MATRIX_MAX_DURATION_MS,
     concurrency: 1,
     outDir: '/tmp/agentic-matrix-test',
-    dataDir: '/tmp/guardian-data',
+    dataDir: '/tmp/kovo-data',
     noLlm: false,
     verifier: 'docker',
     keepDataDirs: false,
@@ -48,7 +48,7 @@ function cell(over: Partial<MatrixCell> = {}): MatrixCell {
 
 const tempDirs: string[] = []
 function tempDir(label: string): string {
-  const dir = mkdtempSync(join(tmpdir(), `guardian-matrix-${label}-`))
+  const dir = mkdtempSync(join(tmpdir(), `kovo-matrix-${label}-`))
   tempDirs.push(dir)
   return dir
 }
@@ -107,7 +107,7 @@ describe('CLI parsing', () => {
     assert.equal(args.noLlm, false)
     assert.equal(args.smoke, false)
     assert.equal(args.dataDir, undefined)
-    assert.match(args.outDir, /\.guardian\/agentic-matrix$/)
+    assert.match(args.outDir, /\.kovo\/agentic-matrix$/)
     assert.equal(args.childTimeoutMs, DEFAULT_MATRIX_MAX_DURATION_MS + 5 * 60_000)
   })
 
@@ -116,7 +116,7 @@ describe('CLI parsing', () => {
       '--apps', 'opsportal,acme-saas,opsportal', '--seeds', '2,1,2',
       '--modes', 'white-box,grey-box', '--budget-usd', '2.5',
       '--max-duration-ms', '60000', '--concurrency', '2', '--out-dir', '/tmp/matrix',
-      '--data-dir', '/tmp/guardian-data', '--verifier', 'local-jq',
+      '--data-dir', '/tmp/kovo-data', '--verifier', 'local-jq',
       '--no-llm', '--keep-data-dirs', '--timeout-ms', '90000',
     ], {})
     assert.deepEqual(args.apps, ['opsportal', 'acme-saas'])
@@ -126,15 +126,15 @@ describe('CLI parsing', () => {
     assert.equal(args.maxDurationMs, 60_000)
     assert.equal(args.concurrency, 2)
     assert.equal(resolve(args.outDir), resolve('/tmp/matrix'))
-    assert.equal(resolve(args.dataDir!), resolve('/tmp/guardian-data'))
+    assert.equal(resolve(args.dataDir!), resolve('/tmp/kovo-data'))
     assert.equal(args.verifier, 'local-jq')
     assert.equal(args.noLlm, true)
     assert.equal(args.keepDataDirs, true)
     assert.equal(args.childTimeoutMs, 90_000)
   })
 
-  test('--apps all expands to every app; GUARDIAN_DATA_DIR is the default data dir', () => {
-    const args = parseMatrixArgs(['--apps', 'all'], { GUARDIAN_DATA_DIR: '/tmp/gd' })
+  test('--apps all expands to every app; KOVO_DATA_DIR is the default data dir', () => {
+    const args = parseMatrixArgs(['--apps', 'all'], { KOVO_DATA_DIR: '/tmp/gd' })
     assert.deepEqual(args.apps, ['acme-saas', 'shopflow', 'opsportal'])
     assert.equal(resolve(args.dataDir!), resolve('/tmp/gd'))
   })
@@ -151,7 +151,7 @@ describe('CLI parsing', () => {
   })
 
   test('held-out seeds require the salt env and are marked held-out', () => {
-    assert.throws(() => parseMatrixArgs(['--seeds', '1000042'], {}), /GUARDIAN_RB_HELDOUT_SALT/)
+    assert.throws(() => parseMatrixArgs(['--seeds', '1000042'], {}), /KOVO_RB_HELDOUT_SALT/)
     const args = parseMatrixArgs(['--apps', 'acme-saas', '--seeds', '1,1000042'], SALT_ENV)
     assert.deepEqual(buildCells(args).map(c => [c.seed, c.seedSet]), [[1, 'dev'], [1000042, 'held-out']])
     assert.equal(args.seeds.length, 2)
@@ -322,7 +322,7 @@ describe('structured collection and fail-closed classification', () => {
     writeArtifacts(args, target, null, null)
     const locked = collectCellResult(target, args, {
       exitCode: 2, runtimeMs: 500,
-      output: 'error: Guardian data dir is locked by another process (process-lock.sqlite)\nstack trace with raw paths',
+      output: 'error: Kovo Hunter data dir is locked by another process (process-lock.sqlite)\nstack trace with raw paths',
     })
     assert.equal(locked.ok, false)
     assert.equal(locked.lockError, true)

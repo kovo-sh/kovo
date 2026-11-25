@@ -23,7 +23,7 @@
  *     inside the SAME script), forbids substituting standalone single-hop
  *     `prove_access_boundary` / `prove_persisted_mutation` as the final proof, and includes the
  *     1-line call signature reminder.
- *  4. `guardianVerifyHelperGuidance() <= 2048 B`, `guardianVerifyPromptHint() <= 512 B`, and
+ *  4. `kovoVerifyHelperGuidance() <= 2048 B`, `kovoVerifyPromptHint() <= 512 B`, and
  *     zero v8 benchmark literals exist in `src/server/**` or `src/skills/**`.
  */
 import assert from 'node:assert/strict'
@@ -31,9 +31,9 @@ import { resolve } from 'node:path'
 import { test } from 'node:test'
 
 import {
-  GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-  guardianVerifyHelperGuidance,
-  guardianVerifyPromptHint,
+  KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+  kovoVerifyHelperGuidance,
+  kovoVerifyPromptHint,
   matchesMultiHopStepSignal,
   workerInvestigationPrompt,
 } from '../src/server/agent-prompts.ts'
@@ -339,13 +339,13 @@ test('Q31.4: multiHopDirectives unmistakably mandates ctx.seal_capability + ctx.
 })
 
 test('Q31.5: prompt guidance stays within <= 2048 B budget and source tree has zero v8 contamination', () => {
-  const guidanceBytes = Buffer.byteLength(guardianVerifyHelperGuidance(), 'utf8')
-  const hintBytes = Buffer.byteLength(guardianVerifyPromptHint(), 'utf8')
+  const guidanceBytes = Buffer.byteLength(kovoVerifyHelperGuidance(), 'utf8')
+  const hintBytes = Buffer.byteLength(kovoVerifyPromptHint(), 'utf8')
   assert.ok(
-    guidanceBytes <= GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
-    `guardianVerifyHelperGuidance() is ${guidanceBytes} B (> ${GUARDIAN_VERIFY_HELPER_GUIDANCE_MAX_BYTES} B)`,
+    guidanceBytes <= KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES,
+    `kovoVerifyHelperGuidance() is ${guidanceBytes} B (> ${KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES} B)`,
   )
-  assert.ok(hintBytes <= 512, `guardianVerifyPromptHint() is ${hintBytes} B (> 512 B)`)
+  assert.ok(hintBytes <= 512, `kovoVerifyPromptHint() is ${hintBytes} B (> 512 B)`)
 
   const scan = scanSourceTreeForContamination(REPO_ROOT)
   assert.equal(scan.ok, true, `v8 contamination detected: ${JSON.stringify(scan.hits)}`)

@@ -1,5 +1,5 @@
 /**
- * Guardian v6.2 — bounded opt-in FTS + exchange retention GC + footprint guard.
+ * Kovo Hunter v6.2 — bounded opt-in FTS + exchange retention GC + footprint guard.
  *
  * Covers: `ftsMode: 'off' | 'preview' | 'full'` write/search semantics with a hard per-exchange
  * body cap; `pruneExchanges()` deleting rows + FTS rows + unreferenced sharded blobs in bounded
@@ -36,7 +36,7 @@ interface Fixture {
 }
 
 function makeStore(t: { after: (fn: () => void) => void }, label: string, options?: StoreOptions): Fixture {
-  const dir = mkdtempSync(join(tmpdir(), `guardian-v6-fts-${label}-`))
+  const dir = mkdtempSync(join(tmpdir(), `kovo-v6-fts-${label}-`))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const store = new Store(dir, options)
   t.after(() => store.close())
@@ -188,14 +188,14 @@ test('v6 fts full indexes more of the body but never beyond the configured cap',
 })
 
 test('v6 fts full mode is refused above the DB size cap unless forced', t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v6-fts-guard-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v6-fts-guard-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const seed = new Store(dir)
   const { id: projectId } = seed.createProject({
     requestId: randomUUID(), name: 'guard', seeds: [ORIGIN], environment: 'public',
   })
   seed.close()
-  const dbBytes = statSync(join(dir, 'guardian.sqlite')).size
+  const dbBytes = statSync(join(dir, 'kovo.sqlite')).size
   assert.ok(dbBytes > 0)
   const refusedDir = dir
   assert.throws(

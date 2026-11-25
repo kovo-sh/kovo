@@ -226,7 +226,7 @@ describe('v8 M0/M2/M3 Graph & Orchestrator Wiring', () => {
   })
 
   test('Store initializes CapabilityLedger schema on startup and exposes WAL-safe shared-handle store.capabilityLedger(runId)', async (t) => {
-    const { storage } = makeStore(t, 'guardian-v8-wire-store-')
+    const { storage } = makeStore(t, 'kovo-v8-wire-store-')
     const tables = (storage.client.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'capability_%' ORDER BY name",
     ).all() as Array<{ name: string }>).map(r => r.name)
@@ -261,7 +261,7 @@ describe('v8 M0/M2/M3 Graph & Orchestrator Wiring', () => {
   })
 
   test('End-to-end: Store -> synthesizeInvariants -> CapabilityLedger -> depth-4 causal planChainRound -> 2-strike negative-edge suppression -> <= 2 KB hop-checkpoint brief', async (t) => {
-    const { storage } = makeStore(t, 'guardian-v8-wire-e2e-')
+    const { storage } = makeStore(t, 'kovo-v8-wire-e2e-')
     const setup = await setupApprovedRun(storage, { seeds: [ORIGIN_EDGE, ORIGIN_API, ORIGIN_APP], tier: 2 })
     const run = storage.run(setup.runId)
     const planner = makePlanner(storage, { mountedRepos: ['synth-saas'] })
@@ -549,7 +549,7 @@ describe('v8 M0/M2/M3 Graph & Orchestrator Wiring', () => {
   })
 
   test('Grey-box / black-box runtime parity seeds quarantined hypotheses into CapabilityLedger without mounted source', async (t) => {
-    const { storage } = makeStore(t, 'guardian-v8-wire-greybox-')
+    const { storage } = makeStore(t, 'kovo-v8-wire-greybox-')
     const setup = await setupApprovedRun(storage, { seeds: [ORIGIN_API], tier: 2 })
     const run = storage.run(setup.runId)
     const planner = makePlanner(storage, { mountedRepos: [] })
@@ -596,7 +596,7 @@ describe('v8 M0/M2/M3 Graph & Orchestrator Wiring', () => {
   })
 
   test('Frontier-progress termination continues waves on verified HopReceipt reach expansion before terminal confirmation', async (t) => {
-    const { storage } = makeStore(t, 'guardian-v8-wire-progress-')
+    const { storage } = makeStore(t, 'kovo-v8-wire-progress-')
     const setup = await setupApprovedRun(storage, { seeds: [ORIGIN_API], tier: 2 })
     const ledger = storage.capabilityLedger(setup.runId)
     const controller = new FrontierWaveController({ ledger, beamWidth: 8, unproductiveWaveLimit: 2 })

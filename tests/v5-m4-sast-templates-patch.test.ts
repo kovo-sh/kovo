@@ -337,7 +337,7 @@ test('M4-T6: Gate 6 never passes when skipped and guarded 403 guards do not coun
   ].join('\n')
   assert.equal(detectUnconditionalCallerBreak(unconditionalDiff), true, 'unconditional top-level block must be flagged')
 
-  const root = mkdtempSync(join(tmpdir(), 'guardian-m4-patch-'))
+  const root = mkdtempSync(join(tmpdir(), 'kovo-m4-patch-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))
   const repo = 'app'
   mkdirSync(join(root, repo), { recursive: true })
@@ -417,7 +417,7 @@ test('M4-T7: runSafeTemplates resolves {{discovered_protected_path}} and skips i
     res.end('forbidden')
   })
 
-  const withDiscovery = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => runSafeTemplates(
+  const withDiscovery = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => runSafeTemplates(
     {
       origin: fx.origin,
       techFingerprint: ['nextjs'],
@@ -433,7 +433,7 @@ test('M4-T7: runSafeTemplates resolves {{discovered_protected_path}} and skips i
   assert.ok(withDiscovery.matches.some(m => m.templateId === 'nextjs-middleware-subrequest-bypass'), `expected dynamic-path match; skipped=${JSON.stringify(withDiscovery.skipped.slice(0, 3))}`)
   assert.ok(fx.requests.some(r => r.url === '/admin' && r.headers['x-middleware-subrequest']), 'probe must target the discovered protected route')
 
-  const withoutDiscovery = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => runSafeTemplates(
+  const withoutDiscovery = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => runSafeTemplates(
     {
       origin: fx.origin,
       techFingerprint: ['nextjs'],
@@ -483,7 +483,7 @@ test('M4-T8: tech tags unify live headers with mounted manifests; SCA advisories
   assert.equal(versionSatisfiesRange('4.0.5', '>=3.2.0 <3.2.13 || >=4.0.0 <4.0.4'), false)
   assert.equal(hasCuratedAdvisory('PyPI', 'django'), true)
 
-  const advisories = await withEnv({ GUARDIAN_OFFLINE: '1' }, () => queryCves({ ecosystem: 'PyPI', package: 'django', version: '4.0.1' }))
+  const advisories = await withEnv({ KOVO_OFFLINE: '1' }, () => queryCves({ ecosystem: 'PyPI', package: 'django', version: '4.0.1' }))
   assert.ok(advisories.some(a => a.id === 'CVE-2022-28346'), 'expected curated Django SQLi advisory for 4.0.1')
   assert.ok(templateIdsForCves(['CVE-2025-29927']).includes('nextjs-middleware-subrequest-bypass'))
 })
@@ -497,19 +497,19 @@ test('M4-T9: worker trivy-fs reports Python/Go/Java/Ruby advisory IDs from mount
   try {
     const { execFile } = await import('node:child_process')
     const { promisify } = await import('node:util')
-    await promisify(execFile)('docker', ['image', 'inspect', 'guardian-worker:v4'], { timeout: 5_000 })
+    await promisify(execFile)('docker', ['image', 'inspect', 'kovo-worker:v4'], { timeout: 5_000 })
     hasImage = true
   } catch {
     hasImage = false
   }
   if (!hasImage) {
-    t.skip('guardian-worker:v4 image not available')
+    t.skip('kovo-worker:v4 image not available')
     return
   }
 
   const { LinuxWorkerBackend } = await import('../src/server/worker-backend.ts')
   const { randomUUID } = await import('node:crypto')
-  const reposDir = mkdtempSync(join(tmpdir(), 'guardian-m4-sca-'))
+  const reposDir = mkdtempSync(join(tmpdir(), 'kovo-m4-sca-'))
   chmodSync(reposDir, 0o755)
   t.after(() => rmSync(reposDir, { recursive: true, force: true }))
   const appDir = join(reposDir, 'app')

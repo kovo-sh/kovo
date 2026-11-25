@@ -4,13 +4,13 @@
  * Runs in < 5 seconds with zero live LLM calls, zero Docker, and 100% generic fixtures:
  *
  * Part A — Executable Prompt & Skill TS Contract Check:
- *   A.1 Exact 3-way parity of `DerivedSecretKind` across `worker/guardian_verify/guardian_verify.ts`,
+ *   A.1 Exact 3-way parity of `DerivedSecretKind` across `worker/kovo_verify/kovo_verify.ts`,
  *       `src/server/derived-custody.ts`, and `src/server/verify-rpc.ts`.
  *   A.2 Every documented `ctx.*` member and `sealCapability` `kind` enum value referenced in
  *       `src/skills/multihop-chains.md` and `src/server/agent-prompts.ts` exists on `VerifyContext`
  *       and host custody enums.
  *   A.3 Compile-check (both `ts.transpileModule` syntax check and `ts.createProgram` semantic check
- *       against real `worker/guardian_verify/guardian_verify.ts`) of every TypeScript code fence in
+ *       against real `worker/kovo_verify/kovo_verify.ts`) of every TypeScript code fence in
  *       `src/skills/multihop-chains.md` and `src/server/agent-prompts.ts`, plus negative mutation
  *       guards proving broken syntax, invalid `ctx.*` calls, and invalid `kind` values fail immediately.
  *
@@ -22,7 +22,7 @@
  *       rotation on a progressing multi-hop worker -> persists canonical <= 2 KB
  *       `v8.hop_checkpoint.v1` payload -> dispatches continuation worker to clean completion
  *       (while skipping zero-progress stalled workers).
- *   B.3 Live mock-LLM `Execution` dispatches two concurrent workers calling `guardian_verify`
+ *   B.3 Live mock-LLM `Execution` dispatches two concurrent workers calling `kovo_verify`
  *       against the loopback multi-step HTTP target (via real `VerifyRpcServer` + `RequestBroker` +
  *       `DerivedCapabilityVault` + `ExecVerifier.persistAgentScriptProof`) confirming the same
  *       parameterized route with different titles — one with `[redacted:cap:hop_1:id]` and one with
@@ -46,9 +46,9 @@ import ts from 'typescript'
 import type { Finding, InlineVerifyFeedback } from '../src/domain.ts'
 import type { DeclarativeReplaySpec } from '../src/replay-spec.ts'
 import {
-  GUARDIAN_VERIFY_HELPERS,
-  GUARDIAN_VERIFY_MULTIHOP_HELPERS,
-  GUARDIAN_VERIFY_TOOL_DESCRIPTION,
+  KOVO_VERIFY_HELPERS,
+  KOVO_VERIFY_MULTIHOP_HELPERS,
+  KOVO_VERIFY_TOOL_DESCRIPTION,
 } from '../src/server/agent-prompts.ts'
 import { RequestBroker } from '../src/server/broker.ts'
 import {
@@ -76,10 +76,10 @@ import {
 } from '../src/server/worker-backend.ts'
 import { setupApprovedRun, stopExecution, withEnv } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const SDK_TS_PATH = join(REPO_ROOT, 'worker/guardian_verify/guardian_verify.ts')
+const SDK_TS_PATH = join(REPO_ROOT, 'worker/kovo_verify/kovo_verify.ts')
 const DERIVED_CUSTODY_PATH = join(REPO_ROOT, 'src/server/derived-custody.ts')
 const VERIFY_RPC_PATH = join(REPO_ROOT, 'src/server/verify-rpc.ts')
 const MULTIHOP_SKILL_PATH = join(REPO_ROOT, 'src/skills/multihop-chains.md')
@@ -294,7 +294,7 @@ test('Part A.1: DerivedSecretKind enum stays in exact 3-way parity across SDK, d
   const rpcKinds = extractConstSetLiterals(parseTsFile(VERIFY_RPC_PATH), 'DERIVED_SECRET_KINDS')
 
   assert.ok(sdkKinds.length >= 8, `Expected >= 8 DerivedSecretKind entries, got ${sdkKinds.length}`)
-  assert.deepEqual(sdkKinds, custodyKinds, 'SealCapabilityInput.kind in guardian_verify.ts must match DerivedSecretKind in derived-custody.ts')
+  assert.deepEqual(sdkKinds, custodyKinds, 'SealCapabilityInput.kind in kovo_verify.ts must match DerivedSecretKind in derived-custody.ts')
   assert.deepEqual(rpcKinds, custodyKinds, 'DERIVED_SECRET_KINDS in verify-rpc.ts must match DerivedSecretKind in derived-custody.ts')
 })
 
@@ -316,7 +316,7 @@ test('Part A.2: Every documented ctx.* method and sealCapability kind in multiho
   for (const member of promptsCtxRefs) {
     assert.ok(verifyContextMembers.has(member), `agent-prompts.ts references ctx.${member} which is missing on VerifyContext`)
   }
-  for (const helper of [...GUARDIAN_VERIFY_HELPERS, ...GUARDIAN_VERIFY_MULTIHOP_HELPERS]) {
+  for (const helper of [...KOVO_VERIFY_HELPERS, ...KOVO_VERIFY_MULTIHOP_HELPERS]) {
     assert.ok(verifyContextMembers.has(helper.name), `Exported prompt helper "${helper.name}" is missing on VerifyContext`)
   }
 
@@ -330,11 +330,11 @@ test('Part A.2: Every documented ctx.* method and sealCapability kind in multiho
   }
 })
 
-test('Part A.3: Every TS code fence in multihop-chains.md and agent-prompts.ts compiles cleanly against guardian_verify.ts (with negative mutation guards)', () => {
+test('Part A.3: Every TS code fence in multihop-chains.md and agent-prompts.ts compiles cleanly against kovo_verify.ts (with negative mutation guards)', () => {
   const multihopFences = extractMarkdownTsFences(readFileSync(MULTIHOP_SKILL_PATH, 'utf8'), 'multihop-chains.md')
-  const promptFences = extractMarkdownTsFences(GUARDIAN_VERIFY_TOOL_DESCRIPTION, 'agent-prompts.ts')
+  const promptFences = extractMarkdownTsFences(KOVO_VERIFY_TOOL_DESCRIPTION, 'agent-prompts.ts')
   assert.ok(multihopFences.length >= 3, `Expected >= 3 TS code fences in multihop-chains.md, got ${multihopFences.length}`)
-  assert.ok(promptFences.length >= 1, `Expected >= 1 TS code fence in GUARDIAN_VERIFY_TOOL_DESCRIPTION, got ${promptFences.length}`)
+  assert.ok(promptFences.length >= 1, `Expected >= 1 TS code fence in KOVO_VERIFY_TOOL_DESCRIPTION, got ${promptFences.length}`)
 
   const docSnippets = [...multihopFences, ...promptFences]
   for (const snippet of docSnippets) {
@@ -365,7 +365,7 @@ test('Part A.3: Every TS code fence in multihop-chains.md and agent-prompts.ts c
     const syntactic = diags.filter(d => d.category === 'syntactic')
     assert.equal(syntactic.length, 0, `${snippet.id} has TS syntax errors: ${JSON.stringify(syntactic)}`)
 
-    // Note: HttpExchange.json is typed `unknown` in worker/guardian_verify/guardian_verify.ts:140,
+    // Note: HttpExchange.json is typed `unknown` in worker/kovo_verify/kovo_verify.ts:140,
     // which triggers TS2339 on `base.json?.balance` / `after.json?.balance` in multihop-chains.md:201-202.
     // Every other semantic diagnostic (invalid ctx.* call, wrong argument type, bad enum literal,
     // unknown identifier, etc.) MUST fail immediately.
@@ -566,7 +566,7 @@ function rpcOverSocket(
 
 /**
  * In-process subclass of `LinuxWorkerBackend` that connects directly to the real `VerifyRpcServer`
- * Unix socket with zero Docker containers, enabling live `Execution` workers to invoke `guardian_verify`.
+ * Unix socket with zero Docker containers, enabling live `Execution` workers to invoke `kovo_verify`.
  */
 class LocalRpcTestBackend extends LinuxWorkerBackend {
   private readonly verifyHandler: (req: VerifyScriptRequest, rpc: RpcCallFn) => Promise<VerifyScriptResult>
@@ -575,7 +575,7 @@ class LocalRpcTestBackend extends LinuxWorkerBackend {
     super({})
     this.verifyHandler = verifyHandler ?? (async req => ({
       runtime: req.runtime,
-      result: { sdk: 'guardian_verify.ts', nonce: req.nonce, title: 'noop', claims: [] },
+      result: { sdk: 'kovo_verify.ts', nonce: req.nonce, title: 'noop', claims: [] },
       stdout: '',
       stderr: '',
       exitCode: 0,
@@ -744,8 +744,8 @@ function makeConfirmingFeedback(): InlineVerifyFeedback {
 
 test('Part B.1: 12 concurrent async tasks writing events, facts, artifacts, capabilities, and findings to SQLite WAL Store produce 0 SQLITE_BUSY errors', async (t) => {
   const origin = 'http://127.0.0.1:4190'
-  const { storage, dir } = makeTempStore(t, 'guardian-v8-seam2-chaos-')
-  const secondaryConn = new DatabaseSync(join(dir, 'guardian.sqlite'))
+  const { storage, dir } = makeTempStore(t, 'kovo-v8-seam2-chaos-')
+  const secondaryConn = new DatabaseSync(join(dir, 'kovo.sqlite'))
   secondaryConn.exec('PRAGMA busy_timeout = 5000;')
   t.after(() => secondaryConn.close())
 
@@ -898,7 +898,7 @@ test('Part B.2: Live Mock-LLM Execution wall-clock rotation creates <= 2 KB v8.h
     return { hang: true }
   })
 
-  const { storage } = makeTempStore(t, 'guardian-v8-seam2-rotate-')
+  const { storage } = makeTempStore(t, 'kovo-v8-seam2-rotate-')
   await saveModelProfile({
     name: 'Seam2-Rotation-Mock',
     endpoint: llm.endpoint,
@@ -953,7 +953,7 @@ test('Part B.2: Live Mock-LLM Execution wall-clock rotation creates <= 2 KB v8.h
     assignmentWallClockOverrideMs: 220,
   })
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     engine.start()
     engine.wake()
     const deadline = Date.now() + 5_000
@@ -991,7 +991,7 @@ test('Part B.2: Live Mock-LLM Execution wall-clock rotation creates <= 2 KB v8.h
   assert.ok(continuationPrompt.includes('v8.hop_checkpoint.v1'), 'dispatched continuation worker must receive hydrated v8.hop_checkpoint.v1 prompt')
 })
 
-test('Part B.3: Concurrent cross-worker guardian_verify confirmations on redacted vs concrete ID routes collapse to 1 finding with merged evidence and 0 conflicts', async (t) => {
+test('Part B.3: Concurrent cross-worker kovo_verify confirmations on redacted vs concrete ID routes collapse to 1 finding with merged evidence and 0 conflicts', async (t) => {
   const target = await startMultiStepLoopbackTarget(t)
   const runOrigin = target.origin
 
@@ -1130,7 +1130,7 @@ test('Part B.3: Concurrent cross-worker guardian_verify confirmations on redacte
     return {
       runtime: req.runtime,
       result: {
-        sdk: 'guardian_verify.ts',
+        sdk: 'kovo_verify.ts',
         nonce: req.nonce,
         title,
         severity: isRedactedWorker ? 'high' : 'critical',
@@ -1144,7 +1144,7 @@ test('Part B.3: Concurrent cross-worker guardian_verify confirmations on redacte
     }
   })
 
-  // Mock LLM drives all 3 workers concurrently: Turn 1 invokes `guardian_verify`, Turn 2 calls `complete_intent`.
+  // Mock LLM drives all 3 workers concurrently: Turn 1 invokes `kovo_verify`, Turn 2 calls `complete_intent`.
   const llm = await startMockLlmServer(t, body => {
     const inputItems = Array.isArray(body.input) ? body.input : [body.input]
     const firstUserMsg = inputItems.find(item => item && typeof item === 'object' && (item as { role?: string }).role === 'user')
@@ -1158,7 +1158,7 @@ test('Part B.3: Concurrent cross-worker guardian_verify confirmations on redacte
         toolCall: {
           callId: `done_${randomUUID().slice(0, 8)}`,
           name: 'complete_intent',
-          argumentsJson: JSON.stringify({ status: 'proved', summary: 'Confirmed composite proof via guardian_verify.' }),
+          argumentsJson: JSON.stringify({ status: 'proved', summary: 'Confirmed composite proof via kovo_verify.' }),
         },
       }
     }
@@ -1167,7 +1167,7 @@ test('Part B.3: Concurrent cross-worker guardian_verify confirmations on redacte
       return {
         toolCall: {
           callId: 'gv_redacted',
-          name: 'guardian_verify',
+          name: 'kovo_verify',
           argumentsJson: JSON.stringify({
             runtime: 'ts',
             title: 'Cross-tenant order export via sealed capability handle',
@@ -1180,7 +1180,7 @@ test('Part B.3: Concurrent cross-worker guardian_verify confirmations on redacte
       return {
         toolCall: {
           callId: 'gv_concrete',
-          name: 'guardian_verify',
+          name: 'kovo_verify',
           argumentsJson: JSON.stringify({
             runtime: 'ts',
             title: 'Unauthorized foreign order readback via runtime concrete ID',
@@ -1192,7 +1192,7 @@ test('Part B.3: Concurrent cross-worker guardian_verify confirmations on redacte
     return {
       toolCall: {
         callId: 'gv_distinct',
-        name: 'guardian_verify',
+        name: 'kovo_verify',
         argumentsJson: JSON.stringify({
           runtime: 'ts',
           title: 'Foreign tenant invoice export readback via derived bearer token',
@@ -1202,7 +1202,7 @@ test('Part B.3: Concurrent cross-worker guardian_verify confirmations on redacte
     }
   })
 
-  const { storage } = makeTempStore(t, 'guardian-v8-seam2-dedupe-')
+  const { storage } = makeTempStore(t, 'kovo-v8-seam2-dedupe-')
   await saveModelProfile({
     name: 'Seam2-Dedupe-Mock',
     endpoint: llm.endpoint,
@@ -1265,7 +1265,7 @@ test('Part B.3: Concurrent cross-worker guardian_verify confirmations on redacte
     deterministicSweep: false,
   })
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     engine.start()
     engine.wake()
     const deadline = Date.now() + 5_000

@@ -29,7 +29,7 @@ import { synthesizeEngineSpecs } from '../src/server/deterministic-specs.ts'
 import type { DifferentialResult } from '../src/server/surface-engine.ts'
 
 // scopedAssetOrigin accepts loopback origins only when local-lab mode is enabled.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const personas: EnginePersona[] = [
   { handle: 'persona-a', roleLabel: 'owner (f6e944)', privilege: 'member', tenant: 'f6e944' },
@@ -343,8 +343,8 @@ describe('deterministic engine orchestrator', () => {
   })
 
   test('the disable env keeps the engine inert', async () => {
-    const previous = process.env.GUARDIAN_DETERMINISTIC_ENGINE
-    process.env.GUARDIAN_DETERMINISTIC_ENGINE = '0'
+    const previous = process.env.KOVO_DETERMINISTIC_ENGINE
+    process.env.KOVO_DETERMINISTIC_ENGINE = '0'
     try {
       assert.equal(deterministicEngineEnabled(), false)
       let persisted = 0
@@ -352,8 +352,8 @@ describe('deterministic engine orchestrator', () => {
       assert.equal(report.stoppedReason, 'disabled')
       assert.equal(persisted, 0)
     } finally {
-      if (previous === undefined) delete process.env.GUARDIAN_DETERMINISTIC_ENGINE
-      else process.env.GUARDIAN_DETERMINISTIC_ENGINE = previous
+      if (previous === undefined) delete process.env.KOVO_DETERMINISTIC_ENGINE
+      else process.env.KOVO_DETERMINISTIC_ENGINE = previous
     }
     assert.equal(deterministicEngineEnabled(), true)
   })

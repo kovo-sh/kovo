@@ -19,7 +19,7 @@ import type { EndpointHarvest, EngineEndpoint, EngineHypothesis, EnginePersona }
 import { synthesizeEngineSpecs } from '../src/server/deterministic-specs.ts'
 import type { DifferentialResult } from '../src/server/surface-engine.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const personas: EnginePersona[] = [
   { handle: 'persona-a', roleLabel: 'owner (t1)', privilege: 'member', tenant: 't1' },
@@ -254,7 +254,7 @@ describe('new replay-spec converters', () => {
       pathAndQuery: '/api/v1/search',
       param: { name: 'query', location: 'query' },
       location: 'query',
-      baselineValue: 'guardian',
+      baselineValue: 'kovo',
       ownerPersona: 'persona-a',
       risk: 80,
     }
@@ -264,7 +264,7 @@ describe('new replay-spec converters', () => {
       anomalies: [{ type: 'boolean_differential', style: 'or_branch' }],
     }))
     assert.ok(specs.length >= 2)
-    assert.match((specs[1].spec as { baselineValue?: string }).baselineValue ?? '', /^guardian-[0-9a-f]{8}$/)
+    assert.match((specs[1].spec as { baselineValue?: string }).baselineValue ?? '', /^kovo-[0-9a-f]{8}$/)
     assert.ok(
       specs.some(s => (s.spec as { baselineValue?: string }).baselineValue === ''),
       'expected empty-string fallback baseline in OR-branch candidates',

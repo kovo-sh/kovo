@@ -2,7 +2,7 @@
 // membership. The member roster and the org record were readable for foreign tenants (and the org record
 // without any session), which surfaced as an out-of-spec single-hop authorization finding.
 // The intended PG-C1..PG-C4 chains must stay solvable in vulnerable mode and silent in hardened mode.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

@@ -25,7 +25,7 @@ import { RETIRED_LEGACY_SPEC_KINDS, RETIRED_LEGACY_SPEC_REASON, verifyReplaySpec
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
 import { makeLabGrant } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const origin = 'http://127.0.0.1:4392'
 
@@ -242,7 +242,7 @@ test('Cut 3e: cache_differential and static_ast_proof run zero-jq with exact ver
   assert.equal(miss.verdict, 'dismissed')
 
   // static_ast_proof: strictly static_verified (never runtime_confirmed), zero jq
-  const reposDir = mkdtempSync(join(tmpdir(), 'guardian-cut3e-ast-'))
+  const reposDir = mkdtempSync(join(tmpdir(), 'kovo-cut3e-ast-'))
   t.after(() => rmSync(reposDir, { recursive: true, force: true }))
   mkdirSync(join(reposDir, 'app'), { recursive: true })
   writeFileSync(join(reposDir, 'app', 'vuln.ts'), 'export function run(x: string) {\n  return eval(x)\n}\n', 'utf8')
@@ -382,14 +382,14 @@ test('Cut 3e (#181 P0 regression): authenticated reflected XSS confirms through 
   const payload = `<img src=x onerror="document.title='{{canary_token}}'">`
   const encodedPayload = payload.split('{{canary_token}}').map(encodeURIComponent).join('{{canary_token}}')
   const candidateSteps = [
-    { id: 'c1', role: 'control', description: 'Control benign search', origin: appOrigin, persona: 'member_a', pathAndQuery: '/search?q=guardian', action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 200 },
+    { id: 'c1', role: 'control', description: 'Control benign search', origin: appOrigin, persona: 'member_a', pathAndQuery: '/search?q=kovo', action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 200 },
     { id: 'p1', role: 'probe', description: 'Probe reflected XSS', origin: appOrigin, persona: 'member_a', pathAndQuery: `/search?q=${encodedPayload}`, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 600 },
   ]
   const hypothesis = {
     intent: 'xss_reflected',
     probeClass: 'xss_context',
     method: 'GET',
-    pathAndQuery: '/search?q=guardian',
+    pathAndQuery: '/search?q=kovo',
     ownerPersona: 'member_a',
     endpoint: { origin: appOrigin, pathTemplate: '/search', method: 'GET' },
   }

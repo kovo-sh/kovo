@@ -232,7 +232,7 @@ test('a tight cap drops the proof obligation, never the code evidence', () => {
 })
 
 test('assignmentBriefForStep grounds a code-slice step in the exact route and sink chain', async t => {
-  const { storage } = makeStore(t, 'guardian-v7-realism4-brief-')
+  const { storage } = makeStore(t, 'kovo-v7-realism4-brief-')
   const { run, runId, assignment } = await approvedRun(storage)
   const execution = new Execution(storage)
   t.after(() => execution.stop())
@@ -277,7 +277,7 @@ test('assignmentBriefForStep grounds a code-slice step in the exact route and si
   assert.match(packet.proofObligation?.chain ?? '', /controllers\/users\.ts:5/)
   assert.equal(packet.proofObligation?.controlPersona, 'mono-alice')
   assert.equal(packet.proofObligation?.variantPersona, 'mono-bob', 'variant prefers another tenant')
-  assert.match(packet.proofObligation?.deliverable ?? '', /guardian_verify\(prove_persisted_mutation\)/)
+  assert.match(packet.proofObligation?.deliverable ?? '', /kovo_verify\(prove_persisted_mutation\)/)
   assert.match(packet.proofObligation?.deliverable ?? '', /proofGapReason/)
 })
 
@@ -386,7 +386,7 @@ test('a dry-round stop is deferred while first-pass or Tier-A work remains; exha
 })
 
 test('Tier-A leads seed as ready Round-1 steps without runtime contrast evidence and idempotently', async t => {
-  const { storage } = makeStore(t, 'guardian-v7-realism4-tier-a-')
+  const { storage } = makeStore(t, 'kovo-v7-realism4-tier-a-')
   const { run, assignment } = await approvedRun(storage)
   const execution = new Execution(storage)
   t.after(() => execution.stop())

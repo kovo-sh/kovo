@@ -42,7 +42,7 @@ import {
   type GateInput,
 } from '../scripts/smoke-agentic.ts'
 
-const tempRoot = mkdtempSync(join(tmpdir(), 'guardian-smoke-test-'))
+const tempRoot = mkdtempSync(join(tmpdir(), 'kovo-smoke-test-'))
 process.on('exit', () => rmSync(tempRoot, { recursive: true, force: true }))
 
 function cell(overrides: Partial<CellMetrics> = {}): CellMetrics {

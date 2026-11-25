@@ -228,7 +228,7 @@ function makeCompositeProofReceipt(input: {
 // ============================================================================
 
 test('alreadyConfirmedRefs exposes verified CompositeProofReceipt hop & terminal endpoints with hasCompositeReceipt=true', async (t) => {
-  const { storage } = makeStore(t, 'guardian-v8-dedupe-comp-')
+  const { storage } = makeStore(t, 'kovo-v8-dedupe-comp-')
   const { runId } = await setupApprovedRun(storage, { seeds: [ORIGIN_A, ORIGIN_B], tier: 2 })
   const run = storage.run(runId)
   const worker = makeWorker(storage, run, ORIGIN_A)
@@ -330,7 +330,7 @@ test('alreadyConfirmedRefs exposes verified CompositeProofReceipt hop & terminal
 // ============================================================================
 
 test('queueSecondOrderSurfaceSteps skips routes with verified CompositeProofReceipt but NEVER skips single-hop-only routes', async (t) => {
-  const { storage } = makeStore(t, 'guardian-v8-dedupe-2nd-')
+  const { storage } = makeStore(t, 'kovo-v8-dedupe-2nd-')
   const { runId } = await setupApprovedRun(storage, { seeds: [ORIGIN_A, ORIGIN_B], tier: 2 })
   const run = storage.run(runId)
   const worker = makeWorker(storage, run, ORIGIN_A)
@@ -438,7 +438,7 @@ test('queueSecondOrderSurfaceSteps skips routes with verified CompositeProofRece
 // ============================================================================
 
 test('persistDispatchPlan suppresses duplicate (origin, normalizedRoute, classFamily) confirmed/in-flight while preserving every zero-recall-loss invariant', async (t) => {
-  const { storage } = makeStore(t, 'guardian-v8-dedupe-persist-')
+  const { storage } = makeStore(t, 'kovo-v8-dedupe-persist-')
   const { runId } = await setupApprovedRun(storage, { seeds: [ORIGIN_A, ORIGIN_B], tier: 2 })
   const run = storage.run(runId)
   const worker = makeWorker(storage, run, ORIGIN_A)
@@ -746,7 +746,7 @@ test('persistDispatchPlan suppresses duplicate (origin, normalizedRoute, classFa
 // ============================================================================
 
 test('applyPlannerNewSteps suppresses confirmed/in-flight tuples with exact funnel accounting and preserves zero-recall-loss invariants', async (t) => {
-  const { storage } = makeStore(t, 'guardian-v8-dedupe-newsteps-')
+  const { storage } = makeStore(t, 'kovo-v8-dedupe-newsteps-')
   const { runId } = await setupApprovedRun(storage, { seeds: [ORIGIN_A, ORIGIN_B], tier: 2 })
   const run = storage.run(runId)
   const worker = makeWorker(storage, run, ORIGIN_A)
@@ -872,7 +872,7 @@ test('applyPlannerNewSteps suppresses confirmed/in-flight tuples with exact funn
 // ============================================================================
 
 test('queueTierALeadSteps skips already-confirmed and in-flight (origin, normalizedRoute, classFamily) leads while seeding novel classes and routes', async (t) => {
-  const { storage } = makeStore(t, 'guardian-v8-dedupe-tiera-')
+  const { storage } = makeStore(t, 'kovo-v8-dedupe-tiera-')
   const { runId } = await setupApprovedRun(storage, { seeds: [ORIGIN_A, ORIGIN_B], tier: 2 })
   const run = storage.run(runId)
   const worker = makeWorker(storage, run, ORIGIN_A)

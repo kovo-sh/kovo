@@ -11,7 +11,7 @@ import { execFileSync } from 'node:child_process'
 import { describe, test } from 'node:test'
 
 // scopedAssetOrigin accepts loopback http origins only under the local-lab gate.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { declarativeReplaySpecSchema } from '../src/replay-spec.ts'
 import { synthesizeSpec, synthesizeSpecs } from '../scripts/benchmark-specs.ts'
@@ -218,7 +218,7 @@ describe('M7.2 authz synthesis: identifier binding', () => {
     ]
     const built = expectSpec(outcome({
       hyp: hypothesis({ endpoint: ep, probeClass: 'authz_matrix', param: undefined, location: undefined, method: 'POST' }),
-      anomalies: [{ type: 'unauthorized_access', resourceId: '', actor: 'other_persona', method: 'POST', status: 200, functionLevel: true, bodyTemplate: ['acme', 'guardian'] }],
+      anomalies: [{ type: 'unauthorized_access', resourceId: '', actor: 'other_persona', method: 'POST', status: 200, functionLevel: true, bodyTemplate: ['acme', 'kovo'] }],
       details: { matrix: rows },
     }), 'http_chain')
     const steps = built.spec.steps as Array<{ id: string; request: { pathAndQuery: string; jsonBody?: unknown } }>
@@ -228,7 +228,7 @@ describe('M7.2 authz synthesis: identifier binding', () => {
     // The mutation carries the observed function body; c1/p2 are the readback arms.
     const mutation = steps.find(s => s.id === 'p1')!
     assert.equal(mutation.request.pathAndQuery, '/api/v1/admin/orgs')
-    assert.deepEqual(mutation.request.jsonBody, ['acme', 'guardian'])
+    assert.deepEqual(mutation.request.jsonBody, ['acme', 'kovo'])
 
     const trivial = rows.map(row => ({ ...row, bodyBytes: 10 }))
     assert.equal(synthesizeSpec(outcome({
@@ -245,7 +245,7 @@ describe('M7.2 authz synthesis: identifier binding', () => {
     }), 'http_chain')
     const steps = built.spec.steps as Array<{ id: string; request: { pathAndQuery: string } }>
     assert.deepEqual(steps.map(s => s.id), ['c2', 'c1', 'p1'])
-    assert.match(steps[0].request.pathAndQuery, /guardian-none-/)
+    assert.match(steps[0].request.pathAndQuery, /kovo-none-/)
   })
 })
 
@@ -267,8 +267,8 @@ describe('M7.2 NoSQL operator injection synthesis', () => {
     assert.match(steps[2].request.pathAndQuery, /%24ne/)
     const hit = jq(String(built.spec.assertionsJq), {
       steps: {
-        c1: { status: 200, body: '{"users":[{"name":"guardian"}]}', json: { users: [{ name: 'guardian' }] } },
-        c2: { status: 200, body: '{"users":[{"name":"guardian"}]}', json: { users: [{ name: 'guardian' }] } },
+        c1: { status: 200, body: '{"users":[{"name":"kovo"}]}', json: { users: [{ name: 'kovo' }] } },
+        c2: { status: 200, body: '{"users":[{"name":"kovo"}]}', json: { users: [{ name: 'kovo' }] } },
         p1: { status: 200, body: '{"users":[{"name":"a"},{"name":"b"}]}', json: { users: [{ name: 'a' }, { name: 'b' }] } },
       },
     })
@@ -292,7 +292,7 @@ describe('v5 M3 contracts (awaiting probe shapes)', () => {
       hyp: hypothesis({ endpoint: endpoint({ method: 'PATCH', path: '/api/v1/profile', params: [] }), probeClass: 'csrf_state_change', param: undefined, location: undefined, method: 'PATCH' }),
       anomalies: [{
         type: 'csrf_state_change', path: '/api/v1/profile', method: 'PATCH', bodyField: 'displayName',
-        controlValue: 'guardian-control', expectedValue: 'guardian-probe', readPath: '/api/v1/profile', stateField: 'displayName',
+        controlValue: 'kovo-control', expectedValue: 'kovo-probe', readPath: '/api/v1/profile', stateField: 'displayName',
       }],
     }), 'http_chain')
     const steps = built.spec.steps as Array<{ id: string; request: { method: string; csrfBind?: boolean; jsonBody?: Record<string, unknown>; headers?: Record<string, string> } }>
@@ -305,16 +305,16 @@ describe('v5 M3 contracts (awaiting probe shapes)', () => {
     const hit = jq(String(built.spec.assertionsJq), {
       steps: {
         c1: { status: 200 },
-        r1: { status: 200, json: { displayName: 'guardian-control' } },
+        r1: { status: 200, json: { displayName: 'kovo-control' } },
         p1: { status: 200 },
-        p2: { status: 200, json: { displayName: 'guardian-probe' } },
+        p2: { status: 200, json: { displayName: 'kovo-probe' } },
       },
     })
     assert.equal(hit.confirmed, true)
     const untouched = jq(String(built.spec.assertionsJq), {
       steps: {
-        c1: { status: 200 }, r1: { status: 200, json: { displayName: 'guardian-control' } },
-        p1: { status: 403 }, p2: { status: 200, json: { displayName: 'guardian-control' } },
+        c1: { status: 200 }, r1: { status: 200, json: { displayName: 'kovo-control' } },
+        p1: { status: 403 }, p2: { status: 200, json: { displayName: 'kovo-control' } },
       },
     })
     assert.equal(untouched.confirmed, false)
@@ -326,13 +326,13 @@ describe('v5 M3 contracts (awaiting probe shapes)', () => {
       hyp: hypothesis({ endpoint: ep, probeClass: 'csrf_state_change', param: undefined, location: undefined, method: 'POST' }),
       anomalies: [{
         type: 'csrf_state_change', path: '/rest/settings', method: 'POST', bodyField: 'name', bodyEncoding: 'form',
-        controlValue: 'guardian-control', expectedValue: 'guardian-probe', readPath: '/rest/settings', stateField: 'name',
+        controlValue: 'kovo-control', expectedValue: 'kovo-probe', readPath: '/rest/settings', stateField: 'name',
       }],
     }), 'http_chain')
     const steps = built.spec.steps as Array<{ id: string; request: { textBody?: string; jsonBody?: unknown; headers?: Record<string, string> } }>
     const probe = steps.find(s => s.id === 'p1')!
     assert.equal(probe.request.headers?.['Content-Type'], 'application/x-www-form-urlencoded')
-    assert.equal(probe.request.textBody, 'name=guardian-probe')
+    assert.equal(probe.request.textBody, 'name=kovo-probe')
     assert.equal(probe.request.jsonBody, undefined)
   })
 
@@ -378,7 +378,7 @@ describe('v5 M3 contracts (awaiting probe shapes)', () => {
       }],
     }), 'http_chain')
     const steps = built.spec.steps as Array<{ id: string; request: { headers?: Record<string, string>; jsonBody?: Record<string, unknown> } }>
-    assert.equal(steps[0].request.headers?.['X-Signature'], 'guardian-invalid-signature')
+    assert.equal(steps[0].request.headers?.['X-Signature'], 'kovo-invalid-signature')
     assert.equal(steps[1].request.headers?.['X-Signature'], undefined)
     const hit = jq(String(built.spec.assertionsJq), {
       steps: { c1: { status: 401 }, p1: { status: 200 }, p2: { status: 200, json: { status: 'paid' } } },
@@ -396,7 +396,7 @@ describe('v5 M3 contracts (awaiting probe shapes)', () => {
     }), 'http_chain')
     const steps = built.spec.steps as Array<{ id: string; request: { headers?: Record<string, string> } }>
     assert.deepEqual(steps.map(s => s.id), ['c1', 'p1'])
-    assert.equal(steps[0].request.headers?.['X-Signature'], 'guardian-invalid-signature')
+    assert.equal(steps[0].request.headers?.['X-Signature'], 'kovo-invalid-signature')
     const hit = jq(String(built.spec.assertionsJq), { steps: { c1: { status: 401 }, p1: { status: 200, body: '{"ok":true}' } } })
     assert.equal(hit.confirmed, true)
     const noAck = jq(String(built.spec.assertionsJq), { steps: { c1: { status: 401 }, p1: { status: 200, body: '{"ok":false}' } } })
@@ -411,7 +411,7 @@ describe('v5 M3 contracts (awaiting probe shapes)', () => {
       anomalies: [{
         type: 'webhook_signature_bypass', proof: 'readback', variant: 'unsigned',
         path: '/api/webhooks', headerName: 'x-webhook-signature',
-        body: { event: 'guardian.probe' }, readPath: '/api/webhooks/deliveries', stateField: 'deliveries', expectedValue: 3,
+        body: { event: 'kovo.probe' }, readPath: '/api/webhooks/deliveries', stateField: 'deliveries', expectedValue: 3,
       }],
     }), 'http_chain')
     const hit = jq(String(built.spec.assertionsJq), {
@@ -441,12 +441,12 @@ describe('v5 M3 contracts (awaiting probe shapes)', () => {
       anomalies: [{
         type: 'webhook_signature_bypass', proof: 'acceptance', variant: 'inline_key:key/sig',
         path: '/webhooks/events', headerName: 'X-Signature',
-        body: { event: 'invoice.paid', key: 'guardian_whk_abc', sig: 'valid-digest' },
+        body: { event: 'invoice.paid', key: 'kovo_whk_abc', sig: 'valid-digest' },
       }],
     }), 'http_chain')
     const steps = built.spec.steps as Array<{ id: string; request: { headers?: Record<string, string>; jsonBody?: Record<string, unknown> } }>
     assert.equal(steps[0].request.headers?.['X-Signature'], undefined)
-    assert.equal(steps[0].request.jsonBody?.sig, 'guardian-invalid-signature')
+    assert.equal(steps[0].request.jsonBody?.sig, 'kovo-invalid-signature')
     assert.equal(steps[1].request.jsonBody?.sig, 'valid-digest')
   })
 
@@ -456,7 +456,7 @@ describe('v5 M3 contracts (awaiting probe shapes)', () => {
       anomalies: [{ type: 'open_redirect_differential', payload: 'https://evil.invalid/cb', location: 'https://evil.invalid/cb' }],
     }), 'http_chain')
     const steps = built.spec.steps as Array<{ request: { pathAndQuery: string } }>
-    assert.match(steps[0].request.pathAndQuery, /guardian-control\.invalid/)
+    assert.match(steps[0].request.pathAndQuery, /kovo-control\.invalid/)
     assert.match(steps[1].request.pathAndQuery, /evil\.invalid/)
     const hit = jq(String(built.spec.assertionsJq), {
       steps: {

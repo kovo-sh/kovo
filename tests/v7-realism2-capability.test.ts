@@ -167,7 +167,7 @@ const localLabGrant = { allowLocalLab: true, tier: 3 } as unknown as Grant
 
 describe('realism2: probe end-to-end', () => {
   test('a real sleep confirms through a 50–300 ms jittered transport', async () => {
-    process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+    process.env.KOVO_ALLOW_LOCAL_LAB = '1'
     const ctx = fakeProbeContext({ sleep: true, delayMs: 1500 })
     const outcome = await diffSqlTimeDifferential(ctx, localLabGrant)
     assert.equal(outcome.verdict, 'signal', outcome.summary)
@@ -176,7 +176,7 @@ describe('realism2: probe end-to-end', () => {
   })
 
   test('identical responses with no delay never confirm', async () => {
-    process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+    process.env.KOVO_ALLOW_LOCAL_LAB = '1'
     const ctx = fakeProbeContext({ sleep: false, delayMs: 0 })
     const outcome = await diffSqlTimeDifferential(ctx, localLabGrant)
     assert.notEqual(outcome.verdict, 'signal', outcome.summary)

@@ -1,4 +1,4 @@
-process.env.GUARDIAN_ALLOW_LOCAL_LAB ??= "1"
+process.env.KOVO_ALLOW_LOCAL_LAB ??= "1"
 /**
  * v5 M3 specs3 contracts: impact-first synthesis for the realistic classes that previously produced
  * no confirmed findings. Each case combines a synthesis assertion (jq evaluated against the exact
@@ -13,7 +13,7 @@ import { createHmac } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { test } from 'node:test'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'
@@ -355,7 +355,7 @@ function jobFixture(hardened: boolean) {
 }
 
 const jobAnomaly = {
-  type: 'workflow_step_skip', createPath: '/api/jobs', createEncoding: 'form', producerBody: { title: 'guardian' },
+  type: 'workflow_step_skip', createPath: '/api/jobs', createEncoding: 'form', producerBody: { title: 'kovo' },
   targetTemplate: '/api/jobs/{{id}}/complete', targetBody: {}, readPath: '/api/jobs',
   stateField: 'status', collection: 'items', idField: 'id', fromState: 'pending', toState: 'done',
 }
@@ -409,7 +409,7 @@ function jwtBodyFixture(hardened: boolean) {
     try { payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) } catch { return json(res, 401, { error: 'invalid_token' }) }
     const header = (() => { try { return JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')) as { alg?: string } } catch { return {} } })()
     if (!hardened && header.alg === 'none' && payload.sub === 'victim@example.test') {
-      return json(res, 200, { ok: true, access_token: 'guardian-issued-access-token', access: 'guardian-issued-access-token' })
+      return json(res, 200, { ok: true, access_token: 'kovo-issued-access-token', access: 'kovo-issued-access-token' })
     }
     return json(res, 401, { error: 'invalid_token' })
   })
@@ -570,7 +570,7 @@ function webhookFixture(hardened: boolean) {
 }
 
 function inlineWebhookAnomaly() {
-  const key = 'guardian-attacker-key'
+  const key = 'kovo-attacker-key'
   const ts = '1800000000'
   const event = { type: 'invoice.paid', amount: 100000 }
   const signature = createHmac('sha256', key).update(`${ts}.${JSON.stringify(event)}`).digest('hex')

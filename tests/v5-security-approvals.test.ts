@@ -377,7 +377,7 @@ test('HIGH #1: broker passes body/flags/persona to the approval fast path and fa
 // ---------------------------------------------------------------------------
 
 test('HIGH #1: execution auto-approval is exact and single-use; persisted rows never authorize /a/b', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-sec-approvals-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-sec-approvals-'))
   const storage = new Store(dir)
   const execution = new Execution(storage)
   t.after(async () => {
@@ -473,7 +473,7 @@ test('HIGH #1: execution auto-approval is exact and single-use; persisted rows n
 })
 
 test('HIGH #1: operator approval authorizes the exact request once, then re-escalates', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-sec-approvals-hitl-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-sec-approvals-hitl-'))
   const storage = new Store(dir)
   const execution = new Execution(storage)
   t.after(async () => {

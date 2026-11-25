@@ -5,7 +5,7 @@
  *      (`retestPersistedRecipe` + `recipeSpecRecord`).
  *  (b) All 5 retired legacy VM kinds (`dns_takeover`, `tls_audit`, `browser_dom`, `ws_chain`,
  *      `upload_probe`) fail closed with `verdict: 'dismissed'` and
- *      `reason: 'retired_legacy_spec_kind: use guardian_verify'` without touching transport/browser.
+ *      `reason: 'retired_legacy_spec_kind: use kovo_verify'` without touching transport/browser.
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
@@ -16,7 +16,7 @@ import { RETIRED_LEGACY_SPEC_KINDS, RETIRED_LEGACY_SPEC_REASON, verifyReplaySpec
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
 import { makeLabGrant } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const origin = 'http://127.0.0.1:4391'
 const actor = { handle: 'anonymous', role: 'anonymous' as const }
@@ -208,8 +208,8 @@ test('Cut 3c/3d/3e retirement: all 9 retired legacy spec kinds fail closed witho
     severity: 'medium' as const,
     severityRationale: 'Test fixture for Cut 3c-1 fail-closed retirement.',
     impact: 'None — retired spec kind.',
-    remediation: 'Use guardian_verify.',
-    recheckInstructions: 'Submit via guardian_verify.',
+    remediation: 'Use kovo_verify.',
+    recheckInstructions: 'Submit via kovo_verify.',
     assertionsJq: '{ controlPassed: true, confirmed: true, observed: "ok", expected: "ok" }',
   }
 

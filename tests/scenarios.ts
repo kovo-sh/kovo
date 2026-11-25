@@ -1,7 +1,7 @@
 import type { PublicObservation } from '../src/server/broker.ts'
 import type { AccessPolicySnapshot } from '../src/access-policy.ts'
 
-export const fixtureCredential = 'guardian-replay-fixture-key'
+export const fixtureCredential = 'kovo-replay-fixture-key'
 export const primaryOrigin = 'https://northstar.example'
 export const unavailableOrigin = 'https://docs.northstar.example'
 export const healthyOrigin = 'https://healthy.northstar.example'

@@ -34,7 +34,7 @@ import type { BolaTestQueueItem, DispatchLaneStep } from '../src/server/executio
 import type { Run } from '../src/server/store.ts'
 import { makeStore, setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const origin = 'https://app.example.invalid'
 

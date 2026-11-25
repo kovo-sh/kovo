@@ -13,7 +13,7 @@
  *     schedules multi-hop chains immediately without starvation.
  *  4. `runAgentSession` enforces `wallClockMs` as a real per-assignment `AbortController` timer:
  *     - stalled LLM stream with `wallClockMs=150` aborts cleanly in `< 400ms`;
- *     - active `guardian_verify` call gets its bounded grace window to finish before rotation;
+ *     - active `kovo_verify` call gets its bounded grace window to finish before rotation;
  *     - final wall-clock settlement nudge fires at `max(wallClockMs - 15_000, wallClockMs * 0.8)`.
  *  5. Live `Execution` with a stalled specialist (`wallClockMs=150`) emits
  *     `worker.wall_clock_rotated`, frees its slot within `< 400ms`, and immediately dispatches
@@ -42,7 +42,7 @@ import { saveModelProfile } from '../src/server/model-settings.ts'
 import type { WorkerBackend, WorkerSession } from '../src/server/worker-backend.ts'
 import { makeStore, setupApprovedRun, stopExecution, withEnv } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const ORIGIN = 'https://target.example.invalid'
 
@@ -411,7 +411,7 @@ test('Execution scheduler.dispatch opens >= 3 concurrent slots (not slots=1) and
   })
 
   const engine = new Execution(storage, { backend: stubBackend(), deterministicSweep: false })
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     engine.start()
     engine.wake()
     const deadline = Date.now() + 4_000
@@ -448,8 +448,8 @@ test('wallClockSettlementMs computes max(wallClockMs - 15s, 80%) and settlement 
   assert.equal(wallClockSettlementMs(180_000), 165_000)
   assert.equal(wallClockSettlementMs(60_000), 48_000)
   assert.equal(wallClockSettlementMs(150), 120)
-  const msg = wallClockSettlementMessage({ elapsedMs: 105_000, wallClockMs: 120_000, proofTools: ['guardian_verify'] })
-  assert.match(msg, /guardian_verify/i)
+  const msg = wallClockSettlementMessage({ elapsedMs: 105_000, wallClockMs: 120_000, proofTools: ['kovo_verify'] })
+  assert.match(msg, /kovo_verify/i)
   assert.match(msg, /record_coverage/i)
   assert.match(msg, /complete_intent/i)
 })
@@ -496,14 +496,14 @@ test('runAgentSession hard-aborts a stalled specialist at wallClockMs=150 within
   assert.ok(elapsedMs < 400, `expected hard rotation within < 400ms for wallClockMs=150, took ${elapsedMs}ms`)
 })
 
-test('runAgentSession grants bounded grace for an actively running guardian_verify proof call before rotating', async (t) => {
+test('runAgentSession grants bounded grace for an actively running kovo_verify proof call before rotating', async (t) => {
   let verifyFinished = false
   const llm = await startCustomMockLlmServer(t, (_body, idx) => {
     if (idx === 1) {
       return {
         toolCall: {
           callId: 'call_gv_1',
-          name: 'guardian_verify',
+          name: 'kovo_verify',
           argumentsJson: JSON.stringify({ runtime: 'ts', script: 'export default async () => ({ confirmed: true })' }),
         },
       }
@@ -532,13 +532,13 @@ test('runAgentSession grants bounded grace for an actively running guardian_veri
       outputCostPerMtok: 0,
     },
     scenario: 'worker-investigation',
-    prompt: 'Submit guardian_verify proof now.',
+    prompt: 'Submit kovo_verify proof now.',
     signal: new AbortController().signal,
     maxTurns: 10,
     wallClockMs: 90,
     wallClockGraceMs: 250,
     handlers: {
-      guardian_verify: async () => {
+      kovo_verify: async () => {
         await new Promise(r => setTimeout(r, 140))
         verifyFinished = true
         return JSON.stringify({ ok: true, confirmed: true })
@@ -548,7 +548,7 @@ test('runAgentSession grants bounded grace for an actively running guardian_veri
   })
 
   const elapsedMs = Date.now() - startedAt
-  assert.equal(verifyFinished, true, 'in-flight guardian_verify proof must be allowed to complete inside the grace window')
+  assert.equal(verifyFinished, true, 'in-flight kovo_verify proof must be allowed to complete inside the grace window')
   assert.equal(result.status, 'wall_clock_rotated')
   assert.ok(elapsedMs < 500, `expected bounded rotation shortly after grace completion, took ${elapsedMs}ms`)
 })
@@ -627,7 +627,7 @@ test('Execution rotates a stalled specialist at wallClockMs=150 in < 400ms and d
   })
 
   const startedAt = Date.now()
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     engine.start()
     engine.wake()
     const deadline = Date.now() + 4_000

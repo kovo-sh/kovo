@@ -15,7 +15,7 @@ import * as tables from '../src/server/schema.ts'
 
 function withTempStore(fn: (ctx: { dir: string; store: Store }) => Promise<void> | void) {
   return async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'guardian-ux-del-'))
+    const dir = mkdtempSync(join(tmpdir(), 'kovo-ux-del-'))
     const store = new Store(dir, { ftsMode: 'preview' })
     try {
       await fn({ dir, store })

@@ -2,7 +2,7 @@
 // agentic run (same audit pass as the paygrid Queue #27/#29 fixes). Every case pins the route
 // behaviour that previously allowed an unintended shortcut; the final cases pin that all four
 // SF-C1..SF-C4 chains stay solvable in vulnerable mode and that hardened / SF-D1..SF-D3 stay silent.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

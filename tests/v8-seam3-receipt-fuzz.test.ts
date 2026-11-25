@@ -58,7 +58,7 @@ import {
 } from '../src/server/verify-rpc.ts'
 import { verifyScript } from '../src/server/verify-runner.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const ORIGIN_API = 'https://api.example.test'
 const ORIGIN_APP = 'https://app.example.test'

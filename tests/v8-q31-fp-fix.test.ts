@@ -234,7 +234,7 @@ test('verifyScript confirms dual fresh runs with dynamic jsonpath/structural_dif
       }).exchangeId)
       return {
         result: {
-          sdk: 'guardian_verify.ts',
+          sdk: 'kovo_verify.ts',
           nonce,
           title: `Account ${id} dynamic verification`,
           claims: [
@@ -265,7 +265,7 @@ test('verifyScript confirms dual fresh runs with dynamic jsonpath/structural_dif
       })
       return {
         result: {
-          sdk: 'guardian_verify.ts',
+          sdk: 'kovo_verify.ts',
           nonce,
           title: 'Account balance check',
           claims: [

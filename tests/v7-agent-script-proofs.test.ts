@@ -52,14 +52,14 @@ import {
 import type { VerifyScriptRequest, VerifyScriptResult, WorkerBackend, WorkerSession, WorkerSessionOptions } from '../src/server/worker-backend.ts'
 import { makeLabGrant, setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 // ---------------------------------------------------------------------------
 // Helpers: Store, HTTP fixture, RPC client, and fake WorkerBackend (no Docker)
 // ---------------------------------------------------------------------------
 
 function makeStore(t: { after: (fn: () => void) => void }): { storage: Store; dir: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v7-script-proofs-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v7-script-proofs-'))
   const storage = new Store(dir)
   t.after(() => {
     storage.close()
@@ -366,7 +366,7 @@ function makeTenantWriteScriptHandler(origin: string, mode: 'valid' | 'missing_r
 // ---------------------------------------------------------------------------
 
 test('v7 agent-script-proofs: schema v8->v9 additive migration and proof column accessors', async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v7-mig-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v7-mig-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
 
   // Create a database, seed a legacy replay_spec row, then downgrade the schema to v8
@@ -398,7 +398,7 @@ test('v7 agent-script-proofs: schema v8->v9 additive migration and proof column 
   initial.close()
 
   // Simulate an existing v8 database on disk (no proof_* columns, user_version = 8).
-  const rawDb = new DatabaseSync(join(dir, 'guardian.sqlite'))
+  const rawDb = new DatabaseSync(join(dir, 'kovo.sqlite'))
   rawDb.exec('DROP INDEX IF EXISTS replay_specs_proof;')
   for (const col of ['proof_kind', 'proof_verdict', 'proof_runtime', 'proof_script_sha256', 'proof_artifact_id', 'proof_receipt']) {
     rawDb.exec(`ALTER TABLE replay_specs DROP COLUMN ${col};`)

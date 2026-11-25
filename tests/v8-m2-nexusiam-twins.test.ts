@@ -7,7 +7,7 @@
 //  3. app/api/docs-worker: foreign org roster, inbox material for other authors' comments, global
 //     moderation queue, unauthenticated benign routes, docs-worker job list/create/cancel/audit.
 // Each case pins that vulnerable mode still solves 4/4 and hardened/twin modes stay silent.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

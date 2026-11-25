@@ -158,11 +158,11 @@ const grant = (origin: string): Grant => ({
 })
 
 function lab(run: () => Promise<unknown>): Promise<unknown> {
-  const previous = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  const previous = process.env.KOVO_ALLOW_LOCAL_LAB
+  process.env.KOVO_ALLOW_LOCAL_LAB = '1'
   return run().finally(() => {
-    if (previous === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = previous
+    if (previous === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = previous
   })
 }
 

@@ -257,8 +257,8 @@ test('M1-static T7: semver comparator matrix (unions, hyphen ranges, patches)', 
 })
 
 test('M1-static T8: curated advisories respect affectedRange for patched versions', async () => {
-  const prevOffline = process.env.GUARDIAN_OFFLINE
-  process.env.GUARDIAN_OFFLINE = '1'
+  const prevOffline = process.env.KOVO_OFFLINE
+  process.env.KOVO_OFFLINE = '1'
   try {
     assert.deepEqual(await queryCves({ ecosystem: 'npm', package: 'next', version: '15.5.0' }), [])
     assert.deepEqual(await queryCves({ ecosystem: 'npm', package: 'express', version: '5.1.0' }), [])
@@ -283,7 +283,7 @@ test('M1-static T8: curated advisories respect affectedRange for patched version
     assert.equal(advisoryMatchesVersion({ affectedRange: '<1.0.0' }, undefined), true)
     assert.equal(advisoryMatchesVersion({ affectedRange: '<1.0.0' }, 'latest'), true)
   } finally {
-    if (prevOffline === undefined) delete process.env.GUARDIAN_OFFLINE
-    else process.env.GUARDIAN_OFFLINE = prevOffline
+    if (prevOffline === undefined) delete process.env.KOVO_OFFLINE
+    else process.env.KOVO_OFFLINE = prevOffline
   }
 })

@@ -256,7 +256,7 @@ function writeCellFixture(root: string, overrides: {
 }
 
 function withFixture<T>(run: (root: string) => T, overrides: Parameters<typeof writeCellFixture>[1] = {}): T {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-phaseb-concurrency-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-phaseb-concurrency-'))
   try {
     return run(writeCellFixture(dir, overrides))
   } finally {

@@ -1,4 +1,4 @@
-process.env.GUARDIAN_ALLOW_LOCAL_LAB ??= '1'
+process.env.KOVO_ALLOW_LOCAL_LAB ??= '1'
 /**
  * v5.1 Slice 4 — proof-strength + endpoint-binding guards for LLM-authored specs.
  *
@@ -13,7 +13,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { test } from 'node:test'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'

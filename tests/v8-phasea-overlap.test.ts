@@ -31,7 +31,7 @@ import type { ChainStep, Run } from '../src/server/store.ts'
 import type { WorkerBackend, WorkerSession } from '../src/server/worker-backend.ts'
 import { makeStore, setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const ORIGIN_API = 'http://api.overlap.test:8081'
 
@@ -179,7 +179,7 @@ async function createMockProfile(storage: ReturnType<typeof makeStore>['storage'
 }
 
 function makeMountedRepo(t: Parameters<typeof makeStore>[0]): string {
-  const reposDir = mkdtempSync(join(tmpdir(), 'guardian-overlap-repo-'))
+  const reposDir = mkdtempSync(join(tmpdir(), 'kovo-overlap-repo-'))
   mkdirSync(join(reposDir, 'demo-service'), { recursive: true })
   writeFileSync(join(reposDir, 'demo-service', 'app.ts'), 'export const health = () => ({ ok: true })\n', 'utf8')
   t.after(() => rmSync(reposDir, { recursive: true, force: true }))
@@ -187,11 +187,11 @@ function makeMountedRepo(t: Parameters<typeof makeStore>[0]): string {
 }
 
 function disableStage1Llm(t: Parameters<typeof makeStore>[0]): void {
-  const prev = process.env.GUARDIAN_STAGE1_LLM
-  process.env.GUARDIAN_STAGE1_LLM = '0'
+  const prev = process.env.KOVO_STAGE1_LLM
+  process.env.KOVO_STAGE1_LLM = '0'
   t.after(() => {
-    if (prev === undefined) delete process.env.GUARDIAN_STAGE1_LLM
-    else process.env.GUARDIAN_STAGE1_LLM = prev
+    if (prev === undefined) delete process.env.KOVO_STAGE1_LLM
+    else process.env.KOVO_STAGE1_LLM = prev
   })
 }
 

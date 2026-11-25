@@ -34,10 +34,10 @@ import { findings, replaySpecs } from '../src/server/schema.ts'
 import { Store } from '../src/server/store.ts'
 import { setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 function makeStore(t: { after: (fn: () => void) => void }): { storage: Store; dir: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v8-q35-dedupe-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v8-q35-dedupe-'))
   const storage = new Store(dir)
   t.after(() => {
     storage.close()

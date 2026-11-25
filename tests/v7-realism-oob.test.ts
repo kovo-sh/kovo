@@ -6,7 +6,7 @@
  * the durable `pending_oob` subscription is what lets the run-level drain promote the late
  * callback. For the drain to attribute that callback to the injection, the recorded exchange must
  * name the canary token. Request bodies are not searchable; the broker's correlation id is
- * (`X-Guardian-Trace-Id` in a local lab), so every canary-carrying probe request sets `traceId` to
+ * (`X-Kovo-Trace-Id` in a local lab), so every canary-carrying probe request sets `traceId` to
  * the token it injected.
  *
  * Selection/hypothesis-shape tests and the second-order engine helper live in the engine lane; see
@@ -27,7 +27,7 @@ import { xxeProbe } from '../src/server/probes/xxe.ts'
 import { Store } from '../src/server/store.ts'
 import { setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const origin = 'http://127.0.0.1:46527'
 const runId = 'run-realism-oob'
@@ -44,7 +44,7 @@ afterEach(() => {
 })
 
 function localBroker(): CanaryBroker {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-realism-oob-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-realism-oob-'))
   tempDirs.push(dir)
   const broker = new CanaryBroker({ oobDirectory: dir })
   brokers.push(broker)
@@ -120,7 +120,7 @@ test('the SSRF probe correlates every canary URL it injects with the carrying re
     param: 'url',
     paramLocation: 'json',
     ssrfParams: ['url'],
-    jsonBody: { url: 'http://guardian-control.invalid/' },
+    jsonBody: { url: 'http://kovo-control.invalid/' },
     waitMs: 1,
     runId,
     assignmentId,
@@ -185,7 +185,7 @@ test('the XXE probe correlates every entity canary and sends an XML body', async
 // ============================================================================
 
 test('a recorded correlation header makes the carrying exchange findable for OOB attribution', async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-realism-oob-store-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-realism-oob-store-'))
   const storage = new Store(dir)
   t.after(() => {
     storage.close()
@@ -196,7 +196,7 @@ test('a recorded correlation header makes the carrying exchange findable for OOB
   const asset = run.candidates[0]!
   const worker = storage.workerList(storeRunId)[0]
     ?? storage.makeWorker(run, 'verification', asset, 'oob carrier', 'oob carrier')
-  const token = 'guardian-canary-5f08851ce59f23bfd53e9340'
+  const token = 'kovo-canary-5f08851ce59f23bfd53e9340'
   const exchange = storage.recordExchange({
     runId: storeRunId,
     assignmentId: worker.id,
@@ -209,7 +209,7 @@ test('a recorded correlation header makes the carrying exchange findable for OOB
     personaHandle: null,
     status: 202,
     mediaType: 'application/json',
-    reqHeaders: { 'content-type': 'application/json', 'x-guardian-trace-id': token },
+    reqHeaders: { 'content-type': 'application/json', 'x-kovo-trace-id': token },
     respHeaders: { 'content-type': 'application/json' },
     body: '{"accepted":true}',
     durationMs: 4,
@@ -220,5 +220,5 @@ test('a recorded correlation header makes the carrying exchange findable for OOB
   })
   assert.equal(found.length, 1, 'the token in the request headers identifies the injection exchange')
   assert.equal(found[0]!.id, exchange.id)
-  assert.equal(found[0]!.reqHeaders['x-guardian-trace-id'], token)
+  assert.equal(found[0]!.reqHeaders['x-kovo-trace-id'], token)
 })

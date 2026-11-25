@@ -15,7 +15,7 @@
 // inputs are harvested at runtime from the reference solvers' own transcripts, so this file holds no
 // probe literals. Reproductions listed in KNOWN_UNMERGED_GAPS (fix in flight, #502) or KNOWN_GAPS
 // (reported by this seam) are surfaced as diagnostics; anything else fails the suite.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -115,7 +115,7 @@ function publicContext(app: AppKey, lab: LabLike, log?: CallRecord[]): Ctx {
   const call = async (service: string, url: string, path: string, request: Req = {}): Promise<Resp> => {
     const origin = new URL(url).origin
     if (!allowed.has(origin)) throw new Error(`non-public origin contacted: ${service} ${path}`)
-    const headers: Record<string, string> = { 'x-guardian-run-id': lab.runId, ...(request.headers ?? {}) }
+    const headers: Record<string, string> = { 'x-kovo-run-id': lab.runId, ...(request.headers ?? {}) }
     if (request.token) headers.authorization = `Bearer ${request.token}`
     let body: string | undefined
     if (request.rawBody !== undefined) {
@@ -322,7 +322,7 @@ function requestTemplate(record: Req): Req {
   delete copy.token
   if (copy.headers) {
     for (const key of Object.keys(copy.headers)) {
-      if (/authorization|guardian-run-id|signature|derived-from|scim-token|registry-token|delegation-key/i.test(key)) {
+      if (/authorization|kovo-run-id|signature|derived-from|scim-token|registry-token|delegation-key/i.test(key)) {
         delete copy.headers[key]
       }
     }

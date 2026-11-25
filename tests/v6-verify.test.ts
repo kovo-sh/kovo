@@ -1,4 +1,4 @@
-// Layer-3 verification MVP (v6 Phase 3): Unix-socket Layer-1 RPC, guardian_verify SDK,
+// Layer-3 verification MVP (v6 Phase 3): Unix-socket Layer-1 RPC, kovo_verify SDK,
 // signed transcript oracle, independent fresh-session re-run, and chunked worker IPC.
 //
 // Defensive framing: these are differential probes against local fixtures and the isolated
@@ -29,10 +29,10 @@ import type { VerifyBrowserDriver, VerifyCanaryBroker, VerifyClaim } from '../sr
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
 
 const execFile = promisify(execFileCb)
-const SDK_DIR = join(dirname(fileURLToPath(import.meta.url)), '../worker/guardian_verify')
+const SDK_DIR = join(dirname(fileURLToPath(import.meta.url)), '../worker/kovo_verify')
 
 // The broker only permits loopback when the operator explicitly opted into a local lab.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const ALICE_SECRET = 'alice-secret-8f21c4'
 const BOB_SECRET = 'bob-secret-3c77d1'
@@ -168,7 +168,7 @@ const browserDriver: VerifyBrowserDriver = {
 const mintedTokens = new Set<string>()
 const canary: VerifyCanaryBroker = {
   mintCanary(runId, label) {
-    const token = `guardian-canary-${randomUUID().replace(/-/g, '').slice(0, 24)}`
+    const token = `kovo-canary-${randomUUID().replace(/-/g, '').slice(0, 24)}`
     mintedTokens.add(token)
     return { token, httpUrl: `http://canary.local/c/${token}`, url: `http://canary.local/c/${token}`, dnsHost: `${token}.canary.local`, label }
   },
@@ -200,8 +200,8 @@ function rpc(server: VerifyRpcServer, op: string, args: Record<string, unknown> 
       headers: {
         'content-type': 'application/json',
         'content-length': Buffer.byteLength(payload),
-        'x-guardian-rpc-token': server.token,
-        'x-guardian-verify-nonce': nonce,
+        'x-kovo-rpc-token': server.token,
+        'x-kovo-verify-nonce': nonce,
       },
     }, res => {
       const chunks: Buffer[] = []
@@ -405,7 +405,7 @@ test('TS SDK confirms a local BOLA fixture only after two fresh-session runs', a
     name: 'bola.ts',
     runtime: 'ts' as const,
     code: `
-import { defineVerification, runVerification } from './guardian_verify.ts'
+import { defineVerification, runVerification } from './kovo_verify.ts'
 
 runVerification(defineVerification({
   async verify(ctx) {
@@ -449,7 +449,7 @@ test('forged stdout or fabricated exchange ids are rejected by the transcript or
 import { writeFileSync } from 'node:fs'
 
 console.log('PASSED: everything is vulnerable, trust me')
-writeFileSync(process.env.GUARDIAN_PROOF_RESULT_FILE!, JSON.stringify({
+writeFileSync(process.env.KOVO_PROOF_RESULT_FILE!, JSON.stringify({
   title: 'forged finding',
   claims: [
     { kind: 'status', exchangeId: 'gx-00000000-0000-0000-0000-000000000000', expected: 200 },
@@ -491,7 +491,7 @@ test('a flaky candidate (second fresh run fails) is not confirmed', async () => 
     name: 'flaky.ts',
     runtime: 'ts' as const,
     code: `
-import { defineVerification, runVerification } from './guardian_verify.ts'
+import { defineVerification, runVerification } from './kovo_verify.ts'
 
 runVerification(defineVerification({
   async verify(ctx) {
@@ -518,15 +518,15 @@ async function dockerReady(): Promise<boolean> {
   try {
     await execFile('docker', ['info', '--format', '{{.ServerVersion}}'], { timeout: 5_000 })
     const { stdout } = await execFile('docker', ['images', '--format', '{{.Repository}}:{{.Tag}}'], { timeout: 5_000 })
-    return stdout.split('\n').includes('guardian-worker:v4')
+    return stdout.split('\n').includes('kovo-worker:v4')
   } catch {
     return false
   }
 }
 
-test('end-to-end: guardian_verify TS script runs inside the sandbox and is oracle-verified', async t => {
+test('end-to-end: kovo_verify TS script runs inside the sandbox and is oracle-verified', async t => {
   if (!(await dockerReady())) {
-    t.skip('docker daemon or guardian-worker:v4 image unavailable')
+    t.skip('docker daemon or kovo-worker:v4 image unavailable')
     return
   }
   const server = await startRpc()
@@ -539,7 +539,7 @@ test('end-to-end: guardian_verify TS script runs inside the sandbox and is oracl
       runtime: 'ts',
       nonce: server.nonce,
       code: `
-import { defineVerification, runVerification } from './guardian_verify.ts'
+import { defineVerification, runVerification } from './kovo_verify.ts'
 
 runVerification(defineVerification({
   async verify(ctx) {
@@ -574,7 +574,7 @@ runVerification(defineVerification({
 
 test('chunked IPC: one-shot output >64 KiB hydrates through a tmpfs pointer', async t => {
   if (!(await dockerReady())) {
-    t.skip('docker daemon or guardian-worker:v4 image unavailable')
+    t.skip('docker daemon or kovo-worker:v4 image unavailable')
     return
   }
   const backend = new LinuxWorkerBackend({ runId: 'run-v6-verify-ipc-oneshot' })
@@ -591,7 +591,7 @@ test('chunked IPC: one-shot output >64 KiB hydrates through a tmpfs pointer', as
 
 test('chunked IPC: >64 KiB output survives without terminating the worker session', async t => {
   if (!(await dockerReady())) {
-    t.skip('docker daemon or guardian-worker:v4 image unavailable')
+    t.skip('docker daemon or kovo-worker:v4 image unavailable')
     return
   }
   const backend = new LinuxWorkerBackend({ runId: 'run-v6-verify-ipc' })

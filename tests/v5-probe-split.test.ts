@@ -26,7 +26,7 @@ import { ownedProbeClasses, probeFamilyFor, probeModuleFor, probeModules } from 
 // ---------------------------------------------------------------------------
 
 // Loopback fixtures are the point of this suite; keep the local-lab gate stable for every test.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 async function fixture(handler: (req: IncomingMessage, res: ServerResponse, body: string) => void | Promise<void>) {
   const requests: Array<{ method: string; url: string; body: string }> = []
@@ -218,7 +218,7 @@ test('xxe: a DTD canary entity fetched by the parser signals and a static XML si
     try {
       const make = (expands: boolean) => fixture(async (_req, res, body) => {
         if (expands) {
-          const m = /https?:\/\/[^\s"'>]+guardian-canary-[a-f0-9]+[^\s"'>]*/i.exec(body)
+          const m = /https?:\/\/[^\s"'>]+kovo-canary-[a-f0-9]+[^\s"'>]*/i.exec(body)
           if (m) await fetch(m[0]).catch(() => undefined)
         }
         res.setHeader('Content-Type', 'application/xml')
@@ -557,7 +557,7 @@ test('open redirect: an unvalidated off-origin target signals and a pinned redir
   {
     const make = (validates: boolean) => fixture((req, res) => {
       const target = new URL(req.url ?? '/', 'http://fixture').searchParams.get('next') ?? ''
-      if (!/^https?:|^\/\//.test(target) || target.startsWith('/guardian-return-')) {
+      if (!/^https?:|^\/\//.test(target) || target.startsWith('/kovo-return-')) {
         res.writeHead(302, { Location: '/home' }).end()
         return
       }

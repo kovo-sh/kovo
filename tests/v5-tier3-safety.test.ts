@@ -66,8 +66,8 @@ function localLabGrant(overrides: Partial<Grant> = {}): Grant {
 // Invariant 1 — public isolation
 // ---------------------------------------------------------------------------
 
-test('invariant 1: GUARDIAN_ALLOW_LOCAL_LAB=1 never relaxes Tier-3 approvals for public or unspecified environments', async () => {
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+test('invariant 1: KOVO_ALLOW_LOCAL_LAB=1 never relaxes Tier-3 approvals for public or unspecified environments', async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const cases = [
       { label: 'DELETE', input: { method: 'DELETE' as const, pathAndQuery: '/api/items/42' } },
       { label: 'multipart', input: { method: 'POST' as const, pathAndQuery: '/api/upload', hasMultipart: true } },
@@ -114,7 +114,7 @@ test('invariant 2: local-lab auto-approval requires a loopback or LabRunner-inte
     'http://localhost:3000',
     'http://[::1]:3000',
     CONTAINER_ORIGIN,
-    'http://guardian-lab-web-1a2b3c4d5e:8080',
+    'http://kovo-lab-web-1a2b3c4d5e:8080',
     PRIVATE_LAB_ORIGIN,
     'http://10.4.5.6:8080',
     'http://192.168.1.20:8080',
@@ -133,7 +133,7 @@ test('invariant 2: local-lab auto-approval requires a loopback or LabRunner-inte
   for (const origin of allowed) assert.equal(isLocalLabAutoApprovalOrigin(origin), true, `${origin} should be lab-internal`)
   for (const origin of rejected) assert.equal(isLocalLabAutoApprovalOrigin(origin), false, `${origin} must never be lab-internal`)
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     // Authorized loopback/container origins auto-approve, including DELETE/multipart/RCE keys.
     for (const origin of [LOOPBACK_ORIGIN, CONTAINER_ORIGIN, PRIVATE_LAB_ORIGIN]) {
       const result = await evaluateTier3Approval({
@@ -181,7 +181,7 @@ test('invariant 2: local-lab auto-approval requires a loopback or LabRunner-inte
 // ---------------------------------------------------------------------------
 
 test('invariant 3: explicit strict policy always escalates and never auto-approves', async () => {
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     let llmCalled = false
     const llmCall = async () => {
       llmCalled = true
@@ -231,7 +231,7 @@ test('invariant 3: explicit strict policy always escalates and never auto-approv
 // ---------------------------------------------------------------------------
 
 test('invariant 4: local-lab auto-approval never bypasses destructive, webshell, metadata-SSRF, or RPS guards', async () => {
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const labAddress: PublicAddress[] = [{ address: '127.0.0.1', family: 4 }]
 
     // 4a. Destructive-payload denylist (SQL/storage destruction) is enforced pre-flight.
@@ -339,7 +339,7 @@ test('invariant 4: local-lab auto-approval never bypasses destructive, webshell,
 // ---------------------------------------------------------------------------
 
 test('execution Tier-3 gate: local-lab approval is origin-bound, strict-aware, and persisted', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-tier3-exec-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-tier3-exec-'))
   const storage = new Store(dir)
   const execution = new Execution(storage)
   t.after(async () => {
@@ -429,7 +429,7 @@ test('execution Tier-3 gate: local-lab approval is origin-bound, strict-aware, a
 // ---------------------------------------------------------------------------
 
 test('redirect containment: an auto-approved loopback Tier-3 write is never followed to an external host', async () => {
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const externalOrigin = 'https://collector.example.net'
     const resolve = async (hostname: string) => (
       hostname === '127.0.0.1'
@@ -507,12 +507,12 @@ test('redirect containment: an auto-approved loopback Tier-3 write is never foll
 // ---------------------------------------------------------------------------
 
 test('default environment fail-closed: a project without explicit environment is public and never local-lab auto-approved', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-tier3-default-env-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-tier3-default-env-'))
   const storage = new Store(dir)
   try {
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       // The project schema defaults environment to 'public', so a loopback/http seed is rejected
-      // even while GUARDIAN_ALLOW_LOCAL_LAB=1 is set.
+      // even while KOVO_ALLOW_LOCAL_LAB=1 is set.
       assert.throws(
         () => newProject.parse({
           requestId: randomUUID(),
@@ -578,10 +578,10 @@ test('default environment fail-closed: a project without explicit environment is
 // ---------------------------------------------------------------------------
 
 test('invariant 5: local-lab auto-approval persists an audit record attributed to auto-review:local-lab', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-tier3-safety-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-tier3-safety-'))
   const storage = new Store(dir)
   try {
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       const project = storage.createProject({
         requestId: randomUUID(),
         name: 'Tier 3 safety audit',

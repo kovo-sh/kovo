@@ -34,7 +34,7 @@ import type { ChainStep, Run } from '../src/server/store.ts'
 import type { CompiledProof } from '../src/server/proof-tools.ts'
 import { makeStore, setupApprovedRun, withEnv } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 type LaneOptions = {
   lane?: boolean
@@ -130,9 +130,9 @@ test('deterministicSweep resolves from option/env and defaults OFF', () => {
   assert.equal(resolveDeterministicSweepMode(false, {}), 'off')
   assert.equal(resolveDeterministicSweepMode(true, {}), 'on')
   assert.equal(resolveDeterministicSweepMode('always', {}), 'always')
-  assert.equal(resolveDeterministicSweepMode(undefined, { GUARDIAN_DETERMINISTIC_SWEEP: '1' }), 'on')
-  assert.equal(resolveDeterministicSweepMode(undefined, { GUARDIAN_DETERMINISTIC_SWEEP: 'always' }), 'always')
-  assert.equal(resolveDeterministicSweepMode(undefined, { GUARDIAN_DETERMINISTIC_SWEEP: '0' }), 'off')
+  assert.equal(resolveDeterministicSweepMode(undefined, { KOVO_DETERMINISTIC_SWEEP: '1' }), 'on')
+  assert.equal(resolveDeterministicSweepMode(undefined, { KOVO_DETERMINISTIC_SWEEP: 'always' }), 'always')
+  assert.equal(resolveDeterministicSweepMode(undefined, { KOVO_DETERMINISTIC_SWEEP: '0' }), 'off')
 })
 
 test('flag OFF: zero lane traffic and no lane events', async (t) => {
@@ -398,7 +398,7 @@ test('occurred context builders: confirmed refs, leads and <=1.5 KB assignment b
 
 test('tracing is OFF by default and emits lifecycle/planner/checkpoint records when enabled', async (t) => {
   const { storage, runId } = await startRun(t)
-  const cleanEnv = { GUARDIAN_TRACE: undefined, GUARDIAN_TRACE_DIR: undefined, GUARDIAN_TRACE_ROOT: undefined }
+  const cleanEnv = { KOVO_TRACE: undefined, KOVO_TRACE_DIR: undefined, KOVO_TRACE_ROOT: undefined }
 
   await withEnv(cleanEnv, () => {
     const execution = new Execution(storage)
@@ -406,8 +406,8 @@ test('tracing is OFF by default and emits lifecycle/planner/checkpoint records w
     assert.equal(internals(execution).ensureRunTrace(storage.run(runId)), null, 'trace is off by default')
   })
 
-  const traceRoot = mkdtempSync(join(tmpdir(), 'guardian-trace-'))
-  await withEnv({ GUARDIAN_TRACE: '1', GUARDIAN_TRACE_ROOT: traceRoot }, () => {
+  const traceRoot = mkdtempSync(join(tmpdir(), 'kovo-trace-'))
+  await withEnv({ KOVO_TRACE: '1', KOVO_TRACE_ROOT: traceRoot }, () => {
     const execution = new Execution(storage)
     t.after(() => execution.stop())
     const trace = internals(execution).ensureRunTrace(storage.run(runId), [{ model: 'mock-model' }])

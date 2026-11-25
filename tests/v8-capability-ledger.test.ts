@@ -39,7 +39,7 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const ledgerSourcePath = join(repoRoot, 'src/server/capability-ledger.ts')
 
 function makeTempDbPath(t: { after: (fn: () => void) => void }): string {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v8-ledger-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v8-ledger-'))
   t.after(() => { rmSync(dir, { recursive: true, force: true }) })
   return join(dir, 'capability-ledger.sqlite')
 }

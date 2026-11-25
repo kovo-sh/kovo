@@ -51,7 +51,7 @@ interface RepoTree {
 }
 
 function writeTree(t: TestContext, files: Record<string, string>): RepoTree {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v7-whitebox-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v7-whitebox-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   for (const [path, content] of Object.entries(files)) {
     const full = join(dir, path)

@@ -3,7 +3,7 @@ import { once } from 'node:events'
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
-export const E2E_CREDENTIAL = 'guardian-v2-e2e-fixture-key-99182'
+export const E2E_CREDENTIAL = 'kovo-v2-e2e-fixture-key-99182'
 export const E2E_COOKIE_SECRET = 'e2e-synthetic-session-cookie-77123'
 
 type ResponsesToolCall = { name: string; args: Record<string, unknown> }
@@ -137,7 +137,7 @@ export async function createV2FixtureServer(options: V2FixtureOptions) {
         .end(JSON.stringify({ stateProbeOk: true, status: 'verified' }))
       return
     }
-    if (url.pathname.startsWith('/.guardian-nonexistent-')) {
+    if (url.pathname.startsWith('/.kovo-nonexistent-')) {
       res.writeHead(404, { 'Content-Type': 'text/plain' }).end('Not Found')
       return
     }
@@ -166,9 +166,9 @@ export async function createV2FixtureServer(options: V2FixtureOptions) {
 
     let sseBody: string
 
-    if (toolNames.has('guardian_connection')) {
+    if (toolNames.has('kovo_connection')) {
       modelCalls.push('connection')
-      sseBody = sseMessage('', [{ name: 'guardian_connection', args: { status: 'ready' } }])
+      sseBody = sseMessage('', [{ name: 'kovo_connection', args: { status: 'ready' } }])
     } else if ((toolNames.has('request_http') || toolNames.has('http_request')) && toolNames.has('complete_intent')) {
       // Worker investigation turn! Count how many function_call_output entries are in input
       const outputs = (body.input ?? []).filter(item => item.type === 'function_call_output')
@@ -303,7 +303,7 @@ export async function createV2FixtureServer(options: V2FixtureOptions) {
       sseBody = sseMessage(JSON.stringify({ checks: ['hsts', 'nosniff', 'referrer-policy', 'content-security-policy', 'frame-protection', 'server-disclosure'] }))
     } else {
       modelCalls.push('coordinator_chat')
-      sseBody = sseMessage('Guardian coordinator status: active assessment progressing under approved scope.')
+      sseBody = sseMessage('Kovo Hunter coordinator status: active assessment progressing under approved scope.')
     }
 
     res.writeHead(200, { 'Content-Type': 'text/event-stream' })
@@ -318,9 +318,9 @@ export async function createV2FixtureServer(options: V2FixtureOptions) {
       })
       return
     }
-    const targetHref = req.headers['x-guardian-fixture-target']
+    const targetHref = req.headers['x-kovo-fixture-target']
     if (typeof targetHref !== 'string') {
-      res.writeHead(400).end('Missing x-guardian-fixture-target')
+      res.writeHead(400).end('Missing x-kovo-fixture-target')
       return
     }
     targetRequests.push({ method: req.method ?? 'GET', target: targetHref, headers: req.headers })

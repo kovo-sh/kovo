@@ -195,7 +195,7 @@ function timingArgs(mode: 'boolean' | 'timing' = 'timing'): BooleanOrTimingArgs 
   return {
     origin: ORIGIN,
     method: 'GET',
-    pathAndQuery: '/search?q=guardian',
+    pathAndQuery: '/search?q=kovo',
     vulnClass: 'blind_sqli',
     mode,
   }
@@ -222,9 +222,9 @@ function booleanArgs(overrides: Partial<BooleanOrTimingArgs> = {}): BooleanOrTim
   return {
     origin: ORIGIN,
     method: 'GET',
-    pathAndQuery: "/search?q=guardian%27+AND+%271%27%3D%271",
-    controlPathAndQuery: "/search?q=guardian%27+AND+%271%27%3D%271",
-    probePathAndQuery: "/search?q=guardian%27+AND+%271%27%3D%272",
+    pathAndQuery: "/search?q=kovo%27+AND+%271%27%3D%271",
+    controlPathAndQuery: "/search?q=kovo%27+AND+%271%27%3D%271",
+    probePathAndQuery: "/search?q=kovo%27+AND+%271%27%3D%272",
     vulnClass: 'sqli',
     param: 'q',
     mode: 'boolean',
@@ -271,7 +271,7 @@ test('boolean_or_timing rejects hardened, echo-only, nonce-only, unstable and 5x
   const echoed = await runFloorRecipe(floorRecipe('boolean_or_timing', booleanArgs()), booleanDeps(
     Array.from({ length: 2 }, () => ({
       control: { status: 200, json: { result: '' } },
-      probe: { status: 200, json: { result: "guardian' AND '1'='2" } },
+      probe: { status: 200, json: { result: "kovo' AND '1'='2" } },
     })),
   ))
   assert.equal(echoed.result.confirmed, false)
@@ -303,7 +303,7 @@ test('boolean_or_timing rejects hardened, echo-only, nonce-only, unstable and 5x
 
 test('boolean_or_timing rejects a request shape that differs beyond the predicate', async () => {
   const run = await runFloorRecipe(
-    floorRecipe('boolean_or_timing', booleanArgs({ probePathAndQuery: "/search?q=guardian%27+AND+%271%27%3D%272&extra=1" })),
+    floorRecipe('boolean_or_timing', booleanArgs({ probePathAndQuery: "/search?q=kovo%27+AND+%271%27%3D%272&extra=1" })),
     booleanDeps(vulnRounds()),
   )
   assert.equal(run.result.confirmed, false)
@@ -323,7 +323,7 @@ test('boolean_or_timing names a missing host duration', async () => {
 // oob_callback
 // ============================================================================
 
-const CANARY = 'guardian-canary-0123456789abcdef01234567'
+const CANARY = 'kovo-canary-0123456789abcdef01234567'
 
 function oobArgs(): OobCallbackArgs {
   return {

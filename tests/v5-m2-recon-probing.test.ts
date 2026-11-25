@@ -30,7 +30,7 @@ import {
 
 describe('v5 M2 recon probing: static route literals', () => {
   test('rejects SQL/query fragments picked up from verb-named data helpers', (t: TestContext) => {
-    const repoDir = makeTempDir(t, 'guardian-v5m2-repo-')
+    const repoDir = makeTempDir(t, 'kovo-v5m2-repo-')
     const write = (rel: string, content: string) => {
       const full = join(repoDir, rel)
       mkdirSync(join(full, '..'), { recursive: true })
@@ -112,7 +112,7 @@ describe('v5 M2 recon probing: XHR route-map documents', () => {
   }
 
   test('expands route maps and walks collection ids into detail templates', async (t: TestContext) => {
-    const { storage } = makeStore(t, 'guardian-v5m2-crawl-')
+    const { storage } = makeStore(t, 'kovo-v5m2-crawl-')
     const origin = 'https://recon.fixture.test'
     const { runId, run } = await setupApprovedRun(storage, { seeds: [origin], budgetRequests: 900 })
     const visited: string[] = []
@@ -231,11 +231,11 @@ describe('v5 M2 recon probing: phase-0 route-map probing and soft-404 calibratio
       res.end(shell)
     })
 
-    const { storage } = makeStore(t, 'guardian-v5m2-phase0-')
+    const { storage } = makeStore(t, 'kovo-v5m2-phase0-')
     const setup = await setupApprovedRun(storage, { seeds: [fx.origin], budgetRequests: 900 })
     const grant: Grant = makeLabGrant(fx.origin, { tier: 1 })
 
-    const result = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => runPhase0Recon({
+    const result = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => runPhase0Recon({
       storage,
       runId: setup.runId,
       scopeRevision: setup.run.scopeRevision,
@@ -261,7 +261,7 @@ describe('v5 M2 recon probing: phase-0 route-map probing and soft-404 calibratio
 
     const endpoints = storage.listEndpoints(setup.runId, { origin: fx.origin })
     assert.ok(!endpoints.some(e => e.pathTemplate === '/ghost-page'), 'catch-all navigation route rejected')
-    assert.ok(!endpoints.some(e => /\/api\/\.guardian-cal-/.test(e.pathTemplate)), 'calibration probes are not surface')
+    assert.ok(!endpoints.some(e => /\/api\/\.kovo-cal-/.test(e.pathTemplate)), 'calibration probes are not surface')
     const probed = endpoints.filter(e => e.method === 'GET' && e.pathTemplate.startsWith('/api/issues'))
     assert.ok(probed.length >= 2, 'collection and detail routes recorded as live surface')
 
@@ -301,10 +301,10 @@ describe('v5 M4 wiring: tech tags and generic exposure templates', () => {
     ])
     assert.ok(repo.includes('nextjs') && repo.includes('fastapi'), `repo tags: ${repo.join(', ')}`)
 
-    const repoDir = makeTempDir(t, 'guardian-v5m4-manifests-')
+    const repoDir = makeTempDir(t, 'kovo-v5m4-manifests-')
     mkdirSync(join(repoDir, 'web'), { recursive: true })
     writeFileSync(join(repoDir, 'web/package.json'), JSON.stringify({ dependencies: { express: '4.19.0' } }), 'utf8')
-    const { storage } = makeStore(t, 'guardian-v5m4-tags-')
+    const { storage } = makeStore(t, 'kovo-v5m4-tags-')
     const { runId, run } = await setupApprovedRun(storage, { seeds: ['http://127.0.0.1:9'], tier: 0, budgetRequests: 100 })
     const result = await runPhase0Recon({
       storage,
@@ -328,9 +328,9 @@ describe('v5 M4 wiring: tech tags and generic exposure templates', () => {
       res.setHeader('Content-Type', 'text/plain')
       res.end('not found')
     })
-    const { storage } = makeStore(t, 'guardian-v5m4-generic-')
+    const { storage } = makeStore(t, 'kovo-v5m4-generic-')
     const setup = await setupApprovedRun(storage, { seeds: [fx.origin], budgetRequests: 900 })
-    const result = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => runPhase0Recon({
+    const result = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => runPhase0Recon({
       storage,
       runId: setup.runId,
       scopeRevision: setup.run.scopeRevision,

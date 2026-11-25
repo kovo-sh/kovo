@@ -47,9 +47,9 @@ async function startMockGithubServer(handler: (
 }
 
 test('GitHub App Device Flow end-to-end: start -> pending -> slow_down -> authorized -> 0600 vault -> repo discovery', async () => {
-  const dataDir = tempDataDir('guardian-gh-device-')
-  const prevEnvClientId = process.env.GUARDIAN_GITHUB_CLIENT_ID
-  delete process.env.GUARDIAN_GITHUB_CLIENT_ID
+  const dataDir = tempDataDir('kovo-gh-device-')
+  const prevEnvClientId = process.env.KOVO_GITHUB_CLIENT_ID
+  delete process.env.KOVO_GITHUB_CLIENT_ID
 
   const testClientId = 'Iv23liTESTCLIENTID001'
   const secretDeviceCode = 'dc_super_secret_device_code_never_expose_998877'
@@ -274,14 +274,14 @@ test('GitHub App Device Flow end-to-end: start -> pending -> slow_down -> author
     assert.equal(afterClear.clientIdSource, 'vault')
   } finally {
     await server.close()
-    if (prevEnvClientId === undefined) delete process.env.GUARDIAN_GITHUB_CLIENT_ID
-    else process.env.GUARDIAN_GITHUB_CLIENT_ID = prevEnvClientId
+    if (prevEnvClientId === undefined) delete process.env.KOVO_GITHUB_CLIENT_ID
+    else process.env.KOVO_GITHUB_CLIENT_ID = prevEnvClientId
     rmSync(dataDir, { recursive: true, force: true })
   }
 })
 
 test('automatic silent refresh rotates near-expiry token via grant_type=refresh_token and persists 0600 vault', async () => {
-  const dataDir = tempDataDir('guardian-gh-refresh-')
+  const dataDir = tempDataDir('kovo-gh-refresh-')
   const testClientId = 'Iv23liREFRESHCLIENT02'
   const oldAccess = 'ghu_11OLD_EXPIRING_ACCESS_TOKEN_AAAAAA'
   const oldRefresh = 'ghr_11OLD_REFRESH_TOKEN_BBBBBBBBBBBB'
@@ -393,10 +393,10 @@ test('automatic silent refresh rotates near-expiry token via grant_type=refresh_
   }
 })
 
-test('device flow handles expired_token, access_denied, cancellation, and GUARDIAN_GITHUB_CLIENT_ID env var', async () => {
-  const dataDir = tempDataDir('guardian-gh-edge-')
-  const prevEnvClientId = process.env.GUARDIAN_GITHUB_CLIENT_ID
-  process.env.GUARDIAN_GITHUB_CLIENT_ID = 'Iv23liENVCLIENTID99'
+test('device flow handles expired_token, access_denied, cancellation, and KOVO_GITHUB_CLIENT_ID env var', async () => {
+  const dataDir = tempDataDir('kovo-gh-edge-')
+  const prevEnvClientId = process.env.KOVO_GITHUB_CLIENT_ID
+  process.env.KOVO_GITHUB_CLIENT_ID = 'Iv23liENVCLIENTID99'
 
   let mode: 'expired' | 'denied' = 'expired'
   const server = await startMockGithubServer((req, body, res) => {
@@ -451,14 +451,14 @@ test('device flow handles expired_token, access_denied, cancellation, and GUARDI
     assert.equal(res3.status, 'expired')
   } finally {
     await server.close()
-    if (prevEnvClientId === undefined) delete process.env.GUARDIAN_GITHUB_CLIENT_ID
-    else process.env.GUARDIAN_GITHUB_CLIENT_ID = prevEnvClientId
+    if (prevEnvClientId === undefined) delete process.env.KOVO_GITHUB_CLIENT_ID
+    else process.env.KOVO_GITHUB_CLIENT_ID = prevEnvClientId
     rmSync(dataDir, { recursive: true, force: true })
   }
 })
 
 test('plain Fine-Grained PAT vault files remain 100% backward compatible alongside Device Flow', async () => {
-  const dataDir = tempDataDir('guardian-gh-pat-compat-')
+  const dataDir = tempDataDir('kovo-gh-pat-compat-')
   const plainPat = 'github_pat_11PLAIN_COMPAT_TOKEN_9876543210'
 
   const server = await startMockGithubServer((req, _body, res) => {

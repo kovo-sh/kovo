@@ -135,8 +135,8 @@ test('verify-rpc.ts preserves 100% public runtime export parity with canonical s
     evaluateClaims: 'function',
     causalFingerprints: 'function',
     VerifyRpcServer: 'function',
-    GUARDIAN_VERIFY_STDERR_PREVIEW_MAX_CHARS: 'number',
-    GUARDIAN_VERIFY_USAGE_HINT: 'string',
+    KOVO_VERIFY_STDERR_PREVIEW_MAX_CHARS: 'number',
+    KOVO_VERIFY_USAGE_HINT: 'string',
     redactStderrPreview: 'function',
     prepareVerifyScript: 'function',
     verifyScript: 'function',
@@ -180,8 +180,8 @@ test('verify-rpc.ts preserves 100% public runtime export parity with canonical s
   }
 
   const runnerSymbols = [
-    'GUARDIAN_VERIFY_STDERR_PREVIEW_MAX_CHARS',
-    'GUARDIAN_VERIFY_USAGE_HINT',
+    'KOVO_VERIFY_STDERR_PREVIEW_MAX_CHARS',
+    'KOVO_VERIFY_USAGE_HINT',
     'redactStderrPreview',
     'prepareVerifyScript',
     'verifyScript',

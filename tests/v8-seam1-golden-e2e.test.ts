@@ -1,4 +1,4 @@
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
@@ -47,7 +47,7 @@ import {
 // docs-worker port is used by a candidate script.
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
-const SDK_DIR = join(REPO_ROOT, 'worker', 'guardian_verify')
+const SDK_DIR = join(REPO_ROOT, 'worker', 'kovo_verify')
 const SEED = 42
 const ASYNC_LATENCY_MS = 5
 
@@ -310,7 +310,7 @@ const pendingDerived = await ctx.hmac_sign(pendingCap.handle, pending)
 const h2 = await send('idp', '/invites/resolve', {
   ...bearer(memberB, 'member_b'),
   method: 'POST',
-  headers: { 'x-guardian-derivation': pendingDerived.signature },
+  headers: { 'x-kovo-derivation': pendingDerived.signature },
   body: { email: pending.normalize('NFKC'), orgSlug: cfg.tenantA, role: 'finance' },
 })
 if (h2.status !== 200) return ctx.result({ title })
@@ -379,7 +379,7 @@ const renderPath = \`\${cfg.routePrefix}/invoices/\${cfg.ids.invoiceId}/render\`
 const h2 = await send('api', renderPath, {
   ...bearer(member, 'member_a'),
   method: 'POST',
-  headers: { 'x-guardian-correlation': templateId },
+  headers: { 'x-kovo-correlation': templateId },
 })
 if (h2.status !== 202) return ctx.result({ title })
 const jobId = String(h2.json.jobId)
@@ -464,7 +464,7 @@ const h2 = await send('api', exportPath, {
   method: 'POST',
   entityId: cacheKey,
   body: { correlation: cacheKey },
-  headers: { 'x-guardian-correlation': cacheKey },
+  headers: { 'x-kovo-correlation': cacheKey },
 })
 if (h2.status !== 202) return ctx.result({ title })
 const jobId = String(h2.json.jobId)
@@ -473,7 +473,7 @@ const poll = await ctx.await_async({
   pollRequest: \`\${origin('api')}\${cfg.routePrefix}/exports/\${jobId}?correlation=\${cacheKey}\`,
   as: 'dual_member',
   capability: { handle: viewerB.handle, target: 'bearer' },
-  headers: { 'x-guardian-job': jobCap.handle, 'x-guardian-correlation': cacheKey },
+  headers: { 'x-kovo-job': jobCap.handle, 'x-kovo-correlation': cacheKey },
   role: 'probe',
   triggerExchangeId: h2.exchangeId,
   correlationId: cacheKey,
@@ -762,7 +762,7 @@ const webhookPath = \`\${cfg.routePrefix}/projects/\${cfg.ids.projectIdA}/webhoo
 const h2 = await send('api', webhookPath, {
   ...bearer(member, 'member_a'),
   method: 'POST',
-  headers: { 'x-guardian-derivation': templateDerived.signature },
+  headers: { 'x-kovo-derivation': templateDerived.signature },
   body: { templateId: templateCap.handle, targetHost: 'registry.internal', targetPath: '/sync', events: ['push'] },
 })
 if (h2.status !== 201) return ctx.result({ title })
@@ -779,7 +779,7 @@ const tokenDerived = await ctx.hmac_sign(tokenCap.handle, cfg.tenantB)
 const h4 = await send('api', \`\${cfg.routePrefix}/integrations/registry/sync\`, {
   ...bearer(member, 'member_a'),
   method: 'POST',
-  headers: { 'x-registry-token': tokenCap.handle, 'x-guardian-derivation': tokenDerived.signature },
+  headers: { 'x-registry-token': tokenCap.handle, 'x-kovo-derivation': tokenDerived.signature },
   body: { tenant: cfg.tenantB, projectId: cfg.ids.projectIdB },
 })
 return await finish({
@@ -895,7 +895,7 @@ if (h2.status !== 200 || !h2.json.token) return ctx.result({ title })
 const h2TokenCap = await seal(h2, 'nx-c1-h2', 'moderation_token', { jsonPath: '$.token' }, 'api_token')
 const h3 = await send('app', inboxPath, {
   ...bearer(member, 'member_a'),
-  headers: { 'x-guardian-value': h2TokenCap.handle },
+  headers: { 'x-kovo-value': h2TokenCap.handle },
 })
 if (h3.status !== 200 || !h3.json.token) return ctx.result({ title })
 const scimCap = await seal(h3, 'nx-c1-h3', 'scim_token', { jsonPath: '$.token' }, 'api_token')
@@ -915,7 +915,7 @@ const h4 = await send('api', \`\${cfg.routePrefix}/scim/users/\${cfg.memberUserI
 if (h4.status !== 200) return ctx.result({ title })
 const h5 = await send('api', vaultPath, {
   capability: { handle: member.handle, target: 'bearer' },
-  headers: { 'x-guardian-value': scimCap.handle },
+  headers: { 'x-kovo-value': scimCap.handle },
   entityId: cfg.memberUserId,
 })
 const result = await finish({
@@ -971,13 +971,13 @@ const codeAssertion = await ctx.jwt_sign(codeCap.handle, { sub: 'share-preview' 
 })
 const h2 = await send('app', \`\${nextPath}?code=\${encodeURIComponent(codeCap.handle)}&state=share-preview\`, {
   ...bearer(member, 'member_b'),
-  headers: { 'x-guardian-assertion': codeAssertion.handle },
+  headers: { 'x-kovo-assertion': codeAssertion.handle },
 })
 if (h2.status !== 200) return ctx.result({ title })
 const codeDerived = await ctx.hmac_sign(codeAssertion.handle, code)
 const h3 = await send('idp', \`/invites?tenant=\${encodeURIComponent(cfg.tenantA)}\`, {
   ...bearer(member, 'member_b'),
-  headers: { 'x-derived-from': createHash('sha256').update(code).digest('hex'), 'x-guardian-derivation': codeDerived.signature },
+  headers: { 'x-derived-from': createHash('sha256').update(code).digest('hex'), 'x-kovo-derivation': codeDerived.signature },
 })
 if (h3.status !== 200) return ctx.result({ title })
 const invite = h3.json.invites?.find((item: any) => item.role === 'admin' && item.token)
@@ -987,7 +987,7 @@ const inviteDerived = await ctx.hmac_sign(inviteCap.handle, String(invite.token)
 const h4 = await send('idp', '/invites/redeem', {
   ...bearer(member, 'member_b'),
   method: 'POST',
-  headers: { 'x-guardian-derivation': inviteDerived.signature },
+  headers: { 'x-kovo-derivation': inviteDerived.signature },
   body: { token: inviteCap.handle },
 })
 if (h4.status !== 200 || !h4.json.token) return ctx.result({ title })
@@ -1100,7 +1100,7 @@ const jobCap = await seal(h2, 'nx-c4-h2', 'export_job', { jsonPath: '$.jobId' })
 const poll = await ctx.await_async({
   pollRequest: \`\${origin('api')}\${cfg.routePrefix}/exports/\${jobId}\`,
   capability: { handle: member.handle, target: 'bearer' },
-  headers: { 'x-guardian-job': jobCap.handle },
+  headers: { 'x-kovo-job': jobCap.handle },
   role: 'probe',
   triggerExchangeId: h2.exchangeId,
   correlationId: jobId,

@@ -6,7 +6,7 @@
 //    so an outsider could read the export without the share-handle and status-poll hops. The api
 //    now requires share-handle lineage per session, and the worker scopes reads to the caller tenant
 //    and requires a ready status poll by the same requester before serving the artifact.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

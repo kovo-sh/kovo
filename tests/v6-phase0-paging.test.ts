@@ -1,5 +1,5 @@
 /**
- * Guardian v6 — Phase-0 planning reads must page past the store's default 500-row page.
+ * Kovo Hunter v6 — Phase-0 planning reads must page past the store's default 500-row page.
  *
  * Regression for the monorepo fixture finding: `runPhase0Recon` ingested the declared surface
  * losslessly, but the discovery planning phases (nav targets, GraphQL argument pass, XML surface,
@@ -139,11 +139,11 @@ async function reconWithSurface(
   options: { reverse?: boolean } = {},
 ): Promise<RunOutcome> {
   const fx = await startSurfaceFixture(t)
-  const { storage } = makeStore(t, `guardian-v6-phase0-paging-${label}-`)
+  const { storage } = makeStore(t, `kovo-v6-phase0-paging-${label}-`)
   const setup = await setupApprovedRun(storage, { seeds: [fx.origin], budgetRequests: 900 })
   seedSurface(storage, setup.runId, fx.origin, options)
   const result = await withEnv(
-    { GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_RECON_SIBLINGS: '1' },
+    { KOVO_ALLOW_LOCAL_LAB: '1', KOVO_RECON_SIBLINGS: '1' },
     () => runPhase0Recon({
       storage,
       runId: setup.runId,
@@ -168,7 +168,7 @@ async function reconWithSurface(
 describe('v6 phase-0 planning reads: full-surface paging', () => {
   test('nav/GraphQL/XML/sibling phases see 6,000+ endpoints and report truncated=false', async (t: TestContext) => {
     const fx = await startSurfaceFixture(t)
-    const { storage } = makeStore(t, 'guardian-v6-phase0-paging-assert-')
+    const { storage } = makeStore(t, 'kovo-v6-phase0-paging-assert-')
     const setup = await setupApprovedRun(storage, { seeds: [fx.origin], budgetRequests: 900 })
     seedSurface(storage, setup.runId, fx.origin)
 
@@ -181,7 +181,7 @@ describe('v6 phase-0 planning reads: full-surface paging', () => {
     )
 
     const result = await withEnv(
-      { GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_RECON_SIBLINGS: '1' },
+      { KOVO_ALLOW_LOCAL_LAB: '1', KOVO_RECON_SIBLINGS: '1' },
       () => runPhase0Recon({
         storage,
         runId: setup.runId,

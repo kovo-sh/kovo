@@ -236,7 +236,7 @@ test('arch-c3 export parity: github-connector barrel preserves 100% of public ru
 })
 
 test('arch-c3 crash-recovery consolidation: skips duplicate tmpdir JSON record when SQLite store is attached', async t => {
-  const workspace = mkdtempSync(join(tmpdir(), 'guardian-arch-c3-state-'))
+  const workspace = mkdtempSync(join(tmpdir(), 'kovo-arch-c3-state-'))
   t.after(() => rmSync(workspace, { recursive: true, force: true }))
   const repoDir = join(workspace, 'repo')
   const stateDir = join(workspace, 'state')
@@ -300,8 +300,8 @@ test('arch-c3 crash-recovery consolidation: skips duplicate tmpdir JSON record w
     await Promise.all(servers.map(s => new Promise<void>(r => s.close(() => r()))))
   })
 
-  const prevAllow = process.env.GUARDIAN_ALLOW_LOCAL_LAB
-  process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+  const prevAllow = process.env.KOVO_ALLOW_LOCAL_LAB
+  process.env.KOVO_ALLOW_LOCAL_LAB = '1'
   try {
     const runner = new labRunner.LabRunner({ docker, stateDir })
     await runner.startLabTarget({
@@ -343,7 +343,7 @@ test('arch-c3 crash-recovery consolidation: skips duplicate tmpdir JSON record w
     await runner.stopLabTarget('run-standalone')
     assert.deepEqual(existsSync(stateDir) ? readdirSync(stateDir) : [], [], 'stopLabTarget cleans up standalone record')
   } finally {
-    if (prevAllow === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prevAllow
+    if (prevAllow === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = prevAllow
   }
 })

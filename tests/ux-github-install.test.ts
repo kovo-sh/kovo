@@ -37,8 +37,8 @@ async function startMockGithubServer(handler: (
 
 test('resolveGithubAppSlug & githubAppInstallUrl: env precedence, validation, github-app.json fallback, and custom base URL', () => {
   const dataDir = tempDataDir('kovo-gh-slug-')
-  const prevSlug = process.env.GUARDIAN_GITHUB_APP_SLUG
-  delete process.env.GUARDIAN_GITHUB_APP_SLUG
+  const prevSlug = process.env.KOVO_GITHUB_APP_SLUG
+  delete process.env.KOVO_GITHUB_APP_SLUG
 
   try {
     // Default null when neither env nor github-app.json is set
@@ -74,29 +74,29 @@ test('resolveGithubAppSlug & githubAppInstallUrl: env precedence, validation, gi
     assert.equal(resolveGithubAppSlug(dataDir), 'kovo-hunter')
 
     // Env var takes precedence over github-app.json and trims whitespace
-    process.env.GUARDIAN_GITHUB_APP_SLUG = '  kovo-hunter-staging  '
+    process.env.KOVO_GITHUB_APP_SLUG = '  kovo-hunter-staging  '
     assert.equal(resolveGithubAppSlug(dataDir), 'kovo-hunter-staging')
 
     // Invalid env slug is rejected (returns null)
-    process.env.GUARDIAN_GITHUB_APP_SLUG = 'Bad Slug/Path'
+    process.env.KOVO_GITHUB_APP_SLUG = 'Bad Slug/Path'
     assert.equal(resolveGithubAppSlug(dataDir), null)
 
     // getGithubAuthStatus exposes appSlug and installUrl
-    process.env.GUARDIAN_GITHUB_APP_SLUG = 'kovo-hunter'
+    process.env.KOVO_GITHUB_APP_SLUG = 'kovo-hunter'
     const status = getGithubAuthStatus(dataDir)
     assert.equal(status.appSlug, 'kovo-hunter')
     assert.equal(status.installUrl, 'https://github.com/apps/kovo-hunter/installations/new')
   } finally {
-    if (prevSlug === undefined) delete process.env.GUARDIAN_GITHUB_APP_SLUG
-    else process.env.GUARDIAN_GITHUB_APP_SLUG = prevSlug
+    if (prevSlug === undefined) delete process.env.KOVO_GITHUB_APP_SLUG
+    else process.env.KOVO_GITHUB_APP_SLUG = prevSlug
     rmSync(dataDir, { recursive: true, force: true })
   }
 })
 
 test('listAccessibleGithubRepos queries /user/installations FIRST, puts installed private/org repos ahead of public repos, and deduplicates keeping richer/private entry', async () => {
   const dataDir = tempDataDir('kovo-gh-inst-first-')
-  const prevSlug = process.env.GUARDIAN_GITHUB_APP_SLUG
-  process.env.GUARDIAN_GITHUB_APP_SLUG = 'kovo-hunter'
+  const prevSlug = process.env.KOVO_GITHUB_APP_SLUG
+  process.env.KOVO_GITHUB_APP_SLUG = 'kovo-hunter'
 
   const accessToken = 'ghu_11INSTALLATIONS_FIRST_TEST_TOKEN_12345'
   const callOrder: string[] = []
@@ -276,16 +276,16 @@ test('listAccessibleGithubRepos queries /user/installations FIRST, puts installe
     assert.equal(statusAfter.installUrl, `${server.baseUrl}/apps/kovo-hunter/installations/new`)
   } finally {
     await server.close()
-    if (prevSlug === undefined) delete process.env.GUARDIAN_GITHUB_APP_SLUG
-    else process.env.GUARDIAN_GITHUB_APP_SLUG = prevSlug
+    if (prevSlug === undefined) delete process.env.KOVO_GITHUB_APP_SLUG
+    else process.env.KOVO_GITHUB_APP_SLUG = prevSlug
     rmSync(dataDir, { recursive: true, force: true })
   }
 })
 
 test('listAccessibleGithubRepos sets needsAppInstall=true when GitHub App token has 0 installations, and false for PATs', async () => {
   const dataDir = tempDataDir('kovo-gh-needs-inst-')
-  const prevSlug = process.env.GUARDIAN_GITHUB_APP_SLUG
-  process.env.GUARDIAN_GITHUB_APP_SLUG = 'kovo-hunter'
+  const prevSlug = process.env.KOVO_GITHUB_APP_SLUG
+  process.env.KOVO_GITHUB_APP_SLUG = 'kovo-hunter'
 
   const server = await startMockGithubServer((req, res) => {
     const url = req.url ?? '/'
@@ -356,8 +356,8 @@ test('listAccessibleGithubRepos sets needsAppInstall=true when GitHub App token 
     assert.deepEqual(patListed.repos.map(r => r.fullName), ['octo-dev/public-demo'])
   } finally {
     await server.close()
-    if (prevSlug === undefined) delete process.env.GUARDIAN_GITHUB_APP_SLUG
-    else process.env.GUARDIAN_GITHUB_APP_SLUG = prevSlug
+    if (prevSlug === undefined) delete process.env.KOVO_GITHUB_APP_SLUG
+    else process.env.KOVO_GITHUB_APP_SLUG = prevSlug
     rmSync(dataDir, { recursive: true, force: true })
   }
 })

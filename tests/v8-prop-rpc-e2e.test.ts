@@ -1,7 +1,7 @@
 /**
  * Full-Stack Loopback E2E & Adversarial Integration Suite for v8 Multi-Hop Verification.
  *
- * Defensive QA: executes real TypeScript `guardian_verify.ts` scripts through the FULL stack:
+ * Defensive QA: executes real TypeScript `kovo_verify.ts` scripts through the FULL stack:
  *   `verifyScript()` (dual fresh clean replay)
  *     -> `createLocalAttemptFactory()` (spawns real `node` candidate per attempt)
  *     -> `VerifyRpcServer` (Unix-socket RPC, DerivedCapabilityVault, host-signed transcript)
@@ -40,10 +40,10 @@ import { createLocalAttemptFactory } from '../src/server/verify-rpc.ts'
 import { verifyScript } from '../src/server/verify-runner.ts'
 import type { VerifyVerdict } from '../src/server/verify-runner.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const SDK_DIR = join(REPO_ROOT, 'worker', 'guardian_verify')
+const SDK_DIR = join(REPO_ROOT, 'worker', 'kovo_verify')
 
 // Realistic secret literals (all generic, zero benchmark identifiers)
 const DUAL_MEMBER_BEARER = 'dual_mem_base_tok_91a2b3c4d5e6f708'

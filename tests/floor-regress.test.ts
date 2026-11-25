@@ -16,7 +16,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { once } from 'node:events'
 import { test } from 'node:test'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'
@@ -391,14 +391,14 @@ test('floor: a broad LIKE baseline is ordered so a non-matching term is tried fi
   // The first (empty) baseline cannot separate a LIKE '%' match, so the next tried candidate is a
   // fresh non-matching term rather than another common character.
   assert.equal(baselines[0], '')
-  assert.match(baselines[1] ?? '', /^guardian-[a-f0-9]{8}$/)
+  assert.match(baselines[1] ?? '', /^kovo-[a-f0-9]{8}$/)
 })
 
 test('floor: the discriminating baseline confirms on the concatenating twin', async () => {
   const fx = await startSearchFixture()
   try {
     const specs = synthesizeEngineSpecs(sqliHypothesis(fx.origin, ''), sqliSignal())
-    const nonce = specs.find(spec => /^guardian-/.test(String((spec.spec as Json).baselineValue ?? '')))
+    const nonce = specs.find(spec => /^kovo-/.test(String((spec.spec as Json).baselineValue ?? '')))
     assert.ok(nonce, 'a fresh baseline candidate exists')
     const res = await verify(nonce!.spec as Json, fx.origin)
     assert.equal(res.verdict, 'confirmed', String(res.outcome.reason))
@@ -409,7 +409,7 @@ test('floor: the same boolean recipe stays unconfirmed on the parameterized twin
   const fx = await startSearchFixture({ hardened: true })
   try {
     const specs = synthesizeEngineSpecs(sqliHypothesis(fx.origin, ''), sqliSignal())
-    const nonce = specs.find(spec => /^guardian-/.test(String((spec.spec as Json).baselineValue ?? '')))
+    const nonce = specs.find(spec => /^kovo-/.test(String((spec.spec as Json).baselineValue ?? '')))
     assert.ok(nonce)
     const res = await verify(nonce!.spec as Json, fx.origin)
     assert.notEqual(res.verdict, 'confirmed', 'the hardened twin must not confirm')

@@ -1,5 +1,5 @@
 /**
- * Guardian v6 Phase 1 — store scale & data-integrity suite.
+ * Kovo Hunter v6 Phase 1 — store scale & data-integrity suite.
  *
  * Covers: WAL/NORMAL pragmas + VACUUM INTO snapshot compatibility, additive
  * `resource_samples.collection_path` migration and multi-collection integrity, bounded async
@@ -31,7 +31,7 @@ interface Fixture {
 }
 
 function makeStore(t: { after: (fn: () => void) => void }, label: string): Fixture {
-  const dir = mkdtempSync(join(tmpdir(), `guardian-v6-${label}-`))
+  const dir = mkdtempSync(join(tmpdir(), `kovo-v6-${label}-`))
   const snapshotDir = join(dir, 'snapshot')
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const store = new Store(dir)
@@ -93,7 +93,7 @@ test('v6 resource_samples collection_path migrates additively and keeps /invoice
   store.close()
 
   // Simulate a pre-v6 database: no collection_path column and the old 4-column unique index.
-  const raw = new DatabaseSync(join(dir, 'guardian.sqlite'))
+  const raw = new DatabaseSync(join(dir, 'kovo.sqlite'))
   raw.exec(`
     PRAGMA user_version = 0;
     DROP INDEX IF EXISTS resource_samples_key;
@@ -214,7 +214,7 @@ test('v6 exchange batching keeps p99 main-thread stall well below 50 ms and lose
 })
 
 test('v6 batched exchanges flush on teardown (close without an explicit flush)', t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v6-teardown-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v6-teardown-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const store = new Store(dir)
   const { id: projectId } = store.createProject({
@@ -230,7 +230,7 @@ test('v6 batched exchanges flush on teardown (close without an explicit flush)',
   store.recordExchange(exchangeInput(runId, worker.id, 1))
   store.close()
 
-  const raw = new DatabaseSync(join(dir, 'guardian.sqlite'), { readOnly: true })
+  const raw = new DatabaseSync(join(dir, 'kovo.sqlite'), { readOnly: true })
   try {
     const count = raw.prepare('SELECT count(*) AS c FROM broker_exchanges WHERE run_id = ?').get(runId) as { c: number }
     assert.equal(Number(count.c), 1)
@@ -251,8 +251,8 @@ test('v6 recover pauses runs, resets board/assignments, expires approvals and re
     origin: ORIGIN, method: 'POST', pathAndQuery: '/api/orders',
     rationale: 'State-changing probe', requestPreview: '{"id":1}', expiresInMs: -1_000,
   })
-  store.recordLabContainer({ runId, assignmentId: workerId, containerName: 'guardian-lab-live', imageName: 'lab:1' })
-  store.recordLabContainer({ runId, containerName: 'guardian-lab-orphan', status: 'orphaned' })
+  store.recordLabContainer({ runId, assignmentId: workerId, containerName: 'kovo-lab-live', imageName: 'lab:1' })
+  store.recordLabContainer({ runId, containerName: 'kovo-lab-orphan', status: 'orphaned' })
 
   // Simulate a process killed mid-run (createRun leaves the run in its pre-execution phase).
   store.updateRun(runId, { status: 'running' })

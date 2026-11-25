@@ -1,14 +1,14 @@
 /**
- * v7 agent-conversion — unit tests for Layer-3 `guardian_verify` ergonomics, route obligation
+ * v7 agent-conversion — unit tests for Layer-3 `kovo_verify` ergonomics, route obligation
  * coverage from verify transcripts/dynamic scripts, premature early-exit guard on unprobed
  * assigned routes, and semantic non-floor class prioritization.
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
-  GUARDIAN_VERIFY_HELPERS,
-  GUARDIAN_VERIFY_SPEC_SHAPE,
-  GUARDIAN_VERIFY_TOOL_DESCRIPTION,
+  KOVO_VERIFY_HELPERS,
+  KOVO_VERIFY_SPEC_SHAPE,
+  KOVO_VERIFY_TOOL_DESCRIPTION,
   SpecSubmissionTracker,
   coordinatorPlannerPrompt,
   earlyExitEligible,
@@ -23,23 +23,23 @@ import {
 } from '../src/server/graph-coordinator.ts'
 import type { CoordinatorEndpoint } from '../src/server/graph-coordinator.ts'
 
-test('guardian_verify tool description and repair directives clearly guide inline script + all 5 typed helpers', () => {
-  assert.match(GUARDIAN_VERIFY_TOOL_DESCRIPTION, /pass `script` inline/i)
-  for (const helper of GUARDIAN_VERIFY_HELPERS) {
-    assert.ok(GUARDIAN_VERIFY_TOOL_DESCRIPTION.includes(helper.name), `missing helper ${helper.name}`)
+test('kovo_verify tool description and repair directives clearly guide inline script + all 5 typed helpers', () => {
+  assert.match(KOVO_VERIFY_TOOL_DESCRIPTION, /pass `script` inline/i)
+  for (const helper of KOVO_VERIFY_HELPERS) {
+    assert.ok(KOVO_VERIFY_TOOL_DESCRIPTION.includes(helper.name), `missing helper ${helper.name}`)
   }
 
   const route = { method: 'POST', path: '/api/v1/wallets/:id/redeem', params: ['amount'], origin: 'https://app.example' }
   const reqMsg = specSubmissionRequiredMessage(route)
-  assert.match(reqMsg, /guardian_verify\(script=/)
-  assert.ok(reqMsg.includes(GUARDIAN_VERIFY_SPEC_SHAPE), 'keeps DeclarativeReplaySpec fallback contract intact')
+  assert.match(reqMsg, /kovo_verify\(script=/)
+  assert.ok(reqMsg.includes(KOVO_VERIFY_SPEC_SHAPE), 'keeps DeclarativeReplaySpec fallback contract intact')
 
   const gapMsg = gapValidationRejectedMessage([{ key: 'POST /api/v1/wallets/:id/redeem', code: 'auth_blocked', missing: 'a 401/403' }], route)
-  assert.match(gapMsg, /guardian_verify\(script=/)
-  assert.ok(gapMsg.includes(GUARDIAN_VERIFY_SPEC_SHAPE))
+  assert.match(gapMsg, /kovo_verify\(script=/)
+  assert.ok(gapMsg.includes(KOVO_VERIFY_SPEC_SHAPE))
 
-  const directive = renderSettlementSpecDirective(route, GUARDIAN_VERIFY_SPEC_SHAPE, ['auth_blocked'])
-  assert.match(directive, /guardian_verify inline script \(ctx\.prove_\*\)/i)
+  const directive = renderSettlementSpecDirective(route, KOVO_VERIFY_SPEC_SHAPE, ['auth_blocked'])
+  assert.match(directive, /kovo_verify inline script \(ctx\.prove_\*\)/i)
 })
 
 test('SpecSubmissionTracker.noteVerifyScript covers assigned/probed routes via transcript routes and dynamic template paths', () => {

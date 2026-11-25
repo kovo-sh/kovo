@@ -38,10 +38,10 @@ import { makeLabGrant, setupApprovedRun } from './v4-tier-helpers.ts'
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const executionSource = readFileSync(join(repoRoot, 'src/server/execution.ts'), 'utf8')
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 function makeStore(t: { after: (fn: () => void) => void }): Store {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v7-receipt-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v7-receipt-'))
   const storage = new Store(dir)
   t.after(() => {
     storage.close()
@@ -153,7 +153,7 @@ test('M0 receipt: persisted protected-field mutation confirms; an unchanged read
 })
 
 test('M0 receipt: an OOB callback confirms only when a cited exchange carried the delivered token', () => {
-  const token = 'guardian-canary-0123456789abcdef01234567'
+  const token = 'kovo-canary-0123456789abcdef01234567'
   const receipt = {
     vulnClass: 'ssrf',
     target: { origin: 'http://127.0.0.1:7777', method: 'POST', pathAndQuery: '/v1/integrations/webhook-test' },
@@ -239,8 +239,8 @@ test('M0 receipt: boolean differential confirms a stable paired structural chang
     browserTraceIds: [],
     claimedDelta: 'The false predicate returns an empty result set while the true predicate returns rows.',
   }
-  const controlPath = "/search?q=guardian' AND '1'='1"
-  const probePath = "/search?q=guardian' AND '1'='2"
+  const controlPath = "/search?q=kovo' AND '1'='1"
+  const probePath = "/search?q=kovo' AND '1'='2"
   const transcript: ReceiptTranscript = {
     entries: [
       entry('c1', step({ id: 'c1', arm: 'control', method: 'GET', status: 200, pathAndQuery: controlPath, json: { rows: [{ id: 1 }, { id: 2 }], message: 'ok' } })),
@@ -266,8 +266,8 @@ test('M0 receipt: boolean differential rejects one round, echo-only, nonce-only 
     browserTraceIds: [],
     claimedDelta: 'The predicates diverge.',
   }
-  const controlPath = "/search?q=guardian' AND '1'='1"
-  const probePath = "/search?q=guardian' AND '1'='2"
+  const controlPath = "/search?q=kovo' AND '1'='1"
+  const probePath = "/search?q=kovo' AND '1'='2"
   const pair = (id: string, arm: 'control' | 'probe', status: number, path: string, json: unknown) =>
     entry(id, step({ id, arm, method: 'GET', status, pathAndQuery: path, json }))
 
@@ -283,9 +283,9 @@ test('M0 receipt: boolean differential rejects one round, echo-only, nonce-only 
   const echoOnly = verifyReceipt(receipt, {
     entries: [
       pair('c1', 'control', 200, controlPath, { result: '' }),
-      pair('p1', 'probe', 200, probePath, { result: "guardian' AND '1'='2" }),
+      pair('p1', 'probe', 200, probePath, { result: "kovo' AND '1'='2" }),
       pair('c2', 'control', 200, controlPath, { result: '' }),
-      pair('p2', 'probe', 200, probePath, { result: "guardian' AND '1'='2" }),
+      pair('p2', 'probe', 200, probePath, { result: "kovo' AND '1'='2" }),
     ],
   })
   assert.equal(echoOnly.confirmed, false)
@@ -330,10 +330,10 @@ test('M0 receipt: boolean differential rejects one round, echo-only, nonce-only 
 
 test('M0 receipt: mode env is off/shadow/strict and defaults to shadow', () => {
   assert.equal(proofReceiptMode({} as NodeJS.ProcessEnv), 'shadow')
-  assert.equal(proofReceiptMode({ GUARDIAN_PROOF_RECEIPT: '0' } as NodeJS.ProcessEnv), 'off')
-  assert.equal(proofReceiptMode({ GUARDIAN_PROOF_RECEIPT: 'off' } as NodeJS.ProcessEnv), 'off')
-  assert.equal(proofReceiptMode({ GUARDIAN_PROOF_RECEIPT: 'strict' } as NodeJS.ProcessEnv), 'strict')
-  assert.equal(proofReceiptMode({ GUARDIAN_PROOF_RECEIPT: '1' } as NodeJS.ProcessEnv), 'strict')
+  assert.equal(proofReceiptMode({ KOVO_PROOF_RECEIPT: '0' } as NodeJS.ProcessEnv), 'off')
+  assert.equal(proofReceiptMode({ KOVO_PROOF_RECEIPT: 'off' } as NodeJS.ProcessEnv), 'off')
+  assert.equal(proofReceiptMode({ KOVO_PROOF_RECEIPT: 'strict' } as NodeJS.ProcessEnv), 'strict')
+  assert.equal(proofReceiptMode({ KOVO_PROOF_RECEIPT: '1' } as NodeJS.ProcessEnv), 'strict')
 })
 
 test('M0 receipt: the floor adapter builds a receipt and strict mode can only downgrade', () => {
@@ -480,8 +480,8 @@ test('M0: verifyReplaySpec and retestReplaySpec confirm through the receipt on a
   assert.equal(verified.receipt!.receipt.exchangeIds.length, 3)
 
   // Strict mode runs the same receipt as the final gate and still confirms a substantiated replay.
-  const priorMode = process.env.GUARDIAN_PROOF_RECEIPT
-  process.env.GUARDIAN_PROOF_RECEIPT = 'strict'
+  const priorMode = process.env.KOVO_PROOF_RECEIPT
+  process.env.KOVO_PROOF_RECEIPT = 'strict'
   try {
     state = { owner_id: 'u1', status: 'open' }
     const strict = await verifyReplaySpec(params)
@@ -489,8 +489,8 @@ test('M0: verifyReplaySpec and retestReplaySpec confirm through the receipt on a
     assert.equal(strict.receipt?.mode, 'strict')
     assert.equal(strict.receipt?.verification.confirmed, true)
   } finally {
-    if (priorMode === undefined) delete process.env.GUARDIAN_PROOF_RECEIPT
-    else process.env.GUARDIAN_PROOF_RECEIPT = priorMode
+    if (priorMode === undefined) delete process.env.KOVO_PROOF_RECEIPT
+    else process.env.KOVO_PROOF_RECEIPT = priorMode
   }
 
   state = { owner_id: 'u1', status: 'open' }

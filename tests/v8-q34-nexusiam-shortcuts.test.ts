@@ -10,7 +10,7 @@
 //  - NX-C3: a stale-invite session (NX-C2 terminal) got an org_a workspace delegation from the CDN and
 //    read private documents without the cross-tenant cache hop. Delegations now need a live tenant role.
 // Monitor: NX-C1 credits a member -> admin promotion too (the audit vault admits owner and admin).
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

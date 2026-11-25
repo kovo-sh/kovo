@@ -39,7 +39,7 @@ const ORIGIN_APP = 'https://app.example.test'
 const ORIGIN_OOS = 'https://outside.example.test'
 
 function tempDir(prefix: string): string {
-  return mkdtempSync(join(tmpdir(), `guardian-${prefix}-`))
+  return mkdtempSync(join(tmpdir(), `kovo-${prefix}-`))
 }
 
 function makeRunSetup(storage: Store, name = 'v8 DAG Export App') {
@@ -678,11 +678,11 @@ test('v8 Stream D: compositeReceiptsToSarifCodeFlows & buildSarifLog emit valid 
   // Verify topological order & executionOrder 1..4
   assert.deepEqual(tf.locations.map(l => l.executionOrder), [1, 2, 3, 4])
   assert.deepEqual(
-    tf.locations.map(l => l.properties?.guardian.hopId),
+    tf.locations.map(l => l.properties?.kovo.hopId),
     ['hop_1', 'hop_2', 'hop_3', 'hop_4'],
   )
   assert.deepEqual(
-    tf.locations.map(l => l.properties?.guardian.surface),
+    tf.locations.map(l => l.properties?.kovo.surface),
     ['http', 'idp', 'graphql', 'async_job'],
   )
   assert.deepEqual(
@@ -692,24 +692,24 @@ test('v8 Stream D: compositeReceiptsToSarifCodeFlows & buildSarifLog emit valid 
 
   // Verify route + surface + binding kinds in each location
   assert.match(tf.locations[0]!.location.logicalLocations?.[0]?.name ?? '', /^http:GET \/api\/v1\/preview/)
-  assert.deepEqual(tf.locations[0]!.properties?.guardian.incomingBindingKinds, [])
+  assert.deepEqual(tf.locations[0]!.properties?.kovo.incomingBindingKinds, [])
   assert.equal(tf.locations[0]!.importance, 'essential')
 
   assert.match(tf.locations[1]!.location.logicalLocations?.[0]?.name ?? '', /^idp:POST \/oauth\/token/)
-  assert.deepEqual(tf.locations[1]!.properties?.guardian.incomingBindingKinds, ['value_binding'])
+  assert.deepEqual(tf.locations[1]!.properties?.kovo.incomingBindingKinds, ['value_binding'])
   assert.ok(tf.locations[1]!.kinds?.includes('value_binding'))
   assert.equal(tf.locations[1]!.importance, 'important')
 
   assert.match(tf.locations[2]!.location.logicalLocations?.[0]?.name ?? '', /^graphql:POST \/graphql/)
-  assert.deepEqual(tf.locations[2]!.properties?.guardian.incomingBindingKinds, ['derived_crypto_binding'])
-  assert.equal(tf.locations[2]!.properties?.guardian.patchBrokeHopId, 'hop_3')
+  assert.deepEqual(tf.locations[2]!.properties?.kovo.incomingBindingKinds, ['derived_crypto_binding'])
+  assert.equal(tf.locations[2]!.properties?.kovo.patchBrokeHopId, 'hop_3')
 
   assert.match(tf.locations[3]!.location.logicalLocations?.[0]?.name ?? '', /^async_job:GET \/api\/exports\/job-99\/download/)
   assert.deepEqual(
-    tf.locations[3]!.properties?.guardian.incomingBindingKinds,
+    tf.locations[3]!.properties?.kovo.incomingBindingKinds,
     ['state_transition_binding', 'async_pivot_binding'],
   )
-  assert.equal(tf.locations[3]!.properties?.guardian.isTerminal, true)
+  assert.equal(tf.locations[3]!.properties?.kovo.isTerminal, true)
   assert.equal(tf.locations[3]!.importance, 'essential')
 
   // Zero secret or PII leakage in codeFlows
@@ -782,8 +782,8 @@ test('v8 Stream D: compositeReceiptsToSarifCodeFlows & buildSarifLog emit valid 
   assert.ok(!sarifSerialized.includes(piiSsn))
   assert.ok(!sarifSerialized.includes(rawCanary))
 
-  const chainResult = log.runs[0]!.results.find(r => r.properties.guardian.findingId === 'finding-4hop')!
-  const singleResult = log.runs[0]!.results.find(r => r.properties.guardian.findingId === 'finding-single')!
+  const chainResult = log.runs[0]!.results.find(r => r.properties.kovo.findingId === 'finding-4hop')!
+  const singleResult = log.runs[0]!.results.find(r => r.properties.kovo.findingId === 'finding-single')!
   assert.equal(chainResult.codeFlows?.length, 1)
   assert.equal(chainResult.codeFlows![0]!.threadFlows[0]!.locations.length, 4)
   assert.equal(singleResult.codeFlows, undefined, 'single-hop finding must remain 100% backward compatible without codeFlows')

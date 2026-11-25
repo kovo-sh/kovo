@@ -62,7 +62,7 @@ import { privateModelProfiles, saveModelProfile } from '../src/server/model-sett
 import type { WorkerBackend, WorkerSession } from '../src/server/worker-backend.ts'
 import { makeStore, setupApprovedRun, stopExecution, withEnv } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const ORIGIN = 'https://saas.example.invalid'
 
@@ -301,7 +301,7 @@ test('Execution computes 270s wall-clock on 15m run and 300s on 30m run for mult
 
     storage.updateRun(runId, { phase: 'investigation', status: 'running', workerConcurrency: 3, multiTrialEnabled: false })
     const engine = new Execution(storage, { backend: stubBackend(), deterministicSweep: false, maxDurationMs })
-    await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+    await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
       engine.start()
       engine.wake()
       const deadline = Date.now() + 4_000
@@ -709,7 +709,7 @@ test('isPromotableCodeAuditFact filters concrete security defects vs benign inve
 })
 
 test('runSourceFirstCodeAudit promotes explicit suspects AND cross-cutting defect facts (up to 6) into Wave-1 multi-hop chain steps with top priority', async (t) => {
-  const reposDir = mkdtempSync(join(tmpdir(), 'guardian-q25-audit-'))
+  const reposDir = mkdtempSync(join(tmpdir(), 'kovo-q25-audit-'))
   t.after(() => rmSync(reposDir, { recursive: true, force: true }))
   mkdirSync(join(reposDir, 'acme', 'services', 'api'), { recursive: true })
   writeFileSync(join(reposDir, 'acme', 'services', 'api', 'server.ts'), 'export const ok = true\n', 'utf8')
@@ -836,11 +836,11 @@ test('runSourceFirstCodeAudit promotes explicit suspects AND cross-cutting defec
   t.after(() => engine.stop())
   internals(engine).projectReposMount = () => ({ reposDir, mountedRepos: ['acme'] })
 
-  const prevStage1 = process.env.GUARDIAN_STAGE1_LLM
-  process.env.GUARDIAN_STAGE1_LLM = '0'
+  const prevStage1 = process.env.KOVO_STAGE1_LLM
+  process.env.KOVO_STAGE1_LLM = '0'
   t.after(() => {
-    if (prevStage1 === undefined) delete process.env.GUARDIAN_STAGE1_LLM
-    else process.env.GUARDIAN_STAGE1_LLM = prevStage1
+    if (prevStage1 === undefined) delete process.env.KOVO_STAGE1_LLM
+    else process.env.KOVO_STAGE1_LLM = prevStage1
   })
 
   const res = await engine.runSourceFirstCodeAudit(run, [], profiles, new AbortController().signal)

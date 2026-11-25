@@ -68,27 +68,27 @@ import {
   evaluateClaims,
   verifyScript,
 } from '../src/server/verify-rpc.ts'
-import { VerifyContext } from '../worker/guardian_verify/guardian_verify.ts'
+import { VerifyContext } from '../worker/kovo_verify/kovo_verify.ts'
 import { makeLabGrant } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
-const SDK_DIR = join(dirname(fileURLToPath(import.meta.url)), '../worker/guardian_verify')
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
+const SDK_DIR = join(dirname(fileURLToPath(import.meta.url)), '../worker/kovo_verify')
 const ORIGIN = 'https://app.example.invalid'
 
 function bindRpcEnv(server: VerifyRpcServer): () => void {
   const prev = {
-    GUARDIAN_RPC_SOCKET: process.env.GUARDIAN_RPC_SOCKET,
-    GUARDIAN_RPC_TOKEN_FILE: process.env.GUARDIAN_RPC_TOKEN_FILE,
-    GUARDIAN_RPC_CONTEXT_FILE: process.env.GUARDIAN_RPC_CONTEXT_FILE,
-    GUARDIAN_VERIFY_NONCE: process.env.GUARDIAN_VERIFY_NONCE,
-    GUARDIAN_PROOF_RESULT_FILE: process.env.GUARDIAN_PROOF_RESULT_FILE,
+    KOVO_RPC_SOCKET: process.env.KOVO_RPC_SOCKET,
+    KOVO_RPC_TOKEN_FILE: process.env.KOVO_RPC_TOKEN_FILE,
+    KOVO_RPC_CONTEXT_FILE: process.env.KOVO_RPC_CONTEXT_FILE,
+    KOVO_VERIFY_NONCE: process.env.KOVO_VERIFY_NONCE,
+    KOVO_PROOF_RESULT_FILE: process.env.KOVO_PROOF_RESULT_FILE,
   }
-  process.env.GUARDIAN_RPC_SOCKET = server.socketPath
-  process.env.GUARDIAN_RPC_TOKEN_FILE = join(server.hostDir, VERIFY_RPC_TOKEN_NAME)
-  process.env.GUARDIAN_RPC_CONTEXT_FILE = join(server.hostDir, VERIFY_RPC_CONTEXT_NAME)
-  process.env.GUARDIAN_VERIFY_NONCE = server.nonce
-  const tmpDir = mkdtempSync(join(tmpdir(), 'guardian-v7-oracles-'))
-  process.env.GUARDIAN_PROOF_RESULT_FILE = join(tmpDir, 'result.json')
+  process.env.KOVO_RPC_SOCKET = server.socketPath
+  process.env.KOVO_RPC_TOKEN_FILE = join(server.hostDir, VERIFY_RPC_TOKEN_NAME)
+  process.env.KOVO_RPC_CONTEXT_FILE = join(server.hostDir, VERIFY_RPC_CONTEXT_NAME)
+  process.env.KOVO_VERIFY_NONCE = server.nonce
+  const tmpDir = mkdtempSync(join(tmpdir(), 'kovo-v7-oracles-'))
+  process.env.KOVO_PROOF_RESULT_FILE = join(tmpDir, 'result.json')
   return () => {
     for (const [k, v] of Object.entries(prev)) {
       if (v === undefined) delete process.env[k]

@@ -212,7 +212,7 @@ test('Execution wires onProofObligation, onGapValidation, and assignedTargetRout
   storage.updateRun(runId, { phase: 'investigation', status: 'running', workerConcurrency: 1, multiTrialEnabled: false })
 
   const engine = new Execution(storage, { backend, deterministicSweep: false })
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     engine.start()
     engine.wake()
     const deadline = Date.now() + 8_000

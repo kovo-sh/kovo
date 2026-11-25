@@ -151,7 +151,7 @@ function sseResponsesPayload(text: string, toolCalls: ResponsesToolCall[] = []):
 // ============================================================================
 
 test('CanaryBroker real local HTTP listener receives callbacks, redacts sensitive headers, and shuts down cleanly', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-canary-test-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-canary-test-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -171,7 +171,7 @@ test('CanaryBroker real local HTTP listener receives callbacks, redacts sensitiv
   const synthetic = broker.mintCanary(runId, 'offline-check', appOrigin)
   assert.equal(synthetic.listenerActive, false)
   assert.equal(synthetic.synthetic, true)
-  assert.match(synthetic.token, /^guardian-canary-[a-f0-9]{24}$/)
+  assert.match(synthetic.token, /^kovo-canary-[a-f0-9]{24}$/)
   assert.equal(broker.checkCanary(synthetic.token).hit, false)
 
   // Start real local HTTP callback listener on ephemeral port
@@ -193,7 +193,7 @@ test('CanaryBroker real local HTTP listener receives callbacks, redacts sensitiv
   const callbackResp = await fetch(`${canary.httpUrl}?probe=ok`, {
     method: 'POST',
     headers: {
-      'User-Agent': 'GuardianTargetBackend/2.0',
+      'User-Agent': 'KovoTargetBackend/2.0',
       Authorization: rawBearer,
       Cookie: rawCookie,
       'X-Custom-Trace': 'trace-123',
@@ -202,7 +202,7 @@ test('CanaryBroker real local HTTP listener receives callbacks, redacts sensitiv
     signal: AbortSignal.timeout(5_000),
   })
   assert.equal(callbackResp.status, 200)
-  assert.equal(await callbackResp.text(), 'guardian-canary-ok')
+  assert.equal(await callbackResp.text(), 'kovo-canary-ok')
 
   const check = broker.checkCanary(canary.token)
   assert.equal(check.found, true)
@@ -211,7 +211,7 @@ test('CanaryBroker real local HTTP listener receives callbacks, redacts sensitiv
   assert.equal(check.hits.length, 1)
   assert.equal(check.hits[0].method, 'POST')
   assert.equal(check.hits[0].path, `/c/${canary.token}`)
-  assert.equal(check.hits[0].userAgent, 'GuardianTargetBackend/2.0')
+  assert.equal(check.hits[0].userAgent, 'KovoTargetBackend/2.0')
   assert.equal(check.hits[0].headers['x-custom-trace'], 'trace-123')
   // Sensitive headers MUST be redacted
   assert.ok(!JSON.stringify(check.hits[0].headers).includes('super-secret-canary-jwt-99999'))
@@ -427,7 +427,7 @@ test('RequestBroker.executeRaceBurst hits local TOCTOU fixture concurrently and 
 // ============================================================================
 
 test('verifyReplaySpec & retestReplaySpec verify race_burst and browser_chain specs with Zero LLM against local fixture servers', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-replay-v2-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-replay-v2-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const backend = new LinuxWorkerBackend({ workspace: { id: 'replay-v2', directory: dir } })
 
@@ -483,7 +483,7 @@ test('verifyReplaySpec & retestReplaySpec verify race_burst and browser_chain sp
 </body></html>`)
         return
       }
-      if (url.pathname.startsWith('/.guardian-nonexistent-')) {
+      if (url.pathname.startsWith('/.kovo-nonexistent-')) {
         res.writeHead(404, { 'Content-Type': 'text/plain' }).end('Not Found')
         return
       }
@@ -495,8 +495,8 @@ test('verifyReplaySpec & retestReplaySpec verify race_burst and browser_chain sp
   <script>
     window.addEventListener('message', function(ev) {
       // Deliberately missing event.origin validation
-      if (ev.data && ev.data.guardianCanary) {
-        document.getElementById('status-banner').textContent = 'PM_ACCEPTED:' + ev.data.guardianCanary;
+      if (ev.data && ev.data.kovoCanary) {
+        document.getElementById('status-banner').textContent = 'PM_ACCEPTED:' + ev.data.kovoCanary;
       }
     });
   </script>
@@ -631,7 +631,7 @@ test('verifyReplaySpec & retestReplaySpec verify race_burst and browser_chain sp
   const canaryMarkup = `<img src=x onerror="document.title='{{canary_token}}'">`
   const encodedMarkup = canaryMarkup.split('{{canary_token}}').map(encodeURIComponent).join('{{canary_token}}')
   const sinkSteps = [
-    { id: 'c', role: 'control', description: 'Render a benign query value', origin: sandpackOrigin, pathAndQuery: '/sink?q=guardian', action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 200 },
+    { id: 'c', role: 'control', description: 'Render a benign query value', origin: sandpackOrigin, pathAndQuery: '/sink?q=kovo', action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 200 },
     { id: 'p', role: 'probe', description: 'Render the canary through the innerHTML sink', origin: sandpackOrigin, pathAndQuery: `/sink?q=${encodedMarkup}`, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 400 },
   ]
   const browserSinkSpec: DeclarativeReplaySpec = declarativeReplaySpecSchema.parse({
@@ -647,11 +647,11 @@ test('verifyReplaySpec & retestReplaySpec verify race_burst and browser_chain sp
       args: {
         origin: sandpackOrigin,
         method: 'GET',
-        pathAndQuery: '/sink?q=guardian',
+        pathAndQuery: '/sink?q=kovo',
         vulnClass: 'dom_xss',
         actor: { handle: 'user_a' },
         steps: [
-          { role: 'control', action: 'navigate', pathAndQuery: '/sink?q=guardian' },
+          { role: 'control', action: 'navigate', pathAndQuery: '/sink?q=kovo' },
           { role: 'probe', action: 'navigate', pathAndQuery: `/sink?q=${encodedMarkup}` },
         ],
       },
@@ -663,7 +663,7 @@ test('verifyReplaySpec & retestReplaySpec verify race_burst and browser_chain sp
 
   // Pooled per-persona session (one Chromium, one context per persona) renders the sink page.
   const sessionVisits = await browser.runBrowserSession([
-    { id: 'sink', role: 'probe', origin: sandpackOrigin, pathAndQuery: '/sink?q=guardian', action: 'navigate', waitAfterLoadMs: 200 },
+    { id: 'sink', role: 'probe', origin: sandpackOrigin, pathAndQuery: '/sink?q=kovo', action: 'navigate', waitAfterLoadMs: 200 },
   ], tier2Grant, AbortSignal.timeout(20_000))
   assert.equal(sessionVisits[0]?.status, 200)
 
@@ -702,7 +702,7 @@ test('verifyReplaySpec & retestReplaySpec verify race_burst and browser_chain sp
 // ============================================================================
 
 test('Source-First Code Audit reads mounted /repos via derive_evidence, records code_audit_suspect facts, queues targeted chain_steps, and skips gracefully when no repos are mounted', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-code-audit-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-code-audit-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -857,7 +857,7 @@ test('Source-First Code Audit reads mounted /repos via derive_evidence, records 
 // ============================================================================
 
 test('Header hygiene noise collapse, (origin, cwe) chain dedup, 80/20 crown-jewel budgeting, BOLA queue, and defensive playbooks', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-rollup-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-rollup-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())

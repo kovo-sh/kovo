@@ -51,7 +51,7 @@ function internals(execution: Execution): Record<string, any> {
 }
 
 function makeStorage(t: { after(fn: () => void): void }): Store {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v6-delete-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v6-delete-'))
   const storage = new Store(dir)
   t.after(() => {
     try { storage.close() } catch { /* already closed */ }
@@ -388,9 +388,9 @@ test('v6 delete: finalization drains pending OOB before writeReport()', async t 
 
 test('v6 delete: OOB drain grace is bounded and configurable', () => {
   assert.equal(resolveOobDrainMs({} as NodeJS.ProcessEnv), 45_000)
-  assert.equal(resolveOobDrainMs({ GUARDIAN_OOB_DRAIN_MS: '1500' } as NodeJS.ProcessEnv), 1_500)
-  assert.equal(resolveOobDrainMs({ GUARDIAN_OOB_DRAIN_MS: 'nope' } as NodeJS.ProcessEnv), 45_000)
-  assert.equal(resolveOobDrainMs({ GUARDIAN_OOB_DRAIN_MS: '999999999' } as NodeJS.ProcessEnv), 600_000)
+  assert.equal(resolveOobDrainMs({ KOVO_OOB_DRAIN_MS: '1500' } as NodeJS.ProcessEnv), 1_500)
+  assert.equal(resolveOobDrainMs({ KOVO_OOB_DRAIN_MS: 'nope' } as NodeJS.ProcessEnv), 45_000)
+  assert.equal(resolveOobDrainMs({ KOVO_OOB_DRAIN_MS: '999999999' } as NodeJS.ProcessEnv), 600_000)
 })
 
 // ---------------------------------------------------------------------------

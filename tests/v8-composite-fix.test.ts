@@ -36,10 +36,10 @@ import {
   verifyScript,
 } from '../src/server/verify-rpc.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
-const SDK_DIR = join(REPO_ROOT, 'worker', 'guardian_verify')
+const SDK_DIR = join(REPO_ROOT, 'worker', 'kovo_verify')
 const SIGNING_KEY = 'unit-test-composite-fix-key'
 
 function makePersona(handle: string, roleLabel: string, token: string, origin: string): ResolvedPersona {

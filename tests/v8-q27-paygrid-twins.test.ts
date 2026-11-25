@@ -3,7 +3,7 @@
 //     job, and the tenantless cache let non-members create foreign exports).
 //  2. Unauthenticated / foreign PAT revocation (plus the sibling invite admin routes on idp).
 // Each case also pins that the intended PG-C3 5-hop chain stays solvable in vulnerable mode.
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

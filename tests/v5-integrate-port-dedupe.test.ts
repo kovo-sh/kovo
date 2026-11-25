@@ -164,7 +164,7 @@ describe('structural dedupe key', () => {
 
 describe('store chain dedupe', () => {
   test('distinct fingerprints stay distinct rows; origin-wide classes still collapse', t => {
-    const dir = mkdtempSync(join(tmpdir(), 'guardian-integrate-dedupe-'))
+    const dir = mkdtempSync(join(tmpdir(), 'kovo-integrate-dedupe-'))
     t.after(() => rmSync(dir, { recursive: true, force: true }))
     const storage = new Store(dir)
     t.after(() => storage.close())

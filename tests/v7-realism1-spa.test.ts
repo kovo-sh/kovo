@@ -25,7 +25,7 @@ import { createProjectPersona, personaSecrets, resolveRunPersonas } from '../src
 import { ScopedBrowser, personaSessionBundle } from '../src/server/scoped-browser.ts'
 import { Store } from '../src/server/store.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 function normalizeOrigin(value: string): string {
   try { return new URL(value).origin } catch { return value.replace(/\/+$/, '') }
@@ -45,7 +45,7 @@ interface SpaSetup {
 }
 
 async function setupSpa(t: { after: (fn: () => Promise<void> | void) => void }): Promise<SpaSetup> {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v7-spa-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v7-spa-'))
   const storage = new Store(dir)
   const fixture = await startEnterpriseSpa()
   const broker = new RequestBroker({ storage })

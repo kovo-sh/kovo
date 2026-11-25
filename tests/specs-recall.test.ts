@@ -1,4 +1,4 @@
-process.env.GUARDIAN_ALLOW_LOCAL_LAB ??= '1'
+process.env.KOVO_ALLOW_LOCAL_LAB ??= '1'
 /**
  * Spec-shape recall: the five product floor targets that were lost to spec/gate interplay, not to
  * discovery. Each case drives the real deterministic engine's hypothesis + spec synthesis, then
@@ -15,7 +15,7 @@ import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { test } from 'node:test'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'

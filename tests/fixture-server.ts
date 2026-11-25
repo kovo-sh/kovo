@@ -106,7 +106,7 @@ export async function fixtureServer(options: {
       response.end()
       return
     }
-    const target = request.headers['x-guardian-fixture-target']
+    const target = request.headers['x-kovo-fixture-target']
     if (typeof target !== 'string') {
       response.writeHead(400).end('Expected a synthetic target')
       return

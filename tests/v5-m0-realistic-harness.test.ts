@@ -45,7 +45,7 @@ test('CLI: defaults are local-lab safe and deterministic', () => {
   assert.equal(args.concurrency, 1)
   assert.equal(args.noLlm, false)
   assert.equal(args.verifier, 'auto')
-  assert.match(args.outDir, /\.guardian\/realistic-bench$/)
+  assert.match(args.outDir, /\.kovo\/realistic-bench$/)
 })
 
 test('CLI: app, seed sweep, mode, budget, duration and out-dir parse', () => {
@@ -76,13 +76,13 @@ test('CLI: --app all expands to all three apps and dedupes seeds', () => {
   ])
 })
 
-test('CLI: GUARDIAN_DATA_DIR is the default data dir and --allow-inert-workers parses', () => {
-  const args = parseRealisticArgs(['--allow-inert-workers'], { GUARDIAN_DATA_DIR: '/tmp/guardian-data' })
-  assert.equal(args.dataDir, '/tmp/guardian-data')
+test('CLI: KOVO_DATA_DIR is the default data dir and --allow-inert-workers parses', () => {
+  const args = parseRealisticArgs(['--allow-inert-workers'], { KOVO_DATA_DIR: '/tmp/kovo-data' })
+  assert.equal(args.dataDir, '/tmp/kovo-data')
   assert.equal(args.allowInertWorkers, true)
   assert.equal(args.isolateDataDir, false)
   assert.equal(args.keepDataDirs, false)
-  const override = parseRealisticArgs(['--data-dir', '/tmp/explicit'], { GUARDIAN_DATA_DIR: '/tmp/guardian-data' })
+  const override = parseRealisticArgs(['--data-dir', '/tmp/explicit'], { KOVO_DATA_DIR: '/tmp/kovo-data' })
   assert.equal(override.dataDir, '/tmp/explicit')
   assert.equal(override.allowInertWorkers, false)
   const isolation = parseRealisticArgs(['--isolate-data-dir', '--keep-data-dirs'], {})
@@ -91,13 +91,13 @@ test('CLI: GUARDIAN_DATA_DIR is the default data dir and --allow-inert-workers p
 })
 
 test('CLI: held-out requires salt and a held-out seed range', () => {
-  assert.throws(() => parseRealisticArgs(['--held-out', '--seed', '1000001'], {}), /GUARDIAN_RB_HELDOUT_SALT/)
+  assert.throws(() => parseRealisticArgs(['--held-out', '--seed', '1000001'], {}), /KOVO_RB_HELDOUT_SALT/)
   assert.throws(
-    () => parseRealisticArgs(['--held-out', '--seed', '10'], { GUARDIAN_RB_HELDOUT_SALT: 'x'.repeat(16) }),
+    () => parseRealisticArgs(['--held-out', '--seed', '10'], { KOVO_RB_HELDOUT_SALT: 'x'.repeat(16) }),
     />= 1000000/,
   )
   assert.throws(() => parseRealisticArgs(['--seed', '1000001'], {}), /add --held-out/)
-  const ok = parseRealisticArgs(['--held-out', '--seed', '1000001'], { GUARDIAN_RB_HELDOUT_SALT: 'x'.repeat(16) })
+  const ok = parseRealisticArgs(['--held-out', '--seed', '1000001'], { KOVO_RB_HELDOUT_SALT: 'x'.repeat(16) })
   assert.equal(ok.heldOut, true)
   assert.deepEqual(ok.seeds, [1_000_001])
 })
@@ -116,9 +116,9 @@ test('CLI: --help exits 0 and prints the usage contract', async () => {
     cwd: repoRoot,
     env: { ...process.env },
   })
-  assert.match(stdout, /Guardian realistic-bench \(real Execution loop\)/)
+  assert.match(stdout, /Kovo(?: Hunter)? realistic-bench \(real Execution loop\)/)
   assert.match(stdout, /benchmark_runs row/)
-  assert.match(stdout, /GUARDIAN_RB_HELDOUT_SALT/)
+  assert.match(stdout, /KOVO_RB_HELDOUT_SALT/)
 })
 
 // ---------------------------------------------------------------------------------------------
@@ -212,7 +212,7 @@ test('mapping: login route preference avoids legacy surfaces', () => {
 })
 
 // ---------------------------------------------------------------------------------------------
-// Finding translation (persisted Guardian rows -> grader schema)
+// Finding translation (persisted Kovo Hunter rows -> grader schema)
 // ---------------------------------------------------------------------------------------------
 
 function finding(overrides: Partial<Finding> & { id: string }): Finding {
@@ -599,7 +599,7 @@ test('isolation: defaults on for parallel cells with a source data dir', () => {
   assert.equal(shouldIsolateDataDir({ ...base, dataDir: undefined, concurrency: 3 }), false)
 })
 function makeSourceDataDir(): { dir: string; credentialId: string; workspaceId: string; keep: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-iso-source-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-iso-source-'))
   const storage = new Store(dir)
   const credentialId = randomUUID()
   const workspaceId = storage.workspace.id
@@ -630,7 +630,7 @@ function walkFilesNoFollow(dir: string): string[] {
 }
 
 test('isolation: two cell Stores run concurrently, profile visible, credentials symlinked, no key in out-dir', async () => {  const source = makeSourceDataDir()
-  const outDir = mkdtempSync(join(tmpdir(), 'guardian-iso-out-'))
+  const outDir = mkdtempSync(join(tmpdir(), 'kovo-iso-out-'))
   try {
     const targetA = join(outDir, 'data', 'acme-saas-seed1-grey-box')
     const targetB = join(outDir, 'data', 'shopflow-seed1-grey-box')
@@ -642,7 +642,7 @@ test('isolation: two cell Stores run concurrently, profile visible, credentials 
     assert.deepEqual(b.profileNames, ['Isolated Test Profile'])
     assert.notEqual(a.directory, b.directory)
 
-    // Both Stores open at the same time: no "Another Guardian server" collision.
+    // Both Stores open at the same time: no "Another Kovo Hunter server" collision.
     const storeA = openCellStore(a.directory)
     const storeB = openCellStore(b.directory)
     try {
@@ -678,7 +678,7 @@ test('isolation: two cell Stores run concurrently, profile visible, credentials 
 })
 
 test('isolation: a locked data dir suggests --isolate-data-dir with exit code 2', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-iso-lock-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-iso-lock-'))
   const first = new Store(dir)
   try {
     let caught: unknown
@@ -693,8 +693,8 @@ test('isolation: a locked data dir suggests --isolate-data-dir with exit code 2'
 })
 
 test('isolation: missing source profile fails before creating a run', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-iso-empty-'))
-  const outDir = mkdtempSync(join(tmpdir(), 'guardian-iso-empty-out-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-iso-empty-'))
+  const outDir = mkdtempSync(join(tmpdir(), 'kovo-iso-empty-out-'))
   try {
     const storage = new Store(dir)
     storage.close()
@@ -722,19 +722,19 @@ test('shutdown: stopEngine aborts promptly and reports zero busy tasks', async (
 })
 
 test('smoke: a single-cell CLI run against a fake data dir refuses without local-lab consent', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m0-test-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m0-test-'))
   try {
     const result = await execFileAsync(process.execPath, [
       'scripts/benchmark-realistic.ts', '--app', 'acme-saas', '--seed', '1',
       '--mode', 'grey-box', '--out-dir', dir,
     ], {
       cwd: repoRoot,
-      env: { ...process.env, GUARDIAN_ALLOW_LOCAL_LAB: '' },
+      env: { ...process.env, KOVO_ALLOW_LOCAL_LAB: '' },
     }).then(() => ({ code: 0, stderr: '' }), (error: { code?: number; stderr?: string }) => ({
       code: error.code ?? 1, stderr: String(error.stderr ?? ''),
     }))
     assert.notEqual(result.code, 0)
-    assert.match(result.stderr, /GUARDIAN_ALLOW_LOCAL_LAB/)
+    assert.match(result.stderr, /KOVO_ALLOW_LOCAL_LAB/)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

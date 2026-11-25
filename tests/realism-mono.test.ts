@@ -40,7 +40,7 @@ import type { EndpointRow } from '../src/server/store.ts'
 import { Store } from '../src/server/store.ts'
 import { makeLabGrant, setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const FIXTURE = 'monorepo-whitebox'
 const ORIGIN = 'http://127.0.0.1:9'
@@ -73,7 +73,7 @@ describe('realism #4 monorepo: briefing -> declared surface -> AST reachability'
 
   before(async () => {
     fixture = await start({ keepSource: true })
-    tempRoot = mkdtempSync(join(tmpdir(), 'guardian-realism-mono-'))
+    tempRoot = mkdtempSync(join(tmpdir(), 'kovo-realism-mono-'))
     // Mirror the harness white-box mount: <reposDir>/bench/monorepo-whitebox.
     repoRoot = join(tempRoot, 'bench', FIXTURE)
     mkdirSync(join(repoRoot, '..'), { recursive: true })

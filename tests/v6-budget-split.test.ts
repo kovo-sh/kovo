@@ -32,7 +32,7 @@ import {
 import type { ChainStep, Run } from '../src/server/store.ts'
 import { makeStore, setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 type PhaseInternals = {
   beginFloorRequestPhase: (run: Run) => { floorBudget: number; agentBudget: number } | null
@@ -101,16 +101,16 @@ test('budget split: explicit flags and env override the scaled defaults', () => 
   ], {}), /either --budget-requests or --total-request-budget/)
 
   const env = parseRealisticArgs([], {
-    GUARDIAN_FLOOR_REQUEST_BUDGET: '700',
-    GUARDIAN_AGENT_REQUEST_BUDGET: '2100',
-    GUARDIAN_TOTAL_REQUEST_BUDGET: '3000',
+    KOVO_FLOOR_REQUEST_BUDGET: '700',
+    KOVO_AGENT_REQUEST_BUDGET: '2100',
+    KOVO_TOTAL_REQUEST_BUDGET: '3000',
   })
   assert.equal(env.floorRequestBudget, 700)
   assert.equal(env.agentRequestBudget, 2_100)
   assert.equal(env.totalRequestBudget, 3_000)
 
   const flagWins = parseRealisticArgs(['--agent-request-budget', '1500'], {
-    GUARDIAN_AGENT_REQUEST_BUDGET: '2100',
+    KOVO_AGENT_REQUEST_BUDGET: '2100',
   })
   assert.equal(flagWins.agentRequestBudget, 1_500)
 })
@@ -119,8 +119,8 @@ test('budget split: --max-rps plumbs a hard rate cap (flag > env > default)', ()
   assert.equal(DEFAULT_MAX_RPS, 50)
   assert.equal(parseRealisticArgs([], {}).maxRps, 50)
   assert.equal(parseRealisticArgs(['--max-rps', '40'], {}).maxRps, 40)
-  assert.equal(parseRealisticArgs([], { GUARDIAN_MAX_RPS: '35' }).maxRps, 35)
-  assert.equal(parseRealisticArgs(['--max-rps', '20'], { GUARDIAN_MAX_RPS: '35' }).maxRps, 20)
+  assert.equal(parseRealisticArgs([], { KOVO_MAX_RPS: '35' }).maxRps, 35)
+  assert.equal(parseRealisticArgs(['--max-rps', '20'], { KOVO_MAX_RPS: '35' }).maxRps, 20)
   assert.throws(() => parseRealisticArgs(['--max-rps', '0'], {}), /--max-rps/)
   assert.throws(() => parseRealisticArgs(['--max-rps', '500'], {}), /--max-rps/)
 })
@@ -137,7 +137,7 @@ test('budget split: invalid values fail fast', () => {
   assert.throws(() => parseRealisticArgs(['--agent-request-budget', '-1'], {}), /--agent-request-budget/)
   assert.throws(() => parseRealisticArgs(['--budget-requests', 'nope'], {}), /--budget-requests/)
   assert.throws(
-    () => parseRealisticArgs([], { GUARDIAN_TOTAL_REQUEST_BUDGET: 'nope' }),
+    () => parseRealisticArgs([], { KOVO_TOTAL_REQUEST_BUDGET: 'nope' }),
     /--budget-requests/,
   )
 })
@@ -149,7 +149,7 @@ test('budget split: engine resolver is opt-in (legacy path stays off without opt
     { floor: 10, agent: 20 },
   )
   assert.deepEqual(
-    resolvePhaseRequestBudgets({}, { GUARDIAN_AGENT_REQUEST_BUDGET: '25' }),
+    resolvePhaseRequestBudgets({}, { KOVO_AGENT_REQUEST_BUDGET: '25' }),
     { floor: DEFAULT_FLOOR_REQUEST_BUDGET, agent: 25 },
     'a single configured phase fills the other with its default',
   )

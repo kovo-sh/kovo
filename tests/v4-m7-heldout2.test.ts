@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { normalizeEndpointTemplate } from '../src/server/dedupe.ts'
 import { harvestJsRequestParams, harvestJsRouteTable, harvestRouteMapDocument } from '../src/server/phase0-recon.ts'
@@ -177,7 +177,7 @@ describe('M7 held-out2: value synthesis and spec encoding', () => {
   test('sibling values are format-aware and prefer observed identifiers', () => {
     const corpusEnv = env({ corpus: { all: 'href="/app/projects/p_acme_1/activity"', json: [{ role: 'member' }] } })
     assert.equal(siblingValue('projectId', corpusEnv), 'p_acme_1')
-    assert.equal(siblingValue('email', corpusEnv), 'guardian@example.test')
+    assert.equal(siblingValue('email', corpusEnv), 'kovo@example.test')
     assert.equal(siblingValue('qty', corpusEnv), 1)
     assert.equal(siblingValue('marketingOptIn', corpusEnv), true)
     assert.equal(siblingValue('role', corpusEnv), 'member')
@@ -254,7 +254,7 @@ describe('M7 held-out2: ambiguous patch attribution', () => {
   }
 
   test('ambiguous findings are excluded from patch fixed/regressed evidence', async () => {
-    const summary: PatchVerificationSummary = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
+    const summary: PatchVerificationSummary = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => verifyPatchesLive({
       manifest, hooks, patchTimeoutMs: 2_000, baseline: { findings },
     }))
     const ambiguous = summary.perPatch.find(p => p.id === 'hos-09')

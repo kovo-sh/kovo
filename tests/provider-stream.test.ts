@@ -174,7 +174,7 @@ function messagesTurn() {
 
 for (const protocol of ['responses', 'messages'] as const) {
   test(`keeps split ${protocol} API keys and persona secrets out of recorded turns and Pi Durable sessions`, async t => {
-    const directory = await mkdtemp(join(tmpdir(), 'guardian-provider-redaction-'))
+    const directory = await mkdtemp(join(tmpdir(), 'kovo-provider-redaction-'))
     const server = createServer((request, response) => {
       request.resume()
       response.writeHead(200, { 'Content-Type': 'text/event-stream' })
@@ -256,7 +256,7 @@ test('enforces v2 16 MiB default stream limit and rejects invalid or oversized d
   // Custom low responseLimit enforces byte cap without leaking contents
   await assert.rejects(
     new Response(sanitizeProviderStream(chunks('x'.repeat(8 * 1024 + 1), 1024), key, 'responses', { responseLimit: 8 * 1024 })).text(),
-    /response exceeded Guardian’s size limit/,
+    /response exceeded Kovo(?: Hunter)?’s size limit/,
   )
 })
 
@@ -273,7 +273,7 @@ test('classifies 429 quota exhaustion as 402 hard failure vs transient RPM rate 
 })
 
 test('multi-profile LLM failover pool handles 429->402 quota circuit breaking, context filtering, and safe-window failover', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'guardian-failover-pool-'))
+  const directory = await mkdtemp(join(tmpdir(), 'kovo-failover-pool-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
   const storage = new Store(directory)
   t.after(() => storage.close())
@@ -444,7 +444,7 @@ test('cached input token pricing and editing a profile without re-entering API k
   assert.deepEqual(mUsage, { inputTokens: 1_000_000, cachedInputTokens: 800_000, outputTokens: 100_000 })
 
   // 3. Editing an existing profile with blank key preserves the stored 0600 credential & skips redundant check
-  const directory = await mkdtemp(join(tmpdir(), 'guardian-model-edit-'))
+  const directory = await mkdtemp(join(tmpdir(), 'kovo-model-edit-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
   const storage = new Store(directory)
   t.after(() => storage.close())

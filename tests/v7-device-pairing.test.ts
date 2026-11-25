@@ -6,7 +6,7 @@ import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { createGuardianLocalServer } from '../scripts/serve.ts'
+import { createKovoLocalServer } from '../scripts/serve.ts'
 
 async function availablePort(): Promise<number> {
   const probe = createServer().listen(0, '127.0.0.1')
@@ -23,11 +23,11 @@ async function startLocalServer(
 ) {
   const port = await availablePort()
   let appFetches = 0
-  const local = createGuardianLocalServer({
+  const local = createKovoLocalServer({
     app: {
       fetch: async () => {
         appFetches += 1
-        return new Response('<html><body>guardian app</body></html>', {
+        return new Response('<html><body>kovo app</body></html>', {
           headers: { 'content-type': 'text/html; charset=utf-8' },
         })
       },
@@ -55,7 +55,7 @@ async function bootstrapSession(origin: string, secret: string): Promise<string>
   assert.equal(res.status, 303)
   const setCookie = res.headers.get('set-cookie') ?? ''
   const cookie = setCookie.split(';')[0]
-  assert.match(cookie, /^guardian_local=[a-f0-9]{64}$/)
+  assert.match(cookie, /^kovo_local=[a-f0-9]{64}$/)
   return cookie
 }
 
@@ -81,13 +81,13 @@ async function rawRequest(
   })
 }
 
-test('unauthenticated POST /_guardian/auth/* is rejected with 401 and origin mismatch is rejected with 403', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-device-pairing-unauth-'))
+test('unauthenticated POST /_kovo/auth/* is rejected with 401 and origin mismatch is rejected with 403', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-device-pairing-unauth-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const app = await startLocalServer(dir)
   t.after(() => app.close())
 
-  for (const endpoint of ['/_guardian/auth/pairing-link', '/_guardian/auth/rotate-session']) {
+  for (const endpoint of ['/_kovo/auth/pairing-link', '/_kovo/auth/rotate-session']) {
     const unauth = await fetch(`${app.origin}${endpoint}`, {
       method: 'POST',
       headers: { Origin: app.origin },
@@ -98,7 +98,7 @@ test('unauthenticated POST /_guardian/auth/* is rejected with 401 and origin mis
 
     const badCookie = await fetch(`${app.origin}${endpoint}`, {
       method: 'POST',
-      headers: { Origin: app.origin, Cookie: `guardian_local=${'0'.repeat(64)}` },
+      headers: { Origin: app.origin, Cookie: `kovo_local=${'0'.repeat(64)}` },
     })
     assert.equal(badCookie.status, 401)
     assert.equal(badCookie.headers.get('set-cookie'), null)
@@ -106,7 +106,7 @@ test('unauthenticated POST /_guardian/auth/* is rejected with 401 and origin mis
 
   // Authenticated caller still requires exact matching Origin header
   const cookie = await bootstrapSession(app.origin, app.local.bootstrapSecret)
-  for (const endpoint of ['/_guardian/auth/pairing-link', '/_guardian/auth/rotate-session']) {
+  for (const endpoint of ['/_kovo/auth/pairing-link', '/_kovo/auth/rotate-session']) {
     const missingOrigin = await fetch(`${app.origin}${endpoint}`, {
       method: 'POST',
       headers: { Cookie: cookie },
@@ -130,7 +130,7 @@ test('unauthenticated POST /_guardian/auth/* is rejected with 401 and origin mis
 })
 
 test('authenticated mint returns a single-use pairing link consumed by a second browser and rejected on replay', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-device-pairing-mint-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-device-pairing-mint-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   let nowMs = 1_770_000_000_000
   const app = await startLocalServer(dir, { now: () => nowMs })
@@ -143,7 +143,7 @@ test('authenticated mint returns a single-use pairing link consumed by a second 
   assert.equal(replayStartup.status, 401)
 
   // Browser 1 mints an ephemeral pairing link
-  const mintRes = await fetch(`${app.origin}/_guardian/auth/pairing-link`, {
+  const mintRes = await fetch(`${app.origin}/_kovo/auth/pairing-link`, {
     method: 'POST',
     headers: { Origin: app.origin, Cookie: browser1Cookie },
   })
@@ -163,14 +163,14 @@ test('authenticated mint returns a single-use pairing link consumed by a second 
   assert.equal(exchange.status, 303)
   assert.equal(exchange.headers.get('location'), '/')
   const setCookie2 = exchange.headers.get('set-cookie') ?? ''
-  assert.match(setCookie2, /^guardian_local=[a-f0-9]{64}; Path=\/; HttpOnly; SameSite=Strict/)
+  assert.match(setCookie2, /^kovo_local=[a-f0-9]{64}; Path=\/; HttpOnly; SameSite=Strict/)
   const browser2Cookie = setCookie2.split(';')[0]
   assert.equal(browser2Cookie, browser1Cookie)
 
   // Browser 2 can now access the app
   const page = await fetch(`${app.origin}/`, { headers: { Cookie: browser2Cookie } })
   assert.equal(page.status, 200)
-  assert.match(await page.text(), /guardian app/)
+  assert.match(await page.text(), /kovo app/)
   assert.equal(app.appFetches(), 1)
 
   // Replaying the same pairing link a second time must fail with 401
@@ -180,7 +180,7 @@ test('authenticated mint returns a single-use pairing link consumed by a second 
 })
 
 test('expired pairing tokens are rejected with 401 and active token cap evicts the oldest token beyond 10', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-device-pairing-expiry-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-device-pairing-expiry-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   let nowMs = 1_770_000_000_000
   const app = await startLocalServer(dir, { now: () => nowMs })
@@ -189,7 +189,7 @@ test('expired pairing tokens are rejected with 401 and active token cap evicts t
   const cookie = await bootstrapSession(app.origin, app.local.bootstrapSecret)
 
   // Mint token that will expire after 5 minutes
-  const expMint = await fetch(`${app.origin}/_guardian/auth/pairing-link`, {
+  const expMint = await fetch(`${app.origin}/_kovo/auth/pairing-link`, {
     method: 'POST',
     headers: { Origin: app.origin, Cookie: cookie },
   })
@@ -206,7 +206,7 @@ test('expired pairing tokens are rejected with 401 and active token cap evicts t
   const urls: string[] = []
   for (let i = 0; i < 11; i += 1) {
     nowMs += 100
-    const res = await fetch(`${app.origin}/_guardian/auth/pairing-link`, {
+    const res = await fetch(`${app.origin}/_kovo/auth/pairing-link`, {
       method: 'POST',
       headers: { Origin: app.origin, Cookie: cookie },
     })
@@ -225,7 +225,7 @@ test('expired pairing tokens are rejected with 401 and active token cap evicts t
 })
 
 test('rotate-session atomically rotates local-session (0600), clears pending links, invalidates old cookies, and keeps caller signed in', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-device-pairing-rotate-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-device-pairing-rotate-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const app = await startLocalServer(dir)
   t.after(() => app.close())
@@ -234,7 +234,7 @@ test('rotate-session atomically rotates local-session (0600), clears pending lin
   const callerCookie = await bootstrapSession(app.origin, app.local.bootstrapSecret)
 
   // Pair a second browser AND leave a third pending pairing link unused
-  const mintA = await fetch(`${app.origin}/_guardian/auth/pairing-link`, {
+  const mintA = await fetch(`${app.origin}/_kovo/auth/pairing-link`, {
     method: 'POST',
     headers: { Origin: app.origin, Cookie: callerCookie },
   })
@@ -243,14 +243,14 @@ test('rotate-session atomically rotates local-session (0600), clears pending lin
   assert.equal(pairResA.status, 303)
   const otherDeviceCookie = (pairResA.headers.get('set-cookie') ?? '').split(';')[0]
 
-  const mintPending = await fetch(`${app.origin}/_guardian/auth/pairing-link`, {
+  const mintPending = await fetch(`${app.origin}/_kovo/auth/pairing-link`, {
     method: 'POST',
     headers: { Origin: app.origin, Cookie: callerCookie },
   })
   const { url: pendingUrl } = await mintPending.json() as { url: string }
 
   // Caller rotates the session
-  const rotateRes = await fetch(`${app.origin}/_guardian/auth/rotate-session`, {
+  const rotateRes = await fetch(`${app.origin}/_kovo/auth/rotate-session`, {
     method: 'POST',
     headers: { Origin: app.origin, Cookie: callerCookie },
   })
@@ -259,7 +259,7 @@ test('rotate-session atomically rotates local-session (0600), clears pending lin
   assert.deepEqual(await rotateRes.json(), { rotated: true })
 
   const freshSetCookie = rotateRes.headers.get('set-cookie') ?? ''
-  assert.match(freshSetCookie, /^guardian_local=[a-f0-9]{64}; Path=\/; HttpOnly; SameSite=Strict/)
+  assert.match(freshSetCookie, /^kovo_local=[a-f0-9]{64}; Path=\/; HttpOnly; SameSite=Strict/)
   const freshCookie = freshSetCookie.split(';')[0]
   assert.notEqual(freshCookie, callerCookie, 'Rotated cookie must contain a brand-new session token')
 
@@ -269,7 +269,7 @@ test('rotate-session atomically rotates local-session (0600), clears pending lin
   assert.match(onDisk, /^[a-f0-9]{64}$/)
   assert.notEqual(onDisk, originalToken)
   assert.equal(onDisk, app.local.token)
-  assert.equal(freshCookie, `guardian_local=${onDisk}`)
+  assert.equal(freshCookie, `kovo_local=${onDisk}`)
   assert.equal(statSync(sessionFile).mode & 0o077, 0, 'Rotated local-session must stay mode 0600')
   assert.equal(readdirSync(dir).some(f => f.endsWith('.tmp')), false, 'No temp files should remain after atomic rename')
 
@@ -280,7 +280,7 @@ test('rotate-session atomically rotates local-session (0600), clears pending lin
   // Other device with old cookie is immediately signed out (401)
   const otherBlocked = await fetch(`${app.origin}/`, { headers: { Cookie: otherDeviceCookie } })
   assert.equal(otherBlocked.status, 401)
-  const otherApiBlocked = await fetch(`${app.origin}/_guardian/auth/pairing-link`, {
+  const otherApiBlocked = await fetch(`${app.origin}/_kovo/auth/pairing-link`, {
     method: 'POST',
     headers: { Origin: app.origin, Cookie: otherDeviceCookie },
   })
@@ -293,9 +293,9 @@ test('rotate-session atomically rotates local-session (0600), clears pending lin
 })
 
 test('HTTPS publicOrigin mints HTTPS pairing links and sets Secure cookies on exchange and rotation', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-device-pairing-https-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-device-pairing-https-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const publicOrigin = 'https://guardian.local.example'
+  const publicOrigin = 'https://kovo.local.example'
   const app = await startLocalServer(dir, { publicOrigin })
   t.after(() => app.close())
 
@@ -303,7 +303,7 @@ test('HTTPS publicOrigin mints HTTPS pairing links and sets Secure cookies on ex
   const boot = await rawRequest(app.port, {
     method: 'GET',
     path: `/?bootstrap=${app.local.bootstrapSecret}`,
-    headers: { Host: 'guardian.local.example' },
+    headers: { Host: 'kovo.local.example' },
   })
   assert.equal(boot.status, 303)
   const bootCookieHeader = String(boot.headers['set-cookie'] ?? '')
@@ -313,8 +313,8 @@ test('HTTPS publicOrigin mints HTTPS pairing links and sets Secure cookies on ex
   // Mint via HTTPS origin
   const mint = await rawRequest(app.port, {
     method: 'POST',
-    path: '/_guardian/auth/pairing-link',
-    headers: { Host: 'guardian.local.example', Origin: publicOrigin, Cookie: cookie },
+    path: '/_kovo/auth/pairing-link',
+    headers: { Host: 'kovo.local.example', Origin: publicOrigin, Cookie: cookie },
   })
   assert.equal(mint.status, 200)
   const minted = JSON.parse(mint.body) as { url: string }
@@ -323,8 +323,8 @@ test('HTTPS publicOrigin mints HTTPS pairing links and sets Secure cookies on ex
   // Rotate via HTTPS origin sets Secure cookie
   const rot = await rawRequest(app.port, {
     method: 'POST',
-    path: '/_guardian/auth/rotate-session',
-    headers: { Host: 'guardian.local.example', Origin: publicOrigin, Cookie: cookie },
+    path: '/_kovo/auth/rotate-session',
+    headers: { Host: 'kovo.local.example', Origin: publicOrigin, Cookie: cookie },
   })
   assert.equal(rot.status, 200)
   assert.match(String(rot.headers['set-cookie'] ?? ''), /; Secure$/)

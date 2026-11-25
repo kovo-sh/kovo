@@ -71,12 +71,12 @@ test('M5-1 compose & service sanitizer rejects unsafe directives, >6 services, a
   assert.equal(parsedOk[0].name, 'app')
   assert.deepEqual(parsedOk[1].command, ['node', '/app/sidecar.js'])
 
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m5-san-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m5-san-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const runner = new LabRunner()
   t.after(() => runner.stopAll())
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const tooMany = Array.from({ length: 7 }, (_, i) => ({ name: `svc_${i}`, image: 'node:24-bookworm-slim' }))
     await assert.rejects(
       runner.startLabTarget({ runId: randomUUID(), environment: 'local-lab', repoDir: dir, labConfig: { enabled: true, services: tooMany } }),
@@ -91,13 +91,13 @@ test('M5-1 compose & service sanitizer rejects unsafe directives, >6 services, a
     }
   })
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: undefined }, () => {
-    assert.throws(() => assertLocalLabAllowed('local-lab'), /GUARDIAN_ALLOW_LOCAL_LAB/)
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: undefined }, () => {
+    assert.throws(() => assertLocalLabAllowed('local-lab'), /KOVO_ALLOW_LOCAL_LAB/)
   })
 })
 
 test('M5-2 ingestLabTelemetry rejects public env, scrubs all secrets, enforces <= 64 KiB valid JSON, and updates endpoints.coverage_pct', t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m5-iast-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m5-iast-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -190,7 +190,7 @@ test('M5-2 ingestLabTelemetry rejects public env, scrubs all secrets, enforces <
 })
 
 test('M5-3 Store rejects public iastEnabled and persists sandboxWriteAllowlist cleanly', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m5-store-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m5-store-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -220,7 +220,7 @@ test('M5-3 Store rejects public iastEnabled and persists sandboxWriteAllowlist c
 })
 
 test('M5-4 LabRunner multi-service --internal stack + seedCommand -> 0600 Persona Vault + live Node IAST hook + 0 orphans', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m5-docker-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m5-docker-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
 
   const repoDir = join(dir, 'repo')
@@ -254,7 +254,7 @@ test('M5-4 LabRunner multi-service --internal stack + seedCommand -> 0600 Person
   const runner = new LabRunner()
   t.after(() => runner.stopAll())
 
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     const { id: projectId } = storage.createProject({
       requestId: randomUUID(),
       name: 'M5 Docker Stack',
@@ -306,7 +306,7 @@ test('M5-4 LabRunner multi-service --internal stack + seedCommand -> 0600 Person
     assert.ok(traceContent.sinkEvents.some(ev => ev.sink === 'sql.query'))
 
     await runner.stopAll()
-    const leftC = (await exec('docker', ['ps', '-aq', '--filter', `label=dev.guardian.run=${runId}`])).stdout.trim()
+    const leftC = (await exec('docker', ['ps', '-aq', '--filter', `label=dev.kovo.run=${runId}`])).stdout.trim()
     const leftN = (await exec('docker', ['network', 'ls', '-q', '--filter', `name=${handle.networkName}`])).stdout.trim()
     assert.equal(leftC, '')
     assert.equal(leftN, '')
@@ -329,7 +329,7 @@ test('M5-5 cli.ts parses v4 local-lab flags cleanly', () => {
 })
 
 test('M5-6 Surface Graph SSR route renders endpoints, endpoint_params, and api_dependencies from SQLite', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-m5-surface-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-m5-surface-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   let runId = ''
   let consumerId = ''
@@ -404,7 +404,7 @@ test('M5-6 Surface Graph SSR route renders endpoints, endpoint_params, and api_d
   await app.start()
   const token = readFileSync(join(dir, 'local-session'), 'utf8').trim()
   const resp = await fetch(`${app.url}/runs/${runId}?view=surface&sel=endpoint:${consumerId}`, {
-    headers: { Cookie: `guardian_local=${token}` },
+    headers: { Cookie: `kovo_local=${token}` },
   })
   assert.equal(resp.status, 200)
   const html = await resp.text()

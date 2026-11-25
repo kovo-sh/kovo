@@ -38,7 +38,7 @@ import type { ScopedBrowser } from '../src/server/scoped-browser.ts'
 import { makeStore, makeLabGrant, setupApprovedRun, startHttpFixture, withEnv } from './v4-tier-helpers.ts'
 
 function makeRunStore(t: TestContext): { storage: Store; runId: string; origin: string; scopeRevision: number } {
-  const { storage } = makeStore(t, 'guardian-m7-spa-')
+  const { storage } = makeStore(t, 'kovo-m7-spa-')
   const origin = 'https://spa.fixture.test'
   const { id: projectId } = storage.createProject({
     requestId: randomUUID(), name: 'M7 SPA fixtures', environment: 'local-lab', seeds: [origin],
@@ -312,7 +312,7 @@ describe('M7 SPA: JSON navigation, XHR shapes and soft-404 calibration', () => {
   })
 
   test('crawlStateGraph records intercepted request bodies and query params', async t => {
-    const { storage } = makeStore(t, 'guardian-m7-spa-crawl-')
+    const { storage } = makeStore(t, 'kovo-m7-spa-crawl-')
     const { runId, run } = await setupApprovedRun(storage, { seeds: ['https://spa.fixture.test'], budgetRequests: 900 })
     const origin = 'https://spa.fixture.test'
     const xhr = {
@@ -448,7 +448,7 @@ describe('M7 SPA: authenticated recon with config artifact expansion', () => {
       res.end(shell)
     })
 
-    const { storage } = makeStore(t, 'guardian-m7-spa-auth-')
+    const { storage } = makeStore(t, 'kovo-m7-spa-auth-')
     const setup = await setupApprovedRun(storage, {
       seeds: [fx.origin],
       budgetRequests: 900,
@@ -456,7 +456,7 @@ describe('M7 SPA: authenticated recon with config artifact expansion', () => {
     })
     const grant: Grant = makeLabGrant(fx.origin, { tier: 3, personas: setup.personaMap })
 
-    const result = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () => runPhase0Recon({
+    const result = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () => runPhase0Recon({
       storage,
       runId: setup.runId,
       scopeRevision: setup.run.scopeRevision,

@@ -51,7 +51,7 @@ test('worker lifecycle: create succeeds but start fails -> the container is remo
   await assert.rejects(() => backend.run(job(), AbortSignal.timeout(5_000)), /refused to start/)
   const removed = rmTargets(calls)
   assert.equal(removed.length, 1, 'exactly one rm --force must target the failed container')
-  assert.match(removed[0], /^guardian-[a-f0-9-]{36}$/)
+  assert.match(removed[0], /^kovo-[a-f0-9-]{36}$/)
 })
 
 test('worker lifecycle: abort during start -> finally removes the created container', async () => {
@@ -84,15 +84,15 @@ test('worker lifecycle: created containers carry run, assignment, session and ti
   assert.ok(create, 'create was invoked')
   const labels = create!.args.flatMap((arg, i) => arg === '--label' ? [create!.args[i + 1]] : [])
   const get = (name: string) => labels.find(l => l.startsWith(name + '='))?.slice(name.length + 1)
-  assert.equal(get('dev.guardian.run'), 'run-gate-v5')
-  assert.equal(get('dev.guardian.assignment'), raw.assignmentId)
-  assert.match(get('dev.guardian.session') ?? '', /^[a-f0-9-]{36}$/)
-  assert.ok(Number(get('dev.guardian.created-at')) > 0)
+  assert.equal(get('dev.kovo.run'), 'run-gate-v5')
+  assert.equal(get('dev.kovo.assignment'), raw.assignmentId)
+  assert.match(get('dev.kovo.session') ?? '', /^[a-f0-9-]{36}$/)
+  assert.ok(Number(get('dev.kovo.created-at')) > 0)
 })
 
 test('worker lifecycle: ownerless backends reclaim stale created containers but spare in-flight ones', async () => {
-  const staleName = 'guardian-' + randomUUID()
-  const freshName = 'guardian-' + randomUUID()
+  const staleName = 'kovo-' + randomUUID()
+  const freshName = 'kovo-' + randomUUID()
   const staleId = 'a'.repeat(64)
   const freshId = 'b'.repeat(64)
   const now = Date.now()
@@ -134,15 +134,15 @@ test('worker lifecycle (docker): abandoned created container is reaped, fresh cr
     t.skip('Docker daemon unavailable')
     return
   }
-  const image = 'guardian-worker:v4'
-  const staleName = 'guardian-' + randomUUID()
-  const freshName = 'guardian-' + randomUUID()
+  const image = 'kovo-worker:v4'
+  const staleName = 'kovo-' + randomUUID()
+  const freshName = 'kovo-' + randomUUID()
   const now = Date.now()
   const create = (name: string, createdAt: number) => execFile('docker', [
     'container', 'create', '--name', name, '--network', 'none',
-    '--label', 'dev.guardian.assignment=' + randomUUID(),
-    '--label', 'dev.guardian.session=gate-v5-test',
-    '--label', 'dev.guardian.created-at=' + createdAt,
+    '--label', 'dev.kovo.assignment=' + randomUUID(),
+    '--label', 'dev.kovo.session=gate-v5-test',
+    '--label', 'dev.kovo.created-at=' + createdAt,
     image, '--session',
   ], { timeout: 15_000 })
   await create(staleName, now - 10 * 60_000)
@@ -169,7 +169,7 @@ test('worker lifecycle (docker): abandoned created container is reaped, fresh cr
 async function containersForAssignment(assignmentId: string) {
   try {
     const { stdout } = await execFile('docker', [
-      'container', 'ls', '--all', '--filter', `label=dev.guardian.assignment=${assignmentId}`, '--format', '{{.ID}} {{.Names}} {{.Status}}',
+      'container', 'ls', '--all', '--filter', `label=dev.kovo.assignment=${assignmentId}`, '--format', '{{.ID}} {{.Names}} {{.Status}}',
     ], { timeout: 5_000 })
     return stdout.trim()
   } catch {

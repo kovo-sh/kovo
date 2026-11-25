@@ -1,5 +1,5 @@
 // v6 verifier hardening: semantic impact gates shared by the declarative replay path and the
-// guardian_verify transcript oracle.
+// kovo_verify transcript oracle.
 //
 // Every fixture below models the acme-saas authorization policy: the tenant is the object boundary,
 // roles rank owner > admin > member > viewer, the plan price is catalog-authoritative, and the
@@ -14,7 +14,7 @@ import { once } from 'node:events'
 import { randomUUID } from 'node:crypto'
 import { test } from 'node:test'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'
@@ -246,7 +246,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, state: Fixture[
   }
   if (url.pathname === '/api/reports/9f1/public') {
     // Public share route by design: id/name/summary/workspace + a tenant label reference.
-    return json(res, 200, { id: '9f1', name: 'Quarterly', summary: 'internal', workspace: 'guardian_state_acme', ref: 'rbc_acme_0123456789ab' })
+    return json(res, 200, { id: '9f1', name: 'Quarterly', summary: 'internal', workspace: 'kovo_state_acme', ref: 'rbc_acme_0123456789ab' })
   }
   if (url.pathname === '/api/admin/audit') {
     if (!actor.handle) return json(res, 401, { error: 'unauthenticated' })
@@ -756,7 +756,7 @@ test('regression: retired sql_boolean_diff kind without floorRecipe fails closed
     }
     const res = await verify(spec, fx.origin)
     assert.equal(res.verdict, 'dismissed', String(res.outcome.reason))
-    assert.equal(res.outcome.reason, 'retired_legacy_spec_kind: use guardian_verify')
+    assert.equal(res.outcome.reason, 'retired_legacy_spec_kind: use kovo_verify')
     assert.equal(res.exchanges.length, 0)
   } finally { await fx.close() }
 })
@@ -830,7 +830,7 @@ test('regression: retired browser_dom kind fails closed without executing legacy
     }
     const res = await verify(spec, fx.origin, browser)
     assert.equal(res.verdict, 'dismissed', String(res.outcome.reason))
-    assert.equal(res.outcome.reason, 'retired_legacy_spec_kind: use guardian_verify')
+    assert.equal(res.outcome.reason, 'retired_legacy_spec_kind: use kovo_verify')
     assert.equal(visitCalls, 0)
   } finally { await fx.close() }
 })
@@ -899,7 +899,7 @@ test('units: mass assignment requires a protected persisted field read back by a
 })
 
 // ---------------------------------------------------------------------------
-// guardian_verify parity: the transcript oracle dismisses the same fixtures
+// kovo_verify parity: the transcript oracle dismisses the same fixtures
 // ---------------------------------------------------------------------------
 
 interface RpcResponse { ok: boolean; result?: unknown; error?: string }
@@ -914,8 +914,8 @@ function rpc(server: VerifyRpcServer, op: string, args: Record<string, unknown> 
       headers: {
         'content-type': 'application/json',
         'content-length': Buffer.byteLength(payload),
-        'x-guardian-rpc-token': server.token,
-        'x-guardian-verify-nonce': server.nonce,
+        'x-kovo-rpc-token': server.token,
+        'x-kovo-verify-nonce': server.nonce,
       },
     }, res => {
       const chunks: Buffer[] = []
@@ -956,7 +956,7 @@ function oracleFor(
   })
 }
 
-test('parity: guardian_verify dismisses the viewer same-tenant write over the same exchanges', async () => {
+test('parity: kovo_verify dismisses the viewer same-tenant write over the same exchanges', async () => {
   const fx = await startFixture()
   const server = await startRpc(fx)
   try {
@@ -1000,7 +1000,7 @@ test('parity: guardian_verify dismisses the viewer same-tenant write over the sa
   }
 })
 
-test('parity: guardian_verify dismisses the catalog-price mass assignment echo', async () => {
+test('parity: kovo_verify dismisses the catalog-price mass assignment echo', async () => {
   const fx = await startFixture()
   const server = await startRpc(fx)
   try {
@@ -1043,7 +1043,7 @@ test('parity: guardian_verify dismisses the catalog-price mass assignment echo',
   }
 })
 
-test('parity: guardian_verify dismisses the SameSite=Lax CSRF claim', async () => {
+test('parity: kovo_verify dismisses the SameSite=Lax CSRF claim', async () => {
   const fx = await startFixture({ csrfTokenBypass: true })
   const server = await startRpc(fx)
   try {
@@ -1088,7 +1088,7 @@ test('parity: guardian_verify dismisses the SameSite=Lax CSRF claim', async () =
   }
 })
 
-test('parity: guardian_verify confirms a genuine cross-tenant write with a clean readback', async () => {
+test('parity: kovo_verify confirms a genuine cross-tenant write with a clean readback', async () => {
   const fx = await startFixture({ crossTenantInvoiceWrite: true })
   const server = await startRpc(fx)
   try {
@@ -1125,7 +1125,7 @@ test('parity: guardian_verify confirms a genuine cross-tenant write with a clean
   }
 })
 
-test('parity: guardian_verify dismisses the decorative 2FA over-claim', async () => {
+test('parity: kovo_verify dismisses the decorative 2FA over-claim', async () => {
   const fx = await startFixture()
   const server = await startRpc(fx)
   try {
@@ -1154,7 +1154,7 @@ test('parity: guardian_verify dismisses the decorative 2FA over-claim', async ()
   }
 })
 
-test('parity: guardian_verify confirms a real MFA bypass with enrolled + pre/post access evidence', async () => {
+test('parity: kovo_verify confirms a real MFA bypass with enrolled + pre/post access evidence', async () => {
   const fx = await startFixture()
   const server = await startRpc(fx)
   try {
@@ -1308,7 +1308,7 @@ test('units: anonymous public-route reads need owner-scoped or credential eviden
     impactClass: 'disclosure',
     steps: [
       { id: 'control', arm: 'control', method: 'GET', route: '/api/reports/none/public', status: 404, actor: anonActor },
-      { id: 'probe', arm: 'probe', method: 'GET', route: '/api/reports/9f1/public', status: 200, actor: anonActor, json: { id: '9f1', name: 'Quarterly', summary: 'internal', workspace: 'guardian_state_acme', ref: 'rbc_acme_0123456789ab' } },
+      { id: 'probe', arm: 'probe', method: 'GET', route: '/api/reports/9f1/public', status: 200, actor: anonActor, json: { id: '9f1', name: 'Quarterly', summary: 'internal', workspace: 'kovo_state_acme', ref: 'rbc_acme_0123456789ab' } },
     ],
   })
   assert.equal(labelsOnly.satisfied, false)
@@ -1323,7 +1323,7 @@ test('units: anonymous public-route reads need owner-scoped or credential eviden
   assert.equal(credential.satisfied, true, credential.reason)
 })
 
-test('parity: guardian_verify dismisses the K=6 business-logic, markup and disclosure over-claims', async () => {
+test('parity: kovo_verify dismisses the K=6 business-logic, markup and disclosure over-claims', async () => {
   const fx = await startFixture()
   const server = await startRpc(fx)
   try {
@@ -1362,7 +1362,7 @@ test('parity: guardian_verify dismisses the K=6 business-logic, markup and discl
     const pub = id(await rpc(server, 'http', { path: '/api/reports/9f1/public' }))
     const disclosure = oracleFor(server, 'Unauthenticated report disclosure via /api/reports/:reportId/public (internal workspace + owner ref leaked, no visibility gate)', [
       { kind: 'status', exchangeId: pub, expected: 200 },
-      { kind: 'body_contains', exchangeId: pub, text: 'guardian_state_acme' },
+      { kind: 'body_contains', exchangeId: pub, text: 'kovo_state_acme' },
     ])
     assert.equal(disclosure.passed, false)
     assert.match(disclosure.failures.join(' '), /disclosure claim dismissed/i)

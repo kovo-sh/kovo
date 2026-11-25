@@ -23,7 +23,7 @@ import {
 } from '../scripts/benchmark-multihop.ts'
 import type { Finding } from '../src/domain.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 function routePrefixOf(started: StartedMultihopApp): string {
   const apiRef = started.briefing('grey-box').apiReference ?? []
@@ -300,7 +300,7 @@ function devChainFixtures(app: 'paygrid' | 'shipforge' | 'nexusiam', p: string):
 }
 
 // ---------------------------------------------------------------------------
-// 1. All 12 Dev chains match Guardian-style arbitrary chainIds across /v1 & /api/v1
+// 1. All 12 Dev chains match Kovo-style arbitrary chainIds across /v1 & /api/v1
 // ---------------------------------------------------------------------------
 
 test('all 12 Dev chains (PG-C1..C4, SF-C1..C4, NX-C1..C4) match generic chainIds under both /v1 and /api/v1', async () => {
@@ -453,7 +453,7 @@ test('confirmed PG-C1 (b025b159 shape) clears PG-D1 decoy FP, while decoy-hop-on
     const p = routePrefixOf(vuln)
     const b025b159Receipt: ProductSubmittedCompositeProof = {
       findingId: 'b025b159',
-      chainId: 'chain-guardian-payout-self-approval',
+      chainId: 'chain-kovo-payout-self-approval',
       terminalVulnClass: 'dual_tenant_abac',
       hopCount: 2,
       replayMode: 'fresh_clean_replay',

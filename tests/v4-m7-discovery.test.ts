@@ -26,7 +26,7 @@ import type { DiscoveredEndpoint } from '../scripts/benchmark-probes.ts'
 import { makeTempDir } from './v4-tier-helpers.ts'
 
 function makeRunStore(t: TestContext): { storage: Store; runId: string; origin: string; scopeRevision: number } {
-  const dir = makeTempDir(t, 'guardian-m7-discovery-')
+  const dir = makeTempDir(t, 'kovo-m7-discovery-')
   const storage = new Store(dir)
   t.after(() => {
     try { storage.close() } catch { /* already closed */ }

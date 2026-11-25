@@ -41,7 +41,7 @@ import {
 import { VERIFY_NONCE_HEADER, VERIFY_RPC_HEADER, VerifyRpcServer } from '../src/server/verify-rpc.ts'
 import { verifyScript, type AttemptExecution, type VerifyAttemptSession } from '../src/server/verify-runner.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const ORIGIN_API = 'http://127.0.0.1:48100'
@@ -492,7 +492,7 @@ test('VerifyRpcServer backfills late capability.seal onto subsequent 6-request r
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
   const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`
-  const hostDir = mkdtempSync(join(tmpdir(), 'guardian-q34-vb-'))
+  const hostDir = mkdtempSync(join(tmpdir(), 'kovo-q34-vb-'))
   const rpc = new VerifyRpcServer({
     runId: 'run-q34-vb',
     assignmentId: 'assign-q34-vb',

@@ -31,7 +31,7 @@ import type { CodeToRuntimeHypothesis } from '../src/server/program-graph.ts'
 import { callGraphFromProgramGraph, resolveSuspectEntrypoint } from '../src/server/semantic-audit.ts'
 import { makeLabGrant, makeStore, setupApprovedRun, startHttpFixture, withEnv } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 function makeRepoDir(t: TestContext, prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), prefix))
@@ -68,7 +68,7 @@ async function runStaticRecon(input: {
   result: Awaited<ReturnType<typeof runPhase0Recon>>
   endpoints: ReturnType<ReturnType<typeof makeStore>['storage']['listEndpoints']>
 }> {
-  const { storage } = makeStore(input.t, 'guardian-v6-graphwire-')
+  const { storage } = makeStore(input.t, 'kovo-v6-graphwire-')
   const setup = await setupApprovedRun(storage, { seeds: [input.origin], budgetRequests: 900 })
   if (input.openapi) {
     storage.upsertProjectSpecRaw(setup.projectId, { name: 'reference.json', kind: 'openapi', content: input.openapi })
@@ -471,10 +471,10 @@ describe('v6 graphwire: sibling derivation suppression', () => {
       ].join('\n'),
     })
 
-    const { storage } = makeStore(t, 'guardian-v6-graphwire-sib-')
+    const { storage } = makeStore(t, 'kovo-v6-graphwire-sib-')
     const setup = await setupApprovedRun(storage, { seeds: [fx.origin], budgetRequests: 900 })
     const grant: Grant = makeLabGrant(fx.origin, { tier: 1 })
-    const result = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1', GUARDIAN_RECON_SIBLINGS: '1' }, () => runPhase0Recon({
+    const result = await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_RECON_SIBLINGS: '1' }, () => runPhase0Recon({
       storage,
       runId: setup.runId,
       scopeRevision: setup.run.scopeRevision,

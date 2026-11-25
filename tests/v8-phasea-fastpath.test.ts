@@ -42,7 +42,7 @@ import type { ChainStep, Run } from '../src/server/store.ts'
 import type { WorkerBackend, WorkerSession } from '../src/server/worker-backend.ts'
 import { makeStore, setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const ORIGIN_EDGE = 'http://edge.synth.test:8080'
 const ORIGIN_API = 'http://api.synth.test:8081'
@@ -401,7 +401,7 @@ test('runSourceFirstCodeAudit enforces proportional wall-clock cap (90s), turn c
   const { runId } = await setupApprovedRun(storage, { seeds: [ORIGIN_API], tier: 2 })
   const run = storage.run(runId)
 
-  const reposDir = mkdtempSync(join(tmpdir(), 'guardian-phasea-repo-'))
+  const reposDir = mkdtempSync(join(tmpdir(), 'kovo-phasea-repo-'))
   mkdirSync(join(reposDir, 'demo-app'), { recursive: true })
   writeFileSync(join(reposDir, 'demo-app', 'server.ts'), 'export const ok = true\n', 'utf8')
   t.after(() => rmSync(reposDir, { recursive: true, force: true }))
@@ -476,11 +476,11 @@ test('runSourceFirstCodeAudit enforces proportional wall-clock cap (90s), turn c
   }, storage, { skipConnectionCheck: true })
   const profiles = await privateModelProfiles(storage)
 
-  const prevStage1 = process.env.GUARDIAN_STAGE1_LLM
-  process.env.GUARDIAN_STAGE1_LLM = '0'
+  const prevStage1 = process.env.KOVO_STAGE1_LLM
+  process.env.KOVO_STAGE1_LLM = '0'
   t.after(() => {
-    if (prevStage1 === undefined) delete process.env.GUARDIAN_STAGE1_LLM
-    else process.env.GUARDIAN_STAGE1_LLM = prevStage1
+    if (prevStage1 === undefined) delete process.env.KOVO_STAGE1_LLM
+    else process.env.KOVO_STAGE1_LLM = prevStage1
   })
 
   const ac = new AbortController()

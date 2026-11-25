@@ -1,4 +1,4 @@
-process.env.GUARDIAN_ALLOW_LOCAL_LAB ??= '1'
+process.env.KOVO_ALLOW_LOCAL_LAB ??= '1'
 /**
  * Typed proof compilers: each compiler emits an identifier-bound, proof-strength-compliant replay
  * spec that the ReplayVerifier confirms on a vulnerable fixture and rejects on a hardened one.
@@ -10,7 +10,7 @@ import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { test } from 'node:test'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'
@@ -249,7 +249,7 @@ test('prove_business_invariant: negative balance violates the invariant; hardene
 // 4a. Stored marker propagation
 // ---------------------------------------------------------------------------
 
-const storedMarker = 'guardian-marker-7f3a9c'
+const storedMarker = 'kovo-marker-7f3a9c'
 
 function commentsFixture(hardened: boolean) {
   let stored = ''

@@ -226,18 +226,18 @@ describe('M6 benchmark harness: runBenchmarkSuite (dry run)', () => {
 })
 
 describe('M6 benchmark harness: gate + CLI', () => {
-  test('refuses a live local-lab run without GUARDIAN_ALLOW_LOCAL_LAB=1 but allows dry runs', async t => {
+  test('refuses a live local-lab run without KOVO_ALLOW_LOCAL_LAB=1 but allows dry runs', async t => {
     const { storage } = makeStore(t)
     const manifests = { 'held-out-saas': fixtureManifest() }
     await assert.rejects(
-      () => withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: undefined }, () => runBenchmarkSuite({ suite: 'held-out-saas', storage, manifests })),
-      /GUARDIAN_ALLOW_LOCAL_LAB/,
+      () => withEnv({ KOVO_ALLOW_LOCAL_LAB: undefined }, () => runBenchmarkSuite({ suite: 'held-out-saas', storage, manifests })),
+      /KOVO_ALLOW_LOCAL_LAB/,
     )
     await assert.rejects(
-      () => withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '0' }, () => runBenchmarkSuite({ suite: 'xben-25', storage, manifests })),
-      /GUARDIAN_ALLOW_LOCAL_LAB/,
+      () => withEnv({ KOVO_ALLOW_LOCAL_LAB: '0' }, () => runBenchmarkSuite({ suite: 'xben-25', storage, manifests })),
+      /KOVO_ALLOW_LOCAL_LAB/,
     )
-    const dry = await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: undefined }, () => runBenchmarkSuite({ suite: 'held-out-saas', dryRun: true, storage, manifests }))
+    const dry = await withEnv({ KOVO_ALLOW_LOCAL_LAB: undefined }, () => runBenchmarkSuite({ suite: 'held-out-saas', dryRun: true, storage, manifests }))
     assert.equal(dry.targetsTotal, 8)
     assert.equal(storage.listBenchmarkRuns('held-out-saas').length, 1)
   })
@@ -245,7 +245,7 @@ describe('M6 benchmark harness: gate + CLI', () => {
   test('parseBenchmarkCliArgs parses every flag and rejects unknown ones', () => {
     const opts = parseBenchmarkCliArgs([
       '--suite', 'saas-lab', '--baseline-sha', 'base', '--git-sha=head', '--out-json', 'a.json', '--out-md', 'a.md',
-      '--out-dir', 'out', '--db', '/tmp/x/guardian.sqlite', '--dry-run', '--profile-mode', 'v3-baseline', '--diff', '--verify-patches',
+      '--out-dir', 'out', '--db', '/tmp/x/kovo.sqlite', '--dry-run', '--profile-mode', 'v3-baseline', '--diff', '--verify-patches',
       '--verifier-backend', 'local-jq',
     ])
     assert.equal(opts.suite, 'saas-lab')
@@ -271,14 +271,14 @@ describe('M6 benchmark harness: gate + CLI', () => {
   test('importing the module has no side effects and the CLI prints help', async () => {
     const script = resolve(repoRoot, 'scripts/benchmark-recall.ts')
     const help = await exec('node', [script, '--help'], { cwd: repoRoot })
-    assert.match(help.stdout, /Guardian v4 recall benchmark/)
+    assert.match(help.stdout, /Kovo(?: Hunter)? v4 recall benchmark/)
     const bad = await exec('node', [script, '--bogus'], { cwd: repoRoot }).then(() => null, (e: { code?: number; stderr?: string }) => e)
     assert.ok(bad && bad.code === 1)
     assert.match(bad?.stderr ?? '', /Unknown benchmark option/)
   })
 
   test('CLI --dry-run writes JSON + Markdown and persists to --db', async t => {
-    const dir = makeTempDir(t, 'guardian-m6-cli-')
+    const dir = makeTempDir(t, 'kovo-m6-cli-')
     const outJson = join(dir, 'cli.json')
     const outMd = join(dir, 'cli.md')
     const manifest = resolve(repoRoot, 'benchmarks/xben-25/manifest.json')

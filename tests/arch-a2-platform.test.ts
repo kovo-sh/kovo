@@ -40,7 +40,7 @@ function loadRunDataSseHelpers(): {
 
 function withTempStore(fn: (ctx: { dir: string; store: Store }) => Promise<void> | void) {
   return async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'guardian-arch-a2-'))
+    const dir = mkdtempSync(join(tmpdir(), 'kovo-arch-a2-'))
     const store = new Store(dir, { ftsMode: 'preview' })
     try {
       await fn({ dir, store })
@@ -58,9 +58,9 @@ test('LabRunner split-brain eliminated: actions.ts uses execution().labRunner wi
   assert.equal(/execution\(\)\.labRunner|exec\.labRunner/.test(actionsSrc), true, 'actions.ts must read labRunner from execution()')
 
   // Execution singleton exposes one stable LabRunner instance across calls
-  const execDir = mkdtempSync(join(tmpdir(), 'guardian-arch-a2-exec-'))
-  const prevDir = process.env.GUARDIAN_DATA_DIR
-  process.env.GUARDIAN_DATA_DIR = execDir
+  const execDir = mkdtempSync(join(tmpdir(), 'kovo-arch-a2-exec-'))
+  const prevDir = process.env.KOVO_DATA_DIR
+  process.env.KOVO_DATA_DIR = execDir
   try {
     const execA = execution()
     const execB = execution()
@@ -69,8 +69,8 @@ test('LabRunner split-brain eliminated: actions.ts uses execution().labRunner wi
     assert.ok(execA.labRunner instanceof LabRunner)
   } finally {
     try { defaultStore().close() } catch { /* ignore */ }
-    if (prevDir === undefined) delete process.env.GUARDIAN_DATA_DIR
-    else process.env.GUARDIAN_DATA_DIR = prevDir
+    if (prevDir === undefined) delete process.env.KOVO_DATA_DIR
+    else process.env.KOVO_DATA_DIR = prevDir
     rmSync(execDir, { recursive: true, force: true })
   }
 

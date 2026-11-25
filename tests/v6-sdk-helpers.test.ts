@@ -25,10 +25,10 @@ import {
   VERIFY_RPC_TOKEN_ENV,
 } from '../src/server/verify-rpc.ts'
 import type { VerifyCanaryBroker, VerifyClaim, VerifyOobPromotionView, VerifyOobSubscriptionView } from '../src/server/verify-rpc.ts'
-import { VerifyContext } from '../worker/guardian_verify/guardian_verify.ts'
+import { VerifyContext } from '../worker/kovo_verify/kovo_verify.ts'
 
-const SDK_DIR = join(dirname(fileURLToPath(import.meta.url)), '../worker/guardian_verify')
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+const SDK_DIR = join(dirname(fileURLToPath(import.meta.url)), '../worker/kovo_verify')
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const ALICE_SECRET = 'alice-secret-helper-1'
 const BOB_SECRET = 'bob-secret-helper-2'
@@ -205,7 +205,7 @@ class FakeCanary implements VerifyCanaryBroker {
   private sequence = 0
 
   mintCanary(_runId: string, label: string) {
-    const token = `guardian-canary-${randomUUID().replace(/-/g, '').slice(0, 20)}`
+    const token = `kovo-canary-${randomUUID().replace(/-/g, '').slice(0, 20)}`
     this.minted.set(token, { createdAt: this.now })
     return { token, httpUrl: `http://canary.local/c/${token}`, url: `http://canary.local/c/${token}`, dnsHost: `${token}.canary.local`, label }
   }
@@ -622,7 +622,7 @@ test('access-boundary helper confirms through verifyScript fresh-session double 
       name: 'boundary-helper.ts',
       runtime: 'ts',
       code: `
-import { defineVerification, runVerification } from './guardian_verify.ts'
+import { defineVerification, runVerification } from './kovo_verify.ts'
 
 runVerification(defineVerification({
   async verify(ctx) {
@@ -663,7 +663,7 @@ test('packaged-helper failure names the exact missing role in the same verdict f
       name: 'boundary-helper-gap.ts',
       runtime: 'ts',
       code: `
-import { defineVerification, runVerification } from './guardian_verify.ts'
+import { defineVerification, runVerification } from './kovo_verify.ts'
 
 runVerification(defineVerification({
   async verify(ctx) {

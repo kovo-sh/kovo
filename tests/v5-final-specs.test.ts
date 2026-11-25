@@ -8,7 +8,7 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { test } from 'node:test'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { declarativeReplaySpecSchema } from '../src/replay-spec.ts'
 import { synthesizeSpecs } from '../scripts/benchmark-specs.ts'

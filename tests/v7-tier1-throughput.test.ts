@@ -2,8 +2,8 @@
  * v7 tier1-throughput-fix — unit tests for:
  *  1. Evidence-gated early exit on hardened 400/422 validation denials, repeated identical-body
  *     non-anomalous responses (`unchanged_response`), and immediate wrap-up after a confirmed
- *     `guardian_verify` proof (`proof_confirmed`).
- *  2. All 7 specialist `focusPrompt`s steering to `guardian_verify` with zero retired VM kinds.
+ *     `kovo_verify` proof (`proof_confirmed`).
+ *  2. All 7 specialist `focusPrompt`s steering to `kovo_verify` with zero retired VM kinds.
  *  3. `scripts/smoke-agentic.ts` `resolveLiftBaseline` resolution chain (explicit scorecard ->
  *     snapshotRoot baseline -> default baseline -> cold-captured post-floor `snapshot.json`)
  *     without weakening `evaluateGates`.
@@ -67,7 +67,7 @@ test('repeated identical-body clean 2xx probes earn unchanged_response only at >
   assert.equal(three.eligible && three.reason, 'unchanged_response')
 
   const event = buildEarlyExitEvent({ reason: 'unchanged_response', evidence: snap, turnsUsed: 5, maxTurns: 18 })
-  const directive = earlyExitDirectiveMessage({ ...event, proofTools: ['guardian_verify'] })
+  const directive = earlyExitDirectiveMessage({ ...event, proofTools: ['kovo_verify'] })
   assert.match(directive, /unchanged_response/)
   assert.match(directive, /identical non-anomalous response body/)
 
@@ -77,7 +77,7 @@ test('repeated identical-body clean 2xx probes earn unchanged_response only at >
   assert.equal(diverged.eligible, false)
 })
 
-test('confirmed guardian_verify proof earns immediate proof_confirmed early exit while respecting open blockers', () => {
+test('confirmed kovo_verify proof earns immediate proof_confirmed early exit while respecting open blockers', () => {
   const tracker = new SpecSubmissionTracker()
   tracker.noteAssignedRoutes([{ method: 'GET', path: '/api/v1/admin/config', origin: 'https://app.example' }])
   tracker.noteVerifyScript('await ctx.prove_access_boundary({ path: "/api/v1/admin/config" })', [{ method: 'GET', path: '/api/v1/admin/config' }], { confirmed: true })
@@ -104,20 +104,20 @@ test('confirmed guardian_verify proof earns immediate proof_confirmed early exit
   assert.deepEqual(blocked, { eligible: false, blockedBy: 'unprobed_assigned_routes' })
 
   const event = buildEarlyExitEvent({ reason: 'proof_confirmed', evidence: tracker.observationSnapshot(), turnsUsed: 2, maxTurns: 18 })
-  const directive = earlyExitDirectiveMessage({ ...event, proofTools: ['guardian_verify'] })
+  const directive = earlyExitDirectiveMessage({ ...event, proofTools: ['kovo_verify'] })
   assert.match(directive, /proof_confirmed/)
   assert.match(directive, /ProofReceipt/)
 })
 
-test('all 7 specialist focusPrompts steer to guardian_verify and avoid retired legacy VM kinds', () => {
+test('all 7 specialist focusPrompts steer to kovo_verify and avoid retired legacy VM kinds', () => {
   for (const [id, profile] of Object.entries(SPECIALIST_PROFILES)) {
-    assert.match(profile.focusPrompt, /guardian_verify/, `${id} focusPrompt must mention guardian_verify`)
+    assert.match(profile.focusPrompt, /kovo_verify/, `${id} focusPrompt must mention kovo_verify`)
     assert.doesNotMatch(profile.focusPrompt, /\b(?:ws_chain|dns_takeover|tls_audit|browser_dom|upload_probe)\b/, `${id} must not cite retired VM kinds`)
   }
 })
 
 test('resolveLiftBaseline resolves cold post-floor snapshot counts and default baseline without weakening conversion gate', () => {
-  const root = mkdtempSync(join(tmpdir(), 'guardian-lift-baseline-'))
+  const root = mkdtempSync(join(tmpdir(), 'kovo-lift-baseline-'))
   try {
     const snapRoot = join(root, 'run-snapshots')
     const defaultRoot = join(root, 'default-snapshots')
@@ -198,7 +198,7 @@ function writeFindingsDb(
 }
 
 test('resumed --resume-snapshot conversion counts preserved floor findings from snapshot DB without weakening drop gate', () => {
-  const root = mkdtempSync(join(tmpdir(), 'guardian-resume-conv-'))
+  const root = mkdtempSync(join(tmpdir(), 'kovo-resume-conv-'))
   try {
     const snapDbPath = join(root, 'snapshot.sqlite')
     const resumedDbPath = join(root, 'resumed.sqlite')

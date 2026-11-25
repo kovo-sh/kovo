@@ -286,7 +286,7 @@ test('the no-fallback assertion throws for every wired pair and stays quiet for 
       assert.throws(
         () => assertNotRecipeWiredLegacyCall({ kind, category: vulnClass }),
         (error: unknown) => error instanceof RecipeWiredLegacyCallError
-          && error.code === 'GUARDIAN_RECIPE_WIRED_LEGACY_CALL'
+          && error.code === 'KOVO_RECIPE_WIRED_LEGACY_CALL'
           && error.specKind === kind,
       )
     }

@@ -18,7 +18,7 @@
 //
 // Set V8_PBI_SUMMARY=<path.json> to dump a structured per-app summary (status codes, route keys,
 // persona ids only — never response bodies).
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

@@ -62,7 +62,7 @@ function fixture(options?: {
   const tools = buildWorkerTools({
     request_http: async args => options?.http?.(args) ?? { exchangeId: 'ex-1', status: 403, bodySha256: 'sha-denied' },
     ...(options?.differential ? { probe_differential: async () => options.differential } : {}),
-    guardian_verify: async () => options?.verify?.() ?? { oraclePassed: false, attempts: [] },
+    kovo_verify: async () => options?.verify?.() ?? { oraclePassed: false, attempts: [] },
     record_coverage: async args => ({ id: 'cov-1', status: args.status }),
     complete_intent: async completion => {
       completions.push(completion)
@@ -118,12 +118,12 @@ test('two denial attempts on distinct params earn hardened_denial with a structu
   assert.equal(event.turnsUsed, 6)
   assert.equal(event.turnsSaved, MAX_TURNS - 6 - EARLY_EXIT_GRACE_TURNS)
 
-  const directive = earlyExitDirectiveMessage({ ...event, proofTools: ['guardian_verify'] })
-  assert.match(directive, /GUARDIAN EARLY EXIT — Turn 6\/18/)
+  const directive = earlyExitDirectiveMessage({ ...event, proofTools: ['kovo_verify'] })
+  assert.match(directive, /KOVO(?: HUNTER)? EARLY EXIT — Turn 6\/18/)
   assert.match(directive, /hardened_denial/)
   assert.match(directive, /403\/403/)
   assert.match(directive, /do not probe further/)
-  assert.match(directive, /guardian_verify/)
+  assert.match(directive, /kovo_verify/)
   assert.match(directive, /proofGapReason/)
 })
 
@@ -235,12 +235,12 @@ test('the stat counts saved turns and the final turn stays reserved for complete
 
   const triggerTurn = 6
   const finalTurn = triggerTurn + EARLY_EXIT_GRACE_TURNS
-  assert.equal(settlementToolBlock({ name: 'guardian_verify', settling: true, turnsUsed: triggerTurn, maxTurns: 18, finalTurn }), undefined,
+  assert.equal(settlementToolBlock({ name: 'kovo_verify', settling: true, turnsUsed: triggerTurn, maxTurns: 18, finalTurn }), undefined,
     'the reserved wrap-up verify turn still fires')
   assert.match(settlementToolBlock({ name: 'request_http', settling: true, turnsUsed: triggerTurn, maxTurns: 18, finalTurn }) ?? '', /disabled during settlement/)
-  assert.match(settlementToolBlock({ name: 'guardian_verify', settling: true, turnsUsed: finalTurn, maxTurns: 18, finalTurn }) ?? '', /Final settlement turn/)
+  assert.match(settlementToolBlock({ name: 'kovo_verify', settling: true, turnsUsed: finalTurn, maxTurns: 18, finalTurn }) ?? '', /Final settlement turn/)
   // Without early exit the legacy maxTurns behaviour is unchanged.
-  assert.equal(settlementToolBlock({ name: 'guardian_verify', settling: true, turnsUsed: 11, maxTurns: 18 }), undefined)
+  assert.equal(settlementToolBlock({ name: 'kovo_verify', settling: true, turnsUsed: 11, maxTurns: 18 }), undefined)
 })
 
 // ============================================================================

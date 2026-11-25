@@ -39,7 +39,7 @@ describe('realism2 fixture: payload delay parsing', () => {
 describe('realism2 fixture: blind-SQLi timing oracle', () => {
   let fixture: WanOobFixture
   before(async () => {
-    process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+    process.env.KOVO_ALLOW_LOCAL_LAB = '1'
     // Zero edge jitter: the measurement is the server-side branch delay, not WAN noise.
     fixture = await start({ seed: 11, jitterMs: [0, 0], callbackDelayMs: [50, 80] })
   })

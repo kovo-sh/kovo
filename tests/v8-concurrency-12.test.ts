@@ -56,7 +56,7 @@ import {
 import type { WorkerBackend, WorkerSession } from '../src/server/worker-backend.ts'
 import { makeStore, setupApprovedRun, stopExecution, withEnv } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const GiB = 1024 ** 3
 const ORIGIN = 'https://target.example.invalid'
@@ -292,14 +292,14 @@ test('PhaseBConcurrencyController winds down smoothly on low remaining budget an
   assert.equal(ctrl.getEffectiveConcurrency({ remainingBudgetUsd: 0.10 }), 1)
 
   // Explicit env override always wins (even on low RAM, pressure, or small budget)
-  assert.equal(parseEnvPhaseBConcurrencyOverride({ GUARDIAN_PHASE_B_CONCURRENCY: '12' }), 12)
-  assert.equal(parseEnvPhaseBConcurrencyOverride({ GUARDIAN_WORKER_CONCURRENCY: '9' }), 9)
+  assert.equal(parseEnvPhaseBConcurrencyOverride({ KOVO_PHASE_B_CONCURRENCY: '12' }), 12)
+  assert.equal(parseEnvPhaseBConcurrencyOverride({ KOVO_WORKER_CONCURRENCY: '9' }), 9)
   assert.equal(parseEnvPhaseBConcurrencyOverride({}), undefined)
 
   const envPinned = new PhaseBConcurrencyController({
     cpuCount: 4,
     availMemBytes: 2 * GiB,
-    env: { GUARDIAN_PHASE_B_CONCURRENCY: '10' },
+    env: { KOVO_PHASE_B_CONCURRENCY: '10' },
   })
   assert.equal(envPinned.getEffectiveConcurrency({ remainingBudgetUsd: 0.10 }), 10)
   assert.equal(envPinned.recordPressure('llm_429'), 10)
@@ -408,7 +408,7 @@ test('Live Execution dispatches 12 unique concurrent specialists on Wave 1 with 
     deterministicSweep: false,
     workerConcurrencyOverride: 12,
   })
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
     engine.start()
     engine.wake()
     const deadline = Date.now() + 5_000
@@ -595,8 +595,8 @@ test('LabRunner bounds container memory/CPU/PIDs limits and sweeps orphans clean
   )
 
   // Failed-start cleanup removes tracked container rows and falls back to per-id orphan removal
-  const repoDir = mkdtempSync(join(tmpdir(), 'guardian-lab-conc12-repo-'))
-  const stateDir = mkdtempSync(join(tmpdir(), 'guardian-lab-conc12-state-'))
+  const repoDir = mkdtempSync(join(tmpdir(), 'kovo-lab-conc12-repo-'))
+  const stateDir = mkdtempSync(join(tmpdir(), 'kovo-lab-conc12-state-'))
   t.after(() => {
     rmSync(repoDir, { recursive: true, force: true })
     rmSync(stateDir, { recursive: true, force: true })

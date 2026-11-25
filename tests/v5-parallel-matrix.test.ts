@@ -28,7 +28,7 @@ import { orchestrationEnv } from '../scripts/benchmark-realistic-matrix.ts'
 
 const tempDirs: string[] = []
 function tempDir(label: string): string {
-  const dir = mkdtempSync(join(tmpdir(), `guardian-parallel-${label}-`))
+  const dir = mkdtempSync(join(tmpdir(), `kovo-parallel-${label}-`))
   tempDirs.push(dir)
   return dir
 }
@@ -48,7 +48,7 @@ function matrixArgs(over: Partial<MatrixArgs> = {}): MatrixArgs {
   return {
     apps: ['acme-saas'], seeds: [42], modes: ['grey-box'], budgetUsd: 5,
     maxDurationMs: 1_200_000, concurrency: 3, outDir: '/tmp/parallel-matrix-test',
-    dataDir: '/tmp/guardian-data', noLlm: false, verifier: 'docker',
+    dataDir: '/tmp/kovo-data', noLlm: false, verifier: 'docker',
     keepDataDirs: false, smoke: false, childTimeoutMs: 1_500_000, help: false,
     ...over,
   }
@@ -356,12 +356,12 @@ describe('cell isolation', () => {
     })
     const a = cellEnv(cell(), args)
     const b = cellEnv(cell({ app: 'shopflow', label: 'shopflow-seed42-grey-box' }), args)
-    assert.notEqual(a.GUARDIAN_DATA_DIR, b.GUARDIAN_DATA_DIR)
-    assert.notEqual(a.GUARDIAN_CELL_ID, b.GUARDIAN_CELL_ID)
-    assert.match(a.GUARDIAN_DATA_DIR!, /data\/acme-saas-seed42-grey-box$/)
-    assert.equal(a.GUARDIAN_RUN_LABEL, a.GUARDIAN_CELL_ID)
-    assert.equal(a.GUARDIAN_WARM_WORKERS, '1')
-    assert.equal(cellEnv(cell(), { ...args, warmWorkers: false }).GUARDIAN_WARM_WORKERS, '0')
+    assert.notEqual(a.KOVO_DATA_DIR, b.KOVO_DATA_DIR)
+    assert.notEqual(a.KOVO_CELL_ID, b.KOVO_CELL_ID)
+    assert.match(a.KOVO_DATA_DIR!, /data\/acme-saas-seed42-grey-box$/)
+    assert.equal(a.KOVO_RUN_LABEL, a.KOVO_CELL_ID)
+    assert.equal(a.KOVO_WARM_WORKERS, '1')
+    assert.equal(cellEnv(cell(), { ...args, warmWorkers: false }).KOVO_WARM_WORKERS, '0')
   })
 
   test('prepared per-cell data dir override replaces the shared --data-dir', () => {
@@ -382,9 +382,9 @@ describe('cell isolation', () => {
     }
     const a = orchestrationEnv(opts, { app: 'acme-saas', seed: 42 })
     const b = orchestrationEnv(opts, { app: 'shopflow', seed: 42 })
-    assert.notEqual(a.GUARDIAN_CELL_ID, b.GUARDIAN_CELL_ID)
-    assert.notEqual(a.GUARDIAN_DATA_DIR, b.GUARDIAN_DATA_DIR)
-    assert.equal(a.GUARDIAN_ALLOW_LOCAL_LAB, '1')
+    assert.notEqual(a.KOVO_CELL_ID, b.KOVO_CELL_ID)
+    assert.notEqual(a.KOVO_DATA_DIR, b.KOVO_DATA_DIR)
+    assert.equal(a.KOVO_ALLOW_LOCAL_LAB, '1')
   })
 
   test('cellLabel yields a docker-safe, collapsed label', () => {
@@ -395,7 +395,7 @@ describe('cell isolation', () => {
 
   test('rewriteProfileEndpoints routes only enabled profiles through the gate', () => {
     const dir = tempDir('profiles')
-    const db = new DatabaseSync(join(dir, 'guardian.sqlite'))
+    const db = new DatabaseSync(join(dir, 'kovo.sqlite'))
     db.exec('create table model_profiles (id text primary key, endpoint text, enabled integer, updated_at integer)')
     db.prepare('insert into model_profiles values (?,?,?,?)').run('on', 'https://openrouter.ai/api/v1', 1, 0)
     db.prepare('insert into model_profiles values (?,?,?,?)').run('off', 'https://disabled.invalid/v1', 0, 0)
@@ -403,7 +403,7 @@ describe('cell isolation', () => {
     const result = rewriteProfileEndpoints(dir, endpoint => `http://127.0.0.1:9999/g/${Buffer.from(endpoint).toString('base64url')}`)
     assert.equal(result.updated, 1)
     assert.deepEqual(result.endpoints, ['https://openrouter.ai/api/v1'])
-    const check = new DatabaseSync(join(dir, 'guardian.sqlite'), { readOnly: true })
+    const check = new DatabaseSync(join(dir, 'kovo.sqlite'), { readOnly: true })
     const rows = check.prepare('select id, endpoint from model_profiles order by id').all() as Array<{ id: string; endpoint: string }>
     check.close()
     assert.match(rows.find(row => row.id === 'on')!.endpoint, /^http:\/\/127\.0\.0\.1:9999\/g\//)
@@ -418,7 +418,7 @@ describe('cell-labeled reaper', () => {
     const live = new Set(['id-a', 'id-b'])
     const docker = async (args: string[]) => {
       if (args[0] === 'ps') {
-        const filter = args.find(arg => arg.startsWith('label=dev.guardian.cell='))!
+        const filter = args.find(arg => arg.startsWith('label=dev.kovo.cell='))!
         queries.push(filter)
         const id = filter.endsWith('cell-a') ? 'id-a' : filter.endsWith('cell-b') ? 'id-b' : ''
         return live.has(id) ? id : ''
@@ -437,7 +437,7 @@ describe('cell-labeled reaper', () => {
     assert.deepEqual(removals, [['id-a']])
     assert.equal(await reaper.reapAll(), 1)
     assert.deepEqual(removals.slice(1).sort(), [['id-b']])
-    assert.ok(queries.every(query => query.startsWith('label=dev.guardian.cell=')))
+    assert.ok(queries.every(query => query.startsWith('label=dev.kovo.cell=')))
   })
 
   test('orphans() lists only owned labels', async () => {
@@ -457,17 +457,17 @@ describe('warm worker pool', () => {
   test('pre-creates one labeled session container with the hardened flags intact', async () => {
     dockerArgs.length = 0
     const pool = new WarmWorkerPool({
-      cell: 'cell-a', image: 'guardian-worker:v4', dockerRunner: runner, runLabel: 'cell-a',
+      cell: 'cell-a', image: 'kovo-worker:v4', dockerRunner: runner, runLabel: 'cell-a',
     })
     const name = await pool.warm()
-    assert.ok(name && name.startsWith('guardian-'))
+    assert.ok(name && name.startsWith('kovo-'))
     assert.equal(pool.state, 'ready')
     const create = dockerArgs.find(args => args[0] === 'container' && args[1] === 'create')!
     for (const flag of ['--network', '--user', '--read-only', '--cap-drop', '--security-opt']) {
       assert.ok(create.includes(flag), `missing ${flag}`)
     }
-    assert.ok(create.includes('dev.guardian.cell=cell-a'))
-    assert.ok(create.includes('dev.guardian.warm=1'))
+    assert.ok(create.includes('dev.kovo.cell=cell-a'))
+    assert.ok(create.includes('dev.kovo.warm=1'))
     assert.ok(create.includes('--session'))
     const taken = await pool.take(new AbortController().signal)
     assert.equal(taken, name)
@@ -487,7 +487,7 @@ describe('warm worker pool', () => {
 
   test('does not hand out a container for mismatched session options', async () => {
     const pool = new WarmWorkerPool({
-      cell: 'cell-c', image: 'guardian-worker:v4', dockerRunner: runner, runLabel: 'cell-c',
+      cell: 'cell-c', image: 'kovo-worker:v4', dockerRunner: runner, runLabel: 'cell-c',
     })
     await pool.warm()
     const taken = await pool.take(new AbortController().signal, { memoryMb: 4096, reposDir: '/tmp' })
@@ -497,14 +497,14 @@ describe('warm worker pool', () => {
 
   test('container builder keeps security flags and adds the cell label', () => {
     const args = workerContainerCreateArgs({
-      image: 'guardian-worker:v4', name: 'guardian-test', assignmentId: 'a',
+      image: 'kovo-worker:v4', name: 'kovo-test', assignmentId: 'a',
       runLabel: 'run', cell: 'cell-z',
     })
     assert.ok(args.includes('--read-only'))
     assert.ok(args.includes('--cap-drop') && args.includes('ALL'))
     assert.ok(args.includes('--security-opt') && args.includes('no-new-privileges'))
     assert.ok(args.includes('--user') && args.includes('10001:10001'))
-    assert.ok(args.includes('dev.guardian.cell=cell-z'))
+    assert.ok(args.includes('dev.kovo.cell=cell-z'))
   })
 })
 
@@ -564,7 +564,7 @@ describe('matrix summary', () => {
 describe('CLI defaults', () => {
   test('agentic matrix defaults enable gate, warm workers and watermarks', () => {
     const args = parseMatrixArgs(['--apps', 'acme-saas', '--seeds', '42', '--data-dir', '/tmp/gd'], {
-      GUARDIAN_RB_HELDOUT_SALT: 'a'.repeat(48),
+      KOVO_RB_HELDOUT_SALT: 'a'.repeat(48),
     } as NodeJS.ProcessEnv)
     assert.equal(args.modelGate, true)
     assert.equal(args.warmWorkers, true)
@@ -581,7 +581,7 @@ describe('CLI defaults', () => {
     assert.equal(args.warmWorkers, false)
     assert.equal(args.modelGate, false)
     const envArgs = parseMatrixArgs(['--apps', 'acme-saas', '--seeds', '42', '--data-dir', '/tmp/gd'], {
-      GUARDIAN_WARM_WORKERS: '0', GUARDIAN_MODEL_GATE: '0',
+      KOVO_WARM_WORKERS: '0', KOVO_MODEL_GATE: '0',
     } as NodeJS.ProcessEnv)
     assert.equal(envArgs.warmWorkers, false)
     assert.equal(envArgs.modelGate, false)
@@ -589,14 +589,14 @@ describe('CLI defaults', () => {
 
   test('per-cell env marks the cell for the worker backend label', () => {
     const env = cellEnv(cell(), matrixArgs())
-    assert.equal(env.GUARDIAN_CELL_ID, 'acme-saas-seed42-grey-box')
-    assert.equal(env.GUARDIAN_ALLOW_LOCAL_LAB, '1')
+    assert.equal(env.KOVO_CELL_ID, 'acme-saas-seed42-grey-box')
+    assert.equal(env.KOVO_ALLOW_LOCAL_LAB, '1')
   })
 
   test('global stream cap is env-overridable and clamped', () => {
     assert.equal(defaultMaxInFlightStreams({} as NodeJS.ProcessEnv), 28)
-    assert.equal(defaultMaxInFlightStreams({ GUARDIAN_MODEL_MAX_STREAMS: '12' } as NodeJS.ProcessEnv), 12)
-    assert.equal(defaultMaxInFlightStreams({ GUARDIAN_MODEL_MAX_STREAMS: '0' } as NodeJS.ProcessEnv), 28)
-    assert.equal(defaultMaxInFlightStreams({ GUARDIAN_MODEL_MAX_STREAMS: '9999' } as NodeJS.ProcessEnv), 256)
+    assert.equal(defaultMaxInFlightStreams({ KOVO_MODEL_MAX_STREAMS: '12' } as NodeJS.ProcessEnv), 12)
+    assert.equal(defaultMaxInFlightStreams({ KOVO_MODEL_MAX_STREAMS: '0' } as NodeJS.ProcessEnv), 28)
+    assert.equal(defaultMaxInFlightStreams({ KOVO_MODEL_MAX_STREAMS: '9999' } as NodeJS.ProcessEnv), 256)
   })
 })

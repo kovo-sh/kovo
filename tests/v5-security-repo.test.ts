@@ -50,7 +50,7 @@ function hasSymlinkUnder(root: string): boolean {
 }
 
 function buildFixtureRepo(t: { after: (fn: () => void) => void }) {
-  const root = makeTempDir(t, 'guardian-sec-repo-')
+  const root = makeTempDir(t, 'kovo-sec-repo-')
   const outside = join(root, 'outside')
   mkdirSync(outside, { recursive: true })
   writeFileSync(join(outside, 'outside.ts'), `import express from 'express'\nconst r = express.Router()\nr.get('/outside-route', (_req, res) => res.end('x'))\n`)
@@ -135,8 +135,8 @@ test('recon does not read symlinked manifests or routes', t => {
 // ============================================================================
 
 test('safeResolveUnderRoot rejects traversal, absolute paths and symlinked components', t => {
-  const root = makeTempDir(t, 'guardian-safe-resolve-')
-  const outside = makeTempDir(t, 'guardian-safe-resolve-out-')
+  const root = makeTempDir(t, 'kovo-safe-resolve-')
+  const outside = makeTempDir(t, 'kovo-safe-resolve-out-')
   writeFileSync(join(outside, 'secret.ts'), OUTSIDE_CANARY)
   writeFileSync(join(root, 'app.ts'), 'export const ok = true\n')
   symlinkSync('/etc/passwd', join(root, 'passwd-link.ts'))
@@ -155,8 +155,8 @@ test('safeResolveUnderRoot rejects traversal, absolute paths and symlinked compo
 })
 
 test('patch application cannot write through a symlinked target', t => {
-  const root = makeTempDir(t, 'guardian-patch-symlink-')
-  const outside = makeTempDir(t, 'guardian-patch-symlink-out-')
+  const root = makeTempDir(t, 'kovo-patch-symlink-')
+  const outside = makeTempDir(t, 'kovo-patch-symlink-out-')
   const victim = join(outside, 'victim.ts')
   writeFileSync(victim, 'export const value = "original"\n')
   symlinkSync(victim, join(root, 'victim.ts'))
@@ -203,7 +203,7 @@ test('patch work copy is built without symlinks', t => {
 // ============================================================================
 
 test('IAST telemetry dir is owner-only and lab containers run as a non-root user', t => {
-  const root = makeTempDir(t, 'guardian-iast-perms-')
+  const root = makeTempDir(t, 'kovo-iast-perms-')
   const telemetryDir = join(root, 'telemetry')
   prepareIastTelemetryDir(telemetryDir)
 
@@ -214,23 +214,23 @@ test('IAST telemetry dir is owner-only and lab containers run as a non-root user
   const user = resolveLabContainerUser()
   assert.match(user, /^\d+:\d+$/)
   assert.notEqual(user.split(':')[0], '0', 'lab container user must not be root')
-  assert.throws(() => resolveLabContainerUser({ GUARDIAN_LAB_USER: '0:0' }), /non-root|rejected/i)
-  assert.throws(() => resolveLabContainerUser({ GUARDIAN_LAB_USER: 'nobody' }), /numeric/i)
+  assert.throws(() => resolveLabContainerUser({ KOVO_LAB_USER: '0:0' }), /non-root|rejected/i)
+  assert.throws(() => resolveLabContainerUser({ KOVO_LAB_USER: 'nobody' }), /numeric/i)
 
   const runArgs = buildLabContainerRunArgs({
-    containerName: 'guardian-lab-app-test',
-    networkName: 'guardian-lab-net-test',
+    containerName: 'kovo-lab-app-test',
+    networkName: 'kovo-lab-net-test',
     runId: 'run-test',
     serviceName: 'app',
     imageName: 'node:24-bookworm-slim',
     cmd: ['node', '/app/app.js'],
     internalPort: 8080,
     mountArgs: [
-      '--mount', `type=bind,source=${telemetryDir},target=/var/run/guardian-iast`,
+      '--mount', `type=bind,source=${telemetryDir},target=/var/run/kovo-iast`,
       '--mount', 'type=bind,source=/repos/app,target=/app,readonly', '--workdir', '/app',
     ],
     env: {},
-    extraEnv: { GUARDIAN_IAST_OUT_DIR: '/var/run/guardian-iast' },
+    extraEnv: { KOVO_IAST_OUT_DIR: '/var/run/kovo-iast' },
     memoryLimit: '512m',
     cpus: '1.0',
     pidsLimit: 128,
@@ -243,12 +243,12 @@ test('IAST telemetry dir is owner-only and lab containers run as a non-root user
   assert.ok(runArgs.includes('--cap-drop'))
   assert.equal(runArgs[runArgs.indexOf('--cap-drop') + 1], 'ALL')
   assert.ok(runArgs.includes('--read-only'))
-  assert.ok(runArgs.some(a => a.includes('target=/var/run/guardian-iast')))
+  assert.ok(runArgs.some(a => a.includes('target=/var/run/kovo-iast')))
 
   // The only writable bind mount is the 0700 telemetry dir; /app stays read-only.
   const writableMounts = runArgs.filter(a => a.startsWith('type=bind,') && !a.endsWith('readonly'))
   assert.equal(writableMounts.length, 1)
-  assert.match(writableMounts[0], /guardian-iast/)
+  assert.match(writableMounts[0], /kovo-iast/)
   assert.equal(mode & 0o002, 0, 'writable telemetry mount must not be world-writable')
 })
 

@@ -27,12 +27,12 @@ import { setupApprovedRun } from './v4-tier-helpers.ts'
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const executionSource = readFileSync(join(repoRoot, 'src/server/execution.ts'), 'utf8')
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const ORIGIN = 'http://127.0.0.1:7788'
 
 function makeStore(t: { after: (fn: () => void) => void }): Store {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v7-confirm-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v7-confirm-'))
   const storage = new Store(dir)
   t.after(() => {
     storage.close()

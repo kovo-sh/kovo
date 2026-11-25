@@ -98,15 +98,15 @@ test('enforces DNS public-IP check, 8-hop redirect scope, abort-before-dial, and
   )
   assert.equal(attempted.length, 0)
 
-  // local-lab requires BOTH grant.allowLocalLab=true AND GUARDIAN_ALLOW_LOCAL_LAB=1
-  const prevEnv = process.env.GUARDIAN_ALLOW_LOCAL_LAB
+  // local-lab requires BOTH grant.allowLocalLab=true AND KOVO_ALLOW_LOCAL_LAB=1
+  const prevEnv = process.env.KOVO_ALLOW_LOCAL_LAB
   try {
-    delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
+    delete process.env.KOVO_ALLOW_LOCAL_LAB
     await assert.rejects(
       privateBroker.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: '/' }, makeGrant({ allowLocalLab: true }), AbortSignal.timeout(5_000)),
       /public addresses/,
     )
-    process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+    process.env.KOVO_ALLOW_LOCAL_LAB = '1'
     await assert.rejects(
       privateBroker.executeHttp({ origin: northstar, method: 'GET', pathAndQuery: '/' }, makeGrant({ allowLocalLab: false }), AbortSignal.timeout(5_000)),
       /public addresses/,
@@ -123,8 +123,8 @@ test('enforces DNS public-IP check, 8-hop redirect scope, abort-before-dial, and
     assert.equal(labRes.status, 200)
     assert.equal(labRes.body, 'local-lab-ok')
   } finally {
-    if (prevEnv === undefined) delete process.env.GUARDIAN_ALLOW_LOCAL_LAB
-    else process.env.GUARDIAN_ALLOW_LOCAL_LAB = prevEnv
+    if (prevEnv === undefined) delete process.env.KOVO_ALLOW_LOCAL_LAB
+    else process.env.KOVO_ALLOW_LOCAL_LAB = prevEnv
   }
 
   // Abort while DNS is unresolved must never dial
@@ -273,7 +273,7 @@ test('enforces Tiers 0-3 capabilities and Tier 3 HITL approval requests', async 
   assert.equal(approvedRes.status, 200)
 
   // Store-level HITL approval request lifecycle (approve + deny)
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-hitl-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-hitl-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -304,7 +304,7 @@ test('enforces Tiers 0-3 capabilities and Tier 3 HITL approval requests', async 
 // ============================================================================
 
 test('isolates persona secrets at 0600, strips auth on cross-origin redirect, and prevents leaks across exchanges/artifacts/exports', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-persona-vault-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-persona-vault-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -328,7 +328,7 @@ test('isolates persona secrets at 0600, strips auth on cross-origin redirect, an
   assert.ok(!JSON.stringify(pubList).includes(rawSecret))
 
   // Credential file on disk is strictly 0600
-  const credFiles = readFileSync(join(dir, 'guardian.sqlite'))
+  const credFiles = readFileSync(join(dir, 'kovo.sqlite'))
   assert.ok(!credFiles.includes(rawSecret), 'Raw persona secret must never be stored in SQLite.')
   const credDir = join(dir, 'credentials')
   const { readdirSync } = await import('node:fs')
@@ -437,7 +437,7 @@ test('isolates persona secrets at 0600, strips auth on cross-origin redirect, an
 
   // Live on-disk secret rotation (e.g., short-lived Clerk JWT refresh via atomic 0600 temp+rename):
   // broker must immediately send the rotated token while still scrubbing BOTH old and new tokens!
-  const rotatedSecret = 'guardian-secret-token-rotated-99887766'
+  const rotatedSecret = 'kovo-secret-token-rotated-99887766'
   const { renameSync, writeFileSync } = await import('node:fs')
   const personaFile = join(credDir, files[0])
   const tmpFile = personaFile + '.tmp'
@@ -539,8 +539,8 @@ test('enforces --network none intent container, NDJSON staging, all offline anal
     else process.env.DOCKER_HOST = prevDockerHost
   }
 
-  const wsDirA = mkdtempSync(join(tmpdir(), 'guardian-ws-a-'))
-  const wsDirB = mkdtempSync(join(tmpdir(), 'guardian-ws-b-'))
+  const wsDirA = mkdtempSync(join(tmpdir(), 'kovo-ws-a-'))
+  const wsDirB = mkdtempSync(join(tmpdir(), 'kovo-ws-b-'))
   t.after(() => {
     rmSync(wsDirA, { recursive: true, force: true })
     rmSync(wsDirB, { recursive: true, force: true })
@@ -559,7 +559,7 @@ test('enforces --network none intent container, NDJSON staging, all offline anal
 
   let containerId = ''
   for (let attempt = 0; attempt < 60 && !containerId; attempt += 1) {
-    containerId = (await exec('docker', ['ps', '-q', '--filter', 'label=dev.guardian.assignment=' + assignmentId])).stdout.trim()
+    containerId = (await exec('docker', ['ps', '-q', '--filter', 'label=dev.kovo.assignment=' + assignmentId])).stdout.trim()
     if (!containerId) await delay(50)
   }
   assert.ok(containerId, 'Persistent intent container must be running.')
@@ -576,7 +576,7 @@ test('enforces --network none intent container, NDJSON staging, all offline anal
   const probe = [
     'if (process.getuid() !== 10001) process.exit(11)',
     "if (require('node:fs').existsSync('/var/run/docker.sock')) process.exit(12)",
-    "if (process.env.OPENROUTER_API_KEY || process.env.GUARDIAN_DATA_DIR) process.exit(13)",
+    "if (process.env.OPENROUTER_API_KEY || process.env.KOVO_DATA_DIR) process.exit(13)",
     "fetch(process.argv[1], {signal: AbortSignal.timeout(700)}).then(() => process.exit(14), () => console.log('blocked'))",
   ].join('\n')
   const probeRes = await exec('docker', ['exec', containerId, 'node', '-e', probe, hostFixture.url])
@@ -669,15 +669,15 @@ test('enforces --network none intent container, NDJSON staging, all offline anal
   const { createHash } = await import('node:crypto')
   const { realpathSync } = await import('node:fs')
   const ownerHash = (id: string, d: string) => createHash('sha256').update(id).update('\0').update(realpathSync(d)).digest('hex')
-  const orphanA = 'guardian-' + randomUUID()
-  const foreignB = 'guardian-' + randomUUID()
+  const orphanA = 'kovo-' + randomUUID()
+  const foreignB = 'kovo-' + randomUUID()
   await exec('docker', [
     'container', 'create', '--name', orphanA, '--network', 'none',
-    '--label', `dev.guardian.workspace=${ownerHash('ws-a', wsDirA)}`, 'guardian-worker:local', '--session',
+    '--label', `dev.kovo.workspace=${ownerHash('ws-a', wsDirA)}`, 'kovo-worker:local', '--session',
   ])
   await exec('docker', [
     'container', 'create', '--name', foreignB, '--network', 'none',
-    '--label', `dev.guardian.workspace=${ownerHash('ws-b', wsDirB)}`, 'guardian-worker:local', '--session',
+    '--label', `dev.kovo.workspace=${ownerHash('ws-b', wsDirB)}`, 'kovo-worker:local', '--session',
   ])
   t.after(async () => {
     await exec('docker', ['container', 'rm', '--force', orphanA, foreignB]).catch(() => undefined)
@@ -692,16 +692,16 @@ test('enforces --network none intent container, NDJSON staging, all offline anal
 // ============================================================================
 
 test('correlates CVE-2025-29927 hypothesis, confirms vulnerable fixture, rules out edge-blocked, and rejects SPA catch-all', async () => {
-  const prevOffline = process.env.GUARDIAN_OFFLINE
-  process.env.GUARDIAN_OFFLINE = '1'
+  const prevOffline = process.env.KOVO_OFFLINE
+  process.env.KOVO_OFFLINE = '1'
   try {
     const advisories = await queryCves({ ecosystem: 'npm', package: 'next', version: '14.2.20' })
     const cve = advisories.find(a => a.id === 'CVE-2025-29927')
     assert.ok(cve, 'Curated CVE-2025-29927 advisory must be returned for Next.js.')
     assert.equal(cve.severity, 'critical')
   } finally {
-    if (prevOffline === undefined) delete process.env.GUARDIAN_OFFLINE
-    else process.env.GUARDIAN_OFFLINE = prevOffline
+    if (prevOffline === undefined) delete process.env.KOVO_OFFLINE
+    else process.env.KOVO_OFFLINE = prevOffline
   }
 
   const backend = new LinuxWorkerBackend()
@@ -752,7 +752,7 @@ test('correlates CVE-2025-29927 hypothesis, confirms vulnerable fixture, rules o
           body: '<!doctype html><html><head><title>App</title></head><body><div id="root">SPA Shell admin_panel_secret_view</div></body></html>',
         }
       }
-      if (url.pathname.startsWith('/.guardian-nonexistent-')) {
+      if (url.pathname.startsWith('/.kovo-nonexistent-')) {
         return { status: 404, headers: { 'content-type': 'text/plain' }, body: 'Not Found' }
       }
       const hasSubreq = Boolean(opts?.headers?.['x-middleware-subrequest'])
@@ -841,7 +841,7 @@ test('retires dns_takeover, tls_audit, and browser_dom fail-closed while ScopedB
   ]) {
     const res = await verifyReplaySpec({ spec, broker: noopBroker, backend, grant: makeGrant(), signal: AbortSignal.timeout(10_000) })
     assert.equal(res.verdict, 'dismissed')
-    assert.equal(res.outcome.reason, 'retired_legacy_spec_kind: use guardian_verify')
+    assert.equal(res.outcome.reason, 'retired_legacy_spec_kind: use kovo_verify')
     assert.equal(res.exchanges.length, 0)
   }
 
@@ -1079,7 +1079,7 @@ test('enforces rce_proof cryptographic nonces (dynamic_math, split_echo, oob_can
     transport: async (_url, _addr, _sig, opts) => {
       const parsed = JSON.parse(opts?.body ?? '{}') as { mode?: string; url?: string }
       if (triggerProbe && parsed.mode === 'exec' && parsed.url) {
-        // Simulate asynchronous server-side callback to Guardian's local canary listener
+        // Simulate asynchronous server-side callback to Kovo Hunter's local canary listener
         void fetch(parsed.url, { signal: AbortSignal.timeout(3_000) }).catch(() => undefined)
       }
       return { status: 202, headers: { 'content-type': 'application/json' }, body: '{"queued":true}' }
@@ -1106,7 +1106,7 @@ test('enforces rce_proof cryptographic nonces (dynamic_math, split_echo, oob_can
 // ============================================================================
 
 test('transitively taints downstream graph nodes on scope revocation, keeps early facts raw, and enforces budget_paused -> resume', async t => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-graph-budget-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-graph-budget-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)
   t.after(() => storage.close())
@@ -1234,7 +1234,7 @@ test('transitively taints downstream graph nodes on scope revocation, keeps earl
 // ============================================================================
 
 test('clones full repos without .git/credentials, extracts deep lockfiles, and mounts /repos read-only without symlink escapes in Docker worker', { timeout: 45_000 }, async t => {
-  const workDir = mkdtempSync(join(tmpdir(), 'guardian-repos-test-'))
+  const workDir = mkdtempSync(join(tmpdir(), 'kovo-repos-test-'))
   t.after(() => rmSync(workDir, { recursive: true, force: true }))
 
   // 1. PAT 0600 permission check & invalid owner/repo validation
@@ -1286,8 +1286,8 @@ test('clones full repos without .git/credentials, extracts deep lockfiles, and m
   mkdirSync(join(gitOriginParent, 'acme'), { recursive: true })
 
   await exec('git', ['init', '-b', 'main', srcRepo])
-  await exec('git', ['-C', srcRepo, 'config', 'user.email', 'test@guardian.local'])
-  await exec('git', ['-C', srcRepo, 'config', 'user.name', 'Guardian Test'])
+  await exec('git', ['-C', srcRepo, 'config', 'user.email', 'test@kovo.local'])
+  await exec('git', ['-C', srcRepo, 'config', 'user.name', 'Kovo Hunter Test'])
 
   // Create >45 filler files so we prove no 40-file cap applies to full clone / dependency walk
   mkdirSync(join(srcRepo, 'src', 'routes'), { recursive: true })
@@ -1373,7 +1373,7 @@ test('clones full repos without .git/credentials, extracts deep lockfiles, and m
   // Plant an out-of-tree symlink on host to verify Docker OverlayFs allowSymlinks: false blocks reading it
   symlinkSync('/etc/passwd', join(reposDir, 'acme', 'demo-app', 'escape-link'))
 
-  // 5. Mount /repos read-only inside real guardian-worker:local Docker container
+  // 5. Mount /repos read-only inside real kovo-worker:local Docker container
   const backend = new LinuxWorkerBackend()
 
   // Reject invalid reposDir containing commas
@@ -1389,7 +1389,7 @@ test('clones full repos without .git/credentials, extracts deep lockfiles, and m
   // Inspect Docker container HostConfig to verify readonly bind mount + --network none
   let containerId = ''
   for (let attempt = 0; attempt < 60 && !containerId; attempt += 1) {
-    containerId = (await exec('docker', ['ps', '-q', '--filter', 'label=dev.guardian.assignment=' + assignmentId])).stdout.trim()
+    containerId = (await exec('docker', ['ps', '-q', '--filter', 'label=dev.kovo.assignment=' + assignmentId])).stdout.trim()
     if (!containerId) await delay(50)
   }
   assert.ok(containerId, 'Worker container with /repos mount must be running.')

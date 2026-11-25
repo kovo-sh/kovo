@@ -39,7 +39,7 @@ import {
   buildWorkerTools,
   parseNegativeEdgeGapReason,
   selectPreInjectionSkills,
-  summarizeGuardianVerifyOutcome,
+  summarizeKovoVerifyOutcome,
 } from '../src/server/agent-session.ts'
 import { RequestBroker, type Grant } from '../src/server/broker.ts'
 import { Execution, FrontierWaveController, nextPlannerDryRounds, runV8AgentScriptProof, syncVerifyArtifactsToLedger } from '../src/server/execution.ts'
@@ -62,14 +62,14 @@ import type {
 } from '../src/server/worker-backend.ts'
 import { setupApprovedRun } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
 const execFileAsync = promisify(execFile)
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const RAW_SIGNING_SALT = 's_v8_exec_wire_secret_salt_7a6b5c4d3e2f'
 
 function makeStore(t: { after: (fn: () => void) => void }): { storage: Store; dir: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v8-exec-wire-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v8-exec-wire-'))
   const storage = new Store(dir)
   t.after(() => {
     storage.close()
@@ -318,7 +318,7 @@ test('1. Run-scoped DerivedCapabilityVault persists sealed handles across two Ve
 
     return {
       runtime: req.runtime,
-      result: { sdk: 'guardian_verify.ts', nonce: req.nonce, title: 'Hop 1 capability seal', claims: [] },
+      result: { sdk: 'kovo_verify.ts', nonce: req.nonce, title: 'Hop 1 capability seal', claims: [] },
       stdout: '',
       stderr: '',
       exitCode: 0,
@@ -432,7 +432,7 @@ test('1. Run-scoped DerivedCapabilityVault persists sealed handles across two Ve
 
     return {
       runtime: req.runtime,
-      result: { sdk: 'guardian_verify.ts', nonce: req.nonce, title: 'Worker 2 pivot', claims: [] },
+      result: { sdk: 'kovo_verify.ts', nonce: req.nonce, title: 'Worker 2 pivot', claims: [] },
       stdout: '',
       stderr: '',
       exitCode: 0,
@@ -466,7 +466,7 @@ test('1. Run-scoped DerivedCapabilityVault persists sealed handles across two Ve
   assert.equal(sync2.verifiedHops.some(h => h.binding === 'derived_crypto_binding'), true)
 
   // Raw secret MUST NEVER appear in any RPC output, tool summary, transcript, or CapabilityLedger row!
-  const summary2 = summarizeGuardianVerifyOutcome({
+  const summary2 = summarizeKovoVerifyOutcome({
     ...worker2Proof.verdict,
     sealedCapabilities: sync2.sealedCapabilities,
     verifiedHops: sync2.verifiedHops,
@@ -612,7 +612,7 @@ test('2. Verified CompositeProofReceipt persists cleanly to Store, satisfies aud
     return {
       runtime: req.runtime,
       result: {
-        sdk: 'guardian_verify.ts',
+        sdk: 'kovo_verify.ts',
         nonce: req.nonce,
         title: 'Multi-hop cryptographic scope replay into restricted vault export',
         severity: 'critical',

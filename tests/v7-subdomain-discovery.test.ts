@@ -143,7 +143,7 @@ test('discoverSubdomainsForOrigins degrades gracefully on crt.sh 429/5xx and res
 })
 
 test('wildcard *.domain opt-in auto-admits first-party subdomains while keeping third-party CNAMEs unapproved candidates', async () => {
-  const { dir, store } = tempStore('guardian-sub-wildcard-')
+  const { dir, store } = tempStore('kovo-sub-wildcard-')
   try {
     const proj = store.createProject({
       requestId: randomUUID(),
@@ -278,7 +278,7 @@ test('wildcard *.domain opt-in auto-admits first-party subdomains while keeping 
 })
 
 test('strict single-host mode (includeSubdomains: false) keeps discovered subdomains as unapproved candidates only', async () => {
-  const { dir, store } = tempStore('guardian-sub-strict-')
+  const { dir, store } = tempStore('kovo-sub-strict-')
   try {
     const proj = store.createProject({
       requestId: randomUUID(),

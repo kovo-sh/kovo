@@ -18,7 +18,7 @@ function withTempStore(
   options?: ConstructorParameters<typeof Store>[1],
 ) {
   return async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'guardian-arch-b3-'))
+    const dir = mkdtempSync(join(tmpdir(), 'kovo-arch-b3-'))
     const store = new Store(dir, options ?? { ftsMode: 'preview' })
     try {
       await fn({ dir, store })
@@ -890,14 +890,14 @@ test('Store.deleteRun and Store.deleteProject work cleanly on fresh cascaded DBs
 }))
 
 test('Store.deleteRun and Store.deleteProject stay 100% backward-compatible on legacy pre-cascade SQLite DBs', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-arch-b3-legacy-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-arch-b3-legacy-'))
   try {
     // Bootstrap a genuine pre-cascade SQLite DB from the legacy v2 Drizzle migration SQL (0 ON DELETE CASCADE!)
     const legacySql = readFileSync(
       join(REPO_ROOT, 'drizzle', '20261120220711_guardian_v2_initial', 'migration.sql'),
       'utf8',
     )
-    const raw = new DatabaseSync(join(dir, 'guardian.sqlite'))
+    const raw = new DatabaseSync(join(dir, 'kovo.sqlite'))
     for (const stmt of legacySql.split('--> statement-breakpoint')) {
       const trimmed = stmt.trim()
       if (trimmed) raw.exec(trimmed)

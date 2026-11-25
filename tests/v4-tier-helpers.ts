@@ -24,7 +24,7 @@ export const execFileAsync = promisify(execFile)
 export const repoRoot = resolve(new URL('..', import.meta.url).pathname)
 export const RAW_STRIPE_SECRET = 'sk_live_TESTFIXTURE000000000000000000'
 export const RAW_AWS_SECRET = 'AKIAIOSFODNN7EXAMPLE'
-export const RAW_JWT_SECRET = 'super-secret-guardian-v4-hs256-signing-key-9988'
+export const RAW_JWT_SECRET = 'super-secret-kovo-v4-hs256-signing-key-9988'
 
 // ============================================================================
 // Dynamic v4 Module & Contract Bridges (TS-safe before & after M1-M6 land)
@@ -34,7 +34,7 @@ export async function loadV4Module<T = Record<string, unknown>>(relPathFromRepoR
   const abs = resolve(repoRoot, relPathFromRepoRoot)
   assert.ok(
     existsSync(abs),
-    `Expected Guardian v4 module "${relPathFromRepoRoot}" to exist at ${abs}`,
+    `Expected Kovo Hunter v4 module "${relPathFromRepoRoot}" to exist at ${abs}`,
   )
   return await import(pathToFileURL(abs).href) as T
 }
@@ -295,7 +295,7 @@ export async function withEnv<T>(vars: Record<string, string | undefined>, fn: (
   }
 }
 
-export function makeTempDir(t: TestContext, prefix = 'guardian-v4-tier-'): string {
+export function makeTempDir(t: TestContext, prefix = 'kovo-v4-tier-'): string {
   const dir = mkdtempSync(join(tmpdir(), prefix))
   // The hardened worker runs as UID 10001 and bind-mounts repo fixtures, so
   // the mount root must be traversable by that user (mkdtemp defaults to 0700).
@@ -306,7 +306,7 @@ export function makeTempDir(t: TestContext, prefix = 'guardian-v4-tier-'): strin
   return dir
 }
 
-export function makeStore(t: TestContext, prefix = 'guardian-v4-db-'): { dir: string; storage: Store } {
+export function makeStore(t: TestContext, prefix = 'kovo-v4-db-'): { dir: string; storage: Store } {
   const dir = makeTempDir(t, prefix)
   const storage = new Store(dir)
   t.after(() => {
@@ -436,7 +436,7 @@ export async function setupApprovedRun(
   }
 
   return environment === 'local-lab'
-    ? await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, runSetup)
+    ? await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, runSetup)
     : runSetup()
 }
 
@@ -601,10 +601,10 @@ export async function startMockLlmServer(
   const fixture = await startHttpFixture(t, (req, body, res) => {
     const parsed = body ? JSON.parse(body) as Record<string, unknown> : {}
     const tools = Array.isArray(parsed.tools) ? (parsed.tools as Array<{ name?: string }>) : []
-    const isConnPing = tools.some(tl => tl.name === 'guardian_connection')
+    const isConnPing = tools.some(tl => tl.name === 'kovo_connection')
     const idx = isConnPing ? -1 : calls.length
     const reply = isConnPing
-      ? { type: 'tool_call' as const, callId: `call_conn_${Date.now()}`, name: 'guardian_connection', argumentsJson: JSON.stringify({ status: 'ready' }) }
+      ? { type: 'tool_call' as const, callId: `call_conn_${Date.now()}`, name: 'kovo_connection', argumentsJson: JSON.stringify({ status: 'ready' }) }
       : (() => {
           calls.push({ body: parsed, headers: req.headers })
           return responder({ body: parsed, headers: req.headers }, idx)
@@ -766,14 +766,14 @@ export async function dockerAvailable(): Promise<boolean> {
   }
 }
 
-export async function assertZeroGuardianOrphans(runId?: string): Promise<void> {
-  assert.equal(await dockerAvailable(), true, 'Docker daemon is required to verify zero Guardian orphans')
+export async function assertZeroKovoOrphans(runId?: string): Promise<void> {
+  assert.equal(await dockerAvailable(), true, 'Docker daemon is required to verify zero Kovo Hunter orphans')
   // Scope the assertion to the caller: a run id covers worker + lab containers for that run.
   // Without one, only this process's worker containers are ours to assert on — a global
-  // `dev.guardian.run` filter would flag concurrent streams' live containers as orphans.
+  // `dev.kovo.run` filter would flag concurrent streams' live containers as orphans.
   const runFilter = runId
-    ? ['--filter', `label=dev.guardian.run=${runId}`]
-    : ['--filter', `label=dev.guardian.session=${workerProcessSessionId()}`]
+    ? ['--filter', `label=dev.kovo.run=${runId}`]
+    : ['--filter', `label=dev.kovo.session=${workerProcessSessionId()}`]
   // Cleanup is asynchronous at the edges (a close handler may still be in flight); poll briefly
   // so a container that is already being removed is not reported as a leak.
   const deadline = Date.now() + 5_000
@@ -870,7 +870,7 @@ export function baseReplaySpecFields(origin: string) {
   return {
     version: 1 as const,
     origin,
-    title: 'Guardian v4 Opaque-Box Replay Test',
+    title: 'Kovo Hunter v4 Opaque-Box Replay Test',
     category: 'broken-access-control' as const,
     cwe: 'CWE-639',
     severity: 'high' as const,

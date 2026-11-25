@@ -1,5 +1,5 @@
 /**
- * v7 guardian-verify-default — verifies `guardian_verify` is exposed on every specialist bundle
+ * v7 kovo-verify-default — verifies `kovo_verify` is exposed on every specialist bundle
  * when registered (Docker backend) and clearly prioritized ahead of legacy `verify_replay_spec`
  * and `propose_chain_finding` across tool ordering, descriptions, system instructions, and repair
  * feedback.
@@ -13,15 +13,15 @@ import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import {
-  GUARDIAN_VERIFY_TOOL_DESCRIPTION,
-  GUARDIAN_VERIFY_USAGE_HINT,
+  KOVO_VERIFY_TOOL_DESCRIPTION,
+  KOVO_VERIFY_USAGE_HINT,
   SPECIALIST_COMMON_TOOLS,
   SPECIALIST_PROFILES,
   buildWorkerTools,
   coordinatorPlannerPrompt,
   filterHandlersForSpecialist,
   proofToolHandlerNames,
-  summarizeGuardianVerifyOutcome,
+  summarizeKovoVerifyOutcome,
   verifierRepairFeedback,
   withVerifierRepairFeedback,
   workerSessionInstructions,
@@ -43,13 +43,13 @@ import {
 } from '../src/server/verify-rpc.ts'
 import { makeLabGrant } from './v4-tier-helpers.ts'
 
-process.env.GUARDIAN_ALLOW_LOCAL_LAB = '1'
-const SDK_DIR = join(dirname(fileURLToPath(import.meta.url)), '../worker/guardian_verify')
+process.env.KOVO_ALLOW_LOCAL_LAB = '1'
+const SDK_DIR = join(dirname(fileURLToPath(import.meta.url)), '../worker/kovo_verify')
 
-function fullHandlers(withGuardianVerify: boolean): WorkerToolHandlers {
+function fullHandlers(withKovoVerify: boolean): WorkerToolHandlers {
   const noop = async () => ({ ok: true })
   return {
-    ...(withGuardianVerify ? { guardian_verify: noop } : {}),
+    ...(withKovoVerify ? { kovo_verify: noop } : {}),
     verify_replay_spec: noop,
     propose_chain_finding: noop,
     update_proposed_finding: noop,
@@ -62,44 +62,44 @@ function fullHandlers(withGuardianVerify: boolean): WorkerToolHandlers {
   }
 }
 
-test('guardian_verify is exposed on every specialist profile and prioritized before verify_replay_spec', () => {
-  const gvIdx = SPECIALIST_COMMON_TOOLS.indexOf('guardian_verify')
+test('kovo_verify is exposed on every specialist profile and prioritized before verify_replay_spec', () => {
+  const gvIdx = SPECIALIST_COMMON_TOOLS.indexOf('kovo_verify')
   const vrsIdx = SPECIALIST_COMMON_TOOLS.indexOf('verify_replay_spec')
-  assert.ok(gvIdx >= 0 && vrsIdx >= 0 && gvIdx < vrsIdx, 'guardian_verify must precede verify_replay_spec in SPECIALIST_COMMON_TOOLS')
+  assert.ok(gvIdx >= 0 && vrsIdx >= 0 && gvIdx < vrsIdx, 'kovo_verify must precede verify_replay_spec in SPECIALIST_COMMON_TOOLS')
 
   const handlers = fullHandlers(true)
   for (const [id, profile] of Object.entries(SPECIALIST_PROFILES)) {
     const scoped = filterHandlersForSpecialist(handlers, profile)
-    assert.equal(typeof scoped.guardian_verify, 'function', `${id} must expose guardian_verify`)
+    assert.equal(typeof scoped.kovo_verify, 'function', `${id} must expose kovo_verify`)
     for (const compiler of proofToolHandlerNames) {
-      assert.equal(scoped[compiler], undefined, `${id} must hide JSON compiler ${compiler} when guardian_verify is active`)
+      assert.equal(scoped[compiler], undefined, `${id} must hide JSON compiler ${compiler} when kovo_verify is active`)
     }
     const tools = buildWorkerTools(scoped, v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {})
     const names = tools.map(t => t.name)
-    const gIdx = names.indexOf('guardian_verify')
+    const gIdx = names.indexOf('kovo_verify')
     const pIdx = names.indexOf('propose_chain_finding')
     const vIdx = names.indexOf('verify_replay_spec')
-    assert.ok(gIdx >= 0, `${id} registers guardian_verify`)
-    assert.ok(gIdx < pIdx, `${id} registers guardian_verify before propose_chain_finding`)
-    assert.equal(vIdx, -1, `${id} hides legacy verify_replay_spec by default when guardian_verify is active`)
+    assert.ok(gIdx >= 0, `${id} registers kovo_verify`)
+    assert.ok(gIdx < pIdx, `${id} registers kovo_verify before propose_chain_finding`)
+    assert.equal(vIdx, -1, `${id} hides legacy verify_replay_spec by default when kovo_verify is active`)
 
-    // Explicit opt-in exposes verify_replay_spec after guardian_verify for legacy/static tests.
+    // Explicit opt-in exposes verify_replay_spec after kovo_verify for legacy/static tests.
     const optedIn = buildWorkerTools(scoped, v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {}, { allowLegacyReplaySpec: true })
     const optNames = optedIn.map(t => t.name)
-    assert.ok(optNames.indexOf('guardian_verify') < optNames.indexOf('verify_replay_spec'), `${id} registers guardian_verify before opted-in verify_replay_spec`)
+    assert.ok(optNames.indexOf('kovo_verify') < optNames.indexOf('verify_replay_spec'), `${id} registers kovo_verify before opted-in verify_replay_spec`)
   }
 })
 
-test('tool descriptions mark verify_replay_spec and propose_chain_finding as legacy fallback only when guardian_verify is active', () => {
+test('tool descriptions mark verify_replay_spec and propose_chain_finding as legacy fallback only when kovo_verify is active', () => {
   const withTools = buildWorkerTools(fullHandlers(true), v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {})
-  assert.equal(withTools.find(t => t.name === 'verify_replay_spec'), undefined, 'verify_replay_spec is omitted by default while guardian_verify is active')
+  assert.equal(withTools.find(t => t.name === 'verify_replay_spec'), undefined, 'verify_replay_spec is omitted by default while kovo_verify is active')
   const withPropose = withTools.find(t => t.name === 'propose_chain_finding')!
-  assert.match(withPropose.description, /LEGACY FALLBACK.*guardian_verify/i)
+  assert.match(withPropose.description, /LEGACY FALLBACK.*kovo_verify/i)
   assert.match(withPropose.description, /proof_kind="agent_script"/)
 
   const withOptInTools = buildWorkerTools(fullHandlers(true), v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {}, { allowLegacyReplaySpec: true })
   const withVrs = withOptInTools.find(t => t.name === 'verify_replay_spec')!
-  assert.match(withVrs.description, /LEGACY FALLBACK.*guardian_verify/i)
+  assert.match(withVrs.description, /LEGACY FALLBACK.*kovo_verify/i)
 
   const withoutTools = buildWorkerTools(fullHandlers(false), v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {})
   const withoutVrs = withoutTools.find(t => t.name === 'verify_replay_spec')!
@@ -108,21 +108,21 @@ test('tool descriptions mark verify_replay_spec and propose_chain_finding as leg
   assert.doesNotMatch(withoutPropose.description, /LEGACY FALLBACK/)
 })
 
-test('workerSessionInstructions and repair feedback steer active sessions to guardian_verify', () => {
-  const active = workerSessionInstructions('worker-investigation', { hasGuardianVerify: true })
-  assert.match(active, /PRIMARY PROOF CONTRACT: `guardian_verify` is active/)
+test('workerSessionInstructions and repair feedback steer active sessions to kovo_verify', () => {
+  const active = workerSessionInstructions('worker-investigation', { hasKovoVerify: true })
+  assert.match(active, /PRIMARY PROOF CONTRACT: `kovo_verify` is active/)
   assert.match(active, /proof_kind="agent_script"/)
   assert.match(active, /Do NOT call legacy `verify_replay_spec` or `propose_chain_finding` with `http_chain`/)
 
-  const fallback = workerSessionInstructions('worker-investigation', { hasGuardianVerify: false })
+  const fallback = workerSessionInstructions('worker-investigation', { hasKovoVerify: false })
   assert.doesNotMatch(fallback, /PRIMARY PROOF CONTRACT/)
-  assert.match(fallback, /guardian_verify/)
+  assert.match(fallback, /kovo_verify/)
 
   const wrapped = withVerifierRepairFeedback({ verdict: 'dismissed', controlPassed: false, spaCatchallMatched: true }, true)
   const repair = verifierRepairFeedback(wrapped, true)
   assert.ok(repair)
-  assert.match(repair.suggestedFix ?? '', /guardian_verify/)
-  assert.match(GUARDIAN_VERIFY_TOOL_DESCRIPTION, /BOTH proves AND persists the confirmed finding/i)
+  assert.match(repair.suggestedFix ?? '', /kovo_verify/)
+  assert.match(KOVO_VERIFY_TOOL_DESCRIPTION, /BOTH proves AND persists the confirmed finding/i)
 })
 
 const ORIGIN = 'https://app.example.invalid'
@@ -173,20 +173,20 @@ function staticAstSpec() {
   }
 }
 
-test('when guardian_verify is active, propose_chain_finding and verify_replay_spec reject runtime specs and allow static_ast_proof', async () => {
+test('when kovo_verify is active, propose_chain_finding and verify_replay_spec reject runtime specs and allow static_ast_proof', async () => {
   let proposeCalls = 0
   let verifyCalls = 0
   const activeTools = buildWorkerTools({
-    guardian_verify: async () => ({ confirmed: true, attempts: [] }),
+    kovo_verify: async () => ({ confirmed: true, attempts: [] }),
     propose_chain_finding: async () => { proposeCalls += 1; return { ok: true } },
     verify_replay_spec: async () => { verifyCalls += 1; return { ok: true } },
   }, v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {})
 
-  assert.equal(activeTools.find(t => t.name === 'verify_replay_spec'), undefined, 'verify_replay_spec is hidden by default when guardian_verify is active')
+  assert.equal(activeTools.find(t => t.name === 'verify_replay_spec'), undefined, 'verify_replay_spec is hidden by default when kovo_verify is active')
   const proposeTool = activeTools.find(t => t.name === 'propose_chain_finding')!
 
   const optedInTools = buildWorkerTools({
-    guardian_verify: async () => ({ confirmed: true, attempts: [] }),
+    kovo_verify: async () => ({ confirmed: true, attempts: [] }),
     verify_replay_spec: async () => { verifyCalls += 1; return { ok: true } },
   }, v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {}, { allowLegacyReplaySpec: true })
   const verifyTool = optedInTools.find(t => t.name === 'verify_replay_spec')!
@@ -197,17 +197,17 @@ test('when guardian_verify is active, propose_chain_finding and verify_replay_sp
     confidenceRationale: 'Owner-scoped fields returned across tenants.',
   } as never, {} as never, { abortSignal: AbortSignal.timeout(5_000) } as never) as { isError?: boolean; output: Array<{ text?: string }> }
   assert.equal(rejectedPropose.isError, true)
-  assert.match(rejectedPropose.output[0]?.text ?? '', /guardian_verify\(script=/)
-  assert.equal(proposeCalls, 0, 'legacy handler must never execute for runtime specs while guardian_verify is active')
+  assert.match(rejectedPropose.output[0]?.text ?? '', /kovo_verify\(script=/)
+  assert.equal(proposeCalls, 0, 'legacy handler must never execute for runtime specs while kovo_verify is active')
 
   const rejectedVerify = await verifyTool.execute({
     spec: httpChainSpec(),
   } as never, {} as never, { abortSignal: AbortSignal.timeout(5_000) } as never) as { isError?: boolean; output: Array<{ text?: string }> }
   assert.equal(rejectedVerify.isError, true)
-  assert.match(rejectedVerify.output[0]?.text ?? '', /guardian_verify\(script=/)
+  assert.match(rejectedVerify.output[0]?.text ?? '', /kovo_verify\(script=/)
   assert.equal(verifyCalls, 0)
 
-  // static_ast_proof remains allowed even while guardian_verify is active
+  // static_ast_proof remains allowed even while kovo_verify is active
   const allowedStatic = await proposeTool.execute({
     replaySpec: staticAstSpec(),
     counterevidence: 'Route might be unreachable behind middleware.',
@@ -216,7 +216,7 @@ test('when guardian_verify is active, propose_chain_finding and verify_replay_sp
   assert.notEqual(allowedStatic.isError, true)
   assert.equal(proposeCalls, 1)
 
-  // When guardian_verify is absent (local-jq / replay-only), runtime http_chain remains allowed
+  // When kovo_verify is absent (local-jq / replay-only), runtime http_chain remains allowed
   let fallbackCalls = 0
   const fallbackTools = buildWorkerTools({
     verify_replay_spec: async () => { fallbackCalls += 1; return { ok: true } },
@@ -228,7 +228,7 @@ test('when guardian_verify is active, propose_chain_finding and verify_replay_sp
   assert.equal(fallbackCalls, 1)
 })
 
-test('guardian_verify ProofReceipt cleanly supports BOLA (CWE-639) boundary claims and SSTI (CWE-1336) evaluated expressions with anti-reflection', () => {
+test('kovo_verify ProofReceipt cleanly supports BOLA (CWE-639) boundary claims and SSTI (CWE-1336) evaluated expressions with anti-reflection', () => {
   // 1. BOLA via ctx.prove_access_boundary (`kind: 'boundary'`)
   const bolaExchanges: ScriptProofExchange[] = [
     {
@@ -354,7 +354,7 @@ async function startBoundaryFixture(): Promise<{ origin: string; grant: Grant; c
   }
 }
 
-test('inline TS guardian_verify scripts execute and confirm for bare ctx body, export default, and explicit import styles', async t => {
+test('inline TS kovo_verify scripts execute and confirm for bare ctx body, export default, and explicit import styles', async t => {
   const fixture = await startBoundaryFixture()
   t.after(() => fixture.close())
   const makeFactory = () => createLocalAttemptFactory({
@@ -371,8 +371,8 @@ test('inline TS guardian_verify scripts execute and confirm for bare ctx body, e
   })
 
   // Tool description includes a concise working inline TS example matching the wrapper contract.
-  assert.match(GUARDIAN_VERIFY_TOOL_DESCRIPTION, /ctx\.prove_access_boundary/)
-  assert.match(GUARDIAN_VERIFY_TOOL_DESCRIPTION, /return ctx\.result\(/)
+  assert.match(KOVO_VERIFY_TOOL_DESCRIPTION, /ctx\.prove_access_boundary/)
+  assert.match(KOVO_VERIFY_TOOL_DESCRIPTION, /return ctx\.result\(/)
 
   // 1. Bare inline TS body (no imports, no export default, no runVerification)
   const bareVerdict = await verifyScript({
@@ -435,13 +435,13 @@ export default async (ctx) => {
   assert.equal(exportDefaultVerdict.confirmed, true, `${exportDefaultVerdict.reason}: ${exportDefaultVerdict.detail}`)
   assert.equal(exportDefaultVerdict.attempts[0]!.claimCount, 1)
 
-  // 4. Explicit import (even extensionless `'guardian_verify'`) + `export default defineVerification(...)`
+  // 4. Explicit import (even extensionless `'kovo_verify'`) + `export default defineVerification(...)`
   const importExportVerdict = await verifyScript({
     candidate: {
       name: 'import-export.ts',
       runtime: 'ts',
       code: `
-import { defineVerification } from 'guardian_verify'
+import { defineVerification } from 'kovo_verify'
 
 export default defineVerification({
   async verify(ctx) {
@@ -501,18 +501,18 @@ throw new Error('custom_probe_boom ${leakedToken} ${noisyTail}')
   assert.ok(runtimeFailVerdict.stderrPreview.length <= 400, `stderrPreview must be <= 400 chars, got ${runtimeFailVerdict.stderrPreview.length}`)
   assert.equal(runtimeFailVerdict.stderrPreview.includes('super_secret_inline_token_987654321'), false, 'stderrPreview must redact Bearer tokens')
   assert.match(runtimeFailVerdict.stderrPreview, /\[redacted\]/)
-  assert.equal(runtimeFailVerdict.usageHint, GUARDIAN_VERIFY_USAGE_HINT)
+  assert.equal(runtimeFailVerdict.usageHint, KOVO_VERIFY_USAGE_HINT)
 
   // Summarization preserves exitCode, stderrPreview, and usageHint idempotently across double-summary
-  const summary1 = summarizeGuardianVerifyOutcome(runtimeFailVerdict)
-  const summary2 = summarizeGuardianVerifyOutcome(summary1)
+  const summary1 = summarizeKovoVerifyOutcome(runtimeFailVerdict)
+  const summary2 = summarizeKovoVerifyOutcome(summary1)
   for (const summary of [summary1, summary2]) {
     assert.equal(summary.confirmed, false)
     assert.equal(summary.exitCode, 1)
     assert.ok(summary.stderrPreview && summary.stderrPreview.includes('custom_probe_boom'))
     assert.equal(summary.stderrPreview.includes('super_secret_inline_token_987654321'), false)
     assert.ok(summary.stderrPreview.length <= 400)
-    assert.equal(summary.usageHint, GUARDIAN_VERIFY_USAGE_HINT)
+    assert.equal(summary.usageHint, KOVO_VERIFY_USAGE_HINT)
   }
 
   // 2. Zero-claim script (makes an HTTP call but records no claims) still fails closed
@@ -531,7 +531,7 @@ console.log('confirmed: true')
   assert.equal(zeroClaimsVerdict.reason, 'claims_missing')
   assert.ok(zeroClaimsVerdict.usageHint, 'zero-claim failure must surface usageHint')
 
-  // 3. Syntax error surfaces non-zero exitCode + stderrPreview through guardian_verify tool output
+  // 3. Syntax error surfaces non-zero exitCode + stderrPreview through kovo_verify tool output
   const syntaxFailVerdict = await verifyScript({
     candidate: {
       name: 'syntax-fail.ts',
@@ -546,9 +546,9 @@ console.log('confirmed: true')
   assert.ok(syntaxFailVerdict.stderrPreview && syntaxFailVerdict.stderrPreview.length > 0 && syntaxFailVerdict.stderrPreview.length <= 400)
 
   const tools = buildWorkerTools({
-    guardian_verify: async () => syntaxFailVerdict,
+    kovo_verify: async () => syntaxFailVerdict,
   }, v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {})
-  const gvTool = tools.find(tool => tool.name === 'guardian_verify')!
+  const gvTool = tools.find(tool => tool.name === 'kovo_verify')!
   const toolOut = await gvTool.execute(
     { script: 'await ctx.prove_access_boundary({ unclosed: ' } as never,
     {} as never,
@@ -563,7 +563,7 @@ console.log('confirmed: true')
   assert.equal(payload.confirmed, false)
   assert.notEqual(payload.exitCode, 0)
   assert.ok(payload.stderrPreview && payload.stderrPreview.length > 0 && payload.stderrPreview.length <= 400)
-  assert.equal(payload.usageHint, GUARDIAN_VERIFY_USAGE_HINT)
+  assert.equal(payload.usageHint, KOVO_VERIFY_USAGE_HINT)
 })
 
 test('VerifyRpcServer stages hostDir, token, context.json, and verify.sock with container-UID-accessible modes even under umask 0077', async t => {
@@ -647,10 +647,10 @@ test('TS wrapper edge cases (markdown fences, inline semicolon export default, s
   assert.equal(standaloneFnVerdict.confirmed, true, `${standaloneFnVerdict.reason}: ${standaloneFnVerdict.detail}`)
 })
 
-test('guardian_verify tool accepts code/source aliases, returns 1-line JSON example on missing script, and flags repeated validation loops', async () => {
+test('kovo_verify tool accepts code/source aliases, returns 1-line JSON example on missing script, and flags repeated validation loops', async () => {
   const receivedScripts: string[] = []
   const handlers: WorkerToolHandlers = {
-    guardian_verify: async args => {
+    kovo_verify: async args => {
       receivedScripts.push(args.script ?? '')
       return { confirmed: false, reason: 'oracle_failed', detail: 'stub' }
     },
@@ -659,8 +659,8 @@ test('guardian_verify tool accepts code/source aliases, returns 1-line JSON exam
     complete_intent: async () => ({}),
   }
   const tools = buildWorkerTools(handlers, v => v, AbortSignal.timeout(5_000), 64 * 1024, () => {})
-  const gvTool = tools.find(tool => tool.name === 'guardian_verify')
-  assert.ok(gvTool, 'guardian_verify tool must be built')
+  const gvTool = tools.find(tool => tool.name === 'kovo_verify')
+  assert.ok(gvTool, 'kovo_verify tool must be built')
 
   const execCtx = { abortSignal: new AbortController().signal } as Parameters<typeof gvTool.execute>[2]
   const dummyApi = {} as Parameters<typeof gvTool.execute>[1]

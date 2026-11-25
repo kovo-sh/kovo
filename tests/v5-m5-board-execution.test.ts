@@ -1,5 +1,5 @@
 /**
- * Guardian v5 M5 (execution wiring) — board tools in worker turns, deterministic 0-LLM posters,
+ * Kovo Hunter v5 M5 (execution wiring) — board tools in worker turns, deterministic 0-LLM posters,
  * operator routing, delta injection, warm specialist lifecycle and Tier-3 pause.
  */
 import assert from 'node:assert/strict'
@@ -20,7 +20,7 @@ const revokedOrigin = 'https://revoked-board.example'
 type PrivateExecution = Record<string, any>
 
 async function makeExecution(t: { after: (fn: () => void) => void }) {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v5-board-exec-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v5-board-exec-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const store = new Store(dir)
   const execution = new Execution(store)

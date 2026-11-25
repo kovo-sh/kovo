@@ -1,5 +1,5 @@
 /**
- * Guardian v5 M1-core: P0 wiring, canary correlation, dedupe, routing & feedback correctness.
+ * Kovo Hunter v5 M1-core: P0 wiring, canary correlation, dedupe, routing & feedback correctness.
  *
  * Covers plans/v5.md M1.1–M1.5 as owned by the m1-core stream:
  *   1.1 storage/session/csrfBind/authMutation/traceId/runId/assignmentId wiring in Execution
@@ -51,7 +51,7 @@ const executionSource = readFileSync(join(repoRoot, 'src/server/execution.ts'), 
 const fakeOrigin = 'https://app.example.invalid'
 
 function makeStore(t: { after: (fn: () => void) => void }): Store {
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v5-m1-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v5-m1-'))
   const storage = new Store(dir)
   t.after(() => {
     storage.close()
@@ -683,13 +683,13 @@ test('M1.5: retired sql_boolean_diff and sql_time_diff feedback reports retired 
         outcome: {
           confirmed: false,
           controlPassed: false,
-          observed: 'retired_legacy_spec_kind: use guardian_verify',
-          expected: 'Proof submitted via guardian_verify or a wired floor recipe.',
-          reason: 'retired_legacy_spec_kind: use guardian_verify',
+          observed: 'retired_legacy_spec_kind: use kovo_verify',
+          expected: 'Proof submitted via kovo_verify or a wired floor recipe.',
+          reason: 'retired_legacy_spec_kind: use kovo_verify',
         },
         exchangeIds: [],
         exchanges: [],
-        evidencePayload: { kind, retired: true, reason: 'retired_legacy_spec_kind: use guardian_verify' },
+        evidencePayload: { kind, retired: true, reason: 'retired_legacy_spec_kind: use kovo_verify' },
         evidenceSha256: 'e',
       },
       1,
@@ -760,7 +760,7 @@ test('M1 fallback: zero model profiles probe discovered endpoints and propose de
 
   const execution = new Execution(storage)
   t.after(() => execution.stop())
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
     (execution as unknown as { runDeterministicInvestigation: (run: Run) => Promise<void> })
       .runDeterministicInvestigation(storage.run(runId)))
 
@@ -802,7 +802,7 @@ test('M1 fallback: deterministic mode respects request budget and never runs des
 
   const execution = new Execution(storage)
   t.after(() => execution.stop())
-  await withEnv({ GUARDIAN_ALLOW_LOCAL_LAB: '1' }, () =>
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, () =>
     (execution as unknown as { runDeterministicInvestigation: (run: Run) => Promise<void> })
       .runDeterministicInvestigation(storage.run(runId)))
 
@@ -960,7 +960,7 @@ test('M1 precision: BFLA gate feeds the verdict and survives feedback enrichment
 // ============================================================================
 
 test('M1 worker reliability: docker failures report the real cause and never the bare image hint', async (t) => {
-  const withDetail = formatWorkerFailure('docker: Error response from daemon: No such image: guardian-missing:v5\nsecond line', 125)
+  const withDetail = formatWorkerFailure('docker: Error response from daemon: No such image: kovo-missing:v5\nsecond line', 125)
   assert.match(withDetail, /No such image/)
   assert.match(withDetail, /exit 125/)
   assert.match(withDetail, /Build the local worker image/)
@@ -969,14 +969,14 @@ test('M1 worker reliability: docker failures report the real cause and never the
   assert.match(bare, /exit 1/)
   assert.match(bare, /Build the local worker image/)
 
-  const dir = mkdtempSync(join(tmpdir(), 'guardian-v5-worker-'))
+  const dir = mkdtempSync(join(tmpdir(), 'kovo-v5-worker-'))
   const storage = new Store(dir)
   t.after(() => {
     storage.close()
     rmSync(dir, { recursive: true, force: true })
   })
   const backend = new LinuxWorkerBackend({
-    image: 'guardian-m1-missing-image:v5',
+    image: 'kovo-m1-missing-image:v5',
     workspace: { id: storage.workspace.id, directory: storage.directory },
   })
   let message = ''
@@ -1010,7 +1010,7 @@ test('M4 wiring: safe templates receive CVE hypotheses and recon-discovered dyna
 
 test('M4 wiring: Stage-1 LLM is enabled by default and receives live endpoints', () => {
   assert.ok(!executionSource.includes('enableStage1Llm: false'))
-  assert.match(executionSource, /enableStage1Llm: process\.env\.GUARDIAN_STAGE1_LLM !== '0'/)
+  assert.match(executionSource, /enableStage1Llm: process\.env\.KOVO_STAGE1_LLM !== '0'/)
   assert.match(executionSource, /liveEndpoints: this\.storage\.listEndpoints\(run\.id\)/)
 })
 
