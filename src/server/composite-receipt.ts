@@ -664,7 +664,7 @@ function verifyTerminalImpactGate(
     const cRaw = actorOf(c), isCapCtrl = Boolean(cRaw?.startsWith('cap:'))
     if (isCapCtrl && cRaw !== termRawActor && !isLoginCap(cRaw!, capIdx)) return false
     const anonFor401 = !cRaw || ANON_ACTOR_RE.test(cRaw) || (isCapCtrl && cRaw !== termRawActor)
-    const sameTenantForeignPeer = Boolean(c.step.status === 403 && termEx && hasForeignTenantData && !isPrivilegedActorOrRole(cRaw, roleOf(c), c.actorRoleLabel) && probeTenantOf(c, capIdx) && probeTenantOf(c, capIdx) === probeTenantOf(termEx, capIdx) && cleanExactPath(c.step.pathAndQuery ?? c.step.route ?? '') === cleanExactPath(termEx.step.pathAndQuery ?? termEx.step.route ?? ''))
+    const sameTenantForeignPeer = Boolean(receipt.hops.length >= 2 && hasExplicitVerifiedTermEdge && c.step.status === 403 && termEx && hasForeignTenantData && !isPrivilegedActorOrRole(cRaw, roleOf(c), c.actorRoleLabel) && probeTenantOf(c, capIdx) && probeTenantOf(c, capIdx) === probeTenantOf(termEx, capIdx) && cleanExactPath(c.step.pathAndQuery ?? c.step.route ?? '') === cleanExactPath(termEx.step.pathAndQuery ?? termEx.step.route ?? ''))
     if ((c.step.status === 401 && termAuthd && anonFor401) || (termAuthd && (!termEx || (!sameCredIdentity(c, termEx, capIdx) && !sameTenantForeignPeer)))) return false
     return Boolean((termEx && matchesBoundTerminalControl(c, termEx, ctrlCtx)) || (postMutRb && matchesBoundTerminalControl(c, postMutRb, ctrlCtx)))
   })

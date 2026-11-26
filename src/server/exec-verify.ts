@@ -54,6 +54,7 @@ import {
   type DerivedSecretKind,
 } from './derived-custody.ts'
 import { checkCoverage, readComparisons, verificationCommand, type EvidenceReview } from './evidence-checks.ts'
+import { isFixedEligibleFailureReason } from './retest-health.ts'
 import type { ExecBoardManager } from './exec-board.ts'
 import {
   ExecServiceModule,
@@ -3606,7 +3607,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       ? 'confirmed'
       : identityDriftReason
         ? 'inconclusive'
-        : result.verdict.reason === 'oracle_failed'
+        : result.verdict.reason === 'oracle_failed' || isFixedEligibleFailureReason(result.verdict.reason)
           ? 'dismissed'
           : 'inconclusive'
     const verificationTier: VerificationTier | undefined = confirmed ? 'runtime_confirmed' : undefined
