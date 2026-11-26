@@ -76,6 +76,7 @@ import type {
 } from '../report-summary.ts'
 import {
   deriveOperatorPrefixPattern,
+  evaluateLeaseEligibility,
   hasApprovalPathGlobMetacharacters,
   HOST_NONDESTRUCTIVE_LEASE_METHOD,
   HOST_NONDESTRUCTIVE_LEASE_PATTERN,
@@ -87,7 +88,7 @@ import {
   matchesApprovedEndpointPattern,
   normalizeApprovalPathPattern,
 } from './approval-pattern.ts'
-import type { ApprovalPathPatternSource } from './approval-pattern.ts'
+import type { ApprovalPathPatternSource, LeaseMatchContext } from './approval-pattern.ts'
 import type { ApprovalDecidedBy, ApprovalRiskLevel } from './approval-judge.ts'
 import { redact, redactZdrJsonValue } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
@@ -1657,8 +1658,11 @@ export class RunsRepository {
         throw new Error('Bare /** wildcard approval leases are forbidden.')
       }
       if (input.leaseScope === 'prefix') {
-        if (!isPrefixApprovalPattern(routePattern)) {
-          throw new Error('Prefix approval leases require a concrete non-empty prefix segment.')
+        if (!isNonDestructiveMutationMethod(method)) {
+          throw new Error('Prefix approval leases only apply to POST, PUT, and PATCH requests (never DELETE).')
+        }
+        if (!isPrefixApprovalPattern(routePattern) || isHighRiskOrExternalMutationPath(routePattern.slice(0, -3))) {
+          throw new Error('Prefix approval leases require at least two concrete non-high-risk prefix segments.')
         }
         resolvedScope = 'prefix'
       } else {
@@ -1796,6 +1800,7 @@ export class RunsRepository {
     method: string,
     pathAndQuery: string,
     personaHandle?: string | null,
+    context?: LeaseMatchContext,
   ): boolean {
     const normalized = normalizeScopeOrigin(origin)
     if (!normalized) return false
@@ -1826,6 +1831,7 @@ export class RunsRepository {
       } catch {
         return false
       }
+      const effectiveEnvMode = context?.environmentMode ?? run.environmentMode
       const rows = this.session.db.select().from(tables.approvalLeases).where(and(
         eq(tables.approvalLeases.runId, runId),
         eq(tables.approvalLeases.origin, normalized),
@@ -1848,23 +1854,56 @@ export class RunsRepository {
       }
       if (!activeRows.length) return false
 
-      // 1. Typed 'route' scope: exact / normalized route match only (never widens legacy '/**' rows).
-      let matched = activeRows.find(row =>
-        row.leaseScope === 'route' &&
-        row.method === upperMethod &&
-        routePatternSet.has(row.routePattern) &&
-        matchesPersona(row),
-      )
+      const baseMatchContext: LeaseMatchContext = {
+        ...context,
+        origin: normalized,
+        environmentMode: effectiveEnvMode,
+      }
 
-      // 2. Typed 'prefix' scope: explicit operator prefix match (`/<prefix>/**`, bare `/**` rejected).
+      // 1. Typed 'route' scope: exact / normalized route match gated by the single canonical
+      //    `evaluateLeaseEligibility` predicate (never overrides `prod_readonly`, non-overridable
+      //    structural risks; allows explicitly approved exact route DELETE/multipart while
+      //    `RequestAdmissionEngine` still routes structural mutations to `isStateChangeApproved`).
+      let matched: ApprovalLeaseRow | undefined
+      if (
+        evaluateLeaseEligibility({
+          ...baseMatchContext,
+          scope: 'route',
+          method: upperMethod,
+          pathAndQuery,
+          allowExplicitRouteStructural: true,
+        }).eligible
+      ) {
+        matched = activeRows.find(row =>
+          row.leaseScope === 'route' &&
+          row.method === upperMethod &&
+          routePatternSet.has(row.routePattern) &&
+          matchesPersona(row),
+        )
+      }
+
+      // 2. Typed 'prefix' scope: explicit operator prefix match (`/<seg1>/<seg2>/**`, >= 2 fixed
+      //    segments) gated at match time by `evaluateLeaseEligibility` (enforces high-risk path
+      //    exclusion, DELETE/GraphQL/JSON-RPC/body-destructive refusal, and prod_readonly refusal).
       if (!matched && !hasGlob) {
         for (const row of activeRows) {
           if (row.leaseScope !== 'prefix') continue
           if (row.method !== upperMethod || !matchesPersona(row)) continue
-          if (!isPrefixApprovalPattern(row.routePattern)) continue
+          if (
+            !evaluateLeaseEligibility({
+              ...baseMatchContext,
+              scope: 'prefix',
+              method: upperMethod,
+              pathAndQuery,
+              routePattern: row.routePattern,
+            }).eligible
+          ) {
+            continue
+          }
           const hit = matchesApprovedEndpointPattern(
             { origin: normalized, method: upperMethod, pathAndQuery },
             [{ origin: row.origin, method: row.method, pathPattern: row.routePattern, source: 'operator_explicit' }],
+            baseMatchContext,
           )
           if (hit) {
             matched = row
@@ -1873,12 +1912,16 @@ export class RunsRepository {
         }
       }
 
-      // 3. Typed 'host_nondestructive' scope: POST/PUT/PATCH only; never DELETE or high-risk paths.
+      // 3. Typed 'host_nondestructive' scope: POST/PUT/PATCH only; gated at match time by
+      //    `evaluateLeaseEligibility` (refuses DELETE, high-risk paths, GraphQL/JSON-RPC, body-destructive, prod_readonly).
       if (
         !matched &&
-        !hasGlob &&
-        isNonDestructiveMutationMethod(upperMethod) &&
-        !isHighRiskOrExternalMutationPath(pathAndQuery)
+        evaluateLeaseEligibility({
+          ...baseMatchContext,
+          scope: 'host_nondestructive',
+          method: upperMethod,
+          pathAndQuery,
+        }).eligible
       ) {
         matched = activeRows.find(row =>
           row.leaseScope === 'host_nondestructive' &&
@@ -1906,9 +1949,15 @@ export class RunsRepository {
   /** Ready-to-wire broker grant hook: `approvalLeases: storage.approvalLeaseAuthorizer(runId)`. */
   approvalLeaseAuthorizer(
     runId: string,
-  ): (origin: string, method: string, pathAndQuery: string, personaHandle?: string | null) => boolean {
-    return (origin, method, pathAndQuery, personaHandle) =>
-      this.leaseAuthorizes(runId, origin, method, pathAndQuery, personaHandle)
+  ): (
+    origin: string,
+    method: string,
+    pathAndQuery: string,
+    personaHandle?: string | null,
+    context?: LeaseMatchContext,
+  ) => boolean {
+    return (origin, method, pathAndQuery, personaHandle, context) =>
+      this.leaseAuthorizes(runId, origin, method, pathAndQuery, personaHandle, context)
   }
 
   /**
@@ -1927,16 +1976,34 @@ export class RunsRepository {
     const normalizedOrigin = normalizeScopeOrigin(ap.origin) ?? ap.origin.trim()
     const upperMethod = ap.method.trim().toUpperCase()
     const routePattern = normalizeApprovalPathPattern(ap.pathAndQuery, { source: 'card_path' })
-    const hasGlob = hasApprovalPathGlobMetacharacters(ap.pathAndQuery)
-    const prefixPattern =
-      upperMethod !== 'DELETE' && ap.riskLevel !== 'high' && !hasGlob
-        ? deriveOperatorPrefixPattern(ap.pathAndQuery)
-        : null
-    const hostEligible =
-      ap.riskLevel !== 'high' &&
-      isNonDestructiveMutationMethod(upperMethod) &&
-      !hasGlob &&
-      !isHighRiskOrExternalMutationPath(ap.pathAndQuery)
+    const derivedPrefixPattern = deriveOperatorPrefixPattern(ap.pathAndQuery)
+    const routeEligibility = evaluateLeaseEligibility({
+      scope: 'route',
+      origin: ap.origin,
+      method: upperMethod,
+      pathAndQuery: ap.pathAndQuery,
+      riskLevel: ap.riskLevel,
+      environmentMode: run.environmentMode,
+    })
+    const prefixEligibility = evaluateLeaseEligibility({
+      scope: 'prefix',
+      origin: ap.origin,
+      method: upperMethod,
+      pathAndQuery: ap.pathAndQuery,
+      routePattern: derivedPrefixPattern,
+      riskLevel: ap.riskLevel,
+      environmentMode: run.environmentMode,
+    })
+    const prefixPattern = prefixEligibility.eligible ? derivedPrefixPattern : null
+    const hostEligibility = evaluateLeaseEligibility({
+      scope: 'host_nondestructive',
+      origin: ap.origin,
+      method: upperMethod,
+      pathAndQuery: ap.pathAndQuery,
+      riskLevel: ap.riskLevel,
+      environmentMode: run.environmentMode,
+    })
+    const hostEligible = hostEligibility.eligible
     const cardPersona = ap.personaHandle?.trim() || null
     const crossPersona = Boolean(options.crossPersona)
     const pendingPersonaMatches = (other: ApprovalRequest): boolean =>
@@ -1994,13 +2061,23 @@ export class RunsRepository {
       for (const ep of inventoryRows) {
         const epMethod = ep.method.trim().toUpperCase()
         if (epMethod !== upperMethod) continue
-        if (hasApprovalPathGlobMetacharacters(ep.pathTemplate)) continue
+        if (
+          !evaluateLeaseEligibility({
+            scope: 'prefix',
+            origin: ep.origin,
+            method: epMethod,
+            pathAndQuery: ep.pathTemplate,
+            routePattern: prefixPattern,
+            environmentMode: run.environmentMode,
+          }).eligible
+        ) continue
         const epNorm = normalizeApprovalPathPattern(ep.pathTemplate, { source: 'operator_explicit' })
         const hit =
           (epNorm !== '' && (epNorm === prefixBase || epNorm.startsWith(`${prefixBase}/`))) ||
           Boolean(matchesApprovedEndpointPattern(
             { origin: ep.origin, method: epMethod, pathAndQuery: ep.pathTemplate },
             [{ origin: ap.origin, method: upperMethod, pathPattern: prefixPattern, source: 'operator_explicit' }],
+            { environmentMode: run.environmentMode },
           ))
         if (!hit) continue
         const label = formatRoute(epMethod, ep.pathTemplate)
@@ -2011,11 +2088,19 @@ export class RunsRepository {
       }
       prefixPendingExtra = otherPending.filter(req =>
         req.method.trim().toUpperCase() === upperMethod &&
-        req.riskLevel !== 'high' &&
-        !hasApprovalPathGlobMetacharacters(req.pathAndQuery) &&
+        evaluateLeaseEligibility({
+          scope: 'prefix',
+          origin: req.origin,
+          method: req.method,
+          pathAndQuery: req.pathAndQuery,
+          routePattern: prefixPattern,
+          riskLevel: req.riskLevel,
+          environmentMode: run.environmentMode,
+        }).eligible &&
         Boolean(matchesApprovedEndpointPattern(
           { origin: req.origin, method: req.method, pathAndQuery: req.pathAndQuery },
           [{ origin: ap.origin, method: upperMethod, pathPattern: prefixPattern, source: 'operator_explicit' }],
+          { environmentMode: run.environmentMode },
         )),
       ).length
     }
@@ -2027,9 +2112,15 @@ export class RunsRepository {
       const hostSeen = new Set<string>()
       for (const ep of inventoryRows) {
         const epMethod = ep.method.trim().toUpperCase()
-        if (!isNonDestructiveMutationMethod(epMethod)) continue
-        if (hasApprovalPathGlobMetacharacters(ep.pathTemplate)) continue
-        if (isHighRiskOrExternalMutationPath(ep.pathTemplate)) continue
+        if (
+          !evaluateLeaseEligibility({
+            scope: 'host_nondestructive',
+            origin: ep.origin,
+            method: epMethod,
+            pathAndQuery: ep.pathTemplate,
+            environmentMode: run.environmentMode,
+          }).eligible
+        ) continue
         const label = formatRoute(epMethod, ep.pathTemplate)
         if (!hostSeen.has(label)) {
           hostSeen.add(label)
@@ -2037,10 +2128,14 @@ export class RunsRepository {
         }
       }
       hostPendingExtra = otherPending.filter(req =>
-        isNonDestructiveMutationMethod(req.method) &&
-        req.riskLevel !== 'high' &&
-        !hasApprovalPathGlobMetacharacters(req.pathAndQuery) &&
-        !isHighRiskOrExternalMutationPath(req.pathAndQuery),
+        evaluateLeaseEligibility({
+          scope: 'host_nondestructive',
+          origin: req.origin,
+          method: req.method,
+          pathAndQuery: req.pathAndQuery,
+          riskLevel: req.riskLevel,
+          environmentMode: run.environmentMode,
+        }).eligible,
       ).length
     }
 
@@ -2064,7 +2159,8 @@ export class RunsRepository {
         origin: normalizedOrigin,
         method: upperMethod,
         pattern: routePattern || ap.pathAndQuery,
-        eligible: Boolean(routePattern && routePattern !== '/**'),
+        eligible: Boolean(routePattern && routePattern !== '/**' && routeEligibility.eligible),
+        ineligibleReason: routeEligibility.eligible ? null : (routeEligibility.reason ?? null),
         matchingRouteCount: routeMatches.length,
         sampleRoutes: routeMatches.slice(0, SAMPLE_LIMIT),
         pendingApprovalCount: 1 + routePendingExtra,
@@ -2079,13 +2175,7 @@ export class RunsRepository {
         method: upperMethod,
         pattern: prefixPattern ?? '',
         eligible: Boolean(prefixPattern),
-        ineligibleReason: prefixPattern
-          ? null
-          : upperMethod === 'DELETE'
-            ? 'Prefix leases cannot cover DELETE requests.'
-            : ap.riskLevel === 'high'
-              ? 'Prefix leases cannot cover high-risk requests.'
-              : 'Prefix leases require a concrete non-empty prefix without glob metacharacters.',
+        ineligibleReason: prefixPattern ? null : (prefixEligibility.reason ?? 'Prefix leases require at least two concrete non-high-risk prefix segments.'),
         matchingRouteCount: prefixMatches.length,
         sampleRoutes: prefixMatches.slice(0, SAMPLE_LIMIT),
         pendingApprovalCount: prefixPattern ? 1 + prefixPendingExtra : 0,
@@ -2100,11 +2190,7 @@ export class RunsRepository {
         method: HOST_NONDESTRUCTIVE_LEASE_METHOD,
         pattern: HOST_NONDESTRUCTIVE_LEASE_PATTERN,
         eligible: hostEligible,
-        ineligibleReason: hostEligible
-          ? null
-          : !isNonDestructiveMutationMethod(upperMethod)
-            ? 'Host non-destructive leases only apply to POST, PUT, and PATCH requests.'
-            : 'Host non-destructive leases exclude high-risk, external-mutation, and glob routes.',
+        ineligibleReason: hostEligible ? null : (hostEligibility.reason ?? 'Host non-destructive leases exclude high-risk, external-mutation, and glob routes.'),
         matchingRouteCount: hostMatches.length,
         sampleRoutes: hostMatches.slice(0, SAMPLE_LIMIT),
         pendingApprovalCount: hostEligible ? 1 + hostPendingExtra : 0,
@@ -2211,10 +2297,12 @@ export class RunsRepository {
     if (!pathPattern || pathPattern === '/**') {
       throw new Error('Cannot create an approved endpoint pattern from a malformed or bare wildcard path.')
     }
+    const patternSource: ApprovalPathPatternSource = mode === 'prefix' ? 'operator_explicit' : 'card_path'
     const newPattern: ApprovedEndpointPattern = {
       origin: existing.origin,
       method: existing.method.toUpperCase(),
       pathPattern,
+      source: patternSource,
       scopeRevision: currentRun.scopeRevision,
       createdAt: now,
     }
@@ -2223,6 +2311,7 @@ export class RunsRepository {
       p.origin === newPattern.origin &&
       p.method.toUpperCase() === newPattern.method &&
       p.pathPattern === newPattern.pathPattern &&
+      (p.source ?? 'card_path') === patternSource &&
       p.scopeRevision === newPattern.scopeRevision,
     )
     const nextPatterns = alreadyStored ? currentPatterns : [...currentPatterns, newPattern]
@@ -2231,19 +2320,34 @@ export class RunsRepository {
     }
 
     // Bulk-approve currently pending cards matching this newly approved route or prefix pattern.
-    // Prefix scope strictly skips `high`-risk cards and any worker-glob cards.
+    // Prefix scope strictly evaluates `evaluateLeaseEligibility` (skipping high-risk cards,
+    // high-risk paths, DELETE, and worker-glob cards).
     // Persona-bound leases only bulk-approve cards from the same persona unless `crossPersona: true`.
     let matchedPendingCount = 0
     for (const req of this.listApprovalRequests(currentRun.id, 'pending')) {
       if (req.id === existing.id || req.scopeRevision !== currentRun.scopeRevision) continue
       if (!crossPersona && (req.personaHandle?.trim() || null) !== existingPersona) continue
-      if (mode === 'prefix' && (req.riskLevel === 'high' || hasApprovalPathGlobMetacharacters(req.pathAndQuery))) {
+      if (
+        mode === 'prefix' &&
+        !evaluateLeaseEligibility({
+          scope: 'prefix',
+          origin: req.origin,
+          method: req.method,
+          pathAndQuery: req.pathAndQuery,
+          routePattern: pathPattern,
+          riskLevel: req.riskLevel,
+          environmentMode: currentRun.environmentMode,
+        }).eligible
+      ) {
         continue
       }
-      const matchList = mode === 'prefix'
-        ? [{ ...newPattern, source: 'operator_explicit' as const }]
-        : [newPattern]
-      if (matchesApprovedEndpointPattern({ origin: req.origin, method: req.method, pathAndQuery: req.pathAndQuery }, matchList)) {
+      if (
+        matchesApprovedEndpointPattern(
+          { origin: req.origin, method: req.method, pathAndQuery: req.pathAndQuery },
+          [newPattern],
+          { environmentMode: currentRun.environmentMode },
+        )
+      ) {
         this.session.db.update(tables.approvalRequests).set({
           status: 'approved',
           decidedBy: 'auto-review:rule',
@@ -2373,9 +2477,9 @@ export class RunsRepository {
         return updated
       }
 
-      // Explicit `prefix` scope: operator_explicit prefix pattern + lease + bulk resolve non-high pending cards.
+      // Explicit `prefix` scope: operator_explicit prefix pattern (>= 2 fixed segments) + lease + bulk resolve non-high pending cards.
       if (scope === 'prefix') {
-        if (existing.method.trim().toUpperCase() === 'DELETE') {
+        if (existing.method.trim().toUpperCase() === 'DELETE' || !isNonDestructiveMutationMethod(existing.method)) {
           throw new Error('Prefix approvals cannot be granted for DELETE requests; approve once or approve this exact route instead.')
         }
         if (existing.riskLevel === 'high') {
@@ -2384,9 +2488,24 @@ export class RunsRepository {
         if (hasApprovalPathGlobMetacharacters(existing.pathAndQuery)) {
           throw new Error('Prefix approvals cannot be derived from a path containing glob metacharacters (R3-H-9).')
         }
+        if (isHighRiskOrExternalMutationPath(existing.pathAndQuery)) {
+          throw new Error('Prefix approvals cannot be granted for high-risk or external-mutation paths.')
+        }
         const prefixPattern = deriveOperatorPrefixPattern(existing.pathAndQuery)
         if (!prefixPattern || !isPrefixApprovalPattern(prefixPattern)) {
-          throw new Error('Prefix approvals require a concrete non-empty prefix segment (bare /** is forbidden).')
+          throw new Error('Prefix approvals require at least two concrete fixed prefix segments (bare /** and single-segment /api/** are forbidden).')
+        }
+        const prefixCheck = evaluateLeaseEligibility({
+          scope: 'prefix',
+          origin: existing.origin,
+          method: existing.method,
+          pathAndQuery: existing.pathAndQuery,
+          routePattern: prefixPattern,
+          riskLevel: existing.riskLevel,
+          environmentMode: currentRun.environmentMode,
+        })
+        if (!prefixCheck.eligible) {
+          throw new Error(prefixCheck.reason ?? 'Prefix approval is not eligible for this request.')
         }
         const updated = this.applyRouteOrPrefixApproval(currentRun, existing, {
           mode: 'prefix',
@@ -2404,14 +2523,16 @@ export class RunsRepository {
 
       // Explicit `host_nondestructive` scope: origin-scoped POST/PUT/PATCH lease (NEVER DELETE or high-risk).
       if (scope === 'host_nondestructive') {
-        if (!isNonDestructiveMutationMethod(existing.method)) {
-          throw new Error('Host non-destructive approvals only apply to POST, PUT, and PATCH requests (never DELETE).')
-        }
-        if (existing.riskLevel === 'high') {
-          throw new Error('Host non-destructive approvals cannot be granted for high-risk requests.')
-        }
-        if (hasApprovalPathGlobMetacharacters(existing.pathAndQuery) || isHighRiskOrExternalMutationPath(existing.pathAndQuery)) {
-          throw new Error('Host non-destructive approvals cannot be granted for high-risk, external-mutation, or glob paths.')
+        const hostCheck = evaluateLeaseEligibility({
+          scope: 'host_nondestructive',
+          origin: existing.origin,
+          method: existing.method,
+          pathAndQuery: existing.pathAndQuery,
+          riskLevel: existing.riskLevel,
+          environmentMode: currentRun.environmentMode,
+        })
+        if (!hostCheck.eligible) {
+          throw new Error(hostCheck.reason ?? 'Host non-destructive approval is not eligible for this request.')
         }
         const crossPersona = Boolean(leaseOptions?.crossPersona)
         const existingPersona = existing.personaHandle?.trim() || null
@@ -2429,10 +2550,18 @@ export class RunsRepository {
           if (req.id === approvalId || req.scopeRevision !== currentRun.scopeRevision) continue
           if ((normalizeScopeOrigin(req.origin) ?? req.origin.trim()) !== normalizedOrigin) continue
           if (!crossPersona && (req.personaHandle?.trim() || null) !== existingPersona) continue
-          if (!isNonDestructiveMutationMethod(req.method)) continue
-          if (req.riskLevel === 'high') continue
-          if (hasApprovalPathGlobMetacharacters(req.pathAndQuery)) continue
-          if (isHighRiskOrExternalMutationPath(req.pathAndQuery)) continue
+          if (
+            !evaluateLeaseEligibility({
+              scope: 'host_nondestructive',
+              origin: req.origin,
+              method: req.method,
+              pathAndQuery: req.pathAndQuery,
+              riskLevel: req.riskLevel,
+              environmentMode: currentRun.environmentMode,
+            }).eligible
+          ) {
+            continue
+          }
           this.session.db.update(tables.approvalRequests).set({
             status: 'approved',
             decidedBy: 'auto-review:rule',

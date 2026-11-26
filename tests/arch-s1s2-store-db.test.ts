@@ -544,6 +544,7 @@ test('S2: concurrent suggestCandidateHost, addChainStep, triageFinding, updatePr
     assert.equal(merged.operatorTriage?.status, 'confirmed_by_operator', 'operatorTriage must survive updateProposedFinding')
 
     // 5. SQL-atomic counters: leaseAuthorizes uses & boardMembers postsCount.
+    store.setEnvironmentMode(staleRun, 'staging_isolated')
     store.grantApprovalLease(staleRun, {
       origin: 'https://conc.example.test',
       method: 'POST',

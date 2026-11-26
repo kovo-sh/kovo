@@ -87,7 +87,10 @@ export function isHostNonDestructiveLease(
 
 export function isPrefixApprovalPattern(pathPattern: string): boolean {
   const trimmed = pathPattern.trim()
-  return trimmed.endsWith('/**') && trimmed !== '/**' && trimmed.length > 3
+  if (!trimmed.startsWith('/') || !trimmed.endsWith('/**')) return false
+  const fixedSegs = trimmed.slice(0, -3).split('/').filter(Boolean)
+  if (fixedSegs.length < 2) return false
+  return fixedSegs.every(seg => seg !== '*' && seg !== '**' && !seg.includes('*') && !seg.includes('%2a'))
 }
 
 const APPROVAL_UUID_SEG = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -112,14 +115,17 @@ export function isConcreteApprovalIdSegment(segment: string): boolean {
 const HIGH_RISK_PATH_TOKENS = new Set([
   // Destructive verbs
   'delete', 'destroy', 'purge', 'drop', 'truncate', 'wipe', 'terminate', 'deactivate', 'unregister', 'unsubscribe',
+  'remove', 'cancel', 'close', 'reset', 'disable', 'suspend',
   // Billing / financial / external payments
   'billing', 'payment', 'payments', 'charge', 'charges', 'refund', 'refunds', 'payout', 'payouts',
   'transfer', 'transfers', 'wire', 'withdraw', 'withdrawal', 'checkout', 'stripe', 'invoice', 'invoices',
-  // External communications / webhooks
+  // External communications / webhooks / third-party integrations
   'email', 'emails', 'mail', 'sendgrid', 'sms', 'webhook', 'webhooks', 'broadcast',
+  'github', 'gitlab', 'bitbucket', 'invite', 'invites', 'invitation', 'invitations',
   // Privilege / credentials / admin
-  'admin', 'superadmin', 'iam', 'rbac', 'roles', 'permissions', 'revoke', 'apikey', 'apikeys',
-  'password', 'passwd', 'mfa', '2fa', 'sso',
+  'admin', 'superadmin', 'iam', 'rbac', 'role', 'roles', 'permission', 'permissions', 'privilege', 'privileges',
+  'acl', 'acls', 'revoke', 'rotate', 'reissue', 'regenerate', 'apikey', 'apikeys', 'credential', 'credentials',
+  'secret', 'secrets', 'oauth', 'password', 'passwd', 'mfa', '2fa', 'sso',
   // Uploads / code execution / deployment
   'upload', 'uploads', 'import', 'exec', 'eval', 'shell', 'deploy',
 ])
@@ -187,9 +193,11 @@ export function isHighRiskOrExternalMutationPath(pathAndQuery: string): boolean 
 }
 
 /**
- * Derive a concrete operator-explicit prefix pattern (e.g. `/_actions/**`, `/api/**`, `/api/v1/**`)
- * from an already-normalized `card_path` pattern. Returns `null` when the path has worker glob
- * metacharacters, fewer than 2 path segments, or no leading concrete literal segment (never `/**`).
+ * Derive a concrete operator-explicit prefix pattern (e.g. `/api/v1/**`, `/api/orders/**`,
+ * `/_actions/courses/**`) from an already-normalized `card_path` pattern.
+ *
+ * R4-H-1 invariant: requires at least TWO fixed non-wildcard leading segments (rejecting bare `/**`
+ * and single-segment `/api/**`), rejects worker glob metacharacters, and rejects high-risk prefix bases.
  */
 export function deriveOperatorPrefixPatternFromNormalized(
   normalizedCardPath: string,
@@ -197,16 +205,16 @@ export function deriveOperatorPrefixPatternFromNormalized(
 ): string | null {
   if (hasGlobMetacharacters || !normalizedCardPath) return null
   const segs = normalizedCardPath.split('/').filter(Boolean)
-  if (segs.length < 2) return null
+  if (segs.length < 3) return null
   const prefixSegs: string[] = []
-  const limit = Math.min(segs.length - 1, 2)
-  for (let i = 0; i < limit; i += 1) {
+  for (let i = 0; i < 2; i += 1) {
     const seg = segs[i]!
-    if (!seg || seg === '*' || seg === '**' || seg.includes('*') || seg.includes('%2a')) break
+    if (!seg || seg === '*' || seg === '**' || seg.includes('*') || seg.includes('%2a')) return null
     prefixSegs.push(seg)
   }
-  if (prefixSegs.length === 0) return null
-  return `/${prefixSegs.join('/')}/**`
+  const base = `/${prefixSegs.join('/')}`
+  if (isHighRiskOrExternalMutationPath(base)) return null
+  return `${base}/**`
 }
 
 /** Browser-safe operator prefix derivation for UI action buttons and blast-radius previews. */
@@ -231,9 +239,75 @@ export function approvalRouteDedupeKey(ap: { origin: string; method: string; pat
 }
 
 /** Default primary approval scope for a card: `once` on `high`-risk or `DELETE`, `route` otherwise. */
-export function defaultPrimaryApprovalScope(ap: { method?: string | null; riskLevel?: string | null }): 'once' | 'route' {
-  if (ap.riskLevel === 'high' || (ap.method ?? '').trim().toUpperCase() === 'DELETE') return 'once'
+export function defaultPrimaryApprovalScope(ap: { method?: string | null; riskLevel?: string | null; environmentMode?: string | null }): 'once' | 'route' {
+  if (ap.environmentMode === 'prod_readonly' || ap.riskLevel === 'high' || (ap.method ?? '').trim().toUpperCase() === 'DELETE') return 'once'
   return 'route'
+}
+
+export interface ApprovalScopeEligibility {
+  eligible: boolean
+  reason?: string
+  prefixPattern?: string | null
+}
+
+/**
+ * Shared browser-safe lease-eligibility predicate consumed by both the Queue UI and server-side
+ * `evaluateLeaseEligibility` (`src/server/approval-pattern.ts`), keeping UI buttons/copy and
+ * server lease enforcement on one interpretation (R4-H-1).
+ */
+export function evaluateClientApprovalLeaseEligibility(input: {
+  scope: ApprovalLeaseScope
+  method: string
+  pathAndQuery: string
+  riskLevel?: string | null
+  environmentMode?: string | null
+  routePattern?: string | null
+}): ApprovalScopeEligibility {
+  const method = input.method.trim().toUpperCase()
+  if (input.environmentMode === 'prod_readonly') {
+    return { eligible: false, reason: 'Read-only environments never permit approval leases.' }
+  }
+  if (!method) return { eligible: false, reason: 'HTTP method is required.' }
+  if (input.scope === 'route') {
+    const route = normalizeClientApprovalPath(input.pathAndQuery)
+    return route && route !== '/**' ? { eligible: true } : { eligible: false, reason: 'Route path is invalid.' }
+  }
+  if (!isNonDestructiveMutationMethod(method)) {
+    return {
+      eligible: false,
+      reason: input.scope === 'prefix'
+        ? 'Prefix leases only apply to POST, PUT, and PATCH requests (never DELETE).'
+        : 'Host non-destructive leases only apply to POST, PUT, and PATCH requests.',
+    }
+  }
+  if (input.riskLevel === 'high') {
+    return {
+      eligible: false,
+      reason: input.scope === 'prefix'
+        ? 'Prefix leases cannot cover high-risk requests.'
+        : 'Host non-destructive leases cannot cover high-risk requests.',
+    }
+  }
+  if (isHighRiskOrExternalMutationPath(input.pathAndQuery)) {
+    return {
+      eligible: false,
+      reason: input.scope === 'prefix'
+        ? 'Prefix leases exclude high-risk, external-mutation, and glob paths.'
+        : 'Host non-destructive leases exclude high-risk, external-mutation, and glob paths.',
+    }
+  }
+  if (input.scope === 'prefix') {
+    const pat = input.routePattern ?? deriveApprovalPrefixPattern(input.pathAndQuery)
+    if (!pat || !isPrefixApprovalPattern(pat) || isHighRiskOrExternalMutationPath(pat.slice(0, -3))) {
+      return {
+        eligible: false,
+        prefixPattern: null,
+        reason: 'Prefix leases require at least two concrete non-high-risk prefix segments.',
+      }
+    }
+    return { eligible: true, prefixPattern: pat }
+  }
+  return { eligible: true }
 }
 
 /** Returns the concrete prefix pattern when a card is eligible for `prefix` approval, else `null`. */
@@ -241,9 +315,10 @@ export function eligibleApprovalPrefixPattern(ap: {
   method: string
   pathAndQuery: string
   riskLevel?: string | null
+  environmentMode?: string | null
 }): string | null {
-  if (ap.riskLevel === 'high' || ap.method.trim().toUpperCase() === 'DELETE') return null
-  return deriveApprovalPrefixPattern(ap.pathAndQuery)
+  const res = evaluateClientApprovalLeaseEligibility({ scope: 'prefix', ...ap })
+  return res.eligible ? (res.prefixPattern ?? null) : null
 }
 
 /** True when a card is eligible for `host_nondestructive` approval (`POST`/`PUT`/`PATCH`, non-`high`, non-high-risk path). */
@@ -251,17 +326,30 @@ export function isHostNonDestructiveEligibleCard(ap: {
   method: string
   pathAndQuery: string
   riskLevel?: string | null
+  environmentMode?: string | null
 }): boolean {
-  if (ap.riskLevel === 'high') return false
-  if (!isNonDestructiveMutationMethod(ap.method)) return false
-  if (isHighRiskOrExternalMutationPath(ap.pathAndQuery)) return false
-  return true
+  return evaluateClientApprovalLeaseEligibility({ scope: 'host_nondestructive', ...ap }).eligible
 }
+
+/** Shared scope copy helper driven by the same lease-eligibility semantics (`R4-H-1`). */
+export function formatApprovalScopeHint(
+  scope: ApprovalScope,
+  opts: { method: string; originHost: string; routePattern: string; prefixPattern?: string | null; tail?: string | null },
+): string {
+  const m = opts.method.trim().toUpperCase()
+  if (scope === 'once') return `Approve once: ${m} ${opts.routePattern} · single request only (no lease)`
+  if (scope === 'route') return `Approve route: ${m} ${opts.routePattern} · ${opts.tail ?? 'reuses lease on this route'}`
+  if (scope === 'prefix') return `Approve prefix: ${m} ${opts.prefixPattern || opts.routePattern} · ${opts.tail ?? 'non-high-risk only (no high-risk/GraphQL/JSON-RPC)'}`
+  return [`Approve host: POST/PUT/PATCH on ${opts.originHost} (no DELETE, high-risk, GraphQL/JSON-RPC)`, opts.tail].filter(Boolean).join(' · ')
+}
+
+export type ApprovalPathPatternSource = 'card_path' | 'operator_explicit'
 
 export interface ApprovedEndpointPattern {
   origin: string
   method: string
   pathPattern: string
+  source?: ApprovalPathPatternSource
   scopeRevision?: number
   createdAt?: number
 }
@@ -270,6 +358,7 @@ export const approvedEndpointPatternSchema = z.object({
   origin: z.string().trim().min(1).max(253),
   method: z.string().trim().min(1).max(16),
   pathPattern: z.string().trim().min(1).max(512),
+  source: z.enum(['card_path', 'operator_explicit']).optional(),
   scopeRevision: z.number().int().nonnegative().optional(),
   createdAt: z.number().int().nonnegative().optional(),
 })

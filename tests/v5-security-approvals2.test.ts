@@ -272,7 +272,7 @@ test('C: exact literal segments still match, and a prefix match requires an expl
   assert.equal(matchesApprovedEndpointPattern({ origin: PUBLIC_ORIGIN, method: 'POST', pathAndQuery: '/api/items/update/9' }, exact), undefined)
   assert.equal(matchesApprovedEndpointPattern({ origin: PUBLIC_ORIGIN, method: 'POST', pathAndQuery: '/api/items/delete' }, exact), undefined)
 
-  const prefix = [{ origin: PUBLIC_ORIGIN, method: 'POST', pathPattern: '/api/items/**' }]
+  const prefix = [{ origin: PUBLIC_ORIGIN, method: 'POST', pathPattern: '/api/items/**', source: 'operator_explicit' as const }]
   assert.ok(matchesApprovedEndpointPattern({ origin: PUBLIC_ORIGIN, method: 'POST', pathAndQuery: '/api/items/123/settings' }, prefix),
     'an explicit `**` prefix is the only arbitrary-depth form')
   assert.equal(matchesApprovedEndpointPattern({ origin: PUBLIC_ORIGIN, method: 'POST', pathAndQuery: '/other/items/123' }, prefix), undefined)
