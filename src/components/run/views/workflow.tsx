@@ -4,6 +4,7 @@
 // worker rows. Inspectors: worker, stack, queued steps, step, graph digest.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
+import { isTerminalRunStatus } from '../../../server/run-status.ts'
 import { Dropdown, FilterBox, Tabs } from '../controls.tsx'
 import { useRun, useRunModel } from '../data.tsx'
 import { EmptyState, Kbd, KbdGroup, Seg, Tag } from '../display.tsx'
@@ -25,9 +26,6 @@ import { isLive, QUEUE_ID, setExpanded, useWorkflowLayout } from './workflow-lay
 type Filter = 'all' | 'live' | 'complete' | 'findings' | 'failed'
 type Mode = 'graph' | 'list'
 const isWorkflowMode = (v: string | null): v is Mode => v === 'graph' || v === 'list'
-const isTerminalRun = (status: string, phase: string) =>
-  status === 'complete' || status === 'stopped' || status === 'failed' || phase === 'complete'
-const isActiveTask = (a: Assignment) => isLive(a) || (a.status as string) === 'waiting'
 type Group = 'phase' | 'step' | 'status' | 'none'
 const GROUPS: [Group, string][] = [['phase', 'Phase'], ['step', 'Plan step'], ['status', 'Status'], ['none', 'None']]
 const ICON_SLOT = 'inline-flex size-3.5 flex-none items-center justify-center'
@@ -39,7 +37,7 @@ export function WorkflowView() {
   const nav = useNav()
   const L = useWorkflowLayout()
   const runId = detail.run.id
-  const terminal = isTerminalRun(detail.run.status, detail.run.phase)
+  const terminal = isTerminalRunStatus(detail.activity?.lifecycle ?? detail.run.status) || detail.run.phase === 'complete'
   const [mode, setModeState] = useViewState<Mode>('wf.mode', 'list')
   const [filter, setFilter] = useViewState<Filter>('wf.filter', 'all')
   const [query, setQuery] = useViewState('wf.q', '')
@@ -70,7 +68,7 @@ export function WorkflowView() {
   const tabs = useMemo(() => {
     const t: Record<Filter, number> = { all: assignments.length, live: 0, complete: 0, findings: 0, failed: 0 }
     for (const a of assignments) {
-      if (!terminal && isActiveTask(a)) t.live++
+      if (!terminal && isLive(a)) t.live++
       if (a.status === 'complete') t.complete++
       if (a.status === 'failed') t.failed++
       if ((model.workerFindings.get(a.id) ?? []).length) t.findings++
@@ -81,7 +79,7 @@ export function WorkflowView() {
   const effFilter: Filter = tabs.some(t => t.k === filter) ? filter : 'all'
   const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean)
   const matches = useCallback((a: Assignment) => {
-    if (effFilter === 'live' && (terminal || !isActiveTask(a))) return false
+    if (effFilter === 'live' && (terminal || !isLive(a))) return false
     if (effFilter === 'complete' && a.status !== 'complete') return false
     if (effFilter === 'failed' && a.status !== 'failed') return false
     if (effFilter === 'findings' && !(model.workerFindings.get(a.id) ?? []).length) return false
@@ -271,7 +269,7 @@ function WorkerList({ matches, terminal }: { matches: (a: Assignment) => boolean
     if (terminal) return { activeItems: [] as Assignment[], restItems: items }
     const active: Assignment[] = []
     const rest: Assignment[] = []
-    for (const a of items) (isActiveTask(a) ? active : rest).push(a)
+    for (const a of items) (isLive(a) ? active : rest).push(a)
     active.sort((a, b) => Number(a.status !== 'running') - Number(b.status !== 'running') || a.createdAt - b.createdAt)
     return { activeItems: active, restItems: rest }
   }, [items, terminal])
@@ -308,7 +306,7 @@ function WorkerList({ matches, terminal }: { matches: (a: Assignment) => boolean
     const nfa = (model.factsByWorker.get(a.id) ?? []).length
     const pct = a.maxTurns ? Math.min(100, a.turnsUsed / a.maxTurns * 100) : 0
     const cur = nav.sel?.kind === 'worker' && nav.sel.id === a.id
-    const live = !terminal && isActiveTask(a)
+    const live = !terminal && isLive(a)
     const r0 = isRound0ThreatModelWorker(a) ? deriveRound0PipelineState({ assignment: a, detail: model.detail, events }) : null
     return <div
       key={a.id}

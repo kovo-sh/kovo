@@ -593,7 +593,7 @@ export function deriveRound0PipelineState(input: Round0DerivationInput): Round0P
   if (totalHosts > 0) mappedHosts = Math.min(totalHosts, mappedHosts)
 
   const workerDone = a.status === 'complete'
-  const workerStopped = a.status === 'failed' || a.status === 'canceled' || a.status === 'stopped'
+  const workerStopped = a.status === 'failed' || a.status === 'canceled'
   const hasThreatModel = Boolean(detail.threatModel) || hasThreatModelSaved
   const isComplete = workerDone || (hasThreatModel && a.status !== 'running')
   const phase0Done = Boolean(detail.run.phase0CompletedAt) || hasPhase0Discovery || hasPhase0Completed || hasThreatModel

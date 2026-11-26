@@ -12,8 +12,35 @@ import type {
   VerificationTier,
 } from './domain.ts'
 import { ORIGIN_WIDE_CWE_KEYS } from './finding-keys.ts'
-import { projectRunFindings } from './findings-view.ts'
-import type { FindingsScopeContext, FindingsViewInputRow } from './findings-view.ts'
+import {
+  HEADER_HYGIENE_CHECK_IDS,
+  HEADER_POSTURE_CATEGORY,
+  chainFindingDedupKey,
+  collapseBaselineHeaderFindings,
+  deduplicateChainFindings,
+  findingSeverityOrder,
+  findingStatusOrder,
+  isBaselineHeaderHygieneFinding,
+  isConsolidatedHeaderPostureFinding,
+  mergeChainFindings,
+  projectRunFindings,
+} from './findings-view.ts'
+import type { FindingsScopeContext, FindingsViewInputRow, HeaderPostureSummary } from './findings-view.ts'
+
+export {
+  HEADER_HYGIENE_CHECK_IDS,
+  HEADER_POSTURE_CATEGORY,
+  ORIGIN_WIDE_CWE_KEYS,
+  chainFindingDedupKey,
+  collapseBaselineHeaderFindings,
+  deduplicateChainFindings,
+  findingSeverityOrder,
+  findingStatusOrder,
+  isBaselineHeaderHygieneFinding,
+  isConsolidatedHeaderPostureFinding,
+  mergeChainFindings,
+}
+export type { HeaderPostureSummary }
 
 export const checkLabels: Record<CheckCoverage['status'], string> = {
   met: 'Meets baseline',
@@ -38,14 +65,6 @@ export const retestVerdictLabels: Record<'reproduced' | 'fixed' | 'inconclusive'
   reproduced: 'Still reproducible',
   fixed: 'Verified fixed',
   inconclusive: 'Inconclusive',
-}
-
-export const findingSeverityOrder: Record<Finding['severity'], number> = {
-  critical: 0, high: 1, medium: 2, low: 3, informational: 4,
-}
-
-export const findingStatusOrder: Record<Finding['status'], number> = {
-  confirmed: 0, static_verified: 1, pending: 2, inconclusive: 3, dismissed: 4,
 }
 
 export const verificationTierLabels: Record<VerificationTier, string> = {
@@ -82,239 +101,6 @@ export function findingVerificationTier(
     return finding.findingKind === 'baseline_check' ? 'baseline_confirmed' : 'runtime_confirmed'
   }
   return undefined
-}
-
-export const HEADER_HYGIENE_CHECK_IDS = [
-  'content-security-policy',
-  'frame-protection',
-  'nosniff',
-  'referrer-policy',
-  'server-disclosure',
-] as const
-
-const headerHygieneCheckIdSet = new Set<string>(HEADER_HYGIENE_CHECK_IDS)
-
-const headerHygieneTitlePatterns: readonly RegExp[] = [
-  /^content security policy is not enforced$/i,
-  /^html response can be embedded without a recorded frame restriction$/i,
-  /^mime sniffing protection missing$/i,
-  /referrer[- ]policy/i,
-  /^response discloses server technology details$/i,
-]
-
-export const HEADER_POSTURE_CATEGORY = 'HTTP Security Header Posture'
-
-export function isConsolidatedHeaderPostureFinding(finding: Pick<Finding, 'category' | 'title'>): boolean {
-  return finding.category === HEADER_POSTURE_CATEGORY || finding.title.startsWith(HEADER_POSTURE_CATEGORY)
-}
-
-export function isBaselineHeaderHygieneFinding(finding: Finding): boolean {
-  if (finding.findingKind === 'multi_step_chain') return false
-  if (isConsolidatedHeaderPostureFinding(finding)) return false
-  if (finding.severity !== 'low' && finding.severity !== 'informational') return false
-  if (finding.check?.id && headerHygieneCheckIdSet.has(finding.check.id)) return true
-  return headerHygieneTitlePatterns.some(pattern => pattern.test(finding.title.trim()))
-}
-
-export interface HeaderPostureSummary {
-  origin: string
-  status: Finding['status']
-  severity: 'low' | 'informational'
-  count: number
-  checks: Array<{
-    id?: string
-    title: string
-    observed: string | null
-    expected?: string
-    cwe?: string
-  }>
-  evidenceIds: string[]
-  finding: Finding
-}
-
-// Re-export the single browser-safe origin-wide CWE Set from `src/finding-keys.ts` so the
-// report layer and server fingerprinting/dedupe layer can never drift.
-export { ORIGIN_WIDE_CWE_KEYS }
-
-export function chainFindingDedupKey(finding: Pick<Finding, 'origin' | 'cwe' | 'category' | 'title' | 'fingerprintHash'>): string {
-  const origin = finding.origin.trim().toLowerCase()
-  const cwe = (finding.cwe ?? '').trim().toUpperCase()
-  const title = finding.title.trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
-  // A fingerprint already encodes (origin, endpoint, method, param/resolver, cwe), but origin-wide
-  // classes (CORS/CSP/HSTS/TLS/cookies) share one host-level root cause and still collapse.
-  if (cwe && ORIGIN_WIDE_CWE_KEYS.has(cwe)) return `${origin}::cwe::${cwe}`
-  if (finding.fingerprintHash) return `${origin}::fp::${finding.fingerprintHash}`
-  if (cwe) return `${origin}::cwe::${cwe}::title::${title}`
-  const category = (finding.category ?? 'uncategorized').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-')
-  return `${origin}::class::${category}::${title}`
-}
-
-export function mergeChainFindings(existing: Finding, incoming: Finding): Finding {
-  const existingRank = findingStatusOrder[existing.status]
-  const incomingRank = findingStatusOrder[incoming.status]
-  const preferIncoming = incomingRank < existingRank ||
-    (incomingRank === existingRank && existing.status !== 'confirmed' && existing.status !== 'static_verified')
-  const primary = preferIncoming ? incoming : existing
-  const secondary = preferIncoming ? existing : incoming
-  const primaryVerified = primary.status === 'confirmed' || primary.status === 'static_verified'
-  const secondaryVerified = secondary.status === 'confirmed' || secondary.status === 'static_verified'
-  const bestSeverity: Finding['severity'] =
-    primaryVerified && !secondaryVerified
-      ? primary.severity
-      : findingSeverityOrder[incoming.severity] < findingSeverityOrder[existing.severity]
-        ? incoming.severity
-        : existing.severity
-
-  const evidenceIds = [...new Set([...existing.evidenceIds, ...incoming.evidenceIds])]
-  const exchangeIds = [...new Set([...(existing.exchangeIds ?? []), ...(incoming.exchangeIds ?? [])])]
-  const chainFactIds = [...new Set([...(existing.chainFactIds ?? []), ...(incoming.chainFactIds ?? [])])]
-  const codeLocations = primary.codeLocations?.length ? primary.codeLocations : secondary.codeLocations
-
-  const mergedTier: VerificationTier | undefined =
-    primary.status === 'confirmed'
-      ? (primary.verificationTier && primary.verificationTier !== 'static_verified'
-          ? primary.verificationTier
-          : (secondary.verificationTier && secondary.verificationTier !== 'static_verified'
-              ? secondary.verificationTier
-              : 'runtime_confirmed'))
-      : (primary.verificationTier ?? secondary.verificationTier)
-  const mergedRuntimeProofGap = primary.status === 'confirmed'
-    ? (primary.runtimeProofGap ?? null)
-    : (primary.runtimeProofGap ?? secondary.runtimeProofGap)
-
-  return {
-    ...secondary,
-    ...primary,
-    id: existing.id,
-    severity: bestSeverity,
-    findingKind: 'multi_step_chain',
-    replaySpecId: primary.replaySpecId ?? secondary.replaySpecId,
-    verificationTier: mergedTier,
-    fingerprintHash: primary.fingerprintHash ?? secondary.fingerprintHash,
-    supersededByFindingId: primary.supersededByFindingId ?? secondary.supersededByFindingId,
-    counterevidence: primary.counterevidence ?? secondary.counterevidence,
-    confidenceRationale: primary.confidenceRationale ?? secondary.confidenceRationale,
-    severityChangeConditions: primary.severityChangeConditions ?? secondary.severityChangeConditions,
-    runtimeProofGap: mergedRuntimeProofGap,
-    ...(codeLocations?.length ? { codeLocations } : {}),
-    evidenceIds,
-    ...(exchangeIds.length ? { exchangeIds } : {}),
-    ...(chainFactIds.length ? { chainFactIds } : {}),
-    scopeRevision: Math.max(existing.scopeRevision, incoming.scopeRevision),
-  }
-}
-
-export function deduplicateChainFindings(findings: readonly Finding[]): Finding[] {
-  const out: Finding[] = []
-  const chainIndex = new Map<string, number>()
-  for (const finding of findings) {
-    if (finding.findingKind !== 'multi_step_chain') {
-      out.push(finding)
-      continue
-    }
-    const key = chainFindingDedupKey(finding)
-    const idx = chainIndex.get(key)
-    if (idx === undefined) {
-      chainIndex.set(key, out.length)
-      out.push(finding)
-    } else {
-      out[idx] = mergeChainFindings(out[idx], finding)
-    }
-  }
-  return out
-}
-
-function safeHostname(origin: string): string {
-  try { return new URL(origin).hostname } catch { return origin }
-}
-
-export function collapseBaselineHeaderFindings(findings: readonly Finding[]): {
-  findings: Finding[]
-  collapsedCount: number
-  hygieneSummaries: HeaderPostureSummary[]
-} {
-  const kept: Finding[] = []
-  const groups = new Map<string, Finding[]>()
-  let collapsedCount = 0
-
-  for (const finding of findings) {
-    if (!isBaselineHeaderHygieneFinding(finding)) {
-      kept.push(finding)
-      continue
-    }
-    collapsedCount += 1
-    const key = `${finding.origin}\0${finding.status}`
-    const list = groups.get(key) ?? []
-    list.push(finding)
-    groups.set(key, list)
-  }
-
-  const hygieneSummaries: HeaderPostureSummary[] = []
-  const consolidatedFindings: Finding[] = []
-
-  for (const items of groups.values()) {
-    const first = items[0]
-    const origin = first.origin
-    const status = first.status
-    const severity: 'low' | 'informational' = items.some(item => item.severity === 'low') ? 'low' : 'informational'
-    const evidenceIds = [...new Set(items.flatMap(item => item.evidenceIds))]
-    const exchangeIds = [...new Set(items.flatMap(item => item.exchangeIds ?? []))]
-    const cwes = [...new Set(items.map(item => item.cwe).filter((c): c is string => Boolean(c)))]
-    const checks = items.map(item => ({
-      id: item.check?.id,
-      title: item.title,
-      observed: item.check?.observed ?? null,
-      expected: item.check?.expected,
-      cwe: item.cwe,
-    }))
-    const host = safeHostname(origin)
-    const checkSummary = checks
-      .map(c => `${c.title}${c.observed ? ` (${c.observed})` : ''}`)
-      .join('; ')
-    const remediations = [...new Set(items.map(item => item.remediation.trim()).filter(Boolean))].join(' ')
-
-    const consolidated: Finding = {
-      id: first.id,
-      origin,
-      title: `${HEADER_POSTURE_CATEGORY} (${items.length} ${items.length === 1 ? 'header gap' : 'header gaps'})`,
-      status,
-      severity,
-      reason: `Consolidated ${items.length} baseline HTTP security header ${items.length === 1 ? 'check' : 'checks'} on ${host}: ${checkSummary}.`,
-      remediation: remediations || 'Configure Content-Security-Policy (with frame-ancestors), X-Content-Type-Options: nosniff, a restrictive Referrer-Policy, and minimize Server/X-Powered-By disclosures.',
-      impact: 'Missing or permissive browser security headers reduce defense-in-depth hardening against client-side attacks and reconnaissance, though they do not independently prove an exploitable vulnerability.',
-      recheck: 'Re-fetch a fresh authorized response from this origin and verify CSP, frame protection, X-Content-Type-Options: nosniff, Referrer-Policy, and Server header hygiene.',
-      category: HEADER_POSTURE_CATEGORY,
-      cwe: cwes.join(' / ') || 'CWE-693',
-      confidence: status === 'confirmed' ? 'high' : status === 'inconclusive' ? 'low' : 'medium',
-      verification: `Consolidated from ${items.length} baseline HTTP security header ${items.length === 1 ? 'check' : 'checks'}.`,
-      findingKind: 'baseline_check',
-      evidenceIds,
-      ...(exchangeIds.length ? { exchangeIds } : {}),
-      scopeRevision: Math.max(...items.map(item => item.scopeRevision)),
-    }
-
-    consolidatedFindings.push(consolidated)
-    hygieneSummaries.push({
-      origin,
-      status,
-      severity,
-      count: items.length,
-      checks,
-      evidenceIds,
-      finding: consolidated,
-    })
-  }
-
-  const combined = [...kept, ...consolidatedFindings].sort((a, b) =>
-    findingStatusOrder[a.status] - findingStatusOrder[b.status] ||
-    findingSeverityOrder[a.severity] - findingSeverityOrder[b.severity] ||
-    Number(isConsolidatedHeaderPostureFinding(a)) - Number(isConsolidatedHeaderPostureFinding(b)) ||
-    Number(a.findingKind !== 'multi_step_chain') - Number(b.findingKind !== 'multi_step_chain') ||
-    a.origin.localeCompare(b.origin) ||
-    a.title.localeCompare(b.title),
-  )
-
-  return { findings: combined, collapsedCount, hygieneSummaries }
 }
 
 // ---------------------------------------------------------------------------
@@ -471,13 +257,12 @@ export function reportHighlights(body: ReportBody, scopeCtx?: Omit<FindingsScope
     ...scopeCtx,
     approvedOrigins: scope,
   })
-  const activeProjected = [...projected.confirmed, ...projected.advisories, ...projected.unverified]
-    .map(item => (item.effectiveSeverity === item.finding.severity
+  const withEffectiveSev = (item: typeof projected.confirmed[number]): Finding =>
+    item.effectiveSeverity === item.finding.severity
       ? item.finding
-      : { ...item.finding, severity: item.effectiveSeverity }))
-  const collapsed = collapseBaselineHeaderFindings(deduplicateChainFindings(activeProjected)).findings
-  const confirmed = collapsed.filter(item => item.status === 'confirmed' && item.verificationTier !== 'static_verified')
-  const staticVerified = collapsed.filter(item => item.status === 'static_verified' || item.verificationTier === 'static_verified')
+      : { ...item.finding, severity: item.effectiveSeverity }
+  const confirmed = projected.confirmed.map(withEffectiveSev)
+  const staticVerified = projected.advisories.map(withEffectiveSev)
   const chainConfirmed = confirmed.filter(item => item.findingKind === 'multi_step_chain').length
   const headerPostureCount = confirmed.filter(item => isConsolidatedHeaderPostureFinding(item)).length
   const prominentConfirmed = confirmed.filter(item => !isConsolidatedHeaderPostureFinding(item))

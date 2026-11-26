@@ -7,6 +7,8 @@
 // pulled toward the rows of their parents so handoffs read left to right.
 import { useMemo, useSyncExternalStore } from 'react'
 import { workerHistory } from '../../../domain.ts'
+import { isLiveWorkerStatus } from '../../../server/run-status.ts'
+import { isTerminalStepStatus } from '../../../step-status.ts'
 import { useRunModel } from '../data.tsx'
 import type { Assignment, ChainStep, RunEvent, RunModel } from '../model.ts'
 
@@ -59,8 +61,8 @@ export interface WfLayout {
 }
 
 export const QUEUE_ID = 'queued-steps'
-export const isLive = (a: Assignment) => a.status === 'running' || a.status === 'paused' || a.status === 'waiting_approval'
-const OPEN_STEP = new Set(['pending', 'ready', 'blocked', 'running'])
+export const isLive = (a: Assignment) => isLiveWorkerStatus(a.status)
+const isOpenStep = (status: ChainStep['status']) => !isTerminalStepStatus(status) || status === 'blocked'
 
 /** ≥ 8 workers in one phase sharing one title template ("Baseline capture · host") fold into a stack. */
 export function buildStacks(assignments: readonly Assignment[]): Stacks {
@@ -82,7 +84,7 @@ export function buildStacks(assignments: readonly Assignment[]): Stacks {
 }
 
 /** Chain steps that are planned but have no worker yet (the original trace's "Queued chain steps" lane). */
-export const queuedSteps = (m: RunModel) => m.detail.chainSteps.filter(s => !s.assignedWorkerId && OPEN_STEP.has(s.status)).sort((a, b) => a.seq - b.seq)
+export const queuedSteps = (m: RunModel) => m.detail.chainSteps.filter(s => !s.assignedWorkerId && isOpenStep(s.status)).sort((a, b) => a.seq - b.seq)
 
 export function buildLayout(m: RunModel, stacks: Stacks, expanded: ReadonlySet<string>): WfLayout {
   const d = m.detail

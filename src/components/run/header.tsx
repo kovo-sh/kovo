@@ -15,6 +15,8 @@ import {
   maxRpsPerOriginCeiling,
 } from '../../domain.ts'
 import type { ApprovalPolicy } from '../../domain.ts'
+import { isRunDeleteBlocked, isRunEditable } from '../../server/run-status.ts'
+import type { RunActivity } from '../../server/run-status.ts'
 import { approvalPolicyMeta, capabilityTierMeta } from '../run-state.ts'
 import { Dialog, DialogContent, DialogTitle } from '../ui/dialog.tsx'
 import { useRun, useRunModel } from './data.tsx'
@@ -150,10 +152,9 @@ export function RunHeader() {
   const rPct = r.budgetRequests ? r.spentRequests / r.budgetRequests : 0
   const scopeN = model.scopeOrigins.length
   const { totalGrants } = deriveActiveLeaseGrants(detail)
-  const editable = !['complete', 'stopped', 'failed'].includes(r.status)
-  const hasActiveWorkers = r.status === 'running'
-    || detail.assignments.some(a => a.status === 'running' || a.status === 'waiting_approval')
+  const editable = isRunEditable(detail.activity ?? r.status)
   const hasRunningLab = Boolean(detail.labTarget)
+    || Boolean(detail.activity?.blockingReasons.some(reason => reason.code === 'running_lab_container'))
   useFitRunline(rl, [r.status, r.phase, r.spentUsd, r.spentRequests, scopeN, totalGrants])
 
   useEffect(() => {
@@ -338,7 +339,7 @@ export function RunHeader() {
       </span>
     </div>
     {deleteOpen && <DeleteRunDialog
-      hasActiveWorkers={hasActiveWorkers}
+      activity={detail.activity}
       hasRunningLab={hasRunningLab}
       onClose={() => setDeleteOpen(false)}
       onDeleted={async () => {
@@ -418,7 +419,7 @@ function PopShell({ title, sub, children, footer, wide = false }: { title: React
 function BudgetPopover({ onClose }: { onClose: () => void }) {
   const { detail, send, pending } = useRun()
   const r = detail.run
-  const editable = !['complete', 'stopped', 'failed'].includes(r.status)
+  const editable = isRunEditable(detail.activity ?? r.status)
   const isLocalLab = detail.project.environment === 'local-lab'
   const rpsMax = effectiveRpsCap(detail.project.environment)
   const [usd, setUsd] = useState(r.status === 'budget_paused' ? Math.min(500, Math.max(r.budgetUsd + 10, Math.ceil(r.spentUsd + 10))) : r.budgetUsd)
@@ -482,7 +483,7 @@ function LeasesList({ onError }: { onError: (msg: string) => void }) {
   const { detail, send, pending, now } = useRun()
   const toast = useToast()
   const r = detail.run
-  const editable = !['complete', 'stopped', 'failed'].includes(r.status)
+  const editable = isRunEditable(detail.activity ?? r.status)
   const { activeLeases } = deriveActiveLeaseGrants(detail, now)
 
   if (!activeLeases.length) {
@@ -588,7 +589,7 @@ function PolicyPopover({ onClose }: { onClose: () => void }) {
   const { detail, send, pending, now } = useRun()
   const r = detail.run
   const current: ApprovalPolicy = r.approvalPolicy ?? 'auto_review'
-  const editable = !['complete', 'stopped', 'failed'].includes(r.status)
+  const editable = isRunEditable(detail.activity ?? r.status)
   const { totalGrants } = deriveActiveLeaseGrants(detail, now)
   const [err, setErr] = useState('')
   return <PopShell title="Approval policy" sub={editable ? 'Switches live' : runStatusLabel(r.status)} wide={totalGrants > 0} footer={err ? <span className="mr-auto text-[12px] text-danger">{err}</span> : undefined}>
@@ -672,8 +673,8 @@ function GoalPopover({ onClose }: { onClose: () => void }) {
   </form>
 }
 
-function DeleteRunDialog({ hasActiveWorkers, hasRunningLab, onClose, onDeleted }: {
-  hasActiveWorkers: boolean
+function DeleteRunDialog({ activity, hasRunningLab, onClose, onDeleted }: {
+  activity: RunActivity
   hasRunningLab: boolean
   onClose: () => void
   onDeleted: () => Promise<void>
@@ -685,15 +686,17 @@ function DeleteRunDialog({ hasActiveWorkers, hasRunningLab, onClose, onDeleted }
   const [err, setErr] = useState('')
   const totalFindings = model.findings.length
   const confirmedFindings = model.findings.filter(f => normFStatus(f.status) === 'confirmed').length
-  const isActive = hasActiveWorkers || hasRunningLab
-  const dialogTitle = hasActiveWorkers ? 'Stop & delete run' : hasRunningLab ? 'Stop lab & delete run' : 'Delete run'
-  const activeWarning = hasActiveWorkers && hasRunningLab
-    ? 'This run has active workers and a running local lab container. Confirming will stop active workers and clean up the lab container before deleting.'
-    : hasActiveWorkers
-      ? 'This run has active workers running. Confirming will stop active workers before deleting.'
-      : 'This run still has a running local lab container. Confirming will stop and clean up the lab container before deleting.'
-  const confirmIdleLabel = hasActiveWorkers ? 'Stop & delete run' : hasRunningLab ? 'Stop lab & delete run' : 'Delete run'
-  const confirmBusyLabel = hasActiveWorkers ? 'Stopping & deleting…' : hasRunningLab ? 'Stopping lab & deleting…' : 'Deleting…'
+  const stopNeeded = activity.hasLiveWork || activity.hasParkedApprovals
+  const isBlocked = isRunDeleteBlocked(activity) || hasRunningLab
+  const dialogTitle = stopNeeded ? 'Stop & delete run' : hasRunningLab ? 'Stop lab & delete run' : 'Delete run'
+  const activeWarning = activity.hasLiveWork && hasRunningLab
+    ? 'Active workers and a local lab container are running. Confirming will stop both before deleting.'
+    : activity.hasLiveWork
+      ? 'Active workers are running. Confirming will stop them before deleting.'
+      : activity.hasParkedApprovals
+        ? 'This paused run has parked approval requests awaiting decision. Confirming will cancel them before deleting.'
+        : 'A local lab container is still running. Confirming will stop and clean it up before deleting.'
+  const confirmBusyLabel = stopNeeded ? 'Stopping & deleting…' : hasRunningLab ? 'Stopping lab & deleting…' : 'Deleting…'
 
   useShortcuts([{ key: 'Escape', allowInInput: true, run: () => { if (!deleting) onClose() } }], { priority: 100, exclusive: true })
 
@@ -702,7 +705,7 @@ function DeleteRunDialog({ hasActiveWorkers, hasRunningLab, onClose, onDeleted }
     setDeleting(true)
     setErr('')
     try {
-      await removeRun({ data: { runId: r.id, stopActive: isActive } })
+      await removeRun({ data: { runId: r.id, stopActive: isBlocked } })
       await onDeleted()
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'Could not delete the run.')
@@ -740,7 +743,7 @@ function DeleteRunDialog({ hasActiveWorkers, hasRunningLab, onClose, onDeleted }
             <span>{fmtN(r.spentRequests)} req · {fmtUsd(r.spentUsd)}</span>
           </div>
         </div>
-        {isActive && <div className="flex items-start gap-2 rounded-lg bg-warn-soft px-[11px] py-[9px] text-[12px] leading-[17px] text-fg shadow-[inset_0_0_0_1px_var(--warn-line)]" role="status">
+        {isBlocked && <div className="flex items-start gap-2 rounded-lg bg-warn-soft px-[11px] py-[9px] text-[12px] leading-[17px] text-fg shadow-[inset_0_0_0_1px_var(--warn-line)]" role="status">
           <Icon name="alert" className="mt-0.5 flex-none text-warn" />
           <span>{activeWarning}</span>
         </div>}
@@ -750,7 +753,7 @@ function DeleteRunDialog({ hasActiveWorkers, hasRunningLab, onClose, onDeleted }
         <button type="button" className={runBtn({ variant: 'ghost' })} disabled={deleting} onClick={onClose}>Cancel</button>
         <button type="button" className={runBtn({ variant: 'dangerSolid' })} disabled={deleting} onClick={() => void handleConfirm()}>
           <Icon name="trash" />
-          {deleting ? confirmBusyLabel : confirmIdleLabel}
+          {deleting ? confirmBusyLabel : dialogTitle}
         </button>
       </div>
     </DialogContent>

@@ -8,8 +8,6 @@ import {
   callerCompatibilityLabels,
   capabilityTierLabel,
   checkLabels,
-  collapseBaselineHeaderFindings,
-  deduplicateChainFindings,
   dynamicRetestLabels,
   findingVerificationTier,
   isConsolidatedHeaderPostureFinding,
@@ -562,14 +560,14 @@ export function exportReportMarkdown(
     ...(provenanceAllowedOrigins.length ? { provenanceAllowedOrigins } : {}),
     ...(taintedFactIds.length ? { taintedFactIds } : {}),
   })
-  const activeProjected = [...projected.confirmed, ...projected.advisories, ...projected.unverified].map(item =>
+  const withEffectiveSeverity = (item: typeof projected.confirmed[number]): Finding =>
     item.effectiveSeverity === item.finding.severity
       ? item.finding
-      : { ...item.finding, severity: item.effectiveSeverity },
-  )
-  const { findings } = collapseBaselineHeaderFindings(deduplicateChainFindings(activeProjected))
-  const prominentFindings = findings.filter(item => !isConsolidatedHeaderPostureFinding(item))
-  const headerPostureFindings = findings.filter(item => isConsolidatedHeaderPostureFinding(item))
+      : { ...item.finding, severity: item.effectiveSeverity }
+  const confirmedFindings = projected.confirmed.map(withEffectiveSeverity)
+  const staticVerifiedFindings = projected.advisories.map(withEffectiveSeverity)
+  const unverifiedFindings = projected.unverified.map(withEffectiveSeverity)
+  const findings = [...confirmedFindings, ...staticVerifiedFindings, ...unverifiedFindings]
   const { coverage, confirmed, staticVerified, chainConfirmed, priority } = reportHighlights(
     { ...body, findings: hydratedFindings },
     {
@@ -578,19 +576,17 @@ export function exportReportMarkdown(
     },
   )
   const plan = reportPlanLabel(body.selectedChecks)
-  const confirmedFindings = findings.filter(item => item.status === 'confirmed')
-  const staticVerifiedFindings = findings.filter(item => item.status === 'static_verified')
   const suppressedItems = projected.suppressed
-  const confirmedProminent = prominentFindings.filter(item => item.status === 'confirmed')
-  const staticAdvisoryProminent = prominentFindings.filter(item => item.status === 'static_verified')
-  const unverifiedProminent = prominentFindings.filter(item => item.status !== 'confirmed' && item.status !== 'static_verified')
-  const confirmedHeaderPosture = headerPostureFindings.filter(item => item.status === 'confirmed')
-  const otherHeaderPosture = headerPostureFindings.filter(item => item.status !== 'confirmed')
-  const severityCounts = ['critical', 'high', 'medium', 'low', 'informational'].flatMap(severity => {
-    const count = confirmedFindings.filter(item => item.severity === severity).length
+  const confirmedProminent = confirmedFindings.filter(item => !isConsolidatedHeaderPostureFinding(item))
+  const staticAdvisoryProminent = staticVerifiedFindings.filter(item => !isConsolidatedHeaderPostureFinding(item))
+  const unverifiedProminent = unverifiedFindings.filter(item => !isConsolidatedHeaderPostureFinding(item))
+  const confirmedHeaderPosture = confirmedFindings.filter(item => isConsolidatedHeaderPostureFinding(item))
+  const otherHeaderPosture = [...staticVerifiedFindings, ...unverifiedFindings].filter(item => isConsolidatedHeaderPostureFinding(item))
+  const severityCounts = (['critical', 'high', 'medium', 'low', 'informational'] as const).flatMap(severity => {
+    const count = projected.counts.byConfirmedSeverity[severity]
     return count ? [`- **${severity[0].toUpperCase() + severity.slice(1)}** ${count}`] : []
   })
-  const staticSeverityCounts = ['critical', 'high', 'medium', 'low', 'informational'].flatMap(severity => {
+  const staticSeverityCounts = (['critical', 'high', 'medium', 'low', 'informational'] as const).flatMap(severity => {
     const count = staticVerifiedFindings.filter(item => item.severity === severity).length
     return count ? [`- **${severity[0].toUpperCase() + severity.slice(1)} (static verified)** ${count}`] : []
   })
@@ -757,7 +753,7 @@ export function exportReportMarkdown(
     appendFindingMarkdown(finding)
   }
 
-  const renderHeaderPostureTable = (items: typeof headerPostureFindings) => {
+  const renderHeaderPostureTable = (items: typeof confirmedHeaderPosture) => {
     lines.push(
       '### HTTP Security Header Posture (Baseline Hygiene)', '',
       'Repetitive per-origin missing-header baseline checks (CSP, frame protection, `X-Content-Type-Options`, `Referrer-Policy`, and `Server` disclosure) are consolidated below:', '',
@@ -838,7 +834,7 @@ export function exportReportMarkdown(
     const orderedRemediation = [
       ...confirmedProminent,
       ...staticVerifiedFindings,
-      ...headerPostureFindings.filter(item => item.status === 'confirmed'),
+      ...confirmedHeaderPosture,
     ]
     for (const [index, finding] of orderedRemediation.entries()) {
       const tier = findingVerificationTier(finding)
