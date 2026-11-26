@@ -14,6 +14,7 @@ import type { KeyLike, KeyObject } from 'node:crypto'
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { desc, eq } from 'drizzle-orm'
+import { normalizeCurlHttpMethod, quotePosixShellArg } from '../components/curl-parser.ts'
 import { CAUSAL_EDGE_KINDS, REPLAY_MODES, compositeProofReceiptSchema } from './composite-receipt.ts'
 import type {
   CausalEdgeBinding,
@@ -71,6 +72,7 @@ export interface PortableReproducerStep {
   personaHandle: string | null
   headers: Record<string, string>
   observedStatus: number
+  body?: string | null
 }
 
 export interface PortablePatchRetestProof {
@@ -365,13 +367,25 @@ function resolveDefaultSigningOptions(storage: Store): ReceiptBundleSignOptions 
   return { algorithm: 'ed25519', privateKey: pair.privateKey, keyId: pair.keyId }
 }
 
-function buildCommandHint(steps: readonly PortableReproducerStep[]): string {
+export function buildCommandHint(steps: readonly PortableReproducerStep[]): string {
   const primary = steps[steps.length - 1]
   if (!primary) return '# No HTTP exchange recorded for this receipt.'
-  const authFlag = primary.personaHandle
-    ? ` -H "Authorization: Bearer <token:${primary.personaHandle}>"`
-    : ''
-  return `curl -i -X ${primary.method}${authFlag} "${primary.origin}${primary.pathAndQuery}"`
+  const method = normalizeCurlHttpMethod(primary.method)
+  const parts = ['curl', '-i', '-X', quotePosixShellArg(method)]
+  if (primary.personaHandle) {
+    parts.push('-H', quotePosixShellArg(`Authorization: Bearer <token:${primary.personaHandle}>`))
+  }
+  for (const [key, value] of Object.entries(primary.headers ?? {})) {
+    const lower = key.toLowerCase()
+    if (lower === 'host') continue
+    if (primary.personaHandle && lower === 'authorization') continue
+    parts.push('-H', quotePosixShellArg(`${key}: ${String(value)}`))
+  }
+  if (typeof primary.body === 'string' && primary.body.length > 0) {
+    parts.push('--data-raw', quotePosixShellArg(primary.body))
+  }
+  parts.push(quotePosixShellArg(`${primary.origin}${primary.pathAndQuery}`))
+  return parts.join(' ')
 }
 
 function recordDigest(record: Omit<PortableReceiptRecord, 'recordSha256'>): string {
