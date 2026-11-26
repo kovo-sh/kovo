@@ -57,7 +57,12 @@ import {
 } from '../src/server/proof-receipt.ts'
 import { retestPersistedAgentScript, retestReplaySpec, verifyReplaySpec } from '../src/server/replay-verifier.ts'
 import { assessDeclarativeRetestHealth, assessRetestHealth, type RetestFailureReason, type RetestHealthAssessment } from '../src/server/retest-health.ts'
-import { defaultTerminalOracleRegistry } from '../src/server/terminal-oracle-registry.ts'
+import {
+  REGISTERED_V8_ORACLE_FAMILIES,
+  SINGLE_HOP_ORACLE_RULES,
+  defaultTerminalOracleRegistry,
+  type SingleHopOracleRule,
+} from '../src/server/terminal-oracle-registry.ts'
 import type { V8OracleFamily } from '../src/server/v8-oracle-families.ts'
 import { TranscriptStore, evaluateClaims, type VerifyClaim } from '../src/server/verify-claims.ts'
 import { VERIFY_NONCE_HEADER, VERIFY_RPC_CONTEXT_NAME, VERIFY_RPC_HEADER, VERIFY_RPC_SOCKET_NAME, VERIFY_RPC_TOKEN_NAME } from '../src/server/verify-rpc.ts'
@@ -379,22 +384,18 @@ function expectedVerdictFor(
   return row.tpExpectedConfirmed
 }
 
-type ManifestReceiptRule = Exclude<ReceiptVerification['rule'], 'none'>
-const MANIFEST_RECEIPT_RULES: readonly ManifestReceiptRule[] = [
-  'impact',
-  'boolean',
-  'status_differential',
-  'timing',
-  'oob',
-  'redirect',
-  'conserved_balance',
-  'auth_bypass',
-  'webhook',
-  'browser',
-]
+type ManifestReceiptRule = SingleHopOracleRule
+const MANIFEST_RECEIPT_RULES: readonly ManifestReceiptRule[] = SINGLE_HOP_ORACLE_RULES
 
 interface CorpusClassExemption {
   readonly rule: ManifestReceiptRule
+  readonly ticket: string
+  readonly reason: string
+  readonly expires: string
+}
+
+interface FpCorpusBackfillRatchetEntry {
+  readonly oracle: ManifestReceiptRule | V8OracleFamily
   readonly ticket: string
   readonly reason: string
   readonly expires: string
@@ -405,6 +406,32 @@ interface CorpusClassExemption {
  * Currently empty because every manifest receipt rule has at least one offline corpus fixture.
  */
 export const CORPUS_CLASS_EXEMPTIONS: ReadonlyArray<CorpusClassExemption> = []
+
+/**
+ * R3-12 strictly-shrinking FP corpus backfill ratchet for single-hop rules that do not yet have
+ * an explicit `side === 'fp'` fixture in `tests/parity/corpus/*.json` (TP cases do NOT count).
+ * Prune-fail: once an FP corpus case lands for a listed rule, this test fails until removed here.
+ */
+export const FP_RULE_BACKFILL_RATCHET: ReadonlyArray<FpCorpusBackfillRatchetEntry> = [
+  { oracle: 'oob', ticket: 'R3-12-FP-CORPUS-BACKFILL', reason: 'Pending FP corpus fixture once tests/parity/corpus/*.json lease is free (covered live in tests/kernel-archetype-matrix.test.ts).', expires: '2026-12-31' },
+  { oracle: 'timing', ticket: 'R3-12-FP-CORPUS-BACKFILL', reason: 'Pending FP corpus fixture once tests/parity/corpus/*.json lease is free (covered live in tests/kernel-archetype-matrix.test.ts).', expires: '2026-12-31' },
+  { oracle: 'browser', ticket: 'R3-12-FP-CORPUS-BACKFILL', reason: 'Pending FP corpus fixture once tests/parity/corpus/*.json lease is free (covered live in tests/kernel-archetype-matrix.test.ts).', expires: '2026-12-31' },
+  { oracle: 'redirect', ticket: 'R3-12-FP-CORPUS-BACKFILL', reason: 'Pending FP corpus fixture once tests/parity/corpus/*.json lease is free (covered live in tests/kernel-archetype-matrix.test.ts).', expires: '2026-12-31' },
+  { oracle: 'conserved_balance', ticket: 'R3-12-FP-CORPUS-BACKFILL', reason: 'Pending FP corpus fixture once tests/parity/corpus/*.json lease is free (covered live in tests/kernel-archetype-matrix.test.ts).', expires: '2026-12-31' },
+  { oracle: 'webhook', ticket: 'R3-12-FP-CORPUS-BACKFILL', reason: 'Pending FP corpus fixture once tests/parity/corpus/*.json lease is free (covered live in tests/kernel-archetype-matrix.test.ts).', expires: '2026-12-31' },
+]
+
+/**
+ * R3-12 strictly-shrinking FP corpus backfill ratchet for V8 oracle families that do not yet have
+ * an explicit `side === 'fp'` fixture with `composite.v8OracleInput.family` in `tests/parity/corpus/*.json`.
+ * Prune-fail: once an FP corpus case lands for a listed family, this test fails until removed here.
+ */
+export const V8_FP_FAMILY_BACKFILL_RATCHET: ReadonlyArray<FpCorpusBackfillRatchetEntry> = [
+  { oracle: 'temporal_revocation', ticket: 'R3-12-FP-CORPUS-BACKFILL', reason: 'Pending V8 FP corpus fixture once tests/parity/corpus/*.json lease is free (covered live in tests/kernel-archetype-matrix.test.ts).', expires: '2026-12-31' },
+  { oracle: 'economic_conservation', ticket: 'R3-12-FP-CORPUS-BACKFILL', reason: 'Pending V8 FP corpus fixture once tests/parity/corpus/*.json lease is free (covered live in tests/kernel-archetype-matrix.test.ts).', expires: '2026-12-31' },
+  { oracle: 'parser_cache_differential', ticket: 'R3-12-FP-CORPUS-BACKFILL', reason: 'Pending V8 FP corpus fixture once tests/parity/corpus/*.json lease is free (covered live in tests/kernel-archetype-matrix.test.ts).', expires: '2026-12-31' },
+  { oracle: 'cross_surface_pivot', ticket: 'R3-12-FP-CORPUS-BACKFILL', reason: 'Pending V8 FP corpus fixture once tests/parity/corpus/*.json lease is free (covered live in tests/kernel-archetype-matrix.test.ts).', expires: '2026-12-31' },
+]
 
 function loadCorpus(): ParityCase[] {
   const files = readdirSync(CORPUS_DIR).filter(f => f.endsWith('.json')).sort()
@@ -922,12 +949,21 @@ test('parity corpus: covers both TP and FP sides including anon-control authz an
 
   // R2-11: Every manifest receipt class must be covered by the corpus or carry a valid ticketed exemption.
   const coveredRules = new Set<ManifestReceiptRule>()
+  const fpCoveredRules = new Set<ManifestReceiptRule>()
+  const fpCoveredV8Families = new Set<V8OracleFamily>()
   for (const c of corpus) {
     const cls = c.proofReceipt?.vulnClass ?? c.canonicalLabel.vulnClass
-    if (!cls) continue
-    const oobIds = c.proofReceipt?.oobEvents?.map(e => e.id) ?? []
-    const { rule } = receiptRuleFor(cls, { oobEventIds: oobIds })
-    if (rule !== 'none') coveredRules.add(rule)
+    if (cls) {
+      const oobIds = c.proofReceipt?.oobEvents?.map(e => e.id) ?? []
+      const { rule } = receiptRuleFor(cls, { oobEventIds: oobIds })
+      if (rule !== 'none') {
+        coveredRules.add(rule)
+        if (c.side === 'fp') fpCoveredRules.add(rule)
+      }
+    }
+    if (c.side === 'fp' && c.composite?.v8OracleInput?.family) {
+      fpCoveredV8Families.add(c.composite.v8OracleInput.family)
+    }
   }
   const exemptionsByRule = new Map(CORPUS_CLASS_EXEMPTIONS.map(ex => [ex.rule, ex]))
   for (const rule of MANIFEST_RECEIPT_RULES) {
@@ -935,6 +971,51 @@ test('parity corpus: covers both TP and FP sides including anon-control authz an
     const ex = exemptionsByRule.get(rule)
     assert.ok(ex, `R2-11 manifest receipt class "${rule}" has zero parity corpus coverage and no ticketed exemption`)
     assert.ok(ex.ticket.trim().length > 0 && ex.reason.trim().length > 0 && /^\d{4}-\d{2}-\d{2}$/.test(ex.expires))
+  }
+
+  // R3-12: FP-only completeness across EVERY single-hop rule AND EVERY registered V8 oracle family.
+  // TP cases NO LONGER satisfy FP coverage. Any currently uncovered rule/family must be tracked in the
+  // monotone-shrinking (prune-fail) backfill ratchet with a ticket, reason, and ISO expiry date.
+  const fpRuleRatchet = new Map(FP_RULE_BACKFILL_RATCHET.map(e => [e.oracle, e]))
+  for (const rule of SINGLE_HOP_ORACLE_RULES) {
+    const ratcheted = fpRuleRatchet.get(rule)
+    if (fpCoveredRules.has(rule)) {
+      assert.equal(
+        ratcheted,
+        undefined,
+        `R3-12 prune-fail: single-hop rule "${rule}" now has an FP corpus case — remove it from FP_RULE_BACKFILL_RATCHET`,
+      )
+      continue
+    }
+    assert.ok(
+      ratcheted,
+      `R3-12 FP completeness: single-hop rule "${rule}" has ZERO FP corpus cases (TP cases do not count) and is not in FP_RULE_BACKFILL_RATCHET`,
+    )
+    assert.ok(
+      ratcheted.ticket.trim().length > 0 && ratcheted.reason.trim().length > 0 && /^\d{4}-\d{2}-\d{2}$/.test(ratcheted.expires),
+      `R3-12 invalid FP_RULE_BACKFILL_RATCHET entry for "${rule}"`,
+    )
+  }
+
+  const fpV8Ratchet = new Map(V8_FP_FAMILY_BACKFILL_RATCHET.map(e => [e.oracle, e]))
+  for (const family of REGISTERED_V8_ORACLE_FAMILIES) {
+    const ratcheted = fpV8Ratchet.get(family)
+    if (fpCoveredV8Families.has(family)) {
+      assert.equal(
+        ratcheted,
+        undefined,
+        `R3-12 prune-fail: V8 oracle family "${family}" now has an FP corpus case — remove it from V8_FP_FAMILY_BACKFILL_RATCHET`,
+      )
+      continue
+    }
+    assert.ok(
+      ratcheted,
+      `R3-12 FP completeness: V8 oracle family "${family}" has ZERO FP corpus cases with composite.v8OracleInput (TP cases do not count) and is not in V8_FP_FAMILY_BACKFILL_RATCHET`,
+    )
+    assert.ok(
+      ratcheted.ticket.trim().length > 0 && ratcheted.reason.trim().length > 0 && /^\d{4}-\d{2}-\d{2}$/.test(ratcheted.expires),
+      `R3-12 invalid V8_FP_FAMILY_BACKFILL_RATCHET entry for "${family}"`,
+    )
   }
 })
 
