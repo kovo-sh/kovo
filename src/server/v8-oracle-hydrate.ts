@@ -764,7 +764,7 @@ function deriveDualActorFromTranscript(
   for (const e of idx.entriesById.values()) {
     if (resolveEntryActor(e).toLowerCase() !== actorLower) continue
     const idn = resolveEntryIdentity(e); recordRole(idn.tenant, idn.role)
-    if (e.actorRoleLabel && (e.actorRoleLabel.includes('memberships=') || (e.actorRoleLabel.includes('@') && /[,;]/.test(e.actorRoleLabel)))) recordMemberships(e.actorRoleLabel, false)
+    if (e.actorRoleLabel && (e.actorRoleLabel.includes('memberships=') || /[,;]/.test(e.actorRoleLabel))) recordMemberships(e.actorRoleLabel, false)
   }
   const needReg = Object.keys(rolesByTenant).length === 0
   for (const reg of [idx.personaRoleLabels, econCtx?.personaRoleLabels]) if (reg) for (const [k, label] of Object.entries(reg)) if (k.trim().toLowerCase() === actorLower) recordMemberships(label, needReg)
