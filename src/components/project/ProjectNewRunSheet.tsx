@@ -79,7 +79,7 @@ const SCAN_MODES: Record<ScanMode, ScanModePreset> = {
     goal: 'Run all in-scope active probes, mutations, and race bursts automatically with full audit logs and no approval pauses.',
     label: 'Autonomous Scan',
     badge: 'Risky',
-    desc: 'All in-scope active probes, mutations, and race bursts with no approval pauses.',
+    desc: 'Runs write probes automatically without pausing for approval. Best for staging or local labs.',
     badgeVariant: 'warn',
     warning: 'Not recommended for production environments',
   },
@@ -136,7 +136,6 @@ function ModeIllustration({ mode }: { mode: ScanMode }) {
 export function resolveRunSubmissionMode(
   scanMode: ScanMode,
   selectedPersonaCount: number,
-  strictWrites: boolean,
 ): { capabilityTier: CapabilityTier; approvalPolicy: ApprovalPolicy } {
   if (scanMode === 'passive') {
     return {
@@ -147,7 +146,7 @@ export function resolveRunSubmissionMode(
   if (scanMode === 'supervised') {
     return {
       capabilityTier: 3,
-      approvalPolicy: strictWrites ? 'strict' : 'auto_review',
+      approvalPolicy: 'auto_review',
     }
   }
   return {
@@ -169,7 +168,6 @@ export function ProjectNewRunSheet({
   const navigate = useNavigate()
 
   const [scanMode, setScanMode] = useState<ScanMode>('supervised')
-  const [strictWrites, setStrictWrites] = useState(false)
   const [goal, setGoal] = useState('')
   const [budgetUsd, setBudgetUsd] = useState<number>(SCAN_MODES.supervised.usdCap)
   const [maxRps, setMaxRps] = useState<number>(SCAN_MODES.supervised.rps)
@@ -196,7 +194,6 @@ export function ProjectNewRunSheet({
     const { capabilityTier, approvalPolicy } = resolveRunSubmissionMode(
       scanMode,
       selectedPersonaIds.length,
-      strictWrites,
     )
     const effectiveGoal = goal.trim() || SCAN_MODES[scanMode].goal
     const effectiveReqs = unlimitedReqs ? 0 : Math.max(1, Math.min(maxBudgetRequests, Math.round(budgetReqs)))
@@ -298,17 +295,6 @@ export function ProjectNewRunSheet({
                   })}
                 </div>
 
-                {scanMode === 'supervised' && (
-                  <label className="inline-flex cursor-pointer select-none items-center gap-[7px] pt-0.5 text-[12px] font-normal text-fg-muted">
-                    <Checkbox
-                      checked={strictWrites}
-                      aria-label="Ask before every write (strict)"
-                      onCheckedChange={checked => setStrictWrites(Boolean(checked))}
-                    />
-                    <span>Ask before every write (strict)</span>
-                  </label>
-                )}
-
                 {scanMode === 'autonomous' && (
                   <div
                     role="status"
@@ -317,7 +303,7 @@ export function ProjectNewRunSheet({
                     <Icon name="alert" size={14} className="mt-0.5 flex-none text-warn" />
                     <span>
                       <strong className="font-semibold">Not recommended for production environments.</strong>{' '}
-                      Autonomous Scan executes in-scope mutations and race bursts without pausing for approval.
+                      Write probes run automatically without approval.
                     </span>
                   </div>
                 )}

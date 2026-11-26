@@ -230,9 +230,10 @@ test('B1/B2/B3 + #607: ProjectNewRunSheet 3-card Scan Mode picker, removes Worke
   assert.match(src, /label:\s*'Supervised Scan'/)
   assert.match(src, /badge:\s*'Recommended'/)
   assert.match(src, /useState<ScanMode>\('supervised'\)/)
-  assert.match(src, /Ask before every write \(strict\)/)
+  assert.doesNotMatch(src, /Ask before every write \(strict\)/)
   assert.match(src, /label:\s*'Autonomous Scan'/)
   assert.match(src, /badge:\s*'Risky'/)
+  assert.match(src, /Runs write probes automatically without pausing for approval\. Best for staging or local labs\./)
   assert.match(src, /Not recommended for production environments/)
   const applyScanModeBlock = src.match(/function applyScanMode\([\s\S]*?\n  \}/)?.[0] ?? ''
   assert.ok(applyScanModeBlock.length > 0, 'Expected applyScanMode handler')
@@ -244,17 +245,17 @@ test('B1/B2/B3 + #607: ProjectNewRunSheet 3-card Scan Mode picker, removes Worke
 
   // Verify exact mode -> (capabilityTier, approvalPolicy) mapping via resolveRunSubmissionMode
   const resolveRunSubmissionMode = evalExportedFunction<
-    (scanMode: 'passive' | 'supervised' | 'autonomous', count: number, strictWrites: boolean) => {
+    (scanMode: 'passive' | 'supervised' | 'autonomous', count: number) => {
       capabilityTier: number
       approvalPolicy: string
     }
   >('src/components/project/ProjectNewRunSheet.tsx', 'resolveRunSubmissionMode')
-  assert.deepEqual(resolveRunSubmissionMode('passive', 0, false), { capabilityTier: 1, approvalPolicy: 'auto_review' })
-  assert.deepEqual(resolveRunSubmissionMode('passive', 2, true), { capabilityTier: 2, approvalPolicy: 'auto_review' })
-  assert.deepEqual(resolveRunSubmissionMode('supervised', 0, false), { capabilityTier: 3, approvalPolicy: 'auto_review' })
-  assert.deepEqual(resolveRunSubmissionMode('supervised', 2, true), { capabilityTier: 3, approvalPolicy: 'strict' })
-  assert.deepEqual(resolveRunSubmissionMode('autonomous', 0, false), { capabilityTier: 3, approvalPolicy: 'yolo' })
-  assert.deepEqual(resolveRunSubmissionMode('autonomous', 2, true), { capabilityTier: 3, approvalPolicy: 'yolo' })
+  assert.deepEqual(resolveRunSubmissionMode('passive', 0), { capabilityTier: 1, approvalPolicy: 'auto_review' })
+  assert.deepEqual(resolveRunSubmissionMode('passive', 2), { capabilityTier: 2, approvalPolicy: 'auto_review' })
+  assert.deepEqual(resolveRunSubmissionMode('supervised', 0), { capabilityTier: 3, approvalPolicy: 'auto_review' })
+  assert.deepEqual(resolveRunSubmissionMode('supervised', 2), { capabilityTier: 3, approvalPolicy: 'auto_review' })
+  assert.deepEqual(resolveRunSubmissionMode('autonomous', 0), { capabilityTier: 3, approvalPolicy: 'yolo' })
+  assert.deepEqual(resolveRunSubmissionMode('autonomous', 2), { capabilityTier: 3, approvalPolicy: 'yolo' })
 
   // B3: reuses PersonaFormModal (no inline registerPersona/parseCurlOrHeader) and wires onTestPersona on chips
   assert.match(src, /import\s*\{\s*PersonaFormModal\s*\}\s*from\s*'\.\/PersonaFormModal\.tsx'/)
