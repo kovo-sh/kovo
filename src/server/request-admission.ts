@@ -28,7 +28,6 @@ import {
   isVerifiedReadOnlyGraphqlQuery,
   normalizeScopeOrigin,
   originRoleFor,
-  requestCarriesTenantTag,
 } from './scope-policy.ts'
 import type { EnvironmentMode, ScopeHook, ScopePolicy, ScopeSurface } from './scope-policy.ts'
 
@@ -111,6 +110,12 @@ export interface RequestMutationClassification {
   effectiveMethod: string
   /** R2-H-1: True when any method-override header or `_method` query/form/JSON field is present. */
   hasMethodOverride: boolean
+  /** R3-H-1(b): True when the request body exceeds the 64 KiB deterministic classification window. */
+  hasOverCapBody: boolean
+  /** R3-H-1(b): True when the request body could not be completely parsed/scanned for method overrides. */
+  overrideScanIncomplete: boolean
+  /** R3-H-1(b): Authoritative override-risk flag (explicit override, over-cap body, compressed, or unscannable). */
+  hasOverrideRisk: boolean
   /** R2-H-1: Override carrier names when `hasMethodOverride` is true. */
   methodOverrideCarriers?: string[]
   isReadOnly: boolean
@@ -827,18 +832,28 @@ export function classifyRequestMutation(input: {
   const hasMultipartContentType = /^\s*multipart\//i.test(contentType)
   const hasMultipart = hasMultipartParts || hasMultipartContentType
   const hasCompressedBody = contentEncoding !== '' && !/^identity$/i.test(contentEncoding)
-  const isReadOnlyHttp = !hasMultipart && !override.hasOverride && isReadOnlyHttpMethod(effectiveMethod, input.body ?? null)
-  // R2-H-1: Treat override carriers (and effective DELETE verbs) as structural mutations so
-  // auto_review DELETE gates can never be bypassed via method overrides.
+  const hasOverCapBody = override.bodyExceedsScanWindow
+  const overrideScanIncomplete = override.scanIncomplete
+  const hasOverrideRisk = override.hasOverrideRisk || hasCompressedBody
+  const isReadOnlyHttp = !hasMultipart && !hasOverrideRisk && isReadOnlyHttpMethod(effectiveMethod, input.body ?? null)
+  // R2-H-1 / R3-H-1(b): Treat override carriers, over-cap bodies (>64 KiB), unscannable bodies,
+  // effective DELETE verbs, multipart uploads, and compressed bodies as structural mutations so
+  // auto_review gates and durable route leases can never be bypassed.
   const isStructuralMutation =
     method === 'DELETE' ||
     effectiveMethod === 'DELETE' ||
     override.hasOverride ||
+    hasOverCapBody ||
+    overrideScanIncomplete ||
+    hasOverrideRisk ||
     hasMultipart ||
     hasCompressedBody
   const overrideMeta = {
     effectiveMethod,
     hasMethodOverride: override.hasOverride,
+    hasOverCapBody,
+    overrideScanIncomplete,
+    hasOverrideRisk,
     ...(override.carriers.length > 0 ? { methodOverrideCarriers: override.carriers } : {}),
   }
 
@@ -885,7 +900,7 @@ export function classifyRequestMutation(input: {
   }
 
   if (
-    !override.hasOverride &&
+    !hasOverrideRisk &&
     method === 'POST' &&
     isVerifiedReadOnlyGraphqlQuery(input.pathAndQuery, input.body ?? null, input.headers, {
       ...(input.confirmedGraphqlEndpoints !== undefined
@@ -958,6 +973,29 @@ export function classifyRequestMutation(input: {
     hasCompressedBody: false,
     isJsonRpc: false,
   }
+}
+
+/**
+ * Single authoritative durable-route-lease eligibility check (`R3-H-1(b)`).
+ *
+ * Race bursts, compressed bodies, explicit method-override carriers, over-cap bodies (>64 KiB),
+ * and bodies whose override scan was incomplete NEVER satisfy a durable POST/route lease under
+ * any approval policy.
+ */
+export function isDurableRouteLeaseEligible(
+  classification: Pick<
+    RequestMutationClassification,
+    'hasCompressedBody' | 'hasMethodOverride' | 'hasOverCapBody' | 'overrideScanIncomplete' | 'hasOverrideRisk'
+  >,
+  options: { isRaceBurst?: boolean } = {},
+): boolean {
+  if (options.isRaceBurst === true) return false
+  if (classification.hasCompressedBody) return false
+  if (classification.hasMethodOverride) return false
+  if (classification.hasOverCapBody) return false
+  if (classification.overrideScanIncomplete) return false
+  if (classification.hasOverrideRisk) return false
+  return true
 }
 
 // ---------------------------------------------------------------------------
@@ -1606,15 +1644,17 @@ export class RequestAdmissionEngine {
         surface: request.surface ?? (kind === 'browser' ? 'browser' : 'broker'),
       })
       const contractApplies = effectiveScopePolicy.mode !== 'ephemeral_lab'
+      const leaseClassificationEligible = isDurableRouteLeaseEligible(classification, {
+        isRaceBurst: request.isRaceBurst === true,
+      })
       const checkLease = (): boolean =>
-        !request.isRaceBurst &&
-        !classification.hasCompressedBody &&
-        !classification.hasMethodOverride &&
+        leaseClassificationEligible &&
         grant.approvalLeases?.(initialOrigin, classification.effectiveMethod, canonical) === true
 
       const sandboxPostAllowed =
         !classification.hasMultipart &&
-        !classification.hasMethodOverride &&
+        !classification.hasCompressedBody &&
+        !classification.hasOverrideRisk &&
         normalizedMethod === 'POST' &&
         capabilityTier === 2 &&
         grant.sandboxWriteAllowlist !== undefined &&
@@ -1626,9 +1666,17 @@ export class RequestAdmissionEngine {
           approvedReasonCode = classification.isVerifiedGraphqlRead ? 'allowed_graphql_readonly' : 'allowed_read_only'
           approvedRule = classification.isVerifiedGraphqlRead ? 'scope_policy:graphql_readonly' : 'scope_policy:read_only'
         } else if (approvalMeta.explicitEnvironmentMode) {
-          contractApproved = contractApplies || (evaluateConsuming && checkLease())
-          approvedReasonCode = contractApplies ? 'allowed_environment_contract' : 'allowed_approval_lease'
-          approvedRule = contractApplies ? `scope_policy:${effectiveScopePolicy.mode}` : 'approval_lease'
+          // R3-H-1(b): Even on explicit staging_isolated, method-override carriers, over-cap
+          // (>64 KiB) bodies, and unscannable bodies MUST escalate through `isStateChangeApproved`
+          // (matching `approval-judge.ts`), unless policy is explicitly `yolo`.
+          const allowExplicitContract =
+            contractApplies &&
+            (!classification.hasOverrideRisk || approvalMeta.effectivePolicy === 'yolo')
+          contractApproved = allowExplicitContract || (evaluateConsuming && checkLease())
+          if (contractApproved) {
+            approvedReasonCode = allowExplicitContract ? 'allowed_environment_contract' : 'allowed_approval_lease'
+            approvedRule = allowExplicitContract ? `scope_policy:${effectiveScopePolicy.mode}` : 'approval_lease'
+          }
         } else if (!contractApplies) {
           contractApproved = evaluateConsuming && checkLease()
           if (contractApproved) {
@@ -1646,31 +1694,12 @@ export class RequestAdmissionEngine {
             approvedRule = 'approval_lease'
           }
         } else {
-          // auto_review on derived staging_isolated (`R2-H-1`):
-          //  - Structural mutations (DELETE, method-override carriers, multipart, compressed) and
-          //    race bursts ALWAYS flow through exact approval / HITL.
-          //  - Host-injected run tag headers (`x-kovo-tenant-tag`) NEVER serve as standalone
-          //    isolation proof: require an explicit hook or target-visible tenant tag in path/body.
-          const hasNonHostInjectedTag =
-            request.scopeHook === 'setup' ||
-            request.scopeHook === 'cleanup' ||
-            requestCarriesTenantTag(
-              {
-                origin: initialOrigin,
-                method: normalizedMethod,
-                pathAndQuery: canonical,
-                body: request.body ?? null,
-                headers: normalizedHeaders,
-              },
-              effectiveScopePolicy.tenantTag,
-              { ignoreHostInjectedHeaders: true },
-            )
-          if (!classification.isStructuralMutation && !request.isRaceBurst && hasNonHostInjectedTag) {
-            contractApproved = true
-            approvedReasonCode = 'allowed_environment_contract'
-            approvedRule = 'approval_policy:auto_review'
-          } else if (evaluateConsuming && checkLease()) {
-            contractApproved = true
+          // R3-H-1(a): Derived (non-explicit) staging_isolated under `auto_review` NEVER
+          // auto-approves writes via tenant tags (neither headers nor host-injected
+          // `stagingProbeTag` / `tagStagingEntityBody` body fields) or hooks. Every non-read-only
+          // mutation without an eligible durable operator lease routes through `isStateChangeApproved`.
+          contractApproved = evaluateConsuming && checkLease()
+          if (contractApproved) {
             approvedReasonCode = 'allowed_approval_lease'
             approvedRule = 'approval_lease'
           }
@@ -1678,6 +1707,7 @@ export class RequestAdmissionEngine {
       } else {
         const leaseEligible =
           contractApplies &&
+          leaseClassificationEligible &&
           scopeDecision.code !== 'out_of_scope' &&
           scopeDecision.code !== 'invalid_path' &&
           scopeDecision.code !== 'auth_origin_active_probe' &&
@@ -1729,7 +1759,8 @@ export class RequestAdmissionEngine {
     if (!contractApproved && (!classification.isReadOnly || classification.hasMultipart)) {
       const sandboxPostAllowed =
         !classification.hasMultipart &&
-        !classification.hasMethodOverride &&
+        !classification.hasCompressedBody &&
+        !classification.hasOverrideRisk &&
         normalizedMethod === 'POST' &&
         capabilityTier === 2 &&
         (grant.sandboxWriteAllowlist !== undefined
@@ -1902,6 +1933,8 @@ export class RequestAdmissionEngine {
               Boolean(pre.classification?.hasMultipart),
               Boolean(pre.classification?.hasCompressedBody),
               Boolean(pre.classification?.hasMethodOverride),
+              Boolean(pre.classification?.hasOverCapBody),
+              Boolean(pre.classification?.hasOverrideRisk),
             ]
           }),
         ),
