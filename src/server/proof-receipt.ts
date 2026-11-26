@@ -12,10 +12,18 @@
  * produce the same artifact, so promotion, patch retest, and reporting share one confirmation
  * path instead of three.
  */
-import { createHmac } from 'node:crypto'
+import { createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto'
 import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
-import { HostFactLog, parseBodyFromCarrierText, type HostExchangeFact } from './host-fact-log.ts'
+import {
+  HostFactLog,
+  hasVaultScrubbedRequestPlane,
+  hasVaultScrubbedToken,
+  isReservedEvidenceRole,
+  parseBodyFromCarrierText,
+  type HostCredentialPlacement,
+  type HostExchangeFact,
+} from './host-fact-log.ts'
 import {
   assessBooleanDifferential,
   assessImpactEvidence,
@@ -61,6 +69,227 @@ export const proofReceiptSchema = z.object({
 })
 export type ProofReceipt = z.output<typeof proofReceiptSchema>
 
+export type ExpressionConstructFamily = 'ssti' | 'cmdi' | 'sqli' | 'expression'
+
+export interface HostMintedExpressionChallenge {
+  readonly challengeId: string
+  readonly family: ExpressionConstructFamily
+  readonly operandA: number
+  readonly operandB: number
+  readonly operator: '*' | '+'
+  readonly expectedOutput: string
+  readonly expressionSyntax: string
+  readonly mintedAtMs: number
+}
+
+export type TimingConstructFamily = 'sqli' | 'nosqli' | 'cmdi' | 'timing'
+
+export interface HostMintedTimingChallenge {
+  readonly challengeId: string
+  readonly family: TimingConstructFamily
+  readonly delayMs: number
+  readonly controlDelayMs: 0
+  readonly delayToken: string
+  readonly controlToken: string
+  readonly mintedAtMs: number
+}
+
+export interface HostMintedRedirectCanary {
+  readonly canaryId: string
+  readonly host: string
+  readonly mintedAtMs: number
+}
+
+/**
+ * HostMintedOracle — host-owned randomized oracle state (Move A Part 3a: R2-C-6, H-15, R2-H-13).
+ *
+ * Mints per-attempt expression operands, timing delay tokens, and redirect canary hosts on the
+ * host side so workers can never supply their own expected markers, delay tokens, or external
+ * redirect destinations to forge confirmations.
+ */
+export class HostMintedOracle {
+  private readonly expressionChallenges = new Map<string, HostMintedExpressionChallenge>()
+  private readonly recentExpressionOutputs = new Set<string>()
+  private readonly timingChallenges = new Map<string, HostMintedTimingChallenge>()
+  private readonly redirectCanaries = new Map<string, HostMintedRedirectCanary>()
+
+  mintExpressionChallenge(
+    family: ExpressionConstructFamily = 'ssti',
+    operator: '*' | '+' = '*',
+  ): HostMintedExpressionChallenge {
+    let operandA = 0
+    let operandB = 0
+    let expectedOutput = ''
+    for (let attempt = 0; attempt < 32; attempt += 1) {
+      operandA = randomInt(113, 997)
+      operandB = randomInt(113, 997)
+      if (operandA === operandB) operandB = operandA === 996 ? 113 : operandA + 1
+      const computed = operator === '+' ? operandA + operandB : operandA * operandB
+      expectedOutput = String(computed)
+      if (expectedOutput.length >= 5 && !this.recentExpressionOutputs.has(expectedOutput)) {
+        break
+      }
+    }
+    this.recentExpressionOutputs.add(expectedOutput)
+    if (this.recentExpressionOutputs.size > 512) {
+      const oldest = this.recentExpressionOutputs.values().next().value
+      if (oldest !== undefined) this.recentExpressionOutputs.delete(oldest)
+    }
+    const expressionSyntax = `${operandA}${operator}${operandB}`
+    const challenge: HostMintedExpressionChallenge = Object.freeze({
+      challengeId: `expr_${randomUUID()}`,
+      family,
+      operandA,
+      operandB,
+      operator,
+      expectedOutput,
+      expressionSyntax,
+      mintedAtMs: Date.now(),
+    })
+    this.expressionChallenges.set(challenge.challengeId, challenge)
+    if (this.expressionChallenges.size > 512) {
+      const oldest = this.expressionChallenges.keys().next().value
+      if (oldest !== undefined) this.expressionChallenges.delete(oldest)
+    }
+    return challenge
+  }
+
+  getExpressionChallenge(challengeId: string): HostMintedExpressionChallenge | undefined {
+    return this.expressionChallenges.get(challengeId)
+  }
+
+  verifyExpressionChallenge(challenge: HostMintedExpressionChallenge | null | undefined): HostMintedExpressionChallenge | null {
+    if (!challenge || typeof challenge.challengeId !== 'string') return null
+    const stored = this.expressionChallenges.get(challenge.challengeId)
+    if (!stored) return null
+    const expected = stored.operator === '+'
+      ? String(stored.operandA + stored.operandB)
+      : String(stored.operandA * stored.operandB)
+    if (
+      stored.operandA !== challenge.operandA ||
+      stored.operandB !== challenge.operandB ||
+      stored.operator !== challenge.operator ||
+      stored.expectedOutput !== expected ||
+      challenge.expectedOutput !== expected
+    ) {
+      return null
+    }
+    return stored
+  }
+
+  mintTimingChallenge(
+    family: TimingConstructFamily = 'sqli',
+    delayMs = 2_000,
+    tokens?: { delayToken?: string; controlToken?: string },
+  ): HostMintedTimingChallenge {
+    const safeDelayMs = Math.max(1_000, Math.min(Math.round(delayMs), 15_000))
+    const delaySec = Math.max(1, Math.round(safeDelayMs / 1000))
+    const defaultDelayToken = family === 'sqli'
+      ? `SLEEP(${delaySec})`
+      : family === 'cmdi'
+        ? `sleep ${delaySec}`
+        : family === 'nosqli'
+          ? `sleep(${safeDelayMs})`
+          : `delay=${safeDelayMs}`
+    const defaultControlToken = family === 'sqli'
+      ? 'SLEEP(0)'
+      : family === 'cmdi'
+        ? 'sleep 0'
+        : family === 'nosqli'
+          ? 'sleep(0)'
+          : 'delay=0'
+    const challenge: HostMintedTimingChallenge = Object.freeze({
+      challengeId: `time_${randomUUID()}`,
+      family,
+      delayMs: safeDelayMs,
+      controlDelayMs: 0,
+      delayToken: tokens?.delayToken?.trim() || defaultDelayToken,
+      controlToken: tokens?.controlToken?.trim() || defaultControlToken,
+      mintedAtMs: Date.now(),
+    })
+    this.timingChallenges.set(challenge.challengeId, challenge)
+    if (this.timingChallenges.size > 512) {
+      const oldest = this.timingChallenges.keys().next().value
+      if (oldest !== undefined) this.timingChallenges.delete(oldest)
+    }
+    return challenge
+  }
+
+  getTimingChallenge(challengeId: string): HostMintedTimingChallenge | undefined {
+    return this.timingChallenges.get(challengeId)
+  }
+
+  verifyTimingChallenge(challenge: HostMintedTimingChallenge | null | undefined): HostMintedTimingChallenge | null {
+    if (!challenge || typeof challenge.challengeId !== 'string') return null
+    const stored = this.timingChallenges.get(challenge.challengeId)
+    if (!stored) return null
+    if (
+      stored.family !== challenge.family ||
+      stored.delayMs !== challenge.delayMs ||
+      stored.controlDelayMs !== 0 ||
+      challenge.controlDelayMs !== 0 ||
+      stored.delayToken !== challenge.delayToken ||
+      stored.controlToken !== challenge.controlToken
+    ) {
+      return null
+    }
+    return stored
+  }
+
+  mintRedirectCanary(baseDomain = 'canary.kovo.invalid'): HostMintedRedirectCanary {
+    const cleanBase = baseDomain.trim().toLowerCase().replace(/^\.+|\.+$/g, '') || 'canary.kovo.invalid'
+    const nonce = randomBytes(6).toString('hex')
+    const host = `redir-${nonce}.${cleanBase}`
+    const canary: HostMintedRedirectCanary = Object.freeze({
+      canaryId: `redir_${randomUUID()}`,
+      host,
+      mintedAtMs: Date.now(),
+    })
+    this.redirectCanaries.set(host, canary)
+    if (this.redirectCanaries.size > 512) {
+      const oldest = this.redirectCanaries.keys().next().value
+      if (oldest !== undefined) this.redirectCanaries.delete(oldest)
+    }
+    return canary
+  }
+
+  isMintedRedirectHost(host: string | null | undefined): boolean {
+    if (!host) return false
+    return this.redirectCanaries.has(host.trim().toLowerCase())
+  }
+}
+
+export const defaultHostMintedOracle = new HostMintedOracle()
+
+/** R2-H-11: Canonical HMAC signature over host-recorded OOB callback timestamp and identifiers. */
+export function signOobCallback(
+  event: Pick<ReceiptOobEvent, 'id' | 'callbackId' | 'canaryId' | 'token' | 'targetOrigin' | 'delivered' | 'receivedAtMs'>,
+  signingKey: string,
+): string {
+  const canonical = JSON.stringify({
+    id: event.id,
+    callbackId: event.callbackId ?? null,
+    canaryId: event.canaryId ?? null,
+    token: event.token ?? null,
+    targetOrigin: event.targetOrigin ?? null,
+    delivered: event.delivered === true,
+    receivedAtMs: event.receivedAtMs,
+  })
+  return createHmac('sha256', signingKey).update(canonical, 'utf8').digest('hex')
+}
+
+export function verifyOobCallbackSignature(
+  event: ReceiptOobEvent,
+  signingKey: string,
+): boolean {
+  const sig = event.callbackSignature
+  if (!sig || !/^[0-9a-f]{64}$/i.test(sig)) return false
+  const expected = signOobCallback(event, signingKey)
+  const a = Buffer.from(sig.toLowerCase(), 'hex')
+  const b = Buffer.from(expected.toLowerCase(), 'hex')
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
 /** One host-recorded exchange, already mapped onto the shared impact model. */
 export interface ReceiptTranscriptEntry {
   exchangeId: string
@@ -94,6 +323,18 @@ export interface ReceiptTranscriptEntry {
    * without it the rule falls back to inferring the triangle from status and request shape.
    */
   evidenceRole?: string
+  /** C-5: Host-generated concurrent burst batch identifier. */
+  raceBatchId?: string | null
+  /** H-13: Host-only wire credential placement provenance. */
+  credentialPlacement?: HostCredentialPlacement
+  /** R2-C-9: True if the request plane carried a vault-scrubbed `[redacted:cap:...]` token. */
+  requestPlaneVaultScrubbed?: boolean
+  /** R2-C-6: Host-minted evaluated-expression challenge bound to this probe exchange. */
+  hostExpressionChallenge?: HostMintedExpressionChallenge
+  /** H-15: Host-minted timing delay challenge bound to this timing experiment. */
+  hostTimingChallenge?: HostMintedTimingChallenge
+  /** R2-H-13: Host-minted redirect canary host bound to this redirect probe. */
+  hostRedirectCanaryHost?: string | null
 }
 
 /** One durable OOB delivery promoted by the relay (host-observed, not model-supplied). */
@@ -109,6 +350,8 @@ export interface ReceiptOobEvent {
   receivedAtMs: number
   injectedAtMs?: number
   latencyMs?: number
+  hostSignature?: string
+  callbackSignature?: string
 }
 
 export interface ReceiptBrowserTrace {
@@ -122,6 +365,21 @@ export interface ReceiptTranscript {
   entries?: readonly ReceiptTranscriptEntry[]
   oobEvents?: readonly ReceiptOobEvent[]
   browserTraces?: readonly ReceiptBrowserTrace[]
+  /** R2-C-6: Host-minted expression challenges bound to this transcript. */
+  hostExpressionChallenges?: readonly HostMintedExpressionChallenge[]
+  /** H-15: Host-minted timing delay challenge bound to this transcript. */
+  hostTimingChallenge?: HostMintedTimingChallenge
+  /** R2-H-13: Host-minted redirect canary destination host bound to this transcript. */
+  hostRedirectCanaryHost?: string | null
+  /** R2-H-11: Optional host key for verifying signed OOB callback timestamps/ids. */
+  oobSigningKey?: string
+}
+
+export interface VerifyReceiptOptions {
+  /** Optional host signing key for OOB callback signature verification. */
+  signingKey?: string
+  /** Host-minted oracle instance (defaults to `defaultHostMintedOracle`). */
+  hostMintedOracle?: HostMintedOracle
 }
 
 export interface ReceiptVerification {
@@ -328,7 +586,12 @@ function webhookReadbackBound(steps: readonly ImpactStep[], probeIndex: number, 
  * event, a mismatched target, or an impact claim the oracle model cannot substantiate is rejected —
  * there is no "trust me" branch.
  */
-export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript): ReceiptVerification {
+export function verifyReceipt(
+  rawReceipt: unknown,
+  transcript: ReceiptTranscript,
+  options: VerifyReceiptOptions = {},
+): ReceiptVerification {
+  const oracle = options.hostMintedOracle ?? defaultHostMintedOracle
   const parsed = proofReceiptSchema.safeParse(rawReceipt)
   if (!parsed.success) {
     const issue = parsed.error.issues[0]
@@ -363,10 +626,23 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
   if (rule === 'oob') {
     if (receipt.oobEventIds.length === 0) return reject(receipt, rule, 'An out-of-band class needs at least one durable OOB event.')
     const events = receipt.oobEventIds.map(id => oobById.get(id)!)
+    const oobSigningKey = options.signingKey ?? transcript.oobSigningKey
     for (const event of events) {
       if (!event.delivered) return reject(receipt, rule, `OOB event ${event.id} was not delivered.`)
+      if (typeof event.receivedAtMs !== 'number' || !Number.isFinite(event.receivedAtMs) || event.receivedAtMs <= 0) {
+        return reject(receipt, rule, `OOB event ${event.id} is missing a valid host-recorded callback timestamp.`)
+      }
       if (event.targetOrigin && normalizeOrigin(event.targetOrigin) !== normalizeOrigin(receipt.target.origin)) {
         return reject(receipt, rule, `OOB event ${event.id} belongs to a different target origin.`)
+      }
+      if (oobSigningKey) {
+        if (event.callbackSignature) {
+          if (!verifyOobCallbackSignature(event, oobSigningKey)) {
+            return reject(receipt, rule, `OOB event ${event.id} failed host callback timestamp/id signature verification.`)
+          }
+        } else if (!event.hostSignature) {
+          return reject(receipt, rule, `OOB event ${event.id} is missing a host-signed callback signature.`)
+        }
       }
       const injectedAt = receipt.injectedAtMs ?? event.injectedAtMs
       if (injectedAt !== undefined && event.receivedAtMs < injectedAt) {
@@ -375,24 +651,37 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
       if (!event.token) return reject(receipt, rule, `OOB event ${event.id} does not name the canary token that was delivered.`)
     }
     const token = events.find(event => event.token)!.token!
-    // The injection must be visible in the host-recorded request the receipt names; a callback
-    // alone proves the relay was reached, not that this target was the one that reached it.
+    // R2-H-11/H-6: The injection MUST appear strictly in a request-side carrier (NEVER response-only
+    // echo), MUST resolve to a unique carrier exchange, and MUST satisfy startedAt <= receivedAtMs.
     if (receipt.exchangeIds.length === 0) {
       return reject(receipt, rule, 'An OOB receipt must cite the exchange that carried the injected canary.')
     }
-    const carrying = receipt.exchangeIds
-      .map(id => entriesById.get(id)!)
-      .filter(entry => (entry.carrierText ?? entry.step.body ?? '').includes(token) ||
-        stepCarries(entry.step, token))
-    if (carrying.length === 0) {
-      return reject(receipt, rule, 'None of the cited exchanges carried the delivered canary token.')
+    const citedEntries = receipt.exchangeIds.map(id => entriesById.get(id)!)
+    if (citedEntries.some(entry => entryHasVaultScrubbedRequestPlane(entry))) {
+      return reject(receipt, rule, 'OOB receipt cites a vault-scrubbed kernel request plane ([redacted:cap:...]).')
     }
-    if (receipt.target.method && carrying.every(entry => entry.step.method.toUpperCase() !== receipt.target.method)) {
+    const carrying = citedEntries.filter(entry => entryCarriesTokenInRequest(entry, token))
+    if (carrying.length === 0) {
+      return reject(receipt, rule, 'None of the cited exchanges carried the delivered canary token in their request (response-only echoes are never valid carriers).')
+    }
+    if (carrying.length > 1) {
+      return reject(receipt, rule, `OOB receipt cites ${carrying.length} request-side carrying exchanges; a unique carrier exchange is required.`)
+    }
+    const uniqueCarrier = carrying[0]!
+    const carrierStartedAt = uniqueCarrier.startedAt ?? (uniqueCarrier as { timestampMs?: number }).timestampMs
+    if (carrierStartedAt !== undefined) {
+      for (const event of events) {
+        if (carrierStartedAt > event.receivedAtMs) {
+          return reject(receipt, rule, `OOB event ${event.id} (receivedAtMs=${event.receivedAtMs}) arrived before the carrying request started (startedAt=${carrierStartedAt}).`)
+        }
+      }
+    }
+    if (receipt.target.method && uniqueCarrier.step.method.toUpperCase() !== receipt.target.method) {
       return reject(receipt, rule, 'The cited exchange method does not match the receipt target.')
     }
     if (receipt.target.pathAndQuery) {
       const wanted = normalizePath(receipt.target.pathAndQuery)
-      if (carrying.every(entry => routeOf(entry.step) !== wanted)) {
+      if (routeOf(uniqueCarrier.step) !== wanted) {
         return reject(receipt, rule, 'The cited exchange route does not match the receipt target.')
       }
     }
@@ -400,10 +689,15 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
       confirmed: true,
       vulnClass: receipt.vulnClass,
       rule,
-      reason: `A durable out-of-band callback for canary ${events[0]!.canaryId ?? events[0]!.id} was delivered ${events[0]!.stage ? `(${events[0]!.stage}) ` : ''}after the injection exchange carried it to the target.`,
+      reason: `A durable out-of-band callback for canary ${events[0]!.canaryId ?? events[0]!.id} was delivered ${events[0]!.stage ? `(${events[0]!.stage}) ` : ''}after the unique request-side injection exchange (${uniqueCarrier.exchangeId}) carried it to the target.`,
       observed: receipt.claimedDelta,
       expected: 'no out-of-band fetch of the injected canary',
-      evidence: { exchangeIds: receipt.exchangeIds, oobEventIds: receipt.oobEventIds, latencyMs: events[0]!.latencyMs ?? null },
+      evidence: {
+        exchangeIds: receipt.exchangeIds,
+        carrierExchangeId: uniqueCarrier.exchangeId,
+        oobEventIds: receipt.oobEventIds,
+        latencyMs: events[0]!.latencyMs ?? null,
+      },
     }
   }
 
@@ -512,56 +806,164 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
   }
 
   if (rule === 'timing') {
-    if (receipt.exchangeIds.length < 2) return reject(receipt, rule, 'A timing receipt needs a control and a probe exchange.')
     const uniqueIds = new Set(receipt.exchangeIds)
     if (uniqueIds.size !== receipt.exchangeIds.length) {
       return reject(receipt, rule, 'A timing receipt must not cite duplicate exchange IDs across control and probe arms.')
     }
-    const timed = receipt.exchangeIds.map(id => entriesById.get(id)!)
+    const transcriptOrder = new Map(entries.map((entry, idx) => [entry.exchangeId, idx]))
+    const timed = receipt.exchangeIds
+      .map(id => entriesById.get(id)!)
+      .sort((a, b) => {
+        const orderDiff = entryHostOrder(a, transcriptOrder) - entryHostOrder(b, transcriptOrder)
+        if (orderDiff !== 0) return orderDiff
+        return (a.startedAt ?? 0) - (b.startedAt ?? 0)
+      })
     const controls = timed.filter(entry => entry.step.arm === 'control')
     const probes = timed.filter(entry => entry.step.arm === 'probe')
-    if (controls.length === 0 || probes.length === 0) {
-      return reject(receipt, rule, 'A timing receipt needs at least one control arm and one probe arm.')
+    // H-15: Require >= 5 control arms and >= 5 probe arms executed inside the kernel.
+    if (controls.length < 5 || probes.length < 5) {
+      return reject(
+        receipt,
+        rule,
+        `A timing receipt requires >= 5 control arms and >= 5 probe arms (got ${controls.length} control, ${probes.length} probe).`,
+      )
     }
-    // H-15: Every control and probe exchange MUST target the exact same normalized origin,
-    // HTTP method, route path, and persona so a fast route or different persona cannot be paired
-    // against a legitimately slow route/persona to forge a blind_sqli timing confirmation.
-    const normalizedActorOf = (entry: ReceiptTranscriptEntry): string => (entry.step.actor.handle ?? '').trim().toLowerCase()
-    const baseMethod = controls[0]!.step.method.toUpperCase()
-    const baseRoute = routeOf(controls[0]!.step)
-    const basePersona = normalizedActorOf(controls[0]!)
-    const baseOrigin = controls[0]!.origin ? normalizeOrigin(controls[0]!.origin) : null
+    // H-15: Enforce interleaving in host chronological order (reject contiguous control/probe blocks).
+    const orderedArms = timed
+      .filter(entry => entry.step.arm === 'control' || entry.step.arm === 'probe')
+      .map(entry => entry.step.arm)
+    let armSwitches = 0
+    for (let i = 1; i < orderedArms.length; i += 1) {
+      if (orderedArms[i] !== orderedArms[i - 1]) armSwitches += 1
+    }
+    const minSwitches = Math.min(controls.length, probes.length)
+    if (armSwitches < minSwitches) {
+      return reject(
+        receipt,
+        rule,
+        `Timing arms must be interleaved in host transcript order (observed ${armSwitches} arm transitions; need >= ${minSwitches}).`,
+      )
+    }
+
+    // H-15: Require exactly 1 differing parameter across query/body between control and probe.
+    const paramDiff = diffRequestParams(controls[0]!, probes[0]!)
+    if (paramDiff.differingKeys.length !== 1) {
+      return reject(
+        receipt,
+        rule,
+        paramDiff.differingKeys.length === 0
+          ? 'Timing control and probe requests are identical; exactly 1 differing parameter is required.'
+          : `Timing control and probe differ in ${paramDiff.differingKeys.length} parameters (${paramDiff.differingKeys.join(', ')}); exactly 1 differing parameter is required.`,
+      )
+    }
+    const differingParam = paramDiff.differingKeys[0]!
+    if (receipt.target.param && receipt.target.param !== differingParam) {
+      return reject(
+        receipt,
+        rule,
+        `Timing receipt target param (${receipt.target.param}) does not match the sole differing parameter (${differingParam}).`,
+      )
+    }
+
+    // H-15: Strict `timingArmIdentity` tuple across every control and probe arm
+    // (method, origin, exact case-sensitive path, remaining query, remaining body shape,
+    // persona + session, capability set, and HTTP status parity).
     const targetOrigin = normalizeOrigin(receipt.target.origin)
-    const targetRoute = receipt.target.pathAndQuery ? normalizePath(receipt.target.pathAndQuery) : null
+    const targetPathExact = receipt.target.pathAndQuery ? exactPathnameOf(receipt.target.pathAndQuery) : null
+    const baseIdentity = timingArmIdentityOf(controls[0]!, differingParam)
+    if (baseIdentity.status === null) {
+      return reject(receipt, rule, 'Timing arms must record a non-null HTTP status code.')
+    }
+    if (receipt.target.method && baseIdentity.method !== receipt.target.method) {
+      return reject(receipt, rule, `Timing exchange method (${baseIdentity.method}) does not match receipt target (${receipt.target.method}).`)
+    }
+    if (targetPathExact && baseIdentity.path !== targetPathExact) {
+      return reject(receipt, rule, `Timing exchange path (${baseIdentity.path}) does not match receipt target (${targetPathExact}).`)
+    }
+    if (baseIdentity.origin && baseIdentity.origin !== targetOrigin) {
+      return reject(receipt, rule, `Timing exchange origin (${baseIdentity.origin}) does not match receipt target (${targetOrigin}).`)
+    }
+
+    const baseControlVal = paramDiff.controlValues[differingParam] ?? ''
+    const baseProbeVal = paramDiff.probeValues[differingParam] ?? ''
     for (const entry of [...controls, ...probes]) {
-      const method = entry.step.method.toUpperCase()
-      if (method !== baseMethod) {
-        return reject(receipt, rule, `Timing arms must use the exact same HTTP method (${baseMethod} vs ${method}).`)
+      if (entryHasVaultScrubbedRequestPlane(entry)) {
+        return reject(receipt, rule, 'Timing receipt cites a vault-scrubbed kernel request plane ([redacted:cap:...]).')
       }
-      if (receipt.target.method && method !== receipt.target.method) {
-        return reject(receipt, rule, `Timing exchange method (${method}) does not match receipt target (${receipt.target.method}).`)
+      const id = timingArmIdentityOf(entry, differingParam)
+      if (id.method !== baseIdentity.method) {
+        return reject(receipt, rule, `Timing arms must use the exact same HTTP method (${baseIdentity.method} vs ${id.method}).`)
       }
-      const route = routeOf(entry.step)
-      if (route !== baseRoute) {
-        return reject(receipt, rule, `Timing arms must target the exact same route (${baseRoute || '/'} vs ${route || '/'}).`)
+      if (id.origin !== baseIdentity.origin) {
+        return reject(receipt, rule, `Timing arms must target the exact same origin (${baseIdentity.origin || '(missing)'} vs ${id.origin || '(missing)'}).`)
       }
-      if (targetRoute && route && route !== targetRoute) {
-        return reject(receipt, rule, `Timing exchange route (${route}) does not match receipt target (${targetRoute}).`)
+      if (id.origin && id.origin !== targetOrigin) {
+        return reject(receipt, rule, `Timing exchange origin (${id.origin}) does not match receipt target (${targetOrigin}).`)
       }
-      const persona = normalizedActorOf(entry)
-      if (persona !== basePersona) {
-        return reject(receipt, rule, `Timing arms must execute under the exact same persona (${basePersona || 'anonymous'} vs ${persona || 'anonymous'}).`)
+      if (id.path !== baseIdentity.path) {
+        return reject(receipt, rule, `Timing arms must target the exact same case-sensitive path (${baseIdentity.path} vs ${id.path}).`)
       }
-      if (entry.origin) {
-        const entryOrigin = normalizeOrigin(entry.origin)
-        if (baseOrigin && entryOrigin !== baseOrigin) {
-          return reject(receipt, rule, `Timing arms must target the exact same origin (${baseOrigin} vs ${entryOrigin}).`)
-        }
-        if (entryOrigin !== targetOrigin) {
-          return reject(receipt, rule, `Timing exchange origin (${entryOrigin}) does not match receipt target (${targetOrigin}).`)
-        }
+      if (id.queryShape !== baseIdentity.queryShape) {
+        return reject(receipt, rule, 'Timing arms differ in query parameters outside the sole injected parameter.')
+      }
+      if (id.bodyShape !== baseIdentity.bodyShape) {
+        return reject(receipt, rule, 'Timing arms differ in request body shape/fields outside the sole injected parameter.')
+      }
+      if (id.persona !== baseIdentity.persona) {
+        return reject(receipt, rule, `Timing arms must execute under the exact same persona/session (${baseIdentity.persona} vs ${id.persona}).`)
+      }
+      if (id.capabilitySet !== baseIdentity.capabilitySet) {
+        return reject(receipt, rule, `Timing arms must carry the exact same capability set (${baseIdentity.capabilitySet} vs ${id.capabilitySet}).`)
+      }
+      if (id.status !== baseIdentity.status) {
+        return reject(receipt, rule, `Timing arms lack HTTP status parity (${baseIdentity.status} vs ${id.status}).`)
+      }
+      const params = extractRequestParamMap(entry)
+      const val = params[differingParam] ?? ''
+      if (entry.step.arm === 'control' && val !== baseControlVal) {
+        return reject(receipt, rule, 'Control timing arms carried inconsistent values for the tested parameter.')
+      }
+      if (entry.step.arm === 'probe' && val !== baseProbeVal) {
+        return reject(receipt, rule, 'Probe timing arms carried inconsistent values for the tested parameter.')
       }
     }
+
+    // H-15: Require host-minted delay construct vs zero-delay control arm, and derive class from
+    // the host-controlled construct family.
+    const rawChallenge = transcript.hostTimingChallenge
+      ?? probes.find(p => p.hostTimingChallenge)?.hostTimingChallenge
+      ?? controls.find(c => c.hostTimingChallenge)?.hostTimingChallenge
+    const verifiedChallenge = oracle.verifyTimingChallenge(rawChallenge)
+    if (!verifiedChallenge) {
+      return reject(
+        receipt,
+        rule,
+        'Timing receipt requires a host-minted delay vs zero-delay timing challenge registered in HostMintedOracle.',
+      )
+    }
+    if (!baseProbeVal.includes(verifiedChallenge.delayToken)) {
+      return reject(
+        receipt,
+        rule,
+        `Timing probe arm parameter "${differingParam}" does not carry the host-minted delay construct.`,
+      )
+    }
+    if (!baseControlVal.includes(verifiedChallenge.controlToken) || baseControlVal.includes(verifiedChallenge.delayToken)) {
+      return reject(
+        receipt,
+        rule,
+        `Timing control arm parameter "${differingParam}" does not carry the zero-delay control construct.`,
+      )
+    }
+    const derivedVulnClass = derivedTimingVulnClassForFamily(verifiedChallenge.family)
+    if (!timingClassCompatibleWithFamily(receipt.vulnClass, verifiedChallenge.family)) {
+      return reject(
+        receipt,
+        rule,
+        `Timing receipt class "${receipt.vulnClass}" does not match host-controlled construct family "${verifiedChallenge.family}" (derived class "${derivedVulnClass}").`,
+      )
+    }
+
     const controlDurations = controls.map(entry => entry.durationMs ?? entry.step.durationMs ?? 0)
     const probeDurations = probes.map(entry => entry.durationMs ?? entry.step.durationMs ?? 0)
     if (controlDurations.some(d => d <= 0) || probeDurations.some(d => d <= 0)) {
@@ -574,17 +976,30 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
       : (sortedProbes[mid - 1]! + sortedProbes[mid]!) / 2
     const controlMs = Math.max(...controlDurations)
     if (controlMs >= 1_000) return reject(receipt, rule, `The control took ${controlMs} ms, so a delay is not distinguishable from normal latency.`)
-    if (probeMs < Math.max(1_000, controlMs * 3)) {
-      return reject(receipt, rule, `Probe ${probeMs} ms is not a stable separation from the ${controlMs} ms control.`)
+    const minProbeMs = Math.max(1_000, controlMs * 3, Math.floor(verifiedChallenge.delayMs * 0.7))
+    if (probeMs < minProbeMs) {
+      return reject(receipt, rule, `Probe ${probeMs} ms is not a stable separation from the ${controlMs} ms zero-delay control (need >= ${minProbeMs} ms).`)
     }
     return {
       confirmed: true,
-      vulnClass: receipt.vulnClass,
+      vulnClass: derivedVulnClass,
       rule,
-      reason: `The probe arm took ${probeMs} ms (median) against a ${controlMs} ms control (>3x separation) on ${baseMethod} ${baseRoute || targetRoute || '/'}.`,
+      reason: `Host-minted timing differential (${verifiedChallenge.family}) confirmed across ${controls.length}/${probes.length} interleaved arms: probe median ${probeMs} ms vs ${controlMs} ms zero-delay control on ${baseIdentity.method} ${baseIdentity.path} (param "${differingParam}", status ${baseIdentity.status}).`,
       observed: receipt.claimedDelta,
-      expected: 'comparable latency between control and probe',
-      evidence: { controlMs, probeMs, method: baseMethod, route: baseRoute || targetRoute || '/', persona: basePersona || null },
+      expected: 'comparable latency between zero-delay control and host-minted delay probe',
+      evidence: {
+        controlMs,
+        probeMs,
+        method: baseIdentity.method,
+        route: baseIdentity.path,
+        param: differingParam,
+        status: baseIdentity.status,
+        persona: controls[0]!.step.actor.handle ?? null,
+        interleavedTransitions: armSwitches,
+        constructFamily: verifiedChallenge.family,
+        derivedVulnClass,
+        challengeId: verifiedChallenge.challengeId,
+      },
     }
   }
 
@@ -606,32 +1021,119 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
   }
 
   if (rule === 'redirect') {
-    if (receipt.exchangeIds.length === 0) return reject(receipt, rule, 'A redirect receipt needs at least one recorded exchange.')
-    const entries = receipt.exchangeIds.map(id => entriesById.get(id)!)
-    const probe = entries.find(entry => entry.step.arm === 'probe') ?? entries[entries.length - 1]!
+    // R2-H-13: Require same method/route/actor control arm, 3xx status, host-minted canary
+    // destination host carried in the controlled parameter, and host-level comparison rather
+    // than raw full Location string inequality (rejecting SSO/IdP state/nonce redirects).
+    if (receipt.exchangeIds.length < 2) {
+      return reject(receipt, rule, 'A redirect receipt requires both a same-route control arm and a probe arm.')
+    }
+    const cited = receipt.exchangeIds.map(id => entriesById.get(id)!)
+    const probes = cited.filter(entry => entry.step.arm === 'probe')
+    const controls = cited.filter(entry => entry.step.arm === 'control')
+    if (probes.length === 0 || controls.length === 0) {
+      return reject(receipt, rule, 'A redirect receipt requires at least one control arm and one probe arm.')
+    }
+    const probe = probes[probes.length - 1]!
+    if (entryHasVaultScrubbedRequestPlane(probe)) {
+      return reject(receipt, rule, 'Redirect receipt cites a vault-scrubbed kernel request plane ([redacted:cap:...]).')
+    }
+    const probeStatus = probe.step.status
+    if (probeStatus === null || probeStatus < 300 || probeStatus >= 400) {
+      return reject(receipt, rule, `Redirect probe returned status ${probeStatus ?? 'null'}; a 3xx redirect status is required.`)
+    }
+    const probeMethod = probe.step.method.toUpperCase()
+    const probeRoute = routeOf(probe.step)
+    const probeActor = (probe.step.actor.handle ?? '').trim().toLowerCase()
+    const probeOrigin = probe.origin ? normalizeOrigin(probe.origin) : normalizeOrigin(receipt.target.origin)
+    if (receipt.target.method && probeMethod !== receipt.target.method) {
+      return reject(receipt, rule, `Redirect probe method (${probeMethod}) does not match receipt target (${receipt.target.method}).`)
+    }
+    if (receipt.target.pathAndQuery && probeRoute !== normalizePath(receipt.target.pathAndQuery)) {
+      return reject(receipt, rule, `Redirect probe route (${probeRoute}) does not match receipt target (${normalizePath(receipt.target.pathAndQuery)}).`)
+    }
+    const matchingControls = controls.filter(ctrl => {
+      if (ctrl.step.method.toUpperCase() !== probeMethod) return false
+      if (routeOf(ctrl.step) !== probeRoute) return false
+      if ((ctrl.step.actor.handle ?? '').trim().toLowerCase() !== probeActor) return false
+      if (ctrl.origin && normalizeOrigin(ctrl.origin) !== probeOrigin) return false
+      return true
+    })
+    if (matchingControls.length === 0) {
+      return reject(
+        receipt,
+        rule,
+        `Redirect receipt lacks a matching control arm with the exact same method (${probeMethod}), route (${probeRoute}), and actor (${probeActor || 'anonymous'}).`,
+      )
+    }
     const location = locationOf(probe.step)
-    if (!location) return reject(receipt, rule, 'The cited exchange carries no Location header; a 3xx status alone is not an open redirect.')
+    if (!location) return reject(receipt, rule, 'The cited probe exchange carries no Location header; a 3xx status alone is not an open redirect.')
     const targetHost = hostOf(receipt.target.origin)
     const locationHost = hostOf(location, receipt.target.origin)
     if (!locationHost || locationHost === targetHost) {
       return reject(receipt, rule, 'The redirect stays on the target origin (or has no host); a local 3xx is not an open redirect.')
     }
-    const controlLocations = entries
-      .filter(entry => entry !== probe)
-      .map(entry => locationOf(entry.step))
+    // Host comparison (never raw full Location string inequality so SSO/IdP `?state=` redirects do not confirm).
+    const controlHosts = matchingControls
+      .map(ctrl => hostOf(locationOf(ctrl.step), receipt.target.origin))
       .filter((value): value is string => Boolean(value))
-    if (controlLocations.includes(location)) {
-      return reject(receipt, rule, 'The control arm redirects to the same off-origin destination, so the destination is not attacker-controlled.')
+    if (controlHosts.includes(locationHost)) {
+      return reject(
+        receipt,
+        rule,
+        `The matching control arm already redirects to host "${locationHost}"; destination host is not attacker-controlled.`,
+      )
     }
-    const canaryPattern = (receipt.proofPatterns ?? []).find(pattern => safeRegexTest(pattern, location))
+    // Require a host-minted canary destination host carried in the controlled parameter.
+    const mintedHost = (transcript.hostRedirectCanaryHost ?? probe.hostRedirectCanaryHost ?? '').trim().toLowerCase()
+    const isHostMintedCanary = Boolean(
+      (mintedHost && mintedHost === locationHost && oracle.isMintedRedirectHost(mintedHost)) ||
+      oracle.isMintedRedirectHost(locationHost),
+    )
+    if (!isHostMintedCanary) {
+      return reject(
+        receipt,
+        rule,
+        `Redirect destination host "${locationHost}" is not a host-minted redirect canary host.`,
+      )
+    }
+    const matchedControl = matchingControls.find(ctrl => {
+      const diff = diffRequestParams(ctrl, probe)
+      if (diff.differingKeys.length === 0) return false
+      const paramName = receipt.target.param
+      const candidateKeys = paramName
+        ? (diff.differingKeys.includes(paramName) ? [paramName] : [])
+        : diff.differingKeys
+      return candidateKeys.some(key => {
+        const probeVal = (diff.probeValues[key] ?? '').toLowerCase()
+        const ctlVal = (diff.controlValues[key] ?? '').toLowerCase()
+        return probeVal.includes(locationHost) && !ctlVal.includes(locationHost)
+      })
+    })
+    if (!matchedControl) {
+      return reject(
+        receipt,
+        rule,
+        `The host-minted canary host "${locationHost}" was not carried by a controlled parameter differing between control and probe.`,
+      )
+    }
+    const controlledDiff = diffRequestParams(matchedControl, probe)
+    const controlledParam = receipt.target.param
+      ?? controlledDiff.differingKeys.find(k => (controlledDiff.probeValues[k] ?? '').toLowerCase().includes(locationHost))
+      ?? null
     return {
       confirmed: true,
       vulnClass: receipt.vulnClass,
       rule,
-      reason: `The probe response redirects to an off-origin host (${locationHost}) that no control arm reaches${canaryPattern ? ' and the Location matches the proof-declared canary host' : ''}; the 3xx is backed by a destination change, not status alone.`,
+      reason: `Probe returned ${probeStatus} redirecting to host-minted canary host (${locationHost}) supplied via parameter "${controlledParam ?? 'controlled'}" while the matching same-route/actor control did not redirect to that host.`,
       observed: receipt.claimedDelta,
-      expected: 'the marker-bearing request stays local',
-      evidence: { locationHost, canaryPattern: canaryPattern ?? null },
+      expected: 'the host-minted canary destination host is rejected or kept local',
+      evidence: {
+        status: probeStatus,
+        locationHost,
+        controlledParam,
+        controlExchangeId: matchedControl.exchangeId,
+        probeExchangeId: probe.exchangeId,
+      },
     }
   }
 
@@ -696,15 +1198,26 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
 
   // Impact rules: re-run the shared oracle model over the recorded steps.
   if (receipt.exchangeIds.length === 0) return reject(receipt, rule, 'An impact receipt needs at least one recorded exchange.')
-  const steps = receipt.exchangeIds.map(id => entriesById.get(id)!.step)
+  const citedEntries = receipt.exchangeIds.map(id => entriesById.get(id)!)
+  const steps = citedEntries.map(entry => entry.step)
+  // R2-C-9: Kernel request plane must NEVER contain vault-scrubbed `[redacted:cap:...]` tokens
+  // on injection/markup checks (prevents anti-reflection bypass).
+  if ((impactClass === 'injection' || impactClass === 'markup') && citedEntries.some(entry => entryHasVaultScrubbedRequestPlane(entry))) {
+    return reject(
+      receipt,
+      rule,
+      `Kernel request plane contains a vault-scrubbed [redacted:cap:...] token; anti-reflection for ${impactClass} fails closed.`,
+    )
+  }
   const statusOnly = assessStatusOnlyDivergence(steps)
   if (statusOnly.statusOnly) {
     return reject(receipt, rule, `Bare status-only divergence (${statusOnly.controlStatus ?? 'no control'} -> ${statusOnly.probeStatus}): ${statusOnly.reason} A 4xx/5xx probe is only supporting evidence; confirmation needs a fingerprint, structural differential, timing arm, state delta or OOB callback.`)
   }
   // Bind the receipt target to the mutating exchange the claim actually made: a GET used as a
   // readback baseline must never become the finding's route for a write.
-  const mutatingProbe = steps.find(step =>
-    step.arm === 'probe' && stepMutatesState(step) && step.status !== null && step.status >= 200 && step.status < 300)
+  const mutatingProbeEntry = citedEntries.find(entry =>
+    entry.step.arm === 'probe' && stepMutatesState(entry.step) && entry.step.status !== null && entry.step.status >= 200 && entry.step.status < 300)
+  const mutatingProbe = mutatingProbeEntry?.step
   if (mutatingProbe && receipt.target.pathAndQuery) {
     const targetRoute = normalizePath(receipt.target.pathAndQuery)
     const probeRoute = routeOf(mutatingProbe)
@@ -713,6 +1226,14 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     }
     if (receipt.target.method && receipt.target.method.toUpperCase() !== mutatingProbe.method.toUpperCase()) {
       return reject(receipt, rule, `The receipt target method (${receipt.target.method}) is not the mutating probe method (${mutatingProbe.method}); a read used as evidence must not become the write's finding method.`)
+    }
+  }
+  // H-13: Enforce cross-site sendability for CSRF checks (pure cookie placement, SameSite=None
+  // defaulting unknown to Lax, simple Content-Type, no custom auth/CSRF headers or tokens).
+  if (impactClass === 'csrf' && mutatingProbe) {
+    const sendable = isCrossSiteSendableCsrfRequest(mutatingProbe, receipt.target.origin, mutatingProbeEntry)
+    if (!sendable.sendable) {
+      return reject(receipt, rule, `CSRF claim dismissed: ${sendable.reason ?? 'request is not cross-site sendable from a browser'}.`)
     }
   }
   const oracleEvents = (receipt.oracleEvents ?? []).filter(knownOracleEvent)
@@ -732,7 +1253,7 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
   }
   if (!assessment.satisfied) {
     if (impactClass === 'injection') {
-      const evaluated = verifyEvaluatedExpression(receipt, entriesById)
+      const evaluated = verifyEvaluatedExpression(receipt, entriesById, transcript, oracle)
       if (evaluated) return evaluated
     }
     return {
@@ -787,8 +1308,9 @@ const BURST_ROLE_RE = /^(?:burst|race_burst|concurrent)(?:[_-].*)?$/i
 const SERIAL_MUTATION_ROLE_RE = /^serial(?:_(?:control|mutation|probe|step|request|debit))?(?:_\d+)?$/i
 
 const is2xxStatus = (status: number | null): boolean => status !== null && status >= 200 && status < 300
-const is4xxRejection = (status: number | null): boolean =>
-  status !== null && (status === 400 || status === 403 || status === 404 || status === 409 || status === 410 || status === 422)
+/** C-5: Narrow conservation serial_rejection strictly to 409 / 410 / 422 (never 400 / 403 / 404). */
+export const isConservationConflictStatus = (status: number | null): boolean =>
+  status !== null && (status === 409 || status === 410 || status === 422)
 
 function parseStepJson(step: ImpactStep): unknown {
   if (step.json !== undefined) return step.json
@@ -947,12 +1469,52 @@ function verifyConservedBalanceReceipt(
   const lastBurstIdx = burstIndices[burstIndices.length - 1]!
   const burstEntries = burstIndices.map(i => cited[i]!)
 
-  if (receipt.target.method && burstEntries.every(entry => entry.step.method.toUpperCase() !== receipt.target.method)) {
+  // C-5: Every burst exchange MUST be a state-mutating request, executed inside ONE host-stamped
+  // concurrent `raceBatchId` (never ordinary `op: 'http'` requests or cross-batch exchanges), and
+  // targeting the exact same method, route, origin, and actor.
+  const nonMutatingBurst = burstEntries.find(entry => !stepMutatesState(entry.step))
+  if (nonMutatingBurst) {
+    return reject(receipt, rule, `Burst exchange ${nonMutatingBurst.exchangeId} (${nonMutatingBurst.step.method}) is not a state-mutating request; read-only GET bursts cannot prove a race.`)
+  }
+  const batchIds = new Set(burstEntries.map(entry => (entry.raceBatchId ?? '').trim()))
+  if (batchIds.has('') || batchIds.size !== 1) {
+    return reject(
+      receipt,
+      rule,
+      'Conserved-balance burst exchanges must all carry the exact same host-generated raceBatchId.',
+    )
+  }
+  const burstBatchId = [...batchIds][0]!
+  const nonRaceOp = burstEntries.find(entry => entry.op !== undefined && entry.op !== 'race')
+  if (nonRaceOp) {
+    return reject(
+      receipt,
+      rule,
+      `Burst exchange ${nonRaceOp.exchangeId} has op "${nonRaceOp.op}"; conserved_balance bursts must be executed by the host race runner.`,
+    )
+  }
+  const burstMethod = burstEntries[0]!.step.method.toUpperCase()
+  const burstRoute = routeOf(burstEntries[0]!.step)
+  const burstActor = (burstEntries[0]!.step.actor.handle ?? '').trim().toLowerCase()
+  const burstOrigin = burstEntries[0]!.origin ? normalizeOrigin(burstEntries[0]!.origin) : null
+  for (const entry of burstEntries) {
+    if (entry.step.method.toUpperCase() !== burstMethod || routeOf(entry.step) !== burstRoute) {
+      return reject(receipt, rule, 'All concurrent burst exchanges must target the exact same HTTP method and route.')
+    }
+    if ((entry.step.actor.handle ?? '').trim().toLowerCase() !== burstActor) {
+      return reject(receipt, rule, 'All concurrent burst exchanges must execute under the exact same actor.')
+    }
+    if (burstOrigin && entry.origin && normalizeOrigin(entry.origin) !== burstOrigin) {
+      return reject(receipt, rule, 'All concurrent burst exchanges must target the exact same origin.')
+    }
+  }
+
+  if (receipt.target.method && burstMethod !== receipt.target.method) {
     return reject(receipt, rule, 'The cited burst exchange method does not match the receipt target.')
   }
   if (receipt.target.pathAndQuery) {
     const wanted = normalizePath(receipt.target.pathAndQuery)
-    if (burstEntries.every(entry => routeOf(entry.step) !== wanted)) {
+    if (burstRoute !== wanted) {
       return reject(receipt, rule, 'The cited burst exchange route does not match the receipt target.')
     }
   }
@@ -965,28 +1527,33 @@ function verifyConservedBalanceReceipt(
     return reject(receipt, rule, `Only ${ackedBurst.length} concurrent mutation was acknowledged; a conserved_balance proof requires >=2 acknowledged concurrent mutations.`)
   }
 
-  // C-5: Verify genuine temporal concurrency overlap across acknowledged burst exchanges whenever
-  // host timestamps are present. Strictly sequential HTTP requests cannot prove a race condition.
+  // C-5: Host timestamps are mandatory to verify genuine temporal concurrency overlap across
+  // acknowledged burst exchanges (missing timestamps or strictly sequential requests fail closed).
   const ackedWindows = ackedBurst.map(entryWindow).filter((w): w is { start: number; end: number } => w !== null)
-  if (ackedWindows.length >= 2) {
-    let hasOverlap = false
-    for (let i = 0; i < ackedWindows.length && !hasOverlap; i += 1) {
-      for (let j = i + 1; j < ackedWindows.length; j += 1) {
-        const a = ackedWindows[i]!
-        const b = ackedWindows[j]!
-        if (a.start <= b.end && b.start <= a.end) {
-          hasOverlap = true
-          break
-        }
+  if (ackedWindows.length < 2) {
+    return reject(
+      receipt,
+      rule,
+      'Conserved-balance burst exchanges must record host timestamps (startedAt/endedAt) to prove temporal concurrency overlap.',
+    )
+  }
+  let hasOverlap = false
+  for (let i = 0; i < ackedWindows.length && !hasOverlap; i += 1) {
+    for (let j = i + 1; j < ackedWindows.length; j += 1) {
+      const a = ackedWindows[i]!
+      const b = ackedWindows[j]!
+      if (a.start <= b.end && b.start <= a.end) {
+        hasOverlap = true
+        break
       }
     }
-    if (!hasOverlap) {
-      return reject(
-        receipt,
-        rule,
-        'Burst exchanges did not overlap in time in the host transcript; strictly sequential requests cannot prove a race condition.',
-      )
-    }
+  }
+  if (!hasOverlap) {
+    return reject(
+      receipt,
+      rule,
+      'Burst exchanges did not overlap in time in the host transcript; strictly sequential requests cannot prove a race condition.',
+    )
   }
 
   // C-5: Enforce strict host chronological ordering for baseline and post-burst readbacks.
@@ -1033,19 +1600,27 @@ function verifyConservedBalanceReceipt(
   }
   const postEntry = cited[postIdx]!
 
-  // Timestamp sanity check when host timestamps are recorded: baseline cannot start after burst,
-  // and post-burst readback cannot start before burst.
-  if (ackedWindows.length > 0) {
-    const minBurstStart = Math.min(...ackedWindows.map(w => w.start))
-    const maxBurstEnd = Math.max(...ackedWindows.map(w => w.end))
-    const baseWin = entryWindow(baselineEntry)
-    const postWin = entryWindow(postEntry)
-    if (baseWin && baseWin.start > maxBurstEnd) {
-      return reject(receipt, rule, 'Baseline readback timestamp is after the concurrent burst in the host transcript.')
-    }
-    if (postWin && postWin.start < minBurstStart) {
-      return reject(receipt, rule, 'Post-burst readback timestamp precedes the concurrent burst in the host transcript.')
-    }
+  // C-5: Baseline and post-burst readbacks MUST read the exact same resource route and actor.
+  const readRoute = routeOf(baselineEntry.step)
+  const readActor = (baselineEntry.step.actor.handle ?? '').trim().toLowerCase()
+  if (routeOf(postEntry.step) !== readRoute || (postEntry.step.actor.handle ?? '').trim().toLowerCase() !== readActor) {
+    return reject(
+      receipt,
+      rule,
+      'Baseline and post-burst readbacks must read the exact same route and actor (different wallets/resources cannot be compared).',
+    )
+  }
+
+  // Timestamp sanity check: baseline cannot start after burst, and post-burst cannot start before burst.
+  const minBurstStart = Math.min(...ackedWindows.map(w => w.start))
+  const maxBurstEnd = Math.max(...ackedWindows.map(w => w.end))
+  const baseWin = entryWindow(baselineEntry)
+  const postWin = entryWindow(postEntry)
+  if (baseWin && baseWin.start > maxBurstEnd) {
+    return reject(receipt, rule, 'Baseline readback timestamp is after the concurrent burst in the host transcript.')
+  }
+  if (postWin && postWin.start < minBurstStart) {
+    return reject(receipt, rule, 'Post-burst readback timestamp precedes the concurrent burst in the host transcript.')
   }
 
   const conserved = sharedConservedField(baselineEntry.step, postEntry.step, receipt.conservedBalance?.balanceField)
@@ -1058,6 +1633,7 @@ function verifyConservedBalanceReceipt(
   }
 
   const actualBurstDebit = conserved.pre - conserved.post
+  const actualBurstCredit = conserved.post - conserved.pre
   const cap = findCapValue(baselineEntry.step, postEntry.step, conserved.field, receipt.conservedBalance?.capField)
 
   // Locate serial control exchanges (must not be interleaved inside the burst).
@@ -1083,30 +1659,71 @@ function verifyConservedBalanceReceipt(
   if (serialMutations.length === 0) {
     return reject(receipt, rule, 'A conserved_balance receipt requires a serial control exchange proving the conservation boundary holds serially.')
   }
+  // C-5: Every serial control mutation MUST target the exact same method, route, origin, and actor
+  // as the concurrent burst (rejecting unrelated 404/409 requests on other routes).
+  for (const sm of serialMutations) {
+    if (sm.step.method.toUpperCase() !== burstMethod || routeOf(sm.step) !== burstRoute) {
+      return reject(
+        receipt,
+        rule,
+        `Serial control exchange ${sm.exchangeId} (${sm.step.method} ${routeOf(sm.step)}) does not match the burst mutation (${burstMethod} ${burstRoute}).`,
+      )
+    }
+    if ((sm.step.actor.handle ?? '').trim().toLowerCase() !== burstActor) {
+      return reject(receipt, rule, `Serial control exchange ${sm.exchangeId} does not execute under the burst actor.`)
+    }
+    if (burstOrigin && sm.origin && normalizeOrigin(sm.origin) !== burstOrigin) {
+      return reject(receipt, rule, `Serial control exchange ${sm.exchangeId} does not target the burst origin.`)
+    }
+  }
+  if (serialPreEntry && (routeOf(serialPreEntry.step) !== readRoute || (serialPreEntry.step.actor.handle ?? '').trim().toLowerCase() !== readActor)) {
+    return reject(receipt, rule, 'Serial pre-readback must match the baseline readback route and actor.')
+  }
+  if (serialPostEntry && (routeOf(serialPostEntry.step) !== readRoute || (serialPostEntry.step.actor.handle ?? '').trim().toLowerCase() !== readActor)) {
+    return reject(receipt, rule, 'Serial post-readback must match the baseline readback route and actor.')
+  }
+
   const lastSerialIdx = serialIndices[serialIndices.length - 1]!
   if (serialPostIdx >= 0 && serialPostIdx < lastSerialIdx) {
     return reject(receipt, rule, 'Serial post-readback must occur chronologically after the serial control mutation in the host transcript.')
   }
   const serial5xx = serialMutations.filter(entry => entry.step.status !== null && entry.step.status >= 500)
-  const serial2xx = serialMutations.filter(entry => is2xxStatus(entry.step.status))
-  const serial4xx = serialMutations.filter(entry => is4xxRejection(entry.step.status))
+  const serial2xxEntries = serialIndices
+    .filter(idx => is2xxStatus(cited[idx]!.step.status))
+    .map(idx => ({ idx, entry: cited[idx]! }))
+  const serialConflictEntries = serialIndices
+    .filter(idx => isConservationConflictStatus(cited[idx]!.step.status))
+    .map(idx => ({ idx, entry: cited[idx]! }))
+  const serial2xx = serial2xxEntries.map(x => x.entry)
 
-  if (serial2xx.length === 0 && serial4xx.length === 0) {
+  // C-5: Narrow `serial_rejection` strictly to 409 / 410 / 422 chronologically FOLLOWING a serial 2xx.
+  const firstSerial2xxIdx = serial2xxEntries[0]?.idx ?? -1
+  const serialConflictAfter2xx = firstSerial2xxIdx >= 0
+    ? serialConflictEntries.filter(x => x.idx > firstSerial2xxIdx)
+    : []
+
+  if (serial2xx.length === 0) {
     return reject(
       receipt,
       rule,
       serial5xx.length > 0
         ? 'Serial control returned 5xx; cannot prove the conservation boundary holds serially.'
-        : 'Serial control produced neither a verified serial debit nor a 4xx conservation rejection.',
+        : 'Serial control requires a 2xx serial mutation (a bare 4xx/404/409 without a preceding serial 2xx cannot prove the conservation boundary holds serially).',
     )
   }
 
   let serialControlKind: 'serial_debit_exact' | 'serial_rejection' | null = null
   let serialDebitObserved: number | null = null
   const declaredUnitDebit = receipt.conservedBalance?.unitDebit
-  if (serial2xx.length > 0) {
+  if (serialConflictAfter2xx.length > 0 && !serialPostEntry) {
+    serialControlKind = 'serial_rejection'
+  } else {
     if (!serialPostEntry || !is2xxStatus(serialPostEntry.step.status)) {
-      return reject(receipt, rule, 'Serial control mutations succeeded without a 2xx post-serial numeric readback proving exact serial debit.')
+      return reject(
+        receipt,
+        rule,
+        'Serial control mutations succeeded without a 2xx post-serial numeric readback (or subsequent 409/410/422 serial rejection) proving the serial boundary.',
+      )
     }
     const serialPreVal = serialPreEntry && is2xxStatus(serialPreEntry.step.status)
       ? numericFieldFrom(serialPreEntry.step, conserved.field)
@@ -1135,38 +1752,44 @@ function verifyConservedBalanceReceipt(
         `Serial control under-debited (${serialDelta} vs expected ${expectedSerialDebit}); conservation does not hold serially.`,
       )
     }
-    serialControlKind = 'serial_debit_exact'
+    serialControlKind = serialConflictAfter2xx.length > 0 ? 'serial_rejection' : 'serial_debit_exact'
     serialDebitObserved = serialDelta
-  } else {
-    // Pure serial rejection (4xx once depleted/already-redeemed): verify serialPost (if given) did not violate further.
-    if (serialPostEntry && is2xxStatus(serialPostEntry.step.status)) {
-      const afterSerial = numericFieldFrom(serialPostEntry.step, conserved.field)
-      if (afterSerial !== null && Math.abs(afterSerial - conserved.post) > 1e-6) {
-        return reject(receipt, rule, 'Rejected serial control still mutated the conserved field; serial boundary did not hold.')
-      }
-    }
-    serialControlKind = 'serial_rejection'
   }
 
   // C-5: Derive/bound expectedBurstDebit strictly from host-recorded exchanges — NEVER trust an
   // uncorroborated worker-supplied `unitDebit` to fabricate an `under_debit` violation!
   const burstHostDebits = ackedBurst.map(entry => hostRequestDebitOf(entry.step))
   const allBurstHostDebits = burstHostDebits.every((d): d is number => d !== null)
+  const serialHostDebits = serial2xx.map(entry => hostRequestDebitOf(entry.step))
+  const allSerialHostDebits = serialHostDebits.every((d): d is number => d !== null)
+  // C-5: Reject unit mismatch between burst request debits and serial request debits when both are recorded.
+  if (allBurstHostDebits && allSerialHostDebits) {
+    const burstUnitSet = new Set(burstHostDebits)
+    const serialUnitSet = new Set(serialHostDebits)
+    if (burstUnitSet.size === 1 && serialUnitSet.size === 1 && burstHostDebits[0] !== serialHostDebits[0]) {
+      return reject(
+        receipt,
+        rule,
+        `Unit debit mismatch between concurrent burst (${burstHostDebits[0]}) and serial control (${serialHostDebits[0]}).`,
+      )
+    }
+  }
   let expectedBurstDebit: number
+  let hostUnitDelta: number | null = null
   let hasHostDerivedDebit = false
   if (allBurstHostDebits) {
     expectedBurstDebit = burstHostDebits.reduce((sum, d) => sum + d, 0)
+    hostUnitDelta = expectedBurstDebit / ackedBurst.length
     hasHostDerivedDebit = true
-  } else if (serialControlKind === 'serial_debit_exact' && serialDebitObserved !== null && serialDebitObserved > 1e-6) {
+  } else if (serialDebitObserved !== null && serialDebitObserved > 1e-6) {
     const derivedHostUnitDebit = serialDebitObserved / serial2xx.length
-    // Bound any declared unitDebit to never exceed the host-observed serial per-mutation debit.
     const effectiveUnitDebit = declaredUnitDebit !== undefined
       ? Math.min(declaredUnitDebit, derivedHostUnitDebit)
       : derivedHostUnitDebit
     expectedBurstDebit = ackedBurst.length * effectiveUnitDebit
+    hostUnitDelta = effectiveUnitDebit
     hasHostDerivedDebit = true
   } else {
-    // No host request body debit and no 2xx serial debit: worker-supplied unitDebit is untrusted.
     expectedBurstDebit = ackedBurst.length
     hasHostDerivedDebit = false
   }
@@ -1178,16 +1801,26 @@ function verifyConservedBalanceReceipt(
   } else if (cap && conserved.pre <= cap.value && conserved.post > cap.value) {
     violationKind = 'cap_overshoot'
   } else if (conserved.pre >= 0 && conserved.post >= 0 && actualBurstDebit < expectedBurstDebit - 1e-6) {
-    // Require host-derived debit AND concrete movement (under_debit cannot rely on worker unitDebit).
     const provedMutating = actualBurstDebit > 1e-6 || (serialDebitObserved !== null && serialDebitObserved > 1e-6)
-    if (hasHostDerivedDebit && provedMutating) {
+    if (hasHostDerivedDebit && provedMutating && actualBurstCredit <= 1e-6) {
       violationKind = 'under_debit'
-    } else if (serialControlKind === 'serial_rejection' && conserved.post > conserved.pre + 1e-6) {
-      // Single-use credit/coupon race: >=2 concurrent redemptions credited the balance while a
-      // subsequent serial redemption was rejected with 4xx.
+    } else if (
+      serialControlKind === 'serial_rejection' &&
+      hostUnitDelta !== null &&
+      hostUnitDelta > 1e-6 &&
+      actualBurstCredit >= 2 * hostUnitDelta - 1e-6
+    ) {
+      // C-5: Single-use credit/coupon race requires over_credit >= 2 * delta AND a 409/410/422
+      // serial rejection chronologically following a serial 2xx.
       violationKind = 'over_credit'
     }
-  } else if (serialControlKind === 'serial_rejection' && conserved.pre >= 0 && conserved.post > conserved.pre + 1e-6) {
+  } else if (
+    serialControlKind === 'serial_rejection' &&
+    conserved.pre >= 0 &&
+    hostUnitDelta !== null &&
+    hostUnitDelta > 1e-6 &&
+    actualBurstCredit >= 2 * hostUnitDelta - 1e-6
+  ) {
     violationKind = 'over_credit'
   }
 
@@ -1195,7 +1828,7 @@ function verifyConservedBalanceReceipt(
     return reject(
       receipt,
       rule,
-      `Numeric readbacks on "${conserved.field}" (${conserved.pre} -> ${conserved.post} across ${ackedBurst.length} acked burst mutations, expected debit ${expectedBurstDebit}) show no conservation violation (no under-debit, negative balance, or cap overshoot).`,
+      `Numeric readbacks on "${conserved.field}" (${conserved.pre} -> ${conserved.post} across ${ackedBurst.length} acked burst mutations, expected debit ${expectedBurstDebit}) show no conservation violation (no under-debit, negative balance, cap overshoot, or over_credit >= 2*delta).`,
     )
   }
 
@@ -1203,10 +1836,11 @@ function verifyConservedBalanceReceipt(
     confirmed: true,
     vulnClass: receipt.vulnClass,
     rule,
-    reason: `Conserved-balance violation (${violationKind}) on "${conserved.field}": ${ackedBurst.length} concurrent mutations acknowledged (${conserved.pre} -> ${conserved.post}, expected debit ${expectedBurstDebit}, actual debit ${actualBurstDebit}) while serial control (${serialControlKind}) preserved the conservation boundary.`,
+    reason: `Conserved-balance violation (${violationKind}) on "${conserved.field}": ${ackedBurst.length} concurrent mutations in batch "${burstBatchId}" acknowledged (${conserved.pre} -> ${conserved.post}, expected debit ${expectedBurstDebit}, actual debit ${actualBurstDebit}) while serial control (${serialControlKind}) preserved the conservation boundary.`,
     observed: receipt.claimedDelta,
     expected: `concurrent mutations preserve "${conserved.field}" conservation identically to serial execution`,
     evidence: {
+      raceBatchId: burstBatchId,
       balanceField: conserved.field,
       preBalance: conserved.pre,
       postBalance: conserved.post,
@@ -1611,64 +2245,425 @@ function verifyAuthBypassReceipt(
   }
 }
 
+const SIMPLE_CSRF_CONTENT_TYPES = new Set([
+  'application/x-www-form-urlencoded',
+  'multipart/form-data',
+  'text/plain',
+])
+
+const ALLOWED_SIMPLE_CSRF_HEADERS = new Set([
+  'cookie',
+  'origin',
+  'referer',
+  'host',
+  'content-type',
+  'content-length',
+  'accept',
+  'accept-language',
+  'accept-encoding',
+  'user-agent',
+  'connection',
+  'cache-control',
+  'pragma',
+  'upgrade-insecure-requests',
+])
+
+const CSRF_TOKEN_FIELD_RE = /^(?:_?csrf(?:_?token)?|xsrf(?:_?token)?|authenticity_token|__requestverificationtoken|anti_?forgery_?token)$/i
+
 /**
- * Fail-closed evaluated-expression oracle for SSTI / server-side expression evaluation (`CWE-1336`).
+ * H-13: Verify whether a host-recorded mutating request is genuinely cross-site sendable from a
+ * browser for CSRF confirmation: pure cookie credential placement (not mixed with bearer/header),
+ * SameSite=None on the authenticating cookie (defaulting unknown to Lax), simple Content-Type,
+ * no custom auth/CSRF headers, no CSRF anti-forgery token in query/body, and foreign Origin/Referer.
+ */
+export function isCrossSiteSendableCsrfRequest(
+  step: ImpactStep,
+  targetOrigin: string,
+  entry?: ReceiptTranscriptEntry,
+): { sendable: boolean; reason?: string } {
+  if (entry?.credentialPlacement?.mixed) {
+    return { sendable: false, reason: 'mixed credential placement (cookie + bearer/header) is not a pure ambient-cookie CSRF' }
+  }
+  const reqHeaders = step.requestHeaders ?? {}
+  if (headerValue(reqHeaders, 'authorization') || headerValue(reqHeaders, 'x-api-key') || headerValue(reqHeaders, 'x-auth-token')) {
+    return { sendable: false, reason: 'request carries an explicit Authorization/API-key header that a cross-site browser form cannot attach' }
+  }
+  if (step.actor.auth !== 'cookie') {
+    return { sendable: false, reason: `actor authenticates with "${step.actor.auth}" rather than a pure ambient cookie` }
+  }
+  // Bind SameSite strictly: unknown/null defaults to Lax (never None).
+  const effectiveSameSite = (step.actor.sameSite ?? 'Lax').trim().toLowerCase()
+  if (effectiveSameSite === 'strict') {
+    return { sendable: false, reason: 'authenticating cookie is SameSite=Strict' }
+  }
+  if (effectiveSameSite !== 'none' && !/^(?:GET|HEAD)$/i.test(step.method)) {
+    return { sendable: false, reason: `authenticating cookie is SameSite=${step.actor.sameSite ?? 'Lax (default)'}, which blocks cross-site ${step.method}` }
+  }
+  const rawCt = headerValue(reqHeaders, 'content-type')
+  if (rawCt) {
+    const mediaType = rawCt.split(';')[0]!.trim().toLowerCase()
+    if (!SIMPLE_CSRF_CONTENT_TYPES.has(mediaType)) {
+      return { sendable: false, reason: `Content-Type "${mediaType}" requires a CORS preflight and is not cross-site sendable without CORS` }
+    }
+  }
+  for (const [k, v] of Object.entries(reqHeaders)) {
+    const lower = k.trim().toLowerCase()
+    if (!lower || !String(v ?? '').trim()) continue
+    if (lower.startsWith('sec-fetch-') || ALLOWED_SIMPLE_CSRF_HEADERS.has(lower)) continue
+    return { sendable: false, reason: `custom request header "${k}" triggers CORS preflight / acts as a CSRF guard` }
+  }
+  const queryParams = parseQueryMap(step.pathAndQuery)
+  for (const [k, v] of Object.entries(queryParams)) {
+    if (CSRF_TOKEN_FIELD_RE.test(k) && v.trim().length > 0) {
+      return { sendable: false, reason: `request carries anti-CSRF query token "${k}"` }
+    }
+  }
+  const bodyEntries = collectBodyEntries(step.requestJson)
+  for (const [k, v] of Object.entries(bodyEntries)) {
+    const leaf = k.split('.').pop()?.replace(/\[\d+\]$/, '') ?? ''
+    if (CSRF_TOKEN_FIELD_RE.test(leaf) && v.trim().length > 0) {
+      return { sendable: false, reason: `request carries anti-CSRF body token "${leaf}"` }
+    }
+  }
+  const originHdr = headerValue(reqHeaders, 'origin') ?? headerValue(reqHeaders, 'referer')
+  const targetHost = hostOf(targetOrigin)
+  const reqHost = hostOf(originHdr)
+  if (!targetHost || !reqHost || reqHost === targetHost) {
+    return { sendable: false, reason: 'request is same-origin or lacks a foreign Origin/Referer header' }
+  }
+  return { sendable: true }
+}
+
+/** R2-C-9: Detect vault-scrubbed `[redacted:cap:...]` tokens anywhere in a transcript entry's request plane. */
+export function entryHasVaultScrubbedRequestPlane(entry: ReceiptTranscriptEntry): boolean {
+  if (entry.requestPlaneVaultScrubbed === true) return true
+  const reqBody = entry.step.requestJson === undefined
+    ? null
+    : typeof entry.step.requestJson === 'string'
+      ? entry.step.requestJson
+      : JSON.stringify(entry.step.requestJson)
+  return hasVaultScrubbedRequestPlane({
+    pathAndQuery: entry.step.pathAndQuery ?? entry.step.route ?? null,
+    requestHeaders: entry.step.requestHeaders ?? null,
+    rawRequestBody: reqBody,
+    carrierText: entry.carrierText ?? null,
+  })
+}
+
+export function exactPathnameOf(pathAndQuery: string | undefined): string {
+  const raw = (pathAndQuery ?? '/').split('?')[0]!.split('#')[0]!
+  return raw.length > 1 ? raw.replace(/\/+$/, '') : (raw || '/')
+}
+
+/** Extract query parameters and JSON/form request body fields into a flat key -> string value map. */
+export function extractRequestParamMap(entry: ReceiptTranscriptEntry): Record<string, string> {
+  const out: Record<string, string> = {}
+  const q = queryPartOf(entry.step.pathAndQuery)
+  if (q) {
+    for (const [k, v] of new URLSearchParams(q).entries()) {
+      out[k] = v
+    }
+  }
+  const req = entry.step.requestJson
+  if (req !== undefined && req !== null) {
+    if (typeof req === 'string') {
+      const trimmed = req.trim()
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try {
+          const parsed = JSON.parse(trimmed)
+          for (const [k, v] of Object.entries(collectCaseSensitiveBodyEntries(parsed))) {
+            out[`body:${k}`] = v
+          }
+        } catch {
+          out['body:$'] = trimmed
+        }
+      } else if (trimmed.includes('=')) {
+        for (const [k, v] of new URLSearchParams(trimmed).entries()) {
+          out[`body:${k}`] = v
+        }
+      } else if (trimmed.length > 0) {
+        out['body:$'] = trimmed
+      }
+    } else if (typeof req === 'object') {
+      for (const [k, v] of Object.entries(collectCaseSensitiveBodyEntries(req))) {
+        out[`body:${k}`] = v
+      }
+    }
+  }
+  return out
+}
+
+function collectCaseSensitiveBodyEntries(
+  value: unknown,
+  prefix = '',
+  depth = 0,
+  out: Record<string, string> = {},
+): Record<string, string> {
+  if (depth > 4 || value === null || value === undefined) return out
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    out[prefix || '$'] = String(value)
+    return out
+  }
+  if (Array.isArray(value)) {
+    value.slice(0, 16).forEach((item, idx) => collectCaseSensitiveBodyEntries(item, `${prefix}[${idx}]`, depth + 1, out))
+    return out
+  }
+  if (typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      const next = prefix ? `${prefix}.${k}` : k
+      collectCaseSensitiveBodyEntries(v, next, depth + 1, out)
+    }
+  }
+  return out
+}
+
+export function diffRequestParams(
+  control: ReceiptTranscriptEntry,
+  probe: ReceiptTranscriptEntry,
+): {
+  differingKeys: string[]
+  controlValues: Record<string, string>
+  probeValues: Record<string, string>
+} {
+  const controlValues = extractRequestParamMap(control)
+  const probeValues = extractRequestParamMap(probe)
+  const allKeys = [...new Set([...Object.keys(controlValues), ...Object.keys(probeValues)])].sort()
+  const differingKeys = allKeys.filter(k => controlValues[k] !== probeValues[k])
+  return { differingKeys, controlValues, probeValues }
+}
+
+export interface TimingArmIdentity {
+  readonly method: string
+  readonly origin: string
+  readonly path: string
+  readonly queryShape: string
+  readonly bodyShape: string
+  readonly persona: string
+  readonly capabilitySet: string
+  readonly status: number | null
+}
+
+/**
+ * H-15: Strict timing arm identity tuple covering method, origin, case-sensitive path,
+ * remaining query shape, remaining body shape, persona/session, capability set, and HTTP status.
+ */
+export function timingArmIdentityOf(
+  entry: ReceiptTranscriptEntry,
+  differingParam?: string | null,
+): TimingArmIdentity {
+  const params = extractRequestParamMap(entry)
+  const queryPairs: Array<[string, string]> = []
+  const bodyPairs: Array<[string, string]> = []
+  for (const key of Object.keys(params).sort()) {
+    if (differingParam && key === differingParam) continue
+    if (key.startsWith('body:')) bodyPairs.push([key, params[key]!])
+    else queryPairs.push([key, params[key]!])
+  }
+  const caps = [...new Set([
+    ...(entry.consumedCapabilityId ? [entry.consumedCapabilityId] : []),
+    ...(entry.consumedCapabilities ?? []),
+  ])].sort()
+  const actor = entry.step.actor
+  return {
+    method: entry.step.method.toUpperCase(),
+    origin: entry.origin ? normalizeOrigin(entry.origin) : '',
+    path: exactPathnameOf(entry.step.pathAndQuery ?? entry.step.route),
+    queryShape: JSON.stringify(queryPairs),
+    bodyShape: JSON.stringify(bodyPairs),
+    persona: JSON.stringify([
+      (actor.handle ?? '').trim().toLowerCase(),
+      actor.role ?? null,
+      actor.tenant ?? null,
+      actor.auth,
+      entry.sessionId ?? null,
+    ]),
+    capabilitySet: JSON.stringify(caps),
+    status: entry.step.status,
+  }
+}
+
+export function derivedTimingVulnClassForFamily(family: TimingConstructFamily): string {
+  if (family === 'sqli') return 'blind_sqli'
+  if (family === 'nosqli') return 'nosqli'
+  if (family === 'cmdi') return 'command_injection'
+  return 'timing'
+}
+
+function timingClassCompatibleWithFamily(vulnClass: string, family: TimingConstructFamily): boolean {
+  const lower = vulnClass.trim().toLowerCase()
+  if (family === 'timing' || lower === 'timing') return true
+  if (family === 'sqli') return /^(?:blind_sqli|sqli_time|sql_time)$/i.test(lower)
+  if (family === 'nosqli') return /^(?:nosqli|nosql_injection)$/i.test(lower)
+  if (family === 'cmdi') return /^(?:command_injection|cmdi)$/i.test(lower)
+  return false
+}
+
+function derivedExpressionVulnClassForFamily(family: ExpressionConstructFamily): string {
+  if (family === 'ssti') return 'ssti'
+  if (family === 'cmdi') return 'command_injection'
+  if (family === 'sqli') return 'sqli_error'
+  return 'injection'
+}
+
+function expressionClassCompatibleWithFamily(vulnClass: string, family: ExpressionConstructFamily): boolean {
+  const lower = vulnClass.trim().toLowerCase()
+  if (family === 'expression' || lower === 'injection' || lower === 'injection_input' || lower === 'injection-input') return true
+  if (family === 'ssti') return /^(?:ssti|template_injection)$/i.test(lower)
+  if (family === 'cmdi') return /^(?:command_injection|cmdi)$/i.test(lower)
+  if (family === 'sqli') return /^(?:sqli_error|sqli|sql_injection)$/i.test(lower)
+  return false
+}
+
+function escapeRegExpLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function probeCarriesExpressionWithOperands(
+  probeReqText: string,
+  challenge: HostMintedExpressionChallenge,
+): boolean {
+  const a = escapeRegExpLiteral(String(challenge.operandA))
+  const b = escapeRegExpLiteral(String(challenge.operandB))
+  const op = challenge.operator === '+' ? '\\+' : '(?:\\*|\\\\\\*)'
+  // Recognize standard expression / template / shell / SQL arithmetic constructs carrying the
+  // exact host-minted operands (never bare plain values).
+  const exprRe = new RegExp(
+    `(?:\\{\\{[^}]*|\\$\\{[^}]*|<%[=-]?[^%]*|#\\{[^}]*|\\$\\(\\([^)]*|\\bexpr\\s+[^\\n;|&]*|\\bSELECT\\s+[^\\n;]*|\\bpython\\d?\\s+-c\\s+[^\\n;]*|\\bawk\\b[^\\n;]*|\\bprint\\s*\\(?[^\\n;]*|['"\`]?\\s*)${a}\\s*${op}\\s*${b}`,
+    'i',
+  )
+  return exprRe.test(probeReqText)
+}
+
+/**
+ * R2-C-6: Fail-closed host-minted evaluated-expression oracle for SSTI / command / SQL expression
+ * evaluation (`CWE-1336` / `CWE-78` / `CWE-89`).
+ *
  * Requires:
- *  1. Same route family across a 2xx control and 2xx probe with distinct request inputs,
- *  2. An explicit non-trivial expected marker (`proofPatterns`, length >= 4),
- *  3. Strict anti-reflection: the marker appears in the probe response body, is ABSENT from every
- *     control response body, AND is ABSENT from the probe request itself (path, headers, body).
+ *  1. Host-minted randomized expression challenge(s) verified in `HostMintedOracle` (rejects ALL
+ *     worker-chosen `proofPatterns` / markers),
+ *  2. Same normalized origin, HTTP method, route, persona, and request shape apart from the
+ *     injected expression parameter between control and probe,
+ *  3. Probe request text (clean kernel plane, zero `[redacted:cap:...]` tokens) carries the exact
+ *     host-minted operands in a recognized expression syntax,
+ *  4. Strict anti-reflection: host-computed `expectedOutput` appears in the 2xx probe body, is
+ *     ABSENT from every 2xx control body, and is ABSENT from the probe request text,
+ *  5. When multiple probes/attempts are cited, expected outputs MUST vary across attempts and each
+ *     probe must return its own host-computed output (never a static page value).
  */
 function verifyEvaluatedExpression(
   receipt: ProofReceipt,
   entriesById: ReadonlyMap<string, ReceiptTranscriptEntry>,
+  transcript: ReceiptTranscript,
+  oracle: HostMintedOracle,
 ): ReceiptVerification | null {
-  const patterns = (receipt.proofPatterns ?? []).filter(p => p.length >= 4)
-  if (patterns.length === 0) return null
   const cited = receipt.exchangeIds.map(id => entriesById.get(id)!)
   const controls = cited.filter(entry => entry.step.arm === 'control' && is2xxStatus(entry.step.status))
   const probes = cited.filter(entry => entry.step.arm === 'probe' && is2xxStatus(entry.step.status))
   if (controls.length === 0 || probes.length === 0) return null
+  if (cited.some(entry => entryHasVaultScrubbedRequestPlane(entry))) return null
+
+  const transcriptChallenges = (transcript.hostExpressionChallenges ?? [])
+    .map(ch => oracle.verifyExpressionChallenge(ch))
+    .filter((ch): ch is HostMintedExpressionChallenge => ch !== null)
+
   const bodyOf = (step: ImpactStep): string =>
     typeof step.body === 'string' ? step.body : step.json !== undefined ? JSON.stringify(step.json) : ''
   const requestTextOf = (entry: ReceiptTranscriptEntry): string => {
     const parts = [
       entry.step.pathAndQuery ?? '',
-      entry.step.requestJson !== undefined ? JSON.stringify(entry.step.requestJson) : '',
+      entry.step.requestJson !== undefined
+        ? (typeof entry.step.requestJson === 'string' ? entry.step.requestJson : JSON.stringify(entry.step.requestJson))
+        : '',
       entry.step.requestHeaders ? JSON.stringify(entry.step.requestHeaders) : '',
     ]
     const raw = parts.join('\n')
     try { return `${raw}\n${decodeURIComponent(raw)}` } catch { return raw }
   }
   const controlBodies = controls.map(c => bodyOf(c.step)).join('\n')
+  const targetOrigin = normalizeOrigin(receipt.target.origin)
+
+  const verifiedProbes: Array<{
+    probe: ReceiptTranscriptEntry
+    control: ReceiptTranscriptEntry
+    challenge: HostMintedExpressionChallenge
+    param: string
+  }> = []
+
   for (const probe of probes) {
+    const probeOrigin = probe.origin ? normalizeOrigin(probe.origin) : targetOrigin
+    if (probeOrigin !== targetOrigin) continue
+    const probeMethod = probe.step.method.toUpperCase()
     const probeRoute = routeOf(probe.step)
-    const matchingControl = controls.find(control => {
-      if (routeOf(control.step) !== probeRoute) return false
-      const samePath = (control.step.pathAndQuery ?? '') === (probe.step.pathAndQuery ?? '')
-      const sameBody = JSON.stringify(control.step.requestJson ?? null) === JSON.stringify(probe.step.requestJson ?? null)
-      return !(samePath && sameBody)
-    })
-    if (!matchingControl) continue
+    const probePersona = (probe.step.actor.handle ?? '').trim().toLowerCase()
     const probeBody = bodyOf(probe.step)
     const probeReqText = requestTextOf(probe)
-    for (const marker of patterns) {
+
+    const candidateChallenges: HostMintedExpressionChallenge[] = []
+    if (probe.hostExpressionChallenge) {
+      const verified = oracle.verifyExpressionChallenge(probe.hostExpressionChallenge)
+      if (verified) candidateChallenges.push(verified)
+    } else {
+      candidateChallenges.push(...transcriptChallenges)
+    }
+    if (candidateChallenges.length === 0) continue
+
+    const matchingControl = controls.find(control => {
+      const ctlOrigin = control.origin ? normalizeOrigin(control.origin) : targetOrigin
+      if (ctlOrigin !== probeOrigin) return false
+      if (control.step.method.toUpperCase() !== probeMethod) return false
+      if (routeOf(control.step) !== probeRoute) return false
+      if ((control.step.actor.handle ?? '').trim().toLowerCase() !== probePersona) return false
+      const diff = diffRequestParams(control, probe)
+      if (diff.differingKeys.length !== 1) return false
+      const param = diff.differingKeys[0]!
+      const ctlId = timingArmIdentityOf(control, param)
+      const prbId = timingArmIdentityOf(probe, param)
+      return ctlId.queryShape === prbId.queryShape && ctlId.bodyShape === prbId.bodyShape
+    })
+    if (!matchingControl) continue
+    const differingParam = diffRequestParams(matchingControl, probe).differingKeys[0]!
+
+    for (const challenge of candidateChallenges) {
+      if (!expressionClassCompatibleWithFamily(receipt.vulnClass, challenge.family)) continue
+      if (!probeCarriesExpressionWithOperands(probeReqText, challenge)) continue
+      const marker = challenge.expectedOutput
       if (!probeBody.includes(marker)) continue
       if (controlBodies.includes(marker)) continue
-      // Anti-reflection: a marker present verbatim in the request is reflection, not evaluation.
+      // Anti-reflection: expected output must not appear verbatim in the probe request.
       if (probeReqText.includes(marker)) continue
-      return {
-        confirmed: true,
-        vulnClass: receipt.vulnClass,
-        rule: 'impact',
-        reason: `Server-side expression evaluation confirmed: computed marker "${marker}" appeared in the probe response while absent from both the control response and the probe request (non-reflected).`,
-        observed: receipt.claimedDelta,
-        expected: 'user input is rendered literally without server-side expression evaluation',
-        evidence: { evaluatedMarker: marker, route: probeRoute, antiReflectionPassed: true },
-      }
+      verifiedProbes.push({ probe, control: matchingControl, challenge, param: differingParam })
+      break
     }
   }
-  return null
+
+  if (verifiedProbes.length === 0) return null
+  // When multiple probe exchanges are present, require varying host-minted outputs across attempts.
+  if (probes.length >= 2) {
+    if (verifiedProbes.length < 2) return null
+    const distinctOutputs = new Set(verifiedProbes.map(v => v.challenge.expectedOutput))
+    if (distinctOutputs.size < 2) return null
+  }
+
+  const first = verifiedProbes[0]!
+  const derivedClass = derivedExpressionVulnClassForFamily(first.challenge.family)
+  return {
+    confirmed: true,
+    vulnClass: receipt.vulnClass === 'injection' ? derivedClass : receipt.vulnClass,
+    rule: 'impact',
+    reason: `Host-minted server-side expression evaluation confirmed (${first.challenge.family}): computed output "${first.challenge.expectedOutput}" for host operands ${first.challenge.operandA}${first.challenge.operator}${first.challenge.operandB} appeared in probe response while absent from control responses and probe request.`,
+    observed: receipt.claimedDelta,
+    expected: 'user input is rendered literally without server-side expression evaluation',
+    evidence: {
+      evaluatedMarker: first.challenge.expectedOutput,
+      challengeIds: verifiedProbes.map(v => v.challenge.challengeId),
+      distinctOutputs: [...new Set(verifiedProbes.map(v => v.challenge.expectedOutput))],
+      route: routeOf(first.probe.step),
+      param: first.param,
+      family: first.challenge.family,
+      antiReflectionPassed: true,
+      hostMinted: true,
+    },
+  }
 }
 
 /**
@@ -1738,13 +2733,31 @@ function normalizeOrigin(origin: string): string {
   }
 }
 
+/** R2-H-11: Strictly request-side carrier check (NEVER matches response body `step.body`). */
 function stepCarries(step: ImpactStep, token: string): boolean {
   if ((step.pathAndQuery ?? '').includes(token)) return true
-  if ((step.body ?? '').includes(token)) return true
   if (step.requestHeaders) {
     if (Object.values(step.requestHeaders).some(value => value.includes(token))) return true
   }
-  return step.requestJson !== undefined && JSON.stringify(step.requestJson).includes(token)
+  if (step.requestJson !== undefined) {
+    const rawReq = typeof step.requestJson === 'string' ? step.requestJson : JSON.stringify(step.requestJson)
+    if (rawReq.includes(token)) return true
+  }
+  return false
+}
+
+/** R2-H-11: Strictly request-side carrier match for an OOB transcript entry (excluding `op: 'oob'` and response echoes). */
+function entryCarriesTokenInRequest(entry: ReceiptTranscriptEntry, token: string): boolean {
+  if (entry.op === 'oob') return false
+  if (stepCarries(entry.step, token)) return true
+  if (entry.step.requestJson === undefined && entry.carrierText) {
+    const resp = typeof entry.step.body === 'string'
+      ? entry.step.body
+      : entry.step.json !== undefined ? JSON.stringify(entry.step.json) : null
+    const reqBody = parseBodyFromCarrierText(entry.carrierText, entry.step.requestHeaders, resp)
+    if (reqBody && reqBody.includes(token)) return true
+  }
+  return false
 }
 
 /** Typed builder used by the floor/verifier so receipts are always schema-checked before use. */
@@ -1790,6 +2803,16 @@ export interface ScriptProofExchange {
   consumedCapabilities?: readonly string[]
   /** Host-recorded session jar identifier (if any). */
   sessionId?: string | null
+  /** C-5: Host-generated concurrent burst batch identifier. */
+  raceBatchId?: string | null
+  /** H-13: Host-only wire credential placement provenance. */
+  credentialPlacement?: HostCredentialPlacement
+  /** R2-C-6: Host-minted evaluated-expression challenge bound to this exchange. */
+  hostExpressionChallenge?: HostMintedExpressionChallenge
+  /** H-15: Host-minted timing delay challenge bound to this exchange. */
+  hostTimingChallenge?: HostMintedTimingChallenge
+  /** R2-H-13: Host-minted redirect canary host bound to this exchange. */
+  hostRedirectCanaryHost?: string | null
   /** Host-recorded OOB or structured artifact (for `op: 'oob'` mint/wait/check records). */
   artifact?: {
     kind?: string
@@ -1799,7 +2822,10 @@ export interface ScriptProofExchange {
     hit?: boolean
     subscriptionId?: string
     canaryId?: string
+    callbackId?: string
     receivedAtMs?: number
+    hostSignature?: string
+    callbackSignature?: string
   } | null
   body?: string
   requestBody?: string | null
@@ -1907,12 +2933,12 @@ export function buildAgentScriptReceipt(input: {
     if (impactClass === 'csrf' && beforeId && afterId) {
       const probeEntry = transcript.entries?.find(e => e.exchangeId === probeId)
       const probeStep = probeEntry?.step
-      if (probeStep && is2xxStatus(probeStep.status) && stepMutatesState(probeStep) && probeStep.actor.auth === 'cookie') {
-        const ss = (probeStep.actor.sameSite ?? '').toLowerCase()
-        const originHdr = headerValue(probeStep.requestHeaders, 'origin') ?? headerValue(probeStep.requestHeaders, 'referer')
-        const targetHost = hostOf(probe.origin || input.origin)
-        const reqHost = hostOf(originHdr)
-        if (ss !== 'strict' && ss !== 'lax' && targetHost && reqHost && reqHost !== targetHost) {
+      if (probeStep && is2xxStatus(probeStep.status) && stepMutatesState(probeStep)) {
+        // H-13: Only emit host-observed csrf_state_change when the request is genuinely
+        // cross-site sendable (pure cookie placement, SameSite=None, simple Content-Type,
+        // no custom auth/CSRF headers or tokens, foreign Origin/Referer).
+        const sendable = isCrossSiteSendableCsrfRequest(probeStep, probe.origin || input.origin, probeEntry)
+        if (sendable.sendable) {
           hostOracleEvents.push('csrf_state_change')
         }
       }
@@ -2010,49 +3036,27 @@ export function buildAgentScriptReceipt(input: {
     }
   }
 
-  // Paired non-reflected evaluated-expression claims (`body_contains` absent on control + present
-  // on probe for the same >=4-char marker, emitted by `ctx.prove_injection_differential`).
-  // Checked BEFORE `structural_diff` because `prove_injection_differential` also emits a 2-round
-  // `structural_diff` claim for the Layer-3 injection semantic oracle.
-  const bodyClaims = input.claims.filter(claim =>
-    recordField(claim, 'kind') === 'body_contains' &&
-    typeof recordField(claim, 'exchangeId') === 'string' &&
-    typeof recordField(claim, 'text') === 'string' &&
-    (recordField(claim, 'text') as string).length >= 4)
-  for (const present of bodyClaims) {
-    if (recordField(present, 'absent') === true) continue
-    const marker = recordField(present, 'text') as string
-    const probeId = recordField(present, 'exchangeId') as string
-    const probe = factLog.getExchange(probeId)
+  // R2-C-6: Plain `body_contains` pairs with worker-chosen markers are downgraded to unconfirmed
+  // leads and NEVER build a confirming ProofReceipt. Only host-minted expression challenges
+  // registered in `defaultHostMintedOracle` can produce an evaluated-expression receipt.
+  for (const claim of input.claims) {
+    if (recordField(claim, 'kind') !== 'host_evaluated_expression') continue
+    const controlIds = cited(stringArray(recordField(claim, 'controlIds')))
+    const probeIds = cited(stringArray(recordField(claim, 'probeIds')))
+    const challengeIds = stringArray(recordField(claim, 'hostMintedChallengeIds'))
+    if (controlIds.length === 0 || probeIds.length === 0 || challengeIds.length === 0) continue
+    const verifiedChallenges = challengeIds
+      .map(id => defaultHostMintedOracle.getExpressionChallenge(id))
+      .filter((ch): ch is HostMintedExpressionChallenge => Boolean(ch))
+    if (verifiedChallenges.length === 0) continue
+    const probe = factLog.getExchange(probeIds[0]!)
     if (!probe) continue
-    const absent = bodyClaims.find(c =>
-      recordField(c, 'absent') === true &&
-      recordField(c, 'text') === marker &&
-      typeof recordField(c, 'exchangeId') === 'string' &&
-      recordField(c, 'exchangeId') !== probeId &&
-      hasExchange(recordField(c, 'exchangeId') as string))
-    if (!absent) continue
-    const controlId = recordField(absent, 'exchangeId') as string
-    const exchangeIds = sortByHostOrder([controlId, probeId])
-    const armOverrides = new Map<string, ImpactStep['arm']>([
-      [controlId, 'control'],
-      [probeId, 'probe'],
-    ])
-    // Request bodies come strictly from immutable HostFactLog — never from worker claim scalars.
-    const transcript = buildTranscript(armOverrides)
-    const rawExplicit = typeof recordField(present, 'vulnClass') === 'string'
-      ? (recordField(present, 'vulnClass') as string).trim().toLowerCase()
-      : ''
-    const msg = `${input.title} ${String(recordField(present, 'message') ?? '')}`.toLowerCase()
-    const vulnClass = rawExplicit && IMPACT_CLASS_BY_VULN[rawExplicit] === 'injection'
-      ? rawExplicit
-      : /^(?:sqli|sql_injection)$/i.test(rawExplicit)
-        ? 'sqli_error'
-        : /command|cmdi|os.command|rce/.test(msg)
-          ? 'command_injection'
-          : /ssti|template/.test(msg)
-            ? 'ssti'
-            : 'injection'
+    const exchangeIds = sortByHostOrder([...controlIds, ...probeIds])
+    const armOverrides = new Map<string, ImpactStep['arm']>()
+    for (const id of controlIds) armOverrides.set(id, 'control')
+    for (const id of probeIds) armOverrides.set(id, 'probe')
+    const baseTranscript = buildTranscript(armOverrides)
+    const vulnClass = derivedExpressionVulnClassForFamily(verifiedChallenges[0]!.family)
     return {
       receipt: buildProofReceipt({
         vulnClass,
@@ -2064,10 +3068,12 @@ export function buildAgentScriptReceipt(input: {
         exchangeIds,
         oobEventIds: [],
         browserTraceIds: [],
-        claimedDelta: `${input.title} — evaluated marker "${marker}" observed only in probe response.`.slice(0, 1200),
-        proofPatterns: [marker],
+        claimedDelta: `${input.title} — host-minted expression evaluation verified across ${verifiedChallenges.length} challenge(s).`.slice(0, 1200),
       }),
-      transcript,
+      transcript: {
+        ...baseTranscript,
+        hostExpressionChallenges: verifiedChallenges,
+      },
       factLog,
       armOverrides,
     }
@@ -2117,42 +3123,61 @@ export function buildAgentScriptReceipt(input: {
       const probe = factLog.getExchange(variants[0]!)
       const baseline = factLog.getExchange(controls[0]!)
       if (!probe || !baseline) continue
-      // H-15: Every control and variant exchange MUST target the exact same normalized origin,
-      // HTTP method, route path, and persona.
-      const baseOrigin = normalizeOrigin(baseline.origin || input.origin)
-      const baseMethod = baseline.method.toUpperCase()
-      const baseRoute = normalizePath(baseline.pathAndQuery)
-      const basePersona = (baseline.actor ?? '').trim().toLowerCase()
-      const allConsistent = [...controls, ...variants].every(id => {
-        const ex = factLog.getExchange(id)!
-        return normalizeOrigin(ex.origin || input.origin) === baseOrigin
-          && ex.method.toUpperCase() === baseMethod
-          && normalizePath(ex.pathAndQuery) === baseRoute
-          && (ex.actor ?? '').trim().toLowerCase() === basePersona
-      })
-      if (!allConsistent) continue
+      // H-15: Require host-minted timing challenge and strict timingArmIdentity consistency.
+      const challengeId = typeof recordField(claim, 'hostMintedTimingChallengeId') === 'string'
+        ? (recordField(claim, 'hostMintedTimingChallengeId') as string).trim()
+        : ''
+      const rawChallenge = (challengeId ? defaultHostMintedOracle.getTimingChallenge(challengeId) : undefined)
+        ?? probe.hostTimingChallenge
+        ?? baseline.hostTimingChallenge
+      const verifiedChallenge = defaultHostMintedOracle.verifyTimingChallenge(rawChallenge)
+      if (!verifiedChallenge) continue
+
       const armOverrides = new Map<string, ImpactStep['arm']>()
       for (const id of controls) armOverrides.set(id, 'control')
       for (const id of variants) armOverrides.set(id, 'probe')
-      const transcript = buildTranscript(armOverrides)
-      const controlEntry = transcript.entries!.find(entry => entry.exchangeId === controls[0])
-      const probeEntry = transcript.entries!.find(entry => entry.exchangeId === variants[0])
-      const param = controlEntry && probeEntry ? deriveDifferingParam(controlEntry, probeEntry) : null
+      const baseTranscript = buildTranscript(armOverrides)
+      const byId = new Map((baseTranscript.entries ?? []).map(entry => [entry.exchangeId, entry]))
+      const controlEntry = byId.get(controls[0]!)
+      const probeEntry = byId.get(variants[0]!)
+      if (!controlEntry || !probeEntry) continue
+      const paramDiff = diffRequestParams(controlEntry, probeEntry)
+      if (paramDiff.differingKeys.length !== 1) continue
+      const param = paramDiff.differingKeys[0]!
+      const baseId = timingArmIdentityOf(controlEntry, param)
+      const allConsistent = [...controls, ...variants].every(id => {
+        const entry = byId.get(id)
+        if (!entry) return false
+        const cur = timingArmIdentityOf(entry, param)
+        return cur.method === baseId.method
+          && cur.origin === baseId.origin
+          && cur.path === baseId.path
+          && cur.queryShape === baseId.queryShape
+          && cur.bodyShape === baseId.bodyShape
+          && cur.persona === baseId.persona
+          && cur.capabilitySet === baseId.capabilitySet
+          && cur.status === baseId.status
+      })
+      if (!allConsistent) continue
+      const derivedClass = derivedTimingVulnClassForFamily(verifiedChallenge.family)
       return {
         receipt: buildProofReceipt({
-          vulnClass: 'blind_sqli',
+          vulnClass: derivedClass,
           target: {
             origin: probe.origin || input.origin,
             method: probe.method.toUpperCase(),
             pathAndQuery: probe.pathAndQuery,
-            ...(param ? { param } : {}),
+            param,
           },
           exchangeIds: sortByHostOrder([...controls, ...variants]),
           oobEventIds: [],
           browserTraceIds: [],
-          claimedDelta: `${input.title} — timing separation over ${controls.length}/${variants.length} recorded arms.`.slice(0, 1200),
+          claimedDelta: `${input.title} — host-minted ${verifiedChallenge.family} timing separation over ${controls.length}/${variants.length} interleaved arms.`.slice(0, 1200),
         }),
-        transcript,
+        transcript: {
+          ...baseTranscript,
+          hostTimingChallenge: verifiedChallenge,
+        },
         factLog,
         armOverrides,
       }
@@ -2283,6 +3308,11 @@ export function buildAgentScriptReceipt(input: {
           (!mintToken || ex.artifact!.token!.toLowerCase() === mintToken.toLowerCase()),
         )
       if (waitRecord?.artifact?.hit === true && waitRecord.artifact.token) {
+        // R2-H-11: Require the host-recorded relay callback timestamp (`artifact.receivedAtMs`);
+        // NEVER synthesize it from the WAIT exchange end time or `Date.now()`.
+        if (typeof waitRecord.artifact.receivedAtMs !== 'number' || !Number.isFinite(waitRecord.artifact.receivedAtMs) || waitRecord.artifact.receivedAtMs <= 0) {
+          continue
+        }
         derivedWaitId = waitRecord.exchangeId
         const subMatch = /^\/oob\/pending\/([^/?#]+)/.exec(waitRecord.pathAndQuery ?? '')
         const derivedId = explicitOobEventId
@@ -2291,35 +3321,39 @@ export function buildAgentScriptReceipt(input: {
           ?? waitRecord.exchangeId
         oobEvent = {
           id: derivedId,
+          ...(waitRecord.artifact.callbackId ? { callbackId: waitRecord.artifact.callbackId } : {}),
           ...(waitRecord.artifact.canaryId ? { canaryId: waitRecord.artifact.canaryId } : {}),
           token: waitRecord.artifact.token,
           targetOrigin: input.origin,
           delivered: true,
           stage: 'immediate',
-          receivedAtMs: waitRecord.artifact.receivedAtMs ?? waitRecord.endedAt ?? waitRecord.startedAt ?? Date.now(),
+          receivedAtMs: waitRecord.artifact.receivedAtMs,
+          ...(waitRecord.artifact.hostSignature ? { hostSignature: waitRecord.artifact.hostSignature } : {}),
+          ...(waitRecord.artifact.callbackSignature ? { callbackSignature: waitRecord.artifact.callbackSignature } : {}),
         }
       }
     }
     if (!oobEvent || !oobEvent.delivered || !oobEvent.token) continue
 
     const token = oobEvent.token
+    // R2-H-11: Strictly request-side carrier match (NEVER match `rawResponseBody`!).
     const carriesToken = (ex: HostExchangeFact): boolean => {
       if (ex.op === 'oob') return false
       if ((ex.pathAndQuery ?? '').includes(token)) return true
       if ((ex.rawRequestBody ?? '').includes(token)) return true
-      if ((ex.rawResponseBody ?? '').includes(token)) return true
       if (Object.values(ex.requestHeaders).some(v => String(v).includes(token))) return true
       return false
     }
+    const allCarriers = allFacts.filter(carriesToken)
     const explicitCarrier = explicitInjectId ? factLog.getExchange(explicitInjectId) : undefined
-    const carryingExchanges = explicitCarrier && carriesToken(explicitCarrier)
-      ? [explicitCarrier]
-      : allFacts.filter(carriesToken)
-    const primaryCarrier = carryingExchanges[0] ?? explicitCarrier ?? null
+    // Never let worker-chosen `explicitInjectId` pick a non-carrying (echo-only) exchange!
+    const carryingExchanges = explicitCarrier
+      ? (carriesToken(explicitCarrier) ? [explicitCarrier] : [])
+      : allCarriers
+    const primaryCarrier = carryingExchanges.length === 1 ? carryingExchanges[0]! : null
     const exchangeIds = sortByHostOrder([
       ...(mintId ? [mintId] : []),
       ...carryingExchanges.map(ex => ex.exchangeId),
-      ...(explicitCarrier ? [explicitCarrier.exchangeId] : []),
       ...(derivedWaitId ? [derivedWaitId] : []),
     ])
     if (exchangeIds.length === 0) continue

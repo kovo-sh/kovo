@@ -139,7 +139,7 @@ export type V8FamilyHandler = (
   opts?: { econCtx?: EconomicAutoHydrateContext; fallbackSig?: string; verifySignature?: SignatureVerifier },
 ) => V8OracleDecision
 
-function sanitizeSingleHopReceiptForHostCustody(
+export function sanitizeSingleHopReceiptForHostCustody(
   receipt: ProofReceipt,
   factLog: HostFactLog,
   policy: TerminalOraclePolicyContext,
@@ -153,15 +153,9 @@ function sanitizeSingleHopReceiptForHostCustody(
     ? [...orderedIds, ...missingIds]
     : orderedIds
 
-  if (policy.strictHostDerivation === false) {
-    return {
-      ...receipt,
-      exchangeIds: hostOrderedExchangeIds,
-    }
-  }
-
-  // Strict host custody: neutralize untrusted worker-supplied scalar hints so mutating them
-  // cannot flip an oracle verdict; preserve only host-trusted oracleEvents if explicitly passed.
+  // Strict host custody (H-13 / R2-H-6): unconditionally neutralize untrusted worker-supplied
+  // scalar hints so mutating them (or passing strictHostDerivation:false) can never flip an
+  // oracle verdict; preserve only host-trusted oracleEvents if explicitly passed by host code.
   const { requiredRole: _dropRole, resourceTenant: _dropTenant, oracleEvents: _dropEvents, conservedBalance, ...rest } = receipt
   const cleanConserved = conservedBalance
     ? {
@@ -175,6 +169,106 @@ function sanitizeSingleHopReceiptForHostCustody(
     exchangeIds: hostOrderedExchangeIds,
     ...(trustedEvents ? { oracleEvents: trustedEvents } : {}),
     ...(cleanConserved && Object.keys(cleanConserved).length > 0 ? { conservedBalance: cleanConserved } : {}),
+  }
+}
+
+function sanitizeEmbeddedReceiptField(
+  rawEmbedded: unknown,
+  factLog: HostFactLog,
+  policy: TerminalOraclePolicyContext,
+): { sanitized: unknown; parsed?: ProofReceipt } {
+  if (!rawEmbedded || typeof rawEmbedded !== 'object') return { sanitized: rawEmbedded }
+  const parsed = proofReceiptSchema.safeParse(rawEmbedded)
+  if (!parsed.success) return { sanitized: rawEmbedded }
+  const clean = sanitizeSingleHopReceiptForHostCustody(parsed.data, factLog, {
+    ...policy,
+    strictHostDerivation: true,
+    // Never pass untrusted worker oracleEvents into embedded composite receipts.
+    trustedOracleEvents: undefined,
+  })
+  return { sanitized: clean, parsed: clean }
+}
+
+function sanitizeAndBindCompositeReceipt(
+  rawReceipt: unknown,
+  factLog: HostFactLog,
+  policy: TerminalOraclePolicyContext,
+): { receipt: unknown; bindingError?: string } {
+  if (!rawReceipt || typeof rawReceipt !== 'object' || Array.isArray(rawReceipt)) {
+    return { receipt: rawReceipt }
+  }
+  const rec = rawReceipt as Record<string, unknown>
+  const rawHops = Array.isArray(rec.hops) ? rec.hops : null
+  const sanitizedHops = rawHops
+    ? rawHops.map(rawHop => {
+        if (!rawHop || typeof rawHop !== 'object' || Array.isArray(rawHop)) return rawHop
+        const hopObj = rawHop as Record<string, unknown>
+        if (!hopObj.proofReceipt) return rawHop
+        const { sanitized } = sanitizeEmbeddedReceiptField(hopObj.proofReceipt, factLog, policy)
+        return { ...hopObj, proofReceipt: sanitized }
+      })
+    : undefined
+
+  let sanitizedTerminalImpact = rec.terminalImpact
+  let bindingError: string | undefined
+  if (rec.terminalImpact && typeof rec.terminalImpact === 'object' && !Array.isArray(rec.terminalImpact)) {
+    const ti = rec.terminalImpact as Record<string, unknown>
+    if (ti.proofReceipt) {
+      const { sanitized, parsed } = sanitizeEmbeddedReceiptField(ti.proofReceipt, factLog, policy)
+      sanitizedTerminalImpact = { ...ti, proofReceipt: sanitized }
+      if (parsed) {
+        // R2-H-6: Bind embedded terminal proofReceipt class to terminalVulnClass and bind its
+        // exchange/OOB/trace citations to the terminal hop (+ pre/post terminal controls).
+        const terminalClass = typeof rec.terminalVulnClass === 'string' ? rec.terminalVulnClass.trim().toLowerCase() : ''
+        const embeddedClass = parsed.vulnClass.trim().toLowerCase()
+        if (terminalClass && embeddedClass && terminalClass !== embeddedClass) {
+          const termRule = receiptRuleFor(terminalClass, parsed)
+          const embRule = receiptRuleFor(embeddedClass, parsed)
+          const sameImpactClass = Boolean(termRule.impactClass && embRule.impactClass && termRule.impactClass === embRule.impactClass)
+          const sameRule = termRule.rule !== 'none' && termRule.rule === embRule.rule && termRule.rule !== 'impact'
+          if (!sameImpactClass && !sameRule) {
+            bindingError = `Embedded terminal proofReceipt vulnClass "${parsed.vulnClass}" does not match composite terminalVulnClass "${String(rec.terminalVulnClass)}".`
+          }
+        }
+        if (!bindingError && sanitizedHops && typeof ti.terminalHopId === 'string') {
+          const termHop = sanitizedHops.find(
+            h => h && typeof h === 'object' && (h as Record<string, unknown>).hopId === ti.terminalHopId,
+          ) as Record<string, unknown> | undefined
+          if (termHop) {
+            const allowedEx = new Set<string>([
+              ...(Array.isArray(termHop.exchangeIds) ? termHop.exchangeIds.filter((x): x is string => typeof x === 'string') : []),
+              ...(Array.isArray(ti.preChainControlExchangeIds) ? ti.preChainControlExchangeIds.filter((x): x is string => typeof x === 'string') : []),
+              ...(Array.isArray(ti.postChainReadbackExchangeIds) ? ti.postChainReadbackExchangeIds.filter((x): x is string => typeof x === 'string') : []),
+            ])
+            const allowedOob = new Set<string>(
+              Array.isArray(termHop.oobEventIds) ? termHop.oobEventIds.filter((x): x is string => typeof x === 'string') : [],
+            )
+            const allowedTrace = new Set<string>(
+              Array.isArray(termHop.browserTraceIds) ? termHop.browserTraceIds.filter((x): x is string => typeof x === 'string') : [],
+            )
+            const unboundEx = parsed.exchangeIds.find(id => !allowedEx.has(id))
+            const unboundOob = parsed.oobEventIds.find(id => !allowedOob.has(id))
+            const unboundTrace = parsed.browserTraceIds.find(id => !allowedTrace.has(id))
+            if (unboundEx) {
+              bindingError = `Embedded terminal proofReceipt cites exchange "${unboundEx}" outside terminal hop "${ti.terminalHopId}".`
+            } else if (unboundOob) {
+              bindingError = `Embedded terminal proofReceipt cites OOB event "${unboundOob}" outside terminal hop "${ti.terminalHopId}".`
+            } else if (unboundTrace) {
+              bindingError = `Embedded terminal proofReceipt cites browser trace "${unboundTrace}" outside terminal hop "${ti.terminalHopId}".`
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    receipt: {
+      ...rec,
+      ...(sanitizedHops ? { hops: sanitizedHops } : {}),
+      ...(sanitizedTerminalImpact !== undefined ? { terminalImpact: sanitizedTerminalImpact } : {}),
+    },
+    ...(bindingError ? { bindingError } : {}),
   }
 }
 
@@ -226,8 +320,13 @@ function defaultSingleHopHandler(
       expected: 'host-custody verified transcript records',
     }
   }
-  const canonicalReceipt = sanitizeSingleHopReceiptForHostCustody(receipt, factLog, policy)
-  return verifyReceipt(canonicalReceipt, transcript)
+  const canonicalReceipt = sanitizeSingleHopReceiptForHostCustody(receipt, factLog, {
+    ...policy,
+    strictHostDerivation: true,
+  })
+  return verifyReceipt(canonicalReceipt, transcript, {
+    ...(policy.signingKey ? { signingKey: policy.signingKey } : {}),
+  })
 }
 
 function defaultV8FamilyHandler(
@@ -339,7 +438,19 @@ export class TerminalOracleRegistry {
 
     if (pointerRef.kind === 'composite') {
       const hostTranscript = factLog.toHostSignedTranscript()
-      const composite = verifyCompositeReceipt(pointerRef.receipt, hostTranscript, {
+      const sanitized = sanitizeAndBindCompositeReceipt(pointerRef.receipt, factLog, {
+        ...policyContext,
+        strictHostDerivation: true,
+      })
+      if (sanitized.bindingError) {
+        return {
+          confirmed: false,
+          kind: 'composite',
+          familyOrRule: String((pointerRef.receipt as { terminalVulnClass?: unknown } | null)?.terminalVulnClass ?? 'composite'),
+          reason: sanitized.bindingError,
+        }
+      }
+      const composite = verifyCompositeReceipt(sanitized.receipt, hostTranscript, {
         ...(policyContext.compositeOptions ?? {}),
         ...(policyContext.signingKey ? { signingKey: policyContext.signingKey } : {}),
         ...(policyContext.attackerPersonas ? { attackerPersonas: policyContext.attackerPersonas } : {}),

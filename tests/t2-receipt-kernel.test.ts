@@ -31,6 +31,7 @@ import {
 import {
   buildAgentScriptReceipt,
   buildProofReceipt,
+  defaultHostMintedOracle,
   verifyReceipt,
   type ImpactStep,
   type ReceiptOobEvent,
@@ -69,11 +70,11 @@ function mkStep(overrides: Partial<ImpactStep> & { id: string; arm: ImpactStep['
 // ============================================================================
 
 test('C-5: conserved_balance confirms genuine overlapping burst with host requestBody & serial debit, and rejects swapped order / non-overlapping burst / forged requestBody / inflated unitDebit / role reuse', () => {
-  // Positive: overlapping burst windows, chronological host seq, host requestBody
+  // Positive: overlapping burst windows, chronological host seq, host-stamped raceBatchId & requestBody
   const validExchanges: ScriptProofExchange[] = [
     { exchangeId: 'pre', seq: 1, startedAt: 1000, endedAt: 1015, method: 'GET', pathAndQuery: '/api/v1/wallet', origin: ORIGIN, status: 200, body: '{"balance":100}' },
-    { exchangeId: 'b1', seq: 2, startedAt: 1050, endedAt: 1120, durationMs: 70, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
-    { exchangeId: 'b2', seq: 3, startedAt: 1052, endedAt: 1125, durationMs: 73, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
+    { exchangeId: 'b1', seq: 2, op: 'race', raceBatchId: 'batch-c5-1', startedAt: 1050, endedAt: 1120, durationMs: 70, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
+    { exchangeId: 'b2', seq: 3, op: 'race', raceBatchId: 'batch-c5-1', startedAt: 1052, endedAt: 1125, durationMs: 73, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
     { exchangeId: 'post', seq: 4, startedAt: 1150, endedAt: 1165, method: 'GET', pathAndQuery: '/api/v1/wallet', origin: ORIGIN, status: 200, body: '{"balance":90}' },
     { exchangeId: 's1', seq: 5, startedAt: 1200, endedAt: 1230, durationMs: 30, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
     { exchangeId: 'spost', seq: 6, startedAt: 1250, endedAt: 1265, method: 'GET', pathAndQuery: '/api/v1/wallet', origin: ORIGIN, status: 200, body: '{"balance":80}' },
@@ -102,8 +103,8 @@ test('C-5: conserved_balance confirms genuine overlapping burst with host reques
   // Negative 1: Swapped baseline/post timestamps & host seq (worker claims later read is baseline and earlier read is post)
   const swappedExchanges: ScriptProofExchange[] = [
     { exchangeId: 'early', seq: 1, startedAt: 1000, endedAt: 1015, method: 'GET', pathAndQuery: '/api/v1/wallet', origin: ORIGIN, status: 200, body: '{"balance":90}' },
-    { exchangeId: 'b1', seq: 2, startedAt: 1050, endedAt: 1120, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
-    { exchangeId: 'b2', seq: 3, startedAt: 1051, endedAt: 1122, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
+    { exchangeId: 'b1', seq: 2, op: 'race', raceBatchId: 'batch-c5-swap', startedAt: 1050, endedAt: 1120, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
+    { exchangeId: 'b2', seq: 3, op: 'race', raceBatchId: 'batch-c5-swap', startedAt: 1051, endedAt: 1122, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
     { exchangeId: 'late', seq: 4, startedAt: 1150, endedAt: 1165, method: 'GET', pathAndQuery: '/api/v1/wallet', origin: ORIGIN, status: 200, body: '{"balance":100}' },
     { exchangeId: 's1', seq: 5, startedAt: 1200, endedAt: 1220, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
     { exchangeId: 'spost', seq: 6, startedAt: 1250, endedAt: 1265, method: 'GET', pathAndQuery: '/api/v1/wallet', origin: ORIGIN, status: 200, body: '{"balance":90}' },
@@ -130,8 +131,8 @@ test('C-5: conserved_balance confirms genuine overlapping burst with host reques
   // Negative 2: Worker tries to override host requestBody and inflate unitDebit on a CONSERVED wallet
   const conservedExchanges: ScriptProofExchange[] = [
     { exchangeId: 'pre', seq: 1, startedAt: 1000, endedAt: 1015, method: 'GET', pathAndQuery: '/api/v1/wallet', origin: ORIGIN, status: 200, body: '{"balance":100}' },
-    { exchangeId: 'b1', seq: 2, startedAt: 1050, endedAt: 1110, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
-    { exchangeId: 'b2', seq: 3, startedAt: 1052, endedAt: 1115, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
+    { exchangeId: 'b1', seq: 2, op: 'race', raceBatchId: 'batch-c5-cons', startedAt: 1050, endedAt: 1110, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
+    { exchangeId: 'b2', seq: 3, op: 'race', raceBatchId: 'batch-c5-cons', startedAt: 1052, endedAt: 1115, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
     { exchangeId: 'post', seq: 4, startedAt: 1150, endedAt: 1165, method: 'GET', pathAndQuery: '/api/v1/wallet', origin: ORIGIN, status: 200, body: '{"balance":80}' },
     { exchangeId: 's1', seq: 5, startedAt: 1200, endedAt: 1220, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
     { exchangeId: 'spost', seq: 6, startedAt: 1250, endedAt: 1265, method: 'GET', pathAndQuery: '/api/v1/wallet', origin: ORIGIN, status: 200, body: '{"balance":70}' },
@@ -660,15 +661,20 @@ test('H-14: auth_bypass rejects sealed capabilities, session cookies/jars, admin
 // H-15: Timing differential (`blind_sqli`) route / origin / method / persona lock
 // ============================================================================
 
-test('H-15: timing differential confirms same-origin/method/route/persona and rejects mismatched route, persona, method, or origin', () => {
+test('H-15: timing differential confirms same-origin/method/route/persona with host-minted delay >=5 interleaved arms and rejects mismatched route, persona, method, origin, or 1+1 arms', () => {
+  const challenge = defaultHostMintedOracle.mintTimingChallenge('sqli', 1_800)
   const mkTimingExchanges = (probeOverrides: Partial<ScriptProofExchange> = {}): ScriptProofExchange[] => [
     ...Array.from({ length: 5 }, (_, i) => ({
-      exchangeId: `c${i}`, seq: i * 2, method: 'GET', pathAndQuery: '/api/search?q=benign', origin: ORIGIN,
-      status: 200, durationMs: 35, personaHandle: 'alice', body: '{"items":[]}',
+      exchangeId: `c${i}`, seq: i * 2, method: 'GET',
+      pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.controlToken)}`,
+      origin: ORIGIN, status: 200, durationMs: 35, personaHandle: 'alice', body: '{"items":[]}',
+      hostTimingChallenge: challenge,
     })),
     ...Array.from({ length: 5 }, (_, i) => ({
-      exchangeId: `p${i}`, seq: i * 2 + 1, method: 'GET', pathAndQuery: '/api/search?q=sleep', origin: ORIGIN,
-      status: 200, durationMs: 1_800, personaHandle: 'alice', body: '{"items":[]}',
+      exchangeId: `p${i}`, seq: i * 2 + 1, method: 'GET',
+      pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.delayToken)}`,
+      origin: ORIGIN, status: 200, durationMs: 1_800, personaHandle: 'alice', body: '{"items":[]}',
+      hostTimingChallenge: challenge,
       ...probeOverrides,
     })),
   ]
@@ -676,9 +682,10 @@ test('H-15: timing differential confirms same-origin/method/route/persona and re
     kind: 'timing',
     controlIds: ['c0', 'c1', 'c2', 'c3', 'c4'],
     variantIds: ['p0', 'p1', 'p2', 'p3', 'p4'],
+    hostMintedTimingChallengeId: challenge.challengeId,
   }
 
-  // Positive: identical origin, method, route, persona
+  // Positive: identical origin, method, route, persona, >=5 interleaved arms, host-minted delay vs zero-delay control
   const okBuilt = buildAgentScriptReceipt({
     origin: ORIGIN,
     title: 'Blind timing on /api/search',
@@ -691,7 +698,7 @@ test('H-15: timing differential confirms same-origin/method/route/persona and re
 
   // Negative 1 (buildAgentScriptReceipt): different routes (`/api/search` vs `/api/export`)
   assert.equal(
-    buildAgentScriptReceipt({ origin: ORIGIN, title: 'Cross-route timing', exchanges: mkTimingExchanges({ pathAndQuery: '/api/export?q=sleep' }), claims: [timingClaim] }),
+    buildAgentScriptReceipt({ origin: ORIGIN, title: 'Cross-route timing', exchanges: mkTimingExchanges({ pathAndQuery: `/api/export?q=${encodeURIComponent(challenge.delayToken)}` }), claims: [timingClaim] }),
     null,
     'buildAgentScriptReceipt must reject cross-route timing',
   )
@@ -703,31 +710,49 @@ test('H-15: timing differential confirms same-origin/method/route/persona and re
     'buildAgentScriptReceipt must reject cross-persona timing',
   )
 
-  // Negative 3 (verifyReceipt direct): different routes, personas, methods, and origins all fail closed
+  // Negative 3 (verifyReceipt direct): 1+1 arms must be rejected; >=5 interleaved arms with host challenge confirms,
+  // and mismatched route, persona, method, or origin all fail closed.
+  const onePairReceipt = buildProofReceipt({
+    vulnClass: 'blind_sqli',
+    target: { origin: ORIGIN, method: 'GET', pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.delayToken)}` },
+    exchangeIds: ['c0', 'p0'],
+    claimedDelta: 'Single pair timing claim must fail closed.',
+  })
+  assert.equal(verifyReceipt(onePairReceipt, {
+    hostTimingChallenge: challenge,
+    entries: [
+      { exchangeId: 'c0', seq: 1, origin: ORIGIN, durationMs: 40, step: mkStep({ id: 'c0', arm: 'control', method: 'GET', route: '/api/search', pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.controlToken)}`, status: 200 }) },
+      { exchangeId: 'p0', seq: 2, origin: ORIGIN, durationMs: 2_000, step: mkStep({ id: 'p0', arm: 'probe', method: 'GET', route: '/api/search', pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.delayToken)}`, status: 200 }) },
+    ],
+  }).confirmed, false, '1+1 timing arms must be rejected by R2 H-15')
+
   const timingReceipt = buildProofReceipt({
     vulnClass: 'blind_sqli',
-    target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/search?q=sleep' },
-    exchangeIds: ['c0', 'p0'],
-    claimedDelta: 'Timing separation claimed.',
+    target: { origin: ORIGIN, method: 'GET', pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.delayToken)}`, param: 'q' },
+    exchangeIds: ['c0', 'p0', 'c1', 'p1', 'c2', 'p2', 'c3', 'p3', 'c4', 'p4'],
+    claimedDelta: 'Timing separation claimed across 5 interleaved host-minted rounds.',
   })
   const makeDirect = (probePatch: Partial<ReceiptTranscriptEntry> & { stepPatch?: Partial<ImpactStep> }): ReceiptTranscript => ({
-    entries: [
+    hostTimingChallenge: challenge,
+    entries: Array.from({ length: 5 }, (_, i) => [
       {
-        exchangeId: 'c0',
+        exchangeId: `c${i}`,
+        seq: i * 2,
         origin: ORIGIN,
         durationMs: 40,
-        step: mkStep({ id: 'c0', arm: 'control', method: 'GET', route: '/api/search', pathAndQuery: '/api/search?q=1', status: 200 }),
+        step: mkStep({ id: `c${i}`, arm: 'control', method: 'GET', route: '/api/search', pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.controlToken)}`, status: 200 }),
       },
       {
-        exchangeId: 'p0',
+        exchangeId: `p${i}`,
+        seq: i * 2 + 1,
         origin: probePatch.origin ?? ORIGIN,
         durationMs: 2_000,
-        step: mkStep({ id: 'p0', arm: 'probe', method: 'GET', route: '/api/search', pathAndQuery: '/api/search?q=2', status: 200, ...(probePatch.stepPatch ?? {}) }),
+        step: mkStep({ id: `p${i}`, arm: 'probe', method: 'GET', route: '/api/search', pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.delayToken)}`, status: 200, ...(probePatch.stepPatch ?? {}) }),
       },
-    ],
+    ]).flat(),
   })
   assert.equal(verifyReceipt(timingReceipt, makeDirect({})).confirmed, true)
-  assert.equal(verifyReceipt(timingReceipt, makeDirect({ stepPatch: { route: '/api/slow-export', pathAndQuery: '/api/slow-export?q=2' } })).confirmed, false)
+  assert.equal(verifyReceipt(timingReceipt, makeDirect({ stepPatch: { route: '/api/slow-export', pathAndQuery: `/api/slow-export?q=${encodeURIComponent(challenge.delayToken)}` } })).confirmed, false)
   assert.equal(verifyReceipt(timingReceipt, makeDirect({ stepPatch: { actor: { handle: 'admin', role: 'admin', tenant: 'acme', auth: 'bearer', sameSite: null } } })).confirmed, false)
   assert.equal(verifyReceipt(timingReceipt, makeDirect({ stepPatch: { method: 'POST' } })).confirmed, false)
   assert.equal(verifyReceipt(timingReceipt, makeDirect({ origin: OTHER_ORIGIN })).confirmed, false)
